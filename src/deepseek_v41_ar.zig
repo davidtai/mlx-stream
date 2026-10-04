@@ -1115,9 +1115,6 @@ const CellReceipt = struct {
     /// The phase change's settle condition as the Module installed it (`module.phaseChangeSettle`; the default until_freed).
     /// until_freed's bound, grow and margin ride in `phase_change`.
     phase_change_settle: ?module.PhaseChangeSettle = null,
-    /// The phase change's host relief as installed (`module.hostRelief`; off by default); the bytes malloc reported
-    /// returned ride in `phase_change.host_relief_bytes`.
-    host_relief: ?bool = null,
     /// The grow's new rows' allocation as installed (`module.growFill`; zeros by default).
     grow_fill: ?[]const u8 = null,
     /// The request's index through this Module (1 = the first; request k > 1 follows a reverse phase change).
@@ -1624,7 +1621,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .phase_change = md.phase_change,
         .phase_change_poll_ms = md.installed.phase_change_poll_ms,
         .phase_change_settle = md.installed.phase_change_settle,
-        .host_relief = md.installed.host_relief,
         .grow_fill = @tagName(md.installed.grow_fill),
         .request = cx.request,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
@@ -1784,7 +1780,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     // The phase change's settle poll (ms; the Module refuses a value outside 1..phase_change_settle_ms at construction).
     if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;
     // The phase change's settle condition (interval | until_freed; anything else refused here).
-    if (envStr("DSV41_CELL_HOST_RELIEF")) |v| ov.host_relief = try cellBool("DSV41_CELL_HOST_RELIEF", v);
     if (envStr("DSV41_CELL_GROW_FILL")) |v| ov.grow_fill = std.meta.stringToEnum(@import("expert_stream.zig").GrowFill, v) orelse return error.CellGrowFill;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;

@@ -177,9 +177,6 @@ pub const RouteOverrides = struct {
     phase_change_poll_ms: ?u32 = null,
     /// The phase change's settle condition (`PhaseChangeSettle`). null: the default, `until_freed`.
     phase_change_settle: ?PhaseChangeSettle = null,
-    /// The phase change's host relief: libc malloc's zones asked once, after the frees, to return the free pages they
-    /// keep (`malloc_zone_pressure_relief(NULL, 0)`; the prompt pass's host heap). null: the default, off.
-    host_relief: ?bool = null,
     /// MLX's buffer cache limit through decode (set at the phase change; the bill's decode cache term). null: the
     /// default, the envelope's 268,435,456 B; at most that (a larger limit would bill past the admission's term).
     decode_cache_bytes: ?u64 = null,
@@ -274,26 +271,6 @@ pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
     const v = ov.decode_cache_bytes orelse return envelope.decode_cache_bytes;
     if (v > envelope.decode_cache_bytes) return error.DecodeCacheLimit;
     return v;
-}
-
-/// The host relief route the Module installs (off by default).
-pub fn hostRelief(ov: RouteOverrides) bool {
-    return ov.host_relief orelse false;
-}
-
-extern "c" fn malloc_zone_pressure_relief(zone: ?*anyopaque, goal: usize) usize;
-
-/// libc malloc's relief over every zone (no goal: everything it can return); the bytes it reports returned.
-pub const LibcRelief = struct {
-    pub fn relieve(_: LibcRelief) u64 {
-        return malloc_zone_pressure_relief(null, 0);
-    }
-};
-
-/// The phase change's one relief call when the route is installed (`relief.relieve()`, once); null when it is not.
-pub fn boundaryRelief(installed: bool, relief: anytype) ?u64 {
-    if (!installed) return null;
-    return relief.relieve();
 }
 
 /// The process's host side at a reading: its footprint less MLX's active and cache.
@@ -800,10 +777,8 @@ pub const Module = struct {
         log.info("NATIVE first-verify warm: {s}", .{if (self.installed.first_verify_warm) "installed (the grow reads each layer's prompt-tail set into its empty rows below demand; a layer's first decode route cancels the unread)" else "off"});
         self.installed.phase_change_poll_ms = poll_ms;
         self.installed.phase_change_settle = phaseChangeSettle(ov);
-        self.installed.host_relief = hostRelief(ov);
         self.installed.decode_cache_bytes = decodeCacheLimit(ov) catch unreachable;
         log.info("NATIVE decode cache limit: {d} B ({s})", .{ self.installed.decode_cache_bytes, if (self.installed.decode_cache_bytes == envelope.decode_cache_bytes) "the envelope's" else "the route's" });
-        log.info("NATIVE host relief: {s}", .{if (self.installed.host_relief) "installed (malloc_zone_pressure_relief once at the phase change, after the frees)" else "off"});
         log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
         log.info("NATIVE phase change settle: {t} ({s})", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
             .interval => "until the footprint is down by the freed bytes",
@@ -1584,8 +1559,6 @@ pub const Module = struct {
         _ = mlx.mlx_synchronize(self.g.s);
         // The frees' end (free_to_grow_ms starts here).
         const freed_at = std.Io.Timestamp.now(self.io, .boot);
-        // On its route: libc malloc's free pages returned once, with the frees (the prompt pass's host heap).
-        const relieved = boundaryRelief(self.installed.host_relief, LibcRelief{});
         // prompt_stats: the rows from the prompt's counts, host only, while the frees land (before the settle).
         if (self.decode_rows) |*dr| {
             self.grown_rows = switch (self.arm) {
@@ -1601,7 +1574,7 @@ pub const Module = struct {
         const bound: ?u64 = if (uf) |x| x.bound else null;
         const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms, bound);
         marks[3] = VmMark.now();
-        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = released_here, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null, .host_relief_bytes = relieved };
+        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = released_here, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
         checkSettled(before, st.after, freed_device, bound) catch |e| return self.refuseBoundary(e);
         try self.observe(.released);
         self.phase_change.?.free_to_grow_ms = @as(f64, @floatFromInt(@max(freed_at.untilNow(self.io, .boot).nanoseconds, 0))) / 1e6;
@@ -1739,8 +1712,6 @@ pub const Installed = struct {
     phase_change_poll_ms: u32 = phase_change_poll_ms,
     /// The phase change's settle condition, as installed (`phaseChangeSettle`).
     phase_change_settle: PhaseChangeSettle = .until_freed,
-    /// The phase change's host relief, as installed (`hostRelief`).
-    host_relief: bool = false,
     /// The ring geometry the states are built with, as installed (`ringGeometry`; the bill reads the same).
     ring_geo: kvc.Geometry = .{},
     /// The grow's new rows' allocation, as installed in the stream.
@@ -1908,8 +1879,6 @@ pub const PhaseChangeRecord = struct {
     grow_bound_bytes: ?u64 = null,
     grow_bytes: ?u64 = null,
     margin_bytes: ?i64 = null,
-    /// The host relief route only: the bytes malloc reported returned (`malloc_zone_pressure_relief`).
-    host_relief_bytes: ?u64 = null,
     /// A phase change only: the time from the frees' end (the scratch released and MLX's cache cleared) to the grow's start.
     free_to_grow_ms: ?f64 = null,
     /// The refusal's name, when the phase change refused the grow.
@@ -3215,24 +3184,7 @@ test "dsv41 memory: the reverse bound is the prompt bill less the terms the next
     try checkFreed(before, early, freed);
 }
 
-test "dsv41 memory: the host relief route calls malloc's relief once at the boundary, never when off; the decode host side reads" {
-    try std.testing.expect(!hostRelief(.{}));
-    try std.testing.expect(!(Installed{}).host_relief);
-    try std.testing.expect(hostRelief(.{ .host_relief = true }));
-    const Counting = struct {
-        n: *u32,
-        pub fn relieve(c: @This()) u64 {
-            c.n.* += 1;
-            return 4096;
-        }
-    };
-    var n: u32 = 0;
-    try std.testing.expectEqual(@as(?u64, null), boundaryRelief(false, Counting{ .n = &n }));
-    try std.testing.expectEqual(@as(u32, 0), n);
-    try std.testing.expectEqual(@as(?u64, 4096), boundaryRelief(true, Counting{ .n = &n }));
-    try std.testing.expectEqual(@as(u32, 1), n);
-    // The real call is host-only libc (no device): it returns, whatever it reports.
-    _ = boundaryRelief(true, LibcRelief{});
+test "dsv41 memory: the decode host side reads" {
     // The decode host side: footprint less active and cache (SERVED19 control1 112957's grown reading: 1.047 GB).
     try std.testing.expectEqual(@as(u64, 1_046_698_048), hostSideOf(.{ .active = 107_371_043_568, .cache = 720, .footprint = 108_417_742_336 }));
     try std.testing.expectEqual(@as(u64, 0), hostSideOf(.{ .active = 2, .cache = 2, .footprint = 3 }));
