@@ -235,3 +235,4 @@ Use it to port commits written against the in-tree layout (for example the cover
 | coverage/expert-io `src/io_util.zig` no-cache tests | host src/io_util.zig and, renamed "nocache io: ...", src/nocache_io.zig |
 | coverage/expert-io `src/gpu_ceiling.zig`, `src/nocache_reader.zig` tests | host only |
 | coverage/plugin-core ad3d0f93..f1da4b90 (src/mlx_stream/*, src/fixtures/dsv41_*, src/mlx_stream/deepseek_v41_bill_receipts_test.zig) | src/*, src/fixtures/*, src/deepseek_v41_bill_receipts_test.zig |
+| coverage/plugin-core 9cca0993 (deepseek_v41_bill_mini_test.zig + bill / engram / module / deepseek_v41 hunks) | src/deepseek_v41_bill_mini_test.zig and the same names under src/ |
