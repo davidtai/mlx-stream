@@ -975,7 +975,7 @@ static void *worker(void *arg) {
         if (qlen > 0) {
             job = queue[qhead];
             qhead = (qhead + 1) % qcap;
-            qlen -= 1;
+            __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);   /* SCHED spin reads it lock-free */
             EV(2, job.first);
         } else {                                      /* WARM: demand and pre-read idle, below the busy limit */
             job = wqueue[whead];
@@ -1341,11 +1341,11 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     memset(gates, 0, sizeof(gates));                  /* EVENT: armed later by q3ld_ev_config */
     g_head = g_tail = 0; ev_hi = ev_target = ev_sent = 0; ev_target_t = 0; ev_kind = EVK_OFF; ev_obj = 0;
     wd_stop = 0; wd_running = 0;
-    qcap = n_tickets; qhead = 0; qlen = 0;
+    qcap = n_tickets; qhead = 0; __atomic_store_n(&qlen, 0, __ATOMIC_RELAXED);
     whead = 0; wlen = 0; warm_busy_max = 0;
     res = res_arr; nt = n_tickets; logbuf = log_arr; logn = n_log; gauge = gauge_arr;
     staging_bytes = sbytes; page_size = psize;
-    stopping = 0; busy = 0; seq = 0;
+    __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); busy = 0; seq = 0;
     for (int i = 0; i < nw; i++) staging[i] = (char *)(uintptr_t)staging_ptrs[i];
     nworkers = 0;
     for (int i = 0; i < nw; i++) {
@@ -1419,7 +1419,7 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     if (nspec) claim_ranges(fd, first, count);
     job_t *job = &queue[(qhead + qlen) % qcap];
     job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->first = first; job->count = count;
-    qlen += 1;
+    __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);   /* SCHED spin reads it lock-free */
     EV(1, first);
     pthread_cond_signal(&work_cv);
     pthread_mutex_unlock(&mu);
@@ -1711,7 +1711,7 @@ int q3ld_stop(void) {
     if (!running) { pthread_mutex_unlock(&mu); return -1; }
     if (wlen) warm_cancel_locked(0, -1);         /* WARM: no waiter outlives the pool */
     warm_busy_max = 0;
-    stopping = 1;
+    __atomic_store_n(&stopping, 1, __ATOMIC_RELAXED);   /* SCHED spin reads it lock-free */
     pthread_cond_broadcast(&work_cv);
     pthread_cond_broadcast(&spec_cv);
     pthread_cond_broadcast(&pre_cv);             /* PRE: a worker held at an unbound range's bind point drops it */
@@ -1758,7 +1758,7 @@ int q3ld_stop(void) {
         memset(&spec[i], 0, sizeof(spec_t));
         spec[i].fd = -1;
     }
-    running = 0; nworkers = 0; nspec_started = 0; stopping = 0; nspec = 0; nspec_threads = 0; spec_configured = 0;
+    running = 0; nworkers = 0; nspec_started = 0; __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); nspec = 0; nspec_threads = 0; spec_configured = 0;
     spec_idle_busy = SPEC_MAX_DEMAND_BUSY;
     free(ranges); free(queue); free(pre_of); free(wqueue); ranges = 0; queue = 0; pre_of = 0; wqueue = 0;
     whead = 0; wlen = 0;

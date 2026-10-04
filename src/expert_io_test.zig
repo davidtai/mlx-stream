@@ -1838,3 +1838,23 @@ test "dsv41 io cov: DSV41_TEST_READER_SCHED runs a stock pool at its value (thre
     defer pool.stop();
     try waitFor({}, namedDemand1);
 }
+
+// The spin mode's lock-free reads of the queue length and the stop flag race the writers' stores unless both sides are
+// atomic: this drives both against spinning workers. A ThreadSanitizer build of the pool (the coverage hook with a
+// -fsanitize=thread object) reports any such race here; the plain build checks the bytes.
+test "dsv41 io cov: spin mode: submits and a stop against spinning workers land every job" {
+    if (std.c.getenv("DSV41_TEST_READER_SCHED") != null) return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(32 * page);
+    defer f.deinit();
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 64, .sched = .{ .qos = true, .spin = true } });
+    defer pool.stop();
+    var d = try Dests.init(1, &spec_lens);
+    defer testing.allocator.free(d.buf);
+    for (0..200) |i| {
+        const base: u64 = (i % 20) * page + i;
+        const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
+        try pool.wait(first, 2, 10 * std.time.ns_per_s);
+        try d.expectRecord(0, f.image, base, base + spec_gu_len, &spec_lens);
+    }
+}
