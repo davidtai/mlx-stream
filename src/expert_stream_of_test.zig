@@ -1,0 +1,142 @@
+//! The bank contract's second shape: a MiMo-like MXFP4 bank module (six components, gate/up range four, every segment a
+//! 16 KiB multiple, one experts.bin) drives the same stream code on host rows. No MLX array, no device.
+
+const std = @import("std");
+const sdk = @import("sdk");
+const mlx = @import("mlx");
+const StreamOf = sdk.expert.stream.StreamOf;
+
+const testing = std.testing;
+
+/// A bank module in MiMo's record layout (gate / up / down weight U32 then scales U8), at a test's size.
+const MxBank = struct {
+    pub const n_components = 6;
+    pub const gu_components = 4;
+    pub const Records = sdk.expert.Records(n_components, gu_components);
+    pub const Component = enum(u8) { gate_weight, gate_scales, up_weight, up_scales, down_weight, down_scales };
+    pub const Dtype = enum { U32, U8 };
+    pub const Segment = struct { offset: u64, length: u64, dtype: Dtype, shape: [3]u64, rank: u8 };
+    pub const Layer = struct { logical_bytes: u64, segments: [n_components]Segment };
+    pub const BankArrays = [n_components]mlx.mlx_array;
+    pub const routed_top_k = 8;
+
+    pub fn mlxDtype(d: Dtype) mlx.mlx_dtype {
+        return switch (d) {
+            .U32 => .uint32,
+            .U8 => .uint8,
+        };
+    }
+
+    pub fn bankArraysOf(x: [n_components]mlx.mlx_array) BankArrays {
+        return x;
+    }
+
+    pub const Spans = struct { gu_offset: u64, down_offset: u64 };
+
+    pub const Bank = struct {
+        layers: []Layer,
+        n_experts: u32,
+        sidecar: sdk.expert.UncachedFd,
+        record_bytes: u64,
+
+        pub fn recordOffset(self: *const Bank, layer: u32, expert: u32) u64 {
+            return (@as(u64, layer) * self.n_experts + expert) * self.record_bytes;
+        }
+
+        pub fn spans(self: *const Bank, layer: u32, expert: u32) Spans {
+            const off = self.recordOffset(layer, expert);
+            return .{ .gu_offset = off, .down_offset = off + self.layers[layer].segments[gu_components].offset };
+        }
+    };
+
+    /// MiMo's segment table at hidden `h`, intermediate `i` (weights 4 bits packed in U32, scales one U8 per 32).
+    fn layerOf(h: u64, i: u64) Layer {
+        var l: Layer = .{ .logical_bytes = 0, .segments = undefined };
+        var off: u64 = 0;
+        for (0..3) |p| {
+            const in = if (p == 2) i else h;
+            const out = if (p == 2) h else i;
+            l.segments[p * 2] = .{ .offset = off, .length = out * in / 2, .dtype = .U32, .shape = .{ out, in / 8, 0 }, .rank = 2 };
+            off += out * in / 2;
+            l.segments[p * 2 + 1] = .{ .offset = off, .length = out * in / 32, .dtype = .U8, .shape = .{ out, in / 32, 0 }, .rank = 2 };
+            off += out * in / 32;
+        }
+        l.logical_bytes = off;
+        return l;
+    }
+};
+
+const MxStream = StreamOf(MxBank, false).Stream;
+
+test "dsv41 bank contract: a MiMo-shaped MXFP4 bank (6 components, gate/up 4) streams through the same code, every slot its record" {
+    // h 256, i 128: weights 16 KiB, scales 1 KiB per projection; record 52 KiB (MiMo: 13,369,344 B at h 4096, i 2048).
+    var layers = [_]MxBank.Layer{ MxBank.layerOf(256, 128), MxBank.layerOf(256, 128) };
+    const rec = layers[0].logical_bytes;
+    try testing.expectEqual(@as(u64, 3 * (16384 + 1024)), rec);
+    const n_experts: u32 = 24;
+    const total = rec * n_experts * layers.len;
+    const image = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(image);
+    for (image, 0..) |*b, k| b.* = @truncate(k *% 2654435761 >> 9);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = image });
+    var root: [512]u8 = undefined;
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/experts.bin", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    defer testing.allocator.free(path);
+    const fd = try sdk.expert.openUncached(path.ptr, null);
+    defer fd.close();
+    const bank: MxBank.Bank = .{ .layers = &layers, .n_experts = n_experts, .sidecar = fd, .record_bytes = rec };
+
+    const s = try MxStream.init(testing.allocator, &bank, .{ .rows = &.{ 4, 3 }, .max_route_ids = 8, .transient_rows = 8, .pool = .{ .workers = 2, .staging_bytes = 65536, .tickets = 256 } });
+    defer s.deinit();
+    var rng = std.Random.DefaultPrng.init(11);
+    var ids: [8]u16 = undefined;
+    for (0..40) |step| {
+        const l: u32 = @intCast(step % 2);
+        const n = 1 + rng.random().uintLessThan(usize, ids.len);
+        var k: usize = 0;
+        while (k < n) {
+            const e = rng.random().uintLessThan(u16, @intCast(n_experts));
+            if (std.mem.indexOfScalar(u16, ids[0..k], e) == null) {
+                ids[k] = e;
+                k += 1;
+            }
+        }
+        const r = try s.route(l, ids[0..n], &.{});
+        for (0..r.n_parts) |p| {
+            try s.waitGu(r, @intCast(p));
+            try s.waitDown(r, @intCast(p));
+        }
+        for (ids[0..n], r.plan.slotsOf()) |e, slot| {
+            const off = bank.recordOffset(l, e);
+            for (layers[l].segments, 0..) |seg, c| {
+                try testing.expectEqualSlices(u8, image[off + seg.offset ..][0..seg.length], s.slotRow(l, slot, @enumFromInt(c))[0..seg.length]);
+            }
+        }
+        s.release(r);
+    }
+}
+
+test "dsv41 bank contract: a top-8 arch's lookahead measures tau from each row's eighth score, a top-6 arch's from its sixth" {
+    const a = testing.allocator;
+    // One row over 16 experts, scores 15 - e: the 6th score is 10, the 8th is 8. With tau 1 and k 10, a top-6 selector keeps
+    // scores >= 9 (experts 0..6), a top-8 selector scores >= 7 (experts 0..8); none is resident.
+    var row: [16]f32 = undefined;
+    for (&row, 0..) |*v, e| v.* = 15 - @as(f32, @floatFromInt(e));
+    var none = try sdk.expert.policy.LayerPolicy.init(a, 16, 0);
+    defer none.deinit(a);
+    var out: [4]u16 = undefined;
+    var s6 = try sdk.expert.lookahead.SelectorOf(6).init(a, 16, 10, 1.0, 4);
+    defer s6.deinit(a);
+    var s8 = try sdk.expert.lookahead.SelectorOf(8).init(a, 16, 10, 1.0, 4);
+    defer s8.deinit(a);
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3 }, s6.select(&row, &none, &out));
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3 }, s8.select(&row, &none, &out));
+    // The candidate counts differ by the threshold: read through a budget wide enough to see the cut.
+    var wide: [12]u16 = undefined;
+    try testing.expectEqual(@as(usize, 7), s6.select(&row, &none, &wide).len);
+    try testing.expectEqual(@as(usize, 9), s8.select(&row, &none, &wide).len);
+    // A top-8 arch cannot keep fewer than eight candidates per row.
+    try testing.expectError(error.InvalidSelector, sdk.expert.lookahead.SelectorOf(8).init(a, 16, 7, 1.0, 4));
+}
