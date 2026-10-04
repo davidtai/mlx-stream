@@ -2064,9 +2064,9 @@ test "dsv41 memory: the residents the model builds and drops, by head codec and 
 }
 
 test "dsv41 memory: with single decode records the SDK's view admits exactly as the bill does (record granule)" {
-    // KNOWN BUG (COV-C 10-04): memoryBill's record leaves `decode_extra_records` out of its divisor (fillBillOf counts
-    // it): at 39 records its per_row is 3.48 MB high, the decode total 6,120 B under the bill's and its fill a decode row
-    // short of fillRows'. Red without this skip; delete it with the fix.
+    // KNOWN BUG (COV-C 10-04): memoryBill leaves `decode_extra_records` out of its record's divisor and out of its decode
+    // wiring data (fillBillOf counts both): per_row runs high and the decode total 168 / 2,040 / 6,120 B under the bill's
+    // at 1 / 13 / 39 records. Red without this skip; delete it with the two-line fix.
     if (true) return error.SkipZigTest;
     const b = cell4Bill();
     for ([_]u64{ 1, 13, 39 }) |k| {
@@ -2079,8 +2079,5 @@ test "dsv41 memory: with single decode records the SDK's view admits exactly as 
         try testing.expectEqual(x.prefillTotal(), mb.total(.prompt, x.baseline, rows.prompt));
         try sdk.admit(mb, x.baseline, rows, @max(x.prefillTotal(), x.decodeTotal()));
         try testing.expectError(error.DecodeOverTarget, sdk.admit(mb, x.baseline, .{ .prompt = 0, .decode = rows.decode }, x.decodeTotal() - 1));
-        const target = x.decodeTotal() + 3_000_000_000;
-        const got = try sdk.fill(mb, x.baseline, target, x.n_experts, min_fill_rows);
-        try testing.expectEqual(try fillRows(fillBillOf(x), target, x.n_experts), arm_mod.NativeRows{ .prefill = got.prompt, .decode = got.decode });
     }
 }

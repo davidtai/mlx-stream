@@ -1633,3 +1633,53 @@ test "dsv41 kernels: no Metal device in this process" {
     if (std.c.getenv("DSV41_KERNELS_GPU") != null) return error.SkipZigTest;
     try testing.expect(!metalDriverLoaded());
 }
+
+test "dsv41 kernels: the host decode reads each weight's 16-bit state bit by bit from its tile's circular stream, K 1 to 3" {
+    const a = testing.allocator;
+    const table = try a.create([65536]u16);
+    defer a.destroy(table);
+    mul1Table(table);
+    // tile_perm places 256 code positions on the 16 x 16 tile, each once.
+    var seen: [256]bool = @splat(false);
+    for (tile_perm) |p| {
+        try testing.expect(!seen[p]);
+        seen[p] = true;
+    }
+    var prng = std.Random.DefaultPrng.init(0xe3c0de);
+    const rnd = prng.random();
+    const n_i = 2;
+    const n_j = 3;
+    // tileStates holds 8 K u32 words in a [24]: K <= 3 (the claim admits only bank_ks).
+    for (1..bank_ks[bank_ks.len - 1] + 1) |K| {
+        const tw = 16 * K;
+        const code = try a.alloc(i16, n_i * n_j * tw);
+        defer a.free(code);
+        for (code) |*c| c.* = @bitCast(rnd.int(u16));
+        const w = try a.alloc(u16, n_i * n_j * 256);
+        defer a.free(w);
+        const st = try a.alloc(u16, w.len);
+        defer a.free(st);
+        reconstruct(code, n_i, n_j, K, table, w, st);
+        for (0..n_i) |ti| for (0..n_j) |tj| {
+            const tile = code[(ti * n_j + tj) * tw ..][0..tw];
+            const bits: usize = 256 * K;
+            for (0..256) |p| {
+                // Stream bit b: the u32 words (i16 pairs, little-endian) read MSB first; the state is the 16 bits ending
+                // at bit (p + 1) K, wrapping at the tile's end.
+                var s: u16 = 0;
+                for (0..16) |i| {
+                    const b = ((p + 1) * K + bits - 16 + i) % bits;
+                    const word: u32 = @as(u32, @as(u16, @bitCast(tile[2 * (b / 32)]))) | @as(u32, @as(u16, @bitCast(tile[2 * (b / 32) + 1]))) << 16;
+                    s = (s << 1) | @as(u16, @intCast((word >> @intCast(31 - b % 32)) & 1));
+                }
+                const pos: usize = tile_perm[p];
+                const at = (ti * 16 + pos / 16) * (n_j * 16) + tj * 16 + pos % 16;
+                try testing.expectEqual(s, st[at]);
+                try testing.expectEqual(table[s], w[at]);
+            }
+        };
+    }
+    // The codebook at its ends: state 0 and state 0xFFFF decode as exllamav3's hfma of (1024 + byte sum).
+    try testing.expectEqual(@as(u16, @bitCast(@as(f16, @floatCast(1024.0 * @as(f64, @as(f16, @bitCast(@as(u16, 0x1EEE)))) + @as(f64, @as(f16, @bitCast(@as(u16, 0xC931)))))))), mul1Decode(0));
+    try testing.expect(std.math.isFinite(@as(f16, @bitCast(mul1Decode(0xFFFF)))));
+}

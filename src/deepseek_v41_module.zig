@@ -3654,3 +3654,27 @@ test "dsv41 module: decode_first16 needs its pool's rows above the prompt rows a
     try std.testing.expectError(error.DecodePoolNeedsRelease, checkDecodePoolRoutes(.decode_first16, .row, false));
     try checkDecodePoolRoutes(.uniform, .record, false);
 }
+
+test "dsv41 module: the arm's options from the shell's rows: native both, forced decode rows through the envelope, else the plan" {
+    const ceiling = boxCeiling(120_259_084_288, 384);
+    try std.testing.expectEqual(@as(u64, 120_259_084_288 - ceiling_stop_bytes), ceiling.max_target_bytes);
+    // The Module's own: both counts set (the fill's, or forced decode rows with the fill's prompt rows).
+    const native = armOptions(&.{ .expert_bank_dir = "/b", .expert_rows = 162, .expert_prefill_rows = 126, .memory_baseline_bytes = 11_655_036_928 }, ceiling, .host);
+    try std.testing.expectEqual(@as(?arm_mod.NativeRows, .{ .prefill = 126, .decode = 162 }), native.native_rows);
+    try std.testing.expect(native.fixed_rows == null and !native.envelope_record and !native.preallocate);
+    try std.testing.expectEqual(@as(?u64, 11_655_036_928), native.baseline_bytes);
+    try std.testing.expectEqualStrings("/b", native.model_dir);
+    // Prompt rows alone: decode takes them too.
+    try std.testing.expectEqual(@as(?arm_mod.NativeRows, .{ .prefill = 100, .decode = 100 }), armOptions(&.{ .expert_bank_dir = "/b", .expert_prefill_rows = 100 }, ceiling, .host).native_rows);
+    // `expert_rows` alone (a harness's Python-paired forced rows): the envelope planner's record at those rows.
+    const forced = armOptions(&.{ .expert_bank_dir = "/b", .expert_rows = 150 }, ceiling, .host);
+    try std.testing.expect(forced.native_rows == null and forced.envelope_record);
+    try std.testing.expectEqual(@as(?u32, 150), forced.fixed_rows);
+    // Neither: the plan's own rows, no record.
+    const plan = armOptions(&.{ .expert_bank_dir = "/b" }, ceiling, .host);
+    try std.testing.expect(plan.native_rows == null and plan.fixed_rows == null and !plan.envelope_record);
+    // The wide depth and the read-ahead follow the settings, on the served tier's defaults.
+    try std.testing.expectEqual(@as(u8, 5), plan.wide_depth);
+    try std.testing.expectEqual(@as(u8, 1), armOptions(&.{ .expert_bank_dir = "/b", .numeric_tier = .stock }, ceiling, .host).wide_depth);
+    try std.testing.expectEqual(lookahead.budget, plan.lookahead.?.budget);
+}
