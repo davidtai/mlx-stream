@@ -11,10 +11,10 @@ What it contains:
   serial and DSpark draft decode, and the memory bill the host admits against;
 - the EXL3 quant its routed experts use (K = 3, mul1 codebook, 128-wide Hadamard with suh / svh), with Metal kernels
   pinned by a manifest hash and specialised to the model's shapes (hidden 5120, intermediate 2304);
-- the expert source that streams them: the packed-record reader, the C read pool, the slot cache, the residency
-  policy, and the MLX event gates that order reads and kernels.
+- the expert source that streams them: the packed-record reader, the C read pool, the residency policy, and the MLX
+  event gates that order reads and kernels.
 
-Decode levers that are still being evaluated ship **off by default**, each behind its own environment switch.
+Decode levers that are still being evaluated ship **off by default** (see Environment switches).
 
 The supported model is the DeepSeek-V4.1-Flash streaming EXL3 3.0 bpw package (a model directory whose
 `config.json` has `"model_type": "deepseek_v41"` and whose expert bank has a v2 expert manifest). No weights are
@@ -62,6 +62,33 @@ CPU, and adds the bank tests when `DSV41_BANK` is set.
 The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model or run on the GPU
 skip unless their own inputs are given.
 
+## Environment switches
+
+The served path reads two environment variables, both at construction. Its routes, schedules and memory bill come
+from the tier defaults and the model settings (`model-settings.json`: `numeric_tier`, `ctx_size`, `expert_event_gates`,
+`layer_major_prefill`, `expert_wide_*`, `embedding_host_rows`), never from the environment.
+
+The levers still under evaluation are construction-time routes of the timed cell harness (the `dsv41 served cell`
+test, `zig build cell`); a served build never compiles their switches. Unset is the default below, which is the
+served behavior.
+
+| Variable | Read by | Default | Effect |
+|---|---|---|---|
+| `DSV41_BILL_VARIANT` | server | `conservative` | `tight` bills one live K16 routed-group stream instead of four (only with the model's chunk-fenced taps). Any other value is refused by name at construction. |
+| `DSV41_SELFCHECK_REPORT` | server | off | `1` logs every kernel self-check result at construction (a failure is always logged and refuses the load). |
+| `DSV41_CELL_ROUTED_FORMS` | cell | `stock` | `down_pair`, `gu_one` or both (comma list): the routed decode GEMVs rebuilt on those exact texts. |
+| `DSV41_CELL_ROUTED_BANKED` | cell | `0` | `1`: each routed decode stage runs as one launch over every bank's rows (exact). |
+| `DSV41_CELL_DEVROUTE` | cell | `0` | `1`: decode's hit wave runs as a device graph before the host's routing wait (exact; needs `ROUTED_BANKED`). |
+| `DSV41_CELL_HOIST_FIRST` | cell | `0` | `1`: each decode call commits its hoist right behind the routing barrier's arrays (exact). |
+| `DSV41_CELL_DRAFT_STAGED` | cell | `0` | `1`: each draft stage is committed as soon as it is built (exact). |
+| `DSV41_CELL_PHASE_SETTLE` | cell | `until_freed` | `interval`: the phase change's settle waits for the freed bytes only, not the grow's bound. |
+| `DSV41_CELL_PHASE_POLL_MS` | cell | the settle's own | the phase change's footprint poll in ms (1 .. the settle bound; outside is refused). |
+| `DSV41_CELL_PREFILL_SUB` | cell | the cache's sub-chunk | the prompt rows per layer-major call; `whole` runs the prompt in one call. |
+| `DSV41_CELL_MAX_CONTEXT` | cell (bill tool) | 16,384 | the longest prompt the construction bills; the server takes it from `ctx_size`. |
+
+The test suites also read their own inputs (`DSV41_BANK`, device-only smoke switches, fixture paths, the cell
+harness's rows, baseline and output paths); each such test skips without its input.
+
 ## Versions
 
 - **mlx-serve:** the commit in `HOST_PIN`. Until the host's SDK lands upstream, that is a commit on the
@@ -97,7 +124,7 @@ src/conformance.zig        the conformance suite's root
 src/*.zig                  the DeepSeek-V4.1 arch, the EXL3 quant and kernels, the expert stream
 src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile)
 src/kernels/exl3/          the pinned Metal kernel texts and their manifest (embedded at compile time)
-src/fixtures/              test fixtures (bank peek, draft routes, prefill wave samples)
+src/fixtures/              test fixtures (bank peek, prefill wave samples, DSpark lookup and receipt stats)
 csrc/                      the C read pool, the MLX event / alloc shims and the profile-only timeline sources
 src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
 docs/                      design notes and the path map from the in-tree layout
