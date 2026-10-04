@@ -340,3 +340,116 @@ pub fn residentBytes(path: [:0]const u8) !u64 {
     for (vec) |v| resident += @intFromBool(v & 1 != 0);
     return resident * page;
 }
+
+// ── Tests (temp files; the reads checked against a plain pread of the same bytes) ──
+
+const testing = std.testing;
+
+/// A temp file of `len` pattern bytes and its absolute path.
+const TmpFile = struct {
+    dir: std.testing.TmpDir,
+    path: [:0]u8,
+    image: []u8,
+
+    fn init(len: usize) !TmpFile {
+        var dir = std.testing.tmpDir(.{});
+        errdefer dir.cleanup();
+        const image = try testing.allocator.alloc(u8, len);
+        errdefer testing.allocator.free(image);
+        for (image, 0..) |*b, i| b.* = @truncate((i *% 2654435761) >> 11);
+        try dir.dir.writeFile(testing.io, .{ .sub_path = "f.bin", .data = image });
+        var root: [512]u8 = undefined;
+        const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/f.bin", .{root[0..try dir.dir.realPath(testing.io, &root)]}, 0);
+        return .{ .dir = dir, .path = path, .image = image };
+    }
+
+    fn deinit(t: *TmpFile) void {
+        testing.allocator.free(t.path);
+        testing.allocator.free(t.image);
+        t.dir.cleanup();
+    }
+};
+
+test "nocache io: readAligned equals the file's bytes at unaligned offsets and lengths, across stages, zero-length and to the last byte" {
+    const page = std.heap.pageSize();
+    // Past one 8 MiB stage, ending inside a page.
+    var t = try TmpFile.init(stage_bytes + 3 * page + 123);
+    defer t.deinit();
+    const fd = try openNoCache(t.path.ptr, .{});
+    defer _ = std.c.close(fd);
+    const buf = try testing.allocator.alloc(u8, stage_bytes + 2 * page);
+    defer testing.allocator.free(buf);
+    const Case = struct { off: u64, len: usize };
+    for ([_]Case{
+        .{ .off = 0, .len = 1 },
+        .{ .off = 1, .len = page },
+        .{ .off = page - 1, .len = 2 },
+        .{ .off = 7, .len = stage_bytes + page + 5 }, // two stages, both ends unaligned
+        .{ .off = t.image.len - 10, .len = 10 }, // the last bytes (the file ends inside the page)
+        .{ .off = 5, .len = 0 },
+    }) |cs| {
+        @memset(buf, 0xAA);
+        try readAligned(fd, buf[0..cs.len], cs.off);
+        try testing.expectEqualSlices(u8, t.image[@intCast(cs.off)..][0..cs.len], buf[0..cs.len]);
+        if (cs.len < buf.len) try testing.expectEqual(@as(u8, 0xAA), buf[cs.len]);
+    }
+    // Past the end: short, by name.
+    try testing.expectError(error.ReadShort, readAligned(fd, buf[0..20], t.image.len - 10));
+    try testing.expectError(error.ReadShort, readAligned(fd, buf[0..1], t.image.len + page));
+    // A bad descriptor: the read fails by name.
+    try testing.expectError(error.ReadFailed, readAligned(-1, buf[0..1], 0));
+}
+
+test "nocache io: the past-the-cache open refuses a missing file and a symlink it may not follow; the whole-file read keeps its limit" {
+    var t = try TmpFile.init(5000);
+    defer t.deinit();
+    try testing.expectError(error.FileNotFound, openNoCache("/nonexistent/cov-d/f.bin", .{}));
+    var lbuf: [700]u8 = undefined;
+    const link = try std.fmt.bufPrintSentinel(&lbuf, "{s}.link", .{t.path}, 0);
+    try testing.expectEqual(@as(c_int, 0), std.c.symlink(t.path.ptr, link.ptr));
+    try testing.expectError(error.OpenFailed, openNoCache(link.ptr, .{ .follow_symlinks = false }));
+    const fd = try openNoCache(link.ptr, .{ .read_ahead = true });
+    _ = std.c.close(fd);
+    const all = try readAllNoCache(testing.allocator, t.path, 5000);
+    defer testing.allocator.free(all);
+    try testing.expectEqualSlices(u8, t.image, all);
+    try testing.expectError(error.FileTooBig, readAllNoCache(testing.allocator, t.path, 4999));
+    try testing.expectError(error.FileNotFound, readAllNoCache(testing.allocator, "/nonexistent/cov-d/f.bin", 10));
+    try testing.expectError(error.NoCacheFcntl, noCache(-1, .{}));
+}
+
+test "nocache io: the row gather refuses its geometry by name, and a table shorter than its rows fails the gather (caller alone and with helpers)" {
+    const page = std.heap.pageSize();
+    try testing.expectError(error.GatherGeometry, RowGather.init(-1, 0, 0, 10, 0, 8, 2));
+    try testing.expectError(error.GatherGeometry, RowGather.init(-1, 0, 100, 10, 0, 0, 2));
+    try testing.expectError(error.GatherGeometry, RowGather.init(-1, 0, RowGather.stage_len - page, 10, 0, 8, 2));
+    // 40 rows declared, the file holds 10 rows of 1000 B after a 100 B prefix.
+    var t = try TmpFile.init(100 + 10 * 1000);
+    defer t.deinit();
+    const fd = try openNoCache(t.path.ptr, .{});
+    defer _ = std.c.close(fd);
+    for ([_]usize{ 0, 3 }) |helpers| {
+        const rg = try RowGather.init(fd, 100, 1000, 40, helpers, 16, 2);
+        defer rg.deinit();
+        var out: [3 * 1000]u8 = undefined;
+        try rg.gather(&.{ 9, 0, 9 }, &out);
+        for ([_]u32{ 9, 0, 9 }, 0..) |r, i| try testing.expectEqualSlices(u8, t.image[100 + r * 1000 ..][0..1000], out[i * 1000 ..][0..1000]);
+        // Rows far past the file's end: their runs read nothing, the gather fails by name.
+        try testing.expectError(error.GatherRead, rg.gather(&.{ 39, 0, 30 }, &out));
+        // The row gather's reads are aligned by construction; a hand-made unaligned run is refused.
+        try testing.expect(!rg.aligned(.{ .off = 0, .len = page, .need = page + 1, .first = 0, .end = 1 }, rg.stages[0]));
+        try testing.expect(!rg.aligned(.{ .off = 0, .len = 2 * RowGather.stage_len, .need = 1, .first = 0, .end = 1 }, rg.stages[0]));
+    }
+}
+
+test "nocache io: residency of an empty file is 0, a missing file refuses, and a file's resident bytes never exceed its pages" {
+    const page = std.heap.pageSize();
+    var t = try TmpFile.init(3 * page + 1);
+    defer t.deinit();
+    const r = try residentBytes(t.path);
+    try testing.expect(r <= 4 * page);
+    try testing.expectError(error.OpenFailed, residentBytes("/nonexistent/cov-d/f.bin"));
+    var e = try TmpFile.init(0);
+    defer e.deinit();
+    try testing.expectEqual(@as(u64, 0), try residentBytes(e.path));
+}
