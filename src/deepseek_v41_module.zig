@@ -112,8 +112,6 @@ pub const RouteOverrides = struct {
     decode_index_topk: ?bool = null,
     decode_smallm: ?bool = null,
     decode_mxfp8_rows: ?bool = null,
-    /// C22 moeshared: the shared expert's middle compiled at decode rows.
-    decode_shared_mid: ?bool = null,
     /// K16: each chunk's layer input stream released at its chunk fence (`inputStreamEarlyRelease`).
     input_stream_early_release: ?bool = null,
     /// K16: each routed group's MoE inputs freed after its wide call (`prefillInputRelease`).
@@ -656,7 +654,6 @@ pub const Module = struct {
         if (ov.decode_index_topk) |v| tier.routes.rc_index_topk = v;
         if (ov.decode_smallm) |v| tier.routes.rc_smallm = v;
         if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
-        if (ov.decode_shared_mid) |v| tier.routes.shared_mid = v;
         tier.routes.input_stream_early_release = inputStreamEarlyRelease(ov);
         tier.routes.prefill_input_release = prefillInputRelease(ov);
         if (ov.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
@@ -698,7 +695,7 @@ pub const Module = struct {
             weights.drop("head.weight");
             log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B", .{self.model.droppedBytes()});
         }
-        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.prefill_hcpost or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax or tier.routes.shared_mid) try self.checkPrefillRoutes();
+        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.prefill_hcpost or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax) try self.checkPrefillRoutes();
         // ENGRAM=prefetch: the poster threads started and their gathers checked against a read past the cache.
         if (tier.routes.engram_posted and tier.layer_major and c.engram.n_layers > 0) {
             // The pass posts slot s + 1 once slot s's layer is taken: the slots run in layer order.
@@ -729,7 +726,6 @@ pub const Module = struct {
         self.installed.decode_index_topk = self.model.tier.routes.rc_index_topk;
         self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
         self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
-        self.installed.decode_shared_mid = self.model.tier.routes.shared_mid;
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
         self.installed.prefill_input_release = self.model.tier.routes.prefill_input_release;
         self.prefill_sub = prefillSub(ov, self.model.tier.layer_major);
@@ -745,7 +741,6 @@ pub const Module = struct {
         self.installed.dense_rc = self.model.tier.routes.dense_rc;
         if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
-        log.info("NATIVE decode dispatch fuse installed: shared middle {}", .{self.installed.decode_shared_mid});
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
         if (self.installed.head_mode == .mxfp8) log.info("NATIVE head mxfp8 apply: {s}", .{if (self.installed.head_mxfp8_rc) "rcproj (the verify rows and the draft block at <= 8 rows)" else "mlx quantized_matmul"});
         log.info("NATIVE prefill input streams: {s}", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
@@ -1079,11 +1074,6 @@ pub const Module = struct {
         var checks: [40]Tr.RouteCheck = undefined;
         var n = try Tr.prefillRoutesCheck(&self.g, c, &self.model.tier.routes, &self.model.kx, self.model.layers, scratch, &checks);
         n += try Tr.decodeRoutesCheck(&self.g, c, &self.model.kx, self.model.layers, scratch, checks[n..]);
-        // C22 moeshared: the compiled middle against the op chain, bit for bit.
-        if (self.model.tier.routes.shared_mid) {
-            checks[n] = .{ .name = "shared middle compiled", .ok = try Tr.sharedMidCheck(&self.g, c, &self.model.tier.routes, scratch) };
-            n += 1;
-        }
         // C29's Engram wkv (the model's route): its first slot against the stock qmm at 5 rows.
         if (self.model.engram_m1[0]) |*s| {
             const en = self.model.engram.?;
@@ -1724,8 +1714,6 @@ pub const Installed = struct {
     decode_index_topk: bool = false,
     decode_smallm: bool = false,
     decode_mxfp8_rows: bool = false,
-    /// C22 moeshared: the shared expert's middle compiled at decode rows (installed, past its self-check).
-    decode_shared_mid: bool = false,
     /// K16's input streams released at each chunk fence, as installed.
     input_stream_early_release: bool = false,
     /// K16's routed groups' MoE inputs freed after the wide call, as installed.

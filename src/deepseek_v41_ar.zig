@@ -1131,8 +1131,6 @@ const CellReceipt = struct {
     decode_index_topk: ?bool = null,
     decode_smallm: ?bool = null,
     decode_mxfp8_rows: ?bool = null,
-    /// C22 moeshared (installed): the shared expert's middle compiled at decode rows.
-    decode_shared_mid: ?bool = null,
     /// K16's input streams released at each chunk fence (installed).
     input_stream_early_release: ?bool = null,
     /// K16's routed groups' MoE inputs freed after the wide call (installed).
@@ -1619,7 +1617,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_index_topk = md.installed.decode_index_topk,
         .decode_smallm = md.installed.decode_smallm,
         .decode_mxfp8_rows = md.installed.decode_mxfp8_rows,
-        .decode_shared_mid = md.installed.decode_shared_mid,
         .input_stream_early_release = md.installed.input_stream_early_release,
         .prefill_input_release = md.installed.prefill_input_release,
         .prefill_sub = if (md.installed.prefill_sub == std.math.maxInt(u64)) null else md.installed.prefill_sub,
@@ -1732,7 +1729,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| ov.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);
     if (envStr("DSV41_CELL_DECODE_SMALLM")) |v| ov.decode_smallm = try cellBool("DSV41_CELL_DECODE_SMALLM", v);
     if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| ov.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
-    if (envStr("DSV41_CELL_DECODE_SHARED_MID")) |v| ov.decode_shared_mid = try cellBool("DSV41_CELL_DECODE_SHARED_MID", v);
     // The ring levers over the tier's (WINDOW_RING_MAX_VERIFY / _SLACK / _HEADROOM): the Module installs them and the
     // bill rows its rings at them (`module.ringGeometry`, which refuses a value outside the tested box by name).
     if (envStr("DSV41_CELL_WINDOW_RING_MAX_VERIFY")) |v| ov.window_ring_max_verify = std.fmt.parseInt(u32, v, 10) catch return error.CellWindowRing;
