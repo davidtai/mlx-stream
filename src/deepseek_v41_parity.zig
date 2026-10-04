@@ -1,14 +1,14 @@
 //! Word-for-word parity of the Zig trunk against our Python oracle's dump
-//! (reports R/exl3/runtime/dump_dsv41_layer_parity.py: stock eager path, MLX
+//! (the reference runtime's dump_dsv41_layer_parity.py: stock eager path, MLX
 //! CPU device, real layers, routed experts as a stand-in whose output is
 //! injected here). The comparator is host code; the runner builds MLX graphs,
-//! so its test runs only inside a guarded window (`_GPU_WINDOW_LOCKED=1`).
+//! so its test runs only on a GPU machine (on a GPU machine).
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const model = @import("deepseek_v41_host.zig").model;
 /// Bank shards open past the page cache (F_NOCACHE): a test's reads leave no credited cache behind
-/// for the next window (SERVED3 found 4.2 GB).
+/// for the next window (served run 3 found 4.2 GB).
 const bank_load: model.LoadOpts = .{ .nocache = true };
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
@@ -90,7 +90,7 @@ pub fn compareWords(dtype: v41.StDtype, a: []const u8, b: []const u8) !Diff {
     return d;
 }
 
-// ── the window runner (MLX: guarded window only) ──
+// ── the window runner (MLX: GPU only) ──
 
 pub fn mlxDtype(d: v41.StDtype) !mlx.mlx_dtype {
     return switch (d) {
@@ -1102,10 +1102,10 @@ test "dsv41 parity: the report is JSON naming the first differing stage" {
     try testing.expectEqual(@as(i64, 1), stages[1].object.get("first").?.integer);
 }
 
-// Guarded window only: DSV41_PARITY_DUMP=<dump.safetensors> DSV41_BANK=<bank> _GPU_WINDOW_LOCKED=1
+// GPU only: DSV41_PARITY_DUMP=<dump.safetensors> DSV41_BANK=<bank> _GPU_WINDOW_LOCKED=1
 // [DSV41_PARITY_DEVICE=gpu (the dump's device)] [DSV41_ENGRAM_TOKEN_MAP=<u32 map> (dumps made with --engram)]
 // [DSV41_PARITY_REPORT=<json>] [DSV41_PARITY_REPORT_ONLY=1]
-// Guarded window only: DSV41_PARITY_DIGESTS=<dump>.digests.json DSV41_BANK=<bank> _GPU_WINDOW_LOCKED=1
+// GPU only: DSV41_PARITY_DIGESTS=<dump>.digests.json DSV41_BANK=<bank> _GPU_WINDOW_LOCKED=1
 // [DSV41_PARITY_DEVICE=gpu] [DSV41_ENGRAM_TOKEN_MAP=<u32 map>] [DSV41_PARITY_REPORT=<json>] [DSV41_PARITY_REPORT_ONLY=1]
 test "dsv41 parity: the chained Zig trunk hashes every stage as the Python stock path does" {
     const digests = std.mem.span(std.c.getenv("DSV41_PARITY_DIGESTS") orelse return error.SkipZigTest);
@@ -1143,7 +1143,7 @@ test "dsv41 parity: the Zig trunk equals the Python stock path word for word" {
     try finish(&r, dump_path);
 }
 
-// Guarded window only: DSV41_PARITY2_DUMP=<dump_dsv41_parity_w2.py output> DSV41_BANK=<bank>
+// GPU only: DSV41_PARITY2_DUMP=<dump_dsv41_parity_w2.py output> DSV41_BANK=<bank>
 // DSV41_ENGRAM_TOKEN_MAP=<converter output, with its .json> _GPU_WINDOW_LOCKED=1
 // [DSV41_PARITY_DEVICE=gpu] [DSV41_PARITY_REPORT=<json>] [DSV41_PARITY_REPORT_ONLY=1]
 test "dsv41 parity: the tier routes, window ring, chunked passes and trims equal the Python run" {
@@ -1167,7 +1167,7 @@ test "dsv41 parity: the window-2 schedule metadata parses to passes and trims" {
     try testing.expectError(error.ScheduleSyntax, Schedule.parse(arena.allocator(), "1,1", "5:3"));
 }
 
-// Guarded window only: DSV41_BANK=<bank> _GPU_WINDOW_LOCKED=1. mlx-serve's own
+// GPU only: DSV41_BANK=<bank> _GPU_WINDOW_LOCKED=1. mlx-serve's own
 // loader maps all 49 shards lazily (no tensor data is read); every resident of
 // the resident spec must bind with the declared dtype and shape.
 test "dsv41 weights: every resident binds through model.loadWeights with its spec dtype and shape" {
@@ -1198,7 +1198,7 @@ test "dsv41 host: the host-only tests created no Metal device" {
     }
 }
 
-// Guarded window only (_GPU_WINDOW_LOCKED; MLX on the CPU stream): DSV41_BANK=<bank> DSV41_HEAD_FIXTURE_DUMP=<a parity dump with p*.final.h and
+// GPU only (_GPU_WINDOW_LOCKED; MLX on the CPU stream): DSV41_BANK=<bank> DSV41_HEAD_FIXTURE_DUMP=<a parity dump with p*.final.h and
 // p*.head.logits over the head's first `head_rows` rows>. HEAD_MODE mxfp8 is LOSSY: this reports, against the dump's
 // own logits (the f32 head of the stock levers), the max / rms error and the top-1 agreement of the bf16 head, (a) MLX's mxfp8 quantized matmul (today's path) and (b)
 // the RCPROJ route's numerics on the host (the dequantized codes, x cast to bf16, an f32 product, the bf16 output); the

@@ -1,5 +1,5 @@
 //! The event gate's tests (`sdk_ext.expert.event`), kept in the package's test root under their names (the 0b ones run
-//! inside a guarded window only: DSV41_PHASE0B_MLX=1; creating any MLX array creates the Metal device).
+//! on a GPU machine only: DSV41_PHASE0B_MLX=1; creating any MLX array creates the Metal device).
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -112,7 +112,7 @@ const Rig = struct {
     }
 };
 
-// DSV41_PHASE0B_MLX=1, inside a guarded window.
+// DSV41_PHASE0B_MLX=1, on a GPU machine.
 test "dsv41 event 0b: a host event holds a CPU-stream consumer until the pool publishes the bytes" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const stream = mlx.mlx_default_cpu_stream_new();

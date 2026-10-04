@@ -252,7 +252,7 @@ test "dsv41 policy: bounded parts cut at the last physical gap" {
     try testing.expectEqual(@as(usize, 0), boundedParts(&.{}, &.{}, 3, &ends).len);
 }
 
-/// One plan as R/exl3/runtime/dump_phase1_route_fixture.py records it from the
+/// One plan as the reference runtime's dump_phase1_route_fixture.py records it from the
 /// Python bank. loads: [expert, slot, persistent, physical skip];
 /// evictions: [slot, previous, next]; parts: decode miss parts by expert.
 pub const FixPlan = struct {
@@ -330,7 +330,7 @@ const Physical = struct {
     }
 };
 
-// DSV41_PHASE1_ROUTE_FIXTURE=<json from R/exl3/runtime/dump_phase1_route_fixture.py>
+// DSV41_PHASE1_ROUTE_FIXTURE=<json from the reference runtime's dump_phase1_route_fixture.py>
 test "dsv41 policy: the recorded trace plans exactly like the Python bank" {
     const path = std.mem.span(std.c.getenv("DSV41_PHASE1_ROUTE_FIXTURE") orelse return error.SkipZigTest);
     const a = testing.allocator;

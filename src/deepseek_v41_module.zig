@@ -168,7 +168,7 @@ pub const RouteOverrides = struct {
     /// resident LUT into the banked texts) committed before the host's routing barrier wait; the host then routes and
     /// builds only the miss parts. Needs ROUTED_BANKED. null: the default, off.
     devroute: ?bool = null,
-    /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
+    /// The phase change's transient release (served run 16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
     /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
     /// the grow below demand). null: the default, off.
@@ -407,7 +407,7 @@ pub const DecodeHost = struct {
 /// at most `phase_change_settle_ms`, then refused by name).
 /// - `interval`: this process's footprint down since the pre-release reading by the bytes the frees report (the
 ///   cache clear, the transient release), within `phase_change_tolerance_bytes`. Relative: the prompt's earlier
-///   releases still trailing in the ledger count toward it (pass3bj: 1.414 GB of them between the boundary's
+///   releases still trailing in the ledger count toward it (run 3bj: 1.414 GB of them between the boundary's
 ///   first reading and its frees, so one 5 ms poll satisfied it with 0.76 GB of the clear still landing).
 /// - `until_freed`: that, and the footprint at most the grow's bound, the decode phase's billed process bytes less the
 ///   grow's bytes (`untilFreedBound`): absolute, from the admission, so the grow lands within the decode bill whatever
@@ -425,7 +425,7 @@ pub fn phaseChangeSettle(ov: RouteOverrides) PhaseChangeSettle {
 /// the admission) less the bytes the grow allocates: the decode slot banks over the prompt's (`slot_decode` -
 /// `slot_prefill`), the transient scratch the release freed (the grow reallocates decode's window 0 of it), and each
 /// allocation's rounding (`grow_alloc_round_bytes`, one per array: `expert_bank.n_components` per grown layer and for
-/// window 0). pass3bd / pass3bj: the measured MLX active rise is the first two + 1.6-3.4 MB, under the rounding term's
+/// window 0). run 3bd / run 3bj: the measured MLX active rise is the first two + 1.6-3.4 MB, under the rounding term's
 /// 5.9-6.0 MB.
 pub fn untilFreedBound(billed_decode_process: u64, slot_prefill: u64, slot_decode: u64, transient_freed: u64, n_layers: u32) struct { bound: u64, grow: u64 } {
     const allocs: u64 = (@as(u64, n_layers) + @intFromBool(transient_freed > 0)) * expert_bank.n_components;
@@ -726,7 +726,7 @@ pub const Module = struct {
         // The banked route, when overridden: after the forms (it aliases their GEMVs' statics); the hook binds its waves.
         if (ov.routed_banked orelse false) try self.exl3.routeBanked(&self.g);
         // The admission at the admitted rows, BEFORE any slot bank or Module resident is allocated
-        // (pass3ah refused only after construction, at an 82.7 GiB footprint): the native bill at the
+        // (run 3ah refused only after construction, at an 82.7 GiB footprint): the native bill at the
         // box's wired bytes now (nothing of the Module wired yet); a plan that does not fit refuses here.
         {
             var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1005,7 +1005,7 @@ pub const Module = struct {
         } else log.info("NATIVE phase grow delay: off", .{});
         // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here, never
         // in a request, and with the DSpark strategy its 5-row draft block through every stage too (the first
-        // round no longer compiles its draft inside timed decode). pass3an2's widths (B above the start): width
+        // round no longer compiles its draft inside timed decode). run 3an2's widths (B above the start): width
         // 1 9.41 GB (the residents' first use: MLX active then equals the billed device terms, so resident,
         // not transient), widths 2-8 11-47 MB, widths 9-32 0.27-0.42 GB (a 9-32 token prompt or prompt tail):
         // cheap, so they stay. Each shape's MLX peak is kept for the bill (C4).
@@ -1087,7 +1087,7 @@ pub const Module = struct {
         };
         self.bill = b;
         // The footprint the module keeps: every command retired (their completion handlers hand the buffers
-        // they held to MLX's cache), then the cache cleared. SERVED9 (pass3an) read it with the fence's
+        // they held to MLX's cache), then the cache cleared. Served run 9 (run 3an) read it with the fence's
         // table still cached: the fence cleared before its reads retired, and the 2 GiB prefill cache held
         // the 1.32 GB table (+1.33 GB over v7's construction, 0.75 GB over the bill).
         _ = mlx.mlx_synchronize(self.g.s);
@@ -2091,7 +2091,7 @@ pub const construction_tolerance_bytes: u64 = 250_000_000;
 
 /// MLX's allocator and this process's footprint at a phase boundary: this process's own ledgers, which the
 /// boundary judges. The box's pages are not read here: host_statistics64 is rate-limited box-wide for
-/// non-platform binaries (2-10 fresh calls a second, then the last reading; pass3an2's phase change read one
+/// non-platform binaries (2-10 fresh calls a second, then the last reading; run 3an2's phase change read one
 /// value five times), so the harnesses read them fresh through vm_stat (`ar.boxMark`).
 pub const BoundaryMemory = struct {
     active: u64,
@@ -2139,7 +2139,7 @@ pub const PhaseChangeRecord = struct {
     refused: ?[]const u8 = null,
 };
 
-/// A harness's observer of the phase change (the window's box proofs), set before the first request; none on the served
+/// A harness's observer of the phase change (its memory proofs), set before the first request; none on the served
 /// path. `start`: after the first synchronize, before any free; `released`: after the release, the clear and the
 /// boundary check, before the grow allocates; `grown`: after the grow and the grown banks' check; `tail` (the tail release
 /// route only): at the prompt's last trunk chunk, synchronized, before its frees.
@@ -2308,7 +2308,7 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
         // envelope planner runs for its rows and its record.
         .envelope_record = config.expert_prefill_rows == null and config.expert_rows != null,
         // The banks grow at the phase change (two row counts); `phaseChange` proves the prompt's frees
-        // complete before the grow, so the growth never meets unreleased buffers (SERVED7).
+        // complete before the grow, so the growth never meets unreleased buffers (served run 7).
         .preallocate = false,
         .slot_memory = slot_memory,
         .draft_pruned_bytes = 0,
@@ -2377,8 +2377,8 @@ pub fn requestForward(comptime B: type, g: *B, model: *mdl.Model(B), st: *mdl.Mo
 /// The allocator cache the prefill holds, which the bill charges at exactly this limit: MLX trims its cache
 /// to the limit after every allocation (allocator.cpp malloc: release_cached_buffers(cache - max_pool_size_)),
 /// and a free that overshoots it lowers active by as much, so at every footprint peak the cache is at most
-/// the limit. The served tier holds 2 GiB, what pass3ak (v6c3) actually held at its prompt peak under 4 GiB:
-/// at 1 GiB (pass3am, v7) the prompt read the same 186.0 GB in the same 14.4 s of read-busy time while TTFT
+/// the limit. The served tier holds 2 GiB, what run 3ak (v6c3) actually held at its prompt peak under 4 GiB:
+/// at 1 GiB (run 3am, v7) the prompt read the same 186.0 GB in the same 14.4 s of read-busy time while TTFT
 /// rose 37.64 -> 39.14 s, the allocator churning in the prompt pass. The stock tier the envelope's own.
 pub fn prefillCacheLimit(t: settings.NumericTier) usize {
     return switch (t) {
@@ -3286,31 +3286,31 @@ test "dsv41 memory: the phase change's settle poll as a route (poll5): the same 
     }
 }
 
-test "dsv41 memory: until_freed settles on the admission's bound (pass3bj): a reading above it keeps polling, the settled arms pass at once" {
+test "dsv41 memory: until_freed settles on the admission's bound (run 3bj): a reading above it keeps polling, the settled arms pass at once" {
     // The resolver: until_freed by default (served and cell), interval on the setting (the control arm).
     try std.testing.expectEqual(PhaseChangeSettle.until_freed, phaseChangeSettle(.{}));
     try std.testing.expectEqual(PhaseChangeSettle.until_freed, (Installed{}).phase_change_settle);
     try std.testing.expectEqual(PhaseChangeSettle.interval, phaseChangeSettle(.{ .phase_change_settle = .interval }));
-    // The grow's bound from the bill (pass3bj's 134 / 164 rows): decode billed process 108,963,257,928 B, slot banks
+    // The grow's bound from the bill (run 3bj's 134 / 164 rows): decode billed process 108,963,257,928 B, slot banks
     // 74,567,270,400 -> 90,545,971,200 B, + 40 layers x 9 arrays x 16 KiB rounding: the grow 15,984,599,040 B (measured
     // MLX active rise 15,980,298,240).
     const billed: u64 = 108_963_257_928;
     const uf = untilFreedBound(billed, 74_567_270_400, 90_545_971_200, 0, 40);
     try std.testing.expectEqual(@as(u64, 15_978_700_800 + 360 * 16_384), uf.grow);
     try std.testing.expectEqual(@as(u64, 92_978_658_888), uf.bound);
-    // The release route (pass3bd release: 135 / 169 rows): the grow reallocates the freed scratch's window 0 too:
+    // The release route (run 3bd release: 135 / 169 rows): the grow reallocates the freed scratch's window 0 too:
     // 15,552,602,112 + 3,195,740,160 + 41 x 9 x 16 KiB = 18,754,387,968 (measured 18,750,701,568).
     const ur = untilFreedBound(109_069_782_600, 75_099_893_760, 90_652_495_872, 3_195_740_160, 40);
     try std.testing.expectEqual(@as(u64, 18_754_387_968), ur.grow);
     try std.testing.expectEqual(@as(u64, 109_069_782_600 - 18_754_387_968), ur.bound);
-    // Never under-stated: the bill's grow covers every measured rise (pass3bd control1 / release, pass3bj control1 / tight).
+    // Never under-stated: the bill's grow covers every measured rise (run 3bd control1 / release, run 3bj control1 / tight).
     for ([_][4]u64{
         .{ 75_099_893_760, 90_545_971_200, 0, 15_449_456_640 },
         .{ 75_099_893_760, 90_652_495_872, 3_195_740_160, 18_750_701_568 },
         .{ 74_567_270_400, 90_545_971_200, 0, 15_980_298_240 },
         .{ 78_295_633_920, 90_545_971_200, 0, 12_252_610_560 },
     }) |x| try std.testing.expect(untilFreedBound(billed, x[0], x[1], x[2], 40).grow >= x[3]);
-    // poll5 (pass3bj): the drop test alone passes its first reading (2.788 GB down: 1.414 GB of the prompt's trailing
+    // poll5 (run 3bj): the drop test alone passes its first reading (2.788 GB down: 1.414 GB of the prompt's trailing
     // releases + 1.374 of the 2.131 GB clear), above the bound by 1.585 GB; control1's settled reading 92,437,427,712
     // (+ the grow 15.985 <= 108.963) is under it by 0.541 GB.
     const before: BoundaryMemory = .{ .active = 91_390_748_592, .cache = 2_130_798_984, .footprint = 97_351_005_792 };
@@ -3400,7 +3400,7 @@ test "dsv41 memory: the tail release route: off by default; the grow's bound and
         try std.testing.expectEqual(@as(u32, 1), cnt.n);
         try std.testing.expect(lp.tail == null);
     }
-    // served19f (pass3bs control1, 134 / 168 rows, record 13,315,584 B): slot banks (40 x 134 + 240) -> (40 x 168 + 48)
+    // Served run 19f (run 3bs control1, 134 / 168 rows, record 13,315,584 B): slot banks (40 x 134 + 240) -> (40 x 168 + 48)
     // records, the transient 240 records; decode bill 108,991,190,704 B.
     const rec: u64 = 13_315_584;
     const sp = (40 * 134 + 240) * rec;
@@ -3510,7 +3510,7 @@ test "dsv41 memory: the host relief route calls malloc's relief once at the boun
     try std.testing.expectEqual(@as(u32, 1), n);
     // The real call is host-only libc (no device): it returns, whatever it reports.
     _ = boundaryRelief(true, LibcRelief{});
-    // The decode host side: footprint less active and cache (SERVED19 control1 112957's grown reading: 1.047 GB).
+    // The decode host side: footprint less active and cache (served run 19 control1 112957's grown reading: 1.047 GB).
     try std.testing.expectEqual(@as(u64, 1_046_698_048), hostSideOf(.{ .active = 107_371_043_568, .cache = 720, .footprint = 108_417_742_336 }));
     try std.testing.expectEqual(@as(u64, 0), hostSideOf(.{ .active = 2, .cache = 2, .footprint = 3 }));
 }

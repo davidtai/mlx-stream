@@ -324,7 +324,7 @@ test "dsv41 dspark: the lookup extends a full proposal from its earliest longest
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5 }, short.extend(&.{ 1, 2, 3, 4, 5 }, &buf));
 }
 
-// DSV41_LOOKUP_FIXTURE=<json from R/exl3/runtime/dump_dsv41_lookup_fixture.py>
+// DSV41_LOOKUP_FIXTURE=<json from the reference runtime's dump_dsv41_lookup_fixture.py>
 test "dsv41 dspark: the lookup replays the lane's LookupExtension call for call" {
     const path = std.mem.span(std.c.getenv("DSV41_LOOKUP_FIXTURE") orelse return error.SkipZigTest);
     const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(64 << 20));

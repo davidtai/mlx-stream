@@ -1907,7 +1907,7 @@ test "dsv41 dspark head: HEAD_MODE mxfp8 on RCPROJ runs the block's head pass on
     try testing.expectEqual(@as(usize, 3 + 3 + 1), g.launchesOf(l0, .q3rc_mxfp8_fma));
 }
 
-/// One recorded draft route stream (pass3bz's receipts, `draft_route_stream`): per cycle, per stage, the block's ids.
+/// One recorded draft route stream (run 3bz's receipts, `draft_route_stream`): per cycle, per stage, the block's ids.
 const RouteStream = struct { stages: u32, experts_per_stage: u32, cycles: []const []const []const u16 };
 
 /// Total draft misses of `stream` through a shared pool at `hot` under `policy`, from an empty cache (no seed).

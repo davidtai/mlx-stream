@@ -486,7 +486,7 @@ test "dsv41 slots: cross-layer PICK set" {
     if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try testing.expect(!metalDriverLoaded());
 }
 
-// Phase 0b, inside a guarded window (GPU lock held): DSV41_PHASE0B_MLX=1.
+// Phase 0b, on a GPU machine (GPU lock held): DSV41_PHASE0B_MLX=1.
 test "dsv41 slots 0b: an MLX LayerSlotBank on the CPU stream fills like the host rows" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     var env = try Env.open();
@@ -988,7 +988,7 @@ fn slotDigest(s: *Stream, layer: u32, slot: u32, geom: *const Layer) [32]u8 {
     return d;
 }
 
-// DSV41_BANK=<bank dir> DSV41_PHASE1_ROUTE_FIXTURE=<json from R/exl3/runtime/dump_phase1_route_fixture.py>
+// DSV41_BANK=<bank dir> DSV41_PHASE1_ROUTE_FIXTURE=<json from the reference runtime's dump_phase1_route_fixture.py>
 test "dsv41 stream: a recorded trace on the real bank serves every slot's bytes" {
     try realBankTrace(.host);
 }
@@ -1053,7 +1053,7 @@ fn realBankTrace(memory: SlotMemory) !void {
     try testing.expectEqual((st.expert_cache_misses - st.loads_skipped) * geom.logical_bytes, st.expert_bytes_read);
 }
 
-// Inside a guarded window: DSV41_PHASE0B_MLX=1 + the bank env above.
+// Inside a GPU run: DSV41_PHASE0B_MLX=1 + the bank env above.
 test "dsv41 stream 0b: the recorded trace on the real bank fills MLX slot banks" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const stream = mlx.mlx_default_gpu_stream_new();
@@ -1094,7 +1094,7 @@ fn expectShape(arr: mlx.mlx_array, dtype: mlx.mlx_dtype, want: []const c_int) !v
     try testing.expectEqualSlices(c_int, want, mlx.mlx_array_shape(arr)[0..want.len]);
 }
 
-// DSV41_PHASE0B_MLX=1, inside a guarded window.
+// DSV41_PHASE0B_MLX=1, on a GPU machine.
 test "dsv41 stream 0b: MLX slot memory is filled by the pool like host rows" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const stream = mlx.mlx_default_gpu_stream_new();
@@ -1347,9 +1347,9 @@ const ProbeBox = struct {
     }
 };
 
-// DSV41_PHASE0B_MLX=1, inside a guarded window: SERVED13's kill (12 GB outside the footprint late in decode; the grow's
+// DSV41_PHASE0B_MLX=1, on a GPU machine: served run 13's kill (12 GB outside the footprint late in decode; the grow's
 // wrapped rows its one new mechanism) at 2 GB: the box's pages around each step of the overlapped grow's mechanics,
-// the release included (SERVED14's probe: the release left 2.15 GB wired outside the footprint).
+// the release included (served run 14's probe: the release left 2.15 GB wired outside the footprint).
 test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pages, its first GPU read of every page and its release stay inside the footprint" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     _ = mlx.applyWiredPolicy();
@@ -1438,7 +1438,7 @@ test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pa
     if (!released) return error.GrowWrapReleaseOutsideFootprint;
 }
 
-// DSV41_PHASE0B_MLX=1 and DSV41_BANK=<bank dir>, inside a guarded window (SERVED16): the 240-row MLX scratch filled with
+// DSV41_PHASE0B_MLX=1 and DSV41_BANK=<bank dir>, on a GPU machine (served run 16): the 240-row MLX scratch filled with
 // records and read on the GPU, released (the allocator check) and cache-cleared back inside the footprint (the box
 // probe's after-release rule); then decode's window 0 serves a route's records.
 test "dsv41 stream 0b: the transient release frees the 240-row MLX scratch back inside the footprint, and window 0 serves decode" {
@@ -1536,7 +1536,7 @@ test "dsv41 stream 0b: the transient release frees the 240-row MLX scratch back 
     if (!released) return error.TransientReleaseOutsideFootprint;
 }
 
-// DSV41_PHASE0B_MLX=1, inside a guarded window: the GPU reads the slot arrays behind the event gate.
+// DSV41_PHASE0B_MLX=1, on a GPU machine: the GPU reads the slot arrays behind the event gate.
 test "dsv41 stream 0b: gated waves over the MLX slot arrays read the landed bytes on the GPU" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const expert_event = sdk_ext.expert.event;
@@ -2221,7 +2221,7 @@ fn replayLookahead(a: std.mem.Allocator, bank: *const expert_bank.Bank, f: anyty
     return s.stats();
 }
 
-// DSV41_BANK=<bank dir> DSV41_PHASE2_FIXTURE=<json from R/exl3/runtime/dump_phase2_lookahead_fixture.py>: SERVED16's decode
+// DSV41_BANK=<bank dir> DSV41_PHASE2_FIXTURE=<json from the reference runtime's dump_phase2_lookahead_fixture.py>: served run 16's decode
 // read regression against the release. The release frees only the transient scratch, so the decode routes and reads
 // must be the same with and without it: every route's plan and reads, and the read pool's lookahead and pre-read counts.
 test "dsv41 stream: the recorded lookahead trace on the real bank routes and reads the same with and without the transient release" {
@@ -2268,7 +2268,7 @@ test "dsv41 stream: the recorded lookahead trace on the real bank routes and rea
 /// The phase-2 fixture's calls for one layer as M = 1 routes, and the P1 scores of each row.
 const TraceCall = struct { ids: []const u16, pre: []const u16, sel: []const []const u16, cand: []const []const u16 };
 
-// DSV41_BANK=<bank dir> DSV41_PHASE2_FIXTURE=<json from R/exl3/runtime/dump_phase2_lookahead_fixture.py>
+// DSV41_BANK=<bank dir> DSV41_PHASE2_FIXTURE=<json from the reference runtime's dump_phase2_lookahead_fixture.py>
 test "dsv41 stream: a two-layer recorded trace with lookahead and gates on the real bank serves every slot's bytes" {
     const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const fixture = std.mem.span(std.c.getenv("DSV41_PHASE2_FIXTURE") orelse return error.SkipZigTest);

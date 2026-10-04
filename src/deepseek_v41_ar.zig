@@ -1,6 +1,6 @@
 //! The AR token-parity harness (track M, M3): the native model, its routed
 //! experts streamed from the bank, against the Python reference's greedy ids
-//! (R/exl3/runtime/dump_dsv41_ar_ref.py: the stock trunk + the EXL3 decode
+//! (the reference runtime's dump_dsv41_ar_ref.py: the stock trunk + the EXL3 decode
 //! lane). Both sides feed the prompt in forwards of <= 8 rows and decode one
 //! token per forward, so every routed call is a decode-lane call. Window only;
 //! the host dry path is the model test "the AR dry path ...".
@@ -265,7 +265,7 @@ fn servedSchedule() bool {
 pub const ArPhase = enum { late, early_grow, early_fence };
 pub const ArTier = enum { served, stock };
 
-/// The served schedule's variant (pass3ab): the prompt's first forward of `split` rows, then ONE extend of
+/// The served schedule's variant (run 3ab): the prompt's first forward of `split` rows, then ONE extend of
 /// the rest (none when `split` is the whole prompt: the served shell's shape since dsv41 prefills
 /// unchunked, one Module.prefill whose logits yield the first id); the phase change; the numeric tier.
 pub const ServedRun = struct { split: u32, phase: ArPhase, tier: ArTier };
@@ -728,7 +728,7 @@ test "dsv41 ar: profile read-outs (profile builds): the receipt keeps its fields
     try testing.expectEqualStrings(json0, try nbo.receipt(a, json0));
 }
 
-test "dsv41 ar: the served schedule's variants parse by name and plan their Module calls (pass3ab)" {
+test "dsv41 ar: the served schedule's variants parse by name and plan their Module calls (run 3ab)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1021,7 +1021,7 @@ const CellReceipt = struct {
     /// (MLX's default for the architecture: 50 on an M5 Max).
     mlx_max_ops_per_buffer: ?[]const u8 = null,
     /// The bill variant this process ran with (DSV41_BILL_VARIANT, read by the bill at construction): "conservative"
-    /// when unset, or "tight" (the memory lane's one live stream per routed group, with `main_taps_in_chunk_fence`).
+    /// when unset, or "tight" (the measured one live stream per routed group, with `main_taps_in_chunk_fence`).
     bill_variant: []const u8 = "conservative",
     /// The window's arm tag (DSV41_CELL_ARM: tight, fusedw, maxops40, mxfp8head), null for arm 1.
     cell_arm: ?[]const u8 = null,
@@ -1073,7 +1073,7 @@ const CellReceipt = struct {
     wide_depth: ?u8 = null,
     /// Decode's transient rows after the phase change (window 0 + `decode_staging_rows`; the bill's name).
     transient_decode_rows: ?u32 = null,
-    /// The phase change's transient release as installed (the route; on by default since SERVED19E).
+    /// The phase change's transient release as installed (the route; on by default since served run 19E).
     transient_release: ?bool = null,
     wide_cold_rows: ?u8 = null,
     /// P1's read-ahead as installed (its counts are the prompt stream's `ahead_*`).
@@ -1337,7 +1337,7 @@ test "dsv41 served cell: the host allocator is the server's init.gpa for the bui
 }
 
 /// The server's wired-residency policy at the server's point: the scheduler applies `mlx.applyWiredPolicy()` once the
-/// model is constructed, before its first forward ("[wired] mode=max limit=114688 MB" on this box). The cell (timed,
+/// model is constructed, before its first forward ("[wired] mode=max limit=114688 MB" on the test machine). The cell (timed,
 /// decode profile and prefill profile alike) applies it right after `Module.initWith`, before the "module constructed"
 /// record, so the window runs the Metal residency setup the server runs. Once per process, outside the timed spans.
 fn applyServerWiredPolicy() mlx.WiredPolicyResult {
@@ -2032,7 +2032,7 @@ pub fn checkPageCache(created: i64) error{ConstructionLeftPageCache}!void {
 
 /// One fresh reading of the box's physical pages beside this process's footprint, for the harnesses' box proofs.
 /// Read through a vm_stat child: XNU rate-limits host_statistics64 for non-platform binaries (2-10 fresh calls
-/// per second box-wide, then the last reading: pass3an2's phase change read one value five times while the
+/// per second box-wide, then the last reading: run 3an2's phase change read one value five times while the
 /// footprint grew 13.66 GB); vm_stat, a platform binary, is exempt. `sdk.memory.vmBytes` stays for coarse
 /// once-per-phase marks.
 pub const BoxMark = struct {
@@ -2043,9 +2043,9 @@ pub const BoxMark = struct {
 
 /// A mark's two footprint reads, on either side of its vm_stat child, agree within this, so its pair is one
 /// moment's. The process frees late after the prompt (MLX releases a command buffer's temporaries when the GPU
-/// completes it; P1's read-ahead drains its posts): SERVED11's and SERVED12's before marks read the footprint,
+/// completes it; P1's read-ahead drains its posts): served run 11's and served run 12's before marks read the footprint,
 /// then vm_stat after 0.74 / 0.77 GB of those frees had landed, and the proof counted them as physical growth
-/// beyond the footprint's (0.45 / 0.73 GB; SERVED12 refused).
+/// beyond the footprint's (0.45 / 0.73 GB; served run 12 refused).
 pub const box_mark_stable_bytes: u64 = 64 << 20;
 /// A mark is retried `box_mark_retry_ms` apart, at most `box_mark_attempts` times, then refused by name.
 pub const box_mark_attempts: u32 = 20;
@@ -2107,7 +2107,7 @@ pub fn vmStatPhysical(out: []const u8) !u64 {
 }
 
 /// At the phase change, judged at the grow on fresh readings: the box's physical pages rose by no more than this
-/// process's footprint did, from before the phase change to after its grow (+ `box_tolerance_bytes`). SERVED7's
+/// process's footprint did, from before the phase change to after its grow (+ `box_tolerance_bytes`). Served run 7's
 /// double residency fails it (the freed pages still counted while the grow added its own, and page cache aged
 /// in). The free alone proves nothing on a full box: the kernel keeps a small release's pages counted until
 /// there is pressure for them, and a grow that reuses them adds nothing, which is the property.
@@ -2117,25 +2117,25 @@ pub fn checkGrowResidency(before: BoxMark, grown: BoxMark) error{PhaseChangeNotR
     if (physical_growth > footprint_growth + @as(i64, @intCast(box_tolerance_bytes))) return error.PhaseChangeNotReclaimed;
 }
 
-/// The phase change's release (SERVED16): the box's pages outside this footprint rose by no more than
+/// The phase change's release (served run 16): the box's pages outside this footprint rose by no more than
 /// `box_tolerance_bytes` from the phase change's start to after the transient release, the clear and the boundary check.
-/// The released scratch left the box, and no page stayed wired outside every footprint (SERVED13's no-copy class).
+/// The released scratch left the box, and no page stayed wired outside every footprint (served run 13's no-copy class).
 pub fn checkReleaseResidency(start: BoxMark, released: BoxMark) error{TransientReleaseNotReclaimed}!void {
     const outside_start = @as(i64, @intCast(start.physical)) - @as(i64, @intCast(start.footprint));
     const outside_released = @as(i64, @intCast(released.physical)) - @as(i64, @intCast(released.footprint));
     if (outside_released - outside_start > @as(i64, @intCast(box_tolerance_bytes))) return error.TransientReleaseNotReclaimed;
 }
 
-/// The release proof's released mark waits for the box (SERVED17, pass3ay). With the transient release off the Module's
+/// The release proof's released mark waits for the box (served run 17, run 3ay). With the transient release off the Module's
 /// settle had none of its own bytes to wait for (settle_ms 0), and the released mark read the box mid-reclaim of the
 /// cache clear: the footprint down 1.406 GB from the start mark, the box's pages down 0.858 GB, outside +547.8 MB; by the
-/// grown mark the box had caught up (start + 10 MB). SERVED16 (release on: a 250 ms settle for the scratch) read -6.4 MB,
+/// grown mark the box had caught up (start + 10 MB). Served run 16 (release on: a 250 ms settle for the scratch) read -6.4 MB,
 /// and the box probe's control arm (an allocator-owned buffer and a cache clear) needed 301 ms, then read clean.
 /// - The release route off: nothing is released, so the release proof is NA by construction (the record names it, with
 ///   the cache clear's bytes); the released mark is the grow proof's before mark, taken once.
 /// - The route on: the released mark is retaken every `release_settle_poll_ms` until the outside rise from the start mark
 ///   is within `box_tolerance_bytes`, at most `release_settle_bound_ms`, with no allocation in between. A lag settles; a
-///   reclaim that needs new demand (SERVED13's no-copy class: the pages stay wired until an allocation reclaims them)
+///   reclaim that needs new demand (served run 13's no-copy class: the pages stay wired until an allocation reclaims them)
 ///   does not, and the release proof refuses it by name (TransientReleaseNotReclaimed).
 pub const release_settle_bound_ms: u32 = 2000;
 pub const release_settle_poll_ms: u32 = 50;
@@ -2318,7 +2318,7 @@ fn printBoxGrow(a: std.mem.Allocator, before: BoxMark, grown: BoxMark) void {
     std.debug.print("NATIVE DSV41_BOX_GROW {s}\n", .{json});
 }
 
-/// The harnesses' outside-the-footprint sentinel (the window's, never the served path's). SERVED13 (pass3au): about
+/// The harnesses' outside-the-footprint sentinel (a test harness's, never the served path's). Served run 13 (run 3au): about
 /// 12 GB appeared outside this process's footprint within 13 s of decode, and the guard killed the window 4.5 GB short
 /// of physical RAM, before any record. A thread beside the run reads the box's pages through a fresh vm_stat child
 /// every `sentinel_period_ms`, this process's footprint read on either side of it. The first reading whose pages
@@ -2610,14 +2610,14 @@ test "dsv41 memory: the harness's window proofs: page cache left by the load, th
     try testing.expectError(error.ConstructionLeftPageCache, checkPageCache(19_950_000_000 - 4_870_000_000));
     try checkPageCache(200_000_000);
     try checkPageCache(-300_000_000);
-    // A phase change on a full box (pass3an2's served schedule: the 0.72 GB freed stays counted, the grow reuses
+    // A phase change on a full box (run 3an2's served schedule: the 0.72 GB freed stays counted, the grow reuses
     // it): physical +1.0 GB while the footprint grew 13.66 GB: passes.
     const before: BoxMark = .{ .physical = 106_164_191_232, .footprint = 92_046_774_184 };
     try checkGrowResidency(before, .{ .physical = before.physical + 1_000_000_000, .footprint = 105_708_343_184 });
     // On a box with room: physical follows the footprint: passes.
     const grown: BoxMark = .{ .physical = before.physical + 13_661_569_000, .footprint = 105_708_343_184 };
     try checkGrowResidency(before, grown);
-    // SERVED7's shape: the grow's pages on top of freed pages still counted and page cache aged in, physical
+    // Served run 7's shape: the grow's pages on top of freed pages still counted and page cache aged in, physical
     // +7.7 GB beyond the footprint's growth: refused.
     try testing.expectError(error.PhaseChangeNotReclaimed, checkGrowResidency(before, .{ .physical = grown.physical + 7_700_000_000, .footprint = grown.footprint }));
     // Other processes' movement within the tolerance passes; beyond it, refused.
@@ -2645,14 +2645,14 @@ const ReplayBox = struct {
     fn sleep(_: *ReplayBox, _: u32) void {}
 };
 
-// SERVED11 (pass3ar, served-cell-typical-fastest-20260930-124252) and SERVED12 (pass3at, -134710) as recorded. The
+// Served run 11 (run 3ar, served-cell-typical-fastest-20260930-124252) and served run 12 (run 3at, -134710) as recorded. The
 // before mark paired the footprint read at the prompt record with a vm_stat taken after the process's late frees:
 // the phase change's first reading, moments later, sat 0.74 / 0.77 GB lower. The grown marks sit at the box's
-// outside-the-footprint of the other marks (11.38 / 12.57 GB). On that pairing SERVED12 was refused (0.728 GB of
-// physical growth beyond the footprint's) and SERVED11 passed by 45 MB. The stable mark rereads the footprint after
+// outside-the-footprint of the other marks (11.38 / 12.57 GB). On that pairing served run 12 was refused (0.728 GB of
+// physical growth beyond the footprint's) and served run 11 passed by 45 MB. The stable mark rereads the footprint after
 // vm_stat, retries, and pairs vm_stat with the settled footprint (the retry's vm_stat replays the recorded one: the
 // frees had landed before it). Both then pass, their physical growth 0.28 / 0.04 GB under the footprint's.
-test "dsv41 memory: the box proof's before mark is one moment's (SERVED11 and SERVED12 replayed)" {
+test "dsv41 memory: the box proof's before mark is one moment's (served run 11 and served run 12 replayed)" {
     const W = struct { before: BoxMark, settled: u64, grown: BoxMark, old_excess: i64 };
     const windows = [_]W{
         .{ .before = .{ .physical = 108_606_652_416, .footprint = 97_684_961_536 }, .settled = 96_946_780_416, .grown = .{ .physical = 119_697_031_168, .footprint = 108_320_536_832 }, .old_excess = 454_803_456 },
@@ -2664,7 +2664,7 @@ test "dsv41 memory: the box proof's before mark is one moment's (SERVED11 and SE
         }
     }.f;
     for (windows, 0..) |w, i| {
-        // The recorded pairing: SERVED11 passes by 45 MB, SERVED12 is refused.
+        // The recorded pairing: served run 11 passes by 45 MB, served run 12 is refused.
         try testing.expectEqual(w.old_excess, excess(w.before, w.grown));
         if (i == 0) try checkGrowResidency(w.before, w.grown) else try testing.expectError(error.PhaseChangeNotReclaimed, checkGrowResidency(w.before, w.grown));
         // The stable mark: the first attempt's reads disagree by the late frees, the retry's agree.
@@ -2698,12 +2698,12 @@ test "dsv41 memory: the box proof's before mark is one moment's (SERVED11 and SE
     try testing.expectEqual(box_mark_attempts, moving.n_physical);
 }
 
-// The sentinel on recorded marks. SERVED13 (pass3au): the construction record's pages, then the guard's last two
+// The sentinel on recorded marks. Served run 13 (run 3au): the construction record's pages, then the guard's last two
 // samples (0.1 GiB resolution). At 21:07:14 decode ran at its bill with the box's usual pages outside the footprint;
-// by 21:07:27 physical was 12.2 GB higher with the footprint at its last sample: that trips. SERVED12b (pass3at2),
-// construction to the decode record: quiet. SERVED12b's skewed before mark (the footprint read at the prompt record,
+// by 21:07:27 physical was 12.2 GB higher with the footprint at its last sample: that trips. Served run 12b (run 3at2),
+// construction to the decode record: quiet. Served run 12b's skewed before mark (the footprint read at the prompt record,
 // vm_stat after 1.35 GB of late frees): the larger footprint read keeps the frees from counting as outside.
-test "dsv41 memory: the sentinel trips on SERVED13's recorded marks, not on SERVED12b's" {
+test "dsv41 memory: the sentinel trips on served run 13's recorded marks, not on served run 12b's" {
     const gib: u64 = 1 << 30;
     const at = struct {
         fn f(physical: u64, footprint: u64) SentinelReading {
@@ -2765,21 +2765,21 @@ test "dsv41 memory: the sentinel reads vm_stat through posix_spawn, starts and s
     sleepMs(2 * sentinel_period_ms + 150);
     const sum = s.stop(testing.allocator);
     try testing.expect(sum.ticks >= 1 and sum.errors == 0);
-    // The peak line names the peak's own tick (SERVED14's printed the final count).
+    // The peak line names the peak's own tick (served run 14's printed the final count).
     try testing.expect(sum.peak_tick >= 1 and sum.peak_tick <= sum.ticks);
     try testing.expect(sum.peak_rise <= @as(i64, @intCast(sentinel_rise_bytes)));
 }
 
-// The phase change's two proofs from the Module's observer marks (SERVED16): the release (start -> released) left the
+// The phase change's two proofs from the Module's observer marks (served run 16): the release (start -> released) left the
 // box as it left the footprint, and the grow (released -> grown) added no pages beyond its own footprint growth.
 test "dsv41 memory: the release proof and the grow proof from the observer's marks" {
-    // SERVED15's cell before its phase change; the release takes the 240-row scratch (3,195,740,160 B) and the prompt's
+    // Served run 15's cell before its phase change; the release takes the 240-row scratch (3,195,740,160 B) and the prompt's
     // cache (0.47 GB) off the footprint, and the box follows.
     const start: BoxMark = .{ .physical = 108_531_089_408, .footprint = 95_381_370_800 };
     const freed: u64 = 3_195_740_160 + 472_942_002;
     const released: BoxMark = .{ .physical = start.physical - freed, .footprint = start.footprint - freed };
     try checkReleaseResidency(start, released);
-    // SERVED13's class: the footprint fell, the box did not (the pages stayed wired outside every footprint).
+    // Served run 13's class: the footprint fell, the box did not (the pages stayed wired outside every footprint).
     try testing.expectError(error.TransientReleaseNotReclaimed, checkReleaseResidency(start, .{ .physical = start.physical, .footprint = released.footprint }));
     // The tolerance holds, one byte more is refused.
     try checkReleaseResidency(start, .{ .physical = released.physical + box_tolerance_bytes, .footprint = released.footprint });
@@ -2830,9 +2830,9 @@ const SettleReplay = struct {
     }
 };
 
-// SERVED17 (pass3ay): the release proof waits for the box on the release route, and is NA off it. Recorded marks:
-// SERVED17's (the release off; the cache clear's 2,108,224,908 B; the first released mark +547.8 MB outside, the box
-// caught up by the grown mark) and SERVED16's (the release on; -6.4 MB at once).
+// Served run 17 (run 3ay): the release proof waits for the box on the release route, and is NA off it. Recorded marks:
+// Served run 17's (the release off; the cache clear's 2,108,224,908 B; the first released mark +547.8 MB outside, the box
+// caught up by the grown mark) and served run 16's (the release on; -6.4 MB at once).
 test "dsv41 memory: the released mark settles a lag, refuses a reclaim that needs demand, and is NA with the route off" {
     const s17_start: BoxMark = .{ .physical = 108_457_197_568, .footprint = 94_360_761_496 };
     const s17_first: BoxMark = .{ .physical = 107_599_052_800, .footprint = 92_954_784_920 };
@@ -2850,7 +2850,7 @@ test "dsv41 memory: the released mark settles a lag, refuses a reclaim that need
     try testing.expectEqual(@as(u32, 2), r1.polls);
     try testing.expectEqual(@as(u32, release_settle_poll_ms), r1.waited_ms);
     try checkReleaseResidency(s17_start, r1.mark);
-    // 2. SERVED13's class: the footprint fell 2.15 GB, the box did not, and nothing reclaims it without demand: polled to
+    // 2. Served run 13's class: the footprint fell 2.15 GB, the box did not, and nothing reclaims it without demand: polled to
     //    the bound, then refused by name.
     const s16_start: BoxMark = .{ .physical = 108_970_672_128, .footprint = 94_914_459_064 };
     const stuck: BoxMark = .{ .physical = s16_start.physical, .footprint = s16_start.footprint - 2_150_000_000 };
@@ -2859,7 +2859,7 @@ test "dsv41 memory: the released mark settles a lag, refuses a reclaim that need
     try testing.expect(r2.waited_ms >= release_settle_bound_ms);
     try testing.expectEqual(@as(u32, 1 + release_settle_bound_ms / release_settle_poll_ms), r2.polls);
     try testing.expectError(error.TransientReleaseNotReclaimed, checkReleaseResidency(s16_start, r2.mark));
-    // 3. SERVED16's clean release: no retake, no wait.
+    // 3. Served run 16's clean release: no retake, no wait.
     const s16_released: BoxMark = .{ .physical = 102_238_257_152, .footprint = 88_188_480_744 };
     var clean: SettleReplay = .{ .seq = &.{s16_start} };
     const r3 = try settleRelease(&clean, s16_start, s16_released);
@@ -2870,7 +2870,7 @@ test "dsv41 memory: the released mark settles a lag, refuses a reclaim that need
     // 4. A retake that cannot be taken fails by its own name.
     var unstable: SettleReplay = .{ .seq = &.{settled}, .fail_at = 0 };
     try testing.expectError(error.BoxMarkUnstable, settleRelease(&unstable, s17_start, s17_first));
-    // 5. The release route off (SERVED17's arm 1): the release proof is NA (the record names it, with the cache clear's
+    // 5. The release route off (served run 17's arm 1): the release proof is NA (the record names it, with the cache clear's
     //    bytes, and no rise), and the grow proof still runs from the released mark.
     var off: PhaseMarks = .{ .a = testing.allocator, .io = testing.io, .release_route = false };
     off.marks = .{ s17_start, s17_first, s17_grown, null };
@@ -2882,7 +2882,7 @@ test "dsv41 memory: the released mark settles a lag, refuses a reclaim that need
     try testing.expectEqual(@as(?i64, -537_395_200), rec_off.grow_outside_rise);
     off.marks[2] = .{ .physical = s17_grown.physical + box_tolerance_bytes + 600_000_000, .footprint = s17_grown.footprint };
     try testing.expectError(error.PhaseChangeNotReclaimed, off.judge());
-    // The route on, SERVED17's first mark unsettled: judged and refused; the record says FAIL with its rise.
+    // The route on, served run 17's first mark unsettled: judged and refused; the record says FAIL with its rise.
     var on: PhaseMarks = .{ .a = testing.allocator, .io = testing.io, .release_route = true };
     on.marks = .{ s17_start, s17_first, s17_grown, null };
     try testing.expectError(error.TransientReleaseNotReclaimed, on.judge());
@@ -2901,7 +2901,7 @@ test "dsv41 memory: the released mark settles a lag, refuses a reclaim that need
 }
 
 test "dsv41 memory: the tail release route's release proof starts from the tail mark (a scratch left wired outside the footprint before the phase change still fails)" {
-    // The scratch freed at the tail; 3 GB of it stays wired outside the footprint (SERVED13's class) by the phase change's start.
+    // The scratch freed at the tail; 3 GB of it stays wired outside the footprint (served run 13's class) by the phase change's start.
     const tail: BoxMark = .{ .physical = 110_000_000_000, .footprint = 98_000_000_000 };
     const start: BoxMark = .{ .physical = 106_000_000_000, .footprint = 91_000_000_000 };
     const released: BoxMark = .{ .physical = 104_000_000_000, .footprint = 89_000_000_000 };
@@ -2946,7 +2946,7 @@ test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
     try testing.expect(m.physical > 0 and m.physical <= sdk.memory.totalMemBytes());
 }
 
-// DSV41_BANK=<bank> (host): the harness's rows reach the Module's admission at the window's inputs (pass3an3's:
+// DSV41_BANK=<bank> (host): the harness's rows reach the Module's admission at the test inputs (run 3an3's:
 // 9.73 GB baseline, box 120.259 GB). Upstream's default wired margin (8 GiB) refuses the harness's forced rows
 // before construction; the window's stop, which the harness sets, admits them.
 test "dsv41 memory: the harness's filled rows pass the Module's admission under the window's stop (bank)" {
@@ -3268,7 +3268,7 @@ const PrefillProbe = struct {
     /// `layers_done` (out.h puts: one per layer and chunk) and the chunk when the largest one fell.
     peak_done: u64 = 0,
     peak_chunk: usize = 0,
-    /// (SERVED19) The grouped mode (DSV41_CELL_GROUP_PROFILE=1): the routed group's final evaluation measured whole, as
+    /// (served run 19) The grouped mode (DSV41_CELL_GROUP_PROFILE=1): the routed group's final evaluation measured whole, as
     /// the timed pass runs it. The per-chunk moe.y / out.h points and the merge's own stage are not evaluated (out.h keeps
     /// its row bookkeeping; the layer count moves at group.eval), so "group.eval" is the merge, the combines, the HC
     /// posts and the new streams at once.
@@ -3561,7 +3561,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
         const chunks = @max(@as(u64, 1), probe.layers_done / @max(@as(u64, 1), probe.n_layers));
         std.debug.print("PREFILL_PROFILE_PEAK_MAX {{\"stage\": \"{s}\", \"above_start_gb\": {d:.3}, \"start_active_gb\": {d:.3}, \"layer\": {d}, \"chunk\": {d}}}\n", .{ if (probe.n > 0) probe.names[probe.peak_stage] else "none", gb(probe.peak_max -| start_active), gb(start_active), probe.peak_done / chunks, probe.peak_chunk });
     }
-    // (SERVED19) Per routed group: MLX's active mark right before its final evaluation and that evaluation's peak (above the
+    // (served run 19) Per routed group: MLX's active mark right before its final evaluation and that evaluation's peak (above the
     // pass's start), with the geometry it reads and writes (the combine gathers nothing; at the evaluation's start every
     // chunk's halves are held by the group's HC posts).
     {
@@ -3708,7 +3708,7 @@ test "dsv41 served cell: the embedding rows' aligned parallel gather equals the 
 // The served cell's preconditions on the real inputs (host; bank mode): DSV41_BANK and
 // DSV41_CELL_PROMPT_IDS as the window passes them. The prompt entry, its length and digest, the
 // config's paths and EOS ids; the receipt serialises.
-test "dsv41 served cell: the window's inputs pass on the host (the standard prompt, the bank's shell config)" {
+test "dsv41 served cell: the test inputs pass on the host (the standard prompt, the bank's shell config)" {
     const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

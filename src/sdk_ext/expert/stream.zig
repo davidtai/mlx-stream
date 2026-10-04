@@ -471,10 +471,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         pub const route_capacity = max_wide_depth + 1;
         /// Prefill routes one layer may hold live at once (`Options.wide_depth`; P1c: 5, the served default).
         pub const max_wide_depth = 5;
-        /// SERVED16: the phase change frees the transient scratch (`Stream.releaseTransient`) and the grow allocates decode's
+        /// Served run 16: the phase change frees the transient scratch (`Stream.releaseTransient`) and the grow allocates decode's
         /// window 0 plus `decode_staging_rows`; the bill (deepseek_v41_bill.zig) reads this declaration.
         pub const phase_change_releases_wide_windows = true;
-        /// The release as a construction-time route (on by default since SERVED19E; off: the control arm).
+        /// The release as a construction-time route (on by default since served run 19E; off: the control arm).
         pub const transient_release_default = true;
         /// Slot rows decode reserves beside window 0 for staged reads: none (the lookahead and A1 stage in the read pool).
         pub const decode_staging_rows: u32 = 0;

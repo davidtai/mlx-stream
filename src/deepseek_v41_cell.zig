@@ -351,7 +351,7 @@ test "dsv41 cell: a stand-in cell on a synthetic model writes the tier's receipt
     try testing.expectError(error.ReceiptExists, publish(a, io, &receipt, c.receipt_path, &sink.writer));
 }
 
-// DSV41_REPORT_PAIRS=<R/exl3/runtime/report_pairs.py> [DSV41_PY=<python>]: the reader runs on the CPU
+// DSV41_REPORT_PAIRS=<the reference runtime's report_pairs.py> [DSV41_PY=<python>]: the reader runs on the CPU
 // (MLX_DEFAULT_DEVICE=cpu; it imports no MLX).
 test "dsv41 cell: report_pairs reads a stand-in cell's receipt and log as the tier's" {
     const rp = std.mem.span(std.c.getenv("DSV41_REPORT_PAIRS") orelse return error.SkipZigTest);
@@ -424,7 +424,7 @@ test "dsv41 cell: report_pairs reads a stand-in cell's receipt and log as the ti
     });
 }
 
-// Guarded window only (allocates the slot banks at the admitted rows): _GPU_WINDOW_LOCKED=1
+// GPU only (allocates the slot banks at the admitted rows): _GPU_WINDOW_LOCKED=1
 // DSV41_CELL_MODEL=<model dir> DSV41_CELL_OUT=<receipt path; must not exist> MTPLX_DSV41_BOX_BASELINE_GB=<the
 // guard's baseline> [DSV41_CELL_ROWS=<forced decode rows>] [DSV41_CELL_CYCLES=32] [DSV41_CELL_PROMPT_TOKENS=64]
 test "dsv41 cell: the stand-in cell on the bank at the admitted rows (the arm's GPU gate)" {

@@ -181,7 +181,7 @@ pub const Routes = struct {
     shared_mid: bool = false,
     /// C22 DISPATCH_FUSE's memos at decode rows (<= rc_max_rows): the RoPE tables per family, the K30 decode path's
     /// window selection and shared selected compressed rows, and `gatherRows`' flat rows at b == 1. Exact either way;
-    /// off by default (SERVED16's decode regression is unattributed: one-factor arm, DSV41_CELL_DECODE_MEMOS=1). The
+    /// off by default (served run 16's decode regression is unattributed: one-factor arm, DSV41_CELL_DECODE_MEMOS=1). The
     /// RoPE tables' memo at prompt widths is C22's prompt member and stays on.
     decode_memos: bool = false,
     /// K16: each chunk's layer input stream released at its chunk fence (nothing reads it after: the Half carries the
@@ -2676,7 +2676,7 @@ fn noneOf(g: *const TraceOps, from: usize, op: ops.Op) bool {
     return true;
 }
 
-// Inside a guarded window (DSV41_PHASE0B_MLX=1: any MLX array creates the Metal device), seconds: P1's predictor
+// Inside a GPU run (DSV41_PHASE0B_MLX=1: any MLX array creates the Metal device), seconds: P1's predictor
 // selection on the GPU stream against the router's own (`gatePrefix` + `gateSelect`) over the same rows and gate.
 test "dsv41 smoke 0b: the prefill shared expert's three mxfp8 qmm at the K16 chunk shapes, against a bf16 matmul ceiling (MLX, GPU stream)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;

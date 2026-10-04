@@ -1,4 +1,4 @@
-//! The bill against the served cells' own receipts (reports mlx-serve-phase2/served-cell-*.json, 10-02..10-04, one per
+//! The bill against the served cells' own receipts (the served runs' receipts, 10-02..10-04, one per
 //! route class and baseline): each receipt's phase records carry the terms the bill billed. Rebuilt from those terms,
 //! the bill gives every phase's terms, wiring tables and residuals back to the byte, and the fill gives the rows each
 //! cell's start rule took (`.forced.json`'s `bill_fill`).

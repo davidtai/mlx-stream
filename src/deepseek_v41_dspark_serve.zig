@@ -106,7 +106,7 @@ pub fn Resources(comptime G: type) type {
 /// the table's bytes (refused otherwise), and the table leaves the cache too:
 /// the commands that read it retire before the clear (their completion
 /// handlers release its buffer into MLX's cache; cleared ahead of them, the
-/// table stays cached whenever the cache limit holds it, as SERVED9's 2 GiB
+/// table stays cached whenever the cache limit holds it, as served run 9's 2 GiB
 /// prefill cache held the 1.32 GB table while active dropped).
 pub fn embeddingFence(comptime G: type, g: *G, model: *mdl.Model(G), rows: *ngram.NgramTable, owner: anytype) !void {
     const before = activeBytes(G, g);
