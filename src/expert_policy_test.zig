@@ -665,10 +665,6 @@ test "dsv41 policy: every allocation failure of the residency policy's construct
     try std.testing.checkAllAllocationFailures(testing.allocator, policyInitDeinit, .{ 16, 4 });
 }
 
-test "dsv41 policy: KNOWN BUG: an allocation failure in the LRU planner's construction leaks its earlier arrays" {
-    if (std.c.getenv("DSV41_COV_KNOWN_BUGS") == null) {
-        std.debug.print("KNOWN BUG (skipped; DSV41_COV_KNOWN_BUGS=1 runs it): LruPolicy.init allocates three arrays in one struct literal with no errdefer\n", .{});
-        return error.SkipZigTest;
-    }
+test "dsv41 policy: every allocation failure of the LRU planner's construction unwinds without a leak" {
     try std.testing.checkAllAllocationFailures(testing.allocator, lruInitDeinit, .{ 16, 4 });
 }

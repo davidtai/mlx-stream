@@ -370,11 +370,7 @@ fn tmpRewrite(fx: *Fixture) !void {
     }
 }
 
-test "dsv41 slot cache: KNOWN BUG: an allocation failure in a planner surfaces from the cache's construction as CacheGeometry" {
-    if (std.c.getenv("DSV41_COV_KNOWN_BUGS") == null) {
-        std.debug.print("KNOWN BUG (skipped; DSV41_COV_KNOWN_BUGS=1 runs it): Cache.init reports a planner's OutOfMemory as CacheGeometry\n", .{});
-        return error.SkipZigTest;
-    }
+test "dsv41 slot cache: every allocation failure of the cache's construction unwinds as OutOfMemory (both planners)" {
     try std.testing.checkAllAllocationFailures(testing.allocator, cacheInitDeinit, .{.shipped});
     try std.testing.checkAllAllocationFailures(testing.allocator, cacheInitDeinit, .{.lru});
 }

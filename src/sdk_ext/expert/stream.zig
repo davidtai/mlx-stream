@@ -708,22 +708,22 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer a.free(layer_misses);
                 @memset(layer_misses, 0);
                 var dpool: ?DPool = null;
+                errdefer if (dpool) |*d| dpoolFree(a, d);
                 if (opt.decode_pool) |dp| {
                     const nl = n_layers;
                     const per = dp.per_layer;
-                    dpool = .{
-                        .cfg = dp,
-                        .table = try a.alloc(u32, nl * 2 * per),
-                        .base = try a.alloc(u64, nl),
-                        .first = try a.alloc(u64, nl),
-                        .rows = try a.alloc(u32, nl),
-                        .floor = try a.alloc(u32, nl),
-                        .cands = try a.alloc(PoolCand, nl * 2 * per),
-                    };
-                    @memset(dpool.?.first, 0);
-                    try dpool.?.free.ensureTotalCapacity(a, nl * per);
+                    // Empty first, then each array: a failed allocation frees exactly the ones before it.
+                    dpool = .{ .cfg = dp, .table = &.{}, .base = &.{}, .first = &.{}, .rows = &.{}, .floor = &.{}, .cands = &.{} };
+                    const d = &dpool.?;
+                    d.table = try a.alloc(u32, nl * 2 * per);
+                    d.base = try a.alloc(u64, nl);
+                    d.first = try a.alloc(u64, nl);
+                    d.rows = try a.alloc(u32, nl);
+                    d.floor = try a.alloc(u32, nl);
+                    d.cands = try a.alloc(PoolCand, nl * 2 * per);
+                    @memset(d.first, 0);
+                    try d.free.ensureTotalCapacity(a, nl * per);
                 }
-                errdefer if (dpool) |*d| dpoolFree(a, d);
                 const pool = try expert_io.Pool.start(a, pool_opt);
                 errdefer pool.stop();
                 if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[widest].lens);

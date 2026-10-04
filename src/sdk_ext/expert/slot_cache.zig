@@ -41,7 +41,11 @@ pub const LruPolicy = struct {
 
     pub fn init(a: std.mem.Allocator, n_experts: u32, rows: u32) !LruPolicy {
         if (n_experts == 0 or n_experts >= expert_policy.no_expert or rows > n_experts) return error.InvalidCapacity;
-        const p: LruPolicy = .{ .n_experts = n_experts, .rows = rows, .slot_to_expert = try a.alloc(u16, rows), .expert_to_slot = try a.alloc(u32, n_experts), .last_used = try a.alloc(u64, rows) };
+        const slot_to_expert = try a.alloc(u16, rows);
+        errdefer a.free(slot_to_expert);
+        const expert_to_slot = try a.alloc(u32, n_experts);
+        errdefer a.free(expert_to_slot);
+        const p: LruPolicy = .{ .n_experts = n_experts, .rows = rows, .slot_to_expert = slot_to_expert, .expert_to_slot = expert_to_slot, .last_used = try a.alloc(u64, rows) };
         @memset(p.slot_to_expert, expert_policy.no_expert);
         @memset(p.expert_to_slot, expert_policy.no_slot);
         @memset(p.last_used, 0);
@@ -221,6 +225,14 @@ pub const Error = error{ CacheGeometry, CacheLocation, CacheFailed, ReadFailed, 
 /// Where a record's part sits: a file the cache opened and the byte offset in it.
 pub const Loc = struct { file: u16 = std.math.maxInt(u16), offset: u64 = 0 };
 
+/// A group's planner: an allocation failure is OutOfMemory, a capacity the planner refuses is the geometry's.
+fn planner(a: std.mem.Allocator, geom: Geometry, cap: u32) error{ OutOfMemory, CacheGeometry }!Planner {
+    return Planner.init(a, geom.policy, geom.n_experts, cap, geom.transient) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidCapacity => error.CacheGeometry,
+    };
+}
+
 pub const Cache = struct {
     a: std.mem.Allocator,
     geom: Geometry,
@@ -263,7 +275,7 @@ pub const Cache = struct {
                 a.free(pols);
             }
             for (pols, geom.capacity) |*p, cap| {
-                p.* = Planner.init(a, geom.policy, geom.n_experts, cap, geom.transient) catch return error.CacheGeometry;
+                p.* = try planner(a, geom, cap);
                 n_pol += 1;
             }
             self.policies = pols;
@@ -413,7 +425,7 @@ pub const Cache = struct {
     /// their bytes but no plan serves from them until read again.
     pub fn forgetAll(self: *Cache) Error!void {
         for (self.policies, self.geom.capacity) |*p, cap| {
-            const fresh = Planner.init(self.a, self.geom.policy, self.geom.n_experts, cap, self.geom.transient) catch return error.CacheGeometry;
+            const fresh = try planner(self.a, self.geom, cap);
             p.deinit(self.a);
             p.* = fresh;
         }

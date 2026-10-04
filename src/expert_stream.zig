@@ -2647,11 +2647,7 @@ fn streamInitDeinit(a: std.mem.Allocator, sb: *const SynthBank, opt: Options) !v
 
 // The construction's every allocation (the stream's, its layers', the selector's, the warm and decode-pool state's and
 // the read pool's) failed in turn: each failure unwinds to error.OutOfMemory with nothing leaked and the pool stopped.
-test "dsv41 stream: KNOWN BUG: an allocation failure in the decode pool's construction leaks its earlier arrays" {
-    if (std.c.getenv("DSV41_COV_KNOWN_BUGS") == null) {
-        std.debug.print("KNOWN BUG (skipped; DSV41_COV_KNOWN_BUGS=1 runs it): Stream.init builds DPool's six arrays in one struct literal; the errdefer is installed after it\n", .{});
-        return error.SkipZigTest;
-    }
+test "dsv41 stream: every allocation failure of the construction unwinds, the decode pool installed" {
     var sb = try SynthBank.open(32);
     defer sb.close();
     try std.testing.checkAllAllocationFailures(testing.allocator, streamInitDeinit, .{ &sb, Options{
