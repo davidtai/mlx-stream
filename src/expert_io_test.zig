@@ -968,13 +968,6 @@ const q3raw = struct {
     extern fn q3ld_max_h() i32;
 };
 
-/// A known reader defect's test fails until the defect is fixed, so it runs only with DSV41_COV_KNOWN_BUGS=1.
-fn knownBug(comptime what: []const u8) !void {
-    if (std.c.getenv("DSV41_COV_KNOWN_BUGS") != null) return;
-    std.debug.print("KNOWN BUG (skipped; DSV41_COV_KNOWN_BUGS=1 runs it): " ++ what ++ "\n", .{});
-    return error.SkipZigTest;
-}
-
 /// One record's job on the raw ABI at ticket `first`: gate/up parts `gl` at `gu`, down parts `dl` at `down`, back to
 /// back into `dst`. The Pool's published marks of its two tickets are cleared first (Pool.wait reads them).
 fn rawSubmit(pool: *Pool, fd: i32, size: i64, deadline: i64, gu: u64, down: u64, gl: []const i64, dl: []const i64, dst: []u8, first: u32) c_int {

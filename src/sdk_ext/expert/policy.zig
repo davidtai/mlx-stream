@@ -108,6 +108,8 @@ pub const LayerPolicy = struct {
 
     /// A plan beside other live routes of the layer: their slots (`held`) are
     /// never victims, and its transient loads take rows from `transient_base`.
+    /// `held` is a prefill plan's: a decode plan takes none (the stream's phase
+    /// change leaves decode one window and no held base).
     pub const PlanOpts = struct { transient_base: u32 = 0, held: []const u32 = &.{} };
 
     pub fn init(a: std.mem.Allocator, n_experts: u32, capacity: u32) !LayerPolicy {
@@ -342,6 +344,7 @@ pub const LayerPolicy = struct {
 
     pub fn planWith(p: *LayerPolicy, ids: []const u16, phase: Phase, out: *Plan, opts: PlanOpts) void {
         std.debug.assert(ids.len > 0 and ids.len <= max_route_ids);
+        std.debug.assert(phase == .prefill or opts.held.len == 0);
         for (opts.held) |s| p.held.set(s);
         defer for (opts.held) |s| p.held.unset(s);
         out.* = .{ .phase = phase, .n_ids = @intCast(ids.len) };

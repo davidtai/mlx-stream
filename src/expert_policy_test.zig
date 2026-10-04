@@ -532,7 +532,7 @@ test "dsv41 policy: prefill traces at full capacity never evict, and with held s
 
 }
 
-/// A random trace whose every plan holds two slots of another live route (`PlanOpts.held`): none is ever a victim.
+/// A random prefill trace whose every plan holds two slots of another live route (`PlanOpts.held`): none is ever a victim.
 fn heldTrace(phase: Phase) !void {
     var p = try LayerPolicy.init(testing.allocator, 40, 6);
     defer p.deinit(testing.allocator);
@@ -558,13 +558,6 @@ fn heldTrace(phase: Phase) !void {
     try t.expectIdentities(p.occupancy);
 }
 
-test "dsv41 policy: KNOWN BUG: a decode plan beside a live route evicts the route's held slots" {
-    if (std.c.getenv("DSV41_COV_KNOWN_BUGS") == null) {
-        std.debug.print("KNOWN BUG (skipped; DSV41_COV_KNOWN_BUGS=1 runs it): LayerPolicy.transitionAdmissions ignores PlanOpts.held\n", .{});
-        return error.SkipZigTest;
-    }
-    try heldTrace(.decode);
-}
 
 test "dsv41 policy: capacities and read-ahead admissions refuse or stop at their bounds" {
     try testing.expectError(error.InvalidCapacity, LayerPolicy.init(testing.allocator, 0, 0));

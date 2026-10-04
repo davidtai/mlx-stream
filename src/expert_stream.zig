@@ -2679,3 +2679,21 @@ test "dsv41 stream: every allocation failure of the construction unwinds (lookah
         .first_verify_warm = .{ .max_records = 8, .busy_max = 1 },
     } });
 }
+
+test "dsv41 stream: no decode plan runs beside held slots: the phase change refuses a held base and leaves decode one window" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 2 * 12, .wide_depth = 2, .pool = test_pool });
+    defer s.deinit();
+    const r = try serve(s, 0, &.{ 1, 2, 3 });
+    try s.holdBase(r);
+    s.release(r);
+    try testing.expectError(error.RoutesLive, s.grow(&.{ 6, 6 }));
+    s.releaseHeld();
+    try s.grow(&.{ 6, 6 });
+    try testing.expectEqual(@as(u8, 1), s.wide_depth);
+    const d = try serve(s, 0, &.{ 4, 5, 1 });
+    try testing.expectEqual(@as(u8, 0), d.window);
+    try expectServed(s, &sb, d, &.{ 4, 5, 1 });
+    s.release(d);
+}

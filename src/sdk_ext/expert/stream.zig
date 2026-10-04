@@ -1424,6 +1424,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
                 try self.flush();
                 for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
+                if (self.held_base.items.len > 0) return error.RoutesLive;
                 const per: u32 = if (self.dpool) |d| d.cfg.per_layer else 0;
                 for (self.layers, decode_rows) |*ls, rows| {
                     if (rows < ls.policy.capacity + per or rows > ls.policy.n_experts) return error.InvalidRows;
@@ -1480,6 +1481,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 if (self.dpool) |*d| d.row0 = self.max_route_ids + decode_staging_rows;
                 self.phase = .decode;
+                // Decode routes take one window: no decode plan ever runs beside a live route's held slots (the decode
+                // policy has no held set; `shrink` restores the prompt's depth).
+                self.wide_depth = 1;
                 if (self.keep_warm) try self.pool.keepWarm(true);
                 self.route_lookahead = self.selector != null;
                 self.route_preread = self.route_lookahead and self.preread;
