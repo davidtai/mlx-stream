@@ -3145,6 +3145,11 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     const stop = WindowStop.set(args.stop, args.ceiling);
     defer stop.restore();
     const max_tokens: u64 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 1024;
+    // The server's billed context (its model-settings ctx_size): every prompt up to it (the covering bill).
+    if (std.c.getenv("DSV41_CELL_MAX_CONTEXT")) |v| {
+        config.max_context_tokens = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.CellMaxContext;
+        std.debug.print("DSV41_CELL_BILL_CONTEXT {{\"max_context_tokens\": {d}}}\n", .{config.max_context_tokens.?});
+    }
     try cellFill(a, testing.io, &config, args, 16384, max_tokens);
     const b = try cellBill(a, testing.io, &config, args, 16384, max_tokens);
     printBill(b);

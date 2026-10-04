@@ -107,14 +107,23 @@ pub const Config = struct {
             c.expert_wide_depth = @intCast(v.integer);
             any = true;
         };
-        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s}\n", .{
+        // The model's context (`ctx_size`, the host's own key: the server refuses a longer prompt with a 400): the
+        // construction bills every prompt up to it (`max_context_tokens`). Unset, the standard request's 16,384.
+        if (obj.get("ctx_size")) |v| if (v == .integer and v.integer >= 1 and v.integer <= max_ctx_size) {
+            c.max_context_tokens = @intCast(v.integer);
+            any = true;
+        };
+        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} billed_context={d}\n", .{
             onOff(c.expert_event_gates),  if (c.numeric_tier) |t| @tagName(t) else "default",
             onOff(c.layer_major_prefill), onOff(c.expert_wide_feed),
             onOff(c.expert_wide_seed),    onOff(c.expert_wide_hot_first),
             c.expert_wide_depth orelse 0, c.expert_wide_cold_rows orelse 0,
-            onOff(c.embedding_host_rows),
+            onOff(c.embedding_host_rows),     c.max_context_tokens orelse 0,
         });
     }
+
+    /// The longest `ctx_size` the bill takes (the bank's max_position_embeddings).
+    pub const max_ctx_size: i64 = 1 << 20;
 
     fn onOff(v: ?bool) []const u8 {
         return if (v) |b| (if (b) "on" else "off") else "default";
@@ -215,6 +224,13 @@ test "dsv41 settings: the prefill routes are a bool, a bool and a depth of 1 or 
     try testing.expectEqual(@as(?bool, null), c.expert_wide_seed);
     // Not an object: nothing set.
     try testing.expectEqual(Config{}, try settingsOf("[1]"));
+}
+
+test "dsv41 settings: ctx_size bills every prompt up to it; anything else leaves the standard request's" {
+    try testing.expectEqual(@as(?u32, 132096), (try settingsOf("{\"ctx_size\": 132096}")).max_context_tokens);
+    try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": 0}")).max_context_tokens);
+    try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": \"131072\"}")).max_context_tokens);
+    try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": 2097152}")).max_context_tokens);
 }
 
 test "dsv41 settings: the reader schedule parses its knob list, a conflict is unset; the load facts replace the fill's inputs" {
