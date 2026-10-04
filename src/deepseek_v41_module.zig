@@ -1241,32 +1241,6 @@ pub const Module = struct {
         return self.forward(ids);
     }
 
-    /// The reading `reclaimShrink` judges against, taken before the caller frees the grown rows: every
-    /// command of the previous request retired first, so nothing it still held is missing from it.
-    pub fn boundaryBefore(self: *Module) BoundaryMemory {
-        _ = mlx.mlx_synchronize(self.g.s);
-        return BoundaryMemory.now();
-    }
-
-    /// The served path's return to the prompt phase before a later prompt, after the caller freed the grown
-    /// rows (the arm's shrink; `before` read just before it): the MLX cache cleared (the freed rows' buffers
-    /// go back to the driver, not into the cache), synchronize, then the same settle and one check as the
-    /// phase change on this process's own ledgers (the footprint down by the freed bytes, MLX's cache empty
-    /// and active down); a refusal is a typed error and every later request is refused by name. Bill: every
-    /// prompt pass then runs at the prompt rows, so max(prompt, decode) holds for every request.
-    pub fn reclaimShrink(self: *Module, before: BoundaryMemory, freed_bytes: u64) !void {
-        try self.gate.request();
-        // Every command that still held the freed rows retires first (its completion handlers hand them to
-        // the allocator's cache before the clear, as at the phase change).
-        _ = mlx.mlx_synchronize(self.g.s);
-        self.g.clearCache();
-        _ = mlx.mlx_synchronize(self.g.s);
-        const st = settle(LiveReader{ .io = self.io }, before, freed_bytes, phase_change_poll_ms, null);
-        self.phase_change = .{ .kind = "shrink", .before = before, .after = st.after, .freed_bytes = before.cache + freed_bytes, .settle_ms = st.waited_ms };
-        checkFreed(before, st.after, freed_bytes) catch |e| return self.refuseBoundary(e);
-        self.logPhaseChange();
-    }
-
     /// The reverse phase change (decode -> prompt), once per finished request: the served shell calls it at the request's
     /// end, after its last token went out (off both clocks); the next prefill runs it when an errored request's end did
     /// not. The order is the bill's (ledger 101): the request's state and the decode-only rows freed first (the grown
@@ -2125,10 +2099,7 @@ test "dsv41 module: LOOKAHEAD4: event gates are the served tier's default, host 
 test "dsv41 module: the module's construction and forwards analyse (host, nothing runs)" {
     try std.testing.expect(@TypeOf(&Module.init) != void and @TypeOf(&Module.extend) != void);
     // The served path's per-request pieces are analysed with the module (their wiring is the served path's).
-    const shrink_reclaim: *const fn (*Module, BoundaryMemory, u64) anyerror!void = &Module.reclaimShrink;
-    const boundary_before: *const fn (*Module) BoundaryMemory = &Module.boundaryBefore;
-    try std.testing.expect(@intFromPtr(boundary_before) != 0);
-    try std.testing.expect(@intFromPtr(shrink_reclaim) != 0);
+    try std.testing.expect(@intFromPtr(&Module.requestEnd) != 0);
 }
 
 // DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]

@@ -128,7 +128,6 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
 #define MAX_SPEC 16
 #define MAX_SPEC_THREADS 3
 #define MAX_H 4
-#define MAX_VAL 64
 #define SPEC_MAX_DEMAND_BUSY 1
 #define SP_FREE 0
 #define SP_QUEUED 1

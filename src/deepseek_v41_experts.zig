@@ -86,35 +86,6 @@ const lutOf = expert_stream.lutOf;
 
 pub const StreamSource = expert_stream.StreamSource;
 
-/// The lookahead's predictor (router math, the arch's), folded by the model into the router barrier's eval: the
-/// next routed layer's own gate on this layer's router input,
-/// s = sqrt(softplus(f32(x @ w^T))) + bias (x [M, hidden], w [n_experts,
-/// hidden], bias [n_experts] f32). The lane compiles this chain; the op chain
-/// may differ in the last bits, which only changes what is read ahead.
-pub fn nextLayerScores(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, stream: mlx.mlx_stream) !mlx.mlx_array {
-    var wt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wt);
-    try mlx.check(mlx.mlx_transpose(&wt, w, stream));
-    var z = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(z);
-    try mlx.check(mlx.mlx_matmul(&z, x, wt, stream));
-    var zf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(zf);
-    try mlx.check(mlx.mlx_astype(&zf, z, .float32, stream));
-    const zero = mlx.mlx_array_new_float(0);
-    defer _ = mlx.mlx_array_free(zero);
-    var sp = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sp);
-    try mlx.check(mlx.mlx_logaddexp(&sp, zf, zero, stream));
-    var root = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(root);
-    try mlx.check(mlx.mlx_sqrt(&root, sp, stream));
-    var scores = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(scores);
-    try mlx.check(mlx.mlx_add(&scores, root, bias, stream));
-    return scores;
-}
-
 // ── FakeSource: the streamer's residency with no reads (host tests) ──
 
 /// The streamer's residency policy (one `LayerPolicy` per layer, the Stream's
@@ -1061,7 +1032,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return if (layer + 1 < self.gates.len) self.gates[layer + 1] else null;
         }
 
-        /// `nextLayerScores`: sqrt(softplus(f32(x @ w^T))) + bias.
+        /// The predictor's scores: sqrt(softplus(f32(x @ w^T))) + bias.
         fn nextScores(g: *G, xf: T, gate: Gate) !T {
             const z = try g.astype(try g.matmul(xf, try g.transpose(gate.w)), .float32);
             return g.add(try g.sqrt(try g.logaddexp(z, try g.scalar(0, .float32))), gate.bias);
@@ -4276,56 +4247,6 @@ test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's source
     try testing.expectEqual(@as(usize, 0), bad_old);
     try testing.expectEqual(@as(usize, 0), bad_new);
     try testing.expectEqual(@as(usize, words), finite);
-}
-
-fn predictorBf16Bits(v: f32) u16 {
-    const b: u32 = @bitCast(v);
-    return @intCast((b + 0x7FFF + ((b >> 16) & 1)) >> 16);
-}
-
-fn predictorFromBf16(h: u16) f32 {
-    return @bitCast(@as(u32, h) << 16);
-}
-
-// DSV41_PHASE0B_MLX=1, inside a guarded window (creates MLX arrays).
-test "dsv41 lookahead 0b: the predictor graph scores like its host reference" {
-    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const m = 3;
-    const d = 64;
-    const e_n = 16;
-    var rng = std.Random.DefaultPrng.init(3);
-    const rand = rng.random();
-    var xb: [m * d]u16 = undefined;
-    var wb: [e_n * d]u16 = undefined;
-    var bias: [e_n]f32 = undefined;
-    for (&xb) |*v| v.* = predictorBf16Bits(rand.float(f32) * 2 - 1);
-    for (&wb) |*v| v.* = predictorBf16Bits((rand.float(f32) * 2 - 1) * 0.5);
-    for (&bias) |*v| v.* = rand.float(f32) * 0.2;
-    const stream = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(stream);
-    const x = mlx.mlx_array_new_data(&xb, &[_]c_int{ m, d }, 2, .bfloat16);
-    defer _ = mlx.mlx_array_free(x);
-    const w = mlx.mlx_array_new_data(&wb, &[_]c_int{ e_n, d }, 2, .bfloat16);
-    defer _ = mlx.mlx_array_free(w);
-    const b = mlx.mlx_array_new_data(&bias, &[_]c_int{e_n}, 1, .float32);
-    defer _ = mlx.mlx_array_free(b);
-    const s = try nextLayerScores(x, w, b, stream);
-    defer _ = mlx.mlx_array_free(s);
-    try mlx.check(mlx.mlx_array_eval(s));
-    try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(s));
-    try testing.expectEqual(@as(usize, m * e_n), mlx.mlx_array_size(s));
-    const got = (mlx.mlx_array_data_float32(s) orelse return error.MlxNoData)[0 .. m * e_n];
-    // Host: the product rounded to bf16 (the matmul's output dtype), then the f32 tail.
-    var worst: f32 = 0;
-    for (0..m) |r| for (0..e_n) |e| {
-        var acc: f32 = 0;
-        for (0..d) |k| acc += predictorFromBf16(xb[r * d + k]) * predictorFromBf16(wb[e * d + k]);
-        const z = predictorFromBf16(predictorBf16Bits(acc));
-        const want = @sqrt(@max(z, 0) + std.math.log1p(@exp(-@abs(z)))) + bias[e];
-        worst = @max(worst, @abs(got[r * e_n + e] - want));
-    };
-    std.debug.print("predictor graph: worst |mlx - host| {d:.6}\n", .{worst});
-    try testing.expect(worst < 2e-2);
 }
 
 /// A decode math whose outputs carry, per row, its slot row and the arrays it read (host arrays the trace records):

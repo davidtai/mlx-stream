@@ -101,12 +101,6 @@ pub fn armHost(layer_count: u32) void {
     arm(layer_count);
 }
 
-/// A test's signal log (the pool's, by hand).
-pub fn setSignals(sig: []const Signal) void {
-    @memcpy(signals[0..sig.len], sig);
-    n_signals = sig.len;
-}
-
 pub fn verifyOf(ci: usize) Verify {
     return verifies[ci];
 }

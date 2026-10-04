@@ -410,11 +410,6 @@ pub const Pool = struct {
     }
 };
 
-/// The reader's monotonic clock (ns), the one its result words use.
-pub fn monotonicNs() i64 {
-    return c.q3ld_monotonic_ns();
-}
-
 /// Test builds (-DQ3LD_INJECT): one scripted preadv fault at an aligned file
 /// offset (code 1 EINTR, 2 EIO, 3 zero return, 4 truncate to `arg` bytes, 5
 /// sleep `arg` ns first).

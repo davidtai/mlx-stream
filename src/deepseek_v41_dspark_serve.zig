@@ -92,11 +92,6 @@ pub fn Resources(comptime G: type) type {
         pub fn retireEmbedding(self: *Self, g: *G) !void {
             try embeddingFence(G, g, self.model, &self.embed_rows, &self.weights);
         }
-
-        fn fenceRun(ctx: *anyopaque, g: *G) anyerror!void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            try self.retireEmbedding(g);
-        }
     };
 }
 

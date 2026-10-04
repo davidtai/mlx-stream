@@ -70,11 +70,6 @@ pub const Outcome = struct {
     pub fn trimRows(o: Outcome) u32 {
         return o.verified - (o.accepted + 1);
     }
-
-    /// The `main_hidden` row the next draft starts from.
-    pub fn nextMainRow(o: Outcome) u32 {
-        return o.accepted;
-    }
 };
 
 /// The run's counters (`DSparkDecodeStats`): depth i counts the cycles that
@@ -256,7 +251,6 @@ test "dsv41 dspark: greedy acceptance commits the accepted run and its correctio
     try testing.expectEqual(@as(u32, 2), o.accepted);
     try testing.expectEqual(@as(?u32, 99), o.correction);
     try testing.expectEqual(@as(u32, 3), o.trimRows()); // 6 verified - (2 + 1) kept
-    try testing.expectEqual(@as(u32, 2), o.nextMainRow());
     // Everything accepted: the last row is the bonus, nothing to trim.
     var all: Outcome = .{};
     try testing.expect(acceptChunk(&all, &st, &drafts, 5, .{ 0, 6 }, &.{ 11, 12, 13, 14, 15, 42 }, null));

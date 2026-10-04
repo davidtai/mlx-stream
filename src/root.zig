@@ -22,6 +22,4 @@ pub const testing = struct {
     pub const v41 = @import("deepseek_v41.zig");
     pub const engram = @import("deepseek_v41_engram.zig");
     pub const Settings = @import("deepseek_v41_settings.zig").Config;
-    pub const kernel_manifest_sha256 = @import("exl3_kernels.zig").manifest_sha256;
-    pub const stream_uses_reader = @import("expert_stream.zig").uses_reader;
 };

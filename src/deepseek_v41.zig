@@ -277,14 +277,6 @@ pub const PrefillBill = struct {
         return b.layerMajorCallBytes(b.promptCallRows(seq), b.chunkRows(seq), seq, tier);
     }
 
-    /// The covering bound of every sub-chunked prompt up to `max_context` tokens: any such call has at most
-    /// `prefill_sub` + one span rows, its span at most the first sub-chunked length's (the chunk rule falls with the
-    /// length), and reads at most `max_context` positions (`layerMajorCallBytes` grows with all three). The rows.
-    pub fn subCallBoundRows(b: PrefillBill) struct { rows: u64, span: u64 } {
-        const span = b.chunkRows(b.prefill_sub + 1);
-        return .{ .rows = b.prefill_sub + span, .span = span };
-    }
-
     /// The layer-major wave's terms (`layerMajorWaveBytesAt`), for the read-outs: the kept streams (the hc streams and
     /// the DSpark taps), the halves, the index selection (its rows' masks over every compressed position), the attention
     /// side, the routed group, its final evaluation and what the input release frees from it.

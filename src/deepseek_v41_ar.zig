@@ -2180,12 +2180,6 @@ fn printBoxPhase(a: std.mem.Allocator, pm: *const PhaseMarks, cache_clear_bytes:
     std.debug.print("NATIVE DSV41_BOX_PHASE {s}\n", .{json});
 }
 
-fn printBoxGrow(a: std.mem.Allocator, before: BoxMark, grown: BoxMark) void {
-    const r = .{ .before = before, .grown = grown, .physical_growth = @as(i64, @intCast(grown.physical)) - @as(i64, @intCast(before.physical)), .footprint_growth = @as(i64, @intCast(grown.footprint)) - @as(i64, @intCast(before.footprint)), .tolerance = box_tolerance_bytes };
-    const json = std.json.Stringify.valueAlloc(a, r, .{}) catch return;
-    std.debug.print("NATIVE DSV41_BOX_GROW {s}\n", .{json});
-}
-
 /// The harnesses' outside-the-footprint sentinel (the window's, never the served path's). SERVED13 (pass3au): about
 /// 12 GB appeared outside this process's footprint within 13 s of decode, and the guard killed the window 4.5 GB short
 /// of physical RAM, before any record. A thread beside the run reads the box's pages through a fresh vm_stat child

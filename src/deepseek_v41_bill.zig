@@ -32,8 +32,8 @@ const log = std.log.scoped(.dsv41);
 /// phase record carries `file_cache_created_bytes` and `box_speculative_bytes`.
 ///
 /// Every prompt pass is billed at the prompt rows: the first one before the phase change grows the banks,
-/// every later one after the served path returned them to the prompt rows (the arm's shrink, proven by
-/// `Module.reclaimShrink` before the prompt allocates), so max(prompt total, decode total) bounds every request.
+/// every later one after the served path returned them to the prompt rows (the reverse phase change,
+/// `Module.requestEnd`, settles before the prompt allocates), so max(prompt total, decode total) bounds every request.
 ///
 /// The cell's memory bill (decimal bytes), each term by construction from the bank's headers, the
 /// admission the module builds with (`Module.armOptions` at the same config) and the arch's prefill
