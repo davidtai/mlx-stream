@@ -121,6 +121,9 @@ pub const RouteOverrides = struct {
     input_stream_early_release: ?bool = null,
     /// K16: each routed group's MoE inputs freed after its wide call (`prefillInputRelease`).
     prefill_input_release: ?bool = null,
+    /// The prompt's sub-chunk (`prefillSub`): the rows a layer-major call takes before the prompt continues in another
+    /// call. null: `kvc.prefill_sub`; maxInt: the whole prompt in one call (the proof cell's control).
+    prefill_sub: ?u64 = null,
     /// The shared expert's middle compiled (C22's region) at prompt widths. null: the default, off.
     prefill_shared_mid: ?bool = null,
     /// PREFILL_HCPOST: both HC combines at prompt widths in one pass on the region's numerics. null: the default, off.
@@ -488,6 +491,14 @@ pub fn prefillInputRelease(ov: RouteOverrides) bool {
     return ov.prefill_input_release orelse numericTier(.served).routes.prefill_input_release;
 }
 
+/// The prompt's sub-chunk the Module installs and the bill reads (upstream deepseek_v4's `prefillSub()`, read by both
+/// its `extendState` and server.zig's prefill memory guard, deepseek_v4.zig:8063-8077): the override's, else
+/// `kvc.prefill_sub`. Only the layer-major pass takes sub-chunk calls (the chunk-major pass settles each span already).
+pub fn prefillSub(ov: RouteOverrides, layer_major: bool) u64 {
+    if (!layer_major) return std.math.maxInt(u64);
+    return ov.prefill_sub orelse kvc.prefill_sub;
+}
+
 /// A0 (a)'s route the Module installs: the capture and the warm class together (off by default).
 /// DEVROUTE as the hook binds it (`devroute`): off unless set.
 pub fn devRoute(ov: RouteOverrides) bool {
@@ -600,6 +611,8 @@ pub const Module = struct {
     fill_target: u64 = 0,
     /// The longest prompt the construction billed (`bill.servedContext`); a longer request is refused before its prompt pass.
     max_context: u64 = bill_mod.fill_prompt_tokens,
+    /// The prompt's sub-chunk as installed (`prefillSub`): a longer prompt runs as calls of about this many rows.
+    prefill_sub: u64 = std.math.maxInt(u64),
     /// The phase change's boundary readings, freed bytes and reclaim time (the receipts carry it).
     phase_change: ?PhaseChangeRecord = null,
     /// The request's tail release (`tailRelease`; reset at each prefill).
@@ -854,6 +867,8 @@ pub const Module = struct {
         self.installed.decode_memos = self.model.tier.routes.decode_memos;
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
         self.installed.prefill_input_release = self.model.tier.routes.prefill_input_release;
+        self.prefill_sub = prefillSub(ov, self.model.tier.layer_major);
+        self.installed.prefill_sub = self.prefill_sub;
         self.installed.prefill_shared_mid = self.model.tier.routes.prefill_shared_mid;
         self.installed.prefill_hcpost = self.model.tier.routes.prefill_hcpost;
         self.installed.predict_bf16 = self.model.tier.routes.predict_bf16;
@@ -1332,8 +1347,38 @@ pub const Module = struct {
         self.state = try self.model.newStateWith(self.model.boundedKv(maxPositions(ids.len, reserved_tokens)));
         self.prompt_stats0 = self.streamStats();
         self.prompt_tokens = ids.len;
-        const logits = if (self.dspark_cfg) |cfg| try self.prefillSeeded(ids, cfg, final) else try self.forward(ids);
+        // A prompt up to the sub-chunk: one call (the standard cell's path); a longer one: sub-chunk calls.
+        const logits = if (ids.len <= self.prefill_sub) try self.promptCall(ids, final) else try self.prefillSubCalls(ids, final);
         self.gate.completePrefill(self.dspark != null);
+        return logits;
+    }
+
+    /// One prompt call from the request's fresh state: the strategy's seeded pass, else the trunk's.
+    fn promptCall(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
+        return if (self.dspark_cfg) |cfg| try self.prefillSeeded(ids, cfg, final) else try self.forward(ids);
+    }
+
+    /// A prompt longer than the sub-chunk (upstream deepseek_v4's `extendState` loop over `prefillSub()` sub-chunks):
+    /// its first call as `promptCall`, every later one as a continuation (`continueCall`, the split prompt's path), each
+    /// call's spans pinned to the whole prompt's chunk rule so they are the one-call pass's spans. Between calls the MLX
+    /// allocator cache goes back to the driver (upstream's per-sub-chunk release, `extendChunkShouldClearCache`,
+    /// deepseek_v4.zig:8079-8087): a call's transients do not repeat their shapes in the next call (its positions grew).
+    fn prefillSubCalls(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
+        const st = &self.state.?;
+        const tier = &self.model.tier;
+        const span = kvc.resolvePrefillChunk(&self.model.c, ids.len, tier.prefill_chunk, tier.chunk_target_bytes);
+        const calls = try kvc.prefillSubCalls(self.gpa, @intCast(ids.len), @intCast(span), self.prefill_sub);
+        defer self.gpa.free(calls);
+        st.span_chunk = span;
+        defer if (self.state) |*s| {
+            s.span_chunk = null;
+        };
+        var logits = try self.promptCall(ids[calls[0][0]..calls[0][1]], final and calls.len == 1);
+        for (calls[1..], 2..) |c, k| {
+            _ = mlx.mlx_array_free(logits);
+            self.g.clearCache();
+            logits = try self.continueCall(ids[c[0]..c[1]], final and k == calls.len);
+        }
         return logits;
     }
 
@@ -1541,6 +1586,11 @@ pub const Module = struct {
     /// are gone).
     pub fn prefillContinue(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
         try self.gate.begin(.prefill_continue);
+        return self.continueCall(ids, final);
+    }
+
+    /// A prompt continuation's forward (`prefillContinue` past its gate; a sub-chunk call inside `prefillPart`).
+    fn continueCall(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
         // The tail release freed the prompt's scratch: a later prompt part would route without it.
         if (self.tail_release != null) return error.PromptContinuedAfterTailRelease;
         const d = if (self.dspark) |*x| x else return self.step(ids);
@@ -1945,6 +1995,8 @@ pub const Installed = struct {
     input_stream_early_release: bool = false,
     /// K16's routed groups' MoE inputs freed after the wide call, as installed.
     prefill_input_release: bool = false,
+    /// The prompt's sub-chunk (`prefillSub`; maxInt: one call).
+    prefill_sub: u64 = std.math.maxInt(u64),
     /// The shared expert's middle compiled at prompt widths, as installed.
     prefill_shared_mid: bool = false,
     /// PREFILL_HCPOST's one-pass combine, as installed (past its construction check).

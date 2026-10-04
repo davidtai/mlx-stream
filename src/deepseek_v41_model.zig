@@ -121,6 +121,9 @@ pub fn Model(comptime G: type) type {
             max_len: ?u32 = null,
             /// Host scratch of a forward of at most `scratch_rows` rows (the decode / verify lane).
             scratch: []u8 = &.{},
+            /// A prompt run as sub-chunk calls (`kvc.prefillSubCalls`): every call's spans at the chunk rule of the
+            /// WHOLE prompt (set for the prompt's calls only), so each call runs the one-call pass's spans.
+            span_chunk: ?i64 = null,
 
             pub fn deinit(self: *State, g: *G, gpa: std.mem.Allocator) void {
                 for (self.layers) |*l| l.deinit(g);
@@ -605,7 +608,7 @@ pub fn Model(comptime G: type) type {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
             const a = if (n <= scratch_rows) fba.allocator() else arena.allocator();
-            const chunk = kvc.resolvePrefillChunk(&self.c, n, self.tier.prefill_chunk, self.tier.chunk_target_bytes);
+            const chunk = kvc.resolvePrefillChunk(&self.c, n, st.span_chunk orelse self.tier.prefill_chunk, self.tier.chunk_target_bytes);
             var hidden: T = undefined;
             var main: ?T = null;
             if (chunk <= 0 or chunk >= n) {
@@ -1519,6 +1522,71 @@ test "dsv41 model: K16 layer-major prefill runs every layer over all chunks, one
     try testing.expectEqual(@as(u32, 10), st.layers[1].compress.rows());
     // The engram needs its row source; a model without it refuses at construction.
     try testing.expectError(error.EngramSourceRequired, TM.init(testing.allocator, &g, m.c, tier, &lookup, null));
+}
+
+test "dsv41 model: a prompt's sub-chunk calls run the one-call pass's spans over the same state (1, 2 and 3 calls)" {
+    const a = testing.allocator;
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    const model_ = try TM.init(a, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    const span: u64 = 8;
+    const sub: u64 = 16;
+    // 12 tokens: one call; 36: two (the 4-row tail rides on the second); 50: three.
+    for ([_]u32{ 12, 36, 50 }, [_]usize{ 1, 2, 3 }) |n, n_calls| {
+        var ids: [64]u32 = undefined;
+        for (ids[0..n], 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 64);
+        const calls = try kvc.prefillSubCalls(a, n, span, sub);
+        defer a.free(calls);
+        try testing.expectEqual(n_calls, calls.len);
+        // The one call.
+        var one = try model_.newState();
+        defer one.deinit(&g, a);
+        const m1 = g.nodes.items.len;
+        _ = try model_.forward(&g, &one, ids[0..n], .{ .logits = .last, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
+        const seq1 = try g.opsSince(a, m1);
+        defer a.free(seq1);
+        // The sub-chunk calls over one state, the spans pinned to the whole prompt's chunk rule.
+        var st = try model_.newState();
+        defer st.deinit(&g, a);
+        st.span_chunk = @intCast(span);
+        var tapes: usize = 0;
+        for (calls) |c| {
+            const mk = g.nodes.items.len;
+            const r = try model_.forward(&g, &st, ids[c[0]..c[1]], .{ .logits = .last, .main_hidden = true }, TraceRouted{}, graph.NoProbe{});
+            try testing.expect(g.shapeOf(r.main_hidden.?).eql(ops.Shape.of(&.{ 1, @as(c_int, @intCast(c[1] - c[0])), 64 })));
+            const seq = try g.opsSince(a, mk);
+            defer a.free(seq);
+            tapes += std.mem.count(ops.Op, seq, &.{.tape_begin});
+        }
+        // The same spans: one compiled HC post per layer and span, ceil(n / 8) spans either way.
+        const n_spans = (n + span - 1) / span;
+        try testing.expectEqual(m.c.n_layers * n_spans, std.mem.count(ops.Op, seq1, &.{.tape_begin}));
+        try testing.expectEqual(m.c.n_layers * n_spans, tapes);
+        // The same state: the offset, every layer's window / compressed / index rows, the Engram history.
+        try testing.expectEqual(one.offset, st.offset);
+        for (one.layers, st.layers) |*x, *y| {
+            try testing.expectEqual(x.window.rows(), y.window.rows());
+            try testing.expectEqual(x.compress.rows(), y.compress.rows());
+            try testing.expectEqual(x.index.rows(), y.index.rows());
+        }
+        try testing.expectEqualSlices(i64, one.hash.?.hist.items, st.hash.?.hist.items);
+    }
+    // The pin is what the calls read: a 4-row pin over the tier's 8 doubles the spans of a 16-row call.
+    var st = try model_.newState();
+    defer st.deinit(&g, a);
+    st.span_chunk = 4;
+    var ids: [16]u32 = undefined;
+    for (&ids, 0..) |*d, i| d.* = @intCast(i + 1);
+    const mk = g.nodes.items.len;
+    _ = try model_.forward(&g, &st, &ids, .{ .logits = .last }, TraceRouted{}, graph.NoProbe{});
+    const seq = try g.opsSince(a, mk);
+    defer a.free(seq);
+    try testing.expectEqual(m.c.n_layers * 4, std.mem.count(ops.Op, seq, &.{.tape_begin}));
 }
 
 /// Records each stage a pass publishes and the chunk the profile charges it to (PrefillProbe's attribution).

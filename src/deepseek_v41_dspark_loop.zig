@@ -254,6 +254,17 @@ pub fn Loop(comptime G: type) type {
             return g.take(x, try g.arange(@floatFromInt(lo), @floatFromInt(hi), 1, .int32), 1);
         }
 
+        /// The seed's retained state as copies of its rows (`seedRetainedBytes`): the next draft's main row from the
+        /// main taps and each stage's window, so neither keeps the prompt's buffers alive.
+        fn keepSeedCopies(self: *Self, mains: T, n: c_int) !void {
+            const g = self.g;
+            self.setMain(try copyRows(g, mains, n - 1, n));
+            for (self.caches) |*c| if (c.window) |w| {
+                c.window = g.keep(try copyRows(g, w, 0, g.shapeOf(w).dim(1)));
+                g.release(w);
+            };
+        }
+
         fn windows(self: *const Self, ws: *[8]T) []const T {
             var n: usize = 0;
             for (self.caches) |c| if (c.window) |w| {
@@ -308,7 +319,9 @@ pub fn Loop(comptime G: type) type {
             const mains = r.main_hidden.?;
             try self.head.seedMain(g, mains, self.caches);
             const n: c_int = @intCast(ids.len);
-            self.setMain(try sliceRows(g, mains, n - 1, n));
+            // A prompt's sub-chunk call (wider than a verify block): copies, as the prompt's own seed keeps
+            // (`keepSeedCopies`); a serial step's one-row view holds nothing more.
+            if (ids.len > M.scratch_rows) try self.keepSeedCopies(mains, n) else self.setMain(try sliceRows(g, mains, n - 1, n));
             try self.evalWindows();
             try g.evalAll(&.{self.main_h.?});
             if (self.lookup) |*l| try l.appendCommitted(if (self.lookup_has_primary) ids[1..] else ids);
@@ -353,11 +366,7 @@ pub fn Loop(comptime G: type) type {
             // stage's window sliced from its main KV would hold those whole buffers (P x 67,584 B, 1.11 GB
             // at 16K) until the first round replaces them, through the phase change. A gather writes fresh
             // buffers of the views' own rows (the same bytes); the prompt's go at the reset below.
-            self.setMain(try copyRows(g, all, n - 1, n));
-            for (self.caches) |*c| if (c.window) |w| {
-                c.window = g.keep(try copyRows(g, w, 0, g.shapeOf(w).dim(1)));
-                g.release(w);
-            };
+            try self.keepSeedCopies(all, n);
             try self.evalWindows();
             try g.evalAll(&.{self.main_h.?});
             g.reset();

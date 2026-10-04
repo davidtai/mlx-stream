@@ -509,7 +509,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
         .unbilled_overhead = 0,
         .embedding_host_rows = config.embedding_host_rows orelse true,
         .prompt_state = dsl.seedRetainedBytes(&c, prompt_tokens),
-        .engram_posted = if (engramPostedRoute(config, ov, &c)) engramPostedBytes(c.engram, prompt_tokens) else 0,
+        .engram_posted = if (engramPostedRoute(config, ov, &c)) engramPostedBytes(c.engram, bill.promptCallRows(prompt_tokens)) else 0,
         .wire_arrays_prompt = persistent_arrays + 2 * wire_arrays_prompt_wave,
         .wire_arrays_decode = persistent_arrays + 2 * wire_arrays_decode_wave,
         .ring_geo = ring_geo,
@@ -526,14 +526,15 @@ pub fn prefillBillAt(config: *const settings.Config, ov: module.RouteOverrides, 
     // P1d's resident-first route makes one more deferred base call per wide call (one more output).
     const base_calls = v41.PrefillBill.wide_base_calls + @intFromBool(config.dsv41WideResidentFirst());
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = base_calls };
-    return v41.PrefillBill.of(c, try module.ringGeometry(config, ov)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinlessRoute(ov)) shape else null).withGroupStreams(group_streams).withInputRelease(module.prefillInputRelease(ov));
+    return v41.PrefillBill.of(c, try module.ringGeometry(config, ov)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinlessRoute(ov)) shape else null).withGroupStreams(group_streams).withInputRelease(module.prefillInputRelease(ov)).withPrefillSub(module.prefillSub(ov, config.dsv41LayerMajor()));
 }
 
 /// The prompt pass's largest single buffer: the routed group's joined input (`PrefillBill.joinedBytes`, the minimal
 /// copy's bound at the most outputs a call can make; K16 joins every chunk's rows of a layer). The K16 bank trace at
 /// 16K pins it (deepseek_v41_module "the prefill bill covers ...", DSV41_CACHE_SIM: a [50852, 5120] f32 concat).
 pub fn cacheOvershootPrompt(bill: v41.PrefillBill, prompt_tokens: u64) u64 {
-    return bill.joinedBytes(prompt_tokens);
+    // A sub-chunked prompt joins one call's rows at a time (`promptCallRows`; the prompt itself up to the sub-chunk).
+    return bill.joinedBytes(bill.promptCallRows(prompt_tokens));
 }
 
 /// A decode cycle's largest freed buffer: a KV lane's slice_update output when MLX does not donate the input (a whole
@@ -596,7 +597,7 @@ pub fn draftCacheBytes(c: *const v41.Config, ov: module.RouteOverrides) !u64 {
 /// routed-output copy), or the chunk-major widest wave x 5 / 4.
 fn promptWave(bill: v41.PrefillBill, layer_major: bool, joinless: bool, prompt_tokens: u64) u64 {
     if (!layer_major) return bill.waveBytes(bill.chunkRows(prompt_tokens), prompt_tokens, .served) / 4 * 5;
-    return if (joinless) bill.layerMajorWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served);
+    return if (joinless) bill.layerMajorPromptWaveBytes(prompt_tokens, .served) else bill.layerMajorBilledBytes(prompt_tokens, .served);
 }
 
 /// The head codec the request's model builds: the override's, else the served tier's (`RouteOverrides.head_mode`).
@@ -847,8 +848,23 @@ pub fn billCovering(a: std.mem.Allocator, io: std.Io, config: *const settings.Co
     var b = try billAt(a, io, config, max_context, max_tokens, wired_bytes, ceiling_bytes, ov);
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, io, config.expert_bank_dir orelse return error.Dsv41BankDir, &vd);
-    const covered = coveredPromptLengths(try prefillBillAt(config, ov, &c, 4), max_context);
-    for (covered.at[1..covered.n]) |len| {
+    const pb = try prefillBillAt(config, ov, &c, if (b.variant == .tight) tightGroupStreams(model_taps_fenced, module.inputStreamEarlyRelease(ov)) else 4);
+    // The one-call prompts (up to the sub-chunk): the convex bound at their end, the knee and the length after it.
+    const covered = coveredPromptLengths(pb, @min(max_context, pb.prefill_sub));
+    // The sub-chunked prompts (past the sub-chunk): `billAt(max_context)` holds their KV, rings and decode terms at the
+    // largest; their call terms move with the length (the widest call's rows, its span, its positions), so every
+    // such length's (`subCallMax`).
+    if (max_context > pb.prefill_sub) {
+        const joinless = joinlessRoute(ov);
+        const m = subCallMax(pb, joinless, max_context);
+        const mt = subCallMax(pb.withGroupStreams(tightGroupStreams(model_taps_fenced, module.inputStreamEarlyRelease(ov))), joinless, max_context);
+        b.prefill_wave = @max(b.prefill_wave, m.wave);
+        b.prefill_wave_tight = @max(b.prefill_wave_tight, mt.wave);
+        b.cache_overshoot_prompt = @max(b.cache_overshoot_prompt, pb.joinedBytes(m.call_rows));
+        if (b.engram_posted > 0) b.engram_posted = @max(b.engram_posted, engramPostedBytes(c.engram, m.call_rows));
+    }
+    for (covered.at[0..covered.n]) |len| {
+        if (len == max_context) continue;
         const x = try billAt(a, io, config, len, max_tokens, wired_bytes, ceiling_bytes, ov);
         b.prefill_wave = @max(b.prefill_wave, x.prefill_wave);
         b.prefill_wave_tight = @max(b.prefill_wave_tight, x.prefill_wave_tight);
@@ -862,6 +878,19 @@ pub fn billCovering(a: std.mem.Allocator, io: std.Io, config: *const settings.Co
         b.engram_posted = @max(b.engram_posted, x.engram_posted);
     }
     return b;
+}
+
+/// The largest layer-major prompt wave and widest call of every sub-chunked prompt `prefill_sub` < P <= `max_context`
+/// (`PrefillBill.promptCallRows`): exhaustive over the lengths (host arithmetic, no bank).
+pub fn subCallMax(pb: v41.PrefillBill, joinless: bool, max_context: u64) struct { wave: u64, call_rows: u64 } {
+    var wave: u64 = 0;
+    var rows: u64 = 0;
+    var p = pb.prefill_sub + 1;
+    while (p <= max_context) : (p += 1) {
+        wave = @max(wave, promptWave(pb, true, joinless, p));
+        rows = @max(rows, pb.promptCallRows(p));
+    }
+    return .{ .wave = wave, .call_rows = rows };
 }
 
 /// The served module's billed context: `max_context_tokens` (covering, `billCovering`), else the standard request's length
@@ -2175,9 +2204,38 @@ test "dsv41 memory: the covering lengths are the knee, the length after it and t
     const small = coveredPromptLengths(pb, knee);
     try testing.expectEqual(@as(usize, 1), small.n);
     try testing.expectEqual(knee, small.at[0]);
-    // the prompt wave over [1, 131072] never exceeds the larger of the covered lengths' (sampled every 256 tokens)
-    var worst: u64 = 0;
-    for (cov.at[0..cov.n]) |x| worst = @max(worst, promptWave(pb, true, true, x));
+    // the prompt wave over [1, 131072] never exceeds the larger of the one-call lengths' (covered up to the sub-chunk)
+    // and the sub-chunked lengths' (`subCallMax`) (sampled every 256 tokens)
+    const one = coveredPromptLengths(pb, pb.prefill_sub);
+    var worst: u64 = subCallMax(pb, true, 131072).wave;
+    for (one.at[0..one.n]) |x| worst = @max(worst, promptWave(pb, true, true, x));
     var n: u64 = 256;
     while (n <= 131072) : (n += 256) try testing.expect(promptWave(pb, true, true, n) <= worst);
 }
+
+test "dsv41 memory: a prompt up to the sub-chunk bills its one call byte for byte; a longer one its widest sub-chunk call over every position (no bank)" {
+    const c = try realConfig();
+    const config: settings.Config = .{};
+    const pb = try prefillBillAt(&config, .{}, &c, 4);
+    try testing.expectEqual(kvc.prefill_sub, pb.prefill_sub);
+    // One call (the standard cell's 16,384 included): the single wave and the whole prompt's joined input, unchanged.
+    for ([_]u64{ 1024, 3953, 3954, 16384 }) |n| {
+        try testing.expectEqual(n, pb.promptCallRows(n));
+        try testing.expectEqual(pb.layerMajorWaveBytes(n, .served), promptWave(pb, true, true, n));
+        try testing.expectEqual(pb.joinedBytes(n), cacheOvershootPrompt(pb, n));
+    }
+    // Sub-chunked: the widest call's rows (`kvc.prefillSubWidest`), its wave below the single wave at the same length.
+    for ([_]u64{ 32768, 65536, 131072 }) |n| {
+        const rows = pb.promptCallRows(n);
+        try testing.expectEqual(kvc.prefillSubWidest(n, pb.chunkRows(n), kvc.prefill_sub), rows);
+        try testing.expect(rows <= kvc.prefill_sub + pb.chunkRows(n));
+        try testing.expectEqual(pb.layerMajorCallBytes(rows, pb.chunkRows(n), n, .served), promptWave(pb, true, true, n));
+        try testing.expect(promptWave(pb, true, true, n) < pb.layerMajorWaveBytes(n, .served));
+        try testing.expectEqual(pb.joinedBytes(rows), cacheOvershootPrompt(pb, n));
+    }
+    try testing.expectEqual(@as(u64, 16303), pb.promptCallRows(131072));
+    // The one-call route (the proof cell's control, `RouteOverrides.prefill_sub` maxInt): the single wave at any length.
+    const one = try prefillBillAt(&config, .{ .prefill_sub = std.math.maxInt(u64) }, &c, 4);
+    try testing.expectEqual(one.layerMajorWaveBytes(131072, .served), promptWave(one, true, true, 131072));
+}
+

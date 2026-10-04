@@ -1174,6 +1174,8 @@ const CellReceipt = struct {
     input_stream_early_release: ?bool = null,
     /// K16's routed groups' MoE inputs freed after the wide call (installed).
     prefill_input_release: ?bool = null,
+    /// The prompt's sub-chunk rows as installed (null: the prompt in one call).
+    prefill_sub: ?u64 = null,
     /// The shared expert's middle at prompt widths as installed: "compiled" or "eager".
     prefill_shared_mid: ?[]const u8 = null,
     /// The prompt-width HC combines as installed: "fused" (one pass) or "region" (the compiled HcPost).
@@ -1689,6 +1691,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_memos = md.installed.decode_memos,
         .input_stream_early_release = md.installed.input_stream_early_release,
         .prefill_input_release = md.installed.prefill_input_release,
+        .prefill_sub = if (md.installed.prefill_sub == std.math.maxInt(u64)) null else md.installed.prefill_sub,
         .prefill_shared_mid = if (md.installed.prefill_shared_mid) "compiled" else "eager",
         .prefill_hcpost = if (md.installed.prefill_hcpost) "fused" else "region",
         .predict_bf16 = md.installed.predict_bf16,
@@ -1818,6 +1821,8 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_WINDOW_RING_HEADROOM")) |v| ov.window_ring_headroom = std.fmt.parseInt(u32, v, 10) catch return error.CellWindowRing;
     if (envStr("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE")) |v| ov.input_stream_early_release = try cellBool("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE", v);
     if (envStr("DSV41_CELL_PREFILL_INPUT_RELEASE")) |v| ov.prefill_input_release = try cellBool("DSV41_CELL_PREFILL_INPUT_RELEASE", v);
+    // The prompt's sub-chunk rows ("whole": the prompt in one call, the proof cell's control).
+    if (envStr("DSV41_CELL_PREFILL_SUB")) |v| ov.prefill_sub = if (std.mem.eql(u8, v, "whole")) std.math.maxInt(u64) else std.fmt.parseInt(u64, v, 10) catch return error.CellPrefillSub;
     if (envStr("DSV41_CELL_PREFILL_HCPOST")) |v| ov.prefill_hcpost = if (std.mem.eql(u8, v, "fused")) true else if (std.mem.eql(u8, v, "region")) false else return error.CellHcPostValue;
     if (envStr("DSV41_CELL_PREFILL_SHAREDMID")) |v| ov.prefill_shared_mid = if (std.mem.eql(u8, v, "compiled")) true else if (std.mem.eql(u8, v, "eager")) false else return error.CellSharedMidValue;
     if (envStr("DSV41_CELL_PREDICT_BF16")) |v| ov.predict_bf16 = try cellBool("DSV41_CELL_PREDICT_BF16", v);
@@ -3079,12 +3084,53 @@ test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselin
             // Monotonic in the context: the terms that scale with positions alone. The prompt wave and the rings are
             // not: they follow the chunk rule (one chunk up to about 4K tokens, then 8 GB-target chunks), so the
             // wave peaks where a whole prompt is one chunk (see the report); the fill follows the bill, not the size.
+            // Past the sub-chunk the prompt's call terms (the joined input, the posted gathers) are one call's.
             if (prev) |p| {
-                try testing.expect(r.overshoot_prompt >= p.overshoot_prompt and r.decode_wave >= p.decode_wave and r.engram_posted >= p.engram_posted and r.prompt_state >= p.prompt_state);
+                try testing.expect(r.decode_wave >= p.decode_wave and r.prompt_state >= p.prompt_state);
+                if (n <= @import("deepseek_v41_cache.zig").prefill_sub) try testing.expect(r.overshoot_prompt >= p.overshoot_prompt and r.engram_posted >= p.engram_posted);
             }
             prev = r;
         }
     };
+    // The prompt wave's terms at 16K .. 128K: the one call (the proof cell's control) and the widest sub-chunk call.
+    {
+        var config = try host_bridge.loadConfig(testing.io, a, bank_dir);
+        var vd: v41.Diag = .{};
+        const c = try v41.Config.load(a, testing.io, config.expert_bank_dir.?, &vd);
+        config.memory_baseline_bytes = 0;
+        const pb = try bill_mod.prefillBillAt(&config, .{}, &c, 4);
+        for ([_]u64{ 16384, 32768, 65536, 131072 }) |n| for ([_]u64{ n, pb.promptCallRows(n) }, 0..) |rows, k| {
+            if (k == 1 and rows == n) continue;
+            const w = pb.layerMajorWaveTerms(rows, pb.chunkRows(n), n, .served);
+            std.debug.print("DSV41_WAVE_TERMS {{\"positions\": {d}, \"rows\": {d}, \"span\": {d}, \"kept_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"selection_gb\": {d:.3}, \"attn_gb\": {d:.3}, \"group_gb\": {d:.3}, \"final_eval_gb\": {d:.3}, \"released_gb\": {d:.3}, \"total_gb\": {d:.3}, \"overshoot_gb\": {d:.3}}}\n", .{
+                n, rows, pb.chunkRows(n), gbOf(w.kept), gbOf(w.halves), gbOf(w.selection), gbOf(w.attn), gbOf(w.group), gbOf(w.final_eval), gbOf(w.released), gbOf(w.total()), gbOf(pb.joinedBytes(rows)),
+            });
+        };
+    }
+    // The cell's bill at each size (max_context_tokens = the prompt, the covering fill), sub-chunked (the served
+    // route) and one call (RouteOverrides.prefill_sub = maxInt, the proof cell's control).
+    const sub_rows = @import("deepseek_v41_cache.zig").prefill_sub;
+    for ([_]u64{ 8_300_000_000, 10_300_000_000 }) |baseline| {
+        var config = try host_bridge.loadConfig(testing.io, a, bank_dir);
+        config.memory_baseline_bytes = baseline;
+        for ([_]u64{ 16384, 32768, 65536, 131072 }) |n| for ([_]u64{ sub_rows, std.math.maxInt(u64) }) |sub| {
+            const ov: module.RouteOverrides = .{ .prefill_sub = sub };
+            var cn = config;
+            cn.max_context_tokens = @intCast(n);
+            const rows = bill_mod.fillCovering(a, testing.io, cn, 1024, null, ceiling, target, ov) catch |e| switch (e) {
+                error.NativeBillDoesNotFit => null,
+                else => return e,
+            };
+            var c2 = cn;
+            c2.expert_rows = if (rows) |x| x.decode else bill_mod.min_fill_rows;
+            c2.expert_prefill_rows = if (rows) |x| x.prefill else bill_mod.min_fill_rows;
+            const b = try bill_mod.billCovering(a, testing.io, &c2, n, 1024, null, ceiling, ov);
+            std.debug.print("DSV41_BILL_SUB {{\"baseline_gb\": {d:.2}, \"prompt\": {d}, \"route\": \"{s}\", \"wave_gb\": {d:.3}, \"overshoot_prompt_gb\": {d:.3}, \"kv_prompt_gb\": {d:.3}, \"engram_posted_gb\": {d:.3}, \"rows\": [{?d}, {?d}], \"prompt_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"fits\": {}}}\n", .{
+                gbOf(baseline), n, if (sub == sub_rows) "sub-chunk" else "one-call", gbOf(b.prefill_wave), gbOf(b.cache_overshoot_prompt), gbOf(b.kv), gbOf(b.engram_posted), if (rows) |x| x.prefill else null, if (rows) |x| x.decode else null, gbOf(b.prefillTotal()), gbOf(b.decodeTotal()), rows != null,
+            });
+            if (rows != null) try testing.expect(b.prefillTotal() <= target and b.decodeTotal() <= target);
+        };
+    }
 }
 
 

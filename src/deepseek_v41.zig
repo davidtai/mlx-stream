@@ -73,6 +73,8 @@ pub const PrefillBill = struct {
     /// K16's MoE-input release (`Routes.prefill_input_release`): the group's final evaluation no longer holds the
     /// chunks' moe_in (seq x hidden f32, in `halves`) nor their concat (g_rows x hidden f32, in the final evaluation).
     input_release: bool = false,
+    /// The prompt's sub-chunk (`kvc.prefill_sub`, the module's `prefillSub`): a longer prompt's calls (`promptCallRows`).
+    prefill_sub: u64 = kvc.prefill_sub,
 
     /// JOINLESS's minimal-copy merge (58d9fb1, `experts.planJoinless`): the combine reads at most
     /// `joinless_sources` sources; a wide call with n outputs above that concatenates only its smallest n - 23
@@ -246,13 +248,68 @@ pub const PrefillBill = struct {
     ///   JOINLESS the minimal copy's bound, `joinedBytes`), the combine and the HC post to the next stream,
     ///   with the group's new stream held beside the old), or the group's final evaluation (SERVED19, below).
     pub fn layerMajorWaveBytes(b: PrefillBill, seq: u64, tier: Tier) u64 {
+        return b.layerMajorWaveTerms(seq, b.chunkRows(seq), seq, tier).total();
+    }
+
+    /// The layer-major wave of one call of `rows` rows, its spans `span` rows, its attention reading `positions`
+    /// positions (its own rows and every earlier call's): a prompt's sub-chunk call (`kvc.prefillSubCalls`). Every
+    /// row-held term follows `rows`; the index selection is the rows' masks over every compressed position, the score
+    /// chains read `positions`. Each term grows with `rows`, `span` and `positions`.
+    pub fn layerMajorCallBytes(b: PrefillBill, rows: u64, span: u64, positions: u64, tier: Tier) u64 {
+        return b.layerMajorWaveTerms(rows, span, positions, tier).total();
+    }
+
+    /// The prompt's sub-chunk the module runs a longer prompt by (`deepseek_v41_module.prefillSub`; maxInt: one call).
+    pub fn withPrefillSub(b: PrefillBill, sub: u64) PrefillBill {
+        var x = b;
+        x.prefill_sub = sub;
+        return x;
+    }
+
+    /// The rows of the prompt pass's widest call: the prompt itself up to the sub-chunk, else the widest sub-chunk call.
+    pub fn promptCallRows(b: PrefillBill, seq: u64) u64 {
+        return kvc.prefillSubWidest(seq, b.chunkRows(seq), b.prefill_sub);
+    }
+
+    /// The prompt pass's layer-major wave at `seq` tokens: `layerMajorWaveBytes` while the prompt is one call (the
+    /// standard cell's, byte for byte), else its widest sub-chunk call over every position (the calls before it read fewer).
+    pub fn layerMajorPromptWaveBytes(b: PrefillBill, seq: u64, tier: Tier) u64 {
+        return b.layerMajorCallBytes(b.promptCallRows(seq), b.chunkRows(seq), seq, tier);
+    }
+
+    /// The covering bound of every sub-chunked prompt up to `max_context` tokens: any such call has at most
+    /// `prefill_sub` + one span rows, its span at most the first sub-chunked length's (the chunk rule falls with the
+    /// length), and reads at most `max_context` positions (`layerMajorCallBytes` grows with all three). The rows.
+    pub fn subCallBoundRows(b: PrefillBill) struct { rows: u64, span: u64 } {
+        const span = b.chunkRows(b.prefill_sub + 1);
+        return .{ .rows = b.prefill_sub + span, .span = span };
+    }
+
+    /// The layer-major wave's terms (`layerMajorWaveBytesAt`), for the read-outs: the kept streams (the hc streams and
+    /// the DSpark taps), the halves, the index selection (its rows' masks over every compressed position), the attention
+    /// side, the routed group, its final evaluation and what the input release frees from it.
+    pub const WaveTerms = struct {
+        kept: u64,
+        halves: u64,
+        selection: u64,
+        attn: u64,
+        group: u64,
+        final_eval: u64,
+        released: u64,
+
+        pub fn total(t: WaveTerms) u64 {
+            return t.kept + t.selection + @max(t.halves + @max(t.attn, t.group), t.halves + t.final_eval - t.released);
+        }
+    };
+
+    pub fn layerMajorWaveTerms(b: PrefillBill, seq: u64, span: u64, positions: u64, tier: Tier) WaveTerms {
         const d = b.hidden;
         const kept_stream = seq * (b.hc * d * 4 + b.hc * 4 + 4) + b.n_main * seq * d * 4;
         const halves = seq * (b.hc * d * 4 + d * 4 + 2 * b.hc * 4 + b.hc * b.hc * 4);
         // The index selection, plus (served) the prefill core's window selection memo per chunk: idx i32 + valid.
         const win_sel = if (tier == .served) seq * (b.selected_keys - b.index_topk) * 5 else 0;
-        const selection = seq * ((if (b.min_ratio > 0) seq / b.min_ratio else 0) + b.index_topk * 4) + win_sel;
-        const attn = b.waveBytes(b.chunkRows(seq), seq, tier) - seq * kept_pos_bytes;
+        const selection = seq * ((if (b.min_ratio > 0) positions / b.min_ratio else 0) + b.index_topk * 4) + win_sel;
+        const attn = b.waveBytes(span, positions, tier) - positions * kept_pos_bytes;
         const cap: u64 = @max(1, @as(u64, @intFromFloat(@floor(@max(chunk_target_bytes, 1e9) / @as(f64, @floatFromInt(b.top_k * d * 4))))));
         const g_rows = @min(seq, cap);
         // The group's routed outputs, their joined input (`joinedBytes`), the combine and the HC post.
@@ -272,7 +329,7 @@ pub const PrefillBill = struct {
         // its own <= 8 rows, while the earlier groups' rows are already gone, so the widest group still bounds it.
         const releases = b.input_release and g_rows * b.top_k > joinless_min_ids;
         const released: u64 = if (releases) seq * d * 4 + g_rows * d * 4 else 0;
-        return kept_stream + selection + @max(halves + @max(attn, group), halves + final_eval - released);
+        return .{ .kept = kept_stream, .halves = halves, .selection = selection, .attn = attn, .group = group, .final_eval = final_eval, .released = released };
     }
 
     /// The K16 wide lane's own transient beside the layer-major wave: one more copy of the routed
@@ -289,7 +346,7 @@ pub const PrefillBill = struct {
 
     /// The K16 prompt pass's billed transient: the layer-major wave plus the wide lane's own.
     pub fn layerMajorBilledBytes(b: PrefillBill, seq: u64, tier: Tier) u64 {
-        return b.layerMajorWaveBytes(seq, tier) + b.wideLaneBytes(seq);
+        return b.layerMajorPromptWaveBytes(seq, tier) + b.wideLaneBytes(b.promptCallRows(seq));
     }
 
     /// The served tier's bounded KV lanes, for a request of `positions` (its prompt, its tokens and one verify block):

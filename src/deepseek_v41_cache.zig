@@ -265,6 +265,85 @@ pub fn prefillSpans(a: std.mem.Allocator, s: u32, chunk: i64) ![][2]u32 {
     return out;
 }
 
+/// The prompt's sub-chunk: a prompt longer than this runs as module calls of at most about this many rows, each
+/// extending the request's state (upstream deepseek_v4's `PREFILL_SUB`, deepseek_v4.zig:8054-8077, which sub-chunks its
+/// prefill inside `extendState` at 512 and exposes `prefillSub()` to server.zig's prefill memory guard). Here the
+/// sub-chunk is a call of the layer-major pass, so it is wide: the 16,384-token standard cell stays one call.
+pub const prefill_sub: u64 = 16384;
+
+/// The rows of each sub-chunk call of a prompt of `n` tokens whose spans are `span` rows (the chunk rule at the
+/// WHOLE prompt's length, pinned for every call): `sub` rounded down to a multiple of `span`, so each call's spans
+/// are the one-call pass's spans at the same positions. `n` when the prompt is one call.
+pub fn prefillSubWidth(n: u64, span: u64, sub: u64) u64 {
+    if (n <= sub or span == 0 or span >= sub) return n;
+    return sub - sub % span;
+}
+
+/// The widest call of `prefillSubCalls` (the bill's rows): a tail of at most one span rides on the call before it
+/// (alone it would be a one-span call: the single-span forward, not the layer-major pass of the one-call run).
+pub fn prefillSubWidest(n: u64, span: u64, sub: u64) u64 {
+    const w = prefillSubWidth(n, span, sub);
+    if (w >= n) return n;
+    const r = n % w;
+    return if (r > 0 and r <= span) w + r else w;
+}
+
+/// The calls (`[start, end)`) a prompt of `n` tokens runs as (`prefillSubWidth`, the short tail merged).
+pub fn prefillSubCalls(a: std.mem.Allocator, n: u32, span: u64, sub: u64) ![][2]u32 {
+    const w: u32 = @intCast(prefillSubWidth(n, span, sub));
+    const full = n / w;
+    const r = n % w;
+    const count = if (r > 0 and r > span) full + 1 else full;
+    const out = try a.alloc([2]u32, count);
+    for (out, 0..) |*c, i| c.* = .{ @intCast(i * w), if (i + 1 == count) n else @intCast((i + 1) * w) };
+    return out;
+}
+
+test "dsv41 cache: the prompt's sub-chunk calls: one call up to the sub-chunk, then span-aligned calls, the short tail merged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try v41.testConfigJson(testing.allocator, .real);
+    defer testing.allocator.free(json);
+    const c = try v41.Config.parse(testing.allocator, json, null);
+    // The standard cell: one call (16,384 rows, its 18 spans unchanged).
+    const s16: u64 = @intCast(resolvePrefillChunk(&c, 16384, null, default_chunk_target_bytes));
+    try testing.expectEqual(@as(usize, 1), (try prefillSubCalls(a, 16384, s16, prefill_sub)).len);
+    try testing.expectEqual(@as(u64, 16384), prefillSubWidest(16384, s16, prefill_sub));
+    // Every longer prompt: calls whose starts are span boundaries of the one-call pass, covering it exactly.
+    for ([_]u32{ 16385, 32768, 65536, 131072, 100_003 }) |n| {
+        const span: u64 = @intCast(resolvePrefillChunk(&c, n, null, default_chunk_target_bytes));
+        const calls = try prefillSubCalls(a, n, span, prefill_sub);
+        try testing.expectEqual(@as(u32, 0), calls[0][0]);
+        try testing.expectEqual(n, calls[calls.len - 1][1]);
+        var widest: u64 = 0;
+        for (calls, 0..) |cl, i| {
+            if (i > 0) try testing.expectEqual(calls[i - 1][1], cl[0]);
+            try testing.expectEqual(@as(u64, 0), cl[0] % span);
+            // Every call is wider than one span (the layer-major pass), none past the sub-chunk and a span.
+            try testing.expect(cl[1] - cl[0] > span or calls.len == 1);
+            try testing.expect(cl[1] - cl[0] <= prefill_sub + span);
+            widest = @max(widest, cl[1] - cl[0]);
+        }
+        try testing.expectEqual(widest, prefillSubWidest(n, span, prefill_sub));
+    }
+    // 128K: a 119-row span; eight 16,303-row calls (137 spans each), then the last 648 rows.
+    const s128: u64 = @intCast(resolvePrefillChunk(&c, 131072, null, default_chunk_target_bytes));
+    try testing.expectEqual(@as(u64, 119), s128);
+    try testing.expectEqual(@as(u64, 16303), prefillSubWidth(131072, s128, prefill_sub));
+    const c128 = try prefillSubCalls(a, 131072, s128, prefill_sub);
+    try testing.expectEqual(@as(usize, 9), c128.len);
+    try testing.expectEqual([2]u32{ 130424, 131072 }, c128[8]);
+    // A tail of at most one span rides on the call before it.
+    const m = try prefillSubCalls(a, 2 * 60 + 25, 30, 60);
+    try testing.expectEqual(@as(usize, 2), m.len);
+    try testing.expectEqual([2]u32{ 60, 145 }, m[1]);
+    try testing.expectEqual(@as(u64, 85), prefillSubWidest(145, 30, 60));
+    const t = try prefillSubCalls(a, 2 * 60 + 31, 30, 60);
+    try testing.expectEqual(@as(usize, 3), t.len);
+    try testing.expectEqual([2]u32{ 120, 151 }, t[2]);
+}
+
 // ── tests: a row-id backend checks the lanes' reachable rows on the host ──
 
 const testing = std.testing;
