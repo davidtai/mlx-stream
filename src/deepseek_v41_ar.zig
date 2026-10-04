@@ -1122,9 +1122,6 @@ const CellReceipt = struct {
     /// and its bytes in `phase_change.tail_release_bytes`.
     phase_tail_release: ?bool = null,
     tail_release: ?module.TailReleaseRecord = null,
-    /// STOCKDELAY as installed (`module.phaseGrowDelayMs`; 0: off): the sleep between the phase change's settled frees and
-    /// the grow (its time and the frees-to-grow interval ride in `phase_change`).
-    phase_grow_delay_ms: u32 = 0,
     /// The grow's new rows' allocation as installed (`module.growFill`; zeros by default).
     grow_fill: ?[]const u8 = null,
     /// The request's index through this Module (1 = the first; request k > 1 follows a reverse phase change).
@@ -1635,7 +1632,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .host_relief = md.installed.host_relief,
         .phase_tail_release = md.installed.phase_tail_release,
         .tail_release = md.tail_release,
-        .phase_grow_delay_ms = md.installed.phase_grow_delay_ms,
         .grow_fill = @tagName(md.installed.grow_fill),
         .request = cx.request,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
@@ -1797,9 +1793,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     // The phase change's settle condition (interval | until_freed; anything else refused here).
     if (envStr("DSV41_CELL_HOST_RELIEF")) |v| ov.host_relief = try cellBool("DSV41_CELL_HOST_RELIEF", v);
     if (envStr("DSV41_CELL_PHASE_TAIL_RELEASE")) |v| ov.phase_tail_release = try cellBool("DSV41_CELL_PHASE_TAIL_RELEASE", v);
-    // STOCKDELAY (W5): ms between the stock phase change's settled frees and the grow (the Module refuses 0, > 2000 and
-    // the tail release by name at construction).
-    if (envStr("DSV41_CELL_PHASE_GROW_DELAY_MS")) |v| ov.phase_grow_delay_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhaseGrowDelay;
     if (envStr("DSV41_CELL_GROW_FILL")) |v| ov.grow_fill = std.meta.stringToEnum(@import("expert_stream.zig").GrowFill, v) orelse return error.CellGrowFill;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;
