@@ -1265,7 +1265,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const vm_start = sdk.memory.vmBytes();
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
-    const md = try module.Module.initWith(gpa, io, &config, &weights, s, hostBox(), args.ov);
+    const md = try module.Module.initWith(gpa, io, &config, &weights, s, hostBox(), cellModuleOverrides(args.ov, &config, prompt.len));
     defer md.deinit();
     const wired = applyServerWiredPolicy();
     const constructed = phaseMemory("module constructed", bill.constructionTerms(), 0, vm_start.external);
@@ -1946,6 +1946,15 @@ fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, ar
     var ov = args.ov;
     ov.decode_extra_records = bill_mod.fillExtraRecords(b, args.ceiling -| args.stop);
     return cellBillAt(a, io, config, args, prompt_tokens, max_tokens, ov);
+}
+
+/// The Module's overrides for the cell: the standard 16,384-token cell pins its one prompt (`bill_pinned_prompt`: the
+/// bill is that prompt's alone, the receipts of record stay comparable, any other length refused by name); a context
+/// sweep size (`max_context_tokens`) bills every length up to it.
+fn cellModuleOverrides(ov: module.RouteOverrides, config: *const settings.Config, prompt_tokens: usize) module.RouteOverrides {
+    var o = ov;
+    if (config.max_context_tokens == null) o.bill_pinned_prompt = prompt_tokens;
+    return o;
 }
 
 /// The cell's bill: at the request's own length, or (a context sweep size, `max_context_tokens`) every length up to it,
@@ -3055,6 +3064,38 @@ fn ctxRow(a: std.mem.Allocator, io: std.Io, base: settings.Config, prompt: u64, 
 // dependent terms, the filled rows (or the refusal at the floor rows), each phase's total. Asserts: the 16K row is the
 // served cells' (the receipts' wave and KV), a filled size's totals are under the target, the terms that scale with
 // positions alone never shrink, and a size whose floor bill exceeds the target is refused (no rows).
+// Bank (CPU, the bank suite): the server's default bill (no ctx_size) covers every prompt length up to 16,384 at the
+// chunk rule's breakpoints (the knee, the length after it, the doublings, the 16K cell); the pinned cell bills its
+// prompt alone, byte for byte the bill of record (13,868,806,049 B wave).
+test "dsv41 bill: the default served bill covers every prompt up to 16,384; the pinned cell keeps the exact bill" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ceiling: u64 = 120_259_084_288;
+    var config = try host_bridge.loadConfig(testing.io, a, bank_dir);
+    config.memory_baseline_bytes = 8_000_000_000;
+    config.expert_rows = bill_mod.min_fill_rows;
+    config.expert_prefill_rows = bill_mod.min_fill_rows;
+    const served = try bill_mod.servedBill(a, testing.io, &config, null, ceiling, .{});
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const pb = try bill_mod.prefillBillAt(&config, .{}, &c, 4);
+    const knee = bill_mod.coveredPromptLengths(pb, 16384).at[1];
+    for ([_]u64{ 1, 1024, 2048, knee - 1, knee, knee + 1, 4096, 6144, 8192, 12288, 16383, 16384 }) |n| {
+        const x = try bill_mod.billAt(a, testing.io, &config, n, bill_mod.fill_max_tokens, null, ceiling, .{});
+        try testing.expect(served.prefill_wave >= x.prefill_wave and served.prefill_wave_tight >= x.prefill_wave_tight);
+        try testing.expect(served.kv >= x.kv and served.cache_overshoot_prompt >= x.cache_overshoot_prompt and served.engram_posted >= x.engram_posted);
+        try testing.expect(served.prefillTotal() >= x.prefillTotal() and served.decodeTotal() >= x.decodeTotal());
+    }
+    const pinned = try bill_mod.servedBill(a, testing.io, &config, null, ceiling, .{ .bill_pinned_prompt = 16384 });
+    try testing.expectEqual(@as(u64, 13_868_806_049), pinned.prefill_wave);
+    const exact = try bill_mod.billAt(a, testing.io, &config, 16384, bill_mod.fill_max_tokens, null, ceiling, .{});
+    try testing.expectEqual(exact.prefillTotal(), pinned.prefillTotal());
+    try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());
+    std.debug.print("\nDSV41_DEFAULT_SERVED_BILL {{\"knee\": {d}, \"wave\": {d}, \"pinned_wave\": {d}}}\n", .{ knee, served.prefill_wave, pinned.prefill_wave });
+}
+
 test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselines" {
     if (std.c.getenv("DSV41_BILL_CONTEXT") == null) return error.SkipZigTest;
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
@@ -3146,10 +3187,9 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     defer stop.restore();
     const max_tokens: u64 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 1024;
     // The server's billed context (its model-settings ctx_size): every prompt up to it (the covering bill).
-    if (std.c.getenv("DSV41_CELL_MAX_CONTEXT")) |v| {
-        config.max_context_tokens = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.CellMaxContext;
-        std.debug.print("DSV41_CELL_BILL_CONTEXT {{\"max_context_tokens\": {d}}}\n", .{config.max_context_tokens.?});
-    }
+    // The bill tool mirrors the server's bill: every prompt up to its context (16,384 without a ctx_size).
+    config.max_context_tokens = if (std.c.getenv("DSV41_CELL_MAX_CONTEXT")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.CellMaxContext else @intCast(bill_mod.fill_prompt_tokens);
+    std.debug.print("DSV41_CELL_BILL_CONTEXT {{\"max_context_tokens\": {d}}}\n", .{config.max_context_tokens.?});
     try cellFill(a, testing.io, &config, args, 16384, max_tokens);
     const b = try cellBill(a, testing.io, &config, args, 16384, max_tokens);
     printBill(b);
@@ -3456,7 +3496,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     defer _ = mlx.mlx_stream_free(s);
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
-    const md = try module.Module.initWith(gpa, io, &config, &weights, s, hostBox(), args.ov);
+    const md = try module.Module.initWith(gpa, io, &config, &weights, s, hostBox(), cellModuleOverrides(args.ov, &config, inputs.prompt.len));
     defer md.deinit();
     _ = applyServerWiredPolicy();
     const arm = switch (md.arm) {

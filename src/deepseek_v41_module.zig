@@ -124,6 +124,9 @@ pub const RouteOverrides = struct {
     /// The prompt's sub-chunk (`prefillSub`): the rows a layer-major call takes before the prompt continues in another
     /// call. null: `kvc.prefill_sub`; maxInt: the whole prompt in one call (the proof cell's control).
     prefill_sub: ?u64 = null,
+    /// A harness that runs ONE prompt length (the timed cell): the bill is that prompt's alone (`bill.servedBill`) and any
+    /// other length is refused by name before its pass (`checkContext`). null: every length up to the context (served).
+    bill_pinned_prompt: ?u64 = null,
     /// The shared expert's middle compiled (C22's region) at prompt widths. null: the default, off.
     prefill_shared_mid: ?bool = null,
     /// PREFILL_HCPOST: both HC combines at prompt widths in one pass on the region's numerics. null: the default, off.
@@ -709,7 +712,7 @@ pub const Module = struct {
                 admitted.expert_rows = nr.decode;
                 admitted.expert_prefill_rows = nr.prefill;
             }
-            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill{s}, baseline {d} B, target {d} B)", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, bill_mod.servedContext(&admitted), if (admitted.max_context_tokens != null) ", every length up to it" else "", admitted.memory_baseline_bytes orelse 0, target });
+            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill{s}, baseline {d} B, target {d} B)", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, if (ov.bill_pinned_prompt) |pp| pp else bill_mod.servedContext(&admitted), if (ov.bill_pinned_prompt == null) ", every length up to it" else " alone", admitted.memory_baseline_bytes orelse 0, target });
         }
         errdefer self.dropKernels();
         // The fused down GEMM, when overridden: its self-checks on the set, then every layer's DIG-X waves launch it.
@@ -1328,7 +1331,7 @@ pub const Module = struct {
     /// `extend`, refused before the handover), so only a harness passes false.
     pub fn prefillPart(self: *Module, ids: []const u32, reserved_tokens: u64, final: bool) !mlx.mlx_array {
         // The request against the context the construction billed, once, before anything of it runs.
-        try checkContext(ids.len, self.max_context);
+        try checkContext(ids.len, self.max_context, self.overrides.bill_pinned_prompt);
         // The previous request's decode end (served path), before this request touches anything.
         self.recordDecodeEnd();
         // The previous request's end, when the shell did not run it (an errored request): its routes settled and, if it
@@ -2329,16 +2332,24 @@ pub const admitPhases = bill_mod.admitPhases;
 pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
 
 /// A request's prompt against the billed context (`Module.max_context`): longer is refused by name, once, before its pass.
-pub fn checkContext(prompt_tokens: usize, max_context: u64) error{ContextOverBill}!void {
+pub fn checkContext(prompt_tokens: usize, max_context: u64, pinned: ?u64) error{ ContextOverBill, ContextNotPinned }!void {
+    if (pinned) |p| {
+        if (prompt_tokens == p) return;
+        log.warn("NATIVE request refused: a {d}-token prompt on a Module billed for the {d}-token prompt alone (ContextNotPinned)", .{ prompt_tokens, p });
+        return error.ContextNotPinned;
+    }
     if (prompt_tokens <= max_context) return;
     log.warn("NATIVE request refused: a {d}-token prompt is over the billed context of {d} tokens (ContextOverBill); construct with max_context_tokens >= the prompt", .{ prompt_tokens, max_context });
     return error.ContextOverBill;
 }
 
 test "dsv41 module: a prompt over the billed context is refused before its pass, by name" {
-    try checkContext(16384, 16384);
-    try checkContext(1, 16384);
-    try std.testing.expectError(error.ContextOverBill, checkContext(16385, 16384));
+    try checkContext(16384, 16384, null);
+    try checkContext(1, 16384, null);
+    try std.testing.expectError(error.ContextOverBill, checkContext(16385, 16384, null));
+    // A pinned prompt (the timed cell): that length only.
+    try checkContext(16384, 16384, 16384);
+    try std.testing.expectError(error.ContextNotPinned, checkContext(3953, 16384, 16384));
 }
 pub const fill_max_tokens = bill_mod.fill_max_tokens;
 pub const min_fill_rows = bill_mod.min_fill_rows;

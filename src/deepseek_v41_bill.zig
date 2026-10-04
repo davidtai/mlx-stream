@@ -756,7 +756,9 @@ pub fn billAtFloor(a: std.mem.Allocator, io: std.Io, config: settings.Config, pr
 pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: settings.Config, ceiling_bytes: u64) !u64 {
     var c = config;
     c.memory_baseline_bytes = 0;
-    // The server's load preflight: the served routes, no harness override.
+    // The server's load preflight: the served routes, no harness override. The standard request's bill at the floor
+    // rows (the host's contract: the term-wise `bill` of that request bounds the process as this does); the construction's
+    // admission then bills every prompt up to the context (`servedBill`) and refuses by name before any allocation.
     const b = try billAtFloor(a, io, c, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
     return b.processBound();
 }
@@ -893,11 +895,14 @@ pub fn subCallMax(pb: v41.PrefillBill, joinless: bool, max_context: u64) struct 
     return .{ .wave = wave, .call_rows = rows };
 }
 
-/// The served module's billed context: `max_context_tokens` (covering, `billCovering`), else the standard request's length
-/// billed at that length alone (`billAt`, today's served bill).
+/// The served module's bill: every prompt length up to its context (`servedContext`: `max_context_tokens`, else the
+/// standard request's 16,384), the covering bill (`billCovering`): the prompt wave peaks where a whole prompt is one
+/// chunk (~3,953 tokens, 23.28 GB on the bank), far above the 16,384-token wave (13.87 GB), so a bill at the context's
+/// length alone under-bills a shorter prompt. A harness that pins ONE prompt (`RouteOverrides.bill_pinned_prompt`, the
+/// timed cell) bills that prompt alone (`billAt`) and the Module refuses any other length by name.
 pub fn servedBill(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
-    if (config.max_context_tokens) |m| return billCovering(a, io, config, m, fill_max_tokens, wired_bytes, ceiling_bytes, ov);
-    return billAt(a, io, config, fill_prompt_tokens, fill_max_tokens, wired_bytes, ceiling_bytes, ov);
+    if (ov.bill_pinned_prompt) |p| return billAt(a, io, config, p, fill_max_tokens, wired_bytes, ceiling_bytes, ov);
+    return billCovering(a, io, config, servedContext(config), fill_max_tokens, wired_bytes, ceiling_bytes, ov);
 }
 
 /// `fill` over the served bill (`servedBill` at the floor rows).
@@ -2239,3 +2244,37 @@ test "dsv41 memory: a prompt up to the sub-chunk bills its one call byte for byt
     try testing.expectEqual(one.layerMajorWaveBytes(131072, .served), promptWave(one, true, true, 131072));
 }
 
+
+test "dsv41 memory: the default served bill's wave covers every prompt length 1 .. 16,384, the chunk rule's breakpoints included (no bank)" {
+    const c = try realConfig();
+    const config: settings.Config = .{};
+    const pb = try prefillBillAt(&config, .{}, &c, 4);
+    // What `billCovering` takes at the default context (`servedContext` = 16,384): the covered lengths' largest wave.
+    const cov = coveredPromptLengths(pb, @min(servedContext(&config), pb.prefill_sub));
+    var billed: u64 = 0;
+    for (cov.at[0..cov.n]) |x| billed = @max(billed, promptWave(pb, true, true, x));
+    // The chunk rule's breakpoints: the knee (the longest one-chunk prompt) and every length where the chunk changes.
+    const knee = cov.at[1];
+    try testing.expectEqual(knee, pb.chunkRows(knee));
+    try testing.expect(pb.chunkRows(knee + 1) < knee + 1);
+    var breakpoints: usize = 0;
+    var worst_n: u64 = 0;
+    var worst: u64 = 0;
+    var n: u64 = 1;
+    while (n <= fill_prompt_tokens) : (n += 1) {
+        const w = promptWave(pb, true, true, n);
+        try testing.expect(w <= billed);
+        if (w > worst) {
+            worst = w;
+            worst_n = n;
+        }
+        if (n > 1 and pb.chunkRows(n) != pb.chunkRows(n - 1)) breakpoints += 1;
+    }
+    // The worst length is a covered one (the length after the knee on the bank: 3,953), its wave the covering wave; the
+    // 16,384 length alone bills far less (the old bill).
+    try testing.expect(worst_n == knee or worst_n == knee + 1);
+    try testing.expectEqual(worst, billed);
+    try testing.expect(breakpoints > 100);
+    try testing.expect(promptWave(pb, true, true, fill_prompt_tokens) + 9_000_000_000 < billed);
+    std.debug.print("\nDSV41_DEFAULT_COVERING {{\"knee\": {d}, \"worst_length\": {d}, \"covering_wave\": {d}, \"wave_16384\": {d}, \"breakpoints\": {d}}}\n", .{ knee, worst_n, billed, promptWave(pb, true, true, fill_prompt_tokens), breakpoints });
+}
