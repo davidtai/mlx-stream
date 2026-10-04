@@ -298,6 +298,9 @@ fn runOver(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, want: 
         if (!want.contains(e.kernel)) continue;
         var it = e.checks.iterator();
         while (it.next()) |c| {
+            // layout_guard is not run: its oracle was MLX's own mxfp8 quantized_matmul (MLX's to verify, not ours);
+            // the rcproj kernels' f64 checks cover them.
+            if (c == .layout_guard) continue;
             const before = report.results.items.len;
             h.dispatch(e.kernel, c) catch |err| {
                 var buf: [512]u8 = undefined;
@@ -369,7 +372,7 @@ const H = struct {
             .golden_tiles => try checkGoldenTiles(h, k),
             .mlx_chain => try checkChain(h, k),
             .f64 => try checkF64(h, k),
-            .layout_guard => try checkLayoutGuard(h, k),
+            .layout_guard => unreachable, // never planned (runOver)
             .composition => try checkComposition(h, k),
             .join_equiv => try checkJoinEquiv(h, k),
             .twin => if (bankedTwinOf(k) != null) try checkBankedTwin(h, k) else if (formTwinOf(k) != null) try checkFormTwin(h, k) else try checkTwin(h, k),
@@ -2019,61 +2022,6 @@ fn digF64(h: *H, k: Kernel) !void {
         }
     }
     try recordTol(h, k, words, worst, 1.0 / 256.0);
-}
-
-// ── layout_guard: rcproj rows vs MLX's own mxfp8 M = 1 route (per group on woa) ──
-
-fn checkLayoutGuard(h: *H, k: Kernel) !void {
-    const e = h.reg.get(k);
-    const s = h.s;
-    for (e.sites) |*site| {
-        var sc: Scope = .{ .a = h.a };
-        defer sc.deinit();
-        var vars = defaultVars(e);
-        const wave: Wave = .{};
-        const ins = try genAll(h, &sc, e, &vars, site, &wave);
-        const outs = try launch(h, &sc, k, ins[0..e.inputs.len], &vars, site.name);
-        const w = ins[inputIndex(e, "w")];
-        const sc_arr = ins[inputIndex(e, "scales")];
-        const x = ins[inputIndex(e, "x")];
-        const G: c_int = @intCast(site.G);
-        const N: c_int = @intCast(site.N);
-        const K: c_int = @intCast(site.K);
-        const rows: c_int = @intCast(vars.get(.rows));
-        var row_refs: [8]mlx.mlx_array = undefined;
-        for (0..@intCast(rows)) |m| {
-            var parts: [8]mlx.mlx_array = undefined;
-            const mm: c_int = @intCast(m);
-            for (0..@intCast(G)) |g| {
-                const gg: c_int = @intCast(g);
-                const xs = try op(&sc, mlx.mlx_slice, .{ x, &[2]c_int{ mm, gg * K }, @as(usize, 2), &[2]c_int{ mm + 1, (gg + 1) * K }, @as(usize, 2), &[2]c_int{ 1, 1 }, @as(usize, 2), s });
-                const ws = try op(&sc, mlx.mlx_slice, .{ w, &[2]c_int{ gg * N, 0 }, @as(usize, 2), &[2]c_int{ (gg + 1) * N, @divExact(K, 4) }, @as(usize, 2), &[2]c_int{ 1, 1 }, @as(usize, 2), s });
-                const ss = try op(&sc, mlx.mlx_slice, .{ sc_arr, &[2]c_int{ gg * N, 0 }, @as(usize, 2), &[2]c_int{ (gg + 1) * N, @divExact(K, 32) }, @as(usize, 2), &[2]c_int{ 1, 1 }, @as(usize, 2), s });
-                parts[g] = try op(&sc, mlx.mlx_quantized_matmul, .{ xs, ws, ss, mlx.mlx_array{}, true, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), @as([*:0]const u8, "mxfp8"), s });
-            }
-            const v = mlx.mlx_vector_array_new_data(&parts, @intCast(G));
-            defer _ = mlx.mlx_vector_array_free(v);
-            row_refs[m] = try op(&sc, mlx.mlx_concatenate_axis, .{ v, @as(c_int, -1), s });
-        }
-        const rv = mlx.mlx_vector_array_new_data(&row_refs, @intCast(rows));
-        defer _ = mlx.mlx_vector_array_free(rv);
-        const ref_arr = try op(&sc, mlx.mlx_concatenate_axis, .{ rv, @as(c_int, 0), s });
-        const got = try hostF64(h, outs[0]);
-        defer h.a.free(got);
-        const ref = try hostF64(h, ref_arr);
-        defer h.a.free(ref);
-        var num: f64 = 0;
-        var den: f64 = 0;
-        var finite = true;
-        for (got, ref) |a, b| {
-            finite = finite and std.math.isFinite(a);
-            num += (a - b) * (a - b);
-            den += b * b;
-        }
-        const max_rel = maxRel(got, ref);
-        const rms_rel = @sqrt(num / @max(den, 1e-30));
-        try h.record(.{ .kernel = k, .check = .layout_guard, .site = site.name, .words = got.len, .metric = max_rel, .limit = 2e-2, .ok = finite and max_rel <= 2e-2 and rms_rel <= 5e-3 });
-    }
 }
 
 // ── Tests ──
