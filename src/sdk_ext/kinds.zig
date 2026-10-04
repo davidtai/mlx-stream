@@ -77,3 +77,74 @@ pub const ExpertSource = struct {
         };
     }
 };
+
+const testing = std.testing;
+
+const fixture = struct {
+    fn claimsModel(p: *const peek.ConfigPeek) ?peek.Priority {
+        return if (p.modelType() != null) .generic else null;
+    }
+    fn billBytes(gpa: Allocator, io: std.Io, req: *const bill.BillRequest) !bill.MemoryBill {
+        _ = gpa;
+        _ = io;
+        return .{ .per_row = req.max_tokens };
+    }
+    fn claimsGroup(g: *const peek.GroupPeek, why: ?*peek.Diag) ?peek.Priority {
+        if (g.hidden == 0) return quant.decline(why, "fixture quant: no hidden", .{});
+        return .native;
+    }
+    /// The C2 quant half `quant.check` reads; the call half is never instantiated here.
+    fn Quant(comptime with_pin: bool, comptime with_bill: bool) type {
+        return struct {
+            pub const name = "fixture-quant";
+            pub fn Arrays(comptime T: type) type {
+                return struct { w: T };
+            }
+            pub const claims = claimsGroup;
+            pub fn Accepted(comptime G: type) type {
+                _ = G;
+                return struct {};
+            }
+            pub fn accept() void {}
+            pub const kernel_pin = if (with_pin) kernels.Pin{ .manifest_sha256 = "abc123" } else {};
+            pub const bill = if (with_bill) billBytes else {};
+        };
+    }
+};
+
+test "sdk kinds: a quant's kernel pin and bill are optional; `{}` switches either off; the bill runs through the table" {
+    const full = comptime Quant.of(fixture.Quant(true, true));
+    const bare = comptime Quant.of(fixture.Quant(false, false));
+    try testing.expectEqualStrings("fixture-quant", full.name);
+    try testing.expectEqualStrings("abc123", full.kernels.?.manifest_sha256);
+    try testing.expect(bare.kernels == null and bare.bill == null);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try peek.ConfigPeek.parse(arena.allocator(), "/m", "{}");
+    const req: bill.BillRequest = .{ .peek = &p, .cfg = &p, .routes = &p, .prompt_tokens = 1, .max_tokens = 4096, .ceiling = 0, .stop = 0 };
+    try testing.expectEqual(@as(u64, 4096), (try full.bill.?(testing.allocator, testing.io, &req)).per_row);
+    // the claim and its decline reason cross the table
+    var why: peek.Diag = .{};
+    const g: peek.GroupPeek = .{ .quantization = .null, .hidden = 0, .inter = 0, .n_experts = 0, .n_layers = 0, .layers = &.{} };
+    try testing.expectEqual(@as(?peek.Priority, null), full.claims(&g, &why));
+    try testing.expectEqualStrings("fixture quant: no hidden", why.message());
+}
+
+test "sdk kinds: an expert source's caps default to none and a declared set is copied; its bill is optional" {
+    const Plain = struct {
+        pub const name = "plain-stream";
+        pub const claims = fixture.claimsModel;
+    };
+    const Declared = struct {
+        pub const name = "declared-stream";
+        pub const claims = fixture.claimsModel;
+        pub const caps: ExpertCaps = .{ .two_phase = true, .event_gates = true };
+        pub const bill = fixture.billBytes;
+    };
+    const plain = comptime ExpertSource.of(Plain);
+    const declared = comptime ExpertSource.of(Declared);
+    try testing.expectEqual(ExpertCaps{}, plain.caps);
+    try testing.expect(plain.bill == null);
+    try testing.expectEqual(ExpertCaps{ .two_phase = true, .event_gates = true }, declared.caps);
+    try testing.expect(declared.bill != null);
+}

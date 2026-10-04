@@ -438,3 +438,296 @@ pub const GatherQmm = struct {
         }
     }
 };
+
+const testing = std.testing;
+
+/// A host backend for the adapter's tests: nodes of shape and dtype, and every graph op in call order. No MLX.
+const HostOps = struct {
+    pub const T = u32;
+    pub const Shape = struct {
+        d: [4]c_int = @splat(0),
+        n: usize = 0,
+        pub fn slice(s: *const Shape) []const c_int {
+            return s.d[0..s.n];
+        }
+    };
+    const Node = struct { shape: Shape, dtype: Dtype, words: []const u32 = &.{} };
+    pub const Op = struct { kind: []const u8, f: f64 = 0, dtype: Dtype = .float32, sorted: bool = false, mode: ?QuantMode = null };
+
+    a: Allocator,
+    nodes: std.ArrayList(Node) = .empty,
+    ops: std.ArrayList(Op) = .empty,
+
+    fn deinit(g: *HostOps) void {
+        for (g.nodes.items) |n| g.a.free(n.words);
+        g.nodes.deinit(g.a);
+        g.ops.deinit(g.a);
+    }
+    fn node(g: *HostOps, shape: []const c_int, dt: Dtype) !T {
+        var s: Shape = .{ .n = shape.len };
+        @memcpy(s.d[0..shape.len], shape);
+        try g.nodes.append(g.a, .{ .shape = s, .dtype = dt });
+        return @intCast(g.nodes.items.len - 1);
+    }
+    fn op(g: *HostOps, o: Op, shape: []const c_int, dt: Dtype) !T {
+        try g.ops.append(g.a, o);
+        return g.node(shape, dt);
+    }
+    pub fn shapeOf(g: *HostOps, x: T) Shape {
+        return g.nodes.items[x].shape;
+    }
+    pub fn dtypeOf(g: *HostOps, x: T) Dtype {
+        return g.nodes.items[x].dtype;
+    }
+    pub fn mul(g: *HostOps, x: T, y: T) !T {
+        return g.op(.{ .kind = "mul" }, g.shapeOf(x).slice(), g.dtypeOf(y));
+    }
+    pub fn silu(g: *HostOps, x: T) !T {
+        return g.op(.{ .kind = "silu" }, g.shapeOf(x).slice(), g.dtypeOf(x));
+    }
+    pub fn clip(g: *HostOps, x: T, lo: T, hi: T) !T {
+        _ = .{ lo, hi };
+        return g.op(.{ .kind = "clip" }, g.shapeOf(x).slice(), g.dtypeOf(x));
+    }
+    pub fn minimum(g: *HostOps, x: T, y: T) !T {
+        _ = y;
+        return g.op(.{ .kind = "minimum" }, g.shapeOf(x).slice(), g.dtypeOf(x));
+    }
+    pub fn scalar(g: *HostOps, v: f64, dt: Dtype) !T {
+        return g.op(.{ .kind = "scalar", .f = v, .dtype = dt }, &.{}, dt);
+    }
+    pub fn take(g: *HostOps, x: T, idx: T, axis: c_int) !T {
+        std.debug.assert(axis == 0);
+        var s = g.shapeOf(x);
+        s.d[0] = g.shapeOf(idx).d[0];
+        return g.op(.{ .kind = "take" }, s.slice(), g.dtypeOf(x));
+    }
+    pub fn hostArray(g: *HostOps, bytes: []const u8, shape: []const c_int, dt: Dtype) !T {
+        const x = try g.node(shape, dt);
+        const words = try g.a.alloc(u32, bytes.len / 4);
+        @memcpy(std.mem.sliceAsBytes(words), bytes);
+        g.nodes.items[x].words = words;
+        return x;
+    }
+    pub fn reshape(g: *HostOps, x: T, shape: []const c_int) !T {
+        return g.node(shape, g.dtypeOf(x));
+    }
+    pub fn gatherMatmul(g: *HostOps, x: T, w: T, scales: ?T, biases: ?T, rhs: T, bits: u32, group: u32, mode: ?QuantMode, sorted: bool) !T {
+        _ = .{ scales, biases, rhs, bits, group };
+        return g.op(.{ .kind = "gather", .sorted = sorted, .mode = mode }, &.{ g.shapeOf(x).d[0], 1, g.shapeOf(w).d[1] }, g.dtypeOf(x));
+    }
+    fn kinds(g: *const HostOps, from: usize, buf: []u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        for (g.ops.items[from..]) |o| w.print("{s} ", .{o.kind}) catch break;
+        return w.buffered();
+    }
+};
+
+comptime {
+    if (@import("builtin").is_test) checkAccepted(FromGatherMatmul(GatherQmm), HostOps);
+}
+
+fn groupOf(arena: Allocator, quantization: []const u8) !BankPeek {
+    const q = try std.json.parseFromSliceLeaky(std.json.Value, arena, quantization, .{});
+    return .{ .quantization = q, .hidden = 64, .inter = 32, .n_experts = 4, .n_layers = 1, .layers = &.{} };
+}
+
+test "sdk quant: a refusal and a decline write their reason when asked, truncated to the buffer, and return their verdict" {
+    var d: Diag = .{};
+    try testing.expectEqual(error.TopKTooWide, refuse(&d, error.TopKTooWide, "top_k {d}", .{9}));
+    try testing.expectEqualStrings("top_k 9", d.message());
+    try testing.expectEqual(error.BankArrays, refuse(null, error.BankArrays, "unused {d}", .{1}));
+    try testing.expectEqual(@as(?Priority, null), decline(&d, "{s}", .{"declined"}));
+    try testing.expectEqualStrings("declined", d.message());
+    try testing.expectEqual(@as(?Priority, null), decline(null, "x", .{}));
+    const long: [500]u8 = @splat('y');
+    _ = decline(&d, "{s}", .{&long});
+    try testing.expectEqual(d.buf.len, d.message().len);
+}
+
+test "sdk quant: the JSON readers return null (or .null) for a missing field, a mistyped field and a non-object" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"mode\":\"mxfp4\",\"bits\":4,\"o\":{\"k\":1},\"f\":4.5}", .{});
+    try testing.expectEqualStrings("mxfp4", str(v, "mode").?);
+    try testing.expect(str(v, "bits") == null and str(v, "absent") == null);
+    try testing.expectEqual(@as(?i64, 4), int(v, "bits"));
+    try testing.expect(int(v, "f") == null and int(v, "mode") == null);
+    try testing.expectEqual(@as(i64, 1), obj(v, "o").object.get("k").?.integer);
+    try testing.expect(obj(v, "absent") == .null);
+    const arr = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "[1]", .{});
+    try testing.expect(str(arr, "mode") == null and int(arr, "bits") == null and obj(arr, "o") == .null);
+}
+
+test "sdk quant: the gather quant claims MLX's own quantizations and dense experts, generically; each decline names its field" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Case = struct { q: []const u8, want: ?Priority, why: []const u8 = "" };
+    const cases = [_]Case{
+        .{ .q = "null", .want = .generic },
+        .{ .q = "{\"bits\":4,\"group_size\":64}", .want = .generic },
+        .{ .q = "{\"mode\":\"mxfp4\",\"bits\":4,\"group_size\":32}", .want = .generic },
+        .{ .q = "{\"mode\":\"nvfp4\",\"bits\":4,\"group_size\":16}", .want = .generic },
+        .{ .q = "{\"mode\":\"mxfp8\",\"bits\":8,\"group_size\":32}", .want = .generic },
+        .{ .q = "4", .want = null, .why = "quantization is not an object" },
+        .{ .q = "{\"mode\":\"int3\",\"bits\":3,\"group_size\":32}", .want = null, .why = "quantization.mode \"int3\" is not an MLX quantization mode" },
+        .{ .q = "{\"mode\":\"affine\",\"group_size\":32}", .want = null, .why = "quantization.bits missing" },
+        .{ .q = "{\"mode\":\"affine\",\"bits\":4.0,\"group_size\":32}", .want = null, .why = "quantization.bits missing" },
+        .{ .q = "{\"mode\":\"affine\",\"bits\":4}", .want = null, .why = "quantization.group_size missing" },
+        .{ .q = "{\"mode\":\"affine\",\"bits\":-4,\"group_size\":32}", .want = null, .why = "affine at -4 bits, group 32 is not an MLX quantization" },
+        .{ .q = "{\"mode\":\"affine\",\"bits\":4,\"group_size\":-32}", .want = null, .why = "group -32" },
+        .{ .q = "{\"mode\":\"affine\",\"bits\":7,\"group_size\":64}", .want = null, .why = "affine at 7 bits" },
+        .{ .q = "{\"mode\":\"affine\",\"bits\":1,\"group_size\":64}", .want = null, .why = "affine at 1 bits" },
+        .{ .q = "{\"mode\":\"affine\",\"bits\":9,\"group_size\":64}", .want = null, .why = "affine at 9 bits" },
+        .{ .q = "{\"mode\":\"affine\",\"bits\":4,\"group_size\":16}", .want = null, .why = "group 16" },
+        .{ .q = "{\"mode\":\"mxfp4\",\"bits\":4,\"group_size\":64}", .want = null, .why = "mxfp4 at 4 bits, group 64" },
+        .{ .q = "{\"mode\":\"nvfp4\",\"bits\":4,\"group_size\":32}", .want = null, .why = "nvfp4 at 4 bits, group 32" },
+        .{ .q = "{\"mode\":\"mxfp8\",\"bits\":4,\"group_size\":32}", .want = null, .why = "mxfp8 at 4 bits" },
+        .{ .q = "{\"mode\":\"gguf\",\"bits\":4,\"group_size\":32}", .want = null, .why = "gguf at 4 bits" },
+    };
+    for (cases) |c| {
+        const g = try groupOf(a, c.q);
+        var why: Diag = .{};
+        testing.expectEqual(c.want, GatherQmm.claims(&g, &why)) catch |e| {
+            std.debug.print("claims {s}: {s}\n", .{ c.q, why.message() });
+            return e;
+        };
+        if (c.want == null) try testing.expect(std.mem.indexOf(u8, why.message(), c.why) != null);
+    }
+    // every affine width MLX quantizes, at every affine group
+    for ([_]u32{ 2, 3, 4, 5, 6, 8 }) |bits| for ([_]u32{ 32, 64, 128 }) |group| {
+        try testing.expect(GatherQmm.valid(.affine, bits, group));
+    };
+}
+
+test "sdk quant: the gather quant's params are what its claim read; a declined description is NotClaimed at accept" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const spec: Spec = .{ .hidden = 64, .inter = 32, .top_k = 2, .n_layers = 1, .act = .swiglu, .input = .bfloat16 };
+    var d: Diag = .{};
+    try testing.expectEqual(GatherQmm.Params{ .mode = null, .bits = 16, .group_size = 0 }, try GatherQmm.params(&try groupOf(a, "null"), spec, &d));
+    try testing.expectEqual(GatherQmm.Params{ .mode = .affine, .bits = 6, .group_size = 128 }, try GatherQmm.params(&try groupOf(a, "{\"bits\":6,\"group_size\":128}"), spec, &d));
+    try testing.expectError(error.NotClaimed, GatherQmm.params(&try groupOf(a, "{\"mode\":\"mxfp4\",\"bits\":8,\"group_size\":32}"), spec, &d));
+    try testing.expect(std.mem.indexOf(u8, d.message(), "mxfp4 at 8 bits") != null);
+
+    var g: HostOps = .{ .a = testing.allocator };
+    defer g.deinit();
+    const Q = FromGatherMatmul(GatherQmm);
+    try testing.expectError(error.NoWeightDescription, Q.accept(HostOps, testing.allocator, &g, .{}, spec, &d));
+    try testing.expectEqualStrings("quant mlx-gather-qmm: accepted without the group's description", d.message());
+    const declined = try groupOf(a, "{\"mode\":\"gguf\",\"bits\":4,\"group_size\":32}");
+    try testing.expectError(error.NotClaimed, Q.accept(HostOps, testing.allocator, &g, .{ .peek = &declined }, spec, &d));
+    try testing.expectEqual(@as(u32, 63), Q.Accepted(HostOps).max_decode_rows);
+}
+
+test "sdk quant: a projection's arrays are checked against the params, by projection, and the biases follow the mode" {
+    var g: HostOps = .{ .a = testing.allocator };
+    defer g.deinit();
+    var d: Diag = .{};
+    const A = GatherQmm.Arrays(u32);
+    const mx4: GatherQmm.Params = .{ .mode = .mxfp4, .bits = 4, .group_size = 32 };
+    const aff: GatherQmm.Params = .{ .mode = .affine, .bits = 4, .group_size = 64 };
+    const dense: GatherQmm.Params = .{ .mode = null, .bits = 16, .group_size = 0 };
+    // gate: in 128 -> out 64; packed in = 128 * 4 / 32 = 16 words; scales in / group
+    const w = try g.node(&.{ 4, 64, 16 }, .uint32);
+    const s32 = try g.node(&.{ 4, 64, 4 }, .uint8);
+    const s64 = try g.node(&.{ 4, 64, 2 }, .bfloat16);
+    try GatherQmm.checkArrays(HostOps, &g, &mx4, .gate, A{ .w = w, .scales = s32 }, 128, 64, &d);
+    try GatherQmm.checkArrays(HostOps, &g, &aff, .gate, A{ .w = w, .scales = s64, .biases = s64 }, 128, 64, &d);
+    try GatherQmm.checkArrays(HostOps, &g, &dense, .down, A{ .w = try g.node(&.{ 4, 64, 128 }, .bfloat16) }, 128, 64, &d);
+    const Bad = struct { p: *const GatherQmm.Params, arrays: A, why: []const u8 };
+    const bad = [_]Bad{
+        .{ .p = &mx4, .arrays = .{ .w = try g.node(&.{ 64, 16 }, .uint32), .scales = s32 }, .why = "gate w is { 64, 16 }" },
+        .{ .p = &mx4, .arrays = .{ .w = try g.node(&.{ 4, 32, 16 }, .uint32), .scales = s32 }, .why = "the params read [slots, 64, 16]" },
+        .{ .p = &mx4, .arrays = .{ .w = try g.node(&.{ 4, 64, 32 }, .uint32), .scales = s32 }, .why = "gate w is" },
+        .{ .p = &dense, .arrays = .{ .w = w }, .why = "the params read [slots, 64, 128]" },
+        .{ .p = &mx4, .arrays = .{ .w = w }, .why = "gate has no scales" },
+        .{ .p = &mx4, .arrays = .{ .w = w, .scales = try g.node(&.{ 4, 64 }, .uint8) }, .why = "gate scales are" },
+        .{ .p = &mx4, .arrays = .{ .w = w, .scales = try g.node(&.{ 3, 64, 4 }, .uint8) }, .why = "want [slots, 64, 4]" },
+        .{ .p = &mx4, .arrays = .{ .w = w, .scales = try g.node(&.{ 4, 63, 4 }, .uint8) }, .why = "gate scales are" },
+        .{ .p = &mx4, .arrays = .{ .w = w, .scales = try g.node(&.{ 4, 64, 8 }, .uint8) }, .why = "gate scales are" },
+        .{ .p = &mx4, .arrays = .{ .w = w, .scales = s32, .biases = s32 }, .why = "gate biases given for mxfp4" },
+        .{ .p = &aff, .arrays = .{ .w = w, .scales = s64 }, .why = "gate biases missing for affine" },
+    };
+    for (bad) |b| {
+        try testing.expectError(error.BankArrays, GatherQmm.checkArrays(HostOps, &g, b.p, .gate, b.arrays, 128, 64, &d));
+        testing.expect(std.mem.indexOf(u8, d.message(), b.why) != null) catch |e| {
+            std.debug.print("want \"{s}\" in \"{s}\"\n", .{ b.why, d.message() });
+            return e;
+        };
+    }
+}
+
+test "sdk quant: the activation runs in mlx-lm's order, its limit scalars in each operand's dtype" {
+    var g: HostOps = .{ .a = testing.allocator };
+    defer g.deinit();
+    const gate = try g.node(&.{ 2, 8 }, .bfloat16);
+    const up = try g.node(&.{ 2, 8 }, .float16);
+    var buf: [256]u8 = undefined;
+    const plain = try activation(HostOps, &g, .swiglu, gate, up);
+    try testing.expectEqualStrings("silu mul ", g.kinds(0, &buf));
+    try testing.expectEqualSlices(c_int, &.{ 2, 8 }, g.shapeOf(plain).slice());
+    const from = g.ops.items.len;
+    _ = try activation(HostOps, &g, .{ .swiglu_clamped = 7.0 }, gate, up);
+    try testing.expectEqualStrings("scalar scalar clip scalar minimum silu mul ", g.kinds(from, &buf));
+    const o = g.ops.items[from..];
+    try testing.expect(o[0].f == -7.0 and o[0].dtype == .float16 and o[1].f == 7.0 and o[1].dtype == .float16);
+    try testing.expect(o[3].f == 7.0 and o[3].dtype == .bfloat16);
+}
+
+test "sdk quant: the gather adapter's prefill sorts the routed rows stably by slot, gathers sorted, and restores routed order; dense experts never sort" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: HostOps = .{ .a = testing.allocator };
+    defer g.deinit();
+    var d: Diag = .{};
+    const Q = FromGatherMatmul(GatherQmm);
+    const spec: Spec = .{ .hidden = 64, .inter = 32, .top_k = 2, .n_layers = 1, .act = .swiglu, .input = .bfloat16 };
+    const mx = try groupOf(arena.allocator(), "{\"mode\":\"mxfp4\",\"bits\":4,\"group_size\":32}");
+    const acc = try Q.accept(HostOps, testing.allocator, &g, .{ .peek = &mx }, spec, &d);
+    defer acc.deinit(&g);
+    const bank: BankArrays(GatherQmm.Arrays(u32)) = .{
+        .gate = .{ .w = try g.node(&.{ 4, 32, 8 }, .uint32) },
+        .up = .{ .w = try g.node(&.{ 4, 32, 8 }, .uint32) },
+        .down = .{ .w = try g.node(&.{ 4, 64, 4 }, .uint32) },
+    };
+    // the bank is checked per projection against the spec's (hidden 64, inter 32): down reads [slots, 64, 32 * 4 / 32]
+    const scaled = struct {
+        fn of(gg: *HostOps, out: c_int, in: c_int) !GatherQmm.Arrays(u32) {
+            return .{ .w = try gg.node(&.{ 4, out, @divExact(in * 4, 32) }, .uint32), .scales = try gg.node(&.{ 4, out, @divExact(in, 32) }, .uint8) };
+        }
+    };
+    try acc.checkBank(&g, .{ .gate = try scaled.of(&g, 32, 64), .up = try scaled.of(&g, 32, 64), .down = try scaled.of(&g, 64, 32) }, &d);
+    try testing.expectError(error.BankArrays, acc.checkBank(&g, .{ .gate = try scaled.of(&g, 32, 64), .up = try scaled.of(&g, 32, 64), .down = try scaled.of(&g, 32, 64) }, &d));
+    try testing.expect(std.mem.startsWith(u8, d.message(), "quant mlx-gather-qmm: down w is"));
+    // no act_row: routed row i reads x row i
+    const x = try g.node(&.{ 5, 64 }, .bfloat16);
+    const from = g.ops.items.len;
+    const y = try acc.prefill(&g, 0, x, .{ .slot = &.{ 3, 1, 3, 0, 1 } }, bank);
+    try testing.expectEqualSlices(u32, &.{ 3, 1, 4, 0, 2 }, acc.order.items);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 1, 3, 3 }, acc.ids.items);
+    try testing.expectEqualSlices(u32, acc.order.items, acc.src.items);
+    for (acc.order.items, 0..) |o, i| try testing.expectEqual(@as(u32, @intCast(i)), acc.inv.items[o]);
+    try testing.expectEqualSlices(c_int, &.{ 5, 64 }, g.shapeOf(y).slice());
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("take gather gather silu mul gather take ", g.kinds(from, &buf));
+    for (g.ops.items[from..]) |o| if (std.mem.eql(u8, o.kind, "gather")) try testing.expect(o.sorted and o.mode.? == .mxfp4);
+    // decode width: no sort
+    const ids = try g.node(&.{2}, .uint32);
+    const from2 = g.ops.items.len;
+    _ = try acc.down(&g, try acc.gateUp(&g, try g.node(&.{ 2, 64 }, .bfloat16), ids, bank.gate, bank.up), ids, bank.down);
+    try testing.expectEqualStrings("gather gather silu mul gather ", g.kinds(from2, &buf));
+    for (g.ops.items[from2..]) |o| if (std.mem.eql(u8, o.kind, "gather")) try testing.expect(!o.sorted);
+    try acc.finishPrefill(&g);
+
+    // dense experts: MLX's dense gather_mm is wrong with sorted indices, so the prefill passes them unsorted
+    const dense = try groupOf(arena.allocator(), "null");
+    const dacc = try Q.accept(HostOps, testing.allocator, &g, .{ .peek = &dense }, spec, &d);
+    defer dacc.deinit(&g);
+    const from3 = g.ops.items.len;
+    _ = try dacc.prefill(&g, 0, x, .{ .slot = &.{ 2, 0 }, .act_row = &.{ 4, 1 } }, bank);
+    try testing.expectEqualSlices(u32, &.{ 1, 4 }, dacc.src.items);
+    for (g.ops.items[from3..]) |o| if (std.mem.eql(u8, o.kind, "gather")) try testing.expect(!o.sorted and o.mode == null);
+}

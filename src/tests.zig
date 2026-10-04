@@ -55,5 +55,7 @@ comptime {
     _ = @import("dsv41_profile.zig");
     _ = @import("sdk_ext.zig");
     _ = @import("nocache_io.zig");
+    _ = @import("ngram_table.zig");
+    _ = @import("ngram_table_parity_test.zig");
     _ = @import("exl3_sushi_parity.zig");
 }

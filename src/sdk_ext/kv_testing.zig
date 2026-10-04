@@ -174,3 +174,25 @@ test "sdk testing: every kv lane keeps the concatenated store's rows through app
     ring_steps[steps.len] = .{ .n = 1, .trim = 200 };
     try expectLaneEquivalence(&g, &ring, &ring_steps, 128 - 1);
 }
+
+test "sdk kv: the lanes' logical rows (a ring's dropped rows included) and a full rollback of each lane" {
+    const L = kv.Lanes(RowOps);
+    var g: RowOps = .{ .gpa = testing.allocator };
+    defer g.deinit();
+    var store: L.Window = .{ .store = .{ .concat = .{} } };
+    defer store.deinit(&g);
+    try store.append(&g, try g.range(0, 5));
+    try testing.expect(store.rows() == 5 and store.dropOffset() == 0 and store.canTruncateTo(0));
+    try store.store.truncate(&g, 0);
+    try testing.expect(store.rows() == 0 and try store.view(&g) == null);
+    var ring: L.Window = .{ .ring = L.Ring.init(4, .{ .route = .window_ring, .max_verify = 1, .slack = 1, .headroom = 2 }) };
+    defer ring.deinit(&g);
+    var pos: i64 = 0;
+    while (pos < 40) : (pos += 4) try ring.append(&g, try g.range(pos, pos + 4));
+    const r = ring.ring;
+    try testing.expect(r.drop > 0 and ring.rows() == 40 and r.logicalLen() == r.drop + r.len and ring.dropOffset() == r.drop);
+    // a rollback to the start is always honoured; it keeps no row
+    try testing.expect(ring.canTruncateTo(0) and !ring.canTruncateTo(1));
+    try ring.ring.truncateToLength(0);
+    try testing.expect(ring.rows() == 0);
+}

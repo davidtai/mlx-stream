@@ -197,3 +197,237 @@ pub fn KernelSet(comptime R: type) type {
         }
     };
 }
+
+const testing = std.testing;
+
+/// A three-kernel registry without Metal: texts are names, the pin is their join, binding counts, the self-check plan
+/// is the stub device's. Enough of `R` for the set's own machinery.
+const FakeReg = struct {
+    pub const Kernel = enum { k0, k1, k2 };
+    pub const Header = enum { h0, h1 };
+    pub const Check = enum { parity, bounds };
+    pub const n_kernels = 3;
+    pub const n_headers = 2;
+    pub const Texts = [n_kernels][]const u8;
+    pub const embedded: Texts = .{ "k0", "k1", "k2" };
+    pub const manifest_sha256 = "fake-manifest";
+    pub const Diag = struct { msg: []const u8 = "" };
+    pub const Entry = struct { kernel: Kernel, checks: std.EnumSet(Check), header: ?Header };
+
+    pub const Registry = struct {
+        entries: [n_kernels]Entry,
+        texts: *const Texts,
+        live: *u32,
+
+        var live_count: u32 = 0;
+        var refuse_bind = false;
+
+        pub fn init(a: std.mem.Allocator, texts: *const Texts, pin: []const u8, diag: *Diag) !Registry {
+            _ = a;
+            if (!std.mem.eql(u8, pin, manifest_sha256)) {
+                diag.msg = "manifest not pinned";
+                return error.ManifestNotPinned;
+            }
+            live_count += 1;
+            return .{
+                .entries = .{
+                    .{ .kernel = .k0, .checks = .initMany(&.{ .parity, .bounds }), .header = .h0 },
+                    .{ .kernel = .k1, .checks = .initOne(.parity), .header = .h0 },
+                    .{ .kernel = .k2, .checks = .initOne(.bounds), .header = null },
+                },
+                .texts = texts,
+                .live = &live_count,
+            };
+        }
+        pub fn deinit(r: *Registry) void {
+            r.live.* -= 1;
+        }
+        /// The stream arm's bind: here it builds nothing, it marks every kernel built.
+        pub fn bind(self: *const Registry, stream: mlx.mlx_stream, diag: *Diag) !Bound {
+            if (refuse_bind) {
+                diag.msg = "kernel create failed";
+                return error.KernelCreateFailed;
+            }
+            return .{ .reg = self, .stream = stream, .kernels = @splat(.{ .built = true }) };
+        }
+    };
+
+    pub const Bound = struct {
+        reg: *const Registry,
+        stream: mlx.mlx_stream,
+        kernels: [n_kernels]struct { built: bool = false },
+        observed: bool = false,
+        pub fn observe(self: *Bound, comptime L: type) void {
+            self.observed = L.enabled;
+        }
+        pub fn deinit(_: *Bound) void {}
+    };
+
+    pub const selfcheck = struct {
+        pub const Result = struct { kernel: Kernel, check: Check, words: u32, ok: bool, err: []const u8 };
+        pub const Report = struct {
+            results: std.ArrayList(Result) = .empty,
+            fn deinit(r: *Report, a: std.mem.Allocator) void {
+                r.results.deinit(a);
+            }
+        };
+        /// The stream arm's plan: one passing result per subset kernel, marked as the device's (words 2).
+        pub fn runSubset(a: std.mem.Allocator, _: *const Registry, bound: *const Bound, subset: []const Kernel, report: *Report) !void {
+            for (subset) |k| try report.results.append(a, .{ .kernel = k, .check = .parity, .words = 2, .ok = bound.kernels[@backingInt(k)].built, .err = "" });
+        }
+        pub fn judge(report: *const Report, diag: *Diag) !void {
+            for (report.results.items) |r| if (!r.ok) {
+                diag.msg = @tagName(r.kernel);
+                return error.SelfCheckFailed;
+            };
+        }
+    };
+};
+
+const FS = KernelSet(FakeReg);
+
+/// A backend with every route method (bodies never run here) and the launcher slot `install` fills.
+const RouteBackend = struct {
+    launcher: ?*const FakeReg.Bound = null,
+    pub fn launch() void {}
+    pub fn shapeOf() void {}
+    pub fn dtypeOf() void {}
+    pub fn hostArray() void {}
+    pub fn keep() void {}
+    pub fn release() void {}
+    pub fn reshape() void {}
+    pub fn astype() void {}
+};
+
+test "sdk kernel set: a stub-device set is built over its pinned registry, erased and taken back by pin only" {
+    var diag: FakeReg.Diag = .{};
+    try testing.expectError(error.ManifestNotPinned, FS.Set.init(testing.allocator, .{ .device = .{ .stub = .{} }, .pin = "another" }, &diag));
+    try testing.expectEqualStrings("manifest not pinned", diag.msg);
+    try testing.expectEqual(@as(u32, 0), FakeReg.Registry.live_count);
+    const s = try FS.Set.init(testing.allocator, .{ .device = .{ .stub = .{} } }, &diag);
+    try testing.expectEqual(@as(u32, 1), FakeReg.Registry.live_count);
+    try testing.expect(s.bound.reg == &s.reg and s.reg.texts == &FakeReg.embedded);
+    const r = s.ref();
+    try testing.expectEqualStrings("fake-manifest", r.manifest_sha256);
+    try testing.expect(FS.Set.of(r).? == s);
+    try testing.expect(FS.Set.of(.{ .set = s, .manifest_sha256 = "another" }) == null);
+    s.deinit();
+    try testing.expectEqual(@as(u32, 0), FakeReg.Registry.live_count);
+}
+
+test "sdk kernel set: install points the backend's launcher (or its wrapped base's) at the bound set; uninstall clears it" {
+    var diag: FakeReg.Diag = .{};
+    const s = try FS.Set.init(testing.allocator, .{ .device = .{ .stub = .{} } }, &diag);
+    defer s.deinit();
+    var g: RouteBackend = .{};
+    s.install(RouteBackend, &g);
+    try testing.expect(g.launcher.? == &s.bound and !s.bound.observed);
+    FS.Set.uninstall(RouteBackend, &g);
+    try testing.expect(g.launcher == null);
+    // a profiling wrapper: the launcher lives on its base, and the wrapper's hook observes the launches
+    const Wrapper = struct {
+        inner: *RouteBackend,
+        pub const Inner = RouteBackend;
+        pub const profile_hook: profile.Hook = .{ .launch = struct {
+            pub const enabled = true;
+            pub fn kernel(_: []const u8, _: u64, _: []const mlx.mlx_array) void {}
+        } };
+        pub fn base(w: *@This()) *RouteBackend {
+            return w.inner;
+        }
+        pub fn launch() void {}
+        pub fn shapeOf() void {}
+        pub fn dtypeOf() void {}
+        pub fn hostArray() void {}
+        pub fn keep() void {}
+        pub fn release() void {}
+        pub fn reshape() void {}
+        pub fn astype() void {}
+    };
+    var w: Wrapper = .{ .inner = &g };
+    s.install(Wrapper, &w);
+    try testing.expect(g.launcher.? == &s.bound and s.bound.observed);
+    FS.Set.uninstall(Wrapper, &w);
+    try testing.expect(g.launcher == null);
+    // a backend without a slot installs nothing (the host trace without launches)
+    const NoSlot = struct {
+        pub fn launch() void {}
+        pub fn shapeOf() void {}
+        pub fn dtypeOf() void {}
+        pub fn hostArray() void {}
+        pub fn keep() void {}
+        pub fn release() void {}
+        pub fn reshape() void {}
+        pub fn astype() void {}
+    };
+    var n: NoSlot = .{};
+    s.install(NoSlot, &n);
+    FS.Set.uninstall(NoSlot, &n);
+    try testing.expectEqual(@as(?[]const u8, null), FS.missingBackendMethod(RouteBackend));
+    try testing.expectEqualStrings("launch", FS.missingBackendMethod(struct {}).?);
+    try testing.expectEqualStrings("astype", FS.missingBackendMethod(struct {
+        pub fn launch() void {}
+        pub fn shapeOf() void {}
+        pub fn dtypeOf() void {}
+        pub fn hostArray() void {}
+        pub fn keep() void {}
+        pub fn release() void {}
+        pub fn reshape() void {}
+    }).?);
+}
+
+test "sdk kernel set: a consumer self-checks its own subset in registry order; a scripted failure is refused by name" {
+    var diag: FakeReg.Diag = .{};
+    const s = try FS.Set.init(testing.allocator, .{ .device = .{ .stub = .{} } }, &diag);
+    defer s.deinit();
+    var report: FakeReg.selfcheck.Report = .{};
+    defer report.deinit(testing.allocator);
+    try s.selfCheck(testing.allocator, &.{ .k2, .k0 }, &report, &diag);
+    try testing.expectEqual(@as(usize, 3), report.results.items.len);
+    const r = report.results.items;
+    try testing.expect(r[0].kernel == .k0 and r[0].check == .parity and r[1].kernel == .k0 and r[1].check == .bounds and r[2].kernel == .k2);
+    for (r) |x| try testing.expect(x.ok and x.err.len == 0);
+
+    const f = try FS.Set.init(testing.allocator, .{ .device = .{ .stub = .{ .fail = .{ .kernel = .k1, .check = .parity } } } }, &diag);
+    defer f.deinit();
+    var report2: FakeReg.selfcheck.Report = .{};
+    defer report2.deinit(testing.allocator);
+    // the failing kernel outside the subset is never planned
+    try f.selfCheck(testing.allocator, &.{.k0}, &report2, &diag);
+    try testing.expectError(error.SelfCheckFailed, f.selfCheck(testing.allocator, &.{.k1}, &report2, &diag));
+    try testing.expectEqualStrings("k1", diag.msg);
+    try testing.expectEqualStrings("stub device: scripted failure", report2.results.items[report2.results.items.len - 1].err);
+    try testing.expect(FS.subsetOf(&.{ .k2, .k2 }).count() == 1 and FS.subsetOf(&.{}).count() == 0);
+
+    // a stream device binds through the registry and runs the registry's own plan (this fake's touches no device)
+    const d = try FS.Set.init(testing.allocator, .{ .device = .{ .stream = .{} } }, &diag);
+    defer d.deinit();
+    try testing.expect(d.device == .stream and d.bound.kernels[2].built);
+    var report3: FakeReg.selfcheck.Report = .{};
+    defer report3.deinit(testing.allocator);
+    try d.selfCheck(testing.allocator, &.{.k1}, &report3, &diag);
+    try testing.expect(report3.results.items.len == 1 and report3.results.items[0].words == 2);
+    // a bind refusal frees the registry it built
+    FakeReg.Registry.refuse_bind = true;
+    defer FakeReg.Registry.refuse_bind = false;
+    const live = FakeReg.Registry.live_count;
+    try testing.expectError(error.KernelCreateFailed, FS.Set.init(testing.allocator, .{ .device = .{ .stream = .{} } }, &diag));
+    try testing.expectEqualStrings("kernel create failed", diag.msg);
+    try testing.expectEqual(live, FakeReg.Registry.live_count);
+}
+
+test "sdk kernel set: the consumers partition the kernels and the headers, or the first violation is named" {
+    comptime FS.checkPartition(&.{ &.{ .k0, .k1 }, &.{.k2} });
+    var diag: FakeReg.Diag = .{};
+    const s = try FS.Set.init(testing.allocator, .{ .device = .{ .stub = .{} } }, &diag);
+    defer s.deinit();
+    var buf: [128]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), FS.partitionError(&s.reg, &.{ &.{ .k0, .k1 }, &.{.k2} }, &buf));
+    try testing.expectEqualStrings("k1 is in subsets 0 and 1", FS.partitionError(&s.reg, &.{ &.{ .k0, .k1 }, &.{ .k1, .k2 } }, &buf).?);
+    try testing.expectEqualStrings("k2 is in no subset", FS.partitionError(&s.reg, &.{ &.{.k0}, &.{.k1} }, &buf).?);
+    // k0 and k1 read h0: splitting them across consumers shares a header
+    try testing.expectEqualStrings("header h0 is read by subsets 0 and 1 (k1)", FS.partitionError(&s.reg, &.{ &.{ .k0, .k2 }, &.{.k1} }, &buf).?);
+    // a buffer too small for the message returns the buffer itself
+    var tiny: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), FS.partitionError(&s.reg, &.{ &.{.k0}, &.{.k1} }, &tiny).?.len);
+}
