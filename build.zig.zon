@@ -1,0 +1,17 @@
+.{
+    .name = .mlx_stream,
+    .version = "0.1.0",
+    .fingerprint = 0x96c799c23b4f6a80,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "csrc",
+        "LICENSE",
+        "LICENSE-APACHE-2.0",
+        "NOTICE",
+        "README.md",
+    },
+    .dependencies = .{},
+}

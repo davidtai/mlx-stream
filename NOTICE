@@ -1,0 +1,72 @@
+mlx-stream
+Copyright (c) 2026 David Tai
+
+mlx-stream as a whole is distributed under the MIT License (see LICENSE). It
+incorporates or is derived from third-party material that remains under its own
+license, listed below. Those licenses continue to apply to those portions. A
+copy of the Apache License, Version 2.0 ships with this repository as
+LICENSE-APACHE-2.0. The source comments at each site name their upstream too.
+
+mlx-stream is a plugin for mlx-serve (https://github.com/ddalcu/mlx-serve,
+Copyright (c) 2026 David Dalcu, MIT). It was split out of a fork of mlx-serve;
+the files it shares with the host's SDK seams (src/sdk_ext/check.zig, the
+no-cache read helpers in src/nocache_io.zig and the n-gram table in
+src/ngram_table.zig) were written for that fork by this repository's author.
+
+================================================================================
+Apache License, Version 2.0
+================================================================================
+
+--------------------------------------------------------------------------------
+MTPLX
+https://github.com/youssofal/mtplx
+Copyright 2026 Youssof Altoukhi
+Licensed under the Apache License, Version 2.0.
+
+    Powered by MTPLX by Youssof Altoukhi
+    https://github.com/youssofal/mtplx
+
+Used in mlx-stream: the MTPLX-STREAMING Python runtime for DeepSeek-V4.1 is
+the reference this plugin was ported from and its parity oracle: the packed
+expert record and manifest formats (`mtplx-expert-manifest-v*`,
+`mtplx-engram-manifest-v*`), the streamed-bank layout read by
+src/expert_bank.zig, and the routed-expert EXL3 Metal kernels pinned under
+src/kernels/exl3/ (src/exl3_kernels.zig).
+
+Modifications by mlx-stream: the runtime was reimplemented in Zig against
+mlx-c behind mlx-serve's plugin SDK; the kernel texts are embedded at compile
+time and pinned by the manifest's sha256; the read pool (csrc/) and the event
+gates were written for this plugin.
+
+================================================================================
+MIT License
+================================================================================
+
+--------------------------------------------------------------------------------
+MLX
+https://github.com/ml-explore/mlx
+Copyright (c) 2023-2025 Apple Inc.
+Licensed under the MIT License.
+
+The Metal kernel texts under src/kernels/exl3/ inline MLX's steel headers
+(`steel/defines.h`, `steel/utils/type_traits.h` and their siblings), each
+section marked with its MLX source path and copyright line. csrc/mlx_event_shim.cpp
+and csrc/mlx_alloc_shim.cpp compile against the host's staged MLX and mlx-c
+private headers.
+
+--------------------------------------------------------------------------------
+ExLlamaV3
+https://github.com/turboderp-org/exllamav3
+Copyright (c) turboderp
+Licensed under the MIT License.
+
+The EXL3 format this plugin reads (the mul1 codebook, the trellis packing, the
+tensor-core permutation and the Hadamard suh / svh transforms) follows
+exllamav3 v1.4.2 (codebook.cuh, exl3_dq.cuh, pack.cu, hadamard.cu,
+quantize.py); src/exl3_quant.zig and src/exl3_kernels.zig cite the lines they
+reproduce.
+
+--------------------------------------------------------------------------------
+DeepSeek-V4.1-Flash
+The DeepSeek-V4.1-Flash release's `inference/model.py` is the reference for the
+`deepseek_v41` architecture. No model weights are included in this repository.
