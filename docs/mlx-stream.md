@@ -105,7 +105,7 @@ The arch kind takes the opt-in the proposal leans toward in its open questions: 
 | | Module | What it does |
 |---|---|---|
 | G5 | `sdk.kernels` | A pinned kernel registry. One manifest pins every Metal source by its sha256. `KernelSet(R)` builds the registry's kernels once per load and splits them among its consumers; each consumer runs the manifest's self-checks for its own kernels when it accepts the set. |
-| G6 | `sdk.expert` | The expert source surface: the reader (one per process), the event gate, the residency policy, the lookahead selector, the record layout, the source contract, the bank contract and the stream over it (`sdk.expert.stream`), and a slot cache for experts at offsets in several files (`sdk.expert.slot_cache`). |
+| G6 | `sdk.expert` | The expert source surface: the reader (one per process), the event gate, the residency policy, the lookahead selector, the record layout, the source contract, the bank contract and the stream over it (`sdk.expert.stream`). |
 | G7 | `sdk.profile` | Profile timers across a plugin's kinds, with no imports between them. Generic code reads the probes its backend type declares (`sdk.profile.of`). A non-generic site, such as the kernel launcher or the expert stream, gets a probe its arch installs at construction; outside profile builds the probe's type is `void`. The SDK has no timers of its own. |
 
 ## The quant kind
@@ -154,9 +154,7 @@ checked by `sdk.expert.assertBank` at compile time. The bank module provides:
 
 The stream is the same code for every bank: the instance is fixed at compile time, with no runtime branch on the bank.
 mlx-stream instantiates it over its EXL3 bank (9 components, 6 in gate/up). An MXFP4 bank of six components (4 in
-gate/up) is tested through the same code in the CPU lane. Experts at per-tensor offsets in several files (safetensors
-as published) go through `sdk.expert.slot_cache` instead, which drives the same policy and reader without the stream's
-lookahead or gates.
+gate/up) is tested through the same code in the CPU lane.
 
 ## Conformance
 

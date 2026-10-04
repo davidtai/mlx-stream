@@ -170,7 +170,6 @@ Use it to port commits written against the in-tree layout (for example the cover
 | src/mlx_stream/expert_io_test.zig | src/expert_io_test.zig |  |
 | src/mlx_stream/expert_lookahead.zig | src/expert_lookahead.zig |  |
 | src/mlx_stream/expert_policy_test.zig | src/expert_policy_test.zig |  |
-| src/mlx_stream/expert_slot_cache_test.zig | src/expert_slot_cache_test.zig |  |
 | src/mlx_stream/expert_stream.zig | src/expert_stream.zig |  |
 | src/mlx_stream/expert_stream_of_test.zig | src/expert_stream_of_test.zig |  |
 | src/mlx_stream/mlx_stream.zig | src/root.zig |  |
@@ -186,7 +185,6 @@ Use it to port commits written against the in-tree layout (for example the cover
 | src/sdk/expert/io_stub.zig | src/sdk_ext/expert/io_stub.zig |  |
 | src/sdk/expert/lookahead.zig | src/sdk_ext/expert/lookahead.zig |  |
 | src/sdk/expert/policy.zig | src/sdk_ext/expert/policy.zig |  |
-| src/sdk/expert/slot_cache.zig | src/sdk_ext/expert/slot_cache.zig |  |
 | src/sdk/expert/stream.zig | src/sdk_ext/expert/stream.zig |  |
 | src/sdk/kernel_routes.zig | src/sdk_ext/kernel_routes.zig |  |
 | src/sdk/kernel_set.zig | src/sdk_ext/kernel_set.zig |  |

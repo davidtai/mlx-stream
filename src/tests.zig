@@ -22,7 +22,6 @@ comptime {
     _ = @import("deepseek_v41_dspark_loop.zig");
     _ = @import("expert_bank.zig");
     _ = @import("expert_io_test.zig");
-    _ = @import("expert_slot_cache_test.zig");
     _ = @import("expert_lookahead.zig");
     _ = @import("expert_event_test.zig");
     _ = @import("expert_admission.zig");
