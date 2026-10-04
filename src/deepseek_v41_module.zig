@@ -114,8 +114,6 @@ pub const RouteOverrides = struct {
     decode_mxfp8_rows: ?bool = null,
     /// C22 moeshared: the shared expert's middle compiled at decode rows.
     decode_shared_mid: ?bool = null,
-    /// C22's memos at decode rows (rope tables, the window selection and shared compressed rows, b == 1 rows).
-    decode_memos: ?bool = null,
     /// K16: each chunk's layer input stream released at its chunk fence (`inputStreamEarlyRelease`).
     input_stream_early_release: ?bool = null,
     /// K16: each routed group's MoE inputs freed after its wide call (`prefillInputRelease`).
@@ -659,7 +657,6 @@ pub const Module = struct {
         if (ov.decode_smallm) |v| tier.routes.rc_smallm = v;
         if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
         if (ov.decode_shared_mid) |v| tier.routes.shared_mid = v;
-        if (ov.decode_memos) |v| tier.routes.decode_memos = v;
         tier.routes.input_stream_early_release = inputStreamEarlyRelease(ov);
         tier.routes.prefill_input_release = prefillInputRelease(ov);
         if (ov.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
@@ -733,7 +730,6 @@ pub const Module = struct {
         self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
         self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
         self.installed.decode_shared_mid = self.model.tier.routes.shared_mid;
-        self.installed.decode_memos = self.model.tier.routes.decode_memos;
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
         self.installed.prefill_input_release = self.model.tier.routes.prefill_input_release;
         self.prefill_sub = prefillSub(ov, self.model.tier.layer_major);
@@ -749,7 +745,7 @@ pub const Module = struct {
         self.installed.dense_rc = self.model.tier.routes.dense_rc;
         if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}", .{self.installed.decodeSites(&line_buf)});
-        log.info("NATIVE decode dispatch fuse installed: shared middle {}, memos {}", .{ self.installed.decode_shared_mid, self.installed.decode_memos });
+        log.info("NATIVE decode dispatch fuse installed: shared middle {}", .{self.installed.decode_shared_mid});
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
         if (self.installed.head_mode == .mxfp8) log.info("NATIVE head mxfp8 apply: {s}", .{if (self.installed.head_mxfp8_rc) "rcproj (the verify rows and the draft block at <= 8 rows)" else "mlx quantized_matmul"});
         log.info("NATIVE prefill input streams: {s}", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
@@ -1730,8 +1726,6 @@ pub const Installed = struct {
     decode_mxfp8_rows: bool = false,
     /// C22 moeshared: the shared expert's middle compiled at decode rows (installed, past its self-check).
     decode_shared_mid: bool = false,
-    /// C22's memos, as installed.
-    decode_memos: bool = false,
     /// K16's input streams released at each chunk fence, as installed.
     input_stream_early_release: bool = false,
     /// K16's routed groups' MoE inputs freed after the wide call, as installed.
