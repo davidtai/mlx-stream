@@ -786,11 +786,9 @@ test "dsv41 io cov: a running pool refuses a malformed job and a pending ticket 
     pool.res[0] = @intFromEnum(Status.pending);
     try testing.expectError(error.TicketsBusy, R96.submit(pool, f.ufd, &.{0}, &.{1000}, d.rows[0..1], &small));
     pool.res[0] = 0;
-    // Shapes Records refuses before the pool: no record, offsets that do not match the rows, no aux ring.
+    // Shapes Records refuses before the pool: no record, offsets that do not match the rows.
     try testing.expectError(error.InvalidJob, R96.submit(pool, f.ufd, &.{}, &.{}, d.rows[0..0], &small));
     try testing.expectError(error.InvalidJob, R96.submit(pool, f.ufd, &.{ 0, 1 }, &.{1000}, d.rows[0..1], &small));
-    try testing.expectError(error.InvalidJob, R96.submitAux(pool, f.ufd, &.{0}, &.{1000}, d.rows[0..1], &small));
-    try testing.expectEqual(@as(u32, 0), pool.auxTickets());
     // A well-formed raw job lands: its two one-part ranges, byte for byte.
     try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, size, -1, 3, page + 7, lens[0..1], lens[1..2], &dst, 10));
     try pool.wait(10, 2, 10 * std.time.ns_per_s);

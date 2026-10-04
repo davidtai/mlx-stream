@@ -1144,7 +1144,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.phase != .prefill) return error.NotPrefill;
                 if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
                 const ah = &self.ahead;
-                const fit = @min(ah.loads.len, (self.pool.published.len - self.pool.auxTickets() - 2 * expert_io.max_items) / 2);
+                const fit = @min(ah.loads.len, (self.pool.published.len - 2 * expert_io.max_items) / 2);
                 const admitted = self.layers[layer].policy.admitReadAhead(experts, ah.loads[0..fit]);
                 if (comptime read_ahead_probed) if (self.probe) |pr| {
                     // The predicted seed: the ranking's top as many as the layer's unprotected rows (the seed's rule); blocked:

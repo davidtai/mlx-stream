@@ -173,8 +173,6 @@ pub const Options = struct {
     staging_bytes: u64 = 9 << 20,
     tickets: u32 = 256,
     spec: ?Spec = null,
-    /// Tickets of their own for a second demand client (the draft-expert cache), above demand's ring: its submits (`Records.submitAux`) never reuse a ticket the stream's demand ring holds. 0: none.
-    aux_tickets: u32 = 0,
 };
 
 /// A speculative staging slot: the page-rounded record plus two pages.
@@ -258,10 +256,6 @@ pub const Pool = struct {
     next_ticket: u32 = 0,
     /// Demand's tickets end here.
     demand_tickets: u32 = 0,
-    /// The aux ring [aux_first, aux_end) (`Options.aux_tickets`) and its next ticket.
-    aux_first: u32 = 0,
-    aux_end: u32 = 0,
-    next_aux: u32 = 0,
     record_bytes: u64 = 0,
 
     /// Starts the process's pool (the speculative class, when given, is
@@ -273,7 +267,6 @@ pub const Pool = struct {
             return error.InvalidOptions;
         if (opt.spec) |s| if (s.threads == 0 or s.threads > max_spec_threads or s.slots == 0 or s.slots > max_spec or s.record_bytes == 0 or
             s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
-        if (opt.aux_tickets % 2 != 0 or (opt.aux_tickets > 0 and opt.aux_tickets < 2 * max_items) or opt.aux_tickets > opt.tickets -| 2 * max_items) return error.InvalidOptions;
         if (c.q3ld_abi() != abi_version or c.q3ld_counters_n() != counters_n or c.q3ld_max_spec() != max_spec or c.q3ld_max_pre() != max_pre or
             c.q3ld_max_gates() != max_gates or c.q3ld_max_gate_tickets() != max_gate_tickets) return error.PoolAbi;
         const self = try allocator.create(Pool);
@@ -289,8 +282,8 @@ pub const Pool = struct {
         @memset(res, 0);
         @memset(log_arr, 0);
         @memset(published, false);
-        const demand: u32 = opt.tickets - opt.aux_tickets;
-        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand, .aux_first = demand, .aux_end = demand + opt.aux_tickets, .next_aux = demand };
+        const demand: u32 = opt.tickets;
+        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand };
         var bufs: [max_spec]u64 = undefined;
         var threads: i32 = 0;
         var slot_bytes: u64 = 0;
@@ -408,11 +401,6 @@ pub const Pool = struct {
 
     /// Marks what the log published since the last call (ACQUIRE on the
     /// sequence, so the status words and slot bytes of those tickets are visible).
-    /// Tickets of the aux ring (0: none).
-    pub fn auxTickets(self: *const Pool) u32 {
-        return self.aux_end - self.aux_first;
-    }
-
     fn drain(self: *Pool) void {
         const s = c.q3ld_seq();
         while (self.seen < s) : (self.seen += 1) {
@@ -455,12 +443,6 @@ pub fn Records(comptime components: usize, comptime gate_up: usize) type {
         /// every down span, each part `lens[c]` bytes into `rows[i][c]`. Returns the first of its 2n tickets.
         pub fn submit(pool: *Pool, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
             return submitOn(pool, 0, pool.demand_tickets, &pool.next_ticket, fd, gu_offsets, down_offsets, rows, lens);
-        }
-
-        /// `submit` on the aux ring (`Options.aux_tickets`): a second client's jobs, on tickets the demand ring never uses.
-        pub fn submitAux(pool: *Pool, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
-            if (pool.aux_end == pool.aux_first) return error.InvalidJob;
-            return submitOn(pool, pool.aux_first, pool.aux_end, &pool.next_aux, fd, gu_offsets, down_offsets, rows, lens);
         }
 
         fn submitOn(pool: *Pool, lo: u32, hi: u32, next: *u32, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
