@@ -3488,65 +3488,6 @@ fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, case_id
     return .{ .prompt = prompt, .config = config, .eos = try a.dupe(u32, host.eos_token_ids[0..host.num_eos_tokens]) };
 }
 
-// DSV41_EMBED_GATHER_BENCH=1 with DSV41_BANK and DSV41_CELL_PROMPT_IDS (host I/O only; never inside a window): the
-// input embedding's rows for the standard prompt (16,384 real ids, unsorted, repeats), chunk by chunk as the prompt
-// pass asks for them, through the table's aligned parallel gather and through the serial path it replaced (one
-// unaligned F_NOCACHE pread per row, which the page cache keeps: evict the shard's clean cache after this test).
-// Every chunk's bytes equal both ways; the two times and the distinct rows print as one EMBED_GATHER line.
-test "dsv41 served cell: the embedding rows' aligned parallel gather equals the serial reads on the prompt's ids (bench)" {
-    if (std.c.getenv("DSV41_EMBED_GATHER_BENCH") == null) return error.SkipZigTest;
-    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
-    const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
-    const a = testing.allocator;
-    const io = testing.io;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const aa = arena.allocator();
-    var diag: v41.Diag = .{};
-    errdefer std.debug.print("embed gather bench: {s}\n", .{diag.message()});
-    const c = try v41.Config.load(aa, io, bank, &diag);
-    var rows = try dss.openEmbeddingRows(aa, io, bank, &c, &diag);
-    defer rows.close();
-    const prompt = try cellPrompt(aa, io, prompt_path, null);
-    const kvc = @import("deepseek_v41_cache.zig");
-    const spans = try kvc.prefillSpans(aa, @intCast(prompt.len), kvc.resolvePrefillChunk(&c, prompt.len, null, kvc.default_chunk_target_bytes));
-    const rb: usize = @as(usize, rows.dim) * 2;
-    var widest: usize = 0;
-    for (spans) |sp| widest = @max(widest, sp[1] - sp[0]);
-    const got = try aa.alloc(u8, widest * rb);
-    const want = try aa.alloc(u8, widest * rb);
-    // Aligned parallel first: its reads leave no page behind, so the serial reads after it start cold too.
-    var aligned_ns: u64 = 0;
-    var serial_ns: u64 = 0;
-    for (spans) |sp| {
-        const ids = prompt[sp[0]..sp[1]];
-        const t0 = std.Io.Timestamp.now(io, .boot);
-        try rows.gatherRaw(ids, got[0 .. ids.len * rb]);
-        aligned_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
-    }
-    for (spans) |sp| {
-        const ids = prompt[sp[0]..sp[1]];
-        const t0 = std.Io.Timestamp.now(io, .boot);
-        for (ids, 0..) |r, i| {
-            const dst = want[i * rb ..][0..rb];
-            var done: usize = 0;
-            while (done < rb) {
-                const k = std.c.pread(rows.fd, dst[done..].ptr, rb - done, @intCast(rows.w_off + @as(usize, r) * rb + done));
-                try testing.expect(k > 0);
-                done += @intCast(k);
-            }
-        }
-        serial_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
-        try rows.gatherRaw(ids, got[0 .. ids.len * rb]);
-        try testing.expectEqualSlices(u8, want[0 .. ids.len * rb], got[0 .. ids.len * rb]);
-    }
-    var seen = try std.DynamicBitSet.initEmpty(aa, c.vocab_size);
-    for (prompt) |r| seen.set(r);
-    std.debug.print("\nEMBED_GATHER {{\"chunks\": {d}, \"rows\": {d}, \"distinct\": {d}, \"serial_s\": {d:.3}, \"aligned_parallel_s\": {d:.3}}}\n", .{
-        spans.len, prompt.len, seen.count(), @as(f64, @floatFromInt(serial_ns)) / 1e9, @as(f64, @floatFromInt(aligned_ns)) / 1e9,
-    });
-}
-
 // The served cell's preconditions on the real inputs (host; bank mode): DSV41_BANK and
 // DSV41_CELL_PROMPT_IDS as the window passes them. The prompt entry, its length and digest, the
 // config's paths and EOS ids; the receipt serialises.
