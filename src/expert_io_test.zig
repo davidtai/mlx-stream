@@ -1744,8 +1744,7 @@ test "dsv41 io cov: q3ld_stop alone wakes and joins a worker held at a pre-range
     try testing.expect(!hung);
 }
 
-test "dsv41 io cov: KNOWN BUG: the warm class arms on a pool configured without counters (its first submit writes through a null pointer)" {
-    try knownBug("q3ld_warm_config accepts a pool whose q3ld_spec_config passed no counters; q3ld_submit_warm then increments sc[SC_WARM_SUBMITTED] through NULL");
+test "dsv41 io cov: the warm class refuses to arm on a pool configured without counters (its submits count into them)" {
     const page = std.heap.pageSize();
     const mem = try std.heap.page_allocator.alloc(u8, page);
     defer std.heap.page_allocator.free(mem);
@@ -1764,8 +1763,7 @@ test "dsv41 io cov: KNOWN BUG: the warm class arms on a pool configured without 
     try testing.expectEqual(@as(c_int, -1), rc);
 }
 
-test "dsv41 io cov: KNOWN BUG: a refused pre-read re-arm (a negative length) leaves the class armed with no components" {
-    try knownBug("q3ld_pre_config: a re-arm refused for a negative length zeroes pre_ngu/pre_ndown but leaves pre_on set");
+test "dsv41 io cov: a refused pre-read re-arm (a negative length) leaves the armed class as it was" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(16 * page);
     defer f.deinit();

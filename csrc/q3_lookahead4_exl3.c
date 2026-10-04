@@ -1467,11 +1467,11 @@ int q3ld_submit_warm(int32_t fd, int64_t file_size, int32_t n, int32_t ngu, int3
     return 0;
 }
 
-/* WARM: arm (1 <= busy_max <= the worker count) or disarm (0: every queued warm job cancelled) on a running pool.
- * 0 or -1. */
+/* WARM: arm (1 <= busy_max <= the worker count; the pool has counters) or disarm (0: every queued warm job cancelled)
+ * on a running pool.  0 or -1. */
 int q3ld_warm_config(int32_t busy_max) {
     pthread_mutex_lock(&mu);
-    if (!running || stopping || busy_max < 0 || busy_max > nworkers) { pthread_mutex_unlock(&mu); return -1; }
+    if (!running || stopping || busy_max < 0 || busy_max > nworkers || (busy_max > 0 && !sc)) { pthread_mutex_unlock(&mu); return -1; }
     warm_busy_max = busy_max;
     if (busy_max == 0 && wlen) warm_cancel_locked(0, -1);
     pthread_cond_broadcast(&work_cv);
@@ -1781,12 +1781,14 @@ int q3ld_pre_config(int32_t ngu, int32_t ndown, const int64_t *lens) {
         pthread_mutex_unlock(&mu);
         return -1;
     }
+    if (!off) for (int32_t c = 0; c < ngu + ndown; c++) {   /* all or nothing: a refusal leaves the class as it was */
+        if (lens[c] < 0) { pthread_mutex_unlock(&mu); return -1; }
+    }
     pre_ngu = off ? 0 : ngu;
     pre_ndown = off ? 0 : ndown;
     pre_gu_total = 0;
     for (int32_t c = 0; c < pre_ngu + pre_ndown; c++) {
         pre_lens[c] = lens[c];
-        if (lens[c] < 0) { pre_ngu = pre_ndown = 0; pthread_mutex_unlock(&mu); return -1; }
         if (c < pre_ngu) pre_gu_total += lens[c];
     }
     pre_on = !off;

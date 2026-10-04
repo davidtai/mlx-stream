@@ -67,7 +67,8 @@ int64_t q3ld_wait(int64_t seen, int64_t timeout_ns);
 void q3ld_gauge(int64_t *out);              /* 6 words */
 int q3ld_quiesce(int64_t timeout_ns);       /* 0 quiescent, 1 timeout */
 int q3ld_stop(void);                        /* drain, join, release every live gate; 0, -1 not running */
-/* Running pool with the speculative class configured: arm (lens = ngu GU then ndown DOWN lengths) or disarm (0, 0). */
+/* Running pool with the speculative class configured: arm (lens = ngu GU then ndown DOWN lengths, none negative) or
+ * disarm (0, 0). All or nothing: -1 leaves the class as it was. */
 int q3ld_pre_config(int32_t ngu, int32_t ndown, const int64_t *lens);
 /* A layer call's certain misses (record bases, route order) before its plan; tag = this call's settle value. */
 int32_t q3ld_pre_read(int32_t fd, int64_t file_size, int64_t tag, int32_t n, const int64_t *bases);
@@ -82,7 +83,8 @@ int q3ld_ev_config(int32_t kind, uint64_t obj, int64_t timeout_ns, uint64_t star
 int32_t q3ld_ev_gates(int32_t n, const uint64_t *values, const int32_t *counts, const int64_t *tickets);
 int32_t q3ld_ev_release(uint64_t value);    /* force every live gate <= value; forced count, -1 off */
 int32_t q3ld_ev_state(int64_t *out);        /* 10 words; returns the live gate count */
-/* Running pool: arm the warm class (1 <= busy_max <= workers) or disarm it (0: queued warm jobs cancelled). 0 or -1. */
+/* Running pool with counters: arm the warm class (1 <= busy_max <= workers) or disarm it (0: queued warm jobs
+ * cancelled). 0 or -1. */
 int q3ld_warm_config(int32_t busy_max);
 /* One stock job (as q3ld_submit, no deadline) on the warm ring: no pre-range bind, no speculative claim, no gate.
  * 0, -1 bad args / off, -2 ticket pending, -3 ring full. */
