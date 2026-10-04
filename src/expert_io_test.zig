@@ -1,9 +1,9 @@
-//! The reader's tests (`sdk.expert.io`), kept in the package's test root under their names: the C pool and its
+//! The reader's tests (`sdk_ext.expert.io`), kept in the package's test root under their names: the C pool and its
 //! fault injection compile into the test binary, never into the SDK's own tests.
 
 const std = @import("std");
 const expert_bank = @import("expert_bank.zig");
-const io = @import("sdk").expert.io;
+const io = @import("sdk_ext.zig").expert.io;
 const c = io.test_abi.abi;
 const Pool = io.Pool;
 const Status = io.Status;

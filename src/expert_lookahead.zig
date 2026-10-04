@@ -1,9 +1,9 @@
-//! sdk.expert.lookahead's tests (the Python lane's oracle traces), in the unit tests; the names it reads are the SDK's.
+//! sdk_ext.expert.lookahead's tests (the Python lane's oracle traces), in the unit tests; the names it reads are the SDK's.
 
 const std = @import("std");
-const mlx = @import("mlx");
-const lookahead = @import("sdk").expert.lookahead;
-const expert_policy = @import("sdk").expert.policy;
+const mlx = @import("sdk").mlx;
+const lookahead = @import("sdk_ext.zig").expert.lookahead;
+const expert_policy = @import("sdk_ext.zig").expert.policy;
 const LayerPolicy = expert_policy.LayerPolicy;
 pub const routed_top_k = @import("expert_bank.zig").routed_top_k;
 pub const min_k = routed_top_k;

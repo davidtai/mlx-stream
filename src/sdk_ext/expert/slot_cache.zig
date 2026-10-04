@@ -6,7 +6,7 @@
 //! MLX arrays the kernels bind (served), host pages (tests), or none (the trace backend: the policy alone).
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const expert_io = @import("io.zig");
 const expert_policy = @import("policy.zig");
 const Stats = @import("../expert.zig").Stats;

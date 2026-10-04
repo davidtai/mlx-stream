@@ -2,9 +2,9 @@
 //! (G5): every launch, eval, join and graph op recorded with its inputs, no MLX. Test code only.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const kernel_routes = @import("kernel_routes.zig");
-const QuantMode = @import("quant_mode.zig").QuantMode;
+const QuantMode = @import("sdk").QuantMode;
 
 /// The trace backend and the test helpers over registry `R` (`kernel_routes.Routes(R)`'s, plus `Sample`,
 /// `TemplateArg`, `max_outputs`, `Registry`, `embedded` and `manifest_sha256`).

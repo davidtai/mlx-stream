@@ -9,8 +9,8 @@
 //! `"bits":"16"`) for bit-exact PLE lookups.
 
 const std = @import("std");
-const log = @import("log");
-const io_util = @import("io_util");
+const log = @import("sdk").log;
+const io_util = @import("nocache_io.zig");
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15;

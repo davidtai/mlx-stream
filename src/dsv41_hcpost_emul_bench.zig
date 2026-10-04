@@ -7,7 +7,7 @@
 //! shape; no served-path change.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const ops = @import("deepseek_v41_ops.zig");
 const v41 = @import("deepseek_v41.zig");
 const graph = @import("deepseek_v41_graph.zig");

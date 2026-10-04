@@ -7,7 +7,7 @@
 //! lane is not ported: the prompt goes in decode-lane forwards of <= 8 rows.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");

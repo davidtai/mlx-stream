@@ -6,9 +6,9 @@
 //! with the geometry fixed here: nothing is selected or re-validated per call.
 
 const std = @import("std");
-const mlx = @import("mlx");
-const bo = @import("build_options");
-/// The registry's self-check plan (`sdk.kernels.KernelSet(R)` runs it at each consumer's accept).
+const mlx = @import("sdk").mlx;
+const bo = @import("build_flags.zig");
+/// The registry's self-check plan (`sdk_ext.kernels.KernelSet(R)` runs it at each consumer's accept).
 pub const selfcheck = @import("exl3_selfcheck.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -25,7 +25,7 @@ pub const LaunchKey = if (launch_observed) u64 else void;
 /// The observer a profile hook installs: the kernel's name, the launch key and the inputs.
 pub const Observer = if (launch_observed) ?*const fn ([]const u8, u64, []const mlx.mlx_array) void else void;
 pub const format = "mlx-serve-exl3-kernels-v1";
-const dir = "../kernels/exl3/";
+const dir = "kernels/exl3/";
 
 /// The bank these texts decode: EXL3 codebook mul1, K = 3 on every layer.
 pub const bank_codebook = "mul1";
@@ -608,7 +608,7 @@ pub const Bound = struct {
         self.* = undefined;
     }
 
-    /// Every later launch reaches the hook's launch probe `L` (`sdk.profile.Hook.launch`), at construction, before
+    /// Every later launch reaches the hook's launch probe `L` (`sdk_ext.profile.Hook.launch`), at construction, before
     /// the first: a no-op unless the build observes launches and `L` is enabled.
     pub fn observe(self: *Bound, comptime L: type) void {
         if (comptime launch_observed and L.enabled) self.observer = &L.kernel;

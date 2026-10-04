@@ -18,11 +18,11 @@ const kvc = @import("deepseek_v41_cache.zig");
 const eng = @import("deepseek_v41_engram.zig");
 const xk = @import("exl3_kernels.zig");
 const routes = @import("deepseek_v41_routes.zig");
-const expert_policy = @import("sdk").expert.policy;
+const expert_policy = @import("sdk_ext.zig").expert.policy;
 /// PROFILE builds only: P1's read-ahead record (compiles to nothing otherwise).
 const prof = @import("dsv41_prefill_timers.zig");
 const recall = @import("dsv41_decode_recall.zig");
-const ngram = @import("ngram");
+const ngram = @import("ngram_table.zig");
 
 /// K16: each chunk's DSpark main tap is evaluated in its chunk fence (`forwardLayerMajor`), so the tap's mean does
 /// not hold the layer's input stream (hc x the tap's bytes) to the forward's end. The bill reads this declaration
@@ -1759,7 +1759,7 @@ test "dsv41 model: A1's recall check (profile builds): every decode-width layer 
 
 test "dsv41 model: a prompt forward wider than a route takes runs every layer's routed call through the wide lane" {
     const xp = @import("deepseek_v41_experts.zig");
-    const quant = @import("sdk").quant;
+    const quant = @import("sdk_ext.zig").quant;
     const m = try Mini.init();
     defer m.deinit();
     var g = TraceOps.init(testing.allocator);
@@ -1822,7 +1822,7 @@ test "dsv41 model: a prompt forward wider than a route takes runs every layer's 
 
 test "dsv41 model: P1: each layer's predictor pass counts its chunks' predicted ids, hands the seed's ranking to the hook, and the call lands it before routing" {
     const xp = @import("deepseek_v41_experts.zig");
-    const quant = @import("sdk").quant;
+    const quant = @import("sdk_ext.zig").quant;
     const m = try Mini.init();
     defer m.deinit();
     var g = TraceOps.init(testing.allocator);

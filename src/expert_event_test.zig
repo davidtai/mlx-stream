@@ -1,11 +1,11 @@
-//! The event gate's tests (`sdk.expert.event`), kept in the package's test root under their names (the 0b ones run
+//! The event gate's tests (`sdk_ext.expert.event`), kept in the package's test root under their names (the 0b ones run
 //! inside a guarded window only: DSV41_PHASE0B_MLX=1; creating any MLX array creates the Metal device).
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const expert_bank = @import("expert_bank.zig");
-const expert_io = @import("sdk").expert.io;
-const event = @import("sdk").expert.event;
+const expert_io = @import("sdk_ext.zig").expert.io;
+const event = @import("sdk_ext.zig").expert.event;
 const c = event.test_abi.abi;
 const abi_version = event.abi_version;
 const Event = event.Event;

@@ -4,7 +4,7 @@
 //! inference thread; nothing here is asked per token or per layer at run time.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 
 /// The reader: one pool per process (lib/expert_io's C pool), read through one record topology per source
 /// (`Records(components, gate_up)`), from fds `openUncached` makes. On graphs without the C sources it refuses at start.

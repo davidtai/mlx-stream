@@ -3,7 +3,7 @@
 //! arrays at compile time, so an instance is the same code as a stream written for that bank.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const expert = @import("../expert.zig");
 const expert_io = @import("io.zig");
 const expert_policy = @import("policy.zig");

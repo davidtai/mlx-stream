@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 
 const c = if (builtin.os.tag == .macos) struct {
     pub extern fn dsv41ev_abi() i32;

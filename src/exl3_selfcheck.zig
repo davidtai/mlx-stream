@@ -6,7 +6,7 @@
 //! against MLX's own mxfp8 route. GPU only (DSV41_KERNELS_GPU=1 in a lock-holding window).
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const xk = @import("exl3_kernels.zig");
 
 const Allocator = std.mem.Allocator;

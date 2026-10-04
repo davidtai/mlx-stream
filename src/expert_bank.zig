@@ -5,9 +5,9 @@
 //! first-boot checks (bankv2, exl3_lane) are their oracle.
 
 const std = @import("std");
-const io_util = @import("io_util");
-const expert_io = @import("sdk").expert.io;
-const mlx = @import("mlx");
+const io_util = @import("nocache_io.zig");
+const expert_io = @import("sdk_ext.zig").expert.io;
+const mlx = @import("sdk").mlx;
 
 /// Record segments in on-disk order: the gate/up span is the first six, the
 /// down span the last three.
@@ -184,7 +184,7 @@ pub fn submitRecords(pool: *expert_io.Pool, bank: *const Bank, records: []const 
     return Records.submit(pool, bank.sidecar, gu[0..records.len], down[0..records.len], rows, &lens);
 }
 
-// The stream's bank contract (sdk.expert.assertBank; sdk.expert.stream): with the topology, `Component`, `Layer`,
+// The stream's bank contract (sdk_ext.expert.assertBank; sdk_ext.expert.stream): with the topology, `Component`, `Layer`,
 // `Records` and `Bank` above and below, a segment's MLX dtype and the slot arrays by projection.
 
 /// DeepSeek-V4.1 routes six experts per token.
@@ -652,7 +652,7 @@ const ManifestSource = struct {
 
 // ── C2: the bank's description for the quants' claims ──
 
-const quant = @import("sdk").quant;
+const quant = @import("sdk_ext.zig").quant;
 
 /// The bank's description (`quant.BankPeek`) from its v2 manifest, for the load path's quant
 /// `claims`: the `quantization` object whole (each quant reads its own fields), the dims, and

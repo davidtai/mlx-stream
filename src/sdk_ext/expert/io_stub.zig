@@ -2,7 +2,7 @@
 //! without those sources (every target but macOS: Linux, iOS), like `ds4_ffi_stub.zig`: shared code
 //! type-checks there; the pool and the event gate refuse at start.
 
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const io = @import("io.zig");
 
 /// `q3ld_*`: `q3ld_abi` answers 0, so `expert_io`'s start refuses before any read.

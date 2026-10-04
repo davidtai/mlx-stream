@@ -7,8 +7,9 @@
 //! bank (`expert_bank.zig`), never from these shards.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
+const sdk_ext = @import("sdk_ext.zig");
 const expert_admission = @import("expert_admission.zig");
 const kvc = @import("deepseek_v41_cache.zig");
 
@@ -306,15 +307,15 @@ pub const PrefillBill = struct {
 
     pub fn laneBytes(b: PrefillBill, positions: u64) u64 {
         var buf: PlanBuf = undefined;
-        return sdk.kv.lanesBytes(b.kvPlan(positions, &buf));
+        return sdk_ext.kv.lanesBytes(b.kvPlan(positions, &buf));
     }
 
-    pub const PlanBuf = struct { lanes: [max_layers]sdk.kv.LanePlan, rings: [max_layers + 1]sdk.kv.RingPlan };
+    pub const PlanBuf = struct { lanes: [max_layers]sdk_ext.kv.LanePlan, rings: [max_layers + 1]sdk_ext.kv.RingPlan };
 
-    /// The served tier's KV plan (`sdk.kv.Plan`) for a request of `positions`: per kv source its compressed and index
+    /// The served tier's KV plan (`sdk_ext.kv.Plan`) for a request of `positions`: per kv source its compressed and index
     /// lane (one lane of head_dim + index_head_dim f32 rows at `boundedCompCap`), the window ring (one row over every
     /// layer), and per ratio > 1 kv source its frontier's two rings (raw_kv, raw_score: head_dim f32 rows each).
-    pub fn kvPlan(b: PrefillBill, positions: u64, buf: *PlanBuf) sdk.kv.Plan {
+    pub fn kvPlan(b: PrefillBill, positions: u64, buf: *PlanBuf) sdk_ext.kv.Plan {
         const m: u32 = @intCast(positions);
         var n_rings: usize = 0;
         buf.rings[0] = .{ .window = b.window, .row_bytes = b.ring_row_bytes };
@@ -332,19 +333,19 @@ pub const PrefillBill = struct {
     /// A `deepseek_v41_cache` Ring of `window` rows (the window ring: the model's window; the compressor frontier: the
     /// source's ratio): its base, the window plus a verify block, its slack and the headroom.
     pub fn ringBase(b: PrefillBill, window: u64) u64 {
-        return sdk.kv.ringBase(window, b.ring_geo);
+        return sdk_ext.kv.ringBase(window, b.ring_geo);
     }
 
     /// A ring's rows through the prompt pass: both of its slots at the compaction size (a chunk plus the window less
-    /// one, at least the base), at every chunk count (`sdk.kv.ringPromptRows`: a bound at every instant).
+    /// one, at least the base), at every chunk count (`sdk_ext.kv.ringPromptRows`: a bound at every instant).
     pub fn ringPromptRows(b: PrefillBill, window: u64, seq: u64) u64 {
-        return sdk.kv.ringPromptRows(window, b.chunkRows(seq), seq, b.ring_geo);
+        return sdk_ext.kv.ringPromptRows(window, b.chunkRows(seq), seq, b.ring_geo);
     }
 
     /// A ring's rows in decode at its widest: the first step compacts the prompt's last chunk's ring (its rows plus
     /// the window less one, at least the base) beside a new base; steady decode holds two bases.
     pub fn ringDecodeRows(b: PrefillBill, window: u64, seq: u64) u64 {
-        return sdk.kv.ringDecodeRows(window, b.chunkRows(seq), seq, b.ring_geo);
+        return sdk_ext.kv.ringDecodeRows(window, b.chunkRows(seq), seq, b.ring_geo);
     }
 
     /// The window ring (one row over every layer: bf16 on layer 0, f32 after) through the prompt and in decode.
@@ -378,12 +379,12 @@ pub const PrefillBill = struct {
     /// frontier rings at their widest in the phase.
     pub fn kvPromptBytes(b: PrefillBill, seq: u64, positions: u64) u64 {
         var buf: PlanBuf = undefined;
-        return sdk.kv.planBytes(b.kvPlan(positions, &buf), .prompt, b.chunkRows(seq), seq, b.ring_geo);
+        return sdk_ext.kv.planBytes(b.kvPlan(positions, &buf), .prompt, b.chunkRows(seq), seq, b.ring_geo);
     }
 
     pub fn kvDecodeBytes(b: PrefillBill, seq: u64, positions: u64) u64 {
         var buf: PlanBuf = undefined;
-        return sdk.kv.planBytes(b.kvPlan(positions, &buf), .decode, b.chunkRows(seq), seq, b.ring_geo);
+        return sdk_ext.kv.planBytes(b.kvPlan(positions, &buf), .decode, b.chunkRows(seq), seq, b.ring_geo);
     }
 
     /// `bytes` for a K16 request: the layer-major wave and the wide lane's transient in place of the
@@ -989,7 +990,7 @@ pub fn quantBits(mode: sdk.QuantMode) u64 {
         .mxfp8 => 8,
         .mxfp4, .nvfp4 => 4,
         .affine => 0,
-        // ggml blocks are the gguf engine's; a bank's quantization parses through sdk.quant, which refuses them.
+        // ggml blocks are the gguf engine's; a bank's quantization parses through sdk_ext.quant, which refuses them.
         .gguf => unreachable,
     };
 }

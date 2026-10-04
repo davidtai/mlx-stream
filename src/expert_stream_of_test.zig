@@ -3,8 +3,9 @@
 
 const std = @import("std");
 const sdk = @import("sdk");
-const mlx = @import("mlx");
-const StreamOf = sdk.expert.stream.StreamOf;
+const sdk_ext = @import("sdk_ext.zig");
+const mlx = @import("sdk").mlx;
+const StreamOf = sdk_ext.expert.stream.StreamOf;
 
 const testing = std.testing;
 
@@ -12,7 +13,7 @@ const testing = std.testing;
 const MxBank = struct {
     pub const n_components = 6;
     pub const gu_components = 4;
-    pub const Records = sdk.expert.Records(n_components, gu_components);
+    pub const Records = sdk_ext.expert.Records(n_components, gu_components);
     pub const Component = enum(u8) { gate_weight, gate_scales, up_weight, up_scales, down_weight, down_scales };
     pub const Dtype = enum { U32, U8 };
     pub const Segment = struct { offset: u64, length: u64, dtype: Dtype, shape: [3]u64, rank: u8 };
@@ -36,7 +37,7 @@ const MxBank = struct {
     pub const Bank = struct {
         layers: []Layer,
         n_experts: u32,
-        sidecar: sdk.expert.UncachedFd,
+        sidecar: sdk_ext.expert.UncachedFd,
         record_bytes: u64,
 
         pub fn recordOffset(self: *const Bank, layer: u32, expert: u32) u64 {
@@ -84,7 +85,7 @@ test "dsv41 bank contract: a MiMo-shaped MXFP4 bank (6 components, gate/up 4) st
     var root: [512]u8 = undefined;
     const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/experts.bin", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
     defer testing.allocator.free(path);
-    const fd = try sdk.expert.openUncached(path.ptr, null);
+    const fd = try sdk_ext.expert.openUncached(path.ptr, null);
     defer fd.close();
     const bank: MxBank.Bank = .{ .layers = &layers, .n_experts = n_experts, .sidecar = fd, .record_bytes = rec };
 
@@ -124,12 +125,12 @@ test "dsv41 bank contract: a top-8 arch's lookahead measures tau from each row's
     // scores >= 9 (experts 0..6), a top-8 selector scores >= 7 (experts 0..8); none is resident.
     var row: [16]f32 = undefined;
     for (&row, 0..) |*v, e| v.* = 15 - @as(f32, @floatFromInt(e));
-    var none = try sdk.expert.policy.LayerPolicy.init(a, 16, 0);
+    var none = try sdk_ext.expert.policy.LayerPolicy.init(a, 16, 0);
     defer none.deinit(a);
     var out: [4]u16 = undefined;
-    var s6 = try sdk.expert.lookahead.SelectorOf(6).init(a, 16, 10, 1.0, 4);
+    var s6 = try sdk_ext.expert.lookahead.SelectorOf(6).init(a, 16, 10, 1.0, 4);
     defer s6.deinit(a);
-    var s8 = try sdk.expert.lookahead.SelectorOf(8).init(a, 16, 10, 1.0, 4);
+    var s8 = try sdk_ext.expert.lookahead.SelectorOf(8).init(a, 16, 10, 1.0, 4);
     defer s8.deinit(a);
     try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3 }, s6.select(&row, &none, &out));
     try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3 }, s8.select(&row, &none, &out));
@@ -138,5 +139,5 @@ test "dsv41 bank contract: a top-8 arch's lookahead measures tau from each row's
     try testing.expectEqual(@as(usize, 7), s6.select(&row, &none, &wide).len);
     try testing.expectEqual(@as(usize, 9), s8.select(&row, &none, &wide).len);
     // A top-8 arch cannot keep fewer than eight candidates per row.
-    try testing.expectError(error.InvalidSelector, sdk.expert.lookahead.SelectorOf(8).init(a, 16, 7, 1.0, 4));
+    try testing.expectError(error.InvalidSelector, sdk_ext.expert.lookahead.SelectorOf(8).init(a, 16, 7, 1.0, 4));
 }

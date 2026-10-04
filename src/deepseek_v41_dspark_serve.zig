@@ -13,8 +13,8 @@ const arm_mod = @import("deepseek_v41_arm.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const mdl = @import("deepseek_v41_model.zig");
-const mlx = @import("mlx");
-const ngram = @import("ngram");
+const mlx = @import("sdk").mlx;
+const ngram = @import("ngram_table.zig");
 const dh = @import("deepseek_v41_dspark_head.zig");
 
 /// How the residents load: past the page cache (`nocache_reader`), so a load

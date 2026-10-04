@@ -9,7 +9,7 @@
 //! Pure: it chooses records and reads nothing.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const expert_policy = @import("policy.zig");
 
 const LayerPolicy = expert_policy.LayerPolicy;

@@ -7,16 +7,17 @@
 
 const std = @import("std");
 const sdk = @import("sdk");
+const sdk_ext = @import("sdk_ext.zig");
 /// PROFILE builds only (`-Ddsv41-prefill-timers=true`): P1's read-ahead record; every call compiles to nothing otherwise.
-const bo = @import("build_options");
-const mlx = @import("mlx");
+const bo = @import("build_flags.zig");
+const mlx = @import("sdk").mlx;
 const expert_bank = @import("expert_bank.zig");
-const expert_io = sdk.expert.io;
-const expert_policy = @import("sdk").expert.policy;
+const expert_io = sdk_ext.expert.io;
+const expert_policy = @import("sdk_ext.zig").expert.policy;
 const expert_lookahead = @import("expert_lookahead.zig");
 const exl3_quant = @import("exl3_quant.zig");
 
-const S = sdk.expert.stream.StreamOf(expert_bank, if (@hasDecl(bo, "dsv41_prefill_timers")) bo.dsv41_prefill_timers else false);
+const S = sdk_ext.expert.stream.StreamOf(expert_bank, if (@hasDecl(bo, "dsv41_prefill_timers")) bo.dsv41_prefill_timers else false);
 const n_components = S.n_components;
 const gu_components = S.gu_components;
 const Component = S.Component;
@@ -66,9 +67,9 @@ pub const Stream = S.Stream;
 pub const ProjArrays = expert_bank.ProjArrays;
 pub const BankArrays = expert_bank.BankArrays;
 
-/// A bank's arrays by projection, as the quant binds them (`sdk.quant.BankArrays` of the EXL3 quant's `Arrays`).
+/// A bank's arrays by projection, as the quant binds them (`sdk_ext.quant.BankArrays` of the EXL3 quant's `Arrays`).
 pub fn BankArraysOf(comptime T: type) type {
-    return sdk.quant.BankArrays(exl3_quant.Arrays(T));
+    return sdk_ext.quant.BankArrays(exl3_quant.Arrays(T));
 }
 
 /// Per routed id of `r`, its wave: 0 for a slot resident at the call (a hit),
@@ -134,7 +135,7 @@ pub const StreamSource = struct {
 
     /// What the stream supports; an arm installs a subset at construction.
     pub const caps = source_caps;
-    /// The slot arrays it fills are the EXL3 quant's (`sdk.expert`: a source's arrays are its quant's).
+    /// The slot arrays it fills are the EXL3 quant's (`sdk_ext.expert`: a source's arrays are its quant's).
     pub const Arrays = exl3_quant.Arrays;
 
     /// One call per live route of the Stream's ring.
@@ -169,7 +170,7 @@ pub const StreamSource = struct {
         return call;
     }
 
-    pub fn served(_: *StreamSource, call: *const Call) sdk.expert.Served {
+    pub fn served(_: *StreamSource, call: *const Call) sdk_ext.expert.Served {
         return .{ .refs = call.refs[0..call.n_ids], .waves = call.waves[0..call.n_ids], .n_parts = call.route.?.n_parts };
     }
 
@@ -1538,7 +1539,7 @@ test "dsv41 stream 0b: the transient release frees the 240-row MLX scratch back 
 // DSV41_PHASE0B_MLX=1, inside a guarded window: the GPU reads the slot arrays behind the event gate.
 test "dsv41 stream 0b: gated waves over the MLX slot arrays read the landed bytes on the GPU" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const expert_event = sdk.expert.event;
+    const expert_event = sdk_ext.expert.event;
     const stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
     var sb = try SynthBank.open(32);

@@ -15,14 +15,15 @@
 //! decode-width forward after a prompt.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
+const sdk_ext = @import("sdk_ext.zig");
 const settings = @import("deepseek_v41_settings.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const xp = @import("deepseek_v41_experts.zig");
 const xk = @import("exl3_kernels.zig");
-const kernel_set = sdk.kernels.KernelSet(xk);
+const kernel_set = sdk_ext.kernels.KernelSet(xk);
 const xq = @import("exl3_quant.zig");
 const trunk_routes = @import("dsv41_kernel_routes.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
@@ -35,7 +36,7 @@ const eng = @import("deepseek_v41_engram.zig");
 const mdl = @import("deepseek_v41_model.zig");
 const kvc = @import("deepseek_v41_cache.zig");
 const dh = @import("deepseek_v41_dspark_head.zig");
-const ngram = @import("ngram");
+const ngram = @import("ngram_table.zig");
 const dsp = @import("deepseek_v41_dspark_serve.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 
@@ -43,9 +44,9 @@ const log = std.log.scoped(.dsv41);
 
 const G = ops.MlxOps;
 const expert_stream = @import("expert_stream.zig");
-const expert_event = sdk.expert.event;
-const expert_io = sdk.expert.io;
-const xsc = sdk.expert.slot_cache;
+const expert_event = sdk_ext.expert.event;
+const expert_io = sdk_ext.expert.io;
+const xsc = sdk_ext.expert.slot_cache;
 const expert_bank = @import("expert_bank.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
 // The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
@@ -883,7 +884,7 @@ pub const Module = struct {
         self.installed.reader_sched = readerSched(config);
         {
             const rs = self.installed.reader_sched;
-            var nb: [sdk.expert.Sched.name_len]u8 = undefined;
+            var nb: [sdk_ext.expert.Sched.name_len]u8 = undefined;
             log.info("NATIVE reader scheduling: {s} (constructing thread {s}; threads {s}; spin {s}; speculative chunks {s}; keep-warm {s})", .{ rs.name(&nb), if (rs.start_ui) "USER_INTERACTIVE at the pool start" else "unchanged", if (rs.qos) "USER_INTERACTIVE demand + watchdog, UTILITY speculative, named" else if (rs.qos_demand) "USER_INTERACTIVE demand + watchdog, speculative inherited (no UTILITY), named" else "inherit the constructing thread's QoS", if (rs.spin) "30 us before a demand worker or the submitter sleeps" else "none", if (rs.demand_first) "only while no demand job is queued or executing" else "while at most one demand job executes (stock)", if (rs.keep_warm and rs.keep_warm_prefill) "one thread through the prompt and decode phases" else if (rs.keep_warm and rs.keep_warm_us > 0) "one thread through the decode phase, sleeping its us per loop" else if (rs.keep_warm) "one spinner thread through the decode phase" else "none" });
         }
         log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
@@ -1513,11 +1514,11 @@ pub const Module = struct {
     /// Positions a request's bounded lanes hold: its reservation (else the prompt plus the shell's
     /// generation headroom), plus one verify block.
     pub fn maxPositions(prompt: usize, reserved_tokens: u64) u32 {
-        return sdk.kv.capacity(prompt, reserved_tokens, kv_bound);
+        return sdk_ext.kv.capacity(prompt, reserved_tokens, kv_bound);
     }
 
-    /// The lanes' bound (`sdk.kv.Bound`): the shell's generation headroom and one verify block of scratch rows.
-    pub const kv_bound: sdk.kv.Bound = .{ .headroom = generation_headroom, .scratch = mdl.Model(G).scratch_rows };
+    /// The lanes' bound (`sdk_ext.kv.Bound`): the shell's generation headroom and one verify block of scratch rows.
+    pub const kv_bound: sdk_ext.kv.Bound = .{ .headroom = generation_headroom, .scratch = mdl.Model(G).scratch_rows };
 
     /// A decode step of the request (the served seam's every call after the prompt; the phase is the
     /// decode handover's, `decodeHandover`): refused by name before the handover, so a driver that skips it
@@ -2388,7 +2389,7 @@ test "dsv41 module: the load refuses a bank its quant does not claim, by name, b
     defer tmp.cleanup();
     var rbuf: [512]u8 = undefined;
     const root = try expert_bank.tmpRoot(&tmp, &rbuf);
-    const fixture = @embedFile("../fixtures/dsv41_bank_peek.json");
+    const fixture = @embedFile("fixtures/dsv41_bank_peek.json");
     var diag: arm_mod.Diag = .{};
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "expert-manifest-v2.json", .data = fixture });
     try claimBank(a, std.testing.io, root, &diag);

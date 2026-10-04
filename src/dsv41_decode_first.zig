@@ -16,7 +16,7 @@
 //!     under 8 elements, else `device`) and a compiled region's input signature (MLX traces one per shapes and dtypes).
 //! Printed once after the decode (`DECODE_FIRST`).
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const dt = @import("dsv41_decode_timers.zig");
 
 pub const enabled = dt.enabled;

@@ -8,7 +8,7 @@
 //! a served build carries no clock read, counter, field or branch for them.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 
 /// Where the prompt pass's routed call spends its host time: the routing barrier (the ids to the host), the source's
 /// route (reads issued), the read waits, the waves' encode (graphs, host tables, submission), the drains (the host

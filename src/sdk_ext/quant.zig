@@ -33,10 +33,10 @@
 //!   deinit(*, *G) void
 
 const std = @import("std");
-const mlx = @import("mlx");
-const pk = @import("peek.zig");
+const mlx = @import("sdk").mlx;
+const pk = @import("sdk");
 const kernel_reg = @import("kernels.zig");
-const QuantMode = @import("quant_mode.zig").QuantMode;
+const QuantMode = @import("sdk").QuantMode;
 
 const Allocator = std.mem.Allocator;
 const Dtype = mlx.mlx_dtype;

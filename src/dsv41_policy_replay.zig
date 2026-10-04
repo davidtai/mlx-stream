@@ -8,7 +8,7 @@
 //! own misses over cycles 2..17, the m / r^3 marginal). Prints misses per cycle per layer, one table per quantity.
 //! CPU only; no MLX. Run: DSV41_POLICY_TRACE=<.policytrace.bin> with the dsv41 test binary.
 const std = @import("std");
-const expert_policy = @import("sdk").expert.policy;
+const expert_policy = @import("sdk_ext.zig").expert.policy;
 const arm = @import("deepseek_v41_arm.zig");
 
 /// The record kinds of dsv41-policytrace-v1 (lane B's `dsv41_policy_trace.Kind`).

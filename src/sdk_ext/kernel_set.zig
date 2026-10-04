@@ -9,7 +9,7 @@
 //! (every text verified) and only that consumer's subset is self-checked.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const profile = @import("profile.zig");
 
 /// A load's kernel set as a quant's accept receives it (`sdk.quant.Context.kernels`): the set, erased, and the pin

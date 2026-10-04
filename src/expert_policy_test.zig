@@ -1,7 +1,7 @@
-//! The residency policy's tests (`sdk.expert.policy`), kept in the package's test root under their names.
+//! The residency policy's tests (`sdk_ext.expert.policy`), kept in the package's test root under their names.
 
 const std = @import("std");
-const policy = @import("sdk").expert.policy;
+const policy = @import("sdk_ext.zig").expert.policy;
 const Phase = policy.Phase;
 const max_route_ids = policy.max_route_ids;
 const no_expert = policy.no_expert;

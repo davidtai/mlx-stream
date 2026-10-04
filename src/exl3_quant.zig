@@ -10,13 +10,14 @@
 //! from exl3_kernel_ops.zig.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const xk = @import("exl3_kernels.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
-const kr = sdk.kernels.Routes(xk);
-const ks = sdk.kernels.KernelSet(xk);
-const quant = @import("sdk").quant;
+const kr = sdk_ext.kernels.Routes(xk);
+const ks = sdk_ext.kernels.KernelSet(xk);
+const quant = @import("sdk_ext.zig").quant;
 const sdk = @import("sdk");
+const sdk_ext = @import("sdk_ext.zig");
 
 const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;
@@ -41,7 +42,7 @@ const no_vars = kr.no_vars;
 pub const name = "exl3-mul1-k3";
 
 /// G5: the kernel set this quant self-checks at accept is pinned by the registry's manifest.
-pub const kernel_pin: sdk.kernels.Pin = .{ .manifest_sha256 = xk.manifest_sha256 };
+pub const kernel_pin: sdk_ext.kernels.Pin = .{ .manifest_sha256 = xk.manifest_sha256 };
 
 /// This consumer's subset of the kernel set: the EXL3 families (the decode GEMV, the rin stage,
 /// the rebuild, DIG-X and its golden-tile check texts).
@@ -969,7 +970,7 @@ pub fn DigXPrefill(comptime G: type) type {
     return struct {
         const Self = @This();
         /// G7: the backend's prompt-pass split (the arch injects it; off on every other backend and build).
-        const prof = sdk.profile.of(G).prefill;
+        const prof = sdk_ext.profile.of(G).prefill;
         const hidden = 5120;
         /// The wave's down stage, installed at construction (`installDown`): the 128-row down text then rot_widen1
         /// (stock), or the fused down GEMM (the same words in one launch). Each builds its own table.
@@ -1266,7 +1267,7 @@ const checkProjArrays = checkBank;
 // ── Tests ──
 
 const testing = std.testing;
-const kt = sdk.kernels.Trace(xk);
+const kt = sdk_ext.kernels.Trace(xk);
 const Trace = kt.Trace;
 const testRegistry = kt.testRegistry;
 const expectLaunch = kt.expectLaunch;
@@ -1282,7 +1283,7 @@ const v41_spec: quant.Spec = .{ .hidden = 5120, .inter = 2304, .top_k = 6, .n_la
 
 // ── 2. claims on C1's description of the bank ──
 
-const bank_peek_fixture = @embedFile("../fixtures/dsv41_bank_peek.json");
+const bank_peek_fixture = @embedFile("fixtures/dsv41_bank_peek.json");
 
 test "dsv41 kernels c2: the EXL3 quant claims the bank of record's description (C1's peek) and declines each mutation, by field" {
     const a = testing.allocator;
@@ -1449,7 +1450,7 @@ test "dsv41 kernels ops: wave tables are the lanes' (DIG wave_table, rebuild slo
 
 // ── The prefill wave route vs the lane of record's own dispatch (dump_prefill_waves.py --samples) ──
 
-const prefill_samples = @embedFile("../fixtures/dsv41_prefill_wave_samples.json");
+const prefill_samples = @embedFile("fixtures/dsv41_prefill_wave_samples.json");
 const JRoute = struct { seed: u64, slots: []const u32, counts: []const u32 };
 const JCall = struct { name: []const u8, a_rows: u32, route: JRoute, events: []const []const u8, ret: []const u8, ret_shape: []const i64 };
 const JShapeCfg = struct { wave: u32, inflight: u32, row_budget: u32, carry_rows: u32 };
@@ -1973,7 +1974,7 @@ test "dsv41 smoke 0b: L1: DIG-X prefill waves at 8 experts per wave equal Record
         try st.waitGu(r, @intCast(p));
         try st.waitDown(r, @intCast(p));
     }
-    var refs: [@import("sdk").expert.policy.max_route_ids]es.SlotRef = undefined;
+    var refs: [@import("sdk_ext.zig").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(r, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     for (rf) |x| try testing.expectEqual(es.BankKind.base, x.bank);
@@ -2634,7 +2635,7 @@ test "dsv41 smoke 0b: take2 retune: the lane's take2 words on real records, bit 
         try st.waitGu(route, @intCast(p));
         try st.waitDown(route, @intCast(p));
     }
-    var refs: [@import("sdk").expert.policy.max_route_ids]es.SlotRef = undefined;
+    var refs: [@import("sdk_ext.zig").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
@@ -2859,7 +2860,7 @@ test "dsv41 smoke 0b: m128: the 128-row DIG-X GEMMs' z words equal the 64-row te
         try st.waitGu(route, @intCast(p));
         try st.waitDown(route, @intCast(p));
     }
-    var refs: [@import("sdk").expert.policy.max_route_ids]es.SlotRef = undefined;
+    var refs: [@import("sdk_ext.zig").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
@@ -3088,7 +3089,7 @@ test "dsv41 smoke 0b: fused down: the fused down GEMM's words equal the 128-row 
         try st.waitGu(route, @intCast(p));
         try st.waitDown(route, @intCast(p));
     }
-    var refs: [@import("sdk").expert.policy.max_route_ids]es.SlotRef = undefined;
+    var refs: [@import("sdk_ext.zig").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
@@ -3283,7 +3284,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
         try st.waitGu(route, @intCast(p));
         try st.waitDown(route, @intCast(p));
     }
-    var refs: [@import("sdk").expert.policy.max_route_ids]es.SlotRef = undefined;
+    var refs: [@import("sdk_ext.zig").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;

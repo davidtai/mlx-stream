@@ -23,18 +23,19 @@
 //! `TraceMath` stand in on the trace backend.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const expert_bank = @import("expert_bank.zig");
-const expert_io = sdk.expert.io;
-const expert_policy = @import("sdk").expert.policy;
+const expert_io = sdk_ext.expert.io;
+const expert_policy = @import("sdk_ext.zig").expert.policy;
 const expert_stream = @import("expert_stream.zig");
 const expert_lookahead = @import("expert_lookahead.zig");
-const expert_event = sdk.expert.event;
+const expert_event = sdk_ext.expert.event;
 const xk = @import("exl3_kernels.zig");
 const sdk = @import("sdk");
-const quant = @import("sdk").quant;
+const sdk_ext = @import("sdk_ext.zig");
+const quant = @import("sdk_ext.zig").quant;
 const dt = @import("dsv41_decode_timers.zig");
 const recall = @import("dsv41_decode_recall.zig");
 const timeline = @import("dsv41_verify_timeline.zig");
@@ -56,8 +57,8 @@ pub const Error = expert_stream.Error;
 const Load = expert_policy.Load;
 const n_banks = std.meta.fieldNames(BankKind).len;
 
-/// What one routed-layer call serves (`sdk.expert.Served`).
-pub const Served = sdk.expert.Served;
+/// What one routed-layer call serves (`sdk_ext.expert.Served`).
+pub const Served = sdk_ext.expert.Served;
 
 /// One projection's slot arrays in a bank (the streamer's `ProjArrays` over
 /// any backend): code int16 [rows, in/16, out/16, 16K], rout f16 [rows, out],
@@ -69,9 +70,9 @@ pub fn BankArraysOf(comptime T: type) type {
     return quant.BankArrays(ProjOf(T));
 }
 
-// ── The source contract (`sdk.expert.assertSource`: the required set and each declared capability's) ──
+// ── The source contract (`sdk_ext.expert.assertSource`: the required set and each declared capability's) ──
 
-pub const assertSource = sdk.expert.assertSource;
+pub const assertSource = sdk_ext.expert.assertSource;
 
 /// The stream's wave numbering of a call's ids (`expert_stream.wavesOf`).
 const wavesOf = expert_stream.wavesOf;
@@ -152,7 +153,7 @@ pub const FakeSource = struct {
     /// A0 (a): a test's scripted warm wait per layer (`Stream.warmWaitNs`; past its end, 0).
     warm_wait_ns: []const u64 = &.{},
 
-    pub const caps: sdk.expert.Caps = .{ .two_phase = true, .prompt_seed = true, .read_ahead = true, .wide = true, .event_gates = true };
+    pub const caps: sdk_ext.expert.Caps = .{ .two_phase = true, .prompt_seed = true, .read_ahead = true, .wide = true, .event_gates = true };
 
     pub const Pick = struct { layer: u32, n: u8 = 0, experts: [expert_lookahead.max_budget]u16 = undefined };
 
@@ -840,7 +841,7 @@ pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
 pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptime routes: Routes) type {
     comptime {
         assertSource(S);
-        if (routes.gated and !sdk.expert.capsOf(S).event_gates) @compileError(@typeName(S) ++ ": a gated route needs a source with event gates");
+        if (routes.gated and !sdk_ext.expert.capsOf(S).event_gates) @compileError(@typeName(S) ++ ": a gated route needs a source with event gates");
         // A source's slot arrays are its quant's: a source and a quant that disagree on the format do not compile.
         if (@hasDecl(S, "Arrays") and S.Arrays(G.T) != ProjOf(G.T)) @compileError(@typeName(S) ++ ": its slot arrays are not the quant's");
     }
@@ -2565,7 +2566,7 @@ test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samp
             calls: []const struct { name: []const u8, a_rows: u32, route: struct { seed: u64, slots: []const u32, counts: []const u32 }, events: []const []const u8 },
         },
     };
-    const parsed = try std.json.parseFromSlice(Sample, a, @embedFile("../fixtures/dsv41_prefill_wave_samples.json"), .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(Sample, a, @embedFile("fixtures/dsv41_prefill_wave_samples.json"), .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const tier = for (parsed.value.cases) |cs| {
         if (std.mem.eql(u8, cs.case, "tier")) break cs;
@@ -4367,7 +4368,7 @@ test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's source
         std.debug.print("\njoinless merge smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
         return error.TestUnexpectedResult;
     });
-    const ks = sdk.kernels.KernelSet(xk);
+    const ks = sdk_ext.kernels.KernelSet(xk);
     const dkr = @import("dsv41_kernel_routes.zig");
     const G = ops.MlxOps;
     const T = G.T;

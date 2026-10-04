@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const io_util = @import("io_util");
+const io_util = @import("../../nocache_io.zig");
 
 // 1:1 mirror of lib/expert_io/q3_lookahead4.h. The C pool and the event shims compile on macOS graphs only (the host's
 // `macos_engines` graphs: the macOS exe and tests); the Linux exe and the iOS lib get the refusing stand-ins, whose

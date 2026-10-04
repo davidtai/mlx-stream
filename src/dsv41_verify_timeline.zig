@@ -5,7 +5,7 @@
 //! window and, per routed layer, the host stamps of the layer's submits (`Point`). All storage is static; the
 //! summary (`VERIFY_GPU_TIMELINE`) and the raw rows (`writeJson`) are made after the decode.
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const dt = @import("dsv41_decode_timers.zig");
 
 pub const enabled = dt.enabled;

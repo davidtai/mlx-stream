@@ -4,14 +4,15 @@
 //! timer, branch or counter).
 
 const std = @import("std");
-const bo = @import("build_options");
+const bo = @import("build_flags.zig");
 const sdk = @import("sdk");
+const sdk_ext = @import("sdk_ext.zig");
 
 pub const enabled: bool = if (@hasDecl(bo, "dsv41_prefill_timers")) bo.dsv41_prefill_timers else false;
 
 /// Where the routed call's host time goes (the SDK's probe shape, G7): the routing barrier, the stream's route,
 /// the read waits, the waves' encode, the drains, the join.
-pub const Bucket = sdk.profile.PrefillBucket;
+pub const Bucket = sdk_ext.profile.PrefillBucket;
 const n_buckets = @typeInfo(Bucket).@"enum".field_names.len;
 
 pub var ns: [n_buckets]u64 = @splat(0);

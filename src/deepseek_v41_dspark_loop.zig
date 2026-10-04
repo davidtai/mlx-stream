@@ -2087,7 +2087,7 @@ test "dsv41 dspark loop: the MLX instantiation of the loop analyses (host, nothi
 /// A wide route that records each call: its layer (routes are built in layer
 /// order), rows, act rows and slots, in the order the forward makes them.
 const WideLog = struct {
-    const quant = @import("sdk").quant;
+    const quant = @import("sdk_ext.zig").quant;
     var next_layer: u32 = 0;
     var order: [512]u32 = undefined;
     var n_order: usize = 0;
@@ -2440,7 +2440,7 @@ test "dsv41 dspark loop: the fixture's mini config builds the model and head, an
 // DSV41_PHASE0B_MLX=1 only (a GPU-lock-held run: any MLX array creates the Metal device).
 test "dsv41 smoke 0b: the seed's row copy owns its rows and equals the view (MLX)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const mlx = @import("mlx");
+    const mlx = @import("sdk").mlx;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(testing.allocator, s);

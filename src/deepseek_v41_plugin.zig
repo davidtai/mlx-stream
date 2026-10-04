@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const sdk = @import("sdk");
+const sdk_ext = @import("sdk_ext.zig");
 const v41 = @import("deepseek_v41.zig");
 const settings = @import("deepseek_v41_settings.zig");
 const module = @import("deepseek_v41_module.zig");
@@ -15,15 +16,16 @@ pub const caps: sdk.Caps = .{
     .prefill_whole_prompt = true,
     .prefill_yields_last_logits = true,
     .residents_past_page_cache = true,
-    .uses_expert_reader = @import("expert_stream.zig").uses_reader,
 };
 
 pub const Config = settings.Config;
 pub const Module = module.Module;
 
-/// What the module binds at comptime: the EXL3 quant of its routed experts (the module's `exl3_quant` import) and the
-/// EXL3 expert source that streams them. `/v1/models` and `/props` name both beside the arch.
-pub const binds: sdk.Binds = .{ .quant = @import("exl3_quant.zig"), .expert_source = @import("exl3_source.zig") };
+/// G6: the process's one expert reader. The host claims it at the load claim, before the preflight and the weights,
+/// when the stream reads through it, and releases it when the loaded model goes (or the load fails). A second load
+/// that needs it is refused by name (`error.ExpertReaderInUse`).
+pub const claimProcess = if (@import("expert_stream.zig").uses_reader) sdk_ext.expert.takeReader else {};
+pub const releaseProcess = if (@import("expert_stream.zig").uses_reader) sdk_ext.expert.giveReader else {};
 
 pub fn claims(p: *const sdk.ConfigPeek) ?sdk.Priority {
     const t = p.modelType() orelse return null;

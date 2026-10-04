@@ -9,13 +9,13 @@ const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
 
-const sdk_kv = @import("sdk").kv;
-const sdk_testing = @import("sdk").testing;
+const sdk_kv = @import("sdk_ext.zig").kv;
+const sdk_testing = @import("sdk_ext.zig").kv_testing;
 comptime {
     std.debug.assert(ops.max_dims == sdk_kv.max_dims);
 }
 
-/// The lanes, their routes and caps live in the SDK's KV seam (`sdk.kv`); the names stay here for the arch.
+/// The lanes, their routes and caps live in the SDK's KV seam (`sdk_ext.kv`); the names stay here for the arch.
 pub const Route = sdk_kv.Route;
 pub const Geometry = sdk_kv.Geometry;
 pub const boundedCompCap = sdk_kv.boundedCompCap;

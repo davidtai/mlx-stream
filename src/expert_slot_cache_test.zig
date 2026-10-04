@@ -1,10 +1,11 @@
-//! sdk.expert.slot_cache's tests (host rows or no memory; never MLX), in the unit tests beside the read pool they drive.
+//! sdk_ext.expert.slot_cache's tests (host rows or no memory; never MLX), in the unit tests beside the read pool they drive.
 
 const std = @import("std");
 const sdk = @import("sdk");
-const xsc = sdk.expert.slot_cache;
-const expert_io = sdk.expert.io;
-const expert_policy = sdk.expert.policy;
+const sdk_ext = @import("sdk_ext.zig");
+const xsc = sdk_ext.expert.slot_cache;
+const expert_io = sdk_ext.expert.io;
+const expert_policy = sdk_ext.expert.policy;
 const Pair = expert_io.Records(2, 1);
 const Component = xsc.Component;
 const Geometry = xsc.Geometry;

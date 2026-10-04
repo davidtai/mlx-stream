@@ -4,7 +4,7 @@
 //! to nothing (the timed path carries no timer, branch or counter).
 
 const std = @import("std");
-const bo = @import("build_options");
+const bo = @import("build_flags.zig");
 
 pub const enabled: bool = if (@hasDecl(bo, "dsv41_decode_timers")) bo.dsv41_decode_timers else false;
 

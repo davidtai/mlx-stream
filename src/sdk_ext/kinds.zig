@@ -1,11 +1,10 @@
-//! The `source`, `engine`, `quant` and `expert_source` kinds' registry tables (docs/plugins.md). Each carries the
-//! routing question plus the hooks its first consumer needs; a kind's full interface lands with that consumer. The
-//! calls a kind makes per layer (a quant's matmuls, a source's routes) are bound by the arch at comptime and never
-//! cross these tables.
+//! The `quant` and `expert_source` contracts' tables (docs/plugins.md): what mlx-stream's EXL3 quant and EXL3 expert
+//! source declare, checked at comptime by `of`. They are internals of the `deepseek_v41` arch (the host registers the
+//! arch only); the arch binds both at comptime, and nothing per layer crosses these tables.
 
 const std = @import("std");
-const peek = @import("peek.zig");
-const bill = @import("memory_bill.zig");
+const peek = @import("sdk");
+const bill = @import("sdk");
 const kernels = @import("kernels.zig");
 const quant = @import("quant.zig");
 const check = @import("check.zig");
@@ -22,36 +21,6 @@ fn billOf(comptime T: type, comptime w: []const u8) ?BillFn {
         }
     }.f;
 }
-
-/// Opens a non-HF container: claims a model path before any file is read as a model directory.
-pub const Source = struct {
-    name: []const u8,
-    claims: *const fn (p: *const peek.ConfigPeek) ?peek.Priority,
-
-    pub fn of(comptime T: type) Source {
-        comptime {
-            const w = "source " ++ @typeName(T);
-            check.nameDecl(w, T);
-            check.fnDecl(w, T, "claims", &.{*const peek.ConfigPeek}, ?peek.Priority);
-        }
-        return .{ .name = T.name, .claims = T.claims };
-    }
-};
-
-/// A whole engine behind an opaque session (ds4, llama.cpp): it gets none of the host's stack below HTTP.
-pub const Engine = struct {
-    name: []const u8,
-    claims: *const fn (p: *const peek.ConfigPeek) ?peek.Priority,
-
-    pub fn of(comptime T: type) Engine {
-        comptime {
-            const w = "engine " ++ @typeName(T);
-            check.nameDecl(w, T);
-            check.fnDecl(w, T, "claims", &.{*const peek.ConfigPeek}, ?peek.Priority);
-        }
-        return .{ .name = T.name, .claims = T.claims };
-    }
-};
 
 /// Weight load and the MoE matmul for one weight format. The load path asks every quant once per weight group;
 /// the arch binds the one that claimed its group at comptime (`sdk.quant`'s contract, C2: Arrays, claims,

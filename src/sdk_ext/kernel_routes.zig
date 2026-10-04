@@ -16,7 +16,7 @@
 //! nodes of `cfg`'s output shapes and dtypes).
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 
 /// The routes over registry `R`, which supplies `Kernel`, `Entry`, `Arg`, `Vars`, `LaunchConfig`, `Diag`,
 /// `launchFor`, `max_rank` and `max_inputs`.

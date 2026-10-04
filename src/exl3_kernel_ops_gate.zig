@@ -5,10 +5,11 @@
 //! GPU only: DSV41_KERNELS_GPU=1 and DSV41_KERNEL_OPS_FIXTURE=<dir> in a lock-holding window.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const xk = @import("exl3_kernels.zig");
 const sdk = @import("sdk");
-const kr = sdk.kernels.Routes(xk);
+const sdk_ext = @import("sdk_ext.zig");
+const kr = sdk_ext.kernels.Routes(xk);
 const tr = @import("dsv41_kernel_routes.zig");
 const xq = @import("exl3_quant.zig");
 

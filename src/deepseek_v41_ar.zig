@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const host_bridge = @import("deepseek_v41_host.zig");
 const model = host_bridge.model;
 const settings = @import("deepseek_v41_settings.zig");
@@ -25,7 +25,8 @@ const ds = @import("deepseek_v41_dspark.zig");
 const dss = @import("deepseek_v41_dspark_serve.zig");
 const xk = @import("exl3_kernels.zig");
 const sdk = @import("sdk");
-const kernel_set = sdk.kernels.KernelSet(xk);
+const sdk_ext = @import("sdk_ext.zig");
+const kernel_set = sdk_ext.kernels.KernelSet(xk);
 const xq = @import("exl3_quant.zig");
 const module = @import("deepseek_v41_module.zig");
 const gpu_ceiling = host_bridge.gpu_ceiling;
@@ -1562,7 +1563,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const stt = md.dsparkStats() orelse return error.CellNeedsDspark;
     const prompt_sha = try cell.idsSha256(a, prompt);
     const ids_sha = try cell.idsSha256(a, ids);
-    var reader_sched_buf: [sdk.expert.Sched.name_len]u8 = undefined;
+    var reader_sched_buf: [sdk_ext.expert.Sched.name_len]u8 = undefined;
     // This request's draft-cache statistics (the cache carries over to the next request through the same Module).
     const dcs: ?expert_stream.Stats = if (md.draft_cache) |dc| dc.takeRequestStats() else null;
     if (dcs) |d| std.debug.print("NATIVE draft cache request: route_calls {d}, hits {d}, misses {d}, cycles {d}, misses per cycle {d:.3}\n", .{ d.route_calls, d.expert_cache_hits, d.expert_cache_misses, cycles.items.len, @as(f64, @floatFromInt(d.expert_cache_misses)) / @as(f64, @floatFromInt(@max(cycles.items.len, 1))) });
@@ -1764,7 +1765,7 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     // C6: the typical tier's event-gated waves (the Module builds the gated arm; default host waits).
     if (envStr("DSV41_CELL_EVENT_GATES")) |v| config.expert_event_gates = try cellBool("DSV41_CELL_EVENT_GATES", v);
     // The read pool's scheduling, through the same config field the server's model setting sets.
-    if (envStr("DSV41_CELL_READER_SCHED")) |v| config.expert_reader_sched = @import("sdk").expert.Sched.parse(v) orelse return error.CellReaderSched;
+    if (envStr("DSV41_CELL_READER_SCHED")) |v| config.expert_reader_sched = @import("sdk_ext.zig").expert.Sched.parse(v) orelse return error.CellReaderSched;
     if (envStr("DSV41_CELL_WIDE_FEED")) |v| config.expert_wide_feed = try cellBool("DSV41_CELL_WIDE_FEED", v);
     // The feed's halves on their own (each overrides the feed's value for its half).
     if (envStr("DSV41_CELL_WIDE_SEED")) |v| config.expert_wide_seed = try cellBool("DSV41_CELL_WIDE_SEED", v);
@@ -1821,7 +1822,7 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_GROW_FILL")) |v| ov.grow_fill = std.meta.stringToEnum(@import("expert_stream.zig").GrowFill, v) orelse return error.CellGrowFill;
     // DRAFTCACHE's hot slots (a count; the Module refuses a geometry that saves nothing at construction).
     if (envStr("DSV41_CELL_DRAFT_CACHE")) |v| ov.draft_cache_hot = std.fmt.parseInt(u32, v, 10) catch return error.CellDraftCache;
-    if (envStr("DSV41_CELL_DRAFT_CACHE_POLICY")) |v| ov.draft_cache_policy = std.meta.stringToEnum(@import("sdk").expert.slot_cache.PolicyKind, v) orelse return error.CellDraftCachePolicy;
+    if (envStr("DSV41_CELL_DRAFT_CACHE_POLICY")) |v| ov.draft_cache_policy = std.meta.stringToEnum(@import("sdk_ext.zig").expert.slot_cache.PolicyKind, v) orelse return error.CellDraftCachePolicy;
     if (envStr("DSV41_CELL_DRAFT_CACHE_POOL")) |v| ov.draft_cache_pool = std.meta.stringToEnum(@import("deepseek_v41_dspark_head.zig").DraftPool, v) orelse return error.CellDraftCachePool;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;

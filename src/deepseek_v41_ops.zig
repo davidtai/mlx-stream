@@ -11,15 +11,16 @@
 //! the dtype explicitly through `scalar`, never an f32 default.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const xk = @import("exl3_kernels.zig");
 const sdk = @import("sdk");
+const sdk_ext = @import("sdk_ext.zig");
 const first_cycle = @import("dsv41_decode_first.zig");
 const prefill_timers = @import("dsv41_prefill_timers.zig");
 
 /// G7: the package's profile probes, injected into the quant and the kernel registry through the backend type
-/// (`sdk.profile.of`); every probe compiles to nothing outside the profile builds.
-const package_profile: sdk.profile.Hook = .{ .prefill = prefill_timers, .launch = first_cycle };
+/// (`sdk_ext.profile.of`); every probe compiles to nothing outside the profile builds.
+const package_profile: sdk_ext.profile.Hook = .{ .prefill = prefill_timers, .launch = first_cycle };
 
 pub const Dtype = mlx.mlx_dtype;
 pub const max_dims = 8;
@@ -105,7 +106,7 @@ pub fn quantBits(mode: sdk.QuantMode) u32 {
         .mxfp8 => 8,
         .mxfp4, .nvfp4 => 4,
         .affine => 8,
-        // ggml blocks are the gguf engine's; a bank's quantization parses through sdk.quant, which refuses them.
+        // ggml blocks are the gguf engine's; a bank's quantization parses through sdk_ext.quant, which refuses them.
         .gguf => unreachable,
     };
 }
@@ -993,8 +994,8 @@ pub const MlxOps = struct {
     }
 };
 
-/// The SDK's strided host copy (sdk.ops), the name this package's code reads.
-pub const copyStrided = sdk.ops.copyStrided;
+/// The SDK's strided host copy (sdk_ext.ops), the name this package's code reads.
+pub const copyStrided = sdk_ext.ops.copyStrided;
 
 /// f32 -> bf16 bits, round to nearest even (what MLX's host conversion does).
 pub fn bf16Bits(f: f32) u16 {

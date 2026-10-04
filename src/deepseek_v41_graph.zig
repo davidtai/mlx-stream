@@ -2680,7 +2680,7 @@ fn noneOf(g: *const TraceOps, from: usize, op: ops.Op) bool {
 // selection on the GPU stream against the router's own (`gatePrefix` + `gateSelect`) over the same rows and gate.
 test "dsv41 smoke 0b: the prefill shared expert's three mxfp8 qmm at the K16 chunk shapes, against a bf16 matmul ceiling (MLX, GPU stream)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const mlx = @import("mlx");
+    const mlx = @import("sdk").mlx;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(testing.allocator, s);
@@ -2728,7 +2728,7 @@ test "dsv41 smoke 0b: the prefill shared expert's three mxfp8 qmm at the K16 chu
 
 test "dsv41 smoke 0b: C22 moeshared: the compiled shared middle equals the op chain bit for bit at every decode row count (MLX, GPU stream)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const mlx = @import("mlx");
+    const mlx = @import("sdk").mlx;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(testing.allocator, s);
@@ -2767,7 +2767,7 @@ test "dsv41 smoke 0b: C22 moeshared: the compiled shared middle equals the op ch
 
 test "dsv41 smoke 0b: P1's predictor top-k is the router's selection on the same rows (MLX, GPU stream)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const mlx = @import("mlx");
+    const mlx = @import("sdk").mlx;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(testing.allocator, s);
@@ -2809,7 +2809,7 @@ test "dsv41 smoke 0b: P1's predictor top-k is the router's selection on the same
 
 test "dsv41 smoke 0b: P1's predictor on the gate as stored (bf16) takes its own scores' top-k, the router's wherever the rounding cannot reorder (MLX, GPU stream)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const mlx = @import("mlx");
+    const mlx = @import("sdk").mlx;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(testing.allocator, s);

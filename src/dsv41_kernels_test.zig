@@ -4,14 +4,15 @@
 //! same interface. Test code only.
 
 const std = @import("std");
-const mlx = @import("mlx");
+const mlx = @import("sdk").mlx;
 const xk = @import("exl3_kernels.zig");
 const sdk = @import("sdk");
+const sdk_ext = @import("sdk_ext.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
-const kr = sdk.kernels.Routes(xk);
-const ks = sdk.kernels.KernelSet(xk);
-const kt = sdk.kernels.Trace(xk);
-const quant = @import("sdk").quant;
+const kr = sdk_ext.kernels.Routes(xk);
+const ks = sdk_ext.kernels.KernelSet(xk);
+const kt = sdk_ext.kernels.Trace(xk);
+const quant = @import("sdk_ext.zig").quant;
 const eq = @import("exl3_quant.zig");
 const tr = @import("dsv41_kernel_routes.zig");
 
@@ -899,7 +900,7 @@ test "dsv41 kernels ops: the banked route launches its texts with every bank's a
     const ne = reg.get(.q3_exl3_prep_din_rin);
     const s = &ge.samples[0];
     const P = xq.ProjArrays(Trace.T);
-    var banks: [3]@import("sdk").quant.BankArrays(P) = undefined;
+    var banks: [3]@import("sdk_ext.zig").quant.BankArrays(P) = undefined;
     for (&banks) |*b| b.* = .{
         .gate = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "rg", &s.vars), .rin = try t.arg(ie, "rg", &s.vars) },
         .up = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "ru", &s.vars), .rin = try t.arg(ie, "ru", &s.vars) },
