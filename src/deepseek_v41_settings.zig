@@ -56,8 +56,6 @@ pub const Config = struct {
     expert_lookahead_budget: ?u8 = null,
     /// P1c: the seed's ranks grouped apart from the stream's, the base call after the last seed group.
     expert_wide_seed_aligned: ?bool = null,
-    /// P1d: the base rows resident at the barrier drain first, in their own call (null = off).
-    expert_wide_resident_first: ?bool = null,
     /// The input embedding read from its host rows from construction (null = on).
     embedding_host_rows: ?bool = null,
 
@@ -169,11 +167,6 @@ pub const Config = struct {
     /// P1c's seed-aligned groups: the setting, else on wherever the base call at the seed and the hottest-first order are.
     pub fn dsv41WideSeedAligned(self: *const Config) bool {
         return self.expert_wide_seed_aligned orelse (self.dsv41WideBaseAtSeed() and self.dsv41WideHotFirst());
-    }
-
-    /// P1d's resident-first base call: the setting, else off.
-    pub fn dsv41WideResidentFirst(self: *const Config) bool {
-        return self.expert_wide_resident_first orelse false;
     }
 
     fn dsv41ServedTier(self: *const Config) bool {

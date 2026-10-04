@@ -519,9 +519,7 @@ fn joinlessRoute(ov: module.RouteOverrides) bool {
 
 /// The arch's prefill bill at the routes `billAt` bills, with `group_streams` live K16 streams (no bank: host-testable).
 pub fn prefillBillAt(config: *const settings.Config, ov: module.RouteOverrides, c: *const v41.Config, group_streams: u64) !v41.PrefillBill {
-    // P1d's resident-first route makes one more deferred base call per wide call (one more output).
-    const base_calls = v41.PrefillBill.wide_base_calls + @intFromBool(config.dsv41WideResidentFirst());
-    const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = base_calls };
+    const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = v41.PrefillBill.wide_base_calls };
     return v41.PrefillBill.of(c, try module.ringGeometry(config, ov)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinlessRoute(ov)) shape else null).withGroupStreams(group_streams).withInputRelease(module.prefillInputRelease(ov)).withPrefillSub(module.prefillSub(ov, config.dsv41LayerMajor()));
 }
 

@@ -806,11 +806,6 @@ pub const Wide = struct {
     /// record) and the base call issued after the last seed group, so only the seed's own reads precede it. Exact:
     /// each expert's rows and kernel are its own whatever its group; the combine folds by routed position.
     seed_aligned: bool = false,
-    /// With `base_at_seed`: the deferred base rows of the experts resident at the barrier (the routed groups' hits, the
-    /// read-ahead's landings among them) drain in their own call before the first group waits on a read; the rest wait
-    /// for their reads as before. Exact: defer_base's argument (a wave's rows are independent of its composition, and
-    /// the combine folds by routed position); only the base rows' calls and places change.
-    resident_first: bool = false,
     /// A0 (a): each wide call records its last `warm_tail_rows` rows' experts per layer (the prompt's last call
     /// stands), the first verify's warm set (`warmSet`, read at the grow). Exact: it chooses reads only.
     warm_tail: bool = false,
@@ -939,11 +934,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             def_slot: std.ArrayList(u32) = .empty,
             def_act: std.ArrayList(u32) = .empty,
             def_pos: std.ArrayList(u32) = .empty,
-            /// `Wide.resident_first`: per routed row, already in the resident base call.
-            early: std.ArrayList(bool) = .empty,
 
             fn deinit(w: *WideScratch, a: std.mem.Allocator) void {
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc, &w.def_slot, &w.def_act, &w.def_pos, &w.early }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc, &w.def_slot, &w.def_act, &w.def_pos }) |l| l.deinit(a);
                 w.jl.deinit(a);
             }
         };
@@ -967,7 +960,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (wr.base_at_seed and (!wr.seed or !wr.defer_base)) return error.InvalidWideRoute;
             if (wr.seed_aligned and (!wr.base_at_seed or !wr.hot_first or comptime !@hasDecl(S, "seedRanks"))) return error.InvalidWideRoute;
             if (opt.banked and comptime !hasBanked()) return error.BankedNotInMath;
-            if (wr.resident_first and !wr.base_at_seed) return error.InvalidWideRoute;
             if (wr.warm_tail and (!routes.prefill or c.n_routed_experts > warm_max_experts)) return error.InvalidWideRoute;
             if (wr.depth > 1) {
                 if (comptime @hasDecl(S, "wideDepth")) {
@@ -1739,30 +1731,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             w.def_pos.clearRetainingCapacity();
         }
 
-        /// `Wide.resident_first`: the routed groups' base rows whose records are resident at the barrier (wave 0: no read)
-        /// as one base call now, marked so the groups' own loop skips them; the base call at the seed takes the rest.
-        fn residentBase(self: *Self, g: *G, layer: u32, act: T, comptime parts: bool, k: u32, live: []const ?*S.Call, groups: Groups) !void {
-            const a = self.a;
-            const w = &self.wide;
-            try w.early.resize(a, w.ids.items.len);
-            @memset(w.early.items, false);
-            for (live, 0..) |call, gi| {
-                const start = groups.start(gi);
-                const len = groups.of(gi).len;
-                const sv = self.source.served(call.?);
-                for (w.ids.items, 0..) |e, row| {
-                    const fi: usize = @intCast(w.first.items[e]);
-                    if (fi < start or fi >= start + len) continue;
-                    if (sv.refs[fi - start].bank != .base or sv.waves[fi - start] != 0) continue;
-                    w.early.items[row] = true;
-                    try w.def_slot.append(a, sv.refs[fi - start].row);
-                    try w.def_act.append(a, @intCast(row / @as(usize, k)));
-                    try w.def_pos.append(a, @intCast(row));
-                }
-            }
-            try self.deferredBase(g, layer, act, parts, true);
-        }
-
         fn runWideCore(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32, comptime parts: bool) !void {
             const a = self.a;
             const w = &self.wide;
@@ -1840,8 +1808,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             tp = prof.now();
             for (0..@min(depth, n_groups)) |gi| calls[gi % depth] = try self.source.route(layer, groups.of(gi), &.{});
             prof.charge(.route, tp);
-            const rf = self.wide_route.resident_first;
-            if (rf) try self.residentBase(g, layer, act, parts, k, calls[0..@min(depth, n_groups)], groups);
             for (0..n_groups) |gi| {
                 const start = groups.start(gi);
                 const group = groups.of(gi);
@@ -1867,7 +1833,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                         if (fi < start or fi >= start + group.len) continue;
                         const ref = sv.refs[fi - start];
                         if (ref.bank != kind) continue;
-                        if (rf and w.early.items[row]) continue;
                         const act_row: u32 = @intCast(row / @as(usize, k));
                         if (defer_base and kind == .base) {
                             try w.def_slot.append(a, ref.row);
@@ -3795,113 +3760,6 @@ test "dsv41 experts: P1c: the seed-aligned groups put the seed's base call ahead
         try testing.expectEqual(@as(u32, if (aligned) 3 else 2), recs[bi].live);
         try testing.expectEqual(@as(u64, if (aligned) 4 else 3), s.stats().route_calls);
     }
-}
-
-test "dsv41 experts: P1d resident-first: every routed position keeps its bank, slot and token; the resident base rows drain before any read wait" {
-    // Exact by defer_base's argument: each output row depends only on its own slot and token (a wave's rows are
-    // independent of its composition), and the combine folds a token's k rows by routed position.
-    const a = testing.allocator;
-    var c = testConfig(256, 128, 1);
-    c.n_routed_experts = 128;
-    const Chain = EagerChain(TraceOps, TraceGemv);
-    const Math = WithPrefillRoutes(TraceOps, Chain, RecRoute);
-    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
-    const n = 40;
-    const k = 6;
-    var ids: [n * k]u16 = undefined;
-    for (&ids, 0..) |*e, i| e.* = @intCast((7 * (i / k) + 11 * (i % k)) % 128);
-    var counts: [128]u32 = @splat(0);
-    for (ids) |e| counts[e] += 1;
-    var ranked_buf: [128]u16 = undefined;
-    const ranked = expert_policy.rankHottest(&counts, &ranked_buf);
-    // The read-ahead per case: the whole seed (the 32 hottest), none, every other seed record plus 8 non-seed ones; the
-    // split prompt runs two calls (its halves) on the layer, the second one finding the first's residents.
-    var mixed: [24]u16 = undefined;
-    for (0..16) |i| mixed[i] = ranked[2 * i];
-    for (0..8) |i| mixed[16 + i] = ranked[40 + i];
-    const Case = enum { resident, demand, mixed, split };
-    const Row = struct { code: u32, slot: u32, act: u32 };
-    for (std.enums.values(Case)) |case| {
-        var maps: [2][n * k]Row = undefined;
-        var n_base: [2]usize = .{ 0, 0 };
-        for ([_]bool{ false, true }, 0..) |rf, run| {
-            var reg = try hostRegistry();
-            defer reg.deinit();
-            var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 128, .rows = &.{32} });
-            defer src.deinit();
-            var g = TraceOps.init(a);
-            defer g.deinit();
-            src.trace = &g;
-            RecRoute.source = &src;
-            defer RecRoute.source = null;
-            var rrs = [_]RecRoute{RecRoute.init(a)};
-            defer rrs[0].deinit(&g);
-            const wide: Wide = .{ .seed = true, .hot_first = true, .defer_base = true, .read_ahead = true, .base_at_seed = true, .seed_aligned = true, .resident_first = rf };
-            var ex = try Ex.initWith(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c, .{ .wide = wide });
-            defer ex.deinit();
-            switch (case) {
-                .resident => try src.readAheadSeed(0, ranked[0..32]),
-                .demand, .split => {},
-                .mixed => try src.readAheadSeed(0, &mixed),
-            }
-            const halves: []const [2]usize = if (case == .split) &.{ .{ 0, n / 2 }, .{ n / 2, n } } else &.{.{ 0, n }};
-            var script: Script = .{ .calls = if (case == .split) &.{ ids[0 .. n / 2 * k], ids[n / 2 * k ..] } else &.{&ids} };
-            g.host_values = script.values();
-            const base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
-            for (halves) |hv| {
-                const rows: c_int = @intCast(hv[1] - hv[0]);
-                const r0 = rrs[0].calls.items.len;
-                const l0 = src.log.items.len;
-                _ = try ex.at(0).routed(&g, try g.input(&.{ rows, 256 }, .float32), try g.input(&.{ rows, k }, .int32));
-                // Each output row (calls in order, rows in order) is the call's routed position `pos[j]`.
-                var j: usize = 0;
-                for (rrs[0].calls.items[r0..]) |rec| for (rec.slot, rec.act_row) |sl, t| {
-                    const p = ex.wide.pos.items[j];
-                    j += 1;
-                    maps[run][hv[0] * k + p] = .{ .code = rec.bank_code, .slot = sl, .act = t };
-                    try testing.expectEqual(@as(u32, @intCast(p / k)), t);
-                };
-                try testing.expectEqual(ex.wide.pos.items.len, j);
-                try testing.expectEqual((hv[1] - hv[0]) * k, j);
-                var buf: [4096]u8 = undefined;
-                const kinds = kindsOf(src.log.items[l0..], &buf);
-                const first_wait = std.mem.indexOfScalar(u8, kinds, 'g') orelse kinds.len;
-                for (rrs[0].calls.items[r0..]) |rec| n_base[run] += @intFromBool(rec.bank_code == base_code);
-                // Resident-first with residents at the barrier: the call's first call is their base call, encoded
-                // before its first read wait.
-                if (rf and (case == .resident or case == .mixed)) {
-                    const first = rrs[0].calls.items[r0];
-                    try testing.expectEqual(base_code, first.bank_code);
-                    try testing.expect(first.at - l0 <= first_wait);
-                    // It drains (an evaluation) before any later base call is built: two base calls' waves never live
-                    // together, so the bill's per-wave terms hold.
-                    for (rrs[0].calls.items[r0 + 1 ..]) |rec| if (rec.bank_code == base_code) {
-                        const drained = for (g.evals.items) |e| {
-                            if (e > first.node and e <= rec.node) break true;
-                        } else false;
-                        try testing.expect(drained);
-                    };
-                }
-            }
-        }
-        // The same bank, slot and token at every routed position either way: the schedule moved, not the routes.
-        for (maps[0], maps[1]) |x, y| try testing.expectEqual(x, y);
-        // Base calls: all resident = one (now, none left for the seed's call); all demand = the single call; mixed = two;
-        // the split prompt at most one more per call.
-        switch (case) {
-            .resident, .demand => try testing.expectEqual([2]usize{ 1, 1 }, n_base),
-            .mixed => try testing.expectEqual([2]usize{ 1, 2 }, n_base),
-            .split => try testing.expect(n_base[1] >= n_base[0] and n_base[1] <= n_base[0] + 2),
-        }
-    }
-    // Resident-first splits the base call at the seed: refused without it.
-    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 128, .rows = &.{32} });
-    defer src.deinit();
-    var g = TraceOps.init(a);
-    defer g.deinit();
-    var rrs = [_]RecRoute{RecRoute.init(a)};
-    defer rrs[0].deinit(&g);
-    try testing.expectError(error.InvalidWideRoute, Ex.initWith(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c, .{ .wide = .{ .seed = true, .defer_base = true, .resident_first = true } }));
 }
 
 test "dsv41 experts: a read-ahead deeper than the source's windows is refused at construction" {

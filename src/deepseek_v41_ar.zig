@@ -1082,8 +1082,6 @@ const CellReceipt = struct {
     wide_base_at_seed: ?bool = null,
     /// P1c's seed-aligned groups, as installed.
     wide_seed_aligned: ?bool = null,
-    /// P1d's base split as installed: "single" (the one deferred base call) or "resident_first".
-    prefill_base_split: ?[]const u8 = null,
     /// The attention call sites the Module installed (read back from it).
     prefill_attn: ?bool = null,
     prefill_index: ?bool = null,
@@ -1598,7 +1596,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .wide_read_ahead = md.installed.wide.read_ahead,
         .wide_base_at_seed = md.installed.wide.base_at_seed,
         .wide_seed_aligned = md.installed.wide.seed_aligned,
-        .prefill_base_split = if (md.installed.wide.resident_first) "resident_first" else "single",
         .prefill_attn = md.installed.prefill_attn,
         .prefill_index = md.installed.prefill_index,
         .prefill_hc = md.installed.prefill_hc,
@@ -1751,7 +1748,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_WIDE_READ_AHEAD")) |v| config.expert_wide_read_ahead = try cellBool("DSV41_CELL_WIDE_READ_AHEAD", v);
     if (envStr("DSV41_CELL_WIDE_BASE_AT_SEED")) |v| config.expert_wide_base_at_seed = try cellBool("DSV41_CELL_WIDE_BASE_AT_SEED", v);
     if (envStr("DSV41_CELL_WIDE_SEED_ALIGNED")) |v| config.expert_wide_seed_aligned = try cellBool("DSV41_CELL_WIDE_SEED_ALIGNED", v);
-    if (envStr("DSV41_CELL_PREFILL_BASE_SPLIT")) |v| config.expert_wide_resident_first = if (std.mem.eql(u8, v, "resident_first")) true else if (std.mem.eql(u8, v, "single")) false else return error.CellBaseSplitValue;
     if (envStr("DSV41_CELL_EMBEDDING_ROWS")) |v| config.embedding_host_rows = try cellBool("DSV41_CELL_EMBEDDING_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_ATTN_SOFTMAX")) |v| ov.decode_attn_softmax = try cellBool("DSV41_CELL_DECODE_ATTN_SOFTMAX", v);
     if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| ov.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);
