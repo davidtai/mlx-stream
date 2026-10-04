@@ -151,7 +151,6 @@ Use it to port commits written against the in-tree layout (for example the cover
 | src/mlx_stream/deepseek_v41_settings.zig | src/deepseek_v41_settings.zig |  |
 | src/mlx_stream/dsv41_cache_sim.zig | src/dsv41_cache_sim.zig |  |
 | src/mlx_stream/dsv41_decode_first.zig | src/dsv41_decode_first.zig |  |
-| src/mlx_stream/dsv41_decode_recall.zig | src/dsv41_decode_recall.zig |  |
 | src/mlx_stream/dsv41_decode_timers.zig | src/dsv41_decode_timers.zig |  |
 | src/mlx_stream/dsv41_draft_routes.zig | src/dsv41_draft_routes.zig |  |
 | src/mlx_stream/dsv41_host_heap.zig | src/dsv41_host_heap.zig |  |

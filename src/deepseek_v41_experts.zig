@@ -37,7 +37,6 @@ const sdk = @import("sdk");
 const sdk_ext = @import("sdk_ext.zig");
 const quant = @import("sdk_ext.zig").quant;
 const dt = @import("dsv41_decode_timers.zig");
-const recall = @import("dsv41_decode_recall.zig");
 const timeline = @import("dsv41_verify_timeline.zig");
 const first_cycle = @import("dsv41_decode_first.zig");
 const prof = @import("dsv41_prefill_timers.zig");
@@ -868,8 +867,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         wide_route: Wide = .{},
         /// `releaseTransient` nulled the transient bindings; `grow` binds decode's window 0.
         transient_released: bool = false,
-        /// A1's recall check (profile builds): the next call's predicted ids, handed over before its layer's attention.
-        recall_pred: if (recall.enabled) ?T else void = if (recall.enabled) null else {},
         /// (profile builds: `prof.enabled`) The last wide call's JOINLESS merge (`MergeStats`); compiled out elsewhere.
         last_merge: if (prof.enabled) MergeStats else void = if (prof.enabled) .{} else {},
         /// A0 (a): per layer, the last wide call's last `warm_tail_rows` rows' experts (`Wide.warm_tail`; empty
@@ -1223,15 +1220,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 return h.ex.run(g, h.layer, xf, indices, hoist);
             }
 
-            /// A1's recall check (profile builds): the layer's predicted ids [rows, k], compared at its routing barrier.
-            pub fn recallPredicted(h: Hook, pred: T) void {
-                if (comptime recall.enabled) {
-                    // The previous layer's call consumed its prediction (a stale one would outlive its wave).
-                    std.debug.assert(h.ex.recall_pred == null);
-                    h.ex.recall_pred = pred;
-                }
-            }
-
             /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs as the
             /// combine's sources and each assignment's (source, row); `releaseParts` after the combines are evaluated.
             pub fn routedParts(h: Hook, g: *G, xf: T, indices: T) !Parts {
@@ -1423,7 +1411,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// barrier, the residents' wave, then per miss part gate/up after
         /// `waitGu` and down after `waitDown`, each wave started on the GPU;
         /// release; the outputs in the router's order, `[n, k, hidden]` f32.
-        /// The recall check's residency query over the source (before the call's route admits and evicts).
+        /// A residency query over the source (before the call's route admits and evicts; profile builds).
         const ResidentAt = struct {
             src: *S,
             layer: u32,
@@ -1460,15 +1448,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             // A0 (profile builds): the call's barrier, route and MoE build (`first_cycle.call`).
             const t_call = tt;
             if (comptime timeline.enabled) timeline.point(layer, .call, self.readGauge(), false);
-            // A1's recall check (profile builds): the prediction joins the barrier's eval; it reads nothing.
-            const pred: ?T = if (comptime recall.enabled) self.recall_pred else null;
-            if (comptime recall.enabled) self.recall_pred = null;
             // The predictor joins the routing barrier's eval (the last layer predicts nothing).
             const sc: ?T = if (if (routes.lookahead) self.predictorGate(layer) else null) |gate| try nextScores(g, xf, gate) else null;
-            // The barrier's arrays: the ids, then the scores and the prediction when there are any.
-            var bar: [3]T = undefined;
+            // The barrier's arrays: the ids, then the scores when there are any.
+            var bar: [2]T = undefined;
             var n_bar: usize = 0;
-            for ([_]?T{ indices, sc, pred }) |x| if (x) |v| {
+            for ([_]?T{ indices, sc }) |x| if (x) |v| {
                 bar[n_bar] = v;
                 n_bar += 1;
             };
@@ -1494,14 +1479,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 first_cycle.tailRecord(layer, ids, n, k);
                 tt = dt.now();
             }
-            var pred_buf: [max_route_ids]u16 = undefined;
-            var predicted: []const u16 = &.{};
-            var wasted: u64 = 0;
-            if (pred) |p| {
-                predicted = try g.hostIds(p, pred_buf[0..n_ids]);
-                wasted = if (comptime @hasDecl(S, "isResident")) recall.wastedOf(predicted, ids, ResidentAt{ .src = self.source, .layer = layer }, ResidentAt.of) else 0;
-                tt = dt.now();
-            }
             const t_route0 = tt;
             const call = try self.source.route(layer, ids, scores);
             const t_route = dt.charge(.route, tt);
@@ -1510,7 +1487,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var released = false;
             errdefer if (!released) self.source.release(call);
             const sv = self.source.served(call);
-            if (pred != null) recall.record(layer, recall.countCall(predicted, ids, sv.waves, wasted));
             var acc: Acc = .{};
             if (dev) |d| {
                 // DEVROUTE: every pair's row from the device wave; the miss parts' rows follow and replace theirs in the join.

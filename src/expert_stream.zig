@@ -256,7 +256,7 @@ pub const StreamSource = struct {
         return k;
     }
 
-    /// Whether `expert` holds one of `layer`'s persistent slots now (the recall check's residency, before a route).
+    /// Whether `expert` holds one of `layer`'s persistent slots now (the profile builds' residency query, before a route).
     pub fn isResident(self: *const StreamSource, layer: u32, expert: u16) bool {
         return self.stream.layers[layer].policy.slotOf(expert) != null;
     }
