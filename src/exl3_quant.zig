@@ -3483,3 +3483,35 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
         }
     }
 }
+
+// The served construction's self-checks alone, on the device (a guarded step: the GPU lock held). The two plans the
+// served module judges at construction, the EXL3 quant's accept subset and the V4.1 trunk's, each result printed
+// (PASS / FAIL, words / bad, metric / limit, the reference side), then the module's verdict. No model, no bank.
+test "dsv41 selfcheck device: the served construction's self-check plans, every result printed" {
+    if (std.c.getenv("DSV41_SELFCHECK_DEVICE") == null) return error.SkipZigTest;
+    const trunk = @import("dsv41_kernel_routes.zig");
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var kd: xk.Diag = .{};
+    const set = ks.Set.init(a, .{ .device = .{ .stream = s } }, &kd) catch |e| {
+        std.debug.print("DSV41_SELFCHECK_DEVICE set refused: {t} {s}\n", .{ e, kd.message() });
+        return e;
+    };
+    defer set.deinit();
+    var failed: usize = 0;
+    inline for (.{ .{ "exl3_quant_accept", &checked_at_accept }, .{ "trunk_routes", &trunk.kernels } }) |plan| {
+        var report: selfcheck.Report = .{};
+        defer report.deinit(a);
+        selfcheck.runSubset(a, &set.reg, &set.bound, plan[1], &report) catch |e| {
+            std.debug.print("DSV41_SELFCHECK_DEVICE plan {s} raised {t}\n", .{ plan[0], e });
+            return e;
+        };
+        std.debug.print("DSV41_SELFCHECK_DEVICE plan {s}\n", .{plan[0]});
+        selfcheck.logResults(&report, true);
+        const n = report.failures();
+        failed += n;
+        std.debug.print("DSV41_SELFCHECK_DEVICE verdict {s} results={d} failed={d}\n", .{ plan[0], report.results.items.len, n });
+    }
+    std.debug.print("DSV41_SELFCHECK_DEVICE done failed={d}\n", .{failed});
+}

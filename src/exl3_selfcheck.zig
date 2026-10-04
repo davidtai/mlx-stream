@@ -321,6 +321,7 @@ pub fn accept(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, rep
 /// The acceptance verdict over a finished plan: refused (error.SelfCheckFailed, `diag` naming
 /// the first failing kernel / check / site) unless every result passed and the plan ran.
 pub fn judge(report: *const Report, diag: ?*xk.Diag) error{SelfCheckFailed}!void {
+    logResults(report, if (std.c.getenv("DSV41_SELFCHECK_REPORT")) |v| v[0] == '1' else false);
     if (report.results.items.len == 0) {
         if (diag) |d| d.len = (std.fmt.bufPrint(&d.buf, "exl3 kernels: self-check produced no result", .{}) catch unreachable).len;
         return error.SelfCheckFailed;
@@ -330,6 +331,18 @@ pub fn judge(report: *const Report, diag: ?*xk.Diag) error{SelfCheckFailed}!void
         if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, "exl3 kernels: self-check {t} {t} {s} failed ({d} of {d} words, metric {e} limit {e}, {s})", .{ r.kernel, r.check, r.site, r.bad, r.words, r.metric, r.limit, r.err })) |m| m.len else |_| d.buf.len;
         return error.SelfCheckFailed;
     }
+}
+
+/// One line per failed result (every result when `all`): kernel, check, site, words / bad, metric / limit, the error
+/// and the reference side. Construction only (the acceptance gate), never in a measured path.
+pub fn logResults(report: *const Report, all: bool) void {
+    var n_fail: usize = 0;
+    for (report.results.items) |r| {
+        n_fail += @intFromBool(!r.ok);
+        if (r.ok and !all) continue;
+        std.debug.print("[exl3 selfcheck] {s} {t} {t} site={s} words={d} bad={d} metric={e} limit={e} err={s} msg={s} reference={s}\n", .{ if (r.ok) "PASS" else "FAIL", r.kernel, r.check, r.site, r.words, r.bad, r.metric, r.limit, r.err, r.msg, referenceOf(r.check) });
+    }
+    if (all or n_fail > 0) std.debug.print("[exl3 selfcheck] {d} results, {d} failed\n", .{ report.results.items.len, n_fail });
 }
 
 const inputs_max = xk.max_inputs;
@@ -690,7 +703,51 @@ fn expectWords(h: *H, k: Kernel, c: Check, want: mlx.mlx_array, got: mlx.mlx_arr
         return;
     }
     words.* += g.len / size;
-    bad.* += countDiff(w, g, size);
+    const n_bad = countDiff(w, g, size);
+    bad.* += n_bad;
+    if (n_bad > 0) logWordDiff(k, c, mlx.mlx_array_dtype(got), mlx.mlx_array_shape(got)[0..@intCast(mlx.mlx_array_ndim(got))], w, g, size, n_bad);
+}
+
+/// A failed bitwise comparison, once, at construction: the shape, how many words differ, the first one (reference
+/// and kernel values) and the largest absolute difference. The reference side is the check's (`referenceOf`).
+fn logWordDiff(k: Kernel, c: Check, dt: mlx.mlx_dtype, shape: []const c_int, want: []const u8, got: []const u8, size: usize, n_bad: u64) void {
+    var first: ?usize = null;
+    var max_abs: f64 = 0;
+    const numeric = switch (dt) {
+        .float32, .float16, .bfloat16, .int32, .uint32, .int16, .uint8 => true,
+        else => false,
+    };
+    var i: usize = 0;
+    while (i * size < got.len) : (i += 1) {
+        if (std.mem.eql(u8, want[i * size ..][0..size], got[i * size ..][0..size])) continue;
+        if (first == null) first = i;
+        if (!numeric) continue;
+        const d = @abs(getF64(got, i, dt) - getF64(want, i, dt));
+        if (!(d <= max_abs)) max_abs = d; // NaN wins
+    }
+    const f = first.?;
+    if (!numeric) {
+        std.debug.print("[exl3 selfcheck] {t} {t}: {d} of {d} words differ ({t} {any}); first at word {d}; reference = {s}\n", .{ k, c, n_bad, got.len / size, dt, shape, f, referenceOf(c) });
+        return;
+    }
+    std.debug.print("[exl3 selfcheck] {t} {t}: {d} of {d} words differ ({t} {any}); first at {d}: reference {e} kernel {e}; max abs error {e}; reference = {s}\n", .{ k, c, n_bad, got.len / size, dt, shape, f, getF64(want, f, dt), getF64(got, f, dt), max_abs, referenceOf(c) });
+}
+
+/// What a check compares the kernel against (the side a failure line names as the reference).
+pub fn referenceOf(c: Check) []const u8 {
+    return switch (c) {
+        .compile => "a launch that completes",
+        .row_invariance => "the kernel's own full-M call",
+        .decode_table => "the stored trellis decode table",
+        .golden_tiles => "the stored golden tiles",
+        .mlx_chain => "the eager MLX op chain (bitwise)",
+        .f64 => "a host float64 reference",
+        .layout_guard => "MLX's mxfp8 quantized_matmul",
+        .composition => "the composition of the registered kernels",
+        .twin => "the registered twin kernel",
+        .fused => "the unfused kernel text then rot_widen1",
+        .join_equiv => "the registered q3sk_combine on the joined rows",
+    };
 }
 
 // ── compile ──
