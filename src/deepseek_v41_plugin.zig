@@ -89,10 +89,19 @@ pub fn bill(gpa: std.mem.Allocator, io: std.Io, req: *const sdk.BillRequest) !sd
 
 /// The prompt admission's bytes: the tier's bill for the pass the module builds (K16 layer-major, or chunk-major).
 pub fn promptBytes(c: *const Config, seq: u64, max_tokens: u32) u64 {
-    const pb = c.dsv41_prefill.?;
-    const tier: v41.PrefillBill.Tier = if ((c.numeric_tier orelse .served) == .stock) .stock else .served;
-    return if (c.dsv41LayerMajor()) pb.layerMajorBytes(seq, max_tokens, tier) else pb.bytes(seq, max_tokens, tier);
+    _ = c;
+    _ = seq;
+    _ = max_tokens;
+    return prompt_bytes_beyond_admission;
 }
+
+/// What a prompt needs beyond what the Module already holds, for the host's per-request guard (it compares this with the
+/// box's free memory NOW, which after a request still counts the Module's decode-phase rows): nothing. The construction
+/// admitted every prompt up to the billed context (`bill.servedBill`: the covering wave, both phases under the target),
+/// and each prompt pass starts with the reverse phase change, which returns the previous request's decode rows before
+/// anything of the prompt allocates (its settle checked by name). A prompt over the billed context is the Module's own
+/// refusal by name before its pass (`ContextOverBill`), never a memory guess here.
+pub const prompt_bytes_beyond_admission: u64 = 0;
 
 pub fn init(load: *const sdk.LoadCtx, c: *const Config) !*Module {
     const built = c.withFacts(&load.facts);
@@ -197,6 +206,10 @@ test "dsv41 plugin: the table the registry builds (owns its decode state, a hand
     const vt = comptime sdk.Arch.of(@This());
     try testing.expect(vt.caps.owns_decode_state and !vt.caps.batches_decode);
     try testing.expect(vt.handover != null and vt.prompt_bytes != null and vt.bill != null and vt.spec == .draft_lane);
+    // The host's per-request guard: a prompt needs nothing beyond the Module's own admission (the covering bill), at
+    // any length; the context is the Module's refusal by name.
+    var pc: Config = .{};
+    for ([_]u64{ 1, 2047, 4096, 16384, 131072, 1 << 20 }) |n| try testing.expectEqual(@as(u64, 0), vt.prompt_bytes.?(@ptrCast(&pc), n, 64));
 }
 
 // DSV41_BANK=<bank> (host): the term-wise bill's process bound at the fill's floor rows is the load preflight's number.

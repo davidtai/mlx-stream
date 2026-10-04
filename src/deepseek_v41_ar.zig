@@ -3088,6 +3088,23 @@ test "dsv41 bill: the default served bill covers every prompt up to 16,384; the 
         try testing.expect(served.kv >= x.kv and served.cache_overshoot_prompt >= x.cache_overshoot_prompt and served.engram_posted >= x.engram_posted);
         try testing.expect(served.prefillTotal() >= x.prefillTotal() and served.decodeTotal() >= x.decodeTotal());
     }
+    // The host's guard admits every prompt up to the context (`plugin.promptBytes` 0): each fits the Module's admitted
+    // target in the prompt phase, the previous request's decode rows released (the reverse phase change runs first):
+    // at the served fill's rows the covering prompt total, and every length's own, are under the target.
+    for ([_]u64{ 8_000_000_000, 10_300_000_000 }) |baseline| {
+        var cf = config;
+        cf.memory_baseline_bytes = baseline;
+        const target = ceiling - module.ceiling_stop_bytes;
+        const rows = try bill_mod.servedFill(a, testing.io, cf, null, ceiling, target, .{});
+        cf.expert_rows = rows.decode;
+        cf.expert_prefill_rows = rows.prefill;
+        const at = try bill_mod.servedBill(a, testing.io, &cf, null, ceiling, .{});
+        try testing.expect(at.prefillTotal() <= target and at.decodeTotal() <= target);
+        for ([_]u64{ 1, 1024, 2047, knee, knee + 1, 4096, 8192, 16384 }) |n| {
+            const x = try bill_mod.billAt(a, testing.io, &cf, n, bill_mod.fill_max_tokens, null, ceiling, .{});
+            try testing.expect(x.prefillTotal() <= at.prefillTotal());
+        }
+    }
     const pinned = try bill_mod.servedBill(a, testing.io, &config, null, ceiling, .{ .bill_pinned_prompt = 16384 });
     try testing.expectEqual(@as(u64, 13_868_806_049), pinned.prefill_wave);
     const exact = try bill_mod.billAt(a, testing.io, &config, 16384, bill_mod.fill_max_tokens, null, ceiling, .{});
@@ -3717,7 +3734,8 @@ test "dsv41 served cell: the window's inputs pass on the host (the standard prom
     // Either line: the fastest prompt (a fixture case, DSV41_CELL_CASE) or the standard sweep prompt.
     const case_id: ?[]const u8 = if (std.c.getenv("DSV41_CELL_CASE")) |v| std.mem.span(v) else null;
     const inputs = try cellInputs(a, testing.io, prompt_path, case_id, bank_dir);
-    try testing.expectEqual(@as(usize, 16384), inputs.prompt.len);
+    // The cell's prompt length (`cellPromptTokens`: 16,384 unless a context sweep size is pinned).
+    try testing.expectEqual(@as(usize, try cellPromptTokens()), inputs.prompt.len);
     const sha = try cell.idsSha256(a, inputs.prompt);
     // The fastest line's prompt is pinned here; either file's own digest was checked by the loader.
     if (case_id) |id| if (std.mem.eql(u8, id, "code-20260923")) try testing.expectEqualStrings("667506d734cce8152f3c42c9a97639a5b466540c70d9798a72e7564e2361bf86", &sha);
