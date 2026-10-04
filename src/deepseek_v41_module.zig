@@ -160,9 +160,6 @@ pub const RouteOverrides = struct {
     devroute: ?bool = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
-    /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
-    /// the grow below demand). null: the default, off.
-    first_verify_warm: ?bool = null,
     /// The phase change's settle poll: milliseconds between this process's footprint reads (1..`phase_change_settle_ms`).
     /// null: the settle's own default (`phaseChangePollMs`). Exact: it moves only when the settle sees the frees, not
     /// what it reads or the one check that judges the last reading.
@@ -371,7 +368,6 @@ pub fn prefillSub(ov: RouteOverrides, layer_major: bool) u64 {
     return ov.prefill_sub orelse kvc.prefill_sub;
 }
 
-/// A0 (a)'s route the Module installs: the capture and the warm class together (off by default).
 /// DEVROUTE as the hook binds it (`devroute`): off unless set.
 pub fn devRoute(ov: RouteOverrides) bool {
     return ov.devroute orelse false;
@@ -390,10 +386,6 @@ pub fn draftStaged(ov: RouteOverrides) bool {
 /// HOIST_FIRST as the hook binds it (`hoist_first`): off unless set.
 pub fn hoistFirst(ov: RouteOverrides) bool {
     return ov.hoist_first orelse false;
-}
-
-pub fn firstVerifyWarm(ov: RouteOverrides) bool {
-    return ov.first_verify_warm orelse false;
 }
 
 /// The phase change's settle poll the Module installs: the setting over its condition's default (`until_freed`:
@@ -711,7 +703,7 @@ pub const Module = struct {
             self.model.engram.?.posted = true;
         }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .first_verify_warm = t.arm.stream.warm != null, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
         };
         // DEVROUTE: exact by construction (the same banked texts per routed pair, the slots the host's plan names; the join
         // takes the miss parts' rows for their pairs).
@@ -753,7 +745,6 @@ pub const Module = struct {
             .zeros => "the grown rows zero-filled on the GPU",
             .unfilled => "the grown rows MLX-owned without a fill; each is written by its read before any kernel reads it",
         } });
-        log.info("NATIVE first-verify warm: {s}", .{if (self.installed.first_verify_warm) "installed (the grow reads each layer's prompt-tail set into its empty rows below demand; a layer's first decode route cancels the unread)" else "off"});
         self.installed.phase_change_poll_ms = poll_ms;
         self.installed.phase_change_settle = phaseChangeSettle(ov);
         self.installed.decode_cache_bytes = decodeCacheLimit(ov) catch unreachable;
@@ -929,11 +920,8 @@ pub const Module = struct {
         opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
         opts.transient_release = transientRelease(self.overrides);
         opts.grow_fill = growFill(self.overrides);
-        const warm = firstVerifyWarm(self.overrides);
-        opts.first_verify_warm = if (warm) .{} else null;
         if (decodeRowsAlloc(self.overrides) == .decode_first16) opts.decode_pool = .{};
-        var wide = wideRoute(config);
-        wide.warm_tail = warm;
+        const wide = wideRoute(config);
         const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wide, .banked = self.exl3.banked != null, .hoist_first = hoistFirst(self.overrides), .devroute = devRoute(self.overrides) }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
         checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
@@ -1562,13 +1550,6 @@ pub const Module = struct {
         self.logPhaseChange();
         for (marks, [_][]const u8{ "start", "after the embedding fence", "after the transient release", "after the frees (settled)", "after the banks grew" }) |mark, name| if (mark) |m|
             log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d}; host_statistics64, possibly cached)", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
-        // A0 (a), after the grow's record and marks: the first verify's warm reads, below demand.
-        if (self.installed.first_verify_warm) {
-            const issued = switch (self.arm) {
-                inline else => |t| t.arm.warmIssue() catch |e| return self.refuseBoundary(e),
-            };
-            log.info("NATIVE first-verify warm: {d} records issued at the grow", .{issued});
-        }
     }
 
     /// One `NATIVE DSV41_DECODE_ROWS {json}` line: prompt_stats' rows per layer, their total / min / max, and each
@@ -1678,8 +1659,6 @@ pub const Installed = struct {
     transient_release: bool = false,
     /// The decode read-ahead's speculative records per layer call (the stream's selector; 0 = none).
     lookahead_budget: u32 = 0,
-    /// A0 (a): the first verify's warm reads (installed in the stream at construction).
-    first_verify_warm: bool = false,
     /// The phase change's settle poll (ms), as installed (`phaseChangePollMs`).
     phase_change_poll_ms: u32 = phase_change_poll_ms,
     /// The phase change's settle condition, as installed (`phaseChangeSettle`).
@@ -2254,16 +2233,6 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     try std.testing.expect(!try layerMajor(&c));
     // Cold rows keep the per-group base calls (the deferred call is off with them).
     try std.testing.expectEqual(xp.Wide{ .cold_rows = 2 }, wideRoute(&c));
-}
-
-test "dsv41 module: A0 (a): the first verify's warm reads are off unless the route is set, and the transient release's resolver is apart" {
-    try std.testing.expect(!firstVerifyWarm(.{}));
-    try std.testing.expect(firstVerifyWarm(.{ .first_verify_warm = true }));
-    try std.testing.expect(!firstVerifyWarm(.{ .first_verify_warm = false }));
-    try std.testing.expect(!firstVerifyWarm(.{ .transient_release = true }));
-    try std.testing.expectEqual(transientRelease(.{}), transientRelease(.{ .first_verify_warm = true }));
-    const off: Installed = .{};
-    try std.testing.expect(!off.first_verify_warm);
 }
 
 test "dsv41 module: LOOKAHEAD4: event gates are the served tier's default, host waits the stock tier's; a setting overrides" {

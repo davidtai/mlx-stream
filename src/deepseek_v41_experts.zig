@@ -149,8 +149,6 @@ pub const FakeSource = struct {
     /// and every admission in order (the tests' view of the seed the model handed over).
     ahead_layer: ?u32 = null,
     ahead_log: std.ArrayList(u16) = .empty,
-    /// A0 (a): a test's scripted warm wait per layer (`Stream.warmWaitNs`; past its end, 0).
-    warm_wait_ns: []const u64 = &.{},
 
     pub const caps: sdk_ext.expert.Caps = .{ .two_phase = true, .prompt_seed = true, .read_ahead = true, .wide = true, .event_gates = true };
 
@@ -430,11 +428,6 @@ pub const FakeSource = struct {
 
     pub fn isResident(self: *const FakeSource, layer: u32, expert: u16) bool {
         return self.policies[layer].slotOf(expert) != null;
-    }
-
-    /// A0 (a): the ns `layer`'s first decode route waited for its started warm jobs (the test's script).
-    pub fn warmWaitNs(self: *const FakeSource, layer: u32) u64 {
-        return if (layer < self.warm_wait_ns.len) self.warm_wait_ns[layer] else 0;
     }
 
     pub fn bankRows(self: *FakeSource, layer: u32, kind: BankKind) u32 {
@@ -805,16 +798,8 @@ pub const Wide = struct {
     /// record) and the base call issued after the last seed group, so only the seed's own reads precede it. Exact:
     /// each expert's rows and kernel are its own whatever its group; the combine folds by routed position.
     seed_aligned: bool = false,
-    /// A0 (a): each wide call records its last `warm_tail_rows` rows' experts per layer (the prompt's last call
-    /// stands), the first verify's warm set (`warmSet`, read at the grow). Exact: it chooses reads only.
-    warm_tail: bool = false,
     pub const max_cold_rows = 8;
 };
-
-/// The prompt rows whose routed experts make a layer's warm set (`Wide.warm_tail`).
-pub const warm_tail_rows = 8;
-/// The most routed experts a layer's warm set addresses.
-pub const warm_max_experts = 512;
 
 /// The routed-expert hook of `Model(G)` over source `S` with math `M`
 /// (`gateUp(g, x, ids, gate, up)`, `down(g, h, ids, d)`). Bank arrays are
@@ -869,10 +854,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         transient_released: bool = false,
         /// (profile builds: `prof.enabled`) The last wide call's JOINLESS merge (`MergeStats`); compiled out elsewhere.
         last_merge: if (prof.enabled) MergeStats else void = if (prof.enabled) .{} else {},
-        /// A0 (a): per layer, the last wide call's last `warm_tail_rows` rows' experts (`Wide.warm_tail`; empty
-        /// without it), and the wide call's record, prebound at construction.
-        warm_tail: []std.StaticBitSet(warm_max_experts) = &.{},
-        tail_record: *const fn (*Self, u32, []const u16, u32, u32) void = recordNoTail,
         /// The decode lane's wave stages, bound at construction (`Options.banked`): one group per bank (the stock route)
         /// or one banked group over every bank.
         gate_up_wave: *const GateUpWaveFn = gateUpWaveGrouped,
@@ -957,7 +938,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (wr.base_at_seed and (!wr.seed or !wr.defer_base)) return error.InvalidWideRoute;
             if (wr.seed_aligned and (!wr.base_at_seed or !wr.hot_first or comptime !@hasDecl(S, "seedRanks"))) return error.InvalidWideRoute;
             if (opt.banked and comptime !hasBanked()) return error.BankedNotInMath;
-            if (wr.warm_tail and (!routes.prefill or c.n_routed_experts > warm_max_experts)) return error.InvalidWideRoute;
             if (wr.depth > 1) {
                 if (comptime @hasDecl(S, "wideDepth")) {
                     if (source.wideDepth() < wr.depth) return error.WideDepthExceedsSource;
@@ -971,11 +951,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
             var self: Self = .{ .a = a, .source = source, .math = math, .hidden = @intCast(c.hidden_size), .n_experts = c.n_routed_experts, .banks = banks, .gates = opt.gates, .g = g, .wide_route = wr };
             if (opt.event) |e| self.event = e;
-            if (wr.warm_tail) {
-                self.warm_tail = try a.alloc(std.StaticBitSet(warm_max_experts), c.n_layers);
-                @memset(self.warm_tail, .empty);
-                self.tail_record = recordTail;
-            }
             if (comptime hasBanked()) {
                 if (opt.banked) {
                     self.gate_up_wave = gateUpWaveBanked;
@@ -1076,34 +1051,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return self.pre_barrier == &preBarrierHoist;
         }
 
-        fn recordNoTail(_: *Self, _: u32, _: []const u16, _: u32, _: u32) void {}
-
         fn hasBanked() bool {
             return @hasDecl(M, "has_banked") and M.has_banked;
-        }
-
-        /// A wide call's routed ids (`n` rows x `k`, row order): its last `warm_tail_rows` rows' experts become the
-        /// layer's warm set.
-        fn recordTail(self: *Self, layer: u32, ids: []const u16, n: u32, k: u32) void {
-            const r = @min(n, warm_tail_rows);
-            const set = &self.warm_tail[layer];
-            set.* = .empty;
-            for (ids[(n - r) * k .. n * k]) |e| set.set(e);
-        }
-
-        /// A0 (a): layer `layer`'s warm set, ascending, at most `out.len`: the experts the first verify's warm class may
-        /// read at the grow. The stream's issue skips the residents itself (its no-evict admission), so the warm route
-        /// needs no residency query of the source. Empty without `Wide.warm_tail`.
-        pub fn warmSet(self: *const Self, layer: u32, out: []u16) []u16 {
-            if (layer >= self.warm_tail.len) return out[0..0];
-            var n: usize = 0;
-            var it = self.warm_tail[layer].iterator(.{});
-            while (it.next()) |e| {
-                if (n == out.len) break;
-                out[n] = @intCast(e);
-                n += 1;
-            }
-            return out[0..n];
         }
 
         /// The router that scores layer `layer`'s read-ahead: the NEXT layer's
@@ -1139,7 +1088,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             self.a.free(self.dev_parity);
             self.wide.deinit(self.a);
             self.a.free(self.banks);
-            self.a.free(self.warm_tail);
             self.* = undefined;
         }
 
@@ -1525,8 +1473,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (dev != null) try self.devLutAfterRoute(g, layer);
             if (comptime timeline.enabled) timeline.point(layer, .end, self.readGauge(), sv.n_parts > 0);
             if (comptime first_cycle.enabled) first_cycle.call(layer, t_barrier - t_call, t_route - t_route0, dt.now() - t_route, ids, sv.waves, wall_b, tail_reads);
-            // A0 (a) (profile builds): what this layer's first decode route waited for its started warm jobs.
-            if (comptime first_cycle.enabled and @hasDecl(S, "warmWaitNs")) first_cycle.warmWait(layer, self.source.warmWaitNs(layer));
             return self.join(g, &acc, n, k);
         }
 
@@ -1724,9 +1670,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var tp = prof.now();
             _ = try g.hostIds(indices, w.ids.items);
             prof.charge(.barrier, tp);
-            // A0: the prompt's last rows' experts, the layer's warm set (a no-op unless `Wide.warm_tail`); the profile
-            // builds' own tail set
-            self.tail_record(self, layer, w.ids.items, n, k);
+            // A0 (profile builds): the prompt's last rows' experts.
             if (comptime first_cycle.enabled) first_cycle.tailRecord(layer, w.ids.items, n, k);
             try w.first.resize(a, self.n_experts);
             @memset(w.first.items, -1);
@@ -2056,38 +2000,6 @@ test "dsv41 experts: a decode call runs the residents, then each part's gate/up 
     try testing.expectEqual(FakeSource.Event.Kind.flush, src.log.items[src.log.items.len - 1].kind);
 }
 
-test "dsv41 experts: A0 (a) (profile builds): a first-cycle decode call records its layer's warm wait; later cycles do not" {
-    if (comptime !first_cycle.enabled) return error.SkipZigTest;
-    const a = testing.allocator;
-    const c = testConfig(256, 128, 2);
-    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
-    defer src.deinit();
-    var g = TraceOps.init(a);
-    defer g.deinit();
-    const Chain = EagerChain(TraceOps, TraceGemv);
-    const Ex = Experts(TraceOps, FakeSource, Chain);
-    var ex = try Ex.init(a, &g, &src, Chain.init(.{}, &c), &c);
-    defer ex.deinit();
-    try ex.grow(&g, &.{ 8, 8 });
-    var script: Script = .{ .calls = &.{ &.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 7, 1, 7, 9, 3 }, &.{ 1, 2, 3, 4, 5, 6 } } };
-    g.host_values = script.values();
-    const xf = try g.input(&.{ 2, 256 }, .bfloat16);
-    const idx = try g.input(&.{ 2, 3 }, .int32);
-    src.warm_wait_ns = &.{ 0, 5_000_000 };
-    first_cycle.startDecode();
-    defer first_cycle.phase = .build;
-    _ = try ex.at(0).routed(&g, xf, idx);
-    _ = try ex.at(1).routed(&g, xf, idx);
-    try testing.expectEqual(@as(u64, 0), first_cycle.cycle1_warm_wait_ns[0]);
-    try testing.expectEqual(@as(u64, 5_000_000), first_cycle.cycle1_warm_wait_ns[1]);
-    // past the first cycle a call records nothing
-    first_cycle.endCycle();
-    src.warm_wait_ns = &.{ 0, 9_000_000 };
-    _ = try ex.at(1).routed(&g, xf, idx);
-    try testing.expectEqual(@as(u64, 5_000_000), first_cycle.cycle1_warm_wait_ns[1]);
-    try ex.flush();
-}
-
 test "dsv41 experts: a wider call is the prefill lane's (not ported), refused before any route" {
     const a = testing.allocator;
     const c = testConfig(256, 128, 1);
@@ -2377,53 +2289,6 @@ test "dsv41 experts: the joined outputs are put back in routed order" {
     var inv: [5]u32 = undefined;
     invertPositions(&.{ 3, 0, 4, 1, 2 }, &inv);
     try testing.expectEqualSlices(u32, &.{ 1, 3, 4, 0, 2 }, &inv);
-}
-
-test "dsv41 experts: A0 (a): a wide call records its last 8 rows' experts; the warm set is them, ascending, residents included" {
-    const a = testing.allocator;
-    var c = testConfig(256, 128, 1);
-    c.n_routed_experts = 64;
-    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 64, .rows = &.{16} });
-    defer src.deinit();
-    var g = TraceOps.init(a);
-    defer g.deinit();
-    src.trace = &g;
-    RecRoute.source = &src;
-    defer RecRoute.source = null;
-    const Chain = EagerChain(TraceOps, TraceGemv);
-    const Math = WithPrefillRoutes(TraceOps, Chain, RecRoute);
-    var rrs = [_]RecRoute{RecRoute.init(a)};
-    defer rrs[0].deinit(&g);
-    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
-    var ex = try Ex.initWith(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c, .{ .wide = .{ .warm_tail = true } });
-    defer ex.deinit();
-    // 20 tokens x top-6 over 64 experts; the last 8 rows' experts are the warm set
-    const n = 20;
-    const k = 6;
-    var ids: [n * k]u16 = undefined;
-    for (&ids, 0..) |*e, i| e.* = @intCast((7 * (i / k) + 11 * (i % k)) % 64);
-    var script: Script = .{ .calls = &.{&ids} };
-    g.host_values = script.values();
-    _ = try ex.at(0).routed(&g, try g.input(&.{ n, 256 }, .float32), try g.input(&.{ n, k }, .int32));
-    var tail: std.StaticBitSet(64) = .empty;
-    for (ids[(n - warm_tail_rows) * k ..]) |e| tail.set(e);
-    var buf: [64]u16 = undefined;
-    const got = ex.warmSet(0, &buf);
-    // the whole set, ascending, residents included (the stream's issue skips those)
-    try testing.expectEqual(tail.count(), got.len);
-    for (got, 0..) |e, i| {
-        try testing.expect(tail.isSet(e));
-        if (i > 0) try testing.expect(got[i - 1] < e);
-    }
-    var resident: usize = 0;
-    for (got) |e| resident += @intFromBool(src.isResident(0, e));
-    try testing.expect(resident > 0 and resident < got.len);
-    // the route needs the prefill lane; without it the warm set is empty
-    const Dec = ExpertsWith(TraceOps, FakeSource, Chain, .{});
-    try testing.expectError(error.InvalidWideRoute, Dec.initWith(a, &g, &src, Chain.init(.{}, &c), &c, .{ .wide = .{ .warm_tail = true } }));
-    var plain = try Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c);
-    defer plain.deinit();
-    try testing.expectEqual(@as(usize, 0), plain.warmSet(0, &buf).len);
 }
 
 test "dsv41 experts: a decode-width call never takes the wide lane: construction proves it fits a route, the wide lane refuses it by name" {

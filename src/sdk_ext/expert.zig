@@ -117,12 +117,6 @@ pub const Stats = struct {
     ahead_hits: u64 = 0,
     ahead_demand: u64 = 0,
     ahead_bytes: u64 = 0,
-    /// A0 (a)'s warm reads: records issued at the grow, landed / cancelled by their layer's first decode route, and
-    /// that route's hits on landed ones (once per layer; warm_landed + warm_cancelled == warm_issued).
-    warm_issued: u64 = 0,
-    warm_landed: u64 = 0,
-    warm_cancelled: u64 = 0,
-    warm_hits: u64 = 0,
 };
 
 /// A source's refusals at run time. A failure is sticky: every later call refuses as `StreamFailed`.

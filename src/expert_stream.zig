@@ -46,7 +46,6 @@ pub const PoolCand = S.PoolCand;
 pub const poolRows = S.poolRows;
 const ProbeSlot = S.ProbeSlot;
 const no_probe = S.no_probe;
-pub const FirstVerifyWarm = S.FirstVerifyWarm;
 pub const Lookahead = S.Lookahead;
 pub const Event = S.Event;
 pub const Gates = S.Gates;
@@ -278,11 +277,6 @@ pub const StreamSource = struct {
     /// Prefill routes one layer may hold live at once (`Stream.Options.wide_depth`).
     pub fn wideDepth(self: *const StreamSource) u8 {
         return self.stream.wide_depth;
-    }
-
-    /// A0 (a) (profile builds read it): the ns `layer`'s first decode route waited for its started warm jobs.
-    pub fn warmWaitNs(self: *const StreamSource, layer: u32) u64 {
-        return self.stream.warmWaitNs(layer);
     }
 
     pub fn stats(self: *StreamSource) Stats {
@@ -708,62 +702,6 @@ test "dsv41 stream: growth is the one phase change" {
     try testing.expectEqual(@as(u32, 0), r.plan.n_evictions);
     try expectServed(s, &sb, r, &.{ 1, 2, 3, 4 });
     s.release(r);
-}
-
-test "dsv41 stream: A0 (a): the grow's warm reads fill empty rows below demand; a layer's first decode route lands the started, cancels the queued (served on demand) and counts its hits" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    const page = std.heap.pageSize();
-    // Off its route the class is refused by name and counts nothing.
-    {
-        const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
-        defer s.deinit();
-        try s.grow(&.{ 4, 4 });
-        try testing.expectError(error.WarmNotInstalled, s.warmIssue(0, &.{3}));
-        try testing.expectEqual(@as(u64, 0), s.stats().warm_issued);
-    }
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .first_verify_warm = .{ .max_records = 8, .busy_max = 1 } });
-    defer s.deinit();
-    defer expert_io.clearFaults();
-    var r = try serve(s, 0, &.{ 1, 2 });
-    s.release(r);
-    r = try serve(s, 1, &.{ 1, 2 });
-    s.release(r);
-    try testing.expectError(error.WarmBeforeGrow, s.warmIssue(0, &.{3}));
-    try s.grow(&.{ 6, 6 });
-    // Layer 0's first warm record (expert 3) holds the reader 80 ms, so the rest wait in the warm ring (busy limit 1).
-    const off3 = sb.bank.recordOffset(0, 3);
-    expert_io.injectFault(off3 - off3 % page, 5, 80 * std.time.ns_per_ms);
-    // Layer 0: 1 is resident (skipped), 3, 4 and 5 issued; layer 1: 7; a layer issues once.
-    try testing.expectEqual(@as(u32, 3), try s.warmIssue(0, &.{ 1, 3, 4, 5 }));
-    try testing.expectEqual(@as(u32, 1), try s.warmIssue(1, &.{7}));
-    try testing.expectError(error.InvalidWarm, s.warmIssue(0, &.{6}));
-    while (s.pool.counter(.warm_started) == 0) std.Thread.yield() catch {};
-    // Layer 0's first decode route: 3 lands (waited for), 4 and 5 are cancelled; 3 is a hit, 4 and 6 are read on demand.
-    r = try serve(s, 0, &.{ 3, 4, 6 });
-    try testing.expectEqual(@as(u32, 1), r.plan.n_hits);
-    try testing.expectEqualSlices(u16, &.{3}, r.plan.hitsOf());
-    try expectServed(s, &sb, r, &.{ 3, 4, 6 });
-    try testing.expect(s.warmWaitNs(0) > 0);
-    s.release(r);
-    // Layer 1's warm record lands below demand; its first route serves it as a hit.
-    const w = &s.warm.?;
-    const t7 = w.loads[w.layers[1].lo].ticket;
-    try s.pool.wait(t7, 2, 10 * std.time.ns_per_s);
-    r = try serve(s, 1, &.{ 7, 8 });
-    try testing.expectEqualSlices(u16, &.{7}, r.plan.hitsOf());
-    try expectServed(s, &sb, r, &.{ 7, 8 });
-    s.release(r);
-    // Settled once: a later route of layer 0 counts no warm hit.
-    r = try serve(s, 0, &.{3});
-    s.release(r);
-    const st = s.stats();
-    try testing.expectEqual(@as(u64, 4), st.warm_issued);
-    try testing.expectEqual(@as(u64, 2), st.warm_landed);
-    try testing.expectEqual(@as(u64, 2), st.warm_cancelled);
-    try testing.expectEqual(@as(u64, 2), st.warm_hits);
-    try testing.expectEqual(st.warm_issued, st.warm_landed + st.warm_cancelled);
-    try testing.expect(!s.warm_live);
 }
 
 test "dsv41 stream: slots held for a deferred call are never refilled until released" {
@@ -2608,7 +2546,7 @@ fn streamInitDeinit(a: std.mem.Allocator, sb: *const SynthBank, opt: Options) !v
     s.deinit();
 }
 
-// The construction's every allocation (the stream's, its layers', the selector's, the warm and decode-pool state's and
+// The construction's every allocation (the stream's, its layers', the selector's, the decode-pool state's and
 // the read pool's) failed in turn: each failure unwinds to error.OutOfMemory with nothing leaked and the pool stopped.
 test "dsv41 stream: every allocation failure of the construction unwinds, the decode pool installed" {
     var sb = try SynthBank.open(32);
@@ -2622,12 +2560,11 @@ test "dsv41 stream: every allocation failure of the construction unwinds, the de
         .lookahead = .{ .k = 6, .budget = 2, .chunks = 1 },
         .event = .{ .watchdog_ms = 10_000 },
         .transient_release = true,
-        .first_verify_warm = .{ .max_records = 8, .busy_max = 1 },
         .decode_pool = .{ .per_layer = 2, .from_cycle = 2, .at_cycle = 4 },
     } });
 }
 
-test "dsv41 stream: every allocation failure of the construction unwinds (lookahead, gates, wide depth, warm, transient release)" {
+test "dsv41 stream: every allocation failure of the construction unwinds (lookahead, gates, wide depth, transient release)" {
     var sb = try SynthBank.open(32);
     defer sb.close();
     try std.testing.checkAllAllocationFailures(testing.allocator, streamInitDeinit, .{ &sb, Options{
@@ -2639,7 +2576,6 @@ test "dsv41 stream: every allocation failure of the construction unwinds (lookah
         .lookahead = .{ .k = 6, .budget = 2, .chunks = 1 },
         .event = .{ .watchdog_ms = 10_000 },
         .transient_release = true,
-        .first_verify_warm = .{ .max_records = 8, .busy_max = 1 },
     } });
 }
 

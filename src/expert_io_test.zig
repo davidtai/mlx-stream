@@ -8,7 +8,6 @@ const c = io.test_abi.abi;
 const Pool = io.Pool;
 const Status = io.Status;
 const Spec = io.Spec;
-const Warm = io.Warm;
 const max_items = io.max_items;
 const max_spec = io.max_spec;
 const max_pre = io.max_pre;
@@ -193,105 +192,6 @@ test "dsv41 io: stop joins and restarts" {
     try testing.expectError(error.InvalidOptions, Pool.start(testing.allocator, .{ .staging_bytes = std.heap.pageSize() + 1 }));
     const bad_spec: Spec = .{ .threads = 1, .slots = max_spec + 1, .record_bytes = 100, .chunk_bytes = std.heap.pageSize() };
     try testing.expectError(error.InvalidOptions, Pool.start(testing.allocator, .{ .spec = bad_spec }));
-}
-
-test "dsv41 io: A0 (a): warm jobs start only with demand idle, after a demand job submitted later, and land a demand read's bytes" {
-    const page = std.heap.pageSize();
-    var f = try PatternFile.init(16 * page);
-    defer f.deinit();
-    // One worker: the order is the queue rule's. Warm tickets 16..31 above demand's 0..15.
-    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 32, .warm = .{ .tickets = 16, .busy_max = 1 } });
-    defer pool.stop();
-    defer clearFaults();
-    const lens = [n_components]u64{ 100, 100, 100, 100, 100, 100, 50, 50, 50 };
-    // The first demand job holds the worker 80 ms (its first range sleeps), so everything below queues behind it.
-    injectFault(0, 5, 80 * std.time.ns_per_ms);
-    var d = try Dests.init(4, &lens);
-    defer testing.allocator.free(d.buf);
-    const seq0 = c.q3ld_seq();
-    const j0 = try R96.submit(pool, f.ufd, &.{500}, &.{700}, d.rows[0..1], &lens);
-    const w0 = try R96.submitWarm(pool, f.ufd, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
-    const w1 = try R96.submitWarm(pool, f.ufd, &.{4 * page + 500}, &.{4 * page + 700}, d.rows[2..3], &lens);
-    const j1 = try R96.submit(pool, f.ufd, &.{6 * page + 500}, &.{6 * page + 700}, d.rows[3..4], &lens);
-    try testing.expect(w0 >= 16 and w1 == w0 + 2 and j1 == j0 + 2 and j1 < 16);
-    try pool.wait(j0, 2, 10 * std.time.ns_per_s);
-    try pool.wait(j1, 2, 10 * std.time.ns_per_s);
-    try pool.wait(w0, 4, 10 * std.time.ns_per_s);
-    // Completion order: the held job, the demand job submitted after the warm ones, then the warm jobs.
-    var order: [8]u32 = undefined;
-    const got = pool.logOrder(seq0, c.q3ld_seq(), &order);
-    try testing.expectEqualSlices(u32, &.{ j0, j0 + 1, j1, j1 + 1, w0, w0 + 1, w1, w1 + 1 }, got);
-    for ([_]u64{ 500, 2 * page + 500, 4 * page + 500, 6 * page + 500 }, 0..) |gu, i| try d.expectRecord(i, f.image, gu, gu + 200, &lens);
-    try testing.expectEqual(@as(i64, 2), pool.counter(.warm_submitted));
-    try testing.expectEqual(@as(i64, 2), pool.counter(.warm_started));
-    try testing.expectEqual(@as(i64, 0), pool.counter(.warm_cancelled));
-    try testing.expectEqual(@as(i64, 0), pool.counter(.warm_max_busy_at_start));
-}
-
-test "dsv41 io: A0 (a): a warm cancel publishes the queued jobs skipped at once and lets a started one land" {
-    const page = std.heap.pageSize();
-    var f = try PatternFile.init(16 * page);
-    defer f.deinit();
-    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 32, .warm = .{ .tickets = 16, .busy_max = 1 } });
-    defer pool.stop();
-    defer clearFaults();
-    const lens = [n_components]u64{ 100, 100, 100, 100, 100, 100, 50, 50, 50 };
-    var d = try Dests.init(3, &lens);
-    defer testing.allocator.free(d.buf);
-    // The started one: its first range sleeps 80 ms, so the two after it stay queued (one worker).
-    injectFault(0, 5, 80 * std.time.ns_per_ms);
-    const w0 = try R96.submitWarm(pool, f.ufd, &.{500}, &.{700}, d.rows[0..1], &lens);
-    const w1 = try R96.submitWarm(pool, f.ufd, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
-    const w2 = try R96.submitWarm(pool, f.ufd, &.{4 * page + 500}, &.{4 * page + 700}, d.rows[2..3], &lens);
-    while (pool.counter(.warm_started) == 0) std.Thread.yield() catch {};
-    try testing.expectEqual(@as(u32, 4), pool.cancelWarm(w0, w2 + 2 - w0));
-    try pool.wait(w1, 4, std.time.ns_per_s);
-    for (0..4) |k| try testing.expectEqual(Status.skipped, pool.result(w1 + @as(u32, @intCast(k))).status);
-    // The cancelled rows were never written; the started one lands.
-    try testing.expect(std.mem.allEqual(u8, d.part(1, 0, &lens), 0xAA) and std.mem.allEqual(u8, d.part(2, 8, &lens), 0xAA));
-    try pool.wait(w0, 2, 10 * std.time.ns_per_s);
-    try testing.expectEqual(Status.ok, pool.result(w0).status);
-    try testing.expectEqual(Status.ok, pool.result(w0 + 1).status);
-    try d.expectRecord(0, f.image, 500, 700, &lens);
-    try testing.expectEqual(@as(i64, 2), pool.counter(.warm_cancelled));
-    try testing.expectEqual(@as(u32, 0), pool.cancelWarm(w0, 2));
-}
-
-test "dsv41 io: A0 (a): demand wraps below the warm tickets; a pool stopping with warm jobs queued returns" {
-    const page = std.heap.pageSize();
-    var f = try PatternFile.init(16 * page);
-    defer f.deinit();
-    const lens = [n_components]u64{ 100, 100, 100, 100, 100, 100, 50, 50, 50 };
-    var d = try Dests.init(2, &lens);
-    defer testing.allocator.free(d.buf);
-    {
-        var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 32, .warm = .{ .tickets = 16, .busy_max = 1 } });
-        defer pool.stop();
-        // Demand's 16 tickets: eight 1-record jobs, then the ninth wraps to 0, never into the warm tickets.
-        for (0..9) |k| {
-            const t = try R96.submit(pool, f.ufd, &.{500}, &.{700}, d.rows[0..1], &lens);
-            try testing.expectEqual(@as(u32, @intCast((2 * k) % 16)), t);
-            try pool.wait(t, 2, 10 * std.time.ns_per_s);
-        }
-        const w = try R96.submitWarm(pool, f.ufd, &.{500}, &.{700}, d.rows[1..2], &lens);
-        try testing.expectEqual(@as(u32, 16), w);
-        try pool.wait(w, 2, 10 * std.time.ns_per_s);
-    }
-    {
-        var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 32, .warm = .{ .tickets = 16, .busy_max = 1 } });
-        defer clearFaults();
-        injectFault(0, 5, 50 * std.time.ns_per_ms);
-        _ = try R96.submit(pool, f.ufd, &.{500}, &.{700}, d.rows[0..1], &lens);
-        _ = try R96.submitWarm(pool, f.ufd, &.{2 * page + 500}, &.{2 * page + 700}, d.rows[1..2], &lens);
-        pool.stop();
-    }
-    // Refusals at construction: odd or oversized warm tickets, a busy limit of 0 or past the workers.
-    for ([_]Warm{ .{ .tickets = 3, .busy_max = 1 }, .{ .tickets = 32, .busy_max = 1 }, .{ .tickets = 8, .busy_max = 0 }, .{ .tickets = 8, .busy_max = 3 } }) |bad|
-        try testing.expectError(error.InvalidOptions, Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 32, .warm = bad }));
-    // Without the class, a warm submit is refused by name.
-    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 32 });
-    defer pool.stop();
-    try testing.expectError(error.InvalidJob, R96.submitWarm(pool, f.ufd, &.{500}, &.{700}, d.rows[0..1], &lens));
 }
 
 test "dsv41 io: speculative slots and chunks follow the lane's sizes" {
@@ -787,9 +687,6 @@ test "dsv41 io cov: with no pool running every entry point refuses, and the snap
     try testing.expectEqual(@as(c_int, -1), c.q3ld_stop());
     try testing.expectEqual(@as(c_int, 0), c.q3ld_quiesce(std.time.ns_per_ms));
     try testing.expectEqual(@as(c_int, -1), c.q3ld_submit(3, 1000, -1, 1, 1, 1, &offs, &rows, &lens, 0));
-    try testing.expectEqual(@as(c_int, -1), c.q3ld_submit_warm(3, 1000, 1, 1, 1, &offs, &rows, &lens, 0));
-    try testing.expectEqual(@as(c_int, -1), c.q3ld_warm_config(1));
-    try testing.expectEqual(@as(i64, -1), c.q3ld_warm_cancel(0, 2));
     try testing.expectEqual(@as(i32, -1), c.q3ld_spec_step_len(3, 1000, 0, 1, &bases, 10));
     try testing.expectEqual(@as(i32, -1), q3raw.q3ld_spec_step(3, 1000, 0, 1, &bases));
     for ([_]i32{ -1, 1, 5 }) |nh| try testing.expectEqual(@as(i32, -1), q3raw.q3ld_spec_stepn(3, 1000, 0, nh, &one, &bases, &one, &bases));
@@ -862,11 +759,11 @@ test "dsv41 io cov: the stopped pool's configuration refuses bad arguments; the 
     try testing.expectEqual(@as(c_int, -1), c.q3ld_start(1, &staging, pg, pg, &res_arr, 16, &log_arr, 16, &gauge));
 }
 
-test "dsv41 io cov: a running pool refuses a malformed job, a pending ticket and the warm class's bad arguments by their codes" {
+test "dsv41 io cov: a running pool refuses a malformed job and a pending ticket by their codes" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(8 * page);
     defer f.deinit();
-    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 32, .warm = .{ .tickets = 8, .busy_max = 1 } });
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 32 });
     defer pool.stop();
     const fd = f.ufd.fd;
     const size: i64 = @intCast(f.ufd.size);
@@ -878,12 +775,10 @@ test "dsv41 io cov: a running pool refuses a malformed job, a pending ticket and
     const Shape = struct { n: i32 = 1, ngu: i32 = 1, ndown: i32 = 1, first: i64 = 0 };
     for ([_]Shape{ .{ .n = 0 }, .{ .n = max_items + 1 }, .{ .ngu = 0 }, .{ .ngu = 7 }, .{ .ndown = 0 }, .{ .ndown = 7 }, .{ .first = -1 }, .{ .first = 31 } }) |s| {
         try testing.expectEqual(@as(c_int, -1), c.q3ld_submit(fd, size, -1, s.n, s.ngu, s.ndown, &offs, &rows, &lens, s.first));
-        try testing.expectEqual(@as(c_int, -1), c.q3ld_submit_warm(fd, size, s.n, s.ngu, s.ndown, &offs, &rows, &lens, s.first));
     }
-    // A ticket still pending (its status word) refuses both rings' submits, raw and through Records.
+    // A ticket still pending (its status word) refuses the submit, raw and through Records.
     pool.res[5 * res_w] = @intFromEnum(Status.pending);
     try testing.expectEqual(@as(c_int, -2), rawSubmit(pool, fd, size, -1, 0, 100, lens[0..1], lens[1..2], &dst, 4));
-    try testing.expectEqual(@as(c_int, -2), c.q3ld_submit_warm(fd, size, 1, 1, 1, &offs, &rows, &lens, 4));
     pool.res[5 * res_w] = 0;
     const small = [n_components]u64{ 10, 10, 10, 10, 10, 10, 10, 10, 10 };
     var d = try Dests.init(1, &small);
@@ -891,20 +786,11 @@ test "dsv41 io cov: a running pool refuses a malformed job, a pending ticket and
     pool.res[0] = @intFromEnum(Status.pending);
     try testing.expectError(error.TicketsBusy, R96.submit(pool, f.ufd, &.{0}, &.{1000}, d.rows[0..1], &small));
     pool.res[0] = 0;
-    pool.res[24 * res_w] = @intFromEnum(Status.pending);
-    try testing.expectError(error.TicketsBusy, R96.submitWarm(pool, f.ufd, &.{0}, &.{1000}, d.rows[0..1], &small));
-    pool.res[24 * res_w] = 0;
     // Shapes Records refuses before the pool: no record, offsets that do not match the rows, no aux ring.
     try testing.expectError(error.InvalidJob, R96.submit(pool, f.ufd, &.{}, &.{}, d.rows[0..0], &small));
     try testing.expectError(error.InvalidJob, R96.submit(pool, f.ufd, &.{ 0, 1 }, &.{1000}, d.rows[0..1], &small));
     try testing.expectError(error.InvalidJob, R96.submitAux(pool, f.ufd, &.{0}, &.{1000}, d.rows[0..1], &small));
     try testing.expectEqual(@as(u32, 0), pool.auxTickets());
-    // The warm class: a busy limit outside 0..workers, a negative cancel span; off refuses its submit, on again takes it.
-    for ([_]i32{ -1, 3 }) |b| try testing.expectEqual(@as(c_int, -1), c.q3ld_warm_config(b));
-    try testing.expectEqual(@as(i64, -1), c.q3ld_warm_cancel(0, -1));
-    try testing.expectEqual(@as(c_int, 0), c.q3ld_warm_config(0));
-    try testing.expectEqual(@as(c_int, -1), c.q3ld_submit_warm(fd, size, 1, 1, 1, &offs, &rows, &lens, 24));
-    try testing.expectEqual(@as(c_int, 0), c.q3ld_warm_config(1));
     // A well-formed raw job lands: its two one-part ranges, byte for byte.
     try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, size, -1, 3, page + 7, lens[0..1], lens[1..2], &dst, 10));
     try pool.wait(10, 2, 10 * std.time.ns_per_s);
@@ -1492,25 +1378,6 @@ test "dsv41 io cov: q3ld_stop alone wakes and joins a worker held at a pre-range
     if (hung) _ = c.q3ld_quiesce(10 * std.time.ns_per_s);
     th.join();
     try testing.expect(!hung);
-}
-
-test "dsv41 io cov: the warm class refuses to arm on a pool configured without counters (its submits count into them)" {
-    const page = std.heap.pageSize();
-    const mem = try std.heap.page_allocator.alloc(u8, page);
-    defer std.heap.page_allocator.free(mem);
-    var res_arr: [16 * res_w]i64 = @splat(0);
-    var log_arr: [16]i64 = @splat(0);
-    var gauge: [6]i64 = @splat(0);
-    const staging = [1]u64{@intFromPtr(mem.ptr)};
-    try testing.expectEqual(@as(c_int, 0), c.q3ld_spec_config(0, null, 0, 0, 0, 0, null));
-    try testing.expectEqual(@as(c_int, 0), c.q3ld_start(1, &staging, @intCast(page), @intCast(page), &res_arr, 16, &log_arr, 16, &gauge));
-    defer _ = c.q3ld_stop();
-    // pre_config and ev_config refuse a pool without counters; the warm class must too (never submitted here).
-    const rc = c.q3ld_warm_config(1);
-    defer if (rc == 0) {
-        _ = c.q3ld_warm_config(0);
-    };
-    try testing.expectEqual(@as(c_int, -1), rc);
 }
 
 test "dsv41 io cov: a refused pre-read re-arm (a negative length) leaves the armed class as it was" {

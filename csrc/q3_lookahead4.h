@@ -7,9 +7,7 @@
  *                submit claims the record holding its range and copies it out instead of reading;
  *   pre-read     a layer call's certain misses queued as ranges before its plan; the submit binds them;
  *   event gate   per-wave gates over tickets; the satisfied prefix is handed to an MTLSharedEvent (or a host
- *                word) by the publishing worker, and a watchdog forces a gate whose bytes never land;
- *   warm         stock jobs on a second ring that a worker takes only while no demand job or pre-range is queued
- *                and fewer than busy_max jobs run; queued ones are cancelled by ticket span (published skipped).
+ *                word) by the publishing worker, and a watchdog forces a gate whose bytes never land.
  * The pool never calls MLX. State is static: one pool per process. macOS only (mach time). */
 #ifndef MLX_SERVE_Q3_LOOKAHEAD4_H
 #define MLX_SERVE_Q3_LOOKAHEAD4_H
@@ -83,15 +81,6 @@ int q3ld_ev_config(int32_t kind, uint64_t obj, int64_t timeout_ns, uint64_t star
 int32_t q3ld_ev_gates(int32_t n, const uint64_t *values, const int32_t *counts, const int64_t *tickets);
 int32_t q3ld_ev_release(uint64_t value);    /* force every live gate <= value; forced count, -1 off */
 int32_t q3ld_ev_state(int64_t *out);        /* 10 words; returns the live gate count */
-/* Running pool with counters: arm the warm class (1 <= busy_max <= workers) or disarm it (0: queued warm jobs
- * cancelled). 0 or -1. */
-int q3ld_warm_config(int32_t busy_max);
-/* One stock job (as q3ld_submit, no deadline) on the warm ring: no pre-range bind, no speculative claim, no gate.
- * 0, -1 bad args / off, -2 ticket pending, -3 ring full. */
-int q3ld_submit_warm(int32_t fd, int64_t file_size, int32_t n, int32_t ngu, int32_t ndown, const int64_t *offsets,
-                     const uint64_t *const *rows, const int64_t *lens, int64_t first);
-/* Queued warm jobs overlapping tickets [first, first + count) published skipped. Tickets published, -1 off. */
-int64_t q3ld_warm_cancel(int64_t first, int64_t count);
 int32_t q3ld_abi(void);                     /* 2026100201 */
 int32_t q3ld_max_gates(void);
 int32_t q3ld_max_gate_tickets(void);

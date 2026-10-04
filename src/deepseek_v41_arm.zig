@@ -104,8 +104,6 @@ pub const Options = struct {
     transient_release: bool = false,
     /// The grow's new rows' allocation (`expert_stream.Options.grow_fill`; the Module's route).
     grow_fill: expert_stream.GrowFill = .zeros,
-    /// A0 (a): the first verify's warm reads (`expert_stream.Options.first_verify_warm`; the Module's route).
-    first_verify_warm: ?expert_stream.FirstVerifyWarm = null,
     /// Option (b): decode pool rows re-owned from decode's own misses (`expert_stream.DecodePool`; route decode_first16).
     decode_pool: ?expert_stream.DecodePool = null,
     /// The draft head's resident bytes for the admission: null charges the
@@ -402,7 +400,6 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .transient_rows = @as(u32, opt.wide_depth) * expert_policy.max_route_ids,
                 .transient_release = opt.transient_release,
                 .grow_fill = opt.grow_fill,
-                .first_verify_warm = opt.first_verify_warm,
                 .decode_pool = opt.decode_pool,
                 .read_ahead_probe = if (comptime expert_stream.read_ahead_probed) .{ .barrier = prefill_timers.readAheadBarrier, .admission = prefill_timers.readAheadAdmission, .posted = prefill_timers.readAheadPosted } else {},
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
@@ -466,15 +463,6 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
         /// release route freed it; else it stayed through decode). Returns the bytes allocated.
         pub fn regrowTransient(self: *Self, g: *G, released: bool) !u64 {
             return self.hook.regrowTransient(g, released);
-        }
-
-        /// A0 (a), after the grow (its record taken): every layer's prompt-tail set (the hook's `warmSet`) read below
-        /// demand into its empty rows, layer-major (`Stream.warmIssue`). Returns the records issued.
-        pub fn warmIssue(self: *Self) !u32 {
-            var buf: [xp.warm_max_experts]u16 = undefined;
-            var n: u32 = 0;
-            for (0..self.config.n_layers) |l| n += try self.stream.warmIssue(@intCast(l), self.hook.warmSet(@intCast(l), &buf));
-            return n;
         }
     };
 }

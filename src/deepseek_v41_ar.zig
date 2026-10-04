@@ -940,12 +940,6 @@ const StreamPhase = struct {
     transient_loads: u64 = 0,
     loads_skipped: u64 = 0,
     evictions: u64 = 0,
-    /// A0 (a)'s warm reads (`Stats.warm_*`): issued at the grow, landed / cancelled and hit by each layer's first
-    /// decode route.
-    warm_issued: u64 = 0,
-    warm_landed: u64 = 0,
-    warm_cancelled: u64 = 0,
-    warm_hits: u64 = 0,
 
     fn of(a: expert_stream.Stats, b: expert_stream.Stats) StreamPhase {
         return .{
@@ -977,10 +971,6 @@ const StreamPhase = struct {
             .transient_loads = b.transient_loads -| a.transient_loads,
             .loads_skipped = b.loads_skipped -| a.loads_skipped,
             .evictions = b.expert_cache_evictions -| a.expert_cache_evictions,
-            .warm_issued = b.warm_issued -| a.warm_issued,
-            .warm_landed = b.warm_landed -| a.warm_landed,
-            .warm_cancelled = b.warm_cancelled -| a.warm_cancelled,
-            .warm_hits = b.warm_hits -| a.warm_hits,
         };
     }
 };
@@ -1094,8 +1084,6 @@ const CellReceipt = struct {
     prefill_fused_down: ?bool = null,
     /// The decode read-ahead's speculative records per layer call, as installed (read back from the Module).
     lookahead_budget: ?u32 = null,
-    /// A0 (a): the first verify's warm reads, as installed (read back from the Module).
-    first_verify_warm: ?bool = null,
     /// (v9) ENGRAM=prefetch and the wide call's deferred base-bank rows, as installed (read back from the Module).
     engram_posted: ?bool = null,
     deferred_base: ?bool = null,
@@ -1592,7 +1580,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .prefill_hc_post = md.installed.prefill_hc_post,
         .prefill_fused_down = md.installed.prefill_fused_down,
         .lookahead_budget = md.installed.lookahead_budget,
-        .first_verify_warm = md.installed.first_verify_warm,
         .engram_posted = md.installed.engram_posted,
         .deferred_base = md.installed.wide.defer_base,
         .bill_baseline_bytes = cx.bill.baseline,
@@ -1742,7 +1729,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_PREFILL_SHAREDMID")) |v| ov.prefill_shared_mid = if (std.mem.eql(u8, v, "compiled")) true else if (std.mem.eql(u8, v, "eager")) false else return error.CellSharedMidValue;
     if (envStr("DSV41_CELL_PREDICT_BF16")) |v| ov.predict_bf16 = try cellBool("DSV41_CELL_PREDICT_BF16", v);
     if (envStr("DSV41_CELL_TRANSIENT_RELEASE")) |v| ov.transient_release = try cellBool("DSV41_CELL_TRANSIENT_RELEASE", v);
-    if (envStr("DSV41_CELL_FIRST_VERIFY_WARM")) |v| ov.first_verify_warm = try cellBool("DSV41_CELL_FIRST_VERIFY_WARM", v);
     // The phase change's settle poll (ms; the Module refuses a value outside 1..phase_change_settle_ms at construction).
     if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;
     if (envStr("DSV41_CELL_GROW_FILL")) |v| ov.grow_fill = std.meta.stringToEnum(@import("expert_stream.zig").GrowFill, v) orelse return error.CellGrowFill;
