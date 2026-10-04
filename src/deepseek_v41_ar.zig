@@ -869,17 +869,27 @@ pub const seeded_fixture_schema = "dsv41-seeded-mtp-comparison-v1";
 const FixtureCase = struct { id: []const u8, prompt_ids: []const u32, prompt_ids_sha256: []const u8 };
 const SeededFixture = struct { schema: []const u8, cases: []const FixtureCase };
 
+/// The prompt length the cell runs (DSV41_CELL_PROMPT_TOKENS, read once at the harness's start): 16,384 (the standard
+/// cell) unless set; the context sweep's sizes (1,024 .. 131,072) select a case of that length (`ctx-prompts/`).
+pub fn cellPromptTokens() error{CellPromptTokens}!u32 {
+    const v = std.c.getenv("DSV41_CELL_PROMPT_TOKENS") orelse return 16384;
+    const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.CellPromptTokens;
+    if (n == 0 or n > 131072) return error.CellPromptTokens;
+    return n;
+}
+
 /// The cell's prompt: case `case_id` of a seeded fixture (DSV41_CELL_CASE; the headline's fastest
-/// prompt), else the standard sweep entry of a prompt-ids file; 16,384 tokens, its json.dumps digest
-/// equal to the file's. Refused by name otherwise.
+/// prompt, or a context sweep case `code-ctx<N>`), else the standard sweep entry of a prompt-ids file; `cellPromptTokens`
+/// tokens, its json.dumps digest equal to the file's. Refused by name otherwise.
 pub fn cellPrompt(a: std.mem.Allocator, io: std.Io, path: []const u8, case_id: ?[]const u8) ![]const u32 {
-    const id = case_id orelse return standardPrompt(a, io, path, 16384, 20260829);
+    const target = try cellPromptTokens();
+    const id = case_id orelse return standardPrompt(a, io, path, target, 20260829);
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20));
     const f = try std.json.parseFromSliceLeaky(SeededFixture, a, text, .{ .ignore_unknown_fields = true });
     if (!std.mem.eql(u8, f.schema, seeded_fixture_schema)) return error.PromptIdsSchema;
     for (f.cases) |c| {
         if (!std.mem.eql(u8, c.id, id)) continue;
-        if (c.prompt_ids.len != 16384) return error.PromptIdsLength;
+        if (c.prompt_ids.len != target) return error.PromptIdsLength;
         const d = try cell.idsSha256(a, c.prompt_ids);
         if (!std.mem.eql(u8, &d, c.prompt_ids_sha256)) return error.PromptIdsDigest;
         return c.prompt_ids;
@@ -1230,6 +1240,8 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     // 1,024 ids = the primary + 1,023; the server's max_tokens counts the same way).
     const max_tokens: u32 = if (std.c.getenv("DSV41_CELL_MAX_TOKENS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 1024;
     if (max_tokens < 2) return error.CellMaxTokens;
+    // A context sweep size (any prompt but the standard 16,384): the module bills every length up to it and admits it.
+    if (prompt.len != bill_mod.fill_prompt_tokens) config.max_context_tokens = @intCast(prompt.len);
     try cellFill(a, io, &config, args, prompt.len, max_tokens);
     // The bill at the admitted rows (host): the phase records' billed terms.
     const bill = try cellBill(a, io, &config, args, prompt.len, max_tokens);
@@ -1924,10 +1936,17 @@ fn gbOf(x: u64) f64 {
 /// The record granule (`DSV41_CELL_DECODE_FILL_GRANULE=record`): the single decode records the Module derives at the same
 /// target (`bill_mod.fillExtraRecords`), billed.
 fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !CellBill {
-    const b = try bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, args.ov);
+    const b = try cellBillAt(a, io, config, args, prompt_tokens, max_tokens, args.ov);
     if (module.decodeFillGranule(args.ov) == .row) return b;
     var ov = args.ov;
     ov.decode_extra_records = bill_mod.fillExtraRecords(b, args.ceiling -| args.stop);
+    return cellBillAt(a, io, config, args, prompt_tokens, max_tokens, ov);
+}
+
+/// The cell's bill: at the request's own length, or (a context sweep size, `max_context_tokens`) every length up to it,
+/// as the module bills it (`bill.billCovering`).
+fn cellBillAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, args: CellArgs, prompt_tokens: u64, max_tokens: u64, ov: module.RouteOverrides) !CellBill {
+    if (config.max_context_tokens) |m| return bill_mod.billCovering(a, io, config, m, max_tokens, args.wired, args.ceiling, ov);
     return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, ov);
 }
 
@@ -1935,7 +1954,8 @@ fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, ar
 /// (the window's own numbers, passed explicitly), refused by name on stdout.
 fn fillAt(a: std.mem.Allocator, io: std.Io, config: settings.Config, args: CellArgs, prompt_tokens: u64, max_tokens: u64) !arm_mod.NativeRows {
     const target = args.ceiling -| args.stop;
-    return bill_mod.fill(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, target, args.ov) catch |e| {
+    const filled = if (config.max_context_tokens != null) bill_mod.fillCovering(a, io, config, max_tokens, args.wired, args.ceiling, target, args.ov) else bill_mod.fill(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, target, args.ov);
+    return filled catch |e| {
         std.debug.print("DSV41_CELL_REFUSED {s}: the native bill does not fit the ceiling's target at the floor rows\n", .{@errorName(e)});
         return e;
     };
@@ -2996,6 +3016,78 @@ test "dsv41 memory: cell fill == server fill at 9.20, 9.73, 12.90 (bank)" {
 // The runner's --bill mode (host; bank): DSV41_CELL_BILL=1 DSV41_BANK DSV41_CELL_BASELINE_GB
 // DSV41_CELL_CEILING_GB [DSV41_CELL_WIRED_GB] [DSV41_CELL_ROWS] [DSV41_CELL_MAX_TOKENS]: the cell's bill at the rows the window
 // will admit, printed as a table and one DSV41_CELL_BILL json line.
+/// The context sizes the prefill sweep runs (prompt tokens) and the generation the standard cell reserves.
+const ctx_sizes = [_]u64{ 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072 };
+
+/// One row of the context table: the bill's context-dependent terms at `prompt` tokens (the cell's max_tokens), the fill
+/// to `target`, and the totals at the filled rows (null rows: refused at the floor, `bill.min_fill_rows`).
+const CtxRow = struct { prompt: u64, positions: u64, wave: u64, kv_prompt: u64, kv_decode: u64, overshoot_prompt: u64, overshoot_decode: u64, prompt_state: u64, engram_posted: u64, decode_wave: u64, rows: ?arm_mod.NativeRows, prompt_total: u64, decode_total: u64 };
+
+fn ctxRow(a: std.mem.Allocator, io: std.Io, base: settings.Config, prompt: u64, max_tokens: u64, ceiling: u64, target: u64, covering: bool) !CtxRow {
+    var config = base;
+    if (covering) config.max_context_tokens = @intCast(prompt);
+    const ov: module.RouteOverrides = .{};
+    const filled = if (covering) bill_mod.fillCovering(a, io, config, max_tokens, null, ceiling, target, ov) else bill_mod.fill(a, io, config, prompt, max_tokens, null, ceiling, target, ov);
+    const rows = filled catch |e| switch (e) {
+        error.NativeBillDoesNotFit => null,
+        else => return e,
+    };
+    if (rows) |r| {
+        config.expert_rows = r.decode;
+        config.expert_prefill_rows = r.prefill;
+    } else {
+        config.expert_rows = bill_mod.min_fill_rows;
+        config.expert_prefill_rows = bill_mod.min_fill_rows;
+    }
+    const b = if (covering) try bill_mod.billCovering(a, io, &config, prompt, max_tokens, null, ceiling, ov) else try bill_mod.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov);
+    const pt = b.prefillTerms();
+    const dterms = b.decodeTerms();
+    return .{ .prompt = prompt, .positions = bill_mod.billedPositions(prompt, max_tokens), .wave = pt.waves, .kv_prompt = pt.kv, .kv_decode = dterms.kv, .overshoot_prompt = pt.mlx_cache_overshoot, .overshoot_decode = dterms.mlx_cache_overshoot, .prompt_state = dterms.prompt_state, .engram_posted = pt.engram_posted, .decode_wave = dterms.waves, .rows = rows, .prompt_total = b.prefillTotal(), .decode_total = b.decodeTotal() };
+}
+
+// DSV41_BANK + DSV41_BILL_CONTEXT=1: the served bill at every sweep size (1k .. 128k prompt tokens, the cell's 1,024 new
+// tokens), at the box's ceiling (112 GiB) less the guard's 2.0 GB stop, at box baselines 8.3 and 10.3 GB: the context-
+// dependent terms, the filled rows (or the refusal at the floor rows), each phase's total. Asserts: the 16K row is the
+// served cells' (the receipts' wave and KV), a filled size's totals are under the target, the terms that scale with
+// positions alone never shrink, and a size whose floor bill exceeds the target is refused (no rows).
+test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselines" {
+    if (std.c.getenv("DSV41_BILL_CONTEXT") == null) return error.SkipZigTest;
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ceiling: u64 = 120_259_084_288; // 112 GiB
+    const target = ceiling - module.ceiling_stop_bytes;
+    for ([_]bool{ false, true }) |covering| for ([_]u64{ 8_300_000_000, 10_300_000_000 }) |baseline| {
+        var config = try host_bridge.loadConfig(testing.io, a, bank_dir);
+        config.memory_baseline_bytes = baseline;
+        var prev: ?CtxRow = null;
+        for (ctx_sizes) |n| {
+            const r = try ctxRow(a, testing.io, config, n, 1024, ceiling, target, covering);
+            std.debug.print("DSV41_BILL_CONTEXT {{\"bill\": \"{s}\", \"baseline_gb\": {d:.2}, \"prompt\": {d}, \"positions\": {d}, \"wave_gb\": {d:.3}, \"kv_prompt_gb\": {d:.3}, \"kv_decode_gb\": {d:.3}, \"overshoot_prompt_gb\": {d:.3}, \"overshoot_decode_gb\": {d:.3}, \"prompt_state_gb\": {d:.3}, \"engram_posted_gb\": {d:.3}, \"decode_wave_gb\": {d:.3}, \"rows\": [{?d}, {?d}], \"prompt_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"target_gb\": {d:.3}, \"fits\": {}}}\n", .{
+                if (covering) "covering" else "exact", gbOf(baseline), r.prompt, r.positions, gbOf(r.wave), gbOf(r.kv_prompt), gbOf(r.kv_decode), gbOf(r.overshoot_prompt), gbOf(r.overshoot_decode), gbOf(r.prompt_state), gbOf(r.engram_posted), gbOf(r.decode_wave),
+                if (r.rows) |x| x.prefill else null, if (r.rows) |x| x.decode else null, gbOf(r.prompt_total), gbOf(r.decode_total), gbOf(target), r.rows != null,
+            });
+            if (n == 16384 and !covering) {
+                try testing.expectEqual(@as(u64, 13_868_806_049), r.wave);
+                try testing.expectEqual(@as(u64, 355_600_384), r.kv_prompt);
+            }
+            if (r.rows) |x| {
+                try testing.expect(r.prompt_total <= target and r.decode_total <= target);
+                try testing.expect(x.prefill >= bill_mod.min_fill_rows and x.decode >= x.prefill);
+            } else try testing.expect(@max(r.prompt_total, r.decode_total) > target);
+            // Monotonic in the context: the terms that scale with positions alone. The prompt wave and the rings are
+            // not: they follow the chunk rule (one chunk up to about 4K tokens, then 8 GB-target chunks), so the
+            // wave peaks where a whole prompt is one chunk (see the report); the fill follows the bill, not the size.
+            if (prev) |p| {
+                try testing.expect(r.overshoot_prompt >= p.overshoot_prompt and r.decode_wave >= p.decode_wave and r.engram_posted >= p.engram_posted and r.prompt_state >= p.prompt_state);
+            }
+            prev = r;
+        }
+    };
+}
+
+
 test "dsv41 served cell: the cell's bill on the host (the window's admission, every term)" {
     if (std.c.getenv("DSV41_CELL_BILL") == null) return error.SkipZigTest;
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);

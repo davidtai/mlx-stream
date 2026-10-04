@@ -818,6 +818,88 @@ pub fn fillRows(b: FillBill, target: u64, n_experts: u32) error{NativeBillDoesNo
 pub const fill_prompt_tokens: u64 = 16384;
 pub const fill_max_tokens: u64 = 1024;
 
+/// The prompt lengths whose bill bounds every length up to `max_context` (`billCovering`). Every context term but the
+/// chunk-shaped ones grows with the length; the prompt wave and the rings follow the chunk rule (`PrefillBill.chunkRows`):
+/// while a whole prompt is one chunk (up to the knee) every term grows with it, past the knee the chunk's rows fall as
+/// 1 / length while the kept terms grow (a convex sum: its largest value on an interval is at an end). So the knee, the
+/// length after it and `max_context` bound the interval (the lengths above `max_context` dropped).
+pub fn coveredPromptLengths(pb: v41.PrefillBill, max_context: u64) struct { n: usize, at: [3]u64 } {
+    var lo: u64 = 1;
+    var hi: u64 = max_context;
+    while (lo < hi) { // the knee: the longest length whose chunk is the whole prompt
+        const mid = lo + (hi - lo + 1) / 2;
+        if (pb.chunkRows(mid) == mid) lo = mid else hi = mid - 1;
+    }
+    var out: [3]u64 = .{ max_context, 0, 0 };
+    var n: usize = 1;
+    for ([_]u64{ lo, lo + 1 }) |x| if (x < max_context) {
+        out[n] = x;
+        n += 1;
+    };
+    return .{ .n = n, .at = out };
+}
+
+/// The bill for any request up to `max_context` prompt tokens (each with `max_tokens`): `billAt` at `max_context`, every
+/// context-dependent term at its largest over `coveredPromptLengths` (the prompt wave, the KV of both phases, the cache
+/// overshoots, the verify and draft waves, the retained prompt state, the posted Engram gathers). The served module bills
+/// this when `max_context_tokens` is set; a request longer than `max_context` is refused before its prompt pass.
+pub fn billCovering(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, max_context: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
+    var b = try billAt(a, io, config, max_context, max_tokens, wired_bytes, ceiling_bytes, ov);
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, io, config.expert_bank_dir orelse return error.Dsv41BankDir, &vd);
+    const covered = coveredPromptLengths(try prefillBillAt(config, ov, &c, 4), max_context);
+    for (covered.at[1..covered.n]) |len| {
+        const x = try billAt(a, io, config, len, max_tokens, wired_bytes, ceiling_bytes, ov);
+        b.prefill_wave = @max(b.prefill_wave, x.prefill_wave);
+        b.prefill_wave_tight = @max(b.prefill_wave_tight, x.prefill_wave_tight);
+        b.kv = @max(b.kv, x.kv);
+        b.kv_decode = @max(b.kv_decode, x.kv_decode);
+        b.cache_overshoot_prompt = @max(b.cache_overshoot_prompt, x.cache_overshoot_prompt);
+        b.cache_overshoot_decode = @max(b.cache_overshoot_decode, x.cache_overshoot_decode);
+        b.decode_wave = @max(b.decode_wave, x.decode_wave);
+        b.draft_wave = @max(b.draft_wave, x.draft_wave);
+        b.prompt_state = @max(b.prompt_state, x.prompt_state);
+        b.engram_posted = @max(b.engram_posted, x.engram_posted);
+    }
+    return b;
+}
+
+/// The served module's billed context: `max_context_tokens` (covering, `billCovering`), else the standard request's length
+/// billed at that length alone (`billAt`, today's served bill).
+pub fn servedBill(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
+    if (config.max_context_tokens) |m| return billCovering(a, io, config, m, fill_max_tokens, wired_bytes, ceiling_bytes, ov);
+    return billAt(a, io, config, fill_prompt_tokens, fill_max_tokens, wired_bytes, ceiling_bytes, ov);
+}
+
+/// `fill` over the served bill (`servedBill` at the floor rows).
+pub fn servedFill(a: std.mem.Allocator, io: std.Io, config: settings.Config, wired_bytes: ?u64, ceiling_bytes: u64, target: u64, ov: module.RouteOverrides) !arm_mod.NativeRows {
+    var c = config;
+    c.expert_rows = min_fill_rows;
+    c.expert_prefill_rows = min_fill_rows;
+    const b0 = try servedBill(a, io, &c, wired_bytes, ceiling_bytes, ov);
+    const mb = try memoryBill(a, b0);
+    defer mb.free(a);
+    const r = try sdk.fill(mb, b0.baseline, target, b0.n_experts, min_fill_rows);
+    return .{ .prefill = r.prompt, .decode = r.decode };
+}
+
+/// `fill` over `billCovering` at `config.max_context_tokens` (the floor rows), each request with `max_tokens`.
+pub fn fillCovering(a: std.mem.Allocator, io: std.Io, config: settings.Config, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, target: u64, ov: module.RouteOverrides) !arm_mod.NativeRows {
+    var c = config;
+    c.expert_rows = min_fill_rows;
+    c.expert_prefill_rows = min_fill_rows;
+    const b0 = try billCovering(a, io, &c, config.max_context_tokens orelse fill_prompt_tokens, max_tokens, wired_bytes, ceiling_bytes, ov);
+    const mb = try memoryBill(a, b0);
+    defer mb.free(a);
+    const r = try sdk.fill(mb, b0.baseline, target, b0.n_experts, min_fill_rows);
+    return .{ .prefill = r.prompt, .decode = r.decode };
+}
+
+/// The longest prompt the served module admits (`max_context_tokens`, else the standard request's).
+pub fn servedContext(config: *const settings.Config) u64 {
+    return config.max_context_tokens orelse fill_prompt_tokens;
+}
+
 /// The fewest rows per layer the fill admits (the envelope admission's prefill floor).
 pub const min_fill_rows = 16;
 
@@ -2077,4 +2159,25 @@ test "dsv41 memory: with single decode records the SDK's view admits exactly as 
         try sdk.admit(mb, x.baseline, rows, @max(x.prefillTotal(), x.decodeTotal()));
         try testing.expectError(error.DecodeOverTarget, sdk.admit(mb, x.baseline, .{ .prompt = 0, .decode = rows.decode }, x.decodeTotal() - 1));
     }
+}
+
+test "dsv41 memory: the covering lengths are the knee, the length after it and the context; below the knee the context alone (no bank)" {
+    const c = try realConfig();
+    const config: settings.Config = .{};
+    const pb = try prefillBillAt(&config, .{}, &c, 4);
+    const cov = coveredPromptLengths(pb, 131072);
+    try testing.expectEqual(@as(usize, 3), cov.n);
+    const knee = cov.at[1];
+    try testing.expectEqual(knee, pb.chunkRows(knee));
+    try testing.expect(pb.chunkRows(knee + 1) < knee + 1);
+    try testing.expectEqual(knee + 1, cov.at[2]);
+    // a context at or below the knee: its own length bounds every shorter one (every term grows with it there)
+    const small = coveredPromptLengths(pb, knee);
+    try testing.expectEqual(@as(usize, 1), small.n);
+    try testing.expectEqual(knee, small.at[0]);
+    // the prompt wave over [1, 131072] never exceeds the larger of the covered lengths' (sampled every 256 tokens)
+    var worst: u64 = 0;
+    for (cov.at[0..cov.n]) |x| worst = @max(worst, promptWave(pb, true, true, x));
+    var n: u64 = 256;
+    while (n <= 131072) : (n += 256) try testing.expect(promptWave(pb, true, true, n) <= worst);
 }

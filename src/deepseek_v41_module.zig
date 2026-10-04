@@ -598,6 +598,8 @@ pub const Module = struct {
     prompt_cache_bytes: usize = 0,
     /// The fill's target (the ceiling less upstream's wired margin): each phase's billed total stays under it.
     fill_target: u64 = 0,
+    /// The longest prompt the construction billed (`bill.servedContext`); a longer request is refused before its prompt pass.
+    max_context: u64 = bill_mod.fill_prompt_tokens,
     /// The phase change's boundary readings, freed bytes and reclaim time (the receipts carry it).
     phase_change: ?PhaseChangeRecord = null,
     /// The request's tail release (`tailRelease`; reset at each prefill).
@@ -687,14 +689,14 @@ pub const Module = struct {
         if (admitted.expert_prefill_rows == null) {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const nr = try bill_mod.fill(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, sdk.memory.vmBytes().wired, ceiling_bytes, target, ov);
+            const nr = try bill_mod.servedFill(arena.allocator(), io, admitted, sdk.memory.vmBytes().wired, ceiling_bytes, target, ov);
             if (admitted.expert_rows) |forced| {
                 admitted.expert_prefill_rows = @min(nr.prefill, forced);
             } else {
                 admitted.expert_rows = nr.decode;
                 admitted.expert_prefill_rows = nr.prefill;
             }
-            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill, baseline {d} B, target {d} B)", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, fill_prompt_tokens, admitted.memory_baseline_bytes orelse 0, target });
+            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill{s}, baseline {d} B, target {d} B)", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, bill_mod.servedContext(&admitted), if (admitted.max_context_tokens != null) ", every length up to it" else "", admitted.memory_baseline_bytes orelse 0, target });
         }
         errdefer self.dropKernels();
         // The fused down GEMM, when overridden: its self-checks on the set, then every layer's DIG-X waves launch it.
@@ -713,7 +715,7 @@ pub const Module = struct {
         {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            var b = bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, sdk.memory.vmBytes().wired, ceiling_bytes, ov) catch |e| {
+            var b = bill_mod.servedBill(arena.allocator(), io, &admitted, sdk.memory.vmBytes().wired, ceiling_bytes, ov) catch |e| {
                 log.err("admission refused before construction: {s}", .{@errorName(e)});
                 return e;
             };
@@ -722,9 +724,10 @@ pub const Module = struct {
             if (ov.bank_geometry != null) return error.BankGeometryIsBillOnly;
             if (decodeFillGranule(ov) == .record) {
                 self.overrides.decode_extra_records = bill_mod.fillExtraRecords(b, target);
-                b = try bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, sdk.memory.vmBytes().wired, ceiling_bytes, self.overrides);
+                b = try bill_mod.servedBill(arena.allocator(), io, &admitted, sdk.memory.vmBytes().wired, ceiling_bytes, self.overrides);
             }
             self.fill_target = target;
+            self.max_context = bill_mod.servedContext(&admitted);
             // Forced rows too: both phases' totals under the target (a baseline-free shell bills the process alone).
             const mb = try bill_mod.memoryBill(arena.allocator(), b);
             sdk.admit(mb, b.baseline, .{ .prompt = b.prefill_rows, .decode = b.decode_rows }, self.fill_target) catch |e| {
@@ -1056,7 +1059,7 @@ pub const Module = struct {
         const planned_wired = switch (self.arm) {
             inline else => |t| t.arm.inputs.wired_bytes,
         };
-        const b = try bill_mod.billAt(arena.allocator(), io, admitted, fill_prompt_tokens, fill_max_tokens, planned_wired, ceiling_bytes, self.overrides);
+        const b = try bill_mod.servedBill(arena.allocator(), io, admitted, planned_wired, ceiling_bytes, self.overrides);
         const rows = switch (self.arm) {
             inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
         };
@@ -1309,6 +1312,8 @@ pub const Module = struct {
     /// always sends the whole prompt here (`Transformer.forwardDsv41WithImpl`: step 0 is `prefill`, every later forward
     /// `extend`, refused before the handover), so only a harness passes false.
     pub fn prefillPart(self: *Module, ids: []const u32, reserved_tokens: u64, final: bool) !mlx.mlx_array {
+        // The request against the context the construction billed, once, before anything of it runs.
+        try checkContext(ids.len, self.max_context);
         // The previous request's decode end (served path), before this request touches anything.
         self.recordDecodeEnd();
         // The previous request's end, when the shell did not run it (an errored request): its routes settled and, if it
@@ -2270,6 +2275,19 @@ pub const FillBill = bill_mod.FillBill;
 pub const fillRows = bill_mod.fillRows;
 pub const admitPhases = bill_mod.admitPhases;
 pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
+
+/// A request's prompt against the billed context (`Module.max_context`): longer is refused by name, once, before its pass.
+pub fn checkContext(prompt_tokens: usize, max_context: u64) error{ContextOverBill}!void {
+    if (prompt_tokens <= max_context) return;
+    log.warn("NATIVE request refused: a {d}-token prompt is over the billed context of {d} tokens (ContextOverBill); construct with max_context_tokens >= the prompt", .{ prompt_tokens, max_context });
+    return error.ContextOverBill;
+}
+
+test "dsv41 module: a prompt over the billed context is refused before its pass, by name" {
+    try checkContext(16384, 16384);
+    try checkContext(1, 16384);
+    try std.testing.expectError(error.ContextOverBill, checkContext(16385, 16384));
+}
 pub const fill_max_tokens = bill_mod.fill_max_tokens;
 pub const min_fill_rows = bill_mod.min_fill_rows;
 

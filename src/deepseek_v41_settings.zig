@@ -37,6 +37,10 @@ pub const Config = struct {
     numeric_tier: ?NumericTier = null,
     /// The prompt pass layer by layer (null = the tier's default).
     layer_major_prefill: ?bool = null,
+    /// The longest request the served module admits (prompt tokens; null: the standard request's, `fill_prompt_tokens`).
+    /// Set, the construction bills every prompt length up to it (`bill.billCovering`); a longer request is refused by name
+    /// before its prompt pass (`error.ContextOverBill`).
+    max_context_tokens: ?u32 = null,
     /// The wide prefill read schedule (null = the tier's defaults below).
     expert_wide_feed: ?bool = null,
     expert_wide_seed: ?bool = null,
