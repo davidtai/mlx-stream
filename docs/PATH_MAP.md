@@ -154,7 +154,6 @@ Use it to port commits written against the in-tree layout (for example the cover
 | src/mlx_stream/dsv41_decode_recall.zig | src/dsv41_decode_recall.zig |  |
 | src/mlx_stream/dsv41_decode_timers.zig | src/dsv41_decode_timers.zig |  |
 | src/mlx_stream/dsv41_draft_routes.zig | src/dsv41_draft_routes.zig |  |
-| src/mlx_stream/dsv41_hcpost_emul_bench.zig | src/dsv41_hcpost_emul_bench.zig |  |
 | src/mlx_stream/dsv41_host_heap.zig | src/dsv41_host_heap.zig |  |
 | src/mlx_stream/dsv41_kernel_routes.zig | src/dsv41_kernel_routes.zig |  |
 | src/mlx_stream/dsv41_kernels_test.zig | src/dsv41_kernels_test.zig |  |
