@@ -183,9 +183,6 @@ pub const RouteOverrides = struct {
     /// MLX's buffer cache limit through decode (set at the phase change; the bill's decode cache term). null: the
     /// default, the envelope's 268,435,456 B; at most that (a larger limit would bill past the admission's term).
     decode_cache_bytes: ?u64 = null,
-    /// The phase change's frees (transient release, cache clear, decode cache limit) at the prompt's last trunk chunk,
-    /// before the DSpark seed, so they land while the seed runs (`tailRelease`). null: the default, off.
-    phase_tail_release: ?bool = null,
     /// The phase change's per-layer decode rows (`arm_mod.DecodeRowsAlloc`). null: the default, uniform.
     decode_rows_alloc: ?arm_mod.DecodeRowsAlloc = null,
     /// The fill's decode granule (`arm_mod.DecodeFillGranule`). null: the default, a row.
@@ -208,11 +205,6 @@ pub fn growFill(ov: RouteOverrides) expert_stream.GrowFill {
     return ov.grow_fill orelse .zeros;
 }
 
-/// The tail release route the Module installs (off by default; it needs the transient release and the DSpark seed).
-pub fn phaseTailRelease(ov: RouteOverrides) bool {
-    return ov.phase_tail_release orelse false;
-}
-
 /// The forms `routeForms` rebuilds the decode GEMVs on at construction, or null (the accept-time GEMVs kept): any
 /// form set, or GEMV_REBUILD (then the stock texts are rebuilt too). Unset, exactly the routing before GEMV_REBUILD.
 pub fn formsRoute(ov: RouteOverrides) ?xq.Forms {
@@ -233,35 +225,6 @@ test "dsv41 module: GEMV_REBUILD routes the stock forms through routeForms; unse
     try std.testing.expectEqual(xq.Forms{}, formsRoute(.{ .routed_forms = .{}, .gemv_rebuild = true }).?);
     try std.testing.expectEqual(xq.Forms{ .gu_one = true }, formsRoute(.{ .routed_forms = .{ .gu_one = true }, .gemv_rebuild = true }).?);
 }
-
-/// The loop's tail hook for one prompt part: armed before the part's forward, cleared after it, so the request's later
-/// extends (a serial decode lane) never run it.
-pub fn armPromptTail(slot: *?dsl.PromptTail, tail: ?dsl.PromptTail) void {
-    slot.* = tail;
-}
-
-/// Whether a prompt part runs the tail release: the route installed and the part the prompt's last (a split prompt's
-/// earlier parts still route through the scratch).
-pub fn tailArms(installed: bool, final: bool) bool {
-    return installed and final;
-}
-
-/// The phase change's transient accounting. Released at the prompt's tail (`tail`: its bytes), the scratch left before the
-/// boundary's first reading, so it is none of the boundary's frees; the grow re-allocates decode's window 0 of it either way,
-/// so `untilFreedBound` takes its bytes on both routes.
-pub fn transientAccount(tail: ?u64, released_here: u64) struct { boundary: u64, grow: u64 } {
-    if (tail) |b| return .{ .boundary = 0, .grow = b };
-    return .{ .boundary = released_here, .grow = released_here };
-}
-
-/// The tail release's record (`NATIVE DSV41_TAIL_RELEASE`): the scratch's bytes, this process's readings around the frees
-/// (MLX active must drop by the bytes: the stream refuses otherwise) and the frees' own time on the prompt's clock.
-pub const TailReleaseRecord = struct {
-    freed_bytes: u64,
-    before: BoundaryMemory,
-    after: BoundaryMemory,
-    ms: f64,
-};
 
 /// The fill granule the Module installs (a row unless set).
 pub fn decodeFillGranule(ov: RouteOverrides) arm_mod.DecodeFillGranule {
@@ -558,10 +521,6 @@ pub const Module = struct {
     prefill_sub: u64 = std.math.maxInt(u64),
     /// The phase change's boundary readings, freed bytes and reclaim time (the receipts carry it).
     phase_change: ?PhaseChangeRecord = null,
-    /// The request's tail release (`tailRelease`; reset at each prefill).
-    tail_release: ?TailReleaseRecord = null,
-    /// When the tail release's frees ended (the phase change's free_to_grow_ms starts here on that route).
-    tail_freed_at: ?std.Io.Timestamp = null,
     /// The Module holds its prompt configuration (the scratch, the prompt rows, the prompt cache limit): false from a
     /// prompt's tail release or phase change until the reverse phase change (`requestEnd`).
     prompt_ready: bool = true,
@@ -903,12 +862,6 @@ pub const Module = struct {
             log.info("NATIVE draft ahead: installed (the next draft built during each verify's wait, committed when every draft is accepted)", .{});
         }
         log.info("NATIVE decode lane installed: {s} (draft block {d}), expert reads {s}", .{ self.decodeLane(), self.draftBlockSize(), if (self.arm == .event_gates) "event gates" else "host waits" });
-        self.installed.phase_tail_release = phaseTailRelease(ov);
-        if (self.installed.phase_tail_release and (!self.installed.transient_release or self.dspark_cfg == null)) {
-            log.err("phase tail release refused: it needs the transient release ({}) and the DSpark seed ({})", .{ self.installed.transient_release, self.dspark_cfg != null });
-            return error.PhaseTailReleaseUnsupported;
-        }
-        log.info("NATIVE phase tail release: {s}", .{if (self.installed.phase_tail_release) "installed (the transient release, the cache clear and the decode cache limit at the prompt's last trunk chunk, before the DSpark seed; the phase change keeps its settle, bound and grow)" else "off"});
         // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here, never
         // in a request, and with the DSpark strategy its 5-row draft block through every stage too (the first
         // round no longer compiles its draft inside timed decode). pass3an2's widths (B above the start): width
@@ -1215,14 +1168,11 @@ pub const Module = struct {
     /// `reserved_tokens` is the request's KV reservation (the shell's `KVCache.reserve`: prompt +
     /// its generation budget + a chunk); 0 (none declared) bounds it at the prompt plus the shell's
     /// generation headroom. A forward past the bound is refused by name (BoundedLaneFull).
+    ///
+    /// The served shell always sends the whole prompt here (`Transformer.forwardDsv41WithImpl`: step 0 is `prefill`, every
+    /// later forward `extend`, refused before the handover); a harness may send a prompt's first part and the rest through
+    /// `prefillContinue`.
     pub fn prefill(self: *Module, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
-        return self.prefillPart(ids, reserved_tokens, true);
-    }
-
-    /// `prefill` over a prompt's first part; `final` false when `prefillContinue` follows (a split prompt). The served shell
-    /// always sends the whole prompt here (`Transformer.forwardDsv41WithImpl`: step 0 is `prefill`, every later forward
-    /// `extend`, refused before the handover), so only a harness passes false.
-    pub fn prefillPart(self: *Module, ids: []const u32, reserved_tokens: u64, final: bool) !mlx.mlx_array {
         // The request against the context the construction billed, once, before anything of it runs.
         try checkContext(ids.len, self.max_context, self.overrides.bill_pinned_prompt);
         // The previous request's decode end (served path), before this request touches anything.
@@ -1231,8 +1181,6 @@ pub const Module = struct {
         // left the prompt configuration, the reverse phase change, on this request's clock before anything of it allocates.
         try self.requestEnd();
         try self.gate.begin(.prefill);
-        self.tail_release = null;
-        self.tail_freed_at = null;
         // #23: the prompt counts the phase change reads are this request's alone.
         switch (self.arm) {
             inline else => |t| t.arm.stream.resetPromptCounts(),
@@ -1244,14 +1192,14 @@ pub const Module = struct {
         self.prompt_stats0 = self.streamStats();
         self.prompt_tokens = ids.len;
         // A prompt up to the sub-chunk: one call (the standard cell's path); a longer one: sub-chunk calls.
-        const logits = if (ids.len <= self.prefill_sub) try self.promptCall(ids, final) else try self.prefillSubCalls(ids, final);
+        const logits = if (ids.len <= self.prefill_sub) try self.promptCall(ids) else try self.prefillSubCalls(ids);
         self.gate.completePrefill(self.dspark != null);
         return logits;
     }
 
     /// One prompt call from the request's fresh state: the strategy's seeded pass, else the trunk's.
-    fn promptCall(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
-        return if (self.dspark_cfg) |cfg| try self.prefillSeeded(ids, cfg, final) else try self.forward(ids);
+    fn promptCall(self: *Module, ids: []const u32) !mlx.mlx_array {
+        return if (self.dspark_cfg) |cfg| try self.prefillSeeded(ids, cfg) else try self.forward(ids);
     }
 
     /// A prompt longer than the sub-chunk (upstream deepseek_v4's `extendState` loop over `prefillSub()` sub-chunks):
@@ -1259,7 +1207,7 @@ pub const Module = struct {
     /// call's spans pinned to the whole prompt's chunk rule so they are the one-call pass's spans. Between calls the MLX
     /// allocator cache goes back to the driver (upstream's per-sub-chunk release, `extendChunkShouldClearCache`,
     /// deepseek_v4.zig:8079-8087): a call's transients do not repeat their shapes in the next call (its positions grew).
-    fn prefillSubCalls(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
+    fn prefillSubCalls(self: *Module, ids: []const u32) !mlx.mlx_array {
         const st = &self.state.?;
         const tier = &self.model.tier;
         const span = kvc.resolvePrefillChunk(&self.model.c, ids.len, tier.prefill_chunk, tier.chunk_target_bytes);
@@ -1269,11 +1217,11 @@ pub const Module = struct {
         defer if (self.state) |*s| {
             s.span_chunk = null;
         };
-        var logits = try self.promptCall(ids[calls[0][0]..calls[0][1]], final and calls.len == 1);
-        for (calls[1..], 2..) |c, k| {
+        var logits = try self.promptCall(ids[calls[0][0]..calls[0][1]]);
+        for (calls[1..]) |c| {
             _ = mlx.mlx_array_free(logits);
             self.g.clearCache();
-            logits = try self.continueCall(ids[c[0]..c[1]], final and k == calls.len);
+            logits = try self.continueCall(ids[c[0]..c[1]]);
         }
         return logits;
     }
@@ -1327,51 +1275,14 @@ pub const Module = struct {
 
     /// The prompt pass with the DSpark seed (`Loop.prefill`'s: the main taps of every prompt row seed
     /// the draft head, the lookup takes the prompt); the last row's logits, as `forward`'s.
-    fn prefillSeeded(self: *Module, ids: []const u32, cfg: dsl.Config, final: bool) !mlx.mlx_array {
+    fn prefillSeeded(self: *Module, ids: []const u32, cfg: dsl.Config) !mlx.mlx_array {
         const caches = try self.gpa.alloc(H.Cache, self.head.nStages());
         for (caches) |*x| x.* = .{};
         self.dspark = .{ .lp = dsl.Loop(G).init(&self.g, self.model, self.head, &self.state.?, caches, cfg), .caches = caches };
         errdefer self.dropDspark();
-        // The hook belongs to this prompt part only: a later serial extend must never run it (`armPromptTail`).
-        armPromptTail(&self.dspark.?.lp.tail, self.promptTail(final));
-        defer if (self.dspark) |*d| armPromptTail(&d.lp.tail, null);
         switch (self.arm) {
             inline else => |t| return self.dspark.?.lp.prefillLogits(self.gpa, &t.arm.hook, ids),
         }
-    }
-
-    /// The tail release's hook for a prompt part: only on the prompt's final part (`tailArms`).
-    fn promptTail(self: *Module, final: bool) ?dsl.PromptTail {
-        return if (tailArms(self.installed.phase_tail_release, final)) .{ .ctx = self, .run = tailReleaseThunk } else null;
-    }
-
-    fn tailReleaseThunk(ctx: *anyopaque) anyerror!void {
-        const self: *Module = @ptrCast(@alignCast(ctx));
-        return self.tailRelease();
-    }
-
-    /// The tail release route, once per prompt, at its last trunk chunk (every routed command retired; the seed reads no
-    /// expert row): the phase change's frees, so the driver returns their pages while the seed runs. The transient release
-    /// keeps its proofs (routes flushed, the read-ahead awaited, MLX active down by its bytes); a refusal is the boundary's.
-    fn tailRelease(self: *Module) !void {
-        try self.gate.request();
-        _ = mlx.mlx_synchronize(self.g.s);
-        try self.observe(.tail);
-        self.prompt_ready = false;
-        const t0 = std.Io.Timestamp.now(self.io, .boot);
-        const before = BoundaryMemory.now();
-        const freed = switch (self.arm) {
-            inline else => |t| t.arm.releaseTransient() catch |e| return self.refuseBoundary(e),
-        };
-        self.g.clearCache();
-        setCacheLimit(self.installed.decode_cache_bytes);
-        const after = BoundaryMemory.now();
-        const ns = @max(t0.untilNow(self.io, .boot).nanoseconds, 0);
-        self.tail_release = .{ .freed_bytes = freed, .before = before, .after = after, .ms = @as(f64, @floatFromInt(ns)) / 1e6 };
-        self.tail_freed_at = std.Io.Timestamp.now(self.io, .boot);
-        const json = std.json.Stringify.valueAlloc(self.gpa, self.tail_release.?, .{}) catch return;
-        defer self.gpa.free(json);
-        log.info("NATIVE DSV41_TAIL_RELEASE {s}", .{json});
     }
 
     fn dropDspark(self: *Module) void {
@@ -1477,21 +1388,15 @@ pub const Module = struct {
         return self.step(ids);
     }
 
-    /// The prompt's continuation: a split prompt runs `prefillPart` over its first part, then this over each
-    /// later part (`final` on the last), all before the decode handover (refused by name after it: the prompt's rows
-    /// are gone).
-    pub fn prefillContinue(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
+    /// The prompt's continuation: a split prompt runs `prefill` over its first part, then this over each later part, all
+    /// before the decode handover (refused by name after it: the prompt's rows are gone).
+    pub fn prefillContinue(self: *Module, ids: []const u32) !mlx.mlx_array {
         try self.gate.begin(.prefill_continue);
-        return self.continueCall(ids, final);
+        return self.continueCall(ids);
     }
 
-    /// A prompt continuation's forward (`prefillContinue` past its gate; a sub-chunk call inside `prefillPart`).
-    fn continueCall(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
-        // The tail release freed the prompt's scratch: a later prompt part would route without it.
-        if (self.tail_release != null) return error.PromptContinuedAfterTailRelease;
-        const d = if (self.dspark) |*x| x else return self.step(ids);
-        armPromptTail(&d.lp.tail, self.promptTail(final));
-        defer armPromptTail(&d.lp.tail, null);
+    /// A prompt continuation's forward (`prefillContinue` past its gate; a sub-chunk call inside `prefill`).
+    fn continueCall(self: *Module, ids: []const u32) !mlx.mlx_array {
         return self.step(ids);
     }
 
@@ -1665,22 +1570,20 @@ pub const Module = struct {
         marks[1] = VmMark.now();
         // On its route: the transient scratch, freed before the cache clear so the boundary check counts it (the grow
         // allocates decode's window 0); a holder that kept it refuses here by name (TransientStillReferenced).
-        // The tail release route freed it before `before` (`transientAccount`).
         var released_here: u64 = 0;
-        if (self.installed.transient_release and self.tail_release == null) {
+        if (self.installed.transient_release) {
             released_here = switch (self.arm) {
                 inline else => |t| t.arm.releaseTransient() catch |e| return self.refuseBoundary(e),
             };
             marks[2] = VmMark.now();
         }
-        const acct = transientAccount(if (self.tail_release) |tr| tr.freed_bytes else null, released_here);
-        freed_device += acct.boundary;
-        const transient_freed = acct.grow;
+        freed_device += released_here;
+        const transient_freed = released_here;
         self.g.clearCache();
         setCacheLimit(self.installed.decode_cache_bytes);
         _ = mlx.mlx_synchronize(self.g.s);
-        // The frees' end: here, or at the prompt's tail on the tail release route (free_to_grow_ms starts there).
-        const freed_at = self.tail_freed_at orelse std.Io.Timestamp.now(self.io, .boot);
+        // The frees' end (free_to_grow_ms starts here).
+        const freed_at = std.Io.Timestamp.now(self.io, .boot);
         // On its route: libc malloc's free pages returned once, with the frees (the prompt pass's host heap).
         const relieved = boundaryRelief(self.installed.host_relief, LibcRelief{});
         // prompt_stats: the rows from the prompt's counts, host only, while the frees land (before the settle).
@@ -1698,7 +1601,7 @@ pub const Module = struct {
         const bound: ?u64 = if (uf) |x| x.bound else null;
         const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms, bound);
         marks[3] = VmMark.now();
-        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = acct.boundary, .tail_release_bytes = if (self.tail_release) |tr| tr.freed_bytes else null, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null, .host_relief_bytes = relieved };
+        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = released_here, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null, .host_relief_bytes = relieved };
         checkSettled(before, st.after, freed_device, bound) catch |e| return self.refuseBoundary(e);
         try self.observe(.released);
         self.phase_change.?.free_to_grow_ms = @as(f64, @floatFromInt(@max(freed_at.untilNow(self.io, .boot).nanoseconds, 0))) / 1e6;
@@ -1838,8 +1741,6 @@ pub const Installed = struct {
     phase_change_settle: PhaseChangeSettle = .until_freed,
     /// The phase change's host relief, as installed (`hostRelief`).
     host_relief: bool = false,
-    /// The phase change's frees at the prompt's tail, as installed (`phaseTailRelease`).
-    phase_tail_release: bool = false,
     /// The ring geometry the states are built with, as installed (`ringGeometry`; the bill reads the same).
     ring_geo: kvc.Geometry = .{},
     /// The grow's new rows' allocation, as installed in the stream.
@@ -1999,8 +1900,6 @@ pub const PhaseChangeRecord = struct {
     freed_bytes: u64,
     /// The transient scratch the release freed (included in `freed_bytes`; 0 for a shrink).
     transient_freed_bytes: u64 = 0,
-    /// The tail release route only: the scratch it freed before this boundary (not in `freed_bytes`; in the grow).
-    tail_release_bytes: ?u64 = null,
     settle_ms: u32,
     /// The settle condition the phase change waited for (a shrink: `interval`).
     settle: PhaseChangeSettle = .interval,
@@ -2011,8 +1910,7 @@ pub const PhaseChangeRecord = struct {
     margin_bytes: ?i64 = null,
     /// The host relief route only: the bytes malloc reported returned (`malloc_zone_pressure_relief`).
     host_relief_bytes: ?u64 = null,
-    /// A phase change only: the time from the frees' end (the scratch released and MLX's cache cleared: here, or at the
-    /// prompt's tail on the tail release route) to the grow's start.
+    /// A phase change only: the time from the frees' end (the scratch released and MLX's cache cleared) to the grow's start.
     free_to_grow_ms: ?f64 = null,
     /// The refusal's name, when the phase change refused the grow.
     refused: ?[]const u8 = null,
@@ -3238,47 +3136,11 @@ test "dsv41 memory: until_freed settles on the admission's bound (pass3bj): a re
     }
 }
 
-test "dsv41 memory: the tail release route: off by default; the grow's bound and bytes equal stock's, and the boundary counts only the frees after its first reading" {
-    try std.testing.expect(!phaseTailRelease(.{}));
-    try std.testing.expect(!(Installed{}).phase_tail_release);
-    try std.testing.expect(phaseTailRelease(.{ .phase_tail_release = true }));
+test "dsv41 memory: the phase change's grow bound and bytes (stock route), and the grow fill route" {
     // The grow fill route: zeros unless set (the stream installs it; Installed reads it back).
     try std.testing.expectEqual(expert_stream.GrowFill.zeros, growFill(.{}));
     try std.testing.expectEqual(expert_stream.GrowFill.zeros, (Installed{}).grow_fill);
     try std.testing.expectEqual(expert_stream.GrowFill.unfilled, growFill(.{ .grow_fill = .unfilled }));
-    // A split prompt: only its final part arms the hook; the route off never does.
-    try std.testing.expect(tailArms(true, true));
-    try std.testing.expect(!tailArms(true, false));
-    try std.testing.expect(!tailArms(false, true));
-    {
-        // The hook's lifetime over a request: a final seeded prefill runs it once; a serial-lane extend after it does not.
-        const Count = struct {
-            n: u32 = 0,
-            fn run(ctx: *anyopaque) anyerror!void {
-                const c: *@This() = @ptrCast(@alignCast(ctx));
-                c.n += 1;
-            }
-        };
-        const FakeLoop = struct {
-            tail: ?dsl.PromptTail = null,
-            fn forward(l: *@This()) !void {
-                if (l.tail) |t| try t.run(t.ctx);
-            }
-        };
-        var cnt: Count = .{};
-        var lp: FakeLoop = .{};
-        const hook: dsl.PromptTail = .{ .ctx = &cnt, .run = Count.run };
-        // prefillSeeded's shape: arm for the part, forward, clear on leaving.
-        {
-            armPromptTail(&lp.tail, if (tailArms(true, true)) hook else null);
-            defer armPromptTail(&lp.tail, null);
-            try lp.forward();
-        }
-        try lp.forward(); // extend
-        try lp.forward(); // extend
-        try std.testing.expectEqual(@as(u32, 1), cnt.n);
-        try std.testing.expect(lp.tail == null);
-    }
     // served19f (pass3bs control1, 134 / 168 rows, record 13,315,584 B): slot banks (40 x 134 + 240) -> (40 x 168 + 48)
     // records, the transient 240 records; decode bill 108,991,190,704 B.
     const rec: u64 = 13_315_584;
@@ -3287,28 +3149,10 @@ test "dsv41 memory: the tail release route: off by default; the grow's bound and
     const billed: u64 = 108_991_190_704;
     const transient: u64 = 240 * rec;
     try std.testing.expectEqual(@as(u64, 3_195_740_160), transient);
-    const stock = transientAccount(null, transient);
-    const tail = transientAccount(transient, 0);
-    try std.testing.expectEqual(transient, stock.boundary);
-    try std.testing.expectEqual(@as(u64, 0), tail.boundary);
-    // The grow re-allocates window 0 on both routes: bound and grow bit for bit stock's (receipt 90,236,802,736 / 18,754,387,968).
-    const us = untilFreedBound(billed, sp, sd, stock.grow, 40);
-    const ut = untilFreedBound(billed, sp, sd, tail.grow, 40);
+    // The grow re-allocates window 0: bound and grow (receipt 90,236,802,736 / 18,754,387,968).
+    const us = untilFreedBound(billed, sp, sd, transient, 40);
     try std.testing.expectEqual(@as(u64, 18_754_387_968), us.grow);
     try std.testing.expectEqual(@as(u64, 90_236_802_736), us.bound);
-    try std.testing.expectEqual(us.grow, ut.grow);
-    try std.testing.expectEqual(us.bound, ut.bound);
-    // The phase change after a tail release: `before` already without the scratch (active 88,194,961,404, as the stock
-    // route's settled reading), the cache the seed left; the boundary's check passes on the route's frees and would refuse
-    // the stock count (the scratch's bytes can no longer leave MLX active).
-    const before: BoundaryMemory = .{ .active = 88_194_961_404, .cache = 180_000_000, .footprint = 90_400_000_000 };
-    const after: BoundaryMemory = .{ .active = 88_194_961_404, .cache = 0, .footprint = 89_653_177_912 };
-    var i: usize = 0;
-    var slept: u32 = 0;
-    const st = settle(FakeReader{ .readings = &.{after}, .i = &i, .slept_ms = &slept }, before, tail.boundary, 5, ut.bound);
-    try std.testing.expectEqual(@as(u32, 0), st.waited_ms);
-    try checkSettled(before, st.after, tail.boundary, ut.bound);
-    try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkSettled(before, st.after, stock.boundary, us.bound));
 }
 
 test "dsv41 memory: the reverse phase change frees, settles, and only then allocates; a refused settle allocates nothing" {

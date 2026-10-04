@@ -448,7 +448,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const sentinel = try Sentinel.start(gpa, "harness");
     defer _ = sentinel.stop(gpa);
     // The phase change's proof marks (start, released, grown), taken by the Module's observer on the served sequence.
-    var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = m.installed.transient_release, .tail_route = m.installed.phase_tail_release };
+    var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = m.installed.transient_release };
     m.phase_observer = marks.observer();
 
     const out = try a.alloc(u32, ref.new_tokens);
@@ -476,11 +476,11 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     // The prompt's calls; the last one's logits are generated id 0.
     var state: std.ArrayList(LayerStateLine) = .empty;
     const probe = stateProbe(&m.model.c);
-    var logits = try m.prefillPart(prompt[calls[0].lo..calls[0].hi], 0, calls.len == 1);
+    var logits = try m.prefill(prompt[calls[0].lo..calls[0].hi], 0);
     memProbe("dsv41 ar served", "the prompt's first call (before the phase change)");
-    for (calls[1..], 2..) |c, k| {
+    for (calls[1..]) |c| {
         _ = mlx.mlx_array_free(logits);
-        logits = try m.prefillContinue(prompt[c.lo..c.hi], k == calls.len);
+        logits = try m.prefillContinue(prompt[c.lo..c.hi]);
     }
     try readState(a, &state, m, probe, "after_prompt", calls[calls.len - 1].lo);
     printPhaseMemory(a, phaseMemory("prompt pass", m.bill.prefillTerms(), 0, vm_start.external));
@@ -1118,10 +1118,6 @@ const CellReceipt = struct {
     /// The phase change's host relief as installed (`module.hostRelief`; off by default); the bytes malloc reported
     /// returned ride in `phase_change.host_relief_bytes`.
     host_relief: ?bool = null,
-    /// The tail release route as installed (`module.phaseTailRelease`; off by default); its record rides in `tail_release`
-    /// and its bytes in `phase_change.tail_release_bytes`.
-    phase_tail_release: ?bool = null,
-    tail_release: ?module.TailReleaseRecord = null,
     /// The grow's new rows' allocation as installed (`module.growFill`; zeros by default).
     grow_fill: ?[]const u8 = null,
     /// The request's index through this Module (1 = the first; request k > 1 follows a reverse phase change).
@@ -1254,7 +1250,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const sentinel = try Sentinel.start(gpa, "cell");
     defer _ = sentinel.stop(gpa);
     // The phase change's proof marks (start, released, grown), taken by the Module's observer on the served sequence.
-    var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = md.installed.transient_release, .tail_route = md.installed.phase_tail_release };
+    var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = md.installed.transient_release };
     md.phase_observer = marks.observer();
 
     // DSV41_CELL_REQUESTS (1..3, default 1): the same prompt again through the same Module, each after the previous
@@ -1272,7 +1268,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
             const end_ms: ?f64 = if (end_at_prefill) null else @as(f64, @floatFromInt(@max(t_end.untilNow(io, .boot).nanoseconds, 0))) / 1e6;
             const rj = try std.json.Stringify.valueAlloc(a, .{ .request = k + 1, .request_end_ms = end_ms, .reverse = if (end_at_prefill) null else md.reverse_change }, .{});
             std.debug.print("NATIVE DSV41_REQUEST_END {s}\n", .{rj});
-            marks = .{ .a = a, .io = io, .release_route = md.installed.transient_release, .tail_route = md.installed.phase_tail_release };
+            marks = .{ .a = a, .io = io, .release_route = md.installed.transient_release };
         }
         const out_k = if (k == 0) out_path else try std.fmt.allocPrint(a, "{s}.req{d}.json", .{ out_path, k + 1 });
         // Either arm the configuration builds: host waits (the served default) or event gates (C6).
@@ -1399,8 +1395,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const pl = try md.prefill(prompt, prompt.len + max_tokens);
     const primary = try g.hostArgmax(pl);
     _ = mlx.mlx_array_free(pl);
-    // The tail release route's box mark (harness only) is taken out of the prompt's clock, as the phase change's marks are.
-    const ttft_s = secondsSince(io, t0) - cx.marks.tailSeconds();
+    const ttft_s = secondsSince(io, t0);
     const s_prompt = arm.hook.source.stats();
     // The phase records (outside the timed spans' hot paths: at their boundaries).
     var phases: [4]PhaseMemory = undefined;
@@ -1630,8 +1625,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .phase_change_poll_ms = md.installed.phase_change_poll_ms,
         .phase_change_settle = md.installed.phase_change_settle,
         .host_relief = md.installed.host_relief,
-        .phase_tail_release = md.installed.phase_tail_release,
-        .tail_release = md.tail_release,
         .grow_fill = @tagName(md.installed.grow_fill),
         .request = cx.request,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
@@ -1792,7 +1785,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;
     // The phase change's settle condition (interval | until_freed; anything else refused here).
     if (envStr("DSV41_CELL_HOST_RELIEF")) |v| ov.host_relief = try cellBool("DSV41_CELL_HOST_RELIEF", v);
-    if (envStr("DSV41_CELL_PHASE_TAIL_RELEASE")) |v| ov.phase_tail_release = try cellBool("DSV41_CELL_PHASE_TAIL_RELEASE", v);
     if (envStr("DSV41_CELL_GROW_FILL")) |v| ov.grow_fill = std.meta.stringToEnum(@import("expert_stream.zig").GrowFill, v) orelse return error.CellGrowFill;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;
@@ -2147,15 +2139,10 @@ pub const PhaseMarks = struct {
     /// The transient release as the Module installed it (`Module.installed.transient_release`): the release proof is
     /// judged only when the phase change releases the scratch; off, it is NA.
     release_route: bool,
-    /// The tail release route (`Module.installed.phase_tail_release`): the scratch is freed at the prompt's tail, so the
-    /// release proof starts from the `tail` mark taken there, before those frees.
-    tail_route: bool = false,
-    /// Indexed by `module.PhaseObserver.Stage`: start, released, grown, tail.
+    /// Indexed by `module.PhaseObserver.Stage`: start, released, grown (the SDK's `tail` stage is never observed here).
     marks: [4]?BoxMark = @splat(null),
     failed: [4]?anyerror = @splat(null),
     spent_ns: u64 = 0,
-    /// The `tail` mark's own time (on the prompt's clock, not the phase change's).
-    tail_ns: u64 = 0,
     /// The released mark's settle (`settleRelease`): null when it did not run (no start mark, or the first released
     /// mark failed).
     release_settle: ?ReleaseSettle = null,
@@ -2172,7 +2159,7 @@ pub const PhaseMarks = struct {
             self.failed[i] = e;
             break :blk null;
         };
-        if (stage == .released and self.release_route) if (self.releaseStart()) |start| if (self.marks[1]) |first| {
+        if (stage == .released and self.release_route) if (self.marks[0]) |start| if (self.marks[1]) |first| {
             const settled: ?ReleaseSettle = settleRelease(LiveSettle{ .a = self.a, .io = self.io, .t0 = std.Io.Timestamp.now(self.io, .boot) }, start, first) catch |e| blk: {
                 self.failed[1] = e;
                 self.marks[1] = null;
@@ -2184,16 +2171,7 @@ pub const PhaseMarks = struct {
             }
         };
         const ns: u64 = @intCast(@max(t0.untilNow(self.io, .boot).nanoseconds, 0));
-        if (stage == .tail) self.tail_ns += ns else self.spent_ns += ns;
-    }
-
-    /// The release proof's start: the tail mark under the tail release route, else the phase change's start.
-    fn releaseStart(self: *const PhaseMarks) ?BoxMark {
-        return if (self.tail_route) self.marks[3] else self.marks[0];
-    }
-
-    pub fn tailSeconds(self: *const PhaseMarks) f64 {
-        return @as(f64, @floatFromInt(self.tail_ns)) / 1e9;
+        self.spent_ns += ns;
     }
 
     pub fn observerSeconds(self: *const PhaseMarks) f64 {
@@ -2204,8 +2182,7 @@ pub const PhaseMarks = struct {
     /// and the grow proof (released -> grown) on both routes.
     pub fn judge(self: *const PhaseMarks) !void {
         for (self.failed) |f| if (f) |e| return e;
-        _ = self.marks[0] orelse return error.PhaseMarkMissing;
-        const start = self.releaseStart() orelse return error.PhaseMarkMissing;
+        const start = self.marks[0] orelse return error.PhaseMarkMissing;
         const released = self.marks[1] orelse return error.PhaseMarkMissing;
         const grown = self.marks[2] orelse return error.PhaseMarkMissing;
         if (self.release_route) try checkReleaseResidency(start, released);
@@ -2220,8 +2197,6 @@ pub const BoxPhaseRecord = struct {
     start: ?BoxMark,
     released: ?BoxMark,
     grown: ?BoxMark,
-    /// The tail release route's mark at the prompt's tail (the release proof's start then); null off the route.
-    tail: ?BoxMark = null,
     release_proof: []const u8,
     cache_clear_bytes: ?u64,
     release_outside_rise: ?i64,
@@ -2240,14 +2215,13 @@ pub fn boxPhaseRecord(pm: *const PhaseMarks, cache_clear_bytes: ?u64) BoxPhaseRe
             return if (x != null and y != null) outsideRise(x.?, y.?) else null;
         }
     }.f;
-    const rs = pm.releaseStart();
+    const rs = pm.marks[0];
     const verdict: []const u8 = if (!pm.release_route) "NA" else if (rs == null or pm.marks[1] == null) "MISSING" else if (checkReleaseResidency(rs.?, pm.marks[1].?)) |_| "PASS" else |_| "FAIL";
     const st = pm.release_settle;
     return .{
         .start = pm.marks[0],
         .released = pm.marks[1],
         .grown = pm.marks[2],
-        .tail = pm.marks[3],
         .release_proof = verdict,
         .cache_clear_bytes = if (pm.release_route) null else cache_clear_bytes,
         .release_outside_rise = if (pm.release_route) both(rs, pm.marks[1]) else null,
@@ -2850,31 +2824,6 @@ test "dsv41 memory: the released mark settles a lag, refuses a reclaim that need
     try testing.expectEqualStrings("PASS", rec_set.release_proof);
     try testing.expectEqual(@as(?i64, 547_831_808), rec_set.release_first_rise);
     try testing.expectEqual(@as(?u32, 2), rec_set.release_polls);
-}
-
-test "dsv41 memory: the tail release route's release proof starts from the tail mark (a scratch left wired outside the footprint before the phase change still fails)" {
-    // The scratch freed at the tail; 3 GB of it stays wired outside the footprint (SERVED13's class) by the phase change's start.
-    const tail: BoxMark = .{ .physical = 110_000_000_000, .footprint = 98_000_000_000 };
-    const start: BoxMark = .{ .physical = 106_000_000_000, .footprint = 91_000_000_000 };
-    const released: BoxMark = .{ .physical = 104_000_000_000, .footprint = 89_000_000_000 };
-    const grown: BoxMark = .{ .physical = 122_754_000_000, .footprint = 107_754_000_000 };
-    var pm: PhaseMarks = .{ .a = testing.allocator, .io = testing.io, .release_route = true, .tail_route = true };
-    pm.marks = .{ start, released, grown, tail };
-    try testing.expectError(error.TransientReleaseNotReclaimed, pm.judge());
-    const rec = boxPhaseRecord(&pm, null);
-    try testing.expectEqualStrings("FAIL", rec.release_proof);
-    try testing.expectEqual(@as(?i64, 3_000_000_000), rec.release_outside_rise);
-    try testing.expectEqual(@as(?BoxMark, tail), rec.tail);
-    // Judged from the phase change's start the same marks would pass: the start mark alone cannot see it.
-    var from_start = pm;
-    from_start.tail_route = false;
-    try from_start.judge();
-    // Clean: the tail's outside equals the released mark's; the tail mark is missing -> refused by name.
-    pm.marks[3] = .{ .physical = 107_000_000_000, .footprint = 92_000_000_000 };
-    try pm.judge();
-    try testing.expectEqualStrings("PASS", boxPhaseRecord(&pm, null).release_proof);
-    pm.marks[3] = null;
-    try testing.expectError(error.PhaseMarkMissing, pm.judge());
 }
 
 test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
