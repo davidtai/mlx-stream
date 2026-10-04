@@ -1129,12 +1129,6 @@ const CellReceipt = struct {
     grow_fill: ?[]const u8 = null,
     /// The request's index through this Module (1 = the first; request k > 1 follows a reverse phase change).
     request: u32 = 1,
-    /// DRAFTCACHE's hot slots as installed (`module.draftCacheHot`; null: every draft expert resident), and its stream
-    /// statistics over the request (route calls, hits, misses, loads, bytes read), read after the timed decode.
-    draft_cache_hot: ?u32 = null,
-    draft_cache_stats: ?expert_stream.Stats = null,
-    /// DRAFTCACHE's pool form as installed ("per_stage" | "shared"; null: the route off).
-    draft_cache_pool: ?[]const u8 = null,
     /// MLX's buffer cache limit through decode as installed (`module.decodeCacheLimit`; the envelope's by default).
     decode_cache_bytes: ?u64 = null,
     /// The phase change's per-layer decode rows route as installed ("uniform" | "prompt_stats"; `module.decodeRowsAlloc`)
@@ -1144,8 +1138,6 @@ const CellReceipt = struct {
     /// The fill's decode granule as installed ("row" | "record") and the single records past the rows it admitted.
     decode_fill_granule: ?[]const u8 = null,
     decode_extra_records: ?u32 = null,
-    /// DRAFTCACHE's residency policy as installed ("shipped" | "lru"; null: the route off).
-    draft_cache_policy: ?[]const u8 = null,
     /// The decode phase's host side (footprint less MLX active and cache) after the grow and at the end of decode.
     decode_host_after_grow_bytes: ?u64 = null,
     decode_host_end_bytes: ?u64 = null,
@@ -1565,9 +1557,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const stt = md.dsparkStats() orelse return error.CellNeedsDspark;
     const prompt_sha = try cell.idsSha256(a, prompt);
     const ids_sha = try cell.idsSha256(a, ids);
-    // This request's draft-cache statistics (the cache carries over to the next request through the same Module).
-    const dcs: ?expert_stream.Stats = if (md.draft_cache) |dc| dc.takeRequestStats() else null;
-    if (dcs) |d| std.debug.print("NATIVE draft cache request: route_calls {d}, hits {d}, misses {d}, cycles {d}, misses per cycle {d:.3}\n", .{ d.route_calls, d.expert_cache_hits, d.expert_cache_misses, cycles.items.len, @as(f64, @floatFromInt(d.expert_cache_misses)) / @as(f64, @floatFromInt(@max(cycles.items.len, 1))) });
     const rec: CellReceipt = .{
         .typical_delta = module.dspark_typical_delta,
         .decode_lane = md.decodeLane(),
@@ -1649,9 +1638,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .phase_grow_delay_ms = md.installed.phase_grow_delay_ms,
         .grow_fill = @tagName(md.installed.grow_fill),
         .request = cx.request,
-        .draft_cache_hot = md.installed.draft_cache_hot,
-        .draft_cache_stats = dcs,
-        .draft_cache_pool = if (md.installed.draft_cache_pool) |p| @tagName(p) else null,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
         .decode_rows_alloc = @tagName(md.installed.decode_rows_alloc),
         .decode_fill_granule = @tagName(md.installed.decode_fill_granule),
@@ -1661,7 +1647,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
             const s = module.rowsSummary(gr);
             break :blk .{ .layers = gr, .total = s.total, .min = s.min, .max = s.max };
         },
-        .draft_cache_policy = if (md.installed.draft_cache_policy) |p| @tagName(p) else null,
         .decode_host_after_grow_bytes = md.decode_host.after_grow,
         .decode_host_end_bytes = md.decode_host.end,
         .decode_attn_softmax = md.installed.decode_attn_softmax,
@@ -1816,10 +1801,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     // the tail release by name at construction).
     if (envStr("DSV41_CELL_PHASE_GROW_DELAY_MS")) |v| ov.phase_grow_delay_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhaseGrowDelay;
     if (envStr("DSV41_CELL_GROW_FILL")) |v| ov.grow_fill = std.meta.stringToEnum(@import("expert_stream.zig").GrowFill, v) orelse return error.CellGrowFill;
-    // DRAFTCACHE's hot slots (a count; the Module refuses a geometry that saves nothing at construction).
-    if (envStr("DSV41_CELL_DRAFT_CACHE")) |v| ov.draft_cache_hot = std.fmt.parseInt(u32, v, 10) catch return error.CellDraftCache;
-    if (envStr("DSV41_CELL_DRAFT_CACHE_POLICY")) |v| ov.draft_cache_policy = std.meta.stringToEnum(@import("sdk_ext.zig").expert.slot_cache.PolicyKind, v) orelse return error.CellDraftCachePolicy;
-    if (envStr("DSV41_CELL_DRAFT_CACHE_POOL")) |v| ov.draft_cache_pool = std.meta.stringToEnum(@import("deepseek_v41_dspark_head.zig").DraftPool, v) orelse return error.CellDraftCachePool;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;
     // The decode cache limit in MiB (decodecache32 ...): 0 refused by name (decodecache0 is dead: a fresh buffer per
@@ -2578,7 +2559,6 @@ fn printBill(b: CellBill) void {
         }
     }.f;
     std.debug.print("\ndsv41 served cell bill (decimal GB; prompt / decode phase):\n", .{});
-    if (b.draft_cache > 0) std.debug.print("  (DRAFTCACHE: the residents carry the draft cache's slot banks, {d} B, in place of the DSpark experts)\n", .{b.draft_cache});
     for (billLines(b)) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
     std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"decode_extra_records\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}, \"transient_decode_rows\": {d}, \"bill_variant\": \"{t}\", \"prefill_wave_gb\": {d:.3}, \"prefill_wave_tight_gb\": {d:.3}, \"kv_gb\": {d:.3}, \"wire_tables_bytes\": [{d}, {d}], \"wire_arrays\": [{d}, {d}], \"wire_arrays_persistent\": {d}, \"wire_arrays_wave\": [{d}, {d}], \"decode_buffer_allowance_bytes\": {d}, \"prompt_buffer_allowance_bytes\": {d}, \"wire_buffer_bytes\": {d}, \"mlx_cache_overshoot_bytes\": [{d}, {d}]}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, b.decode_extra_records, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows, b.transient_decode_rows, b.variant, gb(b.prefill_wave), gb(b.prefill_wave_tight), gb(b.kv), b.prefillTerms().wire_tables, b.decodeTerms().wire_tables, b.wire_arrays_prompt, b.wire_arrays_decode, b.wire_arrays_prompt - 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_decode_wave, b.decodeTerms().decode_buffer_allowance, b.prefillTerms().prompt_buffer_allowance, bill_mod.wire_buffer_bytes, b.cache_overshoot_prompt, b.cache_overshoot_decode });

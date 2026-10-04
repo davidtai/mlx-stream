@@ -46,7 +46,6 @@ const G = ops.MlxOps;
 const expert_stream = @import("expert_stream.zig");
 const expert_event = sdk_ext.expert.event;
 const expert_io = sdk_ext.expert.io;
-const xsc = sdk_ext.expert.slot_cache;
 const expert_bank = @import("expert_bank.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
 // The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
@@ -161,8 +160,7 @@ pub const RouteOverrides = struct {
     /// the GPU runs it while the host builds the later stages and the head. null: the default, off (one commit per block).
     draft_staged: ?bool = null,
     /// DRAFT_AHEAD (exact): the next draft block built during each verify's wait for "every draft accepted", committed
-    /// only on that outcome (`dsl.Config.draft_ahead`). Needs the resident draft experts (DRAFTCACHE's per-stage routing
-    /// barriers would sync inside it). null: the default, off.
+    /// only on that outcome (`dsl.Config.draft_ahead`). null: the default, off.
     draft_ahead: ?bool = null,
     /// DEVROUTE (exact): in decode each routed call's hit wave runs as a device graph (the router's ids through the layer's
     /// resident LUT into the banked texts) committed before the host's routing barrier wait; the host then routes and
@@ -182,11 +180,6 @@ pub const RouteOverrides = struct {
     /// The phase change's host relief: libc malloc's zones asked once, after the frees, to return the free pages they
     /// keep (`malloc_zone_pressure_relief(NULL, 0)`; the prompt pass's host heap). null: the default, off.
     host_relief: ?bool = null,
-    /// DRAFTCACHE: the DSpark experts behind an exact adaptive cache of this many hot slots (split over the stages),
-    /// plus one draft block's transient slots per stage; none resident. null: the default, all resident.
-    draft_cache_hot: ?u32 = null,
-    /// DRAFTCACHE's slot pool form (`dh.DraftPool`; null: per_stage). Only with `draft_cache_hot`.
-    draft_cache_pool: ?dh.DraftPool = null,
     /// MLX's buffer cache limit through decode (set at the phase change; the bill's decode cache term). null: the
     /// default, the envelope's 268,435,456 B; at most that (a larger limit would bill past the admission's term).
     decode_cache_bytes: ?u64 = null,
@@ -207,8 +200,6 @@ pub const RouteOverrides = struct {
     bank_geometry: ?expert_bank.Implemented = null,
     /// The grow's new rows without the zero fill (`expert_stream.GrowFill`). null: the default, zeros.
     grow_fill: ?expert_stream.GrowFill = null,
-    /// DRAFTCACHE's residency policy (shipped: the streamer's decode policy; lru). Only with `draft_cache_hot`.
-    draft_cache_policy: ?xsc.PolicyKind = null,
     /// The ring levers (WINDOW_RING_MAX_VERIFY / _SLACK / _HEADROOM) over the numeric tier's (`ringGeometry`): the states
     /// and the bill take the same geometry. null: the tier's.
     window_ring_max_verify: ?u32 = null,
@@ -341,28 +332,11 @@ pub fn checkDecodePoolRoutes(alloc: arm_mod.DecodeRowsAlloc, granule: arm_mod.De
     if (!transient_release) return error.DecodePoolNeedsRelease;
 }
 
-/// DRAFTCACHE's hot slots as the Module installs it and the bill charges it (one resolver; off by default).
-pub fn draftCacheHot(ov: RouteOverrides) ?u32 {
-    return ov.draft_cache_hot;
-}
-
-/// DRAFTCACHE's pool form as installed and billed (per_stage unless set); a form without a hot count is refused by name.
-pub fn draftCachePool(ov: RouteOverrides) error{DraftCachePoolWithoutHot}!dh.DraftPool {
-    if (ov.draft_cache_hot == null and ov.draft_cache_pool != null) return error.DraftCachePoolWithoutHot;
-    return ov.draft_cache_pool orelse .per_stage;
-}
-
 /// The decode cache limit the Module installs and the bill charges (one resolver: the setting over the envelope's).
 pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
     const v = ov.decode_cache_bytes orelse return envelope.decode_cache_bytes;
     if (v > envelope.decode_cache_bytes) return error.DecodeCacheLimit;
     return v;
-}
-
-/// DRAFTCACHE's residency policy as installed (shipped unless set); a policy without a hot count is refused by name.
-pub fn draftCachePolicy(ov: RouteOverrides) error{DraftCachePolicyWithoutHot}!xsc.PolicyKind {
-    if (ov.draft_cache_hot == null and ov.draft_cache_policy != null) return error.DraftCachePolicyWithoutHot;
-    return ov.draft_cache_policy orelse .shipped;
 }
 
 /// The host relief route the Module installs (off by default).
@@ -588,8 +562,6 @@ pub const Module = struct {
     embed_rows: ngram.NgramTable,
     model: *M,
     head: *H,
-    /// DRAFTCACHE's slot banks and policy (`draftCacheHot`); the head routes its stages through it.
-    draft_cache: ?*dh.DraftCache = null,
     /// The request in flight (rebuilt at `cache.step == 0`).
     state: ?M.State = null,
     /// The DSpark strategy's settings (the served tier with a draft head); null: serial decode only.
@@ -907,21 +879,6 @@ pub const Module = struct {
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
-        if (draftCacheHot(ov)) |hot| {
-            var ck = try v41.Checkpoint.openIndexed(gpa, io, dir, &vd);
-            defer ck.deinit();
-            const pool = switch (self.arm) {
-                inline else => |t| t.arm.stream.pool,
-            };
-            self.draft_cache = dh.DraftCache.openWith(gpa, &ck, &c, hot, try draftCachePool(ov), try draftCachePolicy(ov), .{ .mlx = s }, pool) catch |e| {
-                log.err("draft cache refused at hot {d}: {s}", .{ hot, @errorName(e) });
-                return e;
-            };
-        }
-        errdefer if (self.draft_cache) |dc| dc.deinit();
-        _ = try draftCachePool(ov);
-        _ = try draftCachePolicy(ov);
-        self.installed.draft_cache_hot = draftCacheHot(ov);
         const rows_alloc = decodeRowsAlloc(ov);
         switch (self.arm) {
             inline else => |t| {
@@ -952,13 +909,8 @@ pub const Module = struct {
             .prompt_stats => std.fmt.comptimePrint("prompt_stats (shift cap {d}; floor max(prompt rows, U - {d}); total U x layers)", .{ arm_mod.decode_rows_shift_cap, arm_mod.decode_rows_shift_cap }),
             .decode_first16 => std.fmt.comptimePrint("decode_first16 ({d} pool rows per layer in window 0; re-owned once at the end of cycle {d} from cycles {d}..{d}'s misses, m / r^3; total U x layers)", .{ (expert_stream.DecodePool{}).per_layer, (expert_stream.DecodePool{}).at_cycle, (expert_stream.DecodePool{}).from_cycle, (expert_stream.DecodePool{}).at_cycle }),
         }});
-        self.installed.draft_cache_pool = if (self.draft_cache) |dc| dc.geom.pool else null;
-        self.installed.draft_cache_policy = if (self.draft_cache) |dc| dc.geom.policy else null;
-        if (self.draft_cache) |dc| {
-            const caps = dc.geom.caps[0..dc.geom.n_groups];
-            log.info("NATIVE draft experts: cached (hot {d} = {any} persistent + {d} transient slots per group, pool {t}, policy {t}, {d} B of slot banks; misses read past the page cache by the stream's pool; seeded with first ids)", .{ dc.hot, caps, dc.geom.transient, dc.geom.pool, dc.geom.policy, dc.cache.geom.billBytes() });
-        } else log.info("NATIVE draft experts: resident ({d} x {d} B)", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
-        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .cache = self.draft_cache, .head_mx = if (self.model.head_mx) |*hm| hm else null, .staged_commit = draftStaged(ov) });
+        log.info("NATIVE draft experts: resident ({d} x {d} B)", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
+        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .head_mx = if (self.model.head_mx) |*hm| hm else null, .staged_commit = draftStaged(ov) });
         errdefer self.head.deinit(&self.g);
         // DRAFT_STAGED: exact by construction (the block's graph unchanged; each stage's outputs committed once built).
         self.installed.draft_staged = self.head.stagedCommit();
@@ -966,11 +918,10 @@ pub const Module = struct {
         // The decode lane: DSpark (typical acceptance, the tier of record) on the served tier with a draft head.
         if (self.head.nStages() > 0 and (config.numeric_tier orelse .served) == .served) self.dspark_cfg = dspark_config;
         // DRAFT_AHEAD: exact by construction (the same block graph; built during the verify's wait, committed only on the
-        // outcome it was built for, its primary written into its own inputs first). Refused without the DSpark lane or
-        // with DRAFTCACHE (a routing barrier inside the block would run it before its primary is written).
+        // outcome it was built for, its primary written into its own inputs first). Refused without the DSpark lane.
         if (draftAhead(ov)) {
-            if (self.dspark_cfg == null or self.draft_cache != null) {
-                log.err("draft ahead refused: it needs the DSpark lane ({}) and resident draft experts ({})", .{ self.dspark_cfg != null, self.draft_cache == null });
+            if (self.dspark_cfg == null) {
+                log.err("draft ahead refused: it needs the DSpark lane", .{});
                 return error.DraftAheadUnsupported;
             }
             self.dspark_cfg.?.draft_ahead = true;
@@ -1041,12 +992,6 @@ pub const Module = struct {
             inline else => |t| try t.arm.stream.forgetResidents(),
         };
         log.info("NATIVE construction residents forgotten: {d} rows (the warm-up's); every layer's protection, seed and prompt counts cleared", .{forgotten});
-        // DRAFTCACHE: the warm-up's draft block belongs to no request either; each stage's first ids seed its hot slots.
-        if (self.draft_cache) |dc| {
-            const seeded = try dc.seedFirstIds();
-            log.info("NATIVE draft cache seeded: {d} records (each stage's first ids), {d} B read", .{ seeded, dc.cache.stats.expert_bytes_read });
-            dc.cache.stats = .{};
-        }
         // The construction check (once, before any request): the native bill at the rows the arm built,
         // against the footprint the module holds now.
         try self.checkConstruction(io, &admitted, ceiling_bytes);
@@ -1109,11 +1054,6 @@ pub const Module = struct {
         var opts = armOptions(config, ceiling, .{ .mlx = s });
         opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
         opts.transient_release = transientRelease(self.overrides);
-        // DRAFTCACHE reads on its own tickets of the stream's pool (more tickets, the demand ring unchanged).
-        if (draftCacheHot(self.overrides) != null) {
-            opts.pool.tickets += dh.draft_aux_tickets;
-            opts.pool.aux_tickets = dh.draft_aux_tickets;
-        }
         opts.grow_fill = growFill(self.overrides);
         const warm = firstVerifyWarm(self.overrides);
         opts.first_verify_warm = if (warm) .{} else null;
@@ -1213,7 +1153,6 @@ pub const Module = struct {
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);
         self.head.deinit(&self.g);
-        if (self.draft_cache) |dc| dc.deinit();
         if (self.decode_rows) |*dr| dr.deinit(gpa);
         gpa.free(self.uniform_rows);
         self.model.deinit(&self.g);
@@ -1630,7 +1569,7 @@ pub const Module = struct {
     /// not. The order is the bill's (ledger 101): the request's state and the decode-only rows freed first (the grown
     /// rows and window 0; a cancelled request's routes settled and unpinned before), the MLX cache cleared, then the
     /// settle until the footprint is at most the prompt bill less the terms not yet live (`reverseBound`), and ONLY
-    /// then the prompt's scratch and cache limit back. Residents, Engram and the draft cache persist. A no-op when the
+    /// then the prompt's scratch and cache limit back. Residents and Engram persist. A no-op when the
     /// Module already holds its prompt configuration; a refusal is the boundary's (every later request refused).
     pub fn requestEnd(self: *Module) !void {
         try self.gate.request();
@@ -1943,18 +1882,12 @@ pub const Installed = struct {
     ring_geo: kvc.Geometry = .{},
     /// The grow's new rows' allocation, as installed in the stream.
     grow_fill: expert_stream.GrowFill = .zeros,
-    /// DRAFTCACHE's hot slots, as installed (`draftCacheHot`; null: every draft expert resident).
-    draft_cache_hot: ?u32 = null,
-    /// DRAFTCACHE's pool form, as installed (null: the route off).
-    draft_cache_pool: ?dh.DraftPool = null,
     /// MLX's buffer cache limit through decode, as installed (`decodeCacheLimit`).
     decode_cache_bytes: u64 = envelope.decode_cache_bytes,
     /// The phase change's per-layer decode rows, as installed (`decodeRowsAlloc`, past `checkDecodeRowsAlloc`).
     decode_rows_alloc: arm_mod.DecodeRowsAlloc = .uniform,
     /// The fill's decode granule, as installed (`decodeFillGranule`).
     decode_fill_granule: arm_mod.DecodeFillGranule = .row,
-    /// DRAFTCACHE's residency policy, as installed (null: the route off).
-    draft_cache_policy: ?xsc.PolicyKind = null,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -3639,18 +3572,6 @@ test "dsv41 module: the installed-routes line reads the routes as built, on and 
     try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed false, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first false", seed_only.line(&buf));
     const off: Installed = .{};
     try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0, seed false, hot-first false", off.line(&buf));
-}
-
-test "dsv41 module: DRAFTCACHE is off by default (every draft expert resident) and installs at the overrides' hot count" {
-    try std.testing.expectEqual(@as(?u32, null), draftCacheHot(.{}));
-    try std.testing.expectEqual(@as(?u32, null), (Installed{}).draft_cache_hot);
-    try std.testing.expectEqual(@as(?u32, 201), draftCacheHot(.{ .draft_cache_hot = 201 }));
-    try std.testing.expectEqual(dh.DraftPool.per_stage, try draftCachePool(.{ .draft_cache_hot = 201 }));
-    try std.testing.expectEqual(dh.DraftPool.shared, try draftCachePool(.{ .draft_cache_hot = 201, .draft_cache_pool = .shared }));
-    try std.testing.expectError(error.DraftCachePoolWithoutHot, draftCachePool(.{ .draft_cache_pool = .shared }));
-    try std.testing.expectEqual(xsc.PolicyKind.shipped, try draftCachePolicy(.{ .draft_cache_hot = 128 }));
-    try std.testing.expectEqual(xsc.PolicyKind.lru, try draftCachePolicy(.{ .draft_cache_hot = 128, .draft_cache_policy = .lru }));
-    try std.testing.expectError(error.DraftCachePolicyWithoutHot, draftCachePolicy(.{ .draft_cache_policy = .lru }));
 }
 
 test "dsv41 module: per-layer decode rows are uniform unless set; prompt_stats needs the prompt seeds and room above the prompt rows" {

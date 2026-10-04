@@ -39,8 +39,6 @@ Use it to port commits written against the in-tree layout (for example the cover
 | lib/expert_io/q3_lookahead4.h | csrc/q3_lookahead4.h |  |
 | lib/expert_io/q3_lookahead4_exl3.c | csrc/q3_lookahead4_exl3.c |  |
 | src/fixtures/dsv41_bank_peek.json | src/fixtures/dsv41_bank_peek.json |  |
-| src/fixtures/dsv41_draft_routes_fastest_20261001.json | src/fixtures/dsv41_draft_routes_fastest_20261001.json |  |
-| src/fixtures/dsv41_draft_routes_standard_20261001.json | src/fixtures/dsv41_draft_routes_standard_20261001.json |  |
 | src/fixtures/dsv41_prefill_wave_samples.json | src/fixtures/dsv41_prefill_wave_samples.json |  |
 | src/kernels/exl3/dsv41_exl3_b3_guone_k3_2304.metal | src/kernels/exl3/dsv41_exl3_b3_guone_k3_2304.metal |  |
 | src/kernels/exl3/dsv41_exl3_b3_moeprep_dpost.metal | src/kernels/exl3/dsv41_exl3_b3_moeprep_dpost.metal |  |

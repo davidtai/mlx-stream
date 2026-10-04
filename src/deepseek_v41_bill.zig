@@ -22,7 +22,6 @@ const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
 const expert_bank = @import("expert_bank.zig");
 const kvc = @import("deepseek_v41_cache.zig");
-const dspark_head = @import("deepseek_v41_dspark_head.zig");
 
 const log = std.log.scoped(.dsv41);
 
@@ -65,8 +64,6 @@ pub const Bill = struct {
     /// Every resident tensor the index names (trunk, head, embedding, the DSpark head); the
     /// embedding leaves the device at the prompt fence (decode phase).
     residents: u64,
-    /// DRAFTCACHE's slot banks (inside `residents`, in place of the DSpark experts; 0 when the route is off).
-    draft_cache: u64 = 0,
     embedding: u64,
     /// The Engram sidecar's residents and its row caches (host).
     engram: u64,
@@ -484,8 +481,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
         .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + (ov.decode_extra_records orelse 0) + transient_decode) * rec,
         // The host side is billed as measured (`measured_host_side_bytes`, in host_reserve).
         .lookahead_staging = 0,
-        .residents = m.totalBytes() - droppedResidentBytes(&m, &c, headRoute(ov), denseRc(ov)) + builtResidentBytes(&c, headRoute(ov), denseRc(ov)) - draftResidentBytes(&m, ov) + try draftCacheBytes(&c, ov),
-        .draft_cache = try draftCacheBytes(&c, ov),
+        .residents = m.totalBytes() - droppedResidentBytes(&m, &c, headRoute(ov), denseRc(ov)) + builtResidentBytes(&c, headRoute(ov), denseRc(ov)),
         .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
         .engram = em.totalBytes(),
         // K16 (the layer-major route) bills its own wave (every chunk's kept state + one sub-wave). With
@@ -579,19 +575,6 @@ pub fn verifyWaveBytes(c: *const v41.Config, rows: u64, positions: u64, block: u
 /// verify_wave's allowance for a layer's projections, rope, HC tail, router, shared and routed chains and Engram at
 /// decode rows (the memory lane's 20 MB; the bank trace test holds the whole layer under the form).
 pub const verify_glue_bytes: u64 = 20 << 20;
-
-/// DRAFTCACHE (`module.draftCacheHot`): the DSpark experts the checkpoint holds leave the residents (dropped unread),
-pub fn draftResidentBytes(m: *const v41.WeightMap, ov: module.RouteOverrides) u64 {
-    return if (module.draftCacheHot(ov) == null) 0 else m.bytes_by_module[@backingInt(v41.Module.dspark_expert)];
-}
-
-/// and the cache's slot banks join them, by geometry: every stage's (hot + transient) rows of each part, each array
-/// rounded to the allocator's page (`dspark_head.draftCacheBytes`). Miss reads land in those rows through the stream's
-/// pool staging (in the host side): nothing else.
-pub fn draftCacheBytes(c: *const v41.Config, ov: module.RouteOverrides) !u64 {
-    const hot = module.draftCacheHot(ov) orelse return 0;
-    return dspark_head.draftCacheBytes(c, hot, try module.draftCachePool(ov));
-}
 
 /// The prompt pass's billed transient: K16's layer-major wave (JOINLESS: the wave alone; else with the wide lane's
 /// routed-output copy), or the chunk-major widest wave x 5 / 4.
@@ -1726,9 +1709,8 @@ test "dsv41 memory: the load preflight's requirement is the bill at the fill's f
     std.debug.print("\nload preflight requirement: {d} B at {d} rows\n", .{ need, min_fill_rows });
 }
 
-// DSV41_BANK=<bank> (host): DRAFTCACHE swaps the 384 DSpark experts (7,219,445,760 B) out of the residents for its slot
-// banks at each hot count, by geometry, in both phases; the fill's rows at the windows' baselines (default route).
-test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark experts, and the rows it frees (bank)" {
+// DSV41_BANK=<bank> (host): the fill's rows at the windows' baselines (default route).
+test "dsv41 memory: the fill's rows at the windows' baselines (bank)" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1738,59 +1720,19 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     const target = ceiling_bytes - module.ceiling_stop_bytes;
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
-    var ck = try v41.Checkpoint.openIndexed(a, testing.io, bank_dir, &vd);
-    defer ck.deinit();
-    const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
-    try testing.expectEqual(@as(u64, 7_219_445_760), m.bytes_by_module[@backingInt(v41.Module.dspark_expert)]);
-    try testing.expectEqual(@as(u64, 0), draftResidentBytes(&m, .{}));
-    try testing.expectEqual(@as(u64, 7_219_445_760), draftResidentBytes(&m, .{ .draft_cache_hot = 201 }));
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
-    const hots = [_]u32{ 96, 128, 201, 256 };
-    // Decode rows / prompt rows by baseline: stock, then hot 96 / 128 / 201 / 256.
-    const Want = struct { base: u64, decode: [5]u32, prefill: [5]u32 };
+    const Want = struct { base: u64, decode: u32, prefill: u32 };
     for ([_]Want{
-        .{ .base = 7_290_000_000, .decode = .{ 171, 179, 178, 176, 174 }, .prefill = .{ 134, 143, 141, 139, 137 } },
-        .{ .base = 8_990_000_000, .decode = .{ 168, 176, 175, 173, 171 }, .prefill = .{ 131, 139, 138, 136, 134 } },
-        .{ .base = 9_200_000_000, .decode = .{ 167, 176, 175, 172, 170 }, .prefill = .{ 130, 139, 138, 135, 133 } },
-        .{ .base = 9_550_000_000, .decode = .{ 167, 175, 174, 171, 170 }, .prefill = .{ 130, 138, 137, 135, 133 } },
+        .{ .base = 7_290_000_000, .decode = 171, .prefill = 134 },
+        .{ .base = 8_990_000_000, .decode = 168, .prefill = 131 },
+        .{ .base = 9_200_000_000, .decode = 167, .prefill = 130 },
+        .{ .base = 9_550_000_000, .decode = 167, .prefill = 130 },
     }) |w| {
-        const base = w.base;
-        config.memory_baseline_bytes = base;
+        config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
         b0.engram_posted = posted;
         const r0 = try fillRows(fillBillOf(b0), target, b0.n_experts);
-        std.debug.print("\nDSV41_DRAFTCACHE_ROWS {{\"baseline_gb\": {d:.2}, \"hot\": null, \"prefill_rows\": {d}, \"decode_rows\": {d}}}", .{ @as(f64, @floatFromInt(base)) / 1e9, r0.prefill, r0.decode });
-        try testing.expectEqual(arm_mod.NativeRows{ .prefill = w.prefill[0], .decode = w.decode[0] }, r0);
-        for (hots, 1..) |hot, hi| {
-            var b = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .draft_cache_hot = hot });
-            const term = try dspark_head.draftCacheBytes(&c, hot, .per_stage);
-            try testing.expectEqual(term, b.draft_cache);
-            try testing.expectEqual(@as(i64, @intCast(term)) - 7_219_445_760, @as(i64, @intCast(b.residents)) - @as(i64, @intCast(b0.residents)));
-            b.engram_posted = posted;
-            const r = try fillRows(fillBillOf(b), target, b.n_experts);
-            try testing.expectEqual(arm_mod.NativeRows{ .prefill = w.prefill[hi], .decode = w.decode[hi] }, r);
-            std.debug.print("\nDSV41_DRAFTCACHE_ROWS {{\"baseline_gb\": {d:.2}, \"hot\": {d}, \"draft_cache_bytes\": {d}, \"freed_bytes\": {d}, \"prefill_rows\": {d}, \"decode_rows\": {d}}}", .{ @as(f64, @floatFromInt(base)) / 1e9, hot, term, 7_219_445_760 - term, r.prefill, r.decode });
-        }
-    }
-    std.debug.print("\n", .{});
-    // The shared pool: one bank of H + 15 rows; decode / prompt rows at hot 96 / 128 / 201 / 256.
-    const Shared = struct { base: u64, decode: [4]u32, prefill: [4]u32 };
-    for ([_]Shared{
-        .{ .base = 7_290_000_000, .decode = .{ 181, 179, 177, 175 }, .prefill = .{ 144, 142, 140, 138 } },
-        .{ .base = 8_990_000_000, .decode = .{ 177, 176, 174, 172 }, .prefill = .{ 140, 139, 137, 135 } },
-        .{ .base = 9_200_000_000, .decode = .{ 177, 176, 173, 171 }, .prefill = .{ 140, 139, 136, 134 } },
-        .{ .base = 9_550_000_000, .decode = .{ 176, 175, 173, 171 }, .prefill = .{ 139, 138, 136, 134 } },
-    }) |w| {
-        config.memory_baseline_bytes = w.base;
-        for (hots, 0..) |hot, hi| {
-            var b = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .draft_cache_hot = hot, .draft_cache_pool = .shared });
-            const r_rows: u64 = hot + 15;
-            const term = r_rows * 18_800_640 + 3 * (std.mem.alignForward(u64, r_rows * 368_640, 16384) - r_rows * 368_640);
-            try testing.expectEqual(term, b.draft_cache);
-            b.engram_posted = posted;
-            const r = try fillRows(fillBillOf(b), target, b.n_experts);
-            try testing.expectEqual(arm_mod.NativeRows{ .prefill = w.prefill[hi], .decode = w.decode[hi] }, r);
-        }
+        try testing.expectEqual(arm_mod.NativeRows{ .prefill = w.prefill, .decode = w.decode }, r0);
     }
 }
 
@@ -2136,12 +2078,7 @@ test "dsv41 memory: the route resolvers the bill reads: transient rows, live str
     try testing.expectEqual(@as(?u64, null), billWired(null, true));
     try testing.expectEqual(@as(?u64, 5), billWired(5, false));
     try testing.expectEqual(@as(?u64, 5), billWired(5, true));
-    // DRAFTCACHE: off bills nothing; a pool form without a hot count, and a decode cache over the envelope's, refuse.
-    const c = try realConfig();
-    try testing.expectEqual(@as(u64, 0), try draftCacheBytes(&c, .{}));
-    try testing.expectEqual(try dspark_head.draftCacheBytes(&c, 201, .per_stage), try draftCacheBytes(&c, .{ .draft_cache_hot = 201 }));
-    try testing.expectEqual(@as(u64, 0), try draftCacheBytes(&c, .{ .draft_cache_pool = .shared }));
-    try testing.expectError(error.DraftCachePoolWithoutHot, module.draftCachePool(.{ .draft_cache_pool = .shared }));
+    // A decode cache over the envelope's refuses.
     const cap = expert_admission.Envelope.dsv41_pass2.decode_cache_bytes;
     try testing.expectEqual(cap, try module.decodeCacheLimit(.{}));
     try testing.expectEqual(@as(u64, 1 << 20), try module.decodeCacheLimit(.{ .decode_cache_bytes = 1 << 20 }));
@@ -2174,10 +2111,6 @@ test "dsv41 memory: the residents the model builds and drops, by head codec and 
     try testing.expectEqual(module.numericTier(.served).routes.head, headRoute(.{}));
     try testing.expectEqual(graph.Routes.Head.mxfp8, headRoute(.{ .head_mode = .mxfp8 }));
     try testing.expect(!denseRc(.{}) and denseRc(.{ .dense_rc = true }));
-    // DRAFTCACHE drops the DSpark experts the checkpoint holds, unread.
-    m.bytes_by_module[@backingInt(v41.Module.dspark_expert)] = 7_219_445_760;
-    try testing.expectEqual(@as(u64, 0), draftResidentBytes(&m, .{}));
-    try testing.expectEqual(@as(u64, 7_219_445_760), draftResidentBytes(&m, .{ .draft_cache_hot = 96 }));
 }
 
 test "dsv41 memory: with single decode records the SDK's view admits exactly as the bill does (record granule)" {
