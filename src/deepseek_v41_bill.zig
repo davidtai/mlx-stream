@@ -675,7 +675,7 @@ pub fn fill(a: std.mem.Allocator, io: std.Io, config: settings.Config, prompt_to
 /// construction terms marked (`constructionTerms`, less the retained prompt state the prompt creates) and the host
 /// side a measured bound. The baseline stays out: the fill and the admission take it.
 pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
-    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows);
+    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.decode_extra_records + b.transient_decode_rows);
     const per_row = @as(u64, b.layers) * rec;
     const p = b.prefillTerms();
     const d = b.decodeTerms();
@@ -701,7 +701,7 @@ pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
         .{ .name = "prompt buffer allowance", .bytes = .{ p.prompt_buffer_allowance, d.prompt_buffer_allowance }, .at_construction = false },
     });
     const w = fillBillOf(b).wiring.?;
-    return .{ .terms = terms, .per_row = per_row, .row_terms = .{ .data = .{ w.prefill_wired, w.decode_wired, per_row, 0 }, .at = wiringAt } };
+    return .{ .terms = terms, .per_row = per_row, .row_terms = .{ .data = .{ w.prefill_wired, w.decode_wired + b.decode_extra_records * rec, per_row, 0 }, .at = wiringAt } };
 }
 
 /// The wiring terms at `rows` (`sdk.MemoryBill.RowTerms`), exactly as `FillBill.total` re-evaluates them; `data` is
@@ -2064,10 +2064,6 @@ test "dsv41 memory: the residents the model builds and drops, by head codec and 
 }
 
 test "dsv41 memory: with single decode records the SDK's view admits exactly as the bill does (record granule)" {
-    // KNOWN BUG (COV-C 10-04): memoryBill leaves `decode_extra_records` out of its record's divisor and out of its decode
-    // wiring data (fillBillOf counts both): per_row runs high and the decode total 168 / 2,040 / 6,120 B under the bill's
-    // at 1 / 13 / 39 records. Red without this skip; delete it with the two-line fix.
-    if (true) return error.SkipZigTest;
     const b = cell4Bill();
     for ([_]u64{ 1, 13, 39 }) |k| {
         const x = withExtra(b, k);
