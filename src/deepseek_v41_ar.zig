@@ -1104,9 +1104,7 @@ const CellReceipt = struct {
     request: u32 = 1,
     /// MLX's buffer cache limit through decode as installed (`module.decodeCacheLimit`; the envelope's by default).
     decode_cache_bytes: ?u64 = null,
-    /// The phase change's per-layer decode rows route as installed ("uniform" | "prompt_stats"; `module.decodeRowsAlloc`)
-    /// and the rows each layer grew to (`decode_rows_per_layer` stays the admitted count).
-    decode_rows_alloc: ?[]const u8 = null,
+    /// The rows each layer grew to (`decode_rows_per_layer` stays the admitted count).
     decode_rows_layers: ?struct { layers: []const u32, total: u64, min: u32, max: u32 } = null,
     /// The fill's decode granule as installed ("row" | "record") and the single records past the rows it admitted.
     decode_fill_granule: ?[]const u8 = null,
@@ -1590,13 +1588,13 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .grow_fill = @tagName(md.installed.grow_fill),
         .request = cx.request,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
-        .decode_rows_alloc = @tagName(md.installed.decode_rows_alloc),
         .decode_fill_granule = @tagName(md.installed.decode_fill_granule),
         .decode_extra_records = md.decode_extra,
         .decode_rows_layers = blk: {
             const gr = md.grownRows();
-            const s = module.rowsSummary(gr);
-            break :blk .{ .layers = gr, .total = s.total, .min = s.min, .max = s.max };
+            var total: u64 = 0;
+            for (gr) |r| total += r;
+            break :blk .{ .layers = gr, .total = total, .min = std.mem.min(u32, gr), .max = std.mem.max(u32, gr) };
         },
         .decode_host_after_grow_bytes = md.decode_host.after_grow,
         .decode_host_end_bytes = md.decode_host.end,
@@ -1740,8 +1738,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
         if (ov.decode_cache_bytes != null) return error.CellDecodeCacheTwoForms;
         ov.decode_cache_bytes = try cellCacheLimitMb(v);
     }
-    // #23: the phase change's per-layer decode rows (uniform | prompt_stats; the Module refuses prompt_stats without the seed).
-    if (envStr("DSV41_CELL_DECODE_ROWS_ALLOC")) |v| ov.decode_rows_alloc = std.meta.stringToEnum(@import("deepseek_v41_arm.zig").DecodeRowsAlloc, v) orelse return error.CellDecodeRowsAlloc;
     // The fill's decode granule (row | record: the leftover below one row as single records, billed).
     if (envStr("DSV41_CELL_DECODE_FILL_GRANULE")) |v| ov.decode_fill_granule = std.meta.stringToEnum(@import("deepseek_v41_arm.zig").DecodeFillGranule, v) orelse return error.CellDecodeFillGranule;
     if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;

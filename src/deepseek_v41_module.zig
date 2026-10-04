@@ -169,8 +169,6 @@ pub const RouteOverrides = struct {
     /// MLX's buffer cache limit through decode (set at the phase change; the bill's decode cache term). null: the
     /// default, the envelope's 268,435,456 B; at most that (a larger limit would bill past the admission's term).
     decode_cache_bytes: ?u64 = null,
-    /// The phase change's per-layer decode rows (`arm_mod.DecodeRowsAlloc`). null: the default, uniform.
-    decode_rows_alloc: ?arm_mod.DecodeRowsAlloc = null,
     /// The fill's decode granule (`arm_mod.DecodeFillGranule`). null: the default, a row.
     decode_fill_granule: ?arm_mod.DecodeFillGranule = null,
     /// Set by the Module only (the record granule's `bill.fillExtraRecords` at the admitted rows; refused when given).
@@ -212,43 +210,6 @@ pub fn decodeFillGranule(ov: RouteOverrides) arm_mod.DecodeFillGranule {
     return ov.decode_fill_granule orelse .row;
 }
 
-/// The decode rows route the Module installs (uniform unless set).
-pub fn decodeRowsAlloc(ov: RouteOverrides) arm_mod.DecodeRowsAlloc {
-    return ov.decode_rows_alloc orelse .uniform;
-}
-
-pub const RowsSummary = struct { total: u64, min: u32, max: u32 };
-
-pub fn rowsSummary(rows: []const u32) RowsSummary {
-    var s: RowsSummary = .{ .total = 0, .min = std.math.maxInt(u32), .max = 0 };
-    for (rows) |r| {
-        s.total += r;
-        s.min = @min(s.min, r);
-        s.max = @max(s.max, r);
-    }
-    return s;
-}
-
-/// prompt_stats' construction check: it reads the prompt seeds' counts (the wide seed route) and shifts rows only
-/// between the prompt rows and the decode rows' cap, so it needs both.
-pub fn checkDecodeRowsAlloc(alloc: arm_mod.DecodeRowsAlloc, wide_seed: bool, prefill_rows: u32, decode_rows: u32) error{ DecodeRowsAllocNeedsSeed, DecodeRowsAllocNoRoom }!void {
-    switch (alloc) {
-        .uniform => {},
-        .prompt_stats => {
-            if (!wide_seed) return error.DecodeRowsAllocNeedsSeed;
-            if (prefill_rows >= decode_rows) return error.DecodeRowsAllocNoRoom;
-        },
-        // The pool rows come out of each layer's grow: at least the pool's rows above the prompt rows.
-        .decode_first16 => if (decode_rows < prefill_rows + (expert_stream.DecodePool{}).per_layer) return error.DecodeRowsAllocNoRoom,
-    }
-}
-
-/// decode_first16 is its own row route: the record granule (single records on top) is refused with it.
-pub fn checkDecodePoolRoutes(alloc: arm_mod.DecodeRowsAlloc, granule: arm_mod.DecodeFillGranule, transient_release: bool) error{ DecodePoolWithRecords, DecodePoolNeedsRelease }!void {
-    if (alloc != .decode_first16) return;
-    if (granule == .record) return error.DecodePoolWithRecords;
-    if (!transient_release) return error.DecodePoolNeedsRelease;
-}
 
 /// The decode cache limit the Module installs and the bill charges (one resolver: the setting over the envelope's).
 pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
@@ -484,11 +445,10 @@ pub const Module = struct {
     reverse_change: ?ReverseRecord = null,
     /// A harness's observer at the phase change's proof points (set before the first request; none on the served path).
     phase_observer: ?PhaseObserver = null,
-    /// prompt_stats' scratch (built at construction when installed) and the rows the phase change grew to.
-    decode_rows: ?arm_mod.DecodeRows = null,
+    /// The rows the phase change grows to when they are not the admitted count everywhere (the record granule's).
     grown_rows: ?[]const u32 = null,
-    /// The record granule's single decode records (`RouteOverrides.decode_extra_records`) and, on the uniform route,
-    /// its rows (layers 0 .. extra - 1 one more), built at construction.
+    /// The record granule's single decode records (`RouteOverrides.decode_extra_records`) and its rows (layers
+    /// 0 .. extra - 1 one more), built at construction.
     decode_extra: u32 = 0,
     uniform_rows: []u32 = &.{},
     /// The request's decode host side (`DecodeHost`; reset at each phase change).
@@ -757,24 +717,9 @@ pub const Module = struct {
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
-        const rows_alloc = decodeRowsAlloc(ov);
-        switch (self.arm) {
-            inline else => |t| {
-                checkDecodeRowsAlloc(rows_alloc, self.installed.wide.seed, t.arm.prefill_rows[0], t.arm.decode_rows[0]) catch |e| {
-                    log.err("decode rows alloc {t} refused at construction: {s}", .{ rows_alloc, @errorName(e) });
-                    return e;
-                };
-                checkDecodePoolRoutes(rows_alloc, decodeFillGranule(ov), self.installed.transient_release) catch |e| {
-                    log.err("decode rows alloc {t} refused at construction: {s}", .{ rows_alloc, @errorName(e) });
-                    return e;
-                };
-                if (rows_alloc == .prompt_stats) self.decode_rows = try arm_mod.DecodeRows.init(gpa, @intCast(t.arm.prefill_rows.len), t.arm.bank.n_experts);
-            },
-        }
-        self.installed.decode_rows_alloc = rows_alloc;
         self.installed.decode_fill_granule = decodeFillGranule(ov);
         self.decode_extra = self.overrides.decode_extra_records orelse 0;
-        if (rows_alloc == .uniform and self.decode_extra > 0) switch (self.arm) {
+        if (self.decode_extra > 0) switch (self.arm) {
             inline else => |t| {
                 self.uniform_rows = try gpa.alloc(u32, t.arm.decode_rows.len);
                 arm_mod.uniformRows(self.uniform_rows, t.arm.decode_rows[0], self.decode_extra);
@@ -782,11 +727,6 @@ pub const Module = struct {
             },
         };
         log.info("NATIVE decode fill granule: {t} ({d} single decode records past the rows)", .{ self.installed.decode_fill_granule, self.decode_extra });
-        log.info("NATIVE decode rows alloc: {s}", .{switch (rows_alloc) {
-            .uniform => "uniform",
-            .prompt_stats => std.fmt.comptimePrint("prompt_stats (shift cap {d}; floor max(prompt rows, U - {d}); total U x layers)", .{ arm_mod.decode_rows_shift_cap, arm_mod.decode_rows_shift_cap }),
-            .decode_first16 => std.fmt.comptimePrint("decode_first16 ({d} pool rows per layer in window 0; re-owned once at the end of cycle {d} from cycles {d}..{d}'s misses, m / r^3; total U x layers)", .{ (expert_stream.DecodePool{}).per_layer, (expert_stream.DecodePool{}).at_cycle, (expert_stream.DecodePool{}).from_cycle, (expert_stream.DecodePool{}).at_cycle }),
-        }});
         log.info("NATIVE draft experts: resident ({d} x {d} B)", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
         self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .head_mx = if (self.model.head_mx) |*hm| hm else null, .staged_commit = draftStaged(ov) });
         errdefer self.head.deinit(&self.g);
@@ -920,7 +860,6 @@ pub const Module = struct {
         opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
         opts.transient_release = transientRelease(self.overrides);
         opts.grow_fill = growFill(self.overrides);
-        if (decodeRowsAlloc(self.overrides) == .decode_first16) opts.decode_pool = .{};
         const wide = wideRoute(config);
         const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wide, .banked = self.exl3.banked != null, .hoist_first = hoistFirst(self.overrides), .devroute = devRoute(self.overrides) }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
@@ -963,48 +902,6 @@ pub const Module = struct {
         const m = BoundaryMemory.now();
         self.decode_host.end = hostSideOf(m);
         log.info("NATIVE decode host side: end of decode {d} B (after the grow {d} B; footprint {d} B, MLX active {d} B, cache {d} B)", .{ self.decode_host.end.?, after, m.footprint, m.active, m.cache });
-        self.logUniformPromptRows();
-        self.logPoolReplan();
-    }
-
-    /// decode_first16's line after the decode (off every clock): the rows each layer was re-owned to and the misses
-    /// the rule read, or that the re-plan never ran (a decode shorter than its cycle).
-    fn logPoolReplan(self: *Module) void {
-        if (self.installed.decode_rows_alloc != .decode_first16) return;
-        const st = switch (self.arm) {
-            inline else => |t| t.arm.stream,
-        };
-        const r = st.poolReplan() orelse {
-            log.info("NATIVE DSV41_DECODE_ROWS skipped: decode ended before the re-plan's cycle", .{});
-            return;
-        };
-        const sm = rowsSummary(r.rows);
-        const json = std.json.Stringify.valueAlloc(self.gpa, .{ .alloc = "decode_first16", .uniform = self.bill.decode_rows, .layers = r.rows, .total = sm.total, .min = sm.min, .max = sm.max, .misses = r.misses }, .{}) catch return;
-        defer self.gpa.free(json);
-        log.info("NATIVE DSV41_DECODE_ROWS {s}", .{json});
-    }
-
-    /// The uniform route's counterpart of `logDecodeRows`, after the decode (off every clock; the prompt counts are
-    /// unchanged by decode): the rows prompt_stats would have grown to and each layer's prompt tail.
-    fn logUniformPromptRows(self: *Module) void {
-        if (self.installed.decode_rows_alloc != .uniform) return;
-        self.logUniformPromptRowsOr() catch |e| log.info("NATIVE DSV41_DECODE_ROWS skipped: {s}", .{@errorName(e)});
-    }
-
-    fn logUniformPromptRowsOr(self: *Module) !void {
-        if (!self.installed.wide.seed) return error.NoPromptSeeds;
-        switch (self.arm) {
-            inline else => |t| {
-                if (t.arm.prefill_rows[0] >= t.arm.decode_rows[0]) return error.NoRoomAbovePromptRows;
-                var dr = try arm_mod.DecodeRows.init(self.gpa, @intCast(t.arm.prefill_rows.len), t.arm.bank.n_experts);
-                defer dr.deinit(self.gpa);
-                const would = try t.arm.promptRows(&dr, self.decode_extra);
-                const s = rowsSummary(would);
-                const json = try std.json.Stringify.valueAlloc(self.gpa, .{ .alloc = "uniform", .uniform = t.arm.decode_rows[0], .extra = self.decode_extra, .prompt_stats_layers = would, .total = s.total, .min = s.min, .max = s.max, .tail_ppm = dr.tail_ppm }, .{});
-                defer self.gpa.free(json);
-                log.info("NATIVE DSV41_DECODE_ROWS {s}", .{json});
-            },
-        }
     }
 
     pub fn deinit(self: *Module) void {
@@ -1013,7 +910,6 @@ pub const Module = struct {
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);
         self.head.deinit(&self.g);
-        if (self.decode_rows) |*dr| dr.deinit(gpa);
         gpa.free(self.uniform_rows);
         self.model.deinit(&self.g);
         self.embed_rows.close();
@@ -1519,13 +1415,6 @@ pub const Module = struct {
         _ = mlx.mlx_synchronize(self.g.s);
         // The frees' end (free_to_grow_ms starts here).
         const freed_at = std.Io.Timestamp.now(self.io, .boot);
-        // prompt_stats: the rows from the prompt's counts, host only, while the frees land (before the settle).
-        if (self.decode_rows) |*dr| {
-            self.grown_rows = switch (self.arm) {
-                inline else => |t| t.arm.promptRows(dr, self.decode_extra) catch |e| return self.refuseBoundary(e),
-            };
-            self.logDecodeRows(dr);
-        }
         // until_freed: the admission's bound on the footprint before the grow (from the bill and the release's bytes).
         const uf: ?@TypeOf(untilFreedBound(0, 0, 0, 0, 0)) = switch (self.installed.phase_change_settle) {
             .interval => null,
@@ -1550,17 +1439,6 @@ pub const Module = struct {
         self.logPhaseChange();
         for (marks, [_][]const u8{ "start", "after the embedding fence", "after the transient release", "after the frees (settled)", "after the banks grew" }) |mark, name| if (mark) |m|
             log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d}; host_statistics64, possibly cached)", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
-    }
-
-    /// One `NATIVE DSV41_DECODE_ROWS {json}` line: prompt_stats' rows per layer, their total / min / max, and each
-    /// layer's prompt mass outside its top-U experts (ppm).
-    fn logDecodeRows(self: *Module, dr: *const arm_mod.DecodeRows) void {
-        const s = rowsSummary(dr.rows);
-        // A stack buffer: the phase change allocates nothing on the heap.
-        var buf: [8192]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buf);
-        const json = std.json.Stringify.valueAlloc(fba.allocator(), .{ .alloc = "prompt_stats", .uniform = self.bill.decode_rows, .extra = self.decode_extra, .layers = dr.rows, .total = s.total, .min = s.min, .max = s.max, .tail_ppm = dr.tail_ppm }, .{}) catch return;
-        log.info("NATIVE DSV41_DECODE_ROWS {s}", .{json});
     }
 
     /// The harness's observer at a proof point (none on the served path); its error refuses the boundary.
@@ -1589,11 +1467,8 @@ pub const Module = struct {
         return e;
     }
 
-    /// The decode rows per layer the phase change grew to (the admitted count everywhere on the uniform route).
+    /// The decode rows per layer the phase change grew to (the admitted count everywhere without single records).
     pub fn grownRows(self: *const Module) []const u32 {
-        switch (self.arm) {
-            inline else => |t| if (t.arm.stream.poolReplan()) |r| return r.rows,
-        }
         return self.grown_rows orelse switch (self.arm) {
             inline else => |t| t.arm.decode_rows,
         };
@@ -1669,8 +1544,6 @@ pub const Installed = struct {
     grow_fill: expert_stream.GrowFill = .zeros,
     /// MLX's buffer cache limit through decode, as installed (`decodeCacheLimit`).
     decode_cache_bytes: u64 = envelope.decode_cache_bytes,
-    /// The phase change's per-layer decode rows, as installed (`decodeRowsAlloc`, past `checkDecodeRowsAlloc`).
-    decode_rows_alloc: arm_mod.DecodeRowsAlloc = .uniform,
     /// The fill's decode granule, as installed (`decodeFillGranule`).
     decode_fill_granule: arm_mod.DecodeFillGranule = .row,
     /// The prefill attention core (installed and past its construction self-check).
@@ -3243,17 +3116,6 @@ test "dsv41 module: the installed-routes line reads the routes as built, on and 
     try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0, seed false, hot-first false", off.line(&buf));
 }
 
-test "dsv41 module: per-layer decode rows are uniform unless set; prompt_stats needs the prompt seeds and room above the prompt rows" {
-    try std.testing.expectEqual(arm_mod.DecodeRowsAlloc.uniform, decodeRowsAlloc(.{}));
-    try std.testing.expectEqual(arm_mod.DecodeRowsAlloc.prompt_stats, decodeRowsAlloc(.{ .decode_rows_alloc = .prompt_stats }));
-    try std.testing.expect((Installed{}).decode_rows_alloc == .uniform);
-    try checkDecodeRowsAlloc(.uniform, false, 171, 171);
-    try checkDecodeRowsAlloc(.prompt_stats, true, 136, 171);
-    try std.testing.expectError(error.DecodeRowsAllocNeedsSeed, checkDecodeRowsAlloc(.prompt_stats, false, 136, 171));
-    try std.testing.expectError(error.DecodeRowsAllocNoRoom, checkDecodeRowsAlloc(.prompt_stats, true, 171, 171));
-    try std.testing.expectEqual(RowsSummary{ .total = 12, .min = 2, .max = 6 }, rowsSummary(&.{ 4, 2, 6 }));
-}
-
 test "dsv41 module: the fill's decode granule is a row unless set; the records are the Module's to derive" {
     try std.testing.expectEqual(arm_mod.DecodeFillGranule.row, decodeFillGranule(.{}));
     try std.testing.expectEqual(arm_mod.DecodeFillGranule.record, decodeFillGranule(.{ .decode_fill_granule = .record }));
@@ -3295,15 +3157,6 @@ test "dsv41 module: the states and the bill read one ring geometry: the numeric 
     const dec0 = b0.ringDecodeBytes(seq) + b0.frontierDecodeBytes(seq);
     const dec1 = b1.ringDecodeBytes(seq) + b1.frontierDecodeBytes(seq);
     try std.testing.expectEqual(dec1 - dec0, b1.kvDecodeBytes(seq, positions) - b0.kvDecodeBytes(seq, positions));
-}
-
-test "dsv41 module: decode_first16 needs its pool's rows above the prompt rows and the transient release, and refuses single records" {
-    try checkDecodeRowsAlloc(.decode_first16, false, 136, 168);
-    try std.testing.expectError(error.DecodeRowsAllocNoRoom, checkDecodeRowsAlloc(.decode_first16, true, 150, 168));
-    try checkDecodePoolRoutes(.decode_first16, .row, true);
-    try std.testing.expectError(error.DecodePoolWithRecords, checkDecodePoolRoutes(.decode_first16, .record, true));
-    try std.testing.expectError(error.DecodePoolNeedsRelease, checkDecodePoolRoutes(.decode_first16, .row, false));
-    try checkDecodePoolRoutes(.uniform, .record, false);
 }
 
 test "dsv41 module: the arm's options from the shell's rows: native both, forced decode rows through the envelope, else the plan" {

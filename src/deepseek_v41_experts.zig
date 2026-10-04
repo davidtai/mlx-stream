@@ -1148,11 +1148,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             try self.source.flush();
         }
 
-        /// The end of a decode cycle, after its flush (a source without a cycle clock: nothing).
-        pub fn cycleEnd(self: *Self) !void {
-            if (comptime @hasDecl(S, "cycleEnd")) try self.source.cycleEnd();
-        }
-
         pub const Hook = struct {
             ex: *Self,
             layer: u32,

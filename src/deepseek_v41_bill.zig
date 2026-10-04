@@ -1734,49 +1734,6 @@ test "dsv41 memory: the fill's rows at the windows' baselines (bank)" {
     }
 }
 
-// DSV41_BANK=<bank> (host): #23's route bills nothing new. The bill at prompt_stats is uniform's, term for term, at the
-// served baseline; every layer's record is the same size on the bank, so any per-layer split of the same total grows
-// the same bytes, and the until_freed bound (rounding per array) is unchanged.
-test "dsv41 memory: per-layer decode rows (prompt_stats) bill exactly what uniform rows bill (bank)" {
-    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
-    config.memory_baseline_bytes = 9_200_000_000;
-    const ceiling_bytes: u64 = 120_259_084_288;
-    const target = ceiling_bytes - module.ceiling_stop_bytes;
-    const b_u = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
-    const b_p = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .decode_rows_alloc = .prompt_stats });
-    try testing.expectEqualDeep(b_u, b_p);
-    const rows = try fillRows(fillBillOf(b_u), target, b_u.n_experts);
-    try testing.expectEqual(rows, try fillRows(fillBillOf(b_p), target, b_p.n_experts));
-    var bd: expert_bank.Diag = .{};
-    var bank = try expert_bank.Bank.open(a, testing.io, bank_dir, expert_bank.dsv41, &bd);
-    defer bank.deinit();
-    const rec = bank.layers[0].logical_bytes;
-    for (bank.layers) |l| try testing.expectEqual(rec, l.logical_bytes);
-    const L: u32 = @intCast(bank.layers.len);
-    var dr = try arm_mod.DecodeRows.init(a, L, bank.n_experts);
-    const prompt_rows = try a.alloc(u32, L);
-    @memset(prompt_rows, rows.prefill);
-    // A skewed prompt: layer l's counts fall off at a layer-dependent rate (flat layers want rows).
-    for (0..L) |l| for (dr.layerCounts(l), 0..) |*c, e| {
-        c.* = @intCast(1000 / (1 + e * (1 + (l * 7) % 13) / 16));
-    };
-    const grown = try dr.plan(prompt_rows, rows.decode);
-    var grow_bytes: u64 = 0;
-    var arrays: u64 = 0;
-    for (grown, bank.layers) |r, l| {
-        grow_bytes += (r - rows.prefill) * l.logical_bytes;
-        arrays += @as(u64, @intFromBool(r > rows.prefill)) * expert_bank.n_components;
-    }
-    try testing.expect(std.mem.min(u32, grown) != std.mem.max(u32, grown));
-    try testing.expectEqual(@as(u64, L) * (rows.decode - rows.prefill) * rec, grow_bytes);
-    try testing.expect(arrays <= @as(u64, L) * expert_bank.n_components);
-    std.debug.print("\nprompt_stats at {d} / {d} rows: grown {d} B over {d} arrays (uniform's), rows min {d} max {d}\n", .{ rows.prefill, rows.decode, grow_bytes, arrays, std.mem.min(u32, grown), std.mem.max(u32, grown) });
-}
-
 /// `b` with `k` single decode records past its rows, billed as billAt bills them.
 fn withExtra(b: Bill, k: u64) Bill {
     const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.decode_extra_records + b.transient_decode_rows);

@@ -734,17 +734,11 @@ pub fn Loop(comptime G: type) type {
                 self.setMain(try sliceRows(g, c.verify_hidden, @intCast(c.kept), @intCast(c.kept + 1)));
             }
             try ex.flush();
-            try cycleEnd(ex);
             g.reset();
             _ = dt.charge(.tail, tt);
             dt.countCycle();
             mark(stamp, .tail);
             return finish;
-        }
-
-        /// A decode cycle's end for the routed source (option (b)'s clock), when the hook has one.
-        fn cycleEnd(ex: anytype) !void {
-            if (comptime @hasDecl(@TypeOf(ex.*), "cycleEnd")) try ex.cycleEnd();
         }
 
         /// The shell's round over `core` (the Generator's v2 spec invariant: the state holds the
@@ -774,7 +768,6 @@ pub fn Loop(comptime G: type) type {
             // The next draft's main row, realised by that draft's eval.
             self.setMain(try sliceRows(g, c.verify_hidden, @intCast(c.kept), @intCast(c.kept + 1)));
             try ex.flush();
-            try cycleEnd(ex);
             g.reset();
             _ = dt.charge(.tail, tt);
             dt.countCycle();
