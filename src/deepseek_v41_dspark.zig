@@ -327,12 +327,20 @@ test "dsv41 dspark: the lookup extends a full proposal from its earliest longest
 // DSV41_LOOKUP_FIXTURE=<json from R/exl3/runtime/dump_dsv41_lookup_fixture.py>
 test "dsv41 dspark: the lookup replays the lane's LookupExtension call for call" {
     const path = std.mem.span(std.c.getenv("DSV41_LOOKUP_FIXTURE") orelse return error.SkipZigTest);
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(64 << 20));
+    defer testing.allocator.free(text);
+    try replayLookup(text);
+}
+
+test "dsv41 dspark: the lookup replays one recorded scenario of the lane's LookupExtension (embedded)" {
+    try replayLookup(@embedFile("fixtures/dsv41_lookup_fixture_one.json"));
+}
+
+fn replayLookup(text: []const u8) !void {
     const a = testing.allocator;
     const Op = struct { op: []const u8, tokens: []const u32 = &.{}, native: []const u32 = &.{}, out: []const u32 = &.{} };
     const Scenario = struct { seed: u32, prompt: []const u32, ops: []const Op };
     const Fixture = struct { format: []const u8, minimum_context: u32, extra_tokens: u32, scenarios: []const Scenario };
-    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(64 << 20));
-    defer a.free(text);
     const parsed = try std.json.parseFromSlice(Fixture, a, text, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const f = parsed.value;
@@ -363,6 +371,16 @@ test "dsv41 dspark: the lookup replays the lane's LookupExtension call for call"
 // DSV41_DSPARK_RECEIPT=<a lane receipt's comparison json (stats + acceptance)>
 test "dsv41 dspark: the counters have the lane receipt's shape and derived rates" {
     const path = std.mem.span(std.c.getenv("DSV41_DSPARK_RECEIPT") orelse return error.SkipZigTest);
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(64 << 20));
+    defer testing.allocator.free(text);
+    try checkReceipt(text);
+}
+
+test "dsv41 dspark: the counters have a lane receipt's shape and derived rates (embedded stats)" {
+    try checkReceipt(@embedFile("fixtures/dsv41_dspark_receipt_stats.json"));
+}
+
+fn checkReceipt(text: []const u8) !void {
     const a = testing.allocator;
     const RStats = struct {
         speculative_depth: u32,
@@ -383,8 +401,6 @@ test "dsv41 dspark: the counters have the lane receipt's shape and derived rates
     };
     const Depth = struct { depth: u32, mechanism: []const u8, reached: u32, accepted: u32 };
     const Receipt = struct { stats: RStats, acceptance: struct { cycles: u32, depths: []const Depth } };
-    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(64 << 20));
-    defer a.free(text);
     const parsed = try std.json.parseFromSlice(Receipt, a, text, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const r = parsed.value.stats;
@@ -423,4 +439,132 @@ fn expectShape(st: *const Stats, depth: u32) !void {
     try testing.expectEqual(st.cycles, st.correction_tokens + st.bonus_tokens);
     // Every cycle emits its accepted drafts and one target token; the prompt's pick is the +1.
     try testing.expect(st.generated_tokens <= st.accepted_drafts + st.cycles + 1);
+}
+
+/// A synthetic target over a 23-token vocabulary: the greedy next token of a history (its last two tokens).
+fn synthTarget(h: []const u32) u32 {
+    const y: u32 = if (h.len > 1) h[h.len - 2] else 0;
+    return (h[h.len - 1] * 7 + y * 3 + 1) % 23;
+}
+
+/// A drafter right where a hash of the position says (about 3 in 4), wrong (the target + 1) elsewhere.
+fn synthDraft(h: []const u32) struct { id: u32, conf: f32 } {
+    const t = synthTarget(h);
+    const hit = (h.len * 2654435761) % 4 != 0;
+    return .{ .id = if (hit) t else (t + 1) % 23, .conf = if (hit) 0.9 else 0.3 };
+}
+
+/// Runs the host half's cycles (draft 5, early stop, lookup to 7, verify by `schedule`, accept, commit) until `n` tokens.
+fn runCycles(a: std.mem.Allocator, prompt: []const u32, n: usize, schedule: ?[]const u32, threshold: ?f64, typical: bool, st: *Stats) !std.ArrayList(u32) {
+    var hist: std.ArrayList(u32) = .empty;
+    defer hist.deinit(a);
+    try hist.appendSlice(a, prompt);
+    var out: std.ArrayList(u32) = .empty;
+    errdefer out.deinit(a);
+    var lk = try Lookup.init(a, prompt, 2, 2, 0);
+    defer lk.deinit();
+    try lk.appendCommitted(&.{});
+    var buf: [max_block + 1]u32 = undefined;
+    const chunks = try verifyChunks(7, schedule, &buf);
+    st.speculative_depth = 7;
+    while (out.items.len < n) {
+        var drafts: [8]u32 = undefined;
+        var conf: [5]f32 = undefined;
+        var scratch: std.ArrayList(u32) = .empty;
+        defer scratch.deinit(a);
+        try scratch.appendSlice(a, hist.items);
+        for (0..5) |i| {
+            const d = synthDraft(scratch.items);
+            drafts[i] = d.id;
+            conf[i] = d.conf;
+            try scratch.append(a, d.id);
+        }
+        var k_eff = effectiveDraftLen(&conf, 5, threshold);
+        var ext: [8]u32 = undefined;
+        const proposal = lk.extend(drafts[0..k_eff], &ext);
+        @memcpy(drafts[0..proposal.len], proposal);
+        k_eff = @intCast(proposal.len);
+        // The target's argmax at every verify row of [primary, drafts], and typical flags that also pass odd misses.
+        var rows_t: [8]u32 = undefined;
+        var flags: [8]bool = undefined;
+        scratch.clearRetainingCapacity();
+        try scratch.appendSlice(a, hist.items);
+        for (0..k_eff + 1) |r| {
+            rows_t[r] = synthTarget(scratch.items);
+            if (r < k_eff) {
+                flags[r] = rows_t[r] == drafts[r] or (drafts[r] % 2 == 1);
+                try scratch.append(a, drafts[r]);
+            }
+        }
+        var o: Outcome = .{};
+        st.verify_calls += 1;
+        for (0..chunks.len) |i| {
+            const rows = chunkRows(chunks, i, k_eff) orelse break;
+            if (acceptChunk(&o, st, drafts[0..k_eff], k_eff, rows, rows_t[rows[0]..rows[1]], if (typical) flags[rows[0]..rows[1]] else null)) break;
+        }
+        st.endCycle(o, k_eff);
+        // The commit: the accepted run and the correction (or the bonus), which is always the target's argmax there.
+        try testing.expectEqual(rows_t[o.accepted], o.correction.?);
+        try testing.expect(o.verified >= o.accepted + 1);
+        const committed = o.trimRows() + o.accepted + 1;
+        try testing.expectEqual(o.verified, committed);
+        var c: [9]u32 = undefined;
+        @memcpy(c[0..o.accepted], drafts[0..o.accepted]);
+        c[o.accepted] = o.correction.?;
+        try out.appendSlice(a, c[0 .. o.accepted + 1]);
+        try hist.appendSlice(a, c[0 .. o.accepted + 1]);
+        try lk.appendCommitted(c[0 .. o.accepted + 1]);
+    }
+    st.generated_tokens = @intCast(out.items.len);
+    return out;
+}
+
+test "dsv41 dspark: greedy cycles over every verify schedule, early stop and the lookup commit the target's own greedy stream" {
+    const a = testing.allocator;
+    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9 };
+    const n = 96;
+    // The serial reference: the target's argmax, one token at a time.
+    var ref: std.ArrayList(u32) = .empty;
+    defer ref.deinit(a);
+    try ref.appendSlice(a, &prompt);
+    for (0..n + 8) |_| try ref.append(a, synthTarget(ref.items));
+    const schedules = [_]?[]const u32{ null, &.{ 2, 6 }, &.{ 1, 1, 1, 1, 1, 1, 1, 1 }, &.{ 5, 3 } };
+    for (schedules) |sched| for ([_]?f64{ null, 0.5 }) |thr| {
+        var st: Stats = .{};
+        var out = try runCycles(a, &prompt, n, sched, thr, false, &st);
+        defer out.deinit(a);
+        try testing.expectEqualSlices(u32, ref.items[prompt.len..][0..out.items.len], out.items);
+        try expectShape(&st, 7);
+        try testing.expect(st.accepted_drafts > st.cycles and st.tokensPerCycle() > 1.0);
+        try testing.expectEqual(st.cycles, st.verify_calls);
+    };
+}
+
+test "dsv41 dspark: typical cycles commit each accepted run's drafts and the argmax at the first unaccepted row" {
+    const a = testing.allocator;
+    var st: Stats = .{};
+    var out = try runCycles(a, &.{ 2, 7, 1, 8, 2, 8 }, 80, &.{ 3, 5 }, null, true, &st);
+    defer out.deinit(a);
+    try expectShape(&st, 7);
+    // Its flags pass the argmax's misses with an odd id too: more accepted than the drafter's three in four.
+    try testing.expect(st.acceptRate() > 0.75);
+}
+
+test "dsv41 dspark: the counters' rates on an empty run, and the schedule's depth and width bounds" {
+    const st: Stats = .{};
+    try testing.expectEqual(@as(f64, 0), st.acceptRate());
+    try testing.expectEqual(@as(f64, 0), st.tokensPerCycle());
+    try testing.expectEqual(@as(?f64, null), st.acceptRateAt(0));
+    var buf: [max_block + 1]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{max_block + 1}, try verifyChunks(max_block, null, &buf));
+    try testing.expectError(error.DraftDepth, verifyChunks(max_block + 1, null, &buf));
+    try testing.expectError(error.VerifySchedule, verifyChunks(4, &.{}, &buf));
+    const ones: [max_block + 2]u32 = @splat(1);
+    try testing.expectError(error.VerifySchedule, verifyChunks(max_block, &ones, &buf));
+    // The lookup's extension stops at the history's end.
+    var lk = try Lookup.init(testing.allocator, &.{ 7, 1, 2, 3, 4, 5, 6, 9 }, 1, 4, 16);
+    defer lk.deinit();
+    try lk.appendCommitted(&.{7});
+    var out: [12]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6, 9, 7 }, lk.extend(&.{ 1, 2, 3, 4, 5 }, &out));
 }

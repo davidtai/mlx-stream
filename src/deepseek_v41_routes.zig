@@ -559,3 +559,50 @@ test "dsv41 routes: a ring geometry below the widest forward or outside the test
     const t = try parse(corners, null);
     try testing.expectEqual(kvc.Geometry{ .route = .window_ring, .max_verify = 64, .slack = 0, .headroom = 4096 }, t.kv);
 }
+
+test "dsv41 routes: the prefill, KV and head levers' every value class parses or refuses by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Case = struct { text: []const u8, err: anyerror };
+    for ([_]Case{
+        .{ .text = "MTPLX_DSV41_PREFILL_CHUNK=lots", .err = error.LeverValue },
+        .{ .text = "MTPLX_DSV41_PREFILL_CHUNK_TARGET_GB=big", .err = error.LeverValue },
+        .{ .text = "MTPLX_DSV41_PREFILL_MOE_TARGET_GB=x", .err = error.LeverValue },
+        .{ .text = "MTPLX_DSV41_WINDOW_RING_SLACK=-1", .err = error.LeverValue },
+        .{ .text = "MTPLX_DSV41_KV_BOUNDED_MAXKV=17k", .err = error.LeverValue },
+        .{ .text = "MTPLX_DSV41_KV_CHUNK_GROW=maybe", .err = error.LeverValue },
+        .{ .text = "MTPLX_DSV41_HEAD_MODE=BF16", .err = error.LeverValue },
+        .{ .text = "MTPLX_DSV41_ATTN_LEAN_CASTS=maybe", .err = error.LeverValue },
+    }) |cs| {
+        var diag: v41.Diag = .{};
+        try testing.expectError(cs.err, parse(try splitPairs(a, cs.text), &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), cs.text[0..std.mem.indexOfScalar(u8, cs.text, '=').?]) != null);
+    }
+    try testing.expectError(error.LeverSyntax, splitPairs(a, "MTPLX_DSV41_KV_BOUNDED"));
+    // PREFILL_CHUNK auto (any case) and empty stay derived; the chunk target floors at 1 GB; the MoE target is read and dropped.
+    try testing.expectEqual(@as(?i64, null), (try parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK", " AUTO " }}, null)).prefill_chunk);
+    try testing.expectEqual(@as(?i64, null), (try parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK", "" }}, null)).prefill_chunk);
+    try testing.expectEqual(@as(?i64, -1), (try parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK", "-1" }}, null)).prefill_chunk);
+    try testing.expectEqual(@as(f64, 2.5e9), (try parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK_TARGET_GB", " 2.5" }}, null)).chunk_target_bytes);
+    try testing.expectEqual(@as(f64, 1e9), (try parse(&.{.{ "MTPLX_DSV41_PREFILL_CHUNK_TARGET_GB", "0.2" }}, null)).chunk_target_bytes);
+    _ = try parse(&.{.{ "MTPLX_DSV41_PREFILL_MOE_TARGET_GB", "40" }}, null);
+    // The head codecs: bf16, mxfp8, and every off word for the f32 reference.
+    try testing.expectEqual(graph.Routes.Head.mxfp8, (try parse(&.{.{ "MTPLX_DSV41_HEAD_MODE", "mxfp8" }}, null)).routes.head);
+    try testing.expectEqual(graph.Routes.Head.f32, (try parse(&.{.{ "MTPLX_DSV41_HEAD_MODE", "control" }}, null)).routes.head);
+    // KV: chunk grow alone; bounded with its own cap over the ring's; a zero cap is none.
+    try testing.expectEqual(kvc.Route.chunk_grow, (try parse(&.{.{ "MTPLX_DSV41_KV_CHUNK_GROW", "yes" }}, null)).kv.route);
+    const both = try parse(try splitPairs(a, "MTPLX_DSV41_KV_BOUNDED=on MTPLX_DSV41_KV_BOUNDED_MAXKV=20000 MTPLX_DSV41_WINDOW_RING_MAXKV=17664 MTPLX_DSV41_KV_CHUNK_GROW=1"), null);
+    try testing.expectEqual(kvc.Route.bounded, both.kv.route);
+    try testing.expectEqual(@as(?u32, 20000), both.kv.max_kv);
+    const zero = try parse(try splitPairs(a, "MTPLX_DSV41_WINDOW_RING=true MTPLX_DSV41_WINDOW_RING_MAXKV=0"), null);
+    try testing.expectEqual(@as(?u32, null), zero.kv.max_kv);
+    // A by-design lever must still be a boolean; a kernel lever set off is accepted.
+    _ = try parse(&.{.{ "MTPLX_DSV41_PREFILL_SOFTMAX_KERNEL", "off" }}, null);
+    // Deferred levers are kept for their owners, up to the tier's room.
+    var many: [Tier.max_deferred + 1][2][]const u8 = @splat(.{ "MTPLX_DSV41_TCQ3", "1" });
+    try testing.expectEqual(@as(usize, Tier.max_deferred), (try parse(many[0..Tier.max_deferred], null)).deferredLevers().len);
+    var diag: v41.Diag = .{};
+    try testing.expectError(error.LeverValue, parse(&many, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "deferred") != null);
+}

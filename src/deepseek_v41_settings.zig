@@ -212,3 +212,20 @@ test "dsv41 settings: the prefill routes are a bool, a bool and a depth of 1 or 
     // Not an object: nothing set.
     try testing.expectEqual(Config{}, try settingsOf("[1]"));
 }
+
+test "dsv41 settings: the reader schedule parses its knob list, a conflict is unset; the load facts replace the fill's inputs" {
+    try testing.expectEqual(@as(?sdk_ext.expert.Sched, .{ .qos = true, .spin = true }), (try settingsOf("{\"expert_reader_sched\": \"qos,spin\"}")).expert_reader_sched);
+    try testing.expectEqual(@as(?sdk_ext.expert.Sched, .{}), (try settingsOf("{\"expert_reader_sched\": \"off\"}")).expert_reader_sched);
+    try testing.expectEqual(@as(?sdk_ext.expert.Sched, null), (try settingsOf("{\"expert_reader_sched\": \"spin\"}")).expert_reader_sched);
+    try testing.expectEqual(@as(?sdk_ext.expert.Sched, null), (try settingsOf("{\"expert_reader_sched\": true}")).expert_reader_sched);
+    // The host's facts win over the settings' (rows, baseline, the page-cache setting); the routes stay the settings'.
+    const s = try settingsOf("{\"numeric_tier\": \"stock\"}");
+    var set = s;
+    set.expert_rows = 99;
+    const c = set.withFacts(&.{ .memory_baseline_bytes = 9_200_000_000, .expert_prefill_rows = 130, .nocache_weights = true, .wired_margin_bytes = 2_000_000_000 });
+    try testing.expectEqual(@as(?u64, 9_200_000_000), c.memory_baseline_bytes);
+    try testing.expectEqual(@as(?u32, null), c.expert_rows);
+    try testing.expectEqual(@as(?u32, 130), c.expert_prefill_rows);
+    try testing.expectEqual(@as(?bool, true), c.nocache_weights);
+    try testing.expectEqual(@as(?NumericTier, .stock), c.numeric_tier);
+}

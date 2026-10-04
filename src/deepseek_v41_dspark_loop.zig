@@ -2377,9 +2377,17 @@ test "dsv41 dspark loop: the lane's recorded cycles replay decision for decision
 // DSV41_DSPARK_MINI_CONFIG=<dump_dsv41_dspark_cycles.py --dump-config json>
 test "dsv41 dspark loop: the fixture's mini config builds the model and head, and a full proposal takes the lookup" {
     const path = std.mem.span(std.c.getenv("DSV41_DSPARK_MINI_CONFIG") orelse return error.SkipZigTest);
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(text);
+    try miniConfigCycles(text);
+}
+
+test "dsv41 dspark loop: the m4 mini config builds the model and head, and a full proposal takes the lookup (embedded)" {
+    try miniConfigCycles(@embedFile("fixtures/dsv41_dspark_mini_config.json"));
+}
+
+fn miniConfigCycles(text: []const u8) !void {
     const a = testing.allocator;
-    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1 << 20));
-    defer a.free(text);
     var diag: v41.Diag = .{};
     const c = v41.Config.parse(a, text, &diag) catch |e| {
         std.debug.print("mini config refused: {s}\n", .{diag.message()});

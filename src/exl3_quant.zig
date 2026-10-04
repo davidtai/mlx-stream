@@ -1308,6 +1308,11 @@ test "dsv41 kernels c2: the EXL3 quant claims the bank of record's description (
         .{ .needle = "\"layer\":7,\"K\":3", .replacement = "\"layer\":7,\"K\":4", .names = "layer 7 K 4" },
         .{ .needle = "\"hidden\":5120", .replacement = "\"hidden\":4096", .names = "dims hidden 4096" },
         .{ .needle = "\"component\":\"up_proj.rout\",\"dtype\":\"F16\"", .replacement = "\"component\":\"up_proj.rout\",\"dtype\":\"F32\"", .names = "segment up_proj.rout: its dtype" },
+        .{ .needle = "\"order\":\"sylvester-natural\"", .replacement = "\"order\":\"walsh\"", .names = "quantization.hadamard 128 / walsh" },
+        .{ .needle = "\"rin\":\"exl3.suh\"", .replacement = "\"rin\":\"exl3.sv\"", .names = "quantization.scales rin exl3.sv" },
+        .{ .needle = "\"component\":\"gate_proj.rout\"", .replacement = "\"component\":\"gate_prj.rout\"", .names = "segment gate_prj.rout: an unknown projection" },
+        .{ .needle = "\"component\":\"down_proj.rin\"", .replacement = "\"component\":\"down_proj.bias\"", .names = "segment down_proj.bias: an unknown tensor" },
+        .{ .needle = "\"component\":\"gate_proj.code\",\"dtype\":\"I16\",\"shape\":[320,144,48]", .replacement = "\"component\":\"gate_proj.code\",\"dtype\":\"I16\",\"shape\":[144,320,48]", .names = "segment gate_proj.code: its shape" },
     };
     for (cases) |c| {
         const text = try std.mem.replaceOwned(u8, a, bank_peek_fixture, c.needle, c.replacement);
@@ -1326,6 +1331,25 @@ test "dsv41 kernels c2: the EXL3 quant claims the bank of record's description (
     try testing.expectError(error.ManifestFormat, expert_bank.peekText(a, "{\"format\":\"x\",\"quantization\":{},\"dims\":{\"hidden\":1,\"inter\":1,\"n_experts\":1,\"n_layers\":0},\"layers\":[]}", &bd));
     try testing.expectError(error.LayerGeometry, expert_bank.peekText(a, "{\"format\":\"mtplx-expert-manifest-v2\",\"quantization\":{},\"dims\":{\"hidden\":1,\"inter\":1,\"n_experts\":1,\"n_layers\":1},\"layers\":[{\"layer\":1,\"K\":3,\"segments\":[]}]}", &bd));
     try testing.expectError(error.ManifestSyntax, expert_bank.peekText(a, "{", &bd));
+}
+
+test "dsv41 kernels c2: the EXL3 quant is accepted only with the load's kernel set, and checks its Spec before building" {
+    const a = testing.allocator;
+    var diag: Diag = .{};
+    var tb: Trace = .{ .a = a };
+    defer tb.deinit();
+    try testing.expectError(error.NoKernelSet, accept(Trace, a, &tb, .{}, v41_spec, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "without the load context's kernel set") != null);
+    const set = try ks.Set.init(a, .{ .device = .{ .stub = .{} } }, &diag);
+    defer set.deinit();
+    set.install(Trace, &tb);
+    var bad = v41_spec;
+    bad.top_k = 9;
+    try testing.expectError(error.TopKTooWide, accept(Trace, a, &tb, .{ .kernels = set.ref() }, bad, &diag));
+    const acc = try accept(Trace, a, &tb, .{ .kernels = set.ref() }, v41_spec, &diag);
+    defer acc.deinit(&tb);
+    try testing.expectEqual(@as(usize, v41_spec.n_layers), acc.waves.len);
+    try testing.expectEqual(decode_table_rows, acc.n_tok);
 }
 
 test "dsv41 kernels c2: the real 3.0 bank's own manifest is claimed (DSV41_BANK)" {
@@ -1409,6 +1433,16 @@ test "dsv41 kernels c2: the EXL3 quant refuses a Spec its texts do not implement
             s.top_k = 9;
             break :blk s;
         }, .err = error.TopKTooWide, .names = "top_k 9" },
+        .{ .spec = blk: {
+            s = v41_spec;
+            s.top_k = 0;
+            break :blk s;
+        }, .err = error.TopKTooWide, .names = "top_k 0" },
+        .{ .spec = blk: {
+            s = v41_spec;
+            s.n_layers = 0;
+            break :blk s;
+        }, .err = error.DimsNotImplemented, .names = "no layers" },
     };
     for (cases) |c| {
         try testing.expectError(c.err, checkSpec(c.spec, &diag));
