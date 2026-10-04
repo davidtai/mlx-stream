@@ -1823,10 +1823,6 @@ pub fn checkSettled(before: BoundaryMemory, after: BoundaryMemory, freed_device:
     if (bound) |b| if (after.footprint > b) return error.PhaseChangeFootprintOverBill;
 }
 
-pub fn checkConstructionBytes(billed: u64, measured: u64) error{ConstructionOverBill}!void {
-    if (measured > billed + construction_tolerance_bytes) return error.ConstructionOverBill;
-}
-
 /// The admitted modeled peak lands this far under the box's ceiling.
 pub const ceiling_stop_bytes: u64 = 2_000_000_000;
 
@@ -3048,12 +3044,7 @@ test "dsv41 memory: the return to the prompt rows (shrink) is judged like the ph
     try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, st.after, grown_rows));
 }
 
-test "dsv41 memory: the construction check passes the constructed footprints of record and refuses one over its bill by name" {
-    // cell4 (106 / 148 rows): constructed footprint 76.41 GB against 77.00 GB of construction terms.
-    try checkConstructionBytes(77_000_000_000, 76_410_000_000);
-    // At the tolerance: passes; one byte over: refused.
-    try checkConstructionBytes(77_000_000_000, 77_000_000_000 + construction_tolerance_bytes);
-    try std.testing.expectError(error.ConstructionOverBill, checkConstructionBytes(77_000_000_000, 77_000_000_001 + construction_tolerance_bytes));
+test "dsv41 memory: the construction check's tolerance sits inside the ceiling's stop" {
     try std.testing.expect(construction_tolerance_bytes < ceiling_stop_bytes);
 }
 

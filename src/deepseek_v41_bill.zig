@@ -1063,9 +1063,7 @@ test "dsv41 memory: the SDK's term-wise view fills, admits and checks constructi
     defer mb.free(testing.allocator);
     const billed = mb.constructionBytes(c.prefill_rows);
     try sdk.checkConstruction(billed, billed + module.construction_tolerance_bytes, module.construction_tolerance_bytes);
-    try module.checkConstructionBytes(billed, billed + module.construction_tolerance_bytes);
     try testing.expectError(error.ConstructionOverBill, sdk.checkConstruction(billed, billed + module.construction_tolerance_bytes + 1, module.construction_tolerance_bytes));
-    try testing.expectError(error.ConstructionOverBill, module.checkConstructionBytes(billed, billed + module.construction_tolerance_bytes + 1));
 }
 
 test "dsv41 memory: the host side is the bill's measured bound: SERVED17's 0.3318 GB passes, past 0.90 GB refuses" {
