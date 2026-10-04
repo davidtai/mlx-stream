@@ -199,60 +199,6 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
 }
 
-test "dsv41 kernels c2: GEMV_REBUILD's stock rebuild frees the accept-time GEMVs and builds the same ones (texts, statics bytes, launch configs)" {
-    const a = testing.allocator;
-    var t: Trace = .{ .a = a };
-    defer t.deinit();
-    var diag: xk.Diag = .{};
-    const set = try ks.Set.init(a, .{ .device = .{ .stub = .{} } }, &diag);
-    defer set.deinit();
-    set.install(Trace, &t);
-    defer ks.Set.uninstall(Trace, &t);
-    const acc = try eq.accept(Trace, a, &t, .{ .kernels = set.ref() }, v41_spec, &diag);
-    const before = acc.gemv;
-    const keeps0 = t.keeps;
-    const prepared0 = t.prepared_live;
-    try acc.routeForms(&t, .{});
-    const after = acc.gemv;
-    // the same stock texts, the same bound gate / up call, no one-launch table
-    try testing.expectEqual(Kernel.dsv41_exl3_mul1h_k3_2304, after.gu.kernel);
-    try testing.expectEqual(Kernel.dsv41_exl3_mul1h_k3_5120, after.dn.kernel);
-    try testing.expectEqual(before.gu, after.gu);
-    try testing.expectEqual(before.dn, after.dn);
-    try testing.expect(before.gu_call == after.gu_call and after.gu1_p == null);
-    try testing.expectEqual(xq_forms_stock, acc.forms);
-    // new static arrays (the accept-time ones released), byte for byte the same values, shapes and dtypes
-    inline for (.{ .{ before.gu_statics, after.gu_statics }, .{ before.dn_statics, after.dn_statics } }) |pair| {
-        try testing.expectEqual(pair[0].mask, pair[1].mask);
-        try testing.expect(pair[0].mask != 0);
-        for (0..xk.max_inputs) |i| {
-            if (pair[0].mask & (@as(u32, 1) << @intCast(i)) == 0) continue;
-            const x = t.nodes.items[pair[0].arrays[i]];
-            const y = t.nodes.items[pair[1].arrays[i]];
-            try testing.expect(pair[0].arrays[i] != pair[1].arrays[i]);
-            try testing.expectEqualSlices(u8, x.bytes, y.bytes);
-            try testing.expectEqualSlices(c_int, x.shape.slice(), y.shape.slice());
-            try testing.expectEqual(x.dtype, y.dtype);
-        }
-    }
-    // every row count's launch config and prepared config the same
-    inline for (.{ .{ before.gu_p, after.gu_p }, .{ before.dn_p, after.dn_p } }) |pair| {
-        try testing.expectEqual(pair[0].e, pair[1].e);
-        for (pair[0].cfg, pair[1].cfg, pair[0].prep, pair[1].prep) |c0, c1, p0, p1| {
-            try testing.expect(std.meta.eql(c0, c1));
-            try testing.expect(p0.k == p1.k and std.meta.eql(p0.cfg, p1.cfg) and std.meta.eql(p0.cfg, c0));
-        }
-    }
-    // the frees and the rebuild balance: as many kept arrays and prepared configs as before
-    try testing.expectEqual(keeps0, t.keeps);
-    try testing.expectEqual(prepared0, t.prepared_live);
-    acc.deinit(&t);
-    try testing.expectEqual(@as(isize, 0), t.keeps);
-    try testing.expectEqual(@as(isize, 0), t.prepared_live);
-}
-
-const xq_forms_stock: eq.Forms = .{};
-
 test "dsv41 kernels c2: the kernel set refuses by name (text, pin) and a backend without a route method" {
     const a = testing.allocator;
     var diag: xk.Diag = .{};

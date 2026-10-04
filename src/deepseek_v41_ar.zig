@@ -1162,9 +1162,6 @@ const CellReceipt = struct {
     dense_rc: ?bool = null,
     /// ROUTED_BANKED as installed: the routed decode stages one launch over every bank (true) or per bank.
     routed_banked: bool = false,
-    /// GEMV_REBUILD as installed: the accept-time decode GEMVs freed and rebuilt at construction (the stock-route leak's
-    /// discriminator; false: off).
-    gemv_rebuild: bool = false,
     /// HOIST_FIRST as installed: each decode call's hoist committed before its routing barrier's wait (true) or behind
     /// its hit wave.
     hoist_first: bool = false,
@@ -1651,7 +1648,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .routed_forms = formsName(md.installed.routed_forms),
         .dense_rc = md.installed.dense_rc,
         .routed_banked = md.installed.routed_banked,
-        .gemv_rebuild = md.installed.gemv_rebuild,
         .hoist_first = md.installed.hoist_first,
         .draft_staged = md.installed.draft_staged,
         .draft_ahead = md.installed.draft_ahead,
@@ -1779,7 +1775,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_FIRST_VERIFY_WARM")) |v| ov.first_verify_warm = try cellBool("DSV41_CELL_FIRST_VERIFY_WARM", v);
     // The phase change's settle poll (ms; the Module refuses a value outside 1..phase_change_settle_ms at construction).
     if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;
-    // The phase change's settle condition (interval | until_freed; anything else refused here).
     if (envStr("DSV41_CELL_GROW_FILL")) |v| ov.grow_fill = std.meta.stringToEnum(@import("expert_stream.zig").GrowFill, v) orelse return error.CellGrowFill;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;
@@ -1798,7 +1793,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_ROUTED_FORMS")) |v| ov.routed_forms = try parseForms(v);
     if (envStr("DSV41_CELL_DENSE_RC")) |v| ov.dense_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellDenseRc;
     if (envStr("DSV41_CELL_ROUTED_BANKED")) |v| ov.routed_banked = try cellBool("DSV41_CELL_ROUTED_BANKED", v);
-    if (envStr("DSV41_CELL_GEMV_REBUILD")) |v| ov.gemv_rebuild = try cellBool("DSV41_CELL_GEMV_REBUILD", v);
     if (envStr("DSV41_CELL_HOIST_FIRST")) |v| ov.hoist_first = try cellBool("DSV41_CELL_HOIST_FIRST", v);
     if (envStr("DSV41_CELL_DRAFT_STAGED")) |v| ov.draft_staged = try cellBool("DSV41_CELL_DRAFT_STAGED", v);
     if (envStr("DSV41_CELL_DRAFT_AHEAD")) |v| ov.draft_ahead = try cellBool("DSV41_CELL_DRAFT_AHEAD", v);
