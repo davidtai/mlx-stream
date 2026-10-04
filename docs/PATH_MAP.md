@@ -221,7 +221,6 @@ Use it to port commits written against the in-tree layout (for example the cover
 | coverage/sdk `src/sdk/testing.zig` "sdk kv:" test | `src/sdk_ext/kv_testing.zig` |
 | coverage/sdk `src/plugins_refusals.zig` cases `expert_source_wrong_caps`, `quant_half_contract`, `quant_claims_mistyped`, `quant_check_direct`, `profile_hook_missing_probe` | `src/refusals.zig` + `refusal_cases` in build.zig (`zig build refusals`) |
 | coverage/sdk cases `arch_binds_unprovided`, `arch_binds_another`; registry tests of quant routing and binds | dropped: the small SDK has no binds and no quant / expert-source tables |
-| coverage/host-seams `src/qwen4_exp.zig` "host seams: ngram ..." tests + `src/ngram_oracle_af34af04.zig` | `src/ngram_table_parity_test.zig` ("ngram table parity: ...") + `src/ngram_oracle_af34af04.zig`, against `src/ngram_table.zig` (the host's qwen4_exp is upstream's again) |
 | fork `src/qwen4_exp.zig` "dsv41 ngram table: a BF16 tensor inside a checkpoint shard ..." | `src/ngram_table.zig` |
 | coverage/expert-io 74c81fff..fbc12206 (src/mlx_stream/expert_*_test.zig, expert_stream.zig, lib/expert_io/*, src/sdk/expert/*) | the same names under src/, csrc/, src/sdk_ext/expert/ (one commit per original commit; the decode-plan fix sits beside the keepwarm lever's line) |
 | coverage/expert-io `src/io_util.zig` no-cache tests | host src/io_util.zig and, renamed "nocache io: ...", src/nocache_io.zig |
