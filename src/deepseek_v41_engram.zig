@@ -673,6 +673,37 @@ test "dsv41 engram: a synthetic bank opens and its rows come back through the ro
     try testing.expectError(error.RowOutOfRange, src.readIds(0, &.{97}, codes[0..32], scales[0..1]));
 }
 
+test "dsv41 engram: the posted route's construction check passes on the mini bank, and a direct read is the record" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [512]u8 = undefined;
+    const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
+    const map_path = try writeMiniBank(a, &tmp, root, .{});
+    const c = try miniConfig();
+    var diag: v41.Diag = .{};
+    var src = try RowSource.open(testing.allocator, testing.io, root, map_path, &c, &diag);
+    defer src.deinit();
+    try src.enablePosting();
+    var st: HashState = .{};
+    defer st.deinit(testing.allocator);
+    var rows: [5 * 4]i64 = undefined;
+    try src.advance(testing.allocator, &st, &.{ 3, 5, 7, 9, 11 }, &rows);
+    try src.checkPosted(testing.allocator, &rows, 5);
+    // readRows (the parity harness's direct read): each record's code bytes then its scale byte.
+    var codes: [3 * 32]u8 = undefined;
+    var scales: [3]u8 = undefined;
+    try readRows(src.fds[0], &src.bank, &.{ 0, 41, 96 }, &codes, &scales);
+    for ([_]u64{ 0, 41, 96 }, 0..) |r, k| {
+        for (0..32) |i| try testing.expectEqual(miniRecordByte(r, i), codes[k * 32 + i]);
+        try testing.expectEqual(miniRecordByte(r, 32), scales[k]);
+    }
+    try testing.expectError(error.RowOutOfRange, readRows(src.fds[0], &src.bank, &.{-1}, codes[0..32], scales[0..1]));
+    try testing.expectError(error.ShortRead, readRows(src.fds[0], &src.bank, &.{97}, codes[0..32], scales[0..1]));
+}
+
 test "dsv41 engram: posted gathers return the blocking reads' bytes in post order and leave the cache as they do" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

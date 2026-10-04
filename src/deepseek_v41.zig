@@ -1660,9 +1660,9 @@ test "dsv41 spec: the real geometry lists the bank's 1,206 text and 2,398 DSpark
 
 // ── a synthetic mini checkpoint (hermetic) ──
 
-const MiniTensor = struct { name: []const u8, dtype: StDtype, shape: [2]u64, rank: u8 };
+pub const MiniTensor = struct { name: []const u8, dtype: StDtype, shape: [2]u64, rank: u8 };
 
-const MiniFault = struct {
+pub const MiniFault = struct {
     drop: ?[]const u8 = null,
     dtype_of: ?[]const u8 = null,
     shape_of: ?[]const u8 = null,
@@ -1676,7 +1676,7 @@ const MiniFault = struct {
 
 /// Tensors of `spec` as stored (quantized params expand to weight + scales),
 /// plus the skips a real bank carries.
-fn miniTensors(a: std.mem.Allocator, spec: []const Param) ![]MiniTensor {
+pub fn miniTensors(a: std.mem.Allocator, spec: []const Param) ![]MiniTensor {
     var list: std.ArrayList(MiniTensor) = .empty;
     for (spec) |p| switch (p.kind) {
         .dense => |d| try list.append(a, .{ .name = p.name, .dtype = d.dtype, .shape = d.shape, .rank = d.rank }),
@@ -1696,7 +1696,7 @@ fn miniByte(t: usize, i: u64) u8 {
 }
 
 /// Two shards (tensors alternate) + an index; returns the tensor list written.
-fn writeMini(a: std.mem.Allocator, tmp: *std.testing.TmpDir, spec: []const Param, f: MiniFault) ![]MiniTensor {
+pub fn writeMini(a: std.mem.Allocator, tmp: *std.testing.TmpDir, spec: []const Param, f: MiniFault) ![]MiniTensor {
     const io = testing.io;
     var all = try miniTensors(a, spec);
     var kept: std.ArrayList(MiniTensor) = .empty;

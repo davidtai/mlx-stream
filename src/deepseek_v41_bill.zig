@@ -435,6 +435,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
     var diag: arm_mod.Diag = .{};
     var opts = module.armOptions(config, ceiling, .host);
     opts.wired_bytes = billWired(wired_bytes, opts.envelope_record);
+    if (ov.bank_geometry) |g| opts.implemented = g;
     var p = arm_mod.planRows(a, io, opts, &diag) catch |e| {
         log.err("bill: refused: {s}", .{diag.message()});
         return e;

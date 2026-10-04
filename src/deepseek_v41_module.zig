@@ -197,6 +197,8 @@ pub const RouteOverrides = struct {
     decode_fill_granule: ?arm_mod.DecodeFillGranule = null,
     /// Set by the Module only (the record granule's `bill.fillExtraRecords` at the admitted rows; refused when given).
     decode_extra_records: ?u32 = null,
+    /// The bill's bank geometry (a harness's synthetic bank); null: DSV4.1's (`expert_bank.dsv41`). Bill only: hermetic tests.
+    bank_geometry: ?expert_bank.Implemented = null,
     /// The grow's new rows without the zero fill (`expert_stream.GrowFill`). null: the default, zeros.
     grow_fill: ?expert_stream.GrowFill = null,
     /// DRAFTCACHE's residency policy (shipped: the streamer's decode policy; lru). Only with `draft_cache_hot`.
@@ -717,6 +719,7 @@ pub const Module = struct {
             };
             // The record granule: the fill's leftover below one row as single decode records, billed (slot_decode).
             if (ov.decode_extra_records != null) return error.DecodeExtraRecordsAreDerived;
+            if (ov.bank_geometry != null) return error.BankGeometryIsBillOnly;
             if (decodeFillGranule(ov) == .record) {
                 self.overrides.decode_extra_records = bill_mod.fillExtraRecords(b, target);
                 b = try bill_mod.billAt(arena.allocator(), io, &admitted, fill_prompt_tokens, fill_max_tokens, sdk.memory.vmBytes().wired, ceiling_bytes, self.overrides);

@@ -36,6 +36,7 @@ comptime {
     _ = @import("exl3_source.zig");
     _ = @import("deepseek_v41_bill.zig");
     _ = @import("deepseek_v41_bill_receipts_test.zig");
+    _ = @import("deepseek_v41_bill_mini_test.zig");
     _ = @import("dsv41_decode_timers.zig");
     _ = @import("dsv41_decode_first.zig");
     _ = @import("dsv41_cache_sim.zig");
