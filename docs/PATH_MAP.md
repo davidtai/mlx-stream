@@ -231,3 +231,7 @@ Use it to port commits written against the in-tree layout (for example the cover
 | coverage/sdk cases `arch_binds_unprovided`, `arch_binds_another`; registry tests of quant routing and binds | dropped: the small SDK has no binds and no quant / expert-source tables |
 | coverage/host-seams `src/qwen4_exp.zig` "host seams: ngram ..." tests + `src/ngram_oracle_af34af04.zig` | `src/ngram_table_parity_test.zig` ("ngram table parity: ...") + `src/ngram_oracle_af34af04.zig`, against `src/ngram_table.zig` (the host's qwen4_exp is upstream's again) |
 | fork `src/qwen4_exp.zig` "dsv41 ngram table: a BF16 tensor inside a checkpoint shard ..." | `src/ngram_table.zig` |
+| coverage/expert-io 74c81fff..fbc12206 (src/mlx_stream/expert_*_test.zig, expert_stream.zig, lib/expert_io/*, src/sdk/expert/*) | the same names under src/, csrc/, src/sdk_ext/expert/ (one commit per original commit; the decode-plan fix sits beside the keepwarm lever's line) |
+| coverage/expert-io `src/io_util.zig` no-cache tests | host src/io_util.zig and, renamed "nocache io: ...", src/nocache_io.zig |
+| coverage/expert-io `src/gpu_ceiling.zig`, `src/nocache_reader.zig` tests | host only |
+| coverage/plugin-core ad3d0f93..f1da4b90 (src/mlx_stream/*, src/fixtures/dsv41_*, src/mlx_stream/deepseek_v41_bill_receipts_test.zig) | src/*, src/fixtures/*, src/deepseek_v41_bill_receipts_test.zig |
