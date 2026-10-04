@@ -359,12 +359,6 @@ pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
     return v;
 }
 
-/// The read pool's scheduling the Module installs, the server's and a harness's alike (the `expert_reader_sched` model
-/// setting on the shell's config; off by default): handed to the pool at its start.
-pub fn readerSched(config: *const settings.Config) expert_io.Sched {
-    return config.expert_reader_sched orelse .{};
-}
-
 /// DRAFTCACHE's residency policy as installed (shipped unless set); a policy without a hot count is refused by name.
 pub fn draftCachePolicy(ov: RouteOverrides) error{DraftCachePolicyWithoutHot}!xsc.PolicyKind {
     if (ov.draft_cache_hot == null and ov.draft_cache_policy != null) return error.DraftCachePolicyWithoutHot;
@@ -905,12 +899,6 @@ pub const Module = struct {
         self.installed.decode_cache_bytes = decodeCacheLimit(ov) catch unreachable;
         log.info("NATIVE decode cache limit: {d} B ({s})", .{ self.installed.decode_cache_bytes, if (self.installed.decode_cache_bytes == envelope.decode_cache_bytes) "the envelope's" else "the route's" });
         log.info("NATIVE host relief: {s}", .{if (self.installed.host_relief) "installed (malloc_zone_pressure_relief once at the phase change, after the frees)" else "off"});
-        self.installed.reader_sched = readerSched(config);
-        {
-            const rs = self.installed.reader_sched;
-            var nb: [sdk_ext.expert.Sched.name_len]u8 = undefined;
-            log.info("NATIVE reader scheduling: {s} (constructing thread {s}; threads {s}; spin {s}; speculative chunks {s}; keep-warm {s})", .{ rs.name(&nb), if (rs.start_ui) "USER_INTERACTIVE at the pool start" else "unchanged", if (rs.qos) "USER_INTERACTIVE demand + watchdog, UTILITY speculative, named" else if (rs.qos_demand) "USER_INTERACTIVE demand + watchdog, speculative inherited (no UTILITY), named" else "inherit the constructing thread's QoS", if (rs.spin) "30 us before a demand worker or the submitter sleeps" else "none", if (rs.demand_first) "only while no demand job is queued or executing" else "while at most one demand job executes (stock)", if (rs.keep_warm and rs.keep_warm_prefill) "one thread through the prompt and decode phases" else if (rs.keep_warm and rs.keep_warm_us > 0) "one thread through the decode phase, sleeping its us per loop" else if (rs.keep_warm) "one spinner thread through the decode phase" else "none" });
-        }
         log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
         log.info("NATIVE phase change settle: {t} ({s})", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
             .interval => "until the footprint is down by the freed bytes",
@@ -1126,7 +1114,6 @@ pub const Module = struct {
             opts.pool.tickets += dh.draft_aux_tickets;
             opts.pool.aux_tickets = dh.draft_aux_tickets;
         }
-        opts.pool.sched = readerSched(config);
         opts.grow_fill = growFill(self.overrides);
         const warm = firstVerifyWarm(self.overrides);
         opts.first_verify_warm = if (warm) .{} else null;
@@ -1952,8 +1939,6 @@ pub const Installed = struct {
     phase_tail_release: bool = false,
     /// STOCKDELAY's sleep before the grow (ms), as installed (`phaseGrowDelayMs`; 0: off).
     phase_grow_delay_ms: u32 = 0,
-    /// The read pool's scheduling, as installed at its start (`readerSched`).
-    reader_sched: expert_io.Sched = .{},
     /// The ring geometry the states are built with, as installed (`ringGeometry`; the bill reads the same).
     ring_geo: kvc.Geometry = .{},
     /// The grow's new rows' allocation, as installed in the stream.
@@ -3666,15 +3651,6 @@ test "dsv41 module: DRAFTCACHE is off by default (every draft expert resident) a
     try std.testing.expectEqual(xsc.PolicyKind.shipped, try draftCachePolicy(.{ .draft_cache_hot = 128 }));
     try std.testing.expectEqual(xsc.PolicyKind.lru, try draftCachePolicy(.{ .draft_cache_hot = 128, .draft_cache_policy = .lru }));
     try std.testing.expectError(error.DraftCachePolicyWithoutHot, draftCachePolicy(.{ .draft_cache_policy = .lru }));
-}
-
-test "dsv41 module: the reader scheduling is off by default and follows the shell's model setting" {
-    var c: settings.Config = .{};
-    c.expert_reader_sched = null;
-    try std.testing.expectEqual(expert_io.Sched{}, readerSched(&c));
-    try std.testing.expectEqual(expert_io.Sched{}, (Installed{}).reader_sched);
-    c.expert_reader_sched = .{ .qos = true, .demand_first = true };
-    try std.testing.expectEqual(expert_io.Sched{ .qos = true, .demand_first = true }, readerSched(&c));
 }
 
 test "dsv41 module: per-layer decode rows are uniform unless set; prompt_stats needs the prompt seeds and room above the prompt rows" {

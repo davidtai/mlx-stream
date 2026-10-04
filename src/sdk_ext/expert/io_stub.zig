@@ -35,18 +35,6 @@ pub const q3ld = struct {
     pub fn q3ld_quiesce(_: i64) c_int {
         return 0;
     }
-    pub fn q3ld_sched_config(_: i32) c_int {
-        return -1;
-    }
-    pub fn q3ld_keepwarm(_: i32) c_int {
-        return -1;
-    }
-    pub fn q3ld_keepwarm_sleep(_: i64) c_int {
-        return -1;
-    }
-    pub fn q3ld_keepwarm_spins() i64 {
-        return 0;
-    }
     pub fn q3ld_stop() c_int {
         return 0;
     }

@@ -710,43 +710,6 @@ test "dsv41 stream: growth is the one phase change" {
     s.release(r);
 }
 
-test "dsv41 stream: keepwarm: the pool's spinner runs from the grow to the reverse phase change, never in the prompt phase" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    var pool_opt = test_pool;
-    pool_opt.sched = .{ .keep_warm = true };
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = pool_opt });
-    defer s.deinit();
-    const r = try serve(s, 0, &.{ 1, 2 });
-    s.release(r);
-    std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch {};
-    try testing.expectEqual(@as(u64, 0), s.pool.keepWarmSpins());
-    try s.grow(&.{ 4, 4 });
-    std.Io.sleep(testing.io, .fromMilliseconds(20), .awake) catch {};
-    try testing.expect(s.pool.keepWarmSpins() > 1000);
-    _ = try s.shrink(&.{ 2, 2 });
-    const after = s.pool.keepWarmSpins();
-    std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch {};
-    try testing.expect(s.pool.keepWarmSpins() <= after + 1);
-}
-
-test "dsv41 stream: keepwarm<us>p: the thread runs from construction through the prompt, the grow and the reverse phase change" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    var pool_opt = test_pool;
-    pool_opt.sched = expert_io.Sched.parse("keepwarm25p").?;
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = pool_opt });
-    defer s.deinit();
-    std.Io.sleep(testing.io, .fromMilliseconds(20), .awake) catch {};
-    const in_prompt = s.pool.keepWarmSpins();
-    try testing.expect(in_prompt > 10);
-    try s.grow(&.{ 4, 4 });
-    _ = try s.shrink(&.{ 2, 2 });
-    const at_shrink = s.pool.keepWarmSpins();
-    std.Io.sleep(testing.io, .fromMilliseconds(20), .awake) catch {};
-    try testing.expect(s.pool.keepWarmSpins() > at_shrink + 10);
-}
-
 test "dsv41 stream: A0 (a): the grow's warm reads fill empty rows below demand; a layer's first decode route lands the started, cancels the queued (served on demand) and counts its hits" {
     var sb = try SynthBank.open(32);
     defer sb.close();

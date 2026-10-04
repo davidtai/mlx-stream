@@ -31,8 +31,6 @@ pub const Config = struct {
     nocache_weights: ?bool = null,
     /// The routed waves wait on the reads' events instead of the host (null = the tier's default).
     expert_event_gates: ?bool = null,
-    /// The read pool threads' scheduling (null = off).
-    expert_reader_sched: ?sdk_ext.expert.Sched = null,
     /// The numerics, chosen at construction (null = served).
     numeric_tier: ?NumericTier = null,
     /// The prompt pass layer by layer (null = the tier's default).
@@ -90,12 +88,6 @@ pub const Config = struct {
         if (obj.get("numeric_tier")) |v| if (v == .string) {
             if (std.meta.stringToEnum(NumericTier, v.string)) |t| {
                 c.numeric_tier = t;
-                any = true;
-            }
-        };
-        if (obj.get("expert_reader_sched")) |v| if (v == .string) {
-            if (sdk_ext.expert.Sched.parse(v.string)) |rs| {
-                c.expert_reader_sched = rs;
                 any = true;
             }
         };
@@ -233,11 +225,7 @@ test "dsv41 settings: ctx_size bills every prompt up to it; anything else leaves
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": 2097152}")).max_context_tokens);
 }
 
-test "dsv41 settings: the reader schedule parses its knob list, a conflict is unset; the load facts replace the fill's inputs" {
-    try testing.expectEqual(@as(?sdk_ext.expert.Sched, .{ .qos = true, .spin = true }), (try settingsOf("{\"expert_reader_sched\": \"qos,spin\"}")).expert_reader_sched);
-    try testing.expectEqual(@as(?sdk_ext.expert.Sched, .{}), (try settingsOf("{\"expert_reader_sched\": \"off\"}")).expert_reader_sched);
-    try testing.expectEqual(@as(?sdk_ext.expert.Sched, null), (try settingsOf("{\"expert_reader_sched\": \"spin\"}")).expert_reader_sched);
-    try testing.expectEqual(@as(?sdk_ext.expert.Sched, null), (try settingsOf("{\"expert_reader_sched\": true}")).expert_reader_sched);
+test "dsv41 settings: the load facts replace the fill's inputs" {
     // The host's facts win over the settings' (rows, baseline, the page-cache setting); the routes stay the settings'.
     const s = try settingsOf("{\"numeric_tier\": \"stock\"}");
     var set = s;

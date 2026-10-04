@@ -1135,18 +1135,6 @@ const CellReceipt = struct {
     draft_cache_stats: ?expert_stream.Stats = null,
     /// DRAFTCACHE's pool form as installed ("per_stage" | "shared"; null: the route off).
     draft_cache_pool: ?[]const u8 = null,
-    /// The read pool's scheduling as installed ("off" or the list of qos, qosdemand, spin, demandfirst; `module.readerSched`), and its
-    /// demand-first knob on its own.
-    reader_sched: ?[]const u8 = null,
-    reader_demand_first: ?bool = null,
-    /// The read pool's keep-warm spinner as installed (`reader_sched` keepwarm).
-    reader_keep_warm: ?bool = null,
-    /// Its per-loop sleep in us (0: a yield loop).
-    reader_keep_warm_us: ?u16 = null,
-    /// ... held through the prompt phase too (`keepwarm<us>p`).
-    reader_keep_warm_prefill: ?bool = null,
-    /// The constructing (inference) thread raised to USER_INTERACTIVE at the pool's start (`startui`).
-    reader_start_ui: ?bool = null,
     /// MLX's buffer cache limit through decode as installed (`module.decodeCacheLimit`; the envelope's by default).
     decode_cache_bytes: ?u64 = null,
     /// The phase change's per-layer decode rows route as installed ("uniform" | "prompt_stats"; `module.decodeRowsAlloc`)
@@ -1577,7 +1565,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const stt = md.dsparkStats() orelse return error.CellNeedsDspark;
     const prompt_sha = try cell.idsSha256(a, prompt);
     const ids_sha = try cell.idsSha256(a, ids);
-    var reader_sched_buf: [sdk_ext.expert.Sched.name_len]u8 = undefined;
     // This request's draft-cache statistics (the cache carries over to the next request through the same Module).
     const dcs: ?expert_stream.Stats = if (md.draft_cache) |dc| dc.takeRequestStats() else null;
     if (dcs) |d| std.debug.print("NATIVE draft cache request: route_calls {d}, hits {d}, misses {d}, cycles {d}, misses per cycle {d:.3}\n", .{ d.route_calls, d.expert_cache_hits, d.expert_cache_misses, cycles.items.len, @as(f64, @floatFromInt(d.expert_cache_misses)) / @as(f64, @floatFromInt(@max(cycles.items.len, 1))) });
@@ -1665,12 +1652,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .draft_cache_hot = md.installed.draft_cache_hot,
         .draft_cache_stats = dcs,
         .draft_cache_pool = if (md.installed.draft_cache_pool) |p| @tagName(p) else null,
-        .reader_sched = md.installed.reader_sched.name(&reader_sched_buf),
-        .reader_demand_first = md.installed.reader_sched.demand_first,
-        .reader_keep_warm = md.installed.reader_sched.keep_warm,
-        .reader_keep_warm_us = md.installed.reader_sched.keep_warm_us,
-        .reader_keep_warm_prefill = md.installed.reader_sched.keep_warm_prefill,
-        .reader_start_ui = md.installed.reader_sched.start_ui,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
         .decode_rows_alloc = @tagName(md.installed.decode_rows_alloc),
         .decode_fill_granule = @tagName(md.installed.decode_fill_granule),
@@ -1779,8 +1760,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_LAYER_MAJOR")) |v| config.layer_major_prefill = try cellBool("DSV41_CELL_LAYER_MAJOR", v);
     // C6: the typical tier's event-gated waves (the Module builds the gated arm; default host waits).
     if (envStr("DSV41_CELL_EVENT_GATES")) |v| config.expert_event_gates = try cellBool("DSV41_CELL_EVENT_GATES", v);
-    // The read pool's scheduling, through the same config field the server's model setting sets.
-    if (envStr("DSV41_CELL_READER_SCHED")) |v| config.expert_reader_sched = @import("sdk_ext.zig").expert.Sched.parse(v) orelse return error.CellReaderSched;
     if (envStr("DSV41_CELL_WIDE_FEED")) |v| config.expert_wide_feed = try cellBool("DSV41_CELL_WIDE_FEED", v);
     // The feed's halves on their own (each overrides the feed's value for its half).
     if (envStr("DSV41_CELL_WIDE_SEED")) |v| config.expert_wide_seed = try cellBool("DSV41_CELL_WIDE_SEED", v);

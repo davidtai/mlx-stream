@@ -45,10 +45,6 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_warm_cancel(first: i64, count: i64) i64;
     pub extern fn q3ld_monotonic_ns() i64;
     pub extern fn q3ld_abi() i32;
-    pub extern fn q3ld_sched_config(mode: i32) c_int;
-    pub extern fn q3ld_keepwarm(on: i32) c_int;
-    pub extern fn q3ld_keepwarm_sleep(ns: i64) c_int;
-    pub extern fn q3ld_keepwarm_spins() i64;
     pub extern fn q3ld_counters_n() i32;
     pub extern fn q3ld_max_spec() i32;
     pub extern fn q3ld_max_pre() i32;
@@ -181,12 +177,8 @@ pub const Spec = struct {
 /// `busy_max` jobs run, on `tickets` tickets of their own at the top of the ring (demand wraps below them).
 pub const Warm = struct { tickets: u32, busy_max: u32 };
 
-/// The pool's scheduling, fixed at start (`sched.zig`).
-pub const Sched = @import("sched.zig").Sched;
-
 pub const Options = struct {
     workers: u32 = 4,
-    sched: Sched = .{},
     /// One page-aligned staging buffer per worker; 9 MiB holds a whole
     /// 8,877,056-byte gate/up span plus its page alignment.
     staging_bytes: u64 = 9 << 20,
@@ -336,8 +328,6 @@ pub const Pool = struct {
         if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
         var ptrs: [max_workers]u64 = undefined;
         for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
-        if (c.q3ld_sched_config(testSched(opt.sched).bits()) != 0) return error.PoolUnavailable;
-        if (c.q3ld_keepwarm_sleep(@as(i64, opt.sched.keep_warm_us) * std.time.ns_per_us) != 0) return error.PoolUnavailable;
         const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
         if (rc == -2) _ = c.q3ld_stop(); // fewer threads than asked: join the ones that started
         if (rc != 0) return if (rc == -1) error.PoolUnavailable else error.PoolStart;
@@ -360,16 +350,6 @@ pub const Pool = struct {
         a.free(self.log);
         a.free(self.published);
         a.destroy(self);
-    }
-
-    /// The keep-warm spinner on or off (`Sched.keep_warm` pools only: error otherwise).
-    pub fn keepWarm(_: *Pool, on: bool) !void {
-        if (c.q3ld_keepwarm(@intFromBool(on)) != 0) return error.PoolUnavailable;
-    }
-
-    /// The keep-warm spinner's loop count (0 without one).
-    pub fn keepWarmSpins(_: *const Pool) u64 {
-        return @intCast(@max(c.q3ld_keepwarm_spins(), 0));
     }
 
     /// Arms the event-gate class: the satisfied prefix goes to `object` (an
@@ -471,16 +451,6 @@ pub const Pool = struct {
 };
 
 /// The reader's monotonic clock (ns), the one its result words use.
-/// Test builds only: DSV41_TEST_READER_SCHED (a `Sched.parse` list) runs every pool a test starts with the default
-/// (stock) scheduling at that value, so the stream's bank tests prove each value reads the same bytes into the same
-/// rows; a test that asks for a scheduling itself keeps it.
-fn testSched(s: Sched) Sched {
-    if (comptime !@import("builtin").is_test) return s;
-    if (s.qos or s.qos_demand or s.spin or s.demand_first or s.keep_warm or s.start_ui) return s;
-    const v = std.c.getenv("DSV41_TEST_READER_SCHED") orelse return s;
-    return Sched.parse(std.mem.span(v)) orelse s;
-}
-
 pub fn monotonicNs() i64 {
     return c.q3ld_monotonic_ns();
 }

@@ -13,8 +13,6 @@ pub const Pool = io.Pool;
 pub const Records = io.Records;
 pub const UncachedFd = io.UncachedFd;
 pub const openUncached = io.openUncached;
-/// The read pool threads' scheduling (`Options.sched`).
-pub const Sched = io.Sched;
 pub const openUncachedFollowing = io.openUncachedFollowing;
 pub const max_range_components = io.max_range_components;
 pub const checkTopology = io.checkTopology;

@@ -536,10 +536,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             copy_only_ns: u64 = 0,
             selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null,
             preread: bool = false,
-            /// The pool's keep-warm spinner (`Sched.keep_warm`, bound at construction): on through the decode phase.
-            keep_warm: bool = false,
-            /// ... and held on through the prompt phase too (`Sched.keep_warm_prefill`): on from construction to deinit.
-            keep_warm_prefill: bool = false,
             /// Decode layer calls so far; a call's pre-reads and speculative records
             /// carry its tag, settled by its own step.
             clock: i64 = 0,
@@ -755,15 +751,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .wide_depth = opt.wide_depth,
                     .selector = selector,
                     .preread = if (opt.lookahead) |la| la.preread else false,
-                    .keep_warm = pool_opt.sched.keep_warm,
-                    .keep_warm_prefill = pool_opt.sched.keep_warm and pool_opt.sched.keep_warm_prefill,
                     .event_word = word,
                     .gated = opt.event != null,
                     .owner = std.Thread.getCurrentId(),
                     .ahead = .{ .loads = ahead_loads, .reads = ahead_reads, .parts = ahead_parts },
                     .warm = warm,
                 };
-                if (self.keep_warm_prefill) try pool.keepWarm(true);
                 return self;
             }
 
@@ -1484,7 +1477,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 // Decode routes take one window: no decode plan ever runs beside a live route's held slots (the decode
                 // policy has no held set; `shrink` restores the prompt's depth).
                 self.wide_depth = 1;
-                if (self.keep_warm) try self.pool.keepWarm(true);
                 self.route_lookahead = self.selector != null;
                 self.route_preread = self.route_lookahead and self.preread;
             }
@@ -1547,7 +1539,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     @memset(d.first, 0);
                 }
                 self.phase = .prefill;
-                if (self.keep_warm and !self.keep_warm_prefill) try self.pool.keepWarm(false);
                 self.route_lookahead = false;
                 self.route_preread = false;
                 if (self.memory == .mlx and before -| mlxActive() < bytes) {

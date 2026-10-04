@@ -9,7 +9,6 @@ const Pool = io.Pool;
 const Status = io.Status;
 const Spec = io.Spec;
 const Warm = io.Warm;
-const Sched = io.Sched;
 const max_items = io.max_items;
 const max_spec = io.max_spec;
 const max_pre = io.max_pre;
@@ -683,274 +682,36 @@ test "dsv41 io: the event class refuses a pool without it and bad arguments" {
     try testing.expectError(error.PreReadRefused, R96.armPreRead(pool, &spec_lens));
 }
 
-/// The pool threads as the kernel sees them (tests): each thread's QoS class and name.
+/// The pool threads as the kernel sees them (tests): how many carry a q3ld-* name.
 const ThreadProbe = struct {
     const mach_port_t = u32;
     extern "c" var mach_task_self_: mach_port_t;
     extern "c" fn task_threads(task: mach_port_t, list: *[*]mach_port_t, count: *u32) c_int;
     extern "c" fn pthread_from_mach_thread_np(port: mach_port_t) ?std.c.pthread_t;
-    extern "c" fn pthread_get_qos_class_np(t: std.c.pthread_t, qos: *c_uint, rel: *c_int) c_int;
     extern "c" fn pthread_getname_np(t: std.c.pthread_t, name: [*]u8, len: usize) c_int;
-    extern "c" fn pthread_self() std.c.pthread_t;
 
-    const user_interactive: c_uint = 0x21;
-    const utility: c_uint = 0x11;
-
-    const Seen = struct { demand: u32 = 0, demand_ui: u32 = 0, spec: u32 = 0, spec_utility: u32 = 0, spec_inherited: u32 = 0, watchdog: u32 = 0, watchdog_ui: u32 = 0, named: u32 = 0 };
-
-    fn qosOf(t: std.c.pthread_t) c_uint {
-        var q: c_uint = 0;
-        var rel: c_int = 0;
-        _ = pthread_get_qos_class_np(t, &q, &rel);
-        return q;
-    }
-
-    /// Every thread named q3ld-* with its QoS; printed one line each (QOSPROBE).
-    fn scan(label: []const u8) Seen {
+    fn named() u32 {
         var list: [*]mach_port_t = undefined;
         var n: u32 = 0;
-        var s: Seen = .{};
-        if (task_threads(mach_task_self_, &list, &n) != 0) return s;
+        var count: u32 = 0;
+        if (task_threads(mach_task_self_, &list, &n) != 0) return 0;
         for (list[0..n]) |port| {
             const t = pthread_from_mach_thread_np(port) orelse continue;
             var name: [64]u8 = @splat(0);
             _ = pthread_getname_np(t, &name, name.len);
-            const nm = std.mem.sliceTo(&name, 0);
-            if (!std.mem.startsWith(u8, nm, "q3ld-")) continue;
-            const q = qosOf(t);
-            std.debug.print("QOSPROBE {s}: \"{s}\" qos 0x{x}\n", .{ label, nm, q });
-            s.named += 1;
-            if (std.mem.startsWith(u8, nm, "q3ld-demand-")) {
-                s.demand += 1;
-                s.demand_ui += @intFromBool(q == user_interactive);
-            } else if (std.mem.startsWith(u8, nm, "q3ld-spec-")) {
-                s.spec += 1;
-                s.spec_utility += @intFromBool(q == utility);
-                s.spec_inherited += @intFromBool(q == qosOf(pthread_self()));
-            } else if (std.mem.eql(u8, nm, "q3ld-watchdog")) {
-                s.watchdog += 1;
-                s.watchdog_ui += @intFromBool(q == user_interactive);
-            }
+            if (std.mem.startsWith(u8, std.mem.sliceTo(&name, 0), "q3ld-")) count += 1;
         }
-        return s;
+        return count;
     }
 };
 
-test "dsv41 io: the reader scheduling sets each pool thread's QoS and name at start; off leaves them unnamed, inherited" {
-    // The bank sweep (DSV41_TEST_READER_SCHED) runs every pool at one value: this test reads all three itself.
-    if (std.c.getenv("DSV41_TEST_READER_SCHED") != null) return error.SkipZigTest;
+test "dsv41 io: the pool's threads keep the creating thread's class and are left unnamed" {
     const page = std.heap.pageSize();
-    for ([_]Sched{ .{}, .{ .qos = true }, .{ .qos = true, .spin = true }, .{ .demand_first = true }, .{ .qos = true, .spin = true, .demand_first = true }, .{ .qos_demand = true } }) |sched| {
-        var nb: [Sched.name_len]u8 = undefined;
-        const label = sched.name(&nb);
-        var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 64, .sched = sched, .spec = .{ .threads = 1, .slots = 1, .record_bytes = page, .chunk_bytes = page } });
-        defer pool.stop();
-        var word: i64 align(8) = 0;
-        try pool.armEvent(.host, @intFromPtr(&word), std.time.ns_per_s, 0);
-        // Each thread sets its class and name as its first act: poll until all four show (at most 1 s).
-        var seen: ThreadProbe.Seen = .{};
-        var tries: u32 = 0;
-        while (tries < 200) : (tries += 1) {
-            seen = ThreadProbe.scan(label);
-            if (!(sched.qos or sched.qos_demand) or seen.named == 4) break;
-            std.Io.sleep(testing.io, .fromMilliseconds(5), .awake) catch {};
-        }
-        std.debug.print("QOSPROBE {s}: self qos 0x{x}; demand {d} (UI {d}), spec {d} (UTILITY {d}), watchdog {d} (UI {d})\n", .{ label, ThreadProbe.qosOf(ThreadProbe.pthread_self()), seen.demand, seen.demand_ui, seen.spec, seen.spec_utility, seen.watchdog, seen.watchdog_ui });
-        if (sched.qos_demand) {
-            // qosdemand: demand + watchdog raised, the speculative worker at the creating thread's class (no UTILITY)
-            try testing.expectEqual(@as(u32, 2), seen.demand_ui);
-            try testing.expectEqual(@as(u32, 0), seen.spec_utility);
-            try testing.expectEqual(@as(u32, 1), seen.spec_inherited);
-            try testing.expectEqual(@as(u32, 1), seen.watchdog_ui);
-            try testing.expectEqual(@as(u32, 4), seen.named);
-        } else if (!sched.qos) {
-            try testing.expectEqual(@as(u32, 0), seen.named);
-        } else {
-            try testing.expectEqual(@as(u32, 2), seen.demand_ui);
-            try testing.expectEqual(@as(u32, 1), seen.spec_utility);
-            try testing.expectEqual(@as(u32, 1), seen.watchdog_ui);
-            try testing.expectEqual(@as(u32, 4), seen.named);
-        }
-    }
-}
-
-test "dsv41 io: keepwarm: the spinner runs only while switched on; a pool without it refuses the switch" {
-    var nb: [Sched.name_len]u8 = undefined;
-    try testing.expectEqual(@as(i32, 32), (Sched.parse("keepwarm").?).bits());
-    try testing.expectEqualStrings("qos,demandfirst,keepwarm", (Sched.parse("keepwarm,demandfirst,qos").?).name(&nb));
-    for ([_][]const u8{ "qos,spin,keepwarm", "keepwarm,keepwarm", "keepwarm0", "keepwarm1001", "keepwarmx" }) |bad| try testing.expect(Sched.parse(bad) == null);
-    try testing.expectEqualStrings("qos,demandfirst,keepwarm1000", (Sched.parse("qos,demandfirst,keepwarm1000").?).name(&nb));
-    try testing.expectEqual(@as(u16, 25), (Sched.parse("keepwarm25").?).keep_warm_us);
-    try testing.expect((Sched.parse("keepwarm25p").?).keep_warm_prefill and !(Sched.parse("keepwarm25").?).keep_warm_prefill);
-    try testing.expectEqualStrings("qos,demandfirst,keepwarm1000p", (Sched.parse("qos,demandfirst,keepwarm1000p").?).name(&nb));
-    try testing.expectEqualStrings("keepwarmp", (Sched.parse("keepwarmp").?).name(&nb));
-    for ([_][]const u8{ "keepwarm25pp", "keepwarmp25" }) |bad| try testing.expect(Sched.parse(bad) == null);
-    const page = std.heap.pageSize();
-    {
-        var plain = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 16 });
-        defer plain.stop();
-        try testing.expectError(error.PoolUnavailable, plain.keepWarm(true));
-    }
-    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 16, .sched = .{ .keep_warm = true } });
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 64, .spec = .{ .threads = 1, .slots = 1, .record_bytes = page, .chunk_bytes = page } });
     defer pool.stop();
-    const s0 = pool.keepWarmSpins();
-    std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch {};
-    try testing.expectEqual(s0, pool.keepWarmSpins());
-    try pool.keepWarm(true);
-    std.Io.sleep(testing.io, .fromMilliseconds(20), .awake) catch {};
-    try pool.keepWarm(false);
-    const s1 = pool.keepWarmSpins();
-    try testing.expect(s1 > s0 + 1000);
-    std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch {};
-    // At most the iteration in flight at the switch.
-    try testing.expect(pool.keepWarmSpins() <= s1 + 1);
-}
-
-test "dsv41 io: startui: the pool's starting thread becomes USER_INTERACTIVE at start; without it the thread keeps its class" {
-    var nb: [Sched.name_len]u8 = undefined;
-    try testing.expectEqualStrings("qos,startui,keepwarm25", (Sched.parse("keepwarm25,startui,qos").?).name(&nb));
-    try testing.expectEqual(@as(i32, 64 | 32 | 1), (Sched.parse("qos,startui,keepwarm25").?).bits());
-    try testing.expectEqualStrings("qosdemand,demandfirst,startui,keepwarm1000p", (Sched.parse("keepwarm1000p,startui,demandfirst,qosdemand").?).name(&nb));
-    const Run = struct {
-        sched: Sched,
-        before: c_uint = 0,
-        after: c_uint = 0,
-        err: ?anyerror = null,
-        fn go(r: *@This()) void {
-            r.before = ThreadProbe.qosOf(ThreadProbe.pthread_self());
-            var pool = Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = std.heap.pageSize(), .tickets = 16, .sched = r.sched }) catch |e| {
-                r.err = e;
-                return;
-            };
-            r.after = ThreadProbe.qosOf(ThreadProbe.pthread_self());
-            pool.stop();
-        }
-    };
-    var on: Run = .{ .sched = .{ .start_ui = true } };
-    const t1 = try std.Thread.spawn(.{}, Run.go, .{&on});
-    t1.join();
-    if (on.err) |e| return e;
-    try testing.expect(on.before != ThreadProbe.user_interactive);
-    try testing.expectEqual(ThreadProbe.user_interactive, on.after);
-    var off: Run = .{ .sched = .{ .keep_warm = true } };
-    const t2 = try std.Thread.spawn(.{}, Run.go, .{&off});
-    t2.join();
-    if (off.err) |e| return e;
-    try testing.expectEqual(off.before, off.after);
-}
-
-test "dsv41 io: keepwarm<us>: the thread sleeps that long per loop instead of spinning" {
-    const page = std.heap.pageSize();
-    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 16, .sched = .{ .keep_warm = true, .keep_warm_us = 100 } });
-    defer pool.stop();
-    const s0 = pool.keepWarmSpins();
-    try pool.keepWarm(true);
-    std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
-    try pool.keepWarm(false);
-    const loops = pool.keepWarmSpins() - s0;
-    // 50 ms of 100 us sleeps: some loops, and far fewer than a yield loop's millions.
-    try testing.expect(loops > 20 and loops < 1000);
-}
-
-test "dsv41 io: the reader scheduling list: off or qos, spin, demandfirst (spin only with qos), and the pool refuses spin alone" {
-    var nb: [Sched.name_len]u8 = undefined;
-    try testing.expectEqualStrings("off", (Sched.parse("off").?).name(&nb));
-    try testing.expectEqualStrings("qos,spin,demandfirst", (Sched.parse("demandfirst,spin,qos").?).name(&nb));
-    try testing.expectEqual(@as(i32, 5), (Sched.parse("qos,demandfirst").?).bits());
-    for ([_][]const u8{ "spin", "qos,qos", "qos,fast", "", "QOS" }) |bad| try testing.expect(Sched.parse(bad) == null);
-    // qosdemand: its own bit, named after qos, refused with qos and with spin; the C pool refuses the pair as well
-    try testing.expectEqualStrings("qosdemand", (Sched.parse("qosdemand").?).name(&nb));
-    try testing.expectEqual(@as(i32, 8), (Sched.parse("qosdemand").?).bits());
-    try testing.expectEqualStrings("qosdemand,demandfirst", (Sched.parse("demandfirst,qosdemand").?).name(&nb));
-    try testing.expectEqual(@as(i32, 12), (Sched.parse("qosdemand,demandfirst").?).bits());
-    for ([_][]const u8{ "qos,qosdemand", "qosdemand,spin", "qosdemand,qosdemand", "qosdemand," }) |bad| try testing.expect(Sched.parse(bad) == null);
-    try testing.expectError(error.PoolUnavailable, Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = std.heap.pageSize(), .tickets = 16, .sched = .{ .qos = true, .qos_demand = true } }));
-    try testing.expectError(error.PoolUnavailable, Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = std.heap.pageSize(), .tickets = 16, .sched = .{ .spin = true } }));
-}
-
-test "dsv41 io: demand first: no unclaimed speculative chunk starts while a demand job executes; the record lands after it" {
-    const page = std.heap.pageSize();
-    var f = try PatternFile.init(64 * page);
-    defer f.deinit();
-    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 128, .sched = .{ .demand_first = true }, .spec = .{ .threads = 1, .slots = 2, .record_bytes = spec_rec_len, .chunk_bytes = page } });
-    defer pool.stop();
-    defer clearFaults();
-    // The demand job's first read sleeps 80 ms (a demand job executing), during which a record is queued for speculation.
-    const base: u64 = 2 * page;
-    injectFault(base / page * page, 5, 80 * std.time.ns_per_ms);
-    var d = try Dests.init(1, &spec_lens);
-    defer testing.allocator.free(d.buf);
-    const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
-    std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch {};
-    const spec_base: u64 = 30 * page + 7;
-    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{@intCast(spec_base)}, spec_rec_len));
-    std.Io.sleep(testing.io, .fromMilliseconds(30), .awake) catch {};
-    // Still executing: nothing speculative started.
-    try testing.expectEqual(@as(i64, 0), pool.counter(.spec_chunks));
-    try pool.wait(first, 2, 10 * std.time.ns_per_s);
-    try d.expectRecord(0, f.image, base, base + spec_gu_len, &spec_lens);
-    try waitFor(@as(i64, @intCast(spec_base)), landedAt);
-    try testing.expectEqual(@as(i64, 0), pool.counter(.max_busy_at_start));
-}
-
-test "dsv41 io: qos: a claimed speculative record's worker runs at the demand class while claimed" {
-    if (std.c.getenv("DSV41_TEST_READER_SCHED") != null) return error.SkipZigTest;
-    const page = std.heap.pageSize();
-    var f = try PatternFile.init(64 * page);
-    defer f.deinit();
-    // A record of three page chunks (the demand ranges inside its first page) whose second and third chunks each sleep
-    // 800 ms: claimed during the second, so the worker promotes itself at the third chunk's boundary. Both checks poll
-    // for the state (a loaded box schedules the UTILITY worker late) and end on the chunk count, not on a sleep.
-    const rec = 3 * page;
-    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 128, .sched = .{ .qos = true }, .spec = .{ .threads = 1, .slots = 2, .record_bytes = rec, .chunk_bytes = page } });
-    defer pool.stop();
-    defer clearFaults();
-    const base: u64 = 20 * page;
-    injectFaults(&.{ @intCast(base + page), @intCast(base + 2 * page) }, &.{ 5, 5 }, &.{ 800 * std.time.ns_per_ms, 800 * std.time.ns_per_ms });
-    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{@intCast(base)}, rec));
-    const SpecQos = struct {
-        fn of() ?c_uint {
-            var list: [*]ThreadProbe.mach_port_t = undefined;
-            var n: u32 = 0;
-            if (ThreadProbe.task_threads(ThreadProbe.mach_task_self_, &list, &n) != 0) return null;
-            for (list[0..n]) |port| {
-                const t = ThreadProbe.pthread_from_mach_thread_np(port) orelse continue;
-                var name: [64]u8 = @splat(0);
-                _ = ThreadProbe.pthread_getname_np(t, &name, name.len);
-                if (std.mem.eql(u8, std.mem.sliceTo(&name, 0), "q3ld-spec-0")) return ThreadProbe.qosOf(t);
-            }
-            return null;
-        }
-        fn is(want: c_uint) bool {
-            return of() == want;
-        }
-    };
-    // Unclaimed: the worker has named itself and set UTILITY (its first chunk is unclaimed; the claim is not yet made).
-    try waitFor(ThreadProbe.utility, SpecQos.is);
-    try testing.expectEqual(@as(i64, 0), pool.counter(.claimed));
-    var d = try Dests.init(1, &spec_lens);
-    defer testing.allocator.free(d.buf);
-    const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
-    if (pool.counter(.spec_chunks) >= 2) {
-        // The claim landed after the second chunk ended (the test thread stalled > 800 ms): no boundary left to promote at.
-        std.debug.print("QOSPROBE skipped: the claim came after the second chunk (box loaded)\n", .{});
-        try pool.wait(first, 2, 10 * std.time.ns_per_s);
-        return error.SkipZigTest;
-    }
-    // Claimed: the worker reaches USER_INTERACTIVE before its third (claimed) chunk ends.
-    var seen: ?c_uint = null;
-    var t: u32 = 0;
-    while (pool.counter(.spec_chunks) < 3) : (t += 1) {
-        if (t > 10_000) return error.Timeout;
-        seen = SpecQos.of();
-        if (seen == ThreadProbe.user_interactive) break;
-        std.Io.sleep(testing.io, .fromMilliseconds(1), .awake) catch {};
-    }
-    std.debug.print("QOSPROBE claimed: \"q3ld-spec-0\" qos 0x{x}\n", .{seen orelse 0});
-    try testing.expectEqual(@as(?c_uint, ThreadProbe.user_interactive), seen);
-    try pool.wait(first, 2, 10 * std.time.ns_per_s);
-    try d.expectRecord(0, f.image, base, base + spec_gu_len, &spec_lens);
-    try testing.expectEqual(@as(i64, 1), pool.counter(.claimed));
+    var word: i64 align(8) = 0;
+    try pool.armEvent(.host, @intFromPtr(&word), std.time.ns_per_s, 0);
+    try testing.expectEqual(@as(u32, 0), ThreadProbe.named());
 }
 
 // ── The reader's C ABI at its edges. Deterministic by construction: a worker is held at a pre-range's bind point (a
@@ -1074,8 +835,6 @@ test "dsv41 io cov: the stopped pool's configuration refuses bad arguments; the 
         .{ .slot = pg, .chunk = pg, .ctr = false },
     }) |b| try testing.expectEqual(@as(c_int, -1), c.q3ld_spec_config(b.t, &bufs, b.n, b.slot, b.rec, b.chunk, if (b.ctr) &counters else null));
     for ([_]i32{ -1, 2 }) |v| try testing.expectEqual(@as(c_int, -1), c.q3ld_spec_streams(v));
-    // Out of range, spin without qos, qos with qosdemand.
-    for ([_]i32{ -1, 16, 2, 9 }) |m| try testing.expectEqual(@as(c_int, -1), c.q3ld_sched_config(m));
 
     var res_arr: [16 * res_w]i64 = @splat(0);
     var log_arr: [16]i64 = @splat(0);
@@ -1099,7 +858,6 @@ test "dsv41 io cov: the stopped pool's configuration refuses bad arguments; the 
     try testing.expectEqual(@as(c_int, -1), c.q3ld_start(1, &staging, pg, pg, &res_arr, 16, &log_arr, 16, &gauge));
     try testing.expectEqual(@as(c_int, -1), c.q3ld_spec_config(0, null, 0, 0, 0, 0, &counters));
     try testing.expectEqual(@as(c_int, -1), c.q3ld_spec_streams(0));
-    try testing.expectEqual(@as(c_int, -1), c.q3ld_sched_config(0));
     try testing.expectEqual(@as(c_int, 0), c.q3ld_stop());
     try testing.expectEqual(@as(c_int, -1), c.q3ld_start(1, &staging, pg, pg, &res_arr, 16, &log_arr, 16, &gauge));
 }
@@ -1519,12 +1277,11 @@ test "dsv41 io cov: a gate forced before its ticket lands ignores the late publi
     try testing.expectEqual(@as(i64, 0), pool.counter(.ev_wd_forced));
 }
 
-test "dsv41 io cov: qos with spin reads a record and waits through the spin; the test event log names submit, start and the spec delay hook" {
-    if (std.c.getenv("DSV41_TEST_READER_SCHED") != null) return error.SkipZigTest;
+test "dsv41 io cov: a pool reads a record; the test event log names submit, start and the spec delay hook" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(16 * page);
     defer f.deinit();
-    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = 4 * page, .tickets = 32, .sched = .{ .qos = true, .spin = true } });
+    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = 4 * page, .tickets = 32 });
     defer pool.stop();
     const Log = struct {
         var buf: [5 * 16]i64 = undefined;
@@ -1806,48 +1563,4 @@ test "dsv41 io cov: a file shorter than its job's size, ending inside a range's 
     };
     try testing.expectEqual(Status.short, pool.result(0).status);
     try testing.expectEqual(@as(i64, 200), pool.result(0).payload);
-}
-
-fn namedDemand1(_: void) bool {
-    return ThreadProbe.scan("testsched").demand >= 1;
-}
-
-test "dsv41 io cov: DSV41_TEST_READER_SCHED runs a stock pool at its value (threads named); a malformed value leaves the stock pool" {
-    if (std.c.getenv("DSV41_TEST_READER_SCHED") != null) return error.SkipZigTest;
-    const env = struct {
-        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-    };
-    defer _ = env.unsetenv("DSV41_TEST_READER_SCHED");
-    const page = std.heap.pageSize();
-    _ = env.setenv("DSV41_TEST_READER_SCHED", "qos,qos", 1);
-    {
-        var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 16 });
-        defer pool.stop();
-        try testing.expectEqual(@as(u32, 0), ThreadProbe.scan("testsched-bad").named);
-    }
-    _ = env.setenv("DSV41_TEST_READER_SCHED", "qos", 1);
-    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 16 });
-    defer pool.stop();
-    try waitFor({}, namedDemand1);
-}
-
-// The spin mode's lock-free reads of the queue length and the stop flag race the writers' stores unless both sides are
-// atomic: this drives both against spinning workers. A ThreadSanitizer build of the pool (the coverage hook with a
-// -fsanitize=thread object) reports any such race here; the plain build checks the bytes.
-test "dsv41 io cov: spin mode: submits and a stop against spinning workers land every job" {
-    if (std.c.getenv("DSV41_TEST_READER_SCHED") != null) return error.SkipZigTest;
-    const page = std.heap.pageSize();
-    var f = try PatternFile.init(32 * page);
-    defer f.deinit();
-    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 64, .sched = .{ .qos = true, .spin = true } });
-    defer pool.stop();
-    var d = try Dests.init(1, &spec_lens);
-    defer testing.allocator.free(d.buf);
-    for (0..200) |i| {
-        const base: u64 = (i % 20) * page + i;
-        const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
-        try pool.wait(first, 2, 10 * std.time.ns_per_s);
-        try d.expectRecord(0, f.image, base, base + spec_gu_len, &spec_lens);
-    }
 }

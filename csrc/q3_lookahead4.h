@@ -93,10 +93,6 @@ int q3ld_submit_warm(int32_t fd, int64_t file_size, int32_t n, int32_t ngu, int3
 /* Queued warm jobs overlapping tickets [first, first + count) published skipped. Tickets published, -1 off. */
 int64_t q3ld_warm_cancel(int64_t first, int64_t count);
 int32_t q3ld_abi(void);                     /* 2026100201 */
-/* SCHED, a stopped pool before q3ld_start, bits: 1 QoS (demand + watchdog USER_INTERACTIVE, speculative UTILITY) and
- * thread names, 2 a bounded spin before a demand worker or q3ld_wait sleeps (with 1 only), 4 demand first (no
- * unclaimed speculative chunk starts while a demand job is queued or executing). 0 = stock. 0 or -1. */
-int q3ld_sched_config(int32_t mode);
 int32_t q3ld_max_gates(void);
 int32_t q3ld_max_gate_tickets(void);
 int32_t q3ld_max_pre(void);
