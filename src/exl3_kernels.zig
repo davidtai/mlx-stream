@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "c408265f2739942404e355be63910e34a632e181e7861716db0fa0e5f56230f7";
+pub const manifest_sha256 = "dc50fb5d6df59e8cf8a0082aa27952a43948c4d22d389da90f3b26cbfbc2ff7f";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
@@ -1194,7 +1194,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 12), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 13), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));
@@ -1211,6 +1211,8 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     // served19j's union manifest lists both (every kernel and header of each unchanged)
     try testing.expect(reg.acceptsManifest("9033520a3565e84d0d3ece55ba5f9e0db096b7e27f7c955f6ed8de9acf26cdf9"));
     try testing.expect(reg.acceptsManifest("1aee687704d0009f85155621acdfb8917c7ba1446f652f5209b19028204beac4"));
+    // the published (minified) manifest lists the pretty-printed one it was written from, provenance fields included
+    try testing.expect(reg.acceptsManifest("c408265f2739942404e355be63910e34a632e181e7861716db0fa0e5f56230f7"));
     try testing.expect(reg.acceptsManifest(manifest_sha256));
     try testing.expect(!reg.acceptsManifest("0000000000000000000000000000000000000000000000000000000000000000"));
     // the member sites the RC tiers still run, a plan per M = 1..8 at each
@@ -1392,9 +1394,9 @@ test "dsv41 kernels: an unknown kernel name is refused" {
     const a = testing.allocator;
     try testing.expectEqual(@as(?Kernel, null), std.meta.stringToEnum(Kernel, "dsv41_exl3_mul1_k3_2304"));
     // A manifest naming a kernel this build lacks, pinned to itself, still refuses.
-    const needle = "\"name\": \"q3_moeprep_dpost\"";
+    const needle = "\"name\":\"q3_moeprep_dpost\"";
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, embedded.manifest, needle));
-    const m = try std.mem.replaceOwned(u8, a, embedded.manifest, needle, "\"name\": \"q3_moeprep_dpost_k2\"");
+    const m = try std.mem.replaceOwned(u8, a, embedded.manifest, needle, "\"name\":\"q3_moeprep_dpost_k2\"");
     defer a.free(m);
     var texts = embedded;
     texts.manifest = m;
@@ -1404,8 +1406,30 @@ test "dsv41 kernels: an unknown kernel name is refused" {
     try testing.expect(std.mem.indexOf(u8, diag.message(), "q3_moeprep_dpost_k2") != null);
 }
 
-/// `text` with the first occurrence of `needle` replaced (caller frees).
-fn replaceFirst(a: Allocator, text: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+/// A JSON snippet as the published (minified) manifest spells it: no whitespace outside string literals.
+fn minified(buf: []u8, s: []const u8) []const u8 {
+    var n: usize = 0;
+    var in_str = false;
+    var esc = false;
+    for (s) |ch| {
+        if (in_str) {
+            if (esc) esc = false else if (ch == '\\') esc = true else if (ch == '"') in_str = false;
+        } else if (ch == '"') {
+            in_str = true;
+        } else if (ch == ' ' or ch == '\n' or ch == '\t' or ch == '\r') continue;
+        buf[n] = ch;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// `text` with the first occurrence of `needle` replaced (caller frees). Needle and replacement are written readably
+/// and matched minified.
+fn replaceFirst(a: Allocator, text: []const u8, needle_: []const u8, replacement_: []const u8) ![]u8 {
+    var nb: [4096]u8 = undefined;
+    var rb: [4096]u8 = undefined;
+    const needle = minified(&nb, needle_);
+    const replacement = minified(&rb, replacement_);
     const at = std.mem.indexOf(u8, text, needle) orelse return error.NeedleMissing;
     return std.mem.concat(a, u8, &.{ text[0..at], replacement, text[at + needle.len ..] });
 }
@@ -1448,7 +1472,8 @@ test "dsv41 kernels: a static without its value is refused, by name (the K36 RMS
         try testing.expectEqualSlices(f64, &.{1e-20}, eps.domain.floats);
     }
     const eps_text = "\"floats\": [\n       1e-20\n      ],\n      \"kind\": \"values\"";
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, embedded.manifest, eps_text));
+    var eb: [256]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, embedded.manifest, minified(&eb, eps_text)));
     const Case = struct { replacement: []const u8 };
     for ([_]Case{
         .{ .replacement = "\"floats\": [],\n      \"kind\": \"values\"" }, // no value
@@ -1533,7 +1558,13 @@ test "dsv41 kernels: the DRAFTRC variants are their base texts at recorded templ
 }
 
 /// `text` with the first `needle` after `anchor` replaced (caller frees).
-fn replaceAfter(a: Allocator, text: []const u8, anchor: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+fn replaceAfter(a: Allocator, text: []const u8, anchor_: []const u8, needle_: []const u8, replacement_: []const u8) ![]u8 {
+    var ab: [4096]u8 = undefined;
+    var nb: [4096]u8 = undefined;
+    var rb: [4096]u8 = undefined;
+    const anchor = minified(&ab, anchor_);
+    const needle = minified(&nb, needle_);
+    const replacement = minified(&rb, replacement_);
     const from = std.mem.indexOf(u8, text, anchor) orelse return error.NeedleMissing;
     const at = from + (std.mem.indexOf(u8, text[from..], needle) orelse return error.NeedleMissing);
     return std.mem.concat(a, u8, &.{ text[0..at], replacement, text[at + needle.len ..] });
