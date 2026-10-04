@@ -152,8 +152,8 @@ test "dsv41 io: injected faults map to status words" {
         .{ .code = 3, .arg = 0, .hit = .down0, .want = .{ .ok, .ok, .short, .skipped } },
         // 4 truncated past the skip: 200 bytes land, the range continues.
         .{ .code = 4, .arg = 700, .hit = .gu1, .want = .{ .ok, .ok, .ok, .ok }, .hit_calls = 2 },
-        // 4 truncated inside the skip: no progress, the same request is retried.
-        .{ .code = 4, .arg = 300, .hit = .gu1, .want = .{ .ok, .ok, .ok, .ok }, .hit_calls = 2 },
+        // 4 truncated inside the skip: no byte past it, the range ends short (never a retry of the same request).
+        .{ .code = 4, .arg = 300, .hit = .gu1, .want = .{ .ok, .short, .skipped, .skipped } },
     };
     for (cases, 0..) |cs, round| {
         // Each range on its own page, 500 bytes in, so a rule's aligned offset names one range.
@@ -1791,8 +1791,7 @@ test "dsv41 io cov: KNOWN BUG: a refused pre-read re-arm (a negative length) lea
     try testing.expect(pool.counter(.pre_bound) >= 1);
 }
 
-test "dsv41 io cov: KNOWN BUG: a file shorter than its job's size, ending inside a range's page, retries one preadv forever" {
-    try knownBug("run_range retries a preadv that returns no byte past the skip (0 < r <= skip) without bound: a real end of file inside the page (the file shorter than the size the job carries) spins the worker until its descriptor closes");
+test "dsv41 io cov: a file shorter than its job's size, ending inside a range's page, ends the range short (no retry spin)" {
     const page = std.heap.pageSize();
     // The file ends 300 bytes into its second page; the job carries the four pages it had when opened.
     var f = try PatternFile.init(page + 300);

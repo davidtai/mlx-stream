@@ -23,7 +23,7 @@
  *   claim the demand submit would make ~0.3 ms later; a QUEUED one is cancelled and the bytes pre-read instead, as the
  *   submit would read them); otherwise its GU range and DOWN range are queued as PRE-RANGES (every GU first, then every
  *   DOWN: the stock batch-fill order).  A demand worker with no job queued takes the oldest pre-range and runs the
- *   STOCK range loop (run_range: aligned F_NOCACHE preadv into ITS OWN 9 MiB staging buffer, padding retry, short-read
+ *   STOCK range loop (run_range: aligned F_NOCACHE preadv into ITS OWN 9 MiB staging buffer, short-read
  *   continuation, the same syscalls and bytes) up to the first scatter copy, where it waits for the range's rows.
  *   q3ld_submit BINDS each job range (fd, offset, component lengths all equal; job without a deadline) to its pre-range:
  *   in flight / waiting -> the rows are attached and that worker scatters and finishes the loop; still QUEUED -> the
@@ -550,7 +550,7 @@ static int run_range(const job_t *job, const range_t *rg, char *stage, int64_t *
             if (r < 0) { out[4] = errno; status = ST_OSERR; break; }
             returned += r;
             if (LATE(job->deadline)) { status = ST_DEADLINE; break; }
-            if (r <= 0 || r > skip) break;
+            break;   /* a read with no byte past the skip ends the range short below: the file ends inside it */
         }
         if (status) break;
         int64_t payload = r - skip;
@@ -612,7 +612,7 @@ static int run_range_pre(const job_t *job, pre_t *pr, char *stage, int64_t *out)
             if (r < 0) { out[4] = errno; status = ST_OSERR; break; }
             returned += r;
             if (LATE(job->deadline)) { status = ST_DEADLINE; break; }
-            if (r <= 0 || r > skip) break;
+            break;   /* a read with no byte past the skip ends the range short below: the file ends inside it */
         }
         if (status) break;
         int64_t payload = r - skip;
