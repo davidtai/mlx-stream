@@ -299,3 +299,82 @@ test "dsv41 slot cache: the LRU policy keeps every routed id's rows its record's
     try testing.expectEqual(@as(u64, 0), cache.stats.transient_loads);
     try testing.expectEqual(@as(usize, 8), cache.policies[0].residents().len);
 }
+
+fn cacheInitDeinit(a: std.mem.Allocator, policy: xsc.PolicyKind) !void {
+    const cache = try Cache.init(a, .{ .n_experts = 12, .policy = policy, .components = &test_comps, .capacity = &.{ 2, 3 }, .transient = 6 }, .none, null);
+    cache.deinit();
+}
+
+test "dsv41 slot cache: the geometry's every bound and a missing file are refused by name" {
+    const a = testing.allocator;
+    var ten: [10]Component = undefined;
+    for (&ten) |*c| c.* = test_comps[0];
+    const Bad = struct { comps: []const Component, cap: []const u32, transient: u32 };
+    for ([_]Bad{
+        .{ .comps = &test_comps, .cap = &.{}, .transient = 2 }, // no group
+        .{ .comps = &.{}, .cap = &.{1}, .transient = 2 }, // no component
+        .{ .comps = &ten, .cap = &.{1}, .transient = 2 }, // past max_components
+        .{ .comps = &test_comps, .cap = &.{1}, .transient = 0 }, // no transient row
+        .{ .comps = &test_comps, .cap = &.{1}, .transient = expert_policy.max_route_ids + 1 },
+    }) |b| try testing.expectError(error.CacheGeometry, Cache.init(a, .{ .n_experts = 64, .components = b.comps, .capacity = b.cap, .transient = b.transient }, .none, null));
+    const cache = try Cache.init(a, .{ .n_experts = 8, .components = &test_comps, .capacity = &.{1}, .transient = 2 }, .none, null);
+    defer cache.deinit();
+    try testing.expectError(error.NotFound, cache.openFile("/nonexistent/cov-d/shard.safetensors"));
+    // The trace backend (no memory) seeds and routes without reading.
+    try testing.expectEqual(@as(u32, 1), try cache.seed(0, &.{ 5, 6 }));
+    var slots: [2]u32 = undefined;
+    try cache.route(0, &.{ 5, 7 }, &slots);
+    try testing.expectEqual(@as(?u32, 0), cache.slotOf(0, 5));
+    try testing.expectEqual(@as(u64, 0), cache.stats.expert_bytes_read);
+}
+
+test "dsv41 slot cache: a seed whose read fails forgets what it admitted; the route after it reads again" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a, 1, 6, &test_comps, 9);
+    defer fx.deinit(a);
+    var pool = try expert_io.Pool.start(a, .{ .workers = 2, .staging_bytes = 4 * std.heap.pageSize(), .tickets = 64 });
+    defer pool.stop();
+    const cache = try Cache.init(a, .{ .n_experts = 6, .components = &test_comps, .capacity = &.{2}, .transient = 4 }, .host, pool);
+    defer cache.deinit();
+    const f = try cache.openFile(fx.path);
+    for (0..6) |e| for (0..test_comps.len) |k| cache.setLoc(0, e, k, .{ .file = f, .offset = fx.offsets[e * test_comps.len + k] });
+    try cache.checkLocs();
+    // The file is emptied under the open descriptor: every read finds its end at once (short).
+    try testing.expectEqual(@as(c_int, 0), c_truncate(fx.path.ptr, 0));
+    try testing.expectError(error.ReadFailed, cache.seed(0, &.{ 1, 2 }));
+    try testing.expectEqual(@as(?u32, null), cache.slotOf(0, 1));
+    try testing.expectEqual(@as(?u32, null), cache.slotOf(0, 2));
+    // A failed read is not a latched cache (it saw every job land): with the file whole again the same ids read.
+    try tmpRewrite(&fx);
+    try testing.expectEqual(@as(u32, 2), try cache.seed(0, &.{ 1, 2 }));
+    for ([_]u16{ 1, 2 }) |e| for (0..test_comps.len) |k| {
+        try testing.expectEqualSlices(u8, fx.part(&test_comps, 6, 0, e, k), cache.row(0, k, cache.slotOf(0, e).?));
+    };
+    // forgetAll: nothing resident until read again.
+    try cache.forgetAll();
+    try testing.expectEqual(@as(?u32, null), cache.slotOf(0, 1));
+}
+
+extern "c" fn truncate(path: [*:0]const u8, len: i64) c_int;
+const c_truncate = truncate;
+
+fn tmpRewrite(fx: *Fixture) !void {
+    const fd = std.c.open(fx.path.ptr, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = std.c.close(fd);
+    var done: usize = 0;
+    while (done < fx.image.len) {
+        const n = std.c.pwrite(fd, fx.image[done..].ptr, fx.image.len - done, @intCast(done));
+        if (n <= 0) return error.WriteFailed;
+        done += @intCast(n);
+    }
+}
+
+test "dsv41 slot cache: KNOWN BUG: an allocation failure in a planner surfaces from the cache's construction as CacheGeometry" {
+    if (std.c.getenv("DSV41_COV_KNOWN_BUGS") == null) {
+        std.debug.print("KNOWN BUG (skipped; DSV41_COV_KNOWN_BUGS=1 runs it): Cache.init reports a planner's OutOfMemory as CacheGeometry\n", .{});
+        return error.SkipZigTest;
+    }
+    try std.testing.checkAllAllocationFailures(testing.allocator, cacheInitDeinit, .{.shipped});
+    try std.testing.checkAllAllocationFailures(testing.allocator, cacheInitDeinit, .{.lru});
+}

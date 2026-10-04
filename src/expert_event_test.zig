@@ -177,3 +177,19 @@ test "dsv41 event 0b: a gate whose bytes never land is forced, so the GPU never 
     try testing.expect(r.ms >= 150 and r.ms < 5000);
     try testing.expectEqual(@as(i64, 1), pool.counter(.ev_wd_forced));
 }
+
+test "dsv41 event: a refused host event names its reason; the shim's counters count every event made (no device)" {
+    var word: i64 align(8) = 0;
+    const before = stats();
+    try testing.expectError(error.EventUnavailable, createHost(&word, -1));
+    try testing.expect(std.mem.indexOf(u8, event.lastError(), "positive timeout") != null);
+    const ev = try createHost(&word, std.time.ns_per_s);
+    const after = stats();
+    try testing.expectEqual(before.events + 1, after.events);
+    // No wait or signal ran: the device-side counters did not move.
+    try testing.expectEqual(before.gpu_waits, after.gpu_waits);
+    try testing.expectEqual(before.gpu_signals, after.gpu_signals);
+    try testing.expectEqual(@as(u64, 0), signaledValue(ev));
+    // An unknown id reads 0.
+    try testing.expectEqual(@as(u64, 0), signaledValue(.{ .id = 1 << 30, .object = 0 }));
+}

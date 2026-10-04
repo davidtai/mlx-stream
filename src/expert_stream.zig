@@ -2639,3 +2639,47 @@ test "dsv41 stream: decode_first16 re-arms its pool and its clock for the next r
         _ = try s.regrowTransient();
     }
 }
+
+fn streamInitDeinit(a: std.mem.Allocator, sb: *const SynthBank, opt: Options) !void {
+    const s = try Stream.init(a, &sb.bank, opt);
+    s.deinit();
+}
+
+// The construction's every allocation (the stream's, its layers', the selector's, the warm and decode-pool state's and
+// the read pool's) failed in turn: each failure unwinds to error.OutOfMemory with nothing leaked and the pool stopped.
+test "dsv41 stream: KNOWN BUG: an allocation failure in the decode pool's construction leaks its earlier arrays" {
+    if (std.c.getenv("DSV41_COV_KNOWN_BUGS") == null) {
+        std.debug.print("KNOWN BUG (skipped; DSV41_COV_KNOWN_BUGS=1 runs it): Stream.init builds DPool's six arrays in one struct literal; the errdefer is installed after it\n", .{});
+        return error.SkipZigTest;
+    }
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    try std.testing.checkAllAllocationFailures(testing.allocator, streamInitDeinit, .{ &sb, Options{
+        .rows = &.{ 4, 2 },
+        .max_route_ids = 12,
+        .transient_rows = 2 * 12,
+        .wide_depth = 2,
+        .pool = la_pool,
+        .lookahead = .{ .k = 6, .budget = 2, .chunks = 1 },
+        .event = .{ .watchdog_ms = 10_000 },
+        .transient_release = true,
+        .first_verify_warm = .{ .max_records = 8, .busy_max = 1 },
+        .decode_pool = .{ .per_layer = 2, .from_cycle = 2, .at_cycle = 4 },
+    } });
+}
+
+test "dsv41 stream: every allocation failure of the construction unwinds (lookahead, gates, wide depth, warm, transient release)" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    try std.testing.checkAllAllocationFailures(testing.allocator, streamInitDeinit, .{ &sb, Options{
+        .rows = &.{ 4, 2 },
+        .max_route_ids = 12,
+        .transient_rows = 2 * 12,
+        .wide_depth = 2,
+        .pool = la_pool,
+        .lookahead = .{ .k = 6, .budget = 2, .chunks = 1 },
+        .event = .{ .watchdog_ms = 10_000 },
+        .transient_release = true,
+        .first_verify_warm = .{ .max_records = 8, .busy_max = 1 },
+    } });
+}
