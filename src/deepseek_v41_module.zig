@@ -2042,17 +2042,10 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
         .preallocate = false,
         .slot_memory = slot_memory,
         .draft_pruned_bytes = 0,
-        .lookahead = lookaheadFor(config),
+        .lookahead = lookahead,
         .ceiling = ceiling,
         .wide_depth = config.dsv41WideDepth(),
     };
-}
-
-/// The read-ahead at the config's speculative budget (`expert_lookahead_budget`; the bill reads the same options).
-pub fn lookaheadFor(config: *const settings.Config) expert_stream.Lookahead {
-    var la = lookahead;
-    la.budget = config.dsv41LookaheadBudget();
-    return la;
 }
 
 /// The fill's shape and target (the bill module's), re-exported for the module's callers.
@@ -2279,22 +2272,6 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     try std.testing.expect(!try layerMajor(&c));
     // Cold rows keep the per-group base calls (the deferred call is off with them).
     try std.testing.expectEqual(xp.Wide{ .cold_rows = 2 }, wideRoute(&c));
-}
-
-test "dsv41 module: the read-ahead's speculative budget: 2 unless set, the stream and the staging bill read the setting" {
-    var c: settings.Config = undefined;
-    c.expert_lookahead_budget = null;
-    try std.testing.expectEqual(lookahead, lookaheadFor(&c));
-    c.expert_lookahead_budget = 1;
-    const la = lookaheadFor(&c);
-    try std.testing.expectEqual(@as(u32, 1), la.budget);
-    try std.testing.expectEqual(lookahead.k, la.k);
-    try std.testing.expectEqual(lookahead.chunks, la.chunks);
-    try std.testing.expectEqual(lookahead.preread, la.preread);
-    // the staging charge follows the budget (2 x budget slots): budget 1 bills two slots fewer
-    const f = bill_mod.fill_fixture;
-    const slot = std.mem.alignForward(u64, f.record, 16384) + 2 * 16384;
-    try std.testing.expectEqual(2 * slot, expert_admission.lookaheadCharge(f.record, 2 * lookahead.budget, 16384) - expert_admission.lookaheadCharge(f.record, 2 * la.budget, 16384));
 }
 
 test "dsv41 module: A0 (a): the first verify's warm reads are off unless the route is set, and the transient release's resolver is apart" {
