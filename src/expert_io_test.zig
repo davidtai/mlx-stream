@@ -1716,8 +1716,7 @@ test "dsv41 io cov: an in-flight record parks (class 1) or pauses (class 0) when
     try testing.expectEqual(@as(i64, 1), pool.counter(.claimed_inflight));
 }
 
-test "dsv41 io cov: KNOWN BUG: q3ld_stop never wakes a pre-range waiting at its bind point (only a quiesce does)" {
-    try knownBug("q3ld_stop broadcasts work_cv and spec_cv but not pre_cv: a worker held at a pre-range's bind point is never joined");
+test "dsv41 io cov: q3ld_stop alone wakes and joins a worker held at a pre-range's bind point" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(64 * page);
     defer f.deinit();

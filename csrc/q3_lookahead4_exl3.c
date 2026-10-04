@@ -1714,6 +1714,7 @@ int q3ld_stop(void) {
     stopping = 1;
     pthread_cond_broadcast(&work_cv);
     pthread_cond_broadcast(&spec_cv);
+    pthread_cond_broadcast(&pre_cv);             /* PRE: a worker held at an unbound range's bind point drops it */
     pthread_mutex_unlock(&mu);
     for (int i = 0; i < nworkers; i++) pthread_join(threads[i], 0);
     for (int i = 0; i < nspec_started; i++) pthread_join(spec_threads[i], 0);
