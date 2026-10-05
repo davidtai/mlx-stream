@@ -3921,3 +3921,44 @@ test "dsv41 served cell: a ring lever moves only the bill's KV line, its wiring 
     try testing.expectEqual(b0.prefillTotal() + (b1.kv - b0.kv) + (wire_p - b0.prefillTerms().wire_tables), b1.prefillTotal());
     try testing.expectEqual(b0.decodeTotal() + (b1.kv_decode - b0.kv_decode) + (wire_d - b0.decodeTerms().wire_tables), b1.decodeTotal());
 }
+
+// pass3ef (cx4, 16K, ctx 17,472, server 9ccf4eb2 at 131 / 165 rows, baseline 9,523,232,768 B): the labelled cached repeat of
+// the 16K request (full-prefix reuse, 16,383 kept, one token forwarded) refused its reverse change: the bound then
+// charged the kept state AND a cold prompt's whole wave (88,926,716,632 B) against the settled footprint
+// 88,988,658,776 B (margin -61,942,144 B), and latched the server. A continuation allocates its own call's wave, and a
+// fresh prompt drops the kept state before the settle: both bounds hold that footprint with room.
+test "dsv41 memory: the reverse change's bound follows the coming request: a 16K full-prefix reuse holds the settled footprint (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ceiling: u64 = 120_259_084_288;
+    var config = try host_bridge.loadConfig(testing.io, a, bank_dir);
+    config.memory_baseline_bytes = 9_523_232_768;
+    config.max_context_tokens = 17_472;
+    config.expert_prefill_rows = 131;
+    config.expert_rows = 165;
+    const b = try bill_mod.servedBill(a, testing.io, &config, null, ceiling, .{});
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const terms = b.prefillTerms();
+    const scratch: u64 = b.transient_rows * (b.slot_prefill / (@as(u64, c.n_layers) * b.prefill_rows + b.transient_rows));
+    const tc: module.TurnCall = .{ .pb = try bill_mod.servedPrefillBill(&config, .{}, &c, b.variant), .layer_major = config.dsv41LayerMajor(), .joinless = bill_mod.joinlessRoute(.{}) };
+    const settled: u64 = 88_988_658_776;
+    const kept_old = module.reverseBound(terms, scratch) + terms.kv;
+    const full_reuse = module.reverseBoundKept(terms, scratch, tc.wave(1, 16_384));
+    const long_reuse = module.reverseBoundKept(terms, scratch, tc.wave(16_384, 17_472));
+    const fresh = module.reverseBound(terms, scratch);
+    std.debug.print("\nDSV41_REVERSE_BOUND {{\"kept_cold_wave\": {d}, \"full_reuse\": {d}, \"reuse_16k_rows\": {d}, \"fresh\": {d}, \"call_wave_1\": {d}, \"prompt_wave\": {d}, \"kept_kv\": {d}, \"turn_boundary\": {d}, \"settled\": {d}}}\n", .{ kept_old, full_reuse, long_reuse, fresh, tc.wave(1, 16_384), terms.waves, terms.kv, terms.prompt_state, settled });
+    // The bound the server read (its log, within the wired-table term's 1 MB): kept state + a cold wave, under the footprint.
+    try testing.expect(kept_old < settled and settled - kept_old < 100_000_000);
+    // The continuation's own call (one row over 16,384 positions) leaves the cold wave's room: the reuse passes.
+    try testing.expect(full_reuse > settled + 1_000_000_000);
+    // A continuation's call never charges more than the bill's prompt wave (the old bound is its floor).
+    try testing.expect(long_reuse >= kept_old and full_reuse >= long_reuse);
+    // A fresh prompt: the kept boundary and state freed before the settle, the cold wave charged, the bound without them.
+    try testing.expect(fresh + terms.kv + terms.prompt_state >= kept_old);
+    // The settle refusals fail one request (not latched); a broken invariant still latches.
+    try testing.expect(module.isSettleRefusal(error.PhaseChangeFootprintOverBill) and module.isSettleRefusal(error.PhaseChangeFootprintNotFreed));
+    try testing.expect(!module.isSettleRefusal(error.TransientStillReferenced));
+}

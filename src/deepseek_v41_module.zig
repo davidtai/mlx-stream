@@ -280,6 +280,34 @@ pub fn reverseBound(prompt: bill_mod.PhaseTerms, scratch_bytes: u64) u64 {
     return prompt.sum() -| (scratch_bytes + prompt.waves + prompt.kv + prompt.mlx_cache + prompt.mlx_cache_overshoot + prompt.engram_posted);
 }
 
+/// The reverse bound with a kept boundary (a continuation comes next): the kept state's KV and boundary stay live, and
+/// the continuation allocates its own call's wave (`call_wave`, at most the bill's prompt wave), the scratch, the cache
+/// and the posted gathers. A fresh request never keeps the boundary through the change (`ReverseLive.free`).
+pub fn reverseBoundKept(prompt: bill_mod.PhaseTerms, scratch_bytes: u64, call_wave: u64) u64 {
+    return prompt.sum() -| (scratch_bytes + @min(call_wave, prompt.waves) + prompt.mlx_cache + prompt.mlx_cache_overshoot + prompt.engram_posted);
+}
+
+/// The request the reverse change prepares for: a fresh prompt (the kept boundary and state are dropped in the change),
+/// or a continuation of `rows` new rows over `positions` (the kept boundary restored after the change).
+/// `unknown` (a harness's own request end): the kept boundary stays and the bound charges a cold prompt's wave.
+pub const Coming = union(enum) { fresh, unknown, continuation: struct { rows: u64, positions: u64 } };
+
+/// The continuation call's wave (`bill.turnCallWave`) at the served bill's prompt geometry.
+pub const TurnCall = struct {
+    pb: v41.PrefillBill,
+    layer_major: bool,
+    joinless: bool,
+
+    pub fn wave(t: TurnCall, rows: u64, positions: u64) u64 {
+        return bill_mod.turnCallWave(t.pb, t.layer_major, t.joinless, rows, positions);
+    }
+};
+
+/// A boundary's settle check (`checkSettled`): the readings, not a broken invariant. It fails its request only.
+pub fn isSettleRefusal(e: anyerror) bool {
+    return e == error.PhaseChangeCacheNotEmpty or e == error.PhaseChangeActiveNotFreed or e == error.PhaseChangeFootprintNotFreed or e == error.PhaseChangeFootprintOverBill;
+}
+
 /// The reverse phase change in the bill's order (ledger 101), on any `x` with `free() !u64` (the request's state and the
 /// decode-only rows; the bytes), `clear()` (MLX's cache), `settle(freed) !void` (until the frees landed and the footprint
 /// is at most `reverseBound`, then the one check) and `allocate() !void` (the prompt's scratch and cache limit): nothing
@@ -499,6 +527,9 @@ pub const Module = struct {
     turn_boundary: ?TurnBoundary = null,
     /// Multi-turn is installed (the served path; off when the harness pins one prompt, `bill_pinned_prompt`).
     multiturn: bool = false,
+    /// Multi-turn's continuation call bill (`turnCallWave`'s inputs, from the served bill at construction): the reverse
+    /// change's bound for a kept boundary charges the coming continuation's own call wave, not a cold prompt's.
+    turn_call: ?TurnCall = null,
     /// The positions `restorePrefix` kept for the next prompt pass (0: none); that pass takes it (`prefillAt`).
     resume_at: u64 = 0,
     /// The prompt fence ran: the embedding reads its host rows from then on (per process).
@@ -905,6 +936,11 @@ pub const Module = struct {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         self.bill = try bill_mod.servedBill(arena.allocator(), io, admitted, planned_wired, ceiling_bytes, self.overrides);
+        if (multiturnRoute(self.overrides)) self.turn_call = .{
+            .pb = try bill_mod.servedPrefillBill(admitted, self.overrides, &self.model.c, self.bill.variant),
+            .layer_major = admitted.dsv41LayerMajor(),
+            .joinless = bill_mod.joinlessRoute(self.overrides),
+        };
     }
 
     /// The construction check (the verification harnesses only, `RouteOverrides.verify`): the bill's rows against the
@@ -1129,9 +1165,11 @@ pub const Module = struct {
         try checkContext(start + ids.len, self.max_context, self.overrides.bill_pinned_prompt);
         // The previous request's decode end (served path), before this request touches anything.
         self.recordDecodeEnd();
-        // The previous request's end, when the shell did not run it (an errored request): its routes settled and, if it
-        // left the prompt configuration, the reverse phase change, on this request's clock before anything of it allocates.
-        try self.requestEnd();
+        // The previous request's end (the served path runs it here, never at the request's end): its routes settled and,
+        // if it left the prompt configuration, the reverse phase change, on this request's clock before anything of it
+        // allocates. The coming request is known here: a fresh one drops the kept boundary and state inside the change
+        // (before its settle, which then sees their frees); a continuation keeps them and brings its own call.
+        try self.requestEndFor(if (start > 0) .{ .continuation = .{ .rows = @min(ids.len, self.prefill_sub), .positions = start + ids.len } } else .fresh);
         try self.gate.begin(.prefill);
         // #23: the prompt counts the phase change reads are this request's alone.
         switch (self.arm) {
@@ -1470,6 +1508,13 @@ pub const Module = struct {
     /// then the prompt's scratch and cache limit back. Residents and Engram persist. A no-op when the
     /// Module already holds its prompt configuration; a refusal is the boundary's (every later request refused).
     pub fn requestEnd(self: *Module) !void {
+        return self.requestEndFor(.unknown);
+    }
+
+    /// `requestEnd` with the coming request's shape (`Coming`): the reverse bound charges what that request allocates.
+    /// A refused settle fails that request only (the gate is not latched: nothing was allocated, and the next request
+    /// runs the change again on fresh readings); a kept boundary is dropped with it, so the next request runs cold.
+    fn requestEndFor(self: *Module, coming: Coming) !void {
         try self.gate.request();
         const t0 = std.Io.Timestamp.now(self.io, .boot);
         _ = mlx.mlx_synchronize(self.g.s);
@@ -1481,10 +1526,13 @@ pub const Module = struct {
         if (self.prompt_ready) return;
         self.recordDecodeEnd();
         const vm0: ?VmMark = if (self.overrides.verify) VmMark.now() else null;
-        var x: ReverseLive = .{ .m = self, .before = BoundaryMemory.now() };
+        var x: ReverseLive = .{ .m = self, .before = BoundaryMemory.now(), .coming = coming };
         reverseSteps(&x) catch |e| {
             self.logReverse();
-            return self.refuseBoundary(e);
+            if (!isSettleRefusal(e)) return self.refuseBoundary(e);
+            self.dropState();
+            log.err("NATIVE reverse phase change refused: {s}; this request fails, the kept boundary is dropped, the next request runs the change again\n", .{@errorName(e)});
+            return e;
         };
         self.prompt_ready = true;
         const r = &self.reverse_change.?;
@@ -1501,6 +1549,7 @@ pub const Module = struct {
     const ReverseLive = struct {
         m: *Module,
         before: BoundaryMemory,
+        coming: Coming = .fresh,
         scratch_absent: bool = false,
 
         /// The finished request's state (its KV lanes, the strategy's caches; a new prompt rebuilds both), then the
@@ -1508,7 +1557,8 @@ pub const Module = struct {
         pub fn free(x: *ReverseLive) !u64 {
             const m = x.m;
             m.dropDspark();
-            // Multi-turn: the state stays for the next turn (its boundary kept); otherwise freed.
+            // Multi-turn: the state stays for a continuation (its boundary kept); a fresh request's is freed here.
+            if (x.coming == .fresh) m.dropTurnBoundary();
             if (m.turn_boundary == null) {
                 if (m.state) |*st| st.deinit(&m.g, m.gpa);
                 m.state = null;
@@ -1534,8 +1584,14 @@ pub const Module = struct {
             const scratch = if (x.scratch_absent) switch (m.arm) {
                 inline else => |t| t.arm.stream.promptTransientBytes(),
             } else 0;
-            // Multi-turn: the kept state's KV stays (the kept boundary is in the prompt terms' retained state already).
-            const bound = reverseBound(m.bill.prefillTerms(), scratch) + if (m.turn_boundary != null) m.bill.prefillTerms().kv else 0;
+            // Multi-turn: the kept state's KV stays (the kept boundary is in the prompt terms' retained state already), and
+            // the coming continuation allocates its own call's wave (`turnCallWave`), not a cold prompt's.
+            const terms = m.bill.prefillTerms();
+            const bound = if (m.turn_boundary != null) switch (x.coming) {
+                .continuation => |c| reverseBoundKept(terms, scratch, if (m.turn_call) |tc| tc.wave(c.rows, c.positions) else terms.waves),
+                .unknown => reverseBoundKept(terms, scratch, terms.waves),
+                .fresh => unreachable,
+            } else reverseBound(terms, scratch);
             const st = settleReadings(LiveReader{ .io = m.io }, x.before, freed, m.installed.phase_change_poll_ms, bound);
             m.reverse_change = .{ .vm_after = if (m.overrides.verify) VmMark.now() else null, .before = x.before, .after = st.after, .freed_bytes = x.before.cache + freed, .settle_ms = st.waited_ms, .bound_bytes = bound, .margin_bytes = @as(i64, @intCast(bound)) - @as(i64, @intCast(st.after.footprint)), .ms = 0 };
             try checkSettled(x.before, st.after, freed, bound);
@@ -1626,7 +1682,14 @@ pub const Module = struct {
         const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms, bound);
         if (v) marks[3] = VmMark.now();
         self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = released_here, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
-        checkSettled(before, st.after, freed_device, bound) catch |e| return self.refuseBoundary(e);
+        checkSettled(before, st.after, freed_device, bound) catch |e| {
+            // The readings over the bound: this request fails (nothing grew); the next request's reverse change returns
+            // the Module to its prompt configuration on fresh readings. Not latched.
+            self.phase_change.?.refused = @errorName(e);
+            self.logPhaseChange();
+            log.err("NATIVE phase change refused: {s}; this request fails, the next request runs the reverse change\n", .{@errorName(e)});
+            return e;
+        };
         try self.observe(.released);
         self.phase_change.?.free_to_grow_ms = @as(f64, @floatFromInt(@max(freed_at.untilNow(self.io, .boot).nanoseconds, 0))) / 1e6;
         switch (self.arm) {
@@ -1921,7 +1984,8 @@ pub const PhaseObserver = @import("sdk").PhaseObserver;
 /// The request's phase gate: every public Module entry asks it first, so the order of a request's entries is
 /// proven by construction here, with no model and no device (host-tested below).
 /// - A refused boundary is kept: every later entry is refused by name (PhaseChangeRefused) before any phase check,
-///   so no retry grows over what the refused check saw.
+///   so no retry grows over what the refused check saw. Only a broken invariant latches it (a scratch holder, the
+///   routes, an observer); a settle's readings over their bound (`isSettleRefusal`) fail their request alone.
 /// - The request's phase orders its entries:
 ///   - `prefill` (a new request, at any phase): the phase is `idle` until the prompt's forward completes, then
 ///     `prompt` (seeded or not: whether the DSpark strategy took the prompt);

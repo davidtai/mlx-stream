@@ -1964,6 +1964,65 @@ test "dsv41 memory: multi-turn's reused turns at the conversation's chunk rule s
     }
 }
 
+test "dsv41 memory: a full-prefix reuse (P - 1 kept, one token forwarded) stays under its billed call wave at 16,384 and 131,072 (bank, trace)" {
+    // pass3ef: the cached repeat of the 16K request forwards one token over the kept 16,383; the reverse change's bound
+    // charges that call's wave (`bill.turnCallWave(1, P)`), so the traced one-row call must sit under it.
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 held: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(a, io, bank, &diag);
+    const eng = @import("deepseek_v41_engram.zig");
+    const kvc = @import("deepseek_v41_cache.zig");
+    const bill_mod = @import("deepseek_v41_bill.zig");
+    var src = try eng.RowSource.open(a, io, bank, try std.fmt.allocPrint(aa, "{s}/engram-token-map.u32", .{bank}), &c, &diag);
+    defer src.deinit();
+    const spec = try std.mem.concat(aa, v41.Param, &.{ try v41.residentSpec(aa, &c), try v41.engramSpec(aa, &c) });
+    const prompt = try aa.alloc(u32, 131072);
+    for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
+    var tier = routes.served;
+    tier.layer_major = true;
+    for ([_]u32{ 16384, 131072 }) |p| {
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        g.track_live = true;
+        const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
+        var kd: @import("exl3_kernels.zig").Diag = .{};
+        var reg = try @import("exl3_kernels.zig").Registry.init(a, &@import("exl3_kernels.zig").embedded, @import("exl3_kernels.zig").manifest_sha256, &kd);
+        defer reg.deinit();
+        const model_ = try Loop(TraceOps).M.initWith(a, &g, c, tier, &lookup, &src, .{ .registry = &reg });
+        defer model_.deinit(&g);
+        const positions = bill_mod.billedPositions(p, bill_mod.fill_max_tokens);
+        var st = try model_.newStateWith(model_.boundedKv(@intCast(positions)));
+        defer st.deinit(&g, a);
+        const stand: graph.StandIn(TraceOps) = .{ .scale = try g.input(&.{@intCast(c.n_routed_experts)}, .float32) };
+        const pb = v41.PrefillBill.of(&c, tier.kv).withIndexLaunch(tier.routes.prefill_index);
+        // The kept conversation (P - 1), then the one forwarded token at the whole conversation's chunk rule.
+        st.span_chunk = 16384;
+        {
+            const r = try model_.forward(&g, &st, prompt[0 .. p - 1], .{ .logits = .last, .main_hidden = true }, stand, graph.NoProbe{});
+            try Loop(TraceOps).M.fence(&g, &st, &.{ r.logits.?, r.main_hidden.? });
+            g.reset();
+        }
+        st.span_chunk = kvc.resolvePrefillChunk(&c, p, null, kvc.default_chunk_target_bytes);
+        const f0 = g.nodes.items.len;
+        const w0 = g.freed.items.len;
+        const r = try model_.forward(&g, &st, prompt[p - 1 .. p], .{ .logits = .last, .main_hidden = true }, stand, graph.NoProbe{});
+        const nst = Held.nested(&g, f0, g.nodes.items.len, g.freed.items[w0..], 0);
+        const wave = nst.peak + (@as(u64, c.hc_mult) * c.hidden_size * 2 + c.hidden_size * 2 + 3 * @as(u64, c.hc_mult) * 4 + @as(u64, c.hc_mult) * c.hc_mult * 4);
+        const billed = bill_mod.turnCallWave(pb, true, true, 1, p);
+        std.debug.print("DSV41_FULL_REUSE {{\"conversation\": {d}, \"kept\": {d}, \"rows\": 1, \"wave\": {d}, \"billed_call_wave\": {d}, \"cold_wave\": {d}}}\n", .{ p, p - 1, wave, billed, pb.layerMajorPromptWaveBytes(p, .served) });
+        try testing.expect(wave <= billed);
+        try testing.expect(billed < pb.layerMajorPromptWaveBytes(p, .served));
+        try Loop(TraceOps).M.fence(&g, &st, &.{ r.logits.?, r.main_hidden.? });
+        g.reset();
+    }
+}
+
 test "dsv41 memory: the layer-major sub-chunk calls pin one version of each lane and stay under the bill at 65,536 / 131,072 / 262,144 / 1,048,576 (bank, trace)" {
     const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const a = testing.allocator;
