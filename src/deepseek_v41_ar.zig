@@ -2996,8 +2996,9 @@ test "dsv41 bill: the default served bill covers every prompt up to 16,384; the 
         }
     }
     const pinned = try bill_mod.servedBill(a, testing.io, &config, null, ceiling, .{ .bill_pinned_prompt = 16384 });
-    // The 16K wave of the 10-02..10-04 receipts (13,868,806,049 B, f32 streams) less kv16's bf16 kept streams, h1, moe_in.
-    try testing.expectEqual(@as(u64, 13_868_806_049 - 1_509_949_440), pinned.prefill_wave);
+    // The 16K wave of the 10-02..10-04 receipts (13,868,806,049 B, f32 streams) less kv16's bf16 kept streams, h1, moe_in,
+    // and its bf16 DSpark main taps.
+    try testing.expectEqual(@as(u64, 13_868_806_049 - 1_509_949_440 - 503_316_480), pinned.prefill_wave);
     const exact = try bill_mod.billAt(a, testing.io, &config, 16384, bill_mod.fill_max_tokens, null, ceiling, .{});
     try testing.expectEqual(exact.prefillTotal(), pinned.prefillTotal());
     try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());

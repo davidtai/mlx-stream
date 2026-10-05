@@ -313,7 +313,8 @@ pub const PrefillBill = struct {
     pub fn layerMajorWaveTerms(b: PrefillBill, seq: u64, span: u64, positions: u64, tier: Tier) WaveTerms {
         const d = b.hidden;
         const sb = b.stream_bytes;
-        const kept_stream = seq * (b.hc * d * sb + b.hc * 4 + 4) + b.n_main * seq * d * 4;
+        // The DSpark main taps are the stream's dtype (`mainOf`: the hc mean in f32, returned as the stream's dtype).
+        const kept_stream = seq * (b.hc * d * sb + b.hc * 4 + 4) + b.n_main * seq * d * sb;
         const halves = seq * (b.hc * d * sb + d * sb + 2 * b.hc * 4 + b.hc * b.hc * 4);
         // The index selection, plus (served) the prefill core's window selection memo per chunk: idx i32 + valid.
         const win_sel = if (tier == .served) seq * (b.selected_keys - b.index_topk) * 5 else 0;
@@ -519,7 +520,8 @@ test "dsv41 memory: kv16's layer-major wave: bf16 streams, the attention side ov
     // kv16's streams: the kept hs and h1 halve, moe_in halves, at 16K 1.51 GB under the f32 wave's kept and halves.
     const f32w = bank30Bill().withIndexLaunch(true).layerMajorWaveTerms(16384, 953, 16384, .served);
     const bf = b.layerMajorWaveTerms(16384, 953, 16384, .served);
-    try std.testing.expectEqual(@as(u64, 16384 * (4 * 5120 * 2 + 4 * 5120 * 2 + 5120 * 2)), (f32w.kept + f32w.halves) - (bf.kept + bf.halves));
+    // (the kept hc streams, h1, moe_in, and the three DSpark main taps at the stream's width)
+    try std.testing.expectEqual(@as(u64, 16384 * (4 * 5120 * 2 + 4 * 5120 * 2 + 5120 * 2) + 3 * 16384 * 5120 * 2), (f32w.kept + f32w.halves) - (bf.kept + bf.halves));
 }
 
 test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-output copy, over the measured 16K transient" {

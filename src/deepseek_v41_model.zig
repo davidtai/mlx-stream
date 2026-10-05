@@ -1423,6 +1423,12 @@ test "dsv41 model: K16 settles each chunk's DSpark main tap in its chunk fence (
     }
     try testing.expectEqual(@as(usize, 3), taps);
     try testing.expect(main_taps_in_chunk_fence);
+    // The bill's kept taps (`PrefillBill.layerMajorWaveTerms`: n_main x seq x hidden x stream_bytes): a tap is the
+    // stream's dtype (kv16's bf16 stream: bf16, never f32).
+    inline for (.{ ops.Dtype.bfloat16, ops.Dtype.float32 }) |dt| {
+        const hs = try g.input(&.{ 1, 8, @intCast(m.c.hc_mult), @intCast(m.c.hidden_size) }, dt);
+        try testing.expectEqual(dt, g.dtypeOf(try TM.mainOf(&g, hs)));
+    }
 }
 
 test "dsv41 model: K16's input-stream release (route): each chunk's layer input goes at its chunk fence, before the layer's routed call; the ops are the same either way" {
