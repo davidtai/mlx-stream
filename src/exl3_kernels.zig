@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "01eef9e1f9b6be810ad4638057a215173422adb80ec1b5c09c1c6379c4f1a648";
+pub const manifest_sha256 = "abd5a429cd30c2260095b652773cf7dbff3f89c133e01a68cdf58e9bf2119bbd";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
@@ -145,6 +145,7 @@ pub const Kernel = enum {
     // tail); the f32 residual and layer 0's bf16 one (checked against the region at model construction)
     dsv41_hcpost_tf32,
     dsv41_hcpost_tf32__rbf16,
+    dsv41_hcpost_tf32__bf16,
     // The banked hit wave (10-02, kbench v6d / v9b: exact): each routed decode text over three banks (base, ext,
     // transient) in one launch, a row's bank from its packed slot (bank << 24 | row) (twin: the stock text on bank 0)
     dsv41_exl3_b3_mul1h_k3_2304,
@@ -1172,7 +1173,7 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 95), n_kernels);
+    try testing.expectEqual(@as(usize, 96), n_kernels);
     try testing.expectEqual(@as(usize, 17), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
@@ -1187,7 +1188,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 15), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 16), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));

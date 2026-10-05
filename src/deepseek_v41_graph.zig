@@ -1548,15 +1548,17 @@ pub fn Trunk(comptime G: type) type {
                 n += 1;
             }
             if (kx.hcpost) |*hp| {
-                // PREFILL_HCPOST: the one-pass combine == the compiled region, every element, on both residual dtypes.
-                for ([_]Dtype{ .float32, .bfloat16 }) |rdt| {
-                    const x = try checkFill(g, r, scratch, &.{ 1, S, dim }, 4.0, .float32);
+                // PREFILL_HCPOST: the one-pass combine == the compiled region, every element, on both residual dtypes and on
+                // kv16's all-bf16 stream (x and the residual bf16, h bf16).
+                for ([_][2]Dtype{ .{ .float32, .float32 }, .{ .float32, .bfloat16 }, .{ .bfloat16, .bfloat16 } }) |dts| {
+                    const rdt = dts[1];
+                    const x = try checkFill(g, r, scratch, &.{ 1, S, dim }, 4.0, dts[0]);
                     const res = try checkFill(g, r, scratch, &.{ 1, S, hc, dim }, 4.0, rdt);
                     const post = try g.add(try checkFill(g, r, scratch, &.{ 1, S, hc }, 1.0, .float32), try g.scalar(1.0, .float32));
                     const comb = try g.add(try checkFill(g, r, scratch, &.{ 1, S, hc, hc }, 0.5, .float32), try g.scalar(0.5, .float32));
                     var want: [1]T = undefined;
                     try g.tape(HcPost, c, &.{ x, res, post, comb }, &want);
-                    out[n] = .{ .name = if (rdt == .float32) "HC post, f32 residual" else "HC post, bf16 residual", .ok = try checkEqual(g, try hcPostFused(g, hp, x, res, post, comb), want[0]) };
+                    out[n] = .{ .name = if (dts[0] == .bfloat16) "HC post, bf16 stream" else if (rdt == .float32) "HC post, f32 residual" else "HC post, bf16 residual", .ok = try checkEqual(g, try hcPostFused(g, hp, x, res, post, comb), want[0]) };
                     n += 1;
                 }
             }
@@ -2413,8 +2415,12 @@ pub fn Trunk(comptime G: type) type {
         fn hcPostFused(g: *G, hp: *const kr.HcPostTf32(G), x: T, residual: T, post: T, comb: T) !T {
             const rs = g.shapeOf(residual);
             const m = rs.d[0] * rs.d[1];
-            // The kernel computes in f32 over f32 x (the reference's hc_post: f32 math, `y.type_as(x)`): the result in x's dtype.
-            const h = try hp.call(g, try g.reshape(try g.astype(x, .float32), &.{ m, rs.d[3] }), try g.reshape(residual, &.{ m, rs.d[2], rs.d[3] }), try g.reshape(post, &.{ m, rs.d[2] }), try g.reshape(comb, &.{ m, rs.d[2] * rs.d[2] }));
+            // The kernel computes in f32 (the reference's hc_post: f32 math, `y.type_as(x)`): the result in x's dtype. On
+            // kv16's bf16 stream (x and the residual bf16) the all-bf16 text reads x through static_cast<float> and stores
+            // h rounded to bfloat, the region's `astype(.., x dtype)`: no f32 x copy, no f32 h to narrow.
+            const bf16_stream = g.dtypeOf(x) == .bfloat16 and g.dtypeOf(residual) == .bfloat16;
+            const xin = if (bf16_stream) x else try g.astype(x, .float32);
+            const h = try hp.call(g, try g.reshape(xin, &.{ m, rs.d[3] }), try g.reshape(residual, &.{ m, rs.d[2], rs.d[3] }), try g.reshape(post, &.{ m, rs.d[2] }), try g.reshape(comb, &.{ m, rs.d[2] * rs.d[2] }));
             return g.astype(try g.reshape(h, rs.slice()), g.dtypeOf(x));
         }
 
@@ -3930,6 +3936,27 @@ test "dsv41 graph: PREFILL_HCPOST runs both HC combines above 8 rows as one laun
         try testing.expectEqual(@as(usize, 2), kernels);
         try testing.expect(noneOf(&g, n0, .tape_begin));
     };
+    // kv16-opt: on the bf16 stream (x and the residual bf16) both combines read and write bf16 in their one launch:
+    // no f32 x copy, no narrowing of an f32 h.
+    for ([_]c_int{ 953, 183, 9 }) |S| {
+        const x = try g.input(&.{ 1, S, dim }, .bfloat16);
+        const res = try g.input(&.{ 1, S, hc, dim }, .bfloat16);
+        const post = try g.input(&.{ 1, S, hc }, .float32);
+        const comb = try g.input(&.{ 1, S, hc, hc }, .float32);
+        const n0 = g.nodes.items.len;
+        const half: Tr.Half = .{ .moe_in = x, .h1 = res, .post = post, .comb = comb, .ffn_pre = post };
+        const a = try Tr.prefillHcPost(&g, &c, lk, x, half);
+        const b = try Tr.hcPostRoute(&g, &c, &rt, lk, x, res, post, comb);
+        for ([_]u32{ a, b }) |h| try testing.expectEqual(ops.Dtype.bfloat16, g.dtypeOf(h));
+        var kernels: usize = 0;
+        var casts: usize = 0;
+        for (g.nodes.items[n0..]) |nd| {
+            kernels += @intFromBool(nd.op == .kernel);
+            casts += @intFromBool(nd.op == .astype);
+        }
+        try testing.expectEqual(@as(usize, 2), kernels);
+        try testing.expectEqual(@as(usize, 0), casts);
+    }
     // 8 rows and below: no launch (the region or the decode tape / chain, as before).
     {
         const S: c_int = 8;

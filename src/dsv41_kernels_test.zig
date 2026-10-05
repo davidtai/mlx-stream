@@ -74,7 +74,7 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         return error.TestUnexpectedResult;
     }
     try testing.expectEqual(@as(usize, 33), eq.kernels.len);
-    try testing.expectEqual(@as(usize, 62), tr.kernels.len);
+    try testing.expectEqual(@as(usize, 63), tr.kernels.len);
     try testing.expectEqual(xk.n_kernels, eq.kernels.len + tr.kernels.len);
     // the EXL3 subset is exactly the EXL3 families; its headers are the DIG ones
     const exl3_families = [_][]const u8{ "exl3_decode_gemv", "exl3_rin_stage", "prefill_rebuild", "prefill_digx", "prefill_digx_check" };

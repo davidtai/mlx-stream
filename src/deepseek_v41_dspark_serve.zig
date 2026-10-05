@@ -419,6 +419,7 @@ test "dsv41 dspark serve: the served tier binds the tier of record's routes; the
         mini_served.routes.prefill_oproj = false;
         mini_served.routes.prefill_host_shared = false;
         mini_served.routes.prefill_joinless = false;
+        mini_served.routes.prefill_hcpost = false;
         mini_served.routes.rc_smallm = false;
         mini_served.routes.rc_mxfp8_rows = false;
         mini_served.routes.rc_index_topk = false;

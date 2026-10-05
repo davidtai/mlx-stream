@@ -99,6 +99,7 @@ pub const kernels = [_]Kernel{
     .q3jl_combine,
     .dsv41_hcpost_tf32,
     .dsv41_hcpost_tf32__rbf16,
+    .dsv41_hcpost_tf32__bf16,
 };
 
 /// The arch's kernel acceptance, once per backend before its routes are built: this subset's
@@ -1272,16 +1273,19 @@ pub fn HcPostTf32(comptime G: type) type {
         const Self = @This();
         f32_res: *const Entry,
         bf16_res: *const Entry,
+        /// kv16-opt: x, res and h in the stream's bf16 (the same text: x read through static_cast<float>, h stored as
+        /// the f32 word rounded to bfloat, the region's `astype(.., x dtype)`).
+        bf16: *const Entry,
 
         pub fn init(reg: *const xk.Registry, geo: *const PrefillGeometry, diag: ?*xk.Diag) Refusal!Self {
             try geo.admit("dsv41_hcpost_tf32", diag);
-            return .{ .f32_res = reg.get(.dsv41_hcpost_tf32), .bf16_res = reg.get(.dsv41_hcpost_tf32__rbf16) };
+            return .{ .f32_res = reg.get(.dsv41_hcpost_tf32), .bf16_res = reg.get(.dsv41_hcpost_tf32__rbf16), .bf16 = reg.get(.dsv41_hcpost_tf32__bf16) };
         }
 
-        /// x f32 [n, 5120], res [n, 4, 5120] (f32; bf16 on layer 0's stream), post f32 [n, 4], comb f32 [n, 16]
-        /// (`...jk` flattened) -> f32 [n, 4, 5120].
+        /// x [n, 5120], res [n, 4, 5120], post f32 [n, 4], comb f32 [n, 16] (`...jk` flattened) -> [n, 4, 5120]: x f32
+        /// with res f32 or bf16 -> f32 h; x and res bf16 (kv16's stream) -> bf16 h.
         pub fn call(self: *const Self, g: *G, x: G.T, res: G.T, post: G.T, comb: G.T) !G.T {
-            const e = if (g.dtypeOf(res) == .bfloat16) self.bf16_res else self.f32_res;
+            const e = if (g.dtypeOf(x) == .bfloat16) self.bf16 else if (g.dtypeOf(res) == .bfloat16) self.bf16_res else self.f32_res;
             var out: [1]G.T = undefined;
             try launchRule(G, g, e, &rowsVars(rowsOf(G, g, x, 0)), &.{ x, res, post, comb }, &out);
             return out[0];
@@ -1759,12 +1763,12 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
         }
     }
     // PREFILL_HCPOST: x, res, post, comb at each sample's rows; the residual's dtype picks the text
-    for ([_]xk.Kernel{ .dsv41_hcpost_tf32, .dsv41_hcpost_tf32__rbf16 }) |k| {
+    for ([_]xk.Kernel{ .dsv41_hcpost_tf32, .dsv41_hcpost_tf32__rbf16, .dsv41_hcpost_tf32__bf16 }) |k| {
         const e = reg.get(k);
         const r = try HcPostTf32(Trace).init(&reg, &.derived, null);
         for (e.samples) |*s| {
             const n: c_int = @intCast(s.vars.get(.rows));
-            const x, const res, const post, const comb = .{ try t.node(&.{ n, 5120 }, .float32, &.{}), try t.node(&.{ n, 4, 5120 }, if (k == .dsv41_hcpost_tf32) .float32 else .bfloat16, &.{}), try t.node(&.{ n, 4 }, .float32, &.{}), try t.node(&.{ n, 16 }, .float32, &.{}) };
+            const x, const res, const post, const comb = .{ try t.node(&.{ n, 5120 }, if (k == .dsv41_hcpost_tf32__bf16) .bfloat16 else .float32, &.{}), try t.node(&.{ n, 4, 5120 }, if (k == .dsv41_hcpost_tf32) .float32 else .bfloat16, &.{}), try t.node(&.{ n, 4 }, .float32, &.{}), try t.node(&.{ n, 16 }, .float32, &.{}) };
             _ = try r.call(&t, x, res, post, comb);
             try expectLaunch(t.back(1), e, s, &.{ x, res, post, comb });
         }
