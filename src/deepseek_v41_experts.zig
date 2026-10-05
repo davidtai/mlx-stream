@@ -2397,28 +2397,7 @@ test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samp
     try testing.expectEqual(picks.len, checked);
 }
 
-const SynthBank = struct {
-    tmp: std.testing.TmpDir,
-    image: []u8,
-    bank: expert_bank.Bank,
-
-    fn open(n_experts: u32) !SynthBank {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const image = try expert_bank.writeSynth(testing.allocator, &tmp, .{ .n_experts = n_experts });
-        errdefer testing.allocator.free(image);
-        var rbuf: [512]u8 = undefined;
-        const implemented: expert_bank.Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = n_experts, .n_layers = 2 };
-        const bank = try expert_bank.Bank.open(testing.allocator, std.testing.io, try expert_bank.tmpRoot(&tmp, &rbuf), implemented, null);
-        return .{ .tmp = tmp, .image = image, .bank = bank };
-    }
-
-    fn close(self: *SynthBank) void {
-        self.bank.deinit();
-        testing.allocator.free(self.image);
-        self.tmp.cleanup();
-    }
-};
+const SynthBank = expert_bank.SynthBank;
 
 /// Every routed id's slot row holds its record's bytes (the rows the hook bound).
 fn expectRowsHold(s: *expert_stream.Stream, sb: *const SynthBank, layer: u32, ids: []const u16, sv: Served) !void {

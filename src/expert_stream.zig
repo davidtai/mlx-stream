@@ -496,28 +496,7 @@ test "dsv41 slots: no Metal device in this process" {
 
 /// A 2-layer synthetic bank on disk (hidden 64, inter 32: 2,880-byte records
 /// in 4 KiB slots), opened, with its experts.bin image.
-const SynthBank = struct {
-    tmp: std.testing.TmpDir,
-    image: []u8,
-    bank: expert_bank.Bank,
-
-    fn open(n_experts: u32) !SynthBank {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const image = try expert_bank.writeSynth(testing.allocator, &tmp, .{ .n_experts = n_experts });
-        errdefer testing.allocator.free(image);
-        var rbuf: [512]u8 = undefined;
-        const implemented: expert_bank.Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = n_experts, .n_layers = 2 };
-        const bank = try expert_bank.Bank.open(testing.allocator, std.testing.io, try expert_bank.tmpRoot(&tmp, &rbuf), implemented, null);
-        return .{ .tmp = tmp, .image = image, .bank = bank };
-    }
-
-    fn close(self: *SynthBank) void {
-        self.bank.deinit();
-        testing.allocator.free(self.image);
-        self.tmp.cleanup();
-    }
-};
+const SynthBank = expert_bank.SynthBank;
 
 const test_pool: expert_io.Options = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 };
 
