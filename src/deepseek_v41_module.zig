@@ -91,6 +91,13 @@ pub const dspark_config: dsl.Config = .{
 /// ModelConfig: the server builds with none (`Module.init`), a harness passes its own (`Module.initWith`), and
 /// the bill reads the same ones.
 pub const RouteOverrides = struct {
+    /// The verification harnesses only (the device test `dsv41 pre-ship gate: the served Module's construction, verified`, the
+    /// window cells): the construction's numeric probes (the prefill call sites against the stock chain, the posted Engram
+    /// gathers, the host embedding rows, the event gates, the read-ahead, the arm's banks against the quant), the
+    /// construction check (the footprint and the host side against the bill) and the boundaries' extra readings (the
+    /// box's pages, the decode host side). The served path never sets it: it runs none of them (David 10-05: tests
+    /// belong in the test suite).
+    verify: bool = false,
     /// The prefill attention core (ATTNHALF ropefuse) at prompt widths.
     prefill_attn: ?bool = null,
     /// The prefill indexer (ATTNHALF idxscore + INDEX_TOPK) at prompt widths.
@@ -710,7 +717,7 @@ pub const Module = struct {
             weights.drop("head.weight");
             log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B\n", .{self.model.droppedBytes()});
         }
-        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.prefill_hcpost or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax) try self.checkPrefillRoutes();
+        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.prefill_hcpost or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax) if (self.overrides.verify) try self.checkPrefillRoutes();
         // ENGRAM=prefetch: the poster threads started and their gathers checked against a read past the cache.
         if (tier.routes.engram_posted and tier.layer_major and c.engram.n_layers > 0) {
             // The pass posts slot s + 1 once slot s's layer is taken: the slots run in layer order.
@@ -719,7 +726,7 @@ pub const Module = struct {
                 if (slot != sl or (sl > 0 and l <= c.engram.layer_ids[sl - 1])) return error.EngramSlotOrder;
             }
             try self.engram.enablePosting();
-            self.checkEngramPosted(gpa) catch |e| {
+            if (self.overrides.verify) self.checkEngramPosted(gpa) catch |e| {
                 log.err("NATIVE engram posted: the construction self-check against a read past the cache failed: {s}\n", .{@errorName(e)});
                 return e;
             };
@@ -826,34 +833,24 @@ pub const Module = struct {
         // held to the allocator's cache, and a clear ahead of them leaves those cached.
         _ = mlx.mlx_synchronize(self.g.s);
         self.g.clearCache();
-        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B\n", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
-        log.info("NATIVE warm-up peaks by width 1..{d} then the draft block (0: not warmed), B above the residents: {any}\n", .{ self.warm_peaks.len - 1, self.warm_peaks });
+        if (self.overrides.verify) log.info("NATIVE warm-up peaks by width 1..{d} then the draft block (0: not warmed), B above the residents: {any}\n", .{ self.warm_peaks.len - 1, self.warm_peaks });
         // The input embedding moves to its host rows now, not at the phase change: every lookup (the
         // prompt's included) reads the table's rows past the page cache, and the device table is gone
         // from both phases. Checked once: the rows equal the table's, byte for byte.
         if (config.embedding_host_rows orelse true) {
-            try self.checkEmbeddingRows(gpa);
+            if (self.overrides.verify) try self.checkEmbeddingRows(gpa);
             _ = mlx.mlx_synchronize(self.g.s);
             const before = BoundaryMemory.now();
             try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
-            // The table's pages can trail its release in the footprint while the driver retires them (the
-            // 05:36 / 06:28 cells' constructions: out of MLX's active and cache, 1.32 GB still in the
-            // footprint). The phase change's settle waits for the footprint to show the release (bounded)
-            // before the construction check reads it.
-            const st = settle(LiveReader{ .io = self.io }, before, self.model.embeddingBytes(), phase_change_poll_ms, null);
-            log.info("NATIVE embedding fence: footprint {d} -> {d} B (the table {d} B), settled in {d} ms\n", .{ before.footprint, st.after.footprint, self.model.embeddingBytes(), st.waited_ms });
+            // The verification harness's construction check reads the footprint next: the table's pages can trail its
+            // release while the driver retires them, so it waits (bounded) for the footprint to show it. Serving needs no
+            // wait (nothing allocates against the footprint before the first request's phase change, which settles).
+            if (self.overrides.verify) {
+                const st = settle(LiveReader{ .io = self.io }, before, self.model.embeddingBytes(), phase_change_poll_ms, null);
+                log.info("NATIVE embedding fence: footprint {d} -> {d} B (the table {d} B), settled in {d} ms\n", .{ before.footprint, st.after.footprint, self.model.embeddingBytes(), st.waited_ms });
+            }
             self.fenced = true;
             self.installed.embedding_rows = true;
-        }
-        // The bill against the warm-up's measured peak (C4 G7): the widest decode-width wave, the tier's head.
-        if (config.dsv41_prefill) |bill| {
-            const bt: v41.PrefillBill.Tier = switch (config.numeric_tier orelse .served) {
-                .stock => .stock,
-                .served => .served,
-            };
-            const billed = bill.waveBytes(M.scratch_rows, M.scratch_rows, bt) + (if (bt == .stock) bill.head_promotion_bytes else 0);
-            const measured = std.mem.max(u64, self.warm_peaks);
-            log.info("bill: decode-width wave billed {d} B, warm-up measured {d} B, error {d} B\n", .{ billed, measured, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)) });
         }
         // The warm-up's residents belong to no prompt (its wide calls even seed and protect them): forgotten once here,
         // so the first prompt's seed takes every prompt row and its read-ahead starts from empty rows.
@@ -861,25 +858,34 @@ pub const Module = struct {
             inline else => |t| try t.arm.stream.forgetResidents(),
         };
         log.info("NATIVE construction residents forgotten: {d} rows (the warm-up's); every layer's protection, seed and prompt counts cleared\n", .{forgotten});
-        // The construction check (once, before any request): the native bill at the rows the arm built,
-        // against the footprint the module holds now.
-        try self.checkConstruction(io, &admitted, ceiling_bytes);
+        // The bill at the admitted rows (the boundaries' bounds read it); the verification harness checks the constructed
+        // footprint against it (`checkConstruction`).
+        try self.billAdmitted(io, &admitted, ceiling_bytes);
+        if (self.overrides.verify) try self.checkConstruction();
         return self;
     }
 
-    /// The module's native bill at its admitted rows (the standard request's), and the construction
-    /// check against it: the footprint after the install (warm-up released, cache cleared) must sit
-    /// within `construction_tolerance_bytes` of the bill's construction terms, else the module is
-    /// refused by name before any request.
-    fn checkConstruction(self: *Module, io: std.Io, admitted: *const settings.Config, ceiling_bytes: u64) !void {
-        var arena = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena.deinit();
+    /// The module's native bill at its admitted rows (the standard request's): the phase change's and the reverse
+    /// change's bounds read it.
+    fn billAdmitted(self: *Module, io: std.Io, admitted: *const settings.Config, ceiling_bytes: u64) !void {
         // The bill plans through the arm's own inputs: the wired bytes the arm was planned with (a live
         // read here would count this module's own banks and residents as the box's).
         const planned_wired = switch (self.arm) {
             inline else => |t| t.arm.inputs.wired_bytes,
         };
-        const b = try bill_mod.servedBill(arena.allocator(), io, admitted, planned_wired, ceiling_bytes, self.overrides);
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        self.bill = try bill_mod.servedBill(arena.allocator(), io, admitted, planned_wired, ceiling_bytes, self.overrides);
+    }
+
+    /// The construction check (the verification harnesses only, `RouteOverrides.verify`): the bill's rows against the
+    /// rows the arm built, the footprint after the install (warm-up released, cache cleared) within
+    /// `construction_tolerance_bytes` of the bill's construction terms, and the host side within its billed bound;
+    /// refused by name.
+    pub fn checkConstruction(self: *Module) !void {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const b = self.bill;
         const rows = switch (self.arm) {
             inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
         };
@@ -887,11 +893,8 @@ pub const Module = struct {
             log.err("construction check: the bill plans {d} / {d} rows, the arm built {d} / {d}\n", .{ b.prefill_rows, b.decode_rows, rows.prefill, rows.decode });
             return e;
         };
-        self.bill = b;
         // The footprint the module keeps: every command retired (their completion handlers hand the buffers
-        // they held to MLX's cache), then the cache cleared. Served run 9 (run 3an) read it with the fence's
-        // table still cached: the fence cleared before its reads retired, and the 2 GiB prefill cache held
-        // the 1.32 GB table (+1.33 GB over v7's construction, 0.75 GB over the bill).
+        // they held to MLX's cache), then the cache cleared.
         _ = mlx.mlx_synchronize(self.g.s);
         self.g.clearCache();
         const measured = sdk.memory.footprint().now;
@@ -927,15 +930,17 @@ pub const Module = struct {
         const wide = wideRoute(config);
         const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wide, .banked = self.exl3.banked != null, .hoist_first = hoistFirst(self.overrides), .devroute = devRoute(self.overrides) }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
-        checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
-        // LOOKAHEAD4, once before any request: a gated call's waves against the same slots waited.
+        if (self.overrides.verify) checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
+        // LOOKAHEAD4 (the verification harness): a gated call's waves against the same slots waited.
         if (comptime AT == AGated) {
+            if (self.overrides.verify) {
             arm.hook.checkGates(&self.g, gpa, arm.config.n_experts_per_tok) catch |e|
                 return refused(refuse(diag, e, "event gates: the gated waves differ from the same slots waited, or a gate was forced", .{}), diag);
             log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)\n", .{arm.config.n_experts_per_tok});
+            }
         }
-        // P1, once before any request: records read ahead against the same records read on demand.
-        if (wideRoute(config).read_ahead) {
+        // P1 (the verification harness): records read ahead against the same records read on demand.
+        if (self.overrides.verify and wideRoute(config).read_ahead) {
             const n = arm.hook.checkReadAhead() catch |e|
                 return refused(refuse(diag, e, "read-ahead: a record read ahead differs from its demand read, or a read failed", .{}), diag);
             log.info("NATIVE read-ahead: the construction self-check passed (layer 0, {d} records: read ahead == demand read, bit for bit)\n", .{n});
@@ -944,7 +949,7 @@ pub const Module = struct {
         if (arm.hook.wide_route.base_at_seed) log.info("NATIVE base call at the seed: installed (the seed's deferred base call drains once its groups are read)\n", .{});
         // P1c: exact by construction (groups change no expert's rows; the base call's place moves before the stream's).
         if (arm.hook.wide_route.seed_aligned) log.info("NATIVE seed-aligned groups: installed (the seed's ranks grouped apart from the stream's; the base call after the last seed group)\n", .{});
-        arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
+        if (self.overrides.verify) arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
         return .{ .arm = arm, .gates = gates };
     }
 
@@ -1446,7 +1451,7 @@ pub const Module = struct {
         // A request that ended in its prompt phase with nothing released needs nothing more.
         if (self.prompt_ready) return;
         self.recordDecodeEnd();
-        const vm0 = VmMark.now();
+        const vm0: ?VmMark = if (self.overrides.verify) VmMark.now() else null;
         var x: ReverseLive = .{ .m = self, .before = BoundaryMemory.now() };
         reverseSteps(&x) catch |e| {
             self.logReverse();
@@ -1454,9 +1459,11 @@ pub const Module = struct {
         };
         self.prompt_ready = true;
         const r = &self.reverse_change.?;
-        r.prompt_ready = BoundaryMemory.now();
-        r.vm_before = vm0;
-        r.vm_prompt_ready = VmMark.now();
+        if (self.overrides.verify) {
+            r.prompt_ready = BoundaryMemory.now();
+            r.vm_before = vm0;
+            r.vm_prompt_ready = VmMark.now();
+        }
         r.ms = @as(f64, @floatFromInt(@max(t0.untilNow(self.io, .boot).nanoseconds, 0))) / 1e6;
         self.logReverse();
     }
@@ -1501,7 +1508,7 @@ pub const Module = struct {
             // Multi-turn: the kept state's KV stays (the kept boundary is in the prompt terms' retained state already).
             const bound = reverseBound(m.bill.prefillTerms(), scratch) + if (m.turn_boundary != null) m.bill.prefillTerms().kv else 0;
             const st = settleReadings(LiveReader{ .io = m.io }, x.before, freed, m.installed.phase_change_poll_ms, bound);
-            m.reverse_change = .{ .vm_after = VmMark.now(), .before = x.before, .after = st.after, .freed_bytes = x.before.cache + freed, .settle_ms = st.waited_ms, .bound_bytes = bound, .margin_bytes = @as(i64, @intCast(bound)) - @as(i64, @intCast(st.after.footprint)), .ms = 0 };
+            m.reverse_change = .{ .vm_after = if (m.overrides.verify) VmMark.now() else null, .before = x.before, .after = st.after, .freed_bytes = x.before.cache + freed, .settle_ms = st.waited_ms, .bound_bytes = bound, .margin_bytes = @as(i64, @intCast(bound)) - @as(i64, @intCast(st.after.footprint)), .ms = 0 };
             try checkSettled(x.before, st.after, freed, bound);
         }
 
@@ -1553,7 +1560,8 @@ pub const Module = struct {
         if (self.grown()) return;
         self.prompt_ready = false;
         var marks: [5]?VmMark = @splat(null);
-        marks[0] = VmMark.now();
+        const v = self.overrides.verify;
+        if (v) marks[0] = VmMark.now();
         _ = mlx.mlx_synchronize(self.g.s);
         const before = BoundaryMemory.now();
         try self.observe(.start);
@@ -1563,7 +1571,7 @@ pub const Module = struct {
             try dsp.embeddingFence(G, &self.g, self.model, &self.embed_rows, self.weights);
             self.fenced = true;
         }
-        marks[1] = VmMark.now();
+        if (v) marks[1] = VmMark.now();
         // On its route: the transient scratch, freed before the cache clear so the boundary check counts it (the grow
         // allocates decode's window 0); a holder that kept it refuses here by name (TransientStillReferenced).
         var released_here: u64 = 0;
@@ -1571,7 +1579,7 @@ pub const Module = struct {
             released_here = switch (self.arm) {
                 inline else => |t| t.arm.releaseTransient() catch |e| return self.refuseBoundary(e),
             };
-            marks[2] = VmMark.now();
+            if (v) marks[2] = VmMark.now();
         }
         freed_device += released_here;
         const transient_freed = released_here;
@@ -1587,7 +1595,7 @@ pub const Module = struct {
         };
         const bound: ?u64 = if (uf) |x| x.bound else null;
         const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms, bound);
-        marks[3] = VmMark.now();
+        if (v) marks[3] = VmMark.now();
         self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = released_here, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
         checkSettled(before, st.after, freed_device, bound) catch |e| return self.refuseBoundary(e);
         try self.observe(.released);
@@ -1595,11 +1603,13 @@ pub const Module = struct {
         switch (self.arm) {
             inline else => |t| try t.arm.growRows(&self.g, self.grown_rows orelse t.arm.decode_rows),
         }
-        marks[4] = VmMark.now();
-        const grown_m = BoundaryMemory.now();
-        self.phase_change.?.grown = grown_m;
-        self.decode_host = .{ .after_grow = hostSideOf(grown_m) };
-        log.info("NATIVE decode host side: after the grow {d} B (footprint {d} B less MLX active {d} B and cache {d} B)\n", .{ self.decode_host.after_grow.?, grown_m.footprint, grown_m.active, grown_m.cache });
+        if (v) {
+            marks[4] = VmMark.now();
+            const grown_m = BoundaryMemory.now();
+            self.phase_change.?.grown = grown_m;
+            self.decode_host = .{ .after_grow = hostSideOf(grown_m) };
+            log.info("NATIVE decode host side: after the grow {d} B (footprint {d} B less MLX active {d} B and cache {d} B)\n", .{ self.decode_host.after_grow.?, grown_m.footprint, grown_m.active, grown_m.cache });
+        }
         try self.observe(.grown);
         self.logPhaseChange();
         for (marks, [_][]const u8{ "start", "after the embedding fence", "after the transient release", "after the frees (settled)", "after the banks grew" }) |mark, name| if (mark) |m|

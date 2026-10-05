@@ -277,7 +277,7 @@ pub fn Accepted(comptime G: type) type {
         /// 128-row down text and rot_widen1. A failed check refuses it by name (SelfCheckFailed, `diag`) and the
         /// waves stay stock.
         pub fn routeFusedDown(self: *Self, set: *const ks.Set, diag: *Diag) !void {
-            try set.selfCheck(self.a, &w1_texts, .startup, &self.report, diag);
+            try set.selfCheck(self.a, &w1_texts, .compile, &self.report, diag);
             for (self.waves) |*w| w.installDown(.fused);
             self.fused_down = true;
         }
@@ -360,7 +360,7 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
         acc.report.deinit(a);
         a.destroy(acc);
     }
-    try set.selfCheck(a, &checked_at_accept, .startup, &acc.report, diag);
+    try set.selfCheck(a, &checked_at_accept, .compile, &acc.report, diag);
     acc.gemv = try Gemv(G).init(g, &set.reg);
     errdefer acc.gemv.deinit(g);
     acc.prep = try RinPrep(G).init(g, &set.reg);
@@ -2572,7 +2572,7 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
         defer accf.deinit(&tf);
         try accf.routeFusedDown(set, &diag);
         try testing.expect(accf.fused_down and !acc.fused_down);
-        try testing.expectEqual(acc.report.results.items.len + 2, accf.report.results.items.len); // its startup plan: compile + the family probe
+        try testing.expectEqual(acc.report.results.items.len + w1_texts.len, accf.report.results.items.len); // its construction plan: one compile per text
         var fused_log: std.ArrayList(u8) = .empty;
         defer fused_log.deinit(a);
         const nf = try movedLaneLog(a, &tf, &set.reg, accf, try namedBank(&tf, 64), &fused_log);
@@ -3479,7 +3479,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
 // The served construction's self-checks alone, on the device (a guarded step: the GPU lock held). The two plans the
 // served module judges at construction, the EXL3 quant's accept subset and the V4.1 trunk's, each result printed
 // (PASS / FAIL, words / bad, metric / limit, the reference side), then the module's verdict. No model, no bank.
-test "dsv41 selfcheck device: the served construction's self-check plans, every result printed" {
+test "dsv41 pre-ship gate: the kernels' full self-check plan on the device, every result printed (DSV41_SELFCHECK_DEVICE)" {
     if (std.c.getenv("DSV41_SELFCHECK_DEVICE") == null) return error.SkipZigTest;
     const trunk = @import("dsv41_kernel_routes.zig");
     @import("sdk").log.enableStderr(); // the results are this test's output
@@ -3493,8 +3493,8 @@ test "dsv41 selfcheck device: the served construction's self-check plans, every 
     };
     defer set.deinit();
     var failed: usize = 0;
-    // Both depths, each timed: the construction runs `.startup`; `.full` is the manifest's whole plan.
-    inline for (.{ selfcheck.Depth.startup, selfcheck.Depth.full }) |depth| {
+    // Both depths, each timed: the construction runs `.compile`; `.full` is the manifest's whole plan (the numeric probes).
+    inline for (.{ selfcheck.Depth.compile, selfcheck.Depth.full }) |depth| {
         inline for (.{ .{ "exl3_quant_accept", &checked_at_accept }, .{ "trunk_routes", &trunk.kernels } }) |plan| {
             var report: selfcheck.Report = .{};
             defer report.deinit(a);
@@ -3512,4 +3512,6 @@ test "dsv41 selfcheck device: the served construction's self-check plans, every 
         }
     }
     std.debug.print("DSV41_SELFCHECK_DEVICE done failed={d}\n", .{failed});
+    // The pre-ship gate (the served construction runs compiles only): every numeric probe of the manifest passes here.
+    try testing.expectEqual(@as(usize, 0), failed);
 }

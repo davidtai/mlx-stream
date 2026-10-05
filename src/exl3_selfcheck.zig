@@ -277,41 +277,24 @@ fn checkFormTwin(h: *H, k: Kernel) !void {
 }
 
 /// How much of each kernel's manifest plan runs.
-/// - `startup` (the construction's acceptance): every kernel compiles and launches, and each kernel family gets one exact
-///   probe against a reference (its first kernel's, by `probe_order`). It protects what differs per machine and per
-///   build (a text that does not compile or bind, a family whose numerics left their reference).
-/// - `full` (the device test, `DSV41_SELFCHECK_DEVICE`): every check of the manifest, the per-site row invariance,
-///   twins, golden tiles and compositions included. Those are properties of the texts, fixed by the manifest's sha256.
-pub const Depth = enum { startup, full };
-
-/// The reference checks in the order a family's startup probe picks them (host f64 first).
-const probe_order = [_]Check{ .f64, .mlx_chain, .decode_table, .join_equiv, .golden_tiles, .composition };
+/// - `compile` (the construction's acceptance): every kernel compiles, binds and completes one launch on generated inputs;
+///   no numeric comparison (David 10-05: the server's startup runs no numeric probes). A kernel that does not compile or
+///   bind refuses the load by name (SelfCheckFailed).
+/// - `full` (the device test, `DSV41_SELFCHECK_DEVICE`, and the window smoke tests): every check of the manifest: the
+///   exact references (host f64, the MLX chain, the decode table, the join, golden tiles, compositions), the per-site row
+///   invariance and the twins. The numeric probes live there only.
+pub const Depth = enum { compile, full };
 
 /// The checks of `want`'s entries at `depth`, per kernel, in registry order (`stubPlan` runs the same plan).
 pub fn plan(reg: *const xk.Registry, want: std.EnumSet(Kernel), depth: Depth) std.EnumArray(Kernel, std.EnumSet(Check)) {
     var out: std.EnumArray(Kernel, std.EnumSet(Check)) = .initFill(.empty);
-    var probed: [64][]const u8 = undefined;
-    var n_probed: usize = 0;
     for (&reg.entries) |*e| {
         if (!want.contains(e.kernel)) continue;
         var cs = e.checks;
         // layout_guard is never run: its oracle was MLX's own mxfp8 quantized_matmul (MLX's to verify, not ours);
         // the rcproj kernels' f64 checks cover them.
         cs.remove(.layout_guard);
-        if (depth == .startup) {
-            var keep: std.EnumSet(Check) = .empty;
-            if (cs.contains(.compile)) keep.insert(.compile);
-            const seen = for (probed[0..n_probed]) |f| {
-                if (std.mem.eql(u8, f, e.family)) break true;
-            } else false;
-            if (!seen) for (probe_order) |c| if (cs.contains(c)) {
-                keep.insert(c);
-                probed[n_probed] = e.family;
-                n_probed += 1;
-                break;
-            };
-            cs = keep;
-        }
+        if (depth == .compile) cs = cs.intersectWith(comptime std.EnumSet(Check).initOne(.compile));
         out.set(e.kernel, cs);
     }
     return out;
@@ -2175,29 +2158,23 @@ test "dsv41 kernels gpu: every kernel of record passes its self-check" {
     try verdict;
 }
 
-test "dsv41 selfcheck: the startup plan compiles every kernel and probes each family once; the full plan is the manifest's" {
+test "dsv41 selfcheck: the construction plan compiles every kernel and probes nothing; the full plan is the manifest's" {
     const a = testing.allocator;
     var diag: xk.Diag = .{};
     var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
     defer reg.deinit();
     const every: std.EnumSet(Kernel) = .full;
     const full = plan(&reg, every, .full);
-    const startup = plan(&reg, every, .startup);
+    const compile = plan(&reg, every, .compile);
     var n_full: usize = 0;
-    var n_startup: usize = 0;
-    var n_probes: usize = 0;
     for (&reg.entries) |*e| {
         var manifest = e.checks;
         manifest.remove(.layout_guard);
         try testing.expect(full.get(e.kernel).eql(manifest));
-        const s = startup.get(e.kernel);
-        try testing.expect(s.contains(.compile) and s.subsetOf(manifest));
-        try testing.expect(!s.contains(.row_invariance) and !s.contains(.twin) and !s.contains(.fused));
-        try testing.expect(s.count() <= 2);
+        // every manifest kernel has its compile check; the construction runs it and nothing else
+        try testing.expect(manifest.contains(.compile));
+        try testing.expect(compile.get(e.kernel).eql(std.EnumSet(Check).initOne(.compile)));
         n_full += manifest.count();
-        n_startup += s.count();
-        n_probes += s.count() - 1;
     }
-    std.debug.print("\nself-check plan: full {d} checks, startup {d} ({d} compiles + {d} family probes)\n", .{ n_full, n_startup, reg.entries.len, n_probes });
-    try testing.expect(n_startup < n_full);
+    std.debug.print("\nself-check plan: full {d} checks (the device test), construction {d} compiles\n", .{ n_full, reg.entries.len });
 }

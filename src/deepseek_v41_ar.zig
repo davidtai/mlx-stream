@@ -385,6 +385,56 @@ const ServedRecord = struct {
 // last prompt token alone (Module.extend: the phase change first, once), then each generated id alone, greedy.
 // Records the ids and each step's logits sha256 / top-2 / margin in the ar-ref format; prints the comparison with
 // the reference's ids (the harness schedule) without judging it (the wide lane is rounding-class).
+// DSV41_VERIFY_DEVICE=1 DSV41_BANK=<bank> DSV41_VERIFY_BASELINE_GB=<the box's non-file baseline> DSV41_VERIFY_CEILING_GB=<the
+// guard's ceiling> [DSV41_VERIFY_STOP_BYTES=<the server's wired margin, default 2 GiB>] (a guarded window): the pre-ship
+// gate of what the served construction no longer runs (David 10-05: tests belong in the test suite). The served Module
+// built exactly as the server builds it (`Module.initWith`, the server's admission and default context), with
+// `RouteOverrides.verify`: the construction's numeric probes (the prefill call sites against the stock chain, the posted
+// Engram gathers, the host embedding rows against the device table, the event gates, the read-ahead, the arm's banks
+// against the quant) and the construction check, with the served check's tolerances unchanged: the bill's rows equal the
+// arm's, the constructed footprint within `construction_tolerance_bytes` of the billed construction terms, the host
+// side within its billed bound (`ConstructionOverBill`). A refusal fails the test by name. The kernels' numeric plan is
+// the companion test "dsv41 pre-ship gate: the kernels' full self-check plan" (DSV41_SELFCHECK_DEVICE).
+test "dsv41 pre-ship gate: the served Module's construction, verified (probes and the construction check; DSV41_VERIFY_DEVICE)" {
+    if (std.c.getenv("DSV41_VERIFY_DEVICE") == null) return error.SkipZigTest;
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    testing.log_level = .info;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try host_bridge.loadConfig(io, a, bank_dir);
+    const base = std.c.getenv("DSV41_VERIFY_BASELINE_GB") orelse return error.VerifyBaselineMissing;
+    config.memory_baseline_bytes = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(base)) * 1e9));
+    const ceil = std.c.getenv("DSV41_VERIFY_CEILING_GB") orelse return error.VerifyCeilingMissing;
+    const ceiling: u64 = @intFromFloat(@round(try std.fmt.parseFloat(f64, std.mem.span(ceil)) * 1e9));
+    const stop_bytes: u64 = if (std.c.getenv("DSV41_VERIFY_STOP_BYTES")) |v| try std.fmt.parseInt(u64, std.mem.span(v), 10) else 2 << 30;
+    const stop = WindowStop.set(stop_bytes, ceiling);
+    defer stop.restore();
+    var prev = mlx.mlx_device{ .ctx = null };
+    _ = mlx.mlx_get_default_device(&prev);
+    defer {
+        _ = mlx.mlx_set_default_device(prev);
+        _ = mlx.mlx_device_free(prev);
+    }
+    const dev = mlx.mlx_device_new_type(.gpu, 0);
+    defer _ = mlx.mlx_device_free(dev);
+    try mlx.check(mlx.mlx_set_default_device(dev));
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
+    defer weights.deinit();
+    const t0 = std.Io.Timestamp.now(io, .awake);
+    const m = module.Module.initWith(gpa, io, &config, &weights, s, hostBox(), .{ .verify = true }) catch |e| {
+        std.debug.print("DSV41_VERIFY_DEVICE refused: {t}\n", .{e});
+        return e;
+    };
+    defer m.deinit();
+    const ms = @as(f64, @floatFromInt(@max(t0.untilNow(io, .awake).nanoseconds, 0))) / 1e6;
+    std.debug.print("DSV41_VERIFY_DEVICE PASS construction verified in {d:.0} ms (rows {d} / {d})\n", .{ ms, m.bill.prefill_rows, m.bill.decode_rows });
+}
+
 test "dsv41 ar: the served schedule through the served module records its greedy ids" {
     if (!servedSchedule()) return error.SkipZigTest;
     const ref_path = std.mem.span(std.c.getenv("DSV41_AR_REF") orelse return error.SkipZigTest);
@@ -436,7 +486,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const vm_start = sdk.memory.vmBytes();
     var weights = try model.loadWeightsOpt(io, gpa, bank_dir, dss.resident_load_opts);
     defer weights.deinit();
-    const m = try module.Module.init(gpa, io, &config, &weights, s, hostBox());
+    const m = try module.Module.initWith(gpa, io, &config, &weights, s, hostBox(), .{ .verify = true });
     defer m.deinit();
     const constructed = phaseMemory("module constructed", m.bill.constructionTerms(), 0, vm_start.external);
     printPhaseMemory(a, constructed);
@@ -1839,6 +1889,8 @@ fn cellBill(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, ar
 /// sweep size (`max_context_tokens`) bills every length up to it.
 fn cellModuleOverrides(ov: module.RouteOverrides, config: *const settings.Config, prompt_tokens: usize) module.RouteOverrides {
     var o = ov;
+    // The window cells are verification harnesses: the construction's probes and check, the boundaries' readings.
+    o.verify = true;
     if (config.max_context_tokens == null) o.bill_pinned_prompt = prompt_tokens;
     return o;
 }

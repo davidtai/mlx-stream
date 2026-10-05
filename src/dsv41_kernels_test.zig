@@ -113,37 +113,37 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     defer set.deinit();
     set.install(Trace, &t);
     try testing.expectEqual(@as(*const xk.Bound, &set.bound), t.launcher.?);
-    // the startup plan of a subset: every kernel's compile, one probe per kernel family
+    // the construction plan of a subset: every kernel's compile, no numeric probe
     const Plan = struct {
         fn count(reg: *const xk.Registry, subset: []const Kernel) usize {
-            const p = selfcheck.plan(reg, ks.subsetOf(subset), .startup);
+            const p = selfcheck.plan(reg, ks.subsetOf(subset), .compile);
             var n: usize = 0;
             for (subset) |k| n += p.get(k).count();
             return n;
         }
-        /// The first check of `subset`'s startup plan that is not a compile (a scripted failure must be one that runs).
+        /// The first check of `subset`'s construction plan (a compile: a scripted failure must be one that runs).
         fn probe(reg: *const xk.Registry, subset: []const Kernel) struct { k: Kernel, c: xk.Check } {
-            const p = selfcheck.plan(reg, ks.subsetOf(subset), .startup);
+            const p = selfcheck.plan(reg, ks.subsetOf(subset), .compile);
             for (&reg.entries) |*e| {
                 var it = p.get(e.kernel).iterator();
-                while (it.next()) |c| if (c != .compile) return .{ .k = e.kernel, .c = c };
+                while (it.next()) |c| return .{ .k = e.kernel, .c = c };
             }
             unreachable;
         }
     };
-    // the EXL3 quant: exactly its startup plan, the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
+    // the EXL3 quant: exactly its construction plan, the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
     const acc = try eq.accept(Trace, a, &t, .{ .kernels = set.ref() }, v41_spec, &diag);
     const exl3_plan = Plan.count(&set.reg, &eq.checked_at_accept);
     try testing.expectEqual(exl3_plan, acc.report.results.items.len);
-    // every kernel compiles at startup; at most one probe per family
-    try testing.expect(exl3_plan > eq.checked_at_accept.len and exl3_plan < 60);
+    // every kernel compiles at construction, and nothing else runs
+    try testing.expectEqual(eq.checked_at_accept.len, exl3_plan);
     const ex = ks.subsetOf(&eq.kernels);
     for (acc.report.results.items) |r| try testing.expect(ex.contains(r.kernel) and r.ok);
     try testing.expectEqual(@as(isize, 288), t.prepared_live);
     try testing.expectEqual(@as(usize, 40), acc.waves.len);
-    // the fused down GEMM's arm: its startup checks join the report, and every layer's waves launch it
+    // the fused down GEMM's arm: its compiles join the report, and every layer's waves launch it
     const fused_checks = Plan.count(&set.reg, &eq.w1_texts);
-    try testing.expectEqual(@as(usize, 2), fused_checks);
+    try testing.expectEqual(eq.w1_texts.len, fused_checks);
     try testing.expectEqual(@as(u32, 5), acc.waves[0].wave_launches);
     try acc.routeFusedDown(set, &diag);
     try testing.expectEqual(exl3_plan + fused_checks, acc.report.results.items.len);
@@ -173,7 +173,7 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expectEqual(@as(isize, 288 + 48), t.prepared_live);
     try acc.routeForms(&t, .{});
     try testing.expectEqual(@as(isize, 288), t.prepared_live);
-    // the trunk: its own startup plan, none of the EXL3 kernels
+    // the trunk: its own construction plan, none of the EXL3 kernels
     var rep: selfcheck.Report = .{};
     defer rep.deinit(a);
     try tr.accept(a, set, &rep, &diag);
@@ -185,7 +185,7 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     for (tr.kernels) |k| nf[1] += full_trunk.get(k).count();
     std.debug.print("\nconstruction self-checks (checks, before sites): EXL3 accept {d} -> {d}, trunk {d} -> {d}\n", .{ nf[0], exl3_plan, nf[1], rep.results.items.len });
     for (rep.results.items) |r| try testing.expect(!ex.contains(r.kernel) and r.ok);
-    // a scripted failure of a planned probe refuses its owner's accept by name; the other consumer's passes
+    // a scripted failure of a planned compile refuses its owner's accept by name; the other consumer's passes
     const pe = Plan.probe(&set.reg, &eq.checked_at_accept);
     const pt = Plan.probe(&set.reg, &tr.kernels);
     const Fail = struct { k: Kernel, c: xk.Check, exl3: bool };
