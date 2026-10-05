@@ -282,6 +282,12 @@ pub fn Accepted(comptime G: type) type {
             self.fused_down = true;
         }
 
+        /// The decode route texts (the forms', the banked route's) compiled at construction with the rest of the set
+        /// (`.compile`: compile, bind, one launch), so no route text compiles at its first decode launch.
+        pub fn compileTexts(self: *Self, set: *const ks.Set, texts: []const Kernel, diag: *Diag) !void {
+            try set.selfCheck(self.a, texts, .compile, &self.report, diag);
+        }
+
         /// The routed decode forms, at construction (before any decode): the GEMVs rebuilt on the forms' texts. Exact by
         /// the registry's twin checks (every word == mul1h's) and kbench v9; no device check here.
         pub fn routeForms(self: *Self, g: *G, forms: Forms) !void {

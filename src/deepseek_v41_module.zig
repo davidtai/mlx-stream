@@ -198,19 +198,24 @@ pub fn growFill(ov: RouteOverrides) expert_stream.GrowFill {
 }
 
 /// The forms `routeForms` rebuilds the decode GEMVs on at construction, or null (the accept-time GEMVs kept): any
-/// form set.
-pub fn formsRoute(ov: RouteOverrides) ?xq.Forms {
-    const f = ov.routed_forms orelse xq.Forms{};
+/// form set. Unset, stack4's (`settings.Config.dsv41DecodeStack4`): down_pair and gu_one.
+pub const stack4_forms: xq.Forms = .{ .down_pair = true, .gu_one = true };
+pub fn formsRoute(ov: RouteOverrides, stack4: bool) ?xq.Forms {
+    const f = ov.routed_forms orelse if (stack4) stack4_forms else xq.Forms{};
     return if (f.down_pair or f.gu_one) f else null;
 }
 
 test "dsv41 module: the routed forms rebuild the GEMVs only when a form is set" {
     // unset or stock: the accept-time GEMVs stay
-    try std.testing.expect(formsRoute(.{}) == null);
-    try std.testing.expect(formsRoute(.{ .routed_forms = .{} }) == null);
-    try std.testing.expectEqual(xq.Forms{ .gu_one = true }, formsRoute(.{ .routed_forms = .{ .gu_one = true } }).?);
-    try std.testing.expectEqual(xq.Forms{ .down_pair = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true } }).?);
-    try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true, .gu_one = true } }).?);
+    inline for (.{ false, true }) |s4| {
+        try std.testing.expect(formsRoute(.{ .routed_forms = .{} }, s4) == null);
+        try std.testing.expectEqual(xq.Forms{ .gu_one = true }, formsRoute(.{ .routed_forms = .{ .gu_one = true } }, s4).?);
+        try std.testing.expectEqual(xq.Forms{ .down_pair = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true } }, s4).?);
+        try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true, .gu_one = true } }, s4).?);
+    }
+    // unset: stack4's forms when it is the default, else the accept-time GEMVs
+    try std.testing.expect(formsRoute(.{}, false) == null);
+    try std.testing.expectEqual(stack4_forms, formsRoute(.{}, true).?);
 }
 
 /// The fill granule the Module installs (a row unless set).
@@ -344,9 +349,9 @@ pub fn multiturnRoute(ov: RouteOverrides) bool {
 }
 
 /// A0 (a)'s route the Module installs: the capture and the warm class together (off by default).
-/// DEVROUTE as the hook binds it (`devroute`): off unless set.
-pub fn devRoute(ov: RouteOverrides) bool {
-    return ov.devroute orelse false;
+/// DEVROUTE as the hook binds it (`devroute`): the override, else stack4's default.
+pub fn devRoute(ov: RouteOverrides, stack4: bool) bool {
+    return ov.devroute orelse stack4;
 }
 
 /// DRAFT_AHEAD as the loop binds it (`draft_ahead`): off unless set.
@@ -354,14 +359,19 @@ pub fn draftAhead(ov: RouteOverrides) bool {
     return ov.draft_ahead orelse false;
 }
 
-/// DRAFT_STAGED as the head binds it (`draft_staged`): off unless set.
-pub fn draftStaged(ov: RouteOverrides) bool {
-    return ov.draft_staged orelse false;
+/// DRAFT_STAGED as the head binds it (`draft_staged`): the override, else stack4's default.
+pub fn draftStaged(ov: RouteOverrides, stack4: bool) bool {
+    return ov.draft_staged orelse stack4;
 }
 
-/// HOIST_FIRST as the hook binds it (`hoist_first`): off unless set.
-pub fn hoistFirst(ov: RouteOverrides) bool {
-    return ov.hoist_first orelse false;
+/// HOIST_FIRST as the hook binds it (`hoist_first`): the override, else stack4's default.
+pub fn hoistFirst(ov: RouteOverrides, stack4: bool) bool {
+    return ov.hoist_first orelse stack4;
+}
+
+/// ROUTED_BANKED as the quant installs it (`routed_banked`): the override, else stack4's default.
+pub fn routedBanked(ov: RouteOverrides, stack4: bool) bool {
+    return ov.routed_banked orelse stack4;
 }
 
 /// The phase change's settle poll the Module installs: the setting over its condition's default (`until_freed`:
@@ -606,9 +616,17 @@ pub const Module = struct {
             self.exl3.routeFusedDown(self.set, &kd) catch |e| return refused(refuse(&diag, e, "exl3 fused down: {s}", .{kd.message()}), &diag);
         }
         // The routed decode forms, when overridden: the GEMVs rebuilt on their texts (exact by the registry's twins).
-        if (formsRoute(ov)) |f| try self.exl3.routeForms(&self.g, f);
+        if (formsRoute(ov, config.dsv41DecodeStack4())) |f| {
+            var kd: xk.Diag = .{};
+            self.exl3.compileTexts(self.set, &xq.form_texts, &kd) catch |e| return refused(refuse(&diag, e, "exl3 routed forms: {s}", .{kd.message()}), &diag);
+            try self.exl3.routeForms(&self.g, f);
+        }
         // The banked route, when overridden: after the forms (it aliases their GEMVs' statics); the hook binds its waves.
-        if (ov.routed_banked orelse false) try self.exl3.routeBanked(&self.g);
+        if (routedBanked(ov, config.dsv41DecodeStack4())) {
+            var kd: xk.Diag = .{};
+            self.exl3.compileTexts(self.set, &xq.banked_texts, &kd) catch |e| return refused(refuse(&diag, e, "exl3 routed banked: {s}", .{kd.message()}), &diag);
+            try self.exl3.routeBanked(&self.g);
+        }
         // The admission at the admitted rows, BEFORE any slot bank or Module resident is allocated
         // (run 3ah refused only after construction, at an 82.7 GiB footprint): the native bill at the
         // box's wired bytes now (nothing of the Module wired yet); a plan that does not fit refuses here.
@@ -804,7 +822,7 @@ pub const Module = struct {
         };
         log.info("NATIVE decode fill granule: {t} ({d} single decode records past the rows)\n", .{ self.installed.decode_fill_granule, self.decode_extra });
         log.info("NATIVE draft experts: resident ({d} x {d} B)\n", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
-        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .head_mx = if (self.model.head_mx) |*hm| hm else null, .staged_commit = draftStaged(ov) });
+        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .head_mx = if (self.model.head_mx) |*hm| hm else null, .staged_commit = draftStaged(ov, config.dsv41DecodeStack4()) });
         errdefer self.head.deinit(&self.g);
         // DRAFT_STAGED: exact by construction (the block's graph unchanged; each stage's outputs committed once built).
         self.installed.draft_staged = self.head.stagedCommit();
@@ -933,7 +951,7 @@ pub const Module = struct {
         opts.transient_release = transientRelease(self.overrides);
         opts.grow_fill = growFill(self.overrides);
         const wide = wideRoute(config);
-        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wide, .banked = self.exl3.banked != null, .hoist_first = hoistFirst(self.overrides), .devroute = devRoute(self.overrides) }, diag) catch |e| return refused(e, diag);
+        const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wide, .banked = self.exl3.banked != null, .hoist_first = hoistFirst(self.overrides, config.dsv41DecodeStack4()), .devroute = devRoute(self.overrides, config.dsv41DecodeStack4() and self.exl3.banked != null) }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
         if (self.overrides.verify) checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
         // LOOKAHEAD4 (the verification harness): a gated call's waves against the same slots waited.

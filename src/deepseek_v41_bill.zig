@@ -472,7 +472,10 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
     const positions = billedPositions(prompt_tokens, max_tokens);
     const rows: u64 = mdl.Model(ops.MlxOps).scratch_rows;
     // A verify forward's (and the draft block's) live set: verify_wave, the geometric bound (G3).
-    const decode_wave = verifyWaveBytes(&c, rows, positions, c.dspark.block_size);
+    // stack4's DEVROUTE (on by default with ROUTED_BANKED): its resident LUTs and one layer's device hit wave beside it.
+    const stack4 = config.dsv41DecodeStack4();
+    const devroute = module.devRoute(ov, stack4 and module.routedBanked(ov, stack4));
+    const decode_wave = verifyWaveBytes(&c, rows, positions, c.dspark.block_size) + if (devroute) devrouteBytes(&c, rows) else 0;
     // The phases' buffers (printed): the checkpoint's tensors as the Module keeps them, what it builds, the state, the slot banks.
     const persistent_arrays = m.totalTensors() - droppedResidentArrays(&c, headRoute(ov), denseRc(ov)) + builtResidentArrays(&c, headRoute(ov), denseRc(ov)) + em.totalTensors() + wire_arrays_state + (@as(u64, c.n_layers) + 1) * expert_bank.n_components;
     return .{
@@ -577,6 +580,61 @@ pub fn verifyWaveBytes(c: *const v41.Config, rows: u64, positions: u64, block: u
     const carry = 2 * m * @as(u64, c.index_topk) * hd * 4 + 2 * m * p + 2 * m * c.hc_mult * d * 4;
     const pending = m * 8 * d * 4 + block * @as(u64, c.vocab_size) * 4;
     return index + attn + prim + lane + verify_glue_bytes + carry + pending;
+}
+
+/// DEVROUTE's decode bytes beside verify_wave, by geometry (`experts.devLutsAtGrow` / `devWave`): every layer's two
+/// resident LUTs (u32 [n_experts], kept from the grow), and one layer's device hit wave (a forward resets its handles
+/// per layer) over every routed pair of `rows` rows: the gathered input row and the token / id vectors, then the banked
+/// texts' outputs (`exl3_quant.Banked`): in_rin's two rotated inputs, gate | up's two, gu_epi's SwiGLU, din_rin's
+/// rotated hidden, the down GEMV's and dpost's rows: five hidden-wide and four inter-wide rows a pair, at f32.
+pub fn devrouteBytes(c: *const v41.Config, rows: u64) u64 {
+    const pairs = rows * c.n_experts_per_tok;
+    return devrouteLutBytes(c) + pairs * devroute_pair_ids_bytes + pairs * devroutePairBytes(c);
+}
+
+pub fn devrouteLutBytes(c: *const v41.Config) u64 {
+    return @as(u64, c.n_layers) * 2 * c.n_routed_experts * 4;
+}
+
+/// A routed pair's device-wave rows: the gathered input row and the banked texts' five hidden- / four inter-wide outputs.
+pub fn devroutePairBytes(c: *const v41.Config) u64 {
+    return 5 * @as(u64, c.hidden_size) * 4 + 4 * @as(u64, c.moe_intermediate_size) * 4;
+}
+
+/// A routed pair's id (the LUT's take, u32) and its token index (int32).
+pub const devroute_pair_ids_bytes: u64 = 8;
+
+test "dsv41 memory: DEVROUTE's pair bytes cover the gathered row and every banked text's outputs, read from the manifest" {
+    const xk = @import("exl3_kernels.zig");
+    const c = try realConfig();
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    // stack4's forms (gu_one, down_pair) and the stock forms the route may also take: the larger per-row sum binds.
+    const sets = [_][]const xk.Kernel{
+        &.{ .dsv41_exl3_b3_prep_in_rin, .dsv41_exl3_b3_guone_k3_2304, .dsv41_exl3_b3_prep_gu_epi, .dsv41_exl3_b3_prep_din_rin, .dsv41_exl3_b3_pair_k3_5120, .dsv41_exl3_b3_moeprep_dpost },
+        &.{ .dsv41_exl3_b3_prep_in_rin, .dsv41_exl3_b3_mul1h_k3_2304, .dsv41_exl3_b3_mul1h_k3_2304, .dsv41_exl3_b3_prep_gu_epi, .dsv41_exl3_b3_prep_din_rin, .dsv41_exl3_b3_mul1h_k3_5120, .dsv41_exl3_b3_moeprep_dpost },
+    };
+    for (sets) |set| {
+        // the gathered input row (at most f32)
+        var per_row: u64 = @as(u64, c.hidden_size) * 4;
+        for (set) |k| {
+            const e = reg.get(k);
+            const s = e.samples[e.samples.len - 1];
+            const rows: u64 = s.vars.get(.rows);
+            var bytes: u64 = 0;
+            for (s.output_shapes, s.output_dtypes) |shape, dt| {
+                var n: u64 = 1;
+                for (shape) |d| n *= d;
+                bytes += n * ops.dtypeSize(dt);
+            }
+            per_row += bytes / rows;
+        }
+        try testing.expect(per_row <= devroutePairBytes(&c));
+    }
+    // 8 verify rows x top-6: 48 pairs; 40 layers x 2 x 384 LUT words.
+    try testing.expectEqual(@as(u64, 40 * 2 * 384 * 4), devrouteLutBytes(&c));
+    try testing.expectEqual(devrouteLutBytes(&c) + 48 * (devroute_pair_ids_bytes + devroutePairBytes(&c)), devrouteBytes(&c, 8));
 }
 
 /// verify_wave's allowance for a layer's projections, rope, HC tail, router, shared and routed chains and Engram at
@@ -1256,7 +1314,8 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     try testing.expectEqual(@as(u64, 900_000_000), b.constructionTerms().host_reserve);
     try testing.expectEqual(@as(u64, 0), b.lookahead_staging + b.wide_window + b.unbilled_overhead);
     // The verify and draft waves bill verify_wave (G3) at M 8, the fill's positions and the DSpark block.
-    try testing.expectEqual(@as(u64, 271_525_120), b.decode_wave);
+    // verify_wave plus stack4's DEVROUTE term (6,807,936 B at 8 rows).
+    try testing.expectEqual(@as(u64, 271_525_120 + 6_807_936), b.decode_wave);
     try testing.expectEqual(b.decode_wave, b.draft_wave);
     std.debug.print("\nfill and admission at v6's inputs: {d} / {d} rows, prompt total {d} B\n", .{ nr.prefill, nr.decode, b.prefillTotal() });
     // v6's failure mode is gone by construction: without the envelope planner the native bill does not read
@@ -1297,7 +1356,8 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     // Served run 19E: wire_tables (~0.16 GB a phase) and decode's buffer allowance: 9.20 GB posted on 134 -> 133 prompt rows.
     // Served run 19F: the re-frozen buffer allowances (decode 40.4 MB, prompt 17 MB): 9.20 GB decode 168 -> 167 (release on).
     // verify_wave (G3, 0.272 GB for 0.365): 9.20 GB decode back to 168.
-    // kv16-opt: the DSpark taps at the stream's width (-0.503 GB) add one prompt row at every baseline in these tables.
+    // kv16-opt: the DSpark taps at the stream's width (-0.503 GB) add one prompt row at every baseline in these tables;
+    // stack4's DEVROUTE term (+6.8 MB) moves no decode row.
     const every_window = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 135, .decode = 163 }, .on = .{ .prefill = 135, .decode = 163 } },
         .{ .base = 9_200_000_000, .off = .{ .prefill = 135, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },

@@ -102,7 +102,8 @@ test "dsv41 memory mini: billAt bills every term from the bank's own files and t
     try testing.expectEqual(pb.kvDecodeBytes(prompt, positions), b.kv_decode);
     try testing.expectEqual(bill.cacheOvershootPrompt(pb, prompt), b.cache_overshoot_prompt);
     try testing.expectEqual(bill.cacheOvershootDecode(pb, positions), b.cache_overshoot_decode);
-    try testing.expectEqual(bill.verifyWaveBytes(&c, 8, positions, c.dspark.block_size), b.decode_wave);
+    // stack4 is the served default: DEVROUTE's LUTs and device hit wave beside verify_wave.
+    try testing.expectEqual(bill.verifyWaveBytes(&c, 8, positions, c.dspark.block_size) + bill.devrouteBytes(&c, 8), b.decode_wave);
     try testing.expectEqual(b.decode_wave, b.draft_wave);
     try testing.expectEqual(dsl.seedRetainedBytes(&c, prompt), b.prompt_state);
     try testing.expectEqual(if (c.engram.n_layers > 0) bill.engramPostedBytes(c.engram, prompt) else 0, b.engram_posted);
