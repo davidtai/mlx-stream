@@ -69,6 +69,7 @@ pub fn applySettings(c: *Config, raw: std.json.Value) void {
 
 /// The load preflight's requirement: the native bill's process bound at the fill's floor rows.
 pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, c: *const Config, facts: *const sdk.LoadFacts, ceiling: u64) !u64 {
+    try module.checkCtxSize(c);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     return bill_mod.loadRequirementBytes(arena.allocator(), io, c.withFacts(facts), ceiling);

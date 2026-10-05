@@ -39439,6 +39439,572 @@
       "kind": "normal",
       "scale": 1.0
      },
+     "dtype": "bfloat16",
+     "name": "q",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "win",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "ring"
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "ring"
+     },
+     "dtype": "int32",
+     "name": "widx",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 2,
+      "kind": "range",
+      "lo": 0
+     },
+     "dtype": "bool_",
+     "name": "wval",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "ckv",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "store"
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "store"
+     },
+     "dtype": "int32",
+     "name": "cidx",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 1,
+       "v": "kc"
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "arm": "the P line of the tier of record (std30 prefill cell / record 3: DSV41_PREFILL_ATTNCORE=fused, DSV41_PREFILL_ATTN=topksum,hc, DSV41_PREFILL_ATTNHALF=idxscore,corevec,ropefuse, DSV41_PREFILL_SMALLK=all)",
+    "env": "DSV41_PREFILL_ATTNHALF",
+    "module": "q3_prefill_attnhalf_candidate.py",
+    "object": "make_vec_core(mx, Kernels(mx).vec, af.make_fused(..)) (the attncore core, rows > 8)",
+    "route": "rows 9..32 (ropefuse owns _attend above 32; rows <= 8: the decode attention)",
+    "value": "idxscore,corevec,ropefuse"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "header+join+source",
+     "join": "\n//----\n",
+     "sha256": "fedd07549edcdf77bc55b29a92b1a3f6baa250793fd7a73e539e97a698944748",
+     "symbol": "q3_prefill_attnhalf_candidate.kernel_sha256()['corevec_qk_cmp']"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1280,
+      1,
+      9
+     ],
+     "output_dtypes": [
+      "float32",
+      "bool_"
+     ],
+     "output_shapes": [
+      [
+       1,
+       9,
+       64,
+       604
+      ],
+      [
+       1,
+       9,
+       604
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 476
+      },
+      {
+       "name": "ring",
+       "value": 137
+      },
+      {
+       "name": "rows",
+       "value": 9
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1280,
+      1,
+      9
+     ],
+     "output_dtypes": [
+      "float32",
+      "bool_"
+     ],
+     "output_shapes": [
+      [
+       1,
+       9,
+       64,
+       640
+      ],
+      [
+       1,
+       9,
+       640
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 512
+      },
+      {
+       "name": "ring",
+       "value": 137
+      },
+      {
+       "name": "rows",
+       "value": 9
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1280,
+      1,
+      32
+     ],
+     "output_dtypes": [
+      "float32",
+      "bool_"
+     ],
+     "output_shapes": [
+      [
+       1,
+       32,
+       64,
+       604
+      ],
+      [
+       1,
+       32,
+       604
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 476
+      },
+      {
+       "name": "ring",
+       "value": 160
+      },
+      {
+       "name": "rows",
+       "value": 32
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1280,
+      1,
+      32
+     ],
+     "output_dtypes": [
+      "float32",
+      "bool_"
+     ],
+     "output_shapes": [
+      [
+       1,
+       32,
+       64,
+       640
+      ],
+      [
+       1,
+       32,
+       640
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 512
+      },
+      {
+       "name": "ring",
+       "value": 160
+      },
+      {
+       "name": "rows",
+       "value": 32
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "q3_ph_qkvec_cmp__kvbf16",
+   "notes": "TKV bfloat16 (kv16: the window ring and the compressed store in the reference's bf16): the text of record's own template, another instantiation",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "scores",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "add": 128,
+       "m": 1,
+       "v": "kc"
+      }
+     ]
+    },
+    {
+     "dtype": "bool_",
+     "name": "valid",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "add": 128,
+       "m": 1,
+       "v": "kc"
+      }
+     ]
+    }
+   ],
+   "phase": "prefill",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance"
+    ],
+    "lane_install_check": "q3_prefill_attnhalf_candidate.install (corevec / ropefuse): the attn-fuse stage-2 text pins, the counted substitutions, the _attend seam pin, and the warm of every (TQ, TKV) the attncore member builds; probe_q3_prefill_attnhalf.py: bitwise vs the attncore member / the stock _attend chain",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 6258,
+    "file": "q3_ph_qkvec_cmp.metal",
+    "sha256": "96679e5512a2e11af3571eadbcd861a8fa50bdb0d003324cc9b81d0cea5093ae"
+   },
+   "template": [
+    {
+     "dtype": "bfloat16",
+     "name": "TQ"
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "TKV"
+    },
+    {
+     "int": 0,
+     "name": "SPLIT"
+    }
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "tiers": [
+    "exact",
+    "typical"
+   ],
+   "variant": {
+    "key": {
+     "input_dtypes": [
+      "bfloat16",
+      "bfloat16",
+      "int32",
+      "bool_",
+      "bfloat16",
+      "int32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "text_sha256": "96679e5512a2e11af3571eadbcd861a8fa50bdb0d003324cc9b81d0cea5093ae"
+    },
+    "mlx_name": "q3_ph_qkvec_cmp",
+    "of": "q3_ph_qkvec_cmp"
+   },
+   "vars": [
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 16777216,
+     "lo": 1,
+     "name": "ring"
+    },
+    {
+     "hi": 16777216,
+     "lo": 1,
+     "name": "store"
+    },
+    {
+     "hi": 512,
+     "lo": 1,
+     "name": "kc"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": {
+    "field": "kernel_sha256/corevec_qk_cmp",
+    "log": "std30-prefill-fast-exl3-30-guard-20260928.log",
+    "records": 1,
+    "tag": "Q3_PREFILL_ATTNHALF_INSTALL",
+    "value": "fedd07549edcdf77bc55b29a92b1a3f6baa250793fd7a73e539e97a698944748"
+   },
+   "ensure_row_contiguous": true,
+   "family": "pf_attn_core",
+   "grid": [
+    {
+     "add": 256,
+     "div": 128,
+     "m": 256,
+     "v": "kc"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    }
+   ],
+   "header": {
+    "bytes": 31389,
+    "file": "header_attnfuse_s2.metal",
+    "id": "attnfuse_s2",
+    "sha256": "354018f560e12e6f1defb31c3d4bb269885501b851281bd449df12ad2750a645"
+   },
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
      "dtype": "float32",
      "name": "q",
      "role": "rows",
@@ -41066,6 +41632,506 @@
     "exact",
     "typical"
    ],
+   "vars": [
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 16777216,
+     "lo": 1,
+     "name": "ring"
+    },
+    {
+     "hi": 16777216,
+     "lo": 1,
+     "name": "store"
+    },
+    {
+     "hi": 512,
+     "lo": 1,
+     "name": "kc"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": {
+    "field": "kernel_sha256/corevec_pv_cmp",
+    "log": "std30-prefill-fast-exl3-30-guard-20260928.log",
+    "records": 1,
+    "tag": "Q3_PREFILL_ATTNHALF_INSTALL",
+    "value": "165a888f8138ef2b72abcefd0752db50433467ccc7e95690f79e9c571e1e6359"
+   },
+   "ensure_row_contiguous": true,
+   "family": "pf_attn_core",
+   "grid": [
+    {
+     "m": 1024
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    }
+   ],
+   "header": {
+    "bytes": 31389,
+    "file": "header_attnfuse_s2.metal",
+    "id": "attnfuse_s2",
+    "sha256": "354018f560e12e6f1defb31c3d4bb269885501b851281bd449df12ad2750a645"
+   },
+   "inputs": [
+    {
+     "domain": {
+      "hi": 1.0,
+      "kind": "uniform",
+      "lo": 0.0
+     },
+     "dtype": "float32",
+     "name": "ex",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "add": 128,
+       "m": 1,
+       "v": "kc"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 64.0,
+      "kind": "uniform",
+      "lo": 1.0
+     },
+     "dtype": "float32",
+     "name": "denom",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 1
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "win",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "ring"
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "ring"
+     },
+     "dtype": "int32",
+     "name": "widx",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 2,
+      "kind": "range",
+      "lo": 0
+     },
+     "dtype": "bool_",
+     "name": "wval",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "ckv",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "store"
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "store"
+     },
+     "dtype": "int32",
+     "name": "cidx",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 1,
+       "v": "kc"
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "arm": "the P line of the tier of record (std30 prefill cell / record 3: DSV41_PREFILL_ATTNCORE=fused, DSV41_PREFILL_ATTN=topksum,hc, DSV41_PREFILL_ATTNHALF=idxscore,corevec,ropefuse, DSV41_PREFILL_SMALLK=all)",
+    "env": "DSV41_PREFILL_ATTNHALF",
+    "module": "q3_prefill_attnhalf_candidate.py",
+    "object": "make_vec_core(mx, Kernels(mx).vec, af.make_fused(..)) (the attncore core, rows > 8)",
+    "route": "rows 9..32 (ropefuse owns _attend above 32; rows <= 8: the decode attention)",
+    "value": "idxscore,corevec,ropefuse"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "header+join+source",
+     "join": "\n//----\n",
+     "sha256": "165a888f8138ef2b72abcefd0752db50433467ccc7e95690f79e9c571e1e6359",
+     "symbol": "q3_prefill_attnhalf_candidate.kernel_sha256()['corevec_pv_cmp']"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1024,
+      1,
+      9
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       9,
+       64,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 476
+      },
+      {
+       "name": "ring",
+       "value": 137
+      },
+      {
+       "name": "rows",
+       "value": 9
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      1,
+      9
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       9,
+       64,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 512
+      },
+      {
+       "name": "ring",
+       "value": 137
+      },
+      {
+       "name": "rows",
+       "value": 9
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      1,
+      32
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       32,
+       64,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 476
+      },
+      {
+       "name": "ring",
+       "value": 160
+      },
+      {
+       "name": "rows",
+       "value": 32
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      1,
+      32
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       32,
+       64,
+       512
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 512
+      },
+      {
+       "name": "ring",
+       "value": 160
+      },
+      {
+       "name": "rows",
+       "value": 32
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "q3_ph_pvvec_cmp__kvbf16",
+   "notes": "TKV bfloat16 (kv16: the window ring and the compressed store in the reference's bf16): the text of record's own template, another instantiation",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "o",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 512
+      }
+     ]
+    }
+   ],
+   "phase": "prefill",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance"
+    ],
+    "lane_install_check": "q3_prefill_attnhalf_candidate.install (corevec / ropefuse): the attn-fuse stage-2 text pins, the counted substitutions, the _attend seam pin, and the warm of every (TQ, TKV) the attncore member builds; probe_q3_prefill_attnhalf.py: bitwise vs the attncore member / the stock _attend chain",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 4459,
+    "file": "q3_ph_pvvec_cmp.metal",
+    "sha256": "4cbb5c8a1f499ff2e2310e145f2056c103e32022fcedf3ed27530701bf326d9f"
+   },
+   "template": [
+    {
+     "dtype": "bfloat16",
+     "name": "TKV"
+    }
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "tiers": [
+    "exact",
+    "typical"
+   ],
+   "variant": {
+    "key": {
+     "input_dtypes": [
+      "float32",
+      "float32",
+      "bfloat16",
+      "int32",
+      "bool_",
+      "bfloat16",
+      "int32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      }
+     ],
+     "text_sha256": "4cbb5c8a1f499ff2e2310e145f2056c103e32022fcedf3ed27530701bf326d9f"
+    },
+    "mlx_name": "q3_ph_pvvec_cmp",
+    "of": "q3_ph_pvvec_cmp"
+   },
    "vars": [
     {
      "hi": 1048576,
@@ -43617,6 +44683,732 @@
       "kind": "normal",
       "scale": 1.0
      },
+     "dtype": "bfloat16",
+     "name": "q",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "win",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "ring"
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "ring"
+     },
+     "dtype": "int32",
+     "name": "widx",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 2,
+      "kind": "range",
+      "lo": 0
+     },
+     "dtype": "bool_",
+     "name": "wval",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "ckv",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "store"
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "store"
+     },
+     "dtype": "int32",
+     "name": "cidx",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 1,
+       "v": "kc"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "qcos",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "qsin",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 32
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "arm": "the P line of the tier of record (std30 prefill cell / record 3: DSV41_PREFILL_ATTNCORE=fused, DSV41_PREFILL_ATTN=topksum,hc, DSV41_PREFILL_ATTNHALF=idxscore,corevec,ropefuse, DSV41_PREFILL_SMALLK=all)",
+    "env": "DSV41_PREFILL_ATTNHALF",
+    "module": "q3_prefill_attnhalf_candidate.py",
+    "object": "make_rope_core(mx, Kernels(mx).rope, af.make_fused(..)) (_q3_ph_rope_attend in the rewritten _attend)",
+    "route": "rows > 32 (ROPE_MIN_ROWS; rows <= 32 keep the bound base _attend)",
+    "value": "idxscore,corevec,ropefuse"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "header+join+source",
+     "join": "\n//----\n",
+     "sha256": "2f3d0454562b52d34d3c17d21193788884b3296f76b9eaf00038d735f7718fbd",
+     "symbol": "q3_prefill_attnhalf_candidate.kernel_sha256()['ropefuse_qk_cmp']"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1280,
+      1,
+      33
+     ],
+     "output_dtypes": [
+      "float32",
+      "bool_"
+     ],
+     "output_shapes": [
+      [
+       1,
+       33,
+       64,
+       604
+      ],
+      [
+       1,
+       33,
+       604
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 476
+      },
+      {
+       "name": "ring",
+       "value": 161
+      },
+      {
+       "name": "rows",
+       "value": 33
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1280,
+      1,
+      33
+     ],
+     "output_dtypes": [
+      "float32",
+      "bool_"
+     ],
+     "output_shapes": [
+      [
+       1,
+       33,
+       64,
+       640
+      ],
+      [
+       1,
+       33,
+       640
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 512
+      },
+      {
+       "name": "ring",
+       "value": 161
+      },
+      {
+       "name": "rows",
+       "value": 33
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1280,
+      1,
+      183
+     ],
+     "output_dtypes": [
+      "float32",
+      "bool_"
+     ],
+     "output_shapes": [
+      [
+       1,
+       183,
+       64,
+       604
+      ],
+      [
+       1,
+       183,
+       604
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 476
+      },
+      {
+       "name": "ring",
+       "value": 311
+      },
+      {
+       "name": "rows",
+       "value": 183
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1280,
+      1,
+      183
+     ],
+     "output_dtypes": [
+      "float32",
+      "bool_"
+     ],
+     "output_shapes": [
+      [
+       1,
+       183,
+       64,
+       640
+      ],
+      [
+       1,
+       183,
+       640
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 512
+      },
+      {
+       "name": "ring",
+       "value": 311
+      },
+      {
+       "name": "rows",
+       "value": 183
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1280,
+      1,
+      953
+     ],
+     "output_dtypes": [
+      "float32",
+      "bool_"
+     ],
+     "output_shapes": [
+      [
+       1,
+       953,
+       64,
+       604
+      ],
+      [
+       1,
+       953,
+       604
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 476
+      },
+      {
+       "name": "ring",
+       "value": 1081
+      },
+      {
+       "name": "rows",
+       "value": 953
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1280,
+      1,
+      953
+     ],
+     "output_dtypes": [
+      "float32",
+      "bool_"
+     ],
+     "output_shapes": [
+      [
+       1,
+       953,
+       64,
+       640
+      ],
+      [
+       1,
+       953,
+       640
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 512
+      },
+      {
+       "name": "ring",
+       "value": 1081
+      },
+      {
+       "name": "rows",
+       "value": 953
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "q3_ph_qkrope_cmp__kvbf16",
+   "notes": "TKV bfloat16 (kv16: the window ring and the compressed store in the reference's bf16): the text of record's own template, another instantiation",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "scores",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "add": 128,
+       "m": 1,
+       "v": "kc"
+      }
+     ]
+    },
+    {
+     "dtype": "bool_",
+     "name": "valid",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "add": 128,
+       "m": 1,
+       "v": "kc"
+      }
+     ]
+    }
+   ],
+   "phase": "prefill",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance"
+    ],
+    "lane_install_check": "q3_prefill_attnhalf_candidate.install (corevec / ropefuse): the attn-fuse stage-2 text pins, the counted substitutions, the _attend seam pin, and the warm of every (TQ, TKV) the attncore member builds; probe_q3_prefill_attnhalf.py: bitwise vs the attncore member / the stock _attend chain",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 7847,
+    "file": "q3_ph_qkrope_cmp.metal",
+    "sha256": "51e8ca3da39d639ac48267ad99fcf4de700bc954bc3b7b3108745b0bdd0e9fee"
+   },
+   "template": [
+    {
+     "dtype": "bfloat16",
+     "name": "TQ"
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "TKV"
+    },
+    {
+     "int": 0,
+     "name": "SPLIT"
+    }
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "tiers": [
+    "exact",
+    "typical"
+   ],
+   "variant": {
+    "key": {
+     "input_dtypes": [
+      "bfloat16",
+      "bfloat16",
+      "int32",
+      "bool_",
+      "bfloat16",
+      "int32",
+      "float32",
+      "float32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TQ"
+      },
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 0,
+       "name": "SPLIT"
+      }
+     ],
+     "text_sha256": "51e8ca3da39d639ac48267ad99fcf4de700bc954bc3b7b3108745b0bdd0e9fee"
+    },
+    "mlx_name": "q3_ph_qkrope_cmp",
+    "of": "q3_ph_qkrope_cmp"
+   },
+   "vars": [
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 16777216,
+     "lo": 1,
+     "name": "ring"
+    },
+    {
+     "hi": 16777216,
+     "lo": 1,
+     "name": "store"
+    },
+    {
+     "hi": 512,
+     "lo": 1,
+     "name": "kc"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": {
+    "field": "kernel_sha256/ropefuse_qk_cmp",
+    "log": "std30-prefill-fast-exl3-30-guard-20260928.log",
+    "records": 1,
+    "tag": "Q3_PREFILL_ATTNHALF_INSTALL",
+    "value": "2f3d0454562b52d34d3c17d21193788884b3296f76b9eaf00038d735f7718fbd"
+   },
+   "ensure_row_contiguous": true,
+   "family": "pf_attn_core",
+   "grid": [
+    {
+     "add": 256,
+     "div": 128,
+     "m": 256,
+     "v": "kc"
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    }
+   ],
+   "header": {
+    "bytes": 31389,
+    "file": "header_attnfuse_s2.metal",
+    "id": "attnfuse_s2",
+    "sha256": "354018f560e12e6f1defb31c3d4bb269885501b851281bd449df12ad2750a645"
+   },
+   "inputs": [
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
      "dtype": "float32",
      "name": "q",
      "role": "rows",
@@ -45729,6 +47521,661 @@
     "exact",
     "typical"
    ],
+   "vars": [
+    {
+     "hi": 1048576,
+     "lo": 1,
+     "name": "rows"
+    },
+    {
+     "hi": 16777216,
+     "lo": 1,
+     "name": "ring"
+    },
+    {
+     "hi": 16777216,
+     "lo": 1,
+     "name": "store"
+    },
+    {
+     "hi": 512,
+     "lo": 1,
+     "name": "kc"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "device_evidence": {
+    "field": "kernel_sha256/ropefuse_pv_cmp",
+    "log": "std30-prefill-fast-exl3-30-guard-20260928.log",
+    "records": 1,
+    "tag": "Q3_PREFILL_ATTNHALF_INSTALL",
+    "value": "b864122429d2ded8b94dc318984d2b1718c7bed7f692e3c47239a4ac7c1a1caf"
+   },
+   "ensure_row_contiguous": true,
+   "family": "pf_attn_core",
+   "grid": [
+    {
+     "m": 1024
+    },
+    {
+     "m": 1
+    },
+    {
+     "m": 1,
+     "v": "rows"
+    }
+   ],
+   "header": {
+    "bytes": 31389,
+    "file": "header_attnfuse_s2.metal",
+    "id": "attnfuse_s2",
+    "sha256": "354018f560e12e6f1defb31c3d4bb269885501b851281bd449df12ad2750a645"
+   },
+   "inputs": [
+    {
+     "domain": {
+      "hi": 1.0,
+      "kind": "uniform",
+      "lo": 0.0
+     },
+     "dtype": "float32",
+     "name": "ex",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "add": 128,
+       "m": 1,
+       "v": "kc"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 64.0,
+      "kind": "uniform",
+      "lo": 1.0
+     },
+     "dtype": "float32",
+     "name": "denom",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 1
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "win",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "ring"
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "ring"
+     },
+     "dtype": "int32",
+     "name": "widx",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "domain": {
+      "hi": 2,
+      "kind": "range",
+      "lo": 0
+     },
+     "dtype": "bool_",
+     "name": "wval",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "bfloat16",
+     "name": "ckv",
+     "role": "shared",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "store"
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "index",
+      "of": "store"
+     },
+     "dtype": "int32",
+     "name": "cidx",
+     "role": "rows",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 1,
+       "v": "kc"
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "qcos",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "domain": {
+      "kind": "normal",
+      "scale": 1.0
+     },
+     "dtype": "float32",
+     "name": "qsin",
+     "role": "rows",
+     "shape": [
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 32
+      }
+     ]
+    }
+   ],
+   "lane": {
+    "arm": "the P line of the tier of record (std30 prefill cell / record 3: DSV41_PREFILL_ATTNCORE=fused, DSV41_PREFILL_ATTN=topksum,hc, DSV41_PREFILL_ATTNHALF=idxscore,corevec,ropefuse, DSV41_PREFILL_SMALLK=all)",
+    "env": "DSV41_PREFILL_ATTNHALF",
+    "module": "q3_prefill_attnhalf_candidate.py",
+    "object": "make_rope_core(mx, Kernels(mx).rope, af.make_fused(..)) (_q3_ph_rope_attend in the rewritten _attend)",
+    "route": "rows > 32 (ROPE_MIN_ROWS; rows <= 32 keep the bound base _attend)",
+    "value": "idxscore,corevec,ropefuse"
+   },
+   "lane_pins": [
+    {
+     "hash_of": "header+join+source",
+     "join": "\n//----\n",
+     "sha256": "b864122429d2ded8b94dc318984d2b1718c7bed7f692e3c47239a4ac7c1a1caf",
+     "symbol": "q3_prefill_attnhalf_candidate.kernel_sha256()['ropefuse_pv_cmp']"
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1024,
+      1,
+      33
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       8,
+       33,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 8,
+       "name": "GH"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 476
+      },
+      {
+       "name": "ring",
+       "value": 161
+      },
+      {
+       "name": "rows",
+       "value": 33
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      1,
+      33
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       8,
+       33,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 8,
+       "name": "GH"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 512
+      },
+      {
+       "name": "ring",
+       "value": 161
+      },
+      {
+       "name": "rows",
+       "value": 33
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      1,
+      183
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       8,
+       183,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 8,
+       "name": "GH"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 476
+      },
+      {
+       "name": "ring",
+       "value": 311
+      },
+      {
+       "name": "rows",
+       "value": 183
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      1,
+      183
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       8,
+       183,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 8,
+       "name": "GH"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 512
+      },
+      {
+       "name": "ring",
+       "value": 311
+      },
+      {
+       "name": "rows",
+       "value": 183
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      1,
+      953
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       8,
+       953,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 8,
+       "name": "GH"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 476
+      },
+      {
+       "name": "ring",
+       "value": 1081
+      },
+      {
+       "name": "rows",
+       "value": 953
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      1,
+      953
+     ],
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       8,
+       953,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 8,
+       "name": "GH"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "kc",
+       "value": 512
+      },
+      {
+       "name": "ring",
+       "value": 1081
+      },
+      {
+       "name": "rows",
+       "value": 953
+      },
+      {
+       "name": "store",
+       "value": 4096
+      }
+     ]
+    }
+   ],
+   "math_mode": "safe",
+   "name": "q3_ph_pvrope_cmp__kvbf16",
+   "notes": "TKV bfloat16 (kv16: the window ring and the compressed store in the reference's bf16): the text of record's own template, another instantiation",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "o",
+     "row_axis": 1,
+     "shape": [
+      {
+       "m": 8
+      },
+      {
+       "m": 1,
+       "v": "rows"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    }
+   ],
+   "phase": "prefill",
+   "self_check": {
+    "checks": [
+     "compile",
+     "row_invariance"
+    ],
+    "lane_install_check": "q3_prefill_attnhalf_candidate.install (corevec / ropefuse): the attn-fuse stage-2 text pins, the counted substitutions, the _attend seam pin, and the warm of every (TQ, TKV) the attncore member builds; probe_q3_prefill_attnhalf.py: bitwise vs the attncore member / the stock _attend chain",
+    "rows_max": 8
+   },
+   "source": {
+    "bytes": 5789,
+    "file": "q3_ph_pvrope_cmp.metal",
+    "sha256": "08abfcfb293ac6ba0a717f493711e4413e0d9d41687a5abbca2a98264fd05243"
+   },
+   "template": [
+    {
+     "dtype": "bfloat16",
+     "name": "TKV"
+    },
+    {
+     "int": 8,
+     "name": "GH"
+    }
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ],
+   "tiers": [
+    "exact",
+    "typical"
+   ],
+   "variant": {
+    "key": {
+     "input_dtypes": [
+      "float32",
+      "float32",
+      "bfloat16",
+      "int32",
+      "bool_",
+      "bfloat16",
+      "int32",
+      "float32",
+      "float32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "TKV"
+      },
+      {
+       "int": 8,
+       "name": "GH"
+      }
+     ],
+     "text_sha256": "08abfcfb293ac6ba0a717f493711e4413e0d9d41687a5abbca2a98264fd05243"
+    },
+    "mlx_name": "q3_ph_pvrope_cmp",
+    "of": "q3_ph_pvrope_cmp"
+   },
    "vars": [
     {
      "hi": 1048576,
@@ -54772,6 +57219,121 @@
     "dsv41_exl3_b3_guone_k3_2304"
    ],
    "manifest_sha256": "1aee687704d0009f85155621acdfb8917c7ba1446f652f5209b19028204beac4"
+  },
+  {
+   "headers": [
+    "attnfuse",
+    "attnfuse_s2",
+    "attnhalf_idx",
+    "dig2_x",
+    "dig_mul1_k3",
+    "dig_mul1h_k3",
+    "hctape",
+    "index_topk",
+    "mxfp8_m1rows",
+    "pf_hc",
+    "rcproj",
+    "router_tail",
+    "smallk",
+    "woa_e4m3",
+    "joinless",
+    "dig_mul1h_k3_lut",
+    "hcpost_tf32"
+   ],
+   "kernels": [
+    "dsv41_exl3_mul1h_k3_2304",
+    "dsv41_exl3_mul1h_k3_5120",
+    "q3_exl3_prep_in_rin",
+    "q3_exl3_prep_gu_epi",
+    "q3_exl3_prep_din_rin",
+    "q3_moeprep_dpost",
+    "q3rc_gate_part",
+    "q3rc_router_tail",
+    "q3rc_premix_part",
+    "q3rc_premix_fin",
+    "q3dk_sinkhorn16_hc4_it20",
+    "q3rc_mxfp8_fma",
+    "q3ht_combine",
+    "q3ht_collapse_norm",
+    "q3ht_combine_collapse_norm",
+    "q3ht_mixfin",
+    "q3_prefill_fused_exl3x3_mul1lut_k3_bf16",
+    "q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3",
+    "q3_prefill_dig_gemm_2304x5120_xmul1hk3",
+    "q3_prefill_dig_rot_take2_5120",
+    "q3_prefill_dig_rot_roundx_2304",
+    "q3_prefill_dig2_swiglu_2304_x",
+    "q3_prefill_dig_rot_widen2_2304",
+    "q3_prefill_dig_rot_widen1_5120",
+    "q3_exl3_dig_decmat_5120x2304_mul1hk3",
+    "q3_exl3_dig_decmat_2304x5120_mul1hk3",
+    "q3_exl3_dig_decmat_5120x2304_mul1k3",
+    "q3_exl3_dig_decmat_2304x5120_mul1k3",
+    "mtplx_dsv4_sinkhorn_hc4_it20",
+    "mtplx_dsv41_fp_rmsnorm_tg128_d1280",
+    "mtplx_dsv41_fp_rmsnorm_rope_tg128_d512_rd64",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_fwd",
+    "mtplx_dsv41_fp_rope_h64_hd512_rd64_inv",
+    "q3rc_gate_part__n128",
+    "q3rc_router_tail__n128_top3",
+    "q3ht_combine__f32",
+    "q3ht_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32",
+    "q3ht_combine_collapse_norm__f32_rbf16",
+    "q3drc_mxfp8_fma_f32x",
+    "q3rc_mxfp8_fma__draft",
+    "dsv41_woa_decode_transpose_32",
+    "mtplx_dsv41_index_topk_select",
+    "q3_attnfuse_softmax",
+    "q3_attnfuse_softmax__ls128",
+    "dsv41_mxfp8_m1rows",
+    "dsv41_head_m1rows",
+    "dsv41_smallm_all",
+    "dsv41_smallm_all__bf16",
+    "q3_ph_index_score",
+    "q3_ph_qkvec_win",
+    "q3_ph_qkvec_win__kvf32",
+    "q3_ph_qkvec_win__qf32",
+    "q3_ph_qkvec_win__qf32_kvf32",
+    "q3_ph_qkvec_cmp",
+    "q3_ph_qkvec_cmp__qf32",
+    "q3_ph_pvvec_win",
+    "q3_ph_pvvec_win__kvf32",
+    "q3_ph_pvvec_cmp",
+    "q3_ph_qkrope_win",
+    "q3_ph_qkrope_win__kvf32",
+    "q3_ph_qkrope_win__qf32",
+    "q3_ph_qkrope_win__qf32_kvf32",
+    "q3_ph_qkrope_cmp",
+    "q3_ph_qkrope_cmp__qf32",
+    "q3_ph_pvrope_win",
+    "q3_ph_pvrope_win__kvf32",
+    "q3_ph_pvrope_cmp",
+    "q3pf_hc_mix_rsqrt",
+    "q3pf_hc_pre_norm",
+    "q3pf_hc_mix_rsqrt__f32",
+    "q3pf_hc_pre_norm__f32",
+    "q3sk_combine",
+    "q3jl_combine",
+    "dsv41_prefill_dig_take2v_5120",
+    "dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128",
+    "dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut",
+    "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128",
+    "dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1",
+    "dsv41_exl3_pair_k3_5120",
+    "dsv41_exl3_guone_k3_2304",
+    "dsv41_hcpost_tf32",
+    "dsv41_hcpost_tf32__rbf16",
+    "dsv41_exl3_b3_mul1h_k3_2304",
+    "dsv41_exl3_b3_mul1h_k3_5120",
+    "dsv41_exl3_b3_prep_in_rin",
+    "dsv41_exl3_b3_prep_gu_epi",
+    "dsv41_exl3_b3_prep_din_rin",
+    "dsv41_exl3_b3_moeprep_dpost",
+    "dsv41_exl3_b3_pair_k3_5120",
+    "dsv41_exl3_b3_guone_k3_2304"
+   ],
+   "manifest_sha256": "c408265f2739942404e355be63910e34a632e181e7861716db0fa0e5f56230f7"
   }
  ],
  "sources": {

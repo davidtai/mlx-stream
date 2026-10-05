@@ -164,6 +164,11 @@ pub const PrefillBill = struct {
     pub const kept_pos_bytes: u64 = 256 << 10;
     /// `default_chunk_target_bytes` of the chunk rule the model forwards its prompt by.
     pub const chunk_target_bytes: f64 = 8e9;
+    /// kv16: the bytes of one stored KV element: the window ring's and the compressed store's rows are bf16 (the
+    /// reference's own storage, model.py:664-679 under generate.py:118's bf16 default); the index keys stay f32 (the
+    /// prompt's index score kernel takes f32 keys only).
+    pub const kv_store_bytes: u64 = 2;
+    pub const index_store_bytes: u64 = 4;
 
     pub fn of(c: *const Config, ring_geo: kvc.Geometry) PrefillBill {
         var min_ratio: u64 = 0;
@@ -176,8 +181,9 @@ pub const PrefillBill = struct {
             if (li.ratio > 0 and (min_ratio == 0 or li.ratio < min_ratio)) min_ratio = li.ratio;
             if (l >= c.n_layers) continue;
             kv += @as(u64, c.head_dim) * 4;
-            // The ring's row: layer 0's KV comes off the bf16 embedding stream, every later layer's is f32.
-            ring_row += @as(u64, c.head_dim) * @as(u64, if (l == 0) 2 else 4);
+            // The ring's row (kv16): every layer's KV comes off the bf16 stream, stored bf16 (the reference's
+            // `window_kv_cache`).
+            ring_row += @as(u64, c.head_dim) * kv_store_bytes;
             if (li.ratio == 0) continue;
             if (li.kv_source) src += @as(u64, c.head_dim) * 4 / li.ratio;
             if (li.index_source) src += @as(u64, c.index_head_dim) * 4 / li.ratio;
@@ -358,7 +364,7 @@ pub const PrefillBill = struct {
     pub fn laneMaxBytes(b: PrefillBill, positions: u64) u64 {
         const m: u32 = @intCast(positions);
         var n: u64 = 0;
-        for (b.kv_sources[0..b.n_kv_sources]) |r| n = @max(n, @as(u64, kvc.boundedCompCap(m, r).?) * @max(b.head_dim, b.index_head_dim) * 4);
+        for (b.kv_sources[0..b.n_kv_sources]) |r| n = @max(n, @as(u64, kvc.boundedCompCap(m, r).?) * @max(b.head_dim * kv_store_bytes, b.index_head_dim * index_store_bytes));
         return n;
     }
 
@@ -370,15 +376,16 @@ pub const PrefillBill = struct {
     pub const PlanBuf = struct { lanes: [max_layers]sdk_ext.kv.LanePlan, rings: [max_layers + 1]sdk_ext.kv.RingPlan };
 
     /// The served tier's KV plan (`sdk_ext.kv.Plan`) for a request of `positions`: per kv source its compressed and index
-    /// lane (one lane of head_dim + index_head_dim f32 rows at `boundedCompCap`), the window ring (one row over every
-    /// layer), and per ratio > 1 kv source its frontier's two rings (raw_kv, raw_score: head_dim f32 rows each).
+    /// lane (one lane of head_dim bf16 + index_head_dim f32 rows at `boundedCompCap`: kv16 stores the compressed rows bf16,
+    /// the index keys stay f32 for `q3_ph_index_score`), the window ring (one bf16 row over every layer), and per ratio > 1
+    /// kv source its frontier's two rings (raw_kv, raw_score: head_dim f32 rows each, as the reference's).
     pub fn kvPlan(b: PrefillBill, positions: u64, buf: *PlanBuf) sdk_ext.kv.Plan {
         const m: u32 = @intCast(positions);
         var n_rings: usize = 0;
         buf.rings[0] = .{ .window = b.window, .row_bytes = b.ring_row_bytes };
         n_rings += 1;
         for (b.kv_sources[0..b.n_kv_sources], 0..) |r, i| {
-            buf.lanes[i] = .{ .rows = kvc.boundedCompCap(m, r).?, .row_bytes = (b.head_dim + b.index_head_dim) * 4 };
+            buf.lanes[i] = .{ .rows = kvc.boundedCompCap(m, r).?, .row_bytes = b.head_dim * kv_store_bytes + b.index_head_dim * index_store_bytes };
             if (r > 1) {
                 buf.rings[n_rings] = .{ .window = r, .row_bytes = 2 * b.head_dim * 4 };
                 n_rings += 1;

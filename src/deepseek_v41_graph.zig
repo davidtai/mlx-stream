@@ -518,14 +518,14 @@ pub fn Trunk(comptime G: type) type {
                     // The kernel lane admits only the geometry its texts were derived for (each field
                     // compared by name, RouteInput): the model's, from its config.
                     const geo = prefillGeometry(c);
-                    // The prompt pass's dtypes: layer 0 reads the bf16 embedding stream (bf16 query and
-                    // window rows), every later layer the f32 stream; compressed rows are f32.
+                    // The prompt pass's dtypes (kv16): every layer reads the bf16 stream (bf16 query and window rows);
+                    // compressed rows are stored bf16 (the reference's `compress_kv_cache`).
                     for (c.layers[0..c.n_layers], 0..) |li, l| {
                         const kind: u8 = if (l == 0) 0 else if (li.ratio > 0) 2 else 1;
                         if (l == 0 and li.ratio > 0) return error.RouteInput;
                         k.prefill_attn_kind[l] = kind;
                         if (k.prefill_attn[kind] == null) {
-                            const dt: ops.Dtype = if (kind == 0) .bfloat16 else .float32;
+                            const dt: ops.Dtype = .bfloat16;
                             k.prefill_attn[kind] = try kr.PrefillAttn(G).init(g, reg, &geo, .rope, dt, dt, kind == 2, null);
                         }
                     }
@@ -1112,7 +1112,7 @@ pub fn Trunk(comptime G: type) type {
             const wts = try g.mul(wts0, try sf(g, softmax_scale * std.math.pow(f64, @floatFromInt(c.index_n_heads), -0.5), wts0));
             if (pi) |ix| {
                 // One launch: sum_h relu(q_h . k_n) w_h, -inf past each row's reach.
-                var score = try ix.score.call(g, q, index_k, try g.astype(wts, .float32), compress_lens);
+                var score = try ix.score.call(g, try g.astype(q, .float32), index_k, try g.astype(wts, .float32), compress_lens);
                 var cand: ?T = null;
                 if (set_candidates) {
                     cand = try candidateBlocks(g, c, score, compress_lens);
@@ -1170,8 +1170,8 @@ pub fn Trunk(comptime G: type) type {
                 try p.put("attn.comp_latent", lat);
                 try p.put("attn.compress_new", cnew);
                 try p.put("attn.index_new", inew);
-                try cache.compress.append(g, cnew);
-                try cache.index.append(g, inew);
+                try cache.compress.append(g, try g.astype(cnew, .bfloat16));
+                try cache.index.append(g, try g.astype(inew, .float32));
             }
             shared.compress_kv = try cache.compress.view(g);
             shared.index_k = try cache.index.view(g);
@@ -1712,7 +1712,7 @@ pub fn Trunk(comptime G: type) type {
                 if (l == c.n_layers) continue;
                 const li = c.layers[l];
                 const w = &layers[l];
-                const dt: Dtype = if (kind == 0) .bfloat16 else .float32;
+                const dt: Dtype = .bfloat16;
                 const fill = struct {
                     fn f(g_: *G, rr: std.Random, buf: []f32, shape: []const c_int, amp: f32, d: Dtype) !T {
                         var n: usize = 1;
@@ -1725,7 +1725,7 @@ pub fn Trunk(comptime G: type) type {
                 const window = try fill(g, r, scratch, &.{ 1, S, hd }, 1.0, dt);
                 var cmp: ?[2]T = null;
                 if (kind == 2) {
-                    const ckv = try fill(g, r, scratch, &.{ 1, Nc, hd }, 1.0, .float32);
+                    const ckv = try fill(g, r, scratch, &.{ 1, Nc, hd }, 1.0, .bfloat16);
                     var idx: [64 * 32]i32 = undefined;
                     for (0..64) |si| for (0..32) |j| {
                         idx[si * 32 + j] = if (j < (si + 1) / 2) @intCast(j) else -1;
@@ -2433,11 +2433,15 @@ pub fn Trunk(comptime G: type) type {
                 try p.put("attn.comb", a[3]);
             }
             try p.put("attn.x", a[0]);
-            const ao = try attention(g, p, c, rt, lk, li, w, inv_freq, a[0], positions, cache, shared);
+            const ao_raw = try attention(g, p, c, rt, lk, li, w, inv_freq, a[0], positions, cache, shared);
             var f: [5]T = undefined;
             if (hc_tape) {
-                try g.tape(HcFfnPrep, c, &.{ ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm }, &f);
+                try g.tape(HcFfnPrep, c, &.{ ao_raw, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm }, &f);
             } else {
+                // kv16: at prompt widths the attention output joins the stream in the stream's dtype (the reference's bf16
+                // `wo_b`; `hc_post` returns its x's dtype), so the residual stream stays bf16 through every layer. Decode
+                // rows keep their tapes' own dtypes (C14 / C16 already run the bf16 stream).
+                const ao = if (rowsOf(g, h, 2) > rc_max_rows) try g.astype(ao_raw, g.dtypeOf(h)) else ao_raw;
                 f = if (rt.prefill_hc_post and rowsOf(g, h, 2) > rc_max_rows)
                     try hcFfnPrepCompiledPost(g, c, lk, ao, h, a[1], a[2], a[3], w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm)
                 else
@@ -2469,8 +2473,9 @@ pub fn Trunk(comptime G: type) type {
         fn hcPostFused(g: *G, hp: *const kr.HcPostTf32(G), x: T, residual: T, post: T, comb: T) !T {
             const rs = g.shapeOf(residual);
             const m = rs.d[0] * rs.d[1];
-            const h = try hp.call(g, try g.reshape(x, &.{ m, rs.d[3] }), try g.reshape(residual, &.{ m, rs.d[2], rs.d[3] }), try g.reshape(post, &.{ m, rs.d[2] }), try g.reshape(comb, &.{ m, rs.d[2] * rs.d[2] }));
-            return g.reshape(h, rs.slice());
+            // The kernel computes in f32 over f32 x (the reference's hc_post: f32 math, `y.type_as(x)`): the result in x's dtype.
+            const h = try hp.call(g, try g.reshape(try g.astype(x, .float32), &.{ m, rs.d[3] }), try g.reshape(residual, &.{ m, rs.d[2], rs.d[3] }), try g.reshape(post, &.{ m, rs.d[2] }), try g.reshape(comb, &.{ m, rs.d[2] * rs.d[2] }));
+            return g.astype(try g.reshape(h, rs.slice()), g.dtypeOf(x));
         }
 
         /// `_PREFILL_HC_POST`: K16's ffn combine, always the compiled `_hc_post_impl` (PREFILL_HCPOST's one pass above
@@ -3531,12 +3536,13 @@ test "dsv41 graph: layer 2 (Full, ratio 2) pools a group every 2 tokens across p
         var shared: Tr.Share = .{};
         p.names.clearRetainingCapacity();
         p.nodes.clearRetainingCapacity();
-        const x = try g.input(&.{ 1, st.s, 5120 }, .float32);
+        // kv16: the bf16 stream in; the window ring and the compressed store bf16, the index keys f32.
+        const x = try g.input(&.{ 1, st.s, 5120 }, .bfloat16);
         const pos = try g.arange(@floatFromInt(pos0), @floatFromInt(pos0 + st.s), 1, .int32);
         const out = try Tr.attention(&g, &p, &c, &stock, .{}, li, &w, inv, x, pos, &cache, &shared);
         try expectShape(&g, out, &.{ 1, st.s, 5120 }, .float32);
-        try expectShape(&g, (try cache.window.view(&g)).?, &.{ 1, st.rows, 512 }, .float32);
-        try expectShape(&g, (try cache.compress.view(&g)).?, &.{ 1, st.comp, 512 }, .float32);
+        try expectShape(&g, (try cache.window.view(&g)).?, &.{ 1, st.rows, 512 }, .bfloat16);
+        try expectShape(&g, (try cache.compress.view(&g)).?, &.{ 1, st.comp, 512 }, .bfloat16);
         try expectShape(&g, (try cache.index.view(&g)).?, &.{ 1, st.comp, 128 }, .float32);
         try testing.expectEqual(p.get("attn.compress_new") != null, st.fresh);
         try expectStage(&g, &p, "attn.index_score", &.{ 1, st.s, st.comp }, .float32);
@@ -3908,8 +3914,8 @@ test "dsv41 graph: the K22 / K4 / K35 regions hold the eager ops, compiled only 
     try testing.expectEqual(@as(usize, 0), std.mem.count(O, prefill, &.{.tape_begin}));
 }
 
-/// K16's attention side and ffn combine over two layers (layer 0 on the bf16 embedding stream, layer 1 on the f32
-/// stream the combine writes), one chunk per width in order: the HcPost region's traces (`mx.compile`'s cache).
+/// K16's attention side and ffn combine over two layers (kv16: both on the bf16 stream, the attention output joining
+/// it at the stream's dtype), one chunk per width in order: the HcPost region's traces (`mx.compile`'s cache).
 fn k16HcPostTraces(rt: *const Routes, widths: []const c_int) !usize {
     var g = TraceOps.init(testing.allocator);
     defer g.deinit();
@@ -3927,10 +3933,11 @@ fn k16HcPostTraces(rt: *const Routes, widths: []const c_int) !usize {
             defer cache.deinit(&g);
             var shared: Tr.Share = .{};
             const half = try Tr.attnAndMoeInput(&g, NoProbe{}, &c, rt, .{}, li, w, inv, h, pm, try g.arange(0, @floatFromInt(s), 1, .int32), &cache, &shared);
-            // The combine's x at the MoE input's dtype (f32: the stream dtype of h1), as forwardLayerMajor casts it.
-            try testing.expectEqual(Dtype.float32, g.dtypeOf(half.moe_in));
+            // kv16: the combine's x at the MoE input's dtype (bf16: the stream dtype of h1), as forwardLayerMajor casts
+            // it; the stream stays bf16 through every layer (the reference's `y.type_as(x)`).
+            try testing.expectEqual(Dtype.bfloat16, g.dtypeOf(half.moe_in));
             h = try Tr.prefillHcPost(&g, &c, .{}, try g.input(g.shapeOf(half.moe_in).slice(), g.dtypeOf(half.moe_in)), half);
-            try testing.expectEqual(Dtype.float32, g.dtypeOf(h));
+            try testing.expectEqual(Dtype.bfloat16, g.dtypeOf(h));
             pm = half.ffn_pre;
         }
     }
@@ -3985,17 +3992,17 @@ test "dsv41 graph: HCPOST compiles both HC posts above 8 rows over the eager ops
         defer testing.allocator.free(on);
         try testing.expectEqualSlices(O, e, on);
     }
-    // The compile cost: K16's ffn combine already traces the region once per chunk width (x, h1, post, comb all
-    // f32); the attention side reuses that trace on the f32 stream (layers 1..) and adds one on layer 0's bf16
-    // stream: one added trace per chunk width, at that width's first chunk (two chunks of 64 rows, a 40-row tail).
+    // The compile cost (kv16: one bf16 signature): K16's ffn combine traces the region once per chunk width (x and h1
+    // bf16, post and comb f32); the attention side reuses that trace on every layer: no added trace (two chunks of 64
+    // rows, a 40-row tail: two widths).
     const widths = [_]c_int{ 64, 64, 40 };
     try testing.expectEqual(@as(usize, 2), try k16HcPostTraces(&.{}, &widths));
-    try testing.expectEqual(@as(usize, 4), try k16HcPostTraces(&.{ .prefill_hc_post = true }, &widths));
-    // The single-span pass (short prompts, the warm-up's 9..32): both combines traced per width, the bf16 stream's
-    // attention post and one f32 signature the ffn combine and later layers share; none with the route off.
+    try testing.expectEqual(@as(usize, 2), try k16HcPostTraces(&.{ .prefill_hc_post = true }, &widths));
+    // The single-span pass (short prompts, the warm-up's 9..32): both combines share the one bf16 signature per width;
+    // none with the route off.
     const span = [_]c_int{ 16, 16, 12 };
     try testing.expectEqual(@as(usize, 0), try spanHcPostTraces(&.{}, &span));
-    try testing.expectEqual(@as(usize, 4), try spanHcPostTraces(&.{ .prefill_hc_post = true }, &span));
+    try testing.expectEqual(@as(usize, 2), try spanHcPostTraces(&.{ .prefill_hc_post = true }, &span));
 }
 
 test "dsv41 graph: PREFILL_HCPOST runs both HC combines above 8 rows as one launch (the f32 or bf16 residual text), checked against the region; 8 rows and below keep their routes" {

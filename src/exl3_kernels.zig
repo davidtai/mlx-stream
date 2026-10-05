@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "c408265f2739942404e355be63910e34a632e181e7861716db0fa0e5f56230f7";
+pub const manifest_sha256 = "823b22d8bdedd66592f538adb15afccb610af898ed9cc4d36ee010fe3ec6d074";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
@@ -97,19 +97,23 @@ pub const Kernel = enum {
     q3_ph_qkvec_win__qf32,
     q3_ph_qkvec_win__qf32_kvf32,
     q3_ph_qkvec_cmp,
+    q3_ph_qkvec_cmp__kvbf16,
     q3_ph_qkvec_cmp__qf32,
     q3_ph_pvvec_win,
     q3_ph_pvvec_win__kvf32,
     q3_ph_pvvec_cmp,
+    q3_ph_pvvec_cmp__kvbf16,
     q3_ph_qkrope_win,
     q3_ph_qkrope_win__kvf32,
     q3_ph_qkrope_win__qf32,
     q3_ph_qkrope_win__qf32_kvf32,
     q3_ph_qkrope_cmp,
+    q3_ph_qkrope_cmp__kvbf16,
     q3_ph_qkrope_cmp__qf32,
     q3_ph_pvrope_win,
     q3_ph_pvrope_win__kvf32,
     q3_ph_pvrope_cmp,
+    q3_ph_pvrope_cmp__kvbf16,
     q3pf_hc_mix_rsqrt,
     q3pf_hc_pre_norm,
     q3pf_hc_mix_rsqrt__f32,
@@ -1179,7 +1183,7 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 91), n_kernels);
+    try testing.expectEqual(@as(usize, 95), n_kernels);
     try testing.expectEqual(@as(usize, 17), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
@@ -1194,7 +1198,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 12), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 13), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));
@@ -1259,6 +1263,11 @@ test "dsv41 kernels: prefill batch 2 carries its instantiations, the div / add r
         .{ .k = .q3_ph_qkrope_cmp__qf32, .base = .q3_ph_qkrope_cmp, .tq = .float32, .tkv = .float32 },
         .{ .k = .q3_ph_pvrope_win__kvf32, .base = .q3_ph_pvrope_win, .tq = null, .tkv = .float32 },
         .{ .k = .q3_ph_pvvec_cmp, .base = .q3_ph_pvvec_cmp, .tq = null, .tkv = .float32 },
+        // kv16: the bf16 window ring and compressed store on the compressed layers
+        .{ .k = .q3_ph_qkvec_cmp__kvbf16, .base = .q3_ph_qkvec_cmp, .tq = .bfloat16, .tkv = .bfloat16 },
+        .{ .k = .q3_ph_pvvec_cmp__kvbf16, .base = .q3_ph_pvvec_cmp, .tq = null, .tkv = .bfloat16 },
+        .{ .k = .q3_ph_qkrope_cmp__kvbf16, .base = .q3_ph_qkrope_cmp, .tq = .bfloat16, .tkv = .bfloat16 },
+        .{ .k = .q3_ph_pvrope_cmp__kvbf16, .base = .q3_ph_pvrope_cmp, .tq = null, .tkv = .bfloat16 },
     };
     for (vs) |v| {
         const e = reg.get(v.k);

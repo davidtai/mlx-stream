@@ -74,19 +74,23 @@ pub const kernels = [_]Kernel{
     .q3_ph_qkvec_win__qf32,
     .q3_ph_qkvec_win__qf32_kvf32,
     .q3_ph_qkvec_cmp,
+    .q3_ph_qkvec_cmp__kvbf16,
     .q3_ph_qkvec_cmp__qf32,
     .q3_ph_pvvec_win,
     .q3_ph_pvvec_win__kvf32,
     .q3_ph_pvvec_cmp,
+    .q3_ph_pvvec_cmp__kvbf16,
     .q3_ph_qkrope_win,
     .q3_ph_qkrope_win__kvf32,
     .q3_ph_qkrope_win__qf32,
     .q3_ph_qkrope_win__qf32_kvf32,
     .q3_ph_qkrope_cmp,
+    .q3_ph_qkrope_cmp__kvbf16,
     .q3_ph_qkrope_cmp__qf32,
     .q3_ph_pvrope_win,
     .q3_ph_pvrope_win__kvf32,
     .q3_ph_pvrope_cmp,
+    .q3_ph_pvrope_cmp__kvbf16,
     .q3pf_hc_mix_rsqrt,
     .q3pf_hc_pre_norm,
     .q3pf_hc_mix_rsqrt__f32,
@@ -1651,7 +1655,9 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
     // reshaped to [1, S, 128]
     const sink = try t.node(&.{ 1, 1, 64, 1 }, .float32, &.{});
     const Layer = struct { ring: Dtype, cmp: bool };
-    for ([_]CoreKind{ .vec, .rope }) |kind| for ([_]Dtype{ .bfloat16, .float32 }) |qdt| for ([_]Layer{ .{ .ring = .bfloat16, .cmp = false }, .{ .ring = .float32, .cmp = false }, .{ .ring = .float32, .cmp = true } }) |lay| {
+    // (kv16: the compressed layers' bf16 window and store, registered at a bf16 query only)
+    for ([_]CoreKind{ .vec, .rope }) |kind| for ([_]Dtype{ .bfloat16, .float32 }) |qdt| for ([_]Layer{ .{ .ring = .bfloat16, .cmp = false }, .{ .ring = .float32, .cmp = false }, .{ .ring = .float32, .cmp = true }, .{ .ring = .bfloat16, .cmp = true } }) |lay| {
+        if (lay.cmp and lay.ring == .bfloat16 and qdt != .bfloat16) continue;
         var r = try PrefillAttn(Trace).init(&t, &reg, &.derived, kind, qdt, lay.ring, lay.cmp, null);
         defer r.deinit(&t);
         try testing.expect(r.qk.samples.len > 0);
@@ -1667,7 +1673,7 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
             var keys: u64 = 128;
             if (lay.cmp) {
                 const kc: c_int = @intCast(s.vars.get(.kc));
-                cmp = .{ try t.node(&.{ 1, @intCast(s.vars.get(.store)), 512 }, .float32, &.{}), try t.node(&.{ 1, n_s, kc }, .int32, &.{}) };
+                cmp = .{ try t.node(&.{ 1, @intCast(s.vars.get(.store)), 512 }, lay.ring, &.{}), try t.node(&.{ 1, n_s, kc }, .int32, &.{}) };
                 ops_kv[0..2].* = cmp.?;
                 n_kv = 2;
                 keys += @intCast(kc);
@@ -1701,7 +1707,17 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
         }
     };
     // a dtype set the lane never warms, a mismatched call and a selection wider than index_topk
-    try testing.expectError(error.TemplateNotRegistered, PrefillAttn(Trace).init(&t, &reg, &.derived, .vec, .bfloat16, .bfloat16, true, null));
+    // kv16: the compressed layers' bf16 window and compressed store (the __kvbf16 instantiations of the same texts).
+    {
+        var pa = try PrefillAttn(Trace).init(&t, &reg, &.derived, .vec, .bfloat16, .bfloat16, true, null);
+        defer pa.deinit(&t);
+        try testing.expectEqual(Kernel.q3_ph_qkvec_cmp__kvbf16, pa.qk.kernel);
+        try testing.expectEqual(Kernel.q3_ph_pvvec_cmp__kvbf16, pa.pv.kernel);
+        var pr = try PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .bfloat16, .bfloat16, true, null);
+        defer pr.deinit(&t);
+        try testing.expectEqual(Kernel.q3_ph_qkrope_cmp__kvbf16, pr.qk.kernel);
+        try testing.expectEqual(Kernel.q3_ph_pvrope_cmp__kvbf16, pr.pv.kernel);
+    }
     try testing.expectError(error.TemplateNotRegistered, PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .float16, .float32, false, null));
     {
         var r = try PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, .bfloat16, .float32, true, null);
@@ -1791,11 +1807,10 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
             try testing.expect(std.mem.indexOf(u8, d.message(), "pf_hc norms is derived for " ++ name) != null);
         }
         try testing.expectEqual(kept, t.keeps);
-        // the native prompt pass's three layer kinds (the model lane, 09-29): layer 0 on the bf16
-        // embedding stream (q, window bf16, window-only), layer 1 on the f32 stream (window-only),
-        // the compressed layers f32 with the f32 compressed store
+        // the native prompt pass's layer kinds (kv16): every layer on the bf16 stream (q, window bf16), the
+        // compressed layers with the bf16 compressed store
         const Kind = struct { q: Dtype, ring: Dtype, cmp: bool };
-        for ([_]Kind{ .{ .q = .bfloat16, .ring = .bfloat16, .cmp = false }, .{ .q = .float32, .ring = .float32, .cmp = false }, .{ .q = .float32, .ring = .float32, .cmp = true } }) |k| {
+        for ([_]Kind{ .{ .q = .bfloat16, .ring = .bfloat16, .cmp = false }, .{ .q = .bfloat16, .ring = .bfloat16, .cmp = true } }) |k| {
             var r = try PrefillAttn(Trace).init(&t, &reg, &.derived, .rope, k.q, k.ring, k.cmp, null);
             r.deinit(&t);
         }

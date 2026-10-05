@@ -41,6 +41,9 @@ pub const Config = struct {
     /// Set, the construction bills every prompt length up to it (`bill.billCovering`); a longer request is refused by name
     /// before its prompt pass (`error.ContextOverBill`).
     max_context_tokens: ?u32 = null,
+    /// A `ctx_size` above the model's limit (`Config.max_ctx_size`): refused by name at load and construction
+    /// (`error.CtxSizeOverModelLimit`), never a silent fall back to the standard request's context.
+    ctx_size_over_limit: ?i64 = null,
     /// The wide prefill read schedule (null = the tier's defaults below).
     expert_wide_feed: ?bool = null,
     expert_wide_seed: ?bool = null,
@@ -109,8 +112,8 @@ pub const Config = struct {
         };
         // The model's context (`ctx_size`, the host's own key: the server refuses a longer prompt with a 400): the
         // construction bills every prompt up to it (`max_context_tokens`). Unset, the standard request's 16,384.
-        if (obj.get("ctx_size")) |v| if (v == .integer and v.integer >= 1 and v.integer <= max_ctx_size) {
-            c.max_context_tokens = @intCast(v.integer);
+        if (obj.get("ctx_size")) |v| if (v == .integer and v.integer >= 1) {
+            if (v.integer <= max_ctx_size) c.max_context_tokens = @intCast(v.integer) else c.ctx_size_over_limit = v.integer;
             any = true;
         };
         if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} billed_context={d}\n", .{
@@ -231,6 +234,9 @@ test "dsv41 settings: ctx_size bills every prompt up to it; anything else leaves
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": 0}")).max_context_tokens);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": \"131072\"}")).max_context_tokens);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": 2097152}")).max_context_tokens);
+    // Above the model's 1,048,576: kept, so the load refuses it by name.
+    try testing.expectEqual(@as(?i64, 2097152), (try settingsOf("{\"ctx_size\": 2097152}")).ctx_size_over_limit);
+    try testing.expectEqual(@as(?i64, null), (try settingsOf("{\"ctx_size\": 1048576}")).ctx_size_over_limit);
 }
 
 test "dsv41 settings: the reader schedule parses its knob list, a conflict is unset; the load facts replace the fill's inputs" {

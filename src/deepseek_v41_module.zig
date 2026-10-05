@@ -661,6 +661,7 @@ pub const Module = struct {
 
     /// `init` with a harness's route overrides (the served path passes none).
     pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, ov: RouteOverrides) !*Module {
+        try checkCtxSize(config);
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
@@ -2332,6 +2333,20 @@ pub const admitPhases = bill_mod.admitPhases;
 pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
 
 /// A request's prompt against the billed context (`Module.max_context`): longer is refused by name, once, before its pass.
+/// A `ctx_size` above the model's own limit (1,048,576: `max_position_embeddings`), refused by name before anything
+/// loads (`ctx_size_over_limit`): never silently the standard 16,384.
+pub fn checkCtxSize(config: *const settings.Config) error{CtxSizeOverModelLimit}!void {
+    const v = config.ctx_size_over_limit orelse return;
+    log.warn("NATIVE load refused: ctx_size {d} is over the model's limit of {d} tokens (CtxSizeOverModelLimit)", .{ v, settings.Config.max_ctx_size });
+    return error.CtxSizeOverModelLimit;
+}
+
+test "dsv41 module: a ctx_size over the model's limit is refused by name; at or under it passes" {
+    try checkCtxSize(&.{});
+    try checkCtxSize(&.{ .max_context_tokens = 1 << 20 });
+    try std.testing.expectError(error.CtxSizeOverModelLimit, checkCtxSize(&.{ .ctx_size_over_limit = (1 << 20) + 1 }));
+}
+
 pub fn checkContext(prompt_tokens: usize, max_context: u64, pinned: ?u64) error{ ContextOverBill, ContextNotPinned }!void {
     if (pinned) |p| {
         if (prompt_tokens == p) return;

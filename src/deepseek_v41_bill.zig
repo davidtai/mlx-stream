@@ -239,7 +239,9 @@ pub const prompt_buffer_allowance_bytes: u64 = 17_000_000;
 /// forward holds at once at decode rows (<= 8) and at prompt rows.
 pub const wire_arrays_state: u64 = 512;
 pub const wire_arrays_decode_wave: u64 = 704;
-pub const wire_arrays_prompt_wave: u64 = 4400;
+// kv16 (the attention output's cast into the bf16 stream at prompt widths: one more array a chunk and layer): the
+// bank trace's K16 wave holds 4,946 arrays (4,400 before); the bound with margin.
+pub const wire_arrays_prompt_wave: u64 = 5120;
 
 /// One phase boundary's memory record (NATIVE; probes at the four boundaries only: module constructed,
 /// end of the prompt pass, after the phase change, end of decode): the phase's billed terms, the
@@ -1257,14 +1259,14 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     // verify_wave (G3, 0.272 GB for 0.365): 9.20 GB decode back to 168.
     const every_window = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 131, .decode = 163 }, .on = .{ .prefill = 131, .decode = 163 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 162 }, .on = .{ .prefill = 130, .decode = 162 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 163 }, .on = .{ .prefill = 131, .decode = 163 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 130, .decode = 162 }, .on = .{ .prefill = 130, .decode = 162 } },
     };
     // With the transient release installed (SERVED16 for every request; since SERVED17 the route,
     // DSV41_CELL_TRANSIENT_RELEASE), decode bills window 0 only: +5 decode rows at each baseline.
     const window_0 = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 131, .decode = 168 }, .on = .{ .prefill = 131, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 167 }, .on = .{ .prefill = 130, .decode = 167 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 167 }, .on = .{ .prefill = 131, .decode = 167 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 130, .decode = 167 }, .on = .{ .prefill = 130, .decode = 167 } },
     };
     // The release route as the Module resolves it: the default (on), then each override.
@@ -1304,22 +1306,24 @@ test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's requ
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const pb = v41.PrefillBill.of(&c, module.numericTier(.served).kv);
     const positions = billedPositions(fill_prompt_tokens, fill_max_tokens);
-    // Compressed 125,935,616 + index 31,483,904 (the four kv sources): +36,700,160 and +9,175,040 over the fill's request.
+    // kv16: compressed 62,967,808 (bf16; 125,935,616 at f32) + index 31,483,904 (f32) over the four kv sources.
     try testing.expectEqual(@as(u64, 24_584), positions);
-    try testing.expectEqual(@as(u64, 157_419_520), pb.laneBytes(positions));
-    // The window ring: 2,160 rows over the prompt (both slots at 953 + 127), 518 at decode's first step (310 + 208).
-    try testing.expectEqual(@as(u64, 174_735_360), pb.ringPromptBytes(fill_prompt_tokens));
-    try testing.expectEqual(@as(u64, 41_904_128), pb.ringDecodeBytes(fill_prompt_tokens));
+    try testing.expectEqual(@as(u64, 94_451_712), pb.laneBytes(positions));
+    // The window ring (kv16: a bf16 row on every layer, 40,960 B; 80,896 at f32 past layer 0): 2,160 rows over the
+    // prompt (both slots at 953 + 127), 518 at decode's first step (310 + 208).
+    try testing.expectEqual(@as(u64, 40_960), pb.ring_row_bytes);
+    try testing.expectEqual(@as(u64, 88_473_600), pb.ringPromptBytes(fill_prompt_tokens));
+    try testing.expectEqual(@as(u64, 21_217_280), pb.ringDecodeBytes(fill_prompt_tokens));
     // The frontier rings (window 2, 2,048 B a row, two a source, three sources): 1,908 rows a ring over the prompt
     // (2 x (953 + 1)), 266 at decode's first step (184 + 82), against 214,106,112 B of full-length lanes.
     try testing.expectEqual(@as(u64, 954), pb.ringBase(2) + 872);
     try testing.expectEqual(@as(u64, 23_445_504), pb.frontierPromptBytes(fill_prompt_tokens));
     try testing.expectEqual(@as(u64, 3_268_608), pb.frontierDecodeBytes(fill_prompt_tokens));
-    try testing.expectEqual(@as(u64, 355_600_384), pb.kvPromptBytes(fill_prompt_tokens, positions));
-    try testing.expectEqual(@as(u64, 202_592_256), pb.kvDecodeBytes(fill_prompt_tokens, positions));
+    try testing.expectEqual(@as(u64, 206_370_816), pb.kvPromptBytes(fill_prompt_tokens, positions));
+    try testing.expectEqual(@as(u64, 118_937_600), pb.kvDecodeBytes(fill_prompt_tokens, positions));
     // At the phase change: the lanes, the window ring's last chunk (310 rows) and the frontier's (184 a ring).
     const at_change = pb.laneBytes(positions) + pb.ring_row_bytes * 310 + 3 * 2 * 2048 * 184;
-    try testing.expectEqual(@as(u64, 184_758_272), at_change);
+    try testing.expectEqual(@as(u64, 109_410_304), at_change);
     // The bill carries them per phase.
     var config = try @import("deepseek_v41_host.zig").loadConfig(testing.io, a, bank_dir);
     // Option B: the ceiling is the bill's argument, not a config field.
@@ -1407,7 +1411,7 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
         // The default route (the transient release on: decode bills window 0); the fence at two streams (-2.68 GB) adds
         // 5 prompt rows.
         .{ .base = 8_990_000_000, .conservative = .{ .prefill = 131, .decode = 168 }, .tight = .{ .prefill = 136, .decode = 168 } },
-        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 130, .decode = 167 }, .tight = .{ .prefill = 135, .decode = 167 } },
+        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 131, .decode = 167 }, .tight = .{ .prefill = 136, .decode = 167 } },
         .{ .base = 9_550_000_000, .conservative = .{ .prefill = 130, .decode = 167 }, .tight = .{ .prefill = 135, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1459,7 +1463,7 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
     const Want = struct { base: u64, two: arm_mod.NativeRows, one: arm_mod.NativeRows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .two = .{ .prefill = 136, .decode = 168 }, .one = .{ .prefill = 138, .decode = 168 } },
-        .{ .base = 9_200_000_000, .two = .{ .prefill = 135, .decode = 167 }, .one = .{ .prefill = 137, .decode = 167 } },
+        .{ .base = 9_200_000_000, .two = .{ .prefill = 136, .decode = 167 }, .one = .{ .prefill = 138, .decode = 167 } },
         .{ .base = 9_550_000_000, .two = .{ .prefill = 135, .decode = 167 }, .one = .{ .prefill = 137, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1503,9 +1507,9 @@ test "dsv41 memory: the decode cache term follows the decode cache limit route (
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, stock: arm_mod.NativeRows, zero: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 7_290_000_000, .stock = .{ .prefill = 134, .decode = 171 }, .zero = .{ .prefill = 134, .decode = 171 } },
+        .{ .base = 7_290_000_000, .stock = .{ .prefill = 134, .decode = 171 }, .zero = .{ .prefill = 134, .decode = 172 } },
         .{ .base = 8_990_000_000, .stock = .{ .prefill = 131, .decode = 168 }, .zero = .{ .prefill = 131, .decode = 168 } },
-        .{ .base = 9_200_000_000, .stock = .{ .prefill = 130, .decode = 167 }, .zero = .{ .prefill = 130, .decode = 168 } },
+        .{ .base = 9_200_000_000, .stock = .{ .prefill = 131, .decode = 167 }, .zero = .{ .prefill = 131, .decode = 168 } },
         .{ .base = 9_550_000_000, .stock = .{ .prefill = 130, .decode = 167 }, .zero = .{ .prefill = 130, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1550,7 +1554,7 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     const Want = struct { base: u64, bf16: arm_mod.NativeRows, mxfp8: arm_mod.NativeRows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 131, .decode = 168 }, .mxfp8 = .{ .prefill = 132, .decode = 169 } },
-        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 130, .decode = 167 }, .mxfp8 = .{ .prefill = 132, .decode = 168 } },
+        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 131, .decode = 167 }, .mxfp8 = .{ .prefill = 132, .decode = 169 } },
         .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 130, .decode = 167 }, .mxfp8 = .{ .prefill = 131, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1591,7 +1595,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     const Want = struct { base: u64, cons_off: Rows, cons_on: Rows, tight_off: Rows, tight_on: Rows };
     for ([_]Want{
         .{ .base = 8_990_000_000, .cons_off = .{ .prefill = 131, .decode = 163 }, .cons_on = .{ .prefill = 131, .decode = 168 }, .tight_off = .{ .prefill = 136, .decode = 163 }, .tight_on = .{ .prefill = 136, .decode = 168 } },
-        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 130, .decode = 162 }, .cons_on = .{ .prefill = 130, .decode = 167 }, .tight_off = .{ .prefill = 135, .decode = 162 }, .tight_on = .{ .prefill = 135, .decode = 167 } },
+        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 131, .decode = 163 }, .cons_on = .{ .prefill = 131, .decode = 167 }, .tight_off = .{ .prefill = 136, .decode = 163 }, .tight_on = .{ .prefill = 136, .decode = 167 } },
         .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 130, .decode = 162 }, .cons_on = .{ .prefill = 130, .decode = 167 }, .tight_off = .{ .prefill = 135, .decode = 162 }, .tight_on = .{ .prefill = 135, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1637,7 +1641,7 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
         // Without the release (this tree's fill): 163 / 163 / 162 decode rows; with it, +5 at each baseline (the host side
         // billed at 1.25 GB since SERVED19, -0.35 GB in both phases).
         .{ .base = 8_990_000_000, .off = .{ .prefill = 131, .decode = 168 }, .on = .{ .prefill = 131, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 167 }, .on = .{ .prefill = 130, .decode = 167 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 167 }, .on = .{ .prefill = 131, .decode = 167 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 130, .decode = 167 }, .on = .{ .prefill = 130, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
@@ -1749,10 +1753,10 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     // Decode rows / prompt rows by baseline: stock, then hot 96 / 128 / 201 / 256.
     const Want = struct { base: u64, decode: [5]u32, prefill: [5]u32 };
     for ([_]Want{
-        .{ .base = 7_290_000_000, .decode = .{ 171, 179, 178, 176, 174 }, .prefill = .{ 134, 143, 141, 139, 137 } },
-        .{ .base = 8_990_000_000, .decode = .{ 168, 176, 175, 173, 171 }, .prefill = .{ 131, 139, 138, 136, 134 } },
-        .{ .base = 9_200_000_000, .decode = .{ 167, 176, 175, 172, 170 }, .prefill = .{ 130, 139, 138, 135, 133 } },
-        .{ .base = 9_550_000_000, .decode = .{ 167, 175, 174, 171, 170 }, .prefill = .{ 130, 138, 137, 135, 133 } },
+        .{ .base = 7_290_000_000, .decode = .{ 171, 180, 178, 176, 174 }, .prefill = .{ 134, 143, 142, 139, 137 } },
+        .{ .base = 8_990_000_000, .decode = .{ 168, 176, 175, 173, 171 }, .prefill = .{ 131, 140, 138, 136, 134 } },
+        .{ .base = 9_200_000_000, .decode = .{ 167, 176, 175, 172, 170 }, .prefill = .{ 131, 139, 138, 136, 134 } },
+        .{ .base = 9_550_000_000, .decode = .{ 167, 175, 174, 172, 170 }, .prefill = .{ 130, 139, 137, 135, 133 } },
     }) |w| {
         const base = w.base;
         config.memory_baseline_bytes = base;
@@ -1776,10 +1780,10 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     // The shared pool: one bank of H + 15 rows; decode / prompt rows at hot 96 / 128 / 201 / 256.
     const Shared = struct { base: u64, decode: [4]u32, prefill: [4]u32 };
     for ([_]Shared{
-        .{ .base = 7_290_000_000, .decode = .{ 181, 179, 177, 175 }, .prefill = .{ 144, 142, 140, 138 } },
-        .{ .base = 8_990_000_000, .decode = .{ 177, 176, 174, 172 }, .prefill = .{ 140, 139, 137, 135 } },
-        .{ .base = 9_200_000_000, .decode = .{ 177, 176, 173, 171 }, .prefill = .{ 140, 139, 136, 134 } },
-        .{ .base = 9_550_000_000, .decode = .{ 176, 175, 173, 171 }, .prefill = .{ 139, 138, 136, 134 } },
+        .{ .base = 7_290_000_000, .decode = .{ 181, 180, 177, 175 }, .prefill = .{ 144, 143, 140, 138 } },
+        .{ .base = 8_990_000_000, .decode = .{ 177, 176, 174, 172 }, .prefill = .{ 141, 140, 137, 135 } },
+        .{ .base = 9_200_000_000, .decode = .{ 177, 176, 173, 171 }, .prefill = .{ 140, 139, 137, 135 } },
+        .{ .base = 9_550_000_000, .decode = .{ 176, 175, 173, 171 }, .prefill = .{ 140, 139, 136, 134 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         for (hots, 0..) |hot, hi| {
@@ -1929,13 +1933,13 @@ const RingLive = struct { window: u64 = 0, frontier: u64 = 0 };
 fn appendRows(g: *ops.TraceOps, states: []TraceState, rows: u64, head_dim: u32) !RingLive {
     const n: c_int = @intCast(rows);
     const hd: c_int = @intCast(head_dim);
-    // The window ring's row: layer 0's KV off the bf16 embedding stream, every later layer's f32 (`PrefillBill.of`);
-    // the frontier's raw_kv and raw_score: head_dim f32 rows.
+    // The window ring's row (kv16): every layer's KV off the bf16 stream (`PrefillBill.of`); the frontier's raw_kv and
+    // raw_score: head_dim f32 rows.
     const x16 = try g.input(&.{ 1, n, hd }, .bfloat16);
     const x32 = try g.input(&.{ 1, n, hd }, .float32);
     var live: RingLive = .{};
-    for (states, 0..) |*st, l| {
-        live.window += try ringAppendLive(g, &st.window.ring, if (l == 0) x16 else x32);
+    for (states) |*st| {
+        live.window += try ringAppendLive(g, &st.window.ring, x16);
         if (st.frontier) |*fr| {
             live.frontier += try ringAppendLive(g, &fr.kv.ring, x32);
             live.frontier += try ringAppendLive(g, &fr.score.ring, x32);
@@ -2094,8 +2098,11 @@ test "dsv41 memory: the prompt wave, KV lanes, overshoots and posted gathers at 
     const positions = billedPositions(fill_prompt_tokens, fill_max_tokens);
     // What every served cell of 10-02..10-04 billed (deepseek_v41_bill_receipts_test.zig) at the 16K request.
     try testing.expectEqual(@as(u64, 13_868_806_049), promptWave(pb, config.dsv41LayerMajor(), joinlessRoute(ov), fill_prompt_tokens));
-    try testing.expectEqual(@as(u64, 355_600_384), pb.kvPromptBytes(fill_prompt_tokens, positions));
-    try testing.expectEqual(@as(u64, 202_592_256), pb.kvDecodeBytes(fill_prompt_tokens, positions));
+    // kv16: the window ring and the compressed rows bf16 (those receipts billed them f32: 355,600,384 / 202,592,256); the
+    // index keys and the compressor frontier stay f32.
+    std.debug.print("\nDSV41_KV16_KV {{\"prompt\": {d}, \"decode\": {d}}}\n", .{ pb.kvPromptBytes(fill_prompt_tokens, positions), pb.kvDecodeBytes(fill_prompt_tokens, positions) });
+    try testing.expectEqual(@as(u64, 206_370_816), pb.kvPromptBytes(fill_prompt_tokens, positions));
+    try testing.expectEqual(@as(u64, 118_937_600), pb.kvDecodeBytes(fill_prompt_tokens, positions));
     try testing.expectEqual(@as(u64, 1_474_834_337), cacheOvershootPrompt(pb, fill_prompt_tokens));
     try testing.expectEqual(@as(u64, 83_230_720), cacheOvershootDecode(pb, positions));
     try testing.expect(engramPostedRoute(&config, ov, &c));
