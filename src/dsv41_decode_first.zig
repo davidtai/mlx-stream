@@ -26,7 +26,7 @@ pub const enabled = dt.enabled;
 pub const Phase = enum(u8) { build, prompt, cycle1, warm };
 pub var phase: Phase = .build;
 
-pub const max_layers = 64;
+pub const max_layers = @import("deepseek_v41.zig").max_layers;
 pub const max_experts = 512;
 pub const Layer = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u64 = 0, moe_ns: u64 = 0, misses: u64 = 0, read_ns: u64 = 0 };
 /// Per routed layer: [0] the first cycle, [1] the warm cycles summed.

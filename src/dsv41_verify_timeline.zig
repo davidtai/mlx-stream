@@ -15,7 +15,7 @@ pub var active: bool = false;
 
 /// Cycles <= max_tokens - 1 (the cell's default cap: 1,024 ids).
 pub const max_cycles = 1024;
-pub const max_layers = 64;
+pub const max_layers = @import("deepseek_v41.zig").max_layers;
 /// Buffers past this are counted (`dropped`), not recorded.
 pub const max_buffers = 1 << 18;
 
