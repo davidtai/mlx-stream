@@ -756,6 +756,31 @@ pub fn Model(comptime G: type) type {
         /// K16 `_forward_layer_major`: every layer over all chunks before the next;
         /// the gate and shared expert per chunk, the routed call batched across
         /// chunks (row-capped), the ffn combine the compiled `_PREFILL_HC_POST`.
+        /// Each chunk's published lanes as views of the layer's final lanes, up to the rows the lanes held after that
+        /// chunk's publish (`publishCompressed` read `view` there: the same rows, never rewritten after). One lane
+        /// version per kv source, written in place chunk by chunk (nothing else holds the version a write replaces).
+        fn laneViewsAtLayerEnd(g: *G, lc: *Cache, lane_rows: []const [2]u32, shareds: []Tr.Share) !void {
+            const cv = try lc.compress.view(g);
+            const iv = try lc.index.view(g);
+            for (shareds, lane_rows) |*sh, n| {
+                sh.compress_kv = if (cv) |v| try lanePrefix(g, v, n[0]) else null;
+                sh.index_k = if (iv) |v| try lanePrefix(g, v, n[1]) else null;
+            }
+        }
+
+        /// Rows [0, n) of a lane view (null for none, the view itself for all of it).
+        fn lanePrefix(g: *G, v: T, n: u32) !?T {
+            const s = g.shapeOf(v);
+            if (n == 0) return null;
+            if (n == s.dim(1)) return v;
+            var start: [8]c_int = @splat(0);
+            var stop: [8]c_int = undefined;
+            const strides: [8]c_int = @splat(1);
+            @memcpy(stop[0..s.n], s.slice());
+            stop[1] = @intCast(n);
+            return try g.slice(v, start[0..s.n], stop[0..s.n], strides[0..s.n]);
+        }
+
         fn forwardLayerMajor(self: *const Self, g: *G, a: std.mem.Allocator, st: *State, ids: []const u32, spans: []const [2]u32, want_main: bool, routed: anytype, probe: anytype) !struct { hidden: T, main: ?T } {
             const c = &self.c;
             const rt = &self.tier.routes;
@@ -803,6 +828,8 @@ pub fn Model(comptime G: type) type {
             const xfs = try a.alloc(T, nc);
             const routes_ = try a.alloc(Tr.Route, nc);
             const dim: c_int = @intCast(c.hidden_size);
+            // A kv source's lane rows after each chunk's publish (`laneViewsAtLayerEnd`).
+            const lane_rows = try a.alloc([2]u32, nc);
             // P1 (the routed hook's construction option, read once): each layer's predicted seed read ahead during its attention.
             const has_ahead = comptime @hasDecl(@TypeOf(routed.at(0)), "readAheadSeed");
             const read_ahead = if (comptime has_ahead) routed.at(0).readAhead() else false;
@@ -851,6 +878,15 @@ pub fn Model(comptime G: type) type {
                     // the wave's frees (each probe re-reads an evaluated kept array: its segment is the host work).
                     try probe.put("chunk.fence", hf.moe_in);
                     keepHalf(g, &halves[i]);
+                    // A kv source's published lanes are not carried per chunk: a carried view would pin this chunk's
+                    // version of each lane, so the next chunk's write could not donate it and every chunk would copy
+                    // and keep a whole lane (pass3ds: 137 lane versions, 27.8 GB at 128K). The chunk's rows are
+                    // recorded and its view of the final lanes carried at the layer's end (`laneViewsAtLayerEnd`).
+                    if (li.kv_source) {
+                        lane_rows[i] = .{ lc.compress.rows(), lc.index.rows() };
+                        shareds[i].compress_kv = null;
+                        shareds[i].index_k = null;
+                    }
                     carries[i].persistShared(g, &shareds[i]);
                     // Nothing reads the layer's input stream past the fence (the Half carries the residual, the tap is
                     // settled): on its route it goes here, not at the chunk's HC post.
@@ -985,6 +1021,7 @@ pub fn Model(comptime G: type) type {
                     i = j;
                 }
                 try g.evalAll(hs);
+                if (li.kv_source) try laneViewsAtLayerEnd(g, lc, lane_rows, shareds);
                 for (shareds, carries) |*sh, *k| k.persistShared(g, sh);
                 g.resetTo(layer_wave);
                 // This layer's gathers are taken and its waves evaluated: free them, post the next slot's.

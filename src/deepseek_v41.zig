@@ -368,6 +368,18 @@ pub const PrefillBill = struct {
         return n;
     }
 
+    /// A lane write's transient (the prompt pass): one kv source's two lanes (its kv and its index lane, at their cap)
+    /// copied once, when MLX cannot donate the version a write replaces. The layer-major pass carries no chunk's lane
+    /// version past its write (`forwardLayerMajor`: each chunk's view of the final lanes at the layer's end), so the
+    /// write's input is the lane's only holder and MLX donates it in place; this bills the one copy anyway (donation is
+    /// MLX's runtime choice). Before 2026-10-05 every chunk's version stayed live (pass3ds: 28.1 GB at 128K).
+    pub fn laneWriteCopyBytes(b: PrefillBill, positions: u64) u64 {
+        const m: u32 = @intCast(positions);
+        var n: u64 = 0;
+        for (b.kv_sources[0..b.n_kv_sources]) |r| n = @max(n, @as(u64, kvc.boundedCompCap(m, r).?) * (b.head_dim * kv_store_bytes + b.index_head_dim * index_store_bytes));
+        return n;
+    }
+
     pub fn laneBytes(b: PrefillBill, positions: u64) u64 {
         var buf: PlanBuf = undefined;
         return sdk_ext.kv.lanesBytes(b.kvPlan(positions, &buf));

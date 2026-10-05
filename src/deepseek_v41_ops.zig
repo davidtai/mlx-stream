@@ -1131,6 +1131,11 @@ pub const TraceOps = struct {
     /// Arrays dropped before their scope ended (`drop`), and the reads of them after (a use after release).
     dropped: std.ArrayList(T) = .empty,
     use_after_drop: u32 = 0,
+    /// `track_live` (tests): the kept handles' live counts (keep +1, release -1) and each slice's base array, so a
+    /// test can sum the distinct buffers the kept handles pin (a view pins its whole base).
+    track_live: bool = false,
+    live_kept: std.AutoHashMapUnmanaged(T, i32) = .empty,
+    slice_base: std.AutoHashMapUnmanaged(T, T) = .empty,
     pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
@@ -1152,6 +1157,15 @@ pub const TraceOps = struct {
         g.host_data.deinit(g.gpa);
         g.tape_sigs.deinit(g.gpa);
         g.launched.deinit(g.gpa);
+        g.live_kept.deinit(g.gpa);
+        g.slice_base.deinit(g.gpa);
+    }
+
+    /// The base array a view resolves to (itself when it is no slice).
+    pub fn baseOf(g: *const TraceOps, x: T) T {
+        var b = x;
+        while (g.slice_base.get(b)) |p| b = p;
+        return b;
     }
 
     /// Prepared launches of kernel `k` since the `from`-th.
@@ -1192,17 +1206,28 @@ pub const TraceOps = struct {
         try g.evals.append(g.gpa, g.nodes.items.len);
         try g.evaluated.appendSlice(g.gpa, xs);
     }
-    pub fn keep(_: *TraceOps, x: T) T {
+    pub fn keep(g: *TraceOps, x: T) T {
+        if (g.track_live) {
+            const e = g.live_kept.getOrPut(g.gpa, x) catch @panic("trace: out of memory");
+            if (!e.found_existing) e.value_ptr.* = 0;
+            e.value_ptr.* += 1;
+        }
         return x;
     }
     pub fn release(g: *TraceOps, x: T) void {
         g.released.append(g.gpa, x) catch @panic("trace: out of memory");
+        if (g.track_live) if (g.live_kept.getPtr(x)) |c| {
+            c.* -= 1;
+        };
     }
     /// An array freed before its scope ends; any later shape, dtype or evaluation of it counts in `use_after_drop`.
     pub fn drop(g: *TraceOps, x: T) void {
         g.dropped.append(g.gpa, x) catch @panic("trace: out of memory");
     }
     pub fn dropKept(g: *TraceOps, x: T) T {
+        if (g.track_live) if (g.live_kept.getPtr(x)) |c| {
+            c.* -= 1;
+        };
         g.drop(x);
         return x;
     }
@@ -1742,7 +1767,9 @@ pub const TraceOps = struct {
             if (strides[i] <= 0 or start[i] < 0 or stop[i] > s.d[i] or start[i] > stop[i]) return error.SliceBounds;
             out.d[i] = @divFloor(stop[i] - start[i] + strides[i] - 1, strides[i]);
         }
-        return g.push(.slice, g.dtypeOf(x), out);
+        const y = try g.push(.slice, g.dtypeOf(x), out);
+        if (g.track_live) try g.slice_base.put(g.gpa, y, x);
+        return y;
     }
 
     pub fn sliceUpdateDyn(g: *TraceOps, src: T, update: T, start: T) !T {

@@ -77,6 +77,8 @@ pub const Bill = struct {
     /// at its widest in the phase (`v41.PrefillBill.kvPromptBytes`, `kvDecodeBytes`).
     kv: u64,
     kv_decode: u64,
+    /// One lane write's transient copy in the prompt pass (`PrefillBill.laneWriteCopyBytes`), prompt phase only.
+    lane_copy: u64 = 0,
     /// The served tier's prefill allocator cache (4 GiB, D5) and the decode charge.
     prefill_cache: u64,
     decode_cache: u64,
@@ -121,7 +123,7 @@ pub const Bill = struct {
 
     /// The prompt phase's process terms (the prompt pass's peak: every term live at once).
     pub fn prefillTerms(b: Bill) PhaseTerms {
-        var t = withWireTables(.{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv, .mlx_cache = b.prefill_cache, .mlx_cache_overshoot = b.cache_overshoot_prompt, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted });
+        var t = withWireTables(.{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv + b.lane_copy, .mlx_cache = b.prefill_cache, .mlx_cache_overshoot = b.cache_overshoot_prompt, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted });
         t.prompt_buffer_allowance = prompt_buffer_allowance_bytes;
         return t;
     }
@@ -502,6 +504,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
         .prefill_wave_tight = promptWave(bill.withGroupStreams(tight_streams), config.dsv41LayerMajor(), joinless, prompt_tokens),
         .kv = bill.kvPromptBytes(prompt_tokens, positions),
         .kv_decode = bill.kvDecodeBytes(prompt_tokens, positions),
+        .lane_copy = bill.laneWriteCopyBytes(positions),
         .prefill_cache = module.prefillCacheLimit(.served),
         .decode_cache = try module.decodeCacheLimit(ov),
         .decode_wave = decode_wave,
@@ -873,6 +876,7 @@ pub fn billCovering(a: std.mem.Allocator, io: std.Io, config: *const settings.Co
         b.prefill_wave = @max(b.prefill_wave, x.prefill_wave);
         b.prefill_wave_tight = @max(b.prefill_wave_tight, x.prefill_wave_tight);
         b.kv = @max(b.kv, x.kv);
+        b.lane_copy = @max(b.lane_copy, x.lane_copy);
         b.kv_decode = @max(b.kv_decode, x.kv_decode);
         b.cache_overshoot_prompt = @max(b.cache_overshoot_prompt, x.cache_overshoot_prompt);
         b.cache_overshoot_decode = @max(b.cache_overshoot_decode, x.cache_overshoot_decode);
@@ -1755,7 +1759,7 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     for ([_]Want{
         .{ .base = 7_290_000_000, .decode = .{ 171, 180, 178, 176, 174 }, .prefill = .{ 134, 143, 142, 139, 137 } },
         .{ .base = 8_990_000_000, .decode = .{ 168, 176, 175, 173, 171 }, .prefill = .{ 131, 140, 138, 136, 134 } },
-        .{ .base = 9_200_000_000, .decode = .{ 167, 176, 175, 172, 170 }, .prefill = .{ 131, 139, 138, 136, 134 } },
+        .{ .base = 9_200_000_000, .decode = .{ 167, 176, 175, 172, 170 }, .prefill = .{ 131, 139, 138, 135, 134 } },
         .{ .base = 9_550_000_000, .decode = .{ 167, 175, 174, 172, 170 }, .prefill = .{ 130, 139, 137, 135, 133 } },
     }) |w| {
         const base = w.base;
@@ -1781,9 +1785,9 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     const Shared = struct { base: u64, decode: [4]u32, prefill: [4]u32 };
     for ([_]Shared{
         .{ .base = 7_290_000_000, .decode = .{ 181, 180, 177, 175 }, .prefill = .{ 144, 143, 140, 138 } },
-        .{ .base = 8_990_000_000, .decode = .{ 177, 176, 174, 172 }, .prefill = .{ 141, 140, 137, 135 } },
+        .{ .base = 8_990_000_000, .decode = .{ 177, 176, 174, 172 }, .prefill = .{ 141, 139, 137, 135 } },
         .{ .base = 9_200_000_000, .decode = .{ 177, 176, 173, 171 }, .prefill = .{ 140, 139, 137, 135 } },
-        .{ .base = 9_550_000_000, .decode = .{ 176, 175, 173, 171 }, .prefill = .{ 140, 139, 136, 134 } },
+        .{ .base = 9_550_000_000, .decode = .{ 176, 175, 173, 171 }, .prefill = .{ 140, 138, 136, 134 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         for (hots, 0..) |hot, hi| {

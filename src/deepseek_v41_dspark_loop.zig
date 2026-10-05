@@ -1851,6 +1851,110 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
     }
 }
 
+const LanePin = struct {
+    g: *TraceOps,
+    peak: u64 = 0,
+    peak_n: u64 = 0,
+    pub fn put(self: *LanePin, name: []const u8, _: anytype) !void {
+        if (!std.mem.eql(u8, name, "layer.end")) return;
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen.deinit(self.g.gpa);
+        var bytes: u64 = 0;
+        var it = self.g.live_kept.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* <= 0) continue;
+            const b = self.g.baseOf(e.key_ptr.*);
+            const nd = self.g.nodes.items[b];
+            if (nd.op != .slice_update and nd.op != .zeros) continue;
+            const n = Held.allocating(nd);
+            if (n < (4 << 20)) continue;
+            const gop = try seen.getOrPut(self.g.gpa, b);
+            if (gop.found_existing) continue;
+            bytes += n;
+        }
+        if (bytes > self.peak) {
+            self.peak = bytes;
+            self.peak_n = seen.count();
+        }
+    }
+};
+
+// Bank mode (host only, the trace backend; DSV41_BANK): the served layer-major prompt pass at the sub-chunk calls'
+// real geometry (`kvc.prefillSubCalls`, the span pinned to the whole prompt's chunk rule), from a bounded state at the
+// request's lanes. pass3ds was killed at 128K by every chunk's lane version kept live (a carried view per chunk: 137
+// versions of each kv source's two lanes, 28.1 GB); `forwardLayerMajor` now carries each chunk's view of the final
+// lanes, so the kept handles pin each lane once. Per call: the distinct lane buffers the kept handles pin (a view pins
+// its whole base) are the lanes at their cap and no more, and the call's wave (its nested peak and the kept halves, the
+// routed calls a stand-in, as the 16K test) stays under the bill's widest sub-chunk call. 262,144: its first two calls;
+// 1,048,576: its first call, the lanes only (the trace's wave read is quadratic in the waves; every call's geometry is
+// the first call's but the positions, which `layerMajorCallBytes` bills at the prompt's end).
+test "dsv41 memory: the layer-major sub-chunk calls pin one version of each lane and stay under the bill at 65,536 / 131,072 / 262,144 / 1,048,576 (bank, trace)" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 held: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(a, io, bank, &diag);
+    const eng = @import("deepseek_v41_engram.zig");
+    const kvc = @import("deepseek_v41_cache.zig");
+    const bill_mod = @import("deepseek_v41_bill.zig");
+    var src = try eng.RowSource.open(a, io, bank, try std.fmt.allocPrint(aa, "{s}/engram-token-map.u32", .{bank}), &c, &diag);
+    defer src.deinit();
+    const spec = try std.mem.concat(aa, v41.Param, &.{ try v41.residentSpec(aa, &c), try v41.engramSpec(aa, &c) });
+    const Case = struct { n: u32, calls: usize, wave: bool };
+    const cases = [_]Case{ .{ .n = 65536, .calls = std.math.maxInt(usize), .wave = true }, .{ .n = 131072, .calls = std.math.maxInt(usize), .wave = true }, .{ .n = 262144, .calls = 2, .wave = true }, .{ .n = 1048576, .calls = 1, .wave = false } };
+    const prompt = try aa.alloc(u32, 1048576);
+    for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
+    var tier = routes.served;
+    tier.layer_major = true;
+    for (cases) |cs| {
+        const n = cs.n;
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        g.track_live = true;
+        const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
+        var kd: @import("exl3_kernels.zig").Diag = .{};
+        var reg = try @import("exl3_kernels.zig").Registry.init(a, &@import("exl3_kernels.zig").embedded, @import("exl3_kernels.zig").manifest_sha256, &kd);
+        defer reg.deinit();
+        const model_ = try Loop(TraceOps).M.initWith(a, &g, c, tier, &lookup, &src, .{ .registry = &reg });
+        defer model_.deinit(&g);
+        const positions = bill_mod.billedPositions(n, bill_mod.fill_max_tokens);
+        var st = try model_.newStateWith(model_.boundedKv(@intCast(positions)));
+        defer st.deinit(&g, a);
+        const stand: graph.StandIn(TraceOps) = .{ .scale = try g.input(&.{@intCast(c.n_routed_experts)}, .float32) };
+        const span = kvc.resolvePrefillChunk(&c, n, null, kvc.default_chunk_target_bytes);
+        const calls = try kvc.prefillSubCalls(aa, n, @intCast(span), kvc.prefill_sub);
+        st.span_chunk = span;
+        const pb = v41.PrefillBill.of(&c, tier.kv).withIndexLaunch(tier.routes.prefill_index);
+        const lanes = pb.laneBytes(positions);
+        const billed_wave = pb.layerMajorPromptWaveBytes(n, .served);
+        for (calls[0..@min(calls.len, cs.calls)], 0..) |cl, k| {
+            const rows: u64 = cl[1] - cl[0];
+            const f0 = g.nodes.items.len;
+            const w0 = g.freed.items.len;
+            var pin: LanePin = .{ .g = &g };
+            const r = try model_.forward(&g, &st, prompt[cl[0]..cl[1]], .{ .logits = .last, .main_hidden = true }, stand, &pin);
+            var written: u64 = 0;
+            for (g.nodes.items[f0..]) |nd| if (nd.op == .slice_update and Held.allocating(nd) >= (4 << 20)) {
+                written += Held.allocating(nd);
+            };
+            const wave: u64 = if (cs.wave) blk: {
+                const nst = Held.nested(&g, f0, g.nodes.items.len, g.freed.items[w0..], 0);
+                const halves: u64 = rows * (@as(u64, c.hc_mult) * c.hidden_size * 4 + c.hidden_size * 4 + 3 * @as(u64, c.hc_mult) * 4 + @as(u64, c.hc_mult) * c.hc_mult * 4);
+                break :blk nst.peak + halves;
+            } else 0;
+            std.debug.print("DSV41_SUBCALL_LANES {{\"context\": {d}, \"span\": {d}, \"call\": {d}, \"calls\": {d}, \"rows\": {d}, \"positions\": {d}, \"pinned_lane_bytes\": {d}, \"pinned_buffers\": {d}, \"billed_lanes\": {d}, \"lane_write_bytes\": {d}, \"wave\": {d}, \"billed_wave\": {d}, \"lane_copy\": {d}}}\n", .{ n, span, k, calls.len, rows, cl[1], pin.peak, pin.peak_n, lanes, written, wave, billed_wave, pb.laneWriteCopyBytes(positions) });
+            try testing.expect(pin.peak <= lanes);
+            if (cs.wave) try testing.expect(wave <= billed_wave);
+            try Loop(TraceOps).M.fence(&g, &st, &.{ r.logits.?, r.main_hidden.? });
+            g.reset();
+        }
+    }
+}
+
 test "dsv41 dspark loop: a pinned subset head keeps only its experts, maps every routed id through its lut and otherwise drafts as the full head" {
     const a = testing.allocator;
     var rig: Rig = undefined;
