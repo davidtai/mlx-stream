@@ -121,7 +121,8 @@ pub const Acceptance = union(enum) {
 
 /// `accept <=> p_t(draft) > min(eps, delta * exp(-H(p_t)))`, p_t = softmax of the
 /// verify row at temperature 1 (evaluated on the device; the host sees the flags).
-pub const Typical = struct { delta: f32, eps: f32 = 1.0 };
+/// The host's typical-mode parameters (`sdk.acceptance.Mode.typical`: delta, eps = 1.0).
+pub const Typical = @FieldType(@import("sdk").acceptance.Mode, "typical");
 
 /// One verify chunk's acceptance (the greedy branch of `_decode_cycles`, whose
 /// compare the typical tier swaps for its flags): `target[r]` = the argmax of
