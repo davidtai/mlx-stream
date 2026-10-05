@@ -1791,7 +1791,8 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
                 // Three wave levels (layer > chunk > score chain): the nested peak, and the chunks' kept
                 // Halves (their survivors, invisible to the trace) by construction.
                 const nst = Held.nested(&g, f0, g.nodes.items.len, g.freed.items[w0..], 0);
-                const halves: u64 = 16384 * (@as(u64, c.hc_mult) * c.hidden_size * 4 + c.hidden_size * 4 + 3 * @as(u64, c.hc_mult) * 4 + @as(u64, c.hc_mult) * c.hc_mult * 4);
+                // kv16: h1 and moe_in are bf16 (the stream's dtype); post, comb and ffn_pre f32.
+                const halves: u64 = 16384 * (@as(u64, c.hc_mult) * c.hidden_size * 2 + c.hidden_size * 2 + 3 * @as(u64, c.hc_mult) * 4 + @as(u64, c.hc_mult) * c.hc_mult * 4);
                 const billed = v41.PrefillBill.of(&c, t.tier.kv).withIndexLaunch(t.tier.routes.prefill_index).layerMajorWaveBytes(16384, .served);
                 std.debug.print("dsv41 held: served-k16 tier, 16K one forward: nested peak {d} B + kept halves {d} B = {d} B (built {d} B); billed layer-major wave {d} B\n", .{ nst.peak, halves, nst.peak + halves, nst.all, billed });
                 // The bill covers the trace. Tightness: with the prefill core and indexer the attention side
@@ -1943,7 +1944,7 @@ test "dsv41 memory: the layer-major sub-chunk calls pin one version of each lane
             };
             const wave: u64 = if (cs.wave) blk: {
                 const nst = Held.nested(&g, f0, g.nodes.items.len, g.freed.items[w0..], 0);
-                const halves: u64 = rows * (@as(u64, c.hc_mult) * c.hidden_size * 4 + c.hidden_size * 4 + 3 * @as(u64, c.hc_mult) * 4 + @as(u64, c.hc_mult) * c.hc_mult * 4);
+                const halves: u64 = rows * (@as(u64, c.hc_mult) * c.hidden_size * 2 + c.hidden_size * 2 + 3 * @as(u64, c.hc_mult) * 4 + @as(u64, c.hc_mult) * c.hc_mult * 4);
                 break :blk nst.peak + halves;
             } else 0;
             std.debug.print("DSV41_SUBCALL_LANES {{\"context\": {d}, \"span\": {d}, \"call\": {d}, \"calls\": {d}, \"rows\": {d}, \"positions\": {d}, \"pinned_lane_bytes\": {d}, \"pinned_buffers\": {d}, \"billed_lanes\": {d}, \"lane_write_bytes\": {d}, \"wave\": {d}, \"billed_wave\": {d}, \"lane_copy\": {d}}}\n", .{ n, span, k, calls.len, rows, cl[1], pin.peak, pin.peak_n, lanes, written, wave, billed_wave, pb.laneWriteCopyBytes(positions) });

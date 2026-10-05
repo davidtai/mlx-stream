@@ -1262,16 +1262,16 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     // SERVED19F: the re-frozen buffer allowances (decode 40.4 MB, prompt 17 MB): 9.20 GB decode 168 -> 167 (release on).
     // verify_wave (G3, 0.272 GB for 0.365): 9.20 GB decode back to 168.
     const every_window = [_]Want{
-        .{ .base = 8_990_000_000, .off = .{ .prefill = 131, .decode = 163 }, .on = .{ .prefill = 131, .decode = 163 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 163 }, .on = .{ .prefill = 131, .decode = 163 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 130, .decode = 162 }, .on = .{ .prefill = 130, .decode = 162 } },
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 133, .decode = 163 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 162 }, .on = .{ .prefill = 133, .decode = 162 } },
     };
     // With the transient release installed (SERVED16 for every request; since SERVED17 the route,
     // DSV41_CELL_TRANSIENT_RELEASE), decode bills window 0 only: +5 decode rows at each baseline.
     const window_0 = [_]Want{
-        .{ .base = 8_990_000_000, .off = .{ .prefill = 131, .decode = 168 }, .on = .{ .prefill = 131, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 167 }, .on = .{ .prefill = 131, .decode = 167 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 130, .decode = 167 }, .on = .{ .prefill = 130, .decode = 167 } },
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
     };
     // The release route as the Module resolves it: the default (on), then each override.
     for ([_]?bool{ null, false, true }) |route| {
@@ -1414,9 +1414,9 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
     for ([_]Want{
         // The default route (the transient release on: decode bills window 0); the fence at two streams (-2.68 GB) adds
         // 5 prompt rows.
-        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 131, .decode = 168 }, .tight = .{ .prefill = 136, .decode = 168 } },
-        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 131, .decode = 167 }, .tight = .{ .prefill = 136, .decode = 167 } },
-        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 130, .decode = 167 }, .tight = .{ .prefill = 135, .decode = 167 } },
+        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 134, .decode = 168 }, .tight = .{ .prefill = 139, .decode = 168 } },
+        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 133, .decode = 167 }, .tight = .{ .prefill = 138, .decode = 167 } },
+        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 133, .decode = 167 }, .tight = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -1466,16 +1466,17 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, two: arm_mod.NativeRows, one: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .two = .{ .prefill = 136, .decode = 168 }, .one = .{ .prefill = 138, .decode = 168 } },
-        .{ .base = 9_200_000_000, .two = .{ .prefill = 136, .decode = 167 }, .one = .{ .prefill = 138, .decode = 167 } },
-        .{ .base = 9_550_000_000, .two = .{ .prefill = 135, .decode = 167 }, .one = .{ .prefill = 137, .decode = 167 } },
+        .{ .base = 8_990_000_000, .two = .{ .prefill = 139, .decode = 168 }, .one = .{ .prefill = 141, .decode = 168 } },
+        .{ .base = 9_200_000_000, .two = .{ .prefill = 138, .decode = 167 }, .one = .{ .prefill = 141, .decode = 167 } },
+        .{ .base = 9_550_000_000, .two = .{ .prefill = 138, .decode = 167 }, .one = .{ .prefill = 140, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         const off = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
         const on = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .input_stream_early_release = true });
         // The tight wave drops by the third stream's bound down to the group's final evaluation (SERVED19: it binds
         // below two streams, over the attention side); the conservative wave, the KV and decode do not move.
-        try testing.expectEqual(@as(u64, 3_689_021_440 - 2_684_354_560), off.prefill_wave_tight - on.prefill_wave_tight);
+        // kv16: the final evaluation's concat input is bf16 (16384 x 5120 x 2 B less in the on branch's bound).
+        try testing.expectEqual(@as(u64, 3_689_021_440 - 2_684_354_560 + 16384 * 5120 * 2), off.prefill_wave_tight - on.prefill_wave_tight);
         try testing.expectEqual(off.prefill_wave, on.prefill_wave);
         try testing.expectEqual(off.decodeTotal(), on.decodeTotal());
         var rows: [2]arm_mod.NativeRows = undefined;
@@ -1511,10 +1512,10 @@ test "dsv41 memory: the decode cache term follows the decode cache limit route (
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, stock: arm_mod.NativeRows, zero: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 7_290_000_000, .stock = .{ .prefill = 134, .decode = 171 }, .zero = .{ .prefill = 134, .decode = 172 } },
-        .{ .base = 8_990_000_000, .stock = .{ .prefill = 131, .decode = 168 }, .zero = .{ .prefill = 131, .decode = 168 } },
-        .{ .base = 9_200_000_000, .stock = .{ .prefill = 131, .decode = 167 }, .zero = .{ .prefill = 131, .decode = 168 } },
-        .{ .base = 9_550_000_000, .stock = .{ .prefill = 130, .decode = 167 }, .zero = .{ .prefill = 130, .decode = 167 } },
+        .{ .base = 7_290_000_000, .stock = .{ .prefill = 137, .decode = 171 }, .zero = .{ .prefill = 137, .decode = 172 } },
+        .{ .base = 8_990_000_000, .stock = .{ .prefill = 134, .decode = 168 }, .zero = .{ .prefill = 134, .decode = 168 } },
+        .{ .base = 9_200_000_000, .stock = .{ .prefill = 133, .decode = 167 }, .zero = .{ .prefill = 133, .decode = 168 } },
+        .{ .base = 9_550_000_000, .stock = .{ .prefill = 133, .decode = 167 }, .zero = .{ .prefill = 133, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b1 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -1557,9 +1558,9 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, bf16: arm_mod.NativeRows, mxfp8: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 131, .decode = 168 }, .mxfp8 = .{ .prefill = 132, .decode = 169 } },
-        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 131, .decode = 167 }, .mxfp8 = .{ .prefill = 132, .decode = 169 } },
-        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 130, .decode = 167 }, .mxfp8 = .{ .prefill = 131, .decode = 168 } },
+        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 134, .decode = 168 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
+        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 133, .decode = 167 }, .mxfp8 = .{ .prefill = 135, .decode = 169 } },
+        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 133, .decode = 167 }, .mxfp8 = .{ .prefill = 134, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b1 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -1598,9 +1599,9 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     const Rows = arm_mod.NativeRows;
     const Want = struct { base: u64, cons_off: Rows, cons_on: Rows, tight_off: Rows, tight_on: Rows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .cons_off = .{ .prefill = 131, .decode = 163 }, .cons_on = .{ .prefill = 131, .decode = 168 }, .tight_off = .{ .prefill = 136, .decode = 163 }, .tight_on = .{ .prefill = 136, .decode = 168 } },
-        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 131, .decode = 163 }, .cons_on = .{ .prefill = 131, .decode = 167 }, .tight_off = .{ .prefill = 136, .decode = 163 }, .tight_on = .{ .prefill = 136, .decode = 167 } },
-        .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 130, .decode = 162 }, .cons_on = .{ .prefill = 130, .decode = 167 }, .tight_off = .{ .prefill = 135, .decode = 162 }, .tight_on = .{ .prefill = 135, .decode = 167 } },
+        .{ .base = 8_990_000_000, .cons_off = .{ .prefill = 134, .decode = 163 }, .cons_on = .{ .prefill = 134, .decode = 168 }, .tight_off = .{ .prefill = 139, .decode = 163 }, .tight_on = .{ .prefill = 139, .decode = 168 } },
+        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 133, .decode = 163 }, .cons_on = .{ .prefill = 133, .decode = 167 }, .tight_off = .{ .prefill = 138, .decode = 163 }, .tight_on = .{ .prefill = 138, .decode = 167 } },
+        .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 133, .decode = 162 }, .cons_on = .{ .prefill = 133, .decode = 167 }, .tight_off = .{ .prefill = 138, .decode = 162 }, .tight_on = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         const by_route = [2]Bill{
@@ -1644,9 +1645,9 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
     for ([_]Want{
         // Without the release (this tree's fill): 163 / 163 / 162 decode rows; with it, +5 at each baseline (the host side
         // billed at 1.25 GB since SERVED19, -0.35 GB in both phases).
-        .{ .base = 8_990_000_000, .off = .{ .prefill = 131, .decode = 168 }, .on = .{ .prefill = 131, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 131, .decode = 167 }, .on = .{ .prefill = 131, .decode = 167 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 130, .decode = 167 }, .on = .{ .prefill = 130, .decode = 167 } },
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .transient_release = true });
@@ -1757,10 +1758,10 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     // Decode rows / prompt rows by baseline: stock, then hot 96 / 128 / 201 / 256.
     const Want = struct { base: u64, decode: [5]u32, prefill: [5]u32 };
     for ([_]Want{
-        .{ .base = 7_290_000_000, .decode = .{ 171, 180, 178, 176, 174 }, .prefill = .{ 134, 143, 142, 139, 137 } },
-        .{ .base = 8_990_000_000, .decode = .{ 168, 176, 175, 173, 171 }, .prefill = .{ 131, 140, 138, 136, 134 } },
-        .{ .base = 9_200_000_000, .decode = .{ 167, 176, 175, 172, 170 }, .prefill = .{ 131, 139, 138, 135, 134 } },
-        .{ .base = 9_550_000_000, .decode = .{ 167, 175, 174, 172, 170 }, .prefill = .{ 130, 139, 137, 135, 133 } },
+        .{ .base = 7_290_000_000, .decode = .{ 171, 180, 178, 176, 174 }, .prefill = .{ 137, 146, 144, 142, 140 } },
+        .{ .base = 8_990_000_000, .decode = .{ 168, 176, 175, 173, 171 }, .prefill = .{ 134, 142, 141, 139, 137 } },
+        .{ .base = 9_200_000_000, .decode = .{ 167, 176, 175, 172, 170 }, .prefill = .{ 133, 142, 141, 138, 136 } },
+        .{ .base = 9_550_000_000, .decode = .{ 167, 175, 174, 172, 170 }, .prefill = .{ 133, 141, 140, 138, 136 } },
     }) |w| {
         const base = w.base;
         config.memory_baseline_bytes = base;
@@ -1784,10 +1785,10 @@ test "dsv41 memory: DRAFTCACHE bills its slot banks in place of the DSpark exper
     // The shared pool: one bank of H + 15 rows; decode / prompt rows at hot 96 / 128 / 201 / 256.
     const Shared = struct { base: u64, decode: [4]u32, prefill: [4]u32 };
     for ([_]Shared{
-        .{ .base = 7_290_000_000, .decode = .{ 181, 180, 177, 175 }, .prefill = .{ 144, 143, 140, 138 } },
-        .{ .base = 8_990_000_000, .decode = .{ 177, 176, 174, 172 }, .prefill = .{ 141, 139, 137, 135 } },
-        .{ .base = 9_200_000_000, .decode = .{ 177, 176, 173, 171 }, .prefill = .{ 140, 139, 137, 135 } },
-        .{ .base = 9_550_000_000, .decode = .{ 176, 175, 173, 171 }, .prefill = .{ 140, 138, 136, 134 } },
+        .{ .base = 7_290_000_000, .decode = .{ 181, 180, 177, 175 }, .prefill = .{ 147, 146, 143, 141 } },
+        .{ .base = 8_990_000_000, .decode = .{ 177, 176, 174, 172 }, .prefill = .{ 143, 142, 140, 138 } },
+        .{ .base = 9_200_000_000, .decode = .{ 177, 176, 173, 171 }, .prefill = .{ 143, 142, 139, 137 } },
+        .{ .base = 9_550_000_000, .decode = .{ 176, 175, 173, 171 }, .prefill = .{ 142, 141, 139, 137 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         for (hots, 0..) |hot, hi| {
@@ -2100,8 +2101,12 @@ test "dsv41 memory: the prompt wave, KV lanes, overshoots and posted gathers at 
     const ov: module.RouteOverrides = .{};
     const pb = try prefillBillAt(&config, ov, &c, 4);
     const positions = billedPositions(fill_prompt_tokens, fill_max_tokens);
-    // What every served cell of 10-02..10-04 billed (deepseek_v41_bill_receipts_test.zig) at the 16K request.
-    try testing.expectEqual(@as(u64, 13_868_806_049), promptWave(pb, config.dsv41LayerMajor(), joinlessRoute(ov), fill_prompt_tokens));
+    // What every served cell of 10-02..10-04 billed (deepseek_v41_bill_receipts_test.zig) at the 16K request, 13,868,806,049 B,
+    // with the f32 stream; kv16's bf16 kept streams, h1 and moe_in bill 1,509,949,440 B less (16384 x 92,160 B).
+    var pb32 = pb;
+    pb32.stream_bytes = 4;
+    try testing.expectEqual(@as(u64, 13_868_806_049), promptWave(pb32, config.dsv41LayerMajor(), joinlessRoute(ov), fill_prompt_tokens));
+    try testing.expectEqual(@as(u64, 13_868_806_049 - 1_509_949_440), promptWave(pb, config.dsv41LayerMajor(), joinlessRoute(ov), fill_prompt_tokens));
     // kv16: the window ring and the compressed rows bf16 (those receipts billed them f32: 355,600,384 / 202,592,256); the
     // index keys and the compressor frontier stay f32.
     std.debug.print("\nDSV41_KV16_KV {{\"prompt\": {d}, \"decode\": {d}}}\n", .{ pb.kvPromptBytes(fill_prompt_tokens, positions), pb.kvDecodeBytes(fill_prompt_tokens, positions) });
@@ -2281,11 +2286,12 @@ test "dsv41 memory: the default served bill's wave covers every prompt length 1 
         }
         if (n > 1 and pb.chunkRows(n) != pb.chunkRows(n - 1)) breakpoints += 1;
     }
-    // The worst length is a covered one (the length after the knee on the bank: 3,953), its wave the covering wave; the
-    // 16,384 length alone bills far less (the old bill).
-    try testing.expect(worst_n == knee or worst_n == knee + 1);
+    // The worst length is a covered one, its wave the covering wave. With the 5 MiB attention row the knee's one call
+    // bound it (23.28 GB at 3,953); with the bank trace's 2 MiB row (`PrefillBill.attn_row_bytes`) the attention side no
+    // longer binds at the knee and the 16,384 length's routed group does.
+    try testing.expect(worst_n == knee or worst_n == knee + 1 or worst_n == fill_prompt_tokens);
     try testing.expectEqual(worst, billed);
     try testing.expect(breakpoints > 100);
-    try testing.expect(promptWave(pb, true, true, fill_prompt_tokens) + 9_000_000_000 < billed);
+    try testing.expectEqual(promptWave(pb, true, true, fill_prompt_tokens), billed);
     std.debug.print("\nDSV41_DEFAULT_COVERING {{\"knee\": {d}, \"worst_length\": {d}, \"covering_wave\": {d}, \"wave_16384\": {d}, \"breakpoints\": {d}}}\n", .{ knee, worst_n, billed, promptWave(pb, true, true, fill_prompt_tokens), breakpoints });
 }

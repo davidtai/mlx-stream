@@ -75,6 +75,16 @@ pub const PrefillBill = struct {
     input_release: bool = false,
     /// The prompt's sub-chunk (`kvc.prefill_sub`, the module's `prefillSub`): a longer prompt's calls (`promptCallRows`).
     prefill_sub: u64 = kvc.prefill_sub,
+    /// kv16: the bytes of one residual-stream element. The layer-major pass's kept streams (each chunk's hs, the halves'
+    /// h1) and its MoE inputs (moe_in, the group's concat) are bf16 (`hcPostFused` returns its x's dtype; the embedding
+    /// is bf16). 4 is the f32 stream before kv16 (the pinned pre-kv16 tests).
+    stream_bytes: u64 = 2,
+    /// The layer-major attention side's bytes per chunk row (`layerMajorWaveTerms.attn`), from the bank's trace
+    /// (2026-10-05, the served layer-major tier: the widest attention chunk wave less its fixed part and its score
+    /// chains, per row: 1.706 MB at the knee's 3,952 rows, 1.644 at 1,907, 1.518 at 953, 1.296 at 476) rounded up to
+    /// 2 MiB. It was the chunk-major estimate `wave_row_bytes` (5 MiB, never measured), which billed the knee's one-call
+    /// prompt 22.3 GB of attention against the trace's 8.3 GB.
+    attn_row_bytes: u64 = 2 << 20,
 
     /// JOINLESS's minimal-copy merge (58d9fb1, `experts.planJoinless`): the combine reads at most
     /// `joinless_sources` sources; a wide call with n outputs above that concatenates only its smallest n - 23
@@ -310,12 +320,13 @@ pub const PrefillBill = struct {
 
     pub fn layerMajorWaveTerms(b: PrefillBill, seq: u64, span: u64, positions: u64, tier: Tier) WaveTerms {
         const d = b.hidden;
-        const kept_stream = seq * (b.hc * d * 4 + b.hc * 4 + 4) + b.n_main * seq * d * 4;
-        const halves = seq * (b.hc * d * 4 + d * 4 + 2 * b.hc * 4 + b.hc * b.hc * 4);
+        const sb = b.stream_bytes;
+        const kept_stream = seq * (b.hc * d * sb + b.hc * 4 + 4) + b.n_main * seq * d * 4;
+        const halves = seq * (b.hc * d * sb + d * sb + 2 * b.hc * 4 + b.hc * b.hc * 4);
         // The index selection, plus (served) the prefill core's window selection memo per chunk: idx i32 + valid.
         const win_sel = if (tier == .served) seq * (b.selected_keys - b.index_topk) * 5 else 0;
         const selection = seq * ((if (b.min_ratio > 0) positions / b.min_ratio else 0) + b.index_topk * 4) + win_sel;
-        const attn = b.waveBytes(span, positions, tier) - positions * kept_pos_bytes;
+        const attn = b.waveBytes(span, positions, tier) - positions * kept_pos_bytes - span * wave_row_bytes + span * b.attn_row_bytes;
         const cap: u64 = @max(1, @as(u64, @intFromFloat(@floor(@max(chunk_target_bytes, 1e9) / @as(f64, @floatFromInt(b.top_k * d * 4))))));
         const g_rows = @min(seq, cap);
         // The group's routed outputs, their joined input (`joinedBytes`), the combine and the HC post.
@@ -328,13 +339,13 @@ pub const PrefillBill = struct {
         // concatenated input (d f32 a row) and the routing arrays (top_k x 20 B a row). The new streams, h1, moe_in,
         // the taps and the selection are the kept terms above. It binds where the group's streams no longer do (the
         // tight bill with the early release).
-        const final_eval = routed + b.joinedBytes(g_rows) + g_rows * (2 * d * 4 + b.hc * d * 4 + d * 4 + b.top_k * 20);
+        const final_eval = routed + b.joinedBytes(g_rows) + g_rows * (2 * d * 4 + b.hc * d * 4 + d * sb + b.top_k * 20);
         // With the input release the final evaluation runs without the moe_in rows and their concat (the attention
         // side and the routed call still hold both). Only a group that takes JOINLESS's parts releases: the bill's group
         // (g_rows, the widest) does above joinless_min_ids routed ids; a narrower last group of a longer prompt keeps
         // its own <= 8 rows, while the earlier groups' rows are already gone, so the widest group still bounds it.
         const releases = b.input_release and g_rows * b.top_k > joinless_min_ids;
-        const released: u64 = if (releases) seq * d * 4 + g_rows * d * 4 else 0;
+        const released: u64 = if (releases) seq * d * sb + g_rows * d * sb else 0;
         return .{ .kept = kept_stream, .halves = halves, .selection = selection, .attn = attn, .group = group, .final_eval = final_eval, .released = released };
     }
 
@@ -490,9 +501,33 @@ pub const PrefillBill = struct {
 };
 
 /// The 3.0 bank's geometry as `PrefillBill.of` reads it (text_config: 64 heads, 32 index heads, window
-/// 128 + index top-k 512, the smallest ratio 1, hidden 5120, hc 4, top-6, 3 DSpark targets).
+/// 128 + index top-k 512, the smallest ratio 1, hidden 5120, hc 4, top-6, 3 DSpark targets), with the pre-kv16 f32
+/// stream and the 5 MiB attention row the measurements below were billed with.
 fn bank30Bill() PrefillBill {
-    return .{ .n_heads = 64, .index_heads = 32, .selected_keys = 640, .min_ratio = 1, .kv_pos_bytes = 0, .head_promotion_bytes = 0, .cache_bytes = 0, .hidden = 5120, .hc = 4, .top_k = 6, .n_main = 3, .index_topk = 512, .n_experts = 384, .ring_geo = .{} };
+    return .{ .n_heads = 64, .index_heads = 32, .selected_keys = 640, .min_ratio = 1, .kv_pos_bytes = 0, .head_promotion_bytes = 0, .cache_bytes = 0, .hidden = 5120, .hc = 4, .top_k = 6, .n_main = 3, .index_topk = 512, .n_experts = 384, .ring_geo = .{}, .stream_bytes = 4, .attn_row_bytes = PrefillBill.wave_row_bytes };
+}
+
+test "dsv41 memory: kv16's layer-major wave: bf16 streams, the attention side over the bank trace's widest attention chunk waves" {
+    var b = bank30Bill().withIndexLaunch(true);
+    b.stream_bytes = 2;
+    b.attn_row_bytes = 2 << 20;
+    // (chunk rows, positions, the trace's widest attention chunk wave on the bank, the served layer-major tier,
+    // 2026-10-05): the one-call knee, 8,192 and 16,384, and the first sub-chunk calls at 32,768 and 65,536.
+    for ([_][3]u64{
+        .{ 3952, 3953, 8_295_814_048 },
+        .{ 1907, 8192, 4_017_332_963 },
+        .{ 953, 16384, 2_016_150_976 },
+        .{ 476, 16184, 1_029_239_384 },
+        .{ 238, 16184, 579_654_086 },
+    }) |x| try std.testing.expect(b.layerMajorWaveTerms(x[0], x[0], x[1], .served).attn >= x[2]);
+    // The knee's one-call wave: 23.28 GB at the 5 MiB row and f32 streams, now under 11 GB; the attention side no longer
+    // binds there (the routed group does at 16K).
+    try std.testing.expect(bank30Bill().withIndexLaunch(true).layerMajorWaveBytes(3953, .served) > 23_000_000_000);
+    try std.testing.expect(b.layerMajorWaveBytes(3953, .served) < 11_000_000_000);
+    // kv16's streams: the kept hs and h1 halve, moe_in halves, at 16K 1.51 GB under the f32 wave's kept and halves.
+    const f32w = bank30Bill().withIndexLaunch(true).layerMajorWaveTerms(16384, 953, 16384, .served);
+    const bf = b.layerMajorWaveTerms(16384, 953, 16384, .served);
+    try std.testing.expectEqual(@as(u64, 16384 * (4 * 5120 * 2 + 4 * 5120 * 2 + 5120 * 2)), (f32w.kept + f32w.halves) - (bf.kept + bf.halves));
 }
 
 test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-output copy, over the measured 16K transient" {

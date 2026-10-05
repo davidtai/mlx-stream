@@ -2565,7 +2565,7 @@ pub fn billLines(b: CellBill) [17]BillLine {
         .{ .name = "Engram residents (row caches: host side)", .p = b.engram, .d = b.engram },
         .{ .name = "Engram posted gathers (ENGRAM=prefetch: one slot's, host)", .p = b.engram_posted, .d = 0 },
         .{ .name = "prompt wave (K16 + wide lane; chunk-major x 5/4) / verify or draft (in sequence)", .p = b.prefill_wave, .d = @max(b.decode_wave, b.draft_wave) },
-        .{ .name = "KV (every bounded lane at its cap; the ring at its widest)", .p = b.kv, .d = b.kv_decode },
+        .{ .name = "KV (every bounded lane at its cap; the ring at its widest; prompt: one lane write's copy)", .p = b.kv + b.lane_copy, .d = b.kv_decode },
         .{ .name = "MLX allocator cache (the phase's limit)", .p = b.prefill_cache, .d = b.decode_cache },
         .{ .name = "MLX cache overshoot (one freed buffer above the limit)", .p = b.cache_overshoot_prompt, .d = b.cache_overshoot_decode },
         .{ .name = "host side, measured (pools, staging, caches, process)", .p = b.host_reserve, .d = b.host_reserve },
@@ -3106,7 +3106,8 @@ test "dsv41 bill: the default served bill covers every prompt up to 16,384; the 
         }
     }
     const pinned = try bill_mod.servedBill(a, testing.io, &config, null, ceiling, .{ .bill_pinned_prompt = 16384 });
-    try testing.expectEqual(@as(u64, 13_868_806_049), pinned.prefill_wave);
+    // The 16K wave of the 10-02..10-04 receipts (13,868,806,049 B, f32 streams) less kv16's bf16 kept streams, h1, moe_in.
+    try testing.expectEqual(@as(u64, 13_868_806_049 - 1_509_949_440), pinned.prefill_wave);
     const exact = try bill_mod.billAt(a, testing.io, &config, 16384, bill_mod.fill_max_tokens, null, ceiling, .{});
     try testing.expectEqual(exact.prefillTotal(), pinned.prefillTotal());
     try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());
@@ -4024,7 +4025,7 @@ test "dsv41 served cell: a ring lever moves only the bill's KV line, its wiring 
     for (billLines(b0), billLines(b1)) |x, y| {
         try testing.expectEqualStrings(x.name, y.name);
         if (std.mem.startsWith(u8, x.name, "KV ")) {
-            try testing.expectEqual(b1.kv, y.p);
+            try testing.expectEqual(b1.kv + b1.lane_copy, y.p);
             try testing.expectEqual(b1.kv_decode, y.d);
         } else if (std.mem.startsWith(u8, x.name, "wire_tables")) {
             try testing.expectEqual(wire_p, y.p);
