@@ -703,6 +703,7 @@ pub const Module = struct {
         // kv16-opt route switches (model settings, construction only; default: the tier's route, on).
         if (config.kv16_oproj_bf16) |v| tier.routes.prefill_oproj_bf16 = v;
         if (config.kv16_hcpost) |v| tier.routes.prefill_hcpost = v;
+        if (config.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
         tier.layer_major = layer_major;
         log.info("numeric tier: {t}\n", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
@@ -1825,7 +1826,7 @@ pub fn wideRoute(config: *const settings.Config) xp.Wide {
 /// decode-width (8 rows: no rounding-class wide lane); `served` is the tier of record (its DIG-X prefill).
 /// The kv16-opt routes as installed (one construction line; each a model-settings switch, `settings.Config.kv16_*`).
 pub fn kv16OptLine(r: *const graph.Routes, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "NATIVE kv16-opt routes installed: o-projection bf16 out {}, hc post fused bf16 {}", .{ r.prefill_oproj and r.prefill_oproj_bf16, r.prefill_hcpost }) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "NATIVE kv16-opt routes installed: o-projection bf16 out {}, hc post fused bf16 {}, shared middle compiled {}", .{ r.prefill_oproj and r.prefill_oproj_bf16, r.prefill_hcpost, r.prefill_shared_mid }) catch buf[0..0];
 }
 
 pub fn numericTier(t: settings.NumericTier) routes.Tier {

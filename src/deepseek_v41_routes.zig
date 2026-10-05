@@ -122,6 +122,7 @@ pub const served: Tier = blk: {
     t.routes.prefill_oproj = true; // DENSE16 oproj after the prefill core (rows > 32)
     t.routes.prefill_oproj_bf16 = true; // kv16-opt: DENSE16's bf16 product joins the bf16 stream as is (value-identical)
     t.routes.prefill_hcpost = true; // kv16-opt PREFILL_HCPOST: both HC combines above 8 rows in one pass on the bf16 stream
+    t.routes.prefill_shared_mid = true; // C22 SharedMid compiled at prompt widths (word for word the op chain, SHAREDMIDX)
     t.routes.prefill_host_shared = true; // PREFILL_HOST shared: the shared expert under the host's wave plan
     t.routes.prefill_joinless = true; // JOINLESS: the K16 combine reads the unjoined routed outputs
     t.routes.prefill_hc_post = true; // Q3_PREFILL_ATTN hcpost: the attention HC post compiled above 8 rows (`_PREFILL_HC_POST`)
@@ -443,6 +444,7 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     rc_off.prefill_oproj = false;
     rc_off.prefill_oproj_bf16 = false;
     rc_off.prefill_hcpost = false;
+    rc_off.prefill_shared_mid = false;
     rc_off.prefill_host_shared = false;
     rc_off.prefill_joinless = false;
     rc_off.prefill_hc_post = false;

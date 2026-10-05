@@ -65,6 +65,9 @@ pub const Config = struct {
     /// kv16-opt: PREFILL_HCPOST, both HC combines at prompt widths in one pass reading and writing the bf16 stream
     /// (`Routes.prefill_hcpost`, the all-bf16 text; null = the tier's route: on; false: the compiled HcPost region).
     kv16_hcpost: ?bool = null,
+    /// The shared expert's middle as C22's compiled SharedMid region at prompt widths (`Routes.prefill_shared_mid`; null =
+    /// the tier's route: on; false: the op chain).
+    prefill_shared_mid: ?bool = null,
 
     /// The host's load facts onto this config (the module and the bill read them under these names).
     pub fn withFacts(c: Config, facts: *const sdk.LoadFacts) Config {
@@ -84,7 +87,7 @@ pub const Config = struct {
             else => return,
         };
         var any = false;
-        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows", "kv16_oproj_bf16", "kv16_hcpost" }) |key| {
+        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows", "kv16_oproj_bf16", "kv16_hcpost", "prefill_shared_mid" }) |key| {
             if (obj.get(key)) |v| if (v == .bool) {
                 @field(c, key) = v.bool;
                 any = true;
@@ -110,12 +113,13 @@ pub const Config = struct {
             if (v.integer <= max_ctx_size) c.max_context_tokens = @intCast(v.integer) else c.ctx_size_over_limit = v.integer;
             any = true;
         };
-        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} kv16_oproj_bf16={s} kv16_hcpost={s} billed_context={d}\n", .{
+        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} kv16_oproj_bf16={s} kv16_hcpost={s} prefill_shared_mid={s} billed_context={d}\n", .{
             onOff(c.expert_event_gates),  if (c.numeric_tier) |t| @tagName(t) else "default",
             onOff(c.layer_major_prefill), onOff(c.expert_wide_feed),
             onOff(c.expert_wide_seed),    onOff(c.expert_wide_hot_first),
             c.expert_wide_depth orelse 0, c.expert_wide_cold_rows orelse 0,
             onOff(c.embedding_host_rows),     onOff(c.kv16_oproj_bf16),     onOff(c.kv16_hcpost),
+            onOff(c.prefill_shared_mid),
             c.max_context_tokens orelse 0,
         });
     }
