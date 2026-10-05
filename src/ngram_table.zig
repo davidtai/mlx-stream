@@ -8,6 +8,9 @@ const log = @import("sdk").log;
 const io_util = @import("sdk").io_util;
 
 pub const NgramTable = struct {
+    /// The host's persistent pread workers (`io_util.PrefetchPool`), over this table's regions.
+    pub const Pool = io_util.PrefetchPool(NgramTable);
+
     map: []align(std.heap.page_size_min) const u8,
     rows: u64,
     dim: u32,
@@ -21,7 +24,7 @@ pub const NgramTable = struct {
     /// Kept open for the pool's `pread` gather (page faults on one mapping
     /// serialize on the VM map lock; preads run in parallel).
     fd: std.c.fd_t = -1,
-    pool: ?*PrefetchPool = null,
+    pool: ?*Pool = null,
     /// Rows come through `pread` on `fd`, opened past the page cache
     /// (F_NOCACHE, read-ahead off), never through a mapping (`openTensor`).
     nocache: bool = false,
@@ -62,7 +65,7 @@ pub const NgramTable = struct {
         const need = std.math.add(u64, data_offset, std.math.mul(u64, rows, record_bytes) catch return error.NgramTableRegion) catch return error.NgramTableRegion;
         if (size < 0 or @as(u64, @intCast(size)) < need) return error.NgramTableTruncated;
         var t: NgramTable = .{ .map = &empty_map, .rows = rows, .dim = record_bytes, .bits = records_bits, .group_size = 0, .w_off = @intCast(data_offset), .s_off = 0, .b_off = 0, .wcols = 0, .scols = 0, .fd = fd, .nocache = true };
-        if (record_bytes <= PrefetchPool.ROW_BUF) t.pool = try PrefetchPool.create();
+        if (record_bytes <= Pool.ROW_BUF) t.pool = try Pool.create();
         return t;
     }
 
@@ -99,7 +102,7 @@ pub const NgramTable = struct {
     }
 
     /// Row reads per row: the three quantized regions, or the one record.
-    fn regions(self: *const NgramTable) usize {
+    pub fn regions(self: *const NgramTable) usize {
         return if (self.bits == records_bits) 1 else 3;
     }
 
@@ -117,8 +120,8 @@ pub const NgramTable = struct {
         const rb: usize = self.dim;
         if (self.pool) |p| {
             var start: usize = 0;
-            while (start < rows.len) : (start += PrefetchPool.MAX_ROWS) {
-                const end = @min(start + PrefetchPool.MAX_ROWS, rows.len);
+            while (start < rows.len) : (start += Pool.MAX_ROWS) {
+                const end = @min(start + Pool.MAX_ROWS, rows.len);
                 if (!p.run(self, rows[start..end])) return error.RecordRead;
                 for (start..end) |i| @memcpy(out[i * rb ..][0..rb], p.bufs[i - start][0..rb]);
             }
@@ -206,7 +209,7 @@ pub const NgramTable = struct {
     }
 
     /// One (row, region) pread into the pool's row buffer. False on a short read.
-    fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
+    pub fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
         const wl: usize = if (self.bits == records_bits) self.dim else self.wcols * 4;
         const sl: usize = self.scols * 2;
         const off: usize, const dst: []u8 = switch (region) {
@@ -486,99 +489,6 @@ const Poster = struct {
             }
             self.cv.broadcast(io);
             self.mu.unlock(io);
-        }
-    }
-};
-
-/// Persistent gather workers. Every row's three regions are one SSD read on
-/// the cold 32 GB table (~100 us), 48 per token: serial mmap faults were ~5 ms
-/// of every decode step, 16 fault threads ~0.7 ms, and more threads got SLOWER
-/// (faults on one mapping serialize on the VM map lock), so workers `pread`
-/// instead and dequantize their rows in place. Workers wake on a generation
-/// bump and count themselves down; the caller spins (the job is ~100 us).
-pub const PrefetchPool = struct {
-    const N = 48;
-    pub const MAX_ROWS = 64;
-    const ROW_BUF = 512;
-    mu: std.Io.Mutex = .init,
-    cv: std.Io.Condition = .init,
-    gen: u64 = 0,
-    quit: bool = false,
-    table: ?*const NgramTable = null,
-    rows: []const i64 = &.{},
-    bufs: [MAX_ROWS][ROW_BUF]u8 = undefined,
-    pending: std.atomic.Value(u32) = .init(0),
-    failed: std.atomic.Value(u32) = .init(0),
-    /// Fan-out rounds issued; the engagement counter the prefill test reads.
-    runs: std.atomic.Value(u64) = .init(0),
-    threads: [N]std.Thread = undefined,
-
-    fn create() !*PrefetchPool {
-        const a = std.heap.page_allocator;
-        const p = try a.create(PrefetchPool);
-        p.* = .{};
-        var started: usize = 0;
-        errdefer {
-            p.shutdown(started);
-            a.destroy(p);
-        }
-        for (0..N) |i| {
-            p.threads[i] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{ p, i });
-            started += 1;
-        }
-        return p;
-    }
-
-    pub fn destroy(self: *PrefetchPool) void {
-        self.shutdown(N);
-        std.heap.page_allocator.destroy(self);
-    }
-
-    fn shutdown(self: *PrefetchPool, started: usize) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        self.mu.lockUncancelable(io);
-        self.quit = true;
-        self.cv.broadcast(io);
-        self.mu.unlock(io);
-        for (self.threads[0..started]) |t| t.join();
-    }
-
-    /// Fan the `regions * rows.len` preads over the workers; rows land in `bufs`.
-    fn run(self: *PrefetchPool, table: *const NgramTable, rows: []const i64) bool {
-        _ = self.runs.fetchAdd(1, .monotonic);
-        const io = std.Io.Threaded.global_single_threaded.io();
-        self.mu.lockUncancelable(io);
-        self.table = table;
-        self.rows = rows;
-        self.failed.store(0, .release);
-        self.pending.store(N, .release);
-        self.gen += 1;
-        self.cv.broadcast(io);
-        self.mu.unlock(io);
-        while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
-        return self.failed.load(.acquire) == 0;
-    }
-
-    fn worker(self: *PrefetchPool, idx: usize) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        var seen: u64 = 0;
-        while (true) {
-            self.mu.lockUncancelable(io);
-            while (self.gen == seen and !self.quit) self.cv.wait(io, &self.mu) catch {};
-            if (self.quit) {
-                self.mu.unlock(io);
-                return;
-            }
-            seen = self.gen;
-            const table = self.table.?;
-            const rows = self.rows;
-            self.mu.unlock(io);
-            const k = table.regions();
-            var i = idx;
-            while (i < rows.len * k) : (i += N) {
-                if (!table.preadSite(@intCast(rows[i / k]), i % k, &self.bufs[i / k])) _ = self.failed.fetchAdd(1, .acq_rel);
-            }
-            _ = self.pending.fetchSub(1, .acq_rel);
         }
     }
 };
