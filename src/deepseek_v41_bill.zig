@@ -900,21 +900,23 @@ pub fn servedPrefillBill(config: *const settings.Config, ov: module.RouteOverrid
     return prefillBillAt(config, ov, c, if (variant == .tight) tightGroupStreams(model_taps_fenced, module.inputStreamEarlyRelease(ov)) else 4);
 }
 
-/// A reused turn's prompt call of `rows` new rows over `positions` positions (`Module.continueTurn`: the continuation
-/// calls run at their own length's chunk rule, no span pin): the layer-major call's wave (or the chunk-major one's).
+/// A reused turn's prompt call of `rows` new rows in a conversation of `positions` positions (`Module.continueTurn`: the
+/// calls' spans pinned to the whole conversation's chunk rule, as a cold prompt's sub-chunk calls; a span wider than the
+/// call is the call): the layer-major call's wave (or the chunk-major one's).
 pub fn turnCallWave(pb: v41.PrefillBill, layer_major: bool, joinless: bool, rows: u64, positions: u64) u64 {
-    const span = pb.chunkRows(rows);
+    const span = @min(pb.chunkRows(positions), rows);
     if (!layer_major) return pb.waveBytes(span, positions, .served) / 4 * 5;
     const w = pb.layerMajorCallBytes(rows, span, positions, .served);
     return if (joinless) w else w + pb.wideLaneBytes(rows);
 }
 
-/// The widest wave of any reused turn up to `ctx`: every call width 1 .. min(ctx, the sub-chunk) (a longer suffix runs
-/// in sub-chunk pieces) over `ctx` positions (each term grows with the positions), exhaustive.
+/// The widest wave of any reused turn up to `ctx`: every conversation length T up to `ctx`, its widest call (T rows up to
+/// the sub-chunk: a longer suffix runs in sub-chunk pieces; each term grows with the rows) at T's chunk rule over T
+/// positions, exhaustive.
 pub fn reusedTurnWave(pb: v41.PrefillBill, layer_major: bool, joinless: bool, ctx: u64) u64 {
     var w: u64 = 0;
-    var n: u64 = 1;
-    while (n <= @min(ctx, pb.prefill_sub)) : (n += 1) w = @max(w, turnCallWave(pb, layer_major, joinless, n, ctx));
+    var t: u64 = 1;
+    while (t <= ctx) : (t += 1) w = @max(w, turnCallWave(pb, layer_major, joinless, @min(t, pb.prefill_sub), t));
     return w;
 }
 

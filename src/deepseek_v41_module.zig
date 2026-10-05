@@ -1164,6 +1164,14 @@ pub const Module = struct {
             lp.lookup_has_primary = false;
         }
         const rest = ids[keep..];
+        // The continuation's spans at the whole conversation's chunk rule (`ids` is the whole prompt), as a cold prompt's
+        // sub-chunk calls pin theirs: a short turn after a long conversation scores every position, so its own length's
+        // rule (a 3,952-row span at the knee) would hold an index score of span x positions (33 GB at 1M).
+        const tier = &self.model.tier;
+        st.span_chunk = kvc.resolvePrefillChunk(&self.model.c, ids.len, tier.prefill_chunk, tier.chunk_target_bytes);
+        defer if (self.state) |*s| {
+            s.span_chunk = null;
+        };
         if (rest.len <= self.prefill_sub) return self.continueCall(rest);
         var at: usize = 0;
         var logits: ?mlx.mlx_array = null;

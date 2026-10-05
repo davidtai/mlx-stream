@@ -1837,8 +1837,18 @@ test "dsv41 dspark loop: the bank's 16K prompt chunks hold at most two score blo
     }
 }
 
+/// The smallest kv source lane's rows at `positions` (`kvc.boundedCompCap`): every lane is at least this tall.
+fn minLaneRows(pb: v41.PrefillBill, positions: u64) c_int {
+    const kvc = @import("deepseek_v41_cache.zig");
+    var m: u32 = std.math.maxInt(u32);
+    for (pb.kv_sources[0..pb.n_kv_sources]) |r| m = @min(m, kvc.boundedCompCap(@intCast(positions), r).?);
+    return @intCast(m);
+}
+
 const LanePin = struct {
     g: *TraceOps,
+    /// Only buffers of at least this many rows (axis 1): the lanes at their cap, not the window / frontier rings.
+    min_rows: c_int = 0,
     peak: u64 = 0,
     peak_n: u64 = 0,
     pub fn put(self: *LanePin, name: []const u8, _: anytype) !void {
@@ -1852,6 +1862,7 @@ const LanePin = struct {
             const b = self.g.baseOf(e.key_ptr.*);
             const nd = self.g.nodes.items[b];
             if (nd.op != .slice_update and nd.op != .zeros) continue;
+            if (nd.shape.n < 2 or nd.shape.d[1] < self.min_rows) continue;
             const n = Held.allocating(nd);
             if (n < (4 << 20)) continue;
             const gop = try seen.getOrPut(self.g.gpa, b);
@@ -1875,12 +1886,14 @@ const LanePin = struct {
 // 1,048,576: its first call, the lanes only (the trace's wave read is quadratic in the waves; every call's geometry is
 // the first call's but the positions, which `layerMajorCallBytes` bills at the prompt's end).
 // Bank mode (host only, the trace backend; DSV41_BANK): multi-turn's reused turns (`Module.continueTurn`: the
-// continuation calls at their own length's chunk rule, no span pin) on the merged tree. A context of 131,072: a cold
-// prompt of 110,735 tokens (its sub-chunk calls), then a reused turn of 3,953 rows (the knee: the widest one-chunk span)
-// and one of 16,384 (the sub-chunk), each reading every position before it. Each call's wave (its nested peak and the
-// kept halves, the routed calls a stand-in) stays under `turnCallWave` at the context, and its kept handles pin each
-// lane once.
-test "dsv41 memory: multi-turn's reused turns stay under their billed call wave and pin one version of each lane at 131,072 (bank, trace)" {
+// continuation calls' spans pinned to the whole conversation's chunk rule) at contexts 131,072 / 262,144 / 1,048,576.
+// The conversation so far (the context less the two turns) is written into the lanes by one wide-span forward (its own
+// wave is not the subject: the cold prompt's sub-chunk calls have their own test); then a reused turn of 3,953 rows
+// (the knee) and one of 16,384 (the sub-chunk), each at the conversation's chunk rule, reading every position before it.
+// Each turn's kept handles pin each lane once (the billed lanes); its wave (the nested peak and the kept halves, the
+// routed calls a stand-in) stays under `turnCallWave` at the conversation's length (262,144: the first turn; 1,048,576:
+// the lanes only, the trace's wave read is quadratic in the waves).
+test "dsv41 memory: multi-turn's reused turns at the conversation's chunk rule stay under their billed call wave and pin one version of each lane at 131,072 / 262,144 / 1,048,576 (bank, trace)" {
     const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = testing.io;
@@ -1896,52 +1909,58 @@ test "dsv41 memory: multi-turn's reused turns stay under their billed call wave 
     var src = try eng.RowSource.open(a, io, bank, try std.fmt.allocPrint(aa, "{s}/engram-token-map.u32", .{bank}), &c, &diag);
     defer src.deinit();
     const spec = try std.mem.concat(aa, v41.Param, &.{ try v41.residentSpec(aa, &c), try v41.engramSpec(aa, &c) });
-    const ctx: u32 = 131072;
-    const prompt = try aa.alloc(u32, ctx);
+    const prompt = try aa.alloc(u32, 1048576);
     for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
     var tier = routes.served;
     tier.layer_major = true;
-    var g = TraceOps.init(a);
-    defer g.deinit();
-    g.track_live = true;
-    const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
-    var kd: @import("exl3_kernels.zig").Diag = .{};
-    var reg = try @import("exl3_kernels.zig").Registry.init(a, &@import("exl3_kernels.zig").embedded, @import("exl3_kernels.zig").manifest_sha256, &kd);
-    defer reg.deinit();
-    const model_ = try Loop(TraceOps).M.initWith(a, &g, c, tier, &lookup, &src, .{ .registry = &reg });
-    defer model_.deinit(&g);
-    const positions = bill_mod.billedPositions(ctx, bill_mod.fill_max_tokens);
-    var st = try model_.newStateWith(model_.boundedKv(@intCast(positions)));
-    defer st.deinit(&g, a);
-    const stand: graph.StandIn(TraceOps) = .{ .scale = try g.input(&.{@intCast(c.n_routed_experts)}, .float32) };
-    const pb = v41.PrefillBill.of(&c, tier.kv).withIndexLaunch(tier.routes.prefill_index);
-    const lanes = pb.laneBytes(positions);
-    const turns = [_]u32{ 3953, 16384 };
-    const cold: u32 = ctx - turns[0] - turns[1];
-    // The cold prompt, as the Module runs it (sub-chunk calls, the span pinned to its chunk rule).
-    const span = kvc.resolvePrefillChunk(&c, cold, null, kvc.default_chunk_target_bytes);
-    st.span_chunk = span;
-    for (try kvc.prefillSubCalls(aa, cold, @intCast(span), kvc.prefill_sub)) |cl| {
-        const r = try model_.forward(&g, &st, prompt[cl[0]..cl[1]], .{ .logits = .last, .main_hidden = true }, stand, graph.NoProbe{});
-        try Loop(TraceOps).M.fence(&g, &st, &.{ r.logits.?, r.main_hidden.? });
-        g.reset();
-    }
-    st.span_chunk = null;
-    var at: u32 = cold;
-    for (turns) |n| {
-        const f0 = g.nodes.items.len;
-        const w0 = g.freed.items.len;
-        var pin: LanePin = .{ .g = &g };
-        const r = try model_.forward(&g, &st, prompt[at .. at + n], .{ .logits = .last, .main_hidden = true }, stand, &pin);
-        const nst = Held.nested(&g, f0, g.nodes.items.len, g.freed.items[w0..], 0);
-        const halves: u64 = @as(u64, n) * (@as(u64, c.hc_mult) * c.hidden_size * 2 + c.hidden_size * 2 + 3 * @as(u64, c.hc_mult) * 4 + @as(u64, c.hc_mult) * c.hc_mult * 4);
-        const billed = bill_mod.turnCallWave(pb, true, true, n, ctx);
-        std.debug.print("DSV41_REUSED_TURN {{\"context\": {d}, \"from\": {d}, \"rows\": {d}, \"wave\": {d}, \"billed_call_wave\": {d}, \"reused_turn_wave\": {d}, \"pinned_lane_bytes\": {d}, \"billed_lanes\": {d}}}\n", .{ ctx, at, n, nst.peak + halves, billed, bill_mod.reusedTurnWave(pb, true, true, ctx), pin.peak, lanes });
-        try testing.expect(nst.peak + halves <= billed);
-        try testing.expect(pin.peak <= lanes);
-        try Loop(TraceOps).M.fence(&g, &st, &.{ r.logits.?, r.main_hidden.? });
-        g.reset();
-        at += n;
+    const Case = struct { ctx: u32, waves: usize };
+    for ([_]Case{ .{ .ctx = 131072, .waves = 2 }, .{ .ctx = 262144, .waves = 1 }, .{ .ctx = 1048576, .waves = 0 } }) |cs| {
+        const ctx = cs.ctx;
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        g.track_live = true;
+        const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
+        var kd: @import("exl3_kernels.zig").Diag = .{};
+        var reg = try @import("exl3_kernels.zig").Registry.init(a, &@import("exl3_kernels.zig").embedded, @import("exl3_kernels.zig").manifest_sha256, &kd);
+        defer reg.deinit();
+        const model_ = try Loop(TraceOps).M.initWith(a, &g, c, tier, &lookup, &src, .{ .registry = &reg });
+        defer model_.deinit(&g);
+        const positions = bill_mod.billedPositions(ctx, bill_mod.fill_max_tokens);
+        var st = try model_.newStateWith(model_.boundedKv(@intCast(positions)));
+        defer st.deinit(&g, a);
+        const stand: graph.StandIn(TraceOps) = .{ .scale = try g.input(&.{@intCast(c.n_routed_experts)}, .float32) };
+        const pb = v41.PrefillBill.of(&c, tier.kv).withIndexLaunch(tier.routes.prefill_index);
+        const lanes = pb.laneBytes(positions);
+        const turns = [_]u32{ 3953, 16384 };
+        const before: u32 = ctx - turns[0] - turns[1];
+        // The conversation so far, into the lanes (one forward, wide spans).
+        st.span_chunk = 16384;
+        {
+            const r = try model_.forward(&g, &st, prompt[0..before], .{ .logits = .last, .main_hidden = true }, stand, graph.NoProbe{});
+            try Loop(TraceOps).M.fence(&g, &st, &.{ r.logits.?, r.main_hidden.? });
+            g.reset();
+        }
+        var at: u32 = before;
+        for (turns, 0..) |n, ti| {
+            const conv = at + n;
+            st.span_chunk = kvc.resolvePrefillChunk(&c, conv, null, kvc.default_chunk_target_bytes);
+            const f0 = g.nodes.items.len;
+            const w0 = g.freed.items.len;
+            var pin: LanePin = .{ .g = &g, .min_rows = minLaneRows(pb, positions) };
+            const r = try model_.forward(&g, &st, prompt[at..conv], .{ .logits = .last, .main_hidden = true }, stand, &pin);
+            const billed = bill_mod.turnCallWave(pb, true, true, n, conv);
+            const wave: u64 = if (ti < cs.waves) blk: {
+                const nst = Held.nested(&g, f0, g.nodes.items.len, g.freed.items[w0..], 0);
+                break :blk nst.peak + @as(u64, n) * (@as(u64, c.hc_mult) * c.hidden_size * 2 + c.hidden_size * 2 + 3 * @as(u64, c.hc_mult) * 4 + @as(u64, c.hc_mult) * c.hc_mult * 4);
+            } else 0;
+            std.debug.print("DSV41_REUSED_TURN {{\"context\": {d}, \"from\": {d}, \"rows\": {d}, \"span\": {d}, \"wave\": {d}, \"billed_call_wave\": {d}, \"reused_turn_wave\": {d}, \"pinned_lane_bytes\": {d}, \"billed_lanes\": {d}}}\n", .{ ctx, at, n, st.span_chunk.?, wave, billed, bill_mod.reusedTurnWave(pb, true, true, ctx), pin.peak, lanes });
+            if (ti < cs.waves) try testing.expect(wave <= billed);
+            try testing.expect(billed <= bill_mod.reusedTurnWave(pb, true, true, ctx));
+            try testing.expect(pin.peak <= lanes);
+            try Loop(TraceOps).M.fence(&g, &st, &.{ r.logits.?, r.main_hidden.? });
+            g.reset();
+            at = conv;
+        }
     }
 }
 
