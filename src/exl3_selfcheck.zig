@@ -458,10 +458,7 @@ fn dtypeSize(dt: mlx.mlx_dtype) usize {
     };
 }
 
-fn bf16Bits(f: f32) u16 {
-    const b: u32 = @bitCast(f);
-    return @truncate((b +% 0x7FFF +% ((b >> 16) & 1)) >> 16);
-}
+const bf16Bits = @import("sdk").io_util.bf16Rne;
 
 fn putFloat(buf: []u8, i: usize, dt: mlx.mlx_dtype, v: f64) void {
     switch (dt) {
