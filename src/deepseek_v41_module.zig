@@ -615,6 +615,12 @@ pub const Module = struct {
             var kd: xk.Diag = .{};
             self.exl3.routeFusedDown(self.set, &kd) catch |e| return refused(refuse(&diag, e, "exl3 fused down: {s}", .{kd.message()}), &diag);
         }
+        // kv16-opt: the DIG-X waves' expert outputs in bf16 (the cold-row GEMVs write f32: refused together).
+        if (config.dsv41ExpertBf16()) {
+            if ((config.expert_wide_cold_rows orelse 0) > 0) return refused(refuse(&diag, error.ExpertBf16WithColdRows, "kv16 expert bf16: the wide call's cold rows write f32 outputs", .{}), &diag);
+            self.exl3.routeExpertBf16() catch |e| return refused(refuse(&diag, e, "kv16 expert bf16: the fused down GEMM writes f32", .{}), &diag);
+        }
+        log.info("NATIVE kv16-opt expert outputs: bf16 {}\n", .{self.exl3.expert_bf16});
         // The routed decode forms, when overridden: the GEMVs rebuilt on their texts (exact by the registry's twins).
         if (formsRoute(ov, config.dsv41DecodeStack4())) |f| {
             var kd: xk.Diag = .{};

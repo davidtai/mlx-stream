@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "abd5a429cd30c2260095b652773cf7dbff3f89c133e01a68cdf58e9bf2119bbd";
+pub const manifest_sha256 = "3608fcb4b3eb4d81e26335c6b43d10d19ca5bb543f9023c66c29b1c59a082b16";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
@@ -61,6 +61,7 @@ pub const Kernel = enum {
     q3_prefill_dig2_swiglu_2304_x,
     q3_prefill_dig_rot_widen2_2304,
     q3_prefill_dig_rot_widen1_5120,
+    dsv41_prefill_dig_rot_widen1_5120_obf16,
     q3_exl3_dig_decmat_5120x2304_mul1hk3,
     q3_exl3_dig_decmat_2304x5120_mul1hk3,
     q3_exl3_dig_decmat_5120x2304_mul1k3,
@@ -119,6 +120,7 @@ pub const Kernel = enum {
     q3pf_hc_mix_rsqrt__f32,
     q3pf_hc_pre_norm__f32,
     q3sk_combine,
+    q3sk_combine__rbf16,
     // JOINLESS (09-30, port-exported: R/mlx-serve-kernels/tools/export_joinless.py): SMALLK's combine reading the
     // routed rows from the fused call outputs through a (source, row) table
     q3jl_combine,
@@ -156,6 +158,7 @@ pub const Kernel = enum {
     dsv41_exl3_b3_moeprep_dpost,
     dsv41_exl3_b3_pair_k3_5120,
     dsv41_exl3_b3_guone_k3_2304,
+    dsv41_jl_combine_bf16,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -1173,7 +1176,7 @@ fn shaHex(bytes: []const u8) [64]u8 {
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 96), n_kernels);
+    try testing.expectEqual(@as(usize, 99), n_kernels);
     try testing.expectEqual(@as(usize, 17), n_headers);
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
@@ -1188,7 +1191,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 16), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 17), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));

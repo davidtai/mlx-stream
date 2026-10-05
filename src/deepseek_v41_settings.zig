@@ -72,6 +72,9 @@ pub const Config = struct {
     /// DRAFT_STAGED as the construction's defaults (`dsv41DecodeStack4`; null = the tier's: on for served; false: each
     /// off, the stock decode GEMVs, host-built hit waves and one draft commit per block). A harness override wins.
     decode_stack4: ?bool = null,
+    /// kv16-opt: the DIG-X prefill waves store their expert outputs as bf16 (the reference's `Expert` output type; the
+    /// combines read them in f32). Rounding-class against the f32 outputs. null = the tier's: on for served; false: f32.
+    kv16_expert_bf16: ?bool = null,
 
     /// The host's load facts onto this config (the module and the bill read them under these names).
     pub fn withFacts(c: Config, facts: *const sdk.LoadFacts) Config {
@@ -91,7 +94,7 @@ pub const Config = struct {
             else => return,
         };
         var any = false;
-        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows", "kv16_oproj_bf16", "kv16_hcpost", "prefill_shared_mid", "decode_stack4" }) |key| {
+        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows", "kv16_oproj_bf16", "kv16_hcpost", "prefill_shared_mid", "decode_stack4", "kv16_expert_bf16" }) |key| {
             if (obj.get(key)) |v| if (v == .bool) {
                 @field(c, key) = v.bool;
                 any = true;
@@ -117,13 +120,14 @@ pub const Config = struct {
             if (v.integer <= max_ctx_size) c.max_context_tokens = @intCast(v.integer) else c.ctx_size_over_limit = v.integer;
             any = true;
         };
-        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} kv16_oproj_bf16={s} kv16_hcpost={s} prefill_shared_mid={s} decode_stack4={s} billed_context={d}\n", .{
+        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} kv16_oproj_bf16={s} kv16_hcpost={s} prefill_shared_mid={s} decode_stack4={s} kv16_expert_bf16={s} billed_context={d}\n", .{
             onOff(c.expert_event_gates),  if (c.numeric_tier) |t| @tagName(t) else "default",
             onOff(c.layer_major_prefill), onOff(c.expert_wide_feed),
             onOff(c.expert_wide_seed),    onOff(c.expert_wide_hot_first),
             c.expert_wide_depth orelse 0, c.expert_wide_cold_rows orelse 0,
             onOff(c.embedding_host_rows),     onOff(c.kv16_oproj_bf16),     onOff(c.kv16_hcpost),
             onOff(c.prefill_shared_mid),  onOff(c.decode_stack4),
+            onOff(c.kv16_expert_bf16),
             c.max_context_tokens orelse 0,
         });
     }
@@ -178,6 +182,11 @@ pub const Config = struct {
     /// P1c's seed-aligned groups: the setting, else on wherever the base call at the seed and the hottest-first order are.
     pub fn dsv41WideSeedAligned(self: *const Config) bool {
         return self.expert_wide_seed_aligned orelse (self.dsv41WideBaseAtSeed() and self.dsv41WideHotFirst());
+    }
+
+    /// kv16-opt's bf16 expert outputs: the setting, else on for the served tier.
+    pub fn dsv41ExpertBf16(self: *const Config) bool {
+        return self.kv16_expert_bf16 orelse self.dsv41ServedTier();
     }
 
     /// stack4's routes as the construction's defaults: the setting, else on for the served tier.

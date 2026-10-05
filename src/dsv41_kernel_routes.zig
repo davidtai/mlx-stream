@@ -96,7 +96,9 @@ pub const kernels = [_]Kernel{
     .q3pf_hc_mix_rsqrt__f32,
     .q3pf_hc_pre_norm__f32,
     .q3sk_combine,
+    .q3sk_combine__rbf16,
     .q3jl_combine,
+    .dsv41_jl_combine_bf16,
     .dsv41_hcpost_tf32,
     .dsv41_hcpost_tf32__rbf16,
     .dsv41_hcpost_tf32__bf16,
@@ -1247,16 +1249,19 @@ pub fn SmallKCombine(comptime G: type) type {
         const Self = @This();
         e: *const Entry,
 
+        /// kv16-opt: the same text over bf16 routed rows (the DIG-X waves' bf16 expert outputs)
+        bf16: *const Entry,
+
         pub fn init(reg: *const xk.Registry, geo: *const PrefillGeometry, diag: ?*xk.Diag) Refusal!Self {
             try geo.admit("q3sk_combine", diag);
-            return .{ .e = reg.get(.q3sk_combine) };
+            return .{ .e = reg.get(.q3sk_combine), .bf16 = reg.get(.q3sk_combine__rbf16) };
         }
 
-        /// routed f32 [n, 6, 5120] (the unweighted expert outputs), weights f32 [n, 6], shared f32
-        /// [n, 5120] -> f32 [n, 5120].
+        /// routed f32 or bf16 [n, 6, 5120] (the unweighted expert outputs, read as f32), weights f32 [n, 6], shared
+        /// f32 [n, 5120] -> f32 [n, 5120].
         pub fn call(self: *const Self, g: *G, routed: G.T, weights: G.T, shared: G.T) !G.T {
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.e, &rowsVars(rowsOf(G, g, routed, 0)), &.{ routed, weights, shared }, &out);
+            try launchRule(G, g, if (g.dtypeOf(routed) == .bfloat16) self.bf16 else self.e, &rowsVars(rowsOf(G, g, routed, 0)), &.{ routed, weights, shared }, &out);
             return out[0];
         }
     };
@@ -1302,10 +1307,12 @@ pub fn JoinlessCombine(comptime G: type) type {
         /// the text's source slots (the lane's NSRC); unused slots alias source 0
         pub const sources = 24;
         e: *const Entry,
+        /// kv16-opt: the text over bf16 sources (the DIG-X waves' bf16 expert outputs; the same f32 arithmetic)
+        bf16: *const Entry,
 
         pub fn init(reg: *const xk.Registry, geo: *const PrefillGeometry, diag: ?*xk.Diag) Refusal!Self {
             try geo.admit("q3jl_combine", diag);
-            return .{ .e = reg.get(.q3jl_combine) };
+            return .{ .e = reg.get(.q3jl_combine), .bf16 = reg.get(.dsv41_jl_combine_bf16) };
         }
 
         /// outs: the layer's routed outputs as sources (1..24, each f32 [r_i, 5120]; a layer with more
@@ -1319,7 +1326,7 @@ pub fn JoinlessCombine(comptime G: type) type {
             var vars = rowsVars(rowsOf(G, g, weights, 0));
             vars.set(.src, rowsOf(G, g, outs[0], 0));
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.e, &vars, &ins, &out);
+            try launchRule(G, g, if (g.dtypeOf(outs[0]) == .bfloat16) self.bf16 else self.e, &vars, &ins, &out);
             return out[0];
         }
     };
@@ -1752,12 +1759,13 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
     try testing.expect(std.mem.indexOf(u8, diag.message(), "q3pf_hc_mix_rsqrt") != null);
     try testing.expectError(error.TemplateNotRegistered, HcNorm(Trace).init(&t, &reg, &.derived, .float16, 1e-20, null));
     // the MoE combine
-    {
-        const e = reg.get(.q3sk_combine);
+    // (kv16-opt: bf16 routed rows take the bf16-routed instantiation)
+    for ([_]xk.Kernel{ .q3sk_combine, .q3sk_combine__rbf16 }) |k| {
+        const e = reg.get(k);
         const r = try SmallKCombine(Trace).init(&reg, &.derived, null);
         for (e.samples) |*s| {
             const n: c_int = @intCast(s.vars.get(.rows));
-            const routed, const w, const sh = .{ try t.node(&.{ n, 6, 5120 }, .float32, &.{}), try t.node(&.{ n, 6 }, .float32, &.{}), try t.node(&.{ n, 5120 }, .float32, &.{}) };
+            const routed, const w, const sh = .{ try t.node(&.{ n, 6, 5120 }, if (k == .q3sk_combine) .float32 else .bfloat16, &.{}), try t.node(&.{ n, 6 }, .float32, &.{}), try t.node(&.{ n, 5120 }, .float32, &.{}) };
             _ = try r.call(&t, routed, w, sh);
             try expectLaunch(t.back(1), e, s, &.{ routed, w, sh });
         }
@@ -1813,13 +1821,14 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
     }
     // JOINLESS: the call outputs in slots 0..n-1, the rest aliasing slot 0, then the table, the weights
     // and the shared rows; at the lane's install shapes; more than 24 outputs or a foreign geometry refused
-    {
-        const e = reg.get(.q3jl_combine);
+    // (kv16-opt: bf16 sources take the bf16-source text)
+    for ([_]xk.Kernel{ .q3jl_combine, .dsv41_jl_combine_bf16 }) |k| {
+        const e = reg.get(k);
         const r = try JoinlessCombine(Trace).init(&reg, &.derived, null);
         for (e.samples) |*s| {
             const n: c_int = @intCast(s.vars.get(.rows));
             var outs: [3]Trace.T = undefined;
-            for (&outs, 0..) |*o, i| o.* = try t.node(&.{ @intCast(97 + i), 5120 }, .float32, &.{});
+            for (&outs, 0..) |*o, i| o.* = try t.node(&.{ @intCast(97 + i), 5120 }, if (k == .q3jl_combine) .float32 else .bfloat16, &.{});
             const loc, const w, const sh = .{ try t.node(&.{ n, 6, 2 }, .int32, &.{}), try t.node(&.{ n, 6 }, .float32, &.{}), try t.node(&.{ n, 5120 }, .float32, &.{}) };
             _ = try r.call(&t, &outs, loc, w, sh);
             var want: [27]Trace.T = undefined;

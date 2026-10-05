@@ -92,7 +92,7 @@ fn appendJsonEscaped(j: *std.ArrayList(u8), a: Allocator, s: []const u8) !void {
 pub fn implemented(k: Kernel, c: Check) bool {
     return switch (c) {
         .compile, .row_invariance => true,
-        .join_equiv => k == .q3jl_combine,
+        .join_equiv => k == .q3jl_combine or k == .dsv41_jl_combine_bf16,
         .twin => twinOf(k) != null or formTwinOf(k) != null or bankedTwinOf(k) != null,
         .fused => fusedOf(k) != null,
         .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120,
@@ -100,7 +100,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
         .composition => isDigGemm(k) or fusedOf(k) != null,
         .layout_guard => k == .q3rc_mxfp8_fma or k == .q3drc_mxfp8_fma_f32x or k == .q3rc_mxfp8_fma__draft,
         .mlx_chain => switch (k) {
-            .q3_exl3_prep_in_rin, .q3_exl3_prep_din_rin, .q3_moeprep_dpost, .q3_prefill_dig_rot_take2_5120, .dsv41_prefill_dig_take2v_5120, .q3_prefill_dig_rot_roundx_2304, .q3_prefill_dig_rot_widen2_2304, .q3_prefill_dig_rot_widen1_5120, .q3_prefill_fused_exl3x3_mul1lut_k3_bf16 => true,
+            .q3_exl3_prep_in_rin, .q3_exl3_prep_din_rin, .q3_moeprep_dpost, .q3_prefill_dig_rot_take2_5120, .dsv41_prefill_dig_take2v_5120, .q3_prefill_dig_rot_roundx_2304, .q3_prefill_dig_rot_widen2_2304, .q3_prefill_dig_rot_widen1_5120, .dsv41_prefill_dig_rot_widen1_5120_obf16, .q3_prefill_fused_exl3x3_mul1lut_k3_bf16 => true,
             else => false,
         },
         .f64 => switch (k) {
@@ -810,7 +810,8 @@ fn checkJoinEquiv(h: *H, k: Kernel) !void {
         const flat = try op(&sc, mlx.mlx_concatenate_axis, .{ v, @as(c_int, 0), h.s });
         const gi = try fromHost(&sc, std.mem.sliceAsBytes(glob), &.{@intCast(n_as)}, .int32);
         const routed = try reshape(&sc, try take0(&sc, flat, gi, h.s), &.{ @intCast(rows), 6, 5120 }, h.s);
-        const want = try launch(h, &sc, .q3sk_combine, &.{ routed, ins[join_sources + 1], ins[join_sources + 2] }, &vars, null);
+        // (the bf16 sources' text against SMALLK's bf16-routed instantiation)
+        const want = try launch(h, &sc, if (k == .dsv41_jl_combine_bf16) .q3sk_combine__rbf16 else .q3sk_combine, &.{ routed, ins[join_sources + 1], ins[join_sources + 2] }, &vars, null);
         const a = try hostCopy(h, got[0]);
         defer h.a.free(a);
         const b = try hostCopy(h, want[0]);
@@ -1078,9 +1079,11 @@ fn checkChain(h: *H, k: Kernel) !void {
                 n_ref += 1;
             }
         },
-        .q3_prefill_dig_rot_widen1_5120 => {
+        .q3_prefill_dig_rot_widen1_5120, .dsv41_prefill_dig_rot_widen1_5120_obf16 => {
             const r = try slotRows(&sc, in_.at("rout"), in_.at("slots"), in_.at("rhs"), rows, 5120, s);
             refs[0] = try mul(&sc, try t128(&sc, in_.at("act"), &.{ rows, 1, 5120 }, s), r, s);
+            // kv16-opt: the bf16-out instantiation stores the same f32 word rounded to bf16 (MLX's astype)
+            if (k == .dsv41_prefill_dig_rot_widen1_5120_obf16) refs[0] = try op(&sc, mlx.mlx_astype, .{ refs[0], mlx.mlx_dtype.bfloat16, s });
             n_ref = 1;
         },
         else => return error.NoChainForKernel,

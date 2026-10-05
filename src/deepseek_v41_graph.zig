@@ -2103,7 +2103,7 @@ pub fn Trunk(comptime G: type) type {
         /// The combine at prompt widths: SMALLK's kernel above attn_compile_max_rows when bound.
         fn combineWide(g: *G, lk: LK, ro: T, weights: T, shared: T) !T {
             if (lk.combine) |k| if (g.shapeOf(shared).dim(0) > attn_compile_max_rows)
-                return k.call(g, try g.astype(ro, .float32), try g.astype(weights, .float32), shared);
+                return k.call(g, if (g.dtypeOf(ro) == .bfloat16) ro else try g.astype(ro, .float32), try g.astype(weights, .float32), shared);
             return moeCombine(g, ro, weights, shared);
         }
 

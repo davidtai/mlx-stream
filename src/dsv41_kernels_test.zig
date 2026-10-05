@@ -73,8 +73,8 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         std.debug.print("partition: {s}\n", .{m});
         return error.TestUnexpectedResult;
     }
-    try testing.expectEqual(@as(usize, 33), eq.kernels.len);
-    try testing.expectEqual(@as(usize, 63), tr.kernels.len);
+    try testing.expectEqual(@as(usize, 34), eq.kernels.len);
+    try testing.expectEqual(@as(usize, 65), tr.kernels.len);
     try testing.expectEqual(xk.n_kernels, eq.kernels.len + tr.kernels.len);
     // the EXL3 subset is exactly the EXL3 families; its headers are the DIG ones
     const exl3_families = [_][]const u8{ "exl3_decode_gemv", "exl3_rin_stage", "prefill_rebuild", "prefill_digx", "prefill_digx_check" };
@@ -634,6 +634,15 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
             const e, const v = .{ r.widen1_e, &s.vars };
             const act, const rhs, const slots, const rout = .{ try t.arg(e, "act", v), try t.arg(e, "rhs", v), try t.arg(e, "slots", v), try t.arg(e, "rout", v) };
             _ = try r.widen1(&t, act, rhs, slots, rout);
+            try expectLaunch(t.back(1), e, s, &.{ act, rhs, slots, rout });
+        }
+        // kv16-opt: the bf16-out rot_widen1 (`Accepted.routeExpertBf16` installs it as the waves' widen1)
+        var rb = r;
+        rb.widen1_e = reg.get(.dsv41_prefill_dig_rot_widen1_5120_obf16);
+        for (rb.widen1_e.samples) |*s| {
+            const e, const v = .{ rb.widen1_e, &s.vars };
+            const act, const rhs, const slots, const rout = .{ try t.arg(e, "act", v), try t.arg(e, "rhs", v), try t.arg(e, "slots", v), try t.arg(e, "rout", v) };
+            _ = try rb.widen1(&t, act, rhs, slots, rout);
             try expectLaunch(t.back(1), e, s, &.{ act, rhs, slots, rout });
         }
     }

@@ -66,6 +66,7 @@ pub const kernels = [_]Kernel{
     .q3_prefill_dig2_swiglu_2304_x,
     .q3_prefill_dig_rot_widen2_2304,
     .q3_prefill_dig_rot_widen1_5120,
+    .dsv41_prefill_dig_rot_widen1_5120_obf16,
     .q3_exl3_dig_decmat_5120x2304_mul1hk3,
     .q3_exl3_dig_decmat_2304x5120_mul1hk3,
     .q3_exl3_dig_decmat_5120x2304_mul1k3,
@@ -210,6 +211,8 @@ pub fn Accepted(comptime G: type) type {
         waves: []DigXPrefill(G) = &.{},
         /// the waves' down stage is the fused down GEMM (`routeFusedDown`)
         fused_down: bool = false,
+        /// kv16-opt: the waves' expert outputs in bf16 (`routeExpertBf16`)
+        expert_bf16: bool = false,
         /// the decode GEMVs' routed forms (`routeForms`); all false: the stock mul1h texts
         forms: Forms = .{},
         /// the banked route (`routeBanked`): every bank's rows of a wave in one launch per stage; null: not installed
@@ -286,6 +289,16 @@ pub fn Accepted(comptime G: type) type {
         /// (`.compile`: compile, bind, one launch), so no route text compiles at its first decode launch.
         pub fn compileTexts(self: *Self, set: *const ks.Set, texts: []const Kernel, diag: *Diag) !void {
             try set.selfCheck(self.a, texts, .compile, &self.report, diag);
+        }
+
+        /// kv16-opt, at construction (before any prefill): every layer's DIG-X waves store their expert outputs as bf16
+        /// (rot_widen1's bf16-out instantiation: the same f32 word, rounded to bf16), the reference's `Expert` output
+        /// type (`type_as(x)`); the combines read them in f32 as before. The fused down GEMM's epilogue writes f32, so it
+        /// refuses with the fused arm installed.
+        pub fn routeExpertBf16(self: *Self) !void {
+            if (self.fused_down) return error.ExpertBf16NeedsChainDown;
+            for (self.waves) |*w| w.dig.widen1_e = self.reg.get(.dsv41_prefill_dig_rot_widen1_5120_obf16);
+            self.expert_bf16 = true;
         }
 
         /// The routed decode forms, at construction (before any decode): the GEMVs rebuilt on the forms' texts. Exact by
