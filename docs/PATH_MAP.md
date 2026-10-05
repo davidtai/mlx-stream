@@ -178,7 +178,7 @@ Use it to port commits written against the in-tree layout (for example the cover
 | src/mlx_stream_tests.zig | src/tests.zig |  |
 | src/sdk/arch.zig | host src/sdk/arch.zig | `Binds` and `Caps.uses_expert_reader` removed; `claim_process` / `release_process` added |
 | src/sdk/build_option.zig | (deleted) | no host build options for plugins; see src/build_flags.zig |
-| src/sdk/check.zig | src/sdk_ext/check.zig (copy) + host src/sdk/check.zig |  |
+| src/sdk/check.zig | host src/sdk/check.zig (`sdk.check`) |  |
 | src/sdk/expert.zig | src/sdk_ext/expert.zig |  |
 | src/sdk/expert/event.zig | src/sdk_ext/expert/event.zig |  |
 | src/sdk/expert/io.zig | src/sdk_ext/expert/io.zig |  |
