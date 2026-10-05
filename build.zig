@@ -90,6 +90,6 @@ const refusal_cases = [_]struct { case: []const u8, err: []const u8 }{
     .{ .case = "expert_source_wrong_caps", .err = "WrongCaps.caps: a u32 where the SDK has sdk_ext.expert.Caps" },
     .{ .case = "quant_half_contract", .err = "HalfQuant: no Accepted" },
     .{ .case = "quant_claims_mistyped", .err = "QuantWrongClaims.claims: takes a different parameter count than the SDK's" },
-    .{ .case = "quant_check_direct", .err = "QuantWrongClaims.claims: takes a different parameter count than the C2 contract" },
+    .{ .case = "quant_check_direct", .err = "QuantWrongClaims.claims: takes a different parameter count than the SDK's" },
     .{ .case = "profile_hook_missing_probe", .err = "the prefill probes lack now" },
 };

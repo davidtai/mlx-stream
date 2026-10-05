@@ -143,22 +143,6 @@ pub fn obj(v: std.json.Value, name: []const u8) std.json.Value {
 
 // ── The interface checks (comptime) ──
 
-fn expectFn(comptime where: []const u8, comptime F: type, comptime params: []const type, comptime Payload: ?type) void {
-    const info = @typeInfo(F).@"fn";
-    if (info.param_types.len != params.len) @compileError(where ++ ": takes a different parameter count than the C2 contract");
-    for (info.param_types, params) |p, t| {
-        if (p.? != t) @compileError(where ++ ": parameter " ++ @typeName(p.?) ++ " where the C2 contract has " ++ @typeName(t));
-    }
-    if (Payload) |want| {
-        const R = info.return_type.?;
-        const P = switch (@typeInfo(R)) {
-            .error_union => |eu| eu.payload,
-            else => R,
-        };
-        if (P != want) @compileError(where ++ ": returns " ++ @typeName(P) ++ " where the C2 contract has " ++ @typeName(want));
-    }
-}
-
 /// Comptime: `Q` declares the quant half of the contract; a compile error names the first
 /// declaration missing or mistyped.
 pub fn check(comptime Q: type) void {
@@ -167,7 +151,7 @@ pub fn check(comptime Q: type) void {
             if (!@hasDecl(Q, d)) @compileError("quant " ++ @typeName(Q) ++ ": no " ++ d);
         }
         if (@TypeOf(Q.name) != []const u8 and @TypeOf(Q.name) != *const [Q.name.len:0]u8) @compileError("quant " ++ @typeName(Q) ++ ": name is not a string");
-        expectFn("quant " ++ @typeName(Q) ++ ".claims", @TypeOf(Q.claims), &.{ *const BankPeek, ?*Diag }, ?Priority);
+        pk.check.fnDecl("quant " ++ @typeName(Q), Q, "claims", &.{ *const BankPeek, ?*Diag }, ?Priority);
     }
 }
 
@@ -180,12 +164,12 @@ pub fn checkAccepted(comptime Q: type, comptime G: type) void {
         const Bank = BankArrays(Ar);
         const where = "quant " ++ @typeName(Q) ++ ".Accepted";
         if (!@hasDecl(A, "max_decode_rows") or @TypeOf(A.max_decode_rows) != u32) @compileError(where ++ ": no max_decode_rows: u32");
-        expectFn(where ++ ".checkBank", @TypeOf(A.checkBank), &.{ *const A, *G, Bank, *Diag }, void);
-        expectFn(where ++ ".gateUp", @TypeOf(A.gateUp), &.{ *const A, *G, G.T, G.T, Ar, Ar }, G.T);
-        expectFn(where ++ ".down", @TypeOf(A.down), &.{ *const A, *G, G.T, G.T, Ar }, G.T);
-        expectFn(where ++ ".prefill", @TypeOf(A.prefill), &.{ *A, *G, u32, G.T, PrefillRows, Bank }, G.T);
-        expectFn(where ++ ".finishPrefill", @TypeOf(A.finishPrefill), &.{ *A, *G }, void);
-        expectFn(where ++ ".deinit", @TypeOf(A.deinit), &.{ *A, *G }, void);
+        pk.check.fnDecl(where, A, "checkBank", &.{ *const A, *G, Bank, *Diag }, void);
+        pk.check.fnDecl(where, A, "gateUp", &.{ *const A, *G, G.T, G.T, Ar, Ar }, G.T);
+        pk.check.fnDecl(where, A, "down", &.{ *const A, *G, G.T, G.T, Ar }, G.T);
+        pk.check.fnDecl(where, A, "prefill", &.{ *A, *G, u32, G.T, PrefillRows, Bank }, G.T);
+        pk.check.fnDecl(where, A, "finishPrefill", &.{ *A, *G }, void);
+        pk.check.fnDecl(where, A, "deinit", &.{ *A, *G }, void);
         // accept(G, a, g, ctx, spec, diag) !*A: instantiated through a wrapper of the contract's
         // signature, so a mistyped accept fails here, named
         const Wrap = struct {
