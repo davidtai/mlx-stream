@@ -159,6 +159,10 @@ pub const Routes = struct {
     /// the packed mxfp8 wo_a (one expert per group) and wo_b as a bf16 qmm, widened to f32 (no f32
     /// einsum over the dense f32 wo_a).
     prefill_oproj: bool = false,
+    /// kv16-opt: DENSE16 returns wo_b's bf16 gather_qmm product as is. The attention side joins the stream in its dtype
+    /// (bf16 under kv16), so the f32 widening and the narrowing after it were a round trip of the same words (bf16 ->
+    /// f32 is exact): value-identical, two [rows, 5120] arrays fewer per chunk and layer. false: the f32 widening.
+    prefill_oproj_bf16: bool = false,
     /// PREFILL_HOST shared (K16): after the routing barrier each chunk's shared expert (f32) is
     /// started on the GPU before the routed call, so it runs while the host plans the waves;
     /// the combine reads it (the same expression: exact). Billed in the layer-major wave.
@@ -1489,7 +1493,7 @@ pub fn Trunk(comptime G: type) type {
                 const in_: c_int = @intCast(c.n_heads * c.head_dim / c.o_groups);
                 const og = try checkFill(g, r, scratch, &.{ @intCast(c.o_groups), S, in_ }, 1.0, .float32);
                 const w = &layers[1];
-                out[n] = .{ .name = "o-projection DENSE16", .ok = try checkClose(g, try outProjDense16(g, c, og, w, 1, S), try outProjGrouped(g, c, og, try woaDense(g, c, w), w.wo_b, 1, S), 3e-2) };
+                out[n] = .{ .name = "o-projection DENSE16", .ok = try checkClose(g, try outProjDense16(g, c, og, w, 1, S, .float32), try outProjGrouped(g, c, og, try woaDense(g, c, w), w.wo_b, 1, S), 3e-2) };
                 n += 1;
             }
             if (rt.prefill_hc_post) {
@@ -1770,8 +1774,8 @@ pub fn Trunk(comptime G: type) type {
 
         /// DENSE16 `outProj` after the prefill core: og f32 [g, S, in] -> bf16, the grouped o-LoRA as
         /// gather_qmm over wo_a's packed [g, rank, in] view (rhs = arange(g)), [S, g x rank], then
-        /// wo_b's qmm, widened to f32.
-        pub fn outProjDense16(g: *G, c: *const v41.Config, og: T, w: *const W, b: c_int, s: c_int) !T {
+        /// wo_b's qmm in `out_dt` (bf16: the product as is, `Routes.prefill_oproj_bf16`; f32: widened).
+        pub fn outProjDense16(g: *G, c: *const v41.Config, og: T, w: *const W, b: c_int, s: c_int, out_dt: Dtype) !T {
             const G_: c_int = @intCast(c.o_groups);
             const R: c_int = @intCast(c.o_lora_rank);
             const ws = g.shapeOf(w.wo_a.w);
@@ -1789,7 +1793,7 @@ pub fn Trunk(comptime G: type) type {
             const wb = try g.reshape(w.wo_b.w, &.{ 1, bs_.dim(0), bs_.dim(1) });
             const sb = try g.reshape(w.wo_b.s, &.{ 1, bss.dim(0), bss.dim(1) });
             const y = try g.gatherQmm(flat, wb, sb, oi[1], w.wo_b.mode);
-            return g.astype(try g.reshape(y, &.{ b, s, bs_.dim(0) }), .float32);
+            return g.astype(try g.reshape(y, &.{ b, s, bs_.dim(0) }), out_dt);
         }
 
         /// `outProj` after the prefill core: o already inverse-roped as [g, S, in] f32 -> the grouped
@@ -1887,7 +1891,7 @@ pub fn Trunk(comptime G: type) type {
                     var og = try core.attend(g, q, window, sel.idx, sel.valid, cmp, sink, .{ cs.cos, cs.sin });
                     if (scores) |m| try closeScores(g, m, &.{&og});
                     try p.put("attn.o_grouped", og);
-                    const out = if (rt.prefill_oproj) try outProjDense16(g, c, og, w, b, s) else try outProjGrouped(g, c, og, try woaDense(g, c, w), w.wo_b, b, s);
+                    const out = if (rt.prefill_oproj) try outProjDense16(g, c, og, w, b, s, if (rt.prefill_oproj_bf16) .bfloat16 else .float32) else try outProjGrouped(g, c, og, try woaDense(g, c, w), w.wo_b, b, s);
                     try p.put("attn.out", out);
                     return out;
                 }
@@ -3105,7 +3109,7 @@ test "dsv41 graph: the DENSE16 o-projection takes its rhs index pair from constr
     const s: c_int = 64;
     const og = try g.input(&.{ @intCast(c.o_groups), s, @intCast(c.n_heads * c.head_dim / c.o_groups) }, .float32);
     const from = g.nodes.items.len;
-    const out = try Tr.outProjDense16(&g, &c, og, &w, 1, s);
+    const out = try Tr.outProjDense16(&g, &c, og, &w, 1, s, .float32);
     try testing.expectEqual(@as(u8, 3), g.shapeOf(out).n);
     var aranges: usize = 0;
     var u32_casts: usize = 0;
@@ -3119,6 +3123,24 @@ test "dsv41 graph: the DENSE16 o-projection takes its rhs index pair from constr
     try testing.expectEqual(@as(usize, 0), u32_casts);
     // Both projections still gather through their packed views (wo_a's groups, wo_b's one expert).
     try testing.expectEqual(@as(usize, 2), gathers);
+}
+
+test "dsv41 graph: kv16-opt DENSE16 bf16 out: wo_b's product as is (no f32 widening); the f32 route widens once" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const c = try realConfig();
+    var w = try traceLayerW(&g, &c, c.layers[1]);
+    w.oproj_idx = try Tr.oprojIndices(&g, &c);
+    const s: c_int = 64;
+    const og = try g.input(&.{ @intCast(c.o_groups), s, @intCast(c.n_heads * c.head_dim / c.o_groups) }, .float32);
+    inline for (.{ Dtype.bfloat16, Dtype.float32 }, .{ 0, 1 }) |dt, widen| {
+        const from = g.nodes.items.len;
+        const out = try Tr.outProjDense16(&g, &c, og, &w, 1, s, dt);
+        try testing.expectEqual(dt, g.dtypeOf(out));
+        var f32_casts: usize = 0;
+        for (g.nodes.items[from..]) |nd| f32_casts += @intFromBool(nd.op == .astype and nd.dtype == .float32);
+        try testing.expectEqual(@as(usize, widen), f32_casts);
+    }
 }
 
 test "dsv41 graph: the prefill attention core takes the prompt widths per layer kind; no gathered KVg; verify widths keep the chain" {

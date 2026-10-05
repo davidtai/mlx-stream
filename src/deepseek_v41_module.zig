@@ -700,6 +700,8 @@ pub const Module = struct {
             if (v and !tier.routes.prefill_attn) return error.PrefillOprojNeedsPrefillAttn;
             tier.routes.prefill_oproj = v;
         }
+        // kv16-opt route switches (model settings, construction only; default: the tier's route, on).
+        if (config.kv16_oproj_bf16) |v| tier.routes.prefill_oproj_bf16 = v;
         tier.layer_major = layer_major;
         log.info("numeric tier: {t}\n", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
@@ -743,6 +745,7 @@ pub const Module = struct {
         var line_buf: [384]u8 = undefined;
         log.info("{s}\n", .{self.installed.line(&line_buf)});
         log.info("{s}\n", .{self.installed.callSites(&line_buf)});
+        log.info("{s}\n", .{kv16OptLine(&self.model.tier.routes, &line_buf)});
         self.installed.decode_attn_softmax = self.model.tier.routes.rc_attn_softmax;
         self.installed.ring_geo = self.model.tier.kv;
         self.installed.decode_index_topk = self.model.tier.routes.rc_index_topk;
@@ -1819,6 +1822,11 @@ pub fn wideRoute(config: *const settings.Config) xp.Wide {
 
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
 /// decode-width (8 rows: no rounding-class wide lane); `served` is the tier of record (its DIG-X prefill).
+/// The kv16-opt routes as installed (one construction line; each a model-settings switch, `settings.Config.kv16_*`).
+pub fn kv16OptLine(r: *const graph.Routes, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "NATIVE kv16-opt routes installed: o-projection bf16 out {}", .{r.prefill_oproj and r.prefill_oproj_bf16}) catch buf[0..0];
+}
+
 pub fn numericTier(t: settings.NumericTier) routes.Tier {
     return switch (t) {
         .stock => blk: {

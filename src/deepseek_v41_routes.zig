@@ -120,6 +120,7 @@ pub const served: Tier = blk: {
     t.routes.prefill_hc = true; // ATTN hcnorm: the prefill HC norms (rows >= 32)
     t.routes.prefill_combine = true; // SMALLK: the prefill MoE combine (rows > 32)
     t.routes.prefill_oproj = true; // DENSE16 oproj after the prefill core (rows > 32)
+    t.routes.prefill_oproj_bf16 = true; // kv16-opt: DENSE16's bf16 product joins the bf16 stream as is (value-identical)
     t.routes.prefill_host_shared = true; // PREFILL_HOST shared: the shared expert under the host's wave plan
     t.routes.prefill_joinless = true; // JOINLESS: the K16 combine reads the unjoined routed outputs
     t.routes.prefill_hc_post = true; // Q3_PREFILL_ATTN hcpost: the attention HC post compiled above 8 rows (`_PREFILL_HC_POST`)
@@ -439,6 +440,7 @@ test "dsv41 routes: the tier arm refuses only for its Metal kernels, and parses 
     rc_off.prefill_hc = false;
     rc_off.prefill_combine = false;
     rc_off.prefill_oproj = false;
+    rc_off.prefill_oproj_bf16 = false;
     rc_off.prefill_host_shared = false;
     rc_off.prefill_joinless = false;
     rc_off.prefill_hc_post = false;

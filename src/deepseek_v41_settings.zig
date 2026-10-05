@@ -59,6 +59,9 @@ pub const Config = struct {
     expert_wide_seed_aligned: ?bool = null,
     /// The input embedding read from its host rows from construction (null = on).
     embedding_host_rows: ?bool = null,
+    /// kv16-opt: the DENSE16 o-projection returns wo_b's bf16 product as the stream's bf16 (`Routes.prefill_oproj_bf16`),
+    /// no f32 widening the attention side narrows again (null = the tier's route: on; false: the old f32 widening).
+    kv16_oproj_bf16: ?bool = null,
 
     /// The host's load facts onto this config (the module and the bill read them under these names).
     pub fn withFacts(c: Config, facts: *const sdk.LoadFacts) Config {
@@ -78,7 +81,7 @@ pub const Config = struct {
             else => return,
         };
         var any = false;
-        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows" }) |key| {
+        inline for (.{ "expert_event_gates", "layer_major_prefill", "expert_wide_feed", "expert_wide_seed", "expert_wide_hot_first", "embedding_host_rows", "kv16_oproj_bf16" }) |key| {
             if (obj.get(key)) |v| if (v == .bool) {
                 @field(c, key) = v.bool;
                 any = true;
@@ -104,12 +107,13 @@ pub const Config = struct {
             if (v.integer <= max_ctx_size) c.max_context_tokens = @intCast(v.integer) else c.ctx_size_over_limit = v.integer;
             any = true;
         };
-        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} billed_context={d}\n", .{
+        if (any) log.info("[model-settings] deepseek_v41: event_gates={s} numeric_tier={s} layer_major_prefill={s} wide_feed={s} wide_seed={s} wide_hot_first={s} wide_depth={d} wide_cold_rows={d} embedding_host_rows={s} kv16_oproj_bf16={s} billed_context={d}\n", .{
             onOff(c.expert_event_gates),  if (c.numeric_tier) |t| @tagName(t) else "default",
             onOff(c.layer_major_prefill), onOff(c.expert_wide_feed),
             onOff(c.expert_wide_seed),    onOff(c.expert_wide_hot_first),
             c.expert_wide_depth orelse 0, c.expert_wide_cold_rows orelse 0,
-            onOff(c.embedding_host_rows),     c.max_context_tokens orelse 0,
+            onOff(c.embedding_host_rows),     onOff(c.kv16_oproj_bf16),
+            c.max_context_tokens orelse 0,
         });
     }
 
