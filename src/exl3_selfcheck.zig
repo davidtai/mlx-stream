@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+const log = @import("sdk").log;
 const xk = @import("exl3_kernels.zig");
 
 const Allocator = std.mem.Allocator;
@@ -344,7 +345,7 @@ fn runOver(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, want: 
             h.dispatch(e.kernel, c) catch |err| {
                 var buf: [512]u8 = undefined;
                 const msg = mlx.takeError(&buf) orelse "";
-                std.debug.print("[exl3 selfcheck] {t} {t}: {t} {s}\n", .{ e.kernel, c, err, msg });
+                log.err("[exl3 selfcheck] {t} {t}: {t} {s}\n", .{ e.kernel, c, err, msg });
                 try report.appendRaised(a, e.kernel, c, err, msg);
             };
             if (report.results.items.len == before)
@@ -382,9 +383,9 @@ pub fn logResults(report: *const Report, all: bool) void {
     for (report.results.items) |r| {
         n_fail += @intFromBool(!r.ok);
         if (r.ok and !all) continue;
-        std.debug.print("[exl3 selfcheck] {s} {t} {t} site={s} words={d} bad={d} metric={e} limit={e} err={s} msg={s} reference={s}\n", .{ if (r.ok) "PASS" else "FAIL", r.kernel, r.check, r.site, r.words, r.bad, r.metric, r.limit, r.err, r.msg, referenceOf(r.check) });
+        if (r.ok) log.info("[exl3 selfcheck] {s} {t} {t} site={s} words={d} bad={d} metric={e} limit={e} err={s} msg={s} reference={s}\n", .{ if (r.ok) "PASS" else "FAIL", r.kernel, r.check, r.site, r.words, r.bad, r.metric, r.limit, r.err, r.msg, referenceOf(r.check) }) else log.err("[exl3 selfcheck] {s} {t} {t} site={s} words={d} bad={d} metric={e} limit={e} err={s} msg={s} reference={s}\n", .{ if (r.ok) "PASS" else "FAIL", r.kernel, r.check, r.site, r.words, r.bad, r.metric, r.limit, r.err, r.msg, referenceOf(r.check) });
     }
-    if (all or n_fail > 0) std.debug.print("[exl3 selfcheck] {d} results, {d} failed\n", .{ report.results.items.len, n_fail });
+    if (n_fail > 0) log.err("[exl3 selfcheck] {d} results, {d} failed\n", .{ report.results.items.len, n_fail }) else if (all) log.info("[exl3 selfcheck] {d} results, {d} failed\n", .{ report.results.items.len, n_fail });
 }
 
 const inputs_max = xk.max_inputs;
@@ -740,7 +741,7 @@ fn expectWords(h: *H, k: Kernel, c: Check, want: mlx.mlx_array, got: mlx.mlx_arr
     defer h.a.free(g);
     const size = dtypeSize(mlx.mlx_array_dtype(got));
     if (w.len != g.len or mlx.mlx_array_dtype(want) != mlx.mlx_array_dtype(got)) {
-        std.debug.print("[exl3 selfcheck] {t} {t}: reference {d} B {t} vs kernel {d} B {t}\n", .{ k, c, w.len, mlx.mlx_array_dtype(want), g.len, mlx.mlx_array_dtype(got) });
+        log.err("[exl3 selfcheck] {t} {t}: reference {d} B {t} vs kernel {d} B {t}\n", .{ k, c, w.len, mlx.mlx_array_dtype(want), g.len, mlx.mlx_array_dtype(got) });
         bad.* += g.len / size + 1;
         return;
     }
@@ -769,10 +770,10 @@ fn logWordDiff(k: Kernel, c: Check, dt: mlx.mlx_dtype, shape: []const c_int, wan
     }
     const f = first.?;
     if (!numeric) {
-        std.debug.print("[exl3 selfcheck] {t} {t}: {d} of {d} words differ ({t} {any}); first at word {d}; reference = {s}\n", .{ k, c, n_bad, got.len / size, dt, shape, f, referenceOf(c) });
+        log.err("[exl3 selfcheck] {t} {t}: {d} of {d} words differ ({t} {any}); first at word {d}; reference = {s}\n", .{ k, c, n_bad, got.len / size, dt, shape, f, referenceOf(c) });
         return;
     }
-    std.debug.print("[exl3 selfcheck] {t} {t}: {d} of {d} words differ ({t} {any}); first at {d}: reference {e} kernel {e}; max abs error {e}; reference = {s}\n", .{ k, c, n_bad, got.len / size, dt, shape, f, getF64(want, f, dt), getF64(got, f, dt), max_abs, referenceOf(c) });
+    log.err("[exl3 selfcheck] {t} {t}: {d} of {d} words differ ({t} {any}); first at {d}: reference {e} kernel {e}; max abs error {e}; reference = {s}\n", .{ k, c, n_bad, got.len / size, dt, shape, f, getF64(want, f, dt), getF64(got, f, dt), max_abs, referenceOf(c) });
 }
 
 /// What a check compares the kernel against (the side a failure line names as the reference).

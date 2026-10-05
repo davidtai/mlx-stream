@@ -40,7 +40,7 @@ const ngram = @import("ngram_table.zig");
 const dsp = @import("deepseek_v41_dspark_serve.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 
-const log = std.log.scoped(.dsv41);
+const log = @import("sdk").log;
 
 const G = ops.MlxOps;
 const expert_stream = @import("expert_stream.zig");
@@ -479,15 +479,15 @@ pub const Module = struct {
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
-            log.err("prefill routes refused: {s}", .{@errorName(e)});
+            log.err("prefill routes refused: {s}\n", .{@errorName(e)});
             return e;
         };
         _ = decodeCacheLimit(ov) catch |e| {
-            log.err("decode cache limit refused: {d} B (at most the envelope's {d} B)", .{ ov.decode_cache_bytes.?, envelope.decode_cache_bytes });
+            log.err("decode cache limit refused: {d} B (at most the envelope's {d} B)\n", .{ ov.decode_cache_bytes.?, envelope.decode_cache_bytes });
             return e;
         };
         const poll_ms = phaseChangePollMs(ov) catch |e| {
-            log.err("phase change poll refused: {d} ms (1..{d})", .{ ov.phase_change_poll_ms.?, phase_change_settle_ms });
+            log.err("phase change poll refused: {d} ms (1..{d})\n", .{ ov.phase_change_poll_ms.?, phase_change_settle_ms });
             return e;
         };
         const self = try gpa.create(Module);
@@ -500,7 +500,7 @@ pub const Module = struct {
         var diag: arm_mod.Diag = .{};
         var vd0: v41.Diag = .{};
         const c0 = v41.Config.load(gpa, io, dir, &vd0) catch |e| {
-            log.err("config refused: {s}", .{vd0.message()});
+            log.err("config refused: {s}\n", .{vd0.message()});
             return e;
         };
         claimBank(gpa, io, dir, &diag) catch |e| return refused(e, &diag);
@@ -527,7 +527,7 @@ pub const Module = struct {
                 admitted.expert_rows = nr.decode;
                 admitted.expert_prefill_rows = nr.prefill;
             }
-            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill{s}, baseline {d} B, target {d} B)", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, if (ov.bill_pinned_prompt) |pp| pp else bill_mod.servedContext(&admitted), if (ov.bill_pinned_prompt == null) ", every length up to it" else " alone", admitted.memory_baseline_bytes orelse 0, target });
+            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill{s}, baseline {d} B, target {d} B)\n", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, if (ov.bill_pinned_prompt) |pp| pp else bill_mod.servedContext(&admitted), if (ov.bill_pinned_prompt == null) ", every length up to it" else " alone", admitted.memory_baseline_bytes orelse 0, target });
         }
         errdefer self.dropKernels();
         // The fused down GEMM, when overridden: its self-checks on the set, then every layer's DIG-X waves launch it.
@@ -546,7 +546,7 @@ pub const Module = struct {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
             var b = bill_mod.servedBill(arena.allocator(), io, &admitted, sdk.memory.vmBytes().wired, ceiling_bytes, ov) catch |e| {
-                log.err("admission refused before construction: {s}", .{@errorName(e)});
+                log.err("admission refused before construction: {s}\n", .{@errorName(e)});
                 return e;
             };
             // The record granule: the fill's leftover below one row as single decode records, billed (slot_decode).
@@ -561,7 +561,7 @@ pub const Module = struct {
             // Forced rows too: both phases' totals under the target (a baseline-free shell bills the process alone).
             const mb = try bill_mod.memoryBill(arena.allocator(), b);
             sdk.admit(mb, b.baseline, .{ .prompt = b.prefill_rows, .decode = b.decode_rows }, self.fill_target) catch |e| {
-                log.err("admission refused before construction: {s} (prompt total {d} B, decode total {d} B, target {d} B)", .{ @errorName(e), b.prefillTotal(), b.decodeTotal(), self.fill_target });
+                log.err("admission refused before construction: {s} (prompt total {d} B, decode total {d} B, target {d} B)\n", .{ @errorName(e), b.prefillTotal(), b.decodeTotal(), self.fill_target });
                 return e;
             };
         }
@@ -576,7 +576,7 @@ pub const Module = struct {
             .{ .host_waits = try self.buildArm(A, io, &admitted, weights, s, ceiling, null, &diag) };
         errdefer self.dropArm();
         var vd: v41.Diag = .{};
-        errdefer if (vd.len > 0) log.err("residents refused: {s}", .{vd.message()});
+        errdefer if (vd.len > 0) log.err("residents refused: {s}\n", .{vd.message()});
         const c = switch (self.arm) {
             inline else => |t| t.arm.config,
         };
@@ -631,7 +631,7 @@ pub const Module = struct {
             tier.routes.prefill_oproj = v;
         }
         tier.layer_major = layer_major;
-        log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
+        log.info("numeric tier: {t}\n", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         // HEAD_MODE mxfp8: the model evaluated its quantized head at construction and reads nothing else of the
@@ -645,7 +645,7 @@ pub const Module = struct {
         }
         if (tier.routes.head == .mxfp8) {
             weights.drop("head.weight");
-            log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B", .{self.model.droppedBytes()});
+            log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B\n", .{self.model.droppedBytes()});
         }
         if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.prefill_hcpost or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax) try self.checkPrefillRoutes();
         // ENGRAM=prefetch: the poster threads started and their gathers checked against a read past the cache.
@@ -657,7 +657,7 @@ pub const Module = struct {
             }
             try self.engram.enablePosting();
             self.checkEngramPosted(gpa) catch |e| {
-                log.err("NATIVE engram posted: the construction self-check against a read past the cache failed: {s}", .{@errorName(e)});
+                log.err("NATIVE engram posted: the construction self-check against a read past the cache failed: {s}\n", .{@errorName(e)});
                 return e;
             };
             self.model.engram.?.posted = true;
@@ -667,12 +667,12 @@ pub const Module = struct {
         };
         // DEVROUTE: exact by construction (the same banked texts per routed pair, the slots the host's plan names; the join
         // takes the miss parts' rows for their pairs).
-        if (self.installed.devroute) log.info("NATIVE devroute: installed (the decode hit wave on the device through each layer's resident LUT, committed before the routing barrier's wait)", .{});
+        if (self.installed.devroute) log.info("NATIVE devroute: installed (the decode hit wave on the device through each layer's resident LUT, committed before the routing barrier's wait)\n", .{});
         // HOIST_FIRST: exact by construction (the same evals of the same arrays; only the hoist's commit moves ahead of the wait).
-        if (self.installed.hoist_first) log.info("NATIVE hoist first: installed (each decode call's hoist committed behind its routing barrier's arrays, before the wait)", .{});
+        if (self.installed.hoist_first) log.info("NATIVE hoist first: installed (each decode call's hoist committed behind its routing barrier's arrays, before the wait)\n", .{});
         var line_buf: [384]u8 = undefined;
-        log.info("{s}", .{self.installed.line(&line_buf)});
-        log.info("{s}", .{self.installed.callSites(&line_buf)});
+        log.info("{s}\n", .{self.installed.line(&line_buf)});
+        log.info("{s}\n", .{self.installed.callSites(&line_buf)});
         self.installed.decode_attn_softmax = self.model.tier.routes.rc_attn_softmax;
         self.installed.ring_geo = self.model.tier.kv;
         self.installed.decode_index_topk = self.model.tier.routes.rc_index_topk;
@@ -689,28 +689,28 @@ pub const Module = struct {
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
         self.installed.routed_forms = self.exl3.forms;
         self.installed.routed_banked = self.exl3.banked != null;
-        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, banked {}", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_banked });
+        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, banked {}\n", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_banked });
         self.installed.dense_rc = self.model.tier.routes.dense_rc;
-        if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
-        log.info("{s}", .{self.installed.decodeSites(&line_buf)});
-        log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
-        if (self.installed.head_mode == .mxfp8) log.info("NATIVE head mxfp8 apply: {s}", .{if (self.installed.head_mxfp8_rc) "rcproj (the verify rows and the draft block at <= 8 rows)" else "mlx quantized_matmul"});
-        log.info("NATIVE prefill input streams: {s}", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
-        if (self.installed.prefill_hcpost) log.info("NATIVE prefill HC post: fused (both HC combines above 8 rows in one pass on the region's numerics; checked against the region at construction; word-exact on every normal-range and mixed-edge input tested, an input whose products are all below 2^-126 is not covered)", .{});
-        if (self.installed.prefill_shared_mid) log.info("NATIVE prefill shared middle: compiled (the shared expert's clamps, silu and product as one region above 8 rows)", .{});
-        if (self.installed.prefill_input_release) log.info("NATIVE prefill input release: installed (each routed group's MoE inputs freed after its wide call)", .{});
-        log.info("NATIVE prefill predictor installed: {s}", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
-        log.info("NATIVE transient release: {s}", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
-        log.info("NATIVE grow fill: {t} ({s})", .{ self.installed.grow_fill, switch (self.installed.grow_fill) {
+        if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped\n", .{graph.sharedGateUpBytes(&self.model.c)});
+        log.info("{s}\n", .{self.installed.decodeSites(&line_buf)});
+        log.info("NATIVE head installed: {t}, verify rows on m1rows {}\n", .{ self.installed.head_mode, self.model.head_rows != null });
+        if (self.installed.head_mode == .mxfp8) log.info("NATIVE head mxfp8 apply: {s}\n", .{if (self.installed.head_mxfp8_rc) "rcproj (the verify rows and the draft block at <= 8 rows)" else "mlx quantized_matmul"});
+        log.info("NATIVE prefill input streams: {s}\n", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
+        if (self.installed.prefill_hcpost) log.info("NATIVE prefill HC post: fused (both HC combines above 8 rows in one pass on the region's numerics; checked against the region at construction; word-exact on every normal-range and mixed-edge input tested, an input whose products are all below 2^-126 is not covered)\n", .{});
+        if (self.installed.prefill_shared_mid) log.info("NATIVE prefill shared middle: compiled (the shared expert's clamps, silu and product as one region above 8 rows)\n", .{});
+        if (self.installed.prefill_input_release) log.info("NATIVE prefill input release: installed (each routed group's MoE inputs freed after its wide call)\n", .{});
+        log.info("NATIVE prefill predictor installed: {s}\n", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
+        log.info("NATIVE transient release: {s}\n", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
+        log.info("NATIVE grow fill: {t} ({s})\n", .{ self.installed.grow_fill, switch (self.installed.grow_fill) {
             .zeros => "the grown rows zero-filled on the GPU",
             .unfilled => "the grown rows MLX-owned without a fill; each is written by its read before any kernel reads it",
         } });
         self.installed.phase_change_poll_ms = poll_ms;
         self.installed.phase_change_settle = phaseChangeSettle(ov);
         self.installed.decode_cache_bytes = decodeCacheLimit(ov) catch unreachable;
-        log.info("NATIVE decode cache limit: {d} B ({s})", .{ self.installed.decode_cache_bytes, if (self.installed.decode_cache_bytes == envelope.decode_cache_bytes) "the envelope's" else "the route's" });
-        log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
-        log.info("NATIVE phase change settle: {t} ({s})", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
+        log.info("NATIVE decode cache limit: {d} B ({s})\n", .{ self.installed.decode_cache_bytes, if (self.installed.decode_cache_bytes == envelope.decode_cache_bytes) "the envelope's" else "the route's" });
+        log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)\n", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
+        log.info("NATIVE phase change settle: {t} ({s})\n", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
             .interval => "until the footprint is down by the freed bytes",
             .until_freed => "until the footprint is down by the freed bytes and at most the grow's bound, the decode bill less the grow",
         } });
@@ -726,27 +726,27 @@ pub const Module = struct {
                 self.grown_rows = self.uniform_rows;
             },
         };
-        log.info("NATIVE decode fill granule: {t} ({d} single decode records past the rows)", .{ self.installed.decode_fill_granule, self.decode_extra });
-        log.info("NATIVE draft experts: resident ({d} x {d} B)", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
+        log.info("NATIVE decode fill granule: {t} ({d} single decode records past the rows)\n", .{ self.installed.decode_fill_granule, self.decode_extra });
+        log.info("NATIVE draft experts: resident ({d} x {d} B)\n", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
         self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .head_mx = if (self.model.head_mx) |*hm| hm else null, .staged_commit = draftStaged(ov) });
         errdefer self.head.deinit(&self.g);
         // DRAFT_STAGED: exact by construction (the block's graph unchanged; each stage's outputs committed once built).
         self.installed.draft_staged = self.head.stagedCommit();
-        if (self.installed.draft_staged) log.info("NATIVE draft staged commits: installed (each draft stage committed once built)", .{});
+        if (self.installed.draft_staged) log.info("NATIVE draft staged commits: installed (each draft stage committed once built)\n", .{});
         // The decode lane: DSpark (typical acceptance, the tier of record) on the served tier with a draft head.
         if (self.head.nStages() > 0 and (config.numeric_tier orelse .served) == .served) self.dspark_cfg = dspark_config;
         // DRAFT_AHEAD: exact by construction (the same block graph; built during the verify's wait, committed only on the
         // outcome it was built for, its primary written into its own inputs first). Refused without the DSpark lane.
         if (draftAhead(ov)) {
             if (self.dspark_cfg == null) {
-                log.err("draft ahead refused: it needs the DSpark lane", .{});
+                log.err("draft ahead refused: it needs the DSpark lane\n", .{});
                 return error.DraftAheadUnsupported;
             }
             self.dspark_cfg.?.draft_ahead = true;
             self.installed.draft_ahead = true;
-            log.info("NATIVE draft ahead: installed (the next draft built during each verify's wait, committed when every draft is accepted)", .{});
+            log.info("NATIVE draft ahead: installed (the next draft built during each verify's wait, committed when every draft is accepted)\n", .{});
         }
-        log.info("NATIVE decode lane installed: {s} (draft block {d}), expert reads {s}", .{ self.decodeLane(), self.draftBlockSize(), if (self.arm == .event_gates) "event gates" else "host waits" });
+        log.info("NATIVE decode lane installed: {s} (draft block {d}), expert reads {s}\n", .{ self.decodeLane(), self.draftBlockSize(), if (self.arm == .event_gates) "event gates" else "host waits" });
         // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here, never
         // in a request, and with the DSpark strategy its 5-row draft block through every stage too (the first
         // round no longer compiles its draft inside timed decode). pass3an2's widths (B above the start): width
@@ -762,8 +762,8 @@ pub const Module = struct {
         // held to the allocator's cache, and a clear ahead of them leaves those cached.
         _ = mlx.mlx_synchronize(self.g.s);
         self.g.clearCache();
-        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
-        log.info("NATIVE warm-up peaks by width 1..{d} then the draft block (0: not warmed), B above the residents: {any}", .{ self.warm_peaks.len - 1, self.warm_peaks });
+        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B\n", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
+        log.info("NATIVE warm-up peaks by width 1..{d} then the draft block (0: not warmed), B above the residents: {any}\n", .{ self.warm_peaks.len - 1, self.warm_peaks });
         // The input embedding moves to its host rows now, not at the phase change: every lookup (the
         // prompt's included) reads the table's rows past the page cache, and the device table is gone
         // from both phases. Checked once: the rows equal the table's, byte for byte.
@@ -777,7 +777,7 @@ pub const Module = struct {
             // footprint). The phase change's settle waits for the footprint to show the release (bounded)
             // before the construction check reads it.
             const st = settle(LiveReader{ .io = self.io }, before, self.model.embeddingBytes(), phase_change_poll_ms, null);
-            log.info("NATIVE embedding fence: footprint {d} -> {d} B (the table {d} B), settled in {d} ms", .{ before.footprint, st.after.footprint, self.model.embeddingBytes(), st.waited_ms });
+            log.info("NATIVE embedding fence: footprint {d} -> {d} B (the table {d} B), settled in {d} ms\n", .{ before.footprint, st.after.footprint, self.model.embeddingBytes(), st.waited_ms });
             self.fenced = true;
             self.installed.embedding_rows = true;
         }
@@ -789,14 +789,14 @@ pub const Module = struct {
             };
             const billed = bill.waveBytes(M.scratch_rows, M.scratch_rows, bt) + (if (bt == .stock) bill.head_promotion_bytes else 0);
             const measured = std.mem.max(u64, self.warm_peaks);
-            log.info("bill: decode-width wave billed {d} B, warm-up measured {d} B, error {d} B", .{ billed, measured, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)) });
+            log.info("bill: decode-width wave billed {d} B, warm-up measured {d} B, error {d} B\n", .{ billed, measured, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)) });
         }
         // The warm-up's residents belong to no prompt (its wide calls even seed and protect them): forgotten once here,
         // so the first prompt's seed takes every prompt row and its read-ahead starts from empty rows.
         const forgotten = switch (self.arm) {
             inline else => |t| try t.arm.stream.forgetResidents(),
         };
-        log.info("NATIVE construction residents forgotten: {d} rows (the warm-up's); every layer's protection, seed and prompt counts cleared", .{forgotten});
+        log.info("NATIVE construction residents forgotten: {d} rows (the warm-up's); every layer's protection, seed and prompt counts cleared\n", .{forgotten});
         // The construction check (once, before any request): the native bill at the rows the arm built,
         // against the footprint the module holds now.
         try self.checkConstruction(io, &admitted, ceiling_bytes);
@@ -820,7 +820,7 @@ pub const Module = struct {
             inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
         };
         sdk.checkRows(.{ .prompt = b.prefill_rows, .decode = b.decode_rows }, .{ .prompt = rows.prefill, .decode = rows.decode }) catch |e| {
-            log.err("construction check: the bill plans {d} / {d} rows, the arm built {d} / {d}", .{ b.prefill_rows, b.decode_rows, rows.prefill, rows.decode });
+            log.err("construction check: the bill plans {d} / {d} rows, the arm built {d} / {d}\n", .{ b.prefill_rows, b.decode_rows, rows.prefill, rows.decode });
             return e;
         };
         self.bill = b;
@@ -837,16 +837,16 @@ pub const Module = struct {
         var mlx_cache: usize = 0;
         _ = mlx.mlx_get_active_memory(&mlx_active);
         _ = mlx.mlx_get_cache_memory(&mlx_cache);
-        log.info("NATIVE construction check: MLX active {d} B, MLX cache {d} B, host side {d} B (the footprint less both)", .{ mlx_active, mlx_cache, measured -| mlx_active -| mlx_cache });
-        log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)", .{ measured, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)), construction_tolerance_bytes });
+        log.info("NATIVE construction check: MLX active {d} B, MLX cache {d} B, host side {d} B (the footprint less both)\n", .{ mlx_active, mlx_cache, measured -| mlx_active -| mlx_cache });
+        log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)\n", .{ measured, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)), construction_tolerance_bytes });
         sdk.checkConstruction(billed, measured, construction_tolerance_bytes) catch |e| {
-            log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B", .{ measured, billed, construction_tolerance_bytes });
+            log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B\n", .{ measured, billed, construction_tolerance_bytes });
             return e;
         };
         // The bill's measured bound (the host side) against its one measurement here.
         const host_side = measured -| mlx_active -| mlx_cache;
         for (mb.terms) |t| if (t.measured) sdk.checkMeasured(t, host_side) catch |e| {
-            log.err("construction check: the host side {d} B exceeds its billed bound {d} B", .{ host_side, t.bytes[0] });
+            log.err("construction check: the host side {d} B exceeds its billed bound {d} B\n", .{ host_side, t.bytes[0] });
             return e;
         };
     }
@@ -868,18 +868,18 @@ pub const Module = struct {
         if (comptime AT == AGated) {
             arm.hook.checkGates(&self.g, gpa, arm.config.n_experts_per_tok) catch |e|
                 return refused(refuse(diag, e, "event gates: the gated waves differ from the same slots waited, or a gate was forced", .{}), diag);
-            log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)", .{arm.config.n_experts_per_tok});
+            log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)\n", .{arm.config.n_experts_per_tok});
         }
         // P1, once before any request: records read ahead against the same records read on demand.
         if (wideRoute(config).read_ahead) {
             const n = arm.hook.checkReadAhead() catch |e|
                 return refused(refuse(diag, e, "read-ahead: a record read ahead differs from its demand read, or a read failed", .{}), diag);
-            log.info("NATIVE read-ahead: the construction self-check passed (layer 0, {d} records: read ahead == demand read, bit for bit)", .{n});
+            log.info("NATIVE read-ahead: the construction self-check passed (layer 0, {d} records: read ahead == demand read, bit for bit)\n", .{n});
         }
         // P1b: exact by construction (the base call's rows and slots are the seed's; only its place moves).
-        if (arm.hook.wide_route.base_at_seed) log.info("NATIVE base call at the seed: installed (the seed's deferred base call drains once its groups are read)", .{});
+        if (arm.hook.wide_route.base_at_seed) log.info("NATIVE base call at the seed: installed (the seed's deferred base call drains once its groups are read)\n", .{});
         // P1c: exact by construction (groups change no expert's rows; the base call's place moves before the stream's).
-        if (arm.hook.wide_route.seed_aligned) log.info("NATIVE seed-aligned groups: installed (the seed's ranks grouped apart from the stream's; the base call after the last seed group)", .{});
+        if (arm.hook.wide_route.seed_aligned) log.info("NATIVE seed-aligned groups: installed (the seed's ranks grouped apart from the stream's; the base call after the last seed group)\n", .{});
         arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
         return .{ .arm = arm, .gates = gates };
     }
@@ -901,7 +901,7 @@ pub const Module = struct {
         if (self.decode_host.end != null) return;
         const m = BoundaryMemory.now();
         self.decode_host.end = hostSideOf(m);
-        log.info("NATIVE decode host side: end of decode {d} B (after the grow {d} B; footprint {d} B, MLX active {d} B, cache {d} B)", .{ self.decode_host.end.?, after, m.footprint, m.active, m.cache });
+        log.info("NATIVE decode host side: end of decode {d} B (after the grow {d} B; footprint {d} B, MLX active {d} B, cache {d} B)\n", .{ self.decode_host.end.?, after, m.footprint, m.active, m.cache });
     }
 
     pub fn deinit(self: *Module) void {
@@ -974,11 +974,11 @@ pub const Module = struct {
             var b: [1]bool = undefined;
             _ = try self.g.hostBool(ck.ok, &b);
             if (!b[0]) {
-                log.err("NATIVE prefill route {s}: the construction self-check against the stock chain failed", .{ck.name});
+                log.err("NATIVE prefill route {s}: the construction self-check against the stock chain failed\n", .{ck.name});
                 return error.PrefillRouteSelfCheck;
             }
         }
-        log.info("NATIVE prefill routes: {d} construction self-checks against the stock chain passed", .{n});
+        log.info("NATIVE prefill routes: {d} construction self-checks against the stock chain passed\n", .{n});
     }
 
     /// The kernels go after the last launch drained.
@@ -1099,7 +1099,7 @@ pub const Module = struct {
         _ = try g.hostF32(from_table, t);
         _ = try g.hostF32(from_rows, r);
         if (!std.mem.eql(u8, std.mem.sliceAsBytes(t), std.mem.sliceAsBytes(r))) {
-            log.err("embedding rows: the host rows differ from the resident table", .{});
+            log.err("embedding rows: the host rows differ from the resident table\n", .{});
             return error.EmbeddingRowsDiffer;
         }
     }
@@ -1191,13 +1191,13 @@ pub const Module = struct {
         const s0 = self.prompt_stats0 orelse return;
         self.prompt_stats0 = null;
         const s1 = self.streamStats();
-        log.info("NATIVE prefill stream: {d} prompt tokens, read {d} B in {d} preadv, {d} misses, {d} routes", .{
+        log.info("NATIVE prefill stream: {d} prompt tokens, read {d} B in {d} preadv, {d} misses, {d} routes\n", .{
             self.prompt_tokens, s1.expert_bytes_read - s0.expert_bytes_read, s1.preadv_calls - s0.preadv_calls, s1.expert_cache_misses - s0.expert_cache_misses, s1.route_calls - s0.route_calls,
         });
         const ahead = switch (self.arm) {
             inline else => |t| t.arm.hook.wide_route.read_ahead,
         };
-        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead", .{
+        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead\n", .{
             s1.ahead_posted - s0.ahead_posted, s1.ahead_hits - s0.ahead_hits, s1.ahead_demand - s0.ahead_demand, s1.ahead_bytes - s0.ahead_bytes,
         });
     }
@@ -1328,7 +1328,7 @@ pub const Module = struct {
         const r = self.reverse_change orelse return;
         const json = std.json.Stringify.valueAlloc(self.gpa, r, .{}) catch return;
         defer self.gpa.free(json);
-        log.info("NATIVE DSV41_REVERSE_PHASE_CHANGE {s}", .{json});
+        log.info("NATIVE DSV41_REVERSE_PHASE_CHANGE {s}\n", .{json});
     }
 
     /// Upstream's prefill-to-decode handover (`model.DecodeHandover`; `Transformer.decodeHandover` dispatches
@@ -1408,11 +1408,11 @@ pub const Module = struct {
         const grown_m = BoundaryMemory.now();
         self.phase_change.?.grown = grown_m;
         self.decode_host = .{ .after_grow = hostSideOf(grown_m) };
-        log.info("NATIVE decode host side: after the grow {d} B (footprint {d} B less MLX active {d} B and cache {d} B)", .{ self.decode_host.after_grow.?, grown_m.footprint, grown_m.active, grown_m.cache });
+        log.info("NATIVE decode host side: after the grow {d} B (footprint {d} B less MLX active {d} B and cache {d} B)\n", .{ self.decode_host.after_grow.?, grown_m.footprint, grown_m.active, grown_m.cache });
         try self.observe(.grown);
         self.logPhaseChange();
         for (marks, [_][]const u8{ "start", "after the embedding fence", "after the transient release", "after the frees (settled)", "after the banks grew" }) |mark, name| if (mark) |m|
-            log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d}; host_statistics64, possibly cached)", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
+            log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d}; host_statistics64, possibly cached)\n", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
     }
 
     /// The harness's observer at a proof point (none on the served path); its error refuses the boundary.
@@ -1427,7 +1427,7 @@ pub const Module = struct {
         const r = self.phase_change orelse return;
         const json = std.json.Stringify.valueAlloc(self.gpa, r, .{}) catch return;
         defer self.gpa.free(json);
-        log.info("NATIVE DSV41_PHASE_CHANGE {s}", .{json});
+        log.info("NATIVE DSV41_PHASE_CHANGE {s}\n", .{json});
     }
 
     /// A refused boundary: recorded in the gate (every later request refused by name, PhaseChangeRefused),
@@ -1437,7 +1437,7 @@ pub const Module = struct {
         self.gate.refuse(e);
         if (self.phase_change) |*r| r.refused = @errorName(e);
         self.logPhaseChange();
-        log.err("NATIVE {s} refused: {s}; every later request is refused by name", .{ if (self.phase_change) |r| r.kind else "phase change", @errorName(e) });
+        log.err("NATIVE {s} refused: {s}; every later request is refused by name\n", .{ if (self.phase_change) |r| r.kind else "phase change", @errorName(e) });
         return e;
     }
 
@@ -1860,11 +1860,11 @@ pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
 pub fn checkContext(prompt_tokens: usize, max_context: u64, pinned: ?u64) error{ ContextOverBill, ContextNotPinned }!void {
     if (pinned) |p| {
         if (prompt_tokens == p) return;
-        log.warn("NATIVE request refused: a {d}-token prompt on a Module billed for the {d}-token prompt alone (ContextNotPinned)", .{ prompt_tokens, p });
+        log.warn("NATIVE request refused: a {d}-token prompt on a Module billed for the {d}-token prompt alone (ContextNotPinned)\n", .{ prompt_tokens, p });
         return error.ContextNotPinned;
     }
     if (prompt_tokens <= max_context) return;
-    log.warn("NATIVE request refused: a {d}-token prompt is over the billed context of {d} tokens (ContextOverBill); construct with max_context_tokens >= the prompt", .{ prompt_tokens, max_context });
+    log.warn("NATIVE request refused: a {d}-token prompt is over the billed context of {d} tokens (ContextOverBill); construct with max_context_tokens >= the prompt\n", .{ prompt_tokens, max_context });
     return error.ContextOverBill;
 }
 
@@ -1968,7 +1968,7 @@ fn GrownBanks(comptime AT: type) type {
             const exl3: *const xq.Accepted(G) = @ptrCast(@alignCast(ctx));
             var diag: arm_mod.Diag = .{};
             checkArmBanks(arm, g, exl3, &diag) catch |e| {
-                log.warn("grown banks refused: {s} {s}", .{ @errorName(e), diag.message() });
+                log.warn("grown banks refused: {s} {s}\n", .{ @errorName(e), diag.message() });
                 return e;
             };
         }
@@ -1984,7 +1984,7 @@ fn routerGates(comptime Gate: type, gpa: std.mem.Allocator, weights: *const sdk.
         const w = weights.get(try std.fmt.bufPrint(&buf, "layers.{d}.ffn.gate.weight", .{l}));
         const b = weights.get(try std.fmt.bufPrint(&buf, "layers.{d}.ffn.gate.bias", .{l}));
         if (w == null or b == null) {
-            log.err("refused: MissingWeight layers.{d}.ffn.gate", .{l});
+            log.err("refused: MissingWeight layers.{d}.ffn.gate\n", .{l});
             return error.MissingWeight;
         }
         gt.* = .{ .w = w.?, .bias = b.? };

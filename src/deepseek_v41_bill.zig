@@ -23,7 +23,7 @@ const graph = @import("deepseek_v41_graph.zig");
 const expert_bank = @import("expert_bank.zig");
 const kvc = @import("deepseek_v41_cache.zig");
 
-const log = std.log.scoped(.dsv41);
+const log = @import("sdk").log;
 
 /// ASSUMPTION the bill rests on: the step creates no page cache. The guard credits only the file cache present
 /// at its start and does not count speculative pages until the kernel ages them into inactive, so page cache
@@ -424,7 +424,7 @@ pub fn billedPositions(prompt_tokens: u64, max_tokens: u64) u64 {
 pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
     const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
     var vd: v41.Diag = .{};
-    errdefer if (vd.len > 0) log.err("bill: {s}", .{vd.message()});
+    errdefer if (vd.len > 0) log.err("bill: {s}\n", .{vd.message()});
     const c = try v41.Config.load(a, io, dir, &vd);
     // The box: the caller's ceiling, passed explicitly (the Module's own, a harness's window ceiling, the load
     // preflight's upstream static ceiling): no hidden global, and a host-side bill never queries the device.
@@ -434,7 +434,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
     opts.wired_bytes = billWired(wired_bytes, opts.envelope_record);
     if (ov.bank_geometry) |g| opts.implemented = g;
     var p = arm_mod.planRows(a, io, opts, &diag) catch |e| {
-        log.err("bill: refused: {s}", .{diag.message()});
+        log.err("bill: refused: {s}\n", .{diag.message()});
         return e;
     };
     defer p.bank.deinit();

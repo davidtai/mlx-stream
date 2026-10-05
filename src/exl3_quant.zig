@@ -3482,6 +3482,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
 test "dsv41 selfcheck device: the served construction's self-check plans, every result printed" {
     if (std.c.getenv("DSV41_SELFCHECK_DEVICE") == null) return error.SkipZigTest;
     const trunk = @import("dsv41_kernel_routes.zig");
+    @import("sdk").log.enableStderr(); // the results are this test's output
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
