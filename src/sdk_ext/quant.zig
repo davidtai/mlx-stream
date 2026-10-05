@@ -111,13 +111,13 @@ pub const Refusal = error{
 };
 
 pub fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (diag) |d| d.set(fmt, args);
     return err;
 }
 
 /// A declined claim, the first mismatch in `why`.
 pub fn decline(why: ?*Diag, comptime fmt: []const u8, args: anytype) ?Priority {
-    if (why) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (why) |d| d.set(fmt, args);
     return null;
 }
 

@@ -956,17 +956,10 @@ pub const Refusal = error{
 pub const Error = Refusal || std.mem.Allocator.Error;
 
 /// Why a checkpoint was refused, for the one log line the caller writes.
-pub const Diag = struct {
-    buf: [400]u8 = undefined,
-    len: usize = 0,
-
-    pub fn message(self: *const Diag) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
+pub const Diag = @import("sdk").Diag;
 
 fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (diag) |d| d.set(fmt, args);
     return err;
 }
 

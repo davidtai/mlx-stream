@@ -123,7 +123,7 @@ fn activeBytes(comptime G: type, g: *G) u64 {
 }
 
 fn refuse(diag: *v41.Diag, err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
-    diag.len = if (std.fmt.bufPrint(&diag.buf, fmt, args)) |m| m.len else |_| diag.buf.len;
+    diag.set(fmt, args);
     return err;
 }
 

@@ -1946,9 +1946,8 @@ fn refused(err: anyerror, diag: *const arm_mod.Diag) anyerror {
 }
 
 fn refuse(diag: *arm_mod.Diag, err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
-    const s = std.fmt.bufPrint(&diag.buf, fmt, args) catch diag.buf[0..];
-    diag.len = s.len;
-    log.warn("NATIVE construction refused ({t}): {s}", .{ err, s });
+    diag.set(fmt, args);
+    log.warn("NATIVE construction refused ({t}): {s}\n", .{ err, diag.message() });
     return err;
 }
 

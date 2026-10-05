@@ -44,7 +44,7 @@ pub fn Routes(comptime R: type) type {
         };
 
         pub fn refuse(diag: ?*xk.Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-            if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+            if (diag) |d| d.set(fmt, args);
             return err;
         }
 

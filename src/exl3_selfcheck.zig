@@ -365,12 +365,12 @@ pub fn accept(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, rep
 pub fn judge(report: *const Report, diag: ?*xk.Diag) error{SelfCheckFailed}!void {
     logResults(report, if (std.c.getenv("DSV41_SELFCHECK_REPORT")) |v| v[0] == '1' else false);
     if (report.results.items.len == 0) {
-        if (diag) |d| d.len = (std.fmt.bufPrint(&d.buf, "exl3 kernels: self-check produced no result", .{}) catch unreachable).len;
+        if (diag) |d| d.set("exl3 kernels: self-check produced no result", .{});
         return error.SelfCheckFailed;
     }
     for (report.results.items) |r| {
         if (r.ok) continue;
-        if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, "exl3 kernels: self-check {t} {t} {s} failed ({d} of {d} words, metric {e} limit {e}, {s})", .{ r.kernel, r.check, r.site, r.bad, r.words, r.metric, r.limit, r.err })) |m| m.len else |_| d.buf.len;
+        if (diag) |d| d.set("exl3 kernels: self-check {t} {t} {s} failed ({d} of {d} words, metric {e} limit {e}, {s})", .{ r.kernel, r.check, r.site, r.bad, r.words, r.metric, r.limit, r.err });
         return error.SelfCheckFailed;
     }
 }

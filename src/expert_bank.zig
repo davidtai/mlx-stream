@@ -68,14 +68,7 @@ pub const Implemented = struct {
 pub const dsv41: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 5120, .inter = 2304, .n_experts = 384, .n_layers = 40 };
 
 /// Why a bank was refused, for the one log line the caller writes.
-pub const Diag = struct {
-    buf: [320]u8 = undefined,
-    len: usize = 0,
-
-    pub fn message(self: *const Diag) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
+pub const Diag = @import("sdk").Diag;
 
 pub const Refusal = error{
     BankDirNotAbsolute,
@@ -441,7 +434,7 @@ fn segmentsMatch(segs: anytype, l: *const Layer, base: u64) bool {
 }
 
 fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (diag) |d| d.set(fmt, args);
     return err;
 }
 

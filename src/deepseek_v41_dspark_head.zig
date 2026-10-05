@@ -898,17 +898,10 @@ pub const Subset = struct {
 };
 
 /// A refusal's message (the caller names the subset in its own diag).
-pub const SubsetDiag = struct {
-    buf: [256]u8 = undefined,
-    len: usize = 0,
-
-    pub fn message(self: *const SubsetDiag) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
+pub const SubsetDiag = @import("sdk").Diag;
 
 fn refuse(diag: ?*SubsetDiag, err: SubsetError, comptime fmt: []const u8, args: anytype) SubsetError {
-    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (diag) |d| d.set(fmt, args);
     return err;
 }
 

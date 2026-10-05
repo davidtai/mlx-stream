@@ -40,18 +40,10 @@ const prefill_timers = @import("dsv41_prefill_timers.zig");
 /// The receipt's `decode_binding`: which loop drove the cell.
 pub const DecodeBinding = enum { stand_in, dspark };
 
-pub const Diag = struct {
-    buf: [320]u8 = undefined,
-    len: usize = 0,
-
-    pub fn message(self: *const Diag) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
+pub const Diag = @import("sdk").Diag;
 
 fn refuse(diag: *Diag, err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
-    const s = std.fmt.bufPrint(&diag.buf, fmt, args) catch diag.buf[0..];
-    diag.len = s.len;
+    diag.set(fmt, args);
     return err;
 }
 

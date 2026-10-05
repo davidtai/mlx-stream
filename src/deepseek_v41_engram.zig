@@ -114,7 +114,7 @@ pub fn parseManifest(a: std.mem.Allocator, text: []const u8, c: *const v41.Confi
 }
 
 fn fail(diag: ?*v41.Diag, comptime fmt: []const u8, args: anytype) error{EngramManifest} {
-    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (diag) |d| d.set(fmt, args);
     return error.EngramManifest;
 }
 
@@ -203,7 +203,7 @@ pub const row_cache_host_bytes: u64 = 2 * ngram.RowCache.hostBytes(264, row_cach
 pub const Refusal = error{ EngramManifest, EngramTokenMap, EngramBankFile };
 
 fn refuse(diag: ?*v41.Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (diag) |d| d.set(fmt, args);
     return err;
 }
 
