@@ -1115,7 +1115,7 @@ test "dsv41 bank: every bankv2 refusal refuses, by name" {
     }
 }
 
-// DSV41_BANK=<bank dir> [DSV41_PHASE0_FIXTURE=<json from R/exl3/runtime/dump_phase0_reader_fixture.py>]
+// DSV41_BANK=<bank dir> [DSV41_PHASE0_FIXTURE=<json from the reference runtime's dump_phase0_reader_fixture.py>]
 test "dsv41 bank: the real 3.0 bank opens" {
     const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var diag: Diag = .{};

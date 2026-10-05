@@ -107,7 +107,7 @@ test "dsv41 lookahead: certain misses are the route's unique non-residents in ro
     try testing.expectEqualSlices(u16, &.{ 5, 9, 1, 12 }, plan.missesOf());
 }
 
-// DSV41_PHASE2_FIXTURE=<json from R/exl3/runtime/dump_phase2_lookahead_fixture.py> (its scores file beside it)
+// DSV41_PHASE2_FIXTURE=<json from the reference runtime's dump_phase2_lookahead_fixture.py> (its scores file beside it)
 test "dsv41 lookahead: the recorded trace selects exactly like the Python lane" {
     const path = std.mem.span(std.c.getenv("DSV41_PHASE2_FIXTURE") orelse return error.SkipZigTest);
     const a = testing.allocator;

@@ -28,7 +28,7 @@ var n_ids: [max_cycles][max_stages]u8 = undefined;
 pub var cycles: u32 = 0;
 pub var geo: Geometry = .{ .n_stages = 0, .n_experts = 0, .top_k = 0, .block = 0 };
 
-/// The hot-set capacities the memory lane prices (over all stages' experts) and its cold cache.
+/// The hot-set capacities the measurements prices (over all stages' experts) and its cold cache.
 pub const lru_capacities = [_]u32{ 96, 128, 201, 256 };
 pub const cold_slots = 45;
 

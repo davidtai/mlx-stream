@@ -23,8 +23,7 @@ SOFTWARE.
 -------------------------------------------------------------------------------
 
 The MIT terms above cover mlx-stream's own code. This repository also includes
-third-party material under its own licenses (the Apache License 2.0 and further
-MIT-licensed components). Those licenses continue to apply to those portions.
+third-party material under its own licenses (MIT-licensed components). Those
+licenses continue to apply to those portions.
 
-See NOTICE for the list and the required attributions, and LICENSE-APACHE-2.0
-for the text of the Apache License, Version 2.0.
+See NOTICE for the list and the required attributions.

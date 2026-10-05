@@ -59,7 +59,7 @@ pub const Tier = struct {
 };
 
 /// The ring levers a model is built with (WINDOW_RING_MAX_VERIFY / _SLACK / _HEADROOM): the box the bill's ring tests
-/// cover (the memory lane's bounds, 10-02). The parser keeps a lever's u32; the model refuses outside the box.
+/// cover (the measured bounds, 10-02). The parser keeps a lever's u32; the model refuses outside the box.
 pub const ring_lever_box = struct {
     pub const max_verify_max: u32 = 64;
     pub const slack_max: u32 = 64;
@@ -129,7 +129,7 @@ pub const served: Tier = blk: {
     t.routes.rc_index_topk = true; // C27 INDEX_TOPK=metal (rows <= 8)
     t.routes.rc_attn_softmax = true; // C23 ATTN_FUSE softmax (rows <= 8)
     // K16's input streams released at each chunk fence: a one-factor arm (DSV41_CELL_INPUT_STREAM_EARLY_RELEASE=1); the
-    // memory lane's tight bill counts one routed-group stream when it is installed (`module.inputStreamEarlyRelease`).
+    // measurement's tight bill counts one routed-group stream when it is installed (`module.inputStreamEarlyRelease`).
     t.routes.input_stream_early_release = false;
     // P1's predictor in bf16: a one-factor arm (DSV41_CELL_PREDICT_BF16=1), judged on the read-ahead counters.
     t.routes.predict_bf16 = false;

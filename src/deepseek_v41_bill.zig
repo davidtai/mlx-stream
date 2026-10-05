@@ -205,8 +205,8 @@ pub fn wiredOf(t: PhaseTerms) u64 {
 /// The page granule of the kernel and of the GPU (ARM64 16 KiB).
 pub const wire_page_bytes: u64 = 16_384;
 
-/// The memory the wiring of `wired` bytes costs outside the process footprint (the memory lane, ledger sec. 73:
-/// +0.091-0.126 GB in every SERVED19 cell): per 16 KiB page a CPU and a GPU leaf entry and the kernel's wiring record
+/// The memory the wiring of `wired` bytes costs outside the process footprint (the measurements, ledger sec. 73:
+/// +0.091-0.126 GB in every served run 19 cell): per 16 KiB page a CPU and a GPU leaf entry and the kernel's wiring record
 /// (8 B each), one CPU + GPU L2 entry per 32 MiB and L1 entry per 64 GiB. No per-buffer term: ~4,000 live buffers at
 /// construction left no room for one under the measured figure. Monotone and subadditive, so a fill's per-row step can
 /// carry `wireTables(per_row)`.
@@ -216,18 +216,18 @@ pub fn wireTables(wired: u64) u64 {
         (std.math.divCeil(u64, wired, 1 << 36) catch unreachable) * 16;
 }
 
-/// The wiring overhead per live buffer if all of it were per buffer (the memory lane, ledger sec. 78a): the largest
-/// construction reading, 125,852,608 B (pass3bk control1), over the 4,493 buffers live there, rounded up to a KiB.
+/// The wiring overhead per live buffer if all of it were per buffer (measured): the largest
+/// construction reading, 125,852,608 B (run 3bk control1), over the 4,493 buffers live there, rounded up to a KiB.
 pub const wire_buffer_bytes: u64 = 28_672;
 
-/// Decode's provisional buffer allowance (memory lane, re-frozen on pass3br's decode-mark readings): the decode wave's
-/// buffers (live + cached, 2 x `wire_arrays_decode_wave`) at `wire_buffer_bytes` each, on top of wire_tables. pass3br
+/// Decode's provisional buffer allowance (re-frozen on run 3br's decode-mark readings): the decode wave's
+/// buffers (live + cached, 2 x `wire_arrays_decode_wave`) at `wire_buffer_bytes` each, on top of wire_tables. run 3br
 /// read 0.1715 / 0.1817 / 0.1739 GB outside the footprint at decode against wire_tables 0.1601 + the old allowance's
 /// 0.0091 (an under-bill of up to 12.5 MB); maxops40's decode-less-construction excess over the per-page term was
 /// 31.8 MB over 1,408 buffers (22.6 KB each, under 28 KiB). Deleted or re-measured when a decode reading says so.
 pub const decode_buffer_allowance_bytes: u64 = wire_buffer_bytes * 2 * wire_arrays_decode_wave;
 
-/// The prompt bill's provisional buffer allowance (memory lane): pass3br maxops40's prompt-mark reading over the
+/// The prompt bill's provisional buffer allowance : run 3br maxops40's prompt-mark reading over the
 /// per-page term (3.8 MB) plus that window's idle-wired census spread (13 MB), rounded up. The prompt wave's buffer
 /// count is no upper bound (the DIG-X outputs are not in the trace), so no per-buffer form is billed there.
 pub const prompt_buffer_allowance_bytes: u64 = 17_000_000;
@@ -325,8 +325,8 @@ pub fn printPhaseMemory(a: std.mem.Allocator, r: PhaseMemory) void {
 /// served cells' peak phys_footprint over their own bill's bound (fastest 20260929-152450: 78.294 vs 77.657
 /// GB = 0.637; standard 20260929-153540: 77.139 vs 76.591 = 0.548), the larger, rounded up. Those peaks were
 /// decode peaks, and what they measured there is now attributed: the retained prompt state (`prompt_state`,
-/// 1.11 GB at 16K; pass3ak's decode: MLX 1.46 GB above the constructed module after the prompt, the host side
-/// 0.38-0.59 GB against 1.26 billed with this term), so the decode phase no longer carries it (pass3ak's decode
+/// 1.11 GB at 16K; run 3ak's decode: MLX 1.46 GB above the constructed module after the prompt, the host side
+/// 0.38-0.59 GB against 1.26 billed with this term), so the decode phase no longer carries it (run 3ak's decode
 /// residual was +1.30 GB with both). The prompt phase keeps it: its host side measured 1.64-1.87 GB against
 /// 1.26 billed without it.
 pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
@@ -334,18 +334,18 @@ pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
 /// The process's host side (its footprint less MLX's active and cache: the read pool and its staging, the
 /// lookahead staging, the Engram row caches, the tables, the process itself), billed as measured with a
 /// 0.3 GB margin in place of the named host terms (lookahead staging, row caches, host reserve, the wide
-/// window's second transient window, the prompt phase's unattributed overhead: 1.90 GB together). pass3am (v7,
+/// second transient window, the prompt phase's unattributed overhead: 1.90 GB together). run 3am (v7,
 /// served-cell-typical-fastest-20260930-065643): 0.31 GB after construction; host and cache together 0.59 GB
 /// at the prompt pass's footprint peak (MLX 104.90, footprint 105.49 GB); 0.50-0.59 GB in decode; 1.93 GB at the
 /// prompt's end, after its waves were freed (footprint 96.1 GB, far under the peak). MLX active equals the
 /// device terms without the wide window at every boundary, so that window is no device memory either.
-/// SERVED19 (the cells on the server's host allocator, libc malloc, which keeps the prompt pass's host heap): the
+/// Served run 19 (the cells on the server's host allocator, libc malloc, which keeps the prompt pass's host heap): the
 /// decode host side measured 1,114,998,952-1,119,622,914 B in all five receipts (16K, 134-141 / 164-169 rows, the
 /// transient release on and off); the server carries about +0.06 GB of its own (construction 0.445 vs the cell's
-/// 0.385; SERVED18H server B 1.109 GB at the grow vs the cells' 1.047), so about 1.18 GB served, + 0.07 GB for a
-/// decode longer than 604 tokens (the memory lane, ledger sec. 69; provisional until SERVED19H's servers record
+/// 0.385; served run 18H server B 1.109 GB at the grow vs the cells' 1.047), so about 1.18 GB served, + 0.07 GB for a
+/// decode longer than 604 tokens (provisional until served run 19H's servers record
 /// their decode host side). The prompt and decode phases bill this; construction keeps its own term below.
-/// SERVED19H (memory lane ledger sec. 124): the max-shape decode-end host side 1.235 GB, + 0.02 GB for a long decode,
+/// Served run 19H (measured): the max-shape decode-end host side 1.235 GB, + 0.02 GB for a long decode,
 /// + 0.06 GB the server's own, rounded up to the next 50 MB.
 pub const host_side_decode_end_bytes: u64 = 1_235_000_000;
 pub const host_side_long_decode_bytes: u64 = 20_000_000;
@@ -359,7 +359,7 @@ pub const construction_host_side_bytes: u64 = 900_000_000;
 
 /// The bill's variant (DSV41_BILL_VARIANT=conservative|tight, read where the bill is built, at construction): `tight`
 /// bills the main taps' chunk fences (one live stream in the K16 routed group) when the model declares them
-/// (`deepseek_v41_model.main_taps_in_chunk_fence`); `conservative` (the default) keeps the four streams. SERVED16 runs a
+/// (`deepseek_v41_model.main_taps_in_chunk_fence`); `conservative` (the default) keeps the four streams. Served run 16 runs a
 /// tight arm only after the conservative arm's measured prompt transient sits a gigabyte under the tight wave.
 pub const BillVariant = enum { conservative, tight };
 
@@ -378,9 +378,9 @@ pub const model_taps_fenced: bool = blk: {
     break :blk mdl.main_taps_in_chunk_fence;
 };
 
-/// The K16 routed group's live hc-width streams the tight variant bills: four without the fence, two with it (SERVED16's
+/// The K16 routed group's live hc-width streams the tight variant bills: four without the fence, two with it (served run 16's
 /// measured drop), one when the early-release route frees each chunk's layer input stream at its chunk fence (e499d60:
-/// `module.inputStreamEarlyRelease(ov)`, the route the Module installs; the holder SERVED16's derive could not name, which
+/// `module.inputStreamEarlyRelease(ov)`, the route the Module installs; the holder served run 16's derive could not name, which
 /// held the input streams of every unprocessed chunk to their routed group's HC post).
 pub fn tightGroupStreams(fenced: bool, one_stream: bool) u64 {
     if (!fenced) return 4;
@@ -397,7 +397,7 @@ pub const stream_decode_staging_rows: u64 = blk: {
 /// Decode's transient rows: once the phase change releases the prompt's windows (the whole scratch freed, then window 0
 /// reallocated: decode's calls take at most max_route_ids ids), window 0 plus decode's staging rows; else every window
 /// the prompt's wide reads allocated. `releases` is the route the Module installs (`module.transientRelease`: the
-/// stream's capability and the request's setting over the default, off since SERVED17), which `billAt` resolves from
+/// stream's capability and the request's setting over the default, off since served run 17), which `billAt` resolves from
 /// the same overrides the Module builds with, so one binary bills both arms.
 pub fn transientDecodeRows(wide_depth: u8, releases: bool, staging_rows: u64) u64 {
     return if (releases) xp.max_route_ids + staging_rows else @as(u64, wide_depth) * xp.max_route_ids;
@@ -414,7 +414,7 @@ pub fn billWired(wired_bytes: ?u64, envelope_record: bool) ?u64 {
 /// The request's bounded KV positions the bill charges: what the Module allocates (`Module.maxPositions`, the lanes'
 /// bound at the prompt): on the served path the shell declares no reservation (0), so the prompt plus the generation
 /// headroom (8,192) plus a verify block; a harness that reserves the prompt plus its tokens holds the larger of the two
-/// bills. Until SERVED18 the bill charged prompt + max_tokens + a block (17,416 at the standard request) while the served
+/// bills. Until served run 18 the bill charged prompt + max_tokens + a block (17,416 at the standard request) while the served
 /// Module allocated 24,584 (about 46 MB of lanes and 15 MB of the verify wave's index chain unbilled on servers).
 pub fn billedPositions(prompt_tokens: u64, max_tokens: u64) u64 {
     return sdk_ext.kv.billedCapacity(prompt_tokens, max_tokens, module.Module.kv_bound);
@@ -448,7 +448,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
     // read the stream holds in flight (the arm's `.transient_rows = wide_depth x max_route_ids`). Billing one
     // window left 48 records (0.64 GB) of device memory unbilled after c47001e folded the second window's named
     // term into the host side; 9b's construction hid it behind ~0.64 GB of draft-head residents that load at the
-    // first draft block, and SERVED10b's draft-block warm-up showed it (MLX active +642,935,748 B).
+    // first draft block, and served run 10b's draft-block warm-up showed it (MLX active +642,935,748 B).
     const transient: u64 = @as(u64, opts.wide_depth) * xp.max_route_ids;
     // Decode's: the release route the Module installs from these overrides (`Module.init` sets the stream's
     // `transient_release` from the same resolver after `armOptions`).
@@ -545,7 +545,7 @@ pub fn cacheOvershootDecode(bill: v41.PrefillBill, positions: u64) u64 {
     return @max(cache_overshoot_decode_traced, bill.laneMaxBytes(positions));
 }
 
-/// verify_wave (G3, the memory lane's ledger sec. 76): a decode forward's live set, by geometry. forwardSpan resets the
+/// verify_wave (G3): a decode forward's live set, by geometry. forwardSpan resets the
 /// handles once per layer, so a decode forward holds at most one layer's allocating outputs plus what crosses layers.
 /// The widest layer is an index source over the ratio-1 lane (P' = the bounded compressed rows at `positions`):
 /// - index chain: the f32 index keys, the [M, Hi, P'] einsum / relu / weighted products (3), six [M, P'] reductions
@@ -576,7 +576,7 @@ pub fn verifyWaveBytes(c: *const v41.Config, rows: u64, positions: u64, block: u
 }
 
 /// verify_wave's allowance for a layer's projections, rope, HC tail, router, shared and routed chains and Engram at
-/// decode rows (the memory lane's 20 MB; the bank trace test holds the whole layer under the form).
+/// decode rows (the measured 20 MB; the bank trace test holds the whole layer under the form).
 pub const verify_glue_bytes: u64 = 20 << 20;
 
 /// The prompt pass's billed transient: K16's layer-major wave (JOINLESS: the wave alone; else with the wide lane's
@@ -1015,7 +1015,7 @@ test "dsv41 memory: wire_tables bills the page tables and wiring records of a ph
     try testing.expectEqual(wireTables(d.sum() - d.wire_tables - d.decode_buffer_allowance - d.host_reserve - d.lookahead_staging - d.wide_window), d.wire_tables);
     try testing.expect(p.wire_tables > 0 and d.wire_tables > 0);
     // Decode's provisional buffer allowance: the per-buffer reading's excess over the per-page term, decode only.
-    // The provisional allowances (pass3br): decode 1,408 buffers x 28 KiB, prompt 17 MB, each its own phase only.
+    // The provisional allowances (run 3br): decode 1,408 buffers x 28 KiB, prompt 17 MB, each its own phase only.
     try testing.expectEqual(@as(u64, 40_370_176), d.decode_buffer_allowance);
     try testing.expectEqual(@as(u64, 0), p.decode_buffer_allowance);
     try testing.expectEqual(@as(u64, 17_000_000), p.prompt_buffer_allowance);
@@ -1060,7 +1060,7 @@ test "dsv41 memory: the SDK's term-wise view fills, admits and checks constructi
     try testing.expectError(error.ConstructionOverBill, sdk.checkConstruction(billed, billed + module.construction_tolerance_bytes + 1, module.construction_tolerance_bytes));
 }
 
-test "dsv41 memory: the host side is the bill's measured bound: SERVED17's 0.3318 GB passes, past 0.90 GB refuses" {
+test "dsv41 memory: the host side is the bill's measured bound: served run 17's 0.3318 GB passes, past 0.90 GB refuses" {
     var b = cell4Bill();
     b.host_reserve = measured_host_side_bytes;
     const mb = try memoryBill(testing.allocator, b);
@@ -1180,7 +1180,7 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
     try testing.expectEqual(@as(u64, module.prefillCacheLimit(.served)), b.prefill_cache);
     try testing.expectEqual(@as(u64, 2 << 30), b.prefill_cache);
     // The host side billed as measured, the named host terms folded into it: 1.35 GB in the prompt and decode
-    // phases (SERVED19's decode host side on libc malloc), the construction check's term at 0.90 GB.
+    // phases (served run 19's decode host side on libc malloc), the construction check's term at 0.90 GB.
     try testing.expectEqual(@as(u64, 1_350_000_000), b.host_reserve);
     try testing.expectEqual(@as(u64, 1_350_000_000), b.prefillTerms().host_reserve);
     try testing.expectEqual(@as(u64, 1_350_000_000), b.decodeTerms().host_reserve);
@@ -1203,7 +1203,7 @@ test "dsv41 memory: the fill and its admission agree at the same inputs (bank)" 
 }
 
 // DSV41_BANK=<bank> (host): this tree's rows at the served windows' inputs (box 120.259 GB less the guard's 2.0 GB
-// stop; baselines 9.2 GB and pass3an's 9.55 GB), with the seed's copies as the retained prompt state (ac2121c:
+// stop; baselines 9.2 GB and run 3an's 9.55 GB), with the seed's copies as the retained prompt state (ac2121c:
 // 847,872 B) and every transient window billed (b4473fa; P1's v1b third window: one row less than depth 2's
 // 137 / 167 at 9.2 GB), the served KV lanes by owner per phase (G7 57409c7: one prompt row at 9.2 GB with the posted
 // gathers on, one at 9.55 GB off), the Engram posted gathers off and on (the served tier's route).
@@ -1223,17 +1223,17 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     // Wide depth 5 (P1c, 240 transient rows), the minimal copy's bound at the most outputs a call can make (63 / 86
     // of the routed rows at 16K), and the frontier as rings (3ebd8a7: -0.191 GB in the prompt, -0.211 GB in decode;
     // before it 8.99 GB 135 / 164 off, 134 / 164 on; 9.20 GB 134 / 163 both; 9.55 GB 134 / 163 off, 133 / 163 on).
-    // SERVED19: the host side billed at 1.25 GB in both phases (was 0.90; the decode host side on libc malloc measured
+    // Served run 19: the host side billed at 1.25 GB in both phases (was 0.90; the decode host side on libc malloc measured
     // 1.115-1.120 GB): before it 8.99 GB 135 / 164, 9.20 GB 135 / 164 off and 134 / 164 on, 9.55 GB 134 / 163.
-    // SERVED19E: wire_tables (~0.16 GB a phase) and decode's buffer allowance: 9.20 GB posted on 134 -> 133 prompt rows.
-    // SERVED19F: the re-frozen buffer allowances (decode 40.4 MB, prompt 17 MB): 9.20 GB decode 168 -> 167 (release on).
+    // Served run 19E: wire_tables (~0.16 GB a phase) and decode's buffer allowance: 9.20 GB posted on 134 -> 133 prompt rows.
+    // Served run 19F: the re-frozen buffer allowances (decode 40.4 MB, prompt 17 MB): 9.20 GB decode 168 -> 167 (release on).
     // verify_wave (G3, 0.272 GB for 0.365): 9.20 GB decode back to 168.
     const every_window = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 134, .decode = 163 } },
         .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 163 }, .on = .{ .prefill = 133, .decode = 163 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 162 }, .on = .{ .prefill = 133, .decode = 162 } },
     };
-    // With the transient release installed (SERVED16 for every request; since SERVED17 the route,
+    // With the transient release installed (served run 16 for every request; since served run 17 the route,
     // DSV41_CELL_TRANSIENT_RELEASE), decode bills window 0 only: +5 decode rows at each baseline.
     const window_0 = [_]Want{
         .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
@@ -1263,9 +1263,9 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     std.debug.print("\n", .{});
 }
 
-// DSV41_BANK=<bank> (host): the bounded KV by owner at the bill's positions (`billedPositions`: since SERVED18 the served
+// DSV41_BANK=<bank> (host): the bounded KV by owner at the bill's positions (`billedPositions`: since served run 18 the served
 // Module's bound, 16,384 + 8,192 + one verify block; until then the fill's request, 16,384 + 1,024 + 8, which held the
-// lanes at 111,544,320 B, kvPrompt 309,725,184 B, kvDecode 156,717,056 B, 138,883,072 B at the phase change). SERVED11 (full-length frontier lanes) held 351,152,128 B after the prompt, the lanes, ring and frontier
+// lanes at 111,544,320 B, kvPrompt 309,725,184 B, kvDecode 156,717,056 B, 138,883,072 B at the phase change). Served run 11 (full-length frontier lanes) held 351,152,128 B after the prompt, the lanes, ring and frontier
 // of 57409c7's bill within 0.42 MB. Since 3ebd8a7 the frontier of each ratio-2 kv source (layers 2, 8, 14) is two rings
 // of window 2, so it is billed as rings, per phase.
 test "dsv41 memory: the bounded KV lanes by owner, per phase, at the fill's request (bank)" {
@@ -1355,7 +1355,7 @@ test "dsv41 memory: the bill's transient rows are the arm's allocation, every wi
 
 // DSV41_BANK=<bank> (host): the bill's variants at the windows' baselines. Conservative (the default) bills the K16
 // routed group's four hc-width streams; tight bills two once the model declares its main taps fenced (ee80e40:
-// `main_taps_in_chunk_fence`; SERVED16 measured the second stream still live), one when the early-release route frees
+// `main_taps_in_chunk_fence`; served run 16 measured the second stream still live), one when the early-release route frees
 // each chunk's input stream at its fence (`module.inputStreamEarlyRelease`, e499d60). The tight rows are computed at two
 // streams here, whether or not this tree declares the fence; the route's one stream is pinned through billAt below.
 test "dsv41 memory: the bill's variants, conservative and tight, at the windows' baselines (bank)" {
@@ -1440,7 +1440,7 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
         config.memory_baseline_bytes = w.base;
         const off = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
         const on = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .input_stream_early_release = true });
-        // The tight wave drops by the third stream's bound down to the group's final evaluation (SERVED19: it binds
+        // The tight wave drops by the third stream's bound down to the group's final evaluation (served run 19: it binds
         // below two streams, over the attention side); the conservative wave, the KV and decode do not move.
         // kv16: the final evaluation's concat input is bf16 (16384 x 5120 x 2 B less in the on branch's bound).
         try testing.expectEqual(@as(u64, 3_689_021_440 - 2_684_354_560 + 16384 * 5120 * 2), off.prefill_wave_tight - on.prefill_wave_tight);
@@ -1546,7 +1546,7 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     std.debug.print("\n", .{});
 }
 
-// DSV41_BANK=<bank> (host): SERVED17's four arms, the bill's variant (the prompt's wave: four group streams or the
+// DSV41_BANK=<bank> (host): served run 17's four arms, the bill's variant (the prompt's wave: four group streams or the
 // fence's two) against the transient release (decode's transient rows: every window, 240, or window 0, 48), the
 // release through the route's override both ways (the cell's DSV41_CELL_TRANSIENT_RELEASE). The variant moves only
 // prompt rows, the release only decode rows.
@@ -1594,7 +1594,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     std.debug.print("\n", .{});
 }
 
-// DSV41_BANK=<bank> (host): the decode rows the phase change's window release returns (SERVED16). Decode keeps window 0
+// DSV41_BANK=<bank> (host): the decode rows the phase change's window release returns (served run 16). Decode keeps window 0
 // of the transient bank (48 rows) and gives windows 1..4 back (192 records, 2,556,592,128 B at depth 5); the prompt
 // phase is unchanged. The rows are the release route's (`.transient_release = true`; the default is off).
 test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank)" {
@@ -1611,7 +1611,7 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
     const Want = struct { base: u64, off: arm_mod.NativeRows, on: arm_mod.NativeRows };
     for ([_]Want{
         // Without the release (this tree's fill): 163 / 163 / 162 decode rows; with it, +5 at each baseline (the host side
-        // billed at 1.25 GB since SERVED19, -0.35 GB in both phases).
+        // billed at 1.25 GB since served run 19, -0.35 GB in both phases).
         .{ .base = 8_990_000_000, .off = .{ .prefill = 134, .decode = 168 }, .on = .{ .prefill = 134, .decode = 168 } },
         .{ .base = 9_200_000_000, .off = .{ .prefill = 134, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
         .{ .base = 9_550_000_000, .off = .{ .prefill = 133, .decode = 167 }, .on = .{ .prefill = 133, .decode = 167 } },
@@ -1787,7 +1787,7 @@ test "dsv41 memory: MLX's cache overshoot (one freed buffer over the limit) is b
 
 // (a) The bill's ring bytes against the real LayerState rings (`LayerState.init` per layer of the real config, as the
 // model's state builder makes them, `Ring.append` through the bill's chunks and then decode) on the trace backend: the
-// same slot bookkeeping as MLX, no device. A ring's live rows through an append (the memory lane's rule, 10-02 §140):
+// same slot bookkeeping as MLX, no device. A ring's live rows through an append (a measured rule):
 // each slot from its first write to its release (a never-written zeros slot holds nothing), a source the append
 // released (live until its destination is built), and at the ring's first write its slot once more (the zeros the
 // write consumes). A compaction's own intermediates (a fresh destination's zeros, its first write's result) are wave

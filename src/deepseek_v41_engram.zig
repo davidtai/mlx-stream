@@ -207,7 +207,7 @@ fn refuse(diag: ?*v41.Diag, err: Refusal, comptime fmt: []const u8, args: anytyp
     return err;
 }
 
-/// The compressed token map: `R/exl3/runtime/export_dsv41_engram_token_map.py`
+/// The compressed token map: `the reference runtime's export_dsv41_engram_token_map.py`
 /// runs our Python `build_compressed_token_map` (tokenizer normalisation stays
 /// Python) and writes one little-endian u32 per vocab id plus a JSON sidecar
 /// naming the tokenizer.json and the manifest it was built for. Checked once.
@@ -524,7 +524,7 @@ test "dsv41 engram: streaming, masking and trim hash like one pass" {
     try testing.expectError(error.TokenOutOfMap, p.advance(testing.allocator, &h, &map, &.{6}, null, &fresh));
 }
 
-// DSV41_BANK=<bank> DSV41_ENGRAM_FIXTURE=<json from R/exl3/runtime/dump_dsv41_engram_fixture.py>
+// DSV41_BANK=<bank> DSV41_ENGRAM_FIXTURE=<json from the reference runtime's dump_dsv41_engram_fixture.py>
 test "dsv41 engram: the real manifest and token map hash the prompt to the Python oracle's rows" {
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     const fixture = std.mem.span(std.c.getenv("DSV41_ENGRAM_FIXTURE") orelse return error.SkipZigTest);

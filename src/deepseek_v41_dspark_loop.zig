@@ -2363,7 +2363,7 @@ test "dsv41 dspark loop: the typical decision is realised by the verify's eval (
     try testing.expectEqualSlices(u32, &.{ 5, 6, 9, 11, 14 }, out.items);
 }
 
-// DSV41_DSPARK_CYCLES_FIXTURE=<json from R/exl3/runtime/dump_dsv41_dspark_cycles.py>
+// DSV41_DSPARK_CYCLES_FIXTURE=<json from the reference runtime's dump_dsv41_dspark_cycles.py>
 test "dsv41 dspark loop: the lane's recorded cycles replay decision for decision" {
     const path = std.mem.span(std.c.getenv("DSV41_DSPARK_CYCLES_FIXTURE") orelse return error.SkipZigTest);
     const a = testing.allocator;

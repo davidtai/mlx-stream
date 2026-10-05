@@ -1,5 +1,5 @@
 //! The kernel-ops GPU gate: the Python lanes' own device outputs (a fixture written in a
-//! guarded window by R/exl3/runtime/dump_kernel_ops_fixture.py) replayed through the ported
+//! GPU run by the reference runtime's dump_kernel_ops_fixture.py) replayed through the ported
 //! routes on the registry's kernels, every output word compared. Inputs are regenerated from
 //! the fixture's seeded generators (splitmix64, the dump's twins) and checked by sha256 first.
 //! GPU only: DSV41_KERNELS_GPU=1 and DSV41_KERNEL_OPS_FIXTURE=<dir> in a lock-holding window.
@@ -711,7 +711,7 @@ fn replayFixture(dir: []const u8, format: []const u8, filter: ?[]const u8, recei
     try testing.expectEqual(@as(usize, 0), failed);
 }
 
-// The guarded window only (GPU lock held, service down): DSV41_KERNELS_GPU=1,
+// GPU only: DSV41_KERNELS_GPU=1,
 // DSV41_KERNEL_OPS_FIXTURE=<fixture dir>; DSV41_KERNEL_OPS_FAMILIES=<a,b|all> narrows it,
 // DSV41_KERNEL_OPS_RECEIPT=<path> keeps the per-output JSON lines.
 test "dsv41 kernels ops gpu: every route reproduces its lane's own device output (fixture), bitwise" {
@@ -721,7 +721,7 @@ test "dsv41 kernels ops gpu: every route reproduces its lane's own device output
     try replayFixture(dir, fixture_format, filter, std.c.getenv("DSV41_KERNEL_OPS_RECEIPT"), "kernel ops gate");
 }
 
-// The guarded window only (block (t)): DSV41_KERNELS_GPU=1, DSV41_KERNEL_DRAFT_FIXTURE=<dir> (the
+// GPU only (block (t)): DSV41_KERNELS_GPU=1, DSV41_KERNEL_DRAFT_FIXTURE=<dir> (the
 // dump_draftrc_fixture.py fixture); DSV41_KERNEL_DRAFT_RECEIPT=<path> keeps the per-output JSON lines.
 test "dsv41 kernels ops gpu: the DRAFTRC routes reproduce the lane's own draft kernels (fixture), bitwise" {
     _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
@@ -729,7 +729,7 @@ test "dsv41 kernels ops gpu: the DRAFTRC routes reproduce the lane's own draft k
     try replayFixture(dir, draft_fixture_format, null, std.c.getenv("DSV41_KERNEL_DRAFT_RECEIPT"), "kernel draft gate");
 }
 
-// The guarded window only (decode batch 2): DSV41_KERNELS_GPU=1, DSV41_KERNEL_DECODE2_FIXTURE=<dir>
+// GPU only (decode batch 2): DSV41_KERNELS_GPU=1, DSV41_KERNEL_DECODE2_FIXTURE=<dir>
 // (the dump_kernel_decode2_fixture.py fixture); DSV41_KERNEL_DECODE2_RECEIPT=<path> keeps the lines.
 test "dsv41 kernels ops gpu: the decode batch 2 routes reproduce their lanes' own device outputs (fixture), bitwise" {
     _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
@@ -737,7 +737,7 @@ test "dsv41 kernels ops gpu: the decode batch 2 routes reproduce their lanes' ow
     try replayFixture(dir, decode2_fixture_format, null, std.c.getenv("DSV41_KERNEL_DECODE2_RECEIPT"), "kernel decode2 gate");
 }
 
-// The guarded window only (prefill batch 2): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL2_FIXTURE=<dir>
+// GPU only (prefill batch 2): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL2_FIXTURE=<dir>
 // (the dump_kernel_prefill2_fixture.py fixture); DSV41_KERNEL_PREFILL2_RECEIPT=<path> keeps the lines.
 test "dsv41 kernels ops gpu: the prefill batch 2 routes reproduce their lanes' own device outputs (fixture), bitwise" {
     _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
@@ -745,7 +745,7 @@ test "dsv41 kernels ops gpu: the prefill batch 2 routes reproduce their lanes' o
     try replayFixture(dir, prefill2_fixture_format, null, std.c.getenv("DSV41_KERNEL_PREFILL2_RECEIPT"), "kernel prefill2 gate");
 }
 
-// The guarded window only (window PG): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL_FIXTURE=<dir>;
+// GPU only (window PG): DSV41_KERNELS_GPU=1, DSV41_KERNEL_PREFILL_FIXTURE=<dir>;
 // DSV41_KERNEL_PREFILL_RECEIPT=<path> keeps the per-call JSON lines.
 test "dsv41 kernels ops gpu: the prefill wave route reproduces the lane's own dispatch output (fixture), bitwise" {
     _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;

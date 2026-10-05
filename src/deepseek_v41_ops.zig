@@ -2060,7 +2060,7 @@ test "dsv41 ops: resetTo frees exactly what was tracked after its mark" {
     try testing.expectEqual(TraceOps.Freed{ .from = 3, .to = 3 }, g.freed.items[1]);
 }
 
-// Guarded window only (_GPU_WINDOW_LOCKED=1): a wave's intermediates go back at
+// GPU only (_GPU_WINDOW_LOCKED=1, set by the GPU lock's holder): a wave's intermediates go back at
 // resetTo while its kept output still evaluates.
 // DSV41_PHASE0B_MLX=1 only (a GPU-lock-held run: any MLX array creates the Metal device). The served path's
 // first-time defaults through the mlx-c shim with initialized handles, before any model window.

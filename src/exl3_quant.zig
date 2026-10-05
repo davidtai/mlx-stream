@@ -922,7 +922,7 @@ pub const PrefillShape = struct {
     /// a call of at most `carry_rows` rows leaves its last waves in flight (to the next call or `finish`)
     carry_rows: u32,
 
-    /// Record 3 (pass3r-record3-fast-typical-exl3-30-guard-20260928.log): the lane's shape, the one its wave
+    /// Record 3 (run 3r-record3-fast-typical-exl3-30-guard-20260928.log): the lane's shape, the one its wave
     /// samples and the move's pinned launches were taken at.
     pub const record3: PrefillShape = .{ .wave = 4, .inflight = 2, .row_budget = 7168, .carry_rows = 8192 };
     /// The served tier: Record 3 with L1, 8 experts per wave. Under K16 a group call's experts carry about 256
@@ -1963,7 +1963,7 @@ test "dsv41 kernels ops: L1: a K16 group call packs the tier's 8 experts per wav
     }
 }
 
-// DSV41_PHASE0B_MLX=1 + DSV41_BANK=<bank>, inside a guarded window (any MLX array creates the Metal device): L1's
+// DSV41_PHASE0B_MLX=1 + DSV41_BANK=<bank>, on a GPU machine (any MLX array creates the Metal device): L1's
 // first device run and its exactness proof, seconds long, no model load. A handful of real records (layer 0's
 // first 16 experts, loaded by the stream into MLX slot rows) through the real DIG-X prefill launches, one K16-shaped
 // group call at 8 experts per wave against the same call at Record 3's 4: the outputs equal, bit for bit.
@@ -2595,7 +2595,7 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
     try acc.checkBank(&tb, bb, &diag);
 }
 
-// DSV41_PHASE0B_MLX=1 + DSV41_BANK=<bank>, inside a guarded window (any MLX array creates the Metal device); seconds,
+// DSV41_PHASE0B_MLX=1 + DSV41_BANK=<bank>, on a GPU machine (any MLX array creates the Metal device); seconds,
 // no model load. The take2 retune on the device, and the per-wave prices the drain note left open:
 // 1. both take2 texts' construction self-checks on the device (compile, row invariance, the bitwise mlx_chain);
 // 2. the retune against the lane's take2, each through its own entry (whichever the route launches), over real
@@ -2819,7 +2819,7 @@ test "dsv41 smoke 0b: take2 retune: the lane's take2 words on real records, bit 
     }
 }
 
-// DSV41_PHASE0B_MLX=1 + DSV41_BANK=<bank>, inside a guarded window (any MLX array creates the Metal device); seconds,
+// DSV41_PHASE0B_MLX=1 + DSV41_BANK=<bank>, on a GPU machine (any MLX array creates the Metal device); seconds,
 // no model load. The 128-row DIG-X GEMMs on the device, and the decode share's price:
 // 1. both 128-row texts' construction self-checks on the device (compile, composition, f64, twin);
 // 2. the 64- and 128-row texts on real records (layer 0's first 16 experts' codes, read by the stream), each wave's

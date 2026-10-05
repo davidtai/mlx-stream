@@ -816,7 +816,7 @@ test "dsv41 admission: every refusal is named before anything is allocated" {
     try testing.expectError(error.CreditGeometry, Admission.plan(env, c));
 }
 
-// The fixture's records (R/exl3/runtime/dump_phase4a_admission_fixture.py).
+// The fixture's records (the reference runtime's dump_phase4a_admission_fixture.py).
 const FixPhases = struct { growth: u64, seed: u64, prime: u64, decode: u64 };
 const FixSummary = struct {
     decode_slots_per_layer: u32,
@@ -1110,7 +1110,7 @@ fn checkCell(env: Envelope, c: FixCell) !enum { planned, refused, typed } {
     return .planned;
 }
 
-// DSV41_PHASE4A_FIXTURE=<json from R/exl3/runtime/dump_phase4a_admission_fixture.py>
+// DSV41_PHASE4A_FIXTURE=<json from the reference runtime's dump_phase4a_admission_fixture.py>
 test "dsv41 admission: every pass-2 admission, synthetic cell and refusal equals the Python stack's" {
     const path = std.mem.span(std.c.getenv("DSV41_PHASE4A_FIXTURE") orelse return error.SkipZigTest);
     const a = testing.allocator;

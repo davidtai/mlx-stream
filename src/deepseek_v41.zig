@@ -17,7 +17,7 @@ pub const max_layers = 64;
 pub const max_rank = 6;
 
 /// The served tier's prefill allocator cache limit (the module sets it for the prompt pass, the native bill and the
-/// per-request prefill bill charge it): 2 GiB (pass3am: 1 GiB cost TTFT).
+/// per-request prefill bill charge it): 2 GiB (run 3am: 1 GiB cost TTFT).
 pub const served_prefill_cache_bytes: u64 = 2 << 30;
 
 /// The prompt pass's bill for mlx-serve's prefill admission (the arch's own estimator, as deepseek_v4 has one): what
@@ -67,7 +67,7 @@ pub const PrefillBill = struct {
     n_experts: u64 = 0,
     /// The K16 routed group's hc-width f32 streams live at its peak (`groupStreams`): four without the main taps' chunk
     /// fence (the DSpark target layers' lazy taps pin their input streams: at layer 39 old37 + old38 + old39 beside next),
-    /// two with it (ee80e40; SERVED16 measured the fence's drop at 2.787 GB: two streams freed, 2.684 GB, so one more than
+    /// two with it (ee80e40; served run 16 measured the fence's drop at 2.787 GB: two streams freed, 2.684 GB, so one more than
     /// the mixed stream stays live), one once the model declares that holder released.
     group_streams: u64 = 4,
     /// K16's MoE-input release (`Routes.prefill_input_release`): the group's final evaluation no longer holds the
@@ -262,7 +262,7 @@ pub const PrefillBill = struct {
     ///   attention side (`waveBytes` without the chunk-major kept positions, which the kept state
     ///   above replaces) or a routed group (moeRowCap rows: the routed outputs, the joined input (under
     ///   JOINLESS the minimal copy's bound, `joinedBytes`), the combine and the HC post to the next stream,
-    ///   with the group's new stream held beside the old), or the group's final evaluation (SERVED19, below).
+    ///   with the group's new stream held beside the old), or the group's final evaluation (served run 19, below).
     pub fn layerMajorWaveBytes(b: PrefillBill, seq: u64, tier: Tier) u64 {
         return b.layerMajorWaveTerms(seq, b.chunkRows(seq), seq, tier).total();
     }
@@ -325,7 +325,7 @@ pub const PrefillBill = struct {
         const routed = g_rows * b.top_k * d * 4;
         const group = routed + b.joinedBytes(g_rows) + g_rows * (2 * d * 4 + b.groupStreams() * b.hc * d * 4);
         // The group's final evaluation (`evalAll(hs[i..j])`: the merge, every chunk's combine and HC post, the new
-        // streams at once; pass3ba: 9.182 GB with the early release on), at its worst over the evaluation order: the
+        // streams at once; run 3ba: 9.182 GB with the early release on), at its worst over the evaluation order: the
         // routed outputs and the merge's copies (`joinedBytes`), the shared outputs and the combines (2 d f32 a row),
         // each post's materialized mix (an hc-width f32 row: the einsum the compiled post cannot fuse), the group's
         // concatenated input (d f32 a row) and the routing arrays (top_k x 20 B a row). The new streams, h1, moe_in,
@@ -536,7 +536,7 @@ test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-
     // The per-request bill (the server's admission) carries the same transient.
     try std.testing.expectEqual(billed, b.layerMajorBytes(16384, 1024, .served));
     // JOINLESS's minimal-copy merge (58d9fb1): the joined input is at most 28 / 51 of the routed rows, 1.11 GB of
-    // the 2.01 GB join, so the routed group's outputs and joined input fall from 4.03 to 3.12 GB. SERVED14 measured
+    // the 2.01 GB join, so the routed group's outputs and joined input fall from 4.03 to 3.12 GB. Served run 14 measured
     // the prompt's transient at 12.40 GB with the merge (13.46 GB before it).
     // On the served indexer route (one score launch) the routed group is the layer's wider sub-wave, so the whole
     // saving reaches the wave; on the per-head score chain the attention side (9.26 GB) binds first.
@@ -551,10 +551,10 @@ test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-
     try std.testing.expectEqual(@as(u64, 1_474_834_337), j.joinedBytes(16384));
     try std.testing.expectEqual(served.layerMajorWaveBytes(16384, .served) - (2_013_265_920 - 1_474_834_337), j.layerMajorWaveBytes(16384, .served));
     // The main taps in their chunk fences (ee80e40, the tight variant). One hc-width stream (the holder released): 9.53 ->
-    // 5.50 GB, under the attention side (5.58 GB) and the group's final evaluation (5.84 GB, SERVED19), which binds: the wave
-    // falls 3,689,021,440 B (3,950,230,945 B to the attention side before SERVED19: 261,209,505 B under the final
-    // evaluation's worst case). Two streams (the fence with SERVED16's holder): 9.53 -> 6.84 GB, still the group's: the wave
-    // -2,684,354,560 B (SERVED16 measured -2.787).
+    // 5.50 GB, under the attention side (5.58 GB) and the group's final evaluation (5.84 GB, served run 19), which binds: the wave
+    // falls 3,689,021,440 B (3,950,230,945 B to the attention side before served run 19: 261,209,505 B under the final
+    // evaluation's worst case). Two streams (the fence with served run 16's holder): 9.53 -> 6.84 GB, still the group's: the wave
+    // -2,684,354,560 B (served run 16 measured -2.787).
     try std.testing.expectEqual(@as(u64, 2_684_354_560), j.layerMajorWaveBytes(16384, .served) - j.withGroupStreams(2).layerMajorWaveBytes(16384, .served));
     try std.testing.expectEqual(@as(u64, 3_689_021_440), j.layerMajorWaveBytes(16384, .served) - j.withGroupStreams(1).layerMajorWaveBytes(16384, .served));
     // The one-stream wave is the kept terms plus the final evaluation's: the routed outputs, the merge's bound, then
@@ -1935,7 +1935,7 @@ test "dsv41 weights: every checkpoint mismatch refuses, by name" {
     }
 }
 
-// DSV41_BANK=<bank dir> [DSV41_M0_FIXTURE=<json from R/exl3/runtime/dump_dsv41_m0_fixture.py>]
+// DSV41_BANK=<bank dir> [DSV41_M0_FIXTURE=<json from the reference runtime's dump_dsv41_m0_fixture.py>]
 test "dsv41 weights: the real bank's config, 49 shard headers and Engram sidecar map with 0 refusals" {
     const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

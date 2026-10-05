@@ -2617,7 +2617,7 @@ fn noneOf(g: *const TraceOps, from: usize, op: ops.Op) bool {
     return true;
 }
 
-// Inside a guarded window (DSV41_PHASE0B_MLX=1: any MLX array creates the Metal device), seconds: P1's predictor
+// Inside a GPU run (DSV41_PHASE0B_MLX=1: any MLX array creates the Metal device), seconds: P1's predictor
 // selection on the GPU stream against the router's own (`gatePrefix` + `gateSelect`) over the same rows and gate.
 test "dsv41 smoke 0b: the prefill shared expert's three mxfp8 qmm at the K16 chunk shapes, against a bf16 matmul ceiling (MLX, GPU stream)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;

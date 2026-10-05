@@ -1,4 +1,4 @@
-//! The self-checks a guarded window runs before the EXL3 kernel registry is accepted: one
+//! The self-checks a GPU run runs before the EXL3 kernel registry is accepted: one
 //! executor per (kernel, check) of the manifest's plan. Every trellis state decoded through
 //! the GEMVs, golden tiles through the DIG-X decode, row invariance of the decode kernels,
 //! bitwise equality with the eager MLX chains the fused kernels replace, float64 parity of
@@ -2144,7 +2144,7 @@ test "dsv41 kernels: an HCTAPE combine word is judged against its f32 chain, not
     try testing.expect(refused * 10 > 9 * 4 * n);
 }
 
-// The guarded window only (GPU lock held, service down): DSV41_KERNELS_GPU=1.
+// GPU only: DSV41_KERNELS_GPU=1.
 // DSV41_KERNELS_RECEIPT=<path> keeps the per-check JSON lines.
 test "dsv41 kernels gpu: every kernel of record passes its self-check" {
     _ = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;

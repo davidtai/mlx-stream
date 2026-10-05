@@ -2493,7 +2493,7 @@ test "dsv41 experts: the stream adapter hands the hook every routed record's row
     try testing.expectEqual(@as(u64, 4), st.expert_cache_hits);
 }
 
-// DSV41_PHASE1_ROUTE_FIXTURE=<json from R/exl3/runtime/dump_phase1_route_fixture.py>
+// DSV41_PHASE1_ROUTE_FIXTURE=<json from the reference runtime's dump_phase1_route_fixture.py>
 test "dsv41 experts: the recorded trace's 3,600 decode calls run through the hook as the Python bank serves them" {
     const path = std.mem.span(std.c.getenv("DSV41_PHASE1_ROUTE_FIXTURE") orelse return error.SkipZigTest);
     const a = testing.allocator;
@@ -2851,7 +2851,7 @@ test "dsv41 experts: LOOKAHEAD4's construction check: the gated waves against th
     try testing.expectEqual(@as(usize, 0), src.liveCalls());
 }
 
-// DSV41_PHASE0B_MLX=1, inside a guarded window only (any MLX array allocates through Metal, on a CPU stream too).
+// DSV41_PHASE0B_MLX=1, on a GPU machine only (any MLX array allocates through Metal, on a CPU stream too).
 test "dsv41 experts 0b: a gated wait over handles left as garbage (waitProj's undefined outs) aliases its inputs" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const stream = mlx.mlx_default_cpu_stream_new();
@@ -2948,7 +2948,7 @@ test "dsv41 experts: the read-ahead of layer l is scored by layer l + 1's router
     try testing.expect(ex.predictorGate(2) == null);
 }
 
-// DSV41_PHASE2_FIXTURE=<json from R/exl3/runtime/dump_phase2_lookahead_fixture.py> (its scores file beside it)
+// DSV41_PHASE2_FIXTURE=<json from the reference runtime's dump_phase2_lookahead_fixture.py> (its scores file beside it)
 test "dsv41 experts: the scores the hook passes reproduce the streamer's read-ahead picks on the recorded trace" {
     const path = std.mem.span(std.c.getenv("DSV41_PHASE2_FIXTURE") orelse return error.SkipZigTest);
     const a = testing.allocator;
@@ -4002,7 +4002,7 @@ test "dsv41 experts: past 24 outputs the combine still reads each assignment's o
     }
 }
 
-// Inside a guarded window only: DSV41_PHASE0B_MLX=1 and DSV41_BANK (the real records). Device memory under 3 GB:
+// Inside a GPU only: DSV41_PHASE0B_MLX=1 and DSV41_BANK (the real records). Device memory under 3 GB:
 // 32 slot rows 0.43 GB, act 0.04 GB, the 51 outputs 0.50 GB, the three source sets at most 1.28 GB, the three
 // combines and the shared rows 0.34 GB.
 test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's sources equals the full concatenate's on real records, bit for bit" {

@@ -1694,7 +1694,7 @@ test "dsv41 model: the K16 profile charges a chunk's carry-over to its own stage
             try testing.expectEqual(ch, p.chunks.items[k - 1]);
         }
     }
-    // (SERVED19) the grouped profile's points: per routed group, the halves read after its routed call (before the first
+    // (served run 19) the grouped profile's points: per routed group, the halves read after its routed call (before the first
     // combine), the mark after the last HC post's build, then group.eval (the group's one evaluation, charged to its first
     // chunk) right before group.frees (charged to its last chunk, as before); the halves and the new streams are the
     // group's chunks.

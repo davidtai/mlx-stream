@@ -4,7 +4,7 @@
 //! tier's configuration: one request, one resident pool per layer plus a
 //! shared transient scratch, 2Q prefill admission behind the prompt-frequency
 //! seed, transition-window decode admission. That class is the oracle
-//! (R/exl3/runtime/dump_phase1_route_fixture.py replays a recorded trace
+//! (the reference runtime's dump_phase1_route_fixture.py replays a recorded trace
 //! through it for the parity test below).
 
 const std = @import("std");
