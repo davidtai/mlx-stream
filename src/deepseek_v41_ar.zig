@@ -3945,11 +3945,14 @@ test "dsv41 memory: the reverse change's bound follows the coming request: a 16K
     const scratch: u64 = b.transient_rows * (b.slot_prefill / (@as(u64, c.n_layers) * b.prefill_rows + b.transient_rows));
     const tc: module.TurnCall = .{ .pb = try bill_mod.servedPrefillBill(&config, .{}, &c, b.variant), .layer_major = config.dsv41LayerMajor(), .joinless = bill_mod.joinlessRoute(.{}) };
     const settled: u64 = 88_988_658_776;
-    const kept_old = module.reverseBound(terms, scratch) + terms.kv;
-    const full_reuse = module.reverseBoundKept(terms, scratch, tc.wave(1, 16_384));
-    const long_reuse = module.reverseBoundKept(terms, scratch, tc.wave(16_384, 17_472));
-    const fresh = module.reverseBound(terms, scratch);
-    std.debug.print("\nDSV41_REVERSE_BOUND {{\"kept_cold_wave\": {d}, \"full_reuse\": {d}, \"reuse_16k_rows\": {d}, \"fresh\": {d}, \"call_wave_1\": {d}, \"prompt_wave\": {d}, \"kept_kv\": {d}, \"turn_boundary\": {d}, \"settled\": {d}}}\n", .{ kept_old, full_reuse, long_reuse, fresh, tc.wave(1, 16_384), terms.waves, terms.kv, terms.prompt_state, settled });
+    // The server's bound then (the 1.35 GB host term of that build; the measured 2.60 GB term followed in the next fix).
+    var then = terms;
+    then.host_reserve = 1_350_000_000;
+    const kept_old = module.reverseBound(then, scratch) + then.kv;
+    const full_reuse = module.reverseBoundKept(then, scratch, tc.wave(1, 16_384));
+    const long_reuse = module.reverseBoundKept(then, scratch, tc.wave(16_384, 17_472));
+    const fresh = module.reverseBound(then, scratch);
+    std.debug.print("\nDSV41_REVERSE_BOUND {{\"kept_cold_wave\": {d}, \"full_reuse\": {d}, \"reuse_16k_rows\": {d}, \"fresh\": {d}, \"call_wave_1\": {d}, \"prompt_wave\": {d}, \"kept_kv\": {d}, \"turn_boundary\": {d}, \"settled\": {d}}}\n", .{ kept_old, full_reuse, long_reuse, fresh, tc.wave(1, 16_384), then.waves, then.kv, then.prompt_state, settled });
     // The bound the server read (its log, within the wired-table term's 1 MB): kept state + a cold wave, under the footprint.
     try testing.expect(kept_old < settled and settled - kept_old < 100_000_000);
     // The continuation's own call (one row over 16,384 positions) leaves the cold wave's room: the reuse passes.
@@ -3957,8 +3960,57 @@ test "dsv41 memory: the reverse change's bound follows the coming request: a 16K
     // A continuation's call never charges more than the bill's prompt wave (the old bound is its floor).
     try testing.expect(long_reuse >= kept_old and full_reuse >= long_reuse);
     // A fresh prompt: the kept boundary and state freed before the settle, the cold wave charged, the bound without them.
-    try testing.expect(fresh + terms.kv + terms.prompt_state >= kept_old);
+    try testing.expect(fresh + then.kv + then.prompt_state >= kept_old);
     // The settle refusals fail one request (not latched); a broken invariant still latches.
     try testing.expect(module.isSettleRefusal(error.PhaseChangeFootprintOverBill) and module.isSettleRefusal(error.PhaseChangeFootprintNotFreed));
     try testing.expect(!module.isSettleRefusal(error.TransientStillReferenced));
+}
+
+// pass3eg (reuse16k, server 9be644b3 at 132 / 167 rows, ctx 18,432, baseline 8,933,801,984 B): the sequence cold -> identical
+// repeat -> follow-up turn -> fresh shorter prompt -> unrelated prompt (-> a fresh 16K prompt), every boundary's settled
+// reading against the bound that boundary uses. With the 1.35 GB host term the fresh prompt after the reused conversation
+// refused at -455,322,072 B (its at-rest host side 2.407 GB); with the measured 2.60 GB term every boundary holds.
+test "dsv41 memory: a reused 16K conversation then fresh prompts: every phase change and reverse change holds its bound (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ceiling: u64 = 120_259_084_288;
+    var config = try host_bridge.loadConfig(testing.io, a, bank_dir);
+    config.memory_baseline_bytes = 8_933_801_984;
+    config.max_context_tokens = 18_432;
+    config.expert_prefill_rows = 132;
+    config.expert_rows = 167;
+    const b = try bill_mod.servedBill(a, testing.io, &config, null, ceiling, .{});
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    const terms = b.prefillTerms();
+    const scratch: u64 = b.transient_rows * (b.slot_prefill / (@as(u64, c.n_layers) * b.prefill_rows + b.transient_rows));
+    const tc: module.TurnCall = .{ .pb = try bill_mod.servedPrefillBill(&config, .{}, &c, b.variant), .layer_major = config.dsv41LayerMajor(), .joinless = bill_mod.joinlessRoute(.{}) };
+    const forward = module.untilFreedBound(b.decodeTotal() - b.baseline, b.slot_prefill, b.slot_decode, 3_195_740_160, @intCast(c.n_layers)).bound;
+    const Turn = struct { name: []const u8, coming: module.Coming, settled: u64, phase_after: ?u64 };
+    // Each step: the reverse change before it (none before the first request), then its phase change's settled reading.
+    const steps = [_]Turn{
+        .{ .name = "r1 cold 16K", .coming = .fresh, .settled = 0, .phase_after = 89_618_181_568 },
+        .{ .name = "r2 identical repeat", .coming = .{ .continuation = .{ .rows = 1, .positions = 16_384 } }, .settled = 89_665_826_264, .phase_after = 89_674_984_920 },
+        .{ .name = "r3 follow-up turn", .coming = .{ .continuation = .{ .rows = 607, .positions = 16_991 } }, .settled = 89_667_087_832, .phase_after = 89_749_302_744 },
+        .{ .name = "r4 fresh 1K", .coming = .fresh, .settled = 89_397_980_632, .phase_after = null },
+        .{ .name = "r5 unrelated", .coming = .fresh, .settled = 89_398_013_400, .phase_after = null },
+        .{ .name = "r6 fresh 16K", .coming = .fresh, .settled = 89_398_013_400, .phase_after = 89_618_181_568 },
+    };
+    for (steps) |s| {
+        const bound = switch (s.coming) {
+            .fresh => module.reverseBound(terms, scratch),
+            .continuation => |k| module.reverseBoundKept(terms, scratch, tc.wave(k.rows, k.positions)),
+            .unknown => unreachable,
+        };
+        std.debug.print("\nDSV41_REUSE_SEQUENCE {{\"step\": \"{s}\", \"reverse_bound\": {d}, \"settled\": {d}, \"reverse_margin\": {d}, \"phase_bound\": {d}, \"phase_after\": {?d}}}", .{ s.name, bound, s.settled, @as(i64, @intCast(bound)) - @as(i64, @intCast(s.settled)), forward, s.phase_after });
+        if (s.settled > 0) try testing.expect(s.settled <= bound);
+        if (s.phase_after) |p| try testing.expect(p <= forward);
+    }
+    // The 1.35 GB term reproduces pass3eg's refusal of the fresh prompt (-455,322,072 B, within the wired-table term).
+    var old = terms;
+    old.host_reserve = 1_350_000_000;
+    const old_fresh = module.reverseBound(old, scratch);
+    try testing.expect(old_fresh < steps[3].settled and steps[3].settled - old_fresh > 400_000_000 and steps[3].settled - old_fresh < 500_000_000);
 }
