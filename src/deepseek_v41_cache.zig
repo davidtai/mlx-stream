@@ -222,6 +222,58 @@ pub fn LayerState(comptime G: type) type {
             }
             self.offset = m.offset;
         }
+
+        /// The layer's state at a prompt's end, to continue a later prompt that starts with it (a conversation's next
+        /// turn): the window and frontier rings copied (`Window.snapshot`, a turn deeper than any ring's margin), the
+        /// stores' rows (append-only, so a truncate restores them).
+        pub const Boundary = struct {
+            offset: u32,
+            window: L.Window.Snap,
+            compress: u32,
+            index: u32,
+            frontier: ?struct { kv: L.Window.Snap, score: L.Window.Snap } = null,
+
+            pub fn deinit(self: *Boundary, g: *G) void {
+                self.window.deinit(g);
+                if (self.frontier) |*f| {
+                    f.kv.deinit(g);
+                    f.score.deinit(g);
+                }
+            }
+
+            /// The copies to evaluate before the state is written again (at most three).
+            pub fn arrays(self: *const Boundary, out: []T) usize {
+                var k: usize = 0;
+                if (self.window.array()) |x| {
+                    out[k] = x;
+                    k += 1;
+                }
+                if (self.frontier) |*f| for ([_]?T{ f.kv.array(), f.score.array() }) |a| if (a) |x| {
+                    out[k] = x;
+                    k += 1;
+                };
+                return k;
+            }
+        };
+
+        pub fn boundary(self: *const Self, g: *G) !Boundary {
+            var b: Boundary = .{ .offset = self.offset, .window = try self.window.snapshot(g), .compress = self.compress.rows(), .index = self.index.rows() };
+            errdefer b.deinit(g);
+            if (self.frontier) |*f| b.frontier = .{ .kv = try f.kv.snapshot(g), .score = try f.score.snapshot(g) };
+            return b;
+        }
+
+        /// Back to `b` (spent): every lane as it stood at the boundary, whatever was appended or compacted since.
+        pub fn restoreBoundary(self: *Self, g: *G, b: Boundary) !void {
+            try self.window.restore(g, b.window);
+            try self.compress.truncate(g, b.compress);
+            try self.index.truncate(g, b.index);
+            if (self.frontier) |*f| {
+                try f.kv.restore(g, b.frontier.?.kv);
+                try f.score.restore(g, b.frontier.?.score);
+            }
+            self.offset = b.offset;
+        }
     };
 }
 
@@ -362,6 +414,52 @@ fn expectWindow(g: *RowOps, st: *const RS, logical: u32) !void {
     const drop = st.window.dropOffset();
     try testing.expectEqual(logical - drop, @as(u32, @intCast(r.len)));
     for (r, 0..) |id, j| try testing.expectEqual(@as(i64, @intCast(drop + j)), id);
+}
+
+test "dsv41 cache: a prompt's boundary restores the ring whatever decode appended since; the next turn reads every row a cold prompt would" {
+    var g: RowOps = .{ .gpa = testing.allocator };
+    defer g.deinit();
+    const li: v41.LayerInfo = .{ .ratio = 0 };
+    for ([_]u32{ 0, 1 }) |cut| {
+        var st = RS.init(li, 128, .{ .route = .window_ring });
+        defer st.deinit(&g);
+        // Turn 1's prompt: 300 rows in chunks.
+        var pos: u32 = 0;
+        for ([_]u32{ 120, 120, 60 }) |n| {
+            try st.window.append(&g, try g.range(pos, pos + n));
+            st.advance(n);
+            pos += n;
+        }
+        var b = try st.boundary(&g);
+        var spent = false;
+        defer if (!spent) b.deinit(&g);
+        // Decode: 250 single rows, the ring compacting several times past the boundary's rows.
+        for (0..250) |_| {
+            try st.window.append(&g, try g.range(pos, pos + 1));
+            st.advance(1);
+            pos += 1;
+        }
+        // The next turn: back to the boundary (spent), `cut` ids short (a thinking turn re-renders the last prompt id),
+        // then 70 new rows: the ring holds exactly the rows a cold 300 - cut + 70 prompt holds.
+        try st.restoreBoundary(&g, b);
+        spent = true;
+        try testing.expectEqual(@as(u32, 300), st.offset);
+        if (cut > 0) try testing.expectEqual(cut, try st.trim(&g, cut));
+        const at = 300 - cut;
+        try st.window.append(&g, try g.range(at, at + 70));
+        st.advance(70);
+        try expectWindow(&g, &st, at + 70);
+        // Two turns on: a second boundary, decode, restore, extend.
+        const b2 = try st.boundary(&g);
+        for (0..40) |k| {
+            try st.window.append(&g, try g.range(at + 70 + @as(u32, @intCast(k)), at + 71 + @as(u32, @intCast(k))));
+            st.advance(1);
+        }
+        try st.restoreBoundary(&g, b2);
+        try st.window.append(&g, try g.range(at + 70, at + 90));
+        st.advance(20);
+        try expectWindow(&g, &st, at + 90);
+    }
 }
 
 test "dsv41 cache: the window ring keeps every reachable row across prefill chunks, decode, verify and trims" {

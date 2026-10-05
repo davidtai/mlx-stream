@@ -257,3 +257,35 @@ test "dsv41 memory mini: the plugin's bill hook is the floor bill's term-wise vi
     const nr = try bill.fill(a, io, cb, prompt, max_tokens, null, ceiling, target, ov);
     try testing.expectEqual(nr, arm_mod.NativeRows{ .prefill = rows.prompt, .decode = rows.decode });
 }
+
+test "dsv41 memory mini: the served bill keeps multi-turn's prompt boundary in the retained prompt state; a pinned prompt does not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tm = try miniBank(a);
+    defer tm.destroy();
+    var config = configOf(tm);
+    config.expert_rows = bill.min_fill_rows;
+    config.expert_prefill_rows = bill.min_fill_rows;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, io, tm.root, &vd);
+    const served = try bill.servedBill(a, io, &config, null, ceiling, ov);
+    var pov = ov;
+    pov.bill_pinned_prompt = bill.fill_prompt_tokens;
+    const pinned = try bill.servedBill(a, io, &config, null, ceiling, pov);
+    const covering = try bill.billCovering(a, io, &config, bill.servedContext(&config), bill.fill_max_tokens, null, ceiling, ov);
+    const pb = try bill.prefillBillAt(&config, ov, &c, 4);
+    const tb = bill.turnBoundaryCovering(pb, &c, bill.servedContext(&config));
+    // The boundary: the rings at their prompt-pass rows and the draft caches, every covered length.
+    try testing.expect(tb >= pb.ringPromptBytes(bill.fill_prompt_tokens) + pb.frontierPromptBytes(bill.fill_prompt_tokens));
+    try testing.expectEqual(tb, served.turn_boundary);
+    try testing.expectEqual(covering.prompt_state, served.prompt_state);
+    // Both phases carry it (their wiring tables count the retained arrays too).
+    try testing.expect(served.decodeTotal() >= covering.decodeTotal() + tb);
+    try testing.expect(served.prefillTotal() >= covering.prefillTotal() + tb);
+    // The pinned prompt (the timed cell) retains nothing: its bill is the prompt's alone.
+    const exact = try bill.billAt(a, io, &config, bill.fill_prompt_tokens, bill.fill_max_tokens, null, ceiling, ov);
+    try testing.expectEqual(exact.prompt_state, pinned.prompt_state);
+    try testing.expectEqual(@as(u64, 0), pinned.turn_boundary);
+    try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());
+}

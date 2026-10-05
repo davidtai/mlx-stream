@@ -99,6 +99,10 @@ pub const Bill = struct {
     /// stage's window a view of its whole-prompt main KV, 1.11 GB at 16K; v6b measured +1.30 GB persistent
     /// after the prompt). Decode phase only (inside the prompt wave's kept state during the pass).
     prompt_state: u64 = 0,
+    /// Multi-turn's kept boundary (`turnBoundaryCovering`: the rings copied at a prompt's end, the draft caches and main
+    /// row), billed in BOTH phases: taken after a prompt's last call, held through decode and between requests, spent or
+    /// dropped at the next prompt's start (the prompt phase bills it too, never relying on that order).
+    turn_boundary: u64 = 0,
     /// ENGRAM=prefetch's posted gathers (`engramPostedBytes`: one Engram slot's ids and records, host), prompt
     /// phase only; 0 when the route is off.
     engram_posted: u64 = 0,
@@ -120,7 +124,7 @@ pub const Bill = struct {
 
     /// The prompt phase's process terms (the prompt pass's peak: every term live at once).
     pub fn prefillTerms(b: Bill) PhaseTerms {
-        var t = withWireTables(.{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv + b.lane_copy, .mlx_cache = b.prefill_cache, .mlx_cache_overshoot = b.cache_overshoot_prompt, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted });
+        var t = withWireTables(.{ .slot_banks = b.slot_prefill, .lookahead_staging = b.lookahead_staging, .residents = if (b.embedding_host_rows) b.residents - b.embedding else b.residents, .engram = b.engram, .waves = b.prefill_wave, .kv = b.kv + b.lane_copy, .mlx_cache = b.prefill_cache, .mlx_cache_overshoot = b.cache_overshoot_prompt, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .unbilled_overhead = b.unbilled_overhead, .engram_posted = b.engram_posted, .prompt_state = b.turn_boundary });
         t.prompt_buffer_allowance = prompt_buffer_allowance_bytes;
         return t;
     }
@@ -128,7 +132,7 @@ pub const Bill = struct {
     /// The decode phase's process terms (the embedding off at the fence; the larger of the verify and draft waves:
     /// a round drafts, then verifies, so the two never hold their transients at once).
     pub fn decodeTerms(b: Bill) PhaseTerms {
-        var t = withWireTables(.{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = @max(b.decode_wave, b.draft_wave), .kv = b.kv_decode, .mlx_cache = b.decode_cache, .mlx_cache_overshoot = b.cache_overshoot_decode, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .prompt_state = b.prompt_state });
+        var t = withWireTables(.{ .slot_banks = b.slot_decode, .lookahead_staging = b.lookahead_staging, .residents = b.residents - b.embedding, .engram = b.engram, .waves = @max(b.decode_wave, b.draft_wave), .kv = b.kv_decode, .mlx_cache = b.decode_cache, .mlx_cache_overshoot = b.cache_overshoot_decode, .host_reserve = b.host_reserve, .wide_window = b.wide_window, .prompt_state = b.prompt_state + b.turn_boundary });
         t.decode_buffer_allowance = decode_buffer_allowance_bytes;
         return t;
     }
@@ -518,7 +522,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
 }
 
 /// JOINLESS (the served default): the routed group's joined input is the minimal copy's bound (`joinedBytes`).
-fn joinlessRoute(ov: module.RouteOverrides) bool {
+pub fn joinlessRoute(ov: module.RouteOverrides) bool {
     return ov.prefill_joinless orelse module.numericTier(.served).routes.prefill_joinless;
 }
 
@@ -868,7 +872,69 @@ pub fn subCallMax(pb: v41.PrefillBill, joinless: bool, max_context: u64) struct 
 /// timed cell) bills that prompt alone (`billAt`) and the Module refuses any other length by name.
 pub fn servedBill(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
     if (ov.bill_pinned_prompt) |p| return billAt(a, io, config, p, fill_max_tokens, wired_bytes, ceiling_bytes, ov);
-    return billCovering(a, io, config, servedContext(config), fill_max_tokens, wired_bytes, ceiling_bytes, ov);
+    return servedBillAt(a, io, config, fill_max_tokens, wired_bytes, ceiling_bytes, ov);
+}
+
+/// The served (unpinned) bill for requests of `max_tokens`: the covering bill at the context, plus multi-turn's two terms:
+/// the kept boundary (`turn_boundary`, both phases) and a reused turn's prompt calls (`reusedTurnWave`: its rows' own
+/// chunk rule over every position up to the context, which no cold prompt of any length makes).
+pub fn servedBillAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, ov: module.RouteOverrides) !Bill {
+    const ctx = servedContext(config);
+    var b = try billCovering(a, io, config, ctx, max_tokens, wired_bytes, ceiling_bytes, ov);
+    if (module.multiturnRoute(ov)) {
+        var vd: v41.Diag = .{};
+        const c = try v41.Config.load(a, io, config.expert_bank_dir orelse return error.Dsv41BankDir, &vd);
+        const tight = tightGroupStreams(model_taps_fenced, module.inputStreamEarlyRelease(ov));
+        const pb = try prefillBillAt(config, ov, &c, if (b.variant == .tight) tight else 4);
+        const lm = config.dsv41LayerMajor();
+        const joinless = joinlessRoute(ov);
+        b.turn_boundary = turnBoundaryCovering(pb, &c, ctx);
+        b.prefill_wave = @max(b.prefill_wave, reusedTurnWave(pb, lm, joinless, ctx));
+        b.prefill_wave_tight = @max(b.prefill_wave_tight, reusedTurnWave(pb.withGroupStreams(tight), lm, joinless, ctx));
+    }
+    return b;
+}
+
+/// The prefill bill `servedBillAt` bills the waves with (the bill's variant's group streams), for the multi-turn tests.
+pub fn servedPrefillBill(config: *const settings.Config, ov: module.RouteOverrides, c: *const v41.Config, variant: BillVariant) !v41.PrefillBill {
+    return prefillBillAt(config, ov, c, if (variant == .tight) tightGroupStreams(model_taps_fenced, module.inputStreamEarlyRelease(ov)) else 4);
+}
+
+/// A reused turn's prompt call of `rows` new rows over `positions` positions (`Module.continueTurn`: the continuation
+/// calls run at their own length's chunk rule, no span pin): the layer-major call's wave (or the chunk-major one's).
+pub fn turnCallWave(pb: v41.PrefillBill, layer_major: bool, joinless: bool, rows: u64, positions: u64) u64 {
+    const span = pb.chunkRows(rows);
+    if (!layer_major) return pb.waveBytes(span, positions, .served) / 4 * 5;
+    const w = pb.layerMajorCallBytes(rows, span, positions, .served);
+    return if (joinless) w else w + pb.wideLaneBytes(rows);
+}
+
+/// The widest wave of any reused turn up to `ctx`: every call width 1 .. min(ctx, the sub-chunk) (a longer suffix runs
+/// in sub-chunk pieces) over `ctx` positions (each term grows with the positions), exhaustive.
+pub fn reusedTurnWave(pb: v41.PrefillBill, layer_major: bool, joinless: bool, ctx: u64) u64 {
+    var w: u64 = 0;
+    var n: u64 = 1;
+    while (n <= @min(ctx, pb.prefill_sub)) : (n += 1) w = @max(w, turnCallWave(pb, layer_major, joinless, n, ctx));
+    return w;
+}
+
+/// Multi-turn's retained boundary for a prompt of `seq` (`Module.TurnBoundary`), by geometry: each layer's window ring
+/// and frontier rings copied at the prompt's end (one slot each, within the ring's prompt-pass rows: `ringPromptBytes`
+/// and `frontierPromptBytes` bound both slots) and the strategy's draft caches and main row kept (`seedRetainedBytes`).
+/// Live from the prompt's end through decode and between requests.
+pub fn turnBoundaryBytes(pb: v41.PrefillBill, c: *const v41.Config, seq: u64) u64 {
+    return pb.ringPromptBytes(seq) + pb.frontierPromptBytes(seq) + dsl.seedRetainedBytes(c, seq);
+}
+
+/// `turnBoundaryBytes` at its largest over every prompt up to `ctx` (the ring rows follow the chunk rule: the covered
+/// lengths and every sub-chunked length's widest call bound them).
+pub fn turnBoundaryCovering(pb: v41.PrefillBill, c: *const v41.Config, ctx: u64) u64 {
+    var worst: u64 = 0;
+    const cov = coveredPromptLengths(pb, @min(ctx, pb.prefill_sub));
+    for (cov.at[0..cov.n]) |x| worst = @max(worst, turnBoundaryBytes(pb, c, x));
+    worst = @max(worst, turnBoundaryBytes(pb, c, ctx));
+    if (ctx > pb.prefill_sub) worst = @max(worst, turnBoundaryBytes(pb, c, pb.prefill_sub + 1));
+    return worst;
 }
 
 /// `fill` over the served bill (`servedBill` at the floor rows).
@@ -888,7 +954,8 @@ pub fn fillCovering(a: std.mem.Allocator, io: std.Io, config: settings.Config, m
     var c = config;
     c.expert_rows = min_fill_rows;
     c.expert_prefill_rows = min_fill_rows;
-    const b0 = try billCovering(a, io, &c, config.max_context_tokens orelse fill_prompt_tokens, max_tokens, wired_bytes, ceiling_bytes, ov);
+    if (c.max_context_tokens == null) c.max_context_tokens = @intCast(fill_prompt_tokens);
+    const b0 = try servedBillAt(a, io, &c, max_tokens, wired_bytes, ceiling_bytes, ov);
     const mb = try memoryBill(a, b0);
     defer mb.free(a);
     const r = try sdk.fill(mb, b0.baseline, target, b0.n_experts, min_fill_rows);

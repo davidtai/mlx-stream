@@ -358,6 +358,31 @@ pub fn Lanes(comptime G: type) type {
                 };
                 self.len = 0;
             }
+
+            /// The ring as it stands, its current slot COPIED (a fresh buffer: later writes, donated or not, never reach
+            /// it) and the other slot left empty (a compaction allocates it): `restore` puts it back whole. The caller
+            /// evaluates the copy (`snapArray`) before the ring is written again.
+            pub fn snapshot(self: *const Ring, g: *G) !Ring {
+                var s = self.*;
+                s.bufs = .{ null, null };
+                s.caps = .{ 0, 0 };
+                if (self.bufs[self.cur]) |b| {
+                    s.bufs[self.cur] = g.keep(try write(g, try alloc(g, b, self.caps[self.cur]), b, 0));
+                    s.caps[self.cur] = self.caps[self.cur];
+                }
+                return s;
+            }
+
+            /// The snapshot's buffer (null: an empty ring).
+            pub fn snapArray(self: *const Ring) ?T {
+                return self.bufs[self.cur];
+            }
+
+            /// Back to `s` (a `snapshot` of this ring), taking its buffer: the snapshot is spent.
+            pub fn restore(self: *Ring, g: *G, s: Ring) void {
+                self.deinit(g);
+                self.* = s;
+            }
         };
 
         /// One store lane under its route.
@@ -450,6 +475,42 @@ pub fn Lanes(comptime G: type) type {
             pub fn deinit(self: *Window, g: *G) void {
                 switch (self.*) {
                     inline else => |*l| l.deinit(g),
+                }
+            }
+
+            /// A window's state to come back to: a store's rows (it only grows, so a truncate restores it), a ring's
+            /// `Ring.snapshot`.
+            pub const Snap = union(enum) {
+                store: u32,
+                ring: Ring,
+
+                pub fn array(self: *const Snap) ?T {
+                    return switch (self.*) {
+                        .store => null,
+                        .ring => |*r| r.snapArray(),
+                    };
+                }
+
+                pub fn deinit(self: *Snap, g: *G) void {
+                    switch (self.*) {
+                        .store => {},
+                        .ring => |*r| r.deinit(g),
+                    }
+                }
+            };
+
+            pub fn snapshot(self: *const Window, g: *G) !Snap {
+                return switch (self.*) {
+                    .store => |*l| .{ .store = l.rows() },
+                    .ring => |*r| .{ .ring = try r.snapshot(g) },
+                };
+            }
+
+            /// Back to `s` (spent): a store truncated to its rows, a ring restored whole.
+            pub fn restore(self: *Window, g: *G, s: Snap) !void {
+                switch (self.*) {
+                    .store => |*l| try l.truncate(g, s.store),
+                    .ring => |*r| r.restore(g, s.ring),
                 }
             }
         };
