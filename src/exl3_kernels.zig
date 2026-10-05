@@ -1151,17 +1151,6 @@ pub const HostPlane = struct {
 
 const testing = std.testing;
 
-extern fn _dyld_image_count() u32;
-extern fn _dyld_get_image_name(image_index: u32) ?[*:0]const u8;
-
-fn metalDriverLoaded() bool {
-    for (0.._dyld_image_count()) |i| {
-        const name = _dyld_get_image_name(@intCast(i)) orelse continue;
-        if (std.mem.indexOf(u8, std.mem.span(name), "AGXMetal") != null) return true;
-    }
-    return false;
-}
-
 fn initOrPrint(texts: *const Texts, pin: []const u8) !Registry {
     var diag: Diag = .{};
     return Registry.init(testing.allocator, texts, pin, &diag) catch |e| {
@@ -1662,7 +1651,7 @@ test "dsv41 kernels: the registry implements exactly the bank's codebook and K" 
 
 test "dsv41 kernels: no Metal device in this process" {
     if (std.c.getenv("DSV41_KERNELS_GPU") != null) return error.SkipZigTest;
-    try testing.expect(!metalDriverLoaded());
+    try @import("sdk").testing.expectNoDevice();
 }
 
 test "dsv41 kernels: the host decode reads each weight's 16-bit state bit by bit from its tile's circular stream, K 1 to 3" {

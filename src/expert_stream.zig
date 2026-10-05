@@ -318,19 +318,6 @@ pub const StreamSource = struct {
 
 const testing = std.testing;
 
-extern fn _dyld_image_count() u32;
-extern fn _dyld_get_image_name(image_index: u32) ?[*:0]const u8;
-
-/// Only creating a Metal device maps a GPU driver bundle (AGXMetal*), so its
-/// absence proves this process did no Metal work.
-fn metalDriverLoaded() bool {
-    for (0.._dyld_image_count()) |i| {
-        const name = _dyld_get_image_name(@intCast(i)) orelse continue;
-        if (std.mem.indexOf(u8, std.mem.span(name), "AGXMetal") != null) return true;
-    }
-    return false;
-}
-
 const FixSeg = struct { component: []const u8, offset: u64, length: u64, sha256: []const u8, head16: []const u8 };
 const FixRec = struct {
     layer: u32,
@@ -457,7 +444,7 @@ test "dsv41 slots: layer 13, 8 rows through the pool == pread == v2 sha == Pytho
     const calls = try checkSet("layer_set", &env.bank, set, &rows);
     try testing.expect(calls >= 2 * set.len);
     // With DSV41_PHASE0B_MLX the 0b tests run earlier in this process and made the Metal device.
-    if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try testing.expect(!metalDriverLoaded());
+    if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try sdk.testing.expectNoDevice();
 }
 
 test "dsv41 slots: cross-layer PICK set" {
@@ -469,7 +456,7 @@ test "dsv41 slots: cross-layer PICK set" {
     defer rows.deinit();
     _ = try checkSet("pick_set", &env.bank, set, &rows);
     // With DSV41_PHASE0B_MLX the 0b tests run earlier in this process and made the Metal device.
-    if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try testing.expect(!metalDriverLoaded());
+    if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try sdk.testing.expectNoDevice();
 }
 
 // Phase 0b, inside a guarded window (GPU lock held): DSV41_PHASE0B_MLX=1.
@@ -491,7 +478,7 @@ test "dsv41 slots 0b: an MLX LayerSlotBank on the CPU stream fills like the host
 
 test "dsv41 slots: no Metal device in this process" {
     if (std.c.getenv("DSV41_PHASE0B_MLX") != null) return error.SkipZigTest;
-    try testing.expect(!metalDriverLoaded());
+    try sdk.testing.expectNoDevice();
 }
 
 /// A 2-layer synthetic bank on disk (hidden 64, inter 32: 2,880-byte records
