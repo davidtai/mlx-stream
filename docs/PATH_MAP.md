@@ -9,7 +9,7 @@ Use it to port commits written against the in-tree layout (for example the cover
 |---|---|
 | `@import("mlx")` | `@import("sdk").mlx` |
 | `@import("log")` | `@import("sdk").log` |
-| `@import("io_util")` (no-cache helpers) | `@import("nocache_io.zig")` (`../nocache_io.zig` from src/sdk_ext/, `../../` from src/sdk_ext/expert/) |
+| `@import("io_util")` (no-cache helpers) | `@import("sdk").io_util` |
 | `@import("ngram")` | `@import("ngram_table.zig")` |
 | `@import("build_options")` | `@import("build_flags.zig")` |
 | `sdk.expert`, `sdk.kv`, `sdk.kernels`, `sdk.quant`, `sdk.profile`, `sdk.ops` | `sdk_ext.<same>` with `const sdk_ext = @import("sdk_ext.zig");` |
@@ -206,7 +206,7 @@ Use it to port commits written against the in-tree layout (for example the cover
 | src/sdk/weights.zig | host src/sdk/weights.zig |  |
 | tests/test_dsv41.sh | scripts/test_dsv41.sh |  |
 | src/ngram.zig | src/ngram_table.zig (copy; host keeps src/ngram.zig for qwen4_exp) |  |
-| src/io_util.zig (noCache, openNoCache, readAllNoCache, readAligned, RowGather, residentBytes) | src/nocache_io.zig (copy; host io_util keeps them) |  |
+| src/io_util.zig (noCache, openNoCache, readAllNoCache, readAligned, RowGather, residentBytes) | not copied: the host SDK exports io_util |  |
 | src/plugins.zig (the mlx-stream conformance tests) | src/conformance.zig | renamed "mlx-stream conformance: ..." |
 | src/sdk.zig (`expert`, `kernels`, `quant`, `profile`, `ops`, `kv`, `Quant`, `ExpertSource`) | src/sdk_ext.zig (`sdk_ext.expert`, ...) |  |
 | (new) | src/build_flags.zig | profile switches from `sdk.plugin_profile` |
@@ -223,7 +223,7 @@ Use it to port commits written against the in-tree layout (for example the cover
 | coverage/sdk cases `arch_binds_unprovided`, `arch_binds_another`; registry tests of quant routing and binds | dropped: the small SDK has no binds and no quant / expert-source tables |
 | fork `src/qwen4_exp.zig` "dsv41 ngram table: a BF16 tensor inside a checkpoint shard ..." | `src/ngram_table.zig` |
 | coverage/expert-io 74c81fff..fbc12206 (src/mlx_stream/expert_*_test.zig, expert_stream.zig, lib/expert_io/*, src/sdk/expert/*) | the same names under src/, csrc/, src/sdk_ext/expert/ (one commit per original commit; the decode-plan fix sits beside the keepwarm lever's line) |
-| coverage/expert-io `src/io_util.zig` no-cache tests | host src/io_util.zig and, renamed "nocache io: ...", src/nocache_io.zig |
+| coverage/expert-io `src/io_util.zig` no-cache tests | host src/io_util.zig |
 | coverage/expert-io `src/gpu_ceiling.zig`, `src/nocache_reader.zig` tests | host only |
 | coverage/plugin-core ad3d0f93..f1da4b90 (src/mlx_stream/*, src/fixtures/dsv41_*, src/mlx_stream/deepseek_v41_bill_receipts_test.zig) | src/*, src/fixtures/*, src/deepseek_v41_bill_receipts_test.zig |
 | coverage/plugin-core 9cca0993 (deepseek_v41_bill_mini_test.zig + bill / engram / module / deepseek_v41 hunks) | src/deepseek_v41_bill_mini_test.zig and the same names under src/ |

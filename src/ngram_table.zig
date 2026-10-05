@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const log = @import("sdk").log;
-const io_util = @import("nocache_io.zig");
+const io_util = @import("sdk").io_util;
 
 pub const NgramTable = struct {
     map: []align(std.heap.page_size_min) const u8,

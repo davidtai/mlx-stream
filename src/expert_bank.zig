@@ -5,7 +5,7 @@
 //! first-boot checks (bankv2, exl3_lane) are their oracle.
 
 const std = @import("std");
-const io_util = @import("nocache_io.zig");
+const io_util = @import("sdk").io_util;
 const expert_io = @import("sdk_ext.zig").expert.io;
 const mlx = @import("sdk").mlx;
 

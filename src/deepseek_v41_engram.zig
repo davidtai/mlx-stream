@@ -8,7 +8,7 @@
 const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
 const ngram = @import("ngram_table.zig");
-const io_util = @import("nocache_io.zig");
+const io_util = @import("sdk").io_util;
 
 pub const max_ngram = 8;
 pub const max_heads = 16;

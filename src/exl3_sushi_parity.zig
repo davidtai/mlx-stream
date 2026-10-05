@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const kernels = @import("exl3_kernels.zig");
-const nocache_io = @import("nocache_io.zig");
+const nocache_io = @import("sdk").io_util;
 
 const fixture_default = "lib/sushi/src/exl3/fixtures/exl3_k3_linear.safetensors";
 
