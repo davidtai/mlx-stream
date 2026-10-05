@@ -117,8 +117,14 @@ pub fn reservedTokens(_: sdk.RequestShape) u64 {
     return 0;
 }
 
+/// The prompt pass: from position 0, or after the positions `restorePrefix` kept (`req.prompt_tokens` counts them).
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
-    return m.prefill(ids, reservedTokens(req));
+    return m.prefillAt(req.prompt_tokens - ids.len, ids, reservedTokens(req), true);
+}
+
+/// Multi-turn over the host's prefix cache: the positions of the host's match the Module's kept boundary honours.
+pub fn restorePrefix(m: *Module, prefix: []const u32) u64 {
+    return m.restorePrefix(prefix);
 }
 
 pub fn step(m: *Module, ids: []const u32) !sdk.mlx.mlx_array {

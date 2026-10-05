@@ -1960,7 +1960,7 @@ fn cellModuleOverrides(ov: module.RouteOverrides, config: *const settings.Config
 /// The cell's bill: at the request's own length, or (a context sweep size, `max_context_tokens`) every length up to it,
 /// as the module bills it (`bill.billCovering`).
 fn cellBillAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, args: CellArgs, prompt_tokens: u64, max_tokens: u64, ov: module.RouteOverrides) !CellBill {
-    if (config.max_context_tokens) |m| return bill_mod.billCovering(a, io, config, m, max_tokens, args.wired, args.ceiling, ov);
+    if (config.max_context_tokens != null) return bill_mod.servedBillAt(a, io, config, max_tokens, args.wired, args.ceiling, ov);
     return bill_mod.billAt(a, io, config, prompt_tokens, max_tokens, args.wired, args.ceiling, ov);
 }
 
@@ -3053,7 +3053,7 @@ fn ctxRow(a: std.mem.Allocator, io: std.Io, base: settings.Config, prompt: u64, 
         config.expert_rows = bill_mod.min_fill_rows;
         config.expert_prefill_rows = bill_mod.min_fill_rows;
     }
-    const b = if (covering) try bill_mod.billCovering(a, io, &config, prompt, max_tokens, null, ceiling, ov) else try bill_mod.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov);
+    const b = if (covering) try bill_mod.servedBillAt(a, io, &config, max_tokens, null, ceiling, ov) else try bill_mod.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov);
     const pt = b.prefillTerms();
     const dterms = b.decodeTerms();
     return .{ .prompt = prompt, .positions = bill_mod.billedPositions(prompt, max_tokens), .wave = pt.waves, .kv_prompt = pt.kv, .kv_decode = dterms.kv, .overshoot_prompt = pt.mlx_cache_overshoot, .overshoot_decode = dterms.mlx_cache_overshoot, .prompt_state = dterms.prompt_state, .engram_posted = pt.engram_posted, .decode_wave = dterms.waves, .rows = rows, .prompt_total = b.prefillTotal(), .decode_total = b.decodeTotal() };
@@ -3111,6 +3111,57 @@ test "dsv41 bill: the default served bill covers every prompt up to 16,384; the 
     try testing.expectEqual(exact.prefillTotal(), pinned.prefillTotal());
     try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());
     std.debug.print("\nDSV41_DEFAULT_SERVED_BILL {{\"knee\": {d}, \"wave\": {d}, \"pinned_wave\": {d}}}\n", .{ knee, served.prefill_wave, pinned.prefill_wave });
+}
+
+// Bank (CPU): multi-turn under the host's guard (promptBytes 0): every prompt the guard now admits fits the Module's
+// admitted target in the prompt phase, the previous request's decode rows released (the reverse phase change, its settle
+// checked by name, runs at every prompt's start). At the served fill's rows for baselines 8.0 and 10.3, for the default
+// context and the sweep's 132,096: a reused turn's calls (suffix 1, 64, 1024, 4096, 16384 new tokens over a conversation
+// at the context limit) bill no more wave than the served bill, with the kept state's KV at the context; a cold prompt
+// after a kept boundary bills its own prompt plus the boundary (dropped before it allocates, billed anyway).
+test "dsv41 bill: multi-turn's reused and cold prompts fit the admitted target in the prompt phase (bank)" {
+    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ceiling: u64 = 120_259_084_288;
+    const target = ceiling - module.ceiling_stop_bytes;
+    var vd: v41.Diag = .{};
+    const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+    for ([_]?u32{ null, 132096 }) |ctx_size| for ([_]u64{ 8_000_000_000, 10_300_000_000 }) |baseline| {
+        var cf = try host_bridge.loadConfig(testing.io, a, bank_dir);
+        cf.memory_baseline_bytes = baseline;
+        cf.max_context_tokens = ctx_size;
+        const ctx = bill_mod.servedContext(&cf);
+        const rows = try bill_mod.servedFill(a, testing.io, cf, null, ceiling, target, .{});
+        cf.expert_rows = rows.decode;
+        cf.expert_prefill_rows = rows.prefill;
+        const at = try bill_mod.servedBill(a, testing.io, &cf, null, ceiling, .{});
+        try testing.expect(at.prefillTotal() <= target and at.decodeTotal() <= target);
+        try testing.expect(at.turn_boundary > 0);
+        const pb = try bill_mod.servedPrefillBill(&cf, .{}, &c, at.variant);
+        const wave = if (at.variant == .tight) at.prefill_wave_tight else at.prefill_wave;
+        const lm = cf.dsv41LayerMajor();
+        const joinless = bill_mod.joinlessRoute(.{});
+        // The kept state's lanes are bounded at the context (a reused turn extends them in place): its KV is billed.
+        const at_ctx = try bill_mod.billAt(a, testing.io, &cf, ctx, bill_mod.fill_max_tokens, null, ceiling, .{});
+        try testing.expect(at.kv >= at_ctx.kv);
+        // Reused turns: each call of the suffix (sub-chunk pieces past 16,384) over every position up to the context.
+        for ([_]u64{ 1, 64, 1024, 4096, 16384 }) |suffix| {
+            if (suffix > ctx) continue;
+            const w = bill_mod.turnCallWave(pb, lm, joinless, @min(suffix, pb.prefill_sub), ctx);
+            try testing.expect(w <= wave);
+            try testing.expect(at.prefillTotal() - wave + w <= target);
+        }
+        // Cold after a kept boundary: the prompt's own bill plus the boundary under the prompt phase's total.
+        for ([_]u64{ 1, 2047, 3953, 4096, 16384 }) |n| {
+            const x = try bill_mod.billAt(a, testing.io, &cf, n, bill_mod.fill_max_tokens, null, ceiling, .{});
+            try testing.expect(x.prefillTotal() + at.turn_boundary <= at.prefillTotal());
+        }
+        std.debug.print("\nDSV41_MT_BILL {{\"context\": {d}, \"baseline_gb\": {d:.1}, \"rows\": [{d}, {d}], \"wave_gb\": {d:.3}, \"reused_wave_gb\": {d:.3}, \"turn_boundary_mb\": {d:.1}, \"prompt_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}}}\n", .{
+            ctx, gbOf(baseline), rows.prefill, rows.decode, gbOf(wave), gbOf(bill_mod.reusedTurnWave(pb, lm, joinless, ctx)), @as(f64, @floatFromInt(at.turn_boundary)) / 1e6, gbOf(at.prefillTotal()), gbOf(at.decodeTotal()),
+        });
+    };
 }
 
 test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselines" {
@@ -3182,7 +3233,7 @@ test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselin
             var c2 = cn;
             c2.expert_rows = if (rows) |x| x.decode else bill_mod.min_fill_rows;
             c2.expert_prefill_rows = if (rows) |x| x.prefill else bill_mod.min_fill_rows;
-            const b = try bill_mod.billCovering(a, testing.io, &c2, n, 1024, null, ceiling, ov);
+            const b = try bill_mod.servedBillAt(a, testing.io, &c2, 1024, null, ceiling, ov);
             std.debug.print("DSV41_BILL_SUB {{\"baseline_gb\": {d:.2}, \"prompt\": {d}, \"route\": \"{s}\", \"wave_gb\": {d:.3}, \"overshoot_prompt_gb\": {d:.3}, \"kv_prompt_gb\": {d:.3}, \"engram_posted_gb\": {d:.3}, \"rows\": [{?d}, {?d}], \"prompt_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"fits\": {}}}\n", .{
                 gbOf(baseline), n, if (sub == sub_rows) "sub-chunk" else "one-call", gbOf(b.prefill_wave), gbOf(b.cache_overshoot_prompt), gbOf(b.kv), gbOf(b.engram_posted), if (rows) |x| x.prefill else null, if (rows) |x| x.decode else null, gbOf(b.prefillTotal()), gbOf(b.decodeTotal()), rows != null,
             });

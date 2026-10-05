@@ -39,6 +39,7 @@ const dh = @import("deepseek_v41_dspark_head.zig");
 const ngram = @import("ngram_table.zig");
 const dsp = @import("deepseek_v41_dspark_serve.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
+const ds = @import("deepseek_v41_dspark.zig");
 
 const log = std.log.scoped(.dsv41);
 
@@ -502,6 +503,12 @@ pub fn prefillSub(ov: RouteOverrides, layer_major: bool) u64 {
     return ov.prefill_sub orelse kvc.prefill_sub;
 }
 
+/// Multi-turn (`TurnBoundary`, `restorePrefix`) is installed on the served path; a harness that pins one prompt runs every
+/// request cold.
+pub fn multiturnRoute(ov: RouteOverrides) bool {
+    return ov.bill_pinned_prompt == null;
+}
+
 /// A0 (a)'s route the Module installs: the capture and the warm class together (off by default).
 /// DEVROUTE as the hook binds it (`devroute`): off unless set.
 pub fn devRoute(ov: RouteOverrides) bool {
@@ -544,6 +551,53 @@ const Dspark = struct {
     lp: dsl.Loop(G),
     caches: []H.Cache,
 };
+
+/// A conversation's last prompt, kept after its request (multi-turn): the prompt's ids, the request's state at the
+/// prompt's end (`Model.Boundary`: the rings copied, the stores' rows) and the strategy's draft caches and main row
+/// there (kept references: a decode replaces them, never writes them). The host's prefix cache decides what a later
+/// prompt reuses; `restorePrefix` honours it from here, and the prompt pass runs only what follows.
+const TurnBoundary = struct {
+    ids: []u32,
+    state: mdl.Model(G).Boundary,
+    caches: []H.Cache = &.{},
+    main_h: ?G.T = null,
+
+    fn deinit(self: *TurnBoundary, g: *G, gpa: std.mem.Allocator) void {
+        self.state.deinit(g, gpa);
+        for (self.caches) |*c| c.deinit(g);
+        gpa.free(self.caches);
+        if (self.main_h) |x| g.release(x);
+        gpa.free(self.ids);
+    }
+};
+
+/// What the Module honours of the host's prefix-cache match `prefix` (the positions the host would not run again): its one
+/// kept boundary (`TurnBoundary`, the last prompt's end) when the match reaches it, or one position short of it when the
+/// match stops there (a thinking turn re-renders the last prompt id; the same prompt again re-runs its last id): inside
+/// every ring's margin. The boundary's ids must be the prefix's there (the host's cache holds many conversations, the
+/// Module one state). Anything else: 0, the prompt runs cold.
+pub fn boundaryKeep(boundary_ids: []const u32, prefix: []const u32) u64 {
+    const p = boundary_ids.len;
+    const keep = if (prefix.len >= p) p else if (prefix.len + 1 == p) p - 1 else return 0;
+    if (keep == 0) return 0;
+    return if (std.mem.eql(u32, boundary_ids[0..keep], prefix[0..keep])) keep else 0;
+}
+
+test "dsv41 module: the host's prefix is honoured to the kept boundary or one position short of it, for the boundary's own ids only" {
+    const b = [_]u32{ 1, 2, 3, 4, 5 };
+    // The next turn: the host's match runs past the boundary (the answer's ids re-rendered alike); the boundary is kept.
+    try std.testing.expectEqual(@as(u64, 5), boundaryKeep(&b, &.{ 1, 2, 3, 4, 5, 6, 7 }));
+    try std.testing.expectEqual(@as(u64, 5), boundaryKeep(&b, &b));
+    // A thinking turn (<think> -> </think>) or the same prompt again (the host re-runs the last id): one short.
+    try std.testing.expectEqual(@as(u64, 4), boundaryKeep(&b, &.{ 1, 2, 3, 4 }));
+    // Deeper than the rings keep: none.
+    try std.testing.expectEqual(@as(u64, 0), boundaryKeep(&b, &.{ 1, 2, 3 }));
+    // Another conversation's entry in the host's cache (the Module holds this one): none.
+    try std.testing.expectEqual(@as(u64, 0), boundaryKeep(&b, &.{ 1, 2, 9, 4, 5, 6 }));
+    try std.testing.expectEqual(@as(u64, 0), boundaryKeep(&b, &.{ 7, 2, 3, 4 }));
+    try std.testing.expectEqual(@as(u64, 0), boundaryKeep(&.{}, &.{ 1, 2 }));
+    try std.testing.expectEqual(@as(u64, 0), boundaryKeep(&.{1}, &.{}));
+}
 
 /// One DSpark round's result (the shell's `DsparkRound` shape, as `deepseek_v4.DsparkRound`).
 pub const DsparkRound = struct {
@@ -602,6 +656,13 @@ pub const Module = struct {
     dspark_cfg: ?dsl.Config = null,
     /// The request's DSpark strategy, seeded by `prefill` when `dspark_cfg` is set.
     dspark: ?Dspark = null,
+    /// Multi-turn: the last prompt's boundary (`TurnBoundary`), kept after its request; null after a cold miss, an error
+    /// or on a pinned harness.
+    turn_boundary: ?TurnBoundary = null,
+    /// Multi-turn is installed (the served path; off when the harness pins one prompt, `bill_pinned_prompt`).
+    multiturn: bool = false,
+    /// The positions `restorePrefix` kept for the next prompt pass (0: none); that pass takes it (`prefillAt`).
+    resume_at: u64 = 0,
     /// The prompt fence ran: the embedding reads its host rows from then on (per process).
     fenced: bool = false,
     /// The native bill at the admitted rows (set by the construction check; the harnesses' phase records read it).
@@ -871,6 +932,7 @@ pub const Module = struct {
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
         self.installed.prefill_input_release = self.model.tier.routes.prefill_input_release;
         self.prefill_sub = prefillSub(ov, self.model.tier.layer_major);
+        self.multiturn = multiturnRoute(ov);
         self.installed.prefill_sub = self.prefill_sub;
         self.installed.prefill_shared_mid = self.model.tier.routes.prefill_shared_mid;
         self.installed.prefill_hcpost = self.model.tier.routes.prefill_hcpost;
@@ -1223,6 +1285,7 @@ pub const Module = struct {
     pub fn deinit(self: *Module) void {
         self.recordDecodeEnd();
         const gpa = self.gpa;
+        self.dropTurnBoundary();
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);
         self.head.deinit(&self.g);
@@ -1323,15 +1386,37 @@ pub const Module = struct {
     /// its generation budget + a chunk); 0 (none declared) bounds it at the prompt plus the shell's
     /// generation headroom. A forward past the bound is refused by name (BoundedLaneFull).
     pub fn prefill(self: *Module, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
-        return self.prefillPart(ids, reserved_tokens, true);
+        return self.prefillAt(0, ids, reserved_tokens, true);
     }
 
     /// `prefill` over a prompt's first part; `final` false when `prefillContinue` follows (a split prompt). The served shell
     /// always sends the whole prompt here (`Transformer.forwardDsv41WithImpl`: step 0 is `prefill`, every later forward
     /// `extend`, refused before the handover), so only a harness passes false.
     pub fn prefillPart(self: *Module, ids: []const u32, reserved_tokens: u64, final: bool) !mlx.mlx_array {
+        return self.prefillAt(0, ids, reserved_tokens, final);
+    }
+
+    /// Multi-turn (the host's prefix cache, `sdk.Arch.restore_prefix`): the host matched `prefix` against its cache and
+    /// would not run it again. The Module keeps what its one boundary honours (`boundaryKeep`: the boundary, or one
+    /// position short of it; 0 otherwise) and returns it; the host runs the rest through `prefillAt`. Nothing of the state
+    /// moves here: that pass ends the previous request first (the reverse phase change) with the boundary still held.
+    pub fn restorePrefix(self: *Module, prefix: []const u32) u64 {
+        self.resume_at = 0;
+        if (self.state == null) return 0;
+        const b = &(self.turn_boundary orelse return 0);
+        self.resume_at = boundaryKeep(b.ids, prefix);
+        return self.resume_at;
+    }
+
+    /// The prompt pass of a request whose first `start` positions the host skipped (kept by `restorePrefix` just before;
+    /// 0: a fresh request): `ids` are the positions after them. A continuation from any other position is refused by
+    /// name (`PrefixNotRestored`), never run cold.
+    pub fn prefillAt(self: *Module, start: u64, ids: []const u32, reserved_tokens: u64, final: bool) !mlx.mlx_array {
+        const kept = self.resume_at;
+        self.resume_at = 0;
+        if (start > 0 and start != kept) return error.PrefixNotRestored;
         // The request against the context the construction billed, once, before anything of it runs.
-        try checkContext(ids.len, self.max_context, self.overrides.bill_pinned_prompt);
+        try checkContext(start + ids.len, self.max_context, self.overrides.bill_pinned_prompt);
         // The previous request's decode end (served path), before this request touches anything.
         self.recordDecodeEnd();
         // The previous request's end, when the shell did not run it (an errored request): its routes settled and, if it
@@ -1344,16 +1429,108 @@ pub const Module = struct {
         switch (self.arm) {
             inline else => |t| t.arm.stream.resetPromptCounts(),
         }
+        self.prompt_stats0 = self.streamStats();
+        self.prompt_tokens = ids.len;
+        // Multi-turn: the whole prompt's ids (the boundary's kept ones, then these) for the next boundary.
+        const full: []const u32 = if (start > 0) try std.mem.concat(self.gpa, u32, &.{ self.turn_boundary.?.ids[0..start], ids }) else ids;
+        defer if (start > 0) self.gpa.free(full);
+        // A continuation restores the boundary and runs only `ids`; a fresh request drops it and runs cold.
+        const logits = if (start > 0) try self.continueTurn(full, start, final) else blk: {
+            self.dropTurnBoundary();
+            self.dropDspark();
+            if (self.state) |*st| st.deinit(&self.g, self.gpa);
+            self.state = null;
+            // Multi-turn lanes are bounded at the billed context (the covering bill's KV), so a later turn extends in place.
+            const bound_len: u64 = if (self.multiturn) @max(ids.len, self.max_context) else ids.len;
+            self.state = try self.model.newStateWith(self.model.boundedKv(maxPositions(@intCast(bound_len), reserved_tokens)));
+            // A prompt up to the sub-chunk: one call (the standard cell's path); a longer one: sub-chunk calls.
+            break :blk if (ids.len <= self.prefill_sub) try self.promptCall(ids, final) else try self.prefillSubCalls(ids, final);
+        };
+        if (self.multiturn and final) try self.takeTurnBoundary(full);
+        self.gate.completePrefill(self.dspark != null);
+        return logits;
+    }
+
+    /// Continue the last prompt's state with `ids[keep..]` (`ids` the whole prompt): the boundary restored (spent),
+    /// trimmed to `keep` (at most one id: inside every ring's margin), the strategy rebuilt over its draft caches there
+    /// (the split prompt's seed: the lookup over the kept ids, the windows appended per row), then the rest through the
+    /// continuation path.
+    fn continueTurn(self: *Module, ids: []const u32, keep: u64, final: bool) !mlx.mlx_array {
+        var b = self.turn_boundary.?;
+        self.turn_boundary = null;
+        defer b.deinit(&self.g, self.gpa);
+        const st = &self.state.?;
+        const p = b.ids.len;
+        self.model.restoreBoundary(&self.g, self.gpa, st, &b.state) catch |e| {
+            self.dropState();
+            return e;
+        };
+        if (keep < p) try self.model.trim(&self.g, st, @intCast(p - keep));
+        self.dropDspark();
+        if (self.dspark_cfg) |cfg| {
+            const caches = b.caches;
+            b.caches = &.{};
+            errdefer {
+                for (caches) |*c| c.deinit(&self.g);
+                self.gpa.free(caches);
+            }
+            const cut: u32 = @intCast(p - keep);
+            if (cut > 0) for (caches) |*c| if (c.window) |w| {
+                const sh = self.g.shapeOf(w);
+                const rows: c_int = sh.d[1] - @as(c_int, @intCast(cut));
+                c.window = self.g.keep(try self.g.slice(w, &.{ 0, 0, 0 }, &.{ sh.d[0], rows, sh.d[2] }, &.{ 1, 1, 1 }));
+                self.g.release(w);
+                c.offset -= cut;
+            };
+            self.dspark = .{ .lp = dsl.Loop(G).init(&self.g, self.model, self.head, st, caches, cfg), .caches = caches };
+            const lp = &self.dspark.?.lp;
+            lp.main_h = b.main_h;
+            b.main_h = null;
+            if (cfg.lookup) |l| lp.lookup = try ds.Lookup.init(self.gpa, ids[0..keep], l.minimum_context, l.extra_tokens, st.max_len orelse 0);
+            lp.lookup_has_primary = false;
+        }
+        const rest = ids[keep..];
+        if (rest.len <= self.prefill_sub) return self.continueCall(rest, final);
+        var at: usize = 0;
+        var logits: ?mlx.mlx_array = null;
+        while (at < rest.len) {
+            const end = @min(rest.len, at + self.prefill_sub);
+            if (logits) |x| _ = mlx.mlx_array_free(x);
+            if (at > 0) self.g.clearCache();
+            logits = try self.continueCall(rest[at..end], final and end == rest.len);
+            at = end;
+        }
+        return logits.?;
+    }
+
+    /// The prompt's boundary (multi-turn), after its last call: the state's copies, the strategy's draft caches and
+    /// main row kept, the ids.
+    fn takeTurnBoundary(self: *Module, ids: []const u32) !void {
+        self.dropTurnBoundary();
+        const st = &(self.state orelse return);
+        var sb = try self.model.boundary(&self.g, self.gpa, st);
+        errdefer sb.deinit(&self.g, self.gpa);
+        const own = try self.gpa.dupe(u32, ids);
+        errdefer self.gpa.free(own);
+        var tb: TurnBoundary = .{ .ids = own, .state = sb };
+        if (self.dspark) |*d| {
+            tb.caches = try self.gpa.alloc(H.Cache, d.caches.len);
+            for (tb.caches, d.caches) |*o, c| o.* = .{ .window = if (c.window) |w| self.g.keep(w) else null, .offset = c.offset };
+            if (d.lp.main_h) |x| tb.main_h = self.g.keep(x);
+        }
+        self.turn_boundary = tb;
+    }
+
+    fn dropTurnBoundary(self: *Module) void {
+        if (self.turn_boundary) |*b| b.deinit(&self.g, self.gpa);
+        self.turn_boundary = null;
+    }
+
+    fn dropState(self: *Module) void {
+        self.dropTurnBoundary();
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, self.gpa);
         self.state = null;
-        self.state = try self.model.newStateWith(self.model.boundedKv(maxPositions(ids.len, reserved_tokens)));
-        self.prompt_stats0 = self.streamStats();
-        self.prompt_tokens = ids.len;
-        // A prompt up to the sub-chunk: one call (the standard cell's path); a longer one: sub-chunk calls.
-        const logits = if (ids.len <= self.prefill_sub) try self.promptCall(ids, final) else try self.prefillSubCalls(ids, final);
-        self.gate.completePrefill(self.dspark != null);
-        return logits;
     }
 
     /// One prompt call from the request's fresh state: the strategy's seeded pass, else the trunk's.
@@ -1682,8 +1859,11 @@ pub const Module = struct {
         pub fn free(x: *ReverseLive) !u64 {
             const m = x.m;
             m.dropDspark();
-            if (m.state) |*st| st.deinit(&m.g, m.gpa);
-            m.state = null;
+            // Multi-turn: the state stays for the next turn (its boundary kept); otherwise freed.
+            if (m.turn_boundary == null) {
+                if (m.state) |*st| st.deinit(&m.g, m.gpa);
+                m.state = null;
+            }
             const freed = if (m.grown()) switch (m.arm) {
                 inline else => |t| try t.arm.shrink(),
             } else 0;
@@ -1705,7 +1885,8 @@ pub const Module = struct {
             const scratch = if (x.scratch_absent) switch (m.arm) {
                 inline else => |t| t.arm.stream.promptTransientBytes(),
             } else 0;
-            const bound = reverseBound(m.bill.prefillTerms(), scratch);
+            // Multi-turn: the kept state's KV stays (the kept boundary is in the prompt terms' retained state already).
+            const bound = reverseBound(m.bill.prefillTerms(), scratch) + if (m.turn_boundary != null) m.bill.prefillTerms().kv else 0;
             const st = settleReadings(LiveReader{ .io = m.io }, x.before, freed, m.installed.phase_change_poll_ms, bound);
             m.reverse_change = .{ .vm_after = VmMark.now(), .before = x.before, .after = st.after, .freed_bytes = x.before.cache + freed, .settle_ms = st.waited_ms, .bound_bytes = bound, .margin_bytes = @as(i64, @intCast(bound)) - @as(i64, @intCast(st.after.footprint)), .ms = 0 };
             try checkSettled(x.before, st.after, freed, bound);
@@ -2341,6 +2522,28 @@ pub fn checkContext(prompt_tokens: usize, max_context: u64, pinned: ?u64) error{
     if (prompt_tokens <= max_context) return;
     log.warn("NATIVE request refused: a {d}-token prompt is over the billed context of {d} tokens (ContextOverBill); construct with max_context_tokens >= the prompt", .{ prompt_tokens, max_context });
     return error.ContextOverBill;
+}
+
+test "dsv41 module: restorePrefix keeps what the boundary honours for the next prompt pass only; a continuation from anywhere else is refused by name" {
+    // Only the fields the two entries read before anything runs (no device, no bank).
+    var m: Module = undefined;
+    m.resume_at = 0;
+    m.state = null;
+    m.turn_boundary = null;
+    var ids = [_]u32{ 1, 2, 3, 4 };
+    // No state kept: nothing honoured, and a continuation is refused before its pass.
+    try std.testing.expectEqual(@as(u64, 0), m.restorePrefix(&ids));
+    try std.testing.expectError(error.PrefixNotRestored, m.prefillAt(2, ids[2..], 0, true));
+    m.state = @as(@typeInfo(@TypeOf(m.state)).optional.child, undefined);
+    m.turn_boundary = .{ .ids = &ids, .state = undefined };
+    // The host's match past the boundary: the boundary; that pass's start only, and once.
+    try std.testing.expectEqual(@as(u64, 4), m.restorePrefix(&.{ 1, 2, 3, 4, 5, 6 }));
+    try std.testing.expectError(error.PrefixNotRestored, m.prefillAt(3, &.{ 4, 5 }, 0, true));
+    try std.testing.expectError(error.PrefixNotRestored, m.prefillAt(4, &.{ 5, 6 }, 0, true));
+    // One short (a thinking turn), then another conversation's match: the later answer stands.
+    try std.testing.expectEqual(@as(u64, 3), m.restorePrefix(&.{ 1, 2, 3 }));
+    try std.testing.expectEqual(@as(u64, 0), m.restorePrefix(&.{ 1, 9, 3, 4, 5 }));
+    try std.testing.expectError(error.PrefixNotRestored, m.prefillAt(3, &.{ 4, 5 }, 0, true));
 }
 
 test "dsv41 module: a prompt over the billed context is refused before its pass, by name" {

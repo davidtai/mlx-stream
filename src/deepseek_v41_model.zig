@@ -1086,6 +1086,53 @@ pub fn Model(comptime G: type) type {
             return .{ .offset = st.offset, .layers = ms };
         }
 
+        /// The request's state at a prompt's end (`Cache.Boundary` per layer, the n-gram history's length), to continue
+        /// a later prompt that starts with this one. Its copies are evaluated here (no later write reaches them).
+        pub const Boundary = struct {
+            offset: u32,
+            layers: []Cache.Boundary,
+            hash_len: usize,
+
+            pub fn deinit(self: *Boundary, g: *G, a: std.mem.Allocator) void {
+                for (self.layers) |*l| l.deinit(g);
+                a.free(self.layers);
+                self.layers = &.{};
+            }
+        };
+
+        pub fn boundary(self: *const Self, g: *G, a: std.mem.Allocator, st: *const State) !Boundary {
+            _ = self;
+            const ls = try a.alloc(Cache.Boundary, st.layers.len);
+            var n: usize = 0;
+            errdefer {
+                for (ls[0..n]) |*l| l.deinit(g);
+                a.free(ls);
+            }
+            for (st.layers) |*lc| {
+                ls[n] = try lc.boundary(g);
+                n += 1;
+            }
+            var arrs: std.ArrayList(T) = .empty;
+            defer arrs.deinit(a);
+            for (ls) |*l| {
+                var buf: [3]T = undefined;
+                try arrs.appendSlice(a, buf[0..l.arrays(&buf)]);
+            }
+            if (arrs.items.len > 0) try g.evalAll(arrs.items);
+            return .{ .offset = st.offset, .layers = ls, .hash_len = if (st.hash) |h| h.hist.items.len else 0 };
+        }
+
+        /// Back to `b` (spent, its layers freed): every lane and the n-gram history as at the boundary.
+        pub fn restoreBoundary(self: *const Self, g: *G, a: std.mem.Allocator, st: *State, b: *Boundary) !void {
+            _ = self;
+            if (b.offset > st.offset or b.layers.len != st.layers.len) return error.BoundaryAhead;
+            for (st.layers, b.layers) |*lc, lb| try lc.restoreBoundary(g, lb);
+            a.free(b.layers);
+            b.layers = &.{};
+            if (st.hash) |*h| h.trim(@intCast(h.hist.items.len - b.hash_len));
+            st.offset = b.offset;
+        }
+
         pub fn rollback(self: *const Self, g: *G, st: *State, m: Mark) !void {
             _ = self;
             if (m.offset > st.offset) return error.TrimTooDeep;
@@ -1587,6 +1634,51 @@ test "dsv41 model: a prompt's sub-chunk calls run the one-call pass's spans over
     const seq = try g.opsSince(a, mk);
     defer a.free(seq);
     try testing.expectEqual(m.c.n_layers * 4, std.mem.count(ops.Op, seq, &.{.tape_begin}));
+}
+
+test "dsv41 model: a conversation's next turn from the last prompt's boundary has the state of a cold prompt of the whole conversation (two and three turns)" {
+    const a = testing.allocator;
+    const m = try Mini.init();
+    defer m.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
+    const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
+    const model_ = try TM.init(a, &g, m.c, tier, &lookup, &m.src);
+    defer model_.deinit(&g);
+    var conv: [96]u32 = undefined;
+    for (&conv, 0..) |*d, i| d.* = @intCast((i * 7 + 3) % 64);
+    // Turn prompts end at 24, 52 and 90; each turn decodes 6 ids that the next prompt does not keep (`cut` 1: the
+    // thinking turn's last prompt id re-rendered), then the next prompt continues from the boundary.
+    for ([_]u32{ 0, 1 }) |cut| {
+        var st = try model_.newStateWith(model_.boundedKv(200));
+        defer st.deinit(&g, a);
+        const ends = [_]u32{ 24, 52, 90 };
+        _ = try model_.forward(&g, &st, conv[0..ends[0]], .{ .logits = .last }, TraceRouted{}, graph.NoProbe{});
+        var prev = ends[0];
+        for (ends[1..]) |e| {
+            var b = try model_.boundary(&g, a, &st);
+            defer b.deinit(&g, a);
+            var junk: [6]u32 = .{ 60, 61, 62, 63, 1, 2 };
+            for (&junk) |*j| _ = try model_.forward(&g, &st, j[0..1], .{ .logits = .last }, TraceRouted{}, graph.NoProbe{});
+            try model_.restoreBoundary(&g, a, &st, &b);
+            try testing.expectEqual(prev, st.offset);
+            if (cut > 0) try model_.trim(&g, &st, cut);
+            _ = try model_.forward(&g, &st, conv[prev - cut .. e], .{ .logits = .last }, TraceRouted{}, graph.NoProbe{});
+            // The same state as a cold prompt of the whole conversation so far.
+            var cold = try model_.newStateWith(model_.boundedKv(200));
+            defer cold.deinit(&g, a);
+            _ = try model_.forward(&g, &cold, conv[0..e], .{ .logits = .last }, TraceRouted{}, graph.NoProbe{});
+            try testing.expectEqual(cold.offset, st.offset);
+            for (cold.layers, st.layers) |*x, *y| {
+                try testing.expectEqual(x.window.rows(), y.window.rows());
+                try testing.expectEqual(x.compress.rows(), y.compress.rows());
+                try testing.expectEqual(x.index.rows(), y.index.rows());
+            }
+            try testing.expectEqualSlices(i64, cold.hash.?.hist.items, st.hash.?.hist.items);
+            prev = e;
+        }
+    }
 }
 
 /// Records each stage a pass publishes and the chunk the profile charges it to (PrefillProbe's attribution).
