@@ -153,18 +153,18 @@ test "dsv41 memory mini: the fill and its admission agree; one more row in eithe
     const b = try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov);
     try testing.expectEqual(nr.prefill, b.prefill_rows);
     try testing.expectEqual(nr.decode, b.decode_rows);
-    try bill.admitPhases(b, target);
+    try bill.admitOf(b, target);
     const mb = try bill.memoryBill(testing.allocator, b);
     defer mb.free(testing.allocator);
     try sdk.admit(mb, b.baseline, .{ .prompt = nr.prefill, .decode = nr.decode }, target);
     if (nr.decode < n_experts) {
         config.expert_rows = nr.decode + 1;
-        try testing.expectError(error.DecodeOverTarget, bill.admitPhases(try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov), target));
+        try testing.expectError(error.DecodeOverTarget, bill.admitOf(try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov), target));
         config.expert_rows = nr.decode;
     }
     if (nr.prefill < nr.decode) {
         config.expert_prefill_rows = nr.prefill + 1;
-        try testing.expectError(error.PromptOverTarget, bill.admitPhases(try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov), target));
+        try testing.expectError(error.PromptOverTarget, bill.admitOf(try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov), target));
     }
     // A box with room for every expert: the fill takes the layer's 32 in both phases; one under the floor refuses.
     try testing.expectEqual(arm_mod.NativeRows{ .prefill = n_experts, .decode = n_experts }, try bill.fill(a, io, configOf(tm), prompt, max_tokens, null, ceiling, ceiling, ov));

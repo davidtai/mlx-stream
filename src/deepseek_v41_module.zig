@@ -1854,8 +1854,6 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
 
 /// The fill's shape and target (the bill module's), re-exported for the module's callers.
 pub const FillBill = bill_mod.FillBill;
-pub const fillRows = bill_mod.fillRows;
-pub const admitPhases = bill_mod.admitPhases;
 pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
 
 /// A request's prompt against the billed context (`Module.max_context`): longer is refused by name, once, before its pass.
@@ -1943,7 +1941,7 @@ fn claimBank(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, diag: *arm_mod
 }
 
 fn refused(err: anyerror, diag: *const arm_mod.Diag) anyerror {
-    log.err("refused: {s} {s}", .{ @errorName(err), diag.message() });
+    log.err("refused: {s} {s}\n", .{ @errorName(err), diag.message() });
     return err;
 }
 

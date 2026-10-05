@@ -642,7 +642,7 @@ fn engramPostedRoute(config: *const settings.Config, ov: module.RouteOverrides, 
 }
 
 /// The fill for `config`'s routes: the bill at the floor rows (both phases' rows-free totals by
-/// construction; no admission of another kind), then `fillRows` up to `target` (the caller's box: the served
+/// construction; no admission of another kind), then `sdk.fill` up to `target` (the caller's box: the served
 /// Module's is the GPU ceiling less upstream's wired margin, a harness's the guard's ceiling less its stop).
 /// `wired_bytes` as `billAt`.
 pub fn fill(a: std.mem.Allocator, io: std.Io, config: settings.Config, prompt_tokens: u64, max_tokens: u64, wired_bytes: ?u64, ceiling_bytes: u64, target: u64, ov: module.RouteOverrides) !arm_mod.NativeRows {
@@ -776,27 +776,6 @@ pub const FillBill = struct {
     }
 };
 
-/// The native admission's fill: the most decode rows and the most prompt rows (prompt <= decode <= the
-/// layer's experts) whose phase totals each stay under `target` (the caller's box: the ceiling less its margin). The slot banks
-/// hold the prompt rows through the prompt pass and grow to the decode rows at the phase change, which
-/// grows only after the prompt's frees are proven complete (`Module.phaseChange`), so the process bound is
-/// max(prompt total, decode total) with no transition term. Refused by name under `min_fill_rows`.
-pub fn fillRows(b: FillBill, target: u64, n_experts: u32) error{NativeBillDoesNotFit}!arm_mod.NativeRows {
-    const most = struct {
-        // The linear rows (the wiring terms left out) bound it from above; step down while the exact total is over.
-        fn f(fb: FillBill, decode: bool, t: u64) u64 {
-            const fixed = if (decode) fb.decode_fixed else fb.prefill_fixed;
-            var r = if (fixed >= t) 0 else (t - fixed) / fb.per_row;
-            while (r > 0 and fb.total(decode, r) > t) r -= 1;
-            return r;
-        }
-    }.f;
-    const decode = @min(most(b, true, target), n_experts);
-    const prefill = @min(most(b, false, target), decode);
-    if (prefill < min_fill_rows) return error.NativeBillDoesNotFit;
-    return .{ .prefill = @intCast(prefill), .decode = @intCast(decode) };
-}
-
 /// The request the served admission's fill bills: the standard 16K cell's prompt and token cap (a longer
 /// request is admitted, or refused by name, by the server's per-request prefill bill at its time).
 pub const fill_prompt_tokens: u64 = 16384;
@@ -919,17 +898,25 @@ pub fn servedContext(config: *const settings.Config) u64 {
 pub const min_fill_rows = 16;
 
 
-/// Both phases' billed totals within the fill's target (the fill guarantees it; forced rows are checked
-/// here), once, before construction: the grow at the phase change is then admitted by construction.
-pub fn admitPhases(b: Bill, target: u64) error{ PromptOverTarget, DecodeOverTarget }!void {
-    if (b.prefillTotal() > target) return error.PromptOverTarget;
-    if (b.decodeTotal() > target) return error.DecodeOverTarget;
-}
-
-
 // ── Tests ──
 
 const testing = std.testing;
+
+/// The SDK's fill (`sdk.fill`) over a fill-shaped bill, for the tests: its fixed totals as one term, its wiring as the
+/// row-following terms (`wiringAt`).
+pub fn fillOf(fb: FillBill, target: u64, n_experts: u32) error{ NoSlotRows, NativeBillDoesNotFit }!arm_mod.NativeRows {
+    const terms = [_]sdk.MemoryBill.Term{.{ .name = "fixed", .bytes = .{ fb.prefill_fixed, fb.decode_fixed }, .at_construction = false }};
+    const wiring: ?sdk.MemoryBill.RowTerms = if (fb.wiring) |w| .{ .data = .{ w.prefill_wired, w.decode_wired, fb.per_row, 0 }, .at = wiringAt } else null;
+    const r = try sdk.fill(.{ .terms = &terms, .per_row = fb.per_row, .row_terms = wiring }, 0, target, n_experts, min_fill_rows);
+    return .{ .prefill = r.prompt, .decode = r.decode };
+}
+
+/// The SDK's admission (`sdk.admit`) of `b` at its own rows, for the tests.
+pub fn admitOf(b: Bill, target: u64) !void {
+    const mb = try memoryBill(testing.allocator, b);
+    defer mb.free(testing.allocator);
+    return sdk.admit(mb, b.baseline, .{ .prompt = b.prefill_rows, .decode = b.decode_rows }, target);
+}
 
 test "dsv41 memory: the host side bills 1.35 GB in the prompt and decode phases, 0.90 GB at construction" {
     try testing.expectEqual(@as(u64, 1_350_000_000), measured_host_side_bytes);
@@ -1040,12 +1027,13 @@ fn expectSdkView(b: Bill, target: u64) !void {
     try testing.expectEqual(b.slot_prefill, (@as(u64, b.layers) * b.prefill_rows + b.transient_rows) * rec);
     try testing.expectEqual(b.slot_decode, (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows) * rec);
     const got = sdk.fill(mb, b.baseline, target, b.n_experts, min_fill_rows);
-    if (fillRows(fillBillOf(b), target, b.n_experts)) |want| {
+    if (fillOf(fillBillOf(b), target, b.n_experts)) |want| {
         const g = try got;
         try testing.expectEqual(want, arm_mod.NativeRows{ .prefill = g.prompt, .decode = g.decode });
     } else |e| try testing.expectError(e, got);
     const rows: sdk.Rows = .{ .prompt = b.prefill_rows, .decode = b.decode_rows };
-    if (admitPhases(b, target)) |_| try sdk.admit(mb, b.baseline, rows, target) else |e| try testing.expectError(e, sdk.admit(mb, b.baseline, rows, target));
+    const over: ?anyerror = if (b.prefillTotal() > target) error.PromptOverTarget else if (b.decodeTotal() > target) error.DecodeOverTarget else null;
+    if (over) |e| try testing.expectError(e, sdk.admit(mb, b.baseline, rows, target)) else try sdk.admit(mb, b.baseline, rows, target);
     try testing.expectEqual(b.constructionTerms().sum(), mb.constructionBytes(b.prefill_rows));
     try testing.expectEqual(b.processBound(), mb.processBound(rows));
 }
@@ -1112,8 +1100,8 @@ test "dsv41 memory: with the embedding on its host rows no phase bills the devic
             return .{ .prefill_fixed = b.prefillTotal() - b.baseline + base - @as(u64, b.prefill_rows) * pr, .decode_fixed = b.decodeTotal() - b.baseline + base - @as(u64, b.decode_rows) * pr, .per_row = pr };
         }
     }.f;
-    const r_dev = try fillRows(at(dev, 9_200_000_000, per_row), 120_259_084_288 - module.ceiling_stop_bytes, 384);
-    const r_host = try fillRows(at(host, 9_200_000_000, per_row), 120_259_084_288 - module.ceiling_stop_bytes, 384);
+    const r_dev = try fillOf(at(dev, 9_200_000_000, per_row), 120_259_084_288 - module.ceiling_stop_bytes, 384);
+    const r_host = try fillOf(at(host, 9_200_000_000, per_row), 120_259_084_288 - module.ceiling_stop_bytes, 384);
     // The embedding is 2.48 rows: the fill gains its floor or its ceiling by where the remainder falls.
     try testing.expect(r_host.prefill == r_dev.prefill + 2 or r_host.prefill == r_dev.prefill + 3);
 }
@@ -1256,10 +1244,10 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
             try testing.expectEqual(if (engramPostedRoute(&config, ov, &c)) posted else 0, b0.engram_posted);
             b0.engram_posted = 0;
             try expectSdkView(b0, target);
-            const off = try fillRows(fillBillOf(b0), target, b0.n_experts);
+            const off = try fillOf(fillBillOf(b0), target, b0.n_experts);
             b0.engram_posted = posted;
             try expectSdkView(b0, target);
-            const on = try fillRows(fillBillOf(b0), target, b0.n_experts);
+            const on = try fillOf(fillBillOf(b0), target, b0.n_experts);
             const name = if (route) |r| (if (r) "on" else "off") else "default";
             std.debug.print("\nrows at baseline {d:.2} GB (target {d:.3} GB, transient release {s}, {d} decode transient rows): posted gathers off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, @as(f64, @floatFromInt(target)) / 1e9, name, b0.transient_decode_rows, off.prefill, off.decode, on.prefill, on.decode });
             try testing.expectEqual(w.off, off);
@@ -1393,10 +1381,10 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
         b0.engram_posted = posted;
         try expectSdkView(b0, target);
-        const cons = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        const cons = try fillOf(fillBillOf(b0), target, b0.n_experts);
         b0.prefill_wave = fenced.layerMajorWaveBytes(fill_prompt_tokens, .served);
         try expectSdkView(b0, target);
-        const tight = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        const tight = try fillOf(fillBillOf(b0), target, b0.n_experts);
         std.debug.print("\nbill variants at baseline {d:.2} GB (posted gathers on): conservative {d} / {d}, tight {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, cons.prefill, cons.decode, tight.prefill, tight.decode });
         try testing.expectEqual(w.conservative, cons);
         try testing.expectEqual(w.tight, tight);
@@ -1454,7 +1442,7 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
             var b = b0;
             b.engram_posted = posted;
             b.prefill_wave = b.prefill_wave_tight;
-            rows[i] = try fillRows(fillBillOf(b), target, b.n_experts);
+            rows[i] = try fillOf(fillBillOf(b), target, b.n_experts);
         }
         std.debug.print("\ntight at baseline {d:.2} GB (posted gathers on): early release off {d} / {d} ({d:.3} GB wave), on {d} / {d} ({d:.3} GB)", .{ @as(f64, @floatFromInt(w.base)) / 1e9, rows[0].prefill, rows[0].decode, @as(f64, @floatFromInt(off.prefill_wave_tight)) / 1e9, rows[1].prefill, rows[1].decode, @as(f64, @floatFromInt(on.prefill_wave_tight)) / 1e9 });
         try testing.expectEqual(w.two, rows[0]);
@@ -1495,8 +1483,8 @@ test "dsv41 memory: the decode cache term follows the decode cache limit route (
         try testing.expectEqual(b1.prefillTotal(), b0.prefillTotal());
         b1.engram_posted = posted;
         b0.engram_posted = posted;
-        const r1 = try fillRows(fillBillOf(b1), target, b1.n_experts);
-        const r0 = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        const r1 = try fillOf(fillBillOf(b1), target, b1.n_experts);
+        const r0 = try fillOf(fillBillOf(b0), target, b0.n_experts);
         std.debug.print("\ndecode cache at baseline {d:.2} GB (posted gathers on): envelope {d} / {d}, decodecache0 {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, r1.prefill, r1.decode, r0.prefill, r0.decode });
         try testing.expectEqual(w.stock, r1);
         try testing.expectEqual(w.zero, r0);
@@ -1539,9 +1527,9 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
         b1.engram_posted = posted;
         b5.engram_posted = posted;
         try expectSdkView(b1, target);
-        const r1 = try fillRows(fillBillOf(b1), target, b1.n_experts);
+        const r1 = try fillOf(fillBillOf(b1), target, b1.n_experts);
         try expectSdkView(b5, target);
-        const r5 = try fillRows(fillBillOf(b5), target, b5.n_experts);
+        const r5 = try fillOf(fillBillOf(b5), target, b5.n_experts);
         std.debug.print("\nhead modes at baseline {d:.2} GB (posted gathers on): bf16 {d} / {d}, mxfp8 {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, r1.prefill, r1.decode, r5.prefill, r5.decode });
         try testing.expectEqual(w.bf16, r1);
         try testing.expectEqual(w.mxfp8, r5);
@@ -1586,7 +1574,7 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
             b.engram_posted = posted;
             b.prefill_wave = pb.withGroupStreams(streams).layerMajorWaveBytes(fill_prompt_tokens, .served);
             try expectSdkView(b, target);
-            got[vi * 2 + ri] = try fillRows(fillBillOf(b), target, b.n_experts);
+            got[vi * 2 + ri] = try fillOf(fillBillOf(b), target, b.n_experts);
         };
         std.debug.print("\nfour arms at baseline {d:.2} GB (posted gathers on): conservative release off {d} / {d}, on {d} / {d}; tight off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, got[0].prefill, got[0].decode, got[1].prefill, got[1].decode, got[2].prefill, got[2].decode, got[3].prefill, got[3].decode });
         try testing.expectEqual(w.cons_off, got[0]);
@@ -1624,10 +1612,10 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
         try testing.expectEqual(@as(u64, 48), b0.transient_decode_rows);
         b0.engram_posted = 0;
         try expectSdkView(b0, target);
-        const off = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        const off = try fillOf(fillBillOf(b0), target, b0.n_experts);
         b0.engram_posted = posted;
         try expectSdkView(b0, target);
-        const on = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        const on = try fillOf(fillBillOf(b0), target, b0.n_experts);
         std.debug.print("\nwindow release: rows at baseline {d:.2} GB: posted gathers off {d} / {d}, on {d} / {d}", .{ @as(f64, @floatFromInt(w.base)) / 1e9, off.prefill, off.decode, on.prefill, on.decode });
         try testing.expectEqual(w.off, off);
         try testing.expectEqual(w.on, on);
@@ -1655,31 +1643,31 @@ test "dsv41 memory: the native fill takes two row counts, each phase at its targ
     const target = f.ceiling - module.ceiling_stop_bytes;
     for ([_]u64{ 9_000_000_000, 11_000_000_000, 13_400_000_000, f.baseline }) |base| {
         const b = f.at(base);
-        const r = try fillRows(b, target, 384);
+        const r = try fillOf(b, target, 384);
         try std.testing.expect(r.prefill <= r.decode);
         try std.testing.expect(b.decode_fixed + r.decode * b.per_row <= target and b.decode_fixed + (r.decode + 1) * b.per_row > target);
         try std.testing.expect(b.prefill_fixed + r.prefill * b.per_row <= target and b.prefill_fixed + (r.prefill + 1) * b.per_row > target);
         std.debug.print("native fill at baseline {d:.1} GB: {d} prefill / {d} decode rows per layer (target {d:.2} GB)\n", .{ @as(f64, @floatFromInt(base)) / 1e9, r.prefill, r.decode, @as(f64, @floatFromInt(target)) / 1e9 });
     }
-    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 168 }, try fillRows(f.at(9_000_000_000), target, 384));
+    try std.testing.expectEqual(arm_mod.NativeRows{ .prefill = 127, .decode = 168 }, try fillOf(f.at(9_000_000_000), target, 384));
     // Capped at the layer's experts; refused by name when not even the floor fits.
-    const cap = try fillRows(.{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = 100_000_000 }, target, 384);
+    const cap = try fillOf(.{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = 100_000_000 }, target, 384);
     try std.testing.expectEqual(@as(u32, 384), cap.decode);
-    try std.testing.expectError(error.NativeBillDoesNotFit, fillRows(.{ .prefill_fixed = target - 10 * f.per_row, .decode_fixed = 0, .per_row = f.per_row }, target, 384));
+    try std.testing.expectError(error.NativeBillDoesNotFit, fillOf(.{ .prefill_fixed = target - 10 * f.per_row, .decode_fixed = 0, .per_row = f.per_row }, target, 384));
 }
 
 test "dsv41 memory: the grow is refused when the two-count decode total exceeds the fill's target" {
     var b = cell4Bill();
     const target: u64 = 118_259_084_288;
-    try admitPhases(b, target);
+    try admitOf(b, target);
     // Decode rows forced past the target (148 -> 170 rows: +11.72 GB).
     b.decode_rows = 170;
     b.slot_decode = (40 * 170 + 48) * 13_315_584;
     try std.testing.expect(b.decodeTotal() > target);
-    try std.testing.expectError(error.DecodeOverTarget, admitPhases(b, target));
+    try std.testing.expectError(error.DecodeOverTarget, admitOf(b, target));
     // The prompt phase over it is refused first.
     b.prefill_wave += 20_000_000_000;
-    try std.testing.expectError(error.PromptOverTarget, admitPhases(b, target));
+    try std.testing.expectError(error.PromptOverTarget, admitOf(b, target));
 }
 
 
@@ -1727,7 +1715,7 @@ test "dsv41 memory: the fill's rows at the windows' baselines (bank)" {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
         b0.engram_posted = posted;
-        const r0 = try fillRows(fillBillOf(b0), target, b0.n_experts);
+        const r0 = try fillOf(fillBillOf(b0), target, b0.n_experts);
         try testing.expectEqual(arm_mod.NativeRows{ .prefill = w.prefill, .decode = w.decode }, r0);
     }
 }

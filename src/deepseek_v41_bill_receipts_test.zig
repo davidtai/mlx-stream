@@ -265,7 +265,7 @@ test "dsv41 memory receipts: each served cell's phase terms, wiring tables and r
         try expectRecord("decode", r.decode, r.decode_record, r.file_backed_start);
         // Every cell ran inside its target, the rows it took (forced or filled) admitted by both admissions.
         const target = r.wired_limit - module.ceiling_stop_bytes;
-        try bill.admitPhases(b, target);
+        try bill.admitOf(b, target);
         try sdk.admit(mb, b.baseline, .{ .prompt = r.prefill_rows, .decode = r.decode_rows }, target);
     }
 }
@@ -281,25 +281,25 @@ test "dsv41 memory receipts: the fill at each cell's baseline gives the start ru
         // The fill's shape is row-free: the cell's rows and the fill's rows give the same one.
         const fb = bill.fillBillOf(b);
         try testing.expectEqualDeep(fb, bill.fillBillOf(atRows(b, want)));
-        try testing.expectEqual(want, try bill.fillRows(fb, target, n_experts));
+        try testing.expectEqual(want, try bill.fillOf(fb, target, n_experts));
         const mb = try bill.memoryBill(testing.allocator, b);
         defer mb.free(testing.allocator);
         const got = try sdk.fill(mb, b.baseline, target, n_experts, bill.min_fill_rows);
         try testing.expectEqual(want, arm_mod.NativeRows{ .prefill = got.prompt, .decode = got.decode });
         // The fill's rows are admitted; a decode row more is over the target, and so is a prompt row more.
         const at = atRows(b, want);
-        try bill.admitPhases(at, target);
+        try bill.admitOf(at, target);
         try testing.expectEqual(at.decodeTotal(), fb.total(true, want.decode));
         try testing.expectEqual(at.prefillTotal(), fb.total(false, want.prefill));
-        try testing.expectError(error.DecodeOverTarget, bill.admitPhases(atRows(b, .{ .prefill = want.prefill, .decode = want.decode + 1 }), target));
-        try testing.expectError(error.PromptOverTarget, bill.admitPhases(atRows(b, .{ .prefill = want.prefill + 1, .decode = want.decode }), target));
+        try testing.expectError(error.DecodeOverTarget, bill.admitOf(atRows(b, .{ .prefill = want.prefill, .decode = want.decode + 1 }), target));
+        try testing.expectError(error.PromptOverTarget, bill.admitOf(atRows(b, .{ .prefill = want.prefill + 1, .decode = want.decode }), target));
         try testing.expectError(error.DecodeOverTarget, sdk.admit(mb, b.baseline, .{ .prompt = want.prefill, .decode = want.decode + 1 }, target));
         try testing.expectError(error.PromptOverTarget, sdk.admit(mb, b.baseline, .{ .prompt = want.prefill + 1, .decode = want.decode }, target));
         // The boundary is the byte: a target at the fill's larger total keeps its rows; a byte under loses a row there.
         const edge = @max(at.prefillTotal(), at.decodeTotal());
-        try bill.admitPhases(at, edge);
-        try testing.expectEqual(want, try bill.fillRows(fb, edge, n_experts));
-        const under = try bill.fillRows(fb, edge - 1, n_experts);
+        try bill.admitOf(at, edge);
+        try testing.expectEqual(want, try bill.fillOf(fb, edge, n_experts));
+        const under = try bill.fillOf(fb, edge - 1, n_experts);
         try testing.expect(under.prefill + under.decode == want.prefill + want.decode - 1);
         // The cell's forced rows sit at or under the fill in both phases.
         try testing.expect(r.prefill_rows <= want.prefill and r.decode_rows <= want.decode);

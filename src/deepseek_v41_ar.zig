@@ -1767,7 +1767,7 @@ fn cellConfig(config: *settings.Config) !CellArgs {
 }
 
 /// The native admission's fill: the cell's own bill at the envelope's rows gives each phase's rows-free
-/// total and `module.fillRows` takes ONE row count up to the binding phase's target (no grow at the phase
+/// total and `sdk.fill` takes ONE row count up to the binding phase's target (no grow at the phase
 /// change); the config then carries it as both row counts (the stream's, the bill's). DSV41_CELL_ROWS + DSV41_CELL_PREFILL_ROWS force both (a ladder's
 /// later lines at its first line's rows): billed, and refused by name above the target. DSV41_CELL_ROWS
 /// alone keeps the envelope's forced-rows admission. DSV41_CELL_FILL_LADDER=1 fills at the prefill
@@ -2804,11 +2804,11 @@ test "dsv41 memory: the harness's filled rows pass the Module's admission under 
             return box -| gpu_ceiling.wired_limit_margin_bytes;
         }
     }.of;
-    try testing.expectError(error.PromptOverTarget, bill_mod.admitPhases(b, target(ceiling)));
+    try testing.expectError(error.PromptOverTarget, bill_mod.admitOf(b, target(ceiling)));
     {
         const stop = WindowStop.set(module.ceiling_stop_bytes, null);
         defer stop.restore();
-        try bill_mod.admitPhases(b, target(ceiling));
+        try bill_mod.admitOf(b, target(ceiling));
         try testing.expectEqual(ceiling - module.ceiling_stop_bytes, target(ceiling));
     }
     try testing.expectEqual(gpu_ceiling.WIRED_LIMIT_MARGIN_BYTES, gpu_ceiling.wired_limit_margin_bytes);

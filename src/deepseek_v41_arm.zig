@@ -73,7 +73,7 @@ pub const Options = struct {
     /// Wired bytes at construction; null reads them now.
     wired_bytes: ?u64 = null,
     fixed_rows: ?u32 = null,
-    /// Rows chosen by the caller's native bill (`deepseek_v41_bill.fillRows`): the stream's prefill
+    /// Rows chosen by the caller's native bill (`deepseek_v41_bill.fill`): the stream's prefill
     /// and decode rows per layer. Exclusive with `fixed_rows`.
     native_rows: ?NativeRows = null,
     /// Run the Python-calibrated envelope admission (`expert_admission.Admission.plan`) for its rows and its
