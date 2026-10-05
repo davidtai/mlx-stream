@@ -1626,7 +1626,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const n_ids = n * k;
             // The wide lane takes prefill-width calls only (the prefill texts bind small inputs as
             // `constant`; a decode-width call is the decode lane's).
-            if (n_ids < wide_min_ids) return error.WideLaneUnderMinIds;
+            std.debug.assert(n_ids >= wide_min_ids);
             const feed = self.wide_route.seed;
             const hot_first = self.wide_route.hot_first;
             const depth: usize = self.wide_route.depth;
@@ -2257,7 +2257,7 @@ test "dsv41 experts: the joined outputs are put back in routed order" {
     try testing.expectEqualSlices(u32, &.{ 1, 3, 4, 0, 2 }, &inv);
 }
 
-test "dsv41 experts: a decode-width call never takes the wide lane: construction proves it fits a route, the wide lane refuses it by name" {
+test "dsv41 experts: a decode-width call never takes the wide lane: construction proves it fits a route" {
     const a = testing.allocator;
     var c = testConfig(256, 128, 1);
     c.n_routed_experts = 64;
@@ -2281,9 +2281,8 @@ test "dsv41 experts: a decode-width call never takes the wide lane: construction
     try testing.expectError(error.DecodeRowsWiderThanRoute, Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &wide_k));
     var ex = try Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c);
     defer ex.deinit();
-    // 8 rows x top-6 = 48 ids: the wide lane refuses them by name (the dispatch sends them to the decode lane).
+    // 8 rows x top-6 = 48 ids: a decode-width call (the dispatch sends it to the decode lane).
     try testing.expectEqual(@as(u32, 48), decode_forward_rows * 6);
-    try testing.expectError(error.WideLaneUnderMinIds, ex.runWide(&g, 0, try g.input(&.{ 8, 256 }, .float32), try g.input(&.{ 8, 6 }, .int32), 8, 6));
     try testing.expectEqual(@as(usize, 0), rrs[0].calls.items.len);
 }
 

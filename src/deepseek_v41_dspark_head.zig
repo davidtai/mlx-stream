@@ -726,7 +726,7 @@ pub fn Head(comptime G: type) type {
         /// The block's token ids `[primary, noise, ...]` (`block_size`).
         pub fn blockIds(self: *const Self, primary: u32, out: *[64]u32) ![]const u32 {
             const ds = self.c.dspark;
-            if (ds.block_size > out.len) return error.BlockTooWide;
+            std.debug.assert(ds.block_size <= out.len); // the config bounds dspark_block_size to [1, 64]
             out[0] = primary;
             for (out[1..ds.block_size]) |*d| d.* = @intCast(ds.noise_token_id);
             return out[0..ds.block_size];
@@ -739,7 +739,7 @@ pub fn Head(comptime G: type) type {
             const ds = c.dspark;
             const bs: c_int = @intCast(ds.block_size);
             var ids: [64]i32 = undefined;
-            if (ds.block_size > ids.len) return error.BlockTooWide;
+            std.debug.assert(ds.block_size <= ids.len);
             ids[0] = @intCast(primary);
             const e = try Tr.expandEmbedding(g, c, raw);
             var cur: Tr.Out = e;
