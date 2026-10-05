@@ -5,7 +5,7 @@
 //! first-boot checks (bankv2, exl3_lane) are their oracle.
 
 const std = @import("std");
-const io_util = @import("nocache_io.zig");
+const io_util = @import("sdk").io_util;
 const expert_io = @import("sdk_ext.zig").expert.io;
 const mlx = @import("sdk").mlx;
 
@@ -68,14 +68,7 @@ pub const Implemented = struct {
 pub const dsv41: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 5120, .inter = 2304, .n_experts = 384, .n_layers = 40 };
 
 /// Why a bank was refused, for the one log line the caller writes.
-pub const Diag = struct {
-    buf: [320]u8 = undefined,
-    len: usize = 0,
-
-    pub fn message(self: *const Diag) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
+pub const Diag = @import("sdk").Diag;
 
 pub const Refusal = error{
     BankDirNotAbsolute,
@@ -441,7 +434,7 @@ fn segmentsMatch(segs: anytype, l: *const Layer, base: u64) bool {
 }
 
 fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (diag) |d| d.set(fmt, args);
     return err;
 }
 
@@ -985,6 +978,30 @@ const implemented_synth: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .
 pub fn tmpRoot(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
     return buf[0..try tmp.dir.realPath(std.testing.io, buf)];
 }
+
+/// A synthetic bank (`writeSynth`) opened from a temporary directory (tests).
+pub const SynthBank = struct {
+    tmp: std.testing.TmpDir,
+    image: []u8,
+    bank: Bank,
+
+    pub fn open(n_experts: u32) !SynthBank {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const image = try writeSynth(testing.allocator, &tmp, .{ .n_experts = n_experts });
+        errdefer testing.allocator.free(image);
+        var rbuf: [512]u8 = undefined;
+        const implemented: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = n_experts, .n_layers = 2 };
+        const bank = try Bank.open(testing.allocator, std.testing.io, try tmpRoot(&tmp, &rbuf), implemented, null);
+        return .{ .tmp = tmp, .image = image, .bank = bank };
+    }
+
+    pub fn close(self: *SynthBank) void {
+        self.bank.deinit();
+        testing.allocator.free(self.image);
+        self.tmp.cleanup();
+    }
+};
 
 test "dsv41 bank: a clean synthetic bank opens with offsets, spans and digests from its manifests" {
     var tmp = std.testing.tmpDir(.{});

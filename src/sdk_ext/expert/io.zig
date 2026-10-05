@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const io_util = @import("../../nocache_io.zig");
+const io_util = @import("sdk").io_util;
 
 // 1:1 mirror of lib/expert_io/q3_lookahead4.h. The C pool and the event shims compile on macOS graphs only (the host's
 // `macos_engines` graphs: the macOS exe and tests); the Linux exe and the iOS lib get the refusing stand-ins, whose
@@ -40,15 +40,8 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_ev_gates(n: i32, values: [*]const u64, counts: [*]const i32, tickets: [*]const i64) i32;
     pub extern fn q3ld_ev_release(value: u64) i32;
     pub extern fn q3ld_ev_state(out: *[10]i64) i32;
-    pub extern fn q3ld_warm_config(busy_max: i32) c_int;
-    pub extern fn q3ld_submit_warm(fd: i32, file_size: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
-    pub extern fn q3ld_warm_cancel(first: i64, count: i64) i64;
     pub extern fn q3ld_monotonic_ns() i64;
     pub extern fn q3ld_abi() i32;
-    pub extern fn q3ld_sched_config(mode: i32) c_int;
-    pub extern fn q3ld_keepwarm(on: i32) c_int;
-    pub extern fn q3ld_keepwarm_sleep(ns: i64) c_int;
-    pub extern fn q3ld_keepwarm_spins() i64;
     pub extern fn q3ld_counters_n() i32;
     pub extern fn q3ld_max_spec() i32;
     pub extern fn q3ld_max_pre() i32;
@@ -157,12 +150,8 @@ pub const Counter = enum(u8) {
     ev_wd_last_value = 69,
     ev_host_released = 70,
     ev_stop_released = 71,
-    warm_submitted = 72,
-    warm_started = 73,
-    warm_cancelled = 74,
-    warm_max_busy_at_start = 75,
 };
-pub const counters_n = 76;
+pub const counters_n = 72;
 
 /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
 /// read by `threads` threads in `chunk_bytes` preadv steps.
@@ -177,25 +166,13 @@ pub const Spec = struct {
     idle_busy: u32 = 0,
 };
 
-/// The warm class (A0 (a)): stock jobs a worker starts only while no demand job or pre-range is queued and fewer than
-/// `busy_max` jobs run, on `tickets` tickets of their own at the top of the ring (demand wraps below them).
-pub const Warm = struct { tickets: u32, busy_max: u32 };
-
-/// The pool's scheduling, fixed at start (`sched.zig`).
-pub const Sched = @import("sched.zig").Sched;
-
 pub const Options = struct {
     workers: u32 = 4,
-    sched: Sched = .{},
     /// One page-aligned staging buffer per worker; 9 MiB holds a whole
     /// 8,877,056-byte gate/up span plus its page alignment.
     staging_bytes: u64 = 9 << 20,
     tickets: u32 = 256,
     spec: ?Spec = null,
-    warm: ?Warm = null,
-    /// Tickets of their own for a second demand client (the draft-expert cache), between demand's ring and the warm
-    /// class's: its submits (`Records.submitAux`) never reuse a ticket the stream's demand ring holds. 0: none.
-    aux_tickets: u32 = 0,
 };
 
 /// A speculative staging slot: the page-rounded record plus two pages.
@@ -277,13 +254,8 @@ pub const Pool = struct {
     /// Log entries consumed so far.
     seen: i64 = 0,
     next_ticket: u32 = 0,
-    /// Demand's tickets end here; the warm class's (`Options.warm`) run from here to the end of the ring.
+    /// Demand's tickets end here.
     demand_tickets: u32 = 0,
-    next_warm: u32 = 0,
-    /// The aux ring [aux_first, aux_end) (`Options.aux_tickets`) and its next ticket.
-    aux_first: u32 = 0,
-    aux_end: u32 = 0,
-    next_aux: u32 = 0,
     record_bytes: u64 = 0,
 
     /// Starts the process's pool (the speculative class, when given, is
@@ -295,10 +267,6 @@ pub const Pool = struct {
             return error.InvalidOptions;
         if (opt.spec) |s| if (s.threads == 0 or s.threads > max_spec_threads or s.slots == 0 or s.slots > max_spec or s.record_bytes == 0 or
             s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
-        if (opt.warm) |w| if (w.tickets == 0 or w.tickets % 2 != 0 or w.tickets > opt.tickets -| 2 * max_items or w.busy_max == 0 or
-            w.busy_max > opt.workers) return error.InvalidOptions;
-        const warm_n: u32 = if (opt.warm) |w| w.tickets else 0;
-        if (opt.aux_tickets % 2 != 0 or (opt.aux_tickets > 0 and opt.aux_tickets < 2 * max_items) or opt.aux_tickets + warm_n > opt.tickets -| 2 * max_items) return error.InvalidOptions;
         if (c.q3ld_abi() != abi_version or c.q3ld_counters_n() != counters_n or c.q3ld_max_spec() != max_spec or c.q3ld_max_pre() != max_pre or
             c.q3ld_max_gates() != max_gates or c.q3ld_max_gate_tickets() != max_gate_tickets) return error.PoolAbi;
         const self = try allocator.create(Pool);
@@ -314,8 +282,8 @@ pub const Pool = struct {
         @memset(res, 0);
         @memset(log_arr, 0);
         @memset(published, false);
-        const demand: u32 = opt.tickets - warm_n - opt.aux_tickets;
-        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand, .next_warm = demand + opt.aux_tickets, .aux_first = demand, .aux_end = demand + opt.aux_tickets, .next_aux = demand };
+        const demand: u32 = opt.tickets;
+        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand };
         var bufs: [max_spec]u64 = undefined;
         var threads: i32 = 0;
         var slot_bytes: u64 = 0;
@@ -336,15 +304,9 @@ pub const Pool = struct {
         if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
         var ptrs: [max_workers]u64 = undefined;
         for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
-        if (c.q3ld_sched_config(testSched(opt.sched).bits()) != 0) return error.PoolUnavailable;
-        if (c.q3ld_keepwarm_sleep(@as(i64, opt.sched.keep_warm_us) * std.time.ns_per_us) != 0) return error.PoolUnavailable;
         const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
         if (rc == -2) _ = c.q3ld_stop(); // fewer threads than asked: join the ones that started
         if (rc != 0) return if (rc == -1) error.PoolUnavailable else error.PoolStart;
-        if (opt.warm) |w| if (c.q3ld_warm_config(@intCast(w.busy_max)) != 0) {
-            _ = c.q3ld_stop();
-            return error.WarmRefused;
-        };
         return self;
     }
 
@@ -362,29 +324,12 @@ pub const Pool = struct {
         a.destroy(self);
     }
 
-    /// The keep-warm spinner on or off (`Sched.keep_warm` pools only: error otherwise).
-    pub fn keepWarm(_: *Pool, on: bool) !void {
-        if (c.q3ld_keepwarm(@intFromBool(on)) != 0) return error.PoolUnavailable;
-    }
-
-    /// The keep-warm spinner's loop count (0 without one).
-    pub fn keepWarmSpins(_: *const Pool) u64 {
-        return @intCast(@max(c.q3ld_keepwarm_spins(), 0));
-    }
-
     /// Arms the event-gate class: the satisfied prefix goes to `object` (an
     /// id<MTLSharedEvent>, or an 8-aligned int64 host word) from the
     /// publishing worker; a gate unsatisfied after `timeout_ns` is forced.
     pub fn armEvent(self: *Pool, kind: EventKind, object: u64, timeout_ns: i64, start_value: u64) !void {
         _ = self;
         if (c.q3ld_ev_config(@intFromEnum(kind), object, timeout_ns, start_value) != 0) return error.EventRefused;
-    }
-
-    /// The queued warm jobs overlapping tickets [first, first + count), published skipped now (a started job
-    /// finishes). Returns the tickets cancelled.
-    pub fn cancelWarm(_: *Pool, first: u32, count: u32) u32 {
-        const n = c.q3ld_warm_cancel(first, count);
-        return if (n < 0) 0 else @intCast(n);
     }
 
     /// A layer call's speculative step: settles every unclaimed record tagged
@@ -456,11 +401,6 @@ pub const Pool = struct {
 
     /// Marks what the log published since the last call (ACQUIRE on the
     /// sequence, so the status words and slot bytes of those tickets are visible).
-    /// Tickets of the aux ring (0: none).
-    pub fn auxTickets(self: *const Pool) u32 {
-        return self.aux_end - self.aux_first;
-    }
-
     fn drain(self: *Pool) void {
         const s = c.q3ld_seq();
         while (self.seen < s) : (self.seen += 1) {
@@ -469,21 +409,6 @@ pub const Pool = struct {
         }
     }
 };
-
-/// The reader's monotonic clock (ns), the one its result words use.
-/// Test builds only: DSV41_TEST_READER_SCHED (a `Sched.parse` list) runs every pool a test starts with the default
-/// (stock) scheduling at that value, so the stream's bank tests prove each value reads the same bytes into the same
-/// rows; a test that asks for a scheduling itself keeps it.
-fn testSched(s: Sched) Sched {
-    if (comptime !@import("builtin").is_test) return s;
-    if (s.qos or s.qos_demand or s.spin or s.demand_first or s.keep_warm or s.start_ui) return s;
-    const v = std.c.getenv("DSV41_TEST_READER_SCHED") orelse return s;
-    return Sched.parse(std.mem.span(v)) orelse s;
-}
-
-pub fn monotonicNs() i64 {
-    return c.q3ld_monotonic_ns();
-}
 
 /// Test builds (-DQ3LD_INJECT): one scripted preadv fault at an aligned file
 /// offset (code 1 EINTR, 2 EIO, 3 zero return, 4 truncate to `arg` bytes, 5
@@ -501,7 +426,7 @@ pub fn clearFaults() void {
 }
 
 /// One record topology over the process's pool, fixed when its source is built: `components` components per record,
-/// the first `gate_up` in its gate/up range. Every demand, warm and pre-read submit goes through it: gate/up of
+/// the first `gate_up` in its gate/up range. Every demand and pre-read submit goes through it: gate/up of
 /// record i is ticket `first + i`, its down `first + n + i`, whatever the topology.
 pub fn Records(comptime components: usize, comptime gate_up: usize) type {
     comptime checkTopology(components, gate_up);
@@ -513,12 +438,6 @@ pub fn Records(comptime components: usize, comptime gate_up: usize) type {
         /// every down span, each part `lens[c]` bytes into `rows[i][c]`. Returns the first of its 2n tickets.
         pub fn submit(pool: *Pool, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
             return submitOn(pool, 0, pool.demand_tickets, &pool.next_ticket, fd, gu_offsets, down_offsets, rows, lens);
-        }
-
-        /// `submit` on the aux ring (`Options.aux_tickets`): a second client's jobs, on tickets the demand ring never uses.
-        pub fn submitAux(pool: *Pool, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
-            if (pool.aux_end == pool.aux_first) return error.InvalidJob;
-            return submitOn(pool, pool.aux_first, pool.aux_end, &pool.next_aux, fd, gu_offsets, down_offsets, rows, lens);
         }
 
         fn submitOn(pool: *Pool, lo: u32, hi: u32, next: *u32, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
@@ -545,35 +464,6 @@ pub fn Records(comptime components: usize, comptime gate_up: usize) type {
             }
             @memset(pool.published[first..][0..count], false);
             next.* = first + count;
-            return first;
-        }
-
-        /// The warm class (`Options.warm`): one job queued below demand on the warm tickets, laid out as `submit`'s.
-        /// Returns its first ticket.
-        pub fn submitWarm(pool: *Pool, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
-            const n = rows.len;
-            if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n or pool.aux_end == pool.published.len) return error.InvalidJob;
-            const count: u32 = @intCast(2 * n);
-            pool.drain();
-            if (pool.next_warm + count > pool.published.len) pool.next_warm = pool.aux_end;
-            const first = pool.next_warm;
-            var offsets: [2 * max_items]i64 = undefined;
-            var row_ptrs: [max_items][*]const u64 = undefined;
-            for (0..n) |i| {
-                offsets[i] = @intCast(gu_offsets[i]);
-                offsets[n + i] = @intCast(down_offsets[i]);
-                row_ptrs[i] = &rows[i];
-            }
-            var lens_i: [components]i64 = undefined;
-            for (lens.*, &lens_i) |l, *li| li.* = @intCast(l);
-            switch (c.q3ld_submit_warm(fd.fd, @intCast(fd.size), @intCast(n), gate_up, components - gate_up, &offsets, &row_ptrs, &lens_i, first)) {
-                0 => {},
-                -2 => return error.TicketsBusy,
-                -3 => return error.QueueFull,
-                else => return error.SubmitRefused,
-            }
-            @memset(pool.published[first..][0..count], false);
-            pool.next_warm = first + count;
             return first;
         }
 

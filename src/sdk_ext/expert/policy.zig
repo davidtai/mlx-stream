@@ -315,15 +315,6 @@ pub const LayerPolicy = struct {
         return out[0..n];
     }
 
-    /// Relabels the resident of slot `from` as slot `to` (empty); its record stays where the caller keeps it.
-    pub fn moveSlot(p: *LayerPolicy, from: u32, to: u32) void {
-        const e = p.slot_to_expert[from];
-        std.debug.assert(e != no_expert and p.slot_to_expert[to] == no_expert);
-        p.slot_to_expert[to] = e;
-        p.slot_to_expert[from] = no_expert;
-        p.expert_to_slot[e] = to;
-    }
-
     /// Forgets a resident expert (its record failed to load).
     pub fn invalidate(p: *LayerPolicy, expert: u16) void {
         const s = p.expert_to_slot[expert];

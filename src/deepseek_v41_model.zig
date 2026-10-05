@@ -21,7 +21,6 @@ const routes = @import("deepseek_v41_routes.zig");
 const expert_policy = @import("sdk_ext.zig").expert.policy;
 /// PROFILE builds only: P1's read-ahead record (compiles to nothing otherwise).
 const prof = @import("dsv41_prefill_timers.zig");
-const recall = @import("dsv41_decode_recall.zig");
 const ngram = @import("ngram_table.zig");
 
 /// K16: each chunk's DSpark main tap is evaluated in its chunk fence (`forwardLayerMajor`), so the tap's mean does
@@ -555,7 +554,6 @@ pub fn Model(comptime G: type) type {
                     mains[n_main] = g.keep(try mainOf(g, h));
                     n_main += 1;
                 }
-                if (comptime recall.enabled) try self.recallPredict(g, l, lw, h, pm, n, routed.at(@intCast(l)));
                 const out = try Tr.layer(g, probe, c, rt, self.kx.at(l), li, lw, self.invFor(li), h, pm, positions, &st.layers[l], &shared, routed.at(@intCast(l)));
                 h = out.h;
                 pm = out.pre_mix;
@@ -703,15 +701,6 @@ pub fn Model(comptime G: type) type {
         /// P1's predictor chunks per GPU round trip: their transients live together (about 25 MB a 953-row chunk, 100 MB
         /// a batch), before the layer's wave opens, so under the wave's own bound.
         pub const predict_batch = 4;
-
-        /// A1's recall check (profile builds): P1's predictor over a decode-width call's rows, before the layer's
-        /// attention, handed to the hook to compare at its routing barrier. It reads nothing; no output depends on it.
-        fn recallPredict(self: *const Self, g: *G, l: usize, lw: *const Tr.W, h: T, pm: T, rows: u32, hook: anytype) !void {
-            if (comptime !@hasDecl(@TypeOf(hook), "recallPredicted")) return;
-            if (!recall.active or rows * self.c.n_experts_per_tok > expert_policy.max_route_ids) return;
-            const wf = try g.astype(lw.gate_w, .float32);
-            hook.recallPredicted(try Tr.predictIds(g, &self.c, self.kx.at(l), lw, h, pm, wf));
-        }
 
         /// P1: layer `l`'s predictor pass before its attention: per chunk `Tr.predictIds` and one host read; the counts'
         /// ranking (`expert_policy.rankHottest`, the seed's order) to the hook, which reads that seed ahead. Profile
@@ -1799,67 +1788,6 @@ test "dsv41 model: the AR dry path routes every layer call of every forward thro
     try testing.expectEqual(@as(u32, 4), host.picks);
     // A prompt forward wider than the decode lane (top-2 x 25 rows > 48 ids) is refused by route.
     try testing.expectError(error.PrefillLaneNotPorted, model_.greedy(&g, &st, &(@as([25]u32, @splat(1))), 25, &ex, &out, {}));
-}
-
-test "dsv41 model: A1's recall check (profile builds): every decode-width layer call counts P1's prediction against its routes" {
-    if (comptime !recall.enabled) return error.SkipZigTest;
-    const xp = @import("deepseek_v41_experts.zig");
-    const m = try Mini.init();
-    defer m.deinit();
-    var g = TraceOps.init(testing.allocator);
-    defer g.deinit();
-    const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
-    const model_ = try TM.init(testing.allocator, &g, m.c, try routes.parse(&.{}, null), &lookup, &m.src);
-    defer model_.deinit(&g);
-    var st = try model_.newState();
-    defer st.deinit(&g, testing.allocator);
-    const nl = m.c.n_layers;
-    // Two persistent rows per layer: a layer's first call misses experts 0 and 1, its later calls hit them.
-    var rows0: [8]u32 = @splat(2);
-    var src = try xp.FakeSource.init(testing.allocator, .{ .hidden = m.c.hidden_size, .inter = m.c.moe_intermediate_size, .n_experts = m.c.n_routed_experts, .rows = rows0[0..nl] });
-    defer src.deinit();
-    const Ex = xp.Experts(TraceOps, xp.FakeSource, xp.TraceMath);
-    var ex = try Ex.init(testing.allocator, &g, &src, .{ .hidden = @intCast(m.c.hidden_size), .inter = @intCast(m.c.moe_intermediate_size) }, &m.c);
-    defer ex.deinit();
-    // Each layer call reads its routed ids, then its predicted ids. Routes are always experts 0 and 1; even layers
-    // predict exactly them, odd layers predict 2 and 3 (never routed, so never resident).
-    const Host = struct {
-        nl: u32,
-        reads: u32 = 0,
-        fn ids(ctx: *anyopaque, out: []u16) anyerror!void {
-            const h: *@This() = @ptrCast(@alignCast(ctx));
-            const layer = (h.reads / 2) % h.nl;
-            const off: u16 = if (h.reads % 2 == 1 and layer % 2 == 1) 2 else 0;
-            for (out, 0..) |*o, i| o.* = off + @as(u16, @intCast(i % 2));
-            h.reads += 1;
-        }
-        fn argmax(_: *anyopaque) anyerror!u32 {
-            return 5;
-        }
-    };
-    var host: Host = .{ .nl = nl };
-    g.host_values = .{ .ctx = &host, .ids = Host.ids, .argmax = Host.argmax };
-    recall.reset();
-    recall.active = true;
-    defer {
-        recall.active = false;
-        recall.reset();
-    }
-    var out: [3]u32 = undefined;
-    // One 4-row forward, then two one-token forwards: three calls per layer.
-    try model_.greedy(&g, &st, &.{ 1, 2, 3, 4 }, 4, &ex, &out, {});
-    try testing.expectEqual(@as(u32, 2 * 3 * nl), host.reads);
-    var missed: u64 = 0;
-    for (recall.layers[0..nl], 0..) |c, l| {
-        const want: recall.Counts = if (l % 2 == 0)
-            .{ .calls = 3, .routed = 6, .missed = 2, .predicted = 6, .predicted_routed = 6, .predicted_missed = 2, .wasted = 0 }
-        else
-            .{ .calls = 3, .routed = 6, .missed = 2, .predicted = 6, .predicted_routed = 0, .predicted_missed = 0, .wasted = 6 };
-        try testing.expectEqual(want, c);
-        missed += c.missed;
-    }
-    // The check's misses are the source's own.
-    try testing.expectEqual(src.stats().expert_cache_misses, missed);
 }
 
 test "dsv41 model: a prompt forward wider than a route takes runs every layer's routed call through the wide lane" {

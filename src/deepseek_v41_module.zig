@@ -40,13 +40,12 @@ const ngram = @import("ngram_table.zig");
 const dsp = @import("deepseek_v41_dspark_serve.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 
-const log = std.log.scoped(.dsv41);
+const log = @import("sdk").log;
 
 const G = ops.MlxOps;
 const expert_stream = @import("expert_stream.zig");
 const expert_event = sdk_ext.expert.event;
 const expert_io = sdk_ext.expert.io;
-const xsc = sdk_ext.expert.slot_cache;
 const expert_bank = @import("expert_bank.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
 // The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
@@ -113,10 +112,6 @@ pub const RouteOverrides = struct {
     decode_index_topk: ?bool = null,
     decode_smallm: ?bool = null,
     decode_mxfp8_rows: ?bool = null,
-    /// C22 moeshared: the shared expert's middle compiled at decode rows.
-    decode_shared_mid: ?bool = null,
-    /// C22's memos at decode rows (rope tables, the window selection and shared compressed rows, b == 1 rows).
-    decode_memos: ?bool = null,
     /// K16: each chunk's layer input stream released at its chunk fence (`inputStreamEarlyRelease`).
     input_stream_early_release: ?bool = null,
     /// K16: each routed group's MoE inputs freed after its wide call (`prefillInputRelease`).
@@ -149,10 +144,6 @@ pub const RouteOverrides = struct {
     /// ROUTED_BANKED (kbench v6d / v9b, exact): the routed decode stages on the banked texts, one launch per stage
     /// over a wave's rows of every bank (packed slot ids), the forms above taken. null: the default, off (per bank).
     routed_banked: ?bool = null,
-    /// GEMV_REBUILD (the stock-route leak's discriminator; info): the accept-time decode GEMVs freed and rebuilt at
-    /// construction on the forms above even when they are the stock texts (`formsRoute`). Exact: the same texts,
-    /// statics and launch configs. null: the default, off (the accept-time GEMVs kept unless a form is set).
-    gemv_rebuild: ?bool = null,
     /// HOIST_FIRST (exact: the same evals, only their commit order moves): each decode call commits its hoist (the
     /// shared expert, the gate weights, the HC tail) right behind the routing barrier's arrays, before the host waits
     /// on them, instead of behind the hit wave. null: the default, off (behind the hit wave).
@@ -161,8 +152,7 @@ pub const RouteOverrides = struct {
     /// the GPU runs it while the host builds the later stages and the head. null: the default, off (one commit per block).
     draft_staged: ?bool = null,
     /// DRAFT_AHEAD (exact): the next draft block built during each verify's wait for "every draft accepted", committed
-    /// only on that outcome (`dsl.Config.draft_ahead`). Needs the resident draft experts (DRAFTCACHE's per-stage routing
-    /// barriers would sync inside it). null: the default, off.
+    /// only on that outcome (`dsl.Config.draft_ahead`). null: the default, off.
     draft_ahead: ?bool = null,
     /// DEVROUTE (exact): in decode each routed call's hit wave runs as a device graph (the router's ids through the layer's
     /// resident LUT into the banked texts) committed before the host's routing barrier wait; the host then routes and
@@ -170,35 +160,15 @@ pub const RouteOverrides = struct {
     devroute: ?bool = null,
     /// The phase change's transient release (SERVED16; decode keeps window 0 of the scratch). null: the default, on.
     transient_release: ?bool = null,
-    /// A0 (a): the first verify's warm reads (the hook's prompt-tail capture plus the stream's warm class, read at
-    /// the grow below demand). null: the default, off.
-    first_verify_warm: ?bool = null,
     /// The phase change's settle poll: milliseconds between this process's footprint reads (1..`phase_change_settle_ms`).
     /// null: the settle's own default (`phaseChangePollMs`). Exact: it moves only when the settle sees the frees, not
     /// what it reads or the one check that judges the last reading.
     phase_change_poll_ms: ?u32 = null,
     /// The phase change's settle condition (`PhaseChangeSettle`). null: the default, `until_freed`.
     phase_change_settle: ?PhaseChangeSettle = null,
-    /// The phase change's host relief: libc malloc's zones asked once, after the frees, to return the free pages they
-    /// keep (`malloc_zone_pressure_relief(NULL, 0)`; the prompt pass's host heap). null: the default, off.
-    host_relief: ?bool = null,
-    /// DRAFTCACHE: the DSpark experts behind an exact adaptive cache of this many hot slots (split over the stages),
-    /// plus one draft block's transient slots per stage; none resident. null: the default, all resident.
-    draft_cache_hot: ?u32 = null,
-    /// DRAFTCACHE's slot pool form (`dh.DraftPool`; null: per_stage). Only with `draft_cache_hot`.
-    draft_cache_pool: ?dh.DraftPool = null,
     /// MLX's buffer cache limit through decode (set at the phase change; the bill's decode cache term). null: the
     /// default, the envelope's 268,435,456 B; at most that (a larger limit would bill past the admission's term).
     decode_cache_bytes: ?u64 = null,
-    /// The phase change's frees (transient release, cache clear, decode cache limit) at the prompt's last trunk chunk,
-    /// before the DSpark seed, so they land while the seed runs (`tailRelease`). null: the default, off.
-    phase_tail_release: ?bool = null,
-    /// STOCKDELAY (W5's discriminator for the tail release's decode reading): the stock phase change with a fixed sleep
-    /// (ms, 1..`phase_grow_delay_max_ms`) between its settled frees and the grow, so the freed pages retire before the
-    /// decode rows are allocated; refused with the tail release. null: the default, off.
-    phase_grow_delay_ms: ?u32 = null,
-    /// The phase change's per-layer decode rows (`arm_mod.DecodeRowsAlloc`). null: the default, uniform.
-    decode_rows_alloc: ?arm_mod.DecodeRowsAlloc = null,
     /// The fill's decode granule (`arm_mod.DecodeFillGranule`). null: the default, a row.
     decode_fill_granule: ?arm_mod.DecodeFillGranule = null,
     /// Set by the Module only (the record granule's `bill.fillExtraRecords` at the admitted rows; refused when given).
@@ -207,8 +177,6 @@ pub const RouteOverrides = struct {
     bank_geometry: ?expert_bank.Implemented = null,
     /// The grow's new rows without the zero fill (`expert_stream.GrowFill`). null: the default, zeros.
     grow_fill: ?expert_stream.GrowFill = null,
-    /// DRAFTCACHE's residency policy (shipped: the streamer's decode policy; lru). Only with `draft_cache_hot`.
-    draft_cache_policy: ?xsc.PolicyKind = null,
     /// The ring levers (WINDOW_RING_MAX_VERIFY / _SLACK / _HEADROOM) over the numeric tier's (`ringGeometry`): the states
     /// and the bill take the same geometry. null: the tier's.
     window_ring_max_verify: ?u32 = null,
@@ -221,174 +189,33 @@ pub fn growFill(ov: RouteOverrides) expert_stream.GrowFill {
     return ov.grow_fill orelse .zeros;
 }
 
-/// The tail release route the Module installs (off by default; it needs the transient release and the DSpark seed).
-pub fn phaseTailRelease(ov: RouteOverrides) bool {
-    return ov.phase_tail_release orelse false;
-}
-
-/// STOCKDELAY's bound: the longest sleep the discriminator may put between the frees and the grow.
-pub const phase_grow_delay_max_ms: u32 = 2000;
-
-/// STOCKDELAY as installed (0: off): refused by name at construction outside 1..`phase_grow_delay_max_ms` or with the
-/// tail release (the discriminator is the stock route plus the delay).
-pub fn phaseGrowDelayMs(ov: RouteOverrides) error{ PhaseGrowDelayOutOfRange, PhaseGrowDelayWithTailRelease }!u32 {
-    const d = ov.phase_grow_delay_ms orelse return 0;
-    if (d == 0 or d > phase_grow_delay_max_ms) return error.PhaseGrowDelayOutOfRange;
-    if (phaseTailRelease(ov)) return error.PhaseGrowDelayWithTailRelease;
-    return d;
-}
-
 /// The forms `routeForms` rebuilds the decode GEMVs on at construction, or null (the accept-time GEMVs kept): any
-/// form set, or GEMV_REBUILD (then the stock texts are rebuilt too). Unset, exactly the routing before GEMV_REBUILD.
+/// form set.
 pub fn formsRoute(ov: RouteOverrides) ?xq.Forms {
     const f = ov.routed_forms orelse xq.Forms{};
-    return if (f.down_pair or f.gu_one or (ov.gemv_rebuild orelse false)) f else null;
+    return if (f.down_pair or f.gu_one) f else null;
 }
 
-test "dsv41 module: GEMV_REBUILD routes the stock forms through routeForms; unset, the forms route exactly as before" {
-    // unset or 0: the accept-time GEMVs stay unless a form is set (the routing before GEMV_REBUILD)
+test "dsv41 module: the routed forms rebuild the GEMVs only when a form is set" {
+    // unset or stock: the accept-time GEMVs stay
     try std.testing.expect(formsRoute(.{}) == null);
     try std.testing.expect(formsRoute(.{ .routed_forms = .{} }) == null);
-    try std.testing.expect(formsRoute(.{ .gemv_rebuild = false }) == null);
     try std.testing.expectEqual(xq.Forms{ .gu_one = true }, formsRoute(.{ .routed_forms = .{ .gu_one = true } }).?);
-    try std.testing.expectEqual(xq.Forms{ .down_pair = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true }, .gemv_rebuild = false }).?);
+    try std.testing.expectEqual(xq.Forms{ .down_pair = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true } }).?);
     try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true, .gu_one = true } }).?);
-    // set: the stock texts rebuilt (with or without an explicit stock ROUTED_FORMS); a form set is unchanged by it
-    try std.testing.expectEqual(xq.Forms{}, formsRoute(.{ .gemv_rebuild = true }).?);
-    try std.testing.expectEqual(xq.Forms{}, formsRoute(.{ .routed_forms = .{}, .gemv_rebuild = true }).?);
-    try std.testing.expectEqual(xq.Forms{ .gu_one = true }, formsRoute(.{ .routed_forms = .{ .gu_one = true }, .gemv_rebuild = true }).?);
 }
-
-test "dsv41 module: STOCKDELAY is off by default, 1..2000 ms, and refused with the tail release" {
-    try std.testing.expectEqual(@as(u32, 0), try phaseGrowDelayMs(.{}));
-    try std.testing.expectEqual(@as(u32, 250), try phaseGrowDelayMs(.{ .phase_grow_delay_ms = 250 }));
-    try std.testing.expectEqual(@as(u32, 2000), try phaseGrowDelayMs(.{ .phase_grow_delay_ms = 2000 }));
-    try std.testing.expectError(error.PhaseGrowDelayOutOfRange, phaseGrowDelayMs(.{ .phase_grow_delay_ms = 0 }));
-    try std.testing.expectError(error.PhaseGrowDelayOutOfRange, phaseGrowDelayMs(.{ .phase_grow_delay_ms = 2001 }));
-    try std.testing.expectError(error.PhaseGrowDelayWithTailRelease, phaseGrowDelayMs(.{ .phase_grow_delay_ms = 250, .phase_tail_release = true }));
-    try std.testing.expectEqual(@as(u32, 0), try phaseGrowDelayMs(.{ .phase_tail_release = true }));
-}
-
-/// The loop's tail hook for one prompt part: armed before the part's forward, cleared after it, so the request's later
-/// extends (a serial decode lane) never run it.
-pub fn armPromptTail(slot: *?dsl.PromptTail, tail: ?dsl.PromptTail) void {
-    slot.* = tail;
-}
-
-/// Whether a prompt part runs the tail release: the route installed and the part the prompt's last (a split prompt's
-/// earlier parts still route through the scratch).
-pub fn tailArms(installed: bool, final: bool) bool {
-    return installed and final;
-}
-
-/// The phase change's transient accounting. Released at the prompt's tail (`tail`: its bytes), the scratch left before the
-/// boundary's first reading, so it is none of the boundary's frees; the grow re-allocates decode's window 0 of it either way,
-/// so `untilFreedBound` takes its bytes on both routes.
-pub fn transientAccount(tail: ?u64, released_here: u64) struct { boundary: u64, grow: u64 } {
-    if (tail) |b| return .{ .boundary = 0, .grow = b };
-    return .{ .boundary = released_here, .grow = released_here };
-}
-
-/// The tail release's record (`NATIVE DSV41_TAIL_RELEASE`): the scratch's bytes, this process's readings around the frees
-/// (MLX active must drop by the bytes: the stream refuses otherwise) and the frees' own time on the prompt's clock.
-pub const TailReleaseRecord = struct {
-    freed_bytes: u64,
-    before: BoundaryMemory,
-    after: BoundaryMemory,
-    ms: f64,
-};
 
 /// The fill granule the Module installs (a row unless set).
 pub fn decodeFillGranule(ov: RouteOverrides) arm_mod.DecodeFillGranule {
     return ov.decode_fill_granule orelse .row;
 }
 
-/// The decode rows route the Module installs (uniform unless set).
-pub fn decodeRowsAlloc(ov: RouteOverrides) arm_mod.DecodeRowsAlloc {
-    return ov.decode_rows_alloc orelse .uniform;
-}
-
-pub const RowsSummary = struct { total: u64, min: u32, max: u32 };
-
-pub fn rowsSummary(rows: []const u32) RowsSummary {
-    var s: RowsSummary = .{ .total = 0, .min = std.math.maxInt(u32), .max = 0 };
-    for (rows) |r| {
-        s.total += r;
-        s.min = @min(s.min, r);
-        s.max = @max(s.max, r);
-    }
-    return s;
-}
-
-/// prompt_stats' construction check: it reads the prompt seeds' counts (the wide seed route) and shifts rows only
-/// between the prompt rows and the decode rows' cap, so it needs both.
-pub fn checkDecodeRowsAlloc(alloc: arm_mod.DecodeRowsAlloc, wide_seed: bool, prefill_rows: u32, decode_rows: u32) error{ DecodeRowsAllocNeedsSeed, DecodeRowsAllocNoRoom }!void {
-    switch (alloc) {
-        .uniform => {},
-        .prompt_stats => {
-            if (!wide_seed) return error.DecodeRowsAllocNeedsSeed;
-            if (prefill_rows >= decode_rows) return error.DecodeRowsAllocNoRoom;
-        },
-        // The pool rows come out of each layer's grow: at least the pool's rows above the prompt rows.
-        .decode_first16 => if (decode_rows < prefill_rows + (expert_stream.DecodePool{}).per_layer) return error.DecodeRowsAllocNoRoom,
-    }
-}
-
-/// decode_first16 is its own row route: the record granule (single records on top) is refused with it.
-pub fn checkDecodePoolRoutes(alloc: arm_mod.DecodeRowsAlloc, granule: arm_mod.DecodeFillGranule, transient_release: bool) error{ DecodePoolWithRecords, DecodePoolNeedsRelease }!void {
-    if (alloc != .decode_first16) return;
-    if (granule == .record) return error.DecodePoolWithRecords;
-    if (!transient_release) return error.DecodePoolNeedsRelease;
-}
-
-/// DRAFTCACHE's hot slots as the Module installs it and the bill charges it (one resolver; off by default).
-pub fn draftCacheHot(ov: RouteOverrides) ?u32 {
-    return ov.draft_cache_hot;
-}
-
-/// DRAFTCACHE's pool form as installed and billed (per_stage unless set); a form without a hot count is refused by name.
-pub fn draftCachePool(ov: RouteOverrides) error{DraftCachePoolWithoutHot}!dh.DraftPool {
-    if (ov.draft_cache_hot == null and ov.draft_cache_pool != null) return error.DraftCachePoolWithoutHot;
-    return ov.draft_cache_pool orelse .per_stage;
-}
 
 /// The decode cache limit the Module installs and the bill charges (one resolver: the setting over the envelope's).
 pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
     const v = ov.decode_cache_bytes orelse return envelope.decode_cache_bytes;
     if (v > envelope.decode_cache_bytes) return error.DecodeCacheLimit;
     return v;
-}
-
-/// The read pool's scheduling the Module installs, the server's and a harness's alike (the `expert_reader_sched` model
-/// setting on the shell's config; off by default): handed to the pool at its start.
-pub fn readerSched(config: *const settings.Config) expert_io.Sched {
-    return config.expert_reader_sched orelse .{};
-}
-
-/// DRAFTCACHE's residency policy as installed (shipped unless set); a policy without a hot count is refused by name.
-pub fn draftCachePolicy(ov: RouteOverrides) error{DraftCachePolicyWithoutHot}!xsc.PolicyKind {
-    if (ov.draft_cache_hot == null and ov.draft_cache_policy != null) return error.DraftCachePolicyWithoutHot;
-    return ov.draft_cache_policy orelse .shipped;
-}
-
-/// The host relief route the Module installs (off by default).
-pub fn hostRelief(ov: RouteOverrides) bool {
-    return ov.host_relief orelse false;
-}
-
-extern "c" fn malloc_zone_pressure_relief(zone: ?*anyopaque, goal: usize) usize;
-
-/// libc malloc's relief over every zone (no goal: everything it can return); the bytes it reports returned.
-pub const LibcRelief = struct {
-    pub fn relieve(_: LibcRelief) u64 {
-        return malloc_zone_pressure_relief(null, 0);
-    }
-};
-
-/// The phase change's one relief call when the route is installed (`relief.relieve()`, once); null when it is not.
-pub fn boundaryRelief(installed: bool, relief: anytype) ?u64 {
-    if (!installed) return null;
-    return relief.relieve();
 }
 
 /// The process's host side at a reading: its footprint less MLX's active and cache.
@@ -502,7 +329,6 @@ pub fn prefillSub(ov: RouteOverrides, layer_major: bool) u64 {
     return ov.prefill_sub orelse kvc.prefill_sub;
 }
 
-/// A0 (a)'s route the Module installs: the capture and the warm class together (off by default).
 /// DEVROUTE as the hook binds it (`devroute`): off unless set.
 pub fn devRoute(ov: RouteOverrides) bool {
     return ov.devroute orelse false;
@@ -521,10 +347,6 @@ pub fn draftStaged(ov: RouteOverrides) bool {
 /// HOIST_FIRST as the hook binds it (`hoist_first`): off unless set.
 pub fn hoistFirst(ov: RouteOverrides) bool {
     return ov.hoist_first orelse false;
-}
-
-pub fn firstVerifyWarm(ov: RouteOverrides) bool {
-    return ov.first_verify_warm orelse false;
 }
 
 /// The phase change's settle poll the Module installs: the setting over its condition's default (`until_freed`:
@@ -594,8 +416,6 @@ pub const Module = struct {
     embed_rows: ngram.NgramTable,
     model: *M,
     head: *H,
-    /// DRAFTCACHE's slot banks and policy (`draftCacheHot`); the head routes its stages through it.
-    draft_cache: ?*dh.DraftCache = null,
     /// The request in flight (rebuilt at `cache.step == 0`).
     state: ?M.State = null,
     /// The DSpark strategy's settings (the served tier with a draft head); null: serial decode only.
@@ -618,10 +438,6 @@ pub const Module = struct {
     prefill_sub: u64 = std.math.maxInt(u64),
     /// The phase change's boundary readings, freed bytes and reclaim time (the receipts carry it).
     phase_change: ?PhaseChangeRecord = null,
-    /// The request's tail release (`tailRelease`; reset at each prefill).
-    tail_release: ?TailReleaseRecord = null,
-    /// When the tail release's frees ended (the phase change's free_to_grow_ms starts here on that route).
-    tail_freed_at: ?std.Io.Timestamp = null,
     /// The Module holds its prompt configuration (the scratch, the prompt rows, the prompt cache limit): false from a
     /// prompt's tail release or phase change until the reverse phase change (`requestEnd`).
     prompt_ready: bool = true,
@@ -629,11 +445,10 @@ pub const Module = struct {
     reverse_change: ?ReverseRecord = null,
     /// A harness's observer at the phase change's proof points (set before the first request; none on the served path).
     phase_observer: ?PhaseObserver = null,
-    /// prompt_stats' scratch (built at construction when installed) and the rows the phase change grew to.
-    decode_rows: ?arm_mod.DecodeRows = null,
+    /// The rows the phase change grows to when they are not the admitted count everywhere (the record granule's).
     grown_rows: ?[]const u32 = null,
-    /// The record granule's single decode records (`RouteOverrides.decode_extra_records`) and, on the uniform route,
-    /// its rows (layers 0 .. extra - 1 one more), built at construction.
+    /// The record granule's single decode records (`RouteOverrides.decode_extra_records`) and its rows (layers
+    /// 0 .. extra - 1 one more), built at construction.
     decode_extra: u32 = 0,
     uniform_rows: []u32 = &.{},
     /// The request's decode host side (`DecodeHost`; reset at each phase change).
@@ -665,15 +480,15 @@ pub const Module = struct {
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
-            log.err("prefill routes refused: {s}", .{@errorName(e)});
+            log.err("prefill routes refused: {s}\n", .{@errorName(e)});
             return e;
         };
         _ = decodeCacheLimit(ov) catch |e| {
-            log.err("decode cache limit refused: {d} B (at most the envelope's {d} B)", .{ ov.decode_cache_bytes.?, envelope.decode_cache_bytes });
+            log.err("decode cache limit refused: {d} B (at most the envelope's {d} B)\n", .{ ov.decode_cache_bytes.?, envelope.decode_cache_bytes });
             return e;
         };
         const poll_ms = phaseChangePollMs(ov) catch |e| {
-            log.err("phase change poll refused: {d} ms (1..{d})", .{ ov.phase_change_poll_ms.?, phase_change_settle_ms });
+            log.err("phase change poll refused: {d} ms (1..{d})\n", .{ ov.phase_change_poll_ms.?, phase_change_settle_ms });
             return e;
         };
         const self = try gpa.create(Module);
@@ -686,7 +501,7 @@ pub const Module = struct {
         var diag: arm_mod.Diag = .{};
         var vd0: v41.Diag = .{};
         const c0 = v41.Config.load(gpa, io, dir, &vd0) catch |e| {
-            log.err("config refused: {s}", .{vd0.message()});
+            log.err("config refused: {s}\n", .{vd0.message()});
             return e;
         };
         claimBank(gpa, io, dir, &diag) catch |e| return refused(e, &diag);
@@ -713,7 +528,7 @@ pub const Module = struct {
                 admitted.expert_rows = nr.decode;
                 admitted.expert_prefill_rows = nr.prefill;
             }
-            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill{s}, baseline {d} B, target {d} B)", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, if (ov.bill_pinned_prompt) |pp| pp else bill_mod.servedContext(&admitted), if (ov.bill_pinned_prompt == null) ", every length up to it" else " alone", admitted.memory_baseline_bytes orelse 0, target });
+            log.info("admission: native fill {d} prefill / {d} decode rows per layer (the {d}-token request's bill{s}, baseline {d} B, target {d} B)\n", .{ admitted.expert_prefill_rows.?, admitted.expert_rows.?, if (ov.bill_pinned_prompt) |pp| pp else bill_mod.servedContext(&admitted), if (ov.bill_pinned_prompt == null) ", every length up to it" else " alone", admitted.memory_baseline_bytes orelse 0, target });
         }
         errdefer self.dropKernels();
         // The fused down GEMM, when overridden: its self-checks on the set, then every layer's DIG-X waves launch it.
@@ -721,8 +536,7 @@ pub const Module = struct {
             var kd: xk.Diag = .{};
             self.exl3.routeFusedDown(self.set, &kd) catch |e| return refused(refuse(&diag, e, "exl3 fused down: {s}", .{kd.message()}), &diag);
         }
-        // The routed decode forms, when overridden: the GEMVs rebuilt on their texts (exact by the registry's twins);
-        // GEMV_REBUILD: rebuilt on the stock texts too (the accept-time GEMVs freed; the stock-route leak's discriminator).
+        // The routed decode forms, when overridden: the GEMVs rebuilt on their texts (exact by the registry's twins).
         if (formsRoute(ov)) |f| try self.exl3.routeForms(&self.g, f);
         // The banked route, when overridden: after the forms (it aliases their GEMVs' statics); the hook binds its waves.
         if (ov.routed_banked orelse false) try self.exl3.routeBanked(&self.g);
@@ -733,7 +547,7 @@ pub const Module = struct {
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
             var b = bill_mod.servedBill(arena.allocator(), io, &admitted, sdk.memory.vmBytes().wired, ceiling_bytes, ov) catch |e| {
-                log.err("admission refused before construction: {s}", .{@errorName(e)});
+                log.err("admission refused before construction: {s}\n", .{@errorName(e)});
                 return e;
             };
             // The record granule: the fill's leftover below one row as single decode records, billed (slot_decode).
@@ -748,7 +562,7 @@ pub const Module = struct {
             // Forced rows too: both phases' totals under the target (a baseline-free shell bills the process alone).
             const mb = try bill_mod.memoryBill(arena.allocator(), b);
             sdk.admit(mb, b.baseline, .{ .prompt = b.prefill_rows, .decode = b.decode_rows }, self.fill_target) catch |e| {
-                log.err("admission refused before construction: {s} (prompt total {d} B, decode total {d} B, target {d} B)", .{ @errorName(e), b.prefillTotal(), b.decodeTotal(), self.fill_target });
+                log.err("admission refused before construction: {s} (prompt total {d} B, decode total {d} B, target {d} B)\n", .{ @errorName(e), b.prefillTotal(), b.decodeTotal(), self.fill_target });
                 return e;
             };
         }
@@ -763,7 +577,7 @@ pub const Module = struct {
             .{ .host_waits = try self.buildArm(A, io, &admitted, weights, s, ceiling, null, &diag) };
         errdefer self.dropArm();
         var vd: v41.Diag = .{};
-        errdefer if (vd.len > 0) log.err("residents refused: {s}", .{vd.message()});
+        errdefer if (vd.len > 0) log.err("residents refused: {s}\n", .{vd.message()});
         const c = switch (self.arm) {
             inline else => |t| t.arm.config,
         };
@@ -793,8 +607,6 @@ pub const Module = struct {
         if (ov.decode_index_topk) |v| tier.routes.rc_index_topk = v;
         if (ov.decode_smallm) |v| tier.routes.rc_smallm = v;
         if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
-        if (ov.decode_shared_mid) |v| tier.routes.shared_mid = v;
-        if (ov.decode_memos) |v| tier.routes.decode_memos = v;
         tier.routes.input_stream_early_release = inputStreamEarlyRelease(ov);
         tier.routes.prefill_input_release = prefillInputRelease(ov);
         if (ov.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
@@ -820,7 +632,7 @@ pub const Module = struct {
             tier.routes.prefill_oproj = v;
         }
         tier.layer_major = layer_major;
-        log.info("numeric tier: {t}", .{config.numeric_tier orelse .served});
+        log.info("numeric tier: {t}\n", .{config.numeric_tier orelse .served});
         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
         errdefer self.model.deinit(&self.g);
         // HEAD_MODE mxfp8: the model evaluated its quantized head at construction and reads nothing else of the
@@ -834,9 +646,9 @@ pub const Module = struct {
         }
         if (tier.routes.head == .mxfp8) {
             weights.drop("head.weight");
-            log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B", .{self.model.droppedBytes()});
+            log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B\n", .{self.model.droppedBytes()});
         }
-        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.prefill_hcpost or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax or tier.routes.shared_mid) try self.checkPrefillRoutes();
+        if (tier.routes.prefill_attn or tier.routes.prefill_index or tier.routes.prefill_hc or tier.routes.prefill_combine or tier.routes.prefill_oproj or tier.routes.prefill_joinless or tier.routes.prefill_hc_post or tier.routes.prefill_hcpost or tier.routes.rc_smallm or tier.routes.rc_mxfp8_rows or tier.routes.rc_index_topk or tier.routes.rc_attn_softmax) try self.checkPrefillRoutes();
         // ENGRAM=prefetch: the poster threads started and their gathers checked against a read past the cache.
         if (tier.routes.engram_posted and tier.layer_major and c.engram.n_layers > 0) {
             // The pass posts slot s + 1 once slot s's layer is taken: the slots run in layer order.
@@ -846,29 +658,27 @@ pub const Module = struct {
             }
             try self.engram.enablePosting();
             self.checkEngramPosted(gpa) catch |e| {
-                log.err("NATIVE engram posted: the construction self-check against a read past the cache failed: {s}", .{@errorName(e)});
+                log.err("NATIVE engram posted: the construction self-check against a read past the cache failed: {s}\n", .{@errorName(e)});
                 return e;
             };
             self.model.engram.?.posted = true;
         }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .first_verify_warm = t.arm.stream.warm != null, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
         };
         // DEVROUTE: exact by construction (the same banked texts per routed pair, the slots the host's plan names; the join
         // takes the miss parts' rows for their pairs).
-        if (self.installed.devroute) log.info("NATIVE devroute: installed (the decode hit wave on the device through each layer's resident LUT, committed before the routing barrier's wait)", .{});
+        if (self.installed.devroute) log.info("NATIVE devroute: installed (the decode hit wave on the device through each layer's resident LUT, committed before the routing barrier's wait)\n", .{});
         // HOIST_FIRST: exact by construction (the same evals of the same arrays; only the hoist's commit moves ahead of the wait).
-        if (self.installed.hoist_first) log.info("NATIVE hoist first: installed (each decode call's hoist committed behind its routing barrier's arrays, before the wait)", .{});
+        if (self.installed.hoist_first) log.info("NATIVE hoist first: installed (each decode call's hoist committed behind its routing barrier's arrays, before the wait)\n", .{});
         var line_buf: [384]u8 = undefined;
-        log.info("{s}", .{self.installed.line(&line_buf)});
-        log.info("{s}", .{self.installed.callSites(&line_buf)});
+        log.info("{s}\n", .{self.installed.line(&line_buf)});
+        log.info("{s}\n", .{self.installed.callSites(&line_buf)});
         self.installed.decode_attn_softmax = self.model.tier.routes.rc_attn_softmax;
         self.installed.ring_geo = self.model.tier.kv;
         self.installed.decode_index_topk = self.model.tier.routes.rc_index_topk;
         self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
         self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
-        self.installed.decode_shared_mid = self.model.tier.routes.shared_mid;
-        self.installed.decode_memos = self.model.tier.routes.decode_memos;
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
         self.installed.prefill_input_release = self.model.tier.routes.prefill_input_release;
         self.prefill_sub = prefillSub(ov, self.model.tier.layer_major);
@@ -880,130 +690,64 @@ pub const Module = struct {
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
         self.installed.routed_forms = self.exl3.forms;
         self.installed.routed_banked = self.exl3.banked != null;
-        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, banked {}", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_banked });
-        self.installed.gemv_rebuild = self.overrides.gemv_rebuild orelse false;
-        if (self.installed.gemv_rebuild) log.info("NATIVE gemv rebuild: installed (the accept-time decode GEMVs freed and rebuilt at construction; forms down_pair {}, gu_one {})", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one });
+        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, banked {}\n", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_banked });
         self.installed.dense_rc = self.model.tier.routes.dense_rc;
-        if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped", .{graph.sharedGateUpBytes(&self.model.c)});
-        log.info("{s}", .{self.installed.decodeSites(&line_buf)});
-        log.info("NATIVE decode dispatch fuse installed: shared middle {}, memos {}", .{ self.installed.decode_shared_mid, self.installed.decode_memos });
-        log.info("NATIVE head installed: {t}, verify rows on m1rows {}", .{ self.installed.head_mode, self.model.head_rows != null });
-        if (self.installed.head_mode == .mxfp8) log.info("NATIVE head mxfp8 apply: {s}", .{if (self.installed.head_mxfp8_rc) "rcproj (the verify rows and the draft block at <= 8 rows)" else "mlx quantized_matmul"});
-        log.info("NATIVE prefill input streams: {s}", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
-        if (self.installed.prefill_hcpost) log.info("NATIVE prefill HC post: fused (both HC combines above 8 rows in one pass on the region's numerics; checked against the region at construction; word-exact on every normal-range and mixed-edge input tested, an input whose products are all below 2^-126 is not covered)", .{});
-        if (self.installed.prefill_shared_mid) log.info("NATIVE prefill shared middle: compiled (the shared expert's clamps, silu and product as one region above 8 rows)", .{});
-        if (self.installed.prefill_input_release) log.info("NATIVE prefill input release: installed (each routed group's MoE inputs freed after its wide call)", .{});
-        log.info("NATIVE prefill predictor installed: {s}", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
-        log.info("NATIVE transient release: {s}", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
-        log.info("NATIVE grow fill: {t} ({s})", .{ self.installed.grow_fill, switch (self.installed.grow_fill) {
+        if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped\n", .{graph.sharedGateUpBytes(&self.model.c)});
+        log.info("{s}\n", .{self.installed.decodeSites(&line_buf)});
+        log.info("NATIVE head installed: {t}, verify rows on m1rows {}\n", .{ self.installed.head_mode, self.model.head_rows != null });
+        if (self.installed.head_mode == .mxfp8) log.info("NATIVE head mxfp8 apply: {s}\n", .{if (self.installed.head_mxfp8_rc) "rcproj (the verify rows and the draft block at <= 8 rows)" else "mlx quantized_matmul"});
+        log.info("NATIVE prefill input streams: {s}\n", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
+        if (self.installed.prefill_hcpost) log.info("NATIVE prefill HC post: fused (both HC combines above 8 rows in one pass on the region's numerics; checked against the region at construction; word-exact on every normal-range and mixed-edge input tested, an input whose products are all below 2^-126 is not covered)\n", .{});
+        if (self.installed.prefill_shared_mid) log.info("NATIVE prefill shared middle: compiled (the shared expert's clamps, silu and product as one region above 8 rows)\n", .{});
+        if (self.installed.prefill_input_release) log.info("NATIVE prefill input release: installed (each routed group's MoE inputs freed after its wide call)\n", .{});
+        log.info("NATIVE prefill predictor installed: {s}\n", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
+        log.info("NATIVE transient release: {s}\n", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
+        log.info("NATIVE grow fill: {t} ({s})\n", .{ self.installed.grow_fill, switch (self.installed.grow_fill) {
             .zeros => "the grown rows zero-filled on the GPU",
             .unfilled => "the grown rows MLX-owned without a fill; each is written by its read before any kernel reads it",
         } });
-        log.info("NATIVE first-verify warm: {s}", .{if (self.installed.first_verify_warm) "installed (the grow reads each layer's prompt-tail set into its empty rows below demand; a layer's first decode route cancels the unread)" else "off"});
         self.installed.phase_change_poll_ms = poll_ms;
         self.installed.phase_change_settle = phaseChangeSettle(ov);
-        self.installed.host_relief = hostRelief(ov);
         self.installed.decode_cache_bytes = decodeCacheLimit(ov) catch unreachable;
-        log.info("NATIVE decode cache limit: {d} B ({s})", .{ self.installed.decode_cache_bytes, if (self.installed.decode_cache_bytes == envelope.decode_cache_bytes) "the envelope's" else "the route's" });
-        log.info("NATIVE host relief: {s}", .{if (self.installed.host_relief) "installed (malloc_zone_pressure_relief once at the phase change, after the frees)" else "off"});
-        self.installed.reader_sched = readerSched(config);
-        {
-            const rs = self.installed.reader_sched;
-            var nb: [sdk_ext.expert.Sched.name_len]u8 = undefined;
-            log.info("NATIVE reader scheduling: {s} (constructing thread {s}; threads {s}; spin {s}; speculative chunks {s}; keep-warm {s})", .{ rs.name(&nb), if (rs.start_ui) "USER_INTERACTIVE at the pool start" else "unchanged", if (rs.qos) "USER_INTERACTIVE demand + watchdog, UTILITY speculative, named" else if (rs.qos_demand) "USER_INTERACTIVE demand + watchdog, speculative inherited (no UTILITY), named" else "inherit the constructing thread's QoS", if (rs.spin) "30 us before a demand worker or the submitter sleeps" else "none", if (rs.demand_first) "only while no demand job is queued or executing" else "while at most one demand job executes (stock)", if (rs.keep_warm and rs.keep_warm_prefill) "one thread through the prompt and decode phases" else if (rs.keep_warm and rs.keep_warm_us > 0) "one thread through the decode phase, sleeping its us per loop" else if (rs.keep_warm) "one spinner thread through the decode phase" else "none" });
-        }
-        log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
-        log.info("NATIVE phase change settle: {t} ({s})", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
+        log.info("NATIVE decode cache limit: {d} B ({s})\n", .{ self.installed.decode_cache_bytes, if (self.installed.decode_cache_bytes == envelope.decode_cache_bytes) "the envelope's" else "the route's" });
+        log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)\n", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
+        log.info("NATIVE phase change settle: {t} ({s})\n", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
             .interval => "until the footprint is down by the freed bytes",
             .until_freed => "until the footprint is down by the freed bytes and at most the grow's bound, the decode bill less the grow",
         } });
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
-        if (draftCacheHot(ov)) |hot| {
-            var ck = try v41.Checkpoint.openIndexed(gpa, io, dir, &vd);
-            defer ck.deinit();
-            const pool = switch (self.arm) {
-                inline else => |t| t.arm.stream.pool,
-            };
-            self.draft_cache = dh.DraftCache.openWith(gpa, &ck, &c, hot, try draftCachePool(ov), try draftCachePolicy(ov), .{ .mlx = s }, pool) catch |e| {
-                log.err("draft cache refused at hot {d}: {s}", .{ hot, @errorName(e) });
-                return e;
-            };
-        }
-        errdefer if (self.draft_cache) |dc| dc.deinit();
-        _ = try draftCachePool(ov);
-        _ = try draftCachePolicy(ov);
-        self.installed.draft_cache_hot = draftCacheHot(ov);
-        const rows_alloc = decodeRowsAlloc(ov);
-        switch (self.arm) {
-            inline else => |t| {
-                checkDecodeRowsAlloc(rows_alloc, self.installed.wide.seed, t.arm.prefill_rows[0], t.arm.decode_rows[0]) catch |e| {
-                    log.err("decode rows alloc {t} refused at construction: {s}", .{ rows_alloc, @errorName(e) });
-                    return e;
-                };
-                checkDecodePoolRoutes(rows_alloc, decodeFillGranule(ov), self.installed.transient_release) catch |e| {
-                    log.err("decode rows alloc {t} refused at construction: {s}", .{ rows_alloc, @errorName(e) });
-                    return e;
-                };
-                if (rows_alloc == .prompt_stats) self.decode_rows = try arm_mod.DecodeRows.init(gpa, @intCast(t.arm.prefill_rows.len), t.arm.bank.n_experts);
-            },
-        }
-        self.installed.decode_rows_alloc = rows_alloc;
         self.installed.decode_fill_granule = decodeFillGranule(ov);
         self.decode_extra = self.overrides.decode_extra_records orelse 0;
-        if (rows_alloc == .uniform and self.decode_extra > 0) switch (self.arm) {
+        if (self.decode_extra > 0) switch (self.arm) {
             inline else => |t| {
                 self.uniform_rows = try gpa.alloc(u32, t.arm.decode_rows.len);
                 arm_mod.uniformRows(self.uniform_rows, t.arm.decode_rows[0], self.decode_extra);
                 self.grown_rows = self.uniform_rows;
             },
         };
-        log.info("NATIVE decode fill granule: {t} ({d} single decode records past the rows)", .{ self.installed.decode_fill_granule, self.decode_extra });
-        log.info("NATIVE decode rows alloc: {s}", .{switch (rows_alloc) {
-            .uniform => "uniform",
-            .prompt_stats => std.fmt.comptimePrint("prompt_stats (shift cap {d}; floor max(prompt rows, U - {d}); total U x layers)", .{ arm_mod.decode_rows_shift_cap, arm_mod.decode_rows_shift_cap }),
-            .decode_first16 => std.fmt.comptimePrint("decode_first16 ({d} pool rows per layer in window 0; re-owned once at the end of cycle {d} from cycles {d}..{d}'s misses, m / r^3; total U x layers)", .{ (expert_stream.DecodePool{}).per_layer, (expert_stream.DecodePool{}).at_cycle, (expert_stream.DecodePool{}).from_cycle, (expert_stream.DecodePool{}).at_cycle }),
-        }});
-        self.installed.draft_cache_pool = if (self.draft_cache) |dc| dc.geom.pool else null;
-        self.installed.draft_cache_policy = if (self.draft_cache) |dc| dc.geom.policy else null;
-        if (self.draft_cache) |dc| {
-            const caps = dc.geom.caps[0..dc.geom.n_groups];
-            log.info("NATIVE draft experts: cached (hot {d} = {any} persistent + {d} transient slots per group, pool {t}, policy {t}, {d} B of slot banks; misses read past the page cache by the stream's pool; seeded with first ids)", .{ dc.hot, caps, dc.geom.transient, dc.geom.pool, dc.geom.policy, dc.cache.geom.billBytes() });
-        } else log.info("NATIVE draft experts: resident ({d} x {d} B)", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
-        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .cache = self.draft_cache, .head_mx = if (self.model.head_mx) |*hm| hm else null, .staged_commit = draftStaged(ov) });
+        log.info("NATIVE decode fill granule: {t} ({d} single decode records past the rows)\n", .{ self.installed.decode_fill_granule, self.decode_extra });
+        log.info("NATIVE draft experts: resident ({d} x {d} B)\n", .{ @as(u64, c.dspark.n_stages) * c.dspark.n_routed_experts, dh.expertBytes(&c) });
+        self.head = try H.initWith(gpa, &self.g, c, tier.draftRoutes(), weights, .{ .subset = subset, .registry = &self.set.reg, .head_mx = if (self.model.head_mx) |*hm| hm else null, .staged_commit = draftStaged(ov) });
         errdefer self.head.deinit(&self.g);
         // DRAFT_STAGED: exact by construction (the block's graph unchanged; each stage's outputs committed once built).
         self.installed.draft_staged = self.head.stagedCommit();
-        if (self.installed.draft_staged) log.info("NATIVE draft staged commits: installed (each draft stage committed once built)", .{});
+        if (self.installed.draft_staged) log.info("NATIVE draft staged commits: installed (each draft stage committed once built)\n", .{});
         // The decode lane: DSpark (typical acceptance, the tier of record) on the served tier with a draft head.
         if (self.head.nStages() > 0 and (config.numeric_tier orelse .served) == .served) self.dspark_cfg = dspark_config;
         // DRAFT_AHEAD: exact by construction (the same block graph; built during the verify's wait, committed only on the
-        // outcome it was built for, its primary written into its own inputs first). Refused without the DSpark lane or
-        // with DRAFTCACHE (a routing barrier inside the block would run it before its primary is written).
+        // outcome it was built for, its primary written into its own inputs first). Refused without the DSpark lane.
         if (draftAhead(ov)) {
-            if (self.dspark_cfg == null or self.draft_cache != null) {
-                log.err("draft ahead refused: it needs the DSpark lane ({}) and resident draft experts ({})", .{ self.dspark_cfg != null, self.draft_cache == null });
+            if (self.dspark_cfg == null) {
+                log.err("draft ahead refused: it needs the DSpark lane\n", .{});
                 return error.DraftAheadUnsupported;
             }
             self.dspark_cfg.?.draft_ahead = true;
             self.installed.draft_ahead = true;
-            log.info("NATIVE draft ahead: installed (the next draft built during each verify's wait, committed when every draft is accepted)", .{});
+            log.info("NATIVE draft ahead: installed (the next draft built during each verify's wait, committed when every draft is accepted)\n", .{});
         }
-        log.info("NATIVE decode lane installed: {s} (draft block {d}), expert reads {s}", .{ self.decodeLane(), self.draftBlockSize(), if (self.arm == .event_gates) "event gates" else "host waits" });
-        self.installed.phase_tail_release = phaseTailRelease(ov);
-        if (self.installed.phase_tail_release and (!self.installed.transient_release or self.dspark_cfg == null)) {
-            log.err("phase tail release refused: it needs the transient release ({}) and the DSpark seed ({})", .{ self.installed.transient_release, self.dspark_cfg != null });
-            return error.PhaseTailReleaseUnsupported;
-        }
-        log.info("NATIVE phase tail release: {s}", .{if (self.installed.phase_tail_release) "installed (the transient release, the cache clear and the decode cache limit at the prompt's last trunk chunk, before the DSpark seed; the phase change keeps its settle, bound and grow)" else "off"});
-        self.installed.phase_grow_delay_ms = phaseGrowDelayMs(ov) catch |e| {
-            log.err("phase grow delay refused: {t} ({?d} ms, the tail release {})", .{ e, ov.phase_grow_delay_ms, self.installed.phase_tail_release });
-            return e;
-        };
-        if (self.installed.phase_grow_delay_ms > 0) {
-            log.info("NATIVE phase grow delay: installed ({d} ms between the settled frees and the grow; the stock phase change otherwise)", .{self.installed.phase_grow_delay_ms});
-        } else log.info("NATIVE phase grow delay: off", .{});
+        log.info("NATIVE decode lane installed: {s} (draft block {d}), expert reads {s}\n", .{ self.decodeLane(), self.draftBlockSize(), if (self.arm == .event_gates) "event gates" else "host waits" });
         // The install warm-up (P4.3): every forward width up to the compiled regions' bound traces here, never
         // in a request, and with the DSpark strategy its 5-row draft block through every stage too (the first
         // round no longer compiles its draft inside timed decode). pass3an2's widths (B above the start): width
@@ -1019,8 +763,8 @@ pub const Module = struct {
         // held to the allocator's cache, and a clear ahead of them leaves those cached.
         _ = mlx.mlx_synchronize(self.g.s);
         self.g.clearCache();
-        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
-        log.info("NATIVE warm-up peaks by width 1..{d} then the draft block (0: not warmed), B above the residents: {any}", .{ self.warm_peaks.len - 1, self.warm_peaks });
+        log.info("warm-up: {d} widths, widest peak {d} B above the residents; built residents {d} B\n", .{ self.warm_peaks.len - 1, std.mem.max(u64, self.warm_peaks), self.model.builtBytes() + self.head.builtBytes() });
+        log.info("NATIVE warm-up peaks by width 1..{d} then the draft block (0: not warmed), B above the residents: {any}\n", .{ self.warm_peaks.len - 1, self.warm_peaks });
         // The input embedding moves to its host rows now, not at the phase change: every lookup (the
         // prompt's included) reads the table's rows past the page cache, and the device table is gone
         // from both phases. Checked once: the rows equal the table's, byte for byte.
@@ -1034,7 +778,7 @@ pub const Module = struct {
             // footprint). The phase change's settle waits for the footprint to show the release (bounded)
             // before the construction check reads it.
             const st = settle(LiveReader{ .io = self.io }, before, self.model.embeddingBytes(), phase_change_poll_ms, null);
-            log.info("NATIVE embedding fence: footprint {d} -> {d} B (the table {d} B), settled in {d} ms", .{ before.footprint, st.after.footprint, self.model.embeddingBytes(), st.waited_ms });
+            log.info("NATIVE embedding fence: footprint {d} -> {d} B (the table {d} B), settled in {d} ms\n", .{ before.footprint, st.after.footprint, self.model.embeddingBytes(), st.waited_ms });
             self.fenced = true;
             self.installed.embedding_rows = true;
         }
@@ -1046,20 +790,14 @@ pub const Module = struct {
             };
             const billed = bill.waveBytes(M.scratch_rows, M.scratch_rows, bt) + (if (bt == .stock) bill.head_promotion_bytes else 0);
             const measured = std.mem.max(u64, self.warm_peaks);
-            log.info("bill: decode-width wave billed {d} B, warm-up measured {d} B, error {d} B", .{ billed, measured, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)) });
+            log.info("bill: decode-width wave billed {d} B, warm-up measured {d} B, error {d} B\n", .{ billed, measured, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)) });
         }
         // The warm-up's residents belong to no prompt (its wide calls even seed and protect them): forgotten once here,
         // so the first prompt's seed takes every prompt row and its read-ahead starts from empty rows.
         const forgotten = switch (self.arm) {
             inline else => |t| try t.arm.stream.forgetResidents(),
         };
-        log.info("NATIVE construction residents forgotten: {d} rows (the warm-up's); every layer's protection, seed and prompt counts cleared", .{forgotten});
-        // DRAFTCACHE: the warm-up's draft block belongs to no request either; each stage's first ids seed its hot slots.
-        if (self.draft_cache) |dc| {
-            const seeded = try dc.seedFirstIds();
-            log.info("NATIVE draft cache seeded: {d} records (each stage's first ids), {d} B read", .{ seeded, dc.cache.stats.expert_bytes_read });
-            dc.cache.stats = .{};
-        }
+        log.info("NATIVE construction residents forgotten: {d} rows (the warm-up's); every layer's protection, seed and prompt counts cleared\n", .{forgotten});
         // The construction check (once, before any request): the native bill at the rows the arm built,
         // against the footprint the module holds now.
         try self.checkConstruction(io, &admitted, ceiling_bytes);
@@ -1083,7 +821,7 @@ pub const Module = struct {
             inline else => |t| arm_mod.NativeRows{ .prefill = t.arm.prefill_rows[0], .decode = t.arm.decode_rows[0] },
         };
         sdk.checkRows(.{ .prompt = b.prefill_rows, .decode = b.decode_rows }, .{ .prompt = rows.prefill, .decode = rows.decode }) catch |e| {
-            log.err("construction check: the bill plans {d} / {d} rows, the arm built {d} / {d}", .{ b.prefill_rows, b.decode_rows, rows.prefill, rows.decode });
+            log.err("construction check: the bill plans {d} / {d} rows, the arm built {d} / {d}\n", .{ b.prefill_rows, b.decode_rows, rows.prefill, rows.decode });
             return e;
         };
         self.bill = b;
@@ -1100,16 +838,16 @@ pub const Module = struct {
         var mlx_cache: usize = 0;
         _ = mlx.mlx_get_active_memory(&mlx_active);
         _ = mlx.mlx_get_cache_memory(&mlx_cache);
-        log.info("NATIVE construction check: MLX active {d} B, MLX cache {d} B, host side {d} B (the footprint less both)", .{ mlx_active, mlx_cache, measured -| mlx_active -| mlx_cache });
-        log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)", .{ measured, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)), construction_tolerance_bytes });
+        log.info("NATIVE construction check: MLX active {d} B, MLX cache {d} B, host side {d} B (the footprint less both)\n", .{ mlx_active, mlx_cache, measured -| mlx_active -| mlx_cache });
+        log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)\n", .{ measured, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)), construction_tolerance_bytes });
         sdk.checkConstruction(billed, measured, construction_tolerance_bytes) catch |e| {
-            log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B", .{ measured, billed, construction_tolerance_bytes });
+            log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B\n", .{ measured, billed, construction_tolerance_bytes });
             return e;
         };
         // The bill's measured bound (the host side) against its one measurement here.
         const host_side = measured -| mlx_active -| mlx_cache;
         for (mb.terms) |t| if (t.measured) sdk.checkMeasured(t, host_side) catch |e| {
-            log.err("construction check: the host side {d} B exceeds its billed bound {d} B", .{ host_side, t.bytes[0] });
+            log.err("construction check: the host side {d} B exceeds its billed bound {d} B\n", .{ host_side, t.bytes[0] });
             return e;
         };
     }
@@ -1122,18 +860,8 @@ pub const Module = struct {
         var opts = armOptions(config, ceiling, .{ .mlx = s });
         opts.event = if (event) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = event_watchdog_ms } else null;
         opts.transient_release = transientRelease(self.overrides);
-        // DRAFTCACHE reads on its own tickets of the stream's pool (more tickets, the demand ring unchanged).
-        if (draftCacheHot(self.overrides) != null) {
-            opts.pool.tickets += dh.draft_aux_tickets;
-            opts.pool.aux_tickets = dh.draft_aux_tickets;
-        }
-        opts.pool.sched = readerSched(config);
         opts.grow_fill = growFill(self.overrides);
-        const warm = firstVerifyWarm(self.overrides);
-        opts.first_verify_warm = if (warm) .{} else null;
-        if (decodeRowsAlloc(self.overrides) == .decode_first16) opts.decode_pool = .{};
-        var wide = wideRoute(config);
-        wide.warm_tail = warm;
+        const wide = wideRoute(config);
         const arm = AT.initHooked(gpa, io, &self.g, self.exl3, opts, .{ .gates = gates, .event = event, .wide = wide, .banked = self.exl3.banked != null, .hoist_first = hoistFirst(self.overrides), .devroute = devRoute(self.overrides) }, diag) catch |e| return refused(e, diag);
         errdefer arm.deinit();
         checkArmBanks(arm, &self.g, self.exl3, diag) catch |e| return refused(e, diag);
@@ -1141,20 +869,18 @@ pub const Module = struct {
         if (comptime AT == AGated) {
             arm.hook.checkGates(&self.g, gpa, arm.config.n_experts_per_tok) catch |e|
                 return refused(refuse(diag, e, "event gates: the gated waves differ from the same slots waited, or a gate was forced", .{}), diag);
-            log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)", .{arm.config.n_experts_per_tok});
+            log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)\n", .{arm.config.n_experts_per_tok});
         }
         // P1, once before any request: records read ahead against the same records read on demand.
         if (wideRoute(config).read_ahead) {
             const n = arm.hook.checkReadAhead() catch |e|
                 return refused(refuse(diag, e, "read-ahead: a record read ahead differs from its demand read, or a read failed", .{}), diag);
-            log.info("NATIVE read-ahead: the construction self-check passed (layer 0, {d} records: read ahead == demand read, bit for bit)", .{n});
+            log.info("NATIVE read-ahead: the construction self-check passed (layer 0, {d} records: read ahead == demand read, bit for bit)\n", .{n});
         }
         // P1b: exact by construction (the base call's rows and slots are the seed's; only its place moves).
-        if (arm.hook.wide_route.base_at_seed) log.info("NATIVE base call at the seed: installed (the seed's deferred base call drains once its groups are read)", .{});
+        if (arm.hook.wide_route.base_at_seed) log.info("NATIVE base call at the seed: installed (the seed's deferred base call drains once its groups are read)\n", .{});
         // P1c: exact by construction (groups change no expert's rows; the base call's place moves before the stream's).
-        if (arm.hook.wide_route.seed_aligned) log.info("NATIVE seed-aligned groups: installed (the seed's ranks grouped apart from the stream's; the base call after the last seed group)", .{});
-        // P1d: exact by construction (the same base rows, slots and kernels; the resident ones drain first, in their own call).
-        if (arm.hook.wide_route.resident_first) log.info("NATIVE prefill base split: resident_first (the base rows resident at the barrier drain before the seed's reads land)", .{});
+        if (arm.hook.wide_route.seed_aligned) log.info("NATIVE seed-aligned groups: installed (the seed's ranks grouped apart from the stream's; the base call after the last seed group)\n", .{});
         arm.grown_check = .{ .ctx = self.exl3, .check = GrownBanks(AT).check };
         return .{ .arm = arm, .gates = gates };
     }
@@ -1176,49 +902,7 @@ pub const Module = struct {
         if (self.decode_host.end != null) return;
         const m = BoundaryMemory.now();
         self.decode_host.end = hostSideOf(m);
-        log.info("NATIVE decode host side: end of decode {d} B (after the grow {d} B; footprint {d} B, MLX active {d} B, cache {d} B)", .{ self.decode_host.end.?, after, m.footprint, m.active, m.cache });
-        self.logUniformPromptRows();
-        self.logPoolReplan();
-    }
-
-    /// decode_first16's line after the decode (off every clock): the rows each layer was re-owned to and the misses
-    /// the rule read, or that the re-plan never ran (a decode shorter than its cycle).
-    fn logPoolReplan(self: *Module) void {
-        if (self.installed.decode_rows_alloc != .decode_first16) return;
-        const st = switch (self.arm) {
-            inline else => |t| t.arm.stream,
-        };
-        const r = st.poolReplan() orelse {
-            log.info("NATIVE DSV41_DECODE_ROWS skipped: decode ended before the re-plan's cycle", .{});
-            return;
-        };
-        const sm = rowsSummary(r.rows);
-        const json = std.json.Stringify.valueAlloc(self.gpa, .{ .alloc = "decode_first16", .uniform = self.bill.decode_rows, .layers = r.rows, .total = sm.total, .min = sm.min, .max = sm.max, .misses = r.misses }, .{}) catch return;
-        defer self.gpa.free(json);
-        log.info("NATIVE DSV41_DECODE_ROWS {s}", .{json});
-    }
-
-    /// The uniform route's counterpart of `logDecodeRows`, after the decode (off every clock; the prompt counts are
-    /// unchanged by decode): the rows prompt_stats would have grown to and each layer's prompt tail.
-    fn logUniformPromptRows(self: *Module) void {
-        if (self.installed.decode_rows_alloc != .uniform) return;
-        self.logUniformPromptRowsOr() catch |e| log.info("NATIVE DSV41_DECODE_ROWS skipped: {s}", .{@errorName(e)});
-    }
-
-    fn logUniformPromptRowsOr(self: *Module) !void {
-        if (!self.installed.wide.seed) return error.NoPromptSeeds;
-        switch (self.arm) {
-            inline else => |t| {
-                if (t.arm.prefill_rows[0] >= t.arm.decode_rows[0]) return error.NoRoomAbovePromptRows;
-                var dr = try arm_mod.DecodeRows.init(self.gpa, @intCast(t.arm.prefill_rows.len), t.arm.bank.n_experts);
-                defer dr.deinit(self.gpa);
-                const would = try t.arm.promptRows(&dr, self.decode_extra);
-                const s = rowsSummary(would);
-                const json = try std.json.Stringify.valueAlloc(self.gpa, .{ .alloc = "uniform", .uniform = t.arm.decode_rows[0], .extra = self.decode_extra, .prompt_stats_layers = would, .total = s.total, .min = s.min, .max = s.max, .tail_ppm = dr.tail_ppm }, .{});
-                defer self.gpa.free(json);
-                log.info("NATIVE DSV41_DECODE_ROWS {s}", .{json});
-            },
-        }
+        log.info("NATIVE decode host side: end of decode {d} B (after the grow {d} B; footprint {d} B, MLX active {d} B, cache {d} B)\n", .{ self.decode_host.end.?, after, m.footprint, m.active, m.cache });
     }
 
     pub fn deinit(self: *Module) void {
@@ -1227,8 +911,6 @@ pub const Module = struct {
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);
         self.head.deinit(&self.g);
-        if (self.draft_cache) |dc| dc.deinit();
-        if (self.decode_rows) |*dr| dr.deinit(gpa);
         gpa.free(self.uniform_rows);
         self.model.deinit(&self.g);
         self.embed_rows.close();
@@ -1277,11 +959,6 @@ pub const Module = struct {
         var checks: [40]Tr.RouteCheck = undefined;
         var n = try Tr.prefillRoutesCheck(&self.g, c, &self.model.tier.routes, &self.model.kx, self.model.layers, scratch, &checks);
         n += try Tr.decodeRoutesCheck(&self.g, c, &self.model.kx, self.model.layers, scratch, checks[n..]);
-        // C22 moeshared: the compiled middle against the op chain, bit for bit.
-        if (self.model.tier.routes.shared_mid) {
-            checks[n] = .{ .name = "shared middle compiled", .ok = try Tr.sharedMidCheck(&self.g, c, &self.model.tier.routes, scratch) };
-            n += 1;
-        }
         // C29's Engram wkv (the model's route): its first slot against the stock qmm at 5 rows.
         if (self.model.engram_m1[0]) |*s| {
             const en = self.model.engram.?;
@@ -1298,11 +975,11 @@ pub const Module = struct {
             var b: [1]bool = undefined;
             _ = try self.g.hostBool(ck.ok, &b);
             if (!b[0]) {
-                log.err("NATIVE prefill route {s}: the construction self-check against the stock chain failed", .{ck.name});
+                log.err("NATIVE prefill route {s}: the construction self-check against the stock chain failed\n", .{ck.name});
                 return error.PrefillRouteSelfCheck;
             }
         }
-        log.info("NATIVE prefill routes: {d} construction self-checks against the stock chain passed", .{n});
+        log.info("NATIVE prefill routes: {d} construction self-checks against the stock chain passed\n", .{n});
     }
 
     /// The kernels go after the last launch drained.
@@ -1323,14 +1000,11 @@ pub const Module = struct {
     /// `reserved_tokens` is the request's KV reservation (the shell's `KVCache.reserve`: prompt +
     /// its generation budget + a chunk); 0 (none declared) bounds it at the prompt plus the shell's
     /// generation headroom. A forward past the bound is refused by name (BoundedLaneFull).
+    ///
+    /// The served shell always sends the whole prompt here (`Transformer.forwardDsv41WithImpl`: step 0 is `prefill`, every
+    /// later forward `extend`, refused before the handover); a harness may send a prompt's first part and the rest through
+    /// `prefillContinue`.
     pub fn prefill(self: *Module, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
-        return self.prefillPart(ids, reserved_tokens, true);
-    }
-
-    /// `prefill` over a prompt's first part; `final` false when `prefillContinue` follows (a split prompt). The served shell
-    /// always sends the whole prompt here (`Transformer.forwardDsv41WithImpl`: step 0 is `prefill`, every later forward
-    /// `extend`, refused before the handover), so only a harness passes false.
-    pub fn prefillPart(self: *Module, ids: []const u32, reserved_tokens: u64, final: bool) !mlx.mlx_array {
         // The request against the context the construction billed, once, before anything of it runs.
         try checkContext(ids.len, self.max_context, self.overrides.bill_pinned_prompt);
         // The previous request's decode end (served path), before this request touches anything.
@@ -1339,8 +1013,6 @@ pub const Module = struct {
         // left the prompt configuration, the reverse phase change, on this request's clock before anything of it allocates.
         try self.requestEnd();
         try self.gate.begin(.prefill);
-        self.tail_release = null;
-        self.tail_freed_at = null;
         // #23: the prompt counts the phase change reads are this request's alone.
         switch (self.arm) {
             inline else => |t| t.arm.stream.resetPromptCounts(),
@@ -1352,14 +1024,14 @@ pub const Module = struct {
         self.prompt_stats0 = self.streamStats();
         self.prompt_tokens = ids.len;
         // A prompt up to the sub-chunk: one call (the standard cell's path); a longer one: sub-chunk calls.
-        const logits = if (ids.len <= self.prefill_sub) try self.promptCall(ids, final) else try self.prefillSubCalls(ids, final);
+        const logits = if (ids.len <= self.prefill_sub) try self.promptCall(ids) else try self.prefillSubCalls(ids);
         self.gate.completePrefill(self.dspark != null);
         return logits;
     }
 
     /// One prompt call from the request's fresh state: the strategy's seeded pass, else the trunk's.
-    fn promptCall(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
-        return if (self.dspark_cfg) |cfg| try self.prefillSeeded(ids, cfg, final) else try self.forward(ids);
+    fn promptCall(self: *Module, ids: []const u32) !mlx.mlx_array {
+        return if (self.dspark_cfg) |cfg| try self.prefillSeeded(ids, cfg) else try self.forward(ids);
     }
 
     /// A prompt longer than the sub-chunk (upstream deepseek_v4's `extendState` loop over `prefillSub()` sub-chunks):
@@ -1367,7 +1039,7 @@ pub const Module = struct {
     /// call's spans pinned to the whole prompt's chunk rule so they are the one-call pass's spans. Between calls the MLX
     /// allocator cache goes back to the driver (upstream's per-sub-chunk release, `extendChunkShouldClearCache`,
     /// deepseek_v4.zig:8079-8087): a call's transients do not repeat their shapes in the next call (its positions grew).
-    fn prefillSubCalls(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
+    fn prefillSubCalls(self: *Module, ids: []const u32) !mlx.mlx_array {
         const st = &self.state.?;
         const tier = &self.model.tier;
         const span = kvc.resolvePrefillChunk(&self.model.c, ids.len, tier.prefill_chunk, tier.chunk_target_bytes);
@@ -1377,11 +1049,11 @@ pub const Module = struct {
         defer if (self.state) |*s| {
             s.span_chunk = null;
         };
-        var logits = try self.promptCall(ids[calls[0][0]..calls[0][1]], final and calls.len == 1);
-        for (calls[1..], 2..) |c, k| {
+        var logits = try self.promptCall(ids[calls[0][0]..calls[0][1]]);
+        for (calls[1..]) |c| {
             _ = mlx.mlx_array_free(logits);
             self.g.clearCache();
-            logits = try self.continueCall(ids[c[0]..c[1]], final and k == calls.len);
+            logits = try self.continueCall(ids[c[0]..c[1]]);
         }
         return logits;
     }
@@ -1428,58 +1100,21 @@ pub const Module = struct {
         _ = try g.hostF32(from_table, t);
         _ = try g.hostF32(from_rows, r);
         if (!std.mem.eql(u8, std.mem.sliceAsBytes(t), std.mem.sliceAsBytes(r))) {
-            log.err("embedding rows: the host rows differ from the resident table", .{});
+            log.err("embedding rows: the host rows differ from the resident table\n", .{});
             return error.EmbeddingRowsDiffer;
         }
     }
 
     /// The prompt pass with the DSpark seed (`Loop.prefill`'s: the main taps of every prompt row seed
     /// the draft head, the lookup takes the prompt); the last row's logits, as `forward`'s.
-    fn prefillSeeded(self: *Module, ids: []const u32, cfg: dsl.Config, final: bool) !mlx.mlx_array {
+    fn prefillSeeded(self: *Module, ids: []const u32, cfg: dsl.Config) !mlx.mlx_array {
         const caches = try self.gpa.alloc(H.Cache, self.head.nStages());
         for (caches) |*x| x.* = .{};
         self.dspark = .{ .lp = dsl.Loop(G).init(&self.g, self.model, self.head, &self.state.?, caches, cfg), .caches = caches };
         errdefer self.dropDspark();
-        // The hook belongs to this prompt part only: a later serial extend must never run it (`armPromptTail`).
-        armPromptTail(&self.dspark.?.lp.tail, self.promptTail(final));
-        defer if (self.dspark) |*d| armPromptTail(&d.lp.tail, null);
         switch (self.arm) {
             inline else => |t| return self.dspark.?.lp.prefillLogits(self.gpa, &t.arm.hook, ids),
         }
-    }
-
-    /// The tail release's hook for a prompt part: only on the prompt's final part (`tailArms`).
-    fn promptTail(self: *Module, final: bool) ?dsl.PromptTail {
-        return if (tailArms(self.installed.phase_tail_release, final)) .{ .ctx = self, .run = tailReleaseThunk } else null;
-    }
-
-    fn tailReleaseThunk(ctx: *anyopaque) anyerror!void {
-        const self: *Module = @ptrCast(@alignCast(ctx));
-        return self.tailRelease();
-    }
-
-    /// The tail release route, once per prompt, at its last trunk chunk (every routed command retired; the seed reads no
-    /// expert row): the phase change's frees, so the driver returns their pages while the seed runs. The transient release
-    /// keeps its proofs (routes flushed, the read-ahead awaited, MLX active down by its bytes); a refusal is the boundary's.
-    fn tailRelease(self: *Module) !void {
-        try self.gate.request();
-        _ = mlx.mlx_synchronize(self.g.s);
-        try self.observe(.tail);
-        self.prompt_ready = false;
-        const t0 = std.Io.Timestamp.now(self.io, .boot);
-        const before = BoundaryMemory.now();
-        const freed = switch (self.arm) {
-            inline else => |t| t.arm.releaseTransient() catch |e| return self.refuseBoundary(e),
-        };
-        self.g.clearCache();
-        setCacheLimit(self.installed.decode_cache_bytes);
-        const after = BoundaryMemory.now();
-        const ns = @max(t0.untilNow(self.io, .boot).nanoseconds, 0);
-        self.tail_release = .{ .freed_bytes = freed, .before = before, .after = after, .ms = @as(f64, @floatFromInt(ns)) / 1e6 };
-        self.tail_freed_at = std.Io.Timestamp.now(self.io, .boot);
-        const json = std.json.Stringify.valueAlloc(self.gpa, self.tail_release.?, .{}) catch return;
-        defer self.gpa.free(json);
-        log.info("NATIVE DSV41_TAIL_RELEASE {s}", .{json});
     }
 
     fn dropDspark(self: *Module) void {
@@ -1557,13 +1192,13 @@ pub const Module = struct {
         const s0 = self.prompt_stats0 orelse return;
         self.prompt_stats0 = null;
         const s1 = self.streamStats();
-        log.info("NATIVE prefill stream: {d} prompt tokens, read {d} B in {d} preadv, {d} misses, {d} routes", .{
+        log.info("NATIVE prefill stream: {d} prompt tokens, read {d} B in {d} preadv, {d} misses, {d} routes\n", .{
             self.prompt_tokens, s1.expert_bytes_read - s0.expert_bytes_read, s1.preadv_calls - s0.preadv_calls, s1.expert_cache_misses - s0.expert_cache_misses, s1.route_calls - s0.route_calls,
         });
         const ahead = switch (self.arm) {
             inline else => |t| t.arm.hook.wide_route.read_ahead,
         };
-        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead", .{
+        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead\n", .{
             s1.ahead_posted - s0.ahead_posted, s1.ahead_hits - s0.ahead_hits, s1.ahead_demand - s0.ahead_demand, s1.ahead_bytes - s0.ahead_bytes,
         });
     }
@@ -1585,21 +1220,15 @@ pub const Module = struct {
         return self.step(ids);
     }
 
-    /// The prompt's continuation: a split prompt runs `prefillPart` over its first part, then this over each
-    /// later part (`final` on the last), all before the decode handover (refused by name after it: the prompt's rows
-    /// are gone).
-    pub fn prefillContinue(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
+    /// The prompt's continuation: a split prompt runs `prefill` over its first part, then this over each later part, all
+    /// before the decode handover (refused by name after it: the prompt's rows are gone).
+    pub fn prefillContinue(self: *Module, ids: []const u32) !mlx.mlx_array {
         try self.gate.begin(.prefill_continue);
-        return self.continueCall(ids, final);
+        return self.continueCall(ids);
     }
 
-    /// A prompt continuation's forward (`prefillContinue` past its gate; a sub-chunk call inside `prefillPart`).
-    fn continueCall(self: *Module, ids: []const u32, final: bool) !mlx.mlx_array {
-        // The tail release freed the prompt's scratch: a later prompt part would route without it.
-        if (self.tail_release != null) return error.PromptContinuedAfterTailRelease;
-        const d = if (self.dspark) |*x| x else return self.step(ids);
-        armPromptTail(&d.lp.tail, self.promptTail(final));
-        defer armPromptTail(&d.lp.tail, null);
+    /// A prompt continuation's forward (`prefillContinue` past its gate; a sub-chunk call inside `prefill`).
+    fn continueCall(self: *Module, ids: []const u32) !mlx.mlx_array {
         return self.step(ids);
     }
 
@@ -1613,38 +1242,12 @@ pub const Module = struct {
         return self.forward(ids);
     }
 
-    /// The reading `reclaimShrink` judges against, taken before the caller frees the grown rows: every
-    /// command of the previous request retired first, so nothing it still held is missing from it.
-    pub fn boundaryBefore(self: *Module) BoundaryMemory {
-        _ = mlx.mlx_synchronize(self.g.s);
-        return BoundaryMemory.now();
-    }
-
-    /// The served path's return to the prompt phase before a later prompt, after the caller freed the grown
-    /// rows (the arm's shrink; `before` read just before it): the MLX cache cleared (the freed rows' buffers
-    /// go back to the driver, not into the cache), synchronize, then the same settle and one check as the
-    /// phase change on this process's own ledgers (the footprint down by the freed bytes, MLX's cache empty
-    /// and active down); a refusal is a typed error and every later request is refused by name. Bill: every
-    /// prompt pass then runs at the prompt rows, so max(prompt, decode) holds for every request.
-    pub fn reclaimShrink(self: *Module, before: BoundaryMemory, freed_bytes: u64) !void {
-        try self.gate.request();
-        // Every command that still held the freed rows retires first (its completion handlers hand them to
-        // the allocator's cache before the clear, as at the phase change).
-        _ = mlx.mlx_synchronize(self.g.s);
-        self.g.clearCache();
-        _ = mlx.mlx_synchronize(self.g.s);
-        const st = settle(LiveReader{ .io = self.io }, before, freed_bytes, phase_change_poll_ms, null);
-        self.phase_change = .{ .kind = "shrink", .before = before, .after = st.after, .freed_bytes = before.cache + freed_bytes, .settle_ms = st.waited_ms };
-        checkFreed(before, st.after, freed_bytes) catch |e| return self.refuseBoundary(e);
-        self.logPhaseChange();
-    }
-
     /// The reverse phase change (decode -> prompt), once per finished request: the served shell calls it at the request's
     /// end, after its last token went out (off both clocks); the next prefill runs it when an errored request's end did
     /// not. The order is the bill's (ledger 101): the request's state and the decode-only rows freed first (the grown
     /// rows and window 0; a cancelled request's routes settled and unpinned before), the MLX cache cleared, then the
     /// settle until the footprint is at most the prompt bill less the terms not yet live (`reverseBound`), and ONLY
-    /// then the prompt's scratch and cache limit back. Residents, Engram and the draft cache persist. A no-op when the
+    /// then the prompt's scratch and cache limit back. Residents and Engram persist. A no-op when the
     /// Module already holds its prompt configuration; a refusal is the boundary's (every later request refused).
     pub fn requestEnd(self: *Module) !void {
         try self.gate.request();
@@ -1726,7 +1329,7 @@ pub const Module = struct {
         const r = self.reverse_change orelse return;
         const json = std.json.Stringify.valueAlloc(self.gpa, r, .{}) catch return;
         defer self.gpa.free(json);
-        log.info("NATIVE DSV41_REVERSE_PHASE_CHANGE {s}", .{json});
+        log.info("NATIVE DSV41_REVERSE_PHASE_CHANGE {s}\n", .{json});
     }
 
     /// Upstream's prefill-to-decode handover (`model.DecodeHandover`; `Transformer.decodeHandover` dispatches
@@ -1773,31 +1376,20 @@ pub const Module = struct {
         marks[1] = VmMark.now();
         // On its route: the transient scratch, freed before the cache clear so the boundary check counts it (the grow
         // allocates decode's window 0); a holder that kept it refuses here by name (TransientStillReferenced).
-        // The tail release route freed it before `before` (`transientAccount`).
         var released_here: u64 = 0;
-        if (self.installed.transient_release and self.tail_release == null) {
+        if (self.installed.transient_release) {
             released_here = switch (self.arm) {
                 inline else => |t| t.arm.releaseTransient() catch |e| return self.refuseBoundary(e),
             };
             marks[2] = VmMark.now();
         }
-        const acct = transientAccount(if (self.tail_release) |tr| tr.freed_bytes else null, released_here);
-        freed_device += acct.boundary;
-        const transient_freed = acct.grow;
+        freed_device += released_here;
+        const transient_freed = released_here;
         self.g.clearCache();
         setCacheLimit(self.installed.decode_cache_bytes);
         _ = mlx.mlx_synchronize(self.g.s);
-        // The frees' end: here, or at the prompt's tail on the tail release route (free_to_grow_ms starts there).
-        const freed_at = self.tail_freed_at orelse std.Io.Timestamp.now(self.io, .boot);
-        // On its route: libc malloc's free pages returned once, with the frees (the prompt pass's host heap).
-        const relieved = boundaryRelief(self.installed.host_relief, LibcRelief{});
-        // prompt_stats: the rows from the prompt's counts, host only, while the frees land (before the settle).
-        if (self.decode_rows) |*dr| {
-            self.grown_rows = switch (self.arm) {
-                inline else => |t| t.arm.promptRows(dr, self.decode_extra) catch |e| return self.refuseBoundary(e),
-            };
-            self.logDecodeRows(dr);
-        }
+        // The frees' end (free_to_grow_ms starts here).
+        const freed_at = std.Io.Timestamp.now(self.io, .boot);
         // until_freed: the admission's bound on the footprint before the grow (from the bill and the release's bytes).
         const uf: ?@TypeOf(untilFreedBound(0, 0, 0, 0, 0)) = switch (self.installed.phase_change_settle) {
             .interval => null,
@@ -1806,12 +1398,9 @@ pub const Module = struct {
         const bound: ?u64 = if (uf) |x| x.bound else null;
         const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms, bound);
         marks[3] = VmMark.now();
-        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = acct.boundary, .tail_release_bytes = if (self.tail_release) |tr| tr.freed_bytes else null, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null, .host_relief_bytes = relieved };
+        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = released_here, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
         checkSettled(before, st.after, freed_device, bound) catch |e| return self.refuseBoundary(e);
         try self.observe(.released);
-        // STOCKDELAY (W5's discriminator; 0 = off, fixed at construction): the settled frees retire before the grow.
-        if (self.installed.phase_grow_delay_ms > 0) std.Io.sleep(self.io, .fromMilliseconds(self.installed.phase_grow_delay_ms), .awake) catch {};
-        self.phase_change.?.grow_delay_ms = self.installed.phase_grow_delay_ms;
         self.phase_change.?.free_to_grow_ms = @as(f64, @floatFromInt(@max(freed_at.untilNow(self.io, .boot).nanoseconds, 0))) / 1e6;
         switch (self.arm) {
             inline else => |t| try t.arm.growRows(&self.g, self.grown_rows orelse t.arm.decode_rows),
@@ -1820,29 +1409,11 @@ pub const Module = struct {
         const grown_m = BoundaryMemory.now();
         self.phase_change.?.grown = grown_m;
         self.decode_host = .{ .after_grow = hostSideOf(grown_m) };
-        log.info("NATIVE decode host side: after the grow {d} B (footprint {d} B less MLX active {d} B and cache {d} B)", .{ self.decode_host.after_grow.?, grown_m.footprint, grown_m.active, grown_m.cache });
+        log.info("NATIVE decode host side: after the grow {d} B (footprint {d} B less MLX active {d} B and cache {d} B)\n", .{ self.decode_host.after_grow.?, grown_m.footprint, grown_m.active, grown_m.cache });
         try self.observe(.grown);
         self.logPhaseChange();
         for (marks, [_][]const u8{ "start", "after the embedding fence", "after the transient release", "after the frees (settled)", "after the banks grew" }) |mark, name| if (mark) |m|
-            log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d}; host_statistics64, possibly cached)", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
-        // A0 (a), after the grow's record and marks: the first verify's warm reads, below demand.
-        if (self.installed.first_verify_warm) {
-            const issued = switch (self.arm) {
-                inline else => |t| t.arm.warmIssue() catch |e| return self.refuseBoundary(e),
-            };
-            log.info("NATIVE first-verify warm: {d} records issued at the grow", .{issued});
-        }
-    }
-
-    /// One `NATIVE DSV41_DECODE_ROWS {json}` line: prompt_stats' rows per layer, their total / min / max, and each
-    /// layer's prompt mass outside its top-U experts (ppm).
-    fn logDecodeRows(self: *Module, dr: *const arm_mod.DecodeRows) void {
-        const s = rowsSummary(dr.rows);
-        // A stack buffer: the phase change allocates nothing on the heap.
-        var buf: [8192]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buf);
-        const json = std.json.Stringify.valueAlloc(fba.allocator(), .{ .alloc = "prompt_stats", .uniform = self.bill.decode_rows, .extra = self.decode_extra, .layers = dr.rows, .total = s.total, .min = s.min, .max = s.max, .tail_ppm = dr.tail_ppm }, .{}) catch return;
-        log.info("NATIVE DSV41_DECODE_ROWS {s}", .{json});
+            log.info("NATIVE phase change {s}: physical used {d} B, footprint {d} B, outside the footprint {d} B (purgeable {d}, file-backed {d}; host_statistics64, possibly cached)\n", .{ name, m.physical, m.footprint, m.physical -| m.footprint, m.purgeable, m.external });
     }
 
     /// The harness's observer at a proof point (none on the served path); its error refuses the boundary.
@@ -1857,7 +1428,7 @@ pub const Module = struct {
         const r = self.phase_change orelse return;
         const json = std.json.Stringify.valueAlloc(self.gpa, r, .{}) catch return;
         defer self.gpa.free(json);
-        log.info("NATIVE DSV41_PHASE_CHANGE {s}", .{json});
+        log.info("NATIVE DSV41_PHASE_CHANGE {s}\n", .{json});
     }
 
     /// A refused boundary: recorded in the gate (every later request refused by name, PhaseChangeRefused),
@@ -1867,15 +1438,12 @@ pub const Module = struct {
         self.gate.refuse(e);
         if (self.phase_change) |*r| r.refused = @errorName(e);
         self.logPhaseChange();
-        log.err("NATIVE {s} refused: {s}; every later request is refused by name", .{ if (self.phase_change) |r| r.kind else "phase change", @errorName(e) });
+        log.err("NATIVE {s} refused: {s}; every later request is refused by name\n", .{ if (self.phase_change) |r| r.kind else "phase change", @errorName(e) });
         return e;
     }
 
-    /// The decode rows per layer the phase change grew to (the admitted count everywhere on the uniform route).
+    /// The decode rows per layer the phase change grew to (the admitted count everywhere without single records).
     pub fn grownRows(self: *const Module) []const u32 {
-        switch (self.arm) {
-            inline else => |t| if (t.arm.stream.poolReplan()) |r| return r.rows,
-        }
         return self.grown_rows orelse switch (self.arm) {
             inline else => |t| t.arm.decode_rows,
         };
@@ -1941,36 +1509,18 @@ pub const Installed = struct {
     transient_release: bool = false,
     /// The decode read-ahead's speculative records per layer call (the stream's selector; 0 = none).
     lookahead_budget: u32 = 0,
-    /// A0 (a): the first verify's warm reads (installed in the stream at construction).
-    first_verify_warm: bool = false,
     /// The phase change's settle poll (ms), as installed (`phaseChangePollMs`).
     phase_change_poll_ms: u32 = phase_change_poll_ms,
     /// The phase change's settle condition, as installed (`phaseChangeSettle`).
     phase_change_settle: PhaseChangeSettle = .until_freed,
-    /// The phase change's host relief, as installed (`hostRelief`).
-    host_relief: bool = false,
-    /// The phase change's frees at the prompt's tail, as installed (`phaseTailRelease`).
-    phase_tail_release: bool = false,
-    /// STOCKDELAY's sleep before the grow (ms), as installed (`phaseGrowDelayMs`; 0: off).
-    phase_grow_delay_ms: u32 = 0,
-    /// The read pool's scheduling, as installed at its start (`readerSched`).
-    reader_sched: expert_io.Sched = .{},
     /// The ring geometry the states are built with, as installed (`ringGeometry`; the bill reads the same).
     ring_geo: kvc.Geometry = .{},
     /// The grow's new rows' allocation, as installed in the stream.
     grow_fill: expert_stream.GrowFill = .zeros,
-    /// DRAFTCACHE's hot slots, as installed (`draftCacheHot`; null: every draft expert resident).
-    draft_cache_hot: ?u32 = null,
-    /// DRAFTCACHE's pool form, as installed (null: the route off).
-    draft_cache_pool: ?dh.DraftPool = null,
     /// MLX's buffer cache limit through decode, as installed (`decodeCacheLimit`).
     decode_cache_bytes: u64 = envelope.decode_cache_bytes,
-    /// The phase change's per-layer decode rows, as installed (`decodeRowsAlloc`, past `checkDecodeRowsAlloc`).
-    decode_rows_alloc: arm_mod.DecodeRowsAlloc = .uniform,
     /// The fill's decode granule, as installed (`decodeFillGranule`).
     decode_fill_granule: arm_mod.DecodeFillGranule = .row,
-    /// DRAFTCACHE's residency policy, as installed (null: the route off).
-    draft_cache_policy: ?xsc.PolicyKind = null,
     /// The prefill attention core (installed and past its construction self-check).
     prefill_attn: bool = false,
     /// The prefill indexer (installed).
@@ -1991,10 +1541,6 @@ pub const Installed = struct {
     decode_index_topk: bool = false,
     decode_smallm: bool = false,
     decode_mxfp8_rows: bool = false,
-    /// C22 moeshared: the shared expert's middle compiled at decode rows (installed, past its self-check).
-    decode_shared_mid: bool = false,
-    /// C22's memos, as installed.
-    decode_memos: bool = false,
     /// K16's input streams released at each chunk fence, as installed.
     input_stream_early_release: bool = false,
     /// K16's routed groups' MoE inputs freed after the wide call, as installed.
@@ -2017,8 +1563,6 @@ pub const Installed = struct {
     dense_rc: bool = false,
     /// ROUTED_BANKED as installed (the quant's banked route and the hook's banked waves).
     routed_banked: bool = false,
-    /// GEMV_REBUILD as installed: the accept-time decode GEMVs freed and rebuilt at construction.
-    gemv_rebuild: bool = false,
     /// HOIST_FIRST as installed (the hook's barrier commits).
     hoist_first: bool = false,
     /// DRAFT_STAGED as installed (the head's stage commits).
@@ -2070,7 +1614,7 @@ pub fn ringGeometry(config: *const settings.Config, ov: RouteOverrides) routes.R
 
 /// The wide prefill calls' read schedule from the model settings (the tier's default when unset).
 pub fn wideRoute(config: *const settings.Config) xp.Wide {
-    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase(), .read_ahead = config.dsv41WideReadAhead(), .base_at_seed = config.dsv41WideBaseAtSeed(), .seed_aligned = config.dsv41WideSeedAligned(), .resident_first = config.dsv41WideResidentFirst() };
+    return .{ .seed = config.dsv41WideSeed(), .hot_first = config.dsv41WideHotFirst(), .depth = config.dsv41WideDepth(), .cold_rows = config.expert_wide_cold_rows orelse 0, .defer_base = config.dsv41WideDeferBase(), .read_ahead = config.dsv41WideReadAhead(), .base_at_seed = config.dsv41WideBaseAtSeed(), .seed_aligned = config.dsv41WideSeedAligned() };
 }
 
 /// The trunk's numerics by construction: `stock` is the exact reference math with every prompt forward
@@ -2120,8 +1664,6 @@ pub const PhaseChangeRecord = struct {
     freed_bytes: u64,
     /// The transient scratch the release freed (included in `freed_bytes`; 0 for a shrink).
     transient_freed_bytes: u64 = 0,
-    /// The tail release route only: the scratch it freed before this boundary (not in `freed_bytes`; in the grow).
-    tail_release_bytes: ?u64 = null,
     settle_ms: u32,
     /// The settle condition the phase change waited for (a shrink: `interval`).
     settle: PhaseChangeSettle = .interval,
@@ -2130,12 +1672,8 @@ pub const PhaseChangeRecord = struct {
     grow_bound_bytes: ?u64 = null,
     grow_bytes: ?u64 = null,
     margin_bytes: ?i64 = null,
-    /// The host relief route only: the bytes malloc reported returned (`malloc_zone_pressure_relief`).
-    host_relief_bytes: ?u64 = null,
-    /// A phase change only: the time from the frees' end (the scratch released and MLX's cache cleared: here, or at the
-    /// prompt's tail on the tail release route) to the grow's start, and STOCKDELAY's sleep inside it (0: off).
+    /// A phase change only: the time from the frees' end (the scratch released and MLX's cache cleared) to the grow's start.
     free_to_grow_ms: ?f64 = null,
-    grow_delay_ms: u32 = 0,
     /// The refusal's name, when the phase change refused the grow.
     refused: ?[]const u8 = null,
 };
@@ -2286,10 +1824,6 @@ pub fn checkSettled(before: BoundaryMemory, after: BoundaryMemory, freed_device:
     if (bound) |b| if (after.footprint > b) return error.PhaseChangeFootprintOverBill;
 }
 
-pub fn checkConstructionBytes(billed: u64, measured: u64) error{ConstructionOverBill}!void {
-    if (measured > billed + construction_tolerance_bytes) return error.ConstructionOverBill;
-}
-
 /// The admitted modeled peak lands this far under the box's ceiling.
 pub const ceiling_stop_bytes: u64 = 2_000_000_000;
 
@@ -2313,23 +1847,14 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
         .preallocate = false,
         .slot_memory = slot_memory,
         .draft_pruned_bytes = 0,
-        .lookahead = lookaheadFor(config),
+        .lookahead = lookahead,
         .ceiling = ceiling,
         .wide_depth = config.dsv41WideDepth(),
     };
 }
 
-/// The read-ahead at the config's speculative budget (`expert_lookahead_budget`; the bill reads the same options).
-pub fn lookaheadFor(config: *const settings.Config) expert_stream.Lookahead {
-    var la = lookahead;
-    la.budget = config.dsv41LookaheadBudget();
-    return la;
-}
-
 /// The fill's shape and target (the bill module's), re-exported for the module's callers.
 pub const FillBill = bill_mod.FillBill;
-pub const fillRows = bill_mod.fillRows;
-pub const admitPhases = bill_mod.admitPhases;
 pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
 
 /// A request's prompt against the billed context (`Module.max_context`): longer is refused by name, once, before its pass.
@@ -2350,11 +1875,11 @@ test "dsv41 module: a ctx_size over the model's limit is refused by name; at or 
 pub fn checkContext(prompt_tokens: usize, max_context: u64, pinned: ?u64) error{ ContextOverBill, ContextNotPinned }!void {
     if (pinned) |p| {
         if (prompt_tokens == p) return;
-        log.warn("NATIVE request refused: a {d}-token prompt on a Module billed for the {d}-token prompt alone (ContextNotPinned)", .{ prompt_tokens, p });
+        log.warn("NATIVE request refused: a {d}-token prompt on a Module billed for the {d}-token prompt alone (ContextNotPinned)\n", .{ prompt_tokens, p });
         return error.ContextNotPinned;
     }
     if (prompt_tokens <= max_context) return;
-    log.warn("NATIVE request refused: a {d}-token prompt is over the billed context of {d} tokens (ContextOverBill); construct with max_context_tokens >= the prompt", .{ prompt_tokens, max_context });
+    log.warn("NATIVE request refused: a {d}-token prompt is over the billed context of {d} tokens (ContextOverBill); construct with max_context_tokens >= the prompt\n", .{ prompt_tokens, max_context });
     return error.ContextOverBill;
 }
 
@@ -2431,14 +1956,13 @@ fn claimBank(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, diag: *arm_mod
 }
 
 fn refused(err: anyerror, diag: *const arm_mod.Diag) anyerror {
-    log.err("refused: {s} {s}", .{ @errorName(err), diag.message() });
+    log.err("refused: {s} {s}\n", .{ @errorName(err), diag.message() });
     return err;
 }
 
 fn refuse(diag: *arm_mod.Diag, err: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(err) {
-    const s = std.fmt.bufPrint(&diag.buf, fmt, args) catch diag.buf[0..];
-    diag.len = s.len;
-    log.warn("NATIVE construction refused ({t}): {s}", .{ err, s });
+    diag.set(fmt, args);
+    log.warn("NATIVE construction refused ({t}): {s}\n", .{ err, diag.message() });
     return err;
 }
 
@@ -2459,7 +1983,7 @@ fn GrownBanks(comptime AT: type) type {
             const exl3: *const xq.Accepted(G) = @ptrCast(@alignCast(ctx));
             var diag: arm_mod.Diag = .{};
             checkArmBanks(arm, g, exl3, &diag) catch |e| {
-                log.warn("grown banks refused: {s} {s}", .{ @errorName(e), diag.message() });
+                log.warn("grown banks refused: {s} {s}\n", .{ @errorName(e), diag.message() });
                 return e;
             };
         }
@@ -2475,7 +1999,7 @@ fn routerGates(comptime Gate: type, gpa: std.mem.Allocator, weights: *const sdk.
         const w = weights.get(try std.fmt.bufPrint(&buf, "layers.{d}.ffn.gate.weight", .{l}));
         const b = weights.get(try std.fmt.bufPrint(&buf, "layers.{d}.ffn.gate.bias", .{l}));
         if (w == null or b == null) {
-            log.err("refused: MissingWeight layers.{d}.ffn.gate", .{l});
+            log.err("refused: MissingWeight layers.{d}.ffn.gate\n", .{l});
             return error.MissingWeight;
         }
         gt.* = .{ .w = w.?, .bias = b.? };
@@ -2566,32 +2090,6 @@ test "dsv41 module: the served tier's prefill routes are on by default, the stoc
     try std.testing.expectEqual(xp.Wide{ .cold_rows = 2 }, wideRoute(&c));
 }
 
-test "dsv41 module: the read-ahead's speculative budget: 2 unless set, the stream and the staging bill read the setting" {
-    var c: settings.Config = undefined;
-    c.expert_lookahead_budget = null;
-    try std.testing.expectEqual(lookahead, lookaheadFor(&c));
-    c.expert_lookahead_budget = 1;
-    const la = lookaheadFor(&c);
-    try std.testing.expectEqual(@as(u32, 1), la.budget);
-    try std.testing.expectEqual(lookahead.k, la.k);
-    try std.testing.expectEqual(lookahead.chunks, la.chunks);
-    try std.testing.expectEqual(lookahead.preread, la.preread);
-    // the staging charge follows the budget (2 x budget slots): budget 1 bills two slots fewer
-    const f = bill_mod.fill_fixture;
-    const slot = std.mem.alignForward(u64, f.record, 16384) + 2 * 16384;
-    try std.testing.expectEqual(2 * slot, expert_admission.lookaheadCharge(f.record, 2 * lookahead.budget, 16384) - expert_admission.lookaheadCharge(f.record, 2 * la.budget, 16384));
-}
-
-test "dsv41 module: A0 (a): the first verify's warm reads are off unless the route is set, and the transient release's resolver is apart" {
-    try std.testing.expect(!firstVerifyWarm(.{}));
-    try std.testing.expect(firstVerifyWarm(.{ .first_verify_warm = true }));
-    try std.testing.expect(!firstVerifyWarm(.{ .first_verify_warm = false }));
-    try std.testing.expect(!firstVerifyWarm(.{ .transient_release = true }));
-    try std.testing.expectEqual(transientRelease(.{}), transientRelease(.{ .first_verify_warm = true }));
-    const off: Installed = .{};
-    try std.testing.expect(!off.first_verify_warm);
-}
-
 test "dsv41 module: LOOKAHEAD4: event gates are the served tier's default, host waits the stock tier's; a setting overrides" {
     var c: settings.Config = undefined;
     c.numeric_tier = null;
@@ -2609,10 +2107,7 @@ test "dsv41 module: LOOKAHEAD4: event gates are the served tier's default, host 
 test "dsv41 module: the module's construction and forwards analyse (host, nothing runs)" {
     try std.testing.expect(@TypeOf(&Module.init) != void and @TypeOf(&Module.extend) != void);
     // The served path's per-request pieces are analysed with the module (their wiring is the served path's).
-    const shrink_reclaim: *const fn (*Module, BoundaryMemory, u64) anyerror!void = &Module.reclaimShrink;
-    const boundary_before: *const fn (*Module) BoundaryMemory = &Module.boundaryBefore;
-    try std.testing.expect(@intFromPtr(boundary_before) != 0);
-    try std.testing.expect(@intFromPtr(shrink_reclaim) != 0);
+    try std.testing.expect(@intFromPtr(&Module.requestEnd) != 0);
 }
 
 // DSV41_BANK=<bank> [DSV41_MODULE_BASELINE_GB=7.755397656] [DSV41_MODULE_WIRED_GB=3.377741824]
@@ -3374,47 +2869,11 @@ test "dsv41 memory: until_freed settles on the admission's bound (pass3bj): a re
     }
 }
 
-test "dsv41 memory: the tail release route: off by default; the grow's bound and bytes equal stock's, and the boundary counts only the frees after its first reading" {
-    try std.testing.expect(!phaseTailRelease(.{}));
-    try std.testing.expect(!(Installed{}).phase_tail_release);
-    try std.testing.expect(phaseTailRelease(.{ .phase_tail_release = true }));
+test "dsv41 memory: the phase change's grow bound and bytes (stock route), and the grow fill route" {
     // The grow fill route: zeros unless set (the stream installs it; Installed reads it back).
     try std.testing.expectEqual(expert_stream.GrowFill.zeros, growFill(.{}));
     try std.testing.expectEqual(expert_stream.GrowFill.zeros, (Installed{}).grow_fill);
     try std.testing.expectEqual(expert_stream.GrowFill.unfilled, growFill(.{ .grow_fill = .unfilled }));
-    // A split prompt: only its final part arms the hook; the route off never does.
-    try std.testing.expect(tailArms(true, true));
-    try std.testing.expect(!tailArms(true, false));
-    try std.testing.expect(!tailArms(false, true));
-    {
-        // The hook's lifetime over a request: a final seeded prefill runs it once; a serial-lane extend after it does not.
-        const Count = struct {
-            n: u32 = 0,
-            fn run(ctx: *anyopaque) anyerror!void {
-                const c: *@This() = @ptrCast(@alignCast(ctx));
-                c.n += 1;
-            }
-        };
-        const FakeLoop = struct {
-            tail: ?dsl.PromptTail = null,
-            fn forward(l: *@This()) !void {
-                if (l.tail) |t| try t.run(t.ctx);
-            }
-        };
-        var cnt: Count = .{};
-        var lp: FakeLoop = .{};
-        const hook: dsl.PromptTail = .{ .ctx = &cnt, .run = Count.run };
-        // prefillSeeded's shape: arm for the part, forward, clear on leaving.
-        {
-            armPromptTail(&lp.tail, if (tailArms(true, true)) hook else null);
-            defer armPromptTail(&lp.tail, null);
-            try lp.forward();
-        }
-        try lp.forward(); // extend
-        try lp.forward(); // extend
-        try std.testing.expectEqual(@as(u32, 1), cnt.n);
-        try std.testing.expect(lp.tail == null);
-    }
     // served19f (pass3bs control1, 134 / 168 rows, record 13,315,584 B): slot banks (40 x 134 + 240) -> (40 x 168 + 48)
     // records, the transient 240 records; decode bill 108,991,190,704 B.
     const rec: u64 = 13_315_584;
@@ -3423,28 +2882,10 @@ test "dsv41 memory: the tail release route: off by default; the grow's bound and
     const billed: u64 = 108_991_190_704;
     const transient: u64 = 240 * rec;
     try std.testing.expectEqual(@as(u64, 3_195_740_160), transient);
-    const stock = transientAccount(null, transient);
-    const tail = transientAccount(transient, 0);
-    try std.testing.expectEqual(transient, stock.boundary);
-    try std.testing.expectEqual(@as(u64, 0), tail.boundary);
-    // The grow re-allocates window 0 on both routes: bound and grow bit for bit stock's (receipt 90,236,802,736 / 18,754,387,968).
-    const us = untilFreedBound(billed, sp, sd, stock.grow, 40);
-    const ut = untilFreedBound(billed, sp, sd, tail.grow, 40);
+    // The grow re-allocates window 0: bound and grow (receipt 90,236,802,736 / 18,754,387,968).
+    const us = untilFreedBound(billed, sp, sd, transient, 40);
     try std.testing.expectEqual(@as(u64, 18_754_387_968), us.grow);
     try std.testing.expectEqual(@as(u64, 90_236_802_736), us.bound);
-    try std.testing.expectEqual(us.grow, ut.grow);
-    try std.testing.expectEqual(us.bound, ut.bound);
-    // The phase change after a tail release: `before` already without the scratch (active 88,194,961,404, as the stock
-    // route's settled reading), the cache the seed left; the boundary's check passes on the route's frees and would refuse
-    // the stock count (the scratch's bytes can no longer leave MLX active).
-    const before: BoundaryMemory = .{ .active = 88_194_961_404, .cache = 180_000_000, .footprint = 90_400_000_000 };
-    const after: BoundaryMemory = .{ .active = 88_194_961_404, .cache = 0, .footprint = 89_653_177_912 };
-    var i: usize = 0;
-    var slept: u32 = 0;
-    const st = settle(FakeReader{ .readings = &.{after}, .i = &i, .slept_ms = &slept }, before, tail.boundary, 5, ut.bound);
-    try std.testing.expectEqual(@as(u32, 0), st.waited_ms);
-    try checkSettled(before, st.after, tail.boundary, ut.bound);
-    try std.testing.expectError(error.PhaseChangeActiveNotFreed, checkSettled(before, st.after, stock.boundary, us.bound));
 }
 
 test "dsv41 memory: the reverse phase change frees, settles, and only then allocates; a refused settle allocates nothing" {
@@ -3507,24 +2948,7 @@ test "dsv41 memory: the reverse bound is the prompt bill less the terms the next
     try checkFreed(before, early, freed);
 }
 
-test "dsv41 memory: the host relief route calls malloc's relief once at the boundary, never when off; the decode host side reads" {
-    try std.testing.expect(!hostRelief(.{}));
-    try std.testing.expect(!(Installed{}).host_relief);
-    try std.testing.expect(hostRelief(.{ .host_relief = true }));
-    const Counting = struct {
-        n: *u32,
-        pub fn relieve(c: @This()) u64 {
-            c.n.* += 1;
-            return 4096;
-        }
-    };
-    var n: u32 = 0;
-    try std.testing.expectEqual(@as(?u64, null), boundaryRelief(false, Counting{ .n = &n }));
-    try std.testing.expectEqual(@as(u32, 0), n);
-    try std.testing.expectEqual(@as(?u64, 4096), boundaryRelief(true, Counting{ .n = &n }));
-    try std.testing.expectEqual(@as(u32, 1), n);
-    // The real call is host-only libc (no device): it returns, whatever it reports.
-    _ = boundaryRelief(true, LibcRelief{});
+test "dsv41 memory: the decode host side reads" {
     // The decode host side: footprint less active and cache (SERVED19 control1 112957's grown reading: 1.047 GB).
     try std.testing.expectEqual(@as(u64, 1_046_698_048), hostSideOf(.{ .active = 107_371_043_568, .cache = 720, .footprint = 108_417_742_336 }));
     try std.testing.expectEqual(@as(u64, 0), hostSideOf(.{ .active = 2, .cache = 2, .footprint = 3 }));
@@ -3632,12 +3056,7 @@ test "dsv41 memory: the return to the prompt rows (shrink) is judged like the ph
     try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, st.after, grown_rows));
 }
 
-test "dsv41 memory: the construction check passes the constructed footprints of record and refuses one over its bill by name" {
-    // cell4 (106 / 148 rows): constructed footprint 76.41 GB against 77.00 GB of construction terms.
-    try checkConstructionBytes(77_000_000_000, 76_410_000_000);
-    // At the tolerance: passes; one byte over: refused.
-    try checkConstructionBytes(77_000_000_000, 77_000_000_000 + construction_tolerance_bytes);
-    try std.testing.expectError(error.ConstructionOverBill, checkConstructionBytes(77_000_000_000, 77_000_000_001 + construction_tolerance_bytes));
+test "dsv41 memory: the construction check's tolerance sits inside the ceiling's stop" {
     try std.testing.expect(construction_tolerance_bytes < ceiling_stop_bytes);
 }
 
@@ -3669,38 +3088,6 @@ test "dsv41 module: the installed-routes line reads the routes as built, on and 
     try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major true, wide feed false, wide depth 2, stream windows 2, cold rows 0, seed true, hot-first false", seed_only.line(&buf));
     const off: Installed = .{};
     try std.testing.expectEqualStrings("NATIVE prefill routes installed: prefill layer-major false, wide feed false, wide depth 1, stream windows 1, cold rows 0, seed false, hot-first false", off.line(&buf));
-}
-
-test "dsv41 module: DRAFTCACHE is off by default (every draft expert resident) and installs at the overrides' hot count" {
-    try std.testing.expectEqual(@as(?u32, null), draftCacheHot(.{}));
-    try std.testing.expectEqual(@as(?u32, null), (Installed{}).draft_cache_hot);
-    try std.testing.expectEqual(@as(?u32, 201), draftCacheHot(.{ .draft_cache_hot = 201 }));
-    try std.testing.expectEqual(dh.DraftPool.per_stage, try draftCachePool(.{ .draft_cache_hot = 201 }));
-    try std.testing.expectEqual(dh.DraftPool.shared, try draftCachePool(.{ .draft_cache_hot = 201, .draft_cache_pool = .shared }));
-    try std.testing.expectError(error.DraftCachePoolWithoutHot, draftCachePool(.{ .draft_cache_pool = .shared }));
-    try std.testing.expectEqual(xsc.PolicyKind.shipped, try draftCachePolicy(.{ .draft_cache_hot = 128 }));
-    try std.testing.expectEqual(xsc.PolicyKind.lru, try draftCachePolicy(.{ .draft_cache_hot = 128, .draft_cache_policy = .lru }));
-    try std.testing.expectError(error.DraftCachePolicyWithoutHot, draftCachePolicy(.{ .draft_cache_policy = .lru }));
-}
-
-test "dsv41 module: the reader scheduling is off by default and follows the shell's model setting" {
-    var c: settings.Config = .{};
-    c.expert_reader_sched = null;
-    try std.testing.expectEqual(expert_io.Sched{}, readerSched(&c));
-    try std.testing.expectEqual(expert_io.Sched{}, (Installed{}).reader_sched);
-    c.expert_reader_sched = .{ .qos = true, .demand_first = true };
-    try std.testing.expectEqual(expert_io.Sched{ .qos = true, .demand_first = true }, readerSched(&c));
-}
-
-test "dsv41 module: per-layer decode rows are uniform unless set; prompt_stats needs the prompt seeds and room above the prompt rows" {
-    try std.testing.expectEqual(arm_mod.DecodeRowsAlloc.uniform, decodeRowsAlloc(.{}));
-    try std.testing.expectEqual(arm_mod.DecodeRowsAlloc.prompt_stats, decodeRowsAlloc(.{ .decode_rows_alloc = .prompt_stats }));
-    try std.testing.expect((Installed{}).decode_rows_alloc == .uniform);
-    try checkDecodeRowsAlloc(.uniform, false, 171, 171);
-    try checkDecodeRowsAlloc(.prompt_stats, true, 136, 171);
-    try std.testing.expectError(error.DecodeRowsAllocNeedsSeed, checkDecodeRowsAlloc(.prompt_stats, false, 136, 171));
-    try std.testing.expectError(error.DecodeRowsAllocNoRoom, checkDecodeRowsAlloc(.prompt_stats, true, 171, 171));
-    try std.testing.expectEqual(RowsSummary{ .total = 12, .min = 2, .max = 6 }, rowsSummary(&.{ 4, 2, 6 }));
 }
 
 test "dsv41 module: the fill's decode granule is a row unless set; the records are the Module's to derive" {
@@ -3744,15 +3131,6 @@ test "dsv41 module: the states and the bill read one ring geometry: the numeric 
     const dec0 = b0.ringDecodeBytes(seq) + b0.frontierDecodeBytes(seq);
     const dec1 = b1.ringDecodeBytes(seq) + b1.frontierDecodeBytes(seq);
     try std.testing.expectEqual(dec1 - dec0, b1.kvDecodeBytes(seq, positions) - b0.kvDecodeBytes(seq, positions));
-}
-
-test "dsv41 module: decode_first16 needs its pool's rows above the prompt rows and the transient release, and refuses single records" {
-    try checkDecodeRowsAlloc(.decode_first16, false, 136, 168);
-    try std.testing.expectError(error.DecodeRowsAllocNoRoom, checkDecodeRowsAlloc(.decode_first16, true, 150, 168));
-    try checkDecodePoolRoutes(.decode_first16, .row, true);
-    try std.testing.expectError(error.DecodePoolWithRecords, checkDecodePoolRoutes(.decode_first16, .record, true));
-    try std.testing.expectError(error.DecodePoolNeedsRelease, checkDecodePoolRoutes(.decode_first16, .row, false));
-    try checkDecodePoolRoutes(.uniform, .record, false);
 }
 
 test "dsv41 module: the arm's options from the shell's rows: native both, forced decode rows through the envelope, else the plan" {

@@ -40,7 +40,6 @@ const PhaseMemory = bill_mod.PhaseMemory;
 const phaseMemory = bill_mod.phaseMemory;
 const printPhaseMemory = bill_mod.printPhaseMemory;
 const dt = @import("dsv41_decode_timers.zig");
-const recall = @import("dsv41_decode_recall.zig");
 const first_cycle = @import("dsv41_decode_first.zig");
 const draft_routes = @import("dsv41_draft_routes.zig");
 const timeline = @import("dsv41_verify_timeline.zig");
@@ -448,7 +447,7 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const sentinel = try Sentinel.start(gpa, "harness");
     defer _ = sentinel.stop(gpa);
     // The phase change's proof marks (start, released, grown), taken by the Module's observer on the served sequence.
-    var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = m.installed.transient_release, .tail_route = m.installed.phase_tail_release };
+    var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = m.installed.transient_release };
     m.phase_observer = marks.observer();
 
     const out = try a.alloc(u32, ref.new_tokens);
@@ -476,11 +475,11 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     // The prompt's calls; the last one's logits are generated id 0.
     var state: std.ArrayList(LayerStateLine) = .empty;
     const probe = stateProbe(&m.model.c);
-    var logits = try m.prefillPart(prompt[calls[0].lo..calls[0].hi], 0, calls.len == 1);
+    var logits = try m.prefill(prompt[calls[0].lo..calls[0].hi], 0);
     memProbe("dsv41 ar served", "the prompt's first call (before the phase change)");
-    for (calls[1..], 2..) |c, k| {
+    for (calls[1..]) |c| {
         _ = mlx.mlx_array_free(logits);
-        logits = try m.prefillContinue(prompt[c.lo..c.hi], k == calls.len);
+        logits = try m.prefillContinue(prompt[c.lo..c.hi]);
     }
     try readState(a, &state, m, probe, "after_prompt", calls[calls.len - 1].lo);
     printPhaseMemory(a, phaseMemory("prompt pass", m.bill.prefillTerms(), 0, vm_start.external));
@@ -941,12 +940,6 @@ const StreamPhase = struct {
     transient_loads: u64 = 0,
     loads_skipped: u64 = 0,
     evictions: u64 = 0,
-    /// A0 (a)'s warm reads (`Stats.warm_*`): issued at the grow, landed / cancelled and hit by each layer's first
-    /// decode route.
-    warm_issued: u64 = 0,
-    warm_landed: u64 = 0,
-    warm_cancelled: u64 = 0,
-    warm_hits: u64 = 0,
 
     fn of(a: expert_stream.Stats, b: expert_stream.Stats) StreamPhase {
         return .{
@@ -978,10 +971,6 @@ const StreamPhase = struct {
             .transient_loads = b.transient_loads -| a.transient_loads,
             .loads_skipped = b.loads_skipped -| a.loads_skipped,
             .evictions = b.expert_cache_evictions -| a.expert_cache_evictions,
-            .warm_issued = b.warm_issued -| a.warm_issued,
-            .warm_landed = b.warm_landed -| a.warm_landed,
-            .warm_cancelled = b.warm_cancelled -| a.warm_cancelled,
-            .warm_hits = b.warm_hits -| a.warm_hits,
         };
     }
 };
@@ -1062,8 +1051,6 @@ const CellReceipt = struct {
     decode_stream: ?StreamPhase = null,
     /// Set by a decode-profile run only (not a timed cell: its stamps sit in the loop).
     decode_profile: ?[]const ProfCycle = null,
-    /// A profile build's recall check (A1: P1's predictor at every verify layer against its routes), else null.
-    decode_recall: ?recall.Summary = null,
     /// The prefill ladder's routes the Module was built with (null = the setting's default, off).
     layer_major: ?bool = null,
     event_gates: ?bool = null,
@@ -1082,8 +1069,6 @@ const CellReceipt = struct {
     wide_base_at_seed: ?bool = null,
     /// P1c's seed-aligned groups, as installed.
     wide_seed_aligned: ?bool = null,
-    /// P1d's base split as installed: "single" (the one deferred base call) or "resident_first".
-    prefill_base_split: ?[]const u8 = null,
     /// The attention call sites the Module installed (read back from it).
     prefill_attn: ?bool = null,
     prefill_index: ?bool = null,
@@ -1099,8 +1084,6 @@ const CellReceipt = struct {
     prefill_fused_down: ?bool = null,
     /// The decode read-ahead's speculative records per layer call, as installed (read back from the Module).
     lookahead_budget: ?u32 = null,
-    /// A0 (a): the first verify's warm reads, as installed (read back from the Module).
-    first_verify_warm: ?bool = null,
     /// (v9) ENGRAM=prefetch and the wide call's deferred base-bank rows, as installed (read back from the Module).
     engram_posted: ?bool = null,
     deferred_base: ?bool = null,
@@ -1115,49 +1098,17 @@ const CellReceipt = struct {
     /// The phase change's settle condition as the Module installed it (`module.phaseChangeSettle`; the default until_freed).
     /// until_freed's bound, grow and margin ride in `phase_change`.
     phase_change_settle: ?module.PhaseChangeSettle = null,
-    /// The phase change's host relief as installed (`module.hostRelief`; off by default); the bytes malloc reported
-    /// returned ride in `phase_change.host_relief_bytes`.
-    host_relief: ?bool = null,
-    /// The tail release route as installed (`module.phaseTailRelease`; off by default); its record rides in `tail_release`
-    /// and its bytes in `phase_change.tail_release_bytes`.
-    phase_tail_release: ?bool = null,
-    tail_release: ?module.TailReleaseRecord = null,
-    /// STOCKDELAY as installed (`module.phaseGrowDelayMs`; 0: off): the sleep between the phase change's settled frees and
-    /// the grow (its time and the frees-to-grow interval ride in `phase_change`).
-    phase_grow_delay_ms: u32 = 0,
     /// The grow's new rows' allocation as installed (`module.growFill`; zeros by default).
     grow_fill: ?[]const u8 = null,
     /// The request's index through this Module (1 = the first; request k > 1 follows a reverse phase change).
     request: u32 = 1,
-    /// DRAFTCACHE's hot slots as installed (`module.draftCacheHot`; null: every draft expert resident), and its stream
-    /// statistics over the request (route calls, hits, misses, loads, bytes read), read after the timed decode.
-    draft_cache_hot: ?u32 = null,
-    draft_cache_stats: ?expert_stream.Stats = null,
-    /// DRAFTCACHE's pool form as installed ("per_stage" | "shared"; null: the route off).
-    draft_cache_pool: ?[]const u8 = null,
-    /// The read pool's scheduling as installed ("off" or the list of qos, qosdemand, spin, demandfirst; `module.readerSched`), and its
-    /// demand-first knob on its own.
-    reader_sched: ?[]const u8 = null,
-    reader_demand_first: ?bool = null,
-    /// The read pool's keep-warm spinner as installed (`reader_sched` keepwarm).
-    reader_keep_warm: ?bool = null,
-    /// Its per-loop sleep in us (0: a yield loop).
-    reader_keep_warm_us: ?u16 = null,
-    /// ... held through the prompt phase too (`keepwarm<us>p`).
-    reader_keep_warm_prefill: ?bool = null,
-    /// The constructing (inference) thread raised to USER_INTERACTIVE at the pool's start (`startui`).
-    reader_start_ui: ?bool = null,
     /// MLX's buffer cache limit through decode as installed (`module.decodeCacheLimit`; the envelope's by default).
     decode_cache_bytes: ?u64 = null,
-    /// The phase change's per-layer decode rows route as installed ("uniform" | "prompt_stats"; `module.decodeRowsAlloc`)
-    /// and the rows each layer grew to (`decode_rows_per_layer` stays the admitted count).
-    decode_rows_alloc: ?[]const u8 = null,
+    /// The rows each layer grew to (`decode_rows_per_layer` stays the admitted count).
     decode_rows_layers: ?struct { layers: []const u32, total: u64, min: u32, max: u32 } = null,
     /// The fill's decode granule as installed ("row" | "record") and the single records past the rows it admitted.
     decode_fill_granule: ?[]const u8 = null,
     decode_extra_records: ?u32 = null,
-    /// DRAFTCACHE's residency policy as installed ("shipped" | "lru"; null: the route off).
-    draft_cache_policy: ?[]const u8 = null,
     /// The decode phase's host side (footprint less MLX active and cache) after the grow and at the end of decode.
     decode_host_after_grow_bytes: ?u64 = null,
     decode_host_end_bytes: ?u64 = null,
@@ -1166,10 +1117,6 @@ const CellReceipt = struct {
     decode_index_topk: ?bool = null,
     decode_smallm: ?bool = null,
     decode_mxfp8_rows: ?bool = null,
-    /// C22 moeshared (installed): the shared expert's middle compiled at decode rows.
-    decode_shared_mid: ?bool = null,
-    /// C22's memos (installed): the rope tables, the decode window selection and shared compressed rows, b == 1 rows.
-    decode_memos: ?bool = null,
     /// K16's input streams released at each chunk fence (installed).
     input_stream_early_release: ?bool = null,
     /// K16's routed groups' MoE inputs freed after the wide call (installed).
@@ -1192,9 +1139,6 @@ const CellReceipt = struct {
     dense_rc: ?bool = null,
     /// ROUTED_BANKED as installed: the routed decode stages one launch over every bank (true) or per bank.
     routed_banked: bool = false,
-    /// GEMV_REBUILD as installed: the accept-time decode GEMVs freed and rebuilt at construction (the stock-route leak's
-    /// discriminator; false: off).
-    gemv_rebuild: bool = false,
     /// HOIST_FIRST as installed: each decode call's hoist committed before its routing barrier's wait (true) or behind
     /// its hit wave.
     hoist_first: bool = false,
@@ -1277,7 +1221,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     const sentinel = try Sentinel.start(gpa, "cell");
     defer _ = sentinel.stop(gpa);
     // The phase change's proof marks (start, released, grown), taken by the Module's observer on the served sequence.
-    var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = md.installed.transient_release, .tail_route = md.installed.phase_tail_release };
+    var marks: PhaseMarks = .{ .a = a, .io = io, .release_route = md.installed.transient_release };
     md.phase_observer = marks.observer();
 
     // DSV41_CELL_REQUESTS (1..3, default 1): the same prompt again through the same Module, each after the previous
@@ -1295,7 +1239,7 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
             const end_ms: ?f64 = if (end_at_prefill) null else @as(f64, @floatFromInt(@max(t_end.untilNow(io, .boot).nanoseconds, 0))) / 1e6;
             const rj = try std.json.Stringify.valueAlloc(a, .{ .request = k + 1, .request_end_ms = end_ms, .reverse = if (end_at_prefill) null else md.reverse_change }, .{});
             std.debug.print("NATIVE DSV41_REQUEST_END {s}\n", .{rj});
-            marks = .{ .a = a, .io = io, .release_route = md.installed.transient_release, .tail_route = md.installed.phase_tail_release };
+            marks = .{ .a = a, .io = io, .release_route = md.installed.transient_release };
         }
         const out_k = if (k == 0) out_path else try std.fmt.allocPrint(a, "{s}.req{d}.json", .{ out_path, k + 1 });
         // Either arm the configuration builds: host waits (the served default) or event gates (C6).
@@ -1422,8 +1366,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const pl = try md.prefill(prompt, prompt.len + max_tokens);
     const primary = try g.hostArgmax(pl);
     _ = mlx.mlx_array_free(pl);
-    // The tail release route's box mark (harness only) is taken out of the prompt's clock, as the phase change's marks are.
-    const ttft_s = secondsSince(io, t0) - cx.marks.tailSeconds();
+    const ttft_s = secondsSince(io, t0);
     const s_prompt = arm.hook.source.stats();
     // The phase records (outside the timed spans' hot paths: at their boundaries).
     var phases: [4]PhaseMemory = undefined;
@@ -1458,10 +1401,7 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     // A profile build's decode timers count the cycles only (not the warm-up, not the prompt).
     if (comptime dt.enabled) {
         dt.reset();
-        recall.reset();
         first_cycle.startDecode();
-        // DSV41_CELL_DECODE_RECALL=0 keeps the check off (a decode profile without the predictor on its barriers).
-        recall.active = profile and !std.mem.eql(u8, std.mem.span(std.c.getenv("DSV41_CELL_DECODE_RECALL") orelse "1"), "0");
         // The read-outs' storage bounds are checked here, before the first cycle.
         const ds_c = md.model.c.dspark;
         if (ro.routes) try draft_routes.install(.{ .n_stages = ds_c.n_stages, .n_experts = ds_c.n_routed_experts, .top_k = ds_c.n_experts_per_tok, .block = ds_c.block_size }, max_tokens);
@@ -1543,10 +1483,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         }
         var lb: [2048]u8 = undefined;
         std.debug.print("\nNATIVE {s}\n", .{dt.line(&lb)});
-        if (recall.active) {
-            var rb: [16384]u8 = undefined;
-            std.debug.print("NATIVE {s}\n", .{recall.line(&rb, md.model.c.n_layers)});
-        }
         // A0: the first cycle against the warm ones (its stream misses from the decode profile, when it ran)
         var fb: [16384]u8 = undefined;
         std.debug.print("NATIVE {s}\n", .{first_cycle.line(&fb, md.model.c.n_layers, if (prof.items.len > 0) prof.items[0].misses else null)});
@@ -1577,10 +1513,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const stt = md.dsparkStats() orelse return error.CellNeedsDspark;
     const prompt_sha = try cell.idsSha256(a, prompt);
     const ids_sha = try cell.idsSha256(a, ids);
-    var reader_sched_buf: [sdk_ext.expert.Sched.name_len]u8 = undefined;
-    // This request's draft-cache statistics (the cache carries over to the next request through the same Module).
-    const dcs: ?expert_stream.Stats = if (md.draft_cache) |dc| dc.takeRequestStats() else null;
-    if (dcs) |d| std.debug.print("NATIVE draft cache request: route_calls {d}, hits {d}, misses {d}, cycles {d}, misses per cycle {d:.3}\n", .{ d.route_calls, d.expert_cache_hits, d.expert_cache_misses, cycles.items.len, @as(f64, @floatFromInt(d.expert_cache_misses)) / @as(f64, @floatFromInt(@max(cycles.items.len, 1))) });
     const rec: CellReceipt = .{
         .typical_delta = module.dspark_typical_delta,
         .decode_lane = md.decodeLane(),
@@ -1620,7 +1552,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         // The decode window starts at the prompt's end: it includes the phase change's grow.
         .decode_stream = StreamPhase.of(s_prompt, s_end),
         .decode_profile = if (profile) prof.items else null,
-        .decode_recall = if (comptime dt.enabled) (if (recall.active) recall.summary(md.model.c.n_layers) else null) else null,
         // The routes the module installed (read back from it, not from the settings).
         .layer_major = md.installed.layer_major,
         .event_gates = md.arm == .event_gates,
@@ -1636,7 +1567,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .wide_read_ahead = md.installed.wide.read_ahead,
         .wide_base_at_seed = md.installed.wide.base_at_seed,
         .wide_seed_aligned = md.installed.wide.seed_aligned,
-        .prefill_base_split = if (md.installed.wide.resident_first) "resident_first" else "single",
         .prefill_attn = md.installed.prefill_attn,
         .prefill_index = md.installed.prefill_index,
         .prefill_hc = md.installed.prefill_hc,
@@ -1648,7 +1578,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .prefill_hc_post = md.installed.prefill_hc_post,
         .prefill_fused_down = md.installed.prefill_fused_down,
         .lookahead_budget = md.installed.lookahead_budget,
-        .first_verify_warm = md.installed.first_verify_warm,
         .engram_posted = md.installed.engram_posted,
         .deferred_base = md.installed.wide.defer_base,
         .bill_baseline_bytes = cx.bill.baseline,
@@ -1656,39 +1585,23 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .phase_change = md.phase_change,
         .phase_change_poll_ms = md.installed.phase_change_poll_ms,
         .phase_change_settle = md.installed.phase_change_settle,
-        .host_relief = md.installed.host_relief,
-        .phase_tail_release = md.installed.phase_tail_release,
-        .tail_release = md.tail_release,
-        .phase_grow_delay_ms = md.installed.phase_grow_delay_ms,
         .grow_fill = @tagName(md.installed.grow_fill),
         .request = cx.request,
-        .draft_cache_hot = md.installed.draft_cache_hot,
-        .draft_cache_stats = dcs,
-        .draft_cache_pool = if (md.installed.draft_cache_pool) |p| @tagName(p) else null,
-        .reader_sched = md.installed.reader_sched.name(&reader_sched_buf),
-        .reader_demand_first = md.installed.reader_sched.demand_first,
-        .reader_keep_warm = md.installed.reader_sched.keep_warm,
-        .reader_keep_warm_us = md.installed.reader_sched.keep_warm_us,
-        .reader_keep_warm_prefill = md.installed.reader_sched.keep_warm_prefill,
-        .reader_start_ui = md.installed.reader_sched.start_ui,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
-        .decode_rows_alloc = @tagName(md.installed.decode_rows_alloc),
         .decode_fill_granule = @tagName(md.installed.decode_fill_granule),
         .decode_extra_records = md.decode_extra,
         .decode_rows_layers = blk: {
             const gr = md.grownRows();
-            const s = module.rowsSummary(gr);
-            break :blk .{ .layers = gr, .total = s.total, .min = s.min, .max = s.max };
+            var total: u64 = 0;
+            for (gr) |r| total += r;
+            break :blk .{ .layers = gr, .total = total, .min = std.mem.min(u32, gr), .max = std.mem.max(u32, gr) };
         },
-        .draft_cache_policy = if (md.installed.draft_cache_policy) |p| @tagName(p) else null,
         .decode_host_after_grow_bytes = md.decode_host.after_grow,
         .decode_host_end_bytes = md.decode_host.end,
         .decode_attn_softmax = md.installed.decode_attn_softmax,
         .decode_index_topk = md.installed.decode_index_topk,
         .decode_smallm = md.installed.decode_smallm,
         .decode_mxfp8_rows = md.installed.decode_mxfp8_rows,
-        .decode_shared_mid = md.installed.decode_shared_mid,
-        .decode_memos = md.installed.decode_memos,
         .input_stream_early_release = md.installed.input_stream_early_release,
         .prefill_input_release = md.installed.prefill_input_release,
         .prefill_sub = if (md.installed.prefill_sub == std.math.maxInt(u64)) null else md.installed.prefill_sub,
@@ -1700,7 +1613,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .routed_forms = formsName(md.installed.routed_forms),
         .dense_rc = md.installed.dense_rc,
         .routed_banked = md.installed.routed_banked,
-        .gemv_rebuild = md.installed.gemv_rebuild,
         .hoist_first = md.installed.hoist_first,
         .draft_staged = md.installed.draft_staged,
         .draft_ahead = md.installed.draft_ahead,
@@ -1711,7 +1623,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const json0 = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
     const json = if (comptime dt.enabled) try ro.receipt(a, json0) else json0;
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
-    if (comptime dt.enabled) recall.active = false;
     std.debug.print("\nNATIVE dsv41 served cell: typical {d}, {d} prompt tokens, rows {d} prefill / {d} decode per layer; TTFT {d:.2} s = prefill {d:.1} tok/s; phase change {d:.2} s; decode {d} tokens in {d} cycles, {d:.2} s = {d:.2} tok/s ({d:.2} with the phase change); accepted {d}/{d} drafts; wall {d:.2} s; peak footprint {d:.2} GB, MLX peak {d:.2} GB; finish {s}; ids sha256 {s}; wrote {s}\n", .{
         delta,                      prompt.len,             rec.prefill_rows_per_layer, rec.decode_rows_per_layer,
         ttft_s,                     rec.prefill_tok_s,      phase_s,                    out.items.len,
@@ -1779,8 +1690,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_LAYER_MAJOR")) |v| config.layer_major_prefill = try cellBool("DSV41_CELL_LAYER_MAJOR", v);
     // C6: the typical tier's event-gated waves (the Module builds the gated arm; default host waits).
     if (envStr("DSV41_CELL_EVENT_GATES")) |v| config.expert_event_gates = try cellBool("DSV41_CELL_EVENT_GATES", v);
-    // The read pool's scheduling, through the same config field the server's model setting sets.
-    if (envStr("DSV41_CELL_READER_SCHED")) |v| config.expert_reader_sched = @import("sdk_ext.zig").expert.Sched.parse(v) orelse return error.CellReaderSched;
     if (envStr("DSV41_CELL_WIDE_FEED")) |v| config.expert_wide_feed = try cellBool("DSV41_CELL_WIDE_FEED", v);
     // The feed's halves on their own (each overrides the feed's value for its half).
     if (envStr("DSV41_CELL_WIDE_SEED")) |v| config.expert_wide_seed = try cellBool("DSV41_CELL_WIDE_SEED", v);
@@ -1795,25 +1704,16 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_PREFILL_JOINLESS")) |v| ov.prefill_joinless = try cellBool("DSV41_CELL_PREFILL_JOINLESS", v);
     if (envStr("DSV41_CELL_PREFILL_HC_POST")) |v| ov.prefill_hc_post = try cellBool("DSV41_CELL_PREFILL_HC_POST", v);
     if (envStr("DSV41_CELL_PREFILL_FUSED_DOWN")) |v| ov.prefill_fused_down = try cellBool("DSV41_CELL_PREFILL_FUSED_DOWN", v);
-    // The decode read-ahead's speculative budget (1..4 records per layer call; the stream and the bill read it).
-    if (envStr("DSV41_CELL_LOOKAHEAD_BUDGET")) |v| {
-        const b = std.fmt.parseInt(u8, v, 10) catch return error.CellLookaheadBudget;
-        if (b < 1 or b > @import("expert_lookahead.zig").max_budget) return error.CellLookaheadBudget;
-        config.expert_lookahead_budget = b;
-    }
     if (envStr("DSV41_CELL_ENGRAM_POSTED")) |v| ov.engram_posted = try cellBool("DSV41_CELL_ENGRAM_POSTED", v);
     if (envStr("DSV41_CELL_WIDE_DEFER_BASE")) |v| config.expert_wide_defer_base = try cellBool("DSV41_CELL_WIDE_DEFER_BASE", v);
     if (envStr("DSV41_CELL_WIDE_READ_AHEAD")) |v| config.expert_wide_read_ahead = try cellBool("DSV41_CELL_WIDE_READ_AHEAD", v);
     if (envStr("DSV41_CELL_WIDE_BASE_AT_SEED")) |v| config.expert_wide_base_at_seed = try cellBool("DSV41_CELL_WIDE_BASE_AT_SEED", v);
     if (envStr("DSV41_CELL_WIDE_SEED_ALIGNED")) |v| config.expert_wide_seed_aligned = try cellBool("DSV41_CELL_WIDE_SEED_ALIGNED", v);
-    if (envStr("DSV41_CELL_PREFILL_BASE_SPLIT")) |v| config.expert_wide_resident_first = if (std.mem.eql(u8, v, "resident_first")) true else if (std.mem.eql(u8, v, "single")) false else return error.CellBaseSplitValue;
     if (envStr("DSV41_CELL_EMBEDDING_ROWS")) |v| config.embedding_host_rows = try cellBool("DSV41_CELL_EMBEDDING_ROWS", v);
     if (envStr("DSV41_CELL_DECODE_ATTN_SOFTMAX")) |v| ov.decode_attn_softmax = try cellBool("DSV41_CELL_DECODE_ATTN_SOFTMAX", v);
     if (envStr("DSV41_CELL_DECODE_INDEX_TOPK")) |v| ov.decode_index_topk = try cellBool("DSV41_CELL_DECODE_INDEX_TOPK", v);
     if (envStr("DSV41_CELL_DECODE_SMALLM")) |v| ov.decode_smallm = try cellBool("DSV41_CELL_DECODE_SMALLM", v);
     if (envStr("DSV41_CELL_DECODE_MXFP8_ROWS")) |v| ov.decode_mxfp8_rows = try cellBool("DSV41_CELL_DECODE_MXFP8_ROWS", v);
-    if (envStr("DSV41_CELL_DECODE_SHARED_MID")) |v| ov.decode_shared_mid = try cellBool("DSV41_CELL_DECODE_SHARED_MID", v);
-    if (envStr("DSV41_CELL_DECODE_MEMOS")) |v| ov.decode_memos = try cellBool("DSV41_CELL_DECODE_MEMOS", v);
     // The ring levers over the tier's (WINDOW_RING_MAX_VERIFY / _SLACK / _HEADROOM): the Module installs them and the
     // bill rows its rings at them (`module.ringGeometry`, which refuses a value outside the tested box by name).
     if (envStr("DSV41_CELL_WINDOW_RING_MAX_VERIFY")) |v| ov.window_ring_max_verify = std.fmt.parseInt(u32, v, 10) catch return error.CellWindowRing;
@@ -1827,20 +1727,9 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_PREFILL_SHAREDMID")) |v| ov.prefill_shared_mid = if (std.mem.eql(u8, v, "compiled")) true else if (std.mem.eql(u8, v, "eager")) false else return error.CellSharedMidValue;
     if (envStr("DSV41_CELL_PREDICT_BF16")) |v| ov.predict_bf16 = try cellBool("DSV41_CELL_PREDICT_BF16", v);
     if (envStr("DSV41_CELL_TRANSIENT_RELEASE")) |v| ov.transient_release = try cellBool("DSV41_CELL_TRANSIENT_RELEASE", v);
-    if (envStr("DSV41_CELL_FIRST_VERIFY_WARM")) |v| ov.first_verify_warm = try cellBool("DSV41_CELL_FIRST_VERIFY_WARM", v);
     // The phase change's settle poll (ms; the Module refuses a value outside 1..phase_change_settle_ms at construction).
     if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;
-    // The phase change's settle condition (interval | until_freed; anything else refused here).
-    if (envStr("DSV41_CELL_HOST_RELIEF")) |v| ov.host_relief = try cellBool("DSV41_CELL_HOST_RELIEF", v);
-    if (envStr("DSV41_CELL_PHASE_TAIL_RELEASE")) |v| ov.phase_tail_release = try cellBool("DSV41_CELL_PHASE_TAIL_RELEASE", v);
-    // STOCKDELAY (W5): ms between the stock phase change's settled frees and the grow (the Module refuses 0, > 2000 and
-    // the tail release by name at construction).
-    if (envStr("DSV41_CELL_PHASE_GROW_DELAY_MS")) |v| ov.phase_grow_delay_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhaseGrowDelay;
     if (envStr("DSV41_CELL_GROW_FILL")) |v| ov.grow_fill = std.meta.stringToEnum(@import("expert_stream.zig").GrowFill, v) orelse return error.CellGrowFill;
-    // DRAFTCACHE's hot slots (a count; the Module refuses a geometry that saves nothing at construction).
-    if (envStr("DSV41_CELL_DRAFT_CACHE")) |v| ov.draft_cache_hot = std.fmt.parseInt(u32, v, 10) catch return error.CellDraftCache;
-    if (envStr("DSV41_CELL_DRAFT_CACHE_POLICY")) |v| ov.draft_cache_policy = std.meta.stringToEnum(@import("sdk_ext.zig").expert.slot_cache.PolicyKind, v) orelse return error.CellDraftCachePolicy;
-    if (envStr("DSV41_CELL_DRAFT_CACHE_POOL")) |v| ov.draft_cache_pool = std.meta.stringToEnum(@import("deepseek_v41_dspark_head.zig").DraftPool, v) orelse return error.CellDraftCachePool;
     // The decode cache limit in bytes (the Module refuses more than the envelope's at construction).
     if (envStr("DSV41_CELL_DECODE_CACHE_BYTES")) |v| ov.decode_cache_bytes = std.fmt.parseInt(u64, v, 10) catch return error.CellDecodeCacheBytes;
     // The decode cache limit in MiB (decodecache32 ...): 0 refused by name (decodecache0 is dead: a fresh buffer per
@@ -1849,8 +1738,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
         if (ov.decode_cache_bytes != null) return error.CellDecodeCacheTwoForms;
         ov.decode_cache_bytes = try cellCacheLimitMb(v);
     }
-    // #23: the phase change's per-layer decode rows (uniform | prompt_stats; the Module refuses prompt_stats without the seed).
-    if (envStr("DSV41_CELL_DECODE_ROWS_ALLOC")) |v| ov.decode_rows_alloc = std.meta.stringToEnum(@import("deepseek_v41_arm.zig").DecodeRowsAlloc, v) orelse return error.CellDecodeRowsAlloc;
     // The fill's decode granule (row | record: the leftover below one row as single records, billed).
     if (envStr("DSV41_CELL_DECODE_FILL_GRANULE")) |v| ov.decode_fill_granule = std.meta.stringToEnum(@import("deepseek_v41_arm.zig").DecodeFillGranule, v) orelse return error.CellDecodeFillGranule;
     if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
@@ -1858,7 +1745,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_ROUTED_FORMS")) |v| ov.routed_forms = try parseForms(v);
     if (envStr("DSV41_CELL_DENSE_RC")) |v| ov.dense_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellDenseRc;
     if (envStr("DSV41_CELL_ROUTED_BANKED")) |v| ov.routed_banked = try cellBool("DSV41_CELL_ROUTED_BANKED", v);
-    if (envStr("DSV41_CELL_GEMV_REBUILD")) |v| ov.gemv_rebuild = try cellBool("DSV41_CELL_GEMV_REBUILD", v);
     if (envStr("DSV41_CELL_HOIST_FIRST")) |v| ov.hoist_first = try cellBool("DSV41_CELL_HOIST_FIRST", v);
     if (envStr("DSV41_CELL_DRAFT_STAGED")) |v| ov.draft_staged = try cellBool("DSV41_CELL_DRAFT_STAGED", v);
     if (envStr("DSV41_CELL_DRAFT_AHEAD")) |v| ov.draft_ahead = try cellBool("DSV41_CELL_DRAFT_AHEAD", v);
@@ -1881,7 +1767,7 @@ fn cellConfig(config: *settings.Config) !CellArgs {
 }
 
 /// The native admission's fill: the cell's own bill at the envelope's rows gives each phase's rows-free
-/// total and `module.fillRows` takes ONE row count up to the binding phase's target (no grow at the phase
+/// total and `sdk.fill` takes ONE row count up to the binding phase's target (no grow at the phase
 /// change); the config then carries it as both row counts (the stream's, the bill's). DSV41_CELL_ROWS + DSV41_CELL_PREFILL_ROWS force both (a ladder's
 /// later lines at its first line's rows): billed, and refused by name above the target. DSV41_CELL_ROWS
 /// alone keeps the envelope's forced-rows admission. DSV41_CELL_FILL_LADDER=1 fills at the prefill
@@ -2194,15 +2080,10 @@ pub const PhaseMarks = struct {
     /// The transient release as the Module installed it (`Module.installed.transient_release`): the release proof is
     /// judged only when the phase change releases the scratch; off, it is NA.
     release_route: bool,
-    /// The tail release route (`Module.installed.phase_tail_release`): the scratch is freed at the prompt's tail, so the
-    /// release proof starts from the `tail` mark taken there, before those frees.
-    tail_route: bool = false,
-    /// Indexed by `module.PhaseObserver.Stage`: start, released, grown, tail.
+    /// Indexed by `module.PhaseObserver.Stage`: start, released, grown (the SDK's `tail` stage is never observed here).
     marks: [4]?BoxMark = @splat(null),
     failed: [4]?anyerror = @splat(null),
     spent_ns: u64 = 0,
-    /// The `tail` mark's own time (on the prompt's clock, not the phase change's).
-    tail_ns: u64 = 0,
     /// The released mark's settle (`settleRelease`): null when it did not run (no start mark, or the first released
     /// mark failed).
     release_settle: ?ReleaseSettle = null,
@@ -2219,7 +2100,7 @@ pub const PhaseMarks = struct {
             self.failed[i] = e;
             break :blk null;
         };
-        if (stage == .released and self.release_route) if (self.releaseStart()) |start| if (self.marks[1]) |first| {
+        if (stage == .released and self.release_route) if (self.marks[0]) |start| if (self.marks[1]) |first| {
             const settled: ?ReleaseSettle = settleRelease(LiveSettle{ .a = self.a, .io = self.io, .t0 = std.Io.Timestamp.now(self.io, .boot) }, start, first) catch |e| blk: {
                 self.failed[1] = e;
                 self.marks[1] = null;
@@ -2231,16 +2112,7 @@ pub const PhaseMarks = struct {
             }
         };
         const ns: u64 = @intCast(@max(t0.untilNow(self.io, .boot).nanoseconds, 0));
-        if (stage == .tail) self.tail_ns += ns else self.spent_ns += ns;
-    }
-
-    /// The release proof's start: the tail mark under the tail release route, else the phase change's start.
-    fn releaseStart(self: *const PhaseMarks) ?BoxMark {
-        return if (self.tail_route) self.marks[3] else self.marks[0];
-    }
-
-    pub fn tailSeconds(self: *const PhaseMarks) f64 {
-        return @as(f64, @floatFromInt(self.tail_ns)) / 1e9;
+        self.spent_ns += ns;
     }
 
     pub fn observerSeconds(self: *const PhaseMarks) f64 {
@@ -2251,8 +2123,7 @@ pub const PhaseMarks = struct {
     /// and the grow proof (released -> grown) on both routes.
     pub fn judge(self: *const PhaseMarks) !void {
         for (self.failed) |f| if (f) |e| return e;
-        _ = self.marks[0] orelse return error.PhaseMarkMissing;
-        const start = self.releaseStart() orelse return error.PhaseMarkMissing;
+        const start = self.marks[0] orelse return error.PhaseMarkMissing;
         const released = self.marks[1] orelse return error.PhaseMarkMissing;
         const grown = self.marks[2] orelse return error.PhaseMarkMissing;
         if (self.release_route) try checkReleaseResidency(start, released);
@@ -2267,8 +2138,6 @@ pub const BoxPhaseRecord = struct {
     start: ?BoxMark,
     released: ?BoxMark,
     grown: ?BoxMark,
-    /// The tail release route's mark at the prompt's tail (the release proof's start then); null off the route.
-    tail: ?BoxMark = null,
     release_proof: []const u8,
     cache_clear_bytes: ?u64,
     release_outside_rise: ?i64,
@@ -2287,14 +2156,13 @@ pub fn boxPhaseRecord(pm: *const PhaseMarks, cache_clear_bytes: ?u64) BoxPhaseRe
             return if (x != null and y != null) outsideRise(x.?, y.?) else null;
         }
     }.f;
-    const rs = pm.releaseStart();
+    const rs = pm.marks[0];
     const verdict: []const u8 = if (!pm.release_route) "NA" else if (rs == null or pm.marks[1] == null) "MISSING" else if (checkReleaseResidency(rs.?, pm.marks[1].?)) |_| "PASS" else |_| "FAIL";
     const st = pm.release_settle;
     return .{
         .start = pm.marks[0],
         .released = pm.marks[1],
         .grown = pm.marks[2],
-        .tail = pm.marks[3],
         .release_proof = verdict,
         .cache_clear_bytes = if (pm.release_route) null else cache_clear_bytes,
         .release_outside_rise = if (pm.release_route) both(rs, pm.marks[1]) else null,
@@ -2310,12 +2178,6 @@ pub fn boxPhaseRecord(pm: *const PhaseMarks, cache_clear_bytes: ?u64) BoxPhaseRe
 fn printBoxPhase(a: std.mem.Allocator, pm: *const PhaseMarks, cache_clear_bytes: ?u64) void {
     const json = std.json.Stringify.valueAlloc(a, boxPhaseRecord(pm, cache_clear_bytes), .{}) catch return;
     std.debug.print("NATIVE DSV41_BOX_PHASE {s}\n", .{json});
-}
-
-fn printBoxGrow(a: std.mem.Allocator, before: BoxMark, grown: BoxMark) void {
-    const r = .{ .before = before, .grown = grown, .physical_growth = @as(i64, @intCast(grown.physical)) - @as(i64, @intCast(before.physical)), .footprint_growth = @as(i64, @intCast(grown.footprint)) - @as(i64, @intCast(before.footprint)), .tolerance = box_tolerance_bytes };
-    const json = std.json.Stringify.valueAlloc(a, r, .{}) catch return;
-    std.debug.print("NATIVE DSV41_BOX_GROW {s}\n", .{json});
 }
 
 /// The harnesses' outside-the-footprint sentinel (the window's, never the served path's). SERVED13 (pass3au): about
@@ -2599,7 +2461,6 @@ fn printBill(b: CellBill) void {
         }
     }.f;
     std.debug.print("\ndsv41 served cell bill (decimal GB; prompt / decode phase):\n", .{});
-    if (b.draft_cache > 0) std.debug.print("  (DRAFTCACHE: the residents carry the draft cache's slot banks, {d} B, in place of the DSpark experts)\n", .{b.draft_cache});
     for (billLines(b)) |t| std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}\n", .{ t.name, gb(t.p), gb(t.d) });
     std.debug.print("  {s:<56} {d:>7.2} / {d:>7.2}   rows {d} / {d}; process bound {d:.2}\n", .{ "TOTAL", gb(b.prefillTotal()), gb(b.decodeTotal()), b.prefill_rows, b.decode_rows, gb(b.processBound()) });
     std.debug.print("DSV41_CELL_BILL {{\"baseline_gb\": {d:.3}, \"prefill_rows\": {d}, \"decode_rows\": {d}, \"decode_extra_records\": {d}, \"prefill_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"process_bound_gb\": {d:.3}, \"transient_rows\": {d}, \"transient_decode_rows\": {d}, \"bill_variant\": \"{t}\", \"prefill_wave_gb\": {d:.3}, \"prefill_wave_tight_gb\": {d:.3}, \"kv_gb\": {d:.3}, \"wire_tables_bytes\": [{d}, {d}], \"wire_arrays\": [{d}, {d}], \"wire_arrays_persistent\": {d}, \"wire_arrays_wave\": [{d}, {d}], \"decode_buffer_allowance_bytes\": {d}, \"prompt_buffer_allowance_bytes\": {d}, \"wire_buffer_bytes\": {d}, \"mlx_cache_overshoot_bytes\": [{d}, {d}]}}\n", .{ gb(b.baseline), b.prefill_rows, b.decode_rows, b.decode_extra_records, gb(b.prefillTotal()), gb(b.decodeTotal()), gb(b.processBound()), b.transient_rows, b.transient_decode_rows, b.variant, gb(b.prefill_wave), gb(b.prefill_wave_tight), gb(b.kv), b.prefillTerms().wire_tables, b.decodeTerms().wire_tables, b.wire_arrays_prompt, b.wire_arrays_decode, b.wire_arrays_prompt - 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_prompt_wave, 2 * bill_mod.wire_arrays_decode_wave, b.decodeTerms().decode_buffer_allowance, b.prefillTerms().prompt_buffer_allowance, bill_mod.wire_buffer_bytes, b.cache_overshoot_prompt, b.cache_overshoot_decode });
@@ -2900,31 +2761,6 @@ test "dsv41 memory: the released mark settles a lag, refuses a reclaim that need
     try testing.expectEqual(@as(?u32, 2), rec_set.release_polls);
 }
 
-test "dsv41 memory: the tail release route's release proof starts from the tail mark (a scratch left wired outside the footprint before the phase change still fails)" {
-    // The scratch freed at the tail; 3 GB of it stays wired outside the footprint (SERVED13's class) by the phase change's start.
-    const tail: BoxMark = .{ .physical = 110_000_000_000, .footprint = 98_000_000_000 };
-    const start: BoxMark = .{ .physical = 106_000_000_000, .footprint = 91_000_000_000 };
-    const released: BoxMark = .{ .physical = 104_000_000_000, .footprint = 89_000_000_000 };
-    const grown: BoxMark = .{ .physical = 122_754_000_000, .footprint = 107_754_000_000 };
-    var pm: PhaseMarks = .{ .a = testing.allocator, .io = testing.io, .release_route = true, .tail_route = true };
-    pm.marks = .{ start, released, grown, tail };
-    try testing.expectError(error.TransientReleaseNotReclaimed, pm.judge());
-    const rec = boxPhaseRecord(&pm, null);
-    try testing.expectEqualStrings("FAIL", rec.release_proof);
-    try testing.expectEqual(@as(?i64, 3_000_000_000), rec.release_outside_rise);
-    try testing.expectEqual(@as(?BoxMark, tail), rec.tail);
-    // Judged from the phase change's start the same marks would pass: the start mark alone cannot see it.
-    var from_start = pm;
-    from_start.tail_route = false;
-    try from_start.judge();
-    // Clean: the tail's outside equals the released mark's; the tail mark is missing -> refused by name.
-    pm.marks[3] = .{ .physical = 107_000_000_000, .footprint = 92_000_000_000 };
-    try pm.judge();
-    try testing.expectEqualStrings("PASS", boxPhaseRecord(&pm, null).release_proof);
-    pm.marks[3] = null;
-    try testing.expectError(error.PhaseMarkMissing, pm.judge());
-}
-
 test "dsv41 memory: the harness reads the box's pages fresh through vm_stat" {
     const sample =
         \\Mach Virtual Memory Statistics: (page size of 16384 bytes)
@@ -2968,11 +2804,11 @@ test "dsv41 memory: the harness's filled rows pass the Module's admission under 
             return box -| gpu_ceiling.wired_limit_margin_bytes;
         }
     }.of;
-    try testing.expectError(error.PromptOverTarget, bill_mod.admitPhases(b, target(ceiling)));
+    try testing.expectError(error.PromptOverTarget, bill_mod.admitOf(b, target(ceiling)));
     {
         const stop = WindowStop.set(module.ceiling_stop_bytes, null);
         defer stop.restore();
-        try bill_mod.admitPhases(b, target(ceiling));
+        try bill_mod.admitOf(b, target(ceiling));
         try testing.expectEqual(ceiling - module.ceiling_stop_bytes, target(ceiling));
     }
     try testing.expectEqual(gpu_ceiling.WIRED_LIMIT_MARGIN_BYTES, gpu_ceiling.wired_limit_margin_bytes);
@@ -3662,65 +3498,6 @@ fn cellInputs(a: std.mem.Allocator, io: std.Io, prompt_path: []const u8, case_id
     if (config.expert_bank_dir == null or config.engram_token_map_path == null) return error.Dsv41BankDir;
     if (host.num_eos_tokens == 0) return error.NoEosIds;
     return .{ .prompt = prompt, .config = config, .eos = try a.dupe(u32, host.eos_token_ids[0..host.num_eos_tokens]) };
-}
-
-// DSV41_EMBED_GATHER_BENCH=1 with DSV41_BANK and DSV41_CELL_PROMPT_IDS (host I/O only; never inside a window): the
-// input embedding's rows for the standard prompt (16,384 real ids, unsorted, repeats), chunk by chunk as the prompt
-// pass asks for them, through the table's aligned parallel gather and through the serial path it replaced (one
-// unaligned F_NOCACHE pread per row, which the page cache keeps: evict the shard's clean cache after this test).
-// Every chunk's bytes equal both ways; the two times and the distinct rows print as one EMBED_GATHER line.
-test "dsv41 served cell: the embedding rows' aligned parallel gather equals the serial reads on the prompt's ids (bench)" {
-    if (std.c.getenv("DSV41_EMBED_GATHER_BENCH") == null) return error.SkipZigTest;
-    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
-    const prompt_path = std.mem.span(std.c.getenv("DSV41_CELL_PROMPT_IDS") orelse return error.SkipZigTest);
-    const a = testing.allocator;
-    const io = testing.io;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const aa = arena.allocator();
-    var diag: v41.Diag = .{};
-    errdefer std.debug.print("embed gather bench: {s}\n", .{diag.message()});
-    const c = try v41.Config.load(aa, io, bank, &diag);
-    var rows = try dss.openEmbeddingRows(aa, io, bank, &c, &diag);
-    defer rows.close();
-    const prompt = try cellPrompt(aa, io, prompt_path, null);
-    const kvc = @import("deepseek_v41_cache.zig");
-    const spans = try kvc.prefillSpans(aa, @intCast(prompt.len), kvc.resolvePrefillChunk(&c, prompt.len, null, kvc.default_chunk_target_bytes));
-    const rb: usize = @as(usize, rows.dim) * 2;
-    var widest: usize = 0;
-    for (spans) |sp| widest = @max(widest, sp[1] - sp[0]);
-    const got = try aa.alloc(u8, widest * rb);
-    const want = try aa.alloc(u8, widest * rb);
-    // Aligned parallel first: its reads leave no page behind, so the serial reads after it start cold too.
-    var aligned_ns: u64 = 0;
-    var serial_ns: u64 = 0;
-    for (spans) |sp| {
-        const ids = prompt[sp[0]..sp[1]];
-        const t0 = std.Io.Timestamp.now(io, .boot);
-        try rows.gatherRaw(ids, got[0 .. ids.len * rb]);
-        aligned_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
-    }
-    for (spans) |sp| {
-        const ids = prompt[sp[0]..sp[1]];
-        const t0 = std.Io.Timestamp.now(io, .boot);
-        for (ids, 0..) |r, i| {
-            const dst = want[i * rb ..][0..rb];
-            var done: usize = 0;
-            while (done < rb) {
-                const k = std.c.pread(rows.fd, dst[done..].ptr, rb - done, @intCast(rows.w_off + @as(usize, r) * rb + done));
-                try testing.expect(k > 0);
-                done += @intCast(k);
-            }
-        }
-        serial_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
-        try rows.gatherRaw(ids, got[0 .. ids.len * rb]);
-        try testing.expectEqualSlices(u8, want[0 .. ids.len * rb], got[0 .. ids.len * rb]);
-    }
-    var seen = try std.DynamicBitSet.initEmpty(aa, c.vocab_size);
-    for (prompt) |r| seen.set(r);
-    std.debug.print("\nEMBED_GATHER {{\"chunks\": {d}, \"rows\": {d}, \"distinct\": {d}, \"serial_s\": {d:.3}, \"aligned_parallel_s\": {d:.3}}}\n", .{
-        spans.len, prompt.len, seen.count(), @as(f64, @floatFromInt(serial_ns)) / 1e9, @as(f64, @floatFromInt(aligned_ns)) / 1e9,
-    });
 }
 
 // The served cell's preconditions on the real inputs (host; bank mode): DSV41_BANK and

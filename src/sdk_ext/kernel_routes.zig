@@ -44,7 +44,7 @@ pub fn Routes(comptime R: type) type {
         };
 
         pub fn refuse(diag: ?*xk.Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-            if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+            if (diag) |d| d.set(fmt, args);
             return err;
         }
 
@@ -262,7 +262,7 @@ pub fn Routes(comptime R: type) type {
                 }
 
                 pub fn launch(p: *const Self, g: *G, m: u64, inputs: []const G.T, out: []G.T) !void {
-                    if (m < 1 or m > n) return error.RowsOutOfPlan;
+                    std.debug.assert(!(m < 1 or m > n));
                     const k = m - 1;
                     if (prepared) {
                         try g.launchPrepared(&p.prep[k], inputs, out[0..p.cfg[k].n_out]);

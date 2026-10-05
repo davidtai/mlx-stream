@@ -8,7 +8,7 @@
 const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
 const ngram = @import("ngram_table.zig");
-const io_util = @import("nocache_io.zig");
+const io_util = @import("sdk").io_util;
 
 pub const max_ngram = 8;
 pub const max_heads = 16;
@@ -114,7 +114,7 @@ pub fn parseManifest(a: std.mem.Allocator, text: []const u8, c: *const v41.Confi
 }
 
 fn fail(diag: ?*v41.Diag, comptime fmt: []const u8, args: anytype) error{EngramManifest} {
-    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (diag) |d| d.set(fmt, args);
     return error.EngramManifest;
 }
 
@@ -203,7 +203,7 @@ pub const row_cache_host_bytes: u64 = 2 * ngram.RowCache.hostBytes(264, row_cach
 pub const Refusal = error{ EngramManifest, EngramTokenMap, EngramBankFile };
 
 fn refuse(diag: ?*v41.Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (diag) |d| d.set(fmt, args);
     return err;
 }
 
@@ -964,69 +964,4 @@ test "dsv41 engram: the lane's gather sequence replays through the row source wi
         });
         try testing.expectEqual(resident0, resident1);
     }
-}
-
-// DSV41_BANK=<bank> DSV41_ENGRAM_TOKEN_MAP=<map> DSV41_ENGRAM_READ_COST=1: an 8-row verify forward's
-// Engram reads cold and warm, and a prefill chunk's, on the real bank.
-test "dsv41 engram: a verify forward's and a prefill chunk's reads on the real bank" {
-    const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
-    const map_path = std.mem.span(std.c.getenv("DSV41_ENGRAM_TOKEN_MAP") orelse return error.SkipZigTest);
-    if (std.c.getenv("DSV41_ENGRAM_READ_COST") == null) return error.SkipZigTest;
-    const gpa = testing.allocator;
-    var diag: v41.Diag = .{};
-    errdefer std.debug.print("refused: {s}\n", .{diag.message()});
-    const c = try v41.Config.load(gpa, testing.io, bank_dir, &diag);
-    var src = try RowSource.open(gpa, testing.io, bank_dir, map_path, &c, &diag);
-    defer src.deinit();
-    const resident0 = try engramResident(&src, bank_dir);
-    const cols = src.hashing.cols();
-    const nl = src.hashing.n_layers;
-    const hd: usize = src.bank.head_dim;
-    var prng = std.Random.DefaultPrng.init(0x5eed);
-    const rnd = prng.random();
-    var st: HashState = .{};
-    defer st.deinit(gpa);
-    const Shape = struct { name: []const u8, n: usize, reps: usize };
-    const shapes = [_]Shape{ .{ .name = "8-row verify", .n = 8, .reps = 30 }, .{ .name = "953-row prefill chunk", .n = 953, .reps = 3 } };
-    std.debug.print("\n", .{});
-    for (shapes) |sh| {
-        const out = try gpa.alloc(i64, sh.n * nl * cols);
-        defer gpa.free(out);
-        const ids_buf = try gpa.alloc(i64, sh.n * cols);
-        defer gpa.free(ids_buf);
-        const codes = try gpa.alloc(u8, sh.n * cols * hd);
-        defer gpa.free(codes);
-        const scales = try gpa.alloc(u8, sh.n * cols * (hd / 32));
-        defer gpa.free(scales);
-        const ids = try gpa.alloc(u32, sh.n);
-        defer gpa.free(ids);
-        var cold: f64 = 0;
-        var warm: f64 = 0;
-        var cold_max: f64 = 0;
-        var warm_misses: u64 = 0;
-        for (0..sh.reps) |_| {
-            for (ids) |*t| t.* = rnd.uintLessThan(u32, @intCast(src.map.ids.len));
-            for (0..2) |pass| {
-                const m0 = src.cacheStats(0).misses + src.cacheStats(1).misses;
-                const t0 = std.Io.Timestamp.now(testing.io, .boot);
-                try src.advance(gpa, &st, ids, out);
-                for (0..nl) |li| try src.read(li, out, sh.n, ids_buf, codes, scales);
-                const dt = msSince(t0);
-                if (pass == 0) {
-                    cold += dt;
-                    cold_max = @max(cold_max, dt);
-                } else {
-                    warm += dt;
-                    warm_misses += src.cacheStats(0).misses + src.cacheStats(1).misses - m0;
-                }
-                st.trim(sh.n);
-            }
-        }
-        const reps: f64 = @floatFromInt(sh.reps);
-        std.debug.print("DSV41_ENGRAM_READ_COST {s} ({d} records): cold {d:.3} ms mean (max {d:.3}), warm {d:.4} ms mean ({d} warm misses)\n", .{ sh.name, sh.n * cols * nl, cold / reps, cold_max, warm / reps, warm_misses });
-        try testing.expectEqual(@as(u64, 0), warm_misses);
-    }
-    const resident1 = try engramResident(&src, bank_dir);
-    std.debug.print("DSV41_ENGRAM_READ_COST bank 1 {any}; bank 14 {any}; Engram page cache {d} -> {d} B\n", .{ src.cacheStats(0), src.cacheStats(1), resident0, resident1 });
-    try testing.expectEqual(resident0, resident1);
 }

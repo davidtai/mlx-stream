@@ -7,7 +7,7 @@ const peek = @import("sdk");
 const bill = @import("sdk");
 const kernels = @import("kernels.zig");
 const quant = @import("quant.zig");
-const check = @import("check.zig");
+const check = @import("sdk").check;
 
 const Allocator = std.mem.Allocator;
 const BillFn = *const fn (gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill;

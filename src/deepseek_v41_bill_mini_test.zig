@@ -11,7 +11,6 @@ const module = @import("deepseek_v41_module.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const settings = @import("deepseek_v41_settings.zig");
 const expert_bank = @import("expert_bank.zig");
-const dspark_head = @import("deepseek_v41_dspark_head.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 const xp = @import("deepseek_v41_experts.zig");
 const plugin = @import("deepseek_v41_plugin.zig");
@@ -154,18 +153,18 @@ test "dsv41 memory mini: the fill and its admission agree; one more row in eithe
     const b = try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov);
     try testing.expectEqual(nr.prefill, b.prefill_rows);
     try testing.expectEqual(nr.decode, b.decode_rows);
-    try bill.admitPhases(b, target);
+    try bill.admitOf(b, target);
     const mb = try bill.memoryBill(testing.allocator, b);
     defer mb.free(testing.allocator);
     try sdk.admit(mb, b.baseline, .{ .prompt = nr.prefill, .decode = nr.decode }, target);
     if (nr.decode < n_experts) {
         config.expert_rows = nr.decode + 1;
-        try testing.expectError(error.DecodeOverTarget, bill.admitPhases(try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov), target));
+        try testing.expectError(error.DecodeOverTarget, bill.admitOf(try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov), target));
         config.expert_rows = nr.decode;
     }
     if (nr.prefill < nr.decode) {
         config.expert_prefill_rows = nr.prefill + 1;
-        try testing.expectError(error.PromptOverTarget, bill.admitPhases(try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov), target));
+        try testing.expectError(error.PromptOverTarget, bill.admitOf(try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, ov), target));
     }
     // A box with room for every expert: the fill takes the layer's 32 in both phases; one under the floor refuses.
     try testing.expectEqual(arm_mod.NativeRows{ .prefill = n_experts, .decode = n_experts }, try bill.fill(a, io, configOf(tm), prompt, max_tokens, null, ceiling, ceiling, ov));
@@ -204,11 +203,6 @@ test "dsv41 memory mini: each route the bill reads moves its own term by geometr
     o = ov;
     o.dense_rc = true;
     try testing.expectEqual(b0.residents, (try bill.billAtFloor(a, io, config, prompt, max_tokens, null, ceiling, o)).residents);
-    // DRAFTCACHE: a cache as large as the mini head's experts (hot + transient rows) is refused by name, before any bytes.
-    o = ov;
-    o.draft_cache_hot = 2;
-    try testing.expectError(error.DraftCacheGeometry, bill.billAtFloor(a, io, config, prompt, max_tokens, null, ceiling, o));
-    try testing.expectError(error.DraftCacheGeometry, dspark_head.draftCacheBytes(&c, 2, .per_stage));
     // The decode cache limit and the transient release, each its own term.
     o = ov;
     o.decode_cache_bytes = 1 << 20;

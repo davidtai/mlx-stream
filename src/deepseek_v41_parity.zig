@@ -1185,17 +1185,11 @@ test "dsv41 weights: every resident binds through model.loadWeights with its spe
     std.debug.print("dsv41 weights: {d} arrays loaded, every resident bound\n", .{w.count()});
 }
 
-extern fn _dyld_image_count() u32;
-extern fn _dyld_get_image_name(image_index: u32) ?[*:0]const u8;
-
 // Declared last so it runs after the other dsv41 tests: only creating a Metal
 // device maps a GPU driver bundle (AGXMetal*), so none may be mapped here.
 test "dsv41 host: the host-only tests created no Metal device" {
     if (std.c.getenv("_GPU_WINDOW_LOCKED") != null) return error.SkipZigTest; // window runs build MLX arrays
-    for (0.._dyld_image_count()) |i| {
-        const name = _dyld_get_image_name(@intCast(i)) orelse continue;
-        try testing.expect(std.mem.indexOf(u8, std.mem.span(name), "AGXMetal") == null);
-    }
+    try @import("sdk").testing.expectNoDevice();
 }
 
 // Guarded window only (_GPU_WINDOW_LOCKED; MLX on the CPU stream): DSV41_BANK=<bank> DSV41_HEAD_FIXTURE_DUMP=<a parity dump with p*.final.h and

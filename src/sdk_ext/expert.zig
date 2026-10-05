@@ -13,8 +13,6 @@ pub const Pool = io.Pool;
 pub const Records = io.Records;
 pub const UncachedFd = io.UncachedFd;
 pub const openUncached = io.openUncached;
-/// The read pool threads' scheduling (`Options.sched`).
-pub const Sched = io.Sched;
 pub const openUncachedFollowing = io.openUncachedFollowing;
 pub const max_range_components = io.max_range_components;
 pub const checkTopology = io.checkTopology;
@@ -26,9 +24,6 @@ pub const Event = event.Event;
 
 /// The residency policy every source plans with (one admission and replacement policy for every source).
 pub const policy = @import("expert/policy.zig");
-/// A generic expert cache over per-expert tensors at known file offsets (the draft head's experts): the residency
-/// policy plans it, the read pool fills it.
-pub const slot_cache = @import("expert/slot_cache.zig");
 /// The expert stream over a bank module (`assertBank`): slot rows, routes, residency, reads, lookahead, gates, release.
 pub const stream = @import("expert/stream.zig");
 /// The lookahead selector: the next routed layer's predicted records, chosen by score over its router rows.
@@ -122,12 +117,6 @@ pub const Stats = struct {
     ahead_hits: u64 = 0,
     ahead_demand: u64 = 0,
     ahead_bytes: u64 = 0,
-    /// A0 (a)'s warm reads: records issued at the grow, landed / cancelled by their layer's first decode route, and
-    /// that route's hits on landed ones (once per layer; warm_landed + warm_cancelled == warm_issued).
-    warm_issued: u64 = 0,
-    warm_landed: u64 = 0,
-    warm_cancelled: u64 = 0,
-    warm_hits: u64 = 0,
 };
 
 /// A source's refusals at run time. A failure is sticky: every later call refuses as `StreamFailed`.

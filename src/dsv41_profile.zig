@@ -66,7 +66,7 @@ pub const n_tags = std.meta.fieldNames(Tag).len;
 pub const glue = n_tags;
 pub const n_slots = n_tags + 1;
 pub const max_depth = 8;
-pub const max_layers = 64;
+pub const max_layers = @import("deepseek_v41.zig").max_layers;
 
 fn ix(t: Tag) usize {
     return @backingInt(t);

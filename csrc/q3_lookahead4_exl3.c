@@ -101,23 +101,11 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  *     (same fd, offset, component lengths) holds, and a pre-range covers exactly the layer's span;
  *   - the stock entry points (q3ld_spec_step / _spec_stepn / _pre_read) behave as before (len = rec_len, the armed
  *     lengths): a uniform-record bank reads exactly as with the original pool.  ABI 2026092704 (original 2026092504).
- */
-/* WARM class (A0 (a), 2026-10-01; native-decode-40-design §9 (a)): ONE addition, a second job ring BELOW demand.
- *   q3ld_submit_warm queues a stock job (the ranges, rows, result words and completion log of q3ld_submit) on the warm
- *   ring: no deadline, no pre-range bind, no speculative claim, no gate.  A worker takes a warm job only while the demand
- *   ring is empty, no pre-range is queued and fewer than warm_busy_max jobs run (q3ld_warm_config; 0 = off, which
- *   cancels every queued warm job); once started it runs like a demand job and counts as demand busy.
- *   q3ld_warm_cancel publishes every QUEUED warm job overlapping [first, first + count) as ST_SKIPPED (a started job
- *   finishes); quiesce and stop cancel the queued ones the same way.  Keyed by TICKET only.  Counters SC_WARM_*; inject
- *   event kinds 11 (warm start), 12 (warm submit), 13 (warm cancel).  ABI 2026100101.
- * SCHED (q3ld_sched_config before q3ld_start, bits): the pool threads' QoS and names; bounded spins before sleeping
- *   (demand workers on work_cv, q3ld_wait on done_cv); demand first (the speculative queue rule at demand busy 0).
- *   ABI 2026100201.
+ * ABI 2026100201.
  */
 #include <errno.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
-#include <pthread/qos.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -140,7 +128,6 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
 #define MAX_SPEC 16
 #define MAX_SPEC_THREADS 3
 #define MAX_H 4
-#define MAX_VAL 64
 #define SPEC_MAX_DEMAND_BUSY 1
 #define SP_FREE 0
 #define SP_QUEUED 1
@@ -209,11 +196,6 @@ enum {
     SC_EV_WD_LAST_VALUE,  /* the value of the last forced gate */
     SC_EV_HOST_RELEASED,  /* gates the host released (error paths) */
     SC_EV_STOP_RELEASED,  /* live gates released at stop */
-    /* the warm class (A0 (a)) */
-    SC_WARM_SUBMITTED,    /* warm jobs queued */
-    SC_WARM_STARTED,      /* warm jobs a worker started */
-    SC_WARM_CANCELLED,    /* queued warm jobs cancelled (their tickets published skipped) */
-    SC_WARM_MAX_BUSY_AT_START, /* max jobs running when a warm job started (< warm_busy_max) */
     SC_N
 };
 
@@ -281,47 +263,11 @@ static pthread_t threads[MAX_WORKERS];
 static pthread_t spec_threads[MAX_SPEC_THREADS];
 static char *staging[MAX_WORKERS];
 static int nworkers = 0, running = 0, stopping = 0, busy = 0;
-/* SCHED (set on a stopped pool before q3ld_start; read at each thread's start, by the bounded spins and by the
- * speculative queue rule), bits: SCHED_QOS demand workers and the watchdog USER_INTERACTIVE, speculative workers
- * UTILITY, every thread named; SCHED_SPIN a bounded spin before a demand worker or a q3ld_wait caller sleeps;
- * SCHED_DEMAND_FIRST no unclaimed speculative chunk starts while any demand job is queued or executing;
- * SCHED_QOS_DEMAND (not with SCHED_QOS) the demand workers and the watchdog USER_INTERACTIVE, the speculative workers
- * keeping the inherited class (no UTILITY anywhere: no per-claim switch either), every thread named.  0 = the stock
- * pool (threads inherit the creating thread's QoS). */
-#define SCHED_QOS 1
-#define SCHED_SPIN 2
-#define SCHED_DEMAND_FIRST 4
-#define SCHED_QOS_DEMAND 8
-/* SCHED_KEEPWARM: one named thread that spins (yield) while switched on (q3ld_keepwarm, the decode phase), so the
- * reader cores never idle between a cycle's miss layers; it does no I/O and touches no shared state but its own words. */
-#define SCHED_KEEPWARM 32
-/* SCHED_STARTUI: the thread that called q3ld_start (the stream's constructing thread) USER_INTERACTIVE, once, after the
- * workers were created (they keep its previous class). */
-#define SCHED_STARTUI 64
-static int sched_mode = 0;
-#define SCHED_SPIN_NS 30000
-
-static void sched_thread(qos_class_t qos, const char *fmt, int i) {
-    if (!(sched_mode & (SCHED_QOS | SCHED_QOS_DEMAND))) return;
-    if ((sched_mode & SCHED_QOS) || qos != QOS_CLASS_UTILITY) pthread_set_qos_class_self_np(qos, 0);
-    char name[32];
-    snprintf(name, sizeof name, fmt, i);
-    pthread_setname_np(name);
-}
-
-static inline void sched_relax(void) {
-#if defined(__aarch64__)
-    __asm__ __volatile__("yield");
-#endif
-}
 static int64_t staging_bytes = 0, page_size = 0;
 static int64_t *res = 0, nt = 0, *logbuf = 0, logn = 0, *gauge = 0;
 static range_t *ranges = 0;
 static job_t *queue = 0;
 static int64_t qcap = 0, qhead = 0, qlen = 0;
-static job_t *wqueue = 0;                    /* WARM: the ring below demand (capacity qcap) */
-static int64_t whead = 0, wlen = 0;
-static int warm_busy_max = 0;                /* 0 = the class off */
 static uint64_t seq = 0;
 
 static spec_t spec[MAX_SPEC];
@@ -916,75 +862,23 @@ static void publish(int64_t t) {
     if (gate_of && gate_of[t]) gate_ticket_done(t);          /* EVENT: its gate (the flush follows the unlock) */
 }
 
-/* WARM: a worker may start a warm job now (caller holds mu). */
-static int warm_ready(void) { return wlen > 0 && busy < warm_busy_max; }
-
-/* WARM: every QUEUED warm job overlapping tickets [first, first + count) (count < 0: every one) published as skipped
- * and dropped from the ring, the rest kept in order (caller holds mu).  Returns the tickets published. */
-static int64_t warm_cancel_locked(int64_t first, int64_t count) {
-    int64_t kept = 0, published = 0, jobs = 0;
-    for (int64_t i = 0; i < wlen; i++) {
-        job_t job = wqueue[(whead + i) % qcap];
-        if (count >= 0 && !(job.first < first + count && first < job.first + job.count)) {
-            wqueue[(whead + kept) % qcap] = job;
-            kept += 1;
-            continue;
-        }
-        int64_t now = q3ld_monotonic_ns();
-        for (int32_t k = 0; k < job.count; k++) {
-            int64_t t = job.first + k;
-            int64_t *out = res + t * RES_W;
-            out[1] = out[2] = out[3] = out[4] = 0;
-            out[5] = out[6] = now;
-            out[7] = -1;
-            out[0] = ST_SKIPPED;
-            publish(t);
-            published += 1;
-        }
-        jobs += 1;
-        EV(13, job.first);
-    }
-    wlen = kept;
-    if (sc) sc[SC_WARM_CANCELLED] += jobs;
-    return published;
-}
-
 static void *worker(void *arg) {
     int w = (int)(intptr_t)arg;
     char *stage = staging[w];
-    sched_thread(QOS_CLASS_USER_INTERACTIVE, "q3ld-demand-%d", w);
     for (;;) {
         pthread_mutex_lock(&mu);
         int pi = -1;
-        if ((sched_mode & SCHED_SPIN) && !stopping && qlen == 0 && pre_pick() < 0 && !warm_ready()) {
-            /* SCHED spin: a job queued within SCHED_SPIN_NS starts without a condition wake-up (re-checked below). */
-            pthread_mutex_unlock(&mu);
-            int64_t t0 = q3ld_monotonic_ns();
-            while (__atomic_load_n(&qlen, __ATOMIC_RELAXED) == 0 && !__atomic_load_n(&stopping, __ATOMIC_RELAXED)
-                   && q3ld_monotonic_ns() - t0 < SCHED_SPIN_NS) sched_relax();
-            pthread_mutex_lock(&mu);
-        }
-        while (!stopping && qlen == 0 && (pi = pre_pick()) < 0 && !warm_ready()) pthread_cond_wait(&work_cv, &mu);
+        while (!stopping && qlen == 0 && (pi = pre_pick()) < 0) pthread_cond_wait(&work_cv, &mu);
         if (qlen == 0 && stopping) { pthread_mutex_unlock(&mu); return 0; }
         if (qlen == 0 && pi >= 0) {                   /* PRE: no job queued -> the oldest pre-range */
             run_pre(pi, w, stage);
             pthread_mutex_unlock(&mu);
             continue;
         }
-        job_t job;
-        if (qlen > 0) {
-            job = queue[qhead];
-            qhead = (qhead + 1) % qcap;
-            __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);   /* SCHED spin reads it lock-free */
-            EV(2, job.first);
-        } else {                                      /* WARM: demand and pre-read idle, below the busy limit */
-            job = wqueue[whead];
-            whead = (whead + 1) % qcap;
-            wlen -= 1;
-            sc[SC_WARM_STARTED] += 1;
-            if (busy > sc[SC_WARM_MAX_BUSY_AT_START]) sc[SC_WARM_MAX_BUSY_AT_START] = busy;
-            EV(11, job.first);
-        }
+        job_t job = queue[qhead];
+        qhead = (qhead + 1) % qcap;
+        __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);
+        EV(2, job.first);
         busy += 1;
         pthread_mutex_unlock(&mu);
         int failed = 0;
@@ -1060,7 +954,6 @@ static void *worker(void *arg) {
 
 /* ---------------------------------------------------------------- speculative: reader threads */
 static int rule_ok(int ti) {   /* THE QUEUE RULE, demand side, for speculative thread ti (caller holds mu) */
-    if (sched_mode & SCHED_DEMAND_FIRST) return qlen == 0 && busy == 0;   /* SCHED: demand owns the drive */
     return qlen == 0 && busy <= (ti == 0 ? SPEC_MAX_DEMAND_BUSY : spec_idle_busy);
 }
 
@@ -1114,10 +1007,6 @@ static void spec_drop_parked(spec_t *s) {   /* caller holds mu; s is INFLIGHT &&
 
 static void *spec_worker(void *arg) {
     int ti = (int)(intptr_t)arg;
-    sched_thread(QOS_CLASS_UTILITY, "q3ld-spec-%d", ti);
-    /* SCHED_QOS: a CLAIMED record's chunks run at the demand class (a demand read waits on them), unclaimed ones at
-     * UTILITY; set by the worker itself at each chunk boundary. */
-    int claimed_qos = 0;
     pthread_mutex_lock(&mu);
     for (;;) {
         int i;
@@ -1182,12 +1071,7 @@ static void *spec_worker(void *arg) {
             char *dst = s->buf + s->got;
             int fd = s->fd;
             off_t off = (off_t)(s->aligned + s->got);
-            int want_claimed = s->claimed;
             pthread_mutex_unlock(&mu);
-            if ((sched_mode & SCHED_QOS) && want_claimed != claimed_qos) {
-                pthread_set_qos_class_self_np(want_claimed ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_UTILITY, 0);
-                claimed_qos = want_claimed;
-            }
             SPEC_DELAY();
             int64_t done = 0;
             int err = 0;
@@ -1259,62 +1143,6 @@ int q3ld_spec_streams(int32_t idle_busy) {
     return 0;
 }
 
-/* KEEPWARM: the spinner (started by q3ld_start under SCHED_KEEPWARM, joined by q3ld_stop). */
-static pthread_t kw_thread;
-static int kw_running = 0, kw_stop = 0, kw_on = 0;
-static int64_t kw_spins = 0, kw_sleep_ns = 0;
-static pthread_cond_t kw_cv = PTHREAD_COND_INITIALIZER;
-static void *kw_main(void *arg) {
-    (void)arg;
-    pthread_setname_np("q3ld-keepwarm");
-    for (;;) {
-        pthread_mutex_lock(&mu);
-        while (!kw_on && !kw_stop) pthread_cond_wait(&kw_cv, &mu);
-        int quit = kw_stop;
-        pthread_mutex_unlock(&mu);
-        if (quit) return 0;
-        while (__atomic_load_n(&kw_on, __ATOMIC_RELAXED) && !__atomic_load_n(&kw_stop, __ATOMIC_RELAXED)) {
-            if (kw_sleep_ns > 0) {
-                struct timespec ts = { 0, (long)kw_sleep_ns };
-                nanosleep(&ts, 0);
-            } else {
-                sched_relax();
-            }
-            __atomic_fetch_add(&kw_spins, 1, __ATOMIC_RELAXED);
-        }
-    }
-}
-/* KEEPWARM: switch the spinner on (1) or off (0); -1 without the bit or a running spinner. */
-int q3ld_keepwarm(int32_t on) {
-    pthread_mutex_lock(&mu);
-    if (!kw_running) { pthread_mutex_unlock(&mu); return -1; }
-    __atomic_store_n(&kw_on, on ? 1 : 0, __ATOMIC_RELAXED);
-    pthread_cond_broadcast(&kw_cv);
-    pthread_mutex_unlock(&mu);
-    return 0;
-}
-/* KEEPWARM: the thread's per-loop sleep (0 = a yield loop, else < 1 s); a stopped pool only, before q3ld_start. */
-int q3ld_keepwarm_sleep(int64_t ns) {
-    pthread_mutex_lock(&mu);
-    if (running || ns < 0 || ns >= 1000000000) { pthread_mutex_unlock(&mu); return -1; }
-    kw_sleep_ns = ns;
-    pthread_mutex_unlock(&mu);
-    return 0;
-}
-/* KEEPWARM: the spinner's loop count so far (0 without one). */
-int64_t q3ld_keepwarm_spins(void) { return __atomic_load_n(&kw_spins, __ATOMIC_RELAXED); }
-
-/* SCHED: the pool's scheduling bits (SCHED_QOS, SCHED_SPIN (only with SCHED_QOS), SCHED_DEMAND_FIRST, SCHED_QOS_DEMAND
- * (not with SCHED_QOS), SCHED_KEEPWARM; 0 = stock); a
- * stopped pool only, before q3ld_start. 0 or -1. */
-int q3ld_sched_config(int32_t mode) {
-    pthread_mutex_lock(&mu);
-    if (running || mode < 0 || (mode & ~(SCHED_QOS | SCHED_SPIN | SCHED_DEMAND_FIRST | SCHED_QOS_DEMAND | SCHED_KEEPWARM | SCHED_STARTUI)) || ((mode & SCHED_SPIN) && !(mode & SCHED_QOS)) || ((mode & SCHED_QOS) && (mode & SCHED_QOS_DEMAND))) { pthread_mutex_unlock(&mu); return -1; }
-    sched_mode = mode;
-    pthread_mutex_unlock(&mu);
-    return 0;
-}
-
 /* Start the pool.  staging_ptrs: nw page-aligned buffers of sbytes.  Returns 0 or -errno / -1 / -2. */
 int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t psize,
                int64_t *res_arr, int64_t n_tickets, int64_t *log_arr, int64_t n_log, int64_t *gauge_arr) {
@@ -1329,10 +1157,9 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     queue = (job_t *)calloc((size_t)n_tickets, sizeof(job_t));
     pre_of = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
     gate_of = (int64_t *)calloc((size_t)n_tickets, sizeof(int64_t));
-    wqueue = (job_t *)calloc((size_t)n_tickets, sizeof(job_t));
-    if (!ranges || !queue || !pre_of || !gate_of || !wqueue) {
-        free(ranges); free(queue); free(pre_of); free(gate_of); free(wqueue);
-        ranges = 0; queue = 0; pre_of = 0; gate_of = 0; wqueue = 0;
+    if (!ranges || !queue || !pre_of || !gate_of) {
+        free(ranges); free(queue); free(pre_of); free(gate_of);
+        ranges = 0; queue = 0; pre_of = 0; gate_of = 0;
         pthread_mutex_unlock(&mu);
         return -ENOMEM;
     }
@@ -1342,7 +1169,6 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     g_head = g_tail = 0; ev_hi = ev_target = ev_sent = 0; ev_target_t = 0; ev_kind = EVK_OFF; ev_obj = 0;
     wd_stop = 0; wd_running = 0;
     qcap = n_tickets; qhead = 0; __atomic_store_n(&qlen, 0, __ATOMIC_RELAXED);
-    whead = 0; wlen = 0; warm_busy_max = 0;
     res = res_arr; nt = n_tickets; logbuf = log_arr; logn = n_log; gauge = gauge_arr;
     staging_bytes = sbytes; page_size = psize;
     __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); busy = 0; seq = 0;
@@ -1357,12 +1183,9 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
         if (pthread_create(&spec_threads[i], 0, spec_worker, (void *)(intptr_t)i) != 0) break;
         nspec_started++;
     }
-    kw_stop = 0; kw_on = 0; kw_spins = 0;
-    if ((sched_mode & SCHED_KEEPWARM) && pthread_create(&kw_thread, 0, kw_main, 0) == 0) kw_running = 1;
     running = 1;
     pthread_mutex_unlock(&mu);
-    if (nworkers != nw || nspec_started != nspec_threads || ((sched_mode & SCHED_KEEPWARM) && !kw_running)) return -2;
-    if (sched_mode & SCHED_STARTUI) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    if (nworkers != nw || nspec_started != nspec_threads) return -2;
     return 0;
 }
 
@@ -1419,74 +1242,11 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     if (nspec) claim_ranges(fd, first, count);
     job_t *job = &queue[(qhead + qlen) % qcap];
     job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->first = first; job->count = count;
-    __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);   /* SCHED spin reads it lock-free */
+    __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
     EV(1, first);
     pthread_cond_signal(&work_cv);
     pthread_mutex_unlock(&mu);
     return 0;
-}
-
-/* WARM: one job of n <= MAX_ITEMS records on tickets first .. first + 2n - 1 (GU then DOWN, as q3ld_submit) queued on
- * the warm ring: no deadline, no pre-range bind, no speculative claim, no gate.  0; -1 bad args / not running / the
- * class off; -2 a ticket is still pending; -3 the warm ring is full. */
-int q3ld_submit_warm(int32_t fd, int64_t file_size, int32_t n, int32_t ngu, int32_t ndown, const int64_t *offsets,
-                     const uint64_t *const *rows, const int64_t *lens, int64_t first) {
-    if (n < 1 || n > MAX_ITEMS || ngu < 1 || ndown < 1 || ngu > MAX_COMP || ndown > MAX_COMP) return -1;
-    int32_t count = 2 * n;
-    if (first < 0 || first + count > nt) return -1;
-    pthread_mutex_lock(&mu);
-    if (!running || stopping || warm_busy_max < 1) { pthread_mutex_unlock(&mu); return -1; }
-    for (int32_t i = 0; i < count; i++) {
-        if (res[(first + i) * RES_W] == ST_PENDING) { pthread_mutex_unlock(&mu); return -2; }
-    }
-    if (wlen >= qcap) { pthread_mutex_unlock(&mu); return -3; }
-    for (int32_t i = 0; i < count; i++) {
-        int down = i >= n;
-        int32_t item = down ? i - n : i;
-        range_t *rg = &ranges[first + i];
-        rg->offset = offsets[i];
-        rg->ndst = down ? ndown : ngu;
-        for (int32_t c = 0; c < rg->ndst; c++) {
-            int32_t k = down ? ngu + c : c;
-            rg->dst[c] = rows[item][k];
-            rg->len[c] = lens[k];
-        }
-        int64_t *out = res + (first + i) * RES_W;
-        for (int k = 1; k < RES_W; k++) out[k] = 0;
-        out[0] = ST_PENDING;
-        pre_of[first + i] = 0;
-        gate_of[first + i] = 0;
-    }
-    job_t *job = &wqueue[(whead + wlen) % qcap];
-    job->fd = fd; job->file_size = file_size; job->deadline = -1; job->first = first; job->count = count;
-    wlen += 1;
-    sc[SC_WARM_SUBMITTED] += 1;
-    EV(12, first);
-    pthread_cond_signal(&work_cv);
-    pthread_mutex_unlock(&mu);
-    return 0;
-}
-
-/* WARM: arm (1 <= busy_max <= the worker count; the pool has counters) or disarm (0: every queued warm job cancelled)
- * on a running pool.  0 or -1. */
-int q3ld_warm_config(int32_t busy_max) {
-    pthread_mutex_lock(&mu);
-    if (!running || stopping || busy_max < 0 || busy_max > nworkers || (busy_max > 0 && !sc)) { pthread_mutex_unlock(&mu); return -1; }
-    warm_busy_max = busy_max;
-    if (busy_max == 0 && wlen) warm_cancel_locked(0, -1);
-    pthread_cond_broadcast(&work_cv);
-    pthread_mutex_unlock(&mu);
-    return 0;
-}
-
-/* WARM: every QUEUED warm job overlapping tickets [first, first + count) published as ST_SKIPPED now (a started job
- * finishes).  The tickets published; -1 not running or count < 0. */
-int64_t q3ld_warm_cancel(int64_t first, int64_t count) {
-    pthread_mutex_lock(&mu);
-    if (!running || count < 0) { pthread_mutex_unlock(&mu); return -1; }
-    int64_t n = warm_cancel_locked(first, count);
-    pthread_mutex_unlock(&mu);
-    return n;
 }
 
 /* settle every unclaimed record with tag <= cur: QUEUED dropped, parked dropped, running abandoned at the next
@@ -1649,12 +1409,6 @@ int64_t q3ld_seq(void) {
 
 /* Block (CDLL: GIL released) until seq != seen or timeout_ns elapses; returns seq (ACQUIRE). */
 int64_t q3ld_wait(int64_t seen, int64_t timeout_ns) {
-    if ((sched_mode & SCHED_SPIN) && timeout_ns > 0) {      /* SCHED spin: a completion within SCHED_SPIN_NS needs no sleep */
-        int64_t t0 = q3ld_monotonic_ns();
-        while ((int64_t)__atomic_load_n(&seq, __ATOMIC_ACQUIRE) == seen && q3ld_monotonic_ns() - t0 < SCHED_SPIN_NS) sched_relax();
-        int64_t now = (int64_t)__atomic_load_n(&seq, __ATOMIC_ACQUIRE);
-        if (now != seen) return now;
-    }
     pthread_mutex_lock(&mu);
     if ((int64_t)seq == seen && timeout_ns > 0) {
         struct timespec dl;
@@ -1689,7 +1443,6 @@ int q3ld_quiesce(int64_t timeout_ns) {
         else if (s->state == SP_INFLIGHT && !s->claimed) s->abandon = 1;
     }
     pthread_cond_broadcast(&spec_cv);
-    if (wlen) warm_cancel_locked(0, -1);         /* WARM: queued ones dropped, started ones drain below */
     int rc = 0;
     for (;;) {
         int parked_claimed = 0;
@@ -1709,23 +1462,13 @@ int q3ld_quiesce(int64_t timeout_ns) {
 int q3ld_stop(void) {
     pthread_mutex_lock(&mu);
     if (!running) { pthread_mutex_unlock(&mu); return -1; }
-    if (wlen) warm_cancel_locked(0, -1);         /* WARM: no waiter outlives the pool */
-    warm_busy_max = 0;
-    __atomic_store_n(&stopping, 1, __ATOMIC_RELAXED);   /* SCHED spin reads it lock-free */
+    __atomic_store_n(&stopping, 1, __ATOMIC_RELAXED);
     pthread_cond_broadcast(&work_cv);
     pthread_cond_broadcast(&spec_cv);
     pthread_cond_broadcast(&pre_cv);             /* PRE: a worker held at an unbound range's bind point drops it */
     pthread_mutex_unlock(&mu);
     for (int i = 0; i < nworkers; i++) pthread_join(threads[i], 0);
     for (int i = 0; i < nspec_started; i++) pthread_join(spec_threads[i], 0);
-    if (kw_running) {
-        pthread_mutex_lock(&mu);
-        __atomic_store_n(&kw_stop, 1, __ATOMIC_RELAXED);
-        pthread_cond_broadcast(&kw_cv);
-        pthread_mutex_unlock(&mu);
-        pthread_join(kw_thread, 0);
-        kw_running = 0;
-    }
     /* EVENT: no ticket publishes any more.  Stop the watchdog, then release every live gate (no GPU wait outlives
      * the pool) and hand the final prefix to the event before the class is disarmed. */
     pthread_mutex_lock(&mu);
@@ -1760,8 +1503,7 @@ int q3ld_stop(void) {
     }
     running = 0; nworkers = 0; nspec_started = 0; __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); nspec = 0; nspec_threads = 0; spec_configured = 0;
     spec_idle_busy = SPEC_MAX_DEMAND_BUSY;
-    free(ranges); free(queue); free(pre_of); free(wqueue); ranges = 0; queue = 0; pre_of = 0; wqueue = 0;
-    whead = 0; wlen = 0;
+    free(ranges); free(queue); free(pre_of); ranges = 0; queue = 0; pre_of = 0;
     for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
     pre_on = 0; pre_ngu = pre_ndown = 0; pre_gu_total = 0;
     res = 0; logbuf = 0; gauge = 0; sc = 0;
@@ -1910,7 +1652,6 @@ int32_t q3ld_pre_state(int64_t *out) {
 /* The watchdog: forces the oldest live gate once its deadline passed (a lost signal can never hang the GPU). */
 static void *wd_main(void *arg) {
     (void)arg;
-    sched_thread(QOS_CLASS_USER_INTERACTIVE, "q3ld-watchdog%.0d", 0);
     pthread_mutex_lock(&mu);
     while (!wd_stop) {
         if (g_head >= g_tail) { pthread_cond_wait(&wd_cv, &mu); continue; }
@@ -2085,7 +1826,7 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026100201; }              /* WARM (EXL3_LANE_PORT 2026092704, original 2026092504) */
+int32_t q3ld_abi(void) { return 2026100201; }              /* EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }

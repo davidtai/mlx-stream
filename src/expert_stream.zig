@@ -41,12 +41,8 @@ pub const Options = S.Options;
 pub const read_ahead_probed = S.read_ahead_probed;
 pub const ReadAheadProbe = S.ReadAheadProbe;
 pub const GrowFill = S.GrowFill;
-pub const DecodePool = S.DecodePool;
-pub const PoolCand = S.PoolCand;
-pub const poolRows = S.poolRows;
 const ProbeSlot = S.ProbeSlot;
 const no_probe = S.no_probe;
-pub const FirstVerifyWarm = S.FirstVerifyWarm;
 pub const Lookahead = S.Lookahead;
 pub const Event = S.Event;
 pub const Gates = S.Gates;
@@ -256,7 +252,7 @@ pub const StreamSource = struct {
         return k;
     }
 
-    /// Whether `expert` holds one of `layer`'s persistent slots now (the recall check's residency, before a route).
+    /// Whether `expert` holds one of `layer`'s persistent slots now (the profile builds' residency query, before a route).
     pub fn isResident(self: *const StreamSource, layer: u32, expert: u16) bool {
         return self.stream.layers[layer].policy.slotOf(expert) != null;
     }
@@ -280,11 +276,6 @@ pub const StreamSource = struct {
         return self.stream.wide_depth;
     }
 
-    /// A0 (a) (profile builds read it): the ns `layer`'s first decode route waited for its started warm jobs.
-    pub fn warmWaitNs(self: *const StreamSource, layer: u32) u64 {
-        return self.stream.warmWaitNs(layer);
-    }
-
     pub fn stats(self: *StreamSource) Stats {
         return self.stream.stats();
     }
@@ -292,11 +283,6 @@ pub const StreamSource = struct {
     /// Event gates of the call's reads (a stream built with `event`).
     pub fn gate(self: *StreamSource, call: *Call) Error!?Gates {
         return self.stream.gate(call.route.?);
-    }
-
-    /// The end of a decode cycle (option (b)'s clock; `Stream.cycleEnd`).
-    pub fn cycleEnd(self: *StreamSource) !void {
-        return self.stream.cycleEnd();
     }
 
     pub fn bankRows(self: *StreamSource, layer: u32, kind: BankKind) u32 {
@@ -331,19 +317,6 @@ pub const StreamSource = struct {
 // ── Tests ──
 
 const testing = std.testing;
-
-extern fn _dyld_image_count() u32;
-extern fn _dyld_get_image_name(image_index: u32) ?[*:0]const u8;
-
-/// Only creating a Metal device maps a GPU driver bundle (AGXMetal*), so its
-/// absence proves this process did no Metal work.
-fn metalDriverLoaded() bool {
-    for (0.._dyld_image_count()) |i| {
-        const name = _dyld_get_image_name(@intCast(i)) orelse continue;
-        if (std.mem.indexOf(u8, std.mem.span(name), "AGXMetal") != null) return true;
-    }
-    return false;
-}
 
 const FixSeg = struct { component: []const u8, offset: u64, length: u64, sha256: []const u8, head16: []const u8 };
 const FixRec = struct {
@@ -471,7 +444,7 @@ test "dsv41 slots: layer 13, 8 rows through the pool == pread == v2 sha == Pytho
     const calls = try checkSet("layer_set", &env.bank, set, &rows);
     try testing.expect(calls >= 2 * set.len);
     // With DSV41_PHASE0B_MLX the 0b tests run earlier in this process and made the Metal device.
-    if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try testing.expect(!metalDriverLoaded());
+    if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try sdk.testing.expectNoDevice();
 }
 
 test "dsv41 slots: cross-layer PICK set" {
@@ -483,7 +456,7 @@ test "dsv41 slots: cross-layer PICK set" {
     defer rows.deinit();
     _ = try checkSet("pick_set", &env.bank, set, &rows);
     // With DSV41_PHASE0B_MLX the 0b tests run earlier in this process and made the Metal device.
-    if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try testing.expect(!metalDriverLoaded());
+    if (std.c.getenv("DSV41_PHASE0B_MLX") == null) try sdk.testing.expectNoDevice();
 }
 
 // Phase 0b, inside a guarded window (GPU lock held): DSV41_PHASE0B_MLX=1.
@@ -505,33 +478,12 @@ test "dsv41 slots 0b: an MLX LayerSlotBank on the CPU stream fills like the host
 
 test "dsv41 slots: no Metal device in this process" {
     if (std.c.getenv("DSV41_PHASE0B_MLX") != null) return error.SkipZigTest;
-    try testing.expect(!metalDriverLoaded());
+    try sdk.testing.expectNoDevice();
 }
 
 /// A 2-layer synthetic bank on disk (hidden 64, inter 32: 2,880-byte records
 /// in 4 KiB slots), opened, with its experts.bin image.
-const SynthBank = struct {
-    tmp: std.testing.TmpDir,
-    image: []u8,
-    bank: expert_bank.Bank,
-
-    fn open(n_experts: u32) !SynthBank {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const image = try expert_bank.writeSynth(testing.allocator, &tmp, .{ .n_experts = n_experts });
-        errdefer testing.allocator.free(image);
-        var rbuf: [512]u8 = undefined;
-        const implemented: expert_bank.Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = n_experts, .n_layers = 2 };
-        const bank = try expert_bank.Bank.open(testing.allocator, std.testing.io, try expert_bank.tmpRoot(&tmp, &rbuf), implemented, null);
-        return .{ .tmp = tmp, .image = image, .bank = bank };
-    }
-
-    fn close(self: *SynthBank) void {
-        self.bank.deinit();
-        testing.allocator.free(self.image);
-        self.tmp.cleanup();
-    }
-};
+const SynthBank = expert_bank.SynthBank;
 
 const test_pool: expert_io.Options = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 };
 
@@ -708,99 +660,6 @@ test "dsv41 stream: growth is the one phase change" {
     try testing.expectEqual(@as(u32, 0), r.plan.n_evictions);
     try expectServed(s, &sb, r, &.{ 1, 2, 3, 4 });
     s.release(r);
-}
-
-test "dsv41 stream: keepwarm: the pool's spinner runs from the grow to the reverse phase change, never in the prompt phase" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    var pool_opt = test_pool;
-    pool_opt.sched = .{ .keep_warm = true };
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = pool_opt });
-    defer s.deinit();
-    const r = try serve(s, 0, &.{ 1, 2 });
-    s.release(r);
-    std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch {};
-    try testing.expectEqual(@as(u64, 0), s.pool.keepWarmSpins());
-    try s.grow(&.{ 4, 4 });
-    std.Io.sleep(testing.io, .fromMilliseconds(20), .awake) catch {};
-    try testing.expect(s.pool.keepWarmSpins() > 1000);
-    _ = try s.shrink(&.{ 2, 2 });
-    const after = s.pool.keepWarmSpins();
-    std.Io.sleep(testing.io, .fromMilliseconds(10), .awake) catch {};
-    try testing.expect(s.pool.keepWarmSpins() <= after + 1);
-}
-
-test "dsv41 stream: keepwarm<us>p: the thread runs from construction through the prompt, the grow and the reverse phase change" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    var pool_opt = test_pool;
-    pool_opt.sched = expert_io.Sched.parse("keepwarm25p").?;
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = pool_opt });
-    defer s.deinit();
-    std.Io.sleep(testing.io, .fromMilliseconds(20), .awake) catch {};
-    const in_prompt = s.pool.keepWarmSpins();
-    try testing.expect(in_prompt > 10);
-    try s.grow(&.{ 4, 4 });
-    _ = try s.shrink(&.{ 2, 2 });
-    const at_shrink = s.pool.keepWarmSpins();
-    std.Io.sleep(testing.io, .fromMilliseconds(20), .awake) catch {};
-    try testing.expect(s.pool.keepWarmSpins() > at_shrink + 10);
-}
-
-test "dsv41 stream: A0 (a): the grow's warm reads fill empty rows below demand; a layer's first decode route lands the started, cancels the queued (served on demand) and counts its hits" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    const page = std.heap.pageSize();
-    // Off its route the class is refused by name and counts nothing.
-    {
-        const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool });
-        defer s.deinit();
-        try s.grow(&.{ 4, 4 });
-        try testing.expectError(error.WarmNotInstalled, s.warmIssue(0, &.{3}));
-        try testing.expectEqual(@as(u64, 0), s.stats().warm_issued);
-    }
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 2, 2 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .first_verify_warm = .{ .max_records = 8, .busy_max = 1 } });
-    defer s.deinit();
-    defer expert_io.clearFaults();
-    var r = try serve(s, 0, &.{ 1, 2 });
-    s.release(r);
-    r = try serve(s, 1, &.{ 1, 2 });
-    s.release(r);
-    try testing.expectError(error.WarmBeforeGrow, s.warmIssue(0, &.{3}));
-    try s.grow(&.{ 6, 6 });
-    // Layer 0's first warm record (expert 3) holds the reader 80 ms, so the rest wait in the warm ring (busy limit 1).
-    const off3 = sb.bank.recordOffset(0, 3);
-    expert_io.injectFault(off3 - off3 % page, 5, 80 * std.time.ns_per_ms);
-    // Layer 0: 1 is resident (skipped), 3, 4 and 5 issued; layer 1: 7; a layer issues once.
-    try testing.expectEqual(@as(u32, 3), try s.warmIssue(0, &.{ 1, 3, 4, 5 }));
-    try testing.expectEqual(@as(u32, 1), try s.warmIssue(1, &.{7}));
-    try testing.expectError(error.InvalidWarm, s.warmIssue(0, &.{6}));
-    while (s.pool.counter(.warm_started) == 0) std.Thread.yield() catch {};
-    // Layer 0's first decode route: 3 lands (waited for), 4 and 5 are cancelled; 3 is a hit, 4 and 6 are read on demand.
-    r = try serve(s, 0, &.{ 3, 4, 6 });
-    try testing.expectEqual(@as(u32, 1), r.plan.n_hits);
-    try testing.expectEqualSlices(u16, &.{3}, r.plan.hitsOf());
-    try expectServed(s, &sb, r, &.{ 3, 4, 6 });
-    try testing.expect(s.warmWaitNs(0) > 0);
-    s.release(r);
-    // Layer 1's warm record lands below demand; its first route serves it as a hit.
-    const w = &s.warm.?;
-    const t7 = w.loads[w.layers[1].lo].ticket;
-    try s.pool.wait(t7, 2, 10 * std.time.ns_per_s);
-    r = try serve(s, 1, &.{ 7, 8 });
-    try testing.expectEqualSlices(u16, &.{7}, r.plan.hitsOf());
-    try expectServed(s, &sb, r, &.{ 7, 8 });
-    s.release(r);
-    // Settled once: a later route of layer 0 counts no warm hit.
-    r = try serve(s, 0, &.{3});
-    s.release(r);
-    const st = s.stats();
-    try testing.expectEqual(@as(u64, 4), st.warm_issued);
-    try testing.expectEqual(@as(u64, 2), st.warm_landed);
-    try testing.expectEqual(@as(u64, 2), st.warm_cancelled);
-    try testing.expectEqual(@as(u64, 2), st.warm_hits);
-    try testing.expectEqual(st.warm_issued, st.warm_landed + st.warm_cancelled);
-    try testing.expect(!s.warm_live);
 }
 
 test "dsv41 stream: slots held for a deferred call are never refilled until released" {
@@ -2461,183 +2320,11 @@ test "dsv41 stream: a request's start zeroes every layer's prompt counts, and on
     try s.seedPrefill(0, &.{ 1, 2, 3, 1 });
     try s.seedPrefill(1, &.{7});
     s.release(try serve(s, 0, &.{ 1, 2, 3 }));
-    try testing.expectEqual(@as(u32, 2), s.promptCounts(0)[1]);
+    try testing.expectEqual(@as(u32, 2), s.layers[0].policy.prefill_freq[1]);
     const resident = s.layers[0].policy.occupancy;
     s.resetPromptCounts();
-    for (0..2) |l| for (s.promptCounts(@intCast(l))) |c| try testing.expectEqual(@as(u32, 0), c);
+    for (0..2) |l| for (s.layers[l].policy.prefill_freq) |c| try testing.expectEqual(@as(u32, 0), c);
     try testing.expectEqual(resident, s.layers[0].policy.occupancy);
-}
-
-test "dsv41 stream: option (b)'s rule keeps the total, the floor and the cap, and equal misses keep every layer uniform" {
-    var cands: [4 * 2 * 3]PoolCand = undefined;
-    var out: [4]u32 = undefined;
-    const floor = [_]u32{ 7, 7, 7, 7 };
-    poolRows(&cands, &.{ 5, 5, 5, 5 }, &floor, 10, 3, 32, &out);
-    try testing.expectEqualSlices(u32, &.{ 10, 10, 10, 10 }, &out);
-    poolRows(&cands, &.{ 0, 0, 0, 0 }, &floor, 10, 3, 32, &out);
-    try testing.expectEqualSlices(u32, &.{ 10, 10, 10, 10 }, &out);
-    // One layer misses: it takes the cap (13), the rest give rows by row then layer.
-    poolRows(&cands, &.{ 0, 90, 0, 0 }, &floor, 10, 3, 32, &out);
-    try testing.expectEqual(@as(u32, 13), out[1]);
-    var total: u32 = 0;
-    for (out) |r| {
-        total += r;
-        try testing.expect(r >= 7 and r <= 13);
-    }
-    try testing.expectEqual(@as(u32, 40), total);
-    // m / r^3: twice the misses is worth 2^(1/3) more rows, never all of them.
-    poolRows(&cands, &.{ 10, 20, 10, 10 }, &floor, 10, 3, 32, &out);
-    try testing.expect(out[1] > 10 and out[1] < 13);
-}
-
-// Option (b) on the stream: window 0 carries the pool rows (the same rows the uniform grow puts in the ext banks), each
-// routed id is served its record before and after the re-plan, the re-plan moves rows to the layer that missed, and the
-// rows allocated are the uniform grow's: the bill's (layers x U + window 0) by construction.
-test "dsv41 stream: decode_first16 re-owns pool rows of window 0 at its cycle and serves every id its record" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    var st: [2]Stats = undefined;
-    for ([_]?DecodePool{ null, .{ .per_layer = 2, .from_cycle = 2, .at_cycle = 4 } }, 0..) |dp, arm| {
-        const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .transient_release = true, .decode_pool = dp });
-        defer s.deinit();
-        try s.seedPrefill(0, &.{ 1, 2, 3, 1 });
-        s.release(try serve(s, 0, &.{ 1, 2, 3, 5 }));
-        s.release(try serve(s, 1, &.{ 7, 8, 9 }));
-        _ = try s.releaseTransient();
-        try s.grow(&.{ 8, 8 });
-        // The same rows either way: ext + window 0 == layers x (U - P) + the scratch window.
-        var allocated: u32 = s.transient.rows;
-        for (s.layers) |ls| allocated += if (ls.ext) |e| e.rows else 0;
-        try testing.expectEqual(@as(u32, 2 * (8 - 4) + 12 + decode_staging_rows), allocated);
-        var rng = std.Random.DefaultPrng.init(17);
-        const rand = rng.random();
-        var ids: [12]u16 = undefined;
-        for (1..9) |cycle| {
-            for (0..2) |l| {
-                const layer: u32 = @intCast(l);
-                const n = rand.intRangeAtMost(usize, 2, 8);
-                // Layer 0 reuses 6 experts, layer 1 roams 20.
-                for (ids[0..n]) |*e| e.* = if (layer == 0) rand.intRangeLessThan(u16, 0, 6) else rand.intRangeLessThan(u16, 10, 30);
-                const r = try serve(s, layer, ids[0..n]);
-                try expectServed(s, &sb, r, ids[0..n]);
-                s.release(r);
-            }
-            try s.flush();
-            try s.cycleEnd();
-            if (dp != null and cycle < 4) try testing.expect(s.poolReplan() == null);
-        }
-        st[arm] = s.stats();
-        for (0..2) |l| for (0..s.layers[l].policy.capacity + 12) |slot| {
-            try testing.expectEqual(@as(u16, 0), s.pinsOf(@intCast(l), @intCast(slot)));
-        };
-        if (dp) |_| {
-            const rp = s.poolReplan().?;
-            try testing.expectEqual(@as(u32, 16), rp.rows[0] + rp.rows[1]);
-            try testing.expect(rp.rows[1] > rp.rows[0]);
-            try testing.expect(rp.misses[1] > rp.misses[0]);
-            for (rp.rows, 0..) |r, l| try testing.expectEqual(r, s.layers[l].policy.capacity);
-            // Every pool row has exactly one owner.
-            var seen: [4]bool = @splat(false);
-            for (s.layers) |ls| for (ls.pool[0 .. ls.policy.capacity - ls.pool_lo]) |pr| {
-                try testing.expect(!seen[pr]);
-                seen[pr] = true;
-            };
-            for (seen) |x| try testing.expect(x);
-        }
-    }
-    try testing.expectEqual(st[0].route_calls, st[1].route_calls);
-    try testing.expectEqual(st[0].expert_cache_hits + st[0].expert_cache_misses, st[1].expert_cache_hits + st[1].expert_cache_misses);
-    std.debug.print("\ndecode_first16 misses: uniform {d}, pool {d}\n", .{ st[0].expert_cache_misses, st[1].expert_cache_misses });
-}
-
-test "dsv41 stream: decode_first16 is refused without the transient release or with a zero pool" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    try testing.expectError(error.InvalidOptions, Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .decode_pool = .{} }));
-    try testing.expectError(error.InvalidOptions, Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .transient_release = true, .decode_pool = .{ .per_layer = 0 } }));
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .transient_release = true, .decode_pool = .{ .per_layer = 2 } });
-    defer s.deinit();
-    _ = try s.releaseTransient();
-    // Decode rows must hold the pool above the prompt rows.
-    try testing.expectError(error.InvalidRows, s.grow(&.{ 5, 8 }));
-}
-
-// The re-plan's compaction: a donor's surviving resident in its top pool slot is relabelled below its new capacity and
-// is still served its own record from its own row (the pool table moves with it).
-test "dsv41 stream: decode_first16's re-plan relabels a donor's surviving pool resident with its row" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .transient_release = true, .decode_pool = .{ .per_layer = 2, .from_cycle = 2, .at_cycle = 4 } });
-    defer s.deinit();
-    s.release(try serve(s, 0, &.{ 1, 2, 3, 4 }));
-    s.release(try serve(s, 1, &.{ 1, 2, 3, 4 }));
-    _ = try s.releaseTransient();
-    try s.grow(&.{ 8, 8 });
-    // Layer 0: every decode row filled, then its top pool slot's expert used last.
-    s.release(try serve(s, 0, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }));
-    try s.flush();
-    const ls = &s.layers[0];
-    try testing.expectEqual(@as(u32, 8), ls.policy.occupancy);
-    const top = ls.policy.slot_to_expert[7];
-    s.release(try serve(s, 0, &.{top}));
-    try s.flush();
-    // Layer 1 missed twice as often: rows 7 / 9 (row 9 of layer 1 beats row 8 of layer 0; row 7 of layer 0 beats row 10).
-    const d = &s.dpool.?;
-    d.first[0] = 10;
-    d.first[1] = 20;
-    try s.replanPool();
-    try testing.expectEqualSlices(u32, &.{ 7, 9 }, d.rows);
-    try testing.expectEqual(@as(u32, 7), ls.policy.capacity);
-    try testing.expectEqual(@as(u32, 6), ls.policy.expert_to_slot[top]);
-    const r = try serve(s, 0, &.{top});
-    try testing.expectEqual(@as(u32, 1), r.plan.n_hits);
-    try expectServed(s, &sb, r, &.{top});
-    s.release(r);
-    // Layer 1's new slot is empty and fills by a read.
-    const r1 = try serve(s, 1, &.{ 20, 21, 22, 23, 24 });
-    try expectServed(s, &sb, r1, &.{ 20, 21, 22, 23, 24 });
-    s.release(r1);
-    try s.flush();
-}
-
-// decode_first16 across requests: the reverse phase change frees the pool with window 0 and resets its clock, so the
-// second request's grow re-arms 20 (here 2) pool rows per layer, re-plans once more at its own cycle, and serves every
-// id its record.
-test "dsv41 stream: decode_first16 re-arms its pool and its clock for the next request" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .transient_release = true, .decode_pool = .{ .per_layer = 2, .from_cycle = 2, .at_cycle = 3 } });
-    defer s.deinit();
-    var rng = std.Random.DefaultPrng.init(5);
-    const rand = rng.random();
-    var ids: [12]u16 = undefined;
-    for (0..2) |_| {
-        s.release(try serve(s, 0, &.{ 1, 2, 3 }));
-        _ = try s.releaseTransient();
-        try s.grow(&.{ 8, 8 });
-        for (s.layers) |ls| try testing.expectEqual(@as(u32, 6), ls.pool_lo);
-        for (1..6) |cycle| {
-            for (0..2) |l| {
-                const n = rand.intRangeAtMost(usize, 2, 8);
-                for (ids[0..n]) |*e| e.* = if (l == 0) rand.intRangeLessThan(u16, 0, 5) else rand.intRangeLessThan(u16, 8, 30);
-                const r = try serve(s, @intCast(l), ids[0..n]);
-                try expectServed(s, &sb, r, ids[0..n]);
-                s.release(r);
-            }
-            try s.flush();
-            try s.cycleEnd();
-            try testing.expectEqual(cycle >= 3, s.poolReplan() != null);
-        }
-        const rp = s.poolReplan().?;
-        try testing.expectEqual(@as(u32, 16), rp.rows[0] + rp.rows[1]);
-        _ = try s.shrink(&.{ 4, 4 });
-        for (s.layers) |ls| {
-            try testing.expectEqual(@as(u32, 4), ls.pool_lo);
-            try testing.expectEqual(@as(usize, 0), ls.pool.len);
-        }
-        try testing.expect(s.poolReplan() == null);
-        _ = try s.regrowTransient();
-    }
 }
 
 fn streamInitDeinit(a: std.mem.Allocator, sb: *const SynthBank, opt: Options) !void {
@@ -2645,9 +2332,7 @@ fn streamInitDeinit(a: std.mem.Allocator, sb: *const SynthBank, opt: Options) !v
     s.deinit();
 }
 
-// The construction's every allocation (the stream's, its layers', the selector's, the warm and decode-pool state's and
-// the read pool's) failed in turn: each failure unwinds to error.OutOfMemory with nothing leaked and the pool stopped.
-test "dsv41 stream: every allocation failure of the construction unwinds, the decode pool installed" {
+test "dsv41 stream: every allocation failure of the construction unwinds (lookahead, gates, wide depth, transient release)" {
     var sb = try SynthBank.open(32);
     defer sb.close();
     try std.testing.checkAllAllocationFailures(testing.allocator, streamInitDeinit, .{ &sb, Options{
@@ -2659,24 +2344,6 @@ test "dsv41 stream: every allocation failure of the construction unwinds, the de
         .lookahead = .{ .k = 6, .budget = 2, .chunks = 1 },
         .event = .{ .watchdog_ms = 10_000 },
         .transient_release = true,
-        .first_verify_warm = .{ .max_records = 8, .busy_max = 1 },
-        .decode_pool = .{ .per_layer = 2, .from_cycle = 2, .at_cycle = 4 },
-    } });
-}
-
-test "dsv41 stream: every allocation failure of the construction unwinds (lookahead, gates, wide depth, warm, transient release)" {
-    var sb = try SynthBank.open(32);
-    defer sb.close();
-    try std.testing.checkAllAllocationFailures(testing.allocator, streamInitDeinit, .{ &sb, Options{
-        .rows = &.{ 4, 2 },
-        .max_route_ids = 12,
-        .transient_rows = 2 * 12,
-        .wide_depth = 2,
-        .pool = la_pool,
-        .lookahead = .{ .k = 6, .budget = 2, .chunks = 1 },
-        .event = .{ .watchdog_ms = 10_000 },
-        .transient_release = true,
-        .first_verify_warm = .{ .max_records = 8, .busy_max = 1 },
     } });
 }
 

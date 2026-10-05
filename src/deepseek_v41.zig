@@ -293,14 +293,6 @@ pub const PrefillBill = struct {
         return b.layerMajorCallBytes(b.promptCallRows(seq), b.chunkRows(seq), seq, tier);
     }
 
-    /// The covering bound of every sub-chunked prompt up to `max_context` tokens: any such call has at most
-    /// `prefill_sub` + one span rows, its span at most the first sub-chunked length's (the chunk rule falls with the
-    /// length), and reads at most `max_context` positions (`layerMajorCallBytes` grows with all three). The rows.
-    pub fn subCallBoundRows(b: PrefillBill) struct { rows: u64, span: u64 } {
-        const span = b.chunkRows(b.prefill_sub + 1);
-        return .{ .rows = b.prefill_sub + span, .span = span };
-    }
-
     /// The layer-major wave's terms (`layerMajorWaveBytesAt`), for the read-outs: the kept streams (the hc streams and
     /// the DSpark taps), the halves, the index selection (its rows' masks over every compressed position), the attention
     /// side, the routed group, its final evaluation and what the input release frees from it.
@@ -1018,17 +1010,10 @@ pub const Refusal = error{
 pub const Error = Refusal || std.mem.Allocator.Error;
 
 /// Why a checkpoint was refused, for the one log line the caller writes.
-pub const Diag = struct {
-    buf: [400]u8 = undefined,
-    len: usize = 0,
-
-    pub fn message(self: *const Diag) []const u8 {
-        return self.buf[0..self.len];
-    }
-};
+pub const Diag = @import("sdk").Diag;
 
 fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-    if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, fmt, args)) |m| m.len else |_| d.buf.len;
+    if (diag) |d| d.set(fmt, args);
     return err;
 }
 

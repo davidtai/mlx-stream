@@ -438,7 +438,6 @@ test "dsv41 policy: a plan beside a live route never evicts its held slots and l
 
 // ── Edges and accounting identities (synthetic traces; capacity 0, 1 and full; both phases; both planners) ──
 
-const LruPolicy = @import("sdk_ext.zig").expert.slot_cache.LruPolicy;
 
 /// Totals over a trace: every plan's lookups split into hits and misses, every miss loaded once, and the residency the
 /// persistent loads and evictions leave.
@@ -597,67 +596,11 @@ test "dsv41 policy: bounded parts: one per part, one whole run, no records, and 
     try testing.expectEqual(@as(usize, 0), rankHottest(&.{ 0, 0 }, &out).len);
 }
 
-test "dsv41 policy: the LRU planner evicts the least recently routed row outside the route; capacity edges and its identities" {
-    try testing.expectError(error.InvalidCapacity, LruPolicy.init(testing.allocator, 0, 0));
-    try testing.expectError(error.InvalidCapacity, LruPolicy.init(testing.allocator, 4, 5));
-    var p = try LruPolicy.init(testing.allocator, 8, 2);
-    defer p.deinit(testing.allocator);
-    var out: Plan = .{};
-    p.plan(&.{ 1, 2 }, &out);
-    try testing.expectEqualSlices(u32, &.{ 0, 1 }, out.slotsOf());
-    // 1 is touched again, so 2 is the least recent: 3 takes its row.
-    p.plan(&.{1}, &out);
-    try testing.expectEqualSlices(u16, &.{1}, out.hitsOf());
-    p.plan(&.{3}, &out);
-    try testing.expectEqualSlices(Eviction, &.{.{ .slot = 1, .previous = 2, .next = 3 }}, out.evictionsOf());
-    // A route never evicts its own ids: [1, 4] evicts 3, not 1.
-    p.plan(&.{ 1, 4 }, &out);
-    try testing.expectEqualSlices(Eviction, &.{.{ .slot = 1, .previous = 3, .next = 4 }}, out.evictionsOf());
-    try testing.expectEqual(@as(?u32, null), p.slotOf(3));
-    p.invalidate(3);
-    p.invalidate(1);
-    try testing.expectEqual(@as(u32, 1), p.occupancy);
-    // A seed fills empty rows in order and skips residents, ids past the experts and a full table.
-    var ra: [4]LayerPolicy.ReadAhead = undefined;
-    try testing.expectEqualSlices(LayerPolicy.ReadAhead, &.{.{ .expert = 6, .slot = 0 }}, p.admitReadAhead(&.{ 4, 9, 6, 7 }, &ra));
-    // Random trace: each route at most `rows` unique ids, so every id is served from a row.
-    var q = try LruPolicy.init(testing.allocator, 30, 6);
-    defer q.deinit(testing.allocator);
-    var t: Tally = .{};
-    var rng = std.Random.DefaultPrng.init(5);
-    const r = rng.random();
-    var ids: [max_route_ids]u16 = undefined;
-    for (0..300) |_| {
-        const n = r.intRangeAtMost(usize, 1, 6);
-        for (ids[0..n]) |*e| e.* = @intCast(r.intRangeLessThan(u32, 0, 30));
-        q.plan(ids[0..n], &out);
-        t.add(ids[0..n], &out);
-        try testing.expectEqual(out.n_loads, out.n_persistent);
-        for (ids[0..n], out.slotsOf()) |e, s| try testing.expectEqual(q.expert_to_slot[e], s);
-        var occ: u32 = 0;
-        for (q.slot_to_expert, 0..) |e, s| if (e != no_expert) {
-            occ += 1;
-            try testing.expectEqual(@as(u32, @intCast(s)), q.expert_to_slot[e]);
-        };
-        try testing.expectEqual(q.occupancy, occ);
-    }
-    try t.expectIdentities(q.occupancy);
-}
-
 fn policyInitDeinit(a: std.mem.Allocator, n_experts: u32, capacity: u32) !void {
     var p = try LayerPolicy.init(a, n_experts, capacity);
     p.deinit(a);
 }
 
-fn lruInitDeinit(a: std.mem.Allocator, n_experts: u32, rows: u32) !void {
-    var p = try LruPolicy.init(a, n_experts, rows);
-    p.deinit(a);
-}
-
 test "dsv41 policy: every allocation failure of the residency policy's construction unwinds without a leak" {
     try std.testing.checkAllAllocationFailures(testing.allocator, policyInitDeinit, .{ 16, 4 });
-}
-
-test "dsv41 policy: every allocation failure of the LRU planner's construction unwinds without a leak" {
-    try std.testing.checkAllAllocationFailures(testing.allocator, lruInitDeinit, .{ 16, 4 });
 }

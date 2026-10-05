@@ -9,7 +9,7 @@ Use it to port commits written against the in-tree layout (for example the cover
 |---|---|
 | `@import("mlx")` | `@import("sdk").mlx` |
 | `@import("log")` | `@import("sdk").log` |
-| `@import("io_util")` (no-cache helpers) | `@import("nocache_io.zig")` (`../nocache_io.zig` from src/sdk_ext/, `../../` from src/sdk_ext/expert/) |
+| `@import("io_util")` (no-cache helpers) | `@import("sdk").io_util` |
 | `@import("ngram")` | `@import("ngram_table.zig")` |
 | `@import("build_options")` | `@import("build_flags.zig")` |
 | `sdk.expert`, `sdk.kv`, `sdk.kernels`, `sdk.quant`, `sdk.profile`, `sdk.ops` | `sdk_ext.<same>` with `const sdk_ext = @import("sdk_ext.zig");` |
@@ -39,8 +39,6 @@ Use it to port commits written against the in-tree layout (for example the cover
 | lib/expert_io/q3_lookahead4.h | csrc/q3_lookahead4.h |  |
 | lib/expert_io/q3_lookahead4_exl3.c | csrc/q3_lookahead4_exl3.c |  |
 | src/fixtures/dsv41_bank_peek.json | src/fixtures/dsv41_bank_peek.json |  |
-| src/fixtures/dsv41_draft_routes_fastest_20261001.json | src/fixtures/dsv41_draft_routes_fastest_20261001.json |  |
-| src/fixtures/dsv41_draft_routes_standard_20261001.json | src/fixtures/dsv41_draft_routes_standard_20261001.json |  |
 | src/fixtures/dsv41_prefill_wave_samples.json | src/fixtures/dsv41_prefill_wave_samples.json |  |
 | src/kernels/exl3/dsv41_exl3_b3_guone_k3_2304.metal | src/kernels/exl3/dsv41_exl3_b3_guone_k3_2304.metal |  |
 | src/kernels/exl3/dsv41_exl3_b3_moeprep_dpost.metal | src/kernels/exl3/dsv41_exl3_b3_moeprep_dpost.metal |  |
@@ -153,14 +151,11 @@ Use it to port commits written against the in-tree layout (for example the cover
 | src/mlx_stream/deepseek_v41_settings.zig | src/deepseek_v41_settings.zig |  |
 | src/mlx_stream/dsv41_cache_sim.zig | src/dsv41_cache_sim.zig |  |
 | src/mlx_stream/dsv41_decode_first.zig | src/dsv41_decode_first.zig |  |
-| src/mlx_stream/dsv41_decode_recall.zig | src/dsv41_decode_recall.zig |  |
 | src/mlx_stream/dsv41_decode_timers.zig | src/dsv41_decode_timers.zig |  |
 | src/mlx_stream/dsv41_draft_routes.zig | src/dsv41_draft_routes.zig |  |
-| src/mlx_stream/dsv41_hcpost_emul_bench.zig | src/dsv41_hcpost_emul_bench.zig |  |
 | src/mlx_stream/dsv41_host_heap.zig | src/dsv41_host_heap.zig |  |
 | src/mlx_stream/dsv41_kernel_routes.zig | src/dsv41_kernel_routes.zig |  |
 | src/mlx_stream/dsv41_kernels_test.zig | src/dsv41_kernels_test.zig |  |
-| src/mlx_stream/dsv41_policy_replay.zig | src/dsv41_policy_replay.zig |  |
 | src/mlx_stream/dsv41_prefill_timers.zig | src/dsv41_prefill_timers.zig |  |
 | src/mlx_stream/dsv41_profile.zig | src/dsv41_profile.zig |  |
 | src/mlx_stream/dsv41_verify_timeline.zig | src/dsv41_verify_timeline.zig |  |
@@ -175,7 +170,6 @@ Use it to port commits written against the in-tree layout (for example the cover
 | src/mlx_stream/expert_io_test.zig | src/expert_io_test.zig |  |
 | src/mlx_stream/expert_lookahead.zig | src/expert_lookahead.zig |  |
 | src/mlx_stream/expert_policy_test.zig | src/expert_policy_test.zig |  |
-| src/mlx_stream/expert_slot_cache_test.zig | src/expert_slot_cache_test.zig |  |
 | src/mlx_stream/expert_stream.zig | src/expert_stream.zig |  |
 | src/mlx_stream/expert_stream_of_test.zig | src/expert_stream_of_test.zig |  |
 | src/mlx_stream/mlx_stream.zig | src/root.zig |  |
@@ -184,15 +178,13 @@ Use it to port commits written against the in-tree layout (for example the cover
 | src/mlx_stream_tests.zig | src/tests.zig |  |
 | src/sdk/arch.zig | host src/sdk/arch.zig | `Binds` and `Caps.uses_expert_reader` removed; `claim_process` / `release_process` added |
 | src/sdk/build_option.zig | (deleted) | no host build options for plugins; see src/build_flags.zig |
-| src/sdk/check.zig | src/sdk_ext/check.zig (copy) + host src/sdk/check.zig |  |
+| src/sdk/check.zig | host src/sdk/check.zig (`sdk.check`) |  |
 | src/sdk/expert.zig | src/sdk_ext/expert.zig |  |
 | src/sdk/expert/event.zig | src/sdk_ext/expert/event.zig |  |
 | src/sdk/expert/io.zig | src/sdk_ext/expert/io.zig |  |
 | src/sdk/expert/io_stub.zig | src/sdk_ext/expert/io_stub.zig |  |
 | src/sdk/expert/lookahead.zig | src/sdk_ext/expert/lookahead.zig |  |
 | src/sdk/expert/policy.zig | src/sdk_ext/expert/policy.zig |  |
-| src/sdk/expert/sched.zig | src/sdk_ext/expert/sched.zig |  |
-| src/sdk/expert/slot_cache.zig | src/sdk_ext/expert/slot_cache.zig |  |
 | src/sdk/expert/stream.zig | src/sdk_ext/expert/stream.zig |  |
 | src/sdk/kernel_routes.zig | src/sdk_ext/kernel_routes.zig |  |
 | src/sdk/kernel_set.zig | src/sdk_ext/kernel_set.zig |  |
@@ -214,7 +206,7 @@ Use it to port commits written against the in-tree layout (for example the cover
 | src/sdk/weights.zig | host src/sdk/weights.zig |  |
 | tests/test_dsv41.sh | scripts/test_dsv41.sh |  |
 | src/ngram.zig | src/ngram_table.zig (copy; host keeps src/ngram.zig for qwen4_exp) |  |
-| src/io_util.zig (noCache, openNoCache, readAllNoCache, readAligned, RowGather, residentBytes) | src/nocache_io.zig (copy; host io_util keeps them) |  |
+| src/io_util.zig (noCache, openNoCache, readAllNoCache, readAligned, RowGather, residentBytes) | not copied: the host SDK exports io_util |  |
 | src/plugins.zig (the mlx-stream conformance tests) | src/conformance.zig | renamed "mlx-stream conformance: ..." |
 | src/sdk.zig (`expert`, `kernels`, `quant`, `profile`, `ops`, `kv`, `Quant`, `ExpertSource`) | src/sdk_ext.zig (`sdk_ext.expert`, ...) |  |
 | (new) | src/build_flags.zig | profile switches from `sdk.plugin_profile` |
@@ -229,10 +221,9 @@ Use it to port commits written against the in-tree layout (for example the cover
 | coverage/sdk `src/sdk/testing.zig` "sdk kv:" test | `src/sdk_ext/kv_testing.zig` |
 | coverage/sdk `src/plugins_refusals.zig` cases `expert_source_wrong_caps`, `quant_half_contract`, `quant_claims_mistyped`, `quant_check_direct`, `profile_hook_missing_probe` | `src/refusals.zig` + `refusal_cases` in build.zig (`zig build refusals`) |
 | coverage/sdk cases `arch_binds_unprovided`, `arch_binds_another`; registry tests of quant routing and binds | dropped: the small SDK has no binds and no quant / expert-source tables |
-| coverage/host-seams `src/qwen4_exp.zig` "host seams: ngram ..." tests + `src/ngram_oracle_af34af04.zig` | `src/ngram_table_parity_test.zig` ("ngram table parity: ...") + `src/ngram_oracle_af34af04.zig`, against `src/ngram_table.zig` (the host's qwen4_exp is upstream's again) |
 | fork `src/qwen4_exp.zig` "dsv41 ngram table: a BF16 tensor inside a checkpoint shard ..." | `src/ngram_table.zig` |
 | coverage/expert-io 74c81fff..fbc12206 (src/mlx_stream/expert_*_test.zig, expert_stream.zig, lib/expert_io/*, src/sdk/expert/*) | the same names under src/, csrc/, src/sdk_ext/expert/ (one commit per original commit; the decode-plan fix sits beside the keepwarm lever's line) |
-| coverage/expert-io `src/io_util.zig` no-cache tests | host src/io_util.zig and, renamed "nocache io: ...", src/nocache_io.zig |
+| coverage/expert-io `src/io_util.zig` no-cache tests | host src/io_util.zig |
 | coverage/expert-io `src/gpu_ceiling.zig`, `src/nocache_reader.zig` tests | host only |
 | coverage/plugin-core ad3d0f93..f1da4b90 (src/mlx_stream/*, src/fixtures/dsv41_*, src/mlx_stream/deepseek_v41_bill_receipts_test.zig) | src/*, src/fixtures/*, src/deepseek_v41_bill_receipts_test.zig |
 | coverage/plugin-core 9cca0993 (deepseek_v41_bill_mini_test.zig + bill / engram / module / deepseek_v41 hunks) | src/deepseek_v41_bill_mini_test.zig and the same names under src/ |

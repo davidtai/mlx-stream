@@ -31,8 +31,6 @@ pub const Config = struct {
     nocache_weights: ?bool = null,
     /// The routed waves wait on the reads' events instead of the host (null = the tier's default).
     expert_event_gates: ?bool = null,
-    /// The read pool threads' scheduling (null = off).
-    expert_reader_sched: ?sdk_ext.expert.Sched = null,
     /// The numerics, chosen at construction (null = served).
     numeric_tier: ?NumericTier = null,
     /// The prompt pass layer by layer (null = the tier's default).
@@ -57,12 +55,8 @@ pub const Config = struct {
     expert_wide_read_ahead: ?bool = null,
     /// P1b: the seed's deferred base call run as soon as the seed has landed.
     expert_wide_base_at_seed: ?bool = null,
-    /// The decode read-ahead's speculative records per layer call (1..4; null = 2).
-    expert_lookahead_budget: ?u8 = null,
     /// P1c: the seed's ranks grouped apart from the stream's, the base call after the last seed group.
     expert_wide_seed_aligned: ?bool = null,
-    /// P1d: the base rows resident at the barrier drain first, in their own call (null = off).
-    expert_wide_resident_first: ?bool = null,
     /// The input embedding read from its host rows from construction (null = on).
     embedding_host_rows: ?bool = null,
 
@@ -93,12 +87,6 @@ pub const Config = struct {
         if (obj.get("numeric_tier")) |v| if (v == .string) {
             if (std.meta.stringToEnum(NumericTier, v.string)) |t| {
                 c.numeric_tier = t;
-                any = true;
-            }
-        };
-        if (obj.get("expert_reader_sched")) |v| if (v == .string) {
-            if (sdk_ext.expert.Sched.parse(v.string)) |rs| {
-                c.expert_reader_sched = rs;
                 any = true;
             }
         };
@@ -139,11 +127,6 @@ pub const Config = struct {
         return self.layer_major_prefill orelse self.dsv41ServedTier();
     }
 
-    /// The decode read-ahead's speculative records per layer call: 2 unless set.
-    pub fn dsv41LookaheadBudget(self: *const Config) u8 {
-        return self.expert_lookahead_budget orelse 2;
-    }
-
     /// The served tier reads 3 groups ahead (P1's v1b: the SSD kept busy through the routed stage's drains).
     pub fn dsv41WideDepth(self: *const Config) u8 {
         return self.expert_wide_depth orelse if (self.dsv41ServedTier()) 5 else 1;
@@ -180,11 +163,6 @@ pub const Config = struct {
     /// P1c's seed-aligned groups: the setting, else on wherever the base call at the seed and the hottest-first order are.
     pub fn dsv41WideSeedAligned(self: *const Config) bool {
         return self.expert_wide_seed_aligned orelse (self.dsv41WideBaseAtSeed() and self.dsv41WideHotFirst());
-    }
-
-    /// P1d's resident-first base call: the setting, else off.
-    pub fn dsv41WideResidentFirst(self: *const Config) bool {
-        return self.expert_wide_resident_first orelse false;
     }
 
     fn dsv41ServedTier(self: *const Config) bool {
@@ -239,11 +217,7 @@ test "dsv41 settings: ctx_size bills every prompt up to it; anything else leaves
     try testing.expectEqual(@as(?i64, null), (try settingsOf("{\"ctx_size\": 1048576}")).ctx_size_over_limit);
 }
 
-test "dsv41 settings: the reader schedule parses its knob list, a conflict is unset; the load facts replace the fill's inputs" {
-    try testing.expectEqual(@as(?sdk_ext.expert.Sched, .{ .qos = true, .spin = true }), (try settingsOf("{\"expert_reader_sched\": \"qos,spin\"}")).expert_reader_sched);
-    try testing.expectEqual(@as(?sdk_ext.expert.Sched, .{}), (try settingsOf("{\"expert_reader_sched\": \"off\"}")).expert_reader_sched);
-    try testing.expectEqual(@as(?sdk_ext.expert.Sched, null), (try settingsOf("{\"expert_reader_sched\": \"spin\"}")).expert_reader_sched);
-    try testing.expectEqual(@as(?sdk_ext.expert.Sched, null), (try settingsOf("{\"expert_reader_sched\": true}")).expert_reader_sched);
+test "dsv41 settings: the load facts replace the fill's inputs" {
     // The host's facts win over the settings' (rows, baseline, the page-cache setting); the routes stay the settings'.
     const s = try settingsOf("{\"numeric_tier\": \"stock\"}");
     var set = s;

@@ -37,7 +37,6 @@ const sdk = @import("sdk");
 const sdk_ext = @import("sdk_ext.zig");
 const quant = @import("sdk_ext.zig").quant;
 const dt = @import("dsv41_decode_timers.zig");
-const recall = @import("dsv41_decode_recall.zig");
 const timeline = @import("dsv41_verify_timeline.zig");
 const first_cycle = @import("dsv41_decode_first.zig");
 const prof = @import("dsv41_prefill_timers.zig");
@@ -87,35 +86,6 @@ const lutOf = expert_stream.lutOf;
 
 pub const StreamSource = expert_stream.StreamSource;
 
-/// The lookahead's predictor (router math, the arch's), folded by the model into the router barrier's eval: the
-/// next routed layer's own gate on this layer's router input,
-/// s = sqrt(softplus(f32(x @ w^T))) + bias (x [M, hidden], w [n_experts,
-/// hidden], bias [n_experts] f32). The lane compiles this chain; the op chain
-/// may differ in the last bits, which only changes what is read ahead.
-pub fn nextLayerScores(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, stream: mlx.mlx_stream) !mlx.mlx_array {
-    var wt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wt);
-    try mlx.check(mlx.mlx_transpose(&wt, w, stream));
-    var z = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(z);
-    try mlx.check(mlx.mlx_matmul(&z, x, wt, stream));
-    var zf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(zf);
-    try mlx.check(mlx.mlx_astype(&zf, z, .float32, stream));
-    const zero = mlx.mlx_array_new_float(0);
-    defer _ = mlx.mlx_array_free(zero);
-    var sp = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sp);
-    try mlx.check(mlx.mlx_logaddexp(&sp, zf, zero, stream));
-    var root = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(root);
-    try mlx.check(mlx.mlx_sqrt(&root, sp, stream));
-    var scores = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(scores);
-    try mlx.check(mlx.mlx_add(&scores, root, bias, stream));
-    return scores;
-}
-
 // ── FakeSource: the streamer's residency with no reads (host tests) ──
 
 /// The streamer's residency policy (one `LayerPolicy` per layer, the Stream's
@@ -150,8 +120,6 @@ pub const FakeSource = struct {
     /// and every admission in order (the tests' view of the seed the model handed over).
     ahead_layer: ?u32 = null,
     ahead_log: std.ArrayList(u16) = .empty,
-    /// A0 (a): a test's scripted warm wait per layer (`Stream.warmWaitNs`; past its end, 0).
-    warm_wait_ns: []const u64 = &.{},
 
     pub const caps: sdk_ext.expert.Caps = .{ .two_phase = true, .prompt_seed = true, .read_ahead = true, .wide = true, .event_gates = true };
 
@@ -431,11 +399,6 @@ pub const FakeSource = struct {
 
     pub fn isResident(self: *const FakeSource, layer: u32, expert: u16) bool {
         return self.policies[layer].slotOf(expert) != null;
-    }
-
-    /// A0 (a): the ns `layer`'s first decode route waited for its started warm jobs (the test's script).
-    pub fn warmWaitNs(self: *const FakeSource, layer: u32) u64 {
-        return if (layer < self.warm_wait_ns.len) self.warm_wait_ns[layer] else 0;
     }
 
     pub fn bankRows(self: *FakeSource, layer: u32, kind: BankKind) u32 {
@@ -806,21 +769,8 @@ pub const Wide = struct {
     /// record) and the base call issued after the last seed group, so only the seed's own reads precede it. Exact:
     /// each expert's rows and kernel are its own whatever its group; the combine folds by routed position.
     seed_aligned: bool = false,
-    /// With `base_at_seed`: the deferred base rows of the experts resident at the barrier (the routed groups' hits, the
-    /// read-ahead's landings among them) drain in their own call before the first group waits on a read; the rest wait
-    /// for their reads as before. Exact: defer_base's argument (a wave's rows are independent of its composition, and
-    /// the combine folds by routed position); only the base rows' calls and places change.
-    resident_first: bool = false,
-    /// A0 (a): each wide call records its last `warm_tail_rows` rows' experts per layer (the prompt's last call
-    /// stands), the first verify's warm set (`warmSet`, read at the grow). Exact: it chooses reads only.
-    warm_tail: bool = false,
     pub const max_cold_rows = 8;
 };
-
-/// The prompt rows whose routed experts make a layer's warm set (`Wide.warm_tail`).
-pub const warm_tail_rows = 8;
-/// The most routed experts a layer's warm set addresses.
-pub const warm_max_experts = 512;
 
 /// The routed-expert hook of `Model(G)` over source `S` with math `M`
 /// (`gateUp(g, x, ids, gate, up)`, `down(g, h, ids, d)`). Bank arrays are
@@ -873,14 +823,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         wide_route: Wide = .{},
         /// `releaseTransient` nulled the transient bindings; `grow` binds decode's window 0.
         transient_released: bool = false,
-        /// A1's recall check (profile builds): the next call's predicted ids, handed over before its layer's attention.
-        recall_pred: if (recall.enabled) ?T else void = if (recall.enabled) null else {},
         /// (profile builds: `prof.enabled`) The last wide call's JOINLESS merge (`MergeStats`); compiled out elsewhere.
         last_merge: if (prof.enabled) MergeStats else void = if (prof.enabled) .{} else {},
-        /// A0 (a): per layer, the last wide call's last `warm_tail_rows` rows' experts (`Wide.warm_tail`; empty
-        /// without it), and the wide call's record, prebound at construction.
-        warm_tail: []std.StaticBitSet(warm_max_experts) = &.{},
-        tail_record: *const fn (*Self, u32, []const u16, u32, u32) void = recordNoTail,
         /// The decode lane's wave stages, bound at construction (`Options.banked`): one group per bank (the stock route)
         /// or one banked group over every bank.
         gate_up_wave: *const GateUpWaveFn = gateUpWaveGrouped,
@@ -939,11 +883,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             def_slot: std.ArrayList(u32) = .empty,
             def_act: std.ArrayList(u32) = .empty,
             def_pos: std.ArrayList(u32) = .empty,
-            /// `Wide.resident_first`: per routed row, already in the resident base call.
-            early: std.ArrayList(bool) = .empty,
 
             fn deinit(w: *WideScratch, a: std.mem.Allocator) void {
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc, &w.def_slot, &w.def_act, &w.def_pos, &w.early }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc, &w.def_slot, &w.def_act, &w.def_pos }) |l| l.deinit(a);
                 w.jl.deinit(a);
             }
         };
@@ -967,8 +909,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (wr.base_at_seed and (!wr.seed or !wr.defer_base)) return error.InvalidWideRoute;
             if (wr.seed_aligned and (!wr.base_at_seed or !wr.hot_first or comptime !@hasDecl(S, "seedRanks"))) return error.InvalidWideRoute;
             if (opt.banked and comptime !hasBanked()) return error.BankedNotInMath;
-            if (wr.resident_first and !wr.base_at_seed) return error.InvalidWideRoute;
-            if (wr.warm_tail and (!routes.prefill or c.n_routed_experts > warm_max_experts)) return error.InvalidWideRoute;
             if (wr.depth > 1) {
                 if (comptime @hasDecl(S, "wideDepth")) {
                     if (source.wideDepth() < wr.depth) return error.WideDepthExceedsSource;
@@ -982,11 +922,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
             var self: Self = .{ .a = a, .source = source, .math = math, .hidden = @intCast(c.hidden_size), .n_experts = c.n_routed_experts, .banks = banks, .gates = opt.gates, .g = g, .wide_route = wr };
             if (opt.event) |e| self.event = e;
-            if (wr.warm_tail) {
-                self.warm_tail = try a.alloc(std.StaticBitSet(warm_max_experts), c.n_layers);
-                @memset(self.warm_tail, .empty);
-                self.tail_record = recordTail;
-            }
             if (comptime hasBanked()) {
                 if (opt.banked) {
                     self.gate_up_wave = gateUpWaveBanked;
@@ -1087,34 +1022,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return self.pre_barrier == &preBarrierHoist;
         }
 
-        fn recordNoTail(_: *Self, _: u32, _: []const u16, _: u32, _: u32) void {}
-
         fn hasBanked() bool {
             return @hasDecl(M, "has_banked") and M.has_banked;
-        }
-
-        /// A wide call's routed ids (`n` rows x `k`, row order): its last `warm_tail_rows` rows' experts become the
-        /// layer's warm set.
-        fn recordTail(self: *Self, layer: u32, ids: []const u16, n: u32, k: u32) void {
-            const r = @min(n, warm_tail_rows);
-            const set = &self.warm_tail[layer];
-            set.* = .empty;
-            for (ids[(n - r) * k .. n * k]) |e| set.set(e);
-        }
-
-        /// A0 (a): layer `layer`'s warm set, ascending, at most `out.len`: the experts the first verify's warm class may
-        /// read at the grow. The stream's issue skips the residents itself (its no-evict admission), so the warm route
-        /// needs no residency query of the source. Empty without `Wide.warm_tail`.
-        pub fn warmSet(self: *const Self, layer: u32, out: []u16) []u16 {
-            if (layer >= self.warm_tail.len) return out[0..0];
-            var n: usize = 0;
-            var it = self.warm_tail[layer].iterator(.{});
-            while (it.next()) |e| {
-                if (n == out.len) break;
-                out[n] = @intCast(e);
-                n += 1;
-            }
-            return out[0..n];
         }
 
         /// The router that scores layer `layer`'s read-ahead: the NEXT layer's
@@ -1123,7 +1032,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return if (layer + 1 < self.gates.len) self.gates[layer + 1] else null;
         }
 
-        /// `nextLayerScores`: sqrt(softplus(f32(x @ w^T))) + bias.
+        /// The predictor's scores: sqrt(softplus(f32(x @ w^T))) + bias.
         fn nextScores(g: *G, xf: T, gate: Gate) !T {
             const z = try g.astype(try g.matmul(xf, try g.transpose(gate.w)), .float32);
             return g.add(try g.sqrt(try g.logaddexp(z, try g.scalar(0, .float32))), gate.bias);
@@ -1150,7 +1059,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             self.a.free(self.dev_parity);
             self.wide.deinit(self.a);
             self.a.free(self.banks);
-            self.a.free(self.warm_tail);
             self.* = undefined;
         }
 
@@ -1211,11 +1119,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             try self.source.flush();
         }
 
-        /// The end of a decode cycle, after its flush (a source without a cycle clock: nothing).
-        pub fn cycleEnd(self: *Self) !void {
-            if (comptime @hasDecl(S, "cycleEnd")) try self.source.cycleEnd();
-        }
-
         pub const Hook = struct {
             ex: *Self,
             layer: u32,
@@ -1229,15 +1132,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             /// started: they run during the read wait, not in the next routing barrier.
             pub fn routedHoist(h: Hook, g: *G, xf: T, indices: T, hoist: []const T) !T {
                 return h.ex.run(g, h.layer, xf, indices, hoist);
-            }
-
-            /// A1's recall check (profile builds): the layer's predicted ids [rows, k], compared at its routing barrier.
-            pub fn recallPredicted(h: Hook, pred: T) void {
-                if (comptime recall.enabled) {
-                    // The previous layer's call consumed its prediction (a stale one would outlive its wave).
-                    std.debug.assert(h.ex.recall_pred == null);
-                    h.ex.recall_pred = pred;
-                }
             }
 
             /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs as the
@@ -1431,7 +1325,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// barrier, the residents' wave, then per miss part gate/up after
         /// `waitGu` and down after `waitDown`, each wave started on the GPU;
         /// release; the outputs in the router's order, `[n, k, hidden]` f32.
-        /// The recall check's residency query over the source (before the call's route admits and evicts).
+        /// A residency query over the source (before the call's route admits and evicts; profile builds).
         const ResidentAt = struct {
             src: *S,
             layer: u32,
@@ -1468,15 +1362,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             // A0 (profile builds): the call's barrier, route and MoE build (`first_cycle.call`).
             const t_call = tt;
             if (comptime timeline.enabled) timeline.point(layer, .call, self.readGauge(), false);
-            // A1's recall check (profile builds): the prediction joins the barrier's eval; it reads nothing.
-            const pred: ?T = if (comptime recall.enabled) self.recall_pred else null;
-            if (comptime recall.enabled) self.recall_pred = null;
             // The predictor joins the routing barrier's eval (the last layer predicts nothing).
             const sc: ?T = if (if (routes.lookahead) self.predictorGate(layer) else null) |gate| try nextScores(g, xf, gate) else null;
-            // The barrier's arrays: the ids, then the scores and the prediction when there are any.
-            var bar: [3]T = undefined;
+            // The barrier's arrays: the ids, then the scores when there are any.
+            var bar: [2]T = undefined;
             var n_bar: usize = 0;
-            for ([_]?T{ indices, sc, pred }) |x| if (x) |v| {
+            for ([_]?T{ indices, sc }) |x| if (x) |v| {
                 bar[n_bar] = v;
                 n_bar += 1;
             };
@@ -1502,14 +1393,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 first_cycle.tailRecord(layer, ids, n, k);
                 tt = dt.now();
             }
-            var pred_buf: [max_route_ids]u16 = undefined;
-            var predicted: []const u16 = &.{};
-            var wasted: u64 = 0;
-            if (pred) |p| {
-                predicted = try g.hostIds(p, pred_buf[0..n_ids]);
-                wasted = if (comptime @hasDecl(S, "isResident")) recall.wastedOf(predicted, ids, ResidentAt{ .src = self.source, .layer = layer }, ResidentAt.of) else 0;
-                tt = dt.now();
-            }
             const t_route0 = tt;
             const call = try self.source.route(layer, ids, scores);
             const t_route = dt.charge(.route, tt);
@@ -1518,7 +1401,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var released = false;
             errdefer if (!released) self.source.release(call);
             const sv = self.source.served(call);
-            if (pred != null) recall.record(layer, recall.countCall(predicted, ids, sv.waves, wasted));
             var acc: Acc = .{};
             if (dev) |d| {
                 // DEVROUTE: every pair's row from the device wave; the miss parts' rows follow and replace theirs in the join.
@@ -1557,8 +1439,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (dev != null) try self.devLutAfterRoute(g, layer);
             if (comptime timeline.enabled) timeline.point(layer, .end, self.readGauge(), sv.n_parts > 0);
             if (comptime first_cycle.enabled) first_cycle.call(layer, t_barrier - t_call, t_route - t_route0, dt.now() - t_route, ids, sv.waves, wall_b, tail_reads);
-            // A0 (a) (profile builds): what this layer's first decode route waited for its started warm jobs.
-            if (comptime first_cycle.enabled and @hasDecl(S, "warmWaitNs")) first_cycle.warmWait(layer, self.source.warmWaitNs(layer));
             return self.join(g, &acc, n, k);
         }
 
@@ -1739,30 +1619,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             w.def_pos.clearRetainingCapacity();
         }
 
-        /// `Wide.resident_first`: the routed groups' base rows whose records are resident at the barrier (wave 0: no read)
-        /// as one base call now, marked so the groups' own loop skips them; the base call at the seed takes the rest.
-        fn residentBase(self: *Self, g: *G, layer: u32, act: T, comptime parts: bool, k: u32, live: []const ?*S.Call, groups: Groups) !void {
-            const a = self.a;
-            const w = &self.wide;
-            try w.early.resize(a, w.ids.items.len);
-            @memset(w.early.items, false);
-            for (live, 0..) |call, gi| {
-                const start = groups.start(gi);
-                const len = groups.of(gi).len;
-                const sv = self.source.served(call.?);
-                for (w.ids.items, 0..) |e, row| {
-                    const fi: usize = @intCast(w.first.items[e]);
-                    if (fi < start or fi >= start + len) continue;
-                    if (sv.refs[fi - start].bank != .base or sv.waves[fi - start] != 0) continue;
-                    w.early.items[row] = true;
-                    try w.def_slot.append(a, sv.refs[fi - start].row);
-                    try w.def_act.append(a, @intCast(row / @as(usize, k)));
-                    try w.def_pos.append(a, @intCast(row));
-                }
-            }
-            try self.deferredBase(g, layer, act, parts, true);
-        }
-
         fn runWideCore(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32, comptime parts: bool) !void {
             const a = self.a;
             const w = &self.wide;
@@ -1770,7 +1626,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const n_ids = n * k;
             // The wide lane takes prefill-width calls only (the prefill texts bind small inputs as
             // `constant`; a decode-width call is the decode lane's).
-            if (n_ids < wide_min_ids) return error.WideLaneUnderMinIds;
+            std.debug.assert(n_ids >= wide_min_ids);
             const feed = self.wide_route.seed;
             const hot_first = self.wide_route.hot_first;
             const depth: usize = self.wide_route.depth;
@@ -1780,9 +1636,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             var tp = prof.now();
             _ = try g.hostIds(indices, w.ids.items);
             prof.charge(.barrier, tp);
-            // A0: the prompt's last rows' experts, the layer's warm set (a no-op unless `Wide.warm_tail`); the profile
-            // builds' own tail set
-            self.tail_record(self, layer, w.ids.items, n, k);
+            // A0 (profile builds): the prompt's last rows' experts.
             if (comptime first_cycle.enabled) first_cycle.tailRecord(layer, w.ids.items, n, k);
             try w.first.resize(a, self.n_experts);
             @memset(w.first.items, -1);
@@ -1840,8 +1694,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             tp = prof.now();
             for (0..@min(depth, n_groups)) |gi| calls[gi % depth] = try self.source.route(layer, groups.of(gi), &.{});
             prof.charge(.route, tp);
-            const rf = self.wide_route.resident_first;
-            if (rf) try self.residentBase(g, layer, act, parts, k, calls[0..@min(depth, n_groups)], groups);
             for (0..n_groups) |gi| {
                 const start = groups.start(gi);
                 const group = groups.of(gi);
@@ -1867,7 +1719,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                         if (fi < start or fi >= start + group.len) continue;
                         const ref = sv.refs[fi - start];
                         if (ref.bank != kind) continue;
-                        if (rf and w.early.items[row]) continue;
                         const act_row: u32 = @intCast(row / @as(usize, k));
                         if (defer_base and kind == .base) {
                             try w.def_slot.append(a, ref.row);
@@ -2113,38 +1964,6 @@ test "dsv41 experts: a decode call runs the residents, then each part's gate/up 
     try ex.flush();
     try testing.expectEqual(@as(usize, 0), src.liveCalls());
     try testing.expectEqual(FakeSource.Event.Kind.flush, src.log.items[src.log.items.len - 1].kind);
-}
-
-test "dsv41 experts: A0 (a) (profile builds): a first-cycle decode call records its layer's warm wait; later cycles do not" {
-    if (comptime !first_cycle.enabled) return error.SkipZigTest;
-    const a = testing.allocator;
-    const c = testConfig(256, 128, 2);
-    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
-    defer src.deinit();
-    var g = TraceOps.init(a);
-    defer g.deinit();
-    const Chain = EagerChain(TraceOps, TraceGemv);
-    const Ex = Experts(TraceOps, FakeSource, Chain);
-    var ex = try Ex.init(a, &g, &src, Chain.init(.{}, &c), &c);
-    defer ex.deinit();
-    try ex.grow(&g, &.{ 8, 8 });
-    var script: Script = .{ .calls = &.{ &.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 7, 1, 7, 9, 3 }, &.{ 1, 2, 3, 4, 5, 6 } } };
-    g.host_values = script.values();
-    const xf = try g.input(&.{ 2, 256 }, .bfloat16);
-    const idx = try g.input(&.{ 2, 3 }, .int32);
-    src.warm_wait_ns = &.{ 0, 5_000_000 };
-    first_cycle.startDecode();
-    defer first_cycle.phase = .build;
-    _ = try ex.at(0).routed(&g, xf, idx);
-    _ = try ex.at(1).routed(&g, xf, idx);
-    try testing.expectEqual(@as(u64, 0), first_cycle.cycle1_warm_wait_ns[0]);
-    try testing.expectEqual(@as(u64, 5_000_000), first_cycle.cycle1_warm_wait_ns[1]);
-    // past the first cycle a call records nothing
-    first_cycle.endCycle();
-    src.warm_wait_ns = &.{ 0, 9_000_000 };
-    _ = try ex.at(1).routed(&g, xf, idx);
-    try testing.expectEqual(@as(u64, 5_000_000), first_cycle.cycle1_warm_wait_ns[1]);
-    try ex.flush();
 }
 
 test "dsv41 experts: a wider call is the prefill lane's (not ported), refused before any route" {
@@ -2438,54 +2257,7 @@ test "dsv41 experts: the joined outputs are put back in routed order" {
     try testing.expectEqualSlices(u32, &.{ 1, 3, 4, 0, 2 }, &inv);
 }
 
-test "dsv41 experts: A0 (a): a wide call records its last 8 rows' experts; the warm set is them, ascending, residents included" {
-    const a = testing.allocator;
-    var c = testConfig(256, 128, 1);
-    c.n_routed_experts = 64;
-    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 64, .rows = &.{16} });
-    defer src.deinit();
-    var g = TraceOps.init(a);
-    defer g.deinit();
-    src.trace = &g;
-    RecRoute.source = &src;
-    defer RecRoute.source = null;
-    const Chain = EagerChain(TraceOps, TraceGemv);
-    const Math = WithPrefillRoutes(TraceOps, Chain, RecRoute);
-    var rrs = [_]RecRoute{RecRoute.init(a)};
-    defer rrs[0].deinit(&g);
-    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
-    var ex = try Ex.initWith(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c, .{ .wide = .{ .warm_tail = true } });
-    defer ex.deinit();
-    // 20 tokens x top-6 over 64 experts; the last 8 rows' experts are the warm set
-    const n = 20;
-    const k = 6;
-    var ids: [n * k]u16 = undefined;
-    for (&ids, 0..) |*e, i| e.* = @intCast((7 * (i / k) + 11 * (i % k)) % 64);
-    var script: Script = .{ .calls = &.{&ids} };
-    g.host_values = script.values();
-    _ = try ex.at(0).routed(&g, try g.input(&.{ n, 256 }, .float32), try g.input(&.{ n, k }, .int32));
-    var tail: std.StaticBitSet(64) = .empty;
-    for (ids[(n - warm_tail_rows) * k ..]) |e| tail.set(e);
-    var buf: [64]u16 = undefined;
-    const got = ex.warmSet(0, &buf);
-    // the whole set, ascending, residents included (the stream's issue skips those)
-    try testing.expectEqual(tail.count(), got.len);
-    for (got, 0..) |e, i| {
-        try testing.expect(tail.isSet(e));
-        if (i > 0) try testing.expect(got[i - 1] < e);
-    }
-    var resident: usize = 0;
-    for (got) |e| resident += @intFromBool(src.isResident(0, e));
-    try testing.expect(resident > 0 and resident < got.len);
-    // the route needs the prefill lane; without it the warm set is empty
-    const Dec = ExpertsWith(TraceOps, FakeSource, Chain, .{});
-    try testing.expectError(error.InvalidWideRoute, Dec.initWith(a, &g, &src, Chain.init(.{}, &c), &c, .{ .wide = .{ .warm_tail = true } }));
-    var plain = try Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c);
-    defer plain.deinit();
-    try testing.expectEqual(@as(usize, 0), plain.warmSet(0, &buf).len);
-}
-
-test "dsv41 experts: a decode-width call never takes the wide lane: construction proves it fits a route, the wide lane refuses it by name" {
+test "dsv41 experts: a decode-width call never takes the wide lane: construction proves it fits a route" {
     const a = testing.allocator;
     var c = testConfig(256, 128, 1);
     c.n_routed_experts = 64;
@@ -2509,9 +2281,8 @@ test "dsv41 experts: a decode-width call never takes the wide lane: construction
     try testing.expectError(error.DecodeRowsWiderThanRoute, Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &wide_k));
     var ex = try Ex.init(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c);
     defer ex.deinit();
-    // 8 rows x top-6 = 48 ids: the wide lane refuses them by name (the dispatch sends them to the decode lane).
+    // 8 rows x top-6 = 48 ids: a decode-width call (the dispatch sends it to the decode lane).
     try testing.expectEqual(@as(u32, 48), decode_forward_rows * 6);
-    try testing.expectError(error.WideLaneUnderMinIds, ex.runWide(&g, 0, try g.input(&.{ 8, 256 }, .float32), try g.input(&.{ 8, 6 }, .int32), 8, 6));
     try testing.expectEqual(@as(usize, 0), rrs[0].calls.items.len);
 }
 
@@ -2625,28 +2396,7 @@ test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samp
     try testing.expectEqual(picks.len, checked);
 }
 
-const SynthBank = struct {
-    tmp: std.testing.TmpDir,
-    image: []u8,
-    bank: expert_bank.Bank,
-
-    fn open(n_experts: u32) !SynthBank {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const image = try expert_bank.writeSynth(testing.allocator, &tmp, .{ .n_experts = n_experts });
-        errdefer testing.allocator.free(image);
-        var rbuf: [512]u8 = undefined;
-        const implemented: expert_bank.Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = n_experts, .n_layers = 2 };
-        const bank = try expert_bank.Bank.open(testing.allocator, std.testing.io, try expert_bank.tmpRoot(&tmp, &rbuf), implemented, null);
-        return .{ .tmp = tmp, .image = image, .bank = bank };
-    }
-
-    fn close(self: *SynthBank) void {
-        self.bank.deinit();
-        testing.allocator.free(self.image);
-        self.tmp.cleanup();
-    }
-};
+const SynthBank = expert_bank.SynthBank;
 
 /// Every routed id's slot row holds its record's bytes (the rows the hook bound).
 fn expectRowsHold(s: *expert_stream.Stream, sb: *const SynthBank, layer: u32, ids: []const u16, sv: Served) !void {
@@ -3797,113 +3547,6 @@ test "dsv41 experts: P1c: the seed-aligned groups put the seed's base call ahead
     }
 }
 
-test "dsv41 experts: P1d resident-first: every routed position keeps its bank, slot and token; the resident base rows drain before any read wait" {
-    // Exact by defer_base's argument: each output row depends only on its own slot and token (a wave's rows are
-    // independent of its composition), and the combine folds a token's k rows by routed position.
-    const a = testing.allocator;
-    var c = testConfig(256, 128, 1);
-    c.n_routed_experts = 128;
-    const Chain = EagerChain(TraceOps, TraceGemv);
-    const Math = WithPrefillRoutes(TraceOps, Chain, RecRoute);
-    const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true });
-    const n = 40;
-    const k = 6;
-    var ids: [n * k]u16 = undefined;
-    for (&ids, 0..) |*e, i| e.* = @intCast((7 * (i / k) + 11 * (i % k)) % 128);
-    var counts: [128]u32 = @splat(0);
-    for (ids) |e| counts[e] += 1;
-    var ranked_buf: [128]u16 = undefined;
-    const ranked = expert_policy.rankHottest(&counts, &ranked_buf);
-    // The read-ahead per case: the whole seed (the 32 hottest), none, every other seed record plus 8 non-seed ones; the
-    // split prompt runs two calls (its halves) on the layer, the second one finding the first's residents.
-    var mixed: [24]u16 = undefined;
-    for (0..16) |i| mixed[i] = ranked[2 * i];
-    for (0..8) |i| mixed[16 + i] = ranked[40 + i];
-    const Case = enum { resident, demand, mixed, split };
-    const Row = struct { code: u32, slot: u32, act: u32 };
-    for (std.enums.values(Case)) |case| {
-        var maps: [2][n * k]Row = undefined;
-        var n_base: [2]usize = .{ 0, 0 };
-        for ([_]bool{ false, true }, 0..) |rf, run| {
-            var reg = try hostRegistry();
-            defer reg.deinit();
-            var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 128, .rows = &.{32} });
-            defer src.deinit();
-            var g = TraceOps.init(a);
-            defer g.deinit();
-            src.trace = &g;
-            RecRoute.source = &src;
-            defer RecRoute.source = null;
-            var rrs = [_]RecRoute{RecRoute.init(a)};
-            defer rrs[0].deinit(&g);
-            const wide: Wide = .{ .seed = true, .hot_first = true, .defer_base = true, .read_ahead = true, .base_at_seed = true, .seed_aligned = true, .resident_first = rf };
-            var ex = try Ex.initWith(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c, .{ .wide = wide });
-            defer ex.deinit();
-            switch (case) {
-                .resident => try src.readAheadSeed(0, ranked[0..32]),
-                .demand, .split => {},
-                .mixed => try src.readAheadSeed(0, &mixed),
-            }
-            const halves: []const [2]usize = if (case == .split) &.{ .{ 0, n / 2 }, .{ n / 2, n } } else &.{.{ 0, n }};
-            var script: Script = .{ .calls = if (case == .split) &.{ ids[0 .. n / 2 * k], ids[n / 2 * k ..] } else &.{&ids} };
-            g.host_values = script.values();
-            const base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
-            for (halves) |hv| {
-                const rows: c_int = @intCast(hv[1] - hv[0]);
-                const r0 = rrs[0].calls.items.len;
-                const l0 = src.log.items.len;
-                _ = try ex.at(0).routed(&g, try g.input(&.{ rows, 256 }, .float32), try g.input(&.{ rows, k }, .int32));
-                // Each output row (calls in order, rows in order) is the call's routed position `pos[j]`.
-                var j: usize = 0;
-                for (rrs[0].calls.items[r0..]) |rec| for (rec.slot, rec.act_row) |sl, t| {
-                    const p = ex.wide.pos.items[j];
-                    j += 1;
-                    maps[run][hv[0] * k + p] = .{ .code = rec.bank_code, .slot = sl, .act = t };
-                    try testing.expectEqual(@as(u32, @intCast(p / k)), t);
-                };
-                try testing.expectEqual(ex.wide.pos.items.len, j);
-                try testing.expectEqual((hv[1] - hv[0]) * k, j);
-                var buf: [4096]u8 = undefined;
-                const kinds = kindsOf(src.log.items[l0..], &buf);
-                const first_wait = std.mem.indexOfScalar(u8, kinds, 'g') orelse kinds.len;
-                for (rrs[0].calls.items[r0..]) |rec| n_base[run] += @intFromBool(rec.bank_code == base_code);
-                // Resident-first with residents at the barrier: the call's first call is their base call, encoded
-                // before its first read wait.
-                if (rf and (case == .resident or case == .mixed)) {
-                    const first = rrs[0].calls.items[r0];
-                    try testing.expectEqual(base_code, first.bank_code);
-                    try testing.expect(first.at - l0 <= first_wait);
-                    // It drains (an evaluation) before any later base call is built: two base calls' waves never live
-                    // together, so the bill's per-wave terms hold.
-                    for (rrs[0].calls.items[r0 + 1 ..]) |rec| if (rec.bank_code == base_code) {
-                        const drained = for (g.evals.items) |e| {
-                            if (e > first.node and e <= rec.node) break true;
-                        } else false;
-                        try testing.expect(drained);
-                    };
-                }
-            }
-        }
-        // The same bank, slot and token at every routed position either way: the schedule moved, not the routes.
-        for (maps[0], maps[1]) |x, y| try testing.expectEqual(x, y);
-        // Base calls: all resident = one (now, none left for the seed's call); all demand = the single call; mixed = two;
-        // the split prompt at most one more per call.
-        switch (case) {
-            .resident, .demand => try testing.expectEqual([2]usize{ 1, 1 }, n_base),
-            .mixed => try testing.expectEqual([2]usize{ 1, 2 }, n_base),
-            .split => try testing.expect(n_base[1] >= n_base[0] and n_base[1] <= n_base[0] + 2),
-        }
-    }
-    // Resident-first splits the base call at the seed: refused without it.
-    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 128, .rows = &.{32} });
-    defer src.deinit();
-    var g = TraceOps.init(a);
-    defer g.deinit();
-    var rrs = [_]RecRoute{RecRoute.init(a)};
-    defer rrs[0].deinit(&g);
-    try testing.expectError(error.InvalidWideRoute, Ex.initWith(a, &g, &src, .{ .d = Chain.init(.{}, &c), .routes = &rrs }, &c, .{ .wide = .{ .seed = true, .defer_base = true, .resident_first = true } }));
-}
-
 test "dsv41 experts: a read-ahead deeper than the source's windows is refused at construction" {
     const a = testing.allocator;
     var sb = try SynthBank.open(32);
@@ -4582,56 +4225,6 @@ test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's source
     try testing.expectEqual(@as(usize, 0), bad_old);
     try testing.expectEqual(@as(usize, 0), bad_new);
     try testing.expectEqual(@as(usize, words), finite);
-}
-
-fn predictorBf16Bits(v: f32) u16 {
-    const b: u32 = @bitCast(v);
-    return @intCast((b + 0x7FFF + ((b >> 16) & 1)) >> 16);
-}
-
-fn predictorFromBf16(h: u16) f32 {
-    return @bitCast(@as(u32, h) << 16);
-}
-
-// DSV41_PHASE0B_MLX=1, inside a guarded window (creates MLX arrays).
-test "dsv41 lookahead 0b: the predictor graph scores like its host reference" {
-    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const m = 3;
-    const d = 64;
-    const e_n = 16;
-    var rng = std.Random.DefaultPrng.init(3);
-    const rand = rng.random();
-    var xb: [m * d]u16 = undefined;
-    var wb: [e_n * d]u16 = undefined;
-    var bias: [e_n]f32 = undefined;
-    for (&xb) |*v| v.* = predictorBf16Bits(rand.float(f32) * 2 - 1);
-    for (&wb) |*v| v.* = predictorBf16Bits((rand.float(f32) * 2 - 1) * 0.5);
-    for (&bias) |*v| v.* = rand.float(f32) * 0.2;
-    const stream = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(stream);
-    const x = mlx.mlx_array_new_data(&xb, &[_]c_int{ m, d }, 2, .bfloat16);
-    defer _ = mlx.mlx_array_free(x);
-    const w = mlx.mlx_array_new_data(&wb, &[_]c_int{ e_n, d }, 2, .bfloat16);
-    defer _ = mlx.mlx_array_free(w);
-    const b = mlx.mlx_array_new_data(&bias, &[_]c_int{e_n}, 1, .float32);
-    defer _ = mlx.mlx_array_free(b);
-    const s = try nextLayerScores(x, w, b, stream);
-    defer _ = mlx.mlx_array_free(s);
-    try mlx.check(mlx.mlx_array_eval(s));
-    try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(s));
-    try testing.expectEqual(@as(usize, m * e_n), mlx.mlx_array_size(s));
-    const got = (mlx.mlx_array_data_float32(s) orelse return error.MlxNoData)[0 .. m * e_n];
-    // Host: the product rounded to bf16 (the matmul's output dtype), then the f32 tail.
-    var worst: f32 = 0;
-    for (0..m) |r| for (0..e_n) |e| {
-        var acc: f32 = 0;
-        for (0..d) |k| acc += predictorFromBf16(xb[r * d + k]) * predictorFromBf16(wb[e * d + k]);
-        const z = predictorFromBf16(predictorBf16Bits(acc));
-        const want = @sqrt(@max(z, 0) + std.math.log1p(@exp(-@abs(z)))) + bias[e];
-        worst = @max(worst, @abs(got[r * e_n + e] - want));
-    };
-    std.debug.print("predictor graph: worst |mlx - host| {d:.6}\n", .{worst});
-    try testing.expect(worst < 2e-2);
 }
 
 /// A decode math whose outputs carry, per row, its slot row and the arrays it read (host arrays the trace records):

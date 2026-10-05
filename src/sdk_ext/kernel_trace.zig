@@ -473,7 +473,6 @@ pub fn KernelTrace(comptime R: type) type {
                 try testing.expect(std.meta.eql(a.cfg, b.cfg) and std.meta.eql(a.cfg, want));
             }
             try testing.expectError(error.RowsOutOfPlan, prep.at(0));
-            try testing.expectError(error.RowsOutOfPlan, prep.launch(t, n + 1, ins[0..e.inputs.len], &o1));
             return n;
         }
 

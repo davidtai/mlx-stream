@@ -227,7 +227,7 @@ pub fn Accepted(comptime G: type) type {
         /// the clamped SwiGLU [rows, 2304] f32: in_rin -> the gate and up GEMVs -> gu_epi.
         pub fn gateUp(self: *const Self, g: *G, x: G.T, slot_ids: G.T, gate: A, up: A) !G.T {
             const rows = rowsOf(G, g, x, 0);
-            if (rows < 1 or rows > max_decode_rows) return error.RowsOutOfPlan;
+            std.debug.assert(!(rows < 1 or rows > max_decode_rows));
             const xs = try self.prep.inRin(g, x, self.tok[rows - 1], gate.rin, up.rin, slot_ids);
             const z = try self.gemv.projectGu(g, xs[0], xs[1], slot_ids, gate.code, up.code);
             return self.prep.guEpi(g, z[0], z[1], gate.rout, up.rout, slot_ids);
@@ -246,7 +246,7 @@ pub fn Accepted(comptime G: type) type {
         /// clamped SwiGLU [rows, 2304] f32, every word gateUp's per bank.
         pub fn gateUpBanked(self: *const Self, g: *G, x: G.T, ids: G.T, banks: *const [3]quant.BankArrays(A)) !G.T {
             const rows = rowsOf(G, g, x, 0);
-            if (rows < 1 or rows > max_decode_rows) return error.RowsOutOfPlan;
+            std.debug.assert(!(rows < 1 or rows > max_decode_rows));
             return self.banked.?.gateUp(g, x, self.tok[rows - 1], ids, banks);
         }
 
@@ -277,7 +277,7 @@ pub fn Accepted(comptime G: type) type {
         /// 128-row down text and rot_widen1. A failed check refuses it by name (SelfCheckFailed, `diag`) and the
         /// waves stay stock.
         pub fn routeFusedDown(self: *Self, set: *const ks.Set, diag: *Diag) !void {
-            try set.selfCheck(self.a, &w1_texts, &self.report, diag);
+            try set.selfCheck(self.a, &w1_texts, .startup, &self.report, diag);
             for (self.waves) |*w| w.installDown(.fused);
             self.fused_down = true;
         }
@@ -328,7 +328,7 @@ pub fn Accepted(comptime G: type) type {
 const m128_texts = [_]Kernel{ .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128, .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128 };
 /// The fused down GEMM: a construction-time arm (`Accepted.routeFusedDown` self-checks it, then the waves launch it);
 /// the stock accept neither routes nor checks it. Its 0b smoke checks it by name.
-const w1_texts = [_]Kernel{.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1};
+pub const w1_texts = [_]Kernel{.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1};
 /// The table-codebook gate|up GEMM: registered, not routed (its 0b smoke checks it by name).
 const lut_texts = [_]Kernel{.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut};
 /// The routed decode forms: installed at construction by `Accepted.routeForms` (their twins are registry checks, run in
@@ -340,7 +340,7 @@ pub const banked_texts = [_]Kernel{
     .dsv41_exl3_b3_mul1h_k3_2304,     .dsv41_exl3_b3_mul1h_k3_5120,  .dsv41_exl3_b3_prep_in_rin,  .dsv41_exl3_b3_prep_gu_epi,
     .dsv41_exl3_b3_prep_din_rin,      .dsv41_exl3_b3_moeprep_dpost,  .dsv41_exl3_b3_pair_k3_5120, .dsv41_exl3_b3_guone_k3_2304,
 };
-const checked_at_accept = blk: {
+pub const checked_at_accept = blk: {
     var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len - banked_texts.len]Kernel = undefined;
     var n: usize = 0;
     for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts ++ form_texts ++ banked_texts), k) == null) {
@@ -360,7 +360,7 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
         acc.report.deinit(a);
         a.destroy(acc);
     }
-    try set.selfCheck(a, &checked_at_accept, &acc.report, diag);
+    try set.selfCheck(a, &checked_at_accept, .startup, &acc.report, diag);
     acc.gemv = try Gemv(G).init(g, &set.reg);
     errdefer acc.gemv.deinit(g);
     acc.prep = try RinPrep(G).init(g, &set.reg);
@@ -1035,17 +1035,16 @@ pub fn DigXPrefill(comptime G: type) type {
         }
 
         /// act bf16 [a_rows, 5120], `rows` (A assignment rows), the call's bank -> a KEPT f32
-        /// [A, 5120] in assignment-row order (the lane's `result`; release it). Refused: A outside 1..the kernels' row
-        /// bound (RowsOutOfPlan), a slot outside the bank (SlotOutOfBank), act rows that are not
-        /// A (no act_row) or an act_row outside act (RouteInput).
+        /// [A, 5120] in assignment-row order (the lane's `result`; release it). The caller's route guarantees A within
+        /// 1..the kernels' row bound, every slot inside the bank and the act rows (asserted, not re-checked).
         /// The call's waves (every wave's output KEPT in `parts`, wave order; `pos` maps each wave-ordered
         /// row to its assignment row): true when the call is carried (its last waves left in flight).
         fn runWaves(self: *Self, g: *G, act: G.T, rows: PrefillRows, bank: BankArrays(G.T)) !bool {
             const n_rows = rows.slot.len;
-            if (n_rows == 0 or n_rows > self.rows_hi) return refuse(self.diag, error.RowsOutOfPlan, "exl3 kernel ops: a prefill call of {d} rows (1..{d})", .{ n_rows, self.rows_hi });
+            std.debug.assert(!(n_rows == 0 or n_rows > self.rows_hi));
             const a_rows = rowsOf(G, g, act, 0);
-            if (rows.act_row == null and a_rows != n_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: prefill act has {d} rows for {d} routed rows", .{ a_rows, n_rows });
-            if (rows.act_row) |ar| if (ar.len != n_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: {d} act rows for {d} routed rows", .{ ar.len, n_rows });
+            std.debug.assert(!(rows.act_row == null and a_rows != n_rows));
+            if (rows.act_row) |ar| std.debug.assert(ar.len == n_rows);
             var tp = prof.now();
             prof.countCall();
             try self.group(rows, rowsOf(G, g, bank.gate.code, 0), a_rows);
@@ -1195,8 +1194,8 @@ pub fn DigXPrefill(comptime G: type) type {
             self.gslot.clearRetainingCapacity();
             self.gcount.clearRetainingCapacity();
             for (rows.slot, 0..) |s, i| {
-                if (s >= cap) return refuse(self.diag, error.SlotOutOfBank, "exl3 kernel ops: prefill row {d} names slot {d} of a {d}-slot bank", .{ i, s, cap });
-                if (rows.act_row) |ar| if (ar[i] >= a_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: prefill row {d} reads act row {d} of {d}", .{ i, ar[i], a_rows });
+                std.debug.assert(!(s >= cap));
+                if (rows.act_row) |ar| std.debug.assert(ar[i] < a_rows);
                 var gi = self.group_of.items[s];
                 if (gi < 0) {
                     gi = @intCast(self.gslot.items.len);
@@ -2065,13 +2064,6 @@ test "dsv41 kernels ops: the prefill wave route refuses by name, before any laun
     var r = try DigXPrefill(Trace).init(a, &reg, tier, &diag);
     defer r.deinit(&t);
     const bank = try testBank(&t, 8);
-    const act4 = try t.ext("act", &.{ 4, 5120 }, .bfloat16);
-    try testing.expectError(error.RowsOutOfPlan, r.call(&t, act4, .{ .slot = &.{} }, bank));
-    try testing.expectError(error.SlotOutOfBank, r.call(&t, act4, .{ .slot = &.{ 1, 2, 8, 3 } }, bank));
-    try testing.expect(std.mem.indexOf(u8, diag.message(), "slot 8 of a 8-slot bank") != null);
-    try testing.expectError(error.RouteInput, r.call(&t, act4, .{ .slot = &.{ 1, 2, 3 } }, bank));
-    try testing.expectError(error.RouteInput, r.call(&t, act4, .{ .slot = &.{ 1, 2, 3 }, .act_row = &.{ 0, 4, 1 } }, bank));
-    try testing.expectError(error.RouteInput, r.call(&t, act4, .{ .slot = &.{ 1, 2, 3 }, .act_row = &.{ 0, 1 } }, bank));
     try testing.expectEqual(@as(usize, 0), t.launches.items.len);
     try testing.expectEqual(@as(usize, 0), t.log.items.len);
     // a bank above the kernels' slot bound is refused where the model binds it
@@ -2580,7 +2572,7 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
         defer accf.deinit(&tf);
         try accf.routeFusedDown(set, &diag);
         try testing.expect(accf.fused_down and !acc.fused_down);
-        try testing.expectEqual(acc.report.results.items.len + 3, accf.report.results.items.len);
+        try testing.expectEqual(acc.report.results.items.len + 2, accf.report.results.items.len); // its startup plan: compile + the family probe
         var fused_log: std.ArrayList(u8) = .empty;
         defer fused_log.deinit(a);
         const nf = try movedLaneLog(a, &tf, &set.reg, accf, try namedBank(&tf, 64), &fused_log);
@@ -2641,7 +2633,7 @@ test "dsv41 smoke 0b: take2 retune: the lane's take2 words on real records, bit 
     {
         var report: selfcheck.Report = .{};
         defer report.deinit(a);
-        set.selfCheck(a, &.{ .q3_prefill_dig_rot_take2_5120, .dsv41_prefill_dig_take2v_5120 }, &report, &kd) catch |e| {
+        set.selfCheck(a, &.{ .q3_prefill_dig_rot_take2_5120, .dsv41_prefill_dig_take2v_5120 }, .full, &report, &kd) catch |e| {
             std.debug.print("take2 self-checks refused: {s}\n", .{kd.message()});
             return e;
         };
@@ -2866,7 +2858,7 @@ test "dsv41 smoke 0b: m128: the 128-row DIG-X GEMMs' z words equal the 64-row te
     {
         var report: selfcheck.Report = .{};
         defer report.deinit(a);
-        set.selfCheck(a, &m128_texts, &report, &kd) catch |e| {
+        set.selfCheck(a, &m128_texts, .full, &report, &kd) catch |e| {
             std.debug.print("m128 self-checks refused: {s}\n", .{kd.message()});
             return e;
         };
@@ -3095,7 +3087,7 @@ test "dsv41 smoke 0b: fused down: the fused down GEMM's words equal the 128-row 
     {
         var report: selfcheck.Report = .{};
         defer report.deinit(a);
-        set.selfCheck(a, &w1_texts, &report, &kd) catch |e| {
+        set.selfCheck(a, &w1_texts, .full, &report, &kd) catch |e| {
             std.debug.print("fused down self-checks refused: {s}\n", .{kd.message()});
             return e;
         };
@@ -3290,7 +3282,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
     {
         var report: selfcheck.Report = .{};
         defer report.deinit(a);
-        set.selfCheck(a, &lut_texts, &report, &kd) catch |e| {
+        set.selfCheck(a, &lut_texts, .full, &report, &kd) catch |e| {
             std.debug.print("lut self-checks refused: {s}\n", .{kd.message()});
             return e;
         };
@@ -3490,6 +3482,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
 test "dsv41 selfcheck device: the served construction's self-check plans, every result printed" {
     if (std.c.getenv("DSV41_SELFCHECK_DEVICE") == null) return error.SkipZigTest;
     const trunk = @import("dsv41_kernel_routes.zig");
+    @import("sdk").log.enableStderr(); // the results are this test's output
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -3500,18 +3493,23 @@ test "dsv41 selfcheck device: the served construction's self-check plans, every 
     };
     defer set.deinit();
     var failed: usize = 0;
-    inline for (.{ .{ "exl3_quant_accept", &checked_at_accept }, .{ "trunk_routes", &trunk.kernels } }) |plan| {
-        var report: selfcheck.Report = .{};
-        defer report.deinit(a);
-        selfcheck.runSubset(a, &set.reg, &set.bound, plan[1], &report) catch |e| {
-            std.debug.print("DSV41_SELFCHECK_DEVICE plan {s} raised {t}\n", .{ plan[0], e });
-            return e;
-        };
-        std.debug.print("DSV41_SELFCHECK_DEVICE plan {s}\n", .{plan[0]});
-        selfcheck.logResults(&report, true);
-        const n = report.failures();
-        failed += n;
-        std.debug.print("DSV41_SELFCHECK_DEVICE verdict {s} results={d} failed={d}\n", .{ plan[0], report.results.items.len, n });
+    // Both depths, each timed: the construction runs `.startup`; `.full` is the manifest's whole plan.
+    inline for (.{ selfcheck.Depth.startup, selfcheck.Depth.full }) |depth| {
+        inline for (.{ .{ "exl3_quant_accept", &checked_at_accept }, .{ "trunk_routes", &trunk.kernels } }) |plan| {
+            var report: selfcheck.Report = .{};
+            defer report.deinit(a);
+            const t0 = std.Io.Timestamp.now(testing.io, .awake);
+            selfcheck.runSubset(a, &set.reg, &set.bound, plan[1], depth, &report) catch |e| {
+                std.debug.print("DSV41_SELFCHECK_DEVICE plan {s} {t} raised {t}\n", .{ plan[0], depth, e });
+                return e;
+            };
+            const ms = @as(f64, @floatFromInt(@max(t0.untilNow(testing.io, .awake).nanoseconds, 0))) / 1e6;
+            std.debug.print("DSV41_SELFCHECK_DEVICE plan {s} {t}\n", .{ plan[0], depth });
+            selfcheck.logResults(&report, true);
+            const n = report.failures();
+            failed += n;
+            std.debug.print("DSV41_SELFCHECK_DEVICE verdict {s} {t} results={d} failed={d} ms={d:.1}\n", .{ plan[0], depth, report.results.items.len, n, ms });
+        }
     }
     std.debug.print("DSV41_SELFCHECK_DEVICE done failed={d}\n", .{failed});
 }

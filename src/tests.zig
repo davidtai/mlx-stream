@@ -22,7 +22,6 @@ comptime {
     _ = @import("deepseek_v41_dspark_loop.zig");
     _ = @import("expert_bank.zig");
     _ = @import("expert_io_test.zig");
-    _ = @import("expert_slot_cache_test.zig");
     _ = @import("expert_lookahead.zig");
     _ = @import("expert_event_test.zig");
     _ = @import("expert_admission.zig");
@@ -40,11 +39,9 @@ comptime {
     _ = @import("dsv41_decode_timers.zig");
     _ = @import("dsv41_decode_first.zig");
     _ = @import("dsv41_cache_sim.zig");
-    _ = @import("dsv41_policy_replay.zig");
     _ = @import("dsv41_draft_routes.zig");
     _ = @import("dsv41_verify_timeline.zig");
     _ = @import("dsv41_host_heap.zig");
-    _ = @import("dsv41_hcpost_emul_bench.zig");
     _ = @import("expert_policy_test.zig");
     _ = @import("expert_stream.zig");
     _ = @import("expert_stream_of_test.zig");
@@ -56,8 +53,6 @@ comptime {
     _ = @import("dsv41_kernels_test.zig");
     _ = @import("dsv41_profile.zig");
     _ = @import("sdk_ext.zig");
-    _ = @import("nocache_io.zig");
     _ = @import("ngram_table.zig");
-    _ = @import("ngram_table_parity_test.zig");
     _ = @import("exl3_sushi_parity.zig");
 }

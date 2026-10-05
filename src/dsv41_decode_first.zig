@@ -26,7 +26,7 @@ pub const enabled = dt.enabled;
 pub const Phase = enum(u8) { build, prompt, cycle1, warm };
 pub var phase: Phase = .build;
 
-pub const max_layers = 64;
+pub const max_layers = @import("deepseek_v41.zig").max_layers;
 pub const max_experts = 512;
 pub const Layer = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u64 = 0, moe_ns: u64 = 0, misses: u64 = 0, read_ns: u64 = 0 };
 /// Per routed layer: [0] the first cycle, [1] the warm cycles summed.
@@ -54,9 +54,6 @@ pub var cycle1_draft: [2]DraftBlock = @splat(.{});
 /// The main row and the stage windows the first draft's eval would realise (the prompt's seed), evaluated first.
 pub var cycle1_pending_ns: u64 = 0;
 var drafts_seen: u8 = 0;
-/// A0 (a): per layer, the ns its first decode route waited for its started warm jobs (`warmWaitNs`; 0 with the warm
-/// route off or nothing in flight).
-pub var cycle1_warm_wait_ns: [max_layers]u64 = @splat(0);
 
 /// First dispatches counted per phase; the first cycle's named.
 pub var new_per_phase: [4]u32 = @splat(0);
@@ -86,15 +83,7 @@ pub fn startDecode() void {
     cycle1_draft = @splat(.{});
     cycle1_pending_ns = 0;
     drafts_seen = 0;
-    cycle1_warm_wait_ns = @splat(0);
     phase = .cycle1;
-}
-
-/// A routed layer's warm wait in the first cycle (`Stream.warmWaitNs`, set at that layer's first decode route).
-pub fn warmWait(layer: u32, ns: u64) void {
-    if (comptime !enabled) return;
-    if (phase != .cycle1 or layer >= max_layers) return;
-    cycle1_warm_wait_ns[layer] = ns;
 }
 
 /// The next draft block is the decode's first: D1 runs it twice (once dropped).
@@ -297,12 +286,6 @@ fn write(w: *std.Io.Writer, n: u32, stream_misses: ?u64) !void {
         for (tails[0..n], 0..) |t, i| try w.print("{s}{d}", .{ if (i == 0) "" else ", ", @field(t, name) });
         try w.writeAll("]");
     }
-    // A0 (a): the first decode routes' waits for started warm jobs (zeros with the warm route off)
-    var warm_total: u64 = 0;
-    for (cycle1_warm_wait_ns[0..n]) |x| warm_total += x;
-    try w.print(", \"cycle1_warm_wait_ms\": {d:.3}, \"cycle1_warm_wait_ms_by_layer\": [", .{ms(warm_total, 1)});
-    for (cycle1_warm_wait_ns[0..n], 0..) |x, i| try w.print("{s}{d:.2}", .{ if (i == 0) "" else ", ", ms(x, 1) });
-    try w.writeAll("]");
     // D1: the pending state, then the dropped block and the cycle's own (zeros when the first cycle drafted once)
     try w.print(", \"cycle1_pending_ms\": {d:.3}", .{ms(cycle1_pending_ns, 1)});
     inline for (.{ "first", "second" }, 0..) |label, i| {
@@ -360,9 +343,7 @@ test "dsv41 decode first: a variant or signature counts once, in the phase that 
     try std.testing.expect(!firstDraft());
     recordDraft(1, 1_000_000, 7_000_000, .{ 100, 17 }, .{ 103, 14 });
     cycle1_pending_ns = 2_000_000;
-    warmWait(2, 1_500_000);
     const l2 = line(&buf, 4, 300);
-    try std.testing.expect(std.mem.indexOf(u8, l2, "\"cycle1_warm_wait_ms\": 1.500, \"cycle1_warm_wait_ms_by_layer\": [0.00, 0.00, 1.50, 0.00]") != null);
     try std.testing.expect(std.mem.indexOf(u8, l2, "\"cycle1_pending_ms\": 2.000, \"cycle1_draft_first\": {\"build_ms\": 3.000, \"wait_ms\": 34.000, \"cache_before\": 0, \"fresh_bytes\": 17}, \"cycle1_draft_second\": {\"build_ms\": 1.000, \"wait_ms\": 7.000, \"cache_before\": 17, \"fresh_bytes\": 0}}") != null);
     endCycle();
     try std.testing.expect(!firstDraft());

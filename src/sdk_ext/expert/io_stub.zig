@@ -35,18 +35,6 @@ pub const q3ld = struct {
     pub fn q3ld_quiesce(_: i64) c_int {
         return 0;
     }
-    pub fn q3ld_sched_config(_: i32) c_int {
-        return -1;
-    }
-    pub fn q3ld_keepwarm(_: i32) c_int {
-        return -1;
-    }
-    pub fn q3ld_keepwarm_sleep(_: i64) c_int {
-        return -1;
-    }
-    pub fn q3ld_keepwarm_spins() i64 {
-        return 0;
-    }
     pub fn q3ld_stop() c_int {
         return 0;
     }
@@ -66,15 +54,6 @@ pub const q3ld = struct {
         return -1;
     }
     pub fn q3ld_ev_release(_: u64) i32 {
-        return -1;
-    }
-    pub fn q3ld_warm_config(_: i32) c_int {
-        return -1;
-    }
-    pub fn q3ld_submit_warm(_: i32, _: i64, _: i32, _: i32, _: i32, _: [*]const i64, _: [*]const [*]const u64, _: [*]const i64, _: i64) c_int {
-        return -1;
-    }
-    pub fn q3ld_warm_cancel(_: i64, _: i64) i64 {
         return -1;
     }
     pub fn q3ld_ev_state(_: *[10]i64) i32 {
