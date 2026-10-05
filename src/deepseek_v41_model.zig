@@ -603,7 +603,12 @@ pub fn Model(comptime G: type) type {
             if (st.max_len) |m| if (st.offset + n > m) return error.BoundedLaneFull;
             // A decode / verify forward runs on the state's scratch; a prefill span on an arena.
             var fba: std.heap.FixedBufferAllocator = .init(st.scratch);
-            var arena: std.heap.ArenaAllocator = .init(self.gpa);
+            // A prompt's host transients (the embedding rows gathered from the host table, 16,384 x 5,120 x 2 B at 16K, the
+            // routing and Engram tables) come from pages mapped for this forward and unmapped at its end: through the host's
+            // libc malloc each freed large block stayed dirty in the footprint in libmalloc's large cache (pass3el:
+            // MALLOC_LARGE +0.53 GB after the first prompt, held for the process's life; malloc_zone_pressure_relief returns
+            // none of it).
+            var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
             defer arena.deinit();
             const a = if (n <= scratch_rows) fba.allocator() else arena.allocator();
             const chunk = kvc.resolvePrefillChunk(&self.c, n, st.span_chunk orelse self.tier.prefill_chunk, self.tier.chunk_target_bytes);
