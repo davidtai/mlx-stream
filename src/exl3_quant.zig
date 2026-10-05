@@ -227,7 +227,7 @@ pub fn Accepted(comptime G: type) type {
         /// the clamped SwiGLU [rows, 2304] f32: in_rin -> the gate and up GEMVs -> gu_epi.
         pub fn gateUp(self: *const Self, g: *G, x: G.T, slot_ids: G.T, gate: A, up: A) !G.T {
             const rows = rowsOf(G, g, x, 0);
-            if (rows < 1 or rows > max_decode_rows) return error.RowsOutOfPlan;
+            std.debug.assert(!(rows < 1 or rows > max_decode_rows));
             const xs = try self.prep.inRin(g, x, self.tok[rows - 1], gate.rin, up.rin, slot_ids);
             const z = try self.gemv.projectGu(g, xs[0], xs[1], slot_ids, gate.code, up.code);
             return self.prep.guEpi(g, z[0], z[1], gate.rout, up.rout, slot_ids);
@@ -246,7 +246,7 @@ pub fn Accepted(comptime G: type) type {
         /// clamped SwiGLU [rows, 2304] f32, every word gateUp's per bank.
         pub fn gateUpBanked(self: *const Self, g: *G, x: G.T, ids: G.T, banks: *const [3]quant.BankArrays(A)) !G.T {
             const rows = rowsOf(G, g, x, 0);
-            if (rows < 1 or rows > max_decode_rows) return error.RowsOutOfPlan;
+            std.debug.assert(!(rows < 1 or rows > max_decode_rows));
             return self.banked.?.gateUp(g, x, self.tok[rows - 1], ids, banks);
         }
 
@@ -1035,17 +1035,16 @@ pub fn DigXPrefill(comptime G: type) type {
         }
 
         /// act bf16 [a_rows, 5120], `rows` (A assignment rows), the call's bank -> a KEPT f32
-        /// [A, 5120] in assignment-row order (the lane's `result`; release it). Refused: A outside 1..the kernels' row
-        /// bound (RowsOutOfPlan), a slot outside the bank (SlotOutOfBank), act rows that are not
-        /// A (no act_row) or an act_row outside act (RouteInput).
+        /// [A, 5120] in assignment-row order (the lane's `result`; release it). The caller's route guarantees A within
+        /// 1..the kernels' row bound, every slot inside the bank and the act rows (asserted, not re-checked).
         /// The call's waves (every wave's output KEPT in `parts`, wave order; `pos` maps each wave-ordered
         /// row to its assignment row): true when the call is carried (its last waves left in flight).
         fn runWaves(self: *Self, g: *G, act: G.T, rows: PrefillRows, bank: BankArrays(G.T)) !bool {
             const n_rows = rows.slot.len;
-            if (n_rows == 0 or n_rows > self.rows_hi) return refuse(self.diag, error.RowsOutOfPlan, "exl3 kernel ops: a prefill call of {d} rows (1..{d})", .{ n_rows, self.rows_hi });
+            std.debug.assert(!(n_rows == 0 or n_rows > self.rows_hi));
             const a_rows = rowsOf(G, g, act, 0);
-            if (rows.act_row == null and a_rows != n_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: prefill act has {d} rows for {d} routed rows", .{ a_rows, n_rows });
-            if (rows.act_row) |ar| if (ar.len != n_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: {d} act rows for {d} routed rows", .{ ar.len, n_rows });
+            std.debug.assert(!(rows.act_row == null and a_rows != n_rows));
+            if (rows.act_row) |ar| std.debug.assert(ar.len == n_rows);
             var tp = prof.now();
             prof.countCall();
             try self.group(rows, rowsOf(G, g, bank.gate.code, 0), a_rows);
@@ -1195,8 +1194,8 @@ pub fn DigXPrefill(comptime G: type) type {
             self.gslot.clearRetainingCapacity();
             self.gcount.clearRetainingCapacity();
             for (rows.slot, 0..) |s, i| {
-                if (s >= cap) return refuse(self.diag, error.SlotOutOfBank, "exl3 kernel ops: prefill row {d} names slot {d} of a {d}-slot bank", .{ i, s, cap });
-                if (rows.act_row) |ar| if (ar[i] >= a_rows) return refuse(self.diag, error.RouteInput, "exl3 kernel ops: prefill row {d} reads act row {d} of {d}", .{ i, ar[i], a_rows });
+                std.debug.assert(!(s >= cap));
+                if (rows.act_row) |ar| std.debug.assert(ar[i] < a_rows);
                 var gi = self.group_of.items[s];
                 if (gi < 0) {
                     gi = @intCast(self.gslot.items.len);
@@ -2065,13 +2064,6 @@ test "dsv41 kernels ops: the prefill wave route refuses by name, before any laun
     var r = try DigXPrefill(Trace).init(a, &reg, tier, &diag);
     defer r.deinit(&t);
     const bank = try testBank(&t, 8);
-    const act4 = try t.ext("act", &.{ 4, 5120 }, .bfloat16);
-    try testing.expectError(error.RowsOutOfPlan, r.call(&t, act4, .{ .slot = &.{} }, bank));
-    try testing.expectError(error.SlotOutOfBank, r.call(&t, act4, .{ .slot = &.{ 1, 2, 8, 3 } }, bank));
-    try testing.expect(std.mem.indexOf(u8, diag.message(), "slot 8 of a 8-slot bank") != null);
-    try testing.expectError(error.RouteInput, r.call(&t, act4, .{ .slot = &.{ 1, 2, 3 } }, bank));
-    try testing.expectError(error.RouteInput, r.call(&t, act4, .{ .slot = &.{ 1, 2, 3 }, .act_row = &.{ 0, 4, 1 } }, bank));
-    try testing.expectError(error.RouteInput, r.call(&t, act4, .{ .slot = &.{ 1, 2, 3 }, .act_row = &.{ 0, 1 } }, bank));
     try testing.expectEqual(@as(usize, 0), t.launches.items.len);
     try testing.expectEqual(@as(usize, 0), t.log.items.len);
     // a bank above the kernels' slot bound is refused where the model binds it

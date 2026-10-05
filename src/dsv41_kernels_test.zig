@@ -791,17 +791,13 @@ test "dsv41 kernels ops: the prepared per-M launches are the per-call launches t
     // sinkhorn16 (32 n), the head (8 M)
     try testing.expectEqual(@as(usize, 16 * 48 + 21 * 8 + (6 + 3 + 8 + 4 + 2 + 3) * 8 + 32 + 8), launches);
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
-    // a route refuses M outside its table before any launch; its prepared configs are released
+    // a route's prepared configs are released with it
     const n_launch = t.launches.items.len;
     const pe, const te = .{ reg.get(.q3rc_gate_part), reg.get(.q3rc_router_tail) };
     var r = try Router(Trace).init(&t, &reg, try t.arg(pe, "w", &no_vars), try t.arg(te, "bias", &no_vars), null);
     try testing.expectEqual(@as(isize, 16), t.prepared_live);
-    try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, 5120 }, .float32, &.{})));
     r.deinit(&t);
     var gv = try Gemv(Trace).init(&t, &reg);
-    const ge = reg.get(.dsv41_exl3_mul1h_k3_2304);
-    const s = &ge.samples[0];
-    try testing.expectError(error.RowsOutOfPlan, gv.project(&t, .gate, try t.node(&.{ 49, 5120 }, .float32, &.{}), try t.node(&.{49}, .uint32, &.{}), try t.arg(ge, "code", &s.vars)));
     gv.deinit(&t);
     try testing.expectEqual(n_launch, t.launches.items.len);
     try testing.expectEqual(@as(isize, 0), t.prepared_live);

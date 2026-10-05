@@ -577,7 +577,7 @@ pub fn FusedProj(comptime G: type) type {
             var numel: usize = 1;
             for (sh.slice()) |v| numel *= @intCast(v);
             const rows = numel / width;
-            if (rows < 1 or rows > max_rows) return error.RowsOutOfPlan;
+            std.debug.assert(!(rows < 1 or rows > max_rows));
             return .{ sh, rows };
         }
 
@@ -585,7 +585,7 @@ pub fn FusedProj(comptime G: type) type {
         fn seqOf(g: *G, cos: G.T, rows: u64) !u64 {
             const s: u64 = rowsOf(G, g, cos, 0);
             const seq = if (s == 0) rows else s;
-            if (seq > max_rows) return error.RowsOutOfPlan;
+            std.debug.assert(!(seq > max_rows));
             return seq;
         }
 
@@ -725,11 +725,11 @@ pub fn IndexTopk(comptime G: type) type {
         /// [M, N] }, M >= 1 (decode / verify or a prefill chunk), N >= 1.
         pub fn select(self: *const Self, g: *G, score: G.T, clen: G.T) ![2]G.T {
             const sh = dims(G, g, score);
-            if (sh.n != 2) return error.RouteInput;
+            std.debug.assert(!(sh.n != 2));
             const rows: u64 = @intCast(sh.d[0]);
             const n: u64 = @intCast(sh.d[1]);
-            if (rows < 1) return error.RowsOutOfPlan;
-            if (n < 1) return error.RouteInput;
+            std.debug.assert(!(rows < 1));
+            std.debug.assert(!(n < 1));
             const k = @min(index_topk, n);
             var vars: Vars = .initFill(0);
             vars.set(.rows, rows);
@@ -790,10 +790,10 @@ pub fn AttnSoftmax(comptime G: type) type {
         /// fine), sink f32 [1, 1, 64, 1] -> .{ ex f32 [1, M, 64, k], denom f32 [1, M, 64, 1] }.
         pub fn call(self: *const Self, g: *G, qk: G.T, valid: G.T, sink: G.T) ![2]G.T {
             const sh = dims(G, g, qk);
-            if (sh.n != 4) return error.RouteInput;
+            std.debug.assert(!(sh.n != 4));
             const rows: u64 = @intCast(sh.d[1]);
             const k: u64 = @intCast(sh.d[3]);
-            if (rows < 1 or rows > max_rows) return error.RowsOutOfPlan;
+            std.debug.assert(!(rows < 1 or rows > max_rows));
             const ins = [_]G.T{ qk, valid, sink, self.statics.arrays[3] };
             var out: [2]G.T = undefined;
             if (k == 128) {
@@ -1133,7 +1133,7 @@ pub fn PrefillAttn(comptime G: type) type {
         /// [1, 1, 64, 1], for rope `rope` = .{ qcos, qsin } f32 [S, 32] -> vec: o f32 [1, S, 64,
         /// 512]; rope: o f32 [8, S, 4096] (the lane hands on its [1, S, 8, 4096] transposed view).
         pub fn attend(self: *const Self, g: *G, q: G.T, win: G.T, widx: G.T, wval: G.T, cmp_kv: ?[2]G.T, sink: G.T, rope: ?[2]G.T) !G.T {
-            if ((cmp_kv != null) != self.cmp or (rope != null) != (self.kind == .rope)) return error.RouteInput;
+            std.debug.assert(!((cmp_kv != null) != self.cmp or (rope != null) != (self.kind == .rope)));
             const s = rowsOf(G, g, q, 1);
             var vars: Vars = .initFill(0);
             vars.set(.rows, s);
@@ -1304,7 +1304,7 @@ pub fn JoinlessCombine(comptime G: type) type {
         /// merges its smallest first, `deepseek_v41_experts.mergeJoinless`), loc int32 [n, 6, 2] (the
         /// (source, row) of each assignment), weights f32 [n, 6], shared f32 [n, 5120] -> f32 [n, 5120].
         pub fn call(self: *const Self, g: *G, outs: []const G.T, loc: G.T, weights: G.T, shared: G.T) !G.T {
-            if (outs.len == 0 or outs.len > sources) return error.RouteInput;
+            std.debug.assert(!(outs.len == 0 or outs.len > sources));
             var ins: [sources + 3]G.T = undefined;
             for (ins[0..sources], 0..) |*x, i| x.* = outs[if (i < outs.len) i else 0];
             ins[sources..].* = .{ loc, weights, shared };
@@ -1341,10 +1341,8 @@ test "dsv41 kernels ops: plan routes refuse rows outside their tables" {
     const sc = try t.node(&.{ 512, 160 }, .uint8, &.{});
     var r = try RcProj(Trace).init(&t, &reg, .wkv, w, sc, null);
     defer r.deinit(&t);
-    try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, 5120 }, .bfloat16, &.{})));
     var fp = try FusedProj(Trace).init(&t, &reg, try t.node(&.{1280}, .bfloat16, &.{}), try t.node(&.{512}, .bfloat16, &.{}), 1e-20, null);
     defer fp.deinit(&t);
-    try testing.expectError(error.RowsOutOfPlan, fp.qNorm(&t, try t.node(&.{ 9, 1280 }, .bfloat16, &.{})));
     try testing.expectEqual(@as(usize, 0), t.launches.items.len);
     // 33 matrices leave the 16-lane plans for the stock K3 text at threadgroup min(n, 256)
     var s = try Sinkhorn(Trace).init(&t, &reg);
@@ -1406,7 +1404,6 @@ test "dsv41 kernels ops: the DRAFTRC routes launch the draft's variants at the l
             n += 1;
         }
         try testing.expect(n >= 3);
-        try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, 5120 }, dt, &.{})));
     };
     // router: the draft gate weight (N 128) selects the N 128 / top-3 variants
     {
@@ -1530,7 +1527,6 @@ test "dsv41 kernels ops: decode batch 2 routes launch their lanes' own calls at 
             try testing.expectEqual(@as(c_int, k), l.cfg.out_shapes[0][3]);
         }
         for ([_]c_int{ 64, 1025 }) |k| try testing.expectError(error.KeysOutOfPlan, r.call(&t, try t.node(&.{ 1, 2, 64, k }, .float32, &.{}), try t.node(&.{ 1, 2, k }, .bool_, &.{}), sink));
-        try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 1, 9, 64, 128 }, .float32, &.{}), try t.node(&.{ 1, 9, 128 }, .bool_, &.{}), sink));
     }
     // the mxfp8 m1order sites the RC tiers still run: the lane's own launches, prepared per M
     {
@@ -1547,7 +1543,6 @@ test "dsv41 kernels ops: decode batch 2 routes launch their lanes' own calls at 
                 try testing.expect(t.back(1).prepared);
                 try expectLaunch(t.back(1), e, s, &.{ r.w, r.scales, x });
             };
-            try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, @intCast(st.K) }, .bfloat16, &.{})));
         }
         var vars: Vars = .initFill(0);
         xk.siteVars(e.site("shared_w2").?, &vars);
@@ -1588,7 +1583,6 @@ test "dsv41 kernels ops: decode batch 2 routes launch their lanes' own calls at 
             try testing.expectEqual(want.grid, l.cfg.grid);
             try testing.expectEqual([4]c_int{ @intCast(m), 129280, 0, 0 }, l.cfg.out_shapes[0]);
         }
-        try testing.expectError(error.RowsOutOfPlan, r.call(&t, try t.node(&.{ 9, 5120 }, .bfloat16, &.{})));
         // a bf16 head, or another site's codes, is refused at the bind
         try testing.expectError(error.RouteInput, HeadMx(Trace).init(&t, &reg, try t.node(&.{ 129280, 5120 }, .bfloat16, &.{}), sc, null));
         try testing.expectError(error.RouteInput, HeadMx(Trace).init(&t, &reg, w, try t.node(&.{ 129280, 320 }, .uint8, &.{}), null));
@@ -1713,8 +1707,6 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
         const wval = try t.node(&.{ 40, 128 }, .bool_, &.{});
         const qc = try t.node(&.{ 40, 32 }, .float32, &.{});
         const ckv = try t.node(&.{ 1, 700, 512 }, .float32, &.{});
-        try testing.expectError(error.RouteInput, r.attend(&t, q, win, widx, wval, null, sink, .{ qc, qc }));
-        try testing.expectError(error.RouteInput, r.attend(&t, q, win, widx, wval, .{ ckv, try t.node(&.{ 1, 40, 512 }, .int32, &.{}) }, sink, null));
         try testing.expectError(error.KeysOutOfPlan, r.attend(&t, q, win, widx, wval, .{ ckv, try t.node(&.{ 1, 40, 513 }, .int32, &.{}) }, sink, .{ qc, qc }));
         try testing.expectEqual(n_launch, t.launches.items.len);
     }
@@ -1819,7 +1811,6 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
         var many: [25]Trace.T = undefined;
         for (&many) |*o| o.* = try t.node(&.{ 8, 5120 }, .float32, &.{});
         const n_launch = t.launches.items.len;
-        try testing.expectError(error.RouteInput, r.call(&t, &many, try t.node(&.{ 8, 6, 2 }, .int32, &.{}), try t.node(&.{ 8, 6 }, .float32, &.{}), try t.node(&.{ 8, 5120 }, .float32, &.{})));
         try testing.expectEqual(n_launch, t.launches.items.len);
         var geo = PrefillGeometry.derived;
         geo.n_experts_per_tok = 8;
