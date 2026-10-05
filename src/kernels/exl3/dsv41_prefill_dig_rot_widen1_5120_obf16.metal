@@ -1,4 +1,4 @@
-// rot_widen1 storing its f32 word as the output dtype (bf16: the expert output the reference returns, type_as(x)); its own
+// rot_widen1 storing its f32 word as bf16 (static_cast<bfloat16_t>, the mxfp8 m1rows / fused rebuild store idiom; the expert output the reference returns, type_as(x)); its own
 // MLX name, since MLX keys a kernel by name, template values and input dtypes, not by output dtype.
 #pragma METAL fp contract(off)
     const float SCALE = as_type<float>(1035273459u);
@@ -34,5 +34,5 @@
     _Pragma("clang loop unroll(full)")
     for (uint q = 0u; q < 4u; ++q) {
         float ro = float(rout[rb + (int64_t) (c0 + 32u * q) * rout_strides[1]]);
-        out[dst + (int64_t) (32u * q)] = (w[q] * SCALE) * ro;
+        out[dst + (int64_t) (32u * q)] = static_cast<bfloat16_t>((w[q] * SCALE) * ro);   // the f32 word, rounded to bf16 on store
     }

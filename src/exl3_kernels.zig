@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "3608fcb4b3eb4d81e26335c6b43d10d19ca5bb543f9023c66c29b1c59a082b16";
+pub const manifest_sha256 = "9ddcfccac89c1633d708bd43035fec5fb690c7e248b46c7cb567d0cde6f8a9cd";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
@@ -147,7 +147,7 @@ pub const Kernel = enum {
     // tail); the f32 residual and layer 0's bf16 one (checked against the region at model construction)
     dsv41_hcpost_tf32,
     dsv41_hcpost_tf32__rbf16,
-    dsv41_hcpost_tf32__bf16,
+    dsv41_hcpost_tf32_bf16,
     // The banked hit wave (10-02, kbench v6d / v9b: exact): each routed decode text over three banks (base, ext,
     // transient) in one launch, a row's bank from its packed slot (bank << 24 | row) (twin: the stock text on bank 0)
     dsv41_exl3_b3_mul1h_k3_2304,
@@ -1191,7 +1191,7 @@ test "dsv41 kernels: decode batch 2 carries its sites, plans, variants and the p
     defer reg.deinit();
     // the predecessors' kernels are unchanged here but for grown var bounds (the exporter's
     // check), so their fixtures stand
-    try testing.expectEqual(@as(usize, 17), reg.predecessors.len);
+    try testing.expectEqual(@as(usize, 16), reg.predecessors.len);
     try testing.expect(reg.acceptsManifest("e03f982015726cb9c539f0609fdff59148bf6dfa236d388f83072b1881dbcdaf"));
     // the take2 retune's manifest lists the one before it (every kernel and header unchanged)
     try testing.expect(reg.acceptsManifest("88a78c65006b3964bd2478aa776345deb86e1544dee4ebd0c97f9d620e618f86"));

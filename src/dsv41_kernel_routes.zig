@@ -101,7 +101,7 @@ pub const kernels = [_]Kernel{
     .dsv41_jl_combine_bf16,
     .dsv41_hcpost_tf32,
     .dsv41_hcpost_tf32__rbf16,
-    .dsv41_hcpost_tf32__bf16,
+    .dsv41_hcpost_tf32_bf16,
 };
 
 /// The arch's kernel acceptance, once per backend before its routes are built: this subset's
@@ -1284,7 +1284,7 @@ pub fn HcPostTf32(comptime G: type) type {
 
         pub fn init(reg: *const xk.Registry, geo: *const PrefillGeometry, diag: ?*xk.Diag) Refusal!Self {
             try geo.admit("dsv41_hcpost_tf32", diag);
-            return .{ .f32_res = reg.get(.dsv41_hcpost_tf32), .bf16_res = reg.get(.dsv41_hcpost_tf32__rbf16), .bf16 = reg.get(.dsv41_hcpost_tf32__bf16) };
+            return .{ .f32_res = reg.get(.dsv41_hcpost_tf32), .bf16_res = reg.get(.dsv41_hcpost_tf32__rbf16), .bf16 = reg.get(.dsv41_hcpost_tf32_bf16) };
         }
 
         /// x [n, 5120], res [n, 4, 5120], post f32 [n, 4], comb f32 [n, 16] (`...jk` flattened) -> [n, 4, 5120]: x f32
@@ -1771,12 +1771,12 @@ test "dsv41 kernels ops: prefill batch 2 routes launch their lanes' own calls at
         }
     }
     // PREFILL_HCPOST: x, res, post, comb at each sample's rows; the residual's dtype picks the text
-    for ([_]xk.Kernel{ .dsv41_hcpost_tf32, .dsv41_hcpost_tf32__rbf16, .dsv41_hcpost_tf32__bf16 }) |k| {
+    for ([_]xk.Kernel{ .dsv41_hcpost_tf32, .dsv41_hcpost_tf32__rbf16, .dsv41_hcpost_tf32_bf16 }) |k| {
         const e = reg.get(k);
         const r = try HcPostTf32(Trace).init(&reg, &.derived, null);
         for (e.samples) |*s| {
             const n: c_int = @intCast(s.vars.get(.rows));
-            const x, const res, const post, const comb = .{ try t.node(&.{ n, 5120 }, if (k == .dsv41_hcpost_tf32__bf16) .bfloat16 else .float32, &.{}), try t.node(&.{ n, 4, 5120 }, if (k == .dsv41_hcpost_tf32) .float32 else .bfloat16, &.{}), try t.node(&.{ n, 4 }, .float32, &.{}), try t.node(&.{ n, 16 }, .float32, &.{}) };
+            const x, const res, const post, const comb = .{ try t.node(&.{ n, 5120 }, if (k == .dsv41_hcpost_tf32_bf16) .bfloat16 else .float32, &.{}), try t.node(&.{ n, 4, 5120 }, if (k == .dsv41_hcpost_tf32) .float32 else .bfloat16, &.{}), try t.node(&.{ n, 4 }, .float32, &.{}), try t.node(&.{ n, 16 }, .float32, &.{}) };
             _ = try r.call(&t, x, res, post, comb);
             try expectLaunch(t.back(1), e, s, &.{ x, res, post, comb });
         }
