@@ -399,6 +399,8 @@ test "dsv41 pre-ship gate: the served Module's construction, verified (probes an
     if (std.c.getenv("DSV41_VERIFY_DEVICE") == null) return error.SkipZigTest;
     const bank_dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     testing.log_level = .info;
+    // The construction's lines (the probes, "NATIVE construction check: ... host side ...") are this test's output.
+    sdk.log.enableStderr();
     const gpa = testing.allocator;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(gpa);
