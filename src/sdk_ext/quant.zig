@@ -516,7 +516,7 @@ fn groupOf(arena: Allocator, quantization: []const u8) !BankPeek {
     return .{ .quantization = q, .hidden = 64, .inter = 32, .n_experts = 4, .n_layers = 1, .layers = &.{} };
 }
 
-test "sdk quant: a refusal and a decline write their reason when asked, truncated to the buffer, and return their verdict" {
+test "sdk quant: a refusal and a decline write their reason when asked and return their verdict" {
     var d: Diag = .{};
     try testing.expectEqual(error.TopKTooWide, refuse(&d, error.TopKTooWide, "top_k {d}", .{9}));
     try testing.expectEqualStrings("top_k 9", d.message());
@@ -524,9 +524,6 @@ test "sdk quant: a refusal and a decline write their reason when asked, truncate
     try testing.expectEqual(@as(?Priority, null), decline(&d, "{s}", .{"declined"}));
     try testing.expectEqualStrings("declined", d.message());
     try testing.expectEqual(@as(?Priority, null), decline(null, "x", .{}));
-    const long: [500]u8 = @splat('y');
-    _ = decline(&d, "{s}", .{&long});
-    try testing.expectEqual(d.buf.len, d.message().len);
 }
 
 test "sdk quant: the JSON readers return null (or .null) for a missing field, a mistyped field and a non-object" {

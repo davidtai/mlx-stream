@@ -2286,12 +2286,9 @@ test "dsv41 module: each tier's prefill allocator cache is inside what the admis
     try std.testing.expectEqual(@as(usize, envelope.prefill_cache_bytes), prefillCacheLimit(.stock));
 }
 
-test "dsv41 module: a request's bounded lanes hold its reservation, else the prompt plus the shell's headroom, plus a verify block" {
+test "dsv41 module: the bounded lanes' headroom is the host shell's generation headroom" {
+    // The values are kv.capacity's ("sdk kv: capacity is ..."); the bound is the shell's headroom.
     try std.testing.expectEqual(@import("deepseek_v41_host.zig").transformer.KVCache.RESERVE_GEN_HEADROOM, generation_headroom);
-    // 16K prompt, no declared budget: 16384 + 8192 + 8.
-    try std.testing.expectEqual(@as(u32, 16384 + 8192 + 8), Module.maxPositions(16384, 0));
-    // A reservation (prompt + budget + chunk) is the bound.
-    try std.testing.expectEqual(@as(u32, 40000 + 8), Module.maxPositions(32768, 40000));
 }
 
 test "dsv41 module: the served tier's prefill routes are on by default, the stock tier's off; a setting overrides; layer-major refused on stock" {

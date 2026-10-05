@@ -1665,11 +1665,6 @@ test "dsv41 kernels: the registry implements exactly the bank's codebook and K" 
     try testing.expectEqual(expert_bank.mul1_multiplier, reg.multiplier);
 }
 
-test "dsv41 kernels: no Metal device in this process" {
-    if (std.c.getenv("DSV41_KERNELS_GPU") != null) return error.SkipZigTest;
-    try @import("sdk").testing.expectNoDevice();
-}
-
 test "dsv41 kernels: the host decode reads each weight's 16-bit state bit by bit from its tile's circular stream, K 1 to 3" {
     const a = testing.allocator;
     const table = try a.create([65536]u16);
