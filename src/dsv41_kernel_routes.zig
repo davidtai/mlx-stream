@@ -101,7 +101,7 @@ pub const kernels = [_]Kernel{
 /// self-check plan on the load context's kernel set, recorded in `report` and judged (refused:
 /// SelfCheckFailed, `diag` naming the first failing kernel / check / site).
 pub fn accept(a: Allocator, set: *const ks.Set, report: *selfcheck.Report, diag: *xk.Diag) !void {
-    try set.selfCheck(a, &kernels, report, diag);
+    try set.selfCheck(a, &kernels, .startup, report, diag);
 }
 
 // ── RCTAIL (DSV41_DECODE_RCTAIL = router, hcpremix, sinkhorn) ──

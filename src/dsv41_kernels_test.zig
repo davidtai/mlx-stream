@@ -113,28 +113,47 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     defer set.deinit();
     set.install(Trace, &t);
     try testing.expectEqual(@as(*const xk.Bound, &set.bound), t.launcher.?);
-    var plan: usize = 0;
-    for (&set.reg.entries) |*e| plan += e.checks.count();
-    // the EXL3 quant: exactly its 60 checks (49 + the take2 retune's 3 + the 128-row GEMMs' 8), the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
+    // the startup plan of a subset: every kernel's compile, one probe per kernel family
+    const Plan = struct {
+        fn count(reg: *const xk.Registry, subset: []const Kernel) usize {
+            const p = selfcheck.plan(reg, ks.subsetOf(subset), .startup);
+            var n: usize = 0;
+            for (subset) |k| n += p.get(k).count();
+            return n;
+        }
+        /// The first check of `subset`'s startup plan that is not a compile (a scripted failure must be one that runs).
+        fn probe(reg: *const xk.Registry, subset: []const Kernel) struct { k: Kernel, c: xk.Check } {
+            const p = selfcheck.plan(reg, ks.subsetOf(subset), .startup);
+            for (&reg.entries) |*e| {
+                var it = p.get(e.kernel).iterator();
+                while (it.next()) |c| if (c != .compile) return .{ .k = e.kernel, .c = c };
+            }
+            unreachable;
+        }
+    };
+    // the EXL3 quant: exactly its startup plan, the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
     const acc = try eq.accept(Trace, a, &t, .{ .kernels = set.ref() }, v41_spec, &diag);
-    try testing.expectEqual(@as(usize, 60), acc.report.results.items.len);
+    const exl3_plan = Plan.count(&set.reg, &eq.checked_at_accept);
+    try testing.expectEqual(exl3_plan, acc.report.results.items.len);
+    // every kernel compiles at startup; at most one probe per family
+    try testing.expect(exl3_plan > eq.checked_at_accept.len and exl3_plan < 60);
     const ex = ks.subsetOf(&eq.kernels);
     for (acc.report.results.items) |r| try testing.expect(ex.contains(r.kernel) and r.ok);
     try testing.expectEqual(@as(isize, 288), t.prepared_live);
     try testing.expectEqual(@as(usize, 40), acc.waves.len);
-    // the fused down GEMM's arm: its 3 checks join the report, and every layer's waves launch it
-    const fused_checks = set.reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1).checks.count();
-    try testing.expectEqual(@as(usize, 3), fused_checks);
+    // the fused down GEMM's arm: its startup checks join the report, and every layer's waves launch it
+    const fused_checks = Plan.count(&set.reg, &eq.w1_texts);
+    try testing.expectEqual(@as(usize, 2), fused_checks);
     try testing.expectEqual(@as(u32, 5), acc.waves[0].wave_launches);
     try acc.routeFusedDown(set, &diag);
-    try testing.expectEqual(60 + fused_checks, acc.report.results.items.len);
+    try testing.expectEqual(exl3_plan + fused_checks, acc.report.results.items.len);
     for (acc.waves) |*w| try testing.expectEqual(@as(u32, 4), w.wave_launches);
     // the routed forms: the GEMVs rebuilt on their texts at construction (no check joins the report: the registry's
     // twins run in a check window), the prepared tables swap (gate|up's one-launch table joins: + 48)
     try acc.routeForms(&t, .{ .down_pair = true, .gu_one = true });
     try testing.expectEqual(Kernel.dsv41_exl3_pair_k3_5120, acc.gemv.dn.kernel);
     try testing.expect(acc.gemv.gu1_p != null);
-    try testing.expectEqual(60 + fused_checks, acc.report.results.items.len);
+    try testing.expectEqual(exl3_plan + fused_checks, acc.report.results.items.len);
     try testing.expectEqual(@as(isize, 288 + 48), t.prepared_live);
     // the banked route over the forms: six prepared tables (in_rin, gu_epi, din_rin, dpost, gu_one's, the pair's: + 288),
     // no kept array (its GEMV statics are the forms' own, aliased), no check joins the report; the forms are its
@@ -146,7 +165,7 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expectEqual(Kernel.dsv41_exl3_b3_pair_k3_5120, acc.banked.?.dn_e.kernel);
     try testing.expectEqual(Kernel.dsv41_exl3_b3_guone_k3_2304, acc.banked.?.gu_e.kernel);
     for (5..acc.banked.?.dn_e.inputs.len) |i| try testing.expectEqual(acc.gemv.dn_statics.arrays[i - 2], acc.banked.?.dn_st[i]);
-    try testing.expectEqual(60 + fused_checks, acc.report.results.items.len);
+    try testing.expectEqual(exl3_plan + fused_checks, acc.report.results.items.len);
     try testing.expectError(error.FormsAfterBanked, acc.routeForms(&t, .{}));
     try testing.expectError(error.BankedRoutedTwice, acc.routeBanked(&t));
     acc.banked.?.deinit(&t);
@@ -154,24 +173,23 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
     try testing.expectEqual(@as(isize, 288 + 48), t.prepared_live);
     try acc.routeForms(&t, .{});
     try testing.expectEqual(@as(isize, 288), t.prepared_live);
-    // the trunk: the rest of the plan less the table-codebook text's 3 (the EXL3 subset's, registered, not checked at
-    // accept), none of the EXL3 kernels
+    // the trunk: its own startup plan, none of the EXL3 kernels
     var rep: selfcheck.Report = .{};
     defer rep.deinit(a);
     try tr.accept(a, set, &rep, &diag);
-    const lut_checks = set.reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut).checks.count();
-    try testing.expectEqual(@as(usize, 3), lut_checks);
-    var form_checks: usize = 0;
-    for (eq.form_texts) |k| form_checks += set.reg.get(k).checks.count();
-    try testing.expectEqual(@as(usize, 6), form_checks);
-    var banked_checks: usize = 0;
-    for (eq.banked_texts) |k| banked_checks += set.reg.get(k).checks.count();
-    try testing.expectEqual(@as(usize, 24), banked_checks);
-    try testing.expectEqual(plan - 60 - fused_checks - lut_checks - form_checks - banked_checks, rep.results.items.len);
+    try testing.expectEqual(Plan.count(&set.reg, &tr.kernels), rep.results.items.len);
+    const full_exl3 = selfcheck.plan(&set.reg, ks.subsetOf(&eq.checked_at_accept), .full);
+    const full_trunk = selfcheck.plan(&set.reg, ks.subsetOf(&tr.kernels), .full);
+    var nf: [2]usize = .{ 0, 0 };
+    for (eq.checked_at_accept) |k| nf[0] += full_exl3.get(k).count();
+    for (tr.kernels) |k| nf[1] += full_trunk.get(k).count();
+    std.debug.print("\nconstruction self-checks (checks, before sites): EXL3 accept {d} -> {d}, trunk {d} -> {d}\n", .{ nf[0], exl3_plan, nf[1], rep.results.items.len });
     for (rep.results.items) |r| try testing.expect(!ex.contains(r.kernel) and r.ok);
-    // a scripted failure refuses its owner's accept by name; the other consumer's passes
+    // a scripted failure of a planned probe refuses its owner's accept by name; the other consumer's passes
+    const pe = Plan.probe(&set.reg, &eq.checked_at_accept);
+    const pt = Plan.probe(&set.reg, &tr.kernels);
     const Fail = struct { k: Kernel, c: xk.Check, exl3: bool };
-    for ([_]Fail{ .{ .k = .q3_exl3_prep_gu_epi, .c = .f64, .exl3 = true }, .{ .k = .q3rc_router_tail__n128_top3, .c = .f64, .exl3 = false } }) |f| {
+    for ([_]Fail{ .{ .k = pe.k, .c = pe.c, .exl3 = true }, .{ .k = pt.k, .c = pt.c, .exl3 = false } }) |f| {
         const bad = try ks.Set.init(a, .{ .device = .{ .stub = .{ .fail = .{ .kernel = f.k, .check = f.c } } } }, &diag);
         defer bad.deinit();
         var r2: selfcheck.Report = .{};

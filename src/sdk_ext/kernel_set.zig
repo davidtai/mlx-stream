@@ -130,13 +130,14 @@ pub fn KernelSet(comptime R: type) type {
                 if (launcherSlot(G, g)) |s| s.* = null;
             }
 
-            /// One consumer's acceptance: the self-check plan of the entries of `subset` on the set's
-            /// device (the stub device's scripted plan in host tests), recorded in `report` and judged.
+            /// One consumer's acceptance: the self-check plan of the entries of `subset` at `depth` on the set's
+            /// device (the stub device's scripted plan in host tests), recorded in `report` and judged. The
+            /// construction runs `.startup`; the device tests `.full` (`selfcheck.Depth`).
             /// Refused: error.SelfCheckFailed, `diag` naming the first failing kernel / check / site.
-            pub fn selfCheck(self: *const Set, a: Allocator, subset: []const Kernel, report: *selfcheck.Report, diag: *xk.Diag) !void {
+            pub fn selfCheck(self: *const Set, a: Allocator, subset: []const Kernel, depth: selfcheck.Depth, report: *selfcheck.Report, diag: *xk.Diag) !void {
                 switch (self.device) {
-                    .stream => try selfcheck.runSubset(a, &self.reg, &self.bound, subset, report),
-                    .stub => |st| try stubPlan(a, &self.reg, st, subset, report),
+                    .stream => try selfcheck.runSubset(a, &self.reg, &self.bound, subset, depth, report),
+                    .stub => |st| try stubPlan(a, &self.reg, st, subset, depth, report),
                 }
                 try selfcheck.judge(report, diag);
             }
@@ -150,11 +151,12 @@ pub fn KernelSet(comptime R: type) type {
         }
 
         /// The stub device's plan over `subset`: one scripted result per (kernel, check), in registry order.
-        fn stubPlan(a: Allocator, reg: *const xk.Registry, stub: StubDevice, subset: []const Kernel, report: *selfcheck.Report) !void {
+        fn stubPlan(a: Allocator, reg: *const xk.Registry, stub: StubDevice, subset: []const Kernel, depth: selfcheck.Depth, report: *selfcheck.Report) !void {
             const want = subsetOf(subset);
+            const checks = selfcheck.plan(reg, want, depth);
             for (&reg.entries) |*e| {
                 if (!want.contains(e.kernel)) continue;
-                var it = e.checks.iterator();
+                var it = checks.get(e.kernel).iterator();
                 while (it.next()) |c| {
                     const fails = if (stub.fail) |f| f.kernel == e.kernel and f.check == c else false;
                     try report.results.append(a, .{ .kernel = e.kernel, .check = c, .words = 1, .ok = !fails, .err = if (fails) "stub device: scripted failure" else "" });
@@ -271,8 +273,15 @@ const FakeReg = struct {
                 r.results.deinit(a);
             }
         };
+        pub const Depth = enum { startup, full };
+        /// The fake's plan at either depth: every check of every wanted kernel.
+        pub fn plan(reg: *const Registry, want: std.EnumSet(Kernel), _: Depth) std.EnumArray(Kernel, std.EnumSet(Check)) {
+            var out: std.EnumArray(Kernel, std.EnumSet(Check)) = .initFill(.empty);
+            for (&reg.entries) |*e| if (want.contains(e.kernel)) out.set(e.kernel, e.checks);
+            return out;
+        }
         /// The stream arm's plan: one passing result per subset kernel, marked as the device's (words 2).
-        pub fn runSubset(a: std.mem.Allocator, _: *const Registry, bound: *const Bound, subset: []const Kernel, report: *Report) !void {
+        pub fn runSubset(a: std.mem.Allocator, _: *const Registry, bound: *const Bound, subset: []const Kernel, _: Depth, report: *Report) !void {
             for (subset) |k| try report.results.append(a, .{ .kernel = k, .check = .parity, .words = 2, .ok = bound.kernels[@backingInt(k)].built, .err = "" });
         }
         pub fn judge(report: *const Report, diag: *Diag) !void {
@@ -382,7 +391,7 @@ test "sdk kernel set: a consumer self-checks its own subset in registry order; a
     defer s.deinit();
     var report: FakeReg.selfcheck.Report = .{};
     defer report.deinit(testing.allocator);
-    try s.selfCheck(testing.allocator, &.{ .k2, .k0 }, &report, &diag);
+    try s.selfCheck(testing.allocator, &.{ .k2, .k0 }, .startup, &report, &diag);
     try testing.expectEqual(@as(usize, 3), report.results.items.len);
     const r = report.results.items;
     try testing.expect(r[0].kernel == .k0 and r[0].check == .parity and r[1].kernel == .k0 and r[1].check == .bounds and r[2].kernel == .k2);
@@ -393,8 +402,8 @@ test "sdk kernel set: a consumer self-checks its own subset in registry order; a
     var report2: FakeReg.selfcheck.Report = .{};
     defer report2.deinit(testing.allocator);
     // the failing kernel outside the subset is never planned
-    try f.selfCheck(testing.allocator, &.{.k0}, &report2, &diag);
-    try testing.expectError(error.SelfCheckFailed, f.selfCheck(testing.allocator, &.{.k1}, &report2, &diag));
+    try f.selfCheck(testing.allocator, &.{.k0}, .startup, &report2, &diag);
+    try testing.expectError(error.SelfCheckFailed, f.selfCheck(testing.allocator, &.{.k1}, .startup, &report2, &diag));
     try testing.expectEqualStrings("k1", diag.msg);
     try testing.expectEqualStrings("stub device: scripted failure", report2.results.items[report2.results.items.len - 1].err);
     try testing.expect(FS.subsetOf(&.{ .k2, .k2 }).count() == 1 and FS.subsetOf(&.{}).count() == 0);
@@ -405,7 +414,7 @@ test "sdk kernel set: a consumer self-checks its own subset in registry order; a
     try testing.expect(d.device == .stream and d.bound.kernels[2].built);
     var report3: FakeReg.selfcheck.Report = .{};
     defer report3.deinit(testing.allocator);
-    try d.selfCheck(testing.allocator, &.{.k1}, &report3, &diag);
+    try d.selfCheck(testing.allocator, &.{.k1}, .startup, &report3, &diag);
     try testing.expect(report3.results.items.len == 1 and report3.results.items[0].words == 2);
     // a bind refusal frees the registry it built
     FakeReg.Registry.refuse_bind = true;

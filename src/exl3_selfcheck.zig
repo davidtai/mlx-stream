@@ -275,32 +275,71 @@ fn checkFormTwin(h: *H, k: Kernel) !void {
     try h.record(.{ .kernel = k, .check = .twin, .words = words, .bad = bad, .ok = bad == 0 and words > 0 });
 }
 
+/// How much of each kernel's manifest plan runs.
+/// - `startup` (the construction's acceptance): every kernel compiles and launches, and each kernel family gets one exact
+///   probe against a reference (its first kernel's, by `probe_order`). It protects what differs per machine and per
+///   build (a text that does not compile or bind, a family whose numerics left their reference).
+/// - `full` (the device test, `DSV41_SELFCHECK_DEVICE`): every check of the manifest, the per-site row invariance,
+///   twins, golden tiles and compositions included. Those are properties of the texts, fixed by the manifest's sha256.
+pub const Depth = enum { startup, full };
+
+/// The reference checks in the order a family's startup probe picks them (host f64 first).
+const probe_order = [_]Check{ .f64, .mlx_chain, .decode_table, .join_equiv, .golden_tiles, .composition };
+
+/// The checks of `want`'s entries at `depth`, per kernel, in registry order (`stubPlan` runs the same plan).
+pub fn plan(reg: *const xk.Registry, want: std.EnumSet(Kernel), depth: Depth) std.EnumArray(Kernel, std.EnumSet(Check)) {
+    var out: std.EnumArray(Kernel, std.EnumSet(Check)) = .initFill(.empty);
+    var probed: [64][]const u8 = undefined;
+    var n_probed: usize = 0;
+    for (&reg.entries) |*e| {
+        if (!want.contains(e.kernel)) continue;
+        var cs = e.checks;
+        // layout_guard is never run: its oracle was MLX's own mxfp8 quantized_matmul (MLX's to verify, not ours);
+        // the rcproj kernels' f64 checks cover them.
+        cs.remove(.layout_guard);
+        if (depth == .startup) {
+            var keep: std.EnumSet(Check) = .empty;
+            if (cs.contains(.compile)) keep.insert(.compile);
+            const seen = for (probed[0..n_probed]) |f| {
+                if (std.mem.eql(u8, f, e.family)) break true;
+            } else false;
+            if (!seen) for (probe_order) |c| if (cs.contains(c)) {
+                keep.insert(c);
+                probed[n_probed] = e.family;
+                n_probed += 1;
+                break;
+            };
+            cs = keep;
+        }
+        out.set(e.kernel, cs);
+    }
+    return out;
+}
+
 /// Runs every check of every kernel's plan; a failing check is recorded (with the latched MLX
 /// message) and the run continues, so one window reports the whole registry.
 pub fn runAll(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, report: *Report) !void {
-    return runOver(a, reg, bound, .full, report);
+    return runOver(a, reg, bound, .full, .full, report);
 }
 
-/// As `runAll`, over the entries of `subset` (one consumer's kernels: `kernel_set.Set.selfCheck`),
+/// As `runAll`, over the entries of `subset` (one consumer's kernels: `kernel_set.Set.selfCheck`) at `depth`,
 /// in registry order.
-pub fn runSubset(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, subset: []const Kernel, report: *Report) !void {
+pub fn runSubset(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, subset: []const Kernel, depth: Depth, report: *Report) !void {
     var want: std.EnumSet(Kernel) = .empty;
     for (subset) |k| want.insert(k);
-    return runOver(a, reg, bound, want, report);
+    return runOver(a, reg, bound, want, depth, report);
 }
 
-fn runOver(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, want: std.EnumSet(Kernel), report: *Report) !void {
+fn runOver(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, want: std.EnumSet(Kernel), depth: Depth, report: *Report) !void {
     const table = try a.create([65536]u16);
     defer a.destroy(table);
     xk.mul1Table(table);
     var h: H = .{ .a = a, .reg = reg, .bound = bound, .s = bound.stream, .rng = .init(20260928), .report = report, .table = table };
+    const checks = plan(reg, want, depth);
     for (&reg.entries) |*e| {
         if (!want.contains(e.kernel)) continue;
-        var it = e.checks.iterator();
+        var it = checks.get(e.kernel).iterator();
         while (it.next()) |c| {
-            // layout_guard is not run: its oracle was MLX's own mxfp8 quantized_matmul (MLX's to verify, not ours);
-            // the rcproj kernels' f64 checks cover them.
-            if (c == .layout_guard) continue;
             const before = report.results.items.len;
             h.dispatch(e.kernel, c) catch |err| {
                 var buf: [512]u8 = undefined;
@@ -2136,4 +2175,31 @@ test "dsv41 kernels gpu: every kernel of record passes its self-check" {
     if (std.c.getenv("DSV41_KERNELS_RECEIPT")) |path| try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = std.mem.span(path), .data = lines });
     std.debug.print("[exl3 selfcheck] {d} checks, {d} failed {s}\n", .{ report.results.items.len, report.failures(), diag.message() });
     try verdict;
+}
+
+test "dsv41 selfcheck: the startup plan compiles every kernel and probes each family once; the full plan is the manifest's" {
+    const a = testing.allocator;
+    var diag: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
+    defer reg.deinit();
+    const every: std.EnumSet(Kernel) = .full;
+    const full = plan(&reg, every, .full);
+    const startup = plan(&reg, every, .startup);
+    var n_full: usize = 0;
+    var n_startup: usize = 0;
+    var n_probes: usize = 0;
+    for (&reg.entries) |*e| {
+        var manifest = e.checks;
+        manifest.remove(.layout_guard);
+        try testing.expect(full.get(e.kernel).eql(manifest));
+        const s = startup.get(e.kernel);
+        try testing.expect(s.contains(.compile) and s.subsetOf(manifest));
+        try testing.expect(!s.contains(.row_invariance) and !s.contains(.twin) and !s.contains(.fused));
+        try testing.expect(s.count() <= 2);
+        n_full += manifest.count();
+        n_startup += s.count();
+        n_probes += s.count() - 1;
+    }
+    std.debug.print("\nself-check plan: full {d} checks, startup {d} ({d} compiles + {d} family probes)\n", .{ n_full, n_startup, reg.entries.len, n_probes });
+    try testing.expect(n_startup < n_full);
 }
