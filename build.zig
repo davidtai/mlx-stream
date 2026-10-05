@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
     }.f;
     const log = b.createModule(.{ .root_source_file = hostFile(b, host, "src/log.zig"), .target = target, .link_libc = true });
     const io_util = b.createModule(.{ .root_source_file = hostFile(b, host, "src/io_util.zig"), .target = target, .link_libc = true });
+    const mtp_acceptance = b.createModule(.{ .root_source_file = hostFile(b, host, "src/mtp_acceptance.zig"), .target = target });
     const mlx = b.createModule(.{ .root_source_file = hostFile(b, host, "src/mlx.zig"), .target = target, .link_libc = true, .imports = &.{.{ .name = "log", .module = log }} });
     const sdk_build = b.addOptions();
     sdk_build.addOption(bool, "plugin_profile", false);
@@ -60,6 +61,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "mlx", .module = mlx },
         .{ .name = "log", .module = log },
         .{ .name = "io_util", .module = io_util },
+        .{ .name = "mtp_acceptance", .module = mtp_acceptance },
         .{ .name = "sdk_build", .module = sdk_build.createModule() },
     } });
     for (refusal_cases) |c| {
