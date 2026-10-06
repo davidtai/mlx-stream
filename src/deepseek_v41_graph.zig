@@ -250,12 +250,21 @@ pub const hc_norm_min_rows = 32;
 /// (`closeScores`): the prefill widths, where a chain's arrays are score-sized;
 /// a decode / verify forward keeps no per-layer host calls for it.
 pub const score_wave_min_rows = attn_compile_max_rows;
-/// IDX_CHUNKED_SELECT: the prefill indexer scores and selects `index_select_rows` rows at a time, each block evaluated
-/// before the next, so a call holds its [S, N] bool mask (1 B per row and compressed position) and one block's f32
-/// scores and select (5 B per row and position, R rows) instead of the whole call's f32 scores beside the mask
-/// (5 B per row and position, S rows). 256: 5 x 256 x N is 1.3 GB at N = 1,047,488, a bounded constant beside the
-/// mask's S x N; a wider block costs bytes, a narrower one more evals (one per block per indexed layer).
-pub const index_select_rows: c_int = 256;
+/// IDX_CHUNKED_SELECT: a prefill call whose index scores and select (5 B per row and compressed position: the f32
+/// score beside the bool mask) would pass `index_select_block_bytes` scores and selects in blocks of R rows, each
+/// evaluated before the next, so the call holds its [S, N] mask (1 B per row and position) and one block's 5 x R x N.
+/// R = clamp(budget / (5 N), `index_select_min_rows`, S); R >= S is the one launch, as before (every N up to ~26K
+/// compressed positions at the 2 GiB budget: the 16K headline's call is unchanged). At N = 262,144 R is 1,638; at
+/// N = 1,047,488 the floor, 256 (5 x 256 x N = 1.34 GB): a block below 256 rows would add evals for little.
+pub const index_select_block_bytes: u64 = 2 << 30;
+pub const index_select_min_rows: c_int = 256;
+
+/// IDX_CHUNKED_SELECT's block rows for a call of `s` rows over `n` compressed positions at `budget` bytes.
+pub fn indexSelectRows(s: c_int, n: c_int, budget: u64) c_int {
+    const fit = budget / (5 * @as(u64, @intCast(@max(n, 1))));
+    const r: c_int = @intCast(@min(fit, @as(u64, @intCast(s))));
+    return @min(@max(r, index_select_min_rows), s);
+}
 pub const core_compile_max_rows = 8;
 pub const hc_compile_max_rows = 7;
 pub const small_stages_max_rows = 7;
@@ -1113,10 +1122,13 @@ pub fn Trunk(comptime G: type) type {
             const wts0 = try smallLinear(g, s_wproj, x, iq.weights_proj);
             const wts = try g.mul(wts0, try sf(g, softmax_scale * std.math.pow(f64, @floatFromInt(c.index_n_heads), -0.5), wts0));
             if (pi) |ix| {
-                // IDX_CHUNKED_SELECT past one block of rows (a probe that records the whole call's scores keeps the one
-                // launch: its `attn.index_score` is the call's).
-                if (comptime !recordsScores(@TypeOf(p))) if (sh.d[1] > index_select_rows)
-                    return selectChunked(g, c, ix, try g.astype(q, .float32), index_k, try g.astype(wts, .float32), compress_lens, n_comp, candidates, set_candidates, index_select_rows);
+                // IDX_CHUNKED_SELECT when the call's scores would pass the block budget (a probe that records the whole
+                // call's scores keeps the one launch: its `attn.index_score` is the call's).
+                if (comptime !recordsScores(@TypeOf(p))) {
+                    const rows = indexSelectRows(sh.d[1], n_comp, index_select_block_bytes);
+                    if (rows < sh.d[1])
+                        return selectChunked(g, c, ix, try g.astype(q, .float32), index_k, try g.astype(wts, .float32), compress_lens, n_comp, candidates, set_candidates, rows);
+                }
                 // One launch: sum_h relu(q_h . k_n) w_h, -inf past each row's reach.
                 var score = try ix.score.call(g, try g.astype(q, .float32), index_k, try g.astype(wts, .float32), compress_lens);
                 var cand: ?T = null;
@@ -4299,23 +4311,27 @@ test "dsv41 graph: the all-layer chain's per-layer held bytes at a 2,048-token p
     try testing.expect(worst > 0);
 }
 
-test "dsv41 graph: IDX_CHUNKED_SELECT: a 600-row prefill call scores and selects in 256-row blocks, one eval each; a recording probe keeps the one launch" {
+test "dsv41 graph: IDX_CHUNKED_SELECT: the block rows follow the byte budget; a call under it keeps the one launch, a blocked call evaluates each block" {
+    // The budget: one launch while 5 S N fits 2 GiB (the 16K headline: S = N = 16,384 is 1.34 GB), else blocks.
+    try testing.expectEqual(@as(c_int, 16384), indexSelectRows(16384, 16384, index_select_block_bytes));
+    try testing.expectEqual(@as(c_int, 1638), indexSelectRows(16384, 262144, index_select_block_bytes));
+    try testing.expectEqual(@as(c_int, 410), indexSelectRows(16384, 1047488, index_select_block_bytes));
+    try testing.expectEqual(@as(c_int, 256), indexSelectRows(16384, 1 << 22, index_select_block_bytes));
+    try testing.expectEqual(@as(c_int, 100), indexSelectRows(100, 1 << 22, index_select_block_bytes));
     var kd: xk.Diag = .{};
     var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
     defer reg.deinit();
-    try testing.expectEqual(@as(c_int, 256), index_select_rows);
     const c = try realConfig();
     const rt: Routes = .{ .prefill_index = true, .selected_keys = true };
     var l: usize = 0;
     while (!c.layers[l].index_source) l += 1;
     const li = c.layers[l];
-    for ([_]bool{ false, true }) |recording| {
-        var g = TraceOps.init(testing.allocator);
-        defer g.deinit();
-        var p: TraceProbe = .{ .a = testing.allocator };
-        defer p.deinit();
-        var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &.{});
-        defer k.deinit(&g);
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &.{});
+    defer k.deinit(&g);
+    // A 600-row served call at its own N (300 positions) is far under the budget: the one launch, no eval.
+    {
         const w = try traceLayerW(&g, &c, li);
         const inv = try Tr.yarnInvFreq(&g, &c);
         var cache = Tr.Cache.init(li, c.window, .{});
@@ -4323,23 +4339,27 @@ test "dsv41 graph: IDX_CHUNKED_SELECT: a 600-row prefill call scores and selects
         var shared: Tr.Share = .{};
         const n0 = g.nodes.items.len;
         const e0 = g.evals.items.len;
-        const x = try g.input(&.{ 1, 600, 5120 }, .float32);
-        const pos = try g.arange(0, 600, 1, .int32);
-        if (recording) {
-            _ = try Tr.attention(&g, &p, &c, &rt, k.at(l), li, &w, inv, x, pos, &cache, &shared);
-        } else {
-            _ = try Tr.attention(&g, NoProbe{}, &c, &rt, k.at(l), li, &w, inv, x, pos, &cache, &shared);
-        }
+        _ = try Tr.attention(&g, NoProbe{}, &c, &rt, k.at(l), li, &w, inv, try g.input(&.{ 1, 600, 5120 }, .float32), try g.arange(0, 600, 1, .int32), &cache, &shared);
         var launches: usize = 0;
         for (g.nodes.items[n0..]) |nd| launches += @intFromBool(nd.op == .kernel);
-        const n_comp: c_int = @divTrunc(@as(c_int, 600), @as(c_int, @intCast(li.ratio)));
-        // 600 rows: blocks of 256, 256 and 88, each a score launch and a select launch (one node per output: the
-        // score, the selection and the mask), each block evaluated.
-        try testing.expectEqual(@as(usize, if (recording) 3 else 9), launches);
-        try testing.expectEqual(@as(usize, if (recording) 0 else 3), g.evals.items.len - e0);
-        try testing.expectEqualSlices(c_int, &.{ 1, 600, @min(n_comp, @as(c_int, @intCast(c.index_topk))) }, g.shapeOf(shared.selected_idx.?).slice());
-        try testing.expectEqualSlices(c_int, &.{ 1, 600, n_comp }, g.shapeOf(shared.topk_mask.?).slice());
-        if (recording) try expectStage(&g, &p, "attn.index_score", &.{ 1, 600, n_comp }, .float32);
+        try testing.expectEqual(@as(usize, 3), launches); // the score, the selection and the mask
+        try testing.expectEqual(@as(usize, 0), g.evals.items.len - e0);
+    }
+    // The blocked path on the kernels' own launches (rows forced to 256): 600 rows are blocks of 256, 256 and 88.
+    {
+        const lk = k.at(l);
+        const ix = .{ .score = lk.idx_score.?, .topk = lk.index_topk.? };
+        const n: c_int = 300;
+        const n0 = g.nodes.items.len;
+        const e0 = g.evals.items.len;
+        const sel = try Tr.selectChunked(&g, &c, ix, try g.input(&.{ 1, 600, 32, 128 }, .float32), try g.input(&.{ 1, n, 128 }, .bfloat16), try g.input(&.{ 1, 600, 32 }, .float32), try g.arange(0, 600, 1, .int32), n, null, false, 256);
+        var launches: usize = 0;
+        for (g.nodes.items[n0..]) |nd| launches += @intFromBool(nd.op == .kernel);
+        try testing.expectEqual(@as(usize, 9), launches);
+        try testing.expectEqual(@as(usize, 3), g.evals.items.len - e0);
+        try testing.expectEqualSlices(c_int, &.{ 1, 600, n }, g.shapeOf(sel.mask).slice());
+        try testing.expectEqualSlices(c_int, &.{ 1, 600, @min(n, @as(c_int, @intCast(c.index_topk))) }, g.shapeOf(sel.idx.?).slice());
+        try testing.expect(sel.cand == null);
     }
     try testing.expect(!recordsScores(NoProbe) and !recordsScores(*const NoProbe) and recordsScores(*TraceProbe));
 }
@@ -4396,7 +4416,7 @@ test "dsv41 smoke 0b: IDX_CHUNKED_SELECT: blocked selects equal the one launch b
         .{ .rows = 40, .block = 64, .source = false, .consumer = false }, // under one block
         .{ .rows = 150, .block = 64, .source = false, .consumer = true },
         .{ .rows = 150, .block = 64, .source = true, .consumer = false },
-        .{ .rows = 300, .block = index_select_rows, .source = false, .consumer = true },
+        .{ .rows = 300, .block = index_select_min_rows, .source = false, .consumer = true },
     }, 0..) |cs, case_i| {
         const S = cs.rows;
         const m0 = g.mark();
