@@ -361,11 +361,8 @@ pub const PrefillBill = struct {
 
     /// The model's chunk for a prompt of `seq` tokens (`resolvePrefillChunk` at its default target).
     pub fn chunkRows(b: PrefillBill, seq: u64) u64 {
-        const n_comp = if (b.min_ratio > 0) seq / b.min_ratio else 0;
-        const per_row = b.n_heads * (seq + n_comp) * 4;
-        if (per_row == 0) return seq;
-        const chunk: u64 = @intFromFloat(@floor(chunk_target_bytes / @as(f64, @floatFromInt(per_row))));
-        return @max(1, @min(chunk, seq));
+        // The served tier's span (`kvc.servedSpanRows`: the module's rule, one function).
+        return kvc.servedSpanRows(b.n_heads, b.selected_keys, b.min_ratio, seq, chunk_target_bytes);
     }
 
     /// The widest wave of a chunk of `rows` whose attention reads `positions` positions: the rows' arrays, the

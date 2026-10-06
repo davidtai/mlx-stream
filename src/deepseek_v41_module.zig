@@ -1243,7 +1243,7 @@ pub const Module = struct {
         // sub-chunk calls pin theirs: a short turn after a long conversation scores every position, so its own length's
         // rule (a 3,952-row span at the knee) would hold an index score of span x positions (33 GB at 1M).
         const tier = &self.model.tier;
-        st.span_chunk = kvc.resolvePrefillChunk(&self.model.c, ids.len, tier.prefill_chunk, tier.chunk_target_bytes);
+        st.span_chunk = kvc.resolvePrefillChunkFor(&self.model.c, ids.len, tier.prefill_chunk, tier.chunk_target_bytes, tier.routes.selected_keys);
         defer if (self.state) |*s| {
             s.span_chunk = null;
         };
@@ -1304,7 +1304,7 @@ pub const Module = struct {
     fn prefillSubCalls(self: *Module, ids: []const u32) !mlx.mlx_array {
         const st = &self.state.?;
         const tier = &self.model.tier;
-        const span = kvc.resolvePrefillChunk(&self.model.c, ids.len, tier.prefill_chunk, tier.chunk_target_bytes);
+        const span = kvc.resolvePrefillChunkFor(&self.model.c, ids.len, tier.prefill_chunk, tier.chunk_target_bytes, tier.routes.selected_keys);
         const calls = try kvc.prefillSubCalls(self.gpa, @intCast(ids.len), @intCast(span), self.prefill_sub);
         defer self.gpa.free(calls);
         st.span_chunk = span;
@@ -2652,7 +2652,8 @@ test "dsv41 module: the prefill bill covers the served prompt forwards' waves on
     try std.testing.expect(wave_n[1] <= bill_mod.wire_arrays_prompt_wave);
     // The bill's chunk is the model's.
     for ([_]u64{ 1, 8, 64, 953, 2048, 4096, 16384, 65536, 131072 }) |sq|
-        try std.testing.expectEqual(@as(u64, @intCast(kvc.resolvePrefillChunk(&c, sq, null, kvc.default_chunk_target_bytes))), bill.chunkRows(sq));
+        // The bill's span is the served tier's (`kvc.servedSpanRows`, the module's rule): the stock span up to 16,384.
+        try std.testing.expectEqual(@as(u64, @intCast(kvc.resolvePrefillChunkFor(&c, sq, null, kvc.default_chunk_target_bytes, true))), bill.chunkRows(sq));
     inline for (.{ .stock, .served }) |t| std.debug.print("\nDSV41_PREFILL_BILL {{\"tier\": \"{t}\", \"gate_64_32\": {d}, \"cell_16384_1024\": {d}, \"cell_wave\": {d}}}", .{ @as(v41.PrefillBill.Tier, t), bill.bytes(64, 32, t), bill.bytes(16384, 1024, t), bill.waveBytes(bill.chunkRows(16384), 16384, t) });
 }
 

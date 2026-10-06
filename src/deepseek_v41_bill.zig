@@ -2308,7 +2308,9 @@ test "dsv41 memory: a prompt up to the sub-chunk bills its one call byte for byt
         try testing.expect(promptWave(pb, true, true, n) < pb.layerMajorWaveBytes(n, .served));
         try testing.expectEqual(pb.joinedBytes(rows), cacheOvershootPrompt(pb, n));
     }
-    try testing.expectEqual(@as(u64, 16303), pb.promptCallRows(131072));
+    // The served span past 16K is 953 rows (`kvc.servedSpanRows`): 17 spans a call, 16,201 rows (the stock 119-row span
+    // made 16,303).
+    try testing.expectEqual(@as(u64, 16201), pb.promptCallRows(131072));
     // The one-call route (the proof cell's control, `RouteOverrides.prefill_sub` maxInt): the single wave at any length.
     const one = try prefillBillAt(&config, .{ .prefill_sub = std.math.maxInt(u64) }, &c, 4);
     try testing.expectEqual(one.layerMajorWaveBytes(131072, .served), promptWave(one, true, true, 131072));
@@ -2440,7 +2442,9 @@ test "dsv41 memory: the derived routed group: its terms at 16K and 256K, the res
     for ([_]u64{ 6_160_000_000, 6_190_000_000, 6_190_000_000 }) |m| try testing.expect(billed16 >= m and billed16 - m <= 1_700_000_000);
     // 256K: the first sub-call (16,343 rows in 277 chunks of 59, its attention over its own 16,343 positions).
     const n256: u32 = 262144;
-    const span = pb.chunkRows(n256);
+    // pass3ep ran the stock span (59 rows at 256K); the served span is 953 since (`kvc.servedSpanRows`). The measured
+    // intercept is that geometry's.
+    const span: u64 = 59;
     try testing.expectEqual(@as(u64, 59), span);
     const calls = try kvc.prefillSubCalls(testing.allocator, n256, span, pb.prefill_sub);
     defer testing.allocator.free(calls);
@@ -2471,14 +2475,30 @@ test "dsv41 memory: the derived routed group: its terms at 16K and 256K, the res
     }
 }
 
-test "dsv41 bill: IDX_CHUNKED_SELECT never engages on the served K16 prompt pass: every chunk keeps the one launch (no bank)" {
-    // The indexer launches per K16 chunk; the served chunk rule's span at every context up to 1M, over every compressed
-    // position read, sits under the block budget: indexSelectRows returns the chunk's own rows. The kept selection is
-    // the call's rows x positions at kvc.selection_pos_bytes (5), bounded by the call area.
+test "dsv41 bill: the served K16 span: the stock span up to 16,384 byte for byte, 953 rows past it, IDX_CHUNKED_SELECT where a chunk's score passes its budget (no bank)" {
     const c = try realConfig();
     try testing.expectEqual(@as(u64, 5), kvc.selection_pos_bytes);
-    for ([_]u64{ 16384, 131072, 262144, 524288, 1048576 }) |seq| {
-        const span: u64 = @intCast(kvc.resolvePrefillChunk(&c, seq, null, kvc.default_chunk_target_bytes));
-        try testing.expectEqual(@as(c_int, @intCast(span)), graph.indexSelectRows(@intCast(span), @intCast(seq), graph.index_select_block_bytes));
+    // Every prompt up to the standard cell keeps the stock rule's span (the 16K headline does not move).
+    var s: u64 = 1;
+    while (s <= 16384) : (s += if (s < 4096) 1 else 7) {
+        const stock: u64 = @intCast(kvc.resolvePrefillChunk(&c, s, null, kvc.default_chunk_target_bytes));
+        try testing.expectEqual(stock, @as(u64, @intCast(kvc.resolvePrefillChunkFor(&c, s, null, kvc.default_chunk_target_bytes, true))));
     }
+    try testing.expectEqual(@as(i64, 953), kvc.resolvePrefillChunkFor(&c, 16384, null, kvc.default_chunk_target_bytes, true));
+    // Past it: 953 rows (the stock rule's: 119 at 128K, 59 at 256K, 29 at 512K, 14 at 1M); the stock tier keeps its own.
+    for ([_][3]u64{ .{ 131072, 953, 119 }, .{ 262144, 953, 59 }, .{ 524288, 953, 29 }, .{ 1048576, 953, 14 } }) |x| {
+        try testing.expectEqual(@as(i64, @intCast(x[1])), kvc.resolvePrefillChunkFor(&c, x[0], null, kvc.default_chunk_target_bytes, true));
+        try testing.expectEqual(@as(i64, @intCast(x[2])), kvc.resolvePrefillChunkFor(&c, x[0], null, kvc.default_chunk_target_bytes, false));
+        // The served wave's own span stays wider (the floor binds): its score-sized rows under the 8 GB target.
+        try testing.expect(8e9 / @as(f64, @floatFromInt(64 * 641 * 4 + 4 * x[0])) >= 953);
+    }
+    // The bill reads the same rule.
+    const ov: module.RouteOverrides = .{};
+    const pb = try prefillBillAt(&.{}, ov, &c, 4);
+    for ([_]u64{ 16384, 131072, 262144, 524288, 1048576 }) |n|
+        try testing.expectEqual(@as(u64, @intCast(kvc.resolvePrefillChunkFor(&c, n, null, kvc.default_chunk_target_bytes, true))), pb.chunkRows(n));
+    // The indexer launch per chunk: one launch while 5 x 953 x N fits the 2 GiB block budget (N <= 450,700), blocks past it.
+    try testing.expectEqual(@as(c_int, 953), graph.indexSelectRows(953, 262144, graph.index_select_block_bytes));
+    try testing.expect(graph.indexSelectRows(953, 524288, graph.index_select_block_bytes) < 953);
+    try testing.expect(graph.indexSelectRows(953, 1048576, graph.index_select_block_bytes) < 953);
 }

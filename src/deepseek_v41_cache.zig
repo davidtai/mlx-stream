@@ -303,6 +303,48 @@ pub fn resolvePrefillChunk(c: *const v41.Config, s: u64, explicit: ?i64, target_
     return @intCast(@max(1, @min(chunk, s)));
 }
 
+/// The served tier's K16 span (attention over the selected keys, `routes.selected_keys`): the chunk the served wave
+/// holds under `target_bytes`, never narrower than the standard 16,384-token prompt's span under the stock rule.
+/// The stock rule (`resolvePrefillChunk`) budgets the full-score attention row [H, s + s / ratio] f32, an array the
+/// served tier never builds; its span falls as 1 / s (59 rows at 256K, 14 at 1M), so the K16 pass's chunks, each a
+/// graph build and a fence per layer, grow as s^2 (pass3ew: 512K and 1M ran ~10-13x slower per token at equal depth
+/// than 256K and missed the 6,000 s limit). The served chunk's score-sized arrays per row: the attention's
+/// [H, selected_keys + 1] f32 (`PrefillBill.waveBytes`, served) and the indexer's score over every position read,
+/// 4 B a position (IDX_CHUNKED_SELECT bounds a chunk's at its block budget). Its span is
+///   min(target / (H (selected_keys + 1) 4 + 4 s), max(stock(s), stock(16,384)))
+/// so every prompt up to 16,384 keeps the stock span byte for byte (the served-wave span is wider there), and a longer
+/// one keeps 16,384's span (953 rows) while the served wave allows it (~1,800 rows at 1M).
+pub fn servedSpanRows(n_heads: u64, selected_keys: u64, min_ratio: u64, s: u64, target_bytes: f64) u64 {
+    if (s == 0) return 0;
+    const t = @max(target_bytes, 1e9);
+    const stock = struct {
+        fn of(h: u64, r: u64, n: u64, tb: f64) u64 {
+            const per_row = h * (n + (if (r > 0) n / r else 0)) * 4;
+            if (per_row == 0) return n;
+            return @max(1, @min(@as(u64, @intFromFloat(@floor(tb / @as(f64, @floatFromInt(per_row))))), n));
+        }
+    }.of;
+    const floor_rows = @max(stock(n_heads, min_ratio, s, t), stock(n_heads, min_ratio, fill_span_prompt, t));
+    const served_per_row = n_heads * (selected_keys + 1) * 4 + 4 * s;
+    const served: u64 = @intFromFloat(@floor(t / @as(f64, @floatFromInt(served_per_row))));
+    return @max(1, @min(@min(served, floor_rows), s));
+}
+
+/// The prompt whose stock span the served rule keeps as its floor (the standard 16K cell's).
+pub const fill_span_prompt: u64 = 16384;
+
+/// `resolvePrefillChunk` at the tier's attention: the served span (`servedSpanRows`) when it attends the selected keys,
+/// else the stock rule.
+pub fn resolvePrefillChunkFor(c: *const v41.Config, s: u64, explicit: ?i64, target_bytes: f64, selected_keys: bool) i64 {
+    if (explicit) |e| return e;
+    if (!selected_keys) return resolvePrefillChunk(c, s, null, target_bytes);
+    var min_ratio: u64 = 0;
+    for (c.layers[0 .. c.n_layers + c.dspark.n_stages]) |li| {
+        if (li.ratio > 0 and (min_ratio == 0 or li.ratio < min_ratio)) min_ratio = li.ratio;
+    }
+    return @intCast(servedSpanRows(c.n_heads, @as(u64, c.window) + c.index_topk, min_ratio, s, target_bytes));
+}
+
 /// The query spans of a forward over `s` tokens (`[start, end)` pairs).
 pub fn prefillSpans(a: std.mem.Allocator, s: u32, chunk: i64) ![][2]u32 {
     if (chunk <= 0 or chunk >= s) {

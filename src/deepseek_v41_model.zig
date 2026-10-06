@@ -611,7 +611,7 @@ pub fn Model(comptime G: type) type {
             var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
             defer arena.deinit();
             const a = if (n <= scratch_rows) fba.allocator() else arena.allocator();
-            const chunk = kvc.resolvePrefillChunk(&self.c, n, st.span_chunk orelse self.tier.prefill_chunk, self.tier.chunk_target_bytes);
+            const chunk = kvc.resolvePrefillChunkFor(&self.c, n, st.span_chunk orelse self.tier.prefill_chunk, self.tier.chunk_target_bytes, self.tier.routes.selected_keys);
             var hidden: T = undefined;
             var main: ?T = null;
             if (chunk <= 0 or chunk >= n) {
