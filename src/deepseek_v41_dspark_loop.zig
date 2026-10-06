@@ -2714,3 +2714,108 @@ test "dsv41 smoke 0b: the seed's row copy owns its rows and equals the view (MLX
     // The copy's data is its own buffer, not the source's (a view keeps the whole source alive).
     try testing.expect(mlx.mlx_array_data_float32(copy) != mlx.mlx_array_data_float32(view));
 }
+
+// Bank mode (host only, the trace backend; DSV41_BANK): the served layer-major prompt pass's first sub-call at a 524,288
+// lane capacity (the 512K request's bounded lanes), its writes into the kv sources' lanes judged as MLX runs them
+// (`TraceOps.lane_writes`: in place when no kept handle pins the lane's previous version, else a copy of the whole
+// lane). PASS: every lane write is in place (its chunk's rows), none copies a capacity-sized lane.
+test "dsv41 memory: the layer-major prompt pass writes each chunk's rows into the 512K bounded lanes in place, no whole-lane copy (bank, trace)" {
+    const bank = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var diag: v41.Diag = .{};
+    errdefer std.debug.print("dsv41 held: {s}\n", .{diag.message()});
+    const c = try v41.Config.load(a, io, bank, &diag);
+    const eng = @import("deepseek_v41_engram.zig");
+    const kvc = @import("deepseek_v41_cache.zig");
+    const bill_mod = @import("deepseek_v41_bill.zig");
+    const xkm = @import("exl3_kernels.zig");
+    var src = try eng.RowSource.open(a, io, bank, try std.fmt.allocPrint(aa, "{s}/engram-token-map.u32", .{bank}), &c, &diag);
+    defer src.deinit();
+    const spec = try std.mem.concat(aa, v41.Param, &.{ try v41.residentSpec(aa, &c), try v41.engramSpec(aa, &c) });
+    const n: u32 = 524288;
+    var tier = routes.served;
+    tier.layer_major = true;
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    g.track_live = true;
+    const lookup: mdl.SpecLookup = .{ .g = &g, .spec = spec };
+    var kd: xkm.Diag = .{};
+    var reg = try xkm.Registry.init(a, &xkm.embedded, xkm.manifest_sha256, &kd);
+    defer reg.deinit();
+    const model_ = try Loop(TraceOps).M.initWith(a, &g, c, tier, &lookup, &src, .{ .registry = &reg });
+    defer model_.deinit(&g);
+    const positions = bill_mod.billedPositions(n, bill_mod.fill_max_tokens);
+    var st = try model_.newStateWith(model_.boundedKv(@intCast(positions)));
+    defer st.deinit(&g, a);
+    const stand: graph.StandIn(TraceOps) = .{ .scale = try g.input(&.{@intCast(c.n_routed_experts)}, .float32) };
+    const span = kvc.resolvePrefillChunk(&c, n, null, kvc.default_chunk_target_bytes);
+    const calls = try kvc.prefillSubCalls(aa, n, @intCast(span), kvc.prefill_sub);
+    st.span_chunk = span;
+    const prompt = try aa.alloc(u32, calls[1][1]);
+    for (prompt, 0..) |*d, i| d.* = @intCast((i * 7919 + 11) % c.vocab_size);
+    // Two sub-calls: the second's first chunk writes over the lanes the first call left (its carried views released).
+    var lane_writes: usize = 0;
+    var copies: usize = 0;
+    for (calls[0..2], 0..) |cl, k| {
+        const w0 = g.lane_writes.items.len;
+        const r = try model_.forward(&g, &st, prompt[cl[0]..cl[1]], .{ .logits = .last, .main_hidden = true }, stand, graph.NoProbe{});
+        try Loop(TraceOps).M.fence(&g, &st, &.{ r.logits.?, r.main_hidden.? });
+        g.reset();
+        // The capacity lanes: writes into a buffer of at least an eighth of the capacity's rows and 4 MiB (the window
+        // and frontier rings are left out).
+        var n_w: usize = 0;
+        var n_c: usize = 0;
+        var in_place: u64 = 0;
+        var copied: u64 = 0;
+        var max_update: u64 = 0;
+        for (g.lane_writes.items[w0..]) |lw| {
+            const nd = g.nodes.items[lw.node];
+            if (nd.shape.n < 2 or nd.shape.d[1] < @as(c_int, @intCast(positions / 8)) or lw.full_bytes < (4 << 20)) continue;
+            n_w += 1;
+            max_update = @max(max_update, lw.update_bytes);
+            if (lw.pinned_by) |p| {
+                n_c += 1;
+                copied += lw.full_bytes;
+                if (n_c <= 4) {
+                    const pb = g.baseOf(p);
+                    std.debug.print("DSV41_LANE_COPY call={d} node={d} shape={any} src={d} pinned_by={d} (op {t}, base {d} op {t}) eval={d}\n", .{ k, lw.node, nd.shape.slice(), lw.src, p, g.nodes.items[p].op, pb, g.nodes.items[pb].op, lw.eval });
+                }
+            } else in_place += lw.update_bytes;
+        }
+        std.debug.print("DSV41_LANE_WRITES {{\"call\": {d}, \"capacity_positions\": {d}, \"span\": {d}, \"rows\": {d}, \"lane_writes\": {d}, \"in_place_bytes\": {d}, \"copies\": {d}, \"copied_bytes\": {d}, \"largest_update_bytes\": {d}}}\n", .{ k, positions, span, cl[1] - cl[0], n_w, in_place, n_c, copied, max_update });
+        lane_writes += n_w;
+        copies += n_c;
+    }
+    try testing.expect(lane_writes > 0);
+    try testing.expectEqual(@as(usize, 0), copies);
+}
+
+test "dsv41 memory: the trace judges a lane write in place unless a kept handle (or a kept view) pins the lane's previous version" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    g.track_live = true;
+    const L = @import("sdk_ext.zig").kv.Lanes(TraceOps);
+    var lane = L.Grow.init(256, 1024);
+    defer lane.deinit(&g);
+    try lane.append(&g, try g.input(&.{ 1, 8, 64 }, .bfloat16));
+    try g.evalAll(&.{lane.buf.?});
+    try lane.append(&g, try g.input(&.{ 1, 8, 64 }, .bfloat16));
+    try g.evalAll(&.{lane.buf.?});
+    // A kept view of the current version (a carried view, the pass3ds pin): the next write copies the whole lane.
+    const held = g.keep((try lane.view(&g)).?);
+    try lane.append(&g, try g.input(&.{ 1, 8, 64 }, .bfloat16));
+    try g.evalAll(&.{lane.buf.?});
+    g.release(held);
+    try lane.append(&g, try g.input(&.{ 1, 8, 64 }, .bfloat16));
+    try g.evalAll(&.{lane.buf.?});
+    const w = g.lane_writes.items;
+    try testing.expectEqual(@as(usize, 4), w.len);
+    try testing.expect(w[1].pinned_by == null and w[3].pinned_by == null);
+    try testing.expectEqual(held, w[2].pinned_by.?);
+    try testing.expectEqual(@as(u64, 8 * 64 * 2), w[1].update_bytes);
+    try testing.expectEqual(@as(u64, 1024 * 64 * 2), w[2].full_bytes);
+}

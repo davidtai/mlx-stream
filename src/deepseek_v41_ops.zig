@@ -1136,6 +1136,13 @@ pub const TraceOps = struct {
     track_live: bool = false,
     live_kept: std.AutoHashMapUnmanaged(T, i32) = .empty,
     slice_base: std.AutoHashMapUnmanaged(T, T) = .empty,
+    /// `track_live`: each `sliceUpdateDyn`'s source and update bytes, and at every `evalAll` each update built since
+    /// the previous one judged as MLX would run it: in place (the source's buffer donated: the update's bytes) when no
+    /// kept handle pins the source (itself or a view of it), else a copy of the whole source.
+    update_src: std.AutoHashMapUnmanaged(T, struct { src: T, bytes: u64 }) = .empty,
+    lane_writes: std.ArrayList(LaneWrite) = .empty,
+    last_eval_node: usize = 0,
+    pub const LaneWrite = struct { node: T, src: T, eval: usize, full_bytes: u64, update_bytes: u64, pinned_by: ?T };
     pub const Wait = struct { value: u64, n_deps: u32 };
 
     pub fn init(gpa: std.mem.Allocator) TraceOps {
@@ -1159,6 +1166,8 @@ pub const TraceOps = struct {
         g.launched.deinit(g.gpa);
         g.live_kept.deinit(g.gpa);
         g.slice_base.deinit(g.gpa);
+        g.update_src.deinit(g.gpa);
+        g.lane_writes.deinit(g.gpa);
     }
 
     /// The base array a view resolves to (itself when it is no slice).
@@ -1202,10 +1211,33 @@ pub const TraceOps = struct {
     }
 
     pub fn evalAll(g: *TraceOps, xs: []const T) !void {
+        if (g.track_live) try g.judgeUpdates();
         for (xs) |x| g.touch(x);
         try g.evals.append(g.gpa, g.nodes.items.len);
         try g.evaluated.appendSlice(g.gpa, xs);
     }
+    /// `track_live`: the updates built since the last eval, each in place or a whole-source copy (`lane_writes`).
+    fn judgeUpdates(g: *TraceOps) !void {
+        const to = g.nodes.items.len;
+        var i = g.last_eval_node;
+        while (i < to) : (i += 1) {
+            if (g.nodes.items[i].op != .slice_update) continue;
+            const u = g.update_src.get(@intCast(i)) orelse continue;
+            const src = g.baseOf(u.src);
+            var pinned: ?T = null;
+            var it = g.live_kept.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.* > 0 and g.baseOf(e.key_ptr.*) == src) {
+                    pinned = e.key_ptr.*;
+                    break;
+                }
+            }
+            const nd = g.nodes.items[i];
+            try g.lane_writes.append(g.gpa, .{ .node = @intCast(i), .src = src, .eval = g.evals.items.len, .full_bytes = @as(u64, @intCast(nd.shape.numel())) * dtypeSize(nd.dtype), .update_bytes = u.bytes, .pinned_by = pinned });
+        }
+        g.last_eval_node = to;
+    }
+
     pub fn keep(g: *TraceOps, x: T) T {
         if (g.track_live) {
             const e = g.live_kept.getOrPut(g.gpa, x) catch @panic("trace: out of memory");
@@ -1529,6 +1561,7 @@ pub const TraceOps = struct {
 
     /// A marker: the GPU would start on the arrays here.
     pub fn asyncEval(g: *TraceOps, xs: []const T) !void {
+        if (g.track_live) try g.judgeUpdates();
         const start = g.committed.items.len;
         try g.committed.appendSlice(g.gpa, xs);
         try g.commit_spans.append(g.gpa, .{ start, g.committed.items.len });
@@ -1777,7 +1810,9 @@ pub const TraceOps = struct {
         const us = g.shapeOf(update);
         if (ss.n != us.n or g.shapeOf(start).n != 1 or g.shapeOf(start).d[0] != us.n) return error.SliceUpdateShape;
         for (0..ss.n) |i| if (us.d[i] > ss.d[i]) return error.SliceUpdateShape;
-        return g.push(.slice_update, g.dtypeOf(src), ss);
+        const y = try g.push(.slice_update, g.dtypeOf(src), ss);
+        if (g.track_live) try g.update_src.put(g.gpa, y, .{ .src = src, .bytes = @as(u64, @intCast(us.numel())) * dtypeSize(g.dtypeOf(update)) });
+        return y;
     }
 
     pub fn concat(g: *TraceOps, xs: []const T, axis: c_int) !T {
