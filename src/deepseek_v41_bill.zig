@@ -549,8 +549,21 @@ pub fn joinlessRoute(ov: module.RouteOverrides) bool {
 
 /// The arch's prefill bill at the routes `billAt` bills, with `group_streams` live K16 streams (no bank: host-testable).
 pub fn prefillBillAt(config: *const settings.Config, ov: module.RouteOverrides, c: *const v41.Config, group_streams: u64) !v41.PrefillBill {
-    const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = v41.PrefillBill.wide_base_calls };
-    return v41.PrefillBill.of(c, try module.ringGeometry(config, ov)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinlessRoute(ov)) shape else null).withGroupStreams(group_streams).withInputRelease(module.prefillInputRelease(ov)).withPrefillSub(module.prefillSub(ov, config.dsv41LayerMajor()));
+    const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = v41.PrefillBill.wide_base_calls, .inflight = exl3.PrefillShape.tier.inflight };
+    const expert_bf16 = config.dsv41ExpertBf16();
+    return v41.PrefillBill.of(c, try module.ringGeometry(config, ov)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinlessRoute(ov)) shape else null).withGroupStreams(group_streams).withInputRelease(module.prefillInputRelease(ov)).withPrefillSub(module.prefillSub(ov, config.dsv41LayerMajor())).withDerivedGroup(derivedGroupRoute(config, ov), if (expert_bf16) 2 else 4);
+}
+
+/// The routes `PrefillBill.groupTerms` is derived from, as the Module installs them (`Module.init`: the tier's route, an
+/// override, then the model setting): JOINLESS, the bf16 expert outputs (eabf0de), the all-bf16 HC post (c2600ad), the
+/// compiled shared middle (ab4058d), and the DSpark taps in their chunk fences (ee80e40). Any other route keeps the
+/// streams bound (its group allocates arrays the derivation does not count: the joined copy, the region's f32 casts,
+/// the shared chain's f32 intermediates, a tap's held stream).
+pub fn derivedGroupRoute(config: *const settings.Config, ov: module.RouteOverrides) bool {
+    const routes = module.numericTier(config.numeric_tier orelse .served).routes;
+    const hcpost = config.kv16_hcpost orelse ov.prefill_hcpost orelse routes.prefill_hcpost;
+    const shared_mid = config.prefill_shared_mid orelse ov.prefill_shared_mid orelse routes.prefill_shared_mid;
+    return model_taps_fenced and joinlessRoute(ov) and config.dsv41ExpertBf16() and hcpost and shared_mid;
 }
 
 /// The prompt pass's largest single buffer: the routed group's joined input (`PrefillBill.joinedBytes`, the minimal
@@ -2137,10 +2150,13 @@ test "dsv41 memory: the prompt wave, KV lanes, overshoots and posted gathers at 
     // What every served cell of 10-02..10-04 billed (deepseek_v41_bill_receipts_test.zig) at the 16K request, 13,868,806,049 B,
     // with the f32 stream; kv16's bf16 kept streams, h1 and moe_in bill 1,509,949,440 B less (16384 x 92,160 B), and its
     // bf16 DSpark main taps (three target layers, `mainOf` returns the stream's dtype) 503,316,480 B less (3 x 16384 x 10,240 B).
-    var pb32 = pb;
+    // (Those receipts billed the group by its streams bound: `withDerivedGroup(false, ..)`.)
+    var pb32 = pb.withDerivedGroup(false, 4);
     pb32.stream_bytes = 4;
     try testing.expectEqual(@as(u64, 13_868_806_049), promptWave(pb32, config.dsv41LayerMajor(), joinlessRoute(ov), fill_prompt_tokens));
-    try testing.expectEqual(@as(u64, 13_868_806_049 - 1_509_949_440 - 503_316_480), promptWave(pb, config.dsv41LayerMajor(), joinlessRoute(ov), fill_prompt_tokens));
+    try testing.expectEqual(@as(u64, 13_868_806_049 - 1_509_949_440 - 503_316_480), promptWave(pb.withDerivedGroup(false, 4), config.dsv41LayerMajor(), joinlessRoute(ov), fill_prompt_tokens));
+    // The derived group (`PrefillBill.groupTerms`, the served routes): the 16K wave 11,855,540,129 -> 6,130,702,289 B.
+    try testing.expectEqual(@as(u64, 6_130_702_289), promptWave(pb, config.dsv41LayerMajor(), joinlessRoute(ov), fill_prompt_tokens));
     // kv16: the window ring and the compressed rows bf16 (those receipts billed them f32: 355,600,384 / 202,592,256); the
     // index keys and the compressor frontier stay f32.
     std.debug.print("\nDSV41_KV16_KV {{\"prompt\": {d}, \"decode\": {d}}}\n", .{ pb.kvPromptBytes(fill_prompt_tokens, positions), pb.kvDecodeBytes(fill_prompt_tokens, positions) });
@@ -2153,13 +2169,16 @@ test "dsv41 memory: the prompt wave, KV lanes, overshoots and posted gathers at 
     try testing.expectEqual(@as(u64, 847_872), dsl.seedRetainedBytes(&c, fill_prompt_tokens));
     // The decode overshoot is the traced lane until the bill's own largest lane passes it (a long request).
     try testing.expect(cacheOvershootDecode(pb, 1 << 20) == pb.laneMaxBytes(1 << 20) and pb.laneMaxBytes(1 << 20) > cache_overshoot_decode_traced);
-    // The routes that move the wave: the joined copy without JOINLESS, chunk-major's x 5/4, fewer live K16 streams.
+    // The routes that move the wave: the joined copy without JOINLESS, chunk-major's x 5/4, fewer live K16 streams (the
+    // streams bound's; the derived group holds no stream beyond the kept one, so the variants bill it alike).
     const lm = promptWave(pb, true, true, fill_prompt_tokens);
-    try testing.expect(promptWave(pb, true, false, fill_prompt_tokens) > lm);
+    try testing.expect(promptWave(pb.withDerivedGroup(false, 4), true, false, fill_prompt_tokens) > promptWave(pb.withDerivedGroup(false, 4), true, true, fill_prompt_tokens));
     try testing.expectEqual(pb.waveBytes(pb.chunkRows(fill_prompt_tokens), fill_prompt_tokens, .served) / 4 * 5, promptWave(pb, false, true, fill_prompt_tokens));
-    const two = promptWave(try prefillBillAt(&config, ov, &c, 2), true, true, fill_prompt_tokens);
-    const one = promptWave(try prefillBillAt(&config, ov, &c, 1), true, true, fill_prompt_tokens);
-    try testing.expect(one < two and two < lm);
+    const four_s = promptWave(pb.withDerivedGroup(false, 4), true, true, fill_prompt_tokens);
+    const two_s = promptWave((try prefillBillAt(&config, ov, &c, 2)).withDerivedGroup(false, 4), true, true, fill_prompt_tokens);
+    const one_s = promptWave((try prefillBillAt(&config, ov, &c, 1)).withDerivedGroup(false, 4), true, true, fill_prompt_tokens);
+    try testing.expect(one_s < two_s and two_s < four_s);
+    try testing.expectEqual(lm, promptWave(try prefillBillAt(&config, ov, &c, 1), true, true, fill_prompt_tokens));
     // The posted gathers need K16 and the route.
     try testing.expect(!engramPostedRoute(&.{ .layer_major_prefill = false }, ov, &c));
     try testing.expect(!engramPostedRoute(&config, .{ .engram_posted = false }, &c));
@@ -2312,11 +2331,97 @@ test "dsv41 memory: the default served bill's wave covers every prompt length 1 
         if (n > 1 and pb.chunkRows(n) != pb.chunkRows(n - 1)) breakpoints += 1;
     }
     // The worst length is a covered one, its wave the covering wave. With the 5 MiB attention row the knee's one call
-    // bound it (23.28 GB at 3,953); with the bank trace's 2 MiB row (`PrefillBill.attn_row_bytes`) the attention side no
-    // longer binds at the knee and the 16,384 length's routed group does.
+    // bound it (23.28 GB at 3,953); with the bank trace's 2 MiB row (`PrefillBill.attn_row_bytes`) the 16,384 length's
+    // routed group did under the streams bound (11.86 GB); with the derived group (6.13 GB at 16,384) the knee's
+    // one-call attention side binds again.
     try testing.expect(worst_n == knee or worst_n == knee + 1 or worst_n == fill_prompt_tokens);
     try testing.expectEqual(worst, billed);
     try testing.expect(breakpoints > 100);
-    try testing.expectEqual(promptWave(pb, true, true, fill_prompt_tokens), billed);
+    try testing.expect(worst_n == knee or worst_n == knee + 1);
+    const kt = pb.layerMajorWaveTerms(worst_n, pb.chunkRows(worst_n), worst_n, .served);
+    try testing.expect(kt.attn > kt.group and kt.attn > kt.final_eval);
+    try testing.expectEqual(@as(u64, 6_130_702_289), promptWave(pb, true, true, fill_prompt_tokens));
+    try testing.expectEqual(@as(u64, 10_365_850_005), billed);
     std.debug.print("\nDSV41_DEFAULT_COVERING {{\"knee\": {d}, \"worst_length\": {d}, \"covering_wave\": {d}, \"wave_16384\": {d}, \"breakpoints\": {d}}}\n", .{ knee, worst_n, billed, promptWave(pb, true, true, fill_prompt_tokens), breakpoints });
+}
+
+// The derived routed group (`PrefillBill.groupTerms`) at the served routes against the measured prompt transients: the
+// 16K hostmem cells (MLX peak over constructed 6.16 / 6.19 / 6.19 GB: hm-20261005-152111, -154513, -172914) and the 256K
+// trace's first sub-call (tr-20261005-193033: the per-call peak intercept at k = 0, 80.44 GB over constructed 72.08 GB; its
+// first window's own peak 80.57 GB). Each measurement holds the request's KV and posted gathers beside the wave, so the
+// residual is the billed wave plus those two billed terms (as the runs printed them: kv 515,792,896 / 1,472,485,376 B,
+// engram_posted 106,954,752 / 112,457,856 B) less the measured transient.
+test "dsv41 memory: the derived routed group: its terms at 16K and 256K, the residual against the measured transients (no bank)" {
+    const c = try realConfig();
+    const config: settings.Config = .{};
+    const ov: module.RouteOverrides = .{};
+    try testing.expect(derivedGroupRoute(&config, ov));
+    const pb = try prefillBillAt(&config, ov, &c, 4);
+    try testing.expect(pb.derived_group and pb.expert_out_bytes == 2 and pb.moe_inter == 2304);
+    // Off the routes it is derived from, the streams bound: f32 expert outputs, the compiled HC post region, the shared
+    // op chain, the joined copy.
+    try testing.expect(!derivedGroupRoute(&.{ .kv16_expert_bf16 = false }, ov));
+    try testing.expect(!derivedGroupRoute(&.{ .kv16_hcpost = false }, ov));
+    try testing.expect(!derivedGroupRoute(&.{ .prefill_shared_mid = false }, ov));
+    try testing.expect(!derivedGroupRoute(&config, .{ .prefill_joinless = false }));
+    try testing.expect(!(try prefillBillAt(&.{ .kv16_expert_bf16 = false }, ov, &c, 4)).derived_group);
+    // The formula at the 16K one-call prompt (16,384 rows, 18 chunks of 953; d 5120, E 384, k 6, I 2304, bf16 stream and
+    // outputs; g_rows = 16,384 under the 65,104-row cap; L1's waves: 2 in flight of 7,168 rows, or one solo of g_rows).
+    const d: u64 = 5120;
+    const r: u64 = 16384;
+    const gt = pb.groupTerms(r, 953);
+    try testing.expectEqual(r * (d * 4 + 7 * 384 * 4 + 9 * 6 * 4 + 8) + 18 * 384 * d * 4, gt.router);
+    try testing.expectEqual(r * d * 2, gt.cat_xf);
+    try testing.expectEqual(r * 6 * 4, gt.cat_idx);
+    try testing.expectEqual(r * (3 * 2304 * 2 + d * 2 + d * 4), gt.shared);
+    try testing.expectEqual(r * 6 * d * 2, gt.routed);
+    try testing.expectEqual(@max(2 * 7168, r) * (2 * d * 2 + 2 * 2304 * 4 + 2304 * 2 + d * 4 + 8), gt.waves);
+    // JOINLESS's copy at bf16: at most 86 outputs (48 + 27 + 9 + 2), the smallest 63 merged.
+    try testing.expectEqual(std.math.divCeil(u64, r * 6 * d * 2 * 63, 86) catch unreachable, gt.merge);
+    try testing.expectEqual(r * 6 * 2 * 4, gt.loc);
+    try testing.expectEqual(r * d * 4, gt.combine);
+    try testing.expectEqual(r * d * 2, gt.cast);
+    // The final evaluation binds (its combines over the routed call's waves): 3.80 GB against the streams bound's 9.53.
+    const t16 = pb.layerMajorWaveTerms(r, 953, r, .served);
+    try testing.expectEqual(gt.routedCall(), t16.group);
+    try testing.expectEqual(gt.finalEval(), t16.final_eval);
+    try testing.expectEqual(@as(u64, 3_610_247_168), t16.group);
+    try testing.expectEqual(@as(u64, 3_803_060_177), t16.final_eval);
+    try testing.expectEqual(@as(u64, 9_527_898_017), pb.withDerivedGroup(false, 4).layerMajorWaveTerms(r, 953, r, .served).group);
+    try testing.expectEqual(@as(u64, 6_130_702_289), t16.total());
+    try testing.expectEqual(@as(u64, 11_855_540_129), pb.withDerivedGroup(false, 4).layerMajorWaveTerms(r, 953, r, .served).total());
+    // 16K: billed 6,753,449,937 B against 6.16 / 6.19 / 6.19 GB measured: residual 0.59 / 0.56 / 0.56 GB.
+    const billed16 = t16.total() + 515_792_896 + 106_954_752;
+    for ([_]u64{ 6_160_000_000, 6_190_000_000, 6_190_000_000 }) |m| try testing.expect(billed16 >= m and billed16 - m <= 1_000_000_000);
+    // 256K: the first sub-call (16,343 rows in 277 chunks of 59, its attention over its own 16,343 positions).
+    const n256: u32 = 262144;
+    const span = pb.chunkRows(n256);
+    try testing.expectEqual(@as(u64, 59), span);
+    const calls = try kvc.prefillSubCalls(testing.allocator, n256, span, pb.prefill_sub);
+    defer testing.allocator.free(calls);
+    try testing.expectEqual(@as(usize, 17), calls.len); // 16 of 16,343 rows and the last 656
+    const r0: u64 = calls[0][1] - calls[0][0];
+    try testing.expectEqual(@as(u64, 16343), r0);
+    const t256 = pb.layerMajorWaveTerms(r0, span, calls[0][1], .served);
+    const gt256 = pb.groupTerms(r0, span);
+    // The router's per-chunk f32 gate copies: 277 x 7,864,320 B = 2.18 GB of its 2.69 GB (0.14 GB at 16K's 18 chunks).
+    try testing.expectEqual(r0 * (d * 4 + 7 * 384 * 4 + 9 * 6 * 4 + 8) + 277 * 384 * d * 4, gt256.router);
+    try testing.expectEqual(@as(u64, 5_830_756_362), t256.final_eval);
+    try testing.expectEqual(@as(u64, 8_151_903_623), t256.total());
+    try testing.expectEqual(@as(u64, 11_825_202_272), pb.withDerivedGroup(false, 4).layerMajorWaveTerms(r0, span, calls[0][1], .served).total());
+    // Billed 9,736,846,855 B against the intercept's 8.36 GB: residual 1.38 GB (1.25 against the window's 80.57 GB peak).
+    // Over the 1 GB aim; never under. Of it, the bill's KV term (1.47 GB) sits >= 0.26 GB over the KV the trace kept at
+    // rest after the call (73.29 - 72.08 GB), and the 277 gate copies are the term a device read-out would have to confirm.
+    const billed256 = t256.total() + 1_472_485_376 + 112_457_856;
+    try testing.expect(billed256 >= 80_570_000_000 - 72_080_000_000);
+    try testing.expectEqual(@as(u64, 1_376_846_855), billed256 - (80_440_000_000 - 72_080_000_000));
+    // The read-out (the group's terms at 16K, 128K and 256K's widest / first call; the 128K sub-call: 16,303 rows of 119).
+    for ([_]u32{ 16384, 131072, 262144 }) |seq| {
+        const sp = pb.chunkRows(seq);
+        const rows = pb.promptCallRows(seq);
+        const g = pb.groupTerms(rows, sp);
+        const t = pb.layerMajorWaveTerms(rows, sp, rows, .served);
+        const old = pb.withDerivedGroup(false, 4).layerMajorWaveTerms(rows, sp, rows, .served);
+        std.debug.print("\nDSV41_GROUP_DERIVED {{\"seq\": {d}, \"rows\": {d}, \"span\": {d}, \"router\": {d}, \"cat_xf\": {d}, \"cat_idx\": {d}, \"shared\": {d}, \"routed\": {d}, \"waves\": {d}, \"merge\": {d}, \"loc\": {d}, \"combine\": {d}, \"cast\": {d}, \"group\": {d}, \"final_eval\": {d}, \"old_group\": {d}, \"old_final_eval\": {d}, \"wave\": {d}, \"old_wave\": {d}}}\n", .{ seq, rows, sp, g.router, g.cat_xf, g.cat_idx, g.shared, g.routed, g.waves, g.merge, g.loc, g.combine, g.cast, t.group, t.final_eval, old.group, old.final_eval, t.total(), old.total() });
+    }
 }

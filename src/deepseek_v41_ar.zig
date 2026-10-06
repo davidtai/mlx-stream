@@ -2997,8 +2997,9 @@ test "dsv41 bill: the default served bill covers every prompt up to 16,384; the 
     }
     const pinned = try bill_mod.servedBill(a, testing.io, &config, null, ceiling, .{ .bill_pinned_prompt = 16384 });
     // The 16K wave of the 10-02..10-04 receipts (13,868,806,049 B, f32 streams) less kv16's bf16 kept streams, h1, moe_in,
-    // and its bf16 DSpark main taps.
-    try testing.expectEqual(@as(u64, 13_868_806_049 - 1_509_949_440 - 503_316_480), pinned.prefill_wave);
+    // and its bf16 DSpark main taps (11,855,540,129 B), with the derived routed group (`PrefillBill.groupTerms`) in place
+    // of the streams bound: 6,130,702,289 B.
+    try testing.expectEqual(@as(u64, 6_130_702_289), pinned.prefill_wave);
     const exact = try bill_mod.billAt(a, testing.io, &config, 16384, bill_mod.fill_max_tokens, null, ceiling, .{});
     try testing.expectEqual(exact.prefillTotal(), pinned.prefillTotal());
     try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());
@@ -3103,8 +3104,11 @@ test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselin
         for ([_]u64{ 16384, 32768, 65536, 131072 }) |n| for ([_]u64{ n, pb.promptCallRows(n) }, 0..) |rows, k| {
             if (k == 1 and rows == n) continue;
             const w = pb.layerMajorWaveTerms(rows, pb.chunkRows(n), n, .served);
-            std.debug.print("DSV41_WAVE_TERMS {{\"positions\": {d}, \"rows\": {d}, \"span\": {d}, \"kept_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"selection_gb\": {d:.3}, \"attn_gb\": {d:.3}, \"group_gb\": {d:.3}, \"final_eval_gb\": {d:.3}, \"released_gb\": {d:.3}, \"total_gb\": {d:.3}, \"overshoot_gb\": {d:.3}}}\n", .{
+            // The derived group's terms (`PrefillBill.groupTerms`; `group_derived` false: the streams bound bills the group).
+            const gt = pb.groupTerms(rows, pb.chunkRows(n));
+            std.debug.print("DSV41_WAVE_TERMS {{\"positions\": {d}, \"rows\": {d}, \"span\": {d}, \"kept_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"selection_gb\": {d:.3}, \"attn_gb\": {d:.3}, \"group_gb\": {d:.3}, \"final_eval_gb\": {d:.3}, \"released_gb\": {d:.3}, \"total_gb\": {d:.3}, \"overshoot_gb\": {d:.3}, \"group_derived\": {}, \"group_terms_gb\": {{\"router\": {d:.3}, \"cat_xf\": {d:.3}, \"cat_idx\": {d:.4}, \"shared\": {d:.3}, \"routed\": {d:.3}, \"waves\": {d:.3}, \"merge\": {d:.3}, \"loc\": {d:.4}, \"combine\": {d:.3}, \"cast\": {d:.3}}}}}\n", .{
                 n, rows, pb.chunkRows(n), gbOf(w.kept), gbOf(w.halves), gbOf(w.selection), gbOf(w.attn), gbOf(w.group), gbOf(w.final_eval), gbOf(w.released), gbOf(w.total()), gbOf(pb.joinedBytes(rows)),
+                pb.derived_group, gbOf(gt.router), gbOf(gt.cat_xf), gbOf(gt.cat_idx), gbOf(gt.shared), gbOf(gt.routed), gbOf(gt.waves), gbOf(gt.merge), gbOf(gt.loc), gbOf(gt.combine), gbOf(gt.cast),
             });
         };
     }
@@ -3153,6 +3157,17 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
     try cellFill(a, testing.io, &config, args, 16384, max_tokens);
     const b = try cellBill(a, testing.io, &config, args, 16384, max_tokens);
     printBill(b);
+    // The routed group's terms at the context's widest call (`PrefillBill.groupTerms`; derived false: the streams bound).
+    {
+        var vd: v41.Diag = .{};
+        const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
+        const pb = try bill_mod.prefillBillAt(&config, .{}, &c, 4);
+        const n: u64 = config.max_context_tokens.?;
+        const rows = pb.promptCallRows(n);
+        const gt = pb.groupTerms(rows, pb.chunkRows(n));
+        const w = pb.layerMajorWaveTerms(rows, pb.chunkRows(n), n, .served);
+        std.debug.print("DSV41_CELL_BILL_GROUP {{\"context\": {d}, \"rows\": {d}, \"span\": {d}, \"derived\": {}, \"group\": {d}, \"final_eval\": {d}, \"router\": {d}, \"cat_xf\": {d}, \"cat_idx\": {d}, \"shared\": {d}, \"routed\": {d}, \"waves\": {d}, \"merge\": {d}, \"loc\": {d}, \"combine\": {d}, \"cast\": {d}}}\n", .{ n, rows, pb.chunkRows(n), pb.derived_group, w.group, w.final_eval, gt.router, gt.cat_xf, gt.cat_idx, gt.shared, gt.routed, gt.waves, gt.merge, gt.loc, gt.combine, gt.cast });
+    }
     try testing.expect(b.decode_rows >= b.prefill_rows and b.processBound() > 0);
 }
 

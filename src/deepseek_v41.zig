@@ -85,6 +85,14 @@ pub const PrefillBill = struct {
     /// 2 MiB. It was the chunk-major estimate `wave_row_bytes` (5 MiB, never measured), which billed the knee's one-call
     /// prompt 22.3 GB of attention against the trace's 8.3 GB.
     attn_row_bytes: u64 = 2 << 20,
+    /// The expert intermediate width (the shared expert's and the DIG-X waves' gate|up: `moe_intermediate_size`) and
+    /// the routed experts' count per row, for the derived group (`groupTerms`).
+    moe_inter: u64 = 0,
+    /// The derived routed group (`withDerivedGroup`, `groupTerms`): the group's and its final evaluation's terms from
+    /// the arrays the served routes allocate. Off (the struct default, the pinned pre-kv16 tests): the streams bound.
+    derived_group: bool = false,
+    /// kv16-opt (eabf0de): the bytes of one DIG-X wave output element (bf16 under `kv16_expert_bf16`, else f32).
+    expert_out_bytes: u64 = 2,
 
     /// JOINLESS's minimal-copy merge (58d9fb1, `experts.planJoinless`): the combine reads at most
     /// `joinless_sources` sources; a wide call with n outputs above that concatenates only its smallest n - 23
@@ -96,7 +104,8 @@ pub const PrefillBill = struct {
     /// The wide lane's shape the outputs follow: the DIG-X prefill wave's experts and assignment-row budget
     /// (`exl3_quant.PrefillShape.tier`) and a call's experts (a group: `experts.max_route_ids`).
     /// `base_calls`: the deferred base calls a wide call makes (`wide_base_calls`, one more with P1d's resident call).
-    pub const JoinlessShape = struct { wave_experts: u64, wave_rows: u64, group_experts: u64, base_calls: u64 = wide_base_calls };
+    /// `inflight`: the waves a call holds in flight at once (`exl3_quant.PrefillShape.inflight`; a solo wave runs alone).
+    pub const JoinlessShape = struct { wave_experts: u64, wave_rows: u64, group_experts: u64, base_calls: u64 = wide_base_calls, inflight: u64 = 2 };
     /// A wide call's calls beyond its groups of `group_experts`: the seed-aligned split (the seed's ranks chunked
     /// apart from the stream's, 8b534af) adds at most one group, and the base bank's rows run in at most two deferred
     /// calls (P1b's at the seed, and the last); P1d's resident-first route adds a third (the rows resident at the barrier).
@@ -134,6 +143,95 @@ pub const PrefillBill = struct {
         return b.group_streams;
     }
 
+    /// The derived group (`groupTerms`) with the DIG-X waves' output element bytes; `prefillBillAt` installs it only on
+    /// the routes it is derived from (JOINLESS, the bf16 stream and HC post, the compiled shared middle, the fenced taps).
+    pub fn withDerivedGroup(b: PrefillBill, on: bool, expert_out_bytes: u64) PrefillBill {
+        var x = b;
+        x.derived_group = on;
+        x.expert_out_bytes = expert_out_bytes;
+        return x;
+    }
+
+    /// The routed group's live arrays beside the kept terms, by the shapes and dtypes the served routes allocate. A wave
+    /// tracks every array it builds until its reset (`MlxOps.resetTo`, deepseek_v41_ops.zig:348): an intermediate an
+    /// evaluation computed stays allocated until then, so each term is every array of its kind the group builds.
+    /// Layer wave (built after every chunk's attention, deepseek_v41_model.zig:893-897, freed at the layer's end):
+    ///   router: each chunk's eager router (above 32 rows; graph.zig:1939-1957): the f32 copy of its rows (d x 4), seven
+    ///     [rows, E] 4-byte arrays (logits, /1, softplus, sqrt, + bias, neg, argpartition), nine [rows, k] 4-byte and
+    ///     two [rows, 1] f32 arrays, and per chunk one f32 copy of the bf16 gate [E, d] (graph.zig:1940).
+    /// Group wave (model.zig:911-1013), over the group's g_rows rows:
+    ///   cat_xf: the joined MoE input, d x stream bytes (model.zig:912); cat_idx: the joined ids, k x 4 (model.zig:915).
+    ///   shared: each chunk's shared expert (graph.zig:2049-2050: w1, w3 and the compiled middle I x stream bytes each,
+    ///     w2 d x stream bytes) and its f32 copy (model.zig:923).
+    ///   routed: the DIG-X waves' outputs, k x d x expert_out_bytes (exl3_quant.zig:1101; rot_widen1_obf16 writes bf16).
+    ///   waves: the in-flight waves' intermediates (exl3_quant.zig:1178-1196, manifest dtypes): take2's two f16
+    ///     [R, d], the gate|up GEMM's two f32 [R, I], onepass's f16 [R, I], the down GEMM's f32 [R, d] and the wave's
+    ///     two int32 / uint32 row maps, over at most `inflight` waves of `wave_rows` or one solo wave (an expert's rows,
+    ///     at most g_rows: exl3_quant.zig:1083-1087).
+    ///   merge: JOINLESS's minimal copy at the outputs' dtype (experts.zig:694-719, `joinedBytesOf`); loc: int32
+    ///     [g_rows, k, 2] (experts.zig:1566); combine: the f32 [rows, d] output (q3jl_combine / dsv41_jl_combine_bf16,
+    ///     manifest); cast: its cast to the stream dtype (model.zig:993; none on an f32 stream).
+    /// The HC post's output (dsv41_hcpost_tf32_bf16: bf16 [rows, hc, d], graph.zig:2423) is the chunk's new stream: the
+    /// kept term's, because the old one is gone before it is computed (released at the chunk fence, model.zig:887, or
+    /// at the post's build, model.zig:997; the fenced taps hold none).
+    pub const GroupTerms = struct {
+        router: u64,
+        cat_xf: u64,
+        cat_idx: u64,
+        shared: u64,
+        routed: u64,
+        waves: u64,
+        merge: u64,
+        loc: u64,
+        combine: u64,
+        cast: u64,
+
+        fn held(t: GroupTerms) u64 {
+            return t.router + t.cat_xf + t.cat_idx + t.shared + t.routed;
+        }
+
+        /// The routed call's instant: the held arrays and the waves in flight (the merge is built after the last drain).
+        pub fn routedCall(t: GroupTerms) u64 {
+            return t.held() + t.waves;
+        }
+
+        /// The group's final evaluation: the held arrays, the merge, loc, the combines and their casts.
+        pub fn finalEval(t: GroupTerms) u64 {
+            return t.held() + t.merge + t.loc + t.combine + t.cast;
+        }
+    };
+
+    /// `GroupTerms` of a call of `seq` rows in chunks of `span`.
+    pub fn groupTerms(b: PrefillBill, seq: u64, span: u64) GroupTerms {
+        const d = b.hidden;
+        const k = b.top_k;
+        const e = b.n_experts;
+        const inter = b.moe_inter;
+        const sb = b.stream_bytes;
+        const eb = b.expert_out_bytes;
+        const nc = std.math.divCeil(u64, seq, @max(span, 1)) catch unreachable;
+        const g_rows = @min(seq, b.moeRowCap());
+        const shape = b.joinless orelse JoinlessShape{ .wave_experts = 0, .wave_rows = 0, .group_experts = 1 };
+        const wave_rows = @max(shape.inflight * shape.wave_rows, g_rows);
+        return .{
+            .router = seq * (d * 4 + 7 * e * 4 + 9 * k * 4 + 2 * 4) + nc * e * d * 4,
+            .cat_xf = g_rows * d * sb,
+            .cat_idx = g_rows * k * 4,
+            .shared = g_rows * (3 * inter * sb + d * sb + d * 4),
+            .routed = g_rows * k * d * eb,
+            .waves = wave_rows * (2 * d * 2 + 2 * inter * 4 + inter * 2 + d * 4 + 8),
+            .merge = b.joinedBytesOf(g_rows, eb),
+            .loc = g_rows * k * 2 * 4,
+            .combine = g_rows * d * 4,
+            .cast = if (sb < 4) g_rows * d * sb else 0,
+        };
+    }
+
+    /// `deepseek_v41_model.moeRowCap` at the chunk target: the routed group's widest rows.
+    pub fn moeRowCap(b: PrefillBill) u64 {
+        return @max(1, @as(u64, @intFromFloat(@floor(@max(chunk_target_bytes, 1e9) / @as(f64, @floatFromInt(b.top_k * b.hidden * 4))))));
+    }
+
     pub fn withJoinless(b: PrefillBill, shape: ?JoinlessShape) PrefillBill {
         var x = b;
         x.joinless = shape;
@@ -155,8 +253,13 @@ pub const PrefillBill = struct {
     /// The routed group's joined input over `g_rows` rows: every routed row joined, or under JOINLESS the minimal
     /// copy's bound at the most outputs the call can make, (n_max - 23) / n_max of the routed rows (rounded up).
     pub fn joinedBytes(b: PrefillBill, g_rows: u64) u64 {
+        return b.joinedBytesOf(g_rows, 4);
+    }
+
+    /// `joinedBytes` over routed rows of `elem` bytes an element (the merge copies the waves' outputs as they are).
+    pub fn joinedBytesOf(b: PrefillBill, g_rows: u64, elem: u64) u64 {
         const routed_rows = g_rows * b.top_k;
-        const routed = routed_rows * b.hidden * 4;
+        const routed = routed_rows * b.hidden * elem;
         const shape = b.joinless orelse return routed;
         const n = b.joinlessOutputsMax(shape, routed_rows);
         if (n <= joinless_sources) return 0;
@@ -229,6 +332,7 @@ pub const PrefillBill = struct {
             },
             .index_topk = c.index_topk,
             .n_experts = c.n_routed_experts,
+            .moe_inter = c.moe_intermediate_size,
         };
     }
 
@@ -339,6 +443,10 @@ pub const PrefillBill = struct {
         // its own <= 8 rows, while the earlier groups' rows are already gone, so the widest group still bounds it.
         const releases = b.input_release and g_rows * b.top_k > joinless_min_ids;
         const released: u64 = if (releases) seq * d * sb + g_rows * d * sb else 0;
+        if (b.derived_group) {
+            const gt = b.groupTerms(seq, span);
+            return .{ .kept = kept_stream, .halves = halves, .selection = selection, .attn = attn, .group = gt.routedCall(), .final_eval = gt.finalEval(), .released = released };
+        }
         return .{ .kept = kept_stream, .halves = halves, .selection = selection, .attn = attn, .group = group, .final_eval = final_eval, .released = released };
     }
 
