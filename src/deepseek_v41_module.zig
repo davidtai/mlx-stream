@@ -629,7 +629,8 @@ pub const Module = struct {
         // the fill's capped at R. Both row counts then reach the arm as native rows.
         var admitted = config.*;
         if (admitted.expert_prefill_rows == null) {
-            var arena = std.heap.ArenaAllocator.init(gpa);
+            // Construction transients on mapped pages, unmapped at the arena's end (libc malloc's large cache would keep them dirty in the footprint).
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const nr = try bill_mod.servedFill(arena.allocator(), io, admitted, sdk.memory.vmBytes().wired, ceiling_bytes, target, ov);
             if (admitted.expert_rows) |forced| {
@@ -668,7 +669,8 @@ pub const Module = struct {
         // (run 3ah refused only after construction, at an 82.7 GiB footprint): the native bill at the
         // box's wired bytes now (nothing of the Module wired yet); a plan that does not fit refuses here.
         {
-            var arena = std.heap.ArenaAllocator.init(gpa);
+            // Construction transients on mapped pages, unmapped at the arena's end (libc malloc's large cache would keep them dirty in the footprint).
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             var b = bill_mod.servedBill(arena.allocator(), io, &admitted, sdk.memory.vmBytes().wired, ceiling_bytes, ov) catch |e| {
                 log.err("admission refused before construction: {s}\n", .{@errorName(e)});
@@ -933,7 +935,8 @@ pub const Module = struct {
         const planned_wired = switch (self.arm) {
             inline else => |t| t.arm.inputs.wired_bytes,
         };
-        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        // The bill's transients on mapped pages, unmapped at the arena's end (see the admission's arenas).
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         self.bill = try bill_mod.servedBill(arena.allocator(), io, admitted, planned_wired, ceiling_bytes, self.overrides);
         if (multiturnRoute(self.overrides)) self.turn_call = .{

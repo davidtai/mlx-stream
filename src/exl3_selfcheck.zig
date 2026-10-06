@@ -605,8 +605,10 @@ fn genInput(h: *H, sc: *Scope, arg: *const xk.Arg, vars: *const Vars, wave: *con
     if (arg.role == .scalar) return sc.keep(mlx.mlx_array_new_int(@intCast(vars.get(arg.domain.of.?))));
     var shape: [xk.max_rank]c_int = undefined;
     const n = argShape(arg, vars, &shape);
-    const buf = try h.a.alloc(u8, n * dtypeSize(arg.dtype));
-    defer h.a.free(buf);
+    // The input's host bytes on mapped pages, unmapped once MLX copied them: through libc malloc each freed large block
+    // stayed dirty in the footprint (pass3eo's allocation trace: 2.0 GB of construction self-check inputs, one 1.32 GB).
+    const buf = try std.heap.page_allocator.alloc(u8, n * dtypeSize(arg.dtype));
+    defer std.heap.page_allocator.free(buf);
     fillArg(h, buf, n, arg, vars, wave);
     return sc.keep(mlx.mlx_array_new_data(buf.ptr, &shape, @intCast(arg.shape.len), arg.dtype));
 }
