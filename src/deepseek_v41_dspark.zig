@@ -227,12 +227,16 @@ pub const Lookup = struct {
 };
 
 /// A sampled request's parameters as the lane applies them to the TARGET's verify logits (the host's
-/// `sdk.SamplingParams`: temperature, top_k, top_p, min_p, seed). The lane tempers each verify row (logits / T),
+/// `sdk.SamplingParams`: temperature, top_k, top_p, min_p, seed). The lane tempers each verify row (logits / T) and
 /// filters it (top_k, then top_p over the top_k-renormalised probabilities, then min_p: every token at or above the
-/// kept set's smallest tempered logit is kept, ties included), runs the typical test on that distribution (its
-/// entropy, its probability of the draft) and draws each row's token from it (the correction and the bonus) by its
-/// inverse CDF at `drawU(seed, the drawn token's absolute position)`. `greedy` requests (T < 0.01 or top_k = 1) never
-/// reach it: the lane keeps the exact path (the argmax rows, the typical test at T = 1).
+/// kept set's smallest tempered logit is kept, ties included): p. It then runs EXACT speculative sampling (Leviathan et
+/// al. 2023, Chen et al. 2023) with the drafts as proposed: the draft head's markov argmax and the lookup's extension
+/// are deterministic proposals, a point-mass q, for which the rule is exact as stated (`refSpec`): draft x at a row is
+/// accepted with probability p(x) (u < p(x), u = `drawU(seed, pos)`); at the first rejection the correction is drawn
+/// from the residual norm((p - q)+) = p without x, renormalised; with every draft accepted the bonus is drawn from the
+/// next row's p (both draws by inverse CDF at `drawV(seed, pos)`). Every emitted token is then distributed as p.
+/// `greedy` requests (T < 0.01 or top_k = 1) never reach it: the lane keeps the exact path (the argmax rows, the
+/// typical test at T = 1).
 pub const Sampling = struct {
     temperature: f32 = 1.0,
     top_p: f32 = 1.0,
@@ -267,6 +271,11 @@ pub fn drawU(seed: u64, pos: u64) f32 {
     z ^= z >> 31;
     const bits: u32 = @intCast(z >> 40);
     return (@as(f32, @floatFromInt(bits)) + 0.5) / 16777216.0;
+}
+
+/// The draw uniform at `pos` (the residual or bonus draw), a stream apart from `drawU`'s (the acceptance test).
+pub fn drawV(seed: u64, pos: u64) f32 {
+    return drawU(seed ^ 0xD1B54A32D192ED03, pos);
 }
 
 /// The host reference of the lane's sampled row (the parity tests' oracle; the lane runs it on the device; rows of at
@@ -332,13 +341,17 @@ pub fn refDraw(dist: []const f64, u: f32) u32 {
     return @intCast(dist.len - 1);
 }
 
-/// The reference typical test on a sampled row: p(draft) > min(eps, delta x exp(-H)) over the row's distribution.
-pub fn refTypical(dist: []const f64, draft: u32, t: Typical) bool {
-    var h: f64 = 0;
-    for (dist) |p| if (p > 0) {
-        h -= p * @log(p);
-    };
-    return dist[draft] > @min(@as(f64, t.eps), @as(f64, t.delta) * @exp(-h));
+
+/// The reference speculative step on one row (`Sampling`'s rule): with a draft x (a point-mass proposal), accept iff
+/// u < p(x), else the residual's draw at v (p without x, renormalised); without one, the draw from p at v.
+pub fn refSpec(dist: []const f64, draft: ?u32, u: f32, v: f32) struct { accept: bool, tok: u32 } {
+    const x = draft orelse return .{ .accept = false, .tok = refDraw(dist, v) };
+    if (@as(f64, u) < dist[x]) return .{ .accept = true, .tok = x };
+    var resid_buf: [4096]f64 = undefined;
+    const resid = resid_buf[0..dist.len];
+    @memcpy(resid, dist);
+    resid[x] = 0;
+    return .{ .accept = false, .tok = refDraw(resid, v) };
 }
 
 const testing = std.testing;
@@ -713,47 +726,43 @@ test "dsv41 dspark: sampling: the reference filter keeps top_k, then top_p over 
     for (0..1000) |i| try testing.expect(d[refDraw(&d, drawU(3, i))] > 0);
 }
 
-test "dsv41 dspark: sampling: on a fixed target / draft fixture, temperature lowers the draft's probability; the typical rule's acceptance does not fall" {
-    // 64 rows of a 512-token vocab with one clear leader per row; two drafters: one proposes the row's leader, one its
-    // runner-up. The typical test at the served delta 0.3: p(draft) > min(1, 0.3 exp(-H)). The floor falls with the
-    // entropy as fast as the leader's probability does (a flat row of m tokens accepts any of them at 0.3 / m), so the
-    // rule's acceptance does not fall with T, it rises: the leader is accepted from low T on (bar the rows its runner-up
-    // overtakes), the runner-up from the T where the row flattens enough. The draft's own probability falls at every step (the sampled correction's work rises).
-    var rng: std.Random.DefaultPrng = .init(20261007);
-    const V = 512;
-    var rows: [64][V]f32 = undefined;
-    var lead: [64]u32 = undefined;
-    var second: [64]u32 = undefined;
-    for (&rows, &lead, &second) |*row, *ld, *sc| {
-        for (row) |*v| v.* = rng.random().floatNorm(f32);
-        ld.* = rng.random().uintLessThan(u32, V);
-        sc.* = (ld.* + 1 + rng.random().uintLessThan(u32, V - 1)) % V;
-        row[ld.*] += 6.0 + 2.0 * rng.random().float(f32);
-        row[sc.*] += 4.0 + 1.0 * rng.random().float(f32);
-    }
-    const temps = [_]f32{ 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0 };
-    var rate_lead: [temps.len]f64 = undefined;
-    var rate_second: [temps.len]f64 = undefined;
-    var mass_lead: [temps.len]f64 = undefined;
-    var d: [V]f64 = undefined;
-    for (temps, 0..) |t, ti| {
-        var al: f64 = 0;
-        var as: f64 = 0;
-        var ml: f64 = 0;
-        for (&rows, lead, second) |*row, ld, sc| {
-            refDistribution(row, .{ .temperature = t, .seed = 0 }, &d);
-            al += @floatFromInt(@intFromBool(refTypical(&d, ld, .{ .delta = 0.3 })));
-            as += @floatFromInt(@intFromBool(refTypical(&d, sc, .{ .delta = 0.3 })));
-            ml += d[ld];
+test "dsv41 dspark: sampling: speculative sampling with point-mass drafts emits tokens distributed as the tempered, filtered target (20k rounds)" {
+    // A 6-token row, a fixed draft, 20,000 seeded rounds at T 0.7 / 1.0 / 1.6, top_p 0.9: the emitted token (the accepted
+    // draft or the residual's draw) has the target's frequencies within 5 binomial standard deviations, and tokens the
+    // filter drops are never emitted.
+    const lg = [_]f32{ 1.2, 0.9, 0.4, 0.1, -0.6, -1.5 };
+    const n = 20000;
+    for ([_]f32{ 0.7, 1.0, 1.6 }) |t| for ([_]u32{ 0, 2 }) |draft| {
+        const sm: Sampling = .{ .temperature = t, .top_p = 0.9, .seed = 314 };
+        var p: [6]f64 = undefined;
+        refDistribution(&lg, sm, &p);
+        var count: [6]u32 = @splat(0);
+        for (0..n) |round| {
+            const pos: u64 = 1000 + round;
+            const r = refSpec(&p, draft, drawU(sm.seed, pos), drawV(sm.seed, pos));
+            count[r.tok] += 1;
         }
-        rate_lead[ti] = al / 64.0;
-        rate_second[ti] = as / 64.0;
-        mass_lead[ti] = ml / 64.0;
+        for (p, count) |pi, ci| {
+            const sd = @sqrt(@as(f64, n) * pi * (1 - pi));
+            const diff = @abs(@as(f64, @floatFromInt(ci)) - @as(f64, n) * pi);
+            try testing.expect(diff <= 5 * sd + 1e-9);
+            if (pi == 0) try testing.expectEqual(@as(u32, 0), ci);
+        }
+    };
+}
+
+test "dsv41 dspark: sampling: a draft the target disfavours is accepted less (acceptance = p(draft) for a point-mass proposal)" {
+    const lg = [_]f32{ 2.0, 1.0, 0.5, 0.0, -1.0, -2.0 };
+    const sm: Sampling = .{ .temperature = 1.0, .seed = 5 };
+    var p: [6]f64 = undefined;
+    refDistribution(&lg, sm, &p);
+    var rates: [6]f64 = undefined;
+    for (&rates, 0..) |*rate, x| {
+        var acc: u32 = 0;
+        for (0..20000) |round| acc += @intFromBool(refSpec(&p, @intCast(x), drawU(sm.seed, round), drawV(sm.seed, round)).accept);
+        rate.* = @as(f64, @floatFromInt(acc)) / 20000.0;
+        try testing.expectApproxEqAbs(p[x], rate.*, 0.015);
     }
-    std.debug.print("\ndsv41 dspark sampling: T {any}\n  typical acceptance, leader drafts {any}\n  typical acceptance, runner-up drafts {any}\n  leader probability {any}\n", .{ temps, rate_lead, rate_second, mass_lead });
-    for (rate_lead[0 .. temps.len - 1], rate_lead[1..]) |x, y| try testing.expect(y >= x);
-    try testing.expectEqual(@as(f64, 1.0), rate_lead[temps.len - 1]);
-    for (rate_second[0 .. temps.len - 1], rate_second[1..]) |x, y| try testing.expect(y >= x);
-    try testing.expect(rate_second[temps.len - 1] > rate_second[0]);
-    for (mass_lead[0 .. temps.len - 1], mass_lead[1..]) |x, y| try testing.expect(y < x);
+    std.debug.print("\ndsv41 dspark sampling: acceptance by the draft's rank (p {any}): {any}\n", .{ p, rates });
+    for (rates[0..5], rates[1..]) |a, b| try testing.expect(b < a);
 }
