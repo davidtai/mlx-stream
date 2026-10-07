@@ -1,8 +1,7 @@
 //! mlx-stream: the native streaming stack as one plugin: the DeepSeek-V4.1 arch, the EXL3 quant it binds (the routed
 //! experts' kernels over the package's pinned registry) and the EXL3 expert source that streams them. Built only where
-//! the macOS-only sources are. The module's one import is the host's `sdk`.
+//! the macOS-only sources are. The module imports its own `sdk` (sdk/) and the host's `mlx_host`.
 
-const sdk = @import("sdk");
 
 pub const plugin = sdk.Plugin{
     .name = "mlx-stream",
@@ -23,3 +22,9 @@ pub const testing = struct {
     pub const engram = @import("deepseek_v41_engram.zig");
     pub const Settings = @import("deepseek_v41_settings.zig").Config;
 };
+
+/// What the host's glue (mlx-serve `src/arch/mlx_stream.zig`) calls: the arch's entry points and their contract types.
+pub const arch = @import("deepseek_v41_plugin.zig");
+pub const sdk = @import("sdk");
+/// The context a construction bills when the model sets none (`ctx_size`): the standard request.
+pub const default_context: u64 = @import("deepseek_v41_bill.zig").fill_prompt_tokens;

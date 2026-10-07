@@ -22,21 +22,15 @@ included in this repository.
 
 ## How mlx-serve consumes it
 
-The same way mlx-serve consumes its other engine modules (`lib/mlx-serve-gguf`, `lib/sushi`):
-
-- a pinned git submodule at `lib/mlx-stream`;
-- `-Dmlx-stream-dir=/abs/path` builds the host against a checkout instead of the submodule;
-- the host creates the module `mlx_stream`, rooted at `src/root.zig`, with exactly one import: the host's `sdk`;
-- the host's registry (`src/plugins.zig`) has one line: `@import("mlx_stream").plugin`.
-
-The plugin declares one kind, the `arch`. The quant, the expert source, the kernel registry and the KV lanes are the
-arch's internals (`src/sdk_ext.zig`); nothing per layer crosses the host boundary. The host compiles `csrc/` against
-its own staged MLX, because the event and alloc shims include MLX's private headers. The plugin is macOS-only, so the
-Linux and iOS graphs register nothing.
-
-`zig build -Dmlx-stream=false` in the host builds without the plugin. Such a build refuses a `deepseek_v41` model at
-config parse with an error that names the plugin. A host whose `lib/mlx-stream` is not checked out fails to compile
-with a message that says how to fix it.
+- A pinned git submodule at `lib/mlx-stream`; `-Dmlx-stream-dir=/abs/path` builds the host against a checkout instead.
+- Two modules: `sdk` (rooted at `sdk/root.zig`: the arch contract's types, the weight loader, the reads past the page
+  cache) and `mlx_stream` (rooted at `src/root.zig`, importing `sdk`). Both reach the host through one import,
+  `mlx_host` (its MLX, log and MTP acceptance modes).
+- One host file calls the plugin: mlx-serve's `src/arch/mlx_stream.zig`. A `deepseek_v41` model directory with
+  `experts.bin` is the plugin's; the host renders the template, samples and schedules, and the plugin runs the
+  forward (`arch.prefill` / `arch.step`), the prefix resume, the decode handover and the DSpark draft lane.
+- The host compiles `csrc/` against its own staged MLX, because the event and alloc shims include MLX's private
+  headers. The plugin is macOS-only; the Linux and iOS graphs build mlx-serve's stub, which refuses the pack by name.
 
 ## Building and testing
 
@@ -44,23 +38,13 @@ The plugin builds only inside a host. This repo's `build.zig` runs the host's bu
 `-Dmlx-stream-dir=<this checkout>` (default host: `../mlx-serve`, or pass `-Dmlx-serve=/path`):
 
 ```sh
-zig build test-hermetic -Dmlx-serve=../mlx-serve "-Dtest-filter=dsv41 "   # CPU, no bank
-DSV41_BANK=/path/to/bank zig build test-bank -Dmlx-serve=../mlx-serve "-Dtest-filter=dsv41 "
-zig build conformance -Dmlx-serve=../mlx-serve     # the plugin conformance suite (CPU lane, no device)
-zig build check -Dmlx-serve=../mlx-serve           # the host's server graph with this plugin (no codegen)
-zig build profile -Dmlx-serve=../mlx-serve         # the same with the profile probes compiled in
-zig build cell -Dmlx-serve=../mlx-serve            # the served AR cell test binary (ReleaseFast)
-zig build serve -Dmlx-serve=../mlx-serve           # the host's ReleaseFast server with this plugin
-zig build refusals -Dmlx-serve=../mlx-serve        # the sdk_ext contracts' compile-time refusals (compile only)
-zig build host-pin -Dmlx-serve=../mlx-serve        # HOST_PIN vs the host checkout's HEAD
+zig build test -Dmlx-serve=../mlx-serve     # the plugin's tests (the host's mlx-stream-test step)
+zig build serve -Dmlx-serve=../mlx-serve    # the host's ReleaseFast server with this plugin
 ```
 
-From the host checkout the same suites are `zig build mlx-stream-test` and `zig build mlx-stream-conformance`
-(both part of `zig build test`). `scripts/test_dsv41.sh` runs every `dsv41 ` test of the plugin and the host on the
-CPU, and adds the bank tests when `DSV41_BANK` is set.
-
-The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model or run on the GPU
-skip unless their own inputs are given.
+`scripts/test_dsv41.sh` runs every `dsv41 ` test of the plugin and the host on the CPU, and adds the bank tests when
+`DSV41_BANK` is set. The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model
+or run on the GPU skip unless their own inputs are given.
 
 ## Memory and context length
 
@@ -161,10 +145,8 @@ harness's rows, baseline and output paths); each such test skips without its inp
 
 ## Versions
 
-- **mlx-serve:** the commit in `HOST_PIN`. Until the host's SDK lands upstream, that is a commit on the
-  `mlx-stream/host-seams` branch of the mlx-serve fork.
-- **MLX:** v0.32.3 (mlx-serve's `lib/mlx-src` pin 64ea011cb). `src/root.zig` declares it, and the host refuses a
-  plugin tested on another MLX at compile time. An MLX bump in the host is one change that also bumps this pin.
+- **mlx-serve:** the host pins this repository as a submodule; that pin is the tested pair.
+- **MLX:** the host's (v0.32.3). An MLX bump in the host can need the shims in `csrc/` to follow.
 - **Zig:** 0.17.0 (`build.zig.zon` `minimum_zig_version`). The host's `scripts/fetch-zig.sh` fetches it.
 
 ## mlx-stream and sushi's EXL3
@@ -187,22 +169,19 @@ in the host checkout) through this plugin's decoder and checks the result agains
 
 ```
 build.zig, build.zig.zon   standalone build (drives the host's build)
-HOST_PIN                   the mlx-serve commit this repo is tested against
-src/root.zig               the plugin declaration (`plugin`) and the host tests' surface (`testing`)
+sdk/                       the arch contract's types (`sdk` module), the weight loader, reads past the page cache
+src/root.zig               the arch the host calls (`arch`, `sdk`, `default_context`) and the tests' surface
 src/tests.zig              the test root (`zig build mlx-stream-test` in the host)
-src/conformance.zig        the conformance suite's root
+src/deepseek_v41_host.zig  the harnesses' and bank tests' bridge (config parse, loaders, memory knobs), test-only
 src/*.zig                  the DeepSeek-V4.1 arch, the EXL3 quant and kernels, the expert stream
 src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile)
 src/kernels/exl3/          the pinned Metal kernel texts and their manifest (embedded at compile time)
 src/fixtures/              test fixtures (bank peek, prefill wave samples, DSpark lookup and receipt stats)
 csrc/                      the C read pool, the MLX event / alloc shims and the profile-only timeline sources
-src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
-docs/                      design notes and the path map from the in-tree layout
-scripts/                   test_dsv41.sh, check_host_pin.sh
+scripts/                   test_dsv41.sh, compile_kernels_offline.py
 ```
 
-This repository was imported from the mlx-serve fork at commit d38ef038, without its history. `docs/PATH_MAP.md`
-maps every in-tree path to its place here.
+This repository was imported from the mlx-serve fork at commit d38ef038, without its history.
 
 ## License
 

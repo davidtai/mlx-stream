@@ -17,8 +17,8 @@ ROOT="$(cd "${MLX_SERVE:-$PLUGIN/../mlx-serve}" && pwd)"
 ZIG="${ZIG:-}"
 [ -n "$ZIG" ] || { if [ -x "$ROOT/.zig-toolchain/zig" ]; then ZIG="$ROOT/.zig-toolchain/zig"; else ZIG=zig; fi; }
 
-echo "[build] zig build test-build mlx-stream-test-build -Dtest-filter='dsv41 ' -Dmlx-stream-dir=$PLUGIN (in $ROOT)"
-( cd "$ROOT" && "$ZIG" build test-build mlx-stream-test-build "-Dtest-filter=dsv41 " "-Dmlx-stream-dir=$PLUGIN" --summary none ) || { echo "FAIL: the dsv41 tests do not build"; exit 1; }
+echo "[build] zig build test-build -Dtest-filter='dsv41 ' -Dmlx-stream-dir=$PLUGIN (in $ROOT)"
+( cd "$ROOT" && "$ZIG" build test-build "-Dtest-filter=dsv41 " "-Dmlx-stream-dir=$PLUGIN" --summary none ) || { echo "FAIL: the dsv41 tests do not build"; exit 1; }
 
 # run <label> <binary> [VAR=value ...]: the tests in a clean environment (only what they read), one summary line.
 run() {

@@ -1,7 +1,6 @@
-//! mlx-stream's test root: every plugin file's tests, plus the plugin's declaration for the host's registry (the host's
-//! test bridge, `mlx_serve_host`, registers this module as `mlx_stream`, so the plugin is one module per test build).
-//! The host builds it with `zig build mlx-stream-test` (`-Dmlx-stream-dir=<this checkout>`); `zig build test-hermetic`
-//! here does the same from this repo. A comptime block, not a test block: the root adds no test of its own.
+//! mlx-stream's test root: every plugin file's tests. The host builds it with `zig build mlx-stream-test`
+//! (`-Dmlx-stream-dir=<this checkout>`); `zig build test` here does the same from this repo. A comptime block, not a
+//! test block: the root adds no test of its own.
 
 pub const plugin = @import("root.zig").plugin;
 pub const testing = @import("root.zig").testing;

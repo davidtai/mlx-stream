@@ -10,7 +10,9 @@ mlx-stream is a plugin for mlx-serve (https://github.com/ddalcu/mlx-serve,
 Copyright (c) 2026 David Dalcu, MIT). It was split out of a fork of mlx-serve;
 the files it shares with the host's SDK seams (src/sdk_ext/check.zig, the
 no-cache read helpers in src/nocache_io.zig and the n-gram table in
-src/ngram_table.zig) were written for that fork by this repository's author.
+src/ngram_table.zig) were written for that fork by this repository's author,
+and so was sdk/ (the arch contract, the weight loader and the reads past the
+page cache), mlx-serve's plugin SDK in that fork, now kept here.
 
 The DeepSeek-V4.1 streaming runtime this plugin was ported from (the packed
 expert record and manifest formats, the streamed-bank layout read by

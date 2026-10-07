@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The plugin carries its own `sdk` module (sdk/: the arch contract, the weight loader, the reads past the page cache)
+  and reaches mlx-serve only through `mlx_host`; mlx-serve calls the arch from one glue file. The conformance and
+  refusal suites, `HOST_PIN` and the host test bridge's dependence on host internals are gone.
 - Long contexts: the bill and the prompt pass are correct and measured at 16K, 256K, 512K and 1M tokens (see
   README, Memory and context length). The prompt pass's chunk span past 16K comes from the served attention's own
   arrays (953 rows; the stock full-score rule fell to 14 rows at 1M and made the pass quadratic in its chunk count);
