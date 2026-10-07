@@ -69,18 +69,24 @@ ceiling (the GPU working set, less the host's wired margin) against an itemized 
 refuses a request that its bill does not cover. The bill covers every prompt up to the model settings' `ctx_size`
 (16,384 tokens without one), so a server started at a long context admits fewer rows than one started at 16K.
 
-Contexts up to the model's 1,048,576 tokens are supported. Measured on one Mac (served, one cold request each, the
-16K headline prompt and the long-context fixture; peak = the server's footprint peak; bound = the bill's process
-bound at the admitted rows):
+Contexts up to the model's 1,048,576 tokens are supported. Measured on one Mac with this build (served, one fresh
+server and one cold request per context; peak = the server's footprint peak; bound = the bill's process bound at the
+admitted rows). The 16,384 headline is the standard 16K prompt; the other rows are the context sweep's fixture.
 
 | context | rows (prompt / decode) | prefill tok/s | TTFT | decode tok/s | peak | bound |
 |---|---|---|---|---|---|---|
-| 16,384 | 135 / 166 | 668 | 24.5 s | 37.6 | 107.0 GB | 108.3 GB |
-| 262,144 | 102 / 165 | 308 | 851 s | 26.9 | 108.1 GB | 110.6 GB |
-| 524,288 | 89 / 155 | 378 | 1,387 s | 18.4 | 104.6 GB | 108.2 GB |
-| 1,047,488 | 72 / 144 | 246 | 4,263 s | 11.0 | 102.5 GB | 108.5 GB |
-
-(The 262,144 row is from the build before the served prompt span below; the others are from this one.)
+| 16,384 (headline) | 135 / 166 | 668.3 | 24.5 s | 37.6 | 107.0 GB | 108.3 GB |
+| 1,024 | 149 / 168 | 81.2 | 12.6 s | 40.3 | 107.7 GB | 108.9 GB |
+| 2,048 | 143 / 168 | 133.4 | 15.3 s | 39.7 | 107.8 GB | 109.1 GB |
+| 4,096 | 139 / 167 | 263.4 | 15.6 s | 38.3 | 107.3 GB | 109.0 GB |
+| 8,192 | 138 / 167 | 464.3 | 17.6 s | 35.1 | 107.4 GB | 108.9 GB |
+| 16,384 | 136 / 167 | 579.6 | 28.3 s | 34.9 | 107.5 GB | 108.8 GB |
+| 32,768 | 136 / 167 | 551.1 | 59.5 s | 34.6 | 107.7 GB | 108.9 GB |
+| 65,536 | 134 / 166 | 529.9 | 123.7 s | 34.6 | 107.4 GB | 109.0 GB |
+| 131,072 | 123 / 165 | 487.3 | 269.0 s | 31.6 | 107.3 GB | 109.0 GB |
+| 262,144 | 100 / 162 | 447.6 | 585.7 s | 27.1 | 106.5 GB | 108.8 GB |
+| 524,288 | 89 / 155 | 378.0 | 1,387 s | 18.4 | 104.6 GB | 108.2 GB |
+| 1,047,488 | 72 / 144 | 245.7 | 4,263 s | 11.0 | 102.5 GB | 108.5 GB |
 
 How the long prompts stay inside the bill:
 
