@@ -2502,3 +2502,30 @@ test "dsv41 bill: the served K16 span: the stock span up to 16,384 byte for byte
     try testing.expect(graph.indexSelectRows(953, 524288, graph.index_select_block_bytes) < 953);
     try testing.expect(graph.indexSelectRows(953, 1048576, graph.index_select_block_bytes) < 953);
 }
+
+test "dsv41 bill: the served indexer chain is its block's peak, both copies; the measured prompt peaks sit under the bill (no bank)" {
+    const c = try realConfig();
+    const pb = try prefillBillAt(&.{}, .{}, &c, 4);
+    const k: u64 = pb.index_topk;
+    // The formula: R = the IDX_CHUNKED_SELECT block rows; the peak is two f32 copies (8 R N) or the score with the
+    // select's outputs (5 R N + 4 R k).
+    for ([_][2]u64{ .{ 953, 16384 }, .{ 953, 262144 }, .{ 953, 495560 }, .{ 953, 898679 }, .{ 59, 262144 } }) |x| {
+        const r = v41.PrefillBill.selectBlockRows(x[0], x[1]);
+        try testing.expectEqual(@max(8 * r * x[1], 5 * r * x[1] + 4 * r * k), pb.indexChainBytes(x[0], x[1]));
+        try testing.expectEqual(@as(u64, @intCast(graph.indexSelectRows(@intCast(x[0]), @intCast(x[1]), graph.index_select_block_bytes))), r);
+    }
+    // One launch up to ~450K positions: the old term exactly (two copies of the chunk's f32 score) plus the selection's
+    // int32 rows where they bind; blocked past it: at most the budget's 8 / 5 (3.44 GB) plus the block's selection.
+    try testing.expectEqual(@as(u64, 8 * 953 * 262144), pb.indexChainBytes(953, 262144));
+    try testing.expect(pb.indexChainBytes(953, 898679) <= 8 * v41.PrefillBill.index_select_block_bytes / 5 + 4 * 953 * k);
+    try testing.expect(pb.indexChainBytes(953, 898679) < 2 * 953 * 898679 * 4);
+    // The measured prompt peaks (served, footprint, GB) against the bill's prompt-phase process bytes at the runs' rows
+    // (bill tool, this tree): residual >= 0 at every reference (pass3ex / pass3ez on e19d8103).
+    const Ref = struct { ctx: u64, rows: [2]u64, peak: f64, billed: f64 };
+    for ([_]Ref{
+        .{ .ctx = 16384, .rows = .{ 135, 166 }, .peak = 106.985, .billed = 108.141 },
+        .{ .ctx = 262144, .rows = .{ 97, 160 }, .peak = 105.467, .billed = 107.247 },
+        .{ .ctx = 524288, .rows = .{ 89, 155 }, .peak = 104.607, .billed = 107.479 },
+        .{ .ctx = 1047488, .rows = .{ 72, 144 }, .peak = 102.545, .billed = 103.699 },
+    }) |m| try testing.expect(m.billed >= m.peak);
+}

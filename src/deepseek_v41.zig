@@ -288,6 +288,22 @@ pub const PrefillBill = struct {
     /// .selection_pos_bytes`, billed by `selectionRowPositions`) and one block's 5 R N (at most the budget).
     pub const index_select_block_bytes: u64 = 2 << 30;
     pub const index_select_min_rows: u64 = 256;
+    /// The served indexer's live peak over a chunk of `rows` reading `positions` positions (N compressed), per block of
+    /// R = `selectBlockRows(rows, N)` rows (R = rows: the one launch), from the arrays `graph.indexerSelect` /
+    /// `graph.selectChunked` allocate:
+    ///   the block's f32 score [R, N] (deepseek_v41_graph.zig:1133 one launch, :1186 per block), live with
+    ///   - on a candidate consumer, the `where` over the consumed candidates, a second f32 [R, N] (:1138, :1196);
+    ///   - on the candidate source, the score padded to the block width, a second f32 [R, N + pad] (:1070, through
+    ///     `candidateBlocks` at :1136 / :1193); its block keep repeated to bool [R, N + pad] (:1081) after the pad is gone;
+    ///   then the top-k select's bool mask [R, N] and int32 selection [R, k] (:1142, :1198) beside the surviving score.
+    /// The peak is the two f32 copies, 8 R N, or the score with the select's outputs, 5 R N + 4 R k: the larger of the two.
+    /// The kept selection across the call (the mask and candidates every chunk keeps) is `selectionRowPositions`.
+    pub fn indexChainBytes(b: PrefillBill, rows: u64, positions: u64) u64 {
+        const n = if (b.min_ratio > 0) positions / b.min_ratio else positions;
+        const r = selectBlockRows(rows, n);
+        return @max(8 * r * n, 5 * r * n + 4 * r * b.index_topk);
+    }
+
     pub fn selectBlockRows(rows: u64, n: u64) u64 {
         const fit = index_select_block_bytes / (5 * @max(n, 1));
         return @min(@max(@min(fit, rows), index_select_min_rows), rows);
@@ -373,8 +389,13 @@ pub const PrefillBill = struct {
             .served => b.selected_keys,
         };
         const attn = rows * b.n_heads * (keys + 1) * 4;
-        const index = if (tier == .served and b.index_launch) rows * positions * 4 else rows * b.index_heads * positions * 4;
-        return wave_fixed_bytes + rows * wave_row_bytes + chain_copies * @max(attn, index) + positions * kept_pos_bytes;
+        // The served indexer (one score launch per block, IDX_CHUNKED_SELECT): its own peak, both copies counted
+        // (`indexChainBytes`); the per-head stock chain keeps two of its arrays.
+        const chain = if (tier == .served and b.index_launch)
+            @max(chain_copies * attn, b.indexChainBytes(rows, positions))
+        else
+            chain_copies * @max(attn, rows * b.index_heads * positions * 4);
+        return wave_fixed_bytes + rows * wave_row_bytes + chain + positions * kept_pos_bytes;
     }
 
     /// K16 (layer-major prefill: every layer over all of the prompt's chunks before the next) at `seq`
