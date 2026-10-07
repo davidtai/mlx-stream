@@ -150,10 +150,11 @@ pub const draft_lane = struct {
         return m.decodeLane();
     }
 
-    /// A clean greedy request takes typical acceptance (with the greedy correction); sampled and shaped ones stay
-    /// serial.
+    /// A clean request takes typical acceptance, greedy or sampled: the lane is the served decode rule (the tier's
+    /// delta over the target's own distribution, argmax correction), so a sampled request's temperature / top_p do not
+    /// shape it. Logprobs, grammar and penalties consume logits the lane never shapes and stay serial.
     pub fn arm(_: *const Module, req: sdk.ArmRequest) sdk.DraftArm {
-        return if (req.greedy and req.clean) .typical else .off;
+        return if (req.clean) .typical else .off;
     }
 
     pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32) !sdk.DraftRound {
@@ -199,11 +200,11 @@ test "dsv41 plugin: parse builds the arch's config and its sidecar paths, and re
     try testing.expect(diag.message().len > 0);
 }
 
-test "dsv41 plugin: the draft lane arms only clean greedy requests, and the served prompt reserves nothing" {
+test "dsv41 plugin: the draft lane arms every clean request, greedy or sampled, and the served prompt reserves nothing" {
     const m: *const Module = undefined;
     try testing.expectEqual(sdk.DraftArm.typical, draft_lane.arm(m, .{ .greedy = true, .clean = true }));
     try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(m, .{ .greedy = true, .clean = false }));
-    try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(m, .{ .greedy = false, .clean = true }));
+    try testing.expectEqual(sdk.DraftArm.typical, draft_lane.arm(m, .{ .greedy = false, .clean = true }));
     try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(m, .{ .greedy = false, .clean = false }));
     for ([_]sdk.RequestShape{ .{ .prompt_tokens = 1, .max_tokens = 0, .host_context = 0 }, .{ .prompt_tokens = 16384, .max_tokens = 1024, .host_context = 1 << 20 } }) |req|
         try testing.expectEqual(@as(u64, 0), reservedTokens(req));
