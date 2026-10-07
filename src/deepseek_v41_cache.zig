@@ -388,13 +388,13 @@ pub fn prefillSubWidest(n: u64, span: u64, sub: u64) u64 {
 /// rows: 16,384 rows up to 262,144 positions (every prompt up to 256K unchanged), then fewer (8,192 at 512K, 4,096 at 1M).
 pub const prefill_sub_area: u64 = prefill_selection_budget_bytes / selection_pos_bytes;
 
-/// The index selection a prompt call holds per row and compressed position across a layer: each K16 chunk's kept
-/// selection (its top-k mask, candidates and window memo, carried to the layer's routed call) over every chunk of the
-/// call, 4.99 B a row and position read (pass3ep at 256K: 16 sub-chunk calls, residual 0.23 GB). IDX_CHUNKED_SELECT
-/// does not lower it: the indexer launches per chunk (`indexerSelect` sees the chunk's rows: 59 at 256K, 14 at 1M), and a
-/// chunk's 5 x rows x N stays under its block budget, so every served chunk keeps the one launch (pass3et's 256K kill
-/// with the select merged). The bill and the call area read this one constant.
-pub const selection_pos_bytes: u64 = 5;
+/// The index selection a prompt call holds per row and compressed position across a layer, beyond what the bill names
+/// (`PrefillBill.selectionKeptBytes`): pass3ep measured 4.99 B a row and position read over every chunk of a sub-chunk
+/// call (256K, 16 calls, residual 0.23 GB), and the trace attributes 2 B of it to the bool top-k mask and candidates each
+/// chunk kept. IDX_CARRY keeps neither (the selected ids and the packed candidate blocks instead), so the bill holds the
+/// other 3 B per row and position until a device cell attributes them, never under. The bill and the call area read this
+/// one constant.
+pub const selection_pos_bytes: u64 = 3;
 
 /// The selection's budget per sub-chunk call, fixed in bytes (21.47 GB: 16,384 rows over 262,144 positions at 5 B, so
 /// every prompt up to 256K runs its calls as before); the area in rows x positions follows `selection_pos_bytes`.

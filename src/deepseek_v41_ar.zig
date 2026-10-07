@@ -2999,7 +2999,7 @@ test "dsv41 bill: the default served bill covers every prompt up to 16,384; the 
     // The 16K wave of the 10-02..10-04 receipts (13,868,806,049 B, f32 streams) less kv16's bf16 kept streams, h1, moe_in,
     // and its bf16 DSpark main taps (11,855,540,129 B), with the derived routed group (`PrefillBill.groupTerms`) in place
     // of the streams bound: 6,130,702,289 B.
-    try testing.expectEqual(@as(u64, 6_130_702_289 + 4 * 16384 * 16384), pinned.prefill_wave);
+    try testing.expectEqual(@as(u64, 6_130_702_289 + 2 * 16384 * 16384 + 16384 * 256), pinned.prefill_wave);
     const exact = try bill_mod.billAt(a, testing.io, &config, 16384, bill_mod.fill_max_tokens, null, ceiling, .{});
     try testing.expectEqual(exact.prefillTotal(), pinned.prefillTotal());
     try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());
@@ -3076,7 +3076,7 @@ test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselin
                 if (r.rows) |x| x.prefill else null, if (r.rows) |x| x.decode else null, gbOf(r.prompt_total), gbOf(r.decode_total), gbOf(target), r.rows != null,
             });
             if (n == 16384 and !covering) {
-                try testing.expectEqual(@as(u64, 13_868_806_049 + 4 * 16384 * 16384), r.wave);
+                try testing.expectEqual(@as(u64, 13_868_806_049 + 2 * 16384 * 16384 + 16384 * 256), r.wave);
                 try testing.expectEqual(@as(u64, 355_600_384), r.kv_prompt);
             }
             if (r.rows) |x| {
@@ -3167,6 +3167,18 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
         const gt = pb.groupTerms(rows, pb.chunkRows(n));
         const w = pb.layerMajorWaveTerms(rows, pb.chunkRows(n), n, .served);
         std.debug.print("DSV41_CELL_BILL_GROUP {{\"context\": {d}, \"rows\": {d}, \"span\": {d}, \"derived\": {}, \"group\": {d}, \"final_eval\": {d}, \"router\": {d}, \"cat_xf\": {d}, \"cat_idx\": {d}, \"shared\": {d}, \"routed\": {d}, \"waves\": {d}, \"merge\": {d}, \"loc\": {d}, \"combine\": {d}, \"cast\": {d}}}\n", .{ n, rows, pb.chunkRows(n), pb.derived_group, w.group, w.final_eval, gt.router, gt.cat_xf, gt.cat_idx, gt.shared, gt.routed, gt.waves, gt.merge, gt.loc, gt.combine, gt.cast });
+        // The kept selection at the context's deepest call, both ways: as billed (IDX_CARRY's kept line + the unattributed
+        // `kvc.selection_pos_bytes` per row and position) and as the trace counts it (the kept line alone): the cell's
+        // residual decides whether the unattributed term stays.
+        {
+            const kvc = @import("deepseek_v41_cache.zig");
+            const calls = try kvc.prefillSubCalls(a, @intCast(n), pb.chunkRows(n), pb.prefill_sub);
+            const last = calls[calls.len - 1];
+            const crow: u64 = last[1] - last[0];
+            const billed = pb.selectionKeptBytes(crow, pb.chunkRows(n), last[1]);
+            const unattributed = pb.selectionRowPositions(crow, pb.chunkRows(n), last[1]) * kvc.selection_pos_bytes;
+            std.debug.print("DSV41_CELL_BILL_SELECTION {{\"context\": {d}, \"call_rows\": {d}, \"positions\": {d}, \"kept_billed\": {d}, \"kept_trace\": {d}, \"unattributed\": {d}, \"chain\": {d}}}\n", .{ n, crow, last[1], billed, billed - unattributed, unattributed, pb.indexChainBytes(pb.chunkRows(n), last[1]) });
+        }
     }
     try testing.expect(b.decode_rows >= b.prefill_rows and b.processBound() > 0);
 }
