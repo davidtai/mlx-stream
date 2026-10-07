@@ -226,6 +226,121 @@ pub const Lookup = struct {
     }
 };
 
+/// A sampled request's parameters as the lane applies them to the TARGET's verify logits (the host's
+/// `sdk.SamplingParams`: temperature, top_k, top_p, min_p, seed). The lane tempers each verify row (logits / T),
+/// filters it (top_k, then top_p over the top_k-renormalised probabilities, then min_p: every token at or above the
+/// kept set's smallest tempered logit is kept, ties included), runs the typical test on that distribution (its
+/// entropy, its probability of the draft) and draws each row's token from it (the correction and the bonus) by its
+/// inverse CDF at `drawU(seed, the drawn token's absolute position)`. `greedy` requests (T < 0.01 or top_k = 1) never
+/// reach it: the lane keeps the exact path (the argmax rows, the typical test at T = 1).
+pub const Sampling = struct {
+    temperature: f32 = 1.0,
+    top_p: f32 = 1.0,
+    top_k: u32 = 0,
+    min_p: ?f32 = null,
+    seed: u64 = 0,
+
+    /// The host's greedy rule (`sdk.ArmRequest.greedy`): the lane's exact path.
+    pub fn greedy(s: Sampling) bool {
+        return s.temperature < 0.01 or s.top_k == 1;
+    }
+
+    /// The sampled parameters, or null when the request is greedy (the exact path).
+    pub fn active(s: ?Sampling) ?Sampling {
+        const x = s orelse return null;
+        return if (x.greedy()) null else x;
+    }
+
+    /// Whether the filter sorts each row (top_k or top_p set).
+    pub fn sorts(s: Sampling) bool {
+        return s.top_k > 0 or s.top_p < 1.0;
+    }
+};
+
+/// The uniform in (0, 1) of the draw at absolute position `pos` of a request seeded `seed`: splitmix64 over
+/// seed + pos x the golden gamma, its top 24 bits, centred ((bits + 0.5) / 2^24, never 0 or 1). A position's draw is
+/// the same however the rounds fall, so a seeded request is reproducible.
+pub fn drawU(seed: u64, pos: u64) f32 {
+    var z = seed +% pos *% 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    z ^= z >> 31;
+    const bits: u32 = @intCast(z >> 40);
+    return (@as(f32, @floatFromInt(bits)) + 0.5) / 16777216.0;
+}
+
+/// The host reference of the lane's sampled row (the parity tests' oracle; the lane runs it on the device; rows of at
+/// most 4,096 tokens): `out` (the row's length) gets the tempered, filtered distribution (0 off the kept set), in f64 over the f32 tempered logits.
+pub fn refDistribution(logits: []const f32, s: Sampling, out: []f64) void {
+    const n = logits.len;
+    const inv_t: f32 = 1.0 / s.temperature;
+    var lt_buf: [4096]f32 = undefined;
+    const lt = lt_buf[0..n];
+    for (lt, logits) |*d, v| d.* = v * inv_t;
+    var thr: f32 = -std.math.inf(f32);
+    if (s.sorts()) {
+        var srt_buf: [4096]f32 = undefined;
+        const srt = srt_buf[0..n];
+        @memcpy(srt, lt);
+        std.mem.sort(f32, srt, {}, std.sort.desc(f32));
+        const smax: f64 = srt[0];
+        var sz: f64 = 0;
+        for (srt) |v| sz += @exp(@as(f64, v) - smax);
+        const kk: usize = if (s.top_k > 0) @min(s.top_k, n) else n;
+        var zk: f64 = 0;
+        for (srt[0..kk]) |v| zk += @exp(@as(f64, v) - smax) / sz;
+        var kept: usize = 0;
+        var cum: f64 = 0;
+        for (srt[0..kk]) |v| {
+            const p = @exp(@as(f64, v) - smax) / sz / zk;
+            if (s.top_p < 1.0 and cum >= s.top_p) break;
+            cum += p;
+            kept += 1;
+        }
+        thr = srt[kept - 1];
+    }
+    var mx: f64 = -std.math.inf(f64);
+    for (lt) |v| if (v >= thr) {
+        mx = @max(mx, v);
+    };
+    var z: f64 = 0;
+    for (lt) |v| if (v >= thr) {
+        z += @exp(@as(f64, v) - mx);
+    };
+    for (out, lt) |*o, v| o.* = if (v >= thr) @exp(@as(f64, v) - mx) / z else 0;
+    if (s.min_p) |mp| {
+        var pmax: f64 = 0;
+        for (out) |p| pmax = @max(pmax, p);
+        var z2: f64 = 0;
+        for (out) |*p| {
+            if (p.* < mp * pmax) p.* = 0;
+            z2 += p.*;
+        }
+        for (out) |*p| p.* /= z2;
+    }
+}
+
+/// The reference draw: the first token whose cumulative probability reaches `u` x the total.
+pub fn refDraw(dist: []const f64, u: f32) u32 {
+    var total: f64 = 0;
+    for (dist) |p| total += p;
+    var cum: f64 = 0;
+    for (dist, 0..) |p, i| {
+        cum += p;
+        if (cum >= @as(f64, u) * total and p > 0) return @intCast(i);
+    }
+    return @intCast(dist.len - 1);
+}
+
+/// The reference typical test on a sampled row: p(draft) > min(eps, delta x exp(-H)) over the row's distribution.
+pub fn refTypical(dist: []const f64, draft: u32, t: Typical) bool {
+    var h: f64 = 0;
+    for (dist) |p| if (p > 0) {
+        h -= p * @log(p);
+    };
+    return dist[draft] > @min(@as(f64, t.eps), @as(f64, t.delta) * @exp(-h));
+}
+
 const testing = std.testing;
 
 test "dsv41 dspark: the verify schedule partitions K + 1 rows, the early stop keeps a leading run" {
@@ -562,4 +677,72 @@ test "dsv41 dspark: the counters' rates on an empty run, and the schedule's dept
     try lk.appendCommitted(&.{7});
     var out: [12]u32 = undefined;
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6, 9, 7 }, lk.extend(&.{ 1, 2, 3, 4, 5 }, &out));
+}
+
+test "dsv41 dspark: sampling: greedy requests keep the exact path; the draws are seeded, per position, in (0, 1)" {
+    try testing.expect(Sampling.active(null) == null);
+    try testing.expect(Sampling.active(.{ .temperature = 0.005, .seed = 1 }) == null);
+    try testing.expect(Sampling.active(.{ .temperature = 0.7, .top_k = 1, .seed = 1 }) == null);
+    try testing.expect(Sampling.active(.{ .temperature = 0.7, .seed = 1 }) != null);
+    try testing.expectEqual(drawU(42, 1000), drawU(42, 1000));
+    try testing.expect(drawU(42, 1000) != drawU(42, 1001) and drawU(42, 1000) != drawU(43, 1000));
+    var lo: f32 = 1;
+    var hi: f32 = 0;
+    for (0..10000) |i| {
+        const u = drawU(7, i);
+        lo = @min(lo, u);
+        hi = @max(hi, u);
+    }
+    try testing.expect(lo > 0 and hi < 1 and lo < 0.01 and hi > 0.99);
+}
+
+test "dsv41 dspark: sampling: the reference filter keeps top_k, then top_p over the renormalised set, then min_p" {
+    const lg = [_]f32{ 2.0, 1.0, 0.5, 0.0, -1.0 };
+    var d: [5]f64 = undefined;
+    refDistribution(&lg, .{ .temperature = 1.0, .top_k = 2, .seed = 0 }, &d);
+    try testing.expect(d[0] > 0 and d[1] > 0 and d[2] == 0 and d[3] == 0 and d[4] == 0);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), d[0] + d[1], 1e-12);
+    // top_p 0.5: the top token alone is 0.53 of the mass.
+    refDistribution(&lg, .{ .temperature = 1.0, .top_p = 0.5, .seed = 0 }, &d);
+    try testing.expect(d[0] == 1.0 and d[1] == 0);
+    // min_p 0.4: tokens under 0.4 x the top's probability are dropped (e^-1 = 0.37 for the second).
+    refDistribution(&lg, .{ .temperature = 1.0, .min_p = 0.4, .seed = 0 }, &d);
+    try testing.expect(d[0] > 0 and d[1] == 0);
+    // T = 1, no filter: the softmax; every draw lands on a token with mass.
+    refDistribution(&lg, .{ .temperature = 1.0, .seed = 0 }, &d);
+    for (0..1000) |i| try testing.expect(d[refDraw(&d, drawU(3, i))] > 0);
+}
+
+test "dsv41 dspark: sampling: on a fixed target / draft fixture the typical acceptance rate falls as the temperature rises" {
+    // 64 rows of a 512-token vocab, seeded logits with one clear leader; the draft is the row's leader (the drafter
+    // agrees with the target's mode), the typical test at the served delta 0.3.
+    var rng: std.Random.DefaultPrng = .init(20261007);
+    const V = 512;
+    var rows: [64][V]f32 = undefined;
+    var drafts: [64]u32 = undefined;
+    for (&rows, &drafts) |*row, *dr| {
+        for (row) |*v| v.* = rng.random().floatNorm(f32);
+        dr.* = rng.random().uintLessThan(u32, V);
+        row[dr.*] += 6.0 + 2.0 * rng.random().float(f32);
+    }
+    const temps = [_]f32{ 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0 };
+    var rates: [temps.len]f64 = undefined;
+    var masses: [temps.len]f64 = undefined;
+    var d: [V]f64 = undefined;
+    for (temps, &rates, &masses) |t, *r, *m| {
+        var acc: f64 = 0;
+        var mass: f64 = 0;
+        for (&rows, drafts) |*row, dr| {
+            refDistribution(row, .{ .temperature = t, .seed = 0 }, &d);
+            acc += @floatFromInt(@intFromBool(refTypical(&d, dr, .{ .delta = 0.3 })));
+            mass += d[dr];
+        }
+        r.* = acc / 64.0;
+        m.* = mass / 64.0;
+    }
+    std.debug.print("\ndsv41 dspark sampling: T {any}\n  typical acceptance {any}\n  draft probability {any}\n", .{ temps, rates, masses });
+    // The rate never rises with T, and falls over the range; the draft's probability falls at every step.
+    for (rates[0 .. rates.len - 1], rates[1..]) |x, y| try testing.expect(y <= x);
+    try testing.expect(rates[rates.len - 1] < rates[0]);
+    for (masses[0 .. masses.len - 1], masses[1..]) |x, y| try testing.expect(y < x);
 }

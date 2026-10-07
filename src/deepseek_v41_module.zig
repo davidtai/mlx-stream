@@ -1423,6 +1423,34 @@ pub const Module = struct {
         return self.dsparkRoundLogged(a, t1, accepted_cap, null, {});
     }
 
+    /// `dsparkRound` for a sampled request (`ds.Sampling`, the host's `sdk.SamplingParams`): each verify row's token is
+    /// drawn from its tempered, filtered distribution (the correction and the bonus) and the typical test reads that
+    /// distribution; a greedy request (`ds.Sampling.active` null) is `dsparkRound`, op for op. Without a strategy the
+    /// serial step draws its next token the same way.
+    pub fn dsparkRoundSampled(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: ?ds.Sampling) !DsparkRound {
+        const sm = ds.Sampling.active(sampling) orelse return self.dsparkRound(a, t1, accepted_cap);
+        try self.gate.begin(.decode_step);
+        const d: *Dspark = if (self.dspark) |*x| x else {
+            const base: u64 = self.position();
+            const logits = try self.forward(&.{t1});
+            defer _ = mlx.mlx_array_free(logits);
+            const sh = self.g.shapeOf(logits);
+            const sr = try dsl.Loop(G).sampledRows(&self.g, try self.g.reshape(logits, &.{ 1, sh.dim(-1) }), sm, base);
+            var next: [1]u32 = undefined;
+            _ = try self.g.hostU32(sr.tok, &next);
+            self.g.reset();
+            const tokens = try a.alloc(u32, 1);
+            tokens[0] = t1;
+            return .{ .tokens = tokens, .accepted = 0, .next_token = next[0] };
+        };
+        switch (self.arm) {
+            inline else => |t| {
+                const r = try d.lp.roundSampled(&t.arm.hook, a, t1, accepted_cap, sm, null, {});
+                return .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token };
+            },
+        }
+    }
+
     /// `dsparkRound` with the loop's cycle log and a stamper (the cell's receipts; `{}` compiles them out).
     pub fn dsparkRoundLogged(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, cycle_log: ?*dsl.CycleLog, stamp: anytype) !DsparkRound {
         // The phase change is upstream's decode handover (`decodeHandover`), never taken here (`PhaseGate`).
