@@ -69,14 +69,36 @@ ceiling (the GPU working set, less the host's wired margin) against an itemized 
 refuses a request that its bill does not cover. The bill covers every prompt up to the model settings' `ctx_size`
 (16,384 tokens without one), so a server started at a long context admits fewer rows than one started at 16K.
 
-Contexts up to the model's 1,048,576 tokens are supported. Measured on one Mac (server build e19d8103, this tree's
-served code), one fresh server and one cold request per context.
+Contexts up to the model's 1,048,576 tokens are supported. Measured on one Mac, one fresh server and one cold request
+per context (2026-10-07, run `f6-20261007-121136`). Build: this tree's served code (plugin `ef7677f`), host mlx-serve
+`72b36513`, server binary sha256 `c8cbf14e`.
 
 Definitions: **context** = prompt tokens of the request; **prompt rows / decode rows** = expert slot rows per layer
 the server admitted for the prompt pass and for decode; **prefill** = prompt tokens / time to first token; **TTFT** =
 time to first token; **decode** = generated tokens per second after the first; **peak** = the server's footprint
 peak over the request; **bound** = the bill's process bound at the admitted rows (the most the bill lets the process
 hold). GB are decimal.
+
+| context | prompt rows | decode rows | prefill (tok/s) | TTFT (s) | decode (tok/s) | peak (GB) | bound (GB) |
+|---|---|---|---|---|---|---|---|
+| 1,024 | 148 | 167 | 81.3 | 12.60 | 39.9 | 107.2 | 108.4 |
+| 2,048 | 142 | 166 | 138.3 | 14.80 | 39.7 | 106.8 | 108.1 |
+| 4,096 | 137 | 166 | 264.4 | 15.49 | 38.3 | 106.8 | 108.2 |
+| 8,192 | 137 | 166 | 461.5 | 17.75 | 38.6 | 106.8 | 108.3 |
+| 16,384 | 135 | 166 | 667.5 | 24.55 | 37.9 | 107.0 | 108.3 |
+| 32,768 | 135 | 166 | 618.5 | 52.98 | 37.9 | 107.1 | 108.4 |
+| 65,536 | 135 | 165 | 537.5 | 121.93 | 35.5 | 106.9 | 108.2 |
+| 131,072 | 130 | 164 | 501.2 | 261.52 | 32.5 | 106.8 | 108.4 |
+| 262,144 | 115 | 161 | 456.3 | 574.50 | 27.1 | 106.4 | 108.4 |
+| 524,288 | 91 | 155 | 379.5 | 1,381.52 | 18.2 | 106.3 | 108.3 |
+| 1,047,488 | 82 | 143 | 262.6 | 3,988.91 | 11.1 | 103.7 | 108.0 |
+
+The 16,384-token headline cell (the standard 16K prompt, its own server, same build and run): 661.5 tok/s prefill,
+24.77 s TTFT, 36.8 tok/s decode, at 135 prompt / 166 decode rows (peak 107.0 GB, bound 108.3 GB).
+
+The previous build (plugin `b955309`, host `72b36513`, server `e19d8103`; 2026-10-06), same definitions, before the
+kept selection was carried as ids and packed candidate blocks and the indexer's consumer was billed at its block
+peak:
 
 | context | prompt rows | decode rows | prefill (tok/s) | TTFT (s) | decode (tok/s) | peak (GB) | bound (GB) |
 |---|---|---|---|---|---|---|---|
@@ -92,8 +114,7 @@ hold). GB are decimal.
 | 524,288 | 88 | 154 | 373.2 | 1,404.85 | 18.4 | 104.1 | 107.7 |
 | 1,047,488 | 71 | 142 | 244.3 | 4,287.71 | 11.0 | 101.5 | 107.7 |
 
-The 16,384-token headline cell (the standard 16K prompt, its own server): 668.3 tok/s prefill, 24.52 s TTFT, 37.6
-tok/s decode, at 135 prompt / 166 decode rows (peak 107.0 GB, bound 108.3 GB).
+Its 16K headline cell: 668.3 tok/s prefill, 24.52 s TTFT, 37.6 tok/s decode, at 135 / 166 rows.
 
 How the long prompts stay inside the bill:
 
@@ -101,10 +122,12 @@ How the long prompts stay inside the bill:
   sized from the served attention's own arrays (`kvc.servedSpanRows`): the 640 selected keys and the indexer's
   score over the positions read, at an 8 GB target. Prompts up to 16,384 tokens keep the span they always had; longer
   ones run 953-row chunks. The module and the bill read the same function.
-- **The index selection.** Each chunk's selection is kept across the layer for every chunk of its call, 5 B per row
-  and position read (`kvc.selection_pos_bytes`). A sub-chunk call deep in a long prompt runs fewer rows, so its rows
-  times the positions it reads stay within a fixed budget; every call up to 256K positions runs the full 16,384 rows.
-  The indexer scores and selects a chunk in row blocks when the chunk's score would pass 2 GiB (above ~450K positions).
+- **The index selection.** Each chunk keeps its selection across the layer as the selected ids (`int32`, 512 per
+  row) and its candidate blocks packed one bit per block, not as row-by-position masks; the bill holds those exactly
+  plus 3 B per row and position read (`kvc.selection_pos_bytes`) that the trace does not yet attribute. The indexer's
+  scoring is billed at its block peak. A sub-chunk call deep in a long prompt runs fewer rows, so its rows times the
+  positions it reads stay within a fixed budget; every call up to ~437K positions runs the full 16,384 rows. The
+  indexer scores and selects a chunk in row blocks when the chunk's score would pass 2 GiB (above ~450K positions).
 - **The host side.** Host transients of the prompt pass and of construction (the kernel self-checks' inputs, the
   bill's own arenas) live on pages unmapped at their end, so libc's large-block cache does not keep them in the
   footprint; the bill's host term is 1.00 GB.
