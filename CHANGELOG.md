@@ -9,6 +9,8 @@
   rows-times-positions budget; the indexer selects in row blocks past a 2 GiB score; the routed group's terms follow
   the arrays the served kernels allocate; construction and prompt host transients no longer stay in libc's large-block
   cache (host term 2.60 -> 1.00 GB).
+- Measured context ladder (1K to 1M, server e19d8103) in README, Memory and context length; 16K headline 668.3 tok/s
+  prefill, 24.52 s TTFT, 37.6 tok/s decode.
 - Initial import from the mlx-serve fork (commit d38ef038): the DeepSeek-V4.1 arch, the EXL3 quant and kernels, the
   streamed expert source and its C read pool, as a plugin consumed through mlx-serve's `sdk`. The decode levers
   under evaluation ship off by default.

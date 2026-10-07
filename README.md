@@ -69,24 +69,31 @@ ceiling (the GPU working set, less the host's wired margin) against an itemized 
 refuses a request that its bill does not cover. The bill covers every prompt up to the model settings' `ctx_size`
 (16,384 tokens without one), so a server started at a long context admits fewer rows than one started at 16K.
 
-Contexts up to the model's 1,048,576 tokens are supported. Measured on one Mac with this build (served, one fresh
-server and one cold request per context; peak = the server's footprint peak; bound = the bill's process bound at the
-admitted rows). The 16,384 headline is the standard 16K prompt; the other rows are the context sweep's fixture.
+Contexts up to the model's 1,048,576 tokens are supported. Measured on one Mac (server build e19d8103, this tree's
+served code), one fresh server and one cold request per context.
 
-| context | rows (prompt / decode) | prefill tok/s | TTFT | decode tok/s | peak | bound |
-|---|---|---|---|---|---|---|
-| 16,384 (headline) | 135 / 166 | 668.3 | 24.5 s | 37.6 | 107.0 GB | 108.3 GB |
-| 1,024 | 149 / 168 | 81.2 | 12.6 s | 40.3 | 107.7 GB | 108.9 GB |
-| 2,048 | 143 / 168 | 133.4 | 15.3 s | 39.7 | 107.8 GB | 109.1 GB |
-| 4,096 | 139 / 167 | 263.4 | 15.6 s | 38.3 | 107.3 GB | 109.0 GB |
-| 8,192 | 138 / 167 | 464.3 | 17.6 s | 35.1 | 107.4 GB | 108.9 GB |
-| 16,384 | 136 / 167 | 579.6 | 28.3 s | 34.9 | 107.5 GB | 108.8 GB |
-| 32,768 | 136 / 167 | 551.1 | 59.5 s | 34.6 | 107.7 GB | 108.9 GB |
-| 65,536 | 134 / 166 | 529.9 | 123.7 s | 34.6 | 107.4 GB | 109.0 GB |
-| 131,072 | 123 / 165 | 487.3 | 269.0 s | 31.6 | 107.3 GB | 109.0 GB |
-| 262,144 | 100 / 162 | 447.6 | 585.7 s | 27.1 | 106.5 GB | 108.8 GB |
-| 524,288 | 89 / 155 | 378.0 | 1,387 s | 18.4 | 104.6 GB | 108.2 GB |
-| 1,047,488 | 72 / 144 | 245.7 | 4,263 s | 11.0 | 102.5 GB | 108.5 GB |
+Definitions: **context** = prompt tokens of the request; **prompt rows / decode rows** = expert slot rows per layer
+the server admitted for the prompt pass and for decode; **prefill** = prompt tokens / time to first token; **TTFT** =
+time to first token; **decode** = generated tokens per second after the first; **peak** = the server's footprint
+peak over the request; **bound** = the bill's process bound at the admitted rows (the most the bill lets the process
+hold). GB are decimal.
+
+| context | prompt rows | decode rows | prefill (tok/s) | TTFT (s) | decode (tok/s) | peak (GB) | bound (GB) |
+|---|---|---|---|---|---|---|---|
+| 1,024 | 146 | 165 | 80.9 | 12.66 | 39.6 | 106.1 | 107.3 |
+| 2,048 | 141 | 165 | 138.1 | 14.82 | 38.9 | 106.2 | 107.6 |
+| 4,096 | 136 | 165 | 264.9 | 15.46 | 38.0 | 106.2 | 107.7 |
+| 8,192 | 135 | 165 | 461.0 | 17.77 | 38.1 | 106.3 | 107.7 |
+| 16,384 | 134 | 165 | 613.0 | 26.73 | 36.4 | 106.5 | 107.7 |
+| 32,768 | 134 | 164 | 582.5 | 56.25 | 36.4 | 106.1 | 107.6 |
+| 65,536 | 131 | 164 | 555.6 | 117.96 | 36.0 | 106.3 | 107.6 |
+| 131,072 | 120 | 162 | 508.8 | 257.61 | 31.4 | 105.7 | 107.4 |
+| 262,144 | 97 | 160 | 466.0 | 562.54 | 26.7 | 105.5 | 107.8 |
+| 524,288 | 88 | 154 | 373.2 | 1,404.85 | 18.4 | 104.1 | 107.7 |
+| 1,047,488 | 71 | 142 | 244.3 | 4,287.71 | 11.0 | 101.5 | 107.7 |
+
+The 16,384-token headline cell (the standard 16K prompt, its own server): 668.3 tok/s prefill, 24.52 s TTFT, 37.6
+tok/s decode, at 135 prompt / 166 decode rows (peak 107.0 GB, bound 108.3 GB).
 
 How the long prompts stay inside the bill:
 
