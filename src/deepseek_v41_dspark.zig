@@ -235,6 +235,8 @@ pub const Lookup = struct {
 /// accepted with probability p(x) (u < p(x), u = `drawU(seed, pos)`); at the first rejection the correction is drawn
 /// from the residual norm((p - q)+) = p without x, renormalised; with every draft accepted the bonus is drawn from the
 /// next row's p (both draws by inverse CDF at `drawV(seed, pos)`). Every emitted token is then distributed as p.
+/// The trade-off: a point-mass proposal is accepted at p(x), against sum min(p, q) for drafts drawn from a draft
+/// distribution q; in exchange the draft graph is the greedy path's (no per-stage softmax, no sampled markov step).
 /// `greedy` requests (T < 0.01 or top_k = 1) never reach it: the lane keeps the exact path (the argmax rows, the
 /// typical test at T = 1).
 pub const Sampling = struct {
