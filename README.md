@@ -62,6 +62,40 @@ CPU, and adds the bank tests when `DSV41_BANK` is set.
 The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model or run on the GPU
 skip unless their own inputs are given.
 
+## Memory and context length
+
+The module bills its memory before it allocates anything. At load it fills the expert slot rows up to the box's
+ceiling (the GPU working set, less the host's wired margin) against an itemized bill of every term it will hold, and
+refuses a request that its bill does not cover. The bill covers every prompt up to the model settings' `ctx_size`
+(16,384 tokens without one), so a server started at a long context admits fewer rows than one started at 16K.
+
+Contexts up to the model's 1,048,576 tokens are supported. Measured on one Mac (served, one cold request each, the
+16K headline prompt and the long-context fixture; peak = the server's footprint peak; bound = the bill's process
+bound at the admitted rows):
+
+| context | rows (prompt / decode) | prefill tok/s | TTFT | decode tok/s | peak | bound |
+|---|---|---|---|---|---|---|
+| 16,384 | 135 / 166 | 668 | 24.5 s | 37.6 | 107.0 GB | 108.3 GB |
+| 262,144 | 102 / 165 | 308 | 851 s | 26.9 | 108.1 GB | 110.6 GB |
+| 524,288 | 89 / 155 | 378 | 1,387 s | 18.4 | 104.6 GB | 108.2 GB |
+| 1,047,488 | 72 / 144 | 246 | 4,263 s | 11.0 | 102.5 GB | 108.5 GB |
+
+(The 262,144 row is from the build before the served prompt span below; the others are from this one.)
+
+How the long prompts stay inside the bill:
+
+- **The prompt pass's span.** The prompt runs in sub-chunk calls of up to 16,384 rows, each in chunks of a span
+  sized from the served attention's own arrays (`kvc.servedSpanRows`): the 640 selected keys and the indexer's
+  score over the positions read, at an 8 GB target. Prompts up to 16,384 tokens keep the span they always had; longer
+  ones run 953-row chunks. The module and the bill read the same function.
+- **The index selection.** Each chunk's selection is kept across the layer for every chunk of its call, 5 B per row
+  and position read (`kvc.selection_pos_bytes`). A sub-chunk call deep in a long prompt runs fewer rows, so its rows
+  times the positions it reads stay within a fixed budget; every call up to 256K positions runs the full 16,384 rows.
+  The indexer scores and selects a chunk in row blocks when the chunk's score would pass 2 GiB (above ~450K positions).
+- **The host side.** Host transients of the prompt pass and of construction (the kernel self-checks' inputs, the
+  bill's own arenas) live on pages unmapped at their end, so libc's large-block cache does not keep them in the
+  footprint; the bill's host term is 1.00 GB.
+
 ## Environment switches
 
 The served path reads two environment variables, both at construction. Its routes, schedules and memory bill come

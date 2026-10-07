@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Long contexts: the bill and the prompt pass are correct and measured at 16K, 256K, 512K and 1M tokens (see
+  README, Memory and context length). The prompt pass's chunk span past 16K comes from the served attention's own
+  arrays (953 rows; the stock full-score rule fell to 14 rows at 1M and made the pass quadratic in its chunk count);
+  the index selection is billed at its measured 5 B per row and position and each sub-chunk call stays within a fixed
+  rows-times-positions budget; the indexer selects in row blocks past a 2 GiB score; the routed group's terms follow
+  the arrays the served kernels allocate; construction and prompt host transients no longer stay in libc's large-block
+  cache (host term 2.60 -> 1.00 GB).
 - Initial import from the mlx-serve fork (commit d38ef038): the DeepSeek-V4.1 arch, the EXL3 quant and kernels, the
   streamed expert source and its C read pool, as a plugin consumed through mlx-serve's `sdk`. The decode levers
   under evaluation ship off by default.
