@@ -1247,11 +1247,12 @@ pub const Module = struct {
         defer if (self.state) |*s| {
             s.span_chunk = null;
         };
-        if (rest.len <= self.prefill_sub) return self.continueCall(rest);
+        // Each call's rows x the positions it reads within `kvc.prefill_sub_area` (the bill's selection bound).
+        if (rest.len <= self.prefill_sub and rest.len * ids.len <= kvc.prefill_sub_area) return self.continueCall(rest);
         var at: usize = 0;
         var logits: ?mlx.mlx_array = null;
         while (at < rest.len) {
-            const end = @min(rest.len, at + self.prefill_sub);
+            const end = @min(rest.len, at + kvc.prefillSubRowsAt(keep + at, 0, self.prefill_sub));
             if (logits) |x| _ = mlx.mlx_array_free(x);
             if (at > 0) self.g.clearCache();
             logits = try self.continueCall(rest[at..end]);

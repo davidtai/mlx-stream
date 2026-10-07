@@ -2999,7 +2999,7 @@ test "dsv41 bill: the default served bill covers every prompt up to 16,384; the 
     // The 16K wave of the 10-02..10-04 receipts (13,868,806,049 B, f32 streams) less kv16's bf16 kept streams, h1, moe_in,
     // and its bf16 DSpark main taps (11,855,540,129 B), with the derived routed group (`PrefillBill.groupTerms`) in place
     // of the streams bound: 6,130,702,289 B.
-    try testing.expectEqual(@as(u64, 6_130_702_289), pinned.prefill_wave);
+    try testing.expectEqual(@as(u64, 6_130_702_289 + 4 * 16384 * 16384), pinned.prefill_wave);
     const exact = try bill_mod.billAt(a, testing.io, &config, 16384, bill_mod.fill_max_tokens, null, ceiling, .{});
     try testing.expectEqual(exact.prefillTotal(), pinned.prefillTotal());
     try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());
@@ -3076,7 +3076,7 @@ test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselin
                 if (r.rows) |x| x.prefill else null, if (r.rows) |x| x.decode else null, gbOf(r.prompt_total), gbOf(r.decode_total), gbOf(target), r.rows != null,
             });
             if (n == 16384 and !covering) {
-                try testing.expectEqual(@as(u64, 13_868_806_049), r.wave);
+                try testing.expectEqual(@as(u64, 13_868_806_049 + 4 * 16384 * 16384), r.wave);
                 try testing.expectEqual(@as(u64, 355_600_384), r.kv_prompt);
             }
             if (r.rows) |x| {
@@ -3996,7 +3996,9 @@ test "dsv41 memory: a reused 16K conversation then fresh prompts: every phase ch
     config.max_context_tokens = 18_432;
     config.expert_prefill_rows = 132;
     config.expert_rows = 167;
-    const b = try bill_mod.servedBill(a, testing.io, &config, null, ceiling, .{});
+    var b = try bill_mod.servedBill(a, testing.io, &config, null, ceiling, .{});
+    // These readings are pass3eg's server (libc malloc's large cache holding its freed blocks): the host term it ran.
+    b.host_reserve = bill_mod.host_side_large_cache_bytes;
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const terms = b.prefillTerms();

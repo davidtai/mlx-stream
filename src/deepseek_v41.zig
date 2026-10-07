@@ -275,6 +275,29 @@ pub const PrefillBill = struct {
     pub const wave_row_bytes: u64 = 5 << 20;
     /// What a prompt forward keeps per position across its chunks (each chunk's hidden and taps until the concat).
     pub const kept_pos_bytes: u64 = 256 << 10;
+    /// The index selection's bytes per row and compressed position (`kvc.selection_pos_bytes`: one constant with the call area).
+    pub const selection_pos_bytes: u64 = kvc.selection_pos_bytes;
+
+    /// A call's rows x compressed positions (the selection's extent): `rows` x `positions / min_ratio`, and for a
+    /// sub-chunk call of a longer prompt (fewer rows than positions) at most the module's area (`kvc.prefill_sub_area`,
+    /// one span over for the merged tail): `kvc.prefillSubCalls` keeps every call within it by construction.
+    /// IDX_CHUNKED_SELECT (`graph.index_select_block_bytes`, `graph.indexSelectRows`): a call of `rows` over N compressed
+    /// positions scores and selects R = clamp(budget / (5 N), 256, rows) rows at a time. The selection's live bytes per row
+    /// and compressed position are measured at 5 (pass3ep: the f32 score beside the bool mask, 4.99 B over 16 calls): one
+    /// launch (R = rows) holds 5 rows N, as before; a blocked call keeps the mask and the candidates (2 B, `kvc
+    /// .selection_pos_bytes`, billed by `selectionRowPositions`) and one block's 5 R N (at most the budget).
+    pub const index_select_block_bytes: u64 = 2 << 30;
+    pub const index_select_min_rows: u64 = 256;
+    pub fn selectBlockRows(rows: u64, n: u64) u64 {
+        const fit = index_select_block_bytes / (5 * @max(n, 1));
+        return @min(@max(@min(fit, rows), index_select_min_rows), rows);
+    }
+    pub fn selectionRowPositions(b: PrefillBill, rows: u64, span: u64, positions: u64) u64 {
+        if (b.min_ratio == 0) return 0;
+        const rp = rows * (positions / b.min_ratio);
+        if (rows >= positions) return rp;
+        return @min(rp, (kvc.prefill_sub_area + span * positions) / b.min_ratio);
+    }
     /// `default_chunk_target_bytes` of the chunk rule the model forwards its prompt by.
     pub const chunk_target_bytes: f64 = 8e9;
     /// kv16: the bytes of one stored KV element: the window ring's and the compressed store's rows are bf16 (the
@@ -422,7 +445,7 @@ pub const PrefillBill = struct {
         const halves = seq * (b.hc * d * sb + d * sb + 2 * b.hc * 4 + b.hc * b.hc * 4);
         // The index selection, plus (served) the prefill core's window selection memo per chunk: idx i32 + valid.
         const win_sel = if (tier == .served) seq * (b.selected_keys - b.index_topk) * 5 else 0;
-        const selection = seq * ((if (b.min_ratio > 0) positions / b.min_ratio else 0) + b.index_topk * 4) + win_sel;
+        const selection = b.selectionRowPositions(seq, span, positions) * selection_pos_bytes + seq * b.index_topk * 4 + win_sel;
         const attn = b.waveBytes(span, positions, tier) - positions * kept_pos_bytes - span * wave_row_bytes + span * b.attn_row_bytes;
         const cap: u64 = @max(1, @as(u64, @intFromFloat(@floor(@max(chunk_target_bytes, 1e9) / @as(f64, @floatFromInt(b.top_k * d * 4))))));
         const g_rows = @min(seq, cap);
@@ -635,14 +658,16 @@ test "dsv41 memory: kv16's layer-major wave: bf16 streams, the attention side ov
 test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-output copy, over the measured 16K transient" {
     const b = bank30Bill();
     const wave = b.layerMajorWaveBytes(16384, .served);
-    try std.testing.expectEqual(@as(u64, 14_407_237_632), wave);
+    try std.testing.expectEqual(@as(u64, 14_407_237_632 + 4 * 16384 * 16384), wave);
     try std.testing.expectEqual(@as(u64, 2_013_265_920), b.wideLaneBytes(16384));
     const billed = b.layerMajorBilledBytes(16384, .served);
     // The K16 cells' prompt MLX peak over the constructed module (16.25 GB) less the request's KV (0.16 GB).
     const measured: u64 = 16_250_000_000 - 160_000_000;
-    try std.testing.expect(billed >= measured and billed - measured < 400_000_000);
+    // The selection's score row (4 B a row and position, pass3ep: 1.07 GB at 16K) is billed since; these cells' residual
+    // is the group term's (its reconcile owns it), never an under-bill.
+    try std.testing.expect(billed >= measured and billed - measured < 400_000_000 + 4 * 16384 * 16384);
     // What it replaces: the x 5/4 pad, 1.59 GB more at 16K.
-    try std.testing.expectEqual(@as(u64, 1_588_543_488), wave / 4 * 5 - billed);
+    try std.testing.expectEqual(@as(u64, 1_588_543_488 + 16384 * 16384), wave / 4 * 5 - billed);
     // The per-request bill (the server's admission) carries the same transient.
     try std.testing.expectEqual(billed, b.layerMajorBytes(16384, 1024, .served));
     // JOINLESS's minimal-copy merge (58d9fb1): the joined input is at most 28 / 51 of the routed rows, 1.11 GB of

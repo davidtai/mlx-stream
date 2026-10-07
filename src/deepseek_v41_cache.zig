@@ -340,15 +340,55 @@ pub fn prefillSubWidest(n: u64, span: u64, sub: u64) u64 {
     return if (r > 0 and r <= span) w + r else w;
 }
 
-/// The calls (`[start, end)`) a prompt of `n` tokens runs as (`prefillSubWidth`, the short tail merged).
+/// A sub-chunk call's rows x the positions it reads, at most (one span over, from the merged short tail: the bill's
+/// `PrefillBill.selectionRowPositions`). The call's index selection is held per row and position read across the layer
+/// (pass3ep, 256K: 4.99 B a row and position, 16 calls, residual 0.23 GB), so a call deep in a long prompt runs fewer
+/// rows: 16,384 rows up to 262,144 positions (every prompt up to 256K unchanged), then fewer (8,192 at 512K, 4,096 at 1M).
+pub const prefill_sub_area: u64 = prefill_selection_budget_bytes / selection_pos_bytes;
+
+/// The index selection a prompt call holds per row and compressed position across a layer: each K16 chunk's kept
+/// selection (its top-k mask, candidates and window memo, carried to the layer's routed call) over every chunk of the
+/// call, 4.99 B a row and position read (pass3ep at 256K: 16 sub-chunk calls, residual 0.23 GB). IDX_CHUNKED_SELECT
+/// does not lower it: the indexer launches per chunk (`indexerSelect` sees the chunk's rows: 59 at 256K, 14 at 1M), and a
+/// chunk's 5 x rows x N stays under its block budget, so every served chunk keeps the one launch (pass3et's 256K kill
+/// with the select merged). The bill and the call area read this one constant.
+pub const selection_pos_bytes: u64 = 5;
+
+/// The selection's budget per sub-chunk call, fixed in bytes (21.47 GB: 16,384 rows over 262,144 positions at 5 B, so
+/// every prompt up to 256K runs its calls as before); the area in rows x positions follows `selection_pos_bytes`.
+pub const prefill_selection_budget_bytes: u64 = 21_474_836_480;
+
+/// The rows of a sub-chunk call starting at position `start`: the largest w <= `sub` with w x (start + w) <=
+/// `prefill_sub_area`, rounded down to a multiple of `span` (at least one span) so its spans are the one-call pass's.
+pub fn prefillSubRowsAt(start: u64, span: u64, sub: u64) u64 {
+    const disc = start * start + 4 * prefill_sub_area;
+    var w = (std.math.sqrt(disc) - start) / 2;
+    while (w > 0 and w * (start + w) > prefill_sub_area) w -= 1;
+    while ((w + 1) * (start + w + 1) <= prefill_sub_area) w += 1;
+    w = @min(w, sub);
+    if (span > 0 and span < sub) w = @max(w - w % span, span);
+    return @max(w, 1);
+}
+
+/// The calls (`[start, end)`) a prompt of `n` tokens runs as: one call up to the sub-chunk, else calls of
+/// `prefillSubRowsAt` rows from each start (`prefillSubWidth` rows while rows x positions stay within the area), the
+/// short tail (at most one span) merged into the call before it.
 pub fn prefillSubCalls(a: std.mem.Allocator, n: u32, span: u64, sub: u64) ![][2]u32 {
-    const w: u32 = @intCast(prefillSubWidth(n, span, sub));
-    const full = n / w;
-    const r = n % w;
-    const count = if (r > 0 and r > span) full + 1 else full;
-    const out = try a.alloc([2]u32, count);
-    for (out, 0..) |*c, i| c.* = .{ @intCast(i * w), if (i + 1 == count) n else @intCast((i + 1) * w) };
-    return out;
+    if (prefillSubWidth(n, span, sub) >= n) {
+        const one = try a.alloc([2]u32, 1);
+        one[0] = .{ 0, n };
+        return one;
+    }
+    var out: std.ArrayList([2]u32) = .empty;
+    errdefer out.deinit(a);
+    var at: u64 = 0;
+    while (at < n) {
+        var end = @min(@as(u64, n), at + prefillSubRowsAt(at, span, sub));
+        if (end < n and n - end <= span) end = n;
+        try out.append(a, .{ @intCast(at), @intCast(end) });
+        at = end;
+    }
+    return out.toOwnedSlice(a);
 }
 
 test "dsv41 cache: the prompt's sub-chunk calls: one call up to the sub-chunk, then span-aligned calls, the short tail merged" {
@@ -394,6 +434,38 @@ test "dsv41 cache: the prompt's sub-chunk calls: one call up to the sub-chunk, t
     const t = try prefillSubCalls(a, 2 * 60 + 31, 30, 60);
     try testing.expectEqual(@as(usize, 3), t.len);
     try testing.expectEqual([2]u32{ 120, 151 }, t[2]);
+}
+
+test "dsv41 cache: a sub-chunk call's rows x positions stay within the area: 256K unchanged, fewer rows deeper" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try v41.testConfigJson(testing.allocator, .real);
+    defer testing.allocator.free(json);
+    const c = try v41.Config.parse(testing.allocator, json, null);
+    for ([_]u32{ 131072, 262144, 524288, 1048576, 700_001 }) |n| {
+        const span: u64 = @intCast(resolvePrefillChunk(&c, n, null, default_chunk_target_bytes));
+        const calls = try prefillSubCalls(a, n, span, prefill_sub);
+        var widest: u64 = 0;
+        for (calls, 0..) |cl, i| {
+            const rows: u64 = cl[1] - cl[0];
+            if (i > 0) try testing.expectEqual(calls[i - 1][1], cl[0]);
+            try testing.expectEqual(@as(u64, 0), cl[0] % span);
+            try testing.expect(rows <= prefill_sub + span);
+            // rows x positions read: within the area, one span over at most (the merged tail).
+            try testing.expect(rows * cl[1] <= prefill_sub_area + span * cl[1]);
+            widest = @max(widest, rows);
+        }
+        try testing.expectEqual(n, calls[calls.len - 1][1]);
+        // The widest call is the first (the bill's rows): unchanged by the area.
+        try testing.expectEqual(prefillSubWidest(n, span, prefill_sub), widest);
+        if (n <= 262144) try testing.expectEqual((n + prefillSubWidth(n, span, prefill_sub) - 1) / prefillSubWidth(n, span, prefill_sub) - @intFromBool(n % prefillSubWidth(n, span, prefill_sub) != 0 and n % prefillSubWidth(n, span, prefill_sub) <= span), calls.len);
+    }
+    // The rows at a start: the root of w (start + w) <= area, a span multiple.
+    try testing.expectEqual(@as(u64, 16384), prefillSubRowsAt(0, 0, prefill_sub));
+    try testing.expectEqual(@as(u64, 16384), prefillSubRowsAt(245_760, 0, prefill_sub));
+    const w = prefillSubRowsAt(1_040_000, 14, prefill_sub);
+    try testing.expect(w * (1_040_000 + w) <= prefill_sub_area and (w + 14) * (1_040_000 + w + 14) > prefill_sub_area and w % 14 == 0);
 }
 
 // ── tests: a row-id backend checks the lanes' reachable rows on the host ──
