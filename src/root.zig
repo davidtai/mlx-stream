@@ -28,3 +28,5 @@ pub const arch = @import("deepseek_v41_plugin.zig");
 pub const sdk = @import("sdk");
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
 pub const default_context: u64 = @import("deepseek_v41_bill.zig").fill_prompt_tokens;
+/// Positions a request may generate past its prompt (the KV lanes' bound).
+pub const generation_headroom: u64 = @import("deepseek_v41_module.zig").generation_headroom;
