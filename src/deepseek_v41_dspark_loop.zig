@@ -3003,11 +3003,16 @@ test "dsv41 dspark loop: sampling: a sampled request draws every verify row in t
             else => {},
         };
         var gn_argmax: usize = 0;
-        for (greedy_rig.g.nodes.items) |nd| gn_argmax += @intFromBool(nd.op == .argmax);
+        var gn_sort: usize = 0;
+        for (greedy_rig.g.nodes.items) |nd| {
+            gn_argmax += @intFromBool(nd.op == .argmax);
+            gn_sort += @intFromBool(nd.op == .sort);
+        }
         // Per verify chunk: the draw's cumsum (and, with top_p, the filter's), one logsumexp; no verify argmax.
         try testing.expect(n.cumsum >= 2 and n.lse >= 2);
         try testing.expect(n.argmax < gn_argmax);
-        if (sm.sorts()) try testing.expect(n.sort >= 2) else try testing.expectEqual(@as(usize, 0), n.sort);
+        // The model's own sorts are the greedy run's; the filter adds one per verify chunk when top_k / top_p is set.
+        if (sm.sorts()) try testing.expect(n.sort >= gn_sort + 2) else try testing.expectEqual(gn_sort, n.sort);
         // The scripted reads give the same tokens: the decision's host values are read in the same order.
         try testing.expectEqualSlices(u32, gout.items, out.items);
     }

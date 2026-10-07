@@ -713,36 +713,47 @@ test "dsv41 dspark: sampling: the reference filter keeps top_k, then top_p over 
     for (0..1000) |i| try testing.expect(d[refDraw(&d, drawU(3, i))] > 0);
 }
 
-test "dsv41 dspark: sampling: on a fixed target / draft fixture the typical acceptance rate falls as the temperature rises" {
-    // 64 rows of a 512-token vocab, seeded logits with one clear leader; the draft is the row's leader (the drafter
-    // agrees with the target's mode), the typical test at the served delta 0.3.
+test "dsv41 dspark: sampling: on a fixed target / draft fixture, temperature lowers the draft's probability; the typical rule's acceptance does not fall" {
+    // 64 rows of a 512-token vocab with one clear leader per row; two drafters: one proposes the row's leader, one its
+    // runner-up. The typical test at the served delta 0.3: p(draft) > min(1, 0.3 exp(-H)). The floor falls with the
+    // entropy as fast as the leader's probability does (a flat row of m tokens accepts any of them at 0.3 / m), so the
+    // rule's acceptance does not fall with T, it rises: the leader is accepted from low T on (bar the rows its runner-up
+    // overtakes), the runner-up from the T where the row flattens enough. The draft's own probability falls at every step (the sampled correction's work rises).
     var rng: std.Random.DefaultPrng = .init(20261007);
     const V = 512;
     var rows: [64][V]f32 = undefined;
-    var drafts: [64]u32 = undefined;
-    for (&rows, &drafts) |*row, *dr| {
+    var lead: [64]u32 = undefined;
+    var second: [64]u32 = undefined;
+    for (&rows, &lead, &second) |*row, *ld, *sc| {
         for (row) |*v| v.* = rng.random().floatNorm(f32);
-        dr.* = rng.random().uintLessThan(u32, V);
-        row[dr.*] += 6.0 + 2.0 * rng.random().float(f32);
+        ld.* = rng.random().uintLessThan(u32, V);
+        sc.* = (ld.* + 1 + rng.random().uintLessThan(u32, V - 1)) % V;
+        row[ld.*] += 6.0 + 2.0 * rng.random().float(f32);
+        row[sc.*] += 4.0 + 1.0 * rng.random().float(f32);
     }
     const temps = [_]f32{ 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0 };
-    var rates: [temps.len]f64 = undefined;
-    var masses: [temps.len]f64 = undefined;
+    var rate_lead: [temps.len]f64 = undefined;
+    var rate_second: [temps.len]f64 = undefined;
+    var mass_lead: [temps.len]f64 = undefined;
     var d: [V]f64 = undefined;
-    for (temps, &rates, &masses) |t, *r, *m| {
-        var acc: f64 = 0;
-        var mass: f64 = 0;
-        for (&rows, drafts) |*row, dr| {
+    for (temps, 0..) |t, ti| {
+        var al: f64 = 0;
+        var as: f64 = 0;
+        var ml: f64 = 0;
+        for (&rows, lead, second) |*row, ld, sc| {
             refDistribution(row, .{ .temperature = t, .seed = 0 }, &d);
-            acc += @floatFromInt(@intFromBool(refTypical(&d, dr, .{ .delta = 0.3 })));
-            mass += d[dr];
+            al += @floatFromInt(@intFromBool(refTypical(&d, ld, .{ .delta = 0.3 })));
+            as += @floatFromInt(@intFromBool(refTypical(&d, sc, .{ .delta = 0.3 })));
+            ml += d[ld];
         }
-        r.* = acc / 64.0;
-        m.* = mass / 64.0;
+        rate_lead[ti] = al / 64.0;
+        rate_second[ti] = as / 64.0;
+        mass_lead[ti] = ml / 64.0;
     }
-    std.debug.print("\ndsv41 dspark sampling: T {any}\n  typical acceptance {any}\n  draft probability {any}\n", .{ temps, rates, masses });
-    // The rate never rises with T, and falls over the range; the draft's probability falls at every step.
-    for (rates[0 .. rates.len - 1], rates[1..]) |x, y| try testing.expect(y <= x);
-    try testing.expect(rates[rates.len - 1] < rates[0]);
-    for (masses[0 .. masses.len - 1], masses[1..]) |x, y| try testing.expect(y < x);
+    std.debug.print("\ndsv41 dspark sampling: T {any}\n  typical acceptance, leader drafts {any}\n  typical acceptance, runner-up drafts {any}\n  leader probability {any}\n", .{ temps, rate_lead, rate_second, mass_lead });
+    for (rate_lead[0 .. temps.len - 1], rate_lead[1..]) |x, y| try testing.expect(y >= x);
+    try testing.expectEqual(@as(f64, 1.0), rate_lead[temps.len - 1]);
+    for (rate_second[0 .. temps.len - 1], rate_second[1..]) |x, y| try testing.expect(y >= x);
+    try testing.expect(rate_second[temps.len - 1] > rate_second[0]);
+    for (mass_lead[0 .. temps.len - 1], mass_lead[1..]) |x, y| try testing.expect(y < x);
 }
