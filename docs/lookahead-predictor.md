@@ -36,13 +36,13 @@ The guesses are issued to the SSD reader and land only in empty rows, so they ne
 
 The guesses only choose when reads start. The bytes a row serves are the same record either way.
 
-## 81% of reads issued early at 16K, 77% at 1M
+## 81% of reads issued early at 16K, 78% at 1M
 
 ![Expert records read into slots per request, split into read ahead and read on demand, from 1K to 1M prompt tokens](img/lookahead-ladder.png)
 
-At 16K, 5,056 records (67.3 GB) were issued ahead and 1,211 were read on demand. Prompts of 1K and 2K run as one span, so the predictor doesn't run for them.
+At 16K, 5,096 records (67.9 GB) were issued ahead and 1,223 were read on demand. Prompts of 1K and 2K run as one span, so the predictor doesn't run for them.
 
-Hits were 5,048 of 5,056. That rate flatters the predictor, because a 16K prompt routes about 95% of all experts. In the release that added it, 16K prefill rose from 430.9 to 475.2 tok/s (+10.3%). That release also added a third read window, so the predictor's share of the gain wasn't measured on its own.
+Hits were 5,087 of 5,096. That rate flatters the predictor, because a 16K prompt routes about 95% of all experts. In the release that added it, 16K prefill rose from 430.9 to 475.2 tok/s (+10.3%). That release also added a third read window, so the predictor's share of the gain wasn't measured on its own.
 
 ## Under a second per prompt, no new expert memory
 
@@ -67,8 +67,10 @@ Code at 29c3d43:
 
 ---
 
+Figures come from plugin build ef7677f (mlx-stream; host 72b36513, server c8cbf14e), 2026-10-07.
+
 Receipts (one native served request per row):
 
-- Ladder: `reports/dsv41-f39-tcq3-runtime/mlx-serve-phase2/cx11-runs/cx2-20261006-214409/rows.txt`
-- Slots, bill target and the 206 GB prompt read: `mlx-serve-phase2/ex-runs/ex-20261006-044335/headline.log`
+- Ladder: `reports/dsv41-f39-tcq3-runtime/mlx-serve-phase2/f6-runs/f6-20261007-121136/ladder.log`
+- Slots, bill target and the 206 GB prompt read: `mlx-serve-phase2/f6-runs/f6-20261007-121136/headline.log`
 - Before profile and release step: `mlx-serve-phase2/p1-cross-layer-read-ahead-20260930.md` and `integration-lane-note-20260930.md`
