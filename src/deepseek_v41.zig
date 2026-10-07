@@ -57,6 +57,8 @@ pub const PrefillBill = struct {
     top_k: u64 = 0,
     n_main: u64 = 0,
     index_topk: u64 = 0,
+    /// The candidate source's block (`candidate_block_size`): IDX_CARRY packs its kept blocks eight a byte.
+    candidate_block_size: u64 = 8,
     /// The served prefill indexer route (idxscore + INDEX_TOPK): an index source's score chain is one
     /// [rows, positions] f32 score (and the select's mask), not the per-head [rows, heads, positions].
     index_launch: bool = false,
@@ -288,10 +290,40 @@ pub const PrefillBill = struct {
     /// .selection_pos_bytes`, billed by `selectionRowPositions`) and one block's 5 R N (at most the budget).
     pub const index_select_block_bytes: u64 = 2 << 30;
     pub const index_select_min_rows: u64 = 256;
+    /// The served indexer's live peak over a chunk of `rows` reading `positions` positions (N compressed), per block of
+    /// R = `selectBlockRows(rows, N)` rows (R = rows: the one launch), from the arrays `graph.indexerSelect` /
+    /// `graph.selectChunked` allocate:
+    ///   the block's f32 score [R, N] (deepseek_v41_graph.zig:1133 one launch, :1186 per block), live with
+    ///   - on a candidate consumer, the `where` over the consumed candidates, a second f32 [R, N] (:1138, :1196);
+    ///   - on the candidate source, the score padded to the block width, a second f32 [R, N + pad] (:1070, through
+    ///     `candidateBlocks` at :1136 / :1193); its block keep repeated to bool [R, N + pad] (:1081) after the pad is gone;
+    ///   then the top-k select's bool mask [R, N] and int32 selection [R, k] (:1142, :1198) beside the surviving score.
+    /// The peak is the two f32 copies with the consumer's expanded candidates, 9.5 R N, or the score with the select's
+    /// outputs, 5 R N + 4 R k: the larger.
+    /// The kept selection across the call (the mask and candidates every chunk keeps) is `selectionRowPositions`.
+    pub fn indexChainBytes(b: PrefillBill, rows: u64, positions: u64) u64 {
+        const n = if (b.min_ratio > 0) positions / b.min_ratio else positions;
+        const r = selectBlockRows(rows, n);
+        // IDX_CARRY: a consumer expands the packed candidates per use (`candidateMask`, :1110: the bits unpacked and the
+        // bool [R, N] mask, 1.5 B a row and position) beside the score and its `where` copy.
+        return @max(8 * r * n + (3 * r * n) / 2, 5 * r * n + 4 * r * b.index_topk);
+    }
+
     pub fn selectBlockRows(rows: u64, n: u64) u64 {
         const fit = index_select_block_bytes / (5 * @max(n, 1));
         return @min(@max(@min(fit, rows), index_select_min_rows), rows);
     }
+    /// The selection a sub-chunk call of `rows` keeps across a layer (IDX_CARRY, deepseek_v41_graph.zig): every chunk's
+    /// selected ids, int32 [rows, k] (`shared.selected_idx`, :1325), the candidate source's kept blocks packed eight a
+    /// byte, uint8 [rows, ceil(N / bs / 8)] (`packBlocks`, :1093), and the unattributed `kvc.selection_pos_bytes` per
+    /// row and position read (bounded by the call area). The window memo is `win_sel` beside it.
+    pub fn selectionKeptBytes(b: PrefillBill, rows: u64, span: u64, positions: u64) u64 {
+        const n = if (b.min_ratio > 0) positions / b.min_ratio else positions;
+        const bs: u64 = @max(b.candidate_block_size, 1);
+        const packed_ = rows * ((((n + bs - 1) / bs) + 7) / 8);
+        return b.selectionRowPositions(rows, span, positions) * selection_pos_bytes + rows * b.index_topk * 4 + packed_;
+    }
+
     pub fn selectionRowPositions(b: PrefillBill, rows: u64, span: u64, positions: u64) u64 {
         if (b.min_ratio == 0) return 0;
         const rp = rows * (positions / b.min_ratio);
@@ -354,6 +386,7 @@ pub const PrefillBill = struct {
                 break :n_main n;
             },
             .index_topk = c.index_topk,
+            .candidate_block_size = @max(c.candidate_block_size, 1),
             .n_experts = c.n_routed_experts,
             .moe_inter = c.moe_intermediate_size,
         };
@@ -373,8 +406,13 @@ pub const PrefillBill = struct {
             .served => b.selected_keys,
         };
         const attn = rows * b.n_heads * (keys + 1) * 4;
-        const index = if (tier == .served and b.index_launch) rows * positions * 4 else rows * b.index_heads * positions * 4;
-        return wave_fixed_bytes + rows * wave_row_bytes + chain_copies * @max(attn, index) + positions * kept_pos_bytes;
+        // The served indexer (one score launch per block, IDX_CHUNKED_SELECT): its own peak, both copies counted
+        // (`indexChainBytes`); the per-head stock chain keeps two of its arrays.
+        const chain = if (tier == .served and b.index_launch)
+            @max(chain_copies * attn, b.indexChainBytes(rows, positions))
+        else
+            chain_copies * @max(attn, rows * b.index_heads * positions * 4);
+        return wave_fixed_bytes + rows * wave_row_bytes + chain + positions * kept_pos_bytes;
     }
 
     /// K16 (layer-major prefill: every layer over all of the prompt's chunks before the next) at `seq`
@@ -442,7 +480,7 @@ pub const PrefillBill = struct {
         const halves = seq * (b.hc * d * sb + d * sb + 2 * b.hc * 4 + b.hc * b.hc * 4);
         // The index selection, plus (served) the prefill core's window selection memo per chunk: idx i32 + valid.
         const win_sel = if (tier == .served) seq * (b.selected_keys - b.index_topk) * 5 else 0;
-        const selection = b.selectionRowPositions(seq, span, positions) * selection_pos_bytes + seq * b.index_topk * 4 + win_sel;
+        const selection = b.selectionKeptBytes(seq, span, positions) + win_sel;
         const attn = b.waveBytes(span, positions, tier) - positions * kept_pos_bytes - span * wave_row_bytes + span * b.attn_row_bytes;
         const cap: u64 = @max(1, @as(u64, @intFromFloat(@floor(@max(chunk_target_bytes, 1e9) / @as(f64, @floatFromInt(b.top_k * d * 4))))));
         const g_rows = @min(seq, cap);
@@ -655,16 +693,16 @@ test "dsv41 memory: kv16's layer-major wave: bf16 streams, the attention side ov
 test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-output copy, over the measured 16K transient" {
     const b = bank30Bill();
     const wave = b.layerMajorWaveBytes(16384, .served);
-    try std.testing.expectEqual(@as(u64, 14_407_237_632 + 4 * 16384 * 16384), wave);
+    try std.testing.expectEqual(@as(u64, 14_407_237_632 + 2 * 16384 * 16384 + 16384 * 256), wave);
     try std.testing.expectEqual(@as(u64, 2_013_265_920), b.wideLaneBytes(16384));
     const billed = b.layerMajorBilledBytes(16384, .served);
     // The K16 cells' prompt MLX peak over the constructed module (16.25 GB) less the request's KV (0.16 GB).
     const measured: u64 = 16_250_000_000 - 160_000_000;
     // The selection's score row (4 B a row and position, pass3ep: 1.07 GB at 16K) is billed since; these cells' residual
     // is the group term's (its reconcile owns it), never an under-bill.
-    try std.testing.expect(billed >= measured and billed - measured < 400_000_000 + 4 * 16384 * 16384);
+    try std.testing.expect(billed >= measured and billed - measured < 400_000_000 + 2 * 16384 * 16384 + 16384 * 256);
     // What it replaces: the x 5/4 pad, 1.59 GB more at 16K.
-    try std.testing.expectEqual(@as(u64, 1_588_543_488 + 16384 * 16384), wave / 4 * 5 - billed);
+    try std.testing.expectEqual(@as(u64, 1_588_543_488 + (2 * 16384 * 16384 + 16384 * 256) / 4), wave / 4 * 5 - billed);
     // The per-request bill (the server's admission) carries the same transient.
     try std.testing.expectEqual(billed, b.layerMajorBytes(16384, 1024, .served));
     // JOINLESS's minimal-copy merge (58d9fb1): the joined input is at most 28 / 51 of the routed rows, 1.11 GB of
