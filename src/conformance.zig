@@ -14,7 +14,8 @@ comptime {
 }
 
 test "mlx-stream conformance: the plugin negotiates with this host and registers one macOS-only arch" {
-    try sdk.negotiate(plugin, sdk.host);
+    var buf: [64]u8 = undefined;
+    try sdk.negotiate(plugin, try sdk.host(&buf));
     try std.testing.expectEqualStrings("mlx-stream", plugin.name);
     try std.testing.expect(plugin.macos_only);
     try std.testing.expect(plugin.provides.arch != null and plugin.provides.source == null and plugin.provides.engine == null);

@@ -1,5 +1,5 @@
-//! A plugin's one declaration and the host's compile-time negotiation (docs/plugins.md). The registry
-//! (src/plugins.zig) wraps `negotiate` in @compileError; each kind's `of` checks the kind's interface.
+//! A plugin's one declaration and its negotiation with the host (`negotiate`, which the conformance suite runs
+//! against `sdk.host`); each kind's `of` checks the kind's interface.
 
 const std = @import("std");
 
@@ -11,7 +11,7 @@ pub const Plugin = struct {
     name: []const u8,
     /// The SDK the plugin was built against.
     api: Version,
-    /// The MLX the plugin was tested on, in `sdk.mlx_pin`'s format.
+    /// The MLX the plugin was tested on: `v` + its version (`v0.32.3`).
     mlx: []const u8,
     /// Registers nothing on graphs without the macOS-only sources (Linux, iOS).
     macos_only: bool = false,

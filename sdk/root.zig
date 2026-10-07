@@ -10,13 +10,10 @@
 
 const std = @import("std");
 
-/// The SDK's version. A plugin built against another major is refused at compile time; a newer minor on either
+/// The SDK's version. A plugin built against another major is refused (`negotiate`); a newer minor on either
 /// side is compatible (newer hooks are optional).
-pub const api: Version = .{ .major = 1, .minor = 0 };
+pub const api: Version = .{ .major = 2, .minor = 0 };
 
-/// The MLX this binary links (lib/mlx-src 64ea011cb: v0.32.3). One MLX per process: a plugin tested on another is
-/// refused at compile time, so an MLX bump is one change that moves this pin and every plugin's.
-pub const mlx_pin = "v0.32.3";
 /// Compile the registered plugins' profile probes in (`-Dplugin-profile=true`); off in every served build.
 pub const plugin_profile = false;
 
@@ -31,8 +28,15 @@ pub const Provides = plugin.Provides;
 pub const Host = plugin.Host;
 pub const NegotiationError = plugin.NegotiationError;
 pub const negotiate = plugin.negotiate;
-/// What this host checks every plugin against.
-pub const host: Host = .{ .api = api, .mlx = mlx_pin };
+/// What this process checks every plugin against: this SDK and the MLX it links, as MLX reports itself (`v` + its
+/// version). One MLX per process, so an MLX bump in the host fails every plugin tested on the old one. `buf` holds
+/// the version text.
+pub fn host(buf: []u8) !Host {
+    var s = mlx.mlx_string_new();
+    defer _ = mlx.mlx_string_free(s);
+    try mlx.check(mlx.mlx_version(&s));
+    return .{ .api = api, .mlx = try std.fmt.bufPrint(buf, "v{s}", .{std.mem.span(mlx.mlx_string_data(s))}) };
+}
 
 const peek = @import("peek.zig");
 pub const Priority = peek.Priority;

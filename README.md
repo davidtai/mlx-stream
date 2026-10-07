@@ -44,8 +44,8 @@ zig build refusals -Dmlx-serve=../mlx-serve     # the sdk_ext contracts' compile
 zig build serve -Dmlx-serve=../mlx-serve        # the host's ReleaseFast server with this plugin
 ```
 
-From the host checkout the suites are `zig build mlx-stream-test` and `zig build mlx-stream-conformance` (both part of
-`zig build test`).
+From the host checkout the suites are `zig build mlx-stream-test` (part of `zig build test`) and
+`zig build mlx-stream-conformance`.
 
 `scripts/test_dsv41.sh` runs every `dsv41 ` test of the plugin and the host on the CPU, and adds the bank tests when
 `DSV41_BANK` is set. The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model

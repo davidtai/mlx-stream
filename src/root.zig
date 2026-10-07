@@ -6,7 +6,7 @@
 pub const plugin = sdk.Plugin{
     .name = "mlx-stream",
     .api = .{ .major = 2, .minor = 0 },
-    // The MLX this plugin is tested on; the host refuses it at compile time unless its own MLX is the same.
+    // The MLX this plugin is tested on; the conformance suite fails when the host links another.
     .mlx = "v0.32.3",
     .macos_only = true,
     // The host registers the arch; the EXL3 quant and the EXL3 expert source are its internals, bound at comptime
