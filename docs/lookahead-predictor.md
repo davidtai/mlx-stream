@@ -1,3 +1,6 @@
+![mlx-stream](img/mlx-stream-logo.png)
+
+
 # Guessing MoE experts before attention, so SSD reads overlap compute
 
 *David Tai, October 2026*
