@@ -38,9 +38,14 @@ The plugin builds only inside a host. This repo's `build.zig` runs the host's bu
 `-Dmlx-stream-dir=<this checkout>` (default host: `../mlx-serve`, or pass `-Dmlx-serve=/path`):
 
 ```sh
-zig build test -Dmlx-serve=../mlx-serve     # the plugin's tests (the host's mlx-stream-test step)
-zig build serve -Dmlx-serve=../mlx-serve    # the host's ReleaseFast server with this plugin
+zig build test -Dmlx-serve=../mlx-serve         # the plugin's tests (the host's mlx-stream-test step)
+zig build conformance -Dmlx-serve=../mlx-serve  # the plugin conformance suite (CPU lane, no device)
+zig build refusals -Dmlx-serve=../mlx-serve     # the sdk_ext contracts' compile-time refusals (compile only)
+zig build serve -Dmlx-serve=../mlx-serve        # the host's ReleaseFast server with this plugin
 ```
+
+From the host checkout the suites are `zig build mlx-stream-test` and `zig build mlx-stream-conformance` (both part of
+`zig build test`).
 
 `scripts/test_dsv41.sh` runs every `dsv41 ` test of the plugin and the host on the CPU, and adds the bank tests when
 `DSV41_BANK` is set. The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model
@@ -172,16 +177,20 @@ build.zig, build.zig.zon   standalone build (drives the host's build)
 sdk/                       the arch contract's types (`sdk` module), the weight loader, reads past the page cache
 src/root.zig               the arch the host calls (`arch`, `sdk`, `default_context`) and the tests' surface
 src/tests.zig              the test root (`zig build mlx-stream-test` in the host)
+src/conformance.zig        the conformance suite's root
 src/deepseek_v41_host.zig  the harnesses' and bank tests' bridge (config parse, loaders, memory knobs), test-only
 src/*.zig                  the DeepSeek-V4.1 arch, the EXL3 quant and kernels, the expert stream
 src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile)
 src/kernels/exl3/          the pinned Metal kernel texts and their manifest (embedded at compile time)
 src/fixtures/              test fixtures (bank peek, prefill wave samples, DSpark lookup and receipt stats)
 csrc/                      the C read pool, the MLX event / alloc shims and the profile-only timeline sources
+src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
+docs/                      design notes and the path map from the in-tree layout
 scripts/                   test_dsv41.sh, compile_kernels_offline.py
 ```
 
-This repository was imported from the mlx-serve fork at commit d38ef038, without its history.
+This repository was imported from the mlx-serve fork at commit d38ef038, without its history. `docs/PATH_MAP.md`
+maps every in-tree path to its place here.
 
 ## License
 
