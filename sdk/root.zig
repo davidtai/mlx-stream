@@ -11,7 +11,7 @@
 const std = @import("std");
 
 /// The SDK's version. A plugin built against another major is refused (`negotiate`); a newer minor on either
-/// side is compatible (newer hooks are optional).
+/// side is compatible (newer hooks are optional). 2.0: a draft lane's `round` takes the request's `SamplingParams`.
 pub const api: Version = .{ .major = 2, .minor = 0 };
 
 /// Compile the registered plugins' profile probes in (`-Dplugin-profile=true`); off in every served build.
@@ -59,6 +59,7 @@ pub const DecodeHandover = arch.DecodeHandover;
 const spec = @import("spec.zig");
 pub const Spec = spec.Spec;
 pub const DraftLane = spec.DraftLane;
+pub const SamplingParams = spec.SamplingParams;
 pub const ArmRequest = spec.ArmRequest;
 pub const DraftArm = spec.DraftArm;
 pub const DraftRound = spec.DraftRound;

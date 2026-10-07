@@ -91,6 +91,8 @@ pub const FakeOptions = struct {
     prompt_bytes: ?u64 = null,
     /// `restorePrefix`: the most positions of a prefix-cache match the fake keeps; null = no hook.
     restore_cap: ?u64 = null,
+    /// The draft lane also arms clean sampled requests (else greedy clean only).
+    lane_samples: bool = false,
 };
 
 /// Every call a fake arch's module received.
@@ -118,7 +120,11 @@ pub fn FakeArch(comptime opts: FakeOptions) type {
             last_request: ?arch.RequestShape = null,
             /// The match the last `restorePrefix` was offered.
             last_prefix: usize = 0,
+            /// The sampling the last `round` received.
+            last_round_sampling: ?spec.SamplingParams = null,
         };
+        /// The request the last `arm` received (arm takes a const module).
+        pub var last_arm: ?spec.ArmRequest = null;
         /// The counters every module of this fake writes; reset per test.
         pub var calls: FakeCalls = .{};
 
@@ -198,10 +204,12 @@ pub fn FakeArch(comptime opts: FakeOptions) type {
                 return "fake lane";
             }
             pub fn arm(_: *const Module, req: spec.ArmRequest) spec.DraftArm {
-                return if (req.greedy and req.clean) .typical else .off;
+                last_arm = req;
+                return if (req.clean and (req.greedy or opts.lane_samples)) .typical else .off;
             }
             /// Keeps min(cap, block - 1) drafts: [t1, t1 + 1, ...], the next token after them.
-            pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32) !spec.DraftRound {
+            pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: spec.SamplingParams) !spec.DraftRound {
+                m.last_round_sampling = sampling;
                 const k = @min(accepted_cap, opts.block_size - 1);
                 const toks = try a.alloc(u32, k + 1);
                 for (toks, 0..) |*t, i| t.* = t1 + @as(u32, @intCast(i));
@@ -284,9 +292,10 @@ test "sdk testing: the fake's draft lane names itself, arms only greedy clean re
     try testing.expectEqual(spec.DraftArm.off, lane.arm(&m, .{ .greedy = true, .clean = false }));
     try testing.expectEqual(spec.DraftArm.off, lane.arm(&m, .{ .greedy = false, .clean = true }));
     // a cap past the block keeps block - 1 drafts
-    var r = try lane.round(&m, testing.allocator, 40, 9);
+    var r = try lane.round(&m, testing.allocator, 40, 9, .{ .temperature = 0.6, .top_p = 0.9, .seed = 7 });
     defer r.deinit(testing.allocator);
     try testing.expectEqualSlices(u32, &.{ 40, 41, 42 }, r.tokens);
+    try testing.expectEqual(spec.SamplingParams{ .temperature = 0.6, .top_p = 0.9, .seed = 7 }, m.last_round_sampling.?);
     try testing.expectEqual(@as(u32, 43), r.next_token);
     try testing.expectEqual(@as(u64, 1), lane.stats(&m).rounds);
 }
