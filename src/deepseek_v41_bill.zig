@@ -1398,16 +1398,16 @@ test "dsv41 memory: this tree's fill rows at the windows' inputs, ENGRAM=prefetc
     // stack4's DEVROUTE term (+6.8 MB) moves no decode row.
     const every_window = [_]Want{
         // memory-correct: the derived routed group, the selection at 5 B, the host side at 1.00 GB with the host fixes.
-        .{ .base = 8_990_000_000, .off = .{ .prefill = 144, .decode = 164 }, .on = .{ .prefill = 144, .decode = 164 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 144, .decode = 163 }, .on = .{ .prefill = 144, .decode = 163 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 143, .decode = 163 }, .on = .{ .prefill = 143, .decode = 163 } },
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 145, .decode = 164 }, .on = .{ .prefill = 145, .decode = 164 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 145, .decode = 163 }, .on = .{ .prefill = 145, .decode = 163 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 144, .decode = 163 }, .on = .{ .prefill = 144, .decode = 163 } },
     };
     // With the transient release installed (served run 16 for every request; since served run 17 the route,
     // DSV41_CELL_TRANSIENT_RELEASE), decode bills window 0 only: +5 decode rows at each baseline.
     const window_0 = [_]Want{
-        .{ .base = 8_990_000_000, .off = .{ .prefill = 144, .decode = 168 }, .on = .{ .prefill = 144, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 144, .decode = 168 }, .on = .{ .prefill = 144, .decode = 168 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 143, .decode = 167 }, .on = .{ .prefill = 143, .decode = 167 } },
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 145, .decode = 168 }, .on = .{ .prefill = 145, .decode = 168 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 145, .decode = 168 }, .on = .{ .prefill = 145, .decode = 168 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 144, .decode = 167 }, .on = .{ .prefill = 144, .decode = 167 } },
     };
     // The release route as the Module resolves it: the default (on), then each override.
     for ([_]?bool{ null, false, true }) |route| {
@@ -1551,9 +1551,9 @@ test "dsv41 memory: the bill's variants, conservative and tight, at the windows'
         // The default route (the transient release on: decode bills window 0); the fence at two streams (-2.68 GB) adds
         // 5 prompt rows.
         // memory-correct: the tight arm is the legacy streams bill (explicit below), now under the derived conservative.
-        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 144, .decode = 168 }, .tight = .{ .prefill = 138, .decode = 168 } },
-        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 144, .decode = 168 }, .tight = .{ .prefill = 138, .decode = 168 } },
-        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 143, .decode = 167 }, .tight = .{ .prefill = 137, .decode = 167 } },
+        .{ .base = 8_990_000_000, .conservative = .{ .prefill = 145, .decode = 168 }, .tight = .{ .prefill = 139, .decode = 168 } },
+        .{ .base = 9_200_000_000, .conservative = .{ .prefill = 145, .decode = 168 }, .tight = .{ .prefill = 139, .decode = 168 } },
+        .{ .base = 9_550_000_000, .conservative = .{ .prefill = 144, .decode = 167 }, .tight = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -1603,9 +1603,9 @@ test "dsv41 memory: the tight wave follows the early-release route (bank)" {
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, two: arm_mod.NativeRows, one: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .two = .{ .prefill = 144, .decode = 168 }, .one = .{ .prefill = 144, .decode = 168 } },
-        .{ .base = 9_200_000_000, .two = .{ .prefill = 144, .decode = 168 }, .one = .{ .prefill = 144, .decode = 168 } },
-        .{ .base = 9_550_000_000, .two = .{ .prefill = 143, .decode = 167 }, .one = .{ .prefill = 143, .decode = 167 } },
+        .{ .base = 8_990_000_000, .two = .{ .prefill = 145, .decode = 168 }, .one = .{ .prefill = 145, .decode = 168 } },
+        .{ .base = 9_200_000_000, .two = .{ .prefill = 145, .decode = 168 }, .one = .{ .prefill = 145, .decode = 168 } },
+        .{ .base = 9_550_000_000, .two = .{ .prefill = 144, .decode = 167 }, .one = .{ .prefill = 144, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         const off = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -1652,10 +1652,10 @@ test "dsv41 memory: the decode cache term follows the decode cache limit route (
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, stock: arm_mod.NativeRows, zero: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 7_290_000_000, .stock = .{ .prefill = 147, .decode = 172 }, .zero = .{ .prefill = 147, .decode = 172 } },
-        .{ .base = 8_990_000_000, .stock = .{ .prefill = 144, .decode = 168 }, .zero = .{ .prefill = 144, .decode = 169 } },
-        .{ .base = 9_200_000_000, .stock = .{ .prefill = 144, .decode = 168 }, .zero = .{ .prefill = 144, .decode = 169 } },
-        .{ .base = 9_550_000_000, .stock = .{ .prefill = 143, .decode = 167 }, .zero = .{ .prefill = 143, .decode = 168 } },
+        .{ .base = 7_290_000_000, .stock = .{ .prefill = 148, .decode = 172 }, .zero = .{ .prefill = 148, .decode = 172 } },
+        .{ .base = 8_990_000_000, .stock = .{ .prefill = 145, .decode = 168 }, .zero = .{ .prefill = 145, .decode = 169 } },
+        .{ .base = 9_200_000_000, .stock = .{ .prefill = 145, .decode = 168 }, .zero = .{ .prefill = 145, .decode = 169 } },
+        .{ .base = 9_550_000_000, .stock = .{ .prefill = 144, .decode = 167 }, .zero = .{ .prefill = 144, .decode = 168 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b1 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -1698,9 +1698,9 @@ test "dsv41 memory: HEAD_MODE mxfp8 bills its codes, not the dense head it drops
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, bf16: arm_mod.NativeRows, mxfp8: arm_mod.NativeRows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 144, .decode = 168 }, .mxfp8 = .{ .prefill = 145, .decode = 170 } },
-        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 144, .decode = 168 }, .mxfp8 = .{ .prefill = 145, .decode = 169 } },
-        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 143, .decode = 167 }, .mxfp8 = .{ .prefill = 144, .decode = 169 } },
+        .{ .base = 8_990_000_000, .bf16 = .{ .prefill = 145, .decode = 168 }, .mxfp8 = .{ .prefill = 146, .decode = 170 } },
+        .{ .base = 9_200_000_000, .bf16 = .{ .prefill = 145, .decode = 168 }, .mxfp8 = .{ .prefill = 146, .decode = 169 } },
+        .{ .base = 9_550_000_000, .bf16 = .{ .prefill = 144, .decode = 167 }, .mxfp8 = .{ .prefill = 145, .decode = 169 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b1 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
@@ -1739,9 +1739,9 @@ test "dsv41 memory: the four arms, variant by release, at the windows' baselines
     const Rows = arm_mod.NativeRows;
     const Want = struct { base: u64, cons_off: Rows, cons_on: Rows, tight_off: Rows, tight_on: Rows };
     for ([_]Want{
-        .{ .base = 8_990_000_000, .cons_off = .{ .prefill = 133, .decode = 164 }, .cons_on = .{ .prefill = 133, .decode = 168 }, .tight_off = .{ .prefill = 138, .decode = 164 }, .tight_on = .{ .prefill = 138, .decode = 168 } },
-        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 133, .decode = 163 }, .cons_on = .{ .prefill = 133, .decode = 168 }, .tight_off = .{ .prefill = 138, .decode = 163 }, .tight_on = .{ .prefill = 138, .decode = 168 } },
-        .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 132, .decode = 163 }, .cons_on = .{ .prefill = 132, .decode = 167 }, .tight_off = .{ .prefill = 137, .decode = 163 }, .tight_on = .{ .prefill = 137, .decode = 167 } },
+        .{ .base = 8_990_000_000, .cons_off = .{ .prefill = 134, .decode = 164 }, .cons_on = .{ .prefill = 134, .decode = 168 }, .tight_off = .{ .prefill = 139, .decode = 164 }, .tight_on = .{ .prefill = 139, .decode = 168 } },
+        .{ .base = 9_200_000_000, .cons_off = .{ .prefill = 134, .decode = 163 }, .cons_on = .{ .prefill = 134, .decode = 168 }, .tight_off = .{ .prefill = 139, .decode = 163 }, .tight_on = .{ .prefill = 139, .decode = 168 } },
+        .{ .base = 9_550_000_000, .cons_off = .{ .prefill = 133, .decode = 163 }, .cons_on = .{ .prefill = 133, .decode = 167 }, .tight_off = .{ .prefill = 138, .decode = 163 }, .tight_on = .{ .prefill = 138, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         const by_route = [2]Bill{
@@ -1785,9 +1785,9 @@ test "dsv41 memory: the decode rows the PhaseGate's window release returns (bank
     for ([_]Want{
         // Without the release (this tree's fill): 163 / 163 / 162 decode rows; with it, +5 at each baseline (the host side
         // billed at 1.25 GB since served run 19, -0.35 GB in both phases).
-        .{ .base = 8_990_000_000, .off = .{ .prefill = 144, .decode = 168 }, .on = .{ .prefill = 144, .decode = 168 } },
-        .{ .base = 9_200_000_000, .off = .{ .prefill = 144, .decode = 168 }, .on = .{ .prefill = 144, .decode = 168 } },
-        .{ .base = 9_550_000_000, .off = .{ .prefill = 143, .decode = 167 }, .on = .{ .prefill = 143, .decode = 167 } },
+        .{ .base = 8_990_000_000, .off = .{ .prefill = 145, .decode = 168 }, .on = .{ .prefill = 145, .decode = 168 } },
+        .{ .base = 9_200_000_000, .off = .{ .prefill = 145, .decode = 168 }, .on = .{ .prefill = 145, .decode = 168 } },
+        .{ .base = 9_550_000_000, .off = .{ .prefill = 144, .decode = 167 }, .on = .{ .prefill = 144, .decode = 167 } },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{ .transient_release = true });
@@ -1889,10 +1889,10 @@ test "dsv41 memory: the fill's rows at the windows' baselines (bank)" {
     const posted = engramPostedBytes(c.engram, fill_prompt_tokens);
     const Want = struct { base: u64, decode: u32, prefill: u32 };
     for ([_]Want{
-        .{ .base = 7_290_000_000, .decode = 172, .prefill = 147 },
-        .{ .base = 8_990_000_000, .decode = 168, .prefill = 144 },
-        .{ .base = 9_200_000_000, .decode = 168, .prefill = 144 },
-        .{ .base = 9_550_000_000, .decode = 167, .prefill = 143 },
+        .{ .base = 7_290_000_000, .decode = 172, .prefill = 148 },
+        .{ .base = 8_990_000_000, .decode = 168, .prefill = 145 },
+        .{ .base = 9_200_000_000, .decode = 168, .prefill = 145 },
+        .{ .base = 9_550_000_000, .decode = 167, .prefill = 144 },
     }) |w| {
         config.memory_baseline_bytes = w.base;
         var b0 = try billAtFloor(a, testing.io, config, fill_prompt_tokens, fill_max_tokens, null, ceiling_bytes, .{});
