@@ -45,7 +45,7 @@ A plugin declares one value in its root file:
 ```zig
 pub const plugin = sdk.Plugin{
     .name = "mlx-stream",
-    .api = .{ .major = 1, .minor = 0 },
+    .api = .{ .major = 2, .minor = 0 },
     .mlx = "v0.32.2",
     .macos_only = true,
     .provides = .{ .arch = ..., .quant = ..., .expert_source = ... },
