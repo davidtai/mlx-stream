@@ -3173,9 +3173,17 @@ test "dsv41 served cell: the cell's bill on the host (the window's admission, ev
         {
             const kvc = @import("deepseek_v41_cache.zig");
             const calls = try kvc.prefillSubCalls(a, @intCast(n), pb.chunkRows(n), pb.prefill_sub);
-            const last = calls[calls.len - 1];
+            // The call whose kept selection bills most (the deepest full call, not the tail): the term at the peak.
+            var last = calls[0];
+            var billed: u64 = 0;
+            for (calls) |call| {
+                const kb = pb.selectionKeptBytes(call[1] - call[0], pb.chunkRows(n), call[1]);
+                if (kb >= billed) {
+                    billed = kb;
+                    last = call;
+                }
+            }
             const crow: u64 = last[1] - last[0];
-            const billed = pb.selectionKeptBytes(crow, pb.chunkRows(n), last[1]);
             const unattributed = pb.selectionRowPositions(crow, pb.chunkRows(n), last[1]) * kvc.selection_pos_bytes;
             std.debug.print("DSV41_CELL_BILL_SELECTION {{\"context\": {d}, \"call_rows\": {d}, \"positions\": {d}, \"kept_billed\": {d}, \"kept_trace\": {d}, \"unattributed\": {d}, \"chain\": {d}}}\n", .{ n, crow, last[1], billed, billed - unattributed, unattributed, pb.indexChainBytes(pb.chunkRows(n), last[1]) });
         }
