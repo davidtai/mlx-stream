@@ -6,7 +6,7 @@ const sdk = @import("sdk");
 
 pub const plugin = sdk.Plugin{
     .name = "mlx-stream",
-    .api = .{ .major = 1, .minor = 0 },
+    .api = .{ .major = 2, .minor = 0 },
     // The MLX this plugin is tested on; the host refuses it at compile time unless its own MLX is the same.
     .mlx = "v0.32.3",
     .macos_only = true,
