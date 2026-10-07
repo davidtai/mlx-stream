@@ -4482,14 +4482,18 @@ test "dsv41 smoke 0b: IDX_CHUNKED_SELECT: blocked selects equal the one launch b
         defer a.free(lens);
         for (lens, 0..) |*x, i| x.* = @intCast(@min(@as(usize, @intCast(N)), 1 + i * @as(usize, @intCast(N)) / @as(usize, @intCast(S))));
         const clen = try g.hostArray(std.mem.sliceAsBytes(lens), &.{S}, .int32);
+        // A consumer's candidates as the served path carries them (IDX_CARRY): a random keep per block, packed.
         var cm: ?Mx.T = null;
-        if (cs.consumer) cm = try g.greater(try fill(&g, a, &.{ 1, S, N }, 51 + case_i), try g.scalar(-0.5, .float32));
-        // The one launch (the pi branch as it was).
+        if (cs.consumer) {
+            const nb: c_int = @divTrunc(N + @as(c_int, @intCast(c.candidate_block_size)) - 1, @as(c_int, @intCast(c.candidate_block_size)));
+            cm = try TrM.packBlocks(&g, try g.greater(try fill(&g, a, &.{ 1, S, nb }, 51 + case_i), try g.scalar(-0.5, .float32)));
+        }
+        // The one launch (the pi branch: the consumed candidates expanded over the row, `candidateMask`).
         var score = try ix.score.call(&g, q, kx, w, clen);
         var want_cand: ?Mx.T = null;
         if (cs.source) {
             want_cand = try TrM.candidateBlocks(&g, &c, score, clen);
-        } else if (cm) |m| score = try g.where(m, score, try TrM.sf(&g, -std.math.inf(f64), score));
+        } else if (cm) |m| score = try g.where(try TrM.candidateMask(&g, &c, m, N), score, try TrM.sf(&g, -std.math.inf(f64), score));
         const r = try ix.topk.select(&g, try g.reshape(score, &.{ S, N }), clen);
         const want_mask = try g.reshape(r[1], &.{ 1, S, N });
         const want_idx = try g.expandDims(r[0], 0);
