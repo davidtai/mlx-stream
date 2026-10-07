@@ -157,9 +157,16 @@ pub const draft_lane = struct {
         return if (req.clean) .typical else .off;
     }
 
-    pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32) !sdk.DraftRound {
-        const r = try m.dsparkRound(a, t1, accepted_cap);
+    /// One round under the request's sampling (the value `arm` received): a greedy request (`sampling.greedy()`) is the
+    /// exact round; a sampled one draws its verify rows from the tempered, filtered target (`Module.dsparkRoundSampled`).
+    pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
+        const r = try m.dsparkRoundSampled(a, t1, accepted_cap, samplingOf(sampling));
         return .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token };
+    }
+
+    /// The lane's sampling from the host's (one field for one field).
+    pub fn samplingOf(s: sdk.SamplingParams) @import("deepseek_v41_dspark.zig").Sampling {
+        return .{ .temperature = s.temperature, .top_p = s.top_p, .top_k = s.top_k, .min_p = s.min_p, .seed = s.seed };
     }
 
     pub fn stats(m: *const Module) sdk.DraftStats {
@@ -198,6 +205,16 @@ test "dsv41 plugin: parse builds the arch's config and its sidecar paths, and re
     const bad = try std.mem.replaceOwned(u8, arena.allocator(), real, "sqrtsoftplus", "softmax");
     try testing.expectError(error.NotImplemented, parse(testing.allocator, &try sdk.ConfigPeek.parse(arena.allocator(), "/m", bad), &diag));
     try testing.expect(diag.message().len > 0);
+}
+
+test "dsv41 plugin: the lane's sampling is the host's, field for field, and greedy where the host's is" {
+    const ds = @import("deepseek_v41_dspark.zig");
+    for ([_]sdk.SamplingParams{ .{}, .{ .temperature = 0.005 }, .{ .temperature = 0.7, .top_p = 0.9, .top_k = 40, .min_p = 0.05, .seed = 123 }, .{ .temperature = 1.2, .top_k = 1, .seed = 7 } }) |sp| {
+        const s = draft_lane.samplingOf(sp);
+        try testing.expectEqual(sp.greedy(), s.greedy());
+        try testing.expectEqual(sp.greedy(), ds.Sampling.active(s) == null);
+        try testing.expect(s.temperature == sp.temperature and s.top_p == sp.top_p and s.top_k == sp.top_k and s.seed == sp.seed and std.meta.eql(s.min_p, sp.min_p));
+    }
 }
 
 test "dsv41 plugin: the draft lane arms every clean request, greedy or sampled, and the served prompt reserves nothing" {
