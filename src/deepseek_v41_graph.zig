@@ -1057,7 +1057,13 @@ pub fn Trunk(comptime G: type) type {
 
         /// `_select_candidate_blocks`: the best `topk_blocks` blocks of compressed
         /// positions per query, the query's newest block pinned in.
+        /// IDX_CARRY: kept as `candidateKeep`'s blocks packed (`packBlocks`), expanded per use (`candidateMask`).
         fn candidateBlocks(g: *G, c: *const v41.Config, logits: T, compress_lens: T) !T {
+            return packBlocks(g, try candidateKeep(g, c, logits, compress_lens));
+        }
+
+        /// `_select_candidate_blocks`'s kept blocks per row (bool [b, s, nb]).
+        fn candidateKeep(g: *G, c: *const v41.Config, logits: T, compress_lens: T) !T {
             const sh = g.shapeOf(logits);
             const b = sh.d[0];
             const s = sh.d[1];
@@ -1078,7 +1084,47 @@ pub fn Trunk(comptime G: type) type {
             const kb = @min(@as(c_int, @intCast(c.candidate_topk_blocks)), nb);
             var keep = try topkRows(g, scores, kb);
             keep = try g.logicalAnd(keep, try g.greater(scores, try sf(g, -std.math.inf(f64), scores)));
-            return sliceLast(g, try g.repeat(keep, bs, -1), 0, width);
+            return keep;
+        }
+
+        /// IDX_CARRY: a candidate set as kept across the layer: each row's kept blocks as a bitmap, eight blocks a byte
+        /// (uint8 [b, s, ceil(nb / 8)], block j at bit j % 8 of byte j / 8), in place of the bool mask over every compressed
+        /// position (1 B a row and position, bs x 8 = 64 times the bitmap). `candidateMask` expands it, per use.
+        fn packBlocks(g: *G, keep: T) !T {
+            const sh = g.shapeOf(keep);
+            const b = sh.d[0];
+            const s = sh.d[1];
+            const nb = sh.d[2];
+            const nbp = @divTrunc(nb + 7, 8) * 8;
+            var k = keep;
+            if (nbp != nb) k = try g.concat(&.{ k, try g.zeros(&.{ b, s, nbp - nb }, .bool_) }, -1);
+            const bits = [8]u8{ 1, 2, 4, 8, 16, 32, 64, 128 };
+            const wts = try g.hostArray(&bits, &.{8}, .uint8);
+            const byte = try g.sum(try g.mul(try g.astype(try g.reshape(k, &.{ b, s, @divExact(nbp, 8), 8 }), .uint8), wts), -1, false);
+            return g.astype(byte, .uint8);
+        }
+
+        /// The candidate mask over `width` compressed positions (bool [b, s, width]) from its packed blocks
+        /// (`packBlocks`): each block's bit, repeated over its `candidate_block_size` positions, cut to `width`, as
+        /// `candidateBlocks` built it before IDX_CARRY. Built per use (a chunk's rows), never kept.
+        fn candidateMask(g: *G, c: *const v41.Config, packed_: T, width: c_int) !T {
+            const sh = g.shapeOf(packed_);
+            const b = sh.d[0];
+            const s = sh.d[1];
+            const bs: c_int = @intCast(c.candidate_block_size);
+            const nb = @divTrunc(width + bs - 1, bs);
+            const pows = [8]i32{ 1, 2, 4, 8, 16, 32, 64, 128 };
+            const p = try g.hostArray(std.mem.sliceAsBytes(&pows), &.{8}, .int32);
+            const t = try g.floorDiv(try g.expandDims(try g.astype(packed_, .int32), -1), p);
+            const bit = try g.sub(t, try g.mul(try g.floorDiv(t, try g.scalar(2, .int32)), try g.scalar(2, .int32)));
+            const keep = try g.reshape(try g.equal(bit, try g.scalar(1, .int32)), &.{ b, s, sh.d[2] * 8 });
+            return sliceLast(g, try g.repeat(try sliceLast(g, keep, 0, nb), bs, -1), 0, width);
+        }
+
+        /// The packed candidate blocks' last dim for `width` compressed positions.
+        fn candidateBytes(c: *const v41.Config, width: c_int) c_int {
+            const bs: c_int = @intCast(c.candidate_block_size);
+            return @divTrunc(@divTrunc(width + bs - 1, bs) + 7, 8);
         }
 
         /// `Indexer.keys`: wk -> k_norm -> RoPE tail of a pre-RoPE latent.
@@ -1135,7 +1181,7 @@ pub fn Trunk(comptime G: type) type {
                 if (set_candidates) {
                     cand = try candidateBlocks(g, c, score, compress_lens);
                 } else if (candidates) |cm| {
-                    score = try g.where(cm, score, try sf(g, -std.math.inf(f64), score));
+                    score = try g.where(try candidateMask(g, c, cm, n_comp), score, try sf(g, -std.math.inf(f64), score));
                 }
                 try p.put("attn.index_score", score);
                 const s_ = sh.d[1];
@@ -1148,7 +1194,7 @@ pub fn Trunk(comptime G: type) type {
             if (set_candidates) {
                 cand = try candidateBlocks(g, c, score, compress_lens);
             } else if (candidates) |cm| {
-                score = try g.where(cm, score, try sf(g, -std.math.inf(f64), score));
+                score = try g.where(try candidateMask(g, c, cm, n_comp), score, try sf(g, -std.math.inf(f64), score));
             }
             try p.put("attn.index_score", score);
             // C27 at the verify rows (one prompt row block): the select as one dispatch.
@@ -1174,7 +1220,7 @@ pub fn Trunk(comptime G: type) type {
             const pre = g.mark();
             var mask = g.keep(try g.zeros(&.{ 1, s_, n_comp }, .bool_));
             var sel = g.keep(try g.zeros(&.{ s_, k }, .int32));
-            var cand: ?T = if (set_candidates) g.keep(try g.zeros(&.{ 1, s_, n_comp }, .bool_)) else null;
+            var cand: ?T = if (set_candidates) g.keep(try g.zeros(&.{ 1, s_, candidateBytes(c, n_comp) }, .uint8)) else null;
             g.resetTo(pre);
             var r0: c_int = 0;
             while (r0 < s_) : (r0 += rows) {
@@ -1192,8 +1238,8 @@ pub fn Trunk(comptime G: type) type {
                 if (set_candidates) {
                     new_cand = try g.sliceUpdateDyn(cand.?, try candidateBlocks(g, c, score, lc), st3);
                 } else if (candidates) |cm| {
-                    const cmc = try g.slice(cm, &.{ 0, r0, 0 }, &.{ 1, r1, n_comp }, &.{ 1, 1, 1 });
-                    score = try g.where(cmc, score, try sf(g, -std.math.inf(f64), score));
+                    const cmc = try g.slice(cm, &.{ 0, r0, 0 }, &.{ 1, r1, g.shapeOf(cm).dim(2) }, &.{ 1, 1, 1 });
+                    score = try g.where(try candidateMask(g, c, cmc, n_comp), score, try sf(g, -std.math.inf(f64), score));
                 }
                 const r = try ix.topk.select(g, try g.reshape(score, &.{ r1 - r0, n_comp }), lc);
                 const new_mask = try g.sliceUpdateDyn(mask, try g.reshape(r[1], &.{ 1, r1 - r0, n_comp }), st3);
@@ -1244,7 +1290,9 @@ pub fn Trunk(comptime G: type) type {
             shared.index_k = try cache.index.view(g);
         }
 
-        const Compressed = struct { kv: T, mask: T };
+        /// `mask`: the top-k mask (the stock attention's); null under K30 (`selected_keys`), whose readers take the
+        /// selected indices (IDX_CARRY: the chunk keeps `selected_idx`, not a mask over every compressed position).
+        const Compressed = struct { kv: T, mask: ?T };
 
         /// `Attention._compressed`: the CSA2 mode dispatch. Under K30 an index
         /// source also publishes its selection as gather indices.
@@ -1252,7 +1300,7 @@ pub fn Trunk(comptime G: type) type {
             if (li.kv_source) try publishCompressed(g, p, c, li, w, lk.minv, inv_freq, x, cache, shared);
             const ckv = shared.compress_kv orelse return null;
             const n_comp = g.shapeOf(ckv).dim(1);
-            var mask: T = undefined;
+            var mask: ?T = null;
             if (li.index_source) {
                 const lens = try g.floorDiv(try g.add(positions, try g.scalar(1, .int32)), try g.scalar(@floatFromInt(li.ratio), .int32));
                 const cand = if (li.candidate_source) null else shared.candidates;
@@ -1263,20 +1311,25 @@ pub fn Trunk(comptime G: type) type {
                         if (sel.cand) |*cd| try closeScores(g, m, &.{ &sel.mask, cd, ix }) else try closeScores(g, m, &.{ &sel.mask, ix });
                     } else if (sel.cand) |*cd| try closeScores(g, m, &.{ &sel.mask, cd }) else try closeScores(g, m, &.{&sel.mask});
                 }
-                shared.topk_mask = sel.mask;
+                // IDX_CARRY: under K30 the chunk carries the selected indices; the mask is this select's (its probe
+                // stage), freed with the chunk's wave.
+                try p.put("attn.topk_mask", sel.mask);
+                if (!rt.selected_keys) {
+                    shared.topk_mask = sel.mask;
+                    mask = sel.mask;
+                }
                 if (li.candidate_source) shared.candidates = sel.cand;
-                mask = sel.mask;
                 if (rt.selected_keys) {
                     // A fixed-shape core pads the selection to index_topk.
                     const k: c_int = if (rt.core_rows > 0) @intCast(c.index_topk) else @min(@as(c_int, @intCast(c.index_topk)), n_comp);
-                    shared.selected_idx = if (sel.idx) |ix| try padIdx(g, ix, k) else try maskToTopkIdx(g, mask, k);
+                    shared.selected_idx = if (sel.idx) |ix| try padIdx(g, ix, k) else try maskToTopkIdx(g, sel.mask, k);
                     try p.put("attn.selected_idx", shared.selected_idx.?);
                 }
-            } else {
+            } else if (!rt.selected_keys) {
                 // The config refuses a reuse layer with no index source before it.
                 mask = shared.topk_mask.?;
+                try p.put("attn.topk_mask", mask.?);
             }
-            try p.put("attn.topk_mask", mask);
             return .{ .kv = ckv, .mask = mask };
         }
 
@@ -1983,7 +2036,7 @@ pub fn Trunk(comptime G: type) type {
                 if (li.ratio > 0) {
                     if (try compressed(g, p, c, rt, lk, li, w, inv_freq, x, qr, positions, cs, cache, shared, pi)) |comp| {
                         keys = try g.concat(&.{ window, comp.kv }, 1);
-                        attend = try g.concat(&.{ attend, comp.mask }, -1);
+                        attend = try g.concat(&.{ attend, comp.mask.? }, -1);
                     }
                 }
                 const scores: ?ops.Mark = if (b * s > score_wave_min_rows) g.mark() else null;
@@ -3631,7 +3684,8 @@ test "dsv41 graph: reuse, candidate and reindex layers share one forward's runti
             // Full, ratio 1, the candidate source: sets the block mask.
             3 => {
                 try expectStage(&g, &p, "attn.topk_mask", &.{ 1, 9, 9 }, .bool_);
-                try expectShape(&g, shared.candidates.?, &.{ 1, 9, 9 }, .bool_);
+                // IDX_CARRY: the kept candidates are the packed blocks (9 positions, blocks of 2: 5 blocks, 1 byte a row).
+                try expectShape(&g, shared.candidates.?, &.{ 1, 9, 1 }, .uint8);
             },
             // Reindex: its own queries over layer 3's keys, masked by the candidates.
             4 => {
@@ -4456,5 +4510,178 @@ test "dsv41 smoke 0b: IDX_CHUNKED_SELECT: blocked selects equal the one launch b
             defer a.free(by);
             try testing.expectEqualSlices(u32, try g.hostU32(x, bx), try g.hostU32(y, by));
         }
+    }
+}
+
+/// The bytes of the shared runtime's selection arrays a K16 chunk carries across its layer (`Carry.persistShared`): every
+/// `?T` slot of `Share` but the published lanes (compress_kv, index_k), each distinct buffer once.
+fn carriedSelectionBytes(g: *const TraceOps, s: *const Tr.Share) u64 {
+    var seen: [16]u32 = undefined;
+    var n: usize = 0;
+    var bytes: u64 = 0;
+    const info = @typeInfo(Tr.Share).@"struct";
+    inline for (info.field_names, info.field_types) |name, ty| {
+        if (ty == ?u32 and comptime !std.mem.eql(u8, name, "compress_kv") and !std.mem.eql(u8, name, "index_k")) if (@field(s, name)) |x| {
+            const b = g.baseOf(x);
+            if (std.mem.indexOfScalar(u32, seen[0..n], b) == null) {
+                seen[n] = b;
+                n += 1;
+                const nd = g.nodes.items[b];
+                bytes += @as(u64, @intCast(nd.shape.numel())) * ops.dtypeSize(nd.dtype);
+            }
+        };
+    }
+    return bytes;
+}
+
+// The served tier's compressed attention side (the prefill indexer, K30 selected keys) of one 16,384-row K16 chunk over N
+// compressed positions: the candidate source, a consumer index source, then a reuse layer; what the chunk's shared runtime
+// carries across the layer afterwards (the selection: masks, candidates, selected indices, the window memo), in bytes.
+test "dsv41 graph: IDX_CARRY: the selection a 16,384-row chunk carries across its layer at N = 16K / 256K / 1M (trace bytes)" {
+    var kd: xk.Diag = .{};
+    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
+    defer reg.deinit();
+    const c = try realConfig();
+    const rt: Routes = .{ .prefill_index = true, .selected_keys = true };
+    var src: usize = 0;
+    while (!c.layers[src].candidate_source) src += 1;
+    var cons = src + 1;
+    while (!(c.layers[cons].index_source and !c.layers[cons].candidate_source)) cons += 1;
+    var reuse = src + 1;
+    while (!(c.layers[reuse].ratio > 0 and !c.layers[reuse].index_source)) reuse += 1;
+    const S: c_int = 16384;
+    for ([_]c_int{ 16384, 262144, 1047488 }) |N| {
+        var g = TraceOps.init(testing.allocator);
+        defer g.deinit();
+        var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, &.{});
+        defer k.deinit(&g);
+        const inv = try Tr.yarnInvFreq(&g, &c);
+        var shared: Tr.Share = .{ .compress_kv = try g.input(&.{ 1, N, 512 }, .bfloat16), .index_k = try g.input(&.{ 1, N, 128 }, .float32) };
+        for ([_]usize{ src, cons, reuse }) |l| {
+            var li = c.layers[l];
+            li.kv_source = false; // the lanes are the test's N positions
+            const r: c_int = li.ratio;
+            const w = try traceLayerW(&g, &c, li);
+            var cache = Tr.Cache.init(li, c.window, .{});
+            defer cache.deinit(&g);
+            const positions = try g.arange(@floatFromInt(N * r - S), @floatFromInt(N * r), 1, .int32);
+            const lk = k.at(l);
+            const pi: ?Tr.PrefillIndex = if (lk.idx_score != null) .{ .score = lk.idx_score.?, .topk = lk.index_topk.? } else null;
+            _ = try Tr.compressed(&g, NoProbe{}, &c, &rt, lk, li, &w, inv, try g.input(&.{ 1, S, 5120 }, .bfloat16), try g.input(&.{ 1, S, @intCast(c.q_lora_rank) }, .bfloat16), positions, try Tr.cosSin(&g, inv, positions), &cache, &shared, pi);
+        }
+        const bytes = carriedSelectionBytes(&g, &shared);
+        // IDX_CARRY: nothing carried spans the compressed positions: the selected indices [1, S, 512] (int32), the packed
+        // candidate blocks [1, S, N / 64] (uint8) and the window memo ([S, W]) only.
+        try testing.expect(shared.topk_mask == null);
+        try testing.expectEqualSlices(c_int, &.{ 1, S, @min(N, 512) }, g.shapeOf(shared.selected_idx.?).slice());
+        try testing.expectEqualSlices(c_int, &.{ 1, S, Tr.candidateBytes(&c, N) }, g.shapeOf(shared.candidates.?).slice());
+        try testing.expect(bytes <= @as(u64, @intCast(S)) * (4 * 512 + @as(u64, @intCast(Tr.candidateBytes(&c, N))) + 8192));
+        std.debug.print("DSV41_IDX_CARRY {{\"rows\": {d}, \"n_comp\": {d}, \"carried_selection_bytes\": {d}, \"per_row_position\": {d:.3}}}\n", .{ S, N, bytes, @as(f64, @floatFromInt(bytes)) / (@as(f64, @floatFromInt(S)) * @as(f64, @floatFromInt(N))) });
+    }
+}
+
+// MLX on the CPU stream (DSV41_PHASE0B_MLX=1, MLX_DEFAULT_DEVICE=cpu): IDX_CARRY against the representation before it, word
+// for word. Before: the candidate source kept the bool mask over every compressed position (`repeat(keep, bs)[:N]`) and each
+// consumer masked its scores with it; after: the source keeps the packed blocks and each consumer expands them per use.
+// Per case: the expanded candidate mask, a consumer's selection (mask and indices) through the one launch, and through
+// IDX_CHUNKED_SELECT's blocks (the source's packed rows and the consumer's), each equal to the mask-carried result.
+// The prefill launches are Metal texts, so both sides use the stock op chain in their places (as the IDX_CHUNKED smoke test).
+test "dsv41 smoke 0b: IDX_CARRY: packed candidate blocks select exactly as the carried masks (one launch and blocked; N small and past 512)" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const TrM = Trunk(ops.MlxOps);
+    const Mx = ops.MlxOps;
+    const s = sdk.mlx.mlx_default_cpu_stream_new();
+    defer _ = sdk.mlx.mlx_stream_free(s);
+    var g = try Mx.init(testing.allocator, s);
+    defer g.deinit();
+    const a = testing.allocator;
+    const Score = struct {
+        pub fn call(_: *const @This(), gg: *Mx, q: Mx.T, k: Mx.T, w: Mx.T, clen: Mx.T) !Mx.T {
+            return TrM.indexScoreStock(gg, q, k, w, clen, gg.shapeOf(k).d[1]);
+        }
+    };
+    const Select = struct {
+        kk: c_int,
+        pub fn select(self: *const @This(), gg: *Mx, score: Mx.T, clen: Mx.T) ![2]Mx.T {
+            const sh = gg.shapeOf(score);
+            const s3 = try gg.reshape(score, &.{ 1, sh.d[0], sh.d[1] });
+            const mask = try gg.logicalAnd(try TrM.topkRows(gg, s3, self.kk), try TrM.reachMask(gg, clen, sh.d[1]));
+            const sel = try TrM.maskToTopkIdx(gg, mask, self.kk);
+            return .{ try gg.reshape(sel, &.{ sh.d[0], self.kk }), try gg.reshape(mask, &.{ sh.d[0], sh.d[1] }) };
+        }
+    };
+    const fill = struct {
+        fn f(gg: *Mx, al: std.mem.Allocator, shape: []const c_int, seed: u64) !Mx.T {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const v = try al.alloc(f32, n);
+            defer al.free(v);
+            var r: std.Random.DefaultPrng = .init(seed);
+            for (v) |*x| x.* = @as(f32, @floatFromInt(r.random().intRangeAtMost(i32, -8, 8))) / 8.0;
+            return gg.hostArray(std.mem.sliceAsBytes(v), shape, .float32);
+        }
+    }.f;
+    const eq = struct {
+        fn f(gg: *Mx, al: std.mem.Allocator, x0: Mx.T, y0: Mx.T) !void {
+            const x = try gg.astype(x0, .uint32);
+            const y = try gg.astype(y0, .uint32);
+            try gg.evalAll(&.{ x, y });
+            try testing.expectEqualSlices(c_int, gg.shapeOf(x).slice(), gg.shapeOf(y).slice());
+            const n: usize = @intCast(sdk.mlx.mlx_array_size(x));
+            const bx = try al.alloc(u32, n);
+            defer al.free(bx);
+            const by = try al.alloc(u32, n);
+            defer al.free(by);
+            try testing.expectEqualSlices(u32, try gg.hostU32(x, bx), try gg.hostU32(y, by));
+        }
+    }.f;
+    const Case = struct { n: c_int, rows: c_int, block: c_int, topk: u32, bs: u32, kb: u32 };
+    for ([_]Case{
+        .{ .n = 37, .rows = 150, .block = 64, .topk = 4, .bs = 2, .kb = 2 }, // N small, blocks 64 + 64 + 22, 19 blocks (not a multiple of 8)
+        .{ .n = 700, .rows = 150, .block = 64, .topk = 512, .bs = 8, .kb = 16 }, // N past 512: k = 512 of 700
+        .{ .n = 2001, .rows = 40, .block = 64, .topk = 512, .bs = 8, .kb = 64 }, // under one block, 251 blocks
+    }, 0..) |cs, case_i| {
+        var c = try miniConfig();
+        c.index_topk = cs.topk;
+        c.candidate_block_size = cs.bs;
+        c.candidate_topk_blocks = cs.kb;
+        const H: c_int = @intCast(c.index_n_heads);
+        const D: c_int = @intCast(c.index_head_dim);
+        const N = cs.n;
+        const S = cs.rows;
+        const kk = @min(@as(c_int, @intCast(c.index_topk)), N);
+        const ix = .{ .score = &Score{}, .topk = &Select{ .kk = kk } };
+        const m0 = g.mark();
+        defer g.resetTo(m0);
+        const kx = try fill(&g, a, &.{ 1, N, D }, 23 + case_i);
+        const lens = try a.alloc(i32, @intCast(S));
+        defer a.free(lens);
+        for (lens, 0..) |*x, i| x.* = @intCast(@min(@as(usize, @intCast(N)), 1 + i * @as(usize, @intCast(N)) / @as(usize, @intCast(S))));
+        const clen = try g.hostArray(std.mem.sliceAsBytes(lens), &.{S}, .int32);
+        // The candidate source's scores and its kept blocks, both representations.
+        const src_score = try ix.score.call(&g, try fill(&g, a, &.{ 1, S, H, D }, 11 + case_i), kx, try fill(&g, a, &.{ 1, S, H }, 37 + case_i), clen);
+        const keep = try TrM.candidateKeep(&g, &c, src_score, clen);
+        const old_mask = try TrM.sliceLast(&g, try g.repeat(keep, @intCast(c.candidate_block_size), -1), 0, N);
+        const packed_ = try TrM.packBlocks(&g, keep);
+        try testing.expectEqualSlices(c_int, &.{ 1, S, TrM.candidateBytes(&c, N) }, g.shapeOf(packed_).slice());
+        try eq(&g, a, old_mask, try TrM.candidateMask(&g, &c, packed_, N));
+        // The source's blocked select keeps the same packed rows as its one launch.
+        const q_src = try fill(&g, a, &.{ 1, S, H, D }, 11 + case_i);
+        const w_src = try fill(&g, a, &.{ 1, S, H }, 37 + case_i);
+        const src_blocked = try TrM.selectChunked(&g, &c, ix, q_src, kx, w_src, clen, N, null, true, cs.block);
+        try eq(&g, a, packed_, src_blocked.cand.?);
+        // A consumer: its own queries over the same keys, masked by the candidates, before (the carried mask) and after.
+        const q = try fill(&g, a, &.{ 1, S, H, D }, 41 + case_i);
+        const w = try fill(&g, a, &.{ 1, S, H }, 43 + case_i);
+        const score = try ix.score.call(&g, q, kx, w, clen);
+        const old_score = try g.where(old_mask, score, try TrM.sf(&g, -std.math.inf(f64), score));
+        const want = try ix.topk.select(&g, try g.reshape(old_score, &.{ S, N }), clen);
+        const new_score = try g.where(try TrM.candidateMask(&g, &c, packed_, N), score, try TrM.sf(&g, -std.math.inf(f64), score));
+        const got = try ix.topk.select(&g, try g.reshape(new_score, &.{ S, N }), clen);
+        try eq(&g, a, want[0], got[0]);
+        try eq(&g, a, want[1], got[1]);
+        const blocked = try TrM.selectChunked(&g, &c, ix, q, kx, w, clen, N, packed_, false, cs.block);
+        try eq(&g, a, try g.expandDims(want[0], 0), blocked.idx.?);
+        try eq(&g, a, try g.reshape(want[1], &.{ 1, S, N }), blocked.mask);
     }
 }
