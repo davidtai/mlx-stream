@@ -80,6 +80,50 @@ The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that lo
 skip unless their own inputs are given. Device cells set the GPU ceiling with the host's
 `MLX_SERVE_GPU_CEILING_MB=114688` (112 GiB).
 
+### Independent reference fixtures (DeepSeek-V4.1)
+
+`src/arch/deepseek_v41/reference_test.zig` compares the real `HashState.advance` / `trim` against the official
+`NgramHashState.forward`: both layers, all 24 columns, masked spans, empty input, every two-way split, single-token
+decode and rollback after a different draft. The sparse token map preserves original token IDs and their official
+compressed IDs; it does not test the pack's token-map loader or reimplement tokenizer normalization. This test is
+hermetic and runs in every suite.
+
+The device test is opt-in and follows the repo's contract for MLX-array tests (they create the Metal device, so they
+are GPU-lock-held runs): under `DSV41_PHASE0B_MLX=1` it runs on the CPU stream, under `_GPU_WINDOW_LOCKED=1` (set by the
+GPU lock's holder) on the GPU stream, and without either it skips. It covers two things:
+
+- the production path: `Trunk.engramRows` over an independently scaled `[2, 2, 24, 256]` FP8 Engram case, bit for bit
+  against BF16 values from Torch E4M3 / E8M0 / BF16 casts;
+- MLX format checks: `MlxOps.dequantize` on 7x64 and 35x96 linear FP8 and FP4 cases crossing packed-word and 32-value
+  scale-group boundaries (production reads those formats through `qmm` / `gatherQmm`, not `dequantize`; the official
+  linear FP8 scale shared across 32 output rows is expanded to MLX's per-row contract inside the test).
+
+Zeros compare by value: the fixture follows OCP E2M1 (nibble `0x8` is -0), the official `FP4_TABLE` in
+`inference/convert.py` maps it to +0, and MLX's decode is the former. NaN/Inf, extreme E8M0 scales, dynamic activation
+and cache quantization, GEMM accumulation and full-model parity are **not** covered. The dequant expectations are
+independent Torch casts and a transcription of the official FP4 table, not the official code running; the Engram
+expectations are the official code running on the CPU.
+
+The fixtures derive from [DeepSeek-V4.1-Flash at
+`2cba9e42aa026125f3ed06c6d98c1db82f7ca027`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/tree/2cba9e42aa026125f3ed06c6d98c1db82f7ca027).
+The dumper pins the SHA-256 of `inference/engram.py`, `inference/kernel.py`, `inference/convert.py`,
+`inference/model.py`, `config.json` and `tokenizer.json`. Attribution is in NOTICE. Reproduce with the pinned Python
+environment (no model weights):
+
+```sh
+python3.14 -m venv /tmp/dsv41-reference-env
+/tmp/dsv41-reference-env/bin/pip install torch==2.14.1 numpy==2.4.2 sympy==1.14.0 tokenizers==0.21.4
+REF=/tmp/dsv41-official-reference
+REV=2cba9e42aa026125f3ed06c6d98c1db82f7ca027
+mkdir -p "$REF/inference"
+for file in inference/engram.py inference/kernel.py inference/convert.py inference/model.py config.json tokenizer.json; do
+  curl -fL "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/$REV/$file" -o "$REF/$file"
+done
+/tmp/dsv41-reference-env/bin/python scripts/dump_dsv41_reference_fixtures.py --reference "$REF" --output /tmp/dsv41-regenerated
+cmp src/fixtures/dsv41_official_engram.json /tmp/dsv41-regenerated/dsv41_official_engram.json
+cmp src/fixtures/dsv41_independent_dequant.json /tmp/dsv41-regenerated/dsv41_independent_dequant.json
+```
+
 ## Memory and context length (DeepSeek-V4.1)
 
 The module bills its memory before it allocates anything. At load it fills the expert slot rows up to the box's
