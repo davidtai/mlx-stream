@@ -10,6 +10,7 @@ comptime {
     _ = @import("deepseek_v41_ops.zig");
     _ = @import("deepseek_v41_graph.zig");
     _ = @import("deepseek_v41_engram.zig");
+    _ = @import("deepseek_v41_reference_test.zig");
     _ = @import("deepseek_v41_cache.zig");
     _ = @import("deepseek_v41_routes.zig");
     _ = @import("deepseek_v41_model.zig");
