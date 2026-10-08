@@ -59,9 +59,8 @@ const n_banks = std.meta.fieldNames(BankKind).len;
 /// What one routed-layer call serves (`sdk_ext.expert.Served`).
 pub const Served = sdk_ext.expert.Served;
 
-/// One projection's slot arrays in a bank (the streamer's `ProjArrays` over
-/// any backend): code int16 [rows, in/16, out/16, 16K], rout f16 [rows, out],
-/// rin f16 [rows, in].
+/// One projection's slot arrays: code int16 [rows, in/16, out/16, physical tile capacity],
+/// rout f16 [rows, out], rin f16 [rows, in]. `layout` separates logical rate from physical row stride.
 pub const ProjOf = xq.ProjArrays;
 
 /// A bank's nine arrays by projection (the streamer's `BankArrays`; the quant seam's).
@@ -432,7 +431,7 @@ const t128_scale: f32 = @bitCast(@as(u32, 0x3db504f3));
 /// The stock tier's routed-expert math, `exl3_lane.Exl3PackedOps` op for op:
 /// per projection `t128(gemv(t128(x * rin[slot])) ) * rout[slot]` (f32), the
 /// clamped SwiGLU between gate/up and down. `Gemv.project(g, proj, xh, ids,
-/// code)` is the EXL3 decode GEMV (`z = xh @ W_hat[slot]` in the trellis domain,
+/// code, layout)` is the EXL3 decode GEMV (`z = xh @ W_hat[slot]` in the trellis domain,
 /// f32 [rows, out]): the accepted EXL3 quant's (`*const exl3_quant.Gemv(G)`).
 /// The parity harnesses' math (the stock path reads f32 routed rows).
 pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
@@ -462,7 +461,7 @@ pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
         fn project(self: *const Self, g: *G, x: T, ids: T, p: ProjOf(T), proj: xq.Proj) !T {
             const rin = try g.astype(try g.take(p.rin, ids, 0), .float32);
             const xh = try t128(g, try g.mul(try g.astype(x, .float32), rin));
-            const z = try self.gemv.project(g, proj, xh, ids, p.code);
+            const z = try self.gemv.project(g, proj, xh, ids, p.code, p.layout);
             const rout = try g.astype(try g.take(p.rout, ids, 0), .float32);
             return g.mul(try t128(g, z), rout);
         }
@@ -579,13 +578,13 @@ pub fn WithPrefillRoutes(comptime G: type, comptime D: type, comptime P: type) t
 /// inputs: xh f32 [rows, in], ids uint32 [rows], code int16 [cap, in/16,
 /// out/16, 48] at K 3); the output is a kernel node f32 [rows, out].
 pub const TraceGemv = struct {
-    pub fn project(_: TraceGemv, g: *ops.TraceOps, _: xq.Proj, xh: u32, ids: u32, code: u32) !u32 {
+    pub fn project(_: TraceGemv, g: *ops.TraceOps, _: xq.Proj, xh: u32, ids: u32, code: u32, layout: xq.ProjectionLayout) !u32 {
         const sx = g.shapeOf(xh);
         const si = g.shapeOf(ids);
         const sc = g.shapeOf(code);
         if (g.dtypeOf(xh) != .float32 or g.dtypeOf(ids) != .uint32 or g.dtypeOf(code) != .int16) return error.GemvDtype;
         if (sx.n != 2 or si.n != 1 or sc.n != 4 or si.d[0] != sx.d[0]) return error.GemvShape;
-        if (sc.d[1] * 16 != sx.d[1] or sc.d[3] != 48) return error.GemvShape;
+        if (sc.d[1] * 16 != sx.d[1] or layout.k < 2 or layout.k > 4 or layout.code_row_words < @as(u64, @intCast(sc.d[1] * sc.d[2])) * 16 * layout.k) return error.GemvShape;
         return g.kernel(&.{ sx.d[0], sc.d[2] * 16 }, .float32);
     }
 };
@@ -1050,7 +1049,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         fn waitProj(self: *Self, g: *G, p: ProjOf(T), value: u64, deps: []const T) !ProjOf(T) {
             var out: [3]T = undefined;
             try self.eventWait(g, &.{ p.code, p.rout, p.rin }, value, deps, &out);
-            return .{ .code = out[0], .rout = out[1], .rin = out[2] };
+            return .{ .code = out[0], .rout = out[1], .rin = out[2], .layout = p.layout };
         }
 
         pub fn deinit(self: *Self) void {
@@ -2243,7 +2242,7 @@ test "dsv41 experts: the kernels' decode GEMV launches configs prepared on the m
         defer gemv.deinit(&g);
         try testing.expect(g.prepared_live > 0);
         // gate / up: xh f32 [rows, 5120] at slot rows ids, code i16 [cap, 320, 144, 48] -> [rows, 2304] f32
-        const z = try gemv.project(&g, .gate, try g.input(&.{ 6, 5120 }, .float32), try g.input(&.{6}, .uint32), try g.input(&.{ 64, 320, 144, 48 }, .int16));
+        const z = try gemv.project(&g, .gate, try g.input(&.{ 6, 5120 }, .float32), try g.input(&.{6}, .uint32), try g.input(&.{ 64, 320, 144, 48 }, .int16), xq.tightLayout(3));
         try testing.expect(g.shapeOf(z).eql(ops.Shape.of(&.{ 6, 2304 })));
         try testing.expectEqual(@as(usize, 1), g.prepared_launches);
     }
@@ -4052,12 +4051,8 @@ test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's source
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     for (rf) |r| try testing.expectEqual(BankKind.base, r.bank);
-    const sb = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
-    const bk: BankArraysOf(T) = .{
-        .gate = .{ .code = sb.gate.code, .rout = sb.gate.rout, .rin = sb.gate.rin },
-        .up = .{ .code = sb.up.code, .rout = sb.up.rout, .rin = sb.up.rin },
-        .down = .{ .code = sb.down.code, .rout = sb.down.rout, .rin = sb.down.rin },
-    };
+    var src = StreamSource.init(st);
+    const bk = (try src.bankArrays(&g, 0, .base)) orelse return error.TestUnexpectedResult;
     // 4,096 tokens x top-6 in seven calls (a hot one, then six), waves of 2 experts: 51 outputs, L1's count.
     const n_tok = 4096;
     const n_ids = n_tok * 6;

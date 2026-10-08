@@ -1,7 +1,7 @@
 # mlx-stream
 
 mlx-stream is a plugin for [mlx-serve](https://github.com/ddalcu/mlx-serve). It serves **DeepSeek-V4.1-Flash** on
-Apple Silicon from an **EXL3 3.0 bpw expert bank streamed from SSD**. The routed experts stay on disk as packed
+Apple Silicon from **EXL3 MUL1 expert banks streamed from SSD**. The routed experts stay on disk as packed
 per-expert records; the resident trunk (attention, shared experts, the head) loads once. A lookahead read pool brings
 the routed rows in for each layer, so the model runs on a Mac whose memory cannot hold all of its experts.
 
@@ -9,16 +9,38 @@ What it contains:
 
 - the `deepseek_v41` arch: the module-owned decode state (KV lanes, Engram rows), the prompt pass in waves, the
   serial and DSpark draft decode, and the memory bill the host admits against;
-- the EXL3 quant its routed experts use (K = 3, mul1 codebook, 128-wide Hadamard with suh / svh), with Metal kernels
+- the EXL3 quant its routed experts use (K = 2, 3 or 4 per projection, MUL1, 128-wide Hadamard with suh / svh), with Metal kernels
   pinned by a manifest hash and specialised to the model's shapes (hidden 5120, intermediate 2304);
 - the expert source that streams them: the packed-record reader, the C read pool, the residency policy, and the MLX
   event gates that order reads and kernels.
 
 Decode levers that are still being evaluated ship **off by default** (see Environment switches).
 
-The supported model is the DeepSeek-V4.1-Flash streaming EXL3 3.0 bpw package (a model directory whose
-`config.json` has `"model_type": "deepseek_v41"` and whose expert bank has a v2 expert manifest). No weights are
-included in this repository.
+The model directory must have `"model_type": "deepseek_v41"` and a checked v2 streaming expert bank. The existing
+EXL3 3.0-bpw streaming package remains supported; source EXL3 safetensors repositories require a streaming repack,
+not just a config rename. Resident trunk, draft and Engram formats are unchanged. No weights are included.
+
+### Expert rates and public packs
+
+Each v2 layer declares exactly one of `"K": 3` (uniform gate/up/down) or `"projection_K": [3, 3, 4]`
+(gate/up/down order). All experts in a layer share that triple. Both/neither declarations, unsupported rates and
+disagreement with the nine source segments are refused. Mixed entries omit `K`, so older readers fail closed.
+The SDK peek uses `bits == 0` for mixed layers; logical source segment shapes carry the individual rates.
+
+Logical tiles are contiguous inside each expert row even when a cache allocation has a wider physical stride.
+Persistent storage is billed per layer, extra rows by their exact layer-prefix cost, and shared transient storage
+by each component's maximum. Enlarged page-rounded preread buffers are charged separately from the K3 reserve.
+Tight K3 keeps its existing kernels; K2/K4 and padded/mixed banks use direct decode and tiled prefill, not full
+BF16 expert materialization.
+
+| Published source | Expert contract | Status |
+|---|---|---|
+| [Pollard 3.5](https://huggingface.co/bot-lab-21/DeepSeek-V4.1-Flash-EXL3-3.5bpw-Pollard/tree/f129e31a81e1337aa33e129e2d847fc7e37c8733) | K3/K4 per projection; native non-expert tensors | Routed layout covered; requires a checked streaming repack. A captured K4 projection is numerically tested, not a full-pack quality evaluation. |
+| [Spark 2.77](https://huggingface.co/0xSero/DeepSeek-V4.1-Flash-Spark/tree/9e3bbeabbb39fa2cf6e37e1cecfbd2fd0290329f) | K2/K3/K5 per expert; native trunk/draft | Not admitted by this per-layer K2–K4 contract. |
+| [Mia 2.9](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw/tree/64ba41b6c916a587db06eae2e19b7845f7be6e6b) | K2/K3 routed layers, plus EXL3 trunk/draft | Not a drop-in checkpoint; replacing its trunk/draft would create a different model. |
+
+Advertised bpw is an average, not a decoder rate or codec. MCG, fractional rates and per-expert mixtures are not
+covered by this contract.
 
 ## How mlx-serve consumes it
 
@@ -145,8 +167,33 @@ served behavior.
 | `DSV41_CELL_PREFILL_SUB` | cell | the cache's sub-chunk | the prompt rows per layer-major call; `whole` runs the prompt in one call. |
 | `DSV41_CELL_MAX_CONTEXT` | cell (bill tool) | 16,384 | the longest prompt the construction bills; the server takes it from `ctx_size`. |
 
-The test suites also read their own inputs (`DSV41_BANK`, device-only smoke switches, fixture paths, the cell
-harness's rows, baseline and output paths); each such test skips without its input.
+The test suites also read their own inputs (`DSV41_BANK`, device-only smoke switches, fixture paths and cell
+harness inputs). Legacy asset-gated tests skip without their inputs; the new independent GPU rate tests fail
+if GPU testing is requested but their required assets are missing.
+
+### Quant correctness checks
+
+Run the host's `mlx-stream-test` and `mlx-stream-conformance` targets with `-Doptimize=ReleaseFast` and
+`-Dmlx-stream-dir=/path/to/checkout`. Inline regressions cover malformed manifests, logical/physical strides,
+nonzero cache slots across growth/shrink/reuse, component-max bills, and actual K4 preread/scatter.
+
+Build the standalone test binary with `test-build -Dtest-filter="dsv41 kernels ops gpu:"`, then run it with
+`DSV41_KERNELS_GPU=1`, `SUSHI_EXL3_K2_FIXTURE`, `SUSHI_EXL3_K3_FIXTURE` and `SUSHI_EXL3_K4_FIXTURE` pointing to
+the host's `lib/sushi/src/exl3/fixtures/exl3_k{2,3,4}_linear.safetensors`. Set `DSV41_PUBLIC_DOWN_FIXTURE` to a
+captured Pollard layer-0/expert-0 `w2` safetensors file containing trellis, suh, svh and mul1. Hold the GPU lock
+for device checks. The tests exercise full-width prepared decode/verify, three banks, mixed projection rates,
+routed forms and carried BF16 prefill against independent public weights; report skips separately.
+
+The Pollard capture is the four unchanged `layers.0.ffn.experts.0.w2.{trellis,suh,svh,mul1}` tensors from
+`model-00003-of-00048.safetensors` at the revision linked above; it is a tensor extraction, not a requantization.
+For the manifest's compile and numerical probes, build with `-Dtest-filter="dsv41 pre-ship gate:"` and run the
+standalone binary with `DSV41_SELFCHECK_DEVICE=1`. This includes the integer-rate kernels, not just K3 construction.
+
+Kernel-ops and prefill-wave replay metadata is now v2, with explicit logical rates and physical row strides.
+For existing K3 fixtures, run `python3 scripts/migrate_exl3_fixture_layouts.py old-spec.json spec.json` in the
+same fixture directory. The utility validates the old K3 shapes, records the source-spec hash and preserves
+input/output descriptors and oracle payloads. Its tests run with
+`python3 -m unittest discover -s scripts -p 'test_migrate_exl3_fixture_layouts.py'`.
 
 ## Versions
 
@@ -164,11 +211,12 @@ Hadamard with suh / svh). They are independent implementations with disjoint cla
 |---|---|---|
 | Model | `qwen4_exp` (`quantization_config.expert_quant`) | `deepseek_v41` (inside the arch) |
 | Expert banks | resident | streamed from SSD as packed per-expert records |
-| Rates | K 2..4, mixes, mul1 and mcg | K = 3, mul1 |
+| Rates | K 2..4, mixes, mul1 and mcg | K 2..4 per layer/projection, mul1 |
 | Kernels | generated for any shape | pinned Metal texts for this model's shapes, behind a manifest hash |
 
-`src/exl3_sushi_parity.zig` decodes sushi's own K3 mul1 fixture (`lib/sushi/src/exl3/fixtures/exl3_k3_linear.safetensors`
-in the host checkout) through this plugin's decoder and checks the result against sushi's reference bit for bit.
+`src/exl3_sushi_parity.zig` checks the independent public K2/K3/K4 MUL1 fixtures, including full H128 and scales.
+`src/exl3_kernel_ops_gate.zig` uses their reference weights for full-width GPU projections and routed operations;
+these numerical tolerances are not a claim of bitwise full-model equivalence or lossless-teacher quality.
 
 ## Layout
 

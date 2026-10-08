@@ -47,6 +47,10 @@ pub const Bill = struct {
     layers: u32 = 0,
     transient_rows: u64 = 0,
     transient_decode_rows: u64 = 0,
+    persistent_row_bytes: u64,
+    transient_row_bytes: u64,
+    /// Owned costs of one extra row on layers [0, n); never borrows the opened bank.
+    slot_prefix: [41]u64,
     /// The variant this bill was built at, and the prompt wave the tight variant bills (the conservative arm's judge
     /// compares the measured prompt transient against it; equal to `prefill_wave` without the model's fence).
     variant: BillVariant = .conservative,
@@ -56,8 +60,7 @@ pub const Bill = struct {
     decode_rows: u32,
     /// Decode's single records past layers x decode_rows (`fillExtraRecords`; the record granule route), in `slot_decode`.
     decode_extra_records: u64 = 0,
-    /// (layers x rows + the transient bank's rows: one max_route_ids window per wide read in flight) x the
-    /// bank's record.
+    /// Per-layer persistent rows plus the shared transient component capacities.
     slot_prefill: u64,
     slot_decode: u64,
     lookahead_staging: u64,
@@ -470,7 +473,12 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
     };
     defer p.bank.deinit();
     defer if (p.draft_subset) |*x| x.deinit();
-    const rec = p.inputs.record_bytes;
+    const geometry = &p.geometry;
+    if (p.bank.layers.len > 40) return error.LayerGeometry;
+    var prefix: [41]u64 = @splat(0);
+    for (p.bank.layers, 0..) |*layer, l| prefix[l + 1] = prefix[l] + @import("expert_stream.zig").StorageGeometry.rowBytes(layer);
+    const extra = ov.decode_extra_records orelse 0;
+    if (extra >= c.n_layers or (extra != 0 and p.decode_rows >= c.n_routed_experts)) return error.InvalidRows;
     // The stream's transient bank, allocated whole at construction: one window of max_route_ids rows per wide
     // read the stream holds in flight (the arm's `.transient_rows = wide_depth x max_route_ids`). Billing one
     // window left 48 records (0.64 GB) of device memory unbilled after c47001e folded the second window's named
@@ -507,14 +515,16 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
         .layers = c.n_layers,
         .transient_rows = transient,
         .transient_decode_rows = transient_decode,
+        .persistent_row_bytes = geometry.persistent_row_bytes,
+        .transient_row_bytes = geometry.transient_row_bytes,
+        .slot_prefix = prefix,
         .n_experts = c.n_routed_experts,
         .prefill_rows = p.prefill_rows,
         .decode_rows = p.decode_rows,
-        .slot_prefill = (@as(u64, c.n_layers) * p.prefill_rows + transient) * rec,
-        .decode_extra_records = ov.decode_extra_records orelse 0,
-        .slot_decode = (@as(u64, c.n_layers) * p.decode_rows + (ov.decode_extra_records orelse 0) + transient_decode) * rec,
-        // The host side is billed as measured (`measured_host_side_bytes`, in host_reserve).
-        .lookahead_staging = 0,
+        .slot_prefill = @as(u64, p.prefill_rows) * geometry.persistent_row_bytes + transient * geometry.transient_row_bytes,
+        .decode_extra_records = extra,
+        .slot_decode = @as(u64, p.decode_rows) * geometry.persistent_row_bytes + prefix[extra] + transient_decode * geometry.transient_row_bytes,
+        .lookahead_staging = arm_mod.poolGrowthBytes(&p.bank, opts, geometry, p.inputs.io_staging_bytes.?),
         .residents = m.totalBytes() - droppedResidentBytes(&m, &c, headRoute(ov), denseRc(ov)) + builtResidentBytes(&c, headRoute(ov), denseRc(ov)),
         .embedding = m.bytes_by_module[@backingInt(v41.Module.embed)],
         .engram = em.totalBytes(),
@@ -761,8 +771,7 @@ pub fn fill(a: std.mem.Allocator, io: std.Io, config: settings.Config, prompt_to
 /// construction terms marked (`constructionTerms`, less the retained prompt state the prompt creates) and the host
 /// side a measured bound. The baseline stays out: the fill and the admission take it.
 pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
-    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.decode_extra_records + b.transient_decode_rows);
-    const per_row = @as(u64, b.layers) * rec;
+    const per_row = b.persistent_row_bytes;
     const p = b.prefillTerms();
     const d = b.decodeTerms();
     const c = b.constructionTerms();
@@ -787,7 +796,7 @@ pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
         .{ .name = "prompt buffer allowance", .bytes = .{ p.prompt_buffer_allowance, d.prompt_buffer_allowance }, .at_construction = false },
     });
     const w = fillBillOf(b).wiring.?;
-    return .{ .terms = terms, .per_row = per_row, .row_terms = .{ .data = .{ w.prefill_wired, w.decode_wired + b.decode_extra_records * rec, per_row, 0 }, .at = wiringAt } };
+    return .{ .terms = terms, .per_row = per_row, .row_terms = .{ .data = .{ w.prefill_wired, w.decode_wired + b.slot_prefix[b.decode_extra_records], per_row, 0 }, .at = wiringAt } };
 }
 
 /// The wiring terms at `rows` (`sdk.MemoryBill.RowTerms`), exactly as `FillBill.total` re-evaluates them; `data` is
@@ -800,16 +809,15 @@ fn wiringAt(data: *const [4]u64, phase: sdk.MemoryBill.Phase, rows: u32) u64 {
 /// A bill in the fill's shape: its phases' totals less their slot rows and their wiring terms, one row on every routed
 /// layer, and each phase's wired bytes less its slot rows (the wiring terms, re-evaluated at every row count).
 pub fn fillBillOf(b: Bill) FillBill {
-    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.decode_extra_records + b.transient_decode_rows);
-    const per_row = @as(u64, b.layers) * rec;
+    const per_row = b.persistent_row_bytes;
     const p = b.prefillTerms();
     const d = b.decodeTerms();
-    const decode_slots = b.decode_rows * per_row + b.decode_extra_records * rec;
+    const decode_slots = b.decode_rows * per_row + b.slot_prefix[b.decode_extra_records];
     return .{
         .prefill_fixed = b.prefillTotal() - p.wire_tables - b.prefill_rows * per_row,
         .decode_fixed = b.decodeTotal() - d.wire_tables - decode_slots,
         .per_row = per_row,
-        .record = rec,
+        .slot_prefix = b.slot_prefix,
         .wiring = .{ .prefill_wired = wiredOf(p) - b.prefill_rows * per_row, .decode_wired = wiredOf(d) - decode_slots },
     };
 }
@@ -822,7 +830,7 @@ pub fn fillExtraRecords(b: Bill, target: u64) u32 {
     const u: u64 = b.decode_rows;
     if (u >= b.n_experts or fb.total(true, u + 1) <= target) return 0;
     var k: u64 = b.layers - 1;
-    while (k > 0 and fb.totalSlots(true, u * fb.per_row + k * fb.record) > target) k -= 1;
+    while (k > 0 and fb.totalSlots(true, u * fb.per_row + fb.slot_prefix[k]) > target) k -= 1;
     return @intCast(k);
 }
 
@@ -847,15 +855,14 @@ pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: settings.C
     return b.processBound();
 }
 
-/// A native bill in the fill's shape: each phase's billed bytes (the box baseline included) without its
-/// persistent slot rows, and one row on every routed layer (layers x the record); a phase's total at
-/// r rows is `fixed + r * per_row` plus, with `wiring`, its wiring terms at r rows (`FillBill.Wiring.at`).
+/// A native bill's fixed terms and exact sum of one persistent row on every layer.
+/// Wiring terms are re-evaluated at the selected slot-byte count.
 pub const FillBill = struct {
     prefill_fixed: u64,
     decode_fixed: u64,
     per_row: u64,
-    /// One record (per_row / layers); the record granule's step.
-    record: u64 = 0,
+    /// Marginal prefix costs, in the same layer order as the allocation.
+    slot_prefix: [41]u64 = @splat(0),
     wiring: ?Wiring = null,
 
     /// Each phase's wired bytes without its slot rows.
@@ -1066,7 +1073,6 @@ pub fn servedContext(config: *const settings.Config) u64 {
 /// The fewest rows per layer the fill admits (the envelope admission's prefill floor).
 pub const min_fill_rows = 16;
 
-
 // ── Tests ──
 
 const testing = std.testing;
@@ -1106,11 +1112,16 @@ test "dsv41 memory: the host side bills 1.00 GB in the prompt and decode phases,
 /// baseline), term by term in bytes as the bill built it on the bank then (a test fixture).
 pub fn cell4Bill() Bill {
     const rec: u64 = 13_315_584;
+    var prefix: [41]u64 = undefined;
+    for (&prefix, 0..) |*p, i| p.* = i * rec;
     return .{
         .baseline = 8_716_419_072,
         .layers = 40,
         .transient_rows = 48,
         .transient_decode_rows = 48,
+        .persistent_row_bytes = 40 * rec,
+        .transient_row_bytes = rec,
+        .slot_prefix = prefix,
         .n_experts = 384,
         .prefill_rows = 106,
         .decode_rows = 148,
@@ -1194,9 +1205,9 @@ test "dsv41 memory: wire_tables bills the page tables and wiring records of a ph
 fn expectSdkView(b: Bill, target: u64) !void {
     const mb = try memoryBill(testing.allocator, b);
     defer mb.free(testing.allocator);
-    const rec = mb.per_row / b.layers;
-    try testing.expectEqual(b.slot_prefill, (@as(u64, b.layers) * b.prefill_rows + b.transient_rows) * rec);
-    try testing.expectEqual(b.slot_decode, (@as(u64, b.layers) * b.decode_rows + b.transient_decode_rows) * rec);
+    try testing.expectEqual(b.persistent_row_bytes, mb.per_row);
+    try testing.expectEqual(b.slot_prefill, b.prefill_rows * mb.per_row + b.transient_rows * b.transient_row_bytes);
+    try testing.expectEqual(b.slot_decode, b.decode_rows * mb.per_row + b.slot_prefix[b.decode_extra_records] + b.transient_decode_rows * b.transient_row_bytes);
     const got = sdk.fill(mb, b.baseline, target, b.n_experts, min_fill_rows);
     if (fillOf(fillBillOf(b), target, b.n_experts)) |want| {
         const g = try got;
@@ -1852,7 +1863,6 @@ test "dsv41 memory: the grow is refused when the two-count decode total exceeds 
     try std.testing.expectError(error.PromptOverTarget, admitOf(b, target));
 }
 
-
 // DSV41_BANK=<bank> (host): what upstream's load preflight bills for the module (in place of the shards' disk
 // bytes): the standard request's process bound at the fill's floor rows, well above the shards' bytes and
 // well under a full fill's bound.
@@ -1904,9 +1914,8 @@ test "dsv41 memory: the fill's rows at the windows' baselines (bank)" {
 
 /// `b` with `k` single decode records past its rows, billed as billAt bills them.
 fn withExtra(b: Bill, k: u64) Bill {
-    const rec = b.slot_decode / (@as(u64, b.layers) * b.decode_rows + b.decode_extra_records + b.transient_decode_rows);
     var x = b;
-    x.slot_decode = (@as(u64, b.layers) * b.decode_rows + k + b.transient_decode_rows) * rec;
+    x.slot_decode = b.slot_decode - b.slot_prefix[b.decode_extra_records] + b.slot_prefix[k];
     x.decode_extra_records = k;
     return x;
 }
@@ -1915,7 +1924,7 @@ test "dsv41 memory: the record granule admits the fill's leftover below one row 
     const b = cell4Bill();
     const fb = fillBillOf(b);
     const rec: u64 = 13_315_584;
-    try testing.expectEqual(rec, fb.record);
+    try testing.expectEqual(rec, fb.slot_prefix[1]);
     // Every leftover below one row: the most records whose billed decode total fits, never a whole row.
     var k_seen: u64 = 0;
     var d: u64 = 0;
@@ -1955,8 +1964,6 @@ test "dsv41 memory: MLX's cache overshoot (one freed buffer over the limit) is b
     try testing.expectEqual(@as(u64, 1_041_448_960), b.prefillTerms().mlx_cache_overshoot);
     try testing.expectEqual(cache_overshoot_decode_traced, b.decodeTerms().mlx_cache_overshoot);
 }
-
-
 
 // (a) The bill's ring bytes against the real LayerState rings (`LayerState.init` per layer of the real config, as the
 // model's state builder makes them, `Ring.append` through the bill's chunks and then decode) on the trace backend: the
@@ -2315,7 +2322,6 @@ test "dsv41 memory: a prompt up to the sub-chunk bills its one call byte for byt
     const one = try prefillBillAt(&config, .{ .prefill_sub = std.math.maxInt(u64) }, &c, 4);
     try testing.expectEqual(one.layerMajorWaveBytes(131072, .served), promptWave(one, true, true, 131072));
 }
-
 
 test "dsv41 memory: the default served bill's wave covers every prompt length 1 .. 16,384, the chunk rule's breakpoints included (no bank)" {
     const c = try realConfig();

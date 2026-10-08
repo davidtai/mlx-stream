@@ -22,8 +22,6 @@ pub fn KernelTrace(comptime R: type) type {
         const Dtype = mlx.mlx_dtype;
         const Shape = kr.Shape;
         const argOf = kr.argOf;
-        const RowPlans = kr.RowPlans;
-        const rowsVars = kr.rowsVars;
 
         /// Host-only backend: nodes of shape + dtype (host arrays keep their bytes), every launch
         /// recorded with its inputs and outputs, every node with its origin, and the launches, evals
@@ -435,45 +433,6 @@ pub fn KernelTrace(comptime R: type) type {
                     try shapeStr(out, a, t.nodes.items[o.out].shape.slice());
                 },
             }
-        }
-
-        /// A backend without prepared launches (the per-call path), recording through a Trace.
-        pub const TracePerCall = struct {
-            pub const T = u32;
-            t: *Trace,
-
-            pub fn launch(p: *TracePerCall, k: Kernel, inputs: []const T, cfg: *const LaunchConfig, out: []T) !void {
-                return p.t.launch(k, inputs, cfg, out);
-            }
-        };
-
-        /// Every M of `e`'s table: the prebuilt config == the per-call `launchFor`, and the prepared
-        /// launch records exactly the launch the per-call path records.
-        pub fn expectRowPlans(comptime n: usize, t: *Trace, e: *const Entry, site: ?[]const u8) !usize {
-            var pc: TracePerCall = .{ .t = t };
-            var prep = try RowPlans(Trace, n).init(t, e, site, null);
-            defer prep.deinit(t);
-            var per = try RowPlans(TracePerCall, n).init(&pc, e, site, null);
-            defer per.deinit(&pc);
-            const ins: [16]Trace.T = @splat(0);
-            var o1: [xk.max_outputs]Trace.T = undefined;
-            var o2: [xk.max_outputs]Trace.T = undefined;
-            for (1..n + 1) |m| {
-                const want = try xk.launchFor(e, &rowsVars(m), site);
-                try testing.expect(std.meta.eql(want, (try prep.at(m)).*));
-                const before = t.prepared_launches;
-                try prep.launch(t, m, ins[0..e.inputs.len], &o1);
-                try testing.expectEqual(before + 1, t.prepared_launches);
-                const a = t.back(1).*;
-                try per.launch(&pc, m, ins[0..e.inputs.len], &o2);
-                try testing.expectEqual(before + 1, t.prepared_launches);
-                const b = t.back(1).*;
-                try testing.expect(a.prepared and !b.prepared);
-                try testing.expect(a.k == b.k and a.n_in == b.n_in and std.mem.eql(Trace.T, a.inputs[0..a.n_in], b.inputs[0..b.n_in]));
-                try testing.expect(std.meta.eql(a.cfg, b.cfg) and std.meta.eql(a.cfg, want));
-            }
-            try testing.expectError(error.RowsOutOfPlan, prep.at(0));
-            return n;
         }
 
         /// The lane's own launch of `e` at exactly `vars` (the samples of an entry several routes share).

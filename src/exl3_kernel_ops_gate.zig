@@ -1,7 +1,7 @@
 //! The kernel-ops GPU gate: the Python lanes' own device outputs (a fixture written in a
 //! GPU run by the reference runtime's dump_kernel_ops_fixture.py) replayed through the ported
-//! routes on the registry's kernels, every output word compared. Inputs are regenerated from
-//! the fixture's seeded generators (splitmix64, the dump's twins) and checked by sha256 first.
+//! routes on the registry's kernels, every output word compared. Seeded or file-backed
+//! inputs are checked by sha256 first; projection rates and physical row strides are explicit.
 //! GPU only: DSV41_KERNELS_GPU=1 and DSV41_KERNEL_OPS_FIXTURE=<dir> in a lock-holding window.
 
 const std = @import("std");
@@ -175,10 +175,11 @@ const JGen = struct {
 };
 const JArray = struct { name: []const u8, dtype: []const u8, shape: []const i64, gen: ?JGen = null, sha256: []const u8, file: ?[]const u8 = null };
 const JVars = struct { rows: u64 = 0, cap: u64 = 0, experts: u64 = 0 };
-const JCase = struct { family: []const u8, case: []const u8, vars: JVars = .{}, site: ?[]const u8 = null, proj: ?[]const u8 = null, eps: ?f64 = null, inputs: []const JArray, outputs: []const JArray };
+const JLayouts = struct { gate: xq.ProjectionLayout, up: xq.ProjectionLayout, down: xq.ProjectionLayout };
+const JCase = struct { family: []const u8, case: []const u8, vars: JVars = .{}, site: ?[]const u8 = null, proj: ?[]const u8 = null, layout: ?xq.ProjectionLayout = null, layouts: ?JLayouts = null, eps: ?f64 = null, inputs: []const JArray, outputs: []const JArray };
 const JSpec = struct { format: []const u8, manifest_sha256: []const u8, cases: []const JCase };
 
-const fixture_format = "mlx-serve-exl3-kernel-ops-fixture-v1";
+const fixture_format = "mlx-serve-exl3-kernel-ops-fixture-v2";
 const draft_fixture_format = "mlx-serve-exl3-kernel-draft-fixture-v1";
 const decode2_fixture_format = "mlx-serve-exl3-kernel-decode2-fixture-v1";
 const prefill2_fixture_format = "mlx-serve-exl3-kernel-prefill2-fixture-v1";
@@ -298,20 +299,11 @@ fn replayCase(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u8, 
     var ins: std.StringHashMapUnmanaged(mlx.mlx_array) = .empty;
     defer ins.deinit(a);
     for (c.inputs) |*i| {
-        const dt = dtypeOf(i.dtype);
-        var shape: [8]c_int = undefined;
-        var n: usize = 1;
-        for (i.shape, 0..) |d, k| {
-            shape[k] = @intCast(d);
-            n *= @intCast(d);
-        }
-        const bytes = try generate(a, i.gen.?, dt, n);
-        defer a.free(bytes);
-        if (!hexEql(i.sha256, bytes)) {
-            try lines.append(a, .{ .family = c.family, .case = c.case, .output = i.name, .err = "input generator differs from the dump's" });
+        const x = try regen(a, g, dir, i) orelse {
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = i.name, .err = "input bytes differ from the dump's" });
             return;
-        }
-        try ins.put(a, i.name, try g.hostArray(bytes, shape[0..i.shape.len], dt));
+        };
+        try ins.put(a, i.name, x);
     }
     var outs: [16]mlx.mlx_array = undefined;
     const n_out = try runFamily(g, reg, c, &ins, &outs);
@@ -499,10 +491,12 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 4;
     }
     if (eq(u8, f, "gemv")) {
-        var r = try xq.Gemv(MlxG).init(g, reg);
+        const layout = c.layout orelse return error.FixtureLayoutMissing;
+        if (layout.k < 2 or layout.k > 4) return error.FixtureRateUnsupported;
+        var r = try xq.Gemv(MlxG).initRates(g.a, g, reg, .{}, @as(u3, 1) << @intCast(layout.k - 2));
         defer r.deinit(g);
         const proj: xq.Proj = if (eq(u8, c.proj.?, "down")) .down else .gate;
-        outs[0] = try r.project(g, proj, in(ins, "xh"), in(ins, "ids"), in(ins, "code"));
+        outs[0] = try r.project(g, proj, in(ins, "xh"), in(ins, "ids"), in(ins, "code"), layout);
         return 1;
     }
     if (eq(u8, f, "prep")) {
@@ -515,9 +509,10 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         outs[4] = try r.dpost(g, in(ins, "zd"), in(ins, "rout_d"), ids);
         return 5;
     }
-    const gate: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_g"), .rout = in(ins, "rout_g"), .rin = in(ins, "rin_g") };
-    const up: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_u"), .rout = in(ins, "rout_u"), .rin = in(ins, "rin_u") };
-    const down: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_d"), .rout = in(ins, "rout_d"), .rin = in(ins, "rin_d") };
+    const layouts = c.layouts orelse return error.FixtureLayoutMissing;
+    const gate: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_g"), .rout = in(ins, "rout_g"), .rin = in(ins, "rin_g"), .layout = layouts.gate };
+    const up: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_u"), .rout = in(ins, "rout_u"), .rin = in(ins, "rin_u"), .layout = layouts.up };
+    const down: xq.ProjArrays(mlx.mlx_array) = .{ .code = in(ins, "code_d"), .rout = in(ins, "rout_d"), .rin = in(ins, "rin_d"), .layout = layouts.down };
     if (eq(u8, f, "rebuild")) {
         const r = xq.Rebuild(MlxG).init(reg);
         outs[0..3].* = try r.call(g, gate, up, down, in(ins, "slots"), @intCast(c.vars.experts));
@@ -533,9 +528,9 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         const gu = try routedTable(g, tbl_gu);
         const dn = try routedTable(g, tbl_dn);
         const x = try r.take2(g, in(ins, "act"), in(ins, "ridx"), rhs, tbl_gu, gate.rin, up.rin);
-        const z = try r.gemmGateUp(g, x[0], x[1], gate.code, up.code, gu.tbl, gu.tgs);
+        const z = try r.gemmGateUp(g, x[0], x[1], gate.code, up.code, gu.tbl, gu.tgs, gate.layout, up.layout);
         const hd = try r.onePass(g, z[0], z[1], rhs, tbl_gu, gate.rout, up.rout, down.rin);
-        const zd = try r.gemmDown(g, hd, down.code, dn.tbl, dn.tgs);
+        const zd = try r.gemmDown(g, hd, down.code, dn.tbl, dn.tgs, down.layout);
         const o = try r.widen1(g, zd, rhs, tbl_dn, down.rout);
         const rx = try r.roundx(g, in(ins, "act_r"), rhs, tbl_gu, down.rin);
         const w2 = try r.widen2(g, in(ins, "act_g"), in(ins, "act_u"), rhs, tbl_gu, gate.rout, up.rout);
@@ -576,12 +571,12 @@ fn wanted(filter: ?[]const u8, family: []const u8) bool {
 
 const PShape = struct { wave: u32, inflight: u32, row_budget: u32, carry_rows: u32 };
 const PCall = struct { name: []const u8, a_rows: u32, slots: []const u32, act: JArray, output: JArray };
-const PCase = struct { family: []const u8, case: []const u8, shape: PShape, cap: u32, inputs: []const JArray, calls: []const PCall };
+const PCase = struct { family: []const u8, case: []const u8, shape: PShape, cap: u32, layouts: JLayouts, inputs: []const JArray, calls: []const PCall };
 const PSpec = struct { format: []const u8, manifest_sha256: []const u8, cases: []const PCase };
-const prefill_format = "mlx-serve-exl3-prefill-waves-fixture-v1";
+const prefill_format = "mlx-serve-exl3-prefill-waves-fixture-v2";
 
-/// An input regenerated from its generator; null when its bytes are not the dump's (sha256).
-fn regen(a: Allocator, g: *MlxG, i: *const JArray) !?mlx.mlx_array {
+/// A generated or file-backed input; null when its bytes differ from the fixture's sha256.
+fn regen(a: Allocator, g: *MlxG, dir: []const u8, i: *const JArray) !?mlx.mlx_array {
     const dt = dtypeOf(i.dtype);
     var shape: [8]c_int = undefined;
     var n: usize = 1;
@@ -589,9 +584,14 @@ fn regen(a: Allocator, g: *MlxG, i: *const JArray) !?mlx.mlx_array {
         shape[k] = @intCast(d);
         n *= @intCast(d);
     }
-    const bytes = try generate(a, i.gen.?, dt, n);
+    if ((i.gen == null) == (i.file == null)) return error.FixtureInputSource;
+    const bytes = if (i.gen) |gen| try generate(a, gen, dt, n) else blk: {
+        const path = try std.fs.path.join(a, &.{ dir, i.file.? });
+        defer a.free(path);
+        break :blk try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1 << 31));
+    };
     defer a.free(bytes);
-    if (!hexEql(i.sha256, bytes)) return null;
+    if (bytes.len != n * size(dt) or !hexEql(i.sha256, bytes)) return null;
     return try g.hostArray(bytes, shape[0..i.shape.len], dt);
 }
 
@@ -601,17 +601,17 @@ fn replayPrefill(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u
     var ins: std.StringHashMapUnmanaged(mlx.mlx_array) = .empty;
     defer ins.deinit(a);
     for (c.inputs) |*i| {
-        const x = try regen(a, g, i) orelse {
-            try lines.append(a, .{ .family = c.family, .case = c.case, .output = i.name, .err = "input generator differs from the dump's" });
+        const x = try regen(a, g, dir, i) orelse {
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = i.name, .err = "input bytes differ from the dump's" });
             return;
         };
         try ins.put(a, i.name, x);
     }
     const P = xq.ProjArrays(mlx.mlx_array);
     const bank: xq.BankArrays(mlx.mlx_array) = .{
-        .gate = P{ .code = in(&ins, "gate_proj.code"), .rout = in(&ins, "gate_proj.rout"), .rin = in(&ins, "gate_proj.rin") },
-        .up = P{ .code = in(&ins, "up_proj.code"), .rout = in(&ins, "up_proj.rout"), .rin = in(&ins, "up_proj.rin") },
-        .down = P{ .code = in(&ins, "down_proj.code"), .rout = in(&ins, "down_proj.rout"), .rin = in(&ins, "down_proj.rin") },
+        .gate = P{ .code = in(&ins, "gate_proj.code"), .rout = in(&ins, "gate_proj.rout"), .rin = in(&ins, "gate_proj.rin"), .layout = c.layouts.gate },
+        .up = P{ .code = in(&ins, "up_proj.code"), .rout = in(&ins, "up_proj.rout"), .rin = in(&ins, "up_proj.rin"), .layout = c.layouts.up },
+        .down = P{ .code = in(&ins, "down_proj.code"), .rout = in(&ins, "down_proj.rout"), .rin = in(&ins, "down_proj.rin"), .layout = c.layouts.down },
     };
     try xq.checkBank(MlxG, g, reg, .gate, bank.gate, diag);
     try xq.checkBank(MlxG, g, reg, .up, bank.up, diag);
@@ -622,8 +622,8 @@ fn replayPrefill(a: Allocator, g: *MlxG, reg: *const xk.Registry, dir: []const u
     var results: std.ArrayList(mlx.mlx_array) = .empty;
     defer results.deinit(a);
     for (c.calls) |*cl| {
-        const act = try regen(a, g, &cl.act) orelse {
-            try lines.append(a, .{ .family = c.family, .case = c.case, .output = cl.name, .err = "act generator differs from the dump's" });
+        const act = try regen(a, g, dir, &cl.act) orelse {
+            try lines.append(a, .{ .family = c.family, .case = c.case, .output = cl.name, .err = "act bytes differ from the dump's" });
             return;
         };
         try results.append(a, try r.call(g, act, .{ .slot = cl.slots }, bank));
@@ -829,4 +829,558 @@ test "dsv41 kernels ops: the fixture generators are the dump's (sha256 of its --
     // the registry's golden-plane stream is the same splitmix64 (state += golden before each output)
     var st: u64 = 0x5EED0001;
     for (0..4) |i| try testing.expectEqual(xk.splitmix64(&st), sm(0x5EED0001, i));
+}
+
+const PublicBlock = struct {
+    k: u32,
+    code: []u16,
+    rin: [128]f32,
+    rout: [128]f32,
+    weights: []f64,
+};
+
+fn publicTensor(header: std.json.Value, data: []const u8, name: []const u8, dtype: []const u8, shape: []const u64) ![]const u8 {
+    const t = header.object.get(name) orelse return error.FixtureTensorMissing;
+    try testing.expectEqualStrings(dtype, t.object.get("dtype").?.string);
+    const dims = t.object.get("shape").?.array.items;
+    try testing.expectEqual(shape.len, dims.len);
+    var count: u64 = 1;
+    for (shape, dims) |want, got| {
+        try testing.expectEqual(want, @as(u64, @intCast(got.integer)));
+        count *= want;
+    }
+    const offsets = t.object.get("data_offsets").?.array.items;
+    const lo: usize = @intCast(offsets[0].integer);
+    const hi: usize = @intCast(offsets[1].integer);
+    try testing.expect(lo <= hi and hi <= data.len);
+    try testing.expectEqual(count * 2, hi - lo);
+    return data[lo..hi];
+}
+
+fn publicHalf(bytes: []const u8, i: usize) f32 {
+    return @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little))));
+}
+
+// These are the existing library-produced public weights, not this engine's decoder.
+// A configured GPU test must find every asset; a missing asset is not a successful skip.
+fn loadPublicBlock(a: Allocator, comptime rate: u32) !PublicBlock {
+    const env = std.c.getenv(std.fmt.comptimePrint("SUSHI_EXL3_K{d}_FIXTURE", .{rate}));
+    const path = if (env) |p| std.mem.span(p) else std.fmt.comptimePrint("lib/sushi/src/exl3/fixtures/exl3_k{d}_linear.safetensors", .{rate});
+    const bytes = try sdk.io_util.readAllNoCache(a, path, 1 << 20);
+    defer a.free(bytes);
+    try testing.expect(bytes.len >= 8);
+    const n: usize = @intCast(std.mem.readInt(u64, bytes[0..8], .little));
+    try testing.expect(n <= bytes.len - 8);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes[8..][0..n], .{});
+    defer parsed.deinit();
+    const data = bytes[8 + n ..];
+    const code = try publicTensor(parsed.value, data, "trellis", "U16", &.{ 8, 8, rate * 16 });
+    const rin = try publicTensor(parsed.value, data, "suh", "F16", &.{128});
+    const rout = try publicTensor(parsed.value, data, "svh", "F16", &.{128});
+    const weights = try publicTensor(parsed.value, data, "public", "F16", &.{ 128, 128 });
+    var block: PublicBlock = .{ .k = rate, .code = try a.alloc(u16, code.len / 2), .rin = undefined, .rout = undefined, .weights = undefined };
+    errdefer a.free(block.code);
+    block.weights = try a.alloc(f64, 128 * 128);
+    for (block.code, 0..) |*word, i| word.* = std.mem.readInt(u16, code[i * 2 ..][0..2], .little);
+    for (0..128) |i| {
+        block.rin[i] = publicHalf(rin, i);
+        block.rout[i] = publicHalf(rout, i);
+    }
+    for (block.weights, 0..) |*w, i| w.* = publicHalf(weights, i);
+    return block;
+}
+
+fn publicProjection(g: *MlxG, block: *const PublicBlock, down: bool, bank: usize, second_slot: bool) !xq.ProjArrays(mlx.mlx_array) {
+    const ni: usize = if (down) 144 else 320;
+    const nj: usize = if (down) 320 else 144;
+    const cap = bank + 2;
+    const width = @max(16 * block.k, 32 + 16 * bank);
+    const row_words = ni * nj * width;
+    const code = try g.a.alloc(u16, cap * row_words);
+    defer g.a.free(code);
+    @memset(code, 0xa55a);
+    const target = code[(cap - 1) * row_words ..];
+    const tile_words = 16 * block.k;
+    for (0..ni) |i| {
+        for (0..nj) |j| {
+            const dst = (i * nj + j) * tile_words;
+            const src = ((i % 8) * 8 + j % 8) * tile_words;
+            @memcpy(target[dst..][0..tile_words], block.code[src..][0..tile_words]);
+        }
+    }
+    const rin = try g.a.alloc(f16, cap * ni * 16);
+    defer g.a.free(rin);
+    const rout = try g.a.alloc(f16, cap * nj * 16);
+    defer g.a.free(rout);
+    @memset(rin, 0);
+    @memset(rout, 0);
+    const factor: f32 = @floatFromInt(@as(u32, 1) << @intCast(bank));
+    for (rin[(cap - 1) * ni * 16 ..], 0..) |*r, i| r.* = @floatCast(block.rin[i % 128] * factor);
+    for (rout[(cap - 1) * nj * 16 ..], 0..) |*r, i| r.* = @floatCast(block.rout[i % 128] / 32);
+    if (second_slot) {
+        std.debug.assert(bank == 2);
+        @memcpy(code[row_words..][0 .. ni * nj * tile_words], target[0 .. ni * nj * tile_words]);
+        for (rin[ni * 16 ..][0 .. ni * 16], 0..) |*r, i| r.* = @floatCast(block.rin[i % 128]);
+        for (rout[nj * 16 ..][0 .. nj * 16], 0..) |*r, i| r.* = @floatCast(block.rout[i % 128] / 32);
+    }
+    return .{
+        .code = try g.hostArray(std.mem.sliceAsBytes(code), &.{ @intCast(cap), @intCast(ni), @intCast(nj), @intCast(width) }, .int16),
+        .rin = try g.hostArray(std.mem.sliceAsBytes(rin), &.{ @intCast(cap), @intCast(ni * 16) }, .float16),
+        .rout = try g.hostArray(std.mem.sliceAsBytes(rout), &.{ @intCast(cap), @intCast(nj * 16) }, .float16),
+        .layout = .{ .k = block.k, .code_row_words = row_words },
+    };
+}
+
+fn publicInput(row: usize, col: usize) f32 {
+    const value: i32 = @as(i32, @intCast((row * 3 + col * 5) % 17)) - 8;
+    return @as(f32, @floatFromInt(value)) / 256;
+}
+
+fn publicActs(g: *MlxG, rows: usize) !mlx.mlx_array {
+    const bits = try g.a.alloc(u16, rows * 5120);
+    defer g.a.free(bits);
+    for (bits, 0..) |*b, i| b.* = sdk.io_util.bf16Rne(publicInput(i / 5120, i % 5120));
+    return g.hostArray(std.mem.sliceAsBytes(bits), &.{ @intCast(rows), 5120 }, .bfloat16);
+}
+
+// Expanding the independent public 128x128 matrix gives identical block columns.
+// Sum input blocks first, then use dense f64 matmul; no trellis or kernel oracle enters here.
+fn publicExpected(blocks: [3]*const PublicBlock, row: usize, bank: usize, hidden: *[128]f64, out: *[128]f64) void {
+    var x: [128]f64 = @splat(0);
+    for (0..5120) |i| x[i % 128] += publicInput(row, i);
+    const factor = @as(f64, @floatFromInt(@as(u32, 1) << @intCast(bank))) / 32;
+    for (0..128) |j| {
+        var gate: f64 = 0;
+        var up: f64 = 0;
+        for (x, 0..) |v, i| {
+            gate += v * blocks[0].weights[i * 128 + j];
+            up += v * blocks[1].weights[i * 128 + j];
+        }
+        gate = @min(gate * factor, 10);
+        up = std.math.clamp(up * factor, -10, 10);
+        hidden[j] = gate / (1 + @exp(-gate)) * up;
+    }
+    for (0..128) |j| {
+        var sum: f64 = 0;
+        for (hidden, 0..) |v, i| sum += (v * 18) * blocks[2].weights[i * 128 + j];
+        out[j] = sum * factor;
+    }
+}
+
+fn expectPublicRows(g: *MlxG, value: mlx.mlx_array, blocks: [3]*const PublicBlock, rows: usize, banked: bool, bank: usize, hidden_output: bool, slots: ?[]const u32) !void {
+    const bytes = try g.hostBytes(value);
+    defer g.a.free(bytes);
+    const dtype = g.dtypeOf(value);
+    const cols: usize = if (hidden_output) 2304 else 5120;
+    try testing.expectEqual(rows * cols * size(dtype), bytes.len);
+    var worst: f64 = 0;
+    for (0..rows) |r| {
+        var hidden: [128]f64 = undefined;
+        var out: [128]f64 = undefined;
+        const expected_bank = if (slots) |s| (if (s[r] == 1) @as(usize, 0) else 2) else if (banked) r % 3 else bank;
+        publicExpected(blocks, r, expected_bank, &hidden, &out);
+        const expected = if (hidden_output) &hidden else &out;
+        var square: f64 = 0;
+        for (expected) |v| square += v * v;
+        const rms = @sqrt(square / 128);
+        try testing.expect(rms > 1e-12);
+        for (0..cols) |c| {
+            const got = getFloat(bytes, r * cols + c, dtype);
+            try testing.expect(std.math.isFinite(got));
+            worst = @max(worst, @abs(got - expected[c % 128]) / rms);
+        }
+    }
+    // Public weights are rounded to f16; tiled stages additionally round to half.
+    // This is a full-projection error bar, not a bit-equality claim across arithmetic families.
+    if (worst > 1.0 / 64.0) std.debug.print("public EXL3 projection error/RMS {d}, rows {d}, banked {}, hidden {}\n", .{ worst, rows, banked, hidden_output });
+    try testing.expect(worst <= 1.0 / 64.0);
+}
+
+test "dsv41 kernels ops gpu: independent public H128 blocks cover full rate projections and prepared routes" {
+    const enabled = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    if (std.mem.eql(u8, std.mem.span(enabled), "0")) return error.SkipZigTest;
+    const a = testing.allocator;
+    var fixtures_arena = std.heap.ArenaAllocator.init(a);
+    defer fixtures_arena.deinit();
+    const fa = fixtures_arena.allocator();
+    const fixtures = [_]PublicBlock{ try loadPublicBlock(fa, 2), try loadPublicBlock(fa, 3), try loadPublicBlock(fa, 4) };
+    mlx.installErrorHandler();
+    var diag: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
+    defer reg.deinit();
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var bound = try reg.bind(stream, &diag);
+    defer bound.deinit();
+    var g: MlxG = .{ .a = a, .s = stream, .bound = &bound };
+    defer g.deinit();
+    var gemv = try xq.Gemv(MlxG).initRates(a, &g, &reg, .{}, 7);
+    defer gemv.deinit(&g);
+    var prep = try xq.RinPrep(MlxG).init(&g, &reg);
+    defer prep.deinit(&g);
+    var banked = try xq.Banked(MlxG).init(&g, &reg, .{}, &gemv);
+    defer banked.deinit(&g);
+    for ([_][3]usize{ .{ 0, 0, 0 }, .{ 1, 1, 1 }, .{ 2, 2, 2 }, .{ 1, 1, 2 }, .{ 0, 2, 1 }, .{ 2, 0, 2 } }) |rates| {
+        const mark = g.mark();
+        defer g.resetTo(mark);
+        const blocks: [3]*const PublicBlock = .{ &fixtures[rates[0]], &fixtures[rates[1]], &fixtures[rates[2]] };
+        var banks: [3]xq.BankArrays(mlx.mlx_array) = undefined;
+        for (&banks, 0..) |*bank, b| bank.* = .{
+            .gate = try publicProjection(&g, blocks[0], false, b, false),
+            .up = try publicProjection(&g, blocks[1], false, b, false),
+            .down = try publicProjection(&g, blocks[2], true, b, false),
+        };
+        for (1..49) |rows| {
+            const batch = g.mark();
+            defer g.resetTo(batch);
+            const act = try publicActs(&g, rows);
+            var tokens: [48]i32 = undefined;
+            var single_ids: [48]u32 = undefined;
+            var packed_ids: [48]u32 = undefined;
+            for (0..rows) |r| {
+                tokens[r] = @intCast(r);
+                single_ids[r] = 3;
+                packed_ids[r] = @intCast(((r % 3) << 24) | (r % 3 + 1));
+            }
+            const tok = try g.hostArray(std.mem.sliceAsBytes(tokens[0..rows]), &.{@intCast(rows)}, .int32);
+            const ids = try g.hostArray(std.mem.sliceAsBytes(single_ids[0..rows]), &.{@intCast(rows)}, .uint32);
+            const bank_ids = try g.hostArray(std.mem.sliceAsBytes(packed_ids[0..rows]), &.{@intCast(rows)}, .uint32);
+            const bank = banks[2];
+            const xs = try prep.inRin(&g, act, tok, bank.gate.rin, bank.up.rin, ids);
+            const zs = try gemv.projectGu(&g, xs[0], xs[1], ids, bank.gate.code, bank.up.code, bank.gate.layout, bank.up.layout);
+            const hidden = try prep.guEpi(&g, zs[0], zs[1], bank.gate.rout, bank.up.rout, ids);
+            try expectPublicRows(&g, hidden, blocks, rows, false, 2, true, null);
+            const hd = try prep.dinRin(&g, hidden, bank.down.rin, ids);
+            const zd = try gemv.project(&g, .down, hd, ids, bank.down.code, bank.down.layout);
+            const out = try prep.dpost(&g, zd, bank.down.rout, ids);
+            try expectPublicRows(&g, out, blocks, rows, false, 2, false, null);
+            const bh = try banked.gateUp(&g, act, tok, bank_ids, &banks);
+            try expectPublicRows(&g, bh, blocks, rows, true, 0, true, null);
+            const bo = try banked.down(&g, bh, bank_ids, &banks);
+            try expectPublicRows(&g, bo, blocks, rows, true, 0, false, null);
+        }
+        var prefill = try xq.DigXPrefill(MlxG).init(a, &reg, .{ .wave = 1, .inflight = 2, .row_budget = 128, .carry_rows = 128 }, &diag);
+        defer prefill.deinit(&g);
+        for ([_]usize{ 1, 127, 128, 129 }) |rows| {
+            const batch = g.mark();
+            defer g.resetTo(batch);
+            const act = try publicActs(&g, rows);
+            const slots: [129]u32 = @splat(3);
+            const out = try prefill.call(&g, act, .{ .slot = slots[0..rows] }, banks[2]);
+            defer g.release(out);
+            try prefill.finish(&g);
+            try expectPublicRows(&g, out, blocks, rows, false, 2, false, null);
+        }
+    }
+}
+
+fn getFloat(bytes: []const u8, i: usize, dtype: Dtype) f64 {
+    return switch (dtype) {
+        .float32 => @as(f32, @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little))),
+        .float16 => publicHalf(bytes, i),
+        .bfloat16 => @as(f32, @bitCast(@as(u32, std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little)) << 16)),
+        else => unreachable,
+    };
+}
+
+fn referenceH128(values: []f64) void {
+    var block: usize = 0;
+    while (block < values.len) : (block += 128) {
+        var out: [128]f64 = @splat(0);
+        for (&out, 0..) |*sum, r| {
+            for (values[block..][0..128], 0..) |v, c| {
+                sum.* += (if (@popCount(r & c) % 2 == 0) @as(f64, 1) else -1) * v;
+            }
+            sum.* *= 0.08838834764831845;
+        }
+        @memcpy(values[block..][0..128], &out);
+    }
+}
+
+// MSB-first circular bit reader and dense H128, independent of the engine's funnel
+// decoder/butterflies. This oracle is calibrated against library-produced public assets.
+fn referenceProjection(a: Allocator, code: []const u16, rate: usize, rin: []const f32, rout: []const f32, x: []const f32, rows: usize) ![]f64 {
+    const ni = rin.len / 16;
+    const nj = rout.len / 16;
+    const transformed = try a.alloc(f64, x.len);
+    defer a.free(transformed);
+    for (transformed, x, 0..) |*v, xv, i| v.* = @as(f64, xv) * rin[i % rin.len];
+    for (0..rows) |r| referenceH128(transformed[r * rin.len ..][0..rin.len]);
+    const output = try a.alloc(f64, rows * rout.len);
+    errdefer a.free(output);
+    @memset(output, 0);
+    for (0..ni) |ti| {
+        for (0..nj) |tj| {
+            const tile = code[(ti * nj + tj) * 16 * rate ..][0 .. 16 * rate];
+            for (0..256) |p| {
+                var state: u16 = 0;
+                for (0..16) |i| {
+                    const bit = ((p + 1) * rate + 256 * rate - 16 + i) % (256 * rate);
+                    const word = @as(u32, tile[2 * (bit / 32)]) | (@as(u32, tile[2 * (bit / 32) + 1]) << 16);
+                    state = (state << 1) | @as(u16, @intCast((word >> @intCast(31 - bit % 32)) & 1));
+                }
+                const mixed = @as(u32, state) *% 0x83DCD12D;
+                var byte_sum: u32 = 0;
+                inline for (0..4) |b| byte_sum += (mixed >> (8 * b)) & 255;
+                const inverse: f64 = @as(f16, @bitCast(@as(u16, 0x1eee)));
+                const bias: f64 = @as(f16, @bitCast(@as(u16, 0xc931)));
+                const weight: f64 = @as(f16, @floatCast((1024 + @as(f64, @floatFromInt(byte_sum))) * inverse + bias));
+                const lane = p / 8;
+                const local_row = (lane % 4) * 2 + p % 2 + ((p % 4) / 2) * 8;
+                const local_col = lane / 4 + (p % 8) / 4 * 8;
+                for (0..rows) |r| {
+                    output[r * rout.len + tj * 16 + local_col] += transformed[r * rin.len + ti * 16 + local_row] * weight;
+                }
+            }
+        }
+    }
+    for (0..rows) |r| {
+        const row = output[r * rout.len ..][0..rout.len];
+        referenceH128(row);
+        for (row, rout) |*v, scale| v.* *= scale;
+    }
+    return output;
+}
+
+test "exl3 sushi parity: independent scalar full projection oracle matches public assets" {
+    const a = testing.allocator;
+    inline for (.{ 2, 3, 4 }) |rate| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const fa = arena.allocator();
+        const block = loadPublicBlock(fa, rate) catch |err| switch (err) {
+            error.FileNotFound => {
+                // An explicit fixture path or GPU gate must never turn missing evidence into a skip.
+                if (std.c.getenv(std.fmt.comptimePrint("SUSHI_EXL3_K{d}_FIXTURE", .{rate})) != null or std.c.getenv("DSV41_KERNELS_GPU") != null) return err;
+                return error.SkipZigTest;
+            },
+            else => return err,
+        };
+        var x: [4 * 128]f32 = undefined;
+        for (&x, 0..) |*v, i| v.* = publicInput(i / 128, i % 128);
+        const reference = try referenceProjection(fa, block.code, rate, &block.rin, &block.rout, &x, 4);
+        for (0..4) |r| {
+            var square: f64 = 0;
+            var error_max: f64 = 0;
+            for (0..128) |j| {
+                var want: f64 = 0;
+                for (x[r * 128 ..][0..128], 0..) |v, i| want += v * block.weights[i * 128 + j];
+                square += want * want;
+                error_max = @max(error_max, @abs(reference[r * 128 + j] - want));
+            }
+            try testing.expect(square > 0);
+            try testing.expect(error_max <= @sqrt(square / 128) / 512);
+        }
+    }
+}
+
+test "dsv41 kernels ops gpu: captured Pollard K4 down full H128 scaled projection" {
+    const enabled = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    if (std.mem.eql(u8, std.mem.span(enabled), "0")) return error.SkipZigTest;
+    const fixture = std.c.getenv("DSV41_PUBLIC_DOWN_FIXTURE") orelse return error.PublicDownFixtureRequired;
+    const a = testing.allocator;
+    // bot-lab-21/DeepSeek-V4.1-Flash-EXL3-3.5bpw-Pollard, f129e31a81e1337aa33e129e2d847fc7e37c8733.
+    const bytes = try sdk.io_util.readAllNoCache(a, std.mem.span(fixture), 8 << 20);
+    defer a.free(bytes);
+    try testing.expect(hexEql("53fa4386b151bd4b7adc58299b45a9abfeb46fd537121d174c09688e3c11fc9e", bytes));
+    const n: usize = @intCast(std.mem.readInt(u64, bytes[0..8], .little));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes[8..][0..n], .{});
+    defer parsed.deinit();
+    const data = bytes[8 + n ..];
+    const prefix = "layers.0.ffn.experts.0.w2.";
+    const code_bytes = try publicTensor(parsed.value, data, prefix ++ "trellis", "I16", &.{ 144, 320, 64 });
+    const rin_bytes = try publicTensor(parsed.value, data, prefix ++ "suh", "F16", &.{2304});
+    const rout_bytes = try publicTensor(parsed.value, data, prefix ++ "svh", "F16", &.{5120});
+    const code = try a.alloc(u16, code_bytes.len / 2);
+    defer a.free(code);
+    for (code, 0..) |*v, i| v.* = std.mem.readInt(u16, code_bytes[i * 2 ..][0..2], .little);
+    var rin: [2304]f32 = undefined;
+    var rout: [5120]f32 = undefined;
+    for (&rin, 0..) |*v, i| v.* = publicHalf(rin_bytes, i);
+    for (&rout, 0..) |*v, i| v.* = publicHalf(rout_bytes, i);
+    var x: [3 * 2304]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = publicInput(i / 2304, i % 2304);
+    const want = try referenceProjection(a, code, 4, &rin, &rout, &x, 3);
+    defer a.free(want);
+    mlx.installErrorHandler();
+    var diag: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
+    defer reg.deinit();
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var bound = try reg.bind(stream, &diag);
+    defer bound.deinit();
+    var g: MlxG = .{ .a = a, .s = stream, .bound = &bound };
+    defer g.deinit();
+    const bank_code = try a.alloc(u16, 3 * code.len);
+    defer a.free(bank_code);
+    @memset(bank_code, 0xa55a);
+    @memcpy(bank_code[2 * code.len ..], code);
+    const bank_rin = try a.alloc(u8, 3 * rin_bytes.len);
+    defer a.free(bank_rin);
+    const bank_rout = try a.alloc(u8, 3 * rout_bytes.len);
+    defer a.free(bank_rout);
+    @memset(bank_rin, 0);
+    @memset(bank_rout, 0);
+    @memcpy(bank_rin[2 * rin_bytes.len ..], rin_bytes);
+    @memcpy(bank_rout[2 * rout_bytes.len ..], rout_bytes);
+    const projection: xq.ProjArrays(mlx.mlx_array) = .{
+        .code = try g.hostArray(std.mem.sliceAsBytes(bank_code), &.{ 3, 144, 320, 64 }, .int16),
+        .rin = try g.hostArray(bank_rin, &.{ 3, 2304 }, .float16),
+        .rout = try g.hostArray(bank_rout, &.{ 3, 5120 }, .float16),
+        .layout = .{ .k = 4, .code_row_words = code.len },
+    };
+    const input = try g.hostArray(std.mem.sliceAsBytes(&x), &.{ 3, 2304 }, .float32);
+    const ids = try g.hostArray(std.mem.sliceAsBytes(&[_]u32{ 2, 2, 2 }), &.{3}, .uint32);
+    var gemv = try xq.Gemv(MlxG).initRates(a, &g, &reg, .{}, 4);
+    defer gemv.deinit(&g);
+    var prep = try xq.RinPrep(MlxG).init(&g, &reg);
+    defer prep.deinit(&g);
+    const transformed = try prep.dinRin(&g, input, projection.rin, ids);
+    const inner = try gemv.project(&g, .down, transformed, ids, projection.code, projection.layout);
+    const output = try prep.dpost(&g, inner, projection.rout, ids);
+    const got = try g.hostBytes(output);
+    defer a.free(got);
+    try testing.expectEqual(want.len * 4, got.len);
+    for (0..3) |r| {
+        var square: f64 = 0;
+        var error_max: f64 = 0;
+        for (want[r * 5120 ..][0..5120], 0..) |v, c| {
+            const actual = getFloat(got, r * 5120 + c, .float32);
+            try testing.expect(std.math.isFinite(actual));
+            square += v * v;
+            error_max = @max(error_max, @abs(actual - v));
+        }
+        try testing.expect(square > 0);
+        try testing.expect(error_max <= @sqrt(square / 5120) / 512);
+    }
+}
+
+fn publicAccepted(g: *MlxG, reg: *const xk.Registry, rates: [3]u32, diag: *xk.Diag) !*xq.Accepted(MlxG) {
+    const a = g.a;
+    var gemv = try xq.Gemv(MlxG).initRates(a, g, reg, .{}, 7);
+    errdefer gemv.deinit(g);
+    var prep = try xq.RinPrep(MlxG).init(g, reg);
+    errdefer prep.deinit(g);
+    var tok: [48]mlx.mlx_array = @splat(.{});
+    var n_tok: usize = 0;
+    errdefer for (tok[0..n_tok]) |x| g.release(x);
+    var indices: [48]i32 = undefined;
+    for (&indices, 0..) |*index, i| index.* = @intCast(i);
+    for (1..49) |rows| {
+        tok[rows - 1] = g.keep(try g.hostArray(std.mem.sliceAsBytes(indices[0..rows]), &.{@intCast(rows)}, .int32));
+        n_tok = rows;
+    }
+    const waves = try a.alloc(xq.DigXPrefill(MlxG), 1);
+    errdefer a.free(waves);
+    waves[0] = try xq.DigXPrefill(MlxG).init(a, reg, .{ .wave = 2, .inflight = 2, .row_budget = 256, .carry_rows = 512 }, diag);
+    errdefer waves[0].deinit(g);
+    const layer_rates = try a.alloc([3]u32, 1);
+    errdefer a.free(layer_rates);
+    layer_rates[0] = rates;
+    const acc = try a.create(xq.Accepted(MlxG));
+    acc.* = .{ .a = a, .reg = reg, .layer_rates = layer_rates, .gemv = gemv, .prep = prep, .tok = tok, .n_tok = n_tok, .waves = waves };
+    return acc;
+}
+
+test "dsv41 kernels ops gpu: accepted routed forms and carried BF16 mixed expert waves match public weights" {
+    const enabled = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    if (std.mem.eql(u8, std.mem.span(enabled), "0")) return error.SkipZigTest;
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const fa = arena.allocator();
+    const fixtures = [_]PublicBlock{ try loadPublicBlock(fa, 2), try loadPublicBlock(fa, 3), try loadPublicBlock(fa, 4) };
+    mlx.installErrorHandler();
+    var diag: xk.Diag = .{};
+    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
+    defer reg.deinit();
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var bound = try reg.bind(stream, &diag);
+    defer bound.deinit();
+    var g: MlxG = .{ .a = a, .s = stream, .bound = &bound };
+    defer g.deinit();
+    const forms_cases = [_]xq.Forms{
+        .{ .gu_one = true },
+        .{ .down_pair = true },
+        .{ .gu_one = true, .down_pair = true },
+    };
+    for ([_][3]u32{ .{ 3, 3, 3 }, .{ 3, 3, 4 }, .{ 2, 4, 3 }, .{ 4, 2, 4 } }) |rates| {
+        const bank_mark = g.mark();
+        defer g.resetTo(bank_mark);
+        const blocks: [3]*const PublicBlock = .{ &fixtures[rates[0] - 2], &fixtures[rates[1] - 2], &fixtures[rates[2] - 2] };
+        var banks: [3]xq.BankArrays(mlx.mlx_array) = undefined;
+        for (&banks, 0..) |*bank, b| bank.* = .{
+            .gate = try publicProjection(&g, blocks[0], false, b, b == 2),
+            .up = try publicProjection(&g, blocks[1], false, b, b == 2),
+            .down = try publicProjection(&g, blocks[2], true, b, b == 2),
+        };
+        for (forms_cases) |forms| {
+            const route_mark = g.mark();
+            defer g.resetTo(route_mark);
+            const acc = try publicAccepted(&g, &reg, rates, &diag);
+            defer acc.deinit(&g);
+            try acc.routeForms(&g, forms);
+            try acc.routeBanked(&g);
+            for (banks) |bank| try acc.checkLayerBank(&g, 0, bank, &diag);
+            for ([_]usize{ 1, 3, 7, 48 }) |rows| {
+                const batch = g.mark();
+                defer g.resetTo(batch);
+                const act = try publicActs(&g, rows);
+                var ids_host: [48]u32 = undefined;
+                for ([_]usize{ 0, 2 }) |b| {
+                    @memset(ids_host[0..rows], @intCast(b + 1));
+                    const ids = try g.hostArray(std.mem.sliceAsBytes(ids_host[0..rows]), &.{@intCast(rows)}, .uint32);
+                    const hidden = try acc.gateUp(&g, act, ids, banks[b].gate, banks[b].up);
+                    try expectPublicRows(&g, hidden, blocks, rows, false, b, true, null);
+                    const out = try acc.down(&g, hidden, ids, banks[b].down);
+                    try expectPublicRows(&g, out, blocks, rows, false, b, false, null);
+                }
+                for (0..rows) |r| ids_host[r] = @intCast(((r % 3) << 24) | (r % 3 + 1));
+                const ids = try g.hostArray(std.mem.sliceAsBytes(ids_host[0..rows]), &.{@intCast(rows)}, .uint32);
+                const hidden = try acc.gateUpBanked(&g, act, ids, &banks);
+                try expectPublicRows(&g, hidden, blocks, rows, true, 0, true, null);
+                const out = try acc.downBanked(&g, hidden, ids, &banks);
+                try expectPublicRows(&g, out, blocks, rows, true, 0, false, null);
+                if (std.mem.eql(u32, &rates, &.{ 3, 3, 3 })) {
+                    // All-tight aliases engage the banked form texts, not the stride-aware fallback.
+                    const tight_banks = [_]xq.BankArrays(mlx.mlx_array){ banks[0], banks[0], banks[0] };
+                    for (0..rows) |r| ids_host[r] = @intCast(((r % 3) << 24) | 1);
+                    const tight_ids = try g.hostArray(std.mem.sliceAsBytes(ids_host[0..rows]), &.{@intCast(rows)}, .uint32);
+                    const th = try acc.gateUpBanked(&g, act, tight_ids, &tight_banks);
+                    try expectPublicRows(&g, th, blocks, rows, false, 0, true, null);
+                    const to = try acc.downBanked(&g, th, tight_ids, &tight_banks);
+                    try expectPublicRows(&g, to, blocks, rows, false, 0, false, null);
+                }
+            }
+            try acc.routeExpertBf16();
+            var slot_rows: [3][257]u32 = undefined;
+            const counts = [_][2]usize{ .{ 127, 128 }, .{ 128, 129 }, .{ 1, 129 } };
+            var outputs: [3]mlx.mlx_array = @splat(.{});
+            var output_count: usize = 0;
+            defer for (outputs[0..output_count]) |out| g.release(out);
+            for (counts, 0..) |count, call| {
+                var remaining = count;
+                const rows = count[0] + count[1];
+                for (0..rows) |r| {
+                    var expert = (r + call) % 2;
+                    if (remaining[expert] == 0) expert = 1 - expert;
+                    remaining[expert] -= 1;
+                    slot_rows[call][r] = if (expert == 0) 1 else 3;
+                }
+                const act = try publicActs(&g, rows);
+                outputs[call] = try acc.prefill(&g, 0, act, .{ .slot = slot_rows[call][0..rows] }, banks[2]);
+                output_count += 1;
+                try testing.expect(acc.waves[0].flight.items.len > 0);
+            }
+            try acc.finishPrefill(&g);
+            try testing.expectEqual(@as(usize, 0), acc.waves[0].flight.items.len);
+            for (outputs, counts, 0..) |out, count, call| {
+                const rows = count[0] + count[1];
+                try testing.expectEqual(Dtype.bfloat16, g.dtypeOf(out));
+                try expectPublicRows(&g, out, blocks, rows, false, 0, false, slot_rows[call][0..rows]);
+            }
+        }
+    }
 }

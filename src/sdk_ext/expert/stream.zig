@@ -23,13 +23,66 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         pub const Plan = expert_policy.Plan;
         pub const max_route_ids = expert_policy.max_route_ids;
 
+        /// Allocation-only geometry: component capacities need not belong to any source record.
+        pub const RowGeometry = struct { segments: @FieldType(Layer, "segments") };
+
+        pub const StorageGeometry = struct {
+            transient: RowGeometry,
+            persistent_row_bytes: u64,
+            transient_row_bytes: u64,
+            max_source_record_bytes: u64,
+
+            pub fn init(layers: []const Layer) !StorageGeometry {
+                if (layers.len == 0) return error.InvalidRows;
+                var out: StorageGeometry = .{
+                    .transient = .{ .segments = layers[0].segments },
+                    .persistent_row_bytes = 0,
+                    .transient_row_bytes = 0,
+                    .max_source_record_bytes = 0,
+                };
+                for (layers) |*l| {
+                    out.persistent_row_bytes += rowBytes(l);
+                    out.max_source_record_bytes = @max(out.max_source_record_bytes, l.logical_bytes);
+                    for (l.segments, &out.transient.segments) |s, *cap| {
+                        if (s.dtype != cap.dtype or s.rank != cap.rank) return error.MixedGeometry;
+                        if (s.length > cap.length) cap.* = s;
+                    }
+                }
+                out.transient_row_bytes = rowBytes(&out.transient);
+                return out;
+            }
+
+            pub fn rowBytes(geometry: anytype) u64 {
+                comptime std.debug.assert(@typeInfo(@TypeOf(geometry)) == .pointer);
+                var bytes: u64 = 0;
+                for (geometry.segments) |s| bytes += s.length;
+                return bytes;
+            }
+
+            pub fn prereadStaging(bank: *const B.Bank, page: u64) !u64 {
+                var bytes: u64 = 0;
+                for (bank.layers, 0..) |*l, li| {
+                    var gu: u64 = 0;
+                    for (l.segments[0..gu_components]) |s| gu += s.length;
+                    if (l.segments[0].offset != 0 or l.segments[gu_components].offset != gu) return error.MixedGeometry;
+                    for (0..bank.n_experts) |e| {
+                        const spans = bank.spans(@intCast(li), @intCast(e));
+                        bytes = @max(bytes, expert_io.spanBytes(spans.gu_offset, gu, page));
+                        bytes = @max(bytes, expert_io.spanBytes(spans.down_offset, l.logical_bytes - gu, page));
+                    }
+                }
+                return bytes;
+            }
+        };
+
         pub const HostSlotRows = struct {
             rows: u32,
             row_bytes: [n_components]u64,
             banks: [n_components][]u8,
 
             /// Rows sized for `layer`'s segments; one page-aligned bank per component.
-            pub fn init(layer: *const Layer, rows: u32) !HostSlotRows {
+            pub fn init(layer: anytype, rows: u32) !HostSlotRows {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 var s: HostSlotRows = .{ .rows = rows, .row_bytes = undefined, .banks = undefined };
                 var n: usize = 0;
                 errdefer for (s.banks[0..n]) |b| std.heap.page_allocator.free(b);
@@ -49,13 +102,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             pub fn row(self: *const HostSlotRows, c: Component, r: u32) []u8 {
-                const n = self.row_bytes[@intFromEnum(c)];
-                return self.banks[@intFromEnum(c)][r * n ..][0..n];
+                const n = self.row_bytes[@backingInt(c)];
+                return self.banks[@backingInt(c)][r * n ..][0..n];
             }
 
             pub fn rowDest(self: *const HostSlotRows, r: u32) [n_components]u64 {
                 var d: [n_components]u64 = undefined;
-                for (&d, 0..) |*a, c| a.* = @intFromPtr(self.row(@enumFromInt(c), r).ptr);
+                for (&d, 0..) |*a, c| a.* = @intFromPtr(self.row(@fromBackingInt(@intCast(c)), r).ptr);
                 return d;
             }
         };
@@ -71,7 +124,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// evaluated on `stream` in one eval. The data pointers are taken here; the
             /// arrays stay held (never donated or recycled) until `deinit`, after the pool
             /// stops. MLX allocates through Metal even on the CPU stream: callers hold the GPU lock.
-            pub fn init(layer: *const Layer, rows: u32, stream: mlx.mlx_stream) !LayerSlotBank {
+            pub fn init(layer: anytype, rows: u32, stream: mlx.mlx_stream) !LayerSlotBank {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 var b = try initLazy(layer, rows, stream);
                 errdefer b.deinit();
                 try evalArrays(&b.arrays);
@@ -81,7 +135,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// `init`'s zero arrays, not yet evaluated: a grow builds every layer's, evaluates them all in one eval
             /// (`Stream.grow`: one GPU round trip, not nine per layer), then `bind`s each.
-            fn initLazy(layer: *const Layer, rows: u32, stream: mlx.mlx_stream) !LayerSlotBank {
+            fn initLazy(layer: anytype, rows: u32, stream: mlx.mlx_stream) !LayerSlotBank {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 var b: LayerSlotBank = .{ .arrays = @splat(.{}), .base = @splat(0), .row_bytes = undefined, .rows = rows };
                 errdefer b.deinit();
                 for (layer.segments, 0..) |seg, c| {
@@ -97,7 +152,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             /// `init`'s arrays without the zero fill: MLX-owned buffers (`dsv41_alloc_uninit`), evaluated as built, bound at once.
-            fn initUnfilled(layer: *const Layer, rows: u32) !LayerSlotBank {
+            fn initUnfilled(layer: anytype, rows: u32) !LayerSlotBank {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 var b: LayerSlotBank = .{ .arrays = @splat(.{}), .base = @splat(0), .row_bytes = undefined, .rows = rows };
                 errdefer b.deinit();
                 for (layer.segments, 0..) |seg, c| {
@@ -129,8 +185,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             pub fn row(self: *const LayerSlotBank, c: Component, r: u32) []u8 {
-                const n = self.row_bytes[@intFromEnum(c)];
-                const p: [*]u8 = @ptrFromInt(self.base[@intFromEnum(c)] + r * n);
+                const n = self.row_bytes[@backingInt(c)];
+                const p: [*]u8 = @ptrFromInt(self.base[@backingInt(c)] + r * n);
                 return p[0..n];
             }
 
@@ -182,7 +238,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             row_bytes: [n_components]u64 = @splat(0),
             backing: union(enum) { none, host: HostSlotRows, mlx: LayerSlotBank } = .none,
 
-            fn init(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
+            fn init(layer: anytype, rows: u32, memory: SlotMemory) !Rows {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 if (rows == 0) return .{};
                 switch (memory) {
                     .host => {
@@ -200,7 +257,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// `init` for a grow: an MLX bank's arrays built without their eval (`bind` after one eval of every layer's,
             /// `evalRows`); host rows are complete at once.
-            fn initLazy(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
+            fn initLazy(layer: anytype, rows: u32, memory: SlotMemory) !Rows {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 if (rows == 0) return .{};
                 switch (memory) {
                     .host => return init(layer, rows, memory),
@@ -213,7 +271,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// `init` without the fill: an MLX bank's buffers taken from the allocator as they are (`LayerSlotBank.initUnfilled`);
             /// host rows as `init`'s.
-            fn initUnfilled(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
+            fn initUnfilled(layer: anytype, rows: u32, memory: SlotMemory) !Rows {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 if (rows == 0) return .{};
                 switch (memory) {
                     .host => return init(layer, rows, memory),
@@ -246,8 +305,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             pub fn row(self: *const Rows, c: Component, r: u32) []u8 {
-                const n = self.row_bytes[@intFromEnum(c)];
-                const p: [*]u8 = @ptrFromInt(self.base[@intFromEnum(c)] + r * n);
+                const n = self.row_bytes[@backingInt(c)];
+                const p: [*]u8 = @ptrFromInt(self.base[@backingInt(c)] + r * n);
                 return p[0..n];
             }
 
@@ -422,8 +481,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             layers: []LayerSlots,
             transient: Rows,
             transient_meta: []SlotMeta,
-            /// The widest layer: the transient rows' geometry (decode's window 0 is allocated in it at the grow).
-            transient_layer: u32,
+            geometry: StorageGeometry,
             /// `releaseTransient` ran: the scratch is freed until the grow allocates window 0.
             transient_released: bool = false,
             /// The release route, installed at construction (`Options.transient_release`).
@@ -515,14 +573,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (opt.wide_depth < 1 or opt.wide_depth > max_wide_depth or opt.transient_rows < @as(u32, opt.wide_depth) * opt.max_route_ids) return error.InvalidOptions;
                 if (opt.max_route_ids == 0 or opt.max_route_ids > max_route_ids or opt.transient_rows < opt.max_route_ids or
                     opt.records_per_part == 0 or opt.records_per_part > expert_io.max_items) return error.InvalidOptions;
-                // One transient row must hold any layer's record.
-                var widest: usize = 0;
-                for (bank.layers, 0..) |l, i| if (l.logical_bytes > bank.layers[widest].logical_bytes) {
-                    widest = i;
-                };
-                for (bank.layers) |l| for (l.segments, bank.layers[widest].segments) |s, w| {
-                    if (s.length > w.length) return error.MixedGeometry;
-                };
+                const geometry = try StorageGeometry.init(bank.layers);
                 if (opt.event != null and opt.lookahead == null) return error.InvalidOptions;
                 if (opt.event) |ev| if (ev.watchdog_ms < 50 or ev.watchdog_ms > 60_000) return error.InvalidOptions;
                 var pool_opt = opt.pool;
@@ -530,16 +581,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (la.chunks == 0 or la.chunks > 8 or !std.math.isPowerOfTwo(la.chunks) or la.idle_busy > 1 or
                         la.budget == 0 or la.budget > expert_lookahead.max_budget) return error.InvalidOptions;
                     const page = std.heap.pageSize();
-                    const record = bank.layers[widest].logical_bytes;
+                    const record = geometry.max_source_record_bytes;
                     pool_opt.spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
-                    // A pre-read range is the record's gate/up span or its down span,
-                    // back to back, each no larger than a staging buffer.
-                    if (la.preread) for (bank.layers) |l| {
-                        var gu: u64 = 0;
-                        for (l.segments[0..gu_components]) |sg| gu += sg.length;
-                        if (l.segments[0].offset != 0 or l.segments[gu_components].offset != gu) return error.MixedGeometry;
-                        if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
-                    };
+                    if (la.preread) pool_opt.staging_bytes = @max(pool_opt.staging_bytes, try StorageGeometry.prereadStaging(bank, page));
                 }
                 var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
                 if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
@@ -574,7 +618,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     ls.* = .{ .policy = policy, .base = base, .meta = meta, .lens = lens };
                     n_init += 1;
                 }
-                var transient = try Rows.init(&bank.layers[widest], opt.transient_rows, opt.slot_memory);
+                var transient = try Rows.init(&geometry.transient, opt.transient_rows, opt.slot_memory);
                 errdefer transient.deinit();
                 const transient_meta = try a.alloc(SlotMeta, opt.transient_rows);
                 errdefer a.free(transient_meta);
@@ -587,7 +631,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer a.free(ahead_parts);
                 const pool = try expert_io.Pool.start(a, pool_opt);
                 errdefer pool.stop();
-                if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[widest].lens);
+                if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[0].lens);
                 if (opt.event) |ev| {
                     const object: u64 = switch (ev.backend) {
                         .host => @intFromPtr(word.?),
@@ -602,7 +646,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .layers = layers,
                     .transient = transient,
                     .transient_meta = transient_meta,
-                    .transient_layer = @intCast(widest),
+                    .geometry = geometry,
                     .release_installed = opt.transient_release,
                     .grow_fill = opt.grow_fill,
                     .prompt_transient_rows = opt.transient_rows,
@@ -1135,7 +1179,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (experts, ahead_sums[0..experts.len]) |e, *sum| {
                     const slot = ls.policy.slotOf(e).?;
                     sum.* = self.recordDigest(layer, slot);
-                    for (ls.lens, 0..) |len, c| @memset(self.slotRow(layer, slot, @enumFromInt(c))[0..len], 0);
+                    for (ls.lens, 0..) |len, c| @memset(self.slotRow(layer, slot, @fromBackingInt(@intCast(c)))[0..len], 0);
                     self.locate(layer, slot).meta.state = .empty;
                     ls.policy.invalidate(e);
                 }
@@ -1167,7 +1211,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// sha256 of the record a layer's slot holds (its component rows at their logical lengths).
             fn recordDigest(self: *Stream, layer: u32, slot: u32) [32]u8 {
                 var h = std.crypto.hash.sha2.Sha256.init(.{});
-                for (self.layers[layer].lens, 0..) |len, c| h.update(self.slotRow(layer, slot, @enumFromInt(c))[0..len]);
+                for (self.layers[layer].lens, 0..) |len, c| h.update(self.slotRow(layer, slot, @fromBackingInt(@intCast(c)))[0..len]);
                 var d: [32]u8 = undefined;
                 h.final(&d);
                 return d;
@@ -1262,7 +1306,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     a.free(meta0);
                 };
                 if (self.transient_released) {
-                    const geom0 = &self.bank.layers[self.transient_layer];
+                    const geom0 = &self.geometry.transient;
                     const n0 = self.max_route_ids + decode_staging_rows;
                     window0 = switch (self.grow_fill) {
                         .zeros => try Rows.init(geom0, n0, self.memory),
@@ -1369,9 +1413,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// The prompt scratch's bytes (`regrowTransient` allocates them).
             pub fn promptTransientBytes(self: *const Stream) u64 {
-                var n: u64 = 0;
-                for (self.bank.layers[self.transient_layer].segments) |seg| n += seg.length;
-                return n * self.prompt_transient_rows;
+                return self.geometry.transient_row_bytes * self.prompt_transient_rows;
             }
 
             /// The reverse phase change's allocation, after its frees landed: the prompt's scratch (`Options.transient_rows`
@@ -1381,7 +1423,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.phase != .prefill) return error.AlreadyGrown;
                 if (self.failed) return error.StreamFailed;
                 if (!self.transient_released) return error.TransientNotReleased;
-                var t = try Rows.init(&self.bank.layers[self.transient_layer], self.prompt_transient_rows, self.memory);
+                var t = try Rows.init(&self.geometry.transient, self.prompt_transient_rows, self.memory);
                 errdefer t.deinit();
                 const meta = try self.allocator.alloc(SlotMeta, t.rows);
                 @memset(meta, .{});
@@ -1408,10 +1450,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 s.read_wall_ns = @intCast(@max(self.pool.readGauge()[4], 0));
                 const p = self.pool;
                 const pairs = .{
-                    .{ "claimed", .claimed },           .{ "spec_bytes", .spec_bytes },   .{ "spec_issued", .submitted },
-                    .{ "spec_landed", .landed },        .{ "adopt_ranges", .adopt_ranges }, .{ "adopt_bytes", .adopt_bytes },
-                    .{ "pre_issued", .pre_issued },     .{ "pre_served", .pre_served },   .{ "pre_expired", .pre_expired },
-                    .{ "gates", .ev_gates },            .{ "gates_forced", .ev_wd_forced },
+                    .{ "claimed", .claimed },       .{ "spec_bytes", .spec_bytes },     .{ "spec_issued", .submitted },
+                    .{ "spec_landed", .landed },    .{ "adopt_ranges", .adopt_ranges }, .{ "adopt_bytes", .adopt_bytes },
+                    .{ "pre_issued", .pre_issued }, .{ "pre_served", .pre_served },     .{ "pre_expired", .pre_expired },
+                    .{ "gates", .ev_gates },        .{ "gates_forced", .ev_wd_forced },
                 };
                 inline for (pairs) |pr| @field(s, pr[0]) = @intCast(@max(p.counter(pr[1]), 0));
                 return s;
@@ -1422,7 +1464,5 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return self.locate(layer, slot).meta.pins;
             }
         };
-
-
     };
 }

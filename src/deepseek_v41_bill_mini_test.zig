@@ -179,7 +179,7 @@ test "dsv41 memory mini: the fill and its admission agree; one more row in eithe
     with_records.decode_extra_records = k;
     const bk = try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, with_records);
     try testing.expect(bk.decodeTotal() <= target);
-    try testing.expectEqual(b.slot_decode + k * (b.slot_decode / (5 * @as(u64, nr.decode) + b.transient_decode_rows)), bk.slot_decode);
+    try testing.expectEqual(b.slot_decode + b.slot_prefix[k], bk.slot_decode);
 }
 
 test "dsv41 memory mini: each route the bill reads moves its own term by geometry" {
@@ -289,4 +289,66 @@ test "dsv41 memory mini: the served bill keeps multi-turn's prompt boundary in t
     try testing.expectEqual(exact.prompt_state, pinned.prompt_state);
     try testing.expectEqual(@as(u64, 0), pinned.turn_boundary);
     try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());
+}
+
+test "dsv41 integer rates: mixed bill owns exact persistent transient and prefix costs" {
+    const Case = struct { synth: expert_bank.Synth, prefix: [6]u64 };
+    for ([_]Case{
+        .{ .synth = .{ .k = &.{ 2, 4, 3, 2, 4 }, .n_experts = n_experts }, .prefix = .{ 0, 2112, 5760, 8640, 10752, 14400 } },
+        .{ .synth = .{ .projection_k = &.{ .{ 4, 2, 2 }, .{ 2, 4, 4 }, .{ 3, 3, 3 }, .{ 4, 2, 2 }, .{ 2, 4, 4 } }, .n_experts = n_experts }, .prefix = .{ 0, 2624, 5760, 8640, 11264, 14400 } },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const tm = try miniBank(a);
+        defer tm.destroy();
+        _ = try expert_bank.writeSynth(a, &tm.tmp, case.synth);
+        var mixed = ov;
+        mixed.bank_geometry.?.k = &.{ 2, 3, 4 };
+        var config = configOf(tm);
+        config.expert_prefill_rows = 16;
+        config.expert_rows = 20;
+        const b = try billAfterScratch(&config, mixed);
+        try testing.expectEqual(@as(u64, 16 * 14400) + b.transient_rows * 3648, b.slot_prefill);
+        try testing.expectEqual(@as(u64, 20 * 14400) + b.transient_decode_rows * 3648, b.slot_decode);
+        const mb = try bill.memoryBill(testing.allocator, b);
+        defer mb.free(testing.allocator);
+        try testing.expectEqual(@as(u64, 14400), mb.per_row);
+        const fb = bill.fillBillOf(b);
+        try testing.expectEqual(@as(u64, 14400), fb.per_row);
+        try testing.expectEqualSlices(u64, &case.prefix, fb.slot_prefix[0..6]);
+        var bd: expert_bank.Diag = .{};
+        var bank = try expert_bank.Bank.open(a, io, tm.root, mixed.bank_geometry.?, &bd);
+        defer bank.deinit();
+        const st = try @import("expert_stream.zig").Stream.init(testing.allocator, &bank, .{
+            .rows = &.{ 16, 16, 16, 16, 16 },
+            .transient_rows = @intCast(b.transient_rows),
+            .wide_depth = @intCast(config.dsv41WideDepth()),
+            .transient_release = module.transientRelease(mixed),
+            .pool = .{ .workers = 2, .staging_bytes = 16384 },
+        });
+        defer st.deinit();
+        var allocated: u64 = 0;
+        for (st.layers) |*l| for (l.base.row_bytes) |bytes| {
+            allocated += bytes * l.base.rows;
+        };
+        for (st.transient.row_bytes) |bytes| allocated += bytes * st.transient.rows;
+        try testing.expectEqual(b.slot_prefill, allocated);
+        for (1..5) |extra| {
+            mixed.decode_extra_records = @intCast(extra);
+            const bx = try billAfterScratch(&config, mixed);
+            try testing.expectEqual(b.slot_decode + case.prefix[extra], bx.slot_decode);
+            try testing.expectEqual(fb.totalSlots(true, 20 * 14400 + case.prefix[extra]), bx.decodeTotal());
+            try testing.expectEqual(@as(u32, @intCast(extra)), bill.fillExtraRecords(b, bx.decodeTotal()));
+            const mx = try bill.memoryBill(testing.allocator, bx);
+            defer mx.free(testing.allocator);
+            try testing.expectEqual(bx.processBound(), mx.processBound(.{ .prompt = 16, .decode = 20 }));
+        }
+    }
+}
+
+fn billAfterScratch(config: *const settings.Config, routes: module.RouteOverrides) !bill.Bill {
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    return bill.billAt(scratch.allocator(), io, config, prompt, max_tokens, null, ceiling, routes);
 }

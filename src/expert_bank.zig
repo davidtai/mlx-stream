@@ -23,7 +23,7 @@ pub const Component = enum(u8) {
     down_rin,
 
     pub fn name(c: Component) []const u8 {
-        return names[@intFromEnum(c)];
+        return names[@backingInt(c)];
     }
 
     const names = [_][]const u8{
@@ -47,7 +47,8 @@ pub const Segment = struct {
 };
 
 pub const Layer = struct {
-    k: u32,
+    /// Logical source rates in gate/up/down order; never allocation capacities.
+    projection_k: [3]u32,
     record_bytes: u64,
     logical_bytes: u64,
     base_offset: u64,
@@ -64,8 +65,8 @@ pub const Implemented = struct {
     n_layers: u64,
 };
 
-/// DeepSeek-V4.1 on the EXL3 3.0 bpw bank: K = 3 on every layer, mul1.
-pub const dsv41: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 5120, .inter = 2304, .n_experts = 384, .n_layers = 40 };
+/// DeepSeek-V4.1 MUL1 banks with independent K2/K3/K4 projection rates.
+pub const dsv41: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3, 4 }, .hidden = 5120, .inter = 2304, .n_experts = 384, .n_layers = 40 };
 
 /// Why a bank was refused, for the one log line the caller writes.
 pub const Diag = @import("sdk").Diag;
@@ -112,11 +113,16 @@ const max_records = 1 << 20;
 /// map hidden -> inter, down inter -> hidden; records pad to `record_alignment`.
 /// A manifest whose layer table differs from this is refused.
 pub fn layerSegments(k: u32, hidden: u64, inter: u64) ?Layer {
-    if (k == 0 or k > 8 or hidden == 0 or inter == 0) return null;
-    if (hidden % 16 != 0 or inter % 16 != 0 or hidden > 1 << 24 or inter > 1 << 24) return null;
-    var l: Layer = .{ .k = k, .record_bytes = 0, .logical_bytes = 0, .base_offset = 0, .segments = undefined };
+    return projectionSegments(@splat(k), hidden, inter);
+}
+
+pub fn projectionSegments(ks: [3]u32, hidden: u64, inter: u64) ?Layer {
+    for (ks) |k| if (k == 0 or k > 8) return null;
+    if (hidden == 0 or inter == 0 or hidden % 16 != 0 or inter % 16 != 0 or hidden > 1 << 24 or inter > 1 << 24) return null;
+    var l: Layer = .{ .projection_k = ks, .record_bytes = 0, .logical_bytes = 0, .base_offset = 0, .segments = undefined };
     var off: u64 = 0;
     for (0..3) |p| {
+        const k = ks[p];
         const in: u64 = if (p == 2) inter else hidden;
         const out: u64 = if (p == 2) hidden else inter;
         const parts = [3]Segment{
@@ -275,19 +281,18 @@ pub const Bank = struct {
 
         const table = v2.layers orelse return refuse(diag, error.ManifestSyntax, "v2: no layer table", .{});
         if (table.len != d.n_layers) return refuse(diag, error.LayerGeometry, "v2: {d} layer entries != dims.n_layers {d}", .{ table.len, d.n_layers });
-        const ks = try a.alloc(u32, table.len);
-        defer a.free(ks);
-        for (table, ks, 0..) |t, *k, li| {
-            if (t.layer != li) return refuse(diag, error.LayerGeometry, "v2: layer entry {d} names layer {d}", .{ li, t.layer });
-            if (t.K > std.math.maxInt(u32) or !containsInt(implemented.k, @intCast(t.K))) return refuse(diag, error.KNotImplemented, "v2: layer {d} K={d} not implemented by the installed lanes", .{ li, t.K });
-            k.* = @intCast(t.K);
-        }
         self.layers = try a.alloc(Layer, table.len);
-        const total = layerTable(ks, d.hidden, d.inter, d.n_experts, self.layers) orelse return refuse(diag, error.DimsInvalid, "v2: bank size overflows", .{});
-        for (table, self.layers, 0..) |t, *want, li| {
-            if (!segmentsMatch(t.segments, want, 0) or t.record_bytes != want.record_bytes or t.logical_bytes != want.logical_bytes)
-                return refuse(diag, error.LayerGeometry, "v2: layer {d} segment table / record size differs from the v2 geometry for K={d}", .{ li, t.K });
-            if (t.base_offset != want.base_offset) return refuse(diag, error.LayerGeometry, "v2: layer {d} base_offset {d} != {d}", .{ li, t.base_offset, want.base_offset });
+        var total: u64 = 0;
+        for (table, self.layers, 0..) |*t, *want, li| {
+            if (t.layer != li) return refuse(diag, error.LayerGeometry, "v2: layer entry {d} names layer {d}", .{ li, t.layer });
+            const rates = try t.rates(diag);
+            for (rates, 0..) |k, p| if (!containsInt(implemented.k, k))
+                return refuse(diag, error.KNotImplemented, "v2: layer {d} projection {d} K={d} not implemented by the installed lanes", .{ li, p, k });
+            want.* = projectionSegments(rates, d.hidden, d.inter) orelse return refuse(diag, error.DimsInvalid, "v2: invalid projection dimensions", .{});
+            want.base_offset = total;
+            try t.check(want, diag);
+            const bytes = std.math.mul(u64, d.n_experts, want.record_bytes) catch return refuse(diag, error.DimsInvalid, "v2: layer size overflows", .{});
+            total = std.math.add(u64, total, bytes) catch return refuse(diag, error.DimsInvalid, "v2: bank size overflows", .{});
         }
         const sc = v2.sidecar orelse return refuse(diag, error.ManifestSyntax, "v2: no sidecar", .{});
         if (sc.size != total) return refuse(diag, error.SidecarGeometry, "v2: sidecar.size {d} != {d}", .{ sc.size, total });
@@ -425,7 +430,7 @@ fn plainName(s: []const u8) bool {
 fn segmentsMatch(segs: anytype, l: *const Layer, base: u64) bool {
     if (segs.len != n_components) return false;
     for (segs, l.segments, 0..) |m, want, c| {
-        if (!std.mem.eql(u8, m.component, Component.name(@enumFromInt(c)))) return false;
+        if (!std.mem.eql(u8, m.component, Component.name(@fromBackingInt(@intCast(c))))) return false;
         if (!std.mem.eql(u8, m.dtype, @tagName(want.dtype))) return false;
         if (m.offset != base + want.offset or m.length != want.length) return false;
         if (!std.mem.eql(u64, m.shape, want.shape[0..want.rank])) return false;
@@ -454,6 +459,43 @@ const Sha256Hex = struct {
 const SegJson = struct { component: []const u8, dtype: []const u8, shape: []const u64, offset: u64, length: u64 };
 const V1SegJson = struct { component: []const u8, dtype: []const u8, shape: []const u64, offset: u64, length: u64, shard: []const u8 };
 const SidecarJson = struct { file: []const u8, alignment: u64, size: u64 };
+
+/// An omitted declaration is distinct from an explicit JSON null, which is invalid.
+fn RateField(comptime T: type) type {
+    return struct {
+        value: ?T = null,
+
+        pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            return .{ .value = try std.json.innerParse(T, a, source, options) };
+        }
+    };
+}
+
+const LayerJson = struct {
+    layer: u64,
+    K: RateField(u32) = .{},
+    projection_K: RateField([3]u32) = .{},
+    record_bytes: u64,
+    logical_bytes: u64,
+    base_offset: u64,
+    segments: []const SegJson,
+
+    fn rates(l: *const LayerJson, diag: ?*Diag) Refusal![3]u32 {
+        if ((l.K.value == null) == (l.projection_K.value == null))
+            return refuse(diag, error.LayerGeometry, "v2: layer {d} requires exactly one K or projection_K", .{l.layer});
+        const ks: [3]u32 = if (l.projection_K.value) |p| p else @splat(l.K.value.?);
+        for (ks, 0..) |k, p| if (k < 2 or k > 4)
+            return refuse(diag, error.KNotImplemented, "v2: layer {d} projection {d} K={d} is outside the integer-rate contract", .{ l.layer, p, k });
+        return ks;
+    }
+
+    fn check(l: *const LayerJson, want: *const Layer, diag: ?*Diag) Refusal!void {
+        if (!segmentsMatch(l.segments, want, 0) or l.record_bytes != want.record_bytes or l.logical_bytes != want.logical_bytes)
+            return refuse(diag, error.LayerGeometry, "v2: layer {d} segment table / record size differs from its declared projection rates", .{l.layer});
+        if (l.base_offset != want.base_offset)
+            return refuse(diag, error.LayerGeometry, "v2: layer {d} base_offset {d} != {d}", .{ l.layer, l.base_offset, want.base_offset });
+    }
+};
 
 const V1RecordJson = struct {
     layer: u64,
@@ -485,7 +527,7 @@ const V2 = struct {
     quant: ?struct { codebook: []const u8, codebook_multiplier: u64 } = null,
     dims: ?struct { hidden: u64, inter: u64, n_experts: u64, n_layers: u64 } = null,
     sidecar: ?SidecarJson = null,
-    layers: ?[]const struct { layer: u64, K: u64, record_bytes: u64, logical_bytes: u64, base_offset: u64, segments: []const SegJson } = null,
+    layers: ?[]const LayerJson = null,
     records: std.ArrayList(Rec) = .empty,
     all_pass: ?bool = null,
     meta: std.heap.ArenaAllocator,
@@ -647,10 +689,9 @@ const ManifestSource = struct {
 
 const quant = @import("sdk_ext.zig").quant;
 
-/// The bank's description (`quant.BankPeek`) from its v2 manifest, for the load path's quant
-/// `claims`: the `quantization` object whole (each quant reads its own fields), the dims, and
-/// every layer's K and segment table. Read on its own, before the quant the bank's arch binds is
-/// accepted and before `Bank.open`; the records are skipped.
+/// The bank's description from its v2 manifest, for load-time quant claims.
+/// Exactly one K or projection_K declares each layer's logical rates; all source segments are checked against it.
+/// The source code shapes carry the validated projection rates through GroupPeek.
 pub const Peek = struct {
     arena: std.heap.ArenaAllocator,
     view: quant.BankPeek,
@@ -662,14 +703,21 @@ pub const Peek = struct {
     fn adopt(p: *Peek, j: PeekJson, diag: ?*Diag) !void {
         const aa = p.arena.allocator();
         if (!std.mem.eql(u8, j.format, format_v2)) return refuse(diag, error.ManifestFormat, "v2 peek: format \"{s}\" is not {s}", .{ j.format, format_v2 });
-        if (j.layers.len > max_layers) return refuse(diag, error.LayerGeometry, "v2 peek: {d} layers", .{j.layers.len});
+        if (j.layers.len == 0 or j.layers.len > max_layers or j.layers.len != j.dims.n_layers or j.dims.n_experts == 0 or j.dims.n_experts > max_experts)
+            return refuse(diag, error.LayerGeometry, "v2 peek: invalid layer/expert counts", .{});
         const layers = try aa.alloc(quant.LayerPeek, j.layers.len);
-        for (j.layers, layers, 0..) |l, *o, li| {
+        var base: u64 = 0;
+        for (j.layers, layers, 0..) |*l, *o, li| {
             if (l.layer != li) return refuse(diag, error.LayerGeometry, "v2 peek: layer entry {d} names layer {d}", .{ li, l.layer });
-            if (l.K > std.math.maxInt(u32)) return refuse(diag, error.KNotImplemented, "v2 peek: layer {d} K={d}", .{ li, l.K });
+            const rates = try l.rates(diag);
+            var geometry = projectionSegments(rates, j.dims.hidden, j.dims.inter) orelse return refuse(diag, error.DimsInvalid, "v2 peek: invalid projection dimensions", .{});
+            geometry.base_offset = base;
+            try l.check(&geometry, diag);
+            const bytes = std.math.mul(u64, j.dims.n_experts, geometry.record_bytes) catch return refuse(diag, error.DimsInvalid, "v2 peek: layer size overflows", .{});
+            base = std.math.add(u64, base, bytes) catch return refuse(diag, error.DimsInvalid, "v2 peek: bank size overflows", .{});
             const segs = try aa.alloc(quant.Segment, l.segments.len);
             for (l.segments, segs) |s, *d| d.* = .{ .name = s.component, .dtype = s.dtype, .shape = s.shape };
-            o.* = .{ .bits = @intCast(l.K), .segments = segs };
+            o.* = .{ .bits = if (rates[0] == rates[1] and rates[1] == rates[2]) rates[0] else 0, .segments = segs };
         }
         p.view = .{ .quantization = j.quantization, .hidden = j.dims.hidden, .inter = j.dims.inter, .n_experts = j.dims.n_experts, .n_layers = j.dims.n_layers, .layers = layers };
     }
@@ -679,7 +727,7 @@ const PeekJson = struct {
     format: []const u8,
     quantization: std.json.Value,
     dims: struct { hidden: u64, inter: u64, n_experts: u64, n_layers: u64 },
-    layers: []const struct { layer: u64, K: u64, segments: []const SegJson },
+    layers: []const LayerJson,
 };
 
 /// `Peek` of a v2 manifest's text.
@@ -754,16 +802,16 @@ test "dsv41 bank: geometry matches bankv2" {
     try testing.expectEqual(@as(u64, 13_315_584), k3.logical_bytes);
     try testing.expectEqual(@as(u64, 13_316_096), k3.record_bytes);
     try expectSegments(k3, &.{
-        .{ 0, 4423680, 320, 144, 48 },      .{ 4423680, 4608, 2304, 0, 0 },  .{ 4428288, 10240, 5120, 0, 0 },
-        .{ 4438528, 4423680, 320, 144, 48 }, .{ 8862208, 4608, 2304, 0, 0 },  .{ 8866816, 10240, 5120, 0, 0 },
+        .{ 0, 4423680, 320, 144, 48 },       .{ 4423680, 4608, 2304, 0, 0 },   .{ 4428288, 10240, 5120, 0, 0 },
+        .{ 4438528, 4423680, 320, 144, 48 }, .{ 8862208, 4608, 2304, 0, 0 },   .{ 8866816, 10240, 5120, 0, 0 },
         .{ 8877056, 4423680, 144, 320, 48 }, .{ 13300736, 10240, 5120, 0, 0 }, .{ 13310976, 4608, 2304, 0, 0 },
     });
     const k2 = layerSegments(2, 5120, 2304).?;
     try testing.expectEqual(@as(u64, 8_891_904), k2.logical_bytes);
     try testing.expectEqual(@as(u64, 8_892_416), k2.record_bytes);
     try expectSegments(k2, &.{
-        .{ 0, 2949120, 320, 144, 32 },      .{ 2949120, 4608, 2304, 0, 0 }, .{ 2953728, 10240, 5120, 0, 0 },
-        .{ 2963968, 2949120, 320, 144, 32 }, .{ 5913088, 4608, 2304, 0, 0 }, .{ 5917696, 10240, 5120, 0, 0 },
+        .{ 0, 2949120, 320, 144, 32 },       .{ 2949120, 4608, 2304, 0, 0 },  .{ 2953728, 10240, 5120, 0, 0 },
+        .{ 2963968, 2949120, 320, 144, 32 }, .{ 5913088, 4608, 2304, 0, 0 },  .{ 5917696, 10240, 5120, 0, 0 },
         .{ 5927936, 2949120, 144, 320, 32 }, .{ 8877056, 10240, 5120, 0, 0 }, .{ 8887296, 4608, 2304, 0, 0 },
     });
     var table: [40]Layer = undefined;
@@ -800,6 +848,9 @@ pub const Synth = struct {
     n_experts: u32 = 4,
     /// K per layer (at most `max_synth_layers` layers).
     k: []const u32 = &.{ 3, 3 },
+    projection_k: ?[]const [3]u32 = null,
+    /// Test-only malformed declaration, including its JSON key(s).
+    rate_json: ?[]const u8 = null,
     v2_format: []const u8 = "mtplx-expert-manifest-v2",
     codebook: []const u8 = "mul1",
     multiplier: u64 = 0x83DCD12D,
@@ -833,7 +884,7 @@ pub const Synth = struct {
 
 const SynthSeg = struct { name: []const u8, dtype: []const u8, shape: [3]u64, rank: usize, offset: u64, length: u64 };
 
-fn synthSegments(k: u64, hidden: u64, inter: u64, out: *[9]SynthSeg) u64 {
+fn synthSegments(ks: [3]u32, hidden: u64, inter: u64, out: *[9]SynthSeg) u64 {
     const names = [_][]const u8{
         "gate_proj.code", "gate_proj.rout", "gate_proj.rin",
         "up_proj.code",   "up_proj.rout",   "up_proj.rin",
@@ -841,6 +892,7 @@ fn synthSegments(k: u64, hidden: u64, inter: u64, out: *[9]SynthSeg) u64 {
     };
     var off: u64 = 0;
     for (0..3) |p| {
+        const k: u64 = ks[p];
         const i: u64 = if (p == 2) inter else hidden;
         const o: u64 = if (p == 2) hidden else inter;
         const segs = [3]SynthSeg{
@@ -865,12 +917,12 @@ fn printShape(j: *std.ArrayList(u8), a: std.mem.Allocator, sg: SynthSeg) !void {
 
 const max_synth_layers = 8;
 
-/// Writes a bank of `s.k.len` layers (manifests + experts.bin) into `tmp`;
-/// returns the experts.bin image (caller frees).
+/// Writes synthetic manifests and their sidecar from an independent projection geometry.
+/// Returns the experts.bin image (caller frees).
 pub fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u8 {
     const io = std.testing.io;
     const Sha256 = std.crypto.hash.sha2.Sha256;
-    const nl = s.k.len;
+    const nl = if (s.projection_k) |rates| rates.len else s.k.len;
     std.debug.assert(nl >= 2 and nl <= max_synth_layers);
     var segs: [max_synth_layers][9]SynthSeg = undefined;
     var logical: [max_synth_layers]u64 = undefined;
@@ -878,7 +930,7 @@ pub fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u
     var base: [max_synth_layers]u64 = undefined;
     var total: u64 = 0;
     for (0..nl) |l| {
-        logical[l] = synthSegments(s.k[l], s.hidden, s.inter, &segs[l]);
+        logical[l] = synthSegments(if (s.projection_k) |rates| rates[l] else @splat(s.k[l]), s.hidden, s.inter, &segs[l]);
         rb[l] = (logical[l] + 4095) / 4096 * 4096;
         base[l] = total;
         total += s.n_experts * rb[l];
@@ -909,7 +961,15 @@ pub fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u
     for (0..nl) |l| {
         if (s.drop_layer_entry and l == 1) continue;
         const index = l + (if (l == 1) s.layer_index_delta else 0);
-        try j.print(a, "{s}{{\"layer\":{d},\"K\":{d},\"record_bytes\":{d},\"logical_bytes\":{d},\"base_offset\":{d},\"segments\":[", .{ if (l == 0) "" else ",", index, s.k[l], rb[l], logical[l], base[l] + (if (l == 1) s.base_delta else 0) });
+        try j.print(a, "{s}{{\"layer\":{d},", .{ if (l == 0) "" else ",", index });
+        if (s.rate_json) |raw| {
+            if (raw.len > 0) try j.print(a, "{s},", .{raw});
+        } else if (s.projection_k) |rates| {
+            try j.print(a, "\"projection_K\":[{d},{d},{d}],", .{ rates[l][0], rates[l][1], rates[l][2] });
+        } else {
+            try j.print(a, "\"K\":{d},", .{s.k[l]});
+        }
+        try j.print(a, "\"record_bytes\":{d},\"logical_bytes\":{d},\"base_offset\":{d},\"segments\":[", .{ rb[l], logical[l], base[l] + (if (l == 1) s.base_delta else 0) });
         for (segs[l], 0..) |sg, n| {
             const len = sg.length + (if (l == 1 and n == 5) s.seg_len_delta else 0);
             try j.print(a, "{s}{{\"component\":\"{s}\",\"dtype\":\"{s}\",\"shape\":", .{ if (n == 0) "" else ",", sg.name, sg.dtype });
@@ -1046,7 +1106,7 @@ test "dsv41 bank: a K=2 layer opens only when K=2 is implemented" {
     k23.k = &.{ 2, 3 };
     var bank = try Bank.open(testing.allocator, std.testing.io, root, k23, null);
     defer bank.deinit();
-    try testing.expectEqual(@as(u32, 2), bank.layers[1].k);
+    try testing.expectEqual([3]u32{ 2, 2, 2 }, bank.layers[1].projection_k);
     try testing.expectEqual(@as(u64, 2112), bank.layers[1].logical_bytes);
     try testing.expectEqual(Spans{ .gu_offset = 4 * 4096, .down_offset = 4 * 4096 + 1408 }, bank.spans(1, 0));
 }
@@ -1127,7 +1187,7 @@ test "dsv41 bank: the real 3.0 bank opens" {
     try testing.expectEqual(@as(usize, 40 * 384), bank.digests.len);
     try testing.expectEqual(bank.sidecar_size, bank.sidecar.size);
     try testing.expectEqual(@as(u64, 204_535_234_560), bank.sidecar_size);
-    for (bank.layers) |l| try testing.expectEqual(@as(u32, 3), l.k);
+    for (bank.layers) |l| try testing.expectEqual([3]u32{ 3, 3, 3 }, l.projection_k);
     const s = bank.spans(13, 17);
     try testing.expectEqual(@as(u64, 66_700_324_864), s.gu_offset);
     try testing.expectEqual(@as(u64, 66_700_324_864 + 8_877_056), s.down_offset);
@@ -1144,4 +1204,99 @@ test "dsv41 bank: the real 3.0 bank opens" {
         try testing.expectEqual(r.down[0], got.down_offset);
         try testing.expectEqual(r.down[0] - r.gu[0], r.gu[1]);
     };
+}
+
+test "dsv41 projection rates: crossed projection declarations open and peek their exact source geometry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image = try writeSynth(testing.allocator, &tmp, .{ .projection_k = &.{ .{ 4, 2, 2 }, .{ 2, 4, 4 } } });
+    defer testing.allocator.free(image);
+    var root: [512]u8 = undefined;
+    const dir = try tmpRoot(&tmp, &root);
+    var impl = implemented_synth;
+    impl.k = &.{ 2, 3, 4 };
+    try expectOwnedRefusal(error.KNotImplemented, Bank.open(testing.allocator, testing.io, dir, implemented_synth, null));
+    var bank = try Bank.open(testing.allocator, testing.io, dir, impl, null);
+    defer bank.deinit();
+    try testing.expectEqual(@as(u64, 2624), bank.layers[0].logical_bytes);
+    try testing.expectEqual(@as(u64, 3136), bank.layers[1].logical_bytes);
+    try testing.expectEqual(@as(u64, 28672), bank.recordOffset(1, 3));
+    const stream = @import("expert_stream.zig");
+    const geometry = try stream.StorageGeometry.init(bank.layers);
+    try testing.expectEqual(@as(u64, 5760), geometry.persistent_row_bytes);
+    try testing.expectEqual(@as(u64, 3648), geometry.transient_row_bytes);
+    try testing.expectEqual(@as(u64, 3136), geometry.max_source_record_bytes);
+    var rows = try stream.HostSlotRows.init(&geometry.transient, 2);
+    defer rows.deinit();
+    try testing.expectEqual([9]u64{ 1024, 64, 128, 1024, 64, 128, 1024, 128, 64 }, rows.row_bytes);
+    var p = try peek(testing.allocator, testing.io, dir, null);
+    defer p.deinit();
+    for (p.view.layers, [_][3]u64{ .{ 64, 32, 32 }, .{ 32, 64, 64 } }) |l, widths| {
+        try testing.expectEqual(@as(u32, 0), l.bits);
+        for (widths, 0..) |w, proj| try testing.expectEqual(w, l.segments[proj * 3].shape[2]);
+    }
+    const text = try tmp.dir.readFileAlloc(testing.io, "expert-manifest-v2.json", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(text);
+    var pt = try peekText(testing.allocator, text, null);
+    defer pt.deinit();
+    try testing.expectEqual(@as(u64, 32), pt.view.layers[0].segments[6].shape[2]);
+}
+
+test "dsv41 projection rates: malformed declarations and source segment disagreements fail closed in open and both peeks" {
+    const Case = struct { declaration: []const u8, err: anyerror };
+    for ([_]Case{
+        .{ .declaration = "\"K\":3,\"projection_K\":[3,3,3]", .err = error.LayerGeometry },
+        .{ .declaration = "", .err = error.LayerGeometry },
+        .{ .declaration = "\"K\":null", .err = error.ManifestSyntax },
+        .{ .declaration = "\"K\":null,\"projection_K\":[3,3,3]", .err = error.ManifestSyntax },
+        .{ .declaration = "\"projection_K\":null", .err = error.ManifestSyntax },
+        .{ .declaration = "\"K\":3,\"projection_K\":null", .err = error.ManifestSyntax },
+        .{ .declaration = "\"projection_K\":[3,3.5,4]", .err = error.ManifestSyntax },
+        .{ .declaration = "\"projection_K\":[3,3]", .err = error.ManifestSyntax },
+        .{ .declaration = "\"projection_K\":[3,3,3,3]", .err = error.ManifestSyntax },
+        .{ .declaration = "\"projection_K\":[3,0,3]", .err = error.KNotImplemented },
+        .{ .declaration = "\"projection_K\":[3,5,3]", .err = error.KNotImplemented },
+        .{ .declaration = "\"projection_K\":[3,4,3]", .err = error.LayerGeometry },
+    }) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const image = try writeSynth(testing.allocator, &tmp, .{ .rate_json = case.declaration });
+        defer testing.allocator.free(image);
+        var root: [512]u8 = undefined;
+        const dir = try tmpRoot(&tmp, &root);
+        var impl = implemented_synth;
+        impl.k = &.{ 2, 3, 4 };
+        try expectOwnedRefusal(case.err, Bank.open(testing.allocator, testing.io, dir, impl, null));
+        try expectOwnedRefusal(case.err, peek(testing.allocator, testing.io, dir, null));
+        const text = try tmp.dir.readFileAlloc(testing.io, "expert-manifest-v2.json", testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(text);
+        try expectOwnedRefusal(case.err, peekText(testing.allocator, text, null));
+    }
+}
+
+fn expectOwnedRefusal(want: anyerror, result: anytype) !void {
+    if (result) |value| {
+        var owned = value;
+        owned.deinit();
+        return testing.expectError(want, @as(anyerror!void, {}));
+    } else |err| {
+        try testing.expectEqual(want, err);
+    }
+}
+
+test "dsv41 projection rates: mixed banks retain runtime manifest agreement and SHA requirements" {
+    for ([_]bool{ false, true }) |bad_sha| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const image = try writeSynth(testing.allocator, &tmp, .{
+            .projection_k = &.{ .{ 3, 3, 4 }, .{ 2, 4, 3 } },
+            .v1_gap = !bad_sha,
+            .v1_sha_short = bad_sha,
+        });
+        defer testing.allocator.free(image);
+        var root: [512]u8 = undefined;
+        var impl = implemented_synth;
+        impl.k = &.{ 2, 3, 4 };
+        try expectOwnedRefusal(if (bad_sha) error.RecordSha256 else error.RuntimeRecordMismatch, Bank.open(testing.allocator, testing.io, try tmpRoot(&tmp, &root), impl, null));
+    }
 }

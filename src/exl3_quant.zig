@@ -1,13 +1,11 @@
 //! The EXL3 routed-expert quant, C2's first client (`quant`): the streamed EXL3 bank's pinned
-//! Metal texts. The texts decode the mul1 codebook at K = 3 and are compiled for hidden 5120 /
-//! inter 2304.
+//! Metal texts. Direct MUL1 integer-rate kernels are compiled for hidden 5120 / inter 2304;
+//! tight K3 banks retain their optimized dispatch.
 //!   - Decode (at most 48 routed rows) runs the tier of record's PREP=rin chain: in_rin, the two
 //!     GEMVs, gu_epi (the clamped SwiGLU, fused), din_rin, the down GEMV, dpost. Every launch
 //!     comes from a per-M table of prepared launches.
 //!   - Prefill runs the DIG-X waves (DIG2 onepass, SHAPE's schedule), one wave state per layer.
-//! Its kernels (`kernels`, 18 of the set) are self-checked by `accept` on the kernel set the load
-//! context owns. The routes below the C2 section are the lanes' own launches, moved here verbatim
-//! from exl3_kernel_ops.zig.
+//! Its kernel subset is self-checked by `accept` on the load context's kernel set.
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -39,7 +37,7 @@ const no_vars = kr.no_vars;
 
 // ── C2: the quant ──
 
-pub const name = "exl3-mul1-k3";
+pub const name = "exl3-mul1";
 
 /// G5: the kernel set this quant self-checks at accept is pinned by the registry's manifest.
 pub const kernel_pin: sdk_ext.kernels.Pin = .{ .manifest_sha256 = xk.manifest_sha256 };
@@ -81,7 +79,7 @@ pub const kernels = [_]Kernel{
     .dsv41_exl3_b3_moeprep_dpost,
     .dsv41_exl3_b3_pair_k3_5120,
     .dsv41_exl3_b3_guone_k3_2304,
-};
+} ++ xk.rate_kernels;
 
 /// The routed decode forms (`DSV41_CELL_ROUTED_FORMS`): each independently selectable, chosen at construction.
 pub const Forms = struct { down_pair: bool = false, gu_one: bool = false };
@@ -148,6 +146,28 @@ fn segmentOk(s: quant.Segment, k: u32) ?[]const u8 {
     return "an unknown projection";
 }
 
+const component_names = [_][]const u8{
+    "gate_proj.code", "gate_proj.rout", "gate_proj.rin",
+    "up_proj.code",   "up_proj.rout",   "up_proj.rin",
+    "down_proj.code", "down_proj.rout", "down_proj.rin",
+};
+
+fn sourceRates(segments: []const quant.Segment) ?[3]u32 {
+    var rates: [3]u32 = @splat(0);
+    for (segments) |s| {
+        inline for (.{ 0, 1, 2 }) |p| {
+            if (std.mem.eql(u8, s.name, component_names[p * 3])) {
+                if (rates[p] != 0 or s.shape.len != 3 or s.shape[2] % 16 != 0 or s.shape[2] < 32 or s.shape[2] > 64) return null;
+                const k: u32 = @intCast(s.shape[2] / 16);
+                if (segmentOk(s, k) != null) return null;
+                rates[p] = k;
+            }
+        }
+    }
+    for (rates) |k| if (k == 0) return null;
+    return rates;
+}
+
 /// At load, once per weight group: `.native` for a bank these texts decode in full (the
 /// format's every field, every layer's K, the compiled dims, every layer's nine tensors), else
 /// null with the first mismatch in `why`.
@@ -169,9 +189,21 @@ pub fn claims(peek: *const quant.BankPeek, why: ?*Diag) ?quant.Priority {
         return quant.decline(why, "exl3 quant: dims hidden {d} / inter {d} (the texts are compiled for {d} / {d})", .{ peek.hidden, peek.inter, compiled_hidden, compiled_inter });
     if (peek.n_layers == 0 or peek.layers.len != peek.n_layers) return quant.decline(why, "exl3 quant: {d} layer entries for dims.n_layers {d}", .{ peek.layers.len, peek.n_layers });
     for (peek.layers, 0..) |l, li| {
-        if (std.mem.indexOfScalar(u32, &xk.bank_ks, l.bits) == null) return quant.decline(why, "exl3 quant: layer {d} K {d} (the texts decode K {any})", .{ li, l.bits, xk.bank_ks });
+        const rates = sourceRates(l.segments) orelse return quant.decline(why, "exl3 quant: layer {d} has invalid logical code geometry", .{li});
+        for (rates, 0..) |k, p| {
+            if (std.mem.indexOfScalar(u32, &xk.bank_ks, k) == null) return quant.decline(why, "exl3 quant: layer {d} projection {d} K {d} (the texts decode K {any})", .{ li, p, k, xk.bank_ks });
+        }
         if (l.segments.len != 9) return quant.decline(why, "exl3 quant: layer {d} has {d} tensors (9)", .{ li, l.segments.len });
-        for (l.segments) |s| if (segmentOk(s, l.bits)) |bad| return quant.decline(why, "exl3 quant: layer {d} segment {s}: {s} ({s} {any})", .{ li, s.name, bad, s.dtype, s.shape });
+        var seen: u9 = 0;
+        for (l.segments) |s| {
+            const index = for (component_names, 0..) |n, i| {
+                if (std.mem.eql(u8, s.name, n)) break i;
+            } else return quant.decline(why, "exl3 quant: layer {d} segment {s}: {s}", .{ li, s.name, segmentOk(s, rates[0]).? });
+            const bit = @as(u9, 1) << @as(u4, @intCast(index));
+            if (seen & bit != 0) return quant.decline(why, "exl3 quant: layer {d} duplicates segment {s}", .{ li, s.name });
+            seen |= bit;
+            if (segmentOk(s, rates[index / 3])) |bad| return quant.decline(why, "exl3 quant: layer {d} segment {s}: {s} ({s} {any})", .{ li, s.name, bad, s.dtype, s.shape });
+        }
     }
     return .native;
 }
@@ -200,6 +232,7 @@ pub fn Accepted(comptime G: type) type {
         pub const max_decode_rows: u32 = decode_table_rows;
         a: Allocator,
         reg: *const xk.Registry,
+        layer_rates: [][3]u32 = &.{},
         /// this subset's self-check results (its receipt: `report.writeJsonLines(a)`)
         report: selfcheck.Report = .{},
         gemv: Gemv(G),
@@ -226,13 +259,21 @@ pub fn Accepted(comptime G: type) type {
             try checkProjArrays(G, g, self.reg, .down, bank.down, diag);
         }
 
+        pub fn checkLayerBank(self: *const Self, g: *G, layer: u32, bank: quant.BankArrays(A), diag: *Diag) !void {
+            if (layer >= self.layer_rates.len) return refuse(diag, error.RouteInput, "exl3 quant: layer {d} outside accepted rates", .{layer});
+            inline for (.{ bank.gate, bank.up, bank.down }, 0..) |p, i| {
+                if (p.layout.k != self.layer_rates[layer][i]) return refuse(diag, error.RouteInput, "exl3 quant: layer {d} projection {d} bound K {d}, accepted K {d}", .{ layer, i, p.layout.k, self.layer_rates[layer][i] });
+            }
+            try self.checkBank(g, bank, diag);
+        }
+
         /// x [rows, 5120] bf16 (the routed rows, taken), slot_ids u32 [rows], rows 1..48 ->
         /// the clamped SwiGLU [rows, 2304] f32: in_rin -> the gate and up GEMVs -> gu_epi.
         pub fn gateUp(self: *const Self, g: *G, x: G.T, slot_ids: G.T, gate: A, up: A) !G.T {
             const rows = rowsOf(G, g, x, 0);
             std.debug.assert(!(rows < 1 or rows > max_decode_rows));
             const xs = try self.prep.inRin(g, x, self.tok[rows - 1], gate.rin, up.rin, slot_ids);
-            const z = try self.gemv.projectGu(g, xs[0], xs[1], slot_ids, gate.code, up.code);
+            const z = try self.gemv.projectGu(g, xs[0], xs[1], slot_ids, gate.code, up.code, gate.layout, up.layout);
             return self.prep.guEpi(g, z[0], z[1], gate.rout, up.rout, slot_ids);
         }
 
@@ -240,7 +281,7 @@ pub fn Accepted(comptime G: type) type {
         /// the down GEMV -> dpost.
         pub fn down(self: *const Self, g: *G, h: G.T, slot_ids: G.T, d: A) !G.T {
             const hd = try self.prep.dinRin(g, h, d.rin, slot_ids);
-            const zd = try self.gemv.project(g, .down, hd, slot_ids, d.code);
+            const zd = try self.gemv.project(g, .down, hd, slot_ids, d.code, d.layout);
             return self.prep.dpost(g, zd, d.rout, slot_ids);
         }
 
@@ -306,7 +347,7 @@ pub fn Accepted(comptime G: type) type {
         pub fn routeForms(self: *Self, g: *G, forms: Forms) !void {
             // The banked route aliases the installed GEMVs' statics: the forms come first.
             if (self.banked != null) return error.FormsAfterBanked;
-            var next = try Gemv(G).initForms(g, self.reg, forms);
+            var next = try Gemv(G).initRates(self.a, g, self.reg, forms, self.gemv.rate_mask);
             errdefer next.deinit(g);
             self.gemv.deinit(g);
             self.gemv = next;
@@ -328,6 +369,7 @@ pub fn Accepted(comptime G: type) type {
             if (self.banked) |*b| b.deinit(g);
             for (self.waves) |*w| w.deinit(g);
             self.a.free(self.waves);
+            self.a.free(self.layer_rates);
             for (self.tok[0..self.n_tok]) |x| g.release(x);
             self.prep.deinit(g);
             self.gemv.deinit(g);
@@ -356,13 +398,14 @@ pub const form_texts = [_]Kernel{ .dsv41_exl3_pair_k3_5120, .dsv41_exl3_guone_k3
 /// The banked route's texts: installed at construction by `Accepted.routeBanked` (their twins are registry checks, run
 /// in a check window and by kbench v6d / v9b); the stock accept neither routes nor checks them.
 pub const banked_texts = [_]Kernel{
-    .dsv41_exl3_b3_mul1h_k3_2304,     .dsv41_exl3_b3_mul1h_k3_5120,  .dsv41_exl3_b3_prep_in_rin,  .dsv41_exl3_b3_prep_gu_epi,
-    .dsv41_exl3_b3_prep_din_rin,      .dsv41_exl3_b3_moeprep_dpost,  .dsv41_exl3_b3_pair_k3_5120, .dsv41_exl3_b3_guone_k3_2304,
+    .dsv41_exl3_b3_mul1h_k3_2304, .dsv41_exl3_b3_mul1h_k3_5120, .dsv41_exl3_b3_prep_in_rin,  .dsv41_exl3_b3_prep_gu_epi,
+    .dsv41_exl3_b3_prep_din_rin,  .dsv41_exl3_b3_moeprep_dpost, .dsv41_exl3_b3_pair_k3_5120, .dsv41_exl3_b3_guone_k3_2304,
 };
 pub const checked_at_accept = blk: {
-    var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len - banked_texts.len]Kernel = undefined;
+    @setEvalBranchQuota(4000);
+    var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len - banked_texts.len - xk.rate_kernels.len]Kernel = undefined;
     var n: usize = 0;
-    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts ++ form_texts ++ banked_texts), k) == null) {
+    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts ++ form_texts ++ banked_texts ++ xk.rate_kernels), k) == null) {
         out[n] = k;
         n += 1;
     };
@@ -373,14 +416,26 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
     const ref = ctx.kernels orelse return quant.refuse(diag, error.NoKernelSet, "exl3 quant: accepted without the load context's kernel set", .{});
     const set = ks.Set.of(ref) orelse return quant.refuse(diag, error.NoKernelSet, "exl3 quant: accepted with a kernel set over another registry (manifest {s})", .{ref.manifest_sha256});
     try checkSpec(spec, diag);
+    const peek = ctx.peek orelse return quant.refuse(diag, error.NoWeightDescription, "exl3 quant: accepted without the group's description", .{});
+    if (claims(peek, diag) == null) return error.NotClaimed;
+    if (peek.n_layers != spec.n_layers) return quant.refuse(diag, error.DimsNotImplemented, "exl3 quant: {d} source layers, {d} requested", .{ peek.n_layers, spec.n_layers });
+    const rates = try a.alloc([3]u32, peek.layers.len);
+    errdefer a.free(rates);
+    for (rates, peek.layers) |*rate, layer| rate.* = sourceRates(layer.segments).?;
     const acc = try a.create(Accepted(G));
-    acc.* = .{ .a = a, .reg = &set.reg, .gemv = undefined, .prep = undefined, .tok = undefined };
+    acc.* = .{ .a = a, .reg = &set.reg, .layer_rates = rates, .gemv = undefined, .prep = undefined, .tok = undefined };
     errdefer {
         acc.report.deinit(a);
         a.destroy(acc);
     }
     try set.selfCheck(a, &checked_at_accept, .compile, &acc.report, diag);
-    acc.gemv = try Gemv(G).init(g, &set.reg);
+    const mask = rateMask(rates);
+    for (xk.rate_kernels) |k| {
+        const pair = xk.ratesOf(k);
+        const needed = (@as(u3, 1) << @as(u2, @intCast(pair[0] - 2))) | (@as(u3, 1) << @as(u2, @intCast(pair[1] - 2)));
+        if (mask & needed == needed) try set.selfCheck(a, &.{k}, .compile, &acc.report, diag);
+    }
+    acc.gemv = try Gemv(G).initRates(a, g, &set.reg, .{}, mask);
     errdefer acc.gemv.deinit(g);
     acc.prep = try RinPrep(G).init(g, &set.reg);
     errdefer acc.prep.deinit(g);
@@ -411,10 +466,31 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
 
 pub const Proj = enum { gate, up, down };
 
-/// One projection's slot-bank arrays, as the streamer's `ProjArrays`: code i16 [rows, in/16,
-/// out/16, 48], rout f16 [rows, out], rin f16 [rows, in] (row = slot).
+pub const ProjectionLayout = struct {
+    k: u32,
+    /// Physical expert stride in int16 elements; logical tiles form a contiguous prefix.
+    code_row_words: u64,
+
+    pub fn tight(self: ProjectionLayout) bool {
+        return self.code_row_words == @as(u64, compiled_hidden / 16) * (compiled_inter / 16) * (16 * self.k);
+    }
+};
+
+pub fn tightLayout(k: u32) ProjectionLayout {
+    return .{ .k = k, .code_row_words = @as(u64, compiled_hidden / 16) * (compiled_inter / 16) * (16 * k) };
+}
+
+fn rateMask(rates: []const [3]u32) u3 {
+    var mask: u3 = 0;
+    for (rates) |layer| for (layer) |k| {
+        mask |= @as(u3, 1) << @as(u2, @intCast(k - 2));
+    };
+    return if (mask == 2) 0 else mask;
+}
+
+/// One projection's slot bank; the logical rate is independent of its physical capacity.
 pub fn ProjArrays(comptime T: type) type {
-    return struct { code: T, rout: T, rin: T };
+    return struct { code: T, rout: T, rin: T, layout: ProjectionLayout };
 }
 
 /// A layer bank's projection arrays are what the kernels read (bind time, once per bank).
@@ -424,18 +500,38 @@ pub fn checkBank(comptime G: type, g: *G, reg: *const xk.Registry, proj: Proj, a
     const bound = reg.get(.dsv41_exl3_mul1h_k3_2304).bounds.get(.cap).?;
     if (cap < bound[0] or cap > bound[1]) return refuse(diag, error.RouteInput, "exl3 kernel ops: a bank of {d} slots (the kernels take {d}..{d})", .{ cap, bound[0], bound[1] });
     vars.set(.cap, cap);
+    const s = g.shapeOf(a.code);
+    const ni: c_int = if (proj == .down) compiled_inter / 16 else compiled_hidden / 16;
+    const nj: c_int = if (proj == .down) compiled_hidden / 16 else compiled_inter / 16;
+    if (g.dtypeOf(a.code) != .int16 or s.n != 4 or s.d[1] != ni or s.d[2] != nj or
+        (s.d[3] != 32 and s.d[3] != 48 and s.d[3] != 64) or a.layout.k < 2 or a.layout.k > 4 or
+        a.layout.code_row_words != @as(u64, @intCast(ni)) * @as(u64, @intCast(nj)) * @as(u64, @intCast(s.d[3])) or
+        a.layout.code_row_words < tightLayout(a.layout.k).code_row_words)
+        return refuse(diag, error.RouteInput, "exl3 kernel ops: input code {any}, K {d}, physical row {d} words", .{ s.slice(), a.layout.k, a.layout.code_row_words });
     switch (proj) {
         .gate, .up => {
-            try expectInput(G, g, reg.get(.dsv41_exl3_mul1h_k3_2304), "code", a.code, &vars, diag);
             try expectInput(G, g, reg.get(.q3_exl3_prep_gu_epi), "rg", a.rout, &vars, diag);
             try expectInput(G, g, reg.get(.q3_exl3_prep_in_rin), "rg", a.rin, &vars, diag);
         },
         .down => {
-            try expectInput(G, g, reg.get(.dsv41_exl3_mul1h_k3_5120), "code", a.code, &vars, diag);
             try expectInput(G, g, reg.get(.q3_moeprep_dpost), "rd", a.rout, &vars, diag);
             try expectInput(G, g, reg.get(.q3_exl3_prep_din_rin), "rn", a.rin, &vars, diag);
         },
     }
+}
+
+fn allocRatePlan(comptime G: type, a: Allocator, g: *G, e: *const Entry) !*RowPlans(G, 48) {
+    const p = try a.create(RowPlans(G, 48));
+    errdefer a.destroy(p);
+    p.* = try .init(g, e, null, null);
+    return p;
+}
+
+fn freeRatePlans(comptime G: type, a: Allocator, g: *G, plans: *[3]?*RowPlans(G, 48)) void {
+    for (plans) |p| if (p) |plan| {
+        plan.deinit(g);
+        a.destroy(plan);
+    };
 }
 
 /// The decode GEMVs (form mul1h, K 3): `Provider.project`.
@@ -452,6 +548,12 @@ pub fn Gemv(comptime G: type) type {
         gu1_p: ?RowPlans(G, 48) = null,
         /// The gate / up call bound at construction: `guOne` (gu_one's one launch) or `guPair` (the two stock launches).
         gu_call: *const GuCall = guPair,
+        rate_mask: u3 = 0,
+        rate_a: Allocator,
+        rate_gu: [3]?*RowPlans(G, 48) = @splat(null),
+        rate_dn: [3]?*RowPlans(G, 48) = @splat(null),
+        rate_gu_e: [3]*const Entry = undefined,
+        rate_dn_e: [3]*const Entry = undefined,
 
         const GuCall = fn (self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T;
 
@@ -462,6 +564,10 @@ pub fn Gemv(comptime G: type) type {
         /// The GEMVs under the routed forms (stock when none): down_pair's text for the down projection, gu_one's one
         /// launch for gate and up. Every form computes the stock words (registry twin checks; kbench v9).
         pub fn initForms(g: *G, reg: *const xk.Registry, forms: Forms) !Self {
+            return initRates(std.heap.page_allocator, g, reg, forms, 0);
+        }
+
+        pub fn initRates(a: Allocator, g: *G, reg: *const xk.Registry, forms: Forms, rate_mask: u3) !Self {
             const gu = reg.get(.dsv41_exl3_mul1h_k3_2304);
             const dn = reg.get(if (forms.down_pair) .dsv41_exl3_pair_k3_5120 else .dsv41_exl3_mul1h_k3_5120);
             var gu_p: RowPlans(G, 48) = try .init(g, gu, null, null);
@@ -472,7 +578,21 @@ pub fn Gemv(comptime G: type) type {
             errdefer if (gu1_p) |*x| x.deinit(g);
             var gs = try Statics(G).init(g, gu);
             errdefer gs.deinit(g);
-            return .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p, .gu_call = if (forms.gu_one) guOne else guPair };
+            var self: Self = .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p, .gu_call = if (forms.gu_one) guOne else guPair, .rate_mask = rate_mask, .rate_a = a };
+            errdefer {
+                self.dn_statics.deinit(g);
+                freeRatePlans(G, a, g, &self.rate_gu);
+                freeRatePlans(G, a, g, &self.rate_dn);
+            }
+            inline for (.{ Kernel.dsv41_exl3_mul1h_rate_2304, Kernel.dsv41_exl3_mul1h_rate_2304__k3, Kernel.dsv41_exl3_mul1h_rate_2304__k4 }, .{ Kernel.dsv41_exl3_mul1h_rate_5120, Kernel.dsv41_exl3_mul1h_rate_5120__k3, Kernel.dsv41_exl3_mul1h_rate_5120__k4 }, 0..) |kg, kd, i| {
+                if (rate_mask & (@as(u3, 1) << i) != 0) {
+                    self.rate_gu_e[i] = reg.get(kg);
+                    self.rate_dn_e[i] = reg.get(kd);
+                    self.rate_gu[i] = try allocRatePlan(G, a, g, self.rate_gu_e[i]);
+                    self.rate_dn[i] = try allocRatePlan(G, a, g, self.rate_dn_e[i]);
+                }
+            }
+            return self;
         }
 
         pub fn deinit(self: *Self, g: *G) void {
@@ -481,15 +601,19 @@ pub fn Gemv(comptime G: type) type {
             if (self.gu1_p) |*x| x.deinit(g);
             self.gu_statics.deinit(g);
             self.dn_statics.deinit(g);
+            freeRatePlans(G, self.rate_a, g, &self.rate_gu);
+            freeRatePlans(G, self.rate_a, g, &self.rate_dn);
         }
 
-        /// Gate and up through the call `initForms` bound (no per-call choice).
-        pub fn projectGu(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) ![2]G.T {
+        /// Tight K3 keeps its installed form; other layouts use their prepared direct-rate plans.
+        pub fn projectGu(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T, lg: ProjectionLayout, lu: ProjectionLayout) ![2]G.T {
+            if (lg.k != 3 or lu.k != 3 or !lg.tight() or !lu.tight())
+                return .{ try self.project(g, .gate, xg, ids, code_g, lg), try self.project(g, .up, xu, ids, code_u, lu) };
             return self.gu_call(self, g, xg, xu, ids, code_g, code_u);
         }
 
         fn guPair(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T {
-            return .{ try self.project(g, .gate, xg, ids, code_g), try self.project(g, .up, xu, ids, code_u) };
+            return .{ try self.project(g, .gate, xg, ids, code_g, tightLayout(3)), try self.project(g, .up, xu, ids, code_u, tightLayout(3)) };
         }
 
         fn guOne(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T {
@@ -500,8 +624,15 @@ pub fn Gemv(comptime G: type) type {
 
         /// xh [rows, in] f32 (rotated), ids [rows] u32 (each row's slot), code = the projection's
         /// bank code -> z [rows, out] f32 (gate / up: out 2304, down: out 5120).
-        pub fn project(self: *const Self, g: *G, proj: Proj, xh: G.T, ids: G.T, code: G.T) !G.T {
-            const e, const st, const p = if (proj == .down) .{ self.dn, &self.dn_statics, &self.dn_p } else .{ self.gu, &self.gu_statics, &self.gu_p };
+        pub fn project(self: *const Self, g: *G, proj: Proj, xh: G.T, ids: G.T, code: G.T, layout: ProjectionLayout) !G.T {
+            const direct = layout.k != 3 or !layout.tight();
+            const index = layout.k - 2;
+            const p: *const RowPlans(G, 48) = if (direct) blk: {
+                const plans = if (proj == .down) &self.rate_dn[index] else &self.rate_gu[index];
+                break :blk plans.* orelse return error.RateNotPrepared;
+            } else if (proj == .down) &self.dn_p else &self.gu_p;
+            const e = if (direct) (if (proj == .down) self.rate_dn_e[index] else self.rate_gu_e[index]) else (if (proj == .down) self.dn else self.gu);
+            const st = if (proj == .down) &self.dn_statics else &self.gu_statics;
             var ins: [9]G.T = undefined;
             ins[0] = xh;
             ins[1] = ids;
@@ -537,13 +668,20 @@ pub fn Banked(comptime G: type) type {
         gu_st: [xk.max_inputs]G.T = undefined,
         dn_st: [xk.max_inputs]G.T = undefined,
         gu_call: *const GuCall,
+        rate_a: Allocator,
+        rate_gu: [3]?*RowPlans(G, 48) = @splat(null),
+        rate_dn: [3]?*RowPlans(G, 48) = @splat(null),
+        rate_gu_e: [3]*const Entry = undefined,
+        rate_dn_e: [3]*const Entry = undefined,
+        rate_gu_st: [xk.max_inputs]G.T = undefined,
+        rate_dn_st: [xk.max_inputs]G.T = undefined,
 
         const GuCall = fn (self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T;
 
         pub fn init(g: *G, reg: *const xk.Registry, forms: Forms, gemv: *const Gemv(G)) !Self {
             const gu_e = reg.get(if (forms.gu_one) .dsv41_exl3_b3_guone_k3_2304 else .dsv41_exl3_b3_mul1h_k3_2304);
             const dn_e = reg.get(if (forms.down_pair) .dsv41_exl3_b3_pair_k3_5120 else .dsv41_exl3_b3_mul1h_k3_5120);
-            var self: Self = .{ .in_rin_p = undefined, .gu_epi_p = undefined, .din_rin_p = undefined, .dpost_p = undefined, .gu_p = undefined, .dn_p = undefined, .gu_e = gu_e, .dn_e = dn_e, .gu_call = if (forms.gu_one) guOne else guPair };
+            var self: Self = .{ .in_rin_p = undefined, .gu_epi_p = undefined, .din_rin_p = undefined, .dpost_p = undefined, .gu_p = undefined, .dn_p = undefined, .gu_e = gu_e, .dn_e = dn_e, .gu_call = if (forms.gu_one) guOne else guPair, .rate_a = gemv.rate_a };
             // The statics: the stock GEMV's by name (gu_one has none; its gate / up statics are compiled in).
             if (!forms.gu_one) try alias(gu_e, gemv.gu, &gemv.gu_statics, &self.gu_st);
             try alias(dn_e, gemv.dn, &gemv.dn_statics, &self.dn_st);
@@ -558,6 +696,19 @@ pub fn Banked(comptime G: type) type {
             self.gu_p = try .init(g, gu_e, null, null);
             errdefer self.gu_p.deinit(g);
             self.dn_p = try .init(g, dn_e, null, null);
+            errdefer self.dn_p.deinit(g);
+            errdefer freeRatePlans(G, self.rate_a, g, &self.rate_gu);
+            errdefer freeRatePlans(G, self.rate_a, g, &self.rate_dn);
+            inline for (.{ Kernel.dsv41_exl3_b3_mul1h_rate_2304, Kernel.dsv41_exl3_b3_mul1h_rate_2304__k3, Kernel.dsv41_exl3_b3_mul1h_rate_2304__k4 }, .{ Kernel.dsv41_exl3_b3_mul1h_rate_5120, Kernel.dsv41_exl3_b3_mul1h_rate_5120__k3, Kernel.dsv41_exl3_b3_mul1h_rate_5120__k4 }, 0..) |kg, kd, i| {
+                if (gemv.rate_mask & (@as(u3, 1) << i) != 0) {
+                    self.rate_gu_e[i] = reg.get(kg);
+                    self.rate_dn_e[i] = reg.get(kd);
+                    try alias(self.rate_gu_e[i], gemv.gu, &gemv.gu_statics, &self.rate_gu_st);
+                    try alias(self.rate_dn_e[i], gemv.dn, &gemv.dn_statics, &self.rate_dn_st);
+                    self.rate_gu[i] = try allocRatePlan(G, self.rate_a, g, self.rate_gu_e[i]);
+                    self.rate_dn[i] = try allocRatePlan(G, self.rate_a, g, self.rate_dn_e[i]);
+                }
+            }
             return self;
         }
 
@@ -587,6 +738,16 @@ pub fn Banked(comptime G: type) type {
             self.dpost_p.deinit(g);
             self.gu_p.deinit(g);
             self.dn_p.deinit(g);
+            freeRatePlans(G, self.rate_a, g, &self.rate_gu);
+            freeRatePlans(G, self.rate_a, g, &self.rate_dn);
+        }
+
+        fn tightBanks(comptime proj: Proj, banks: *const [3]BA) bool {
+            for (banks) |b| {
+                const layout = @field(b, @tagName(proj)).layout;
+                if (layout.k != 3 or !layout.tight()) return false;
+            }
+            return true;
         }
 
         /// x [tokens, 5120] bf16 (taken rows), tok [rows] i32, ids packed -> the clamped SwiGLU [rows, 2304] f32.
@@ -594,7 +755,10 @@ pub fn Banked(comptime G: type) type {
             const rows = rowsOf(G, g, tok, 0);
             var xs: [2]G.T = undefined;
             try self.in_rin_p.launch(g, rows, &.{ x, tok, banks[0].gate.rin, banks[1].gate.rin, banks[2].gate.rin, banks[0].up.rin, banks[1].up.rin, banks[2].up.rin, ids }, &xs);
-            const z = try self.gu_call(self, g, xs[0], xs[1], ids, banks);
+            const z = if (tightBanks(.gate, banks) and tightBanks(.up, banks))
+                try self.gu_call(self, g, xs[0], xs[1], ids, banks)
+            else
+                try self.guPair(g, xs[0], xs[1], ids, banks);
             var out: [1]G.T = undefined;
             try self.gu_epi_p.launch(g, rows, &.{ z[0], z[1], banks[0].gate.rout, banks[1].gate.rout, banks[2].gate.rout, banks[0].up.rout, banks[1].up.rout, banks[2].up.rout, ids }, &out);
             return out[0];
@@ -605,14 +769,18 @@ pub fn Banked(comptime G: type) type {
             const rows = rowsOf(G, g, h, 0);
             var hd: [1]G.T = undefined;
             try self.din_rin_p.launch(g, rows, &.{ h, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, ids }, &hd);
-            var ins: [xk.max_inputs]G.T = self.dn_st;
+            const direct = !tightBanks(.down, banks);
+            const index = banks[0].down.layout.k - 2;
+            const plan: *const RowPlans(G, 48) = if (direct) (self.rate_dn[index] orelse return error.RateNotPrepared) else &self.dn_p;
+            const entry = if (direct) self.rate_dn_e[index] else self.dn_e;
+            var ins: [xk.max_inputs]G.T = if (direct) self.rate_dn_st else self.dn_st;
             ins[0] = hd[0];
             ins[1] = ids;
             ins[2] = banks[0].down.code;
             ins[3] = banks[1].down.code;
             ins[4] = banks[2].down.code;
             var zd: [1]G.T = undefined;
-            try self.dn_p.launch(g, rows, ins[0..self.dn_e.inputs.len], &zd);
+            try plan.launch(g, rows, ins[0..entry.inputs.len], &zd);
             var out: [1]G.T = undefined;
             try self.dpost_p.launch(g, rows, &.{ zd[0], banks[0].down.rout, banks[1].down.rout, banks[2].down.rout, ids }, &out);
             return out[0];
@@ -621,15 +789,19 @@ pub fn Banked(comptime G: type) type {
         fn guPair(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
             const rows = rowsOf(G, g, xg, 0);
             var out: [2]G.T = undefined;
-            var ins: [xk.max_inputs]G.T = self.gu_st;
-            ins[1] = ids;
+            const direct = !tightBanks(.gate, banks) or !tightBanks(.up, banks);
             inline for (.{ .gate, .up }, 0..) |proj, o| {
+                const index = @field(banks[0], @tagName(proj)).layout.k - 2;
+                const plan: *const RowPlans(G, 48) = if (direct) (self.rate_gu[index] orelse return error.RateNotPrepared) else &self.gu_p;
+                const entry = if (direct) self.rate_gu_e[index] else self.gu_e;
+                var ins: [xk.max_inputs]G.T = if (direct) self.rate_gu_st else self.gu_st;
+                ins[1] = ids;
                 ins[0] = if (o == 0) xg else xu;
                 ins[2] = @field(banks[0], @tagName(proj)).code;
                 ins[3] = @field(banks[1], @tagName(proj)).code;
                 ins[4] = @field(banks[2], @tagName(proj)).code;
                 var z: [1]G.T = undefined;
-                try self.gu_p.launch(g, rows, ins[0..self.gu_e.inputs.len], &z);
+                try plan.launch(g, rows, ins[0..entry.inputs.len], &z);
                 out[o] = z[0];
             }
             return out;
@@ -728,6 +900,9 @@ pub fn Rebuild(comptime G: type) type {
 
         /// slots i32 [16] (`rebuildSlots`), `experts` of them used -> (og, ou [n, 5120, 2304], od [n, 2304, 5120]) bf16.
         pub fn call(self: *const Self, g: *G, gate: ProjArrays(G.T), up: ProjArrays(G.T), down: ProjArrays(G.T), slots: G.T, experts: u32) ![3]G.T {
+            inline for (.{ gate, up, down }) |p| {
+                if (p.layout.k != 3 or !p.layout.tight()) return error.RebuildNeedsTightK3;
+            }
             var vars: Vars = .initFill(0);
             vars.set(.experts, experts);
             var out: [3]G.T = undefined;
@@ -797,6 +972,8 @@ pub fn DigX(comptime G: type) type {
         /// the 128-row gate|up text with the mul1h codebook through a threadgroup table: registered, not launched by
         /// the route
         gemm_gu128lut: *const Entry,
+        rate_gu: [3][3]*const Entry,
+        rate_dn: [3]*const Entry,
 
         pub fn init(reg: *const xk.Registry) Self {
             return .{
@@ -812,6 +989,12 @@ pub fn DigX(comptime G: type) type {
                 .widen1_e = reg.get(.q3_prefill_dig_rot_widen1_5120),
                 .gemm_dn_w1 = reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1),
                 .gemm_gu128lut = reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut),
+                .rate_gu = .{
+                    .{ reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128), reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128__k2_k3), reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128__k2_k4) },
+                    .{ reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128__k3_k2), reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128__k3), reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128__k3_k4) },
+                    .{ reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128__k4_k2), reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128__k4_k3), reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128__k4) },
+                },
+                .rate_dn = .{ reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1h_rate_m128), reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1h_rate_m128__k3), reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1h_rate_m128__k4) },
             };
         }
 
@@ -826,11 +1009,12 @@ pub fn DigX(comptime G: type) type {
 
         /// x0 / x1 [rows, 1, 5120] f16 (take2), gate / up code, the gate|up table at `m_tile` rows -> (zg, zu)
         /// [rows, 2304] f32: the 128-row text, the 64-row text's words.
-        pub fn gemmGateUp(self: *const Self, g: *G, x0: G.T, x1: G.T, code_g: G.T, code_u: G.T, tbl: G.T, tgs: u32) ![2]G.T {
+        pub fn gemmGateUp(self: *const Self, g: *G, x0: G.T, x1: G.T, code_g: G.T, code_u: G.T, tbl: G.T, tgs: u32, lg: ProjectionLayout, lu: ProjectionLayout) ![2]G.T {
+            const entry = if (lg.k == 3 and lu.k == 3 and lg.tight() and lu.tight()) self.gemm_gu128 else self.rate_gu[lg.k - 2][lu.k - 2];
             var vars = rowsVars(rowsOf(G, g, x0, 0));
             vars.set(.tgs, tgs);
             var out: [2]G.T = undefined;
-            try launchRule(G, g, self.gemm_gu128, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
+            try launchRule(G, g, entry, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
             return out;
         }
 
@@ -860,11 +1044,12 @@ pub fn DigX(comptime G: type) type {
 
         /// x [rows, 1, 2304] f16 (onepass), down code, the down table at `m_tile` rows -> z [rows, 5120] f32: the
         /// 128-row text, the 64-row text's words.
-        pub fn gemmDown(self: *const Self, g: *G, x: G.T, code_d: G.T, tbl: G.T, tgs: u32) !G.T {
+        pub fn gemmDown(self: *const Self, g: *G, x: G.T, code_d: G.T, tbl: G.T, tgs: u32, layout: ProjectionLayout) !G.T {
+            const entry = if (layout.k == 3 and layout.tight()) self.gemm_dn128 else self.rate_dn[layout.k - 2];
             var vars = rowsVars(rowsOf(G, g, x, 0));
             vars.set(.tgs, tgs);
             var out: [1]G.T = undefined;
-            try launchRule(G, g, self.gemm_dn128, &vars, &.{ x, code_d, tbl }, &out);
+            try launchRule(G, g, entry, &vars, &.{ x, code_d, tbl }, &out);
             return out[0];
         }
 
@@ -915,7 +1100,7 @@ pub fn DigX(comptime G: type) type {
         /// `Dig2GemmOnePassX`: take2 -> the gate|up GEMM -> onepass: (hd, zg, zu).
         pub fn gateUpOnePass(self: *const Self, g: *G, act: G.T, ridx: G.T, rhs: G.T, gu: DigTableArray(G), gate: ProjArrays(G.T), up: ProjArrays(G.T), down_rin: G.T) ![3]G.T {
             const x = try self.take2(g, act, ridx, rhs, gu.tbl, gate.rin, up.rin);
-            const z = try self.gemmGateUp(g, x[0], x[1], gate.code, up.code, gu.tbl, gu.tgs);
+            const z = try self.gemmGateUp(g, x[0], x[1], gate.code, up.code, gu.tbl, gu.tgs, gate.layout, up.layout);
             const hd = try self.onePass(g, z[0], z[1], rhs, gu.tbl, gate.rout, up.rout, down_rin);
             return .{ hd, z[0], z[1] };
         }
@@ -1087,7 +1272,7 @@ pub fn DigXPrefill(comptime G: type) type {
                 while (self.flight.items.len > keep) try self.drainOne(g);
                 prof.charge(.drain, tp);
                 tp = prof.now();
-                prof.count(1, self.wave_launches);
+                prof.count(1, if (self.wave_launches == 4 and (bank.down.layout.k != 3 or !bank.down.layout.tight())) 5 else self.wave_launches);
                 var ex: [wave_max]WaveExpert = undefined;
                 for (order[first..i], 0..) |gi, j| {
                     ex[j] = .{ .slot = self.gslot.items[gi], .rows = cnt[gi] };
@@ -1191,13 +1376,13 @@ pub fn DigXPrefill(comptime G: type) type {
         fn downChain(self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, rhs: G.T) anyerror!G.T {
             const td = digTableBm(ex, self.tiles_dn, DigX(G).m_tile);
             const tdn = try g.hostArray(std.mem.sliceAsBytes(&td.table), &.{80}, .int32);
-            const zd = try self.dig.gemmDown(g, hd, bank.down.code, tdn, td.tgs);
+            const zd = try self.dig.gemmDown(g, hd, bank.down.code, tdn, td.tgs, bank.down.layout);
             return self.dig.widen1(g, zd, rhs, tdn, bank.down.rout);
         }
 
         /// Fused: the fused down GEMM over its 40-tile table (rot_widen1 as its epilogue reads the table's slot column).
         fn downFused(self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, rhs: G.T) anyerror!G.T {
-            _ = rhs;
+            if (bank.down.layout.k != 3 or !bank.down.layout.tight()) return self.downChain(g, hd, bank, ex, rhs);
             const tw = digTableBm(ex, self.tiles_w, DigX(G).m_tile);
             const tdw = try g.hostArray(std.mem.sliceAsBytes(&tw.table), &.{80}, .int32);
             return self.dig.gemmDownWiden(g, hd, bank.down.code, bank.down.rout, tdw, tw.tgs);
@@ -1303,6 +1488,40 @@ const v41_spec: quant.Spec = .{ .hidden = 5120, .inter = 2304, .top_k = 6, .n_la
 
 const bank_peek_fixture = @embedFile("fixtures/dsv41_bank_peek.json");
 
+test "dsv41 kernels rates: logical source geometry determines each projection and rejects ambiguity" {
+    const a = testing.allocator;
+    var peek = try expert_bank.peekText(a, bank_peek_fixture, null);
+    defer peek.deinit();
+    const layers = try a.dupe(@TypeOf(peek.view.layers[0]), peek.view.layers);
+    defer a.free(layers);
+    const segments = try a.dupe(quant.Segment, layers[0].segments);
+    defer a.free(segments);
+    layers[0].segments = segments;
+    peek.view.layers = layers;
+    var diag: Diag = .{};
+    const original = segments[0];
+    for ([_]quant.Segment{
+        .{ .name = original.name, .dtype = "I16", .shape = &.{ 320, 144, 40 } },
+        .{ .name = original.name, .dtype = "I16", .shape = &.{ 144, 320, 48 } },
+        .{ .name = original.name, .dtype = "F16", .shape = original.shape },
+        .{ .name = "up_proj.code", .dtype = original.dtype, .shape = original.shape },
+    }) |invalid| {
+        segments[0] = invalid;
+        try testing.expectEqual(@as(?quant.Priority, null), claims(&peek.view, &diag));
+    }
+    segments[0] = original;
+    segments[0].shape = &.{ 320, 144, 32 };
+    segments[3].shape = &.{ 320, 144, 64 };
+    try testing.expectEqual([3]u32{ 2, 4, 3 }, sourceRates(segments).?);
+    layers[0].bits = 0;
+    try testing.expectEqual([3]u32{ 2, 4, 3 }, sourceRates(layers[0].segments).?);
+    segments[0] = original;
+    segments[3].shape = original.shape;
+    try testing.expectEqual(@as(?quant.Priority, .native), claims(&peek.view, &diag));
+    segments[1] = segments[2];
+    try testing.expectEqual(@as(?quant.Priority, null), claims(&peek.view, &diag));
+}
+
 test "dsv41 kernels c2: the EXL3 quant claims the bank of record's description (C1's peek) and declines each mutation, by field" {
     const a = testing.allocator;
     var why: Diag = .{};
@@ -1317,20 +1536,14 @@ test "dsv41 kernels c2: the EXL3 quant claims the bank of record's description (
         // the stock gather quant declines it (exl3 is no MLX quantization mode)
         try testing.expectEqual(@as(?quant.Priority, null), quant.GatherQmm.claims(v, &why));
     }
-    const Case = struct { needle: []const u8, replacement: []const u8, names: []const u8 };
+    const Case = struct { needle: []const u8, replacement: []const u8 };
     const cases = [_]Case{
-        .{ .needle = "\"mode\":\"exl3\"", .replacement = "\"mode\":\"exl2\"", .names = "quantization.mode \"exl2\"" },
-        .{ .needle = "\"codebook\":\"mul1\"", .replacement = "\"codebook\":\"3inst\"", .names = "quantization.codebook \"3inst\"" },
-        .{ .needle = "\"codebook_multiplier\":2212286765", .replacement = "\"codebook_multiplier\":2212286766", .names = "codebook_multiplier 2212286766" },
-        .{ .needle = "\"layout\":\"exl3-tensor-core\"", .replacement = "\"layout\":\"row-major\"", .names = "quantization.tile 16 / row-major" },
-        .{ .needle = "\"layer\":7,\"K\":3", .replacement = "\"layer\":7,\"K\":4", .names = "layer 7 K 4" },
-        .{ .needle = "\"hidden\":5120", .replacement = "\"hidden\":4096", .names = "dims hidden 4096" },
-        .{ .needle = "\"component\":\"up_proj.rout\",\"dtype\":\"F16\"", .replacement = "\"component\":\"up_proj.rout\",\"dtype\":\"F32\"", .names = "segment up_proj.rout: its dtype" },
-        .{ .needle = "\"order\":\"sylvester-natural\"", .replacement = "\"order\":\"walsh\"", .names = "quantization.hadamard 128 / walsh" },
-        .{ .needle = "\"rin\":\"exl3.suh\"", .replacement = "\"rin\":\"exl3.sv\"", .names = "quantization.scales rin exl3.sv" },
-        .{ .needle = "\"component\":\"gate_proj.rout\"", .replacement = "\"component\":\"gate_prj.rout\"", .names = "segment gate_prj.rout: an unknown projection" },
-        .{ .needle = "\"component\":\"down_proj.rin\"", .replacement = "\"component\":\"down_proj.bias\"", .names = "segment down_proj.bias: an unknown tensor" },
-        .{ .needle = "\"component\":\"gate_proj.code\",\"dtype\":\"I16\",\"shape\":[320,144,48]", .replacement = "\"component\":\"gate_proj.code\",\"dtype\":\"I16\",\"shape\":[144,320,48]", .names = "segment gate_proj.code: its shape" },
+        .{ .needle = "\"mode\":\"exl3\"", .replacement = "\"mode\":\"exl2\"" },
+        .{ .needle = "\"codebook\":\"mul1\"", .replacement = "\"codebook\":\"3inst\"" },
+        .{ .needle = "\"codebook_multiplier\":2212286765", .replacement = "\"codebook_multiplier\":2212286766" },
+        .{ .needle = "\"layout\":\"exl3-tensor-core\"", .replacement = "\"layout\":\"row-major\"" },
+        .{ .needle = "\"order\":\"sylvester-natural\"", .replacement = "\"order\":\"walsh\"" },
+        .{ .needle = "\"rin\":\"exl3.suh\"", .replacement = "\"rin\":\"exl3.sv\"" },
     };
     for (cases) |c| {
         const text = try std.mem.replaceOwned(u8, a, bank_peek_fixture, c.needle, c.replacement);
@@ -1339,20 +1552,39 @@ test "dsv41 kernels c2: the EXL3 quant claims the bank of record's description (
         defer p.deinit();
         why = .{};
         try testing.expectEqual(@as(?quant.Priority, null), claims(&p.view, &why));
-        if (std.mem.indexOf(u8, why.message(), c.names) == null) {
-            std.debug.print("declined for: {s}\n", .{why.message()});
-            return error.TestUnexpectedResult;
-        }
     }
     // C1's peek refuses a manifest it cannot describe, by name
     var bd: expert_bank.Diag = .{};
     try testing.expectError(error.ManifestFormat, expert_bank.peekText(a, "{\"format\":\"x\",\"quantization\":{},\"dims\":{\"hidden\":1,\"inter\":1,\"n_experts\":1,\"n_layers\":0},\"layers\":[]}", &bd));
-    try testing.expectError(error.LayerGeometry, expert_bank.peekText(a, "{\"format\":\"mtplx-expert-manifest-v2\",\"quantization\":{},\"dims\":{\"hidden\":1,\"inter\":1,\"n_experts\":1,\"n_layers\":1},\"layers\":[{\"layer\":1,\"K\":3,\"segments\":[]}]}", &bd));
+    const bad_layer = try std.mem.replaceOwned(u8, a, bank_peek_fixture, "\"layer\":0", "\"layer\":40");
+    defer a.free(bad_layer);
+    try testing.expectError(error.LayerGeometry, expert_bank.peekText(a, bad_layer, &bd));
+    try testing.expectError(error.ManifestSyntax, expert_bank.peekText(a, "{\"format\":\"mtplx-expert-manifest-v2\",\"quantization\":{},\"dims\":{\"hidden\":1,\"inter\":1,\"n_experts\":1,\"n_layers\":1},\"layers\":[{\"layer\":1,\"K\":3,\"segments\":[]}]}", &bd));
     try testing.expectError(error.ManifestSyntax, expert_bank.peekText(a, "{", &bd));
+}
+
+test "dsv41 kernels rates: admission uses each logical projection rate and refuses an unsupported rate" {
+    const a = testing.allocator;
+    var peek = try expert_bank.peekText(a, bank_peek_fixture, null);
+    defer peek.deinit();
+    const layers = try a.dupe(quant.LayerPeek, peek.view.layers);
+    defer a.free(layers);
+    const segments = try a.dupe(quant.Segment, layers[0].segments);
+    defer a.free(segments);
+    var shapes = [3][3]u64{ .{ 320, 144, 32 }, .{ 320, 144, 48 }, .{ 144, 320, 64 } };
+    for (&shapes, 0..) |*shape, p| segments[p * 3].shape = shape;
+    layers[0] = .{ .bits = 0, .segments = segments };
+    var view = peek.view;
+    view.layers = layers;
+    try testing.expectEqual(@as(?quant.Priority, .native), claims(&view, null));
+    shapes[0][2] = 80;
+    try testing.expectEqual(@as(?quant.Priority, null), claims(&view, null));
 }
 
 test "dsv41 kernels c2: the EXL3 quant is accepted only with the load's kernel set, and checks its Spec before building" {
     const a = testing.allocator;
+    var peek = try expert_bank.peekText(a, bank_peek_fixture, null);
+    defer peek.deinit();
     var diag: Diag = .{};
     var tb: Trace = .{ .a = a };
     defer tb.deinit();
@@ -1364,10 +1596,39 @@ test "dsv41 kernels c2: the EXL3 quant is accepted only with the load's kernel s
     var bad = v41_spec;
     bad.top_k = 9;
     try testing.expectError(error.TopKTooWide, accept(Trace, a, &tb, .{ .kernels = set.ref() }, bad, &diag));
-    const acc = try accept(Trace, a, &tb, .{ .kernels = set.ref() }, v41_spec, &diag);
+    try testing.expectError(error.NoWeightDescription, accept(Trace, a, &tb, .{ .kernels = set.ref() }, v41_spec, &diag));
+    const acc = try accept(Trace, a, &tb, .{ .kernels = set.ref(), .peek = &peek.view }, v41_spec, &diag);
     defer acc.deinit(&tb);
     try testing.expectEqual(@as(usize, v41_spec.n_layers), acc.waves.len);
     try testing.expectEqual(decode_table_rows, acc.n_tok);
+}
+
+test "dsv41 kernels rates: accepted layer identity outlives its peek and rejects rebinding" {
+    const a = testing.allocator;
+    var g: Trace = .{ .a = a };
+    defer g.deinit();
+    var diag: Diag = .{};
+    const set = try ks.Set.init(a, .{ .device = .{ .stub = .{} } }, &diag);
+    defer set.deinit();
+    set.install(Trace, &g);
+    const acc = blk: {
+        var peek = try expert_bank.peekText(a, bank_peek_fixture, null);
+        defer peek.deinit();
+        break :blk try accept(Trace, a, &g, .{ .kernels = set.ref(), .peek = &peek.view }, v41_spec, &diag);
+    };
+    defer acc.deinit(&g);
+    var bank = try testBank(&g, 4);
+    bank.down.code = try g.ext("padded", &.{ 4, 144, 320, 64 }, .int16);
+    bank.down.layout.code_row_words = tightLayout(4).code_row_words;
+    try acc.checkLayerBank(&g, 39, bank, &diag);
+    for ([_]u32{ 2, 4 }) |k| {
+        bank.down.layout.k = k;
+        try testing.expectError(error.RouteInput, acc.checkLayerBank(&g, 39, bank, &diag));
+    }
+    bank.down.layout.k = 3;
+    try testing.expectError(error.RouteInput, acc.checkLayerBank(&g, 40, bank, &diag));
+    bank.down.layout.code_row_words -= 1;
+    try testing.expectError(error.RouteInput, acc.checkLayerBank(&g, 39, bank, &diag));
 }
 
 test "dsv41 kernels c2: the real 3.0 bank's own manifest is claimed (DSV41_BANK)" {
@@ -1529,7 +1790,6 @@ fn routeRows(a: Allocator, seed: u64, slots: []const u32, counts: []const u32) !
     }
     return rows;
 }
-
 
 /// A take2 launch line's two forms. The lane samples and the move's pinned log name the lane's take2
 /// (`q3_prefill_dig_rot_take2_5120`, grid z 2: one simdgroup per output); the route launches the retune
@@ -1860,9 +2120,9 @@ fn expectLifecycle(t: *const Trace, log0: usize, resets0: usize, waves: usize, p
 
 fn testBank(t: *Trace, cap: c_int) !BankArrays(Trace.T) {
     return .{
-        .gate = .{ .code = try t.ext("gate_proj.code", &.{ cap, 320, 144, 48 }, .int16), .rout = try t.ext("gate_proj.rout", &.{ cap, 2304 }, .float16), .rin = try t.ext("gate_proj.rin", &.{ cap, 5120 }, .float16) },
-        .up = .{ .code = try t.ext("up_proj.code", &.{ cap, 320, 144, 48 }, .int16), .rout = try t.ext("up_proj.rout", &.{ cap, 2304 }, .float16), .rin = try t.ext("up_proj.rin", &.{ cap, 5120 }, .float16) },
-        .down = .{ .code = try t.ext("down_proj.code", &.{ cap, 144, 320, 48 }, .int16), .rout = try t.ext("down_proj.rout", &.{ cap, 5120 }, .float16), .rin = try t.ext("down_proj.rin", &.{ cap, 2304 }, .float16) },
+        .gate = .{ .code = try t.ext("gate_proj.code", &.{ cap, 320, 144, 48 }, .int16), .rout = try t.ext("gate_proj.rout", &.{ cap, 2304 }, .float16), .rin = try t.ext("gate_proj.rin", &.{ cap, 5120 }, .float16), .layout = tightLayout(3) },
+        .up = .{ .code = try t.ext("up_proj.code", &.{ cap, 320, 144, 48 }, .int16), .rout = try t.ext("up_proj.rout", &.{ cap, 2304 }, .float16), .rin = try t.ext("up_proj.rin", &.{ cap, 5120 }, .float16), .layout = tightLayout(3) },
+        .down = .{ .code = try t.ext("down_proj.code", &.{ cap, 144, 320, 48 }, .int16), .rout = try t.ext("down_proj.rout", &.{ cap, 5120 }, .float16), .rin = try t.ext("down_proj.rin", &.{ cap, 2304 }, .float16), .layout = tightLayout(3) },
     };
 }
 
@@ -2030,12 +2290,8 @@ test "dsv41 smoke 0b: L1: DIG-X prefill waves at 8 experts per wave equal Record
     const rf = st.refsOf(r, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     for (rf) |x| try testing.expectEqual(es.BankKind.base, x.bank);
-    const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
-    const bank_arrays: BankArrays(ops.MlxOps.T) = .{
-        .gate = .{ .code = ba.gate.code, .rout = ba.gate.rout, .rin = ba.gate.rin },
-        .up = .{ .code = ba.up.code, .rout = ba.up.rout, .rin = ba.up.rin },
-        .down = .{ .code = ba.down.code, .rout = ba.down.rout, .rin = ba.down.rin },
-    };
+    var source = es.StreamSource.init(st);
+    const bank_arrays = (try source.bankArrays(&g, 0, .base)) orelse return error.TestUnexpectedResult;
     // A K16-shaped group call at a handful of records: 16 experts x 64 rows, rows interleaved by expert.
     const per = 64;
     const slots = try a.alloc(u32, n_experts * per);
@@ -2086,7 +2342,7 @@ test "dsv41 kernels ops: the prefill wave route refuses by name, before any laun
     try testing.expectEqual(@as(usize, 0), t.launches.items.len);
     try testing.expectEqual(@as(usize, 0), t.log.items.len);
     // a bank above the kernels' slot bound is refused where the model binds it
-    const big: ProjArrays(Trace.T) = .{ .code = try t.ext("c", &.{ 4097, 320, 144, 48 }, .int16), .rout = try t.ext("r", &.{ 4097, 2304 }, .float16), .rin = try t.ext("i", &.{ 4097, 5120 }, .float16) };
+    const big: ProjArrays(Trace.T) = .{ .code = try t.ext("c", &.{ 4097, 320, 144, 48 }, .int16), .rout = try t.ext("r", &.{ 4097, 2304 }, .float16), .rin = try t.ext("i", &.{ 4097, 5120 }, .float16), .layout = tightLayout(3) };
     try testing.expectError(error.RouteInput, checkBank(Trace, &t, &reg, .gate, big, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "a bank of 4097 slots") != null);
     try checkBank(Trace, &t, &reg, .gate, bank.gate, &diag);
@@ -2563,13 +2819,15 @@ fn movedLaneLog(a: Allocator, t: *Trace, reg: *const xk.Registry, acc: *Accepted
 
 test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill launch what today's EXL3 entries launched (pinned at the move)" {
     const a = testing.allocator;
+    var peek = try expert_bank.peekText(a, bank_peek_fixture, null);
+    defer peek.deinit();
     var diag: Diag = .{};
     var tb: Trace = .{ .a = a };
     defer tb.deinit();
     const set = try ks.Set.init(a, .{ .device = .{ .stub = .{} } }, &diag);
     defer set.deinit();
     set.install(Trace, &tb);
-    const acc = try accept(Trace, a, &tb, .{ .kernels = set.ref() }, v41_spec, &diag);
+    const acc = try accept(Trace, a, &tb, .{ .kernels = set.ref(), .peek = &peek.view }, v41_spec, &diag);
     defer acc.deinit(&tb);
     const bb = try namedBank(&tb, 64);
     var lane_log: std.ArrayList(u8) = .empty;
@@ -2587,7 +2845,7 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
         var tf: Trace = .{ .a = a };
         defer tf.deinit();
         set.install(Trace, &tf);
-        const accf = try accept(Trace, a, &tf, .{ .kernels = set.ref() }, v41_spec, &diag);
+        const accf = try accept(Trace, a, &tf, .{ .kernels = set.ref(), .peek = &peek.view }, v41_spec, &diag);
         defer accf.deinit(&tf);
         try accf.routeFusedDown(set, &diag);
         try testing.expect(accf.fused_down and !acc.fused_down);
@@ -2604,7 +2862,7 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
         .{ .cap = 64, .last = 48, .rin_dt = .float32, .what = "input rg" },
         .{ .cap = 5000, .last = 48, .rin_dt = .float16, .what = "a bank of 5000 slots" },
     }) |c| {
-        const arr = ProjArrays(Trace.T){ .code = try tb.ext("code", &.{ c.cap, 320, 144, c.last }, .int16), .rout = try tb.ext("rout", &.{ c.cap, 2304 }, .float16), .rin = try tb.ext("rin", &.{ c.cap, 5120 }, c.rin_dt) };
+        const arr = ProjArrays(Trace.T){ .code = try tb.ext("code", &.{ c.cap, 320, 144, c.last }, .int16), .rout = try tb.ext("rout", &.{ c.cap, 2304 }, .float16), .rin = try tb.ext("rin", &.{ c.cap, 5120 }, c.rin_dt), .layout = .{ .k = 3, .code_row_words = 320 * 144 * @as(u64, @intCast(c.last)) } };
         try testing.expectError(error.RouteInput, acc.checkBank(&tb, .{ .gate = arr, .up = bb.up, .down = bb.down }, &diag));
         if (std.mem.indexOf(u8, diag.message(), c.what) == null) {
             std.debug.print("checkBank refused with: {s}\n", .{diag.message()});
@@ -3137,7 +3395,8 @@ test "dsv41 smoke 0b: fused down: the fused down GEMM's words equal the 128-row 
     var refs: [@import("sdk_ext.zig").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
-    const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
+    var source = es.StreamSource.init(st);
+    const ba = (try source.bankArrays(&g, 0, .base)) orelse return error.TestUnexpectedResult;
     const dig = DigX(G).init(&set.reg);
     const Wave = struct {
         rows: u32,
@@ -3181,7 +3440,7 @@ test "dsv41 smoke 0b: fused down: the fused down GEMM's words equal the 128-row 
             const gu = digTableBm(ex[0..per.len], d.digTiles(.gate_up), DigX(G).m_tile);
             const tbl_gu = try gg.hostArray(std.mem.sliceAsBytes(&gu.table), &.{80}, .int32);
             const x = try d.take2(gg, act, ridx_a, rhs_a, tbl_gu, bank_.gate.rin, bank_.up.rin);
-            const z = try d.gemmGateUp(gg, x[0], x[1], bank_.gate.code, bank_.up.code, tbl_gu, gu.tgs);
+            const z = try d.gemmGateUp(gg, x[0], x[1], bank_.gate.code, bank_.up.code, tbl_gu, gu.tgs, bank_.gate.layout, bank_.up.layout);
             const hd = try d.onePass(gg, z[0], z[1], rhs_a, tbl_gu, bank_.gate.rout, bank_.up.rout, bank_.down.rin);
             try gg.evalAll(&.{hd});
             return .{ .rows = n, .hd = hd, .rhs = rhs_a, .dn = digTableBm(ex[0..per.len], d.digTiles(.down), DigX(G).m_tile), .w1 = digTableBm(ex[0..per.len], d.widenTiles(), DigX(G).m_tile) };
@@ -3194,7 +3453,7 @@ test "dsv41 smoke 0b: fused down: the fused down GEMM's words equal the 128-row 
                 return d.gemmDownWiden(gg, w.hd, bank_.down.code, bank_.down.rout, tbl, w.w1.tgs);
             }
             const tbl = try gg.hostArray(std.mem.sliceAsBytes(&w.dn.table), &.{80}, .int32);
-            const z = try d.gemmDown(gg, w.hd, bank_.down.code, tbl, w.dn.tgs);
+            const z = try d.gemmDown(gg, w.hd, bank_.down.code, tbl, w.dn.tgs, bank_.down.layout);
             return d.widen1(gg, z, w.rhs, tbl, bank_.down.rout);
         }
     };
@@ -3332,7 +3591,8 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
     var refs: [@import("sdk_ext.zig").expert.policy.max_route_ids]es.SlotRef = undefined;
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
-    const ba = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
+    var source = es.StreamSource.init(st);
+    const ba = (try source.bankArrays(&g, 0, .base)) orelse return error.TestUnexpectedResult;
     const dig = DigX(G).init(&set.reg);
     // the gate|up GEMM texts: the 64-row text, the 128-row text, the table-codebook text
     const Text = enum { m64, m128, lut };
@@ -3394,7 +3654,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
                     try launchRule(G, gg, d.gemm_gu, &vars, &.{ w.x0, w.x1, bank_.gate.code, bank_.up.code, tbl }, &out);
                     return out;
                 },
-                .m128 => return d.gemmGateUp(gg, w.x0, w.x1, bank_.gate.code, bank_.up.code, tbl, t.tgs),
+                .m128 => return d.gemmGateUp(gg, w.x0, w.x1, bank_.gate.code, bank_.up.code, tbl, t.tgs, bank_.gate.layout, bank_.up.layout),
                 .lut => return d.gemmGateUpLut(gg, w.x0, w.x1, bank_.gate.code, bank_.up.code, tbl, t.tgs),
             }
         }
@@ -3495,9 +3755,8 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
     }
 }
 
-// The served construction's self-checks alone, on the device (a guarded step: the GPU lock held). The two plans the
-// served module judges at construction, the EXL3 quant's accept subset and the V4.1 trunk's, each result printed
-// (PASS / FAIL, words / bad, metric / limit, the reference side), then the module's verdict. No model, no bank.
+// Construction and integer-rate kernel checks on the device, with the GPU lock held.
+// Every result names its reference and compared words; no model or bank is loaded.
 test "dsv41 pre-ship gate: the kernels' full self-check plan on the device, every result printed (DSV41_SELFCHECK_DEVICE)" {
     if (std.c.getenv("DSV41_SELFCHECK_DEVICE") == null) return error.SkipZigTest;
     const trunk = @import("dsv41_kernel_routes.zig");
@@ -3514,7 +3773,7 @@ test "dsv41 pre-ship gate: the kernels' full self-check plan on the device, ever
     var failed: usize = 0;
     // Both depths, each timed: the construction runs `.compile`; `.full` is the manifest's whole plan (the numeric probes).
     inline for (.{ selfcheck.Depth.compile, selfcheck.Depth.full }) |depth| {
-        inline for (.{ .{ "exl3_quant_accept", &checked_at_accept }, .{ "trunk_routes", &trunk.kernels } }) |plan| {
+        inline for (.{ .{ "exl3_quant_accept", &checked_at_accept }, .{ "exl3_integer_rates", &xk.rate_kernels }, .{ "trunk_routes", &trunk.kernels } }) |plan| {
             var report: selfcheck.Report = .{};
             defer report.deinit(a);
             const t0 = std.Io.Timestamp.now(testing.io, .awake);

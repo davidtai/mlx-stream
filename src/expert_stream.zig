@@ -59,6 +59,7 @@ pub const transient_release_default = S.transient_release_default;
 pub const decode_staging_rows = S.decode_staging_rows;
 const wait_timeout_ns = S.wait_timeout_ns;
 pub const Stream = S.Stream;
+pub const StorageGeometry = S.StorageGeometry;
 /// The EXL3 bank's slot arrays by projection.
 pub const ProjArrays = expert_bank.ProjArrays;
 pub const BankArrays = expert_bank.BankArrays;
@@ -89,6 +90,10 @@ pub fn wavesOf(plan: *const Plan, hit_slots: []const u32, part_loads: []const []
 
 /// Trace arrays in one record's geometry, `rows` rows (a trace backend's `input`).
 pub fn traceBank(g: anytype, geom: *const Layer, rows: u32) !BankArraysOf(@TypeOf(g.*).T) {
+    return traceBankGeometry(g, geom, rows, geom.projection_k);
+}
+
+fn traceBankGeometry(g: anytype, geom: anytype, rows: u32, rates: [3]u32) !BankArraysOf(@TypeOf(g.*).T) {
     var a: [n_components]@TypeOf(g.*).T = undefined;
     for (&a, geom.segments) |*x, seg| {
         var shape: [4]c_int = undefined;
@@ -100,9 +105,9 @@ pub fn traceBank(g: anytype, geom: *const Layer, rows: u32) !BankArraysOf(@TypeO
         });
     }
     return .{
-        .gate = .{ .code = a[0], .rout = a[1], .rin = a[2] },
-        .up = .{ .code = a[3], .rout = a[4], .rin = a[5] },
-        .down = .{ .code = a[6], .rout = a[7], .rin = a[8] },
+        .gate = .{ .code = a[0], .rout = a[1], .rin = a[2], .layout = .{ .k = rates[0], .code_row_words = geom.segments[0].length / 2 } },
+        .up = .{ .code = a[3], .rout = a[4], .rin = a[5], .layout = .{ .k = rates[1], .code_row_words = geom.segments[3].length / 2 } },
+        .down = .{ .code = a[6], .rout = a[7], .rin = a[8], .layout = .{ .k = rates[2], .code_row_words = geom.segments[6].length / 2 } },
     };
 }
 
@@ -298,17 +303,24 @@ pub const StreamSource = struct {
     /// Trace backends: inputs in the bank's geometry.
     pub fn bankArrays(self: *StreamSource, g: anytype, layer: u32, kind: BankKind) !?BankArraysOf(@TypeOf(g.*).T) {
         const G = @TypeOf(g.*);
+        const rates = self.stream.bank.layers[layer].projection_k;
         if (G.T == mlx.mlx_array) {
             const b = self.stream.bankArrays(layer, kind) orelse return null;
+            const row_bytes = switch (kind) {
+                .base => &self.stream.layers[layer].base.row_bytes,
+                .ext => &self.stream.layers[layer].ext.?.row_bytes,
+                .transient => &self.stream.transient.row_bytes,
+            };
             return .{
-                .gate = .{ .code = b.gate.code, .rout = b.gate.rout, .rin = b.gate.rin },
-                .up = .{ .code = b.up.code, .rout = b.up.rout, .rin = b.up.rin },
-                .down = .{ .code = b.down.code, .rout = b.down.rout, .rin = b.down.rin },
+                .gate = .{ .code = b.gate.code, .rout = b.gate.rout, .rin = b.gate.rin, .layout = .{ .k = rates[0], .code_row_words = row_bytes[0] / 2 } },
+                .up = .{ .code = b.up.code, .rout = b.up.rout, .rin = b.up.rin, .layout = .{ .k = rates[1], .code_row_words = row_bytes[3] / 2 } },
+                .down = .{ .code = b.down.code, .rout = b.down.rout, .rin = b.down.rin, .layout = .{ .k = rates[2], .code_row_words = row_bytes[6] / 2 } },
             };
         } else {
             if (comptime !@hasDecl(G, "input")) @compileError("StreamSource binds MLX arrays or a trace backend's inputs; " ++ @typeName(G) ++ " has neither");
             const rows = self.bankRows(layer, kind);
             if (rows == 0) return null;
+            if (kind == .transient) return try traceBankGeometry(g, &self.stream.geometry.transient, rows, rates);
             return try traceBank(g, &self.stream.bank.layers[layer], rows);
         }
     }
@@ -420,7 +432,7 @@ fn checkSet(name: []const u8, bank: *const expert_bank.Bank, set: []const FixRec
         try testing.expect(hexEq(r.v1_sha256, &d));
         try testing.expectEqual(@as(usize, n_components), r.segments.len);
         for (layer.segments, r.segments, 0..) |seg, fs, c| {
-            const comp: Component = @enumFromInt(c);
+            const comp: Component = @fromBackingInt(@intCast(c));
             try testing.expectEqualStrings(comp.name(), fs.component);
             try testing.expectEqual(r.sidecar_offset + seg.offset, fs.offset);
             try testing.expectEqual(seg.length, fs.length);
@@ -504,7 +516,7 @@ fn expectServed(s: *Stream, sb: *const SynthBank, r: *const Route, ids: []const 
         const off = sb.bank.recordOffset(r.layer, e);
         for (geom.segments, 0..) |seg, c| {
             const want = sb.image[off + seg.offset ..][0..seg.length];
-            try testing.expectEqualSlices(u8, want, s.slotRow(r.layer, slot, @enumFromInt(c))[0..seg.length]);
+            try testing.expectEqualSlices(u8, want, s.slotRow(r.layer, slot, @fromBackingInt(@intCast(c)))[0..seg.length]);
         }
     }
 }
@@ -841,7 +853,7 @@ test "dsv41 stream: P1's construction self-check: records read ahead equal their
 /// sha256 of a served slot's logical record (its nine component rows).
 fn slotDigest(s: *Stream, layer: u32, slot: u32, geom: *const Layer) [32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    for (geom.segments, 0..) |seg, c| h.update(s.slotRow(layer, slot, @enumFromInt(c))[0..seg.length]);
+    for (geom.segments, 0..) |seg, c| h.update(s.slotRow(layer, slot, @fromBackingInt(@intCast(c)))[0..seg.length]);
     var d: [32]u8 = undefined;
     h.final(&d);
     return d;
@@ -1190,8 +1202,8 @@ const ProbeBox = struct {
     }
     fn line(b0: @This(), b: @This(), out: []u8) []const u8 {
         return std.fmt.bufPrint(out, "{{\"d_footprint\": {d}, \"d_physical\": {d}, \"d_wired\": {d}, \"d_file_backed\": {d}, \"d_graphics_nofootprint\": {d}, \"d_internal\": {d}, \"outside\": {d}}}", .{
-            d(b0.fp, b.fp), d(b0.pages.physical(), b.pages.physical()), d(b0.pages.wired, b.pages.wired), d(b0.pages.file_backed, b.pages.file_backed),
-            d(b0.pm.graphics_nofootprint, b.pm.graphics_nofootprint), d(b0.pm.internal, b.pm.internal), outside(b0, b),
+            d(b0.fp, b.fp),                                           d(b0.pages.physical(), b.pages.physical()), d(b0.pages.wired, b.pages.wired), d(b0.pages.file_backed, b.pages.file_backed),
+            d(b0.pm.graphics_nofootprint, b.pm.graphics_nofootprint), d(b0.pm.internal, b.pm.internal),           outside(b0, b),
         }) catch out[0..0];
     }
     const Payload = struct { m: []align(std.heap.page_size_min) u8 };
@@ -1261,8 +1273,8 @@ test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pa
     var l: [6][320]u8 = undefined;
     var ms: [3][24]u8 = undefined;
     std.debug.print("\nGROWTH_BOX_PROBE {{\"bytes\": {d}, \"no_copy\": {}, \"baseline_settle_ms\": {s}, \"touch\": {s}, \"wrap_eval\": {s}, \"first_gpu_read\": {s}, \"first_gpu_read_from_touch\": {s}, \"release_from_touch\": {s}, \"release_settle_ms\": {s}, \"after_next_command_from_touch\": {s}, \"after_next_command_settle_ms\": {s}, \"outside_limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
-        bytes, no_copy, Box.msOf(base.ms, &ms[2]), Box.line(b0, b1, &l[0]), Box.line(b0, b2, &l[1]), Box.line(b0, b3, &l[2]), Box.line(b1, b3, &l[5]), Box.line(b1, r1.b, &l[3]), Box.msOf(r1.ms, &ms[0]),
-        if (r2) |x| Box.line(b1, x.b, &l[4]) else "null", if (r2) |x| Box.msOf(x.ms, &ms[1]) else "null", limit, verdict,
+        bytes,                                            no_copy,                                        Box.msOf(base.ms, &ms[2]), Box.line(b0, b1, &l[0]), Box.line(b0, b2, &l[1]), Box.line(b0, b3, &l[2]), Box.line(b1, b3, &l[5]), Box.line(b1, r1.b, &l[3]), Box.msOf(r1.ms, &ms[0]),
+        if (r2) |x| Box.line(b1, x.b, &l[4]) else "null", if (r2) |x| Box.msOf(x.ms, &ms[1]) else "null", limit,                     verdict,
     });
     // Control (the growth's way back): an MLX-allocated array of the same bytes, written and read in full on the GPU,
     // released through the allocator (synchronize, cache cleared) from its own settled baseline; its release is the
@@ -1289,8 +1301,8 @@ test "dsv41 growth 0b: box probe: a no-copy wrap of 2 GB of touched anonymous pa
     var cl: [3][320]u8 = undefined;
     var cms: [3][24]u8 = undefined;
     std.debug.print("\nGROWTH_BOX_PROBE_CONTROL {{\"bytes\": {d}, \"baseline_settle_ms\": {s}, \"written_read\": {s}, \"release\": {s}, \"release_footprint_settle_ms\": {s}, \"after_next_command\": {s}, \"after_next_command_footprint_settle_ms\": {s}, \"footprint_limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
-        bytes, Box.msOf(cbase.ms, &cms[2]), Box.line(c0, c1, &cl[0]), Box.line(c0, cr.b, &cl[1]), Box.msOf(cr.ms, &cms[0]),
-        if (cr2) |x| Box.line(c0, x.b, &cl[2]) else "null", if (cr2) |x| Box.msOf(x.ms, &cms[1]) else "null", limit, if (c_released) "released" else "ControlReleaseKeptFootprint",
+        bytes,                                              Box.msOf(cbase.ms, &cms[2]),                      Box.line(c0, c1, &cl[0]), Box.line(c0, cr.b, &cl[1]),                                    Box.msOf(cr.ms, &cms[0]),
+        if (cr2) |x| Box.line(c0, x.b, &cl[2]) else "null", if (cr2) |x| Box.msOf(x.ms, &cms[1]) else "null", limit,                    if (c_released) "released" else "ControlReleaseKeptFootprint",
     });
     try testing.expect(no_copy);
     if (out3 > limit) return error.GrowWrapOutsideFootprint;
@@ -1387,8 +1399,8 @@ test "dsv41 stream 0b: the transient release frees the 240-row MLX scratch back 
     var l: [5][320]u8 = undefined;
     var ms: [5][24]u8 = undefined;
     std.debug.print("\nTRANSIENT_RELEASE_PROBE {{\"transient_rows\": {d}, \"freed_bytes\": {d}, \"d_active\": {d}, \"window0_rows\": {d}, \"baseline_settle_ms\": {s}, \"filled\": {s}, \"release_from_fill\": {s}, \"footprint_settle_ms\": {s}, \"outside_settle_ms\": {s}, \"after_next_command_from_fill\": {s}, \"after_next_command_footprint_settle_ms\": {s}, \"after_next_command_outside_settle_ms\": {s}, \"grown\": {s}, \"limit\": {d}, \"verdict\": \"{s}\"}}\n", .{
-        depth * max_route_ids, freed, active[0] -| active[1], s.transient.rows, ProbeBox.msOf(base.ms, &ms[4]), ProbeBox.line(b0, b1, &l[0]), ProbeBox.line(b1, r1.b, &l[1]), ProbeBox.msOf(f1.ms, &ms[0]), ProbeBox.msOf(r1.ms, &ms[1]),
-        if (r2) |x| ProbeBox.line(b1, x.b, &l[2]) else "null", if (f2) |x| ProbeBox.msOf(x.ms, &ms[2]) else "null", if (r2) |x| ProbeBox.msOf(x.ms, &ms[3]) else "null", ProbeBox.line(b0, b2, &l[3]), limit, verdict,
+        depth * max_route_ids,                                 freed,                                               active[0] -| active[1],                              s.transient.rows,             ProbeBox.msOf(base.ms, &ms[4]), ProbeBox.line(b0, b1, &l[0]), ProbeBox.line(b1, r1.b, &l[1]), ProbeBox.msOf(f1.ms, &ms[0]), ProbeBox.msOf(r1.ms, &ms[1]),
+        if (r2) |x| ProbeBox.line(b1, x.b, &l[2]) else "null", if (f2) |x| ProbeBox.msOf(x.ms, &ms[2]) else "null", if (r2) |x| ProbeBox.msOf(x.ms, &ms[3]) else "null", ProbeBox.line(b0, b2, &l[3]), limit,                          verdict,
     });
     try testing.expect(in_window0);
     if (kept) return error.TransientReleaseKeptFootprint;
@@ -1690,11 +1702,9 @@ test "dsv41 stream: a verify trace of 1-8 rows with lookahead, pre-read and gate
     try testing.expect(st.spec_issued > 0 and st.pre_issued > 0);
 }
 
-/// The bytes of `rows` rows of the widest layer's record (the transient scratch's row).
+/// The bytes of `rows` shared transient rows, including every component's physical capacity.
 fn transientBytes(s: *const Stream, rows: u64) u64 {
-    var n: u64 = 0;
-    for (s.bank.layers[s.transient_layer].segments) |seg| n += seg.length;
-    return rows * n;
+    return rows * s.geometry.transient_row_bytes;
 }
 
 test "dsv41 stream: the transient release frees the whole scratch with nothing live or held, and the grow allocates decode's window 0" {
@@ -1981,11 +1991,11 @@ test "dsv41 stream: grow fill unfilled: no route reads a grown row before its re
     // grown slots are empty by the state machine, so a kernel can reach a row only after a load wrote its record.
     for (s.layers, 0..) |*ls, l| {
         const e = &ls.ext.?;
-        for (0..e.rows) |r| for (0..n_components) |c| @memset(e.row(@enumFromInt(c), @intCast(r)), 0xA5);
+        for (0..e.rows) |r| for (0..n_components) |c| @memset(e.row(@fromBackingInt(@intCast(c)), @intCast(r)), 0xA5);
         for (ls.meta[ls.base.rows..ls.policy.capacity]) |m| try testing.expect(m.state != .ready);
         _ = l;
     }
-    for (0..s.transient.rows) |r| for (0..n_components) |c| @memset(s.transient.row(@enumFromInt(c), @intCast(r)), 0xA5);
+    for (0..s.transient.rows) |r| for (0..n_components) |c| @memset(s.transient.row(@fromBackingInt(@intCast(c)), @intCast(r)), 0xA5);
     for (s.transient_meta) |m| try testing.expect(m.state != .ready);
     var rng = std.Random.DefaultPrng.init(4242);
     const rand = rng.random();
@@ -2363,4 +2373,103 @@ test "dsv41 stream: no decode plan runs beside held slots: the phase change refu
     try testing.expectEqual(@as(u8, 0), d.window);
     try expectServed(s, &sb, d, &.{ 4, 5, 1 });
     s.release(d);
+}
+
+test "dsv41 integer rates: mixed transient trace and nonzero slots survive release grow shrink regrow" {
+    try mixedLifecycle(.{ .n_experts = 32, .k = &.{ 2, 3, 4 } }, .{ .{ 2, 2, 2 }, .{ 3, 3, 3 }, .{ 4, 4, 4 } }, .{ 2112, 2880, 3648 });
+    try mixedLifecycle(.{ .n_experts = 32, .projection_k = &.{ .{ 4, 2, 2 }, .{ 2, 4, 4 }, .{ 3, 3, 3 } } }, .{ .{ 4, 2, 2 }, .{ 2, 4, 4 }, .{ 3, 3, 3 } }, .{ 2624, 3136, 2880 });
+}
+
+fn mixedLifecycle(synth: expert_bank.Synth, rates: [3][3]u32, costs: [3]u64) !void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image = try expert_bank.writeSynth(testing.allocator, &tmp, synth);
+    defer testing.allocator.free(image);
+    var root: [512]u8 = undefined;
+    var bank = try expert_bank.Bank.open(testing.allocator, testing.io, try expert_bank.tmpRoot(&tmp, &root), .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3, 4 }, .hidden = 64, .inter = 32, .n_experts = 32, .n_layers = 3 }, null);
+    defer bank.deinit();
+    const s = try Stream.init(testing.allocator, &bank, .{ .rows = &.{ 2, 2, 2 }, .max_route_ids = 12, .transient_rows = 24, .wide_depth = 2, .pool = test_pool, .transient_release = true });
+    defer s.deinit();
+    var src = StreamSource.init(s);
+    var g = @import("deepseek_v41_ops.zig").TraceOps.init(testing.allocator);
+    defer g.deinit();
+    for (0..3) |l| {
+        try expectMixedBindings(&src, &g, @intCast(l), rates[l]);
+        try expectMixedRead(s, &bank, image, @intCast(l), &.{ 1, 2, 3, 4, 5, 6 }, 0b101);
+    }
+    const row: u64 = 3648;
+    try testing.expectEqual(24 * row, s.promptTransientBytes());
+    try testing.expectEqual(24 * row, try s.releaseTransient());
+    try s.grow(&.{ 4, 5, 6 });
+    try testing.expectEqual(row * (12 + decode_staging_rows), transientBytes(s, s.transient.rows));
+    for (0..3) |l| {
+        try expectMixedBindings(&src, &g, @intCast(l), rates[l]);
+        try expectMixedRead(s, &bank, image, @intCast(l), &.{ 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 }, 0b111);
+    }
+    const grown_bytes = row * (12 + decode_staging_rows) + 2 * costs[0] + 3 * costs[1] + 4 * costs[2];
+    try testing.expectEqual(grown_bytes, try s.shrink(&.{ 2, 2, 2 }));
+    try testing.expectEqual(24 * row, try s.regrowTransient());
+    try testing.expectEqual(24 * row, s.promptTransientBytes());
+    try testing.expectEqual(@as(u32, 24), s.transient.rows);
+    for (0..3) |l| {
+        try expectMixedBindings(&src, &g, @intCast(l), rates[l]);
+        try expectMixedRead(s, &bank, image, @intCast(l), &.{ 20, 21, 22, 23, 24, 25 }, 0b101);
+    }
+}
+
+fn expectMixedBindings(src: *StreamSource, g: anytype, layer: u32, rates: [3]u32) !void {
+    for ([_]BankKind{ .base, .ext, .transient }) |kind| {
+        const b = (try src.bankArrays(g, layer, kind)) orelse continue;
+        for ([_]exl3_quant.ProjArrays(@TypeOf(g.*).T){ b.gate, b.up, b.down }, rates) |p, k| {
+            const physical: u64 = if (kind == .transient) 512 else 128 * k;
+            try testing.expectEqual(k, p.layout.k);
+            try testing.expectEqual(physical, p.layout.code_row_words);
+            try testing.expectEqual(@as(c_int, @intCast(physical / 8)), g.shapeOf(p.code).d[3]);
+        }
+    }
+}
+
+fn expectMixedRead(s: *Stream, bank: *const expert_bank.Bank, image: []const u8, layer: u32, ids: []const u16, expected_banks: u8) !void {
+    const r = try serve(s, layer, ids);
+    defer s.release(r);
+    var nonzero: u8 = 0;
+    for (ids, r.plan.slotsOf()) |e, slot| {
+        const ref = s.slotRef(layer, slot);
+        if (ref.row > 0) nonzero |= @as(u8, 1) << @as(u3, @intCast(@backingInt(ref.bank)));
+        const off = bank.recordOffset(layer, e);
+        for (bank.layers[layer].segments, 0..) |seg, c| {
+            const got = s.slotRow(layer, slot, @fromBackingInt(@intCast(c)))[0..@intCast(seg.length)];
+            try testing.expectEqualSlices(u8, image[off + seg.offset ..][0..@intCast(seg.length)], got);
+        }
+    }
+    try testing.expectEqual(expected_banks, nonzero);
+}
+
+test "dsv41 integer rates: K4 preread staging covers unaligned gate up and down spans" {
+    var sb = try SynthBank.open(8);
+    defer sb.close();
+    sb.bank.hidden = 5120;
+    sb.bank.inter = 2304;
+    const page = std.heap.pageSize();
+    for (sb.bank.layers, 0..) |*l, i| {
+        l.* = expert_bank.layerSegments(if (i == 0) 3 else 4, 5120, 2304).?;
+        l.base_offset = if (i == 0) 0 else page - expert_bank.record_alignment;
+    }
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 0, 0 }, .max_route_ids = 1, .transient_rows = 1, .lookahead = .{ .budget = 1, .preread = true } });
+    defer s.deinit();
+    const workers = (expert_io.Options{}).workers;
+    for (sb.bank.layers) |l| for (0..sb.bank.n_experts) |e| {
+        const start = l.base_offset + e * l.record_bytes;
+        const gu = l.segments[gu_components].offset;
+        for ([_][2]u64{ .{ start, gu }, .{ start + gu, l.logical_bytes - gu } }) |span| {
+            const bytes = std.mem.alignForward(u64, span[0] + span[1], page) - std.mem.alignBackward(u64, span[0], page);
+            try testing.expect(s.pool.staging.len / workers >= bytes);
+        }
+    };
+    try testing.expect(s.pool.staging.len > workers * (expert_io.Options{}).staging_bytes);
+    const baseline = workers * (expert_io.Options{}).staging_bytes + 2 * (std.mem.alignForward(u64, 13_315_584, page) + 2 * page);
+    const actual = s.pool.staging.len + s.pool.spec_staging.?.len;
+    const arm = @import("deepseek_v41_arm.zig");
+    const opts: arm.Options = .{ .model_dir = "", .baseline_bytes = null, .slot_memory = .host, .lookahead = .{ .budget = 1, .preread = true } };
+    try testing.expectEqual(actual - baseline, arm.poolGrowthBytes(&sb.bank, opts, &s.geometry, s.pool.staging.len));
 }

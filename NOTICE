@@ -49,6 +49,21 @@ exllamav3 v1.4.2 (codebook.cuh, exl3_dq.cuh, pack.cu, hadamard.cu,
 quantize.py); src/exl3_quant.zig and src/exl3_kernels.zig cite the lines they
 reproduce.
 
+The integer-rate direct kernels and real-projection reference tests follow
+the public decoder contract at ExLlamaV3 revision
+151539c77abc7ab7425d30da7a4e8e3c5c154e7b.
+
+--------------------------------------------------------------------------------
+Sushi / mlx-serve
+https://github.com/ddalcu/sushi
+Copyright (c) 2026 Theinruj Toranavikrai
+Copyright (c) 2026 David Dalcu
+Licensed under the MIT License.
+
+The numerical rate tests consume Sushi's independent public EXL3 reference
+fixtures from the host checkout; no model weights or quant-creation tools
+are included.
+
 --------------------------------------------------------------------------------
 DeepSeek-V4.1-Flash
 The DeepSeek-V4.1-Flash release's `inference/model.py` is the reference for the
