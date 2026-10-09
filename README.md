@@ -180,12 +180,30 @@ nonzero cache slots across growth/shrink/reuse, component-max bills, and actual 
 Build the standalone test binary with `test-build -Dtest-filter="dsv41 kernels ops gpu:"`, then run it with
 `DSV41_KERNELS_GPU=1`, `SUSHI_EXL3_K2_FIXTURE`, `SUSHI_EXL3_K3_FIXTURE` and `SUSHI_EXL3_K4_FIXTURE` pointing to
 the host's `lib/sushi/src/exl3/fixtures/exl3_k{2,3,4}_linear.safetensors`. Set `DSV41_PUBLIC_DOWN_FIXTURE` to a
-captured Pollard layer-0/expert-0 `w2` safetensors file containing trellis, suh, svh and mul1. Hold the GPU lock
+canonical Pollard layer-0/expert-0 `w2` fixture extracted as below. Hold the GPU lock
 for device checks. The tests exercise full-width prepared decode/verify, three banks, mixed projection rates,
 routed forms and carried BF16 prefill against independent public weights; report skips separately.
 
 The Pollard capture is the four unchanged `layers.0.ffn.experts.0.w2.{trellis,suh,svh,mul1}` tensors from
 `model-00003-of-00048.safetensors` at the revision linked above; it is a tensor extraction, not a requantization.
+Download that shard, then create the consumer test fixture with:
+
+```sh
+python3 scripts/extract_pollard_fixture.py /path/to/model-00003-of-00048.safetensors /path/to/pollard-down.safetensors
+DSV41_PUBLIC_DOWN_FIXTURE=/path/to/pollard-down.safetensors python3 scripts/test_extract_pollard_fixture.py
+```
+
+The helper reads only the source header and selected payloads. It writes trellis, suh, svh, mul1 in that order,
+with no metadata, compact JSON (`dtype`, `shape`, `data_offsets` key order), contiguous payloads, an 8-byte-aligned
+space-padded header and a little-endian u64 header length. Source JSON formatting, metadata and tensor order
+do not affect the result. The complete canonical fixture must match SHA256
+`53fa4386b151bd4b7adc58299b45a9abfeb46fd537121d174c09688e3c11fc9e` before writing; changed selected payloads
+are refused. The GPU gate retains this exact identity check. The extraction tests skip without their fixture
+environment variable; an explicitly missing or mismatched fixture fails.
+
+The real-bank weight regression checks logical tensor schemas, counts and reference payload hashes, not shard
+count, shard names or byte offsets, so a lossless change of container layout does not invalidate its evidence.
+
 For the manifest's compile and numerical probes, build with `-Dtest-filter="dsv41 pre-ship gate:"` and run the
 standalone binary with `DSV41_SELFCHECK_DEVICE=1`. This includes the integer-rate kernels, not just K3 construction.
 
