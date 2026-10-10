@@ -597,6 +597,10 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             try predictSeed(g, a, c, lw, h, rows, &seed);
             try ex.readAheadSeed(lw.bank_layer.?, seed.items);
         }
+        // A wide prompt call's misses read before its attention (`Experts.stageMisses`): at 8 rows per expert it routes
+        // nearly every expert.
+        if (prompt and wide and lw.bank_layer != null and rows * c.n_experts_per_tok >= 8 * c.n_routed_experts) try ex.stageMisses(lw.bank_layer.?);
+        errdefer ex.dropStaged();
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{}, .seed);
         const x = try rmsNorm(g, h, lw.input_norm, c.rms_norm_eps);
         const h1 = try g.add(h, try attention(g, c, lw, l, x, start, rows, cache, &carry, rt.dsa));
