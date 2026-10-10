@@ -6,7 +6,6 @@ pub const Bucket = @import("../../sdk_ext.zig").profile.PrefillBucket;
 pub const Stamp = if (enabled) u64 else void;
 const n = @typeInfo(Bucket).@"enum".field_names.len;
 var ns: [n]u64 = @splat(0);
-var records: u64 = 0;
 var calls: u64 = 0;
 pub inline fn now() Stamp {
     if (comptime !enabled) return {};
@@ -17,20 +16,13 @@ pub inline fn now() Stamp {
 pub inline fn charge(bucket: Bucket, start: Stamp) void {
     if (comptime enabled) ns[@backingInt(bucket)] += now() - start;
 }
-pub inline fn read(count: usize) void {
-    if (comptime enabled) records += count;
-}
 pub inline fn call() void {
     if (comptime enabled) calls += 1;
 }
 pub fn reset() void {
     if (comptime !enabled) return;
     ns = @splat(0);
-    records = 0;
     calls = 0;
-}
-pub fn report(phase: []const u8, record_bytes: u64) void {
-    reportReadBytes(phase, record_bytes, records * record_bytes);
 }
 /// SDK counters are cumulative; the caller supplies a settled phase delta.
 pub fn reportReadBytes(phase: []const u8, record_bytes: u64, read_bytes: u64) void {

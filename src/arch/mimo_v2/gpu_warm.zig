@@ -43,8 +43,6 @@ pub fn parseRoute(s: []const u8) Route {
 /// simdgroup slot of one core beside the model's kernels.
 pub const route_groups: u32 = 1;
 pub const threads: u32 = 32;
-/// The bench's diagnostic form (`gpu_warm_bench.zig`): 64 threadgroups (every core busy), never routed.
-pub const wide_groups: u32 = 64;
 /// A chunk's target GPU length. After the event, at most the chunks in flight run on (two: <= ~1 ms of one simdgroup).
 /// The profile timeline records every committed buffer (`dsv41_verify_timeline.max_buffers` = 262,144 per request): a
 /// 1,024-token cell's ~116,700 model buffers (cells/k2-20261009) plus ~38 gated layers x ~2.4 ms / 0.5 ms x 270 rounds
@@ -70,7 +68,6 @@ const c = if (builtin.os.tag == .macos) struct {
     extern fn mimo_warm_commit(h: ?*anyopaque, iters: u32, cb: *?*anyopaque) c_int;
     extern fn mimo_warm_retire(cb: ?*anyopaque, gpu_start: *f64, gpu_end: *f64) c_int;
     extern fn mimo_warm_event_value(event: u64) u64;
-    extern fn mimo_warm_event_signal(event: u64, value: u64) void;
     extern fn mimo_warm_now_ns() u64;
     extern fn mimo_warm_last_error() [*:0]const u8;
 } else struct {
@@ -87,7 +84,6 @@ const c = if (builtin.os.tag == .macos) struct {
     fn mimo_warm_event_value(_: u64) u64 {
         return 0;
     }
-    fn mimo_warm_event_signal(_: u64, _: u64) void {}
     fn mimo_warm_now_ns() u64 {
         return 0;
     }
@@ -147,11 +143,6 @@ pub const Metal = struct {
         return std.mem.span(c.mimo_warm_last_error());
     }
 };
-
-/// The bench's stand-in for the read pool: hands the stream's event `value` from the host.
-pub fn signalEvent(event_object: u64, value: u64) void {
-    c.mimo_warm_event_signal(event_object, value);
-}
 
 /// The warm engine's counters (process-wide; the profile prints a request's difference). Written by the warm thread
 /// (episodes, chunks, retired, stuck, GPU time, the current iterations) and nowhere else: the decode lane's arm adds no

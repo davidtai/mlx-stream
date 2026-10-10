@@ -69,7 +69,6 @@ pub const Fixture = struct {
             .digests = &.{},
             .source_repository = "synthetic",
             .source_revision = "0000000000000000000000000000000000000000",
-            .sidecar_digest = @splat(0),
             .sidecar_fd = f.fd.fd,
             .sidecar_file_size = f.fd.size,
         };

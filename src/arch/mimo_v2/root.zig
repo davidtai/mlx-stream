@@ -57,10 +57,6 @@ pub fn applySettings(c: *Config, raw: std.json.Value) void {
     c.applySettings(raw);
 }
 
-pub fn autoContext(c: *const Config) u64 {
-    return @min(c.mimo.max_position_embeddings, settings.fill_reserve_tokens);
-}
-
 pub fn applyLoadFacts(c: *Config, facts: *const sdk.LoadFacts) !void {
     const built = c.withFacts(facts);
     try built.validate();
@@ -175,7 +171,6 @@ test "mimo SDK2 prepared parse and load facts expose the same installed shell" {
     try std.testing.expectEqualStrings("/fixture", c.expert_bank_dir.?);
     try std.testing.expectEqual(@as(u32, 48), shell(c).num_layers);
     try std.testing.expectEqual(@as(?u8, 0), shell(c).kv_quant_bits);
-    try std.testing.expectEqual(@as(u64, 17_408), autoContext(c));
     try std.testing.expectEqual(bills.requestBytesBF16(c.mimo, 33), promptBytes(c, 1, 32));
     const facts: sdk.LoadFacts = .{ .memory_baseline_bytes = 10_000_000_000, .wired_margin_bytes = 2_000_000_000, .effective_context = 32_768, .kv_quant_bits = 8 };
     try applyLoadFacts(c, &facts);

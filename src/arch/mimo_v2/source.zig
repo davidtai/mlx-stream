@@ -18,7 +18,6 @@ const moe = @import("moe.zig");
 const prefill_combine = @import("prefill_combine.zig");
 const gpu_warm = @import("gpu_warm.zig");
 
-pub const family = "mlx-stream";
 pub const top_k: u32 = 8;
 pub const max_forward_tokens: u32 = mimo.prefill_max_tokens;
 pub const max_route_ids: u32 = policy.max_route_ids;
@@ -68,9 +67,6 @@ const Q = quant.GatherQmm;
 const Proj = Q.Arrays(mlx.mlx_array);
 const Arrays = quant.BankArrays(Proj);
 const params: Q.Params = .{ .mode = .mxfp4, .bits = 4, .group_size = 32 };
-/// The prompt pass's routed combine, fixed at construction (`Combine.join` is
-/// the control tier); the workspace bill follows it.
-pub const combine_route: prefill_math.Combine = .joinless;
 comptime {
     if (prefill_math.top_k != top_k) @compileError("mimo_v2: the combine's routes per token differ from the source's");
 }
@@ -228,8 +224,6 @@ pub fn validateGatesFor(g: anytype, geometry: bank_mod.Geometry, gates: []const 
     }
 }
 
-/// Conservative explicit array payloads and host metadata for the installed
-/// combine route (`workspaceBytesFor`).
 /// `prefill_predict_evals: one`: the predictor's router tiles evaluated in one eval hold
 /// every tile's workspace at once: the tiles past the first (which `memoryBillForTokens` charges), each at the full
 /// `predict_rows` tile's rate (geometric: no tile is credited for being shorter).
@@ -240,16 +234,10 @@ pub fn predictorOneEvalExtraBytes(g: bank_mod.Geometry, tokens: u32) u64 {
     return (tiles - 1) * @as(u64, predict_rows) * (6 * @as(u64, g.hidden_size) + 20 * n + 16 * top_k + 8);
 }
 
+/// Conservative explicit array payloads and host metadata of the joinless combine: the kept tile outputs, at most one
+/// merge concatenate of them (`mergeJoinless`), the int32 (source, row) table, and one gather tile's pieces, their
+/// concatenate and the gathered rows.
 pub fn workspaceBytes(g: bank_mod.Geometry, tokens: u32) u64 {
-    return workspaceBytesFor(g, tokens, combine_route);
-}
-
-/// Control: four BF16 routed banks cover per-group packing/join and the shared
-/// scheduler's full-call concatenate/inversion without requiring an extra
-/// scheduler release hook. +join: the kept tile outputs, at most one merge
-/// concatenate of them (`mergeJoinless`), the int32 (source, row) table, and
-/// one gather tile's pieces, their concatenate and the gathered rows.
-pub fn workspaceBytesFor(g: bank_mod.Geometry, tokens: u32, combine: prefill_math.Combine) u64 {
     const nr = @as(u64, tokens) * top_k;
     const max_nr = @as(u64, max_forward_tokens) * top_k;
     const H: u64 = g.hidden_size;
@@ -260,10 +248,7 @@ pub fn workspaceBytesFor(g: bank_mod.Geometry, tokens: u32, combine: prefill_mat
         (@as(u64, g.first_moe_layer) + g.num_moe_layers) * @sizeOf(@typeInfo(@FieldType(Experts, "banks")).pointer.child) +
         ((max_nr + prefill_math.tile_rows - 1) / prefill_math.tile_rows + max_route_ids) * @sizeOf(mlx.mlx_array) +
         @sizeOf(Source) + (1 << 20) + hitpassLutBytes(g);
-    const routed = switch (combine) {
-        .join => nr * (8 * H + 16),
-        .joinless => nr * (4 * H + 8) + 3 * @as(u64, @min(tokens, prefill_math.combine_tokens)) * top_k * 2 * H,
-    };
+    const routed = nr * (4 * H + 8) + 3 * @as(u64, @min(tokens, prefill_math.combine_tokens)) * top_k * 2 * H;
     const input_output = @as(u64, tokens) * (6 * H + top_k * 8);
     // Native BF16 gate/up/activation/down and simultaneous F32 SiLU nodes.
     const matrix_tile = @min(nr, prefill_math.projection_rows) * (20 * H + 24 * I + 32);
@@ -721,7 +706,7 @@ pub const Source = struct {
     /// (`decodeLane`: logical M = 1, or M <= 4 in the decode phase: the MTP
     /// verify) and the wide matrix lane for every other call (the prompt's
     /// M >= 2), each token's rows read in original top-8 order for the F32
-    /// weighted sum and BF16 rounding (`combine_route`).
+    /// weighted sum and BF16 rounding (the joinless combine).
     /// A decode-lane output is returned unevaluated: the caller must
     /// evaluate it, or an array derived from it (the next layer's ids), before
     /// its next `forward` with independent ids or a phase change, then `flush`.
@@ -730,8 +715,6 @@ pub const Source = struct {
         defer g.reset();
         const nt: u32 = @intCast(g.shapeOf(x).d[0]);
         profile.call();
-        const H: c_int = @intCast(self.bank.geometry.hidden_size);
-        const mark = g.mark();
         if (self.decodeLaneAt(nt)) {
             const routed = try self.ex.at(layer).routed(g, x, try g.astype(expert_ids, .int32));
             const encode_start = profile.now();
@@ -750,35 +733,18 @@ pub const Source = struct {
         // `max_route_ids` ids; no decode caller makes one: Module resumes the prompt phase for any forward wider than the
         // decode lane) is refused by name before it routes.
         if (self.narrow_window and self.sdk_stream.phase == .decode) return error.MimoDecodeWideCall;
-        switch (comptime combine_route) {
-            .join => {
-                const routed = try self.ex.at(layer).routed(g, x, try g.astype(expert_ids, .int32));
-                try self.after_wide(self, layer);
-                const join_start = profile.now();
-                try g.evalAll(&.{routed});
-                try mlx.check(mlx.mlx_synchronize(g.s));
-                try self.ex.flush();
-                profile.charge(.join, join_start);
-                const ordered = g.keep(routed);
-                defer g.release(ordered);
-                g.resetTo(mark);
-                return prefill_math.combineJoined(g, ordered, route_weights, nt, H, self.ex.math.drain.reduce);
-            },
-            .joinless => {
-                const hook = self.ex.at(layer);
-                const parts = try hook.routedParts(g, x, try g.astype(expert_ids, .int32));
-                defer hook.releaseParts(g);
-                try self.after_wide(self, layer);
-                if (comptime prefill_timeline.enabled) prefill_timeline.stage(.join);
-                const join_start = profile.now();
-                // The tiles are evaluated; this evaluates the merged source, if any.
-                try g.evalAll(parts.outs);
-                try mlx.check(mlx.mlx_synchronize(g.s));
-                try self.ex.flush();
-                profile.charge(.join, join_start);
-                return self.parts_combine(self, g, parts.outs, parts.loc, route_weights, nt);
-            },
-        }
+        const hook = self.ex.at(layer);
+        const parts = try hook.routedParts(g, x, try g.astype(expert_ids, .int32));
+        defer hook.releaseParts(g);
+        try self.after_wide(self, layer);
+        if (comptime prefill_timeline.enabled) prefill_timeline.stage(.join);
+        const join_start = profile.now();
+        // The tiles are evaluated; this evaluates the merged source, if any.
+        try g.evalAll(parts.outs);
+        try mlx.check(mlx.mlx_synchronize(g.s));
+        try self.ex.flush();
+        profile.charge(.join, join_start);
+        return self.parts_combine(self, g, parts.outs, parts.loc, route_weights, nt);
     }
 };
 
@@ -1254,7 +1220,6 @@ fn fixtureBank(a: std.mem.Allocator, path: [:0]const u8, geometry: bank_mod.Geom
         .digests = digests,
         .source_repository = repository,
         .source_revision = revision,
-        .sidecar_digest = @splat(0),
         .sidecar_fd = fd,
         .sidecar_file_size = geometry.total_bytes,
     };
@@ -1305,7 +1270,6 @@ test "mimo read-ahead: construction check on the first routed layer and 512 tick
         .digests = &.{},
         .source_repository = "synthetic",
         .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_digest = @splat(0),
         .sidecar_fd = fd.fd,
         .sidecar_file_size = fd.size,
     };

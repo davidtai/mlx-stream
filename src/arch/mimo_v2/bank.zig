@@ -169,12 +169,6 @@ pub const Geometry = struct {
         return (@as(u64, layer - g.first_moe_layer) * g.num_experts + expert) * g.record_bytes;
     }
 
-    pub fn lengths(g: *const Geometry) [n_components]u64 {
-        var out: [n_components]u64 = undefined;
-        for (&out, g.segments) |*n, s| n.* = s.length;
-        return out;
-    }
-
     pub fn requireMiMo(g: *const Geometry) !void {
         if (g.hidden_size != 4096 or g.intermediate_size != 2048 or g.num_experts != 256 or g.first_moe_layer != 1 or g.num_moe_layers != 47)
             return error.UnsupportedTopology;
@@ -204,7 +198,6 @@ pub const Bank = struct {
     digests: [][32]u8,
     source_repository: []const u8,
     source_revision: []const u8,
-    sidecar_digest: [32]u8,
     sidecar_fd: std.c.fd_t = -1,
     sidecar_file_size: u64 = 0,
 
@@ -245,7 +238,8 @@ pub const Bank = struct {
         const size = out.object.get("size") orelse return error.InvalidOutputFile;
         const digest = out.object.get("sha256") orelse return error.InvalidOutputFile;
         if (size != .integer or size.integer < 0 or size.integer != g.total_bytes or digest != .string) return error.InvalidOutputFile;
-        const bank_digest = try parseDigest(digest.string);
+        // The bank's digest is validated here (the reader re-hashes nothing per call).
+        _ = try parseDigest(digest.string);
         const repository = try a.dupe(u8, m.source.repository);
         errdefer a.free(repository);
         const revision = try a.dupe(u8, m.source.revision);
@@ -255,7 +249,6 @@ pub const Bank = struct {
             .digests = digests,
             .source_repository = repository,
             .source_revision = revision,
-            .sidecar_digest = bank_digest,
         };
     }
 

@@ -52,26 +52,16 @@ const scale_cols: u32 = mimo.fp8_scale_cols;
 pub const texts = struct {
     pub const manifest = @embedFile("kernels/manifest-fp8res.json");
     pub const header = @embedFile("kernels/header_fp8res.metal");
-    pub const header_nax = @embedFile("kernels/header_fp8res_nax.metal");
     pub const gemv = @embedFile("kernels/mimo_fp8_gemv.metal");
-    pub const gemm = @embedFile("kernels/mimo_fp8_gemm_nax.metal");
-    /// The microbench's threadgroup-tile candidate (not installed; `fp8res_bench` measures it against `gemm`).
-    pub const gemm_tg = @embedFile("kernels/mimo_fp8_gemm_tg.metal");
     /// The installed prompt route's weight writer.
     pub const dequant = @embedFile("kernels/mimo_fp8_dequant_bf16.metal");
 };
-/// The GEMM's header: the +attn NAX tiles (MLX's steel NAX tiles; pinned by manifest-prefill-attn.json, unchanged)
-/// ++ the decoders ++ the NAX helpers.
-const gemm_header = prefill_attention.tiles_text ++ texts.header ++ texts.header_nax;
 /// sha256 of kernels/manifest-fp8res.json, which records every text's sha256 (checked against `text_pins` by a CPU test).
-pub const manifest_sha256 = "a41686d16bac4c6bbf0499e91597ebfd8b32d693b507a95fd387d9e5a94d7d99";
+pub const manifest_sha256 = "cca35a908631a91cacc6e34554b5fb3abb36180a35ae005b5f7206aaa6541e30";
 pub const text_pins = [_]struct { file: []const u8, text: []const u8, sha256: []const u8 }{
     .{ .file = "header_fp8res.metal", .text = texts.header, .sha256 = "3a6e4b978ebe35816d9e1474f9da300302a5ac46c1103a144fd91148c87e1d6d" },
-    .{ .file = "header_fp8res_nax.metal", .text = texts.header_nax, .sha256 = "2e11d63b89ed30c27219012ae9174fe18b4dceb7e7fc805963dba6946484562e" },
     .{ .file = "mimo_fp8_gemv.metal", .text = texts.gemv, .sha256 = "69c5f783f59aa9a347375ecd6ab327420ec7f4665b0ef07db29d7e6583dfa33b" },
-    .{ .file = "mimo_fp8_gemm_nax.metal", .text = texts.gemm, .sha256 = "e109166ff370baf300c43c39c47dc676fa0e12f941a3ccd04c02c505bc0e7778" },
     .{ .file = "mimo_fp8_dequant_bf16.metal", .text = texts.dequant, .sha256 = "6530ac20bf944f5c4153e62e467a1c89de104e52855f3dbba3a6d007ac06ffdb" },
-    .{ .file = "mimo_fp8_gemm_tg.metal", .text = texts.gemm_tg, .sha256 = "65f42907c618bb1287982ba0e6c7b703fb72eb4a972049f0ab90b7d692d9f9b1" },
 };
 
 fn hexOf(bytes: []const u8) [64]u8 {
@@ -83,7 +73,6 @@ fn hexOf(bytes: []const u8) [64]u8 {
 pub fn checkPins() !void {
     if (!std.mem.eql(u8, &hexOf(texts.manifest), manifest_sha256)) return error.MimoFp8ManifestNotPinned;
     for (text_pins) |p| if (!std.mem.eql(u8, &hexOf(p.text), p.sha256)) return error.MimoFp8TextNotPinned;
-    if (!std.mem.eql(u8, &hexOf(prefill_attention.tiles_text), prefill_attention.pins.tiles)) return error.MimoFp8TextNotPinned;
 }
 
 // ---- geometry (host arithmetic; CPU-tested at the real shapes) ----
@@ -154,28 +143,12 @@ pub fn gemvLaunch(p: Gemv, n: c_int) Launch {
     return .{ .grid = .{ 32, groups * p.rg * p.ks, 1 }, .tg = .{ 32, p.rg * p.ks, 1 } };
 }
 
-/// The prompt GEMM's tile: MLX's steel_gemm_fused_nax geometry for this device class ('s', the M5 Max: bm 64, bn 128,
-/// wm 2, wn 4, swizzle 2: what the BF16 tier's mlx_matmul runs at these shapes), SN = 32 output columns per simdgroup
-/// (one 64-row scale row). `relaxed`: the MMA's precision mode (false: the served contract).
-pub const Gemm = struct { bm: c_int = 64, bn: c_int = 128, wm: c_int = 2, wn: c_int = 4, swizzle: c_int = 2, relaxed: bool = false };
-pub const gemm: Gemm = .{};
-
-/// One threadgroup of 32 x WM x WN threads per (BM x BN) tile, MLX's swizzle: grid x = tiles_n << swizzle threadgroups,
-/// grid y = ceil(tiles_m / 2^swizzle); a threadgroup past the last tile exits whole.
-pub fn gemmLaunch(g: Gemm, m: c_int, n: c_int) Launch {
-    const tiles_n = @divExact(n, g.bn);
-    const tiles_m = @divTrunc(m + g.bm - 1, g.bm);
-    const threads = 32 * g.wm * g.wn;
-    const per = @as(c_int, 1) << @intCast(g.swizzle);
-    return .{ .grid = .{ (tiles_n << @intCast(g.swizzle)) * threads, @divTrunc(tiles_m + per - 1, per), 1 }, .tg = .{ threads, 1, 1 } };
-}
 
 // ---- kernels and the bound route ----
 
 /// The kernel objects, one set per module; every FP8 projection's route borrows them (heap-owned: stable address).
 pub const Kernels = struct {
     gemv: Kernel = .{ .ctx = null },
-    gemm: Kernel = .{ .ctx = null },
     dequant: Kernel = .{ .ctx = null },
     /// The prompt route's BF16 weights (owned by `install`; null in host fixtures, which never run a prompt row).
     prompt: ?*PromptCache = null,
@@ -192,13 +165,12 @@ pub const Kernels = struct {
         var k: Kernels = .{};
         errdefer k.deinit();
         k.gemv = try makeKernel("mimo_fp8_gemv", texts.gemv, texts.header);
-        k.gemm = try makeKernel("mimo_fp8_gemm_nax", texts.gemm, gemm_header);
         k.dequant = try makeKernelIo("mimo_fp8_dequant_bf16", &.{ "w", "scales" }, &.{"wb"}, texts.dequant, texts.header);
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
-        for ([_]Kernel{ k.gemv, k.gemm, k.dequant }) |x| if (x.ctx != null) {
+        for ([_]Kernel{ k.gemv, k.dequant }) |x| if (x.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_free(x);
         };
         if (k.prompt) |c| c.release();
@@ -395,7 +367,6 @@ pub const Bound = struct {
 /// Construction: an [n, k] FP8 projection's route, refused when the texts do not cover the shape.
 pub fn bind(kernels: *const Kernels, n: u32, k: u32) !Bound {
     const plan = gemvPlan(n, k) orelse return error.MimoFp8Geometry;
-    if (n % @as(u32, @intCast(gemm.bn)) != 0) return error.MimoFp8Geometry;
     var b: Bound = .{ .kernels = kernels, .n = @intCast(n), .k = @intCast(k), .plan = plan };
     for (&b.plans, 0..) |*p, m| p.* = gemvPlanAt(kernels.gemv_route, plan, n, k, @intCast(m));
     return b;
@@ -418,24 +389,6 @@ pub fn gemvRun(kernels: *const Kernels, p: Gemv, n: c_int, kdim: c_int, x: Array
     for ([_]struct { [*:0]const u8, c_int }{ .{ "M", m }, .{ "N", n }, .{ "K", kdim }, .{ "R", p.r }, .{ "KS", p.ks }, .{ "RG", p.rg } }) |t|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t[0], t[1]));
     return apply(kernels.gemv, c, x, w, scales, s);
-}
-
-pub fn gemmRun(kernels: *const Kernels, g: Gemm, n: c_int, kdim: c_int, x: Array, w: Array, scales: Array, m: c_int, s: Stream) !Array {
-    return gemmApply(kernels.gemm, g, n, kdim, x, w, scales, m, s);
-}
-
-/// Either GEMM text (the installed `mimo_fp8_gemm_nax` or the bench's `mimo_fp8_gemm_tg`: same inputs, templates, grid).
-fn gemmApply(kernel: Kernel, g: Gemm, n: c_int, kdim: c_int, x: Array, w: Array, scales: Array, m: c_int, s: Stream) !Array {
-    const l = gemmLaunch(g, m, n);
-    const c = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ m, n }, 2, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, l.grid[0], l.grid[1], l.grid[2]));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, l.tg[0], l.tg[1], l.tg[2]));
-    for ([_]struct { [*:0]const u8, c_int }{ .{ "N", n }, .{ "K", kdim }, .{ "BM", g.bm }, .{ "BN", g.bn }, .{ "WM", g.wm }, .{ "WN", g.wn }, .{ "SWZ", g.swizzle } }) |t|
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t[0], t[1]));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(c, "RELAXED", g.relaxed));
-    return apply(kernel, c, x, w, scales, s);
 }
 
 fn apply(kernel: Kernel, c: mlx.mlx_fast_metal_kernel_config, x: Array, w: Array, scales: Array, s: Stream) !Array {
@@ -696,9 +649,7 @@ test "mimo fp8res CPU: the manifest and every text match their pins" {
         };
     }
     try testing.expectEqual(text_pins.len, seen);
-    try testing.expectEqual(@as(usize, 4), m.value.kernels.len);
-    // The GEMM header reuses the +attn tiles text as pinned there.
-    try testing.expect(std.mem.indexOf(u8, texts.manifest, prefill_attention.pins.tiles) != null);
+    try testing.expectEqual(@as(usize, 2), m.value.kernels.len);
 }
 
 test "mimo fp8res CPU: e4m3 decode: the kernels' half trick is the OCP value / 256 for all 254 codes; code x scale == decode x (scale x 256)" {
@@ -758,31 +709,6 @@ test "mimo fp8res CPU: GEMV plans at the real shapes: every site covered, K part
     try testing.expect(gemvPlan(12288, 4000) == null);
     try testing.expect(gemvPlan(12290, 4096) == null);
     try testing.expect(gemvPlan(96, 4096) == null);
-}
-
-test "mimo fp8res CPU: GEMM launch at 9 .. 16,384 rows: every row tile once, swizzled, whole threadgroups exit past the tail" {
-    for (sites) |site| {
-        if (@rem(@as(c_int, @intCast(site.n)), gemm.bn) != 0) return error.TestUnexpectedResult;
-        for ([_]c_int{ 9, 64, 511, 512, 523, 4133, 16_384 }) |m| {
-            const l = gemmLaunch(gemm, m, @intCast(site.n));
-            try testing.expectEqual([3]c_int{ 256, 1, 1 }, l.tg);
-            const tiles_n = @divExact(@as(c_int, @intCast(site.n)), gemm.bn);
-            const tiles_m = @divTrunc(m + gemm.bm - 1, gemm.bm);
-            // Map every threadgroup through the text's swizzle; count each (tile_m, tile_n) it covers.
-            const gx = @divExact(l.grid[0], l.tg[0]);
-            var covered: usize = 0;
-            var y: c_int = 0;
-            while (y < l.grid[1]) : (y += 1) {
-                var x: c_int = 0;
-                while (x < gx) : (x += 1) {
-                    const tid_y = (y << @intCast(gemm.swizzle)) + (x & ((@as(c_int, 1) << @intCast(gemm.swizzle)) - 1));
-                    const tid_x = x >> @intCast(gemm.swizzle);
-                    if (tid_x < tiles_n and tid_y < tiles_m) covered += 1;
-                }
-            }
-            try testing.expectEqual(@as(usize, @intCast(tiles_n * tiles_m)), covered);
-        }
-    }
 }
 
 test "mimo fp8res CPU: host GEMV (kernel order) and host block GEMM vs the exact f64 reference on real-shaped fixtures; M-invariant rows" {
@@ -1098,7 +1024,8 @@ test "mimo fp8res route: the flag installs the route on any device; the standard
     const f = try bind(&k, 12288, 4096);
     for (f.plans[1..]) |p| try testing.expectEqual(f.plan, p);
     try testing.expectError(error.MimoFp8Geometry, bind(&k, 12288, 4000));
-    try testing.expectError(error.MimoFp8Geometry, bind(&k, 64, 4096));
+    // The rows must fill whole 64-row scale blocks (the GEMV and the prompt route's dequant read them whole).
+    try testing.expectError(error.MimoFp8Geometry, bind(&k, 96, 4096));
 }
 
 // ---- the real packs (opt-in, CPU, no MLX): MIMO_FP8RES_PACK=<fp8res pack> MIMO_BF16_PACK=<bf16res pack> ----
@@ -1270,7 +1197,7 @@ pub fn gemvSelfcheckBound() u64 {
 }
 
 pub const GemmCase = struct { site: usize, rows: []const c_int };
-/// The prompt GEMM's cases: q / o-width calls over the whole prompt and the full layers' K/V spans to 16,384 rows, the
+/// The prompt route check's GEMM cases: q / o-width calls over the whole prompt and the full layers' K/V spans to 16,384 rows, the
 /// sliding spans and dense-MLP chunks at 512 rows, the tails (9, 523, 4,133).
 pub const gemm_cases = [_]GemmCase{
     .{ .site = 0, .rows = &.{ 16_384, 4133, 512 } },
@@ -1282,7 +1209,7 @@ pub const gemm_cases = [_]GemmCase{
     .{ .site = 6, .rows = &.{ 2048, 512 } },
 };
 
-/// The GEMM check's peak: per site its widest call's x and both outputs (fp8 and the BF16 path) live with every smaller
+/// The prompt route check's peak (`gemmSelfcheckBound`): per site its widest call's x and both outputs live with every smaller
 /// call's output, the codes, scales and the BF16 path's weight (device + host staging), host x and the f64 rows.
 pub fn gemmSelfcheckBound() u64 {
     var worst: u64 = 0;
@@ -1462,132 +1389,6 @@ test "mimo fp8res GPU check: decode GEMV at M = 1..8 on every real site: bit-equ
     if (peak > bound) return error.MimoFp8SelfcheckPeak;
 }
 
-test "mimo fp8res GPU check: the staged fp8 NAX GEMM at 9 .. 16,384 rows on every real site: one row per 64-row tile within the f32 bound of the exact reference, every element inside the BF16 path's rounding band, rows independent of M" {
-    try gpuGate("MIMO_FP8RES_GPU");
-    const a = testing.allocator;
-    const bound = gemmSelfcheckBound();
-    std.debug.print("MIMO_FP8RES_GEMM static: bound={d} ceiling={d}\n", .{ bound, selfcheck_ceiling_bytes });
-    if (bound > selfcheck_ceiling_bytes) return error.MimoFp8SelfcheckAdmission;
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    if (!prefill_attention.deviceHasNax(s)) return error.MimoNaxDeviceRequired;
-    var old_limit: usize = 0;
-    try mlx.check(mlx.mlx_set_memory_limit(&old_limit, selfcheck_ceiling_bytes));
-    defer {
-        var ignored: usize = 0;
-        _ = mlx.mlx_set_memory_limit(&ignored, old_limit);
-    }
-    try mlx.check(mlx.mlx_reset_peak_memory());
-    var kernels = try Kernels.init();
-    defer kernels.deinit();
-    var failed: usize = 0;
-    for (gemm_cases, 0..) |gc, ci| {
-        const site = sites[gc.site];
-        const n: usize = site.n;
-        const big: u32 = @intCast(gc.rows[0]);
-        const f = try Fixture.init(a, site.n, site.k, big, 0xf8e5_9e00 + ci);
-        defer f.deinit(a);
-        const b = try bind(&kernels, site.n, site.k);
-        const dev = try DeviceSite.init(a, f, site.n, site.k, big);
-        defer dev.deinit();
-        // ||w_n|| (f64) for the BF16 band.
-        const wnorm = try a.alloc(f64, n);
-        defer a.free(wnorm);
-        {
-            const w32 = try a.alloc(f32, site.k);
-            defer a.free(w32);
-            for (0..n) |ni| {
-                weightRow(f.codes[ni * site.k ..][0..site.k], f.srow(ni, site.k), w32);
-                var acc: f64 = 0;
-                for (w32) |v| acc += @as(f64, v) * v;
-                wnorm[ni] = @sqrt(acc);
-            }
-        }
-        var y_big: Array = .{};
-        defer drop(y_big);
-        for (gc.rows) |rows| {
-            const xm = try rowsOf(dev.x, rows, s);
-            defer drop(xm);
-            const y = try gemmRun(&kernels, gemm, b.n, b.k, xm, dev.w, dev.sc, rows, s);
-            defer drop(y);
-            const yd = try hostBf16(y);
-            const mrows: usize = @intCast(rows);
-            // One row per 64-row tile (offset varied per tile), and every row of a partial last tile.
-            var picked: std.ArrayList(usize) = .empty;
-            defer picked.deinit(a);
-            var tile: usize = 0;
-            while (tile * 64 < mrows) : (tile += 1) {
-                const first = tile * 64;
-                if ((tile + 1) * 64 > mrows) {
-                    for (first..mrows) |r| try picked.append(a, r);
-                } else try picked.append(a, first + (tile * 29) % 64);
-            }
-            const sampled = picked.items.len;
-            var exact: Hist = .{};
-            var tol_fail: usize = 0;
-            {
-                const x64 = try a.alloc(f64, sampled * site.k);
-                defer a.free(x64);
-                for (picked.items, 0..) |r, j| for (x64[j * site.k ..][0..site.k], f.x[r * site.k ..][0..site.k]) |*d, xb| {
-                    d.* = bf16ToF32(xb);
-                };
-                const w32 = try a.alloc(f32, site.k);
-                defer a.free(w32);
-                const w64 = try a.alloc(f64, site.k);
-                defer a.free(w64);
-                for (0..n) |ni| {
-                    weightRow(f.codes[ni * site.k ..][0..site.k], f.srow(ni, site.k), w32);
-                    for (w64, w32) |*d, v| d.* = v;
-                    for (picked.items, 0..) |r, j| {
-                        const ref = refDotF64(x64[j * site.k ..][0..site.k], w64);
-                        const got = yd[r * n + ni];
-                        exact.add(ulps(got, f64ToBf16(ref.sum)));
-                        tol_fail += @intFromBool(!withinTolerance(got, ref.sum, ref.abs, site.k));
-                    }
-                }
-            }
-            // Row independence: a smaller call's rows equal the widest call's rows bit for bit.
-            var prefix_diff: usize = 0;
-            if (y_big.ctx == null) {
-                try mlx.check(mlx.mlx_array_set(&y_big, y));
-            } else {
-                const bd = try hostBf16(y_big);
-                for (0..mrows * n) |i| prefix_diff += @intFromBool(yd[i] != bd[i]);
-            }
-            // The BF16 path, every element: |fp8 - bf16| <= (2^-9 + 2K x 2^-24) ||x_m|| ||w_n|| + 2^-8 (|fp8| + |bf16|).
-            var vs_bf16: Hist = .{};
-            var band_fail: usize = 0;
-            {
-                const yb = try bf16Path(xm, dev.wb, s);
-                defer drop(yb);
-                const bd = try hostBf16(yb);
-                const rel = std.math.pow(f64, 2, -9) + @as(f64, @floatFromInt(2 * site.k)) * std.math.pow(f64, 2, -24);
-                for (0..mrows) |mi| {
-                    var xn: f64 = 0;
-                    for (f.x[mi * site.k ..][0..site.k]) |xb| xn += @as(f64, bf16ToF32(xb)) * bf16ToF32(xb);
-                    xn = @sqrt(xn);
-                    for (0..n) |ni| {
-                        const p = yd[mi * n + ni];
-                        const q = bd[mi * n + ni];
-                        vs_bf16.add(ulps(p, q));
-                        const fp: f64 = bf16ToF32(p);
-                        const fq: f64 = bf16ToF32(q);
-                        band_fail += @intFromBool(@abs(fp - fq) > rel * xn * wnorm[ni] + std.math.pow(f64, 2, -8) * (@abs(fp) + @abs(fq)));
-                    }
-                }
-            }
-            std.debug.print("MIMO_FP8RES_GEMM site={s} N={d} K={d} M={d} tiles={d} sampled_rows={d} vs_exact max_ulp={d} hist={any} tolerance_fail={d} rows_equal_widest_call={} prefix_diff={d} vs_bf16_path max_ulp={d} hist={any} band_fail={d}\n", .{ site.label, site.n, site.k, rows, tile, sampled, exact.max, exact.b, tol_fail, prefix_diff == 0, prefix_diff, vs_bf16.max, vs_bf16.b, band_fail });
-            failed += tol_fail + prefix_diff + band_fail;
-        }
-    }
-    try mlx.check(mlx.mlx_synchronize(s));
-    var peak: usize = 0;
-    try mlx.check(mlx.mlx_get_peak_memory(&peak));
-    std.debug.print("MIMO_FP8RES_GEMM peak: mlx={d} bound={d} failed={d}\n", .{ peak, bound, failed });
-    try testing.expectEqual(@as(usize, 0), failed);
-    if (peak > bound) return error.MimoFp8SelfcheckPeak;
-}
-
 test "mimo fp8res GPU check: prompt route: the dequantized weight is the host bf16(code x scale) bit for bit and the prompt GEMM is the BF16 tier's stock matmul bit for bit (9 / 512 / 4,133 rows); the LRU keeps a layer's set" {
     try gpuGate("MIMO_FP8RES_GPU");
     const a = testing.allocator;
@@ -1654,214 +1455,8 @@ fn stamp() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-fn timeCalls(comptime f: anytype, args: anytype, iters: usize) !f64 {
-    var samples: [32]f64 = undefined;
-    for (0..3) |_| {
-        const y = try @call(.auto, f, args);
-        defer drop(y);
-        try mlx.check(mlx.mlx_array_eval(y));
-    }
-    for (samples[0..iters]) |*t| {
-        const t0 = stamp();
-        const y = try @call(.auto, f, args);
-        defer drop(y);
-        try mlx.check(mlx.mlx_array_eval(y));
-        t.* = @floatFromInt(stamp() - t0);
-    }
-    std.mem.sort(f64, samples[0..iters], {}, std.sort.asc(f64));
-    return samples[iters / 2] / 1000;
-}
-
-/// The microbench's GEMM geometries (every one compile-checked offline: fp8res-20261009/tools/metal_compile_check.py).
-pub const bench_gemms = [_]Gemm{
-    gemm,
-    .{ .relaxed = true },
-    .{ .bm = 32, .bn = 128, .wm = 1, .wn = 4 },
-    .{ .bm = 128, .bn = 128, .wm = 4, .wn = 4 },
-    .{ .bm = 64, .bn = 256, .wm = 2, .wn = 8 },
-    .{ .bm = 64, .bn = 128, .wm = 2, .wn = 4, .swizzle = 0 },
-};
-
-/// The threadgroup-tile candidate's geometries: MLX's fp_qmm_t default (64 x 64, 2 x 2) and two wider tiles.
-pub const bench_tg_gemms = [_]Gemm{
-    .{ .bm = 64, .bn = 64, .wm = 2, .wn = 2 },
-    .{ .bm = 64, .bn = 128, .wm = 2, .wn = 4 },
-    .{ .bm = 128, .bn = 64, .wm = 4, .wn = 2 },
-};
-
-/// The installed prompt route with the layer's weight already cached (every tile / span after the first).
-fn promptCachedCall(k: *const Kernels, n: c_int, kdim: c_int, x: Array, w: Array, sc: Array, s: Stream) !Array {
-    return promptRun(k, n, kdim, x, w, sc, s);
-}
-
 /// The installed prompt route paying its dequant (the first tile / span of a layer).
 fn promptColdCall(k: *const Kernels, n: c_int, kdim: c_int, x: Array, w: Array, sc: Array, s: Stream) !Array {
     k.prompt.?.release();
     return promptRun(k, n, kdim, x, w, sc, s);
-}
-
-/// Microseconds per call over 32 independent calls evaluated together (after 3 warm calls).
-fn timeBatched(comptime f: anytype, args: anytype) !f64 {
-    return timeBatchedN(f, args, 32);
-}
-
-/// Microseconds per call over `calls` (<= 32) independent calls evaluated together (after 3 warm calls).
-fn timeBatchedN(comptime f: anytype, args: anytype, calls: usize) !f64 {
-    for (0..3) |_| {
-        const y = try @call(.auto, f, args);
-        defer drop(y);
-        try mlx.check(mlx.mlx_array_eval(y));
-    }
-    var ys: [32]Array = @splat(.{});
-    defer for (ys) |y| drop(y);
-    const t0 = stamp();
-    for (ys[0..calls]) |*y| y.* = try @call(.auto, f, args);
-    const vec = mlx.mlx_vector_array_new_data(&ys, calls);
-    defer _ = mlx.mlx_vector_array_free(vec);
-    try mlx.check(mlx.mlx_eval(vec));
-    return @as(f64, @floatFromInt(stamp() - t0)) / 1000 / @as(f64, @floatFromInt(calls));
-}
-
-fn bf16PathCall(x: Array, wb: Array, s: Stream) !Array {
-    return bf16Path(x, wb, s);
-}
-
-test "mimo fp8res GPU bench: GEMV plans and the NAX GEMM vs the BF16 path at the real shapes (median us per call, eval each; staged microbench)" {
-    try gpuGate("MIMO_FP8RES_BENCH");
-    const a = testing.allocator;
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    if (!prefill_attention.deviceHasNax(s)) return error.MimoNaxDeviceRequired;
-    const bound = gemmSelfcheckBound();
-    var old_limit: usize = 0;
-    try mlx.check(mlx.mlx_set_memory_limit(&old_limit, selfcheck_ceiling_bytes));
-    defer {
-        var ignored: usize = 0;
-        _ = mlx.mlx_set_memory_limit(&ignored, old_limit);
-    }
-    std.debug.print("MIMO_FP8RES_BENCH static: bound={d} ceiling={d}\n", .{ bound, selfcheck_ceiling_bytes });
-    var kernels = try Kernels.init();
-    defer kernels.deinit();
-    const tg = try makeKernel("mimo_fp8_gemm_tg", texts.gemm_tg, gemm_header);
-    defer _ = mlx.mlx_fast_metal_kernel_free(tg);
-    var cache: PromptCache = .{};
-    defer cache.release();
-    kernels.prompt = &cache;
-    const iters = 21;
-    for (sites, 0..) |site, si| {
-        const big: u32 = if (site.n * site.k > 16384 * 4096 / 2) 4096 else 16_384;
-        const f = try Fixture.init(a, site.n, site.k, big, 0xbe7c_0000 + si);
-        defer f.deinit(a);
-        const dev = try DeviceSite.init(a, f, site.n, site.k, big);
-        defer dev.deinit();
-        const n: c_int = @intCast(site.n);
-        const k: c_int = @intCast(site.k);
-        const bytes: f64 = @floatFromInt(@as(u64, site.n) * site.k);
-        // Device time per call (32 independent calls, one eval): the eval-each rows below carry a ~150-200 us
-        // submission floor that hides the small k / v sites (fp8res1: 170-250 us for ~5 us of work). Every decode /
-        // verify width M = 1 .. 8, the installed plan and the R alternatives at the site's installed KS (R and RG do
-        // not change an output's accumulation order: KS fixed per site keeps every row M-invariant, so a per-(site, M)
-        // R is a legal construction-time choice if these rows ask for one).
-        {
-            const installed = gemvPlan(site.n, site.k).?;
-            var m: c_int = 1;
-            while (m <= gemv_max_rows) : (m += 1) {
-                const xm = try rowsOf(dev.x, m, s);
-                defer drop(xm);
-                const stock = try timeBatched(bf16PathCall, .{ xm, dev.wb, s });
-                const fp8 = try timeBatched(gemvRun, .{ &kernels, installed, n, k, xm, dev.w, dev.sc, m, s });
-                std.debug.print("MIMO_FP8RES_BENCH gemv_batched site={s} M={d} stock_us={d:.2} fp8_us={d:.2} vs_stock={d:.3} plan=R{d}/KS{d}/RG{d} (installed)\n", .{ site.label, m, stock, fp8, stock / fp8, installed.r, installed.ks, installed.rg });
-                for ([_]c_int{ 1, 2, 8 }) |r| {
-                    if (r == installed.r) continue;
-                    var rg: c_int = installed.rg;
-                    while (rg > 1 and @rem(n, r * rg) != 0) rg = @divExact(rg, 2);
-                    const p: Gemv = .{ .r = r, .ks = installed.ks, .rg = rg };
-                    if (r * m > 32) continue; // more than 32 accumulators per lane: spill territory (fp8res1: R8 already 1.5-2.5x the R4 rows at M = 4)
-                    const alt = try timeBatched(gemvRun, .{ &kernels, p, n, k, xm, dev.w, dev.sc, m, s });
-                    std.debug.print("MIMO_FP8RES_BENCH gemv_batched site={s} M={d} stock_us={d:.2} fp8_us={d:.2} vs_stock={d:.3} plan=R{d}/KS{d}/RG{d}\n", .{ site.label, m, stock, alt, stock / alt, p.r, p.ks, p.rg });
-                }
-            }
-        }
-        for ([_]c_int{ 1, 4 }) |m| {
-            const xm = try rowsOf(dev.x, m, s);
-            defer drop(xm);
-            const stock = try timeCalls(bf16PathCall, .{ xm, dev.wb, s }, iters);
-            std.debug.print("MIMO_FP8RES_BENCH gemv site={s} M={d} route=bf16_stock us={d:.1} GBps={d:.1}\n", .{ site.label, m, stock, 2 * bytes / stock / 1e3 });
-            const installed = gemvPlan(site.n, site.k).?;
-            for ([_]c_int{ 2, 4, 8 }) |r| for ([_]c_int{ 1, 2, 4, 8, 16 }) |ks| {
-                const rg: c_int = @max(1, @divTrunc(4, ks));
-                const p: Gemv = .{ .r = r, .ks = ks, .rg = rg };
-                if (@rem(k, ks * @as(c_int, gemv_step)) != 0 or @rem(n, r * rg) != 0 or rg * ks > 32) continue;
-                const us = try timeCalls(gemvRun, .{ &kernels, p, n, k, xm, dev.w, dev.sc, m, s }, iters);
-                std.debug.print("MIMO_FP8RES_BENCH gemv site={s} M={d} route=fp8 plan=R{d}/KS{d}/RG{d}{s} us={d:.1} GBps={d:.1} vs_stock={d:.3}\n", .{ site.label, m, r, ks, rg, if (std.meta.eql(p, installed)) " (installed)" else "", us, bytes / us / 1e3, stock / us });
-            };
-        }
-        // The installed prompt route per call (index: M = 512, 4096, 16384; NaN = not measured at this site).
-        var stock_at: [3]f64 = @splat(std.math.nan(f64));
-        var cached_at: [3]f64 = @splat(std.math.nan(f64));
-        var cold_at: [3]f64 = @splat(std.math.nan(f64));
-        for ([_]c_int{ 512, 4096, 16_384 }, 0..) |m, mi| {
-            if (m > @as(c_int, @intCast(big))) continue;
-            const xm = try rowsOf(dev.x, m, s);
-            defer drop(xm);
-            const flops: f64 = 2 * @as(f64, @floatFromInt(m)) * bytes;
-            const stock = try timeCalls(bf16PathCall, .{ xm, dev.wb, s }, iters);
-            stock_at[mi] = stock;
-            std.debug.print("MIMO_FP8RES_BENCH gemm site={s} M={d} route=bf16_stock us={d:.1} TFLOPs={d:.2}\n", .{ site.label, m, stock, flops / stock / 1e6 });
-            // The staged fp8 NAX GEMM (not installed): its default geometry (MLX's BF16 NAX tile on this device class) and its neighbours: B shared by fewer
-            // or more simdgroups (WM), wider N tiles, the relaxed MMA mode. SN stays 32 (one scale row per simdgroup).
-            for (bench_gemms) |g| {
-                if (@rem(n, g.bn) != 0) continue;
-                const us = try timeCalls(gemmRun, .{ &kernels, g, n, k, xm, dev.w, dev.sc, m, s }, iters);
-                std.debug.print("MIMO_FP8RES_BENCH gemm site={s} M={d} route=fp8 bm={d} bn={d} wm={d} wn={d} swizzle={d} relaxed={}{s} us={d:.1} TFLOPs={d:.2} vs_stock={d:.3}\n", .{ site.label, m, g.bm, g.bn, g.wm, g.wn, g.swizzle, g.relaxed, if (std.meta.eql(g, gemm)) " (staged default)" else "", us, flops / us / 1e6, stock / us });
-            }
-            // The installed prompt route: cached weight (the stock GEMM alone) and cold (its dequant paid per call).
-            for ([_]bool{ true, false }) |cached| {
-                cache.release();
-                const us = if (cached) try timeCalls(promptCachedCall, .{ &kernels, n, k, xm, dev.w, dev.sc, s }, iters) else try timeCalls(promptColdCall, .{ &kernels, n, k, xm, dev.w, dev.sc, s }, iters);
-                if (cached) cached_at[mi] = us else cold_at[mi] = us;
-                std.debug.print("MIMO_FP8RES_BENCH gemm site={s} M={d} route=fp8_prompt_bf16 weight={s} us={d:.1} TFLOPs={d:.2} vs_stock={d:.3}\n", .{ site.label, m, if (cached) "cached" else "dequant_per_call", us, flops / us / 1e6, stock / us });
-            }
-            // Device time per call, stock / prompt (cached weight) / stock (one eval per set of `calls` independent calls,
-            // the outputs bounded to 256 MiB): the same matmul on the same BF16 tensor, 1.0x up to device noise, read
-            // without the eval-each floor; the ratio takes the mean of the two stock sets (drift cancels).
-            {
-                const out_bytes: usize = @as(usize, @intCast(m)) * site.n * 2;
-                const calls: usize = std.math.clamp((256 << 20) / out_bytes, 2, 32);
-                cache.release();
-                const stock_a = try timeBatchedN(bf16PathCall, .{ xm, dev.wb, s }, calls);
-                const cached_b = try timeBatchedN(promptCachedCall, .{ &kernels, n, k, xm, dev.w, dev.sc, s }, calls);
-                const stock_c = try timeBatchedN(bf16PathCall, .{ xm, dev.wb, s }, calls);
-                std.debug.print("MIMO_FP8RES_BENCH gemm_batched site={s} M={d} calls={d} stock_us={d:.1} prompt_cached_us={d:.1} stock_again_us={d:.1} vs_stock={d:.3}\n", .{ site.label, m, calls, stock_a, cached_b, stock_c, (stock_a + stock_c) / 2 / cached_b });
-            }
-            cache.release();
-            // The threadgroup-tile candidate, and its distance from the staged fp8 NAX GEMM (a different f32 order: ulps).
-            const ref_y = try gemmRun(&kernels, gemm, n, k, xm, dev.w, dev.sc, m, s);
-            defer drop(ref_y);
-            const ref_d = try hostBf16(ref_y);
-            for (bench_tg_gemms) |g| {
-                if (@rem(n, g.bn) != 0) continue;
-                const us = try timeCalls(gemmApply, .{ tg, g, n, k, xm, dev.w, dev.sc, m, s }, iters);
-                const y = try gemmApply(tg, g, n, k, xm, dev.w, dev.sc, m, s);
-                defer drop(y);
-                const yd = try hostBf16(y);
-                var h: Hist = .{};
-                for (yd, ref_d) |p, q| h.add(ulps(p, q));
-                std.debug.print("MIMO_FP8RES_BENCH gemm site={s} M={d} route=fp8_tg bm={d} bn={d} wm={d} wn={d} us={d:.1} TFLOPs={d:.2} vs_stock={d:.3} vs_nax_fp8 max_ulp={d} hist={any}\n", .{ site.label, m, g.bm, g.bn, g.wm, g.wn, us, flops / us / 1e6, stock / us, h.max, h.b });
-            }
-        }
-        // Derived (no further GPU time): one prompt pass of P rows at this site, the installed route against the BF16
-        // tier's stock route. A pass dequantizes the site once (its first call) and reuses the weight for the rest:
-        // the tile sites (q, the sliding k / v, the dense MLP) run P / 512 calls at M = 512 (module.zig forwardNax /
-        // Dense.forwardTiled), the full layers' k / v one span call at M = P (prefill_attention.attentionSpanRows).
-        const span_site = std.mem.endsWith(u8, site.label, "_full");
-        for ([_]u32{ 512, 4096, 16_384 }, 0..) |rows, pi| {
-            const calls: f64 = if (span_site) 1 else @floatFromInt(rows / 512);
-            const at: usize = if (span_site) pi else 0;
-            if (std.math.isNan(stock_at[at]) or std.math.isNan(cached_at[at]) or std.math.isNan(cold_at[at])) continue;
-            const stock_pass = calls * stock_at[at];
-            const fp8_pass = cold_at[at] + (calls - 1) * cached_at[at];
-            std.debug.print("MIMO_FP8RES_BENCH prompt_pass site={s} P={d} calls={d} call_M={d} stock_us={d:.1} fp8_us={d:.1} dequant_us={d:.1} vs_stock={d:.3} cached_vs_stock={d:.3} (derived)\n", .{ site.label, rows, @as(u32, @intFromFloat(calls)), if (span_site) rows else 512, stock_pass, fp8_pass, cold_at[at] - cached_at[at], stock_pass / fp8_pass, stock_at[at] / cached_at[at] });
-        }
-    }
 }

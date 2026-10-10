@@ -12,13 +12,10 @@ comptime {
     _ = @import("arch/mimo_v2/settings.zig");
     _ = @import("arch/mimo_v2/bill.zig");
     _ = @import("arch/mimo_v2/kv.zig");
-    _ = @import("arch/mimo_v2/kv_update_profile.zig");
     _ = @import("arch/mimo_v2/module.zig");
     _ = @import("arch/mimo_v2/bank.zig");
     _ = @import("arch/mimo_v2/source.zig");
-    _ = @import("arch/mimo_v2/event_fixture.zig");
     _ = @import("arch/mimo_v2/predictor_fixture.zig");
-    _ = @import("arch/mimo_v2/sync_fixture.zig");
     _ = @import("arch/mimo_v2/stream.zig");
     _ = @import("arch/mimo_v2/route_trace.zig");
     _ = @import("arch/mimo_v2/math.zig");
@@ -31,7 +28,6 @@ comptime {
     _ = @import("arch/mimo_v2/glue.zig");
     _ = @import("arch/mimo_v2/prefill_attention.zig");
     _ = @import("arch/mimo_v2/fp8_linear.zig");
-    _ = @import("arch/mimo_v2/packed_attention.zig");
     _ = @import("arch/mimo_v2/profile.zig");
     _ = @import("arch/mimo_v2/prefill_timeline.zig");
     _ = @import("arch/mimo_v2/mtp.zig");
@@ -41,7 +37,6 @@ comptime {
     _ = @import("arch/mimo_v2/gpu_warm.zig");
     _ = @import("arch/mimo_v2/gpu_power.zig");
     _ = @import("arch/mimo_v2/gpu_warm_test.zig");
-    _ = @import("arch/mimo_v2/gpu_warm_bench.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");

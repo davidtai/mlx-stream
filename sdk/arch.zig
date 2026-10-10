@@ -49,7 +49,7 @@ pub const LoadFacts = struct {
     expert_prefill_rows: ?u32 = null,
     /// The loader's page-cache setting for resident weights (`nocache_weights`; null = the arch's default).
     nocache_weights: ?bool = null,
-    /// The context the load serves (the model's `ctx_size`, else the arch's `autoContext`), stamped before billing.
+    /// The context the load serves (the model's `ctx_size`, else the arch's default context), stamped before billing.
     effective_context: ?u64 = null,
     /// A construction-time KV precision choice (0 = bf16, 8 = affine 8-bit); null = the arch's default.
     kv_quant_bits: ?u8 = null,

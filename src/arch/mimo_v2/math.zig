@@ -138,7 +138,7 @@ fn windowRows(g: *ops.MlxOps, p: Proj, lo: u32, hi: u32) !Proj {
 }
 
 /// The pipelined route's second tile in flight: one more projection tile and one more reduction tile, at
-/// `source.workspaceBytesFor`'s per-row rates (`matrix_tile`, `reduction_tile`), for a call of `tokens` tokens.
+/// `source.workspaceBytes`'s per-row rates (`matrix_tile`, `reduction_tile`), for a call of `tokens` tokens.
 pub fn pipelinedExtraBytes(hidden: u64, inter: u64, tokens: u32) u64 {
     const nr = @as(u64, tokens) * top_k;
     return @min(nr, projection_rows) * (20 * hidden + 24 * inter + 32) +
@@ -474,21 +474,10 @@ pub const Math = struct {
     pub fn finishPrefill(_: *Math, _: *ops.MlxOps) !void {}
 };
 
-/// The prompt pass's per-token routed combine (Source.forward, logical M >= 2).
-/// Both routes run the same reduction graph per tile of `tile_rows` tokens over
-/// byte-identical [count, 8, H] BF16 rows: f32(row), times its f32 route weight
-/// (a separate multiply), MLX's sum over the 8 routes (axis 1; the same op on the
-/// same contiguous layout, so the same fold order k = 0..7 as the control), BF16
-/// once. Only where the rows are read from differs.
-pub const Combine = enum {
-    /// Control: the scheduler's joined [n, 8, H] (`routed`: per bank call a
-    /// concatenate + inverse take, per call a concatenate + take).
-    join,
-    /// +join: the unjoined tile outputs (`routedParts`); per gather tile of
-    /// `combine_tokens` tokens, each source's rows taken in place, concatenated
-    /// and permuted into [count, 8, H]. No [n, 8, H] array is built.
-    joinless,
-};
+/// The prompt pass's per-token routed combine (Source.forward, logical M >= 2): the unjoined tile outputs
+/// (`routedParts`); per gather tile of `combine_tokens` tokens, each source's rows taken in place, concatenated and
+/// permuted into [count, 8, H] (no [n, 8, H] array is built), then per tile of `tile_rows` tokens f32(row), times its f32
+/// route weight (a separate multiply), MLX's sum over the 8 routes (axis 1, fold order k = 0..7), BF16 once.
 
 pub const top_k: u32 = 8;
 /// Tokens per joinless gather tile (a multiple of `tile_rows`).
@@ -582,7 +571,7 @@ fn joinOutputs(g: *ops.MlxOps, out: *CombineOutputs) !T {
     return g.keep(joined);
 }
 
-/// Control (`Combine.join`): `ordered` is the evaluated [nt, 8, H] BF16 routed rows.
+/// The joined reference (the CPU tests' control): `ordered` is the evaluated [nt, 8, H] BF16 routed rows.
 /// `reduce`: the installed drain's reduction driver (`Math.drain.reduce`).
 pub fn combineJoined(g: *ops.MlxOps, ordered: T, route_weights: T, nt: u32, hidden: c_int, reduce: *const ReduceFn) !T {
     var out: CombineOutputs = .{};
@@ -591,7 +580,7 @@ pub fn combineJoined(g: *ops.MlxOps, ordered: T, route_weights: T, nt: u32, hidd
     return joinOutputs(g, &out);
 }
 
-/// +join (`Combine.joinless`): `outs` the evaluated sources (`routedParts`),
+/// The joinless combine: `outs` the evaluated sources (`routedParts`),
 /// `loc` each routed position's (source, row) as int32 pairs, position
 /// p = token * 8 + k. Each gather tile builds exactly the control's
 /// [count, 8, H] rows (copies of the same words), then the same reductions.

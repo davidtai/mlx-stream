@@ -23,7 +23,6 @@ const std = @import("std");
 const profile = @import("profile.zig");
 const mimo = @import("config.zig");
 const timeline = @import("../deepseek_v41/verify_timeline.zig");
-const log = std.log.scoped(.mimo);
 
 pub const enabled = profile.enabled;
 

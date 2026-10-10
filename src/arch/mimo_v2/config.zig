@@ -285,13 +285,6 @@ pub const Config = struct {
         };
     }
 
-    /// Resident projections: embed, head, q/k/v/o per layer, layer 0's gate/up/down.
-    pub fn residentProjections(c: Config) u32 {
-        var n: u32 = 0;
-        for (0..n_roles) |r| n += c.roleCount(@fromBackingInt(@intCast(r)));
-        return n;
-    }
-
     /// The resident projections' MLX arrays (U2's census): one per BF16 projection, three per quantized one.
     pub fn residentProjectionArrays(c: Config) u64 {
         var n: u64 = 0;
@@ -335,15 +328,9 @@ pub const Config = struct {
     pub fn routerPromotionBytes(c: Config) u64 {
         return @as(u64, c.n_layers - 1) * c.n_routed_experts * c.hidden_size * 4;
     }
-    pub fn kvBytesPerToken(c: Config) u64 {
-        return 2 * @as(u64, c.fullLayers()) * c.n_kv_heads * (c.head_dim + c.value_head_dim);
-    }
     pub fn reserveTokens(c: Config, seq: u64, max_tokens: u64, host_context: u64) u64 {
         const context = @min(c.max_position_embeddings, host_context);
         return @max(seq, @min(seq +| max_tokens, context));
-    }
-    pub fn prefillWorkspaceBytes(c: Config, tokens: u64) u64 {
-        return c.requestBytes(tokens) - c.kvBytes(tokens);
     }
     /// Conservative chunk-local rows, including dense MLP and FP32 routing. Attention scores are separate.
     pub fn workspaceBytes(c: Config, rows: u64) u64 {

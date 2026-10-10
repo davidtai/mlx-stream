@@ -196,11 +196,6 @@ uint64_t mimo_warm_event_value(uint64_t event) {
   return reinterpret_cast<MTL::SharedEvent*>(event)->signaledValue();
 }
 
-// Hands the event `value` from the host (the bench's stand-in for the read pool's signal).
-void mimo_warm_event_signal(uint64_t event, uint64_t value) {
-  reinterpret_cast<MTL::SharedEvent*>(event)->setSignaledValue(value);
-}
-
 // The host clock Metal's GPU timestamps use (mach-absolute, ns).
 uint64_t mimo_warm_now_ns(void) {
   return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);

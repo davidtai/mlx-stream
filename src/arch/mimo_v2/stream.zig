@@ -17,7 +17,6 @@ const S = sdk_ext.expert.stream.StreamOf(bank_mod.SDK, false);
 pub const Stream = S.Stream;
 pub const Options = S.Options;
 pub const SlotMemory = S.SlotMemory;
-pub const HostSlotRows = S.HostSlotRows;
 pub const LayerSlotBank = S.LayerSlotBank;
 pub const Route = S.Route;
 pub const Part = S.Part;
@@ -701,7 +700,6 @@ test "mimo sdk2 mxfp4 SDK GPU: asynchronous windows and bound six-component slot
         .digests = &.{},
         .source_repository = "synthetic",
         .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_digest = @splat(0),
         .sidecar_fd = fd.fd,
         .sidecar_file_size = fd.size,
     };
@@ -836,7 +834,6 @@ fn phaseRowsBoundary(prompt_rows: [2]u32, decode_rows: [2]u32) !void {
         .digests = &.{},
         .source_repository = "synthetic",
         .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_digest = @splat(0),
         .sidecar_fd = fd.fd,
         .sidecar_file_size = fd.size,
     };
@@ -899,7 +896,6 @@ test "mimo rows audit R3: decode's window 0 holds decode_route_ids rows and ever
         .digests = &.{},
         .source_repository = "synthetic",
         .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_digest = @splat(0),
         .sidecar_fd = fd.fd,
         .sidecar_file_size = fd.size,
     };
@@ -1021,7 +1017,6 @@ const HitFixture = struct {
             .digests = &.{},
             .source_repository = "synthetic",
             .source_revision = "0000000000000000000000000000000000000000",
-            .sidecar_digest = @splat(0),
             .sidecar_fd = f.fd.fd,
             .sidecar_file_size = f.fd.size,
         };
@@ -2052,7 +2047,6 @@ test "mimo mtp lane: prefill -> first decode tick -> the verify's decode-phase w
         .digests = &.{},
         .source_repository = "synthetic",
         .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_digest = @splat(0),
         .sidecar_fd = fd.fd,
         .sidecar_file_size = fd.size,
     };

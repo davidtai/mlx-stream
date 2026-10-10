@@ -81,8 +81,6 @@ pub const P7Line = struct {
     }
 };
 
-pub const prefillWholePrompt = true;
-pub const prefillYieldsLastLogits = true;
 /// Cold compiler/runtime headroom, separately charged from retained arrays and
 /// the allocator cache. The guarded real-shape fixture must fit this envelope
 /// before a full artifact is admitted; it does not scale once per layer.
@@ -101,33 +99,10 @@ pub const MemoryBound = struct {
     }
 };
 
-/// The bound's rows: uniform. A `expert_rows_by_layer` split keeps the total (its offsets sum to 0), and every bill term
-/// reads the total (`source.memoryBill` sums the vector), so the uniform rows bound the split exactly.
-fn rowsFor(config: *const settings.Config) ![mimo.moe_layers]u32 {
-    const count = config.expert_rows orelse mimo.default_expert_rows;
-    if (count == 0 or count > 256) return error.MimoExpertRows;
-    return @splat(count);
-}
-
 fn sumRows(rows: []const u32) u64 {
     var n: u64 = 0;
     for (rows) |r| n += r;
     return n;
-}
-
-pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, config: *const settings.Config) !u64 {
-    return (try memoryBound(a, io, config, 0)).total();
-}
-
-pub fn memoryBound(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, reserve: u64) !MemoryBound {
-    const c = config.mimo;
-    const dir = config.expert_bank_dir orelse return error.MimoBankDir;
-    const g = try bank_mod.inspect(a, io, dir);
-    try g.requireMiMo();
-    const rows = try rowsFor(config);
-    const bill = try source_mod.memoryBill(g, &rows);
-    const resident = try prepared.residentBytes(a, io, dir);
-    return .{ .resident_bytes = resident, .router_promotion_bytes = c.routerPromotionBytes(), .expert_bytes = bill.total_bytes, .allocator_cache_bytes = mimo.allocator_cache_bytes, .compilation_bytes = compilation_headroom_bytes, .layer_workspace_bytes = c.workspaceBytes(mimo.prefill_chunk), .request_bytes = if (reserve == 0) 0 else c.requestBytes(reserve) };
 }
 
 pub const Module = struct {
@@ -1656,11 +1631,6 @@ pub fn cast(x: Array, dtype: mlx.mlx_dtype, s: Stream) !Array {
     try mlx.check(mlx.mlx_astype(&out, x, dtype, s));
     return out;
 }
-fn scalarAs(x: f32, dtype: mlx.mlx_dtype, s: Stream) !Array {
-    const f = mlx.mlx_array_new_float(x);
-    defer drop(f);
-    return cast(f, dtype, s);
-}
 pub fn binary(comptime op: anytype, a: Array, b: Array, s: Stream) !Array {
     var out: Array = .{};
     errdefer drop(out);
@@ -1984,7 +1954,7 @@ fn fixtureBank(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: [:0]cons
         return error.MimoFixtureStat;
     }
     std.debug.print("mlx-stream actual_shape bank: logical_bytes={d}, allocated_disk_bytes={d}, initialized_records=8/256\n", .{ g.total_bytes, stat.blocks * 512 });
-    return .{ .allocator = a, .geometry = g, .digests = digests, .source_repository = repository, .source_revision = revision, .sidecar_digest = @splat(0), .sidecar_fd = fd, .sidecar_file_size = g.total_bytes };
+    return .{ .allocator = a, .geometry = g, .digests = digests, .source_repository = repository, .source_revision = revision, .sidecar_fd = fd, .sidecar_file_size = g.total_bytes };
 }
 
 /// Host scalar reference. Every cast here is the explicit BF16 boundary from
