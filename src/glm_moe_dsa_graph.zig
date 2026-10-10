@@ -592,7 +592,8 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
         const l: u32 = @intCast(li);
         const m = g.mark();
         if (pt.enabled and prompt) pt.start();
-        if (rt.read_ahead and wide and lw.bank_layer != null) {
+        // The predictor runs only where the read-ahead has empty rows to fill.
+        if (rt.read_ahead and wide and lw.bank_layer != null and ex.readAheadRoom(lw.bank_layer.?) > 0) {
             try predictSeed(g, a, c, lw, h, rows, &seed);
             try ex.readAheadSeed(lw.bank_layer.?, seed.items);
         }

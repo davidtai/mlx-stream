@@ -244,6 +244,12 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             return self.stream.readAheadSeed(layer, experts);
         }
 
+        /// The prompt rows of `layer` a read-ahead can still fill (it never evicts).
+        pub fn readAheadRoom(self: *const Self, layer: u32) u32 {
+            const p = &self.stream.layers[layer].policy;
+            return p.capacity -| p.occupancy;
+        }
+
         /// One routed-layer call: x [n, hidden], indices [n, k] int32, scores [n, k] f32 -> the weighted sum [n, hidden]
         /// in x's dtype. `next_scores` [n, n_experts] f32: the next routed layer's routing scores on this call's rows (the
         /// decode lookahead's predictor), evaluated with the ids at the routing barrier; null for none.
