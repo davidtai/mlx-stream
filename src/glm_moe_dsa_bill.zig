@@ -21,17 +21,21 @@ pub const fill_prompt_tokens: u64 = 16384;
 pub const fill_max_tokens: u64 = 1024;
 /// The fill's floor: fewer persistent rows per routed layer refuse the load by name.
 pub const min_fill_rows: u32 = 16;
-/// The MLX allocator cache the module holds through each phase (`mlx_set_cache_limit`).
+/// The MLX allocator cache the module holds through each phase (`mlx_set_cache_limit`). MLX recycles a freed buffer
+/// while the cache is under its limit, so the cache can end one buffer over it (`decodeCacheOvershoot`).
 pub const prefill_cache_bytes: u64 = 2 << 30;
 pub const decode_cache_bytes: u64 = 512 << 20;
-/// The process's host side (its footprint less MLX's active and cache: the read pool's staging and tables, the
-/// manifests, the module's host state, the server and the process itself): a declared bound until the box measures it.
-pub const host_side_bytes: u64 = 1_000_000_000;
-/// The process's fixed overhead outside every named term (DeepSeek-V4.1's measured figure, `deepseek_v41_bill`).
-pub const unbilled_process_overhead_bytes: u64 = 640_000_000;
-/// The host side's rise from the decode handover to the request's end (decode's own host state): a declared bound
-/// until the box measures it. The handover's grow reads the footprint and adds this for the rest of the request.
-pub const decode_host_rise_bytes: u64 = 100_000_000;
+/// The process's host side: its footprint less MLX's active and cache (the read pool's staging and tables, the
+/// manifests, the module's host state, the server and the process itself), the whole footprint outside MLX, so no
+/// other term covers a process overhead. Measured on the box (run m1, plugin a2aa9bf, the coding workload at
+/// --ctx-size 16448): 0.240-0.475 GB constructed, 0.694-0.699 GB at the prompt pass's end, 0.711-0.715 GB at the
+/// handover, 0.792 GB (MTP depth 3) and 0.979 GB (MTP off) at the request's end; the largest, plus 0.27 GB for a
+/// second request's decode, rounded up to the next 50 MB.
+pub const host_side_bytes: u64 = 1_250_000_000;
+/// The host side's rise from the handover's reading to the request's end (decode's own host state), the term the
+/// live grow adds to its reading: measured 0.264 GB over 1,024 serial steps and 0.098 GB over 319 MTP rounds (run m1),
+/// the larger plus 0.036 GB, rounded up to the next 50 MB.
+pub const decode_host_rise_bytes: u64 = 300_000_000;
 /// The decode step's fixed part (the token's projections, the shared expert, the head's logits and their copies).
 pub const decode_wave_fixed_bytes: u64 = 64 << 20;
 /// The page tables of `wired` bytes (`deepseek_v41_bill.wireTables`: the kernel's and the GPU's leaf entries per 16
@@ -79,7 +83,6 @@ pub const Terms = struct {
     kv: [2]u64,
     mlx_cache: [2]u64,
     host_side: [2]u64,
-    unbilled: [2]u64,
     /// One persistent slot row on every routed layer.
     per_row: u64,
     /// The draft lane's: its residents and resident experts, its layer's KV, its waves (null: off).
@@ -143,6 +146,12 @@ pub fn mtpDecodeWaveBytes(c: *const glm.Config, d: u32, keys: u64) u64 {
     return 2 * @as(u64, d) * decodeWaveBytes(c, keys);
 }
 
+/// Decode's MLX cache past its limit: one freed buffer, at most the widest a decode step frees (the indexer keys in
+/// fp32 over every position, or a verify's logits in fp32).
+pub fn decodeCacheOvershoot(c: *const glm.Config, positions: u64, verify_rows: u64) u64 {
+    return @max(positions * c.index_head_dim * 4, verify_rows * c.vocab_size * 4);
+}
+
 /// The KV lanes' bytes at `positions` on every layer, each buffer as MLX allocates it (`glm_moe_dsa_cache.bytesAt`).
 pub fn kvBytes(c: *const glm.Config, positions: u64) u64 {
     return cache_mod.bytesAt(c, positions, std.heap.pageSize());
@@ -168,9 +177,8 @@ pub fn termsOf(in: Inputs) Terms {
         .residents = .{ in.resident_bytes, in.resident_bytes },
         .waves = .{ promptWaveBytes(c, in.prompt_tokens, in.prompt_tokens), decodeWaveBytes(c, in.decode_positions) },
         .kv = .{ kvBytes(c, in.prompt_tokens), kvBytes(c, in.decode_positions) },
-        .mlx_cache = .{ prefill_cache_bytes, decode_cache_bytes },
+        .mlx_cache = .{ prefill_cache_bytes, decode_cache_bytes + decodeCacheOvershoot(c, in.decode_positions, s.decode_window_rows / glm.routed_top_k) },
         .host_side = .{ host_side_bytes, host_side_bytes },
-        .unbilled = .{ unbilled_process_overhead_bytes, unbilled_process_overhead_bytes },
         .per_row = @as(u64, g.n_layers) * g.widest_record,
         .mtp = if (in.mtp) |m| blk: {
             const res = m.resident_bytes + m.expert_bytes;
@@ -191,7 +199,6 @@ pub fn memoryBill(a: std.mem.Allocator, t: Terms) !sdk.MemoryBill {
         .{ .name = "KV", .bytes = t.kv, .at_construction = false },
         .{ .name = "MLX allocator cache", .bytes = t.mlx_cache, .at_construction = false },
         .{ .name = "host side", .bytes = t.host_side, .at_construction = true, .measured = true },
-        .{ .name = "unbilled process overhead", .bytes = t.unbilled, .at_construction = true },
         .{ .name = "wire tables", .bytes = .{ wireTables(t.wired(0)), wireTables(t.wired(1)) }, .at_construction = false, .with_rows = true },
     };
     const terms = if (t.mtp) |m| try std.mem.concat(a, T, &.{ &base, &[_]T{

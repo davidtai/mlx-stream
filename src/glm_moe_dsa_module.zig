@@ -394,14 +394,15 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_rows[0], .rows = self.decode_rows[0], .target = self.target, .baseline = self.baseline, .box = box };
             if (!self.forced_rows) {
                 const after = bill_mod.decodeAfter(self.inputs, cap);
-                // The rest of the box as it stands, at least the load's baseline: the bill's rows at the request bound the grow.
-                const live: bill_mod.Live = .{ .target = self.target, .baseline = @max(box.others, self.baseline), .footprint = st.after.footprint, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_rows[0], .max_rows = self.model.n_routed_experts, .per_row = self.bill.per_row, .device_after = after.device, .host_after = after.host };
+                // The rest of the box as it stands now (not the load's baseline, an older reading of it), for the live
+                // reading and the bill at the request alike.
+                const live: bill_mod.Live = .{ .target = self.target, .baseline = box.others, .footprint = st.after.footprint, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_rows[0], .max_rows = self.model.n_routed_experts, .per_row = self.bill.per_row, .device_after = after.device, .host_after = after.host };
                 line.live_rows = bill_mod.liveRows(live) catch |e| {
                     line.refused = @errorName(e);
                     log.err("{f}\n", .{line});
                     return e;
                 };
-                line.bill_rows = try bill_mod.requestRows(self.gpa, self.inputs, cap, self.baseline, self.target, self.model.n_routed_experts);
+                line.bill_rows = try bill_mod.requestRows(self.gpa, self.inputs, cap, box.others, self.target, self.model.n_routed_experts);
                 line.rows = @max(@min(line.live_rows.?, line.bill_rows.?), self.prompt_rows[0]);
                 line.bound = live.total(line.rows);
                 @memset(self.decode_rows, line.rows);
@@ -427,6 +428,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (d.steps == 0) return;
             for (self.layer_counts1, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
             _ = mlx.mlx_synchronize(self.g.s);
+            const end = Mem.now();
             log.info("{f}\n", .{DecodeLine{
                 .steps = d.steps,
                 .tokens = d.tokens,
@@ -434,7 +436,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .r = .of(d.s0, self.stream.stats()),
                 .hit_rate = hitSpread(self.layer_counts0, self.layer_counts1, self.layer_rates),
                 .rows = self.decode_rows[0],
-                .mem = .{ .start = d.mem0, .end = Mem.now() },
+                .mem = .{ .start = d.mem0, .end = end },
+                .box = Box.now(end),
             }});
         }
 
@@ -674,10 +677,10 @@ pub const HandoverLine = struct {
         try w.print("glm_moe_dsa: handover: footprint {d:.3} GB before the frees, {d:.3} GB after ({s} in {d} ms; MLX active {d:.3} GB, host side {d:.3} GB; the box {d:.3} GB used, the rest of it {d:.3} GB), KV at {d} positions {d:.3} GB", .{
             gigabytes(p.before.footprint), gigabytes(p.after.footprint), if (p.settled) "settled" else "not settled", p.settle_ms, gigabytes(p.after.active), gigabytes(p.after.hostSide()), gigabytes(p.box.used), gigabytes(p.box.others), p.positions, gigabytes(p.kv_bytes),
         });
-        if (p.refused) |e| return w.print(", refused: {s} (the prompt's {d} rows per layer leave decode over the {d:.3} GB target, baseline {d:.3} GB)", .{ e, p.prompt_rows, gigabytes(p.target), gigabytes(p.baseline) });
+        if (p.refused) |e| return w.print(", refused: {s} (the prompt's {d} rows per layer leave decode over the {d:.3} GB target)", .{ e, p.prompt_rows, gigabytes(p.target) });
         try w.print(", rows {d} -> {d} per layer", .{ p.prompt_rows, p.rows });
         if (p.bill_rows) |b| try w.print(" (the bill at the request {d}, the live reading {d})", .{ b, p.live_rows.? }) else try w.print(" (forced)", .{});
-        if (p.bound) |b| try w.print(", decode bound {d:.3} GB of the {d:.3} GB target (baseline {d:.3} GB)", .{ gigabytes(b), gigabytes(p.target), gigabytes(p.baseline) });
+        if (p.bound) |b| try w.print(", decode bound {d:.3} GB of the {d:.3} GB target (the load's baseline {d:.3} GB)", .{ gigabytes(b), gigabytes(p.target), gigabytes(p.baseline) });
         if (p.grown) |g| try w.print(", footprint {d:.3} GB after the grow", .{gigabytes(g.footprint)});
     }
 };
@@ -793,6 +796,8 @@ pub const DecodeLine = struct {
     hit_rate: ?Spread,
     rows: u32,
     mem: ?PhaseMem = null,
+    /// The box at the request's end (the rest of it beside the handover's reading).
+    box: ?Box = null,
 
     pub fn format(p: DecodeLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("glm_moe_dsa: decode {d} steps, {d} tokens in {d:.2} s ({d:.1} tok/s): {d} routed records, {d} hits, {d} misses", .{
@@ -803,6 +808,7 @@ pub const DecodeLine = struct {
             gigabytes(p.r.ssd_bytes), p.r.spec_issued, p.r.spec_used, p.r.spec_landed, p.r.spec_expired, p.r.spec_abandoned, p.r.spec_cancelled, p.r.spec_discarded, p.r.loads_skipped, p.r.direct, seconds(p.r.wait_ns), seconds(p.r.in_flight_ns), seconds(p.wall_ns), p.rows,
         });
         if (p.mem) |m| try w.print("; {f}", .{m});
+        if (p.box) |b| try w.print("; the box {d:.3} GB used, the rest of it {d:.3} GB", .{ gigabytes(b.used), gigabytes(b.others) });
     }
 };
 
@@ -984,11 +990,11 @@ test "glm handover: the handover line reports the readings, the rows each bound 
     var l: HandoverLine = .{ .before = .{ .footprint = 225_500_000_000 }, .after = .{ .footprint = 221_000_000_000, .active = 220_400_000_000 }, .settle_ms = 15, .settled = true, .positions = 17_415, .kv_bytes = 1_660_000_000, .prompt_rows = 126, .rows = 136, .bill_rows = 136, .live_rows = 137, .bound = 255_000_000_000, .target = 255_550_554_112, .baseline = 12_402_409_472, .box = .{ .used = 233_900_000_000, .others = 12_600_000_000 }, .grown = .{ .footprint = 237_100_000_000 } };
     const s = try std.fmt.allocPrint(a, "{f}", .{l});
     defer a.free(s);
-    try testing.expectEqualStrings("glm_moe_dsa: handover: footprint 225.500 GB before the frees, 221.000 GB after (settled in 15 ms; MLX active 220.400 GB, host side 0.600 GB; the box 233.900 GB used, the rest of it 12.600 GB), KV at 17415 positions 1.660 GB, rows 126 -> 136 per layer (the bill at the request 136, the live reading 137), decode bound 255.000 GB of the 255.551 GB target (baseline 12.402 GB), footprint 237.100 GB after the grow", s);
+    try testing.expectEqualStrings("glm_moe_dsa: handover: footprint 225.500 GB before the frees, 221.000 GB after (settled in 15 ms; MLX active 220.400 GB, host side 0.600 GB; the box 233.900 GB used, the rest of it 12.600 GB), KV at 17415 positions 1.660 GB, rows 126 -> 136 per layer (the bill at the request 136, the live reading 137), decode bound 255.000 GB of the 255.551 GB target (the load's baseline 12.402 GB), footprint 237.100 GB after the grow", s);
     l.refused = "DecodeOverTarget";
     const r = try std.fmt.allocPrint(a, "{f}", .{l});
     defer a.free(r);
-    try testing.expect(std.mem.endsWith(u8, r, ", refused: DecodeOverTarget (the prompt's 126 rows per layer leave decode over the 255.551 GB target, baseline 12.402 GB)"));
+    try testing.expect(std.mem.endsWith(u8, r, ", refused: DecodeOverTarget (the prompt's 126 rows per layer leave decode over the 255.551 GB target)"));
     const pm: PhaseMem = .{ .start = .{ .active = 200_000_000_000, .footprint = 201_000_000_000 }, .end = .{ .active = 201_000_000_000, .peak = 205_000_000_000, .cache = 500_000_000, .footprint = 202_100_000_000, .footprint_peak = 206_000_000_000 } };
     const p = try std.fmt.allocPrint(a, "{f}", .{pm});
     defer a.free(p);
