@@ -4,7 +4,9 @@
 
 - GLM-5.3 (`glm_moe_dsa`): a second arch over the same expert stream, from a pack of resident shards and an affine
   expert bank (`expert-manifest-affine-v1.json`). Serial decode, the `stock` tier, MLX's `gather_qmm` for the experts.
-  `src/root.zig` exports both archs as `archs`; `arch` stays DeepSeek-V4.1's.
+  `src/root.zig` exports both archs as `archs`; `arch` stays DeepSeek-V4.1's. Each request logs a prompt line and a
+  decode line from the stream's counters; the SDK's arch table gains the optional `requestEnd` hook, and the stream
+  counts its host wait on reads (`Stats.read_wait_ns`) and each layer's hits and misses (`layerCounts`).
 - The expert stream takes its slot arrays' dtypes from the bank module and can size its read pool's staging from the
   bank (`Stream.Options.staging_from_bank`); MlxOps gains affine matmuls with biases at a tensor's own bits and group.
   DeepSeek-V4.1's paths are unchanged.

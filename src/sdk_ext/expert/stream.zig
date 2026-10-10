@@ -519,7 +519,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 /// [n_experts]: one entry per persistent slot.
                 meta: []SlotMeta,
                 lens: [n_components]u64,
+                counts: expert.LayerCounts = .{},
             };
+
+            pub fn layerCounts(self: *const Stream, layer: u32) expert.LayerCounts {
+                return self.layers[layer].counts;
+            }
 
             const Location = struct { rows: *const Rows, row: u32, meta: *SlotMeta };
 
@@ -856,6 +861,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 c.persistent_loads += plan.n_persistent;
                 c.transient_loads += plan.n_loads - plan.n_persistent;
                 c.loads_skipped += skipped;
+                ls.counts.hits += plan.n_hits;
+                ls.counts.misses += plan.n_misses;
                 r.state = .live;
                 return r;
             }
@@ -1003,10 +1010,17 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn waitGu(self: *Stream, r: *Route, part: u32) Error!void {
                 const p = &r.parts[part];
                 if (p.settled) return;
-                self.pool.wait(p.ticket, p.n_reads, wait_timeout_ns) catch |e| return self.fail(e);
+                self.waitReads(p.ticket, p.n_reads) catch |e| return self.fail(e);
                 for (0..p.n_reads) |i| {
                     if (self.pool.result(p.ticket + @as(u32, @intCast(i))).status != .ok) return self.fail(error.ReadFailed);
                 }
+            }
+
+            /// The host blocked until tickets [first, first + count) landed, its time in `read_wait_ns`.
+            fn waitReads(self: *Stream, first: u32, count: u32) !void {
+                const t0 = expert_io.Pool.nowNs();
+                defer self.counters.read_wait_ns += @intCast(@max(expert_io.Pool.nowNs() - t0, 0));
+                return self.pool.wait(first, count, wait_timeout_ns);
             }
 
             /// Blocks until every segment of the part landed; its rows are then ready.
@@ -1017,7 +1031,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             fn settle(self: *Stream, r: *Route, p: *Part) Error!void {
                 if (p.settled) return;
                 const count = 2 * p.n_reads;
-                const waited = self.pool.wait(p.ticket, count, wait_timeout_ns);
+                const waited = self.waitReads(p.ticket, count);
                 var ok = if (waited) |_| true else |_| false;
                 if (ok) {
                     for (0..count) |k| {
@@ -1117,7 +1131,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (p.settled) continue;
                     p.settled = true;
                     const count = 2 * p.n_reads;
-                    const waited = self.pool.wait(p.ticket, count, wait_timeout_ns);
+                    const waited = self.waitReads(p.ticket, count);
                     var ok = if (waited) |_| true else |_| false;
                     if (ok) for (0..count) |k| {
                         const res = self.pool.result(p.ticket + @as(u32, @intCast(k)));

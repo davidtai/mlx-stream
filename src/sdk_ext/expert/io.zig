@@ -361,6 +361,11 @@ pub const Pool = struct {
         _ = c.q3ld_ev_release(value);
     }
 
+    /// The pool's clock (a `Result`'s `t_start_ns` / `t_end_ns`).
+    pub fn nowNs() i64 {
+        return c.q3ld_monotonic_ns();
+    }
+
     pub fn counter(self: *const Pool, which: Counter) i64 {
         return @atomicLoad(i64, &self.counters[@intFromEnum(which)], .monotonic);
     }

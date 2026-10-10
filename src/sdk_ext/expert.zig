@@ -95,6 +95,8 @@ pub const Stats = struct {
     adopt_copy_seconds: f64 = 0,
     /// Wall time with a read in flight (the pool's gauge).
     read_wall_ns: u64 = 0,
+    /// Host time blocked in the read waits (a part's gate/up or its settle, a read-ahead's landing).
+    read_wait_ns: u64 = 0,
     /// The lookahead class: records claimed by a demand read, physical bytes
     /// of speculative reads, records issued / fully landed, demand ranges
     /// copied out of a speculative record (no preadv) and their bytes.
@@ -118,6 +120,9 @@ pub const Stats = struct {
     ahead_demand: u64 = 0,
     ahead_bytes: u64 = 0,
 };
+
+/// One layer's routes so far, every phase: the unique experts per route that were resident / had to be loaded.
+pub const LayerCounts = struct { hits: u64 = 0, misses: u64 = 0 };
 
 /// A source's refusals at run time. A failure is sticky: every later call refuses as `StreamFailed`.
 pub const Error = error{

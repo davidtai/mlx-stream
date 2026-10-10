@@ -125,6 +125,11 @@ pub fn handover(m: *Module, h: sdk.DecodeHandover) !void {
     return m.decodeHandover(h);
 }
 
+/// The request's end: the decode's stats line.
+pub fn requestEnd(m: *Module) void {
+    m.requestEnd();
+}
+
 const testing = std.testing;
 
 test "glm plugin: claims its own model_type at native priority and declines the rest" {
@@ -155,10 +160,10 @@ test "glm plugin: parse builds the arch's config and its pack dir, and refuses b
     try testing.expectError(error.DimsNotImplemented, parse(testing.allocator, &try sdk.ConfigPeek.parse(arena.allocator(), "/m", tiny), &diag));
 }
 
-test "glm plugin: the table the registry builds (owns its decode state, a handover, a prefix restore, its bills, no draft lane)" {
+test "glm plugin: the table the registry builds (owns its decode state, a handover, a request end, a prefix restore, its bills, no draft lane)" {
     const vt = comptime sdk.Arch.of(@This());
     try testing.expect(vt.caps.owns_decode_state and !vt.caps.batches_decode and vt.caps.prefill_whole_prompt and vt.caps.prefill_yields_last_logits);
-    try testing.expect(vt.handover != null and vt.restore_prefix != null and vt.bill != null and vt.prompt_bytes != null and vt.spec == .none);
+    try testing.expect(vt.handover != null and vt.request_end != null and vt.restore_prefix != null and vt.bill != null and vt.prompt_bytes != null and vt.spec == .none);
     try testing.expect(vt.claim_process != null and vt.release_process != null);
     try vt.claim_process.?();
     try testing.expectError(error.ExpertReaderInUse, vt.claim_process.?());

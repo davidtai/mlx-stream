@@ -101,6 +101,8 @@ pub const Arch = struct {
     restore_prefix: ?*const fn (m: *anyopaque, prefix: []const u32) u64,
     /// The phase change; null = the arch has none.
     handover: ?*const fn (m: *anyopaque, h: DecodeHandover) anyerror!void,
+    /// The request's end (the host's finish, on the inference thread, after its last step); null = none.
+    request_end: ?*const fn (m: *anyopaque) void,
     spec: spec.Spec,
     /// G4: the arch's terms of the composed bill (waves, KV by owner, prompt state, cache limits); null = none.
     /// Pure host: it may read the model's headers through `io`, never the device.
@@ -113,7 +115,7 @@ pub const Arch = struct {
 
     /// The table of `T`, a namespace declaring the arch (a missing or mistyped declaration is a compile error
     /// naming it): name, caps, claims, Config, parse, freeConfig, shell, applySettings, loadBytes, Module, init,
-    /// deinit, prefill, step, position; optional (absent when undeclared or `{}`) promptBytes, handover,
+    /// deinit, prefill, step, position; optional (absent when undeclared or `{}`) promptBytes, handover, requestEnd,
     /// restorePrefix (only with `owns_decode_state`), draft_lane, bill, and the pair claimProcess / releaseProcess.
     pub fn of(comptime T: type) Arch {
         comptime {
@@ -136,6 +138,7 @@ pub const Arch = struct {
             check.fnDecl(w, T, "step", &.{ *T.Module, []const u32 }, mlx.mlx_array);
             check.fnDecl(w, T, "position", &.{*const T.Module}, u64);
             if (check.has(T, "handover")) check.fnDecl(w, T, "handover", &.{ *T.Module, DecodeHandover }, void);
+            if (check.has(T, "requestEnd")) check.fnDecl(w, T, "requestEnd", &.{*T.Module}, void);
             if (check.has(T, "restorePrefix")) {
                 if (!T.caps.owns_decode_state) @compileError(w ++ ": restorePrefix without owns_decode_state");
                 check.fnDecl(w, T, "restorePrefix", &.{ *T.Module, []const u32 }, u64);
@@ -193,6 +196,9 @@ pub const Arch = struct {
             fn handover(m: *anyopaque, h: DecodeHandover) anyerror!void {
                 return T.handover(mod(m), h);
             }
+            fn requestEnd(m: *anyopaque) void {
+                T.requestEnd(mod(m));
+            }
             fn restorePrefix(m: *anyopaque, prefix: []const u32) u64 {
                 return T.restorePrefix(mod(m), prefix);
             }
@@ -222,6 +228,7 @@ pub const Arch = struct {
             .step = W.step,
             .position = W.position,
             .handover = if (check.has(T, "handover")) W.handover else null,
+            .request_end = if (check.has(T, "requestEnd")) W.requestEnd else null,
             .restore_prefix = if (check.has(T, "restorePrefix")) W.restorePrefix else null,
             .spec = if (check.has(T, "draft_lane")) .{ .draft_lane = spec.DraftLane.of(T.Module, T.draft_lane) } else .none,
             .bill = if (check.has(T, "bill")) W.billOf else null,

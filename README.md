@@ -186,6 +186,10 @@ the read pool's staging and a host-side bound. The ceiling comes from the host o
 At a 240 GiB ceiling, a 2 GiB margin, a 10 GB baseline and the mixed build's 20.1 GB of residents, the 16K bill fills
 127 prompt and 137 decode rows per layer.
 
+Each request logs one `glm_moe_dsa: prompt` line at the end of its prompt pass and one `glm_moe_dsa: decode` line at
+its end (the arch's `requestEnd`), with the phase's wall time, SSD bytes, records read, read-ahead or lookahead use,
+host wait on reads, and in decode the hits, misses and hit rate per layer (min, median, max).
+
 Not available for GLM-5.3:
 
 - the draft lane (the MLX builds drop the MTP layer): decode is serial, one token per step;
