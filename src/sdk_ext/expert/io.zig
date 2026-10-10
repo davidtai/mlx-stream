@@ -28,6 +28,7 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
     pub extern fn q3ld_submit(fd: i32, file_size: i64, deadline: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
     pub extern fn q3ld_spec_step_len(fd: i32, file_size: i64, cur: i64, n: i32, bases: ?[*]const i64, len: i64) i32;
+    pub extern fn q3ld_spec_step_lens(fd: i32, file_size: i64, cur: i64, n: i32, bases: ?[*]const i64, lens: ?[*]const i64) i32;
     pub extern fn q3ld_spec_state(out: *[spec_state_w * max_spec]i64) i32;
     pub extern fn q3ld_seq() i64;
     pub extern fn q3ld_wait(seen: i64, timeout_ns: i64) i64;
@@ -61,7 +62,7 @@ pub const test_abi = if (builtin.is_test) struct {
     pub const status_words = res_w;
 } else struct {};
 
-pub const abi_version = 2026101001;
+pub const abi_version = 2026101002;
 pub const max_workers = 8;
 /// Records per job (one fill unit).
 pub const max_items = 8;
@@ -345,6 +346,15 @@ pub const Pool = struct {
     pub fn specStep(self: *Pool, fd: UncachedFd, cur: i64, bases: []const i64, len: u64) !u32 {
         const len_i: i64 = @intCast(if (len == 0) self.record_bytes else len);
         const rc = c.q3ld_spec_step_len(fd.fd, @intCast(fd.size), cur, @intCast(bases.len), bases.ptr, len_i);
+        if (rc < 0) return error.SpecRefused;
+        return @intCast(rc);
+    }
+
+    /// `specStep` whose record k is `lens[k]` bytes (records of layers of different lengths in one step).
+    pub fn specStepLens(self: *Pool, fd: UncachedFd, cur: i64, bases: []const i64, lens: []const i64) !u32 {
+        _ = self;
+        std.debug.assert(bases.len == lens.len);
+        const rc = c.q3ld_spec_step_lens(fd.fd, @intCast(fd.size), cur, @intCast(bases.len), bases.ptr, lens.ptr);
         if (rc < 0) return error.SpecRefused;
         return @intCast(rc);
     }

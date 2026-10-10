@@ -16,6 +16,7 @@ const bank_mod = @import("glm_moe_dsa_bank.zig");
 const cache_mod = @import("glm_moe_dsa_cache.zig");
 const io_mod = @import("sdk_ext.zig").expert.io;
 const mtp_mod = @import("glm_moe_dsa_mtp.zig");
+const exl3_bank = @import("glm_moe_dsa_exl3_bank.zig");
 
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
 pub const fill_prompt_tokens: u64 = 16384;
@@ -108,8 +109,6 @@ pub const Terms = struct {
     kv: [2]u64,
     mlx_cache: [2]u64,
     host_side: [2]u64,
-    /// What `rowsAt`'s rounding can add over the units' linear bytes (`roundingBytes`).
-    slot_rounding: [2]u64 = .{ 0, 0 },
     /// One fill unit of persistent slot rows (`unitBytes`).
     per_row: u64,
     /// The draft lane's: its residents and resident experts, its layer's KV, its waves (null: off).
@@ -118,19 +117,20 @@ pub const Terms = struct {
     /// A phase's wired bytes less its persistent rows (the row term's base): every device term.
     pub fn wired(t: Terms, phase: usize) u64 {
         const m = if (t.mtp) |x| x.residents[phase] + x.kv[phase] + x.waves[phase] else 0;
-        return t.transient_slots[phase] + t.slot_rounding[phase] + t.residents[phase] + t.waves[phase] + t.kv[phase] + t.mlx_cache[phase] + m;
+        return t.transient_slots[phase] + t.residents[phase] + t.waves[phase] + t.kv[phase] + t.mlx_cache[phase] + m;
     }
 };
 
-/// A stream layer's expert slots at `units` (the share rounded, at most its experts).
+/// A stream layer's expert slots at `units` (its share of them rounded down, at most its experts): never above what
+/// the units bill.
 fn slotsAt(l: glm.LayerSlots, units: u32) u32 {
     const experts = l.n_records / @max(l.rows_per_unit, 1);
-    const want: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(units)) * l.share));
+    const want: u32 = @intFromFloat(@floor(@as(f64, @floatFromInt(units)) * l.share));
     return @min(want, experts);
 }
 
 /// Each stream layer's rows at `units` (`Stream.Options.rows`, the grow's rows), in `out`: its rows per expert slot
-/// times its share of the units, rounded.
+/// times its share of the units, rounded down.
 pub fn rowsAt(g: glm.Geometry, units: u32, out: []u32) []u32 {
     for (g.layers, out[0..g.layers.len]) |l, *r| r.* = l.rows_per_unit * slotsAt(l, units);
     return out[0..g.layers.len];
@@ -150,23 +150,14 @@ pub fn unitBytes(g: glm.Geometry) u64 {
     return @intFromFloat(@ceil(n));
 }
 
-/// What `rowsAt`'s rounding can add over `unitBytes` at any unit count: half an expert slot on every layer whose share
-/// is not whole (0 for an even fill).
-pub fn roundingBytes(g: glm.Geometry) u64 {
-    var n: u64 = 0;
-    for (g.layers) |l| {
-        if (l.share != @round(l.share)) n += std.math.divCeil(u64, @as(u64, l.rows_per_unit) * l.record_bytes, 2) catch unreachable;
-    }
-    return n;
-}
-
-/// The most units the geometry takes: the most at which no layer's rounded share passes its experts.
+/// The most units the geometry takes: the most at which some layer still takes a slot more (past it every layer is
+/// full).
 pub fn maxUnits(g: glm.Geometry) u32 {
     if (g.layers.len == 0) return 0;
-    var n: u32 = std.math.maxInt(u32);
+    var n: u32 = 0;
     for (g.layers) |l| {
         const experts: f64 = @floatFromInt(l.n_records / @max(l.rows_per_unit, 1));
-        n = @min(n, @as(u32, @intFromFloat(@ceil((experts + 0.5) / l.share))) - 1);
+        n = @max(n, @as(u32, @intFromFloat(@ceil(experts / l.share))));
     }
     return n;
 }
@@ -255,7 +246,6 @@ pub fn termsOf(in: Inputs) Terms {
         .kv = .{ kvBytes(c, in.prompt_tokens), kvBytes(c, in.decode_positions) },
         .mlx_cache = .{ prefill_cache_bytes, decode_cache_bytes + decodeCacheOvershoot(c, in.decode_positions, s.decode_window_rows / glm.routed_top_k) },
         .host_side = .{ host_side_bytes, host_side_bytes },
-        .slot_rounding = .{ roundingBytes(g), roundingBytes(g) },
         .per_row = unitBytes(g),
         .mtp = if (in.mtp) |m| blk: {
             const res = m.resident_bytes + m.expert_bytes;
@@ -268,7 +258,6 @@ pub fn termsOf(in: Inputs) Terms {
 /// page tables following the rows. The baseline stays out (the fill and the admission take it).
 pub fn memoryBill(a: std.mem.Allocator, t: Terms) !sdk.MemoryBill {
     const T = sdk.MemoryBill.Term;
-    const rounding = [_]T{.{ .name = "slot rows' rounding", .bytes = t.slot_rounding, .at_construction = true }};
     const base = [_]T{
         .{ .name = "slot banks (transient rows)", .bytes = t.transient_slots, .at_construction = true },
         .{ .name = "read pool staging", .bytes = t.pool_staging, .at_construction = true },
@@ -284,7 +273,7 @@ pub fn memoryBill(a: std.mem.Allocator, t: Terms) !sdk.MemoryBill {
         .{ .name = "MTP KV", .bytes = m.kv, .at_construction = false },
         .{ .name = "MTP waves", .bytes = m.waves, .at_construction = false },
     } else &.{};
-    const terms = try std.mem.concat(a, T, &.{ &base, if (t.slot_rounding[0] > 0) &rounding else &[_]T{}, mtp_terms });
+    const terms = try std.mem.concat(a, T, &.{ &base, mtp_terms });
     return .{ .terms = terms, .per_row = t.per_row, .row_terms = .{ .data = .{ t.wired(0), t.wired(1), t.per_row, 0 }, .at = wiringAt } };
 }
 
@@ -322,7 +311,7 @@ pub fn decodeWindowRows(cfg: *const settings.Config) u32 {
 
 /// The stream's shape the module builds from `cfg`.
 pub fn streamShape(cfg: *const settings.Config) StreamShape {
-    return .{ .wide_depth = cfg.wideDepth(), .decode_window_rows = decodeWindowRows(cfg) };
+    return .{ .wide_depth = cfg.wideDepth(), .decode_window_rows = decodeWindowRows(cfg), .lookahead_budget = cfg.lookaheadBudget() };
 }
 
 /// The bill of `cfg`'s pack for prompts up to `prompt_tokens`: the residents from the shard headers (checked against
@@ -340,7 +329,7 @@ pub fn billOfKind(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config,
 pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, prompt_tokens: u64, kind: mtp_mod.BankKind, diag: ?*glm.Diag) !Inputs {
     const dir = cfg.model_dir orelse return error.GlmPackDir;
     const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
-    const geo = try bank_mod.Bank.geometry(a, io, dir, model, diag);
+    const geo = if (exl3_bank.present(dir)) try exl3_bank.Bank.geometry(a, io, dir, model, diag) else try bank_mod.Bank.geometry(a, io, dir, model, diag);
     const residents = try glm.residentBytes(a, io, dir, model, diag);
     return .{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .decode_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag) };
 }
@@ -479,7 +468,6 @@ fn glm53Geometry() bank_mod.Geometry {
 test "glm bill: a fill unit is every stream layer's rows per expert slot at its share; the module's rows follow the units" {
     try testing.expectEqual(@as(u64, 75 * 21_233_664), unitBytes(glm53Geometry()));
     try testing.expectEqual(@as(u32, 256), maxUnits(glm53Geometry()));
-    try testing.expectEqual(@as(u64, 0), roundingBytes(glm53Geometry()));
     var out: [75]u32 = undefined;
     for (rowsAt(glm53Geometry(), 131, &out)) |r| try testing.expectEqual(@as(u32, 131), r);
     try testing.expectEqual(131 * unitBytes(glm53Geometry()), slotBytes(glm53Geometry(), 131));
@@ -491,21 +479,19 @@ test "glm bill: a fill unit is every stream layer's rows per expert slot at its 
     try testing.expectEqual(@as(u64, 75 * 4 * (4_139_264 + 4_015_872)), unitBytes(g));
     try testing.expectEqual(@as(u32, 128), maxUnits(g));
     var o: [150]u32 = undefined;
-    // 100 units: 115.625 K3 and 84.375 K4 expert slots, rounded.
+    // 100 units: 115.625 K3 and 84.375 K4 expert slots, rounded down.
     const r = rowsAt(g, 100, &o);
-    try testing.expectEqual(@as(u32, 4 * 116), r[0]);
+    try testing.expectEqual(@as(u32, 4 * 115), r[0]);
     try testing.expectEqual(@as(u32, 4 * 84), r[1]);
     try testing.expectEqual(@as(u32, 592), rowsAt(g, 128, &o)[0]);
     try testing.expectEqual(@as(u32, 432), rowsAt(g, 128, &o)[1]);
-    // The rounding never passes the linear bytes by more than its term.
-    try testing.expectEqual(@as(u64, 75 * (2 * 3_579_904 + 2 * 4_759_552)), roundingBytes(g));
-    for (0..129) |u| try testing.expect(slotBytes(g, @intCast(u)) <= u * unitBytes(g) + roundingBytes(g));
+    // Rounded down, the rows never pass the units' linear bytes.
+    for (0..129) |u| try testing.expect(slotBytes(g, @intCast(u)) <= u * unitBytes(g));
     // The transient rows count each routed id's rows.
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const t = termsOf(.{ .model = &c, .bank = g, .resident_bytes = 0, .prompt_tokens = 1024, .decode_positions = 2048 });
     try testing.expectEqual(@as(u64, 2 * 48 * 4 * 4_759_552), t.transient_slots[0]);
-    try testing.expectEqual(roundingBytes(g), t.slot_rounding[1]);
 }
 
 test "glm bill: GLM-5.3's terms at 16K: 1.59 GB a row, the KV at 95.2 KB a position, the fill under a 240 GiB ceiling" {

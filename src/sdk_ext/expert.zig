@@ -110,6 +110,10 @@ pub const Stats = struct {
     spec_abandoned: u64 = 0,
     spec_discarded: u64 = 0,
     spec_cancelled: u64 = 0,
+    /// Of the claimed, those still in flight at the claim (the prediction right, the read late); the physical bytes
+    /// the abandoned records had read.
+    spec_claimed_inflight: u64 = 0,
+    spec_abandoned_bytes: u64 = 0,
     direct_ranges: u64 = 0,
     adopt_ranges: u64 = 0,
     adopt_bytes: u64 = 0,

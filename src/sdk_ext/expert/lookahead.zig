@@ -54,6 +54,16 @@ pub fn SelectorOf(comptime routed_top_k: u32) type {
         /// n_experts (row-major f32), `next` that layer's residency. Returns the
         /// first `out.len` non-resident experts of the ordered union.
         pub fn select(self: *Selector, scores: []const f32, next: *const LayerPolicy, out: []u16) []u16 {
+            return self.selectWith(scores, next, struct {
+                fn f(p: *const LayerPolicy, e: u16) bool {
+                    return p.slotOf(e) != null;
+                }
+            }.f, out);
+        }
+
+        /// `select` with the residency asked of `resident(ctx, expert)` (the next layer's experts over several
+        /// policies: one per bank layer).
+        pub fn selectWith(self: *Selector, scores: []const f32, ctx: anytype, comptime resident: fn (@TypeOf(ctx), u16) bool, out: []u16) []u16 {
             std.debug.assert(scores.len % self.n_experts == 0 and scores.len / self.n_experts <= max_rows);
             var entries: [max_rows * max_k]Entry = undefined;
             const ordered = self.order(scores, &entries);
@@ -61,7 +71,7 @@ pub fn SelectorOf(comptime routed_top_k: u32) type {
             for (ordered) |en| {
                 if (self.seen.isSet(en.expert)) continue;
                 self.seen.set(en.expert);
-                if (next.slotOf(en.expert) != null) continue;
+                if (resident(ctx, en.expert)) continue;
                 out[n] = en.expert;
                 n += 1;
                 if (n == out.len) break;

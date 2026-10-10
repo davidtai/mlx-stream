@@ -34,13 +34,18 @@ const graph = @import("glm_moe_dsa_graph.zig");
 const bank_mod = @import("glm_moe_dsa_bank.zig");
 const experts_mod = @import("glm_moe_dsa_experts.zig");
 const mtp_mod = @import("glm_moe_dsa_mtp.zig");
+const exl3_bank = @import("glm_moe_dsa_exl3_bank.zig");
+const exl3_quant = @import("glm_moe_dsa_exl3_quant.zig");
+/// PROFILE builds (`-Dplugin-profile=true`): each draft round's verify on the GPU timeline, its summary at the
+/// request's end (`VERIFY_GPU_TIMELINE`); every other build compiles it out.
+const timeline = @import("dsv41_verify_timeline.zig");
 
 const G = graph.G;
 const Stats = sdk_ext.expert.Stats;
 const LayerCounts = sdk_ext.expert.LayerCounts;
 
-/// The decode lookahead: the next routed layer's top-8 candidates, two records read ahead per call.
-pub const lookahead: struct { k: u32 = 8, budget: u32 = 2 } = .{};
+/// The decode lookahead: the next routed layer's top-8 candidates (its records per call: `expert_lookahead_budget`).
+pub const lookahead: struct { k: u32 = 8 } = .{};
 /// A gate whose bytes never land is forced after this (and fails the stream).
 pub const event_watchdog_ms: u32 = 2000;
 /// The chunk-major prompt pass's chunk (`layer_major_prefill` off).
@@ -63,8 +68,35 @@ pub const Overrides = struct {
     prefill_chunk: ?u32 = null,
 };
 
-/// The served module: the affine bank through MLX's `gather_qmm`, the MTP layer's experts from its EXL3 records.
+/// The served modules, the MTP layer's experts from its EXL3 records in both: the affine bank through MLX's
+/// `gather_qmm`; the EXL3 bank (its K3 and K4 bank layers per routed layer) through sushi's EXL3 MoE. The pack's
+/// manifest picks one at load (`Served`).
 pub const Module = ModuleOf(bank_mod, quant.FromGatherMatmul(quant.GatherQmm), .exl3);
+pub const Exl3Module = ModuleOf(exl3_bank, exl3_quant, .exl3);
+
+/// The module the pack's bank serves: the EXL3 one when the pack carries the EXL3 manifest, else the affine one.
+pub const Served = union(enum) {
+    affine: *Module,
+    exl3: *Exl3Module,
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host) !*Served {
+        const self = try gpa.create(Served);
+        errdefer gpa.destroy(self);
+        const dir = cfg.model_dir orelse return error.GlmPackDir;
+        self.* = if (exl3_bank.present(dir)) .{ .exl3 = try Exl3Module.init(gpa, io, cfg, weights, s, host) } else .{ .affine = try Module.init(gpa, io, cfg, weights, s, host) };
+        return self;
+    }
+
+    pub fn deinit(self: *Served) void {
+        const gpa = switch (self.*) {
+            inline else => |m| m.gpa,
+        };
+        switch (self.*) {
+            inline else => |m| m.deinit(),
+        }
+        gpa.destroy(self);
+    }
+};
 
 pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.BankKind) type {
     comptime quant.checkAccepted(Q, G);
@@ -147,6 +179,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const mb = try bill_mod.memoryBill(gpa, bill_mod.termsOf(inputs));
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
+            // The fill's unit (`bill.unitBytes`): every stream layer's share of its experts (`bill.rowsAt`).
             const max_units = bill_mod.maxUnits(inputs.bank);
             const rows: sdk.Rows = if (cfg.expert_rows) |forced| .{ .prompt = @min(cfg.expert_prefill_rows orelse forced, forced), .decode = forced } else sdk.fill(mb, baseline, targets.hard, max_units, bill_mod.min_fill_rows) catch |e| {
                 log.err("glm_moe_dsa: admission refused: {s} (baseline {d} B, target {d} B, {d} B a row)\n", .{ @errorName(e), baseline, targets.hard, mb.per_row });
@@ -181,6 +214,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             errdefer gpa.free(self.decode_rows);
             _ = bill_mod.rowsAt(self.inputs.bank, rows.prompt, self.prompt_rows);
             _ = bill_mod.rowsAt(self.inputs.bank, rows.decode, self.decode_rows);
+            if (n_bank > 1 and self.inputs.bank.layers.len > self.model.nSparse()) log.info("glm_moe_dsa: {d} bank layers, rows per bank layer prompt {d} / {d}, decode {d} / {d} (the first routed layer's two)\n", .{ n_bank, self.prompt_rows[0], self.prompt_rows[1], self.decode_rows[0], self.decode_rows[1] });
             self.layer_counts0 = try gpa.alloc(LayerCounts, n_bank);
             errdefer gpa.free(self.layer_counts0);
             self.layer_counts1 = try gpa.alloc(LayerCounts, n_bank);
@@ -201,8 +235,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .decode_window_rows = shape.decode_window_rows * self.inputs.bank.rows_per_id,
                 .slot_memory = .{ .mlx = s },
                 .staging_from_bank = true,
-                .pool = .{ .workers = shape.workers, .tickets = 1024, .direct = true },
-                .lookahead = .{ .k = lookahead.k, .budget = lookahead.budget },
+                .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
+                .pool = .{ .workers = shape.workers, .tickets = 1024 * Bk.Stream.maxMinis(&self.bank), .direct = true },
+                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
             });
             errdefer self.stream.deinit();
@@ -418,6 +453,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             log.info("{f}\n", .{line});
             startPhase();
             self.decoding = true;
+            if (comptime timeline.enabled) if (self.mtp != null) {
+                timeline.install(self.g.s, @intCast(@min(h.reserved_tokens -| h.prompt_tokens, timeline.max_cycles + 1)), @intCast(self.bank.layers.len / Experts.bpl)) catch |e|
+                    log.warn("glm_moe_dsa: the verify timeline is off ({s})\n", .{@errorName(e)});
+            };
             self.decode_mark = .{ .s0 = self.stream.stats(), .mem0 = Mem.now() };
             if (self.mtp) |ln| ln.counts = .{};
             for (self.layer_counts0, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
@@ -425,8 +464,15 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
         /// The request's end (the host's finish): its decode line, once; nothing when it never decoded.
         pub fn requestEnd(self: *Self) void {
+            if (comptime timeline.enabled) if (timeline.active) {
+                const pending = timeline.settle(self.g.s, 2000);
+                timeline.uninstall();
+                var tb: [16384]u8 = undefined;
+                log.info("glm_moe_dsa: {s}\n", .{timeline.line(&tb, pending)});
+            };
             if (self.mtp) |ln| if (ln.counts.rounds > 0) {
                 log.info("{f}\n", .{ln.line()});
+                log.info("{f}\n", .{mtp_mod.ProbLine{ .c = ln.counts }});
                 ln.counts = .{};
             };
             const d = self.decode_mark orelse return;
@@ -441,7 +487,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .wall_ns = d.wall_ns,
                 .r = .of(d.s0, self.stream.stats()),
                 .hit_rate = hitSpread(self.layer_counts0, self.layer_counts1, self.layer_rates),
-                .rows = self.decode_units,
+                .rows = self.decode_rows[0],
+                .rows_alt = if (Experts.bpl > 1) self.decode_rows[1] else null,
                 .mem = .{ .start = d.mem0, .end = end },
                 .box = Box.now(end),
             }});
@@ -509,6 +556,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// `mtpRound` with a test's `probe`.
         pub fn roundWith(self: *Self, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams, probe: ?*Probe) !sdk.DraftRound {
             const ln = self.mtp orelse return error.NoDraftLane;
+            if (comptime timeline.enabled) timeline.cycleBegin();
             const t0 = self.nowNs();
             const peak0 = self.g.peakFrom();
             const len = self.cache.len;
@@ -526,10 +574,13 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }
             const m0 = self.g.mark();
             defer self.g.resetTo(m0);
+            self.ex.row_bytes = @splat(0);
+            if (comptime timeline.enabled) timeline.verifyBegin();
             const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, self.routes, .{ .verify = true, .hidden = true });
             defer self.g.release(out.logits);
             defer self.g.release(out.hidden.?);
             try self.g.evalAll(&.{ out.logits, out.hidden.? });
+            if (comptime timeline.enabled) timeline.verifyEnd();
             try self.ex.flush();
             const t_verify = self.nowNs();
             const d = try mtp_mod.decide(&self.g, out.logits, drafts, ln.mode, sampling, len);
@@ -548,6 +599,15 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             ln.counts.draft_ns += t_draft - t0;
             ln.counts.verify_ns += t_verify - t_draft;
             ln.counts.peak_rise = @max(ln.counts.peak_rise, self.g.peakAbove(peak0));
+            for (self.ex.row_bytes[0 .. depth + 1], 0..) |b, i| {
+                ln.counts.verify_bytes += b;
+                if (i > d.accepted) ln.counts.rejected_bytes += b;
+            }
+            // The steps the decision reached: the accepted drafts and the first rejected one.
+            for (ln.top_p[0..@min(depth, d.accepted + 1)], 0..) |tp, i| {
+                ln.counts.decided[mtp_mod.tenth(tp)] += 1;
+                if (i < d.accepted) ln.counts.accepted_by_p[mtp_mod.tenth(tp)] += 1;
+            }
             if (self.decode_mark) |*dm| {
                 dm.steps += 1;
                 dm.tokens += rows;
@@ -714,6 +774,11 @@ pub const Reads = struct {
     spec_abandoned: u64 = 0,
     spec_cancelled: u64 = 0,
     spec_discarded: u64 = 0,
+    /// Of the used, those still in flight at the claim (late); the bytes the lookahead read, of them the bytes it
+    /// served to a demand read.
+    spec_late: u64 = 0,
+    spec_bytes: u64 = 0,
+    spec_served_bytes: u64 = 0,
     /// Loads whose slot still held the record (no read); demand ranges read straight into their rows.
     loads_skipped: u64 = 0,
     direct: u64 = 0,
@@ -741,6 +806,9 @@ pub const Reads = struct {
             .spec_abandoned = d(s0.spec_abandoned, s1.spec_abandoned),
             .spec_cancelled = d(s0.spec_cancelled, s1.spec_cancelled),
             .spec_discarded = d(s0.spec_discarded, s1.spec_discarded),
+            .spec_late = d(s0.spec_claimed_inflight, s1.spec_claimed_inflight),
+            .spec_bytes = d(s0.spec_bytes, s1.spec_bytes),
+            .spec_served_bytes = d(s0.adopt_bytes, s1.adopt_bytes),
             .loads_skipped = d(s0.loads_skipped, s1.loads_skipped),
             .direct = d(s0.direct_ranges, s1.direct_ranges),
             .wait_ns = d(s0.read_wait_ns, s1.read_wait_ns),
@@ -775,6 +843,12 @@ fn perSecond(n: u64, ns: u64) f64 {
     return if (ns == 0) 0 else @as(f64, @floatFromInt(n)) / seconds(ns);
 }
 
+/// The share of `wall` with a read in flight, in percent (0 for no wall time).
+fn busyPct(in_flight: u64, wall: u64) f64 {
+    if (wall == 0) return 0;
+    return 100 * @min(@as(f64, @floatFromInt(in_flight)) / @as(f64, @floatFromInt(wall)), 1);
+}
+
 fn gigabytes(b: u64) f64 {
     return @as(f64, @floatFromInt(b)) / 1e9;
 }
@@ -802,6 +876,8 @@ pub const DecodeLine = struct {
     r: Reads,
     hit_rate: ?Spread,
     rows: u32,
+    /// A bank of two bank layers per routed layer: the second's rows (`rows` the first's).
+    rows_alt: ?u32 = null,
     mem: ?PhaseMem = null,
     /// The box at the request's end (the rest of it beside the handover's reading).
     box: ?Box = null,
@@ -811,9 +887,10 @@ pub const DecodeLine = struct {
             p.steps, p.tokens, seconds(p.wall_ns), perSecond(p.tokens, p.wall_ns), p.r.hits + p.r.misses, p.r.hits, p.r.misses,
         });
         if (p.hit_rate) |h| try w.print(" (hit rate per layer min {d:.0}% median {d:.0}% max {d:.0}%)", .{ h.min, h.median, h.max });
-        try w.print(", {d:.2} GB from the SSD, lookahead {d} issued / {d} used (landed {d}, expired {d}, abandoned {d}, cancelled {d}, discarded {d}), {d} loads skipped, {d} direct reads, host wait {d:.2} s and reads in flight {d:.2} s of {d:.2} s, {d} rows per layer", .{
-            gigabytes(p.r.ssd_bytes), p.r.spec_issued, p.r.spec_used, p.r.spec_landed, p.r.spec_expired, p.r.spec_abandoned, p.r.spec_cancelled, p.r.spec_discarded, p.r.loads_skipped, p.r.direct, seconds(p.r.wait_ns), seconds(p.r.in_flight_ns), seconds(p.wall_ns), p.rows,
+        try w.print(", {d:.2} GB from the SSD ({d:.3} GB per emitted token), lookahead {d} issued / {d} used (landed {d}, expired {d}, abandoned {d}, cancelled {d}, discarded {d}, used while in flight {d}), lookahead {d:.2} GB read / {d:.2} GB served, {d} loads skipped, {d} direct reads, host wait {d:.2} s and reads in flight {d:.2} s of {d:.2} s ({d:.1}% busy, {d:.1}% with no read in flight), {d}", .{
+            gigabytes(p.r.ssd_bytes), if (p.tokens == 0) 0 else gigabytes(p.r.ssd_bytes) / @as(f64, @floatFromInt(p.tokens)), p.r.spec_issued, p.r.spec_used, p.r.spec_landed, p.r.spec_expired, p.r.spec_abandoned, p.r.spec_cancelled, p.r.spec_discarded, p.r.spec_late, gigabytes(p.r.spec_bytes), gigabytes(p.r.spec_served_bytes), p.r.loads_skipped, p.r.direct, seconds(p.r.wait_ns), seconds(p.r.in_flight_ns), seconds(p.wall_ns), busyPct(p.r.in_flight_ns, p.wall_ns), 100 - busyPct(p.r.in_flight_ns, p.wall_ns), p.rows,
         });
+        if (p.rows_alt) |r2| try w.print(" / {d} rows per bank layer (its two Ks)", .{r2}) else try w.writeAll(" rows per layer");
         if (p.mem) |m| try w.print("; {f}", .{m});
         if (p.box) |b| try w.print("; the box {d:.3} GB used, the rest of it {d:.3} GB", .{ gigabytes(b.used), gigabytes(b.others) });
     }
@@ -823,9 +900,9 @@ const testing = std.testing;
 
 test "glm stats lines: the prompt and decode lines and the per-layer hit spread, from fixed counters" {
     const s0: Stats = .{ .expert_bytes_read = 100, .adopt_bytes = 10, .spec_bytes = 5, .persistent_loads = 3, .transient_loads = 1, .loads_skipped = 1, .expert_cache_hits = 7, .expert_cache_misses = 4 };
-    const s1: Stats = .{ .expert_bytes_read = 8_000_000_100, .adopt_bytes = 1_000_000_010, .spec_bytes = 2_000_000_005, .persistent_loads = 303, .transient_loads = 101, .loads_skipped = 21, .expert_cache_hits = 607, .expert_cache_misses = 404, .ahead_posted = 50, .ahead_hits = 40, .spec_issued = 90, .claimed = 60, .read_wait_ns = 1_500_000_000, .read_wall_ns = 2_250_000_000, .spec_landed = 70, .spec_expired = 12, .spec_abandoned = 5, .spec_cancelled = 3, .spec_discarded = 7, .direct_ranges = 300 };
+    const s1: Stats = .{ .expert_bytes_read = 8_000_000_100, .adopt_bytes = 1_000_000_010, .spec_bytes = 2_000_000_005, .persistent_loads = 303, .transient_loads = 101, .loads_skipped = 21, .expert_cache_hits = 607, .expert_cache_misses = 404, .ahead_posted = 50, .ahead_hits = 40, .spec_issued = 90, .claimed = 60, .read_wait_ns = 1_500_000_000, .read_wall_ns = 2_250_000_000, .spec_landed = 70, .spec_expired = 12, .spec_abandoned = 5, .spec_cancelled = 3, .spec_discarded = 7, .direct_ranges = 300, .spec_claimed_inflight = 4 };
     const r = Reads.of(s0, s1);
-    try testing.expectEqual(Reads{ .ssd_bytes = 9_000_000_000, .demand_records = 380, .ahead_records = 50, .ahead_hits = 40, .hits = 600, .misses = 400, .spec_issued = 90, .spec_used = 60, .spec_landed = 70, .spec_expired = 12, .spec_abandoned = 5, .spec_cancelled = 3, .spec_discarded = 7, .loads_skipped = 20, .direct = 300, .wait_ns = 1_500_000_000, .in_flight_ns = 2_250_000_000 }, r);
+    try testing.expectEqual(Reads{ .ssd_bytes = 9_000_000_000, .demand_records = 380, .ahead_records = 50, .ahead_hits = 40, .hits = 600, .misses = 400, .spec_issued = 90, .spec_used = 60, .spec_landed = 70, .spec_expired = 12, .spec_abandoned = 5, .spec_cancelled = 3, .spec_discarded = 7, .spec_late = 4, .spec_bytes = 2_000_000_000, .spec_served_bytes = 1_000_000_000, .loads_skipped = 20, .direct = 300, .wait_ns = 1_500_000_000, .in_flight_ns = 2_250_000_000 }, r);
     // Three layers: 1 of 4 hit, 3 of 4, none routed (skipped), 2 of 4.
     const c0 = [_]LayerCounts{ .{}, .{ .hits = 5 }, .{ .hits = 9, .misses = 9 }, .{} };
     const c1 = [_]LayerCounts{ .{ .hits = 1, .misses = 3 }, .{ .hits = 8, .misses = 1 }, .{ .hits = 9, .misses = 9 }, .{ .hits = 2, .misses = 2 } };
@@ -836,9 +913,9 @@ test "glm stats lines: the prompt and decode lines and the per-layer hit spread,
     const p = try std.fmt.allocPrint(a, "{f}", .{PromptLine{ .tokens = 1008, .wall_ns = 31_500_000_000, .r = r }});
     defer a.free(p);
     try testing.expectEqualStrings("glm_moe_dsa: prompt 1008 tokens in 31.50 s (32.0 tok/s): 9.00 GB from the SSD, 380 records on demand, 50 read ahead (40 routed), host wait 1.50 s", p);
-    const d = try std.fmt.allocPrint(a, "{f}", .{DecodeLine{ .steps = 128, .tokens = 128, .wall_ns = 25_000_000_000, .r = r, .hit_rate = hitSpread(&c0, &c1, &rates), .rows = 136 }});
+    const d = try std.fmt.allocPrint(a, "{f}", .{DecodeLine{ .steps = 40, .tokens = 128, .wall_ns = 25_000_000_000, .r = r, .hit_rate = hitSpread(&c0, &c1, &rates), .rows = 136 }});
     defer a.free(d);
-    try testing.expectEqualStrings("glm_moe_dsa: decode 128 steps, 128 tokens in 25.00 s (5.1 tok/s): 1000 routed records, 600 hits, 400 misses (hit rate per layer min 25% median 50% max 75%), 9.00 GB from the SSD, lookahead 90 issued / 60 used (landed 70, expired 12, abandoned 5, cancelled 3, discarded 7), 20 loads skipped, 300 direct reads, host wait 1.50 s and reads in flight 2.25 s of 25.00 s, 136 rows per layer", d);
+    try testing.expectEqualStrings("glm_moe_dsa: decode 40 steps, 128 tokens in 25.00 s (5.1 tok/s): 1000 routed records, 600 hits, 400 misses (hit rate per layer min 25% median 50% max 75%), 9.00 GB from the SSD (0.070 GB per emitted token), lookahead 90 issued / 60 used (landed 70, expired 12, abandoned 5, cancelled 3, discarded 7, used while in flight 4), lookahead 2.00 GB read / 1.00 GB served, 20 loads skipped, 300 direct reads, host wait 1.50 s and reads in flight 2.25 s of 25.00 s (9.0% busy, 91.0% with no read in flight), 136 rows per layer", d);
 }
 
 test "glm stats lines: a prompt pass with read-ahead and a decode with the lookahead on the synthetic bank read back exactly" {
@@ -1025,4 +1102,50 @@ test "glm box: the box's used memory holds this process's footprint, and the res
     const box = Box.now(m);
     try testing.expect(box.used >= m.footprint and box.used <= sdk.memory.totalMemBytes());
     try testing.expectEqual(box.used - m.footprint - bill_mod.wireTables(0), box.others);
+}
+
+test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3 module, each bank layer's rows its share of the units, and a prompt and decode steps run on the GPU" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    var model = try exl3_bank.tinyConfigInter(a, 512);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try exl3_bank.writeSynth(a, testing.io, tmp.dir, &model, .{ .signs = true });
+    defer a.free(img);
+    try glm.writeResidents(a, testing.io, tmp.dir, &model);
+    var rbuf: [512]u8 = undefined;
+    const dir = try exl3_bank.tmpRoot(&tmp, &rbuf);
+    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3, .expert_lookahead_budget = 3 };
+    defer cfg.deinit(a);
+    var weights = try sdk.loader.dir(testing.io, a, dir, .{});
+    defer weights.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const sv = try Served.init(a, testing.io, &cfg, &weights, s, .{ .ceiling = 64 << 30, .wired_margin = 0 });
+    defer sv.deinit();
+    const m = sv.exl3;
+    // The setting's lookahead budget is the stream's.
+    try testing.expectEqual(@as(u32, 3), m.stream.selector.?.budget);
+    try testing.expectEqual(@as(usize, 8), m.decode_rows.len);
+    for (m.prompt_rows, m.decode_rows) |p, d| {
+        try testing.expectEqual(@as(u32, 3), p);
+        try testing.expectEqual(@as(u32, 5), d);
+    }
+    const prompt = [_]u32{ 3, 17, 9, 101, 44, 250, 7, 63, 12, 5, 99, 31 };
+    const logits = try m.prefillAt(0, &prompt);
+    var t = try m.g.hostArgmax(logits);
+    _ = mlx.mlx_array_free(logits);
+    try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
+    var row: [256]f32 = undefined;
+    for (0..4) |_| {
+        const lg = try m.extend(&.{t});
+        defer _ = mlx.mlx_array_free(lg);
+        _ = try m.g.hostF32(try m.g.astype(lg, .float32), &row);
+        for (row) |v| try testing.expect(std.math.isFinite(v));
+        t = try m.g.hostArgmax(lg);
+    }
+    const st = m.stats();
+    try testing.expect(st.expert_cache_misses > 0 and st.route_calls > 0);
+    m.requestEnd();
 }
