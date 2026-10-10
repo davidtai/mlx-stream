@@ -41,6 +41,20 @@ pub fn parse(a: std.mem.Allocator, p: *const sdk.ConfigPeek, diag: *sdk.Diag) !*
     const c = try a.create(Config);
     errdefer a.destroy(c);
     c.* = .{ .mimo = parsed, .expert_bank_dir = if (p.model_dir.len > 0) try a.dupe(u8, p.model_dir) else null };
+    errdefer if (c.expert_bank_dir) |dir| a.free(dir);
+    // The pack's construction settings (`expert_streaming.settings`), read once here and validated with the load's
+    // facts (`applyLoadFacts`): a block that is not an object or a key that is not a setting refuses the load by name.
+    if (p.root.get("expert_streaming").?.object.get("settings")) |raw| {
+        if (raw != .object) {
+            diag.set("expert_streaming.settings is not a JSON object", .{});
+            return error.MimoSettingsBlock;
+        }
+        if (settings.unknownSetting(raw.object)) |key| {
+            diag.set("expert_streaming.settings: \"{s}\" is not a MiMo setting", .{key});
+            return error.MimoSettingUnknown;
+        }
+        c.applySettings(raw);
+    }
     return c;
 }
 
@@ -53,6 +67,8 @@ pub fn shell(c: *const Config) sdk.Shell {
     return .{ .num_experts = c.mimo.n_routed_experts, .num_layers = c.mimo.n_layers, .kv_quant_bits = if (c.kv_mode == .bf16) 0 else 8 };
 }
 
+/// The SDK's per-model settings seam: a host that hands this model's settings object applies it after the pack's
+/// block (the same keys, `settings.setting_keys`; a host key it does not read is left to the host).
 pub fn applySettings(c: *Config, raw: std.json.Value) void {
     c.applySettings(raw);
 }
@@ -433,4 +449,32 @@ test "mimo filepart: construction fills on the box baseline, the preflight and a
     if (comptime @import("builtin").os.tag.isDarwin()) try std.testing.expect(box > 1_000_000_000);
     // withFacts (applyLoadFacts, loadBytes) is unchanged: the host's value.
     try std.testing.expectEqual(@as(?u64, 9_000_000_000), packed_cfg.withFacts(&.{ .memory_baseline_bytes = 9_000_000_000, .wired_margin_bytes = 0 }).memory_baseline_bytes);
+}
+
+test "mimo pack settings: expert_streaming.settings is applied at parse; a non-object block or an unknown key refuses by name" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const marker = "\"manifest\": \"expert-manifest.json\"";
+    std.debug.assert(std.mem.indexOf(u8, fixture_json, marker) != null);
+    const Case = struct { block: []const u8, err: ?anyerror };
+    for ([_]Case{
+        .{ .block = ", \"settings\": {\"mtp_lane\": false, \"decode_glue\": \"ops\", \"prefill_read_schedule\": \"current\"}", .err = null },
+        .{ .block = ", \"settings\": [1]", .err = error.MimoSettingsBlock },
+        .{ .block = ", \"settings\": {\"embedding\": \"rows\"}", .err = error.MimoSettingUnknown },
+    }) |case| {
+        const text = try std.mem.replaceOwned(u8, arena.allocator(), fixture_json, marker, try std.mem.concat(arena.allocator(), u8, &.{ marker, case.block }));
+        const peek = try sdk.ConfigPeek.parse(arena.allocator(), "/fixture", text);
+        var diag: sdk.Diag = .{};
+        if (case.err) |want| {
+            try std.testing.expectError(want, parse(a, &peek, &diag));
+            try std.testing.expect(diag.message().len > 0);
+            continue;
+        }
+        const c = try parse(a, &peek, &diag);
+        defer freeConfig(a, c);
+        try std.testing.expect(!c.mtp_heads);
+        try std.testing.expectEqual(@import("glue.zig").Route.ops, c.decode_glue);
+        try std.testing.expectEqual(@import("stream.zig").ReadSchedule.current, c.prefill_read_schedule);
+    }
 }

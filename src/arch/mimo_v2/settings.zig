@@ -173,6 +173,49 @@ pub fn layerRows(split: LayerRows, rows: sdk.Rows, n_experts: u32) !LayerRowVect
     return out;
 }
 
+/// Every key `Config.applySettings` reads, in its order: a pack's `expert_streaming.settings` block may name these and
+/// nothing else (`unknownSetting`).
+pub const setting_keys = [_][]const u8{
+        "kv_quant",
+        "prefill_read_ahead",
+        "mtp_lane",
+        "draft_tier",
+        "draft_delta",
+        "draft_depth",
+        "decode_attention",
+        "decode_moe",
+        "decode_moe_kernel",
+        "prefill_attention",
+        "expert_rows",
+        "expert_prefill_rows",
+        "expert_rows_by_layer",
+        "phase_rows",
+        "prefill_drain",
+        "prefill_combine",
+        "prefill_bank_view",
+        "prefill_scratch",
+        "prefill_predict_evals",
+        "prefill_read_schedule",
+        "prefill_read_schedule_threshold",
+        "decode_glue",
+        "decode_grow",
+        "decode_window",
+        "gpu_keep_warm",
+        "fp8_prompt_slots",
+        "fp8_gemv_plan",
+        "predict_router",
+};
+
+/// The first key of a settings object that is not one of `setting_keys` (null: every key is a setting).
+pub fn unknownSetting(raw: std.json.ObjectMap) ?[]const u8 {
+    var it = raw.iterator();
+    next: while (it.next()) |e| {
+        for (setting_keys) |k| if (std.mem.eql(u8, k, e.key_ptr.*)) continue :next;
+        return e.key_ptr.*;
+    }
+    return null;
+}
+
 pub const Config = struct {
     mimo: mimo.Config = .{},
     expert_bank_dir: ?[]const u8 = null,
@@ -468,6 +511,9 @@ pub const Config = struct {
         return c.phase_rows and (!c.mtp_heads or c.decode_grow == .after_draft);
     }
 
+    /// The construction settings: the pack's `expert_streaming.settings` object (root.zig `parse`, which first refuses
+    /// a key outside `setting_keys`), then, where a host hands one, the model's per-model settings object (the SDK's
+    /// `applySettings`). Read once per load; `validate` refuses a bad value by name.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
         if (raw != .object) return;
         if (raw.object.get("kv_quant")) |v| {
@@ -1248,4 +1294,23 @@ test "mimo settings: predict_router bf16 by default, f32 (the control) by settin
     try std.testing.expectEqual(PredictRoute.f32, ctl.predict_router);
     for ([_][]const u8{ "{\"predict_router\":\"bf16_gemv\"}", "{\"predict_router\":\"invalid\"}", "{\"predict_router\":1}", "{\"predict_router\":\"F32\"}" }) |t|
         try std.testing.expectError(error.MimoPredictRouter, (try parse(t)).validate());
+}
+
+test "mimo settings: setting_keys is every key applySettings reads: each key with a value it does not take refuses by name; an unknown key is named" {
+    for (setting_keys) |key| {
+        var buf: [96]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{{\"{s}\":{{\"x\":1}}}}", .{key});
+        const v = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer v.deinit();
+        var c: Config = .{};
+        c.applySettings(v.value);
+        if (c.validate()) |_| {
+            std.debug.print("setting {s}: an object value validated\n", .{key});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        try std.testing.expect(unknownSetting(v.value.object) == null);
+    }
+    const v = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"decode_glue\":\"fused\",\"decode_sliding\":\"fused\"}", .{});
+    defer v.deinit();
+    try std.testing.expectEqualStrings("decode_sliding", unknownSetting(v.value.object).?);
 }
