@@ -11,6 +11,7 @@ const settings = @import("glm_moe_dsa_settings.zig");
 const bank_mod = @import("glm_moe_dsa_bank.zig");
 const io_mod = @import("sdk_ext.zig").expert.io;
 const mtp_mod = @import("glm_moe_dsa_mtp.zig");
+const exl3_bank = @import("glm_moe_dsa_exl3_bank.zig");
 
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
 pub const fill_prompt_tokens: u64 = 16384;
@@ -214,7 +215,7 @@ pub fn billOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, pro
 pub fn billOfKind(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, prompt_tokens: u64, kind: mtp_mod.BankKind, diag: ?*glm.Diag) !sdk.MemoryBill {
     const dir = cfg.model_dir orelse return error.GlmPackDir;
     const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
-    const geo = try bank_mod.Bank.geometry(a, io, dir, model, diag);
+    const geo = if (exl3_bank.present(dir)) try exl3_bank.Bank.geometry(a, io, dir, model, diag) else try bank_mod.Bank.geometry(a, io, dir, model, diag);
     const residents = try glm.residentBytes(a, io, dir, model, diag);
     return memoryBill(a, termsOf(.{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .max_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag) }));
 }

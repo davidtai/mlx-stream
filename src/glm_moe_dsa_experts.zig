@@ -45,6 +45,14 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         const S = Bk.Stream;
         pub const Stream = S.Stream;
         pub const Arrays = Bk.BankArrays;
+        /// Stream layers per routed layer (GLM-5.3's EXL3 bank: its K3 and K4 bank layers): a call's ids split by the
+        /// bank layer that holds each expert, one route each.
+        pub const bpl: u32 = if (@hasDecl(Bk, "banks_per_layer")) Bk.banks_per_layer else 1;
+        /// The quant fuses gate, up and down (`M.fused`): each wave runs once all its segments landed.
+        const fused = @hasDecl(M, "fused_waves") and M.fused_waves;
+        comptime {
+            if (bpl > 1 and !fused) @compileError("a bank of several bank layers per routed layer streams through a fused quant");
+        }
 
         a: std.mem.Allocator,
         stream: *Stream,
@@ -71,10 +79,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             pos: std.ArrayList(u32) = .empty,
             inv: std.ArrayList(u32) = .empty,
             kept: std.ArrayList(T) = .empty,
+            side_ids: std.ArrayList(u16) = .empty,
 
             fn deinit(w: *Wide, a: std.mem.Allocator, g: *G) void {
                 for (w.kept.items) |x| g.release(x);
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.slot, &w.act, &w.pos, &w.inv, &w.kept }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.slot, &w.act, &w.pos, &w.inv, &w.kept, &w.side_ids }) |l| l.deinit(a);
             }
         };
 
@@ -156,7 +165,16 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
 
         /// P1: layer `layer`'s predicted experts (hottest first) read ahead of its routed call (prompt phase).
         pub fn readAheadSeed(self: *Self, layer: u32, experts: []const u16) !void {
-            return self.stream.readAheadSeed(layer, experts);
+            if (bpl == 1) return self.stream.readAheadSeed(layer, experts) else {
+                // One read-ahead is live at a time: the first bank layer's share of the seed, hottest first.
+                var buf: [512]u16 = undefined;
+                var n: usize = 0;
+                for (experts) |e| if (n < buf.len and self.stream.bank.streamLayer(layer, e) == bpl * layer) {
+                    buf[n] = e;
+                    n += 1;
+                };
+                return self.stream.readAheadSeed(bpl * layer, buf[0..n]);
+            }
         }
 
         /// One routed-layer call: x [n, hidden], indices [n, k] int32, scores [n, k] f32 -> the weighted sum [n, hidden]
@@ -168,7 +186,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const n: u32 = @intCast(g.shapeOf(x).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
             if (n * k > self.stream.max_route_ids) return self.callWide(g, layer, x, indices, scores, n, k);
-            const y = try self.callDecode(g, layer, x, indices, next_scores, n, k, hoist);
+            const y = if (bpl > 1) try self.callDecodeSplit(g, layer, x, indices, next_scores, n, k, hoist) else try self.callDecode(g, layer, x, indices, next_scores, n, k, hoist);
             return combine(g, y, scores, g.dtypeOf(x));
         }
 
@@ -413,26 +431,192 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
         }
 
+        /// One route of a split call: its stream layer, its ids and their positions in the call (routed order), its
+        /// slot refs and each position's wave.
+        const Side = struct {
+            sl: u32 = 0,
+            n: u32 = 0,
+            ids: [max_route_ids]u16 = undefined,
+            pos: [max_route_ids]u8 = undefined,
+            r: ?*S.Route = null,
+            refs: [max_route_ids]SlotRef = undefined,
+            waves: [max_route_ids]u8 = undefined,
+        };
+
+        /// The decode lane over a routed layer's `bpl` bank layers: the ids split by the bank layer that holds each
+        /// expert and every route made before any wave (their reads in flight together; the last route reads ahead
+        /// the next routed layer's first bank layer, the stream's next layer, from the scores of its experts only),
+        /// every route's hit wave and the hoisted arrays in one commit, then each route's parts as fused waves, each
+        /// once all its segments landed; the outputs `[n, k, hidden]` in routed order.
+        fn callDecodeSplit(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
+            const n_ids = n * k;
+            const bank = self.stream.bank;
+            var id_buf: [max_route_ids]u16 = undefined;
+            var score_buf: [sdk_ext.expert.lookahead.max_rows * 512]f32 = undefined;
+            var sc: []f32 = &.{};
+            const read_next = next_scores != null and self.stream.route_lookahead and n * self.n_experts <= score_buf.len;
+            if (read_next) {
+                try g.evalAll(&.{ indices, next_scores.? });
+                sc = @constCast(try g.hostF32(next_scores.?, score_buf[0 .. n * self.n_experts]));
+                if (layer + 1 < bank.layers.len / bpl) for (0..self.n_experts) |e| {
+                    if (bank.streamLayer(layer + 1, @intCast(e)) == bpl * (layer + 1)) continue;
+                    for (0..n) |row| sc[row * self.n_experts + e] = -std.math.inf(f32);
+                };
+            }
+            const ids = try g.hostIds(indices, id_buf[0..n_ids]);
+            var sides: [bpl]Side = @splat(.{});
+            for (&sides, 0..) |*sd, i| sd.sl = bpl * layer + @as(u32, @intCast(i));
+            for (ids, 0..) |e, p| {
+                const sd = &sides[bank.streamLayer(layer, e) - bpl * layer];
+                sd.ids[sd.n] = e;
+                sd.pos[sd.n] = @intCast(p);
+                sd.n += 1;
+            }
+            errdefer for (&sides) |*sd| if (sd.r) |r| {
+                self.stream.release(r);
+                sd.r = null;
+            };
+            var last: usize = 0;
+            for (sides, 0..) |sd, i| if (sd.n > 0) {
+                last = i;
+            };
+            for (&sides, 0..) |*sd, i| {
+                if (sd.n == 0) continue;
+                const r = try self.stream.route(sd.sl, sd.ids[0..sd.n], if (i == last) sc else &.{});
+                sd.r = r;
+                const geom = &bank.layers[sd.sl];
+                const record = @as(u64, S.minisOf(geom)) * geom.logical_bytes;
+                for (r.plan.loadsOf(), r.reads[0..r.plan.n_loads]) |l, read| if (read) {
+                    const at = std.mem.indexOfScalar(u16, sd.ids[0..sd.n], l.expert) orelse continue;
+                    self.row_bytes[sd.pos[at] / k] += record;
+                };
+                _ = self.stream.refsOf(r, &sd.refs);
+                var bufs: [max_route_ids][max_route_ids]expert_policy.Load = undefined;
+                var parts: [max_route_ids][]const expert_policy.Load = undefined;
+                for (0..r.n_parts) |p| parts[p] = r.partLoads(@intCast(p), &bufs[p]);
+                expert_stream.wavesOf(&r.plan, r.hit_slots[0..r.plan.n_hits], parts[0..r.n_parts], sd.waves[0..sd.n]);
+            }
+            var acc: Acc = .{};
+            // Every route's hit wave and the hoisted arrays in one commit, ahead of every wait on a read.
+            var early: [bpl * n_banks + 4]T = undefined;
+            var n_early: usize = 0;
+            for (&sides) |*sd| if (sd.r != null) for (try self.fusedWave(g, sd, x, k, 0, &acc, null)) |o| {
+                early[n_early] = o;
+                n_early += 1;
+            };
+            for (hoist) |h| {
+                if (n_early == early.len) break;
+                early[n_early] = h;
+                n_early += 1;
+            }
+            if (n_early > 0) try g.asyncEval(early[0..n_early]);
+            var prev: []const T = &.{};
+            for (&sides) |*sd| if (sd.r) |r| {
+                if (self.opt.gated) {
+                    const gates = (try self.stream.gate(r)) orelse continue;
+                    for (0..r.n_parts) |p| {
+                        // Part p's banks waited at its down gate: every gate/up of the route and its own down landed.
+                        var over: [n_banks]?Arrays = @splat(null);
+                        for (sd.waves[0..sd.n], sd.refs[0..sd.n]) |w, ref| {
+                            const b = @backingInt(ref.bank);
+                            if (w != p + 1 or over[b] != null) continue;
+                            const arrays = self.banks[sd.sl][b] orelse return error.SlotArraysUnbound;
+                            over[b] = try self.waitAll(g, arrays, gates.down_first + p, prev);
+                        }
+                        prev = try self.fusedWave(g, sd, x, k, @intCast(p + 1), &acc, &over);
+                    }
+                } else for (0..r.n_parts) |p| {
+                    try self.stream.waitGu(r, @intCast(p));
+                    try self.stream.waitDown(r, @intCast(p));
+                    try g.asyncEval(try self.fusedWave(g, sd, x, k, @intCast(p + 1), &acc, null));
+                }
+            };
+            for (&sides) |*sd| if (sd.r) |r| {
+                self.stream.release(r);
+                sd.r = null;
+            };
+            const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
+            var order: [max_route_ids]u32 = undefined;
+            for (acc.pos[0..acc.n_pos], 0..) |p, j| order[p] = @intCast(j);
+            const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
+            return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+        }
+
+        /// Side `sd`'s positions in wave `w`, grouped by bank in first appearance: each group's rows of x through the
+        /// quant's fused wave (over `over`'s waited arrays when given), their positions in the call recorded in `acc`.
+        fn fusedWave(self: *Self, g: *G, sd: *const Side, x: T, k: u32, w: u8, acc: *Acc, over: ?*const [n_banks]?Arrays) ![]const T {
+            const first = acc.n_outs;
+            var groups: [n_banks]Group = undefined;
+            var ng: usize = 0;
+            for (sd.waves[0..sd.n], sd.refs[0..sd.n], 0..) |wv, ref, i| {
+                if (wv != w) continue;
+                const gi = for (groups[0..ng], 0..) |gr, j| {
+                    if (gr.bank == ref.bank) break j;
+                } else blk: {
+                    groups[ng] = .{ .bank = ref.bank };
+                    ng += 1;
+                    break :blk ng - 1;
+                };
+                groups[gi].pos[groups[gi].n] = @intCast(i);
+                groups[gi].n += 1;
+            }
+            for (groups[0..ng]) |*gr| {
+                const arrays = (if (over) |o| o[@backingInt(gr.bank)] else self.banks[sd.sl][@backingInt(gr.bank)]) orelse return error.SlotArraysUnbound;
+                var tok: [max_route_ids]i32 = undefined;
+                var rows: [max_route_ids]u32 = undefined;
+                for (gr.pos[0..gr.n], tok[0..gr.n], rows[0..gr.n]) |i, *t, *r| {
+                    t.* = @intCast(sd.pos[i] / k);
+                    r.* = sd.refs[i].row;
+                }
+                const nn: c_int = @intCast(gr.n);
+                const xs = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(tok[0..gr.n]), &.{nn}, .int32), 0);
+                acc.outs[acc.n_outs] = try self.math.fused(g, xs, rows[0..gr.n], arrays);
+                acc.n_outs += 1;
+                for (gr.pos[0..gr.n]) |i| {
+                    acc.pos[acc.n_pos] = sd.pos[i];
+                    acc.n_pos += 1;
+                }
+            }
+            return acc.outs[first..acc.n_outs];
+        }
+
         /// The wide lane: the weighted sum `[n, hidden]`.
         fn callWide(self: *Self, g: *G, layer: u32, x: T, indices: T, scores: T, n: u32, k: u32) !T {
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
-            const group_n = self.stream.max_route_ids;
             try w.ids.resize(a, n_ids);
             _ = try g.hostIds(indices, w.ids.items);
+            w.pos.clearRetainingCapacity();
+            for (w.kept.items) |o| g.release(o);
+            w.kept.clearRetainingCapacity();
+            for (0..bpl) |side| try self.wideBank(g, layer, @intCast(side), x, k);
+            return self.wideJoin(g, scores, x, n, k);
+        }
+
+        /// The wide lane's groups on stream layer `bpl x layer + side`: the routed rows whose expert it holds, their
+        /// outputs appended to `wide.kept` and their positions to `wide.pos`.
+        fn wideBank(self: *Self, g: *G, layer: u32, side: u32, x: T, k: u32) !void {
+            const a = self.a;
+            const w = &self.wide;
+            const sl = bpl * layer + side;
+            const group_n = self.stream.max_route_ids;
             try w.first.resize(a, self.n_experts);
             @memset(w.first.items, -1);
             try w.count.resize(a, self.n_experts);
             @memset(w.count.items, 0);
             w.distinct.clearRetainingCapacity();
+            w.side_ids.clearRetainingCapacity();
             for (w.ids.items) |e| {
+                if (bpl > 1 and self.stream.bank.streamLayer(layer, e) != sl) continue;
+                try w.side_ids.append(a, e);
                 w.count.items[e] += 1;
                 if (w.first.items[e] < 0) {
                     w.first.items[e] = 0;
                     try w.distinct.append(a, e);
                 }
             }
+            if (w.distinct.items.len == 0) return;
             // Hottest first (rows descending, ties by id): the first groups' slots are the seed's.
             std.sort.pdq(u16, w.distinct.items, @as([]const u32, w.count.items), struct {
                 fn lt(cnt: []const u32, p: u16, q: u16) bool {
@@ -440,11 +624,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 }
             }.lt);
             for (w.distinct.items, 0..) |e, i| w.first.items[e] = @intCast(i);
-            try self.stream.awaitReadAhead(layer);
-            try self.stream.seedPrefill(layer, w.ids.items);
-            w.pos.clearRetainingCapacity();
-            for (w.kept.items) |o| g.release(o);
-            w.kept.clearRetainingCapacity();
+            try self.stream.awaitReadAhead(sl);
+            try self.stream.seedPrefill(sl, w.side_ids.items);
             const n_distinct = w.distinct.items.len;
             const n_groups = (n_distinct + group_n - 1) / group_n;
             const depth: usize = self.opt.wide_depth;
@@ -453,7 +634,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 self.stream.release(r);
                 rt.* = null;
             };
-            for (0..@min(depth, n_groups)) |gi| routes[gi % depth] = try self.stream.route(layer, groupOf(w.distinct.items, gi, group_n), &.{});
+            for (0..@min(depth, n_groups)) |gi| routes[gi % depth] = try self.stream.route(sl, groupOf(w.distinct.items, gi, group_n), &.{});
             for (0..n_groups) |gi| {
                 const start = gi * group_n;
                 const group = groupOf(w.distinct.items, gi, group_n);
@@ -471,6 +652,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     w.act.clearRetainingCapacity();
                     const p0 = w.pos.items.len;
                     for (w.ids.items, 0..) |e, row| {
+                        if (bpl > 1 and self.stream.bank.streamLayer(layer, e) != sl) continue;
                         const fi: usize = @intCast(w.first.items[e]);
                         if (fi < start or fi >= start + group.len) continue;
                         const ref = refs[fi - start];
@@ -480,12 +662,12 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                         try w.pos.append(a, @intCast(row));
                     }
                     if (w.slot.items.len == 0) continue;
-                    const arrays = self.banks[layer][@backingInt(kind)] orelse return error.SlotArraysUnbound;
+                    const arrays = self.banks[sl][@backingInt(kind)] orelse return error.SlotArraysUnbound;
                     // The group's rows of this bank in slices (each slice's transient bounded, `group_slice_rows`).
                     var s0: usize = 0;
                     while (s0 < w.slot.items.len) : (s0 += glm.group_slice_rows) {
                         const s1 = @min(s0 + glm.group_slice_rows, w.slot.items.len);
-                        const y = try self.math.prefill(g, layer, x, .{ .slot = w.slot.items[s0..s1], .act_row = w.act.items[s0..s1] }, arrays);
+                        const y = try self.math.prefill(g, sl, x, .{ .slot = w.slot.items[s0..s1], .act_row = w.act.items[s0..s1] }, arrays);
                         try w.kept.append(a, g.keep(y));
                     }
                     std.debug.assert(w.pos.items.len - p0 == w.slot.items.len);
@@ -496,8 +678,15 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 g.resetTo(m);
                 self.stream.release(r);
                 routes[gi % depth] = null;
-                if (gi + depth < n_groups) routes[gi % depth] = try self.stream.route(layer, groupOf(w.distinct.items, gi + depth, group_n), &.{});
+                if (gi + depth < n_groups) routes[gi % depth] = try self.stream.route(sl, groupOf(w.distinct.items, gi + depth, group_n), &.{});
             }
+        }
+
+        /// The wide lane's join: every routed row's output in routed order, then the combine in token slices.
+        fn wideJoin(self: *Self, g: *G, scores: T, x: T, n: u32, k: u32) !T {
+            const a = self.a;
+            const w = &self.wide;
+            const n_ids = n * k;
             // The join: every routed row's output in routed order, then the combine in token slices.
             const joined = try g.concat(w.kept.items, 0);
             try g.evalAll(&.{joined});

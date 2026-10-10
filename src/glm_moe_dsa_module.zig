@@ -29,6 +29,8 @@ const graph = @import("glm_moe_dsa_graph.zig");
 const bank_mod = @import("glm_moe_dsa_bank.zig");
 const experts_mod = @import("glm_moe_dsa_experts.zig");
 const mtp_mod = @import("glm_moe_dsa_mtp.zig");
+const exl3_bank = @import("glm_moe_dsa_exl3_bank.zig");
+const exl3_quant = @import("glm_moe_dsa_exl3_quant.zig");
 
 const G = graph.G;
 const Stats = sdk_ext.expert.Stats;
@@ -52,8 +54,35 @@ pub const Overrides = struct {
     prefill_chunk: ?u32 = null,
 };
 
-/// The served module: the affine bank through MLX's `gather_qmm`, the MTP layer's experts from its EXL3 records.
+/// The served modules, the MTP layer's experts from its EXL3 records in both: the affine bank through MLX's
+/// `gather_qmm`; the EXL3 bank (its K3 and K4 bank layers per routed layer) through sushi's EXL3 MoE. The pack's
+/// manifest picks one at load (`Served`).
 pub const Module = ModuleOf(bank_mod, quant.FromGatherMatmul(quant.GatherQmm), .exl3);
+pub const Exl3Module = ModuleOf(exl3_bank, exl3_quant, .exl3);
+
+/// The module the pack's bank serves: the EXL3 one when the pack carries the EXL3 manifest, else the affine one.
+pub const Served = union(enum) {
+    affine: *Module,
+    exl3: *Exl3Module,
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host) !*Served {
+        const self = try gpa.create(Served);
+        errdefer gpa.destroy(self);
+        const dir = cfg.model_dir orelse return error.GlmPackDir;
+        self.* = if (exl3_bank.present(dir)) .{ .exl3 = try Exl3Module.init(gpa, io, cfg, weights, s, host) } else .{ .affine = try Module.init(gpa, io, cfg, weights, s, host) };
+        return self;
+    }
+
+    pub fn deinit(self: *Served) void {
+        const gpa = switch (self.*) {
+            inline else => |m| m.gpa,
+        };
+        switch (self.*) {
+            inline else => |m| m.deinit(),
+        }
+        gpa.destroy(self);
+    }
+};
 
 pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.BankKind) type {
     comptime quant.checkAccepted(Q, G);
@@ -120,11 +149,14 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const mb = try bill_mod.memoryBill(gpa, terms);
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
-            const rows: sdk.Rows = if (cfg.expert_rows) |forced| .{ .prompt = @min(cfg.expert_prefill_rows orelse forced, forced), .decode = forced } else sdk.fill(mb, baseline, target, model.n_routed_experts, bill_mod.min_fill_rows) catch |e| {
+            // The fill's unit: one row on every routed layer (a bank of several bank layers per routed layer: its share of
+            // each bank layer's experts, `Bank.rowsAt`).
+            const max_units: u32 = if (comptime @hasDecl(Bk.Bank, "maxUnits")) bank.maxUnits() else model.n_routed_experts;
+            const rows: sdk.Rows = if (cfg.expert_rows) |forced| .{ .prompt = @min(cfg.expert_prefill_rows orelse forced, forced), .decode = forced } else sdk.fill(mb, baseline, target, max_units, bill_mod.min_fill_rows) catch |e| {
                 log.err("glm_moe_dsa: admission refused: {s} (baseline {d} B, target {d} B, {d} B a row)\n", .{ @errorName(e), baseline, target, mb.per_row });
                 return e;
             };
-            if (rows.prompt > rows.decode or rows.decode > model.n_routed_experts) return error.InvalidRows;
+            if (rows.prompt > rows.decode or rows.decode > max_units) return error.InvalidRows;
             sdk.admit(mb, baseline, rows, target) catch |e| {
                 log.err("glm_moe_dsa: admission refused before construction: {s} (prompt {d} B, decode {d} B, target {d} B)\n", .{ @errorName(e), mb.total(.prompt, baseline, rows.prompt), mb.total(.decode, baseline, rows.decode), target });
                 return e;
@@ -149,8 +181,14 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             errdefer gpa.free(self.prompt_rows);
             self.decode_rows = try gpa.alloc(u32, n_bank);
             errdefer gpa.free(self.decode_rows);
-            @memset(self.prompt_rows, rows.prompt);
-            @memset(self.decode_rows, rows.decode);
+            if (comptime @hasDecl(Bk.Bank, "rowsAt")) {
+                self.bank.rowsAt(rows.prompt, self.prompt_rows);
+                self.bank.rowsAt(rows.decode, self.decode_rows);
+                log.info("glm_moe_dsa: {d} bank layers, rows per bank layer prompt {d} / {d}, decode {d} / {d} (the first routed layer's K{d} / K{d} of {d} / {d} experts)\n", .{ n_bank, self.prompt_rows[0], self.prompt_rows[1], self.decode_rows[0], self.decode_rows[1], self.bank.layers[0].k, self.bank.layers[1].k, self.bank.layers[0].n_held, self.bank.layers[1].n_held });
+            } else {
+                @memset(self.prompt_rows, rows.prompt);
+                @memset(self.decode_rows, rows.decode);
+            }
             self.layer_counts0 = try gpa.alloc(LayerCounts, n_bank);
             errdefer gpa.free(self.layer_counts0);
             self.layer_counts1 = try gpa.alloc(LayerCounts, n_bank);
@@ -170,7 +208,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .transient_release = true,
                 .slot_memory = .{ .mlx = s },
                 .staging_from_bank = true,
-                .pool = .{ .workers = shape.workers, .tickets = 1024, .direct = true },
+                .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
+                .pool = .{ .workers = shape.workers, .tickets = 1024 * Bk.Stream.maxMinis(&self.bank), .direct = true },
                 .lookahead = .{ .k = lookahead.k, .budget = lookahead.budget },
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
             });
@@ -334,6 +373,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .r = .of(d.s0, self.stream.stats()),
                 .hit_rate = hitSpread(self.layer_counts0, self.layer_counts1, self.layer_rates),
                 .rows = self.decode_rows[0],
+                .rows_alt = if (Experts.bpl > 1) self.decode_rows[1] else null,
             }});
         }
 
@@ -561,15 +601,18 @@ pub const DecodeLine = struct {
     r: Reads,
     hit_rate: ?Spread,
     rows: u32,
+    /// A bank of two bank layers per routed layer: the second's rows (`rows` the first's).
+    rows_alt: ?u32 = null,
 
     pub fn format(p: DecodeLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("glm_moe_dsa: decode {d} steps, {d} tokens in {d:.2} s ({d:.1} tok/s): {d} routed records, {d} hits, {d} misses", .{
             p.steps, p.tokens, seconds(p.wall_ns), perSecond(p.tokens, p.wall_ns), p.r.hits + p.r.misses, p.r.hits, p.r.misses,
         });
         if (p.hit_rate) |h| try w.print(" (hit rate per layer min {d:.0}% median {d:.0}% max {d:.0}%)", .{ h.min, h.median, h.max });
-        try w.print(", {d:.2} GB from the SSD ({d:.3} GB per emitted token), lookahead {d} issued / {d} used (landed {d}, expired {d}, abandoned {d}, cancelled {d}, discarded {d}, used while in flight {d}), lookahead {d:.2} GB read / {d:.2} GB served, {d} loads skipped, {d} direct reads, host wait {d:.2} s and reads in flight {d:.2} s of {d:.2} s, {d} rows per layer", .{
+        try w.print(", {d:.2} GB from the SSD ({d:.3} GB per emitted token), lookahead {d} issued / {d} used (landed {d}, expired {d}, abandoned {d}, cancelled {d}, discarded {d}, used while in flight {d}), lookahead {d:.2} GB read / {d:.2} GB served, {d} loads skipped, {d} direct reads, host wait {d:.2} s and reads in flight {d:.2} s of {d:.2} s, {d}", .{
             gigabytes(p.r.ssd_bytes), if (p.tokens == 0) 0 else gigabytes(p.r.ssd_bytes) / @as(f64, @floatFromInt(p.tokens)), p.r.spec_issued, p.r.spec_used, p.r.spec_landed, p.r.spec_expired, p.r.spec_abandoned, p.r.spec_cancelled, p.r.spec_discarded, p.r.spec_late, gigabytes(p.r.spec_bytes), gigabytes(p.r.spec_served_bytes), p.r.loads_skipped, p.r.direct, seconds(p.r.wait_ns), seconds(p.r.in_flight_ns), seconds(p.wall_ns), p.rows,
         });
+        if (p.rows_alt) |r2| try w.print(" / {d} rows per bank layer (its two Ks)", .{r2}) else try w.writeAll(" rows per layer");
     }
 };
 

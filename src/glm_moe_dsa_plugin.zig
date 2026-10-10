@@ -21,7 +21,8 @@ pub const caps: sdk.Caps = .{
 };
 
 pub const Config = settings.Config;
-pub const Module = module.Module;
+/// The pack's bank picks the module at load (`module.Served`).
+pub const Module = module.Served;
 
 /// G6: the process's one expert reader, claimed at the load claim (a second load that needs it is refused by name,
 /// `error.ExpertReaderInUse`), released when the loaded model goes.
@@ -106,28 +107,40 @@ pub fn deinit(m: *Module) void {
 
 /// The prompt pass: from position 0, or after the positions `restorePrefix` kept (`req.prompt_tokens` counts them).
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
-    return m.prefillAt(req.prompt_tokens - ids.len, ids);
+    return switch (m.*) {
+        inline else => |x| x.prefillAt(req.prompt_tokens - ids.len, ids),
+    };
 }
 
 pub fn restorePrefix(m: *Module, prefix: []const u32) u64 {
-    return m.restorePrefix(prefix);
+    return switch (m.*) {
+        inline else => |x| x.restorePrefix(prefix),
+    };
 }
 
 pub fn step(m: *Module, ids: []const u32) !sdk.mlx.mlx_array {
-    return m.extend(ids);
+    return switch (m.*) {
+        inline else => |x| x.extend(ids),
+    };
 }
 
 pub fn position(m: *const Module) u64 {
-    return m.position();
+    return switch (m.*) {
+        inline else => |x| x.position(),
+    };
 }
 
 pub fn handover(m: *Module, h: sdk.DecodeHandover) !void {
-    return m.decodeHandover(h);
+    return switch (m.*) {
+        inline else => |x| x.decodeHandover(h),
+    };
 }
 
 /// The request's end: the decode's stats line.
 pub fn requestEnd(m: *Module) void {
-    m.requestEnd();
+    switch (m.*) {
+        inline else => |x| x.requestEnd(),
+    }
 }
 
 /// The MTP layer's lane (`mtp_depth` drafts a round; 0 = serial). Acceptance is the model's setting: exact (greedy
@@ -135,28 +148,36 @@ pub fn requestEnd(m: *Module) void {
 /// names typical (with its delta). Logprobs, grammar and penalties consume logits the lane never shapes and stay serial.
 pub const draft_lane = struct {
     pub fn blockSize(m: *const Module) u32 {
-        return m.mtpDepth();
+        return switch (m.*) {
+            inline else => |x| x.mtpDepth(),
+        };
     }
 
     pub fn laneName(m: *const Module) []const u8 {
-        return if (m.mtpDepth() > 0) "glm-mtp" else "serial";
+        return if (blockSize(m) > 0) "glm-mtp" else "serial";
     }
 
     pub fn arm(m: *const Module, req: sdk.ArmRequest) sdk.DraftArm {
-        const ln = m.mtp orelse return .off;
+        const mode = switch (m.*) {
+            inline else => |x| (x.mtp orelse return .off).mode,
+        };
         if (!req.clean) return .off;
-        return switch (ln.mode) {
+        return switch (mode) {
             .typical => .typical,
             else => if (req.greedy) .greedy else .stochastic,
         };
     }
 
     pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
-        return m.mtpRound(a, t1, accepted_cap, sampling);
+        return switch (m.*) {
+            inline else => |x| x.mtpRound(a, t1, accepted_cap, sampling),
+        };
     }
 
     pub fn stats(m: *const Module) sdk.DraftStats {
-        return m.draftStats();
+        return switch (m.*) {
+            inline else => |x| x.draftStats(),
+        };
     }
 };
 

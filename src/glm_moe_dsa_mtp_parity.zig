@@ -354,10 +354,11 @@ test "glm mtp: a depth past the route limit, a pack without mtp/ and a config wi
 test "glm mtp: the lane arms clean requests only, exact as greedy or stochastic, typical only when the setting names it" {
     var lane: module.Module.Lane = undefined;
     lane.mode = .exact;
-    var m: module.Module = undefined;
-    m.mtp = null;
+    var inner: module.Module = undefined;
+    inner.mtp = null;
+    const m: module.Served = .{ .affine = &inner };
     try testing.expectEqual(sdk.DraftArm.off, plugin.draft_lane.arm(&m, .{ .greedy = true, .clean = true }));
-    m.mtp = &lane;
+    inner.mtp = &lane;
     try testing.expectEqual(sdk.DraftArm.greedy, plugin.draft_lane.arm(&m, .{ .greedy = true, .clean = true }));
     try testing.expectEqual(sdk.DraftArm.stochastic, plugin.draft_lane.arm(&m, .{ .greedy = false, .clean = true }));
     try testing.expectEqual(sdk.DraftArm.off, plugin.draft_lane.arm(&m, .{ .greedy = true, .clean = false }));
