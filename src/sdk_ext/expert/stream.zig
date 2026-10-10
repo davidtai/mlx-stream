@@ -53,6 +53,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         /// `per_geometry_transients` (GLM-5.3's EXL3 bank: its K3 and K4 bank layers), at most two; otherwise every layer
         /// shares one at the widest layer's geometry.
         pub const per_geometry = @hasDecl(B, "per_geometry_transients") and B.per_geometry_transients;
+        /// A bank of several bank layers per routed layer (`B.banks_per_layer`, its `Bank.streamLayer`): the
+        /// lookahead reads ahead over all the next routed layer's bank layers.
+        pub const multi_bank = @hasDecl(B, "banks_per_layer") and B.banks_per_layer > 1;
 
         /// Two layers whose slot rows are interchangeable: the same records per id and the same segments.
         pub fn sameGeometry(x: *const Layer, y: *const Layer) bool {
@@ -874,6 +877,17 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// read-ahead is the decode phase's: before the phase change (and on a
             /// stream without the lookahead class) the scores are not read.
             pub fn route(self: *Stream, layer: u32, ids: []const u16, scores: []const f32) Error!*Route {
+                return self.routeWith(layer, ids, scores, true);
+            }
+
+            /// `route` of a call that routes again before its waves (a bank of several bank layers per routed layer:
+            /// every bank layer's route but the last): its tag taken, no speculative step (the call's last route
+            /// settles and reads ahead, so a record read ahead for any of its bank layers stays claimable until then).
+            pub fn routeHeld(self: *Stream, layer: u32, ids: []const u16) Error!*Route {
+                return self.routeWith(layer, ids, &.{}, false);
+            }
+
+            fn routeWith(self: *Stream, layer: u32, ids: []const u16, scores: []const f32, step: bool) Error!*Route {
                 if (self.failed) return error.StreamFailed;
                 std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
                 // A layer's read-ahead lands before a route plans over its rows (a hit must never read a loading row).
@@ -929,7 +943,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (lookahead) {
                     r.tag = tag;
                     self.clock = tag;
-                    try self.speculate(r, scores);
+                    if (step) try self.speculate(r, scores);
                 }
                 const c = &self.counters;
                 c.route_calls += 1;
@@ -966,6 +980,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// Settles every record read ahead for this call that it did not claim,
             /// then reads ahead the next layer's predicted records (keyed by offset).
             fn speculate(self: *Stream, r: *const Route, scores: []const f32) Error!void {
+                if (comptime multi_bank) return self.speculateBanks(r, scores);
                 const next = r.layer + 1;
                 var bases: [expert_lookahead.max_budget]i64 = undefined;
                 var n: usize = 0;
@@ -980,6 +995,36 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     len = spanOf(&self.bank.layers[next]);
                 }
                 _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0..n], len) catch
+                    return self.fail(error.SpecRefused);
+            }
+
+            /// `speculate` for a bank of several bank layers per routed layer (`B.banks_per_layer`): the next routed
+            /// layer's experts over all its bank layers, each checked against its own bank layer's residency, each record
+            /// its bank layer's span (one step of records of different lengths).
+            fn speculateBanks(self: *Stream, r: *const Route, scores: []const f32) Error!void {
+                const bpl = B.banks_per_layer;
+                const next: u32 = r.layer / bpl + 1;
+                var bases: [expert_lookahead.max_budget]i64 = undefined;
+                var lens: [expert_lookahead.max_budget]i64 = undefined;
+                var n: usize = 0;
+                if (scores.len > 0 and next < self.layers.len / bpl) {
+                    const sel = &self.selector.?;
+                    const Ctx = struct { s: *const Stream, routed: u32 };
+                    const resident = struct {
+                        fn f(c: Ctx, e: u16) bool {
+                            const sl = c.s.bank.streamLayer(c.routed, e);
+                            return c.s.layers[sl].policy.slotOf(e) != null;
+                        }
+                    }.f;
+                    var chosen: [expert_lookahead.max_budget]u16 = undefined;
+                    for (sel.selectWith(scores, Ctx{ .s = self, .routed = next }, resident, chosen[0..sel.budget])) |e| {
+                        const sl = self.bank.streamLayer(next, e);
+                        bases[n] = @intCast(self.bank.recordOffset(sl, e));
+                        lens[n] = @intCast(spanOf(&self.bank.layers[sl]));
+                        n += 1;
+                    }
+                }
+                _ = self.pool.specStepLens(self.bank.sidecar, r.tag, bases[0..n], lens[0..n]) catch
                     return self.fail(error.SpecRefused);
             }
 

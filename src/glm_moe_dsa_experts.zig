@@ -444,24 +444,20 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         };
 
         /// The decode lane over a routed layer's `bpl` bank layers: the ids split by the bank layer that holds each
-        /// expert and every route made before any wave (their reads in flight together; the last route reads ahead
-        /// the next routed layer's first bank layer, the stream's next layer, from the scores of its experts only),
-        /// every route's hit wave and the hoisted arrays in one commit, then each route's parts as fused waves, each
-        /// once all its segments landed; the outputs `[n, k, hidden]` in routed order.
+        /// expert and every route made before any wave (their reads in flight together; the last route settles the
+        /// lookahead and reads ahead the next routed layer's experts over all its bank layers), every route's hit wave
+        /// and the hoisted arrays in one commit, then each route's parts as fused waves, each once all its segments
+        /// landed; the outputs `[n, k, hidden]` in routed order.
         fn callDecodeSplit(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
             const n_ids = n * k;
             const bank = self.stream.bank;
             var id_buf: [max_route_ids]u16 = undefined;
             var score_buf: [sdk_ext.expert.lookahead.max_rows * 512]f32 = undefined;
-            var sc: []f32 = &.{};
+            var sc: []const f32 = &.{};
             const read_next = next_scores != null and self.stream.route_lookahead and n * self.n_experts <= score_buf.len;
             if (read_next) {
                 try g.evalAll(&.{ indices, next_scores.? });
-                sc = @constCast(try g.hostF32(next_scores.?, score_buf[0 .. n * self.n_experts]));
-                if (layer + 1 < bank.layers.len / bpl) for (0..self.n_experts) |e| {
-                    if (bank.streamLayer(layer + 1, @intCast(e)) == bpl * (layer + 1)) continue;
-                    for (0..n) |row| sc[row * self.n_experts + e] = -std.math.inf(f32);
-                };
+                sc = try g.hostF32(next_scores.?, score_buf[0 .. n * self.n_experts]);
             }
             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
             var sides: [bpl]Side = @splat(.{});
@@ -482,7 +478,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             };
             for (&sides, 0..) |*sd, i| {
                 if (sd.n == 0) continue;
-                const r = try self.stream.route(sd.sl, sd.ids[0..sd.n], if (i == last) sc else &.{});
+                const r = if (i == last) try self.stream.route(sd.sl, sd.ids[0..sd.n], sc) else try self.stream.routeHeld(sd.sl, sd.ids[0..sd.n]);
                 sd.r = r;
                 const geom = &bank.layers[sd.sl];
                 const record = @as(u64, S.minisOf(geom)) * geom.logical_bytes;

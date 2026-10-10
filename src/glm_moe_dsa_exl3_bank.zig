@@ -730,3 +730,50 @@ test "glm exl3 bank: the stream reads each routed expert's minis into adjacent r
     }
     try s.flush();
 }
+
+test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts over both its bank layers, each its own span, and their demand reads claim them" {
+    const a = testing.allocator;
+    var c = try affine.tinyConfig(a);
+    defer c.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try writeSynth(a, testing.io, tmp.dir, &c, .{});
+    defer a.free(img);
+    var rbuf: [512]u8 = undefined;
+    var b = try Bank.open(a, testing.io, try tmpRoot(&tmp, &rbuf), &c, null);
+    defer b.deinit();
+    var rows: [8]u32 = undefined;
+    @memset(&rows, 2);
+    const s = try Stream.Stream.init(a, &b, .{ .rows = &rows, .max_route_ids = 8, .transient_rows = 16, .wide_depth = 2, .transient_release = true, .records_per_part = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 }, .lookahead = .{ .k = 8, .budget = 2, .preread = false } });
+    defer s.deinit();
+    _ = try s.releaseTransient();
+    try s.grow(&rows);
+    // Routed layer 0's call: its K3 route held, its K4 route steps with the next layer's scores, top for expert 2 (K3)
+    // and expert 5 (K4) of routed layer 1, neither resident.
+    var scores: [16]f32 = @splat(0);
+    scores[2] = 9;
+    scores[5] = 8;
+    const r0 = try s.routeHeld(0, &.{ 0, 4 });
+    const r1 = try s.route(1, &.{ 1, 3 }, &scores);
+    for ([_]*Stream.Route{ r0, r1 }) |r| for (0..r.n_parts) |p| try s.waitDown(r, @intCast(p));
+    s.release(r0);
+    s.release(r1);
+    try testing.expectEqual(@as(u64, 2), s.stats().spec_issued);
+    // Routed layer 1's call claims both records (each read at its own bank layer's span), its rows the records' bytes.
+    const q0 = try s.routeHeld(2, &.{2});
+    const q1 = try s.route(3, &.{5}, &.{});
+    for ([_]*Stream.Route{ q0, q1 }) |r| for (0..r.n_parts) |p| try s.waitDown(r, @intCast(p));
+    try testing.expectEqual(@as(u64, 2), s.stats().claimed);
+    for ([_]struct { r: *Stream.Route, l: u32, e: u16 }{ .{ .r = q0, .l = 2, .e = 2 }, .{ .r = q1, .l = 3, .e = 5 } }) |x| {
+        const slot = x.r.plan.slotsOf()[0];
+        const geom = &b.layers[x.l];
+        const off = b.recordOffset(x.l, x.e);
+        for (geom.segments, 0..) |sg, ci| {
+            const row = s.slotRow(x.l, slot, @enumFromInt(ci));
+            for (0..geom.minis) |mi| try testing.expectEqualSlices(u8, img[off + mi * geom.record_bytes + sg.offset ..][0..sg.length], row[mi * sg.length ..][0..sg.length]);
+        }
+    }
+    s.release(q0);
+    s.release(q1);
+    try s.flush();
+}
