@@ -182,7 +182,10 @@ Settings (`model-settings.json`):
 | `mtp_acceptance` | `exact` or `typical` | `exact` |
 | `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |
 
-Memory: one slot row is one 21.2 MB record on each of the 75 routed layers (1.59 GB). The KV costs 95,232 B per
+Memory: the fill counts units of slot rows. On the affine bank a unit is one 21.2 MB record on each of the 75 routed
+layers (1.59 GB); on the EXL3 bank (`expert-manifest-exl3-v1.json`) a unit is each bank layer's share of its experts,
+rounded down (148 K3 and 108 K4 experts per routed layer over 128 units: 1.15625 slots of 14.3 MB and 0.84375 of
+19.0 MB, 2.45 GB a unit). The KV costs 95,232 B per
 position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16).
 The KV lanes hold only the current phase's positions: the prompt's during its pass, and from the decode handover the
 request's own prompt and `max_tokens`. The bill also charges the residents (from the shard headers), the prompt and
