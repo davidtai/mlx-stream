@@ -46,6 +46,20 @@ pub const decode_wave_fixed_bytes: u64 = 64 << 20;
 /// The page tables of `wired` bytes (`deepseek_v41_bill.wireTables`: the kernel's and the GPU's leaf entries per 16
 /// KiB page, the upper levels per 32 MiB and 64 GiB).
 pub const wireTables = @import("deepseek_v41_bill.zig").wireTables;
+/// What the fill leaves of the box's RAM past the box's used memory (`sdk.memory.boxUsedBytes`): the free pages, the
+/// file cache and the speculative pages that macOS and the other processes run in. Measured on the 256 GB M5 Ultra at
+/// --ctx-size 16448, the coding workload: decode at full speed with 24.1 GB of the RAM left (run x1: 15.6 GB of it free,
+/// 7.6 GB file cache), 16 % slower with 20.6 GB left when a 15.8 GB file cache held the free pages to 3.4 GB (run d3).
+/// 16 GiB fills the process to 240 GB beside 17.6 GB of the rest of the box.
+pub const os_reserve_bytes: u64 = 16 << 30;
+
+/// The box's used memory the fill reaches beside `others` (the rest of the box): the RAM less the OS reserve, and at
+/// most what keeps the process's GPU memory within `gpu_target` (the host's ceiling less its wired margin; the
+/// process's host side beside it). No RAM reading (0): the GPU bound alone.
+pub fn targetOf(gpu_target: u64, ram: u64, others: u64) u64 {
+    const gpu = others + host_side_bytes + gpu_target;
+    return if (ram == 0) gpu else @min(gpu, ram -| os_reserve_bytes);
+}
 /// The stream the module builds, as the bill charges it.
 pub const StreamShape = struct {
     /// Widest route (`Stream.Options.max_route_ids`): a prompt group's experts.
@@ -357,9 +371,10 @@ pub fn decodeAfter(in: Inputs, positions: u64) struct { device: u64, host: u64 }
 
 /// The handover's live reading and what decode adds past it (`liveRows`).
 pub const Live = struct {
-    /// The host's target (its ceiling less its wired margin): the grow's, and past it even the prompt rows refuse the
-    /// request.
+    /// The box's target (`targetOf`) and MLX's (the host's ceiling less its wired margin; 0: none): the grow's, and past
+    /// either even the prompt rows refuse the request.
     target: u64,
+    gpu_target: u64 = 0,
     baseline: u64,
     /// The footprint after the prompt's frees settled, with the request's KV lanes at its decode cap.
     footprint: u64,
@@ -388,18 +403,27 @@ pub const Live = struct {
         const g = l.grown(units);
         return l.baseline + l.footprint + g + l.device_after + l.host_after + wireTables(l.mlx_bytes + g + l.device_after);
     }
+
+    /// MLX's bytes at `units`: the reading's, the grown rows and decode's MLX additions.
+    pub fn mlxAt(l: Live, units: u32) u64 {
+        return l.mlx_bytes + l.grown(units) + l.device_after;
+    }
+
+    /// Whether `units` keep the box within its target and MLX within the GPU's.
+    pub fn fits(l: Live, units: u32) bool {
+        return l.total(units) <= l.target and (l.gpu_target == 0 or l.mlxAt(units) <= l.gpu_target);
+    }
 };
 
-/// The most rows per layer whose total stays within the target (`Live.total`), between the prompt rows the reading
-/// holds and `max_rows`; refused by name when even the prompt rows are over it.
+/// The most rows per layer that fit both targets (`Live.fits`), between the prompt rows the reading holds and
+/// `max_rows`; refused by name when even the prompt rows do not.
 pub fn liveRows(l: Live) error{DecodeOverTarget}!u32 {
-    const at_prompt = l.total(l.prompt_rows);
-    if (at_prompt > l.target) return error.DecodeOverTarget;
-    const lin = (l.target - at_prompt) / l.per_row;
+    if (!l.fits(l.prompt_rows)) return error.DecodeOverTarget;
+    const lin = (l.target - l.total(l.prompt_rows)) / l.per_row;
     var r: u64 = @min(@as(u64, l.prompt_rows) + lin, l.max_rows);
-    while (r > l.prompt_rows and l.total(@intCast(r)) > l.target) r -= 1;
+    while (r > l.prompt_rows and !l.fits(@intCast(r))) r -= 1;
     // The rounded shares can fit a unit past the linear estimate.
-    while (r < l.max_rows and l.total(@intCast(r + 1)) <= l.target) r += 1;
+    while (r < l.max_rows and l.fits(@intCast(r + 1))) r += 1;
     return @intCast(r);
 }
 
@@ -527,6 +551,28 @@ test "glm bill: the live grow fills the rows the reading leaves under the target
     l.max_rows = 125;
     try testing.expectEqual(@as(u32, 125), try liveRows(l));
     l.footprint = 243_000_000_000;
+    try testing.expectError(error.DecodeOverTarget, liveRows(l));
+}
+
+test "glm bill: the target is the RAM less the OS reserve, and MLX's bytes stay within the GPU's" {
+    const gib: u64 = 1 << 30;
+    const ram: u64 = 274_877_906_944;
+    const gpu = 240 * gib - 2 * gib;
+    // Beside 17.6 GB of the rest of the box the RAM binds; with the GPU ceiling at 75 % of the RAM the GPU does.
+    try testing.expectEqual(ram - os_reserve_bytes, targetOf(gpu, ram, 17_600_000_000));
+    try testing.expectEqual(@as(u64, 257_698_037_760), targetOf(gpu, ram, 17_600_000_000));
+    try testing.expectEqual(17_600_000_000 + host_side_bytes + 190 * gib, targetOf(190 * gib, ram, 17_600_000_000));
+    try testing.expectEqual(17_600_000_000 + host_side_bytes + gpu, targetOf(gpu, 0, 17_600_000_000));
+    // The box's target leaves room; MLX's bytes past the GPU's stop the grow first, and refuse at the prompt rows.
+    const row: u64 = 2_445_926_400;
+    var l: Live = .{ .target = targetOf(gpu, ram, 17_600_000_000), .gpu_target = gpu, .baseline = 17_600_000_000, .footprint = 214_500_000_000, .mlx_bytes = 213_600_000_000, .prompt_rows = 77, .max_rows = 175, .per_row = row, .device_after = 1_400_000_000, .host_after = 600_000_000 };
+    const r = try liveRows(l);
+    try testing.expect(l.fits(r) and !l.fits(r + 1) and l.total(r + 1) > l.target);
+    l.gpu_target = l.mlxAt(80);
+    const g = try liveRows(l);
+    try testing.expectEqual(@as(u32, 80), g);
+    try testing.expect(l.total(g + 1) <= l.target);
+    l.gpu_target = l.mlxAt(77) - 1;
     try testing.expectError(error.DecodeOverTarget, liveRows(l));
 }
 

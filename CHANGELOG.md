@@ -5,12 +5,13 @@
 - GLM-5.3's memory bill fills to the box: the KV lanes hold each phase's positions (a prompt's at its pass, the
   request's own prompt and `max_tokens` from its handover); `max_output` (default 131,072) bills the longest request
   at construction; the decode handover settles the prompt's frees, reads the footprint and the box, and grows the
-  decode rows to the fewer of the bill at the request and the live reading, under the host's target; decode's
-  transient window holds the widest decode call's ids (8 rows serial); the host side is one measured term (1.5 GB;
-  the unbilled overhead term is gone); the construction checks its footprint (`ConstructionOverBill`). The SDK's
-  arch table gains the optional `maxOutput` hook (SDK 2.1) and `sdk.memory.boxUsedBytes`; the expert stream takes
-  decode's window rows (`Options.decode_window_rows`, default `max_route_ids`) and the KV grow lane a `resize`.
-  DeepSeek-V4.1's paths are unchanged.
+  decode rows to the fewer of the bill at the request and the live reading, under the box's RAM less a 16 GiB OS
+  reserve, MLX's bytes within the host's ceiling less its wired margin; decode's transient window holds the widest
+  decode call's ids (8 rows serial); the host side is one measured term (1.5 GB; the unbilled overhead term is gone);
+  the construction checks its footprint (`ConstructionOverBill`). The SDK's arch table gains the optional `maxOutput`
+  hook (SDK 2.1) and `sdk.memory.boxUsedBytes`; the expert stream takes decode's window rows
+  (`Options.decode_window_rows`, default `max_route_ids`) and the KV grow lane a `resize`. DeepSeek-V4.1's paths are
+  unchanged.
 - GLM-5.3: the MTP draft lane over the release's MTP layer (`mtp_depth`, `mtp_acceptance`, `mtp_typical_delta`;
   off by default, exact acceptance unless typical is named), its experts resident from the EXL3 build's records
   through sushi's EXL3 MoE; `convert_glm_exl3_bank.py --mtp-only` writes the pack's `mtp/` directory.

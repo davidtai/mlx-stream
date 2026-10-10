@@ -133,10 +133,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// The harness forced the rows (`expert_rows`): the handover grows to them, no live fill.
         forced_rows: bool,
         decoding: bool = false,
-        /// The bill's inputs (the handover bills its request's KV from them), the load's baseline and the target.
+        /// The bill's inputs (the handover bills its request's KV from them), the load's baseline, MLX's target (the
+        /// host's ceiling less its wired margin) and the box's RAM (the handover's target, `bill.targetOf`).
         inputs: bill_mod.Inputs,
         baseline: u64,
-        target: u64,
+        gpu_target: u64,
+        ram: u64,
         /// Decode's window rows (`bill.decodeWindowRows`): a decode call over more routed ids is refused.
         window_ids: u32,
         routes: graph.Routes,
@@ -173,12 +175,14 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             errdefer bank.deinit();
             // The admission: the prompt phase billed at the context, decode at the longest request (the context and
             // `max_output`), the rows filled up to the target (or forced).
-            const target = host.ceiling -| host.wired_margin;
+            const gpu_target = host.ceiling -| host.wired_margin;
+            const ram = sdk.memory.totalMemBytes();
             const max_context = bill_mod.servedContext(cfg);
             const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag) };
             const mb = try bill_mod.memoryBill(gpa, bill_mod.termsOf(inputs));
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
+            const target = bill_mod.targetOf(gpu_target, ram, baseline);
             // The fill's unit (`bill.unitBytes`): every stream layer's share of its experts (`bill.rowsAt`).
             const max_units = bill_mod.maxUnits(inputs.bank);
             const rows: sdk.Rows = if (cfg.expert_rows) |forced| .{ .prompt = @min(cfg.expert_prefill_rows orelse forced, forced), .decode = forced } else sdk.fill(mb, baseline, target, max_units, bill_mod.min_fill_rows) catch |e| {
@@ -190,12 +194,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 log.err("glm_moe_dsa: admission refused before construction: {s} (prompt {d} B, decode {d} B, target {d} B)\n", .{ @errorName(e), mb.total(.prompt, baseline, rows.prompt), mb.total(.decode, baseline, rows.decode), target });
                 return e;
             };
-            log.info("glm_moe_dsa: admission {d} prompt / {d} decode units of {d} B ({d}-token context, {d} generated, baseline {d} B, target {d} B)\n", .{ rows.prompt, rows.decode, mb.per_row, max_context, cfg.maxOutput(), baseline, target });
+            log.info("glm_moe_dsa: admission {d} prompt / {d} decode units of {d} B ({d}-token context, {d} generated, baseline {d} B, target {d} B, the GPU's {d} B)\n", .{ rows.prompt, rows.decode, mb.per_row, max_context, cfg.maxOutput(), baseline, target, gpu_target });
             log.info("{f}\n", .{bill_mod.BillLine{ .mb = &mb, .rows = rows, .baseline = baseline, .target = target, .context = max_context, .decode_positions = inputs.decode_positions }});
 
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .target = target, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
+            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
             errdefer self.g.deinit();
             // The module owns its config's copy (the host's config keeps the parsed model's storage).
             self.model = if (self.cfg.model) |*m| m else unreachable;
@@ -430,21 +434,23 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const kv1 = self.kvAllocated();
             const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + transient + kv0), bill_mod.host_side_bytes);
             const box = Box.now(st.after);
-            var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_units, .rows = self.decode_units, .target = self.target, .baseline = self.baseline, .box = box };
+            // The box's target beside the rest of the box as it stands now (not the load's baseline, an older reading of
+            // it), for the live reading and the bill at the request alike.
+            const target = bill_mod.targetOf(self.gpu_target, self.ram, box.others);
+            var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_units, .rows = self.decode_units, .target = target, .gpu_target = self.gpu_target, .baseline = self.baseline, .box = box };
             if (!self.forced_rows) {
                 const after = bill_mod.decodeAfter(self.inputs, cap);
-                // The rest of the box as it stands now (not the load's baseline, an older reading of it), for the live
-                // reading and the bill at the request alike.
                 const max_units = bill_mod.maxUnits(self.inputs.bank);
-                const live: bill_mod.Live = .{ .target = self.target, .baseline = box.others, .footprint = st.after.footprint, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_units, .max_rows = max_units, .per_row = self.bill.per_row, .device_after = after.device, .host_after = after.host, .geometry = self.inputs.bank };
+                const live: bill_mod.Live = .{ .target = target, .gpu_target = self.gpu_target, .baseline = box.others, .footprint = st.after.footprint, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_units, .max_rows = max_units, .per_row = self.bill.per_row, .device_after = after.device, .host_after = after.host, .geometry = self.inputs.bank };
                 line.live_rows = bill_mod.liveRows(live) catch |e| {
                     line.refused = @errorName(e);
                     log.err("{f}\n", .{line});
                     return e;
                 };
-                line.bill_rows = try bill_mod.requestRows(self.gpa, self.inputs, cap, box.others, self.target, max_units);
+                line.bill_rows = try bill_mod.requestRows(self.gpa, self.inputs, cap, box.others, target, max_units);
                 line.rows = @max(@min(line.live_rows.?, line.bill_rows.?), self.prompt_units);
                 line.bound = live.total(line.rows);
+                line.mlx_bound = live.mlxAt(line.rows);
                 self.decode_units = line.rows;
                 _ = bill_mod.rowsAt(self.inputs.bank, line.rows, self.decode_rows);
             }
@@ -731,9 +737,11 @@ pub const HandoverLine = struct {
     /// The bill at the request's KV and the live reading (null: forced rows).
     bill_rows: ?u32 = null,
     live_rows: ?u32 = null,
-    /// The live total at `rows` (`bill.Live.total`).
+    /// The live total and MLX's bytes at `rows` (`bill.Live.total`, `bill.Live.mlxAt`) and their targets.
     bound: ?u64 = null,
+    mlx_bound: ?u64 = null,
     target: u64,
+    gpu_target: u64 = 0,
     baseline: u64,
     /// The box then (`Box.now` after the settle).
     box: Box = .{ .used = 0, .others = 0 },
@@ -744,10 +752,11 @@ pub const HandoverLine = struct {
         try w.print("glm_moe_dsa: handover: footprint {d:.3} GB before the frees, {d:.3} GB after ({s} in {d} ms; MLX active {d:.3} GB, host side {d:.3} GB; the box {d:.3} GB used, the rest of it {d:.3} GB), KV at {d} positions {d:.3} GB", .{
             gigabytes(p.before.footprint), gigabytes(p.after.footprint), if (p.settled) "settled" else "not settled", p.settle_ms, gigabytes(p.after.active), gigabytes(p.after.hostSide()), gigabytes(p.box.used), gigabytes(p.box.others), p.positions, gigabytes(p.kv_bytes),
         });
-        if (p.refused) |e| return w.print(", refused: {s} (the prompt's {d} rows per layer leave decode over the host's target)", .{ e, p.prompt_rows });
+        if (p.refused) |e| return w.print(", refused: {s} (the prompt's {d} rows per layer leave decode over its target)", .{ e, p.prompt_rows });
         try w.print(", rows {d} -> {d} per layer", .{ p.prompt_rows, p.rows });
         if (p.bill_rows) |b| try w.print(" (the bill at the request {d}, the live reading {d})", .{ b, p.live_rows.? }) else try w.print(" (forced)", .{});
         if (p.bound) |b| try w.print(", decode bound {d:.3} GB of the {d:.3} GB target (the load's baseline {d:.3} GB)", .{ gigabytes(b), gigabytes(p.target), gigabytes(p.baseline) });
+        if (p.mlx_bound) |b| try w.print(", MLX {d:.3} GB of the GPU's {d:.3} GB", .{ gigabytes(b), gigabytes(p.gpu_target) });
         if (p.grown) |g| try w.print(", footprint {d:.3} GB after the grow", .{gigabytes(g.footprint)});
     }
 };
@@ -1079,14 +1088,14 @@ test "glm handover: the settle reads until the cache is empty and the footprint 
 
 test "glm handover: the handover line reports the readings, the rows each bound allows and decode's bound" {
     const a = testing.allocator;
-    var l: HandoverLine = .{ .before = .{ .footprint = 225_500_000_000 }, .after = .{ .footprint = 221_000_000_000, .active = 220_400_000_000 }, .settle_ms = 15, .settled = true, .positions = 17_415, .kv_bytes = 1_660_000_000, .prompt_rows = 126, .rows = 136, .bill_rows = 136, .live_rows = 137, .bound = 255_000_000_000, .target = 255_550_554_112, .baseline = 12_402_409_472, .box = .{ .used = 233_900_000_000, .others = 12_600_000_000 }, .grown = .{ .footprint = 237_100_000_000 } };
+    var l: HandoverLine = .{ .before = .{ .footprint = 225_500_000_000 }, .after = .{ .footprint = 221_000_000_000, .active = 220_400_000_000 }, .settle_ms = 15, .settled = true, .positions = 17_415, .kv_bytes = 1_660_000_000, .prompt_rows = 126, .rows = 136, .bill_rows = 136, .live_rows = 137, .bound = 255_000_000_000, .mlx_bound = 238_000_000_000, .target = 255_550_554_112, .gpu_target = 255_550_554_112, .baseline = 12_402_409_472, .box = .{ .used = 233_900_000_000, .others = 12_600_000_000 }, .grown = .{ .footprint = 237_100_000_000 } };
     const s = try std.fmt.allocPrint(a, "{f}", .{l});
     defer a.free(s);
-    try testing.expectEqualStrings("glm_moe_dsa: handover: footprint 225.500 GB before the frees, 221.000 GB after (settled in 15 ms; MLX active 220.400 GB, host side 0.600 GB; the box 233.900 GB used, the rest of it 12.600 GB), KV at 17415 positions 1.660 GB, rows 126 -> 136 per layer (the bill at the request 136, the live reading 137), decode bound 255.000 GB of the 255.551 GB target (the load's baseline 12.402 GB), footprint 237.100 GB after the grow", s);
+    try testing.expectEqualStrings("glm_moe_dsa: handover: footprint 225.500 GB before the frees, 221.000 GB after (settled in 15 ms; MLX active 220.400 GB, host side 0.600 GB; the box 233.900 GB used, the rest of it 12.600 GB), KV at 17415 positions 1.660 GB, rows 126 -> 136 per layer (the bill at the request 136, the live reading 137), decode bound 255.000 GB of the 255.551 GB target (the load's baseline 12.402 GB), MLX 238.000 GB of the GPU's 255.551 GB, footprint 237.100 GB after the grow", s);
     l.refused = "DecodeOverTarget";
     const r = try std.fmt.allocPrint(a, "{f}", .{l});
     defer a.free(r);
-    try testing.expect(std.mem.endsWith(u8, r, ", refused: DecodeOverTarget (the prompt's 126 rows per layer leave decode over the host's target)"));
+    try testing.expect(std.mem.endsWith(u8, r, ", refused: DecodeOverTarget (the prompt's 126 rows per layer leave decode over its target)"));
     const pm: PhaseMem = .{ .start = .{ .active = 200_000_000_000, .footprint = 201_000_000_000 }, .end = .{ .active = 201_000_000_000, .peak = 205_000_000_000, .cache = 500_000_000, .footprint = 202_100_000_000, .footprint_peak = 206_000_000_000 } };
     const p = try std.fmt.allocPrint(a, "{f}", .{pm});
     defer a.free(p);
