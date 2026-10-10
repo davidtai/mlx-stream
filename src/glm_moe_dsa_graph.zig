@@ -14,6 +14,7 @@ const sdk = @import("sdk");
 const ops = @import("deepseek_v41_ops.zig");
 const glm = @import("glm_moe_dsa.zig");
 const cache_mod = @import("glm_moe_dsa_cache.zig");
+const pt = @import("glm_moe_dsa_prefill_timers.zig");
 
 pub const G = ops.MlxOps;
 pub const T = G.T;
@@ -316,7 +317,18 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     try cache.append(g, l, try g.reshape(latent, &.{ 1, n, kvr }), try g.reshape(k_pe, &.{ 1, n, rp }), if (ik) |k| try g.reshape(k, &.{ 1, n, @intCast(c.index_head_dim) }) else null);
     const kv_all = try cache.latentView(g, l);
     const pe_all = try cache.ropeView(g, l);
+    if (pt.enabled and rows > 1) {
+        var bufs: [3]T = undefined;
+        _ = try pt.phase(g, cache.buffers(l, &bufs), .proj);
+        _ = try pt.phase(g, &.{ q_nope, q_pe, qr }, .proj);
+    }
     if (lw.indexer) |ix| try select(g, c, ix, x, iq.?, try cache.indexView(g, l), start, rows, carry);
+    if (pt.enabled and rows > 1) {
+        var sel: std.ArrayList(T) = .empty;
+        defer sel.deinit(carry.a);
+        for (carry.topk) |t| if (t) |x_| try sel.append(carry.a, x_);
+        _ = try pt.phase(g, sel.items, .index);
+    }
     const scale64: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(qhd)));
     const scale: f32 = @floatCast(scale64);
     const qs = try g.scalar(scale64, g.dtypeOf(q_pe));
@@ -368,6 +380,7 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         }
         outs.clearRetainingCapacity();
     }
+    if (pt.enabled and rows > 1) pt.chargeAttn(lw.indexer != null, try pt.phase(g, &.{out}, .attn));
     const o2 = try g.reshape(try g.transposeAxes(out, &.{ 0, 2, 1, 3 }), &.{ n, heads * @as(c_int, @intCast(c.v_head_dim)) });
     return qlinear(g, o2, lw.o);
 }
@@ -464,19 +477,25 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
     for (w.layers, 0..) |*lw, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
+        if (pt.enabled and prompt) pt.start();
         if (rt.read_ahead and wide and lw.bank_layer != null) {
             try predictSeed(g, a, c, lw, h, rows, &seed);
             try ex.readAheadSeed(lw.bank_layer.?, seed.items);
         }
+        if (pt.enabled and prompt) _ = try pt.phase(g, &.{}, .seed);
         const x = try rmsNorm(g, h, lw.input_norm, c.rms_norm_eps);
         const h1 = try g.add(h, try attention(g, c, lw, l, x, start, rows, cache, &carry));
+        if (pt.enabled and prompt) _ = try pt.phase(g, &.{h1}, .oproj);
         const x2 = try rmsNorm(g, h1, lw.post_norm, c.rms_norm_eps);
         const f = if (lw.dense) |d| try mlp(g, d, x2) else blk: {
             const r = try route(g, c, lw.router.?, x2);
+            if (pt.enabled and prompt) _ = try pt.phase(g, &.{ x2, r.indices, r.weights }, .router);
             const next: ?T = if (rt.lookahead and !prompt and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2) else null;
             const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next);
+            if (pt.enabled and prompt) _ = try pt.phase(g, &.{routed}, .routed);
             break :blk try g.add(routed, try mlp(g, lw.shared.?, x2));
         };
+        if (pt.enabled and prompt) _ = try pt.phase(g, &.{f}, .mlp);
         const next_h = g.keep(try g.add(h1, f));
         if (prompt) {
             var bufs: [3]T = undefined;
@@ -486,6 +505,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             try evals.appendSlice(a, cache.buffers(l, &bufs));
             for (carry.topk) |t| if (t) |x_| try evals.append(a, x_);
             try g.evalAll(evals.items);
+            if (pt.enabled) _ = try pt.phase(g, &.{}, .rest);
         }
         g.release(h);
         h = next_h;

@@ -22,6 +22,7 @@ const bill_mod = @import("glm_moe_dsa_bill.zig");
 const graph = @import("glm_moe_dsa_graph.zig");
 const bank_mod = @import("glm_moe_dsa_bank.zig");
 const experts_mod = @import("glm_moe_dsa_experts.zig");
+const prefill_timers = @import("glm_moe_dsa_prefill_timers.zig");
 
 const G = graph.G;
 const Stats = sdk_ext.expert.Stats;
@@ -248,6 +249,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
             try self.g.evalAll(&.{logits.?});
             try self.ex.flush();
             log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()) }});
+            prefill_timers.report(ids.len);
             return logits.?;
         }
 
