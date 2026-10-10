@@ -235,6 +235,62 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             return acc.outs[first..acc.n_outs];
         }
 
+        /// One event wait for every array of the projections in `ps` (a struct of projections, or of optional ones):
+        /// their aliases, read by the GPU after `value` and `deps` (one encoder break for the set, not one per array).
+        fn waitAll(self: *Self, g: *G, ps: anytype, value: u64, deps: []const T) !@TypeOf(ps) {
+            const P = @TypeOf(ps);
+            var out = ps;
+            if (G != ops.MlxOps) {
+                inline for (comptime std.meta.fieldNames(P)) |pf| {
+                    const p = @field(ps, pf);
+                    if (@typeInfo(@TypeOf(p)) == .optional) {
+                        if (p) |q| @field(out, pf) = try self.waitArrays(g, q, value, deps);
+                    } else @field(out, pf) = try self.waitArrays(g, p, value, deps);
+                }
+                return out;
+            }
+            var xs: [32]T = undefined;
+            var n: usize = 0;
+            inline for (comptime std.meta.fieldNames(P)) |pf| {
+                const po = @field(ps, pf);
+                const pv = if (@typeInfo(@TypeOf(po)) == .optional) po else @as(?@TypeOf(po), po);
+                if (pv) |p| inline for (comptime std.meta.fieldNames(@TypeOf(p))) |f| {
+                    const v = @field(p, f);
+                    const x: ?T = if (@TypeOf(v) == T) v else v;
+                    if (x) |arr| {
+                        xs[n] = arr;
+                        n += 1;
+                    }
+                };
+            }
+            if (n == 0) return out;
+            var os: [32]T = undefined;
+            for (os[0..n]) |*o| o.* = mlx.mlx_array_new();
+            expert_event.wait(xs[0..n], self.opt.event.?, value, deps, false, g.s, os[0..n]) catch |e| {
+                for (os[0..n]) |o| _ = mlx.mlx_array_free(o);
+                return e;
+            };
+            var i: usize = 0;
+            inline for (comptime std.meta.fieldNames(P)) |pf| {
+                const po = @field(ps, pf);
+                const is_opt = @typeInfo(@TypeOf(po)) == .optional;
+                const pv = if (is_opt) po else @as(?@TypeOf(po), po);
+                if (pv) |p| {
+                    var q = p;
+                    inline for (comptime std.meta.fieldNames(@TypeOf(p))) |f| {
+                        const v = @field(p, f);
+                        const x: ?T = if (@TypeOf(v) == T) v else v;
+                        if (x != null) {
+                            @field(q, f) = try g.adopt(os[i]);
+                            i += 1;
+                        }
+                    }
+                    @field(out, pf) = q;
+                }
+            }
+            return out;
+        }
+
         /// An event wait's aliases of every array of one projection (`outs` fresh), read by the GPU after `value`.
         fn waitArrays(self: *Self, g: *G, p: anytype, value: u64, deps: []const T) !@TypeOf(p) {
             var out = p;
@@ -262,7 +318,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 const b = @backingInt(ref.bank);
                 if (w == 0 or gu[b] != null) continue;
                 const arrays = self.banks[layer][b] orelse return error.SlotArraysUnbound;
-                gu[b] = .{ .gate = try self.waitArrays(g, arrays.gate, gates.gu, &.{}), .up = try self.waitArrays(g, arrays.up, gates.gu, &.{}), .down = arrays.down };
+                const w2 = try self.waitAll(g, .{ .gate = arrays.gate, .up = arrays.up }, gates.gu, &.{});
+                gu[b] = .{ .gate = w2.gate, .up = w2.up, .down = arrays.down };
             }
             var waves: [max_route_ids]Wave = undefined;
             var hs: [max_route_ids]T = undefined;
@@ -280,9 +337,13 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 @memcpy(deps[0..n_hs], hs[0..n_hs]);
                 @memcpy(deps[n_hs..][0..prev.len], prev);
                 var dn = gu;
-                for (&dn) |*d| if (d.*) |*arr| {
-                    arr.down = try self.waitArrays(g, arr.down, gates.down_first + p, deps[0 .. n_hs + prev.len]);
-                };
+                const d0 = if (dn[0]) |arr| arr.down else null;
+                const d1 = if (dn[1]) |arr| arr.down else null;
+                const d2 = if (dn[2]) |arr| arr.down else null;
+                const wd = try self.waitAll(g, .{ .b0 = d0, .b1 = d1, .b2 = d2 }, gates.down_first + p, deps[0 .. n_hs + prev.len]);
+                if (dn[0]) |*arr| arr.down = wd.b0.?;
+                if (dn[1]) |*arr| arr.down = wd.b1.?;
+                if (dn[2]) |*arr| arr.down = wd.b2.?;
                 prev = try self.downWave(g, layer, &waves[p], acc, &dn);
             }
         }
