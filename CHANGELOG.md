@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Stream compact K2–K5 per-expert MUL1 mixtures without widest-rate cache padding, with capacity-aware admission and settled-only device routing.
+- Stream K2/K3/K4 MUL1 experts with mixed projection rates, exact cache/read-buffer accounting, and independent GPU regressions while retaining the tight K3 path.
+- Include separately billed expert metadata in the construction verifier's host-memory allowance.
 - The plugin carries its own `sdk` module (sdk/: the arch contract, the weight loader, the reads past the page cache)
   and reaches mlx-serve only through `mlx_host`; mlx-serve calls the arch from one glue file. `HOST_PIN`, the
   conformance suite's host-registry test and the host test bridge's dependence on host internals are gone.

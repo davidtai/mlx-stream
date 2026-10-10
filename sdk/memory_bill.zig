@@ -8,8 +8,8 @@ const peek = @import("peek.zig");
 
 pub const MemoryBill = struct {
     pub const Phase = enum { prompt, decode };
-    /// One named term, decimal bytes per phase (0 where absent). Rows-free by construction: the persistent slot rows
-    /// are `per_row` times the fill's rows. Every term is billed, a measured one at its declared bound.
+    /// One named term, decimal bytes per phase (0 where absent). Persistent rows are billed
+    /// through `per_row` plus `row_costs`; measured terms use their declared bounds.
     pub const Term = struct {
         name: []const u8,
         bytes: [2]u64,
@@ -21,8 +21,8 @@ pub const MemoryBill = struct {
         /// What the constructed module holds of the term when it is not its prompt bytes (a measured term whose
         /// construction bound is tighter than its phases'); null: the prompt bytes.
         construction: ?u64 = null,
-        /// Its bytes follow the slot rows (`MemoryBill.row_terms`): `bytes` is the value at the bill's own rows, and
-        /// every total counts the term through `row_terms` at the rows it is asked for.
+        /// Its bytes follow `MemoryBill.row_costs`; `bytes` records the producer's row count,
+        /// while totals and construction use the adjustment at the requested rows.
         with_rows: bool = false,
 
         /// The term's bytes at construction: `construction`, else the prompt phase's.
@@ -32,18 +32,30 @@ pub const MemoryBill = struct {
     };
 
     terms: []const Term = &.{},
-    /// One slot row on every routed layer (an expert_source's); 0 for a model without one.
+    /// A lower bound on one slot row across all routed layers; 0 without slot storage.
     per_row: u64 = 0,
-    /// The terms flagged `with_rows`, at any row count; null for a bill linear in its rows.
-    row_terms: ?RowTerms = null,
+    /// Owned by an allocated bill, indexed from zero rows; empty for a linear bill.
+    row_costs: []const RowCost = &.{},
+    /// Decode costs include a separately allocated suffix after this immutable base.
+    /// A coupled producer must choose the base before materializing its row table.
+    decode_base_rows: ?u32 = null,
 
-    /// Terms not linear in the slot rows (the kernel's page tables over the wired bytes): `at(&data, phase, rows)` is
-    /// their bytes at `rows` per layer. Subadditive in the rows, so the linear fill bounds the rows from above.
-    /// `data` is the plugin's own (the inputs its formula reads), so a bill stays a value.
-    pub const RowTerms = struct {
-        data: [4]u64,
-        at: *const fn (data: *const [4]u64, phase: Phase, rows: u32) u64,
+    /// Nonnegative adjustments above `rows * per_row`, including all `with_rows` terms.
+    pub const RowCost = struct {
+        bytes: [2]u64 = .{ 0, 0 },
+        construction: u64 = 0,
     };
+
+    fn maxRows(b: MemoryBill) u32 {
+        if (b.row_costs.len == 0) return std.math.maxInt(u32);
+        return @intCast(@min(b.row_costs.len - 1, std.math.maxInt(u32)));
+    }
+
+    fn rowCost(b: MemoryBill, rows: u32) ?RowCost {
+        if (b.row_costs.len == 0) return .{};
+        if (rows >= b.row_costs.len) return null;
+        return b.row_costs[rows];
+    }
 
     /// The phase's terms, the baseline, the slot rows and the row-following terms apart.
     pub fn fixed(b: MemoryBill, phase: Phase) u64 {
@@ -54,32 +66,35 @@ pub const MemoryBill = struct {
         return n;
     }
 
-    /// The phase's total over the box baseline at `rows` slot rows per layer.
+    /// Out-of-domain queries have an unrepresentable bound; `admit` reports the named refusal.
     pub fn total(b: MemoryBill, phase: Phase, baseline: u64, rows: u32) u64 {
-        const linear = baseline + b.fixed(phase) + rows * b.per_row;
-        const r = b.row_terms orelse return linear;
-        return linear + r.at(&r.data, phase, rows);
+        const cost = b.rowCost(rows) orelse return std.math.maxInt(u64);
+        return baseline + b.fixed(phase) + rows * b.per_row + cost.bytes[@backingInt(phase)];
     }
 
     /// What the process may hold above the baseline: the larger phase (a phase change frees before it grows, so
     /// there is no transition term).
     pub fn processBound(b: MemoryBill, rows: Rows) u64 {
+        if (b.decode_base_rows) |base| {
+            if (rows.prompt != base or rows.decode < base) return std.math.maxInt(u64);
+        }
         return @max(b.total(.prompt, 0, rows.prompt), b.total(.decode, 0, rows.decode));
     }
 
-    /// What the constructed module holds before any request: the construction terms at their prompt bytes and the
-    /// prompt rows.
+    /// The fixed construction terms and the exact adjustment at the requested prompt rows.
     pub fn constructionBytes(b: MemoryBill, prompt_rows: u32) u64 {
-        var n: u64 = prompt_rows * b.per_row;
+        const cost = b.rowCost(prompt_rows) orelse return std.math.maxInt(u64);
+        var n: u64 = prompt_rows * b.per_row + cost.construction;
         for (b.terms) |t| {
-            if (t.at_construction) n += t.atConstruction();
+            if (t.at_construction and !t.with_rows) n += t.atConstruction();
         }
         return n;
     }
 
-    /// Frees an allocated bill's terms.
+    /// Frees an allocated bill's terms and immutable row-cost table.
     pub fn free(b: MemoryBill, gpa: std.mem.Allocator) void {
         gpa.free(b.terms);
+        gpa.free(b.row_costs);
     }
 };
 
@@ -109,28 +124,35 @@ pub const BillRequest = struct {
     }
 };
 
-/// The fill: the most decode rows, then the most prompt rows (prompt <= decode <= `n_experts`), each phase's total
-/// within `target`. Refused by name below `min_rows`, and for a bill without slot rows (nothing to fill).
+/// Maximize decode, then prompt within the expert/table domain. Coupled bills retain their
+/// declared base; their producer, not this one-dimensional table, chooses the base globally.
 pub fn fill(b: MemoryBill, baseline: u64, target: u64, n_experts: u32, min_rows: u32) error{ NoSlotRows, NativeBillDoesNotFit }!Rows {
     if (b.per_row == 0) return error.NoSlotRows;
+    const limit = @min(n_experts, b.maxRows());
     const most = struct {
-        // The linear rows (the row-following terms left out) bound it from above; step down while the total is over.
-        fn f(mb: MemoryBill, phase: MemoryBill.Phase, base: u64, t: u64) u64 {
+        fn f(mb: MemoryBill, phase: MemoryBill.Phase, base: u64, t: u64, cap: u32) u32 {
             const fixed = base + mb.fixed(phase);
-            var r = if (fixed >= t) 0 else (t - fixed) / mb.per_row;
-            while (r > 0 and mb.total(phase, base, @intCast(r)) > t) r -= 1;
+            var r: u32 = @intCast(@min(@as(u64, cap), if (fixed >= t) 0 else (t - fixed) / mb.per_row));
+            while (r > 0 and mb.total(phase, base, r) > t) r -= 1;
             return r;
         }
     }.f;
-    const decode = @min(most(b, .decode, baseline, target), n_experts);
-    const prompt = @min(most(b, .prompt, baseline, target), decode);
-    if (prompt < min_rows) return error.NativeBillDoesNotFit;
-    return .{ .prompt = @intCast(prompt), .decode = @intCast(decode) };
+    const decode = most(b, .decode, baseline, target, limit);
+    const prompt = b.decode_base_rows orelse @min(most(b, .prompt, baseline, target, limit), decode);
+    if (prompt > decode or prompt < min_rows or
+        b.total(.prompt, baseline, prompt) > target or b.total(.decode, baseline, decode) > target)
+        return error.NativeBillDoesNotFit;
+    return .{ .prompt = prompt, .decode = decode };
 }
 
 /// Both phases within `target` at `rows`, once, before any slot bank or resident is allocated (forced rows are
 /// checked here; the fill guarantees its own).
-pub fn admit(b: MemoryBill, baseline: u64, rows: Rows, target: u64) error{ PromptOverTarget, DecodeOverTarget }!void {
+pub fn admit(b: MemoryBill, baseline: u64, rows: Rows, target: u64) error{ PromptOverTarget, DecodeOverTarget, RowCostDomain, DecodeBaseRowsMismatch }!void {
+    if (rows.prompt > b.maxRows() or rows.decode > b.maxRows()) return error.RowCostDomain;
+    if (b.decode_base_rows) |base| {
+        if (rows.prompt != base) return error.DecodeBaseRowsMismatch;
+        if (rows.decode < base) return error.RowCostDomain;
+    }
     if (b.total(.prompt, baseline, rows.prompt) > target) return error.PromptOverTarget;
     if (b.total(.decode, baseline, rows.decode) > target) return error.DecodeOverTarget;
 }
@@ -217,13 +239,12 @@ test "sdk bill: a row-following term counts at the rows asked; the fill steps do
         .{ .name = "residents", .bytes = .{ 10 * gb, 10 * gb }, .at_construction = true },
         .{ .name = "tables", .bytes = .{ 0, 0 }, .at_construction = false, .with_rows = true },
     };
-    const per_gb = struct {
-        // 1 B per 1,000 B of wired bytes, rounded up: subadditive in the rows.
-        fn at(data: *const [4]u64, _: MemoryBill.Phase, rows: u32) u64 {
-            return std.math.divCeil(u64, data[0] + rows * data[1], 1000) catch unreachable;
-        }
-    }.at;
-    const b: MemoryBill = .{ .terms = &terms, .per_row = gb / 4, .row_terms = .{ .data = .{ 10 * gb, gb / 4, 0, 0 }, .at = per_gb } };
+    var costs: [65]MemoryBill.RowCost = undefined;
+    for (&costs, 0..) |*cost, rows| {
+        const bytes = try std.math.divCeil(u64, 10 * gb + rows * (gb / 4), 1000);
+        cost.* = .{ .bytes = .{ bytes, bytes } };
+    }
+    const b: MemoryBill = .{ .terms = &terms, .per_row = gb / 4, .row_costs = &costs };
     try testing.expectEqual(@as(u64, 10 * gb), b.fixed(.prompt));
     try testing.expectEqual(10 * gb + 8 * (gb / 4) + 12_000_000, b.total(.decode, 0, 8));
     // The largest rows whose exact total stays within the target, one below the linear bound.
@@ -231,4 +252,98 @@ test "sdk bill: a row-following term counts at the rows asked; the fill steps do
     const r = try fill(b, 0, target, 64, 1);
     try testing.expectEqual(@as(u32, 39), r.decode);
     try testing.expect(b.total(.decode, 0, r.decode) <= target and b.total(.decode, 0, r.decode + 1) > target);
+}
+
+test "sdk bill: construction follows the requested capacity prefix, not the producer's row count" {
+    const terms = [_]MemoryBill.Term{
+        .{ .name = "resident", .bytes = .{ 1000, 1000 }, .at_construction = true },
+        .{ .name = "capacity premium", .bytes = .{ 30, 30 }, .at_construction = true, .with_rows = true },
+    };
+    const costs = [_]MemoryBill.RowCost{
+        .{},
+        .{ .bytes = .{ 10, 10 }, .construction = 10 },
+        .{ .bytes = .{ 30, 30 }, .construction = 30 },
+        .{ .bytes = .{ 60, 60 }, .construction = 60 },
+    };
+    const b: MemoryBill = .{
+        .terms = &terms,
+        .per_row = 100,
+        .row_costs = &costs,
+    };
+    try testing.expectEqual(@as(u64, 1110), b.total(.prompt, 0, 1));
+    try testing.expectEqual(@as(u64, 1110), b.constructionBytes(1));
+    try testing.expectEqual(@as(u64, 1360), b.constructionBytes(3));
+}
+
+fn nonlinearFixture() MemoryBill {
+    const terms = comptime [_]MemoryBill.Term{
+        .{ .name = "resident", .bytes = .{ 1000, 800 }, .at_construction = true },
+        .{ .name = "transient", .bytes = .{ 50, 20 }, .at_construction = false },
+        .{ .name = "capacity premium", .bytes = .{ 28, 28 }, .at_construction = true, .with_rows = true },
+        .{ .name = "wire tables", .bytes = .{ 4, 14 }, .at_construction = false, .with_rows = true },
+    };
+    const costs = comptime [_]MemoryBill.RowCost{
+        .{},
+        .{ .bytes = .{ 10, 12 }, .construction = 8 },
+        .{ .bytes = .{ 32, 42 }, .construction = 28 },
+        .{ .bytes = .{ 66, 74 }, .construction = 58 },
+        .{ .bytes = .{ 90, 110 }, .construction = 80 },
+    };
+    return .{ .terms = &terms, .per_row = 100, .row_costs = &costs };
+}
+
+test "sdk bill: owned nonlinear costs give maximal rows at every threshold and clamp before lookup" {
+    var b = nonlinearFixture();
+    {
+        b.terms = try testing.allocator.dupe(MemoryBill.Term, b.terms);
+        errdefer testing.allocator.free(b.terms);
+        b.row_costs = try testing.allocator.dupe(MemoryBill.RowCost, b.row_costs);
+    }
+    defer b.free(testing.allocator);
+    const prompt_totals = [_]u64{ 1050, 1160, 1282, 1416, 1540 };
+    const decode_totals = [_]u64{ 820, 932, 1062, 1194, 1330 };
+    const construction = [_]u64{ 1000, 1108, 1228, 1358, 1480 };
+    for (0..5) |r| {
+        try testing.expectEqual(prompt_totals[r], b.total(.prompt, 0, @intCast(r)));
+        try testing.expectEqual(decode_totals[r], b.total(.decode, 0, @intCast(r)));
+        try testing.expectEqual(construction[r], b.constructionBytes(@intCast(r)));
+    }
+    const baseline = 73;
+    for (800..1651) |target| {
+        var expected: ?Rows = null;
+        for (1..5) |d| for (1..d + 1) |p| {
+            if (prompt_totals[p] + baseline <= target and decode_totals[d] + baseline <= target)
+                expected = .{ .prompt = @intCast(p), .decode = @intCast(d) };
+        };
+        if (expected) |want| {
+            const got = try fill(b, baseline, target, 99, 1);
+            try testing.expectEqual(want, got);
+            try admit(b, baseline, got, target);
+            try testing.expectEqual(@max(prompt_totals[got.prompt], decode_totals[got.decode]), b.processBound(got));
+        } else {
+            try testing.expectError(error.NativeBillDoesNotFit, fill(b, baseline, target, 99, 1));
+        }
+    }
+    try testing.expectEqual(Rows{ .prompt = 4, .decode = 4 }, try fill(b, 0, std.math.maxInt(u64), 99, 1));
+    try testing.expectEqual(Rows{ .prompt = 2, .decode = 2 }, try fill(b, 0, std.math.maxInt(u64), 2, 1));
+    try testing.expectError(error.NativeBillDoesNotFit, fill(b, 0, 0, 99, 0));
+    try testing.expectError(error.RowCostDomain, admit(b, 0, .{ .prompt = 1, .decode = 5 }, std.math.maxInt(u64)));
+    try testing.expectEqual(std.math.maxInt(u64), b.total(.decode, 0, 5));
+    try testing.expectEqual(std.math.maxInt(u64), b.constructionBytes(5));
+}
+
+test "sdk bill: a coupled decode table cannot admit or fill a different construction base" {
+    var b = nonlinearFixture();
+    b.decode_base_rows = 2;
+    try testing.expectEqual(Rows{ .prompt = 2, .decode = 4 }, try fill(b, 0, 1600, 4, 1));
+    try testing.expectEqual(Rows{ .prompt = 2, .decode = 4 }, try fill(b, 0, 1330, 4, 1));
+    try testing.expectEqual(Rows{ .prompt = 2, .decode = 3 }, try fill(b, 0, 1329, 4, 1));
+    try admit(b, 0, .{ .prompt = 2, .decode = 4 }, 1330);
+    try testing.expectError(error.DecodeBaseRowsMismatch, admit(b, 0, .{ .prompt = 3, .decode = 4 }, 1600));
+    try testing.expectError(error.RowCostDomain, admit(b, 0, .{ .prompt = 2, .decode = 1 }, 1600));
+    try testing.expectEqual(@as(u64, 1330), b.processBound(.{ .prompt = 2, .decode = 4 }));
+    try testing.expectEqual(std.math.maxInt(u64), b.processBound(.{ .prompt = 3, .decode = 4 }));
+    try testing.expectEqual(std.math.maxInt(u64), b.processBound(.{ .prompt = 2, .decode = 1 }));
+    try testing.expectError(error.NativeBillDoesNotFit, fill(b, 0, 1281, 4, 1));
+    try testing.expectError(error.NativeBillDoesNotFit, fill(b, 0, 1600, 1, 1));
 }

@@ -131,6 +131,111 @@ test "dsv41 io: pool scatters a synthetic file" {
     }
 }
 
+test "dsv41 io: heterogeneous same-cur speculation and same-tag prereads retain every selected byte" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(10 * page);
+    defer f.deinit();
+    const geometries = [_][9]u64{
+        .{ 512, 64, 128, 768, 64, 128, 1280, 128, 64 },
+        .{ 1280, 64, 128, 512, 64, 128, 512, 128, 64 },
+        .{ 512, 64, 128, 1280, 64, 128, 512, 128, 64 },
+    };
+    const bases = [_]u64{ 2 * page + 123, 4 * page + 77, 6 * page + 91 };
+    const logical = [_]u64{ 3136, 2880, 2880 };
+    const gu_lengths = [_]u64{ 1664, 2176, 2176 };
+    for ([_]bool{ false, true }) |preread| {
+        const pool = try specPool(2, 6);
+        defer pool.stop();
+        defer clearFaults();
+        injectFault(2 * page, 5, 20 * std.time.ns_per_ms);
+        var dests: [3]Dests = undefined;
+        var initialized: usize = 0;
+        defer for (dests[0..initialized]) |d| testing.allocator.free(d.buf);
+        for (geometries, &dests) |lens, *d| {
+            d.* = try Dests.init(1, &lens);
+            initialized += 1;
+        }
+        if (preread) try R96.armPreRead(pool, &geometries[0]);
+        for (geometries, bases, logical) |lens, base, len| {
+            if (preread) {
+                try testing.expectEqual(@as(u32, 2), try R96.preRead(pool, f.ufd, 37, &.{@intCast(base)}, &lens));
+            } else {
+                try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 36, &.{@intCast(base)}, len));
+            }
+        }
+        if (preread) {
+            try waitFor(pool, preStarted2);
+        } else {
+            for (bases) |base| try waitFor(@as(i64, @intCast(base)), landedAt);
+        }
+        var tickets: [3]u32 = undefined;
+        // Every demand binds before the one settle; equal totals need different scatter geometry.
+        for ([_]usize{ 2, 0, 1 }) |i| {
+            tickets[i] = try R96.submit(pool, f.ufd, &.{bases[i]}, &.{bases[i] + gu_lengths[i]}, dests[i].rows[0..1], &geometries[i]);
+        }
+        _ = try pool.specStep(f.ufd, 37, &.{}, 0);
+        for (tickets, dests, geometries, bases, gu_lengths) |ticket, d, lens, base, gu| {
+            try pool.wait(ticket, 2, 10 * std.time.ns_per_s);
+            try testing.expectEqual(Status.ok, pool.result(ticket).status);
+            try testing.expectEqual(Status.ok, pool.result(ticket + 1).status);
+            try d.expectRecord(0, f.image, base, base + gu, &lens);
+        }
+        if (preread) {
+            try testing.expectEqual(@as(i64, 6), pool.counter(.pre_issued));
+            try testing.expectEqual(@as(i64, 0), pool.counter(.pre_expired));
+            try testing.expectEqual(@as(i64, 6), pool.counter(.pre_bound) + pool.counter(.pre_cancelled));
+            try testing.expect(pool.counter(.pre_served) >= 2);
+        } else {
+            try testing.expectEqual(@as(i64, 3), pool.counter(.claimed));
+            try testing.expectEqual(@as(i64, 6), pool.counter(.adopt_ranges));
+            try testing.expectEqual(@as(i64, 8896), pool.counter(.adopt_bytes));
+        }
+    }
+}
+
+test "dsv41 io: speculative and preread bytes never cross source identities at equal offsets" {
+    const page = std.heap.pageSize();
+    var first = try PatternFile.init(4 * page);
+    defer first.deinit();
+    var second = try PatternFile.init(4 * page);
+    defer second.deinit();
+    expert_bank.fillPattern(second.image, 29);
+    try second.tmp.dir.writeFile(testing.io, .{ .sub_path = "pattern.bin", .data = second.image });
+    const lens = [9]u64{ 512, 64, 128, 768, 64, 128, 1280, 128, 64 };
+    const base = page + 123;
+    for ([_]bool{ false, true }) |preread| {
+        const destinations = try Dests.init(1, &lens);
+        defer testing.allocator.free(destinations.buf);
+        // Two workers hold the other source's unbound prereads; demand needs its own worker.
+        const pool = try specPool(3, 4);
+        defer pool.stop();
+        if (preread) {
+            try R96.armPreRead(pool, &lens);
+            _ = try R96.preRead(pool, first.ufd, 37, &.{@intCast(base)}, &lens);
+            waitFor(pool, preStarted2) catch |err| {
+                std.debug.print("source isolation: preread start: {t}\n", .{err});
+                return err;
+            };
+        } else {
+            _ = try pool.specStep(first.ufd, 36, &.{@intCast(base)}, 3136);
+            waitFor(@as(i64, @intCast(base)), landedAt) catch |err| {
+                std.debug.print("source isolation: speculative landing: {t}\n", .{err});
+                return err;
+            };
+        }
+        const ticket = try R96.submit(pool, second.ufd, &.{base}, &.{base + 1664}, destinations.rows[0..1], &lens);
+        pool.wait(ticket, 2, 10 * std.time.ns_per_s) catch |err| {
+            std.debug.print("source isolation: demand preread={} tickets={d}: {t}\n", .{ preread, ticket, err });
+            return err;
+        };
+        try testing.expectEqual(Status.ok, pool.result(ticket).status);
+        try testing.expectEqual(Status.ok, pool.result(ticket + 1).status);
+        try destinations.expectRecord(0, second.image, base, base + 1664, &lens);
+        try testing.expect(!std.mem.eql(u8, first.image[base..][0..3136], destinations.buf));
+        _ = try pool.specStep(second.ufd, 37, &.{}, 0);
+    }
+}
+
 test "dsv41 io: injected faults map to status words" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(40 * page);
@@ -145,7 +250,7 @@ test "dsv41 io: injected faults map to status words" {
         // 1 EINTR: retried inside the call, uncounted.
         .{ .code = 1, .arg = 0, .hit = .gu1, .want = .{ .ok, .ok, .ok, .ok } },
         // 2 EIO: that range fails with errno, the rest of the job is skipped.
-        .{ .code = 2, .arg = 0, .hit = .gu1, .want = .{ .ok, .os_error, .skipped, .skipped }, .err = @intFromEnum(std.posix.E.IO) },
+        .{ .code = 2, .arg = 0, .hit = .gu1, .want = .{ .ok, .os_error, .skipped, .skipped }, .err = @backingInt(std.posix.E.IO) },
         // 3 zero return: a short read.
         .{ .code = 3, .arg = 0, .hit = .down0, .want = .{ .ok, .ok, .short, .skipped } },
         // 4 truncated past the skip: 200 bytes land, the range continues.
@@ -532,14 +637,14 @@ test "dsv41 io: the watchdog forces a gate whose bytes never land; stop and the 
     try rig.pool.wait(f0, 2, 10 * std.time.ns_per_s);
     // Host release: a gate over a ticket that never publishes is forced by value.
     const phantom: u32 = 500;
-    rig.pool.res[phantom * res_w] = @intFromEnum(Status.pending);
+    rig.pool.res[phantom * res_w] = @backingInt(Status.pending);
     try rig.register(&.{&.{phantom}});
     rig.pool.releaseGates(4);
     try testing.expectEqual(@as(i64, 4), @atomicLoad(i64, rig.word, .acquire));
     try testing.expectEqual(@as(i64, 1), rig.pool.counter(.ev_host_released));
     // Stop: a live gate is released so no GPU wait outlives the pool.
     const phantom2: u32 = 501;
-    rig.pool.res[phantom2 * res_w] = @intFromEnum(Status.pending);
+    rig.pool.res[phantom2 * res_w] = @backingInt(Status.pending);
     try rig.register(&.{&.{phantom2}});
     try testing.expectEqual(@as(i64, 4), @atomicLoad(i64, rig.word, .acquire));
     _ = c.q3ld_quiesce(10 * std.time.ns_per_s);
@@ -777,13 +882,13 @@ test "dsv41 io cov: a running pool refuses a malformed job and a pending ticket 
         try testing.expectEqual(@as(c_int, -1), c.q3ld_submit(fd, size, -1, s.n, s.ngu, s.ndown, &offs, &rows, &lens, s.first));
     }
     // A ticket still pending (its status word) refuses the submit, raw and through Records.
-    pool.res[5 * res_w] = @intFromEnum(Status.pending);
+    pool.res[5 * res_w] = @backingInt(Status.pending);
     try testing.expectEqual(@as(c_int, -2), rawSubmit(pool, fd, size, -1, 0, 100, lens[0..1], lens[1..2], &dst, 4));
     pool.res[5 * res_w] = 0;
     const small = [n_components]u64{ 10, 10, 10, 10, 10, 10, 10, 10, 10 };
     var d = try Dests.init(1, &small);
     defer testing.allocator.free(d.buf);
-    pool.res[0] = @intFromEnum(Status.pending);
+    pool.res[0] = @backingInt(Status.pending);
     try testing.expectError(error.TicketsBusy, R96.submit(pool, f.ufd, &.{0}, &.{1000}, d.rows[0..1], &small));
     pool.res[0] = 0;
     // Shapes Records refuses before the pool: no record, offsets that do not match the rows.
@@ -885,7 +990,7 @@ test "dsv41 io cov: ranges at and past the end of file, zero-length parts, a sho
         } else {
             try testing.expectEqual(Status.skipped, pool.result(t + 1).status);
         }
-        if (cs.want == .os_error) try testing.expectEqual(@as(i64, @intFromEnum(std.posix.E.BADF)), r.errno);
+        if (cs.want == .os_error) try testing.expectEqual(@as(i64, @backingInt(std.posix.E.BADF)), r.errno);
         if (cs.gu == page - 1) try testing.expect(r.preadv_calls >= 4);
     }
 }
@@ -1013,10 +1118,10 @@ test "dsv41 io cov: horizon-N steps keep, promote and drop queued records; a ful
     // D is not (dropped); E is issued two ahead.
     try testing.expectEqual(@as(i32, 1), q3raw.q3ld_spec_stepn(fd, size, 1, 2, &[2]i32{ 1, 0 }, &[1]i64{C}, &[2]i32{ 0, 1 }, &[1]i64{E}));
     try testing.expectEqual(@as(i64, 3), pool.counter(.expired));
-    try testing.expectEqual(@as(i64, 1), counterAt(pool, @intFromEnum(io.Counter.h_kept) + 1));
-    try testing.expectEqual(@as(i64, 1), counterAt(pool, @intFromEnum(io.Counter.h_dropped) + 1));
-    try testing.expectEqual(@as(i64, 2), counterAt(pool, @intFromEnum(io.Counter.h_submitted)));
-    try testing.expectEqual(@as(i64, 3), counterAt(pool, @intFromEnum(io.Counter.h_submitted) + 1));
+    try testing.expectEqual(@as(i64, 1), counterAt(pool, @backingInt(io.Counter.h_kept) + 1));
+    try testing.expectEqual(@as(i64, 1), counterAt(pool, @backingInt(io.Counter.h_dropped) + 1));
+    try testing.expectEqual(@as(i64, 2), counterAt(pool, @backingInt(io.Counter.h_submitted)));
+    try testing.expectEqual(@as(i64, 3), counterAt(pool, @backingInt(io.Counter.h_submitted) + 1));
     var raw_st: [spec_state_w * max_spec]i64 = undefined;
     try testing.expectEqual(@as(i32, 4), c.q3ld_spec_state(&raw_st));
     var seen: u32 = 0;
@@ -1102,7 +1207,7 @@ test "dsv41 io cov: the event class's arming refusals, the gate ring's bounds, a
     try testing.expectError(error.GateRefused, pool.registerGates(&.{1}, &.{0}, &.{}));
     try pool.armEvent(.host, w, 60 * std.time.ns_per_s, 0);
     // A gate over a pending ticket heads the ring; a second gate may not wait for that ticket, nor for a negative count.
-    pool.res[60 * res_w] = @intFromEnum(Status.pending);
+    pool.res[60 * res_w] = @backingInt(Status.pending);
     defer pool.res[60 * res_w] = 0;
     try pool.registerGates(&.{1}, &.{1}, &.{60});
     try testing.expectError(error.GateInvalid, pool.registerGates(&.{2}, &.{1}, &.{60}));
@@ -1298,7 +1403,7 @@ test "dsv41 io cov: an in-flight record parks (class 1) or pauses (class 0) when
     try testing.expectEqual(@as(i32, 0), q3raw.q3ld_spec_stepn(fd, size, 1, 2, &[2]i32{ 0, 0 }, &none, &[2]i32{ 0, 0 }, &none));
     try testing.expectEqual(@as(i64, 1), pool.counter(.abandoned));
     try testing.expectEqual(pg, pool.counter(.abandoned_bytes));
-    try testing.expectEqual(@as(i64, 1), counterAt(pool, @intFromEnum(io.Counter.h_dropped) + 1));
+    try testing.expectEqual(@as(i64, 1), counterAt(pool, @backingInt(io.Counter.h_dropped) + 1));
     // Demand idle again (a later pre-read call expires the held ranges).
     try testing.expectEqual(@as(i32, 0), c.q3ld_pre_read_lens(fd, size, 101, 0, &none, &l));
     try waitFor(pool, preIdle);
@@ -1428,4 +1533,40 @@ test "dsv41 io cov: a file shorter than its job's size, ending inside a range's 
     };
     try testing.expectEqual(Status.short, pool.result(0).status);
     try testing.expectEqual(@as(i64, 200), pool.result(0).payload);
+}
+
+test "dsv41 integer rates: unaligned K4 prereads are adopted and scatter every component" {
+    const page = std.heap.pageSize();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image = try expert_bank.writeSynth(testing.allocator, &tmp, .{ .hidden = 5120, .inter = 2304, .n_experts = 2, .k = &.{ 4, 4 } });
+    defer testing.allocator.free(image);
+    var root: [512]u8 = undefined;
+    var bank = try expert_bank.Bank.open(testing.allocator, testing.io, try expert_bank.tmpRoot(&tmp, &root), .{
+        .codebooks = &.{"mul1"},
+        .k = &.{4},
+        .hidden = 5120,
+        .inter = 2304,
+        .n_experts = 2,
+        .n_layers = 2,
+    }, null);
+    defer bank.deinit();
+    const staging = try @import("expert_stream.zig").StorageGeometry.prereadStaging(&bank, page);
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = staging, .spec = .{ .threads = 1, .slots = 1, .record_bytes = bank.layers[0].logical_bytes, .chunk_bytes = page } });
+    defer pool.stop();
+    var lens: [n_components]u64 = undefined;
+    for (&lens, bank.layers[0].segments) |*n, seg| n.* = seg.length;
+    try R96.armPreRead(pool, &lens);
+    const spans = bank.spans(0, 1);
+    try testing.expectEqual(page - expert_bank.record_alignment, spans.gu_offset % page);
+    try testing.expectEqual(@as(u32, 2), try R96.preRead(pool, bank.sidecar, 1, &.{@intCast(spans.gu_offset)}, &lens));
+    try waitFor(pool, preStarted2);
+    var d = try Dests.init(1, &lens);
+    defer testing.allocator.free(d.buf);
+    const first = try R96.submit(pool, bank.sidecar, &.{spans.gu_offset}, &.{spans.down_offset}, d.rows[0..1], &lens);
+    try pool.wait(first, 2, 10 * std.time.ns_per_s);
+    try d.expectRecord(0, image, spans.gu_offset, spans.down_offset, &lens);
+    try testing.expectEqual(@as(i64, 2), pool.counter(.pre_bound));
+    try testing.expectEqual(@as(i64, 2), pool.counter(.pre_served));
+    try testing.expectEqual(@as(i64, 0), pool.counter(.pre_noslot));
 }

@@ -59,9 +59,8 @@ const n_banks = std.meta.fieldNames(BankKind).len;
 /// What one routed-layer call serves (`sdk_ext.expert.Served`).
 pub const Served = sdk_ext.expert.Served;
 
-/// One projection's slot arrays in a bank (the streamer's `ProjArrays` over
-/// any backend): code int16 [rows, in/16, out/16, 16K], rout f16 [rows, out],
-/// rin f16 [rows, in].
+/// One projection's slot arrays: code int16 [rows, in/16, out/16, physical tile capacity],
+/// rout f16 [rows, out], rin f16 [rows, in]. `layout` separates logical rate from physical row stride.
 pub const ProjOf = xq.ProjArrays;
 
 /// A bank's nine arrays by projection (the streamer's `BankArrays`; the quant seam's).
@@ -339,8 +338,8 @@ pub const FakeSource = struct {
     }
 
     /// DEVROUTE: as `StreamSource.residentLut`.
-    pub fn residentLut(self: *const FakeSource, layer: u32, out: []u32) void {
-        lutOf(&self.policies[layer], self, layer, out);
+    pub fn residentLut(self: *const FakeSource, layer: u32, out: []u32, missing_id: u32) void {
+        lutOf(&self.policies[layer], self, layer, out, missing_id);
     }
 
     pub fn decoding(self: *const FakeSource) bool {
@@ -432,7 +431,7 @@ const t128_scale: f32 = @bitCast(@as(u32, 0x3db504f3));
 /// The stock tier's routed-expert math, `exl3_lane.Exl3PackedOps` op for op:
 /// per projection `t128(gemv(t128(x * rin[slot])) ) * rout[slot]` (f32), the
 /// clamped SwiGLU between gate/up and down. `Gemv.project(g, proj, xh, ids,
-/// code)` is the EXL3 decode GEMV (`z = xh @ W_hat[slot]` in the trellis domain,
+/// code, layout)` is the EXL3 decode GEMV (`z = xh @ W_hat[slot]` in the trellis domain,
 /// f32 [rows, out]): the accepted EXL3 quant's (`*const exl3_quant.Gemv(G)`).
 /// The parity harnesses' math (the stock path reads f32 routed rows).
 pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
@@ -462,7 +461,7 @@ pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
         fn project(self: *const Self, g: *G, x: T, ids: T, p: ProjOf(T), proj: xq.Proj) !T {
             const rin = try g.astype(try g.take(p.rin, ids, 0), .float32);
             const xh = try t128(g, try g.mul(try g.astype(x, .float32), rin));
-            const z = try self.gemv.project(g, proj, xh, ids, p.code);
+            const z = try self.gemv.project(g, proj, xh, ids, p.code, p.layout);
             const rout = try g.astype(try g.take(p.rout, ids, 0), .float32);
             return g.mul(try t128(g, z), rout);
         }
@@ -513,6 +512,10 @@ pub fn QuantMath(comptime G: type, comptime Q: type) type {
 
         /// The quant's banked route, when it has one (a construction-time type choice; `Options.banked` binds it).
         pub const has_banked = @hasDecl(Q, "gateUpBanked");
+
+        pub fn devrouteMissingId(self: *const Self) u32 {
+            return self.q.devrouteMissingId();
+        }
 
         /// ids packed (bank << 24 | slot row); `banks` base, ext, transient.
         pub fn gateUpBanked(self: *const Self, g: *G, x: T, ids: T, banks: *const [n_banks]BankArraysOf(T)) !T {
@@ -579,13 +582,17 @@ pub fn WithPrefillRoutes(comptime G: type, comptime D: type, comptime P: type) t
 /// inputs: xh f32 [rows, in], ids uint32 [rows], code int16 [cap, in/16,
 /// out/16, 48] at K 3); the output is a kernel node f32 [rows, out].
 pub const TraceGemv = struct {
-    pub fn project(_: TraceGemv, g: *ops.TraceOps, _: xq.Proj, xh: u32, ids: u32, code: u32) !u32 {
+    pub fn project(_: TraceGemv, g: *ops.TraceOps, _: xq.Proj, xh: u32, ids: u32, code: u32, storage: xq.ProjectionStorage(u32)) !u32 {
+        const layout = switch (storage) {
+            .fixed => |value| value,
+            .compact => return error.GemvShape,
+        };
         const sx = g.shapeOf(xh);
         const si = g.shapeOf(ids);
         const sc = g.shapeOf(code);
         if (g.dtypeOf(xh) != .float32 or g.dtypeOf(ids) != .uint32 or g.dtypeOf(code) != .int16) return error.GemvDtype;
         if (sx.n != 2 or si.n != 1 or sc.n != 4 or si.d[0] != sx.d[0]) return error.GemvShape;
-        if (sc.d[1] * 16 != sx.d[1] or sc.d[3] != 48) return error.GemvShape;
+        if (sc.d[1] * 16 != sx.d[1] or layout.k < 2 or layout.k > 4 or layout.code_row_words < @as(u64, @intCast(sc.d[1] * sc.d[2])) * 16 * layout.k) return error.GemvShape;
         return g.kernel(&.{ sx.d[0], sc.d[2] * 16 }, .float32);
     }
 };
@@ -954,13 +961,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 self.dev_parity = try self.a.alloc(u1, n_l);
                 const zeros = try self.a.alloc(u32, self.n_experts);
                 defer self.a.free(zeros);
-                @memset(zeros, 0);
+                @memset(zeros, self.devrouteMissingId());
                 for (self.dev_lut) |*pair| for (pair) |*x| {
                     x.* = g.keep(try g.hostArray(std.mem.sliceAsBytes(zeros), &.{@intCast(self.n_experts)}, .uint32));
                 };
             }
             for (self.dev_lut, self.dev_parity, 0..) |pair, *par, l| {
-                for (pair) |x| self.source.residentLut(@intCast(l), std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(x)))));
+                for (pair) |x| self.source.residentLut(@intCast(l), std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(x)))), self.devrouteMissingId());
                 par.* = 0;
             }
         }
@@ -974,12 +981,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
         fn devLutAfterRouteIn(self: *Self, g: *G, layer: u32) !void {
             const next = self.dev_parity[layer] +% 1;
-            self.source.residentLut(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next])))));
+            self.source.residentLut(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next])))), self.devrouteMissingId());
             self.dev_parity[layer] = next;
         }
 
         /// DEVROUTE: the call's every routed pair through the banked texts, the slots from the layer's LUT on the device
-        /// (hits: their resident (bank, row), the host's plan's same; misses: base row 0, never joined); `[n * k, hidden]`
+        /// (hits: their resident (bank, row), the host's plan's same; misses: the quant's missing id, never joined); `[n * k, hidden]`
         /// in routed order.
         fn devWave(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !T {
             if (comptime !hasBanked()) {
@@ -1026,6 +1033,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return @hasDecl(M, "has_banked") and M.has_banked;
         }
 
+        fn devrouteMissingId(self: *const Self) u32 {
+            if (comptime hasBanked()) return self.math.devrouteMissingId();
+            return 0;
+        }
+
         /// The router that scores layer `layer`'s read-ahead: the NEXT layer's
         /// (none after the last layer).
         pub fn predictorGate(self: *const Self, layer: u32) ?Gate {
@@ -1048,9 +1060,18 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         fn waitProj(self: *Self, g: *G, p: ProjOf(T), value: u64, deps: []const T) !ProjOf(T) {
-            var out: [3]T = undefined;
-            try self.eventWait(g, &.{ p.code, p.rout, p.rin }, value, deps, &out);
-            return .{ .code = out[0], .rout = out[1], .rin = out[2] };
+            switch (p.layout) {
+                .fixed => {
+                    var out: [3]T = undefined;
+                    try self.eventWait(g, &.{ p.code, p.rout, p.rin }, value, deps, &out);
+                    return .{ .code = out[0], .rout = out[1], .rin = out[2], .layout = p.layout };
+                },
+                .compact => |descriptor| {
+                    var out: [4]T = undefined;
+                    try self.eventWait(g, &.{ p.code, p.rout, p.rin, descriptor }, value, deps, &out);
+                    return .{ .code = out[0], .rout = out[1], .rin = out[2], .layout = .{ .compact = out[3] } };
+                },
+            }
         }
 
         pub fn deinit(self: *Self) void {
@@ -1117,6 +1138,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// After the forward's last eval: settles and unpins released calls.
         pub fn flush(self: *Self) !void {
             try self.source.flush();
+            // Gated loads become publishable only after settlement; neither LUT is in flight here.
+            if (self.devroute and self.dev_lut.len != 0 and self.devrouteMissingId() != 0)
+                try self.devLutsAtGrow(self.g);
         }
 
         pub const Hook = struct {
@@ -1161,6 +1185,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             /// P1: the layer's predicted seed, experts hottest first, read ahead of its routed call.
             pub fn readAheadSeed(h: Hook, experts: []const u16) !void {
                 if (comptime !@hasDecl(S, "readAheadSeed")) return error.ReadAheadNotStreamed;
+                // The predictor evaluated every carried chunk before this boundary.
+                try h.ex.flush();
                 return h.ex.source.readAheadSeed(h.layer, experts);
             }
         };
@@ -2243,7 +2269,7 @@ test "dsv41 experts: the kernels' decode GEMV launches configs prepared on the m
         defer gemv.deinit(&g);
         try testing.expect(g.prepared_live > 0);
         // gate / up: xh f32 [rows, 5120] at slot rows ids, code i16 [cap, 320, 144, 48] -> [rows, 2304] f32
-        const z = try gemv.project(&g, .gate, try g.input(&.{ 6, 5120 }, .float32), try g.input(&.{6}, .uint32), try g.input(&.{ 64, 320, 144, 48 }, .int16));
+        const z = try gemv.project(&g, .gate, try g.input(&.{ 6, 5120 }, .float32), try g.input(&.{6}, .uint32), try g.input(&.{ 64, 320, 144, 48 }, .int16), .{ .fixed = xq.tightLayout(3) });
         try testing.expect(g.shapeOf(z).eql(ops.Shape.of(&.{ 6, 2304 })));
         try testing.expectEqual(@as(usize, 1), g.prepared_launches);
     }
@@ -2872,6 +2898,41 @@ test "dsv41 experts 0b: a gated wait over handles left as garbage (waitProj's un
     var got: [4]f32 = undefined;
     _ = try g.hostF32(try g.add(outs[0], try g.reshape(outs[1], &.{4})), &got);
     try testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, &got);
+    g.reset();
+}
+
+test "dsv41 compact experts: descriptor-only evaluation waits for publication and preserves uint64 offsets" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const stream = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try ops.MlxOps.init(testing.allocator, stream);
+    defer g.deinit();
+    const word = try testing.allocator.create(i64);
+    defer testing.allocator.destroy(word);
+    word.* = 0;
+    const ev = try expert_event.createHost(word, std.time.ns_per_s);
+    const initial = [_]u64{ (@as(u64, 1) << 34) + 7, 2, 17, 2 };
+    const descriptor = try g.hostArray(std.mem.sliceAsBytes(&initial), &.{ 2, 2 }, .uint64);
+    const values = [_]u16{ 1, 2, 3, 4 };
+    const code = try g.hostArray(std.mem.sliceAsBytes(&values), &.{ 2, 2 }, .int16);
+    const scale = try g.hostArray(std.mem.sliceAsBytes(&values), &.{ 2, 2 }, .float16);
+    const Ex = ExpertsWith(ops.MlxOps, StreamSource, QuantMath(ops.MlxOps, xq.Accepted(ops.MlxOps)), .{ .gated = true });
+    var ex: Ex = undefined;
+    ex.event = ev;
+    const waited = try ex.waitProj(&g, .{ .code = code, .rout = scale, .rin = scale, .layout = .{ .compact = descriptor } }, 7, &.{});
+    try testing.expect(waited.layout.compact.ctx != descriptor.ctx);
+    const Publisher = struct {
+        fn publish(bytes: []u8, event_word: *i64) void {
+            std.Io.sleep(testing.io, .fromMilliseconds(30), .awake) catch {};
+            std.mem.writeInt(u64, bytes[8..16], 5, .little);
+            @atomicStore(i64, event_word, 7, .release);
+        }
+    };
+    const publisher = try std.Thread.spawn(.{}, Publisher.publish, .{ try g.hostBytes(descriptor), word });
+    defer publisher.join();
+    try g.evalAll(&.{waited.layout.compact});
+    const got: []const u64 = @alignCast(std.mem.bytesAsSlice(u64, try g.hostBytes(waited.layout.compact)));
+    try testing.expectEqualSlices(u64, &.{ initial[0], 5, 17, 2 }, got);
     g.reset();
 }
 
@@ -4052,12 +4113,8 @@ test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's source
     const rf = st.refsOf(route, &refs);
     try testing.expectEqual(@as(usize, n_experts), rf.len);
     for (rf) |r| try testing.expectEqual(BankKind.base, r.bank);
-    const sb = st.bankArrays(0, .base) orelse return error.TestUnexpectedResult;
-    const bk: BankArraysOf(T) = .{
-        .gate = .{ .code = sb.gate.code, .rout = sb.gate.rout, .rin = sb.gate.rin },
-        .up = .{ .code = sb.up.code, .rout = sb.up.rout, .rin = sb.up.rin },
-        .down = .{ .code = sb.down.code, .rout = sb.down.rout, .rin = sb.down.rin },
-    };
+    var src = StreamSource.init(st);
+    const bk = (try src.bankArrays(&g, 0, .base)) orelse return error.TestUnexpectedResult;
     // 4,096 tokens x top-6 in seven calls (a hot one, then six), waves of 2 experts: 51 outputs, L1's count.
     const n_tok = 4096;
     const n_ids = n_tok * 6;
@@ -4231,6 +4288,9 @@ test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's source
 /// the per-bank calls and the banked calls (packed ids) must hand every routed position the same words.
 const BankEnc = struct {
     pub const has_banked = true;
+    pub fn devrouteMissingId(_: *const BankEnc) u32 {
+        return 0;
+    }
     const w = 4;
 
     fn rowsOf(g: *TraceOps, x: u32) ![]const u32 {
@@ -4285,6 +4345,9 @@ const BankEnc = struct {
 /// TraceMath with the banked texts (DEVROUTE's structural test): shapes only.
 const TraceBankedMath = struct {
     pub const has_banked = true;
+    pub fn devrouteMissingId(_: *const TraceBankedMath) u32 {
+        return 0;
+    }
     inner: TraceMath,
     pub fn gateUp(self: *const TraceBankedMath, g: *ops.TraceOps, x: u32, ids: u32, gate: ProjOf(u32), up: ProjOf(u32)) !u32 {
         return self.inner.gateUp(g, x, ids, gate, up);
@@ -4312,7 +4375,7 @@ test "dsv41 experts: DEVROUTE's invariant: before every decode route, each hit's
     defer src.deinit();
     try src.grow(&.{ 12, 12, 12 });
     var lut: [n_layers][40]u32 = undefined;
-    for (0..n_layers) |l| src.residentLut(@intCast(l), &lut[l]);
+    for (0..n_layers) |l| src.residentLut(@intCast(l), &lut[l], 0);
     var rng = std.Random.DefaultPrng.init(20261003);
     var hits_checked: usize = 0;
     var misses_seen: usize = 0;
@@ -4333,7 +4396,7 @@ test "dsv41 experts: DEVROUTE's invariant: before every decode route, each hit's
         }
         src.release(call);
         try src.flush();
-        src.residentLut(l, &lut[l]);
+        src.residentLut(l, &lut[l], 0);
     }
     try testing.expect(hits_checked > 2000 and misses_seen > 100);
 }
@@ -4403,7 +4466,7 @@ test "dsv41 experts: DEVROUTE: in decode the device hit wave is committed behind
         try testing.expect(ex.dev_parity[0] != before);
         // the LUT the next call reads is the policy after this route
         var want: [16]u32 = undefined;
-        src.residentLut(0, &want);
+        src.residentLut(0, &want, 0);
         const got = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[0][ex.dev_parity[0]]))));
         try testing.expectEqualSlices(u32, &want, got);
     }
@@ -4492,7 +4555,7 @@ const DevHoistRun = struct {
             if (devroute) {
                 out.flipped[call] = ex.dev_parity[0] != parity0;
                 var want: [16]u32 = undefined;
-                src.residentLut(0, &want);
+                src.residentLut(0, &want, 0);
                 const got = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[0][ex.dev_parity[0]]))));
                 out.lut_ok[call] = std.mem.eql(u32, &want, got);
             }
@@ -4586,4 +4649,105 @@ test "dsv41 experts: the banked waves (ROUTED_BANKED) hand every routed position
     // A math without the banked route refuses the option at construction.
     const Plain = ExpertsWith(TraceOps, FakeSource, TraceMath, .{});
     try testing.expectError(error.BankedNotInMath, Plain.initWith(a, &g, &src, .{ .hidden = 64, .inter = 32 }, &c, .{ .banked = true }));
+}
+
+test "dsv41 compact experts: gated DEVROUTE second-call hit consumes the settled slot and matches host routing" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.CompactBankRequired);
+    const a = testing.allocator;
+    mlx.installErrorHandler();
+    const G = ops.MlxOps;
+    const ks = sdk_ext.kernels.KernelSet(xk);
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    var diag: xk.Diag = .{};
+    const set = try ks.Set.init(a, .{ .device = .{ .stream = stream } }, &diag);
+    defer set.deinit();
+    set.install(G, &g);
+    defer ks.Set.uninstall(G, &g);
+    var bank = try expert_bank.Bank.open(a, testing.io, dir, expert_bank.dsv41, null);
+    defer bank.deinit();
+    if (!bank.isCompact()) return error.CompactBankRequired;
+    var peek = try expert_bank.peek(a, testing.io, dir, null);
+    defer peek.deinit();
+    var config = testConfig(@intCast(bank.hidden), @intCast(bank.inter), @intCast(bank.layers.len));
+    config.n_routed_experts = bank.n_experts;
+    const accepted = try xq.accept(G, a, &g, .{ .kernels = set.ref(), .peek = &peek.view }, .{
+        .hidden = config.hidden_size,
+        .inter = config.moe_intermediate_size,
+        .top_k = config.n_experts_per_tok,
+        .n_layers = config.n_layers,
+        .act = xq.fused_act,
+        .input = .bfloat16,
+    }, &diag);
+    defer accepted.deinit(&g);
+    try accepted.routeBanked(&g);
+    const rows = try a.alloc(u32, bank.layers.len);
+    defer a.free(rows);
+    @memset(rows, 1);
+    const event = try expert_event.createMetal();
+    const storage = try expert_stream.Stream.init(a, &bank, .{
+        .rows = rows,
+        .max_route_ids = 6,
+        .transient_rows = 6,
+        .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 128 },
+        .slot_memory = .{ .mlx = stream },
+        .lookahead = .{ .k = 6, .budget = 2, .chunks = 1, .preread = false },
+        .event = .{ .backend = .{ .metal = event.object }, .watchdog_ms = 10000 },
+    });
+    defer storage.deinit();
+    var source = StreamSource.init(storage);
+    const Math = QuantMath(G, xq.Accepted(G));
+    const Ex = ExpertsWith(G, StreamSource, Math, .{ .gated = true });
+    var ex = try Ex.initWith(a, &g, &source, Math.init(accepted, &config), &config, .{
+        .event = event,
+        .banked = true,
+        .devroute = true,
+    });
+    defer ex.deinit();
+    try ex.grow(&g, rows);
+    const input = try a.alloc(f32, config.hidden_size);
+    defer a.free(input);
+    for (input, 0..) |*value, i| value.* = (@as(f32, @floatFromInt(i % 31)) - 15) * 0.01;
+    const x = try g.hostArray(std.mem.sliceAsBytes(input), &.{ 1, @intCast(config.hidden_size) }, .float32);
+    const ids = [_]i32{ 0, 0, 0, 0, 0, 0 };
+    const indices = try g.hostArray(std.mem.sliceAsBytes(&ids), &.{ 1, 6 }, .int32);
+    const output_size = 6 * @as(usize, config.hidden_size);
+    const first_values = try a.alloc(f32, output_size);
+    defer a.free(first_values);
+    const second_values = try a.alloc(f32, output_size);
+    defer a.free(second_values);
+    const host_values = try a.alloc(f32, output_size);
+    defer a.free(host_values);
+    try testing.expect(storage.layers[0].policy.slotOf(0) == null);
+    const first = try ex.run(&g, 0, x, indices, &.{});
+    try g.evalAll(&.{first});
+    _ = try g.hostF32(first, first_values);
+    try ex.flush();
+    const slot = storage.layers[0].policy.slotOf(0).?;
+    try testing.expect(storage.slotReady(0, slot));
+    const ref = storage.slotRef(0, slot);
+    const expected_id = (@as(u32, @backingInt(ref.bank)) << 24) | ref.row;
+    const lut: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, try g.hostBytes(ex.dev_lut[0][ex.dev_parity[0]])));
+    const consumed_id = lut[0];
+    const second = try ex.run(&g, 0, x, indices, &.{});
+    try g.evalAll(&.{second});
+    _ = try g.hostF32(second, second_values);
+    try ex.flush();
+    ex.devroute = false;
+    const host = try ex.run(&g, 0, x, indices, &.{});
+    try g.evalAll(&.{host});
+    _ = try g.hostF32(host, host_values);
+    try ex.flush();
+    try testing.expectEqual(expected_id, consumed_id);
+    var nonzero = false;
+    for (first_values, second_values, host_values) |first_value, second_value, reference| {
+        try testing.expect(std.math.isFinite(first_value) and std.math.isFinite(second_value) and std.math.isFinite(reference));
+        nonzero = nonzero or @abs(reference) > 1e-8;
+        try testing.expectApproxEqAbs(reference, first_value, 1e-5);
+        try testing.expectApproxEqAbs(reference, second_value, 1e-5);
+    }
+    try testing.expect(nonzero);
 }

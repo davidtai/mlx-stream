@@ -187,11 +187,17 @@ const receipts = [_]Receipt{
 fn billOf(r: Receipt) bill.Bill {
     // The device embedding table the bill subtracts on the host-rows route (any size: no phase holds it).
     const embedding: u64 = 1_323_827_200;
+    const rec: u64 = 13_315_584;
+    var prefix: [41]u64 = undefined;
+    for (&prefix, 0..) |*p, i| p.* = i * rec;
     return .{
         .baseline = r.baseline,
         .layers = layers,
         .transient_rows = r.transient_rows,
         .transient_decode_rows = r.transient_decode_rows,
+        .persistent_row_bytes = layers * rec,
+        .transient_row_bytes = rec,
+        .slot_prefix = prefix,
         .n_experts = n_experts,
         .prefill_rows = r.prefill_rows,
         .decode_rows = r.decode_rows,
@@ -221,12 +227,11 @@ fn billOf(r: Receipt) bill.Bill {
 
 /// `b` at `rows` (both phases' slot banks rebuilt at the bill's record).
 fn atRows(b: bill.Bill, rows: arm_mod.NativeRows) bill.Bill {
-    const rec = b.slot_prefill / (@as(u64, b.layers) * b.prefill_rows + b.transient_rows);
     var x = b;
     x.prefill_rows = rows.prefill;
     x.decode_rows = rows.decode;
-    x.slot_prefill = (@as(u64, b.layers) * rows.prefill + b.transient_rows) * rec;
-    x.slot_decode = (@as(u64, b.layers) * rows.decode + b.transient_decode_rows) * rec;
+    x.slot_prefill = @as(u64, rows.prefill) * b.persistent_row_bytes + b.transient_rows * b.transient_row_bytes;
+    x.slot_decode = @as(u64, rows.decode) * b.persistent_row_bytes + b.transient_decode_rows * b.transient_row_bytes;
     return x;
 }
 

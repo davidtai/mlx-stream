@@ -44,6 +44,10 @@ const MxBank = struct {
             return (@as(u64, layer) * self.n_experts + expert) * self.record_bytes;
         }
 
+        pub fn recordGeometry(self: *const Bank, layer: u32, _: u32) *const Layer {
+            return &self.layers[layer];
+        }
+
         pub fn spans(self: *const Bank, layer: u32, expert: u32) Spans {
             const off = self.recordOffset(layer, expert);
             return .{ .gu_offset = off, .down_offset = off + self.layers[layer].segments[gu_components].offset };
@@ -112,7 +116,7 @@ test "dsv41 bank contract: a MiMo-shaped MXFP4 bank (6 components, gate/up 4) st
         for (ids[0..n], r.plan.slotsOf()) |e, slot| {
             const off = bank.recordOffset(l, e);
             for (layers[l].segments, 0..) |seg, c| {
-                try testing.expectEqualSlices(u8, image[off + seg.offset ..][0..seg.length], s.slotRow(l, slot, @enumFromInt(c))[0..seg.length]);
+                try testing.expectEqualSlices(u8, image[off + seg.offset ..][0..seg.length], s.slotRow(l, slot, @fromBackingInt(@intCast(c)))[0..seg.length]);
             }
         }
         s.release(r);
