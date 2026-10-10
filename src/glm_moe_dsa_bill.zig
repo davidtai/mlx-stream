@@ -46,28 +46,6 @@ pub const decode_wave_fixed_bytes: u64 = 64 << 20;
 /// The page tables of `wired` bytes (`deepseek_v41_bill.wireTables`: the kernel's and the GPU's leaf entries per 16
 /// KiB page, the upper levels per 32 MiB and 64 GiB).
 pub const wireTables = @import("deepseek_v41_bill.zig").wireTables;
-/// What decode's grow leaves free of the box's RAM, in thousandths of it (`osReserveBytes`): past the knee the decode
-/// steps slow down by half or more while the prompt pass does not. Measured on the 256 GB M5 Ultra (runs m2, k1 and k2,
-/// the coding workload at --ctx-size 16448): decode 5.5-6.1 tok/s up to 250.0 GB of the box's 274.9 GB used (9.0 %
-/// free), 2.1 tok/s at 252.0 GB (8.3 %), 1.7 tok/s at 255.2 GB; prefill 148 tok/s at every fill. 10 % keeps the grow
-/// 2.6 GB under the last fast reading (macOS's memory pressure levels are fractions of the RAM).
-pub const os_reserve_permille: u64 = 100;
-
-pub fn osReserveBytes(ram: u64) u64 {
-    return ram / 1000 * os_reserve_permille;
-}
-
-/// The box's used memory the bill fills up to. `hard`: the host's target (its ceiling less its wired margin), which the
-/// construction admits both phases under for the longest request, and past which a handover refuses its request.
-/// `grow`: what the handover grows decode's rows up to, at most the box's RAM less the OS reserve as well (no RAM
-/// reading: the host's alone).
-pub const Targets = struct { hard: u64, grow: u64 };
-
-pub fn targetsOf(ceiling: u64, wired_margin: u64, ram: u64) Targets {
-    const hard = ceiling -| wired_margin;
-    return .{ .hard = hard, .grow = if (ram == 0) hard else @min(hard, ram -| osReserveBytes(ram)) };
-}
-
 /// The stream the module builds, as the bill charges it.
 pub const StreamShape = struct {
     /// Widest route (`Stream.Options.max_route_ids`): a prompt group's experts.
@@ -379,9 +357,9 @@ pub fn decodeAfter(in: Inputs, positions: u64) struct { device: u64, host: u64 }
 
 /// The handover's live reading and what decode adds past it (`liveRows`).
 pub const Live = struct {
-    /// The grow's target, and the one past which even the prompt rows refuse the request (`Targets`).
+    /// The host's target (its ceiling less its wired margin): the grow's, and past it even the prompt rows refuse the
+    /// request.
     target: u64,
-    hard_target: u64,
     baseline: u64,
     /// The footprint after the prompt's frees settled, with the request's KV lanes at its decode cap.
     footprint: u64,
@@ -412,13 +390,11 @@ pub const Live = struct {
     }
 };
 
-/// The most rows per layer whose total stays within the grow's target (`Live.total`), between the prompt rows the
-/// reading holds and `max_rows` (the prompt rows when even they are over it); refused by name when the prompt rows are
-/// over the hard target.
+/// The most rows per layer whose total stays within the target (`Live.total`), between the prompt rows the reading
+/// holds and `max_rows`; refused by name when even the prompt rows are over it.
 pub fn liveRows(l: Live) error{DecodeOverTarget}!u32 {
     const at_prompt = l.total(l.prompt_rows);
-    if (at_prompt > l.hard_target) return error.DecodeOverTarget;
-    if (at_prompt >= l.target) return l.prompt_rows;
+    if (at_prompt > l.target) return error.DecodeOverTarget;
     const lin = (l.target - at_prompt) / l.per_row;
     var r: u64 = @min(@as(u64, l.prompt_rows) + lin, l.max_rows);
     while (r > l.prompt_rows and l.total(@intCast(r)) > l.target) r -= 1;
@@ -433,7 +409,7 @@ pub const BillLine = struct {
     mb: *const sdk.MemoryBill,
     rows: sdk.Rows,
     baseline: u64,
-    targets: Targets,
+    target: u64,
     context: u64,
     decode_positions: u64,
 
@@ -443,8 +419,8 @@ pub const BillLine = struct {
             const at = if (t.with_rows) [2]u64{ b.mb.total(.prompt, 0, b.rows.prompt) - b.mb.fixed(.prompt) - b.rows.prompt * b.mb.per_row, b.mb.total(.decode, 0, b.rows.decode) - b.mb.fixed(.decode) - b.rows.decode * b.mb.per_row } else t.bytes;
             try w.print("{s} {s} {d} / {d} B", .{ if (i == 0) "" else ",", t.name, at[0], at[1] });
         }
-        try w.print("; a row {d} B; prompt {d} rows {d} B, decode {d} rows {d} B, of the {d} B target (the grow's {d} B), baseline {d} B", .{
-            b.mb.per_row, b.rows.prompt, b.mb.total(.prompt, b.baseline, b.rows.prompt), b.rows.decode, b.mb.total(.decode, b.baseline, b.rows.decode), b.targets.hard, b.targets.grow, b.baseline,
+        try w.print("; a row {d} B; prompt {d} rows {d} B, decode {d} rows {d} B, of the {d} B target, baseline {d} B", .{
+            b.mb.per_row, b.rows.prompt, b.mb.total(.prompt, b.baseline, b.rows.prompt), b.rows.decode, b.mb.total(.decode, b.baseline, b.rows.decode), b.target, b.baseline,
         });
     }
 };
@@ -543,7 +519,7 @@ test "glm bill: max_output bills the longest request's KV in decode; a request's
 
 test "glm bill: the live grow fills the rows the reading leaves under the target, and refuses below the prompt rows" {
     const row: u64 = 1_592_524_800;
-    var l: Live = .{ .target = 255_550_554_112, .hard_target = 255_550_554_112, .baseline = 12_400_000_000, .footprint = 220_000_000_000, .mlx_bytes = 219_000_000_000, .prompt_rows = 120, .max_rows = 256, .per_row = row, .device_after = 1_000_000_000, .host_after = 100_000_000 };
+    var l: Live = .{ .target = 255_550_554_112, .baseline = 12_400_000_000, .footprint = 220_000_000_000, .mlx_bytes = 219_000_000_000, .prompt_rows = 120, .max_rows = 256, .per_row = row, .device_after = 1_000_000_000, .host_after = 100_000_000 };
     const r = try liveRows(l);
     try testing.expect(r > 120 and l.total(r) <= l.target and l.total(r + 1) > l.target);
     // 22 GB free past the reading: 13 rows of 1.59 GB, the page tables less.
@@ -610,30 +586,9 @@ test "glm bill: the bill line lists every term and each phase's total at the row
     const mb = try memoryBill(testing.allocator, termsOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16384, .decode_positions = maxPositions(&cfg) }));
     defer mb.free(testing.allocator);
     const rows: sdk.Rows = .{ .prompt = 100, .decode = 110 };
-    const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{BillLine{ .mb = &mb, .rows = rows, .baseline = 1, .targets = .{ .hard = 3, .grow = 2 }, .context = 16384, .decode_positions = maxPositions(&cfg) }});
+    const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{BillLine{ .mb = &mb, .rows = rows, .baseline = 1, .target = 3, .context = 16384, .decode_positions = maxPositions(&cfg) }});
     defer testing.allocator.free(s);
     for (mb.terms) |t| try testing.expect(std.mem.indexOf(u8, s, t.name) != null);
     var want: [128]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, s, try std.fmt.bufPrint(&want, "decode 110 rows {d} B, of the 3 B target (the grow's 2 B)", .{mb.total(.decode, 1, 110)})) != null);
-}
-
-test "glm bill: the grow's target keeps the OS reserve free of the box's RAM; the hard target is the host's" {
-    const gib: u64 = 1 << 30;
-    const ram: u64 = 274_877_906_944;
-    const t = targetsOf(240 * gib, 2 * gib, ram);
-    try testing.expectEqual(240 * gib - 2 * gib, t.hard);
-    try testing.expectEqual(@min(t.hard, ram - osReserveBytes(ram)), t.grow);
-    try testing.expectEqual(@as(u64, 247_390_116_344), t.grow);
-    // A box whose RAM leaves the reserve under the host's target, and one without a RAM reading.
-    try testing.expectEqual(t.hard, targetsOf(240 * gib, 2 * gib, 1 << 40).grow);
-    try testing.expectEqual(t.hard, targetsOf(240 * gib, 2 * gib, 0).grow);
-    // Over the grow's target at the prompt rows: no grow; over the hard one: refused.
-    const row: u64 = 1_592_524_800;
-    var l: Live = .{ .target = t.grow, .hard_target = t.hard, .baseline = 13_000_000_000, .footprint = 225_000_000_000, .mlx_bytes = 224_000_000_000, .prompt_rows = 126, .max_rows = 256, .per_row = row, .device_after = 1_000_000_000, .host_after = 350_000_000 };
-    const r = try liveRows(l);
-    try testing.expect(r > 126 and l.total(r) <= t.grow and l.total(r + 1) > t.grow);
-    l.footprint = 235_000_000_000;
-    try testing.expectEqual(@as(u32, 126), try liveRows(l));
-    l.footprint = 242_000_000_000;
-    try testing.expectError(error.DecodeOverTarget, liveRows(l));
+    try testing.expect(std.mem.indexOf(u8, s, try std.fmt.bufPrint(&want, "decode 110 rows {d} B, of the 3 B target,", .{mb.total(.decode, 1, 110)})) != null);
 }

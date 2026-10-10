@@ -197,10 +197,8 @@ The construction admits both phases of the longest request (the billed context a
 under the host's target (its ceiling less its wired margin) and fills the prompt rows to it. At the decode handover
 the module frees the prompt's transients, waits until the footprint shows the frees, reads its footprint and the
 box's used memory, and grows the decode rows to the most that the bill at the request's own KV and that reading both
-keep under the grow's target: the host's target, or the box's RAM less 10 % of it, whichever is lower. The rest of
-the box is read again at each handover. A short request so decodes with more rows than the longest one, and decode
-stays clear of the box's knee: on the 256 GB M5 Ultra, decode fell from 5.2 to 2.1 tok/s when the box's used memory
-went from 249.1 to 252.0 GB, while the prompt pass ran at full speed at a 241.3 GB peak footprint. Each handover logs
+keep under the host's target. The rest of the box is read again at each handover, so a short request decodes with
+more rows than the longest one. Each handover logs
 one `glm_moe_dsa: handover` line with its readings and the rows; the construction logs one `glm_moe_dsa: bill` line
 with every term and checks its footprint against the bill's construction terms (`ConstructionOverBill`). The
 ceiling comes from the host only. The arch declares `max_output` to the host (`maxOutput`, SDK 2.1).
