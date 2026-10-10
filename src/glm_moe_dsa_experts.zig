@@ -583,8 +583,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
+            const tb = pt.now();
             try w.ids.resize(a, n_ids);
             _ = try g.hostIds(indices, w.ids.items);
+            pt.chargeRouted(.barrier, tb);
             w.pos.clearRetainingCapacity();
             for (w.kept.items) |o| g.release(o);
             w.kept.clearRetainingCapacity();
@@ -599,6 +601,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const w = &self.wide;
             const sl = bpl * layer + side;
             const group_n = self.stream.max_route_ids;
+            var tp = pt.now();
             try w.first.resize(a, self.n_experts);
             @memset(w.first.items, -1);
             try w.count.resize(a, self.n_experts);
@@ -621,7 +624,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     return if (cnt[p] != cnt[q]) cnt[p] > cnt[q] else p < q;
                 }
             }.lt);
+            pt.chargeRouted(.barrier, tp);
+            tp = pt.now();
             try self.stream.awaitReadAhead(sl);
+            pt.chargeRouted(.ahead, tp);
+            tp = pt.now();
             try self.stream.seedPrefill(sl, w.side_ids.items);
             // The call's residents first (hottest first among them), then the rest: every resident is routed before any
             // miss is planned, so no miss evicts a resident (one the read-ahead landed) whose group is still to come and
@@ -652,6 +659,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 rt.* = null;
             };
             for (0..@min(depth, n_groups)) |gi| routes[gi % depth] = try self.stream.route(sl, groupOf(w.distinct.items, gi, group_n), &.{});
+            pt.chargeRouted(.route, tp);
             for (0..n_groups) |gi| {
                 const start = gi * group_n;
                 const group = groupOf(w.distinct.items, gi, group_n);
@@ -693,13 +701,17 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     std.debug.assert(w.pos.items.len - p0 == w.slot.items.len);
                 }
                 try self.math.finishPrefill(g);
+                pt.chargeRouted(.encode, tc);
+                const td = pt.now();
                 // The group's waves drained before its slots go back (the next route may refill them).
                 try g.evalAll(w.kept.items[k0..]);
-                pt.chargeRouted(.compute, tc);
+                pt.chargeRouted(.compute, td);
                 g.resetTo(m);
+                const tr = pt.now();
                 self.stream.release(r);
                 routes[gi % depth] = null;
                 if (gi + depth < n_groups) routes[gi % depth] = try self.stream.route(sl, groupOf(w.distinct.items, gi + depth, group_n), &.{});
+                pt.chargeRouted(.route, tr);
             }
         }
 
