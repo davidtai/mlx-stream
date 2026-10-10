@@ -71,7 +71,7 @@ test "mlx-stream conformance: every arch the plugin serves declines what is not 
     }
     const glm = comptime sdk.Arch.of(@import("glm_moe_dsa_plugin.zig"));
     try sdk.testing.expectClaims(glm.claims, &.{.{ .config = "{\"model_type\":\"glm_moe_dsa\"}", .want = .native }});
-    try std.testing.expect(glm.spec == .none and glm.caps.owns_decode_state);
+    try std.testing.expect(glm.spec == .draft_lane and glm.caps.owns_decode_state);
     // The two archs share the process's one reader: a load of one refuses the other's claim by name.
     const v41 = comptime sdk.Arch.of(@import("deepseek_v41_plugin.zig"));
     try v41.claim_process.?();
