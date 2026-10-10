@@ -232,10 +232,10 @@ test "glm mtp parity: a later prompt keeps the prefix the lane tracks and drafts
         const r = try Rig.open(a, dir, cs.depth);
         defer r.close(a);
         _ = try runCase(a, r, cs, r.m.model.vocab_size);
-        // The same prompt again: the state keeps all but its last position (the host restores prompt[0 .. n - 1]),
-        // less one when the lane's pair after the match was formed with the decoded token.
+        // The same prompt again: the host restores prompt[0 .. n - 1], whose last pair the lane formed with the token
+        // after the match (here the prompt's own, in general another): the state keeps one position less.
         const kept = r.m.restorePrefix(cs.prompt[0 .. cs.prompt.len - 1]);
-        try testing.expect(kept >= cs.prompt.len - 2 and kept <= cs.prompt.len - 1);
+        try testing.expectEqual(cs.prompt.len - 2, kept);
         try testing.expectEqual(kept, r.m.mtp.?.tracked());
         const t1 = try r.argmaxOf(try r.m.prefillAt(kept, cs.prompt[kept..]));
         try r.m.decodeHandover(.{ .prompt_tokens = @intCast(cs.prompt.len), .reserved_tokens = cs.prompt.len + 32, .native_draft = true });

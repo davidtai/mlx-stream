@@ -584,6 +584,10 @@ pub const Counts = struct {
     /// Rounds the lane ran without drafts (the budget's last tokens, or a request it did not track).
     serial: u64 = 0,
     wall_ns: u64 = 0,
+    /// The rounds' time in the drafts (the MTP steps) and in the verify forward (the decision and the commit are
+    /// the rest of `wall_ns`).
+    draft_ns: u64 = 0,
+    verify_ns: u64 = 0,
 };
 
 /// The lane's line at the request's end.
@@ -599,8 +603,10 @@ pub const Line = struct {
         const s = @as(f64, @floatFromInt(p.c.wall_ns)) / 1e9;
         try w.print("glm_moe_dsa: mtp depth {d} acceptance {s}", .{ p.depth, p.mode });
         if (std.mem.eql(u8, p.mode, "typical")) try w.print(" (delta {d})", .{p.delta});
-        try w.print(": {d} rounds ({d} without drafts), {d} drafted, {d} accepted ({d:.1}%), {d:.2} accepted / {d:.2} tokens per round, {d} tokens in {d:.2} s ({d:.1} tok/s)", .{
-            p.c.rounds, p.c.serial, p.c.drafted, p.c.accepted, rate, @as(f64, @floatFromInt(p.c.accepted)) / rounds, @as(f64, @floatFromInt(p.c.generated)) / rounds, p.c.generated, s, if (s == 0) 0 else @as(f64, @floatFromInt(p.c.generated)) / s,
+        try w.print(": {d} rounds ({d} without drafts), {d} drafted, {d} accepted ({d:.1}%), {d:.2} accepted / {d:.2} tokens per round, {d} tokens in {d:.2} s ({d:.1} tok/s; drafts {d:.2} s, verify {d:.2} s)", .{
+            p.c.rounds,                                           p.c.serial,                                            p.c.drafted, p.c.accepted, rate,
+            @as(f64, @floatFromInt(p.c.accepted)) / rounds,       @as(f64, @floatFromInt(p.c.generated)) / rounds,       p.c.generated, s,
+            if (s == 0) 0 else @as(f64, @floatFromInt(p.c.generated)) / s, @as(f64, @floatFromInt(p.c.draft_ns)) / 1e9, @as(f64, @floatFromInt(p.c.verify_ns)) / 1e9,
         });
     }
 };
@@ -876,4 +882,154 @@ var tiny_text_buf: [8192]u8 = undefined;
 fn tinyText() ![]const u8 {
     var fba = std.heap.FixedBufferAllocator.init(&tiny_text_buf);
     return glm.tinyConfigJson(fba.allocator(), glm.tiny_quant);
+}
+
+test "glm mtp: the request's line (the ABBA harness reads it): depth, acceptance, rounds, drafted, accepted, rate, per round, tok/s" {
+    const l: Line = .{ .depth = 3, .mode = "exact", .delta = 0, .c = .{ .rounds = 348, .drafted = 1042, .accepted = 676, .generated = 1024, .wall_ns = 207_560_000_000, .draft_ns = 9_000_000_000, .verify_ns = 190_000_000_000 } };
+    const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{l});
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("glm_moe_dsa: mtp depth 3 acceptance exact: 348 rounds (0 without drafts), 1042 drafted, 676 accepted (64.9%), 1.94 accepted / 2.94 tokens per round, 1024 tokens in 207.56 s (4.9 tok/s; drafts 9.00 s, verify 190.00 s)", s);
+    const t: Line = .{ .depth = 2, .mode = "typical", .delta = 0.3, .c = .{ .rounds = 2, .drafted = 4, .accepted = 3, .generated = 5, .wall_ns = 1_000_000_000 } };
+    const u = try std.fmt.allocPrint(testing.allocator, "{f}", .{t});
+    defer testing.allocator.free(u);
+    try testing.expect(std.mem.startsWith(u8, u, "glm_moe_dsa: mtp depth 2 acceptance typical (delta 0.3): 2 rounds"));
+}
+
+/// A synthetic MTP directory for config `c` (`tp` ranks, experts alternating K3 / K4): the manifest, `mtp-experts.bin`
+/// of seeded bytes (each record's logical bytes, zero padding to 4096), and the expected per-expert [K, local]. Returns
+/// the bin's bytes.
+pub fn writeSynthMtp(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const glm.Config, tp: u32, multiplier: u64) ![]u8 {
+    const h: u64 = c.hidden_size;
+    const mini: u64 = c.moe_intermediate_size / tp;
+    const e = c.n_routed_experts;
+    try dir.createDirPath(io, dir_name);
+    var j: std.ArrayList(u8) = .empty;
+    defer j.deinit(a);
+    try j.print(a, "{{\"format\":\"{s}\",\"model_type\":\"glm_moe_dsa\",\"source\":{{\"repo\":null,\"revision\":null}},\"quantization\":{{\"mode\":\"exl3\",\"codebook\":\"mcg\",\"codebook_multiplier\":{d},\"mcg_scalar\":0,\"k_values\":[3,4],\"tp_ranks\":{d}}},", .{ manifest_format, multiplier, tp });
+    try j.print(a, "\"dims\":{{\"hidden\":{d},\"inter\":{d},\"mini_inter\":{d},\"n_experts\":{d},\"n_model_layers\":1,\"n_bank_layers\":2}},\"components\":[", .{ h, c.moe_intermediate_size, mini, e });
+    for (Manifest.components, 0..) |n, i| try j.print(a, "{s}\"{s}\"", .{ if (i == 0) "" else ",", n });
+    try j.appendSlice(a, "],\"layers\":[");
+    var base: u64 = 0;
+    var image: std.ArrayList(u8) = .empty;
+    errdefer image.deinit(a);
+    var rng = std.Random.DefaultPrng.init(78);
+    for ([_]u32{ 3, 4 }, 0..) |k, b| {
+        var members: std.ArrayList(u32) = .empty;
+        defer members.deinit(a);
+        for (0..e) |x| if ((x % 2 == 0) == (k == 3)) try members.append(a, @intCast(x));
+        var logical: u64 = 0;
+        var segs: std.ArrayList(u8) = .empty;
+        defer segs.deinit(a);
+        for (0..9) |ci| {
+            const sh = Manifest.segmentShape(ci, h, mini, k);
+            var n: u64 = 2;
+            for (sh.slice()) |x| n *= x;
+            try segs.print(a, "{s}{{\"component\":\"{s}\",\"dtype\":\"{s}\",\"shape\":[", .{ if (ci == 0) "" else ",", Manifest.components[ci], if (ci % 3 == 0) "I16" else "F16" });
+            for (sh.slice(), 0..) |x, i| try segs.print(a, "{s}{d}", .{ if (i == 0) "" else ",", x });
+            try segs.print(a, "],\"offset\":{d},\"length\":{d}}}", .{ logical, n });
+            logical += n;
+        }
+        const record = std.mem.alignForward(u64, logical, 4096);
+        const n_minis = tp * members.items.len;
+        try j.print(a, "{s}{{\"bank_layer\":{d},\"layer\":{d},\"k\":{d},\"mtp\":true,\"n_minis\":{d},\"record_bytes\":{d},\"logical_bytes\":{d},\"base_offset\":{d},\"experts\":[", .{ if (b == 0) "" else ",", b, c.n_layers, k, n_minis, record, logical, base });
+        for (members.items, 0..) |x, i| try j.print(a, "{s}{d}", .{ if (i == 0) "" else ",", x });
+        try j.print(a, "],\"segments\":[{s}]}}", .{segs.items});
+        for (0..n_minis) |_| {
+            const at = image.items.len;
+            try image.appendNTimes(a, 0, @intCast(record));
+            rng.random().bytes(image.items[at..][0..@intCast(logical)]);
+        }
+        base += n_minis * record;
+    }
+    try j.print(a, "],\"experts\":{{\"{d}\":[", .{c.n_layers});
+    for (0..e) |x| try j.print(a, "{s}[{d},{d}]", .{ if (x == 0) "" else ",", if (x % 2 == 0) @as(u32, 3) else 4, x / 2 });
+    try j.print(a, "]}},\"sidecar\":{{\"file\":\"{s}\",\"alignment\":4096,\"size\":{d}}},\"records\":[],\"parity\":{{\"all_pass\":true,\"checked\":0,\"total\":0,\"method\":\"bytes-equal-source\"}}}}", .{ bank_file, base });
+    var sub = try dir.openDir(io, dir_name, .{});
+    defer sub.close(io);
+    try sub.writeFile(io, .{ .sub_path = manifest_file, .data = j.items });
+    try sub.writeFile(io, .{ .sub_path = bank_file, .data = image.items });
+    return image.toOwnedSlice(a);
+}
+
+test "glm mtp: the EXL3 manifest loads its bank layers and expert map, and every departure from the format is refused by name" {
+    const a = testing.allocator;
+    var c = try glm.Config.parse(a, try tinyText(), null, null);
+    defer c.deinit(a);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [512]u8 = undefined;
+    const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
+    const img = try writeSynthMtp(a, testing.io, tmp.dir, &c, 4, sushi.format.MCG_MULT);
+    defer a.free(img);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const mdir = try std.fmt.allocPrint(arena.allocator(), "{s}/{s}", .{ root, dir_name });
+    var diag: Diag = .{};
+    const m = Manifest.load(arena.allocator(), testing.io, mdir, &c, &diag) catch |e| {
+        std.debug.print("refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    try testing.expectEqual(@as(usize, 2), m.layers.len);
+    try testing.expectEqual(@as(u32, 3), m.layers[0].k);
+    try testing.expectEqual(@as(u32, 32), m.layers[1].n_minis);
+    try testing.expectEqual([2]u32{ 4, 3 }, m.experts[7]);
+    try testing.expectEqual(@as(u32, 16), m.mini_inter);
+    // A wrong codebook multiplier, a short sidecar, a config of other dims.
+    const bad = try writeSynthMtp(a, testing.io, tmp.dir, &c, 4, 0x83DCD12D);
+    a.free(bad);
+    try testing.expectError(error.MtpManifest, Manifest.load(arena.allocator(), testing.io, mdir, &c, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "multiplier") != null);
+    a.free(try writeSynthMtp(a, testing.io, tmp.dir, &c, 4, sushi.format.MCG_MULT));
+    var sub = try tmp.dir.openDir(testing.io, dir_name, .{});
+    defer sub.close(testing.io);
+    try sub.writeFile(testing.io, .{ .sub_path = bank_file, .data = img[0 .. img.len - 4096] });
+    try testing.expectError(error.MtpBankSize, Manifest.load(arena.allocator(), testing.io, mdir, &c, &diag));
+    try sub.writeFile(testing.io, .{ .sub_path = bank_file, .data = img });
+    var other = c;
+    other.hidden_size = 256;
+    try testing.expectError(error.MtpManifest, Manifest.load(arena.allocator(), testing.io, mdir, &other, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "dims") != null);
+    // Two ranks: the same experts in minis of twice the width.
+    a.free(try writeSynthMtp(a, testing.io, tmp.dir, &c, 2, sushi.format.MCG_MULT));
+    const m2 = try Manifest.load(arena.allocator(), testing.io, mdir, &c, &diag);
+    try testing.expectEqual(@as(u32, 16), m2.layers[0].n_minis);
+    try testing.expectEqual(@as(u32, 32), m2.mini_inter);
+}
+
+test "glm mtp: the EXL3 bank's arrays are the records' segments byte for byte, [minis, ...], and each expert's first slot is its bank offset + local x tp" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    var c = try glm.Config.parse(a, try tinyText(), null, null);
+    defer c.deinit(a);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [512]u8 = undefined;
+    const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
+    const img = try writeSynthMtp(a, testing.io, tmp.dir, &c, 4, sushi.format.MCG_MULT);
+    defer a.free(img);
+    var w = sdk.Weights.init(a);
+    defer w.deinit();
+    var b = try Exl3.open(a, testing.io, root, &c, &w, null);
+    defer b.deinit();
+    try testing.expectEqual(@as(usize, 2), b.n_banks);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = try Manifest.load(arena.allocator(), testing.io, try std.fmt.allocPrint(arena.allocator(), "{s}/{s}", .{ root, dir_name }), &c, null);
+    for (m.layers, 0..) |l, bi| {
+        const bank = b.banks[bi];
+        const arrs = [9]mlx.mlx_array{ bank.gate.trellis, bank.gate.svh, bank.gate.suh, bank.up.trellis, bank.up.svh, bank.up.suh, bank.down.trellis, bank.down.svh, bank.down.suh };
+        for (l.segments, arrs, 0..) |sg, arr, ci| {
+            try mlx.check(mlx.mlx_array_eval(arr));
+            try testing.expectEqual(if (ci % 3 == 0) mlx.mlx_dtype.uint16 else mlx.mlx_dtype.float16, mlx.mlx_array_dtype(arr));
+            try testing.expectEqual(@as(usize, l.n_minis) * sg.length, (mlx.mlx_array_size(arr) * mlx.mlx_array_itemsize(arr)));
+            const bytes = mlx.mlx_array_data_uint8(arr).?[0..(mlx.mlx_array_size(arr) * mlx.mlx_array_itemsize(arr))];
+            for (0..l.n_minis) |mi| {
+                const off = l.base_offset + mi * l.record_bytes + sg.offset;
+                try testing.expectEqualSlices(u8, img[off..][0..sg.length], bytes[mi * sg.length ..][0..sg.length]);
+            }
+        }
+    }
+    try mlx.check(mlx.mlx_array_eval(b.base));
+    const base = mlx.mlx_array_data_int32(b.base).?;
+    for (0..c.n_routed_experts) |e| try testing.expectEqual(@as(i32, @intCast(if (e % 2 == 0) (e / 2) * 4 else 32 + (e / 2) * 4)), base[e]);
 }

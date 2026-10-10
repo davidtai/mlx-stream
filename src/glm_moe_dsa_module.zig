@@ -394,6 +394,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             ids[0] = t1;
             const drafts = ids[1..][0..depth];
             if (depth > 0) try ln.draft(&self.g, a, &self.w, self.history.items[ln.cache.len + 1 .. len], t1, depth, drafts, if (probe) |p| p.force else &.{}, if (probe) |p| p.logits else null);
+            const t_draft = self.nowNs();
             if (probe) |p| {
                 p.depth = depth;
                 @memcpy(p.drafts[0..depth], drafts);
@@ -405,6 +406,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             defer self.g.release(out.hidden.?);
             try self.g.evalAll(&.{ out.logits, out.hidden.? });
             try self.ex.flush();
+            const t_verify = self.nowNs();
             const d = try mtp_mod.decide(&self.g, out.logits, drafts, ln.mode, sampling, len);
             self.cache.truncateTo(len + 1 + d.accepted);
             try self.history.appendSlice(self.gpa, ids[0 .. 1 + d.accepted]);
@@ -418,6 +420,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             ln.counts.generated += rows;
             ln.counts.serial += @intFromBool(depth == 0);
             ln.counts.wall_ns += ns;
+            ln.counts.draft_ns += t_draft - t0;
+            ln.counts.verify_ns += t_verify - t_draft;
             if (self.decode_mark) |*dm| {
                 dm.steps += 1;
                 dm.tokens += rows;
