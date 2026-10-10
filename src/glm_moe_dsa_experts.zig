@@ -21,6 +21,8 @@ const expert_event = sdk_ext.expert.event;
 const expert_stream = @import("expert_stream.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const glm = @import("glm_moe_dsa.zig");
+/// PROFILE builds (`-Dplugin-profile=true`): each decode-lane call's host stamps on the verify's GPU timeline.
+const timeline = @import("dsv41_verify_timeline.zig");
 
 pub const BankKind = sdk_ext.expert.BankKind;
 pub const SlotRef = sdk_ext.expert.SlotRef;
@@ -451,6 +453,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         fn callDecodeSplit(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
             const n_ids = n * k;
             const bank = self.stream.bank;
+            if (comptime timeline.enabled) timeline.point(layer, .call, self.readGauge(), false);
             var id_buf: [max_route_ids]u16 = undefined;
             var score_buf: [sdk_ext.expert.lookahead.max_rows * 512]f32 = undefined;
             var sc: []const f32 = &.{};
@@ -460,6 +463,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 sc = try g.hostF32(next_scores.?, score_buf[0 .. n * self.n_experts]);
             }
             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
+            if (comptime timeline.enabled) timeline.point(layer, .barrier, 0, false);
             var sides: [bpl]Side = @splat(.{});
             for (&sides, 0..) |*sd, i| sd.sl = bpl * layer + @as(u32, @intCast(i));
             for (ids, 0..) |e, p| {
@@ -492,6 +496,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 for (0..r.n_parts) |p| parts[p] = r.partLoads(@intCast(p), &bufs[p]);
                 expert_stream.wavesOf(&r.plan, r.hit_slots[0..r.plan.n_hits], parts[0..r.n_parts], sd.waves[0..sd.n]);
             }
+            if (comptime timeline.enabled) timeline.point(layer, .route, 0, false);
             var acc: Acc = .{};
             // Every route's hit wave and the hoisted arrays in one commit, ahead of every wait on a read.
             var early: [bpl * n_banks + 4]T = undefined;
@@ -506,10 +511,17 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 n_early += 1;
             }
             if (n_early > 0) try g.asyncEval(early[0..n_early]);
+            if (comptime timeline.enabled) timeline.point(layer, .hit, 0, false);
             var prev: []const T = &.{};
+            var missed = false;
+            var gu_first: u64 = 0;
             for (&sides) |*sd| if (sd.r) |r| {
+                missed = missed or r.n_parts > 0;
                 if (self.opt.gated) {
                     const gates = (try self.stream.gate(r)) orelse continue;
+                    if (gu_first == 0) gu_first = gates.gu;
+                    // The layer's gate/up value is its first route's, its last down value its last route's.
+                    if (comptime timeline.enabled) timeline.gate(layer, gu_first, gates.down_first, gates.n_parts);
                     for (0..r.n_parts) |p| {
                         // Part p's banks waited at its down gate: every gate/up of the route and its own down landed.
                         var over: [n_banks]?Arrays = @splat(null);
@@ -527,6 +539,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     try g.asyncEval(try self.fusedWave(g, sd, x, k, @intCast(p + 1), &acc, null));
                 }
             };
+            if (comptime timeline.enabled) timeline.point(layer, .end, self.readGauge(), missed);
             for (&sides) |*sd| if (sd.r) |r| {
                 self.stream.release(r);
                 sd.r = null;
@@ -574,6 +587,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 }
             }
             return acc.outs[first..acc.n_outs];
+        }
+
+        /// The read pool's wall time with a read in flight (ns): the timeline's read gauge.
+        fn readGauge(self: *const Self) u64 {
+            return @intCast(@max(self.stream.pool.readGauge()[4], 0));
         }
 
         /// The wide lane: the weighted sum `[n, hidden]`.

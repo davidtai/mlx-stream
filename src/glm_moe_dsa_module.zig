@@ -31,6 +31,9 @@ const experts_mod = @import("glm_moe_dsa_experts.zig");
 const mtp_mod = @import("glm_moe_dsa_mtp.zig");
 const exl3_bank = @import("glm_moe_dsa_exl3_bank.zig");
 const exl3_quant = @import("glm_moe_dsa_exl3_quant.zig");
+/// PROFILE builds (`-Dplugin-profile=true`): each draft round's verify on the GPU timeline, its summary at the
+/// request's end (`VERIFY_GPU_TIMELINE`); every other build compiles it out.
+const timeline = @import("dsv41_verify_timeline.zig");
 
 const G = graph.G;
 const Stats = sdk_ext.expert.Stats;
@@ -341,7 +344,6 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// The phase change, once per request before its first decode step: the transient scratch freed, the MLX cache
         /// cleared, the slot rows grown to the decode fill (window 0 allocated beside them), the decode cache limit.
         pub fn decodeHandover(self: *Self, h: sdk.DecodeHandover) !void {
-            _ = h;
             if (self.decoding) return;
             _ = mlx.mlx_synchronize(self.g.s);
             _ = try self.ex.releaseTransient();
@@ -350,6 +352,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var prev: usize = 0;
             _ = mlx.mlx_set_cache_limit(&prev, bill_mod.decode_cache_bytes);
             self.decoding = true;
+            if (comptime timeline.enabled) if (self.mtp != null) {
+                timeline.install(self.g.s, @intCast(@min(h.reserved_tokens -| h.prompt_tokens, timeline.max_cycles + 1)), @intCast(self.bank.layers.len / Experts.bpl)) catch |e|
+                    log.warn("glm_moe_dsa: the verify timeline is off ({s})\n", .{@errorName(e)});
+            };
             self.decode_mark = .{ .s0 = self.stream.stats() };
             if (self.mtp) |ln| ln.counts = .{};
             for (self.layer_counts0, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
@@ -357,6 +363,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
         /// The request's end (the host's finish): its decode line, once; nothing when it never decoded.
         pub fn requestEnd(self: *Self) void {
+            if (comptime timeline.enabled) if (timeline.active) {
+                const pending = timeline.settle(self.g.s, 2000);
+                timeline.uninstall();
+                var tb: [16384]u8 = undefined;
+                log.info("glm_moe_dsa: {s}\n", .{timeline.line(&tb, pending)});
+            };
             if (self.mtp) |ln| if (ln.counts.rounds > 0) {
                 log.info("{f}\n", .{ln.line()});
                 log.info("{f}\n", .{mtp_mod.ProbLine{ .c = ln.counts }});
@@ -426,6 +438,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// `mtpRound` with a test's `probe`.
         pub fn roundWith(self: *Self, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams, probe: ?*Probe) !sdk.DraftRound {
             const ln = self.mtp orelse return error.NoDraftLane;
+            if (comptime timeline.enabled) timeline.cycleBegin();
             const t0 = self.nowNs();
             const peak0 = self.g.peakFrom();
             const len = self.cache.len;
@@ -444,10 +457,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const m0 = self.g.mark();
             defer self.g.resetTo(m0);
             self.ex.row_bytes = @splat(0);
+            if (comptime timeline.enabled) timeline.verifyBegin();
             const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, self.routes, .{ .verify = true, .hidden = true });
             defer self.g.release(out.logits);
             defer self.g.release(out.hidden.?);
             try self.g.evalAll(&.{ out.logits, out.hidden.? });
+            if (comptime timeline.enabled) timeline.verifyEnd();
             try self.ex.flush();
             const t_verify = self.nowNs();
             const d = try mtp_mod.decide(&self.g, out.logits, drafts, ln.mode, sampling, len);
