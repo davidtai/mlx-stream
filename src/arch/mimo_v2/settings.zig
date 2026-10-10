@@ -94,6 +94,9 @@ pub const PredictEvals = enum { tiled, one, invalid };
 /// stack-next9: the P7 W settings a request named (the rest came from the defaults).
 /// X20: `read_schedule_threshold` records a named `prefill_read_schedule_threshold`.
 pub const P7Requested = packed struct { read_schedule: bool = false, scratch: bool = false, combine: bool = false, predict_evals: bool = false, read_schedule_threshold: bool = false };
+/// The settings a request named with a value its key does not take (`applySettings`), each refused by name in
+/// `validate`: a bool key given a non-bool, a route key given an unknown name.
+pub const Malformed = packed struct { mtp_lane: bool = false, prefill_read_ahead: bool = false, phase_rows: bool = false, decode_moe: bool = false, prefill_attention: bool = false };
 
 /// R2 (mimo/decode-rows-audit): when the prompt->decode boundary grows the slot banks under the MTP lane
 /// (`Config.decode_grow`).
@@ -228,7 +231,7 @@ pub const Config = struct {
     /// Set by `applySettings` when the request names `decode_attention` (an explicit tier is never re-routed).
     decode_attention_requested: bool = false,
     /// L5 fused decode MoE (design-decode-fusion 2c), read once at construction; `"decode_moe": "stock"` installs the
-    /// grouped gather_qmm route (the control). An unknown value keeps the default. HITPASS (2d): the default `"hitpass"`
+    /// grouped gather_qmm route (the control). An unknown value refuses by name. HITPASS (2d): the default `"hitpass"`
     /// adds the device hit pass to the fused route; `"decode_moe": "fused"` is the fused route without it (its control).
     decode_moe: @import("moe.zig").Route = .hitpass,
     /// K1 (mimo/k1-moe-bw): the decode expert kernel family the fused routes bind, read once at construction: `"k1"`
@@ -243,7 +246,7 @@ pub const Config = struct {
     /// `+attn` (design-prefill §3b): the prompt attention route, resolved once at construction
     /// (prefill_attention.zig `resolveServed`): null = NAX on a NAX device within the device-checked keys, else the stock
     /// route (past the checked keys: one log line); `"prefill_attention": "stock"` installs the stock control, `"nax"`
-    /// refuses on a device without NAX and past the checked keys.
+    /// refuses on a device without NAX and past the checked keys; anything else refuses by name.
     prefill_attention: ?@import("prefill_attention.zig").Route = null,
     // ---- +phase-rows: begin ----
     /// Phase-split expert rows (audit task 8), read once at construction: the bill charges the prompt-only terms (the
@@ -337,6 +340,8 @@ pub const Config = struct {
     /// stack-next9: which of the four P7 W settings the request names (`applySettings`); the install line prints
     /// `source=setting` for those, `source=default` for the rest.
     p7_requested: P7Requested = .{},
+    /// Settings named with a value their key does not take (refused by name in `validate`).
+    malformed: Malformed = .{},
     /// K2 (mimo/k2-glue): the decode lane's layer glue (glue.zig), read once at construction: `"fused"` (the default:
     /// exact, cells/k2-20261009 missfree round 69.0 -> 68.3 ms, ids identical) the fused kernels (the stock ops'
     /// arithmetic); `"decode_glue": "ops"` is the control; anything else refuses by name.
@@ -454,6 +459,11 @@ pub const Config = struct {
     /// Validate the selected precision and bound once, before billing/arrays.
     pub fn validate(c: Config) !void {
         if (c.kv_mode == .invalid) return error.MimoKVModeUnsupported;
+        if (c.malformed.mtp_lane) return error.MimoMtpLaneSetting;
+        if (c.malformed.prefill_read_ahead) return error.MimoPrefillReadAheadSetting;
+        if (c.malformed.phase_rows) return error.MimoPhaseRowsSetting;
+        if (c.malformed.decode_moe) return error.MimoDecodeMoe;
+        if (c.malformed.prefill_attention) return error.MimoPrefillAttentionSetting;
         if (c.decode_attention == .invalid) return error.MimoDecodeAttentionTier;
         if (c.expert_rows_setting_invalid) return error.MimoExpertRowsSetting;
         if (c.expert_rows) |d| if (d == 0) return error.MimoExpertRowsSetting;
@@ -567,10 +577,13 @@ pub const Config = struct {
                 else => .invalid,
             });
         }
-        if (raw.object.get("prefill_read_ahead")) |v| if (v == .bool) {
-            c.prefill_read_ahead = v.bool;
-        };
-        if (raw.object.get("mtp_lane")) |v| c.mtp_heads = v == .bool and v.bool;
+        // A bool key given anything but a bool, or a route key given an unknown name, is refused by name in `validate`.
+        if (raw.object.get("prefill_read_ahead")) |v| {
+            if (v == .bool) c.prefill_read_ahead = v.bool else c.malformed.prefill_read_ahead = true;
+        }
+        if (raw.object.get("mtp_lane")) |v| {
+            if (v == .bool) c.mtp_heads = v.bool else c.malformed.mtp_lane = true;
+        }
         if (raw.object.get("draft_tier")) |v| c.draft_tier = if (v != .string) .invalid else std.meta.stringToEnum(DraftTier, v.string) orelse .invalid;
         if (raw.object.get("draft_delta")) |v| c.draft_delta = switch (v) {
             .float => |f| @floatCast(f),
@@ -582,9 +595,10 @@ pub const Config = struct {
             c.decode_attention = if (v == .string) decode_attention.parseTier(v.string) else .invalid;
             c.decode_attention_requested = true;
         }
-        if (raw.object.get("decode_moe")) |v| if (v == .string) {
-            if (std.meta.stringToEnum(@import("moe.zig").Route, v.string)) |r| c.decode_moe = r;
-        };
+        if (raw.object.get("decode_moe")) |v| {
+            const r = if (v == .string) std.meta.stringToEnum(@import("moe.zig").Route, v.string) else null;
+            if (r) |route| c.decode_moe = route else c.malformed.decode_moe = true;
+        }
         if (raw.object.get("decode_moe_kernel")) |v| {
             // An unknown value (or "invalid") is refused by name in `validate`.
             c.decode_moe_kernel = if (v == .string) std.meta.stringToEnum(@import("moe.zig").KernelFamily, v.string) orelse .invalid else .invalid;
@@ -594,15 +608,16 @@ pub const Config = struct {
             const tail: u32 = if (raw.object.get("decode_seed_tail_tokens")) |n| (if (n == .integer and n.integer > 0 and n.integer <= std.math.maxInt(u32)) @intCast(n.integer) else 0) else @import("stream.zig").default_seed_tail_tokens;
             c.decode_seed = if (v != .string) .invalid else if (std.mem.eql(u8, v.string, "prompt_counts")) .prompt_counts else if (std.mem.eql(u8, v.string, "prompt_tail")) .{ .prompt_tail = tail } else .invalid;
         }
-        if (raw.object.get("prefill_attention")) |v| if (v == .string) {
-            c.prefill_attention = std.meta.stringToEnum(@import("prefill_attention.zig").Route, v.string);
-        };
+        if (raw.object.get("prefill_attention")) |v| {
+            const r = if (v == .string) std.meta.stringToEnum(@import("prefill_attention.zig").Route, v.string) else null;
+            if (r) |route| c.prefill_attention = route else c.malformed.prefill_attention = true;
+        }
         if (raw.object.get("expert_rows")) |v| c.expert_rows = c.rowsSetting(v);
         if (raw.object.get("expert_prefill_rows")) |v| c.expert_prefill_rows = c.rowsSetting(v);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
-        if (raw.object.get("phase_rows")) |v| if (v == .bool) { // +phase-rows
-            c.phase_rows = v.bool;
-        };
+        if (raw.object.get("phase_rows")) |v| { // +phase-rows
+            if (v == .bool) c.phase_rows = v.bool else c.malformed.phase_rows = true;
+        }
         if (raw.object.get("prefill_drain")) |v| {
             // An unknown value (or "invalid") is refused by name in `validate`.
             c.prefill_drain = if (v == .string) std.meta.stringToEnum(@import("math.zig").Drain, v.string) orelse .invalid else .invalid;
@@ -1200,6 +1215,45 @@ test "mimo phase rows: on by default; \"phase_rows\": false installs the equal-r
     try c.validate();
 }
 // ---- +phase-rows: end ----
+
+test "mimo settings: mtp_lane, prefill_read_ahead, phase_rows, decode_moe and prefill_attention refuse a value their key does not take, by name" {
+    const cases = [_]struct { text: []const u8, err: anyerror }{
+        .{ .text = "{\"mtp_lane\":\"false\"}", .err = error.MimoMtpLaneSetting },
+        .{ .text = "{\"mtp_lane\":0}", .err = error.MimoMtpLaneSetting },
+        .{ .text = "{\"prefill_read_ahead\":\"off\"}", .err = error.MimoPrefillReadAheadSetting },
+        .{ .text = "{\"phase_rows\":1}", .err = error.MimoPhaseRowsSetting },
+        .{ .text = "{\"decode_moe\":\"other\"}", .err = error.MimoDecodeMoe },
+        .{ .text = "{\"decode_moe\":3}", .err = error.MimoDecodeMoe },
+        .{ .text = "{\"prefill_attention\":\"flash\"}", .err = error.MimoPrefillAttentionSetting },
+        .{ .text = "{\"prefill_attention\":null}", .err = error.MimoPrefillAttentionSetting },
+    };
+    for (cases) |case| {
+        const v = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.text, .{});
+        defer v.deinit();
+        var c: Config = .{};
+        c.applySettings(v.value);
+        try std.testing.expectError(case.err, c.validate());
+    }
+    // A malformed value changes nothing else (the defaults stand), and every well-formed value of the five keys validates.
+    const bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"mtp_lane\":\"no\",\"decode_moe\":\"x\"}", .{});
+    defer bad.deinit();
+    var d: Config = .{};
+    d.applySettings(bad.value);
+    try std.testing.expect(d.mtp_heads and d.decode_moe == .hitpass);
+    const good = [_][]const u8{
+        "{\"mtp_lane\":false,\"prefill_read_ahead\":false,\"phase_rows\":false,\"decode_moe\":\"stock\",\"prefill_attention\":\"stock\"}",
+        "{\"mtp_lane\":true,\"prefill_read_ahead\":true,\"phase_rows\":true,\"decode_moe\":\"fused\",\"prefill_attention\":\"nax\"}",
+        "{\"decode_moe\":\"hitpass\"}",
+    };
+    for (good) |text| {
+        const v = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer v.deinit();
+        var c: Config = .{};
+        c.applySettings(v.value);
+        try std.testing.expectEqual(Malformed{}, c.malformed);
+        try c.validate();
+    }
+}
 
 test "mimo rows audit settings: decode_grow and decode_window parse, default to the releases, refuse unknown values by name" {
     const parse = struct {

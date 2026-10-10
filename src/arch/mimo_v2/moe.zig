@@ -1427,7 +1427,7 @@ test "mimo moe GPU: fused banked gate/up + down + combine vs the stock gather_qm
     std.debug.print("MIMO_MOE_SELFCHECK PASS worst_out_ratio={d:.3} union_vs_pair_bitwise_words={d} k1_vs_banked_bitwise_words={d} k1_fma_worst_rows_ratio={d:.3}\n", .{ worst_ratio, union_words, k1_words, fma_worst });
 }
 
-test "mimo moe route: hitpass is the served default; \"decode_moe\": \"fused\" / \"stock\" install the controls" {
+test "mimo moe route: hitpass is the served default; \"decode_moe\": \"fused\" / \"stock\" install the controls; an unknown name refuses" {
     const settings = @import("settings.zig");
     var c: settings.Config = .{};
     try testing.expectEqual(Route.hitpass, c.decode_moe);
@@ -1443,4 +1443,5 @@ test "mimo moe route: hitpass is the served default; \"decode_moe\": \"fused\" /
     defer bad.deinit();
     c.applySettings(bad.value);
     try testing.expectEqual(Route.stock, c.decode_moe);
+    try testing.expectError(error.MimoDecodeMoe, c.validate());
 }
