@@ -895,10 +895,14 @@ test "glm mtp: the request's line (the ABBA harness reads it): depth, acceptance
     try testing.expect(std.mem.startsWith(u8, u, "glm_moe_dsa: mtp depth 2 acceptance typical (delta 0.3): 2 rounds"));
 }
 
-/// A synthetic MTP directory for config `c` (`tp` ranks, experts alternating K3 / K4): the manifest, `mtp-experts.bin`
-/// of seeded bytes (each record's logical bytes, zero padding to 4096), and the expected per-expert [K, local]. Returns
-/// the bin's bytes.
+/// A synthetic MTP directory for config `c` (`tp` ranks, experts alternating K3 / K4): the manifest and `mtp-experts.bin`
+/// of seeded bytes (each record's logical bytes, zero padding to 4096; with `signs` the suh / svh segments are +/-1 in
+/// f16, the trellis seeded codes). Returns the bin's bytes.
 pub fn writeSynthMtp(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const glm.Config, tp: u32, multiplier: u64) ![]u8 {
+    return writeSynthMtpWith(a, io, dir, c, tp, multiplier, false);
+}
+
+pub fn writeSynthMtpWith(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const glm.Config, tp: u32, multiplier: u64, signs: bool) ![]u8 {
     const h: u64 = c.hidden_size;
     const mini: u64 = c.moe_intermediate_size / tp;
     const e = c.n_routed_experts;
@@ -938,6 +942,19 @@ pub fn writeSynthMtp(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *cons
             const at = image.items.len;
             try image.appendNTimes(a, 0, @intCast(record));
             rng.random().bytes(image.items[at..][0..@intCast(logical)]);
+            if (signs) {
+                var off: u64 = 0;
+                for (0..9) |ci| {
+                    const sh = Manifest.segmentShape(ci, h, mini, k);
+                    var n: u64 = 1;
+                    for (sh.slice()) |x| n *= x;
+                    if (ci % 3 != 0) for (0..n) |i| {
+                        const v: u16 = if (rng.random().boolean()) 0x3C00 else 0xBC00;
+                        std.mem.writeInt(u16, image.items[at + off + 2 * i ..][0..2], v, .little);
+                    };
+                    off += 2 * n;
+                }
+            }
         }
         base += n_minis * record;
     }
@@ -1032,4 +1049,89 @@ test "glm mtp: the EXL3 bank's arrays are the records' segments byte for byte, [
     try mlx.check(mlx.mlx_array_eval(b.base));
     const base = mlx.mlx_array_data_int32(b.base).?;
     for (0..c.n_routed_experts) |e| try testing.expectEqual(@as(i32, @intCast(if (e % 2 == 0) (e / 2) * 4 else 32 + (e / 2) * 4)), base[e]);
+}
+
+test "glm mtp: the EXL3 bank's MoE on the GPU equals sushi's host decode of the same records (each routed expert = its 4 minis at its score)" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    // hidden 128 and minis of 128 (inter 512 over 4 ranks): the kernels' Hadamard blocks.
+    const base_text = try tinyText();
+    const text = try std.mem.replaceOwned(u8, a, base_text, "\"moe_intermediate_size\":64,", "\"moe_intermediate_size\":512,");
+    defer a.free(text);
+    var c = try glm.Config.parse(a, text, null, null);
+    defer c.deinit(a);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [512]u8 = undefined;
+    const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
+    const img = try writeSynthMtpWith(a, testing.io, tmp.dir, &c, 4, sushi.format.MCG_MULT, true);
+    defer a.free(img);
+    var w = sdk.Weights.init(a);
+    defer w.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var b = try Exl3.open(a, testing.io, root, &c, &w, null);
+    defer b.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = try Manifest.load(arena.allocator(), testing.io, try std.fmt.allocPrint(arena.allocator(), "{s}/{s}", .{ root, dir_name }), &c, null);
+    const h = c.hidden_size;
+    const n = 2;
+    const k = 8;
+    var rng = std.Random.DefaultPrng.init(5);
+    var xs: [n * 128]f32 = undefined;
+    for (&xs) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
+    const ids = [n * k]i32{ 0, 3, 5, 6, 9, 10, 12, 15, 1, 2, 4, 7, 8, 11, 13, 14 };
+    var sc: [n * k]f32 = undefined;
+    for (&sc) |*v| v.* = 0.05 + rng.random().float(f32) * 0.2;
+    const xb = try g.astype(try g.hostArray(std.mem.sliceAsBytes(&xs), &.{ n, @intCast(h) }, .float32), .bfloat16);
+    var xin: [n * 128]f32 = undefined;
+    _ = try g.hostF32(try g.astype(xb, .float32), &xin);
+    const y = try b.moe(&g, xb, try g.hostArray(std.mem.sliceAsBytes(&ids), &.{ n, k }, .int32), try g.hostArray(std.mem.sliceAsBytes(&sc), &.{ n, k }, .float32));
+    var got: [n * 128]f32 = undefined;
+    _ = try g.hostF32(try g.astype(y, .float32), &got);
+    // The host reference: sushi's own decode (`format.project`) of each mini's three projections from the records.
+    var want: [n * 128]f32 = @splat(0);
+    const mini: usize = m.mini_inter;
+    var t_in: [512]f32 = undefined;
+    var inner: [512]f32 = undefined;
+    var gate: [512]f32 = undefined;
+    var up: [512]f32 = undefined;
+    var down: [512]f32 = undefined;
+    for (0..n) |row| for (0..k) |j| {
+        const e: usize = @intCast(ids[row * k + j]);
+        const kl = m.experts[e];
+        const l = for (m.layers) |l| {
+            if (l.k == kl[0]) break l;
+        } else unreachable;
+        const rate = sushi.format.kFromPackedDim(16 * l.k).?;
+        for (0..m.tp) |r| {
+            const rec = img[l.base_offset + (kl[1] * m.tp + r) * l.record_bytes ..];
+            const seg = struct {
+                fn f(ll: Manifest.Layer, bytes: []const u8, ci: usize) []const u16 {
+                    const sg = ll.segments[ci];
+                    return @alignCast(std.mem.bytesAsSlice(u16, bytes[sg.offset..][0..sg.length]));
+                }
+            }.f;
+            const x = xin[row * h ..][0..h];
+            sushi.format.project(x, seg(l, rec, 0), seg(l, rec, 2), seg(l, rec, 1), h, mini, rate, .mcg, t_in[0..h], inner[0..mini], gate[0..mini]);
+            sushi.format.project(x, seg(l, rec, 3), seg(l, rec, 5), seg(l, rec, 4), h, mini, rate, .mcg, t_in[0..h], inner[0..mini], up[0..mini]);
+            var act: [512]f32 = undefined;
+            for (act[0..mini], gate[0..mini], up[0..mini]) |*o, gv, uv| o.* = gv / (1 + @exp(-gv)) * uv;
+            sushi.format.project(act[0..mini], seg(l, rec, 6), seg(l, rec, 8), seg(l, rec, 7), mini, h, rate, .mcg, t_in[0..mini], inner[0..h], down[0..h]);
+            for (want[row * h ..][0..h], down[0..h]) |*o, d| o.* += sc[row * k + j] * d;
+        }
+    };
+    var scale: f32 = 0;
+    var worst: f32 = 0;
+    for (want, got) |x, y_| {
+        scale = @max(scale, @abs(x));
+        worst = @max(worst, @abs(x - y_));
+    }
+    std.debug.print("glm mtp exl3: GPU MoE against the host decode, max |delta| {d:.5} at outputs up to {d:.3}\n", .{ worst, scale });
+    try testing.expect(scale > 0.1);
+    try testing.expect(worst <= 0.03 * scale);
 }
