@@ -39,7 +39,7 @@ pub const StreamShape = struct {
     /// Widest route (`Stream.Options.max_route_ids`): a prompt group's experts; decode's window 0 after the grow.
     max_route_ids: u32 = 48,
     /// Prompt routes live at once in one layer (`settings.wideDepth`).
-    wide_depth: u8 = 4,
+    wide_depth: u8 = 5,
     /// The decode lookahead's speculative records per call.
     lookahead_budget: u32 = 2,
     workers: u32 = 4,
@@ -262,7 +262,7 @@ test "glm bill: GLM-5.3's terms at 16K: 1.59 GB a row, the KV at 95.2 KB a posit
     const t = termsOf(.{ .model = &c, .bank = geo, .resident_bytes = 20_100_000_000, .prompt_tokens = 16384, .max_positions = maxPositions(&cfg), .dsa = true });
     try testing.expectEqual(@as(u64, 75 * 21_233_664), t.per_row);
     try testing.expectEqual(@as(u64, 95_232 * (16384 + 8192)), t.kv[1]);
-    try testing.expectEqual(@as(u64, 192 * 21_233_664), t.transient_slots[0]);
+    try testing.expectEqual(@as(u64, 240 * 21_233_664), t.transient_slots[0]);
     try testing.expectEqual(@as(u64, 48 * 21_233_664), t.transient_slots[1]);
     const mb = try memoryBill(testing.allocator, t);
     defer mb.free(testing.allocator);

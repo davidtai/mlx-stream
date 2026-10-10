@@ -178,7 +178,7 @@ pub const Config = struct {
     }
 
     pub fn wideDepth(c: *const Config) u8 {
-        return c.expert_wide_depth orelse 4;
+        return c.expert_wide_depth orelse 5;
     }
 
     pub fn lookaheadBudget(c: *const Config) u32 {
@@ -210,7 +210,7 @@ test "glm settings: numeric_tier names stock only; the gates and the prompt orde
     try testing.expectEqual(@as(?bool, null), (try settingsOf("{\"expert_event_gates\": 0}")).expert_event_gates);
     try testing.expectEqual(@as(?bool, false), (try settingsOf("{\"layer_major_prefill\": false}")).layer_major_prefill);
     const d: Config = .{};
-    try testing.expect(d.eventGates() and d.layerMajor() and d.wideDepth() == 4);
+    try testing.expect(d.eventGates() and d.layerMajor() and d.wideDepth() == 5);
     try testing.expectEqual(Config{}, try settingsOf("[1]"));
 }
 

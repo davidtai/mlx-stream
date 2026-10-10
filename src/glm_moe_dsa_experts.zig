@@ -11,8 +11,8 @@
 //! event-gate aliases), the release; the outputs joined in routed order. A wider call is the wide lane, per bank layer:
 //! its residency seeded from the call's ids, the call's experts in groups of `max_route_ids` (its residents first, then
 //! the misses read at the layer's start (`stageMisses`), then the rest, each hottest first) routed up to `wide_depth`
-//! ahead, each group's rows per bank through the math's `prefill` in slices, drained before the group's slots go back;
-//! then the combine (on the GPU one launch over the groups' outputs, else the join and the op chain in token slices).
+//! ahead, each group's rows per bank through the math's `prefill` in slices, committed as built and drained (while the
+//! host builds the next) before the group's slots go back; then the combine (on the GPU one launch over the groups' outputs, else the join and the op chain in token slices).
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -332,6 +332,20 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 st.experts.shrinkRetainingCapacity(lo);
             }
             if (st.n_routes == 0) st.layer = null;
+        }
+
+        /// Group `gi`'s waves (`outs`, committed) drained before its slots go back (the next route may refill them), its
+        /// route released, the groups after it routed on stream layer `sl` while windows are free.
+        fn drainGroup(self: *Self, g: *G, w: *Wide, sl: u32, gi: usize, outs: []const T, next: *usize, live: *usize, depth: usize, comptime ahead: anytype) !void {
+            const td = pt.now();
+            try g.evalAll(outs);
+            pt.chargeRouted(.compute, td);
+            const tr = pt.now();
+            self.stream.release(w.groute.items[gi].?);
+            w.groute.items[gi] = null;
+            live.* -= 1;
+            try ahead(self, w, sl, next, live, depth);
+            pt.chargeRouted(.route, tr);
         }
 
         /// The staged routes the call did not take released (its end, or an error between `stageMisses` and the call).
@@ -889,8 +903,16 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             }.f;
             try ahead(self, w, sl, &next, &live, depth);
             pt.chargeRouted(.route, tp);
+            // Each group's waves committed as soon as they are built; the group before it is then drained and its
+            // slots go back, so the GPU runs one group while the host builds the next.
+            var prev: ?struct { gi: usize, k0: usize } = null;
             for (0..n_groups) |gi| {
                 const start = w.bounds.items[gi];
+                if (w.groute.items[gi] == null) {
+                    // No window was free for it: the group before it drains first.
+                    if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..], &next, &live, depth, ahead);
+                    prev = null;
+                }
                 const r = w.groute.items[gi].?;
                 const tw = pt.now();
                 for (0..r.n_parts) |p| {
@@ -927,19 +949,13 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     std.debug.assert(w.pos.items.len - p0 == w.slot.items.len);
                 }
                 try self.math.finishPrefill(g);
-                pt.chargeRouted(.encode, tc);
-                const td = pt.now();
-                // The group's waves drained before its slots go back (the next route may refill them).
-                try g.evalAll(w.kept.items[k0..]);
-                pt.chargeRouted(.compute, td);
+                try g.asyncEval(w.kept.items[k0..]);
                 g.resetTo(m);
-                const tr = pt.now();
-                self.stream.release(r);
-                w.groute.items[gi] = null;
-                live -= 1;
-                try ahead(self, w, sl, &next, &live, depth);
-                pt.chargeRouted(.route, tr);
+                pt.chargeRouted(.encode, tc);
+                if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..k0], &next, &live, depth, ahead);
+                prev = .{ .gi = gi, .k0 = k0 };
             }
+            if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..], &next, &live, depth, ahead);
         }
 
         /// The wide lane's join: every routed row's output in routed order, then the combine in token slices.
