@@ -141,3 +141,36 @@ test "dsv41 bank contract: a top-8 arch's lookahead measures tau from each row's
     // A top-8 arch cannot keep fewer than eight candidates per row.
     try testing.expectError(error.InvalidSelector, sdk_ext.expert.lookahead.SelectorOf(8).init(a, 16, 7, 1.0, 4));
 }
+
+test "dsv41 bank contract: a bank whose gate/up span exceeds the pool's 9 MiB staging pre-reads once the staging follows the bank" {
+    // GLM-5.3's affine record shape at one layer: the gate/up span 14,155,776 B, the down span 7,077,888 B (each
+    // segment as its own one-row geometry; only the lengths matter here).
+    var l: MxBank.Layer = .{ .logical_bytes = 0, .segments = undefined };
+    const lens = [_]u64{ 6_291_456, 786_432, 6_291_456, 786_432, 6_291_456, 786_432 };
+    var off: u64 = 0;
+    for (&l.segments, lens, 0..) |*sg, n, c| {
+        sg.* = .{ .offset = off, .length = n, .dtype = if (c % 2 == 0) .U32 else .U8, .shape = .{ 1, n / (if (c % 2 == 0) @as(u64, 4) else 1), 0 }, .rank = 2 };
+        off += n;
+    }
+    l.logical_bytes = off;
+    var layers = [_]MxBank.Layer{l};
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = "" });
+    var root: [512]u8 = undefined;
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/experts.bin", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    defer testing.allocator.free(path);
+    const fd = try sdk_ext.expert.openUncached(path.ptr, null);
+    defer fd.close();
+    const bank: MxBank.Bank = .{ .layers = &layers, .n_experts = 8, .sidecar = fd, .record_bytes = std.mem.alignForward(u64, off, 4096) };
+    const page = std.heap.pageSize();
+    try testing.expectEqual(std.mem.alignForward(u64, 14_155_776, page) + page, StreamOf(MxBank, false).stagingBytes(&bank));
+    const opt: StreamOf(MxBank, false).Options = .{ .rows = &.{1}, .max_route_ids = 1, .transient_rows = 1, .lookahead = .{ .budget = 1 }, .pool = .{ .workers = 1, .tickets = 256 } };
+    // The pool's default staging (9 MiB) cannot hold the gate/up span: the pre-read is refused at construction.
+    try testing.expectError(error.InvalidOptions, MxStream.init(testing.allocator, &bank, opt));
+    var sized = opt;
+    sized.staging_from_bank = true;
+    const s = try MxStream.init(testing.allocator, &bank, sized);
+    defer s.deinit();
+    try testing.expectEqual(StreamOf(MxBank, false).stagingBytes(&bank), s.pool.staging.len);
+}

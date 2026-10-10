@@ -169,7 +169,8 @@ pub const Spec = struct {
 pub const Options = struct {
     workers: u32 = 4,
     /// One page-aligned staging buffer per worker; 9 MiB holds a whole
-    /// 8,877,056-byte gate/up span plus its page alignment.
+    /// 8,877,056-byte gate/up span plus its page alignment. A stream over a bank with
+    /// wider spans sizes it from the bank (`stream.Options.staging_from_bank`).
     staging_bytes: u64 = 9 << 20,
     tickets: u32 = 256,
     spec: ?Spec = null,

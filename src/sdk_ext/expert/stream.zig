@@ -66,7 +66,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             row_bytes: [n_components]u64,
             rows: u32,
 
-            /// Nine arrays in the Python bank's dtypes (code int16 [rows, in/16, out/16,
+            /// One array per segment in the bank's dtypes (`B.mlxDtype`; EXL3: code int16 [rows, in/16, out/16,
             /// 16K], rout / rin float16 [rows, out] / [rows, in]), zero-filled and
             /// evaluated on `stream` in one eval. The data pointers are taken here; the
             /// arrays stay held (never donated or recycled) until `deinit`, after the pool
@@ -104,10 +104,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var shape: [4]c_int = undefined;
                     shape[0] = @intCast(rows);
                     for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
-                    const dtype: mlx.mlx_dtype = switch (seg.dtype) {
-                        .I16 => .int16,
-                        .F16 => .float16,
-                    };
+                    const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
                     if (dsv41_alloc_uninit(&b.arrays[c], &shape, seg.rank + 1, dtype) != 0) return error.MlxUnfilledAlloc;
                     b.row_bytes[c] = seg.length;
@@ -283,6 +280,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// Decode misses per completion part (one pool job).
             records_per_part: u32 = 3,
             pool: expert_io.Options = .{ .tickets = 1024 },
+            /// The pool's staging buffers sized from the bank (`stagingBytes`: its widest gate/up or down span,
+            /// page-rounded, plus a page of alignment) in place of `pool.staging_bytes`. A pre-read range must fit one
+            /// buffer, so a bank whose spans exceed the pool's default needs it.
+            staging_from_bank: bool = false,
             /// Decode routes read the next layer's predicted records ahead and
             /// pre-read their own certain misses (the lookahead4 lane).
             lookahead: ?Lookahead = null,
@@ -346,6 +347,20 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// A gate whose bytes have not landed by then is forced (the stream fails).
             watchdog_ms: u32 = 2000,
         };
+
+        /// One staging buffer that holds any read range of `bank` (`Options.staging_from_bank`): the widest gate/up or
+        /// down span over its layers, rounded up to the page, plus one page (a range's aligned read starts up to a page
+        /// before it).
+        pub fn stagingBytes(bank: *const B.Bank) u64 {
+            var widest: u64 = 0;
+            for (bank.layers) |l| {
+                var gu: u64 = 0;
+                for (l.segments[0..gu_components]) |sg| gu += sg.length;
+                widest = @max(widest, @max(gu, l.logical_bytes - gu));
+            }
+            const page = std.heap.pageSize();
+            return std.mem.alignForward(u64, widest, page) + page;
+        }
 
         /// The contract's gates, counters and refusals (`sdk.expert`).
         pub const Gates = expert.Gates;
@@ -526,6 +541,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (opt.event != null and opt.lookahead == null) return error.InvalidOptions;
                 if (opt.event) |ev| if (ev.watchdog_ms < 50 or ev.watchdog_ms > 60_000) return error.InvalidOptions;
                 var pool_opt = opt.pool;
+                if (opt.staging_from_bank) pool_opt.staging_bytes = stagingBytes(bank);
                 if (opt.lookahead) |la| {
                     if (la.chunks == 0 or la.chunks > 8 or !std.math.isPowerOfTwo(la.chunks) or la.idle_busy > 1 or
                         la.budget == 0 or la.budget > expert_lookahead.max_budget) return error.InvalidOptions;
