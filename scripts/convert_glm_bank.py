@@ -228,7 +228,8 @@ def convert_experts(srcs, g, dst, resume, stop_after):
         shas = []
         for e in range(g["n_experts"]):
             shas.append(record_bytes(srcs, g, layer, e, buf))
-            os.pwrite(fd, buf, (i * g["n_experts"] + e) * g["record"])
+            if os.pwrite(fd, buf, (i * g["n_experts"] + e) * g["record"]) != len(buf):
+                raise OSError("short write to %s at layer %d expert %d" % (path, layer, e))
         os.fsync(fd)
         written += g["n_experts"] * g["record"]
         done[i] = {"index": i, "layer": layer, "records": g["n_experts"], "sha256": shas}
