@@ -28,16 +28,18 @@ pub const prefill_cache_bytes: u64 = 2 << 30;
 pub const decode_cache_bytes: u64 = 512 << 20;
 /// The process's host side: its footprint less MLX's active and cache (the read pool's staging and tables, the
 /// manifests, the module's host state, the server and the process itself), the whole footprint outside MLX, so no
-/// other term covers a process overhead. Measured on the box at --ctx-size 16448 (runs m1 and m2: plugin a2aa9bf and
-/// 4bf1112, the coding then the prose workload on one server, MTP off and depth 3): 0.240-0.475 GB constructed,
-/// 0.694-0.792 GB at the prompt pass's end and the handover, 0.792-1.003 GB at the requests' end; the largest, 1.003 GB,
-/// plus 0.25 GB. Freed GPU pages the kernel has not reclaimed yet read as host side for a while (12.4 GB once, after a
-/// decode at the box's knee): the handover's settle waits for them (`glm_moe_dsa_module.settle`).
-pub const host_side_bytes: u64 = 1_250_000_000;
-/// The host side's rise from the handover's reading to the request's end (decode's own host state), the term the
-/// live grow adds to its reading: measured 0.095-0.300 GB over 1,024 tokens (runs m1 and m2; the most, MTP off), plus
-/// 0.05 GB.
-pub const decode_host_rise_bytes: u64 = 350_000_000;
+/// other term covers a process overhead. Measured on the box at --ctx-size 16448 (runs m1, m2, k1 and k2: plugins
+/// a2aa9bf and 4bf1112, the coding and the prose workloads, MTP off, exact depth 3 and typical depth 3): 0.240-0.475 GB
+/// constructed, 0.693-0.837 GB at the prompt pass's end and the handover, 0.789-1.216 GB at the requests' end. Freed
+/// GPU pages the kernel has not reclaimed yet read here too: the 1.216 GB reading had MLX's cache at 0 where the other
+/// runs' held 0.45-0.48 GB (their sum 1.22-1.27 GB every time), and once, after a decode past the box's knee, 12.4 GB
+/// for a while (the handover's settle waits for those, `glm_moe_dsa_module.settle`). The largest, 1.216 GB, plus
+/// 0.28 GB.
+pub const host_side_bytes: u64 = 1_500_000_000;
+/// The host side's rise from the handover's reading to the request's end (decode's own host state and freed pages not
+/// yet reclaimed), the term the live grow adds to its reading: measured 0.095-0.520 GB over 1,024 tokens (runs m1, m2,
+/// k1 and k2), plus 0.08 GB.
+pub const decode_host_rise_bytes: u64 = 600_000_000;
 /// The decode step's fixed part (the token's projections, the shared expert, the head's logits and their copies).
 pub const decode_wave_fixed_bytes: u64 = 64 << 20;
 /// The page tables of `wired` bytes (`deepseek_v41_bill.wireTables`: the kernel's and the GPU's leaf entries per 16

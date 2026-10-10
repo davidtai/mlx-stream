@@ -7,7 +7,7 @@
   at construction; the decode handover settles the prompt's frees, reads the footprint and the box, and grows the
   decode rows to the fewer of the bill at the request and the live reading, under the host's target or the box's RAM
   less a 10 % reserve (decode slows down past it on the 256 GB M5 Ultra); decode's transient window holds the widest
-  decode call's ids (8 rows serial); the host side is one measured term (1.25 GB; the unbilled overhead term is
+  decode call's ids (8 rows serial); the host side is one measured term (1.5 GB; the unbilled overhead term is
   gone); the construction checks its footprint (`ConstructionOverBill`). The SDK's arch table gains the optional
   `maxOutput` hook (SDK 2.1) and `sdk.memory.boxUsedBytes`; the expert stream takes decode's window rows
   (`Options.decode_window_rows`, default `max_route_ids`) and the KV grow lane a `resize`. DeepSeek-V4.1's paths are

@@ -188,7 +188,7 @@ The KV lanes hold only the current phase's positions: the prompt's during its pa
 request's own prompt and `max_tokens`. The bill also charges the residents (from the shard headers), the prompt and
 decode transients, decode's transient window (the routed ids of the widest decode call: 8 rows serial, 8 per verify
 row with the MTP lane), the MLX cache limits (2 GiB in the prompt pass, 512 MiB in decode, each plus one freed
-buffer), the read pool's staging and the host side (the footprint outside MLX, 1.25 GB, measured on the box).
+buffer), the read pool's staging and the host side (the footprint outside MLX, 1.5 GB, measured on the box).
 
 The construction admits both phases of the longest request (the billed context and `max_output` generated tokens)
 under the host's target (its ceiling less its wired margin) and fills the prompt rows to it. At the decode handover
