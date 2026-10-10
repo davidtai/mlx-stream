@@ -1,0 +1,1312 @@
+{
+ "format": "mlx-stream-mimo-kernels-v1",
+ "headers": [
+  {
+   "bytes": 1293,
+   "file": "dec_attn_header_mma.metal",
+   "id": "attn256_mma",
+   "sha256": "5d70530f61a08aead840a7ac7a03ef087b40a16d23b7de5371b0be42426cb821",
+   "upstream": "mlx-serve 7a9e392 src/transformer.zig ATTN256_KERNEL_HEADER (byte-identical)"
+  }
+ ],
+ "kernels": [
+  {
+   "atomic_outputs": false,
+   "class": "rounding-class",
+   "ensure_row_contiguous": false,
+   "family": "dec_attn",
+   "header": {
+    "id": "attn256_mma"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "q",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 1,
+       "v": "S"
+      },
+      {
+       "m": 192
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "k",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 4
+      },
+      {
+       "m": 1,
+       "v": "N"
+      },
+      {
+       "m": 192
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "v",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 4
+      },
+      {
+       "m": 1,
+       "v": "N"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "scl",
+     "shape": [
+      {
+       "m": 1
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1024,
+      32,
+      1
+     ],
+     "note": "global S=1 N=8192: RG=2 KS=4 splits=32",
+     "output_dtypes": [
+      "float32",
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       64,
+       32,
+       128
+      ],
+      [
+       64,
+       32
+      ],
+      [
+       64,
+       32
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 16,
+       "name": "G"
+      },
+      {
+       "int": 1,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 4,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      }
+     ],
+     "threadgroup": [
+      32,
+      8,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 1
+      },
+      {
+       "name": "N",
+       "value": 8192
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      32,
+      1
+     ],
+     "note": "global S=1 N=16384: RG=2 KS=4 splits=32",
+     "output_dtypes": [
+      "float32",
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       64,
+       32,
+       128
+      ],
+      [
+       64,
+       32
+      ],
+      [
+       64,
+       32
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 16,
+       "name": "G"
+      },
+      {
+       "int": 1,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 4,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      }
+     ],
+     "threadgroup": [
+      32,
+      8,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 1
+      },
+      {
+       "name": "N",
+       "value": 16384
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      32,
+      1
+     ],
+     "note": "global S=2 N=16384: RG=4 KS=2 splits=32",
+     "output_dtypes": [
+      "float32",
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       128,
+       32,
+       128
+      ],
+      [
+       128,
+       32
+      ],
+      [
+       128,
+       32
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 16,
+       "name": "G"
+      },
+      {
+       "int": 2,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 2,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      }
+     ],
+     "threadgroup": [
+      32,
+      8,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 2
+      },
+      {
+       "name": "N",
+       "value": 16384
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      32,
+      1
+     ],
+     "note": "global S=4 N=16384: RG=8 KS=1 splits=32",
+     "output_dtypes": [
+      "float32",
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       256,
+       32,
+       128
+      ],
+      [
+       256,
+       32
+      ],
+      [
+       256,
+       32
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 16,
+       "name": "G"
+      },
+      {
+       "int": 4,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 1,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      }
+     ],
+     "threadgroup": [
+      32,
+      8,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 4
+      },
+      {
+       "name": "N",
+       "value": 16384
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      64,
+      1
+     ],
+     "note": "global S=8 N=16384: RG=16 KS=1 splits=32",
+     "output_dtypes": [
+      "float32",
+      "float32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       512,
+       32,
+       128
+      ],
+      [
+       512,
+       32
+      ],
+      [
+       512,
+       32
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 16,
+       "name": "G"
+      },
+      {
+       "int": 8,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 1,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      }
+     ],
+     "threadgroup": [
+      32,
+      16,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 8
+      },
+      {
+       "name": "N",
+       "value": 16384
+      }
+     ]
+    }
+   ],
+   "layers": "full",
+   "name": "msv_dec_attn_split",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "pacc"
+    },
+    {
+     "dtype": "float32",
+     "name": "pm"
+    },
+    {
+     "dtype": "float32",
+     "name": "pl"
+    }
+   ],
+   "phase": "decode",
+   "source": {
+    "bytes": 4604,
+    "file": "dec_attn_split.metal",
+    "sha256": "e8d8eaaa5eff9cf105752e3c894103691c23c17befaf24eceb99c24eb5d025d4"
+   },
+   "upstream": "src/dec_attn.zig SPLIT_SOURCE (verbatim)",
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "S"
+    },
+    {
+     "lo": 1,
+     "name": "N"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "rounding-class",
+   "ensure_row_contiguous": false,
+   "family": "dec_attn",
+   "header": null,
+   "inputs": [
+    {
+     "dtype": "float32",
+     "name": "pacc",
+     "shape": [
+      {
+       "m": 64,
+       "v": "S"
+      },
+      {
+       "m": 32
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "pm",
+     "shape": [
+      {
+       "m": 64,
+       "v": "S"
+      },
+      {
+       "m": 32
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "pl",
+     "shape": [
+      {
+       "m": 64,
+       "v": "S"
+      },
+      {
+       "m": 32
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      128,
+      64,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       1,
+       128
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      128,
+      512,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       8,
+       128
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 8
+      }
+     ]
+    }
+   ],
+   "layers": "full",
+   "name": "msv_dec_attn_merge",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "out"
+    }
+   ],
+   "phase": "decode",
+   "source": {
+    "bytes": 539,
+    "file": "dec_attn_merge.metal",
+    "sha256": "1c43462d81fe43b9eb6988346685518d8f812880bcba61ee7f4b42be57aa8a2a"
+   },
+   "upstream": "src/dec_attn.zig MERGE_SOURCE (verbatim)",
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "S"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "rounding-class",
+   "ensure_row_contiguous": false,
+   "family": "dec_attn",
+   "header": {
+    "id": "attn256_mma"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "q",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 1,
+       "v": "S"
+      },
+      {
+       "m": 192
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "layout": "SlidingRing view: head stride 656 x 192, row stride 192",
+     "name": "k",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 8
+      },
+      {
+       "m": 1,
+       "v": "N"
+      },
+      {
+       "m": 192
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "layout": "SlidingRing view: head stride 656 x 128, row stride 128",
+     "name": "v",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 8
+      },
+      {
+       "m": 1,
+       "v": "N"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "sinks",
+     "shape": [
+      {
+       "m": 64
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "scl",
+     "shape": [
+      {
+       "m": 1
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      32,
+      32,
+      1
+     ],
+     "note": "sliding S=1 N=128 (full ring view): RG=1 KS=4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       1,
+       128
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "G"
+      },
+      {
+       "int": 1,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 4,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      },
+      {
+       "int": 128,
+       "name": "W"
+      }
+     ],
+     "threadgroup": [
+      32,
+      4,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 1
+      },
+      {
+       "name": "N",
+       "value": 128
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      64,
+      1
+     ],
+     "note": "sliding S=2 N=129 (full ring view): RG=2 KS=4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       2,
+       128
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "G"
+      },
+      {
+       "int": 2,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 4,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      },
+      {
+       "int": 128,
+       "name": "W"
+      }
+     ],
+     "threadgroup": [
+      32,
+      8,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 2
+      },
+      {
+       "name": "N",
+       "value": 129
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      48,
+      1
+     ],
+     "note": "sliding S=3 N=130 (full ring view): RG=3 KS=2",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       3,
+       128
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "G"
+      },
+      {
+       "int": 3,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 2,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      },
+      {
+       "int": 128,
+       "name": "W"
+      }
+     ],
+     "threadgroup": [
+      32,
+      6,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 3
+      },
+      {
+       "name": "N",
+       "value": 130
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      64,
+      1
+     ],
+     "note": "sliding S=4 N=131 (full ring view): RG=4 KS=2",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       4,
+       128
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "G"
+      },
+      {
+       "int": 4,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 2,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      },
+      {
+       "int": 128,
+       "name": "W"
+      }
+     ],
+     "threadgroup": [
+      32,
+      8,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 4
+      },
+      {
+       "name": "N",
+       "value": 131
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      40,
+      1
+     ],
+     "note": "sliding S=5 N=132 (full ring view): RG=5 KS=1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       5,
+       128
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "G"
+      },
+      {
+       "int": 5,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 1,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      },
+      {
+       "int": 128,
+       "name": "W"
+      }
+     ],
+     "threadgroup": [
+      32,
+      5,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 5
+      },
+      {
+       "name": "N",
+       "value": 132
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      48,
+      1
+     ],
+     "note": "sliding S=6 N=133 (full ring view): RG=6 KS=1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       6,
+       128
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "G"
+      },
+      {
+       "int": 6,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 1,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      },
+      {
+       "int": 128,
+       "name": "W"
+      }
+     ],
+     "threadgroup": [
+      32,
+      6,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 6
+      },
+      {
+       "name": "N",
+       "value": 133
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      56,
+      1
+     ],
+     "note": "sliding S=7 N=134 (full ring view): RG=7 KS=1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       7,
+       128
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "G"
+      },
+      {
+       "int": 7,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 1,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      },
+      {
+       "int": 128,
+       "name": "W"
+      }
+     ],
+     "threadgroup": [
+      32,
+      7,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 7
+      },
+      {
+       "name": "N",
+       "value": 134
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      64,
+      1
+     ],
+     "note": "sliding S=8 N=135 (full ring view): RG=8 KS=1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       64,
+       8,
+       128
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "G"
+      },
+      {
+       "int": 8,
+       "name": "S"
+      },
+      {
+       "int": 192,
+       "name": "BDK"
+      },
+      {
+       "int": 128,
+       "name": "BDV"
+      },
+      {
+       "int": 1,
+       "name": "KS"
+      },
+      {
+       "int": 32,
+       "name": "BK"
+      },
+      {
+       "int": 128,
+       "name": "W"
+      }
+     ],
+     "threadgroup": [
+      32,
+      8,
+      1
+     ],
+     "vars": [
+      {
+       "name": "S",
+       "value": 8
+      },
+      {
+       "name": "N",
+       "value": 135
+      }
+     ]
+    }
+   ],
+   "layers": "sliding",
+   "name": "mimo_dec_attn_window",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "out"
+    }
+   ],
+   "phase": "decode",
+   "source": {
+    "bytes": 5142,
+    "file": "dec_attn_window.metal",
+    "sha256": "8b83077c17db8a2f0ead905fb547625538d83972e806ee88c570c0d762aa54ba"
+   },
+   "upstream": "adapted from src/dec_attn.zig SPLIT_SOURCE: one split, window lower bound, per-head sink folded once, normalised output (see the file's header comment)",
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "S"
+    },
+    {
+     "hi": 135,
+     "lo": 1,
+     "name": "N"
+    }
+   ]
+  }
+ ],
+ "upstream": {
+  "commit": "7a9e392f572ddda8a81448c190617a67708507a9",
+  "donor": "reports/dsv41-f39-tcq3-runtime/mimo/donors/dec_attn (CONTRACT.md)",
+  "ref": "origin/mimo-v2",
+  "repo": "mlx-serve"
+ }
+}
