@@ -262,18 +262,19 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         }
 
         /// A wide prompt call's misses read at its layer's start, before its attention: the layer's non-resident
-        /// experts (in expert order) routed into transient rows in groups, as many as all windows but one hold (the
-        /// residents held meanwhile: no staged miss evicts one); `callWide` serves them from these routes. A call of
-        /// at least 8 rows per expert routes nearly every expert, so nearly every staged read is used.
+        /// experts (in expert order) routed into transient rows in groups, as many as all windows but two hold (the
+        /// call's groups alternate in those two; the residents are held meanwhile: no staged miss evicts one);
+        /// `callWide` serves them from these routes. A call of at least 8 rows per expert routes nearly every expert,
+        /// so nearly every staged read is used.
         pub fn stageMisses(self: *Self, layer: u32) !void {
             const st = &self.staged;
             std.debug.assert(st.layer == null);
-            if (self.opt.wide_depth < 2) return;
+            if (self.opt.wide_depth < 3) return;
             const policy = &self.stream.layers[layer].policy;
             st.experts.clearRetainingCapacity();
             for (0..self.n_experts) |e| if (policy.slotOf(@intCast(e)) == null) try st.experts.append(self.a, @intCast(e));
             const group_n = self.stream.max_route_ids;
-            const n_routes = @min(self.opt.wide_depth - 1, (st.experts.items.len + group_n - 1) / group_n);
+            const n_routes = @min(self.opt.wide_depth - 2, (st.experts.items.len + group_n - 1) / group_n);
             if (n_routes == 0) return;
             try self.stream.holdResidents(layer);
             defer self.stream.releaseHeld();
@@ -289,6 +290,20 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             st.experts.shrinkRetainingCapacity(st.bounds[n_routes]);
             st.n_routes = n_routes;
             st.layer = layer;
+        }
+
+        /// Group `gi`'s waves (`outs`, committed) drained before its slots go back (the next route may refill them), its
+        /// route released, the groups after it routed while windows are free.
+        fn drainGroup(self: *Self, g: *G, layer: u32, w: *Wide, gi: usize, outs: []const T, next: *usize, live: *usize, depth: usize, comptime ahead: anytype) !void {
+            const td = pt.now();
+            try g.evalAll(outs);
+            pt.chargeRouted(.compute, td);
+            const tr = pt.now();
+            self.stream.release(w.groute.items[gi].?);
+            w.groute.items[gi] = null;
+            live.* -= 1;
+            try ahead(self, w, layer, next, live, depth);
+            pt.chargeRouted(.route, tr);
         }
 
         /// The staged routes released where their call never came (an error between `stageMisses` and `call`).
@@ -589,8 +604,16 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             }.f;
             try ahead(self, w, layer, &next, &live, depth);
             pt.chargeRouted(.route, tp);
+            // Each group's waves committed as soon as they are built; the group before it is then drained and its
+            // slots go back, so the GPU runs one group while the host builds the next.
+            var prev: ?struct { gi: usize, k0: usize } = null;
             for (0..n_groups) |gi| {
                 const start = w.bounds.items[gi];
+                if (w.groute.items[gi] == null) {
+                    // No window was free for it: the group before it drains first.
+                    if (prev) |pv| try self.drainGroup(g, layer, w, pv.gi, w.kept.items[pv.k0..], &next, &live, depth, ahead);
+                    prev = null;
+                }
                 const r = w.groute.items[gi].?;
                 const tw = pt.now();
                 for (0..r.n_parts) |p| {
@@ -627,19 +650,13 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     std.debug.assert(w.pos.items.len - p0 == w.slot.items.len);
                 }
                 try self.math.finishPrefill(g);
-                pt.chargeRouted(.encode, tc);
-                const td = pt.now();
-                // The group's waves drained before its slots go back (the next route may refill them).
-                try g.evalAll(w.kept.items[k0..]);
-                pt.chargeRouted(.compute, td);
+                try g.asyncEval(w.kept.items[k0..]);
                 g.resetTo(m);
-                const tr = pt.now();
-                self.stream.release(r);
-                w.groute.items[gi] = null;
-                live -= 1;
-                try ahead(self, w, layer, &next, &live, depth);
-                pt.chargeRouted(.route, tr);
+                pt.chargeRouted(.encode, tc);
+                if (prev) |pv| try self.drainGroup(g, layer, w, pv.gi, w.kept.items[pv.k0..k0], &next, &live, depth, ahead);
+                prev = .{ .gi = gi, .k0 = k0 };
             }
+            if (prev) |pv| try self.drainGroup(g, layer, w, pv.gi, w.kept.items[pv.k0..], &next, &live, depth, ahead);
             try w.inv.resize(a, n_ids);
             // On the GPU the combine reads each routed row where its group's call left it (no join).
             if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0 and w.kept.items.len <= max_combine_parts) {
