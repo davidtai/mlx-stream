@@ -151,6 +151,8 @@ pub const Error = error{
     /// The watchdog released a gate before its bytes landed: the GPU may have
     /// read them early, so the outputs since are invalid.
     GateForced,
+    /// A decode route over more ids than decode's transient window holds rows.
+    RouteWiderThanWindow,
 };
 
 /// What a source type supports (`S.caps`, comptime). An instance installs a subset at construction (a route chosen

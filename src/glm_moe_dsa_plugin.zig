@@ -66,6 +66,7 @@ pub fn applySettings(c: *Config, raw: std.json.Value) void {
 pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, c: *const Config, facts: *const sdk.LoadFacts, ceiling: u64) !u64 {
     _ = ceiling;
     try c.checkCtxSize();
+    try c.checkMaxOutput();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const built = c.withFacts(facts);

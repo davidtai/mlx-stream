@@ -299,6 +299,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// The phase change's transient release installed (`releaseTransient`, then the grow's window 0); off: the whole
             /// scratch stays through decode.
             transient_release: bool = false,
+            /// Decode's window 0 under the release: the routed ids of the widest decode call (null: `max_route_ids`). A
+            /// decode route over more ids is refused by name (`RouteWiderThanWindow`).
+            decode_window_rows: ?u32 = null,
             /// How the grow's new rows (decode's window 0 and every layer's ext) are allocated (`GrowFill`).
             grow_fill: GrowFill = .zeros,
             /// G7: the arch's read-ahead records (`ReadAheadProbe`), in the prefill-timers build only.
@@ -452,6 +455,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             probe: ProbeSlot = no_probe,
             memory: SlotMemory = .host,
             max_route_ids: u32,
+            /// Decode's window 0 rows (`Options.decode_window_rows`).
+            decode_window_rows: u32 = 0,
             records_per_part: u32,
             wide_depth: u8 = 1,
             phase: Phase = .prefill,
@@ -535,6 +540,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (opt.wide_depth < 1 or opt.wide_depth > max_wide_depth or opt.transient_rows < @as(u32, opt.wide_depth) * opt.max_route_ids) return error.InvalidOptions;
                 if (opt.max_route_ids == 0 or opt.max_route_ids > max_route_ids or opt.transient_rows < opt.max_route_ids or
                     opt.records_per_part == 0 or opt.records_per_part > expert_io.max_items) return error.InvalidOptions;
+                if (opt.decode_window_rows) |w| if (w == 0 or w > opt.max_route_ids) return error.InvalidOptions;
                 // One transient row must hold any layer's record.
                 var widest: usize = 0;
                 for (bank.layers, 0..) |l, i| if (l.logical_bytes > bank.layers[widest].logical_bytes) {
@@ -631,6 +637,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .probe = opt.read_ahead_probe,
                     .memory = opt.slot_memory,
                     .max_route_ids = opt.max_route_ids,
+                    .decode_window_rows = opt.decode_window_rows orelse opt.max_route_ids,
                     .records_per_part = opt.records_per_part,
                     .wide_depth = opt.wide_depth,
                     .selector = selector,
@@ -798,6 +805,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn route(self: *Stream, layer: u32, ids: []const u16, scores: []const f32) Error!*Route {
                 if (self.failed) return error.StreamFailed;
                 std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
+                // A decode route's transient loads take at most its ids' rows of window 0.
+                if (self.phase == .decode and ids.len > self.transient.rows) return self.fail(error.RouteWiderThanWindow);
                 // A layer's read-ahead lands before a route plans over its rows (a hit must never read a loading row).
                 if (self.ahead.live and self.ahead.layer == layer) try self.awaitReadAhead(layer);
                 const lookahead = self.route_lookahead;
@@ -1293,7 +1302,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 };
                 if (self.transient_released) {
                     const geom0 = &self.bank.layers[self.transient_layer];
-                    const n0 = self.max_route_ids + decode_staging_rows;
+                    const n0 = self.decode_window_rows + decode_staging_rows;
                     window0 = switch (self.grow_fill) {
                         .zeros => try Rows.init(geom0, n0, self.memory),
                         .unfilled => try Rows.initUnfilled(geom0, n0, self.memory),

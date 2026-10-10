@@ -27,6 +27,12 @@ pub const Config = struct {
     max_context_tokens: ?u32 = null,
     /// A `ctx_size` above the model's limit: refused by name at load (`error.CtxSizeOverModelLimit`).
     ctx_size_over_limit: ?i64 = null,
+    /// The most tokens a request may generate past its prompt (`max_output`; null: `default_max_output`). The
+    /// construction bills a request of the billed context plus this many tokens; the decode handover grows the slot
+    /// rows for the request's own prompt and `max_tokens`.
+    max_output_tokens: ?u32 = null,
+    /// A `max_output` above the model's limit: refused by name at load (`error.MaxOutputOverModelLimit`).
+    max_output_over_limit: ?i64 = null,
     numeric_tier: ?NumericTier = null,
     /// The routed waves wait on the reads' events instead of the host (null = on).
     expert_event_gates: ?bool = null,
@@ -46,6 +52,10 @@ pub const Config = struct {
 
     /// The longest `ctx_size` the bill takes (GLM-5.3's max_position_embeddings).
     pub const max_ctx_size: i64 = 1 << 20;
+    /// The generation a request may take past its prompt when the model sets no `max_output` (128K).
+    pub const default_max_output: u32 = 131072;
+    /// The longest `max_output` the bill takes (the positions past the prompt within max_position_embeddings).
+    pub const max_max_output: i64 = 1 << 20;
     /// The prompt routes one layer may hold live at once (`sdk_ext.expert.stream.max_wide_depth`).
     pub const max_wide_depth: i64 = 5;
     /// The deepest draft a round verifies: its depth + 1 rows of top-8 routes in the stream's decode lane
@@ -97,6 +107,10 @@ pub const Config = struct {
             if (v.integer <= max_ctx_size) c.max_context_tokens = @intCast(v.integer) else c.ctx_size_over_limit = v.integer;
             any = true;
         };
+        if (obj.get("max_output")) |v| if (v == .integer and v.integer >= 1) {
+            if (v.integer <= max_max_output) c.max_output_tokens = @intCast(v.integer) else c.max_output_over_limit = v.integer;
+            any = true;
+        };
         if (obj.get("mtp_depth")) |v| if (v == .integer and v.integer >= 0) {
             if (v.integer <= max_mtp_depth) c.mtp_depth = @intCast(v.integer) else c.mtp_depth_over_limit = v.integer;
             any = true;
@@ -121,9 +135,21 @@ pub const Config = struct {
                 any = true;
             };
         }
-        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} billed_context={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
-            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.max_context_tokens orelse 0, c.mtpDepth(), c.acceptanceName(), c.typical().delta,
+        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
+            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta,
         });
+    }
+
+    /// The generation a request may take past its prompt (`max_output`, else `default_max_output`).
+    pub fn maxOutput(c: *const Config) u32 {
+        return c.max_output_tokens orelse default_max_output;
+    }
+
+    /// A `max_output` over the model's limit, refused by name (never a silent fall back to the default).
+    pub fn checkMaxOutput(c: *const Config) error{MaxOutputOverModelLimit}!void {
+        const v = c.max_output_over_limit orelse return;
+        log.warn("glm_moe_dsa: load refused: max_output {d} is over the model's limit of {d} tokens (MaxOutputOverModelLimit)\n", .{ v, max_max_output });
+        return error.MaxOutputOverModelLimit;
     }
 
     /// The lane's drafts per round (0 = off).
@@ -212,6 +238,17 @@ test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up 
     try testing.expectEqual(@as(?u32, null), over.max_context_tokens);
     try testing.expectError(error.CtxSizeOverModelLimit, over.checkCtxSize());
     try (Config{}).checkCtxSize();
+}
+
+test "glm settings: max_output defaults to 128K, takes 1 to 1,048,576, and over the limit is kept for the refusal" {
+    try testing.expectEqual(@as(u32, 131072), (Config{}).maxOutput());
+    try testing.expectEqual(@as(u32, 4096), (try settingsOf("{\"max_output\": 4096}")).maxOutput());
+    try testing.expectEqual(@as(u32, 131072), (try settingsOf("{\"max_output\": 0}")).maxOutput());
+    try testing.expectEqual(@as(u32, 131072), (try settingsOf("{\"max_output\": \"4096\"}")).maxOutput());
+    const over = try settingsOf("{\"max_output\": 2097152}");
+    try testing.expectEqual(@as(u32, 131072), over.maxOutput());
+    try testing.expectError(error.MaxOutputOverModelLimit, over.checkMaxOutput());
+    try (Config{}).checkMaxOutput();
 }
 
 test "glm settings: mtp_depth is 0 to the route limit's 5 (past it kept for the refusal); acceptance is exact unless typical is named" {

@@ -347,8 +347,10 @@ pub const Exl3 = struct {
             next += l.n_minis;
             var arrs: [9]T = undefined;
             for (l.segments, 0..) |sg, ci| {
-                const host = try gpa.alloc(u8, @intCast(@as(u64, l.n_minis) * sg.length));
-                defer gpa.free(host);
+                // On mapped pages, unmapped at the copy's end: a large block freed to libc's malloc can stay in the
+                // process's footprint (its large cache), outside every term of the bill.
+                const host = try std.heap.page_allocator.alloc(u8, @intCast(@as(u64, l.n_minis) * sg.length));
+                defer std.heap.page_allocator.free(host);
                 for (0..l.n_minis) |mi| {
                     const off = l.base_offset + mi * l.record_bytes + sg.offset;
                     if (!preadAll(fd, host[mi * sg.length ..][0..@intCast(sg.length)], off)) return refuse(diag, error.MtpBankSize, "{s}: short read at {d}", .{ bin, off });
