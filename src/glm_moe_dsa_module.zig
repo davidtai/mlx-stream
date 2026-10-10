@@ -38,8 +38,8 @@ const LayerCounts = sdk_ext.expert.LayerCounts;
 
 /// Positions a request may generate past the billed context (the KV lanes' bound).
 pub const generation_headroom = bill_mod.generation_headroom;
-/// The decode lookahead: the next routed layer's top-8 candidates, two records read ahead per call.
-pub const lookahead: struct { k: u32 = 8, budget: u32 = 2 } = .{};
+/// The decode lookahead: the next routed layer's top-8 candidates (its records per call: `expert_lookahead_budget`).
+pub const lookahead: struct { k: u32 = 8 } = .{};
 /// A gate whose bytes never land is forced after this (and fails the stream).
 pub const event_watchdog_ms: u32 = 2000;
 /// The chunk-major prompt pass's chunk (`layer_major_prefill` off).
@@ -210,7 +210,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .staging_from_bank = true,
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
                 .pool = .{ .workers = shape.workers, .tickets = 1024 * Bk.Stream.maxMinis(&self.bank), .direct = true },
-                .lookahead = .{ .k = lookahead.k, .budget = lookahead.budget },
+                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
             });
             errdefer self.stream.deinit();
@@ -762,7 +762,7 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     try glm.writeResidents(a, testing.io, tmp.dir, &model);
     var rbuf: [512]u8 = undefined;
     const dir = try exl3_bank.tmpRoot(&tmp, &rbuf);
-    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3 };
+    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3, .expert_lookahead_budget = 3 };
     defer cfg.deinit(a);
     var weights = try sdk.loader.dir(testing.io, a, dir, .{});
     defer weights.deinit();
@@ -772,6 +772,8 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     const sv = try Served.init(a, testing.io, &cfg, &weights, s, .{ .ceiling = 64 << 30, .wired_margin = 0 });
     defer sv.deinit();
     const m = sv.exl3;
+    // The setting's lookahead budget is the stream's.
+    try testing.expectEqual(@as(u32, 3), m.stream.selector.?.budget);
     try testing.expectEqual(@as(usize, 8), m.decode_rows.len);
     for (m.prompt_rows, m.decode_rows) |p, d| {
         try testing.expectEqual(@as(u32, 3), p);

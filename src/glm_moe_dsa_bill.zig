@@ -202,7 +202,7 @@ pub fn maxPositions(cfg: *const settings.Config) u64 {
 
 /// The stream's shape the module builds from `cfg`.
 pub fn streamShape(cfg: *const settings.Config) StreamShape {
-    return .{ .wide_depth = cfg.wideDepth() };
+    return .{ .wide_depth = cfg.wideDepth(), .lookahead_budget = cfg.lookaheadBudget() };
 }
 
 /// The bill of `cfg`'s pack for prompts up to `prompt_tokens`: the residents from the shard headers (checked against
