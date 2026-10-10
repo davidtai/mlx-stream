@@ -13,8 +13,10 @@ pub const enabled: bool = if (@hasDecl(bo, "glm_prefill_timers")) bo.glm_prefill
 /// the indexer's selection, the attention core, the output projection, the router, the routed experts (split below),
 /// the shared expert or the dense MLP, the residual and the layer's eval.
 pub const Phase = enum { seed, proj, index, attn, oproj, router, routed, mlp, rest };
-/// The routed call's split: the read waits, the groups' compute drains, the join, the combine.
-pub const Routed = enum { wait, compute, join, combine };
+/// The routed call's split: the routing barrier (the ids to the host, their counts and order), the read-ahead's landing,
+/// the seed and the routes (reads planned and posted), the read waits, the groups' graphs, their compute drains, the
+/// join, the combine's build.
+pub const Routed = enum { barrier, ahead, route, wait, encode, compute, join, combine };
 
 const n_phases = @typeInfo(Phase).@"enum".field_names.len;
 const n_routed = @typeInfo(Routed).@"enum".field_names.len;
@@ -72,15 +74,22 @@ pub fn report(tokens: u64) void {
     if (comptime !enabled) return;
     var total: u64 = 0;
     for (ns) |x| total += x;
-    log.info("glm_moe_dsa profile: prompt {d} tokens, phases {d:.2} s: seed {d:.2}, proj {d:.2}, index {d:.2}, attn {d:.2} (full {d:.2}, shared {d:.2}), oproj {d:.2}, router {d:.2}, routed {d:.2} (wait {d:.2}, compute {d:.2}, join {d:.2}, combine {d:.2}), mlp {d:.2}, rest {d:.2}\n", .{
-        tokens,                                sec(total),
-        sec(ns[@intFromEnum(Phase.seed)]),     sec(ns[@intFromEnum(Phase.proj)]),
-        sec(ns[@intFromEnum(Phase.index)]),    sec(ns[@intFromEnum(Phase.attn)]),
-        sec(attn_full_ns),                     sec(attn_shared_ns),
-        sec(ns[@intFromEnum(Phase.oproj)]),    sec(ns[@intFromEnum(Phase.router)]),
-        sec(ns[@intFromEnum(Phase.routed)]),   sec(routed_ns[@intFromEnum(Routed.wait)]),
-        sec(routed_ns[@intFromEnum(Routed.compute)]), sec(routed_ns[@intFromEnum(Routed.join)]),
-        sec(routed_ns[@intFromEnum(Routed.combine)]), sec(ns[@intFromEnum(Phase.mlp)]),
+    const r = struct {
+        fn of(b: Routed) f64 {
+            return sec(routed_ns[@intFromEnum(b)]);
+        }
+    }.of;
+    log.info("glm_moe_dsa profile: prompt {d} tokens, phases {d:.2} s: seed {d:.2}, proj {d:.2}, index {d:.2}, attn {d:.2} (full {d:.2}, shared {d:.2}), oproj {d:.2}, router {d:.2}, routed {d:.2} (barrier {d:.2}, ahead {d:.2}, route {d:.2}, wait {d:.2}, encode {d:.2}, compute {d:.2}, join {d:.2}, combine {d:.2}), mlp {d:.2}, rest {d:.2}\n", .{
+        tokens,                            sec(total),
+        sec(ns[@intFromEnum(Phase.seed)]), sec(ns[@intFromEnum(Phase.proj)]),
+        sec(ns[@intFromEnum(Phase.index)]), sec(ns[@intFromEnum(Phase.attn)]),
+        sec(attn_full_ns),                 sec(attn_shared_ns),
+        sec(ns[@intFromEnum(Phase.oproj)]), sec(ns[@intFromEnum(Phase.router)]),
+        sec(ns[@intFromEnum(Phase.routed)]), r(.barrier),
+        r(.ahead),                         r(.route),
+        r(.wait),                          r(.encode),
+        r(.compute),                       r(.join),
+        r(.combine),                       sec(ns[@intFromEnum(Phase.mlp)]),
         sec(ns[@intFromEnum(Phase.rest)]),
     });
     ns = @splat(0);
