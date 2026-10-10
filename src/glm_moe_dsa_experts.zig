@@ -121,6 +121,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             distinct: std.ArrayList(u16) = .empty,
             order: std.ArrayList(u16) = .empty,
             count: std.ArrayList(u32) = .empty,
+            /// The call's routed rows by group (each group's in row order) and each group's first index there.
+            by_group: std.ArrayList(u32) = .empty,
+            group_at: std.ArrayList(u32) = .empty,
             slot: std.ArrayList(u32) = .empty,
             act: std.ArrayList(u32) = .empty,
             pos: std.ArrayList(u32) = .empty,
@@ -129,7 +132,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
 
             fn deinit(w: *Wide, a: std.mem.Allocator, g: *G) void {
                 for (w.kept.items) |x| g.release(x);
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.order, &w.count, &w.slot, &w.act, &w.pos, &w.inv, &w.kept }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.order, &w.count, &w.by_group, &w.group_at, &w.slot, &w.act, &w.pos, &w.inv, &w.kept }) |l| l.deinit(a);
             }
         };
 
@@ -447,6 +450,19 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             w.kept.clearRetainingCapacity();
             const n_distinct = w.distinct.items.len;
             const n_groups = (n_distinct + group_n - 1) / group_n;
+            // The routed rows bucketed by group once (a counting sort, each group's rows in row order).
+            try w.group_at.resize(a, n_groups + 1);
+            @memset(w.group_at.items, 0);
+            for (w.ids.items) |e| w.group_at.items[@as(usize, @intCast(w.first.items[e])) / group_n + 1] += 1;
+            for (1..n_groups + 1) |gi| w.group_at.items[gi] += w.group_at.items[gi - 1];
+            try w.by_group.resize(a, n_ids);
+            try w.slot.resize(a, n_groups);
+            @memcpy(w.slot.items, w.group_at.items[0..n_groups]);
+            for (w.ids.items, 0..) |e, row| {
+                const gi = @as(usize, @intCast(w.first.items[e])) / group_n;
+                w.by_group.items[w.slot.items[gi]] = @intCast(row);
+                w.slot.items[gi] += 1;
+            }
             const depth: usize = self.opt.wide_depth;
             var routes: [expert_stream.max_wide_depth]?*S.Route = @splat(null);
             errdefer for (&routes) |*rt| if (rt.*) |r| {
@@ -457,7 +473,6 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             pt.chargeRouted(.route, tp);
             for (0..n_groups) |gi| {
                 const start = gi * group_n;
-                const group = groupOf(w.distinct.items, gi, group_n);
                 const r = routes[gi % depth].?;
                 const tw = pt.now();
                 for (0..r.n_parts) |p| {
@@ -474,9 +489,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     w.slot.clearRetainingCapacity();
                     w.act.clearRetainingCapacity();
                     const p0 = w.pos.items.len;
-                    for (w.ids.items, 0..) |e, row| {
-                        const fi: usize = @intCast(w.first.items[e]);
-                        if (fi < start or fi >= start + group.len) continue;
+                    for (w.by_group.items[w.group_at.items[gi]..w.group_at.items[gi + 1]]) |row| {
+                        const fi: usize = @intCast(w.first.items[w.ids.items[row]]);
                         const ref = refs[fi - start];
                         if (ref.bank != kind) continue;
                         try w.slot.append(a, ref.row);
