@@ -4,10 +4,10 @@
 //! both phases and fills the slot rows under the host's ceiling less its wired margin before any slot bank is
 //! allocated, binds the residents, starts the stream (prompt rows, the read pool sized from the bank's widest span,
 //! the decode lookahead, the event gates) and allocates nothing else until a prompt. A request: the reverse phase change
-//! if the previous one decoded, the prompt pass (layer by layer over the whole prompt, or chunk by chunk), the decode
-//! handover (the transient scratch freed, the slot rows grown to the decode fill), serial steps. A later prompt keeps
-//! the KV of the prefix it shares with the state (`restorePrefix`). One log line at the prompt pass's end and one at the
-//! request's end report the phase's reads from the stream's counters (`PromptLine`, `DecodeLine`).
+//! if the previous one decoded, the prompt pass (layer by layer in calls of `glm_moe_dsa.promptCallRows`, or chunk by
+//! chunk), the decode handover (the transient scratch freed, the slot rows grown to the decode fill), serial steps. A
+//! later prompt keeps the KV of the prefix it shares with the state (`restorePrefix`). One log line at the prompt pass's
+//! end and one at the request's end report the phase's reads from the stream's counters (`PromptLine`, `DecodeLine`).
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -106,7 +106,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
             // The admission: both phases billed at the context, the rows filled up to the target (or forced).
             const target = host.ceiling -| host.wired_margin;
             const max_context = bill_mod.servedContext(cfg);
-            const terms = bill_mod.termsOf(.{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .max_positions = bill_mod.maxPositions(cfg) });
+            // The prompt's attention form this device runs (the bill charges its arrays).
+            const dsa = try graph.dsaKernelsRun(gpa, s, model);
+            const terms = bill_mod.termsOf(.{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .max_positions = bill_mod.maxPositions(cfg), .dsa = dsa });
             const mb = try bill_mod.memoryBill(gpa, terms);
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
@@ -174,10 +176,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
             for (self.ex.banks) |b| if (b[@backingInt(experts_mod.BankKind.base)]) |arr| try self.math.checkBank(&self.g, arr, &diag);
             self.cache = try graph.Cache.init(gpa, model, @intCast(bill_mod.maxPositions(cfg)));
             errdefer self.cache.deinit(&self.g);
-            self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids };
+            self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa };
             self.g.clearCache();
             _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, bill_mod.prefill_cache_bytes);
-            log.info("glm_moe_dsa: constructed ({d} routed layers, {d} experts, record {d} B, expert reads {s}, prompt {s})\n", .{ n_bank, self.bank.n_experts, self.bank.geometryOf().widest_record, if (gated) "event gates" else "host waits", if (cfg.layerMajor()) "layer by layer" else "chunk by chunk" });
+            log.info("glm_moe_dsa: constructed ({d} routed layers, {d} experts, record {d} B, expert reads {s}, prompt {s}, prompt attention {s})\n", .{ n_bank, self.bank.n_experts, self.bank.geometryOf().widest_record, if (gated) "event gates" else "host waits", if (cfg.layerMajor()) "layer by layer" else "chunk by chunk", if (self.routes.dsa) "on the DSA kernels" else "in the reference's form" });
             return self;
         }
 
@@ -236,10 +238,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
             const t0 = self.nowNs();
             var logits: ?mlx.mlx_array = null;
             errdefer if (logits) |x| self.g.release(x);
-            const chunk: usize = if (self.cfg.layerMajor()) ids.len else self.overrides.prefill_chunk orelse prefill_chunk_tokens;
+            // Layer by layer in calls of `glm.promptCallRows`, or chunk by chunk.
+            const chunk: usize = self.overrides.prefill_chunk orelse prefill_chunk_tokens;
             var at: usize = 0;
             while (at < ids.len) {
-                const end = @min(at + chunk, ids.len);
+                const end = at + if (self.cfg.layerMajor()) glm.promptCallRows(ids.len, at) else @min(chunk, ids.len - at);
                 if (logits) |x| self.g.release(x);
                 logits = null;
                 logits = try graph.forward(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes);
