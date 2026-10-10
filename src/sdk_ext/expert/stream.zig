@@ -829,6 +829,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const p = &ls.policy;
                 const src = self.locate(layer, from).meta;
                 if (from < p.capacity or src.state != .ready or src.layer != layer or src.expert != e) return false;
+                // A transient row of another geometry than the layer's rows (one scratch at the widest layer) is not copied.
+                for (0..n_components) |c| if (self.slotRow(layer, from, @enumFromInt(c)).len != ls.base.row_bytes[c]) return false;
                 const pinned = &self.held_scratch;
                 pinned.clearRetainingCapacity();
                 for (ls.meta[0..p.capacity], 0..) |m, s| if (m.pins != 0 or m.state == .loading) {
