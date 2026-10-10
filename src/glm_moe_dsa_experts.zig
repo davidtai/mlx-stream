@@ -8,10 +8,10 @@
 //! A call of at most `max_route_ids` routed ids (decode, short prompts) is the decode lane: the routing barrier (the ids
 //! and, with the lookahead, the next routed layer's scores read on the host), the route, the residents' wave at once,
 //! then each miss part's gate/up after its gate/up bytes landed and its down after the rest (or every wave at once over
-//! event-gate aliases), the release; the outputs joined in routed order. A wider call is the wide lane: the call's
-//! experts hottest first, the layer's residency seeded from its ids, groups of `max_route_ids` experts routed up to
-//! `wide_depth` ahead, each group's rows per bank through the math's `prefill` in slices, drained before the group's
-//! slots go back; the join and the combine in token slices.
+//! event-gate aliases), the release; the outputs joined in routed order. A wider call is the wide lane: the layer's
+//! residency seeded from the call's ids, the call's experts in groups of `max_route_ids` (its residents first, then
+//! the rest, each hottest first) routed up to `wide_depth` ahead, each group's rows per bank through the math's
+//! `prefill` in slices, drained before the group's slots go back; the join and the combine in token slices.
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -74,6 +74,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             ids: std.ArrayList(u16) = .empty,
             first: std.ArrayList(i32) = .empty,
             distinct: std.ArrayList(u16) = .empty,
+            order: std.ArrayList(u16) = .empty,
             count: std.ArrayList(u32) = .empty,
             slot: std.ArrayList(u32) = .empty,
             act: std.ArrayList(u32) = .empty,
@@ -84,7 +85,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
 
             fn deinit(w: *Wide, a: std.mem.Allocator, g: *G) void {
                 for (w.kept.items) |x| g.release(x);
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.slot, &w.act, &w.pos, &w.inv, &w.kept, &w.side_ids }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.order, &w.count, &w.slot, &w.act, &w.pos, &w.inv, &w.kept, &w.side_ids }) |l| l.deinit(a);
             }
         };
 
@@ -620,9 +621,28 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     return if (cnt[p] != cnt[q]) cnt[p] > cnt[q] else p < q;
                 }
             }.lt);
-            for (w.distinct.items, 0..) |e, i| w.first.items[e] = @intCast(i);
             try self.stream.awaitReadAhead(sl);
             try self.stream.seedPrefill(sl, w.side_ids.items);
+            // The call's residents first (hottest first among them), then the rest: every resident is routed before any
+            // miss is planned, so no miss evicts a resident (one the read-ahead landed) whose group is still to come and
+            // each routed expert is read at most once in the call.
+            const policy = &self.stream.layers[sl].policy;
+            var n_res: usize = 0;
+            for (w.distinct.items) |e| n_res += @intFromBool(policy.slotOf(e) != null);
+            try w.order.resize(a, w.distinct.items.len);
+            var at_res: usize = 0;
+            var at_miss: usize = n_res;
+            for (w.distinct.items) |e| {
+                if (policy.slotOf(e) != null) {
+                    w.order.items[at_res] = e;
+                    at_res += 1;
+                } else {
+                    w.order.items[at_miss] = e;
+                    at_miss += 1;
+                }
+            }
+            @memcpy(w.distinct.items, w.order.items);
+            for (w.distinct.items, 0..) |e, i| w.first.items[e] = @intCast(i);
             const n_distinct = w.distinct.items.len;
             const n_groups = (n_distinct + group_n - 1) / group_n;
             const depth: usize = self.opt.wide_depth;
