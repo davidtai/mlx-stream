@@ -170,6 +170,20 @@ Hadamard with suh / svh). They are independent implementations with disjoint cla
 `src/exl3_sushi_parity.zig` decodes sushi's own K3 mul1 fixture (`lib/sushi/src/exl3/fixtures/exl3_k3_linear.safetensors`
 in the host checkout) through this plugin's decoder and checks the result against sushi's reference bit for bit.
 
+## GLM-5.3 pack
+
+`scripts/convert_glm_bank.py` converts a Hugging Face MLX snapshot of GLM-5.3 (`model_type` `glm_moe_dsa`, affine
+3- or 4-bit experts, group 64) into a pack: the routed experts in `experts.bin` with the manifest
+`expert-manifest-affine-v1.json`, and the other tensors in safetensors shards. It needs Python 3 and numpy.
+
+```sh
+scripts/convert_glm_bank.py --src <snapshot> --dst <pack> --verify all \
+    --source-repo pipenetwork/GLM-5.3-MLX-mixed-4_8bit --source-revision <sha>
+```
+
+`--resume` continues a stopped run. `docs/glm53-pack-format.md` gives the format. The converter's tests:
+`python -I -m pytest scripts/test_convert_glm_bank.py` (needs mlx, numpy, pytest).
+
 ## Layout
 
 ```
@@ -186,7 +200,7 @@ src/fixtures/              test fixtures (bank peek, prefill wave samples, DSpar
 csrc/                      the C read pool, the MLX event / alloc shims and the profile-only timeline sources
 src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
 docs/                      design notes and the path map from the in-tree layout
-scripts/                   test_dsv41.sh, compile_kernels_offline.py
+scripts/                   test_dsv41.sh, compile_kernels_offline.py, convert_glm_bank.py and its tests
 ```
 
 This repository was imported from the mlx-serve fork at commit d38ef038, without its history. `docs/PATH_MAP.md`
