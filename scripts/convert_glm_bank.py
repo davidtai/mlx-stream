@@ -245,12 +245,14 @@ def convert_experts(srcs, g, dst, resume, stop_after):
     return done, written, stopped
 
 
-def write_safetensors(srcs, path, members):
-    """Writes the source tensors `members` to one safetensors file, bytes unchanged; returns its data bytes."""
+def write_safetensors(srcs, path, members, label=None):
+    """Writes the source tensors `members` to one safetensors file, bytes unchanged; returns its data bytes.
+    `label(name)` gives a member's (name, dtype, shape) in the file (default: the source's)."""
     header, off = {"__metadata__": {"format": "mlx"}}, 0
     for n in members:
         _, dtype, shape, a, b = srcs.tensors[n]
-        header[n] = {"dtype": dtype, "shape": shape, "data_offsets": [off, off + b - a]}
+        name, dtype, shape = label(n) if label else (n, dtype, shape)
+        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [off, off + b - a]}
         off += b - a
     hb = json.dumps(header, separators=(",", ":")).encode()
     hb += b" " * (-len(hb) % 8)
@@ -268,7 +270,12 @@ def write_safetensors(srcs, path, members):
 
 
 def write_residents(srcs, dst, shard_bytes):
-    names = [n for n in srcs.order if SWITCH not in n]
+    return write_shards(srcs, dst, [n for n in srcs.order if SWITCH not in n], shard_bytes)
+
+
+def write_shards(srcs, dst, names, shard_bytes, label=None):
+    """The source tensors `names` in shards of at most `shard_bytes` (`model-0000N-of-0000M.safetensors`, other such
+    shards in `dst` removed) and their index, bytes unchanged, each named as `label` gives; returns the data bytes."""
     shards, cur, cur_n = [], [], 0
     for n in names:
         fn, dtype, shape, a, b = srcs.tensors[n]
@@ -286,8 +293,8 @@ def write_residents(srcs, dst, shard_bytes):
             os.remove(os.path.join(dst, f))
     weight_map, total = {}, 0
     for fname, members in zip(files, shards):
-        total += write_safetensors(srcs, os.path.join(dst, fname), members)
-        weight_map.update({n: fname for n in members})
+        total += write_safetensors(srcs, os.path.join(dst, fname), members, label)
+        weight_map.update({(label(n)[0] if label else n): fname for n in members})
     write_json(os.path.join(dst, "model.safetensors.index.json"),
                {"metadata": {"total_size": total}, "weight_map": dict(sorted(weight_map.items()))})
     return total
