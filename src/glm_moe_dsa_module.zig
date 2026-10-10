@@ -750,3 +750,47 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
     // 24 layer calls: 6 steps of the bank's 4 routed layers.
     std.debug.print("{f}\n", .{DecodeLine{ .steps = 6, .tokens = 6, .wall_ns = wall, .r = decode, .hit_rate = spread, .rows = 6 }});
 }
+
+test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3 module, each bank layer's rows its share of the units, and a prompt and decode steps run on the GPU" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    var model = try exl3_bank.tinyConfigInter(a, 512);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try exl3_bank.writeSynth(a, testing.io, tmp.dir, &model, .{ .signs = true });
+    defer a.free(img);
+    try glm.writeResidents(a, testing.io, tmp.dir, &model);
+    var rbuf: [512]u8 = undefined;
+    const dir = try exl3_bank.tmpRoot(&tmp, &rbuf);
+    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3 };
+    defer cfg.deinit(a);
+    var weights = try sdk.loader.dir(testing.io, a, dir, .{});
+    defer weights.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const sv = try Served.init(a, testing.io, &cfg, &weights, s, .{ .ceiling = 64 << 30, .wired_margin = 0 });
+    defer sv.deinit();
+    const m = sv.exl3;
+    try testing.expectEqual(@as(usize, 8), m.decode_rows.len);
+    for (m.prompt_rows, m.decode_rows) |p, d| {
+        try testing.expectEqual(@as(u32, 3), p);
+        try testing.expectEqual(@as(u32, 5), d);
+    }
+    const prompt = [_]u32{ 3, 17, 9, 101, 44, 250, 7, 63, 12, 5, 99, 31 };
+    const logits = try m.prefillAt(0, &prompt);
+    var t = try m.g.hostArgmax(logits);
+    _ = mlx.mlx_array_free(logits);
+    try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
+    var row: [256]f32 = undefined;
+    for (0..4) |_| {
+        const lg = try m.extend(&.{t});
+        defer _ = mlx.mlx_array_free(lg);
+        _ = try m.g.hostF32(try m.g.astype(lg, .float32), &row);
+        for (row) |v| try testing.expect(std.math.isFinite(v));
+        t = try m.g.hostArgmax(lg);
+    }
+    const st = m.stats();
+    try testing.expect(st.expert_cache_misses > 0 and st.route_calls > 0);
+    m.requestEnd();
+}

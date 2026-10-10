@@ -613,6 +613,18 @@ test "glm exl3 bank: a clean synthetic bank opens: the stream layers, each exper
     try testing.expectEqual(@as(u32, 4), g.n_layers);
     try testing.expectEqual(4 * (ms3.logical + ms4.logical), g.widest_record);
     try testing.expect(present(try tmpRoot(&tmp, &rbuf)));
+    // GLM-5.3's split: 148 K3 and 108 K4 experts, units of 1/128 of each, rounded down.
+    var two = [2]Layer{ b.layers[0], b.layers[1] };
+    two[0].n_held = 148;
+    two[1].n_held = 108;
+    const glm53: Bank = .{ .allocator = a, .n_experts = 256, .layers = &two };
+    var r2: [2]u32 = undefined;
+    glm53.rowsAt(100, &r2);
+    try testing.expectEqualSlices(u32, &.{ 115, 84 }, &r2);
+    glm53.rowsAt(128, &r2);
+    try testing.expectEqualSlices(u32, &.{ 148, 108 }, &r2);
+    glm53.rowsAt(16, &r2);
+    try testing.expectEqualSlices(u32, &.{ 18, 13 }, &r2);
 }
 
 test "glm exl3 bank: every rule of the pack's contract refuses by name" {
