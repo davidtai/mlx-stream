@@ -117,6 +117,8 @@ pub const Stats = struct {
     ahead_hits: u64 = 0,
     ahead_demand: u64 = 0,
     ahead_bytes: u64 = 0,
+    /// P7 overlap: read-ahead records never read because the call's plans evict them before any hit (`p7Tail`).
+    ahead_dropped: u64 = 0,
 };
 
 /// A source's refusals at run time. A failure is sticky: every later call refuses as `StreamFailed`.

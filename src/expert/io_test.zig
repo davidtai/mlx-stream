@@ -923,6 +923,98 @@ test "dsv41 io cov: jobs queued behind a held worker stay pending (a resubmit is
     try testing.expect(preIdle(pool));
 }
 
+fn readInFlight(p: *Pool) bool {
+    return p.readGauge()[0] >= 1;
+}
+
+/// X21's withdraw test: the event log it reads (kind, qlen, busy, t, arg per entry).
+const WithdrawLog = struct {
+    var buf: [5 * 32]i64 = undefined;
+    var off: [5]i64 = undefined;
+};
+
+test "dsv41 io cov X21: a queued job is withdrawn unread (its tickets published as withdrawn, its rows untouched, no start in the event log, its tickets free again); a taken job runs as submitted; a gated job is refused" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(64 * page);
+    defer f.deinit();
+    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = 4 * page, .tickets = 64 });
+    defer pool.stop();
+    defer clearFaults();
+    var word: i64 align(8) = 0;
+    try pool.armEvent(.host, @intFromPtr(&word), 10 * std.time.ns_per_s, 0);
+    _ = q3raw.q3ld_test_events(&WithdrawLog.buf, 32);
+    defer _ = q3raw.q3ld_test_events(&WithdrawLog.off, 0);
+    const bases = [4]u64{ 3 * page + 11, 12 * page + 5, 22 * page + 7, 32 * page + 9 };
+    var d = try Dests.init(4, &spec_lens);
+    defer testing.allocator.free(d.buf);
+    // The only worker takes job 0 and sleeps 300 ms at its first read: jobs 1-3 queue behind it.
+    const pg: u64 = page;
+    injectFault(bases[0] / pg * pg, 5, 300 * std.time.ns_per_ms);
+    var firsts: [4]u32 = undefined;
+    firsts[0] = try R96.submit(pool, f.ufd, bases[0..1], &.{bases[0] + spec_gu_len}, d.rows[0..1], &spec_lens);
+    try waitFor(pool, readInFlight);
+    for (1..4) |i| firsts[i] = try R96.submit(pool, f.ufd, bases[i..][0..1], &.{bases[i] + spec_gu_len}, d.rows[i..][0..1], &spec_lens);
+    // Job 0 was taken: it runs as submitted.
+    try testing.expect(!(try pool.withdraw(firsts[0])));
+    // Job 2, queued: withdrawn unread, its tickets terminal at once.
+    const seq0 = c.q3ld_seq();
+    try testing.expect(try pool.withdraw(firsts[2]));
+    try pool.wait(firsts[2], 2, std.time.ns_per_s);
+    for (0..2) |k| {
+        const r = pool.result(firsts[2] + @as(u32, @intCast(k)));
+        try testing.expectEqual(Status.withdrawn, r.status);
+        try testing.expectEqual(@as(i64, 0), r.payload);
+        try testing.expectEqual(@as(i64, 0), r.preadv_calls);
+    }
+    // Withdrawn once, it is no longer queued; a ticket that starts no queued job withdraws nothing.
+    try testing.expect(!(try pool.withdraw(firsts[2])));
+    try testing.expect(!(try pool.withdraw(firsts[1] + 1)));
+    // Job 3's tickets waited on by a live event gate (its bytes promised to the GPU): refused, it runs as submitted.
+    try pool.registerGates(&.{1}, &.{2}, &.{ firsts[3], firsts[3] + 1 });
+    try testing.expectEqual(@as(c_int, -2), c.q3ld_withdraw(firsts[3]));
+    try testing.expect(!(try pool.withdraw(firsts[3])));
+    // The worker wakes and runs jobs 0, 1 and 3 in order; job 2's rows were never written.
+    for ([_]usize{ 0, 1, 3 }) |i| try pool.wait(firsts[i], 2, 10 * std.time.ns_per_s);
+    for ([_]usize{ 0, 1, 3 }) |i| try d.expectRecord(i, f.image, bases[i], bases[i] + spec_gu_len, &spec_lens);
+    for (0..n_components) |k| try testing.expect(std.mem.allEqual(u8, d.part(2, k, &spec_lens), 0xAA));
+    var order: [8]u32 = undefined;
+    const got = pool.logOrder(seq0, c.q3ld_seq(), &order);
+    try testing.expectEqualSlices(u32, &.{ firsts[2], firsts[2] + 1, firsts[0], firsts[0] + 1, firsts[1], firsts[1] + 1, firsts[3], firsts[3] + 1 }, got);
+    try testing.expectEqual(@as(i64, 1), @atomicLoad(i64, &word, .acquire));
+    // The event log: four submits, job 2's withdrawal (kind 11), and a start (kind 2) for jobs 0, 1 and 3 only.
+    const n: usize = @intCast(q3raw.q3ld_test_events(null, 0));
+    var submits: u32 = 0;
+    var withdrawals: u32 = 0;
+    var started = [4]bool{ false, false, false, false };
+    for (0..n) |i| {
+        const e = WithdrawLog.buf[5 * i ..][0..5];
+        switch (e[0]) {
+            1 => submits += 1,
+            11 => {
+                withdrawals += 1;
+                try testing.expectEqual(@as(i64, firsts[2]), e[4]);
+            },
+            2 => {
+                for (firsts, 0..) |fst, j| {
+                    if (e[4] == fst) started[j] = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(u32, 4), submits);
+    try testing.expectEqual(@as(u32, 1), withdrawals);
+    try testing.expectEqualSlices(bool, &.{ true, true, false, true }, &started);
+    // A withdrawn ticket is not pending: the ring submits on it again, and that job reads.
+    var lens_i: [n_components]i64 = undefined;
+    for (spec_lens, &lens_i) |l, *x| x.* = @intCast(l);
+    var again: [spec_rec_len]u8 = @splat(0xAA);
+    try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, f.ufd.fd, @intCast(f.ufd.size), -1, bases[2], bases[2] + spec_gu_len, lens_i[0..gu_components], lens_i[gu_components..], &again, firsts[2]));
+    try pool.wait(firsts[2], 2, 10 * std.time.ns_per_s);
+    try testing.expectEqual(Status.ok, pool.result(firsts[2]).status);
+    try testing.expectEqualSlices(u8, f.image[bases[2]..][0..spec_rec_len], &again);
+}
+
 test "dsv41 io cov: the pre-read class refuses bad geometry and a re-arm under live ranges; it caps ranges at a staging buffer and its table" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(160 * page);

@@ -231,7 +231,35 @@ pub const LayerPolicy = struct {
         p.seed_ranks = 0;
         if (empty <= 0) return;
         const ranked = rankHottest(counts, p.candidates);
-        const chosen = ranked[0..@min(ranked.len, @as(usize, @intCast(empty)))];
+        p.protectSeed(ranked[0..@min(ranked.len, @as(usize, @intCast(empty)))]);
+    }
+
+    /// `prepareSeed` with the seed ranked by the call's last `tail_ids` routed ids (`rankTail`: the tail's counts,
+    /// ties by the whole call's, then by id) instead of the whole call's counts; the prompt counts, the call's counts
+    /// and the re-protection order are `prepareSeed`'s. `tail_ids` >= ids.len is `prepareSeed`. Returns the ranking
+    /// (every expert the call routes, hottest first), valid until the layer's next plan.
+    pub fn prepareSeedTail(p: *LayerPolicy, ids: []const u16, tail_ids: usize) []const u16 {
+        const counts = p.call_counts;
+        @memset(counts, 0);
+        for (ids) |e| {
+            p.prefill_freq[e] += 1;
+            counts[e] += 1;
+        }
+        // `available` is decode admission scratch: free during the prompt pass.
+        const tail = p.available;
+        @memset(tail, 0);
+        for (ids[ids.len - @min(tail_ids, ids.len) ..]) |e| tail[e] += 1;
+        const ranked = rankTail(counts, tail, p.candidates);
+        const empty: i64 = @as(i64, p.capacity) - @as(i64, @intCast(p.protected.count()));
+        p.seed.unsetAll();
+        p.seed_ranks = 0;
+        if (empty > 0) p.protectSeed(ranked[0..@min(ranked.len, @as(usize, @intCast(empty)))]);
+        return ranked;
+    }
+
+    /// The seed's `chosen` ranks (hottest first): the resident ones re-protected, the rest marked to be admitted first.
+    fn protectSeed(p: *LayerPolicy, chosen: []const u16) void {
+        const counts = p.call_counts;
         p.seed_ranks = @intCast(chosen.len);
         // Resident choices: re-protected in ascending count order (stable).
         var n_res: usize = 0;
@@ -623,6 +651,24 @@ pub fn rankHottest(counts: []const u32, out: []u16) []u16 {
     std.sort.pdq(u16, out[0..n], counts, struct {
         fn lessThan(cs: []const u32, x: u16, y: u16) bool {
             return if (cs[x] != cs[y]) cs[x] > cs[y] else x < y;
+        }
+    }.lessThan);
+    return out[0..n];
+}
+
+/// The tail seed's ranking (`prepareSeedTail`): every expert `whole` counts at least once, by its `tail` count
+/// descending, then its `whole` count, then id. Where `tail` == `whole` it is `rankHottest(whole)`.
+pub fn rankTail(whole: []const u32, tail: []const u32, out: []u16) []u16 {
+    const Key = struct { whole: []const u32, tail: []const u32 };
+    var n: usize = 0;
+    for (whole, 0..) |c, e| if (c > 0) {
+        out[n] = @intCast(e);
+        n += 1;
+    };
+    std.sort.pdq(u16, out[0..n], Key{ .whole = whole, .tail = tail }, struct {
+        fn lessThan(k: Key, x: u16, y: u16) bool {
+            if (k.tail[x] != k.tail[y]) return k.tail[x] > k.tail[y];
+            return if (k.whole[x] != k.whole[y]) k.whole[x] > k.whole[y] else x < y;
         }
     }.lessThan);
     return out[0..n];

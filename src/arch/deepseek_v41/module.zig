@@ -1423,20 +1423,20 @@ pub const Module = struct {
         return self.dsparkRoundLogged(a, t1, accepted_cap, null, {});
     }
 
-    /// `dsparkRound` for a sampled request (`ds.Sampling`, the host's `sdk.SamplingParams`): exact speculative sampling
+    /// `dsparkRound` for a sampled request (`sdk_ext.acceptance.Params`, the host's `sdk.SamplingParams`): exact speculative sampling
     /// over the tempered, filtered target (each draft accepted with probability p(draft), the correction from the
-    /// residual, the bonus from p: every emitted token distributed as p); a greedy request (`ds.Sampling.active` null) is
+    /// residual, the bonus from p: every emitted token distributed as p); a greedy request (`Params.active` null) is
     /// `dsparkRound`, op for op. Without a strategy the
     /// serial step draws its next token the same way.
-    pub fn dsparkRoundSampled(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: ?ds.Sampling) !DsparkRound {
-        const sm = ds.Sampling.active(sampling) orelse return self.dsparkRound(a, t1, accepted_cap);
+    pub fn dsparkRoundSampled(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: ?sdk_ext.acceptance.Params) !DsparkRound {
+        const sm = sdk_ext.acceptance.Params.active(sampling) orelse return self.dsparkRound(a, t1, accepted_cap);
         try self.gate.begin(.decode_step);
         const d: *Dspark = if (self.dspark) |*x| x else {
             const base: u64 = self.position();
             const logits = try self.forward(&.{t1});
             defer _ = mlx.mlx_array_free(logits);
             const sh = self.g.shapeOf(logits);
-            const sr = try dsl.Loop(G).sampledRows(&self.g, try self.g.reshape(logits, &.{ 1, sh.dim(-1) }), sm, base, &.{});
+            const sr = try sdk_ext.acceptance.sampledRows(&self.g, try self.g.reshape(logits, &.{ 1, sh.dim(-1) }), sm, base, &.{});
             var next: [1]u32 = undefined;
             _ = try self.g.hostU32(sr.tok, &next);
             self.g.reset();

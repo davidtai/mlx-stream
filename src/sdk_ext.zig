@@ -16,6 +16,8 @@ pub const quant = @import("sdk_ext/quant.zig");
 pub const profile = @import("sdk_ext/profile.zig");
 /// A strided copy out of an evaluated array's buffer.
 pub const ops = @import("sdk_ext/ops.zig");
+/// The draft lanes' acceptance: the exact and typical rules, the sampled path, the seeded draws (every arch's lane).
+pub const acceptance = @import("sdk_ext/acceptance.zig");
 /// The KV seam: lane storage, routes and bounded caps for a module-owned decode state.
 pub const kv = @import("sdk_ext/kv.zig");
 /// `kv`'s conformance helpers (CPU lane).

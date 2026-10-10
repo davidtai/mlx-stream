@@ -3840,7 +3840,7 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     try checkBanks(&g, kernels, &ex);
     memProbe("dsv41 dspark", "residents and the draft head built, slots grown");
 
-    const acceptance: ds.Acceptance = if (std.mem.eql(u8, ref.arm, "typical")) .{ .typical = .{ .delta = @floatCast(ref.delta.?) } } else .greedy;
+    const acceptance: @import("../../sdk_ext.zig").acceptance.Rule = if (std.mem.eql(u8, ref.arm, "typical")) .{ .typical = .{ .delta = @floatCast(ref.delta.?) } } else .exact;
     var lp = L.init(&g, m, head, &st, caches[0..head.nStages()], .{ .acceptance = acceptance, .max_tokens = 1 << 20 });
     defer lp.deinit();
     const primary = try lp.prefill(gpa, &ex, ref.prompt);

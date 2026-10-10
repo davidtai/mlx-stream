@@ -217,6 +217,65 @@ pub fn uninstall() void {
     active = false;
 }
 
+/// `Row.status` bit set on a row `repairRows` gave a start (Metal statuses are <= 5).
+pub const repaired_status: u64 = 1 << 8;
+pub const Repair = struct { unstarted: u32 = 0, repaired: u32 = 0, zero_length: u32 = 0 };
+
+/// Rows Metal completed with GPUStartTime 0 and a GPUEndTime: a buffer that ran no kernel and only waited (an event
+/// wait in its own buffer, as MiMo's gated miss parts commit them). Read raw, such a row spans [0, end): the busy union
+/// takes the verify from its begin and the gated wait from time 0 (the `bytes_wait_ms` ~1e10 of the first MiMo MTP
+/// cells). Its start is the queue's: MLX's stream queue runs its buffers in commit order (the row order), so the GPU
+/// reached it at the later of its commit and the previous row's end. Set there and marked `repaired_status`; a row
+/// whose queue start is not before its end keeps start 0 (dropped by every span, counted `unstarted` only). Pure over
+/// `rs` (the MiMo profile calls it on the stored rows after `settle`; DSV's cell does not call it).
+pub fn repairRows(rs: []Row) Repair {
+    var out: Repair = .{};
+    var prev_end: u64 = 0;
+    for (rs) |*r| {
+        if (r.queue != 1) continue;
+        if (r.gpu_start == 0 and r.gpu_end != 0) {
+            out.unstarted += 1;
+            const start = @max(r.host_commit, prev_end);
+            if (start < r.gpu_end) {
+                r.gpu_start = start;
+                r.status |= repaired_status;
+                out.repaired += 1;
+            }
+        } else if (r.gpu_end != 0 and r.gpu_end == r.gpu_start) out.zero_length += 1;
+        prev_end = @max(prev_end, r.gpu_end);
+    }
+    return out;
+}
+
+/// `repairRows` over the stored rows (after `settle`); nothing outside profile builds.
+pub fn repairUnstarted() Repair {
+    if (comptime !enabled) return .{};
+    return repairRows(rows[0..@min(counts()[0], max_buffers)]);
+}
+
+/// The stored rows, verifies and layer stamps (read after `settle`), for a plugin's own summary over them; empty
+/// outside profile builds. DSV's cell does not call it (the MiMo MTP profile's `MIMO_BARRIER_RESIDUAL` does).
+pub const Stored = struct { rows: []const Row, verifies: []const Verify, layers: []const [max_layers]Layer, n_layers: u32 };
+
+pub fn stored() Stored {
+    if (comptime !enabled) return .{ .rows = &.{}, .verifies = &.{}, .layers = &.{}, .n_layers = 0 };
+    return .{ .rows = rows[0..@min(counts()[0], max_buffers)], .verifies = verifies[0..cycles], .layers = layers[0..cycles], .n_layers = n_layers };
+}
+
+/// A row's cycle (null: untagged) and phase (`Phase`'s value), as the summary reads its tag.
+pub fn rowCycle(r: Row) ?u32 {
+    return tagCycle(r.tag);
+}
+
+pub fn rowPhase(r: Row) u8 {
+    return tagPhase(r.tag);
+}
+
+/// The tag `cycleBegin` / `verifyBegin` give the buffers of cycle `cyc`'s phase `p` (hand-made rows in tests).
+pub fn tagOf(cyc: u32, p: Phase) u64 {
+    return (@as(u64, cyc) + 1) << 8 | @intFromEnum(p);
+}
+
 /// (committed, completed, dropped) from the shim.
 pub fn counts() [3]u32 {
     var out: [3]u32 = .{ 0, 0, 0 };

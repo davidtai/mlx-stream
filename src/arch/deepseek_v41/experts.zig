@@ -627,9 +627,16 @@ pub const joinless_sources = 24;
 /// Per output: `src[i]` its source, `off[i]` its first row there; returns the sources. `order`: scratch.
 /// Exact: a concatenate copies words, and the combine folds each token's k products in k order.
 pub fn planJoinless(rows: []const u32, order: []u32, src: []u8, off: []u32) usize {
+    return planJoinlessBound(rows, order, src, off, joinless_sources);
+}
+
+/// `planJoinless` with the combine's own source bound: up to `bound` outputs each read in place (`bound` >= the
+/// outputs: no merge); above it the stock rule at `joinless_sources`. A combine that reads every source in place (MiMo
+/// P7 `prefill_combine: "inplace"`) passes its bound; every other caller keeps `planJoinless`.
+pub fn planJoinlessBound(rows: []const u32, order: []u32, src: []u8, off: []u32, bound: usize) usize {
     const n = rows.len;
     @memset(off, 0);
-    if (n <= joinless_sources) {
+    if (n <= @max(bound, joinless_sources)) {
         for (src, 0..) |*s, i| s.* = @intCast(i);
         return n;
     }
@@ -692,13 +699,18 @@ pub const MergeStats = struct { outputs: u32 = 0, sources: u32 = 0, copied_rows:
 /// the combine's sources under `planJoinless` (the in-place outputs, then the merged one, KEPT; its inputs
 /// released) and `loc` each assignment's (source, row). Returns the rows copied.
 pub fn mergeJoinless(comptime G: type, g: *G, a: std.mem.Allocator, outs: *std.ArrayList(G.T), pos: []const u32, loc: []i32, sc: *JoinlessScratch(G.T)) !u64 {
+    return mergeJoinlessBound(G, g, a, outs, pos, loc, sc, joinless_sources);
+}
+
+/// `mergeJoinless` under the combine's source bound (`planJoinlessBound`).
+pub fn mergeJoinlessBound(comptime G: type, g: *G, a: std.mem.Allocator, outs: *std.ArrayList(G.T), pos: []const u32, loc: []i32, sc: *JoinlessScratch(G.T), bound: usize) !u64 {
     const n_out = outs.items.len;
     try sc.rows.resize(a, n_out);
     try sc.order.resize(a, n_out);
     try sc.src.resize(a, n_out);
     try sc.off.resize(a, n_out);
     for (outs.items, sc.rows.items) |x, *r| r.* = @intCast(g.shapeOf(x).dim(0));
-    const n_src = planJoinless(sc.rows.items, sc.order.items, sc.src.items, sc.off.items);
+    const n_src = planJoinlessBound(sc.rows.items, sc.order.items, sc.src.items, sc.off.items, bound);
     fillJoinlessLoc(sc.rows.items, sc.src.items, sc.off.items, pos, loc);
     if (n_src == n_out) return 0;
     const last: u8 = @intCast(n_src - 1);
@@ -784,21 +796,48 @@ fn mlxEventWait(g: *ops.MlxOps, event: expert_event.Event, xs: []const mlx.mlx_a
     for (outs) |*o| o.* = try g.adopt(o.*);
 }
 
+/// A math with optional projection arrays supplies its proven event projection at construction.
+/// DeepSeek's default projection always aliases its three EXL3 arrays in their existing order.
+fn Exl3EventProjection(comptime T: type) type {
+    return struct {
+        pub const count: usize = 3;
+        pub fn inputs(p: ProjOf(T)) [count]T {
+            return .{ p.code, p.rout, p.rin };
+        }
+        pub fn fromWaited(out: [count]T) ProjOf(T) {
+            return .{ .code = out[0], .rout = out[1], .rin = out[2] };
+        }
+    };
+}
+
 pub fn Experts(comptime G: type, comptime S: type, comptime M: type) type {
     return ExpertsWith(G, S, M, .{});
 }
 
 pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptime routes: Routes) type {
+    const Projection = if (@hasDecl(M, "Projection")) M.Projection else ProjOf;
+    const EventProjection = if (@hasDecl(M, "EventProjection")) M.EventProjection(G.T) else Exl3EventProjection(G.T);
+    const wide_event_gates = routes.gated and (if (@hasDecl(M, "wide_event_gates")) M.wide_event_gates else false);
+    const predictor_decode_only = if (@hasDecl(M, "predictor_decode_only")) M.predictor_decode_only else false;
+    const wide_profile = if (@hasDecl(M, "Profile")) M.Profile else prof;
+    const bound_decode_rows = if (@hasDecl(M, "decode_forward_rows")) M.decode_forward_rows else decode_forward_rows;
+    // A math with its own decode barrier (MiMo's `decode_commits` / `decode_miss_issue`, mimo_v2/decode_barrier.zig)
+    // commits the decode lane's barrier set and hit waves and reads the barrier itself; every other math (DeepSeek's)
+    // compiles the inline sequence of `run`, unchanged.
+    const math_barrier = @hasDecl(M, "decodeCommit");
+    comptime {
+        if (math_barrier != @hasDecl(M, "decodeRead") or math_barrier != @hasDecl(M, "decodeWave")) @compileError(@typeName(M) ++ ": a decode barrier is decodeCommit, decodeRead and decodeWave together");
+    }
     comptime {
         assertSource(S);
         if (routes.gated and !sdk_ext.expert.capsOf(S).event_gates) @compileError(@typeName(S) ++ ": a gated route needs a source with event gates");
         // A source's slot arrays are its quant's: a source and a quant that disagree on the format do not compile.
-        if (@hasDecl(S, "Arrays") and S.Arrays(G.T) != ProjOf(G.T)) @compileError(@typeName(S) ++ ": its slot arrays are not the quant's");
+        if (@hasDecl(S, "Arrays") and S.Arrays(G.T) != Projection(G.T)) @compileError(@typeName(S) ++ ": its slot arrays are not the quant's");
     }
     return struct {
         const Self = @This();
         const T = G.T;
-        pub const Arrays = BankArraysOf(T);
+        pub const Arrays = quant.BankArrays(Projection(T));
         /// The math this hook runs (its construction-time capabilities: `has_parts`).
         pub const Math = M;
 
@@ -821,10 +860,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         wide: WideScratch = .{},
         /// The wide lane's read schedule (`Options.wide`).
         wide_route: Wide = .{},
+        /// The parts' combine's source bound (`runWideParts`: outputs above it merge into one source); `joinless_sources`
+        /// unless the arch installs a combine that reads every source in place (`setJoinlessBound`).
+        joinless_bound: usize = joinless_sources,
         /// `releaseTransient` nulled the transient bindings; `grow` binds decode's window 0.
         transient_released: bool = false,
-        /// (profile builds: `prof.enabled`) The last wide call's JOINLESS merge (`MergeStats`); compiled out elsewhere.
-        last_merge: if (prof.enabled) MergeStats else void = if (prof.enabled) .{} else {},
+        /// (profile builds: `wide_profile.enabled`) The last wide call's JOINLESS merge (`MergeStats`); compiled out elsewhere.
+        last_merge: if (wide_profile.enabled) MergeStats else void = if (wide_profile.enabled) .{} else {},
         /// The decode lane's wave stages, bound at construction (`Options.banked`): one group per bank (the stock route)
         /// or one banked group over every bank.
         gate_up_wave: *const GateUpWaveFn = gateUpWaveGrouped,
@@ -890,13 +932,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
         };
 
-        pub fn init(a: std.mem.Allocator, g: *G, source: *S, math: M, c: *const v41.Config) !Self {
+        pub fn init(a: std.mem.Allocator, g: *G, source: *S, math: M, c: anytype) !Self {
             return initWith(a, g, source, math, c, .{});
         }
 
-        pub fn initWith(a: std.mem.Allocator, g: *G, source: *S, math: M, c: *const v41.Config, opt: Options) !Self {
+        pub fn initWith(a: std.mem.Allocator, g: *G, source: *S, math: M, c: anytype, opt: Options) !Self {
             // A decode-width forward must fit one route: its calls are the decode lane's by arithmetic.
-            if (@as(u64, decode_forward_rows) * c.n_experts_per_tok > max_route_ids) return error.DecodeRowsWiderThanRoute;
+            if (@as(u64, bound_decode_rows) * c.n_experts_per_tok > max_route_ids) return error.DecodeRowsWiderThanRoute;
             if (routes.lookahead and opt.gates.len != c.n_layers) return error.LookaheadNeedsGates;
             if (routes.gated and G == ops.MlxOps and opt.event == null) return error.GatedNeedsEvent;
             const wr = opt.wide;
@@ -974,7 +1016,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
         fn devLutAfterRouteIn(self: *Self, g: *G, layer: u32) !void {
             const next = self.dev_parity[layer] +% 1;
-            self.source.residentLut(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next])))));
+            const out = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next]))));
+            // A source that tracks its LUT pair (MiMo's, `residentLutInto`: K7's delta route) writes only what changed
+            // since that LUT was last written; every other source writes the whole map, unchanged.
+            if (comptime @hasDecl(S, "residentLutInto")) self.source.residentLutInto(layer, next, out) else self.source.residentLut(layer, out);
             self.dev_parity[layer] = next;
         }
 
@@ -1032,8 +1077,16 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return if (layer + 1 < self.gates.len) self.gates[layer + 1] else null;
         }
 
-        /// The predictor's scores: sqrt(softplus(f32(x @ w^T))) + bias.
+        /// X19: a math that binds its predictor at construction (MiMo's `predict_router`) scores through its own
+        /// instance; every other math keeps `nextScores`.
+        fn scoresOf(self: *const Self, g: *G, xf: T, gate: Gate) !T {
+            if (comptime @hasDecl(M, "predictorScoresBound")) return self.math.predictorScoresBound(g, xf, gate.w, gate.bias);
+            return nextScores(g, xf, gate);
+        }
+
+        /// The architecture's predictor, or DeepSeek's sqrt(softplus(f32(x @ w^T))) + bias.
         fn nextScores(g: *G, xf: T, gate: Gate) !T {
+            if (comptime @hasDecl(M, "predictorScores")) return M.predictorScores(g, xf, gate.w, gate.bias);
             const z = try g.astype(try g.matmul(xf, try g.transpose(gate.w)), .float32);
             return g.add(try g.sqrt(try g.logaddexp(z, try g.scalar(0, .float32))), gate.bias);
         }
@@ -1047,10 +1100,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
         }
 
-        fn waitProj(self: *Self, g: *G, p: ProjOf(T), value: u64, deps: []const T) !ProjOf(T) {
-            var out: [3]T = undefined;
-            try self.eventWait(g, &.{ p.code, p.rout, p.rin }, value, deps, &out);
-            return .{ .code = out[0], .rout = out[1], .rin = out[2] };
+        fn waitProj(self: *Self, g: *G, p: Projection(T), value: u64, deps: []const T) !Projection(T) {
+            const xs = EventProjection.inputs(p);
+            var outs: [EventProjection.count]T = undefined;
+            try self.eventWait(g, &xs, value, deps, &outs);
+            return EventProjection.fromWaited(outs);
         }
 
         pub fn deinit(self: *Self) void {
@@ -1090,6 +1144,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         /// DEVROUTE as bound at construction.
+        /// Construction: the parts' combine reads up to `bound` sources in place (`runWideParts` merges only above it).
+        pub fn setJoinlessBound(self: *Self, bound: usize) void {
+            self.joinless_bound = @max(bound, joinless_sources);
+        }
+
         pub fn devRoute(self: *const Self) bool {
             return self.devroute;
         }
@@ -1140,7 +1199,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 if (comptime !routes.prefill) return error.PrefillLaneNotPorted;
                 const n: u32 = @intCast(g.shapeOf(xf).dim(0));
                 const k: u32 = @intCast(g.shapeOf(indices).dim(1));
-                if (n * k <= max_route_ids) return error.WideLaneUnderMinIds;
+                if (comptime !@hasDecl(M, "prefill_min_tokens")) {
+                    if (n * k <= max_route_ids) return error.WideLaneUnderMinIds;
+                }
                 return h.ex.runWideParts(g, h.layer, xf, indices, n, k);
             }
 
@@ -1150,7 +1211,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
             /// (profile builds) The last wide call's JOINLESS merge; zeros elsewhere.
             pub fn lastMerge(h: Hook) MergeStats {
-                return if (comptime prof.enabled) h.ex.last_merge else .{};
+                return if (comptime wide_profile.enabled) h.ex.last_merge else .{};
             }
 
             /// P1 (`Wide.read_ahead`, fixed at construction): the model runs its predictor pass for this layer.
@@ -1343,10 +1404,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const n: u32 = @intCast(g.shapeOf(xf).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
             const n_ids = n * k;
-            // A route decision on M: calls of at most `max_route_ids` ids (decode
-            // and verify, <= 8 rows of top-6) are the decode lane; wider calls
-            // are the wide lane (the DIG kernels), when it is installed.
-            if (n_ids > max_route_ids) {
+            // A math with its own prefill token threshold routes by logical M.
+            // DeepSeek keeps its decode / verify route through 48 top-6 ids.
+            if (if (comptime @hasDecl(M, "prefill_min_tokens")) n >= M.prefill_min_tokens else n_ids > max_route_ids) {
                 // Only a decode-width layer hoists (the trunk's small-rows segments).
                 std.debug.assert(hoist.len == 0);
                 if (comptime !routes.prefill) {
@@ -1362,8 +1422,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             // A0 (profile builds): the call's barrier, route and MoE build (`first_cycle.call`).
             const t_call = tt;
             if (comptime timeline.enabled) timeline.point(layer, .call, self.readGauge(), false);
-            // The predictor joins the routing barrier's eval (the last layer predicts nothing).
-            const sc: ?T = if (if (routes.lookahead) self.predictorGate(layer) else null) |gate| try nextScores(g, xf, gate) else null;
+            // The installed decode-only predictor follows the source's phase; the last layer predicts nothing.
+            const predict = if (comptime routes.lookahead and predictor_decode_only) self.source.decoding() else routes.lookahead;
+            const sc: ?T = if (if (predict) self.predictorGate(layer) else null) |gate| try self.scoresOf(g, xf, gate) else null;
             // The barrier's arrays: the ids, then the scores when there are any.
             var bar: [2]T = undefined;
             var n_bar: usize = 0;
@@ -1373,15 +1434,23 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             };
             // DEVROUTE (decode): the barrier's arrays committed, then the device hit wave behind them (before the host waits).
             const dev: ?T = if (comptime @hasDecl(S, "decoding")) (if (self.devroute and self.source.decoding()) try self.devWave(g, layer, xf, indices, n, k) else null) else null;
-            if (dev) |d| {
-                try g.asyncEval(bar[0..n_bar]);
-                try g.asyncEval(&.{d});
-            }
-            // HOIST_FIRST commits them and the hoist here (the evals below then only wait); the stock route nothing.
-            try self.pre_barrier(g, bar[0..n_bar], hoist);
-            if (n_bar > 1) try g.evalAll(bar[0..n_bar]);
-            if (sc) |s| scores = try g.hostF32(s, score_buf[0 .. n * self.n_experts]);
-            const ids = try g.hostIds(indices, id_buf[0..n_ids]);
+            const ids = if (comptime math_barrier) read: {
+                // The math's construction-time routes: the commits ahead of the wait (DEVROUTE's barrier set and device
+                // hit wave), the hoist, then the wait and the host's reads of the ids and scores.
+                try self.math.decodeCommit(g, bar[0..n_bar], dev);
+                try self.pre_barrier(g, bar[0..n_bar], hoist);
+                break :read try self.math.decodeRead(g, bar[0..n_bar], indices, sc, id_buf[0..n_ids], score_buf[0 .. n * self.n_experts], &scores);
+            } else read: {
+                if (dev) |d| {
+                    try g.asyncEval(bar[0..n_bar]);
+                    try g.asyncEval(&.{d});
+                }
+                // HOIST_FIRST commits them and the hoist here (the evals below then only wait); the stock route nothing.
+                try self.pre_barrier(g, bar[0..n_bar], hoist);
+                if (n_bar > 1) try g.evalAll(bar[0..n_bar]);
+                if (sc) |s| scores = try g.hostF32(s, score_buf[0 .. n * self.n_experts]);
+                break :read try g.hostIds(indices, id_buf[0..n_ids]);
+            };
             tt = dt.charge(.barrier, tt);
             const t_barrier = tt;
             if (comptime timeline.enabled) timeline.point(layer, .barrier, 0, false);
@@ -1411,7 +1480,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             } else {
                 // Residents: gate/up and down at once.
                 const hits = try self.gate_up_wave(self, g, layer, xf, k, sv, 0, null);
-                if (hits.n > 0) try g.asyncEval(try self.down_wave(self, g, layer, &hits, &acc, null));
+                if (hits.n > 0) {
+                    const outs = try self.down_wave(self, g, layer, &hits, &acc, null);
+                    if (comptime math_barrier) try self.math.decodeWave(g, outs) else try g.asyncEval(outs);
+                }
             }
             // VERIFY_ENCODE hoist: behind the hit wave, ahead of every miss wave (HOIST_FIRST: committed before the barrier's wait).
             try self.post_hit(g, hoist);
@@ -1459,9 +1531,20 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
         }
 
-        /// `checkGated` on layer 0's first `top_k` experts (cold at construction: every one a miss)
-        /// and one fixed bf16 row.
+        /// The self-check's joined row as the host reads it: a math with its own projection (bf16 joins) casts to
+        /// f32; DeepSeek's EXL3 joins are f32 already and are read as they are.
+        fn checkRow(g: *G, x: T) !T {
+            return if (comptime @hasDecl(M, "Projection")) g.astype(x, .float32) else x;
+        }
+
+        /// `checkGated` on layer 0's first `top_k` experts and one fixed bf16 row.
         pub fn checkGates(self: *Self, g: *G, a: std.mem.Allocator, top_k: u32) !void {
+            return self.checkGatesAt(g, a, top_k, 0);
+        }
+
+        /// `checkGated` on the first routed layer's first `top_k` experts (cold at construction: every one a miss)
+        /// and one fixed bf16 row.
+        pub fn checkGatesAt(self: *Self, g: *G, a: std.mem.Allocator, top_k: u32, first_layer: u32) !void {
             const hidden: usize = @intCast(self.hidden);
             var ids: [max_route_ids]u16 = undefined;
             for (ids[0..top_k], 0..) |*d, i| d.* = @intCast(i);
@@ -1474,7 +1557,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const m = g.mark();
             defer g.resetTo(m);
             const xf = try g.hostArray(std.mem.sliceAsBytes(row), &.{ 1, self.hidden }, .bfloat16);
-            try self.checkGated(g, 0, xf, ids[0..top_k], outs[0..kh], outs[kh..]);
+            try self.checkGated(g, first_layer, xf, ids[0..top_k], outs[0..kh], outs[kh..]);
         }
 
         /// P1's construction self-check (`Wide.read_ahead`), once on the real stream before any request:
@@ -1504,7 +1587,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const hits = try self.gate_up_wave(self, g, layer, xf, k, sv, 0, null);
             if (hits.n > 0) _ = try self.down_wave(self, g, layer, &hits, &acc, null);
             try self.gatedParts(g, layer, xf, k, sv, gates, &acc);
-            _ = try g.hostF32(try self.join(g, &acc, 1, k), gated);
+            _ = try g.hostF32(try checkRow(g, try self.join(g, &acc, 1, k)), gated);
             var ref: Acc = .{};
             if (hits.n > 0) _ = try self.down_wave(self, g, layer, &hits, &ref, null);
             for (0..sv.n_parts) |p| {
@@ -1514,7 +1597,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 try self.source.waitDown(call, part);
                 _ = try self.down_wave(self, g, layer, &wave, &ref, null);
             }
-            _ = try g.hostF32(try self.join(g, &ref, 1, k), waited);
+            _ = try g.hostF32(try checkRow(g, try self.join(g, &ref, 1, k)), waited);
             self.source.release(call);
             released = true;
             try self.source.flush();
@@ -1558,11 +1641,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             try self.runWideCore(g, layer, xf, indices, n, k, comptime @hasDecl(M, "has_parts") and M.has_parts);
             const w = &self.wide;
             try w.loc.resize(self.a, 2 * n * k);
-            if (comptime prof.enabled) {
+            if (comptime wide_profile.enabled) {
                 const n_out = w.kept.items.len;
-                const copied = try mergeJoinless(G, g, self.a, &w.kept, w.pos.items, w.loc.items, &w.jl);
+                const copied = try mergeJoinlessBound(G, g, self.a, &w.kept, w.pos.items, w.loc.items, &w.jl, self.joinless_bound);
                 self.last_merge = .{ .outputs = @intCast(n_out), .sources = @intCast(w.kept.items.len), .copied_rows = copied };
-            } else _ = try mergeJoinless(G, g, self.a, &w.kept, w.pos.items, w.loc.items, &w.jl);
+            } else _ = try mergeJoinlessBound(G, g, self.a, &w.kept, w.pos.items, w.loc.items, &w.jl, self.joinless_bound);
             const loc = try g.hostArray(std.mem.sliceAsBytes(w.loc.items), &.{ @intCast(n), @intCast(k), 2 }, .int32);
             return .{ .outs = w.kept.items, .loc = loc };
         }
@@ -1596,8 +1679,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const a = self.a;
             const w = &self.wide;
             if (w.def_slot.items.len == 0) return;
-            prof.setMode(if (at_seed) .base_seed else .base_end);
-            defer prof.setMode(.stream);
+            wide_profile.setMode(if (at_seed) .base_seed else .base_end);
+            defer wide_profile.setMode(.stream);
             const kb = w.kept.items.len;
             const b = self.banks[layer][@backingInt(BankKind.base)].?;
             const rows_: quant.PrefillRows = .{ .slot = w.def_slot.items, .act_row = w.def_act.items };
@@ -1611,9 +1694,9 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 try w.pos.appendSlice(a, w.def_pos.items);
             }
             try self.math.finishPrefill(g);
-            const td = prof.now();
+            const td = wide_profile.now();
             try g.evalAll(w.kept.items[kb..]);
-            prof.charge(.drain, td);
+            wide_profile.charge(.drain, td);
             w.def_slot.clearRetainingCapacity();
             w.def_act.clearRetainingCapacity();
             w.def_pos.clearRetainingCapacity();
@@ -1622,20 +1705,20 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         fn runWideCore(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32, comptime parts: bool) !void {
             const a = self.a;
             const w = &self.wide;
-            prof.countWideCall();
+            wide_profile.countWideCall();
             const n_ids = n * k;
             // The wide lane takes prefill-width calls only (the prefill texts bind small inputs as
             // `constant`; a decode-width call is the decode lane's).
-            std.debug.assert(n_ids >= wide_min_ids);
+            if (comptime !@hasDecl(M, "prefill_min_tokens")) std.debug.assert(n_ids >= wide_min_ids);
             const feed = self.wide_route.seed;
             const hot_first = self.wide_route.hot_first;
             const depth: usize = self.wide_route.depth;
             const cold: u32 = self.wide_route.cold_rows;
             const cold_chunk: usize = if (@hasDecl(M, "max_decode_rows")) M.max_decode_rows else max_route_ids;
             try w.ids.resize(a, n_ids);
-            var tp = prof.now();
+            var tp = wide_profile.now();
             _ = try g.hostIds(indices, w.ids.items);
-            prof.charge(.barrier, tp);
+            wide_profile.charge(.barrier, tp);
             // A0 (profile builds): the prompt's last rows' experts.
             if (comptime first_cycle.enabled) first_cycle.tailRecord(layer, w.ids.items, n, k);
             try w.first.resize(a, self.n_experts);
@@ -1657,7 +1740,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 if (comptime @hasDecl(S, "seedPrefill")) try self.source.seedPrefill(layer, w.ids.items) else unreachable;
             }
             if (hot_first) {
-                std.sort.pdq(u16, w.distinct.items, @as([]const u32, w.count.items), struct {
+                // A source that ranks its own seed (MiMo's `decode_seed`) orders the call by that ranking.
+                if (comptime @hasDecl(S, "hotOrder")) self.source.hotOrder(layer, w.distinct.items, w.count.items) else std.sort.pdq(u16, w.distinct.items, @as([]const u32, w.count.items), struct {
                     fn lt(c: []const u32, x: u16, y: u16) bool {
                         return if (c[x] != c[y]) c[x] > c[y] else x < y;
                     }
@@ -1691,20 +1775,28 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 w.kept.clearRetainingCapacity();
                 if (comptime @hasDecl(S, "holdBase")) if (defer_base) self.source.releaseHeld();
             }
-            tp = prof.now();
+            tp = wide_profile.now();
             for (0..@min(depth, n_groups)) |gi| calls[gi % depth] = try self.source.route(layer, groups.of(gi), &.{});
-            prof.charge(.route, tp);
+            wide_profile.charge(.route, tp);
             for (0..n_groups) |gi| {
                 const start = groups.start(gi);
                 const group = groups.of(gi);
                 const call = calls[gi % depth].?;
                 const sv = self.source.served(call);
-                tp = prof.now();
-                for (0..sv.n_parts) |p| {
-                    try self.source.waitGu(call, @intCast(p));
-                    try self.source.waitDown(call, @intCast(p));
-                }
-                prof.charge(.read_wait, tp);
+                tp = wide_profile.now();
+                const ready: ?u64 = if (comptime wide_event_gates) blk: {
+                    // Register only the group whose consumer is encoded next. Its final down value
+                    // proves every gate/up and down read in the group complete.
+                    const gates = (try self.source.gate(call)) orelse break :blk null;
+                    break :blk gates.down_first + gates.n_parts - 1;
+                } else blk: {
+                    for (0..sv.n_parts) |p| {
+                        try self.source.waitGu(call, @intCast(p));
+                        try self.source.waitDown(call, @intCast(p));
+                    }
+                    break :blk null;
+                };
+                wide_profile.charge(.read_wait, tp);
                 const k0 = w.kept.items.len;
                 var streamed = false;
                 for ([_]BankKind{ .base, .ext, .transient }) |kind| {
@@ -1738,7 +1830,14 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                     }
                     if (w.slot.items.len == 0 and w.cold_slot.items.len == 0) continue;
                     streamed = streamed or kind == .transient;
-                    const b = self.banks[layer][@backingInt(kind)].?;
+                    var b = self.banks[layer][@backingInt(kind)].?;
+                    if (comptime wide_event_gates) if (ready) |value| {
+                        b = .{
+                            .gate = try self.waitProj(g, b.gate, value, &.{}),
+                            .up = try self.waitProj(g, b.up, value, &.{}),
+                            .down = try self.waitProj(g, b.down, value, &.{}),
+                        };
+                    };
                     const hot = w.slot.items.len > 0;
                     if (hot) {
                         if (parts) {
@@ -1769,25 +1868,25 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                     }
                     if (!feed) {
                         if (hot) try self.math.finishPrefill(g);
-                        tp = prof.now();
+                        tp = wide_profile.now();
                         try g.evalAll(w.kept.items[kb..]);
-                        prof.charge(.drain, tp);
+                        wide_profile.charge(.drain, tp);
                     }
                 }
                 // Feed: the group's banks queued back to back, one drain before its slots go back.
                 if (feed) {
                     try self.math.finishPrefill(g);
-                    tp = prof.now();
+                    tp = wide_profile.now();
                     try g.evalAll(w.kept.items[k0..]);
-                    prof.charge(.drain, tp);
+                    wide_profile.charge(.drain, tp);
                 }
-                tp = prof.now();
+                tp = wide_profile.now();
                 // The group's base-bank slots stay pinned and held for the deferred call past its release.
                 if (comptime @hasDecl(S, "holdBase")) if (defer_base) try self.source.holdBase(call);
                 self.source.release(call);
                 calls[gi % depth] = null;
                 if (gi + depth < n_groups) calls[gi % depth] = try self.source.route(layer, groups.of(gi + depth), &.{});
-                prof.charge(.route, tp);
+                wide_profile.charge(.route, tp);
                 // P1b: the seed has landed (its groups read, the next routes' reads posted): its base call drains now.
                 if (base_due and (if (aligned) gi + 1 == groups.seed_groups else streamed)) {
                     base_due = false;
@@ -2040,6 +2139,260 @@ const RecRoute = struct {
         self.finishes += 1;
     }
 };
+
+test "mimo sdk2 experts: bank bindings derive from the math's native projection" {
+    const NativeMath = struct {
+        pub const Projection = quant.GatherQmm.Arrays;
+    };
+    const Ex = ExpertsWith(TraceOps, FakeSource, NativeMath, .{ .prefill = true });
+    const Native = quant.GatherQmm.Arrays(u32);
+    try testing.expect(Ex.Arrays == quant.BankArrays(Native));
+    try testing.expect(@hasField(@FieldType(Ex.Arrays, "gate"), "w"));
+    try testing.expect(!@hasField(@FieldType(Ex.Arrays, "gate"), "code"));
+    // Math without a projection override keeps DeepSeek's existing signature.
+    const Default = ExpertsWith(TraceOps, FakeSource, TraceMath, .{ .prefill = true });
+    try testing.expect(Default.Arrays == BankArraysOf(u32));
+}
+
+test "mimo sdk2 experts: event waits register the native MXFP4 pair and the EXL3 triple in projection order" {
+    const a = testing.allocator;
+    var source = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{0} });
+    defer source.deinit();
+    const NativeWaitMath = struct {
+        pub const Projection = quant.GatherQmm.Arrays;
+        hidden: c_int,
+        inter: c_int,
+        pub fn EventProjection(comptime T: type) type {
+            return struct {
+                pub const count: usize = 2;
+                pub fn inputs(p: Projection(T)) [count]T {
+                    return .{ p.w, p.scales.? };
+                }
+                pub fn fromWaited(out: [count]T) Projection(T) {
+                    return .{ .w = out[0], .scales = out[1], .biases = null };
+                }
+            };
+        }
+        pub fn gateUp(_: *const @This(), _: *TraceOps, _: u32, _: u32, _: Projection(u32), _: Projection(u32)) !u32 {
+            return error.UnusedEventWaitMath;
+        }
+        pub fn down(_: *const @This(), _: *TraceOps, _: u32, _: u32, _: Projection(u32)) !u32 {
+            return error.UnusedEventWaitMath;
+        }
+    };
+    inline for (.{ NativeWaitMath, TraceMath }) |WaitMath| {
+        const ProjectionType = if (@hasDecl(WaitMath, "Projection")) WaitMath.Projection else ProjOf;
+        const Ex = ExpertsWith(TraceOps, FakeSource, WaitMath, .{ .gated = true });
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        var ex: Ex = .{ .a = a, .source = &source, .math = .{ .hidden = 256, .inter = 128 }, .hidden = 256, .n_experts = 16, .banks = &.{}, .g = &g };
+        const dtypes = if (comptime WaitMath == NativeWaitMath) [_]ops.Dtype{ .uint32, .uint8 } else [_]ops.Dtype{ .int16, .float16, .float16 };
+        var xs: [dtypes.len]u32 = undefined;
+        for (&xs, dtypes, 0..) |*x, dtype, i| x.* = try g.input(&.{ 2, @intCast(8 + i) }, dtype);
+        const projection: ProjectionType(u32) = if (comptime WaitMath == NativeWaitMath)
+            .{ .w = xs[0], .scales = xs[1], .biases = null }
+        else
+            .{ .code = xs[0], .rout = xs[1], .rin = xs[2] };
+        const deps = [_]u32{ try g.input(&.{1}, .float32), try g.input(&.{2}, .float32) };
+        const mark = g.mark();
+        const waited = try ex.waitProj(&g, projection, 17, &deps);
+        const aliases = if (comptime WaitMath == NativeWaitMath)
+            [_]u32{ waited.w, waited.scales.? }
+        else
+            [_]u32{ waited.code, waited.rout, waited.rin };
+        if (comptime WaitMath == NativeWaitMath) try testing.expect(waited.biases == null);
+        try testing.expectEqual(mark.n + xs.len, g.nodes.items.len);
+        try testing.expectEqual(xs.len, g.waits.items.len);
+        for (xs, aliases, 0..) |original, alias, i| {
+            try testing.expectEqual(@as(u32, @intCast(mark.n + i)), alias);
+            try testing.expect(alias != original);
+            try testing.expectEqual(ops.Op.event_wait, g.nodes.items[alias].op);
+            try testing.expectEqual(g.dtypeOf(original), g.dtypeOf(alias));
+            try testing.expect(g.shapeOf(original).eql(g.shapeOf(alias)));
+            try testing.expectEqual(TraceOps.Wait{ .value = 17, .n_deps = deps.len }, g.waits.items[i]);
+        }
+        // Registered aliases belong to the graph scope; the source arrays predate it.
+        g.resetTo(mark);
+        try testing.expectEqual(TraceOps.Freed{ .from = @intCast(mark.n), .to = @intCast(mark.n + xs.len) }, g.freed.items[0]);
+        for (xs) |x| try testing.expect(x < mark.n);
+    }
+}
+
+/// A test-only profile hook proves the optional math hook receives the shared
+/// schedule's charges without reading clocks or initializing MLX.
+const SmallPrefillProfile = struct {
+    pub const enabled = true;
+    pub const Mode = prof.Mode;
+    pub var wide_calls: u32 = 0;
+    pub var charges: u32 = 0;
+    pub fn now() u64 {
+        return 0;
+    }
+    pub fn charge(_: sdk_ext.profile.PrefillBucket, _: u64) void {
+        charges += 1;
+    }
+    pub fn setMode(_: Mode) void {}
+    pub fn countWideCall() void {
+        wide_calls += 1;
+    }
+};
+
+const SmallPrefillMath = struct {
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    pub const decode_forward_rows: u32 = 1;
+    pub const prefill_min_tokens: u32 = 2;
+    pub const wide_event_gates = true;
+    pub const Profile = SmallPrefillProfile;
+    d: Chain,
+    route: *RecRoute,
+    pub fn gateUp(self: *const SmallPrefillMath, g: *TraceOps, x: u32, ids: u32, gate: ProjOf(u32), up: ProjOf(u32)) !u32 {
+        return self.d.gateUp(g, x, ids, gate, up);
+    }
+    pub fn down(self: *const SmallPrefillMath, g: *TraceOps, h: u32, ids: u32, d: ProjOf(u32)) !u32 {
+        return self.d.down(g, h, ids, d);
+    }
+    pub fn prefill(self: *const SmallPrefillMath, g: *TraceOps, _: u32, x: u32, rows: quant.PrefillRows, bank: BankArraysOf(u32)) !u32 {
+        const mark = g.mark();
+        const y = g.keep(try self.route.call(g, x, rows, bank));
+        g.resetTo(mark);
+        return y;
+    }
+    pub fn finishPrefill(self: *const SmallPrefillMath, g: *TraceOps) !void {
+        return self.route.finish(g);
+    }
+};
+
+test "mimo sdk2 experts: top8 one-token decode and two-token prefill preserve assignments with generic config" {
+    const a = testing.allocator;
+    // This is deliberately a different architecture's minimal config type.
+    const c = .{ .hidden_size = @as(u32, 256), .n_layers = @as(u32, 1), .n_routed_experts = @as(u32, 32), .n_experts_per_tok = @as(u32, 8) };
+    const decode_config = testConfig(256, 128, 1);
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 32, .rows = &.{8}, .records_per_part = 2 });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    src.trace = &g;
+    RecRoute.source = &src;
+    defer RecRoute.source = null;
+    var rec = RecRoute.init(a);
+    defer rec.deinit(&g);
+    SmallPrefillProfile.wide_calls = 0;
+    SmallPrefillProfile.charges = 0;
+    const Ex = ExpertsWith(TraceOps, FakeSource, SmallPrefillMath, .{ .prefill = true });
+    var ex = try Ex.init(a, &g, &src, .{ .d = SmallPrefillMath.Chain.init(.{}, &decode_config), .route = &rec }, &c);
+    defer ex.deinit();
+    const prefill_ids = [_]u16{ 0, 1, 2, 3, 4, 5, 6, 7, 4, 5, 6, 7, 8, 9, 10, 11 };
+    var script: Script = .{ .calls = &.{ &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &prefill_ids } };
+    g.host_values = script.values();
+    const decode = try ex.at(0).routed(&g, try g.input(&.{ 1, 256 }, .bfloat16), try g.input(&.{ 1, 8 }, .int32));
+    try testing.expect(g.shapeOf(decode).eql(ops.Shape.of(&.{ 1, 8, 256 })));
+    try testing.expectEqual(@as(usize, 0), rec.calls.items.len);
+    try ex.flush();
+    const prefill = try ex.at(0).routed(&g, try g.input(&.{ 2, 256 }, .bfloat16), try g.input(&.{ 2, 8 }, .int32));
+    try testing.expect(g.shapeOf(prefill).eql(ops.Shape.of(&.{ 2, 8, 256 })));
+    try testing.expect(rec.calls.items.len > 0);
+    var seen: [2]u32 = @splat(0);
+    for (rec.calls.items) |call| {
+        try testing.expectEqual(call.slot.len, call.act_row.len);
+        for (call.act_row) |token| seen[token] += 1;
+        // Each group's rows are evaluated before release makes its slots reusable.
+        const release_at = for (src.log.items[call.at..]) |event| {
+            if (event.kind == .release) break event.at;
+        } else return error.NoRelease;
+        var evaluated = false;
+        for (g.evals.items) |node| evaluated = evaluated or (node >= call.node and node <= release_at);
+        try testing.expect(evaluated);
+    }
+    try testing.expectEqualSlices(u32, &.{ 8, 8 }, &seen);
+    try testing.expectEqual(@as(u32, 1), SmallPrefillProfile.wide_calls);
+    try testing.expect(SmallPrefillProfile.charges > 0);
+    try ex.flush();
+    try testing.expectEqual(@as(usize, 0), src.liveCalls());
+}
+
+test "mimo sdk2 experts: wide gates wait for the current group's complete reads and keep aliases through its drain" {
+    const a = testing.allocator;
+    var c = testConfig(256, 128, 1);
+    c.n_routed_experts = 64;
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const PlainMath = WithPrefillRoutes(TraceOps, Chain, RecRoute);
+    inline for (.{ false, true }) |wide_gated| {
+        const Math = if (wide_gated) SmallPrefillMath else PlainMath;
+        const Ex = ExpertsWith(TraceOps, FakeSource, Math, .{ .prefill = true, .gated = true });
+        var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 64, .rows = &.{64} });
+        defer src.deinit();
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        src.trace = &g;
+        RecRoute.source = &src;
+        defer RecRoute.source = null;
+        var rrs = [_]RecRoute{RecRoute.init(a)};
+        defer rrs[0].deinit(&g);
+        const math: Math = if (wide_gated)
+            .{ .d = Chain.init(.{}, &c), .route = &rrs[0] }
+        else
+            .{ .d = Chain.init(.{}, &c), .routes = &rrs };
+        var ex = try Ex.init(a, &g, &src, math, &c);
+        defer ex.deinit();
+        const n = 12;
+        const k = 6;
+        var ids: [n * k]u16 = undefined;
+        for (&ids, 0..) |*id, i| id.* = @intCast(i % 64);
+        var script: Script = .{ .calls = &.{ &ids, &ids } };
+        g.host_values = script.values();
+        const xf = try g.input(&.{ n, 256 }, .bfloat16);
+        const indices = try g.input(&.{ n, k }, .int32);
+        _ = try ex.at(0).routed(&g, xf, indices);
+        try testing.expectEqual(@as(usize, 2), rrs[0].calls.items.len);
+        var kinds_buf: [64]u8 = undefined;
+        const kinds = kindsOf(src.log.items, &kinds_buf);
+        try testing.expectEqual(@as(usize, if (wide_gated) 2 else 0), std.mem.count(u8, kinds, "E"));
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, kinds, "r"));
+        if (wide_gated) {
+            try testing.expectEqual(@as(usize, 0), std.mem.count(u8, kinds, "g"));
+            try testing.expectEqual(@as(usize, 0), std.mem.count(u8, kinds, "d"));
+            try testing.expectEqual(@as(usize, 18), g.waits.items.len);
+            var lo: u64 = 0;
+            var group: usize = 0;
+            for (src.log.items) |event| if (event.kind == .gate) {
+                const ready = lo + 1 + event.part;
+                const rec = rrs[0].calls.items[group];
+                // Registration precedes this group's aliases and consumer, never a future group's wait.
+                try testing.expectEqual(@as(u32, @intCast(event.at)), rec.bank_code);
+                try testing.expect(rec.bank_code < rec.node);
+                for (g.waits.items[group * 9 ..][0..9]) |wait| try testing.expectEqual(TraceOps.Wait{ .value = ready, .n_deps = 0 }, wait);
+                // Prefill's inner scope releases its result graph while the bank's registered aliases stay outside it.
+                try testing.expectEqual(@as(u32, @intCast(rec.node)), g.freed.items[group].from);
+                try testing.expect(rec.bank_code + 9 <= g.freed.items[group].from);
+                lo = ready;
+                group += 1;
+            };
+            try testing.expectEqual(@as(usize, 2), group);
+        } else {
+            // DeepSeek's explicit wide route still uses host waits even with decode gates installed.
+            try testing.expect(std.mem.count(u8, kinds, "g") > 0);
+            try testing.expectEqual(@as(usize, 0), g.waits.items.len);
+        }
+        for (rrs[0].calls.items) |rec| {
+            const released = for (src.log.items[rec.at..]) |event| {
+                if (event.kind == .release) break event.at;
+            } else return error.NoRelease;
+            var drained = false;
+            for (g.evals.items) |at| drained = drained or (at > rec.node and at <= released);
+            try testing.expect(drained);
+        }
+        // Repeating the same groups serves only residents: no external event producer or alias.
+        const waits_before = g.waits.items.len;
+        src.log.clearRetainingCapacity();
+        _ = try ex.at(0).routed(&g, xf, indices);
+        try testing.expectEqual(waits_before, g.waits.items.len);
+        try testing.expectEqual(@as(usize, 0), std.mem.count(u8, kindsOf(src.log.items, &kinds_buf), "E"));
+        const original = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
+        for (rrs[0].calls.items[2..]) |rec| try testing.expectEqual(original, rec.bank_code);
+        try ex.flush();
+        try testing.expectEqual(@as(usize, 0), src.liveCalls());
+    }
+}
 
 test "dsv41 experts: a wide call routes its experts in groups and runs each bank's rows through the wide route" {
     const a = testing.allocator;
@@ -2928,6 +3281,115 @@ test "dsv41 experts: the gated route builds every wave at once over event-wait a
         if (p > 0) try testing.expect(part[0].n_deps > prev_deps);
         prev_deps = part[0].n_deps;
     }
+}
+
+/// A host-only architecture fixture whose router is already transposed and F32.
+const StageBPredictorMath = struct {
+    pub const predictor_decode_only = true;
+    inner: TraceMath,
+    pub fn predictorScores(g: *TraceOps, xf: u32, router: u32, correction: u32) !u32 {
+        return g.add(try g.sigmoid(try g.matmul(try g.astype(xf, .float32), router)), correction);
+    }
+    pub fn gateUp(self: *const StageBPredictorMath, g: *TraceOps, x: u32, ids: u32, gate: ProjOf(u32), up: ProjOf(u32)) !u32 {
+        return self.inner.gateUp(g, x, ids, gate, up);
+    }
+    pub fn down(self: *const StageBPredictorMath, g: *TraceOps, h: u32, ids: u32, bank: ProjOf(u32)) !u32 {
+        return self.inner.down(g, h, ids, bank);
+    }
+};
+
+test "mimo sdk2 stageB shared: an architecture predictor uses its borrowed transposed router and the DSV default stays exact" {
+    var g = TraceOps.init(testing.allocator);
+    defer g.deinit();
+    const xf = try g.input(&.{ 1, 64 }, .bfloat16);
+    const correction = try g.input(&.{16}, .float32);
+    const router = try g.input(&.{ 64, 16 }, .float32);
+    const native_start = g.nodes.items.len;
+    const Native = ExpertsWith(TraceOps, FakeSource, StageBPredictorMath, .{ .lookahead = true });
+    const native = try Native.nextScores(&g, xf, .{ .w = router, .bias = correction });
+    const native_ops = [_]ops.Op{ .astype, .matmul, .sigmoid, .add };
+    try testing.expectEqual(native_ops.len, g.nodes.items.len - native_start);
+    for (g.nodes.items[native_start..], native_ops) |node, op| try testing.expectEqual(op, node.op);
+    try testing.expect(g.shapeOf(native).eql(ops.Shape.of(&.{ 1, 16 })));
+    try testing.expectEqual(ops.Dtype.float32, g.dtypeOf(native));
+
+    const dsv_router = try g.input(&.{ 16, 64 }, .bfloat16);
+    const dsv_start = g.nodes.items.len;
+    const Default = ExpertsWith(TraceOps, FakeSource, TraceMath, .{ .lookahead = true });
+    const dsv = try Default.nextScores(&g, xf, .{ .w = dsv_router, .bias = correction });
+    const dsv_ops = [_]ops.Op{ .transpose, .matmul, .astype, .scalar, .logaddexp, .sqrt, .add };
+    try testing.expectEqual(dsv_ops.len, g.nodes.items.len - dsv_start);
+    for (g.nodes.items[dsv_start..], dsv_ops) |node, op| try testing.expectEqual(op, node.op);
+    try testing.expect(g.shapeOf(dsv).eql(ops.Shape.of(&.{ 1, 16 })));
+    try testing.expectEqual(ops.Dtype.float32, g.dtypeOf(dsv));
+}
+
+test "mimo sdk2 stageB shared: logical M1 prefill builds no prediction and decode predicts only a following layer" {
+    const a = testing.allocator;
+    var c = testConfig(64, 32, 2);
+    c.n_routed_experts = 16;
+    var src = try FakeSource.init(a, .{ .hidden = 64, .inter = 32, .n_experts = 16, .rows = &.{ 4, 4 } });
+    defer src.deinit();
+    src.selector = try expert_lookahead.Selector.init(a, 16, 8, std.math.inf(f32), 2);
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const Ex = ExpertsWith(TraceOps, FakeSource, StageBPredictorMath, .{ .lookahead = true });
+    var gates: [2]Ex.Gate = undefined;
+    for (&gates) |*gate| gate.* = .{ .w = try g.input(&.{ 64, 16 }, .float32), .bias = try g.input(&.{16}, .float32) };
+    var ex = try Ex.initWith(a, &g, &src, .{ .inner = .{ .hidden = 64, .inter = 32 } }, &c, .{ .gates = &gates });
+    defer ex.deinit();
+    const Reads = struct {
+        score_reads: u32 = 0,
+        fn ids(_: *anyopaque, out: []u16) anyerror!void {
+            const values = [_]u16{ 1, 2, 3, 4, 5, 6 };
+            try testing.expectEqual(values.len, out.len);
+            @memcpy(out, &values);
+        }
+        fn argmax(_: *anyopaque) anyerror!u32 {
+            return error.NoPicks;
+        }
+        fn f32s(ctx: *anyopaque, out: []f32) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.score_reads += 1;
+            for (out, 0..) |*score, e| score.* = 15 - @as(f32, @floatFromInt(e));
+        }
+    };
+    var reads: Reads = .{};
+    g.host_values = .{ .ctx = &reads, .ids = Reads.ids, .argmax = Reads.argmax, .f32s = Reads.f32s };
+    const xf = try g.input(&.{ 1, 64 }, .bfloat16);
+    const indices = try g.input(&.{ 1, 6 }, .int32);
+    const prefill_start = g.nodes.items.len;
+    _ = try ex.at(0).routed(&g, xf, indices);
+    try testing.expectEqual(@as(u32, 0), reads.score_reads);
+    try testing.expectEqual(@as(usize, 0), src.picks.items.len);
+    for (g.nodes.items[prefill_start..]) |node| try testing.expect(node.op != .sigmoid);
+    try ex.grow(&g, &.{ 8, 8 });
+    _ = try ex.at(0).routed(&g, xf, indices);
+    try testing.expectEqual(@as(u32, 1), reads.score_reads);
+    try testing.expectEqual(@as(usize, 1), src.picks.items.len);
+    try testing.expectEqual(@as(u32, 1), src.picks.items[0].layer);
+    _ = try ex.at(1).routed(&g, xf, indices);
+    try testing.expectEqual(@as(u32, 1), reads.score_reads);
+    try testing.expectEqual(@as(usize, 1), src.picks.items.len);
+    try ex.flush();
+    try testing.expectEqual(@as(usize, 0), src.liveCalls());
+    // The default DSV route keeps its prefill-tail prediction even on a source with a phase API.
+    var stock_src = try FakeSource.init(a, .{ .hidden = 64, .inter = 32, .n_experts = 16, .rows = &.{ 4, 4 } });
+    defer stock_src.deinit();
+    stock_src.selector = try expert_lookahead.Selector.init(a, 16, 8, std.math.inf(f32), 2);
+    const Stock = ExpertsWith(TraceOps, FakeSource, TraceMath, .{ .lookahead = true });
+    var stock_gates: [2]Stock.Gate = undefined;
+    for (&stock_gates) |*gate| gate.* = .{ .w = try g.input(&.{ 16, 64 }, .bfloat16), .bias = try g.input(&.{16}, .float32) };
+    var stock = try Stock.initWith(a, &g, &stock_src, .{ .hidden = 64, .inter = 32 }, &c, .{ .gates = &stock_gates });
+    defer stock.deinit();
+    try testing.expect(!stock_src.decoding());
+    const stock_start = g.nodes.items.len;
+    _ = try stock.at(0).routed(&g, xf, indices);
+    try testing.expectEqual(@as(u32, 2), reads.score_reads);
+    var sqrt_count: u32 = 0;
+    for (g.nodes.items[stock_start..]) |node| sqrt_count += @intFromBool(node.op == .sqrt);
+    try testing.expectEqual(@as(u32, 1), sqrt_count);
+    try stock.flush();
 }
 
 test "dsv41 experts: the read-ahead of layer l is scored by layer l + 1's router, none after the last" {

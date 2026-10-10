@@ -102,6 +102,16 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  *   - the stock entry points (q3ld_spec_step / _spec_stepn / _pre_read) behave as before (len = rec_len, the armed
  *     lengths): a uniform-record bank reads exactly as with the original pool.  ABI 2026092704 (original 2026092504).
  * ABI 2026100201.
+ *
+ * WITHDRAW (mimo/ahead-trim, 2026-10-10; ABI 2026101001): q3ld_withdraw(first) takes a demand job that no worker has
+ *   taken yet (still in the FIFO) back out of the queue, by its first ticket; the jobs behind it keep their order.  Its
+ *   tickets get ST_WITHDRAWN words (nothing read: no preadv, payload 0, no row written) and are published in ticket
+ *   order under the pool mutex, so they are terminal for waits and free for the ring's next submit.  A job a worker
+ *   has taken runs as submitted (0 = not queued).  Refused (-2) for a job whose bytes are promised elsewhere: a ticket
+ *   bound to a pre-range or waited on by a live event gate.  Its owner calls it when the job's records are no longer
+ *   needed before the drive reached them (P7 early_whole_trim: the read-ahead jobs still queued when the prompt call's
+ *   plans exist).  It never touches the speculative class (no claim is released; the prompt pass issues none).
+ *   Inject event kind 11 (withdrawn).
  */
 #include <errno.h>
 #include <mach/mach_time.h>
@@ -124,6 +134,7 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
 #define ST_OSERR 2
 #define ST_DEADLINE 3
 #define ST_SKIPPED 4
+#define ST_WITHDRAWN 5       /* q3ld_withdraw: the job left the queue unstarted; nothing read, no row written */
 
 #define MAX_SPEC 16
 #define MAX_SPEC_THREADS 3
@@ -345,7 +356,8 @@ static int nrules = 0;
 static uint64_t rng = 0;
 static int64_t delay_max = 0, spec_delay_max = 0;
 /* event log: kind (1 demand submit, 2 demand start, 3 spec start by thread 0, 8 spec start by a thread >= 1, 7 claimed
- * chunk start, 4 spec end, 5 adopt, 9 pre-range start, 10 pre-range served), qlen, busy, t, arg */
+ * chunk start, 4 spec end, 5 adopt, 9 pre-range start, 10 pre-range served, 11 demand job withdrawn), qlen, busy, t,
+ * arg */
 static int64_t *evlog = 0, evcap = 0, evn = 0;
 
 void q3ld_test_rules(int32_t n, const int64_t *off, const int64_t *code, const int64_t *arg) {
@@ -1249,6 +1261,40 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     return 0;
 }
 
+/* WITHDRAW: take the QUEUED demand job whose first ticket is `first` back out of the FIFO (no worker has taken it), the
+ * jobs behind it keeping their order; its tickets get ST_WITHDRAWN words (no preadv, payload 0, no row written) and are
+ * published in ticket order.  Returns 1 withdrawn; 0 not queued (a worker took it and it runs as submitted, it is done,
+ * or no queued job starts at `first`); -1 not running / bad ticket; -2 refused (a ticket bound to a pre-range or waited
+ * on by a live event gate: its bytes are promised elsewhere). */
+int q3ld_withdraw(int64_t first) {
+    if (first < 0) return -1;
+    pthread_mutex_lock(&mu);
+    if (!running || first >= nt) { pthread_mutex_unlock(&mu); return -1; }
+    int64_t k = 0;
+    while (k < qlen && queue[(qhead + k) % qcap].first != first) k++;
+    if (k == qlen) { pthread_mutex_unlock(&mu); return 0; }
+    const job_t job = queue[(qhead + k) % qcap];
+    for (int32_t i = 0; i < job.count; i++) {
+        int64_t t = first + i;
+        if (pre_of[t] || (gate_of[t] && gate_live(gate_of[t] - 1))) { pthread_mutex_unlock(&mu); return -2; }
+    }
+    for (int64_t m = k; m + 1 < qlen; m++) queue[(qhead + m) % qcap] = queue[(qhead + m + 1) % qcap];
+    __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);
+    int64_t now = q3ld_monotonic_ns();
+    for (int32_t i = 0; i < job.count; i++) {
+        int64_t *out = res + (first + i) * RES_W;
+        out[1] = out[2] = out[3] = out[4] = 0;
+        out[5] = out[6] = now;
+        out[7] = -1;
+        out[0] = ST_WITHDRAWN;
+        publish(first + i);
+    }
+    EV(11, first);
+    pthread_cond_broadcast(&spec_cv);          /* the demand queue got shallower: the speculative queue rule may pass */
+    pthread_mutex_unlock(&mu);
+    return 1;
+}
+
 /* settle every unclaimed record with tag <= cur: QUEUED dropped, parked dropped, running abandoned at the next
  * chunk boundary (caller holds mu).  Returns 1 when a running record was flagged. */
 static int settle(int64_t cur) {
@@ -1826,7 +1872,7 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026100201; }              /* EXL3_LANE_PORT 2026092704, original 2026092504 */
+int32_t q3ld_abi(void) { return 2026101001; }              /* WITHDRAW; 2026100201, EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }

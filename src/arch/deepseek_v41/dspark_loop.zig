@@ -12,6 +12,10 @@ const ops = @import("ops.zig");
 const graph = @import("graph.zig");
 const mdl = @import("model.zig");
 const ds = @import("dspark.zig");
+const acc = @import("../../sdk_ext.zig").acceptance;
+comptime {
+    std.debug.assert(ds.max_block + 1 <= acc.max_rows); // a verify block fits the acceptance graphs' row buffers
+}
 const dh = @import("dspark_head.zig");
 const first_cycle = @import("decode_first.zig");
 const dt = @import("decode_timers.zig");
@@ -25,7 +29,8 @@ pub const Config = struct {
     confidence_threshold: ?f64 = 0.5,
     /// `hybrid_install`'s causal lookup: a full native proposal extended from the history.
     lookup: ?struct { minimum_context: u32 = 2, extra_tokens: u32 = 2 } = .{},
-    acceptance: ds.Acceptance = .greedy,
+    /// The greedy requests' rule (`sdk_ext.acceptance.Rule`); sampled requests take exact speculative sampling.
+    acceptance: acc.Rule = .exact,
     /// Rows per prompt forward; `whole_prompt` runs it as one forward, chunked
     /// by the model's own rule (every chunk wider than a route takes runs
     /// through the wide lane: the served prompt pass).
@@ -121,7 +126,7 @@ pub fn Loop(comptime G: type) type {
         /// DRAFT_AHEAD: the block built during the last verify's wait, and whether that verify's outcome installed it.
         ahead: ?Ahead = null,
         /// The round's sampled request (`roundSampled`; null: the exact path, argmax rows and the typical test at T = 1).
-        sampling: ?ds.Sampling = null,
+        sampling: ?acc.Params = null,
         /// DRAFT_AHEAD's persistent inputs (kept from the first prebuild to `deinit`).
         ahead_in: ?H.AheadIn = null,
 
@@ -387,112 +392,30 @@ pub fn Loop(comptime G: type) type {
             if (self.sampling) |sm| return self.decideSampled(row2, drafts, rows, k_eff, base, sm);
             const tt = try g.argmax(row2, -1);
             const typ = switch (self.cfg.acceptance) {
-                .greedy => return .{ .tt = tt, .width = width },
+                .exact => return .{ .tt = tt, .width = width },
                 .typical => |t| t,
             };
             const drafted: u32 = @min(k_eff -| rows[0], width);
             if (drafted == 0) return .{ .tt = tt, .width = width };
-            const lg = try g.astype(try g.slice(row2, &.{ 0, 0 }, &.{ @intCast(drafted), vocab }, &.{ 1, 1 }), .float32);
-            const log_p = try g.sub(lg, try g.logsumexp(lg, -1, true));
-            const p = try g.exp(log_p);
-            const entropy = try g.neg(try g.sum(try g.mul(p, log_p), -1, false));
-            const floor = try g.minimum(try g.scalar(typ.eps, .float32), try g.mul(try g.scalar(typ.delta, .float32), try g.exp(try g.neg(entropy))));
-            var idb: [ds.max_block]i32 = undefined;
-            for (idb[0..drafted], drafts[rows[0]..][0..drafted]) |*d, v| d.* = @intCast(v);
-            const ids = try g.hostArray(std.mem.sliceAsBytes(idb[0..drafted]), &.{ @intCast(drafted), 1 }, .int32);
-            const typical = try g.greater(try g.reshape(try g.takeAlongAxis(p, ids, -1), &.{-1}), floor);
+            const typical = try acc.typicalFlags(g, row2, drafts[rows[0]..][0..drafted], typ);
             return .{ .tt = tt, .typical = typical, .width = width, .drafted = drafted };
         }
 
-        /// A sampled request's decision (`ds.Sampling`'s exact speculative rule, the host's `ds.refSpec`): the drafted
+        /// A sampled request's decision (`acc.sampledRows`, the host's `acc.specStep`): the drafted
         /// rows' acceptance flags (u < p(draft)) and every row's token: a drafted row's residual draw (its correction
         /// when it rejects), the first undrafted row's draw from p (the bonus). The verify's eval realises it; the
         /// flags take the typical flags' place in `acceptChunk`, the tokens the argmax rows'.
-        fn decideSampled(self: *Self, row2: T, drafts: []const u32, rows: [2]u32, k_eff: u32, base: u64, sm: ds.Sampling) !Decision {
+        fn decideSampled(self: *Self, row2: T, drafts: []const u32, rows: [2]u32, k_eff: u32, base: u64, sm: acc.Params) !Decision {
             const g = self.g;
             const width: u32 = @intCast(g.shapeOf(row2).dim(0));
             const drafted: u32 = @min(k_eff -| rows[0], width);
-            const sr = try sampledRows(g, row2, sm, base, drafts[rows[0]..][0..drafted]);
+            const sr = try acc.sampledRows(g, row2, sm, base, drafts[rows[0]..][0..drafted]);
             return .{ .tt = sr.tok, .typical = sr.accept, .width = width, .drafted = if (sr.accept != null) drafted else 0 };
         }
 
-        pub const SampledRows = struct { tok: T, accept: ?T, p: T };
-
-        /// A sampled request's rows (`ds.Sampling`; the host's reference `ds.refDistribution` / `ds.refSpec`): the
-        /// logits [W, V] tempered (x 1 / T, f32); top_k / top_p (when set: one descending sort per row, the kept set's
-        /// smallest tempered logit as its threshold, ties kept) and min_p (against the row's top probability) as a keep
-        /// mask; the kept set's probabilities p. The first `drafts.len` rows carry a draft x (a point-mass proposal):
-        /// `accept` (bool [drafts.len]) = u < p(x), u = `ds.drawU(seed, pos)`; their token is the residual's draw (p
-        /// with x zeroed); the other rows' token is p's draw; each draw the first token whose cumulative probability
-        /// reaches v x the row's total, v = `ds.drawV(seed, pos)`, pos = `base` + row + 1 (the drawn token's absolute
-        /// position). Two host arrays of W floats. `tok` is uint32 [W], as the argmax rows.
-        pub fn sampledRows(g: *G, row2: T, sm: ds.Sampling, base: u64, drafts: []const u32) !SampledRows {
-            const sh = g.shapeOf(row2);
-            const w = sh.dim(0);
-            const vocab = sh.dim(1);
-            const lt = try g.mul(try g.astype(row2, .float32), try g.scalar(1.0 / sm.temperature, .float32));
-            const ninf = try g.scalar(-std.math.inf(f64), .float32);
-            const zero = try g.scalar(0, .float32);
-            var keep: ?T = null;
-            if (sm.sorts()) {
-                const srt = try g.neg(try g.sort(try g.neg(lt), -1));
-                const ps = try g.softmax(srt, -1);
-                const rank = try g.reshape(try g.arange(0, @floatFromInt(vocab), 1, .int32), &.{ 1, vocab });
-                var kk: ?T = if (sm.top_k > 0) try g.less(rank, try g.scalar(@floatFromInt(sm.top_k), .int32)) else null;
-                if (sm.top_p < 1.0) {
-                    var pk = ps;
-                    if (kk) |m| {
-                        pk = try g.where(m, ps, zero);
-                        pk = try g.div(pk, try g.sum(pk, -1, true));
-                    }
-                    const before = try g.sub(try g.cumsum(pk, -1), pk);
-                    const kp = try g.less(before, try g.scalar(sm.top_p, .float32));
-                    kk = if (kk) |m| try g.logicalAnd(m, kp) else kp;
-                }
-                const count = try g.sum(try g.astype(kk.?, .int32), -1, true);
-                const thr = try g.takeAlongAxis(srt, try g.sub(count, try g.scalar(1, .int32)), -1);
-                keep = try g.greaterEqual(lt, thr);
-            }
-            if (sm.min_p) |mp| {
-                const base_l = if (keep) |k| try g.where(k, lt, ninf) else lt;
-                const pm = try g.softmax(base_l, -1);
-                const km = try g.greaterEqual(pm, try g.mul(try g.max(pm, -1, true), try g.scalar(mp, .float32)));
-                keep = if (keep) |k| try g.logicalAnd(k, km) else km;
-            }
-            const lf = if (keep) |k| try g.where(k, lt, ninf) else lt;
-            const p = try g.softmax(lf, -1);
-            // The draws' uniforms and each row's draft (-1: none, every row past the drafted ones).
-            const nw: usize = @intCast(w);
-            var vb: [ds.max_block + 1]f32 = undefined;
-            var xb: [ds.max_block + 1]i32 = undefined;
-            for (vb[0..nw], xb[0..nw], 0..) |*v, *x, i| {
-                v.* = ds.drawV(sm.seed, base + i + 1);
-                x.* = if (i < drafts.len) @intCast(drafts[i]) else -1;
-            }
-            const vv = try g.hostArray(std.mem.sliceAsBytes(vb[0..nw]), &.{ w, 1 }, .float32);
-            var src = p;
-            var accept: ?T = null;
-            if (drafts.len > 0) {
-                const xs = try g.hostArray(std.mem.sliceAsBytes(xb[0..nw]), &.{ w, 1 }, .int32);
-                const rank = try g.reshape(try g.arange(0, @floatFromInt(vocab), 1, .int32), &.{ 1, vocab });
-                // The residual (p - q)+ for a point-mass q at x: p with x zeroed (rows without a draft: p).
-                src = try g.where(try g.equal(rank, xs), zero, p);
-                var ub: [ds.max_block + 1]f32 = undefined;
-                for (ub[0..drafts.len], 0..) |*u, i| u.* = ds.drawU(sm.seed, base + i + 1);
-                const uu = try g.hostArray(std.mem.sliceAsBytes(ub[0..drafts.len]), &.{@intCast(drafts.len)}, .float32);
-                const nd: c_int = @intCast(drafts.len);
-                const px = try g.takeAlongAxis(try g.slice(p, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 }), try g.slice(xs, &.{ 0, 0 }, &.{ nd, 1 }, &.{ 1, 1 }), -1);
-                accept = try g.less(uu, try g.reshape(px, &.{-1}));
-            }
-            const cum = try g.cumsum(src, -1);
-            const total = try g.slice(cum, &.{ 0, vocab - 1 }, &.{ w, vocab }, &.{ 1, 1 });
-            const tok = try g.astype(try g.sum(try g.astype(try g.less(cum, try g.mul(vv, total)), .int32), -1, false), .uint32);
-            return .{ .tok = tok, .accept = accept, .p = p };
-        }
-
-        /// One round of a sampled request (`ds.Sampling.active`: null for a greedy one, the exact `round`).
-        pub fn roundSampled(self: *Self, ex: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: ?ds.Sampling, log: ?*CycleLog, stamp: anytype) !Round {
-            self.sampling = ds.Sampling.active(sampling);
+        /// One round of a sampled request (`acc.Params.active`: null for a greedy one, the exact `round`).
+        pub fn roundSampled(self: *Self, ex: anytype, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: ?acc.Params, log: ?*CycleLog, stamp: anytype) !Round {
+            self.sampling = acc.Params.active(sampling);
             defer self.sampling = null;
             return self.round(ex, a, t1, accepted_cap, log, stamp);
         }
@@ -504,7 +427,7 @@ pub fn Loop(comptime G: type) type {
             // The typical tier's flags, or a sampled request's acceptance flags (`decideSampled`) on either tier.
             if (d.typical) |ty| return try self.g.hostBool(ty, flags[0..d.drafted]);
             return switch (self.cfg.acceptance) {
-                .greedy => null,
+                .exact => null,
                 .typical => flags[0..0],
             };
         }
@@ -2693,7 +2616,7 @@ test "dsv41 dspark loop: the lane's recorded cycles replay decision for decision
     }
     var script: Script = .{ .n_experts = @intCast(c.n_routed_experts), .pick = f.tokens[0], .u32s = u32s.items, .f32s = f32s.items, .bools = bools.items };
     g.host_values = script.values();
-    const acceptance: ds.Acceptance = if (std.mem.eql(u8, f.arm, "typical")) .{ .typical = .{ .delta = @floatCast(f.delta.?) } } else .greedy;
+    const acceptance: acc.Rule = if (std.mem.eql(u8, f.arm, "typical")) .{ .typical = .{ .delta = @floatCast(f.delta.?) } } else .exact;
     var lp = Loop(TraceOps).init(&g, model, head, &st, caches[0..head.nStages()], .{ .confidence_threshold = f.confidence_threshold, .acceptance = acceptance, .max_tokens = f.max_tokens - 1 });
     defer lp.deinit();
     try testing.expectEqual(f.tokens[0], try lp.prefill(a, &ex, f.prompt));
@@ -2922,7 +2845,7 @@ test "dsv41 memory: the trace judges a lane write in place unless a kept handle 
 
 /// Two rounds of the typical tier from the shell's seed (the scripted mini model), `sampling` passed to `roundSampled`
 /// (null: `round`); the rounds' tokens and the trace's ops and evals for the comparisons below.
-fn sampledRounds(a: std.mem.Allocator, rig: *Rig, sampling: ?ds.Sampling, use_round: bool, out: *std.ArrayList(u32)) !void {
+fn sampledRounds(a: std.mem.Allocator, rig: *Rig, sampling: ?acc.Params, use_round: bool, out: *std.ArrayList(u32)) !void {
     var prompt: [12]u32 = undefined;
     for (&prompt, 0..) |*d, i| d.* = @intCast((i * 5 + 2) % 64);
     var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .lookup = null, .acceptance = .{ .typical = .{ .delta = 0.3 } }, .max_tokens = std.math.maxInt(u32) });
@@ -2957,7 +2880,7 @@ test "dsv41 dspark loop: sampling: a greedy request (T < 0.01 or top_k 1) runs t
     var ops_of: [3]std.ArrayList(ops.Op) = .{ .empty, .empty, .empty };
     defer for (&ops_of) |*o| o.deinit(a);
     var evals: [3]usize = undefined;
-    const cases = [_]struct { s: ?ds.Sampling, round: bool }{ .{ .s = null, .round = true }, .{ .s = .{ .temperature = 0.005, .seed = 9 }, .round = false }, .{ .s = .{ .temperature = 0.9, .top_k = 1, .seed = 9 }, .round = false } };
+    const cases = [_]struct { s: ?acc.Params, round: bool }{ .{ .s = null, .round = true }, .{ .s = .{ .temperature = 0.005, .seed = 9 }, .round = false }, .{ .s = .{ .temperature = 0.9, .top_k = 1, .seed = 9 }, .round = false } };
     for (cases, 0..) |cs, i| {
         var rig: Rig = undefined;
         try rig.init();
@@ -2977,7 +2900,7 @@ test "dsv41 dspark loop: sampling: a greedy request (T < 0.01 or top_k 1) runs t
 
 test "dsv41 dspark loop: sampling: a sampled request draws every verify row in the verify's eval (no extra sync); sorts only for top_k / top_p" {
     const a = testing.allocator;
-    for ([_]ds.Sampling{ .{ .temperature = 0.8, .seed = 11 }, .{ .temperature = 0.8, .top_p = 0.9, .top_k = 40, .min_p = 0.05, .seed = 11 } }) |sm| {
+    for ([_]acc.Params{ .{ .temperature = 0.8, .seed = 11 }, .{ .temperature = 0.8, .top_p = 0.9, .top_k = 40, .min_p = 0.05, .seed = 11 } }) |sm| {
         var rig: Rig = undefined;
         try rig.init();
         defer rig.deinit();
@@ -3021,7 +2944,7 @@ test "dsv41 dspark loop: sampling: a sampled request draws every verify row in t
 }
 
 // MLX on the CPU stream (DSV41_PHASE0B_MLX=1, MLX_DEFAULT_DEVICE=cpu): the lane's sampled rows (`sampledRows`) against the
-// host reference (`ds.refDistribution`, `ds.refSpec`) on fixed logits and drafts: the same seed gives the same accept /
+// host reference (`acc.distribution`, `acc.specStep`) on fixed logits and drafts: the same seed gives the same accept /
 // reject decisions and the same draws (residual and bonus) at T = 1, top_p = 1 and under the filters; p agrees to f32
 // rounding.
 test "dsv41 smoke 0b: sampling: the lane's accept / reject decisions and draws match the host reference (same seed, same tokens)" {
@@ -3039,12 +2962,12 @@ test "dsv41 smoke 0b: sampling: the lane's accept / reject decisions and draws m
     for (&lg) |*v| v.* = rng.random().floatNorm(f32) * 2.0;
     const row2 = try g.hostArray(std.mem.sliceAsBytes(&lg), &.{ W, V }, .float32);
     const base: u64 = 1234;
-    for ([_]ds.Sampling{ .{ .temperature = 1.0, .seed = 77 }, .{ .temperature = 0.7, .top_k = 20, .top_p = 0.9, .min_p = 0.02, .seed = 78 }, .{ .temperature = 1.6, .top_p = 0.5, .seed = 79 } }) |sm| {
+    for ([_]acc.Params{ .{ .temperature = 1.0, .seed = 77 }, .{ .temperature = 0.7, .top_k = 20, .top_p = 0.9, .min_p = 0.02, .seed = 78 }, .{ .temperature = 1.6, .top_p = 0.5, .seed = 79 } }) |sm| {
         var d: [V]f64 = undefined;
         // Drafts on the first 4 rows: each row's top token and a mid-ranked one, alternately; rows 4..5 undrafted.
         var drafts: [4]u32 = undefined;
         for (&drafts, 0..) |*dr, r| {
-            ds.refDistribution(lg[r * V ..][0..V], sm, &d);
+            acc.distribution(lg[r * V ..][0..V], sm, &d);
             var best: u32 = 0;
             for (d, 0..) |x, i| if (x > d[best]) {
                 best = @intCast(i);
@@ -3054,23 +2977,145 @@ test "dsv41 smoke 0b: sampling: the lane's accept / reject decisions and draws m
         for ([_][]const u32{ &drafts, &.{} }) |dd| {
             const m0 = g.mark();
             defer g.resetTo(m0);
-            const sr = try Loop(Mx).sampledRows(&g, row2, sm, base, dd);
+            const sr = try acc.sampledRows(&g, row2, sm, base, dd);
             var tok: [W]u32 = undefined;
             _ = try g.hostU32(sr.tok, &tok);
             var p: [W * V]f32 = undefined;
             _ = try g.hostF32(sr.p, &p);
-            var acc: [W]bool = undefined;
-            if (sr.accept) |a| _ = try g.hostBool(a, acc[0..dd.len]);
+            var flags: [W]bool = undefined;
+            if (sr.accept) |a| _ = try g.hostBool(a, flags[0..dd.len]);
             for (0..W) |r| {
-                ds.refDistribution(lg[r * V ..][0..V], sm, &d);
+                acc.distribution(lg[r * V ..][0..V], sm, &d);
                 for (d, p[r * V ..][0..V]) |want, got| try testing.expectApproxEqAbs(want, @as(f64, got), 1e-6);
-                const want = ds.refSpec(&d, if (r < dd.len) dd[r] else null, ds.drawU(sm.seed, base + r + 1), ds.drawV(sm.seed, base + r + 1));
+                const want = acc.specStep(&d, if (r < dd.len) dd[r] else null, null, acc.drawU(sm.seed, base + r + 1), acc.drawV(sm.seed, base + r + 1));
                 if (r < dd.len) {
-                    try testing.expectEqual(want.accept, acc[r]);
+                    try testing.expectEqual(want.accept, flags[r]);
                     // A rejected row's token is the residual's draw (an accepted row's is unused: the draft is kept).
                     if (!want.accept) try testing.expectEqual(want.tok, tok[r]);
                 } else try testing.expectEqual(want.tok, tok[r]);
             }
         }
     }
+}
+
+// The acceptance characterization (frozen before the lane moved onto `sdk_ext.acceptance`): the host reference's
+// decisions and the lane's traced rounds, for the exact tier, typical 0.5, typical 0.3, greedy requests and seeded
+// sampled requests. The constants were printed by this test on the pre-refactor tree (2504f2b5) and must hold bit for
+// bit after it.
+const char_w = 7;
+const char_v = 96;
+const char_sets = 24;
+const char_base: u64 = 1000;
+
+fn charLogits(seed: u64, lg: *[char_w * char_v]f32, drafts: *[char_w - 1]u32) void {
+    var rng: std.Random.DefaultPrng = .init(seed);
+    // Each set its own spread (the row's entropy), so the typical floor delta x exp(-H) separates 0.3 from 0.5.
+    const spread: f32 = 0.5 + 0.25 * @as(f32, @floatFromInt(seed % 16));
+    for (lg) |*v| v.* = rng.random().floatNorm(f32) * spread;
+    for (0..char_w) |r| {
+        const lead = rng.random().uintLessThan(u32, char_v);
+        lg[r * char_v + lead] += 1.0 + 7.0 * rng.random().float(f32);
+        if (r < char_w - 1) drafts[r] = switch (rng.random().uintLessThan(u32, 4)) {
+            0, 1 => lead,
+            2 => (lead + 1) % char_v,
+            else => rng.random().uintLessThan(u32, char_v),
+        };
+    }
+}
+
+const char_requests = [_]?acc.Params{ null, .{ .temperature = 0.005, .seed = 9 }, .{ .temperature = 0.8, .seed = 11 }, .{ .temperature = 0.7, .top_k = 20, .top_p = 0.9, .min_p = 0.02, .seed = 78 } };
+const char_rules = [_]acc.Rule{ .exact, .{ .typical = .{ .delta = 0.5 } }, .{ .typical = .{ .delta = 0.3 } } };
+
+/// One round's (accepted, next token) by the shared host reference (`acc.accept`); frozen from the pre-refactor path
+/// (the argmax rows and `acceptChunk`, the typical flags by the host's oracle at T = 1, `refDistribution` / `refSpec`).
+fn charPre(lg: *const [char_w * char_v]f32, drafts: *const [char_w - 1]u32, rule: acc.Rule, sampling: ?acc.Params) [2]u32 {
+    const r = acc.accept(rule, sampling, lg, drafts, null, char_base);
+    return .{ r.n_accepted, r.next_token };
+}
+
+test "dsv41 acceptance characterization: the host reference's decisions (exact, typical 0.5 / 0.3, greedy and seeded sampled requests)" {
+    var lg: [char_w * char_v]f32 = undefined;
+    var drafts: [char_w - 1]u32 = undefined;
+    var h = std.hash.Wyhash.init(0);
+    var got: [char_rules.len][char_requests.len][char_sets][2]u32 = undefined;
+    for (0..char_sets) |s| {
+        charLogits(20261007 + s, &lg, &drafts);
+        for (char_rules, 0..) |rule, ri| for (char_requests, 0..) |req, qi| {
+            got[ri][qi][s] = charPre(&lg, &drafts, rule, req);
+        };
+        // The sampled rows' distributions and the draws, bit for bit.
+        var d: [char_v]f64 = undefined;
+        for (char_requests[2..]) |req| for (0..char_w) |r| {
+            acc.distribution(lg[r * char_v ..][0..char_v], req.?, &d);
+            h.update(std.mem.sliceAsBytes(&d));
+            const uv = [2]f32{ acc.drawU(req.?.seed, char_base + r + 1), acc.drawV(req.?.seed, char_base + r + 1) };
+            h.update(std.mem.sliceAsBytes(&uv));
+        };
+    }
+    var hd = std.hash.Wyhash.init(0);
+    hd.update(std.mem.sliceAsBytes(&got));
+    // Frozen on 2504f2b5 (the pre-refactor lane): the decisions of all 288 rounds and the sampled rows' bits.
+    try testing.expectEqual(@as(u64, 0x46f527b6c0a2deb2), hd.final());
+    try testing.expectEqual(@as(u64, 0x90456622b2108d8e), h.final());
+    // Accepted drafts over the 24 sets, by rule (exact, typical 0.5, typical 0.3) and request (greedy, T 0.005, T 0.8,
+    // T 0.7 with the filters): typical accepts more as delta falls; a sampled request ignores the tier's rule.
+    const want_acc = [char_rules.len][char_requests.len]u32{ .{ 9, 9, 5, 9 }, .{ 11, 11, 5, 9 }, .{ 14, 14, 5, 9 } };
+    for (char_rules, 0..) |_, ri| for (char_requests, 0..) |_, qi| {
+        var n_acc: u32 = 0;
+        for (got[ri][qi]) |x| n_acc += x[0];
+        try testing.expectEqual(want_acc[ri][qi], n_acc);
+    };
+}
+
+/// The lane's two traced rounds (the scripted mini model) under `rule` and `sampling` (null: `round`): a digest of every
+/// node's op, dtype and shape, the evals, every host array's bytes and the tokens.
+fn charTrace(a: std.mem.Allocator, rule: acc.Rule, sampling: ?acc.Params, use_round: bool) !u64 {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    rig.g.record_host = true;
+    var script = scriptSampled(@intCast(rig.m.c.n_routed_experts));
+    rig.g.host_values = script.values();
+    var prompt: [12]u32 = undefined;
+    for (&prompt, 0..) |*d, i| d.* = @intCast((i * 5 + 2) % 64);
+    var lp = Loop(TraceOps).init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .lookup = null, .acceptance = rule, .max_tokens = std.math.maxInt(u32) });
+    defer lp.deinit();
+    const l0 = try lp.prefillLogits(a, &rig.ex, &prompt);
+    const t1 = try rig.g.hostArgmax(l0);
+    rig.g.release(l0);
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    var next = t1;
+    for (0..2) |_| {
+        const r = if (use_round) try lp.round(&rig.ex, a, next, 8, null, {}) else try lp.roundSampled(&rig.ex, a, next, 8, sampling, null, {});
+        defer a.free(r.tokens);
+        try out.appendSlice(a, r.tokens);
+        next = r.next_token;
+    }
+    try out.append(a, next);
+    var h = std.hash.Wyhash.init(0);
+    for (rig.g.nodes.items, 0..) |nd, i| {
+        h.update(std.mem.asBytes(&@intFromEnum(nd.op)));
+        h.update(std.mem.asBytes(&nd.dtype));
+        h.update(std.mem.sliceAsBytes(nd.shape.slice()));
+        if (rig.g.host_data.get(@intCast(i))) |bytes| h.update(bytes);
+    }
+    h.update(std.mem.sliceAsBytes(rig.g.evals.items));
+    h.update(std.mem.sliceAsBytes(out.items));
+    h.update(std.mem.asBytes(&lp.stats));
+    return h.final();
+}
+
+test "dsv41 acceptance characterization: the lane's traced rounds (exact, typical 0.5 / 0.3; greedy and seeded sampled requests)" {
+    const a = testing.allocator;
+    // Frozen on 2504f2b5. The trace keeps no scalar values (delta enters the graph as one): typical 0.5 and 0.3 trace
+    // alike; the host reference above separates them.
+    const want = [char_rules.len][char_requests.len]u64{
+        .{ 0xa96a55094f88cb75, 0xa96a55094f88cb75, 0xcf768b59fdf11ca2, 0x836171339f9f4d76 },
+        .{ 0x5a68c655006d7b69, 0x5a68c655006d7b69, 0xcf768b59fdf11ca2, 0x836171339f9f4d76 },
+        .{ 0x5a68c655006d7b69, 0x5a68c655006d7b69, 0xcf768b59fdf11ca2, 0x836171339f9f4d76 },
+    };
+    for (char_rules, 0..) |rule, ri| for (char_requests, 0..) |req, qi| {
+        try testing.expectEqual(want[ri][qi], try charTrace(a, rule, req, req == null));
+    };
 }

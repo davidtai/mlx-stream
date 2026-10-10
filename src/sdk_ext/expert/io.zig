@@ -26,6 +26,7 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_spec_streams(idle_busy: i32) c_int;
     pub extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
     pub extern fn q3ld_submit(fd: i32, file_size: i64, deadline: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
+    pub extern fn q3ld_withdraw(first: i64) c_int;
     pub extern fn q3ld_spec_step_len(fd: i32, file_size: i64, cur: i64, n: i32, bases: ?[*]const i64, len: i64) i32;
     pub extern fn q3ld_spec_state(out: *[spec_state_w * max_spec]i64) i32;
     pub extern fn q3ld_seq() i64;
@@ -60,7 +61,7 @@ pub const test_abi = if (builtin.is_test) struct {
     pub const status_words = res_w;
 } else struct {};
 
-pub const abi_version = 2026100201;
+pub const abi_version = 2026101001;
 pub const max_workers = 8;
 /// Records per job (one fill unit).
 pub const max_items = 8;
@@ -76,7 +77,8 @@ pub const pre_state_w = 5;
 /// `q3ld_submit` reads -1 as no deadline; 0 would expire every range at once.
 const no_deadline: i64 = -1;
 
-pub const Status = enum(i64) { ok = 0, short = 1, os_error = 2, deadline = 3, skipped = 4, pending = -1, _ };
+/// `withdrawn`: the job left the queue unread (`Pool.withdraw`): no preadv, no row written.
+pub const Status = enum(i64) { ok = 0, short = 1, os_error = 2, deadline = 3, skipped = 4, withdrawn = 5, pending = -1, _ };
 
 /// One range's status words, as the worker published them.
 pub const Result = struct {
@@ -310,6 +312,14 @@ pub const Pool = struct {
         return self;
     }
 
+    /// After the owned consumers settle: expire unbound reads and wait for the pool's activity to stop.
+    /// Ready speculative records and their tags stay intact. A timeout refuses the phase change.
+    pub fn quiesce(self: *Pool, timeout_ns: i64) error{ InvalidTimeout, Timeout }!void {
+        _ = self;
+        if (timeout_ns <= 0) return error.InvalidTimeout;
+        if (c.q3ld_quiesce(timeout_ns) != 0) return error.Timeout;
+    }
+
     /// Drains the queue, joins the workers (releasing every live gate), then
     /// frees what they wrote into.
     pub fn stop(self: *Pool) void {
@@ -340,6 +350,19 @@ pub const Pool = struct {
         const rc = c.q3ld_spec_step_len(fd.fd, @intCast(fd.size), cur, @intCast(bases.len), bases.ptr, len_i);
         if (rc < 0) return error.SpecRefused;
         return @intCast(rc);
+    }
+
+    /// Takes a demand job that no worker has taken yet back out of the queue, by its first ticket: true = withdrawn
+    /// (its tickets are published as `withdrawn`: nothing read, no row written; the jobs behind it keep their order);
+    /// false = it runs as submitted: a worker took it (or it is done), or its bytes are promised elsewhere (a ticket
+    /// bound to a pre-range or waited on by a live event gate: the C call's -2).
+    pub fn withdraw(self: *Pool, first: u32) error{PoolUnavailable}!bool {
+        _ = self;
+        return switch (c.q3ld_withdraw(first)) {
+            1 => true,
+            0, -2 => false,
+            else => error.PoolUnavailable,
+        };
     }
 
     /// Registers gates in the GPU's encode order: gate i waits for `counts[i]`
@@ -409,6 +432,13 @@ pub const Pool = struct {
         }
     }
 };
+
+test "mimo sdk2 stageB shared: phase quiescence rejects unbounded deadlines before touching the native pool" {
+    // This inert host object owns no mappings or tickets. Invalid deadlines must return before any C call.
+    var unstarted: Pool = .{ .allocator = std.testing.allocator, .staging = undefined, .res = &.{}, .log = &.{}, .published = &.{} };
+    try std.testing.expectError(error.InvalidTimeout, unstarted.quiesce(0));
+    try std.testing.expectError(error.InvalidTimeout, unstarted.quiesce(-1));
+}
 
 /// Test builds (-DQ3LD_INJECT): one scripted preadv fault at an aligned file
 /// offset (code 1 EINTR, 2 EIO, 3 zero return, 4 truncate to `arg` bytes, 5
