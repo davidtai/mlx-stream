@@ -345,17 +345,28 @@ pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, cfg: *const settin
     return mb.processBound(.{ .prompt = min_fill_rows, .decode = min_fill_rows });
 }
 
-/// The most decode rows the bill of `in` with decode at a request's `positions` admits under `target` (at most
-/// `max_rows`): the construction's bill at the request's own KV.
+/// The most decode units the bill of `in` with decode at a request's `positions` admits under `target` (at most
+/// `max_rows`): the construction's bill at the request's own KV, its slot rows' bytes exactly as `rowsAt` gives them
+/// (the linear fill's `per_row` takes each layer's share of a unit whole: up to a row a bank layer over them).
 pub fn requestRows(a: std.mem.Allocator, in: Inputs, positions: u64, baseline: u64, target: u64, max_rows: u32) !u32 {
     var req = in;
     req.decode_positions = positions;
-    const mb = try memoryBill(a, termsOf(req));
+    const t = termsOf(req);
+    const mb = try memoryBill(a, t);
     defer mb.free(a);
-    const rows = sdk.fill(mb, baseline, target, max_rows, 0) catch |e| switch (e) {
-        error.NativeBillDoesNotFit, error.NoSlotRows => return 0,
-    };
-    return rows.decode;
+    return billRows(mb, t.wired(1), in.bank, baseline, target, max_rows);
+}
+
+/// The most units at which `mb`'s decode total, its slot rows exact and their page tables over `wired` and them, stays
+/// within `target`.
+fn billRows(mb: sdk.MemoryBill, wired: u64, g: glm.Geometry, baseline: u64, target: u64, max_rows: u32) u32 {
+    const fixed = baseline + mb.fixed(.decode);
+    var r: u32 = max_rows;
+    while (r > 0) : (r -= 1) {
+        const slots = slotBytes(g, r);
+        if (fixed + slots + wireTables(wired + slots) <= target) break;
+    }
+    return r;
 }
 
 /// What decode adds past the handover's reading of a request at `positions`, beyond its grown rows: the decode window
@@ -517,6 +528,27 @@ test "glm bill: GLM-5.3's terms at 16K: 1.59 GB a row, the KV at 95.2 KB a posit
     try sdk.admit(mb, 10_000_000_000, rows, ceiling - 2 * gib);
     try testing.expectError(error.PromptOverTarget, sdk.admit(mb, 10_000_000_000, .{ .prompt = rows.prompt + 1, .decode = rows.decode }, ceiling - 2 * gib));
     std.debug.print("glm bill at 16K + 128K out, 240 GiB ceiling, 2 GiB margin, 10 GB baseline: {d} prompt / {d} decode rows per layer; prompt waves {d} B, decode waves {d} B\n", .{ rows.prompt, rows.decode, t.waves[0], t.waves[1] });
+}
+
+test "glm bill: the bill at a request counts its slot rows exactly: a unit past the linear fill's rounded-up shares" {
+    var c = try glm53Config();
+    defer c.deinit(testing.allocator);
+    var split: [150]glm.LayerSlots = undefined;
+    for (&split, 0..) |*l, i| l.* = if (i % 2 == 0) .{ .record_bytes = 3_579_904, .n_records = 592, .rows_per_unit = 4, .share = 148.0 / 128.0 } else .{ .record_bytes = 4_759_552, .n_records = 432, .rows_per_unit = 4, .share = 108.0 / 128.0 };
+    const g: glm.Geometry = .{ .layers = &split, .widest_record = 4_759_552, .widest_span = 3_000_000, .rows_per_id = 4 };
+    const cfg: settings.Config = .{ .max_context_tokens = 16448 };
+    const in: Inputs = .{ .model = &c, .bank = g, .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16448, .decode_positions = maxPositions(&cfg) };
+    const t = termsOf(in);
+    const mb = try memoryBill(testing.allocator, t);
+    defer mb.free(testing.allocator);
+    // A target that 101 units fit exactly: the linear fill (101 whole units) stops a unit short.
+    const baseline: u64 = 17_500_000_000;
+    const slots = slotBytes(g, 101);
+    const target = baseline + mb.fixed(.decode) + slots + wireTables(t.wired(1) + slots);
+    try testing.expectEqual(@as(u32, 101), try requestRows(testing.allocator, in, maxPositions(&cfg), baseline, target, maxUnits(g)));
+    try testing.expectEqual(@as(u32, 100), (try sdk.fill(mb, baseline, target, maxUnits(g), 0)).decode);
+    try testing.expectEqual(@as(u32, 100), try requestRows(testing.allocator, in, maxPositions(&cfg), baseline, target - 1, maxUnits(g)));
+    try testing.expectEqual(@as(u32, 0), try requestRows(testing.allocator, in, maxPositions(&cfg), baseline, baseline, maxUnits(g)));
 }
 
 test "glm bill: max_output bills the longest request's KV in decode; a request's own KV fills more rows" {
