@@ -170,6 +170,35 @@ Hadamard with suh / svh). They are independent implementations with disjoint cla
 `src/exl3_sushi_parity.zig` decodes sushi's own K3 mul1 fixture (`lib/sushi/src/exl3/fixtures/exl3_k3_linear.safetensors`
 in the host checkout) through this plugin's decoder and checks the result against sushi's reference bit for bit.
 
+## GLM-5.3 pack
+
+`scripts/convert_glm_bank.py` converts a Hugging Face MLX snapshot of GLM-5.3 (`model_type` `glm_moe_dsa`, affine
+3- or 4-bit experts, group 64) into a pack: the routed experts in `experts.bin` with the manifest
+`expert-manifest-affine-v1.json`, and the other tensors in safetensors shards. It needs Python 3 and numpy.
+
+```sh
+scripts/convert_glm_bank.py --src <snapshot> --dst <pack> --verify all \
+    --source-repo pipenetwork/GLM-5.3-MLX-mixed-4_8bit --source-revision <sha>
+```
+
+`--resume` continues a stopped run. `docs/glm53-pack-format.md` gives the format. The converter's tests:
+`python -I -m pytest scripts/test_convert_glm_bank.py` (needs mlx, numpy, pytest).
+
+`scripts/convert_glm_exl3_bank.py --src <EXL3 snapshot> --dst <pack> --residents-from <affine pack>` converts the
+EXL3 snapshot (mcg trellis experts at K3 or K4, 4 ranks) into an EXL3 pack: one record per mini-expert in
+`experts.bin`, hard links to the residents of an affine pack on the same filesystem and `mtp-residents.safetensors`.
+`docs/glm53-exl3-pack-format.md` gives the format. Its tests: `scripts/test_convert_glm_exl3_bank.py`.
+`--mtp-only --from-pack <EXL3 pack> --dst <affine pack>/mtp` writes the MTP layer alone (its residents, its experts
+in `mtp-experts.bin`, `mtp-manifest-exl3-v1.json`) for the MTP draft lane of an affine pack.
+
+`scripts/convert_glm_mxfp4_bank.py --src <MXFP4 snapshot> --dst <pack> --verify all` converts the compressed-tensors
+MXFP4 snapshot (`RedHatAI/GLM-5.3-MXFP4`: FP4 E2M1 codes, an E8M0 scale per 32 inputs) into an MXFP4 pack: one
+six-segment record per routed expert in `experts.bin` with `expert-manifest-mxfp4-v1.json`, the residents under MLX's
+mxfp4 labels (`.weight` U32, `.scales` U8, the bytes unchanged) and the MTP layer in `mtp/`. It needs Python 3 only.
+`docs/glm53-mxfp4-pack-format.md` gives the format. Its tests: `scripts/test_convert_glm_mxfp4_bank.py`.
+`scripts/test_glm_mxfp4_packing.py` checks on the release's own bytes that MLX's mxfp4 reads them as
+compressed-tensors does (needs the network, torch and compressed-tensors).
+
 ## Layout
 
 ```
@@ -186,7 +215,7 @@ src/fixtures/              test fixtures (bank peek, prefill wave samples, DSpar
 csrc/                      the C read pool, the MLX event / alloc shims and the profile-only timeline sources
 src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
 docs/                      design notes and the path map from the in-tree layout
-scripts/                   test_dsv41.sh, compile_kernels_offline.py
+scripts/                   test_dsv41.sh, compile_kernels_offline.py, convert_glm_bank.py and its tests
 ```
 
 This repository was imported from the mlx-serve fork at commit d38ef038, without its history. `docs/PATH_MAP.md`
