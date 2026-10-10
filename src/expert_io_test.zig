@@ -1429,3 +1429,81 @@ test "dsv41 io cov: a file shorter than its job's size, ending inside a range's 
     try testing.expectEqual(Status.short, pool.result(0).status);
     try testing.expectEqual(@as(i64, 200), pool.result(0).payload);
 }
+
+/// Page-aligned destination rows (each part a whole number of pages) for `n` records.
+const PageDests = struct {
+    buf: []align(std.heap.page_size_min) u8,
+    rows: [max_items][n_components]u64,
+
+    fn init(n: usize, lens: *const [n_components]u64, skew: usize) !PageDests {
+        var total: usize = 0;
+        for (lens.*) |l| total += l;
+        const page = std.heap.pageSize();
+        var d: PageDests = .{ .buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), total * n + page), .rows = undefined };
+        @memset(d.buf, 0xAA);
+        var off: usize = skew;
+        for (0..n) |i| for (lens.*, 0..) |l, k| {
+            d.rows[i][k] = @intFromPtr(d.buf.ptr) + off;
+            off += l;
+        };
+        return d;
+    }
+
+    fn deinit(self: *PageDests) void {
+        std.heap.page_allocator.free(self.buf);
+    }
+
+    fn expectRecord(self: *const PageDests, i: usize, image: []const u8, gu: u64, down: u64, lens: *const [n_components]u64) !void {
+        var at = gu;
+        for (0..n_components) |k| {
+            if (k == gu_components) at = down;
+            const row: [*]const u8 = @ptrFromInt(self.rows[i][k]);
+            try testing.expectEqualSlices(u8, image[at..][0..lens[k]], row[0..lens[k]]);
+            at += lens[k];
+        }
+    }
+};
+
+test "glm io: with direct reads a page-aligned range lands straight in its rows; an unaligned one, or the pool without them, takes the staging loop; every range lands the file's bytes" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(96 * page);
+    defer f.deinit();
+    // Whole pages per part (the GLM affine records' geometry), page-aligned records.
+    const lens = [n_components]u64{ 3 * page, page, page, 3 * page, page, page, 2 * page, page, page };
+    const n = 3;
+    var gu: [n]u64 = undefined;
+    var down: [n]u64 = undefined;
+    for (0..n) |i| {
+        gu[i] = (2 + 13 * i) * page;
+        down[i] = (60 + 5 * i) * page;
+    }
+    const Case = struct { direct: bool, skew: usize, want: i64 };
+    for ([_]Case{ .{ .direct = true, .skew = 0, .want = 2 * n }, .{ .direct = true, .skew = 64, .want = 0 }, .{ .direct = false, .skew = 0, .want = 0 } }) |cs| {
+        var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 64, .direct = cs.direct });
+        defer pool.stop();
+        var d = try PageDests.init(n, &lens, cs.skew);
+        defer d.deinit();
+        const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..n], &lens);
+        try pool.wait(first, 2 * n, 10 * std.time.ns_per_s);
+        for (0..n) |i| {
+            try d.expectRecord(i, f.image, gu[i], down[i], &lens);
+            try testing.expectEqual(Status.ok, pool.result(first + @as(u32, @intCast(i))).status);
+            try testing.expectEqual(Status.ok, pool.result(first + @as(u32, @intCast(n + i))).status);
+        }
+        try testing.expectEqual(cs.want, pool.counter(.direct_ranges));
+        // A direct gate/up range is one preadv of its six parts.
+        if (cs.want > 0) try testing.expectEqual(@as(i64, 1), pool.result(first).preadv_calls);
+    }
+    // A short read inside a part (the first preadv returns 5 pages and a half): the rest lands after it.
+    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 64, .direct = true });
+    defer pool.stop();
+    defer clearFaults();
+    var d = try PageDests.init(n, &lens, 0);
+    defer d.deinit();
+    injectFault(gu[1], 4, @intCast(5 * page / 2));
+    const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..n], &lens);
+    try pool.wait(first, 2 * n, 10 * std.time.ns_per_s);
+    for (0..n) |i| try d.expectRecord(i, f.image, gu[i], down[i], &lens);
+    try testing.expectEqual(@as(i64, 2 * n), pool.counter(.direct_ranges));
+    try testing.expectEqual(@as(i64, 2), pool.result(first + 1).preadv_calls);
+}

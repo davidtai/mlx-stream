@@ -54,4 +54,18 @@ comptime {
     _ = @import("sdk_ext.zig");
     _ = @import("ngram_table.zig");
     _ = @import("exl3_sushi_parity.zig");
+    _ = @import("glm_moe_dsa.zig");
+    _ = @import("glm_moe_dsa_bank.zig");
+    _ = @import("glm_moe_dsa_exl3_bank.zig");
+    _ = @import("glm_moe_dsa_exl3_quant.zig");
+    _ = @import("glm_moe_dsa_settings.zig");
+    _ = @import("glm_moe_dsa_bill.zig");
+    _ = @import("glm_moe_dsa_cache.zig");
+    _ = @import("glm_moe_dsa_graph.zig");
+    _ = @import("glm_moe_dsa_experts.zig");
+    _ = @import("glm_moe_dsa_module.zig");
+    _ = @import("glm_moe_dsa_plugin.zig");
+    _ = @import("glm_moe_dsa_parity.zig");
+    _ = @import("glm_moe_dsa_mtp.zig");
+    _ = @import("glm_moe_dsa_mtp_parity.zig");
 }

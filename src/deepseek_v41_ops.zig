@@ -568,6 +568,10 @@ pub const MlxOps = struct {
     pub fn exp(g: *MlxOps, x: T) !T {
         return g.op1(mlx.mlx_exp, x);
     }
+    /// `mx.log` (GLM-5.3's MTP lane: the typical test's entropy of a sampled row).
+    pub fn log(g: *MlxOps, x: T) !T {
+        return g.op1(mlx.mlx_log, x);
+    }
     pub fn sigmoid(g: *MlxOps, x: T) !T {
         return g.op1(mlx.mlx_sigmoid, x);
     }
@@ -621,6 +625,51 @@ pub const MlxOps = struct {
             _ = mlx.mlx_array_free(r);
             return e;
         };
+        return g.track(r);
+    }
+
+    /// `mx.quantized_matmul(x, w, scales, biases, transpose, group_size, bits, mode)` at a tensor's own bits and
+    /// group (`nn.QuantizedLinear` with `transpose`; mlx-lm's `QuantizedMultiLinear` either way). Affine carries
+    /// its biases; the fp modes pass none.
+    pub fn quantizedMatmul(g: *MlxOps, x: T, w: T, sc: T, biases: ?T, transpose_w: bool, bits: u32, group: u32, mode: sdk.QuantMode) !T {
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_quantized_matmul(&r, x, w, sc, biases orelse .{}, transpose_w, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
+    /// `mx.dequantize(w, scales, biases, group_size, bits, mode)` at a tensor's own bits and group, the default
+    /// output dtype (the scales' for affine).
+    pub fn dequantizeWith(g: *MlxOps, w: T, sc: T, biases: ?T, bits: u32, group: u32, mode: sdk.QuantMode) !T {
+        var r = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_dequantize(&r, w, sc, biases orelse .{}, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), .{}, .{}, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(r);
+            return e;
+        };
+        return g.track(r);
+    }
+
+    /// The gather quant's backend call (`sdk_ext.quant.GatherQmm`): `mx.gather_qmm(x, w, scales, biases,
+    /// rhs_indices=rhs, transpose=True, group_size, bits, mode, sorted_indices)` for a quantized bank, `mx.gather_mm(x,
+    /// w.T, rhs_indices=rhs)` for a dense one (mode null; never sorted: MLX's dense gather_mm is wrong with sorted
+    /// indices). x [rows, 1, in] -> [rows, 1, out].
+    pub fn gatherMatmul(g: *MlxOps, x: T, w: T, sc: ?T, biases: ?T, rhs: T, bits: u32, group: u32, mode: ?sdk.QuantMode, sorted: bool) !T {
+        if (mode != null and sc == null) return error.GatherScalesMissing;
+        var r = mlx.mlx_array_new();
+        if (mode) |m| {
+            mlx.check(mlx.mlx_gather_qmm(&r, x, w, sc.?, biases orelse .{}, .{}, rhs, true, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), m.cstr(), sorted, g.s)) catch |e| {
+                _ = mlx.mlx_array_free(r);
+                return e;
+            };
+        } else {
+            const wt = try g.transposeAxes(w, &.{ 0, 2, 1 });
+            mlx.check(mlx.mlx_gather_mm(&r, x, wt, .{}, rhs, false, g.s)) catch |e| {
+                _ = mlx.mlx_array_free(r);
+                return e;
+            };
+        }
         return g.track(r);
     }
 
@@ -2145,6 +2194,65 @@ test "dsv41 smoke 0b: the o-projection's wo_b as one gather_qmm over its [1, out
     _ = try g.hostF32(ref, &a);
     _ = try g.hostF32(got, &b);
     for (a, b) |r, v| try testing.expect(@abs(r - v) <= 1e-2 * (1 + @abs(r)));
+}
+
+comptime {
+    // The gather quant's adapter binds this backend (its `gatherMatmul` and the activation's ops).
+    sdk_ext.quant.checkAccepted(sdk_ext.quant.FromGatherMatmul(sdk_ext.quant.GatherQmm), MlxOps);
+}
+
+test "dsv41 smoke 0b: an affine 4-bit group-64 bank: gatherMatmul with biases equals each slot's quantizedMatmul and its dequantized product" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try MlxOps.init(testing.allocator, s);
+    defer g.deinit();
+    // Four slots of [out 64, in 128], quantized as mlx-lm stores them (affine, 4 bits, group 64: weight u32 [64, 16],
+    // scales and biases [64, 2]).
+    var ws: [4 * 64 * 128]f32 = undefined;
+    for (&ws, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 29)) - 14)) / 32.0;
+    const w = try g.astype(try g.hostArray(std.mem.sliceAsBytes(&ws), &.{ 4, 64, 128 }, .float32), .bfloat16);
+    var vec = mlx.mlx_vector_array{ .ctx = null };
+    try mlx.check(mlx.mlx_quantize(&vec, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var parts: [3]mlx.mlx_array = undefined;
+    for (&parts, 0..) |*p, i| {
+        p.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(p, vec, i));
+        p.* = try g.adopt(p.*);
+    }
+    try testing.expectEqualSlices(c_int, &.{ 4, 64, 16 }, g.shapeOf(parts[0]).slice());
+    try testing.expectEqualSlices(c_int, &.{ 4, 64, 2 }, g.shapeOf(parts[2]).slice());
+    var xs: [3 * 128]f32 = undefined;
+    for (&xs, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) / 8.0;
+    const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(&xs), &.{ 3, 1, 128 }, .float32), .bfloat16);
+    const rhs_v = [_]u32{ 2, 0, 2 };
+    const rhs = try g.hostArray(std.mem.sliceAsBytes(&rhs_v), &.{3}, .uint32);
+    const got = try g.astype(try g.gatherMatmul(x, parts[0], parts[1], parts[2], rhs, 4, 64, .affine, false), .float32);
+    try testing.expectEqualSlices(c_int, &.{ 3, 1, 64 }, g.shapeOf(got).slice());
+    var out: [3 * 64]f32 = undefined;
+    _ = try g.hostF32(got, &out);
+    for (rhs_v, 0..) |slot, r| {
+        const sl: c_int = @intCast(slot);
+        const one = struct {
+            fn of(gg: *MlxOps, a: MlxOps.T, i: c_int) !MlxOps.T {
+                const sh = gg.shapeOf(a);
+                return gg.reshape(try gg.slice(a, &.{ i, 0, 0 }, &.{ i + 1, sh.dim(1), sh.dim(2) }, &.{ 1, 1, 1 }), &.{ sh.dim(1), sh.dim(2) });
+            }
+        }.of;
+        const xr = try g.reshape(try g.slice(x, &.{ @intCast(r), 0, 0 }, &.{ @intCast(r + 1), 1, 128 }, &.{ 1, 1, 1 }), &.{ 1, 128 });
+        const q = try g.astype(try g.quantizedMatmul(xr, try one(&g, parts[0], sl), try one(&g, parts[1], sl), try one(&g, parts[2], sl), true, 4, 64, .affine), .float32);
+        const dq = try g.dequantizeWith(try one(&g, parts[0], sl), try one(&g, parts[1], sl), try one(&g, parts[2], sl), 4, 64, .affine);
+        const ref = try g.astype(try g.matmul(xr, try g.transpose(dq)), .float32);
+        var qv: [64]f32 = undefined;
+        var rv: [64]f32 = undefined;
+        _ = try g.hostF32(q, &qv);
+        _ = try g.hostF32(ref, &rv);
+        for (out[r * 64 ..][0..64], qv, rv) |a, b, c| {
+            try testing.expect(@abs(a - b) <= 1e-3 * (1 + @abs(b)));
+            try testing.expect(@abs(a - c) <= 2e-2 * (1 + @abs(c)));
+        }
+    }
 }
 
 test "dsv41 ops: an MLX wave scope frees its intermediates and keeps its output" {
