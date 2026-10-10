@@ -54,4 +54,6 @@ comptime {
     _ = @import("sdk_ext.zig");
     _ = @import("ngram_table.zig");
     _ = @import("exl3_sushi_parity.zig");
+    _ = @import("glm_moe_dsa.zig");
+    _ = @import("glm_moe_dsa_bank.zig");
 }
