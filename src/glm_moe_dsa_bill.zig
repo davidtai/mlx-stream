@@ -45,8 +45,11 @@ pub const decode_wave_fixed_bytes: u64 = 64 << 20;
 /// The page tables of `wired` bytes (`deepseek_v41_bill.wireTables`: the kernel's and the GPU's leaf entries per 16
 /// KiB page, the upper levels per 32 MiB and 64 GiB).
 pub const wireTables = @import("deepseek_v41_bill.zig").wireTables;
-/// What decode's grow leaves free of the box's RAM, in thousandths of it (`osReserveBytes`): past it, the decode steps
-/// slow down (the knee, measured on the box; macOS's memory pressure levels are fractions of the RAM).
+/// What decode's grow leaves free of the box's RAM, in thousandths of it (`osReserveBytes`): past the knee the decode
+/// steps slow down by half or more while the prompt pass does not. Measured on the 256 GB M5 Ultra (runs m2, k1 and k2,
+/// the coding workload at --ctx-size 16448): decode 5.5-6.1 tok/s up to 250.0 GB of the box's 274.9 GB used (9.0 %
+/// free), 2.1 tok/s at 252.0 GB (8.3 %), 1.7 tok/s at 255.2 GB; prefill 148 tok/s at every fill. 10 % keeps the grow
+/// 2.6 GB under the last fast reading (macOS's memory pressure levels are fractions of the RAM).
 pub const os_reserve_permille: u64 = 100;
 
 pub fn osReserveBytes(ram: u64) u64 {
