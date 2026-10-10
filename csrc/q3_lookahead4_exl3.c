@@ -1880,3 +1880,8 @@ int32_t q3ld_spec_idle_busy(void) { return spec_idle_busy; }
 int32_t q3ld_counters_n(void) { return SC_N; }
 int32_t q3ld_max_spec(void) { return MAX_SPEC; }
 int32_t q3ld_max_h(void) { return MAX_H; }
+
+#if defined(Q3LD_INJECT) && defined(__APPLE__)
+/* The plugin's test binaries only: the MiMo device microbench's command-buffer probe (csrc/mimo_gpu_probe.inc). */
+#include "mimo_gpu_probe.inc"
+#endif

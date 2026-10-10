@@ -3,9 +3,50 @@
 //! test block: the root adds no test of its own.
 
 pub const plugin = @import("root.zig").plugin;
+pub const plugin_mimo = @import("root.zig").plugin_mimo;
 pub const testing = @import("root.zig").testing;
 
 comptime {
+    _ = @import("arch/mimo_v2/root.zig");
+    _ = @import("arch/mimo_v2/config.zig");
+    _ = @import("arch/mimo_v2/settings.zig");
+    _ = @import("arch/mimo_v2/bill.zig");
+    _ = @import("arch/mimo_v2/kv.zig");
+    _ = @import("arch/mimo_v2/kv_update_profile.zig");
+    _ = @import("arch/mimo_v2/module.zig");
+    _ = @import("arch/mimo_v2/bank.zig");
+    _ = @import("arch/mimo_v2/source.zig");
+    _ = @import("arch/mimo_v2/event_fixture.zig");
+    _ = @import("arch/mimo_v2/predictor_fixture.zig");
+    _ = @import("arch/mimo_v2/sync_fixture.zig");
+    _ = @import("arch/mimo_v2/stream.zig");
+    _ = @import("arch/mimo_v2/route_trace.zig");
+    _ = @import("arch/mimo_v2/math.zig");
+    _ = @import("arch/mimo_v2/moe.zig");
+    _ = @import("arch/mimo_v2/m4_attribution.zig");
+    _ = @import("arch/mimo_v2/prefill_combine.zig");
+    _ = @import("arch/mimo_v2/barrier_residual.zig");
+    _ = @import("arch/mimo_v2/decode_barrier.zig");
+    _ = @import("arch/mimo_v2/decode_barrier_test.zig");
+    _ = @import("arch/mimo_v2/verify_lane_test.zig");
+    _ = @import("arch/mimo_v2/attention.zig");
+    _ = @import("arch/mimo_v2/decode_attention.zig");
+    _ = @import("arch/mimo_v2/glue.zig");
+    _ = @import("arch/mimo_v2/sliding.zig");
+    _ = @import("arch/mimo_v2/prefill_attention.zig");
+    _ = @import("arch/mimo_v2/fp8_linear.zig");
+    _ = @import("arch/mimo_v2/embed_rows.zig");
+    _ = @import("arch/mimo_v2/packed_attention.zig");
+    _ = @import("arch/mimo_v2/profile.zig");
+    _ = @import("arch/mimo_v2/prefill_timeline.zig");
+    _ = @import("arch/mimo_v2/mtp.zig");
+    _ = @import("arch/mimo_v2/draft.zig");
+    _ = @import("arch/mimo_v2/uncached_test.zig");
+    _ = @import("arch/mimo_v2/pagecache.zig");
+    _ = @import("arch/mimo_v2/gpu_warm.zig");
+    _ = @import("arch/mimo_v2/gpu_power.zig");
+    _ = @import("arch/mimo_v2/gpu_warm_test.zig");
+    _ = @import("arch/mimo_v2/gpu_warm_bench.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");

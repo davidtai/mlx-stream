@@ -14,6 +14,23 @@ pub const plugin = sdk.Plugin{
     .provides = .{ .arch = @import("arch/deepseek_v41/plugin.zig") },
 };
 
+/// MiMo-V2.6-Flash's prepared MXFP4 streaming pack: the package's second arch, over the same expert reader.
+pub const plugin_mimo = sdk.Plugin{
+    .name = "mlx-stream-mimo",
+    .api = .{ .major = 2, .minor = 0 },
+    .mlx = "v0.32.3",
+    .macos_only = true,
+    .provides = .{ .arch = @import("arch/mimo_v2/root.zig") },
+};
+
+/// What the host's glue calls for the second arch: its entry points, the context a load bills when the model sets
+/// none, and the positions a request may generate past that context (none: MiMo reserves generation inside it).
+pub const mimo = struct {
+    pub const arch = @import("arch/mimo_v2/root.zig");
+    pub const default_context: u64 = @import("arch/mimo_v2/settings.zig").fill_reserve_tokens;
+    pub const generation_headroom: u64 = 0;
+};
+
 /// What the host's tests read of the package, reached through the registry (`plugins.mlx_stream_testing`, null when a
 /// build leaves the plugin out): the arch's config fixture and settings type, the modules the host's reader proof
 /// drives, and the pins the conformance tests compare.
