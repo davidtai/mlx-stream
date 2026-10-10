@@ -731,7 +731,7 @@ test "glm exl3 bank: the stream reads each routed expert's minis into adjacent r
     try s.flush();
 }
 
-test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts over both its bank layers, each its own span, and their demand reads claim them" {
+test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts over both its bank layers, each its own span, claimable until the call's last route" {
     const a = testing.allocator;
     var c = try affine.tinyConfig(a);
     defer c.deinit(a);
@@ -744,16 +744,18 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
     defer b.deinit();
     var rows: [8]u32 = undefined;
     @memset(&rows, 2);
-    const s = try Stream.Stream.init(a, &b, .{ .rows = &rows, .max_route_ids = 8, .transient_rows = 16, .wide_depth = 2, .transient_release = true, .records_per_part = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 }, .lookahead = .{ .k = 8, .budget = 2, .preread = false } });
+    const s = try Stream.Stream.init(a, &b, .{ .rows = &rows, .max_route_ids = 8, .transient_rows = 16, .wide_depth = 2, .transient_release = true, .records_per_part = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 }, .lookahead = .{ .k = 8, .budget = 4, .preread = false } });
     defer s.deinit();
     _ = try s.releaseTransient();
     try s.grow(&rows);
-    // Routed layer 0's call: its K3 route held, its K4 route steps with the next layer's scores, top for expert 2 (K3)
-    // and expert 5 (K4) of routed layer 1, neither resident.
+    // Routed layer 0's call: its K3 route held, its K4 route steps with the next layer's scores, in order for experts
+    // 5 (K4), 2 (K3), 6 (K3), 7 (K4) of routed layer 1, none resident. Each speculative chunk held 100-200 ms on the
+    // two speculative threads: 5 and 2 in flight, 6 and 7 queued when the next call routes.
     var scores: [16]f32 = @splat(0);
-    scores[2] = 9;
-    scores[5] = 8;
-    // Each speculative chunk held 100-200 ms: both records are still read when the next call routes.
+    scores[5] = 9;
+    scores[2] = 8.5;
+    scores[6] = 8;
+    scores[7] = 7.5;
     const q3raw = struct {
         extern fn q3ld_test_spec_delay(max_ns: i64) void;
     };
@@ -764,23 +766,26 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
     for ([_]*Stream.Route{ r0, r1 }) |r| for (0..r.n_parts) |p| try s.waitDown(r, @intCast(p));
     s.release(r0);
     s.release(r1);
-    try testing.expectEqual(@as(u64, 2), s.stats().spec_issued);
-    // Routed layer 1's call claims both records (each read at its own bank layer's span), its rows the records' bytes.
-    const q0 = try s.routeHeld(2, &.{2});
-    const q1 = try s.route(3, &.{5}, &.{});
+    try testing.expectEqual(@as(u64, 4), s.stats().spec_issued);
+    // Routed layer 1's call: its held K3 route claims 2 (in flight) and reads 6 itself (queued); nothing is settled
+    // before its K4 route, which claims 5 and reads 7 itself. Every mini's two ranges of 2 and 5 are served from the
+    // records (5's read at its K4 span).
+    const q0 = try s.routeHeld(2, &.{ 2, 6 });
+    const q1 = try s.route(3, &.{ 5, 7 }, &.{});
     for ([_]*Stream.Route{ q0, q1 }) |r| for (0..r.n_parts) |p| try s.waitDown(r, @intCast(p));
-    // Claimed in flight by the call's two routes (the first takes no step: nothing settled before the second), every
-    // mini's two ranges served from the records (each record its own bank layer's span).
-    try testing.expectEqual(@as(u64, 2), s.stats().claimed);
-    try testing.expectEqual(@as(u64, 2), s.stats().spec_claimed_inflight);
-    try testing.expectEqual(@as(u64, 2 * 4 * 2), s.stats().adopt_ranges);
-    for ([_]struct { r: *Stream.Route, l: u32, e: u16 }{ .{ .r = q0, .l = 2, .e = 2 }, .{ .r = q1, .l = 3, .e = 5 } }) |x| {
-        const slot = x.r.plan.slotsOf()[0];
+    const st = s.stats();
+    try testing.expectEqual(@as(u64, 2), st.claimed);
+    try testing.expectEqual(@as(u64, 2), st.spec_cancelled);
+    try testing.expectEqual(@as(u64, 0), st.spec_expired);
+    try testing.expectEqual(@as(u64, 2 * 4 * 2), st.adopt_ranges);
+    for ([_]struct { r: *Stream.Route, l: u32 }{ .{ .r = q0, .l = 2 }, .{ .r = q1, .l = 3 } }) |x| {
         const geom = &b.layers[x.l];
-        const off = b.recordOffset(x.l, x.e);
-        for (geom.segments, 0..) |sg, ci| {
-            const row = s.slotRow(x.l, slot, @enumFromInt(ci));
-            for (0..geom.minis) |mi| try testing.expectEqualSlices(u8, img[off + mi * geom.record_bytes + sg.offset ..][0..sg.length], row[mi * sg.length ..][0..sg.length]);
+        for (x.r.plan.slotsOf(), [_]u16{ if (x.l == 2) 2 else 5, if (x.l == 2) 6 else 7 }) |slot, e| {
+            const off = b.recordOffset(x.l, e);
+            for (geom.segments, 0..) |sg, ci| {
+                const row = s.slotRow(x.l, slot, @enumFromInt(ci));
+                for (0..geom.minis) |mi| try testing.expectEqualSlices(u8, img[off + mi * geom.record_bytes + sg.offset ..][0..sg.length], row[mi * sg.length ..][0..sg.length]);
+            }
         }
     }
     s.release(q0);
