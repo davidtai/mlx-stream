@@ -27,20 +27,52 @@ pub const prefill_cache_bytes: u64 = 2 << 30;
 pub const decode_cache_bytes: u64 = 512 << 20;
 /// The process's host side: its footprint less MLX's active and cache (the read pool's staging and tables, the
 /// manifests, the module's host state, the server and the process itself), the whole footprint outside MLX, so no
-/// other term covers a process overhead. Measured on the box (run m1, plugin a2aa9bf, the coding workload at
-/// --ctx-size 16448): 0.240-0.475 GB constructed, 0.694-0.699 GB at the prompt pass's end, 0.711-0.715 GB at the
-/// handover, 0.792 GB (MTP depth 3) and 0.979 GB (MTP off) at the request's end; the largest, plus 0.27 GB for a
-/// second request's decode, rounded up to the next 50 MB.
+/// other term covers a process overhead. Measured on the box at --ctx-size 16448 (runs m1 and m2: plugin a2aa9bf and
+/// 4bf1112, the coding then the prose workload on one server, MTP off and depth 3): 0.240-0.475 GB constructed,
+/// 0.694-0.792 GB at the prompt pass's end and the handover, 0.792-1.003 GB at the requests' end; the largest, 1.003 GB,
+/// plus 0.25 GB. Freed GPU pages the kernel has not reclaimed yet read as host side for a while (12.4 GB once, after a
+/// decode at the box's knee): the handover's settle waits for them (`glm_moe_dsa_module.settle`).
 pub const host_side_bytes: u64 = 1_250_000_000;
 /// The host side's rise from the handover's reading to the request's end (decode's own host state), the term the
-/// live grow adds to its reading: measured 0.264 GB over 1,024 serial steps and 0.098 GB over 319 MTP rounds (run m1),
-/// the larger plus 0.036 GB, rounded up to the next 50 MB.
-pub const decode_host_rise_bytes: u64 = 300_000_000;
+/// live grow adds to its reading: measured 0.095-0.300 GB over 1,024 tokens (runs m1 and m2; the most, MTP off), plus
+/// 0.05 GB.
+pub const decode_host_rise_bytes: u64 = 350_000_000;
 /// The decode step's fixed part (the token's projections, the shared expert, the head's logits and their copies).
 pub const decode_wave_fixed_bytes: u64 = 64 << 20;
 /// The page tables of `wired` bytes (`deepseek_v41_bill.wireTables`: the kernel's and the GPU's leaf entries per 16
 /// KiB page, the upper levels per 32 MiB and 64 GiB).
 pub const wireTables = @import("deepseek_v41_bill.zig").wireTables;
+/// What decode leaves free of the box's RAM, in thousandths of it (`osReserveBytes`): past it, the decode steps slow
+/// down (the knee, measured on the box; macOS's memory pressure levels are fractions of the RAM).
+pub const os_reserve_permille: u64 = 91;
+
+pub fn osReserveBytes(ram: u64) u64 {
+    return ram / 1000 * os_reserve_permille;
+}
+
+/// The box's used memory each phase fills up to: the prompt phase the host's target (its ceiling less its wired
+/// margin), decode at most the box's RAM less the OS reserve as well (no RAM reading: the host's alone).
+pub const Targets = struct { prompt: u64, decode: u64 };
+
+pub fn targetsOf(ceiling: u64, wired_margin: u64, ram: u64) Targets {
+    const host = ceiling -| wired_margin;
+    return .{ .prompt = host, .decode = if (ram == 0) host else @min(host, ram -| osReserveBytes(ram)) };
+}
+
+/// The fill at each phase's target (`sdk.fill` at each): the most decode rows under decode's target, then the most
+/// prompt rows under the prompt's, at most the decode rows; refused by name below `min_rows`.
+pub fn fillTargets(mb: sdk.MemoryBill, baseline: u64, t: Targets, n_experts: u32, min_rows: u32) error{ NoSlotRows, NativeBillDoesNotFit }!sdk.Rows {
+    const decode = (try sdk.fill(mb, baseline, t.decode, n_experts, 0)).decode;
+    const prompt = @min((try sdk.fill(mb, baseline, t.prompt, n_experts, 0)).prompt, decode);
+    if (prompt < min_rows) return error.NativeBillDoesNotFit;
+    return .{ .prompt = prompt, .decode = decode };
+}
+
+/// Both phases within their targets at `rows` (`sdk.admit` per phase).
+pub fn admitTargets(mb: sdk.MemoryBill, baseline: u64, rows: sdk.Rows, t: Targets) error{ PromptOverTarget, DecodeOverTarget }!void {
+    if (mb.total(.prompt, baseline, rows.prompt) > t.prompt) return error.PromptOverTarget;
+    if (mb.total(.decode, baseline, rows.decode) > t.decode) return error.DecodeOverTarget;
+}
 
 /// The stream the module builds, as the bill charges it.
 pub const StreamShape = struct {
@@ -349,7 +381,7 @@ pub const BillLine = struct {
     mb: *const sdk.MemoryBill,
     rows: sdk.Rows,
     baseline: u64,
-    target: u64,
+    targets: Targets,
     context: u64,
     decode_positions: u64,
 
@@ -359,8 +391,8 @@ pub const BillLine = struct {
             const at = if (t.with_rows) [2]u64{ b.mb.total(.prompt, 0, b.rows.prompt) - b.mb.fixed(.prompt) - b.rows.prompt * b.mb.per_row, b.mb.total(.decode, 0, b.rows.decode) - b.mb.fixed(.decode) - b.rows.decode * b.mb.per_row } else t.bytes;
             try w.print("{s} {s} {d} / {d} B", .{ if (i == 0) "" else ",", t.name, at[0], at[1] });
         }
-        try w.print("; a row {d} B; prompt {d} rows {d} B, decode {d} rows {d} B, baseline {d} B, target {d} B", .{
-            b.mb.per_row, b.rows.prompt, b.mb.total(.prompt, b.baseline, b.rows.prompt), b.rows.decode, b.mb.total(.decode, b.baseline, b.rows.decode), b.baseline, b.target,
+        try w.print("; a row {d} B; prompt {d} rows {d} B of its {d} B target, decode {d} rows {d} B of its {d} B target, baseline {d} B", .{
+            b.mb.per_row, b.rows.prompt, b.mb.total(.prompt, b.baseline, b.rows.prompt), b.targets.prompt, b.rows.decode, b.mb.total(.decode, b.baseline, b.rows.decode), b.targets.decode, b.baseline,
         });
     }
 };
@@ -494,9 +526,32 @@ test "glm bill: the bill line lists every term and each phase's total at the row
     const mb = try memoryBill(testing.allocator, termsOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16384, .decode_positions = maxPositions(&cfg) }));
     defer mb.free(testing.allocator);
     const rows: sdk.Rows = .{ .prompt = 100, .decode = 110 };
-    const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{BillLine{ .mb = &mb, .rows = rows, .baseline = 1, .target = 2, .context = 16384, .decode_positions = maxPositions(&cfg) }});
+    const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{BillLine{ .mb = &mb, .rows = rows, .baseline = 1, .targets = .{ .prompt = 2, .decode = 3 }, .context = 16384, .decode_positions = maxPositions(&cfg) }});
     defer testing.allocator.free(s);
     for (mb.terms) |t| try testing.expect(std.mem.indexOf(u8, s, t.name) != null);
-    var want: [64]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, s, try std.fmt.bufPrint(&want, "decode 110 rows {d} B", .{mb.total(.decode, 1, 110)})) != null);
+    var want: [96]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, s, try std.fmt.bufPrint(&want, "decode 110 rows {d} B of its 3 B target", .{mb.total(.decode, 1, 110)})) != null);
+}
+
+test "glm bill: decode's target keeps the OS reserve free of the box's RAM; the prompt's is the host's" {
+    const gib: u64 = 1 << 30;
+    const ram: u64 = 274_877_906_944;
+    const t = targetsOf(240 * gib, 2 * gib, ram);
+    try testing.expectEqual(240 * gib - 2 * gib, t.prompt);
+    try testing.expectEqual(@min(t.prompt, ram - osReserveBytes(ram)), t.decode);
+    // A box whose RAM leaves the reserve under the host's target, and one without a RAM reading.
+    try testing.expectEqual(t.prompt, targetsOf(240 * gib, 2 * gib, 1 << 40).decode);
+    try testing.expectEqual(t.prompt, targetsOf(240 * gib, 2 * gib, 0).decode);
+    var c = try glm53Config();
+    defer c.deinit(testing.allocator);
+    const cfg: settings.Config = .{ .max_context_tokens = 16448 };
+    const mb = try memoryBill(testing.allocator, termsOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16448, .decode_positions = maxPositions(&cfg) }));
+    defer mb.free(testing.allocator);
+    const rows = try fillTargets(mb, 13_000_000_000, t, 256, min_fill_rows);
+    try admitTargets(mb, 13_000_000_000, rows, t);
+    try testing.expect(mb.total(.decode, 13_000_000_000, rows.decode + 1) > t.decode);
+    try testing.expect(rows.prompt <= rows.decode);
+    try testing.expectError(error.DecodeOverTarget, admitTargets(mb, 13_000_000_000, .{ .prompt = rows.prompt, .decode = rows.decode + 1 }, t));
+    // At one target the fill is the SDK's.
+    try testing.expectEqual(try sdk.fill(mb, 13_000_000_000, t.prompt, 256, min_fill_rows), try fillTargets(mb, 13_000_000_000, .{ .prompt = t.prompt, .decode = t.prompt }, 256, min_fill_rows));
 }

@@ -98,7 +98,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// The harness forced the rows (`expert_rows`): the handover grows to them, no live fill.
         forced_rows: bool,
         decoding: bool = false,
-        /// The bill's inputs (the handover bills its request's KV from them), the load's baseline and the target.
+        /// The bill's inputs (the handover bills its request's KV from them), the load's baseline and decode's target.
         inputs: bill_mod.Inputs,
         baseline: u64,
         target: u64,
@@ -138,27 +138,27 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             errdefer bank.deinit();
             // The admission: the prompt phase billed at the context, decode at the longest request (the context and
             // `max_output`), the rows filled up to the target (or forced).
-            const target = host.ceiling -| host.wired_margin;
+            const targets = bill_mod.targetsOf(host.ceiling, host.wired_margin, sdk.memory.totalMemBytes());
             const max_context = bill_mod.servedContext(cfg);
             const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag) };
             const mb = try bill_mod.memoryBill(gpa, bill_mod.termsOf(inputs));
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
-            const rows: sdk.Rows = if (cfg.expert_rows) |forced| .{ .prompt = @min(cfg.expert_prefill_rows orelse forced, forced), .decode = forced } else sdk.fill(mb, baseline, target, model.n_routed_experts, bill_mod.min_fill_rows) catch |e| {
-                log.err("glm_moe_dsa: admission refused: {s} (baseline {d} B, target {d} B, {d} B a row)\n", .{ @errorName(e), baseline, target, mb.per_row });
+            const rows: sdk.Rows = if (cfg.expert_rows) |forced| .{ .prompt = @min(cfg.expert_prefill_rows orelse forced, forced), .decode = forced } else bill_mod.fillTargets(mb, baseline, targets, model.n_routed_experts, bill_mod.min_fill_rows) catch |e| {
+                log.err("glm_moe_dsa: admission refused: {s} (baseline {d} B, targets {d} / {d} B, {d} B a row)\n", .{ @errorName(e), baseline, targets.prompt, targets.decode, mb.per_row });
                 return e;
             };
             if (rows.prompt > rows.decode or rows.decode > model.n_routed_experts) return error.InvalidRows;
-            sdk.admit(mb, baseline, rows, target) catch |e| {
-                log.err("glm_moe_dsa: admission refused before construction: {s} (prompt {d} B, decode {d} B, target {d} B)\n", .{ @errorName(e), mb.total(.prompt, baseline, rows.prompt), mb.total(.decode, baseline, rows.decode), target });
+            bill_mod.admitTargets(mb, baseline, rows, targets) catch |e| {
+                log.err("glm_moe_dsa: admission refused before construction: {s} (prompt {d} B of {d} B, decode {d} B of {d} B)\n", .{ @errorName(e), mb.total(.prompt, baseline, rows.prompt), targets.prompt, mb.total(.decode, baseline, rows.decode), targets.decode });
                 return e;
             };
-            log.info("glm_moe_dsa: admission {d} prompt / {d} decode rows per routed layer ({d}-token context, {d} generated, baseline {d} B, target {d} B)\n", .{ rows.prompt, rows.decode, max_context, cfg.maxOutput(), baseline, target });
-            log.info("{f}\n", .{bill_mod.BillLine{ .mb = &mb, .rows = rows, .baseline = baseline, .target = target, .context = max_context, .decode_positions = inputs.decode_positions }});
+            log.info("glm_moe_dsa: admission {d} prompt / {d} decode rows per routed layer ({d}-token context, {d} generated, baseline {d} B, targets {d} / {d} B)\n", .{ rows.prompt, rows.decode, max_context, cfg.maxOutput(), baseline, targets.prompt, targets.decode });
+            log.info("{f}\n", .{bill_mod.BillLine{ .mb = &mb, .rows = rows, .baseline = baseline, .targets = targets, .context = max_context, .decode_positions = inputs.decode_positions }});
 
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .target = target, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
+            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .target = targets.decode, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
             errdefer self.g.deinit();
             // The module owns its config's copy (the host's config keeps the parsed model's storage).
             self.model = if (self.cfg.model) |*m| m else unreachable;
@@ -389,7 +389,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
             const kv1 = self.kvAllocated();
-            const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + transient + kv0));
+            const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + transient + kv0), bill_mod.host_side_bytes);
             const box = Box.now(st.after);
             var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_rows[0], .rows = self.decode_rows[0], .target = self.target, .baseline = self.baseline, .box = box };
             if (!self.forced_rows) {
@@ -460,7 +460,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
             const kv1 = self.kvAllocated();
-            const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + freed + kv0));
+            const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + freed + kv0), bill_mod.host_side_bytes);
             _ = try self.ex.regrowTransient();
             var prev: usize = 0;
             _ = mlx.mlx_set_cache_limit(&prev, bill_mod.prefill_cache_bytes);
@@ -617,24 +617,25 @@ const LiveReader = struct {
 };
 
 /// After a phase change's frees (DeepSeek-V4.1's settle): `reader` read every `settle_poll_ms` until MLX's cache is
-/// empty and the footprint is at most `expected` (the reading before the frees, less them, plus what the change
-/// allocated) within `settle_tolerance_bytes`, at most `settle_max_ms`: the footprint's ledger can trail a release while
-/// the driver retires it. The last reading either way; `settled` says which.
-pub fn settle(reader: anytype, expected: u64) struct { after: Mem, waited_ms: u32, settled: bool } {
+/// empty, the footprint is at most `expected` (the reading before the frees, less them, plus what the change allocated)
+/// and the host side at most `host_bound` (freed GPU pages the kernel has not reclaimed yet count there: m2's second
+/// handover read 6.97 GB), each within `settle_tolerance_bytes`, at most `settle_max_ms`: the footprint's ledger can
+/// trail a release while the driver retires it. The last reading either way; `settled` says which.
+pub fn settle(reader: anytype, expected: u64, host_bound: u64) struct { after: Mem, waited_ms: u32, settled: bool } {
     const ok = struct {
-        fn f(m: Mem, e: u64) bool {
-            return m.cache == 0 and m.footprint <= e + settle_tolerance_bytes;
+        fn f(m: Mem, e: u64, h: u64) bool {
+            return m.cache == 0 and m.footprint <= e + settle_tolerance_bytes and m.hostSide() <= h + settle_tolerance_bytes;
         }
     }.f;
     var m = reader.now();
     var waited: u32 = 0;
-    while (!ok(m, expected) and waited < settle_max_ms) {
+    while (!ok(m, expected, host_bound) and waited < settle_max_ms) {
         if (m.cache != 0) reader.clearCache();
         reader.sleep(settle_poll_ms);
         waited += settle_poll_ms;
         m = reader.now();
     }
-    return .{ .after = m, .waited_ms = waited, .settled = ok(m, expected) };
+    return .{ .after = m, .waited_ms = waited, .settled = ok(m, expected, host_bound) };
 }
 
 /// A phase's memory between its start and its end readings (a prompt pass, a request's decode).
@@ -969,17 +970,25 @@ test "glm handover: the settle reads until the cache is empty and the footprint 
     var slept: u32 = 0;
     var cleared: u32 = 0;
     // A late buffer in the cache, then the footprint trailing the frees, then settled.
-    const lagging = [_]Mem{ .{ .cache = 4096, .footprint = 100_000_000_000 }, .{ .footprint = 100_000_000_000 }, .{ .footprint = 90_100_000_000 } };
-    const st = settle(Fake{ .readings = &lagging, .i = &i, .slept = &slept, .cleared = &cleared }, 90_000_000_000);
+    const lagging = [_]Mem{ .{ .cache = 4096, .active = 89_000_000_000, .footprint = 100_000_000_000 }, .{ .active = 89_000_000_000, .footprint = 100_000_000_000 }, .{ .active = 89_000_000_000, .footprint = 90_100_000_000 } };
+    const st = settle(Fake{ .readings = &lagging, .i = &i, .slept = &slept, .cleared = &cleared }, 90_000_000_000, 1_250_000_000);
     try testing.expect(st.settled);
     try testing.expectEqual(@as(u32, 2 * settle_poll_ms), st.waited_ms);
     try testing.expectEqual(@as(u32, 1), cleared);
     try testing.expectEqual(@as(u64, 90_100_000_000), st.after.footprint);
+    // Under the expected footprint, but freed pages still in it above MLX's bytes: the settle waits for them.
+    i = 0;
+    slept = 0;
+    const unreclaimed = [_]Mem{ .{ .active = 80_000_000_000, .footprint = 87_000_000_000 }, .{ .active = 80_000_000_000, .footprint = 81_000_000_000 } };
+    const st3 = settle(Fake{ .readings = &unreclaimed, .i = &i, .slept = &slept, .cleared = &cleared }, 90_000_000_000, 1_250_000_000);
+    try testing.expect(st3.settled);
+    try testing.expectEqual(@as(u32, settle_poll_ms), st3.waited_ms);
+    try testing.expectEqual(@as(u64, 81_000_000_000), st3.after.footprint);
     // Never down to it: the wait ends at its bound with the last reading, not settled.
     i = 0;
     slept = 0;
     const never = [_]Mem{.{ .footprint = 100_000_000_000 }};
-    const st2 = settle(Fake{ .readings = &never, .i = &i, .slept = &slept, .cleared = &cleared }, 90_000_000_000);
+    const st2 = settle(Fake{ .readings = &never, .i = &i, .slept = &slept, .cleared = &cleared }, 90_000_000_000, 1_250_000_000);
     try testing.expect(!st2.settled);
     try testing.expectEqual(settle_max_ms, st2.waited_ms);
     try testing.expectEqual(settle_max_ms, slept);
