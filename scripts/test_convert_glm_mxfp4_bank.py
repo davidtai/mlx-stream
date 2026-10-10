@@ -347,6 +347,18 @@ def flip(path, off):
         f.write(bytes([b[0] ^ 0xFF]))
 
 
+def test_resume_converts_a_layer_whose_first_record_differs(packed, tmp_path):
+    src, dst, t, words = packed
+    _, logical, record = geometry()
+    out = str(tmp_path / "r")
+    ok(convert(src, out))
+    flip(os.path.join(out, "experts.bin"), 1 * N_EXP * record + 5)
+    r = ok(convert(src, out, "--resume"))
+    assert "layer %d: first or last record differs from its sha256, converting it again" % SPARSE[1] in r.stdout
+    assert json.load(open(os.path.join(out, "convert-report.json")))["records_written"] == N_EXP
+    assert open(os.path.join(out, "experts.bin"), "rb").read() == open(os.path.join(dst, "experts.bin"), "rb").read()
+
+
 def test_verify_all_and_flipped_bytes(packed, tmp_path):
     src, dst, t, words = packed
     _, logical, record = geometry()
