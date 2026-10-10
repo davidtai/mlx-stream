@@ -386,6 +386,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         pub fn roundWith(self: *Self, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams, probe: ?*Probe) !sdk.DraftRound {
             const ln = self.mtp orelse return error.NoDraftLane;
             const t0 = self.nowNs();
+            const peak0 = self.g.peakFrom();
             const len = self.cache.len;
             if (len >= self.cache.cap) return error.ContextOverBill;
             const tracked = ln.tracked() == len and ln.n_pending >= 1;
@@ -422,6 +423,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             ln.counts.wall_ns += ns;
             ln.counts.draft_ns += t_draft - t0;
             ln.counts.verify_ns += t_verify - t_draft;
+            ln.counts.peak_rise = @max(ln.counts.peak_rise, self.g.peakAbove(peak0));
             if (self.decode_mark) |*dm| {
                 dm.steps += 1;
                 dm.tokens += rows;

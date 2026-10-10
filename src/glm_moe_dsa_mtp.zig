@@ -588,6 +588,8 @@ pub const Counts = struct {
     /// the rest of `wall_ns`).
     draft_ns: u64 = 0,
     verify_ns: u64 = 0,
+    /// The largest rise of MLX's high-water mark over a round's start (the round's transient, measured).
+    peak_rise: u64 = 0,
 };
 
 /// The lane's line at the request's end.
@@ -603,10 +605,11 @@ pub const Line = struct {
         const s = @as(f64, @floatFromInt(p.c.wall_ns)) / 1e9;
         try w.print("glm_moe_dsa: mtp depth {d} acceptance {s}", .{ p.depth, p.mode });
         if (std.mem.eql(u8, p.mode, "typical")) try w.print(" (delta {d})", .{p.delta});
-        try w.print(": {d} rounds ({d} without drafts), {d} drafted, {d} accepted ({d:.1}%), {d:.2} accepted / {d:.2} tokens per round, {d} tokens in {d:.2} s ({d:.1} tok/s; drafts {d:.2} s, verify {d:.2} s)", .{
+        try w.print(": {d} rounds ({d} without drafts), {d} drafted, {d} accepted ({d:.1}%), {d:.2} accepted / {d:.2} tokens per round, {d} tokens in {d:.2} s ({d:.1} tok/s; drafts {d:.2} s, verify {d:.2} s; round peak {d:.0} MB)", .{
             p.c.rounds,                                           p.c.serial,                                            p.c.drafted, p.c.accepted, rate,
             @as(f64, @floatFromInt(p.c.accepted)) / rounds,       @as(f64, @floatFromInt(p.c.generated)) / rounds,       p.c.generated, s,
             if (s == 0) 0 else @as(f64, @floatFromInt(p.c.generated)) / s, @as(f64, @floatFromInt(p.c.draft_ns)) / 1e9, @as(f64, @floatFromInt(p.c.verify_ns)) / 1e9,
+            @as(f64, @floatFromInt(p.c.peak_rise)) / 1e6,
         });
     }
 };
@@ -648,12 +651,19 @@ pub fn Lane(comptime kind: BankKind) type {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
             self.* = .{ .gpa = gpa, .cfg1 = layerConfig(c), .weights = w, .head = undefined, .bank = undefined, .cache = undefined, .depth = depth, .mode = mode };
+            var active0: usize = 0;
+            _ = mlx.mlx_get_active_memory(&active0);
             self.head = try Head.bind(g, &self.weights, c, diag);
             errdefer self.head.deinit(g);
             self.bank = try Bank.open(gpa, io, dir, c, &self.weights, diag);
             errdefer self.bank.deinit();
             self.cache = try graph.Cache.init(gpa, &self.cfg1, cap);
-            log.info("glm_moe_dsa: MTP lane depth {d}, acceptance {s}, {d} residents ({s})\n", .{ depth, sdk.acceptance.name(mode), self.weights.count(), path });
+            // The residents resident now (a lazy load would land in the first round), and their bytes as MLX counts them.
+            var it = self.weights.map.valueIterator();
+            while (it.next()) |v| try mlx.check(mlx.mlx_array_eval(v.*));
+            var active1: usize = 0;
+            _ = mlx.mlx_get_active_memory(&active1);
+            log.info("glm_moe_dsa: MTP lane depth {d}, acceptance {s}, {d} residents ({s}), {d} B resident with its experts (measured)\n", .{ depth, sdk.acceptance.name(mode), self.weights.count(), path, active1 -| active0 });
             return self;
         }
 
@@ -885,10 +895,10 @@ fn tinyText() ![]const u8 {
 }
 
 test "glm mtp: the request's line (the ABBA harness reads it): depth, acceptance, rounds, drafted, accepted, rate, per round, tok/s" {
-    const l: Line = .{ .depth = 3, .mode = "exact", .delta = 0, .c = .{ .rounds = 348, .drafted = 1042, .accepted = 676, .generated = 1024, .wall_ns = 207_560_000_000, .draft_ns = 9_000_000_000, .verify_ns = 190_000_000_000 } };
+    const l: Line = .{ .depth = 3, .mode = "exact", .delta = 0, .c = .{ .rounds = 348, .drafted = 1042, .accepted = 676, .generated = 1024, .wall_ns = 207_560_000_000, .draft_ns = 9_000_000_000, .verify_ns = 190_000_000_000, .peak_rise = 312_400_000 } };
     const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{l});
     defer testing.allocator.free(s);
-    try testing.expectEqualStrings("glm_moe_dsa: mtp depth 3 acceptance exact: 348 rounds (0 without drafts), 1042 drafted, 676 accepted (64.9%), 1.94 accepted / 2.94 tokens per round, 1024 tokens in 207.56 s (4.9 tok/s; drafts 9.00 s, verify 190.00 s)", s);
+    try testing.expectEqualStrings("glm_moe_dsa: mtp depth 3 acceptance exact: 348 rounds (0 without drafts), 1042 drafted, 676 accepted (64.9%), 1.94 accepted / 2.94 tokens per round, 1024 tokens in 207.56 s (4.9 tok/s; drafts 9.00 s, verify 190.00 s; round peak 312 MB)", s);
     const t: Line = .{ .depth = 2, .mode = "typical", .delta = 0.3, .c = .{ .rounds = 2, .drafted = 4, .accepted = 3, .generated = 5, .wall_ns = 1_000_000_000 } };
     const u = try std.fmt.allocPrint(testing.allocator, "{f}", .{t});
     defer testing.allocator.free(u);
