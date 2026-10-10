@@ -196,6 +196,7 @@ enum {
     SC_EV_WD_LAST_VALUE,  /* the value of the last forced gate */
     SC_EV_HOST_RELEASED,  /* gates the host released (error paths) */
     SC_EV_STOP_RELEASED,  /* live gates released at stop */
+    SC_DIRECT_RANGES,     /* demand ranges read straight into their rows (q3ld_direct_config: no staging, no copy) */
     SC_N
 };
 
@@ -464,8 +465,68 @@ static void gauge_exit(void) {
     pthread_mutex_unlock(&mu);
 }
 
+/* DIRECT: a range whose file offset, destination rows and part lengths are all page multiples is read straight into
+ * its rows by preadv (one iovec per part), no staging buffer and no scatter copy.  Off unless q3ld_direct_config. */
+static int direct_reads = 0;
+
+int q3ld_direct_config(int32_t on) {
+    direct_reads = on != 0;
+    return 0;
+}
+
+static int direct_ok(const job_t *job, const range_t *rg) {
+    if (!direct_reads || rg->offset % page_size) return 0;
+    int64_t total = 0;
+    for (int32_t d = 0; d < rg->ndst; d++) {
+        if (rg->len[d] == 0) continue;
+        if (rg->dst[d] % (uint64_t)page_size || rg->len[d] % page_size) return 0;
+        total += rg->len[d];
+    }
+    return total > 0 && rg->offset + total <= job->file_size;
+}
+
+/* the DIRECT read: preadv into the rows until every part is full; the status words as run_range's */
+static int run_range_direct(const job_t *job, const range_t *rg, int64_t *out) {
+    struct iovec iov[MAX_COMP];
+    int n = 0;
+    int64_t want = 0;
+    for (int32_t d = 0; d < rg->ndst; d++) {
+        if (!rg->len[d]) continue;
+        iov[n].iov_base = (void *)(uintptr_t)rg->dst[d];
+        iov[n].iov_len = (size_t)rg->len[d];
+        want += rg->len[d];
+        n++;
+    }
+    int64_t calls = 0, returned = 0, total = 0, t_start = 0;
+    int status = ST_OK, first = 0;
+    out[4] = 0;
+    while (total < want) {
+        if (LATE(job->deadline)) { status = ST_DEADLINE; break; }
+        calls++;
+        if (!t_start) t_start = q3ld_monotonic_ns();
+        ssize_t r = do_preadv(job->fd, iov + first, n - first, (off_t)(rg->offset + total));
+        if (r < 0) { out[4] = errno; status = ST_OSERR; break; }
+        if (r == 0) { status = ST_SHORT; break; }
+        returned += r;
+        total += r;
+        int64_t left = r;
+        while (first < n && left >= (int64_t)iov[first].iov_len) { left -= (int64_t)iov[first].iov_len; first++; }
+        if (first < n && left > 0) { iov[first].iov_base = (char *)iov[first].iov_base + left; iov[first].iov_len -= (size_t)left; }
+    }
+    pthread_mutex_lock(&mu);
+    sc[SC_DIRECT_RANGES] += 1;
+    pthread_mutex_unlock(&mu);
+    out[1] = calls;
+    out[2] = returned;
+    out[3] = total;
+    out[5] = t_start ? t_start : q3ld_monotonic_ns();
+    out[6] = q3ld_monotonic_ns();
+    return status;
+}
+
 /* one range: stock _readv_range_into_impl loop + _read_some steps; returns the status (q3_nativeissue.c) */
 static int run_range(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
+    if (direct_ok(job, rg)) return run_range_direct(job, rg, out);
     int64_t calls = 0, returned = 0, read_total = 0, t_start = 0;
     int status = ST_OK;
     int32_t d = 0;
@@ -1826,7 +1887,7 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026100201; }              /* EXL3_LANE_PORT 2026092704, original 2026092504 */
+int32_t q3ld_abi(void) { return 2026101001; }              /* EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }

@@ -62,6 +62,9 @@ pub const q3ld = struct {
     pub fn q3ld_monotonic_ns() i64 {
         return 0;
     }
+    pub fn q3ld_direct_config(_: i32) c_int {
+        return -1;
+    }
     pub fn q3ld_abi() i32 {
         return 0;
     }

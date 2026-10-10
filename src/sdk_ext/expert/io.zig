@@ -24,6 +24,7 @@ const io_util = @import("sdk").io_util;
 const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_spec_config(nthreads: i32, bufs: ?[*]const u64, nslots: i32, slot_bytes: i64, rec_len: i64, chunk: i64, counters: ?[*]i64) c_int;
     pub extern fn q3ld_spec_streams(idle_busy: i32) c_int;
+    pub extern fn q3ld_direct_config(on: i32) c_int;
     pub extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
     pub extern fn q3ld_submit(fd: i32, file_size: i64, deadline: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
     pub extern fn q3ld_spec_step_len(fd: i32, file_size: i64, cur: i64, n: i32, bases: ?[*]const i64, len: i64) i32;
@@ -60,7 +61,7 @@ pub const test_abi = if (builtin.is_test) struct {
     pub const status_words = res_w;
 } else struct {};
 
-pub const abi_version = 2026100201;
+pub const abi_version = 2026101001;
 pub const max_workers = 8;
 /// Records per job (one fill unit).
 pub const max_items = 8;
@@ -150,8 +151,9 @@ pub const Counter = enum(u8) {
     ev_wd_last_value = 69,
     ev_host_released = 70,
     ev_stop_released = 71,
+    direct_ranges = 72,
 };
-pub const counters_n = 72;
+pub const counters_n = 73;
 
 /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
 /// read by `threads` threads in `chunk_bytes` preadv steps.
@@ -173,6 +175,9 @@ pub const Options = struct {
     /// wider spans sizes it from the bank (`stream.Options.staging_from_bank`).
     staging_bytes: u64 = 9 << 20,
     tickets: u32 = 256,
+    /// A demand range whose file offset, destination rows and part lengths are all page multiples reads straight into
+    /// its rows (one preadv iovec per part), with no staging and no copy; any other range takes the staging loop.
+    direct: bool = false,
     spec: ?Spec = null,
 };
 
@@ -303,6 +308,7 @@ pub const Pool = struct {
         if (c.q3ld_spec_config(threads, &bufs, nslots, @intCast(slot_bytes), rec_len, @intCast(if (opt.spec) |s| s.chunk_bytes else 0), &self.counters) != 0)
             return error.PoolUnavailable;
         if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
+        _ = c.q3ld_direct_config(@intFromBool(opt.direct));
         var ptrs: [max_workers]u64 = undefined;
         for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
         const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
