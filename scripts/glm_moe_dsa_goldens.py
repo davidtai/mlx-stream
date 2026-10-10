@@ -8,7 +8,8 @@ snapshot, converted into a pack by the converter, and the reference's logits wri
 
   scripts/glm_moe_dsa_goldens.py --reference <glm_moe_dsa.py> --converter <convert_glm_bank.py> --out <dir> [--seed N]
 
-Writes <dir>/snapshot (the MLX snapshot) and <dir>/pack (the pack and goldens.json). Cases: `selected` (a prompt
+Writes <dir>/snapshot (the MLX snapshot) and <dir>/pack (the pack and goldens.json; goldens-gpu.json with
+--device gpu: the weights are built on the CPU either way, the logits run on the device). Cases: `selected` (a prompt
 longer than index_topk: the selection live), `dense` (a prompt the indexer bypasses), `decode` (a prompt, then
 token-by-token steps: one logits row per step), `chunked` (the selected prompt fed in chunks of 8)."""
 import argparse
@@ -106,6 +107,7 @@ def main():
     ap.add_argument("--converter", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=53)
+    ap.add_argument("--device", choices=["cpu", "gpu"], default="cpu", help="the device the reference's logits run on")
     a = ap.parse_args()
     mx.set_default_device(mx.cpu)
     ref = load_reference(a.reference)
@@ -117,9 +119,11 @@ def main():
     with open(os.path.join(snap, "config.json"), "w") as f:
         json.dump({**CONFIG, "quantization": QUANT}, f, indent=1)
     subprocess.run([sys.executable, a.converter, "--src", snap, "--dst", pack, "--verify", "all", "--source-repo", "synthetic"], check=True)
-    with open(os.path.join(pack, "goldens.json"), "w") as f:
+    mx.set_default_device(mx.gpu if a.device == "gpu" else mx.cpu)
+    name = "goldens.json" if a.device == "cpu" else "goldens-gpu.json"
+    with open(os.path.join(pack, name), "w") as f:
         json.dump({"cases": cases(model)}, f)
-    print("wrote %s" % os.path.join(pack, "goldens.json"))
+    print("wrote %s" % os.path.join(pack, name))
 
 
 if __name__ == "__main__":

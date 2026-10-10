@@ -59,6 +59,26 @@ test "mlx-stream conformance: the EXL3 source's capabilities, and the arch claim
     arch.release_process.?();
 }
 
+test "mlx-stream conformance: every arch the plugin serves declines what is not its own, and claims the one reader" {
+    const near_misses = [_]sdk.testing.ClaimCase{
+        .{ .config = "{}", .want = null },
+        .{ .config = "{\"model_type\":\"__no_such_model__\"}", .want = null },
+    };
+    inline for (@import("root.zig").archs) |A| {
+        const arch = comptime sdk.Arch.of(A);
+        try sdk.testing.expectClaims(arch.claims, &near_misses);
+        try std.testing.expect(arch.claim_process != null and arch.release_process != null);
+    }
+    const glm = comptime sdk.Arch.of(@import("glm_moe_dsa_plugin.zig"));
+    try sdk.testing.expectClaims(glm.claims, &.{.{ .config = "{\"model_type\":\"glm_moe_dsa\"}", .want = .native }});
+    try std.testing.expect(glm.spec == .none and glm.caps.owns_decode_state);
+    // The two archs share the process's one reader: a load of one refuses the other's claim by name.
+    const v41 = comptime sdk.Arch.of(@import("deepseek_v41_plugin.zig"));
+    try v41.claim_process.?();
+    try std.testing.expectError(error.ExpertReaderInUse, glm.claim_process.?());
+    v41.release_process.?();
+}
+
 // Declared last so it runs after every other conformance test (the CPU lane's bar).
 test "mlx-stream conformance: the CPU lane created no Metal device" {
     try sdk.testing.expectNoDevice();
