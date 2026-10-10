@@ -568,6 +568,10 @@ pub const MlxOps = struct {
     pub fn exp(g: *MlxOps, x: T) !T {
         return g.op1(mlx.mlx_exp, x);
     }
+    /// `mx.log` (GLM-5.3's MTP lane: the typical test's entropy of a sampled row).
+    pub fn log(g: *MlxOps, x: T) !T {
+        return g.op1(mlx.mlx_log, x);
+    }
     pub fn sigmoid(g: *MlxOps, x: T) !T {
         return g.op1(mlx.mlx_sigmoid, x);
     }

@@ -153,6 +153,11 @@ pub const Config = struct {
     n_eos: u8 = 0,
     indexer_types: [max_layers]IndexerType = @splat(.shared),
     mlp_types: [max_layers]MlpType = @splat(.dense),
+    /// The MTP layers the release ships after the trunk (`num_nextn_predict_layers`; the MLX builds drop them, their
+    /// config keeps the count), and whether a draft step past the first reuses the first step's indexer selection
+    /// (`index_share_for_mtp_iteration`, absent = false).
+    n_nextn: u32 = 0,
+    index_share_mtp: bool = false,
     quant: Quant,
     /// The overrides' storage (`quant.overrides` and their paths), owned by `deinit`.
     owned_overrides: []Quant.Override = &.{},
@@ -240,6 +245,8 @@ pub const Config = struct {
         c.n_eos = @intCast(eos.len);
 
         try c.parseTables(&src);
+        if (src.get("num_nextn_predict_layers") != null) c.n_nextn = try src.uint("num_nextn_predict_layers", 0, 64);
+        c.index_share_mtp = try src.optBoolean("index_share_for_mtp_iteration", false);
         if (want) |w| try c.checkDims(w, diag);
         try c.parseQuant(gpa, &src);
         return c;
@@ -651,6 +658,7 @@ pub fn testConfigJson(a: std.mem.Allocator, overrides: []const u8) ![]u8 {
     try j.appendSlice(a, "\"n_group\":1,\"n_routed_experts\":256,\"n_shared_experts\":1,\"norm_topk_prob\":true,\"num_attention_heads\":64,\"num_experts_per_tok\":8,\"num_hidden_layers\":78,\"num_key_value_heads\":64,");
     try j.appendSlice(a, "\"q_lora_rank\":2048,\"qk_nope_head_dim\":192,\"qk_rope_head_dim\":64,\"rms_norm_eps\":1e-05,\"rope_interleave\":true,\"rope_parameters\":{\"rope_theta\":8000000,\"rope_type\":\"default\"},");
     try j.appendSlice(a, "\"routed_scaling_factor\":2.5,\"scoring_func\":\"sigmoid\",\"tie_word_embeddings\":false,\"topk_group\":1,\"topk_method\":\"noaux_tc\",\"v_head_dim\":256,\"vocab_size\":154880,");
+    try j.appendSlice(a, "\"num_nextn_predict_layers\":1,\"index_share_for_mtp_iteration\":true,");
     try j.appendSlice(a, "\"indexer_types\":[");
     for (0..78) |l| try j.print(a, "{s}\"{s}\"", .{ if (l == 0) "" else ",", if (@mod(@max(@as(i64, @intCast(l)) - 3 + 1, 0), 4) == 0) "full" else "shared" });
     try j.appendSlice(a, "],\"mlp_layer_types\":[");
@@ -713,6 +721,8 @@ test "glm config: the release's config parses to GLM-5.3's dims, 21 full indexer
     // 95.2 KB per position: (512 + 64) x 2 B x 78 layers + 128 x 2 B x 21 full layers.
     try testing.expectEqual(@as(u64, 95_232), c.kvPositionBytes());
     try testing.expectEqual(@as(u32, 4), c.quant.bitsOf("model.layers.0.self_attn.q_a_proj"));
+    try testing.expectEqual(@as(u32, 1), c.n_nextn);
+    try testing.expect(c.index_share_mtp);
 }
 
 test "glm config: a mixed build's per-module bits override the default, every other module keeps it" {

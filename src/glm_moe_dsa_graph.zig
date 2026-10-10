@@ -6,7 +6,10 @@
 //! the sigmoid router with its correction bias (fp32, top-k, normalized, scaled), the dense MLPs, the shared expert, the
 //! final norm and the quantized head. The routed experts are the driver's (`glm_moe_dsa_experts`): this file hands
 //! it the MoE input, the routed ids and their weights and adds what it returns. A prompt's attention runs in query
-//! blocks whose score arrays stay under `glm_moe_dsa.score_budget_bytes`.
+//! blocks whose score arrays stay under `glm_moe_dsa.score_budget_bytes`. The draft lane's verify (`Want.verify`) runs
+//! the projections and the experts over all its rows and the attention one row at a time, row i over the keys up to its
+//! own position with its own selection, as a serial step runs it: on MLX's CPU its rows' logits equal the serial steps'.
+//! A projection may be dense (`QLinear.dense`, the MTP layer's BF16 tensors as published).
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -19,8 +22,19 @@ pub const G = ops.MlxOps;
 pub const T = G.T;
 pub const Cache = cache_mod.Cache(G);
 
-/// An affine projection (`nn.QuantizedLinear`; per head for `QuantizedMultiLinear`): its tensors and its bits.
-pub const QLinear = struct { w: T, s: T, b: T, bits: u32 };
+/// An affine projection (`nn.QuantizedLinear`; per head for `QuantizedMultiLinear`): its tensors and its bits. Bits 0:
+/// a dense one (`nn.Linear`, mlx-lm's `MultiLinear`), the weight `[..., out, in]` as stored or a view of it, `s` / `b`
+/// unread.
+pub const QLinear = struct {
+    w: T,
+    s: T,
+    b: T,
+    bits: u32,
+
+    pub fn dense(w: T) QLinear {
+        return .{ .w = w, .s = w, .b = w, .bits = 0 };
+    }
+};
 pub const Mlp = struct { gate: QLinear, up: QLinear, down: QLinear };
 pub const Indexer = struct { wq_b: T, wk: T, k_norm_w: T, k_norm_b: T, weights_proj: T };
 /// The router (`mlp.gate`) as stored, and its correction bias.
@@ -156,16 +170,18 @@ pub fn putAlongAxis(g: *G, a: T, idx: T, values: T, axis: c_int) !T {
 }
 
 pub fn qlinear(g: *G, x: T, q: QLinear) !T {
+    if (q.bits == 0) return g.matmul(x, try swapLast(g, q.w));
     return g.quantizedMatmul(x, q.w, q.s, q.b, true, q.bits, glm.group_size, .affine);
 }
 
 /// The latent projections' other direction (`QuantizedMultiLinear(x, transpose=False)`).
 fn qlinearT(g: *G, x: T, q: QLinear) !T {
+    if (q.bits == 0) return g.matmul(x, q.w);
     return g.quantizedMatmul(x, q.w, q.s, q.b, false, q.bits, glm.group_size, .affine);
 }
 
 /// `nn.Linear` without bias, the weight as stored.
-fn linear(g: *G, x: T, w: T) !T {
+pub fn linear(g: *G, x: T, w: T) !T {
     return g.matmul(x, try g.transpose(w));
 }
 
@@ -182,7 +198,7 @@ fn lastSlice(g: *G, x: T, lo: c_int, hi: c_int) !T {
 }
 
 /// `x[..., lo:hi, :]` along the second-to-last axis.
-fn rowSlice(g: *G, x: T, lo: c_int, hi: c_int) !T {
+pub fn rowSlice(g: *G, x: T, lo: c_int, hi: c_int) !T {
     const s = g.shapeOf(x);
     var start: [ops.max_dims]c_int = @splat(0);
     var stop: [ops.max_dims]c_int = undefined;
@@ -194,7 +210,7 @@ fn rowSlice(g: *G, x: T, lo: c_int, hi: c_int) !T {
 }
 
 /// `x.swapaxes(-1, -2)`.
-fn swapLast(g: *G, x: T) !T {
+pub fn swapLast(g: *G, x: T) !T {
     const n = g.shapeOf(x).n;
     var axes: [ops.max_dims]c_int = undefined;
     for (0..n) |i| axes[i] = @intCast(i);
@@ -234,6 +250,16 @@ pub const Carry = struct {
         return .{ .a = a, .bounds = bounds, .topk = topk };
     }
 
+    /// One block per row (the verify's per-row attention).
+    pub fn perRow(a: std.mem.Allocator, rows: u32) !Carry {
+        const bounds = try a.alloc(u32, rows + 1);
+        errdefer a.free(bounds);
+        for (bounds, 0..) |*b, i| b.* = @intCast(i);
+        const topk = try a.alloc(?T, rows);
+        @memset(topk, null);
+        return .{ .a = a, .bounds = bounds, .topk = topk };
+    }
+
     pub fn deinit(self: *Carry, g: *G) void {
         for (self.topk) |t| if (t) |x| g.release(x);
         self.a.free(self.topk);
@@ -254,7 +280,7 @@ pub const Carry = struct {
 /// The indexer of full layer `l` over the forward's rows: per query block the top `index_topk` keys by the fp32
 /// score (relu'd per head, weighted by `weights_proj` at `n_heads^-0.5 * head_dim^-0.5`, summed over heads), masked
 /// causally on a prompt; null where the block's keys fit `index_topk` (every causal key is attended). Kept in `carry`.
-fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, rows: u32, carry: *Carry) !void {
+pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, rows: u32, carry: *Carry) !void {
     const keys = start + rows;
     const topk = c.index_topk;
     if (keys <= topk) {
@@ -288,55 +314,99 @@ fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, star
     }
 }
 
-/// Layer `l`'s attention over its input `x [rows, hidden]` (normed) at positions `[start, start + rows)`: the new KV
-/// appended, the indexer's selection made (full layers) or read from `carry` (shared), the output `[rows, hidden]`.
-pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, start: u32, rows: u32, cache: *Cache, carry: *Carry) !T {
+/// Layer `lw`'s query over its input `x [rows, hidden]` (normed) at positions `[start, start + rows)`: the q latent
+/// (the indexer's query input), per head the nope part and the roped part, and on a full layer the indexer's roped
+/// query.
+pub const Query = struct { qr: T, q_nope: T, q_pe: T, iq: ?T = null };
+
+pub fn queryOf(g: *G, c: *const glm.Config, lw: *const Layer, x: T, start: u32, rows: u32) !Query {
     const heads: c_int = @intCast(c.n_heads);
     const qhd: c_int = @intCast(c.qHeadDim());
     const nope: c_int = @intCast(c.qk_nope_head_dim);
+    const n: c_int = @intCast(rows);
+    const qr = try rmsNorm(g, try qlinear(g, x, lw.q_a), lw.q_a_norm, glm.latent_norm_eps);
+    const q = try g.transposeAxes(try g.reshape(try qlinear(g, qr, lw.q_b), &.{ 1, n, heads, qhd }), &.{ 0, 2, 1, 3 });
+    var out: Query = .{ .qr = qr, .q_nope = try lastSlice(g, q, 0, nope), .q_pe = try rope(g, try lastSlice(g, q, nope, qhd), c.qk_rope_head_dim, c.rope_theta, start) };
+    if (lw.indexer) |ix| out.iq = try rope(g, try g.transposeAxes(try g.reshape(try linear(g, qr, ix.wq_b), &.{ 1, n, @intCast(c.index_n_heads), @intCast(c.index_head_dim) }), &.{ 0, 2, 1, 3 }), c.qk_rope_head_dim, c.rope_theta, start);
+    return out;
+}
+
+/// Layer `lw`'s new KV rows from `x [rows, hidden]` (normed) at `[start, start + rows)`: the normalized latent
+/// `[1, rows, kv_lora_rank]`, the roped key `[1, rows, rope]` and, on a full layer, the indexer's roped key
+/// `[1, rows, index_head_dim]`, in the cache's shapes.
+pub const Keys = struct { latent: T, k_pe: T, index: ?T = null };
+
+pub fn keysOf(g: *G, c: *const glm.Config, lw: *const Layer, x: T, start: u32, rows: u32) !Keys {
     const rd: u32 = c.qk_rope_head_dim;
     const rp: c_int = @intCast(rd);
     const kvr: c_int = @intCast(c.kv_lora_rank);
     const n: c_int = @intCast(rows);
-    const qr = try rmsNorm(g, try qlinear(g, x, lw.q_a), lw.q_a_norm, glm.latent_norm_eps);
-    const q = try g.transposeAxes(try g.reshape(try qlinear(g, qr, lw.q_b), &.{ 1, n, heads, qhd }), &.{ 0, 2, 1, 3 });
-    const q_nope = try lastSlice(g, q, 0, nope);
-    const q_pe = try rope(g, try lastSlice(g, q, nope, qhd), rd, c.rope_theta, start);
     const ckv = try qlinear(g, x, lw.kv_a);
     const latent = try rmsNorm(g, try lastSlice(g, ckv, 0, kvr), lw.kv_a_norm, glm.latent_norm_eps);
     const k_pe = try rope(g, try g.reshape(try lastSlice(g, ckv, kvr, kvr + rp), &.{ 1, 1, n, rp }), rd, c.rope_theta, start);
-    var iq: ?T = null;
-    var ik: ?T = null;
+    var out: Keys = .{ .latent = try g.reshape(latent, &.{ 1, n, kvr }), .k_pe = try g.reshape(k_pe, &.{ 1, n, rp }) };
     if (lw.indexer) |ix| {
-        const ih: c_int = @intCast(c.index_n_heads);
         const ihd: c_int = @intCast(c.index_head_dim);
-        iq = try rope(g, try g.transposeAxes(try g.reshape(try linear(g, qr, ix.wq_b), &.{ 1, n, ih, ihd }), &.{ 0, 2, 1, 3 }), rd, c.rope_theta, start);
-        ik = try rope(g, try g.reshape(try layerNorm(g, try linear(g, x, ix.wk), ix.k_norm_w, ix.k_norm_b, glm.index_norm_eps), &.{ 1, 1, n, ihd }), rd, c.rope_theta, start);
+        const ik = try rope(g, try g.reshape(try layerNorm(g, try linear(g, x, ix.wk), ix.k_norm_w, ix.k_norm_b, glm.index_norm_eps), &.{ 1, 1, n, ihd }), rd, c.rope_theta, start);
+        out.index = try g.reshape(ik, &.{ 1, n, ihd });
     }
-    try cache.append(g, l, try g.reshape(latent, &.{ 1, n, kvr }), try g.reshape(k_pe, &.{ 1, n, rp }), if (ik) |k| try g.reshape(k, &.{ 1, n, @intCast(c.index_head_dim) }) else null);
+    return out;
+}
+
+/// One query row's absorbed attention (the reference's L == 1 form): the query through embed_q into the latent over
+/// the keys `kv` / `pe` (`[1, 1, n, ·]`) or the `topk` rows of them, one shared key and value head, the output back
+/// through unembed_out: `[1, heads, 1, v_head_dim]`.
+pub fn absorbedRow(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T, kv: T, pe: T, topk: ?T) !T {
+    const kvr: c_int = @intCast(c.kv_lora_rank);
+    const rp: c_int = @intCast(c.qk_rope_head_dim);
+    const scale64: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(c.qHeadDim())));
+    var kv_sel = kv;
+    var pe_sel = pe;
+    if (topk) |t| {
+        const kk: c_int = @intCast(c.index_topk);
+        const idx = try g.reshape(t, &.{ 1, 1, kk, 1 });
+        kv_sel = try g.takeAlongAxis(kv, try g.broadcastTo(idx, &.{ 1, 1, kk, kvr }), 2);
+        pe_sel = try g.takeAlongAxis(pe, try g.broadcastTo(idx, &.{ 1, 1, kk, rp }), 2);
+    }
+    const scores = try g.matmul(try g.mul(q_pe, try g.scalar(scale64, g.dtypeOf(q_pe))), try swapLast(g, pe_sel));
+    const qa = try qlinear(g, q_nope, lw.embed_q);
+    return qlinear(g, try sdpa(g, qa, kv_sel, kv_sel, @floatCast(scale64), scores), lw.unembed_out);
+}
+
+/// How a forward of several rows attends: `.auto` (one row absorbed, several in the prompt form), or `.per_row` (each
+/// row absorbed over the keys up to its own position, as serial steps run it: the draft lane's verify).
+pub const Form = enum { auto, per_row };
+
+/// Layer `l`'s attention over its input `x [rows, hidden]` (normed) at positions `[start, start + rows)`: the new KV
+/// appended, the indexer's selection made (full layers) or read from `carry` (shared), the output `[rows, hidden]`.
+/// `.per_row` takes a `Carry.perRow` (one block per row).
+pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, start: u32, rows: u32, cache: *Cache, carry: *Carry, form: Form) !T {
+    const heads: c_int = @intCast(c.n_heads);
+    const qhd: c_int = @intCast(c.qHeadDim());
+    const n: c_int = @intCast(rows);
+    const q = try queryOf(g, c, lw, x, start, rows);
+    const k = try keysOf(g, c, lw, x, start, rows);
+    try cache.append(g, l, k.latent, k.k_pe, k.index);
     const kv_all = try cache.latentView(g, l);
     const pe_all = try cache.ropeView(g, l);
-    if (lw.indexer) |ix| try select(g, c, ix, x, iq.?, try cache.indexView(g, l), start, rows, carry);
-    const scale64: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(qhd)));
-    const scale: f32 = @floatCast(scale64);
-    const qs = try g.scalar(scale64, g.dtypeOf(q_pe));
+    if (lw.indexer) |ix| try select(g, c, ix, x, q.iq.?, try cache.indexView(g, l), start, rows, carry);
     var out: T = undefined;
     if (rows == 1) {
-        // The absorbed form (the reference's L == 1): the query through embed_q into the latent, one shared key / value
-        // head, the output back through unembed_out; the selection gathered.
-        var kv_sel = kv_all;
-        var pe_sel = pe_all;
-        if (carry.topk[0]) |t| {
-            const kk: c_int = @intCast(c.index_topk);
-            const idx = try g.reshape(t, &.{ 1, 1, kk, 1 });
-            kv_sel = try g.takeAlongAxis(kv_all, try g.broadcastTo(idx, &.{ 1, 1, kk, kvr }), 2);
-            pe_sel = try g.takeAlongAxis(pe_all, try g.broadcastTo(idx, &.{ 1, 1, kk, rp }), 2);
+        out = try absorbedRow(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, carry.topk[0]);
+    } else if (form == .per_row) {
+        var outs: std.ArrayList(T) = .empty;
+        defer outs.deinit(carry.a);
+        for (0..rows) |i| {
+            const r: c_int = @intCast(i);
+            const nk: c_int = @intCast(start + i + 1);
+            try outs.append(carry.a, try absorbedRow(g, c, lw, try rowSlice(g, q.q_nope, r, r + 1), try rowSlice(g, q.q_pe, r, r + 1), try rowSlice(g, kv_all, 0, nk), try rowSlice(g, pe_all, 0, nk), carry.topk[i]));
         }
-        const pe = try g.matmul(try g.mul(q_pe, qs), try swapLast(g, pe_sel));
-        const qa = try qlinear(g, q_nope, lw.embed_q);
-        out = try qlinear(g, try sdpa(g, qa, kv_sel, kv_sel, scale, pe), lw.unembed_out);
+        out = try g.concat(outs.items, 2);
     } else {
         // The prompt form: the latent expanded per head (k through embed_q, v through unembed_out), in query blocks.
+        const scale64: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(qhd)));
+        const scale: f32 = @floatCast(scale64);
+        const qs = try g.scalar(scale64, g.dtypeOf(q.q_pe));
         const k_all = try qlinearT(g, kv_all, lw.embed_q);
         const v_all = try qlinear(g, kv_all, lw.unembed_out);
         var outs: std.ArrayList(T) = .empty;
@@ -347,8 +417,8 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
             const b1 = carry.bounds[i + 1];
             const nb = start + b1;
             const m = g.mark();
-            const qn = try rowSlice(g, q_nope, @intCast(b0), @intCast(b1));
-            const qp = try rowSlice(g, q_pe, @intCast(b0), @intCast(b1));
+            const qn = try rowSlice(g, q.q_nope, @intCast(b0), @intCast(b1));
+            const qp = try rowSlice(g, q.q_pe, @intCast(b0), @intCast(b1));
             var pe = try g.matmul(try g.mul(qp, qs), try swapLast(g, try rowSlice(g, pe_all, 0, @intCast(nb))));
             var mask = try causalMask(g, start + b0, b1 - b0, nb);
             if (carry.topk[i]) |t| {
@@ -446,13 +516,31 @@ pub const Routes = struct {
     max_route_ids: u32 = 48,
 };
 
+/// What a forward returns beyond the last row's logits.
+pub const Want = struct {
+    /// The draft lane's verify: every row's logits, the attention per row (`Form.per_row`), and the decode lane's
+    /// routes (no per-layer evaluation, the lookahead's scores).
+    verify: bool = false,
+    /// Every row's final-normed hidden `[rows, hidden]` kept (the MTP layer's input).
+    hidden: bool = false,
+};
+
+/// A forward's kept results: the logits (`[1, vocab]`, or `[rows, vocab]` under `Want.verify`) and the final-normed
+/// hidden under `Want.hidden`; the caller frees both.
+pub const Out = struct { logits: T, hidden: ?T = null };
+
 /// One forward of `ids` at positions `[start, start + ids.len)` through every layer (each layer's KV appended to
 /// `cache`), the routed experts through `ex` (`call`, `readAheadSeed`): the last row's logits `[1, vocab]`, a kept
 /// handle the caller frees. A prompt forward evaluates each layer before the next (its waves freed per layer).
 pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, ex: anytype, rt: Routes) !T {
+    return (try forwardRows(g, a, c, w, ids, start, cache, ex, rt, .{})).logits;
+}
+
+/// `forward` with `want`'s results.
+pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, ex: anytype, rt: Routes, want: Want) !Out {
     const rows: u32 = @intCast(ids.len);
-    const prompt = rows > 1;
-    var carry = try Carry.init(a, c, rows, start + rows);
+    const prompt = rows > 1 and !want.verify;
+    var carry = if (want.verify) try Carry.perRow(a, rows) else try Carry.init(a, c, rows, start + rows);
     defer carry.deinit(g);
     var seed: std.ArrayList(u16) = .empty;
     defer seed.deinit(a);
@@ -469,7 +557,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             try ex.readAheadSeed(lw.bank_layer.?, seed.items);
         }
         const x = try rmsNorm(g, h, lw.input_norm, c.rms_norm_eps);
-        const h1 = try g.add(h, try attention(g, c, lw, l, x, start, rows, cache, &carry));
+        const h1 = try g.add(h, try attention(g, c, lw, l, x, start, rows, cache, &carry, if (want.verify) .per_row else .auto));
         const x2 = try rmsNorm(g, h1, lw.post_norm, c.rms_norm_eps);
         const f = if (lw.dense) |d| try mlp(g, d, x2) else blk: {
             const r = try route(g, c, lw.router.?, x2);
@@ -492,5 +580,10 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
         g.resetTo(m);
     }
     cache.commit(rows);
-    return g.keep(try head(g, c, w, h));
+    if (!want.verify and !want.hidden) return .{ .logits = g.keep(try head(g, c, w, h)) };
+    // Row by row the same as `head`: the final norm per row, the head over the rows wanted.
+    const normed = try rmsNorm(g, h, w.norm, c.rms_norm_eps);
+    const n: c_int = @intCast(rows);
+    const lg = try qlinear(g, if (want.verify) normed else try g.slice(normed, &.{ n - 1, 0 }, &.{ n, @intCast(c.hidden_size) }, &.{ 1, 1 }), w.lm_head);
+    return .{ .logits = g.keep(lg), .hidden = if (want.hidden) g.keep(normed) else null };
 }

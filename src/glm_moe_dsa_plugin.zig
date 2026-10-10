@@ -1,6 +1,6 @@
 //! GLM-5.3 behind the `arch` kind (sdk.Arch.of): every declaration wraps the arch's own entry. The host reaches the
-//! module through these, once per prompt, serial step or handover; nothing per layer. No draft lane: the served
-//! builds drop the MTP layer.
+//! module through these, once per prompt, serial step, handover or draft round; nothing per layer. The draft lane is
+//! the release's MTP layer (`glm_moe_dsa_mtp`), off unless the model's `mtp_depth` sets it.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -130,6 +130,36 @@ pub fn requestEnd(m: *Module) void {
     m.requestEnd();
 }
 
+/// The MTP layer's lane (`mtp_depth` drafts a round; 0 = serial). Acceptance is the model's setting: exact (greedy
+/// requests: the argmax; sampled ones: the drafts accepted with the tempered, filtered target's probability) unless it
+/// names typical (with its delta). Logprobs, grammar and penalties consume logits the lane never shapes and stay serial.
+pub const draft_lane = struct {
+    pub fn blockSize(m: *const Module) u32 {
+        return m.mtpDepth();
+    }
+
+    pub fn laneName(m: *const Module) []const u8 {
+        return if (m.mtpDepth() > 0) "glm-mtp" else "serial";
+    }
+
+    pub fn arm(m: *const Module, req: sdk.ArmRequest) sdk.DraftArm {
+        const ln = m.mtp orelse return .off;
+        if (!req.clean) return .off;
+        return switch (ln.mode) {
+            .typical => .typical,
+            else => if (req.greedy) .greedy else .stochastic,
+        };
+    }
+
+    pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
+        return m.mtpRound(a, t1, accepted_cap, sampling);
+    }
+
+    pub fn stats(m: *const Module) sdk.DraftStats {
+        return m.draftStats();
+    }
+};
+
 const testing = std.testing;
 
 test "glm plugin: claims its own model_type at native priority and declines the rest" {
@@ -160,10 +190,10 @@ test "glm plugin: parse builds the arch's config and its pack dir, and refuses b
     try testing.expectError(error.DimsNotImplemented, parse(testing.allocator, &try sdk.ConfigPeek.parse(arena.allocator(), "/m", tiny), &diag));
 }
 
-test "glm plugin: the table the registry builds (owns its decode state, a handover, a request end, a prefix restore, its bills, no draft lane)" {
+test "glm plugin: the table the registry builds (owns its decode state, a handover, a request end, a prefix restore, its bills, a draft lane)" {
     const vt = comptime sdk.Arch.of(@This());
     try testing.expect(vt.caps.owns_decode_state and !vt.caps.batches_decode and vt.caps.prefill_whole_prompt and vt.caps.prefill_yields_last_logits);
-    try testing.expect(vt.handover != null and vt.request_end != null and vt.restore_prefix != null and vt.bill != null and vt.prompt_bytes != null and vt.spec == .none);
+    try testing.expect(vt.handover != null and vt.request_end != null and vt.restore_prefix != null and vt.bill != null and vt.prompt_bytes != null and vt.spec == .draft_lane);
     try testing.expect(vt.claim_process != null and vt.release_process != null);
     try vt.claim_process.?();
     try testing.expectError(error.ExpertReaderInUse, vt.claim_process.?());

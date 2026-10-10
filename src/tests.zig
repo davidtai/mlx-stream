@@ -64,4 +64,6 @@ comptime {
     _ = @import("glm_moe_dsa_module.zig");
     _ = @import("glm_moe_dsa_plugin.zig");
     _ = @import("glm_moe_dsa_parity.zig");
+    _ = @import("glm_moe_dsa_mtp.zig");
+    _ = @import("glm_moe_dsa_mtp_parity.zig");
 }

@@ -10,6 +10,7 @@ const glm = @import("glm_moe_dsa.zig");
 const settings = @import("glm_moe_dsa_settings.zig");
 const bank_mod = @import("glm_moe_dsa_bank.zig");
 const io_mod = @import("sdk_ext.zig").expert.io;
+const mtp_mod = @import("glm_moe_dsa_mtp.zig");
 
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
 pub const fill_prompt_tokens: u64 = 16384;
@@ -43,6 +44,9 @@ pub const StreamShape = struct {
     workers: u32 = 4,
 };
 
+/// The MTP draft lane's part of a bill (`glm_moe_dsa_mtp.facts`): its depth, its residents and its experts' bytes.
+pub const Mtp = struct { depth: u32, resident_bytes: u64, expert_bytes: u64 };
+
 /// What one bill reads: the model, the bank's geometry, the residents' bytes and the stream's shape.
 pub const Inputs = struct {
     model: *const glm.Config,
@@ -52,6 +56,8 @@ pub const Inputs = struct {
     /// The prompt tokens the bill covers (every length up to it) and the positions the KV lanes hold.
     prompt_tokens: u64,
     max_positions: u64,
+    /// The draft lane when the model sets `mtp_depth` (null: off, no term).
+    mtp: ?Mtp = null,
 };
 
 /// Each phase's terms, decimal bytes, `[prompt, decode]`.
@@ -66,10 +72,13 @@ pub const Terms = struct {
     unbilled: [2]u64,
     /// One persistent slot row on every routed layer.
     per_row: u64,
+    /// The draft lane's: its residents and resident experts, its layer's KV, its waves (null: off).
+    mtp: ?struct { residents: [2]u64, kv: [2]u64, waves: [2]u64 } = null,
 
     /// A phase's wired bytes less its persistent rows (the row term's base): every device term.
     pub fn wired(t: Terms, phase: usize) u64 {
-        return t.transient_slots[phase] + t.residents[phase] + t.waves[phase] + t.kv[phase] + t.mlx_cache[phase];
+        const m = if (t.mtp) |x| x.residents[phase] + x.kv[phase] + x.waves[phase] else 0;
+        return t.transient_slots[phase] + t.residents[phase] + t.waves[phase] + t.kv[phase] + t.mlx_cache[phase] + m;
     }
 };
 
@@ -107,6 +116,23 @@ pub fn decodeWaveBytes(c: *const glm.Config, keys: u64) u64 {
         sel * (c.kv_lora_rank + c.qk_rope_head_dim) * 2 * 2 + @as(u64, c.n_heads) * sel * 2 * 4 + @as(u64, c.vocab_size) * 4 * 3;
 }
 
+/// The draft lane's prompt-pass part: the prompt's final-normed hidden, held until the MTP layer appends its pairs'
+/// keys, and one append's wave (the embedding, both norms, the concat, eh_proj, the layer's input norm, its KV and
+/// indexer projections, their copies) over at most `mtp.append_rows` rows.
+pub fn mtpPromptWaveBytes(c: *const glm.Config, tokens: u64) u64 {
+    const h: u64 = c.hidden_size;
+    const r = @min(tokens, mtp_mod.append_rows);
+    const kv: u64 = c.kv_lora_rank + c.qk_rope_head_dim + c.index_head_dim;
+    return tokens * h * 2 + r * (10 * h * 2 + 4 * kv * 2);
+}
+
+/// The draft lane's decode part at depth `d`: the verify's `d` rows past the serial step's and the round's `d` draft
+/// steps (each a decode wave over the keys: the MTP layer's selection and attention, the head's logits), all live
+/// until the round's decision.
+pub fn mtpDecodeWaveBytes(c: *const glm.Config, d: u32, keys: u64) u64 {
+    return 2 * @as(u64, d) * decodeWaveBytes(c, keys);
+}
+
 pub fn termsOf(in: Inputs) Terms {
     const c = in.model;
     const g = in.bank;
@@ -126,6 +152,11 @@ pub fn termsOf(in: Inputs) Terms {
         .host_side = .{ host_side_bytes, host_side_bytes },
         .unbilled = .{ unbilled_process_overhead_bytes, unbilled_process_overhead_bytes },
         .per_row = @as(u64, g.n_layers) * g.widest_record,
+        .mtp = if (in.mtp) |m| blk: {
+            const res = m.resident_bytes + m.expert_bytes;
+            const mkv = 2 * @as(u64, c.kv_lora_rank + c.qk_rope_head_dim + c.index_head_dim) * in.max_positions;
+            break :blk .{ .residents = .{ res, res }, .kv = .{ mkv, mkv }, .waves = .{ mtpPromptWaveBytes(c, in.prompt_tokens), mtpDecodeWaveBytes(c, m.depth, in.max_positions) } };
+        } else null,
     };
 }
 
@@ -133,7 +164,7 @@ pub fn termsOf(in: Inputs) Terms {
 /// page tables following the rows. The baseline stays out (the fill and the admission take it).
 pub fn memoryBill(a: std.mem.Allocator, t: Terms) !sdk.MemoryBill {
     const T = sdk.MemoryBill.Term;
-    const terms = try a.dupe(T, &[_]T{
+    const base = [_]T{
         .{ .name = "slot banks (transient rows)", .bytes = t.transient_slots, .at_construction = true },
         .{ .name = "read pool staging", .bytes = t.pool_staging, .at_construction = true },
         .{ .name = "residents", .bytes = t.residents, .at_construction = true },
@@ -143,7 +174,12 @@ pub fn memoryBill(a: std.mem.Allocator, t: Terms) !sdk.MemoryBill {
         .{ .name = "host side", .bytes = t.host_side, .at_construction = true, .measured = true },
         .{ .name = "unbilled process overhead", .bytes = t.unbilled, .at_construction = true },
         .{ .name = "wire tables", .bytes = .{ wireTables(t.wired(0)), wireTables(t.wired(1)) }, .at_construction = false, .with_rows = true },
-    });
+    };
+    const terms = if (t.mtp) |m| try std.mem.concat(a, T, &.{ &base, &[_]T{
+        .{ .name = "MTP residents and experts", .bytes = m.residents, .at_construction = true },
+        .{ .name = "MTP KV", .bytes = m.kv, .at_construction = false },
+        .{ .name = "MTP waves", .bytes = m.waves, .at_construction = false },
+    } }) else try a.dupe(T, &base);
     return .{ .terms = terms, .per_row = t.per_row, .row_terms = .{ .data = .{ t.wired(0), t.wired(1), t.per_row, 0 }, .at = wiringAt } };
 }
 
@@ -169,13 +205,29 @@ pub fn streamShape(cfg: *const settings.Config) StreamShape {
 }
 
 /// The bill of `cfg`'s pack for prompts up to `prompt_tokens`: the residents from the shard headers (checked against
-/// the spec), the bank's geometry from its manifest. Pure host.
+/// the spec), the bank's geometry from its manifest, and with `mtp_depth` set the draft lane's (the served EXL3 bank's
+/// MTP directory). Pure host.
 pub fn billOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, prompt_tokens: u64, diag: ?*glm.Diag) !sdk.MemoryBill {
+    return billOfKind(a, io, cfg, prompt_tokens, .exl3, diag);
+}
+
+pub fn billOfKind(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, prompt_tokens: u64, kind: mtp_mod.BankKind, diag: ?*glm.Diag) !sdk.MemoryBill {
     const dir = cfg.model_dir orelse return error.GlmPackDir;
     const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
     const geo = try bank_mod.Bank.geometry(a, io, dir, model, diag);
     const residents = try glm.residentBytes(a, io, dir, model, diag);
-    return memoryBill(a, termsOf(.{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .max_positions = maxPositions(cfg) }));
+    return memoryBill(a, termsOf(.{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .max_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag) }));
+}
+
+/// The draft lane's bill inputs when `cfg` turns it on (its settings and the pack's MTP directory checked), else null.
+pub fn mtpOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, kind: mtp_mod.BankKind, diag: ?*glm.Diag) !?Mtp {
+    try cfg.checkMtp();
+    const d = cfg.mtpDepth();
+    if (d == 0) return null;
+    const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
+    try mtp_mod.checkConfig(model, d, diag);
+    const f = try mtp_mod.facts(a, io, cfg.model_dir orelse return error.GlmPackDir, model, kind, diag);
+    return .{ .depth = d, .resident_bytes = f.resident_bytes, .expert_bytes = f.expert_bytes };
 }
 
 /// What the module needs free to load at all (the load preflight): the bill of the billed context at the fill's
@@ -216,6 +268,38 @@ test "glm bill: GLM-5.3's terms at 16K: 1.59 GB a row, the KV at 95.2 KB a posit
     try sdk.admit(mb, 10_000_000_000, rows, ceiling - 2 * gib);
     try testing.expectError(error.PromptOverTarget, sdk.admit(mb, 10_000_000_000, .{ .prompt = rows.prompt + 1, .decode = rows.decode }, ceiling - 2 * gib));
     std.debug.print("glm bill at 16K, 240 GiB ceiling, 2 GiB margin, 10 GB baseline: {d} prompt / {d} decode rows per layer; prompt waves {d} B, decode waves {d} B\n", .{ rows.prompt, rows.decode, t.waves[0], t.waves[1] });
+}
+
+test "glm bill: the MTP lane adds its residents and experts (4.76 GB at GLM-5.3), its layer's KV and its waves to both phases" {
+    var c = try glm53Config();
+    defer c.deinit(testing.allocator);
+    const seg = bank_mod.layerSegments(4, 6144, 2048).?;
+    const geo: bank_mod.Geometry = .{ .n_layers = 75, .n_experts = 256, .widest_record = bank_mod.logicalBytes(&seg), .widest_span = seg[bank_mod.gu_components].offset };
+    const cfg: settings.Config = .{};
+    const in: Inputs = .{ .model = &c, .bank = geo, .resident_bytes = 20_100_000_000, .prompt_tokens = 16384, .max_positions = maxPositions(&cfg) };
+    const off = termsOf(in);
+    try testing.expect(off.mtp == null);
+    // The box's MTP directory: 578,488,832 B of residents, 592 K3 + 432 K4 mini records of 3,578,880 / 4,758,528 B.
+    var with = in;
+    with.mtp = .{ .depth = 3, .resident_bytes = 578_488_832, .expert_bytes = 592 * 3_578_880 + 432 * 4_758_528 };
+    const on = termsOf(with);
+    const m = on.mtp.?;
+    try testing.expectEqual(@as(u64, 4_752_869_888), m.residents[0]);
+    try testing.expectEqual(m.residents[0], m.residents[1]);
+    try testing.expectEqual(@as(u64, 1408 * (16384 + 8192)), m.kv[1]);
+    try testing.expectEqual(mtpDecodeWaveBytes(&c, 3, maxPositions(&cfg)), m.waves[1]);
+    try testing.expect(m.waves[0] > 16384 * 6144 * 2);
+    for (0..2) |ph| try testing.expectEqual(off.wired(ph) + m.residents[ph] + m.kv[ph] + m.waves[ph], on.wired(ph));
+    const mb_off = try memoryBill(testing.allocator, off);
+    defer mb_off.free(testing.allocator);
+    const mb_on = try memoryBill(testing.allocator, on);
+    defer mb_on.free(testing.allocator);
+    try testing.expectEqual(mb_off.terms.len + 3, mb_on.terms.len);
+    try testing.expectEqualStrings("MTP residents and experts", mb_on.terms[mb_off.terms.len].name);
+    try testing.expect(mb_on.total(.decode, 0, 100) > mb_off.total(.decode, 0, 100) + m.residents[1]);
+    // Deeper drafts bill more decode waves.
+    with.mtp.?.depth = 5;
+    try testing.expect(termsOf(with).mtp.?.waves[1] > m.waves[1]);
 }
 
 test "glm bill: the prompt wave grows with the context; the routed call stops growing at its chunk" {

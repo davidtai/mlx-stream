@@ -8,6 +8,12 @@
 //! handover (the transient scratch freed, the slot rows grown to the decode fill), serial steps. A later prompt keeps
 //! the KV of the prefix it shares with the state (`restorePrefix`). One log line at the prompt pass's end and one at the
 //! request's end report the phase's reads from the stream's counters (`PromptLine`, `DecodeLine`).
+//!
+//! With `mtp_depth` set, the MTP draft lane (`glm_moe_dsa_mtp`, its bank kind bound at comptime: the served module's is
+//! EXL3): the prompt pass keeps every row's final-normed hidden and appends the MTP layer's keys of each pair whose next
+//! token it knows; a round drafts `mtp_depth` tokens, verifies `[t1, drafts]` in one forward of the target
+//! (`graph.Want.verify`), decides under the lane's acceptance and the request's sampling, and truncates the target's
+//! lanes to the accepted rows; the MTP layer appends nothing for a draft, so a rejection leaves its cache as it was.
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -22,6 +28,7 @@ const bill_mod = @import("glm_moe_dsa_bill.zig");
 const graph = @import("glm_moe_dsa_graph.zig");
 const bank_mod = @import("glm_moe_dsa_bank.zig");
 const experts_mod = @import("glm_moe_dsa_experts.zig");
+const mtp_mod = @import("glm_moe_dsa_mtp.zig");
 
 const G = graph.G;
 const Stats = sdk_ext.expert.Stats;
@@ -45,16 +52,17 @@ pub const Overrides = struct {
     prefill_chunk: ?u32 = null,
 };
 
-/// The served module: the affine bank through MLX's `gather_qmm`.
-pub const Module = ModuleOf(bank_mod, quant.FromGatherMatmul(quant.GatherQmm));
+/// The served module: the affine bank through MLX's `gather_qmm`, the MTP layer's experts from its EXL3 records.
+pub const Module = ModuleOf(bank_mod, quant.FromGatherMatmul(quant.GatherQmm), .exl3);
 
-pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
+pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.BankKind) type {
     comptime quant.checkAccepted(Q, G);
     return struct {
         const Self = @This();
         const Stream = Bk.Stream.Stream;
         const Math = Q.Accepted(G);
         pub const Experts = experts_mod.Experts(G, Bk, Math);
+        pub const Lane = mtp_mod.Lane(mtp_kind);
 
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -85,6 +93,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
         layer_counts0: []LayerCounts,
         layer_counts1: []LayerCounts,
         layer_rates: []f64,
+        /// The MTP draft lane (null: `mtp_depth` 0).
+        mtp: ?*Lane = null,
 
         const DecodeMark = struct { s0: Stats, steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0 };
 
@@ -94,6 +104,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
 
         pub fn initWith(gpa: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, ov: Overrides) !*Self {
             try cfg.checkCtxSize();
+            try cfg.checkMtp();
             const dir = cfg.model_dir orelse return error.GlmPackDir;
             const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
             var diag: glm.Diag = .{};
@@ -105,7 +116,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
             // The admission: both phases billed at the context, the rows filled up to the target (or forced).
             const target = host.ceiling -| host.wired_margin;
             const max_context = bill_mod.servedContext(cfg);
-            const terms = bill_mod.termsOf(.{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .max_positions = bill_mod.maxPositions(cfg) });
+            const terms = bill_mod.termsOf(.{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .max_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag) });
             const mb = try bill_mod.memoryBill(gpa, terms);
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
@@ -173,6 +184,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
             for (self.ex.banks) |b| if (b[@backingInt(experts_mod.BankKind.base)]) |arr| try self.math.checkBank(&self.g, arr, &diag);
             self.cache = try graph.Cache.init(gpa, model, @intCast(bill_mod.maxPositions(cfg)));
             errdefer self.cache.deinit(&self.g);
+            if (cfg.mtpDepth() > 0) self.mtp = try Lane.open(gpa, io, &self.g, dir, model, cfg.mtpDepth(), cfg.mtpAcceptance(), @intCast(bill_mod.maxPositions(cfg)), cfg.nocache_weights orelse true, &diag);
+            errdefer if (self.mtp) |ln| ln.deinit(&self.g);
             self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids };
             self.g.clearCache();
             _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, bill_mod.prefill_cache_bytes);
@@ -182,6 +195,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
 
         pub fn deinit(self: *Self) void {
             _ = mlx.mlx_synchronize(self.g.s);
+            if (self.mtp) |ln| ln.deinit(&self.g);
             self.cache.deinit(&self.g);
             self.ex.deinit(&self.g);
             self.stream.deinit();
@@ -210,9 +224,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
         }
 
         /// The host matched `prefix` against its prefix cache: the state keeps the positions it shares with it (the
-        /// lanes truncated after them) and returns how many.
+        /// lanes truncated after them) and returns how many. With the draft lane, at most the positions it tracks
+        /// whose pairs stay valid (`Lane.keepFor`).
         pub fn restorePrefix(self: *Self, prefix: []const u32) u64 {
-            const n = std.mem.indexOfDiff(u32, self.history.items, prefix) orelse @min(self.history.items.len, prefix.len);
+            var n = std.mem.indexOfDiff(u32, self.history.items, prefix) orelse @min(self.history.items.len, prefix.len);
+            if (self.mtp) |ln| n = @intCast(ln.keepFor(&self.g, n));
             self.cache.truncateTo(@intCast(n));
             self.history.shrinkRetainingCapacity(n);
             return n;
@@ -241,8 +257,18 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
                 const end = @min(at + chunk, ids.len);
                 if (logits) |x| self.g.release(x);
                 logits = null;
-                logits = try graph.forward(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes);
-                try self.history.appendSlice(self.gpa, ids[at..end]);
+                if (self.mtp) |ln| {
+                    const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes, .{ .hidden = true });
+                    logits = out.logits;
+                    defer self.g.release(out.hidden.?);
+                    try self.history.appendSlice(self.gpa, ids[at..end]);
+                    // The rows' pairs whose next token the prompt gives: their keys in the MTP layer's cache.
+                    try ln.pend(&self.g, self.cache.len, out.hidden.?, @intCast(end - at), false);
+                    if (ln.tracked() == self.cache.len) try ln.append(&self.g, &self.w, self.history.items[ln.cache.len + 1 ..]);
+                } else {
+                    logits = try graph.forward(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes);
+                    try self.history.appendSlice(self.gpa, ids[at..end]);
+                }
                 at = end;
             }
             try self.g.evalAll(&.{logits.?});
@@ -256,9 +282,13 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
             if (ids.len == 0 or ids.len * self.model.n_experts_per_tok > self.routes.max_route_ids) return error.StepWiderThanRoute;
             if (self.cache.len + ids.len > self.cache.cap) return error.ContextOverBill;
             const t0 = self.nowNs();
-            const logits = try graph.forward(&self.g, self.gpa, self.model, &self.w, ids, @intCast(self.cache.len), &self.cache, &self.ex, self.routes);
+            const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids, @intCast(self.cache.len), &self.cache, &self.ex, self.routes, .{ .hidden = self.mtp != null });
+            const logits = out.logits;
             errdefer self.g.release(logits);
+            defer if (out.hidden) |x| self.g.release(x);
             try self.history.appendSlice(self.gpa, ids);
+            // A request the lane does not draft: its positions pending for a later round, up to `mtp.max_pending`.
+            if (self.mtp) |ln| try ln.pend(&self.g, self.cache.len, out.hidden.?, @intCast(ids.len), true);
             try self.g.evalAll(&.{logits});
             try self.ex.flush();
             if (self.decode_mark) |*d| {
@@ -282,11 +312,16 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
             _ = mlx.mlx_set_cache_limit(&prev, bill_mod.decode_cache_bytes);
             self.decoding = true;
             self.decode_mark = .{ .s0 = self.stream.stats() };
+            if (self.mtp) |ln| ln.counts = .{};
             for (self.layer_counts0, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
         }
 
         /// The request's end (the host's finish): its decode line, once; nothing when it never decoded.
         pub fn requestEnd(self: *Self) void {
+            if (self.mtp) |ln| if (ln.counts.rounds > 0) {
+                log.info("{f}\n", .{ln.line()});
+                ln.counts = .{};
+            };
             const d = self.decode_mark orelse return;
             self.decode_mark = null;
             if (d.steps == 0) return;
@@ -318,6 +353,77 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
         /// The routed experts' counters (the stream's).
         pub fn stats(self: *Self) sdk_ext.expert.Stats {
             return self.stream.stats();
+        }
+
+        /// The draft lane's drafts per round (0: no lane).
+        pub fn mtpDepth(self: *const Self) u32 {
+            return if (self.mtp) |ln| ln.depth else 0;
+        }
+
+        /// The lane's counters over the request.
+        pub fn draftStats(self: *const Self) sdk.DraftStats {
+            const ln = self.mtp orelse return .{};
+            return .{ .rounds = ln.counts.rounds, .drafted = ln.counts.drafted, .accepted = ln.counts.accepted, .generated = ln.counts.generated };
+        }
+
+        /// One draft round from `t1` (`sdk.DraftLane.round`): the drafts, the verify of `[t1, drafts]`, the decision,
+        /// the target truncated to the accepted rows. Without room for a draft (the request's token budget, the
+        /// lanes' end) or for a request the lane does not track, a round of `t1` alone.
+        pub fn mtpRound(self: *Self, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
+            return self.roundWith(a, t1, accepted_cap, sampling, null);
+        }
+
+        /// A test's view into a round: its first drafts forced, the drafts and each draft step's logits read back.
+        pub const Probe = struct {
+            force: []const u32 = &.{},
+            depth: u32 = 0,
+            drafts: [mtp_mod.max_depth]u32 = undefined,
+            /// `mtp_depth` x vocab.
+            logits: ?[]f32 = null,
+        };
+
+        /// `mtpRound` with a test's `probe`.
+        pub fn roundWith(self: *Self, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams, probe: ?*Probe) !sdk.DraftRound {
+            const ln = self.mtp orelse return error.NoDraftLane;
+            const t0 = self.nowNs();
+            const len = self.cache.len;
+            if (len >= self.cache.cap) return error.ContextOverBill;
+            const tracked = ln.tracked() == len and ln.n_pending >= 1;
+            const depth: u32 = if (tracked) @min(ln.depth, accepted_cap, self.cache.cap - len - 1) else 0;
+            var ids: [mtp_mod.max_depth + 1]u32 = undefined;
+            ids[0] = t1;
+            const drafts = ids[1..][0..depth];
+            if (depth > 0) try ln.draft(&self.g, a, &self.w, self.history.items[ln.cache.len + 1 .. len], t1, depth, drafts, if (probe) |p| p.force else &.{}, if (probe) |p| p.logits else null);
+            if (probe) |p| {
+                p.depth = depth;
+                @memcpy(p.drafts[0..depth], drafts);
+            }
+            const m0 = self.g.mark();
+            defer self.g.resetTo(m0);
+            const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, self.routes, .{ .verify = true, .hidden = true });
+            defer self.g.release(out.logits);
+            defer self.g.release(out.hidden.?);
+            try self.g.evalAll(&.{ out.logits, out.hidden.? });
+            try self.ex.flush();
+            const d = try mtp_mod.decide(&self.g, out.logits, drafts, ln.mode, sampling, len);
+            self.cache.truncateTo(len + 1 + d.accepted);
+            try self.history.appendSlice(self.gpa, ids[0 .. 1 + d.accepted]);
+            const rows = d.accepted + 1;
+            try ln.pend(&self.g, self.cache.len, try graph.rowSlice(&self.g, out.hidden.?, 0, @intCast(rows)), rows, depth == 0);
+            const tokens = try a.dupe(u32, ids[0..rows]);
+            const ns = self.nowNs() - t0;
+            ln.counts.rounds += 1;
+            ln.counts.drafted += depth;
+            ln.counts.accepted += d.accepted;
+            ln.counts.generated += rows;
+            ln.counts.serial += @intFromBool(depth == 0);
+            ln.counts.wall_ns += ns;
+            if (self.decode_mark) |*dm| {
+                dm.steps += 1;
+                dm.tokens += rows;
+                dm.wall_ns += ns;
+            }
+            return .{ .tokens = tokens, .accepted = d.accepted, .next_token = d.next };
         }
     };
 }
