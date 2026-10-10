@@ -1494,4 +1494,16 @@ test "glm io: with direct reads a page-aligned range lands straight in its rows;
         // A direct gate/up range is one preadv of its six parts.
         if (cs.want > 0) try testing.expectEqual(@as(i64, 1), pool.result(first).preadv_calls);
     }
+    // A short read inside a part (the first preadv returns 5 pages and a half): the rest lands after it.
+    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 64, .direct = true });
+    defer pool.stop();
+    defer clearFaults();
+    var d = try PageDests.init(n, &lens, 0);
+    defer d.deinit();
+    injectFault(gu[1], 4, @intCast(5 * page / 2));
+    const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..n], &lens);
+    try pool.wait(first, 2 * n, 10 * std.time.ns_per_s);
+    for (0..n) |i| try d.expectRecord(i, f.image, gu[i], down[i], &lens);
+    try testing.expectEqual(@as(i64, 2 * n), pool.counter(.direct_ranges));
+    try testing.expectEqual(@as(i64, 2), pool.result(first + 1).preadv_calls);
 }
