@@ -23,6 +23,46 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         pub const Plan = expert_policy.Plan;
         pub const max_route_ids = expert_policy.max_route_ids;
 
+        /// A routed id's records: `Layer.minis` when the bank declares it (GLM-5.3's EXL3 bank: an expert's tensor-parallel
+        /// minis, adjacent in the file at `Layer.record_bytes` and in the slot rows), else 1.
+        pub fn minisOf(l: *const Layer) u32 {
+            return if (comptime @hasField(Layer, "minis")) l.minis else 1;
+        }
+
+        /// The file bytes from one of a routed id's records to the next (0 with one record).
+        pub fn miniStride(l: *const Layer) u64 {
+            return if (comptime @hasField(Layer, "minis")) l.record_bytes else 0;
+        }
+
+        /// A routed id's span in the file: its records back to back (the speculative class reads it whole).
+        pub fn spanOf(l: *const Layer) u64 {
+            return (minisOf(l) - 1) * miniStride(l) + l.logical_bytes;
+        }
+
+        /// The most records a routed id may have (a read job holds `expert_io.max_items` records).
+        pub const max_minis = expert_io.max_items;
+
+        /// The most records any layer's routed id has.
+        pub fn maxMinis(bank: *const B.Bank) u32 {
+            var m: u32 = 1;
+            for (bank.layers) |*l| m = @max(m, minisOf(l));
+            return m;
+        }
+
+        /// Layers of different segments keep separate transient scratches when the bank declares
+        /// `per_geometry_transients` (GLM-5.3's EXL3 bank: its K3 and K4 bank layers), at most two; otherwise every layer
+        /// shares one at the widest layer's geometry.
+        pub const per_geometry = @hasDecl(B, "per_geometry_transients") and B.per_geometry_transients;
+
+        /// Two layers whose slot rows are interchangeable: the same records per id and the same segments.
+        pub fn sameGeometry(x: *const Layer, y: *const Layer) bool {
+            if (minisOf(x) != minisOf(y)) return false;
+            for (x.segments, y.segments) |p, q| {
+                if (p.length != q.length or p.rank != q.rank or p.dtype != q.dtype or !std.mem.eql(u64, p.shape[0..p.rank], q.shape[0..q.rank])) return false;
+            }
+            return true;
+        }
+
         pub const HostSlotRows = struct {
             rows: u32,
             row_bytes: [n_components]u64,
@@ -34,7 +74,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var n: usize = 0;
                 errdefer for (s.banks[0..n]) |b| std.heap.page_allocator.free(b);
                 for (layer.segments, 0..) |seg, c| {
-                    s.row_bytes[c] = seg.length;
+                    s.row_bytes[c] = seg.length * minisOf(layer);
                     const bytes = std.math.mul(u64, seg.length, rows) catch return error.OutOfMemory;
                     s.banks[c] = try std.heap.page_allocator.alloc(u8, @intCast(bytes));
                     n += 1;
@@ -86,12 +126,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer b.deinit();
                 for (layer.segments, 0..) |seg, c| {
                     var shape: [4]c_int = undefined;
-                    shape[0] = @intCast(rows);
+                    shape[0] = @intCast(rows * minisOf(layer));
                     for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
                     const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_zeros(&b.arrays[c], &shape, seg.rank + 1, dtype, stream));
-                    b.row_bytes[c] = seg.length;
+                    b.row_bytes[c] = seg.length * minisOf(layer);
                 }
                 return b;
             }
@@ -102,12 +142,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer b.deinit();
                 for (layer.segments, 0..) |seg, c| {
                     var shape: [4]c_int = undefined;
-                    shape[0] = @intCast(rows);
+                    shape[0] = @intCast(rows * minisOf(layer));
                     for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
                     const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
                     if (dsv41_alloc_uninit(&b.arrays[c], &shape, seg.rank + 1, dtype) != 0) return error.MlxUnfilledAlloc;
-                    b.row_bytes[c] = seg.length;
+                    b.row_bytes[c] = seg.length * minisOf(layer);
                 }
                 try b.bind();
                 return b;
@@ -439,6 +479,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             transient_meta: []SlotMeta,
             /// The widest layer: the transient rows' geometry (decode's window 0 is allocated in it at the grow).
             transient_layer: u32,
+            /// `per_geometry`: the other geometry's transient scratch (the layers `geom_of` marks 1), beside `transient`.
+            alt: ?AltTransient = null,
+            geom_of: []u1 = &.{},
             /// `releaseTransient` ran: the scratch is freed until the grow allocates window 0.
             transient_released: bool = false,
             /// The release route, installed at construction (`Options.transient_release`).
@@ -511,6 +554,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 parts: []Part,
             };
 
+            /// The second geometry's transient scratch: its rows, their meta and the layer whose geometry it has.
+            const AltTransient = struct { rows: Rows, meta: []SlotMeta, layer: u32 };
+
             const LayerSlots = struct {
                 policy: LayerPolicy,
                 /// The prefill rows, then the rows `grow` added.
@@ -533,16 +579,26 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (opt.rows.len != n_layers) return error.InvalidRows;
                 for (opt.rows) |r| if (r > bank.n_experts) return error.InvalidRows;
                 if (opt.wide_depth < 1 or opt.wide_depth > max_wide_depth or opt.transient_rows < @as(u32, opt.wide_depth) * opt.max_route_ids) return error.InvalidOptions;
-                if (opt.max_route_ids == 0 or opt.max_route_ids > max_route_ids or opt.transient_rows < opt.max_route_ids or
-                    opt.records_per_part == 0 or opt.records_per_part > expert_io.max_items) return error.InvalidOptions;
-                // One transient row must hold any layer's record.
+                const minis = maxMinis(bank);
+                if (opt.max_route_ids == 0 or opt.max_route_ids > max_route_ids or opt.transient_rows < opt.max_route_ids or minis > max_minis or
+                    opt.records_per_part == 0 or opt.records_per_part * minis > expert_io.max_items) return error.InvalidOptions;
+                // One transient row must hold any layer's record; per geometry, each of the two geometries has its scratch.
                 var widest: usize = 0;
-                for (bank.layers, 0..) |l, i| if (l.logical_bytes > bank.layers[widest].logical_bytes) {
+                for (bank.layers, 0..) |*l, i| if (spanOf(l) > spanOf(&bank.layers[widest])) {
                     widest = i;
                 };
-                for (bank.layers) |l| for (l.segments, bank.layers[widest].segments) |s, w| {
-                    if (s.length > w.length) return error.MixedGeometry;
-                };
+                var alt_layer: ?usize = null;
+                for (bank.layers, 0..) |*l, i| {
+                    if (sameGeometry(l, &bank.layers[widest])) continue;
+                    if (per_geometry) {
+                        if (alt_layer) |al| {
+                            if (!sameGeometry(l, &bank.layers[al])) return error.MixedGeometry;
+                        } else alt_layer = i;
+                    } else {
+                        if (minisOf(l) != minisOf(&bank.layers[widest])) return error.MixedGeometry;
+                        for (l.segments, bank.layers[widest].segments) |sg, w| if (sg.length > w.length) return error.MixedGeometry;
+                    }
+                }
                 if (opt.event != null and opt.lookahead == null) return error.InvalidOptions;
                 if (opt.event) |ev| if (ev.watchdog_ms < 50 or ev.watchdog_ms > 60_000) return error.InvalidOptions;
                 var pool_opt = opt.pool;
@@ -551,7 +607,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (la.chunks == 0 or la.chunks > 8 or !std.math.isPowerOfTwo(la.chunks) or la.idle_busy > 1 or
                         la.budget == 0 or la.budget > expert_lookahead.max_budget) return error.InvalidOptions;
                     const page = std.heap.pageSize();
-                    const record = bank.layers[widest].logical_bytes;
+                    const record = spanOf(&bank.layers[widest]);
                     pool_opt.spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
                     // A pre-read range is the record's gate/up span or its down span,
                     // back to back, each no larger than a staging buffer.
@@ -600,11 +656,19 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const transient_meta = try a.alloc(SlotMeta, opt.transient_rows);
                 errdefer a.free(transient_meta);
                 @memset(transient_meta, .{});
+                var alt_rows: ?Rows = if (alt_layer) |al| try Rows.init(&bank.layers[al], opt.transient_rows, opt.slot_memory) else null;
+                errdefer if (alt_rows) |*x| x.deinit();
+                const alt_meta: []SlotMeta = if (alt_layer != null) try a.alloc(SlotMeta, opt.transient_rows) else &.{};
+                errdefer a.free(alt_meta);
+                @memset(alt_meta, .{});
+                const geom_of = try a.alloc(u1, n_layers);
+                errdefer a.free(geom_of);
+                for (bank.layers, geom_of) |*l, *gm| gm.* = @intFromBool(alt_layer != null and !sameGeometry(l, &bank.layers[widest]));
                 const ahead_loads = try a.alloc(LayerPolicy.ReadAhead, bank.n_experts);
                 errdefer a.free(ahead_loads);
                 const ahead_reads = try a.alloc(bool, bank.n_experts);
                 errdefer a.free(ahead_reads);
-                const ahead_parts = try a.alloc(Part, std.math.divCeil(u32, bank.n_experts, expert_io.max_items) catch unreachable);
+                const ahead_parts = try a.alloc(Part, std.math.divCeil(u32, bank.n_experts, expert_io.max_items / minis) catch unreachable);
                 errdefer a.free(ahead_parts);
                 const pool = try expert_io.Pool.start(a, pool_opt);
                 errdefer pool.stop();
@@ -624,6 +688,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .transient = transient,
                     .transient_meta = transient_meta,
                     .transient_layer = @intCast(widest),
+                    .alt = if (alt_layer) |al| .{ .rows = alt_rows.?, .meta = alt_meta, .layer = @intCast(al) } else null,
+                    .geom_of = geom_of,
                     .release_installed = opt.transient_release,
                     .grow_fill = opt.grow_fill,
                     .prompt_transient_rows = opt.transient_rows,
@@ -658,6 +724,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.held_scratch.deinit(a);
                 self.transient.deinit();
                 a.free(self.transient_meta);
+                if (self.alt) |*x| {
+                    x.rows.deinit();
+                    a.free(x.meta);
+                }
+                a.free(self.geom_of);
                 if (self.selector) |*sel| sel.deinit(a);
                 if (self.event_word) |w| a.destroy(w);
                 a.free(self.ahead.loads);
@@ -676,7 +747,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (slot < ls.base.rows) return .{ .rows = &ls.base, .row = slot, .meta = &ls.meta[slot] };
                 if (slot < ls.policy.capacity) return .{ .rows = &ls.ext.?, .row = slot - ls.base.rows, .meta = &ls.meta[slot] };
                 const t = slot - ls.policy.capacity;
+                if (self.altOf(layer)) |x| return .{ .rows = &x.rows, .row = t, .meta = &x.meta[t] };
                 return .{ .rows = &self.transient, .row = t, .meta = &self.transient_meta[t] };
+            }
+
+            /// The second geometry's scratch when `layer` has that geometry (null: the layer reads `transient`).
+            fn altOf(self: *Stream, layer: u32) ?*AltTransient {
+                if (self.alt) |*x| if (self.geom_of[layer] == 1) return x;
+                return null;
             }
 
             /// One component row of a layer's slot (for the kernels' binding and tests).
@@ -705,7 +783,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const rows: *const Rows = switch (kind) {
                     .base => &self.layers[layer].base,
                     .ext => if (self.layers[layer].ext) |*e| e else return null,
-                    .transient => &self.transient,
+                    .transient => if (self.alt != null and self.geom_of[layer] == 1) &self.alt.?.rows else &self.transient,
                 };
                 const m = switch (rows.backing) {
                     .mlx => |*m| m,
@@ -873,9 +951,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var experts: [expert_lookahead.max_candidates]u16 = undefined;
                 const misses = self.selector.?.certainMisses(ids, &self.layers[layer].policy, &experts);
                 if (misses.len == 0) return;
-                var bases: [expert_lookahead.max_candidates]i64 = undefined;
-                for (misses, bases[0..misses.len]) |e, *b| b.* = @intCast(self.bank.recordOffset(layer, e));
-                _ = B.Records.preRead(self.pool, self.bank.sidecar, tag, bases[0..misses.len], &self.layers[layer].lens) catch
+                // Each record of each miss (an id of several records pre-reads every one of them).
+                const geom = &self.bank.layers[layer];
+                var bases: [expert_lookahead.max_candidates * max_minis]i64 = undefined;
+                var n: usize = 0;
+                for (misses) |e| for (0..minisOf(geom)) |m| {
+                    bases[n] = @intCast(self.bank.recordOffset(layer, e) + @as(u64, @intCast(m)) * miniStride(geom));
+                    n += 1;
+                };
+                _ = B.Records.preRead(self.pool, self.bank.sidecar, tag, bases[0..n], &self.layers[layer].lens) catch
                     return self.fail(error.PreReadRefused);
             }
 
@@ -893,7 +977,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         bases[n] = @intCast(self.bank.recordOffset(next, e));
                         n += 1;
                     }
-                    len = self.bank.layers[next].logical_bytes;
+                    len = spanOf(&self.bank.layers[next]);
                 }
                 _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0..n], len) catch
                     return self.fail(error.SpecRefused);
@@ -960,10 +1044,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }.less);
                 var offsets: [max_route_ids]u64 = undefined;
                 var lengths: [max_route_ids]u64 = undefined;
-                const logical = bank.layers[r.layer].logical_bytes;
+                const geom = &bank.layers[r.layer];
+                const mn = minisOf(geom);
+                // A record's file footprint (an id of several records: all of them, the last one's pad included).
+                const footprint = if (mn > 1) mn * miniStride(geom) else geom.logical_bytes;
                 for (r.order[0..n], 0..) |li, k| {
                     offsets[k] = bank.recordOffset(r.layer, plan.loads[li].expert);
-                    lengths[k] = logical;
+                    lengths[k] = footprint;
                 }
                 var ends_buf: [max_route_ids]u32 = undefined;
                 const ends = if (plan.phase == .decode)
@@ -972,7 +1059,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var k: u32 = 0;
                     var e: u32 = 0;
                     while (e < n) : (k += 1) {
-                        e = @min(e + expert_io.max_items, n);
+                        e = @min(e + expert_io.max_items / mn, n);
                         ends_buf[k] = e;
                     }
                     break :blk ends_buf[0..k];
@@ -988,12 +1075,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     for (r.order[start..end]) |li| {
                         if (!r.reads[li]) continue;
                         const l = plan.loads[li];
-                        const loc = self.locate(r.layer, l.slot);
-                        rows[nr] = loc.rows.rowDest(loc.row);
-                        const sp = bank.spans(r.layer, l.expert);
-                        gu[nr] = sp.gu_offset;
-                        down[nr] = sp.down_offset;
-                        nr += 1;
+                        nr = self.entries(r.layer, l.slot, l.expert, &rows, &gu, &down, nr);
                     }
                     if (nr > 0) {
                         part.ticket = B.Records.submit(self.pool, bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &ls.lens) catch |e| return self.fail(e);
@@ -1003,6 +1085,26 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     r.n_parts += 1;
                     start = end;
                 }
+            }
+
+            /// Load (`slot`, `e`)'s read entries from index `at`, one per record of the id (its records adjacent in the file
+            /// at `miniStride` and in the slot rows at each segment's length): each record's gate/up and down spans and its
+            /// rows' addresses. Returns the next index.
+            fn entries(self: *Stream, layer: u32, slot: u32, e: u16, rows: *[expert_io.max_items][n_components]u64, gu: *[expert_io.max_items]u64, down: *[expert_io.max_items]u64, at: u32) u32 {
+                const geom = &self.bank.layers[layer];
+                const loc = self.locate(layer, slot);
+                const d0 = loc.rows.rowDest(loc.row);
+                const sp = self.bank.spans(layer, e);
+                const stride = miniStride(geom);
+                var k = at;
+                for (0..minisOf(geom)) |mi| {
+                    const m: u64 = @intCast(mi);
+                    for (&rows[k], d0, geom.segments) |*d, base, sg| d.* = base + m * sg.length;
+                    gu[k] = sp.gu_offset + m * stride;
+                    down[k] = sp.down_offset + m * stride;
+                    k += 1;
+                }
+                return k;
             }
 
             /// Blocks until the part's gate/up segments landed (its down segments may
@@ -1061,7 +1163,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.phase != .prefill) return error.NotPrefill;
                 if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
                 const ah = &self.ahead;
-                const fit = @min(ah.loads.len, (self.pool.published.len - 2 * expert_io.max_items) / 2);
+                const mn = minisOf(&self.bank.layers[layer]);
+                const fit = @min(ah.loads.len, (self.pool.published.len - 2 * expert_io.max_items) / (2 * mn));
                 const admitted = self.layers[layer].policy.admitReadAhead(experts, ah.loads[0..fit]);
                 if (comptime read_ahead_probed) if (self.probe) |pr| {
                     // The predicted seed: the ranking's top as many as the layer's unprotected rows (the seed's rule); blocked:
@@ -1092,25 +1195,22 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const lens = &self.layers[layer].lens;
                 var start: u32 = 0;
                 while (start < n) {
-                    const end = @min(start + expert_io.max_items, n);
+                    const end = @min(start + expert_io.max_items / mn, n);
                     var part: Part = .{ .first = start, .n = end - start };
                     var rows: [expert_io.max_items][n_components]u64 = undefined;
                     var gu: [expert_io.max_items]u64 = undefined;
                     var down: [expert_io.max_items]u64 = undefined;
                     var nr: u32 = 0;
+                    var posted: u32 = 0;
                     for (admitted[start..end], ah.reads[start..end]) |l, rd| if (rd) {
-                        const loc = self.locate(layer, l.slot);
-                        rows[nr] = loc.rows.rowDest(loc.row);
-                        const sp = self.bank.spans(layer, l.expert);
-                        gu[nr] = sp.gu_offset;
-                        down[nr] = sp.down_offset;
-                        nr += 1;
+                        nr = self.entries(layer, l.slot, l.expert, &rows, &gu, &down, nr);
+                        posted += 1;
                     };
                     if (nr > 0) {
                         part.ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |e| return self.fail(e);
                         part.n_reads = nr;
-                        self.counters.ahead_posted += nr;
-                        if (comptime read_ahead_probed) if (self.probe) |pr| pr.posted(layer, nr);
+                        self.counters.ahead_posted += posted;
+                        if (comptime read_ahead_probed) if (self.probe) |pr| pr.posted(layer, posted);
                     } else part.settled = true;
                     ah.parts[ah.n_parts] = part;
                     ah.n_parts += 1;
@@ -1165,7 +1265,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (experts, ahead_sums[0..experts.len]) |e, *sum| {
                     const slot = ls.policy.slotOf(e).?;
                     sum.* = self.recordDigest(layer, slot);
-                    for (ls.lens, 0..) |len, c| @memset(self.slotRow(layer, slot, @enumFromInt(c))[0..len], 0);
+                    const mn = minisOf(&self.bank.layers[layer]);
+                    for (ls.lens, 0..) |len, c| @memset(self.slotRow(layer, slot, @enumFromInt(c))[0 .. len * mn], 0);
                     self.locate(layer, slot).meta.state = .empty;
                     ls.policy.invalidate(e);
                 }
@@ -1197,7 +1298,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// sha256 of the record a layer's slot holds (its component rows at their logical lengths).
             fn recordDigest(self: *Stream, layer: u32, slot: u32) [32]u8 {
                 var h = std.crypto.hash.sha2.Sha256.init(.{});
-                for (self.layers[layer].lens, 0..) |len, c| h.update(self.slotRow(layer, slot, @enumFromInt(c))[0..len]);
+                const mn = minisOf(&self.bank.layers[layer]);
+                for (self.layers[layer].lens, 0..) |len, c| h.update(self.slotRow(layer, slot, @enumFromInt(c))[0 .. len * mn]);
                 var d: [32]u8 = undefined;
                 h.final(&d);
                 return d;
@@ -1254,10 +1356,18 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.held_base.items.len > 0) return error.RoutesLive;
                 var bytes: u64 = 0;
                 for (self.transient.row_bytes) |n| bytes += n * self.transient.rows;
+                if (self.alt) |*x| for (x.rows.row_bytes) |n| {
+                    bytes += n * x.rows.rows;
+                };
                 const before = if (self.memory == .mlx) mlxActive() else 0;
                 self.transient.deinit();
                 self.allocator.free(self.transient_meta);
                 self.transient_meta = self.transient_meta[0..0];
+                if (self.alt) |*x| {
+                    x.rows.deinit();
+                    self.allocator.free(x.meta);
+                    x.meta = x.meta[0..0];
+                }
                 self.transient_released = true;
                 self.wide_depth = 1;
                 if (self.memory == .mlx and before -| mlxActive() < bytes) {
@@ -1291,19 +1401,28 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     w.deinit();
                     a.free(meta0);
                 };
+                var alt0: ?Rows = null;
+                var alt_meta0: []SlotMeta = &.{};
+                errdefer if (alt0) |*w| {
+                    w.deinit();
+                    a.free(alt_meta0);
+                };
                 if (self.transient_released) {
-                    const geom0 = &self.bank.layers[self.transient_layer];
                     const n0 = self.max_route_ids + decode_staging_rows;
-                    window0 = switch (self.grow_fill) {
-                        .zeros => try Rows.init(geom0, n0, self.memory),
-                        .unfilled => try Rows.initUnfilled(geom0, n0, self.memory),
-                    };
-                    meta0 = a.alloc(SlotMeta, window0.?.rows) catch |e| {
-                        window0.?.deinit();
-                        window0 = null;
-                        return e;
-                    };
-                    @memset(meta0, .{});
+                    const geoms = [2]?u32{ self.transient_layer, if (self.alt) |x| x.layer else null };
+                    for (geoms, [2]*?Rows{ &window0, &alt0 }, [2]*[]SlotMeta{ &meta0, &alt_meta0 }) |gl, w, m| {
+                        const geom = &self.bank.layers[gl orelse continue];
+                        w.* = switch (self.grow_fill) {
+                            .zeros => try Rows.init(geom, n0, self.memory),
+                            .unfilled => try Rows.initUnfilled(geom, n0, self.memory),
+                        };
+                        m.* = a.alloc(SlotMeta, w.*.?.rows) catch |e| {
+                            w.*.?.deinit();
+                            w.* = null;
+                            return e;
+                        };
+                        @memset(m.*, .{});
+                    }
                 }
                 const exts = try a.alloc(?Rows, self.layers.len);
                 defer a.free(exts);
@@ -1323,6 +1442,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     self.transient = w;
                     self.transient_meta = meta0;
                     self.transient_released = false;
+                }
+                if (alt0) |w| {
+                    self.alt.?.rows = w;
+                    self.alt.?.meta = alt_meta0;
                 }
                 for (self.layers, decode_rows, exts) |*ls, rows, e| {
                     ls.ext = e;
@@ -1355,6 +1478,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.release_installed) for (self.transient.row_bytes) |n| {
                     bytes += n * self.transient.rows;
                 };
+                if (self.release_installed) if (self.alt) |*x| for (x.rows.row_bytes) |n| {
+                    bytes += n * x.rows.rows;
+                };
                 const before = if (self.memory == .mlx) mlxActive() else 0;
                 for (self.layers, prompt_rows) |*ls, rows| {
                     for (ls.meta[rows..ls.policy.capacity]) |*m| {
@@ -1372,6 +1498,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     self.transient.deinit();
                     self.allocator.free(self.transient_meta);
                     self.transient_meta = self.transient_meta[0..0];
+                    if (self.alt) |*x| {
+                        x.rows.deinit();
+                        self.allocator.free(x.meta);
+                        x.meta = x.meta[0..0];
+                    }
                     self.transient_released = true;
                 }
                 self.phase = .prefill;
@@ -1400,7 +1531,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// The prompt scratch's bytes (`regrowTransient` allocates them).
             pub fn promptTransientBytes(self: *const Stream) u64 {
                 var n: u64 = 0;
-                for (self.bank.layers[self.transient_layer].segments) |seg| n += seg.length;
+                for (self.bank.layers[self.transient_layer].segments) |seg| n += seg.length * minisOf(&self.bank.layers[self.transient_layer]);
+                if (self.alt) |x| for (self.bank.layers[x.layer].segments) |seg| {
+                    n += seg.length * minisOf(&self.bank.layers[x.layer]);
+                };
                 return n * self.prompt_transient_rows;
             }
 
@@ -1414,12 +1548,22 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var t = try Rows.init(&self.bank.layers[self.transient_layer], self.prompt_transient_rows, self.memory);
                 errdefer t.deinit();
                 const meta = try self.allocator.alloc(SlotMeta, t.rows);
+                errdefer self.allocator.free(meta);
                 @memset(meta, .{});
+                var bytes: u64 = 0;
+                if (self.alt) |*x| {
+                    var t2 = try Rows.init(&self.bank.layers[x.layer], self.prompt_transient_rows, self.memory);
+                    errdefer t2.deinit();
+                    const meta2 = try self.allocator.alloc(SlotMeta, t2.rows);
+                    @memset(meta2, .{});
+                    for (t2.row_bytes) |n| bytes += n * t2.rows;
+                    x.rows = t2;
+                    x.meta = meta2;
+                }
                 self.transient = t;
                 self.transient_meta = meta;
                 self.transient_released = false;
                 self.wide_depth = self.prompt_wide_depth;
-                var bytes: u64 = 0;
                 for (t.row_bytes) |n| bytes += n * t.rows;
                 return bytes;
             }
