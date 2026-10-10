@@ -173,6 +173,7 @@ Settings (`model-settings.json`):
 | key | values | default |
 |---|---|---|
 | `ctx_size` | the longest prompt the load bills, 1 to 1,048,576 | 16,384 |
+| `max_output` | the most tokens a request may generate past its prompt, 1 to 1,048,576 | 131,072 |
 | `numeric_tier` | `stock` (the reference's op chain) | `stock` |
 | `expert_event_gates` | the GPU waits on the reads' events (`true`) or the host waits (`false`) | `true` |
 | `layer_major_prefill` | the prompt layer by layer (`true`) or chunk by chunk (`false`) | `true` |
@@ -182,16 +183,29 @@ Settings (`model-settings.json`):
 | `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |
 
 Memory: one slot row is one 21.2 MB record on each of the 75 routed layers (1.59 GB). The KV costs 95,232 B per
-position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16),
-held for the billed context plus 8,192 generated positions. The bill also charges the residents (from the shard
-headers), the prompt and decode transients, the MLX cache limits (2 GiB in the prompt pass, 512 MiB in decode),
-the read pool's staging and a host-side bound. The ceiling comes from the host only; the plugin sets no cap of its own.
-At a 240 GiB ceiling, a 2 GiB margin, a 10 GB baseline and the mixed build's 20.1 GB of residents, the 16K bill fills
-127 prompt and 137 decode rows per layer.
+position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16).
+The KV lanes hold only the current phase's positions: the prompt's during its pass, and from the decode handover the
+request's own prompt and `max_tokens`. The bill also charges the residents (from the shard headers), the prompt and
+decode transients, decode's transient window (the routed ids of the widest decode call: 8 rows serial, 8 per verify
+row with the MTP lane), the MLX cache limits (2 GiB in the prompt pass, 512 MiB in decode, each plus one freed
+buffer), the read pool's staging and the host side (the footprint outside MLX, 1.25 GB, measured on the box).
+
+The construction admits both phases of the longest request (the billed context and `max_output` generated tokens)
+under the host's target (its ceiling less its wired margin) and fills the prompt rows to it. At the decode handover
+the module frees the prompt's transients, waits until the footprint shows the frees, reads its footprint and the
+box's used memory, and grows the decode rows to the most that the bill at the request's own KV and that reading both
+keep under the grow's target: the host's target, or the box's RAM less 10 % of it, whichever is lower. The rest of
+the box is read again at each handover. A short request so decodes with more rows than the longest one, and decode
+stays clear of the box's knee: on the 256 GB M5 Ultra, decode fell from 5.2 to 2.1 tok/s when the box's used memory
+went from 249.1 to 252.0 GB, while the prompt pass ran at full speed at a 241.3 GB peak footprint. Each handover logs
+one `glm_moe_dsa: handover` line with its readings and the rows; the construction logs one `glm_moe_dsa: bill` line
+with every term and checks its footprint against the bill's construction terms (`ConstructionOverBill`). The
+ceiling comes from the host only. The arch declares `max_output` to the host (`maxOutput`, SDK 2.1).
 
 Each request logs one `glm_moe_dsa: prompt` line at the end of its prompt pass and one `glm_moe_dsa: decode` line at
 its end (the arch's `requestEnd`), with the phase's wall time, SSD bytes, records read, read-ahead or lookahead use,
-host wait on reads, and in decode the hits, misses and hit rate per layer (min, median, max).
+host wait on reads, in decode the hits, misses and hit rate per layer (min, median, max), and the phase's memory:
+MLX's active and peak bytes and its cache, the footprint and its peak, and the host side.
 
 The MTP draft lane (`mtp_depth` > 0) runs the release's MTP layer (layer 78), which the MLX builds drop. The pack
 must have `mtp/` beside its shards, as `scripts/convert_glm_exl3_bank.py --mtp-only --from-pack <EXL3 pack>
