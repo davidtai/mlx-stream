@@ -229,8 +229,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
             const m = Mem.now();
+            const box = Box.now(m);
             const billed = self.bill.constructionBytes(prompt_rows);
-            log.info("glm_moe_dsa: construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (tolerance {d} B)\n", .{ m.footprint, m.active, m.cache, m.hostSide(), billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(m.footprint)), construction_tolerance_bytes });
+            log.info("glm_moe_dsa: construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (tolerance {d} B); the box {d} B used, the rest of it {d} B (the load's baseline {d} B)\n", .{ m.footprint, m.active, m.cache, m.hostSide(), billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(m.footprint)), construction_tolerance_bytes, box.used, box.others, self.baseline });
             sdk.checkConstruction(billed, m.footprint, construction_tolerance_bytes) catch |e| {
                 log.err("glm_moe_dsa: load refused: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B ({s})\n", .{ m.footprint, billed, construction_tolerance_bytes, @errorName(e) });
                 return e;
@@ -389,10 +390,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.g.clearCache();
             const kv1 = self.kvAllocated();
             const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + transient + kv0));
-            var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_rows[0], .rows = self.decode_rows[0], .target = self.target, .baseline = self.baseline };
+            const box = Box.now(st.after);
+            var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_rows[0], .rows = self.decode_rows[0], .target = self.target, .baseline = self.baseline, .box = box };
             if (!self.forced_rows) {
                 const after = bill_mod.decodeAfter(self.inputs, cap);
-                const live: bill_mod.Live = .{ .target = self.target, .baseline = self.baseline, .footprint = st.after.footprint, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_rows[0], .max_rows = self.model.n_routed_experts, .per_row = self.bill.per_row, .device_after = after.device, .host_after = after.host };
+                // The rest of the box as it stands, at least the load's baseline: the bill's rows at the request bound the grow.
+                const live: bill_mod.Live = .{ .target = self.target, .baseline = @max(box.others, self.baseline), .footprint = st.after.footprint, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_rows[0], .max_rows = self.model.n_routed_experts, .per_row = self.bill.per_row, .device_after = after.device, .host_after = after.host };
                 line.live_rows = bill_mod.liveRows(live) catch |e| {
                     line.refused = @errorName(e);
                     log.err("{f}\n", .{line});
@@ -573,6 +576,18 @@ pub const Mem = struct {
     }
 };
 
+/// The box's used memory beside this process's (`sdk.memory.boxUsedBytes`, read right after `mem`): what the rest of
+/// the box holds is the used memory less this process's footprint and the page tables of its MLX bytes.
+pub const Box = struct {
+    used: u64,
+    others: u64,
+
+    pub fn now(mem: Mem) Box {
+        const used = sdk.memory.boxUsedBytes();
+        return .{ .used = used, .others = used -| mem.footprint -| bill_mod.wireTables(mem.active + mem.cache) };
+    }
+};
+
 /// A phase's start: MLX's peak and the footprint's interval peak restarted.
 pub fn startPhase() void {
     _ = mlx.mlx_reset_peak_memory();
@@ -650,12 +665,14 @@ pub const HandoverLine = struct {
     bound: ?u64 = null,
     target: u64,
     baseline: u64,
+    /// The box then (`Box.now` after the settle).
+    box: Box = .{ .used = 0, .others = 0 },
     grown: ?Mem = null,
     refused: ?[]const u8 = null,
 
     pub fn format(p: HandoverLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("glm_moe_dsa: handover: footprint {d:.3} GB before the frees, {d:.3} GB after ({s} in {d} ms; MLX active {d:.3} GB, host side {d:.3} GB), KV at {d} positions {d:.3} GB", .{
-            gigabytes(p.before.footprint), gigabytes(p.after.footprint), if (p.settled) "settled" else "not settled", p.settle_ms, gigabytes(p.after.active), gigabytes(p.after.hostSide()), p.positions, gigabytes(p.kv_bytes),
+        try w.print("glm_moe_dsa: handover: footprint {d:.3} GB before the frees, {d:.3} GB after ({s} in {d} ms; MLX active {d:.3} GB, host side {d:.3} GB; the box {d:.3} GB used, the rest of it {d:.3} GB), KV at {d} positions {d:.3} GB", .{
+            gigabytes(p.before.footprint), gigabytes(p.after.footprint), if (p.settled) "settled" else "not settled", p.settle_ms, gigabytes(p.after.active), gigabytes(p.after.hostSide()), gigabytes(p.box.used), gigabytes(p.box.others), p.positions, gigabytes(p.kv_bytes),
         });
         if (p.refused) |e| return w.print(", refused: {s} (the prompt's {d} rows per layer leave decode over the {d:.3} GB target, baseline {d:.3} GB)", .{ e, p.prompt_rows, gigabytes(p.target), gigabytes(p.baseline) });
         try w.print(", rows {d} -> {d} per layer", .{ p.prompt_rows, p.rows });
@@ -964,10 +981,10 @@ test "glm handover: the settle reads until the cache is empty and the footprint 
 
 test "glm handover: the handover line reports the readings, the rows each bound allows and decode's bound" {
     const a = testing.allocator;
-    var l: HandoverLine = .{ .before = .{ .footprint = 225_500_000_000 }, .after = .{ .footprint = 221_000_000_000, .active = 220_400_000_000 }, .settle_ms = 15, .settled = true, .positions = 17_415, .kv_bytes = 1_660_000_000, .prompt_rows = 126, .rows = 136, .bill_rows = 136, .live_rows = 137, .bound = 255_000_000_000, .target = 255_550_554_112, .baseline = 12_402_409_472, .grown = .{ .footprint = 237_100_000_000 } };
+    var l: HandoverLine = .{ .before = .{ .footprint = 225_500_000_000 }, .after = .{ .footprint = 221_000_000_000, .active = 220_400_000_000 }, .settle_ms = 15, .settled = true, .positions = 17_415, .kv_bytes = 1_660_000_000, .prompt_rows = 126, .rows = 136, .bill_rows = 136, .live_rows = 137, .bound = 255_000_000_000, .target = 255_550_554_112, .baseline = 12_402_409_472, .box = .{ .used = 233_900_000_000, .others = 12_600_000_000 }, .grown = .{ .footprint = 237_100_000_000 } };
     const s = try std.fmt.allocPrint(a, "{f}", .{l});
     defer a.free(s);
-    try testing.expectEqualStrings("glm_moe_dsa: handover: footprint 225.500 GB before the frees, 221.000 GB after (settled in 15 ms; MLX active 220.400 GB, host side 0.600 GB), KV at 17415 positions 1.660 GB, rows 126 -> 136 per layer (the bill at the request 136, the live reading 137), decode bound 255.000 GB of the 255.551 GB target (baseline 12.402 GB), footprint 237.100 GB after the grow", s);
+    try testing.expectEqualStrings("glm_moe_dsa: handover: footprint 225.500 GB before the frees, 221.000 GB after (settled in 15 ms; MLX active 220.400 GB, host side 0.600 GB; the box 233.900 GB used, the rest of it 12.600 GB), KV at 17415 positions 1.660 GB, rows 126 -> 136 per layer (the bill at the request 136, the live reading 137), decode bound 255.000 GB of the 255.551 GB target (baseline 12.402 GB), footprint 237.100 GB after the grow", s);
     l.refused = "DecodeOverTarget";
     const r = try std.fmt.allocPrint(a, "{f}", .{l});
     defer a.free(r);
@@ -976,4 +993,15 @@ test "glm handover: the handover line reports the readings, the rows each bound 
     const p = try std.fmt.allocPrint(a, "{f}", .{pm});
     defer a.free(p);
     try testing.expectEqualStrings("MLX active 200.000 -> 201.000 GB (peak 205.000), MLX cache 0.500 GB, footprint 201.000 -> 202.100 GB (peak 206.000), host side 1.000 -> 0.600 GB", p);
+}
+
+test "glm box: the box's used memory holds this process's footprint, and the rest of the box is what is left" {
+    if (comptime !@import("builtin").os.tag.isDarwin()) return error.SkipZigTest;
+    const block = try std.heap.page_allocator.alloc(u8, 64 << 20);
+    defer std.heap.page_allocator.free(block);
+    @memset(block, 0x5a);
+    const m: Mem = .{ .footprint = sdk.memory.processMemory().footprint };
+    const box = Box.now(m);
+    try testing.expect(box.used >= m.footprint and box.used <= sdk.memory.totalMemBytes());
+    try testing.expectEqual(box.used - m.footprint - bill_mod.wireTables(0), box.others);
 }

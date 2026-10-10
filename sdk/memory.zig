@@ -204,6 +204,31 @@ pub fn physicalUsedBytes(v: VmBytes) u64 {
     return v.wired + v.active + v.inactive + v.compressor;
 }
 
+/// The box's used memory as the host's baseline counts it (wired, the compressor's pages, the anonymous pages less
+/// the purgeable ones; file-backed pages aside). The wired, anonymous and purgeable counts come from sysctl, fresh at
+/// every call (host_statistics64 is rate-limited box-wide for non-platform binaries: past 2-10 calls a second it
+/// returns its last reading); the compressor's pages from host_statistics64. 0 off Darwin.
+pub fn boxUsedBytes() u64 {
+    if (comptime !builtin.os.tag.isDarwin()) return 0;
+    const wired = sysctlU64("vm.page_wired_count") orelse return 0;
+    const internal = sysctlU64("vm.page_pageable_internal_count") orelse return 0;
+    const purgeable = sysctlU64("vm.page_purgeable_count") orelse return 0;
+    const page = sysctlU64("vm.pagesize") orelse return 0;
+    return (wired + (internal -| purgeable)) * page + vmBytes().compressor;
+}
+
+/// An unsigned sysctl of 4 or 8 bytes; null when it fails.
+fn sysctlU64(name: [*:0]const u8) ?u64 {
+    var buf: [8]u8 = @splat(0);
+    var len: usize = buf.len;
+    if (sysctlbyname(name, &buf, &len, null, 0) != 0) return null;
+    return switch (len) {
+        4 => std.mem.readInt(u32, buf[0..4], .little),
+        8 => std.mem.readInt(u64, &buf, .little),
+        else => null,
+    };
+}
+
 /// Total physical RAM (hw.memsize). 0 on failure and off Darwin.
 pub fn totalMemBytes() u64 {
     if (comptime !builtin.os.tag.isDarwin()) return 0;
@@ -238,6 +263,9 @@ test "sdk memory: the process and box readings are the kernel's, self-consistent
     const v = vmBytes();
     try testing.expect(v.wired > 0 and v.active > 0);
     try testing.expect(physicalUsedBytes(v) <= total and physicalUsedBytes(v) >= v.wired);
+    // The box's used memory holds the wired pages and this process's anonymous ones, and fits the box.
+    const used = boxUsedBytes();
+    try testing.expect(used <= total and used >= v.wired / 2 and used >= 32 << 20);
 }
 
 test "sdk memory: physical used is wired + active + inactive + compressor, free and speculative and file counts aside" {
