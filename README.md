@@ -16,7 +16,9 @@ What it contains:
 
 Decode levers that are still being evaluated ship **off by default** (see Environment switches).
 
-The supported model is the DeepSeek-V4.1-Flash streaming EXL3 3.0 bpw package (a model directory whose
+The plugin also serves **GLM-5.3** (`glm_moe_dsa`) from an affine expert bank through the same stream (see GLM-5.3).
+
+The supported DeepSeek-V4.1 model is the DeepSeek-V4.1-Flash streaming EXL3 3.0 bpw package (a model directory whose
 `config.json` has `"model_type": "deepseek_v41"` and whose expert bank has a v2 expert manifest). No weights are
 included in this repository.
 
@@ -148,6 +150,52 @@ served behavior.
 The test suites also read their own inputs (`DSV41_BANK`, device-only smoke switches, fixture paths, the cell
 harness's rows, baseline and output paths); each such test skips without its input.
 
+## GLM-5.3
+
+The `glm_moe_dsa` arch serves GLM-5.3 (744B, 78 layers: 3 dense, 75 MoE with 256 experts, top-8 and one shared expert;
+MLA; the lightning indexer on 21 layers) from a pack that `scripts/convert_glm_bank.py` makes from an MLX snapshot.
+The experts stream from the pack's affine bank through the same stream, read pool, residency policy, lookahead and
+event gates as DeepSeek-V4.1; the expert math is MLX's own `gather_qmm`.
+
+Supported pack: a directory whose `config.json` has `"model_type": "glm_moe_dsa"` and GLM-5.3's dims, with:
+
+| file | content |
+|---|---|
+| `model-*.safetensors`, `model.safetensors.index.json` | the residents: every tensor but the routed experts, affine group 64 (the bits per module from `quantization`), the indexer, the router and its bias as stored |
+| `experts.bin` | the routed experts: one record per expert and MoE layer, nine segments (gate / up / down `weight`, `scales`, `biases`) as the source stores them; 21,233,664 B at 4 bits |
+| `expert-manifest-affine-v1.json` | the bank's layers, segments, records and digests; the arch refuses a manifest that does not match `config.json` by name |
+
+The source builds are `pipenetwork/GLM-5.3-MLX-mixed-4_8bit` (4-bit experts, 8-bit trunk) and
+`pipenetwork/GLM-5.3-MLX-4bit`. A bank of 3-bit experts (`mixed-3_6bit`) uses the same format at `bits` 3.
+
+Settings (`model-settings.json`):
+
+| key | values | default |
+|---|---|---|
+| `ctx_size` | the longest prompt the load bills, 1 to 1,048,576 | 16,384 |
+| `numeric_tier` | `stock` (the reference's op chain) | `stock` |
+| `expert_event_gates` | the GPU waits on the reads' events (`true`) or the host waits (`false`) | `true` |
+| `layer_major_prefill` | the prompt layer by layer (`true`) or chunk by chunk (`false`) | `true` |
+| `expert_wide_depth` | prompt expert groups read ahead per layer, 1 to 5 | 2 |
+
+Memory: one slot row is one 21.2 MB record on each of the 75 routed layers (1.59 GB). The KV costs 95,232 B per
+position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16),
+held for the billed context plus 8,192 generated positions. The bill also charges the residents (from the shard
+headers), the prompt and decode transients, the MLX cache limits (2 GiB in the prompt pass, 512 MiB in decode),
+the read pool's staging and a host-side bound. The ceiling comes from the host only; the plugin sets no cap of its own.
+At a 240 GiB ceiling, a 2 GiB margin, a 10 GB baseline and the mixed build's 20.1 GB of residents, the 16K bill fills
+127 prompt and 137 decode rows per layer.
+
+Not available for GLM-5.3:
+
+- the draft lane (the MLX builds drop the MTP layer): decode is serial, one token per step;
+- a tier other than `stock`, and the pinned Metal kernels (the trunk runs on MLX's own ops);
+- a prompt over 16,384 tokens reads each routed layer's experts once per 16,384-token chunk, not once per prompt.
+
+`src/glm_moe_dsa_parity.zig` checks the arch against the reference `glm_moe_dsa.py` on a tiny model of the arch:
+`scripts/glm_moe_dsa_goldens.py` builds it, converts it with the converter and writes the reference's logits beside
+the pack (`GLM53_PARITY=<pack>` with `DSV41_PHASE0B_MLX=1`).
+
 ## Versions
 
 - **mlx-serve:** the host pins this repository as a submodule; that pin is the tested pair.
@@ -175,18 +223,19 @@ in the host checkout) through this plugin's decoder and checks the result agains
 ```
 build.zig, build.zig.zon   standalone build (drives the host's build)
 sdk/                       the arch contract's types (`sdk` module), the weight loader, reads past the page cache
-src/root.zig               the arch the host calls (`arch`, `sdk`, `default_context`) and the tests' surface
+src/root.zig               the archs the host calls (`arch`, `archs`, `sdk`, `default_context`) and the tests' surface
 src/tests.zig              the test root (`zig build mlx-stream-test` in the host)
 src/conformance.zig        the conformance suite's root
 src/deepseek_v41_host.zig  the harnesses' and bank tests' bridge (config parse, loaders, memory knobs), test-only
 src/*.zig                  the DeepSeek-V4.1 arch, the EXL3 quant and kernels, the expert stream
+src/glm_moe_dsa*.zig       the GLM-5.3 arch, its affine bank, bill, module and parity test
 src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile)
 src/kernels/exl3/          the pinned Metal kernel texts and their manifest (embedded at compile time)
 src/fixtures/              test fixtures (bank peek, prefill wave samples, DSpark lookup and receipt stats)
 csrc/                      the C read pool, the MLX event / alloc shims and the profile-only timeline sources
 src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
 docs/                      design notes and the path map from the in-tree layout
-scripts/                   test_dsv41.sh, compile_kernels_offline.py
+scripts/                   test_dsv41.sh, compile_kernels_offline.py, glm_moe_dsa_goldens.py
 ```
 
 This repository was imported from the mlx-serve fork at commit d38ef038, without its history. `docs/PATH_MAP.md`
