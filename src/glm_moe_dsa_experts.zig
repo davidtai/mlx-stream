@@ -23,29 +23,51 @@ const ops = @import("deepseek_v41_ops.zig");
 const glm = @import("glm_moe_dsa.zig");
 const pt = @import("glm_moe_dsa_prefill_timers.zig");
 
-/// The wide lane's combine (`combineGpu`): one thread per token and 4 hidden values, the token's `K` routed rows in
-/// routed order.
-const combine_source =
+/// The wide lane's combine (`combineOnGpu`): one thread per token and 4 hidden values, the token's `K` routed rows in
+/// routed order, each read from its part (`loc`: the part in the top 8 bits, the row in the low 24).
+const max_combine_parts = 24;
+const combine_source = blk: {
+    var cases: []const u8 = "";
+    for (0..max_combine_parts) |i| cases = cases ++ std.fmt.comptimePrint("        case {d}: part = p{d}; break;\n", .{ i, i });
+    break :blk std.fmt.comptimePrint("{s}{s}{s}", .{ combine_head, cases, combine_tail });
+};
+const combine_head =
     \\    const uint t = thread_position_in_grid.y;
     \\    const uint h = thread_position_in_grid.x * 4;
     \\    if (h >= H) return;
     \\    float4 acc = float4(0.0f);
     \\    for (int k = 0; k < K; ++k) {
-    \\        const uint row = inv[t * K + k];
-    \\        const vec<T, 4> y = *(const device vec<T, 4>*)(joined + ulong(row) * H + h);
+    \\        const uint lc = loc[t * K + k];
+    \\        const device T* part;
+    \\        switch (lc >> 24) {
+    \\
+;
+const combine_tail =
+    \\        default: part = p0; break;
+    \\        }
+    \\        const vec<T, 4> y = *(const device vec<T, 4>*)(part + ulong(lc & 0xFFFFFFu) * H + h);
     \\        acc = acc + float4(y) * w[t * K + k];
     \\    }
     \\    *(device vec<T, 4>*)(out + ulong(t) * H + h) = vec<T, 4>(acc);
+    \\
 ;
 
-/// `(y * scores[..., None]).sum(-2)` of the joined rows `joined [n * k, hidden]` in routed order (`inv [n * k]` u32:
-/// token t's j-th routed row is `joined[inv[t * k + j]]`) as one launch: each token's rows weighted and summed in f32
-/// in routed order, products and sums rounded apart (no contraction), cast to `dt`; the op chain's bits.
-fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, joined: ops.MlxOps.T, inv: ops.MlxOps.T, scores: ops.MlxOps.T, n: u32, k: u32, hidden: c_int, dt: ops.Dtype) !ops.MlxOps.T {
+/// `(y * scores[..., None]).sum(-2)` of the routed rows in `parts` (at most `max_combine_parts`; token t's j-th routed
+/// row is row `loc[t * k + j] & 0xFFFFFF` of part `loc[t * k + j] >> 24`, u32 `[n * k]`) as one launch: each token's
+/// rows weighted and summed in f32 in routed order, products and sums rounded apart (no contraction), cast to `dt`;
+/// the op chain's bits.
+fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, parts: []const ops.MlxOps.T, loc: ops.MlxOps.T, scores: ops.MlxOps.T, n: u32, k: u32, hidden: c_int, dt: ops.Dtype) !ops.MlxOps.T {
+    std.debug.assert(parts.len > 0 and parts.len <= max_combine_parts);
+    const names = comptime blk: {
+        var v: [max_combine_parts + 2][*:0]const u8 = undefined;
+        for (0..max_combine_parts) |i| v[i] = std.fmt.comptimePrint("p{d}", .{i});
+        v[max_combine_parts] = "loc";
+        v[max_combine_parts + 1] = "w";
+        break :blk v;
+    };
     const kern = slot.* orelse blk: {
-        const ins = [_][*:0]const u8{ "joined", "inv", "w" };
         const outs = [_][*:0]const u8{"out"};
-        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        const iv = mlx.mlx_vector_string_new_data(&names, names.len);
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
@@ -63,7 +85,11 @@ fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, joined: ops.M
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", hidden));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", @intCast(k)));
-    const inputs = [_]mlx.mlx_array{ joined, inv, scores };
+    // The slots past the parts hold the first part (never read).
+    var inputs: [max_combine_parts + 2]mlx.mlx_array = undefined;
+    for (inputs[0..max_combine_parts], 0..) |*in, i| in.* = if (i < parts.len) parts[i] else parts[0];
+    inputs[max_combine_parts] = loc;
+    inputs[max_combine_parts + 1] = scores;
     const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -796,6 +822,23 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
+            try w.inv.resize(a, n_ids);
+            // On the GPU the combine reads each routed row where its group's call left it (no join).
+            if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0 and w.kept.items.len <= max_combine_parts) {
+                const tb = pt.now();
+                defer if (pt.enabled) pt.chargeRouted(.combine, tb);
+                var j: usize = 0;
+                for (w.kept.items, 0..) |part, pi| for (0..@intCast(g.shapeOf(part).dim(0))) |row| {
+                    w.inv.items[w.pos.items[j]] = @as(u32, @intCast(pi)) << 24 | @as(u32, @intCast(row));
+                    j += 1;
+                };
+                const loc = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
+                const out = try combineOnGpu(&self.combine_kernel, g, w.kept.items, loc, scores, n, k, self.hidden, g.dtypeOf(x));
+                // The combine holds the parts until it is evaluated.
+                for (w.kept.items) |o| g.release(o);
+                w.kept.clearRetainingCapacity();
+                return out;
+            }
             // The join: every routed row's output in routed order, then the combine in token slices.
             const tj = pt.now();
             const joined = try g.concat(w.kept.items, 0);
@@ -805,11 +848,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             defer if (pt.enabled) pt.chargeRouted(.combine, tb);
             for (w.kept.items) |o| g.release(o);
             w.kept.clearRetainingCapacity();
-            try w.inv.resize(a, n_ids);
             for (w.pos.items, 0..) |p, j| w.inv.items[p] = @intCast(j);
             if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0) {
                 const inv = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
-                return combineOnGpu(&self.combine_kernel, g, joined, inv, scores, n, k, self.hidden, g.dtypeOf(x));
+                return combineOnGpu(&self.combine_kernel, g, &.{joined}, inv, scores, n, k, self.hidden, g.dtypeOf(x));
             }
             var outs: std.ArrayList(T) = .empty;
             defer outs.deinit(a);
@@ -833,7 +875,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
     };
 }
 
-test "glm experts: the wide lane's GPU combine equals the op chain's bits at GLM-5.3's hidden size" {
+test "glm experts: the wide lane's GPU combine over its parts equals the op chain's bits at GLM-5.3's hidden size" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
@@ -863,7 +905,18 @@ test "glm experts: the wide lane's GPU combine equals the op chain's bits at GLM
     const joined = try g.astype(try g.hostArray(std.mem.sliceAsBytes(yv), &.{ @intCast(n * k), hidden }, .float32), .bfloat16);
     const scores = try g.hostArray(std.mem.sliceAsBytes(wv), &.{ @intCast(n), @intCast(k) }, .float32);
     const ord = try g.hostArray(std.mem.sliceAsBytes(inv), &.{@intCast(n * k)}, .uint32);
-    const got = try combineOnGpu(&slot, &g, joined, ord, scores, n, k, hidden, .bfloat16);
+    // The rows in 3 parts, each row's place as (part, row).
+    const cuts = [_]c_int{ 0, 700, 1900, @intCast(n * k) };
+    var parts: [3]ops.MlxOps.T = undefined;
+    for (&parts, 0..) |*p, i| p.* = try g.slice(joined, &.{ cuts[i], 0 }, &.{ cuts[i + 1], hidden }, &.{ 1, 1 });
+    const locv = try a.alloc(u32, n * k);
+    defer a.free(locv);
+    for (inv, locv) |r, *l| {
+        const pi: u32 = if (r < cuts[1]) 0 else if (r < cuts[2]) 1 else 2;
+        l.* = pi << 24 | (r - @as(u32, @intCast(cuts[pi])));
+    }
+    const loc = try g.hostArray(std.mem.sliceAsBytes(locv), &.{@intCast(n * k)}, .uint32);
+    const got = try combineOnGpu(&slot, &g, &parts, loc, scores, n, k, hidden, .bfloat16);
     const y = try g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), hidden });
     const want = try g.astype(try g.sum(try g.mul(y, try g.expandDims(scores, -1)), -2, false), .bfloat16);
     const same = try g.astype(try g.equal(got, want), .float32);
