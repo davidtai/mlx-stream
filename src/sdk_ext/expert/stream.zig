@@ -344,6 +344,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             transient_release: bool = false,
             /// How the grow's new rows (decode's window 0 and every layer's ext) are allocated (`GrowFill`).
             grow_fill: GrowFill = .zeros,
+            /// The reverse phase change keeps the residents of each layer's prompt rows (`shrink`): a later prompt finds
+            /// them; off, it forgets them, as at construction.
+            keep_residents: bool = false,
             /// G7: the arch's read-ahead records (`ReadAheadProbe`), in the prefill-timers build only.
             read_ahead_probe: ProbeSlot = no_probe,
         };
@@ -491,6 +494,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             release_installed: bool = false,
             /// The grow's allocation, installed at construction (`Options.grow_fill`).
             grow_fill: GrowFill = .zeros,
+            /// `Options.keep_residents`.
+            keep_residents: bool = false,
             /// The prompt phase's scratch rows and windows (`Options`): `regrowTransient` re-creates them for a later prompt.
             prompt_transient_rows: u32 = 0,
             prompt_wide_depth: u8 = 1,
@@ -695,6 +700,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .geom_of = geom_of,
                     .release_installed = opt.transient_release,
                     .grow_fill = opt.grow_fill,
+                    .keep_residents = opt.keep_residents,
                     .prompt_transient_rows = opt.transient_rows,
                     .prompt_wide_depth = opt.wide_depth,
                     .probe = opt.read_ahead_probe,
@@ -1296,6 +1302,23 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (first_error) |e| return self.fail(e);
             }
 
+            /// Construction (the prompt phase, nothing live): each layer's empty prompt rows filled with the experts of
+            /// `order(layer)` in turn, read and landed as a read-ahead leaves them (unprotected residents a prompt's seed
+            /// re-protects). Returns the records read.
+            pub fn preload(self: *Stream, ctx: anytype, comptime order: fn (@TypeOf(ctx), u32) []const u16) !u64 {
+                if (self.phase != .prefill) return error.NotPrefill;
+                var n: u64 = 0;
+                for (0..self.layers.len) |l| {
+                    const layer: u32 = @intCast(l);
+                    try self.readAheadSeed(layer, order(ctx, layer));
+                    for (self.ahead.reads[0..self.ahead.n]) |rd| n += @intFromBool(rd);
+                    try self.awaitReadAhead(layer);
+                }
+                // No prompt routed what the preload read.
+                self.ahead.tallied = true;
+                return n;
+            }
+
             /// P1's construction self-check: `experts` of `layer` (none resident, one route wide) read ahead, hashed, zeroed and
             /// forgotten, then read again by a demand route; each record's bytes must equal both ways, bit for bit. The layer
             /// is left as found (the experts not resident, their rows empty).
@@ -1533,9 +1556,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         m.* = .{};
                     }
                     ls.policy.shrink(rows) catch unreachable;
-                    // The one place that decides which residents a later prompt finds: none, as at construction (its
-                    // schedule then equals the first prompt's; slot bytes stay, a load of the same record skips its read).
-                    _ = ls.policy.forgetAll();
+                    // The one place that decides which residents a later prompt finds: those of the prompt rows
+                    // (`keep_residents`, their prompt state cleared), or none, as at construction (its schedule then equals
+                    // the first prompt's; slot bytes stay, a load of the same record skips its read).
+                    if (self.keep_residents) ls.policy.forgetPrompt() else _ = ls.policy.forgetAll();
                     if (ls.ext) |*e| e.deinit();
                     ls.ext = null;
                 }

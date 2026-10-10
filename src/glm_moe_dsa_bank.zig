@@ -661,3 +661,45 @@ test "glm bank: the stream serves every routed id from a slot holding its record
     }
     try s.flush();
 }
+
+test "glm bank: the preload fills the prompt rows; a later prompt finds the residents a decode left (keep_residents)" {
+    var sb = try SynthBank.open();
+    defer sb.close();
+    const b = &sb.bank;
+    for ([_]bool{ true, false }) |keep| {
+        const s = try Stream.Stream.init(testing.allocator, b, .{ .rows = &.{ 4, 6, 3, 5 }, .max_route_ids = 16, .transient_rows = 32, .wide_depth = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 }, .transient_release = true, .keep_residents = keep });
+        defer s.deinit();
+        var order: [16]u16 = undefined;
+        for (&order, 0..) |*e, i| e.* = @intCast(15 - i);
+        const fill = struct {
+            fn f(o: []const u16, _: u32) []const u16 {
+                return o;
+            }
+        }.f;
+        // Each layer's rows take the first experts of the order, read and landed.
+        try testing.expectEqual(@as(u64, 4 + 6 + 3 + 5), try s.preload(@as([]const u16, &order), fill));
+        for ([_]u32{ 4, 6, 3, 5 }, 0..) |rows, l| for (order[0..rows]) |e| {
+            try testing.expect(s.layers[l].policy.slotOf(e) != null);
+        };
+        // A prompt route of the preloaded experts reads nothing.
+        const st0 = s.stats();
+        var r = try s.route(1, order[0..6], &.{});
+        try testing.expectEqual(@as(u32, 6), r.plan.n_hits);
+        s.release(r);
+        try s.flush();
+        try testing.expectEqual(st0.expert_bytes_read, s.stats().expert_bytes_read);
+        // A decode and the return to the prompt phase: the prompt rows' residents stay only with `keep_residents`.
+        _ = try s.releaseTransient();
+        try s.grow(&.{ 6, 8, 5, 7 });
+        _ = try s.shrink(&.{ 4, 6, 3, 5 });
+        _ = try s.regrowTransient();
+        r = try s.route(1, order[0..6], &.{});
+        try testing.expectEqual(@as(u32, if (keep) 6 else 0), r.plan.n_hits);
+        for (0..r.n_parts) |p| {
+            try s.waitGu(r, @intCast(p));
+            try s.waitDown(r, @intCast(p));
+        }
+        s.release(r);
+        try s.flush();
+    }
+}

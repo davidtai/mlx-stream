@@ -262,13 +262,19 @@ pub const LayerPolicy = struct {
             e.* = no_expert;
         };
         p.occupancy = 0;
+        p.forgetPrompt();
+        return n;
+    }
+
+    /// The prompt state of a past request forgotten (protection, the seed, the prompt counts, recency), its residents
+    /// kept: a later prompt finds them resident.
+    pub fn forgetPrompt(p: *LayerPolicy) void {
         p.protected.unsetAll();
         p.seed.unsetAll();
         p.seed_ranks = 0;
         @memset(p.prefill_freq, 0);
         @memset(p.recency, 0);
         p.clock = 0;
-        return n;
     }
 
     /// The one phase change: `capacity` persistent slots from now on, the new
