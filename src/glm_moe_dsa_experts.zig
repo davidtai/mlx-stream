@@ -500,6 +500,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             for (sides, 0..) |sd, i| if (sd.n > 0) {
                 last = i;
             };
+            // The route recorder (a diagnostic): one route of the call, each bank layer's route flags its own ids.
+            if (self.stream.recorder) |rec| if (self.stream.phase == .decode) rec.call(layer, ids);
+            defer if (self.stream.recorder) |rec| rec.endCall();
             for (&sides, 0..) |*sd, i| {
                 if (sd.n == 0) continue;
                 const r = if (i == last) try self.stream.route(sd.sl, sd.ids[0..sd.n], sc) else try self.stream.routeHeld(sd.sl, sd.ids[0..sd.n]);

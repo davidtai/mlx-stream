@@ -8,6 +8,7 @@ const expert = @import("../expert.zig");
 const expert_io = @import("io.zig");
 const expert_policy = @import("policy.zig");
 const expert_lookahead = @import("lookahead.zig");
+const expert_routes = @import("routes.zig");
 
 /// `probed`: the plugin's prefill-timers build (its read-ahead probes compiled in; every other build has no field, call or
 /// branch for them).
@@ -443,6 +444,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// Decode layer calls with the lookahead class: this call's settle value.
             tag: i64 = 0,
             gates: ?Gates = null,
+            /// Its record in the route recorder (`Stream.recorder`).
+            rec: u32 = expert_routes.none,
 
             pub fn partsOf(r: *const Route) []const Part {
                 return r.parts[0..r.n_parts];
@@ -542,6 +545,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             owner: std.Thread.Id,
             /// P1: the prompt pass's read-ahead in flight (one layer's predicted seed).
             ahead: Ahead,
+            /// The route recorder, a diagnostic its arch arms (`expert.routes`): every decode route, the handover's
+            /// residents and prompt counts. Null: off.
+            recorder: ?*expert_routes.Recorder = null,
 
             /// P1's read-ahead of one layer: `loads[0..n]` (expert, slot) in file order, `reads[i]` false when the
             /// slot still held the record; its pool jobs `parts[0..n_parts]` over them (a Route's tickets).
@@ -939,6 +945,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (!held) m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = l.expert };
                     m.pins = 1;
                 }
+                if (self.recorder) |rec| if (self.phase == .decode) {
+                    r.rec = rec.route(layer, ids, plan, r.reads[0..plan.n_loads]);
+                };
                 try self.submitParts(r);
                 if (lookahead) {
                     r.tag = tag;
@@ -988,7 +997,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (scores.len > 0 and next < self.layers.len) {
                     const sel = &self.selector.?;
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
-                    for (sel.select(scores, &self.layers[next].policy, chosen[0..sel.budget])) |e| {
+                    const picked = sel.select(scores, &self.layers[next].policy, chosen[0..sel.budget]);
+                    if (self.recorder) |rec| rec.spec(r.rec, picked);
+                    for (picked) |e| {
                         bases[n] = @intCast(self.bank.recordOffset(next, e));
                         n += 1;
                     }
@@ -1017,7 +1028,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         }
                     }.f;
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
-                    for (sel.selectWith(scores, Ctx{ .s = self, .routed = next }, resident, chosen[0..sel.budget])) |e| {
+                    const picked = sel.selectWith(scores, Ctx{ .s = self, .routed = next }, resident, chosen[0..sel.budget]);
+                    if (self.recorder) |rec| rec.spec(r.rec, picked);
+                    for (picked) |e| {
                         const sl = self.bank.streamLayer(next, e);
                         bases[n] = @intCast(self.bank.recordOffset(sl, e));
                         lens[n] = @intCast(spanOf(&self.bank.layers[sl]));
@@ -1191,11 +1204,20 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 p.settled = true;
                 const ls = &self.layers[r.layer];
+                // A read load's records are entries `i ..` of the part (`entries`): its first one's gate/up ticket is `i`.
+                const mn = minisOf(&self.bank.layers[r.layer]);
+                var i: u32 = 0;
                 for (r.order[p.first..][0..p.n]) |li| {
                     if (!r.reads[li]) continue;
                     const l = r.plan.loads[li];
                     self.locate(r.layer, l.slot).meta.state = if (ok) .ready else .failed;
                     if (!ok and l.persistent) ls.policy.invalidate(l.expert);
+                    // The recorder: a gate/up range that ran no preadv was copied out of a lookahead record.
+                    if (self.recorder) |rec| if (ok) {
+                        const gu = self.pool.result(p.ticket + i);
+                        rec.settled(r.rec, l.expert, gu.preadv_calls == 0 and gu.payload > 0);
+                    };
+                    i += mn;
                 }
                 if (!ok) return self.fail(if (waited) |_| error.ReadFailed else |e| e);
             }
@@ -1502,6 +1524,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.wide_depth = 1;
                 self.route_lookahead = self.selector != null;
                 self.route_preread = self.route_lookahead and self.preread;
+                if (self.recorder) |rec| for (self.layers, 0..) |*ls, l| {
+                    rec.handover(@intCast(l), ls.policy.prefill_freq, ls.policy.slot_to_expert[0..ls.policy.capacity], ls.base.rows);
+                };
             }
 
             /// The reverse phase change's free (the return to the prompt phase before a later prompt; the caller synchronized

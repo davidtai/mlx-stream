@@ -44,6 +44,7 @@ comptime {
     _ = @import("expert_policy_test.zig");
     _ = @import("expert_stream.zig");
     _ = @import("expert_stream_of_test.zig");
+    _ = @import("expert_routes_test.zig");
     _ = @import("exl3_kernels.zig");
     _ = @import("exl3_selfcheck.zig");
     _ = @import("exl3_kernel_ops_gate.zig");

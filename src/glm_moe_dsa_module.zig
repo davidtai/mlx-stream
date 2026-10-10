@@ -7,7 +7,8 @@
 //! if the previous one decoded, the prompt pass (layer by layer over the whole prompt, or chunk by chunk), the decode
 //! handover (the transient scratch freed, the slot rows grown to the decode fill), serial steps. A later prompt keeps
 //! the KV of the prefix it shares with the state (`restorePrefix`). One log line at the prompt pass's end and one at the
-//! request's end report the phase's reads from the stream's counters (`PromptLine`, `DecodeLine`).
+//! request's end report the phase's reads from the stream's counters (`PromptLine`, `DecodeLine`). With `GLM53_ROUTES`
+//! set at construction, the route recorder (`expert.routes`) writes each request's decode routes at its end.
 //!
 //! With `mtp_depth` set, the MTP draft lane (`glm_moe_dsa_mtp`, its bank kind bound at comptime: the served module's is
 //! EXL3): the prompt pass keeps every row's final-normed hidden and appends the MTP layer's keys of each pair whose next
@@ -22,6 +23,7 @@ const log = @import("sdk").log;
 const sdk_ext = @import("sdk_ext.zig");
 const quant = sdk_ext.quant;
 const expert_event = sdk_ext.expert.event;
+const expert_routes = sdk_ext.expert.routes;
 const glm = @import("glm_moe_dsa.zig");
 const settings = @import("glm_moe_dsa_settings.zig");
 const bill_mod = @import("glm_moe_dsa_bill.zig");
@@ -47,6 +49,8 @@ pub const lookahead: struct { k: u32 = 8 } = .{};
 pub const event_watchdog_ms: u32 = 2000;
 /// The chunk-major prompt pass's chunk (`layer_major_prefill` off).
 pub const prefill_chunk_tokens: u32 = 2048;
+/// The route recorder's diagnostic switch (`expert.routes`), read once at construction.
+pub const routes_env = "GLM53_ROUTES";
 
 /// What the host hands the construction: the GPU ceiling and the wired margin (`LoadCtx`), never read elsewhere.
 pub const Host = struct { ceiling: u64, wired_margin: u64 };
@@ -127,6 +131,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         layer_rates: []f64,
         /// The MTP draft lane (null: `mtp_depth` 0).
         mtp: ?*Lane = null,
+        /// The route recorder (`routes_env`; null: off) and the directory its files go to.
+        recorder: ?*expert_routes.Recorder = null,
+        routes_dir: []const u8 = "",
 
         const DecodeMark = struct { s0: Stats, steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0 };
 
@@ -217,6 +224,13 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
             });
             errdefer self.stream.deinit();
+            if (expert_routes.dirOf(std.c.getenv(routes_env))) |d| {
+                self.recorder = try expert_routes.Recorder.init(gpa, @intCast(n_bank), self.bank.n_experts, model.n_experts_per_tok, Experts.bpl);
+                self.routes_dir = d;
+                self.stream.recorder = self.recorder;
+                log.info("glm_moe_dsa: {s} is set: each request's decode routes are written under {s}\n", .{ routes_env, d });
+            }
+            errdefer if (self.recorder) |rec| rec.deinit();
             if (gated and !gpu) self.event = try expert_event.createHost(@constCast(self.stream.eventWord().?), @as(i64, event_watchdog_ms) * std.time.ns_per_ms);
             self.w = try graph.Weights.bind(gpa, weights, model, &diag);
             errdefer self.w.deinit(gpa);
@@ -241,6 +255,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.cache.deinit(&self.g);
             self.ex.deinit(&self.g);
             self.stream.deinit();
+            if (self.recorder) |rec| rec.deinit();
             self.math.deinit(&self.g);
             self.w.deinit(self.gpa);
             self.bank.deinit();
@@ -289,6 +304,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }
             try self.reverse();
             self.stream.resetPromptCounts();
+            if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth());
             const s0 = self.stream.stats();
             const t0 = self.nowNs();
             var logits: ?mlx.mlx_array = null;
@@ -338,6 +354,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 d.tokens += ids.len;
                 d.wall_ns += self.nowNs() - t0;
             }
+            if (self.recorder) |rec| rec.endStep(@intCast(ids.len), 0, 0, @intCast(ids.len), self.nowNs() - t0);
             return logits;
         }
 
@@ -391,6 +408,19 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .rows_alt = if (Experts.bpl > 1) self.decode_rows[1] else null,
             }});
             log.info("{f}\n", .{HostLine{ .h = self.ex.host, .wall_ns = d.wall_ns }});
+            if (self.recorder) |rec| self.writeRoutes(rec);
+        }
+
+        /// The route recorder's file of the request that ended. A failure is logged; the request is not failed.
+        fn writeRoutes(self: *Self, rec: *expert_routes.Recorder) void {
+            if (!rec.any()) return;
+            var buf: [1024]u8 = undefined;
+            const path = std.fmt.bufPrint(&buf, "{s}/glm53-routes-{d}-{d}.bin", .{ self.routes_dir, std.c.getpid(), expert_routes.nextFile() }) catch return;
+            rec.write(self.gpa, self.io, path) catch |e| {
+                log.warn("glm_moe_dsa: the routes were not written to {s}: {s}\n", .{ path, @errorName(e) });
+                return;
+            };
+            log.info("glm_moe_dsa: routes written to {s} ({d} routes, {d} steps, {d} dropped)\n", .{ path, rec.routes.items.len, rec.steps.items.len, rec.dropped });
         }
 
         /// The reverse phase change, before a prompt after a decode: every route settled, the grown rows and window 0
@@ -494,6 +524,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 ln.counts.decided[mtp_mod.tenth(tp)] += 1;
                 if (i < d.accepted) ln.counts.accepted_by_p[mtp_mod.tenth(tp)] += 1;
             }
+            if (self.recorder) |rec| rec.endStep(depth + 1, depth, d.accepted, rows, ns);
             if (self.decode_mark) |*dm| {
                 dm.steps += 1;
                 dm.tokens += rows;
