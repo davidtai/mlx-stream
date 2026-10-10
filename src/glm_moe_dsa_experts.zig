@@ -23,6 +23,60 @@ const ops = @import("deepseek_v41_ops.zig");
 const glm = @import("glm_moe_dsa.zig");
 const pt = @import("glm_moe_dsa_prefill_timers.zig");
 
+/// The wide lane's combine (`combineGpu`): one thread per token and 4 hidden values, the token's `K` routed rows in
+/// routed order.
+const combine_source =
+    \\    const uint t = thread_position_in_grid.y;
+    \\    const uint h = thread_position_in_grid.x * 4;
+    \\    if (h >= H) return;
+    \\    float4 acc = float4(0.0f);
+    \\    for (int k = 0; k < K; ++k) {
+    \\        const uint row = inv[t * K + k];
+    \\        const vec<T, 4> y = *(const device vec<T, 4>*)(joined + ulong(row) * H + h);
+    \\        acc = acc + float4(y) * w[t * K + k];
+    \\    }
+    \\    *(device vec<T, 4>*)(out + ulong(t) * H + h) = vec<T, 4>(acc);
+;
+
+/// `(y * scores[..., None]).sum(-2)` of the joined rows `joined [n * k, hidden]` in routed order (`inv [n * k]` u32:
+/// token t's j-th routed row is `joined[inv[t * k + j]]`) as one launch: each token's rows weighted and summed in f32
+/// in routed order, products and sums rounded apart (no contraction), cast to `dt`; the op chain's bits.
+fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, joined: ops.MlxOps.T, inv: ops.MlxOps.T, scores: ops.MlxOps.T, n: u32, k: u32, hidden: c_int, dt: ops.Dtype) !ops.MlxOps.T {
+    const kern = slot.* orelse blk: {
+        const ins = [_][*:0]const u8{ "joined", "inv", "w" };
+        const outs = [_][*:0]const u8{"out"};
+        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const kn = mlx.mlx_fast_metal_kernel_new("glm_moe_dsa_combine", iv, ov, combine_source, "#pragma METAL fp contract(off)\n", true, false);
+        if (kn.ctx == null) return error.MetalKernelCompileFailed;
+        slot.* = kn;
+        break :blk kn;
+    };
+    const h4: c_int = @divExact(hidden, 4);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ @intCast(n), hidden }, 2, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, h4, @intCast(n), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(h4, 256), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", hidden));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", @intCast(k)));
+    const inputs = [_]mlx.mlx_array{ joined, inv, scores };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
+    var out = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_vector_array_get(&out, ov, 0)) catch |e| {
+        _ = mlx.mlx_array_free(out);
+        return e;
+    };
+    return g.adopt(out);
+}
+
 pub const BankKind = sdk_ext.expert.BankKind;
 pub const SlotRef = sdk_ext.expert.SlotRef;
 pub const max_route_ids = expert_policy.max_route_ids;
@@ -68,6 +122,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// The decode lane's read bytes by the first row of the call that routes the expert (row i of `x`), summed over
         /// calls until the caller zeroes it: a draft round's verify attributes its reads to the rows it keeps or rejects.
         row_bytes: [max_route_ids]u64 = @splat(0),
+        /// The wide lane's combine on the GPU (`combine_source`), built at its first call.
+        combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
 
         /// The wide lane's host scratch, reused across calls.
         const Wide = struct {
@@ -104,6 +160,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         }
 
         pub fn deinit(self: *Self, g: *G) void {
+            if (self.combine_kernel) |kern| _ = mlx.mlx_fast_metal_kernel_free(kern);
             self.wide.deinit(self.a, g);
             self.a.free(self.banks);
             self.* = undefined;
@@ -731,6 +788,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             w.kept.clearRetainingCapacity();
             try w.inv.resize(a, n_ids);
             for (w.pos.items, 0..) |p, j| w.inv.items[p] = @intCast(j);
+            if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0) {
+                const inv = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
+                return combineOnGpu(&self.combine_kernel, g, joined, inv, scores, n, k, self.hidden, g.dtypeOf(x));
+            }
             var outs: std.ArrayList(T) = .empty;
             defer outs.deinit(a);
             const ts: u32 = @intCast(glm.combine_slice_tokens);
@@ -751,4 +812,44 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             return d[s0..@min(s0 + group_n, d.len)];
         }
     };
+}
+
+test "glm experts: the wide lane's GPU combine equals the op chain's bits at GLM-5.3's hidden size" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try ops.MlxOps.init(a, s);
+    defer g.deinit();
+    var slot: ?mlx.mlx_fast_metal_kernel = null;
+    defer if (slot) |kern| {
+        _ = mlx.mlx_fast_metal_kernel_free(kern);
+    };
+    const n: u32 = 300;
+    const k: u32 = glm.routed_top_k;
+    const hidden: c_int = 6144;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+    const yv = try a.alloc(f32, n * k * @as(usize, @intCast(hidden)));
+    defer a.free(yv);
+    for (yv) |*v| v.* = rand.floatNorm(f32);
+    const wv = try a.alloc(f32, n * k);
+    defer a.free(wv);
+    for (wv) |*v| v.* = rand.float(f32);
+    // The joined rows in a shuffled order and its inverse, as the wide lane's groups leave them.
+    const inv = try a.alloc(u32, n * k);
+    defer a.free(inv);
+    for (inv, 0..) |*v, i| v.* = @intCast(i);
+    rand.shuffle(u32, inv);
+    const joined = try g.astype(try g.hostArray(std.mem.sliceAsBytes(yv), &.{ @intCast(n * k), hidden }, .float32), .bfloat16);
+    const scores = try g.hostArray(std.mem.sliceAsBytes(wv), &.{ @intCast(n), @intCast(k) }, .float32);
+    const ord = try g.hostArray(std.mem.sliceAsBytes(inv), &.{@intCast(n * k)}, .uint32);
+    const got = try combineOnGpu(&slot, &g, joined, ord, scores, n, k, hidden, .bfloat16);
+    const y = try g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), hidden });
+    const want = try g.astype(try g.sum(try g.mul(y, try g.expandDims(scores, -1)), -2, false), .bfloat16);
+    const same = try g.astype(try g.equal(got, want), .float32);
+    const all = try g.sum(try g.sum(same, -1, false), -1, false);
+    var out: [1]f32 = undefined;
+    _ = try g.hostF32(all, &out);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(n * @as(u32, @intCast(hidden)))), out[0]);
 }
