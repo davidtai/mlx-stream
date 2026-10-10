@@ -7,6 +7,11 @@ converted.
 
   scripts/convert_glm_exl3_bank.py --src <EXL3 snapshot> --dst <pack> --residents-from <affine pack> [--resume]
       [--verify N|all] [--source-repo R --source-revision SHA] [--stop-after-layer K]
+  scripts/convert_glm_exl3_bank.py --mtp-only --dst <affine pack>/mtp (--from-pack <EXL3 pack> | --src <EXL3 snapshot>)
+      [--verify N|all] [--source-repo R --source-revision SHA]
+`--mtp-only` writes the MTP layer alone: `mtp-residents.safetensors` (a hard link to the EXL3 pack's file, or written
+from the snapshot), `mtp-experts.bin` with the MTP bank layers and `mtp-manifest-exl3-v1.json`. A record copied from
+a pack must match the pack manifest's sha256.
 Writes `convert-progress.json` after each bank layer and `convert-report.json` at the end. `--resume` keeps the
 finished bank layers whose first and last record still match their sha256. `--verify` re-reads records from
 `experts.bin` and compares them with the source slices and the recorded sha256. `--stop-after-layer` takes a bank
@@ -32,6 +37,8 @@ SIDECAR = "experts.bin"
 PROGRESS = "convert-progress.json"
 REPORT = "convert-report.json"
 MTP_RESIDENTS = "mtp-residents.safetensors"
+MTP_SIDECAR = "mtp-experts.bin"
+MTP_MANIFEST = "mtp-manifest-exl3-v1.json"
 TIER = "tier_bitmap.json"
 INDEX = "model.safetensors.index.json"
 ALIGN = 4096
@@ -134,17 +141,24 @@ def expected_names(g):
             for r in range(g["tp"]) for part in ["trellis", "suh", "svh", "mcg"]}
 
 
-def check_names(g, names):
+def layer_of(name):
+    return int(name.split(".")[2])
+
+
+def check_names(g, names, only=None):
+    """Refuses a missing routed expert tensor or an unknown tensor under `.mlp.experts.`; `only` limits the second
+    check to those model layers."""
     want = expected_names(g)
     for n in sorted(want - set(names)):
         raise Refused("%s is missing" % n)
-    for n in sorted(n for n in names if EXPERT_RE.match(n) and n not in want):
+    for n in sorted(n for n in names if EXPERT_RE.match(n) and n not in want
+                    and (only is None or layer_of(n) in only)):
         raise Refused("%s is not a routed expert tensor of the pack format" % n)
 
 
-def check_experts(srcs, g):
+def check_experts(srcs, g, only=None):
     """Refuses a tensor whose dtype or shape differs from the format for its expert's K; returns the mcg value."""
-    check_names(g, srcs.tensors)
+    check_names(g, srcs.tensors, only)
     mcg = None
     for L in g["layers"]:
         for e in range(g["n_experts"]):
@@ -331,6 +345,175 @@ def manifest(g, mcg, records, parity, repo, revision):
     }
 
 
+def mtp_geometry(g):
+    """The MTP layers' part of the bank `g`, renumbered from bank layer 0 with offsets from 0."""
+    bank, base = [], 0
+    for b in g["bank"]:
+        if not b["mtp"]:
+            continue
+        b = dict(b, bank_layer=len(bank), base_offset=base)
+        bank.append(b)
+        base += b["n_minis"] * b["record_bytes"]
+    if not bank:
+        raise Refused("the source has no MTP layer (num_nextn_predict_layers is 0)")
+    return dict(g, layers=list(g["mtp"]), bank=bank, size=base,
+                experts={str(L): g["experts"][str(L)] for L in g["mtp"]})
+
+
+def pack_geometry(pack):
+    """The bank of an EXL3 pack from its manifest; refuses a pack that misses a file or whose sidecar size differs."""
+    for f in [MANIFEST, SIDECAR, MTP_RESIDENTS]:
+        if not os.path.isfile(os.path.join(pack, f)):
+            raise Refused("EXL3 pack %s has no %s" % (pack, f))
+    m = json.load(open(os.path.join(pack, MANIFEST)))
+    if m.get("format") != FORMAT:
+        raise Refused("%s format %r is not %s" % (MANIFEST, m.get("format"), FORMAT))
+    size = os.path.getsize(os.path.join(pack, SIDECAR))
+    if size != m["sidecar"]["size"]:
+        raise Refused("%s is %d bytes, the manifest gives %d" % (SIDECAR, size, m["sidecar"]["size"]))
+    q, d = m["quantization"], m["dims"]
+    mtp = sorted({b["layer"] for b in m["layers"] if b["mtp"]})
+    g = {"hidden": d["hidden"], "inter": d["inter"], "mini_inter": d["mini_inter"], "tp": q["tp_ranks"],
+         "n_experts": d["n_experts"], "layers": sorted({b["layer"] for b in m["layers"]}), "mtp": mtp,
+         "k_values": q["k_values"], "multiplier": q["codebook_multiplier"], "bank": m["layers"],
+         "experts": m["experts"], "size": size}
+    sha = {}
+    for r in m["records"]:
+        sha[(r["bank_layer"], r["mini"])] = r["sha256"]
+    return g, m, sha
+
+
+def copy_mtp_bank(read, g, dst, want_sha=None):
+    """Writes the records of bank `g` to MTP_SIDECAR; `read(b, mini, e, r, buf)` fills buf[:logical] with the
+    source record and returns its sha256 hex. Refuses a record whose sha256 differs from `want_sha(b, mini)`.
+    Returns the sha256 of every record by bank layer."""
+    path = os.path.join(dst, MTP_SIDECAR)
+    if os.path.lexists(path):
+        os.remove(path)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    os.ftruncate(fd, g["size"])
+    shas = {}
+    done = False
+    try:
+        for b in g["bank"]:
+            buf = bytearray(b["record_bytes"])
+            shas[b["bank_layer"]] = [None] * b["n_minis"]
+            for mini, e, r in minis(g, b):
+                h = read(b, mini, e, r, buf)
+                if want_sha is not None and h != want_sha(b, mini):
+                    raise Refused("pack record of layer %d K%d mini %d differs from its sha256 in %s" % (
+                        b["layer"], b["k"], mini, MANIFEST))
+                shas[b["bank_layer"]][mini] = h
+                if os.pwrite(fd, buf, b["base_offset"] + mini * b["record_bytes"]) != len(buf):
+                    raise OSError("short write to %s at layer %d K%d mini %d" % (path, b["layer"], b["k"], mini))
+        os.fsync(fd)
+        done = True
+    finally:
+        os.close(fd)
+        if not done:
+            os.remove(path)
+    return shas
+
+
+def verify_mtp(read, g, dst, records, which):
+    picks = pick(len(records), which)
+    bad = 0
+    fd = os.open(os.path.join(dst, MTP_SIDECAR), os.O_RDONLY)
+    for k in picks:
+        r = records[k]
+        b = g["bank"][r["bank_layer"]]
+        buf = bytearray(b["logical_bytes"])
+        got = read_record(fd, b, r["mini"])
+        sha = read(b, r["mini"], r["expert"], r["rank"], buf)
+        if got != bytes(buf) or hashlib.sha256(got).hexdigest() != r["sha256"] or sha != r["sha256"]:
+            print("verify: bank layer %d mini %d (layer %d expert %d rank %d) differs" % (
+                r["bank_layer"], r["mini"], b["layer"], r["expert"], r["rank"]))
+            bad += 1
+    os.close(fd)
+    return {"all_pass": bad == 0, "checked": len(picks), "total": len(records), "method": "bytes-equal-source"}
+
+
+def same_device(a, dst):
+    near = os.path.abspath(dst)
+    while not os.path.exists(near):
+        near = os.path.dirname(near)
+    return os.stat(a).st_dev == os.stat(near).st_dev
+
+
+def run_mtp(a):
+    """--mtp-only: the MTP layer's residents, bank and manifest in `a.dst`."""
+    t0 = time.time()
+    if (a.from_pack is None) == (a.src is None):
+        raise Refused("--mtp-only takes one of --from-pack and --src")
+    if a.residents_from is not None or a.resume or a.stop_after_layer is not None:
+        raise Refused("--mtp-only takes no --residents-from, --resume or --stop-after-layer")
+    srcs, pfd = None, None
+    if a.from_pack is not None:
+        full, pm, pack_sha = pack_geometry(a.from_pack)
+        g = mtp_geometry(full)
+        mcg = pm["quantization"]["mcg_scalar"]
+        repo = a.source_repo if a.source_repo is not None else pm["source"]["repo"]
+        revision = a.source_revision if a.source_revision is not None else pm["source"]["revision"]
+        res = os.path.join(a.from_pack, MTP_RESIDENTS)
+        if not same_device(res, a.dst):
+            raise Refused("EXL3 pack %s is on another filesystem than %s" % (a.from_pack, a.dst))
+        pfd = os.open(os.path.join(a.from_pack, SIDECAR), os.O_RDONLY)
+        old = {(b["layer"], b["k"]): b for b in full["bank"]}
+
+        def read(b, mini, e, r, buf):
+            o = old[(b["layer"], b["k"])]
+            piece = os.pread(pfd, b["logical_bytes"], o["base_offset"] + mini * o["record_bytes"])
+            buf[:b["logical_bytes"]] = piece
+            return hashlib.sha256(piece).hexdigest()
+
+        def want(b, mini):
+            return pack_sha[(old[(b["layer"], b["k"])]["bank_layer"], mini)]
+    else:
+        for f in ["config.json", TIER]:
+            if not os.path.exists(os.path.join(a.src, f)):
+                raise Refused("%s has no %s" % (a.src, f))
+        full = geometry(json.load(open(os.path.join(a.src, "config.json"))),
+                        json.load(open(os.path.join(a.src, TIER))))
+        g = mtp_geometry(full)
+        srcs = Source(a.src)
+        mcg = check_experts(srcs, g, set(g["mtp"]))
+        repo, revision, want = a.source_repo, a.source_revision, None
+
+        def read(b, mini, e, r, buf):
+            return record_bytes(srcs, b, b["layer"], e, r, buf)
+    os.makedirs(a.dst, exist_ok=True)
+    try:
+        shas = copy_mtp_bank(read, g, a.dst, want)
+        path = os.path.join(a.dst, MTP_RESIDENTS)
+        if os.path.lexists(path):
+            os.remove(path)
+        if srcs is None:
+            os.link(res, path)
+            res_written = 0
+        else:
+            mtp = tuple("model.layers.%d." % L for L in g["mtp"])
+            names = [n for n in srcs.order if n.startswith(mtp) and not EXPERT_RE.match(n)]
+            res_written = write_safetensors(srcs, path, names)
+        records = records_of(g, {i: {"sha256": v} for i, v in shas.items()})
+        parity = {"all_pass": False, "checked": 0, "total": len(records), "method": "bytes-equal-source"}
+        if a.verify:
+            parity = verify_mtp(read, g, a.dst, records, a.verify)
+        m = manifest(g, mcg, records, parity, repo, revision)
+        m["sidecar"]["file"] = MTP_SIDECAR
+        write_json(os.path.join(a.dst, MTP_MANIFEST), m)
+    finally:
+        if srcs is not None:
+            srcs.close()
+        if pfd is not None:
+            os.close(pfd)
+    wall = time.time() - t0
+    written = g["size"] + res_written
+    print("mtp: records %d, bank layers %d, %.1f s, %.2f GB/s, parity all_pass=%s checked=%d/%d" % (
+        parity["total"], len(g["bank"]), wall, written / max(wall, 1e-9) / 1e9, str(parity["all_pass"]).lower(),
+        parity["checked"], parity["total"]))
+    return 0 if (not a.verify or parity["all_pass"]) else 1
+
+
 def run(a):
     t0 = time.time()
     for f in ["config.json", TIER]:
@@ -383,9 +566,11 @@ def run(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", required=True)
+    ap.add_argument("--src", default=None)
     ap.add_argument("--dst", required=True)
-    ap.add_argument("--residents-from", required=True)
+    ap.add_argument("--residents-from", default=None)
+    ap.add_argument("--mtp-only", action="store_true")
+    ap.add_argument("--from-pack", default=None)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--verify", default=None, type=verify_arg)
     ap.add_argument("--source-repo", default=None)
@@ -393,6 +578,10 @@ def main():
     ap.add_argument("--stop-after-layer", type=int, default=None)
     a = ap.parse_args()
     try:
+        if a.mtp_only:
+            return run_mtp(a)
+        if a.src is None or a.residents_from is None or a.from_pack is not None:
+            raise Refused("the full pack takes --src and --residents-from and no --from-pack")
         return run(a)
     except Refused as e:
         print("convert_glm_exl3_bank: refused: %s" % e, file=sys.stderr)

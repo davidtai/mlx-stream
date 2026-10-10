@@ -188,6 +188,8 @@ scripts/convert_glm_bank.py --src <snapshot> --dst <pack> --verify all \
 EXL3 snapshot (mcg trellis experts at K3 or K4, 4 ranks) into an EXL3 pack: one record per mini-expert in
 `experts.bin`, hard links to the residents of an affine pack on the same filesystem and `mtp-residents.safetensors`.
 `docs/glm53-exl3-pack-format.md` gives the format. Its tests: `scripts/test_convert_glm_exl3_bank.py`.
+`--mtp-only --from-pack <EXL3 pack> --dst <affine pack>/mtp` writes the MTP layer alone (its residents, its experts
+in `mtp-experts.bin`, `mtp-manifest-exl3-v1.json`) for the MTP draft lane of an affine pack.
 
 ## Layout
 

@@ -5,6 +5,7 @@ and a tiny affine residents pack. The converter copies bytes and never decodes t
 import hashlib
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -364,3 +365,111 @@ def test_refuses_residents_pack(tmp_path, remove):
         cause = "residents pack %s has no %s" % (res, remove)
     r = convert(src, str(tmp_path / "dst"), res)
     assert (r.returncode, r.stderr.strip()) == (2, "convert_glm_exl3_bank: refused: " + cause)
+
+
+MTP_FILES = ["mtp-residents.safetensors", "mtp-experts.bin", "mtp-manifest-exl3-v1.json"]
+
+
+def convert_mtp(dst, *args):
+    return subprocess.run([sys.executable, "-I", CONVERTER, "--mtp-only", "--dst", dst] + list(args),
+                          capture_output=True, text=True)
+
+
+def mtp_bank():
+    """The MTP bank layers of bank(), renumbered from 0 with offsets from 0."""
+    layers, _ = bank()
+    out, base = [], 0
+    for l in layers:
+        if l["mtp"]:
+            out.append(dict(l, bank_layer=len(out), base_offset=base))
+            base += l["n_minis"] * l["record_bytes"]
+    return out, base
+
+
+def test_mtp_only_from_pack(packed, tmp_path):
+    src, res, dst, t = packed
+    out = str(tmp_path / "pack" / "mtp")
+    r = ok(convert_mtp(out, "--from-pack", dst, "--verify", "all"))
+    assert sorted(os.listdir(out)) == sorted(MTP_FILES)
+    assert (os.stat(os.path.join(out, "mtp-residents.safetensors")).st_ino
+            == os.stat(os.path.join(dst, "mtp-residents.safetensors")).st_ino)
+    layers, size = mtp_bank()
+    full, _ = bank()
+    data = open(os.path.join(out, "mtp-experts.bin"), "rb").read()
+    first = [l for l in full if l["mtp"]][0]["base_offset"]
+    assert len(data) == size
+    assert data == open(os.path.join(dst, "experts.bin"), "rb").read()[first:]
+    for l in layers:
+        for local, e in enumerate(l["experts"]):
+            for rank in range(TP):
+                off = l["base_offset"] + (local * TP + rank) * l["record_bytes"]
+                assert data[off:off + l["logical_bytes"]] == source_record(t, MTP, e, rank)
+    m = json.load(open(os.path.join(out, "mtp-manifest-exl3-v1.json")))
+    assert m["format"] == "mlx-stream-expert-manifest-exl3-v1"
+    assert m["source"] == {"repo": "test/glm-exl3", "revision": "0" * 40}
+    assert m["quantization"]["mcg_scalar"] == MCG
+    assert m["dims"] == {"hidden": HIDDEN, "inter": INTER, "mini_inter": MINI, "n_experts": N_EXP,
+                         "n_model_layers": 1, "n_bank_layers": 2}
+    assert m["layers"] == layers
+    assert m["experts"] == {"4": [[4, 0], [4, 1], [3, 0], [4, 2]]}
+    assert m["sidecar"] == {"file": "mtp-experts.bin", "alignment": 4096, "size": size}
+    assert m["records"] == [
+        {"bank_layer": l["bank_layer"], "mini": local * TP + rank, "expert": e, "rank": rank,
+         "sidecar_offset": l["base_offset"] + (local * TP + rank) * l["record_bytes"],
+         "sha256": hashlib.sha256(source_record(t, MTP, e, rank)).hexdigest()}
+        for l in layers for local, e in enumerate(l["experts"]) for rank in range(TP)]
+    assert m["parity"] == {"all_pass": True, "checked": 16, "total": 16, "method": "bytes-equal-source"}
+    assert "mtp: records 16, bank layers 2" in r.stdout
+
+
+def test_mtp_only_from_snapshot_matches_pack(packed, tmp_path):
+    src, res, dst, t = packed
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    ok(convert_mtp(a, "--from-pack", dst))
+    ok(convert_mtp(b, "--src", src, "--source-repo", "test/glm-exl3", "--source-revision", "0" * 40))
+    for f in MTP_FILES:
+        assert open(os.path.join(a, f), "rb").read() == open(os.path.join(b, f), "rb").read(), f
+    assert os.stat(os.path.join(b, "mtp-residents.safetensors")).st_nlink == 1
+    m = json.load(open(os.path.join(b, "mtp-manifest-exl3-v1.json")))
+    assert m["parity"] == {"all_pass": False, "checked": 0, "total": 16, "method": "bytes-equal-source"}
+
+
+def test_mtp_only_refuses_a_pack_record_off_its_sha(packed, tmp_path):
+    src, res, dst, t = packed
+    pack = str(tmp_path / "pack")
+    os.makedirs(pack)
+    for f in ["experts.bin", MANIFEST, "mtp-residents.safetensors"]:
+        shutil.copyfile(os.path.join(dst, f), os.path.join(pack, f))
+    l = [l for l in bank()[0] if l["mtp"]][1]
+    off = l["base_offset"] + 3 * l["record_bytes"] + 7
+    with open(os.path.join(pack, "experts.bin"), "r+b") as f:
+        f.seek(off)
+        v = f.read(1)
+        f.seek(off)
+        f.write(bytes([v[0] ^ 0x01]))
+    out = str(tmp_path / "mtp")
+    r = convert_mtp(out, "--from-pack", pack)
+    assert (r.returncode, r.stderr.strip()) == (
+        2, "convert_glm_exl3_bank: refused: pack record of layer 4 K4 mini 3 differs from its sha256 in "
+           "expert-manifest-exl3-v1.json")
+    assert not os.path.exists(os.path.join(out, "mtp-experts.bin"))
+
+
+@pytest.mark.parametrize("case", ["both", "neither", "residents", "no-manifest"])
+def test_mtp_only_refuses_arguments(packed, tmp_path, case):
+    src, res, dst, t = packed
+    out = str(tmp_path / "mtp")
+    if case == "both":
+        args, cause = ["--from-pack", dst, "--src", src], "--mtp-only takes one of --from-pack and --src"
+    elif case == "neither":
+        args, cause = [], "--mtp-only takes one of --from-pack and --src"
+    elif case == "residents":
+        args = ["--from-pack", dst, "--residents-from", res]
+        cause = "--mtp-only takes no --residents-from, --resume or --stop-after-layer"
+    else:
+        pack = str(tmp_path / "pack")
+        os.makedirs(pack)
+        args, cause = ["--from-pack", pack], "EXL3 pack %s has no expert-manifest-exl3-v1.json" % pack
+    r = convert_mtp(out, *args)
+    assert (r.returncode, r.stderr.strip()) == (2, "convert_glm_exl3_bank: refused: " + cause)
+    assert not os.path.exists(out)

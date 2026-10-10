@@ -78,6 +78,24 @@ DeepSeek-V4.1 EXL3 bank (`src/expert_bank.zig` `Component`). `code` is the trell
 
 The links are hard links, never copies, so the affine pack and the EXL3 pack must be on one filesystem.
 
+## MTP directory
+
+`--mtp-only` writes the MTP layer alone into a directory, intended `<affine pack>/mtp/`, so that the affine pack
+can serve the MTP draft lane:
+
+| file | content |
+|---|---|
+| `mtp-residents.safetensors` | with `--from-pack`: a hard link to the EXL3 pack's file; with `--src`: written from the snapshot as above |
+| `mtp-experts.bin` | the MTP layer's bank layers, record bytes unchanged |
+| `mtp-manifest-exl3-v1.json` | the manifest of those bank layers only |
+
+The manifest has the format above with these differences: `layers` holds the MTP bank layers only, renumbered from
+bank layer 0, with `base_offset` from 0 in `mtp-experts.bin`; `experts` holds the MTP layer only;
+`dims.n_model_layers` and `dims.n_bank_layers` count the MTP layer only; `sidecar.file` is `mtp-experts.bin`.
+With `--from-pack` the source of each record is the EXL3 pack's `experts.bin`, and the converter refuses a record
+whose sha256 differs from the pack manifest's; `source` comes from the pack manifest unless `--source-repo` and
+`--source-revision` are given. `--verify` compares the records with the pack or the snapshot.
+
 ## Manifest `expert-manifest-exl3-v1.json`
 
 ```json
