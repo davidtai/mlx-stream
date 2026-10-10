@@ -591,6 +591,12 @@ fn perSecond(n: u64, ns: u64) f64 {
     return if (ns == 0) 0 else @as(f64, @floatFromInt(n)) / seconds(ns);
 }
 
+/// The share of `wall` with a read in flight, in percent (0 for no wall time).
+fn busyPct(in_flight: u64, wall: u64) f64 {
+    if (wall == 0) return 0;
+    return 100 * @min(@as(f64, @floatFromInt(in_flight)) / @as(f64, @floatFromInt(wall)), 1);
+}
+
 fn gigabytes(b: u64) f64 {
     return @as(f64, @floatFromInt(b)) / 1e9;
 }
@@ -624,8 +630,8 @@ pub const DecodeLine = struct {
             p.steps, p.tokens, seconds(p.wall_ns), perSecond(p.tokens, p.wall_ns), p.r.hits + p.r.misses, p.r.hits, p.r.misses,
         });
         if (p.hit_rate) |h| try w.print(" (hit rate per layer min {d:.0}% median {d:.0}% max {d:.0}%)", .{ h.min, h.median, h.max });
-        try w.print(", {d:.2} GB from the SSD ({d:.3} GB per emitted token), lookahead {d} issued / {d} used (landed {d}, expired {d}, abandoned {d}, cancelled {d}, discarded {d}, used while in flight {d}), lookahead {d:.2} GB read / {d:.2} GB served, {d} loads skipped, {d} direct reads, host wait {d:.2} s and reads in flight {d:.2} s of {d:.2} s, {d}", .{
-            gigabytes(p.r.ssd_bytes), if (p.tokens == 0) 0 else gigabytes(p.r.ssd_bytes) / @as(f64, @floatFromInt(p.tokens)), p.r.spec_issued, p.r.spec_used, p.r.spec_landed, p.r.spec_expired, p.r.spec_abandoned, p.r.spec_cancelled, p.r.spec_discarded, p.r.spec_late, gigabytes(p.r.spec_bytes), gigabytes(p.r.spec_served_bytes), p.r.loads_skipped, p.r.direct, seconds(p.r.wait_ns), seconds(p.r.in_flight_ns), seconds(p.wall_ns), p.rows,
+        try w.print(", {d:.2} GB from the SSD ({d:.3} GB per emitted token), lookahead {d} issued / {d} used (landed {d}, expired {d}, abandoned {d}, cancelled {d}, discarded {d}, used while in flight {d}), lookahead {d:.2} GB read / {d:.2} GB served, {d} loads skipped, {d} direct reads, host wait {d:.2} s and reads in flight {d:.2} s of {d:.2} s ({d:.1}% busy, {d:.1}% with no read in flight), {d}", .{
+            gigabytes(p.r.ssd_bytes), if (p.tokens == 0) 0 else gigabytes(p.r.ssd_bytes) / @as(f64, @floatFromInt(p.tokens)), p.r.spec_issued, p.r.spec_used, p.r.spec_landed, p.r.spec_expired, p.r.spec_abandoned, p.r.spec_cancelled, p.r.spec_discarded, p.r.spec_late, gigabytes(p.r.spec_bytes), gigabytes(p.r.spec_served_bytes), p.r.loads_skipped, p.r.direct, seconds(p.r.wait_ns), seconds(p.r.in_flight_ns), seconds(p.wall_ns), busyPct(p.r.in_flight_ns, p.wall_ns), 100 - busyPct(p.r.in_flight_ns, p.wall_ns), p.rows,
         });
         if (p.rows_alt) |r2| try w.print(" / {d} rows per bank layer (its two Ks)", .{r2}) else try w.writeAll(" rows per layer");
     }
@@ -650,7 +656,7 @@ test "glm stats lines: the prompt and decode lines and the per-layer hit spread,
     try testing.expectEqualStrings("glm_moe_dsa: prompt 1008 tokens in 31.50 s (32.0 tok/s): 9.00 GB from the SSD, 380 records on demand, 50 read ahead (40 routed), host wait 1.50 s", p);
     const d = try std.fmt.allocPrint(a, "{f}", .{DecodeLine{ .steps = 40, .tokens = 128, .wall_ns = 25_000_000_000, .r = r, .hit_rate = hitSpread(&c0, &c1, &rates), .rows = 136 }});
     defer a.free(d);
-    try testing.expectEqualStrings("glm_moe_dsa: decode 40 steps, 128 tokens in 25.00 s (5.1 tok/s): 1000 routed records, 600 hits, 400 misses (hit rate per layer min 25% median 50% max 75%), 9.00 GB from the SSD (0.070 GB per emitted token), lookahead 90 issued / 60 used (landed 70, expired 12, abandoned 5, cancelled 3, discarded 7, used while in flight 4), lookahead 2.00 GB read / 1.00 GB served, 20 loads skipped, 300 direct reads, host wait 1.50 s and reads in flight 2.25 s of 25.00 s, 136 rows per layer", d);
+    try testing.expectEqualStrings("glm_moe_dsa: decode 40 steps, 128 tokens in 25.00 s (5.1 tok/s): 1000 routed records, 600 hits, 400 misses (hit rate per layer min 25% median 50% max 75%), 9.00 GB from the SSD (0.070 GB per emitted token), lookahead 90 issued / 60 used (landed 70, expired 12, abandoned 5, cancelled 3, discarded 7, used while in flight 4), lookahead 2.00 GB read / 1.00 GB served, 20 loads skipped, 300 direct reads, host wait 1.50 s and reads in flight 2.25 s of 25.00 s (9.0% busy, 91.0% with no read in flight), 136 rows per layer", d);
 }
 
 test "glm stats lines: a prompt pass with read-ahead and a decode with the lookahead on the synthetic bank read back exactly" {
