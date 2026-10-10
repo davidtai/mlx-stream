@@ -753,6 +753,12 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
     var scores: [16]f32 = @splat(0);
     scores[2] = 9;
     scores[5] = 8;
+    // Each speculative chunk held 100-200 ms: both records are still read when the next call routes.
+    const q3raw = struct {
+        extern fn q3ld_test_spec_delay(max_ns: i64) void;
+    };
+    q3raw.q3ld_test_spec_delay(200 * std.time.ns_per_ms);
+    defer q3raw.q3ld_test_spec_delay(0);
     const r0 = try s.routeHeld(0, &.{ 0, 4 });
     const r1 = try s.route(1, &.{ 1, 3 }, &scores);
     for ([_]*Stream.Route{ r0, r1 }) |r| for (0..r.n_parts) |p| try s.waitDown(r, @intCast(p));
@@ -763,7 +769,11 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
     const q0 = try s.routeHeld(2, &.{2});
     const q1 = try s.route(3, &.{5}, &.{});
     for ([_]*Stream.Route{ q0, q1 }) |r| for (0..r.n_parts) |p| try s.waitDown(r, @intCast(p));
+    // Claimed in flight by the call's two routes (the first takes no step: nothing settled before the second), every
+    // mini's two ranges served from the records (each record its own bank layer's span).
     try testing.expectEqual(@as(u64, 2), s.stats().claimed);
+    try testing.expectEqual(@as(u64, 2), s.stats().spec_claimed_inflight);
+    try testing.expectEqual(@as(u64, 2 * 4 * 2), s.stats().adopt_ranges);
     for ([_]struct { r: *Stream.Route, l: u32, e: u16 }{ .{ .r = q0, .l = 2, .e = 2 }, .{ .r = q1, .l = 3, .e = 5 } }) |x| {
         const slot = x.r.plan.slotsOf()[0];
         const geom = &b.layers[x.l];
