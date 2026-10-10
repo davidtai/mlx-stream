@@ -819,6 +819,35 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 };
             }
 
+            /// The prompt phase, `layer`'s expert `e` a seed expert (`LayerPolicy.seed`) whose record landed in transient
+            /// slot `from` (a route planned before the layer's seed) and that no wave reads any more: the record copied
+            /// into the row `LayerPolicy.admitSeed` gives it (an empty row, else the coldest probationary resident's that
+            /// no live route pins), the expert resident there. False where no row is left (nothing changes).
+            pub fn promote(self: *Stream, layer: u32, e: u16, from: u32) bool {
+                std.debug.assert(self.phase == .prefill);
+                const ls = &self.layers[layer];
+                const p = &ls.policy;
+                const src = self.locate(layer, from).meta;
+                if (from < p.capacity or src.state != .ready or src.layer != layer or src.expert != e) return false;
+                const pinned = &self.held_scratch;
+                pinned.clearRetainingCapacity();
+                for (ls.meta[0..p.capacity], 0..) |m, s| if (m.pins != 0 or m.state == .loading) {
+                    pinned.append(self.allocator, @intCast(s)) catch return false;
+                };
+                const to = p.admitSeed(e, pinned.items) orelse return false;
+                var bytes: u64 = 0;
+                for (0..n_components) |c| {
+                    const dst = self.slotRow(layer, to, @enumFromInt(c));
+                    const s = self.slotRow(layer, from, @enumFromInt(c));
+                    @memcpy(dst, s);
+                    bytes += dst.len;
+                }
+                ls.meta[to] = .{ .state = .ready, .layer = @intCast(layer), .expert = e };
+                self.counters.promoted += 1;
+                self.counters.promoted_bytes += bytes;
+                return true;
+            }
+
             /// Every resident's prompt row of `layer` held (pinned, never a victim) until `releaseHeld`: routes planned
             /// meanwhile load their misses into transient rows (a prompt layer's misses read before its call).
             pub fn holdResidents(self: *Stream, layer: u32) !void {

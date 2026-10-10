@@ -341,11 +341,40 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             try g.evalAll(outs);
             pt.chargeRouted(.compute, td);
             const tr = pt.now();
-            self.stream.release(w.groute.items[gi].?);
+            const r = w.groute.items[gi].?;
+            var cand: Seeds = .{};
+            seedsOf(&self.stream.layers[sl].policy, w.order.items[w.bounds.items[gi]..w.bounds.items[gi + 1]], r.plan.slotsOf(), &cand);
+            self.stream.release(r);
             w.groute.items[gi] = null;
             live.* -= 1;
+            if (cand.n > 0) {
+                const tp = pt.now();
+                // The eval above consumed the group: its route unpinned (its rows the policy's again), then its seed
+                // experts copied while their transient rows still hold them (the next route may take the window).
+                try self.stream.flush();
+                for (cand.items[0..cand.n]) |cd| if (!self.stream.promote(sl, cd.e, cd.slot)) break;
+                pt.chargeRouted(.promote, tp);
+            }
             try ahead(self, w, sl, next, live, depth);
             pt.chargeRouted(.route, tr);
+        }
+
+        /// A group's seed experts (the call's hottest, `LayerPolicy.seed`) that its route read into transient rows (a
+        /// staged route, planned before the seed was known): each expert and its transient slot, hottest first.
+        const Seeds = struct { items: [max_route_ids]struct { e: u16, slot: u32, n: u32 } = undefined, n: usize = 0 };
+
+        fn seedsOf(pol: *const expert_policy.LayerPolicy, exps: []const u16, slots: []const u32, out: *Seeds) void {
+            for (exps, slots) |e, slot| {
+                if (slot < pol.capacity or !pol.seed.isSet(e)) continue;
+                out.items[out.n] = .{ .e = e, .slot = slot, .n = pol.call_counts[e] };
+                out.n += 1;
+            }
+            const C = @TypeOf(out.items[0]);
+            std.sort.insertion(C, out.items[0..out.n], {}, struct {
+                fn lt(_: void, x: C, y: C) bool {
+                    return if (x.n != y.n) x.n > y.n else x.e < y.e;
+                }
+            }.lt);
         }
 
         /// The staged routes the call did not take released (its end, or an error between `stageMisses` and the call).

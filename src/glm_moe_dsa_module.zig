@@ -548,6 +548,9 @@ pub const Reads = struct {
     /// Loads whose slot still held the record (no read); demand ranges read straight into their rows.
     loads_skipped: u64 = 0,
     direct: u64 = 0,
+    /// Prompt records copied from a transient row into a resident's row (`Stream.promote`), and their bytes.
+    promoted: u64 = 0,
+    promoted_bytes: u64 = 0,
     /// Host time blocked in the read waits; wall time with any read in flight.
     wait_ns: u64 = 0,
     in_flight_ns: u64 = 0,
@@ -577,6 +580,8 @@ pub const Reads = struct {
             .spec_served_bytes = d(s0.adopt_bytes, s1.adopt_bytes),
             .loads_skipped = d(s0.loads_skipped, s1.loads_skipped),
             .direct = d(s0.direct_ranges, s1.direct_ranges),
+            .promoted = d(s0.promoted, s1.promoted),
+            .promoted_bytes = d(s0.promoted_bytes, s1.promoted_bytes),
             .wait_ns = d(s0.read_wait_ns, s1.read_wait_ns),
             .in_flight_ns = d(s0.read_wall_ns, s1.read_wall_ns),
         };
@@ -623,6 +628,7 @@ pub const PromptLine = struct {
         try w.print("glm_moe_dsa: prompt {d} tokens in {d:.2} s ({d:.1} tok/s): {d:.2} GB from the SSD, {d} records on demand, {d} read ahead ({d} routed), host wait {d:.2} s", .{
             p.tokens, seconds(p.wall_ns), perSecond(p.tokens, p.wall_ns), gigabytes(p.r.ssd_bytes), p.r.demand_records, p.r.ahead_records, p.r.ahead_hits, seconds(p.r.wait_ns),
         });
+        if (p.r.promoted > 0) try w.print(", {d} records made resident from transient rows ({d:.2} GB copied)", .{ p.r.promoted, gigabytes(p.r.promoted_bytes) });
     }
 };
 

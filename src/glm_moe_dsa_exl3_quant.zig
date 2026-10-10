@@ -321,7 +321,7 @@ test "glm exl3 quant: claims the EXL3 bank's description and declines the affine
     try testing.expectError(error.NoWeightDescription, accept(G, testing.allocator, undefined, .{}, spec, &diag));
 }
 
-test "glm exl3 quant: a wide prompt call with its misses staged at the layer's start (both bank layers) equals sushi's host decode and reads what the unstaged call reads" {
+test "glm exl3 quant: a wide prompt call with its misses staged at the layer's start (both bank layers) equals sushi's host decode, reads what the unstaged call reads and leaves its residents" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const graph = @import("glm_moe_dsa_graph.zig");
@@ -346,6 +346,9 @@ test "glm exl3 quant: a wide prompt call with its misses staged at the layer's s
     var worst: f32 = 0;
     var scale: f32 = 0;
     var read: [2]u64 = undefined;
+    // Each arm's residents per bank layer after its call (expert ids, slot order).
+    var residents: [2][8][2]u16 = undefined;
+    var promoted: u64 = 0;
     for ([_]bool{ false, true }, 0..) |staged, arm| {
         var g = try G.init(a, s);
         defer g.deinit();
@@ -396,6 +399,23 @@ test "glm exl3 quant: a wide prompt call with its misses staged at the layer's s
             _ = try g.hostF32(try g.astype(y, .float32), got[0 .. n * h]);
             try ex.flush();
             try testing.expectEqual(@as(?u32, null), ex.staged.layer);
+            // Every seed expert resident (a staged one copied from its transient row), each resident row its record.
+            for (0..2) |side| {
+                const sl = 2 * layer + side;
+                const pol = &st.layers[sl].policy;
+                try testing.expectEqual(@as(usize, 0), pol.seed.count());
+                for (0..2) |slot| {
+                    const e = pol.slot_to_expert[slot];
+                    residents[arm][sl][slot] = e;
+                    if (slot == 1) std.mem.sort(u16, &residents[arm][sl], {}, std.sort.asc(u16));
+                    const geom = &b.layers[sl];
+                    const off = b.recordOffset(@intCast(sl), e);
+                    for (geom.segments, 0..) |sg, ci| {
+                        const row = st.slotRow(@intCast(sl), @intCast(slot), @enumFromInt(ci));
+                        for (0..geom.minis) |mi| try testing.expectEqualSlices(u8, img[off + mi * geom.record_bytes + sg.offset ..][0..sg.length], row[mi * sg.length ..][0..sg.length]);
+                    }
+                }
+            }
             var want: [n * 128]f32 = undefined;
             hostMoe(img, &b, @intCast(layer), xin[0 .. n * h], ids[0 .. n * k], sc[0 .. n * k], k, want[0 .. n * h]);
             for (want[0 .. n * h], got[0 .. n * h]) |wv, gv| {
@@ -404,12 +424,16 @@ test "glm exl3 quant: a wide prompt call with its misses staged at the layer's s
             }
         }
         read[arm] = st.stats().expert_bytes_read;
+        if (staged) promoted = st.stats().promoted;
     }
-    std.debug.print("glm exl3 quant staged: max |delta| {d:.5} at outputs up to {d:.3}; {d} B read unstaged, {d} B staged\n", .{ worst, scale, read[0], read[1] });
+    std.debug.print("glm exl3 quant staged: max |delta| {d:.5} at outputs up to {d:.3}; {d} B read unstaged, {d} B staged; {d} records made resident from transient rows\n", .{ worst, scale, read[0], read[1], promoted });
     try testing.expect(scale > 0.1);
     try testing.expect(worst <= 0.03 * scale);
-    // Every expert of every layer read once in both arms.
+    // Every expert of every layer read once in both arms; the staged call leaves the residents the unstaged one does
+    // (its two hottest per bank layer), those its staged route had not put in a prompt row copied from transient rows.
     try testing.expectEqual(read[0], read[1]);
+    try testing.expectEqual(residents[0], residents[1]);
+    try testing.expect(promoted > 0 and promoted <= 4 * 2 * 2);
 }
 
 test "glm exl3 quant: a prompt slice over the host-built routing table equals sushi's moe bit for bit (K3 and K4, runs past one window)" {

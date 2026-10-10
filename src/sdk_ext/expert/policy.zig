@@ -454,6 +454,30 @@ pub const LayerPolicy = struct {
         return null;
     }
 
+    /// Prefill: seed expert `e`, not resident (its record read into a transient row before the seed was known),
+    /// admitted as a miss of a plan would be: an empty slot, else the coldest probationary resident's, none of the
+    /// slots in `held`; protected. Returns its slot (the caller copies the record there), or null where no slot is free
+    /// to take.
+    pub fn admitSeed(p: *LayerPolicy, e: u16, held: []const u32) ?u32 {
+        std.debug.assert(p.seed.isSet(e) and p.expert_to_slot[e] == no_slot);
+        for (held) |s| p.held.set(s);
+        defer for (held) |s| p.held.unset(s);
+        const slot = p.emptySlot() orelse p.probationVictim() orelse return null;
+        const victim = p.slot_to_expert[slot];
+        if (victim != no_expert) {
+            p.expert_to_slot[victim] = no_slot;
+            p.protected.unset(victim);
+            p.recency[victim] = 0;
+        } else p.occupancy += 1;
+        p.slot_to_expert[slot] = e;
+        p.expert_to_slot[e] = slot;
+        p.seed.unset(e);
+        p.clock += 1;
+        p.recency[e] = p.clock;
+        p.protected.set(e);
+        return slot;
+    }
+
     /// The coldest probationary resident (lowest (recency, slot)) that this
     /// route does not hold; prefill never evicts a protected expert.
     fn probationVictim(p: *const LayerPolicy) ?u32 {
