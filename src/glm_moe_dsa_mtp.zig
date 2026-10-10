@@ -335,8 +335,8 @@ pub const Exl3 = struct {
         const mdir = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, dir_name });
         const m = try Manifest.load(a, io, mdir, c, diag);
         const bin = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ mdir, bank_file }, 0);
-        const fd = std.c.open(bin.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
-        if (fd < 0) return refuse(diag, error.MtpPackMissing, "{s}: cannot open", .{bin});
+        // Past the page cache (the experts are resident in MLX arrays; a cached copy would only take the box's memory).
+        const fd = sdk.io_util.openNoCache(bin.ptr, .{}) catch return refuse(diag, error.MtpPackMissing, "{s}: cannot open", .{bin});
         defer _ = std.c.close(fd);
         var self: Exl3 = .{ .base = undefined, .tp = @intCast(m.tp), .gpa = gpa };
         errdefer self.deinit();
@@ -351,7 +351,7 @@ pub const Exl3 = struct {
                 defer gpa.free(host);
                 for (0..l.n_minis) |mi| {
                     const off = l.base_offset + mi * l.record_bytes + sg.offset;
-                    if (!preadAll(fd, host[mi * sg.length ..][0..@intCast(sg.length)], off)) return refuse(diag, error.MtpBankSize, "{s}: short read at {d}", .{ bin, off });
+                    sdk.io_util.readAligned(fd, host[mi * sg.length ..][0..@intCast(sg.length)], off) catch return refuse(diag, error.MtpBankSize, "{s}: short read at {d}", .{ bin, off });
                 }
                 var shape: [4]c_int = undefined;
                 shape[0] = @intCast(l.n_minis);
@@ -407,20 +407,6 @@ pub const Exl3 = struct {
         return g.reshape(y, &.{ n, h });
     }
 };
-
-fn preadAll(fd: std.c.fd_t, buf: []u8, offset: u64) bool {
-    var done: usize = 0;
-    while (done < buf.len) {
-        const r = std.c.pread(fd, buf[done..].ptr, buf.len - done, @intCast(offset + done));
-        if (r < 0) {
-            if (std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
-            return false;
-        }
-        if (r == 0) return false;
-        done += @intCast(r);
-    }
-    return true;
-}
 
 fn get(w: *const sdk.Weights, prefix: []const u8, rest: []const u8, diag: ?*Diag) !T {
     var buf: [192]u8 = undefined;
