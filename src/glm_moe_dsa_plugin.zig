@@ -89,6 +89,11 @@ pub fn bill(gpa: std.mem.Allocator, io: std.Io, req: *const sdk.BillRequest) !sd
     return out;
 }
 
+/// The generation a request may take past its prompt (`max_output`): the host serves the billed context plus it.
+pub fn maxOutput(c: *const Config) u64 {
+    return c.maxOutput();
+}
+
 /// The construction admitted every prompt up to the billed context (both phases under the target); a longer prompt
 /// is the module's refusal by name before its pass (`ContextOverBill`), never a memory guess here.
 pub fn promptBytes(c: *const Config, seq: u64, max_tokens: u32) u64 {
@@ -191,11 +196,14 @@ test "glm plugin: parse builds the arch's config and its pack dir, and refuses b
     try testing.expectError(error.DimsNotImplemented, parse(testing.allocator, &try sdk.ConfigPeek.parse(arena.allocator(), "/m", tiny), &diag));
 }
 
-test "glm plugin: the table the registry builds (owns its decode state, a handover, a request end, a prefix restore, its bills, a draft lane)" {
+test "glm plugin: the table the registry builds (owns its decode state, a handover, a request end, a prefix restore, its bills, its max output, a draft lane)" {
     const vt = comptime sdk.Arch.of(@This());
     try testing.expect(vt.caps.owns_decode_state and !vt.caps.batches_decode and vt.caps.prefill_whole_prompt and vt.caps.prefill_yields_last_logits);
     try testing.expect(vt.handover != null and vt.request_end != null and vt.restore_prefix != null and vt.bill != null and vt.prompt_bytes != null and vt.spec == .draft_lane);
     try testing.expect(vt.claim_process != null and vt.release_process != null);
+    const cfg: Config = .{ .max_output_tokens = 4096 };
+    try testing.expectEqual(@as(u64, 4096), vt.max_output.?(&cfg));
+    try testing.expectEqual(@as(u64, 131072), vt.max_output.?(&Config{}));
     try vt.claim_process.?();
     try testing.expectError(error.ExpertReaderInUse, vt.claim_process.?());
     vt.release_process.?();

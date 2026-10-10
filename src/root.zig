@@ -6,7 +6,7 @@
 
 pub const plugin = sdk.Plugin{
     .name = "mlx-stream",
-    .api = .{ .major = 2, .minor = 0 },
+    .api = .{ .major = 2, .minor = 1 },
     // The MLX this plugin is tested on; the conformance suite fails when the host links another.
     .mlx = "v0.32.3",
     .macos_only = true,
@@ -31,5 +31,6 @@ pub const archs = .{ @import("deepseek_v41_plugin.zig"), @import("glm_moe_dsa_pl
 pub const sdk = @import("sdk");
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
 pub const default_context: u64 = @import("deepseek_v41_bill.zig").fill_prompt_tokens;
-/// Positions a request may generate past its prompt (the KV lanes' bound).
+/// Positions a request may generate past its prompt (the KV lanes' bound) for an arch without its own `maxOutput`
+/// (DeepSeek-V4.1's).
 pub const generation_headroom: u64 = @import("deepseek_v41_module.zig").generation_headroom;
