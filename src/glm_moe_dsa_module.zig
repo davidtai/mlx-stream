@@ -353,7 +353,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_set_cache_limit(&prev, bill_mod.decode_cache_bytes);
             self.decoding = true;
             if (comptime timeline.enabled) if (self.mtp != null) {
-                timeline.install(self.g.s, @intCast(@min(h.reserved_tokens -| h.prompt_tokens, timeline.max_cycles + 1)), @intCast(self.bank.layers.len / Experts.bpl)) catch |e|
+                // The timeline's storage holds DeepSeek-V4.1's 64 layers: GLM-5.3's first 64 routed layers are stamped (the
+                // verify's GPU busy and idle cover every layer).
+                timeline.install(self.g.s, @intCast(@min(h.reserved_tokens -| h.prompt_tokens, timeline.max_cycles + 1)), @intCast(@min(self.bank.layers.len / Experts.bpl, timeline.max_layers))) catch |e|
                     log.warn("glm_moe_dsa: the verify timeline is off ({s})\n", .{@errorName(e)});
             };
             self.decode_mark = .{ .s0 = self.stream.stats() };
