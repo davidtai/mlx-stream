@@ -23,13 +23,111 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         pub const Plan = expert_policy.Plan;
         pub const max_route_ids = expert_policy.max_route_ids;
 
+        /// Allocation-only geometry: component capacities need not belong to any source record.
+        pub const RowGeometry = struct {
+            segments: @FieldType(Layer, "segments"),
+            compact: bool = false,
+            projection_k: [3]u32 = @splat(0),
+            slot_rates: []const [3]u32 = &.{},
+        };
+
+        pub const StorageGeometry = struct {
+            transient: RowGeometry,
+            persistent_row_bytes: u64,
+            transient_row_bytes: u64,
+            max_source_record_bytes: u64,
+
+            pub fn init(layers: []const Layer) !StorageGeometry {
+                if (layers.len == 0) return error.InvalidRows;
+                var out: StorageGeometry = .{
+                    .transient = .{ .segments = layers[0].segments },
+                    .persistent_row_bytes = 0,
+                    .transient_row_bytes = 0,
+                    .max_source_record_bytes = 0,
+                };
+                for (layers) |*l| {
+                    out.persistent_row_bytes += rowBytes(l);
+                    out.max_source_record_bytes = @max(out.max_source_record_bytes, l.logical_bytes);
+                    for (l.segments, &out.transient.segments) |s, *cap| {
+                        if (s.dtype != cap.dtype or s.rank != cap.rank) return error.MixedGeometry;
+                        if (s.length > cap.length) cap.* = s;
+                    }
+                }
+                out.transient_row_bytes = rowBytes(&out.transient);
+                return out;
+            }
+
+            pub fn initBank(bank: *const B.Bank) !StorageGeometry {
+                var out = try init(bank.layers);
+                if (comptime @hasDecl(B.Bank, "isCompact")) {
+                    if (bank.isCompact()) {
+                        out.transient.compact = true;
+                        for (&out.transient.projection_k, 0..) |*k, p| k.* = @intCast(out.transient.segments[p * 3].shape[2] / 16);
+                        out.transient_row_bytes += 48;
+                        out.max_source_record_bytes = 0;
+                        out.persistent_row_bytes = 0;
+                        for (bank.layers, 0..) |_, li| {
+                            var minimum: u64 = std.math.maxInt(u64);
+                            for (0..bank.n_experts) |e| {
+                                const bytes = bank.recordGeometry(@intCast(li), @intCast(e)).logical_bytes;
+                                out.max_source_record_bytes = @max(out.max_source_record_bytes, bytes);
+                                minimum = @min(minimum, bytes + 48);
+                            }
+                            out.persistent_row_bytes += minimum;
+                        }
+                    }
+                }
+                return out;
+            }
+
+            /// The allocator rounds each buffer larger than a page, not each slot.
+            pub fn allocationBytes(geometry: anytype, first: u32, rows: u32) !u64 {
+                if (comptime @hasField(@TypeOf(geometry.*), "compact")) if (geometry.compact) {
+                    const sizes = try compactSizes(geometry, first, rows);
+                    var total: u64 = 3 * metalBytes(@as(u64, rows) * 16);
+                    for (sizes) |size| total = try std.math.add(u64, total, metalBytes(size));
+                    return total;
+                };
+                return std.math.mul(u64, rowBytes(geometry), rows);
+            }
+
+            pub fn metalBytes(bytes: u64) u64 {
+                const page = std.heap.pageSize();
+                return if (bytes > page) std.mem.alignForward(u64, bytes, page) else bytes;
+            }
+
+            pub fn rowBytes(geometry: anytype) u64 {
+                comptime std.debug.assert(@typeInfo(@TypeOf(geometry)) == .pointer);
+                var bytes: u64 = 0;
+                for (geometry.segments) |s| bytes += s.length;
+                return bytes;
+            }
+
+            pub fn prereadStaging(bank: *const B.Bank, page: u64) !u64 {
+                var bytes: u64 = 0;
+                for (bank.layers, 0..) |_, li| {
+                    for (0..bank.n_experts) |e| {
+                        const l = bank.recordGeometry(@intCast(li), @intCast(e));
+                        var gu: u64 = 0;
+                        for (l.segments[0..gu_components]) |s| gu += s.length;
+                        if (l.segments[0].offset != 0 or l.segments[gu_components].offset != gu) return error.MixedGeometry;
+                        const spans = bank.spans(@intCast(li), @intCast(e));
+                        bytes = @max(bytes, expert_io.spanBytes(spans.gu_offset, gu, page));
+                        bytes = @max(bytes, expert_io.spanBytes(spans.down_offset, l.logical_bytes - gu, page));
+                    }
+                }
+                return bytes;
+            }
+        };
+
         pub const HostSlotRows = struct {
             rows: u32,
             row_bytes: [n_components]u64,
             banks: [n_components][]u8,
 
             /// Rows sized for `layer`'s segments; one page-aligned bank per component.
-            pub fn init(layer: *const Layer, rows: u32) !HostSlotRows {
+            pub fn init(layer: anytype, rows: u32) !HostSlotRows {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 var s: HostSlotRows = .{ .rows = rows, .row_bytes = undefined, .banks = undefined };
                 var n: usize = 0;
                 errdefer for (s.banks[0..n]) |b| std.heap.page_allocator.free(b);
@@ -49,13 +147,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             pub fn row(self: *const HostSlotRows, c: Component, r: u32) []u8 {
-                const n = self.row_bytes[@intFromEnum(c)];
-                return self.banks[@intFromEnum(c)][r * n ..][0..n];
+                const n = self.row_bytes[@backingInt(c)];
+                return self.banks[@backingInt(c)][r * n ..][0..n];
             }
 
             pub fn rowDest(self: *const HostSlotRows, r: u32) [n_components]u64 {
                 var d: [n_components]u64 = undefined;
-                for (&d, 0..) |*a, c| a.* = @intFromPtr(self.row(@enumFromInt(c), r).ptr);
+                for (&d, 0..) |*a, c| a.* = @intFromPtr(self.row(@fromBackingInt(@intCast(c)), r).ptr);
                 return d;
             }
         };
@@ -71,7 +169,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// evaluated on `stream` in one eval. The data pointers are taken here; the
             /// arrays stay held (never donated or recycled) until `deinit`, after the pool
             /// stops. MLX allocates through Metal even on the CPU stream: callers hold the GPU lock.
-            pub fn init(layer: *const Layer, rows: u32, stream: mlx.mlx_stream) !LayerSlotBank {
+            pub fn init(layer: anytype, rows: u32, stream: mlx.mlx_stream) !LayerSlotBank {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 var b = try initLazy(layer, rows, stream);
                 errdefer b.deinit();
                 try evalArrays(&b.arrays);
@@ -81,7 +180,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// `init`'s zero arrays, not yet evaluated: a grow builds every layer's, evaluates them all in one eval
             /// (`Stream.grow`: one GPU round trip, not nine per layer), then `bind`s each.
-            fn initLazy(layer: *const Layer, rows: u32, stream: mlx.mlx_stream) !LayerSlotBank {
+            fn initLazy(layer: anytype, rows: u32, stream: mlx.mlx_stream) !LayerSlotBank {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 var b: LayerSlotBank = .{ .arrays = @splat(.{}), .base = @splat(0), .row_bytes = undefined, .rows = rows };
                 errdefer b.deinit();
                 for (layer.segments, 0..) |seg, c| {
@@ -97,7 +197,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             /// `init`'s arrays without the zero fill: MLX-owned buffers (`dsv41_alloc_uninit`), evaluated as built, bound at once.
-            fn initUnfilled(layer: *const Layer, rows: u32) !LayerSlotBank {
+            fn initUnfilled(layer: anytype, rows: u32) !LayerSlotBank {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 var b: LayerSlotBank = .{ .arrays = @splat(.{}), .base = @splat(0), .row_bytes = undefined, .rows = rows };
                 errdefer b.deinit();
                 for (layer.segments, 0..) |seg, c| {
@@ -129,8 +230,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             pub fn row(self: *const LayerSlotBank, c: Component, r: u32) []u8 {
-                const n = self.row_bytes[@intFromEnum(c)];
-                const p: [*]u8 = @ptrFromInt(self.base[@intFromEnum(c)] + r * n);
+                const n = self.row_bytes[@backingInt(c)];
+                const p: [*]u8 = @ptrFromInt(self.base[@backingInt(c)] + r * n);
                 return p[0..n];
             }
 
@@ -163,6 +264,147 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         /// GPU lock). Chosen once, at Stream.init.
         pub const SlotMemory = union(enum) { host, mlx: mlx.mlx_stream };
 
+        pub fn compactSizes(geometry: anytype, first: u32, rows: u32) ![n_components]u64 {
+            var sizes: [n_components]u64 = undefined;
+            if (rows > std.math.maxInt(c_int)) return error.InvalidRows;
+            if (geometry.slot_rates.len != 0 and @as(u64, first) + rows > geometry.slot_rates.len) return error.InvalidRows;
+            for (&sizes, geometry.segments, 0..) |*size, segment, c| {
+                if (c % 3 != 0) {
+                    size.* = try std.math.mul(u64, segment.length, rows);
+                } else {
+                    const p = c / 3;
+                    const unit = segment.length / geometry.projection_k[p];
+                    var sum: u64 = 0;
+                    if (geometry.slot_rates.len == 0) {
+                        sum = try std.math.mul(u64, geometry.projection_k[p], rows);
+                    } else for (geometry.slot_rates[first..][0..rows]) |rates| {
+                        sum = try std.math.add(u64, sum, rates[p]);
+                    }
+                    size.* = try std.math.mul(u64, unit, sum);
+                    const words = size.* / 2;
+                    if (words % 256 != 0 or words / 256 > std.math.maxInt(c_int)) return error.InvalidRows;
+                }
+            }
+            return sizes;
+        }
+
+        pub const CompactRows = struct {
+            rows: u32,
+            sizes: [n_components]u64,
+            banks: [n_components][]u8 = @splat(&.{}),
+            descriptors: [3][]u64 = @splat(&.{}),
+            arrays: [n_components]mlx.mlx_array = @splat(.{}),
+            descriptor_arrays: [3]mlx.mlx_array = @splat(.{}),
+            capacities: []const [3]u32,
+            constant_k: [3]u32,
+            unit_words: u64,
+            memory: SlotMemory,
+            allocated_bytes: u64,
+
+            fn init(geometry: anytype, first: u32, rows: u32, memory: SlotMemory, fill: GrowFill, lazy: bool) !CompactRows {
+                var out: CompactRows = .{
+                    .rows = rows,
+                    .sizes = try compactSizes(geometry, first, rows),
+                    .capacities = if (geometry.slot_rates.len == 0) &.{} else geometry.slot_rates[first..][0..rows],
+                    .constant_k = geometry.projection_k,
+                    .unit_words = geometry.segments[0].length / (2 * geometry.projection_k[0]),
+                    .memory = memory,
+                    .allocated_bytes = try StorageGeometry.allocationBytes(geometry, first, rows),
+                };
+                errdefer out.deinit();
+                for (out.sizes, 0..) |size, c| switch (memory) {
+                    .host => {
+                        out.banks[c] = try std.heap.page_allocator.alloc(u8, @intCast(size));
+                        if (fill == .zeros) @memset(out.banks[c], 0);
+                    },
+                    .mlx => |stream| {
+                        const shape: [2]c_int = if (c % 3 == 0)
+                            .{ @intCast(size / 512), 256 }
+                        else
+                            .{ @intCast(rows), @intCast(geometry.segments[c].shape[0]) };
+                        out.arrays[c] = mlx.mlx_array_new();
+                        if (fill == .zeros) {
+                            try mlx.check(mlx.mlx_zeros(&out.arrays[c], &shape, 2, B.mlxDtype(geometry.segments[c].dtype), stream));
+                        } else if (dsv41_alloc_uninit(&out.arrays[c], &shape, 2, B.mlxDtype(geometry.segments[c].dtype)) != 0) return error.MlxUnfilledAlloc;
+                    },
+                };
+                for (&out.descriptors, &out.descriptor_arrays, 0..) |*data, *array, p| {
+                    switch (memory) {
+                        .host => data.* = try std.heap.page_allocator.alloc(u64, @as(usize, rows) * 2),
+                        .mlx => {
+                            array.* = mlx.mlx_array_new();
+                            const shape: [2]c_int = .{ @intCast(rows), 2 };
+                            if (dsv41_alloc_uninit(array, &shape, 2, .uint64) != 0) return error.MlxUnfilledAlloc;
+                            const ptr = mlx.mlx_array_data_uint8(array.*) orelse return error.MlxNoData;
+                            data.* = @as([*]u64, @ptrCast(@alignCast(@constCast(ptr))))[0 .. @as(usize, rows) * 2];
+                        },
+                    }
+                    var offset: u64 = 0;
+                    for (0..rows) |r| {
+                        const k = out.capacity(@intCast(r))[p];
+                        data.*[2 * r] = offset;
+                        data.*[2 * r + 1] = k;
+                        offset += out.unit_words * k;
+                    }
+                    if (offset * 2 != out.sizes[p * 3]) return error.InvalidRows;
+                }
+                if (memory == .mlx and (!lazy or fill == .unfilled)) {
+                    if (fill == .zeros) try evalArrays(&out.arrays);
+                    try out.bind();
+                }
+                return out;
+            }
+
+            fn bind(self: *CompactRows) !void {
+                if (self.memory != .mlx) return;
+                for (self.arrays, self.sizes, &self.banks) |array, size, *bank| {
+                    const ptr = mlx.mlx_array_data_uint8(array) orelse return error.MlxNoData;
+                    bank.* = @constCast(ptr[0..@intCast(size)]);
+                }
+            }
+
+            pub fn capacity(self: *const CompactRows, slot: u32) [3]u32 {
+                return if (self.capacities.len == 0) self.constant_k else self.capacities[slot];
+            }
+
+            fn publish(self: *const CompactRows, slot: u32, geometry: *const Layer) !void {
+                for (0..3) |p| {
+                    const words = geometry.segments[p * 3].length / 2;
+                    const cap = self.capacity(slot)[p];
+                    if (words % self.unit_words != 0 or words > self.unit_words * cap) return error.SlotStillPinned;
+                    self.descriptors[p][2 * slot + 1] = words / self.unit_words;
+                }
+            }
+
+            fn row(self: *const CompactRows, component: Component, r: u32) []u8 {
+                const c = @backingInt(component);
+                if (c % 3 == 0) {
+                    const p = c / 3;
+                    const offset = self.descriptors[p][2 * r] * 2;
+                    return self.banks[c][offset..][0 .. self.unit_words * self.capacity(r)[p] * 2];
+                }
+                const size = self.sizes[c] / self.rows;
+                return self.banks[c][r * size ..][0..size];
+            }
+
+            fn deinit(self: *CompactRows) void {
+                switch (self.memory) {
+                    .host => {
+                        for (self.banks) |bank| std.heap.page_allocator.free(bank);
+                        for (self.descriptors) |data| std.heap.page_allocator.free(data);
+                    },
+                    .mlx => {
+                        for (self.arrays) |array| if (array.ctx != null) {
+                            _ = mlx.mlx_array_free(array);
+                        };
+                        for (self.descriptor_arrays) |array| if (array.ctx != null) {
+                            _ = mlx.mlx_array_free(array);
+                        };
+                    },
+                }
+            }
+        };
+
         /// One bank of slot rows. Both memories are addressed by the same row
         /// arithmetic, so the read path never asks which one it has.
         /// One eval over every MLX bank among `rows` (none for host rows).
@@ -171,6 +413,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             defer arrays.deinit(a);
             for (rows) |r| if (r) |x| switch (x.backing) {
                 .mlx => |m| try arrays.appendSlice(a, &m.arrays),
+                .compact => |c| if (c.memory == .mlx) try arrays.appendSlice(a, &c.arrays),
                 .none, .host => {},
             };
             if (arrays.items.len > 0) try evalArrays(arrays.items);
@@ -180,10 +423,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             rows: u32 = 0,
             base: [n_components]u64 = @splat(0),
             row_bytes: [n_components]u64 = @splat(0),
-            backing: union(enum) { none, host: HostSlotRows, mlx: LayerSlotBank } = .none,
+            backing: union(enum) { none, host: HostSlotRows, mlx: LayerSlotBank, compact: CompactRows } = .none,
 
-            fn init(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
+            fn init(layer: anytype, rows: u32, memory: SlotMemory) !Rows {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 if (rows == 0) return .{};
+                if (comptime n_components == 9 and @hasField(@TypeOf(layer.*), "compact")) if (layer.compact)
+                    return initCompact(layer, 0, rows, memory, .zeros, false);
                 switch (memory) {
                     .host => {
                         const h = try HostSlotRows.init(layer, rows);
@@ -200,8 +446,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// `init` for a grow: an MLX bank's arrays built without their eval (`bind` after one eval of every layer's,
             /// `evalRows`); host rows are complete at once.
-            fn initLazy(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
+            fn initLazy(layer: anytype, rows: u32, memory: SlotMemory) !Rows {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 if (rows == 0) return .{};
+                if (comptime n_components == 9 and @hasField(@TypeOf(layer.*), "compact")) if (layer.compact)
+                    return initCompact(layer, 0, rows, memory, .zeros, true);
                 switch (memory) {
                     .host => return init(layer, rows, memory),
                     .mlx => |stream| {
@@ -213,8 +462,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// `init` without the fill: an MLX bank's buffers taken from the allocator as they are (`LayerSlotBank.initUnfilled`);
             /// host rows as `init`'s.
-            fn initUnfilled(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
+            fn initUnfilled(layer: anytype, rows: u32, memory: SlotMemory) !Rows {
+                comptime std.debug.assert(@typeInfo(@TypeOf(layer)) == .pointer);
                 if (rows == 0) return .{};
+                if (comptime n_components == 9 and @hasField(@TypeOf(layer.*), "compact")) if (layer.compact)
+                    return initCompact(layer, 0, rows, memory, .unfilled, false);
                 switch (memory) {
                     .host => return init(layer, rows, memory),
                     .mlx => {
@@ -224,9 +476,36 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
             }
 
+            fn initCompact(geometry: anytype, first: u32, rows: u32, memory: SlotMemory, fill: GrowFill, lazy: bool) !Rows {
+                if (rows == 0) return .{};
+                const compact = try CompactRows.init(geometry, first, rows, memory, fill, lazy);
+                return .{ .rows = rows, .backing = .{ .compact = compact } };
+            }
+
+            fn initSuffix(geometry: *const Layer, first: u32, rows: u32, memory: SlotMemory, fill: GrowFill) !Rows {
+                if (comptime @hasField(Layer, "compact")) if (geometry.compact)
+                    return initCompact(geometry, first, rows, memory, fill, fill == .zeros);
+                return switch (fill) {
+                    .zeros => initLazy(geometry, rows, memory),
+                    .unfilled => initUnfilled(geometry, rows, memory),
+                };
+            }
+
+            pub fn bytes(self: *const Rows) u64 {
+                if (self.backing == .compact) return self.backing.compact.allocated_bytes;
+                var total: u64 = 0;
+                for (self.row_bytes) |size| total += size * self.rows;
+                return total;
+            }
+
+            fn publish(self: *const Rows, r: u32, geometry: *const Layer) !void {
+                if (self.backing == .compact) try self.backing.compact.publish(r, geometry);
+            }
+
             /// After the eval that covered an MLX bank's arrays: its data pointers (host rows have theirs).
             fn bind(self: *Rows) !void {
                 switch (self.backing) {
+                    .compact => |*c| try c.bind(),
                     .mlx => |*m| {
                         try m.bind();
                         self.base = m.base;
@@ -241,19 +520,21 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .none => {},
                     .host => |*h| h.deinit(),
                     .mlx => |*m| m.deinit(),
+                    .compact => |*c| c.deinit(),
                 }
                 self.* = .{};
             }
 
             pub fn row(self: *const Rows, c: Component, r: u32) []u8 {
-                const n = self.row_bytes[@intFromEnum(c)];
-                const p: [*]u8 = @ptrFromInt(self.base[@intFromEnum(c)] + r * n);
+                if (self.backing == .compact) return self.backing.compact.row(c, r);
+                const n = self.row_bytes[@backingInt(c)];
+                const p: [*]u8 = @ptrFromInt(self.base[@backingInt(c)] + r * n);
                 return p[0..n];
             }
 
             fn rowDest(self: *const Rows, r: u32) [n_components]u64 {
                 var d: [n_components]u64 = undefined;
-                for (&d, self.base, self.row_bytes) |*a, base, n| a.* = base + r * n;
+                for (&d, 0..) |*address, c| address.* = @intFromPtr(self.row(@fromBackingInt(@intCast(c)), r).ptr);
                 return d;
             }
         };
@@ -422,8 +703,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             layers: []LayerSlots,
             transient: Rows,
             transient_meta: []SlotMeta,
-            /// The widest layer: the transient rows' geometry (decode's window 0 is allocated in it at the grow).
-            transient_layer: u32,
+            geometry: StorageGeometry,
             /// `releaseTransient` ran: the scratch is freed until the grow allocates window 0.
             transient_released: bool = false,
             /// The release route, installed at construction (`Options.transient_release`).
@@ -503,7 +783,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 ext: ?Rows = null,
                 /// [n_experts]: one entry per persistent slot.
                 meta: []SlotMeta,
-                lens: [n_components]u64,
             };
 
             const Location = struct { rows: *const Rows, row: u32, meta: *SlotMeta };
@@ -515,14 +794,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (opt.wide_depth < 1 or opt.wide_depth > max_wide_depth or opt.transient_rows < @as(u32, opt.wide_depth) * opt.max_route_ids) return error.InvalidOptions;
                 if (opt.max_route_ids == 0 or opt.max_route_ids > max_route_ids or opt.transient_rows < opt.max_route_ids or
                     opt.records_per_part == 0 or opt.records_per_part > expert_io.max_items) return error.InvalidOptions;
-                // One transient row must hold any layer's record.
-                var widest: usize = 0;
-                for (bank.layers, 0..) |l, i| if (l.logical_bytes > bank.layers[widest].logical_bytes) {
-                    widest = i;
-                };
-                for (bank.layers) |l| for (l.segments, bank.layers[widest].segments) |s, w| {
-                    if (s.length > w.length) return error.MixedGeometry;
-                };
+                var needed_tickets: u64 = 2 * @as(u64, opt.max_route_ids);
+                for (opt.rows) |rows| needed_tickets = @max(needed_tickets, 2 * @as(u64, rows));
+                if (opt.pool.tickets < needed_tickets) return error.InvalidOptions;
+                const geometry = try StorageGeometry.initBank(bank);
                 if (opt.event != null and opt.lookahead == null) return error.InvalidOptions;
                 if (opt.event) |ev| if (ev.watchdog_ms < 50 or ev.watchdog_ms > 60_000) return error.InvalidOptions;
                 var pool_opt = opt.pool;
@@ -530,16 +805,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (la.chunks == 0 or la.chunks > 8 or !std.math.isPowerOfTwo(la.chunks) or la.idle_busy > 1 or
                         la.budget == 0 or la.budget > expert_lookahead.max_budget) return error.InvalidOptions;
                     const page = std.heap.pageSize();
-                    const record = bank.layers[widest].logical_bytes;
+                    const record = geometry.max_source_record_bytes;
                     pool_opt.spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
-                    // A pre-read range is the record's gate/up span or its down span,
-                    // back to back, each no larger than a staging buffer.
-                    if (la.preread) for (bank.layers) |l| {
-                        var gu: u64 = 0;
-                        for (l.segments[0..gu_components]) |sg| gu += sg.length;
-                        if (l.segments[0].offset != 0 or l.segments[gu_components].offset != gu) return error.MixedGeometry;
-                        if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
-                    };
+                    if (la.preread) pool_opt.staging_bytes = @max(pool_opt.staging_bytes, try StorageGeometry.prereadStaging(bank, page));
                 }
                 var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
                 if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
@@ -562,19 +830,21 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     ls.base.deinit();
                     a.free(ls.meta);
                 };
-                for (layers, opt.rows, bank.layers) |*ls, rows, *geom| {
+                for (layers, opt.rows, bank.layers, 0..) |*ls, rows, *geom, li| {
                     var policy = try LayerPolicy.init(a, bank.n_experts, rows);
                     errdefer policy.deinit(a);
+                    if (comptime @hasDecl(B.Bank, "isCompact")) if (bank.isCompact()) {
+                        policy.needs = bank.expert_rates[li * bank.n_experts ..][0..bank.n_experts];
+                        policy.capacities = geom.slot_rates;
+                    };
                     var base = try Rows.init(geom, rows, opt.slot_memory);
                     errdefer base.deinit();
                     const meta = try a.alloc(SlotMeta, bank.n_experts);
                     @memset(meta, .{});
-                    var lens: [n_components]u64 = undefined;
-                    for (&lens, geom.segments) |*l, s| l.* = s.length;
-                    ls.* = .{ .policy = policy, .base = base, .meta = meta, .lens = lens };
+                    ls.* = .{ .policy = policy, .base = base, .meta = meta };
                     n_init += 1;
                 }
-                var transient = try Rows.init(&bank.layers[widest], opt.transient_rows, opt.slot_memory);
+                var transient = try Rows.init(&geometry.transient, opt.transient_rows, opt.slot_memory);
                 errdefer transient.deinit();
                 const transient_meta = try a.alloc(SlotMeta, opt.transient_rows);
                 errdefer a.free(transient_meta);
@@ -583,11 +853,18 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer a.free(ahead_loads);
                 const ahead_reads = try a.alloc(bool, bank.n_experts);
                 errdefer a.free(ahead_reads);
-                const ahead_parts = try a.alloc(Part, std.math.divCeil(u32, bank.n_experts, expert_io.max_items) catch unreachable);
+                const ahead_parts = try a.alloc(Part, bank.n_experts);
                 errdefer a.free(ahead_parts);
+                var held_base = try std.ArrayList(u32).initCapacity(a, bank.n_experts);
+                errdefer held_base.deinit(a);
+                var held_scratch = try std.ArrayList(u32).initCapacity(a, bank.n_experts + opt.max_route_ids * @as(u32, opt.wide_depth));
+                errdefer held_scratch.deinit(a);
                 const pool = try expert_io.Pool.start(a, pool_opt);
                 errdefer pool.stop();
-                if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[widest].lens);
+                if (opt.lookahead) |la| if (la.preread) {
+                    const lens = lengthsOf(bank.recordGeometry(0, 0));
+                    try B.Records.armPreRead(pool, &lens);
+                };
                 if (opt.event) |ev| {
                     const object: u64 = switch (ev.backend) {
                         .host => @intFromPtr(word.?),
@@ -602,7 +879,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .layers = layers,
                     .transient = transient,
                     .transient_meta = transient_meta,
-                    .transient_layer = @intCast(widest),
+                    .geometry = geometry,
                     .release_installed = opt.transient_release,
                     .grow_fill = opt.grow_fill,
                     .prompt_transient_rows = opt.transient_rows,
@@ -618,6 +895,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .gated = opt.event != null,
                     .owner = std.Thread.getCurrentId(),
                     .ahead = .{ .loads = ahead_loads, .reads = ahead_reads, .parts = ahead_parts },
+                    .held_base = held_base,
+                    .held_scratch = held_scratch,
                 };
                 return self;
             }
@@ -665,6 +944,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             /// The bank holding a layer's slot and the slot's row in it.
+            pub fn slotReady(self: *const Stream, layer: u32, slot: u32) bool {
+                return slot < self.layers[layer].policy.capacity and self.layers[layer].meta[slot].state == .ready;
+            }
+
             pub fn slotRef(self: *const Stream, layer: u32, slot: u32) SlotRef {
                 const ls = &self.layers[layer];
                 if (slot < ls.base.rows) return .{ .bank = .base, .row = slot };
@@ -686,11 +969,18 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .ext => if (self.layers[layer].ext) |*e| e else return null,
                     .transient => &self.transient,
                 };
-                const m = switch (rows.backing) {
-                    .mlx => |*m| m,
-                    else => return null,
+                return switch (rows.backing) {
+                    .mlx => |m| B.bankArraysOf(m.arrays),
+                    .compact => |c| blk: {
+                        if (comptime n_components == 9 and @hasField(B.BankArrays, "descriptors")) {
+                            if (c.memory != .mlx) break :blk null;
+                            var arrays = B.bankArraysOf(c.arrays);
+                            arrays.descriptors = c.descriptor_arrays;
+                            break :blk arrays;
+                        } else break :blk null;
+                    },
+                    else => null,
                 };
-                return B.bankArraysOf(m.arrays);
             }
 
             /// Keep a live prefill route's persistent slots (its hits and persistent loads) pinned and held past
@@ -702,10 +992,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.held_layer = r.layer;
                 const cap = self.layers[r.layer].policy.capacity;
                 for (r.hit_slots[0..r.plan.n_hits]) |s| if (s < cap) {
+                    if (std.mem.indexOfScalar(u32, self.held_base.items, s) != null) continue;
                     try self.held_base.append(self.allocator, s);
                     self.locate(r.layer, s).meta.pins += 1;
                 };
                 for (r.plan.loadsOf()) |l| if (l.persistent) {
+                    if (std.mem.indexOfScalar(u32, self.held_base.items, l.slot) != null) continue;
                     try self.held_base.append(self.allocator, l.slot);
                     self.locate(r.layer, l.slot).meta.pins += 1;
                 };
@@ -763,6 +1055,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 };
             }
 
+            fn holdScratch(self: *Stream, slot: u32) void {
+                if (std.mem.indexOfScalar(u32, self.held_scratch.items, slot) == null)
+                    self.held_scratch.appendAssumeCapacity(slot);
+            }
+
             /// Resolves `ids` (the router's top-k of one layer call, host values read
             /// from an evaluated array) to slots: pins every slot it serves and submits
             /// the misses' reads in parts. The eval that produced `ids` also finished
@@ -777,8 +1074,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn route(self: *Stream, layer: u32, ids: []const u16, scores: []const f32) Error!*Route {
                 if (self.failed) return error.StreamFailed;
                 std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
-                // A layer's read-ahead lands before a route plans over its rows (a hit must never read a loading row).
-                if (self.ahead.live and self.ahead.layer == layer) try self.awaitReadAhead(layer);
+                // Seed read-ahead owns the ticket ring until fully settled, even for a different layer.
+                if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
                 const lookahead = self.route_lookahead;
                 const tag = self.clock + 1;
                 if (self.route_preread) try self.preRead(layer, ids, tag);
@@ -786,31 +1083,33 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.n_free == 0) return self.fail(error.RoutesExhausted);
                 self.n_free -= 1;
                 const r = &self.routes[self.free[self.n_free]];
-                // A prefill route beside live ones of its layer: their slots are held,
-                // its transient loads take the first window no route holds; so are the
-                // slots a deferred call still reads (`holdBase`).
+                // Only transient loads own a window. Persistent hit-only calls can
+                // remain live beside every window, but still hold their resident slots.
                 const held_set = &self.held_scratch;
                 held_set.clearRetainingCapacity();
                 var used_windows: u8 = 0;
-                if (self.wide_depth > 1) for (&self.routes) |*o| {
+                for (&self.routes) |*o| {
                     if (o.state == .free) continue;
-                    used_windows |= @as(u8, 1) << @intCast(o.window);
+                    if (o.plan.n_loads > o.plan.n_persistent)
+                        used_windows |= @as(u8, 1) << @intCast(o.window);
                     if (o.layer != layer) continue;
                     for (o.hit_slots[0..o.plan.n_hits]) |hs| if (hs < self.layers[layer].policy.capacity) {
-                        held_set.append(self.allocator, hs) catch return self.fail(error.RoutesExhausted);
+                        self.holdScratch(hs);
                     };
                     for (o.plan.loadsOf()) |l| if (l.persistent) {
-                        held_set.append(self.allocator, l.slot) catch return self.fail(error.RoutesExhausted);
+                        self.holdScratch(l.slot);
                     };
-                };
+                }
                 if (self.held_base.items.len > 0 and self.held_layer == layer)
-                    held_set.appendSlice(self.allocator, self.held_base.items) catch return self.fail(error.RoutesExhausted);
-                const window: u8 = @intCast(@ctz(~used_windows));
-                if (window >= self.wide_depth) return self.fail(error.RoutesExhausted);
+                    for (self.held_base.items) |slot| self.holdScratch(slot);
+                const first_window: u8 = @intCast(@ctz(~used_windows));
+                const window = if (first_window < self.wide_depth) first_window else 0;
                 r.* = .{ .layer = layer, .window = window };
                 const ls = &self.layers[layer];
                 ls.policy.planWith(ids, self.phase, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held_set.items });
                 const plan = &r.plan;
+                if (first_window >= self.wide_depth and plan.n_loads > plan.n_persistent)
+                    return self.fail(error.SlotStillPinned);
                 for (plan.hitsOf(), r.hit_slots[0..plan.n_hits]) |e, *s| {
                     s.* = ls.policy.slotOf(e).?;
                     self.locate(layer, s.*).meta.pins += 1;
@@ -824,6 +1123,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     r.reads[i] = !held;
                     skipped += @intFromBool(held);
                     if (!held) m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = l.expert };
+                    if (!held) {
+                        const location = self.locate(layer, l.slot);
+                        location.rows.publish(location.row, self.bank.recordGeometry(layer, l.expert)) catch return self.fail(error.SlotStillPinned);
+                    }
                     m.pins = 1;
                 }
                 try self.submitParts(r);
@@ -846,34 +1149,74 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// The call's certain misses (its plan's misses) as pre-read ranges,
             /// before the plan; the submit binds them.
-            fn preRead(self: *Stream, layer: u32, ids: []const u16, tag: i64) Error!void {
-                var experts: [expert_lookahead.max_candidates]u16 = undefined;
-                const misses = self.selector.?.certainMisses(ids, &self.layers[layer].policy, &experts);
-                if (misses.len == 0) return;
-                var bases: [expert_lookahead.max_candidates]i64 = undefined;
-                for (misses, bases[0..misses.len]) |e, *b| b.* = @intCast(self.bank.recordOffset(layer, e));
-                _ = B.Records.preRead(self.pool, self.bank.sidecar, tag, bases[0..misses.len], &self.layers[layer].lens) catch
-                    return self.fail(error.PreReadRefused);
+            fn lengthsOf(geometry: *const Layer) [n_components]u64 {
+                var lens: [n_components]u64 = undefined;
+                for (&lens, geometry.segments) |*length, segment| length.* = segment.length;
+                return lens;
             }
 
-            /// Settles every record read ahead for this call that it did not claim,
-            /// then reads ahead the next layer's predicted records (keyed by offset).
+            const RecordOrder = struct {
+                bank: *const B.Bank,
+                layer: u32,
+
+                fn same(order: RecordOrder, x: u16, y: u16) bool {
+                    for (order.bank.recordGeometry(order.layer, x).segments, order.bank.recordGeometry(order.layer, y).segments) |a, b| {
+                        if (a.length != b.length or a.offset != b.offset) return false;
+                    }
+                    return true;
+                }
+
+                fn less(order: RecordOrder, x: u16, y: u16) bool {
+                    for (order.bank.recordGeometry(order.layer, x).segments, order.bank.recordGeometry(order.layer, y).segments) |a, b| {
+                        if (a.length != b.length) return a.length < b.length;
+                        if (a.offset != b.offset) return a.offset < b.offset;
+                    }
+                    return order.bank.recordOffset(order.layer, x) < order.bank.recordOffset(order.layer, y);
+                }
+            };
+
+            fn preRead(self: *Stream, layer: u32, ids: []const u16, tag: i64) Error!void {
+                var experts: [expert_lookahead.max_candidates]u16 = undefined;
+                const count = self.selector.?.certainMisses(ids, &self.layers[layer].policy, &experts).len;
+                const misses = experts[0..count];
+                const order: RecordOrder = .{ .bank = self.bank, .layer = layer };
+                std.sort.insertion(u16, misses, order, RecordOrder.less);
+                var start: usize = 0;
+                while (start < count) {
+                    var end = start + 1;
+                    while (end < count and order.same(misses[start], misses[end])) : (end += 1) {}
+                    var bases: [expert_lookahead.max_candidates]i64 = undefined;
+                    for (misses[start..end], bases[0 .. end - start]) |e, *base| base.* = @intCast(self.bank.recordOffset(layer, e));
+                    const lens = lengthsOf(self.bank.recordGeometry(layer, misses[start]));
+                    _ = B.Records.preRead(self.pool, self.bank.sidecar, tag, bases[0 .. end - start], &lens) catch return self.fail(error.PreReadRefused);
+                    start = end;
+                }
+            }
+
             fn speculate(self: *Stream, r: *const Route, scores: []const f32) Error!void {
                 const next = r.layer + 1;
-                var bases: [expert_lookahead.max_budget]i64 = undefined;
+                var chosen: [expert_lookahead.max_budget]u16 = undefined;
                 var n: usize = 0;
-                var len: u64 = 0;
                 if (scores.len > 0 and next < self.layers.len) {
                     const sel = &self.selector.?;
-                    var chosen: [expert_lookahead.max_budget]u16 = undefined;
-                    for (sel.select(scores, &self.layers[next].policy, chosen[0..sel.budget])) |e| {
-                        bases[n] = @intCast(self.bank.recordOffset(next, e));
-                        n += 1;
-                    }
-                    len = self.bank.layers[next].logical_bytes;
+                    n = sel.select(scores, &self.layers[next].policy, chosen[0..sel.budget]).len;
                 }
-                _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0..n], len) catch
-                    return self.fail(error.SpecRefused);
+                if (n == 0) {
+                    _ = self.pool.specStep(self.bank.sidecar, r.tag, &.{}, 0) catch return self.fail(error.SpecRefused);
+                    return;
+                }
+                const order: RecordOrder = .{ .bank = self.bank, .layer = next };
+                std.sort.insertion(u16, chosen[0..n], order, RecordOrder.less);
+                var start: usize = 0;
+                while (start < n) {
+                    var end = start + 1;
+                    while (end < n and order.same(chosen[start], chosen[end])) : (end += 1) {}
+                    var bases: [expert_lookahead.max_budget]i64 = undefined;
+                    for (chosen[start..end], bases[0 .. end - start]) |e, *base| base.* = @intCast(self.bank.recordOffset(next, e));
+                    const len = self.bank.recordGeometry(next, chosen[start]).logical_bytes;
+                    _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0 .. end - start], len) catch return self.fail(error.SpecRefused);
+                    start = end;
+                }
             }
 
             /// Event gates for a live route's reads, registered before the GPU commits
@@ -922,6 +1265,45 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return self.event_word;
             }
 
+            /// Tickets remain owned until reclamation; gates include C's queued
+            /// prefix and live calls that have not registered their gates yet.
+            fn reserveResources(self: *const Stream, needed: u32, needed_gates: u32) Error!u32 {
+                if (self.gated) {
+                    var gates = self.pool.liveGates() catch return error.GateRefused;
+                    for (&self.routes) |*route_| {
+                        if (route_.state != .free and route_.gates == null and route_.n_parts != 0)
+                            gates += 1 + route_.n_parts;
+                    }
+                    if (gates + needed_gates > expert_io.max_gates) return error.GatesFull;
+                }
+                if (needed == 0) return 0;
+                const Interval = struct { lo: u32, hi: u32 };
+                var ranges: [route_capacity]Interval = undefined;
+                var n_ranges: usize = 0;
+                for (&self.routes) |*route_| {
+                    if (route_.state == .free) continue;
+                    var range: Interval = .{ .lo = @intCast(self.pool.published.len), .hi = 0 };
+                    for (route_.partsOf()) |part| if (part.n_reads != 0) {
+                        range.lo = @min(range.lo, part.ticket);
+                        range.hi = @max(range.hi, part.ticket + 2 * part.n_reads);
+                    };
+                    if (range.hi == 0) continue;
+                    ranges[n_ranges] = range;
+                    n_ranges += 1;
+                }
+                var first: u32 = 0;
+                while (@as(u64, first) + needed <= self.pool.published.len) {
+                    var next = first;
+                    for (ranges[0..n_ranges]) |range| {
+                        if (first < range.hi and range.lo < first + needed)
+                            next = @max(next, range.hi);
+                    }
+                    if (next == first) return first;
+                    first = next;
+                }
+                return error.RoutesExhausted;
+            }
+
             /// Loads in file order, cut into parts (decode: the bounded parts of
             /// `records_per_part`; prefill: pool-job chunks), one pool job per part.
             fn submitParts(self: *Stream, r: *Route) Error!void {
@@ -930,31 +1312,60 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (n == 0) return;
                 const bank = self.bank;
                 for (r.order[0..n], 0..) |*o, i| o.* = @intCast(i);
-                std.sort.insertion(u8, r.order[0..n], @as(*const Route, r), struct {
-                    fn less(rr: *const Route, a: u8, b: u8) bool {
-                        return rr.plan.loads[a].expert < rr.plan.loads[b].expert;
+                const Order = struct {
+                    records: RecordOrder,
+                    plan: *const Plan,
+                    fn less(order: @This(), a: u8, b: u8) bool {
+                        return order.records.less(order.plan.loads[a].expert, order.plan.loads[b].expert);
                     }
-                }.less);
+                };
+                const order: RecordOrder = .{ .bank = bank, .layer = r.layer };
+                std.sort.insertion(u8, r.order[0..n], Order{ .records = order, .plan = plan }, Order.less);
                 var offsets: [max_route_ids]u64 = undefined;
                 var lengths: [max_route_ids]u64 = undefined;
-                const logical = bank.layers[r.layer].logical_bytes;
                 for (r.order[0..n], 0..) |li, k| {
                     offsets[k] = bank.recordOffset(r.layer, plan.loads[li].expert);
-                    lengths[k] = logical;
+                    lengths[k] = bank.recordGeometry(r.layer, plan.loads[li].expert).logical_bytes;
                 }
                 var ends_buf: [max_route_ids]u32 = undefined;
-                const ends = if (plan.phase == .decode)
-                    expert_policy.boundedParts(offsets[0..n], lengths[0..n], self.records_per_part, &ends_buf)
-                else blk: {
-                    var k: u32 = 0;
-                    var e: u32 = 0;
-                    while (e < n) : (k += 1) {
-                        e = @min(e + expert_io.max_items, n);
-                        ends_buf[k] = e;
+                var n_ends: usize = 0;
+                var group_start: u32 = 0;
+                while (group_start < n) {
+                    var group_end = group_start + 1;
+                    while (group_end < n and order.same(plan.loads[r.order[group_start]].expert, plan.loads[r.order[group_end]].expert)) : (group_end += 1) {}
+                    if (plan.phase == .decode) {
+                        var local_ends: [max_route_ids]u32 = undefined;
+                        for (expert_policy.boundedParts(offsets[group_start..group_end], lengths[group_start..group_end], self.records_per_part, &local_ends)) |end| {
+                            ends_buf[n_ends] = group_start + end;
+                            n_ends += 1;
+                        }
+                    } else {
+                        var end = group_start;
+                        while (end < group_end) {
+                            end = @min(end + expert_io.max_items, group_end);
+                            ends_buf[n_ends] = end;
+                            n_ends += 1;
+                        }
                     }
-                    break :blk ends_buf[0..k];
+                    group_start = group_end;
+                }
+                const ends = ends_buf[0..n_ends];
+                var tickets: u32 = 0;
+                for (r.reads[0..n]) |read_| tickets += 2 * @as(u32, @intFromBool(read_));
+                const first_ticket = self.reserveResources(tickets, @intCast(n_ends + 1)) catch |err| {
+                    // No IO was posted: undo this call's pins and new admissions.
+                    for (r.hit_slots[0..plan.n_hits]) |slot| self.locate(r.layer, slot).meta.pins -= 1;
+                    for (plan.loadsOf(), r.reads[0..n]) |load, read_| {
+                        const meta = self.locate(r.layer, load.slot).meta;
+                        meta.pins -= 1;
+                        if (read_) meta.state = .empty;
+                        if (load.persistent) self.layers[r.layer].policy.invalidate(load.expert);
+                    }
+                    r.* = .{};
+                    self.n_free += 1;
+                    return self.fail(err);
                 };
-                const ls = &self.layers[r.layer];
+                self.pool.next_ticket = first_ticket;
                 var start: u32 = 0;
                 for (ends) |end| {
                     var part: Part = .{ .first = start, .n = end - start };
@@ -973,7 +1384,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         nr += 1;
                     }
                     if (nr > 0) {
-                        part.ticket = B.Records.submit(self.pool, bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &ls.lens) catch |e| return self.fail(e);
+                        const lens = lengthsOf(bank.recordGeometry(r.layer, plan.loads[r.order[start]].expert));
+                        part.ticket = B.Records.submit(self.pool, bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &lens) catch |e| return self.fail(e);
+                        std.debug.assert(self.pool.next_ticket <= first_ticket + tickets);
                         part.n_reads = nr;
                     } else part.settled = true;
                     r.parts[r.n_parts] = part;
@@ -1029,10 +1442,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn readAheadSeed(self: *Stream, layer: u32, experts: []const u16) !void {
                 if (self.failed) return error.StreamFailed;
                 if (self.phase != .prefill) return error.NotPrefill;
+                // Empty-only admission cannot overwrite live hits or held base rows;
+                // an owned reader ticket still forbids resetting the seed cursor.
+                for (&self.routes) |*route_| {
+                    if (route_.state == .free) continue;
+                    for (route_.partsOf()) |part| if (part.n_reads != 0) return error.RoutesLive;
+                }
                 if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
                 const ah = &self.ahead;
-                const fit = @min(ah.loads.len, (self.pool.published.len - 2 * expert_io.max_items) / 2);
-                const admitted = self.layers[layer].policy.admitReadAhead(experts, ah.loads[0..fit]);
+                const admitted = self.layers[layer].policy.admitReadAhead(experts, ah.loads);
                 if (comptime read_ahead_probed) if (self.probe) |pr| {
                     // The predicted seed: the ranking's top as many as the layer's unprotected rows (the seed's rule); blocked:
                     // those neither resident nor admitted (no empty row: every row held by a resident, the read-ahead never evicts).
@@ -1046,9 +1464,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const n: u32 = @intCast(admitted.len);
                 ah.* = .{ .layer = layer, .n = n, .loads = ah.loads, .reads = ah.reads, .parts = ah.parts };
                 if (n == 0) return;
-                std.sort.pdq(LayerPolicy.ReadAhead, admitted, {}, struct {
-                    fn less(_: void, x: LayerPolicy.ReadAhead, y: LayerPolicy.ReadAhead) bool {
-                        return x.expert < y.expert;
+                const order: RecordOrder = .{ .bank = self.bank, .layer = layer };
+                std.sort.pdq(LayerPolicy.ReadAhead, admitted, order, struct {
+                    fn less(o: RecordOrder, x: LayerPolicy.ReadAhead, y: LayerPolicy.ReadAhead) bool {
+                        return o.less(x.expert, y.expert);
                     }
                 }.less);
                 for (admitted, ah.reads[0..n]) |l, *rd| {
@@ -1056,13 +1475,19 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
                     rd.* = !(m.state == .ready and m.layer == layer and m.expert == l.expert);
                     if (rd.*) m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = l.expert };
+                    if (rd.*) {
+                        const location = self.locate(layer, l.slot);
+                        location.rows.publish(location.row, self.bank.recordGeometry(layer, l.expert)) catch return self.fail(error.SlotStillPinned);
+                    }
                     m.pins = 1;
                 }
                 ah.live = true;
-                const lens = &self.layers[layer].lens;
+                self.pool.next_ticket = 0;
                 var start: u32 = 0;
                 while (start < n) {
-                    const end = @min(start + expert_io.max_items, n);
+                    var end = start + 1;
+                    while (end < @min(start + expert_io.max_items, n) and order.same(admitted[start].expert, admitted[end].expert)) : (end += 1) {}
+                    const lens = lengthsOf(self.bank.recordGeometry(layer, admitted[start].expert));
                     var part: Part = .{ .first = start, .n = end - start };
                     var rows: [expert_io.max_items][n_components]u64 = undefined;
                     var gu: [expert_io.max_items]u64 = undefined;
@@ -1077,7 +1502,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         nr += 1;
                     };
                     if (nr > 0) {
-                        part.ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |e| return self.fail(e);
+                        part.ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &lens) catch |e| return self.fail(e);
                         part.n_reads = nr;
                         self.counters.ahead_posted += nr;
                         if (comptime read_ahead_probed) if (self.probe) |pr| pr.posted(layer, nr);
@@ -1135,7 +1560,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (experts, ahead_sums[0..experts.len]) |e, *sum| {
                     const slot = ls.policy.slotOf(e).?;
                     sum.* = self.recordDigest(layer, slot);
-                    for (ls.lens, 0..) |len, c| @memset(self.slotRow(layer, slot, @enumFromInt(c))[0..len], 0);
+                    for (self.bank.recordGeometry(layer, e).segments, 0..) |segment, c| @memset(self.slotRow(layer, slot, @fromBackingInt(@intCast(c)))[0..segment.length], 0);
                     self.locate(layer, slot).meta.state = .empty;
                     ls.policy.invalidate(e);
                 }
@@ -1167,7 +1592,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// sha256 of the record a layer's slot holds (its component rows at their logical lengths).
             fn recordDigest(self: *Stream, layer: u32, slot: u32) [32]u8 {
                 var h = std.crypto.hash.sha2.Sha256.init(.{});
-                for (self.layers[layer].lens, 0..) |len, c| h.update(self.slotRow(layer, slot, @enumFromInt(c))[0..len]);
+                const expert_ = self.locate(layer, slot).meta.expert;
+                for (self.bank.recordGeometry(layer, expert_).segments, 0..) |segment, c| h.update(self.slotRow(layer, slot, @fromBackingInt(@intCast(c)))[0..segment.length]);
                 var d: [32]u8 = undefined;
                 h.final(&d);
                 return d;
@@ -1222,8 +1648,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 try self.flush();
                 for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
                 if (self.held_base.items.len > 0) return error.RoutesLive;
-                var bytes: u64 = 0;
-                for (self.transient.row_bytes) |n| bytes += n * self.transient.rows;
+                const bytes = self.transient.bytes();
                 const before = if (self.memory == .mlx) mlxActive() else 0;
                 self.transient.deinit();
                 self.allocator.free(self.transient_meta);
@@ -1262,7 +1687,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     a.free(meta0);
                 };
                 if (self.transient_released) {
-                    const geom0 = &self.bank.layers[self.transient_layer];
+                    const geom0 = &self.geometry.transient;
                     const n0 = self.max_route_ids + decode_staging_rows;
                     window0 = switch (self.grow_fill) {
                         .zeros => try Rows.init(geom0, n0, self.memory),
@@ -1280,10 +1705,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 @memset(exts, null);
                 errdefer for (exts) |*e| if (e.*) |*rows| rows.deinit();
                 for (self.layers, decode_rows, exts, self.bank.layers) |*ls, rows, *e, *geom| {
-                    if (rows > ls.policy.capacity) e.* = switch (self.grow_fill) {
-                        .zeros => try Rows.initLazy(geom, rows - ls.policy.capacity, self.memory),
-                        .unfilled => try Rows.initUnfilled(geom, rows - ls.policy.capacity, self.memory),
-                    };
+                    if (rows > ls.policy.capacity) e.* = try Rows.initSuffix(geom, ls.policy.capacity, rows - ls.policy.capacity, self.memory, self.grow_fill);
                 }
                 // Every layer's new MLX arrays in one eval (growth-overlap step 1: not nine evals per layer, 360 at 40); unfilled
                 // arrays are already evaluated.
@@ -1320,11 +1742,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 try self.settleRoutes();
                 var bytes: u64 = 0;
                 for (self.layers) |*ls| if (ls.ext) |e| {
-                    for (e.row_bytes) |n| bytes += n * e.rows;
+                    bytes += e.bytes();
                 };
-                if (self.release_installed) for (self.transient.row_bytes) |n| {
-                    bytes += n * self.transient.rows;
-                };
+                if (self.release_installed) bytes += self.transient.bytes();
                 const before = if (self.memory == .mlx) mlxActive() else 0;
                 for (self.layers, prompt_rows) |*ls, rows| {
                     for (ls.meta[rows..ls.policy.capacity]) |*m| {
@@ -1369,9 +1789,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// The prompt scratch's bytes (`regrowTransient` allocates them).
             pub fn promptTransientBytes(self: *const Stream) u64 {
-                var n: u64 = 0;
-                for (self.bank.layers[self.transient_layer].segments) |seg| n += seg.length;
-                return n * self.prompt_transient_rows;
+                return StorageGeometry.allocationBytes(&self.geometry.transient, 0, self.prompt_transient_rows) catch unreachable;
             }
 
             /// The reverse phase change's allocation, after its frees landed: the prompt's scratch (`Options.transient_rows`
@@ -1381,7 +1799,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.phase != .prefill) return error.AlreadyGrown;
                 if (self.failed) return error.StreamFailed;
                 if (!self.transient_released) return error.TransientNotReleased;
-                var t = try Rows.init(&self.bank.layers[self.transient_layer], self.prompt_transient_rows, self.memory);
+                var t = try Rows.init(&self.geometry.transient, self.prompt_transient_rows, self.memory);
                 errdefer t.deinit();
                 const meta = try self.allocator.alloc(SlotMeta, t.rows);
                 @memset(meta, .{});
@@ -1389,9 +1807,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.transient_meta = meta;
                 self.transient_released = false;
                 self.wide_depth = self.prompt_wide_depth;
-                var bytes: u64 = 0;
-                for (t.row_bytes) |n| bytes += n * t.rows;
-                return bytes;
+                return t.bytes();
             }
 
             /// A settled result's read time; a result with payload and no preadv was copied out of a speculative record.
@@ -1408,10 +1824,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 s.read_wall_ns = @intCast(@max(self.pool.readGauge()[4], 0));
                 const p = self.pool;
                 const pairs = .{
-                    .{ "claimed", .claimed },           .{ "spec_bytes", .spec_bytes },   .{ "spec_issued", .submitted },
-                    .{ "spec_landed", .landed },        .{ "adopt_ranges", .adopt_ranges }, .{ "adopt_bytes", .adopt_bytes },
-                    .{ "pre_issued", .pre_issued },     .{ "pre_served", .pre_served },   .{ "pre_expired", .pre_expired },
-                    .{ "gates", .ev_gates },            .{ "gates_forced", .ev_wd_forced },
+                    .{ "claimed", .claimed },       .{ "spec_bytes", .spec_bytes },     .{ "spec_issued", .submitted },
+                    .{ "spec_landed", .landed },    .{ "adopt_ranges", .adopt_ranges }, .{ "adopt_bytes", .adopt_bytes },
+                    .{ "pre_issued", .pre_issued }, .{ "pre_served", .pre_served },     .{ "pre_expired", .pre_expired },
+                    .{ "gates", .ev_gates },        .{ "gates_forced", .ev_wd_forced },
                 };
                 inline for (pairs) |pr| @field(s, pr[0]) = @intCast(@max(p.counter(pr[1]), 0));
                 return s;
@@ -1422,7 +1838,5 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return self.locate(layer, slot).meta.pins;
             }
         };
-
-
     };
 }

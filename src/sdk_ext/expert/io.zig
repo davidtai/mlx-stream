@@ -180,6 +180,11 @@ pub fn slotBytes(record_bytes: u64, page: u64) u64 {
     return std.mem.alignForward(u64, record_bytes, page) + 2 * page;
 }
 
+/// A whole preread range includes both its starting page offset and its ending page.
+pub fn spanBytes(offset: u64, length: u64, page: u64) u64 {
+    return std.mem.alignForward(u64, offset % page + length, page);
+}
+
 /// Page-aligned chunk so `chunks` chunks cover a staging slot.
 pub fn chunkBytes(chunks: u32, record_bytes: u64, page: u64) u64 {
     return (std.math.divCeil(u64, slotBytes(record_bytes, page), chunks * page) catch unreachable) * page;
@@ -228,7 +233,7 @@ fn openUncachedWith(path: [*:0]const u8, errno: ?*c_int, follow: bool) OpenError
     if (fd < 0) {
         const e = std.c._errno().*;
         if (errno) |p| p.* = e;
-        return if (e == @intFromEnum(std.posix.E.NOENT)) error.NotFound else error.OpenFailed;
+        return if (e == @backingInt(std.posix.E.NOENT)) error.NotFound else error.OpenFailed;
     }
     errdefer _ = std.c.close(fd);
     var st: std.c.Stat = undefined;
@@ -329,7 +334,7 @@ pub const Pool = struct {
     /// publishing worker; a gate unsatisfied after `timeout_ns` is forced.
     pub fn armEvent(self: *Pool, kind: EventKind, object: u64, timeout_ns: i64, start_value: u64) !void {
         _ = self;
-        if (c.q3ld_ev_config(@intFromEnum(kind), object, timeout_ns, start_value) != 0) return error.EventRefused;
+        if (c.q3ld_ev_config(@backingInt(kind), object, timeout_ns, start_value) != 0) return error.EventRefused;
     }
 
     /// A layer call's speculative step: settles every unclaimed record tagged
@@ -354,6 +359,15 @@ pub const Pool = struct {
         }
     }
 
+    /// Registered gates still held by C's satisfied-prefix queue, armed or not.
+    pub fn liveGates(self: *const Pool) !u32 {
+        _ = self;
+        var state: [10]i64 = undefined;
+        const count = c.q3ld_ev_state(&state);
+        if (count < 0) return error.GateRefused;
+        return @intCast(count);
+    }
+
     /// Forces every live gate <= `value` (error paths: nothing may wait for it).
     pub fn releaseGates(self: *Pool, value: u64) void {
         _ = self;
@@ -361,7 +375,7 @@ pub const Pool = struct {
     }
 
     pub fn counter(self: *const Pool, which: Counter) i64 {
-        return @atomicLoad(i64, &self.counters[@intFromEnum(which)], .monotonic);
+        return @atomicLoad(i64, &self.counters[@backingInt(which)], .monotonic);
     }
 
     /// Blocks until every ticket in [first, first + count) is in the log;
@@ -385,7 +399,7 @@ pub const Pool = struct {
 
     pub fn result(self: *const Pool, ticket: u32) Result {
         const w = self.res[@as(usize, ticket) * res_w ..][0..res_w];
-        return .{ .status = @enumFromInt(w[0]), .preadv_calls = w[1], .bytes_returned = w[2], .payload = w[3], .errno = w[4], .t_start_ns = w[5], .t_end_ns = w[6], .worker = w[7] };
+        return .{ .status = @fromBackingInt(@intCast(w[0])), .preadv_calls = w[1], .bytes_returned = w[2], .payload = w[3], .errno = w[4], .t_start_ns = w[5], .t_end_ns = w[6], .worker = w[7] };
     }
 
     /// Tickets in publication order for log positions [from, to).

@@ -438,7 +438,6 @@ test "dsv41 policy: a plan beside a live route never evicts its held slots and l
 
 // ── Edges and accounting identities (synthetic traces; capacity 0, 1 and full; both phases; both planners) ──
 
-
 /// Totals over a trace: every plan's lookups split into hits and misses, every miss loaded once, and the residency the
 /// persistent loads and evictions leave.
 const Tally = struct {
@@ -528,7 +527,6 @@ test "dsv41 policy: prefill traces at full capacity never evict, and with held s
         t.add(ids[0..n], &out);
     }
     try t.expectIdentities(full.occupancy);
-
 }
 
 /// A random prefill trace whose every plan holds two slots of another live route (`PlanOpts.held`): none is ever a victim.
@@ -556,7 +554,6 @@ fn heldTrace(phase: Phase) !void {
     }
     try t.expectIdentities(p.occupancy);
 }
-
 
 test "dsv41 policy: capacities and read-ahead admissions refuse or stop at their bounds" {
     try testing.expectError(error.InvalidCapacity, LayerPolicy.init(testing.allocator, 0, 0));
@@ -603,4 +600,72 @@ fn policyInitDeinit(a: std.mem.Allocator, n_experts: u32, capacity: u32) !void {
 
 test "dsv41 policy: every allocation failure of the residency policy's construction unwinds without a leak" {
     try std.testing.checkAllAllocationFailures(testing.allocator, policyInitDeinit, .{ 16, 4 });
+}
+
+test "dsv41 policy: compact admission fits before eviction and preserves protected and routed residents" {
+    const needs = [_][3]u32{ .{ 2, 3, 5 }, .{ 5, 2, 2 }, .{ 2, 5, 2 }, .{ 2, 2, 2 }, .{ 5, 5, 5 }, .{ 2, 3, 5 }, .{ 5, 2, 2 }, .{ 2, 2, 2 } };
+    const capacities = [_][3]u32{ needs[1], needs[0], needs[2], needs[4], needs[1], needs[0], needs[2], needs[4] };
+    for ([_]Phase{ .prefill, .decode }) |phase| {
+        var p = try LayerPolicy.init(testing.allocator, needs.len, 3);
+        defer p.deinit(testing.allocator);
+        p.needs = &needs;
+        p.capacities = &capacities;
+        var plan: Plan = .{};
+        p.plan(&.{ 0, 1 }, phase, &plan);
+        try checkPlan(&p, &.{ 0, 1 }, &plan, max_route_ids);
+        try testing.expectEqual(@as(?u32, 1), p.slotOf(0));
+        try testing.expectEqual(@as(?u32, 0), p.slotOf(1));
+        p.protected.set(0);
+        p.plan(&.{ 0, 4, 5 }, phase, &plan);
+        try checkPlan(&p, &.{ 0, 4, 5 }, &plan, max_route_ids);
+        try testing.expectEqual(@as(u32, 0), plan.n_evictions);
+        try testing.expectEqual(@as(u32, 0), plan.n_persistent);
+        try testing.expectEqual(@as(?u32, null), p.slotOf(4));
+        try testing.expectEqual(@as(?u32, null), p.slotOf(5));
+        p.plan(&.{3}, phase, &plan);
+        try testing.expectEqual(@as(?u32, 2), p.slotOf(3));
+        try p.grow(4);
+        p.plan(&.{5}, phase, &plan);
+        try testing.expectEqual(@as(?u32, 3), p.slotOf(5));
+        try testing.expectEqual(@as(?u32, 1), p.slotOf(0));
+        for (p.slot_to_expert[0..p.capacity], 0..) |expert, slot| {
+            if (expert == no_expert) continue;
+            for (needs[expert], capacities[slot]) |need, capacity| try testing.expect(need <= capacity);
+        }
+    }
+}
+
+test "dsv41 policy: compact read-ahead skips an incompatible prediction and continues fitting empty slots" {
+    const needs = [_][3]u32{ .{ 2, 3, 5 }, .{ 5, 2, 2 }, .{ 2, 5, 2 }, .{ 5, 5, 5 } };
+    const capacities = [_][3]u32{ needs[1], needs[0], needs[2], needs[3] };
+    var p = try LayerPolicy.init(testing.allocator, needs.len, 3);
+    defer p.deinit(testing.allocator);
+    p.needs = &needs;
+    p.capacities = &capacities;
+    var admitted: [4]LayerPolicy.ReadAhead = undefined;
+    const actual = p.admitReadAhead(&.{ 3, 0, 1, 2 }, &admitted);
+    try testing.expectEqualSlices(LayerPolicy.ReadAhead, &.{
+        .{ .expert = 0, .slot = 1 },
+        .{ .expert = 1, .slot = 0 },
+        .{ .expert = 2, .slot = 2 },
+    }, actual);
+    try testing.expectEqual(@as(?u32, null), p.slotOf(3));
+    try testing.expectEqual(@as(u32, 3), p.occupancy);
+}
+
+test "dsv41 policy: compact held capacity is never reassigned" {
+    const rates = [_][3]u32{ .{ 2, 3, 5 }, .{ 5, 2, 2 }, .{ 2, 3, 5 } };
+    var p = try LayerPolicy.init(testing.allocator, rates.len, 2);
+    defer p.deinit(testing.allocator);
+    p.needs = &rates;
+    p.capacities = &rates;
+    var plan: Plan = .{};
+    p.plan(&.{0}, .prefill, &plan);
+    p.planWith(&.{2}, .prefill, &plan, .{ .held = &.{0} });
+    try testing.expectEqual(@as(?u32, 0), p.slotOf(0));
+    try testing.expectEqual(@as(u32, 0), plan.n_evictions);
+    try testing.expectEqualSlices(Load, &.{.{ .expert = 2, .slot = 2, .persistent = false }}, plan.loadsOf());
+    p.plan(&.{2}, .prefill, &plan);
+    try testing.expectEqual(@as(?u32, null), p.slotOf(0));
+    try testing.expectEqual(@as(?u32, 0), p.slotOf(2));
 }

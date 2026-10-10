@@ -90,14 +90,16 @@ const Kernels = struct {
     }
 };
 
-fn acceptKernels(gpa: std.mem.Allocator, g: *ops.MlxOps, c: *const v41.Config) !Kernels {
+fn acceptKernels(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, g: *ops.MlxOps, c: *const v41.Config) !Kernels {
     var diag: xk.Diag = .{};
     errdefer std.debug.print("dsv41 kernels: {s}\n", .{diag.message()});
+    var peek = try expert_bank.peek(gpa, io, dir, &diag);
+    defer peek.deinit();
     const set = try kernel_set.Set.init(gpa, .{ .device = .{ .stream = g.s } }, &diag);
     errdefer set.deinit();
     set.install(ops.MlxOps, g);
     errdefer kernel_set.Set.uninstall(ops.MlxOps, g);
-    const exl3 = try xq.accept(ops.MlxOps, gpa, g, .{ .kernels = set.ref() }, .{
+    const exl3 = try xq.accept(ops.MlxOps, gpa, g, .{ .kernels = set.ref(), .peek = &peek.view }, .{
         .hidden = c.hidden_size,
         .inter = c.moe_intermediate_size,
         .top_k = c.n_experts_per_tok,
@@ -112,7 +114,7 @@ fn acceptKernels(gpa: std.mem.Allocator, g: *ops.MlxOps, c: *const v41.Config) !
 fn checkBanks(g: *ops.MlxOps, k: Kernels, ex: anytype) !void {
     var diag: xk.Diag = .{};
     errdefer std.debug.print("dsv41 kernels: {s}\n", .{diag.message()});
-    for (ex.banks) |per| for (per) |maybe| if (maybe) |b| try k.exl3.checkBank(g, b, &diag);
+    for (ex.banks, 0..) |per, l| for (per) |maybe| if (maybe) |b| try k.exl3.checkLayerBank(g, @intCast(l), b, &diag);
 }
 
 pub const reference_format = "mlx-serve-dsv41-ar-ref-v1";
@@ -189,7 +191,7 @@ test "dsv41 ar: the native path with streamed experts generates the Python refer
     _ = mlx.mlx_set_cache_limit(&prev_cache, 0);
     defer _ = mlx.mlx_set_cache_limit(&prev_cache, prev_cache);
     memProbe("dsv41 ar", "start");
-    const kernels = try acceptKernels(gpa, &g, &c);
+    const kernels = try acceptKernels(gpa, io, bank_dir, &g, &c);
     defer kernels.deinit(&g);
     memProbe("dsv41 ar", "kernels accepted (the startup self-check)");
 
@@ -590,8 +592,8 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     const json = try std.json.Stringify.valueAlloc(a, rec, .{ .whitespace = .indent_1 });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
     std.debug.print("\nNATIVE dsv41 ar served: split {d}+{d}, phase {t}, tier {t}; {d} prompt tokens in {d} calls, {d} generated; ids sha256 {s}; step 0 top-2 {any} margin {d}, step 1 top-2 {any} margin {d}; vs the reference's ids (harness schedule): {s}, first difference {?d}; {d} ms; wrote {s}\n", .{
-        run.split,     n - run.split,  run.phase,     run.tier,       n,         calls.len, out.len, &ids_sha,
-        steps[0].top2, steps[0].margin, steps[1].top2, steps[1].margin, if (override != null) "ref: prompt differs" else if (first == null) "IDENTICAL" else "DIFFER", first, wall_ms, out_path,
+        run.split,     n - run.split,   run.phase,     run.tier,        n,                                                                                             calls.len, out.len, &ids_sha,
+        steps[0].top2, steps[0].margin, steps[1].top2, steps[1].margin, if (override != null) "ref: prompt differs" else if (first == null) "IDENTICAL" else "DIFFER", first,     wall_ms, out_path,
     });
     if (first) |i| std.debug.print("dsv41 ar served: first differing step {d}: served {d} (top-2 {any}, margin {d}), reference {d} (top-2 {any}, margin {d})\n", .{
         i, out[i], steps[i].top2, steps[i].margin, ref.generated_ids[i], ref.steps[i].top2, ref.steps[i].margin,
@@ -1035,7 +1037,7 @@ const ProfCycle = struct { k_eff: u32, accepted: u32, draft_ms: f64, verify_ms: 
 const Stamper = struct {
     io: std.Io,
     last: std.Io.Timestamp,
-    ns: [@intFromEnum(dsl.Phase.tail) + 1]u64 = @splat(0),
+    ns: [@backingInt(dsl.Phase.tail) + 1]u64 = @splat(0),
 
     fn begin(self: *Stamper) void {
         self.ns = @splat(0);
@@ -1043,12 +1045,12 @@ const Stamper = struct {
     }
 
     pub fn mark(self: *Stamper, p: dsl.Phase) void {
-        self.ns[@intFromEnum(p)] += @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
+        self.ns[@backingInt(p)] += @intCast(self.last.untilNow(self.io, .boot).nanoseconds);
         self.last = std.Io.Timestamp.now(self.io, .boot);
     }
 
     fn ms(self: *const Stamper, p: dsl.Phase) f64 {
-        return @as(f64, @floatFromInt(self.ns[@intFromEnum(p)])) / 1e6;
+        return @as(f64, @floatFromInt(self.ns[@backingInt(p)])) / 1e6;
     }
 };
 const CellReceipt = struct {
@@ -1676,11 +1678,11 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
     const json = if (comptime dt.enabled) try ro.receipt(a, json0) else json0;
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json, .flags = .{ .exclusive = true } });
     std.debug.print("\nNATIVE dsv41 served cell: typical {d}, {d} prompt tokens, rows {d} prefill / {d} decode per layer; TTFT {d:.2} s = prefill {d:.1} tok/s; phase change {d:.2} s; decode {d} tokens in {d} cycles, {d:.2} s = {d:.2} tok/s ({d:.2} with the phase change); accepted {d}/{d} drafts; wall {d:.2} s; peak footprint {d:.2} GB, MLX peak {d:.2} GB; finish {s}; ids sha256 {s}; wrote {s}\n", .{
-        delta,                      prompt.len,             rec.prefill_rows_per_layer, rec.decode_rows_per_layer,
-        ttft_s,                     rec.prefill_tok_s,      phase_s,                    out.items.len,
-        cycles.items.len,           decode_s,               rec.decode_tok_s,           rec.decode_tok_s_with_phase_change,
-        stt.accepted_drafts,        stt.drafted_tokens,     wall_s,                     rec.peak_footprint_gb,
-        rec.mlx_peak_gb,            rec.finish,             rec.generated_ids_sha256,   out_path,
+        delta,               prompt.len,         rec.prefill_rows_per_layer, rec.decode_rows_per_layer,
+        ttft_s,              rec.prefill_tok_s,  phase_s,                    out.items.len,
+        cycles.items.len,    decode_s,           rec.decode_tok_s,           rec.decode_tok_s_with_phase_change,
+        stt.accepted_drafts, stt.drafted_tokens, wall_s,                     rec.peak_footprint_gb,
+        rec.mlx_peak_gb,     rec.finish,         rec.generated_ids_sha256,   out_path,
     });
     // The window's box proofs (the harness's), after the receipt: the release left the box, and the grow added no
     // physical pages beyond its own footprint growth.
@@ -2149,7 +2151,7 @@ pub const PhaseMarks = struct {
     fn mark(ctx: *anyopaque, stage: module.PhaseObserver.Stage) anyerror!void {
         const self: *PhaseMarks = @ptrCast(@alignCast(ctx));
         const t0 = std.Io.Timestamp.now(self.io, .boot);
-        const i = @intFromEnum(stage);
+        const i = @backingInt(stage);
         self.marks[i] = boxMark(self.a, self.io) catch |e| blk: {
             self.failed[i] = e;
             break :blk null;
@@ -2476,7 +2478,7 @@ pub const BillLine = struct { name: []const u8, p: u64, d: u64 };
 pub fn billLines(b: CellBill) [17]BillLine {
     return .{
         .{ .name = "box baseline (the guard's)", .p = b.baseline, .d = b.baseline },
-        .{ .name = "slot banks (layers x rows + transient) x record", .p = b.slot_prefill, .d = b.slot_decode },
+        .{ .name = "slot banks (per-layer rows + transient capacity)", .p = b.slot_prefill, .d = b.slot_decode },
         .{ .name = "lookahead staging", .p = b.lookahead_staging, .d = b.lookahead_staging },
         .{ .name = "residents (the embedding: host rows, else off at the fence)", .p = b.prefillTerms().residents, .d = b.residents - b.embedding },
         .{ .name = "Engram residents (row caches: host side)", .p = b.engram, .d = b.engram },
@@ -3075,8 +3077,8 @@ test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselin
         for (ctx_sizes) |n| {
             const r = try ctxRow(a, testing.io, config, n, 1024, ceiling, target, covering);
             std.debug.print("DSV41_BILL_CONTEXT {{\"bill\": \"{s}\", \"baseline_gb\": {d:.2}, \"prompt\": {d}, \"positions\": {d}, \"wave_gb\": {d:.3}, \"kv_prompt_gb\": {d:.3}, \"kv_decode_gb\": {d:.3}, \"overshoot_prompt_gb\": {d:.3}, \"overshoot_decode_gb\": {d:.3}, \"prompt_state_gb\": {d:.3}, \"engram_posted_gb\": {d:.3}, \"decode_wave_gb\": {d:.3}, \"rows\": [{?d}, {?d}], \"prompt_total_gb\": {d:.3}, \"decode_total_gb\": {d:.3}, \"target_gb\": {d:.3}, \"fits\": {}}}\n", .{
-                if (covering) "covering" else "exact", gbOf(baseline), r.prompt, r.positions, gbOf(r.wave), gbOf(r.kv_prompt), gbOf(r.kv_decode), gbOf(r.overshoot_prompt), gbOf(r.overshoot_decode), gbOf(r.prompt_state), gbOf(r.engram_posted), gbOf(r.decode_wave),
-                if (r.rows) |x| x.prefill else null, if (r.rows) |x| x.decode else null, gbOf(r.prompt_total), gbOf(r.decode_total), gbOf(target), r.rows != null,
+                if (covering) "covering" else "exact", gbOf(baseline),                     r.prompt,             r.positions,          gbOf(r.wave), gbOf(r.kv_prompt), gbOf(r.kv_decode), gbOf(r.overshoot_prompt), gbOf(r.overshoot_decode), gbOf(r.prompt_state), gbOf(r.engram_posted), gbOf(r.decode_wave),
+                if (r.rows) |x| x.prefill else null,   if (r.rows) |x| x.decode else null, gbOf(r.prompt_total), gbOf(r.decode_total), gbOf(target), r.rows != null,
             });
             if (n == 16384 and !covering) {
                 try testing.expectEqual(@as(u64, 13_868_806_049 + 2 * 16384 * 16384 + 16384 * 256), r.wave);
@@ -3110,8 +3112,8 @@ test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselin
             // The derived group's terms (`PrefillBill.groupTerms`; `group_derived` false: the streams bound bills the group).
             const gt = pb.groupTerms(rows, pb.chunkRows(n));
             std.debug.print("DSV41_WAVE_TERMS {{\"positions\": {d}, \"rows\": {d}, \"span\": {d}, \"kept_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"selection_gb\": {d:.3}, \"attn_gb\": {d:.3}, \"group_gb\": {d:.3}, \"final_eval_gb\": {d:.3}, \"released_gb\": {d:.3}, \"total_gb\": {d:.3}, \"overshoot_gb\": {d:.3}, \"group_derived\": {}, \"group_terms_gb\": {{\"router\": {d:.3}, \"cat_xf\": {d:.3}, \"cat_idx\": {d:.4}, \"shared\": {d:.3}, \"routed\": {d:.3}, \"waves\": {d:.3}, \"merge\": {d:.3}, \"loc\": {d:.4}, \"combine\": {d:.3}, \"cast\": {d:.3}}}}}\n", .{
-                n, rows, pb.chunkRows(n), gbOf(w.kept), gbOf(w.halves), gbOf(w.selection), gbOf(w.attn), gbOf(w.group), gbOf(w.final_eval), gbOf(w.released), gbOf(w.total()), gbOf(pb.joinedBytes(rows)),
-                pb.derived_group, gbOf(gt.router), gbOf(gt.cat_xf), gbOf(gt.cat_idx), gbOf(gt.shared), gbOf(gt.routed), gbOf(gt.waves), gbOf(gt.merge), gbOf(gt.loc), gbOf(gt.combine), gbOf(gt.cast),
+                n,                rows,            pb.chunkRows(n), gbOf(w.kept),     gbOf(w.halves),  gbOf(w.selection), gbOf(w.attn),   gbOf(w.group),  gbOf(w.final_eval), gbOf(w.released), gbOf(w.total()), gbOf(pb.joinedBytes(rows)),
+                pb.derived_group, gbOf(gt.router), gbOf(gt.cat_xf), gbOf(gt.cat_idx), gbOf(gt.shared), gbOf(gt.routed),   gbOf(gt.waves), gbOf(gt.merge), gbOf(gt.loc),       gbOf(gt.combine), gbOf(gt.cast),
             });
         };
     }
@@ -3140,7 +3142,6 @@ test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselin
         };
     }
 }
-
 
 test "dsv41 served cell: the cell's bill on the host (the window's admission, every term)" {
     if (std.c.getenv("DSV41_CELL_BILL") == null) return error.SkipZigTest;
@@ -3581,10 +3582,10 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     if (dsv41_prof.enabled) {
         const M = dsv41_prof.Mode;
         std.debug.print("PREFILL_PROFILE_ROUTED_SPLIT {{\"wide_calls\": {d}, \"stream_read_wait_s\": {d:.3}, \"stream_encode_s\": {d:.3}, \"stream_drain_s\": {d:.3}, \"stream_join_s\": {d:.3}, \"base_seed_calls\": {d}, \"base_seed_encode_s\": {d:.3}, \"base_seed_drain_s\": {d:.3}, \"base_end_calls\": {d}, \"base_end_encode_s\": {d:.3}, \"base_end_drain_s\": {d:.3}}}\n", .{
-            dsv41_prof.wide_calls,                              dsv41_prof.modeSeconds(M.stream, .read_wait),   dsv41_prof.modeSeconds(M.stream, .encode),
-            dsv41_prof.modeSeconds(M.stream, .drain),           dsv41_prof.modeSeconds(M.stream, .join),        dsv41_prof.mode_calls[@intFromEnum(M.base_seed)],
-            dsv41_prof.modeSeconds(M.base_seed, .encode),       dsv41_prof.modeSeconds(M.base_seed, .drain),    dsv41_prof.mode_calls[@intFromEnum(M.base_end)],
-            dsv41_prof.modeSeconds(M.base_end, .encode),        dsv41_prof.modeSeconds(M.base_end, .drain),
+            dsv41_prof.wide_calls,                        dsv41_prof.modeSeconds(M.stream, .read_wait), dsv41_prof.modeSeconds(M.stream, .encode),
+            dsv41_prof.modeSeconds(M.stream, .drain),     dsv41_prof.modeSeconds(M.stream, .join),      dsv41_prof.mode_calls[@backingInt(M.base_seed)],
+            dsv41_prof.modeSeconds(M.base_seed, .encode), dsv41_prof.modeSeconds(M.base_seed, .drain),  dsv41_prof.mode_calls[@backingInt(M.base_end)],
+            dsv41_prof.modeSeconds(M.base_end, .encode),  dsv41_prof.modeSeconds(M.base_end, .drain),
         });
         var tot: dsv41_prof.ReadAheadLayer = .{};
         for (dsv41_prof.ra[0..@min(md.model.c.n_layers, dsv41_prof.max_layers)], 0..) |rec, l| {
@@ -3621,11 +3622,10 @@ fn printDecodeProfile(p: []const ProfCycle) void {
     }
     const n: f64 = @floatFromInt(p.len);
     std.debug.print("\nDECODE_PROFILE {{\"cycles\": {d}, \"draft_ms\": {d:.2}, \"verify_ms\": {d:.2}, \"decide_ms\": {d:.2}, \"commit_ms\": {d:.2}, \"tail_ms\": {d:.2}, \"cycle_ms\": {d:.2}, \"misses_per_cycle\": {d:.1}, \"mb_read_per_cycle\": {d:.1}, \"read_busy_ms\": {d:.2}, \"k_eff\": {d:.2}, \"accepted\": {d:.2}, \"claimed_per_cycle\": {d:.1}, \"spec_issued_per_cycle\": {d:.1}, \"spec_landed_per_cycle\": {d:.1}}}\n", .{
-        p.len,                     sum.draft_ms / n,       sum.verify_ms / n,  sum.decide_ms / n,
-        sum.commit_ms / n,         sum.tail_ms / n,        (sum.draft_ms + sum.verify_ms + sum.decide_ms + sum.commit_ms + sum.tail_ms) / n,
-        @as(f64, @floatFromInt(sum.misses)) / n, @as(f64, @floatFromInt(sum.bytes_read)) / n / 1e6, sum.read_busy_ms / n,
-        @as(f64, @floatFromInt(sum.k_eff)) / n, @as(f64, @floatFromInt(sum.accepted)) / n,
-        @as(f64, @floatFromInt(sum.claimed)) / n, @as(f64, @floatFromInt(sum.spec_issued)) / n, @as(f64, @floatFromInt(sum.spec_landed)) / n,
+        p.len,                                             sum.draft_ms / n,                             sum.verify_ms / n,                                                                sum.decide_ms / n,
+        sum.commit_ms / n,                                 sum.tail_ms / n,                              (sum.draft_ms + sum.verify_ms + sum.decide_ms + sum.commit_ms + sum.tail_ms) / n, @as(f64, @floatFromInt(sum.misses)) / n,
+        @as(f64, @floatFromInt(sum.bytes_read)) / n / 1e6, sum.read_busy_ms / n,                         @as(f64, @floatFromInt(sum.k_eff)) / n,                                           @as(f64, @floatFromInt(sum.accepted)) / n,
+        @as(f64, @floatFromInt(sum.claimed)) / n,          @as(f64, @floatFromInt(sum.spec_issued)) / n, @as(f64, @floatFromInt(sum.spec_landed)) / n,
     });
 }
 
@@ -3803,7 +3803,7 @@ test "dsv41 ar: the native DSpark loop takes the Python lane's cycle decisions o
     _ = mlx.mlx_set_cache_limit(&prev_cache, 0);
     defer _ = mlx.mlx_set_cache_limit(&prev_cache, prev_cache);
     memProbe("dsv41 dspark", "start");
-    const kernels = try acceptKernels(gpa, &g, &c);
+    const kernels = try acceptKernels(gpa, io, bank_dir, &g, &c);
     defer kernels.deinit(&g);
     memProbe("dsv41 dspark", "kernels accepted (the startup self-check)");
     // The served decode seam's own binding of the residents (`Dspark(A).open`).
@@ -3980,7 +3980,7 @@ test "dsv41 memory: the reverse change's bound follows the coming request: a 16K
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const terms = b.prefillTerms();
-    const scratch: u64 = b.transient_rows * (b.slot_prefill / (@as(u64, c.n_layers) * b.prefill_rows + b.transient_rows));
+    const scratch: u64 = b.transient_rows * b.transient_row_bytes;
     const tc: module.TurnCall = .{ .pb = try bill_mod.servedPrefillBill(&config, .{}, &c, b.variant), .layer_major = config.dsv41LayerMajor(), .joinless = bill_mod.joinlessRoute(.{}) };
     const settled: u64 = 88_988_658_776;
     // The server's bound then (the 1.35 GB host term of that build; the measured 2.60 GB term followed in the next fix).
@@ -4025,7 +4025,7 @@ test "dsv41 memory: a reused 16K conversation then fresh prompts: every phase ch
     var vd: v41.Diag = .{};
     const c = try v41.Config.load(a, testing.io, bank_dir, &vd);
     const terms = b.prefillTerms();
-    const scratch: u64 = b.transient_rows * (b.slot_prefill / (@as(u64, c.n_layers) * b.prefill_rows + b.transient_rows));
+    const scratch: u64 = b.transient_rows * b.transient_row_bytes;
     const tc: module.TurnCall = .{ .pb = try bill_mod.servedPrefillBill(&config, .{}, &c, b.variant), .layer_major = config.dsv41LayerMajor(), .joinless = bill_mod.joinlessRoute(.{}) };
     const forward = module.untilFreedBound(b.decodeTotal() - b.baseline, b.slot_prefill, b.slot_decode, 3_195_740_160, @intCast(c.n_layers)).bound;
     const Turn = struct { name: []const u8, coming: module.Coming, settled: u64, phase_after: ?u64 };

@@ -112,6 +112,7 @@ pub const NativeRows = struct { prefill: u32, decode: u32 };
 pub const Planned = struct {
     config: v41.Config,
     bank: expert_bank.Bank,
+    geometry: expert_stream.StorageGeometry,
     draft_subset: ?dspark_head.Subset = null,
     inputs: expert_admission.Inputs,
     /// The envelope admission (`Options.envelope_record` only).
@@ -146,17 +147,19 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     var bdiag: expert_bank.Diag = .{};
     var bank = expert_bank.Bank.open(a, io, opt.model_dir, im, &bdiag) catch |e| return refuse(diag, e, "bank: {s}", .{bdiag.message()});
     errdefer bank.deinit();
-    var record: u64 = 0;
-    for (bank.layers) |l| record = @max(record, l.logical_bytes);
+    if (bank.isCompact() and opt.envelope_record) return refuse(diag, error.CompactNeedsNativeAdmission, "admission: compact banks require native row accounting", .{});
+    const geometry = try expert_stream.StorageGeometry.initBank(&bank);
+    const record = geometry.max_source_record_bytes;
     const inputs: expert_admission.Inputs = .{
         .baseline_bytes = baseline,
         .wired_bytes = opt.wired_bytes orelse sdk.memory.vmBytes().wired,
         .record_bytes = record,
+        .io_staging_bytes = try poolStagingBytes(&bank, opt),
         .fixed_rows = opt.fixed_rows,
         .allocation = opt.allocation,
         .phase_reserve_bytes = opt.phase_reserve_bytes,
         .lookahead_staging_bytes = if (opt.lookahead) |la| expert_admission.lookaheadCharge(record, 2 * la.budget, std.heap.pageSize()) else 0,
-        .wide_window_bytes = wideWindowBytes(opt.wide_depth, record),
+        .wide_window_bytes = wideWindowBytes(opt.wide_depth, geometry.transient_row_bytes),
         .host_reserve_bytes = opt.host_reserve_bytes,
         .prefill_charge_bytes = opt.prefill_charge_bytes,
         .peak_fill = opt.peak_fill,
@@ -185,7 +188,27 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     if (prefill > decode) return refuse(diag, error.PrefillAboveDecode, "admission: prefill capacity {d} exceeds the decode rows {d}", .{ prefill, decode });
     // Preallocated: the decode rows in both phases (the prompt phase's bill holds them).
     if (opt.preallocate) prefill = decode;
-    return .{ .config = c, .bank = bank, .draft_subset = subset, .inputs = inputs, .plan = plan_, .prefill_rows = prefill, .decode_rows = decode };
+    return .{ .config = c, .bank = bank, .geometry = geometry, .draft_subset = subset, .inputs = inputs, .plan = plan_, .prefill_rows = prefill, .decode_rows = decode };
+}
+
+pub fn poolStagingBytes(bank: *const expert_bank.Bank, opt: Options) !u64 {
+    const span = if (opt.lookahead) |la|
+        if (la.preread) try expert_stream.StorageGeometry.prereadStaging(bank, std.heap.pageSize()) else 0
+    else
+        0;
+    return opt.pool.workers * @max(opt.pool.staging_bytes, span);
+}
+
+/// The measured native host reserve covers the K3 pools; larger physical pools add only their delta.
+pub fn poolGrowthBytes(bank: *const expert_bank.Bank, opt: Options, geometry: *const expert_stream.StorageGeometry, staging_bytes: u64) u64 {
+    const defaults: expert_io.Options = .{};
+    var bytes = staging_bytes -| defaults.workers * defaults.staging_bytes;
+    if (opt.lookahead) |la| {
+        const page = std.heap.pageSize();
+        const k3 = expert_bank.layerSegments(3, bank.hidden, bank.inter).?;
+        bytes += @as(u64, 2 * la.budget) * (expert_io.slotBytes(geometry.max_source_record_bytes, page) -| expert_io.slotBytes(k3.logical_bytes, page));
+    }
+    return bytes;
 }
 
 /// The transient rows past the first window (`Options.wide_depth`).
@@ -314,7 +337,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
 
         pub fn admissionRecord(self: *const Self) AdmissionRecord {
             // The Python-paired receipts' record: an arm planned with `Options.envelope_record`.
-            return AdmissionRecord.of(self.inputs, self.plan.?, self.prefill_rows[0], self.decode_rows[0], self.config.n_layers);
+            return AdmissionRecord.of(self.inputs, self.plan.?, self.prefill_rows[0], self.decode_rows[0], self.stream.geometry.persistent_row_bytes);
         }
 
         /// The phase change's first free (the Module's frees stage, before its cache clear): the hook's transient
@@ -458,7 +481,7 @@ pub const AdmissionRecord = struct {
         };
     }
 
-    pub fn of(in: expert_admission.Inputs, plan: expert_admission.Plan, prefill_rows: u32, decode_rows: u32, n_layers: u32) AdmissionRecord {
+    pub fn of(in: expert_admission.Inputs, plan: expert_admission.Plan, prefill_rows: u32, decode_rows: u32, persistent_row_bytes: u64) AdmissionRecord {
         const a = plan.admission;
         return .{
             .baseline_bytes = a.baseline_bytes,
@@ -467,7 +490,7 @@ pub const AdmissionRecord = struct {
             .prefill_slots_per_layer = a.prefill_rows,
             .stream_prefill_rows_per_layer = prefill_rows,
             .stream_decode_rows_per_layer = decode_rows,
-            .growth_payload_bytes = @as(u64, decode_rows - prefill_rows) * n_layers * in.record_bytes,
+            .growth_payload_bytes = @as(u64, decode_rows - prefill_rows) * persistent_row_bytes,
             .capacity_search_ceiling = a.search_ceiling,
             .tcq3_fixed_capacity = in.fixed_rows,
             .tcq3_matched_prefill_capacity = in.matched_prefill_rows,
@@ -495,7 +518,7 @@ pub const AdmissionRecord = struct {
             .tcq3_additional_active_reserve_bytes = in.phase_reserve_bytes + (if (in.rowsx == null) in.lookahead_staging_bytes else 0),
             .tcq3_additional_host_reserve_bytes = in.host_reserve_bytes,
             .tcq3_allocation = @tagName(in.allocation),
-            .tcq3_io_staging_bytes = if (in.io_layout == .gate_up) 36 << 20 else 32 << 20,
+            .tcq3_io_staging_bytes = expert_admission.workerStagingCharge(in),
             .tcq3_embedding_rows = in.embedding_rows,
             .tcq3_tail_rows = in.tail_rows,
             .tcq3_peak_fill = if (plan.peak_fill) |pf| .{

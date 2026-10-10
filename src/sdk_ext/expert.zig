@@ -234,7 +234,7 @@ pub fn assertBank(comptime B: type) void {
         for ([_][]const u8{ "layers", "n_experts", "sidecar" }) |f|
             if (!@hasField(B.Bank, f)) @compileError(where ++ "Bank has no " ++ f);
         if (@FieldType(B.Bank, "sidecar") != io.UncachedFd) @compileError(where ++ "Bank.sidecar is not an UncachedFd");
-        for ([_][]const u8{ "recordOffset", "spans" }) |m|
+        for ([_][]const u8{ "recordOffset", "recordGeometry", "spans" }) |m|
             if (!@hasDecl(B.Bank, m)) @compileError(where ++ "Bank has no " ++ m);
     }
 }

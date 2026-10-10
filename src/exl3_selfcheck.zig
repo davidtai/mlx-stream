@@ -95,7 +95,7 @@ pub fn implemented(k: Kernel, c: Check) bool {
         .join_equiv => k == .q3jl_combine or k == .dsv41_jl_combine_bf16,
         .twin => twinOf(k) != null or formTwinOf(k) != null or bankedTwinOf(k) != null,
         .fused => fusedOf(k) != null,
-        .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120,
+        .decode_table => k == .dsv41_exl3_mul1h_k3_2304 or k == .dsv41_exl3_mul1h_k3_5120 or isRateGemv(k),
         .golden_tiles => std.mem.startsWith(u8, @tagName(k), "q3_exl3_dig_decmat_"),
         .composition => isDigGemm(k) or fusedOf(k) != null,
         .layout_guard => k == .q3rc_mxfp8_fma or k == .q3drc_mxfp8_fma_f32x or k == .q3rc_mxfp8_fma__draft,
@@ -113,7 +113,11 @@ pub fn implemented(k: Kernel, c: Check) bool {
 }
 
 fn isDigGemm(k: Kernel) bool {
-    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .q3_prefill_dig_gemm_2304x5120_xmul1hk3 or twinOf(k) != null;
+    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .q3_prefill_dig_gemm_2304x5120_xmul1hk3 or twinOf(k) != null or (xk.rateOf(k) != 0 and !isRateGemv(k));
+}
+
+fn isRateGemv(k: Kernel) bool {
+    return xk.rateOf(k) != 0 and std.mem.startsWith(u8, @tagName(k), "dsv41_exl3_");
 }
 
 /// The fused down GEMM's GEMM text (its `fused` check's reference is that text, then rot_widen1); null otherwise.
@@ -457,6 +461,7 @@ fn putInt(buf: []u8, i: usize, dt: mlx.mlx_dtype, v: i64) void {
         .bool_ => buf[i] = @intFromBool(v != 0),
         .int32 => std.mem.writeInt(i32, buf[i * 4 ..][0..4], @intCast(v), .little),
         .uint32 => std.mem.writeInt(u32, buf[i * 4 ..][0..4], @intCast(v), .little),
+        .uint64 => std.mem.writeInt(u64, buf[i * 8 ..][0..8], @intCast(v), .little),
         .int16 => std.mem.writeInt(i16, buf[i * 2 ..][0..2], @intCast(v), .little),
         .uint8 => buf[i] = @intCast(v),
         else => unreachable,
@@ -499,6 +504,24 @@ const Wave = struct {
         return t;
     }
 
+    fn subset(w: *const Wave, first: u64, count: u64) Wave {
+        std.debug.assert(count > 0 and first <= w.total() and count <= w.total() - first);
+        var result: Wave = .{};
+        var begin: u64 = 0;
+        for (w.rows[0..w.n], w.slots[0..w.n]) |rows, slot| {
+            const end = begin + rows;
+            const lo = @max(begin, first);
+            const hi = @min(end, first + count);
+            if (lo < hi) {
+                result.slots[result.n] = slot;
+                result.rows[result.n] = @intCast(hi - lo);
+                result.n += 1;
+            }
+            begin = end;
+        }
+        return result;
+    }
+
     /// q3_prefill_dig_candidate.wave_table: slot, first row, rows, first threadgroup per expert
     /// (unused threadgroup entries INT32_MAX), then [n, threadgroups], at `bm`-row M tiles. Returns the threadgroups.
     fn table(w: *const Wave, tiles: u32, bm: u32, out: *[80]i32) u64 {
@@ -523,6 +546,40 @@ const Wave = struct {
     }
 };
 
+test "exl3 mixed selfcheck: wave subsets retain slots and rebase row and tile bounds" {
+    const t = std.testing;
+    var wave: Wave = .{ .n = 4 };
+    wave.slots[0..4].* = .{ 7, 3, 0, 9 };
+    wave.rows[0..4].* = .{ 1, 127, 128, 129 };
+    for ([_]struct { first: u64, count: u64, slot: u32 }{
+        .{ .first = 0, .count = 1, .slot = 7 },
+        .{ .first = 1, .count = 127, .slot = 3 },
+        .{ .first = 128, .count = 128, .slot = 0 },
+        .{ .first = 256, .count = 129, .slot = 9 },
+    }) |case| {
+        const part = wave.subset(case.first, case.count);
+        try t.expectEqual(@as(usize, 1), part.n);
+        try t.expectEqual(case.slot, part.slots[0]);
+        try t.expectEqual(case.count, part.total());
+        var table: [80]i32 = undefined;
+        const tgs = part.table(18, 128, &table);
+        try t.expectEqual(@as(i32, 0), table[16]);
+        try t.expectEqual(@as(i32, @intCast(case.count)), table[32]);
+        try t.expectEqual(((case.count + 127) / 128) * 18, tgs);
+    }
+    const crossing = wave.subset(127, 130);
+    try t.expectEqual(@as(usize, 3), crossing.n);
+    try t.expectEqualSlices(u32, &.{ 3, 0, 9 }, crossing.slots[0..3]);
+    try t.expectEqualSlices(u32, &.{ 1, 128, 1 }, crossing.rows[0..3]);
+    var table: [80]i32 = undefined;
+    try t.expectEqual(@as(u64, 54), crossing.table(18, 128, &table));
+    try t.expectEqualSlices(i32, &.{ 0, 1, 129 }, table[16..19]);
+    try t.expectEqualSlices(i32, &.{ 0, 18, 36 }, table[48..51]);
+    try t.expectEqual(@as(i32, std.math.maxInt(i32)), table[51]);
+    try t.expectEqual(@as(i32, 3), table[64]);
+    try t.expectEqual(@as(i32, 54), table[65]);
+}
+
 fn defaultVars(e: *const Entry) Vars {
     var v: Vars = .initFill(0);
     v.set(.rows, if (e.rows_max > 0) e.rows_max else 8);
@@ -531,6 +588,7 @@ fn defaultVars(e: *const Entry) Vars {
     v.set(.experts, 2);
     v.set(.a_rows, 16);
     v.set(.seq, v.get(.rows));
+    inline for (.{ Var.code_words, Var.code0_words, Var.code1_words, Var.code2_words }) |vcode| v.set(vcode, 64);
     // decode batch 2: the attention's key count (the tier's 640, clamped into an entry's key
     // range: 512 on the ls 32 text, 640 on ls 128) and the index top-k at a 2,048-entry history
     // (k = width = 512, not all finite)
@@ -923,6 +981,15 @@ fn rowInvariance(h: *H, k: Kernel, site: ?*const xk.Site, sets: u64) !void {
                 };
                 var v2 = vars;
                 v2.set(.rows, m);
+                const subwave = wave.subset(slot, m);
+                for (e.inputs, 0..) |*arg, i| {
+                    if (arg.domain.kind != .wave_table or arg.domain.tiles == 0) continue;
+                    var table: [80]i32 = undefined;
+                    const tgs = subwave.table(arg.domain.tiles, arg.domain.bm, &table);
+                    v2.set(.experts, subwave.n);
+                    v2.set(.tgs, tgs);
+                    ins2[i] = try genInput(h, &sc2, arg, &v2, &subwave);
+                }
                 const outs = try launch(h, &sc2, k, ins2[0..e.inputs.len], &v2, siteName(site));
                 for (e.outputs, 0..) |*o, oi| {
                     const got = try hostCopy(h, outs[oi]);
@@ -944,6 +1011,7 @@ fn goldenFor(h: *H, in_dim: u32) *const xk.GoldenPlane {
 }
 
 fn checkDecodeTable(h: *H, k: Kernel) !void {
+    if (isRateGemv(k)) return checkRateDecodeTable(h, k);
     const e = h.reg.get(k);
     const g = goldenFor(h, e.inputs[inputIndex(e, "xh")].shape[1].m);
     var hp = try xk.HostPlane.init(h.a, g, h.table);
@@ -989,6 +1057,115 @@ fn checkDecodeTable(h: *H, k: Kernel) !void {
     for (hp.states[0..n]) |s| seen.set(s);
     const covered = seen.count();
     try h.record(.{ .kernel = k, .check = .decode_table, .words = n, .bad = bad, .metric = @floatFromInt(covered), .limit = 65536, .ok = bad == 0 and covered == 65536 });
+}
+
+// Distinct payloads in unequal banks, with poison outside each logical row prefix.
+// One-hot rows isolate the decoder from reduction tolerances and expose wrong slot strides.
+fn checkRateDecodeTable(h: *H, k: Kernel) !void {
+    const e = h.reg.get(k);
+    const rate = xk.rateOf(k);
+    const banked = std.mem.indexOf(u8, @tagName(k), "_b3_") != null;
+    const banks: usize = if (banked) 3 else 1;
+    const g = goldenFor(h, e.inputs[inputIndex(e, "xh")].shape[1].m);
+    const in_dim: usize = g.in_dim;
+    const out_dim: usize = g.out_dim;
+    const tiles = (in_dim / 16) * (out_dim / 16);
+    var planes: [3]xk.HostPlane = undefined;
+    var initialized: usize = 0;
+    defer for (planes[0..initialized]) |*plane| plane.deinit(h.a);
+    for (0..banks) |b| {
+        var spec = g.*;
+        spec.k = rate;
+        spec.seed +%= @as(u64, @intCast(b)) *% 0x9e3779b97f4a7c15;
+        planes[b] = try xk.HostPlane.init(h.a, &spec, h.table);
+        initialized += 1;
+    }
+    var seen = try std.DynamicBitSet.initEmpty(h.a, 65536);
+    defer seen.deinit();
+    var words: u64 = 0;
+    var bad: u64 = 0;
+    var covered_rows: usize = 0;
+    while (covered_rows < in_dim) {
+        const at = covered_rows * out_dim;
+        for (planes[0..banks]) |plane| {
+            for (plane.states[at..][0..out_dim]) |state| seen.set(state);
+        }
+        covered_rows += 1;
+        if (seen.count() == 65536 and covered_rows >= g.onehot_rows) break;
+    }
+    seen.unsetAll();
+    const passes: usize = if (!banked and rate < 4) 2 else 1;
+    for (0..passes) |pass| {
+        var sc: Scope = .{ .a = h.a };
+        defer sc.deinit();
+        var codes: [3]mlx.mlx_array = @splat(.{});
+        var widths: [3]usize = @splat(64);
+        for (0..banks) |b| {
+            widths[b] = if (banked) @max(16 * rate, 32 + 16 * b) else if (pass == 0) 16 * rate else 64;
+            const cap = b + 2;
+            const row_words = tiles * widths[b];
+            const payload = try h.a.alloc(i16, cap * row_words);
+            defer h.a.free(payload);
+            @memset(payload, @bitCast(@as(u16, 0xa55a)));
+            @memcpy(payload[(cap - 1) * row_words ..][0..planes[b].code.len], planes[b].code);
+            codes[b] = try fromHost(&sc, std.mem.sliceAsBytes(payload), &.{ @intCast(cap), @intCast(in_dim / 16), @intCast(out_dim / 16), @intCast(widths[b]) }, .int16);
+        }
+        const total_rows = @max(covered_rows * banks, 48 * 49 / 2);
+        var start: usize = 0;
+        var next_rows: usize = 1;
+        while (start < total_rows) {
+            var batch: Scope = .{ .a = h.a };
+            defer batch.deinit();
+            const rows = @min(next_rows, total_rows - start);
+            const xh = try h.a.alloc(f32, rows * in_dim);
+            defer h.a.free(xh);
+            @memset(xh, 0);
+            var ids: [48]u32 = undefined;
+            for (0..rows) |r| {
+                const b = (start + r) % banks;
+                const input_row = ((start + r) / banks) % covered_rows;
+                xh[r * in_dim + input_row] = 1;
+                ids[r] = @intCast((b << 24) | (b + 1));
+            }
+            var vars = defaultVars(e);
+            vars.set(.rows, rows);
+            vars.set(.code_words, widths[0]);
+            vars.set(.code0_words, widths[0]);
+            vars.set(.code1_words, widths[1]);
+            vars.set(.code2_words, widths[2]);
+            var ins: [inputs_max]mlx.mlx_array = @splat(.{});
+            ins[inputIndex(e, "xh")] = try fromHost(&batch, std.mem.sliceAsBytes(xh), &.{ @intCast(rows), @intCast(in_dim) }, .float32);
+            ins[inputIndex(e, "ids")] = try fromHost(&batch, std.mem.sliceAsBytes(ids[0..rows]), &.{@intCast(rows)}, .uint32);
+            if (banked) {
+                ins[inputIndex(e, "code0")] = codes[0];
+                ins[inputIndex(e, "code1")] = codes[1];
+                ins[inputIndex(e, "code2")] = codes[2];
+            } else {
+                ins[inputIndex(e, "code")] = codes[0];
+            }
+            const wave: Wave = .{};
+            for (e.inputs, 0..) |*arg, i| {
+                if (arg.role == .static) ins[i] = try genInput(h, &batch, arg, &vars, &wave);
+            }
+            const outs = try launch(h, &batch, k, ins[0..e.inputs.len], &vars, null);
+            const got = try hostCopy(h, outs[0]);
+            defer h.a.free(got);
+            for (0..rows) |r| {
+                const b = (start + r) % banks;
+                const at = (((start + r) / banks) % covered_rows) * out_dim;
+                for (planes[b].w[at..][0..out_dim], 0..) |bits, c| {
+                    const want: u32 = @bitCast(@as(f32, @as(f16, @bitCast(bits))));
+                    bad += @intFromBool(std.mem.readInt(u32, got[(r * out_dim + c) * 4 ..][0..4], .little) != want);
+                    seen.set(planes[b].states[at + c]);
+                }
+            }
+            words += rows * out_dim;
+            start += rows;
+            next_rows = @min(48, next_rows + 1);
+        }
+    }
+    const covered = seen.count();
+    try h.record(.{ .kernel = k, .check = .decode_table, .words = words, .bad = bad, .metric = @floatFromInt(covered), .limit = 65536, .ok = bad == 0 and covered == 65536 });
 }
 
 // ── golden_tiles: the DIG-X loader's decode (B^T) == W_hat^T, every word ──
@@ -1811,7 +1988,7 @@ fn k36F64(h: *H, sc: *Scope, k: Kernel) !void {
 const dig_rows = [_]u32{ 70, 37, 20, 17 };
 
 fn isGateUp(k: Kernel) bool {
-    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut;
+    return k == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128 or k == .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut or (xk.rateOf(k) != 0 and std.mem.indexOf(u8, @tagName(k), "_gu_") != null);
 }
 
 /// One DIG GEMM launch over `wave` with the A rows `xs` (f16 [rows, 1, K], one per operand); `rout` for the fused
@@ -1827,6 +2004,10 @@ fn digLaunch(h: *H, sc: *Scope, k: Kernel, xs: []const mlx.mlx_array, codes: []c
     vars.set(.tgs, tgs);
     vars.set(.cap, 4);
     vars.set(.experts, wave.n);
+    if (xk.rateOf(k) != 0) {
+        vars.set(.code0_words, @intCast(mlx.getShape(codes[0])[3]));
+        if (codes.len > 1) vars.set(.code1_words, @intCast(mlx.getShape(codes[1])[3]));
+    }
     var ins: [inputs_max]mlx.mlx_array = @splat(.{});
     var n: usize = 0;
     for (xs) |x| {
@@ -1857,7 +2038,7 @@ const DigFull = struct {
 };
 
 fn digFull(h: *H, sc: *Scope, k: Kernel) !DigFull {
-    return digFullAt(h, sc, k, &dig_rows);
+    return digFullAt(h, sc, k, if (xk.rateOf(k) != 0) &.{ 1, 127, 128, 129 } else &dig_rows);
 }
 
 /// `digFull` over experts of `rows_of` rows (slots 0, 1, ...).
@@ -1872,6 +2053,10 @@ fn digFullAt(h: *H, sc: *Scope, k: Kernel, rows_of: []const u32) !DigFull {
     vars.set(.rows, wave.total());
     vars.set(.cap, 4);
     vars.set(.experts, wave.n);
+    if (xk.rateOf(k) != 0) {
+        vars.set(.code0_words, 64);
+        vars.set(.code1_words, @max(48, 16 * xk.ratesOf(k)[1]));
+    }
     const n_ops: usize = if (isGateUp(k)) 2 else 1;
     var f: DigFull = .{ .xs = @splat(.{}), .codes = @splat(.{}), .n_ops = n_ops, .outs = undefined, .wave = wave, .k_dim = @intCast(e.inputs[0].shape[2].m) };
     for (0..n_ops) |o| {
@@ -2008,9 +2193,6 @@ fn digF64(h: *H, k: Kernel) !void {
     const n_j: usize = code_arg.shape[2].m;
     const kd = n_i * 16;
     const nd = n_j * 16;
-    const plane_words = n_i * n_j * 48;
-    const plane = try h.a.alloc(i16, plane_words);
-    defer h.a.free(plane);
     const w = try h.a.alloc(u16, kd * nd);
     defer h.a.free(w);
     const ref = try h.a.alloc(f64, nd);
@@ -2020,16 +2202,21 @@ fn digF64(h: *H, k: Kernel) !void {
     var worst: f64 = 0;
     var words: u64 = 0;
     for (0..f.n_ops) |o| {
+        const rate = if (xk.rateOf(k) != 0) xk.ratesOf(k)[o] else 3;
+        const plane_words = n_i * n_j * 16 * rate;
+        const plane = try h.a.alloc(i16, plane_words);
+        defer h.a.free(plane);
         const x = try hostF64(h, f.xs[o]);
         defer h.a.free(x);
         const code = try hostCopy(h, f.codes[o]);
         defer h.a.free(code);
+        const row_words = mlx.mlx_array_size(f.codes[o]) / @as(usize, @intCast(mlx.getShape(f.codes[o])[0]));
         const z = try hostF64(h, f.outs[o]);
         defer h.a.free(z);
         for ([_]usize{ 0, 3 }) |j| {
             const slot: usize = f.wave.slots[j];
-            @memcpy(std.mem.sliceAsBytes(plane), code[slot * plane_words * 2 ..][0 .. plane_words * 2]);
-            xk.reconstruct(plane, n_i, n_j, 3, h.table, w, null);
+            @memcpy(std.mem.sliceAsBytes(plane), code[slot * row_words * 2 ..][0 .. plane_words * 2]);
+            xk.reconstruct(plane, n_i, n_j, rate, h.table, w, null);
             const r0 = row0Of(&f.wave, j);
             for ([_]u32{ r0, r0 + f.wave.rows[j] - 1 }) |row| {
                 @memset(ref, 0);

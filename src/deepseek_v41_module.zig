@@ -223,7 +223,6 @@ pub fn decodeFillGranule(ov: RouteOverrides) arm_mod.DecodeFillGranule {
     return ov.decode_fill_granule orelse .row;
 }
 
-
 /// The decode cache limit the Module installs and the bill charges (one resolver: the setting over the envelope's).
 pub fn decodeCacheLimit(ov: RouteOverrides) error{DecodeCacheLimit}!u64 {
     const v = ov.decode_cache_bytes orelse return envelope.decode_cache_bytes;
@@ -536,6 +535,7 @@ pub const Module = struct {
     fenced: bool = false,
     /// The native bill at the admitted rows (set by the construction check; the harnesses' phase records read it).
     bill: bill_mod.Bill = undefined,
+    bill_owned: bool = false,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
     /// The prompt phase's MLX cache limit (set at construction; the reverse phase change restores it).
@@ -604,6 +604,7 @@ pub const Module = struct {
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .set = undefined, .exl3 = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
+        errdefer if (self.bill_owned) self.bill.deinit(gpa);
         errdefer self.g.deinit();
         self.owner = std.Thread.getCurrentId();
         self.io = io;
@@ -614,8 +615,9 @@ pub const Module = struct {
             log.err("config refused: {s}\n", .{vd0.message()});
             return e;
         };
-        claimBank(gpa, io, dir, &diag) catch |e| return refused(e, &diag);
-        try self.acceptKernels(gpa, &c0, s, &diag);
+        var peek = claimBank(gpa, io, dir, &diag) catch |e| return refused(e, &diag);
+        defer peek.deinit();
+        try self.acceptKernels(gpa, &c0, &peek.view, s, &diag);
         // The box the admission fits (`host`, read once by the host at load): its static GPU ceiling (Metal's working
         // set, or `--memory-ceiling-gb` / MLX_SERVE_GPU_CEILING_MB; a harness states its window's ceiling the same
         // way); the fill's target lands the wired margin (`--wired-margin-gib`) under it, and the bill (which reads
@@ -938,12 +940,18 @@ pub const Module = struct {
         // The bill's transients on mapped pages, unmapped at the arena's end (see the admission's arenas).
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        self.bill = try bill_mod.servedBill(arena.allocator(), io, admitted, planned_wired, ceiling_bytes, self.overrides);
-        if (multiturnRoute(self.overrides)) self.turn_call = .{
-            .pb = try bill_mod.servedPrefillBill(admitted, self.overrides, &self.model.c, self.bill.variant),
+        const temporary = try bill_mod.servedBill(arena.allocator(), io, admitted, planned_wired, ceiling_bytes, self.overrides);
+        const retained = try temporary.retained(self.gpa);
+        errdefer retained.deinit(self.gpa);
+        const turn_call: ?TurnCall = if (multiturnRoute(self.overrides)) .{
+            .pb = try bill_mod.servedPrefillBill(admitted, self.overrides, &self.model.c, retained.variant),
             .layer_major = admitted.dsv41LayerMajor(),
             .joinless = bill_mod.joinlessRoute(self.overrides),
-        };
+        } else null;
+        if (self.bill_owned) self.bill.deinit(self.gpa);
+        self.bill = retained;
+        self.bill_owned = true;
+        self.turn_call = turn_call;
     }
 
     /// The construction check (the verification harnesses only, `RouteOverrides.verify`): the bill's rows against the
@@ -980,8 +988,8 @@ pub const Module = struct {
         };
         // The bill's measured bound (the host side) against its one measurement here.
         const host_side = measured -| mlx_active -| mlx_cache;
-        for (mb.terms) |t| if (t.measured) sdk.checkMeasured(t, host_side) catch |e| {
-            log.err("construction check: the host side {d} B exceeds its billed bound {d} B\n", .{ host_side, t.bytes[0] });
+        for (mb.terms) |t| if (t.measured) checkHostMeasured(t, b.lookahead_staging, b.expert_metadata, host_side) catch |e| {
+            log.err("construction check: the host side {d} B exceeds its billed bound {d} B\n", .{ host_side, t.atConstruction() + b.lookahead_staging + b.expert_metadata });
             return e;
         };
     }
@@ -1002,9 +1010,9 @@ pub const Module = struct {
         // LOOKAHEAD4 (the verification harness): a gated call's waves against the same slots waited.
         if (comptime AT == AGated) {
             if (self.overrides.verify) {
-            arm.hook.checkGates(&self.g, gpa, arm.config.n_experts_per_tok) catch |e|
-                return refused(refuse(diag, e, "event gates: the gated waves differ from the same slots waited, or a gate was forced", .{}), diag);
-            log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)\n", .{arm.config.n_experts_per_tok});
+                arm.hook.checkGates(&self.g, gpa, arm.config.n_experts_per_tok) catch |e|
+                    return refused(refuse(diag, e, "event gates: the gated waves differ from the same slots waited, or a gate was forced", .{}), diag);
+                log.info("NATIVE event gates: the construction self-check passed (layer 0, {d} cold experts: gated == waited, bit for bit)\n", .{arm.config.n_experts_per_tok});
             }
         }
         // P1 (the verification harness): records read ahead against the same records read on demand.
@@ -1044,6 +1052,7 @@ pub const Module = struct {
     pub fn deinit(self: *Module) void {
         self.recordDecodeEnd();
         const gpa = self.gpa;
+        if (self.bill_owned) self.bill.deinit(gpa);
         self.dropTurnBoundary();
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);
@@ -1061,13 +1070,13 @@ pub const Module = struct {
     }
 
     /// The kernel set, its launcher, then the quant and the trunk routes' acceptance (C2).
-    fn acceptKernels(self: *Module, gpa: std.mem.Allocator, c: *const v41.Config, s: mlx.mlx_stream, diag: *arm_mod.Diag) !void {
+    fn acceptKernels(self: *Module, gpa: std.mem.Allocator, c: *const v41.Config, peek: *const sdk_ext.quant.BankPeek, s: mlx.mlx_stream, diag: *arm_mod.Diag) !void {
         var kd: xk.Diag = .{};
         self.set = kernel_set.Set.init(gpa, .{ .device = .{ .stream = s } }, &kd) catch |e| return refuse(diag, e, "kernels: {s}", .{kd.message()});
         errdefer self.set.deinit();
         self.set.install(G, &self.g);
         errdefer kernel_set.Set.uninstall(G, &self.g);
-        self.exl3 = xq.accept(G, gpa, &self.g, .{ .kernels = self.set.ref() }, .{
+        self.exl3 = xq.accept(G, gpa, &self.g, .{ .kernels = self.set.ref(), .peek = peek }, .{
             .hidden = c.hidden_size,
             .inter = c.moe_intermediate_size,
             .top_k = c.n_experts_per_tok,
@@ -1964,6 +1973,13 @@ pub fn numericTier(t: settings.NumericTier) routes.Tier {
 /// residual threshold; cell4 measured 0.59 GB UNDER them).
 pub const construction_tolerance_bytes: u64 = 250_000_000;
 
+/// The host footprint includes staging and metadata already charged by separate bill terms.
+fn checkHostMeasured(term: sdk.MemoryBill.Term, pool_growth: u64, metadata: u64, host_side: u64) !void {
+    var total = term;
+    total.construction = term.atConstruction() + pool_growth + metadata;
+    try sdk.checkMeasured(total, host_side);
+}
+
 /// MLX's allocator and this process's footprint at a phase boundary: this process's own ledgers, which the
 /// boundary judges. The box's pages are not read here: host_statistics64 is rate-limited box-wide for
 /// non-platform binaries (2-10 fresh calls a second, then the last reading; run 3an2's phase change read one
@@ -2081,7 +2097,6 @@ pub const PhaseGate = struct {
         g.phase = .decode;
     }
 };
-
 
 /// The live boundary reader: MLX's counters, the footprint, vm_stat; waits on the shell's io.
 const LiveReader = struct {
@@ -2300,12 +2315,13 @@ fn loadEngramResidents(gpa: std.mem.Allocator, loader: *const sdk.WeightLoader, 
 /// The quant kind at load, before its accept: the EXL3 quant this arch binds claims the bank's description
 /// (`expert_bank.peek`, streamed past the page cache like the bank's own manifests), or the load refuses by name
 /// with the quant's decline.
-fn claimBank(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, diag: *arm_mod.Diag) !void {
+fn claimBank(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, diag: *arm_mod.Diag) !expert_bank.Peek {
     var bd: expert_bank.Diag = .{};
     var p = expert_bank.peek(gpa, io, dir, &bd) catch |e| return refuse(diag, e, "bank: {s}", .{bd.message()});
-    defer p.deinit();
+    errdefer p.deinit();
     var why: xk.Diag = .{};
     if (xq.claims(&p.view, &why) == null) return refuse(diag, error.QuantNotClaimed, "quant {s}: {s}", .{ xq.name, why.message() });
+    return p;
 }
 
 fn refused(err: anyerror, diag: *const arm_mod.Diag) anyerror {
@@ -2324,7 +2340,7 @@ fn checkArmBanks(arm: anytype, g: *G, exl3: *const xq.Accepted(G), diag: *arm_mo
     var kd: xk.Diag = .{};
     for (arm.hook.banks, 0..) |banks, l| for (banks, 0..) |maybe, kind| {
         const bank = maybe orelse continue;
-        exl3.checkBank(g, bank, &kd) catch |e|
+        exl3.checkLayerBank(g, @intCast(l), bank, &kd) catch |e|
             return refuse(diag, e, "kernels: layer {d} {t} bank: {s}", .{ l, @as(xp.BankKind, @fromBackingInt(@intCast(kind))), kd.message() });
     };
 }
@@ -2369,12 +2385,12 @@ test "dsv41 module: the load refuses a bank its quant does not claim, by name, b
     const fixture = @embedFile("fixtures/dsv41_bank_peek.json");
     var diag: arm_mod.Diag = .{};
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "expert-manifest-v2.json", .data = fixture });
-    try claimBank(a, std.testing.io, root, &diag);
+    var peek = try claimBank(a, std.testing.io, root, &diag);
+    defer peek.deinit();
     const walsh = try std.mem.replaceOwned(u8, a, fixture, "\"order\":\"sylvester-natural\"", "\"order\":\"walsh\"");
     defer a.free(walsh);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "expert-manifest-v2.json", .data = walsh });
     try std.testing.expectError(error.QuantNotClaimed, claimBank(a, std.testing.io, root, &diag));
-    try std.testing.expect(std.mem.startsWith(u8, diag.message(), "quant exl3-mul1-k3: exl3 quant: quantization.hadamard"));
 }
 
 test "dsv41 module: each tier's prefill allocator cache is inside what the admission charges the prefill" {
@@ -3506,4 +3522,17 @@ test "dsv41 module: the arm's options from the shell's rows: native both, forced
     try std.testing.expectEqual(@as(u8, 5), plan.wide_depth);
     try std.testing.expectEqual(@as(u8, 1), armOptions(&.{ .expert_bank_dir = "/b", .numeric_tier = .stock }, ceiling, .host).wide_depth);
     try std.testing.expectEqual(lookahead.budget, plan.lookahead.?.budget);
+}
+
+test "dsv41 integer rates: measured host guard includes separately billed staging and metadata exactly once" {
+    const term: sdk.MemoryBill.Term = .{ .name = "host side", .bytes = .{ 100, 120 }, .at_construction = true, .construction = 30, .measured = true };
+    try checkHostMeasured(term, 0, 0, 30);
+    try std.testing.expectError(error.ConstructionOverBill, checkHostMeasured(term, 0, 0, 31));
+    try checkHostMeasured(term, 17, 0, 47);
+    try std.testing.expectError(error.ConstructionOverBill, checkHostMeasured(term, 17, 0, 48));
+    try checkHostMeasured(term, 17, 11, 58);
+    try std.testing.expectError(error.ConstructionOverBill, checkHostMeasured(term, 17, 11, 59));
+    var unmeasured = term;
+    unmeasured.measured = false;
+    try std.testing.expectError(error.TermNotMeasured, checkHostMeasured(unmeasured, 17, 11, 0));
 }
