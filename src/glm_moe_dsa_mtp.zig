@@ -790,7 +790,7 @@ pub fn Lane(comptime kind: BankKind) type {
             const lw = &self.head.layer;
             const a_in = try graph.rmsNorm(g, x, lw.input_norm, c.rms_norm_eps);
             const q = try graph.queryOf(g, c, lw, a_in, pos, 1);
-            var carry = try graph.Carry.init(a, c, 1, pos + 1);
+            var carry = try graph.Carry.init(a, c, 1, pos + 1, false);
             defer carry.deinit(g);
             try graph.select(g, c, lw.indexer.?, a_in, q.iq.?, try self.cache.indexView(g, 0), pos, 1, &carry);
             return if (carry.topk[0]) |t| g.keep(t) else null;

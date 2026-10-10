@@ -59,6 +59,8 @@ pub const Inputs = struct {
     max_positions: u64,
     /// The draft lane when the model sets `mtp_depth` (null: off, no term).
     mtp: ?Mtp = null,
+    /// The prompt's attention on the DSA kernels (`glm_moe_dsa_graph.Routes.dsa`), else in the reference's form.
+    dsa: bool,
 };
 
 /// Each phase's terms, decimal bytes, `[prompt, decode]`.
@@ -84,28 +86,31 @@ pub const Terms = struct {
 };
 
 /// The prompt pass's widest wave at `tokens` prompt rows over `keys` keys (each term an upper bound of what one
-/// layer's evaluation holds; `glm_moe_dsa_graph` runs this shape): the residual stream's copies, the attention's
-/// projections per row, the latent keys and values expanded per head, the query blocks' score arrays, and the routed
-/// call of at most `moe_chunk_tokens` tokens (the router's fp32 rows, the routed outputs and their join, one group
-/// slice, one combine slice, the shared expert or dense MLP).
-pub fn promptWaveBytes(c: *const glm.Config, tokens: u64, keys: u64) u64 {
+/// layer's evaluation holds; `glm_moe_dsa_graph` runs this shape). One call's rows (`glm.maxPromptCallRows`): the
+/// residual stream's copies, the attention's projections per row, the selection's ids, the router's fp32 rows, the
+/// routed outputs and their join, one group slice, one combine slice, the shared expert or dense MLP. The attention's
+/// own arrays: one span (`glm.promptSpanRows`) on the DSA kernels (`dsa`), else the latent keys and values expanded per
+/// head and the query blocks' score arrays.
+pub fn promptWaveBytes(c: *const glm.Config, tokens: u64, keys: u64, dsa: bool) u64 {
     const h: u64 = c.hidden_size;
     const heads: u64 = c.n_heads;
-    const t = tokens;
-    const tm: u64 = @min(t, glm.moe_chunk_tokens);
+    const t = glm.maxPromptCallRows(tokens);
     const k: u64 = glm.routed_top_k;
     const stream = 6 * t * h * 2;
     const per_row = heads * c.qHeadDim() * 2 * 2 + @as(u64, c.q_lora_rank) * 2 * 2 + @as(u64, c.kv_lora_rank + c.qk_rope_head_dim) * 2 * 2 +
         heads * c.v_head_dim * 2 * 2 + @as(u64, c.index_n_heads) * c.index_head_dim * 2 * 2 + h * 2;
-    const expand = heads * keys * (c.qk_nope_head_dim + c.v_head_dim) * 2;
-    const blocks = 8 * glm.score_budget_bytes;
-    const router = tm * h * 4 + tm * c.n_routed_experts * 4 * 3;
-    const routed = 2 * tm * k * h * 2;
+    const ids = t * @as(u64, c.index_topk) * 4 * 2;
+    const attn = if (dsa)
+        glm.promptSpanRows(c, t, keys) * glm.promptSpanRowBytes(c, keys)
+    else
+        heads * keys * (c.qk_nope_head_dim + c.v_head_dim) * 2 + 8 * glm.score_budget_bytes;
+    const router = t * h * 4 + t * c.n_routed_experts * 4 * 3;
+    const routed = 2 * t * k * h * 2;
     const group = glm.group_slice_rows * (h * 2 * 2 + @as(u64, c.moe_intermediate_size) * 2 * 3);
     const combine = glm.combine_slice_tokens * k * h * (2 + 4);
     const mlp_inter = @max(@as(u64, c.intermediate_size), @as(u64, c.moe_intermediate_size) * c.n_shared_experts);
     const mlp = t * (mlp_inter * 2 * 3 + h * 2);
-    return stream + t * per_row + expand + blocks + router + routed + group + combine + mlp;
+    return stream + t * per_row + ids + attn + router + routed + group + combine + mlp;
 }
 
 /// One decode step's widest layer over `keys` keys: the fixed part, the indexer's fp32 scores over every key (its
@@ -147,7 +152,7 @@ pub fn termsOf(in: Inputs) Terms {
         .transient_slots = .{ @as(u64, s.wide_depth) * s.max_route_ids * g.widest_record, @as(u64, s.max_route_ids) * g.widest_record },
         .pool_staging = .{ pool, pool },
         .residents = .{ in.resident_bytes, in.resident_bytes },
-        .waves = .{ promptWaveBytes(c, in.prompt_tokens, in.prompt_tokens), decodeWaveBytes(c, in.max_positions) },
+        .waves = .{ promptWaveBytes(c, in.prompt_tokens, in.prompt_tokens, in.dsa), decodeWaveBytes(c, in.max_positions) },
         .kv = .{ kv, kv },
         .mlx_cache = .{ prefill_cache_bytes, decode_cache_bytes },
         .host_side = .{ host_side_bytes, host_side_bytes },
@@ -206,8 +211,9 @@ pub fn streamShape(cfg: *const settings.Config) StreamShape {
 }
 
 /// The bill of `cfg`'s pack for prompts up to `prompt_tokens`: the residents from the shard headers (checked against
-/// the spec), the bank's geometry from its manifest, and with `mtp_depth` set the draft lane's (the served EXL3 bank's
-/// MTP directory). Pure host.
+/// the spec), the bank's geometry from its manifest, the prompt's attention on the DSA kernels where the dims fit them
+/// (a device without the tensor units runs the reference's form, which the module's own bill charges), and with
+/// `mtp_depth` set the draft lane's (the served EXL3 bank's MTP directory). Pure host.
 pub fn billOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, prompt_tokens: u64, diag: ?*glm.Diag) !sdk.MemoryBill {
     return billOfKind(a, io, cfg, prompt_tokens, .exl3, diag);
 }
@@ -217,7 +223,7 @@ pub fn billOfKind(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config,
     const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
     const geo = if (exl3_bank.present(dir)) try exl3_bank.Bank.geometry(a, io, dir, model, diag) else try bank_mod.Bank.geometry(a, io, dir, model, diag);
     const residents = try glm.residentBytes(a, io, dir, model, diag);
-    return memoryBill(a, termsOf(.{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .max_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag) }));
+    return memoryBill(a, termsOf(.{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .max_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag), .dsa = glm.dsaKernelsFit(model) }));
 }
 
 /// The draft lane's bill inputs when `cfg` turns it on (its settings and the pack's MTP directory checked), else null.
@@ -253,7 +259,7 @@ test "glm bill: GLM-5.3's terms at 16K: 1.59 GB a row, the KV at 95.2 KB a posit
     const seg = bank_mod.layerSegments(4, 6144, 2048).?;
     const geo: bank_mod.Geometry = .{ .n_layers = 75, .n_experts = 256, .widest_record = bank_mod.logicalBytes(&seg), .widest_span = seg[bank_mod.gu_components].offset };
     const cfg: settings.Config = .{};
-    const t = termsOf(.{ .model = &c, .bank = geo, .resident_bytes = 20_100_000_000, .prompt_tokens = 16384, .max_positions = maxPositions(&cfg) });
+    const t = termsOf(.{ .model = &c, .bank = geo, .resident_bytes = 20_100_000_000, .prompt_tokens = 16384, .max_positions = maxPositions(&cfg), .dsa = true });
     try testing.expectEqual(@as(u64, 75 * 21_233_664), t.per_row);
     try testing.expectEqual(@as(u64, 95_232 * (16384 + 8192)), t.kv[1]);
     try testing.expectEqual(@as(u64, 96 * 21_233_664), t.transient_slots[0]);
@@ -277,7 +283,7 @@ test "glm bill: the MTP lane adds its residents and experts (4.76 GB at GLM-5.3)
     const seg = bank_mod.layerSegments(4, 6144, 2048).?;
     const geo: bank_mod.Geometry = .{ .n_layers = 75, .n_experts = 256, .widest_record = bank_mod.logicalBytes(&seg), .widest_span = seg[bank_mod.gu_components].offset };
     const cfg: settings.Config = .{};
-    const in: Inputs = .{ .model = &c, .bank = geo, .resident_bytes = 20_100_000_000, .prompt_tokens = 16384, .max_positions = maxPositions(&cfg) };
+    const in: Inputs = .{ .model = &c, .bank = geo, .resident_bytes = 20_100_000_000, .prompt_tokens = 16384, .max_positions = maxPositions(&cfg), .dsa = true };
     const off = termsOf(in);
     try testing.expect(off.mtp == null);
     // The box's MTP directory: 578,488,832 B of residents, 592 K3 + 432 K4 mini records of 3,578,880 / 4,758,528 B.
@@ -303,18 +309,21 @@ test "glm bill: the MTP lane adds its residents and experts (4.76 GB at GLM-5.3)
     try testing.expect(termsOf(with).mtp.?.waves[1] > m.waves[1]);
 }
 
-test "glm bill: the prompt wave grows with the context; the routed call stops growing at its chunk" {
+test "glm bill: on the DSA kernels the prompt wave stops growing past one call; the reference's form grows with the keys" {
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     var prev: u64 = 0;
-    for ([_]u64{ 1024, 4096, 16384, 32768, 131072 }) |n| {
-        const w = promptWaveBytes(&c, n, n);
+    for ([_]u64{ 1024, 4096, 16384 }) |n| {
+        const w = promptWaveBytes(&c, n, n, true);
         try testing.expect(w > prev);
         prev = w;
     }
-    // Past the chunk the routed call's terms stop growing: doubling the prompt adds less than it did below the chunk.
-    const d_below = promptWaveBytes(&c, 16384, 16384) - promptWaveBytes(&c, 8192, 8192);
-    const d_past = promptWaveBytes(&c, 32768, 32768) - promptWaveBytes(&c, 16384, 16384);
-    try testing.expect(d_past < 2 * d_below);
+    // Past one call (`glm.maxPromptCallRows`) only the attention's span changes, and it stays under its target.
+    const call = promptWaveBytes(&c, 32768, 32768, true);
+    for ([_]u64{ 65536, 262144, 1048576 }) |n| {
+        const w = promptWaveBytes(&c, n, n, true);
+        try testing.expect(w <= call + glm.span_target_bytes and w + glm.span_target_bytes >= call);
+    }
+    try testing.expect(promptWaveBytes(&c, 1048576, 1048576, false) > promptWaveBytes(&c, 32768, 32768, false) + 30_000_000_000);
     try testing.expect(decodeWaveBytes(&c, 131072) > decodeWaveBytes(&c, 16384));
 }

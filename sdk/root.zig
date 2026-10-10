@@ -19,6 +19,8 @@ pub const plugin_profile = false;
 
 pub const mlx = @import("mlx_host").mlx;
 pub const log = @import("mlx_host").log;
+/// The host's DeepSeek sparse attention kernels (the indexer's scores, the latent attention over selected rows).
+pub const dsa = @import("mlx_host").dsa_nax;
 pub const io_util = @import("io_util.zig");
 
 const plugin = @import("plugin.zig");
