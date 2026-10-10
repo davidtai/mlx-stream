@@ -44,6 +44,10 @@ const MxBank = struct {
             return (@as(u64, layer) * self.n_experts + expert) * self.record_bytes;
         }
 
+        pub fn recordGeometry(self: *const Bank, layer: u32, _: u32) *const Layer {
+            return &self.layers[layer];
+        }
+
         pub fn spans(self: *const Bank, layer: u32, expert: u32) Spans {
             const off = self.recordOffset(layer, expert);
             return .{ .gu_offset = off, .down_offset = off + self.layers[layer].segments[gu_components].offset };

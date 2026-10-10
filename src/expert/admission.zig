@@ -127,8 +127,10 @@ pub const Inputs = struct {
     /// Non-file baseline and wired bytes at construction.
     baseline_bytes: u64,
     wired_bytes: u64,
-    /// One expert record = one slot (EXL3 3.0: 13,315,584).
+    /// Largest source record: the historical envelope remains a conservative mixed-layer bound.
     record_bytes: u64,
+    /// Actual worker staging, when supplied by a bank; null uses the historical envelope's pool.
+    io_staging_bytes: ?u64 = null,
     /// Forced decode rows (84..the ceiling's rows), or null for the largest that fits.
     fixed_rows: ?u32 = null,
     /// The largest decode rows searched (null: the ceiling's rows); an oracle launch searches up to its rows.
@@ -330,13 +332,17 @@ pub fn lookaheadCharge(record_bytes: u64, slots: u64, page: u64) u64 {
     return slots * (std.mem.alignForward(u64, record_bytes, page) + 2 * page) + mib;
 }
 
+pub fn workerStagingCharge(in: Inputs) u64 {
+    return @max(in.io_staging_bytes orelse 0, if (in.io_layout == .gate_up) @as(u64, 36 * mib) else 32 * mib);
+}
+
 /// One admission at `credit` bytes off every post-prefill phase, `fixed` rows
 /// forced; `filled`: the peak fill's run, whose credited phases must stay positive.
 fn retarget(env: Envelope, in: Inputs, credit: u64, fixed: ?u32, filled: bool) Error!Admission {
     const base: i64 = @intCast(in.baseline_bytes);
     const wired: i64 = @intCast(in.wired_bytes);
     const record: i64 = @intCast(in.record_bytes);
-    const io_staging: u64 = if (in.io_layout == .gate_up) 36 * mib else 32 * mib;
+    const io_staging = workerStagingCharge(in);
     const io_host = io_staging + mib;
     // native_retirement_memory.credits (scheduled projections).
     if (in.tail_rows) |t| if (t != tail_rows_proved) return error.TailRowsNotProved;
@@ -1134,7 +1140,7 @@ test "dsv41 admission: every pass-2 admission, synthetic cell and refusal equals
     try testing.expectEqualDeep(Envelope.dsv41_pass2, env);
     var counts: [5][3]u32 = @splat(@splat(0));
     for ([_][]const FixCell{ f.receipts, f.synthetic, f.refusals, f.canned, f.variants }, 0..) |cells, k| {
-        for (cells) |c| counts[k][@intFromEnum(try checkCell(env, c))] += 1;
+        for (cells) |c| counts[k][@backingInt(try checkCell(env, c))] += 1;
     }
     try testing.expect(f.receipts.len >= 10 and counts[0][0] == f.receipts.len);
     try testing.expect(counts[2][0] == 0 and counts[3][0] == f.canned.len and counts[4][0] >= 3);

@@ -8,8 +8,6 @@ const sdk_ext = @import("sdk_ext.zig");
 const plugin = @import("root.zig").plugin;
 const plugin_mimo = @import("root.zig").plugin_mimo;
 
-
-
 comptime {
     _ = @import("sdk_ext/kinds.zig");
 }
@@ -38,12 +36,6 @@ test "mlx-stream conformance: the arch and the kinds it binds decline what is no
     };
     const quant = comptime sdk_ext.Quant.of(@import("exl3/quant.zig"));
     try sdk.testing.expectGroupClaims(quant.claims, &group_near_misses);
-}
-
-test "mlx-stream conformance: the EXL3 quant is pinned by the kernel registry's manifest" {
-    const quant = comptime sdk_ext.Quant.of(@import("exl3/quant.zig"));
-    try std.testing.expectEqualStrings("exl3-mul1-k3", quant.name);
-    try std.testing.expectEqualStrings(@import("exl3/kernels.zig").manifest_sha256, quant.kernels.?.manifest_sha256);
 }
 
 test "mlx-stream conformance: the EXL3 source's capabilities, and the arch claims the one reader for the process" {

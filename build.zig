@@ -5,7 +5,21 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const host = b.option([]const u8, "mlx-serve", "Path to an mlx-serve checkout (default: ../mlx-serve)") orelse "../mlx-serve";
     const filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
+    const optimize = b.option(std.builtin.Optimize, "optimize", "Optimization mode for tests") orelse .fast;
     const here = b.root.root_dir.path orelse ".";
+
+    const bill_tests = b.addTest(.{
+        .name = "memory-bill-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("sdk/memory_bill.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = if (filter) |f| &.{f} else &.{},
+    });
+    const run_bill_tests = b.addRunArtifact(bill_tests);
+    b.step("memory-bill-test", "Run pure SDK memory admission tests").dependOn(&run_bill_tests.step);
 
     const Spec = struct { name: []const u8, desc: []const u8, args: []const []const u8 };
     const steps = [_]Spec{
@@ -17,10 +31,14 @@ pub fn build(b: *std.Build) void {
         const run = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
         run.setCwd(.{ .cwd_relative = host });
         run.addArgs(s.args);
+        if (!std.mem.eql(u8, s.name, "serve"))
+            run.addArg(b.fmt("-Doptimize={s}", .{@tagName(optimize)}));
         run.addArg(b.fmt("-Dmlx-stream-dir={s}", .{here}));
         if (filter) |f| run.addArg(b.fmt("-Dtest-filter={s}", .{f}));
         run.has_side_effects = true;
-        b.step(s.name, s.desc).dependOn(&run.step);
+        const step = b.step(s.name, s.desc);
+        step.dependOn(&run.step);
+        if (std.mem.eql(u8, s.name, "test")) step.dependOn(&run_bill_tests.step);
     }
 
     // The compile-time refusals of the contracts in src/sdk_ext.zig: each case compiles src/refusals.zig with one bad
