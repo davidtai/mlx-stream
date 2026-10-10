@@ -158,12 +158,14 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
 
         /// One routed-layer call: x [n, hidden], indices [n, k] int32, scores [n, k] f32 -> the weighted sum [n, hidden]
         /// in x's dtype. `next_scores` [n, n_experts] f32: the next routed layer's routing scores on this call's rows (the
-        /// decode lookahead's predictor), evaluated with the ids at the routing barrier; null for none.
-        pub fn call(self: *Self, g: *G, layer: u32, x: T, indices: T, scores: T, next_scores: ?T) !T {
+        /// decode lookahead's predictor), evaluated with the ids at the routing barrier; null for none. `hoist`: arrays
+        /// that do not wait on this call (the shared expert), committed behind the hit wave once the reads are issued, so
+        /// the GPU runs them during the read wait (the decode lane; the wide lane leaves them to the caller).
+        pub fn call(self: *Self, g: *G, layer: u32, x: T, indices: T, scores: T, next_scores: ?T, hoist: []const T) !T {
             const n: u32 = @intCast(g.shapeOf(x).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
             if (n * k > self.stream.max_route_ids) return self.callWide(g, layer, x, indices, scores, n, k);
-            const y = try self.callDecode(g, layer, x, indices, next_scores, n, k);
+            const y = try self.callDecode(g, layer, x, indices, next_scores, n, k, hoist);
             return combine(g, y, scores, g.dtypeOf(x));
         }
 
@@ -286,7 +288,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         }
 
         /// The decode lane: the routed outputs `[n, k, hidden]` in routed order.
-        fn callDecode(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32) !T {
+        fn callDecode(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
             const n_ids = n * k;
             var id_buf: [max_route_ids]u16 = undefined;
             var score_buf: [sdk_ext.expert.lookahead.max_rows * 512]f32 = undefined;
@@ -310,7 +312,19 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const sv: sdk_ext.expert.Served = .{ .refs = refs[0..n_ids], .waves = waves[0..n_ids], .n_parts = r.n_parts };
             var acc: Acc = .{};
             const hits = try self.gateUpWave(g, layer, x, k, sv, 0, null);
-            if (hits.n > 0) try g.asyncEval(try self.downWave(g, layer, &hits, &acc, null));
+            // The hit wave and the hoisted arrays in one commit, ahead of every wait on a read.
+            var early: [n_banks + 4]T = undefined;
+            var n_early: usize = 0;
+            if (hits.n > 0) for (try self.downWave(g, layer, &hits, &acc, null)) |o| {
+                early[n_early] = o;
+                n_early += 1;
+            };
+            for (hoist) |h| {
+                if (n_early == early.len) break;
+                early[n_early] = h;
+                n_early += 1;
+            }
+            if (n_early > 0) try g.asyncEval(early[0..n_early]);
             if (self.opt.gated) {
                 if (try self.stream.gate(r)) |gates| try self.gatedParts(g, layer, x, k, sv, gates, &acc);
             } else for (0..sv.n_parts) |p| {

@@ -562,8 +562,10 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         const f = if (lw.dense) |d| try mlp(g, d, x2) else blk: {
             const r = try route(g, c, lw.router.?, x2);
             const next: ?T = if (rt.lookahead and !prompt and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2) else null;
-            const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next);
-            break :blk try g.add(routed, try mlp(g, lw.shared.?, x2));
+            // A decode-lane call takes the shared expert built first and runs it during its read wait; the sum is the same.
+            const shared: ?T = if (!wide) try mlp(g, lw.shared.?, x2) else null;
+            const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, if (shared) |sh| &[_]T{sh} else &.{});
+            break :blk try g.add(routed, shared orelse try mlp(g, lw.shared.?, x2));
         };
         const next_h = g.keep(try g.add(h1, f));
         if (prompt) {
