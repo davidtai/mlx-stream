@@ -290,6 +290,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             try self.reverse();
             self.stream.resetPromptCounts();
             const s0 = self.stream.stats();
+            const q0: ?[2]u64 = if (comptime @hasDecl(Math, "prefillStats")) self.math.prefillStats() else null;
             const t0 = self.nowNs();
             var logits: ?mlx.mlx_array = null;
             errdefer if (logits) |x| self.g.release(x);
@@ -315,7 +316,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }
             try self.g.evalAll(&.{logits.?});
             try self.ex.flush();
-            log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()) }});
+            const gemm: ?[2]u64 = if (q0) |a| blk: {
+                const b = self.math.prefillStats();
+                break :blk .{ b[0] - a[0], b[1] - a[1] };
+            } else null;
+            log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .gemm = gemm }});
             return logits.?;
         }
 
@@ -610,11 +615,14 @@ pub const PromptLine = struct {
     tokens: u64,
     wall_ns: u64,
     r: Reads,
+    /// The EXL3 quant's prefill GEMM calls and its waits on the GPU in the pass (null for a quant without them).
+    gemm: ?[2]u64 = null,
 
     pub fn format(p: PromptLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("glm_moe_dsa: prompt {d} tokens in {d:.2} s ({d:.1} tok/s): {d:.2} GB from the SSD, {d} records on demand, {d} read ahead ({d} routed), host wait {d:.2} s", .{
             p.tokens, seconds(p.wall_ns), perSecond(p.tokens, p.wall_ns), gigabytes(p.r.ssd_bytes), p.r.demand_records, p.r.ahead_records, p.r.ahead_hits, seconds(p.r.wait_ns),
         });
+        if (p.gemm) |q| try w.print(", {d} prefill GEMM calls, {d} GPU drains", .{ q[0], q[1] });
     }
 };
 
@@ -671,6 +679,9 @@ test "glm stats lines: the prompt and decode lines and the per-layer hit spread,
     const p = try std.fmt.allocPrint(a, "{f}", .{PromptLine{ .tokens = 1008, .wall_ns = 31_500_000_000, .r = r }});
     defer a.free(p);
     try testing.expectEqualStrings("glm_moe_dsa: prompt 1008 tokens in 31.50 s (32.0 tok/s): 9.00 GB from the SSD, 380 records on demand, 50 read ahead (40 routed), host wait 1.50 s", p);
+    const pg = try std.fmt.allocPrint(a, "{f}", .{PromptLine{ .tokens = 1008, .wall_ns = 31_500_000_000, .r = r, .gemm = .{ 40, 0 } }});
+    defer a.free(pg);
+    try testing.expect(std.mem.endsWith(u8, pg, "host wait 1.50 s, 40 prefill GEMM calls, 0 GPU drains"));
     const d = try std.fmt.allocPrint(a, "{f}", .{DecodeLine{ .steps = 40, .tokens = 128, .wall_ns = 25_000_000_000, .r = r, .hit_rate = hitSpread(&c0, &c1, &rates), .rows = 136 }});
     defer a.free(d);
     const hl = try std.fmt.allocPrint(a, "{f}", .{HostLine{ .h = .{ .calls = 300, .barrier_ns = 9_000_000_000, .route_ns = 1_500_000_000, .wave_ns = 2_250_000_000 }, .wall_ns = 25_000_000_000 }});
@@ -821,7 +832,12 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
         try testing.expectEqual(@as(u32, 5), d);
     }
     const prompt = [_]u32{ 3, 17, 9, 101, 44, 250, 7, 63, 12, 5, 99, 31 };
+    const q0 = m.math.prefillStats();
     const logits = try m.prefillAt(0, &prompt);
+    // The prompt's slices past sushi's decode rows ran the prefill GEMM over host slots: no wait on the GPU.
+    const q1 = m.math.prefillStats();
+    try testing.expect(q1[0] > q0[0]);
+    try testing.expectEqual(q0[1], q1[1]);
     var t = try m.g.hostArgmax(logits);
     _ = mlx.mlx_array_free(logits);
     try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
