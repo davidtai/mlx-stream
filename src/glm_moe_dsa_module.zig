@@ -92,9 +92,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         max_context: u64,
         /// The most positions decode's KV lanes take: the billed context, `max_output` and a round's verify.
         max_positions: u64,
+        /// Each stream layer's rows (`bill.rowsAt`) at the prompt's units and at the units the handover grows to (the
+        /// construction's fill until the first handover, then its request's).
         prompt_rows: []u32,
-        /// The rows the handover grows to: the construction's fill until the first handover, then its request's.
         decode_rows: []u32,
+        prompt_units: u32,
+        decode_units: u32,
         /// The harness forced the rows (`expert_rows`): the handover grows to them, no live fill.
         forced_rows: bool,
         decoding: bool = false,
@@ -144,21 +147,22 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const mb = try bill_mod.memoryBill(gpa, bill_mod.termsOf(inputs));
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
-            const rows: sdk.Rows = if (cfg.expert_rows) |forced| .{ .prompt = @min(cfg.expert_prefill_rows orelse forced, forced), .decode = forced } else sdk.fill(mb, baseline, targets.hard, model.n_routed_experts, bill_mod.min_fill_rows) catch |e| {
+            const max_units = bill_mod.maxUnits(inputs.bank);
+            const rows: sdk.Rows = if (cfg.expert_rows) |forced| .{ .prompt = @min(cfg.expert_prefill_rows orelse forced, forced), .decode = forced } else sdk.fill(mb, baseline, targets.hard, max_units, bill_mod.min_fill_rows) catch |e| {
                 log.err("glm_moe_dsa: admission refused: {s} (baseline {d} B, target {d} B, {d} B a row)\n", .{ @errorName(e), baseline, targets.hard, mb.per_row });
                 return e;
             };
-            if (rows.prompt > rows.decode or rows.decode > model.n_routed_experts) return error.InvalidRows;
+            if (rows.prompt > rows.decode or rows.decode > max_units) return error.InvalidRows;
             sdk.admit(mb, baseline, rows, targets.hard) catch |e| {
                 log.err("glm_moe_dsa: admission refused before construction: {s} (prompt {d} B, decode {d} B, target {d} B)\n", .{ @errorName(e), mb.total(.prompt, baseline, rows.prompt), mb.total(.decode, baseline, rows.decode), targets.hard });
                 return e;
             };
-            log.info("glm_moe_dsa: admission {d} prompt / {d} decode rows per routed layer ({d}-token context, {d} generated, baseline {d} B, target {d} B, the grow's {d} B)\n", .{ rows.prompt, rows.decode, max_context, cfg.maxOutput(), baseline, targets.hard, targets.grow });
+            log.info("glm_moe_dsa: admission {d} prompt / {d} decode units of {d} B ({d}-token context, {d} generated, baseline {d} B, target {d} B, the grow's {d} B)\n", .{ rows.prompt, rows.decode, mb.per_row, max_context, cfg.maxOutput(), baseline, targets.hard, targets.grow });
             log.info("{f}\n", .{bill_mod.BillLine{ .mb = &mb, .rows = rows, .baseline = baseline, .targets = targets, .context = max_context, .decode_positions = inputs.decode_positions }});
 
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .targets = targets, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
+            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .targets = targets, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
             errdefer self.g.deinit();
             // The module owns its config's copy (the host's config keeps the parsed model's storage).
             self.model = if (self.cfg.model) |*m| m else unreachable;
@@ -170,13 +174,13 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (Q.claims(&peek, &diag) == null) return error.QuantNotClaimed;
             self.math = try Q.accept(G, gpa, &self.g, .{ .peek = &peek }, .{ .hidden = model.hidden_size, .inter = model.moe_intermediate_size, .top_k = model.n_experts_per_tok, .n_layers = model.nSparse(), .act = .swiglu, .input = .bfloat16 }, &diag);
             errdefer self.math.deinit(&self.g);
-            const n_bank: usize = self.bank.layers.len;
+            const n_bank: usize = self.inputs.bank.layers.len;
             self.prompt_rows = try gpa.alloc(u32, n_bank);
             errdefer gpa.free(self.prompt_rows);
             self.decode_rows = try gpa.alloc(u32, n_bank);
             errdefer gpa.free(self.decode_rows);
-            @memset(self.prompt_rows, rows.prompt);
-            @memset(self.decode_rows, rows.decode);
+            _ = bill_mod.rowsAt(self.inputs.bank, rows.prompt, self.prompt_rows);
+            _ = bill_mod.rowsAt(self.inputs.bank, rows.decode, self.decode_rows);
             self.layer_counts0 = try gpa.alloc(LayerCounts, n_bank);
             errdefer gpa.free(self.layer_counts0);
             self.layer_counts1 = try gpa.alloc(LayerCounts, n_bank);
@@ -191,10 +195,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.stream = try Stream.init(gpa, &self.bank, .{
                 .rows = self.prompt_rows,
                 .max_route_ids = shape.max_route_ids,
-                .transient_rows = @as(u32, shape.wide_depth) * shape.max_route_ids,
+                .transient_rows = @as(u32, shape.wide_depth) * shape.max_route_ids * self.inputs.bank.rows_per_id,
                 .wide_depth = shape.wide_depth,
                 .transient_release = true,
-                .decode_window_rows = shape.decode_window_rows,
+                .decode_window_rows = shape.decode_window_rows * self.inputs.bank.rows_per_id,
                 .slot_memory = .{ .mlx = s },
                 .staging_from_bank = true,
                 .pool = .{ .workers = shape.workers, .tickets = 1024, .direct = true },
@@ -391,21 +395,23 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const kv1 = self.kvAllocated();
             const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + transient + kv0), bill_mod.host_side_bytes);
             const box = Box.now(st.after);
-            var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_rows[0], .rows = self.decode_rows[0], .target = self.targets.grow, .baseline = self.baseline, .box = box };
+            var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_units, .rows = self.decode_units, .target = self.targets.grow, .baseline = self.baseline, .box = box };
             if (!self.forced_rows) {
                 const after = bill_mod.decodeAfter(self.inputs, cap);
                 // The rest of the box as it stands now (not the load's baseline, an older reading of it), for the live
                 // reading and the bill at the request alike.
-                const live: bill_mod.Live = .{ .target = self.targets.grow, .hard_target = self.targets.hard, .baseline = box.others, .footprint = st.after.footprint, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_rows[0], .max_rows = self.model.n_routed_experts, .per_row = self.bill.per_row, .device_after = after.device, .host_after = after.host };
+                const max_units = bill_mod.maxUnits(self.inputs.bank);
+                const live: bill_mod.Live = .{ .target = self.targets.grow, .hard_target = self.targets.hard, .baseline = box.others, .footprint = st.after.footprint, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_units, .max_rows = max_units, .per_row = self.bill.per_row, .device_after = after.device, .host_after = after.host, .geometry = self.inputs.bank };
                 line.live_rows = bill_mod.liveRows(live) catch |e| {
                     line.refused = @errorName(e);
                     log.err("{f}\n", .{line});
                     return e;
                 };
-                line.bill_rows = try bill_mod.requestRows(self.gpa, self.inputs, cap, box.others, self.targets.grow, self.model.n_routed_experts);
-                line.rows = @max(@min(line.live_rows.?, line.bill_rows.?), self.prompt_rows[0]);
+                line.bill_rows = try bill_mod.requestRows(self.gpa, self.inputs, cap, box.others, self.targets.grow, max_units);
+                line.rows = @max(@min(line.live_rows.?, line.bill_rows.?), self.prompt_units);
                 line.bound = live.total(line.rows);
-                @memset(self.decode_rows, line.rows);
+                self.decode_units = line.rows;
+                _ = bill_mod.rowsAt(self.inputs.bank, line.rows, self.decode_rows);
             }
             try self.ex.grow(self.decode_rows);
             line.grown = Mem.now();
@@ -435,7 +441,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .wall_ns = d.wall_ns,
                 .r = .of(d.s0, self.stream.stats()),
                 .hit_rate = hitSpread(self.layer_counts0, self.layer_counts1, self.layer_rates),
-                .rows = self.decode_rows[0],
+                .rows = self.decode_units,
                 .mem = .{ .start = d.mem0, .end = end },
                 .box = Box.now(end),
             }});
@@ -465,7 +471,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var prev: usize = 0;
             _ = mlx.mlx_set_cache_limit(&prev, bill_mod.prefill_cache_bytes);
             self.decoding = false;
-            log.info("glm_moe_dsa: reverse: footprint {d:.3} GB before the frees, {d:.3} GB after ({s} in {d} ms), KV at {d} positions {d:.3} GB, {d} rows per layer\n", .{ gigabytes(before.footprint), gigabytes(st.after.footprint), if (st.settled) "settled" else "not settled", st.waited_ms, positions, gigabytes(kv1), self.prompt_rows[0] });
+            log.info("glm_moe_dsa: reverse: footprint {d:.3} GB before the frees, {d:.3} GB after ({s} in {d} ms), KV at {d} positions {d:.3} GB, {d} rows per layer\n", .{ gigabytes(before.footprint), gigabytes(st.after.footprint), if (st.settled) "settled" else "not settled", st.waited_ms, positions, gigabytes(kv1), self.prompt_units });
         }
 
         /// The routed experts' counters (the stream's).

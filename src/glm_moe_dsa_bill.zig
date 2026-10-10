@@ -1,7 +1,8 @@
 //! GLM-5.3's memory bill (G4, `sdk.MemoryBill`): each phase's named terms, upper bounds from the pack's headers, the
 //! bank's manifest, the sizes of the arrays the module allocates and the box's measurements, with the slot banks'
-//! persistent rows apart as `per_row` (one row of the bank's widest record on every routed layer) and the page tables
-//! over the wired bytes as a row-following term. The construction bills the longest request the load takes (the
+//! persistent rows apart as `per_row` (one fill unit: every stream layer's rows per unit of its own record,
+//! `unitBytes`) and the page tables over the wired bytes as a row-following term. The fill counts units; the module
+//! gives each stream layer its rows at them (`rowsAt`). The construction bills the longest request the load takes (the
 //! billed context and `max_output` generated tokens); the decode handover grows the rows for the request it starts
 //! (`requestRows`, `liveRows`). Pure host: no MLX, no device. The fill and the admission (`sdk.fill`, `sdk.admit`) take
 //! the box baseline and the target; the ceiling comes only from the host (`LoadCtx.ceiling`), the margin from
@@ -102,7 +103,9 @@ pub const Terms = struct {
     kv: [2]u64,
     mlx_cache: [2]u64,
     host_side: [2]u64,
-    /// One persistent slot row on every routed layer.
+    /// What `rowsAt`'s rounding can add over the units' linear bytes (`roundingBytes`).
+    slot_rounding: [2]u64 = .{ 0, 0 },
+    /// One fill unit of persistent slot rows (`unitBytes`).
     per_row: u64,
     /// The draft lane's: its residents and resident experts, its layer's KV, its waves (null: off).
     mtp: ?struct { residents: [2]u64, kv: [2]u64, waves: [2]u64 } = null,
@@ -110,9 +113,58 @@ pub const Terms = struct {
     /// A phase's wired bytes less its persistent rows (the row term's base): every device term.
     pub fn wired(t: Terms, phase: usize) u64 {
         const m = if (t.mtp) |x| x.residents[phase] + x.kv[phase] + x.waves[phase] else 0;
-        return t.transient_slots[phase] + t.residents[phase] + t.waves[phase] + t.kv[phase] + t.mlx_cache[phase] + m;
+        return t.transient_slots[phase] + t.slot_rounding[phase] + t.residents[phase] + t.waves[phase] + t.kv[phase] + t.mlx_cache[phase] + m;
     }
 };
+
+/// A stream layer's expert slots at `units` (the share rounded, at most its experts).
+fn slotsAt(l: glm.LayerSlots, units: u32) u32 {
+    const experts = l.n_records / @max(l.rows_per_unit, 1);
+    const want: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(units)) * l.share));
+    return @min(want, experts);
+}
+
+/// Each stream layer's rows at `units` (`Stream.Options.rows`, the grow's rows), in `out`: its rows per expert slot
+/// times its share of the units, rounded.
+pub fn rowsAt(g: glm.Geometry, units: u32, out: []u32) []u32 {
+    for (g.layers, out[0..g.layers.len]) |l, *r| r.* = l.rows_per_unit * slotsAt(l, units);
+    return out[0..g.layers.len];
+}
+
+/// The slot rows' bytes at `units`, exactly as `rowsAt` gives them.
+pub fn slotBytes(g: glm.Geometry, units: u32) u64 {
+    var n: u64 = 0;
+    for (g.layers) |l| n += @as(u64, l.rows_per_unit) * slotsAt(l, units) * l.record_bytes;
+    return n;
+}
+
+/// One fill unit's bytes at the shares, rounded up (the bill's `per_row`).
+pub fn unitBytes(g: glm.Geometry) u64 {
+    var n: f64 = 0;
+    for (g.layers) |l| n += @as(f64, @floatFromInt(l.rows_per_unit)) * l.share * @as(f64, @floatFromInt(l.record_bytes));
+    return @intFromFloat(@ceil(n));
+}
+
+/// What `rowsAt`'s rounding can add over `unitBytes` at any unit count: half an expert slot on every layer whose share
+/// is not whole (0 for an even fill).
+pub fn roundingBytes(g: glm.Geometry) u64 {
+    var n: u64 = 0;
+    for (g.layers) |l| {
+        if (l.share != @round(l.share)) n += std.math.divCeil(u64, @as(u64, l.rows_per_unit) * l.record_bytes, 2) catch unreachable;
+    }
+    return n;
+}
+
+/// The most units the geometry takes: the most at which no layer's rounded share passes its experts.
+pub fn maxUnits(g: glm.Geometry) u32 {
+    if (g.layers.len == 0) return 0;
+    var n: u32 = std.math.maxInt(u32);
+    for (g.layers) |l| {
+        const experts: f64 = @floatFromInt(l.n_records / @max(l.rows_per_unit, 1));
+        n = @min(n, @as(u32, @intFromFloat(@ceil((experts + 0.5) / l.share))) - 1);
+    }
+    return n;
+}
 
 /// The prompt pass's widest wave at `tokens` prompt rows over `keys` keys (each term an upper bound of what one
 /// layer's evaluation holds; `glm_moe_dsa_graph` runs this shape): the residual stream's copies, the attention's
@@ -191,14 +243,15 @@ pub fn termsOf(in: Inputs) Terms {
     const spec = @as(u64, 2 * s.lookahead_budget) * io_mod.slotBytes(g.widest_record, page);
     const pool = s.workers * staging + spec;
     return .{
-        .transient_slots = .{ @as(u64, s.wide_depth) * s.max_route_ids * g.widest_record, @as(u64, s.decode_window_rows) * g.widest_record },
+        .transient_slots = .{ @as(u64, s.wide_depth) * s.max_route_ids * g.rows_per_id * g.widest_record, @as(u64, s.decode_window_rows) * g.rows_per_id * g.widest_record },
         .pool_staging = .{ pool, pool },
         .residents = .{ in.resident_bytes, in.resident_bytes },
         .waves = .{ promptWaveBytes(c, in.prompt_tokens, in.prompt_tokens), decodeWaveBytes(c, in.decode_positions) },
         .kv = .{ kvBytes(c, in.prompt_tokens), kvBytes(c, in.decode_positions) },
         .mlx_cache = .{ prefill_cache_bytes, decode_cache_bytes + decodeCacheOvershoot(c, in.decode_positions, s.decode_window_rows / glm.routed_top_k) },
         .host_side = .{ host_side_bytes, host_side_bytes },
-        .per_row = @as(u64, g.n_layers) * g.widest_record,
+        .slot_rounding = .{ roundingBytes(g), roundingBytes(g) },
+        .per_row = unitBytes(g),
         .mtp = if (in.mtp) |m| blk: {
             const res = m.resident_bytes + m.expert_bytes;
             break :blk .{ .residents = .{ res, res }, .kv = .{ mtpKvBytes(c, in.prompt_tokens), mtpKvBytes(c, in.decode_positions) }, .waves = .{ mtpPromptWaveBytes(c, in.prompt_tokens), mtpDecodeWaveBytes(c, m.depth, in.decode_positions) } };
@@ -210,6 +263,7 @@ pub fn termsOf(in: Inputs) Terms {
 /// page tables following the rows. The baseline stays out (the fill and the admission take it).
 pub fn memoryBill(a: std.mem.Allocator, t: Terms) !sdk.MemoryBill {
     const T = sdk.MemoryBill.Term;
+    const rounding = [_]T{.{ .name = "slot rows' rounding", .bytes = t.slot_rounding, .at_construction = true }};
     const base = [_]T{
         .{ .name = "slot banks (transient rows)", .bytes = t.transient_slots, .at_construction = true },
         .{ .name = "read pool staging", .bytes = t.pool_staging, .at_construction = true },
@@ -220,11 +274,12 @@ pub fn memoryBill(a: std.mem.Allocator, t: Terms) !sdk.MemoryBill {
         .{ .name = "host side", .bytes = t.host_side, .at_construction = true, .measured = true },
         .{ .name = "wire tables", .bytes = .{ wireTables(t.wired(0)), wireTables(t.wired(1)) }, .at_construction = false, .with_rows = true },
     };
-    const terms = if (t.mtp) |m| try std.mem.concat(a, T, &.{ &base, &[_]T{
+    const mtp_terms: []const T = if (t.mtp) |m| &[_]T{
         .{ .name = "MTP residents and experts", .bytes = m.residents, .at_construction = true },
         .{ .name = "MTP KV", .bytes = m.kv, .at_construction = false },
         .{ .name = "MTP waves", .bytes = m.waves, .at_construction = false },
-    } }) else try a.dupe(T, &base);
+    } else &.{};
+    const terms = try std.mem.concat(a, T, &.{ &base, if (t.slot_rounding[0] > 0) &rounding else &[_]T{}, mtp_terms });
     return .{ .terms = terms, .per_row = t.per_row, .row_terms = .{ .data = .{ t.wired(0), t.wired(1), t.per_row, 0 }, .at = wiringAt } };
 }
 
@@ -345,12 +400,21 @@ pub const Live = struct {
     /// What decode adds past the reading: MLX's (wired) and the host's (`decodeAfter`).
     device_after: u64,
     host_after: u64,
+    /// The stream's slots (null: `per_row` a unit): the grown rows' bytes exactly as `rowsAt` gives them.
+    geometry: ?glm.Geometry = null,
 
-    /// The box's bytes at `rows` per layer: the baseline, the reading, the grown rows, decode's additions and the
-    /// page tables of every MLX byte.
-    pub fn total(l: Live, rows: u32) u64 {
-        const grown = @as(u64, rows -| l.prompt_rows) * l.per_row;
-        return l.baseline + l.footprint + grown + l.device_after + l.host_after + wireTables(l.mlx_bytes + grown + l.device_after);
+    /// The rows' bytes from the prompt units to `units`.
+    pub fn grown(l: Live, units: u32) u64 {
+        if (units <= l.prompt_rows) return 0;
+        const g = l.geometry orelse return @as(u64, units - l.prompt_rows) * l.per_row;
+        return slotBytes(g, units) -| slotBytes(g, l.prompt_rows);
+    }
+
+    /// The box's bytes at `units`: the baseline, the reading, the grown rows, decode's additions and the page tables
+    /// of every MLX byte.
+    pub fn total(l: Live, units: u32) u64 {
+        const g = l.grown(units);
+        return l.baseline + l.footprint + g + l.device_after + l.host_after + wireTables(l.mlx_bytes + g + l.device_after);
     }
 };
 
@@ -364,6 +428,8 @@ pub fn liveRows(l: Live) error{DecodeOverTarget}!u32 {
     const lin = (l.target - at_prompt) / l.per_row;
     var r: u64 = @min(@as(u64, l.prompt_rows) + lin, l.max_rows);
     while (r > l.prompt_rows and l.total(@intCast(r)) > l.target) r -= 1;
+    // The rounded shares can fit a unit past the linear estimate.
+    while (r < l.max_rows and l.total(@intCast(r + 1)) <= l.target) r += 1;
     return @intCast(r);
 }
 
@@ -397,9 +463,44 @@ fn glm53Config() !glm.Config {
     return glm.Config.parse(testing.allocator, text, &glm.glm53, null);
 }
 
+/// GLM-5.3's affine bank at 4 bits: 75 routed layers of 256 records of 21,233,664 B, one row a unit.
+const glm53_slots: [75]glm.LayerSlots = @splat(.{ .record_bytes = 21_233_664, .n_records = 256 });
+
 fn glm53Geometry() bank_mod.Geometry {
     const seg = bank_mod.layerSegments(4, 6144, 2048).?;
-    return .{ .n_layers = 75, .n_experts = 256, .widest_record = bank_mod.logicalBytes(&seg), .widest_span = seg[bank_mod.gu_components].offset };
+    return .{ .layers = &glm53_slots, .widest_record = bank_mod.logicalBytes(&seg), .widest_span = seg[bank_mod.gu_components].offset };
+}
+
+test "glm bill: a fill unit is every stream layer's rows per expert slot at its share; the module's rows follow the units" {
+    try testing.expectEqual(@as(u64, 75 * 21_233_664), unitBytes(glm53Geometry()));
+    try testing.expectEqual(@as(u32, 256), maxUnits(glm53Geometry()));
+    try testing.expectEqual(@as(u64, 0), roundingBytes(glm53Geometry()));
+    var out: [75]u32 = undefined;
+    for (rowsAt(glm53Geometry(), 131, &out)) |r| try testing.expectEqual(@as(u32, 131), r);
+    try testing.expectEqual(131 * unitBytes(glm53Geometry()), slotBytes(glm53Geometry(), 131));
+    // The EXL3 split (the MTP agent's bank module): per GLM layer a K3 bank of 592 minis (148 experts) and a K4 bank of
+    // 432 (108), four minis an expert slot, the expert slots shared by expert count (148 / 128 and 108 / 128 a unit).
+    var split: [150]glm.LayerSlots = undefined;
+    for (&split, 0..) |*l, i| l.* = if (i % 2 == 0) .{ .record_bytes = 3_579_904, .n_records = 592, .rows_per_unit = 4, .share = 148.0 / 128.0 } else .{ .record_bytes = 4_759_552, .n_records = 432, .rows_per_unit = 4, .share = 108.0 / 128.0 };
+    const g: glm.Geometry = .{ .layers = &split, .widest_record = 4_759_552, .widest_span = 3_000_000, .rows_per_id = 4 };
+    try testing.expectEqual(@as(u64, 75 * 4 * (4_139_264 + 4_015_872)), unitBytes(g));
+    try testing.expectEqual(@as(u32, 128), maxUnits(g));
+    var o: [150]u32 = undefined;
+    // 100 units: 115.625 K3 and 84.375 K4 expert slots, rounded.
+    const r = rowsAt(g, 100, &o);
+    try testing.expectEqual(@as(u32, 4 * 116), r[0]);
+    try testing.expectEqual(@as(u32, 4 * 84), r[1]);
+    try testing.expectEqual(@as(u32, 592), rowsAt(g, 128, &o)[0]);
+    try testing.expectEqual(@as(u32, 432), rowsAt(g, 128, &o)[1]);
+    // The rounding never passes the linear bytes by more than its term.
+    try testing.expectEqual(@as(u64, 75 * (2 * 3_579_904 + 2 * 4_759_552)), roundingBytes(g));
+    for (0..129) |u| try testing.expect(slotBytes(g, @intCast(u)) <= u * unitBytes(g) + roundingBytes(g));
+    // The transient rows count each routed id's rows.
+    var c = try glm53Config();
+    defer c.deinit(testing.allocator);
+    const t = termsOf(.{ .model = &c, .bank = g, .resident_bytes = 0, .prompt_tokens = 1024, .decode_positions = 2048 });
+    try testing.expectEqual(@as(u64, 2 * 48 * 4 * 4_759_552), t.transient_slots[0]);
+    try testing.expectEqual(roundingBytes(g), t.slot_rounding[1]);
 }
 
 test "glm bill: GLM-5.3's terms at 16K: 1.59 GB a row, the KV at 95.2 KB a position, the fill under a 240 GiB ceiling" {

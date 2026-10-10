@@ -126,6 +126,31 @@ pub fn validBits(bits: i64) bool {
     return bits >= 2 and bits <= 8 and bits != 7;
 }
 
+/// One stream layer's slots as the bill and the stream size them (a bank module's `geometryOf`).
+pub const LayerSlots = struct {
+    /// One slot row's bytes (the layer's record; the stream allocates its rows of every component).
+    record_bytes: u64,
+    /// The layer's records: the most rows it takes.
+    n_records: u32,
+    /// Slot rows one expert slot takes (an EXL3 expert's 4 minis in adjacent rows; 1 for one record per expert).
+    rows_per_unit: u32 = 1,
+    /// The layer's expert slots per fill unit (the bank module's split; `rowsAt` rounds it): 1 for an even fill.
+    share: f64 = 1,
+};
+
+/// A bank's slot geometry: the bill fills in units (`glm_moe_dsa_bill.unitBytes`, `maxUnits`), the module gives each
+/// stream layer its rows at them (`rowsAt`).
+pub const Geometry = struct {
+    /// The stream's layers, in stream order (borrowed from the bank).
+    layers: []const LayerSlots,
+    /// The widest record (the transient rows' and decode's window) and the widest gate/up or down span (the read pool's
+    /// staging).
+    widest_record: u64,
+    widest_span: u64,
+    /// Slot rows one routed id takes.
+    rows_per_id: u32 = 1,
+};
+
 pub const Config = struct {
     vocab_size: u32,
     hidden_size: u32,
