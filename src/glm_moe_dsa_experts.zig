@@ -21,6 +21,7 @@ const expert_event = sdk_ext.expert.event;
 const expert_stream = @import("expert_stream.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const glm = @import("glm_moe_dsa.zig");
+const pt = @import("glm_moe_dsa_prefill_timers.zig");
 
 pub const BankKind = sdk_ext.expert.BankKind;
 pub const SlotRef = sdk_ext.expert.SlotRef;
@@ -635,10 +636,13 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 const start = gi * group_n;
                 const group = groupOf(w.distinct.items, gi, group_n);
                 const r = routes[gi % depth].?;
+                const tw = pt.now();
                 for (0..r.n_parts) |p| {
                     try self.stream.waitGu(r, @intCast(p));
                     try self.stream.waitDown(r, @intCast(p));
                 }
+                pt.chargeRouted(.wait, tw);
+                const tc = pt.now();
                 var refs: [max_route_ids]SlotRef = undefined;
                 _ = self.stream.refsOf(r, &refs);
                 const k0 = w.kept.items.len;
@@ -671,6 +675,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 try self.math.finishPrefill(g);
                 // The group's waves drained before its slots go back (the next route may refill them).
                 try g.evalAll(w.kept.items[k0..]);
+                pt.chargeRouted(.compute, tc);
                 g.resetTo(m);
                 self.stream.release(r);
                 routes[gi % depth] = null;
@@ -684,8 +689,12 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const w = &self.wide;
             const n_ids = n * k;
             // The join: every routed row's output in routed order, then the combine in token slices.
+            const tj = pt.now();
             const joined = try g.concat(w.kept.items, 0);
             try g.evalAll(&.{joined});
+            pt.chargeRouted(.join, tj);
+            const tb = pt.now();
+            defer if (pt.enabled) pt.chargeRouted(.combine, tb);
             for (w.kept.items) |o| g.release(o);
             w.kept.clearRetainingCapacity();
             try w.inv.resize(a, n_ids);
