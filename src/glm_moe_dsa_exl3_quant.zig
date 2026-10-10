@@ -186,6 +186,97 @@ test "glm exl3 quant: claims the EXL3 bank's description and declines the affine
     try testing.expectError(error.NoWeightDescription, accept(G, testing.allocator, undefined, .{}, spec, &diag));
 }
 
+test "glm exl3 quant: a wide prompt call with its misses staged at the layer's start (both bank layers) equals sushi's host decode and reads what the unstaged call reads" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const graph = @import("glm_moe_dsa_graph.zig");
+    const G = graph.G;
+    const experts_mod = @import("glm_moe_dsa_experts.zig");
+    const Ex = experts_mod.Experts(G, bank_mod, Accepted(G));
+    var c = try bank_mod.tinyConfigInter(a, 512);
+    defer c.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try bank_mod.writeSynth(a, testing.io, tmp.dir, &c, .{ .signs = true });
+    defer a.free(img);
+    var rbuf: [512]u8 = undefined;
+    var b = try bank_mod.Bank.open(a, testing.io, try bank_mod.tmpRoot(&tmp, &rbuf), &c, null);
+    defer b.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const h: usize = c.hidden_size;
+    const k = 8;
+    const n = 16;
+    var worst: f32 = 0;
+    var scale: f32 = 0;
+    var read: [2]u64 = undefined;
+    for ([_]bool{ false, true }, 0..) |staged, arm| {
+        var g = try G.init(a, s);
+        defer g.deinit();
+        // Two expert slots per bank layer: most of each layer's experts are misses; five windows (three staged).
+        const prompt_rows: [8]u32 = @splat(2);
+        const st = try bank_mod.Stream.Stream.init(a, &b, .{ .rows = &prompt_rows, .max_route_ids = 48, .transient_rows = 5 * 48, .wide_depth = 5, .transient_release = true, .records_per_part = 2, .slot_memory = .{ .mlx = s }, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 4096 } });
+        defer st.deinit();
+        var diag: Diag = .{};
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const p = try b.peek(arena.allocator());
+        const math = try accept(G, a, &g, .{ .peek = &p }, .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = k, .n_layers = 4, .act = .swiglu, .input = .bfloat16 }, &diag);
+        defer math.deinit(&g);
+        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .wide_depth = 5 });
+        defer ex.deinit(&g);
+        // The same calls in both arms: row r routes expert r and seven others, so every expert is routed.
+        var rng = std.Random.DefaultPrng.init(23);
+        for (0..4) |layer| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            var xs: [n * 128]f32 = undefined;
+            for (xs[0 .. n * h]) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
+            var ids: [n * k]u16 = undefined;
+            var ids32: [n * k]i32 = undefined;
+            var sc: [n * k]f32 = undefined;
+            for (0..n) |row| {
+                var j: usize = 0;
+                while (j < k) {
+                    const e: u16 = if (j == 0) @intCast(row) else rng.random().uintLessThan(u16, 16);
+                    if (std.mem.indexOfScalar(u16, ids[row * k ..][0..j], e) != null) continue;
+                    ids[row * k + j] = e;
+                    ids32[row * k + j] = e;
+                    sc[row * k + j] = 0.05 + rng.random().float(f32) * 0.2;
+                    j += 1;
+                }
+            }
+            const nc: c_int = n;
+            const xb = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs[0 .. n * h]), &.{ nc, @intCast(h) }, .float32), .bfloat16);
+            var xin: [n * 128]f32 = undefined;
+            _ = try g.hostF32(try g.astype(xb, .float32), xin[0 .. n * h]);
+            if (staged) {
+                try ex.stageMisses(@intCast(layer));
+                // Each bank layer's experts (none resident yet) staged, one route per bank layer.
+                try testing.expectEqual(@as(usize, 2), ex.staged.n_routes);
+            }
+            const y = try ex.call(&g, @intCast(layer), xb, try g.hostArray(std.mem.sliceAsBytes(ids32[0 .. n * k]), &.{ nc, k }, .int32), try g.hostArray(std.mem.sliceAsBytes(sc[0 .. n * k]), &.{ nc, k }, .float32), null, &.{});
+            var got: [n * 128]f32 = undefined;
+            _ = try g.hostF32(try g.astype(y, .float32), got[0 .. n * h]);
+            try ex.flush();
+            try testing.expectEqual(@as(?u32, null), ex.staged.layer);
+            var want: [n * 128]f32 = undefined;
+            hostMoe(img, &b, @intCast(layer), xin[0 .. n * h], ids[0 .. n * k], sc[0 .. n * k], k, want[0 .. n * h]);
+            for (want[0 .. n * h], got[0 .. n * h]) |wv, gv| {
+                scale = @max(scale, @abs(wv));
+                worst = @max(worst, @abs(wv - gv));
+            }
+        }
+        read[arm] = st.stats().expert_bytes_read;
+    }
+    std.debug.print("glm exl3 quant staged: max |delta| {d:.5} at outputs up to {d:.3}; {d} B read unstaged, {d} B staged\n", .{ worst, scale, read[0], read[1] });
+    try testing.expect(scale > 0.1);
+    try testing.expect(worst <= 0.03 * scale);
+    // Every expert of every layer read once in both arms.
+    try testing.expectEqual(read[0], read[1]);
+}
+
 /// The host reference of one routed layer's call: each row's experts' minis decoded by sushi's own host path
 /// (`format.project`) from the records, SwiGLU between, the minis summed at the expert's score.
 fn hostMoe(img: []const u8, b: *const bank_mod.Bank, layer: u32, xs: []const f32, ids: []const u16, sc: []const f32, k: usize, out: []f32) void {

@@ -819,6 +819,19 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 };
             }
 
+            /// Every resident's prompt row of `layer` held (pinned, never a victim) until `releaseHeld`: routes planned
+            /// meanwhile load their misses into transient rows (a prompt layer's misses read before its call).
+            pub fn holdResidents(self: *Stream, layer: u32) !void {
+                std.debug.assert(self.phase == .prefill);
+                if (self.held_base.items.len > 0 and self.held_layer != layer) return error.HeldOtherLayer;
+                self.held_layer = layer;
+                const p = &self.layers[layer].policy;
+                for (p.slot_to_expert[0..p.capacity], 0..) |e, sl| if (e != expert_policy.no_expert) {
+                    try self.held_base.append(self.allocator, @intCast(sl));
+                    self.locate(layer, @intCast(sl)).meta.pins += 1;
+                };
+            }
+
             /// Unpin and stop holding what `holdBase` kept (after the deferred call's waves are evaluated).
             pub fn releaseHeld(self: *Stream) void {
                 for (self.held_base.items) |s| self.locate(self.held_layer, s).meta.pins -= 1;

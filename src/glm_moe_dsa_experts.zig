@@ -8,10 +8,11 @@
 //! A call of at most `max_route_ids` routed ids (decode, short prompts) is the decode lane: the routing barrier (the ids
 //! and, with the lookahead, the next routed layer's scores read on the host), the route, the residents' wave at once,
 //! then each miss part's gate/up after its gate/up bytes landed and its down after the rest (or every wave at once over
-//! event-gate aliases), the release; the outputs joined in routed order. A wider call is the wide lane: the layer's
-//! residency seeded from the call's ids, the call's experts in groups of `max_route_ids` (its residents first, then
-//! the rest, each hottest first) routed up to `wide_depth` ahead, each group's rows per bank through the math's
-//! `prefill` in slices, drained before the group's slots go back; the join and the combine in token slices.
+//! event-gate aliases), the release; the outputs joined in routed order. A wider call is the wide lane, per bank layer:
+//! its residency seeded from the call's ids, the call's experts in groups of `max_route_ids` (its residents first, then
+//! the misses read at the layer's start (`stageMisses`), then the rest, each hottest first) routed up to `wide_depth`
+//! ahead, each group's rows per bank through the math's `prefill` in slices, drained before the group's slots go back;
+//! then the combine (on the GPU one launch over the groups' outputs, else the join and the op chain in token slices).
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -145,11 +146,23 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         opt: Options,
         transient_released: bool = false,
         wide: Wide = .{},
+        staged: Staged = .{},
         /// The decode lane's read bytes by the first row of the call that routes the expert (row i of `x`), summed over
         /// calls until the caller zeroes it: a draft round's verify attributes its reads to the rows it keeps or rejects.
         row_bytes: [max_route_ids]u64 = @splat(0),
         /// The wide lane's combine on the GPU (`combine_source`), built at its first call.
         combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
+
+        /// The routes of the prompt layer whose misses were read at its start (`stageMisses`): each route's bank layer and
+        /// experts, in route order; null once the call took it.
+        const Staged = struct {
+            layer: ?u32 = null,
+            routes: [expert_stream.max_wide_depth]?*S.Route = @splat(null),
+            sls: [expert_stream.max_wide_depth]u32 = undefined,
+            n_routes: usize = 0,
+            experts: std.ArrayList(u16) = .empty,
+            bounds: [expert_stream.max_wide_depth + 1]usize = undefined,
+        };
 
         /// The wide lane's host scratch, reused across calls.
         const Wide = struct {
@@ -161,6 +174,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             /// The call's routed rows by group (each group's in row order) and each group's first index there.
             by_group: std.ArrayList(u32) = .empty,
             group_at: std.ArrayList(u32) = .empty,
+            /// The groups: their bounds in `order`, each expert's group, each group's route.
+            bounds: std.ArrayList(u32) = .empty,
+            egroup: std.ArrayList(u16) = .empty,
+            groute: std.ArrayList(?*S.Route) = .empty,
+            staged_mark: std.ArrayList(bool) = .empty,
             slot: std.ArrayList(u32) = .empty,
             act: std.ArrayList(u32) = .empty,
             pos: std.ArrayList(u32) = .empty,
@@ -170,7 +188,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
 
             fn deinit(w: *Wide, a: std.mem.Allocator, g: *G) void {
                 for (w.kept.items) |x| g.release(x);
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.order, &w.count, &w.by_group, &w.group_at, &w.slot, &w.act, &w.pos, &w.inv, &w.kept, &w.side_ids }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.order, &w.count, &w.by_group, &w.group_at, &w.bounds, &w.egroup, &w.groute, &w.staged_mark, &w.slot, &w.act, &w.pos, &w.inv, &w.kept, &w.side_ids }) |l| l.deinit(a);
             }
         };
 
@@ -190,6 +208,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
 
         pub fn deinit(self: *Self, g: *G) void {
             if (self.combine_kernel) |kern| _ = mlx.mlx_fast_metal_kernel_free(kern);
+            self.staged.experts.deinit(self.a);
             self.wide.deinit(self.a, g);
             self.a.free(self.banks);
             self.* = undefined;
@@ -270,6 +289,61 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         pub fn readAheadRoom(self: *const Self, layer: u32) u32 {
             const p = &self.stream.layers[bpl * layer].policy;
             return p.capacity -| p.occupancy;
+        }
+
+        /// A wide prompt call's misses read at its layer's start, before its attention: each bank layer's non-resident
+        /// experts (in expert order) routed into transient rows in groups, as many as all windows but two hold (the
+        /// call's groups alternate in those two; a bank layer's residents are held meanwhile: no staged miss evicts one);
+        /// `callWide` serves them from these routes. A call of at least 8 rows per expert routes nearly every expert, so
+        /// nearly every staged read is used.
+        pub fn stageMisses(self: *Self, layer: u32) !void {
+            const st = &self.staged;
+            std.debug.assert(st.layer == null);
+            if (self.opt.wide_depth < 3) return;
+            const max_routes: usize = self.opt.wide_depth - 2;
+            const group_n = self.stream.max_route_ids;
+            st.experts.clearRetainingCapacity();
+            st.bounds[0] = 0;
+            st.n_routes = 0;
+            st.layer = layer;
+            errdefer self.dropStaged();
+            for (0..bpl) |side| {
+                if (st.n_routes == max_routes) break;
+                const sl = bpl * layer + @as(u32, @intCast(side));
+                const policy = &self.stream.layers[sl].policy;
+                const e0 = st.experts.items.len;
+                for (0..self.n_experts) |e| {
+                    const id: u16 = @intCast(e);
+                    if (bpl > 1 and self.stream.bank.streamLayer(layer, id) != sl) continue;
+                    if (policy.slotOf(id) == null) try st.experts.append(self.a, id);
+                }
+                if (st.experts.items.len == e0) continue;
+                try self.stream.holdResidents(sl);
+                defer self.stream.releaseHeld();
+                var lo = e0;
+                while (lo < st.experts.items.len and st.n_routes < max_routes) {
+                    const hi = @min(lo + group_n, st.experts.items.len);
+                    st.routes[st.n_routes] = try self.stream.route(sl, st.experts.items[lo..hi], &.{});
+                    st.sls[st.n_routes] = sl;
+                    st.n_routes += 1;
+                    st.bounds[st.n_routes] = hi;
+                    lo = hi;
+                }
+                st.experts.shrinkRetainingCapacity(lo);
+            }
+            if (st.n_routes == 0) st.layer = null;
+        }
+
+        /// The staged routes the call did not take released (its end, or an error between `stageMisses` and the call).
+        pub fn dropStaged(self: *Self) void {
+            const st = &self.staged;
+            if (st.layer == null) return;
+            for (st.routes[0..st.n_routes]) |*rt| if (rt.*) |r| {
+                self.stream.release(r);
+                rt.* = null;
+            };
+            st.layer = null;
+            st.n_routes = 0;
         }
 
         /// One routed-layer call: x [n, hidden], indices [n, k] int32, scores [n, k] f32 -> the weighted sum [n, hidden]
@@ -676,6 +750,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
+            // The staged routes this call does not take (a bank layer it routes nothing on) go back at its end.
+            defer self.dropStaged();
             const tb = pt.now();
             try w.ids.resize(a, n_ids);
             _ = try g.hostIds(indices, w.ids.items);
@@ -723,58 +799,99 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             pt.chargeRouted(.ahead, tp);
             tp = pt.now();
             try self.stream.seedPrefill(sl, w.side_ids.items);
-            // The call's residents first (hottest first among them), then the rest: every resident is routed before any
-            // miss is planned, so no miss evicts a resident (one the read-ahead landed) whose group is still to come and
-            // each routed expert is read at most once in the call.
+            // The groups: the bank layer's residents (hottest first), then its misses read at the layer's start
+            // (`stageMisses`, as their routes took them), then the rest (hottest first). Every resident is routed before
+            // any other miss is planned, so no miss evicts a resident whose group is still to come; each expert is read
+            // at most once in the call.
             const policy = &self.stream.layers[sl].policy;
-            var n_res: usize = 0;
-            for (w.distinct.items) |e| n_res += @intFromBool(policy.slotOf(e) != null);
-            try w.order.resize(a, w.distinct.items.len);
-            var at_res: usize = 0;
-            var at_miss: usize = n_res;
-            for (w.distinct.items) |e| {
-                if (policy.slotOf(e) != null) {
-                    w.order.items[at_res] = e;
-                    at_res += 1;
-                } else {
-                    w.order.items[at_miss] = e;
-                    at_miss += 1;
+            const st = &self.staged;
+            const staged = st.layer != null and st.layer.? == layer;
+            try w.staged_mark.resize(a, self.n_experts);
+            @memset(w.staged_mark.items, false);
+            // The staged routes of this bank layer, and those of the others still holding a window.
+            var n_staged: usize = 0;
+            var held_other: usize = 0;
+            if (staged) for (0..st.n_routes) |ri| {
+                if (st.routes[ri] == null) continue;
+                if (st.sls[ri] != sl) {
+                    held_other += 1;
+                    continue;
                 }
+                n_staged += 1;
+                for (st.experts.items[st.bounds[ri]..st.bounds[ri + 1]]) |e| w.staged_mark.items[e] = true;
+            };
+            w.order.clearRetainingCapacity();
+            w.bounds.clearRetainingCapacity();
+            try w.bounds.append(a, 0);
+            var first_staged: usize = 0;
+            for ([_]bool{ true, false }) |resident| {
+                for (w.distinct.items) |e| if ((policy.slotOf(e) != null) == resident and !w.staged_mark.items[e]) {
+                    if (w.order.items.len - w.bounds.items[w.bounds.items.len - 1] == group_n) try w.bounds.append(a, @intCast(w.order.items.len));
+                    try w.order.append(a, e);
+                };
+                if (w.order.items.len > w.bounds.items[w.bounds.items.len - 1]) try w.bounds.append(a, @intCast(w.order.items.len));
+                if (!resident) continue;
+                // The staged routes' groups, between the residents' and the rest's.
+                first_staged = w.bounds.items.len - 1;
+                if (n_staged > 0) for (0..st.n_routes) |ri| if (st.routes[ri] != null and st.sls[ri] == sl) {
+                    try w.order.appendSlice(a, st.experts.items[st.bounds[ri]..st.bounds[ri + 1]]);
+                    try w.bounds.append(a, @intCast(w.order.items.len));
+                };
             }
-            @memcpy(w.distinct.items, w.order.items);
-            for (w.distinct.items, 0..) |e, i| w.first.items[e] = @intCast(i);
-            const n_distinct = w.distinct.items.len;
-            const n_groups = (n_distinct + group_n - 1) / group_n;
+            const n_groups = w.bounds.items.len - 1;
+            try w.egroup.resize(a, self.n_experts);
+            for (0..n_groups) |gi| for (w.order.items[w.bounds.items[gi]..w.bounds.items[gi + 1]], w.bounds.items[gi]..) |e, i| {
+                w.first.items[e] = @intCast(i);
+                w.egroup.items[e] = @intCast(gi);
+            };
+            try w.groute.resize(a, n_groups);
+            @memset(w.groute.items, null);
+            // Windows held: the staged routes (this bank layer's, taken here, and the others').
+            var live: usize = held_other;
+            errdefer for (w.groute.items) |rt| if (rt) |r| self.stream.release(r);
+            if (n_staged > 0) {
+                var gs = first_staged;
+                for (0..st.n_routes) |ri| if (st.routes[ri] != null and st.sls[ri] == sl) {
+                    w.groute.items[gs] = st.routes[ri];
+                    st.routes[ri] = null;
+                    gs += 1;
+                };
+                live += n_staged;
+            }
             // The bank layer's routed rows bucketed by group once (a counting sort, each group's rows in row order; a row
             // of another bank layer's expert has no place here).
             try w.group_at.resize(a, n_groups + 1);
             @memset(w.group_at.items, 0);
-            for (w.ids.items) |e| {
-                const fi = w.first.items[e];
-                if (fi >= 0) w.group_at.items[@as(usize, @intCast(fi)) / group_n + 1] += 1;
-            }
+            for (w.ids.items) |e| if (w.first.items[e] >= 0) {
+                w.group_at.items[@as(usize, w.egroup.items[e]) + 1] += 1;
+            };
             for (1..n_groups + 1) |gi| w.group_at.items[gi] += w.group_at.items[gi - 1];
             try w.by_group.resize(a, w.side_ids.items.len);
             try w.slot.resize(a, n_groups);
             @memcpy(w.slot.items, w.group_at.items[0..n_groups]);
             for (w.ids.items, 0..) |e, row| {
-                const fi = w.first.items[e];
-                if (fi < 0) continue;
-                const gi = @as(usize, @intCast(fi)) / group_n;
+                if (w.first.items[e] < 0) continue;
+                const gi = w.egroup.items[e];
                 w.by_group.items[w.slot.items[gi]] = @intCast(row);
                 w.slot.items[gi] += 1;
             }
             const depth: usize = self.opt.wide_depth;
-            var routes: [expert_stream.max_wide_depth]?*S.Route = @splat(null);
-            errdefer for (&routes) |*rt| if (rt.*) |r| {
-                self.stream.release(r);
-                rt.* = null;
-            };
-            for (0..@min(depth, n_groups)) |gi| routes[gi % depth] = try self.stream.route(sl, groupOf(w.distinct.items, gi, group_n), &.{});
+            // Routes ahead, in group order, while windows are free.
+            var next: usize = 0;
+            const ahead = struct {
+                fn f(slf: *Self, wd: *Wide, lyr: u32, nxt: *usize, lv: *usize, dp: usize) !void {
+                    while (nxt.* < wd.groute.items.len and (wd.groute.items[nxt.*] != null or lv.* < dp)) : (nxt.* += 1) {
+                        if (wd.groute.items[nxt.*] != null) continue;
+                        wd.groute.items[nxt.*] = try slf.stream.route(lyr, wd.order.items[wd.bounds.items[nxt.*]..wd.bounds.items[nxt.* + 1]], &.{});
+                        lv.* += 1;
+                    }
+                }
+            }.f;
+            try ahead(self, w, sl, &next, &live, depth);
             pt.chargeRouted(.route, tp);
             for (0..n_groups) |gi| {
-                const start = gi * group_n;
-                const r = routes[gi % depth].?;
+                const start = w.bounds.items[gi];
+                const r = w.groute.items[gi].?;
                 const tw = pt.now();
                 for (0..r.n_parts) |p| {
                     try self.stream.waitGu(r, @intCast(p));
@@ -818,8 +935,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 g.resetTo(m);
                 const tr = pt.now();
                 self.stream.release(r);
-                routes[gi % depth] = null;
-                if (gi + depth < n_groups) routes[gi % depth] = try self.stream.route(sl, groupOf(w.distinct.items, gi + depth, group_n), &.{});
+                w.groute.items[gi] = null;
+                live -= 1;
+                try ahead(self, w, sl, &next, &live, depth);
                 pt.chargeRouted(.route, tr);
             }
         }
@@ -873,11 +991,6 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 try outs.append(a, try combine(g, y, s, g.dtypeOf(x)));
             }
             return if (outs.items.len == 1) outs.items[0] else g.concat(outs.items, 0);
-        }
-
-        fn groupOf(d: []const u16, gi: usize, group_n: usize) []const u16 {
-            const s0 = gi * group_n;
-            return d[s0..@min(s0 + group_n, d.len)];
         }
     };
 }
