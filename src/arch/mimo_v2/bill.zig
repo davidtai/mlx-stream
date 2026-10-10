@@ -344,7 +344,8 @@ fn sourceTerms(a: std.mem.Allocator, g: bank.Geometry, config: settings.Config) 
         .{ .name = "spec_staging", .bytes = @splat(s.spec_staging_bytes), .at_construction = true },
         .{ .name = "spec_runtime", .bytes = @splat(s.spec_runtime_bytes), .at_construction = true },
         .{ .name = "predictor_metadata", .bytes = @splat(s.predictor_metadata_bytes), .at_construction = true },
-        .{ .name = "predictor_workspace", .bytes = .{ s.predictor_workspace_bytes, d.predictor_workspace_bytes }, .at_construction = false },
+        // `prefill_predict_evals: one`: the predictor holds every router tile of a prompt call at once.
+        .{ .name = "predictor_workspace", .bytes = .{ s.predictor_workspace_bytes + predictorEvalsBytes(g, config), d.predictor_workspace_bytes }, .at_construction = false },
         .{ .name = "predictor_runtime", .bytes = @splat(s.predictor_runtime_bytes), .at_construction = false },
         .{ .name = "slot_wiring", .bytes = @splat(0), .at_construction = false, .with_rows = true },
     };
@@ -360,6 +361,14 @@ fn sourceTerms(a: std.mem.Allocator, g: bank.Geometry, config: settings.Config) 
 pub fn drainBytes(g: bank.Geometry, config: settings.Config) u64 {
     if (config.prefill_drain != .pipelined) return 0;
     return prefill_math.pipelinedExtraBytes(g.hidden_size, g.intermediate_size, source.max_forward_tokens);
+}
+
+/// `prefill_predict_evals: one` (the default): the predictor's router tiles evaluated in one eval hold every tile's
+/// workspace at once (source.zig `predictorOneEvalExtraBytes`, the tiles past the first); 0 on the tiled control. A
+/// prompt-phase term: decode makes no prompt read-ahead.
+pub fn predictorEvalsBytes(g: bank.Geometry, config: settings.Config) u64 {
+    if (config.prefill_predict_evals != .one) return 0;
+    return source.predictorOneEvalExtraBytes(g, source.max_forward_tokens);
 }
 
 /// The phase's slot wiring: its transient rows (data[0] prompt, data[2] decode) and `rows` persistent rows.
@@ -502,8 +511,9 @@ test "mlx-stream MiMo bill: the terms sum to the bill and the layer workspace is
     for ([_]settings.KVMode{ .bf16, .q8 }) |mode| {
         // +phase-rows: the control's terms (both phases billed alike); the arm's decode terms: "MiMo bill: phase rows".
         // stack-next8: the warm route's 1 MiB term (`gpu_warm`, default waits) is outside this sum: the control.
-        // stack-next9: the P7 scratch control (fresh: MLX's cache at allocator_cache_bytes in both phases), as `wired` below.
-        const c = (settings.Config{ .phase_rows = false, .mtp_heads = false, .prefill_drain = .sync, .gpu_keep_warm = .off, .prefill_scratch = .fresh }).withFacts(&.{ .wired_margin_bytes = box_stop, .kv_quant_bits = @as(u8, if (mode == .q8) 8 else 0) });
+        // stack-next9: the P7 scratch control (fresh: MLX's cache at allocator_cache_bytes in both phases), as `wired` below,
+        // and the tiled predictor (the one-eval predictor's extra tiles are `predictorEvalsBytes`, outside this sum).
+        const c = (settings.Config{ .phase_rows = false, .mtp_heads = false, .prefill_drain = .sync, .gpu_keep_warm = .off, .prefill_scratch = .fresh, .prefill_predict_evals = .tiled }).withFacts(&.{ .wired_margin_bytes = box_stop, .kv_quant_bits = @as(u8, if (mode == .q8) 8 else 0) });
         try c.validate();
         for ([_]u64{ 512, 16_384, 17_408, 131_072, 1_047_488 }) |reserve| {
             const b = try fixtureBillAt(a, c, 0, reserve);
@@ -1314,4 +1324,21 @@ test "mimo fp8res bill: the census counts two arrays per FP8 projection (codes +
     // The geometric payload equals the converter's file (prepared.residentBytes bills the file; the pack's headers).
     try testing.expectEqual(@as(u64, 8_895_321_472), fp8.residentPayloadBytes());
     try testing.expectEqual(@as(u64, 11_967_197_056 - 8_895_321_472), bf16.residentPayloadBytes() - fp8.residentPayloadBytes());
+}
+
+test "mimo bill: prefill_predict_evals one bills every router tile of a 16K call in the prompt phase; tiled bills none; decode is unchanged" {
+    const a = testing.allocator;
+    const g = (try bank.Geometry.init(4096, 2048, 256, 1, 47));
+    const extra = source.predictorOneEvalExtraBytes(g, 16_384);
+    try testing.expectEqual(@as(u64, 7 * 2048 * (6 * 4096 + 20 * 256 + 16 * 8 + 8)), extra);
+    try testing.expectEqual(extra, predictorEvalsBytes(g, .{}));
+    try testing.expectEqual(@as(u64, 0), predictorEvalsBytes(g, .{ .prefill_predict_evals = .tiled }));
+    const one = try fixtureBillAt(a, .{}, 0, settings.fill_reserve_tokens);
+    defer one.free(a);
+    const tiled = try fixtureBillAt(a, .{ .prefill_predict_evals = .tiled }, 0, settings.fill_reserve_tokens);
+    defer tiled.free(a);
+    const po = termBytes(one, "predictor_workspace");
+    const pt = termBytes(tiled, "predictor_workspace");
+    try testing.expectEqual(pt[0] + extra, po[0]);
+    try testing.expectEqual(pt[1], po[1]);
 }
