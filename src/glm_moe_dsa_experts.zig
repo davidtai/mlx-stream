@@ -8,10 +8,10 @@
 //! A call of at most `max_route_ids` routed ids (decode, short prompts) is the decode lane: the routing barrier (the ids
 //! and, with the lookahead, the next routed layer's scores read on the host), the route, the residents' wave at once,
 //! then each miss part's gate/up after its gate/up bytes landed and its down after the rest (or every wave at once over
-//! event-gate aliases), the release; the outputs joined in routed order. A wider call is the wide lane: the call's
-//! experts hottest first, the layer's residency seeded from its ids, groups of `max_route_ids` experts routed up to
-//! `wide_depth` ahead, each group's rows per bank through the math's `prefill` in slices, drained before the group's
-//! slots go back; the join and the combine in token slices.
+//! event-gate aliases), the release; the outputs joined in routed order. A wider call is the wide lane: the layer's
+//! residency seeded from the call's ids, the call's experts in groups of `max_route_ids` (its residents first, then
+//! the rest, each hottest first) routed up to `wide_depth` ahead, each group's rows per bank through the math's
+//! `prefill` in slices, drained before the group's slots go back; the join and the combine in token slices.
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -21,6 +21,87 @@ const expert_event = sdk_ext.expert.event;
 const expert_stream = @import("expert_stream.zig");
 const ops = @import("deepseek_v41_ops.zig");
 const glm = @import("glm_moe_dsa.zig");
+const pt = @import("glm_moe_dsa_prefill_timers.zig");
+
+/// The wide lane's combine (`combineOnGpu`): one thread per token and 4 hidden values, the token's `K` routed rows in
+/// routed order, each read from its part (`loc`: the part in the top 8 bits, the row in the low 24).
+const max_combine_parts = 24;
+const combine_source = blk: {
+    var cases: []const u8 = "";
+    for (0..max_combine_parts) |i| cases = cases ++ std.fmt.comptimePrint("        case {d}: part = p{d}; break;\n", .{ i, i });
+    break :blk std.fmt.comptimePrint("{s}{s}{s}", .{ combine_head, cases, combine_tail });
+};
+const combine_head =
+    \\    const uint t = thread_position_in_grid.y;
+    \\    const uint h = thread_position_in_grid.x * 4;
+    \\    if (h >= H) return;
+    \\    float4 acc = float4(0.0f);
+    \\    for (int k = 0; k < K; ++k) {
+    \\        const uint lc = loc[t * K + k];
+    \\        const device T* part;
+    \\        switch (lc >> 24) {
+    \\
+;
+const combine_tail =
+    \\        default: part = p0; break;
+    \\        }
+    \\        const vec<T, 4> y = *(const device vec<T, 4>*)(part + ulong(lc & 0xFFFFFFu) * H + h);
+    \\        acc = acc + float4(y) * w[t * K + k];
+    \\    }
+    \\    *(device vec<T, 4>*)(out + ulong(t) * H + h) = vec<T, 4>(acc);
+    \\
+;
+
+/// `(y * scores[..., None]).sum(-2)` of the routed rows in `parts` (at most `max_combine_parts`; token t's j-th routed
+/// row is row `loc[t * k + j] & 0xFFFFFF` of part `loc[t * k + j] >> 24`, u32 `[n * k]`) as one launch: each token's
+/// rows weighted and summed in f32 in routed order, products and sums rounded apart (no contraction), cast to `dt`;
+/// the op chain's bits.
+fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, parts: []const ops.MlxOps.T, loc: ops.MlxOps.T, scores: ops.MlxOps.T, n: u32, k: u32, hidden: c_int, dt: ops.Dtype) !ops.MlxOps.T {
+    std.debug.assert(parts.len > 0 and parts.len <= max_combine_parts);
+    const names = comptime blk: {
+        var v: [max_combine_parts + 2][*:0]const u8 = undefined;
+        for (0..max_combine_parts) |i| v[i] = std.fmt.comptimePrint("p{d}", .{i});
+        v[max_combine_parts] = "loc";
+        v[max_combine_parts + 1] = "w";
+        break :blk v;
+    };
+    const kern = slot.* orelse blk: {
+        const outs = [_][*:0]const u8{"out"};
+        const iv = mlx.mlx_vector_string_new_data(&names, names.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const kn = mlx.mlx_fast_metal_kernel_new("glm_moe_dsa_combine", iv, ov, combine_source, "#pragma METAL fp contract(off)\n", true, false);
+        if (kn.ctx == null) return error.MetalKernelCompileFailed;
+        slot.* = kn;
+        break :blk kn;
+    };
+    const h4: c_int = @divExact(hidden, 4);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ @intCast(n), hidden }, 2, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, h4, @intCast(n), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(h4, 256), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", hidden));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", @intCast(k)));
+    // The slots past the parts hold the first part (never read).
+    var inputs: [max_combine_parts + 2]mlx.mlx_array = undefined;
+    for (inputs[0..max_combine_parts], 0..) |*in, i| in.* = if (i < parts.len) parts[i] else parts[0];
+    inputs[max_combine_parts] = loc;
+    inputs[max_combine_parts + 1] = scores;
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
+    var out = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_vector_array_get(&out, ov, 0)) catch |e| {
+        _ = mlx.mlx_array_free(out);
+        return e;
+    };
+    return g.adopt(out);
+}
 
 pub const BankKind = sdk_ext.expert.BankKind;
 pub const SlotRef = sdk_ext.expert.SlotRef;
@@ -56,13 +137,35 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         opt: Options,
         transient_released: bool = false,
         wide: Wide = .{},
+        staged: Staged = .{},
+        /// The wide lane's combine on the GPU (`combine_source`), built at its first call.
+        combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
+
+        /// The routes of the prompt layer whose misses were read at its start (`stageMisses`): each route's experts,
+        /// in route order.
+        const Staged = struct {
+            layer: ?u32 = null,
+            routes: [expert_stream.max_wide_depth]*S.Route = undefined,
+            n_routes: usize = 0,
+            experts: std.ArrayList(u16) = .empty,
+            bounds: [expert_stream.max_wide_depth + 1]usize = undefined,
+        };
 
         /// The wide lane's host scratch, reused across calls.
         const Wide = struct {
             ids: std.ArrayList(u16) = .empty,
             first: std.ArrayList(i32) = .empty,
             distinct: std.ArrayList(u16) = .empty,
+            order: std.ArrayList(u16) = .empty,
             count: std.ArrayList(u32) = .empty,
+            /// The call's routed rows by group (each group's in row order) and each group's first index there.
+            by_group: std.ArrayList(u32) = .empty,
+            group_at: std.ArrayList(u32) = .empty,
+            /// The groups: their bounds in `order`, each expert's group, each group's route.
+            bounds: std.ArrayList(u32) = .empty,
+            egroup: std.ArrayList(u16) = .empty,
+            groute: std.ArrayList(?*S.Route) = .empty,
+            staged_mark: std.ArrayList(bool) = .empty,
             slot: std.ArrayList(u32) = .empty,
             act: std.ArrayList(u32) = .empty,
             pos: std.ArrayList(u32) = .empty,
@@ -71,7 +174,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
 
             fn deinit(w: *Wide, a: std.mem.Allocator, g: *G) void {
                 for (w.kept.items) |x| g.release(x);
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.slot, &w.act, &w.pos, &w.inv, &w.kept }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.order, &w.count, &w.by_group, &w.group_at, &w.bounds, &w.egroup, &w.groute, &w.staged_mark, &w.slot, &w.act, &w.pos, &w.inv, &w.kept }) |l| l.deinit(a);
             }
         };
 
@@ -90,6 +193,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         }
 
         pub fn deinit(self: *Self, g: *G) void {
+            if (self.combine_kernel) |kern| _ = mlx.mlx_fast_metal_kernel_free(kern);
+            self.staged.experts.deinit(self.a);
             self.wide.deinit(self.a, g);
             self.a.free(self.banks);
             self.* = undefined;
@@ -154,6 +259,51 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// P1: layer `layer`'s predicted experts (hottest first) read ahead of its routed call (prompt phase).
         pub fn readAheadSeed(self: *Self, layer: u32, experts: []const u16) !void {
             return self.stream.readAheadSeed(layer, experts);
+        }
+
+        /// A wide prompt call's misses read at its layer's start, before its attention: the layer's non-resident
+        /// experts (in expert order) routed into transient rows in groups, as many as all windows but one hold (the
+        /// residents held meanwhile: no staged miss evicts one); `callWide` serves them from these routes. A call of
+        /// at least 8 rows per expert routes nearly every expert, so nearly every staged read is used.
+        pub fn stageMisses(self: *Self, layer: u32) !void {
+            const st = &self.staged;
+            std.debug.assert(st.layer == null);
+            if (self.opt.wide_depth < 2) return;
+            const policy = &self.stream.layers[layer].policy;
+            st.experts.clearRetainingCapacity();
+            for (0..self.n_experts) |e| if (policy.slotOf(@intCast(e)) == null) try st.experts.append(self.a, @intCast(e));
+            const group_n = self.stream.max_route_ids;
+            const n_routes = @min(self.opt.wide_depth - 1, (st.experts.items.len + group_n - 1) / group_n);
+            if (n_routes == 0) return;
+            try self.stream.holdResidents(layer);
+            defer self.stream.releaseHeld();
+            st.bounds[0] = 0;
+            var n: usize = 0;
+            errdefer for (st.routes[0..n]) |r| self.stream.release(r);
+            while (n < n_routes) : (n += 1) {
+                const lo = n * group_n;
+                const hi = @min(lo + group_n, st.experts.items.len);
+                st.routes[n] = try self.stream.route(layer, st.experts.items[lo..hi], &.{});
+                st.bounds[n + 1] = hi;
+            }
+            st.experts.shrinkRetainingCapacity(st.bounds[n_routes]);
+            st.n_routes = n_routes;
+            st.layer = layer;
+        }
+
+        /// The staged routes released where their call never came (an error between `stageMisses` and `call`).
+        pub fn dropStaged(self: *Self) void {
+            const st = &self.staged;
+            if (st.layer == null) return;
+            for (st.routes[0..st.n_routes]) |r| self.stream.release(r);
+            st.layer = null;
+            st.n_routes = 0;
+        }
+
+        /// The prompt rows of `layer` a read-ahead can still fill (it never evicts).
+        pub fn readAheadRoom(self: *const Self, layer: u32) u32 {
+            const p = &self.stream.layers[layer].policy;
+            return p.capacity -| p.occupancy;
         }
 
         /// One routed-layer call: x [n, hidden], indices [n, k] int32, scores [n, k] f32 -> the weighted sum [n, hidden]
@@ -336,6 +486,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const w = &self.wide;
             const n_ids = n * k;
             const group_n = self.stream.max_route_ids;
+            var tp = pt.now();
             try w.ids.resize(a, n_ids);
             _ = try g.hostIds(indices, w.ids.items);
             try w.first.resize(a, self.n_experts);
@@ -356,29 +507,98 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     return if (cnt[p] != cnt[q]) cnt[p] > cnt[q] else p < q;
                 }
             }.lt);
-            for (w.distinct.items, 0..) |e, i| w.first.items[e] = @intCast(i);
+            pt.chargeRouted(.barrier, tp);
+            tp = pt.now();
             try self.stream.awaitReadAhead(layer);
+            pt.chargeRouted(.ahead, tp);
+            tp = pt.now();
             try self.stream.seedPrefill(layer, w.ids.items);
+            // The groups: the call's residents (hottest first), then the misses read at the layer's start (`stageMisses`,
+            // as their routes took them), then the rest (hottest first). Every resident is routed before any other miss
+            // is planned, so no miss evicts a resident whose group is still to come; each expert is read at most once.
+            const policy = &self.stream.layers[layer].policy;
+            const st = &self.staged;
+            const staged = st.layer != null and st.layer.? == layer;
+            st.layer = null;
+            try w.staged_mark.resize(a, self.n_experts);
+            @memset(w.staged_mark.items, false);
+            if (staged) for (st.experts.items) |e| {
+                w.staged_mark.items[e] = true;
+            };
+            w.order.clearRetainingCapacity();
+            w.bounds.clearRetainingCapacity();
+            try w.bounds.append(a, 0);
+            for ([_]bool{ true, false }) |resident| {
+                for (w.distinct.items) |e| if ((policy.slotOf(e) != null) == resident and !w.staged_mark.items[e]) {
+                    if (w.order.items.len - w.bounds.items[w.bounds.items.len - 1] == group_n) try w.bounds.append(a, @intCast(w.order.items.len));
+                    try w.order.append(a, e);
+                };
+                if (w.order.items.len > w.bounds.items[w.bounds.items.len - 1]) try w.bounds.append(a, @intCast(w.order.items.len));
+                if (!resident or !staged) continue;
+                // The staged routes' groups, between the residents' and the rest's.
+                for (0..st.n_routes) |ri| {
+                    try w.order.appendSlice(a, st.experts.items[st.bounds[ri]..st.bounds[ri + 1]]);
+                    try w.bounds.append(a, @intCast(w.order.items.len));
+                }
+            }
+            const n_groups = w.bounds.items.len - 1;
+            try w.egroup.resize(a, self.n_experts);
+            for (0..n_groups) |gi| for (w.order.items[w.bounds.items[gi]..w.bounds.items[gi + 1]], w.bounds.items[gi]..) |e, i| {
+                w.first.items[e] = @intCast(i);
+                w.egroup.items[e] = @intCast(gi);
+            };
+            try w.groute.resize(a, n_groups);
+            @memset(w.groute.items, null);
+            var live: usize = 0;
+            errdefer for (w.groute.items) |rt| if (rt) |r| self.stream.release(r);
+            if (staged) {
+                // The staged groups follow the residents' (`order` above).
+                var gi: usize = 0;
+                while (w.bounds.items[gi] < w.order.items.len and policy.slotOf(w.order.items[w.bounds.items[gi]]) != null) gi += 1;
+                for (st.routes[0..st.n_routes], gi..) |r, gs| w.groute.items[gs] = r;
+                live = st.n_routes;
+            }
+            st.n_routes = 0;
             w.pos.clearRetainingCapacity();
             for (w.kept.items) |o| g.release(o);
             w.kept.clearRetainingCapacity();
-            const n_distinct = w.distinct.items.len;
-            const n_groups = (n_distinct + group_n - 1) / group_n;
+            // The routed rows bucketed by group once (a counting sort, each group's rows in row order).
+            try w.group_at.resize(a, n_groups + 1);
+            @memset(w.group_at.items, 0);
+            for (w.ids.items) |e| w.group_at.items[@as(usize, w.egroup.items[e]) + 1] += 1;
+            for (1..n_groups + 1) |gi| w.group_at.items[gi] += w.group_at.items[gi - 1];
+            try w.by_group.resize(a, n_ids);
+            try w.slot.resize(a, n_groups);
+            @memcpy(w.slot.items, w.group_at.items[0..n_groups]);
+            for (w.ids.items, 0..) |e, row| {
+                const gi = w.egroup.items[e];
+                w.by_group.items[w.slot.items[gi]] = @intCast(row);
+                w.slot.items[gi] += 1;
+            }
             const depth: usize = self.opt.wide_depth;
-            var routes: [expert_stream.max_wide_depth]?*S.Route = @splat(null);
-            errdefer for (&routes) |*rt| if (rt.*) |r| {
-                self.stream.release(r);
-                rt.* = null;
-            };
-            for (0..@min(depth, n_groups)) |gi| routes[gi % depth] = try self.stream.route(layer, groupOf(w.distinct.items, gi, group_n), &.{});
+            // Routes ahead, in group order, while windows are free.
+            var next: usize = 0;
+            const ahead = struct {
+                fn f(slf: *Self, wd: *Wide, lyr: u32, nxt: *usize, lv: *usize, dp: usize) !void {
+                    while (nxt.* < wd.groute.items.len and (wd.groute.items[nxt.*] != null or lv.* < dp)) : (nxt.* += 1) {
+                        if (wd.groute.items[nxt.*] != null) continue;
+                        wd.groute.items[nxt.*] = try slf.stream.route(lyr, wd.order.items[wd.bounds.items[nxt.*]..wd.bounds.items[nxt.* + 1]], &.{});
+                        lv.* += 1;
+                    }
+                }
+            }.f;
+            try ahead(self, w, layer, &next, &live, depth);
+            pt.chargeRouted(.route, tp);
             for (0..n_groups) |gi| {
-                const start = gi * group_n;
-                const group = groupOf(w.distinct.items, gi, group_n);
-                const r = routes[gi % depth].?;
+                const start = w.bounds.items[gi];
+                const r = w.groute.items[gi].?;
+                const tw = pt.now();
                 for (0..r.n_parts) |p| {
                     try self.stream.waitGu(r, @intCast(p));
                     try self.stream.waitDown(r, @intCast(p));
                 }
+                pt.chargeRouted(.wait, tw);
+                const tc = pt.now();
                 var refs: [max_route_ids]SlotRef = undefined;
                 _ = self.stream.refsOf(r, &refs);
                 const k0 = w.kept.items.len;
@@ -387,9 +607,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     w.slot.clearRetainingCapacity();
                     w.act.clearRetainingCapacity();
                     const p0 = w.pos.items.len;
-                    for (w.ids.items, 0..) |e, row| {
-                        const fi: usize = @intCast(w.first.items[e]);
-                        if (fi < start or fi >= start + group.len) continue;
+                    for (w.by_group.items[w.group_at.items[gi]..w.group_at.items[gi + 1]]) |row| {
+                        const fi: usize = @intCast(w.first.items[w.ids.items[row]]);
                         const ref = refs[fi - start];
                         if (ref.bank != kind) continue;
                         try w.slot.append(a, ref.row);
@@ -408,20 +627,50 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     std.debug.assert(w.pos.items.len - p0 == w.slot.items.len);
                 }
                 try self.math.finishPrefill(g);
+                pt.chargeRouted(.encode, tc);
+                const td = pt.now();
                 // The group's waves drained before its slots go back (the next route may refill them).
                 try g.evalAll(w.kept.items[k0..]);
+                pt.chargeRouted(.compute, td);
                 g.resetTo(m);
+                const tr = pt.now();
                 self.stream.release(r);
-                routes[gi % depth] = null;
-                if (gi + depth < n_groups) routes[gi % depth] = try self.stream.route(layer, groupOf(w.distinct.items, gi + depth, group_n), &.{});
+                w.groute.items[gi] = null;
+                live -= 1;
+                try ahead(self, w, layer, &next, &live, depth);
+                pt.chargeRouted(.route, tr);
+            }
+            try w.inv.resize(a, n_ids);
+            // On the GPU the combine reads each routed row where its group's call left it (no join).
+            if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0 and w.kept.items.len <= max_combine_parts) {
+                const tb = pt.now();
+                defer if (pt.enabled) pt.chargeRouted(.combine, tb);
+                var j: usize = 0;
+                for (w.kept.items, 0..) |part, pi| for (0..@intCast(g.shapeOf(part).dim(0))) |row| {
+                    w.inv.items[w.pos.items[j]] = @as(u32, @intCast(pi)) << 24 | @as(u32, @intCast(row));
+                    j += 1;
+                };
+                const loc = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
+                const out = try combineOnGpu(&self.combine_kernel, g, w.kept.items, loc, scores, n, k, self.hidden, g.dtypeOf(x));
+                // The combine holds the parts until it is evaluated.
+                for (w.kept.items) |o| g.release(o);
+                w.kept.clearRetainingCapacity();
+                return out;
             }
             // The join: every routed row's output in routed order, then the combine in token slices.
+            const tj = pt.now();
             const joined = try g.concat(w.kept.items, 0);
             try g.evalAll(&.{joined});
+            pt.chargeRouted(.join, tj);
+            const tb = pt.now();
+            defer if (pt.enabled) pt.chargeRouted(.combine, tb);
             for (w.kept.items) |o| g.release(o);
             w.kept.clearRetainingCapacity();
-            try w.inv.resize(a, n_ids);
             for (w.pos.items, 0..) |p, j| w.inv.items[p] = @intCast(j);
+            if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0) {
+                const inv = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
+                return combineOnGpu(&self.combine_kernel, g, &.{joined}, inv, scores, n, k, self.hidden, g.dtypeOf(x));
+            }
             var outs: std.ArrayList(T) = .empty;
             defer outs.deinit(a);
             const ts: u32 = @intCast(glm.combine_slice_tokens);
@@ -437,9 +686,56 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             return if (outs.items.len == 1) outs.items[0] else g.concat(outs.items, 0);
         }
 
-        fn groupOf(d: []const u16, gi: usize, group_n: usize) []const u16 {
-            const s0 = gi * group_n;
-            return d[s0..@min(s0 + group_n, d.len)];
-        }
     };
+}
+
+test "glm experts: the wide lane's GPU combine over its parts equals the op chain's bits at GLM-5.3's hidden size" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try ops.MlxOps.init(a, s);
+    defer g.deinit();
+    var slot: ?mlx.mlx_fast_metal_kernel = null;
+    defer if (slot) |kern| {
+        _ = mlx.mlx_fast_metal_kernel_free(kern);
+    };
+    const n: u32 = 300;
+    const k: u32 = glm.routed_top_k;
+    const hidden: c_int = 6144;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+    const yv = try a.alloc(f32, n * k * @as(usize, @intCast(hidden)));
+    defer a.free(yv);
+    for (yv) |*v| v.* = rand.floatNorm(f32);
+    const wv = try a.alloc(f32, n * k);
+    defer a.free(wv);
+    for (wv) |*v| v.* = rand.float(f32);
+    // The joined rows in a shuffled order and its inverse, as the wide lane's groups leave them.
+    const inv = try a.alloc(u32, n * k);
+    defer a.free(inv);
+    for (inv, 0..) |*v, i| v.* = @intCast(i);
+    rand.shuffle(u32, inv);
+    const joined = try g.astype(try g.hostArray(std.mem.sliceAsBytes(yv), &.{ @intCast(n * k), hidden }, .float32), .bfloat16);
+    const scores = try g.hostArray(std.mem.sliceAsBytes(wv), &.{ @intCast(n), @intCast(k) }, .float32);
+    const ord = try g.hostArray(std.mem.sliceAsBytes(inv), &.{@intCast(n * k)}, .uint32);
+    // The rows in 3 parts, each row's place as (part, row).
+    const cuts = [_]c_int{ 0, 700, 1900, @intCast(n * k) };
+    var parts: [3]ops.MlxOps.T = undefined;
+    for (&parts, 0..) |*p, i| p.* = try g.slice(joined, &.{ cuts[i], 0 }, &.{ cuts[i + 1], hidden }, &.{ 1, 1 });
+    const locv = try a.alloc(u32, n * k);
+    defer a.free(locv);
+    for (inv, locv) |r, *l| {
+        const pi: u32 = if (r < cuts[1]) 0 else if (r < cuts[2]) 1 else 2;
+        l.* = pi << 24 | (r - @as(u32, @intCast(cuts[pi])));
+    }
+    const loc = try g.hostArray(std.mem.sliceAsBytes(locv), &.{@intCast(n * k)}, .uint32);
+    const got = try combineOnGpu(&slot, &g, &parts, loc, scores, n, k, hidden, .bfloat16);
+    const y = try g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), hidden });
+    const want = try g.astype(try g.sum(try g.mul(y, try g.expandDims(scores, -1)), -2, false), .bfloat16);
+    const same = try g.astype(try g.equal(got, want), .float32);
+    const all = try g.sum(try g.sum(same, -1, false), -1, false);
+    var out: [1]f32 = undefined;
+    _ = try g.hostF32(all, &out);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(n * @as(u32, @intCast(hidden)))), out[0]);
 }

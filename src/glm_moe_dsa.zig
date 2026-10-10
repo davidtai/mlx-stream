@@ -22,15 +22,51 @@ pub const group_size = 64;
 pub const latent_norm_eps: f32 = 1e-6;
 pub const index_norm_eps: f32 = 1e-6;
 
-/// The prompt pass's shape (the graph runs it, the bill charges it): query blocks whose score arrays (the indexer's
-/// fp32 heads, the latent attention's heads, over every key) stay under `score_budget_bytes`; the routed experts in
-/// calls of at most `moe_chunk_tokens` tokens (a longer prompt's layer runs several, each reading the records it routes
-/// that are not resident); a routed group's rows through the gather math in slices of at most `group_slice_rows`; the
-/// weighted combine in slices of `combine_slice_tokens` tokens.
+/// The prompt pass's shape (the graph runs it, the bill charges it): layer-major calls of at most `prompt_call_rows`
+/// rows (`promptCallRows`); on the DSA kernels (`dsaKernelsFit`) each layer's attention in spans of query rows whose
+/// own arrays stay under `span_target_bytes` (`promptSpanRows`), else in query blocks whose score arrays (the
+/// indexer's fp32 heads, the latent attention's heads, over every key) stay under `score_budget_bytes`; a routed
+/// group's rows through the gather math in slices of at most `group_slice_rows`; the weighted combine in slices of
+/// `combine_slice_tokens` tokens.
+pub const prompt_call_rows: u64 = 16384;
+/// A last call shorter than this joins the call before it: a call re-reads every expert it routes that the call before
+/// it held in a transient row.
+pub const prompt_tail_rows: u64 = 2048;
+pub const span_target_bytes: u64 = 2 << 30;
 pub const score_budget_bytes: u64 = 256 << 20;
-pub const moe_chunk_tokens: u64 = 16384;
 pub const group_slice_rows: u64 = 16384;
 pub const combine_slice_tokens: u64 = 2048;
+
+/// The rows of the prompt pass's call at row `at` of a `total`-row prompt: `prompt_call_rows`, or every row left when
+/// fewer than `prompt_call_rows + prompt_tail_rows` are.
+pub fn promptCallRows(total: u64, at: u64) u64 {
+    const left = total - at;
+    return if (left < prompt_call_rows + prompt_tail_rows) left else prompt_call_rows;
+}
+
+/// The most rows a prompt call of a `tokens`-token prompt runs.
+pub fn maxPromptCallRows(tokens: u64) u64 {
+    return @min(tokens, prompt_call_rows + prompt_tail_rows - 1);
+}
+
+/// One query row's part of a prompt span's own arrays over `positions` keys (the DSA kernels): the indexer's f32 score
+/// and its partition over every position read, the absorbed query and its roped part, the latent output, the output
+/// per head and its transpose for the output projection.
+pub fn promptSpanRowBytes(c: *const Config, positions: u64) u64 {
+    return 8 * positions + @as(u64, c.n_heads) * (2 * @as(u64, c.kv_lora_rank) + c.qk_rope_head_dim + 2 * @as(u64, c.v_head_dim)) * 2;
+}
+
+/// The query rows of one prompt span of a `rows`-row call over at most `positions` keys: its arrays under
+/// `span_target_bytes`, at least one row.
+pub fn promptSpanRows(c: *const Config, rows: u64, positions: u64) u64 {
+    return @max(1, @min(rows, span_target_bytes / promptSpanRowBytes(c, positions)));
+}
+
+/// The DSA kernels (`mlx_host.dsa_nax`) serve these dims: the 512-wide latent with a 64-wide roped key, heads in
+/// halves of 32, the indexer's 128-wide keys.
+pub fn dsaKernelsFit(c: *const Config) bool {
+    return c.kv_lora_rank == 512 and c.qk_rope_head_dim == 64 and c.n_heads % 32 == 0 and c.index_head_dim == 128;
+}
 
 /// The query rows of one attention block over `keys` keys: the widest score array (`heads` x rows x keys, fp32) under
 /// `score_budget_bytes`, at least one row.
@@ -858,4 +894,34 @@ var tiny_text_buf: [8192]u8 = undefined;
 fn tinyText() ![]const u8 {
     var fba = std.heap.FixedBufferAllocator.init(&tiny_text_buf);
     return tinyConfigJson(fba.allocator(), tiny_quant);
+}
+
+test "glm prompt shape: calls of 16,384 rows with a short tail joined; spans under their target; the kernels fit GLM-5.3" {
+    const a = std.testing.allocator;
+    var calls: std.ArrayList(u64) = .empty;
+    defer calls.deinit(a);
+    for ([_]struct { total: u64, want: []const u64 }{
+        .{ .total = 16387, .want = &.{16387} },
+        .{ .total = 18431, .want = &.{18431} },
+        .{ .total = 18432, .want = &.{ 16384, 2048 } },
+        .{ .total = 40000, .want = &.{ 16384, 16384, 7232 } },
+    }) |cs| {
+        calls.clearRetainingCapacity();
+        var at: u64 = 0;
+        while (at < cs.total) : (at += calls.items[calls.items.len - 1]) try calls.append(a, promptCallRows(cs.total, at));
+        try std.testing.expectEqualSlices(u64, cs.want, calls.items);
+        try std.testing.expect(maxPromptCallRows(cs.total) >= std.mem.max(u64, calls.items));
+    }
+    const text = try testConfigJson(a, "");
+    defer a.free(text);
+    var c = try Config.parse(a, text, &glm53, null);
+    defer c.deinit(a);
+    try std.testing.expect(dsaKernelsFit(&c));
+    // 16K positions: 8 B a position and 204,800 B of the attention's own arrays a row.
+    try std.testing.expectEqual(@as(u64, 8 * 16387 + 204800), promptSpanRowBytes(&c, 16387));
+    for ([_]u64{ 16387, 262144, 1048576 }) |p| {
+        const rows = promptSpanRows(&c, 16384, p);
+        try std.testing.expect(rows * promptSpanRowBytes(&c, p) <= span_target_bytes and (rows + 1) * promptSpanRowBytes(&c, p) > span_target_bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 100), promptSpanRows(&c, 100, 16387));
 }
