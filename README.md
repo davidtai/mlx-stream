@@ -191,6 +191,14 @@ EXL3 snapshot (mcg trellis experts at K3 or K4, 4 ranks) into an EXL3 pack: one 
 `--mtp-only --from-pack <EXL3 pack> --dst <affine pack>/mtp` writes the MTP layer alone (its residents, its experts
 in `mtp-experts.bin`, `mtp-manifest-exl3-v1.json`) for the MTP draft lane of an affine pack.
 
+`scripts/convert_glm_mxfp4_bank.py --src <MXFP4 snapshot> --dst <pack> --verify all` converts the compressed-tensors
+MXFP4 snapshot (`RedHatAI/GLM-5.3-MXFP4`: FP4 E2M1 codes, an E8M0 scale per 32 inputs) into an MXFP4 pack: one
+six-segment record per routed expert in `experts.bin` with `expert-manifest-mxfp4-v1.json`, the residents under MLX's
+mxfp4 labels (`.weight` U32, `.scales` U8, the bytes unchanged) and the MTP layer in `mtp/`. It needs Python 3 only.
+`docs/glm53-mxfp4-pack-format.md` gives the format. Its tests: `scripts/test_convert_glm_mxfp4_bank.py`.
+`scripts/test_glm_mxfp4_packing.py` checks on the release's own bytes that MLX's mxfp4 reads them as
+compressed-tensors does (needs the network, torch and compressed-tensors).
+
 ## Layout
 
 ```
