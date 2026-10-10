@@ -2421,7 +2421,8 @@ pub const Sentinel = struct {
                 self.errors += 1;
                 continue;
             };
-            self.ticks += 1;
+            // Atomic: a caller may watch the count while the thread runs.
+            @atomicStore(u32, &self.ticks, self.ticks + 1, .release);
             if (@max(r.f0, r.f1) - @min(r.f0, r.f1) > box_mark_stable_bytes) self.unstable += 1;
             if (self.peak == null or sentinelRise(self.base, r) > sentinelRise(self.base, self.peak.?)) {
                 self.peak = r;
@@ -2675,9 +2676,11 @@ test "dsv41 memory: the sentinel reads vm_stat through posix_spawn, starts and s
         try testing.expect(live.physical() > 0 and live.physical() <= sdk.memory.totalMemBytes());
     }
     std.debug.print("\nsentinel reading (posix_spawn vm_stat): {d:.2} ms each\n", .{secondsSince(testing.io, t0) * 1000 / 4});
-    // The thread over two periods, quiet on the host: it read, judged and stopped.
+    // The thread read, judged and stopped. Wait for its first reading, not a fixed span: a loaded
+    // CI runner oversleeps the 50 ms slices of a period.
     const s = try Sentinel.start(testing.allocator, "host test");
-    sleepMs(2 * sentinel_period_ms + 150);
+    var waited: u32 = 0;
+    while (@atomicLoad(u32, &s.ticks, .acquire) == 0 and waited < 20_000) : (waited += 50) sleepMs(50);
     const sum = s.stop(testing.allocator);
     try testing.expect(sum.ticks >= 1 and sum.errors == 0);
     // The peak line names the peak's own tick (served run 14's printed the final count).
