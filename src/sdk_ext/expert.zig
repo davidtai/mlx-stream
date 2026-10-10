@@ -104,6 +104,13 @@ pub const Stats = struct {
     spec_bytes: u64 = 0,
     spec_issued: u64 = 0,
     spec_landed: u64 = 0,
+    /// The lookahead's records no demand read claimed: dropped while queued, abandoned while read, read and never
+    /// served (the waste's attribution); demand ranges read straight into their rows (`io.Options.direct`).
+    spec_expired: u64 = 0,
+    spec_abandoned: u64 = 0,
+    spec_discarded: u64 = 0,
+    spec_cancelled: u64 = 0,
+    direct_ranges: u64 = 0,
     adopt_ranges: u64 = 0,
     adopt_bytes: u64 = 0,
     /// Pre-read ranges queued, served to a demand read, dropped unbound.
