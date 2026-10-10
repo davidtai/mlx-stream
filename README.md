@@ -184,6 +184,11 @@ scripts/convert_glm_bank.py --src <snapshot> --dst <pack> --verify all \
 `--resume` continues a stopped run. `docs/glm53-pack-format.md` gives the format. The converter's tests:
 `python -I -m pytest scripts/test_convert_glm_bank.py` (needs mlx, numpy, pytest).
 
+`scripts/convert_glm_exl3_bank.py --src <EXL3 snapshot> --dst <pack> --residents-from <affine pack>` converts the
+EXL3 snapshot (mcg trellis experts at K3 or K4, 4 ranks) into an EXL3 pack: one record per mini-expert in
+`experts.bin`, hard links to the residents of an affine pack on the same filesystem and `mtp-residents.safetensors`.
+`docs/glm53-exl3-pack-format.md` gives the format. Its tests: `scripts/test_convert_glm_exl3_bank.py`.
+
 ## Layout
 
 ```
