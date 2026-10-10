@@ -16,8 +16,6 @@ const prefill_math = @import("math.zig");
 const shared_experts = @import("../deepseek_v41/experts.zig");
 const moe = @import("moe.zig");
 const prefill_combine = @import("prefill_combine.zig");
-const decode_barrier = @import("decode_barrier.zig");
-const barrier_residual = @import("barrier_residual.zig");
 const gpu_warm = @import("gpu_warm.zig");
 
 pub const family = "mlx-stream";
@@ -42,33 +40,25 @@ pub const Options = struct {
     /// +phase-rows: the decode phase's rows per routed layer (each >= the prompt's), installing the transient release
     /// and the boundary's growth (`beginDecode`); null = the control (one row vector for both phases).
     decode_rows: ?[]const u32 = null,
-    /// Lever 2: the decode-start residency (`stream.DecodeSeed`; `.prompt_counts` is the control).
-    decode_seed: stream_mod.DecodeSeed = .prompt_counts,
     /// The prompt pass's tile drains (`prefill_math.Drain`; `.sync` is the control).
     prefill_drain: prefill_math.Drain = .sync,
     /// The prompt pass's routed combine (`prefill_combine.Route`; `.stock` is the control).
     prefill_combine: prefill_combine.Route = .stock,
     /// The expert tiles' bank view (`prefill_math.BankView`; `.full` is the control).
     prefill_bank_view: prefill_math.BankView = .full,
-    /// Lever 4a: the prompt pass's group order (`stream.GroupOrder`; `.hot` is the control).
-    prefill_group_order: stream_mod.GroupOrder = .hot,
     /// P7: the prompt pass's read schedule (`stream.ReadSchedule`; `.current` is the control).
     prefill_read_schedule: stream_mod.ReadSchedule = .current,
     /// X20: `auto`'s prompt-length threshold (`stream.AutoSchedule`); read for `auto` only.
     prefill_read_schedule_threshold: u32 = stream_mod.default_read_schedule_threshold,
     /// P7: the prompt pass's MLX temporaries (`settings.Scratch`; `.fresh` is the control).
     prefill_scratch: @import("settings.zig").Scratch = .fresh,
-    /// K6 (mimo/k6-commits): the decode lane's command-buffer commits (`decode_barrier.Commits`; `.mlx` is the control).
-    decode_commits: decode_barrier.Commits = .mlx,
-    /// K7: the decode lane's routing-barrier wait and its LUT rewrite (`decode_barrier.MissIssue`; `.host` is the control).
-    decode_miss_issue: decode_barrier.MissIssue = .host,
     /// R2 (rows audit): with `decode_rows`, the boundary (`beginDecode`) releases the prompt's scratch and leaves the
     /// growth to `finishGrow` (the decode phase's first forward); false = the control (the growth at the boundary).
     defer_grow: bool = false,
     /// R3 (rows audit): with `decode_rows`, decode's window 0 rows (`stream.DecodeWindow`; `.route` is the control).
     decode_window: stream_mod.DecodeWindow = .route,
-    /// X12 (mimo/gpu-warm): keep the GPU busy while the stream's gated parts and read-ahead wait for their bytes, and/or
-    /// tick it periodically (`gpu_warm.Route`; `.off` is the control).
+    /// Keep the GPU busy while the stream's gated parts and read-ahead wait for their bytes (`gpu_warm.Route`; `.off`
+    /// is the control).
     gpu_keep_warm: gpu_warm.Route = .off,
     /// X19 (mimo/router-bf16): the decode lookahead predictor's router (`prefill_math.PredictRoute`; `.f32` is the
     /// control: the gate table holds the transposed F32 copies; `.bf16`: the routers' BF16 weights).
@@ -106,12 +96,6 @@ pub fn decodeLane(nt: u32, decoding: bool) bool {
 pub const Gate = Experts.Gate;
 // The shared scheduler's wide-call profile is MiMo's (`Math.Profile`, a pub decl), and every MiMo probe follows the
 // one profile switch (`sdk.plugin_profile`): a served build compiles none of them.
-// K6 / K7: the shared scheduler reaches MiMo's decode barrier and LUT routes through pub decls it tests with @hasDecl
-// (a non-pub decl would silently compile the inline control sequence instead).
-comptime {
-    if (!@hasDecl(prefill_math.Math, "decodeCommit") or !@hasDecl(prefill_math.Math, "decodeRead") or !@hasDecl(prefill_math.Math, "decodeWave")) @compileError("mimo_v2: the shared scheduler would not see MiMo's decode barrier");
-    if (!@hasDecl(stream_mod.StreamSource, "residentLutInto")) @compileError("mimo_v2: the shared scheduler would not see MiMo's LUT route");
-}
 comptime {
     if (!@hasDecl(prefill_math.Math, "Profile") or prefill_math.Math.Profile != prefill_math.Profile) @compileError("mimo_v2: the shared scheduler would not see MiMo's profile hook");
     if (prefill_math.Profile.enabled != @import("sdk").plugin_profile or profile.enabled != @import("sdk").plugin_profile) @compileError("mimo_v2: a profile probe outside the plugin's profile switch");
@@ -246,7 +230,7 @@ pub fn validateGatesFor(g: anytype, geometry: bank_mod.Geometry, gates: []const 
 
 /// Conservative explicit array payloads and host metadata for the installed
 /// combine route (`workspaceBytesFor`).
-/// mimo/prefill-attn2 (`prefill_attention_evals: "spanned"`): the predictor's router tiles evaluated in one eval hold
+/// `prefill_predict_evals: one`: the predictor's router tiles evaluated in one eval hold
 /// every tile's workspace at once: the tiles past the first (which `memoryBillForTokens` charges), each at the full
 /// `predict_rows` tile's rate (geometric: no tile is credited for being shorter).
 pub fn predictorOneEvalExtraBytes(g: bank_mod.Geometry, tokens: u32) u64 {
@@ -483,8 +467,6 @@ pub const Source = struct {
         self.sdk_stream = try stream_mod.Stream.init(a, &self.sdk_bank, stream_opts);
         errdefer self.sdk_stream.deinit();
         self.stream_source = stream_mod.StreamSource.init(self.sdk_stream);
-        try self.stream_source.installSeed(opts.decode_seed, top_k);
-        try self.stream_source.installGroupOrder(opts.prefill_group_order);
         try self.stream_source.installReadSchedule(opts.prefill_read_schedule, opts.prefill_read_schedule_threshold);
         switch (opts.prefill_scratch) {
             .fresh => {},
@@ -520,12 +502,6 @@ pub const Source = struct {
         errdefer math.deinit(&self.g);
         math.drain = try prefill_math.drains(opts.prefill_drain);
         math.bank_view = try prefill_math.bankViews(opts.prefill_bank_view);
-        // K6 / K7: the decode lane's commits and barrier wait, bound once; "layer" proves on the GPU stream that the
-        // limits it writes are the ones MLX's compiled commit test reads (`decode_barrier.selfCheck`), else refuses.
-        math.barrier = try decode_barrier.Routes(ops.MlxOps).of(opts.decode_commits, opts.decode_miss_issue);
-        if (opts.decode_commits == .layer) _ = try decode_barrier.selfCheck(stream);
-        if (opts.decode_miss_issue == .event) try self.stream_source.installLutDelta();
-        if (comptime barrier_residual.enabled) barrier_residual.noteRoutes(@tagName(opts.decode_commits), @tagName(opts.decode_miss_issue));
         self.parts_combine = switch (opts.prefill_combine) {
             .stock => partsCombineStock,
             .fused => blk: {
@@ -904,7 +880,7 @@ test "mimo event bill receipt: fixed124 default BF16 terms and source ABI" {
     defer b.free(std.testing.allocator);
     const rows: @import("sdk").Rows = .{ .prompt = 124, .decode = 124 };
     const bound = b.processBound(rows);
-    try std.testing.expectEqual(@as(usize, 35), b.terms.len); // + the MTP lane's workspace, fp8res's prompt weights, the embedding rows and the warm engine (zero off their tiers / routes)
+    try std.testing.expectEqual(@as(usize, 34), b.terms.len); // + the MTP lane's workspace, fp8res's prompt weights and the warm engine (zero off their tiers / routes)
     // stack-next9: the default P7 pooled scratch bills the prompt phase's MLX cache at the pool's limit (2 GiB, +1.75 GiB
     // over next8's 92.64 GB at these rows).
     try std.testing.expect(bound < 96_000_000_000);

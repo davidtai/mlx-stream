@@ -160,34 +160,6 @@ pub fn attentionSpanRows(kv_heads: u32, mode: mimo.Attention, call_rows: u64) u3
     return @intCast(@max(1, @min(rows, span_target_bytes / spanRowBytes(kv_heads))));
 }
 
-// ---- prefill_attention_evals (mimo/prefill-attn2): begin ----
-
-/// How the NAX prompt route evaluates a call, chosen once at construction (settings `"prefill_attention_evals"`):
-/// `.tiled` (the control, the default): every 512-row query tile projects q, runs the kernel, projects o and is
-/// evaluated before the next tile's graph is built (32 evals per layer at 16,384 rows, plus the join's), and the
-/// read-ahead predictor evaluates and reads back each of its 2,048-row router tiles (8 evals per layer).
-/// `.spanned`: q is projected once over the call and o once over the joined kernel outputs; the kernel still runs per
-/// `query_tile_rows` tile over the span rule's K/V view (global: the IOGPU dispatch bound; sliding: the ring's 512-row
-/// span, whose K/V projections stay per span), each tile committed (async eval) and the one before it waited (two in
-/// flight), and the layer's output is evaluated once; the predictor's router tiles are evaluated in one eval. The same
-/// rows, kernels and elementwise ops; only the q and o GEMMs change M (proof and classification:
-/// reports/.../mimo/prefill-attn2-20261008/REPORT.md). Anything else refuses by name.
-pub const Evals = enum { tiled, spanned, invalid };
-
-/// The bytes `.spanned` holds beyond the tiled control for one call of `call_rows` (<= 16,384) rows, all counted live
-/// at once (geometric, no ordering credit): q over the call (heads x head_dim BF16 per row), every tile's kernel
-/// output kept for the join and the joined copy (2 x heads x value_dim BF16), o over the call (hidden BF16), and a
-/// second tile in flight: its roped q and rotary temporaries (heads x (head_dim + 5 x 64) BF16 per row, as
-/// `spanRowBytes` counts K's) and its key-range pass state (`passStateBillBytes`, two live per tile).
-pub fn spannedEvalBytes(hidden: u64, reserve: u64) u64 {
-    if (reserve == 0) return 0;
-    const rows: u64 = @min(reserve, @as(u64, mimo.prefill_max_tokens));
-    const tile: u64 = @min(rows, @as(u64, query_tile_rows));
-    return rows * (heads * (head_dim + 2 * value_dim) * 2 + hidden * 2) +
-        tile * heads * (head_dim + 5 * 64) * 2 + passStateBillBytes(reserve);
-}
-// ---- prefill_attention_evals: end ----
-
 /// Key-block boundaries of the passes over `nk` key blocks (the donor's rule): one dispatch for a band or a grid too
 /// small to drift apart, else ~8,192-key passes.
 pub fn passEdges(out: *[max_passes + 1]c_int, groups: c_int, nk: c_int, window: c_int) []const c_int {

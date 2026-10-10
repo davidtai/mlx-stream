@@ -33,7 +33,7 @@ const top_k: c_int = 8;
 /// MLX gemv's threadgroups for the [256, 4096] F32 router at M = 1 (`gemv_axbpy`: K >= 16 N -> bm 1, bn 8; tm 4): 64.
 pub const router1_groups: c_int = @divExact(experts, 4);
 
-// ---- registry: the texts and their pins (kernels/manifest-glue.json, shared with sliding.zig) ----
+// ---- registry: the texts and their pins (kernels/manifest-glue.json) ----
 
 pub const texts = struct {
     pub const manifest = @embedFile("kernels/manifest-glue.json");
@@ -45,8 +45,8 @@ pub const texts = struct {
     pub const router_rows = @embedFile("kernels/mimo_glue_router_rows.metal");
     pub const top8 = @embedFile("kernels/mimo_glue_top8.metal");
 };
-/// sha256 of kernels/manifest-glue.json, which records every K2 and K3 text's sha256 (checked against the pins by a CPU test).
-pub const manifest_sha256 = "0b988c6b6d4cd5384b8268185b67fe922bb3177256131e4fbcfffb494901355b";
+/// sha256 of kernels/manifest-glue.json, which records every glue text's sha256 (checked against the pins by a CPU test).
+pub const manifest_sha256 = "561df962d8065264a93a5b002a97c566e4173c143d42721c28b8eb5fed2cd7af";
 pub const text_pins = [_]struct { file: []const u8, text: []const u8, sha256: []const u8 }{
     .{ .file = "header_mimo_glue.metal", .text = texts.header, .sha256 = "75784dde518a7b706e3276c32add41325d28e5bfaa1cff03a68dc40057bf9e51" },
     .{ .file = "mimo_glue_norm.metal", .text = texts.norm, .sha256 = "3008660a5d8e36446aa0e2b4057798655ebbaa3f01496c748e7733147ffe31a6" },
@@ -120,8 +120,8 @@ fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:
 
 /// The router's product for 1 <= M <= `max_rows` rows (`mimo_glue_router_rows`): logits [M, 256] F32 of x [M, 4096] BF16
 /// against the router's BF16 weight [256, 4096], every row in router1's accumulation (MLX gemv bm1 / bn8's), so a row's
-/// logits are its M = 1 logits bit for bit whatever M is. Installed once (settings `verify_router: bf16_gemv`, the verify's
-/// router; `predict_router: bf16`, the lookahead predictor); one launch config per M, built here.
+/// logits are its M = 1 logits bit for bit whatever M is. Installed once (settings `predict_router: bf16`, the lookahead
+/// predictor); one launch config per M, built here.
 pub const RouterRows = struct {
     kernel: Kernel = .{ .ctx = null },
     configs: [rows_cap]mlx.mlx_fast_metal_kernel_config = @splat(.{ .ctx = null }),
@@ -646,7 +646,7 @@ test "mimo glue CPU: the manifest and every K2 text match their pins" {
         };
     }
     try testing.expectEqual(text_pins.len, seen);
-    try testing.expectEqual(@as(usize, 8), m.value.kernels.len);
+    try testing.expectEqual(@as(usize, 6), m.value.kernels.len);
     try requireGeometry(.{});
     var odd: mimo.Config = .{};
     odd.rms_norm_eps = 1e-5;

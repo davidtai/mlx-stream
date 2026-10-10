@@ -14,7 +14,6 @@ const mtp_mod = @import("mtp.zig");
 const io_util = sdk.io_util;
 const dsv_bill = @import("../deepseek_v41/bill.zig");
 const prefill_attention = @import("prefill_attention.zig");
-const embed_rows = @import("embed_rows.zig");
 // The same ARM64 16 KiB CPU/GPU wiring geometry as DeepSeek on this host.
 const wireTables = dsv_bill.wireTables;
 /// DeepSeek's measured wiring cost per live buffer (`deepseek_v41_bill.zig` `wire_buffer_bytes`: the largest
@@ -55,11 +54,8 @@ pub fn archBill(a: std.mem.Allocator, io: std.Io, c: settings.Config, reserve: u
     const dir = c.expert_bank_dir orelse return error.MimoBankDir;
     const resident = try prepared.residentBytes(a, io, dir);
     // Billed by the file's actual resident bytes (any declared storage); each tensor's storage is enforced where it
-    // loads (module.zig `QLinear.load`: dtype and shape per the parsed `Storage`). R1: the rows route never loads the
-    // input table (its header is checked against the geometry where it opens, `embed_rows.Rows.open`).
-    const table: u64 = if (c.embedding == .rows) embed_rows.tableBytes(c.mimo) else 0;
-    const loaded = std.math.sub(u64, resident, table) catch return error.MimoEmbeddingRowsGeometry;
-    return archTerms(a, c, loaded, if (c.mtp_heads) try mtpHeadsBytes(a, io, dir) else 0, reserve);
+    // loads (module.zig `QLinear.load`: dtype and shape per the parsed `Storage`).
+    return archTerms(a, c, resident, if (c.mtp_heads) try mtpHeadsBytes(a, io, dir) else 0, reserve);
 }
 
 // ---- +attn (prefill_attention.zig): begin ----
@@ -73,16 +69,9 @@ pub fn attentionRouteBytes(config: settings.Config, reserve: u64) u64 {
     const c = config.mimo;
     const call = @min(reserve, @as(u64, mimo.prefill_max_tokens));
     return prefill_attention.spanRowBytes(c.n_kv_heads) * prefill_attention.attentionSpanRows(c.n_kv_heads, .full, call) +
-        prefill_attention.passStateBillBytes(reserve) + attentionEvalsBytes(config, reserve);
+        prefill_attention.passStateBillBytes(reserve);
 }
 
-/// mimo/prefill-attn2: `"prefill_attention_evals": "spanned"`'s call-span arrays and its second tile in flight
-/// (prefill_attention.zig `spannedEvalBytes`), riding the route's request bytes above; 0 on the tiled control (and on
-/// the stock route, which refuses `"spanned"`).
-pub fn attentionEvalsBytes(config: settings.Config, reserve: u64) u64 {
-    if (config.prefill_attention_evals != .spanned or config.prefill_attention == .stock or prefill_attention.defaultTakesStock(config.prefill_attention, reserve)) return 0;
-    return prefill_attention.spannedEvalBytes(config.mimo.hidden_size, reserve);
-}
 // ---- +attn: end ----
 
 fn archTerms(a: std.mem.Allocator, config: settings.Config, resident: u64, mtp: u64, reserve: u64) !sdk.MemoryBill {
@@ -97,17 +86,17 @@ fn archTerms(a: std.mem.Allocator, config: settings.Config, resident: u64, mtp: 
     // (config.requestBytes through kv.Bound.other), and wired there (`request_wiring`).
     // P7 `prefill_scratch`: MLX's cache limit per phase (the prompt pass's pool under `"pooled"`; decode keeps its own).
     const cache: [2]u64 = .{ promptCacheBytes(config), mimo.allocator_cache_bytes };
-    // X19: the transposed F32 router copy per phase (`routerF32Bytes`): both phases, or the prompt phase alone when no
-    // decode-phase forward reads it.
-    const routers = routerF32Bytes(config);
+    // The transposed F32 router copy (`Layer.promote`, 47 x [4096, 256] F32), held in both phases.
+    const router = c.routerPromotionBytes();
+    const routers: [2]u64 = .{ router, router };
     const wired: [2]u64 = .{ resident + mtp + routers[0] + cache[0] + settings.compilation_bytes, resident + mtp + routers[1] + cache[1] + settings.compilation_bytes };
-    // X12: the installed warm route (the setting, else the window environment; an invalid one is refused in validate).
-    const warm_on = (config.effectiveGpuKeepWarm() catch .off) != .off;
+    // The installed warm route (an invalid one is refused in validate).
+    const warm_on = config.gpu_keep_warm == .waits;
     const dh = decodeHostTerms(config, reserve);
     const terms = [_]Term{
         .{ .name = "residents", .bytes = .{ resident, resident }, .at_construction = true },
         .{ .name = "mtp_heads", .bytes = .{ mtp, mtp }, .at_construction = true },
-        .{ .name = "router_f32", .bytes = routers, .at_construction = config.routerCopyInDecode() },
+        .{ .name = "router_f32", .bytes = routers, .at_construction = true },
         .{ .name = "mlx_cache", .bytes = cache, .at_construction = false },
         .{ .name = "mlx_cache_overshoot", .bytes = overshoot, .at_construction = false },
         // stack-next8 M1+M2: the decode phase bills the measured host side (`decodeHostTerms`) in place of both terms.
@@ -135,25 +124,13 @@ fn archTerms(a: std.mem.Allocator, config: settings.Config, resident: u64, mtp: 
         .{ .name = "fp8_prompt_weights", .bytes = .{ fp8PromptBytes(config), fp8DecodeBytes(config) }, .at_construction = false },
         .{ .name = "mtp_workspace", .bytes = @splat(if (config.mtp_heads) laneWorkspace(c) + wireTables(laneWorkspace(c)) else 0), .at_construction = false },
         .{ .name = "request_wiring", .bytes = .{ wireTables(request.total() + attention), wireTables(request.total() - request.other + pr.other) }, .at_construction = false },
-        // R1 (rows audit): the embedding rows route's host side (`embedRowsBytes`); 0 on the table route.
-        .{ .name = "embed_rows", .bytes = embedRowsBytes(config), .at_construction = config.embedding == .rows, .construction = if (config.embedding == .rows) embed_rows.persistentBytes(config.mimo) else null },
-        // X12 (mimo/gpu-warm): the warm engine's 32 KiB buffer, library, pipeline, queue, chunks in flight and parked
+        // `gpu_keep_warm`: the warm engine's 32 KiB buffer, library, pipeline, queue, chunks in flight and parked
         // thread (`gpu_warm.bill_bytes`, declared); 0 on the control.
         .{ .name = "gpu_warm", .bytes = @splat(if (warm_on) @import("gpu_warm.zig").bill_bytes else 0), .at_construction = warm_on },
     };
     return .{ .terms = try a.dupe(Term, &terms) };
 }
 
-// ---- X19 (mimo/router-bf16): begin ----
-/// The transposed F32 router copy (`Layer.promote`, 47 x [4096, 256] F32) per phase: built at construction and held in
-/// both phases (the control and every route that reads it in decode), or, with both `predict_router: bf16` and
-/// `verify_router: bf16_gemv` (`settings.routerCopyInDecode` false), built per prompt phase and released at the decode
-/// boundary: the prompt router and predictor (MLX F32 GEMMs) still read it, no decode-phase forward does.
-pub fn routerF32Bytes(config: settings.Config) [2]u64 {
-    const router = config.mimo.routerPromotionBytes();
-    return .{ router, if (config.routerCopyInDecode()) router else 0 };
-}
-// ---- X19: end ----
 
 // ---- stack-next8 M1-M3: begin ----
 /// M1+M2: the decode phase's `host_runtime` and `compiler_runtime` bytes: the measured host side
@@ -170,19 +147,6 @@ pub fn decodeHostTerms(config: settings.Config, reserve: u64) struct { host: u64
 pub fn promptCacheBytes(config: settings.Config) u64 {
     return if (config.prefill_scratch == .pooled) mimo.prompt_pool_cache_bytes else mimo.allocator_cache_bytes;
 }
-
-// ---- rows audit R1: begin ----
-/// R1: the rows route's host bytes per phase: the gather's stages, scratch and decode-width cache (held from
-/// construction) and one lookup's staging at the phase's widest lookup: a prompt call's ids (`prefill_max_tokens`,
-/// straight from the table) or, in decode, a head's catch-up rows (window + drafts; the verify's are fewer) twice (the
-/// output and the cache's miss staging). 0 on the table route.
-pub fn embedRowsBytes(config: settings.Config) [2]u64 {
-    if (config.embedding != .rows) return .{ 0, 0 };
-    const c = config.mimo;
-    const p = embed_rows.persistentBytes(c);
-    return .{ p + embed_rows.stagingBytes(c, mimo.prefill_max_tokens), p + embed_rows.stagingBytes(c, 2 * (@as(u64, c.window) + mtp_mod.max_drafts)) };
-}
-// ---- rows audit R1: end ----
 
 // ---- rows audit R2: begin ----
 /// The FP8 prompt route's cache and its wiring (fp8_linear.PromptCache's `fp8_prompt_slots` widest projections in BF16:
@@ -380,8 +344,7 @@ fn sourceTerms(a: std.mem.Allocator, g: bank.Geometry, config: settings.Config) 
         .{ .name = "spec_staging", .bytes = @splat(s.spec_staging_bytes), .at_construction = true },
         .{ .name = "spec_runtime", .bytes = @splat(s.spec_runtime_bytes), .at_construction = true },
         .{ .name = "predictor_metadata", .bytes = @splat(s.predictor_metadata_bytes), .at_construction = true },
-        // mimo/prefill-attn2: the one-eval predictor holds every router tile of a prompt call (`prefill_attention_evals`).
-        .{ .name = "predictor_workspace", .bytes = .{ s.predictor_workspace_bytes + predictorEvalsBytes(g, config), d.predictor_workspace_bytes }, .at_construction = false },
+        .{ .name = "predictor_workspace", .bytes = .{ s.predictor_workspace_bytes, d.predictor_workspace_bytes }, .at_construction = false },
         .{ .name = "predictor_runtime", .bytes = @splat(s.predictor_runtime_bytes), .at_construction = false },
         .{ .name = "slot_wiring", .bytes = @splat(0), .at_construction = false, .with_rows = true },
     };
@@ -397,14 +360,6 @@ fn sourceTerms(a: std.mem.Allocator, g: bank.Geometry, config: settings.Config) 
 pub fn drainBytes(g: bank.Geometry, config: settings.Config) u64 {
     if (config.prefill_drain != .pipelined) return 0;
     return prefill_math.pipelinedExtraBytes(g.hidden_size, g.intermediate_size, source.max_forward_tokens);
-}
-
-/// mimo/prefill-attn2: the one-eval predictor's extra router tiles (source.zig `predictorOneEvalExtraBytes`), under
-/// `"spanned"` or `"early"` (whose tail eval holds every tile; once: the two routes never hold two predictors at once);
-/// 0 on the control. A prompt-phase term: decode makes no prompt read-ahead.
-pub fn predictorEvalsBytes(g: bank.Geometry, config: settings.Config) u64 {
-    if (config.prefill_attention_evals != .spanned and config.prefill_readahead_post != .early) return 0;
-    return source.predictorOneEvalExtraBytes(g, source.max_forward_tokens);
 }
 
 /// The phase's slot wiring: its transient rows (data[0] prompt, data[2] decode) and `rows` persistent rows.
@@ -1057,32 +1012,12 @@ test "mlx-stream MiMo bill: the bill tool prints every term and the rows per con
                     defer bon.free(a);
                     const boff = try completeBill(a, io, off, off.reserveTokens());
                     defer boff.free(a);
-                    // R1 on top: the embedding rows route (selectable; its bill drops the table from both phases).
-                    var er = on;
-                    er.embedding = .rows;
-                    const ber = try completeBill(a, io, er, er.reserveTokens());
-                    defer ber.free(a);
                     const ron: ?sdk.Rows = if (choose(bon, on, ceiling, box_stop)) |q| q.rows else |_| null;
                     const roff: ?sdk.Rows = if (choose(boff, off, ceiling, box_stop)) |q| q.rows else |_| null;
-                    const rer: ?sdk.Rows = if (choose(ber, er, ceiling, box_stop)) |q| q.rows else |_| null;
-                    std.debug.print("  ROWS_AUDIT kv={s} ctx={d} baseline={d} lane={s} control_routes={d}/{d} releases={d}/{d} releases_embedding_rows={d}/{d} decode_fixed_control={d} decode_fixed_releases={d} decode_fixed_embedding_rows={d} prompt_fixed_releases={d} prompt_fixed_embedding_rows={d}\n", .{
+                    std.debug.print("  ROWS_AUDIT kv={s} ctx={d} baseline={d} lane={s} control_routes={d}/{d} releases={d}/{d} decode_fixed_control={d} decode_fixed_releases={d} prompt_fixed_releases={d}\n", .{
                         @tagName(mode),                     ctx,                                base,                         if (lane) "mtp" else "serial",
                         if (roff) |q| q.prompt else 0,      if (roff) |q| q.decode else 0,      if (ron) |q| q.prompt else 0, if (ron) |q| q.decode else 0,
-                        if (rer) |q| q.prompt else 0,       if (rer) |q| q.decode else 0,       boff.fixed(.decode),          bon.fixed(.decode),
-                        ber.fixed(.decode),                 bon.fixed(.prompt),                 ber.fixed(.prompt),
-                    });
-                    // X19: the routers' routes on this lane: the defaults (the predictor on the BF16 weight, the verify's F32
-                    // GEMM: the copy held in decode) beside both on the BF16 weight (the copy per prompt phase).
-                    var xb = on;
-                    xb.verify_router = .bf16_gemv;
-                    const bxb = try completeBill(a, io, xb, xb.reserveTokens());
-                    defer bxb.free(a);
-                    const rxb: ?sdk.Rows = if (choose(bxb, xb, ceiling, box_stop)) |q| q.rows else |_| null;
-                    std.debug.print("  X19_ROWS kv={s} ctx={d} baseline={d} lane={s} routers_default={d}/{d} routers_both_bf16={d}/{d} decode_fixed_default={d} decode_fixed_both_bf16={d} prompt_fixed_default={d} prompt_fixed_both_bf16={d} router_f32_decode_freed={d}\n", .{
-                        @tagName(mode),                ctx,                           base,                          if (lane) "mtp" else "serial",
-                        if (ron) |q| q.prompt else 0, if (ron) |q| q.decode else 0, if (rxb) |q| q.prompt else 0, if (rxb) |q| q.decode else 0,
-                        bon.fixed(.decode),            bxb.fixed(.decode),            bon.fixed(.prompt),            bxb.fixed(.prompt),
-                        bon.fixed(.decode) - bxb.fixed(.decode),
+                        boff.fixed(.decode),                bon.fixed(.decode),                 bon.fixed(.prompt),
                     });
                 }
             }
@@ -1105,55 +1040,6 @@ test "mimo mtp bill: the lane's workspace term follows the lane (the heads stay 
     for (on.terms) |t| n += @intFromBool(std.mem.eql(u8, t.name, "mtp_heads"));
     try testing.expectEqual(@as(usize, 1), n);
     std.debug.print("MIMO_MTP_BILL heads={d} workspace={d} workspace_wired={d} per_row={d}\n", .{ 3 * mtp_mod.headPayloadBytes(c, mtp_mod.q4_storages), laneWorkspace(c), ws, on.per_row });
-}
-test "mimo prefill attn2 bill: spanned bills its call-span arrays (request) and every router tile (predictor) at 16K and 32K; tiled bills neither" {
-    const a = testing.allocator;
-    const tiled: settings.Config = .{};
-    const spanned: settings.Config = .{ .prefill_attention_evals = .spanned };
-    const g = try bank.Geometry.init(4096, 2048, 256, 1, 47);
-    // At 16,384 rows: q 402,653,184 + kept tile outputs 268,435,456 + joined 268,435,456 + o 134,217,728 + the second
-    // tile in flight 33,554,432 + its pass state 34,078,720 (keys past 12,256).
-    const call16k: u64 = 402_653_184 + 2 * 268_435_456 + 134_217_728 + 33_554_432 + 2 * 17_039_360;
-    try testing.expectEqual(call16k, prefill_attention.spannedEvalBytes(4096, 16_384));
-    // Calls are at most 16,384 rows: a 17,408 or 32,768 reservation bills the same call.
-    try testing.expectEqual(call16k, prefill_attention.spannedEvalBytes(4096, 17_408));
-    try testing.expectEqual(call16k, prefill_attention.spannedEvalBytes(4096, 32_768));
-    // Seven more 2,048-row router tiles live in the one eval.
-    const ahead: u64 = 7 * 2048 * (6 * 4096 + 20 * 256 + 16 * 8 + 8);
-    try testing.expectEqual(ahead, source.predictorOneEvalExtraBytes(g, 16_384));
-    try testing.expectEqual(@as(u64, 0), source.predictorOneEvalExtraBytes(g, 2048));
-    try testing.expectEqual(@as(u64, 0), attentionEvalsBytes(tiled, 16_384));
-    try testing.expectEqual(@as(u64, 0), attentionEvalsBytes(.{ .prefill_attention_evals = .spanned, .prefill_attention = .stock }, 16_384));
-    // `"early"` read-ahead post: its tail eval holds every router tile (the predictor term), no attention bytes; with
-    // `"spanned"` the tiles are billed once.
-    const g_early = try bank.Geometry.init(4096, 2048, 256, 1, 47);
-    try testing.expectEqual(ahead, predictorEvalsBytes(g_early, .{ .prefill_readahead_post = .early }));
-    try testing.expectEqual(ahead, predictorEvalsBytes(g_early, .{ .prefill_readahead_post = .early, .prefill_attention_evals = .spanned }));
-    try testing.expectEqual(@as(u64, 0), predictorEvalsBytes(g_early, tiled));
-    try testing.expectEqual(@as(u64, 0), attentionEvalsBytes(.{ .prefill_readahead_post = .early }, 16_384));
-    for ([_]u64{ 16_384, 17_408, 32_768 }) |reserve| {
-        const bt = try fixtureBillAt(a, tiled, 0, reserve);
-        defer bt.free(a);
-        const bs = try fixtureBillAt(a, spanned, 0, reserve);
-        defer bs.free(a);
-        try testing.expectEqual(termBytes(bt, "request")[0] + call16k, termBytes(bs, "request")[0]);
-        try testing.expectEqual(termBytes(bt, "request")[1], termBytes(bs, "request")[1]);
-        try testing.expectEqual(termBytes(bt, "predictor_workspace")[0] + ahead, termBytes(bs, "predictor_workspace")[0]);
-        try testing.expectEqual(termBytes(bt, "predictor_workspace")[1], termBytes(bs, "predictor_workspace")[1]);
-        try testing.expectEqual(bt.fixed(.decode), bs.fixed(.decode));
-        var rows: [2][2]u32 = undefined;
-        for ([_]settings.Config{ tiled, spanned }, 0..) |cfg, i| {
-            var c = cfg;
-            c.memory_baseline_bytes = 10_700_000_000;
-            const b = try fixtureBillAt(a, c, 0, reserve);
-            defer b.free(a);
-            const p = try choose(b, c, box_ceiling, box_stop);
-            rows[i] = .{ p.rows.prompt, p.rows.decode };
-        }
-        std.debug.print("MIMO_ATTN2_BILL reserve={d} spanned_request={d} spanned_predictor={d} prompt_fixed_delta={d} rows_tiled={d}/{d} rows_spanned={d}/{d} (baseline 10.7 GB)\n", .{
-            reserve, call16k, ahead, bs.fixed(.prompt) - bt.fixed(.prompt), rows[0][0], rows[0][1], rows[1][0], rows[1][1],
-        });
-    }
 }
 
 // ---- +attn (prefill_attention.zig): begin ----
@@ -1384,60 +1270,6 @@ test "mimo rows audit bill: R2 drops the FP8 prompt cache from decode, R3 bills 
     try testing.expectEqual(b0.fixed(.prompt), b1.fixed(.prompt));
 }
 
-test "mimo X19 bill: with both routers on the BF16 weight the F32 copy leaves decode (router_f32 billed in the prompt phase only, not at construction); the predictor alone moves no byte; the prompt phase is unchanged and the decode rows rise by the freed bytes" {
-    const a = testing.allocator;
-    const fp8 = fp8PackConfig();
-    const router = fp8.routerPromotionBytes();
-    try testing.expectEqual(@as(u64, 47 * 4096 * 256 * 4), router);
-    const ctl: settings.Config = .{ .mimo = fp8, .predict_router = .f32 };
-    const def: settings.Config = .{ .mimo = fp8 };
-    const both: settings.Config = .{ .mimo = fp8, .verify_router = .bf16_gemv };
-    for ([_]u64{ 16_384, 17_408, 131_072, 1_047_488 }) |reserve| {
-        const bc = try fixtureBillWith(a, ctl, fp8_pack_residents, fp8_pack_sidecar, reserve);
-        defer bc.free(a);
-        const bd = try fixtureBillWith(a, def, fp8_pack_residents, fp8_pack_sidecar, reserve);
-        defer bd.free(a);
-        const bb = try fixtureBillWith(a, both, fp8_pack_residents, fp8_pack_sidecar, reserve);
-        defer bb.free(a);
-        // The predictor on the BF16 weight alone: the copy is still the verify router's control's, every term unchanged.
-        for (bd.terms, bc.terms) |x, y| {
-            try testing.expectEqualStrings(y.name, x.name);
-            try testing.expectEqual(y.bytes, x.bytes);
-            try testing.expectEqual(y.at_construction, x.at_construction);
-        }
-        try testing.expectEqual([2]u64{ router, router }, termBytes(bc, "router_f32"));
-        try testing.expectEqual([2]u64{ router, 0 }, termBytes(bb, "router_f32"));
-        // The prompt phase is billed exactly as the control bills it; only router_f32 and its wiring move in decode.
-        for (bb.terms, bc.terms) |x, y| {
-            try testing.expectEqual(y.bytes[0], x.bytes[0]);
-            if (std.mem.eql(u8, x.name, "router_f32")) {
-                try testing.expect(y.at_construction and !x.at_construction);
-            } else if (!std.mem.eql(u8, x.name, "resident_wiring")) try testing.expectEqual(y.bytes[1], x.bytes[1]);
-        }
-        const freed = bc.fixed(.decode) - bb.fixed(.decode);
-        try testing.expect(freed >= router and freed <= router + wireTables(router) + 16_384);
-        try testing.expectEqual(bc.fixed(.prompt), bb.fixed(.prompt));
-        try testing.expectEqual(bc.constructionBytes(130) - router, bb.constructionBytes(130));
-        for ([_]u64{ 9_200_000_000, 10_000_000_000, 10_600_000_000, 12_000_000_000 }) |base| {
-            var cb = both;
-            cb.memory_baseline_bytes = base;
-            var cc = ctl;
-            cc.memory_baseline_bytes = base;
-            const pb = choose(bb, cb, box_ceiling, box_stop) catch |e| {
-                try testing.expectError(e, choose(bc, cc, box_ceiling, box_stop));
-                continue;
-            };
-            const pc = try choose(bc, cc, box_ceiling, box_stop);
-            // The prompt rows are the control's; decode gains floor..ceil of the freed bytes over a row (0.31 row).
-            try testing.expectEqual(pc.rows.prompt, pb.rows.prompt);
-            const gain = pb.rows.decode - pc.rows.decode;
-            try testing.expect(pb.rows.decode == fp8.n_routed_experts or gain >= freed / (bb.per_row + wireTables(bb.per_row)));
-            try testing.expect(gain <= (freed + bb.per_row - 1) / bb.per_row);
-            std.debug.print("MIMO_X19_ROWS ctx={d} baseline={d} control={d}/{d} both_bf16={d}/{d} freed_decode_bytes={d} rows_freed={d:.3}\n", .{ reserve, base, pc.rows.prompt, pc.rows.decode, pb.rows.prompt, pb.rows.decode, freed, @as(f64, @floatFromInt(freed)) / @as(f64, @floatFromInt(bb.per_row)) });
-        }
-    }
-}
-
 test "mimo rows audit bill: the deferred growth's catch-up fits the prompt phase at every standard context; a bill whose prompt phase would not hold it is refused by name" {
     const a = testing.allocator;
     const fp8 = fp8PackConfig();
@@ -1468,48 +1300,6 @@ test "mimo rows audit bill: the deferred growth's catch-up fits the prompt phase
     try checkDeferredGrowth(thin, serial);
 }
 
-test "mimo rows audit bill: R1 frees the input table from both phases and bills the rows route's host side; the rows rise by the freed bytes" {
-    const a = testing.allocator;
-    const fp8 = fp8PackConfig();
-    const table = embed_rows.tableBytes(fp8);
-    try testing.expectEqual(@as(u64, 1_249_902_592), table);
-    const tab: settings.Config = .{ .mimo = fp8 };
-    var rows = tab;
-    rows.embedding = .rows;
-    try rows.validate();
-    const reserve = settings.fill_reserve_tokens;
-    const bt = try fixtureBillWith(a, tab, fp8_pack_residents, fp8_pack_sidecar, reserve);
-    defer bt.free(a);
-    // archBill bills the file's residents less the table on the rows route (the table is never loaded).
-    const br = try fixtureBillWith(a, rows, fp8_pack_residents - table, fp8_pack_sidecar, reserve);
-    defer br.free(a);
-    const host = embedRowsBytes(rows);
-    try testing.expectEqual([2]u64{ 0, 0 }, termBytes(bt, "embed_rows"));
-    try testing.expectEqual(host, termBytes(br, "embed_rows"));
-    try testing.expectEqual(embed_rows.persistentBytes(fp8) + 16_384 * 4096 * 2, host[0]);
-    try testing.expectEqual(embed_rows.persistentBytes(fp8) + 2 * 131 * 4096 * 2, host[1]);
-    // The gather's stages (2.1 MB) and the decode-width cache (1,024 rows: 8.4 MB, its map over the vocabulary 0.6 MB).
-    try testing.expectEqual(@as(u64, 16 * (128 << 10) + 1024 * (8 + 32) + 1024 * (4096 * 2 + 4 + 1) + 152_576 * 4), embed_rows.persistentBytes(fp8));
-    try testing.expect(embed_rows.persistentBytes(fp8) < 12_000_000);
-    for ([_]sdk.MemoryBill.Phase{ .prompt, .decode }, 0..) |phase, i| {
-        const wiring = termBytes(bt, "resident_wiring")[i] - termBytes(br, "resident_wiring")[i];
-        try testing.expectEqual(bt.fixed(phase) - table - wiring + host[i], br.fixed(phase));
-    }
-    // The construction terms hold the gather's persistent bytes (the staging comes with a lookup).
-    try testing.expectEqual(bt.constructionBytes(100) - table + embed_rows.persistentBytes(fp8), br.constructionBytes(100));
-    for ([_]u64{ 9_200_000_000, 10_000_000_000, 12_000_000_000 }) |base| {
-        var ct = tab;
-        ct.memory_baseline_bytes = base;
-        var cr = rows;
-        cr.memory_baseline_bytes = base;
-        const pt = try choose(bt, ct, box_ceiling, box_stop);
-        const pr = try choose(br, cr, box_ceiling, box_stop);
-        // Decode frees 1.249 GB less 1 MB of staging (1.99 rows); the prompt 1.249 GB less 134 MB (1.78 rows).
-        try testing.expect(pr.rows.decode >= pt.rows.decode + 1 and pr.rows.decode <= pt.rows.decode + 2);
-        try testing.expect(pr.rows.prompt >= pt.rows.prompt + 1 and pr.rows.prompt <= pt.rows.prompt + 2);
-        std.debug.print("MIMO_ROWS_AUDIT embedding_rows baseline={d} table={d}/{d} rows={d}/{d}\n", .{ base, pt.rows.prompt, pt.rows.decode, pr.rows.prompt, pr.rows.decode });
-    }
-}
 // ---- rows audit: end ----
 
 test "mimo fp8res bill: the census counts two arrays per FP8 projection (codes + scales), one per BF16 one; the residents term is the pack's file bytes" {

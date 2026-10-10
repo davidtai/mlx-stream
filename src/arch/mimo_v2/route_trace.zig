@@ -76,8 +76,6 @@ pub const Trace = struct {
     extended_prompt: bool = false,
     io_prefill: Io = .{},
     io_decode: Io = .{},
-    decode_seed: []const u8 = "prompt_counts",
-    seed_tail_tokens: u32 = 0,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, prefix: []const u8, layers: u32, experts: u32, first_moe_layer: u32, record_bytes: u64) !Trace {
         if (experts == 0 or experts > 256 or layers < 2) return error.MimoRouteTraceShape;
@@ -317,8 +315,6 @@ pub const Trace = struct {
             .overflow = t.overflow,
             .ragged = ragged,
             .extended_prompt = t.extended_prompt,
-            .decode_seed = t.decode_seed,
-            .seed_tail_tokens = t.seed_tail_tokens,
             .mimo_io_prefill = t.io_prefill,
             .mimo_io_decode = t.io_decode,
             .identity = .{ .prompt_ids_sha256 = @as([]const u8, &t.prompt_sha256), .decode_input_ids_sha256 = @as([]const u8, &decode_sha), .decode_input_ids = t.decode_ids.items },

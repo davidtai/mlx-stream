@@ -8,7 +8,6 @@ const bank_mod = @import("bank.zig");
 const profile = @import("profile.zig");
 const moe = @import("moe.zig");
 const timeline = @import("prefill_timeline.zig");
-const decode_barrier = @import("decode_barrier.zig");
 const glue = @import("glue.zig");
 
 pub const tile_rows: u32 = 256;
@@ -267,10 +266,6 @@ pub const Math = struct {
     drain: Drains = .{ .tiles = projectTilesSync, .reduce = reduceTilesSync },
     /// The expert tiles' bank view (`BankView`), bound at construction (`Source.Options.prefill_bank_view`); full = the control.
     bank_view: *const ViewFn = fullView,
-    /// K6 / K7 (mimo/k6-commits): the decode lane's commits and routing-barrier wait (`decode_barrier.Routes`), bound at
-    /// construction (`Source.Options.decode_commits` / `decode_miss_issue`); the control is MLX's command-buffer cuts and
-    /// the blocking wait, op for op the scheduler's inline sequence.
-    barrier: decode_barrier.Routes(ops.MlxOps) = decode_barrier.Routes(ops.MlxOps).control,
     /// X19 (`predict_router`): the decode lookahead predictor's route, bound at construction (`Source.Options.predict_router`);
     /// the control (`.f32`) is `predictorScores` on the transposed F32 router copy.
     predictor: Predictor = .{},
@@ -327,26 +322,6 @@ pub const Math = struct {
         return self.fused.?.down(g, h, ids, banks);
     }
 
-    /// The shared scheduler's decode-barrier seams (`ExpertsWith.run`), through the installed `barrier` routes: the
-    /// commits ahead of the routing barrier's wait (DEVROUTE's barrier set and device hit wave; `dev` null off the hit
-    /// pass), the wait and the host's reads of the routed ids and the predictor's scores, and the host hit wave's commit.
-    pub fn decodeCommit(self: *const Math, g: *ops.MlxOps, bar: []const T, dev: ?T) !void {
-        return self.barrier.commit(g, bar, dev);
-    }
-
-    pub fn decodeRead(self: *const Math, g: *ops.MlxOps, bar: []const T, indices: T, sc: ?T, ids_out: []u16, score_out: []f32, scores: *[]const f32) ![]const u16 {
-        return self.barrier.read(g, bar, indices, sc, ids_out, score_out, scores);
-    }
-
-    pub fn decodeWave(self: *const Math, g: *ops.MlxOps, outs: []const T) !void {
-        return self.barrier.wave(g, outs);
-    }
-
-    /// A barrier set committed ahead of its call (a row-group schedule's first half: `Source.groupBegin`-style callers)
-    /// through the installed K6 packaging (`decode_barrier.Routes.commitSet`).
-    pub fn decodeCommitSet(self: *const Math, g: *ops.MlxOps, bar: []const T) !void {
-        return self.barrier.commitSet(g, bar);
-    }
 
     /// One expert's 3D bank view, shared by its bounded matrix tiles.
     fn row(g: *ops.MlxOps, p: Proj, slot: u32, in: c_int, out: c_int) !Proj {

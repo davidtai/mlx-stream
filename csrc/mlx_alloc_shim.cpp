@@ -53,10 +53,6 @@ int dsv41_alloc_uninit(mlx_array* out, const int* shape, size_t ndim, mlx_dtype 
 
 }  // extern "C"
 
-// MiMo K6 (`decode_commits`): the Metal device's command-buffer commit limits (csrc/mimo_commit_shim.inc). Kept in
-// this translation unit because the host compiles a fixed list of the plugin's csrc files; DeepSeek never calls it.
-#include "mimo_commit_shim.inc"
-
 // MiMo P7 (`prefill_combine: "inplace"`): the wide call's sources' GPU addresses (csrc/mimo_gpu_address.inc).
 #include "mimo_gpu_address.inc"
 

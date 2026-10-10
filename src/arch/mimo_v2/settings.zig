@@ -4,7 +4,6 @@ const sdk = @import("sdk");
 const mimo = @import("config.zig");
 const kv = @import("kv.zig");
 const decode_attention = @import("decode_attention.zig");
-const decode_barrier = @import("decode_barrier.zig");
 const gpu_warm = @import("gpu_warm.zig");
 const fp8_linear = @import("fp8_linear.zig");
 const PredictRoute = @import("math.zig").PredictRoute;
@@ -68,10 +67,6 @@ comptime {
 
 pub const KVMode = enum { q8, bf16, invalid };
 
-/// X19 (`verify_router`): the decode verify's router product at M = 2..4 (`f32_gemm` the control; `bf16_gemv` the
-/// M-invariant BF16 route, `glue.RouterRows`).
-pub const VerifyRouter = enum { f32_gemm, bf16_gemv, invalid };
-
 /// The MTP draft lane's acceptance tier, for every request (greedy or sampled; `sdk_ext.acceptance.acceptGeneral`):
 /// `exact` is the control, `typical` the lossy arm at `draft_delta`. Chosen once, at construction.
 pub const DraftTier = enum { exact, typical, invalid };
@@ -83,10 +78,6 @@ pub const default_draft_delta: f32 = 0.5;
 /// The trained draft depth (the pack's three MTP heads, `mtp.n_heads`): the default and the most `draft_depth` admits.
 pub const trained_draft_depth: u32 = 3;
 
-/// mimo/prefill-attn2: where a routed prompt layer's read-ahead is posted (module.zig `installTail`): `.after_predict`
-/// (the control) at the end of that layer's predictor, `.early` at the previous layer's tail, its predictor riding that
-/// tail's eval (the same records in the same order, issued one tail + edge + predict stage earlier).
-pub const ReadAheadPost = enum { after_predict, early, invalid };
 /// P7 `prefill_scratch` (Config): the prompt pass's MLX temporaries; `fresh` is the control.
 pub const Scratch = enum { fresh, pooled, invalid };
 /// P7 `prefill_predict_evals` (Config): the predictor's router tiles; `tiled` is the control.
@@ -101,8 +92,6 @@ pub const Malformed = packed struct { mtp_lane: bool = false, prefill_read_ahead
 /// R2 (mimo/decode-rows-audit): when the prompt->decode boundary grows the slot banks under the MTP lane
 /// (`Config.decode_grow`).
 pub const DecodeGrow = enum { after_draft, boundary, invalid };
-/// R1 (mimo/decode-rows-audit): the input embedding's source (`Config.embedding`).
-pub const Embedding = enum { table, rows, invalid };
 
 /// mimo/layer-rows (reports/dsv41-f39-tcq3-runtime/mimo/layer-rows-20261009): how the admitted expert rows split over the
 /// 47 routed layers, read once at construction. `.uniform` (the default and the control: every layer holds the admitted
@@ -256,10 +245,6 @@ pub const Config = struct {
     /// `beginDecode`). `"phase_rows": false` installs the control: one row count for both phases, as before.
     phase_rows: bool = true,
     // ---- +phase-rows: end ----
-    /// Lever 2 (design-hit-rate §3.2): the decode-start residency, read once at construction. `"decode_seed":
-    /// "prompt_counts"` is the control (the default); `"prompt_tail"` ranks the seed by the prompt's last
-    /// `"decode_seed_tail_tokens"` tokens (default `stream.default_seed_tail_tokens`). The ABBA arm is `seed_tail`.
-    decode_seed: @import("stream.zig").DecodeSeed = .prompt_counts,
     /// The prompt pass's tile drains (math.zig `Drain`), read once at construction: `"pipelined"` (the default: the
     /// measured best, cells/prefill1-bf16-20261008: 544.9/549.1 vs sync 491.5/495.7 prefill tok/s, TTFT -3.3 s, ids
     /// identical across all five cells) commits each expert projection / reduction tile and waits the one before it
@@ -277,24 +262,11 @@ pub const Config = struct {
     /// selectable (the previous default). A NAMED `inplace` refuses under a wired policy other than `max`; the DEFAULT
     /// takes `fused` there at construction with one line (`Module.init`: `route prefill_combine=fused reason=default ...`).
     prefill_combine: @import("prefill_combine.zig").Route = .inplace,
-    /// mimo/prefill-attn2: how the NAX prompt route evaluates a call (prefill_attention.zig `Evals`), read once at
-    /// construction: `"prefill_attention_evals": "tiled"` is the control (the default), `"spanned"` projects q / o once
-    /// per call and evaluates the predictor's router tiles in one eval; anything else refuses by name, and `"spanned"`
-    /// refuses when the stock attention route installs (Module.init).
-    prefill_attention_evals: @import("prefill_attention.zig").Evals = .tiled,
-    /// mimo/prefill-attn2: `"prefill_readahead_post": "after_predict"` (the control, the default) | `"early"`
-    /// (`ReadAheadPost`), read once at construction; anything else refuses by name, and `"early"` refuses with
-    /// `"prefill_read_ahead": false` (nothing to post).
-    prefill_readahead_post: ReadAheadPost = .after_predict,
     /// The expert tiles' bank view (math.zig `BankView`), read once at construction: `"window"` (the default: measured
     /// +7.8 % prefill, cells/prefill5-next2-20261008 787/792 vs 728/737 tok/s, ids identical, pre-ship family bankview
     /// bitwise) hands each sorted-GEMM tile the slice of its bank its slots span (no copy); `"prefill_bank_view": "full"`
     /// is the control (every tile is handed its whole bank); anything else refuses by name.
     prefill_bank_view: @import("math.zig").BankView = .window,
-    /// Lever 4a: the prompt pass's group order (stream.zig `GroupOrder`), read once at construction:
-    /// `"prefill_group_order": "hot"` is the control (the default), `"interleave"` follows each hit group with the
-    /// heaviest read group; anything else refuses by name.
-    prefill_group_order: @import("stream.zig").GroupOrder = .hot,
     /// P7 (mimo/p7-prefill-reads): the prompt pass's read schedule (stream.zig `ReadSchedule`), read once at construction:
     /// `"prefill_read_schedule": "current"` is the control (the default); `"early"` plans a prompt call's groups at its
     /// first route as the current schedule does and posts each read as soon as its row is free, the read-ahead in rank
@@ -333,8 +305,8 @@ pub const Config = struct {
     prefill_scratch: Scratch = .pooled,
     /// P7: the predictor's router tiles (`PredictEvals`), read once at construction: `"prefill_predict_evals": "tiled"`
     /// is the control (the default: each 2,048-row tile evaluated and read back on its own); `"one"` evaluates every tile
-    /// of the call in one eval and reads them back in tile order (the attn2 spanned route's predictor, composed here
-    /// without spanning the attention: the same graphs, counts and ranking); anything else refuses by name.
+    /// of the call in one eval and reads them back in tile order (the same graphs, counts and ranking); anything else
+    /// refuses by name.
     /// stack-next9: `one` is the DEFAULT (the P7 W arm); `"tiled"` is the control, still selectable.
     prefill_predict_evals: PredictEvals = .one,
     /// stack-next9: which of the four P7 W settings the request names (`applySettings`); the install line prints
@@ -346,21 +318,6 @@ pub const Config = struct {
     /// exact, cells/k2-20261009 missfree round 69.0 -> 68.3 ms, ids identical) the fused kernels (the stock ops'
     /// arithmetic); `"decode_glue": "ops"` is the control; anything else refuses by name.
     decode_glue: @import("glue.zig").Route = .fused,
-    /// K3 (mimo/k2-glue): the sliding layers' M <= 8 attention block (sliding.zig), read once at construction:
-    /// `"decode_sliding": "ops"` is the control (the default), `"fused"` the fused projections + window kernels (exact
-    /// to the kernels decode tier, which it requires, on the BF16 KV); anything else refuses by name.
-    decode_sliding: @import("sliding.zig").Route = .ops,
-    /// K6 (mimo/k6-commits, decode_barrier.zig): the decode lane's command-buffer commits, read once at construction:
-    /// `"decode_commits": "mlx"` is the control (the default: MLX's own cuts, 5.15 / 6.0 buffers per sliding / full
-    /// layer); `"layer"` commits each decode-lane eval once (the barrier set one buffer, the hit wave one) and proves at
-    /// construction that the limits it writes are the ones MLX reads (exact, cells/k6-20261009: serial 12.7 vs 13.1 tok/s,
-    /// MTP flat, so not the default); anything else refuses by name.
-    decode_commits: decode_barrier.Commits = .mlx,
-    /// K7: the decode lane's routing-barrier wait, read once at construction: `"decode_miss_issue": "host"` is the control
-    /// (the default: MLX's blocking wait, then `hostIds` / `hostF32`), `"event"` polls the barrier eval's event and reads
-    /// the ids and scores in place, so the route issues the misses' reads at the GPU's signal, and rewrites only the
-    /// changed LUT entries (exact, cells/k6-20261009; not the default); anything else refuses by name.
-    decode_miss_issue: decode_barrier.MissIssue = .host,
     // ---- rows audit (mimo/decode-rows-audit): begin ----
     /// R2: the boundary's growth under the MTP lane (phase rows on), read once at construction. `"after_draft"` (the
     /// default) grows every slot bank to the decode rows at the decode phase's first forward (the verify, or a serial
@@ -377,25 +334,14 @@ pub const Config = struct {
     /// transient loads are its distinct misses); `"route"` is the control (the SDK's `max_route_ids`, 48). Exact: the same
     /// plans and slot indices; the 16 rows no decode call can reach are not allocated or billed.
     decode_window: @import("stream.zig").DecodeWindow = .verify,
-    /// R1: the input embedding's source, read once at construction: `"table"` (the default and the control: the resident
-    /// BF16 table) or `"rows"` (never resident: every lookup gathers its rows from the pack's resident shard past the page
-    /// cache, embed_rows.zig, DeepSeek's `embedding_rows`; the bill drops the table, 1,249,902,592 B, from both phases).
-    /// Exact: a lookup is a copy of the table's bytes. Under the MTP lane each head embeds the previous head's draft from
-    /// the host rows, so the draft reads each draft id back before the next head (one eval per head, not one per round).
-    /// Not the default: its decode cost (the row reads and the per-head evals on the round's critical path) is
-    /// unmeasured. Refused by name on an affine (non-BF16) table.
-    embedding: Embedding = .table,
     // ---- rows audit: end ----
     /// X12 (mimo/gpu-warm, gpu_warm.zig): while the decode phase's event-gated miss parts wait for their expert bytes,
     /// a trivial resident kernel (one simdgroup, its own 32 KiB buffer) on its own Metal queue keeps the GPU busy, so
     /// the serial GPU parts after each wait do not start from an idle clock. Read once at construction: `"waits"` (the
     /// DEFAULT since stack-next8: cells/gpuwarm1-20261009 met the pre-declared adopt rule on normal cells, round 185.81 ->
     /// 181.12 ms, decode 20.50 -> 21.00 tok/s, ids identical; exact) makes the warm queue, kernel and buffer and the parked
-    /// warm thread; `"off"` (the control) installs nothing; `"tick"` one chunk every 500 ms for the process's life (the slow GPU
-    /// state between cells, requests and idle stretches); `"all"` both; anything else refuses by name. Without the
-    /// setting, `MIMO_GPU_KEEP_WARM` (read once at construction: a window's environment for every cell) selects the
-    /// route (`effectiveGpuKeepWarm`). Exact by construction (the kernel touches only its own buffer; the stream's
-    /// event is only read); costs GPU power while it runs. A route that is NAMED (setting or environment) refuses by name on
+    /// warm thread; `"off"` (the control) installs nothing; anything else refuses by name. Exact by construction (the
+    /// kernel touches only its own buffer; the stream's event is only read); costs GPU power while it runs. A NAMED route refuses by name on
     /// a CPU stream or a non-Metal event; the DEFAULT on a CPU stream (CPU tests, `MLX_DEFAULT_DEVICE=cpu`) takes the
     /// control at construction with one log line (`Module.init`: `route gpu_keep_warm=off reason=...`); the bill keeps
     /// the default's 1 MiB `gpu_warm` term there (an over-bill on a CPU stream only).
@@ -406,7 +352,7 @@ pub const Config = struct {
     /// The FP8 prompt route's BF16 weight cache (fp8_linear.zig `PromptCache`; the fp8res tier only, nothing installs on
     /// the BF16 / affine tiers), read once at construction: `3` (the default) holds one layer's set (its attention's q /
     /// k / v, or layer 0's dense gate / up / down), which every prompt call order the trunk runs needs (the CPU replay
-    /// over the NAX tiled / spanned and stock routes, 9 .. 32,768 rows): each FP8 projection is still dequantized once
+    /// over the NAX tiled and stock routes, 9 .. 32,768 rows): each FP8 projection is still dequantized once
     /// per layer per chunk, the same kernels on the same bytes, so the prompt pass is bit-equal by construction; the bill
     /// drops the fourth slot's 100,663,296 B (+ wiring) from the prompt phase. `"fp8_prompt_slots": 4` is the control
     /// (the fp8res2 cache); anything else refuses by name.
@@ -425,14 +371,6 @@ pub const Config = struct {
     /// (the scores choose only the lookahead's pre-reads); `"predict_router": "f32"` is the control (the transposed F32
     /// copy); anything else refuses by name.
     predict_router: PredictRoute = .bf16,
-    /// The decode verify's router at M = 2..4 (`VerifyRouter`, the fused glue trunk), read once at construction:
-    /// `"f32_gemm"` (the default and the control) multiplies the post-attention norm's F32 cast by the transposed F32 copy
-    /// (MLX's split-K GEMM); `"bf16_gemv"` runs `mimo_glue_router_rows` on the BF16 weight: every verify row's logits are
-    /// the serial (M = 1) token's bit for bit (the router becomes M-invariant) but not the GEMM's, so routed ids change at
-    /// near-ties: ROUNDING-CLASS. Needs `"decode_glue": "fused"` (refused by name on the ops trunk). With both routes on the
-    /// BF16 weight the decode phase reads no F32 router: the copy is built per prompt phase and released at the decode
-    /// boundary (`routerCopyInDecode`; the bill drops `router_f32` from decode).
-    verify_router: VerifyRouter = .f32_gemm,
     // ---- X19: end ----
 
     pub fn withFacts(c: Config, facts: *const sdk.LoadFacts) Config {
@@ -485,53 +423,26 @@ pub const Config = struct {
         const expected: *const fn (mimo.Config, u64) kv.Bound = if (c.kv_mode == .q8) kv.q8Bound else kv.bf16Bound;
         if (c.request_bound != expected) return error.MimoKVModeNotBound;
         if (c.draft_tier == .invalid) return error.MimoDraftTierUnsupported;
-        switch (c.decode_seed) {
-            .invalid => return error.MimoDecodeSeed,
-            .prompt_tail => |n| if (n == 0 or n > mimo.prefill_max_tokens) return error.MimoDecodeSeed,
-            .prompt_counts => {},
-        }
         if (!(c.draft_delta > 0 and c.draft_delta <= 1)) return error.MimoDraftDeltaRange;
         if (c.draft_depth == 0 or c.draft_depth > trained_draft_depth) return error.MimoDraftDepthRange;
         if (c.prefill_drain == .invalid) return error.MimoPrefillDrain;
         if (c.prefill_combine == .invalid) return error.MimoPrefillCombine;
-        if (c.prefill_attention_evals == .invalid) return error.MimoPrefillAttentionEvals;
-        if (c.prefill_attention_evals == .spanned and c.prefill_attention == .stock) return error.MimoPrefillAttentionEvalsRoute;
-        if (c.prefill_readahead_post == .invalid) return error.MimoPrefillReadAheadPost;
-        if (c.prefill_readahead_post == .early and !c.prefill_read_ahead) return error.MimoPrefillReadAheadPostOff;
         if (c.prefill_bank_view == .invalid) return error.MimoPrefillBankView;
-        if (c.prefill_group_order == .invalid) return error.MimoPrefillGroupOrder;
         if (c.prefill_read_schedule == .invalid) return error.MimoPrefillReadSchedule;
         if (c.prefill_read_schedule_threshold == 0 or c.prefill_read_schedule_threshold > @import("stream.zig").max_read_schedule_threshold) return error.MimoPrefillReadScheduleThreshold;
         if (c.p7_requested.read_schedule_threshold and c.prefill_read_schedule != .auto) return error.MimoPrefillReadScheduleThresholdUnused;
         if (c.prefill_scratch == .invalid) return error.MimoPrefillScratch;
         if (c.prefill_predict_evals == .invalid) return error.MimoPrefillPredictEvals;
         if (c.decode_glue == .invalid) return error.MimoDecodeGlue;
-        if (c.decode_sliding == .invalid) return error.MimoDecodeSliding;
-        if (c.decode_sliding == .fused and c.decodeAttentionTier() != .kernels) return error.MimoDecodeSlidingTier;
-        if (c.decode_sliding == .fused and c.kv_mode != .bf16) return error.MimoDecodeSlidingKv;
-        if (c.decode_commits == .invalid) return error.MimoDecodeCommits;
-        if (c.decode_miss_issue == .invalid) return error.MimoDecodeMissIssue;
         if (c.decode_moe_kernel == .invalid) return error.MimoDecodeMoeKernel;
         if (c.decode_moe_kernel == .k1 and c.decode_moe == .stock and c.decode_moe_kernel_requested) return error.MimoDecodeMoeKernelRoute;
         if (c.decode_grow == .invalid) return error.MimoDecodeGrow;
         if (c.decode_window == .invalid) return error.MimoDecodeWindow;
-        if (c.embedding == .invalid) return error.MimoEmbedding;
-        if (c.embedding == .rows and !c.mimo.storage(.embed).dense()) return error.MimoEmbeddingRowsStorage;
         if (c.gpu_keep_warm == .invalid) return error.MimoGpuKeepWarm;
-        _ = try c.effectiveGpuKeepWarm();
         // X18: the FP8 route's two construction-time choices (installed by fp8_linear.install on the fp8res tier only).
         if (c.fp8_prompt_slots < 3 or c.fp8_prompt_slots > fp8_linear.PromptCache.max_slots) return error.MimoFp8PromptSlots;
         if (c.fp8_gemv_plan == .invalid) return error.MimoFp8GemvPlan;
-        // X19: the routers' two construction-time routes.
         if (c.predict_router == .invalid) return error.MimoPredictRouter;
-        if (c.verify_router == .invalid) return error.MimoVerifyRouter;
-        if (c.verify_router == .bf16_gemv and c.decode_glue != .fused) return error.MimoVerifyRouterGlue;
-    }
-
-    /// X19: a decode-phase forward reads the transposed F32 router copy unless both routes read the BF16 weight (the M = 1
-    /// router is router1 on the fused trunk, which `bf16_gemv` requires).
-    pub fn routerCopyInDecode(c: Config) bool {
-        return !(c.predict_router == .bf16 and c.verify_router == .bf16_gemv);
     }
 
     /// X18: the FP8 route's install options (fp8_linear.install), from the two settings.
@@ -539,21 +450,10 @@ pub const Config = struct {
         return .{ .prompt_slots = c.fp8_prompt_slots, .gemv = c.fp8_gemv_plan };
     }
 
-    /// X12: the route construction installs and the bill charges: the setting when the request names it, else the
-    /// window environment `MIMO_GPU_KEEP_WARM` (off | waits | tick | all; anything else refuses by name), else off.
-    /// Construction only (one environment read).
-    /// stack-next8: the effective route came from the default (no setting names it, no window environment): the one
-    /// case construction may resolve to the control where the route cannot install (a CPU stream).
+    /// The keep-warm route came from the default (no setting names it): the one case construction may resolve to the
+    /// control where the route cannot install (a CPU stream).
     pub fn gpuKeepWarmIsDefault(c: Config) bool {
-        return !c.gpu_keep_warm_requested and std.c.getenv("MIMO_GPU_KEEP_WARM") == null;
-    }
-
-    pub fn effectiveGpuKeepWarm(c: Config) !gpu_warm.Route {
-        if (c.gpu_keep_warm_requested) return c.gpu_keep_warm;
-        const env = std.c.getenv("MIMO_GPU_KEEP_WARM") orelse return c.gpu_keep_warm;
-        const r = gpu_warm.parseRoute(std.mem.span(env));
-        if (r == .invalid) return error.MimoGpuKeepWarmEnv;
-        return r;
+        return !c.gpu_keep_warm_requested;
     }
 
     /// R2: the deferred growth is installed (phase rows on, the MTP lane on, `"decode_grow": "after_draft"`).
@@ -604,10 +504,6 @@ pub const Config = struct {
             c.decode_moe_kernel = if (v == .string) std.meta.stringToEnum(@import("moe.zig").KernelFamily, v.string) orelse .invalid else .invalid;
             c.decode_moe_kernel_requested = true;
         }
-        if (raw.object.get("decode_seed")) |v| {
-            const tail: u32 = if (raw.object.get("decode_seed_tail_tokens")) |n| (if (n == .integer and n.integer > 0 and n.integer <= std.math.maxInt(u32)) @intCast(n.integer) else 0) else @import("stream.zig").default_seed_tail_tokens;
-            c.decode_seed = if (v != .string) .invalid else if (std.mem.eql(u8, v.string, "prompt_counts")) .prompt_counts else if (std.mem.eql(u8, v.string, "prompt_tail")) .{ .prompt_tail = tail } else .invalid;
-        }
         if (raw.object.get("prefill_attention")) |v| {
             const r = if (v == .string) std.meta.stringToEnum(@import("prefill_attention.zig").Route, v.string) else null;
             if (r) |route| c.prefill_attention = route else c.malformed.prefill_attention = true;
@@ -627,21 +523,9 @@ pub const Config = struct {
             c.prefill_combine = if (v == .string) std.meta.stringToEnum(@import("prefill_combine.zig").Route, v.string) orelse .invalid else .invalid;
             c.p7_requested.combine = true;
         }
-        if (raw.object.get("prefill_attention_evals")) |v| {
-            // An unknown value (or "invalid") is refused by name in `validate`.
-            c.prefill_attention_evals = if (v == .string) std.meta.stringToEnum(@import("prefill_attention.zig").Evals, v.string) orelse .invalid else .invalid;
-        }
-        if (raw.object.get("prefill_readahead_post")) |v| {
-            // An unknown value (or "invalid") is refused by name in `validate`.
-            c.prefill_readahead_post = if (v == .string) std.meta.stringToEnum(ReadAheadPost, v.string) orelse .invalid else .invalid;
-        }
         if (raw.object.get("prefill_bank_view")) |v| {
             // An unknown value (or "invalid") is refused by name in `validate`.
             c.prefill_bank_view = if (v == .string) std.meta.stringToEnum(@import("math.zig").BankView, v.string) orelse .invalid else .invalid;
-        }
-        if (raw.object.get("prefill_group_order")) |v| {
-            // An unknown value (or "invalid") is refused by name in `validate`.
-            c.prefill_group_order = if (v == .string) std.meta.stringToEnum(@import("stream.zig").GroupOrder, v.string) orelse .invalid else .invalid;
         }
         if (raw.object.get("prefill_scratch")) |v| {
             // An unknown value (or "invalid") is refused by name in `validate`.
@@ -668,18 +552,6 @@ pub const Config = struct {
             // An unknown value (or "invalid") is refused by name in `validate`.
             c.decode_glue = if (v == .string) @import("glue.zig").parseRoute(v.string) else .invalid;
         }
-        if (raw.object.get("decode_sliding")) |v| {
-            // An unknown value (or "invalid") is refused by name in `validate`.
-            c.decode_sliding = if (v == .string) @import("sliding.zig").parseRoute(v.string) else .invalid;
-        }
-        if (raw.object.get("decode_commits")) |v| {
-            // An unknown value (or "invalid") is refused by name in `validate`.
-            c.decode_commits = if (v == .string) decode_barrier.parseCommits(v.string) else .invalid;
-        }
-        if (raw.object.get("decode_miss_issue")) |v| {
-            // An unknown value (or "invalid") is refused by name in `validate`.
-            c.decode_miss_issue = if (v == .string) decode_barrier.parseMissIssue(v.string) else .invalid;
-        }
         if (raw.object.get("decode_grow")) |v| {
             // An unknown value (or "invalid") is refused by name in `validate`.
             c.decode_grow = if (v == .string) std.meta.stringToEnum(DecodeGrow, v.string) orelse .invalid else .invalid;
@@ -687,10 +559,6 @@ pub const Config = struct {
         if (raw.object.get("decode_window")) |v| {
             // An unknown value (or "invalid") is refused by name in `validate`.
             c.decode_window = if (v == .string) std.meta.stringToEnum(@import("stream.zig").DecodeWindow, v.string) orelse .invalid else .invalid;
-        }
-        if (raw.object.get("embedding")) |v| {
-            // An unknown value (or "invalid") is refused by name in `validate`.
-            c.embedding = if (v == .string) std.meta.stringToEnum(Embedding, v.string) orelse .invalid else .invalid;
         }
         if (raw.object.get("gpu_keep_warm")) |v| {
             // An unknown value (or "invalid") is refused by name in `validate`.
@@ -703,9 +571,8 @@ pub const Config = struct {
             // An unknown value (or "invalid") is refused by name in `validate`.
             c.fp8_gemv_plan = if (v == .string) std.meta.stringToEnum(fp8_linear.GemvRoute, v.string) orelse .invalid else .invalid;
         }
-        // X19: an unknown value (or "invalid") is refused by name in `validate`.
+        // An unknown value (or "invalid") is refused by name in `validate`.
         if (raw.object.get("predict_router")) |v| c.predict_router = if (v == .string) std.meta.stringToEnum(PredictRoute, v.string) orelse .invalid else .invalid;
-        if (raw.object.get("verify_router")) |v| c.verify_router = if (v == .string) std.meta.stringToEnum(VerifyRouter, v.string) orelse .invalid else .invalid;
     }
 
     /// A forced-rows setting: a positive JSON integer within u32; anything else marks the setting invalid.
@@ -904,52 +771,6 @@ test "mimo prefill combine: inplace by default (stack-next9), fused / stock on r
     }
 }
 
-test "mimo prefill attn2 settings: tiled by default, spanned on request, anything else refused by name; spanned + stock refused" {
-    const Evals = @import("prefill_attention.zig").Evals;
-    var c: Config = .{};
-    try std.testing.expectEqual(Evals.tiled, c.prefill_attention_evals);
-    try c.validate();
-    const on = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"prefill_attention_evals\":\"spanned\"}", .{});
-    defer on.deinit();
-    c.applySettings(on.value);
-    try c.validate();
-    try std.testing.expectEqual(Evals.spanned, c.prefill_attention_evals);
-    for ([_][]const u8{ "{\"prefill_attention_evals\":\"span\"}", "{\"prefill_attention_evals\":\"invalid\"}", "{\"prefill_attention_evals\":1}" }) |text| {
-        const bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
-        defer bad.deinit();
-        var b: Config = .{};
-        b.applySettings(bad.value);
-        try std.testing.expectError(error.MimoPrefillAttentionEvals, b.validate());
-    }
-    const stock = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"prefill_attention_evals\":\"spanned\",\"prefill_attention\":\"stock\"}", .{});
-    defer stock.deinit();
-    var d: Config = .{};
-    d.applySettings(stock.value);
-    try std.testing.expectError(error.MimoPrefillAttentionEvalsRoute, d.validate());
-}
-
-test "mimo prefill attn2 settings: read-ahead post after_predict by default, early on request, anything else refused by name; early without read-ahead refused" {
-    var c: Config = .{};
-    try std.testing.expectEqual(ReadAheadPost.after_predict, c.prefill_readahead_post);
-    const on = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"prefill_readahead_post\":\"early\"}", .{});
-    defer on.deinit();
-    c.applySettings(on.value);
-    try c.validate();
-    try std.testing.expectEqual(ReadAheadPost.early, c.prefill_readahead_post);
-    for ([_][]const u8{ "{\"prefill_readahead_post\":\"earlier\"}", "{\"prefill_readahead_post\":\"invalid\"}", "{\"prefill_readahead_post\":false}" }) |text| {
-        const bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
-        defer bad.deinit();
-        var b: Config = .{};
-        b.applySettings(bad.value);
-        try std.testing.expectError(error.MimoPrefillReadAheadPost, b.validate());
-    }
-    const off = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"prefill_readahead_post\":\"early\",\"prefill_read_ahead\":false}", .{});
-    defer off.deinit();
-    var d: Config = .{};
-    d.applySettings(off.value);
-    try std.testing.expectError(error.MimoPrefillReadAheadPostOff, d.validate());
-}
-
 test "mimo prefill bank view: window by default, full (the control) on request, anything else refused by name" {
     var c: Config = .{};
     try std.testing.expectEqual(@import("math.zig").BankView.window, c.prefill_bank_view);
@@ -1086,68 +907,11 @@ test "mimo prefill read schedule threshold (X20): 8,192 by default, 1..1,048,576
     }
 }
 
-test "mimo prefill group order: hot by default, interleave on request, anything else refused by name" {
-    var c: Config = .{};
-    try std.testing.expectEqual(@import("stream.zig").GroupOrder.hot, c.prefill_group_order);
-    const on = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"prefill_group_order\":\"interleave\"}", .{});
-    defer on.deinit();
-    c.applySettings(on.value);
-    try c.validate();
-    try std.testing.expectEqual(@import("stream.zig").GroupOrder.interleave, c.prefill_group_order);
-    for ([_][]const u8{ "{\"prefill_group_order\":\"cold\"}", "{\"prefill_group_order\":\"invalid\"}", "{\"prefill_group_order\":false}" }) |text| {
-        const bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
-        defer bad.deinit();
-        var b: Config = .{};
-        b.applySettings(bad.value);
-        try std.testing.expectError(error.MimoPrefillGroupOrder, b.validate());
-    }
-}
-
-test "mimo barrier settings: decode_commits mlx and decode_miss_issue host by default, layer and event on request, anything else refused by name" {
-    const db = @import("decode_barrier.zig");
-    var c: Config = .{};
-    try std.testing.expectEqual(db.Commits.mlx, c.decode_commits);
-    try std.testing.expectEqual(db.MissIssue.host, c.decode_miss_issue);
-    try c.validate();
-    const on = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"decode_commits\":\"layer\",\"decode_miss_issue\":\"event\"}", .{});
-    defer on.deinit();
-    c.applySettings(on.value);
-    try c.validate();
-    try std.testing.expectEqual(db.Commits.layer, c.decode_commits);
-    try std.testing.expectEqual(db.MissIssue.event, c.decode_miss_issue);
-    const ctl = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"decode_commits\":\"mlx\",\"decode_miss_issue\":\"host\"}", .{});
-    defer ctl.deinit();
-    c.applySettings(ctl.value);
-    try c.validate();
-    try std.testing.expectEqual(db.Commits.mlx, c.decode_commits);
-    try std.testing.expectEqual(db.MissIssue.host, c.decode_miss_issue);
-    for ([_][]const u8{ "{\"decode_commits\":\"buffer\"}", "{\"decode_commits\":\"invalid\"}", "{\"decode_commits\":2}" }) |text| {
-        const bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
-        defer bad.deinit();
-        var b: Config = .{};
-        b.applySettings(bad.value);
-        try std.testing.expectError(error.MimoDecodeCommits, b.validate());
-    }
-    for ([_][]const u8{ "{\"decode_miss_issue\":\"poll\"}", "{\"decode_miss_issue\":\"invalid\"}", "{\"decode_miss_issue\":true}" }) |text| {
-        const bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
-        defer bad.deinit();
-        var b: Config = .{};
-        b.applySettings(bad.value);
-        try std.testing.expectError(error.MimoDecodeMissIssue, b.validate());
-    }
-    // The routes' own binding refuses an invalid value by name too (Source construction, never reached past `validate`).
-    try std.testing.expectError(error.MimoDecodeCommits, db.Routes(@import("../deepseek_v41/ops.zig").TraceOps).of(.invalid, .host));
-    try std.testing.expectError(error.MimoDecodeMissIssue, db.Routes(@import("../deepseek_v41/ops.zig").TraceOps).of(.mlx, .invalid));
-}
-
 test "mimo gpu warm settings: gpu_keep_warm waits by default (stack-next8), off (the control) and waits on request, anything else refused by name" {
     var c: Config = .{};
     try std.testing.expectEqual(gpu_warm.Route.waits, c.gpu_keep_warm);
     try c.validate();
-    if (std.c.getenv("MIMO_GPU_KEEP_WARM") == null) {
-        try std.testing.expect(c.gpuKeepWarmIsDefault());
-        try std.testing.expectEqual(gpu_warm.Route.waits, try c.effectiveGpuKeepWarm());
-    }
+    try std.testing.expect(c.gpuKeepWarmIsDefault());
     const on = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"gpu_keep_warm\":\"waits\"}", .{});
     defer on.deinit();
     c.applySettings(on.value);
@@ -1158,19 +922,8 @@ test "mimo gpu warm settings: gpu_keep_warm waits by default (stack-next8), off 
     c.applySettings(ctl.value);
     try c.validate();
     try std.testing.expectEqual(gpu_warm.Route.off, c.gpu_keep_warm);
-    try std.testing.expect(c.gpu_keep_warm_requested);
-    try std.testing.expectEqual(gpu_warm.Route.off, try c.effectiveGpuKeepWarm());
-    for ([_][]const u8{ "tick", "all" }) |r| {
-        var buf: [64]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buf, "{{\"gpu_keep_warm\":\"{s}\"}}", .{r});
-        const ok = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
-        defer ok.deinit();
-        var t: Config = .{};
-        t.applySettings(ok.value);
-        try t.validate();
-        try std.testing.expectEqual(gpu_warm.parseRoute(r), try t.effectiveGpuKeepWarm());
-    }
-    for ([_][]const u8{ "{\"gpu_keep_warm\":\"on\"}", "{\"gpu_keep_warm\":\"invalid\"}", "{\"gpu_keep_warm\":true}", "{\"gpu_keep_warm\":1}" }) |text| {
+    try std.testing.expect(c.gpu_keep_warm_requested and !c.gpuKeepWarmIsDefault());
+    for ([_][]const u8{ "{\"gpu_keep_warm\":\"tick\"}", "{\"gpu_keep_warm\":\"all\"}", "{\"gpu_keep_warm\":\"on\"}", "{\"gpu_keep_warm\":\"invalid\"}", "{\"gpu_keep_warm\":true}", "{\"gpu_keep_warm\":1}" }) |text| {
         const bad = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
         defer bad.deinit();
         var b: Config = .{};
@@ -1181,28 +934,6 @@ test "mimo gpu warm settings: gpu_keep_warm waits by default (stack-next8), off 
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
-test "mimo gpu warm settings: the window environment MIMO_GPU_KEEP_WARM selects the route when no setting names it; a named setting wins; an unknown value refuses by name" {
-    defer _ = unsetenv("MIMO_GPU_KEEP_WARM");
-    _ = setenv("MIMO_GPU_KEEP_WARM", "all", 1);
-    var c: Config = .{};
-    try c.validate();
-    try std.testing.expectEqual(gpu_warm.Route.all, try c.effectiveGpuKeepWarm());
-    const named = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"gpu_keep_warm\":\"off\"}", .{});
-    defer named.deinit();
-    c.applySettings(named.value);
-    try std.testing.expectEqual(gpu_warm.Route.off, try c.effectiveGpuKeepWarm());
-    _ = setenv("MIMO_GPU_KEEP_WARM", "always", 1);
-    const d: Config = .{};
-    try std.testing.expectError(error.MimoGpuKeepWarmEnv, d.validate());
-    _ = unsetenv("MIMO_GPU_KEEP_WARM");
-    try std.testing.expectEqual(gpu_warm.Route.waits, try d.effectiveGpuKeepWarm());
-    try std.testing.expect(d.gpuKeepWarmIsDefault());
-    // The control stays selectable by the environment for a whole window.
-    _ = setenv("MIMO_GPU_KEEP_WARM", "off", 1);
-    try std.testing.expectEqual(gpu_warm.Route.off, try d.effectiveGpuKeepWarm());
-    try std.testing.expect(!d.gpuKeepWarmIsDefault());
-}
 
 // ---- +phase-rows: begin ----
 test "mimo phase rows: on by default; \"phase_rows\": false installs the equal-rows control" {
@@ -1286,15 +1017,6 @@ test "mimo rows audit settings: decode_grow and decode_window parse, default to 
     try std.testing.expectError(error.MimoDecodeGrow, (try parse("{\"decode_grow\":1}")).validate());
     try std.testing.expectError(error.MimoDecodeWindow, (try parse("{\"decode_window\":\"invalid\"}")).validate());
     try std.testing.expectError(error.MimoDecodeWindow, (try parse("{\"decode_window\":32}")).validate());
-    // R1: the table by default; rows only over a dense BF16 table (the default config's affine Q4 table refuses).
-    try std.testing.expectEqual(Embedding.table, d.embedding);
-    const rows = try parse("{\"embedding\":\"rows\"}");
-    try std.testing.expectEqual(Embedding.rows, rows.embedding);
-    try std.testing.expectError(error.MimoEmbeddingRowsStorage, rows.validate());
-    var dense = rows;
-    for (&dense.mimo.residents) |*st| st.* = mimo.Storage.bf16;
-    try dense.validate();
-    try std.testing.expectError(error.MimoEmbedding, (try parse("{\"embedding\":\"host\"}")).validate());
 }
 
 test "mimo forced rows settings: both keys parse, host facts win over settings, refusals by name" {
@@ -1428,9 +1150,8 @@ test "mimo layer rows (mimo/layer-rows): uniform by default, 47 offsets summing 
     _ = try layerRows(c.expert_rows_by_layer, .{ .prompt = 204, .decode = 216 }, 256);
 }
 
-test "mimo decode glue and sliding settings: ops by default, fused on request, anything else refused by name; fused sliding needs the kernels tier and the BF16 KV" {
+test "mimo decode glue settings: fused by default, ops (the control) on request, anything else refused by name" {
     const Glue = @import("glue.zig").Route;
-    const Sliding = @import("sliding.zig").Route;
     const parse = struct {
         fn f(text: []const u8) !Config {
             const v = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
@@ -1442,22 +1163,13 @@ test "mimo decode glue and sliding settings: ops by default, fused on request, a
     }.f;
     const base: Config = .{};
     try std.testing.expectEqual(Glue.fused, base.decode_glue);
-    try std.testing.expectEqual(Sliding.ops, base.decode_sliding);
     try base.validate();
-    const both = try parse("{\"decode_glue\":\"fused\",\"decode_sliding\":\"fused\"}");
-    try both.validate();
-    try std.testing.expectEqual(Glue.fused, both.decode_glue);
-    try std.testing.expectEqual(Sliding.fused, both.decode_sliding);
-    const ctl = try parse("{\"decode_glue\":\"ops\",\"decode_sliding\":\"ops\"}");
+    const ctl = try parse("{\"decode_glue\":\"ops\"}");
     try ctl.validate();
     try std.testing.expectEqual(Glue.ops, ctl.decode_glue);
     for ([_][]const u8{ "{\"decode_glue\":\"fast\"}", "{\"decode_glue\":\"invalid\"}", "{\"decode_glue\":true}" }) |text|
         try std.testing.expectError(error.MimoDecodeGlue, (try parse(text)).validate());
-    for ([_][]const u8{ "{\"decode_sliding\":\"fast\"}", "{\"decode_sliding\":\"invalid\"}", "{\"decode_sliding\":1}" }) |text|
-        try std.testing.expectError(error.MimoDecodeSliding, (try parse(text)).validate());
-    try std.testing.expectError(error.MimoDecodeSlidingTier, (try parse("{\"decode_sliding\":\"fused\",\"decode_attention\":\"stock\"}")).validate());
-    try std.testing.expectError(error.MimoDecodeSlidingKv, (try parse("{\"decode_sliding\":\"fused\",\"kv_quant\":8}")).validate());
-    // Each alone is valid; the glue route beside the stock attention tier and the Q8 KV too.
+    // The glue route beside the stock attention tier and the Q8 KV.
     try (try parse("{\"decode_glue\":\"fused\",\"decode_attention\":\"stock\",\"kv_quant\":8}")).validate();
 }
 
@@ -1518,7 +1230,7 @@ test "mimo settings X18: fp8_prompt_slots 3 and fp8_gemv_plan by_rows by default
         try std.testing.expectError(error.MimoFp8GemvPlan, (try parse(t)).validate());
 }
 
-test "mimo settings X19: predict_router bf16 and verify_router f32_gemm by default; f32 / bf16_gemv by setting; bf16_gemv needs the fused glue; the F32 copy leaves decode only with both on BF16; anything else refuses by name" {
+test "mimo settings: predict_router bf16 by default, f32 (the control) by setting, anything else refuses by name" {
     const parse = struct {
         fn f(text: []const u8) !Config {
             const v = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
@@ -1531,23 +1243,9 @@ test "mimo settings X19: predict_router bf16 and verify_router f32_gemm by defau
     const d: Config = .{};
     try d.validate();
     try std.testing.expectEqual(PredictRoute.bf16, d.predict_router);
-    try std.testing.expectEqual(VerifyRouter.f32_gemm, d.verify_router);
-    try std.testing.expect(d.routerCopyInDecode());
-    const ctl = try parse("{\"predict_router\":\"f32\",\"verify_router\":\"f32_gemm\"}");
+    const ctl = try parse("{\"predict_router\":\"f32\"}");
     try ctl.validate();
     try std.testing.expectEqual(PredictRoute.f32, ctl.predict_router);
-    try std.testing.expect(ctl.routerCopyInDecode());
-    const both = try parse("{\"verify_router\":\"bf16_gemv\"}");
-    try both.validate();
-    try std.testing.expectEqual(VerifyRouter.bf16_gemv, both.verify_router);
-    try std.testing.expect(!both.routerCopyInDecode());
-    const b_only = try parse("{\"predict_router\":\"f32\",\"verify_router\":\"bf16_gemv\"}");
-    try b_only.validate();
-    try std.testing.expect(b_only.routerCopyInDecode());
-    try std.testing.expectError(error.MimoVerifyRouterGlue, (try parse("{\"verify_router\":\"bf16_gemv\",\"decode_glue\":\"ops\"}")).validate());
-    try (try parse("{\"verify_router\":\"f32_gemm\",\"decode_glue\":\"ops\"}")).validate();
     for ([_][]const u8{ "{\"predict_router\":\"bf16_gemv\"}", "{\"predict_router\":\"invalid\"}", "{\"predict_router\":1}", "{\"predict_router\":\"F32\"}" }) |t|
         try std.testing.expectError(error.MimoPredictRouter, (try parse(t)).validate());
-    for ([_][]const u8{ "{\"verify_router\":\"bf16\"}", "{\"verify_router\":\"invalid\"}", "{\"verify_router\":true}", "{\"verify_router\":\"gemv\"}" }) |t|
-        try std.testing.expectError(error.MimoVerifyRouter, (try parse(t)).validate());
 }

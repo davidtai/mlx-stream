@@ -274,8 +274,7 @@ test "mimo SDK2 complete bill retains architecture source and row-following wiri
             "source_metadata",     "expert_workspace", "event_runtime",      "event_graph",
             "spec_staging",        "spec_runtime",     "predictor_metadata", "predictor_workspace",
             "predictor_runtime",   "slot_wiring",
-            "kv_sliding_ring",     "mtp_workspace",      "fp8_prompt_weights", "embed_rows",
-            "gpu_warm",
+            "kv_sliding_ring",     "mtp_workspace",      "fp8_prompt_weights", "gpu_warm",
         };
         try std.testing.expectEqual(names.len, b.terms.len);
         for (names) |term_name| {

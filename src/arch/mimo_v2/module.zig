@@ -13,7 +13,6 @@ const mimo = @import("config.zig");
 const padded_attention = @import("attention.zig");
 const decode_attention = @import("decode_attention.zig");
 const glue = @import("glue.zig");
-const sliding_attention = @import("sliding.zig");
 const prefill_attention = @import("prefill_attention.zig");
 const source_mod = @import("source.zig");
 const bank_mod = @import("bank.zig");
@@ -27,7 +26,6 @@ const route_trace = @import("route_trace.zig");
 const mtp_profile = @import("mtp_profile.zig");
 const prefill_timeline = @import("prefill_timeline.zig");
 const fp8_linear = @import("fp8_linear.zig");
-const embed_rows = @import("embed_rows.zig");
 const DiagnosticPhase = enum { none, prefill, decode };
 const Diagnostics = if (profile.enabled or dt.enabled) struct {
     phase: DiagnosticPhase = .none,
@@ -159,28 +157,12 @@ pub const Module = struct {
     previous_cache_limit: usize,
     /// P1's prompt route, bound once at construction (`settings.Config.prefill_read_ahead`).
     read_ahead: ReadAhead = readAheadOff,
-    /// mimo/prefill-attn2 (`prefill_readahead_post`): a prompt layer's tail, bound once at construction: `tailEval` (the
-    /// control: evaluate the layer's output) or `tailPostNext` (`"early"`: the NEXT layer's predictor in that same eval,
-    /// its read-ahead posted there; the next layer's start route is then `readAheadOff`).
-    tail: Tail = tailEval,
     /// L4's kernel objects, borrowed by every layer's installed M <= 8 route (`Attention.decode`).
     decode_kernels: decode_attention.Kernels = .{},
     /// K2 (`decode_glue`): the decode lane's trunk, bound once at construction: `trunkOps` (the control) or `trunkGlue`
     /// (the fused glue kernels, `glue_kernels`).
     lane_trunk: *const fn (*Module, []const u32, ReadAhead, Tail) anyerror!Array = trunkOps,
     glue_kernels: glue.Kernels = .{},
-    /// X19 (`verify_router`): the fused trunk's router at M = 2..4, bound once at construction: `verifyRouterF32` (the
-    /// control: addnorm32's F32 cast times the transposed F32 copy, MLX's GEMM) or `verifyRouterBf16` (addnorm, then
-    /// `router_rows` on the BF16 weight: every verify row routes on the serial token's logits bit for bit).
-    verify_router: *const fn (*Module, Array, Array, Array, Router) anyerror!glue.AddNorm = verifyRouterF32,
-    router_rows: glue.RouterRows = .{},
-    /// X19: the transposed F32 router copies' life, bound once at construction (`settings.routerCopyInDecode`): built at
-    /// construction and held in both phases (the control; both hooks no-ops), or built at each prompt phase's start and
-    /// released at the decode boundary (`openRouterCopies` / `releaseRouterCopies`).
-    open_routers: *const fn (*Module) anyerror!void = routersResident,
-    release_routers: *const fn (*Module) void = routersKept,
-    /// K3 (`decode_sliding`): the kernel objects every sliding layer's installed M <= 8 route borrows.
-    sliding_kernels: sliding_attention.Kernels = .{},
     /// `+attn`'s installed kernel (prefill_attention.zig), constructed once when the route is `.nax`; the layers'
     /// attentions borrow it. `mask_rows`: the widest chunk that still builds host masks (the route's own lane bound).
     nax: prefill_attention.Kernel = .{},
@@ -193,10 +175,6 @@ pub const Module = struct {
     /// R2 (rows audit): the decode phase after the growth closes the FP8 prompt route (`settings.decodeClosesPromptRoute`,
     /// construction).
     closes_prompt_route: bool = false,
-    /// R1 (rows audit, `"embedding": "rows"`): the table's rows on the host (null: the resident table, `embed`), and the
-    /// trunk's lookup bound to the route once at construction.
-    embed_rows: ?*embed_rows.Rows = null,
-    embed_fn: *const fn (*Module, []const u32, Array) anyerror!Array = embedTable,
     /// Profile builds: the decode-start residents' trace snapshot waits for the deferred growth (R2).
     trace_start_pending: if (profile.enabled) bool else void = if (profile.enabled) false else {},
     /// The MTP draft lane (`settings.mtp_heads`, setting "mtp_lane"), installed at construction or absent: the heads, the tier, the request's
@@ -247,26 +225,18 @@ pub const Module = struct {
         // X18: the prompt cache's capacity and the GEMV's per-width plans (settings `fp8_prompt_slots`, `fp8_gemv_plan`).
         const fp8 = try fp8_linear.install(a, c, config.fp8Install());
         errdefer fp8_linear.destroy(a, fp8);
-        // R1: the rows route never loads the table (the host's lazy array is dropped unread, before the construction
-        // check materializes the residents); its rows come from the pack's shard on demand.
-        const rows_route = config.embedding == .rows;
-        const embed = if (rows_route) QLinear{ .w = .{}, .scales = .{}, .biases = .{} } else try QLinear.load(weights, "model.embed_tokens", c.hidden_size, c.vocab_size, c.storage(.embed), fp8);
-        const er: ?*embed_rows.Rows = if (rows_route) try embed_rows.Rows.open(a, io, dir, c) else null;
-        errdefer if (er) |r| r.close(a);
-        if (rows_route) weights.drop(embed_rows.tensor_name);
+        const embed = try QLinear.load(weights, "model.embed_tokens", c.hidden_size, c.vocab_size, c.storage(.embed), fp8);
         const head = try QLinear.load(weights, "lm_head", c.hidden_size, c.vocab_size, c.storage(.head), fp8);
         const norm = try weight(weights, "model.norm.weight", &.{@intCast(c.hidden_size)}, .bfloat16);
         var layers: [mimo.max_layers]Layer = undefined;
         for (&layers, 0..) |*layer, i| layer.* = try Layer.load(weights, c, i, fp8);
-        // X19: the transposed F32 router copies, built here and held in both phases unless no decode-phase forward reads
-        // them (`routerCopyInDecode`: both routers on the BF16 weight); then each prompt phase builds them.
-        const router_copy_resident = config.routerCopyInDecode();
+        // The transposed F32 router copies (the prompt pass's router and the verify's), built here and held in both phases.
         var promoted: usize = 0;
         errdefer for (layers[0..promoted]) |*l| l.deinitOwned();
-        if (router_copy_resident) for (&layers) |*layer| {
+        for (&layers) |*layer| {
             try layer.promote(s);
             promoted += 1;
-        };
+        }
         const scale = mlx.mlx_array_new_float(c.attention_value_scale);
         errdefer drop(scale);
         var ones: Array = .{};
@@ -279,15 +249,15 @@ pub const Module = struct {
         const gates = try a.alloc(source_mod.Gate, mimo.max_layers);
         errdefer a.free(gates);
         gates[0] = .{ .w = .{}, .bias = .{} };
-        // X19: the decode predictor's gate table per `predict_router`: the routers' BF16 weights as stored, or the F32
-        // copies (the control: resident, `routerCopyInDecode`).
+        // The decode predictor's gate table per `predict_router`: the routers' BF16 weights as stored, or the F32 copies
+        // (the control).
         for (layers[1..], gates[1..]) |layer, *gate| {
             const routed = layer.mlp.routed;
             gate.* = .{ .w = if (config.predict_router == .bf16) routed.weight_bf16 else routed.weight_t_f32, .bias = routed.bias };
         }
-        // X12: the setting, else the window environment MIMO_GPU_KEEP_WARM (read once, here). stack-next8: the DEFAULT
-        // (waits) on a CPU stream takes the control here, once, with one line; a named route still refuses by name there.
-        var warm_route = try config.effectiveGpuKeepWarm();
+        // `gpu_keep_warm`: the DEFAULT (waits) on a CPU stream takes the control here, once, with one line; a named route
+        // still refuses by name there.
+        var warm_route = config.gpu_keep_warm;
         if (warm_route != .off and config.gpuKeepWarmIsDefault() and !@import("gpu_warm.zig").gpuStream(s)) {
             log.info("route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits)", .{@tagName(warm_route)});
             warm_route = .off;
@@ -299,12 +269,12 @@ pub const Module = struct {
             log.info("route prefill_combine=fused reason=default inplace needs the wired policy max (MLX_SERVE_WIRED={s})", .{std.mem.span(v)});
             combine_route = .fused;
         };
-        const source = try source_mod.Source.initWith(a, io, dir, &rows, gates, s, .{ .read_ahead = config.prefill_read_ahead, .decode_moe = config.decode_moe, .decode_moe_kernel = config.decode_moe_kernel, .decode_rows = if (config.phase_rows) &decode_rows else null, .decode_seed = config.decode_seed, .prefill_drain = config.prefill_drain, .prefill_combine = combine_route, .prefill_bank_view = config.prefill_bank_view, .prefill_group_order = config.prefill_group_order, .prefill_read_schedule = config.prefill_read_schedule, .prefill_read_schedule_threshold = config.prefill_read_schedule_threshold, .prefill_scratch = config.prefill_scratch, .decode_commits = config.decode_commits, .decode_miss_issue = config.decode_miss_issue, .defer_grow = config.defersGrowth(), .decode_window = config.decode_window, .gpu_keep_warm = warm_route, .predict_router = config.predict_router });
+        const source = try source_mod.Source.initWith(a, io, dir, &rows, gates, s, .{ .read_ahead = config.prefill_read_ahead, .decode_moe = config.decode_moe, .decode_moe_kernel = config.decode_moe_kernel, .decode_rows = if (config.phase_rows) &decode_rows else null, .prefill_drain = config.prefill_drain, .prefill_combine = combine_route, .prefill_bank_view = config.prefill_bank_view, .prefill_read_schedule = config.prefill_read_schedule, .prefill_read_schedule_threshold = config.prefill_read_schedule_threshold, .prefill_scratch = config.prefill_scratch, .defer_grow = config.defersGrowth(), .decode_window = config.decode_window, .gpu_keep_warm = warm_route, .predict_router = config.predict_router });
         errdefer source.deinit();
         const self = try a.create(Module);
         errdefer a.destroy(self);
         const decode_host = bills.decodeHostTerms(config.*, plan.reserve);
-        self.* = .{ .a = a, .s = s, .c = c, .source = source, .predictor_gates = gates, .embed = embed, .head = head, .norm = norm, .layers = layers, .value_scale = scale, .norm_ones = ones, .full_rope_freq = full_freq, .sliding_rope_freq = sliding_freq, .context_bound = plan.reserve, .decode_host_billed = decode_host.host, .decode_compiler_billed = decode_host.compiler, .previous_cache_limit = previous, .fp8 = fp8, .closes_prompt_route = config.decodeClosesPromptRoute(), .embed_rows = er, .embed_fn = if (rows_route) embedRows else embedTable, .open_routers = if (router_copy_resident) routersResident else openRouterCopies, .release_routers = if (router_copy_resident) routersKept else releaseRouterCopies };
+        self.* = .{ .a = a, .s = s, .c = c, .source = source, .predictor_gates = gates, .embed = embed, .head = head, .norm = norm, .layers = layers, .value_scale = scale, .norm_ones = ones, .full_rope_freq = full_freq, .sliding_rope_freq = sliding_freq, .context_bound = plan.reserve, .decode_host_billed = decode_host.host, .decode_compiler_billed = decode_host.compiler, .previous_cache_limit = previous, .fp8 = fp8, .closes_prompt_route = config.decodeClosesPromptRoute() };
         // The MTP lane: its heads load (every tensor's sha256 verified) only when the lane is set, before the
         // construction check that their bill term covers.
         if (config.mtp_heads) {
@@ -324,15 +294,10 @@ pub const Module = struct {
         for (&self.caches, c.layer_types) |*cache, mode| cache.* = try Cache.install(config.kv_mode, mode, c, rollback, s);
         // P1: the predictor follows the source's installed wide route (its self-check already passed in Source.initWith).
         const read_ahead = source.ex.at(source.bank.geometry.first_moe_layer).readAhead();
-        self.read_ahead = installReadAhead(read_ahead and config.prefill_readahead_post == .after_predict, config.decode_seed, config.prefill_attention_evals == .spanned or config.prefill_predict_evals == .one);
+        self.read_ahead = installReadAhead(read_ahead, config.prefill_predict_evals == .one);
         log.info("MiMo prefill_scratch={s} prefill_predict_evals={s}", .{ @tagName(config.prefill_scratch), @tagName(config.prefill_predict_evals) });
-        // `"early"` needs the read-ahead route installed (settings refuse it with `"prefill_read_ahead": false`; the
-        // source's own self-check can still leave it off, refused here).
-        if (config.prefill_readahead_post == .early and !read_ahead) return error.MimoPrefillReadAheadPostOff;
-        self.tail = installTail(config.prefill_readahead_post, config.decode_seed);
-        log.info("MiMo prefill_readahead_post={s}", .{@tagName(config.prefill_readahead_post)});
-        log.info("MiMo prefill_read_ahead={} decode_moe={s} decode_moe_kernel={s} decode_seed={s} seed_tail_tokens={d} hit_pass={}", .{ read_ahead, @tagName(config.decode_moe), @tagName(config.decode_moe_kernel), @tagName(config.decode_seed), seedTailTokens(config.decode_seed), source.ex.devRoute() });
-        if (comptime profile.enabled) try self.armTrace(io, config.decode_seed);
+        log.info("MiMo prefill_read_ahead={} decode_moe={s} decode_moe_kernel={s} hit_pass={}", .{ read_ahead, @tagName(config.decode_moe), @tagName(config.decode_moe_kernel), source.ex.devRoute() });
+        if (comptime profile.enabled) try self.armTrace(io);
         // Profile builds: `MIMO_PREFILL_TIMELINE=1` (read once here) arms the prompt pass's stage / tile timeline for the
         // process's first prompt pass (prefill_timeline.zig).
         if (comptime profile.enabled) if (try prefill_timeline.want(io)) log.info("MIMO_PREFILL_TIMELINE armed: first prompt pass, files beside the route trace={}", .{self.trace != null});
@@ -361,43 +326,21 @@ pub const Module = struct {
             self.lane_trunk = trunkGlue;
         }
         errdefer self.glue_kernels.deinit();
-        // X19: the verify's router at M = 2..4 (`verify_router`; settings refuse bf16_gemv without the fused trunk).
-        if (config.verify_router == .bf16_gemv) {
-            self.router_rows = try glue.RouterRows.init(c.hidden_size, c.n_routed_experts);
-            self.verify_router = verifyRouterBf16;
-        }
-        errdefer self.router_rows.deinit();
-        log.info("MiMo routers: predict_router={s} verify_router={s} router_f32={s} router_f32_decode_bytes={d}", .{ @tagName(config.predict_router), @tagName(config.verify_router), if (router_copy_resident) "resident" else "per_prompt_phase", if (router_copy_resident) c.routerPromotionBytes() else 0 });
-        // K3: the sliding layers' M <= 8 attention block (`decode_sliding`; `ops` is the control). Its arithmetic is the
-        // kernels route's (settings refuse it beside the stock tier and the Q8 KV); the projections must be BF16.
-        if (config.decode_sliding == .fused) {
-            for ([_]mimo.Role{ .q, .k, .v }) |role| if (!c.storage(role).dense()) {
-                log.warn("refused: decode_sliding=fused needs BF16 q/k/v residents ({s} is {d}-bit; the fp8 tier's hook is kernels/header_mimo_sliding.metal sliding_w4)", .{ @tagName(role), c.storage(role).bits });
-                return error.MimoDecodeSlidingResidents;
-            };
-            self.sliding_kernels = try sliding_attention.Kernels.init(c);
-            for (&self.layers, c.layer_types) |*layer, mode| if (mode == .sliding) layer.attention.installSliding(&self.sliding_kernels);
-        }
-        errdefer self.sliding_kernels.deinit();
-        log.info("MiMo decode_glue={s} decode_sliding={s}", .{ @tagName(config.decode_glue), @tagName(config.decode_sliding) });
+        log.info("MiMo routers: predict_router={s} router_f32_decode_bytes={d}", .{ @tagName(config.predict_router), c.routerPromotionBytes() });
+        log.info("MiMo decode_glue={s}", .{@tagName(config.decode_glue)});
         // +attn: the route resolved above. The stock route is the explicit control.
         errdefer self.nax.deinit();
-        // mimo/prefill-attn2: `"spanned"` evaluates the NAX route's calls; the stock route never takes it (refused here).
-        if (config.prefill_attention_evals == .spanned and attention_route != .nax) return error.MimoPrefillAttentionEvalsRoute;
         if (attention_route == .nax) {
             try prefill_attention.requireGeometry(c);
             self.nax = try prefill_attention.Kernel.init(s);
             self.mask_rows = 8;
-            for (&self.layers) |*layer| layer.attention.installNax(&self.nax, config.prefill_attention_evals);
+            for (&self.layers) |*layer| layer.attention.installNax(&self.nax);
         }
         log.info("MiMo prefill_attention={s}", .{@tagName(attention_route)});
-        log.info("MiMo prefill_attention_evals={s}", .{@tagName(config.prefill_attention_evals)});
         log.info("MiMo prefill_drain={s}", .{@tagName(config.prefill_drain)});
-        log.info("MiMo decode_commits={s} decode_miss_issue={s}", .{ @tagName(config.decode_commits), @tagName(config.decode_miss_issue) });
-        // X12: the receipt's proof of the warm route as installed (the queue, kernel, buffer and parked thread, or none).
-        log.info("MiMo gpu_keep_warm={s} source={s} warm_installed={} waits={} tick_ms={d} warm_groups={d} warm_threads={d} chunk_target_us={d} bill_bytes={d}", .{ @tagName(warm_route), if (config.gpu_keep_warm_requested) "setting" else if (std.c.getenv("MIMO_GPU_KEEP_WARM") != null) "env" else "default", source.warm != null, warm_route.waitsOn(), if (warm_route.tickOn()) @import("gpu_warm.zig").tick_ns / std.time.ns_per_ms else 0, @import("gpu_warm.zig").route_groups, @import("gpu_warm.zig").threads, @import("gpu_warm.zig").chunk_target_ns / std.time.ns_per_us, if (source.warm != null) @import("gpu_warm.zig").bill_bytes else 0 });
-        // Rows audit (R1 / R2 / R3): the receipt's proof of the installed embedding source, boundary and decode window.
-        log.info("MiMo embedding={s} table_bytes_not_resident={d}", .{ @tagName(config.embedding), if (rows_route) embed_rows.tableBytes(c) else 0 });
+        // The receipt's proof of the warm route as installed (the queue, kernel, buffer and parked thread, or none).
+        log.info("MiMo gpu_keep_warm={s} source={s} warm_installed={} warm_groups={d} warm_threads={d} chunk_target_us={d} bill_bytes={d}", .{ @tagName(warm_route), if (config.gpu_keep_warm_requested) "setting" else "default", source.warm != null, @import("gpu_warm.zig").route_groups, @import("gpu_warm.zig").threads, @import("gpu_warm.zig").chunk_target_ns / std.time.ns_per_us, if (source.warm != null) @import("gpu_warm.zig").bill_bytes else 0 });
+        // Rows audit (R2 / R3): the receipt's proof of the installed boundary and decode window.
         log.info("MiMo decode_grow={s} deferred={} decode_window={s} window0_rows={d} decode_closes_prompt_route={}", .{ @tagName(config.decode_grow), config.defersGrowth(), @tagName(config.decode_window), if (config.phase_rows) @import("stream.zig").decodeTransientRows(config.decode_window) else @import("stream.zig").transient_rows, config.decodeClosesPromptRoute() });
         log.info("MiMo prefill_combine={s}", .{@tagName(combine_route)});
         // stack-next9: the receipt's proof of the four P7 W routes as installed and where each came from. X20: under `auto`
@@ -408,7 +351,7 @@ pub const Module = struct {
             const A = @import("stream.zig").AutoSchedule;
             log.info("MiMo prefill_read_schedule=auto threshold={d} source={s}: {s} below, {s} at or above (chosen once per request from its prompt length; the request's P7 line names it)", .{ config.prefill_read_schedule_threshold, P7Line.sourceOf(config.p7_requested.read_schedule_threshold), @tagName(A.below), @tagName(A.at_or_above) });
         }
-        log.info("MiMo prefill_bank_view={s} prefill_group_order={s} prefill_read_schedule={s}", .{ @tagName(config.prefill_bank_view), @tagName(config.prefill_group_order), @tagName(config.prefill_read_schedule) });
+        log.info("MiMo prefill_bank_view={s} prefill_read_schedule={s}", .{ @tagName(config.prefill_bank_view), @tagName(config.prefill_read_schedule) });
         var label_buf: [160]u8 = undefined;
         log.info("mlx-stream MiMo installed: 48 layers; residents {s}; experts MXFP4 g32 streamed (47 sources), {d} resident expert rows/layer, chunk {d}", .{ residentsLabel(&label_buf, c), plan.rows.prompt, mimo.prefill_chunk });
         // mimo/layer-rows: the receipt's proof of the split as installed (the rows each routed layer holds, both phases).
@@ -486,14 +429,12 @@ pub const Module = struct {
     }
 
     /// Profile builds: the route trace, armed once when `MIMO_ROUTE_TRACE` names a file prefix.
-    fn armTrace(self: *Module, io: std.Io, seed: @import("stream.zig").DecodeSeed) !void {
+    fn armTrace(self: *Module, io: std.Io) !void {
         const prefix = std.c.getenv("MIMO_ROUTE_TRACE") orelse return;
         const g = self.source.bank.geometry;
         const t = try self.a.create(route_trace.Trace);
         errdefer self.a.destroy(t);
         t.* = try route_trace.Trace.init(self.a, io, std.mem.span(prefix), g.num_moe_layers, g.num_experts, g.first_moe_layer, g.record_bytes);
-        t.decode_seed = @tagName(seed);
-        t.seed_tail_tokens = seedTailTokens(seed);
         self.trace = t;
         self.source.stream_source.trace = t;
         log.info("MIMO_ROUTE_TRACE armed: prefix={s} format={s}", .{ std.mem.span(prefix), route_trace.format });
@@ -508,15 +449,12 @@ pub const Module = struct {
         };
         for (&self.caches) |*cache| cache.deinit();
         if (self.lane) |l| l.deinit();
-        if (self.embed_rows) |r| r.close(self.a);
         self.nax.deinit();
         self.source.deinit();
         self.a.free(self.predictor_gates);
         for (&self.layers) |*layer| layer.deinitOwned();
         self.decode_kernels.deinit();
         self.glue_kernels.deinit();
-        self.router_rows.deinit();
-        self.sliding_kernels.deinit();
         fp8_linear.destroy(self.a, self.fp8);
         drop(self.value_scale);
         drop(self.norm_ones);
@@ -657,8 +595,6 @@ pub const Module = struct {
         };
         if (comptime profile.enabled) if (self.trace) |t| try t.begin(ids, reserve - ids.len);
         self.startDiagnosticPhase(.prefill);
-        // X19: the prompt phase's F32 router copies (the per-prompt route; a no-op where they are resident).
-        try self.open_routers(self);
         // fp8res: the prompt route's BF16 weights live for the prompt pass only (fp8_linear.PromptCache).
         fp8_linear.openPrompt(self.fp8);
         defer fp8_linear.releasePrompt(self.fp8);
@@ -689,7 +625,6 @@ pub const Module = struct {
         if (ids.len > 1) {
             self.endDiagnosticPhase();
             try self.source.resumePrefill();
-            try self.open_routers(self);
             fp8_linear.openPrompt(self.fp8);
             self.startDiagnosticPhase(.prefill);
         } else try self.finishGrow(); // R2: a serial step is a decode-phase forward
@@ -714,8 +649,6 @@ pub const Module = struct {
     /// the prompt route closed when the growth ran here and nothing in the decode phase takes it
     /// (`settings.decodeClosesPromptRoute`: the serial lane).
     fn enterDecode(self: *Module) !void {
-        // X19: the per-prompt router copies released before the phase change clears MLX's cache (a no-op where resident).
-        self.release_routers(self);
         fp8_linear.releasePrompt(self.fp8);
         try self.source.beginDecode();
         if (!self.source.growPending() and self.closes_prompt_route) fp8_linear.closePrompt(self.fp8);
@@ -752,17 +685,6 @@ pub const Module = struct {
         });
     }
 
-    // ---- rows audit R1: begin ----
-    /// The trunk's lookup on the table route (the control): the resident table's rows.
-    fn embedTable(self: *Module, _: []const u32, token_ids: Array) anyerror!Array {
-        return self.embed.lookup(token_ids, self.s);
-    }
-
-    /// R1: the trunk's lookup on the rows route: the same rows gathered from the pack's shard (embed_rows.zig).
-    fn embedRows(self: *Module, ids: []const u32, _: Array) anyerror!Array {
-        return self.embed_rows.?.lookup(self.a, ids);
-    }
-    // ---- rows audit R1: end ----
     fn checkTokens(self: *const Module, ids: []const u32) !void {
         for (ids) |id| if (id >= self.c.vocab_size) return error.MimoTokenOutOfRange;
     }
@@ -782,7 +704,7 @@ pub const Module = struct {
     }
     fn forwardChunk(self: *Module, ids: []const u32, with_logits: bool) !Array {
         const n: c_int = @intCast(ids.len);
-        const x = try self.trunk(ids, self.read_ahead, self.tail);
+        const x = try self.trunk(ids, self.read_ahead, tailEval);
         defer drop(x);
         if (!with_logits) return .{};
         // The final-normed tail: the last row alone (the serial path), or the lane's history rows, whose last row is
@@ -820,7 +742,7 @@ pub const Module = struct {
         const n: c_int = @intCast(ids.len);
         const token_ids = mlx.mlx_array_new_data(ids.ptr, &.{n}, 1, .uint32);
         defer drop(token_ids);
-        var x = try self.embed_fn(self, ids, token_ids);
+        var x = try self.embed.lookup(token_ids, self.s);
         defer drop(x);
         // Masks are shared by all layers in a chunk, and have the exact cache-view widths. `+mask`: a global layer
         // past eight rows runs MLX's causal mode (`Attention.forward`), so only the native M <= 8 lane builds one.
@@ -857,7 +779,7 @@ pub const Module = struct {
         const k = &self.glue_kernels;
         const token_ids = mlx.mlx_array_new_data(ids.ptr, &.{n}, 1, .uint32);
         defer drop(token_ids);
-        var h = try self.embed_fn(self, ids, token_ids);
+        var h = try self.embed.lookup(token_ids, self.s);
         defer drop(h);
         var mlp: Array = .{};
         defer drop(mlp);
@@ -895,7 +817,7 @@ pub const Module = struct {
             defer drop(attn);
             var post: glue.AddNorm = switch (layer.mlp) {
                 .dense => try glue.addNorm(k, h, attn, layer.post_norm, s),
-                .routed => |r| if (n == 1) try glue.router1(k, h, attn, layer.post_norm, r.weight_bf16, s) else try self.verify_router(self, h, attn, layer.post_norm, r),
+                .routed => |r| if (n == 1) try glue.router1(k, h, attn, layer.post_norm, r.weight_bf16, s) else try verifyRouterF32(self, h, attn, layer.post_norm, r),
             };
             defer post.deinit();
             drop(h);
@@ -958,8 +880,8 @@ pub const Module = struct {
 };
 
 // ---- X19 (mimo/router-bf16): begin ----
-/// `verify_router: f32_gemm` (the control): addnorm32's F32 cast of the norm times the transposed F32 copy (MLX's split-K
-/// GEMM at M = 2..4); the returned `x` holds the logits.
+/// The verify's router (M = 2..4): addnorm32's F32 cast of the norm times the transposed F32 copy (MLX's split-K GEMM);
+/// the returned `x` holds the logits.
 fn verifyRouterF32(self: *Module, a: Array, b: Array, w: Array, r: Router) anyerror!glue.AddNorm {
     var post = try glue.addNormF32(&self.glue_kernels, a, b, w, self.s);
     errdefer post.deinit();
@@ -970,118 +892,6 @@ fn verifyRouterF32(self: *Module, a: Array, b: Array, w: Array, r: Router) anyer
     return post;
 }
 
-/// `verify_router: bf16_gemv`: the add and norm, then every row's product from the BF16 weight in router1's order
-/// (`glue.RouterRows`): each verify row's logits are the serial token's bit for bit; the returned `x` holds them.
-fn verifyRouterBf16(self: *Module, a: Array, b: Array, w: Array, r: Router) anyerror!glue.AddNorm {
-    var post = try glue.addNorm(&self.glue_kernels, a, b, w, self.s);
-    errdefer post.deinit();
-    post.x = try self.router_rows.apply(post.n, r.weight_bf16, self.s);
-    return post;
-}
-
-/// The control's router copies: built at construction, held in both phases.
-fn routersResident(_: *Module) anyerror!void {}
-fn routersKept(_: *Module) void {}
-
-/// The per-prompt route, at a prompt phase's start (Module.prefill / extend): `buildRouterCopies`.
-fn openRouterCopies(self: *Module) anyerror!void {
-    return buildRouterCopies(&self.layers, self.s);
-}
-
-/// The per-prompt route, at the decode boundary (`enterDecode`): every copy released before the source's phase change
-/// clears MLX's cache, so no decode-phase forward can read one and the decode phase holds none (bill: decode 0).
-fn releaseRouterCopies(self: *Module) void {
-    for (&self.layers) |*layer| layer.deinitOwned();
-}
-
-/// Every routed layer's transposed F32 copy (Layer.promote's arrays: the F32 cast, its transposed view) built in one eval;
-/// a layer that still holds one (a request that failed in its prompt phase) keeps it.
-fn buildRouterCopies(layers: []Layer, s: Stream) !void {
-    var built: [mimo.max_layers]Array = undefined;
-    var n: usize = 0;
-    for (layers) |*layer| switch (layer.mlp) {
-        .dense => {},
-        .routed => |*r| if (r.weight_t_f32.ctx == null) {
-            const f = try cast(r.weight_bf16, .float32, s);
-            defer drop(f);
-            try mlx.check(mlx.mlx_transpose(&r.weight_t_f32, f, s));
-            built[n] = r.weight_t_f32;
-            n += 1;
-        },
-    };
-    if (n == 0) return;
-    const vec = mlx.mlx_vector_array_new_data(&built, n);
-    defer _ = mlx.mlx_vector_array_free(vec);
-    try mlx.check(mlx.mlx_eval(vec));
-}
-
-test "mimo X19 CPU: the per-prompt router copies are Layer.promote's arrays (dtype, shape, strides, values bit for bit), built once per prompt phase, released at the boundary, rebuilt equal; the prompt router reads them as it reads promote's" {
-    const a = std.testing.allocator;
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    var prng: std.Random.DefaultPrng = .init(0x7a19_0c01);
-    const rnd = prng.random();
-    const bits = try a.alloc(u16, 256 * 4096);
-    defer a.free(bits);
-    var bias_v: [256]f32 = undefined;
-    var layers: [3]Layer = undefined;
-    var refs: [3]Layer = undefined;
-    layers[0].mlp = .{ .dense = undefined };
-    refs[0].mlp = .{ .dense = undefined };
-    for (1..3) |i| {
-        for (bits) |*b| b.* = glue.model.bf16Bits((rnd.float(f32) * 2 - 1) * 0.05);
-        for (&bias_v) |*v| v.* = (rnd.float(f32) * 2 - 1) * 0.01;
-        const w = mlx.mlx_array_new_data(bits.ptr, &[_]c_int{ 256, 4096 }, 2, .bfloat16);
-        const b = mlx.mlx_array_new_data(&bias_v, &[_]c_int{256}, 1, .float32);
-        layers[i].mlp = .{ .routed = .{ .weight_bf16 = w, .bias = b } };
-        refs[i].mlp = .{ .routed = .{ .weight_bf16 = w, .bias = b } };
-        try refs[i].promote(s);
-    }
-    defer for (1..3) |i| {
-        drop(layers[i].mlp.routed.weight_bf16);
-        drop(layers[i].mlp.routed.bias);
-        layers[i].deinitOwned();
-        refs[i].deinitOwned();
-    };
-    for (0..2) |_| {
-        try buildRouterCopies(&layers, s);
-        var held: [3]?*anyopaque = @splat(null);
-        for (1..3) |i| {
-            const got = layers[i].mlp.routed.weight_t_f32;
-            const want = refs[i].mlp.routed.weight_t_f32;
-            try std.testing.expect(got.ctx != null);
-            try std.testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(got));
-            try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
-            try std.testing.expectEqualSlices(usize, mlx.mlx_array_strides(want)[0..2], mlx.mlx_array_strides(got)[0..2]);
-            const eq = try glue.bitwise(a, got, want, s);
-            try std.testing.expectEqual(eq.total, eq.equal);
-            held[i] = got.ctx;
-        }
-        // A second open in the same prompt phase builds nothing (each layer keeps the array it holds).
-        try buildRouterCopies(&layers, s);
-        for (1..3) |i| try std.testing.expectEqual(held[i], layers[i].mlp.routed.weight_t_f32.ctx);
-        // The prompt router on the copies routes as on promote's.
-        const xb = try a.alloc(u16, 9 * 4096);
-        defer a.free(xb);
-        for (xb) |*v| v.* = glue.model.bf16Bits((rnd.float(f32) * 2 - 1) * 2);
-        const x = mlx.mlx_array_new_data(xb.ptr, &[_]c_int{ 9, 4096 }, 2, .bfloat16);
-        defer drop(x);
-        var rg = try route(x, layers[1].mlp.routed.weight_t_f32, layers[1].mlp.routed.bias, 8, s);
-        defer rg.deinit();
-        var rr = try route(x, refs[1].mlp.routed.weight_t_f32, refs[1].mlp.routed.bias, 8, s);
-        defer rr.deinit();
-        const ids = try glue.bitwise(a, rg.ids, rr.ids, s);
-        try std.testing.expectEqual(ids.total, ids.equal);
-        const sc = try glue.bitwise(a, rg.scores, rr.scores, s);
-        try std.testing.expectEqual(sc.total, sc.equal);
-        // The decode boundary: released (no copy held), the BF16 weight kept for router1 / router_rows.
-        for (&layers) |*l| l.deinitOwned();
-        for (1..3) |i| {
-            try std.testing.expect(layers[i].mlp.routed.weight_t_f32.ctx == null);
-            try std.testing.expect(layers[i].mlp.routed.weight_bf16.ctx != null);
-        }
-    }
-}
 // ---- X19: end ----
 
 /// The verify forward's read-ahead route: none (it runs in the decode phase).
@@ -1357,26 +1167,15 @@ const Attention = struct {
     sinks: Array,
     /// L4: the installed M <= 8 attention (construction-time; a bare Attention keeps the stock call).
     decode: decode_attention.Route = decode_attention.stock,
-    /// The installed M <= 8 forward (construction-time): `forwardOps` (the control) or K3's `forwardSlidingFused`
-    /// (`"decode_sliding": "fused"`, sliding layers), which borrows `sliding_kernels`.
-    small: *const fn (Attention, Array, *Cache, u64, c_int, Array, RotaryTables, Array, Stream) anyerror!Array = forwardOps,
-    sliding_kernels: ?*const sliding_attention.Kernels = null,
     /// The installed prompt route (Module.init, once): the stock tiles (`forwardTiled`, the control) past
     /// `prefill_chunk` rows, or `+attn`'s NAX spans (`forwardNax`) past eight rows.
     tiled: *const fn (Attention, std.mem.Allocator, Array, *Cache, u64, u32, RotaryTables, Array, Stream) anyerror!Array = forwardTiled,
     mask_rows: u32 = mimo.prefill_chunk,
     nax: ?*const prefill_attention.Kernel = null,
 
-    /// K3 (`"decode_sliding": "fused"`, Module.init, sliding layers only): the M <= 8 forward and its kernels, once.
-    fn installSliding(at: *Attention, k: *const sliding_attention.Kernels) void {
-        at.small = forwardSlidingFused;
-        at.sliding_kernels = k;
-    }
-
-    /// `evals` (prefill_attention.zig `Evals`, construction-time; `.invalid` never reaches here: settings validate):
-    /// `.tiled` installs `forwardNax` (the control), `.spanned` installs `forwardNaxSpanned`.
-    fn installNax(at: *Attention, kernel: *const prefill_attention.Kernel, evals: prefill_attention.Evals) void {
-        at.tiled = if (evals == .spanned) &forwardNaxSpanned else &forwardNax;
+    /// `+attn` (Module.init, construction-time): installs `forwardNax`.
+    fn installNax(at: *Attention, kernel: *const prefill_attention.Kernel) void {
+        at.tiled = &forwardNax;
         at.mask_rows = 8;
         at.nax = kernel;
     }
@@ -1456,96 +1255,6 @@ const Attention = struct {
         }
         return joinEvaluated(outputs[0..used], 0, s);
     }
-    /// `prefill_attention_evals: "spanned"` (prefill_attention.zig `Evals`): `forwardNax`'s spans, K/V projections, cache
-    /// writes, views and per-tile kernel dispatches, with q projected ONCE over the call (each tile reads its rows) and
-    /// o projected ONCE over the joined kernel outputs. Each tile's kernel output is committed (async eval) and the
-    /// tile before it waited (two in flight, as `Drain.pipelined`), so the GPU never idles between tiles; the layer's
-    /// output is the one blocking eval. Every array but the q and o GEMMs' outputs is the control's op on the control's
-    /// rows; the GEMMs see the same rows at M = the call instead of M = 512 (bill: `prefill_attention.spannedEvalBytes`).
-    fn forwardNaxSpanned(at: Attention, a: std.mem.Allocator, x: Array, cache: *Cache, pos: u64, rows: u32, rotary: RotaryTables, value_scale: Array, s: Stream) anyerror!Array {
-        const kernel = at.nax.?;
-        const tile = prefill_attention.query_tile_rows;
-        const outputs = try a.alloc(Array, (rows + tile - 1) / tile);
-        defer a.free(outputs);
-        var used: usize = 0;
-        defer for (outputs[0..used]) |out| drop(out);
-        const hidden = mlx.getShape(x)[1];
-        const q_width: c_int = @intCast(at.heads * at.head_dim);
-        const span_rows = prefill_attention.attentionSpanRows(at.kv_heads, at.mode, rows);
-        const scale = 1 / @sqrt(@as(f32, @floatFromInt(at.head_dim)));
-        const window: u32 = if (at.mode == .full) 0 else at.window;
-        // q over the call: one GEMM; released once the last tile that reads it has been waited.
-        var q_call = try at.q.forward(x, s);
-        defer drop(q_call);
-        var span_start: u32 = 0;
-        while (span_start < rows) {
-            const span_end = @min(rows, span_start + span_rows);
-            const span_n = span_end - span_start;
-            const xs = try slice2(x, @intCast(span_start), @intCast(span_end), 0, hidden, s);
-            defer drop(xs);
-            const kp = try at.k.forward(xs, s);
-            defer drop(kp);
-            const vp = try at.v.forward(xs, s);
-            defer drop(vp);
-            const kt = try headsView(kp, @intCast(span_n), at.kv_heads, at.head_dim, s);
-            defer drop(kt);
-            const vt = try headsView(vp, @intCast(span_n), at.kv_heads, at.v_dim, s);
-            defer drop(vt);
-            var span_tables: RotaryTables = .{ .cos = try sliceTime(rotary.cos, @intCast(span_start), @intCast(span_end), s), .sin = .{} };
-            defer span_tables.deinit();
-            span_tables.sin = try sliceTime(rotary.sin, @intCast(span_start), @intCast(span_end), s);
-            const k = try partialRope(kt, span_tables, at.rope_dim, s);
-            defer drop(k);
-            const v = try scaleValues(vt, value_scale, s);
-            defer drop(v);
-            var view = try cache.update(k, v, pos + span_start, span_n, at.mode, at.window, s);
-            defer view.deinit();
-            const view_end: u32 = @intCast(mlx.getShape(view.k)[2]);
-            var start = span_start;
-            while (start < span_end) {
-                const end = @min(span_end, start + tile);
-                const count = end - start;
-                const qp = try slice2(q_call, @intCast(start), @intCast(end), 0, q_width, s);
-                defer drop(qp);
-                const qt = try headsView(qp, @intCast(count), at.heads, at.head_dim, s);
-                defer drop(qt);
-                var tables: RotaryTables = .{ .cos = try sliceTime(rotary.cos, @intCast(start), @intCast(end), s), .sin = .{} };
-                defer tables.deinit();
-                tables.sin = try sliceTime(rotary.sin, @intCast(start), @intCast(end), s);
-                const q = try partialRope(qt, tables, at.rope_dim, s);
-                defer drop(q);
-                const keys = view_end - (span_end - end);
-                const kk = try sliceTime(view.k, 0, @intCast(keys), s);
-                defer drop(kk);
-                const vv = try sliceTime(view.v, 0, @intCast(keys), s);
-                defer drop(vv);
-                const out = try kernel.attention(q, kk, vv, scale, window, at.sinks, s);
-                outputs[used] = out;
-                used += 1;
-                try asyncEval(out);
-                // The tile before this one: waited (its arrays retire) while this one runs.
-                if (used > 1) try mlx.check(mlx.mlx_array_eval(outputs[used - 2]));
-                start = end;
-            }
-            span_start = span_end;
-        }
-        try mlx.check(mlx.mlx_array_eval(outputs[used - 1]));
-        drop(q_call);
-        q_call = .{};
-        // o over the call: the kernel outputs (physically [1, count, 64, 128]) joined on the row axis, read as
-        // [rows, 64 * 128] (no transpose), one GEMM, the layer's one blocking eval.
-        const vec = mlx.mlx_vector_array_new_data(outputs.ptr, used);
-        defer _ = mlx.mlx_vector_array_free(vec);
-        var joined: Array = .{};
-        defer drop(joined);
-        try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 1, s));
-        const flat = try reshape(joined, &.{ @intCast(rows), @intCast(at.heads * at.v_dim) }, s);
-        defer drop(flat);
-        const output = try at.o.forward(flat, s);
-        errdefer drop(output);
-        try mlx.check(mlx.mlx_array_eval(output));
-        return output;
-    }
     /// Reuse the installed bounded query geometry and cache updates, keeping only
     /// evaluated tile outputs. The layer's expert pass sees the entire prompt.
     fn forwardTiled(at: Attention, a: std.mem.Allocator, x: Array, cache: *Cache, pos: u64, rows: u32, rotary: RotaryTables, value_scale: Array, s: Stream) anyerror!Array {
@@ -1577,20 +1286,7 @@ const Attention = struct {
         return joinEvaluated(outputs[0..used], 0, s);
     }
     fn forward(at: Attention, x: Array, cache: *Cache, pos: u64, n: c_int, mask: Array, rotary: RotaryTables, value_scale: Array, s: Stream) !Array {
-        if (n <= decode_attention.max_rows) return at.small(at, x, cache, pos, n, mask, rotary, value_scale, s);
         return forwardOps(at, x, cache, pos, n, mask, rotary, value_scale, s);
-    }
-    /// K3: the q/k/v projections + rope + value scale in one dispatch, the ring's writes, the window attention written
-    /// as the o projection's rows, the o projection (sliding.zig). Bit-equal to `forwardOps` on the kernels decode tier.
-    fn forwardSlidingFused(at: Attention, x: Array, cache: *Cache, pos: u64, n: c_int, _: Array, rotary: RotaryTables, value_scale: Array, s: Stream) anyerror!Array {
-        const k = at.sliding_kernels.?;
-        var p = try sliding_attention.qkv(k, x, at.q.w, at.k.w, at.v.w, rotary.cos, rotary.sin, value_scale, s);
-        defer p.deinit();
-        var view = try cache.update(p.k, p.v, pos, @intCast(n), at.mode, at.window, s);
-        defer view.deinit();
-        const flat = try sliding_attention.windowO(k, p.q, view.k, view.v, at.sinks, s);
-        defer drop(flat);
-        return at.o.forward(flat, s);
     }
     fn forwardOps(at: Attention, x: Array, cache: *Cache, pos: u64, n: c_int, mask: Array, rotary: RotaryTables, value_scale: Array, s: Stream) anyerror!Array {
         const qp = try at.q.forward(x, s);
@@ -1771,86 +1467,28 @@ const Cache = struct {
 /// P1 read-ahead (design-prefill §2), one route per construction: `readAheadPredicted` or the stock `readAheadOff`.
 const ReadAhead = *const fn (source: *source_mod.Source, abs_layer: u32, r: Router, post_norm: Array, x: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void;
 
-/// `evals` (prefill_attention.zig `Evals`): `.tiled` evaluates each 2,048-row router tile on its own (the control),
-/// `.spanned` evaluates all of a call's tiles in one eval.
-fn installReadAhead(on: bool, seed: @import("stream.zig").DecodeSeed, one_eval: bool) ReadAhead {
+/// `one_eval` (`prefill_predict_evals: one`): every 2,048-row router tile of a call in one eval; else each tile on its
+/// own (`tiled`, the control).
+fn installReadAhead(on: bool, one_eval: bool) ReadAhead {
     if (!on) return readAheadOff;
-    const tail = seed == .prompt_tail;
-    return if (one_eval)
-        (if (tail) readAheadPredictedOf(true, true) else readAheadPredictedOf(false, true))
-    else if (tail) readAheadPredictedOf(true, false) else readAheadPredictedOf(false, false);
+    return if (one_eval) readAheadPredictedOf(true) else readAheadPredictedOf(false);
 }
 
-fn seedTailTokens(seed: @import("stream.zig").DecodeSeed) u32 {
-    return switch (seed) {
-        .prompt_tail => |n| n,
-        else => 0,
-    };
-}
-
-/// `tail`: the prediction ranked as the tail seed ranks the call (`expert_policy.rankTail`), so the rows it reads are
-/// the seed's.
-/// A prompt layer's tail (`Module.tail`): evaluates the layer's output `next` (abs layer `next_abs` - 1), and under
-/// `"early"` posts the following layer's read-ahead from it. Installed once; the per-layer branch is the layer kind
-/// (dense layer 0 and the last layer post nothing), as `readAheadBefore` branches today.
+/// A prompt layer's tail (`Module.tail`): evaluates the layer's output `next`.
 const Tail = *const fn (source: *source_mod.Source, next_abs: u32, following: ?*const Layer, next: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void;
 
-/// `"after_predict"` (the control): the layer's output evaluated, nothing posted (the next layer's start route posts).
+/// The layer's output evaluated, nothing posted (the next layer's start route posts its read-ahead).
 fn tailEval(_: *source_mod.Source, _: u32, _: ?*const Layer, next: Array, _: Array, _: f32, _: Stream) anyerror!void {
     try mlx.check(mlx.mlx_array_eval(next));
 }
 
-fn installTail(post: settings.ReadAheadPost, seed: @import("stream.zig").DecodeSeed) Tail {
-    return switch (post) {
-        .early => if (seed == .prompt_tail) tailPostNextOf(readAheadCoEvalOf(true)) else tailPostNextOf(readAheadCoEvalOf(false)),
-        else => tailEval,
-    };
-}
-
-/// The early post's predictor: `readAheadPredicted`'s tiles and counts on the next layer's input `x` (= this layer's
-/// output), evaluated in ONE eval together with `x` itself (the tail's eval), then posted for `abs_layer`.
-const ReadAheadCoEval = *const fn (source: *source_mod.Source, abs_layer: u32, r: Router, post_norm: Array, x: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void;
-
-fn readAheadCoEvalOf(comptime tail: bool) ReadAheadCoEval {
-    return &struct {
-        fn f(source: *source_mod.Source, abs_layer: u32, r: Router, post_norm: Array, x: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void {
-            const n = mlx.getShape(x)[0];
-            const tail_from: c_int = if (tail) n - @min(n, @as(c_int, @intCast(source.stream_source.tail_ids / source_mod.top_k))) else n;
-            const counts = source.ahead_counts[0..source.bank.geometry.num_experts];
-            try predictCountsOneEvalWith(tail, x, r, post_norm, norm_ones, eps, tail_from, counts, &source.ahead_ids, x, s);
-            try source.ex.at(abs_layer).readAheadSeed(expert_policy.rankHottest(counts, &source.ahead_ranked));
-        }
-    }.f;
-}
-
-/// `"early"`: a routed following layer's predictor rides this layer's tail eval and its read-ahead is posted here, one
-/// layer's tail + edge + predict stage before the control posts it. Same input rows, same tile graphs, same counts and
-/// ranking, the same stream state (no stream call falls between the two points: this layer's `Source.forward` has
-/// flushed its routes, and the stream holds at most one read-ahead, this layer's, already awaited by its routing):
-/// the same records in the same order.
-fn tailPostNextOf(comptime post: ReadAheadCoEval) Tail {
-    return &struct {
-        fn f(source: *source_mod.Source, next_abs: u32, following: ?*const Layer, next: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void {
-            const l = following orelse return mlx.check(mlx.mlx_array_eval(next));
-            switch (l.mlp) {
-                .dense => try mlx.check(mlx.mlx_array_eval(next)),
-                .routed => |r| {
-                    if (comptime prefill_timeline.enabled) prefill_timeline.stage(.predict);
-                    try post(source, next_abs, r, l.post_norm, next, norm_ones, eps, s);
-                },
-            }
-        }
-    }.f;
-}
-
-/// `one_eval`: the call's router tiles evaluated together (`.spanned`), else each on its own (the control).
-fn readAheadPredictedOf(comptime tail: bool, comptime one_eval: bool) ReadAhead {
+fn readAheadPredictedOf(comptime one_eval: bool) ReadAhead {
     return &struct {
         fn f(source: *source_mod.Source, abs_layer: u32, r: Router, post_norm: Array, x: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void {
             return if (one_eval)
-                readAheadPredictedOneEval(tail, source, abs_layer, r, post_norm, x, norm_ones, eps, s)
+                readAheadPredictedOneEval(source, abs_layer, r, post_norm, x, norm_ones, eps, s)
             else
-                readAheadPredicted(tail, source, abs_layer, r, post_norm, x, norm_ones, eps, s);
+                readAheadPredicted(source, abs_layer, r, post_norm, x, norm_ones, eps, s);
         }
     }.f;
 }
@@ -1860,12 +1498,9 @@ fn readAheadOff(_: *source_mod.Source, _: u32, _: Router, _: Array, _: Array, _:
 /// The layer's own F32 router (`route`, unchanged) on its post-normed INPUT (the attention output is not yet known), in
 /// `predict_rows` tiles; the prompt's counts ranked hottest first (the seed's order) go to the stream, which reads them
 /// into the layer's empty persistent rows while its attention runs. The prediction only picks reads: no output sees it.
-fn readAheadPredicted(comptime tail: bool, source: *source_mod.Source, abs_layer: u32, r: Router, post_norm: Array, x: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void {
+fn readAheadPredicted(source: *source_mod.Source, abs_layer: u32, r: Router, post_norm: Array, x: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void {
     const shape = mlx.getShape(x);
     const n = shape[0];
-    // Tail: each count packs (tail count << 16 | whole count) (both <= the call's 16,384 rows), so `rankHottest`
-    // ranks by the tail, then the whole call, then id: `rankTail`'s order.
-    const tail_from: c_int = if (tail) n - @min(n, @as(c_int, @intCast(source.stream_source.tail_ids / source_mod.top_k))) else n;
     const counts = source.ahead_counts[0..source.bank.geometry.num_experts];
     @memset(counts, 0);
     var start: c_int = 0;
@@ -1875,9 +1510,6 @@ fn readAheadPredicted(comptime tail: bool, source: *source_mod.Source, abs_layer
         defer drop(tile);
         const ids = try predictIds(tile, r, post_norm, norm_ones, eps, source.ahead_ids[0 .. @as(usize, @intCast(end - start)) * source_mod.top_k], s);
         for (ids) |e| counts[e] += 1;
-        if (tail) for (ids, 0..) |e, i| {
-            if (start + @as(c_int, @intCast(i / source_mod.top_k)) >= tail_from) counts[e] += 1 << 16;
-        };
         start = end;
     }
     try source.ex.at(abs_layer).readAheadSeed(expert_policy.rankHottest(counts, &source.ahead_ranked));
@@ -1886,29 +1518,21 @@ fn readAheadPredicted(comptime tail: bool, source: *source_mod.Source, abs_layer
 /// The most router tiles one call holds (the call's rows are at most `prefill_max_tokens`).
 const max_predict_tiles = (mimo.prefill_max_tokens + source_mod.predict_rows - 1) / source_mod.predict_rows;
 
-/// `.spanned`'s predictor: `readAheadPredicted`'s tiles and graphs, every tile's ids evaluated in ONE eval, then each
-/// read back and counted in tile order (the same counts, so the same seed).
-fn readAheadPredictedOneEval(comptime tail: bool, source: *source_mod.Source, abs_layer: u32, r: Router, post_norm: Array, x: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void {
-    const n = mlx.getShape(x)[0];
-    const tail_from: c_int = if (tail) n - @min(n, @as(c_int, @intCast(source.stream_source.tail_ids / source_mod.top_k))) else n;
+/// `prefill_predict_evals: one`: `readAheadPredicted`'s tiles and graphs, every tile's ids evaluated in ONE eval, then
+/// each read back and counted in tile order (the same counts, so the same seed).
+fn readAheadPredictedOneEval(source: *source_mod.Source, abs_layer: u32, r: Router, post_norm: Array, x: Array, norm_ones: Array, eps: f32, s: Stream) anyerror!void {
     const counts = source.ahead_counts[0..source.bank.geometry.num_experts];
-    try predictCountsOneEval(tail, x, r, post_norm, norm_ones, eps, tail_from, counts, &source.ahead_ids, s);
+    try predictCountsOneEval(x, r, post_norm, norm_ones, eps, counts, &source.ahead_ids, s);
     try source.ex.at(abs_layer).readAheadSeed(expert_policy.rankHottest(counts, &source.ahead_ranked));
 }
 
-/// The one-eval predictor's counts (as `readAheadPredicted` counts them: whole call, plus the tail's `1 << 16` from row
-/// `tail_from` when `tail`), `scratch` holding one tile's ids at a time.
-fn predictCountsOneEval(comptime tail: bool, x: Array, r: Router, post_norm: Array, norm_ones: Array, eps: f32, tail_from: c_int, counts: []u32, scratch: *[source_mod.predict_rows * source_mod.top_k]u32, s: Stream) !void {
-    return predictCountsOneEvalWith(tail, x, r, post_norm, norm_ones, eps, tail_from, counts, scratch, .{}, s);
-}
-
-/// `predictCountsOneEval` with `also` (when set) evaluated in the same eval (the early tail: the layer's output).
-fn predictCountsOneEvalWith(comptime tail: bool, x: Array, r: Router, post_norm: Array, norm_ones: Array, eps: f32, tail_from: c_int, counts: []u32, scratch: *[source_mod.predict_rows * source_mod.top_k]u32, also: Array, s: Stream) !void {
+/// The one-eval predictor's counts (as `readAheadPredicted` counts them), `scratch` holding one tile's ids at a time.
+fn predictCountsOneEval(x: Array, r: Router, post_norm: Array, norm_ones: Array, eps: f32, counts: []u32, scratch: *[source_mod.predict_rows * source_mod.top_k]u32, s: Stream) !void {
     const shape = mlx.getShape(x);
     const n = shape[0];
     std.debug.assert(n <= mimo.prefill_max_tokens);
     @memset(counts, 0);
-    var ids: [max_predict_tiles + 1]Array = @splat(.{});
+    var ids: [max_predict_tiles]Array = @splat(.{});
     var tiles: usize = 0;
     defer for (ids[0..tiles]) |t| drop(t);
     var start: c_int = 0;
@@ -1920,9 +1544,7 @@ fn predictCountsOneEvalWith(comptime tail: bool, x: Array, r: Router, post_norm:
         tiles += 1;
         start = end;
     }
-    // `also` rides the same eval (borrowed: not dropped here).
-    if (also.ctx != null) ids[tiles] = also;
-    const vec = mlx.mlx_vector_array_new_data(&ids, tiles + @intFromBool(also.ctx != null));
+    const vec = mlx.mlx_vector_array_new_data(&ids, tiles);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_eval(vec));
     start = 0;
@@ -1930,9 +1552,6 @@ fn predictCountsOneEvalWith(comptime tail: bool, x: Array, r: Router, post_norm:
         const end = @min(n, start + @as(c_int, source_mod.predict_rows));
         const got = try readIds(t, scratch[0 .. @as(usize, @intCast(end - start)) * source_mod.top_k]);
         for (got) |e| counts[e] += 1;
-        if (tail) for (got, 0..) |e, i| {
-            if (start + @as(c_int, @intCast(i / source_mod.top_k)) >= tail_from) counts[e] += 1 << 16;
-        };
         start = end;
     }
 }
@@ -3774,15 +3393,12 @@ test "mimo read-ahead: the installed route runs only for routed layers; off is t
             layer = abs_layer;
         }
     };
-    try std.testing.expect(installReadAhead(true, .prompt_counts, false) == readAheadPredictedOf(false, false));
-    try std.testing.expect(installReadAhead(true, .{ .prompt_tail = 512 }, false) == readAheadPredictedOf(true, false));
-    try std.testing.expect(installReadAhead(false, .{ .prompt_tail = 512 }, false) == &readAheadOff);
-    try std.testing.expect(installReadAhead(false, .prompt_counts, false) == &readAheadOff);
-    // mimo/prefill-attn2: `.spanned` installs the one-eval predictor; off stays off.
-    try std.testing.expect(installReadAhead(true, .prompt_counts, true) == readAheadPredictedOf(false, true));
-    try std.testing.expect(installReadAhead(true, .{ .prompt_tail = 512 }, true) == readAheadPredictedOf(true, true));
-    try std.testing.expect(installReadAhead(false, .prompt_counts, true) == &readAheadOff);
-    try std.testing.expect(readAheadPredictedOf(false, true) != readAheadPredictedOf(false, false));
+    try std.testing.expect(installReadAhead(true, false) == readAheadPredictedOf(false));
+    try std.testing.expect(installReadAhead(false, false) == &readAheadOff);
+    // `prefill_predict_evals: one` installs the one-eval predictor; off stays off.
+    try std.testing.expect(installReadAhead(true, true) == readAheadPredictedOf(true));
+    try std.testing.expect(installReadAhead(false, true) == &readAheadOff);
+    try std.testing.expect(readAheadPredictedOf(true) != readAheadPredictedOf(false));
     try std.testing.expect((settings.Config{}).prefill_read_ahead);
     var c: settings.Config = .{};
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"prefill_read_ahead\":false}", .{});
@@ -3966,7 +3582,7 @@ test "mimo mtp rollback: a verify trimmed by the rejected rows leaves every cach
 
 test "mimo mtp lane: the verify forward routes no prompt read-ahead; the prompt keeps its installed route" {
     try std.testing.expect(verify_read_ahead == &readAheadOff);
-    try std.testing.expect(installReadAhead(true, .prompt_counts, false) != verify_read_ahead);
+    try std.testing.expect(installReadAhead(true, false) != verify_read_ahead);
 }
 
 test "mimo install log: the residents' storage is named apart from the streamed experts" {
@@ -4018,8 +3634,6 @@ test "mimo fp8res route: QLinear.load binds forwardFp8 for FP8 storage, keeps th
     try std.testing.expect(literal.run == &QLinear.forwardStock);
 }
 
-// ---- mimo/prefill-attn2 (`prefill_attention_evals`): begin ----
-
 /// Aperiodic BF16 values in [-amp, amp) (xorshift; no period a misplaced row could hide behind), any shape.
 fn attn2Random(a: std.mem.Allocator, shape: []const c_int, seed: u32, amp: f32) !Array {
     var count: usize = 1;
@@ -4038,97 +3652,13 @@ fn attn2Random(a: std.mem.Allocator, shape: []const c_int, seed: u32, amp: f32) 
     return mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .bfloat16);
 }
 
-/// Byte equality of two BF16 arrays of one shape (read through their strides): the differing element count and the
-/// first differing flat index.
-fn attn2Diff(a: std.mem.Allocator, left: Array, right: Array) !struct { diff: usize, first: ?usize } {
-    try std.testing.expectEqualSlices(c_int, mlx.getShape(left), mlx.getShape(right));
-    try mlx.check(mlx.mlx_array_eval(left));
-    try mlx.check(mlx.mlx_array_eval(right));
-    const n = mlx.mlx_array_size(left);
-    const l = try a.alloc(u16, n);
-    defer a.free(l);
-    const r = try a.alloc(u16, n);
-    defer a.free(r);
-    const copy = @import("../deepseek_v41/ops.zig").copyStrided;
-    const nd = mlx.mlx_array_ndim(left);
-    copy(u16, u16, mlx.mlx_array_data_bfloat16(left) orelse return error.MimoNumericalData, mlx.getShape(left), mlx.mlx_array_strides(left)[0..nd], l);
-    copy(u16, u16, mlx.mlx_array_data_bfloat16(right) orelse return error.MimoNumericalData, mlx.getShape(right), mlx.mlx_array_strides(right)[0..nd], r);
-    var diff: usize = 0;
-    var first: ?usize = null;
-    for (l, r, 0..) |x, y, i| if (x != y) {
-        diff += 1;
-        if (first == null) first = i;
-    };
-    return .{ .diff = diff, .first = first };
-}
-
-/// The projection proof: `q` over `rows` call rows in one GEMM vs the control's 512-row tiles of the same rows, each
-/// tile compared with its rows of the call's output (no joined copy). `width` = the projection's input width.
-fn attn2Projection(a: std.mem.Allocator, label: []const u8, proj: QLinear, x: Array, rows: u32, s: Stream) !usize {
-    const width = mlx.getShape(x)[1];
-    const out_w = mlx.getShape(proj.w)[0];
-    const call = try proj.forward(x, s);
-    defer drop(call);
-    try mlx.check(mlx.mlx_array_eval(call));
-    var diff: usize = 0;
-    var start: u32 = 0;
-    while (start < rows) {
-        const end = @min(rows, start + prefill_attention.query_tile_rows);
-        const xt = try slice2(x, @intCast(start), @intCast(end), 0, width, s);
-        defer drop(xt);
-        const tile = try proj.forward(xt, s);
-        defer drop(tile);
-        const part = try slice2(call, @intCast(start), @intCast(end), 0, out_w, s);
-        defer drop(part);
-        const d = try attn2Diff(a, part, tile);
-        if (d.diff != 0) std.debug.print("MIMO_ATTN2_PROJ {s} rows={d} tile=[{d},{d}) diff={d} first={?d}\n", .{ label, rows, start, end, d.diff, d.first });
-        diff += d.diff;
-        start = end;
-    }
-    std.debug.print("MIMO_ATTN2_PROJ {s} rows={d} M_call={d} M_tile={d} in={d} out={d} byte_equal={}\n", .{ label, rows, rows, @min(rows, prefill_attention.query_tile_rows), width, out_w, diff == 0 });
-    return diff;
-}
-
-test "mimo prefill attn2 route: tiled installs forwardNax (the control), spanned forwardNaxSpanned; no per-tile branch" {
-    const kernel: prefill_attention.Kernel = .{};
-    var at: Attention = undefined;
-    at.installNax(&kernel, .tiled);
-    try std.testing.expect(at.tiled == &Attention.forwardNax);
-    try std.testing.expectEqual(@as(u32, 8), at.mask_rows);
-    at.installNax(&kernel, .spanned);
-    try std.testing.expect(at.tiled == &Attention.forwardNaxSpanned);
-    try std.testing.expectEqual(@as(u32, 8), max_predict_tiles);
-}
-
 // MLX CPU stream (the gates' MLX_DEFAULT_DEVICE=cpu, as the drain's CPU proof): the q (4096 -> 12,288) and o
 // (8,192 -> 4,096) projections at the real widths, dense BF16 random weights, over the call vs per 512-row tile.
 // 16,384 rows with MIMO_ATTN2_CPU_FULL=1 (seconds of CPU GEMM and ~1.5 GB host arrays: run once, logged).
-test "mimo prefill attn2 CPU: q and o over the call equal the 512-row tiles byte for byte (512 / 1,024 / 1,037; 16,384 opt-in)" {
-    const a = std.testing.allocator;
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    const c: mimo.Config = .{};
-    const q_w = try attn2Random(a, &.{ @intCast(c.n_heads * c.head_dim), @intCast(c.hidden_size) }, 0x9e3779b9, 0.05);
-    defer drop(q_w);
-    const o_w = try attn2Random(a, &.{ @intCast(c.hidden_size), @intCast(c.n_heads * c.value_head_dim) }, 0x7f4a7c15, 0.05);
-    defer drop(o_w);
-    const q: QLinear = .{ .w = q_w, .scales = .{}, .biases = .{}, .storage = mimo.Storage.bf16 };
-    const o: QLinear = .{ .w = o_w, .scales = .{}, .biases = .{}, .storage = mimo.Storage.bf16 };
-    const full = std.c.getenv("MIMO_ATTN2_CPU_FULL") != null;
-    const cases = [_]u32{ 512, 1024, 1037, 16_384 };
-    for (cases[0..if (full) cases.len else cases.len - 1]) |rows| {
-        const x = try attn2Random(a, &.{ @intCast(rows), @intCast(c.hidden_size) }, 0x1234567 +% rows, 2);
-        defer drop(x);
-        try std.testing.expectEqual(@as(usize, 0), try attn2Projection(a, "q", q, x, rows, s));
-        const y = try attn2Random(a, &.{ @intCast(rows), @intCast(c.n_heads * c.value_head_dim) }, 0x2545f491 +% rows, 2);
-        defer drop(y);
-        try std.testing.expectEqual(@as(usize, 0), try attn2Projection(a, "o", o, y, rows, s));
-    }
-}
 
 // MLX CPU stream: the one-eval predictor's counts (whole call and tail) equal the control's per-tile predictor's on a
 // synthetic routed layer over three full router tiles and a 37-row tail tile.
-test "mimo prefill attn2 CPU: the one-eval predictor counts equal the per-tile predictor's (whole call and tail)" {
+test "mimo prefill predict evals CPU: the one-eval predictor counts equal the per-tile predictor's" {
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -4152,8 +3682,7 @@ test "mimo prefill attn2 CPU: the one-eval predictor counts equal the per-tile p
     defer drop(ones);
     const r: Router = .{ .weight_bf16 = .{}, .bias = bias, .weight_t_f32 = w };
     var scratch: [source_mod.predict_rows * source_mod.top_k]u32 = undefined;
-    inline for (.{ false, true }) |tail| {
-        const tail_from: c_int = if (tail) rows - 512 else rows;
+    {
         var want: [E]u32 = @splat(0);
         var got: [E]u32 = @splat(0);
         // The control (`readAheadPredicted`'s loop): each tile evaluated and read back on its own.
@@ -4164,377 +3693,14 @@ test "mimo prefill attn2 CPU: the one-eval predictor counts equal the per-tile p
             defer drop(tile);
             const ids = try predictIds(tile, r, post_norm, ones, 1e-6, scratch[0 .. @as(usize, @intCast(end - start)) * source_mod.top_k], s);
             for (ids) |e| want[e] += 1;
-            if (tail) for (ids, 0..) |e, i| {
-                if (start + @as(c_int, @intCast(i / source_mod.top_k)) >= tail_from) want[e] += 1 << 16;
-            };
             start = end;
         }
-        try predictCountsOneEval(tail, x, r, post_norm, ones, 1e-6, tail_from, &got, &scratch, s);
+        try predictCountsOneEval(x, r, post_norm, ones, 1e-6, &got, &scratch, s);
         try std.testing.expectEqualSlices(u32, &want, &got);
         var total: u64 = 0;
-        for (got) |v| total += v & 0xffff;
+        for (got) |v| total += v;
         try std.testing.expectEqual(@as(u64, @intCast(rows)) * source_mod.top_k, total);
-        std.debug.print("MIMO_ATTN2_PREDICT tail={} rows={d} tiles=4 counts_equal=true\n", .{ tail, rows });
+        std.debug.print("MIMO_PREDICT_EVALS rows={d} tiles=4 counts_equal=true\n", .{rows});
     }
 }
 
-test "mimo prefill attn2 read-ahead post: after_predict installs the evaluating tail (the control); early posts the following routed layer's read-ahead from the tail" {
-    try std.testing.expect(installTail(.after_predict, .prompt_counts) == &tailEval);
-    try std.testing.expect(installTail(.after_predict, .{ .prompt_tail = 512 }) == &tailEval);
-    try std.testing.expect(installTail(.early, .prompt_counts) == tailPostNextOf(readAheadCoEvalOf(false)));
-    try std.testing.expect(installTail(.early, .{ .prompt_tail = 512 }) == tailPostNextOf(readAheadCoEvalOf(true)));
-    try std.testing.expect(verify_tail == &tailEval);
-    // The issue points, recorded: under early the post happens in layer L's tail for L + 1 on L's output; a dense
-    // following layer and the last layer post nothing (and their tails still evaluate the output).
-    const Record = struct {
-        var calls: u32 = 0;
-        var layer: u32 = 0;
-        var input: ?*anyopaque = null;
-        fn post(_: *source_mod.Source, abs_layer: u32, _: Router, _: Array, x: Array, _: Array, _: f32, _: Stream) anyerror!void {
-            calls += 1;
-            layer = abs_layer;
-            input = x.ctx;
-        }
-    };
-    const tail = tailPostNextOf(&Record.post);
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    const one = mlx.mlx_array_new_float(1.5);
-    defer drop(one);
-    const next = try binary(mlx.mlx_add, one, one, s);
-    defer drop(next);
-    var dense: Layer = undefined;
-    dense.mlp = .{ .dense = undefined };
-    var routed: Layer = undefined;
-    routed.mlp = .{ .routed = .{ .weight_bf16 = .{}, .bias = .{} } };
-    routed.post_norm = .{};
-    const source: *source_mod.Source = undefined;
-    try tail(source, 1, &dense, next, .{}, 1e-6, s);
-    try tail(source, 48, null, next, .{}, 1e-6, s);
-    try std.testing.expectEqual(@as(u32, 0), Record.calls);
-    var value: f32 = 0;
-    try mlx.check(mlx.mlx_array_item_float32(&value, next));
-    try std.testing.expectEqual(@as(f32, 3), value);
-    try tail(source, 8, &routed, next, .{}, 1e-6, s);
-    try std.testing.expectEqual(@as(u32, 1), Record.calls);
-    try std.testing.expectEqual(@as(u32, 8), Record.layer);
-    try std.testing.expect(Record.input == next.ctx);
-    // The start route the early post leaves on: off (Module.init installs `installReadAhead(on and after_predict)`).
-    try std.testing.expect(installReadAhead(false, .prompt_counts, false) == &readAheadOff);
-}
-
-// MLX CPU stream: the early tail's predictor (`predictCountsOneEvalWith`, the layer output riding the same eval) counts
-// exactly as the control's per-tile predictor on the next layer's input, and leaves the output evaluated to the same
-// bytes as evaluating it alone.
-test "mimo prefill attn2 CPU: the early tail's co-evaluated predictor counts equal the control's and its output is unchanged" {
-    const a = std.testing.allocator;
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    const H = 64;
-    const E = 256;
-    const rows: c_int = @intCast(2 * source_mod.predict_rows + 129);
-    const residual = try attn2Random(a, &.{ rows, H }, 0x0ddba11, 2);
-    defer drop(residual);
-    const mlp = try attn2Random(a, &.{ rows, H }, 0xcafef00d, 1);
-    defer drop(mlp);
-    const wb = try attn2Random(a, &.{ H, E }, 0x51ed27, 0.25);
-    defer drop(wb);
-    const w = try cast(wb, .float32, s);
-    defer drop(w);
-    const bb = try attn2Random(a, &.{E}, 0x3c6ef372, 0.05);
-    defer drop(bb);
-    const bias = try cast(bb, .float32, s);
-    defer drop(bias);
-    const post_norm = try attn2Random(a, &.{H}, 0xa54ff53a, 1);
-    defer drop(post_norm);
-    var ones: Array = .{};
-    try mlx.check(mlx.mlx_ones(&ones, &.{H}, 1, .bfloat16, s));
-    defer drop(ones);
-    const r: Router = .{ .weight_bf16 = .{}, .bias = bias, .weight_t_f32 = w };
-    var scratch: [source_mod.predict_rows * source_mod.top_k]u32 = undefined;
-    // The control: the layer's output evaluated alone (tailEval), then the next layer's per-tile predictor on it.
-    const alone = try binary(mlx.mlx_add, residual, mlp, s);
-    defer drop(alone);
-    try mlx.check(mlx.mlx_array_eval(alone));
-    var want: [E]u32 = @splat(0);
-    var start: c_int = 0;
-    while (start < rows) {
-        const end = @min(rows, start + @as(c_int, source_mod.predict_rows));
-        const tile = try slice2(alone, start, end, 0, H, s);
-        defer drop(tile);
-        for (try predictIds(tile, r, post_norm, ones, 1e-6, scratch[0 .. @as(usize, @intCast(end - start)) * source_mod.top_k], s)) |e| want[e] += 1;
-        start = end;
-    }
-    // Early: the output still lazy, its predictor and itself in one eval.
-    const next = try binary(mlx.mlx_add, residual, mlp, s);
-    defer drop(next);
-    var got: [E]u32 = @splat(0);
-    try predictCountsOneEvalWith(false, next, r, post_norm, ones, 1e-6, rows, &got, &scratch, next, s);
-    try std.testing.expectEqualSlices(u32, &want, &got);
-    const d = try attn2Diff(a, next, alone);
-    try std.testing.expectEqual(@as(usize, 0), d.diff);
-    std.debug.print("MIMO_ATTN2_EARLY rows={d} tiles=3 counts_equal=true output_byte_equal=true\n", .{rows});
-}
-
-/// Static bound of the device check (one layer kind at a time, every array counted live at once): the call's input
-/// and o's input (16,384 x (4,096 + 8,192) BF16), the layer's dense weights (q 12,288 x 4,096, sliding k/v, o), the
-/// projection proof's call output + one tile, the two routes' outputs and caches, the spanned route's own bill
-/// (`spannedEvalBytes`) and the tiled join (outputs + joined copy), one tiled tile (128 MiB), rotary tables, plus the
-/// 256 MiB cache + 512 MiB compiler + 128 MiB host allowances of the attn families.
-pub fn attn2Bound() u64 {
-    const c: mimo.Config = .{};
-    const rows: u64 = mimo.prefill_max_tokens;
-    const inputs = rows * (c.hidden_size + c.n_heads * c.value_head_dim) * 2;
-    const weights = (@as(u64, c.n_heads) * c.head_dim * c.hidden_size + @as(u64, c.swa_n_kv_heads) * (c.head_dim + c.value_head_dim) * c.hidden_size + @as(u64, c.hidden_size) * c.n_heads * c.value_head_dim) * 2;
-    const projection = rows * c.n_heads * c.head_dim * 2 + @as(u64, prefill_attention.query_tile_rows) * c.n_heads * c.head_dim * 2;
-    const outputs = 2 * rows * c.hidden_size * 2;
-    const caches = 2 * rows * c.n_kv_heads * (c.head_dim + c.value_head_dim) * 2;
-    const tiled_join = 2 * rows * c.hidden_size * 2 + (128 << 20);
-    const tables = rows * c.rope_head_dim * 4 * 4;
-    return inputs + weights + projection + outputs + caches + prefill_attention.spannedEvalBytes(c.hidden_size, rows) + tiled_join + tables +
-        (256 << 20) + (512 << 20) + (128 << 20);
-}
-
-// STAGED pre-ship family `attn2` (families.tsv; never run by the CPU gates): on the NAX device, at 16,384 rows with
-// dense random BF16 weights: (1) q and o over the call equal their 512-row tiles byte for byte (the Metal NAX GEMM:
-// q keeps its pipeline at both M, o's K-block changes 64 -> 256 at M >= 4,096); (2) a global and a sliding layer's
-// `forwardNaxSpanned` output equals `forwardNax`'s byte for byte (and the global cache too). Lock + env gated, its own
-// MLX memory limit (4 GiB), its static bound printed and asserted against the measured peak.
-test "mimo GPU attn2: spanned q/o projections and spanned NAX layers equal the tiled route byte for byte at 16,384 rows" {
-    _ = std.c.getenv("MIMO_ATTN2_GPU") orelse return error.SkipZigTest;
-    const guard = std.c.getenv("_GPU_WINDOW_LOCKED") orelse return error.GpuLockRequired;
-    if (!std.mem.eql(u8, std.mem.span(guard), "1")) return error.GpuLockRequired;
-    const a = std.testing.allocator;
-    const ceiling: u64 = 4 << 30;
-    const bound = attn2Bound();
-    std.debug.print("MIMO_ATTN2 static: bound={d} ceiling={d}\n", .{ bound, ceiling });
-    if (bound > ceiling) return error.MimoNumericalAdmission;
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    if (!prefill_attention.deviceHasNax(s)) return error.MimoNaxDeviceRequired;
-    var old_limit: usize = 0;
-    try mlx.check(mlx.mlx_set_memory_limit(&old_limit, ceiling));
-    defer {
-        var ignored: usize = 0;
-        _ = mlx.mlx_set_memory_limit(&ignored, old_limit);
-    }
-    try mlx.check(mlx.mlx_reset_peak_memory());
-    var kernel = try prefill_attention.Kernel.init(s);
-    defer kernel.deinit();
-    const c: mimo.Config = .{};
-    const rows: u32 = mimo.prefill_max_tokens;
-    const x = try attn2Random(a, &.{ @intCast(rows), @intCast(c.hidden_size) }, 0x0badc0de, 2);
-    defer drop(x);
-    const q_w = try attn2Random(a, &.{ @intCast(c.n_heads * c.head_dim), @intCast(c.hidden_size) }, 0x9e3779b9, 0.05);
-    defer drop(q_w);
-    const o_w = try attn2Random(a, &.{ @intCast(c.hidden_size), @intCast(c.n_heads * c.value_head_dim) }, 0x7f4a7c15, 0.05);
-    defer drop(o_w);
-    const dense = mimo.Storage.bf16;
-    const q: QLinear = .{ .w = q_w, .scales = .{}, .biases = .{}, .storage = dense };
-    const o: QLinear = .{ .w = o_w, .scales = .{}, .biases = .{}, .storage = dense };
-    var failed: usize = 0;
-    // (1) the GEMMs alone.
-    failed += try attn2Projection(a, "q", q, x, rows, s);
-    {
-        const y = try attn2Random(a, &.{ @intCast(rows), @intCast(c.n_heads * c.value_head_dim) }, 0x2545f491, 2);
-        defer drop(y);
-        failed += try attn2Projection(a, "o", o, y, rows, s);
-    }
-    // (2) whole layers, both kinds.
-    const value_scale = mlx.mlx_array_new_float(c.attention_value_scale);
-    defer drop(value_scale);
-    for ([_]mimo.Attention{ .full, .sliding }) |mode| {
-        const kvh: u32 = if (mode == .full) c.n_kv_heads else c.swa_n_kv_heads;
-        const k_w = try attn2Random(a, &.{ @intCast(kvh * c.head_dim), @intCast(c.hidden_size) }, 0x6a09e667, 0.05);
-        defer drop(k_w);
-        const v_w = try attn2Random(a, &.{ @intCast(kvh * c.value_head_dim), @intCast(c.hidden_size) }, 0xbb67ae85, 0.05);
-        defer drop(v_w);
-        const sinks: Array = if (mode == .sliding) try attn2Random(a, &.{@intCast(c.n_heads)}, 0x3c6ef372, 1) else .{};
-        defer drop(sinks);
-        var at: Attention = .{
-            .q = q,
-            .k = .{ .w = k_w, .scales = .{}, .biases = .{}, .storage = dense },
-            .v = .{ .w = v_w, .scales = .{}, .biases = .{}, .storage = dense },
-            .o = o,
-            .mode = mode,
-            .heads = c.n_heads,
-            .kv_heads = kvh,
-            .head_dim = c.head_dim,
-            .v_dim = c.value_head_dim,
-            .rope_dim = c.rope_head_dim,
-            .rope_base = if (mode == .sliding) c.swa_rope_theta else c.rope_theta,
-            .window = c.window,
-            .sinks = sinks,
-        };
-        const freq = inverseFrequencies(at.rope_base, c.rope_head_dim);
-        defer drop(freq);
-        var rotary = try rotaryTables(freq, 0, rows, s);
-        defer rotary.deinit();
-        var outs: [2]Array = .{ .{}, .{} };
-        defer for (outs) |out| drop(out);
-        var caches: [2]Cache = .{ .{}, .{} };
-        defer for (&caches) |*cache| cache.deinit();
-        for ([_]prefill_attention.Evals{ .tiled, .spanned }, 0..) |evals, i| {
-            caches[i] = try Cache.install(.bf16, mode, c, 0, s);
-            if (mode == .full) try caches[i].allocate(c.n_kv_heads, rows, c.head_dim, c.value_head_dim, s);
-            at.installNax(&kernel, evals);
-            outs[i] = try at.tiled(at, a, x, &caches[i], 0, rows, rotary, value_scale, s);
-            try mlx.check(mlx.mlx_synchronize(s));
-        }
-        const d = try attn2Diff(a, outs[1], outs[0]);
-        std.debug.print("MIMO_ATTN2 layer={s} rows={d} spanned==tiled byte_equal={} diff={d} first={?d}\n", .{ @tagName(mode), rows, d.diff == 0, d.diff, d.first });
-        failed += d.diff;
-        if (mode == .full) for ([_][2]Array{ .{ caches[1].k, caches[0].k }, .{ caches[1].v, caches[0].v } }) |pair| {
-            const dc = try attn2Diff(a, pair[0], pair[1]);
-            std.debug.print("MIMO_ATTN2 layer=full cache byte_equal={} diff={d}\n", .{ dc.diff == 0, dc.diff });
-            failed += dc.diff;
-        };
-    }
-    try mlx.check(mlx.mlx_synchronize(s));
-    var peak: usize = 0;
-    try mlx.check(mlx.mlx_get_peak_memory(&peak));
-    std.debug.print("MIMO_ATTN2 peak: mlx={d} bound={d} failed_elements={d}\n", .{ peak, bound, failed });
-    try std.testing.expectEqual(@as(usize, 0), failed);
-    if (peak > bound) return error.MimoNumericalPeakExceeded;
-}
-// ---- mimo/prefill-attn2: end ----
-
-// ---- mimo/k2-glue: begin ----
-test "mimo glue route: K3 installs forwardSlidingFused on a sliding attention (the control: forwardOps)" {
-    var at: Attention = undefined;
-    at.small = Attention.forwardOps;
-    at.sliding_kernels = null;
-    try std.testing.expect(at.small == Attention.forwardOps);
-    var k: sliding_attention.Kernels = .{};
-    at.installSliding(&k);
-    try std.testing.expect(at.small == Attention.forwardSlidingFused);
-    try std.testing.expect(at.sliding_kernels.? == &k);
-}
-
-/// Static bound: the sliding layer's random BF16 weights (q 100.7 MB + k 12.6 + v 8.4 + o 67.1), two rings' slots
-/// (2 x 2 x 656 x 8 x 320 x 2 B = 6.7 MB each), a history chunk (512 rows: 2.6 MB), a step's transients (< 32 MiB), the
-/// MLX cache 256 MiB and the compiler 512 MiB.
-pub fn slidingSelfCheckBound() u64 {
-    const c: mimo.Config = .{};
-    const weights = (@as(u64, c.n_heads) * c.head_dim * c.hidden_size + @as(u64, c.swa_n_kv_heads) * (c.head_dim + c.value_head_dim) * c.hidden_size + @as(u64, c.hidden_size) * c.n_heads * c.value_head_dim) * 2;
-    const rings = 2 * kv_storage.ringBytes(c) / (c.n_layers - c.fullLayers());
-    return weights + rings + (3 << 20) + (32 << 20) + (256 << 20) + (512 << 20);
-}
-
-// STAGED pre-ship family `glue` (families.tsv, with glue.zig's K2 check): K3's fused sliding layer (`forwardSlidingFused`)
-// against the control (`forwardOps` on the kernels decode tier) on the device, random BF16 weights at the real shapes,
-// two BF16 rings with the same history: the layer's output and both rings' slots bit for bit, M = 1..8, histories across
-// the window and the ring's compaction (0, 1, 126, 127, 128, 129, 300, 655, 700).
-test "mimo GPU glue K3: the fused sliding layer vs the kernels route bit for bit (output, ring K/V) at M = 1..8 across the window" {
-    const enabled = std.c.getenv("MIMO_GLUE_GPU") orelse return error.SkipZigTest;
-    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.SkipZigTest;
-    const guard = std.c.getenv("_GPU_WINDOW_LOCKED") orelse return error.GpuLockRequired;
-    if (!std.mem.eql(u8, std.mem.span(guard), "1")) return error.GpuLockRequired;
-    const a = std.testing.allocator;
-    const ceiling: u64 = 2 << 30;
-    const bound = slidingSelfCheckBound();
-    std.debug.print("MIMO_GLUE_SELFCHECK K3 static: bound={d} ceiling={d}\n", .{ bound, ceiling });
-    if (bound > ceiling) return error.MimoNumericalAdmission;
-    mlx.installErrorHandler();
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    var old_limit: usize = 0;
-    try mlx.check(mlx.mlx_set_memory_limit(&old_limit, ceiling));
-    defer {
-        var ignored: usize = 0;
-        _ = mlx.mlx_set_memory_limit(&ignored, old_limit);
-    }
-    try mlx.check(mlx.mlx_reset_peak_memory());
-    const c: mimo.Config = .{};
-    var dk = try decode_attention.Kernels.init(c);
-    defer dk.deinit();
-    var sk = try sliding_attention.Kernels.init(c);
-    defer sk.deinit();
-    const dense = mimo.Storage.bf16;
-    const kvh = c.swa_n_kv_heads;
-    const q_w = try attn2Random(a, &.{ @intCast(c.n_heads * c.head_dim), @intCast(c.hidden_size) }, 0x9e3779b9, 0.03);
-    defer drop(q_w);
-    const k_w = try attn2Random(a, &.{ @intCast(kvh * c.head_dim), @intCast(c.hidden_size) }, 0x6a09e667, 0.03);
-    defer drop(k_w);
-    const v_w = try attn2Random(a, &.{ @intCast(kvh * c.value_head_dim), @intCast(c.hidden_size) }, 0xbb67ae85, 0.03);
-    defer drop(v_w);
-    const o_w = try attn2Random(a, &.{ @intCast(c.hidden_size), @intCast(c.n_heads * c.value_head_dim) }, 0x7f4a7c15, 0.03);
-    defer drop(o_w);
-    const sinks = try attn2Random(a, &.{@intCast(c.n_heads)}, 0x3c6ef372, 2);
-    defer drop(sinks);
-    var ops: Attention = .{
-        .q = .{ .w = q_w, .scales = .{}, .biases = .{}, .storage = dense },
-        .k = .{ .w = k_w, .scales = .{}, .biases = .{}, .storage = dense },
-        .v = .{ .w = v_w, .scales = .{}, .biases = .{}, .storage = dense },
-        .o = .{ .w = o_w, .scales = .{}, .biases = .{}, .storage = dense },
-        .mode = .sliding,
-        .heads = c.n_heads,
-        .kv_heads = kvh,
-        .head_dim = c.head_dim,
-        .v_dim = c.value_head_dim,
-        .rope_dim = c.rope_head_dim,
-        .rope_base = c.swa_rope_theta,
-        .window = c.window,
-        .sinks = sinks,
-    };
-    ops.decode = decode_attention.install(.kernels, .sliding, 1 << 15, &dk);
-    var fused = ops;
-    fused.installSliding(&sk);
-    const value_scale = mlx.mlx_array_new_float(c.attention_value_scale);
-    defer drop(value_scale);
-    const freq = inverseFrequencies(c.swa_rope_theta, c.rope_head_dim);
-    defer drop(freq);
-    var failed: usize = 0;
-    var cases: usize = 0;
-    for ([_]u32{ 0, 1, 126, 127, 128, 129, 300, 655, 700 }) |hist| {
-        var m: u32 = 1;
-        while (m <= decode_attention.max_rows) : (m += 1) {
-            var caches: [2]Cache = .{ try Cache.install(.bf16, .sliding, c, 0, s), .{} };
-            defer for (&caches) |*cache| cache.deinit();
-            caches[1] = try Cache.install(.bf16, .sliding, c, 0, s);
-            // The same history in both rings (chunks of at most one prefill chunk, as the prompt writes them).
-            var at: u32 = 0;
-            while (at < hist) {
-                const n = @min(hist - at, mimo.prefill_chunk);
-                const kz = try attn2Random(a, &.{ 1, @intCast(kvh), @intCast(n), @intCast(c.head_dim) }, 0x1000 + at, 2);
-                defer drop(kz);
-                const vz = try attn2Random(a, &.{ 1, @intCast(kvh), @intCast(n), @intCast(c.value_head_dim) }, 0x2000 + at, 2);
-                defer drop(vz);
-                for (&caches) |*cache| {
-                    var view = try cache.update(kz, vz, at, n, .sliding, c.window, s);
-                    defer view.deinit();
-                    try mlx.check(mlx.mlx_array_eval(view.k));
-                    try mlx.check(mlx.mlx_array_eval(view.v));
-                }
-                at += n;
-            }
-            const x = try attn2Random(a, &.{ @intCast(m), @intCast(c.hidden_size) }, 0x3000 + hist * 8 + m, 1);
-            defer drop(x);
-            var rotary = try rotaryTables(freq, hist, m, s);
-            defer rotary.deinit();
-            const span = mimo.windowView(hist, m, c.window);
-            const mask = try causalMask(a, hist, m, span.first_key, span.key_count, c.window);
-            defer drop(mask);
-            const out_ops = try ops.forward(x, &caches[0], hist, @intCast(m), mask, rotary, value_scale, s);
-            defer drop(out_ops);
-            const out_fused = try fused.forward(x, &caches[1], hist, @intCast(m), mask, rotary, value_scale, s);
-            defer drop(out_fused);
-            try mlx.check(mlx.mlx_synchronize(s));
-            const d_out = try attn2Diff(a, out_fused, out_ops);
-            const d_k = try attn2Diff(a, caches[1].ring.k.bufs[caches[1].ring.k.cur].?, caches[0].ring.k.bufs[caches[0].ring.k.cur].?);
-            const d_v = try attn2Diff(a, caches[1].ring.v.bufs[caches[1].ring.v.cur].?, caches[0].ring.v.bufs[caches[0].ring.v.cur].?);
-            const bad = d_out.diff + d_k.diff + d_v.diff;
-            if (bad != 0 or m == 1 or m == 4 or m == 8)
-                std.debug.print("MIMO_GLUE_SELFCHECK K3 hist={d} M={d} out_diff={d} ring_k_diff={d} ring_v_diff={d}{s}\n", .{ hist, m, d_out.diff, d_k.diff, d_v.diff, if (bad != 0) " FAIL" else "" });
-            failed += @intFromBool(bad != 0);
-            cases += 1;
-        }
-    }
-    try mlx.check(mlx.mlx_synchronize(s));
-    var peak: usize = 0;
-    try mlx.check(mlx.mlx_get_peak_memory(&peak));
-    std.debug.print("MIMO_GLUE_SELFCHECK K3 done cases={d} failed={d} peak={d} bound={d}\n", .{ cases, failed, peak, bound });
-    try std.testing.expectEqual(@as(usize, 0), failed);
-    if (peak > bound) return error.MimoNumericalPeakExceeded;
-}
-// ---- mimo/k2-glue: end ----

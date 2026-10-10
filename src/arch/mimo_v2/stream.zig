@@ -70,69 +70,6 @@ pub fn decodeRouteIds(window: DecodeWindow) u32 {
 // ---- rows audit R3: end ----
 pub const lookahead: S.Lookahead = .{ .k = 8, .tau = std.math.inf(f32), .budget = 2, .chunks = 4, .idle_busy = 0, .preread = true };
 
-/// Lever 2 (design-hit-rate §3.2): which experts the prompt pass leaves resident when decode starts, chosen once at
-/// construction. `prompt_counts` (the control): each layer's hottest by its whole prompt call's counts.
-/// `prompt_tail = n`: hottest by the call's last n tokens' routes, ties by the whole call's counts, then id (n >= the
-/// call's tokens is `prompt_counts`'s set). Every routed record is read by the prompt pass either way.
-pub const DecodeSeed = union(enum) { prompt_counts, prompt_tail: u32, invalid };
-/// The tail seed's window when the settings name none: the design sweeps 64 / 256 / 1,024 / 4,096 and names no
-/// default, so the task's 512 (the middle of that sweep, about 4 x the 124 rows' worth of top-8 routes).
-pub const default_seed_tail_tokens: u32 = 512;
-
-/// Lever 4a (prefill-attr §3): the prompt pass's group order, chosen once at construction. The shared wide feed routes a
-/// call's experts in groups of `max_route_ids` (hot order, `seed_aligned` off), `wide_depth` = 2 groups ahead: group
-/// p + 2's reads are posted when group p's tiles drain and are waited by group p + 2's first tile, so they hide behind
-/// group p + 1's compute only. Hot order puts every read group after the hit groups: groups 3-4 (642 MB of reads each)
-/// sit behind 10.6 / 5.4 tiles and expose 17.3 + 21.1 ms per layer (prefill1 tl-normal timeline). `hot` (the control)
-/// keeps the hot order. `interleave`: the call's whole groups permuted after the seed (residency known): each hit group
-/// (no expert to read) is followed by the heaviest remaining read group, the rest after in hot order; a partial last
-/// group stays last (group membership never changes). Same experts per group, same reads; only their order moves.
-/// Class: the reads and every expert's math are the control's, but an expert's bank (persistent / transient) follows
-/// the routes' order, so a bank call's rows, its tiles' rows and the qmv / GEMM path of its tail tiles can move: the
-/// outputs are rounding-class unless the ABBA's compare-ids shows them identical.
-pub const GroupOrder = enum { hot, interleave, invalid };
-
-/// The most whole groups a call can hold (256 experts / 48 = 5; bounded for any bank).
-pub const max_groups: usize = 32;
-
-/// `GroupOrder.interleave`'s permutation of whole groups by their reads (hot order in, positions out): each hit group
-/// (0 reads), in hot order, followed by the remaining read group with the most reads (ties: the hotter); the read
-/// groups left after the last hit group follow in hot order.
-pub fn interleaveOrder(reads: []const u32, out: []u8) void {
-    std.debug.assert(reads.len == out.len and reads.len <= max_groups);
-    var used: [max_groups]bool = @splat(false);
-    var n: usize = 0;
-    for (reads, 0..) |r, h| {
-        if (r != 0) continue;
-        out[n] = @intCast(h);
-        n += 1;
-        var best: ?usize = null;
-        for (reads, 0..) |q, b| if (q != 0 and !used[b] and (best == null or q > reads[best.?])) {
-            best = b;
-        };
-        if (best) |b| {
-            used[b] = true;
-            out[n] = @intCast(b);
-            n += 1;
-        }
-    }
-    for (reads, 0..) |q, b| if (q != 0 and !used[b]) {
-        out[n] = @intCast(b);
-        n += 1;
-    };
-    std.debug.assert(n == reads.len);
-}
-
-/// Moves `distinct`'s whole groups of `width` to the positions `order` names (`order[pos]` = the group placed at pos);
-/// the experts past the whole groups (a partial last group) stay where they are.
-pub fn permuteGroups(distinct: []u16, order: []const u8, width: usize) void {
-    std.debug.assert(order.len * width <= distinct.len and order.len <= max_groups);
-    var copy: [max_groups * max_route_ids]u16 = undefined;
-    const n = order.len * width;
-    @memcpy(copy[0..n], distinct[0..n]);
-    for (order, 0..) |b, pos| @memcpy(distinct[pos * width ..][0..width], copy[@as(usize, b) * width ..][0..width]);
-}
-
 /// Persistent rows are the caller's admitted routed-layer rows (47 for MiMo).
 /// This adds two 48-row prefill windows, not a second cache or old slot bank.
 pub fn options(rows: []const u32, memory: SlotMemory) Options {
@@ -279,30 +216,11 @@ pub fn traceBank(g: anytype, layer: *const bank_mod.Layer, rows: u32) !BankArray
 pub const StreamSource = struct {
     stream: *Stream,
     calls: [n_routes]Call = @splat(.{}),
-    /// `DecodeSeed`'s routes, bound once (`installSeed`): the prompt call's seed and the wide feed's hot order.
-    seed_route: *const fn (*StreamSource, u32, []const u16) anyerror!void = seedCounts,
-    order_route: *const fn (*StreamSource, u32, []u16, []const u32) void = orderCounts,
-    /// `GroupOrder`'s route, bound once (`installGroupOrder`): applied after the order route, prompt calls only.
-    group_route: *const fn (*StreamSource, u32, []u16) void = keepGroups,
-    /// `prompt_tail`: the window in routed ids (tokens x top-k); the last tail seed's ranking and its layer.
-    tail_ids: u32 = 0,
-    ranked: []const u16 = &.{},
-    ranked_layer: u32 = 0,
     /// Profile builds only (`mimo-route-trace-v1`): the request's route trace, when one is armed.
     trace: if (profile.enabled) ?*route_trace.Trace else void = if (profile.enabled) null else {},
     /// `MIMO_DIAG=missfree` (profile builds; the CPU tests): the decode phase's misses served from resident slots
     /// (`diag.MissFree`). Owned by the source that armed it. `void` in a served build.
     missfree: if (diag.compiled) ?*diag.MissFree else void = if (diag.compiled) null else {},
-    /// K7 (mimo/k6-commits, `decode_miss_issue: "event"`): the hit pass's LUT rewrite after a route (`residentLutInto`)
-    /// writes only the entries a route re-slotted since that LUT of the pair was last written (`installLutDelta`); the
-    /// control writes the whole map (`lutWhole`, the shared `lutOf`). Bound once at construction.
-    lut_into: *const fn (*StreamSource, u32, u1, []u32) void = lutWhole,
-    lut_note: *const fn (*StreamSource, u32, *const expert_policy.Plan) void = noteNone,
-    /// Per routed layer and LUT of its pair: the experts whose persistent slot a route changed since that LUT was last
-    /// written. Every decode-phase change of a layer's map is one of its routes' persistent loads or evictions
-    /// (`LayerPolicy.assign`); `grow` rewrites both LUTs whole and empties the sets. A superset is harmless (an entry is
-    /// rewritten with the map's current value).
-    lut_dirty: [lut_layers][2]LutSet = @splat(@splat(LutSet.empty)),
     /// P7 (`ReadSchedule`): the prompt routes, their release and the executor's read-ahead await, bound once
     /// (`installReadSchedule`); `early` takes a prompt call's groups from its hot order (`hotOrder`).
     prompt_route: *const fn (*StreamSource, u32, []const u16, []const f32) Error!*Route = routeStock,
@@ -317,17 +235,12 @@ pub const StreamSource = struct {
     request_schedule: *const fn (*StreamSource, u64) anyerror!ReadSchedule = scheduleNamed,
     installed_schedule: ReadSchedule = .current,
     auto_schedule: AutoSchedule = .{},
-    /// X12 (mimo/gpu-warm, `gpu_keep_warm: "waits"` / `"all"`): the warm engine's arm, bound once at construction (null =
-    /// the control and `"tick"`). `gate` hands it the value the call's last gated wait needs (both phases);
+    /// `gpu_keep_warm: "waits"`: the warm engine's arm, bound once at construction (null = the control). `gate` hands it the value the call's last gated wait needs (both phases);
     /// `awaitReadAhead` holds it for the host's read-ahead wait.
     warm_arm: ?gpu_warm.Arm = null,
 
     pub const Arrays = sdk_ext.quant.GatherQmm.Arrays;
     pub const uses_reader = S.uses_reader;
-    /// K7's LUT delta bounds: MiMo's routed layers and experts (`installLutDelta` refuses a wider stream).
-    pub const lut_layers: usize = @import("config.zig").moe_layers;
-    pub const lut_experts: usize = 256;
-    pub const LutSet = std.bit_set.Static(lut_experts);
     pub const caps = blk: {
         var c = S.source_caps;
         c.construction_reset = true;
@@ -345,53 +258,16 @@ pub const StreamSource = struct {
         return .{ .stream = stream };
     }
 
-    /// Binds `seed`'s routes, once at construction (`top_k` routed ids per token).
-    pub fn installSeed(self: *StreamSource, seed: DecodeSeed, top_k: u32) !void {
-        switch (seed) {
-            .prompt_counts => {
-                self.seed_route = seedCounts;
-                self.order_route = orderCounts;
-                self.tail_ids = 0;
-            },
-            .prompt_tail => |n| {
-                if (n == 0) return error.MimoDecodeSeed;
-                self.seed_route = seedTail;
-                self.order_route = orderTail;
-                self.tail_ids = n * top_k;
-            },
-            .invalid => return error.MimoDecodeSeed,
-        }
-    }
-
-    fn seedCounts(self: *StreamSource, layer: u32, ids: []const u16) anyerror!void {
-        return self.stream.seedPrefill(self.relativeLayer(layer), ids);
-    }
-
-    fn seedTail(self: *StreamSource, layer: u32, ids: []const u16) anyerror!void {
-        self.ranked = try self.stream.seedPrefillTail(self.relativeLayer(layer), ids, self.tail_ids);
-        self.ranked_layer = layer;
-    }
-
     /// The shared wide feed's hottest-first order (`hot_first`), right after this call's seed.
     pub fn hotOrder(self: *StreamSource, layer: u32, distinct: []u16, counts: []const u32) void {
         // In decode no seed ranked this call (`seedPrefill`): the stock count order.
         if (self.decoding()) return orderCounts(self, layer, distinct, counts);
-        self.order_route(self, layer, distinct, counts);
-        self.group_route(self, layer, distinct);
+        orderCounts(self, layer, distinct, counts);
         // P7 `early`: the call's groups as the executor routes them (its first route plans them all).
         if (self.early) {
             self.pending = distinct;
             self.pending_layer = self.relativeLayer(layer);
         }
-    }
-
-    /// Binds `GroupOrder`'s route, once at construction.
-    pub fn installGroupOrder(self: *StreamSource, order: GroupOrder) !void {
-        self.group_route = switch (order) {
-            .hot => keepGroups,
-            .interleave => interleaveGroups,
-            .invalid => return error.MimoPrefillGroupOrder,
-        };
     }
 
     /// P7: binds the read schedule's routes, once at construction; `early` needs the stream built with its options
@@ -482,25 +358,6 @@ pub const StreamSource = struct {
     /// `early`: the executor's await before the seed lands nothing; the plans land what they need (`Stream.planCall`).
     fn awaitNone(_: *StreamSource, _: u32) Error!void {}
 
-    fn keepGroups(_: *StreamSource, _: u32, _: []u16) void {}
-
-    /// `GroupOrder.interleave`: the call's whole groups of `max_route_ids` (its hot order's), each scored by the
-    /// experts it must read (not resident after the seed and the read-ahead), permuted by `interleaveOrder`.
-    fn interleaveGroups(self: *StreamSource, layer: u32, distinct: []u16) void {
-        const width = max_route_ids;
-        const whole = distinct.len / width;
-        if (whole < 2) return;
-        std.debug.assert(whole <= max_groups and distinct.len <= max_groups * width);
-        const pol = &self.stream.layers[self.relativeLayer(layer)].policy;
-        var reads: [max_groups]u32 = @splat(0);
-        for (reads[0..whole], 0..) |*r, b| {
-            for (distinct[b * width ..][0..width]) |e| r.* += @intFromBool(pol.slotOf(e) == null);
-        }
-        var order: [max_groups]u8 = undefined;
-        interleaveOrder(reads[0..whole], order[0..whole]);
-        permuteGroups(distinct, order[0..whole], width);
-    }
-
     /// The stock order: count descending, ties by id (the seed's `rankHottest`).
     fn orderCounts(_: *StreamSource, _: u32, distinct: []u16, counts: []const u32) void {
         std.sort.pdq(u16, distinct, counts, struct {
@@ -508,12 +365,6 @@ pub const StreamSource = struct {
                 return if (c[x] != c[y]) c[x] > c[y] else x < y;
             }
         }.lt);
-    }
-
-    /// The tail seed's ranking: the call's distinct experts are exactly the ranked ones, so the seed fills the rows first.
-    fn orderTail(self: *StreamSource, layer: u32, distinct: []u16, _: []const u32) void {
-        std.debug.assert(self.ranked_layer == layer and self.ranked.len == distinct.len);
-        @memcpy(distinct, self.ranked);
     }
 
     pub fn decoding(self: *const StreamSource) bool {
@@ -532,57 +383,6 @@ pub const StreamSource = struct {
         @import("../../expert/stream.zig").lutOf(&self.stream.layers[rel].policy, self.stream, rel, out);
     }
 
-    /// The scheduler's rewrite of LUT `which` of layer `layer`'s pair after the layer's route (`devLutAfterRoute`), through
-    /// the installed route: the whole map (the control) or K7's delta.
-    pub fn residentLutInto(self: *StreamSource, layer: u32, which: u1, out: []u32) void {
-        self.lut_into(self, layer, which, out);
-    }
-
-    /// K7 (`decode_miss_issue: "event"`): installs the delta rewrite, once at construction.
-    pub fn installLutDelta(self: *StreamSource) !void {
-        if (self.stream.layers.len > lut_layers or self.stream.bank.n_experts > lut_experts) return error.MimoLutDeltaBounds;
-        self.lut_dirty = @splat(@splat(LutSet.empty));
-        self.lut_into = lutDelta;
-        self.lut_note = noteDelta;
-    }
-
-    fn lutWhole(self: *StreamSource, layer: u32, _: u1, out: []u32) void {
-        self.residentLut(layer, out);
-    }
-
-    fn noteNone(_: *StreamSource, _: u32, _: *const expert_policy.Plan) void {}
-
-    /// A route's re-slotted experts (relative layer `rel`): its persistent loads and the experts they evicted, marked in
-    /// both LUTs' sets.
-    fn noteDelta(self: *StreamSource, rel: u32, plan: *const expert_policy.Plan) void {
-        const sets = &self.lut_dirty[rel];
-        for (plan.loadsOf()[0..plan.n_persistent]) |l| for (sets) |*set| set.set(l.expert);
-        for (plan.evictionsOf()) |ev| for (sets) |*set| set.set(ev.previous);
-    }
-
-    /// K7: LUT `which` of `layer` gets the map's current entry for each expert re-slotted since it was last written.
-    fn lutDelta(self: *StreamSource, layer: u32, which: u1, out: []u32) void {
-        if (layer < self.stream.bank.first_moe_layer) return @memset(out, 0);
-        const rel = self.relativeLayer(layer);
-        const set = &self.lut_dirty[rel][which];
-        var it = set.iterator(.{});
-        while (it.next()) |e| out[e] = self.lutEntry(rel, @intCast(e));
-        set.* = LutSet.empty;
-    }
-
-    /// One expert's entry of the resident map (relative layer `rel`): `lutOf`'s (and, armed, `missFreeLut`'s) value.
-    fn lutEntry(self: *const StreamSource, rel: u32, e: u16) u32 {
-        const pol = &self.stream.layers[rel].policy;
-        if (e >= pol.n_experts) return 0;
-        if (comptime diag.compiled) if (self.missfree) |mf| if (self.decoding()) {
-            const ref = self.stream.slotRef(rel, pol.slotOf(mf.sub(rel, e)).?);
-            return (@as(u32, @backingInt(ref.bank)) << 24) | ref.row;
-        };
-        const s = pol.slotOf(e) orelse return 0;
-        if (s >= pol.capacity) return 0;
-        const ref = self.stream.slotRef(rel, s);
-        return (@as(u32, @backingInt(ref.bank)) << 24) | ref.row;
-    }
     // ── end HITPASS ──
 
     fn relativeLayer(self: *const StreamSource, layer: u32) u32 {
@@ -599,7 +399,6 @@ pub const StreamSource = struct {
     pub fn route(self: *StreamSource, layer: u32, ids: []const u16, scores: []const f32) Error!*Call {
         if (comptime diag.compiled) if (self.missfree) |mf| if (self.decoding()) return self.routeMissFree(mf, layer, ids);
         const r = try self.prompt_route(self, self.relativeLayer(layer), ids, scores);
-        self.lut_note(self, self.relativeLayer(layer), &r.plan);
         if (comptime profile.enabled) if (self.decoding()) {
             if (self.trace) |t| t.decodeRoute(self.relativeLayer(layer), ids, &r.plan, scores);
             @import("mtp_profile.zig").unionNote(ids);
@@ -650,7 +449,7 @@ pub const StreamSource = struct {
         // `Source.decodeLane`; this keeps any decode-phase M >= 5 call off the refusal.)
         if (self.decoding()) return;
         if (comptime profile.enabled) if (self.trace) |t| t.seed(self.relativeLayer(layer), ids);
-        return self.seed_route(self, layer, ids);
+        return self.stream.seedPrefill(self.relativeLayer(layer), ids);
     }
 
     pub fn seedRanks(self: *const StreamSource, layer: u32) u32 {
@@ -672,8 +471,6 @@ pub const StreamSource = struct {
     /// Row vectors always use SDK routed-layer order, without a dense layer 0.
     pub fn grow(self: *StreamSource, rows: []const u32) !void {
         try self.stream.grow(rows);
-        // The scheduler rewrites both LUTs of every layer whole after the grow (`devLutsAtGrow`).
-        self.lut_dirty = @splat(@splat(LutSet.empty));
         if (comptime diag.compiled) if (self.missfree) |mf| for (self.stream.layers, 0..) |*ls, l| try mf.fill(@intCast(l), &ls.policy);
     }
 
@@ -687,7 +484,6 @@ pub const StreamSource = struct {
         const sub = mf.substitute(rel, ids, &buf);
         const r = try self.stream.route(rel, sub, &.{});
         std.debug.assert(r.plan.n_misses == 0 and r.plan.n_loads == 0 and r.n_parts == 0);
-        self.lut_note(self, rel, &r.plan);
         if (comptime profile.enabled) if (self.trace) |t| t.decodeRoute(rel, sub, &r.plan, &.{});
         // The MTP profile's union: the rows' routed experts (before substitution), as the normal route counts it.
         if (comptime profile.enabled) @import("mtp_profile.zig").unionNote(ids);
@@ -1374,7 +1170,6 @@ fn p7FixtureOn(f: *HitFixture, a: std.mem.Allocator, rows: []const u32, schedule
     try f.initOpts(a, opts);
     errdefer f.deinit(a);
     var ss = StreamSource.init(f.stream);
-    try ss.installSeed(.prompt_counts, 8);
     try ss.installReadSchedule(schedule, default_read_schedule_threshold);
     return ss;
 }
@@ -2263,12 +2058,11 @@ test "mimo mtp lane: prefill -> first decode tick -> the verify's decode-phase w
     };
     var bank = try bank_mod.SDKBank.init(a, &owner);
     defer bank.deinit();
-    for ([_]DecodeSeed{ .prompt_counts, .{ .prompt_tail = 2 } }) |seed| {
+    {
         const rows = [_]u32{ 4, 4 };
         const stream = try Stream.init(a, &bank, options(&rows, .host));
         defer stream.deinit();
         var source = StreamSource.init(stream);
-        try source.installSeed(seed, 8);
         const Wide = struct {
             /// One wide call as `runWideCore` makes it: await, seed, hot order, route, drain.
             fn call(src: *StreamSource, layer: u32, ids: []const u16) !void {
@@ -2341,218 +2135,5 @@ const seed_prompt = blk: {
     break :blk ids;
 };
 
-test "mimo prompt-seed: the tail seed ranks by the last N tokens (ties by whole counts, then id); N = prompt is prompt_counts" {
-    const testing = std.testing;
-    const a = testing.allocator;
-    var control = try expert_policy.LayerPolicy.init(a, 64, 4);
-    defer control.deinit(a);
-    control.prepareSeed(&seed_prompt);
-    // Control: the whole prompt's hottest 4 = 4, 5 (8 uses), then 0, 1 (6 uses, by id).
-    for ([_]u16{ 4, 5, 0, 1 }) |e| try testing.expect(control.seed.isSet(e));
-    try testing.expectEqual(@as(usize, 4), control.seed.count());
-
-    // N = 2 tokens: 4, 5, 8..13 tie at 2 tail uses; 4, 5 win on whole counts, then 8, 9 by id.
-    var tail = try expert_policy.LayerPolicy.init(a, 64, 4);
-    defer tail.deinit(a);
-    const ranked = tail.prepareSeedTail(&seed_prompt, 2 * 8);
-    try testing.expectEqualSlices(u16, &.{ 4, 5, 8, 9, 10, 11, 12, 13, 0, 1, 2, 3, 6, 7 }, ranked);
-    for ([_]u16{ 4, 5, 8, 9 }) |e| try testing.expect(tail.seed.isSet(e));
-    try testing.expectEqual(@as(usize, 4), tail.seed.count());
-    try testing.expectEqual(@as(u32, 4), tail.seed_ranks);
-    // The prompt counts (the decode tie-break) and the call's counts stay the whole prompt's.
-    try testing.expectEqualSlices(u32, control.prefill_freq, tail.prefill_freq);
-    try testing.expectEqualSlices(u32, control.call_counts, tail.call_counts);
-
-    // N = the prompt's 8 tokens (and beyond): exactly prompt_counts' seed, ranks and order.
-    for ([_]usize{ 8 * 8, 1 << 20 }) |n| {
-        var whole = try expert_policy.LayerPolicy.init(a, 64, 4);
-        defer whole.deinit(a);
-        const r = whole.prepareSeedTail(&seed_prompt, n);
-        var hot: [64 + expert_policy.max_route_ids]u16 = undefined;
-        try testing.expectEqualSlices(u16, expert_policy.rankHottest(control.call_counts, &hot), r);
-        try testing.expect(whole.seed.eql(control.seed));
-        try testing.expect(whole.protected.eql(control.protected));
-        try testing.expectEqual(control.seed_ranks, whole.seed_ranks);
-        try testing.expectEqualSlices(u32, control.prefill_freq, whole.prefill_freq);
-    }
-}
-
-/// The prompt pass's per-layer group timing model (lever 4a): `wide_depth` routes ahead, group p routed at the call's
-/// start (p < depth) or when group p - depth drains; one drive serving the posted reads in order at `gbps`; group p's
-/// tiles start when group p - 1 is done and its reads have landed. Returns the summed exposed wait (ms).
-fn groupWaitModel(order: []const u8, compute_ms: []const f64, read_mb: []const f64, gbps: f64) f64 {
-    var drive: f64 = 0;
-    var end: f64 = 0;
-    var wait: f64 = 0;
-    var landed: [max_groups]f64 = undefined;
-    // Routes at the start: the first `wide_depth` positions.
-    for (order[0..@min(wide_depth, order.len)], 0..) |b, p| {
-        const r = read_mb[b] / gbps;
-        drive = if (r > 0) @max(drive, 0) + r else drive;
-        landed[p] = if (r > 0) drive else 0;
-    }
-    for (order, 0..) |b, p| {
-        const start = @max(end, landed[p]);
-        wait += start - end;
-        end = start + compute_ms[b];
-        // Group p drains: group p + depth is routed now, its reads queued on the drive.
-        if (p + wide_depth < order.len) {
-            const q = p + wide_depth;
-            const r = read_mb[order[q]] / gbps;
-            if (r > 0) drive = @max(drive, end) + r;
-            landed[q] = if (r > 0) drive else 0;
-        }
-    }
-    return wait;
-}
-
-test "mimo prefill group order: interleave puts the heaviest read group after each hit group; a partial last group stays last" {
-    const testing = std.testing;
-    var out: [6]u8 = undefined;
-    // prefill1's hot-first groups: two hit groups, then 214 / 642 / 642 / 197 MB of reads (16 / 48 / 48 / 15 records).
-    interleaveOrder(&.{ 0, 0, 16, 48, 48, 15 }, &out);
-    try testing.expectEqualSlices(u8, &.{ 0, 3, 1, 4, 2, 5 }, &out);
-    // No hit group: hot order. All hit groups: hot order.
-    interleaveOrder(&.{ 3, 9, 1, 1, 1, 1 }, &out);
-    try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4, 5 }, &out);
-    interleaveOrder(&.{ 0, 0, 0, 0, 0, 0 }, &out);
-    try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4, 5 }, &out);
-    // Hit groups after read groups: each still followed by the heaviest remaining reader.
-    interleaveOrder(&.{ 5, 0, 7, 0, 2, 0 }, out[0..6]);
-    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 0, 5, 4 }, &out);
-    // The permutation moves whole groups and leaves the partial tail (here 2 of width 3) in place.
-    var d = [_]u16{ 10, 11, 12, 20, 21, 22, 30, 31, 32, 40, 41 };
-    permuteGroups(&d, &.{ 2, 0, 1 }, 3);
-    try testing.expectEqualSlices(u16, &.{ 30, 31, 32, 10, 11, 12, 20, 21, 22, 40, 41 }, &d);
-    var src = StreamSource{ .stream = undefined };
-    try testing.expectError(error.MimoPrefillGroupOrder, src.installGroupOrder(.invalid));
-    try src.installGroupOrder(.interleave);
-    try testing.expect(src.group_route == &StreamSource.interleaveGroups);
-    try src.installGroupOrder(.hot);
-    try testing.expect(src.group_route == &StreamSource.keepGroups);
-}
-
-test "mimo prefill group order: the depth-2 wait model on prefill1's measured groups (same reads, interleaved order)" {
-    const testing = std.testing;
-    // prefill1 tl-normal (route-r0.prefill-tiles.tsv), per layer, hot-first group g: tiles' GPU ms minus their exposed
-    // waits (the compute), and the group's reads (prof1's route trace at 128 rows); the drive at 13.5 GB/s (its ceiling).
-    const compute = [_]f64{ 111.3, 49.2, 31.2, 18.6, 12.1, 2.9 };
-    const read_mb = [_]f64{ 0, 0, 214, 642, 642, 197 };
-    var hot: [6]u8 = .{ 0, 1, 2, 3, 4, 5 };
-    var inter: [6]u8 = undefined;
-    interleaveOrder(&.{ 0, 0, 16, 48, 48, 15 }, &inter);
-    const w_hot = groupWaitModel(&hot, &compute, &read_mb, 13.5);
-    const w_int = groupWaitModel(&inter, &compute, &read_mb, 13.5);
-    std.debug.print("MIMO_GROUP_ORDER model ms/layer: hot wait={d:.1} interleave wait={d:.1} (measured hot: 39.4 = 0.6 + 17.3 + 21.1 + 0.5) x47 layers saves {d:.2} s\n", .{ w_hot, w_int, (w_hot - w_int) * 47 / 1000 });
-    // The model reproduces the measured hot-order exposure within 25 %, and interleave exposes < 1/4 of it.
-    try testing.expect(w_hot > 39.4 * 0.75 and w_hot < 39.4 * 1.25);
-    try testing.expect(w_int < w_hot / 4);
-}
-
-test "mimo prompt-seed: rankTail with tail = whole is rankHottest" {
-    const whole = [_]u32{ 0, 3, 7, 3, 1, 0, 7 };
-    var a: [7]u16 = undefined;
-    var b: [7]u16 = undefined;
-    try std.testing.expectEqualSlices(u16, expert_policy.rankHottest(&whole, &a), expert_policy.rankTail(&whole, &whole, &b));
-    // A tail that names 4 alone puts it first; the rest keep whole-count order.
-    const tail = [_]u32{ 0, 0, 0, 0, 2, 0, 0 };
-    try std.testing.expectEqualSlices(u16, &.{ 4, 2, 6, 1, 3 }, expert_policy.rankTail(&whole, &tail, &b));
-}
-
-test "mimo prompt-seed: settings choose the route once (control default, arm seed_tail, invalid refused)" {
-    const settings = @import("settings.zig");
-    const testing = std.testing;
-    try testing.expectEqual(DecodeSeed.prompt_counts, (settings.Config{}).decode_seed);
-    const cases = [_]struct { json: []const u8, want: DecodeSeed }{
-        .{ .json = "{}", .want = .prompt_counts },
-        .{ .json = "{\"decode_seed\":\"prompt_counts\"}", .want = .prompt_counts },
-        .{ .json = "{\"decode_seed\":\"prompt_tail\"}", .want = .{ .prompt_tail = default_seed_tail_tokens } },
-        .{ .json = "{\"decode_seed\":\"prompt_tail\",\"decode_seed_tail_tokens\":256}", .want = .{ .prompt_tail = 256 } },
-        .{ .json = "{\"decode_seed\":\"prompt_tail\",\"decode_seed_tail_tokens\":0}", .want = .{ .prompt_tail = 0 } },
-        .{ .json = "{\"decode_seed\":\"lru\"}", .want = .invalid },
-    };
-    for (cases) |c| {
-        var cfg: settings.Config = .{};
-        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.json, .{});
-        defer parsed.deinit();
-        cfg.applySettings(parsed.value);
-        try testing.expectEqual(c.want, cfg.decode_seed);
-        const ok = switch (c.want) {
-            .prompt_counts => true,
-            .prompt_tail => |n| n > 0,
-            .invalid => false,
-        };
-        if (ok) try cfg.validate() else try testing.expectError(error.MimoDecodeSeed, cfg.validate());
-    }
-    var source: StreamSource = .{ .stream = undefined };
-    try testing.expectError(error.MimoDecodeSeed, source.installSeed(.invalid, 8));
-    try testing.expectError(error.MimoDecodeSeed, source.installSeed(.{ .prompt_tail = 0 }, 8));
-    try source.installSeed(.{ .prompt_tail = 512 }, 8);
-    try testing.expectEqual(@as(u32, 4096), source.tail_ids);
-    try testing.expect(source.order_route == &StreamSource.orderTail);
-    try source.installSeed(.prompt_counts, 8);
-    try testing.expect(source.seed_route == &StreamSource.seedCounts and source.order_route == &StreamSource.orderCounts);
-}
-
 // Host-memory stream (two routed layers, 64 experts, 4 rows): the prompt pass routes each layer's experts in the
 // installed hot order, so decode starts with exactly the installed seed. CPU only: host slot rows and pread workers.
-test "mimo prompt-seed: the prompt pass leaves the tail seed resident at the phase change" {
-    const testing = std.testing;
-    const a = testing.allocator;
-    const geom = try bank_mod.Geometry.init(32, 32, 64, 1, 2);
-    const bytes = try a.alloc(u8, geom.total_bytes);
-    defer a.free(bytes);
-    for (bytes, 0..) |*b, i| b.* = @truncate(i * 7);
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = bytes });
-    var dir_buf: [512]u8 = undefined;
-    var path_buf: [600]u8 = undefined;
-    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
-    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/experts.bin", .{dir}, 0);
-    const fd = try sdk_ext.expert.openUncached(path, null);
-    defer fd.close();
-    const owner: bank_mod.Bank = .{
-        .allocator = a,
-        .geometry = geom,
-        .digests = &.{},
-        .source_repository = "synthetic",
-        .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_digest = @splat(0),
-        .sidecar_fd = fd.fd,
-        .sidecar_file_size = fd.size,
-    };
-    var bank = try bank_mod.SDKBank.init(a, &owner);
-    defer bank.deinit();
-    for ([_]DecodeSeed{ .prompt_counts, .{ .prompt_tail = 2 }, .{ .prompt_tail = 8 } }) |seed| {
-        const rows = [_]u32{ 4, 4 };
-        const stream = try Stream.init(a, &bank, options(&rows, .host));
-        defer stream.deinit();
-        var source = StreamSource.init(stream);
-        try source.installSeed(seed, 8);
-        for ([_]u32{ 1, 2 }) |layer| {
-            try source.seedPrefill(layer, &seed_prompt);
-            // The wide feed: the call's distinct experts, ordered by the installed route, routed hottest first.
-            var count: [64]u32 = @splat(0);
-            for (seed_prompt) |e| count[e] += 1;
-            var distinct: [14]u16 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
-            source.hotOrder(layer, &distinct, &count);
-            const call = try source.route(layer, &distinct, &.{});
-            for (0..source.served(call).n_parts) |p| {
-                try source.waitGu(call, @intCast(p));
-                try source.waitDown(call, @intCast(p));
-            }
-            source.release(call);
-            try source.flush();
-        }
-        try source.grow(&rows);
-        const want: []const u16 = switch (seed) {
-            .prompt_tail => |n| if (n == 2) &.{ 4, 5, 8, 9 } else &.{ 4, 5, 0, 1 },
-            else => &.{ 4, 5, 0, 1 },
-        };
-        for ([_]u32{ 1, 2 }) |layer| {
-            for (want) |e| try testing.expect(source.isResident(layer, e));
-            try testing.expectEqual(@as(u32, 4), source.policy(layer).occupancy);
-        }
-    }
-}

@@ -13,7 +13,6 @@ const stream_mod = @import("stream.zig");
 const source_mod = @import("source.zig");
 const prefill_math = @import("math.zig");
 const moe = @import("moe.zig");
-const decode_barrier = @import("decode_barrier.zig");
 const quant = sdk_ext.quant;
 
 const testing = std.testing;
@@ -155,7 +154,6 @@ pub const LaneMath = struct {
     pub const EventProjection = prefill_math.Math.EventProjection;
     hidden: c_int,
     inter: c_int,
-    barrier: decode_barrier.Routes(Tr) = decode_barrier.Routes(Tr).control,
     pub fn gateUp(self: *const LaneMath, g: *Tr, x: u32, ids: u32, gate: Projection(u32), up: Projection(u32)) !u32 {
         const n = g.shapeOf(x).d[0];
         const r = try g.reshape(x, &.{ n, 1, self.hidden });
@@ -177,17 +175,6 @@ pub const LaneMath = struct {
     }
     fn activation(g: *Tr, gate: u32, up: u32) !u32 {
         return g.mul(try g.astype(try g.silu(try g.astype(gate, .float32)), .bfloat16), up);
-    }
-    /// K6 / K7 (decode_barrier.zig): MiMo's decode-barrier seams on the trace backend, through the routes' own code (the
-    /// control unless a test binds another route: `barrier`).
-    pub fn decodeCommit(self: *const LaneMath, g: *Tr, bar: []const u32, dev: ?u32) !void {
-        return self.barrier.commit(g, bar, dev);
-    }
-    pub fn decodeRead(self: *const LaneMath, g: *Tr, bar: []const u32, indices: u32, sc: ?u32, ids_out: []u16, score_out: []f32, scores: *[]const f32) ![]const u16 {
-        return self.barrier.read(g, bar, indices, sc, ids_out, score_out, scores);
-    }
-    pub fn decodeWave(self: *const LaneMath, g: *Tr, outs: []const u32) !void {
-        return self.barrier.wave(g, outs);
     }
     /// MiMo's `projectTiles` (one tile: a verify has <= 32 rows), its drain included.
     fn tile(self: *const LaneMath, g: *Tr, x: u32, rows: quant.PrefillRows, bank: quant.BankArrays(Projection(u32))) !u32 {

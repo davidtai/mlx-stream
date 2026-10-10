@@ -34,7 +34,6 @@ const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
 const QLinear = tm.QLinear;
 const fp8_linear = @import("fp8_linear.zig");
-const embed_rows = @import("embed_rows.zig");
 const drop = tm.drop;
 
 pub const manifest_file = "mtp-manifest.json";
@@ -488,9 +487,6 @@ pub const Trunk = struct {
     v_dim: u32,
     rope_dim: u32,
     window: u32,
-    /// R1 (rows audit, `"embedding": "rows"`): the trunk's table rows on the host; null = the resident table (`embed`).
-    /// With rows, a head's ids are host values: `draft` reads each draft id back before the next head embeds it.
-    rows: ?*embed_rows.Rows = null,
 };
 
 /// Rows [base, base + len) of one head's keys and values (BF16 [1, kv, len, d]), the newest last (upstream `RowCache`).
@@ -730,7 +726,7 @@ fn attention(t: *const Trunk, h: *const Head, cache: *HeadCache, x: Array, rows:
 /// Head `li`'s rows from wherever its rows end through `q` (the round's last committed position), the last `drafted`
 /// of them carrying this round's drafts (`drafts`, uint32 [1] device arrays) and the rest committed tokens. Returns
 /// the last row, final-normed [1, H].
-fn forwardRows(t: *const Trunk, h: *const Head, st: *State, li: usize, q: u64, drafts: []const Array, host_drafts: []const u32) !Array {
+fn forwardRows(t: *const Trunk, h: *const Head, st: *State, li: usize, q: u64, drafts: []const Array) !Array {
     const s = t.s;
     const cache = &st.caches[li];
     // Rows before the last query's window never reach a later query either.
@@ -746,15 +742,7 @@ fn forwardRows(t: *const Trunk, h: *const Head, st: *State, li: usize, q: u64, d
     for (host[0..committed], 0..) |*x, i| x.* = try st.token(start + i + li + 1);
     const hid = try st.hiddenRows(s, start, q + 1);
     defer drop(hid);
-    const out = if (t.rows) |er| blk: {
-        // R1: every row's token on the host (the drafts read back by `draft`), its embedding from the table's rows.
-        std.debug.assert(host_drafts.len == drafts.len);
-        if (committed + tentative > host.len) return error.MimoMtpHiddenOutOfRing;
-        @memcpy(host[committed..][0..tentative], host_drafts[host_drafts.len - tentative ..]);
-        const emb = try er.lookup(t.a, host[0 .. committed + tentative]);
-        defer drop(emb);
-        break :blk try layerForwardEmb(t, h, cache, emb, hid, start);
-    } else blk: {
+    const out = blk: {
         var parts: [max_drafts + 1]Array = undefined;
         var np: usize = 0;
         const committed_ids = mlx.mlx_array_new_data(&host, &[_]c_int{@intCast(committed)}, 1, .uint32);
@@ -787,11 +775,9 @@ pub fn draft(t: *const Trunk, heads: *const Heads, st: *State, q: u64, k: u32, o
     std.debug.assert(k <= max_drafts and k <= n_heads and out.len >= k);
     var made: usize = 0;
     errdefer for (out[0..made]) |d| drop(d);
-    // R1: on the rows route the next head embeds this head's draft from the host rows: its id is read back first.
-    var host_drafts: [max_drafts]u32 = undefined;
     for (0..k) |i| {
         try st.caches[i].truncate(t.s, st.committed_end[i]);
-        const last = try forwardRows(t, &heads.heads[i], st, i, q, out[0..i], host_drafts[0..i]);
+        const last = try forwardRows(t, &heads.heads[i], st, i, q, out[0..i]);
         defer drop(last);
         const logits = try t.lm_head.forward(last, t.s);
         defer drop(logits);
@@ -800,10 +786,6 @@ pub fn draft(t: *const Trunk, heads: *const Heads, st: *State, q: u64, k: u32, o
         try mlx.check(mlx.mlx_argmax_axis(&arg, logits, -1, false, t.s));
         out[i] = try tm.cast(arg, .uint32, t.s);
         made += 1;
-        if (t.rows != null and i + 1 < k) {
-            try mlx.check(mlx.mlx_array_eval(out[i]));
-            host_drafts[i] = (mlx.mlx_array_data_uint32(out[i]) orelse return error.MimoDraftRead)[0];
-        }
     }
 }
 

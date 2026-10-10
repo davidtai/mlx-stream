@@ -866,28 +866,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// prepare_prefill_seed: the prompt's routed ids of `layer`, before its
             /// prefill routes.
             pub fn seedPrefill(self: *Stream, layer: u32, ids: []const u16) !void {
-                _ = try self.seedAt(layer, ids, false, 0);
-            }
-
-            /// `seedPrefill` with the seed ranked by the call's last `tail_ids` routed ids (`LayerPolicy.prepareSeedTail`).
-            /// Returns the ranking (every expert the call routes, hottest first), valid until the layer's next plan.
-            pub fn seedPrefillTail(self: *Stream, layer: u32, ids: []const u16, tail_ids: usize) ![]const u16 {
-                return self.seedAt(layer, ids, true, tail_ids);
-            }
-
-            fn seedAt(self: *Stream, layer: u32, ids: []const u16, comptime tail: bool, tail_ids: usize) ![]const u16 {
                 if (self.phase != .prefill) return error.NotPrefill;
                 const ah = &self.ahead;
                 // P7 overlap: the seed reads residency only; the read-ahead lands where a plan needs it (`planCall`).
                 if (self.prompt_reads == .stock and ah.live and ah.layer == layer) try self.awaitReadAhead(layer);
                 const policy = &self.layers[layer].policy;
-                const ranked: []const u16 = if (tail) policy.prepareSeedTail(ids, tail_ids) else blk: {
-                    policy.prepareSeed(ids);
-                    break :blk &.{};
-                };
+                policy.prepareSeed(ids);
                 // P1's engagement, once at the layer's barrier: the records read ahead that its call routes, and its seed's
                 // records not read ahead (the seed's misses, loaded on demand).
-                if (ah.layer != layer or ah.n == 0 or ah.tallied) return ranked;
+                if (ah.layer != layer or ah.n == 0 or ah.tallied) return;
                 ah.tallied = true;
                 for (ah.loads[0..ah.n]) |l| self.counters.ahead_hits += @intFromBool(policy.call_counts[l.expert] > 0);
                 self.counters.ahead_demand += policy.seed.count();
@@ -897,7 +884,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     for (ah.loads[0..ah.n]) |l| hits += @intFromBool(policy.call_counts[l.expert] > 0);
                     pr.barrier(layer, hits, &policy.seed);
                 };
-                return ranked;
             }
 
             /// Resolves `ids` (the router's top-k of one layer call, host values read

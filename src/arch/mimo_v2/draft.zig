@@ -228,7 +228,6 @@ pub const Lane = struct {
             .v_dim = m.c.value_head_dim,
             .rope_dim = m.c.rope_head_dim,
             .window = m.c.window,
-            .rows = m.embed_rows,
         };
     }
 

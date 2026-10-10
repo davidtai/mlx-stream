@@ -21,24 +21,18 @@ const mlx = @import("sdk").mlx;
 const log = std.log.scoped(.mimo);
 
 /// `off`: nothing. `waits`: warm while a committed gated wait (decode miss parts, prompt group reads) is below the
-/// stream's event, and while the host waits on a read-ahead (`StreamSource.awaitReadAhead`). `tick`: one chunk every
-/// `tick_ns` for the process's life (the slow GPU state between cells and idle requests; no arm). `all`: both.
+/// stream's event, and while the host waits on a read-ahead (`StreamSource.awaitReadAhead`).
 pub const Route = enum {
     off,
     waits,
-    tick,
-    all,
     invalid,
 
     pub fn waitsOn(r: Route) bool {
-        return r == .waits or r == .all;
-    }
-    pub fn tickOn(r: Route) bool {
-        return r == .tick or r == .all;
+        return r == .waits;
     }
 };
 
-/// A settings string's route (`"off"` / `"waits"` / `"tick"` / `"all"`); anything else is `.invalid`, refused by name in
+/// A settings string's route (`"off"` / `"waits"`); anything else is `.invalid`, refused by name in
 /// `settings.Config.validate`.
 pub fn parseRoute(s: []const u8) Route {
     const r = std.meta.stringToEnum(Route, s) orelse return .invalid;
@@ -62,9 +56,6 @@ pub const min_iters: u32 = 256;
 pub const max_iters: u32 = 1 << 24;
 /// Chunks in flight: the next chunk is queued while one runs (no gap between chunks on the warm queue).
 pub const max_inflight: usize = 2;
-/// `tick` / `all`: one chunk this often while nothing else warms (sushi docs/perf-baselines.md, same M5 Max: a tick
-/// every second held the GPU state, ticks every 2 s or more did not; half that for margin).
-pub const tick_ns: u64 = 500 * std.time.ns_per_ms;
 /// The event standing still this long while warming (a read the pool's 10 s watchdog has not failed yet; a decode wait
 /// is ~2 ms per layer) stops the episode until a newer value is armed.
 pub const stuck_ns: u64 = 200 * std.time.ns_per_ms;
@@ -170,14 +161,13 @@ pub const Stats = struct {
     chunks: u64 = 0,
     retired: u64 = 0,
     stuck: u64 = 0,
-    ticks: u64 = 0,
     warm_gpu_ns: u64 = 0,
     iters: u32 = 0,
     last_chunk_ns: u64 = 0,
     failed: bool = false,
 
     pub fn since(now: Stats, then: Stats) Stats {
-        return .{ .episodes = now.episodes -| then.episodes, .chunks = now.chunks -| then.chunks, .retired = now.retired -| then.retired, .stuck = now.stuck -| then.stuck, .ticks = now.ticks -| then.ticks, .warm_gpu_ns = now.warm_gpu_ns -| then.warm_gpu_ns, .iters = now.iters, .last_chunk_ns = now.last_chunk_ns, .failed = now.failed };
+        return .{ .episodes = now.episodes -| then.episodes, .chunks = now.chunks -| then.chunks, .retired = now.retired -| then.retired, .stuck = now.stuck -| then.stuck, .warm_gpu_ns = now.warm_gpu_ns -| then.warm_gpu_ns, .iters = now.iters, .last_chunk_ns = now.last_chunk_ns, .failed = now.failed };
     }
 };
 
@@ -186,8 +176,6 @@ pub const Params = struct {
     target_chunk_ns: u64 = chunk_target_ns,
     stuck_ns: u64 = stuck_ns,
     first_iters: u32 = initial_iters,
-    /// 0: no tick (`waits`); else one chunk this often while parked (`tick` / `all`).
-    tick_ns: u64 = 0,
 };
 
 /// The warm loop over backend `B` (`Metal` served; a trace backend in the CPU tests): `commit(iters) !Chunk`,
@@ -223,7 +211,6 @@ pub fn Engine(comptime B: type) type {
         n_chunks: std.atomic.Value(u64) = .init(0),
         n_retired: std.atomic.Value(u64) = .init(0),
         n_stuck: std.atomic.Value(u64) = .init(0),
-        n_ticks: std.atomic.Value(u64) = .init(0),
         gpu_ns: std.atomic.Value(u64) = .init(0),
         cur_iters: std.atomic.Value(u32) = .init(0),
         last_ns: std.atomic.Value(u64) = .init(0),
@@ -268,7 +255,7 @@ pub fn Engine(comptime B: type) type {
         }
 
         pub fn stats(self: *const Self) Stats {
-            return .{ .episodes = self.n_episodes.load(.monotonic), .chunks = self.n_chunks.load(.monotonic), .retired = self.n_retired.load(.monotonic), .stuck = self.n_stuck.load(.monotonic), .ticks = self.n_ticks.load(.monotonic), .warm_gpu_ns = self.gpu_ns.load(.monotonic), .iters = self.cur_iters.load(.monotonic), .last_chunk_ns = self.last_ns.load(.monotonic), .failed = self.failed.load(.monotonic) };
+            return .{ .episodes = self.n_episodes.load(.monotonic), .chunks = self.n_chunks.load(.monotonic), .retired = self.n_retired.load(.monotonic), .stuck = self.n_stuck.load(.monotonic), .warm_gpu_ns = self.gpu_ns.load(.monotonic), .iters = self.cur_iters.load(.monotonic), .last_chunk_ns = self.last_ns.load(.monotonic), .failed = self.failed.load(.monotonic) };
         }
 
         /// True while the warm thread is parked (nothing to warm).
@@ -306,36 +293,11 @@ pub fn Engine(comptime B: type) type {
         fn park(self: *Self) void {
             _ = std.c.pthread_mutex_lock(&self.mu);
             self.parked.store(1, .seq_cst);
-            var ticked = false;
-            while (!self.wake and !self.quit.load(.seq_cst) and !self.wants(self.target.load(.seq_cst))) {
-                if (self.params.tick_ns == 0) {
-                    _ = std.c.pthread_cond_wait(&self.cv, &self.mu);
-                    continue;
-                }
-                var ts: std.c.timespec = undefined;
-                _ = std.c.clock_gettime(.REALTIME, &ts);
-                const at = @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec)) + self.params.tick_ns;
-                const dl = std.c.timespec{ .sec = @intCast(at / std.time.ns_per_s), .nsec = @intCast(at % std.time.ns_per_s) };
-                if (std.c.pthread_cond_timedwait(&self.cv, &self.mu, &dl) == .TIMEDOUT) {
-                    ticked = true;
-                    break;
-                }
-            }
+            while (!self.wake and !self.quit.load(.seq_cst) and !self.wants(self.target.load(.seq_cst)))
+                _ = std.c.pthread_cond_wait(&self.cv, &self.mu);
             self.wake = false;
             self.parked.store(0, .seq_cst);
             _ = std.c.pthread_mutex_unlock(&self.mu);
-            if (ticked and !self.failed.load(.monotonic)) self.tick();
-        }
-
-        /// `tick` / `all`: one chunk (the oldest retired first when the ring is full); its GPU time is not waited on.
-        fn tick(self: *Self) void {
-            if (self.ring_n == max_inflight) self.retireOldest() catch |e| return self.fail(e);
-            const ch = self.backend.commit(self.iters) catch |e| return self.fail(e);
-            const slot = (self.ring_head + self.ring_n) % max_inflight;
-            self.ring[slot] = ch;
-            self.ring_iters[slot] = self.iters;
-            self.ring_n += 1;
-            _ = self.n_ticks.fetchAdd(1, .monotonic);
         }
 
         /// One episode: chunks while the event is below the newest target. The event is read before every commit, so
@@ -459,7 +421,7 @@ pub fn install(a: std.mem.Allocator, route: Route, stream: mlx.mlx_stream, event
     switch (route) {
         .off => return null,
         .invalid => return error.MimoGpuKeepWarm,
-        .waits, .tick, .all => {},
+        .waits => {},
     }
     if (!gpuStream(stream)) {
         log.warn("gpu_keep_warm=waits refused: the decode stream is not a GPU stream (its waits are host waits)", .{});
@@ -471,12 +433,12 @@ pub fn install(a: std.mem.Allocator, route: Route, stream: mlx.mlx_stream, event
     }
     var backend = try Metal.init(route_groups, event_object);
     errdefer backend.deinit();
-    return Warm.create(a, backend, .{ .tick_ns = if (route.tickOn()) tick_ns else 0 });
+    return Warm.create(a, backend, .{});
 }
 
 /// The profile's per-request line (`MIMO_GPU_WARM {...}`), from two `stats` readings.
 pub fn line(buf: []u8, route: Route, d: Stats) []const u8 {
-    return std.fmt.bufPrint(buf, "MIMO_GPU_WARM {{\"route\": \"{s}\", \"episodes\": {d}, \"chunks\": {d}, \"ticks\": {d}, \"retired\": {d}, \"stuck\": {d}, \"warm_gpu_ms\": {d:.3}, \"iters\": {d}, \"last_chunk_us\": {d:.1}, \"failed\": {}}}", .{ @tagName(route), d.episodes, d.chunks, d.ticks, d.retired, d.stuck, @as(f64, @floatFromInt(d.warm_gpu_ns)) / 1e6, d.iters, @as(f64, @floatFromInt(d.last_chunk_ns)) / 1e3, d.failed }) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "MIMO_GPU_WARM {{\"route\": \"{s}\", \"episodes\": {d}, \"chunks\": {d}, \"retired\": {d}, \"stuck\": {d}, \"warm_gpu_ms\": {d:.3}, \"iters\": {d}, \"last_chunk_us\": {d:.1}, \"failed\": {}}}", .{ @tagName(route), d.episodes, d.chunks, d.retired, d.stuck, @as(f64, @floatFromInt(d.warm_gpu_ns)) / 1e6, d.iters, @as(f64, @floatFromInt(d.last_chunk_ns)) / 1e3, d.failed }) catch buf[0..0];
 }
 
 // ── the trace backend (CPU proofs): chunks are log entries; a retire sleeps the chunk's emulated GPU time ──
@@ -559,11 +521,8 @@ fn sleepUs(us: u64) void {
 test "mimo gpu warm route: \"off\" / \"waits\" parse; anything else is invalid (refused by name in settings.validate)" {
     try testing.expectEqual(Route.off, parseRoute("off"));
     try testing.expectEqual(Route.waits, parseRoute("waits"));
-    try testing.expectEqual(Route.tick, parseRoute("tick"));
-    try testing.expectEqual(Route.all, parseRoute("all"));
-    try testing.expect(Route.waits.waitsOn() and Route.all.waitsOn() and !Route.tick.waitsOn() and !Route.off.waitsOn());
-    try testing.expect(Route.tick.tickOn() and Route.all.tickOn() and !Route.waits.tickOn() and !Route.off.tickOn());
-    for ([_][]const u8{ "", "on", "Waits", "invalid", "wait", "always" }) |s| try testing.expectEqual(Route.invalid, parseRoute(s));
+    try testing.expect(Route.waits.waitsOn() and !Route.off.waitsOn());
+    for ([_][]const u8{ "", "on", "Waits", "invalid", "wait", "always", "tick", "all" }) |s| try testing.expectEqual(Route.invalid, parseRoute(s));
 }
 
 test "mimo gpu warm route: install refuses an invalid route and a CPU stream by name before any device work; off installs nothing" {
@@ -573,7 +532,7 @@ test "mimo gpu warm route: install refuses an invalid route and a CPU stream by 
     try testing.expect(!gpuStream(s));
     try testing.expectEqual(@as(?*Warm, null), try install(a, .off, s, 0));
     try testing.expectError(error.MimoGpuKeepWarm, install(a, .invalid, s, 0));
-    for ([_]Route{ .waits, .tick, .all }) |r| try testing.expectError(error.MimoGpuKeepWarmStream, install(a, r, s, 0x1000));
+    try testing.expectError(error.MimoGpuKeepWarmStream, install(a, .waits, s, 0x1000));
 }
 
 test "mimo gpu warm loop: warms only while the event is below the armed value, stops at the event (at most one commit after it), parks, re-arms (trace backend)" {
@@ -679,10 +638,10 @@ test "mimo gpu warm line: the profile line names the route and the request's cou
     const now: Stats = .{ .episodes = 50, .chunks = 410, .retired = 409, .stuck = 0, .warm_gpu_ns = 102_500_000, .iters = 70_000, .last_chunk_ns = 251_000 };
     const then: Stats = .{ .episodes = 3, .chunks = 10, .retired = 9, .warm_gpu_ns = 2_500_000 };
     const ln = line(&buf, .waits, now.since(then));
-    try testing.expectEqualStrings("MIMO_GPU_WARM {\"route\": \"waits\", \"episodes\": 47, \"chunks\": 400, \"ticks\": 0, \"retired\": 400, \"stuck\": 0, \"warm_gpu_ms\": 100.000, \"iters\": 70000, \"last_chunk_us\": 251.0, \"failed\": false}", ln);
+    try testing.expectEqualStrings("MIMO_GPU_WARM {\"route\": \"waits\", \"episodes\": 47, \"chunks\": 400, \"retired\": 400, \"stuck\": 0, \"warm_gpu_ms\": 100.000, \"iters\": 70000, \"last_chunk_us\": 251.0, \"failed\": false}", ln);
 }
 
-test "mimo gpu warm loop: a host hold warms until released with no stuck bound; the tick commits one chunk per period while parked and nothing else (trace backend)" {
+test "mimo gpu warm loop: a host hold warms until released with no stuck bound (trace backend)" {
     const a = testing.allocator;
     var ev = std.atomic.Value(u64).init(0);
     var l: Trace.Log = .{};
@@ -699,15 +658,5 @@ test "mimo gpu warm loop: a host hold warms until released with no stuck bound; 
     const n = l.commits.load(.seq_cst);
     sleepUs(5000);
     try testing.expectEqual(n, l.commits.load(.seq_cst));
-    // the tick: 20 ms period, ~4 ticks in 90 ms, nothing armed
-    var ev2 = std.atomic.Value(u64).init(0);
-    var l2: Trace.Log = .{};
-    const t = try TraceEngine.create(a, Trace.word(&ev2, &l2), .{ .target_chunk_ns = 50 * std.time.ns_per_us, .first_iters = 25_000, .tick_ns = 20 * std.time.ns_per_ms });
-    defer t.destroy();
-    sleepUs(90_000);
-    const ticks = t.stats().ticks;
-    try testing.expect(ticks >= 2 and ticks <= 6);
-    try testing.expectEqual(ticks, l2.commits.load(.seq_cst));
-    try testing.expectEqual(@as(u64, 0), t.stats().episodes);
-    std.debug.print("MIMO_GPU_WARM_TRACE hold: commits={d} stuck=0; tick: {d} ticks in 90 ms at 20 ms\n", .{ n, ticks });
+    std.debug.print("MIMO_GPU_WARM_TRACE hold: commits={d} stuck=0\n", .{n});
 }

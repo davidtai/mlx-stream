@@ -208,8 +208,8 @@ pub const Kernels = struct {
 
 /// The prompt route's BF16 weights: the last `cap` FP8 projections a prompt row touched, dequantized once each
 /// (`mimo_fp8_dequant_bf16`) and reused by every tile / span of the layer. A prompt layer touches one set of three at
-/// a time: its attention's q / k / v (`Attention.forwardNax` / `forwardNaxSpanned` / `forwardTiled`: k / v per span, q
-/// per tile or per call), then, in layer 0 only, the dense MLP's gate / up / down (`Dense.forwardTiled`, per 512-row
+/// a time: its attention's q / k / v (`Attention.forwardNax` / `forwardTiled`: k / v per span, q
+/// per tile), then, in layer 0 only, the dense MLP's gate / up / down (`Dense.forwardTiled`, per 512-row
 /// tile); the MTP heads' catch-up touches each of its six once. `cap` is fixed at install (`settings.fp8_prompt_slots`):
 /// 3 (X18's default) holds one set, so every projection is dequantized once per layer per chunk (`pick`, the CPU test
 /// over the real call orders); 4 is the control (fp8res2's cache: the fourth slot only ever held the previous set's
@@ -839,11 +839,10 @@ test "mimo fp8res CPU: the prompt route's bill is the installed capacity's wides
 
 /// X18: one prompt chunk's FP8 calls in the trunk's order (module.zig), the prompt-route calls only (M > 8; a call of at
 /// most eight rows runs the GEMV and never touches the cache): per layer the attention route's q / k / v (NAX tiled:
-/// `forwardNax`, k / v per span, q per 512-row tile; NAX spanned: `forwardNaxSpanned`, q once over the call, k / v per
-/// span; stock: `forwardTiled` -> `forwardOps`, q / k / v per 512-row chunk, or once at <= 512 rows; at <= 8 rows the
+/// `forwardNax`, k / v per span, q per 512-row tile; stock: `forwardTiled` -> `forwardOps`, q / k / v per 512-row chunk, or once at <= 512 rows; at <= 8 rows the
 /// NAX installs take `forward`, the GEMV), then layer 0's dense MLP (`Dense.forward` at <= 512 rows, else
 /// `Dense.forwardTiled` per 512 rows: gate / up / down). Keys name (layer, projection); returns the distinct ones.
-const LruRoute = enum { nax_tiled, nax_spanned, stock };
+const LruRoute = enum { nax_tiled, stock };
 const LruProj = enum(u8) { q, k, v, gate, up, down };
 fn lruKey(owner: usize, p: LruProj) ?*anyopaque {
     return @ptrFromInt((owner * 8 + @intFromEnum(p) + 1) * 64);
@@ -862,16 +861,13 @@ fn lruChunk(list: *std.ArrayList(?*anyopaque), a: std.mem.Allocator, c: mimo.Con
         const nax = route != .stock;
         if (nax and n > 8) {
             const span = prefill_attention.attentionSpanRows(c.kvHeads(layer), mode, n);
-            if (route == .nax_spanned) try lruCall(list, a, &seen, layer, .q, n);
             var s0: u32 = 0;
             while (s0 < n) : (s0 += span) {
                 const sn = @min(span, n - s0);
                 try lruCall(list, a, &seen, layer, .k, sn);
                 try lruCall(list, a, &seen, layer, .v, sn);
-                if (route == .nax_tiled) {
-                    var t0 = s0;
-                    while (t0 < s0 + sn) : (t0 += prefill_attention.query_tile_rows) try lruCall(list, a, &seen, layer, .q, @min(prefill_attention.query_tile_rows, s0 + sn - t0));
-                }
+                var t0 = s0;
+                while (t0 < s0 + sn) : (t0 += prefill_attention.query_tile_rows) try lruCall(list, a, &seen, layer, .q, @min(prefill_attention.query_tile_rows, s0 + sn - t0));
             }
         } else if (!nax) {
             var t0: u32 = 0;
@@ -910,11 +906,11 @@ fn lruMisses(cap: u8, calls: []const ?*anyopaque) usize {
     return misses;
 }
 
-test "mimo fp8res CPU: X18 prompt cache capacity: over the trunk's real call orders (NAX tiled / spanned, stock; 9 .. 32,768-row prompts in 16,384-row chunks) and the MTP heads' catch-up, 3 slots dequantize every FP8 projection once per layer per chunk, exactly as 4 do" {
+test "mimo fp8res CPU: X18 prompt cache capacity: over the trunk's real call orders (NAX tiled, stock; 9 .. 32,768-row prompts in 16,384-row chunks) and the MTP heads' catch-up, 3 slots dequantize every FP8 projection once per layer per chunk, exactly as 4 do" {
     const a = testing.allocator;
     const c: mimo.Config = .{};
     var checked: usize = 0;
-    for ([_]LruRoute{ .nax_tiled, .nax_spanned, .stock }) |route| {
+    for ([_]LruRoute{ .nax_tiled, .stock }) |route| {
         for ([_]u32{ 9, 100, 512, 513, 516, 523, 1024, 4133, 16_384, 16_384 + 9, 16_384 + 600, 32_768 }) |rows| {
             var calls: std.ArrayList(?*anyopaque) = .empty;
             defer calls.deinit(a);
@@ -1274,8 +1270,8 @@ pub fn gemvSelfcheckBound() u64 {
 }
 
 pub const GemmCase = struct { site: usize, rows: []const c_int };
-/// The prompt GEMM's cases: q / o-width calls over the whole prompt and the full layers' K/V spans to 16,384 rows (the
-/// spanned route), the sliding spans and dense-MLP chunks at 512 rows, the tails (9, 523, 4,133).
+/// The prompt GEMM's cases: q / o-width calls over the whole prompt and the full layers' K/V spans to 16,384 rows, the
+/// sliding spans and dense-MLP chunks at 512 rows, the tails (9, 523, 4,133).
 pub const gemm_cases = [_]GemmCase{
     .{ .site = 0, .rows = &.{ 16_384, 4133, 512 } },
     .{ .site = 1, .rows = &.{ 16_384, 523, 9 } },

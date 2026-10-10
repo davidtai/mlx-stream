@@ -821,13 +821,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
     const predictor_decode_only = if (@hasDecl(M, "predictor_decode_only")) M.predictor_decode_only else false;
     const wide_profile = if (@hasDecl(M, "Profile")) M.Profile else prof;
     const bound_decode_rows = if (@hasDecl(M, "decode_forward_rows")) M.decode_forward_rows else decode_forward_rows;
-    // A math with its own decode barrier (MiMo's `decode_commits` / `decode_miss_issue`, mimo_v2/decode_barrier.zig)
-    // commits the decode lane's barrier set and hit waves and reads the barrier itself; every other math (DeepSeek's)
-    // compiles the inline sequence of `run`, unchanged.
-    const math_barrier = @hasDecl(M, "decodeCommit");
-    comptime {
-        if (math_barrier != @hasDecl(M, "decodeRead") or math_barrier != @hasDecl(M, "decodeWave")) @compileError(@typeName(M) ++ ": a decode barrier is decodeCommit, decodeRead and decodeWave together");
-    }
     comptime {
         assertSource(S);
         if (routes.gated and !sdk_ext.expert.capsOf(S).event_gates) @compileError(@typeName(S) ++ ": a gated route needs a source with event gates");
@@ -1016,10 +1009,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
         fn devLutAfterRouteIn(self: *Self, g: *G, layer: u32) !void {
             const next = self.dev_parity[layer] +% 1;
-            const out = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next]))));
-            // A source that tracks its LUT pair (MiMo's, `residentLutInto`: K7's delta route) writes only what changed
-            // since that LUT was last written; every other source writes the whole map, unchanged.
-            if (comptime @hasDecl(S, "residentLutInto")) self.source.residentLutInto(layer, next, out) else self.source.residentLut(layer, out);
+            self.source.residentLut(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next])))));
             self.dev_parity[layer] = next;
         }
 
@@ -1434,23 +1424,15 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             };
             // DEVROUTE (decode): the barrier's arrays committed, then the device hit wave behind them (before the host waits).
             const dev: ?T = if (comptime @hasDecl(S, "decoding")) (if (self.devroute and self.source.decoding()) try self.devWave(g, layer, xf, indices, n, k) else null) else null;
-            const ids = if (comptime math_barrier) read: {
-                // The math's construction-time routes: the commits ahead of the wait (DEVROUTE's barrier set and device
-                // hit wave), the hoist, then the wait and the host's reads of the ids and scores.
-                try self.math.decodeCommit(g, bar[0..n_bar], dev);
-                try self.pre_barrier(g, bar[0..n_bar], hoist);
-                break :read try self.math.decodeRead(g, bar[0..n_bar], indices, sc, id_buf[0..n_ids], score_buf[0 .. n * self.n_experts], &scores);
-            } else read: {
-                if (dev) |d| {
-                    try g.asyncEval(bar[0..n_bar]);
-                    try g.asyncEval(&.{d});
-                }
-                // HOIST_FIRST commits them and the hoist here (the evals below then only wait); the stock route nothing.
-                try self.pre_barrier(g, bar[0..n_bar], hoist);
-                if (n_bar > 1) try g.evalAll(bar[0..n_bar]);
-                if (sc) |s| scores = try g.hostF32(s, score_buf[0 .. n * self.n_experts]);
-                break :read try g.hostIds(indices, id_buf[0..n_ids]);
-            };
+            if (dev) |d| {
+                try g.asyncEval(bar[0..n_bar]);
+                try g.asyncEval(&.{d});
+            }
+            // HOIST_FIRST commits them and the hoist here (the evals below then only wait); the stock route nothing.
+            try self.pre_barrier(g, bar[0..n_bar], hoist);
+            if (n_bar > 1) try g.evalAll(bar[0..n_bar]);
+            if (sc) |s| scores = try g.hostF32(s, score_buf[0 .. n * self.n_experts]);
+            const ids = try g.hostIds(indices, id_buf[0..n_ids]);
             tt = dt.charge(.barrier, tt);
             const t_barrier = tt;
             if (comptime timeline.enabled) timeline.point(layer, .barrier, 0, false);
@@ -1480,10 +1462,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             } else {
                 // Residents: gate/up and down at once.
                 const hits = try self.gate_up_wave(self, g, layer, xf, k, sv, 0, null);
-                if (hits.n > 0) {
-                    const outs = try self.down_wave(self, g, layer, &hits, &acc, null);
-                    if (comptime math_barrier) try self.math.decodeWave(g, outs) else try g.asyncEval(outs);
-                }
+                if (hits.n > 0) try g.asyncEval(try self.down_wave(self, g, layer, &hits, &acc, null));
             }
             // VERIFY_ENCODE hoist: behind the hit wave, ahead of every miss wave (HOIST_FIRST: committed before the barrier's wait).
             try self.post_hit(g, hoist);
@@ -1740,7 +1719,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 if (comptime @hasDecl(S, "seedPrefill")) try self.source.seedPrefill(layer, w.ids.items) else unreachable;
             }
             if (hot_first) {
-                // A source that ranks its own seed (MiMo's `decode_seed`) orders the call by that ranking.
+                // A source with its own hot order (MiMo's: the P7 read schedules take the call's groups from it) orders the call.
                 if (comptime @hasDecl(S, "hotOrder")) self.source.hotOrder(layer, w.distinct.items, w.count.items) else std.sort.pdq(u16, w.distinct.items, @as([]const u32, w.count.items), struct {
                     fn lt(c: []const u32, x: u16, y: u16) bool {
                         return if (c[x] != c[y]) c[x] > c[y] else x < y;

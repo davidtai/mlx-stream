@@ -88,15 +88,6 @@ pub fn resetReads() void {
     if (comptime enabled) reads = .{};
 }
 
-/// K6 / K7 (mimo/k6-commits): the installed decode routes, named once at construction (`Source`) and printed at the head
-/// of the line, so a cell's commits and wake read against its route. Static strings (the routes' tag names).
-const Routes = struct { commits: []const u8 = "mlx", issue: []const u8 = "host" };
-var routes_installed: if (enabled) Routes else void = if (enabled) .{} else {};
-
-pub inline fn noteRoutes(commits: []const u8, issue: []const u8) void {
-    if (comptime enabled) routes_installed = .{ .commits = commits, .issue = issue };
-}
-
 fn kindOf(layer: usize) Kind {
     const c: mimo.Config = .{};
     return if (layer < c.layer_types.len and c.layer_types[layer] == .full) .full else .sliding;
@@ -293,7 +284,6 @@ pub fn writeLine(w: *std.Io.Writer, rounds: u64, tot: Round, per: [2]Acc, profil
     const L = tot.layers;
     const cb = ms(L.call_barrier, rounds);
     try w.writeAll("MIMO_BARRIER_RESIDUAL {");
-    if (comptime enabled) try w.print("\"decode_commits\": \"{s}\", \"decode_miss_issue\": \"{s}\", ", .{ routes_installed.commits, routes_installed.issue });
     try w.print("\"rounds\": {d}, \"layers_per_round\": {d:.2}, \"truncated\": {d}, ", .{ rounds, per1(L.n, rounds), truncated });
     try w.print("\"reconcile\": {{\"call_to_barrier_ms\": {d:.3}, \"verify_barrier_ms\": {d:.3}, \"residual_ms\": {d:.3}}}, ", .{ cb, profile_barrier_ms, profile_barrier_ms - cb });
     try w.print("\"per_round_ms\": {{\"wall\": {d:.3}, \"pre\": {d:.3}, \"post\": {d:.3}, \"host\": {d:.3}, \"gpu\": {d:.3}, \"gpu_prev\": {d:.3}, \"gpu_bar\": {d:.3}, \"gpu_wave\": {d:.3}, \"gpu_gated\": {d:.3}, \"idle_queued\": {d:.3}, \"idle_starved\": {d:.3}, \"wake\": {d:.3}}}, ", .{ ms(tot.wall, rounds), ms(tot.pre, rounds), ms(tot.post, rounds), ms(L.host, rounds), ms(L.gpu, rounds), ms(L.gpu_prev, rounds), ms(L.gpu_bar, rounds), ms(L.gpu_wave, rounds), ms(L.gpu_gated, rounds), ms(L.idle_queued, rounds), ms(L.idle_starved, rounds), ms(L.wake, rounds) });
