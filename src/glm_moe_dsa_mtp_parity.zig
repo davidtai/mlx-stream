@@ -248,6 +248,48 @@ test "glm mtp parity: a later prompt keeps the prefix the lane tracks and drafts
     }
 }
 
+test "glm mtp parity: a round's verify reads, each expert's by the first row that routes it, sum to the stream's demand bytes; with its first draft rejected the kept row read exactly a serial step's bytes from the same state" {
+    const dir = fixtureDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const gold = try loadGoldens(a, dir);
+    defer gold.deinit();
+    const cs = for (gold.value.cases) |*c| {
+        if (c.depth == 3 and std.mem.eql(u8, c.schedule, "mtp")) break c;
+    } else return error.SkipZigTest;
+    // One module at a time: the serial step's demand bytes from the prompt's state first.
+    const serial_bytes = blk: {
+        const r = try Rig.open(a, dir, cs.depth);
+        defer r.close(a);
+        const t1 = try r.begin(cs.prompt, 8);
+        const b0 = r.m.stats().expert_bytes_read;
+        _ = try r.argmaxOf(try r.m.extend(&.{t1}));
+        break :blk r.m.stats().expert_bytes_read - b0;
+    };
+    const r = try Rig.open(a, dir, cs.depth);
+    defer r.close(a);
+    const t1 = try r.begin(cs.prompt, 8);
+    // The greedy target's token after t1 is the serial decode's second: any other first draft is rejected.
+    const wrong = (cs.serial[1] + 1) % r.m.model.vocab_size;
+    var probe: M.Probe = .{ .force = &.{wrong} };
+    const ln = r.m.mtp.?;
+    const b0 = r.m.stats().expert_bytes_read;
+    var out = try r.m.roundWith(a, t1, std.math.maxInt(u32), greedy, &probe);
+    defer out.deinit(a);
+    const round_bytes = r.m.stats().expert_bytes_read - b0;
+    try testing.expectEqual(@as(u32, 0), out.accepted);
+    try testing.expectEqual(cs.serial[1], out.next_token);
+    try testing.expect(serial_bytes > 0);
+    try testing.expectEqual(round_bytes, ln.counts.verify_bytes);
+    try testing.expectEqual(serial_bytes, ln.counts.verify_bytes - ln.counts.rejected_bytes);
+    try testing.expect(ln.counts.rejected_bytes > 0);
+    // The decision reached the first draft only, rejected.
+    var decided: u64 = 0;
+    for (ln.counts.decided) |d| decided += d;
+    try testing.expectEqual(@as(u64, 1), decided);
+    for (ln.counts.accepted_by_p) |acc| try testing.expectEqual(@as(u64, 0), acc);
+    std.debug.print("glm mtp parity: a rejected round read {d} B, {d} B of it for the rejected rows; a serial step {d} B\n", .{ round_bytes, ln.counts.rejected_bytes, serial_bytes });
+}
+
 // ── refusals and decisions (no fixture) ──
 
 /// A synthetic pack of the tiny model with the release's MTP fields in its config (`index_share` as given).

@@ -1444,6 +1444,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .{ "gates", .ev_gates },            .{ "gates_forced", .ev_wd_forced },
                     .{ "spec_expired", .expired },      .{ "spec_abandoned", .abandoned }, .{ "spec_discarded", .discarded },
                     .{ "spec_cancelled", .cancelled_by_demand }, .{ "direct_ranges", .direct_ranges },
+                    .{ "spec_claimed_inflight", .claimed_inflight }, .{ "spec_abandoned_bytes", .abandoned_bytes },
                 };
                 inline for (pairs) |pr| @field(s, pr[0]) = @intCast(@max(p.counter(pr[1]), 0));
                 return s;

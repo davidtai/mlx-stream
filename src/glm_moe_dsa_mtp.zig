@@ -590,7 +590,20 @@ pub const Counts = struct {
     verify_ns: u64 = 0,
     /// The largest rise of MLX's high-water mark over a round's start (the round's transient, measured).
     peak_rise: u64 = 0,
+    /// The verify's demand reads in bytes, and of them the reads whose expert no kept row routes (the first row of
+    /// the layer's call that routes it is past the accepted ones): the rejected rows' own reads.
+    verify_bytes: u64 = 0,
+    rejected_bytes: u64 = 0,
+    /// Per tenth of the head's top probability at a draft step: the steps the decision reached (the accepted ones
+    /// and the first rejected one) and the accepted ones.
+    decided: [10]u64 = @splat(0),
+    accepted_by_p: [10]u64 = @splat(0),
 };
+
+/// The tenth of `p` (a probability): 0 .. 9.
+pub fn tenth(p: f32) usize {
+    return @min(@as(usize, @intFromFloat(@max(p, 0) * 10)), 9);
+}
 
 /// The lane's line at the request's end.
 pub const Line = struct {
@@ -611,6 +624,20 @@ pub const Line = struct {
             if (s == 0) 0 else @as(f64, @floatFromInt(p.c.generated)) / s, @as(f64, @floatFromInt(p.c.draft_ns)) / 1e9, @as(f64, @floatFromInt(p.c.verify_ns)) / 1e9,
             @as(f64, @floatFromInt(p.c.peak_rise)) / 1e6,
         });
+        const gb = @as(f64, @floatFromInt(p.c.verify_bytes)) / 1e9;
+        try w.print(", verify reads {d:.2} GB ({d:.3} GB per emitted token), {d:.2} GB of it for rejected rows only", .{
+            gb, if (p.c.generated == 0) 0 else gb / @as(f64, @floatFromInt(p.c.generated)), @as(f64, @floatFromInt(p.c.rejected_bytes)) / 1e9,
+        });
+    }
+};
+
+/// The lane's acceptance by the head's top probability, at the request's end.
+pub const ProbLine = struct {
+    c: Counts,
+
+    pub fn format(p: ProbLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll("glm_moe_dsa: mtp acceptance by the head's top probability (accepted / decided):");
+        for (p.c.decided, p.c.accepted_by_p, 0..) |d, acc, i| try w.print("{s} {d}.{d} {d}/{d}", .{ if (i == 0) "" else ",", i / 10, i % 10, acc, d });
     }
 };
 
@@ -634,6 +661,8 @@ pub fn Lane(comptime kind: BankKind) type {
         depth: u32,
         mode: sdk.acceptance.Mode,
         counts: Counts = .{},
+        /// The head's top probability at each step of the last round's drafts.
+        top_p: [max_depth]f32 = @splat(0),
         /// Logged once per request that the lane stopped tracking.
         untracked_logged: bool = false,
 
@@ -801,7 +830,17 @@ pub fn Lane(comptime kind: BankKind) type {
                 defer g.release(normed);
                 const lg = try graph.qlinear(g, normed, tw.lm_head);
                 if (logits_out) |lo| _ = try g.hostF32(try g.astype(lg, .float32), lo[step * vocab ..][0..vocab]);
-                out[step] = if (step < force.len) force[step] else try g.hostArgmax(lg);
+                // The argmax and the head's top probability `exp(max - logsumexp)`, read together.
+                const lf = try g.reshape(try g.astype(lg, .float32), &.{-1});
+                const am = try g.argmax(lf, 0);
+                const top = try g.exp(try g.sub(try g.max(lf, 0, false), try g.logsumexp(lf, 0, false)));
+                try g.evalAll(&.{ am, top });
+                var tok: [1]u32 = undefined;
+                var tp: [1]f32 = undefined;
+                _ = try g.hostU32(am, &tok);
+                _ = try g.hostF32(top, &tp);
+                self.top_p[step] = tp[0];
+                out[step] = if (step < force.len) force[step] else tok[0];
                 if (step + 1 < depth) {
                     x = try self.input(g, tw, out[step..][0..1], normed);
                 }
@@ -895,10 +934,16 @@ fn tinyText() ![]const u8 {
 }
 
 test "glm mtp: the request's line (the ABBA harness reads it): depth, acceptance, rounds, drafted, accepted, rate, per round, tok/s" {
-    const l: Line = .{ .depth = 3, .mode = "exact", .delta = 0, .c = .{ .rounds = 348, .drafted = 1042, .accepted = 676, .generated = 1024, .wall_ns = 207_560_000_000, .draft_ns = 9_000_000_000, .verify_ns = 190_000_000_000, .peak_rise = 312_400_000 } };
+    const l: Line = .{ .depth = 3, .mode = "exact", .delta = 0, .c = .{ .rounds = 348, .drafted = 1042, .accepted = 676, .generated = 1024, .wall_ns = 207_560_000_000, .draft_ns = 9_000_000_000, .verify_ns = 190_000_000_000, .peak_rise = 312_400_000, .verify_bytes = 2_100_000_000_000, .rejected_bytes = 230_000_000_000, .decided = .{ 9, 0, 0, 0, 0, 0, 0, 0, 30, 990 }, .accepted_by_p = .{ 1, 0, 0, 0, 0, 0, 0, 0, 20, 655 } } };
     const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{l});
     defer testing.allocator.free(s);
-    try testing.expectEqualStrings("glm_moe_dsa: mtp depth 3 acceptance exact: 348 rounds (0 without drafts), 1042 drafted, 676 accepted (64.9%), 1.94 accepted / 2.94 tokens per round, 1024 tokens in 207.56 s (4.9 tok/s; drafts 9.00 s, verify 190.00 s; round peak 312 MB)", s);
+    try testing.expectEqualStrings("glm_moe_dsa: mtp depth 3 acceptance exact: 348 rounds (0 without drafts), 1042 drafted, 676 accepted (64.9%), 1.94 accepted / 2.94 tokens per round, 1024 tokens in 207.56 s (4.9 tok/s; drafts 9.00 s, verify 190.00 s; round peak 312 MB), verify reads 2100.00 GB (2.051 GB per emitted token), 230.00 GB of it for rejected rows only", s);
+    const ps = try std.fmt.allocPrint(testing.allocator, "{f}", .{ProbLine{ .c = l.c }});
+    defer testing.allocator.free(ps);
+    try testing.expectEqualStrings("glm_moe_dsa: mtp acceptance by the head's top probability (accepted / decided): 0.0 1/9, 0.1 0/0, 0.2 0/0, 0.3 0/0, 0.4 0/0, 0.5 0/0, 0.6 0/0, 0.7 0/0, 0.8 20/30, 0.9 655/990", ps);
+    try testing.expectEqual(@as(usize, 0), tenth(0.0999));
+    try testing.expectEqual(@as(usize, 1), tenth(0.1));
+    try testing.expectEqual(@as(usize, 9), tenth(1.0));
     const t: Line = .{ .depth = 2, .mode = "typical", .delta = 0.3, .c = .{ .rounds = 2, .drafted = 4, .accepted = 3, .generated = 5, .wall_ns = 1_000_000_000 } };
     const u = try std.fmt.allocPrint(testing.allocator, "{f}", .{t});
     defer testing.allocator.free(u);

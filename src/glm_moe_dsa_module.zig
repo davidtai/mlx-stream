@@ -320,6 +320,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         pub fn requestEnd(self: *Self) void {
             if (self.mtp) |ln| if (ln.counts.rounds > 0) {
                 log.info("{f}\n", .{ln.line()});
+                log.info("{f}\n", .{mtp_mod.ProbLine{ .c = ln.counts }});
                 ln.counts = .{};
             };
             const d = self.decode_mark orelse return;
@@ -402,6 +403,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }
             const m0 = self.g.mark();
             defer self.g.resetTo(m0);
+            self.ex.row_bytes = @splat(0);
             const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, self.routes, .{ .verify = true, .hidden = true });
             defer self.g.release(out.logits);
             defer self.g.release(out.hidden.?);
@@ -424,6 +426,15 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             ln.counts.draft_ns += t_draft - t0;
             ln.counts.verify_ns += t_verify - t_draft;
             ln.counts.peak_rise = @max(ln.counts.peak_rise, self.g.peakAbove(peak0));
+            for (self.ex.row_bytes[0 .. depth + 1], 0..) |b, i| {
+                ln.counts.verify_bytes += b;
+                if (i > d.accepted) ln.counts.rejected_bytes += b;
+            }
+            // The steps the decision reached: the accepted drafts and the first rejected one.
+            for (ln.top_p[0..@min(depth, d.accepted + 1)], 0..) |tp, i| {
+                ln.counts.decided[mtp_mod.tenth(tp)] += 1;
+                if (i < d.accepted) ln.counts.accepted_by_p[mtp_mod.tenth(tp)] += 1;
+            }
             if (self.decode_mark) |*dm| {
                 dm.steps += 1;
                 dm.tokens += rows;
@@ -456,6 +467,11 @@ pub const Reads = struct {
     spec_abandoned: u64 = 0,
     spec_cancelled: u64 = 0,
     spec_discarded: u64 = 0,
+    /// Of the used, those still in flight at the claim (late); the bytes the lookahead read, of them the bytes it
+    /// served to a demand read.
+    spec_late: u64 = 0,
+    spec_bytes: u64 = 0,
+    spec_served_bytes: u64 = 0,
     /// Loads whose slot still held the record (no read); demand ranges read straight into their rows.
     loads_skipped: u64 = 0,
     direct: u64 = 0,
@@ -483,6 +499,9 @@ pub const Reads = struct {
             .spec_abandoned = d(s0.spec_abandoned, s1.spec_abandoned),
             .spec_cancelled = d(s0.spec_cancelled, s1.spec_cancelled),
             .spec_discarded = d(s0.spec_discarded, s1.spec_discarded),
+            .spec_late = d(s0.spec_claimed_inflight, s1.spec_claimed_inflight),
+            .spec_bytes = d(s0.spec_bytes, s1.spec_bytes),
+            .spec_served_bytes = d(s0.adopt_bytes, s1.adopt_bytes),
             .loads_skipped = d(s0.loads_skipped, s1.loads_skipped),
             .direct = d(s0.direct_ranges, s1.direct_ranges),
             .wait_ns = d(s0.read_wait_ns, s1.read_wait_ns),
@@ -548,8 +567,8 @@ pub const DecodeLine = struct {
             p.steps, p.tokens, seconds(p.wall_ns), perSecond(p.tokens, p.wall_ns), p.r.hits + p.r.misses, p.r.hits, p.r.misses,
         });
         if (p.hit_rate) |h| try w.print(" (hit rate per layer min {d:.0}% median {d:.0}% max {d:.0}%)", .{ h.min, h.median, h.max });
-        try w.print(", {d:.2} GB from the SSD, lookahead {d} issued / {d} used (landed {d}, expired {d}, abandoned {d}, cancelled {d}, discarded {d}), {d} loads skipped, {d} direct reads, host wait {d:.2} s and reads in flight {d:.2} s of {d:.2} s, {d} rows per layer", .{
-            gigabytes(p.r.ssd_bytes), p.r.spec_issued, p.r.spec_used, p.r.spec_landed, p.r.spec_expired, p.r.spec_abandoned, p.r.spec_cancelled, p.r.spec_discarded, p.r.loads_skipped, p.r.direct, seconds(p.r.wait_ns), seconds(p.r.in_flight_ns), seconds(p.wall_ns), p.rows,
+        try w.print(", {d:.2} GB from the SSD ({d:.3} GB per emitted token), lookahead {d} issued / {d} used (landed {d}, expired {d}, abandoned {d}, cancelled {d}, discarded {d}, used while in flight {d}), lookahead {d:.2} GB read / {d:.2} GB served, {d} loads skipped, {d} direct reads, host wait {d:.2} s and reads in flight {d:.2} s of {d:.2} s, {d} rows per layer", .{
+            gigabytes(p.r.ssd_bytes), if (p.tokens == 0) 0 else gigabytes(p.r.ssd_bytes) / @as(f64, @floatFromInt(p.tokens)), p.r.spec_issued, p.r.spec_used, p.r.spec_landed, p.r.spec_expired, p.r.spec_abandoned, p.r.spec_cancelled, p.r.spec_discarded, p.r.spec_late, gigabytes(p.r.spec_bytes), gigabytes(p.r.spec_served_bytes), p.r.loads_skipped, p.r.direct, seconds(p.r.wait_ns), seconds(p.r.in_flight_ns), seconds(p.wall_ns), p.rows,
         });
     }
 };
@@ -558,9 +577,9 @@ const testing = std.testing;
 
 test "glm stats lines: the prompt and decode lines and the per-layer hit spread, from fixed counters" {
     const s0: Stats = .{ .expert_bytes_read = 100, .adopt_bytes = 10, .spec_bytes = 5, .persistent_loads = 3, .transient_loads = 1, .loads_skipped = 1, .expert_cache_hits = 7, .expert_cache_misses = 4 };
-    const s1: Stats = .{ .expert_bytes_read = 8_000_000_100, .adopt_bytes = 1_000_000_010, .spec_bytes = 2_000_000_005, .persistent_loads = 303, .transient_loads = 101, .loads_skipped = 21, .expert_cache_hits = 607, .expert_cache_misses = 404, .ahead_posted = 50, .ahead_hits = 40, .spec_issued = 90, .claimed = 60, .read_wait_ns = 1_500_000_000, .read_wall_ns = 2_250_000_000, .spec_landed = 70, .spec_expired = 12, .spec_abandoned = 5, .spec_cancelled = 3, .spec_discarded = 7, .direct_ranges = 300 };
+    const s1: Stats = .{ .expert_bytes_read = 8_000_000_100, .adopt_bytes = 1_000_000_010, .spec_bytes = 2_000_000_005, .persistent_loads = 303, .transient_loads = 101, .loads_skipped = 21, .expert_cache_hits = 607, .expert_cache_misses = 404, .ahead_posted = 50, .ahead_hits = 40, .spec_issued = 90, .claimed = 60, .read_wait_ns = 1_500_000_000, .read_wall_ns = 2_250_000_000, .spec_landed = 70, .spec_expired = 12, .spec_abandoned = 5, .spec_cancelled = 3, .spec_discarded = 7, .direct_ranges = 300, .spec_claimed_inflight = 4 };
     const r = Reads.of(s0, s1);
-    try testing.expectEqual(Reads{ .ssd_bytes = 9_000_000_000, .demand_records = 380, .ahead_records = 50, .ahead_hits = 40, .hits = 600, .misses = 400, .spec_issued = 90, .spec_used = 60, .spec_landed = 70, .spec_expired = 12, .spec_abandoned = 5, .spec_cancelled = 3, .spec_discarded = 7, .loads_skipped = 20, .direct = 300, .wait_ns = 1_500_000_000, .in_flight_ns = 2_250_000_000 }, r);
+    try testing.expectEqual(Reads{ .ssd_bytes = 9_000_000_000, .demand_records = 380, .ahead_records = 50, .ahead_hits = 40, .hits = 600, .misses = 400, .spec_issued = 90, .spec_used = 60, .spec_landed = 70, .spec_expired = 12, .spec_abandoned = 5, .spec_cancelled = 3, .spec_discarded = 7, .spec_late = 4, .spec_bytes = 2_000_000_000, .spec_served_bytes = 1_000_000_000, .loads_skipped = 20, .direct = 300, .wait_ns = 1_500_000_000, .in_flight_ns = 2_250_000_000 }, r);
     // Three layers: 1 of 4 hit, 3 of 4, none routed (skipped), 2 of 4.
     const c0 = [_]LayerCounts{ .{}, .{ .hits = 5 }, .{ .hits = 9, .misses = 9 }, .{} };
     const c1 = [_]LayerCounts{ .{ .hits = 1, .misses = 3 }, .{ .hits = 8, .misses = 1 }, .{ .hits = 9, .misses = 9 }, .{ .hits = 2, .misses = 2 } };
@@ -571,9 +590,9 @@ test "glm stats lines: the prompt and decode lines and the per-layer hit spread,
     const p = try std.fmt.allocPrint(a, "{f}", .{PromptLine{ .tokens = 1008, .wall_ns = 31_500_000_000, .r = r }});
     defer a.free(p);
     try testing.expectEqualStrings("glm_moe_dsa: prompt 1008 tokens in 31.50 s (32.0 tok/s): 9.00 GB from the SSD, 380 records on demand, 50 read ahead (40 routed), host wait 1.50 s", p);
-    const d = try std.fmt.allocPrint(a, "{f}", .{DecodeLine{ .steps = 128, .tokens = 128, .wall_ns = 25_000_000_000, .r = r, .hit_rate = hitSpread(&c0, &c1, &rates), .rows = 136 }});
+    const d = try std.fmt.allocPrint(a, "{f}", .{DecodeLine{ .steps = 40, .tokens = 128, .wall_ns = 25_000_000_000, .r = r, .hit_rate = hitSpread(&c0, &c1, &rates), .rows = 136 }});
     defer a.free(d);
-    try testing.expectEqualStrings("glm_moe_dsa: decode 128 steps, 128 tokens in 25.00 s (5.1 tok/s): 1000 routed records, 600 hits, 400 misses (hit rate per layer min 25% median 50% max 75%), 9.00 GB from the SSD, lookahead 90 issued / 60 used (landed 70, expired 12, abandoned 5, cancelled 3, discarded 7), 20 loads skipped, 300 direct reads, host wait 1.50 s and reads in flight 2.25 s of 25.00 s, 136 rows per layer", d);
+    try testing.expectEqualStrings("glm_moe_dsa: decode 40 steps, 128 tokens in 25.00 s (5.1 tok/s): 1000 routed records, 600 hits, 400 misses (hit rate per layer min 25% median 50% max 75%), 9.00 GB from the SSD (0.070 GB per emitted token), lookahead 90 issued / 60 used (landed 70, expired 12, abandoned 5, cancelled 3, discarded 7, used while in flight 4), lookahead 2.00 GB read / 1.00 GB served, 20 loads skipped, 300 direct reads, host wait 1.50 s and reads in flight 2.25 s of 25.00 s, 136 rows per layer", d);
 }
 
 test "glm stats lines: a prompt pass with read-ahead and a decode with the lookahead on the synthetic bank read back exactly" {

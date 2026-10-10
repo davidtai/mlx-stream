@@ -56,6 +56,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         opt: Options,
         transient_released: bool = false,
         wide: Wide = .{},
+        /// The decode lane's read bytes by the first row of the call that routes the expert (row i of `x`), summed over
+        /// calls until the caller zeroes it: a draft round's verify attributes its reads to the rows it keeps or rejects.
+        row_bytes: [max_route_ids]u64 = @splat(0),
 
         /// The wide lane's host scratch, reused across calls.
         const Wide = struct {
@@ -363,6 +366,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const r = try self.stream.route(layer, ids, sc);
             var released = false;
             errdefer if (!released) self.stream.release(r);
+            const record = self.stream.bank.layers[layer].logical_bytes;
+            for (r.plan.loadsOf(), r.reads[0..r.plan.n_loads]) |l, read| if (read) {
+                const at = std.mem.indexOfScalar(u16, ids, l.expert) orelse continue;
+                self.row_bytes[at / k] += record;
+            };
             var refs: [max_route_ids]SlotRef = undefined;
             var waves: [max_route_ids]u8 = undefined;
             _ = self.stream.refsOf(r, &refs);
