@@ -245,6 +245,28 @@ def convert_experts(srcs, g, dst, resume, stop_after):
     return done, written, stopped
 
 
+def write_safetensors(srcs, path, members):
+    """Writes the source tensors `members` to one safetensors file, bytes unchanged; returns its data bytes."""
+    header, off = {"__metadata__": {"format": "mlx"}}, 0
+    for n in members:
+        _, dtype, shape, a, b = srcs.tensors[n]
+        header[n] = {"dtype": dtype, "shape": shape, "data_offsets": [off, off + b - a]}
+        off += b - a
+    hb = json.dumps(header, separators=(",", ":")).encode()
+    hb += b" " * (-len(hb) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(hb)))
+        f.write(hb)
+        for n in members:
+            fn, _, _, a, b = srcs.tensors[n]
+            v = srcs.view(fn)
+            for lo in range(a, b, CHUNK):
+                piece = v[lo:min(b, lo + CHUNK)]
+                f.write(piece)
+                piece.release()
+    return off
+
+
 def write_residents(srcs, dst, shard_bytes):
     names = [n for n in srcs.order if SWITCH not in n]
     shards, cur, cur_n = [], [], 0
@@ -264,37 +286,24 @@ def write_residents(srcs, dst, shard_bytes):
             os.remove(os.path.join(dst, f))
     weight_map, total = {}, 0
     for fname, members in zip(files, shards):
-        header, off = {"__metadata__": {"format": "mlx"}}, 0
-        for n in members:
-            _, dtype, shape, a, b = srcs.tensors[n]
-            header[n] = {"dtype": dtype, "shape": shape, "data_offsets": [off, off + b - a]}
-            off += b - a
-        hb = json.dumps(header, separators=(",", ":")).encode()
-        hb += b" " * (-len(hb) % 8)
-        with open(os.path.join(dst, fname), "wb") as f:
-            f.write(struct.pack("<Q", len(hb)))
-            f.write(hb)
-            for n in members:
-                fn, _, _, a, b = srcs.tensors[n]
-                v = srcs.view(fn)
-                for lo in range(a, b, CHUNK):
-                    piece = v[lo:min(b, lo + CHUNK)]
-                    f.write(piece)
-                    piece.release()
-                weight_map[n] = fname
-        total += off
+        total += write_safetensors(srcs, os.path.join(dst, fname), members)
+        weight_map.update({n: fname for n in members})
     write_json(os.path.join(dst, "model.safetensors.index.json"),
                {"metadata": {"total_size": total}, "weight_map": dict(sorted(weight_map.items()))})
     return total
 
 
+def pick(total, which):
+    """The record numbers `--verify which` checks: all, or N spread evenly with the first and the last."""
+    if which == "all":
+        return list(range(total))
+    n = max(2, min(int(which), total))
+    return sorted({round(k * (total - 1) / (n - 1)) for k in range(n)})
+
+
 def verify(srcs, g, dst, records, which):
     total = len(records)
-    if which == "all":
-        picks = list(range(total))
-    else:
-        n = max(2, min(int(which), total))
-        picks = sorted({round(k * (total - 1) / (n - 1)) for k in range(n)})
+    picks = pick(total, which)
     buf = bytearray(g["record"])
     bad = 0
     fd = os.open(os.path.join(dst, SIDECAR), os.O_RDONLY)
