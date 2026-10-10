@@ -177,6 +177,9 @@ Settings (`model-settings.json`):
 | `expert_event_gates` | the GPU waits on the reads' events (`true`) or the host waits (`false`) | `true` |
 | `layer_major_prefill` | the prompt layer by layer (`true`) or chunk by chunk (`false`) | `true` |
 | `expert_wide_depth` | prompt expert groups read ahead per layer, 1 to 5 | 2 |
+| `mtp_depth` | the MTP draft lane's drafts per round, 0 to 5 (6 or more is refused at load) | 0 (off) |
+| `mtp_acceptance` | `exact` or `typical` | `exact` |
+| `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |
 
 Memory: one slot row is one 21.2 MB record on each of the 75 routed layers (1.59 GB). The KV costs 95,232 B per
 position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16),
@@ -190,9 +193,26 @@ Each request logs one `glm_moe_dsa: prompt` line at the end of its prompt pass a
 its end (the arch's `requestEnd`), with the phase's wall time, SSD bytes, records read, read-ahead or lookahead use,
 host wait on reads, and in decode the hits, misses and hit rate per layer (min, median, max).
 
+The MTP draft lane (`mtp_depth` > 0) runs the release's MTP layer (layer 78), which the MLX builds drop. The pack
+must have `mtp/` beside its shards, as `scripts/convert_glm_exl3_bank.py --mtp-only --from-pack <EXL3 pack>
+--dst <pack>/mtp` writes it: `mtp-residents.safetensors` (the layer's BF16 tensors as published),
+`mtp-experts.bin` and `mtp-manifest-exl3-v1.json` (its 256 experts as the EXL3 build's mini-expert records). Without
+`mtp/`, the load is refused by name. The experts stay resident (4.17 GB) and run through sushi's EXL3 MoE on the
+host's `mlx_host`; the bill adds them, the residents (0.58 GB), the layer's KV (1,408 B per position) and its waves.
+A round drafts `mtp_depth` tokens and verifies them with the token before them in one forward of the target, with the
+attention per row as a serial step runs it; the lane truncates the target's KV to the accepted rows. A draft past the
+first reuses the first step's indexer selection (`index_share_for_mtp_iteration`) and appends nothing to the MTP
+layer's cache. Exact acceptance takes the argmax for a greedy request, and DeepSeek-V4.1's point-mass rule (the draft
+accepted with its probability under the tempered, filtered target) for a sampled one. Typical acceptance is used only
+when `mtp_acceptance` names it. Each request logs one `glm_moe_dsa: mtp` line: depth, acceptance, rounds, drafted,
+accepted, the rate, the accepted and emitted tokens per round, tok/s and the time in the drafts and in the verify.
+
+`src/glm_moe_dsa_mtp_parity.zig` checks the lane on a tiny model with an MTP layer (`scripts/glm_moe_dsa_mtp_goldens.py`,
+`GLM53_MTP_PARITY=<its pack>`): every round's drafts and draft logits against the reference's modules at depth 1 to 5,
+the rounds' tokens against the serial decode, and both KV states after the rounds against a serial run's.
+
 Not available for GLM-5.3:
 
-- the draft lane (the MLX builds drop the MTP layer): decode is serial, one token per step;
 - a tier other than `stock`, and the pinned Metal kernels (the trunk runs on MLX's own ops);
 - a prompt over 16,384 tokens reads each routed layer's experts once per 16,384-token chunk, not once per prompt.
 

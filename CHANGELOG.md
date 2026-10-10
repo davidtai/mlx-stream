@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- GLM-5.3: the MTP draft lane over the release's MTP layer (`mtp_depth`, `mtp_acceptance`, `mtp_typical_delta`;
+  off by default, exact acceptance unless typical is named), its experts resident from the EXL3 build's records
+  through sushi's EXL3 MoE; `convert_glm_exl3_bank.py --mtp-only` writes the pack's `mtp/` directory.
 - GLM-5.3 (`glm_moe_dsa`): a second arch over the same expert stream, from a pack of resident shards and an affine
   expert bank (`expert-manifest-affine-v1.json`). Serial decode, the `stock` tier, MLX's `gather_qmm` for the experts.
   `src/root.zig` exports both archs as `archs`; `arch` stays DeepSeek-V4.1's. Each request logs a prompt line and a
