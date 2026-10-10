@@ -162,6 +162,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
                 .transient_release = true,
                 .slot_memory = .{ .mlx = s },
                 .staging_from_bank = true,
+                .keep_residents = true,
                 .pool = .{ .workers = shape.workers, .tickets = 1024 },
                 .lookahead = .{ .k = lookahead.k, .budget = lookahead.budget },
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
@@ -176,6 +177,15 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
             for (self.ex.banks) |b| if (b[@backingInt(experts_mod.BankKind.base)]) |arr| try self.math.checkBank(&self.g, arr, &diag);
             self.cache = try graph.Cache.init(gpa, model, @intCast(bill_mod.maxPositions(cfg)));
             errdefer self.cache.deinit(&self.g);
+            // The prompt rows filled before the first request, in expert order (a long prompt routes nearly every expert,
+            // so any filled row is a hit); a later request finds its predecessor's residents (`keep_residents`).
+            const order = try gpa.alloc(u16, self.model.n_routed_experts);
+            defer gpa.free(order);
+            for (order, 0..) |*e, i| e.* = @intCast(i);
+            const t_pre = std.Io.Timestamp.now(io, .awake);
+            const preloaded = try self.stream.preload(@as([]const u16, order), sameOrder);
+            const pre_ns: u64 = @intCast(t_pre.untilNow(io, .awake).nanoseconds);
+            log.info("glm_moe_dsa: preloaded {d} records ({d:.2} GB) into the prompt rows in {d:.2} s\n", .{ preloaded, gigabytes(preloaded * self.bank.geometryOf().widest_record), seconds(pre_ns) });
             self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa };
             self.g.clearCache();
             _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, bill_mod.prefill_cache_bytes);
@@ -325,6 +335,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type) type {
             return self.stream.stats();
         }
     };
+}
+
+/// `Stream.preload`'s order: the same for every layer.
+fn sameOrder(order: []const u16, layer: u32) []const u16 {
+    _ = layer;
+    return order;
 }
 
 /// One phase's reads between two snapshots of the stream's counters.
