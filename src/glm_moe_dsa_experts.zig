@@ -1032,11 +1032,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     std.debug.assert(w.pos.items.len - p0 == w.slot.items.len);
                 }
                 try self.math.finishPrefill(g);
-                try g.asyncEval(w.kept.items[k0..]);
                 g.resetTo(m);
                 pt.chargeRouted(.encode, tc);
-                if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..k0], &next, &live, depth, ahead);
-                prev = .{ .gi = gi, .k0 = k0 };
+                try self.drainGroup(g, w, sl, gi, w.kept.items[k0..], &next, &live, depth, ahead);
+                prev = null;
             }
             if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..], &next, &live, depth, ahead);
         }
