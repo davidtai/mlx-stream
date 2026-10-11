@@ -238,7 +238,7 @@ test "dsv41 nocache reader: a safetensors file's header and tensors read through
     });
     var root: [512]u8 = undefined;
     var pbuf: [700]u8 = undefined;
-    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/w.safetensors", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/w.safetensors", .{try @import("testing.zig").tmpRoot(&tmp, &root)}, 0);
     const r = try compareTensors(a, path);
     try testing.expectEqual(@as(usize, 3), r.n);
     try testing.expectEqual(@as(u64, 3 + big.len + 9), r.bytes);
@@ -276,7 +276,7 @@ test "dsv41 nocache reader: MLX's reader handle owns the descriptor and frees it
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "big.bin", .data = image });
     var root: [512]u8 = undefined;
     var pbuf: [700]u8 = undefined;
-    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/big.bin", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/big.bin", .{try @import("testing.zig").tmpRoot(&tmp, &root)}, 0);
     const d = try Desc.open(path);
     try testing.expectEqual(@as(u64, image.len), d.size);
     const out = try a.alloc(u8, stage_bytes + 20_001);

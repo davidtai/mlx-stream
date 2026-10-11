@@ -2019,9 +2019,7 @@ pub fn writeMini(a: std.mem.Allocator, tmp: *std.testing.TmpDir, spec: []const P
     return all;
 }
 
-fn tmpRoot(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
-    return buf[0..try tmp.dir.realPath(testing.io, buf)];
-}
+const tmpRoot = sdk.testing.tmpRoot;
 
 test "dsv41 weights: a synthetic mini checkpoint maps every tensor and reads its bytes back" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

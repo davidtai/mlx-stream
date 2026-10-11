@@ -959,9 +959,7 @@ pub fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u
 
 const implemented_synth: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = 4, .n_layers = 2 };
 
-pub fn tmpRoot(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
-    return buf[0..try tmp.dir.realPath(std.testing.io, buf)];
-}
+pub const tmpRoot = @import("sdk").testing.tmpRoot;
 
 /// A synthetic bank (`writeSynth`) opened from a temporary directory (tests).
 pub const SynthBank = struct {

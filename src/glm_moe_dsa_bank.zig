@@ -427,7 +427,7 @@ pub fn tinyConfig(a: std.mem.Allocator) !glm.Config {
     return glm.Config.parse(a, text, null, null);
 }
 
-pub const tmpRoot = @import("expert_bank.zig").tmpRoot;
+pub const tmpRoot = @import("sdk").testing.tmpRoot;
 
 /// One case of a GLM-5.3 bank's refusal table: the synthetic bank's perturbation, its refusal and words of its message.
 pub fn RefusalCase(comptime M: type) type {

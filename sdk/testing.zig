@@ -80,6 +80,11 @@ pub fn expectBillBoundsLoad(comptime A: type, gpa: std.mem.Allocator, io: std.Io
 
 // ── Fixture files (cpu) ──
 
+/// A test directory's absolute path, in `buf` (a bank or a loader opens absolute paths only).
+pub fn tmpRoot(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
+    return buf[0..try tmp.dir.realPath(std.testing.io, buf)];
+}
+
 /// One tensor of a fixture safetensors file: its name, the file's name for its dtype, its shape and its `len` bytes
 /// (`bytes`, else zeros).
 pub const StTensor = struct { name: []const u8, dtype: []const u8, shape: []const u64, len: u64, bytes: ?[]const u8 = null };
