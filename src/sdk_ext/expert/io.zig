@@ -168,7 +168,9 @@ pub const Counter = enum(u8) {
     diag_wake_ns = 84,
     diag_job_ns = 85,
 };
-pub const counters_n = 86;
+/// DIAG (diag/pool-wait): the wait counters' indices in the C pool's array, past the enum (`counterAt`).
+pub const diag_wait_first = 86;
+pub const counters_n = 121;
 
 /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
 /// read by `threads` threads in `chunk_bytes` preadv steps.
@@ -410,6 +412,11 @@ pub const Pool = struct {
 
     pub fn counter(self: *const Pool, which: Counter) i64 {
         return @atomicLoad(i64, &self.counters[@intFromEnum(which)], .monotonic);
+    }
+
+    /// DIAG: counter `i` of the C pool's array by index.
+    pub fn counterAt(self: *const Pool, i: usize) i64 {
+        return @atomicLoad(i64, &self.counters[i], .monotonic);
     }
 
     /// Blocks until every ticket in [first, first + count) is in the log;

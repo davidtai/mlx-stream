@@ -201,6 +201,13 @@ enum {
     SC_DIAG_GU_RANGES, SC_DIAG_GU_BYTES, SC_DIAG_GU_READ_NS, SC_DIAG_GU_COPY_NS,
     SC_DIAG_DN_RANGES, SC_DIAG_DN_BYTES, SC_DIAG_DN_READ_NS, SC_DIAG_DN_COPY_NS,
     SC_DIAG_ADOPT_COPY_NS, SC_DIAG_COPY_MAX_NS, SC_DIAG_JOBS, SC_DIAG_WAKE_NS, SC_DIAG_JOB_NS,
+    /* DIAG (diag/pool-wait): a demand job's wait (submit -> a worker takes it) by the jobs queued ahead of it at its
+     * submit (0, 1, 2, 3, 4+), by whether a worker was free then (qlen 0 and busy < nworkers: the wait is the wake),
+     * as a histogram (< 8, 32, 128, 512, 1024, 2048, 4096 us, more); the pool's busy workers over time (0..8), the
+     * queue's length over time, and the time a job waited while a worker was free. */
+    SC_DIAG_WQ_N, SC_DIAG_WQ_NS = SC_DIAG_WQ_N + 5, SC_DIAG_IDLE_N = SC_DIAG_WQ_NS + 5, SC_DIAG_IDLE_NS,
+    SC_DIAG_IDLE_MAX_NS, SC_DIAG_FULL_N, SC_DIAG_FULL_NS, SC_DIAG_FULL_PRE_N, SC_DIAG_HIST,
+    SC_DIAG_OCC_NS = SC_DIAG_HIST + 8, SC_DIAG_QLEN_NS = SC_DIAG_OCC_NS + 9, SC_DIAG_GAP_NS,
     SC_N
 };
 
@@ -236,6 +243,9 @@ typedef struct {
     int64_t first;      /* first ticket */
     int32_t count;      /* ranges in the job */
     int64_t t_queued;   /* DIAG: the submit's clock */
+    int32_t q_ahead;    /* DIAG: jobs queued ahead of it at its submit */
+    int32_t free_at;    /* DIAG: a worker was free at its submit */
+    int32_t pre_at;     /* DIAG: workers on a pre-range at its submit */
 } job_t;
 
 typedef struct {
@@ -269,6 +279,8 @@ static pthread_t threads[MAX_WORKERS];
 static pthread_t spec_threads[MAX_SPEC_THREADS];
 static char *staging[MAX_WORKERS];
 static int nworkers = 0, running = 0, stopping = 0, busy = 0;
+static int pre_busy = 0;          /* DIAG: workers running a pre-range */
+static int64_t occ_t = 0;         /* DIAG: the last occupancy tick */
 static int64_t staging_bytes = 0, page_size = 0;
 static int64_t *res = 0, nt = 0, *logbuf = 0, logn = 0, *gauge = 0;
 static range_t *ranges = 0;
@@ -490,6 +502,20 @@ static void diag_range(const range_t *rg, int64_t bytes, int64_t read_ns, int64_
     __atomic_fetch_add(&sc[gu ? SC_DIAG_GU_COPY_NS : SC_DIAG_DN_COPY_NS], copy_ns, __ATOMIC_RELAXED);
     int64_t m = __atomic_load_n(&sc[SC_DIAG_COPY_MAX_NS], __ATOMIC_RELAXED);
     while (copy_ns > m && !__atomic_compare_exchange_n(&sc[SC_DIAG_COPY_MAX_NS], &m, copy_ns, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
+/* DIAG: the time since the last tick into the busy-workers bucket, the queue-length integral and the gap (a job
+ * queued while a worker is free); call with mu held BEFORE busy / qlen change. */
+static void occ_tick(void) {
+    if (!sc) return;
+    int64_t now = q3ld_monotonic_ns();
+    if (occ_t) {
+        int64_t dt = now - occ_t;
+        sc[SC_DIAG_OCC_NS + (busy < 8 ? busy : 8)] += dt;
+        sc[SC_DIAG_QLEN_NS] += dt * qlen;
+        if (qlen > 0 && busy < nworkers) sc[SC_DIAG_GAP_NS] += dt;
+    }
+    occ_t = now;
 }
 
 static void gauge_exit(void) {
@@ -757,13 +783,15 @@ static int pre_expire(int64_t cur) {
 static void run_pre(int i, int w, char *stage) {
     pre_t *p = &pre[i];
     p->state = PR_INFLIGHT;
+    occ_tick();
     busy += 1;
+    pre_busy += 1;
     sc[SC_PRE_STARTED] += 1;
     int n = 0;
     for (int k = 0; k < MAX_PRE; k++) n += pre[k].state == PR_INFLIGHT;
     if (n > sc[SC_PRE_MAX_INFLIGHT]) sc[SC_PRE_MAX_INFLIGHT] = n;
     EV(9, p->rg.offset);
-    job_t job = { p->fd, p->file_size, -1, 0, 0, 0 };
+    job_t job = { p->fd, p->file_size, -1, 0, 0, 0, 0, 0, 0 };
     pthread_mutex_unlock(&mu);
     RANGE_DELAY();
     int64_t out[RES_W] = { 0 };
@@ -771,7 +799,9 @@ static void run_pre(int i, int w, char *stage) {
     int status = run_range_pre(&job, p, stage, out);
     gauge_exit();
     pthread_mutex_lock(&mu);
+    occ_tick();
     busy -= 1;
+    pre_busy -= 1;
     if (status == PRE_DROPPED && !p->bound) {
         p->state = PR_FREE;                 /* expired unbound: nobody waits for it */
         p->cancel = 0;
@@ -997,11 +1027,27 @@ static void *worker(void *arg) {
         }
         job_t job = queue[qhead];
         qhead = (qhead + 1) % qcap;
+        occ_tick();
         __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);
         EV(2, job.first);
         busy += 1;
         int64_t t_deq = q3ld_monotonic_ns();
-        if (sc) { sc[SC_DIAG_JOBS] += 1; sc[SC_DIAG_WAKE_NS] += t_deq - job.t_queued; }
+        if (sc) {
+            int64_t wt = t_deq - job.t_queued;
+            sc[SC_DIAG_JOBS] += 1; sc[SC_DIAG_WAKE_NS] += wt;
+            int qa = job.q_ahead < 4 ? job.q_ahead : 4;
+            sc[SC_DIAG_WQ_N + qa] += 1; sc[SC_DIAG_WQ_NS + qa] += wt;
+            if (job.free_at) {
+                sc[SC_DIAG_IDLE_N] += 1; sc[SC_DIAG_IDLE_NS] += wt;
+                if (wt > sc[SC_DIAG_IDLE_MAX_NS]) sc[SC_DIAG_IDLE_MAX_NS] = wt;
+            } else {
+                sc[SC_DIAG_FULL_N] += 1; sc[SC_DIAG_FULL_NS] += wt;
+                if (job.pre_at > 0) sc[SC_DIAG_FULL_PRE_N] += 1;
+            }
+            int h = 0;
+            for (int64_t lim = 8000; h < 7 && wt >= lim; h++) lim = h < 3 ? lim * 4 : lim * 2;
+            sc[SC_DIAG_HIST + h] += 1;
+        }
         pthread_mutex_unlock(&mu);
         int failed = 0;
         for (int32_t i = 0; i < job.count; i++) {
@@ -1067,6 +1113,7 @@ static void *worker(void *arg) {
             if (status) failed = 1;
         }
         pthread_mutex_lock(&mu);
+        occ_tick();
         busy -= 1;
         if (sc) sc[SC_DIAG_JOB_NS] += q3ld_monotonic_ns() - t_deq;
         pthread_cond_broadcast(&done_cv);
@@ -1319,7 +1366,7 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     qcap = n_tickets; qhead = 0; __atomic_store_n(&qlen, 0, __ATOMIC_RELAXED);
     res = res_arr; nt = n_tickets; logbuf = log_arr; logn = n_log; gauge = gauge_arr;
     staging_bytes = sbytes; page_size = psize;
-    __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); busy = 0; seq = 0;
+    __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); busy = 0; seq = 0; pre_busy = 0; occ_t = 0;
     for (int i = 0; i < nw; i++) staging[i] = (char *)(uintptr_t)staging_ptrs[i];
     nworkers = 0;
     for (int i = 0; i < nw; i++) {
@@ -1394,6 +1441,8 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
         job->fd = fd; job->file_size = file_size; job->deadline = deadline;
         job->first = range_jobs ? first + j : first; job->count = range_jobs ? 1 : count;
         job->t_queued = q3ld_monotonic_ns();
+        job->q_ahead = (int32_t)qlen; job->free_at = qlen == 0 && busy < nworkers; job->pre_at = pre_busy;
+        occ_tick();
         __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
     }
     EV(1, first);
