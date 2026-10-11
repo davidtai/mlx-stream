@@ -642,7 +642,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// Each stream layer's decode rows at `units` grown from the prompt's: the split's (`glm_moe_dsa_split`) on its
         /// geometry, else the even split's (`bill.rowsAt`). The split's grown rows take at most the even split's bytes.
         fn decodeRowsAt(self: *Self, units: u32) void {
-            self.split_rows = split_mod.decodeRows(self.inputs.bank, self.prompt_units, units, self.decode_rows) != null;
+            self.split_rows = split_mod.decodeRows(self.inputs.bank, self.prompt_units, units, bill_mod.grownBytes(self.inputs.bank, self.prompt_units, units), self.decode_rows) != null;
             if (!self.split_rows) _ = bill_mod.rowsAt(self.inputs.bank, units, self.decode_rows);
         }
 

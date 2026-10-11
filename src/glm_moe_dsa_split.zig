@@ -6,11 +6,11 @@
 //!
 //! At `units` grown from the prompt's: each bank layer keeps its share of the reference table's slot bytes, rounded to
 //! rows, at least its prompt rows (the stream grows and never shrinks) and at most its experts. Then the grown rows'
-//! bytes (each array page-rounded, `bill.slotArrays`) are fixed to the even split's (`bill.grownBytes`): while they are
-//! over, the layer whose last row saves the fewest misses gives it up; while a row fits, the layer whose next row saves
-//! the most takes it (ties to the lower layer). A row's misses come from its layer's curve, linear between the stored
-//! rows. A miss reads the slot's bytes, so the misses of the two Ks compare as they are. At the reference units the
-//! procedure gives the table back (a test pins it).
+//! bytes (each array page-rounded, `bill.slotArrays`) are fixed to the handover's byte budget (at the reference, the even
+//! split's `bill.grownBytes`): while they are over, the layer whose last row saves the fewest misses gives it up; while
+//! a row fits, the layer whose next row saves the most takes it (ties to the lower layer). A row's misses come from its
+//! layer's curve, linear between the stored rows. A miss reads the slot's bytes, so the misses of the two Ks compare as
+//! they are. At the reference units the procedure gives the table back (a test pins it).
 
 const std = @import("std");
 const glm = @import("glm_moe_dsa.zig");
@@ -226,9 +226,11 @@ fn experts(l: glm.LayerSlots) u32 {
     return l.n_records / @max(l.rows_per_unit, 1);
 }
 
-/// Each stream layer's decode rows at `units` grown from `prompt` units (`Stream.grow`'s rows), in `out`; null when `g`
-/// is not the table's geometry.
-pub fn decodeRows(g: glm.Geometry, prompt: u32, units: u32, out: []u32) ?[]u32 {
+/// Each stream layer's decode rows grown from `prompt` units (`Stream.grow`'s rows), in `out`: the reference's shares at
+/// `units`, then filled to `budget`, the grown bytes above the prompt rows (each layer's `bill.slotArrays` of its rows
+/// past its prompt rows; not the slot rows' total). Any budget is safe: a layer gives up rows only down to its prompt
+/// rows. Null when `g` is not the table's geometry.
+pub fn decodeRows(g: glm.Geometry, prompt: u32, units: u32, budget: u64, out: []u32) ?[]u32 {
     if (!isTables(g)) return null;
     const from = @min(prompt, units);
     var floor: [n_bank]u32 = undefined;
@@ -247,8 +249,7 @@ pub fn decodeRows(g: glm.Geometry, prompt: u32, units: u32, out: []u32) ?[]u32 {
         const want: u32 = @intCast((@as(u128, r) * at_even + at_ref / 2) / at_ref);
         x.* = std.math.clamp(want, f, experts(l));
     }
-    // The grown rows' bytes fixed to the even split's.
-    const budget = bill.grownBytes(g, from, units);
+    // The grown rows' bytes fixed to the budget.
     var used: u64 = 0;
     for (g.layers, rows, floor) |l, x, f| used += bill.slotArrays(l, x - f);
     while (used > budget) {
@@ -311,7 +312,7 @@ fn slotBytesOf(g: glm.Geometry, prompt: u32, rows: []const u32) u64 {
 test "glm split: at the reference units the table comes back as it is, within the bill's slot rows" {
     const g = bill.box_exl3.geometry;
     var out: [n_bank]u32 = undefined;
-    const rows = decodeRows(g, ref_prompt_units, ref_units, &out).?;
+    const rows = decodeRows(g, ref_prompt_units, ref_units, bill.grownBytes(g, ref_prompt_units, ref_units), &out).?;
     for (rows, ref_rows) |x, r| try testing.expectEqual(@as(u32, r), x);
     try testing.expect(slotBytesOf(g, ref_prompt_units, rows) <= bill.decodeSlotBytes(g, ref_prompt_units, ref_units));
     // The table saves misses on its curves against the even split at the same bytes.
@@ -331,7 +332,7 @@ test "glm split: at other budgets every layer keeps its prompt rows, the bill's 
     const cases = [_][2]u32{ .{ 72, 85 }, .{ 60, 75 }, .{ 72, 100 }, .{ 40, 120 }, .{ 72, 72 }, .{ 100, 128 } };
     for (cases) |cs| {
         var out: [n_bank]u32 = undefined;
-        const rows = decodeRows(g, cs[0], cs[1], &out).?;
+        const rows = decodeRows(g, cs[0], cs[1], bill.grownBytes(g, cs[0], cs[1]), &out).?;
         var floor: [n_bank]u32 = undefined;
         _ = bill.rowsAt(g, cs[0], &floor);
         for (rows, floor, g.layers) |x, f, l| {
@@ -354,5 +355,33 @@ test "glm split: a stream of another geometry keeps the even split" {
     var g = bill.box_exl3.geometry;
     g.layers = &two;
     var out: [n_bank]u32 = undefined;
-    try testing.expect(decodeRows(g, 2, 4, &out) == null);
+    try testing.expect(decodeRows(g, 2, 4, bill.grownBytes(g, 2, 4), &out) == null);
+}
+
+test "glm split: a budget past the even split's bytes grows more rows within it, and no row that fits is left" {
+    const g = bill.box_exl3.geometry;
+    var floor: [n_bank]u32 = undefined;
+    _ = bill.rowsAt(g, ref_prompt_units, &floor);
+    var at_units: [n_bank]u32 = undefined;
+    const today = slotBytesOf(g, ref_prompt_units, decodeRows(g, ref_prompt_units, ref_units, bill.grownBytes(g, ref_prompt_units, ref_units), &at_units).?);
+    // Half a unit and 1.7 GB past the even split's bytes at the reference units.
+    for ([_]u64{ bill.unitBytes(g) / 2, 1_700_000_000 }) |extra| {
+        const budget = bill.grownBytes(g, ref_prompt_units, ref_units) + extra;
+        var out: [n_bank]u32 = undefined;
+        const rows = decodeRows(g, ref_prompt_units, ref_units, budget, &out).?;
+        var used: u64 = 0;
+        for (rows, floor, g.layers) |x, f, l| {
+            try testing.expect(x >= f and x <= experts(l));
+            used += bill.slotArrays(l, x - f);
+        }
+        try testing.expect(used <= budget);
+        try testing.expect(slotBytesOf(g, ref_prompt_units, rows) > today);
+        for (rows, floor, g.layers) |x, f, l| {
+            if (x >= experts(l)) continue;
+            try testing.expect(used + bill.slotArrays(l, x + 1 - f) - bill.slotArrays(l, x - f) > budget);
+        }
+    }
+    // No budget: the prompt rows.
+    var out: [n_bank]u32 = undefined;
+    for (decodeRows(g, ref_prompt_units, ref_units, 0, &out).?, floor) |x, f| try testing.expectEqual(f, x);
 }
