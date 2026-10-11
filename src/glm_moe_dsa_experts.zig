@@ -955,23 +955,6 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 };
                 live += n_staged;
             }
-            // The bank layer's routed rows bucketed by group once (a counting sort, each group's rows in row order; a row
-            // of another bank layer's expert has no place here).
-            try w.group_at.resize(a, n_groups + 1);
-            @memset(w.group_at.items, 0);
-            for (w.ids.items) |e| if (w.first.items[e] >= 0) {
-                w.group_at.items[@as(usize, w.egroup.items[e]) + 1] += 1;
-            };
-            for (1..n_groups + 1) |gi| w.group_at.items[gi] += w.group_at.items[gi - 1];
-            try w.by_group.resize(a, w.side_ids.items.len);
-            try w.slot.resize(a, n_groups);
-            @memcpy(w.slot.items, w.group_at.items[0..n_groups]);
-            for (w.ids.items, 0..) |e, row| {
-                if (w.first.items[e] < 0) continue;
-                const gi = w.egroup.items[e];
-                w.by_group.items[w.slot.items[gi]] = @intCast(row);
-                w.slot.items[gi] += 1;
-            }
             const depth: usize = self.opt.wide_depth;
             // Routes ahead, in group order, while windows are free.
             var next: usize = 0;
@@ -1012,8 +995,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     w.slot.clearRetainingCapacity();
                     w.act.clearRetainingCapacity();
                     const p0 = w.pos.items.len;
-                    for (w.by_group.items[w.group_at.items[gi]..w.group_at.items[gi + 1]]) |row| {
-                        const fi: usize = @intCast(w.first.items[w.ids.items[row]]);
+                    for (w.ids.items, 0..) |e, row| {
+                        if (w.first.items[e] < 0) continue;
+                        const fi: usize = @intCast(w.first.items[e]);
+                        if (fi < start or fi >= w.bounds.items[gi + 1]) continue;
                         const ref = refs[fi - start];
                         if (ref.bank != kind) continue;
                         try w.slot.append(a, ref.row);
