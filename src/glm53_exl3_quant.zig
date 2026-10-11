@@ -908,7 +908,7 @@ fn nbytesOf(x: mlx.mlx_array) u64 {
     return mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
 }
 
-fn benchDecode4(a: Allocator, g: anytype, theirs: anytype, banks: anytype, slot_of: []const u32, b: *const bank_mod.Bank, h: usize) !void {
+fn benchDecode4(a: Allocator, g: anytype, ours: anytype, theirs: anytype, banks: anytype, slot_of: []const u32, b: *const bank_mod.Bank, h: usize) !void {
     const T = mlx.mlx_array;
     const kern = sushi.kernels;
     kern.setDecodeParams(.mcg);
@@ -969,16 +969,18 @@ fn benchDecode4(a: Allocator, g: anytype, theirs: anytype, banks: anytype, slot_
     }
     if (hot[0] == null or hot[1] == null) return error.BenchShape;
     const Cfg = enum { real, distinct, hot };
-    const Wave = struct { n: u32, tok: T, minis: T, ones: T };
+    const Wave = struct { n: u32, tok: T, minis: T, ones: T, slots: []const u32 };
     var waves: [3][2]Wave = undefined;
     for (std.enums.values(Cfg)) |cfg| for (0..2) |side| {
         var tok: std.ArrayList(i32) = .empty;
         var mn: std.ArrayList(u32) = .empty;
+        var sl: std.ArrayList(u32) = .empty;
         for (pairs) |p| {
             if (b.streamLayer(0, p.e) != side) continue;
             if (cfg == .distinct and !p.first) continue;
             const slot = if (cfg == .hot) hot[side].? else slot_of[p.e];
             try tok.append(ar, @intCast(p.row));
+            try sl.append(ar, slot);
             for (0..tp) |q| try mn.append(ar, slot * tp + @as(u32, @intCast(q)));
         }
         const ones = try ar.alloc(f32, mn.items.len);
@@ -989,6 +991,7 @@ fn benchDecode4(a: Allocator, g: anytype, theirs: anytype, banks: anytype, slot_
             .tok = g.keep(try g.hostArray(std.mem.sliceAsBytes(tok.items), &.{n}, .int32)),
             .minis = g.keep(try g.hostArray(std.mem.sliceAsBytes(mn.items), &.{n * tpc}, .uint32)),
             .ones = g.keep(try g.hostArray(std.mem.sliceAsBytes(ones), &.{n * tpc}, .float32)),
+            .slots = sl.items,
         };
     };
     defer for (waves) |ws| for (ws) |w| {
@@ -1010,10 +1013,15 @@ fn benchDecode4(a: Allocator, g: anytype, theirs: anytype, banks: anytype, slot_
     std.debug.print("GLM53_DEC4 setup: {d} minis of {d} per expert; K{d} {d} + {d} B per mini (trellis per projection, scales), K{d} {d} + {d} B; experts K3 / K4 {d} / {d}; pairs real {d} / {d}, distinct {d} / {d}\n", .{ tp, mini, b.layers[0].k, mini_bytes[0], scale_bytes[0], b.layers[1].k, mini_bytes[1], scale_bytes[1], nd_side[0], nd_side[1], waves[0][0].n, waves[0][1].n, waves[1][0].n, waves[1][1].n });
     const Depth = enum { none, gu, gud, full };
     const Sides = enum { both, k3, k4 };
-    const Arm = struct { cfg: Cfg, depth: Depth, sides: Sides };
+    // impl glm53: these texts' GEMVs as the driver's `fused` would call them (`fusedGlm53`: each slot decoded once for
+    // its member pairs), the full wave only
+    const Impl = enum { sushi, glm53 };
+    const Arm = struct { cfg: Cfg, depth: Depth, sides: Sides, impl: Impl = .sushi };
     var arms: std.ArrayList(Arm) = .empty;
     for ([_]Cfg{ .real, .distinct, .hot }) |cfg| for (std.enums.values(Depth)) |d| try arms.append(ar, .{ .cfg = cfg, .depth = d, .sides = .both });
     for ([_]Cfg{ .real, .hot }) |cfg| for ([_]Sides{ .k3, .k4 }) |sd| for ([_]Depth{ .none, .full }) |d| try arms.append(ar, .{ .cfg = cfg, .depth = d, .sides = sd });
+    for ([_]Cfg{ .real, .distinct, .hot }) |cfg| try arms.append(ar, .{ .cfg = cfg, .depth = .full, .sides = .both, .impl = .glm53 });
+    for ([_]Cfg{ .real, .hot }) |cfg| for ([_]Sides{ .k3, .k4 }) |sd| try arms.append(ar, .{ .cfg = cfg, .depth = .full, .sides = sd, .impl = .glm53 });
     const steps = 32;
     const best = try ar.alloc(u64, arms.items.len);
     const best_eval = try ar.alloc(u64, arms.items.len);
@@ -1033,7 +1041,7 @@ fn benchDecode4(a: Allocator, g: anytype, theirs: anytype, banks: anytype, slot_
                 const bk = banks[side];
                 const ns: c_int = @as(c_int, @intCast(w.n)) * tpc;
                 const xt = try g.take(x, w.tok, 0);
-                const out: T = switch (arm.depth) {
+                const out: T = if (arm.impl == .glm53) try ours.fusedGlm53(g, xt, w.slots, bk) else switch (arm.depth) {
                     .none => xt,
                     else => blk: {
                         const inn = try kern.pairGemv(g.s, xt, bk.gate.suh, bk.up.suh, bk.gate.trellis, bk.up.trellis, w.minis, hc, mini, ns, tpc, 0);
@@ -1071,7 +1079,7 @@ fn benchDecode4(a: Allocator, g: anytype, theirs: anytype, banks: anytype, slot_
             bytes += @as(u64, e_side) * tp * (3 * mini_bytes[side] + scale_bytes[side]);
         }
         const ms_eval = @as(f64, @floatFromInt(best_eval[ai])) / 1e6 / steps;
-        std.debug.print("GLM53_DEC4 chain {t} {t} {t}: {d} pairs over {d} experts ({d} B distinct): eval {d:.4} ms per step, build + eval {d:.4} ms\n", .{ arm.cfg, arm.sides, arm.depth, n_pairs, n_ex, bytes, ms_eval, @as(f64, @floatFromInt(best[ai])) / 1e6 / steps });
+        std.debug.print("GLM53_DEC4 chain {t} {t} {t} {t}: {d} pairs over {d} experts ({d} B distinct): eval {d:.4} ms per step, build + eval {d:.4} ms\n", .{ arm.impl, arm.cfg, arm.sides, arm.depth, n_pairs, n_ex, bytes, ms_eval, @as(f64, @floatFromInt(best[ai])) / 1e6 / steps });
     }
     // the read kernel: each listed mini's three trellis rows, uint4 words, 256 threads x CH words a threadgroup
     const ch: c_int = 4096;
@@ -1266,7 +1274,7 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
     std.debug.print("GLM53_UBENCH layer 0: {d} K{d} + {d} K{d} experts resident in {d:.1} s\n", .{ b.layers[0].n_held, b.layers[0].k, b.layers[1].n_held, b.layers[1].k, @as(f64, @floatFromInt(nowNs() - t_load)) / 1e9 });
     var banks: [2]quant.BankArrays(Arrays(G.T)) = undefined;
     for (0..2) |side| banks[side] = st.bankArrays(@intCast(side), .base).?;
-    if (std.c.getenv("GLM53_EXL3_DEC4") != null) return benchDecode4(a, &g, theirs, &banks, slot_of, &b, h);
+    if (std.c.getenv("GLM53_EXL3_DEC4") != null) return benchDecode4(a, &g, ours, theirs, &banks, slot_of, &b, h);
     var rng = std.Random.DefaultPrng.init(0x61b);
     // decode
     for ([_]usize{ 1, 4, 6 }) |n| {
