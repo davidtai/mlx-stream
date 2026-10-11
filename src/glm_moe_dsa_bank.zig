@@ -612,17 +612,8 @@ test "glm bank: the stream serves every routed id from a slot holding its record
                 k += 1;
             }
         }
-        const r = try s.route(l, ids[0..n], &.{});
-        for (0..r.n_parts) |p| {
-            try s.waitGu(r, @intCast(p));
-            try s.waitDown(r, @intCast(p));
-        }
-        for (ids[0..n], r.plan.slotsOf()) |e, slot| {
-            const off = b.recordOffset(l, e);
-            for (b.layers[l].segments, 0..) |seg, c| {
-                try testing.expectEqualSlices(u8, sb.image[off + seg.offset ..][0..seg.length], s.slotRow(l, slot, @enumFromInt(c))[0..seg.length]);
-            }
-        }
+        const r = try s.serve(l, ids[0..n]);
+        try s.expectServed(r, ids[0..n], sb.image);
         s.release(r);
     }
     try s.flush();

@@ -104,17 +104,8 @@ test "dsv41 bank contract: a MiMo-shaped MXFP4 bank (6 components, gate/up 4) st
                 k += 1;
             }
         }
-        const r = try s.route(l, ids[0..n], &.{});
-        for (0..r.n_parts) |p| {
-            try s.waitGu(r, @intCast(p));
-            try s.waitDown(r, @intCast(p));
-        }
-        for (ids[0..n], r.plan.slotsOf()) |e, slot| {
-            const off = bank.recordOffset(l, e);
-            for (layers[l].segments, 0..) |seg, c| {
-                try testing.expectEqualSlices(u8, image[off + seg.offset ..][0..seg.length], s.slotRow(l, slot, @enumFromInt(c))[0..seg.length]);
-            }
-        }
+        const r = try s.serve(l, ids[0..n]);
+        try s.expectServed(r, ids[0..n], image);
         s.release(r);
     }
 }
@@ -238,20 +229,9 @@ test "dsv41 bank contract: host slot rows of a bank of 4 records per routed id: 
     // Layer 0's three misses fill its rows 0, 1 and 2; layer 1's four take transient rows 0 to 3.
     const Case = struct { layer: u32, ids: []const u16, last: u32 };
     for ([_]Case{ .{ .layer = 0, .ids = &.{ 7, 2, 10 }, .last = 2 }, .{ .layer = 1, .ids = &.{ 5, 0, 11, 3 }, .last = 3 } }) |x| {
-        const r = try s.route(x.layer, x.ids, &.{});
-        for (0..r.n_parts) |p| {
-            try s.waitGu(r, @intCast(p));
-            try s.waitDown(r, @intCast(p));
-        }
+        const r = try s.serve(x.layer, x.ids);
         try testing.expect(std.mem.indexOfScalar(u32, r.plan.slotsOf(), x.last) != null);
-        for (x.ids, r.plan.slotsOf()) |e, slot| {
-            const off = bank.recordOffset(x.layer, e);
-            for (geom.segments, 0..) |seg, c| {
-                const row = s.slotRow(x.layer, slot, @enumFromInt(c));
-                try testing.expectEqual(minis * seg.length, row.len);
-                for (0..minis) |mi| try testing.expectEqualSlices(u8, image[off + mi * geom.record_bytes + seg.offset ..][0..seg.length], row[mi * seg.length ..][0..seg.length]);
-            }
-        }
+        try s.expectServed(r, x.ids, image);
         s.release(r);
     }
     try s.flush();

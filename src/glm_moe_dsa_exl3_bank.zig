@@ -680,20 +680,8 @@ test "glm exl3 bank: the stream reads each routed expert's minis into adjacent r
                 k += 1;
             }
         }
-        const r = try s.route(l, ids[0..n], &.{});
-        for (0..r.n_parts) |p| {
-            try s.waitGu(r, @intCast(p));
-            try s.waitDown(r, @intCast(p));
-        }
-        for (ids[0..n], r.plan.slotsOf()) |e, slot| {
-            const off = b.recordOffset(l, e);
-            const geom = &b.layers[l];
-            for (geom.segments, 0..) |sg, ci| {
-                const row = s.slotRow(l, slot, @enumFromInt(ci));
-                try testing.expectEqual(@as(usize, geom.minis * sg.length), row.len);
-                for (0..geom.minis) |mi| try testing.expectEqualSlices(u8, img[off + mi * geom.record_bytes + sg.offset ..][0..sg.length], row[mi * sg.length ..][0..sg.length]);
-            }
-        }
+        const r = try s.serve(l, ids[0..n]);
+        try s.expectServed(r, ids[0..n], img);
         s.release(r);
     }
     try s.flush();
