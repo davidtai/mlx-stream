@@ -14,6 +14,7 @@
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const xk = @import("glm53_exl3_kernels.zig");
+const exl3_quant = @import("exl3_quant.zig");
 
 const Kernel = xk.Kernel;
 
@@ -30,7 +31,7 @@ pub const max_members = 2;
 /// The combine's sources per launch (more chain through its accumulator).
 pub const combine_sources = 16;
 /// The prompt wave table: at most 16 experts.
-pub const wave_experts = 16;
+pub const wave_experts = exl3_quant.wave_max;
 /// Threadgroups per M tile: the gate|up GEMM's (2 projections x 4 minis x MINI / 64 N tiles per 128 rows), the down's
 /// (HID / 128 N tiles per 64 rows).
 pub fn tilesGateUp(mini: u32) u32 {
@@ -234,6 +235,23 @@ pub const Prompt = struct {
             };
         }
 
+        /// A new handle to the same array (the caller frees it).
+        pub fn retain(x: mlx.mlx_array) !mlx.mlx_array {
+            var r = mlx.mlx_array_new();
+            if (x.ctx != null) try mlx.check(mlx.mlx_array_set(&r, x));
+            return r;
+        }
+
+        /// The same arrays under new handles (tests: one stage's inputs launched again and again).
+        pub fn dupe(st: *const Stages) !Stages {
+            var d: Stages = .{};
+            errdefer d.deinit();
+            for (&d.z, st.z) |*o, i| o.* = try retain(i);
+            d.hm[0] = try retain(st.hm[0]);
+            d.y[0] = try retain(st.y[0]);
+            return d;
+        }
+
         pub fn take(st: *Stages) mlx.mlx_array {
             const y = st.y[0];
             st.y[0] = .{};
@@ -280,28 +298,11 @@ pub const Prompt = struct {
     }
 };
 
-/// A prompt wave table: per expert j (<= 16) slot, first row, rows, first threadgroup (INT_MAX unused); [64] experts,
-/// [65] threadgroups; `tiles` threadgroups per `bm`-row M tile.
-pub const WaveTable = struct { t: [80]i32, tgs: u32 };
-
-pub fn waveTable(slots: []const u32, counts: []const u32, tiles: u32, bm: u32) WaveTable {
+/// A prompt wave table (DeepSeek-V4.1's DIG-X table, `exl3_quant.digTableBm`): per expert j (<= 16) slot, first row,
+/// rows, first threadgroup (INT_MAX unused); [64] experts, [65] threadgroups; `tiles` threadgroups per `bm`-row M tile.
+pub fn waveTable(slots: []const u32, counts: []const u32, tiles: u32, bm: u32) exl3_quant.DigTable {
     std.debug.assert(slots.len == counts.len and slots.len <= wave_experts);
-    var t: [80]i32 = @splat(0);
-    var row0: i32 = 0;
-    var tg: i32 = 0;
-    for (0..wave_experts) |j| {
-        if (j >= slots.len) {
-            t[48 + j] = std.math.maxInt(i32);
-            continue;
-        }
-        t[j] = @intCast(slots[j]);
-        t[16 + j] = row0;
-        t[32 + j] = @intCast(counts[j]);
-        t[48 + j] = tg;
-        row0 += @intCast(counts[j]);
-        tg += @intCast((counts[j] + bm - 1) / bm * tiles);
-    }
-    t[64] = @intCast(slots.len);
-    t[65] = tg;
-    return .{ .t = t, .tgs = @intCast(tg) };
+    var experts: [wave_experts]exl3_quant.WaveExpert = undefined;
+    for (slots, counts, experts[0..slots.len]) |s, c, *e| e.* = .{ .slot = s, .rows = c };
+    return exl3_quant.digTableBm(experts[0..slots.len], tiles, bm);
 }

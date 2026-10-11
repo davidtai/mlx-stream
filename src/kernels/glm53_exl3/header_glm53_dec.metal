@@ -1,19 +1,9 @@
-// GLM-5.3 EXL3 decode helpers (mlx-stream native): the mcg codebook at multiplier 0xCBAC1FED, window 16; a trellis
-// tile of 16 x 16 weights in 16 K halfwords (8 K u32 words, the stream read MSB first per little-endian word, weight t's
-// codeword the 16 bits ending at bit K (t + 1), circular); weight t = 8 l + j of lane l sits at tensor-core row
-// (2 (l & 3) + {0, 1, 8, 9}[j & 3]) and column (l >> 2) + 8 (j >> 2) of the tile.
-
-constant constexpr float G53_HSC = 0.08838834764831845f;
-
-// Two codewords to two weights: the f16 sum of the two halves of (cw * mult) & 0x8FFF8FFF ^ 0x3B603B60.
-static inline half2 g53_mcg2(uint2 cw) {
-  const uint2 r = ((cw * uint2(0xCBAC1FEDu)) & uint2(0x8FFF8FFFu)) ^ uint2(0x3B603B60u);
-  const half4 h = as_type<half4>(r);
-  return half2(h.x + h.y, h.z + h.w);
-}
+// GLM-5.3 EXL3 decode helpers (mlx-stream native): the GEMV lanes' reads of a trellis tile and their accumulators
+// (header_glm53_common's codebook and rotation before this).
 
 // The natural-order 128-point Walsh-Hadamard butterflies (unscaled) of a block held as v = (e[l], e[l + 32], e[l + 64],
-// e[l + 96]) by lane l; the result in the same layout.
+// e[l + 96]) by lane l, the result in the same layout: exl3/header_dig2_x.metal's dig2_widen / dig2_round butterflies, on
+// registers (theirs read and write device memory).
 static inline float4 g53_fwht128(float4 v, ushort lane) {
   for (ushort bit = 1; bit <= 16; bit <<= 1) {
     const float4 p = simd_shuffle_xor(v, bit);
@@ -30,12 +20,6 @@ static inline float4 g53_fwht128(float4 v, ushort lane) {
 // 2q + 9) at 4q .. 4q + 3, the four a GEMV lane with l & 3 == q reads as one vector.
 static inline uint g53_lane_slot(uint l) {
   return (l & 16u) + ((l & 7u) >> 1u) * 4u + ((l & 15u) >> 3u) * 2u + (l & 1u);
-}
-
-// silu(g) as the reference rounds it: 1 / (1 + exp(|g|)) folded by the sign.
-static inline float g53_silu(float g) {
-  const float y = 1.0f / (1.0f + exp(fabs(g)));
-  return g * ((g < 0.0f) ? y : 1.0f - y);
 }
 
 // A lane's reads of a tile, fixed per lane: the two words that hold its eight codewords (`a` the one its last

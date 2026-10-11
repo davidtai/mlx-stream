@@ -283,35 +283,53 @@ pub fn Accepted(comptime G: type) type {
             const nrt = @max(8, 2 * w.rows);
             return .{
                 .rt = try g.hostArray(std.mem.sliceAsBytes(self.rt.items[2 * w.first ..][0..nrt]), &.{@intCast(nrt)}, .uint32),
-                .tgu = try g.hostArray(std.mem.sliceAsBytes(&tgu.t), &.{80}, .int32),
+                .tgu = try g.hostArray(std.mem.sliceAsBytes(&tgu.table), &.{80}, .int32),
                 .tgs_gu = tgu.tgs,
-                .tdn = try g.hostArray(std.mem.sliceAsBytes(&tdn.t), &.{80}, .int32),
+                .tdn = try g.hostArray(std.mem.sliceAsBytes(&tdn.table), &.{80}, .int32),
                 .tgs_dn = tdn.tgs,
             };
         }
 
-        /// Tests: the call's first wave's stages, each evaluated alone, best of `reps` -> ns per stage and that wave's rows.
-        fn stageTimes(self: *Self, g: *G, x: G.T, rows: quant.PrefillRows, bank: Bank, reps: usize, with: ?*const routes.Prompt) !struct { ns: [3]u64, rows: usize, experts: usize } {
+        /// Tests: the call's first wave's stages, each timed over `launches` back-to-back launches from the same inputs
+        /// (one evaluation, the GPU kept busy), best of 3 trials -> ns per launch per stage and that wave's rows.
+        fn stageTimes(self: *Self, g: *G, x: G.T, rows: quant.PrefillRows, bank: Bank, launches: usize, with: ?*const routes.Prompt) !struct { ns: [3]u64, rows: usize, experts: usize } {
             const k = kOf(bank.gate.trellis) orelse return error.BankArrays;
             const pf = with orelse &self.pf[ki(k)];
             try self.sortRows(rows, bank);
             const w = self.nextWave(rows, 0);
             const bk: routes.Bank = .{ .gate = proj(bank.gate), .up = proj(bank.up), .down = proj(bank.down) };
-            var best: [3]u64 = @splat(std.math.maxInt(u64));
-            for (0..reps + 1) |rep| {
-                const m = g.mark();
-                defer g.resetTo(m);
-                const t = try self.waveArrays(g, w);
-                try g.evalAll(&.{ x, t.rt, t.tgu, t.tdn });
-                var st: routes.Prompt.Stages = .{};
-                defer st.deinit();
-                for (std.enums.values(routes.Prompt.Stage), 0..) |at, si| {
-                    const t0 = nowNs();
-                    try pf.stage(at, &st, x, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk);
-                    try g.evalAll(&.{st.last(at)});
-                    if (rep > 0) best[si] = @min(best[si], nowNs() - t0);
-                }
+            const m = g.mark();
+            defer g.resetTo(m);
+            const t = try self.waveArrays(g, w);
+            try g.evalAll(&.{ x, t.rt, t.tgu, t.tdn });
+            // each stage's inputs: the chain run once
+            var base: routes.Prompt.Stages = .{};
+            defer base.deinit();
+            var inputs: [3]routes.Prompt.Stages = .{ .{}, .{}, .{} };
+            defer for (&inputs) |*st| st.deinit();
+            for (std.enums.values(routes.Prompt.Stage), 0..) |at, si| {
+                inputs[si] = try base.dupe();
+                try pf.stage(at, &base, x, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk);
+                try g.evalAll(&.{base.last(at)});
             }
+            var best: [3]u64 = @splat(std.math.maxInt(u64));
+            var outs: std.ArrayList(mlx.mlx_array) = .empty;
+            defer outs.deinit(self.a);
+            for (0..4) |trial| for (std.enums.values(routes.Prompt.Stage), 0..) |at, si| {
+                defer {
+                    for (outs.items) |o| _ = mlx.mlx_array_free(o);
+                    outs.clearRetainingCapacity();
+                }
+                const t0 = nowNs();
+                for (0..launches) |_| {
+                    var st = try inputs[si].dupe();
+                    defer st.deinit();
+                    try pf.stage(at, &st, x, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk);
+                    try outs.append(self.a, try routes.Prompt.Stages.retain(st.last(at)));
+                }
+                try g.evalAll(outs.items);
+                if (trial > 0) best[si] = @min(best[si], (nowNs() - t0) / launches);
+            };
             return .{ .ns = best, .rows = w.rows, .experts = w.ne };
         }
 
@@ -868,17 +886,21 @@ const decode_call =
 const decode_call_down =
     \\            if (h != 0u) {
     \\                g53_col<K, 1>::template decode<half>(tile, o, Bs + dst_off);
+    \\                g53_col<K, 1>::template decode<half>(tile + src_step, o, Bs + dst_off + dst_step);
     \\            } else {
     \\                g53_col<K, 0>::template decode<half>(tile, o, Bs + dst_off);
+    \\                g53_col<K, 0>::template decode<half>(tile + src_step, o, Bs + dst_off + dst_step);
     \\            }
 ;
-const no_decode = "        { threadgroup half* dd = Bs + dst_off; for (int q = 0; q < 16; ++q) dd[q] = half(0.001f * float(q)); (void)tile; }";
+const no_decode = "            { threadgroup half* dd = Bs + dst_off; for (int q = 0; q < 16; ++q) { dd[q] = half(0.001f * float(q)); dd[q + dst_step] = half(0.002f * float(q)); } (void)tile; }";
 const no_decode_gu = "        for (int c = 0; c < 32; ++c) v[c] = 0.001f * float(c + int(lane)); (void)t0;";
 const mma_call = "tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});";
 const bench_exps = [_]BenchExp{
     .{ .name = "gu: no trellis decode (B constant before the rotation)", .kernel = .glm53_pf_gu, .needle = decode_call, .repl = no_decode_gu },
-    .{ .name = "gu: no rotation", .kernel = .glm53_pf_gu, .needle = "        g53_t128_quarters(v, lane);", .repl = "" },
     .{ .name = "gu: no MMA (decode, rotation, scale alone)", .kernel = .glm53_pf_gu, .needle = mma_call, .repl = "(void)Atile; (void)Btile;" },
+    .{ .name = "gu: A rows contiguous (no gather)", .kernel = .glm53_pf_gu, .needle = "xr[i][e] = x + size_t(rt[2u * uint(row0 + rr)]) * size_t(HID) + size_t(fc.x);", .repl = "xr[i][e] = x + size_t(row0 + rr) * size_t(HID) + size_t(fc.x);" },
+    .{ .name = "gu: A constant (no x loads)", .kernel = .glm53_pf_gu, .needle = "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));", .repl = "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(0.01f * float(jj + e)); (void)p;" },
+    .{ .name = "gu: one barrier per stage (races; timing only)", .kernel = .glm53_pf_gu, .needle = "        threadgroup_barrier(mem_flags::mem_threadgroup);\n        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]", .repl = "        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]" },
     .{ .name = "down: no trellis decode (B constant)", .kernel = .glm53_pf_down, .needle = decode_call_down, .repl = no_decode },
     .{ .name = "down: no MMA (the decode alone)", .kernel = .glm53_pf_down, .needle = mma_call, .repl = "(void)Atile; (void)Btile;" },
     .{ .name = "down: one epilogue (the last mini's)", .kernel = .glm53_pf_down, .needle = "if (p * SM >= valid) break;", .repl = "if (r != 3 || p * SM >= valid) break;" },
@@ -1120,7 +1142,7 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
     const q1 = .{ ours.prefillStats(), theirStats(theirs) };
     for (0..2) |side| {
         const pr: quant.PrefillRows = .{ .slot = side_slot[side].items[0..@min(16384, side_slot[side].items.len)], .act_row = side_act[side].items[0..@min(16384, side_act[side].items.len)] };
-        const sts = try ours.stageTimes(&g, xp, pr, banks[side], 5, null);
+        const sts = try ours.stageTimes(&g, xp, pr, banks[side], 16, null);
         const f = @as(f64, @floatFromInt(sts.rows)) * 2.0 * @as(f64, @floatFromInt(h)) * 512.0 * 4.0;
         std.debug.print("GLM53_UBENCH prompt wave K{d} ({d} rows, {d} experts): gate|up {d:.3} ms ({d:.1} TFLOP/s), mid {d:.3} ms, down {d:.3} ms ({d:.1} TFLOP/s)\n", .{ b.layers[side].k, sts.rows, sts.experts, @as(f64, @floatFromInt(sts.ns[0])) / 1e6, 2 * f / @as(f64, @floatFromInt(sts.ns[0])) / 1e3, @as(f64, @floatFromInt(sts.ns[1])) / 1e6, @as(f64, @floatFromInt(sts.ns[2])) / 1e6, f / @as(f64, @floatFromInt(sts.ns[2])) / 1e3 });
         // GLM53_EXL3_BENCH_EXP: the stages over mutated texts (where the GEMMs' time goes; the outputs are not checked)
@@ -1142,7 +1164,7 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
             var bd = try reg.bind(s, null);
             defer bd.deinit();
             const pfx = routes.Prompt.init(&bd, .{ .k = b.layers[side].k, .hidden = @intCast(h), .mini = 512 });
-            const ex_t = try ours.stageTimes(&g, xp, pr, banks[side], 5, &pfx);
+            const ex_t = try ours.stageTimes(&g, xp, pr, banks[side], 16, &pfx);
             std.debug.print("GLM53_UBENCH prompt wave K{d} experiment {s}: gate|up {d:.3} ms, mid {d:.3} ms, down {d:.3} ms\n", .{ b.layers[side].k, ex.name, @as(f64, @floatFromInt(ex_t.ns[0])) / 1e6, @as(f64, @floatFromInt(ex_t.ns[1])) / 1e6, @as(f64, @floatFromInt(ex_t.ns[2])) / 1e6 });
         };
     }

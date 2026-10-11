@@ -130,6 +130,8 @@
                 float w[4];
                 STEEL_PRAGMA_UNROLL
                 for (int c = 0; c < 4; ++c) w[c] = src[c];
+                // the 128-column block's t128, bits 0-1 in registers then 2-6 across lanes: the epilogue butterflies of
+                // exl3/dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1.metal
                 const float a0 = w[0] + w[1];
                 const float a1 = w[0] - w[1];
                 const float a2 = w[2] + w[3];
@@ -147,10 +149,10 @@
                         w[c] = upper ? (oth - w[c]) : (w[c] + oth);
                     }
                 }
-                yacc[p][q][0] += w[0] * 0.08838834764831845f * rv.x;
-                yacc[p][q][1] += w[1] * 0.08838834764831845f * rv.y;
-                yacc[p][q][2] += w[2] * 0.08838834764831845f * rv.z;
-                yacc[p][q][3] += w[3] * 0.08838834764831845f * rv.w;
+                yacc[p][q][0] += w[0] * G53_HSC * rv.x;
+                yacc[p][q][1] += w[1] * G53_HSC * rv.y;
+                yacc[p][q][2] += w[2] * G53_HSC * rv.z;
+                yacc[p][q][3] += w[3] * G53_HSC * rv.w;
             }
         }
     }

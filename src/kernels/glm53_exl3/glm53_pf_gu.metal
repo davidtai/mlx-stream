@@ -131,7 +131,7 @@
     }
     if (sgp_sm > 0) {
         STEEL_PRAGMA_UNROLL
-        for (int f = 0; f < TM * TN; ++f) Dtile.val_frags[f] *= 0.08838834764831845f;
+        for (int f = 0; f < TM * TN; ++f) Dtile.val_frags[f] *= G53_HSC;
         device float* zp = (proj == 0 ? zg : zu) + (size_t(row0) + size_t(m0 + tm)) * size_t(LDZ) + size_t(r) * size_t(MINI) + n0 + tn;
         if (full) {
             Dtile.store(zp, LDZ);

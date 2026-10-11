@@ -489,8 +489,8 @@ fn promptChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     const rtd = try sc.host(std.mem.sliceAsBytes(rt_dev), &.{@intCast(rt_dev.len)}, .uint32);
     const tgu = routes.waveTable(slots[0..n_slots], counts, routes.tilesGateUp(inst.mini), routes.bm_gate_up);
     const tdn = routes.waveTable(slots[0..n_slots], counts, routes.tilesDown(inst.hidden), routes.bm_down);
-    const tgud = try sc.host(std.mem.sliceAsBytes(&tgu.t), &.{80}, .int32);
-    const tdnd = try sc.host(std.mem.sliceAsBytes(&tdn.t), &.{80}, .int32);
+    const tgud = try sc.host(std.mem.sliceAsBytes(&tgu.table), &.{80}, .int32);
+    const tdnd = try sc.host(std.mem.sliceAsBytes(&tdn.table), &.{80}, .int32);
     const pr = routes.Prompt.init(bound, inst);
     var bk = bank.bank;
     if (mutation == .rin_rout) swapRinRout(&bk);
@@ -597,9 +597,8 @@ test "glm53 selfcheck: each chain check fails on a wrong codebook, a wrong K, a 
                 return e;
             };
         }
-        // the codebook: mul1's multiplier in the family's header
-        const hdr: xk.Header = if (fam == .decode) .glm53_dec else .glm53_nax;
-        const cb = try mutatedText(a, s, .{ .header = hdr }, "0xCBAC1FEDu", "0x83DCD12Du", fam, inst);
+        // the codebook: mul1's multiplier in both families' common header
+        const cb = try mutatedText(a, s, .{ .header = .glm53_common }, "0xCBAC1FEDu", "0x83DCD12Du", fam, inst);
         try testing.expect(!cb.ok and cb.bad > 0);
         // the rank sum: three of the four minis summed
         const rank = if (fam == .decode)

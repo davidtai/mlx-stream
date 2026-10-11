@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+const kreg = @import("sdk_ext/kernel_registry.zig");
 /// The registry's self-check plan (`sdk_ext.kernels.KernelSet(R)` runs it at the quant's accept).
 pub const selfcheck = @import("glm53_exl3_selfcheck.zig");
 
@@ -14,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
-pub const manifest_sha256 = "74bde426a9baa188bb66a375cf05963e6d60cf4ce72f9ac74e5ec39bd469f152";
+pub const manifest_sha256 = "70cee1f195c2eded957aed0324e48deddbb60a7c45c3cf53f7f4b719540e52dd";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
 const dir = "kernels/glm53_exl3/";
 
@@ -36,7 +37,19 @@ pub const Kernel = enum {
     glm53_pf_down,
 };
 
-pub const Header = enum { glm53_dec, glm53_nax };
+/// The headers a kernel's text follows, in its manifest order. Two are DeepSeek-V4.1's texts, embedded as they are:
+/// `nax` the MLX steel NAX tiles (exl3/header_dig_mul1h_k3.metal), `dig2` the rotation helpers dig2_widen / dig2_round
+/// and Dig2Sigmoid (exl3/header_dig2_x.metal); the others are this registry's own.
+pub const Header = enum { glm53_common, glm53_dec, nax, glm53_nax, dig2 };
+
+/// Header `h`'s file as the manifest records it (relative to kernels/glm53_exl3/).
+pub fn headerFile(h: Header) []const u8 {
+    return switch (h) {
+        .nax => "../exl3/header_dig_mul1h_k3.metal",
+        .dig2 => "../exl3/header_dig2_x.metal",
+        inline else => |t| "header_" ++ @tagName(t) ++ ".metal",
+    };
+}
 /// One text of the registry: a kernel's or a header's.
 pub const TextRef = union(enum) { kernel: Kernel, header: Header };
 /// `compile`: the kernel builds, binds and completes one launch (the construction's acceptance); `chain`: its stage
@@ -50,6 +63,7 @@ pub const max_inputs = 20;
 pub const max_outputs = 2;
 pub const max_template = 5;
 pub const max_rank = 4;
+pub const max_headers = 3;
 
 pub const Texts = struct {
     manifest: []const u8,
@@ -59,14 +73,19 @@ pub const Texts = struct {
 
 pub const embedded: Texts = .{
     .manifest = @embedFile(dir ++ "manifest.json"),
-    .sources = embedAll(Kernel, ""),
-    .headers = embedAll(Header, "header_"),
+    .sources = embedSources(),
+    .headers = embedHeaders(),
 };
 
-fn embedAll(comptime E: type, comptime prefix: []const u8) [std.meta.fieldNames(E).len][:0]const u8 {
-    const names = std.meta.fieldNames(E);
-    var out: [names.len][:0]const u8 = undefined;
-    inline for (names, 0..) |name, i| out[i] = @embedFile(dir ++ prefix ++ name ++ ".metal");
+fn embedSources() [n_kernels][:0]const u8 {
+    var out: [n_kernels][:0]const u8 = undefined;
+    inline for (std.meta.fieldNames(Kernel), 0..) |name, i| out[i] = @embedFile(dir ++ name ++ ".metal");
+    return out;
+}
+
+fn embedHeaders() [n_headers][:0]const u8 {
+    var out: [n_headers][:0]const u8 = undefined;
+    inline for (comptime std.enums.values(Header), 0..) |h, i| out[i] = @embedFile(dir ++ comptime headerFile(h));
     return out;
 }
 
@@ -104,7 +123,9 @@ pub const Entry = struct {
     kernel: Kernel,
     family: Family,
     source: [:0]const u8,
-    header: Header,
+    headers: []const Header,
+    /// the headers' texts in order, the one header mlx compiles before `source`
+    header_text: [:0]const u8,
     text_sha256: [32]u8,
     inputs: []const Arg,
     outputs: []const Arg,
@@ -160,7 +181,8 @@ pub const Registry = struct {
             const id = std.meta.stringToEnum(Header, h.id) orelse return refuse(diag, error.UnknownHeader, "glm53 exl3 kernels: manifest header \"{s}\" is not one this build embeds", .{h.id});
             if (seen_h.contains(id)) return refuse(diag, error.SchemaInvalid, "glm53 exl3 kernels: header {t} listed twice", .{id});
             seen_h.insert(id);
-            try checkText(texts.headers[@backingInt(id)], h.file, h.sha256, h.bytes, @tagName(id), diag);
+            if (!std.mem.eql(u8, h.file, headerFile(id))) return refuse(diag, error.SchemaInvalid, "glm53 exl3 kernels: header {t} is file \"{s}\", not {s}", .{ id, h.file, headerFile(id) });
+            try kreg.checkText(texts.headers[@backingInt(id)], h.sha256, h.bytes, "glm53 exl3 kernels", @tagName(id), diag);
         }
         if (seen_h.count() != n_headers) return refuse(diag, error.MissingHeader, "glm53 exl3 kernels: the manifest lists {d} of {d} headers", .{ seen_h.count(), n_headers });
         var seen: std.EnumSet(Kernel) = .empty;
@@ -205,12 +227,8 @@ pub const Registry = struct {
             var out_names: [max_outputs][*:0]const u8 = undefined;
             for (e.inputs, 0..) |arg, n| in_names[n] = arg.name.ptr;
             for (e.outputs, 0..) |arg, n| out_names[n] = arg.name.ptr;
-            const vin = mlx.mlx_vector_string_new_data(&in_names, e.inputs.len);
-            defer _ = mlx.mlx_vector_string_free(vin);
-            const vout = mlx.mlx_vector_string_new_data(&out_names, e.outputs.len);
-            defer _ = mlx.mlx_vector_string_free(vout);
-            b.kernels[i] = mlx.mlx_fast_metal_kernel_new(@tagName(e.kernel), vin, vout, e.source.ptr, self.headers[@backingInt(e.header)].ptr, true, false);
-            if (b.kernels[i].ctx == null) return refuse(diag, error.KernelCreateFailed, "glm53 exl3 kernels: mlx_fast_metal_kernel_new({t}) failed", .{e.kernel});
+            b.kernels[i] = kreg.newKernel(@tagName(e.kernel), in_names[0..e.inputs.len], out_names[0..e.outputs.len], e.source.ptr, e.header_text.ptr, true) orelse
+                return refuse(diag, error.KernelCreateFailed, "glm53 exl3 kernels: mlx_fast_metal_kernel_new({t}) failed", .{e.kernel});
         }
         return b;
     }
@@ -261,31 +279,18 @@ pub const Bound = struct {
 
     pub fn prepare(self: *const Bound, k: Kernel, cfg: *const LaunchConfig) error{MlxError}!Prepared {
         const e = self.reg.get(k);
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        for (0..cfg.n_out) |i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &cfg.out_shapes[i], cfg.out_ranks[i], cfg.out_dtypes[i]));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @intCast(cfg.grid[0]), @intCast(cfg.grid[1]), @intCast(cfg.grid[2])));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, @intCast(cfg.threadgroup[0]), @intCast(cfg.threadgroup[1]), @intCast(cfg.threadgroup[2])));
-        for (e.template, 0..) |name, i| {
-            if (std.mem.eql(u8, name, "T")) {
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, name.ptr, cfg.dtype));
-            } else try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name.ptr, cfg.ints[i]));
-        }
+        var template: [max_template]kreg.TemplateArg = undefined;
+        for (e.template, template[0..e.template.len], 0..) |name, *t, i| t.* = .{ .name = name, .value = if (std.mem.eql(u8, name, "T")) .{ .dtype = cfg.dtype } else .{ .int = cfg.ints[i] } };
+        var shapes: [max_outputs][]const c_int = undefined;
+        for (0..cfg.n_out) |i| shapes[i] = cfg.out_shapes[i][0..cfg.out_ranks[i]];
+        const c = try kreg.buildConfig(.{ .grid = cfg.grid, .threadgroup = cfg.threadgroup, .out_shapes = shapes[0..cfg.n_out], .out_dtypes = cfg.out_dtypes[0..cfg.n_out], .template = template[0..e.template.len] });
         return .{ .kernel = k, .config = c, .n_out = cfg.n_out };
     }
 
     /// One launch of a prepared config; `outs` receives `p.n_out` new arrays (caller frees).
     pub fn applyPrepared(self: *const Bound, p: *const Prepared, inputs: []const mlx.mlx_array, outs: []mlx.mlx_array) error{MlxError}!void {
         std.debug.assert(inputs.len == self.reg.get(p.kernel).inputs.len);
-        const vin = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
-        defer _ = mlx.mlx_vector_array_free(vin);
-        var vout = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(vout);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&vout, self.kernels[@backingInt(p.kernel)], vin, p.config, self.stream));
-        for (outs[0..p.n_out], 0..) |*o, i| {
-            o.* = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(o, vout, i));
-        }
+        try kreg.apply(self.kernels[@backingInt(p.kernel)], p.config, inputs, outs[0..p.n_out], self.stream);
     }
 
     /// One launch with a config built for it alone (the prompt's per-wave grids).
@@ -305,7 +310,7 @@ const JKernel = struct {
     name: []const u8,
     family: []const u8,
     source: JText,
-    header: []const u8,
+    headers: []const []const u8,
     inputs: []const JArg,
     outputs: []const JArg,
     template: []const []const u8,
@@ -316,21 +321,6 @@ const JKernel = struct {
 const JBank = struct { codebook: []const u8, multiplier: u64, window: u64, K: []const u32, tp_ranks: u32 };
 const JDims = struct { hidden: u32, mini: u32 };
 const JManifest = struct { format: []const u8, bank: JBank, dims: []const JDims, maxm: u32, headers: []const JText, kernels: []const JKernel };
-
-fn hexSha(s: []const u8) ?[32]u8 {
-    if (s.len != 64) return null;
-    var out: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch return null;
-    return out;
-}
-
-fn checkText(text: []const u8, file: []const u8, sha: []const u8, bytes: u64, what: []const u8, diag: ?*Diag) Refusal!void {
-    const want = hexSha(sha) orelse return refuse(diag, error.SchemaInvalid, "glm53 exl3 kernels: {s}: sha256 \"{s}\" is not 64 hex", .{ what, sha });
-    var d: [32]u8 = undefined;
-    Sha256.hash(text, &d, .{});
-    if (!std.mem.eql(u8, &d, &want) or text.len != bytes)
-        return refuse(diag, error.TextSha256Mismatch, "glm53 exl3 kernels: {s} ({s}, {d} B) differs from the manifest ({d} B, sha256 {s})", .{ what, file, text.len, bytes, sha });
-}
 
 fn parseDtype(s: []const u8, k: Kernel, diag: ?*Diag) Refusal!?mlx.mlx_dtype {
     if (std.mem.eql(u8, s, "T")) return null;
@@ -349,8 +339,22 @@ fn adoptArgs(a: Allocator, js: []const JArg, max: usize, k: Kernel, diag: ?*Diag
 
 fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, dims: []const Instance, diag: ?*Diag) (Refusal || Allocator.Error)!Entry {
     const source = texts.sources[@backingInt(k)];
-    try checkText(source, j.source.file, j.source.sha256, j.source.bytes, @tagName(k), diag);
-    const header = std.meta.stringToEnum(Header, j.header) orelse return refuse(diag, error.UnknownHeader, "glm53 exl3 kernels: {t}: header \"{s}\"", .{ k, j.header });
+    try kreg.checkText(source, j.source.sha256, j.source.bytes, "glm53 exl3 kernels", @tagName(k), diag);
+    if (j.headers.len == 0 or j.headers.len > max_headers) return refuse(diag, error.SchemaInvalid, "glm53 exl3 kernels: {t}: {d} headers", .{ k, j.headers.len });
+    const headers = try a.alloc(Header, j.headers.len);
+    var hbytes: usize = 0;
+    for (j.headers, headers) |name, *o| {
+        o.* = std.meta.stringToEnum(Header, name) orelse return refuse(diag, error.UnknownHeader, "glm53 exl3 kernels: {t}: header \"{s}\"", .{ k, name });
+        hbytes += texts.headers[@backingInt(o.*)].len + 1;
+    }
+    const htext = try a.allocSentinel(u8, hbytes, 0);
+    var at: usize = 0;
+    for (headers) |h| {
+        const t = texts.headers[@backingInt(h)];
+        @memcpy(htext[at..][0..t.len], t);
+        htext[at + t.len] = '\n';
+        at += t.len + 1;
+    }
     const family = std.meta.stringToEnum(Family, j.family) orelse return refuse(diag, error.SchemaInvalid, "glm53 exl3 kernels: {t}: family \"{s}\"", .{ k, j.family });
     const tg = j.threadgroup;
     if (tg[0] == 0 or tg[1] == 0 or tg[2] == 0 or @as(u64, tg[0]) * tg[1] * tg[2] > 1024) return refuse(diag, error.SchemaInvalid, "glm53 exl3 kernels: {t}: threadgroup {d}x{d}x{d}", .{ k, tg[0], tg[1], tg[2] });
@@ -377,8 +381,9 @@ fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, dims: [
         .kernel = k,
         .family = family,
         .source = source,
-        .header = header,
-        .text_sha256 = hexSha(j.source.sha256).?,
+        .headers = headers,
+        .header_text = htext,
+        .text_sha256 = kreg.hexSha(j.source.sha256).?,
         .inputs = try adoptArgs(a, j.inputs, max_inputs, k, diag),
         .outputs = try adoptArgs(a, j.outputs, max_outputs, k, diag),
         .template = template,
@@ -393,11 +398,7 @@ fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, dims: [
 
 const testing = std.testing;
 
-fn shaHex(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
+const shaHex = kreg.shaHex;
 
 /// `texts` with `which`'s text replaced by `text` and the manifest re-pinned to it (caller frees the returned manifest):
 /// a registry built over a mutated text (the self-check's mutation tests).
@@ -421,14 +422,15 @@ pub fn retexted(a: Allocator, base: *const Texts, which: TextRef, text: [:0]cons
     const m1 = try std.mem.replaceOwned(u8, a, base.manifest, &old_hex, &new_hex);
     defer a.free(m1);
     // the bytes field sits right before the record's "file": replace it only next to the old text's file name
+    var nb2: [64]u8 = undefined;
     const file = switch (which) {
-        .kernel => |k| @tagName(k),
-        .header => |h| @tagName(h),
+        .kernel => |k| try std.fmt.bufPrint(&nb2, "{t}.metal", .{k}),
+        .header => |h| headerFile(h),
     };
-    var fb: [96]u8 = undefined;
-    const pat_old = try std.fmt.bufPrint(&fb, "{s},\"file\":\"{s}{s}.metal\"", .{ old_rec, if (which == .header) "header_" else "", file });
-    var gb: [96]u8 = undefined;
-    const pat_new = try std.fmt.bufPrint(&gb, "{s},\"file\":\"{s}{s}.metal\"", .{ new_rec, if (which == .header) "header_" else "", file });
+    var fb: [128]u8 = undefined;
+    const pat_old = try std.fmt.bufPrint(&fb, "{s},\"file\":\"{s}\"", .{ old_rec, file });
+    var gb: [128]u8 = undefined;
+    const pat_new = try std.fmt.bufPrint(&gb, "{s},\"file\":\"{s}\"", .{ new_rec, file });
     return std.mem.replaceOwned(u8, a, m1, pat_old, pat_new);
 }
 
@@ -453,7 +455,14 @@ test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel 
         };
         try testing.expect(e.checks.contains(.compile) and e.checks.contains(.chain));
     }
-    try testing.expectEqual(Header.glm53_nax, reg.get(.glm53_pf_gu).header);
+    try testing.expectEqualSlices(Header, &.{ .nax, .glm53_common, .glm53_nax }, reg.get(.glm53_pf_gu).headers);
+    try testing.expectEqualSlices(Header, &.{ .glm53_common, .glm53_dec }, reg.get(.glm53_dec_gu).headers);
+    // the NAX tiles and the rotation helpers are DeepSeek-V4.1's own texts; the header mlx compiles before a kernel holds
+    // every part
+    try testing.expectEqualStrings(@embedFile("kernels/exl3/header_dig_mul1h_k3.metal"), embedded.headers[@backingInt(Header.nax)]);
+    try testing.expectEqualStrings(@embedFile("kernels/exl3/header_dig2_x.metal"), embedded.headers[@backingInt(Header.dig2)]);
+    try testing.expectEqualSlices(Header, &.{.dig2}, reg.get(.glm53_pf_mid).headers);
+    try testing.expect(std.mem.indexOf(u8, reg.get(.glm53_pf_gu).header_text, "g53_mcg2") != null and std.mem.indexOf(u8, reg.get(.glm53_pf_gu).header_text, "tile_matmad_nax") != null);
     try testing.expectEqual(Family.prompt, reg.get(.glm53_pf_down).family);
     try testing.expect(reg.get(.glm53_dec_gu).per_k and !reg.get(.glm53_dec_prep).per_k);
     // the down stage binds every bank kind's five arrays: 19 inputs

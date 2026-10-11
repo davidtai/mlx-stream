@@ -36,13 +36,16 @@
     for (uint job = sg; job < 4u * NIB; job += 8u) {
         const uint r = job / NIB;
         const uint ib = job - r * NIB;
-        const size_t zb = (size_t(p) * 4u + r) * uint(MINI) + ib * 128u + lane;
-        const size_t vb = (srow + r) * uint(MINI) + ib * 128u + lane;
-        float4 g = g53_fwht128(float4(zg[zb], zg[zb + 32u], zg[zb + 64u], zg[zb + 96u]), ushort(lane));
-        float4 u = g53_fwht128(float4(zu[zb], zu[zb + 32u], zu[zb + 64u], zu[zb + 96u]), ushort(lane));
-        g = g * G53_HSC * float4(float(rg[vb]), float(rg[vb + 32u]), float(rg[vb + 64u]), float(rg[vb + 96u]));
-        u = u * G53_HSC * float4(float(ru[vb]), float(ru[vb + 32u]), float(ru[vb + 64u]), float(ru[vb + 96u]));
-        const float4 h = float4(g53_silu(g.x), g53_silu(g.y), g53_silu(g.z), g53_silu(g.w)) * u;
+        const uint c0 = ib * 128u + lane;
+        const size_t zb = (size_t(p) * 4u + r) * uint(MINI) + c0;
+        const size_t rb = (srow + r) * uint(MINI);
+        const size_t vb = rb + c0;
+        float g[4];
+        float u[4];
+        dig2_widen(zg, zb, rg, rb, c0, lane, g);
+        dig2_widen(zu, zb, ru, rb, c0, lane, u);
+        float4 h;
+        for (uint q = 0u; q < 4u; ++q) h[q] = (g[q] * Dig2Sigmoid()(g[q])) * u[q];
         const float4 v = g53_fwht128(h * float4(float(rd[vb]), float(rd[vb + 32u]), float(rd[vb + 64u]), float(rd[vb + 96u])), ushort(lane)) * G53_HSC;
         threadgroup float* mb = mid + r * uint(MINI) + ib * 128u + g53_lane_slot(lane);
         mb[0] = v.x;

@@ -8,6 +8,7 @@
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const bo = @import("build_flags.zig");
+const kreg = @import("sdk_ext/kernel_registry.zig");
 /// The registry's self-check plan (`sdk_ext.kernels.KernelSet(R)` runs it at each consumer's accept).
 pub const selfcheck = @import("exl3_selfcheck.zig");
 
@@ -294,8 +295,8 @@ pub const Arg = struct {
     row_axis: u8,
 };
 
-pub const TemplateValue = union(enum) { int: i32, dtype: mlx.mlx_dtype };
-pub const TemplateArg = struct { name: [:0]const u8, value: TemplateValue };
+pub const TemplateValue = kreg.TemplateValue;
+pub const TemplateArg = kreg.TemplateArg;
 
 /// An explicit launch of a plan kernel at (site, rows): rcproj per site and M, sinkhorn per n.
 pub const Plan = struct {
@@ -573,12 +574,8 @@ pub const Registry = struct {
             var out_names: [max_outputs][*:0]const u8 = undefined;
             for (e.inputs, 0..) |arg, n| in_names[n] = arg.name.ptr;
             for (e.outputs, 0..) |arg, n| out_names[n] = arg.name.ptr;
-            const vin = mlx.mlx_vector_string_new_data(&in_names, e.inputs.len);
-            defer _ = mlx.mlx_vector_string_free(vin);
-            const vout = mlx.mlx_vector_string_new_data(&out_names, e.outputs.len);
-            defer _ = mlx.mlx_vector_string_free(vout);
-            b.kernels[i] = mlx.mlx_fast_metal_kernel_new(e.mlx_name.ptr, vin, vout, e.source.ptr, self.header(e).ptr, e.ensure_row_contiguous, false);
-            if (b.kernels[i].ctx == null) return refuse(diag, error.KernelCreateFailed, "exl3 kernels: mlx_fast_metal_kernel_new({t}) failed", .{e.kernel});
+            b.kernels[i] = kreg.newKernel(e.mlx_name.ptr, in_names[0..e.inputs.len], out_names[0..e.outputs.len], e.source.ptr, self.header(e).ptr, e.ensure_row_contiguous) orelse
+                return refuse(diag, error.KernelCreateFailed, "exl3 kernels: mlx_fast_metal_kernel_new({t}) failed", .{e.kernel});
         }
         return b;
     }
@@ -626,15 +623,9 @@ pub const Bound = struct {
     /// kernel with no per-launch config work. The caller owns it (`Prepared.deinit`).
     pub fn prepare(self: *const Bound, k: Kernel, cfg: *const LaunchConfig) error{MlxError}!Prepared {
         _ = self;
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        for (0..cfg.n_out) |i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &cfg.out_shapes[i], cfg.out_ranks[i], cfg.out_dtypes[i]));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @intCast(cfg.grid[0]), @intCast(cfg.grid[1]), @intCast(cfg.grid[2])));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, @intCast(cfg.threadgroup[0]), @intCast(cfg.threadgroup[1]), @intCast(cfg.threadgroup[2])));
-        for (cfg.template) |t| switch (t.value) {
-            .int => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t.name.ptr, v)),
-            .dtype => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, t.name.ptr, v)),
-        };
+        var shapes: [max_outputs][]const c_int = undefined;
+        for (0..cfg.n_out) |i| shapes[i] = cfg.out_shapes[i][0..cfg.out_ranks[i]];
+        const c = try kreg.buildConfig(.{ .grid = cfg.grid, .threadgroup = cfg.threadgroup, .out_shapes = shapes[0..cfg.n_out], .out_dtypes = cfg.out_dtypes[0..cfg.n_out], .template = cfg.template });
         var p: Prepared = .{ .kernel = k, .config = c, .n_out = cfg.n_out };
         if (comptime launch_observed) {
             var names: [16][]const u8 = undefined;
@@ -654,16 +645,8 @@ pub const Bound = struct {
 
     /// One launch of a prepared config; `outs` receives `p.n_out` new arrays (caller frees).
     pub fn applyPrepared(self: *const Bound, p: *const Prepared, inputs: []const mlx.mlx_array, outs: []mlx.mlx_array) error{MlxError}!void {
-        const vin = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
-        defer _ = mlx.mlx_vector_array_free(vin);
-        var vout = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(vout);
         if (comptime launch_observed) if (self.observer) |f| f(@tagName(p.kernel), p.tkey, inputs);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&vout, self.kernels[@backingInt(p.kernel)], vin, p.config, self.stream));
-        for (outs[0..p.n_out], 0..) |*o, i| {
-            o.* = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(o, vout, i));
-        }
+        try kreg.apply(self.kernels[@backingInt(p.kernel)], p.config, inputs, outs[0..p.n_out], self.stream);
     }
 
     /// One launch of `k` with `cfg`, its config built for this launch only; `outs` receives
@@ -765,19 +748,10 @@ fn adoptPredecessors(a: Allocator, js: []const JPredecessor, diag: ?*Diag) (Refu
     return out;
 }
 
-fn hexSha(s: []const u8) ?[32]u8 {
-    if (s.len != 64) return null;
-    var out: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch return null;
-    return out;
-}
+const hexSha = kreg.hexSha;
 
 fn checkText(text: []const u8, j: JText, what: []const u8, diag: ?*Diag) Refusal!void {
-    const want = hexSha(j.sha256) orelse return refuse(diag, error.SchemaInvalid, "exl3 kernels: {s}: sha256 \"{s}\" is not 64 hex", .{ what, j.sha256 });
-    var d: [32]u8 = undefined;
-    Sha256.hash(text, &d, .{});
-    if (!std.mem.eql(u8, &d, &want) or text.len != j.bytes)
-        return refuse(diag, error.TextSha256Mismatch, "exl3 kernels: {s} text ({d} B) differs from the manifest ({d} B, sha256 {s})", .{ what, text.len, j.bytes, j.sha256 });
+    return kreg.checkText(text, j.sha256, j.bytes, "exl3 kernels", what, diag);
 }
 
 /// A lane pin (the full sha256, or the 16-hex prefix an install record prints) over the
@@ -1167,11 +1141,7 @@ fn initOrPrint(texts: *const Texts, pin: []const u8) !Registry {
     };
 }
 
-fn shaHex(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
+const shaHex = kreg.shaHex;
 
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
