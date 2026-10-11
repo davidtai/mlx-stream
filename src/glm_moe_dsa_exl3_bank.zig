@@ -24,6 +24,10 @@ const sushi = @import("mlx_host").sushi_exl3;
 pub const format = "mlx-stream-expert-manifest-exl3-v1";
 pub const manifest_file = "expert-manifest-exl3-v1.json";
 pub const record_alignment: u64 = 4096;
+/// The pack's `mtp/`: the MTP layer's bank layers in the same format (the draft lane's, outside the stream).
+pub const mtp_dir = "mtp";
+pub const mtp_manifest_file = "mtp-manifest-exl3-v1.json";
+pub const mtp_sidecar_file = "mtp-experts.bin";
 
 // ── the bank contract (`sdk_ext.expert.assertBank`) ──
 
@@ -177,6 +181,13 @@ const ManifestJson = struct {
 /// No local index: the expert is the layer's other bank layer's.
 pub const no_local: u16 = std.math.maxInt(u16);
 
+/// The bank layers a manifest holds: the trunk's (each routed layer's K3 and K4 bank layers, then the MTP layer's two,
+/// outside the stream), or the MTP layer's two alone (the pack's `mtp/`), as the bank's stream layers 0 and 1.
+pub const Holds = enum { trunk, mtp };
+
+/// What `adopt` checks a manifest against: the model's config and the bank layers the manifest holds.
+pub const Against = struct { c: *const glm.Config, holds: Holds = .trunk };
+
 pub const Bank = struct {
     allocator: std.mem.Allocator,
     hidden: u64 = 0,
@@ -197,12 +208,18 @@ pub const Bank = struct {
     sidecar: expert_io.UncachedFd = .{ .fd = -1, .size = 0 },
 
     pub fn open(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, diag: ?*Diag) !Bank {
-        return bank_file.open(Bank, ManifestJson, manifest_file, allocator, io, dir, c, diag, true);
+        return bank_file.open(Bank, ManifestJson, manifest_file, allocator, io, dir, Against{ .c = c }, diag, true);
+    }
+
+    /// The pack's `mtp/` (`mdir`) under the trunk's rules: the MTP layer's two bank layers (`Holds.mtp`), the experts
+    /// map of the MTP layer, the records, the sidecar opened (the draft lane reads its records through it).
+    pub fn openMtp(allocator: std.mem.Allocator, io: std.Io, mdir: []const u8, c: *const glm.Config, diag: ?*Diag) !Bank {
+        return bank_file.open(Bank, ManifestJson, mtp_manifest_file, allocator, io, mdir, Against{ .c = c, .holds = .mtp }, diag, true);
     }
 
     /// The bank's geometry from its manifest alone (no sidecar descriptor), for the bill. Its layers in `allocator`.
     pub fn geometry(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, diag: ?*Diag) !Geometry {
-        var b = try bank_file.open(Bank, ManifestJson, manifest_file, allocator, io, dir, c, diag, false);
+        var b = try bank_file.open(Bank, ManifestJson, manifest_file, allocator, io, dir, Against{ .c = c }, diag, false);
         defer b.deinit();
         var g = b.geometryOf();
         g.layers = try allocator.dupe(LayerSlots, g.layers);
@@ -271,20 +288,30 @@ pub const Bank = struct {
     }
 
     /// The manifest's rules against the model's config (`bank_file.open`, `a` its arena); returns the sidecar's bytes.
-    pub fn adopt(self: *Bank, a: std.mem.Allocator, m: *const ManifestJson, c: *const glm.Config, diag: ?*Diag) (Refusal || std.mem.Allocator.Error)!u64 {
+    pub fn adopt(self: *Bank, a: std.mem.Allocator, m: *const ManifestJson, x: Against, diag: ?*Diag) (Refusal || std.mem.Allocator.Error)!u64 {
+        return switch (x.holds) {
+            inline else => |h| self.adoptAs(h, a, m, x.c, diag),
+        };
+    }
+
+    fn adoptAs(self: *Bank, comptime holds: Holds, a: std.mem.Allocator, m: *const ManifestJson, c: *const glm.Config, diag: ?*Diag) (Refusal || std.mem.Allocator.Error)!u64 {
+        const file = comptime switch (holds) {
+            .trunk => manifest_file,
+            .mtp => mtp_manifest_file,
+        };
         const gpa = self.allocator;
         // 1. The format.
-        if (!std.mem.eql(u8, m.format, format)) return refuse(diag, error.ManifestFormat, manifest_file ++ ": format \"{s}\" is not " ++ format, .{m.format});
-        if (!std.mem.eql(u8, m.model_type, glm.model_type)) return refuse(diag, error.ModelType, manifest_file ++ ": model_type \"{s}\" is not " ++ glm.model_type, .{m.model_type});
+        if (!std.mem.eql(u8, m.format, format)) return refuse(diag, error.ManifestFormat, file ++ ": format \"{s}\" is not " ++ format, .{m.format});
+        if (!std.mem.eql(u8, m.model_type, glm.model_type)) return refuse(diag, error.ModelType, file ++ ": model_type \"{s}\" is not " ++ glm.model_type, .{m.model_type});
         // 2. The quantization and the dims against config.json.
         const q = m.quantization;
         if (!std.mem.eql(u8, q.mode, "exl3") or !std.mem.eql(u8, q.codebook, "mcg") or q.codebook_multiplier != sushi.format.MCG_MULT or q.tp_ranks == 0)
-            return refuse(diag, error.QuantNotImplemented, manifest_file ++ ": quantization {s} / {s} / multiplier {d} / {d} ranks (this build reads exl3 mcg at multiplier {d})", .{ q.mode, q.codebook, q.codebook_multiplier, q.tp_ranks, sushi.format.MCG_MULT });
+            return refuse(diag, error.QuantNotImplemented, file ++ ": quantization {s} / {s} / multiplier {d} / {d} ranks (this build reads exl3 mcg at multiplier {d})", .{ q.mode, q.codebook, q.codebook_multiplier, q.tp_ranks, sushi.format.MCG_MULT });
         const d = m.dims;
         if (d.hidden != c.hidden_size or d.inter != c.moe_intermediate_size or d.n_experts != c.n_routed_experts or d.mini_inter * q.tp_ranks != d.inter or d.n_experts % banks_per_layer != 0)
-            return refuse(diag, error.DimsMismatch, manifest_file ++ ": dims hidden {d} / inter {d} = {d} x {d} / {d} experts, config.json {d} / {d} / {d}", .{ d.hidden, d.inter, q.tp_ranks, d.mini_inter, d.n_experts, c.hidden_size, c.moe_intermediate_size, c.n_routed_experts });
-        if (m.components.len != n_components) return refuse(diag, error.LayerGeometry, manifest_file ++ ": {d} components, the record has {d}", .{ m.components.len, n_components });
-        for (m.components, Component.names) |x, y| if (!std.mem.eql(u8, x, y)) return refuse(diag, error.LayerGeometry, manifest_file ++ ": component \"{s}\" where the format has \"{s}\"", .{ x, y });
+            return refuse(diag, error.DimsMismatch, file ++ ": dims hidden {d} / inter {d} = {d} x {d} / {d} experts, config.json {d} / {d} / {d}", .{ d.hidden, d.inter, q.tp_ranks, d.mini_inter, d.n_experts, c.hidden_size, c.moe_intermediate_size, c.n_routed_experts });
+        if (m.components.len != n_components) return refuse(diag, error.LayerGeometry, file ++ ": {d} components, the record has {d}", .{ m.components.len, n_components });
+        for (m.components, Component.names) |x, y| if (!std.mem.eql(u8, x, y)) return refuse(diag, error.LayerGeometry, file ++ ": component \"{s}\" where the format has \"{s}\"", .{ x, y });
         self.hidden = d.hidden;
         self.inter = d.inter;
         self.mini_inter = d.mini_inter;
@@ -293,10 +320,16 @@ pub const Bank = struct {
         const ne: usize = self.n_experts;
         // 3. The bank layers: every one's segments as the format derives them, back to back, the bases contiguous;
         // the routed layers' first (two per layer, K ascending, their experts each layer's once), then the MTP layer's.
+        // The MTP directory holds the MTP layer's alone, as its one routed layer.
         var sparse: [glm.max_layers]u32 = undefined;
-        const routed = c.sparseLayers(&sparse);
+        const mtp_layer = [1]u32{c.n_layers};
+        const routed: []const u32 = switch (holds) {
+            .trunk => c.sparseLayers(&sparse),
+            .mtp => &mtp_layer,
+        };
         const n_stream = routed.len * banks_per_layer;
-        if (m.layers.len < n_stream) return refuse(diag, error.LayerGeometry, manifest_file ++ ": {d} bank layers, the {d} routed layers need {d}", .{ m.layers.len, routed.len, n_stream });
+        if (holds == .mtp and m.layers.len != n_stream) return refuse(diag, error.LayerGeometry, file ++ ": {d} bank layers, the MTP layer has {d} (one per K)", .{ m.layers.len, n_stream });
+        if (m.layers.len < n_stream) return refuse(diag, error.LayerGeometry, file ++ ": {d} bank layers, the {d} routed layers need {d}", .{ m.layers.len, routed.len, n_stream });
         self.layers = try gpa.alloc(Layer, n_stream);
         self.local = try gpa.alloc(u16, n_stream * ne);
         @memset(self.local, no_local);
@@ -304,35 +337,36 @@ pub const Bank = struct {
         var base: u64 = 0;
         var n_minis: u64 = 0;
         for (m.layers, 0..) |lj, i| {
-            const trunk = i < n_stream;
-            const want_layer: u64 = if (trunk) routed[i / banks_per_layer] else c.n_layers;
-            if (lj.bank_layer != i or lj.layer != want_layer or lj.mtp == trunk)
-                return refuse(diag, error.LayerGeometry, manifest_file ++ ": bank layer entry {d} is bank layer {d} of layer {d} (mtp {}), want layer {d} (mtp {})", .{ i, lj.bank_layer, lj.layer, lj.mtp, want_layer, !trunk });
-            if (lj.k == 0 or lj.k > 8 or sushi.format.kFromPackedDim(@intCast(16 * lj.k)) == null) return refuse(diag, error.QuantNotImplemented, manifest_file ++ ": bank layer {d} at K {d}", .{ i, lj.k });
+            const streamed = i < n_stream;
+            const want_layer: u64 = if (streamed) routed[i / banks_per_layer] else c.n_layers;
+            const want_mtp = holds == .mtp or !streamed;
+            if (lj.bank_layer != i or lj.layer != want_layer or lj.mtp != want_mtp)
+                return refuse(diag, error.LayerGeometry, file ++ ": bank layer entry {d} is bank layer {d} of layer {d} (mtp {}), want layer {d} (mtp {})", .{ i, lj.bank_layer, lj.layer, lj.mtp, want_layer, want_mtp });
+            if (lj.k == 0 or lj.k > 8 or sushi.format.kFromPackedDim(@intCast(16 * lj.k)) == null) return refuse(diag, error.QuantNotImplemented, file ++ ": bank layer {d} at K {d}", .{ i, lj.k });
             if (lj.n_minis != q.tp_ranks * lj.experts.len or lj.base_offset != base)
-                return refuse(diag, error.LayerGeometry, manifest_file ++ ": bank layer {d}: {d} minis for {d} experts, base {d} (want {d})", .{ i, lj.n_minis, lj.experts.len, lj.base_offset, base });
+                return refuse(diag, error.LayerGeometry, file ++ ": bank layer {d}: {d} minis for {d} experts, base {d} (want {d})", .{ i, lj.n_minis, lj.experts.len, lj.base_offset, base });
             const want = miniSegments(d.hidden, d.mini_inter, lj.k);
-            if (lj.segments.len != n_components) return refuse(diag, error.LayerGeometry, manifest_file ++ ": bank layer {d} has {d} segments", .{ i, lj.segments.len });
+            if (lj.segments.len != n_components) return refuse(diag, error.LayerGeometry, file ++ ": bank layer {d} has {d} segments", .{ i, lj.segments.len });
             for (lj.segments, want.segs, 0..) |sj, w, ci| {
                 const dt = std.meta.stringToEnum(Dtype, sj.dtype);
                 if (!std.mem.eql(u8, sj.component, Component.names[ci]) or dt == null or dt.? != w.dtype or sj.offset != w.offset or sj.length != w.length or !std.mem.eql(u64, sj.shape, w.shape[0..w.rank]))
-                    return refuse(diag, error.LayerGeometry, manifest_file ++ ": bank layer {d} segment {s}: {s} {any} at {d}, {d} B (want {s} {any} at {d}, {d} B)", .{ i, sj.component, sj.dtype, sj.shape, sj.offset, sj.length, @tagName(w.dtype), w.shape[0..w.rank], w.offset, w.length });
+                    return refuse(diag, error.LayerGeometry, file ++ ": bank layer {d} segment {s}: {s} {any} at {d}, {d} B (want {s} {any} at {d}, {d} B)", .{ i, sj.component, sj.dtype, sj.shape, sj.offset, sj.length, @tagName(w.dtype), w.shape[0..w.rank], w.offset, w.length });
             }
             if (lj.logical_bytes != want.logical or lj.record_bytes != std.mem.alignForward(u64, want.logical, record_alignment))
-                return refuse(diag, error.LayerGeometry, manifest_file ++ ": bank layer {d}: logical {d} / record {d} B, want {d} / {d}", .{ i, lj.logical_bytes, lj.record_bytes, want.logical, std.mem.alignForward(u64, want.logical, record_alignment) });
+                return refuse(diag, error.LayerGeometry, file ++ ": bank layer {d}: logical {d} / record {d} B, want {d} / {d}", .{ i, lj.logical_bytes, lj.record_bytes, want.logical, std.mem.alignForward(u64, want.logical, record_alignment) });
             for (lj.experts, 0..) |e, j| if (e >= ne or (j > 0 and e <= lj.experts[j - 1]))
-                return refuse(diag, error.ExpertMap, manifest_file ++ ": bank layer {d}: experts not ascending ids below {d} at {d}", .{ i, ne, j });
-            if (trunk) {
+                return refuse(diag, error.ExpertMap, file ++ ": bank layer {d}: experts not ascending ids below {d} at {d}", .{ i, ne, j });
+            if (streamed) {
                 const r = i / banks_per_layer;
                 const sd: u1 = @intCast(i % banks_per_layer);
-                if (sd == 1 and lj.k <= m.layers[i - 1].k) return refuse(diag, error.LayerGeometry, manifest_file ++ ": layer {d}'s bank layers at K {d} then {d} (K ascending)", .{ lj.layer, m.layers[i - 1].k, lj.k });
+                if (sd == 1 and lj.k <= m.layers[i - 1].k) return refuse(diag, error.LayerGeometry, file ++ ": layer {d}'s bank layers at K {d} then {d} (K ascending)", .{ lj.layer, m.layers[i - 1].k, lj.k });
                 for (lj.experts, 0..) |e, j| {
-                    if (sd == 1 and self.local[(i - 1) * ne + e] != no_local) return refuse(diag, error.ExpertMap, manifest_file ++ ": layer {d}: expert {d} in both bank layers", .{ lj.layer, e });
+                    if (sd == 1 and self.local[(i - 1) * ne + e] != no_local) return refuse(diag, error.ExpertMap, file ++ ": layer {d}: expert {d} in both bank layers", .{ lj.layer, e });
                     self.local[i * ne + e] = @intCast(j);
                     self.side[r * ne + e] = sd;
                 }
                 if (sd == 1) for (0..ne) |e| if (self.local[(i - 1) * ne + e] == no_local and self.local[i * ne + e] == no_local)
-                    return refuse(diag, error.ExpertMap, manifest_file ++ ": layer {d}: expert {d} in neither bank layer", .{ lj.layer, e });
+                    return refuse(diag, error.ExpertMap, file ++ ": layer {d}: expert {d} in neither bank layer", .{ lj.layer, e });
                 self.layers[i] = .{ .model_layer = @intCast(lj.layer), .k = @intCast(lj.k), .record_bytes = lj.record_bytes, .logical_bytes = lj.logical_bytes, .base_offset = lj.base_offset, .minis = self.tp, .n_held = @intCast(lj.experts.len), .segments = want.segs };
             }
             base += lj.n_minis * lj.record_bytes;
@@ -344,20 +378,20 @@ pub const Bank = struct {
         for (routed, 0..) |ml, r| {
             var kb: [16]u8 = undefined;
             const key = std.fmt.bufPrint(&kb, "{d}", .{ml}) catch unreachable;
-            const ex = m.experts.map.get(key) orelse return refuse(diag, error.ExpertMap, manifest_file ++ ": experts has no layer {s}", .{key});
-            if (ex.len != ne) return refuse(diag, error.ExpertMap, manifest_file ++ ": experts[{s}] lists {d} experts, want {d}", .{ key, ex.len, ne });
+            const ex = m.experts.map.get(key) orelse return refuse(diag, error.ExpertMap, file ++ ": experts has no layer {s}", .{key});
+            if (ex.len != ne) return refuse(diag, error.ExpertMap, file ++ ": experts[{s}] lists {d} experts, want {d}", .{ key, ex.len, ne });
             for (ex, 0..) |kl, e| {
                 const sl = banks_per_layer * r + self.side[r * ne + e];
                 if (kl[0] != self.layers[sl].k or kl[1] != self.local[sl * ne + e])
-                    return refuse(diag, error.ExpertMap, manifest_file ++ ": experts[{s}][{d}] = [{d}, {d}], its bank layer has it at [{d}, {d}]", .{ key, e, kl[0], kl[1], self.layers[sl].k, self.local[sl * ne + e] });
+                    return refuse(diag, error.ExpertMap, file ++ ": experts[{s}][{d}] = [{d}, {d}], its bank layer has it at [{d}, {d}]", .{ key, e, kl[0], kl[1], self.layers[sl].k, self.local[sl * ne + e] });
             }
         }
         // 5. The sidecar.
         const sc = m.sidecar;
-        if (!bank_file.plainName(sc.file)) return refuse(diag, error.SidecarGeometry, manifest_file ++ ": sidecar file \"{s}\" is not a plain file name", .{sc.file});
-        if (sc.alignment != record_alignment or sc.size != base) return refuse(diag, error.SidecarGeometry, manifest_file ++ ": sidecar alignment {d}, size {d} (want {d} and the bank layers' {d})", .{ sc.alignment, sc.size, record_alignment, base });
+        if (!bank_file.plainName(sc.file)) return refuse(diag, error.SidecarGeometry, file ++ ": sidecar file \"{s}\" is not a plain file name", .{sc.file});
+        if (sc.alignment != record_alignment or sc.size != base) return refuse(diag, error.SidecarGeometry, file ++ ": sidecar alignment {d}, size {d} (want {d} and the bank layers' {d})", .{ sc.alignment, sc.size, record_alignment, base });
         // 6. The records: every (bank layer, mini) once, at its offset, its expert and rank the layout's.
-        if (m.records.len != n_minis) return refuse(diag, error.RecordCount, manifest_file ++ ": {d} records, the bank layers have {d} minis", .{ m.records.len, n_minis });
+        if (m.records.len != n_minis) return refuse(diag, error.RecordCount, file ++ ": {d} records, the bank layers have {d} minis", .{ m.records.len, n_minis });
         const seen = try a.alloc(bool, @intCast(n_minis));
         @memset(seen, false);
         const first = try a.alloc(u64, m.layers.len);
@@ -367,19 +401,19 @@ pub const Bank = struct {
             at += lj.n_minis;
         }
         for (m.records) |rj| {
-            if (rj.bank_layer >= m.layers.len or rj.mini >= m.layers[rj.bank_layer].n_minis) return refuse(diag, error.RecordGeometry, manifest_file ++ ": record ({d}, {d}) out of range", .{ rj.bank_layer, rj.mini });
+            if (rj.bank_layer >= m.layers.len or rj.mini >= m.layers[rj.bank_layer].n_minis) return refuse(diag, error.RecordGeometry, file ++ ": record ({d}, {d}) out of range", .{ rj.bank_layer, rj.mini });
             const lj = m.layers[rj.bank_layer];
             const k = first[rj.bank_layer] + rj.mini;
-            if (seen[k]) return refuse(diag, error.RecordDuplicate, manifest_file ++ ": record ({d}, {d}) duplicated", .{ rj.bank_layer, rj.mini });
+            if (seen[k]) return refuse(diag, error.RecordDuplicate, file ++ ": record ({d}, {d}) duplicated", .{ rj.bank_layer, rj.mini });
             seen[k] = true;
             if (rj.sidecar_offset != lj.base_offset + rj.mini * lj.record_bytes or rj.expert != lj.experts[rj.mini / q.tp_ranks] or rj.rank != rj.mini % q.tp_ranks)
-                return refuse(diag, error.RecordGeometry, manifest_file ++ ": record ({d}, {d}) is expert {d} rank {d} at {d}, want expert {d} rank {d} at {d}", .{ rj.bank_layer, rj.mini, rj.expert, rj.rank, rj.sidecar_offset, lj.experts[rj.mini / q.tp_ranks], rj.mini % q.tp_ranks, lj.base_offset + rj.mini * lj.record_bytes });
+                return refuse(diag, error.RecordGeometry, file ++ ": record ({d}, {d}) is expert {d} rank {d} at {d}, want expert {d} rank {d} at {d}", .{ rj.bank_layer, rj.mini, rj.expert, rj.rank, rj.sidecar_offset, lj.experts[rj.mini / q.tp_ranks], rj.mini % q.tp_ranks, lj.base_offset + rj.mini * lj.record_bytes });
             var dg: [32]u8 = undefined;
-            if (rj.sha256.len != 64) return refuse(diag, error.RecordSha256, manifest_file ++ ": record ({d}, {d}) sha256 is not 64 hex digits", .{ rj.bank_layer, rj.mini });
-            _ = std.fmt.hexToBytes(&dg, rj.sha256) catch return refuse(diag, error.RecordSha256, manifest_file ++ ": record ({d}, {d}) sha256 is not hex", .{ rj.bank_layer, rj.mini });
+            if (rj.sha256.len != 64) return refuse(diag, error.RecordSha256, file ++ ": record ({d}, {d}) sha256 is not 64 hex digits", .{ rj.bank_layer, rj.mini });
+            _ = std.fmt.hexToBytes(&dg, rj.sha256) catch return refuse(diag, error.RecordSha256, file ++ ": record ({d}, {d}) sha256 is not hex", .{ rj.bank_layer, rj.mini });
         }
         // 7. The converter's parity.
-        if (!m.parity.all_pass) return refuse(diag, error.ParityNotPassed, manifest_file ++ ": parity.all_pass is not true", .{});
+        if (!m.parity.all_pass) return refuse(diag, error.ParityNotPassed, file ++ ": parity.all_pass is not true", .{});
         return base;
     }
 };
@@ -406,10 +440,12 @@ const testing = std.testing;
 
 /// A synthetic EXL3 bank for `c`: per routed layer a K3 bank layer of its even experts and a K4 one of its odd
 /// experts, then the MTP layer's two, `tp` minis per expert of seeded bytes (with `signs`: the suh / svh segments
-/// +/-1 in f16), the records, the experts map and the sidecar. Each field below perturbs one rule.
+/// +/-1 in f16), the records, the experts map and the sidecar. With `mtp_only`, the pack's `mtp/` alone: the MTP
+/// layer's two bank layers, its experts map, manifest and sidecar, in `mtp_dir`. Each other field perturbs one rule.
 pub const Synth = struct {
     tp: u32 = 4,
     signs: bool = false,
+    mtp_only: bool = false,
     format: []const u8 = format,
     multiplier: u64 = 0,
     hidden_delta: u64 = 0,
@@ -419,7 +455,8 @@ pub const Synth = struct {
     expert_both: bool = false,
     map_delta: u64 = 0,
     sidecar_size_delta: u64 = 0,
-    sidecar_file: []const u8 = "experts.bin",
+    /// The sidecar the manifest names (null: the file written).
+    sidecar_file: ?[]const u8 = null,
     drop_record: bool = false,
     dup_record: bool = false,
     record_rank_delta: u64 = 0,
@@ -436,8 +473,12 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
     const mini: u64 = c.moe_intermediate_size / s.tp;
     const ne: u64 = c.n_routed_experts;
     var sparse: [glm.max_layers]u32 = undefined;
-    const routed = c.sparseLayers(&sparse);
+    const routed: []const u32 = if (s.mtp_only) &.{} else c.sparseLayers(&sparse);
+    const mtp_layer = [1]u32{c.n_layers};
+    // The layers the experts map lists: the routed layers', or the MTP layer's in its directory.
+    const mapped: []const u32 = if (s.mtp_only) &mtp_layer else routed;
     const n_bank = (routed.len + 1) * banks_per_layer;
+    const bin = if (s.mtp_only) mtp_sidecar_file else "experts.bin";
     var j: std.ArrayList(u8) = .empty;
     defer j.deinit(a);
     var recs: std.ArrayList(u8) = .empty;
@@ -495,14 +536,17 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
         base += n_minis * rb;
     }
     try j.appendSlice(a, "],\"experts\":{");
-    for (routed, 0..) |ml, r| {
+    for (mapped, 0..) |ml, r| {
         try j.print(a, "{s}\"{d}\":[", .{ if (r == 0) "" else ",", ml });
         for (0..ne) |e| try j.print(a, "{s}[{d},{d}]", .{ if (e == 0) "" else ",", if (e % 2 == 0) @as(u64, 3) else 4, e / 2 + (if (r == 1 and e == 5) s.map_delta else 0) });
         try j.appendSlice(a, "]");
     }
-    try j.print(a, "}},\"sidecar\":{{\"file\":\"{s}\",\"alignment\":4096,\"size\":{d}}},\"records\":[{s}],\"parity\":{{\"all_pass\":{},\"checked\":0,\"total\":0,\"method\":\"bytes-equal-source\"}}}}", .{ s.sidecar_file, base + s.sidecar_size_delta, recs.items, s.all_pass });
-    if (!s.no_manifest) try dir.writeFile(io, .{ .sub_path = manifest_file, .data = j.items });
-    try dir.writeFile(io, .{ .sub_path = "experts.bin", .data = if (s.truncate_file) image.items[0 .. image.items.len - 4096] else image.items });
+    try j.print(a, "}},\"sidecar\":{{\"file\":\"{s}\",\"alignment\":4096,\"size\":{d}}},\"records\":[{s}],\"parity\":{{\"all_pass\":{},\"checked\":0,\"total\":0,\"method\":\"bytes-equal-source\"}}}}", .{ s.sidecar_file orelse bin, base + s.sidecar_size_delta, recs.items, s.all_pass });
+    if (s.mtp_only) try dir.createDirPath(io, mtp_dir);
+    const out = if (s.mtp_only) try dir.openDir(io, mtp_dir, .{}) else dir;
+    defer if (s.mtp_only) out.close(io);
+    if (!s.no_manifest) try out.writeFile(io, .{ .sub_path = if (s.mtp_only) mtp_manifest_file else manifest_file, .data = j.items });
+    try out.writeFile(io, .{ .sub_path = bin, .data = if (s.truncate_file) image.items[0 .. image.items.len - 4096] else image.items });
     return image.toOwnedSlice(a);
 }
 
