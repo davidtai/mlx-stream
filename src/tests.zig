@@ -56,6 +56,7 @@ comptime {
     _ = @import("exl3_sushi_parity.zig");
     _ = @import("glm_moe_dsa.zig");
     _ = @import("glm_moe_dsa_bank.zig");
+    _ = @import("glm_moe_dsa_profile.zig");
     _ = @import("glm_moe_dsa_exl3_bank.zig");
     _ = @import("glm_moe_dsa_exl3_quant.zig");
     _ = @import("glm_moe_dsa_settings.zig");

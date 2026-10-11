@@ -16,6 +16,8 @@ const sdk_ext = @import("sdk_ext.zig");
 const expert_io = sdk_ext.expert.io;
 const quant = sdk_ext.quant;
 const glm = @import("glm_moe_dsa.zig");
+const profile = @import("glm_moe_dsa_profile.zig");
+const log = @import("sdk").log;
 const affine = @import("glm_moe_dsa_bank.zig");
 const bill_units = @import("glm_moe_dsa_bill.zig");
 const sushi = @import("mlx_host").sushi_exl3;
@@ -291,6 +293,8 @@ pub const Bank = struct {
         var bank: Bank = .{ .allocator = allocator };
         errdefer bank.deinit();
         const size = try bank.adopt(a, &m, c, diag);
+        if (try profile.apply(a, io, dir, bank.slots, diag)) |pf| if (sidecar)
+            log.info("glm_moe_dsa: slot profile {s}/" ++ profile.file_name ++ ": {d} bank layers, weights {d:.3} to {d:.3}\n", .{ dir, pf.layers, pf.min, pf.max });
         if (!sidecar) return bank;
         bank.sidecar_path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, m.sidecar.file }, 0);
         try bank.openSidecar(size, diag);
@@ -651,6 +655,36 @@ test "glm exl3 bank: a clean synthetic bank opens: the stream layers, each exper
         try testing.expectEqualSlices(u32, &r2, bill_units.rowsAt(g53, u, &o2));
     }
     try testing.expectEqual(@as(u32, 128), bill_units.maxUnits(g53));
+}
+
+test "glm exl3 bank: a slot profile beside the manifest weighs each bank layer's share; one for another bank refuses" {
+    const a = testing.allocator;
+    var c = try affine.tinyConfig(a);
+    defer c.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try writeSynth(a, testing.io, tmp.dir, &c, .{});
+    defer a.free(img);
+    // Eight bank layers of eight experts (K3, K4 per routed layer), one of them a unit.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = profile.file_name, .data = "{\"format\": \"glm-slot-profile-v1\", \"experts\": [8, 8, 8, 8, 8, 8, 8, 8], \"weights\": [2, 0.5, 1, 1, 1, 1, 1, 1]}" });
+    var rbuf: [512]u8 = undefined;
+    var b = try Bank.open(a, testing.io, try tmpRoot(&tmp, &rbuf), &c, null);
+    defer b.deinit();
+    const g = b.geometryOf();
+    try testing.expectEqual(@as(f64, 2), g.layers[0].share);
+    try testing.expectEqual(@as(f64, 0.5), g.layers[1].share);
+    // The bill's rows follow the weights: at 3 units 6 slots on the first bank layer, 1 on the second, 3 on the rest.
+    var rows: [8]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{ 6, 1, 3, 3, 3, 3, 3, 3 }, bill_units.rowsAt(g, 3, &rows));
+    // The bill's geometry (no sidecar) reads the same profile.
+    const g2 = try Bank.geometry(a, testing.io, try tmpRoot(&tmp, &rbuf), &c, null);
+    defer a.free(g2.layers);
+    try testing.expectEqualSlices(glm.LayerSlots, g.layers, g2.layers);
+    // A profile for another bank refuses the open by name.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = profile.file_name, .data = "{\"format\": \"glm-slot-profile-v1\", \"experts\": [8, 8], \"weights\": [1, 1]}" });
+    var diag: Diag = .{};
+    try testing.expectError(error.SlotProfileMismatch, Bank.open(a, testing.io, try tmpRoot(&tmp, &rbuf), &c, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "bank layers") != null);
 }
 
 test "glm exl3 bank: every rule of the pack's contract refuses by name" {

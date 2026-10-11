@@ -11,6 +11,8 @@ const sdk_ext = @import("sdk_ext.zig");
 const expert_io = sdk_ext.expert.io;
 const quant = sdk_ext.quant;
 const glm = @import("glm_moe_dsa.zig");
+const profile = @import("glm_moe_dsa_profile.zig");
+const log = @import("sdk").log;
 
 pub const format = "mlx-stream-expert-manifest-affine-v1";
 pub const manifest_file = "expert-manifest-affine-v1.json";
@@ -226,6 +228,8 @@ pub const Bank = struct {
         var bank: Bank = .{ .allocator = allocator };
         errdefer bank.deinit();
         try bank.adopt(&m, c, diag);
+        if (try profile.apply(a, io, dir, bank.slots, diag)) |pf| if (sidecar)
+            log.info("glm_moe_dsa: slot profile {s}/" ++ profile.file_name ++ ": {d} bank layers, weights {d:.3} to {d:.3}\n", .{ dir, pf.layers, pf.min, pf.max });
         if (!sidecar) return bank;
         bank.sidecar_path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, m.sidecar.file }, 0);
         try bank.openSidecar(m.sidecar.size, diag);
