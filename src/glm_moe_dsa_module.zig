@@ -366,7 +366,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const preloaded = try self.stream.preload(&pre, Preload.order);
             const pre_ns: u64 = @intCast(t_pre.untilNow(io, .awake).nanoseconds);
             log.info("glm_moe_dsa: preloaded {d} experts ({d:.2} GB) into the prompt rows in {d:.2} s\n", .{ preloaded, gigabytes(Reads.of(pre0, self.stream.stats()).ssd_bytes), seconds(pre_ns) });
-            self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa };
+            self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa, .predict_deeper = self.recorder != null };
             self.file_backed_start = file_backed_start;
             if (std.c.getenv(wave_probe_env) != null) {
                 self.probe = try gpa.create(graph.WaveProbe);
@@ -552,7 +552,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             // The lanes the pass appends to are allocated before the allocator's size classes go on for its transients.
             try self.cache.preallocate(&self.g, self.model);
             self.stream.resetPromptCounts();
-            if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth());
+            if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth(), experts_mod.nowNs());
             const s0 = self.stream.stats();
             startPhase();
             const mem0 = Mem.now();

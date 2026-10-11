@@ -259,7 +259,7 @@ test "glm exl3 quant: a wide prompt call with its misses staged at the layer's s
                 // Each bank layer's experts (none resident yet) staged, one route per bank layer.
                 try testing.expectEqual(@as(usize, 2), ex.staged.n_routes);
             }
-            const y = try ex.call(&g, @intCast(layer), xb, try g.hostArray(std.mem.sliceAsBytes(ids32[0 .. n * k]), &.{ nc, k }, .int32), try g.hostArray(std.mem.sliceAsBytes(sc[0 .. n * k]), &.{ nc, k }, .float32), null, &.{});
+            const y = try ex.call(&g, @intCast(layer), xb, try g.hostArray(std.mem.sliceAsBytes(ids32[0 .. n * k]), &.{ nc, k }, .int32), try g.hostArray(std.mem.sliceAsBytes(sc[0 .. n * k]), &.{ nc, k }, .float32), null, &.{}, &.{});
             var got: [n * 128]f32 = undefined;
             _ = try g.hostF32(try g.astype(y, .float32), got[0 .. n * h]);
             try ex.flush();
@@ -416,7 +416,7 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
                 var next: [9 * 16]f32 = undefined;
                 for (next[0 .. n * 16]) |*v| v.* = rng.random().float(f32);
                 const nx = try g.hostArray(std.mem.sliceAsBytes(next[0 .. n * 16]), &.{ nc, 16 }, .float32);
-                const y = try ex.call(&g, @intCast(layer), xb, try g.hostArray(std.mem.sliceAsBytes(ids32[0 .. n * k]), &.{ nc, k }, .int32), try g.hostArray(std.mem.sliceAsBytes(sc[0 .. n * k]), &.{ nc, k }, .float32), nx, &.{});
+                const y = try ex.call(&g, @intCast(layer), xb, try g.hostArray(std.mem.sliceAsBytes(ids32[0 .. n * k]), &.{ nc, k }, .int32), try g.hostArray(std.mem.sliceAsBytes(sc[0 .. n * k]), &.{ nc, k }, .float32), nx, &.{}, &.{});
                 var got: [9 * 128]f32 = undefined;
                 _ = try g.hostF32(try g.astype(y, .float32), got[0 .. n * h]);
                 try ex.flush();

@@ -654,6 +654,10 @@ pub const Routes = struct {
     dsa: bool = false,
     /// The wave probe, a diagnostic the module arms (`WaveProbe`); null: off.
     wave_probe: ?*WaveProbe = null,
+    /// The route recorder's (a diagnostic): decode calls also hand the driver the next routed layer's router scores on
+    /// the layer's input before its attention and on its MoE residual, each normed with the next layer's MoE norm
+    /// (`Experts.call`'s `deeper`, the recorder's slots 2 and 3).
+    predict_deeper: bool = false,
 };
 
 /// A diagnostic the module arms at construction (`GLM53_WAVE_PROBE`, off by default): each prompt layer's MLX peak above
@@ -810,7 +814,16 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             const next: ?T = if (rt.lookahead and !prompt and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2) else null;
             // A decode-lane call takes the shared expert built first and runs it during its read wait; the sum is the same.
             const shared: ?T = if (!wide) try mlp(g, lw.shared.?, x2) else null;
-            const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, if (shared) |sh| &[_]T{sh} else &.{});
+            // The pre-gating signal (diag): the next routed layer's router on this layer's input before its attention
+            // (the residual `h`) and on this call's MoE residual (`h1`), each normed with the next layer's MoE RMSNorm
+            // weight (the router of L+1 sees its own norm of the residual); the recorder's slots 2 and 3.
+            var deeper: [2]?T = .{ null, null };
+            if (rt.predict_deeper and next != null) {
+                const nl = &w.layers[li + 1];
+                deeper[0] = try routerScores(g, nl.router.?, try rmsNorm(g, h, nl.post_norm, c.rms_norm_eps));
+                deeper[1] = try routerScores(g, nl.router.?, try rmsNorm(g, h1, nl.post_norm, c.rms_norm_eps));
+            }
+            const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, &deeper, if (shared) |sh| &[_]T{sh} else &.{});
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{routed}, .routed);
             if (probe) |p| p.mark(l, .moe);
             break :blk try g.add(routed, shared orelse try mlp(g, lw.shared.?, x2));

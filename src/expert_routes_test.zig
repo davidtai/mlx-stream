@@ -47,7 +47,7 @@ test "glm routes: the recorder keeps every decode route as the stream served it,
     const rec = try routes.Recorder.init(a, n_layers, ne, k, 1);
     defer rec.deinit();
     s.recorder = rec;
-    rec.begin(3, 3);
+    rec.begin(3, 3, 0);
     var rng = std.Random.DefaultPrng.init(1234);
     const rnd = rng.random();
     var ids_buf: [32]u16 = undefined;
@@ -200,7 +200,7 @@ test "glm routes: an EXL3 call routes its K3 and K4 bank layers, the recorder ke
     const rec = try routes.Recorder.init(a, n_stream, b.n_experts, glm.routed_top_k, bpl);
     defer rec.deinit();
     s.recorder = rec;
-    rec.begin(0, 0);
+    rec.begin(0, 0, 0);
     var grown: [8]u32 = @splat(5);
     try s.grow(grown[0..n_stream]);
     var rng = std.Random.DefaultPrng.init(42);
@@ -227,7 +227,7 @@ test "glm routes: an EXL3 call routes its K3 and K4 bank layers, the recorder ke
             for (side_n, 0..) |n, i| if (n > 0) {
                 last = i;
             };
-            rec.call(l, ids);
+            _ = rec.call(l, ids);
             var rs: [bpl]?*exl3.Stream.Route = @splat(null);
             hits_want[step * n_routed + l] = 0;
             for (0..bpl) |i| {
