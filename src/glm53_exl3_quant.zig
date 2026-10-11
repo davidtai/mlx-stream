@@ -150,6 +150,11 @@ pub fn Accepted(comptime G: type) type {
 
         /// `fused` through these texts' GEMVs: the wave's pairs (row i, its slot) over one bank kind at score 1.
         fn fusedGlm53(self: *Self, g: *G, x: G.T, slots: []const u32, bank: Bank) !G.T {
+            return self.fusedWith(g, x, slots, bank, null);
+        }
+
+        /// `fusedGlm53` over `with`'s chain (the bench's mutated texts), else the bank's K's.
+        fn fusedWith(self: *Self, g: *G, x: G.T, slots: []const u32, bank: Bank, with: ?*routes.Decode) !G.T {
             const m = slots.len;
             std.debug.assert(m <= routes.max_pairs);
             var pairs: [routes.max_pairs][3]u32 = undefined;
@@ -157,7 +162,7 @@ pub fn Accepted(comptime G: type) type {
             const ones: [routes.max_pairs]f32 = @splat(1);
             const sc = try g.hostArray(std.mem.sliceAsBytes(ones[0..@max(8, m)]), &.{@intCast(@max(8, m))}, .float32);
             const banks = [3]Bank{ bank, bank, bank };
-            return g.astype(try self.decodeWave(g, x, pairs[0..m], &banks, sc), .bfloat16);
+            return g.astype(try self.decodeWaveWith(g, x, pairs[0..m], &banks, sc, with), .bfloat16);
         }
 
         /// One decode wave over a bank layer: x [rows, hidden] bf16 (the call's rows), `pairs` per pair (x row, packed
@@ -165,6 +170,10 @@ pub fn Accepted(comptime G: type) type {
         /// another's), sc the router's weights [rows, top-k] f32 -> f32 [pairs, hidden], each pair's output times its
         /// score. `scratch`: the pair and slot tables' host words (`decodeTables`).
         pub fn decodeWave(self: *Self, g: *G, x: G.T, pairs: []const [3]u32, banks: *const [3]Bank, sc: G.T) !G.T {
+            return self.decodeWaveWith(g, x, pairs, banks, sc, null);
+        }
+
+        fn decodeWaveWith(self: *Self, g: *G, x: G.T, pairs: []const [3]u32, banks: *const [3]Bank, sc: G.T, with: ?*routes.Decode) !G.T {
             const k = kOf(banks[0].gate.trellis) orelse return error.BankArrays;
             const tabs = try selfcheck.decodeTables(self.a, pairs);
             defer self.a.free(tabs.pt);
@@ -173,7 +182,8 @@ pub fn Accepted(comptime G: type) type {
             const gt = try g.hostArray(std.mem.sliceAsBytes(tabs.gt), &.{@intCast(tabs.gt.len)}, .uint32);
             var rb: [3]routes.Bank = undefined;
             for (banks, &rb) |b, *o| o.* = .{ .gate = proj(b.gate), .up = proj(b.up), .down = proj(b.down) };
-            return g.adopt(try self.dec[ki(k)].wave(x, pt, gt, pairs.len, tabs.n_slots, &rb, sc));
+            const dec = with orelse &self.dec[ki(k)];
+            return g.adopt(try dec.wave(x, pt, gt, pairs.len, tabs.n_slots, &rb, sc));
         }
 
         /// One decode wave over the call's every routed position, the slots a device array (e.g. the routed ids through a
@@ -858,6 +868,54 @@ fn nbytesOf(x: mlx.mlx_array) u64 {
     return mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
 }
 
+/// GLM53_EXL3_DEC4's experiments on these texts' decode chain: one text each, one needle replaced.
+const dec_exps = [_]BenchExp{
+    .{ .name = "prep: nothing (returns)", .kernel = .glm53_dec_prep, .needle = "    if (packed == 0xffffffffu || sc[pos] == 0.0f) return;", .repl = "    if (true) return;" },
+    .{ .name = "gu: nothing (returns)", .kernel = .glm53_dec_gu, .needle = "    if (packed == 0xffffffffu) return;", .repl = "    if (true) return;" },
+    .{ .name = "gu: an eighth of the k-tiles", .kernel = .glm53_dec_gu, .needle = "    for (uint tk = 0u; tk < IT; ++tk) {", .repl = "    for (uint tk = 0u; tk < IT / 8u; ++tk) {" },
+    .{ .name = "down: nothing (zeros)", .kernel = .glm53_dec_down, .needle = "    if (packed == 0xffffffffu || sc[pos] == 0.0f) {", .repl = "    if (true) {" },
+    .{ .name = "down: no middle", .kernel = .glm53_dec_down, .needle = "    for (uint job = sg; job < 4u * NIB; job += 8u) {", .repl = "    for (uint job = sg; job < 0u; job += 8u) {" },
+    .{ .name = "down: one mini's GEMV", .kernel = .glm53_dec_down, .needle = "    for (uint r = 0u; r < 4u; ++r) {\n        const device uint* tw", .repl = "    for (uint r = 0u; r < 1u; ++r) {\n        const device uint* tw" },
+};
+
+/// One experiment's registry over its mutated text, bound on the bench's stream, and its decode chains (K3, K4).
+const DecExpRun = struct {
+    src: [:0]u8,
+    mf: []u8,
+    texts: xk.Texts,
+    reg: xk.Registry,
+    bd: xk.Bound,
+    dec: [2]routes.Decode,
+
+    fn init(e: *DecExpRun, a: Allocator, ex: BenchExp, s: mlx.mlx_stream, inst0: xk.Instance, k1: u32) !void {
+        const base = xk.embedded.sources[@backingInt(ex.kernel)];
+        if (std.mem.count(u8, base, ex.needle) != 1) return error.NeedleMissing;
+        const tx = try std.mem.replaceOwned(u8, a, base, ex.needle, ex.repl);
+        defer a.free(tx);
+        e.src = try a.dupeSentinel(u8, tx, 0);
+        errdefer a.free(e.src);
+        e.mf = try xk.retexted(a, &xk.embedded, .{ .kernel = ex.kernel }, e.src, &e.texts);
+        errdefer a.free(e.mf);
+        e.texts.manifest = e.mf;
+        var dg: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(e.mf, &dg, .{});
+        e.reg = try xk.Registry.init(a, &e.texts, &std.fmt.bytesToHex(dg, .lower), null);
+        errdefer e.reg.deinit();
+        e.bd = try e.reg.bind(s, null);
+        var inst1 = inst0;
+        inst1.k = k1;
+        e.dec = .{ .init(&e.bd, inst0), .init(&e.bd, inst1) };
+    }
+
+    fn deinit(e: *DecExpRun, a: Allocator) void {
+        for (&e.dec) |*d| d.deinit();
+        e.bd.deinit();
+        e.reg.deinit();
+        a.free(e.mf);
+        a.free(e.src);
+    }
+};
+
 fn benchDecode4(a: Allocator, g: anytype, ours: anytype, theirs: anytype, banks: anytype, slot_of: []const u32, b: *const bank_mod.Bank, h: usize) !void {
     const T = mlx.mlx_array;
     const kern = sushi.kernels;
@@ -966,12 +1024,21 @@ fn benchDecode4(a: Allocator, g: anytype, ours: anytype, theirs: anytype, banks:
     // impl glm53: these texts' GEMVs as the driver's `fused` would call them (`fusedGlm53`: each slot decoded once for
     // its member pairs), the full wave only
     const Impl = enum { sushi, glm53 };
-    const Arm = struct { cfg: Cfg, depth: Depth, sides: Sides, impl: Impl = .sushi };
+    // exp e: these texts' chain over dec_exps[e]'s mutated text (where the wave's time goes; the outputs are not checked)
+    const Arm = struct { cfg: Cfg, depth: Depth, sides: Sides, impl: Impl = .sushi, exp: ?usize = null };
     var arms: std.ArrayList(Arm) = .empty;
     for ([_]Cfg{ .real, .distinct, .hot }) |cfg| for (std.enums.values(Depth)) |d| try arms.append(ar, .{ .cfg = cfg, .depth = d, .sides = .both });
     for ([_]Cfg{ .real, .hot }) |cfg| for ([_]Sides{ .k3, .k4 }) |sd| for ([_]Depth{ .none, .full }) |d| try arms.append(ar, .{ .cfg = cfg, .depth = d, .sides = sd });
     for ([_]Cfg{ .real, .distinct, .hot }) |cfg| try arms.append(ar, .{ .cfg = cfg, .depth = .full, .sides = .both, .impl = .glm53 });
     for ([_]Cfg{ .real, .hot }) |cfg| for ([_]Sides{ .k3, .k4 }) |sd| try arms.append(ar, .{ .cfg = cfg, .depth = .full, .sides = sd, .impl = .glm53 });
+    const exps = try ar.alloc(DecExpRun, dec_exps.len);
+    var n_exps: usize = 0;
+    defer for (exps[0..n_exps]) |*e| e.deinit(a);
+    for (dec_exps, exps) |dx, *run| {
+        try run.init(a, dx, g.s, .{ .k = b.layers[0].k, .hidden = @intCast(h), .mini = @intCast(mini) }, b.layers[1].k);
+        n_exps += 1;
+    }
+    for (0..dec_exps.len) |ei| for ([_]Cfg{ .real, .hot }) |cfg| for ([_]Sides{ .k3, .k4 }) |sd| try arms.append(ar, .{ .cfg = cfg, .depth = .full, .sides = sd, .impl = .glm53, .exp = ei });
     const steps = 32;
     const best = try ar.alloc(u64, arms.items.len);
     const best_eval = try ar.alloc(u64, arms.items.len);
@@ -991,7 +1058,7 @@ fn benchDecode4(a: Allocator, g: anytype, ours: anytype, theirs: anytype, banks:
                 const bk = banks[side];
                 const ns: c_int = @as(c_int, @intCast(w.n)) * tpc;
                 const xt = try g.take(x, w.tok, 0);
-                const out: T = if (arm.impl == .glm53) try ours.fusedGlm53(g, xt, w.slots, bk) else switch (arm.depth) {
+                const out: T = if (arm.impl == .glm53) try ours.fusedWith(g, xt, w.slots, bk, if (arm.exp) |e| &exps[e].dec[side] else null) else switch (arm.depth) {
                     .none => xt,
                     else => blk: {
                         const inn = try kern.pairGemv(g.s, xt, bk.gate.suh, bk.up.suh, bk.gate.trellis, bk.up.trellis, w.minis, hc, mini, ns, tpc, 0);
@@ -1029,7 +1096,7 @@ fn benchDecode4(a: Allocator, g: anytype, ours: anytype, theirs: anytype, banks:
             bytes += @as(u64, e_side) * tp * (3 * mini_bytes[side] + scale_bytes[side]);
         }
         const ms_eval = @as(f64, @floatFromInt(best_eval[ai])) / 1e6 / steps;
-        std.debug.print("GLM53_DEC4 chain {t} {t} {t} {t}: {d} pairs over {d} experts ({d} B distinct): eval {d:.4} ms per step, build + eval {d:.4} ms\n", .{ arm.impl, arm.cfg, arm.sides, arm.depth, n_pairs, n_ex, bytes, ms_eval, @as(f64, @floatFromInt(best[ai])) / 1e6 / steps });
+        std.debug.print("GLM53_DEC4 chain {t} {t} {t} {t}{s}{s}: {d} pairs over {d} experts ({d} B distinct): eval {d:.4} ms per step, build + eval {d:.4} ms\n", .{ arm.impl, arm.cfg, arm.sides, arm.depth, if (arm.exp != null) " experiment " else "", if (arm.exp) |e| dec_exps[e].name else "", n_pairs, n_ex, bytes, ms_eval, @as(f64, @floatFromInt(best[ai])) / 1e6 / steps });
     }
     // the read kernel: each listed mini's three trellis rows, uint4 words, 256 threads x CH words a threadgroup
     const ch: c_int = 4096;
