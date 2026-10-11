@@ -240,8 +240,9 @@ const bf16_min: f64 = -3.3895313892515355e38;
 // ── the forward ──
 
 /// One forward's query blocks (the same for every layer) and the selection each full layer leaves its shared layers:
-/// per block its top-k key indices (kept: `[1, 1, rows, index_topk]` u32 in the reference's form, `[1, rows,
-/// index_topk]` i32 on the DSA kernels), or null where every causal key is attended.
+/// per block its top-k key indices (kept: `[1, 1, rows, index_topk]` i32 in the reference's form, u32 where the top-k
+/// kernel does not serve the shape; `[1, rows, index_topk]` i32 on the DSA kernels), or null where every causal key is
+/// attended.
 pub const Carry = struct {
     a: std.mem.Allocator,
     bounds: []u32,
@@ -289,7 +290,9 @@ pub const Carry = struct {
 
 /// The indexer of full layer `l` over the forward's rows: per query block the top `index_topk` keys by the fp32
 /// score (relu'd per head, weighted by `weights_proj` at `n_heads^-0.5 * head_dim^-0.5`, summed over heads), masked
-/// causally on a prompt; null where the block's keys fit `index_topk` (every causal key is attended). Kept in `carry`.
+/// causally in a block of several rows (a one-row block's keys all precede its row); argpartition's ids in its order
+/// (`glm_moe_dsa_topk` where it serves the shape); null where the block's keys fit `index_topk` (every causal key is
+/// attended). Kept in `carry`.
 pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, rows: u32, carry: *Carry) !void {
     const keys = start + rows;
     const topk = c.index_topk;
@@ -321,10 +324,13 @@ pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, 
         const w4 = try g.reshape(try g.transposeAxes(wb, &.{ 1, 0 }), &.{ 1, @intCast(c.index_n_heads), @intCast(b1 - b0), 1 });
         s = try g.sum(try g.mul(s, w4), 1, true);
         at("select.mask");
-        if (rows > 1) s = try g.where(try causalMask(g, start + b0, b1 - b0, nb), s, try g.scalar(-std.math.inf(f64), .float32));
-        const kth: c_int = @intCast(nb - topk);
-        at("select.argpartition");
-        const idx = try lastSlice(g, try g.argpartition(s, kth, -1), kth, @intCast(nb));
+        const r: c_int = @intCast(b1 - b0);
+        if (r > 1) s = try g.where(try causalMask(g, start + b0, b1 - b0, nb), s, try g.scalar(-std.math.inf(f64), .float32));
+        at("select.topk");
+        const idx = if (try topk_mod.topk(g, try g.reshape(s, &.{ 1, r, @intCast(nb) }), topk)) |t| try g.reshape(t, &.{ 1, 1, r, @intCast(topk) }) else blk: {
+            const kth: c_int = @intCast(nb - topk);
+            break :blk try lastSlice(g, try g.argpartition(s, kth, -1), kth, @intCast(nb));
+        };
         carry.set(g, i, idx);
         g.resetTo(m);
     }
