@@ -658,7 +658,8 @@ pub const Out = struct { logits: T, hidden: ?T = null };
 
 /// One forward of `ids` at positions `[start, start + ids.len)` through every layer (each layer's KV appended to
 /// `cache`), the routed experts through `ex` (`call`, `readAheadSeed`): the last row's logits `[1, vocab]`, a kept
-/// handle the caller frees. A prompt forward evaluates each layer before the next (its waves freed per layer).
+/// handle the caller frees. A prompt forward commits each layer's results once built and goes on without waiting (the
+/// next routed layer's routing barrier is the host's one wait on the GPU).
 pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, ex: anytype, rt: Routes) !T {
     return (try forwardRows(g, a, c, w, ids, start, cache, ex, rt, .{})).logits;
 }
@@ -713,7 +714,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             try evals.append(a, next_h);
             try evals.appendSlice(a, cache.buffers(l, &bufs));
             for (carry.topk) |t| if (t) |x_| try evals.append(a, x_);
-            try g.evalAll(evals.items);
+            try g.asyncEval(evals.items);
             if (pt.enabled) _ = try pt.phase(g, &.{}, .rest);
         }
         g.release(h);
