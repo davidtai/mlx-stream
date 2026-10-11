@@ -16,7 +16,7 @@ const std = @import("std");
 pub const api: Version = .{ .major = 2, .minor = 1 };
 
 /// Compile the registered plugins' profile probes in (`-Dplugin-profile=true`); off in every served build.
-pub const plugin_profile = false;
+pub const plugin_profile = true;
 
 pub const mlx = @import("mlx_host").mlx;
 pub const log = @import("mlx_host").log;
