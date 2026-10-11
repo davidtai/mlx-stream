@@ -446,6 +446,22 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
 
 #define LATE(deadline) ((deadline) >= 0 && q3ld_monotonic_ns() >= (deadline))
 
+#if defined(Q3LD_INJECT) || defined(Q3LD_EVSIG)
+/* The read gauge's busy spans (any read in flight), for the profile's SSD / GPU overlap: [start, end) ns pairs in a
+ * caller-owned int64[2 * cap] (q3ld_test_busy_log); past the cap the spans are not logged.  Caller holds mu. */
+static int64_t *busy_log = 0, busy_cap = 0, busy_n = 0;
+static void busy_note(int64_t start, int64_t end) {
+    if (busy_log && busy_n < busy_cap) {
+        busy_log[2 * busy_n] = start;
+        busy_log[2 * busy_n + 1] = end;
+        busy_n += 1;
+    }
+}
+#define BUSY_NOTE(s, e) busy_note((s), (e))
+#else
+#define BUSY_NOTE(s, e) ((void)0)
+#endif
+
 static void gauge_enter(void) {
     pthread_mutex_lock(&mu);
     if (gauge[0] == 0) gauge[5] = q3ld_monotonic_ns();
@@ -460,7 +476,12 @@ static void gauge_exit(void) {
     pthread_mutex_lock(&mu);
     if (gauge[0] > 0) {
         gauge[0] -= 1;
-        if (gauge[0] == 0 && gauge[5]) { gauge[4] += q3ld_monotonic_ns() - gauge[5]; gauge[5] = 0; }
+        if (gauge[0] == 0 && gauge[5]) {
+            int64_t end = q3ld_monotonic_ns();
+            gauge[4] += end - gauge[5];
+            BUSY_NOTE(gauge[5], end);
+            gauge[5] = 0;
+        }
     }
     pthread_mutex_unlock(&mu);
 }
@@ -1900,6 +1921,17 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
     int64_t n = evsig_n;
     if (!buf && cap < 0) { evsig = 0; evsig_cap = 0; evsig_n = 0; }
     pthread_mutex_unlock(&sig_mu);
+    return n;
+}
+
+/* The read gauge's busy-span log (int64[2 * cap], cleared on attach); buf = 0 keeps the current log, cap < 0 detaches it
+ * (the owner frees the buffer).  Returns the spans logged so far. */
+int64_t q3ld_test_busy_log(int64_t *buf, int64_t cap) {
+    pthread_mutex_lock(&mu);
+    if (buf) { busy_log = buf; busy_cap = cap; busy_n = 0; }
+    int64_t n = busy_n;
+    if (!buf && cap < 0) { busy_log = 0; busy_cap = 0; busy_n = 0; }
+    pthread_mutex_unlock(&mu);
     return n;
 }
 #endif
