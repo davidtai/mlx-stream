@@ -154,8 +154,21 @@ pub const Counter = enum(u8) {
     ev_host_released = 70,
     ev_stop_released = 71,
     direct_ranges = 72,
+    diag_gu_ranges = 73,
+    diag_gu_bytes = 74,
+    diag_gu_read_ns = 75,
+    diag_gu_copy_ns = 76,
+    diag_dn_ranges = 77,
+    diag_dn_bytes = 78,
+    diag_dn_read_ns = 79,
+    diag_dn_copy_ns = 80,
+    diag_adopt_copy_ns = 81,
+    diag_copy_max_ns = 82,
+    diag_jobs = 83,
+    diag_wake_ns = 84,
+    diag_job_ns = 85,
 };
-pub const counters_n = 73;
+pub const counters_n = 86;
 
 /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
 /// read by `threads` threads in `chunk_bytes` preadv steps.
