@@ -306,8 +306,8 @@ static uint64_t pre_order = 0;
 static int32_t *pre_of = 0;   /* per ticket: 1 + the pre-range bound to that range at submit, 0 = none */
 
 /* ---- the event-gate class (lookahead4) */
-#define MAX_GATES 256
-#define MAX_GATE_TICKETS 256
+#define MAX_GATES 512         /* the live gates of every route a stream holds: 6 routes x (48 parts + 1) <= 512 */
+#define MAX_GATE_TICKETS 768  /* tickets of one registration: a gate/up and a down ticket per record, 2 x 48 ids x 8 minis */
 #define EVK_OFF 0
 #define EVK_MTL 1         /* ev_obj = an MTLSharedEvent (q3ld_mtl_signal) */
 #define EVK_HOST 2        /* ev_obj = an int64 word (release store; the CPU backend and the checks) */
@@ -1872,9 +1872,12 @@ int32_t q3ld_ev_gates(int32_t n, const uint64_t *values, const int32_t *counts, 
     if (!running || stopping || ev_kind == EVK_OFF || !gate_of) { pthread_mutex_unlock(&mu); return -1; }
     if (g_tail - g_head + n > MAX_GATES) { pthread_mutex_unlock(&mu); return -3; }
     uint64_t prev = ev_hi;
+    int64_t total = 0;
+    for (int32_t i = 0; i < n; i++) total += counts[i] < 0 ? MAX_GATE_TICKETS + 1 : counts[i];
+    if (total > MAX_GATE_TICKETS) { pthread_mutex_unlock(&mu); return -2; }
     int64_t k = 0;
     for (int32_t i = 0; i < n; i++) {                   /* validate everything before any change */
-        if (values[i] <= prev || counts[i] < 0 || counts[i] > MAX_GATE_TICKETS) { pthread_mutex_unlock(&mu); return -2; }
+        if (values[i] <= prev) { pthread_mutex_unlock(&mu); return -2; }
         prev = values[i];
         for (int32_t j = 0; j < counts[i]; j++, k++) {
             int64_t t = tickets[k];

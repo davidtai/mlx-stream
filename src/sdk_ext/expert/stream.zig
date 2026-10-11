@@ -481,6 +481,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         pub const route_capacity = max_wide_depth + 1;
         /// Prefill routes one layer may hold live at once (`Options.wide_depth`; P1c: 5, the served default).
         pub const max_wide_depth = 5;
+        comptime {
+            // Every route the stream holds is gated at most once, the gate/up gate and a down gate per part (a part at
+            // least one id): their gates fit the pool's ring.
+            std.debug.assert(route_capacity * (max_route_ids + 1) <= expert_io.max_gates);
+        }
         /// Served run 16: the phase change frees the transient scratch (`Stream.releaseTransient`) and the grow allocates decode's
         /// window 0 plus `decode_staging_rows`; the bill (deepseek_v41_bill.zig) reads this declaration.
         pub const phase_change_releases_wide_windows = true;
@@ -1349,7 +1354,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.gate_value = hi;
                 var values: [max_route_ids + 1]u64 = undefined;
                 var counts: [max_route_ids + 1]i32 = undefined;
-                var tickets: [2 * max_route_ids]i64 = undefined;
+                // A gate/up and a down ticket per RECORD (`max_minis` per id), the pool's bound for one registration.
+                var tickets: [expert_io.max_gate_tickets]i64 = undefined;
                 var k: usize = 0;
                 for (r.partsOf()) |p| for (0..p.n_reads) |i| {
                     tickets[k] = @intCast(p.ticket + i);

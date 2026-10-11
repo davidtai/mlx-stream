@@ -16,6 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_util = @import("sdk").io_util;
+const policy = @import("policy.zig");
 
 // 1:1 mirror of lib/expert_io/q3_lookahead4.h. The C pool and the event shims compile on macOS graphs only (the host's
 // `macos_engines` graphs: the macOS exe and tests); the Linux exe and the iOS lib get the refusing stand-ins, whose
@@ -70,8 +71,12 @@ pub const max_items = 8;
 pub const max_spec = 16;
 pub const max_spec_threads = 3;
 pub const max_pre = 32;
-pub const max_gates = 256;
-pub const max_gate_tickets = 256;
+/// Live gates (the C pool's MAX_GATES): every route a stream holds at once, each the gate/up gate and a down gate per
+/// part (the stream asserts the bound).
+pub const max_gates = 512;
+/// Tickets of one gate registration (the C pool's MAX_GATE_TICKETS; the start's ABI check ties them): a gate/up and a
+/// down ticket per record of the widest route, its ids each of at most `max_items` minis.
+pub const max_gate_tickets = 2 * policy.max_route_ids * max_items;
 /// Status words per ticket (`Result`'s fields, in order).
 const res_w = 8;
 pub const spec_state_w = 11;
