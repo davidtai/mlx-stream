@@ -26,25 +26,15 @@ const ceiling: u64 = 120_259_084_288;
 const prompt: u64 = 2048;
 const max_tokens: u64 = 256;
 
-/// One safetensors file of `tensors` (zero data) at `path`.
+/// One safetensors file of `tensors` (zero data) at `path` (`sdk.testing.safetensors`).
 fn writeFile(a: std.mem.Allocator, tmp: *std.testing.TmpDir, path: []const u8, tensors: []const v41.MiniTensor) !void {
-    var hdr: std.ArrayList(u8) = .empty;
-    try hdr.appendSlice(a, "{\"__metadata__\":{\"format\":\"mlx\"}");
-    var off: u64 = 0;
-    for (tensors) |t| {
+    const ts = try a.alloc(sdk.testing.StTensor, tensors.len);
+    for (tensors, ts) |*t, *x| {
         var n: u64 = t.dtype.size();
         for (t.shape[0..t.rank]) |d| n *= d;
-        try hdr.print(a, ",\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[", .{ t.name, @tagName(t.dtype) });
-        for (t.shape[0..t.rank], 0..) |d, k| try hdr.print(a, "{s}{d}", .{ if (k == 0) "" else ",", d });
-        try hdr.print(a, "],\"data_offsets\":[{d},{d}]}}", .{ off, off + n });
-        off += n;
+        x.* = .{ .name = t.name, .dtype = @tagName(t.dtype), .shape = t.shape[0..t.rank], .len = n };
     }
-    try hdr.append(a, '}');
-    const file = try a.alloc(u8, 8 + hdr.items.len + off);
-    @memset(file, 0);
-    std.mem.writeInt(u64, file[0..8], hdr.items.len, .little);
-    @memcpy(file[8..][0..hdr.items.len], hdr.items);
-    try tmp.dir.writeFile(io, .{ .sub_path = path, .data = file });
+    try tmp.dir.writeFile(io, .{ .sub_path = path, .data = try sdk.testing.safetensors(a, ts, .{ .metadata = true }) });
 }
 
 /// The mini bank dir: config.json, the synthetic expert bank, the resident shards + index, the Engram residents.

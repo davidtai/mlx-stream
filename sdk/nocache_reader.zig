@@ -153,26 +153,18 @@ pub fn reader(path: [:0]const u8) !mlx.mlx_io_reader {
 
 const testing = std.testing;
 
-/// A safetensors image: 8-byte LE header length, the JSON header, the data.
+/// A safetensors file of U8 tensors (`sdk.testing.safetensors`).
 fn writeSafetensors(a: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, tensors: []const struct { name: []const u8, bytes: []const u8 }) !void {
-    var header: std.Io.Writer.Allocating = .init(a);
-    defer header.deinit();
-    try header.writer.writeAll("{");
-    var off: usize = 0;
-    for (tensors, 0..) |t, i| {
-        if (i > 0) try header.writer.writeAll(",");
-        try header.writer.print("\"{s}\":{{\"dtype\":\"U8\",\"shape\":[{d}],\"data_offsets\":[{d},{d}]}}", .{ t.name, t.bytes.len, off, off + t.bytes.len });
-        off += t.bytes.len;
+    const st = @import("testing.zig");
+    var shapes: [8][1]u64 = undefined;
+    var ts: [8]st.StTensor = undefined;
+    for (tensors, &shapes, ts[0..tensors.len]) |t, *shape, *x| {
+        shape.* = .{t.bytes.len};
+        x.* = .{ .name = t.name, .dtype = "U8", .shape = shape, .len = t.bytes.len, .bytes = t.bytes };
     }
-    try header.writer.writeAll("}");
-    var image: std.ArrayList(u8) = .empty;
-    defer image.deinit(a);
-    var len: [8]u8 = undefined;
-    std.mem.writeInt(u64, &len, header.written().len, .little);
-    try image.appendSlice(a, &len);
-    try image.appendSlice(a, header.written());
-    for (tensors) |t| try image.appendSlice(a, t.bytes);
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = image.items });
+    const image = try st.safetensors(a, ts[0..tensors.len], .{});
+    defer a.free(image);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = image });
 }
 
 /// A safetensors file's tensor spans, parsed through the reader's `read` / `seek` / `tell` as MLX does.
