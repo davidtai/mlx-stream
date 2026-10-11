@@ -2,13 +2,13 @@
 
 ## Unreleased
 
-- MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/mimo_v2/): its 12,032 routed experts stream from the SSD as
-  an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
+- MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
+  as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the
   pack's three MTP heads drive a draft lane (depth 1-3, typical or exact acceptance). The arch claims only a prepared
   pack (`model_type: mimo_v2_flash` plus the `expert_streaming` block), bills prompt rows and decode rows apart with
   the host side at its measured readings, and ships its Metal kernels pinned by six manifests
-  (src/mimo_v2/kernels/, `scripts/compile_mimo_kernels_offline.py`). See docs/mimo.md and docs/mimo-pack.md.
+  (src/arch/mimo_v2/kernels/, `scripts/compile_mimo_kernels_offline.py`). See docs/mimo.md and docs/mimo-pack.md.
 - MiMo-V2.6-Flash's settings live in the pack: the `settings` object of `config.json`'s `expert_streaming` block, read
   once at construction. An unknown key, a wrong type or an unknown value refuses the load by name. No environment
   variable or CLI flag selects a route; the host's per-model `ctx_size`, `kv_quant` and `mtp` stay the host's load
@@ -27,12 +27,13 @@
 - SDK: `LoadFacts.effective_context` (the context the load serves), `LoadFacts.kv_quant_bits` and
   `Shell.kv_quant_bits` (optional, null by default); `sdk.plugin_profile` follows the host's profile build option when
   the host declares one. DeepSeek-V4.1 reads none of them.
-- MiMo-V2.6-Flash lines of record in the README (MiMo-V2.6-Flash), fp8res pack, served binary, AUTO rows, draft lane
-  on. The previous stack (plugin `563c105`): greedy 16K cell 28.7 tok/s decode, 848.9 tok/s prefill, 19.30 s TTFT,
-  106.78 GB peak; card cell 28.7 tok/s decode, 873.0 tok/s prefill, 18.77 s TTFT, 107.52 GB peak. This tree's routes
-  (plugin `b485737`'s served binary): greedy 16K cells 30.2 / 30.4 tok/s decode, 862.5 / 866.0 tok/s prefill, 19.00 /
-  18.92 s TTFT, 107.41 GB peak at 135 / 152 rows; BF16-pack card cell (4,096 tokens) 25.8 tok/s decode, 838.7 tok/s
-  prefill.
+- MiMo-V2.6-Flash lines of record in the README (MiMo-V2.6-Flash): server sha256 `746e7da9` (host `2c041af6` + this
+  tree at `8e7d186`), fp8res pack, KV bf16, draft lane on, rows pinned per cell, card sampling (temperature 1.0, top_p
+  0.95, seed 1, thinking on, 16,384-token cap). The 16K card pair at 134 / 152 rows (on the predecessor `b00df80e`,
+  which installs the same routes up to 32,768 context): 996.4 / 1,003.2 tok/s prefill (mean 999.8), 28.40 / 28.10
+  tok/s decode (mean 28.25), 16.44 / 16.33 s TTFT, 107.81 GB peak. The card ladder from 1K to 1M-token prompts:
+  978.5 tok/s prefill and 30.7 tok/s decode at 16K (1,003.9 and 31.6 at 130 / 147 rows), 296.1 and 15.4 at 512K, 179.6 and 9.6 at 1M, peak 96.1-104.3 GB.
+  HumanEval pass@1: greedy 0.9451, card 0.9573 on `746e7da9` (identical counts and failing ids on `bb3c7245`).
 - The MiMo bill charges the one-eval predictor's router tiles on the default `prefill_predict_evals: one` (up to
   0.43 GB in the prompt phase at 16K; it was unbilled).
 

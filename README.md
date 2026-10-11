@@ -197,67 +197,90 @@ mlx-serve serve --model /abs/path/to/pack --ctx-size 17408 --no-vision --kv-quan
 ```
 
 `--ctx-size` (or the model's `ctx_size` in mlx-serve's model settings) is the context the bill covers; without one
-the arch bills 17,408 tokens (16,384 prompt + 1,024 generated). The model needs about 107 GB at 16K: the bill fills
-the expert rows up to the host's GPU ceiling less its wired margin. `experts.bin` must be a real file or a hard link.
+the arch bills 17,408 tokens (16,384 prompt + 1,024 generated). A 16K prompt peaks at 104-108 GB, by the rows the box
+admits: the bill fills the expert rows up to the host's GPU ceiling less its wired margin. `experts.bin` must be a real
+file or a hard link.
 
 **Settings.** Every route is a construction setting in the pack's `config.json` (`expert_streaming.settings`), read
 once at load and refused by name when wrong; there is no environment variable or flag. The defaults are the measured
 best routes; the settings table, with each default's exactness class against its control, is in
 [docs/mimo.md](docs/mimo.md#settings).
 
-**Measurements.** One Mac (M5 Max, 128 GB), each cell its own fresh server and one request: the served ReleaseFast
-binary, the fp8res pack, AUTO rows, the draft lane at its defaults, 1,024 generated tokens, the GPU ceiling at 112 GiB
-(`MLX_SERVE_GPU_CEILING_MB=114688`) and `--wired-margin-gib 2`. This tree: the served binary of plugin `b485737`
-(sha256 `6fd07f60`, the same routes and defaults as this tree; the bill here also charges the one-eval predictor's
-router tiles, which can admit one prompt row fewer), 2026-10-10 22:39-23:01Z, fans on the automatic curve, two greedy
-cells at 135 prompt / 152 decode rows and one BF16-pack card cell at 130 / 146. The previous stack: plugin `563c105`,
-server binary sha256 `87a03944`, 2026-10-10; it admitted 133 / 151 rows on the greedy cell and 135 / 152 on the card
-cell.
+**Measurements.** One Mac (M5 Max, 128 GB), 2026-10-11, no other model server loaded; each cell its own fresh server
+and one request: the served ReleaseFast binary, the fp8res pack, KV bf16, the draft lane at its defaults, rows pinned
+per cell, the GPU ceiling at 112 GiB (`MLX_SERVE_GPU_CEILING_MB=114688`) and `--wired-margin-gib 2`. The binary of
+record: server sha256 `746e7da9` = host mlx-serve `pr/mimo-host` at `2c041af6` + this tree at `8e7d186`. The 16K card
+pair ran on its predecessor (sha256 `b00df80e`, this tree at `d3a8555`), which differs only in the attention routes
+past 32,768 context: up to 32,768 context the two install the same routes and the same bill, and give the same
+outputs.
 
-Definitions: **greedy** = the 16,384-token standard prompt at temperature 0; **card** = the 16K card prompt at
-temperature 1.0, top_p 0.95, seed 1; **decode** = generated tokens / decode wall time, tok/s; **prefill** = prompt
-tokens / prompt wall time, tok/s; **TTFT** = request start to the first token, s; **peak** = the server's peak
-footprint over the request, GB (decimal).
+Definitions: **card** = temperature 1.0, top_p 0.95, seed 1, no top_k, thinking on, max_tokens 16,384; **served
+context** = the context the server is started with (`--ctx-size`): the prompt fixture's length plus the 16,384-token
+cap; **prompt rows / decode rows** = expert slot rows per routed layer; **prefill** = prompt tokens / prompt wall
+time, tok/s; **TTFT** = request start to the first token, s; **decode** = generated tokens / decode wall time, tok/s;
+**peak** = the server's peak footprint over the request, GB (decimal).
 
-Decode (tok/s):
+The 16K card pair (the standard 16K prompt, 16,382 tokens with thinking on; served context 32,768; rows 134 / 152):
 
-| cell | this tree | previous stack |
-|---|---|---|
-| greedy | 30.2, 30.4 | 28.7 |
-| card (fp8res, 1,024 tokens) | not measured | 28.7 |
-| card (bf16res, 4,096 tokens) | 25.8 | not measured |
+| cell | prefill (tok/s) | TTFT (s) | decode (tok/s) | peak (GB) | output tokens |
+|---|---|---|---|---|---|
+| 1 | 996.4 | 16.44 | 28.40 | 107.81 | 16,384 |
+| 2 | 1,003.2 | 16.33 | 28.10 | 107.81 | 16,384 |
+| mean | 999.8 | | 28.25 | | |
 
-Prefill (tok/s):
+The two cells' token ids are identical, and both loop from the same point to the 16,384-token cap (sampling at seed
+1; recorded). The draft lane: 3.59 tokens and 74.3 misses per round, 127 ms per round. A greedy pair on the same
+prompt and rows (thinking off, 16,384 tokens; temperature 0, 1,024-token cap) read 1,002.1 / 1,004.0 tok/s prefill;
+the model stops at 136 tokens, so its decode figure is ramp-dominated and is not quoted.
 
-| cell | this tree | previous stack |
-|---|---|---|
-| greedy | 862.5, 866.0 | 848.9 |
-| card (fp8res, 1,024 tokens) | not measured | 873.0 |
-| card (bf16res, 4,096 tokens) | 838.7 | not measured |
+The card ladder on the binary of record: one cold request per prompt length, each on its own server; rows pinned at
+the bill's fill for a 12.6 GB box baseline (one prompt row lower from 64K up); every output complete and stopped on
+EOS.
 
-TTFT (s):
+| prompt (tokens) | served context | prompt rows | decode rows | prefill (tok/s) | TTFT (s) | decode (tok/s) | peak (GB) | output tokens |
+|---|---|---|---|---|---|---|---|---|
+| 1,023 | 17,407 | 130 | 147 | 92.3 | 11.06 | 31.6 | 104.31 | 659 |
+| 2,048 | 18,432 | 129 | 146 | 178.3 | 11.48 | 33.1 | 103.71 | 683 |
+| 4,096 | 20,480 | 129 | 146 | 345.5 | 11.85 | 32.2 | 103.76 | 655 |
+| 8,192 | 24,576 | 129 | 146 | 654.4 | 12.52 | 30.9 | 103.85 | 664 |
+| 16,384 | 32,768 | 129 | 146 | 978.5 | 16.74 | 30.7 | 104.04 | 683 |
+| 16,384 | 32,768 | 130 | 147 | 1,003.9 | 16.32 | 31.6 | 104.66 | 688 |
+| 32,768 | 49,152 | 128 | 144 | 827.8 | 39.58 | 31.3 | 103.16 | 676 |
+| 65,536 | 81,920 | 125 | 142 | 743.9 | 88.10 | 29.1 | 102.66 | 624 |
+| 131,072 | 147,456 | 121 | 139 | 599.9 | 218.49 | 25.7 | 102.29 | 620 |
+| 262,144 | 278,528 | 114 | 133 | 439.9 | 595.91 | 21.3 | 101.54 | 651 |
+| 524,287 | 540,671 | 98 | 120 | 296.1 | 1,770.63 | 15.4 | 99.42 | 622 |
+| 1,032,192 | 1,048,576 | 67 | 96 | 179.6 | 5,747.16 | 9.6 | 96.08 | 639 |
 
-| cell | this tree | previous stack |
-|---|---|---|
-| greedy | 19.00, 18.92 | 19.30 |
-| card (fp8res, 1,024 tokens) | not measured | 18.77 |
-| card (bf16res, 4,096 tokens) | 19.53 | not measured |
+Prompt lengths are the fixtures', rendered for thinking off; thinking on drops their trailing `<think></think>`, so
+each request carries 2 tokens fewer. The 1K prefill figure is the cold first request: fixed startup dominates its
+11 s TTFT. The previous binary (`b00df80e`), which installed MLX's stock attention past 32,768 context, read
+753.5 / 24.4 at 32K, 661.8 / 21.1 at 64K, 488.0 / 15.8 at 128K and 311.3 / 9.6 at 256K (prefill / decode, tok/s);
+the attention kernels are now the defaults at every served context. The bf16res tier has not been measured on this
+build.
 
-Peak (GB):
+HumanEval (164 problems, one sample each, pass@1, cap 16,384 tokens, thinking on, rows 127 / 145): greedy 155 / 164
+= 0.9451, card 157 / 164 = 0.9573; every failure is a wrong answer (none truncated, looped, without code or errored).
+Scored on the shipping binary `746e7da9` (host `2c041af6` + this branch at `8e7d186`); the earlier run on
+`bb3c7245` (host `2c041af6` + plugin `d67567e`, this branch before its layout move) gave the same counts and the same
+failing problems.
 
-| cell | this tree | previous stack |
-|---|---|---|
-| greedy | 107.41, 107.41 | 106.78 |
-| card (fp8res, 1,024 tokens) | not measured | 107.52 |
-| card (bf16res, 4,096 tokens) | 107.61 | not measured |
+**Known limitations.**
 
-The previous stack passed the 8-fixture quality battery (1K to 32K prompts) 8/8 on both the serial and the default
-arms; this tree's battery completed four fixtures per arm (all four passed) before the window's memory guard stopped it
-on growth outside the server. Greedy token ids depend on the admitted rows: two cells at 134 / 151 rows in the same
-window stopped at 136 tokens with 97 misses per round; the cells above at 135 / 152 are token-identical to each other
-and to the control routes at the same prompt rows. Prefill swings about 6 % with the GPU's clock, which macOS clamps at about 1,470-1,560 MHz active and lower when
-hot: compare cells at matched clocks. The card cell samples with typical acceptance, which is lossy by design (see
-docs/mimo.md, The draft lane).
+- **Greedy ids depend on rows.** Tokens are reproducible only at fixed rows: two runs that admit different rows can
+  diverge within the first tokens. The fp8res and bf16res tiers also diverge (rounding-class).
+- **Greedy thinking-off answers are short.** On the 16K standard prompt the model stops at 136 tokens, so a greedy
+  cell there does not measure decode.
+- **The 16K card cells loop.** At 134 / 152 rows both card cells loop from the same point and run to the
+  16,384-token cap (recorded; sampling at seed 1).
+- **Typical acceptance is lossy** by design ([docs/mimo.md, The draft lane](docs/mimo.md#the-draft-lane)); set
+  `draft_tier: exact` for distribution-preserving sampling.
+- **GPU clock.** macOS holds the GPU at about 1,470-1,560 MHz active, lower when hot; prefill swings about 6 % with
+  it. Compare cells at matched clocks.
+- **Long-context geometry.** Above 128K context the decode attention's split count (32) and the NAX prompt
+  attention's pass cap (64) stay at the donor geometry: a performance limit, not a correctness one.
+- **Forced rows spend the guard margin.** Rows forced above the bill's fill load with an operator-pin log line and
+  spend the margin the box's live guard keeps.
 
 ## Versions
 
@@ -289,10 +312,12 @@ sdk/                       the arch contract's types (`sdk` module), the weight 
 src/root.zig               the arch the host calls (`arch`, `sdk`, `default_context`) and the tests' surface
 src/tests.zig              the test root (`zig build mlx-stream-test` in the host)
 src/conformance.zig        the conformance suite's root
+src/arch/deepseek_v41/     the DeepSeek-V4.1 arch, with its tests
 src/arch/deepseek_v41/host.zig  the harnesses' and bank tests' bridge (config parse, loaders, memory knobs), test-only
-src/*.zig                  the DeepSeek-V4.1 arch, the EXL3 quant and kernels, the expert stream
-src/arch/mimo_v2/               the MiMo-V2.6-Flash arch: settings, bill, forward, expert source, draft lane, tests
-src/arch/mimo_v2/kernels/       its pinned Metal kernel texts and their six manifests (embedded at compile time)
+src/arch/mimo_v2/          the MiMo-V2.6-Flash arch: settings, bill, forward, expert source, draft lane, tests
+src/arch/mimo_v2/kernels/  its pinned Metal kernel texts and their six manifests (embedded at compile time)
+src/exl3/                  the EXL3 quant, kernels, source and self-checks
+src/expert/                the expert stream: bank, stream, admission and lookahead, with their tests
 src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile,
                            the draft lanes' acceptance)
 src/kernels/exl3/          the pinned Metal kernel texts and their manifest (embedded at compile time)

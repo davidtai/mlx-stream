@@ -5,7 +5,7 @@
 > registry, the KV lanes and the profile probes described below live in this repo (`src/sdk_ext.zig`). The arch's
 > process claim (`claimProcess` / `releaseProcess`) replaces the `uses_expert_reader` capability, `/v1/models` and
 > `/props` name the arch only, and the profile options are one host switch, `-Dplugin-profile`. Paths of the form
-> `src/mlx_stream/X` are `src/X` here (docs/PATH_MAP.md).
+> `src/mlx_stream/X` map to their place here in docs/PATH_MAP.md.
 >
 > Since the plugin serves through `mlx_host`, the small SDK is this repo's own `sdk/` too, and mlx-serve has no plugin
 > registry: one host file (`src/arch/mlx_stream.zig`) calls the arch, the host pins this repo as a submodule in place

@@ -24,7 +24,7 @@ rewrite rules below still hold; the host-side rows of the tables are history.
 | `@import("../model.zig")` etc. in deepseek_v41_host.zig | the bridge's own config parse and loaders (no host import) |
 | inside src/sdk_ext: `@import("peek.zig")`, `@import("memory_bill.zig")`, `@import("quant_mode.zig")` | `@import("sdk")` |
 | `plugins.mlx_stream_testing` (host tests) | gone: the host has no registry |
-| `caps.uses_expert_reader` + `sdk.expert.takeReader/giveReader` in the host | `vt.claim_process` / `vt.release_process` (plugin: `claimProcess` / `releaseProcess` in deepseek_v41_plugin.zig) |
+| `caps.uses_expert_reader` + `sdk.expert.takeReader/giveReader` in the host | `vt.claim_process` / `vt.release_process` (plugin: `claimProcess` / `releaseProcess` in src/arch/deepseek_v41/plugin.zig) |
 
 ## Files
 
@@ -226,8 +226,8 @@ rewrite rules below still hold; the host-side rows of the tables are history.
 | coverage/sdk `src/plugins_refusals.zig` cases `expert_source_wrong_caps`, `quant_half_contract`, `quant_claims_mistyped`, `quant_check_direct`, `profile_hook_missing_probe` | `src/refusals.zig` + `refusal_cases` in build.zig (`zig build refusals`) |
 | coverage/sdk cases `arch_binds_unprovided`, `arch_binds_another`; registry tests of quant routing and binds | dropped: the small SDK has no binds and no quant / expert-source tables |
 | fork `src/qwen4_exp.zig` "dsv41 ngram table: a BF16 tensor inside a checkpoint shard ..." | `src/ngram_table.zig` |
-| coverage/expert-io 74c81fff..fbc12206 (src/mlx_stream/expert_*_test.zig, expert_stream.zig, lib/expert_io/*, src/sdk/expert/*) | the same names under src/, csrc/, src/sdk_ext/expert/ (one commit per original commit; the decode-plan fix sits beside the keepwarm lever's line) |
+| coverage/expert-io 74c81fff..fbc12206 (src/mlx_stream/expert_*_test.zig, expert_stream.zig, lib/expert_io/*, src/sdk/expert/*) | src/expert/ (the names without their `expert_` prefix), csrc/, src/sdk_ext/expert/ (one commit per original commit; the decode-plan fix sits beside the keepwarm lever's line) |
 | coverage/expert-io `src/io_util.zig` no-cache tests | host src/io_util.zig |
 | coverage/expert-io `src/gpu_ceiling.zig`, `src/nocache_reader.zig` tests | host only |
-| coverage/plugin-core ad3d0f93..f1da4b90 (src/mlx_stream/*, src/fixtures/dsv41_*, src/mlx_stream/deepseek_v41_bill_receipts_test.zig) | src/*, src/fixtures/*, src/arch/deepseek_v41/bill_receipts_test.zig |
-| coverage/plugin-core 9cca0993 (deepseek_v41_bill_mini_test.zig + bill / engram / module / deepseek_v41 hunks) | src/arch/deepseek_v41/bill_mini_test.zig and the same names under src/ |
+| coverage/plugin-core ad3d0f93..f1da4b90 (src/mlx_stream/*, src/fixtures/dsv41_*, src/mlx_stream/deepseek_v41_bill_receipts_test.zig) | the paths in the table above, src/fixtures/*, src/arch/deepseek_v41/bill_receipts_test.zig |
+| coverage/plugin-core 9cca0993 (deepseek_v41_bill_mini_test.zig + bill / engram / module / deepseek_v41 hunks) | src/arch/deepseek_v41/bill_mini_test.zig and bill.zig, engram.zig, module.zig, deepseek_v41.zig under src/arch/deepseek_v41/ |
