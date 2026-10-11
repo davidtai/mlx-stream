@@ -634,7 +634,7 @@ fn cycleRoute(t: usize) [3]u16 {
     return .{ @intCast(3 + (3 * t) % 13), @intCast(3 + (3 * t + 1) % 13), @intCast(3 + (3 * t + 2) % 13) };
 }
 
-test "expert policy tally: decode never evicts the pinned top of the rate; the other rows churn as the transition window plans them" {
+test "expert policy: tally: decode never evicts the pinned top of the rate; the other rows churn as the transition window plans them" {
     // 16 experts, 6 rows, ratio 0.2: 3 pins. A window long enough that 40 routes leave the pins where the file put them.
     const a = testing.allocator;
     var p = try LayerPolicy.init(a, 16, 6);
@@ -672,7 +672,7 @@ test "expert policy tally: decode never evicts the pinned top of the rate; the o
     for ([_]u16{ 0, 1, 2 }) |e| try testing.expectEqual(@as(?u32, null), q.slotOf(e));
 }
 
-test "expert policy tally: a pinned resident keeps its row where the transition window would give it to the miss" {
+test "expert policy: tally: a pinned resident keeps its row where the transition window would give it to the miss" {
     // One row (the transition test above): without the tally, [2] evicts 1 and [1] is then served transient.
     const a = testing.allocator;
     var p = try LayerPolicy.init(a, 8, 1);
@@ -692,7 +692,7 @@ test "expert policy tally: a pinned resident keeps its row where the transition 
     try testing.expectEqual(@as(u32, 0), out.n_loads);
 }
 
-test "expert policy tally: seeded, a prefill miss that is not pinned evicts nothing and is no seed; a pinned one evicts the coldest probationer" {
+test "expert policy: tally: seeded, a prefill miss that is not pinned evicts nothing and is no seed; a pinned one evicts the coldest probationer" {
     const a = testing.allocator;
     var p = try LayerPolicy.init(a, 16, 3);
     defer p.deinit(a);
@@ -721,7 +721,7 @@ test "expert policy tally: seeded, a prefill miss that is not pinned evicts noth
     try testing.expectEqualSlices(u16, &.{ 1, 3, 5 }, residentsOf(&p, &buf));
 }
 
-test "expert policy tally: ratio 0 plans exactly as no tally; a request's end gives each expert's share of the decode routes and seeds the pins" {
+test "expert policy: tally: ratio 0 plans exactly as no tally; a request's end gives each expert's share of the decode routes and seeds the pins" {
     const a = testing.allocator;
     var p = try LayerPolicy.init(a, 32, 5);
     defer p.deinit(a);
@@ -780,7 +780,7 @@ test "expert policy tally: ratio 0 plans exactly as no tally; a request's end gi
     try expectPins(&u, &.{ 1, 4 });
 }
 
-test "expert policy tally: the settings' defaults, their keys, and the values refused by name" {
+test "expert policy: tally: the settings' defaults, their keys, and the values refused by name" {
     const parse = struct {
         fn of(text: []const u8) !tally.Settings {
             var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -813,7 +813,7 @@ test "expert policy tally: the settings' defaults, their keys, and the values re
     try testing.expectApproxEqAbs(@as(f32, 0.0214), tally.alphaOf(32), 1e-4);
 }
 
-test "expert policy tally: the file round-trips its rates; a missing file, another geometry and a short file are not read" {
+test "expert policy: tally: the file round-trips its rates; a missing file, another geometry and a short file are not read" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
