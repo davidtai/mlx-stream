@@ -651,21 +651,36 @@ pub const Routes = struct {
 /// probe on do the stage evals run.
 pub const WaveProbe = struct {
     pub const Stage = enum { attn, moe, tail };
-    pub const Probed = struct { start: u64 = 0, attn: u64 = 0, moe: u64 = 0, tail: u64 = 0, cache: u64 = 0 };
+    /// One layer: MLX's active bytes, MLX's cache and the footprint at its start; per stage MLX's peak as a rise over
+    /// the start and the footprint's high-water over the stage; MLX's cache at the tail's end.
+    pub const Probed = struct { start: u64 = 0, attn: u64 = 0, moe: u64 = 0, tail: u64 = 0, cache: u64 = 0, cache_start: u64 = 0, footprint: u64 = 0, fp: [3]u64 = @splat(0) };
     layers: [glm.max_layers]Probed = @splat(.{}),
     n: u32 = 0,
     rows: u32 = 0,
     positions: u32 = 0,
+    /// The pass's high-water marks so far: MLX's peak and the footprint's (each restarts at every mark).
     peak: u64 = 0,
+    footprint_peak: u64 = 0,
 
-    fn counters() struct { active: u64, peak: u64, cache: u64 } {
+    const Counters = struct { active: u64, peak: u64, cache: u64, footprint: u64, footprint_peak: u64 };
+
+    fn counters() Counters {
         var active: usize = 0;
         var peak: usize = 0;
         var cache: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
         _ = mlx.mlx_get_peak_memory(&peak);
         _ = mlx.mlx_get_cache_memory(&cache);
-        return .{ .active = active, .peak = @max(peak, active), .cache = cache };
+        const pm = sdk.memory.processMemory();
+        return .{ .active = active, .peak = @max(peak, active), .cache = cache, .footprint = pm.footprint, .footprint_peak = @max(pm.footprint_interval_peak, pm.footprint) };
+    }
+
+    /// The marks so far into the pass's, both restarted.
+    fn restart(p: *WaveProbe, c: Counters) void {
+        p.peak = @max(p.peak, c.peak);
+        p.footprint_peak = @max(p.footprint_peak, c.footprint_peak);
+        _ = mlx.mlx_reset_peak_memory();
+        sdk.memory.startFootprintInterval();
     }
 
     /// A prompt call of `rows` rows ending at `positions`: the probe's layers start over.
@@ -677,18 +692,17 @@ pub const WaveProbe = struct {
 
     fn begin(p: *WaveProbe, l: u32) void {
         const c = counters();
-        p.peak = @max(p.peak, c.peak);
-        _ = mlx.mlx_reset_peak_memory();
-        p.layers[l] = .{ .start = c.active };
+        p.restart(c);
+        p.layers[l] = .{ .start = c.active, .cache_start = c.cache, .footprint = c.footprint };
         p.n = @max(p.n, l + 1);
     }
 
     fn mark(p: *WaveProbe, l: u32, s: Stage) void {
         const c = counters();
-        p.peak = @max(p.peak, c.peak);
-        _ = mlx.mlx_reset_peak_memory();
+        p.restart(c);
         const x = &p.layers[l];
         const rise = c.peak -| x.start;
+        x.fp[@intFromEnum(s)] = c.footprint_peak;
         switch (s) {
             .attn => x.attn = rise,
             .moe => x.moe = rise,
@@ -699,15 +713,21 @@ pub const WaveProbe = struct {
         }
     }
 
-    /// The pass's highest MLX peak, the current stage's included.
-    pub fn passPeak(p: *const WaveProbe) u64 {
-        return @max(p.peak, counters().peak);
+    /// The pass's high-water marks: MLX's peak and the footprint's.
+    pub const Peaks = struct { mlx: u64, footprint: u64 };
+
+    /// The pass's high-water marks, the current stage's included.
+    pub fn passPeaks(p: *const WaveProbe) Peaks {
+        const c = counters();
+        return .{ .mlx = @max(p.peak, c.peak), .footprint = @max(p.footprint_peak, c.footprint_peak) };
     }
 
-    /// One JSON line's payload: the call's rows and positions and each layer's stages (bytes).
+    /// One JSON line's payload: the call's rows and positions and each layer's readings (bytes): MLX's start, its rises
+    /// at the attention, the routed call and the tail, its cache at the tail's end and at the start, the footprint at
+    /// the start and its high-water over each stage.
     pub fn format(p: WaveProbe, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("{{\"rows\":{d},\"positions\":{d},\"peak\":{d},\"layers\":[", .{ p.rows, p.positions, p.peak });
-        for (p.layers[0..p.n], 0..) |x, l| try w.print("{s}[{d},{d},{d},{d},{d}]", .{ if (l == 0) "" else ",", x.start, x.attn, x.moe, x.tail, x.cache });
+        try w.print("{{\"rows\":{d},\"positions\":{d},\"peak\":{d},\"footprint_peak\":{d},\"layers\":[", .{ p.rows, p.positions, p.peak, p.footprint_peak });
+        for (p.layers[0..p.n], 0..) |x, l| try w.print("{s}[{d},{d},{d},{d},{d},{d},{d},{d},{d},{d}]", .{ if (l == 0) "" else ",", x.start, x.attn, x.moe, x.tail, x.cache, x.cache_start, x.footprint, x.fp[0], x.fp[1], x.fp[2] });
         try w.writeAll("]}");
     }
 };
@@ -843,13 +863,14 @@ const TestWeights = struct {
 test "glm wave probe: a layer's stages are its rises over the layer's start; the line carries every layer" {
     var p: WaveProbe = .{};
     p.call(16387, 16387);
-    p.layers[0] = .{ .start = 197_000_000_000, .attn = 4_000_000_000, .moe = 9_000_000_000, .tail = 6_000_000_000, .cache = 17_000_000_000 };
+    p.layers[0] = .{ .start = 197_000_000_000, .attn = 4_000_000_000, .moe = 9_000_000_000, .tail = 6_000_000_000, .cache = 17_000_000_000, .cache_start = 17_100_000_000, .footprint = 214_800_000_000, .fp = .{ 218_000_000_000, 221_000_000_000, 219_000_000_000 } };
     p.layers[1] = .{ .start = 198_000_000_000, .attn = 3_000_000_000 };
     p.n = 2;
     p.peak = 207_000_000_000;
+    p.footprint_peak = 221_000_000_000;
     const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{p});
     defer testing.allocator.free(s);
-    try testing.expectEqualStrings("{\"rows\":16387,\"positions\":16387,\"peak\":207000000000,\"layers\":[[197000000000,4000000000,9000000000,6000000000,17000000000],[198000000000,3000000000,0,0,0]]}", s);
+    try testing.expectEqualStrings("{\"rows\":16387,\"positions\":16387,\"peak\":207000000000,\"footprint_peak\":221000000000,\"layers\":[[197000000000,4000000000,9000000000,6000000000,17000000000,17100000000,214800000000,218000000000,221000000000,219000000000],[198000000000,3000000000,0,0,0,0,0,0,0,0]]}", s);
     // A new call starts the layers over.
     p.call(2048, 18435);
     try testing.expectEqual(@as(u32, 0), p.n);
