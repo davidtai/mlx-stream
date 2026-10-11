@@ -233,6 +233,8 @@ The two cells' token ids are identical, and both loop from the same point to the
 prompt and rows (thinking off, 16,384 tokens; temperature 0, 1,024-token cap) read 1,002.1 / 1,004.0 tok/s prefill;
 the model stops at 136 tokens, so its decode figure is ramp-dominated and is not quoted.
 
+![Prefill and decode tok/s of the served 16K cells: three card cells and a greedy pair, by answer length and expert rows](docs/img/mimo-16k-cells.png)
+
 The card ladder on the binary of record: one cold request per prompt length, each on its own server; rows pinned at
 the bill's fill for a 12.6 GB box baseline (one prompt row lower from 64K up); every output complete and stopped on
 EOS.
@@ -258,6 +260,8 @@ each request carries 2 tokens fewer. The 1K prefill figure is the cold first req
 753.5 / 24.4 at 32K, 661.8 / 21.1 at 64K, 488.0 / 15.8 at 128K and 311.3 / 9.6 at 256K (prefill / decode, tok/s);
 the attention kernels are now the defaults at every served context. The bf16res tier has not been measured on this
 build.
+
+![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on the shipping binary, with the previous binary from 32K to 256K](docs/img/mimo-ladder.png)
 
 HumanEval (164 problems, one sample each, pass@1, cap 16,384 tokens, thinking on, rows 127 / 145): greedy 155 / 164
 = 0.9451, card 157 / 164 = 0.9573; every failure is a wrong answer (none truncated, looped, without code or errored).

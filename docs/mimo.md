@@ -212,6 +212,26 @@ The prompt runs whole, in calls of up to 16,384 rows. Per routed layer:
 
   Every schedule reads the same records into the same rows before any kernel reads them: exact.
 
+## Measurements in charts
+
+`python3 scripts/mimo_charts.py` draws these from the cells behind the README's measured lines (MiMo-V2.6-Flash).
+
+![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on the shipping binary, with the previous binary from 32K to 256K](img/mimo-ladder.png)
+
+The card ladder on the shipping binary `746e7da9`; the previous binary `b00df80e` ran MLX's stock attention past 32,768 context.
+
+![Prefill and decode tok/s of the served 16K cells: three card cells and a greedy pair, by answer length and expert rows](img/mimo-16k-cells.png)
+
+The served 16K cells by answer length and rows; the greedy pair's 136-token answer makes its decode figure ramp-dominated.
+
+![HumanEval pass@1 for greedy and card sampling, and the failed problems by class](img/mimo-humaneval.png)
+
+HumanEval on the shipping binary, greedy and card: every failed problem is a wrong answer.
+
+![Share of routes a layer's busiest half of experts covers within and across contexts, and the decode hit rate of the dynamic policy against a static top-124 set](img/mimo-routing.png)
+
+Expert routing on the standard 16K prompt: the busiest half moves with the context, so a dynamic cache beats a static hot set.
+
 ## Settings
 
 Settings live in the pack's `config.json`, in the `settings` object of its `expert_streaming` block:
