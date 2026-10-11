@@ -421,7 +421,7 @@ static void spec_delay(void) {   /* per chunk: uniform in [max / 2, max) */
     if (d > 0) sleep_ns(d);
 }
 
-static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
+static ssize_t do_preadv_raw(int fd, const struct iovec *iov, int n, off_t off) {
     int64_t code = 0, arg = 0;
     pthread_mutex_lock(&mu);
     for (int i = 0; i < nrules; i++) {
@@ -447,7 +447,7 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
 #define SPEC_MAY_START(s) (spec_hold != 0 || (s)->state != SP_QUEUED)
 #define SPEC_STARTED() do { if (spec_hold > 0) spec_hold -= 1; } while (0)
 #else
-static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
+static ssize_t do_preadv_raw(int fd, const struct iovec *iov, int n, off_t off) {
     ssize_t r;
     do { r = preadv(fd, iov, n, off); } while (r < 0 && errno == EINTR);
     return r;
@@ -458,6 +458,68 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
 #define SPEC_HOLD(s) ((void)0)
 #define SPEC_MAY_START(s) 1
 #define SPEC_STARTED() ((void)0)
+#endif
+
+#if defined(Q3LD_EVSIG)
+/* DIAGNOSTIC (not for merge): every preadv's in-flight count and bytes, their exact time integrals (busy ns: time
+ * with >= 1 in flight; depth ns: the count integrated over time), and a sampler thread that logs them every period. */
+static pthread_mutex_t rd_mu = PTHREAD_MUTEX_INITIALIZER;
+static int64_t rd_n = 0, rd_bytes = 0, rd_last = 0, rd_busy = 0, rd_depth = 0, rd_done = 0, rd_calls = 0;
+static int64_t *rd_buf = 0, rd_cap = 0, rd_cnt = 0, rd_period = 1000000;
+static volatile int rd_run = 0;
+static pthread_t rd_thread;
+
+static void rd_acc(int64_t dn, int64_t db, int64_t done) {
+    pthread_mutex_lock(&rd_mu);
+    int64_t t = q3ld_monotonic_ns();
+    if (rd_last) { int64_t dt = t - rd_last; if (rd_n > 0) rd_busy += dt; rd_depth += rd_n * dt; }
+    rd_last = t; rd_n += dn; rd_bytes += db; rd_done += done; rd_calls += dn > 0;
+    pthread_mutex_unlock(&rd_mu);
+}
+
+static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
+    int64_t len = 0;
+    for (int i = 0; i < n; i++) len += (int64_t)iov[i].iov_len;
+    rd_acc(1, len, 0);
+    ssize_t r = do_preadv_raw(fd, iov, n, off);
+    rd_acc(-1, -len, r > 0 ? (int64_t)r : 0);
+    return r;
+}
+
+static void *rd_main(void *arg) {
+    (void)arg;
+    while (rd_run) {
+        pthread_mutex_lock(&rd_mu);
+        int64_t t = q3ld_monotonic_ns(), dt = rd_last ? t - rd_last : 0;
+        if (rd_cnt < rd_cap) {
+            int64_t *e = rd_buf + 7 * rd_cnt++;
+            e[0] = t; e[1] = rd_n; e[2] = rd_bytes; e[3] = rd_busy + (rd_n > 0 ? dt : 0); e[4] = rd_depth + rd_n * dt;
+            e[5] = rd_done; e[6] = rd_calls;
+        }
+        pthread_mutex_unlock(&rd_mu);
+        struct timespec ts = { 0, (long)rd_period };
+        nanosleep(&ts, 0);
+    }
+    return 0;
+}
+
+/* int64[7 * cap] rows (time, in flight, bytes in flight, busy ns, depth ns, bytes returned, calls), all cumulative
+ * from the process start; buf != 0 starts the sampler (period_ns), buf = 0 with cap < 0 stops it. Returns the rows. */
+int64_t q3ld_test_rd_sampler(int64_t *buf, int64_t cap, int64_t period_ns) {
+    if (buf && !rd_run) {
+        rd_buf = buf; rd_cap = cap; rd_cnt = 0; rd_period = period_ns > 0 ? period_ns : 1000000; rd_run = 1;
+        if (pthread_create(&rd_thread, 0, rd_main, 0) != 0) rd_run = 0;
+    } else if (!buf && cap < 0 && rd_run) {
+        rd_run = 0;
+        pthread_join(rd_thread, 0);
+    }
+    pthread_mutex_lock(&rd_mu);
+    int64_t n = rd_cnt;
+    pthread_mutex_unlock(&rd_mu);
+    return n;
+}
+#else
+#define do_preadv do_preadv_raw
 #endif
 
 #define LATE(deadline) ((deadline) >= 0 && q3ld_monotonic_ns() >= (deadline))

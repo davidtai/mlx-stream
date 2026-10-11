@@ -25,6 +25,26 @@ typedef struct {
   uint64_t queue;  /* 1: the queue of the buffer the install saw (MLX's stream), 0: another queue */
 } Dsv41tlRow;
 
+/* DIAGNOSTIC (not for merge): one GPU wait on the read pool's event (mlx_event_shim.cpp's WaitEvent). Before the
+ * encodeWait the buffer signals a probe event (value 2i+1), after it again (2i+2); a listener on a dedicated queue
+ * stamps the host time each value is reached: t_reach = the GPU finished the work encoded before the wait,
+ * t_clear = the wait cleared. */
+typedef struct {
+  uint64_t gate;     /* the pool event value waited for */
+  uint64_t t_encode; /* host time of the encode */
+  uint64_t t_reach;
+  uint64_t t_clear;
+  uint64_t tag;
+  uint64_t cmdbuf;   /* the buffer's address (pairs with the row whose commit follows) */
+} Dsv41tlWait;
+
+/* Arms the probe log (rows[0..cap) from index 0); cap 0 disarms. */
+void dsv41tl_waits_arm(Dsv41tlWait *rows, uint32_t cap);
+/* mlx_event_shim's probe: phase 0 before the encodeWait, 1 after. Records only while the tag is set. */
+void dsv41tl_wait_probe(void *cmdbuf, int phase, uint64_t value);
+/* waits encoded (incl. dropped), probe notifications received. */
+void dsv41tl_waits_counts(uint32_t out[2]);
+
 /* MLX's current command buffer on stream s (an id<MTLCommandBuffer>), NULL when the stream has no Metal encoder. */
 void *dsv41tl_mlx_buffer(mlx_stream s);
 /* Hooks -commit on every class of cmdbuf's chain that implements it, and records every tagged commit into

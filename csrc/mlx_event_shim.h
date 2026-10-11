@@ -37,6 +37,9 @@ int dsv41ev_wait(const mlx_array *xs, size_t n, int32_t event, uint64_t value, c
 /* outs alias xs; the GPU hands `value` to a metal event after every pass encoded before it (probes). Metal or null
  * events only. 0 or -1. */
 int dsv41ev_signal(const mlx_array *xs, size_t n, int32_t event, uint64_t value, mlx_stream s, mlx_array *outs);
+/* DIAGNOSTIC (not for merge): fn(cmdbuf, 0, value) before and fn(cmdbuf, 1, value) after each GPU wait's
+ * encodeWait (the open compute pass ended); NULL turns it off. */
+void dsv41ev_set_wait_probe(void (*fn)(void* cmdbuf, int phase, uint64_t value));
 /* The event's current value (0 for a null event or an unknown id). */
 uint64_t dsv41ev_value(int32_t event);
 /* gpu waits encoded, gpu signals encoded, host waits already satisfied, host waits that blocked, host wait

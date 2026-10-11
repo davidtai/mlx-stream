@@ -45,6 +45,8 @@ std::vector<EventRec*> g_events;  // id - 1 -> record
 std::atomic<int64_t> g_gpu_waits{0}, g_gpu_signals{0}, g_host_ready{0}, g_host_blocked{0}, g_host_timeouts{0},
     g_host_wait_ns{0}, g_cpu_passthrough{0};
 thread_local std::string g_error;
+// DIAGNOSTIC (not for merge): dsv41ev_set_wait_probe's function, called around each GPU wait's encodeWait.
+std::atomic<void (*)(void*, int, uint64_t)> g_wait_probe{nullptr};
 
 int32_t add(EventRec* rec) {
   std::lock_guard<std::mutex> lk(g_mu);
@@ -102,7 +104,11 @@ class WaitEvent : public mx::Primitive {
     if (ev_->kind != KIND_METAL) return;
     auto& enc = mx::metal::get_command_encoder(stream());
     enc.end_encoding();
+    // DIAGNOSTIC (not for merge): a profile build's wait probe signals its own event before and after the wait.
+    auto probe = g_wait_probe.load(std::memory_order_acquire);
+    if (probe) probe(enc.get_command_buffer(), 0, value_);
     enc.get_command_buffer()->encodeWait(ev_->mtl, value_);
+    if (probe) probe(enc.get_command_buffer(), 1, value_);
     enc.barrier();
     if (track_inputs_) {
       for (int i = 0; i < n_gated_; i++) enc.set_input_array(inputs[i], 0);
@@ -259,6 +265,10 @@ int dsv41ev_signal(const mlx_array* xs, size_t n, int32_t event, uint64_t value,
   } catch (...) {
     return fail("dsv41ev_signal failed");
   }
+}
+
+void dsv41ev_set_wait_probe(void (*fn)(void* cmdbuf, int phase, uint64_t value)) {
+  g_wait_probe.store(fn, std::memory_order_release);
 }
 
 uint64_t dsv41ev_value(int32_t event) {

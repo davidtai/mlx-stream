@@ -729,6 +729,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         pub fn requestEnd(self: *Self) void {
             if (comptime timeline.enabled) if (timeline.active) {
                 const pending = timeline.settle(self.g.s, 2000);
+                // DIAGNOSTIC (not for merge): the raw stores, in the run's HOME (tl_split.py).
+                if (std.c.getenv("HOME")) |home| {
+                    var pb: [1024]u8 = undefined;
+                    if (std.fmt.bufPrintSentinel(&pb, "{s}/tl-raw.bin", .{std.mem.span(home)}, 0)) |path| timeline.dumpRaw(path.ptr) else |_| {}
+                }
                 timeline.uninstall();
                 var tb: [16384]u8 = undefined;
                 log.info("glm_moe_dsa: {s}\n", .{timeline.line(&tb, pending)});

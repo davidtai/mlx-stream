@@ -108,6 +108,8 @@ void q3ld_test_spec_hold(int32_t starts);
 int32_t q3ld_test_spec_held(int32_t n, int64_t timeout_ns);
 int64_t q3ld_test_events(int64_t *buf, int64_t cap);
 int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap);
+/* DIAGNOSTIC (not for merge, -DQ3LD_EVSIG): the preadv in-flight sampler (q3_lookahead4_exl3.c). */
+int64_t q3ld_test_rd_sampler(int64_t *buf, int64_t cap, int64_t period_ns);
 #endif
 
 #ifdef __cplusplus

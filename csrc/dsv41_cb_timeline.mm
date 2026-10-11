@@ -195,6 +195,73 @@ size_t dsv41tl_hooked_names(char *out, size_t cap) {
   return n;
 }
 
+// ── DIAGNOSTIC (not for merge): the GPU waits' probe (see Dsv41tlWait) ──
+static id<MTLSharedEvent> g_probe = nil;
+static MTLSharedEventListener *g_listener = nil;
+static Dsv41tlWait *g_waits = NULL;
+static uint32_t g_wcap = 0;
+static std::atomic<uint32_t> g_wn{0};
+static std::atomic<uint32_t> g_wnotes{0};
+static uint64_t g_pv = 0;          /* the probe event's last encoded value (the inference thread only) */
+static uint32_t g_wcur = UINT32_MAX;
+
+void dsv41tl_waits_arm(Dsv41tlWait *rows, uint32_t cap) {
+  g_waits = rows;
+  g_wcap = cap;
+  g_wn.store(0);
+  g_wnotes.store(0);
+  g_wcur = UINT32_MAX;
+}
+
+void dsv41tl_waits_counts(uint32_t out[2]) {
+  out[0] = g_wn.load();
+  out[1] = g_wnotes.load(std::memory_order_acquire);
+}
+
+void dsv41tl_wait_probe(void *cmdbuf, int phase, uint64_t value) {
+  if (g_waits == NULL || cmdbuf == NULL) return;
+  id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)cmdbuf;
+  if (phase == 0) {
+    g_wcur = UINT32_MAX;
+    uint64_t tag = g_tag.load(std::memory_order_relaxed);
+    if (tag == 0) return;
+    if (g_probe == nil) {
+      g_probe = [[cb device] newSharedEvent];
+      dispatch_queue_attr_t at = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+      g_listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:dispatch_queue_create("dsv41tl.probe", at)];
+      g_pv = [g_probe signaledValue];
+    }
+    uint32_t i = g_wn.fetch_add(1);
+    if (i >= g_wcap) return;
+    Dsv41tlWait *w = &g_waits[i];
+    w->gate = value;
+    w->tag = tag;
+    w->cmdbuf = (uint64_t)(uintptr_t)cmdbuf;
+    w->t_reach = 0;
+    w->t_clear = 0;
+    w->t_encode = dsv41tl_now();
+    g_wcur = i;
+    uint64_t v = ++g_pv;
+    [cb encodeSignalEvent:g_probe value:v];
+    [g_probe notifyListener:g_listener atValue:v block:^(id<MTLSharedEvent> e_, uint64_t v_) {
+      (void)e_; (void)v_;
+      w->t_reach = dsv41tl_now();
+      g_wnotes.fetch_add(1, std::memory_order_release);
+    }];
+  } else {
+    if (g_wcur == UINT32_MAX) return;
+    Dsv41tlWait *w = &g_waits[g_wcur];
+    g_wcur = UINT32_MAX;
+    uint64_t v = ++g_pv;
+    [cb encodeSignalEvent:g_probe value:v];
+    [g_probe notifyListener:g_listener atValue:v block:^(id<MTLSharedEvent> e_, uint64_t v_) {
+      (void)e_; (void)v_;
+      w->t_clear = dsv41tl_now();
+      g_wnotes.fetch_add(1, std::memory_order_release);
+    }];
+  }
+}
+
 // ── the host self-test: a fake buffer hierarchy (no Metal object) ──
 // FakeBase implements -commit (counts), -commandQueue, -addCompletedHandler: (runs the block now), GPUStartTime 1 s,
 // GPUEndTime 2 s, status 4; FakeSub overrides -commit (counts, then [super commit]); FakeSib inherits FakeBase's;

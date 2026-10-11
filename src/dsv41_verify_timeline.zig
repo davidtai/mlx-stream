@@ -15,9 +15,16 @@ pub var active: bool = false;
 
 /// Cycles <= max_tokens - 1 (the cell's default cap: 1,024 ids).
 pub const max_cycles = 1024;
-pub const max_layers = @import("deepseek_v41.zig").max_layers;
+/// DIAGNOSTIC (not for merge): 80, so GLM-5.3's 75 routed layers are all stamped (DeepSeek-V4.1 has 64).
+pub const max_layers = 80;
 /// Buffers past this are counted (`dropped`), not recorded.
-pub const max_buffers = 1 << 18;
+pub const max_buffers = 1 << 19;
+/// DIAGNOSTIC (not for merge): the GPU waits' probe rows (`dsv41tl_wait_probe`) and the read pool's 1 ms in-flight
+/// samples (`q3ld_test_rd_sampler`); the raw dump (`dumpRaw`) is all the summary they get (tl_split.py reads it).
+pub const max_waits = 1 << 18;
+pub const max_samples = 1 << 18;
+pub const Wait = extern struct { gate: u64 = 0, t_encode: u64 = 0, t_reach: u64 = 0, t_clear: u64 = 0, tag: u64 = 0, cmdbuf: u64 = 0 };
+pub const Sample = [7]i64;
 
 /// One committed command buffer (the shim's `Dsv41tlRow`). Times: mach_absolute_time ns.
 /// `queue`: 1 for the queue of the buffer the install saw (MLX's stream), 0 for another queue.
@@ -45,6 +52,10 @@ var rows: [max_buffers]Row = undefined;
 var layers: [max_cycles][max_layers]Layer = undefined;
 var verifies: [max_cycles]Verify = undefined;
 var signals: [max_signals]Signal = undefined;
+var waits: [max_waits]Wait = undefined;
+var samples: [max_samples]Sample = undefined;
+var n_samples: usize = 0;
+var cycle_t: [max_cycles]u64 = undefined;
 var n_signals: usize = 0;
 /// Cycles begun (`cycleBegin`), and the one in progress.
 pub var cycles: u32 = 0;
@@ -65,6 +76,11 @@ const c = if (enabled) struct {
     pub extern fn dsv41tl_hooked_names(out: [*]u8, cap: usize) usize;
     pub extern fn dsv41tl_selftest(rows: [*]Row, cap: u32) c_int;
     pub extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
+    pub extern fn q3ld_test_rd_sampler(buf: ?[*]i64, cap: i64, period_ns: i64) i64;
+    pub extern fn dsv41tl_waits_arm(rows: ?[*]Wait, cap: u32) void;
+    pub extern fn dsv41tl_wait_probe(cmdbuf: ?*anyopaque, phase: c_int, value: u64) callconv(.c) void;
+    pub extern fn dsv41tl_waits_counts(out: *[2]u32) void;
+    pub extern fn dsv41ev_set_wait_probe(f: ?*const fn (?*anyopaque, c_int, u64) callconv(.c) void) void;
 } else struct {};
 // The guards below (`@hasDecl(c, ...)`) see only pub declarations: a profile build must reach every shim call.
 comptime {
@@ -87,6 +103,10 @@ pub fn install(s: mlx.mlx_stream, max_tokens: u32, layer_count: u32) !void {
     if (rc != 0) return error.TimelineNoCommandBuffer;
     stream = s;
     _ = c.q3ld_test_ev_log(@ptrCast(&signals), max_signals);
+    c.dsv41tl_waits_arm(&waits, max_waits);
+    c.dsv41ev_set_wait_probe(&c.dsv41tl_wait_probe);
+    n_samples = 0;
+    _ = c.q3ld_test_rd_sampler(@ptrCast(&samples), max_samples, std.time.ns_per_ms);
     arm(layer_count);
 }
 
@@ -132,6 +152,7 @@ pub fn cycleBegin() void {
     cycles += 1;
     verifies[cur] = .{};
     layers[cur] = @splat(.{});
+    cycle_t[cur] = now();
     if (comptime @hasDecl(c, "dsv41tl_rehook")) if (stream) |s| {
         _ = c.dsv41tl_rehook(c.dsv41tl_mlx_buffer(s));
     };
@@ -214,6 +235,11 @@ pub fn uninstall() void {
     if (comptime !enabled) return;
     disarm();
     if (comptime @hasDecl(c, "q3ld_test_ev_log")) _ = c.q3ld_test_ev_log(null, -1);
+    if (comptime @hasDecl(c, "dsv41ev_set_wait_probe")) {
+        c.dsv41ev_set_wait_probe(null);
+        c.dsv41tl_waits_arm(null, 0);
+        _ = c.q3ld_test_rd_sampler(null, -1, 0);
+    }
     active = false;
 }
 
@@ -231,11 +257,15 @@ pub fn settle(s: mlx.mlx_stream, timeout_ms: u64) u32 {
     disarm();
     _ = mlx.mlx_synchronize(s);
     n_signals = @intCast(@min(c.q3ld_test_ev_log(null, 0), max_signals));
+    n_samples = @intCast(@min(c.q3ld_test_rd_sampler(null, -1, 0), max_samples));
     const start = now();
     while (true) {
         const k = counts();
         const want = @min(k[0], max_buffers);
-        if (k[1] >= want) return 0;
+        var wk: [2]u32 = .{ 0, 0 };
+        c.dsv41tl_waits_counts(&wk);
+        const wwant = 2 * @min(wk[0], max_waits);
+        if (k[1] >= want and wk[1] >= wwant) return 0;
         if (now() - start > timeout_ms * std.time.ns_per_ms) return want - k[1];
         std.Thread.yield() catch {};
     }
@@ -525,6 +555,45 @@ fn writeLine(w: *std.Io.Writer, rs: []const Row, vs: []const Verify, ls: []const
         try w.writeAll("]");
     }
     try w.writeAll("}");
+}
+
+/// DIAGNOSTIC (not for merge): the raw stores in one file (after `settle`): a header of u64 counts (magic, rows,
+/// cycles, layers, signals, waits, samples, t0), then the rows (7 u64 each), per cycle its begin and the verify's
+/// begin and end (3 u64), per cycle and layer the stamps (t[5], read_call, read_end, missed, gate_gu, gate_down: 10
+/// u64), the signals (4 i64), the waits (6 u64), the samples (7 i64). Little-endian.
+pub fn dumpRaw(path: [*:0]const u8) void {
+    if (comptime !enabled) return;
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    const W = struct {
+        fn all(h: std.c.fd_t, bytes: []const u8) void {
+            var off: usize = 0;
+            while (off < bytes.len) {
+                const r = std.c.write(h, bytes[off..].ptr, @min(bytes.len - off, 1 << 30));
+                if (r <= 0) return;
+                off += @intCast(r);
+            }
+        }
+    };
+    const rs = rows[0..@min(counts()[0], max_buffers)];
+    var wk: [2]u32 = .{ 0, 0 };
+    c.dsv41tl_waits_counts(&wk);
+    const nw: usize = @min(wk[0], max_waits);
+    const hdr = [_]u64{ 0x544c53504c495431, rs.len, cycles, n_layers, n_signals, nw, n_samples, t0 };
+    W.all(fd, std.mem.asBytes(&hdr));
+    W.all(fd, std.mem.sliceAsBytes(rs));
+    for (0..cycles) |ci| {
+        const v = [_]u64{ cycle_t[ci], verifies[ci].begin, verifies[ci].end };
+        W.all(fd, std.mem.asBytes(&v));
+    }
+    for (0..cycles) |ci| for (layers[ci][0..n_layers]) |l| {
+        const v = [_]u64{ l.t[0], l.t[1], l.t[2], l.t[3], l.t[4], l.read_call, l.read_end, @intFromBool(l.missed), l.gate_gu, l.gate_down };
+        W.all(fd, std.mem.asBytes(&v));
+    };
+    W.all(fd, std.mem.sliceAsBytes(signals[0..n_signals]));
+    W.all(fd, std.mem.sliceAsBytes(waits[0..nw]));
+    W.all(fd, std.mem.sliceAsBytes(samples[0..n_samples]));
 }
 
 /// The receipt's `verify_gpu_timeline`: every recorded buffer, every verify's stamps and the pool's signals, in us from
