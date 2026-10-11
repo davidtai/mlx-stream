@@ -358,6 +358,34 @@ fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T,
     }
 }
 
+/// DIAG, not for merge: with GLM53_DSA_DUMP=<dir> and GLM53_DSA_DUMP_LAYERS=<l,l,...>, each prompt span's selection
+/// of those layers to <dir>/l<layer>-p<first position>-r<rows>-w<slots>.i32 (int32 [rows, slots], row-major); a span
+/// that passes every causal key (no top-k) as w0 with no data.
+fn dumpSpans(g: *G, carry: *const Carry, start: u32, l: u32) !void {
+    const dir = std.c.getenv("GLM53_DSA_DUMP") orelse return;
+    const want = std.c.getenv("GLM53_DSA_DUMP_LAYERS") orelse return;
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(want), ',');
+    var hit = false;
+    while (it.next()) |tok| hit = hit or (std.fmt.parseInt(u32, tok, 10) catch continue) == l;
+    if (!hit) return;
+    for (0..carry.nBlocks()) |i| {
+        const t = carry.topk[i];
+        const w: u32 = if (t) |x| @intCast(g.shapeOf(x).dim(2)) else 0;
+        var buf: [512]u8 = undefined;
+        const path = try std.mem.printSentinel(&buf, "{s}/l{d}-p{d}-r{d}-w{d}.i32", .{ std.mem.span(dir), l, start + carry.bounds[i], carry.bounds[i + 1] - carry.bounds[i], w }, 0);
+        const f = std.c.fopen(path, "wb") orelse return error.DsaDumpOpen;
+        defer _ = std.c.fclose(f);
+        const x = t orelse continue;
+        var cx = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cx);
+        try mlx.check(mlx.mlx_contiguous(&cx, x, false, g.s));
+        try mlx.check(mlx.mlx_array_eval(cx));
+        const p = mlx.mlx_array_data_int32(cx) orelse return error.MlxNoData;
+        const n = mlx.mlx_array_size(cx);
+        if (std.c.fwrite(@ptrCast(p), 4, n, f) != n) return error.DsaDumpWrite;
+    }
+}
+
 /// The prompt's attention on the DSA kernels, span by span: the query absorbed into the latent through `embed_q`, its
 /// scores over the span's selected keys (the latent rows and their roped keys; every causal key where the span's keys
 /// fit `index_topk`) and their softmax on the tensor units, the latent output back through `unembed_out`. `[1, heads,
@@ -485,6 +513,7 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     }
     var out: T = undefined;
     if (spans) {
+        try dumpSpans(g, carry, start, l);
         out = try attendSpans(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, start, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(qhd)))), carry);
     } else if (rows == 1) {
         out = try absorbedRow(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, carry.topk[0]);
