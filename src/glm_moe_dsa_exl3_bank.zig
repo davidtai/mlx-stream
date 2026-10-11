@@ -786,3 +786,56 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
     s.release(q1);
     try s.flush();
 }
+
+/// One gated route of `max_route_ids` ids on stream layer 0, none resident, over a synthetic bank of `tp` minis per id
+/// (96 experts, 48 a bank layer): every record read, its gates registered, its rows the file's.
+fn gateWidest(tp: u32, records_per_part: u32) !void {
+    const a = testing.allocator;
+    const text = try glm.tinyConfigJson(a, glm.tiny_quant);
+    defer a.free(text);
+    var buf: [64]u8 = undefined;
+    const t1 = try std.mem.replaceOwned(u8, a, text, "\"moe_intermediate_size\":64,", try std.fmt.bufPrint(&buf, "\"moe_intermediate_size\":{d},", .{128 * tp}));
+    defer a.free(t1);
+    const t2 = try std.mem.replaceOwned(u8, a, t1, "\"n_routed_experts\":16,", "\"n_routed_experts\":96,");
+    defer a.free(t2);
+    var c = try glm.Config.parse(a, t2, null, null);
+    defer c.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try writeSynth(a, testing.io, tmp.dir, &c, .{ .tp = tp });
+    defer a.free(img);
+    var rbuf: [512]u8 = undefined;
+    var b = try Bank.open(a, testing.io, try tmpRoot(&tmp, &rbuf), &c, null);
+    defer b.deinit();
+    try testing.expectEqual(tp, b.layers[0].minis);
+    const widest = Stream.max_route_ids;
+    var ids: [widest]u16 = undefined;
+    var n: usize = 0;
+    for (0..96) |e| if (n < widest and b.streamLayer(0, @intCast(e)) == 0) {
+        ids[n] = @intCast(e);
+        n += 1;
+    };
+    try testing.expectEqual(@as(usize, widest), n);
+    var rows: [8]u32 = undefined;
+    @memset(&rows, 2);
+    const s = try Stream.Stream.init(a, &b, .{ .rows = &rows, .max_route_ids = widest, .transient_rows = widest, .wide_depth = 1, .transient_release = true, .records_per_part = records_per_part, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 2048 }, .lookahead = .{ .k = 8, .budget = 2, .preread = false }, .event = .{ .watchdog_ms = 10_000 } });
+    defer s.deinit();
+    _ = try s.releaseTransient();
+    try s.grow(&rows);
+    const r = try s.route(0, &ids, &.{});
+    var records: u32 = 0;
+    for (r.partsOf()) |p| records += p.n_reads;
+    try testing.expectEqual(@as(u32, widest) * tp, records);
+    const g = (try s.gate(r)).?;
+    try testing.expectEqual(r.n_parts, g.n_parts);
+    for (0..r.n_parts) |p| try s.waitDown(r, @intCast(p));
+    try s.expectServed(r, &ids, img);
+    s.release(r);
+    try s.flush();
+    try testing.expectEqual(@as(u64, 0), s.stats().gates_forced);
+}
+
+test "glm exl3 bank: the gates of the widest route register: 48 ids of 8 minis (768 tickets), and GLM-5.3's 48 ids of 4 minis" {
+    try gateWidest(8, 1);
+    try gateWidest(4, 2);
+}
