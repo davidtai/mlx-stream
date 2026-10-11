@@ -237,16 +237,16 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const target = bill_mod.targetOf(gpu_target, ram, baseline);
             // The fill's unit (`bill.unitBytes`): every stream layer's share of its experts (`bill.rowsAt`).
             const max_units = bill_mod.maxUnits(inputs.bank);
-            const rows: sdk.Rows = if (cfg.expert_rows) |forced| .{ .prompt = @min(cfg.expert_prefill_rows orelse forced, forced), .decode = forced } else sdk.fill(mb, baseline, target, max_units, bill_mod.min_fill_rows) catch |e| {
+            const rows: sdk.Rows = if (cfg.expert_rows) |forced| .{ .prompt = @min(cfg.expert_prefill_rows orelse forced, forced), .decode = forced } else bill_mod.capRows(sdk.fill(mb, baseline, target, max_units, bill_mod.min_fill_rows) catch |e| {
                 log.err("glm_moe_dsa: admission refused: {s} (baseline {d} B, target {d} B, {d} B a row)\n", .{ @errorName(e), baseline, target, mb.per_row });
                 return e;
-            };
+            }, cfg.expert_units_cap);
             if (rows.prompt > rows.decode or rows.decode > max_units) return error.InvalidRows;
             sdk.admit(mb, baseline, rows, target) catch |e| {
                 log.err("glm_moe_dsa: admission refused before construction: {s} (prompt {d} B, decode {d} B, target {d} B)\n", .{ @errorName(e), mb.total(.prompt, baseline, rows.prompt), mb.total(.decode, baseline, rows.decode), target });
                 return e;
             };
-            log.info("glm_moe_dsa: admission {d} prompt / {d} decode units of {d} B ({d}-token context, {d} generated, baseline {d} B, target {d} B, the GPU's {d} B)\n", .{ rows.prompt, rows.decode, mb.per_row, max_context, cfg.maxOutput(), baseline, target, gpu_target });
+            log.info("glm_moe_dsa: admission {d} prompt / {d} decode units of {d} B ({d}-token context, {d} generated, baseline {d} B, target {d} B, the GPU's {d} B), units cap {d} (0: off)\n", .{ rows.prompt, rows.decode, mb.per_row, max_context, cfg.maxOutput(), baseline, target, gpu_target, if (cfg.expert_rows == null) cfg.expert_units_cap orelse 0 else 0 });
             log.info("{f}\n", .{bill_mod.BillLine{ .mb = &mb, .rows = rows, .baseline = baseline, .target = target, .context = max_context, .decode_positions = inputs.decode_positions }});
 
             const self = try gpa.create(Self);
@@ -621,7 +621,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 line.bill_rows = try bill_mod.requestRows(self.gpa, self.inputs, cap, self.prompt_units, box.others, target, max_units);
                 // The bill at the request's inputs in bytes (the receipts rebuild its units from them).
                 log.info("glm_moe_dsa: bill at the request: {d} positions beside {d} B of the rest of the box, target {d} B: {d} units\n", .{ cap, box.others, target, line.bill_rows.? });
-                line.rows = @max(@min(line.live_rows.?, line.bill_rows.?), self.prompt_units);
+                line.cap = self.cfg.expert_units_cap;
+                line.rows = @max(@min(@min(line.live_rows.?, line.bill_rows.?), line.cap orelse std.math.maxInt(u32)), self.prompt_units);
                 line.bound = live.total(line.rows);
                 line.mlx_bound = live.mlxAt(line.rows);
                 self.decode_units = line.rows;
@@ -906,6 +907,8 @@ pub const HandoverLine = struct {
     box: Box = .{ .used = 0, .others = 0 },
     grown: ?Mem = null,
     refused: ?[]const u8 = null,
+    /// The units cap (`expert_units_cap`; null: off).
+    cap: ?u32 = null,
 
     pub fn format(p: HandoverLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("glm_moe_dsa: handover: footprint {d:.3} GB before the frees, {d:.3} GB after ({s} in {d} ms; MLX active {d:.3} GB, host side {d:.3} GB; the box {d:.3} GB used, the rest of it {d:.3} GB), KV at {d} positions {d:.3} GB", .{
@@ -914,6 +917,8 @@ pub const HandoverLine = struct {
         if (p.refused) |e| return w.print(", refused: {s} (the prompt's {d} rows per layer leave decode over its target)", .{ e, p.prompt_rows });
         try w.print(", rows {d} -> {d} per layer", .{ p.prompt_rows, p.rows });
         if (p.bill_rows) |b| try w.print(" (the bill at the request {d}, the live reading {d})", .{ b, p.live_rows.? }) else try w.print(" (forced)", .{});
+        // A capped arm's rows: at the cap, or under it when the bill or the live reading admits fewer (a run to flag).
+        if (p.cap) |c| if (p.bill_rows) |b| try w.print("{s} {d} units", .{ if (@min(b, p.live_rows.?) >= c) ", capped at" else ", under the units cap of", c });
         if (p.bound) |b| try w.print(", decode bound {d:.3} GB of the {d:.3} GB target (the load's baseline {d:.3} GB)", .{ gigabytes(b), gigabytes(p.target), gigabytes(p.baseline) });
         if (p.mlx_bound) |b| try w.print(", MLX {d:.3} GB of the GPU's {d:.3} GB", .{ gigabytes(b), gigabytes(p.gpu_target) });
         if (p.grown) |g| try w.print(", footprint {d:.3} GB after the grow", .{gigabytes(g.footprint)});
@@ -1324,6 +1329,16 @@ test "glm handover: the handover line reports the readings, the rows each bound 
     const s = try std.fmt.allocPrint(a, "{f}", .{l});
     defer a.free(s);
     try testing.expectEqualStrings("glm_moe_dsa: handover: footprint 225.500 GB before the frees, 221.000 GB after (settled in 15 ms; MLX active 220.400 GB, host side 0.600 GB; the box 233.900 GB used, the rest of it 12.600 GB), KV at 17415 positions 1.660 GB, rows 126 -> 136 per layer (the bill at the request 136, the live reading 137), decode bound 255.000 GB of the 255.551 GB target (the load's baseline 12.402 GB), MLX 238.000 GB of the GPU's 255.551 GB, footprint 237.100 GB after the grow", s);
+    // A capped arm: at the cap, and under it.
+    l.cap = 136;
+    const at = try std.fmt.allocPrint(a, "{f}", .{l});
+    defer a.free(at);
+    try testing.expect(std.mem.indexOf(u8, at, "(the bill at the request 136, the live reading 137), capped at 136 units, decode bound") != null);
+    l.cap = 137;
+    const under = try std.fmt.allocPrint(a, "{f}", .{l});
+    defer a.free(under);
+    try testing.expect(std.mem.indexOf(u8, under, "(the bill at the request 136, the live reading 137), under the units cap of 137 units, decode bound") != null);
+    l.cap = null;
     l.refused = "DecodeOverTarget";
     const r = try std.fmt.allocPrint(a, "{f}", .{l});
     defer a.free(r);

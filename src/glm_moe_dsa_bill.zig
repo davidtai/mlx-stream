@@ -864,6 +864,12 @@ pub fn liveRows(l: Live) error{DecodeOverTarget}!u32 {
     return @intCast(r);
 }
 
+/// `rows` at most `cap` units in each phase (`settings.Config.expert_units_cap`; null: as they are).
+pub fn capRows(rows: sdk.Rows, cap: ?u32) sdk.Rows {
+    const c = cap orelse return rows;
+    return .{ .prompt = @min(rows.prompt, c), .decode = @min(rows.decode, c) };
+}
+
 /// The bill's one construction line: every term's bytes per phase (the slot rows apart), a unit's linear bytes and the
 /// units the fill chose, each phase's total at them (the slot rows exact) against the target.
 pub const BillLine = struct {
@@ -1208,6 +1214,14 @@ test "glm bill: on the DSA kernels the prompt wave stops growing past one call; 
     // with a limit of 0 every layer's wave adds whole.
     try testing.expect(promptWaveBytes(&c, g, 16384, true, .kernel, .glm53, false, 0, 0) >= promptWaveBytes(&c, g, 16384, true, .kernel, .glm53, false, 17 << 30, 0));
     try testing.expect(decodeWaveBytes(&c, 4, 131072) > decodeWaveBytes(&c, 4, 16384));
+}
+
+test "glm bill: the units cap only lowers the rows, in each phase" {
+    const r: sdk.Rows = .{ .prompt = 72, .decode = 87 };
+    try testing.expectEqual(r, capRows(r, null));
+    try testing.expectEqual(sdk.Rows{ .prompt = 72, .decode = 85 }, capRows(r, 85));
+    try testing.expectEqual(r, capRows(r, 90));
+    try testing.expectEqual(sdk.Rows{ .prompt = 60, .decode = 60 }, capRows(r, 60));
 }
 
 test "glm bill: the bill line lists every term and each phase's total at the units chosen" {
