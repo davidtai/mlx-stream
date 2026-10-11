@@ -28,6 +28,7 @@ const settings = @import("glm_moe_dsa_settings.zig");
 const ds = @import("deepseek_v41_dspark.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 const exl3 = @import("glm_moe_dsa_exl3_bank.zig");
+const timeline = @import("dsv41_verify_timeline.zig");
 
 const G = graph.G;
 const T = G.T;
@@ -392,6 +393,9 @@ pub const Head = struct {
 /// drafts the target accepts and the token after them (the correction, or the bonus when all are accepted).
 pub const Decision = struct { accepted: u32, next: u32 };
 
+/// Diagnostic (the step-tail stamps): the timeline clock after `decide`'s token readback and after its flags readback.
+pub var diag_decide: [2]u64 = .{ 0, 0 };
+
 /// `drafts` against `logits` under `mode` and the request's sampling (`base`: the absolute position of row 0, the
 /// sampled draws' key). Greedy: exact accepts a draft equal to its row's argmax; typical accepts one whose probability
 /// at temperature 1 exceeds min(eps, delta * exp(-entropy)) (the host's `sdk.acceptance.typicalThreshold`); the
@@ -415,10 +419,13 @@ pub fn decide(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode, 
     var have_flags = false;
     if (sampling.greedy()) {
         _ = try g.hostU32(try g.argmax(logits, -1), tok[0..w]);
+        diag_decide[0] = timeline.now();
+        diag_decide[1] = diag_decide[0];
         if (typ) |t| if (drafts.len > 0) {
             const lg = try g.astype(try g.slice(logits, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 }), .float32);
             const lp = try g.sub(lg, try g.logsumexp(lg, -1, true));
             _ = try g.hostBool(try typicalFlags(g, lp, try g.exp(lp), idb[0..drafts.len], t), flags[0..drafts.len]);
+            diag_decide[1] = timeline.now();
             have_flags = true;
         };
     } else {
@@ -427,10 +434,13 @@ pub fn decide(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode, 
         if (typ) |t| {
             const sr = try Loop.sampledRows(g, logits, sm, base, &.{});
             _ = try g.hostU32(sr.tok, tok[0..w]);
+            diag_decide[0] = timeline.now();
+            diag_decide[1] = diag_decide[0];
             if (drafts.len > 0) {
                 const p = try g.slice(sr.p, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 });
                 const lp = try g.log(p);
                 _ = try g.hostBool(try typicalFlags(g, lp, p, idb[0..drafts.len], t), flags[0..drafts.len]);
+                diag_decide[1] = timeline.now();
                 have_flags = true;
             }
         } else {

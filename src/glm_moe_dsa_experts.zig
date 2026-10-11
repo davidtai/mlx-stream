@@ -159,6 +159,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         row_bytes: [max_route_ids]u64 = @splat(0),
         /// The decode lane's host time, summed over calls until the caller zeroes it (`HostSplit`).
         host: HostSplit = .{},
+        /// Diagnostic (the step-tail stamps): the first decode-lane call's start and the last one's end since the caller
+        /// zeroed `round_first` (timeline clock).
+        round_first: u64 = 0,
+        round_last: u64 = 0,
         /// The wide lane's combine on the GPU (`combine_source`), built at its first call.
         combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
 
@@ -784,6 +788,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// A decode-lane call's host split: barrier [t0, t1), routes [t1, t2), waves [t2, now).
         fn noteHost(self: *Self, t0: u64, t1: u64, t2: u64) void {
             const t3 = timeline.now();
+            if (self.round_first == 0) self.round_first = t0;
+            self.round_last = t3;
             self.host.calls += 1;
             self.host.barrier_ns += t1 -| t0;
             self.host.route_ns += t2 -| t1;
