@@ -656,7 +656,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         la.budget == 0 or la.budget > expert_lookahead.max_budget) return error.InvalidOptions;
                     const page = std.heap.pageSize();
                     const record = spanOf(&bank.layers[widest]);
-                    pool_opt.spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
+                    pool_opt.spec = .{ .threads = if (std.c.getenv("GLM_DIAG_SPEC_THREADS")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch @min(la.budget, 2) else @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
                     // A pre-read range is the record's gate/up span or its down span,
                     // back to back, each no larger than a staging buffer.
                     if (la.preread) for (bank.layers) |l| {

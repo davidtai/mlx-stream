@@ -52,6 +52,12 @@ const LayerCounts = sdk_ext.expert.LayerCounts;
 
 /// The decode lookahead: the next routed layer's top-8 candidates (its records per call: `expert_lookahead_budget`).
 pub const lookahead: struct { k: u32 = 8 } = .{};
+
+/// DIAG (diag/spec-knobs): an integer knob from the environment, else `default`.
+fn diagEnv(comptime name: [:0]const u8, default: u32) u32 {
+    const v = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(u32, std.mem.span(v), 10) catch default;
+}
 /// A gate whose bytes never land is forced after this (and fails the stream).
 pub const event_watchdog_ms: u32 = 2000;
 /// The chunk-major prompt pass's chunk (`layer_major_prefill` off).
@@ -306,7 +312,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .staging_from_bank = true,
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
                 .pool = .{ .workers = shape.workers, .tickets = bill_mod.pool_tickets_per_mini * Bk.Stream.maxMinis(&self.bank), .direct = true, .range_jobs = true },
-                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
+                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget(), .chunks = diagEnv("GLM_DIAG_CHUNKS", 4), .idle_busy = diagEnv("GLM_DIAG_IDLE_BUSY", 0), .preread = diagEnv("GLM_DIAG_PREREAD", 1) != 0 },
                 .keep_residents = true,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
             });
