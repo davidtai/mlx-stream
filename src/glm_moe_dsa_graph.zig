@@ -373,6 +373,36 @@ pub fn absorbedRow(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_p
     return qlinear(g, try sdpa(g, qa, kv_sel, kv_sel, @floatCast(scale64), scores), lw.unembed_out);
 }
 
+/// Every row of a per-row carry has its selection (its keys are its own `index_topk` rows: the verify past the
+/// selection's width).
+fn allSelected(carry: *const Carry) bool {
+    for (carry.topk) |t| if (t == null) return false;
+    return true;
+}
+
+/// The verify's rows absorbed in one batch, each over its own selection (row i: `absorbedRow` over its `carry.topk[i]`
+/// keys, the rows a batch axis): `[1, heads, rows, v_head_dim]`, each row as `absorbedRow` computes it.
+fn absorbedRows(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T, kv: T, pe: T, carry: *const Carry) !T {
+    const kvr: c_int = @intCast(c.kv_lora_rank);
+    const rp: c_int = @intCast(c.qk_rope_head_dim);
+    const kk: c_int = @intCast(c.index_topk);
+    const rows: c_int = @intCast(carry.topk.len);
+    const n_keys = g.shapeOf(kv).dim(2);
+    const scale64: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(c.qHeadDim())));
+    var idxs: [16]T = undefined;
+    for (carry.topk, idxs[0..carry.topk.len]) |t, *x| x.* = try g.reshape(t.?, &.{ 1, 1, kk, 1 });
+    const idx = try g.concat(idxs[0..carry.topk.len], 0);
+    const kv_sel = try g.takeAlongAxis(try g.broadcastTo(kv, &.{ rows, 1, n_keys, kvr }), try g.broadcastTo(idx, &.{ rows, 1, kk, kvr }), 2);
+    const pe_sel = try g.takeAlongAxis(try g.broadcastTo(pe, &.{ rows, 1, n_keys, rp }), try g.broadcastTo(idx, &.{ rows, 1, kk, rp }), 2);
+    // [1, heads, rows, d] -> [rows, heads, 1, d]: each row its own batch item.
+    const qp = try g.transposeAxes(q_pe, &.{ 2, 1, 0, 3 });
+    const qn = try g.transposeAxes(q_nope, &.{ 2, 1, 0, 3 });
+    const scores = try g.matmul(try g.mul(qp, try g.scalar(scale64, g.dtypeOf(qp))), try swapLast(g, pe_sel));
+    const qa = try qlinear(g, qn, lw.embed_q);
+    const o = try qlinear(g, try sdpa(g, qa, kv_sel, kv_sel, @floatCast(scale64), scores), lw.unembed_out);
+    return g.transposeAxes(o, &.{ 2, 1, 0, 3 });
+}
+
 /// How a forward of several rows attends: `.auto` (one row absorbed, several in the prompt form), or `.per_row` (each
 /// row absorbed over the keys up to its own position, as serial steps run it: the draft lane's verify).
 pub const Form = enum { auto, per_row };
@@ -393,6 +423,8 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     var out: T = undefined;
     if (rows == 1) {
         out = try absorbedRow(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, carry.topk[0]);
+    } else if (form == .per_row and allSelected(carry)) {
+        out = try absorbedRows(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, carry);
     } else if (form == .per_row) {
         var outs: std.ArrayList(T) = .empty;
         defer outs.deinit(carry.a);
