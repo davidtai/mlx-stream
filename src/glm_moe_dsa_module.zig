@@ -494,6 +494,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth());
             const s0 = self.stream.stats();
             startPhase();
+            prefill_timers.begin(&self.g);
             const mem0 = Mem.now();
             const t0 = self.nowNs();
             var logits: ?mlx.mlx_array = null;
@@ -538,7 +539,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 mem1.footprint_peak = @max(mem1.footprint_peak, p.footprint);
             }
             log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .mem = .{ .start = mem0, .end = mem1 } }});
-            prefill_timers.report(ids.len);
+            prefill_timers.report(ids.len, &self.g);
             if (self.probe) |p| log.info("glm_moe_dsa: wave probe {f}\n", .{p.*});
             self.phaseRecord("prompt pass", self.billed.terms(.prompt, self.prompt_units, self.prompt_units), peaks);
             return logits.?;

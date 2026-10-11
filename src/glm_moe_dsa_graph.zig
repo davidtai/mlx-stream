@@ -401,10 +401,21 @@ pub fn queryOf(g: *G, c: *const glm.Config, lw: *const Layer, x: T, start: u32, 
     const qhd: c_int = @intCast(c.qHeadDim());
     const nope: c_int = @intCast(c.qk_nope_head_dim);
     const n: c_int = @intCast(rows);
-    const qr = try rmsNorm(g, try qlinear(g, x, lw.q_a), lw.q_a_norm, glm.latent_norm_eps);
-    const q = try g.transposeAxes(try g.reshape(try qlinear(g, qr, lw.q_b), &.{ 1, n, heads, qhd }), &.{ 0, 2, 1, 3 });
+    const qa = try qlinear(g, x, lw.q_a);
+    try pt.op(g, &.{qa}, .q_a);
+    const qr = try rmsNorm(g, qa, lw.q_a_norm, glm.latent_norm_eps);
+    try pt.op(g, &.{qr}, .q_a_norm);
+    const qb = try qlinear(g, qr, lw.q_b);
+    try pt.op(g, &.{qb}, .q_b);
+    const q = try g.transposeAxes(try g.reshape(qb, &.{ 1, n, heads, qhd }), &.{ 0, 2, 1, 3 });
     var out: Query = .{ .qr = qr, .q_nope = try lastSlice(g, q, 0, nope), .q_pe = try rope(g, try lastSlice(g, q, nope, qhd), c.qk_rope_head_dim, c.rope_theta, start) };
-    if (lw.indexer) |ix| out.iq = try rope(g, try g.transposeAxes(try g.reshape(try linear(g, qr, ix.wq_b), &.{ 1, n, @intCast(c.index_n_heads), @intCast(c.index_head_dim) }), &.{ 0, 2, 1, 3 }), c.qk_rope_head_dim, c.rope_theta, start);
+    try pt.op(g, &.{out.q_pe}, .q_rope);
+    if (lw.indexer) |ix| {
+        const iqp = try linear(g, qr, ix.wq_b);
+        try pt.op(g, &.{iqp}, .iq_proj);
+        out.iq = try rope(g, try g.transposeAxes(try g.reshape(iqp, &.{ 1, n, @intCast(c.index_n_heads), @intCast(c.index_head_dim) }), &.{ 0, 2, 1, 3 }), c.qk_rope_head_dim, c.rope_theta, start);
+        try pt.op(g, &.{out.iq.?}, .iq_rope);
+    }
     return out;
 }
 
@@ -419,12 +430,20 @@ pub fn keysOf(g: *G, c: *const glm.Config, lw: *const Layer, x: T, start: u32, r
     const kvr: c_int = @intCast(c.kv_lora_rank);
     const n: c_int = @intCast(rows);
     const ckv = try qlinear(g, x, lw.kv_a);
+    try pt.op(g, &.{ckv}, .kv_a);
     const latent = try rmsNorm(g, try lastSlice(g, ckv, 0, kvr), lw.kv_a_norm, glm.latent_norm_eps);
+    try pt.op(g, &.{latent}, .kv_norm);
     const k_pe = try rope(g, try g.reshape(try lastSlice(g, ckv, kvr, kvr + rp), &.{ 1, 1, n, rp }), rd, c.rope_theta, start);
+    try pt.op(g, &.{k_pe}, .k_rope);
     var out: Keys = .{ .latent = try g.reshape(latent, &.{ 1, n, kvr }), .k_pe = try g.reshape(k_pe, &.{ 1, n, rp }) };
     if (lw.indexer) |ix| {
         const ihd: c_int = @intCast(c.index_head_dim);
-        const ik = try rope(g, try g.reshape(try layerNorm(g, try linear(g, x, ix.wk), ix.k_norm_w, ix.k_norm_b, glm.index_norm_eps), &.{ 1, 1, n, ihd }), rd, c.rope_theta, start);
+        const ikp = try linear(g, x, ix.wk);
+        try pt.op(g, &.{ikp}, .ik_proj);
+        const ikn = try layerNorm(g, ikp, ix.k_norm_w, ix.k_norm_b, glm.index_norm_eps);
+        try pt.op(g, &.{ikn}, .ik_norm);
+        const ik = try rope(g, try g.reshape(ikn, &.{ 1, 1, n, ihd }), rd, c.rope_theta, start);
+        try pt.op(g, &.{ik}, .ik_rope);
         out.index = try g.reshape(ik, &.{ 1, n, ihd });
     }
     return out;
@@ -535,12 +554,26 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     }
     if (pt.enabled and rows > 1) pt.chargeAttn(lw.indexer != null, try pt.phase(g, &.{out}, .attn));
     const o2 = try g.reshape(try g.transposeAxes(out, &.{ 0, 2, 1, 3 }), &.{ n, heads * @as(c_int, @intCast(c.v_head_dim)) });
-    return qlinear(g, o2, lw.o);
+    try pt.op(g, &.{o2}, .o_transpose);
+    const o_out = try qlinear(g, o2, lw.o);
+    try pt.op(g, &.{o_out}, .o_proj);
+    return o_out;
 }
 
 /// `down(silu(gate(x)) * up(x))` (the dense MLP and the shared expert).
 pub fn mlp(g: *G, m: Mlp, x: T) !T {
-    return qlinear(g, try g.mul(try g.silu(try qlinear(g, x, m.gate)), try qlinear(g, x, m.up)), m.down);
+    if (!pt.fine()) return qlinear(g, try g.mul(try g.silu(try qlinear(g, x, m.gate)), try qlinear(g, x, m.up)), m.down);
+    const gt = try qlinear(g, x, m.gate);
+    try pt.op(g, &.{gt}, .mlp_gate);
+    const sg = try g.silu(gt);
+    try pt.op(g, &.{sg}, .mlp_silu);
+    const up = try qlinear(g, x, m.up);
+    try pt.op(g, &.{up}, .mlp_up);
+    const pr = try g.mul(sg, up);
+    try pt.op(g, &.{pr}, .mlp_mul);
+    const dn = try qlinear(g, pr, m.down);
+    try pt.op(g, &.{dn}, .mlp_down);
+    return dn;
 }
 
 /// One routed layer's routing: the top-k expert ids `[n, k]` (int32) and their weights `[n, k]` (f32).
@@ -772,15 +805,24 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         const l: u32 = @intCast(li);
         const m = g.mark();
         if (probe) |p| p.begin(l);
-        if (pt.enabled and prompt) pt.start();
+        if (pt.enabled and prompt) {
+            pt.start();
+            pt.layerStart(l);
+        }
         // The predictor runs only where the read-ahead has empty rows to fill.
         if (rt.read_ahead and wide and lw.bank_layer != null and ex.readAheadRoom(lw.bank_layer.?) > 0) {
+            const hp = pt.enter(.seed);
             try predictSeed(g, a, c, lw, h, rows, &seed);
             try ex.readAheadSeed(lw.bank_layer.?, seed.items);
+            pt.leave(hp);
         }
         // A wide prompt call's misses read before its attention (`Experts.stageMisses`): at 8 rows per expert it routes
         // nearly every expert.
-        if (prompt and wide and lw.bank_layer != null and rows * c.n_experts_per_tok >= 8 * c.n_routed_experts) try ex.stageMisses(lw.bank_layer.?);
+        if (prompt and wide and lw.bank_layer != null and rows * c.n_experts_per_tok >= 8 * c.n_routed_experts) {
+            const hs = pt.enter(.stage);
+            try ex.stageMisses(lw.bank_layer.?);
+            pt.leave(hs);
+        }
         errdefer ex.dropStaged();
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{}, .seed);
         const x = try rmsNorm(g, h, lw.input_norm, c.rms_norm_eps);
@@ -792,13 +834,16 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         }
         defer if (probe) |p| p.mark(l, .tail);
         const x2 = try rmsNorm(g, h1, lw.post_norm, c.rms_norm_eps);
+        if (pt.enabled and prompt) try pt.op(g, &.{x2}, .post_norm);
         const f = if (lw.dense) |d| try mlp(g, d, x2) else blk: {
             const r = try route(g, c, lw.router.?, x2);
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{ x2, r.indices, r.weights }, .router);
             const next: ?T = if (rt.lookahead and !prompt and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2) else null;
             // A decode-lane call takes the shared expert built first and runs it during its read wait; the sum is the same.
             const shared: ?T = if (!wide) try mlp(g, lw.shared.?, x2) else null;
+            if (pt.enabled and prompt) try pt.op(g, &.{}, .p_routed);
             const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, if (shared) |sh| &[_]T{sh} else &.{});
+            if (pt.enabled and prompt) pt.host(.tail);
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{routed}, .routed);
             if (probe) |p| p.mark(l, .moe);
             break :blk try g.add(routed, shared orelse try mlp(g, lw.shared.?, x2));
@@ -812,6 +857,11 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             try evals.append(a, next_h);
             try evals.appendSlice(a, cache.buffers(l, &bufs));
             for (carry.topk) |t| if (t) |x_| try evals.append(a, x_);
+            if (pt.enabled) {
+                try pt.op(g, evals.items, .tail);
+                pt.tag(.tail, l, 0, 0);
+                pt.host(.tail_commit);
+            }
             try g.asyncEval(evals.items);
             if (pt.enabled) _ = try pt.phase(g, &.{}, .rest);
         }
@@ -819,6 +869,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         h = next_h;
         g.resetTo(m);
     }
+    if (pt.enabled and prompt) pt.layersEnd();
     cache.commit(rows);
     if (!want.verify and !want.hidden) return .{ .logits = g.keep(try head(g, c, w, h)) };
     // Row by row the same as `head`: the final norm per row, the head over the rows wanted.

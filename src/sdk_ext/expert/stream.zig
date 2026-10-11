@@ -10,6 +10,9 @@ const expert_policy = @import("policy.zig");
 const expert_lookahead = @import("lookahead.zig");
 const expert_routes = @import("routes.zig");
 
+/// DIAGNOSTIC (not for merge): called with true before and false after the host waits on the copier.
+pub var diag_copier_wait: ?*const fn (bool) void = null;
+
 /// `probed`: the plugin's prefill-timers build (its read-ahead probes compiled in; every other build has no field, call or
 /// branch for them).
 pub fn StreamOf(comptime B: type, comptime probed: bool) type {
@@ -974,6 +977,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (c.thread == null) return;
                     c.mutex.lockUncancelable(io);
                     defer c.mutex.unlock(io);
+                    if (c.done >= seq) return;
+                    if (diag_copier_wait) |f| f(true);
+                    defer if (diag_copier_wait) |f| f(false);
                     while (c.done < seq) c.cond.waitUncancelable(io, &c.mutex);
                 }
             };

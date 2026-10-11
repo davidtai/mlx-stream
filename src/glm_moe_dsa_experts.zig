@@ -349,7 +349,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// route released, the groups after it routed on stream layer `sl` while windows are free.
         fn drainGroup(self: *Self, g: *G, w: *Wide, sl: u32, gi: usize, outs: []const T, next: *usize, live: *usize, depth: usize, comptime ahead: anytype) !void {
             const td = pt.now();
+            pt.tag(.drain, sl / bpl, sl % bpl, gi);
+            pt.host(.drain_wait);
             try g.evalAll(outs);
+            pt.host(.drain_post);
             pt.chargeRouted(.compute, td);
             const tr = pt.now();
             const r = w.groute.items[gi].?;
@@ -368,7 +371,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 _ = self.stream.promote(sl, items[0..cand.n]);
                 pt.chargeRouted(.promote, tp);
             }
+            pt.host(.route);
             try ahead(self, w, sl, next, live, depth);
+            pt.host(.encode);
             pt.chargeRouted(.route, tr);
         }
 
@@ -804,7 +809,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             defer self.dropStaged();
             const tb = pt.now();
             try w.ids.resize(a, n_ids);
+            pt.host(.barrier);
             _ = try g.hostIds(indices, w.ids.items);
+            pt.host(.plan);
             pt.chargeRouted(.barrier, tb);
             w.pos.clearRetainingCapacity();
             for (w.kept.items) |o| g.release(o);
@@ -820,6 +827,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const w = &self.wide;
             const sl = bpl * layer + side;
             const group_n = self.stream.max_route_ids;
+            pt.host(.plan);
             var tp = pt.now();
             try w.first.resize(a, self.n_experts);
             @memset(w.first.items, -1);
@@ -845,7 +853,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             }.lt);
             pt.chargeRouted(.barrier, tp);
             tp = pt.now();
+            pt.host(.ahead);
             try self.stream.awaitReadAhead(sl);
+            pt.host(.plan);
             pt.chargeRouted(.ahead, tp);
             tp = pt.now();
             try self.stream.seedPrefill(sl, w.side_ids.items);
@@ -951,10 +961,12 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 }
                 const r = w.groute.items[gi].?;
                 const tw = pt.now();
+                pt.host(.read_wait);
                 for (0..r.n_parts) |p| {
                     try self.stream.waitGu(r, @intCast(p));
                     try self.stream.waitDown(r, @intCast(p));
                 }
+                pt.host(.encode);
                 pt.chargeRouted(.wait, tw);
                 const tc = pt.now();
                 var refs: [max_route_ids]SlotRef = undefined;
@@ -985,7 +997,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     std.debug.assert(w.pos.items.len - p0 == w.slot.items.len);
                 }
                 try self.math.finishPrefill(g);
+                pt.tag(.group, layer, side, gi);
+                pt.host(.commit);
                 try g.asyncEval(w.kept.items[k0..]);
+                pt.host(.encode);
                 g.resetTo(m);
                 pt.chargeRouted(.encode, tc);
                 if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..k0], &next, &live, depth, ahead);
@@ -999,6 +1014,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
+            pt.host(.join);
             try w.inv.resize(a, n_ids);
             // On the GPU the combine reads each routed row where its group's call left it (no join).
             if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0 and w.kept.items.len <= max_combine_parts) {
