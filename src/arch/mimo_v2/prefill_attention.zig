@@ -113,7 +113,7 @@ pub const checked_keys: u64 = 32_768;
 
 /// Once, at construction (Module.init): `resolve`, then the checked range. The default (no "prefill_attention" in the
 /// request's settings) means NAX where it is device-checked: past `checked_keys` it takes the stock control (Module.init
-/// logs decode_attention.autoStockLine; the bill reads `defaultTakesStock`). The served context is a construction
+/// logs `settings.prefillAttentionStockLine`; the bill reads `defaultTakesStock`). The served context is a construction
 /// parameter: a construction-time route, never a per-call branch. An explicit "nax" past the range refuses by number.
 pub fn resolveServed(requested: ?Route, has_nax: bool, served_context: u64) !Route {
     const route = try resolve(requested, has_nax);

@@ -42,17 +42,11 @@ pub const checked_keys: u64 = 32_768;
 
 /// Once, at construction (settings `decodeAttentionTier`, the bill and Module.init read the same function): the default
 /// tier ("kernels", not named in the request's settings) means kernels where they are device-checked. Past
-/// `checked_keys` the default takes the stock control (Module.init logs `autoStockLine`); a served context is a
+/// `checked_keys` the default takes the stock control (Module.init logs `settings.decodeAttentionStockLine`); a served context is a
 /// construction parameter, so this is a construction-time route, not a per-request branch. An explicit "kernels" keeps the
 /// tier, and `requireCheckedContext` refuses it past the range by name (nothing serves an unchecked kernel).
 pub fn effectiveTier(setting: Tier, requested: bool, served_context: u64) Tier {
     return if (setting == .kernels and !requested and served_context > checked_keys) .stock else setting;
-}
-
-/// The one log line a default route writes when the served context takes it to the stock control
-/// (`route decode_attention=stock reason=context 33792 > checked 32768`; prefill_attention.zig writes its own with it).
-pub fn autoStockLine(buf: []u8, route: []const u8, served_context: u64, checked: u64) []const u8 {
-    return std.fmt.bufPrint(buf, "route {s}=stock reason=context {d} > checked {d}", .{ route, served_context, checked }) catch "route stock reason=context";
 }
 
 /// Once, at construction (settings `validate`): the kernel tier serves at most `checked_keys` keys. A decode step's
@@ -1033,10 +1027,7 @@ test "mimo GPU decode attention: split-K full and windowed sliding agree with th
     if (peak > bound) return error.MimoDecodeAttentionPeakExceeded;
 }
 
-test "mimo decode attention CPU: the default route's stock line names the route, the served context and the checked range" {
-    var buf: [128]u8 = undefined;
-    try testing.expectEqualStrings("route decode_attention=stock reason=context 33792 > checked 32768", autoStockLine(&buf, "decode_attention", 33_792, checked_keys));
-    try testing.expectEqualStrings("route prefill_attention=stock reason=context 131072 > checked 32768", autoStockLine(&buf, "prefill_attention", 131_072, 32_768));
+test "mimo decode attention CPU: the default tier routes to stock past the checked keys; a named tier is never re-routed" {
     try testing.expectEqual(Tier.kernels, effectiveTier(.kernels, false, checked_keys));
     try testing.expectEqual(Tier.stock, effectiveTier(.kernels, false, checked_keys + 1));
     try testing.expectEqual(Tier.kernels, effectiveTier(.kernels, true, checked_keys + 1));

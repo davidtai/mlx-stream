@@ -119,9 +119,10 @@ every term and the rows per context for a pack, from its headers.
   admitted rows (from +82 to -44, summing to 0, so every bill term is the uniform split's). The offsets were derived
   from six route traces of non-benchmark prompts and held out on the benchmark prompts. Measured on the bf16res pack
   at 128 / 140 rows: misses per round 118.8 -> 101.2, decode +1.4 tok/s, ids identical within each arm. Where the
-  offsets do not fit the admitted rows (a layer under one prompt row or over 256 decode rows), construction installs
-  the uniform split with one log line. `uniform` is the control; an explicit array of 47 integers summing to 0 is
-  accepted, and refused by name when it does not fit.
+  offsets do not fit the admitted rows (a layer under one prompt row or over 256 decode rows), the default installs
+  the uniform split at construction with one log line naming the admitted rows; a named `derived` is refused there.
+  `uniform` is the control; an explicit array of 47 integers summing to 0 is accepted, and refused by name when it
+  does not fit.
 
 Rows change which experts are resident, not the arithmetic of a forward. They still change greedy ids: the prompt
 pass groups its tiles by slot bank, so its outputs are rounding-class across row counts.
@@ -236,10 +237,21 @@ Settings live in the pack's `config.json`, in the `settings` object of its `expe
   jq '.expert_streaming.settings = {"prefill_drain": "sync"}' /abs/pack/config.json > "$CELL/config.json"
   ```
 
-Construction logs the route it installs for each setting. Five defaults resolve to their control where they cannot
-install, each with one log line, while a named value is refused there instead: `decode_attention` and
-`prefill_attention` past 32,768 keys (and `prefill_attention` without NAX), `prefill_combine` under a wired policy
-other than `max`, `gpu_keep_warm` on a CPU stream, and `expert_rows_by_layer` where the derived offsets do not fit.
+Construction logs the route it installs for each setting. A named value that cannot install is refused by name. A
+default that cannot install takes an explicit route at construction, from a fact fixed for the model's lifetime, and
+logs one line naming the route, the reason and the setting that would pin it. Five defaults do this:
+`decode_attention` and `prefill_attention` past 32,768 keys, `prefill_attention` on a device without NAX,
+`prefill_combine` under a host wired policy other than `max`, `expert_rows_by_layer` where the derived offsets do not
+fit the admitted rows, and `gpu_keep_warm` on a CPU stream. The lines read:
+
+```text
+route decode_attention=stock reason=ctx>32768 keys (kernels device-checked to 32768) pin=decode_attention ctx=65536
+route prefill_attention=stock reason=ctx>32768 keys (NAX device-checked to 32768) pin=prefill_attention ctx=65536
+route prefill_attention=stock reason=platform (this device has no NAX) pin=prefill_attention
+route expert_rows_by_layer=uniform reason=derived split does not fit the admitted rows prompt=44 decode=56 pin=expert_rows_by_layer
+route prefill_combine=fused reason=host wired policy fit (inplace needs max) pin=prefill_combine
+route gpu_keep_warm=off reason=default waits on a CPU stream (its waits are host waits) pin=gpu_keep_warm
+```
 
 Definitions: **class** = what the default does to outputs against its control. **exact** = bit-identical outputs.
 **token-exact** = identical tokens; only pre-reads or memory move. **rounding-class** = different float rounding, so

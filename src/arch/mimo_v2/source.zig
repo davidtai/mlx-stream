@@ -497,7 +497,15 @@ pub const Source = struct {
             // bound to the encoder: they must sit in MLX's residency sets, i.e. the host's wired policy `max` (its
             // default; `fit` and `off` leave transients unwired).
             .inplace => blk: {
-                if (std.c.getenv("MLX_SERVE_WIRED")) |v| if (!std.mem.eql(u8, std.mem.span(v), "max")) return error.MimoPrefillCombineResidency;
+                // Reached under a policy other than `max` only by a NAMED `inplace` (Module.init routes the default to
+                // `fused` there with one line): refused by name.
+                if (std.c.getenv("MLX_SERVE_WIRED")) |v| {
+                    const wired_mode = std.mem.span(v);
+                    if (!std.mem.eql(u8, wired_mode, "max")) {
+                        std.log.scoped(.mimo).warn("refused: prefill_combine=inplace needs the host's wired policy max (MLX_SERVE_WIRED={s}); set \"prefill_combine\":\"fused\" or leave it unset", .{wired_mode});
+                        return error.MimoPrefillCombineResidency;
+                    }
+                }
                 self.combine_kernel = try prefill_combine.Kernel.initInplace(bank.geometry);
                 break :blk partsCombineInplace;
             },

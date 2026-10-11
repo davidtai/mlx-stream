@@ -106,9 +106,11 @@ pub const DecodeGrow = enum { after_draft, boundary, invalid };
 pub const LayerRows = union(enum) {
     uniform,
     /// stack-next7 DEFAULT: the shipped split `derived_offsets` (a constant of the plugin, never read at runtime). Where
-    /// it does not fit the admitted rows (a layer under one prompt row or over its experts) the default takes the uniform
-    /// control at construction with one log line; an explicit `.offsets` there refuses by name.
+    /// it does not fit the admitted rows (a layer under one prompt row or over its experts) the default routes to the
+    /// uniform split at construction with one line (`layerRowsUniformLine`); a named split there refuses by name.
     derived,
+    /// `"expert_rows_by_layer": "derived"` named: the shipped split, refused by name where it does not fit.
+    derived_named,
     offsets: [mimo.moe_layers]i16,
     /// A setting that is neither `"uniform"` nor an array of integers (`MimoExpertRowsByLayer`), an array whose length
     /// is not 47 (`MimoExpertRowsByLayerLength`), or one whose entries do not sum to 0 (`MimoExpertRowsByLayerSum`).
@@ -144,6 +146,7 @@ pub fn offsetsFit(offsets: [mimo.moe_layers]i16, rows: sdk.Rows, n_experts: u32)
 pub fn installedLayerRows(split: LayerRows, rows: sdk.Rows, n_experts: u32) LayerRows {
     return switch (split) {
         .derived => if (offsetsFit(derived_offsets, rows, n_experts)) .{ .offsets = derived_offsets } else .uniform,
+        .derived_named => .{ .offsets = derived_offsets },
         else => split,
     };
 }
@@ -160,7 +163,7 @@ pub fn layerRows(split: LayerRows, rows: sdk.Rows, n_experts: u32) !LayerRowVect
     var out: LayerRowVectors = .{ .prompt = @splat(rows.prompt), .decode = @splat(rows.decode) };
     switch (installedLayerRows(split, rows, n_experts)) {
         .uniform => {},
-        .derived => unreachable,
+        .derived, .derived_named => unreachable,
         .offsets => |d| for (&out.prompt, &out.decode, d) |*p, *q, off| {
             const pp = @as(i64, rows.prompt) + off;
             const dd = @as(i64, rows.decode) + off;
@@ -215,6 +218,45 @@ pub fn unknownSetting(raw: std.json.ObjectMap) ?[]const u8 {
     }
     return null;
 }
+
+// ---- default routes: a DEFAULT picks a construction-time route from a construction-time fact and logs it once;
+// a NAMED value that cannot install refuses by name. Each line names the route, the fact and the setting that pins it.
+
+/// `decode_attention` default past the kernels' checked keys.
+pub fn decodeAttentionStockLine(buf: []u8, served_context: u64) []const u8 {
+    const k = @import("decode_attention.zig").checked_keys;
+    return std.fmt.bufPrint(buf, "route decode_attention=stock reason=ctx>{d} keys (kernels device-checked to {d}) pin=decode_attention ctx={d}", .{ k, k, served_context }) catch buf[0..0];
+}
+
+/// `prefill_attention` default past the NAX route's checked keys.
+pub fn prefillAttentionStockLine(buf: []u8, served_context: u64) []const u8 {
+    const k = @import("prefill_attention.zig").checked_keys;
+    return std.fmt.bufPrint(buf, "route prefill_attention=stock reason=ctx>{d} keys (NAX device-checked to {d}) pin=prefill_attention ctx={d}", .{ k, k, served_context }) catch buf[0..0];
+}
+
+/// `prefill_attention` default on a device without NAX (a platform route, like the CPU stream's keep-warm route).
+pub fn prefillAttentionPlatformLine(buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "route prefill_attention=stock reason=platform (this device has no NAX) pin=prefill_attention", .{}) catch buf[0..0];
+}
+
+/// `expert_rows_by_layer` default where the derived split does not fit the admitted rows.
+pub fn layerRowsUniformLine(buf: []u8, rows: sdk.Rows) []const u8 {
+    return std.fmt.bufPrint(buf, "route expert_rows_by_layer=uniform reason=derived split does not fit the admitted rows prompt={d} decode={d} pin=expert_rows_by_layer", .{ rows.prompt, rows.decode }) catch buf[0..0];
+}
+
+/// `prefill_combine` default under a host wired policy other than `max` (the in-place combine needs `max`).
+pub fn prefillCombineFusedLine(buf: []u8, wired_policy: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "route prefill_combine=fused reason=host wired policy {s} (inplace needs max) pin=prefill_combine", .{wired_policy}) catch buf[0..0];
+}
+
+/// The combine construction installs: the default `inplace` under a host wired policy other than `max` is `fused`
+/// (the host decides the policy); a named `inplace` keeps it, and `Source.initWith` refuses it by name there.
+pub fn installedPrefillCombine(route: @import("prefill_combine.zig").Route, named: bool, wired_policy: ?[]const u8) @import("prefill_combine.zig").Route {
+    if (route != .inplace or named) return route;
+    const p = wired_policy orelse return route;
+    return if (std.mem.eql(u8, p, "max")) route else .fused;
+}
+
 
 pub const Config = struct {
     mimo: mimo.Config = .{},
@@ -451,7 +493,7 @@ pub const Config = struct {
         if (c.expert_prefill_rows) |p| if (p == 0) return error.MimoExpertRowsSetting;
         if (c.expert_rows) |d| if (c.expert_prefill_rows) |p| if (p > d) return error.MimoPhaseRows;
         switch (c.expert_rows_by_layer) {
-            .uniform, .derived, .offsets => {},
+            .uniform, .derived, .derived_named, .offsets => {},
             .invalid => |why| return switch (why) {
                 .setting => error.MimoExpertRowsByLayer,
                 .length => error.MimoExpertRowsByLayerLength,
@@ -631,7 +673,7 @@ pub const Config = struct {
     /// `"expert_rows_by_layer"`: "uniform", "derived" (the default), or 47 integers (each within i16) summing to 0; anything else is invalid.
     fn layerRowsSetting(v: std.json.Value) LayerRows {
         switch (v) {
-            .string => |s| return if (std.mem.eql(u8, s, "uniform")) .uniform else if (std.mem.eql(u8, s, "derived")) .derived else .{ .invalid = .setting },
+            .string => |s| return if (std.mem.eql(u8, s, "uniform")) .uniform else if (std.mem.eql(u8, s, "derived")) .derived_named else .{ .invalid = .setting },
             .array => |arr| {
                 var out: [mimo.moe_layers]i16 = undefined;
                 for (arr.items) |item| if (item != .integer or item.integer < std.math.minInt(i16) or item.integer > std.math.maxInt(i16)) return .{ .invalid = .setting };
@@ -1120,7 +1162,7 @@ test "mimo layer rows (mimo/layer-rows): uniform by default, 47 offsets summing 
     }.f;
     const base: Config = .{};
     try std.testing.expect(base.expert_rows_by_layer == .derived);
-    try std.testing.expect((try parse("{\"expert_rows_by_layer\":\"derived\"}")).expert_rows_by_layer == .derived);
+    try std.testing.expect((try parse("{\"expert_rows_by_layer\":\"derived\"}")).expert_rows_by_layer == .derived_named);
     try base.validate();
     try std.testing.expect((try parse("{\"expert_rows_by_layer\":\"uniform\"}")).expert_rows_by_layer == .uniform);
     // Three bands (+40 on routed layers 1-10, +10 on 11-22, -20.8 on 23-47 as -21 x 20 and -20 x 5: sum 0).
@@ -1313,4 +1355,49 @@ test "mimo settings: setting_keys is every key applySettings reads: each key wit
     const v = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"decode_glue\":\"fused\",\"decode_sliding\":\"fused\"}", .{});
     defer v.deinit();
     try std.testing.expectEqualStrings("decode_sliding", unknownSetting(v.value.object).?);
+}
+
+test "mimo settings: a NAMED value that cannot install refuses by name; the DEFAULT routes at construction with one line naming the route, the fact and the pin" {
+    const facts = struct {
+        fn at(context: u64) sdk.LoadFacts {
+            return .{ .memory_baseline_bytes = 10_000_000_000, .wired_margin_bytes = 2_000_000_000, .effective_context = context };
+        }
+    };
+    var buf: [256]u8 = undefined;
+    // decode_attention past 32,768 keys: the default routes to stock (validates); a named kernels refuses.
+    const past = facts.at(33_792);
+    const d = (Config{}).withFacts(&past);
+    try d.validate();
+    try std.testing.expectEqual(decode_attention.Tier.stock, d.decodeAttentionTier());
+    try std.testing.expectEqualStrings("route decode_attention=stock reason=ctx>32768 keys (kernels device-checked to 32768) pin=decode_attention ctx=33792", decodeAttentionStockLine(&buf, 33_792));
+    var named: Config = .{};
+    const kernels = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"decode_attention\":\"kernels\"}", .{});
+    defer kernels.deinit();
+    named.applySettings(kernels.value);
+    try std.testing.expectError(error.MimoDecodeAttentionContextUnchecked, named.withFacts(&past).validate());
+    // prefill_attention past 32,768 keys and on a device without NAX: the default routes to stock; a named nax refuses.
+    const pa = @import("prefill_attention.zig");
+    try std.testing.expectEqual(pa.Route.stock, try pa.resolveServed(null, true, 33_792));
+    try std.testing.expectEqual(pa.Route.stock, try pa.resolveServed(null, false, 17_408));
+    try std.testing.expectError(error.MimoNaxAttentionContextUnchecked, pa.resolveServed(.nax, true, 33_792));
+    try std.testing.expectError(error.MimoNaxAttentionUnavailable, pa.resolveServed(.nax, false, 17_408));
+    try std.testing.expectEqualStrings("route prefill_attention=stock reason=ctx>32768 keys (NAX device-checked to 32768) pin=prefill_attention ctx=33792", prefillAttentionStockLine(&buf, 33_792));
+    try std.testing.expectEqualStrings("route prefill_attention=stock reason=platform (this device has no NAX) pin=prefill_attention", prefillAttentionPlatformLine(&buf));
+    // expert_rows_by_layer where the derived split does not fit: the default routes to uniform; a named derived refuses.
+    const tight: sdk.Rows = .{ .prompt = 44, .decode = 56 };
+    try std.testing.expect(installedLayerRows(.derived, tight, 256) == .uniform);
+    _ = try layerRows(.derived, tight, 256);
+    try std.testing.expectError(error.MimoExpertRowsByLayerRange, layerRows(.derived_named, tight, 256));
+    const fits: sdk.Rows = .{ .prompt = 128, .decode = 140 };
+    try std.testing.expect(installedLayerRows(.derived_named, fits, 256) == .offsets);
+    try std.testing.expectEqualStrings("route expert_rows_by_layer=uniform reason=derived split does not fit the admitted rows prompt=44 decode=56 pin=expert_rows_by_layer", layerRowsUniformLine(&buf, tight));
+    // prefill_combine under a host wired policy other than max: the default routes to fused; a named inplace is kept
+    // (Source.initWith refuses it by name there); no policy set or max keeps the default.
+    const C = @import("prefill_combine.zig").Route;
+    try std.testing.expectEqual(C.fused, installedPrefillCombine(.inplace, false, "fit"));
+    try std.testing.expectEqual(C.inplace, installedPrefillCombine(.inplace, true, "fit"));
+    try std.testing.expectEqual(C.inplace, installedPrefillCombine(.inplace, false, "max"));
+    try std.testing.expectEqual(C.inplace, installedPrefillCombine(.inplace, false, null));
+    try std.testing.expectEqual(C.stock, installedPrefillCombine(.stock, false, "fit"));
+    try std.testing.expectEqualStrings("route prefill_combine=fused reason=host wired policy fit (inplace needs max) pin=prefill_combine", prefillCombineFusedLine(&buf, "fit"));
 }

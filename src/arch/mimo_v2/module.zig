@@ -174,12 +174,17 @@ pub const Module = struct {
         defer arena.deinit();
         const plan = try bills.plan(arena.allocator(), io, config.*, ceiling, stop);
         // +attn: the prompt attention route, once (design-prefill §3b), and its checked range, before any load.
-        // The default past the NAX route's checked keys takes the stock control (one line); an explicit nax there refuses.
+        // The DEFAULT routes to the stock control on a device without NAX (a platform route) and past the NAX route's
+        // checked keys, one line each; a NAMED nax refuses there by name (`resolveServed`).
         const has_nax = prefill_attention.deviceHasNax(s);
         const attention_route = try prefill_attention.resolveServed(config.prefill_attention, has_nax, plan.reserve);
-        if (has_nax and prefill_attention.defaultTakesStock(config.prefill_attention, plan.reserve)) {
-            var line: [128]u8 = undefined;
-            log.info("{s}", .{decode_attention.autoStockLine(&line, "prefill_attention", plan.reserve, prefill_attention.checked_keys)});
+        if (config.prefill_attention == null) {
+            var line: [256]u8 = undefined;
+            if (!has_nax) {
+                log.info("{s}", .{settings.prefillAttentionPlatformLine(&line)});
+            } else if (prefill_attention.defaultTakesStock(null, plan.reserve)) {
+                log.info("{s}", .{settings.prefillAttentionStockLine(&line, plan.reserve)});
+            }
         }
         // mimo/layer-rows: the admitted rows split over the routed layers (`settings.LayerRows`, once: the uniform control
         // is the splat; a split keeps both phases' totals, so the plan's bill is the split's).
@@ -234,16 +239,17 @@ pub const Module = struct {
         // still refuses by name there.
         var warm_route = config.gpu_keep_warm;
         if (warm_route != .off and config.gpuKeepWarmIsDefault() and !@import("gpu_warm.zig").gpuStream(s)) {
-            log.info("route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits)", .{@tagName(warm_route)});
+            log.info("route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits) pin=gpu_keep_warm", .{@tagName(warm_route)});
             warm_route = .off;
         }
-        // stack-next9: the DEFAULT `prefill_combine: inplace` (P7 W) under a host wired policy other than `max` takes
-        // `fused` here, once, with one line; a NAMED `inplace` still refuses there by name (Source.initWith).
-        var combine_route = config.prefill_combine;
-        if (combine_route == .inplace and !config.p7_requested.combine) if (std.c.getenv("MLX_SERVE_WIRED")) |v| if (!std.mem.eql(u8, std.mem.span(v), "max")) {
-            log.info("route prefill_combine=fused reason=default inplace needs the wired policy max (MLX_SERVE_WIRED={s})", .{std.mem.span(v)});
-            combine_route = .fused;
-        };
+        // The DEFAULT `prefill_combine: inplace` under a host wired policy other than `max` (the host decides the policy)
+        // routes to `fused`, once, with one line; a NAMED `inplace` refuses there by name (Source.initWith).
+        const wired: ?[]const u8 = if (std.c.getenv("MLX_SERVE_WIRED")) |v| std.mem.span(v) else null;
+        const combine_route = settings.installedPrefillCombine(config.prefill_combine, config.p7_requested.combine, wired);
+        if (combine_route != config.prefill_combine) {
+            var line: [256]u8 = undefined;
+            log.info("{s}", .{settings.prefillCombineFusedLine(&line, wired.?)});
+        }
         const source = try source_mod.Source.initWith(a, io, dir, &rows, gates, s, .{ .read_ahead = config.prefill_read_ahead, .decode_moe = config.decode_moe, .decode_moe_kernel = config.decode_moe_kernel, .decode_rows = if (config.phase_rows) &decode_rows else null, .prefill_drain = config.prefill_drain, .prefill_combine = combine_route, .prefill_bank_view = config.prefill_bank_view, .prefill_read_schedule = config.prefill_read_schedule, .prefill_read_schedule_threshold = config.prefill_read_schedule_threshold, .prefill_scratch = config.prefill_scratch, .defer_grow = config.defersGrowth(), .decode_window = config.decode_window, .gpu_keep_warm = warm_route, .predict_router = config.predict_router });
         errdefer source.deinit();
         const self = try a.create(Module);
@@ -288,8 +294,8 @@ pub const Module = struct {
         // The default past the kernels' checked keys takes the stock control (settings `decodeAttentionTier`, one line).
         const decode_tier = config.decodeAttentionTier();
         if (decode_tier != config.decode_attention) {
-            var line: [128]u8 = undefined;
-            log.info("{s}", .{decode_attention.autoStockLine(&line, "decode_attention", plan.reserve, decode_attention.checked_keys)});
+            var line: [256]u8 = undefined;
+            log.info("{s}", .{settings.decodeAttentionStockLine(&line, plan.reserve)});
         }
         if (decode_tier == .kernels) self.decode_kernels = try decode_attention.Kernels.init(c);
         errdefer self.decode_kernels.deinit();
@@ -331,11 +337,13 @@ pub const Module = struct {
         log.info("mlx-stream MiMo installed: 48 layers; residents {s}; experts MXFP4 g32 streamed (47 sources), {d} resident expert rows/layer, chunk {d}", .{ residentsLabel(&label_buf, c), plan.rows.prompt, mimo.prefill_chunk });
         // mimo/layer-rows: the receipt's proof of the split as installed (the rows each routed layer holds, both phases).
         const installed_split = settings.installedLayerRows(config.expert_rows_by_layer, plan.rows, c.n_routed_experts);
-        if (config.expert_rows_by_layer == .derived and installed_split == .uniform)
-            log.info("route expert_rows_by_layer=uniform reason=derived split does not fit prompt_rows={d} decode_rows={d}", .{ plan.rows.prompt, plan.rows.decode });
+        if (config.expert_rows_by_layer == .derived and installed_split == .uniform) {
+            var line: [256]u8 = undefined;
+            log.info("{s}", .{settings.layerRowsUniformLine(&line, plan.rows)});
+        }
         switch (installed_split) {
             .uniform => log.info("MiMo layer rows: split=uniform prompt_rows={d} decode_rows={d} on all {d} routed layers", .{ plan.rows.prompt, plan.rows.decode, mimo.moe_layers }),
-            else => log.info("MiMo layer rows: split={s} prompt_rows={any} decode_rows={any} prompt_total={d} decode_total={d} (uniform {d} x {d} / {d} x {d})", .{ if (config.expert_rows_by_layer == .derived) "derived" else "offsets", rows, decode_rows, sumRows(&rows), sumRows(&decode_rows), mimo.moe_layers, plan.rows.prompt, mimo.moe_layers, plan.rows.decode }),
+            else => log.info("MiMo layer rows: split={s} prompt_rows={any} decode_rows={any} prompt_total={d} decode_total={d} (uniform {d} x {d} / {d} x {d})", .{ if (config.expert_rows_by_layer == .derived or config.expert_rows_by_layer == .derived_named) "derived" else "offsets", rows, decode_rows, sumRows(&rows), sumRows(&decode_rows), mimo.moe_layers, plan.rows.prompt, mimo.moe_layers, plan.rows.decode }),
         }
         log.info("MiMo memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv={s} phase_rows={s} growth_rows={d} forced={s}", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, @tagName(config.kv_mode), if (config.phase_rows) "on" else "off (control)", plan.rows.decode - plan.rows.prompt, if (bills.isForced(config.*)) "yes" else "no" });
         try self.checkConstruction(plan.bill, plan.rows.prompt, weights, file_start);
