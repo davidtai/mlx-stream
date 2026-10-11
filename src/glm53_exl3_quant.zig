@@ -1,12 +1,13 @@
 //! GLM-5.3's EXL3 routed-expert quant `glm53_exl3` (C2, `sdk_ext.quant`): the pinned kernels of
 //! `glm53_exl3_kernels` over the EXL3 bank's slot arrays (`glm_moe_dsa_exl3_bank`), specialized to GLM-5.3 (hidden 6144,
 //! a mini's intermediate 512, four minis per expert, K 3 and 4, the mcg codebook, SwiGLU unclamped, top-8).
-//!   - Decode (`decode_layer`): per wave of a routed layer's pairs over one bank layer, the three bank kinds in one
-//!     launch per stage (`decodeWave`: the inputs per mini, the gate and up GEMVs per distinct slot, the down with the
-//!     SwiGLU middle, the minis' sum and the pair's score fused in); per call, every row's pairs summed in routed order
-//!     (`decodeCombine`). x is read by row, the slot arrays by slot; nothing syncs with the host.
-//!     A device wave (`decodeWaveDevice`) takes the routed positions' slots as a device array: a position of slot
-//!     0xFFFFFFFF or score 0 reads no weight and gives zero, and `decodeCombineDevice` sums every position.
+//!   - Decode: the decode lane's fused waves run sushi's decode chain (`fused`, the sushi binding composed), faster
+//!     at every decode width than these texts' GEMVs. The GEMVs stay callable over a routed layer's pairs: per wave over
+//!     one bank layer, the three bank kinds in one launch per stage (`decodeWave`: the inputs per mini, the gate and up
+//!     GEMVs per distinct slot, the down with the SwiGLU middle, the minis' sum and the pair's score fused in); per
+//!     call, every row's pairs summed in routed order (`decodeCombine`); a device wave (`decodeWaveDevice`) takes the
+//!     routed positions' slots as a device array: a position of slot 0xFFFFFFFF or score 0 reads no weight and gives
+//!     zero, and `decodeCombineDevice` sums every position. Nothing syncs with the host.
 //!   - Prompt (`prefill`): the call's rows sorted by slot on the host, waves of at most 16 experts and `wave_rows` rows,
 //!     each through the 128-row gate and up GEMMs over the rows' x (the trellis decoded per stage, rotated along k and
 //!     scaled by rin), the middle and the down GEMM (the minis summed in its epilogue), then the waves joined in the
@@ -21,6 +22,7 @@ const quant = sdk_ext.quant;
 const bank_mod = @import("glm_moe_dsa_exl3_bank.zig");
 const xk = @import("glm53_exl3_kernels.zig");
 const routes = @import("glm53_exl3_routes.zig");
+const sushi_quant = @import("glm_moe_dsa_exl3_quant.zig");
 const selfcheck = xk.selfcheck;
 const ks = sdk_ext.kernels.KernelSet(xk);
 
@@ -65,15 +67,16 @@ pub fn Accepted(comptime G: type) type {
         const Bank = quant.BankArrays(A);
         /// A decode wave's widest pair count (6 verify rows x top-8).
         pub const max_decode_rows: u32 = routes.max_pairs;
-        /// The decode lane hands each wave over once its segments landed, and the call's combine to `decodeCombine`.
+        /// The decode lane hands each wave over once its segments landed (`fused`: sushi's decode chain).
         pub const fused_waves = true;
-        pub const decode_layer = true;
         /// A decode slot's member pairs per GEMV (`decodeWave`'s gt).
         pub const slot_members = routes.max_members;
         pub const top_k = routes.top_k;
         pub const combine_sources = routes.combine_sources;
         a: Allocator,
         set: *const ks.Set,
+        /// The decode waves' chain: sushi's binding over the same bank (`fused`).
+        sushi_math: *sushi_quant.Accepted(G),
         hidden: u32,
         mini: u32,
         report: selfcheck.Report = .{},
@@ -120,17 +123,19 @@ pub fn Accepted(comptime G: type) type {
 
         pub fn gateUp(self: *const Self, g: *G, x: G.T, slot_ids: G.T, gate: A, up: A) !G.T {
             _ = .{ self, g, x, slot_ids, gate, up };
-            return error.LayeredDecode;
+            return error.FusedWaves;
         }
 
         pub fn down(self: *const Self, g: *G, h: G.T, slot_ids: G.T, d: A) !G.T {
             _ = .{ self, g, h, slot_ids, d };
-            return error.LayeredDecode;
+            return error.FusedWaves;
         }
 
+        /// One decode wave: `x [m, hidden]` (each routed pair's row), `slots` its experts' slot rows -> each pair's
+        /// expert output `[m, hidden]` (its minis summed, unweighted): sushi's decode chain, faster at every decode width
+        /// than these texts' GEMVs (`decodeWave`).
         pub fn fused(self: *Self, g: *G, x: G.T, slots: []const u32, bank: Bank) !G.T {
-            _ = .{ self, g, x, slots, bank };
-            return error.LayeredDecode;
+            return self.sushi_math.fused(g, x, slots, bank);
         }
 
         /// One decode wave over a bank layer: x [rows, hidden] bf16 (the call's rows), `pairs` per pair (x row, packed
@@ -355,7 +360,7 @@ pub fn Accepted(comptime G: type) type {
         }
 
         pub fn deinit(self: *Self, g: *G) void {
-            _ = g;
+            self.sushi_math.deinit(g);
             for (self.waves.items) |w| _ = mlx.mlx_array_free(w);
             for (&self.dec) |*d| d.deinit();
             self.cmb.deinit();
@@ -369,7 +374,6 @@ pub fn Accepted(comptime G: type) type {
 /// The load context's kernel set over this registry, the bank's description, the arch's Spec (SwiGLU unclamped, bf16
 /// inputs, top-8, dims the manifest registers), then the self-check (compile) of every kernel at those dims.
 pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: quant.Spec, diag: *Diag) !*Accepted(G) {
-    _ = g;
     const ref = ctx.kernels orelse return quant.refuse(diag, error.NoKernelSet, "quant " ++ name ++ ": accepted without the load context's kernel set", .{});
     const set = ks.Set.of(ref) orelse return quant.refuse(diag, error.NoKernelSet, "quant " ++ name ++ ": accepted with a kernel set over another registry (manifest {s})", .{ref.manifest_sha256});
     const peek = ctx.peek orelse return quant.refuse(diag, error.NoWeightDescription, "quant " ++ name ++ ": accepted without the bank's description", .{});
@@ -388,9 +392,11 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
         };
     };
     if (!registered) return quant.refuse(diag, error.DimsNotImplemented, "quant " ++ name ++ ": hidden {d}, inter {d} (the manifest registers the texts at other dims)", .{ spec.hidden, spec.inter });
+    const sm = try sushi_quant.accept(G, a, g, .{ .peek = peek }, spec, diag);
+    errdefer sm.deinit(g);
     const acc = try a.create(Accepted(G));
     errdefer a.destroy(acc);
-    acc.* = .{ .a = a, .set = set, .hidden = spec.hidden, .mini = mini, .dec = undefined, .pf = undefined, .cmb = .init(&set.bound, inst) };
+    acc.* = .{ .a = a, .set = set, .sushi_math = sm, .hidden = spec.hidden, .mini = mini, .dec = undefined, .pf = undefined, .cmb = .init(&set.bound, inst) };
     errdefer acc.report.deinit(a);
     switch (set.device) {
         .stream => {
@@ -473,7 +479,7 @@ test "glm53 exl3 quant: claims GLM-5.3's EXL3 bank only; accept refuses what the
     try testing.expectError(error.SelfCheckFailed, accept(G, testing.allocator, undefined, .{ .kernels = bad.ref(), .peek = &exl3 }, spec, &diag));
 }
 
-const old_quant = @import("glm_moe_dsa_exl3_quant.zig");
+const old_quant = sushi_quant;
 
 test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver equals sushi's host decode of the records: both bank layers, every lane, host waits and event gates" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
