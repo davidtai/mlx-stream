@@ -146,6 +146,9 @@ pub const MlxOps = struct {
     gpa: std.mem.Allocator,
     s: mlx.mlx_stream,
     live: std.ArrayList(mlx.mlx_array) = .empty,
+    /// The host's waits on the GPU so far: every evaluation that blocks (`evalAll`) and every read of an array's values
+    /// (`hostIds`, `hostU32`, `hostF32`, `hostBool`, `hostArgmax`); `asyncEval` waits for nothing.
+    waits: u64 = 0,
     /// `nn.silu` / `nn.softplus` are `mx.compile(shapeless=True)` regions in
     /// the Python oracle; the same closures are compiled here (a compiled
     /// graph is not output-preserving against the op chain).
@@ -317,7 +320,8 @@ pub const MlxOps = struct {
         return n -| base;
     }
 
-    pub fn evalAll(_: *MlxOps, xs: []const T) !void {
+    pub fn evalAll(g: *MlxOps, xs: []const T) !void {
+        g.waits += 1;
         const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_eval(vec));
@@ -916,7 +920,8 @@ pub const MlxOps = struct {
 
     /// The routing barrier (`mx.eval(indices)` + `tolist`): evaluates the integer ids `x` and copies
     /// them, row-major, into `out` (x's size). Read in place (`readInPlace`).
-    pub fn hostIds(_: *MlxOps, x: T, out: []u16) ![]const u16 {
+    pub fn hostIds(g: *MlxOps, x: T, out: []u16) ![]const u16 {
+        g.waits += 1;
         try mlx.check(mlx.mlx_array_eval(x));
         if (mlx.mlx_array_size(x) != out.len) return error.HostIdsSize;
         // One producer dtype: the router's int32 indices (the arm's stand-in emits the same).
@@ -959,21 +964,24 @@ pub const MlxOps = struct {
 
     /// Evaluates `x` (only a wait when an eval already produced it) and copies its values,
     /// row-major, into `out` (x's size), read in place (`readInPlace`).
-    pub fn hostU32(_: *MlxOps, x: T, out: []u32) ![]const u32 {
+    pub fn hostU32(g: *MlxOps, x: T, out: []u32) ![]const u32 {
+        g.waits += 1;
         try mlx.check(mlx.mlx_array_eval(x));
         if (mlx.mlx_array_size(x) != out.len) return error.HostReadSize;
         std.debug.assert(mlx.mlx_array_dtype(x) == .uint32); // argmax outputs and draft ids
         return readInPlace(u32, u32, x, mlx.mlx_array_data_uint32(x), out);
     }
 
-    pub fn hostF32(_: *MlxOps, x: T, out: []f32) ![]const f32 {
+    pub fn hostF32(g: *MlxOps, x: T, out: []f32) ![]const f32 {
+        g.waits += 1;
         try mlx.check(mlx.mlx_array_eval(x));
         if (mlx.mlx_array_size(x) != out.len) return error.HostReadSize;
         std.debug.assert(mlx.mlx_array_dtype(x) == .float32);
         return readInPlace(f32, f32, x, mlx.mlx_array_data_float32(x), out);
     }
 
-    pub fn hostBool(_: *MlxOps, x: T, out: []bool) ![]const bool {
+    pub fn hostBool(g: *MlxOps, x: T, out: []bool) ![]const bool {
+        g.waits += 1;
         try mlx.check(mlx.mlx_array_eval(x));
         if (mlx.mlx_array_size(x) != out.len) return error.HostReadSize;
         std.debug.assert(mlx.mlx_array_dtype(x) == .bool_);
@@ -982,6 +990,7 @@ pub const MlxOps = struct {
 
     /// Greedy pick: `mx.argmax` over every logit of `x` (one row), evaluated and read.
     pub fn hostArgmax(g: *MlxOps, x: T) !u32 {
+        g.waits += 1;
         const flat = try g.reshape(x, &.{-1});
         var r = mlx.mlx_array_new();
         mlx.check(mlx.mlx_argmax_axis(&r, flat, 0, false, g.s)) catch |e| {

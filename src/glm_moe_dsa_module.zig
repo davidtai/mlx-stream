@@ -38,6 +38,7 @@ const experts_mod = @import("glm_moe_dsa_experts.zig");
 const mtp_mod = @import("glm_moe_dsa_mtp.zig");
 const exl3_bank = @import("glm_moe_dsa_exl3_bank.zig");
 const exl3_quant = @import("glm_moe_dsa_exl3_quant.zig");
+const glm53_quant = @import("glm53_exl3_quant.zig");
 /// PROFILE builds (`-Dplugin-profile=true`): each draft round's verify on the GPU timeline, its summary at the
 /// request's end (`VERIFY_GPU_TIMELINE`); every other build compiles it out.
 const timeline = @import("dsv41_verify_timeline.zig");
@@ -74,10 +75,12 @@ pub const Overrides = struct {
 };
 
 /// The served modules, the MTP layer's experts from its EXL3 records in both: the affine bank through MLX's
-/// `gather_qmm`; the EXL3 bank (its K3 and K4 bank layers per routed layer) through sushi's EXL3 MoE. The pack's
-/// manifest picks one at load (`Served`).
+/// `gather_qmm`; the EXL3 bank (its K3 and K4 bank layers per routed layer) through GLM-5.3's own EXL3 kernels
+/// (`glm53_exl3_quant`). The pack's manifest picks one at load (`Served`). `Exl3SushiModule`: the EXL3 bank through
+/// sushi's EXL3 MoE, the comparison's.
 pub const Module = ModuleOf(bank_mod, quant.FromGatherMatmul(quant.GatherQmm), .exl3);
-pub const Exl3Module = ModuleOf(exl3_bank, exl3_quant, .exl3);
+pub const Exl3Module = ModuleOf(exl3_bank, glm53_quant, .exl3);
+pub const Exl3SushiModule = ModuleOf(exl3_bank, exl3_quant, .exl3);
 
 /// The module the pack's bank serves: the EXL3 one when the pack carries the EXL3 manifest, else the affine one.
 pub const Served = union(enum) {
@@ -109,6 +112,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         const Self = @This();
         const Stream = Bk.Stream.Stream;
         const Math = Q.Accepted(G);
+        /// A quant with pinned texts gets the load's kernel set over its registry, built on the module's stream.
+        const has_kernels = @hasDecl(Q, "kernel_registry");
+        const KSet = if (has_kernels) sdk_ext.kernels.Set(Q.kernel_registry) else void;
         pub const Experts = experts_mod.Experts(G, Bk, Math);
         pub const Lane = mtp_mod.Lane(mtp_kind);
 
@@ -138,6 +144,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         bank: Bk.Bank,
         stream: *Stream,
         math: *Math,
+        kset: if (has_kernels) *KSet else void,
         ex: Experts,
         cache: graph.Cache,
         /// The tokens whose KV the lanes hold, in order (the prefix a later prompt may keep).
@@ -170,8 +177,6 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         bill: sdk.MemoryBill,
         /// The request's decode since its handover, for its request-end line; null before the handover and after the line.
         decode_mark: ?DecodeMark = null,
-        /// The last prompt pass's prefill GEMM calls and GPU drains (an EXL3 quant's; null for another quant).
-        prompt_gemm: ?[2]u64 = null,
         /// Each routed layer's counts at the handover and at the request's end, and the line's hit rates.
         layer_counts0: []LayerCounts,
         layer_counts1: []LayerCounts,
@@ -228,7 +233,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
+            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .kset = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
             errdefer self.g.deinit();
             // The module owns its config's copy (the host's config keeps the parsed model's storage).
             self.model = if (self.cfg.model) |*m| m else unreachable;
@@ -238,7 +243,15 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             defer arena.deinit();
             const peek = try self.bank.peek(arena.allocator());
             if (Q.claims(&peek, &diag) == null) return error.QuantNotClaimed;
-            self.math = try Q.accept(G, gpa, &self.g, .{ .peek = &peek }, .{ .hidden = model.hidden_size, .inter = model.moe_intermediate_size, .top_k = model.n_experts_per_tok, .n_layers = model.nSparse(), .act = .swiglu, .input = .bfloat16 }, &diag);
+            var kref: ?sdk_ext.kernels.SetRef = null;
+            if (comptime has_kernels) {
+                self.kset = try KSet.init(gpa, .{ .device = .{ .stream = s } }, &diag);
+                // the profile hook's launch probe sees the set's launches (profile builds; a no-op otherwise)
+                self.kset.bound.observe(sdk_ext.profile.of(G).launch);
+                kref = self.kset.ref();
+            }
+            errdefer if (comptime has_kernels) self.kset.deinit();
+            self.math = try Q.accept(G, gpa, &self.g, .{ .kernels = kref, .peek = &peek }, .{ .hidden = model.hidden_size, .inter = model.moe_intermediate_size, .top_k = model.n_experts_per_tok, .n_layers = model.nSparse(), .act = .swiglu, .input = .bfloat16 }, &diag);
             errdefer self.math.deinit(&self.g);
             const n_bank: usize = self.inputs.bank.layers.len;
             self.prompt_rows = try gpa.alloc(u32, n_bank);
@@ -270,7 +283,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .staging_from_bank = true,
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
                 .pool = .{ .workers = shape.workers, .tickets = 1024 * Bk.Stream.maxMinis(&self.bank), .direct = true },
-                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget(), .max_rank = cfg.lookaheadMaxRank() },
+                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
                 .keep_residents = true,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
             });
@@ -352,6 +365,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.stream.deinit();
             if (self.recorder) |rec| rec.deinit();
             self.math.deinit(&self.g);
+            if (comptime has_kernels) self.kset.deinit();
             self.w.deinit(self.gpa);
             self.bank.deinit();
             self.history.deinit(self.gpa);
@@ -401,7 +415,6 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.stream.resetPromptCounts();
             if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth());
             const s0 = self.stream.stats();
-            const q0: ?[2]u64 = if (comptime @hasDecl(Math, "prefillStats")) self.math.prefillStats() else null;
             startPhase();
             const mem0 = Mem.now();
             const t0 = self.nowNs();
@@ -430,12 +443,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }
             try self.g.evalAll(&.{logits.?});
             try self.ex.flush();
-            self.prompt_gemm = if (q0) |a| blk: {
-                const b = self.math.prefillStats();
-                break :blk .{ b[0] - a[0], b[1] - a[1] };
-            } else null;
             _ = mlx.mlx_synchronize(self.g.s);
-            log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .gemm = self.prompt_gemm, .mem = .{ .start = mem0, .end = Mem.now() } }});
+            log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .mem = .{ .start = mem0, .end = Mem.now() } }});
             prefill_timers.report(ids.len);
             return logits.?;
         }
@@ -945,15 +954,12 @@ pub const PromptLine = struct {
     tokens: u64,
     wall_ns: u64,
     r: Reads,
-    /// The EXL3 quant's prefill GEMM calls and its waits on the GPU in the pass (null for a quant without them).
-    gemm: ?[2]u64 = null,
     mem: ?PhaseMem = null,
 
     pub fn format(p: PromptLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("glm_moe_dsa: prompt {d} tokens in {d:.2} s ({d:.1} tok/s): {d:.2} GB from the SSD, {d} records on demand, {d} read ahead ({d} routed), host wait {d:.2} s", .{
             p.tokens, seconds(p.wall_ns), perSecond(p.tokens, p.wall_ns), gigabytes(p.r.ssd_bytes), p.r.demand_records, p.r.ahead_records, p.r.ahead_hits, seconds(p.r.wait_ns),
         });
-        if (p.gemm) |q| try w.print(", {d} prefill GEMM calls, {d} GPU drains", .{ q[0], q[1] });
         if (p.r.promoted > 0) try w.print(", {d} records made resident from transient rows ({d:.2} GB copied)", .{ p.r.promoted, gigabytes(p.r.promoted_bytes) });
         if (p.mem) |m| try w.print("; {f}", .{m});
     }
@@ -1065,9 +1071,6 @@ test "glm stats lines: the prompt and decode lines and the per-layer hit spread,
     const p = try std.fmt.allocPrint(a, "{f}", .{PromptLine{ .tokens = 1008, .wall_ns = 31_500_000_000, .r = r }});
     defer a.free(p);
     try testing.expectEqualStrings("glm_moe_dsa: prompt 1008 tokens in 31.50 s (32.0 tok/s): 9.00 GB from the SSD, 380 records on demand, 50 read ahead (40 routed), host wait 1.50 s", p);
-    const pg = try std.fmt.allocPrint(a, "{f}", .{PromptLine{ .tokens = 1008, .wall_ns = 31_500_000_000, .r = r, .gemm = .{ 40, 0 } }});
-    defer a.free(pg);
-    try testing.expect(std.mem.endsWith(u8, pg, "host wait 1.50 s, 40 prefill GEMM calls, 0 GPU drains"));
     const d = try std.fmt.allocPrint(a, "{f}", .{DecodeLine{ .steps = 40, .tokens = 128, .wall_ns = 25_000_000_000, .r = r, .hit_rate = hitSpread(&c0, &c1, &rates), .rows = 136 }});
     defer a.free(d);
     const hl = try std.fmt.allocPrint(a, "{f}", .{HostLine{ .h = .{ .calls = 300, .barrier_ns = 9_000_000_000, .route_ns = 1_500_000_000, .wave_ns = 2_250_000_000 }, .wall_ns = 25_000_000_000 }});
@@ -1139,6 +1142,8 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
     // The decode: top-8 routes with the next layer's scores (the lookahead), each layer's hit rate from its own routes.
     try s.grow(&.{ 6, 8, 5, 7 });
     p0 = s.stats();
+    const refreshed0 = s.pool.counter(.refreshed);
+    const noslot0 = s.pool.counter(.noslot);
     var c0: [4]LayerCounts = undefined;
     for (&c0, 0..) |*c, l| c.* = s.layerCounts(@intCast(l));
     var per_layer: [4]LayerCounts = @splat(.{});
@@ -1179,15 +1184,19 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
     try testing.expectEqual(demand_bytes, s1.expert_bytes_read - p0.expert_bytes_read);
     try testing.expectEqual(demand_bytes - (s1.adopt_bytes - p0.adopt_bytes) + (s1.spec_bytes - p0.spec_bytes), decode.ssd_bytes);
     try testing.expect(decode.spec_issued > 0 and decode.spec_used <= decode.spec_issued and decode.ahead_records == 0);
-    // The lookahead's precision: every record read ahead counted at its top-k position (the prompt pass read none
-    // ahead), its target call routing at least the ones it claimed.
+    // The lookahead's precision: every record the selector chose for the next routed layer counted at its top-k
+    // position (the prompt pass chose none), its target call routing at least the ones it claimed. The pool issued each
+    // chosen record, refreshed it (its record of an earlier step still live) or skipped it for want of a slot: which one
+    // depends on how far the reads got, the sum does not.
     const by1 = s.lookaheadByRank();
     var la: [2]u64 = .{ 0, 0 };
     for (by1[0]) |x| {
         la[0] += x[0];
         la[1] += x[1];
     }
-    try testing.expectEqual(decode.spec_issued, la[0]);
+    const refreshed: u64 = @intCast(s.pool.counter(.refreshed) - refreshed0);
+    const noslot: u64 = @intCast(s.pool.counter(.noslot) - noslot0);
+    try testing.expectEqual(decode.spec_issued + refreshed + noslot, la[0]);
     try testing.expect(la[1] >= decode.spec_used and la[1] <= la[0]);
     var c1: [4]LayerCounts = undefined;
     for (&c1, 0..) |*c, l| c.* = s.layerCounts(@intCast(l));
@@ -1285,7 +1294,7 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     try glm.writeResidents(a, testing.io, tmp.dir, &model);
     var rbuf: [512]u8 = undefined;
     const dir = try exl3_bank.tmpRoot(&tmp, &rbuf);
-    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3, .expert_lookahead_budget = 3, .expert_lookahead_max_rank = 2 };
+    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3, .expert_lookahead_budget = 3 };
     defer cfg.deinit(a);
     var weights = try sdk.loader.dir(testing.io, a, dir, .{});
     defer weights.deinit();
@@ -1301,24 +1310,15 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     try testing.expectEqual(m.inputs.prompt_cache, @as(u64, limit));
     try testing.expectEqual(bill_mod.prefillCacheBytes(sdk.memory.totalMemBytes()), m.inputs.prompt_cache);
     try testing.expectEqual(m.inputs.prompt_cache, bill_mod.termsOf(m.inputs).mlx_cache[0]);
-    // The setting's lookahead budget and rank cap are the stream's.
+    // The setting's lookahead budget is the stream's.
     try testing.expectEqual(@as(u32, 3), m.stream.selector.?.budget);
-    try testing.expectEqual(@as(u32, 2), m.stream.selector.?.max_rank);
     try testing.expectEqual(@as(usize, 8), m.decode_rows.len);
     for (m.prompt_rows, m.decode_rows) |p, d| {
         try testing.expectEqual(@as(u32, 3), p);
         try testing.expectEqual(@as(u32, 5), d);
     }
     const prompt = [_]u32{ 3, 17, 9, 101, 44, 250, 7, 63, 12, 5, 99, 31 };
-    const q0 = m.math.prefillStats();
     const logits = try m.prefillAt(0, &prompt);
-    // The prompt's slices past sushi's decode rows ran the prefill GEMM over host slots: no wait on the GPU. Sushi's
-    // moePrefillHost served them only where the quant's own table did not (`prefillTabled`, the tensor units).
-    const q1 = m.math.prefillStats();
-    try testing.expectEqual(m.math.gemm == null, q1[0] > q0[0]);
-    try testing.expectEqual(q0[1], q1[1]);
-    // The prompt line's counts: the pass's GEMM calls, no drain.
-    try testing.expectEqual([2]u64{ q1[0] - q0[0], 0 }, m.prompt_gemm.?);
     var t = try m.g.hostArgmax(logits);
     _ = mlx.mlx_array_free(logits);
     try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });

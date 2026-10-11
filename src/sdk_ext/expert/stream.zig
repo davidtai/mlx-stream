@@ -399,8 +399,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// demand jobs run (0 = demand idle).
             idle_busy: u32 = 0,
             preread: bool = true,
-            /// Candidates past this top-k position of their best row are never read ahead (`max_k`: none dropped).
-            max_rank: u32 = expert_lookahead.max_k,
         };
 
         pub const Event = struct {
@@ -661,10 +659,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     };
                 }
                 var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
-                if (opt.lookahead) |la| {
-                    selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
-                    selector.?.max_rank = la.max_rank;
-                }
+                if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
                 errdefer if (selector) |*sel| sel.deinit(a);
                 // The pool writes the event word until it stops.
                 var word: ?*i64 = null;

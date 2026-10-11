@@ -705,18 +705,20 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
     _ = try s.releaseTransient();
     try s.grow(&rows);
     // Routed layer 0's call: its K3 route held, its K4 route steps with the next layer's scores, in order for experts
-    // 5 (K4), 2 (K3), 6 (K3), 7 (K4) of routed layer 1, none resident. Each speculative chunk held 100-200 ms on the
-    // two speculative threads: 5 and 2 in flight, 6 and 7 queued when the next call routes.
+    // 5 (K4), 2 (K3), 6 (K3), 7 (K4) of routed layer 1, none resident. The pool's test hold lets two records start:
+    // the two speculative threads take 5 and 2 and wait at the start of their first chunk until a claim lets them go;
+    // 6 and 7 stay queued when the next call routes.
     var scores: [16]f32 = @splat(0);
     scores[5] = 9;
     scores[2] = 8.5;
     scores[6] = 8;
     scores[7] = 7.5;
     const q3raw = struct {
-        extern fn q3ld_test_spec_delay(max_ns: i64) void;
+        extern fn q3ld_test_spec_hold(starts: i32) void;
+        extern fn q3ld_test_spec_held(n: i32, timeout_ns: i64) i32;
     };
-    q3raw.q3ld_test_spec_delay(200 * std.time.ns_per_ms);
-    defer q3raw.q3ld_test_spec_delay(0);
+    q3raw.q3ld_test_spec_hold(2);
+    defer q3raw.q3ld_test_spec_hold(-1);
     const r0 = try s.routeHeld(0, &.{ 0, 4 });
     const r1 = try s.route(1, &.{ 1, 3 }, &scores);
     for ([_]*Stream.Route{ r0, r1 }) |r| for (0..r.n_parts) |p| try s.waitDown(r, @intCast(p));
@@ -724,9 +726,8 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
     s.release(r1);
     try testing.expectEqual(@as(u64, 4), s.stats().spec_issued);
     // The demand reads done, the two speculative threads start (a chunk starts with at most one demand job running):
-    // 50 ms later records 5 and 2 are in flight (their first chunk held 100-200 ms) and 6 and 7 still queued.
-    var ts: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&ts, null);
+    // records 5 and 2 wait at the hold, 6 and 7 stay queued.
+    try testing.expectEqual(@as(i32, 0), q3raw.q3ld_test_spec_held(2, 10 * std.time.ns_per_s));
     // Routed layer 1's call: its held K3 route claims 2 (in flight) and reads 6 itself (queued); nothing is settled
     // before its K4 route, which claims 5 and reads 7 itself. Every mini's two ranges of 2 and 5 are served from the
     // records (5's read at its K4 span).

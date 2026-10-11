@@ -64,9 +64,14 @@ comptime {
     _ = @import("glm_moe_dsa_cache.zig");
     _ = @import("glm_moe_dsa_graph.zig");
     _ = @import("glm_moe_dsa_experts.zig");
+    _ = @import("glm_moe_dsa_topk.zig");
     _ = @import("glm_moe_dsa_module.zig");
     _ = @import("glm_moe_dsa_plugin.zig");
     _ = @import("glm_moe_dsa_parity.zig");
     _ = @import("glm_moe_dsa_mtp.zig");
     _ = @import("glm_moe_dsa_mtp_parity.zig");
+    _ = @import("glm53_exl3_kernels.zig");
+    _ = @import("glm53_exl3_selfcheck.zig");
+    _ = @import("glm53_exl3_routes.zig");
+    _ = @import("glm53_exl3_quant.zig");
 }

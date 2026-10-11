@@ -198,9 +198,9 @@ the arch loads it in place of the affine bank:
 - A call's ids split by bank layer: the K3 and K4 routes are live together and their reads run in parallel.
 - The lookahead reads ahead the next routed layer's experts over both its bank layers, each record at its own bank
   layer's length.
-- The expert math is sushi's EXL3 MoE (`lib/sushi`, the davidtai fork). Each routed (token, expert) pair is one row of
-  its 4 minis. Decode waves run the decode chain. A prompt slice past 16 pairs runs the prefill GEMM over the slots the
-  host holds, so nothing waits for the GPU.
+- The expert math is sushi's EXL3 MoE (`lib/sushi`). Each routed (token, expert) pair is one row of its 4 minis.
+  Decode waves run the decode chain. A prompt slice past 16 pairs runs sushi's prefill GEMM; on the tensor units the
+  plugin builds its routing table from the slots the host holds (`prefillTabled`), so nothing waits for the GPU.
 - The fill counts units: one unit is 1/128 of each bank layer's experts (148 K3 and 108 K4 experts per layer),
   rounded down per bank layer.
 
@@ -218,7 +218,6 @@ Settings (`model-settings.json`):
 | `mtp_acceptance` | `exact` or `typical` | `exact` |
 | `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |
 | `expert_lookahead_budget` | the decode lookahead's records read ahead per routed call, 1 to 4 | 2 |
-| `expert_lookahead_max_rank` | the decode lookahead reads ahead only the candidates at the first N top-k positions of their row, 1 to 8 | all |
 
 Memory: the fill counts units of slot rows. On the affine bank a unit is one 21.2 MB record on each of the 75 routed
 layers (1.59 GB); on the EXL3 bank (`expert-manifest-exl3-v1.json`) a unit is each bank layer's share of its experts,
@@ -254,8 +253,7 @@ and its bytes read and served, and the share of the decode with a read in flight
 memory: MLX's active and peak bytes and its cache, the footprint and its peak, and the host side. A `glm_moe_dsa:
 decode host split` line gives the decode lane's host time: the routing barriers' waits, the routes, the waves' encode.
 A `glm_moe_dsa: lookahead precision` line gives, per top-k position of the candidate's best row (and per bank layer
-with the EXL3 bank), the records read ahead and how many of them the next routed layer's call routed. With the EXL3
-bank, the prompt line also counts the prefill GEMM calls and the GPU drains.
+with the EXL3 bank), the records read ahead and how many of them the next routed layer's call routed.
 
 At each prompt the residency policy keeps the residents of the prompt rows and forgets its prompt state
 (`LayerPolicy.forgetPrompt` at the reverse phase change, `keep_residents`). The decode policy's transition counts and

@@ -101,6 +101,11 @@ uint64_t q3ld_mtl_value(void *event);
 void q3ld_test_rules(int32_t n, const int64_t *off, const int64_t *code, const int64_t *arg);
 void q3ld_test_delay(uint64_t seed, int64_t max_ns);
 void q3ld_test_spec_delay(int64_t max_ns);
+/* The speculative hold: `starts` >= 0 turns it on with that many records still allowed to start (-1 turns it off);
+ * a started unclaimed record's chunk waits at its start while it is on (a claim or the hold's end lets it go).
+ * q3ld_test_spec_held waits until n records wait there: 0, or 1 at the timeout. */
+void q3ld_test_spec_hold(int32_t starts);
+int32_t q3ld_test_spec_held(int32_t n, int64_t timeout_ns);
 int64_t q3ld_test_events(int64_t *buf, int64_t cap);
 int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap);
 #endif

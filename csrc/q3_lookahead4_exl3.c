@@ -369,6 +369,19 @@ void q3ld_test_spec_delay(int64_t max_ns) {
     pthread_mutex_unlock(&mu);
 }
 
+/* HOLD (spec_hold >= 0): only spec_hold more records may start (SPEC_MAY_START, SPEC_STARTED), and a started
+ * unclaimed record's chunk waits at its start (spec_hold_wait); spec_held counts the records waiting there, hold_cv
+ * tells q3ld_test_spec_held of a change.  A claim (spec_cv) or the hold's end (-1) lets a record go. */
+static int spec_hold = -1, spec_held = 0;
+static pthread_cond_t hold_cv = PTHREAD_COND_INITIALIZER;
+
+void q3ld_test_spec_hold(int32_t starts) {
+    pthread_mutex_lock(&mu);
+    spec_hold = starts < 0 ? -1 : starts;
+    pthread_cond_broadcast(&spec_cv);
+    pthread_mutex_unlock(&mu);
+}
+
 /* Python-owned int64[5 * cap]; n = 0 resets.  Returns entries written so far. */
 int64_t q3ld_test_events(int64_t *buf, int64_t cap) {
     pthread_mutex_lock(&mu);
@@ -433,6 +446,9 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
 #define RANGE_DELAY() range_delay()
 #define SPEC_DELAY() spec_delay()
 #define EV(kind, arg) ev((kind), (arg))
+#define SPEC_HOLD(s) spec_hold_wait(s)
+#define SPEC_MAY_START(s) (spec_hold != 0 || (s)->state != SP_QUEUED)
+#define SPEC_STARTED() do { if (spec_hold > 0) spec_hold -= 1; } while (0)
 #else
 static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
     ssize_t r;
@@ -442,6 +458,9 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
 #define RANGE_DELAY() ((void)0)
 #define SPEC_DELAY() ((void)0)
 #define EV(kind, arg) ((void)0)
+#define SPEC_HOLD(s) ((void)0)
+#define SPEC_MAY_START(s) 1
+#define SPEC_STARTED() ((void)0)
 #endif
 
 #define LATE(deadline) ((deadline) >= 0 && q3ld_monotonic_ns() >= (deadline))
@@ -1066,15 +1085,39 @@ static void spec_drop_parked(spec_t *s) {   /* caller holds mu; s is INFLIGHT &&
     pthread_cond_broadcast(&land_cv);
 }
 
+#ifdef Q3LD_INJECT
+static void spec_hold_wait(const spec_t *s) {   /* caller holds mu */
+    if (spec_hold < 0 || s->claimed) return;
+    spec_held += 1;
+    pthread_cond_broadcast(&hold_cv);
+    while (spec_hold >= 0 && !s->claimed && !stopping) pthread_cond_wait(&spec_cv, &mu);
+    spec_held -= 1;
+    pthread_cond_broadcast(&hold_cv);
+}
+
+int32_t q3ld_test_spec_held(int32_t n, int64_t timeout_ns) {
+    struct timespec dl;
+    abs_realtime(&dl, timeout_ns);
+    pthread_mutex_lock(&mu);
+    int32_t rc = 0;
+    while (spec_held < n) {
+        if (pthread_cond_timedwait(&hold_cv, &mu, &dl) == ETIMEDOUT) { rc = 1; break; }
+    }
+    pthread_mutex_unlock(&mu);
+    return rc;
+}
+#endif
+
 static void *spec_worker(void *arg) {
     int ti = (int)(intptr_t)arg;
     pthread_mutex_lock(&mu);
     for (;;) {
         int i;
-        while (!stopping && !((i = spec_pick()) >= 0 && startable(&spec[i], ti))) pthread_cond_wait(&spec_cv, &mu);
+        while (!stopping && !((i = spec_pick()) >= 0 && startable(&spec[i], ti) && SPEC_MAY_START(&spec[i]))) pthread_cond_wait(&spec_cv, &mu);
         if (stopping) break;
         spec_t *s = &spec[i];
         if (s->state == SP_QUEUED) {
+            SPEC_STARTED();
             s->state = SP_INFLIGHT;
             sc[SC_STARTED] += 1;
             int64_t want_end = s->base + s->len;                  /* EXL3_LANE_PORT: this record's length */
@@ -1127,6 +1170,7 @@ static void *spec_worker(void *arg) {
                 }
             }
             EV(s->claimed ? 7 : (ti > 0 ? 8 : 3), s->claimed ? s->base : nq);
+            SPEC_HOLD(s);
             int64_t n = s->span - s->got;
             if (n > spec_chunk) n = spec_chunk;
             char *dst = s->buf + s->got;

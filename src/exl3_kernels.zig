@@ -8,6 +8,7 @@
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const bo = @import("build_flags.zig");
+const kset = @import("sdk_ext/kernel_set.zig");
 /// The registry's self-check plan (`sdk_ext.kernels.KernelSet(R)` runs it at each consumer's accept).
 pub const selfcheck = @import("exl3_selfcheck.zig");
 
@@ -17,13 +18,10 @@ const Allocator = std.mem.Allocator;
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
 pub const manifest_sha256 = "9ddcfccac89c1633d708bd43035fec5fb690c7e248b46c7cb567d0cde6f8a9cd";
 
-/// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
-/// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
-pub const launch_observed: bool = if (@hasDecl(bo, "dsv41_decode_timers")) bo.dsv41_decode_timers else false;
-/// A launch config's template key (`launchKey`), kept with its prepared config.
-pub const LaunchKey = if (launch_observed) u64 else void;
-/// The observer a profile hook installs: the kernel's name, the launch key and the inputs.
-pub const Observer = if (launch_observed) ?*const fn ([]const u8, u64, []const mlx.mlx_array) void else void;
+/// G7: the decode-timers build's launch probe (`sdk_ext/kernel_set.zig`: its build flag, keys and observer).
+pub const launch_observed = kset.launch_observed;
+pub const LaunchKey = kset.LaunchKey;
+pub const Observer = kset.Observer;
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
@@ -294,8 +292,8 @@ pub const Arg = struct {
     row_axis: u8,
 };
 
-pub const TemplateValue = union(enum) { int: i32, dtype: mlx.mlx_dtype };
-pub const TemplateArg = struct { name: [:0]const u8, value: TemplateValue };
+pub const TemplateValue = kset.TemplateValue;
+pub const TemplateArg = kset.TemplateArg;
 
 /// An explicit launch of a plan kernel at (site, rows): rcproj per site and M, sinkhorn per n.
 pub const Plan = struct {
@@ -456,10 +454,7 @@ pub const Registry = struct {
     /// Parses the manifest, checks it against `pin` (hex sha256) and every text against it,
     /// once. Production passes `embedded` and `manifest_sha256`.
     pub fn init(gpa: Allocator, texts: *const Texts, pin: []const u8, diag: ?*Diag) (Refusal || Allocator.Error)!Registry {
-        var d: [32]u8 = undefined;
-        Sha256.hash(texts.manifest, &d, .{});
-        const got = std.fmt.bytesToHex(d, .lower);
-        if (!std.mem.eql(u8, &got, pin)) return refuse(diag, error.ManifestNotPinned, "exl3 kernels: manifest sha256 {s} is not the pinned {s}", .{ &got, pin });
+        const got = try kset.checkPin(texts.manifest, pin, "exl3 kernels", diag);
         var reg: Registry = .{
             .arena = std.heap.ArenaAllocator.init(gpa),
             .entries = undefined,
@@ -484,7 +479,7 @@ pub const Registry = struct {
         reg.codebook = m.bank.codebook;
         reg.multiplier = m.bank.multiplier;
         reg.ks = m.bank.K;
-        try reg.adoptHeaders(texts, m.headers, diag);
+        try kset.adoptHeaders(Header, &texts.headers, m.headers, "exl3 kernels", diag);
         try reg.adoptAddenda(a, texts, m.port_addenda, diag);
         try reg.adoptKernels(a, texts, m.kernels, diag);
         reg.golden = try adoptGolden(m.golden, diag);
@@ -533,32 +528,13 @@ pub const Registry = struct {
         }
     }
 
-    fn adoptHeaders(self: *Registry, texts: *const Texts, hs: []const JText, diag: ?*Diag) Refusal!void {
-        _ = self;
-        var seen: std.EnumSet(Header) = .empty;
-        for (hs) |h| {
-            const id = std.meta.stringToEnum(Header, h.id orelse "") orelse return refuse(diag, error.UnknownHeader, "exl3 kernels: manifest header \"{s}\" is not one this build embeds", .{h.id orelse ""});
-            if (seen.contains(id)) return refuse(diag, error.SchemaInvalid, "exl3 kernels: header {t} listed twice", .{id});
-            seen.insert(id);
-            try checkText(texts.headers[@backingInt(id)], h, @tagName(id), diag);
-        }
-        if (seen.count() != n_headers) return refuse(diag, error.MissingHeader, "exl3 kernels: the manifest lists {d} of {d} headers", .{ seen.count(), n_headers });
-    }
-
     fn adoptKernels(self: *Registry, a: Allocator, texts: *const Texts, ks: []const JKernel, diag: ?*Diag) (Refusal || Allocator.Error)!void {
-        var seen: std.EnumSet(Kernel) = .empty;
+        var tally: kset.Tally(Kernel) = .{};
         for (ks) |j| {
-            const k = std.meta.stringToEnum(Kernel, j.name) orelse return refuse(diag, error.UnknownKernel, "exl3 kernels: manifest kernel \"{s}\" is not one this build implements", .{j.name});
-            if (seen.contains(k)) return refuse(diag, error.DuplicateKernel, "exl3 kernels: {t} listed twice", .{k});
-            seen.insert(k);
+            const k = try tally.admit(j.name, "exl3 kernels", diag);
             self.entries[@backingInt(k)] = try adoptKernel(a, texts, k, j, self.headers, diag);
         }
-        if (seen.count() != n_kernels) {
-            const absent = seen.complement();
-            var it = absent.iterator();
-            const missing = it.next().?;
-            return refuse(diag, error.MissingKernel, "exl3 kernels: the manifest does not list {t} ({d} of {d})", .{ missing, seen.count(), n_kernels });
-        }
+        try tally.done("exl3 kernels", diag);
         try checkVariants(&self.entries, diag);
     }
 
@@ -573,12 +549,8 @@ pub const Registry = struct {
             var out_names: [max_outputs][*:0]const u8 = undefined;
             for (e.inputs, 0..) |arg, n| in_names[n] = arg.name.ptr;
             for (e.outputs, 0..) |arg, n| out_names[n] = arg.name.ptr;
-            const vin = mlx.mlx_vector_string_new_data(&in_names, e.inputs.len);
-            defer _ = mlx.mlx_vector_string_free(vin);
-            const vout = mlx.mlx_vector_string_new_data(&out_names, e.outputs.len);
-            defer _ = mlx.mlx_vector_string_free(vout);
-            b.kernels[i] = mlx.mlx_fast_metal_kernel_new(e.mlx_name.ptr, vin, vout, e.source.ptr, self.header(e).ptr, e.ensure_row_contiguous, false);
-            if (b.kernels[i].ctx == null) return refuse(diag, error.KernelCreateFailed, "exl3 kernels: mlx_fast_metal_kernel_new({t}) failed", .{e.kernel});
+            b.kernels[i] = kset.newKernel(e.mlx_name.ptr, in_names[0..e.inputs.len], out_names[0..e.outputs.len], e.source.ptr, self.header(e).ptr, e.ensure_row_contiguous) orelse
+                return refuse(diag, error.KernelCreateFailed, "exl3 kernels: mlx_fast_metal_kernel_new({t}) failed", .{e.kernel});
         }
         return b;
     }
@@ -588,103 +560,22 @@ pub const Registry = struct {
 /// built once (`Bound.prepare`) and handed to every launch at that geometry (`applyPrepared`).
 /// mlx copies what a launch needs when it is applied, so `deinit` is safe once the last
 /// `applyPrepared` using it has returned (its outputs need not be evaluated yet).
-pub const Prepared = struct {
-    kernel: Kernel,
-    config: mlx.mlx_fast_metal_kernel_config,
-    n_out: usize,
-    /// its template arguments' key (the observer's; profile builds only)
-    tkey: LaunchKey = if (launch_observed) 0 else {},
+pub const Prepared = kset.Prepared(Kernel);
 
-    pub fn deinit(self: *Prepared) void {
-        _ = mlx.mlx_fast_metal_kernel_config_free(self.config);
-        self.* = undefined;
-    }
-};
+/// The kernels built on one GPU stream (`Registry.bind`); freed after that stream has drained: `prepare` builds a
+/// launch's mlx config once (a route's construction), `applyPrepared` launches it, `apply` builds one for one launch
+/// (the per-call path of the prefill routes whose geometry varies per call), `observe` installs the profile hook's
+/// launch probe.
+pub const Bound = kset.BoundOf(@This());
 
-/// The kernels built on one GPU stream; freed after that stream has drained.
-pub const Bound = struct {
-    reg: *const Registry,
-    stream: mlx.mlx_stream,
-    kernels: [n_kernels]mlx.mlx_fast_metal_kernel,
-    /// the profile hook's launch probe (`observe`); void outside the decode-timers build
-    observer: Observer = if (launch_observed) null else {},
-
-    pub fn deinit(self: *Bound) void {
-        for (self.kernels) |k| {
-            if (k.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(k);
-        }
-        self.* = undefined;
-    }
-
-    /// Every later launch reaches the hook's launch probe `L` (`sdk_ext.profile.Hook.launch`), at construction, before
-    /// the first: a no-op unless the build observes launches and `L` is enabled.
-    pub fn observe(self: *Bound, comptime L: type) void {
-        if (comptime launch_observed and L.enabled) self.observer = &L.kernel;
-    }
-
-    /// A launch's mlx config built once (a route's construction): `applyPrepared` hands it to the
-    /// kernel with no per-launch config work. The caller owns it (`Prepared.deinit`).
-    pub fn prepare(self: *const Bound, k: Kernel, cfg: *const LaunchConfig) error{MlxError}!Prepared {
-        _ = self;
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        for (0..cfg.n_out) |i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &cfg.out_shapes[i], cfg.out_ranks[i], cfg.out_dtypes[i]));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @intCast(cfg.grid[0]), @intCast(cfg.grid[1]), @intCast(cfg.grid[2])));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, @intCast(cfg.threadgroup[0]), @intCast(cfg.threadgroup[1]), @intCast(cfg.threadgroup[2])));
-        for (cfg.template) |t| switch (t.value) {
-            .int => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t.name.ptr, v)),
-            .dtype => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, t.name.ptr, v)),
-        };
-        var p: Prepared = .{ .kernel = k, .config = c, .n_out = cfg.n_out };
-        if (comptime launch_observed) {
-            var names: [16][]const u8 = undefined;
-            var values: [16]i64 = undefined;
-            const nt = @min(cfg.template.len, names.len);
-            for (cfg.template[0..nt], names[0..nt], values[0..nt]) |t, *n, *v| {
-                n.* = t.name;
-                v.* = switch (t.value) {
-                    .int => |x| x,
-                    .dtype => |x| @backingInt(x),
-                };
-            }
-            p.tkey = launchKey(names[0..nt], values[0..nt]);
-        }
-        return p;
-    }
-
-    /// One launch of a prepared config; `outs` receives `p.n_out` new arrays (caller frees).
-    pub fn applyPrepared(self: *const Bound, p: *const Prepared, inputs: []const mlx.mlx_array, outs: []mlx.mlx_array) error{MlxError}!void {
-        const vin = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
-        defer _ = mlx.mlx_vector_array_free(vin);
-        var vout = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(vout);
-        if (comptime launch_observed) if (self.observer) |f| f(@tagName(p.kernel), p.tkey, inputs);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&vout, self.kernels[@backingInt(p.kernel)], vin, p.config, self.stream));
-        for (outs[0..p.n_out], 0..) |*o, i| {
-            o.* = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(o, vout, i));
-        }
-    }
-
-    /// One launch of `k` with `cfg`, its config built for this launch only; `outs` receives
-    /// `cfg.n_out` new arrays (caller frees). The per-call path: the prefill routes whose geometry
-    /// varies per call; decode routes launch prepared configs (`prepare` / `applyPrepared`).
-    pub fn apply(self: *const Bound, k: Kernel, inputs: []const mlx.mlx_array, cfg: *const LaunchConfig, outs: []mlx.mlx_array) error{MlxError}!void {
-        var p = try self.prepare(k, cfg);
-        defer p.deinit();
-        try self.applyPrepared(&p, inputs, outs);
-    }
-};
-
-/// The template key of a launch config's template arguments (name, then the value's bytes).
-pub fn launchKey(names: []const []const u8, values: []const i64) u64 {
-    var h = std.hash.Wyhash.init(0x5eed);
-    for (names, values) |n, v| {
-        h.update(n);
-        h.update(std.mem.asBytes(&v));
-    }
-    return h.final();
+/// `cfg` as the mlx launch (`Bound.prepare`).
+pub fn launchOf(reg: *const Registry, k: Kernel, cfg: *const LaunchConfig, shapes: *[max_outputs][]const c_int, template: *[16]TemplateArg) kset.Launch {
+    _ = .{ reg, k, template };
+    for (0..cfg.n_out) |i| shapes[i] = cfg.out_shapes[i][0..cfg.out_ranks[i]];
+    return .{ .grid = cfg.grid, .threadgroup = cfg.threadgroup, .out_shapes = shapes[0..cfg.n_out], .out_dtypes = cfg.out_dtypes[0..cfg.n_out], .template = cfg.template };
 }
+
+pub const launchKey = kset.launchKey;
 
 // ── Manifest adoption (once, at init) ──
 
@@ -765,19 +656,10 @@ fn adoptPredecessors(a: Allocator, js: []const JPredecessor, diag: ?*Diag) (Refu
     return out;
 }
 
-fn hexSha(s: []const u8) ?[32]u8 {
-    if (s.len != 64) return null;
-    var out: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch return null;
-    return out;
-}
+const hexSha = kset.hexSha;
 
 fn checkText(text: []const u8, j: JText, what: []const u8, diag: ?*Diag) Refusal!void {
-    const want = hexSha(j.sha256) orelse return refuse(diag, error.SchemaInvalid, "exl3 kernels: {s}: sha256 \"{s}\" is not 64 hex", .{ what, j.sha256 });
-    var d: [32]u8 = undefined;
-    Sha256.hash(text, &d, .{});
-    if (!std.mem.eql(u8, &d, &want) or text.len != j.bytes)
-        return refuse(diag, error.TextSha256Mismatch, "exl3 kernels: {s} text ({d} B) differs from the manifest ({d} B, sha256 {s})", .{ what, text.len, j.bytes, j.sha256 });
+    return kset.checkText(text, j.sha256, j.bytes, "exl3 kernels", what, diag);
 }
 
 /// A lane pin (the full sha256, or the 16-hex prefix an install record prints) over the
@@ -1167,11 +1049,7 @@ fn initOrPrint(texts: *const Texts, pin: []const u8) !Registry {
     };
 }
 
-fn shaHex(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
+const shaHex = kset.shaHex;
 
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);

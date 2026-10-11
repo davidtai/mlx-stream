@@ -55,7 +55,7 @@ test "dsv41 lookahead: the union is ordered by best rank over rows, then score" 
     try testing.expectEqualSlices(u16, &.{ 7, 1, 9, 4 }, sel.select(&s, &res, out[0..sel.budget]));
 }
 
-test "dsv41 lookahead: the chosen experts' top-k positions come back with them, and a rank cap drops the candidates past it" {
+test "dsv41 lookahead: the chosen experts' top-k positions come back with them" {
     const a = testing.allocator;
     var sel = try Selector.init(a, 16, 8, std.math.inf(f32), 4);
     defer sel.deinit(a);
@@ -70,10 +70,6 @@ test "dsv41 lookahead: the chosen experts' top-k positions come back with them, 
     var ranks: [max_budget]u8 = undefined;
     try testing.expectEqualSlices(u16, &.{ 7, 1, 9, 4 }, sel.selectWith(&s, &res, resident, &out, &ranks));
     try testing.expectEqualSlices(u8, &.{ 0, 2, 3, 4 }, &ranks);
-    // Only the candidates at the first 3 positions of their row: 7 (0) and 1 (2) are not resident.
-    sel.max_rank = 3;
-    try testing.expectEqualSlices(u16, &.{ 7, 1 }, sel.selectWith(&s, &res, resident, &out, &ranks));
-    try testing.expectEqualSlices(u8, &.{ 0, 2 }, ranks[0..2]);
 }
 
 test "dsv41 lookahead: tau keeps a candidate within tau of its row's sixth score" {
