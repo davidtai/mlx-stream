@@ -65,11 +65,7 @@ test "dsv41 lookahead: the chosen experts' top-k positions come back with them, 
         &.{ .{ 3, 0.9 }, .{ 7, 0.8 }, .{ 1, 0.7 }, .{ 9, 0.6 }, .{ 4, 0.5 }, .{ 2, 0.4 }, .{ 11, 0.3 }, .{ 5, 0.2 }, .{ 13, 0.1 } },
         &.{ .{ 7, 0.95 }, .{ 5, 0.85 }, .{ 3, 0.75 }, .{ 12, 0.65 }, .{ 1, 0.55 }, .{ 0, 0.45 }, .{ 2, 0.35 }, .{ 8, 0.25 }, .{ 14, 0.15 } },
     });
-    const resident = struct {
-        fn f(p: *const LayerPolicy, e: u16) bool {
-            return p.slotOf(e) != null;
-        }
-    }.f;
+    const resident = lookahead.residentIn;
     var out: [max_budget]u16 = undefined;
     var ranks: [max_budget]u8 = undefined;
     try testing.expectEqualSlices(u16, &.{ 7, 1, 9, 4 }, sel.selectWith(&s, &res, resident, &out, &ranks));

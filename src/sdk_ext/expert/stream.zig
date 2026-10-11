@@ -1162,11 +1162,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const sel = &self.selector.?;
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
                     var ranks: [expert_lookahead.max_budget]u8 = undefined;
-                    const picked = sel.selectWith(scores, &self.layers[next].policy, struct {
-                        fn f(p: *const LayerPolicy, e: u16) bool {
-                            return p.slotOf(e) != null;
-                        }
-                    }.f, chosen[0..sel.budget], ranks[0..sel.budget]);
+                    const picked = sel.selectWith(scores, &self.layers[next].policy, expert_lookahead.residentIn, chosen[0..sel.budget], ranks[0..sel.budget]);
                     if (self.recorder) |rec| rec.spec(r.rec, picked);
                     for (picked) |e| {
                         bases[n] = @intCast(self.bank.recordOffset(next, e));
