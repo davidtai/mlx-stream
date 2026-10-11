@@ -208,6 +208,9 @@ enum {
     SC_DIAG_WQ_N, SC_DIAG_WQ_NS = SC_DIAG_WQ_N + 5, SC_DIAG_IDLE_N = SC_DIAG_WQ_NS + 5, SC_DIAG_IDLE_NS,
     SC_DIAG_IDLE_MAX_NS, SC_DIAG_FULL_N, SC_DIAG_FULL_NS, SC_DIAG_FULL_PRE_N, SC_DIAG_HIST,
     SC_DIAG_OCC_NS = SC_DIAG_HIST + 8, SC_DIAG_QLEN_NS = SC_DIAG_OCC_NS + 9, SC_DIAG_GAP_NS,
+    /* DIAG (claim cut): records claimed in flight and cut at their chunk in progress; demand ranges past a cut read
+     * from the file; cut records ended at the cut */
+    SC_DIAG_CUTS, SC_DIAG_CUT_SELF, SC_DIAG_CUT_ENDS,
     SC_N
 };
 
@@ -265,6 +268,7 @@ typedef struct {
     int64_t span;       /* physical bytes to read from `aligned` (page-aligned end, capped at EOF / slot) */
     int64_t got;        /* physical bytes read so far (contiguous from `aligned`) */
     int64_t landed;     /* payload bytes from `base` present in buf */
+    int64_t stop;       /* CUT: claimed in flight, the speculative thread reads only to here (physical; -1 = all) */
     int32_t readers;    /* demand ranges copying out of buf */
     int32_t adopted;    /* ranges served since it was queued */
     char *buf;
@@ -867,6 +871,12 @@ static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
         if (s->landed >= need && (s->state == SP_LANDED || s->state == SP_INFLIGHT)) break;
         /* adoptable only if it will land: a landed-short record (EOF) or an unclaimed / queued one is not */
         if (s->state != SP_INFLIGHT || !s->claimed) { pthread_mutex_unlock(&mu); return -1; }
+        /* CUT: past the cut the range reads from the file now, beside the other demand workers */
+        if (s->stop >= 0 && need > s->aligned + s->stop - s->base) {
+            sc[SC_DIAG_CUT_SELF] += 1;
+            pthread_mutex_unlock(&mu);
+            return -1;
+        }
         if (!waited) { waited = 1; sc[SC_ADOPT_WAITS] += 1; }
         if (job->deadline >= 0) {
             int64_t left = job->deadline - q3ld_monotonic_ns();
@@ -911,6 +921,24 @@ static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
     return ST_OK;
 }
 
+/* CUT: a record claimed while in flight stops after its chunk in progress (a parked one where it stands); its
+ * later bytes are read by the demand ranges that need them, side by side (caller holds mu) */
+static int claim_cut_on = 0;
+int q3ld_claim_cut_config(int32_t on) {
+    claim_cut_on = on != 0;
+    return 0;
+}
+static void claim_cut(spec_t *s) {
+    if (!claim_cut_on || s->state != SP_INFLIGHT || s->stop >= 0) return;
+    int64_t n = 0;
+    if (s->running) {
+        n = s->span - s->got;
+        if (n > spec_chunk) n = spec_chunk;
+    }
+    s->stop = s->got + n;
+    sc[SC_DIAG_CUTS] += 1;
+}
+
 /* a demand job's ranges claim the records that contain them (caller holds mu) */
 static void claim_ranges(int fd, int64_t first, int32_t count) {
     int woke = 0;
@@ -928,7 +956,7 @@ static void claim_ranges(int fd, int64_t first, int32_t count) {
             s->abandon = 0;
             sc[SC_CLAIMED] += 1;
             sc[SC_H_CLAIMED + hidx(s)] += 1;
-            if (s->state == SP_INFLIGHT) { sc[SC_CLAIMED_INFLIGHT] += 1; woke = 1; }
+            if (s->state == SP_INFLIGHT) { sc[SC_CLAIMED_INFLIGHT] += 1; woke = 1; claim_cut(s); }
         }
     }
     if (woke) pthread_cond_broadcast(&spec_cv);
@@ -1234,6 +1262,11 @@ static void *spec_worker(void *arg) {
                 else { sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); }
                 break;
             }
+            if (s->claimed && s->stop >= 0 && s->got >= s->stop) {   /* CUT: the demand side reads the rest */
+                sc[SC_DIAG_CUT_ENDS] += 1;
+                spec_end(s, s->landed > 0 ? SP_LANDED : SP_FAILED);
+                break;
+            }
             if (!s->claimed && !stopping && s->prio > 0 && (!rule_ok(ti) || nearer_queued(s->prio))) {
                 /* PARK: free this thread for demand-nearer work; any thread resumes the record later */
                 sc[SC_PARKS] += 1;
@@ -1511,6 +1544,7 @@ static int32_t issue(int32_t fd, int64_t file_size, int64_t cur, int64_t tag, in
         s->len = len;                                   /* EXL3_LANE_PORT */
         s->aligned = b / page_size * page_size;
         s->span = s->got = s->landed = 0;
+        s->stop = -1;
         s->adopted = 0;
         sc[SC_SUBMITTED] += 1;
         sc[SC_H_SUBMITTED + origin - 1] += 1;
@@ -1824,7 +1858,7 @@ static int32_t pre_read_with(int32_t fd, int64_t file_size, int64_t tag, int32_t
                     r->abandon = 0;
                     sc[SC_CLAIMED] += 1;
                     sc[SC_H_CLAIMED + hidx(r)] += 1;
-                    if (r->state == SP_INFLIGHT) { sc[SC_CLAIMED_INFLIGHT] += 1; woke_spec = 1; }
+                    if (r->state == SP_INFLIGHT) { sc[SC_CLAIMED_INFLIGHT] += 1; woke_spec = 1; claim_cut(r); }
                 }
                 sc[SC_PRE_CLAIMS] += 1;
                 continue;

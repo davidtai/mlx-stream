@@ -467,6 +467,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             diag_t0: i64 = 0,
             diag_end: i64 = 0,
             diag_gu_end: i64 = 0,
+            /// DIAG: the last end of its gate/up ranges served from a speculative record.
+            diag_gu_end_adopt: i64 = 0,
 
             pub fn partsOf(r: *const Route) []const Part {
                 return r.parts[0..r.n_parts];
@@ -536,6 +538,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             diag_lat_ns: i64 = 0,
             diag_gu_lat_ns: i64 = 0,
             diag_lat_hist: [6]i64 = @splat(0),
+            /// DIAG: of those, routes with a gate/up range served from a speculative record, their submit -> last
+            /// gate/up end summed, and the routes whose last gate/up range was such a range.
+            diag_adopt_n: i64 = 0,
+            diag_adopt_gu_lat_ns: i64 = 0,
+            diag_last_gu_adopted: i64 = 0,
             routes: [route_capacity]Route = @splat(.{}),
             /// Free routes (a stack) and released ones awaiting the next flush, in
             /// release order: `route` and `flush` touch only these, never the ring.
@@ -1505,6 +1512,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         if (res.status != .ok) ok = false;
                         r.diag_end = @max(r.diag_end, res.t_end_ns);
                         if (k < p.n_reads) r.diag_gu_end = @max(r.diag_gu_end, res.t_end_ns);
+                        if (k < p.n_reads and res.preadv_calls == 0 and res.payload > 0) r.diag_gu_end_adopt = @max(r.diag_gu_end_adopt, res.t_end_ns);
                         self.counters.expert_bytes_read += @intCast(@max(res.payload, 0));
                         self.counters.preadv_calls += @intCast(@max(res.preadv_calls, 0));
                         self.noteRead(res);
@@ -1726,6 +1734,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         var lim: i64 = 500_000;
                         while (h < 5 and lat >= lim) : (h += 1) lim *= 2;
                         self.diag_lat_hist[h] += 1;
+                        if (r.diag_gu_end_adopt > 0) {
+                            self.diag_adopt_n += 1;
+                            self.diag_adopt_gu_lat_ns += @max(r.diag_gu_end - r.diag_t0, 0);
+                            self.diag_last_gu_adopted += @intFromBool(r.diag_gu_end_adopt == r.diag_gu_end);
+                        }
                     }
                     for (r.hit_slots[0..r.plan.n_hits]) |s| self.locate(r.layer, s).meta.pins -= 1;
                     for (r.plan.loadsOf()) |l| self.locate(r.layer, l.slot).meta.pins -= 1;
