@@ -928,9 +928,13 @@ pub const HostLine = struct {
 
     pub fn format(p: HostLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const other = p.wall_ns -| (p.h.barrier_ns + p.h.route_ns + p.h.wave_ns);
-        try w.print("glm_moe_dsa: decode host split over {d} routed calls: barrier waits {d:.2} s, routes {d:.2} s, wave encode {d:.2} s, the rest {d:.2} s of {d:.2} s", .{
-            p.h.calls, seconds(p.h.barrier_ns), seconds(p.h.route_ns), seconds(p.h.wave_ns), seconds(other), seconds(p.wall_ns),
+        try w.print("glm_moe_dsa: decode host split over {d} routed calls: barrier waits {d:.2} s, routes {d:.2} s, wave encode {d:.2} s", .{
+            p.h.calls, seconds(p.h.barrier_ns), seconds(p.h.route_ns), seconds(p.h.wave_ns),
         });
+        if (comptime experts_mod.split_steps) try w.print(" (hit waves built {d:.2} s, their commit {d:.2} s, miss waves built {d:.2} s, the join {d:.2} s)", .{
+            seconds(p.h.hit_ns), seconds(p.h.commit_ns), seconds(p.h.miss_ns), seconds(p.h.join_ns),
+        });
+        try w.print(", the rest {d:.2} s of {d:.2} s", .{ seconds(other), seconds(p.wall_ns) });
     }
 };
 
@@ -1004,9 +1008,9 @@ test "glm stats lines: the prompt and decode lines and the per-layer hit spread,
     try testing.expect(std.mem.endsWith(u8, pg, "host wait 1.50 s, 40 prefill GEMM calls, 0 GPU drains"));
     const d = try std.fmt.allocPrint(a, "{f}", .{DecodeLine{ .steps = 40, .tokens = 128, .wall_ns = 25_000_000_000, .r = r, .hit_rate = hitSpread(&c0, &c1, &rates), .rows = 136 }});
     defer a.free(d);
-    const hl = try std.fmt.allocPrint(a, "{f}", .{HostLine{ .h = .{ .calls = 300, .barrier_ns = 9_000_000_000, .route_ns = 1_500_000_000, .wave_ns = 2_250_000_000 }, .wall_ns = 25_000_000_000 }});
+    const hl = try std.fmt.allocPrint(a, "{f}", .{HostLine{ .h = .{ .calls = 300, .barrier_ns = 9_000_000_000, .route_ns = 1_500_000_000, .wave_ns = 2_250_000_000, .hit_ns = 1_000_000_000, .commit_ns = 750_000_000, .miss_ns = 400_000_000, .join_ns = 100_000_000 }, .wall_ns = 25_000_000_000 }});
     defer a.free(hl);
-    try testing.expectEqualStrings("glm_moe_dsa: decode host split over 300 routed calls: barrier waits 9.00 s, routes 1.50 s, wave encode 2.25 s, the rest 12.25 s of 25.00 s", hl);
+    try testing.expectEqualStrings("glm_moe_dsa: decode host split over 300 routed calls: barrier waits 9.00 s, routes 1.50 s, wave encode 2.25 s (hit waves built 1.00 s, their commit 0.75 s, miss waves built 0.40 s, the join 0.10 s), the rest 12.25 s of 25.00 s", hl);
     try testing.expectEqualStrings("glm_moe_dsa: decode 40 steps, 128 tokens in 25.00 s (5.1 tok/s): 1000 routed records, 600 hits, 400 misses (hit rate per layer min 25% median 50% max 75%), 9.00 GB from the SSD (0.070 GB per emitted token), lookahead 90 issued / 60 used (landed 70, expired 12, abandoned 5, cancelled 3, discarded 7, used while in flight 4), lookahead 2.00 GB read / 1.00 GB served, 20 loads skipped, 300 direct reads, host wait 1.50 s and reads in flight 2.25 s of 25.00 s (9.0% busy, 91.0% with no read in flight), 136 rows per layer", d);
 }
 
@@ -1113,16 +1117,15 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
     try testing.expectEqual(demand_bytes, s1.expert_bytes_read - p0.expert_bytes_read);
     try testing.expectEqual(demand_bytes - (s1.adopt_bytes - p0.adopt_bytes) + (s1.spec_bytes - p0.spec_bytes), decode.ssd_bytes);
     try testing.expect(decode.spec_issued > 0 and decode.spec_used <= decode.spec_issued and decode.ahead_records == 0);
-    // The lookahead's precision: every record read ahead counted at its top-k position (the prompt pass read none
-    // ahead), its target call routing at least the ones it claimed.
+    // The lookahead's precision: every record chosen counted at its top-k position (the prompt pass chose none), at
+    // least the records issued (a choice of a record still held refreshes it, no read), at most all of them routed.
     const by1 = s.lookaheadByRank();
     var la: [2]u64 = .{ 0, 0 };
     for (by1[0]) |x| {
         la[0] += x[0];
         la[1] += x[1];
     }
-    try testing.expectEqual(decode.spec_issued, la[0]);
-    try testing.expect(la[1] >= decode.spec_used and la[1] <= la[0]);
+    try testing.expect(la[0] >= decode.spec_issued and la[0] > 0 and la[1] <= la[0]);
     var c1: [4]LayerCounts = undefined;
     for (&c1, 0..) |*c, l| c.* = s.layerCounts(@intCast(l));
     var rates: [4]f64 = undefined;
@@ -1262,5 +1265,9 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     // Four serial steps over the 4 routed layers: 16 decode-lane calls in the host split.
     try testing.expectEqual(@as(u64, 16), m.ex.host.calls);
     try testing.expect(m.ex.host.barrier_ns > 0 and m.ex.host.route_ns > 0 and m.ex.host.wave_ns > 0);
+    // The waves' four steps are the wave time, each step stamped.
+    const hs = m.ex.host;
+    try testing.expectEqual(hs.wave_ns, hs.hit_ns + hs.commit_ns + hs.miss_ns + hs.join_ns);
+    try testing.expect(hs.hit_ns > 0 and hs.commit_ns > 0 and hs.miss_ns > 0 and hs.join_ns > 0);
     m.requestEnd();
 }

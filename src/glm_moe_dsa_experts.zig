@@ -32,14 +32,29 @@ const n_banks = std.meta.fieldNames(BankKind).len;
 /// The driver's construction-time routes.
 /// The decode lane's host time per call, summed: blocked in the routing barrier (the GPU up to the router, with event
 /// gates also its wait on the previous layer's bytes), the routes (the ids read, the plans, the reads submitted, the
-/// lookahead's step), the waves' encode and commit.
-pub const HostSplit = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u64 = 0, wave_ns: u64 = 0 };
+/// lookahead's step), the waves' encode and commit (`wave_ns`), and that in its four steps: the hit waves and the
+/// hoisted arrays built, their commit (MLX's encode of them), the miss waves built (their gates registered), the join.
+pub const HostSplit = struct {
+    calls: u64 = 0,
+    barrier_ns: u64 = 0,
+    route_ns: u64 = 0,
+    wave_ns: u64 = 0,
+    hit_ns: u64 = 0,
+    commit_ns: u64 = 0,
+    miss_ns: u64 = 0,
+    join_ns: u64 = 0,
+};
 
-/// A monotonic clock for the host split (ns).
+/// A call's stamps inside its waves (`HostSplit`'s four steps): the hit waves built, committed, the miss waves built.
+const Stamps = struct { hit: u64 = 0, commit: u64 = 0, miss: u64 = 0 };
+
+/// The four steps are stamped in PROFILE builds (`-Dplugin-profile=true`, as the verify timeline) and in the tests; a
+/// served build reads no clock for them.
+pub const split_steps = timeline.enabled or @import("builtin").is_test;
+
+/// The host split's clock: the read pool's (`sdk_ext.expert.io.Pool.nowNs`), in the split's u64 ns.
 fn nowNs() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.UPTIME_RAW, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    return @intCast(sdk_ext.expert.io.Pool.nowNs());
 }
 
 pub const Options = struct {
@@ -401,7 +416,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const t1 = nowNs();
             const r = try self.stream.route(layer, ids, sc);
             const t2 = nowNs();
-            defer self.noteHost(t0, t1, t2);
+            var st: Stamps = .{};
+            defer self.noteHost(t0, t1, t2, &st);
             var released = false;
             errdefer if (!released) self.stream.release(r);
             const record = self.stream.bank.layers[layer].logical_bytes;
@@ -431,7 +447,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 early[n_early] = h;
                 n_early += 1;
             }
+            if (comptime split_steps) st.hit = nowNs();
             if (n_early > 0) try g.asyncEval(early[0..n_early]);
+            if (comptime split_steps) st.commit = nowNs();
             if (self.opt.gated) {
                 if (try self.stream.gate(r)) |gates| try self.gatedParts(g, layer, x, k, sv, gates, &acc);
             } else for (0..sv.n_parts) |p| {
@@ -442,6 +460,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 try self.stream.waitDown(r, part);
                 try g.asyncEval(try self.downWave(g, layer, &wave, &acc, null));
             }
+            if (comptime split_steps) st.miss = nowNs();
             self.stream.release(r);
             released = true;
             const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
@@ -518,7 +537,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             }
             if (comptime timeline.enabled) timeline.point(layer, .route, 0, false);
             const t2 = nowNs();
-            defer self.noteHost(t0, t1, t2);
+            var st: Stamps = .{};
+            defer self.noteHost(t0, t1, t2, &st);
             var acc: Acc = .{};
             // Every route's hit wave and the hoisted arrays in one commit, ahead of every wait on a read.
             var early: [bpl * n_banks + 4]T = undefined;
@@ -532,7 +552,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 early[n_early] = h;
                 n_early += 1;
             }
+            if (comptime split_steps) st.hit = nowNs();
             if (n_early > 0) try g.asyncEval(early[0..n_early]);
+            if (comptime split_steps) st.commit = nowNs();
             if (comptime timeline.enabled) timeline.point(layer, .hit, 0, false);
             var prev: []const T = &.{};
             var missed = false;
@@ -561,6 +583,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     try g.asyncEval(try self.fusedWave(g, sd, x, k, @intCast(p + 1), &acc, null));
                 }
             };
+            if (comptime split_steps) st.miss = nowNs();
             if (comptime timeline.enabled) timeline.point(layer, .end, self.readGauge(), missed);
             for (&sides) |*sd| if (sd.r) |r| {
                 self.stream.release(r);
@@ -611,13 +634,23 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             return acc.outs[first..acc.n_outs];
         }
 
-        /// A decode-lane call's host split: barrier [t0, t1), routes [t1, t2), waves [t2, now).
-        fn noteHost(self: *Self, t0: u64, t1: u64, t2: u64) void {
+        /// A decode-lane call's host split: barrier [t0, t1), routes [t1, t2), waves [t2, now), and the waves' steps at
+        /// `st`'s stamps (a step its call never reached, on an error, is counted in the step before it).
+        fn noteHost(self: *Self, t0: u64, t1: u64, t2: u64, st: *const Stamps) void {
             const t3 = nowNs();
             self.host.calls += 1;
             self.host.barrier_ns += t1 -| t0;
             self.host.route_ns += t2 -| t1;
             self.host.wave_ns += t3 -| t2;
+            if (comptime split_steps) {
+                const hit = if (st.hit == 0) t3 else st.hit;
+                const commit = if (st.commit == 0) t3 else st.commit;
+                const miss = if (st.miss == 0) t3 else st.miss;
+                self.host.hit_ns += hit -| t2;
+                self.host.commit_ns += commit -| hit;
+                self.host.miss_ns += miss -| commit;
+                self.host.join_ns += t3 -| miss;
+            }
         }
 
         /// The read pool's wall time with a read in flight (ns): the timeline's read gauge.
