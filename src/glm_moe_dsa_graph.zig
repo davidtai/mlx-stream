@@ -498,15 +498,16 @@ fn absorbedLatent(g: *G, c: *const glm.Config, q_lat: T, q_pe: T, kv: T, pe: T, 
     return sdpa(g, q_lat, kv_sel, kv_sel, @floatCast(scale64), scores);
 }
 
-/// How a forward of several rows attends: `.auto` (one row absorbed, several in the prompt form), `.per_row` (each
-/// row absorbed over the keys up to its own position, as serial steps run it: the draft lane's verify), or `.span`
-/// (the verify's rows as one prompt span on the DSA kernels: each row over its own keys, not a serial step's bits).
+/// How a forward of several rows attends: `.auto` (one row absorbed, several in the prompt form; on the DSA kernels
+/// any rows in spans), `.per_row` (each row absorbed over the keys up to its own position: the draft lane's verify
+/// where the kernels do not run), or `.span` (the verify's rows as one span on the DSA kernels, each row over its own
+/// keys as a serial step on the kernels attends it).
 pub const Form = enum { auto, per_row, span };
 
 /// Layer `l`'s attention over its input `x [rows, hidden]` (normed) at positions `[start, start + rows)`: the new KV
 /// appended, the indexer's selection made (full layers) or read from `carry` (shared), the output `[rows, hidden]`.
-/// `.per_row` takes a `Carry.perRow` (one block per row). A prompt (`.auto`) or `.span` on the DSA kernels (`kernels`)
-/// runs `selectSpans` and `attendSpans`.
+/// `.per_row` takes a `Carry.perRow` (one block per row). `.auto` or `.span` on the DSA kernels (`kernels`) runs
+/// `selectSpans` and `attendSpans`, a serial step's row as a verify's: the kernels attend each row apart.
 pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, start: u32, rows: u32, cache: *Cache, carry: *Carry, form: Form, kernels: bool) !T {
     const heads: c_int = @intCast(c.n_heads);
     const qhd: c_int = @intCast(c.qHeadDim());
@@ -523,7 +524,7 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         _ = try pt.phase(g, cache.buffers(l, &bufs), .proj);
         _ = try pt.phase(g, &.{ q.q_nope, q.q_pe, q.qr }, .proj);
     }
-    const spans = kernels and form != .per_row and rows > 1;
+    const spans = kernels and form != .per_row;
     if (lw.indexer) |ix| {
         const ik_all = try cache.indexView(g, l);
         if (spans) try selectSpans(g, c, ix, x, q.iq.?, ik_all, start, carry) else try select(g, c, ix, x, q.iq.?, ik_all, start, rows, carry);
@@ -791,7 +792,8 @@ pub const WaveProbe = struct {
 /// What a forward returns beyond the last row's logits.
 pub const Want = struct {
     /// The draft lane's verify: every row's logits, the attention per row (`Form.per_row`; on the DSA kernels its rows
-    /// as one span, `Form.span`), and the decode lane's routes (no per-layer evaluation, the lookahead's scores).
+    /// as one span, `Form.span`, as serial steps on them attend), and the decode lane's routes (no per-layer evaluation,
+    /// the lookahead's scores).
     verify: bool = false,
     /// Every row's final-normed hidden `[rows, hidden]` kept (the MTP layer's input).
     hidden: bool = false,
@@ -813,7 +815,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
 pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, ex: anytype, rt: Routes, want: Want) !Out {
     const rows: u32 = @intCast(ids.len);
     const prompt = rows > 1 and !want.verify;
-    const form: Form = if (!want.verify) .auto else if (rt.dsa and rows > 1) .span else .per_row;
+    const form: Form = if (!want.verify) .auto else if (rt.dsa) .span else .per_row;
     var carry = if (form == .per_row) try Carry.perRow(a, rows) else try Carry.init(a, c, rows, start + rows, rt.dsa);
     defer carry.deinit(g);
     var seed: std.ArrayList(u16) = .empty;
@@ -1237,4 +1239,83 @@ test "glm attention: the verify's rows through embed_q and unembed_out at once e
     defer for (outs) |arm| for (arm) |o| a.free(o);
     // bf16 to f32 keeps every bit (both zeros apart): the outputs' bits compared.
     for (outs[0], outs[1]) |got, want| try testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(want)), std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(got)));
+}
+
+test "glm attention: the DSA kernels attend a verify's rows apart: each row of a 4-row span equals that row alone, bit for bit, at GLM-5.3's dims" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const text = try kernelDimsConfigJson(a, glm53_dims);
+    defer a.free(text);
+    var c = try glm.Config.parse(a, text, null, null);
+    defer c.deinit(a);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!try dsaKernelsRun(a, s, &c)) return error.SkipZigTest;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(57);
+    const tw: TestWeights = .{ .rand = prng.random() };
+    const h: c_int = @intCast(c.n_heads);
+    const ih: c_int = @intCast(c.index_n_heads);
+    const kvr: c_int = @intCast(c.kv_lora_rank);
+    const rp: c_int = @intCast(c.qk_rope_head_dim);
+    const ihd: c_int = @intCast(c.index_head_dim);
+    const k: u32 = c.index_topk;
+    // Keys past the top-k; 4 query rows at the last positions, as a verify's.
+    const rows: c_int = 4;
+    const n0: c_int = @intCast(k + 100);
+    const nb = n0 + rows;
+    const lat = try tw.dense(&g, &.{ 1, 1, nb, kvr }, 1);
+    const pe = try tw.dense(&g, &.{ 1, 1, nb, rp }, 1);
+    const ik = try tw.dense(&g, &.{ 1, nb, ihd }, 1);
+    const q_lat = try tw.dense(&g, &.{ 1, h, rows, kvr }, 1);
+    const q_pe = try tw.dense(&g, &.{ 1, h, rows, rp }, 1);
+    const iq = try tw.dense(&g, &.{ 1, rows, ih, ihd }, 1);
+    const w = try g.astype(try tw.dense(&g, &.{ 1, rows, ih }, 0.1), .float32);
+    const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(c.qHeadDim()))));
+    const sc4 = try g.adopt((try dsa.indexerScores(g.s, iq, w, ik, n0, 1)) orelse return error.DsaKernelDeclined);
+    const idx4 = (try topk_mod.topk(&g, sc4, k)) orelse return error.TopkDeclined;
+    const o4 = try g.adopt((try dsa.sparseLatentRope(g.s, q_lat, q_pe, lat, pe, idx4, scale)) orelse return error.DsaKernelDeclined);
+    for (0..@intCast(rows)) |i| {
+        const r: c_int = @intCast(i);
+        const n1 = n0 + r + 1;
+        const row = struct {
+            fn of(gg: *G, x: T, axis: usize, at: c_int) !T {
+                const sh = gg.shapeOf(x);
+                var lo: [4]c_int = @splat(0);
+                var hi: [4]c_int = undefined;
+                @memcpy(hi[0..sh.n], sh.slice());
+                lo[axis] = at;
+                hi[axis] = at + 1;
+                return gg.slice(x, lo[0..sh.n], hi[0..sh.n], (&[_]c_int{ 1, 1, 1, 1 })[0..sh.n]);
+            }
+        };
+        const keys = struct {
+            fn first(gg: *G, x: T, axis: usize, n: c_int) !T {
+                const sh = gg.shapeOf(x);
+                const lo: [4]c_int = @splat(0);
+                var hi: [4]c_int = undefined;
+                @memcpy(hi[0..sh.n], sh.slice());
+                hi[axis] = n;
+                return gg.slice(x, lo[0..sh.n], hi[0..sh.n], (&[_]c_int{ 1, 1, 1, 1 })[0..sh.n]);
+            }
+        };
+        const sc1 = try g.adopt((try dsa.indexerScores(g.s, try row.of(&g, iq, 1, r), try row.of(&g, w, 1, r), try keys.first(&g, ik, 1, n1), n0 + r, 1)) orelse return error.DsaKernelDeclined);
+        const idx1 = (try topk_mod.topk(&g, sc1, k)) orelse return error.TopkDeclined;
+        const o1 = try g.adopt((try dsa.sparseLatentRope(g.s, try row.of(&g, q_lat, 2, r), try row.of(&g, q_pe, 2, r), try keys.first(&g, lat, 2, n1), try keys.first(&g, pe, 2, n1), idx1, scale)) orelse return error.DsaKernelDeclined);
+        // f32 holds every bf16 bit (both zeros apart): each pair's bits compared on the host.
+        const pairs = [_][2]T{
+            .{ try keys.first(&g, try row.of(&g, sc4, 1, r), 2, n1), sc1 },
+            .{ try g.astype(try row.of(&g, idx4, 1, r), .float32), try g.astype(idx1, .float32) },
+            .{ try g.astype(try row.of(&g, o4, 2, r), .float32), try g.astype(o1, .float32) },
+        };
+        for (pairs) |pr| {
+            const n: usize = @intCast(g.shapeOf(pr[1]).numel());
+            const v = try a.alloc(f32, 2 * n);
+            defer a.free(v);
+            _ = try g.hostF32(try g.astype(pr[0], .float32), v[0..n]);
+            _ = try g.hostF32(try g.astype(pr[1], .float32), v[n..]);
+            try testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(v[n..])), std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(v[0..n])));
+        }
+    }
 }
