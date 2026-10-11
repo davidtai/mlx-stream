@@ -720,6 +720,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             for (carry.topk) |t| if (t) |x_| try evals.append(a, x_);
             try g.evalAll(evals.items);
             if (pt.enabled) _ = try pt.phase(g, &.{}, .rest);
+            if (pt.enabled) try pt.roundTrip(g, l);
         }
         g.release(h);
         h = next_h;
