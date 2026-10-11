@@ -3,8 +3,8 @@
 //! A routed (token, expert) pair is one sushi row: the expert's `tp` minis (slot x tp + rank) at score 1, the
 //! router's score being the arch's combine. Sushi's chain fuses gate, up and down, so the decode lane hands a wave
 //! over once all its segments landed (`fused`, in place of `gateUp` / `down`, which refuse); a wave of any width runs
-//! the decode chain. The prompt's slices run sushi's prefill GEMM past its decode rows (`prefill`) with its routing table
-//! built from the slots the host holds: on the tensor units here (`prefillTabled`), elsewhere sushi's `moePrefillHost`.
+//! the decode chain. The prompt's slices run sushi's prefill GEMM past its decode rows (`prefill`), on the tensor units
+//! with its routing table built from the slots the host holds (`prefillTabled`).
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -50,9 +50,6 @@ pub fn Accepted(comptime G: type) type {
         a: Allocator,
         tp: u32,
         spec: quant.Spec,
-        /// The prompt's prefill GEMM calls through sushi's `moePrefillHost` (slices past sushi's decode rows that
-        /// `prefillTabled` does not serve: a device without the tensor units), each over host-known slots.
-        prefill_gemm_calls: u64 = 0,
         /// Host scratch: each pair's minis, its x row, the scores.
         minis: std.ArrayList(u32) = .empty,
         src: std.ArrayList(u32) = .empty,
@@ -66,7 +63,7 @@ pub fn Accepted(comptime G: type) type {
         starts: std.ArrayList(u32) = .empty,
         lives: std.ArrayList(u32) = .empty,
         /// Sushi's NAX sorted GEMM (`PrefillGridSupport`), built at the first prompt slice on the GPU; null where the
-        /// device has no tensor units (sushi's `moePrefillHost` serves the slice).
+        /// device has no tensor units (sushi's `moe` serves the slice).
         gemm: ?mlx.mlx_fast_metal_kernel = null,
         gemm_probed: bool = false,
 
@@ -127,27 +124,15 @@ pub fn Accepted(comptime G: type) type {
             const mc: c_int = @intCast(m);
             const tc: c_int = @intCast(tp);
             const h: c_int = @intCast(self.spec.hidden);
+            const inds = try g.hostArray(std.mem.sliceAsBytes(self.minis.items), &.{ 1, mc, tc }, .uint32);
+            const sc = try g.hostArray(std.mem.sliceAsBytes(self.ones.items[0 .. m * tp]), &.{ 1, mc, tc }, .float32);
             const sb: sushi.Bank = .{
                 .gate = .{ .trellis = bank.gate.trellis, .suh = bank.gate.suh, .svh = bank.gate.svh },
                 .up = .{ .trellis = bank.up.trellis, .suh = bank.up.suh, .svh = bank.up.svh },
                 .down = .{ .trellis = bank.down.trellis, .suh = bank.down.suh, .svh = bank.down.svh },
             };
-            // Past sushi's decode rows a prompt slice runs its prefill GEMM over the slots the host holds: the sort and
-            // the window table built here, nothing waits for the GPU (sushi's moePrefill reads its sorted slots back).
-            if (!decode_chain and m > sushi.kernels.DECODE_ROWS_MAX) {
-                self.prefill_gemm_calls += 1;
-                const sc = try g.hostArray(std.mem.sliceAsBytes(self.ones.items[0 .. m * tp]), &.{@intCast(m * tp)}, .float32);
-                return g.adopt(try sushi.moePrefillHost(g.s, x, sb, self.minis.items[0 .. m * tp], sc, .mcg));
-            }
-            const inds = try g.hostArray(std.mem.sliceAsBytes(self.minis.items), &.{ 1, mc, tc }, .uint32);
-            const sc = try g.hostArray(std.mem.sliceAsBytes(self.ones.items[0 .. m * tp]), &.{ 1, mc, tc }, .float32);
             const y = try g.adopt(try sushi.moe(g.s, try g.reshape(x, &.{ 1, mc, h }), sb, inds, sc, .mcg, decode_chain));
             return g.reshape(y, &.{ mc, h });
-        }
-
-        /// The prompt's prefill GEMM calls and sushi's waits on the GPU so far (the host-slots calls add none).
-        pub fn prefillStats(self: *const Self) [2]u64 {
-            return .{ self.prefill_gemm_calls, sushi.kernels.prefill_drains };
         }
 
         /// The window rows of sushi's sorted GEMM (`GEMM_WINDOW_ROWS`).
@@ -451,7 +436,7 @@ test "glm exl3 quant: a wide prompt call with its misses staged at the layer's s
     try testing.expect(promoted > 0 and promoted <= 4 * 2 * 2);
 }
 
-test "glm exl3 quant: a prompt slice over either host-built routing table (this quant's, sushi's moePrefillHost) equals sushi's moe bit for bit (K3 and K4, runs past one window)" {
+test "glm exl3 quant: a prompt slice over the host-built routing table equals sushi's moe bit for bit (K3 and K4, runs past one window)" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const G = @import("glm_moe_dsa_graph.zig").G;
@@ -519,44 +504,27 @@ test "glm exl3 quant: a prompt slice over either host-built routing table (this 
                 sl.* = rand.uintLessThan(u32, rows_n);
                 ar.* = rand.uintLessThan(u32, tokens);
             }
-            // Sushi's moe over the gathered rows (the slice's path before the host-built tables), against this quant's
-            // table (`prefillTabled`) and sushi's (`run` past the decode rows: `moePrefillHost`).
+            // Sushi's moe over the gathered rows (the slice's path before the host-built table).
             const xs = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(act), &.{@intCast(n)}, .uint32), 0);
-            const minis = try a.alloc(u32, n * tp);
-            defer a.free(minis);
-            for (slot, 0..) |sl, i| for (0..tp) |r| {
-                minis[i * tp + r] = sl * tp + @as(u32, @intCast(r));
-            };
-            const ones = try a.alloc(f32, n * tp);
-            defer a.free(ones);
-            @memset(ones, 1);
-            const nc: c_int = @intCast(n);
-            const tc: c_int = @intCast(tp);
-            const sb: sushi.Bank = .{ .gate = .{ .trellis = bank.gate.trellis, .suh = bank.gate.suh, .svh = bank.gate.svh }, .up = .{ .trellis = bank.up.trellis, .suh = bank.up.suh, .svh = bank.up.svh }, .down = .{ .trellis = bank.down.trellis, .suh = bank.down.suh, .svh = bank.down.svh } };
-            const want = try g.reshape(try g.adopt(try sushi.moe(g.s, try g.reshape(xs, &.{ 1, nc, @intCast(hidden) }), sb, try g.hostArray(std.mem.sliceAsBytes(minis), &.{ 1, nc, tc }, .uint32), try g.hostArray(std.mem.sliceAsBytes(ones), &.{ 1, nc, tc }, .float32), .mcg, false)), &.{ nc, @intCast(hidden) });
+            const want = try ok.run(&g, xs, slot, bank, false);
             const got = try ok.prefillTabled(&g, x, .{ .slot = slot, .act_row = act }, bank);
-            const host = try ok.run(&g, xs, slot, bank, false);
             const wv = try a.alloc(f32, n * hidden);
             defer a.free(wv);
             const gv = try a.alloc(f32, n * hidden);
             defer a.free(gv);
-            const hv = try a.alloc(f32, n * hidden);
-            defer a.free(hv);
             _ = try g.hostF32(try g.astype(want, .float32), wv);
             _ = try g.hostF32(try g.astype(got, .float32), gv);
-            _ = try g.hostF32(try g.astype(host, .float32), hv);
             var big: f32 = 0;
-            for (wv, gv, hv) |w, v, hh| {
+            for (wv, gv) |w, v| {
                 try testing.expect(std.math.isFinite(w));
                 try testing.expectEqual(@as(u32, @bitCast(w)), @as(u32, @bitCast(v)));
-                try testing.expectEqual(@as(u32, @bitCast(w)), @as(u32, @bitCast(hh)));
                 big = @max(big, @abs(w));
             }
             try testing.expect(big > 0);
             checked += wv.len;
         }
     }
-    std.debug.print("glm exl3 quant tabled: {d} outputs of each host-built table equal sushi's moe bit for bit\n", .{checked});
+    std.debug.print("glm exl3 quant tabled: {d} outputs equal sushi's moe bit for bit\n", .{checked});
 }
 
 /// The host reference of one routed layer's call: each row's experts' minis decoded by sushi's own host path
@@ -690,93 +658,4 @@ test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's hos
     std.debug.print("glm exl3 quant: streamed MoE against the host decode, max |delta| {d:.5} at outputs up to {d:.3}\n", .{ worst, scale });
     try testing.expect(scale > 0.1);
     try testing.expect(worst <= 0.03 * scale);
-}
-
-test "glm exl3 quant: a prompt slice's prefill over host slots equals sushi's moe of the same pairs bit for bit, and never waits for the GPU" {
-    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const a = testing.allocator;
-    const G = @import("glm_moe_dsa_graph.zig").G;
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    var g = try G.init(a, s);
-    defer g.deinit();
-    // A bank of 6 expert slots (24 minis of 128 over hidden 128, K3) and 40 routed pairs: past the decode rows.
-    const slots_n = 6;
-    const tp = 4;
-    const h = 128;
-    const mini = 128;
-    var rng = std.Random.DefaultPrng.init(7);
-    var owned: std.ArrayList(mlx.mlx_array) = .empty;
-    defer {
-        for (owned.items) |x| _ = mlx.mlx_array_free(x);
-        owned.deinit(a);
-    }
-    const mk = struct {
-        fn proj(al: std.mem.Allocator, r: std.Random, own: *std.ArrayList(mlx.mlx_array), in: c_int, out: c_int) !Arrays(mlx.mlx_array) {
-            const n_tr: usize = @intCast(slots_n * tp * @divExact(in, 16) * @divExact(out, 16) * 48);
-            const tr = try al.alloc(u16, n_tr);
-            defer al.free(tr);
-            for (tr) |*v| v.* = r.int(u16);
-            const su = try al.alloc(u16, @intCast(slots_n * tp * in));
-            defer al.free(su);
-            for (su) |*v| v.* = if (r.boolean()) 0x3400 else 0xB400;
-            const sv = try al.alloc(u16, @intCast(slots_n * tp * out));
-            defer al.free(sv);
-            for (sv) |*v| v.* = if (r.boolean()) 0x3400 else 0xB400;
-            const t = mlx.mlx_array_new_data(tr.ptr, &[_]c_int{ slots_n * tp, @divExact(in, 16), @divExact(out, 16), 48 }, 4, .uint16);
-            const u = mlx.mlx_array_new_data(su.ptr, &[_]c_int{ slots_n * tp, in }, 2, .float16);
-            const v = mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ slots_n * tp, out }, 2, .float16);
-            try own.appendSlice(al, &.{ t, u, v });
-            return .{ .trellis = t, .suh = u, .svh = v };
-        }
-    };
-    const bank: quant.BankArrays(Arrays(mlx.mlx_array)) = .{
-        .gate = try mk.proj(a, rng.random(), &owned, h, mini),
-        .up = try mk.proj(a, rng.random(), &owned, h, mini),
-        .down = try mk.proj(a, rng.random(), &owned, mini, h),
-    };
-    var diag: Diag = .{};
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const q = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try std.fmt.allocPrint(arena.allocator(), "{{\"mode\":\"exl3\",\"codebook\":\"mcg\",\"codebook_multiplier\":{d},\"tp_ranks\":4}}", .{sushi.format.MCG_MULT}), .{});
-    const peek: quant.BankPeek = .{ .quantization = q, .hidden = h, .inter = mini * tp, .n_experts = 6, .n_layers = 1, .layers = &.{} };
-    const math = try accept(G, a, &g, .{ .peek = &peek }, .{ .hidden = h, .inter = mini * tp, .top_k = 8, .n_layers = 1, .act = .swiglu, .input = .bfloat16 }, &diag);
-    defer math.deinit(&g);
-    const m0 = g.mark();
-    defer g.resetTo(m0);
-    const tokens = 10;
-    var xs: [tokens * h]f32 = undefined;
-    for (&xs) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
-    const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(&xs), &.{ tokens, h }, .float32), .bfloat16);
-    var slot: [40]u32 = undefined;
-    var act: [40]u32 = undefined;
-    for (&slot, &act, 0..) |*sl, *ac, i| {
-        sl.* = rng.random().uintLessThan(u32, slots_n);
-        ac.* = @intCast(i % tokens);
-    }
-    const drains0 = sushi.kernels.prefill_drains;
-    // The slice through sushi's moePrefillHost (`run` past the decode rows; `prefill` takes `prefillTabled` where the
-    // device has the tensor units).
-    const xs_rows = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(&act), &.{40}, .uint32), 0);
-    const got = try math.run(&g, xs_rows, &slot, bank, false);
-    try testing.expectEqual(@as(u64, 1), math.prefill_gemm_calls);
-    var gv: [40 * h]f32 = undefined;
-    _ = try g.hostF32(try g.astype(got, .float32), &gv);
-    try testing.expectEqual(drains0, sushi.kernels.prefill_drains);
-    // The old path: sushi's moe over the same pairs (its prefill GEMM past the decode rows reads its sorted slots back).
-    var minis: [40 * tp]u32 = undefined;
-    for (slot, 0..) |sl, i| for (0..tp) |r| {
-        minis[i * tp + r] = sl * tp + @as(u32, @intCast(r));
-    };
-    const ones: [40 * tp]f32 = @splat(1);
-    const sb: sushi.Bank = .{ .gate = .{ .trellis = bank.gate.trellis, .suh = bank.gate.suh, .svh = bank.gate.svh }, .up = .{ .trellis = bank.up.trellis, .suh = bank.up.suh, .svh = bank.up.svh }, .down = .{ .trellis = bank.down.trellis, .suh = bank.down.suh, .svh = bank.down.svh } };
-    const want = try g.reshape(try g.adopt(try sushi.moe(g.s, try g.reshape(xs_rows, &.{ 1, 40, h }), sb, try g.hostArray(std.mem.sliceAsBytes(&minis), &.{ 1, 40, tp }, .uint32), try g.hostArray(std.mem.sliceAsBytes(&ones), &.{ 1, 40, tp }, .float32), .mcg, false)), &.{ 40, h });
-    try testing.expectEqual(drains0 + 1, sushi.kernels.prefill_drains);
-    var wv: [40 * h]f32 = undefined;
-    _ = try g.hostF32(try g.astype(want, .float32), &wv);
-    var scale: f32 = 0;
-    for (wv) |v| scale = @max(scale, @abs(v));
-    try testing.expect(scale > 0);
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&wv), std.mem.sliceAsBytes(&gv));
 }
