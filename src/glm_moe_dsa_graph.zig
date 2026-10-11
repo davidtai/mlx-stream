@@ -1050,3 +1050,94 @@ test "glm attention: the verify's rows as one span on the DSA kernels select eac
     for (sel[0], sel[1]) |want, got| try testing.expectEqualSlices(u32, want, got);
     try expectClose("glm verify span vs per row", &outs[0], &outs[1]);
 }
+
+test "MEASUREMENT glm verify span: the span's and the per-row verify's error against an f32 per-row verify from the same state" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const text = try kernelDimsConfigJson(a);
+    defer a.free(text);
+    var c = try glm.Config.parse(a, text, null, null);
+    defer c.deinit(a);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!try dsaKernelsRun(a, s, &c)) return error.SkipZigTest;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(56);
+    const tw: TestWeights = .{ .rand = prng.random() };
+    const hid: c_int = @intCast(c.hidden_size);
+    const layers = try tw.attentionLayers(&g, &c);
+    // The same weights in f32: each projection dequantized, every row through the f32 per-row form.
+    var layers32 = layers;
+    for (&layers32) |*lw| {
+        inline for (.{ "q_a", "q_b", "kv_a", "embed_q", "unembed_out", "o" }) |f| {
+            const q = @field(lw, f);
+            @field(lw, f) = QLinear.dense(try g.astype(try g.dequantizeWith(q.w, q.s, q.b, q.bits, glm.group_size, .affine), .float32));
+        }
+        inline for (.{ "input_norm", "post_norm", "q_a_norm", "kv_a_norm" }) |f| @field(lw, f) = try g.astype(@field(lw, f), .float32);
+        if (lw.indexer) |*ix| inline for (.{ "wq_b", "wk", "k_norm_w", "k_norm_b", "weights_proj" }) |f| {
+            @field(ix, f) = try g.astype(@field(ix, f), .float32);
+        };
+    }
+    // A prompt whose keys and the verify's fit the top-k (every causal key attended: no selection in any arm), then a
+    // 4-row verify; the f32 arm's lanes are the bf16 lanes widened.
+    const p0: u32 = c.index_topk - 8;
+    const rows: u32 = 4;
+    const prompt = try tw.dense(&g, &.{ @intCast(p0), hid }, 1);
+    const xv = try tw.dense(&g, &.{ @intCast(rows), hid }, 1);
+    var bf = try Cache.init(a, &c, p0 + rows);
+    defer bf.deinit(&g);
+    {
+        var carry = try Carry.init(a, &c, p0, p0, true);
+        defer carry.deinit(&g);
+        for (&layers, 0..) |*lw, l| _ = try attention(&g, &c, lw, @intCast(l), prompt, 0, p0, &bf, &carry, .auto, true);
+        bf.commit(p0);
+    }
+    var outs: [3][2][]f32 = undefined;
+    for (0..3) |arm| {
+        var c32 = try Cache.init(a, &c, p0 + rows);
+        defer c32.deinit(&g);
+        const cache = if (arm == 0) &c32 else &bf;
+        if (arm == 0) {
+            for (0..layers.len) |l| {
+                const li: u32 = @intCast(l);
+                const kvr: c_int = @intCast(c.kv_lora_rank);
+                const rp: c_int = @intCast(c.qk_rope_head_dim);
+                const ihd: c_int = @intCast(c.index_head_dim);
+                const lat = try g.astype(try g.reshape(try bf.latentView(&g, li), &.{ 1, @intCast(p0), kvr }), .float32);
+                const pe = try g.astype(try g.reshape(try bf.ropeView(&g, li), &.{ 1, @intCast(p0), rp }), .float32);
+                const ix: ?T = if (layers[l].indexer != null) try g.astype(try g.reshape(try bf.indexView(&g, li), &.{ 1, @intCast(p0), ihd }), .float32) else null;
+                try c32.append(&g, li, lat, pe, ix);
+            }
+            c32.commit(p0);
+        } else bf.truncateTo(p0);
+        const form: Form = if (arm == 2) .span else .per_row;
+        var carry = if (form == .per_row) try Carry.perRow(a, rows) else try Carry.init(a, &c, rows, p0 + rows, true);
+        defer carry.deinit(&g);
+        const x = if (arm == 0) try g.astype(xv, .float32) else xv;
+        const lws = if (arm == 0) &layers32 else &layers;
+        for (lws, 0..) |*lw, l| {
+            const y = try g.astype(try attention(&g, &c, lw, @intCast(l), x, p0, rows, cache, &carry, form, arm != 0), .float32);
+            outs[arm][l] = try a.alloc(f32, @intCast(g.shapeOf(y).numel()));
+            _ = try g.hostF32(y, outs[arm][l]);
+        }
+        cache.commit(rows);
+    }
+    defer for (outs) |arm| for (arm) |o| a.free(o);
+    for (0..2) |l| {
+        var err: [2]f32 = .{ 0, 0 };
+        var sum: [2]f64 = .{ 0, 0 };
+        var maxr: f32 = 0;
+        for (outs[0][l], 0..) |r, i| {
+            maxr = @max(maxr, @abs(r));
+            for (0..2) |k| {
+                const d = @abs(outs[k + 1][l][i] - r);
+                err[k] = @max(err[k], d);
+                sum[k] += d;
+            }
+        }
+        const n: f64 = @floatFromInt(outs[0][l].len);
+        std.debug.print("glm verify against the f32 per-row verify, layer {d}: per-row bf16 max |d| {d:.5} mean {d:.6}; span max |d| {d:.5} mean {d:.6} (output up to {d:.3})\n", .{ l, err[0], sum[0] / n, err[1], sum[1] / n, maxr });
+        try testing.expect(err[1] <= 2 * err[0]);
+    }
+}
