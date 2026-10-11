@@ -22,7 +22,7 @@ const source: [:0]const u8 =
     \\    threadgroup int ids[K];
     \\    threadgroup float picked[K];
     \\    const float s = sig[ulong(row) * uint(E) + e];
-    \\    const float v = -(s + bias[e]);
+    \\    const float v = -(s + float(bias[e]));
     \\    keyv[e] = v;
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
     \\    // The expert's position in the stable ascending order of -(sig + bias): those before it, and its ties of a
@@ -61,13 +61,13 @@ pub fn serves(n_experts: u32, k: u32) bool {
 }
 
 /// The top `k` expert ids `[n, k]` (int32) and their weights `[n, k]` (f32) of `sig` (`[n, n_experts]` f32, the
-/// router's sigmoid) by `sig + bias` (`[n_experts]` f32): `glm_moe_dsa_graph.route`'s chain after its sigmoid, the
-/// same bits (`serves` the shape; a GPU stream).
+/// router's sigmoid) by `sig + bias` (`[n_experts]`, a float dtype read as f32, as MLX's add promotes it):
+/// `glm_moe_dsa_graph.route`'s chain after its sigmoid, the same bits (`serves` the shape; a GPU stream).
 pub fn top(g: *G, sig: T, bias: T, k: u32, norm: bool, scale: f32) !Top {
     const sh = g.shapeOf(sig);
     const n = sh.dim(0);
     const ne = sh.dim(1);
-    std.debug.assert(sh.n == 2 and serves(@intCast(ne), k) and g.dtypeOf(sig) == .float32 and g.dtypeOf(bias) == .float32);
+    std.debug.assert(sh.n == 2 and serves(@intCast(ne), k) and g.dtypeOf(sig) == .float32);
     const kern = kernel orelse blk: {
         const ins = [_][*:0]const u8{ "sig", "bias", "params" };
         const outs = [_][*:0]const u8{ "indices", "weights" };
@@ -128,7 +128,7 @@ fn lastSlice(g: *G, x: T, lo: c_int, hi: c_int) !T {
 
 const testing = std.testing;
 
-test "glm route: the top-k kernel's ids and weights are MLX's chain's bits after the sigmoid, ties, a NaN, 1 to 64 rows, 256 and 16 experts" {
+test "glm route: the top-k kernel's ids and weights are MLX's chain's bits after the sigmoid, ties, a NaN, 1 to 64 rows, 256 and 16 experts, f32 and bf16 biases" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
@@ -139,7 +139,7 @@ test "glm route: the top-k kernel's ids and weights are MLX's chain's bits after
     var prng = std.Random.DefaultPrng.init(23);
     const rand = prng.random();
     // (rows, experts, k, norm, kind): logits N(0, 2) through MLX's sigmoid with a small bias (GLM-5.3's); the scores on
-    // a coarse grid (ties at and inside the top-k); a NaN in some rows; an unnormalized arm.
+    // a coarse grid (ties at and inside the top-k); a NaN in some rows; an unnormalized arm; a bf16 bias.
     const cases = [_]struct { n: u32, e: u32, k: u32, norm: bool, kind: u8 }{
         .{ .n = 1, .e = 256, .k = 8, .norm = true, .kind = 0 },
         .{ .n = 4, .e = 256, .k = 8, .norm = true, .kind = 0 },
@@ -148,6 +148,7 @@ test "glm route: the top-k kernel's ids and weights are MLX's chain's bits after
         .{ .n = 37, .e = 256, .k = 8, .norm = true, .kind = 2 },
         .{ .n = 6, .e = 16, .k = 8, .norm = true, .kind = 1 },
         .{ .n = 4, .e = 256, .k = 8, .norm = false, .kind = 0 },
+        .{ .n = 5, .e = 256, .k = 8, .norm = true, .kind = 3 },
     };
     var checked: usize = 0;
     for (cases) |cs| {
@@ -164,7 +165,8 @@ test "glm route: the top-k kernel's ids and weights are MLX's chain's bits after
         defer a.free(bv);
         for (bv) |*x| x.* = if (cs.kind == 1) 0 else (rand.float(f32) - 0.5) * 0.1;
         const sig = try g.sigmoid(try g.hostArray(std.mem.sliceAsBytes(lv), &.{ @intCast(cs.n), @intCast(cs.e) }, .float32));
-        const bias = try g.hostArray(std.mem.sliceAsBytes(bv), &.{@intCast(cs.e)}, .float32);
+        const b32 = try g.hostArray(std.mem.sliceAsBytes(bv), &.{@intCast(cs.e)}, .float32);
+        const bias = if (cs.kind == 3) try g.astype(b32, .bfloat16) else b32;
         const got = try top(&g, sig, bias, cs.k, cs.norm, 2.5);
         const want = try chain(&g, sig, bias, cs.k, cs.norm, 2.5);
         const len = cs.n * cs.k;
