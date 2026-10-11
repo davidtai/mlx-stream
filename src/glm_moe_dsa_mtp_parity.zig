@@ -248,6 +248,33 @@ test "glm mtp parity: a later prompt keeps the prefix the lane tracks and drafts
     }
 }
 
+test "glm mtp parity: a steady round waits for the GPU only at its routing barriers and once for its decision (the drafts stay on the device)" {
+    const dir = fixtureDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const gold = try loadGoldens(a, dir);
+    defer gold.deinit();
+    const cs = for (gold.value.cases) |*c| {
+        if (c.depth == 3 and std.mem.eql(u8, c.schedule, "mtp")) break c;
+    } else return error.SkipZigTest;
+    const r = try Rig.open(a, dir, cs.depth);
+    defer r.close(a);
+    const t1 = try r.begin(cs.prompt, 16);
+    // The first round appends the prompt's pairs; the second is a steady one.
+    var out0 = try r.m.roundWith(a, t1, std.math.maxInt(u32), greedy, null);
+    defer out0.deinit(a);
+    const w0 = r.m.g.waits;
+    var out1 = try r.m.roundWith(a, out0.next_token, std.math.maxInt(u32), greedy, null);
+    defer out1.deinit(a);
+    // Per routed layer the barrier's eval and its ids' read, and the next layer's scores where a routed layer follows
+    // (the lookahead's); the decision's one read; per draft step the head's top probability (the tests' and PROFILE
+    // builds' probe, none in a served build).
+    var want: u64 = 1 + cs.depth;
+    for (r.m.w.layers, 0..) |lw, li| if (lw.bank_layer != null) {
+        want += if (li + 1 < r.m.w.layers.len and r.m.w.layers[li + 1].router != null) 3 else 1;
+    };
+    try testing.expectEqual(want, r.m.g.waits - w0);
+}
+
 test "glm mtp parity: a round's verify reads, each expert's by the first row that routes it, sum to the stream's demand bytes; with its first draft rejected the kept row read exactly a serial step's bytes from the same state" {
     const dir = fixtureDir() orelse return error.SkipZigTest;
     const a = testing.allocator;
@@ -373,7 +400,12 @@ fn decideHost(g: *G, rows: []const f32, w: usize, drafts: []const u32, mode: sdk
     const m = g.mark();
     defer g.resetTo(m);
     const lg = try g.hostArray(std.mem.sliceAsBytes(rows), &.{ @intCast(w), @intCast(rows.len / w) }, .float32);
-    return mtp.decide(g, lg, drafts, mode, sp, base);
+    const dd: ?G.T = if (drafts.len > 0) try g.hostArray(std.mem.sliceAsBytes(drafts), &.{@intCast(drafts.len)}, .uint32) else null;
+    var back: [mtp.max_depth]u32 = undefined;
+    const d = try mtp.decide(g, lg, dd, back[0..drafts.len], mode, sp, base);
+    // The decision's one read returns the drafts it decided.
+    try testing.expectEqualSlices(u32, drafts, back[0..drafts.len]);
+    return d;
 }
 
 test "glm mtp: the decisions equal the host references: argmax, typical at temperature 1, the sampled point-mass rule, sampled typical" {

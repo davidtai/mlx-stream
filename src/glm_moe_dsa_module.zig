@@ -44,6 +44,8 @@ const timeline = @import("dsv41_verify_timeline.zig");
 const prefill_timers = @import("glm_moe_dsa_prefill_timers.zig");
 
 const G = graph.G;
+const T = graph.T;
+const build_flags = @import("build_flags.zig");
 const Stats = sdk_ext.expert.Stats;
 const LayerCounts = sdk_ext.expert.LayerCounts;
 
@@ -420,7 +422,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                     defer self.g.release(out.hidden.?);
                     try self.history.appendSlice(self.gpa, ids[at..end]);
                     // The rows' pairs whose next token the prompt gives: their keys in the MTP layer's cache.
-                    try ln.pend(&self.g, self.cache.len, out.hidden.?, @intCast(end - at), false);
+                    try ln.pend(&self.g, self.cache.len, out.hidden.?, @intCast(end - at), false, false);
                     if (ln.tracked() == self.cache.len) try ln.append(&self.g, &self.w, self.history.items[ln.cache.len + 1 ..]);
                 } else {
                     logits = try graph.forward(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes);
@@ -452,7 +454,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             defer if (out.hidden) |x| self.g.release(x);
             try self.history.appendSlice(self.gpa, ids);
             // A request the lane does not draft: its positions pending for a later round, up to `mtp.max_pending`.
-            if (self.mtp) |ln| try ln.pend(&self.g, self.cache.len, out.hidden.?, @intCast(ids.len), true);
+            if (self.mtp) |ln| try ln.pend(&self.g, self.cache.len, out.hidden.?, @intCast(ids.len), true, true);
             try self.g.evalAll(&.{logits});
             try self.ex.flush();
             if (self.decode_mark) |*d| {
@@ -538,7 +540,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             };
             if (self.mtp) |ln| if (ln.counts.rounds > 0) {
                 log.info("{f}\n", .{ln.line()});
-                log.info("{f}\n", .{mtp_mod.ProbLine{ .c = ln.counts }});
+                if (comptime build_flags.glm_decode_probes) log.info("{f}\n", .{mtp_mod.ProbLine{ .c = ln.counts }});
                 ln.counts = .{};
             };
             const d = self.decode_mark orelse return;
@@ -648,28 +650,35 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var ids: [mtp_mod.max_depth + 1]u32 = undefined;
             ids[0] = t1;
             const drafts = ids[1..][0..depth];
-            if (depth > 0) try ln.draft(&self.g, a, &self.w, self.history.items[ln.cache.len + 1 .. len], t1, depth, drafts, if (probe) |p| p.force else &.{}, if (probe) |p| p.logits else null);
+            // The drafts stay on the device: the verify embeds them there, the decision reads them back.
+            const drafts_dev: ?T = if (depth > 0) try ln.draft(&self.g, a, &self.w, self.history.items[ln.cache.len + 1 .. len], t1, depth, if (probe) |p| p.force else &.{}, if (probe) |p| p.logits else null) else null;
+            defer if (drafts_dev) |dd| self.g.release(dd);
             const t_draft = self.nowNs();
-            if (probe) |p| {
-                p.depth = depth;
-                @memcpy(p.drafts[0..depth], drafts);
-            }
             const m0 = self.g.mark();
             defer self.g.resetTo(m0);
             self.ex.row_bytes = @splat(0);
             if (comptime timeline.enabled) timeline.verifyBegin();
-            const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, self.routes, .{ .verify = true, .hidden = true });
+            const ids_dev: ?T = if (drafts_dev) |dd| try self.g.concat(&.{ try self.g.hostArray(std.mem.sliceAsBytes(ids[0..1]), &.{1}, .uint32), dd }, 0) else null;
+            const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, self.routes, .{ .verify = true, .hidden = true, .ids_device = ids_dev });
             defer self.g.release(out.logits);
             defer self.g.release(out.hidden.?);
-            try self.g.evalAll(&.{ out.logits, out.hidden.? });
-            if (comptime timeline.enabled) timeline.verifyEnd();
-            try self.ex.flush();
+            // The verify's end on the timeline (PROFILE builds); a served build's one wait is the decision's read.
+            if (comptime timeline.enabled) {
+                try self.g.evalAll(&.{ out.logits, out.hidden.? });
+                timeline.verifyEnd();
+            }
             const t_verify = self.nowNs();
-            const d = try mtp_mod.decide(&self.g, out.logits, drafts, ln.mode, sampling, len);
+            const d = try mtp_mod.decide(&self.g, out.logits, drafts_dev, drafts, ln.mode, sampling, len);
+            // After the read that evaluated the verify: its routes' rows unpinned.
+            try self.ex.flush();
+            if (probe) |p| {
+                p.depth = depth;
+                @memcpy(p.drafts[0..depth], drafts);
+            }
             self.cache.truncateTo(len + 1 + d.accepted);
             try self.history.appendSlice(self.gpa, ids[0 .. 1 + d.accepted]);
             const rows = d.accepted + 1;
-            try ln.pend(&self.g, self.cache.len, try graph.rowSlice(&self.g, out.hidden.?, 0, @intCast(rows)), rows, depth == 0);
+            try ln.pend(&self.g, self.cache.len, try graph.rowSlice(&self.g, out.hidden.?, 0, @intCast(rows)), rows, depth == 0, true);
             const tokens = try a.dupe(u32, ids[0..rows]);
             const ns = self.nowNs() - t0;
             ln.counts.rounds += 1;
@@ -685,11 +694,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 ln.counts.verify_bytes += b;
                 if (i > d.accepted) ln.counts.rejected_bytes += b;
             }
-            // The steps the decision reached: the accepted drafts and the first rejected one.
-            for (ln.top_p[0..@min(depth, d.accepted + 1)], 0..) |tp, i| {
+            // The steps the decision reached: the accepted drafts and the first rejected one (PROFILE builds and the
+            // tests read the head's top probability; a served build reads none).
+            if (comptime build_flags.glm_decode_probes) for (ln.top_p[0..@min(depth, d.accepted + 1)], 0..) |tp, i| {
                 ln.counts.decided[mtp_mod.tenth(tp)] += 1;
                 if (i < d.accepted) ln.counts.accepted_by_p[mtp_mod.tenth(tp)] += 1;
-            }
+            };
             if (self.recorder) |rec| rec.endStep(depth + 1, depth, d.accepted, rows, ns);
             if (self.decode_mark) |*dm| {
                 dm.steps += 1;

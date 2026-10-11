@@ -8,5 +8,8 @@ const sdk = @import("sdk");
 pub const dsv41_decode_timers: bool = sdk.plugin_profile;
 /// The prompt pass routed-call timers (dsv41_prefill_timers.zig).
 pub const dsv41_prefill_timers: bool = sdk.plugin_profile;
+/// GLM-5.3's decode probes that read the GPU for stats only (the MTP head's top probability per draft step): PROFILE
+/// builds and the tests read them; a served build reads none.
+pub const glm_decode_probes: bool = sdk.plugin_profile or @import("builtin").is_test;
 /// GLM-5.3's prompt-pass phase split (glm_moe_dsa_prefill_timers.zig).
 pub const glm_prefill_timers: bool = sdk.plugin_profile;
