@@ -25,11 +25,14 @@ struct g53_col {
     for (uint q = 0; q < NQ; ++q) o[q] = (w0 + q) % NW;
   }
 
-  // The column's 16 weights at k-rows 0 .. 15 into v.
-  METAL_FUNC static void decode_v(const device uint* tile, thread const uint* o, thread float* v) {
-    uint P[NQ];
+  // The tile's words this thread's column reads (a load the decode can trail).
+  METAL_FUNC static void words(const device uint* tile, thread const uint* o, thread uint* P) {
     STEEL_PRAGMA_UNROLL
     for (uint q = 0; q < NQ; ++q) P[q] = tile[o[q]];
+  }
+
+  // The column's 16 weights at k-rows 0 .. 15 from its words (`words`) into v.
+  METAL_FUNC static void decode_p(thread const uint* P, thread float* v) {
     STEEL_PRAGMA_UNROLL
     for (uint i = 0; i < 4u; ++i) {
       STEEL_PRAGMA_UNROLL
@@ -43,11 +46,16 @@ struct g53_col {
     }
   }
 
-  // The column's 16 weights at k-rows 0 .. 15 into dst (two 16-byte stores), as T.
+  // The column's 16 weights at k-rows 0 .. 15 into v.
+  METAL_FUNC static void decode_v(const device uint* tile, thread const uint* o, thread float* v) {
+    uint P[NQ];
+    words(tile, o, P);
+    decode_p(P, v);
+  }
+
+  // 16 weights v into dst (two 16-byte stores), as T.
   template <typename T>
-  METAL_FUNC static void decode(const device uint* tile, thread const uint* o, threadgroup T* dst) {
-    float v[16];
-    decode_v(tile, o, v);
+  METAL_FUNC static void store(thread const float* v, threadgroup T* dst) {
     threadgroup uint4* d4 = reinterpret_cast<threadgroup uint4*>(dst);
     uint pk[8];
     STEEL_PRAGMA_UNROLL
@@ -56,6 +64,14 @@ struct g53_col {
     }
     d4[0] = uint4(pk[0], pk[1], pk[2], pk[3]);
     d4[1] = uint4(pk[4], pk[5], pk[6], pk[7]);
+  }
+
+  // The column's 16 weights at k-rows 0 .. 15 into dst (two 16-byte stores), as T.
+  template <typename T>
+  METAL_FUNC static void decode(const device uint* tile, thread const uint* o, threadgroup T* dst) {
+    float v[16];
+    decode_v(tile, o, v);
+    store<T>(v, dst);
   }
 };
 
