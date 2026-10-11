@@ -121,6 +121,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         bill: sdk.MemoryBill,
         /// The request's decode since its handover, for its request-end line; null before the handover and after the line.
         decode_mark: ?DecodeMark = null,
+        /// The last prompt pass's prefill GEMM calls and GPU drains (an EXL3 quant's; null for another quant).
+        prompt_gemm: ?[2]u64 = null,
         /// Each routed layer's counts at the handover and at the request's end, and the line's hit rates.
         layer_counts0: []LayerCounts,
         layer_counts1: []LayerCounts,
@@ -316,11 +318,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }
             try self.g.evalAll(&.{logits.?});
             try self.ex.flush();
-            const gemm: ?[2]u64 = if (q0) |a| blk: {
+            self.prompt_gemm = if (q0) |a| blk: {
                 const b = self.math.prefillStats();
                 break :blk .{ b[0] - a[0], b[1] - a[1] };
             } else null;
-            log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .gemm = gemm }});
+            log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .gemm = self.prompt_gemm }});
             return logits.?;
         }
 
@@ -838,6 +840,8 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     const q1 = m.math.prefillStats();
     try testing.expect(q1[0] > q0[0]);
     try testing.expectEqual(q0[1], q1[1]);
+    // The prompt line's counts: the pass's GEMM calls, no drain.
+    try testing.expectEqual([2]u64{ q1[0] - q0[0], 0 }, m.prompt_gemm.?);
     var t = try m.g.hostArgmax(logits);
     _ = mlx.mlx_array_free(logits);
     try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
