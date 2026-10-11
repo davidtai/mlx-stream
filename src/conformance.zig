@@ -28,28 +28,28 @@ test "mlx-stream conformance: the arch and the kinds it binds decline what is no
     };
     const arch = comptime sdk.Arch.of(plugin.provides.arch.?);
     try sdk.testing.expectClaims(arch.claims, &near_misses);
-    const source = comptime sdk_ext.ExpertSource.of(@import("exl3_source.zig"));
+    const source = comptime sdk_ext.ExpertSource.of(@import("exl3/source.zig"));
     try sdk.testing.expectClaims(source.claims, &near_misses);
     // a weight group no quant's format describes
     const group_near_misses = [_]sdk.testing.GroupClaimCase{
         .{ .quantization = "{}", .hidden = 5120, .inter = 2304, .want = null },
         .{ .quantization = "{\"mode\":\"__no_such_format__\",\"bits\":4,\"group_size\":32}", .hidden = 5120, .inter = 2304, .want = null },
     };
-    const quant = comptime sdk_ext.Quant.of(@import("exl3_quant.zig"));
+    const quant = comptime sdk_ext.Quant.of(@import("exl3/quant.zig"));
     try sdk.testing.expectGroupClaims(quant.claims, &group_near_misses);
 }
 
 test "mlx-stream conformance: the EXL3 quant is pinned by the kernel registry's manifest" {
-    const quant = comptime sdk_ext.Quant.of(@import("exl3_quant.zig"));
+    const quant = comptime sdk_ext.Quant.of(@import("exl3/quant.zig"));
     try std.testing.expectEqualStrings("exl3-mul1-k3", quant.name);
-    try std.testing.expectEqualStrings(@import("exl3_kernels.zig").manifest_sha256, quant.kernels.?.manifest_sha256);
+    try std.testing.expectEqualStrings(@import("exl3/kernels.zig").manifest_sha256, quant.kernels.?.manifest_sha256);
 }
 
 test "mlx-stream conformance: the EXL3 source's capabilities, and the arch claims the one reader for the process" {
-    const k = comptime sdk_ext.ExpertSource.of(@import("exl3_source.zig"));
+    const k = comptime sdk_ext.ExpertSource.of(@import("exl3/source.zig"));
     try std.testing.expectEqualStrings("exl3-stream", k.name);
     try std.testing.expect(k.caps.two_phase and k.caps.transient_release and k.caps.event_gates and !k.caps.construction_reset);
-    try std.testing.expect(@import("expert_stream.zig").uses_reader);
+    try std.testing.expect(@import("expert/stream.zig").uses_reader);
     const arch = comptime sdk.Arch.of(plugin.provides.arch.?);
     try std.testing.expect(arch.claim_process != null and arch.release_process != null);
     try arch.claim_process.?();

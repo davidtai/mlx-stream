@@ -167,7 +167,7 @@ Hadamard with suh / svh). They are independent implementations with disjoint cla
 | Rates | K 2..4, mixes, mul1 and mcg | K = 3, mul1 |
 | Kernels | generated for any shape | pinned Metal texts for this model's shapes, behind a manifest hash |
 
-`src/exl3_sushi_parity.zig` decodes sushi's own K3 mul1 fixture (`lib/sushi/src/exl3/fixtures/exl3_k3_linear.safetensors`
+`src/exl3/sushi_parity.zig` decodes sushi's own K3 mul1 fixture (`lib/sushi/src/exl3/fixtures/exl3_k3_linear.safetensors`
 in the host checkout) through this plugin's decoder and checks the result against sushi's reference bit for bit.
 
 ## Layout
@@ -178,7 +178,7 @@ sdk/                       the arch contract's types (`sdk` module), the weight 
 src/root.zig               the arch the host calls (`arch`, `sdk`, `default_context`) and the tests' surface
 src/tests.zig              the test root (`zig build mlx-stream-test` in the host)
 src/conformance.zig        the conformance suite's root
-src/deepseek_v41_host.zig  the harnesses' and bank tests' bridge (config parse, loaders, memory knobs), test-only
+src/arch/deepseek_v41/host.zig  the harnesses' and bank tests' bridge (config parse, loaders, memory knobs), test-only
 src/*.zig                  the DeepSeek-V4.1 arch, the EXL3 quant and kernels, the expert stream
 src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile)
 src/kernels/exl3/          the pinned Metal kernel texts and their manifest (embedded at compile time)

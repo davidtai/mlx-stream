@@ -16,7 +16,7 @@ page cache), mlx-serve's plugin SDK in that fork, now kept here.
 
 The DeepSeek-V4.1 streaming runtime this plugin was ported from (the packed
 expert record and manifest formats, the streamed-bank layout read by
-src/expert_bank.zig and the routed-expert EXL3 Metal kernels pinned under
+src/expert/bank.zig and the routed-expert EXL3 Metal kernels pinned under
 src/kernels/exl3/) is this repository's author's own earlier work, written in
 Python; it is the plugin's parity oracle. It is Copyright (c) 2026 David Tai
 and is distributed here under the MIT License.
@@ -46,7 +46,7 @@ Licensed under the MIT License.
 The EXL3 format this plugin reads (the mul1 codebook, the trellis packing, the
 tensor-core permutation and the Hadamard suh / svh transforms) follows
 exllamav3 v1.4.2 (codebook.cuh, exl3_dq.cuh, pack.cu, hadamard.cu,
-quantize.py); src/exl3_quant.zig and src/exl3_kernels.zig cite the lines they
+quantize.py); src/exl3/quant.zig and src/exl3/kernels.zig cite the lines they
 reproduce.
 
 --------------------------------------------------------------------------------
