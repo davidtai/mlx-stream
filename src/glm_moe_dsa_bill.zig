@@ -30,7 +30,7 @@ pub const min_fill_rows: u32 = 16;
 /// its first use.
 pub const decode_cache_bytes: u64 = 512 << 20;
 /// The prompt pass's cache limit at most (on the 256 GiB M5 Ultra, a sixteenth of its RAM).
-pub const prefill_cache_max_bytes: u64 = 16 << 30;
+pub const prefill_cache_max_bytes: u64 = 8 << 30;
 
 /// The prompt pass's cache limit on a box of `ram` bytes, which is also the bill's prompt-phase cache term (one value,
 /// `Inputs.prompt_cache`, for both): a sixteenth of the RAM, at most `prefill_cache_max_bytes`; with no RAM reading (0),
