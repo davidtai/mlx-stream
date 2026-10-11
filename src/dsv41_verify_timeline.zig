@@ -406,20 +406,22 @@ fn lastEnd(rs: []const Row, cyc: u32, a: u64, b: u64) ?u64 {
 /// signal of its last down value / of its gate-up value, capped at those buffers' end).
 /// `split`: the layer's window (its barrier's submit to the next stamped layer's, the last to the verify's end) split
 /// between the GPU and the SSD (`splitIn`).
-pub const PerLayer = struct { idle_barrier: u64 = 0, hit_span: ?u64 = null, gap: ?u64 = null, wait: ?u64 = null, wait_gu: ?u64 = null, split: ?Split = null };
+pub const PerLayer = struct { idle_barrier: u64 = 0, hit_span: ?u64 = null, gap: ?u64 = null, wait: ?u64 = null, wait_gu: ?u64 = null, split: ?Split = null, issue: ?u64 = null, read_time: ?u64 = null };
 
 /// One verify (ns): its wall, the GPU's busy union inside it and the idle rest, split by the host's stamps into
 /// `idle_barrier`, `idle_encode` (before the first layer, and between a layer's hit submit and the next layer's barrier
 /// submit) and `idle_tail` (after the last layer's hit submit); `read` the stream's read gauge over the routed calls;
 /// `miss_busy` the GPU busy time after the hit submit of the layers that missed; `wait` the summed gated waits on miss
 /// bytes (`PerLayer.wait`) and `work` = busy - wait; `hit_span` / `gap` summed over the layers that have them.
-pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_barrier: u64 = 0, idle_encode: u64 = 0, idle_tail: u64 = 0, read: u64 = 0, miss_busy: u64 = 0, buffers: u32 = 0, layers: u32 = 0, truncated: bool = false, work: u64 = 0, wait: u64 = 0, wait_gu: u64 = 0, hit_span: u64 = 0, hit_layers: u32 = 0, gap: u64 = 0, gap_layers: u32 = 0, gated: u32 = 0, unsignalled: u32 = 0, split: Split = .{}, layers_split: Split = .{}, round: u64 = 0, draft: u64 = 0, draft_idle: u64 = 0, tail: u64 = 0, tail_idle: u64 = 0, bar_neither: u64 = 0, enc_neither_missed: u64 = 0, enc_neither_hits: u64 = 0, enc_ssd_missed: u64 = 0, late: u64 = 0 };
+pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_barrier: u64 = 0, idle_encode: u64 = 0, idle_tail: u64 = 0, read: u64 = 0, miss_busy: u64 = 0, buffers: u32 = 0, layers: u32 = 0, truncated: bool = false, work: u64 = 0, wait: u64 = 0, wait_gu: u64 = 0, hit_span: u64 = 0, hit_layers: u32 = 0, gap: u64 = 0, gap_layers: u32 = 0, gated: u32 = 0, unsignalled: u32 = 0, split: Split = .{}, layers_split: Split = .{}, round: u64 = 0, draft: u64 = 0, draft_idle: u64 = 0, tail: u64 = 0, tail_idle: u64 = 0, bar_neither: u64 = 0, enc_neither_missed: u64 = 0, enc_neither_hits: u64 = 0, enc_ssd_missed: u64 = 0, late: u64 = 0, neither_call_ids: u64 = 0, neither_ids_reads: u64 = 0, neither_reads_hit: u64 = 0, issue: u64 = 0, read_time: u64 = 0 };
 
 /// `ssd`: the pool's busy spans. The splits are over the GPU's work (its busy union less its gated waits on bytes):
 /// `split` the verify's whole window, `layers_split` the routed layers' windows summed, and of those the barrier
 /// windows' (a layer's barrier submit to its hit submit) and encode windows' (its hit submit to the next barrier
-/// submit, after a layer that missed or not) idle time. `late`: per gated layer, the miss waves' GPU start after their
-/// bytes landed. `draft` / `tail`: the cycle's draft before the verify and the rest after it to `next_draft` (the next
+/// submit, after a layer that missed or not) idle time, the barrier window's in three parts (to the ids read, to the
+/// route's reads submitted, to the hit wave's submit). `issue`: the host from the ids read to the reads submitted;
+/// `read_time`: per gated layer, its reads submitted to its last bytes landed; `late`: the miss waves' GPU start after
+/// their bytes landed. `draft` / `tail`: the cycle's draft before the verify and the rest after it to `next_draft` (the next
 /// cycle's start, 0 for none), and the GPU's idle time in them; `round` the cycle's start to the next's.
 pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []const Signal, ssd: []const Span, next_draft: u64, scratch: []Span, work_scratch: []Span, per: []PerLayer) CycleSum {
     var s: CycleSum = .{};
@@ -501,6 +503,8 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
             waits[n_waits] = .{ b, b + wait };
             n_waits += 1;
         }
+        s.read_time += sd -| P.t(l, .route);
+        per[i].read_time = sd -| P.t(l, .route);
         // The bytes landed before the GPU reached the miss waves (after the hit wave's end, when there is one).
         const hit_end: u64 = if (per[i].hit_span != null) (spanOf(rs, cyc, P.t(l, .route), P.t(l, .hit)).?)[1] else 0;
         s.late += b -| @max(sd, hit_end);
@@ -524,6 +528,11 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
         per[i].split = sp;
         inline for (.{ "both", "ssd_only", "gpu_only", "idle" }) |f| @field(s.layers_split, f) += @field(sp, f);
         s.bar_neither += splitIn(work, ssd, P.t(l, .call), P.t(l, .hit)).idle;
+        s.neither_call_ids += splitIn(work, ssd, P.t(l, .call), P.t(l, .barrier)).idle;
+        s.neither_ids_reads += splitIn(work, ssd, P.t(l, .barrier), P.t(l, .route)).idle;
+        s.neither_reads_hit += splitIn(work, ssd, P.t(l, .route), P.t(l, .hit)).idle;
+        s.issue += P.t(l, .route) -| P.t(l, .barrier);
+        per[i].issue = P.t(l, .route) -| P.t(l, .barrier);
         const enc = splitIn(work, ssd, P.t(l, .hit), next_call);
         if (l.missed) {
             s.enc_neither_missed += enc.idle;
@@ -533,7 +542,7 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
     return s;
 }
 
-const fields = [_][]const u8{ "wall_ms", "busy_ms", "gpu_work_ms", "bytes_wait_ms", "bytes_wait_gu_ms", "idle_ms", "idle_barrier_ms", "idle_barrier_per_layer_ms", "idle_encode_ms", "idle_tail_ms", "hit_span_ms", "hit_span_per_layer_ms", "router_hit_gap_ms", "router_hit_gap_per_layer_ms", "read_busy_ms", "miss_layer_busy_ms", "buffers", "gated_layers", "unsignalled_gates", "work_and_ssd_ms", "ssd_alone_ms", "work_alone_ms", "neither_ms", "layers_work_and_ssd_ms", "layers_ssd_alone_ms", "layers_work_alone_ms", "layers_neither_ms", "barrier_neither_ms", "encode_neither_missed_ms", "encode_neither_hit_only_ms", "encode_ssd_alone_missed_ms", "miss_late_start_ms", "round_ms", "draft_ms", "draft_gpu_idle_ms", "tail_ms", "tail_gpu_idle_ms" };
+const fields = [_][]const u8{ "wall_ms", "busy_ms", "gpu_work_ms", "bytes_wait_ms", "bytes_wait_gu_ms", "idle_ms", "idle_barrier_ms", "idle_barrier_per_layer_ms", "idle_encode_ms", "idle_tail_ms", "hit_span_ms", "hit_span_per_layer_ms", "router_hit_gap_ms", "router_hit_gap_per_layer_ms", "read_busy_ms", "miss_layer_busy_ms", "buffers", "gated_layers", "unsignalled_gates", "work_and_ssd_ms", "ssd_alone_ms", "work_alone_ms", "neither_ms", "layers_work_and_ssd_ms", "layers_ssd_alone_ms", "layers_work_alone_ms", "layers_neither_ms", "barrier_neither_ms", "encode_neither_missed_ms", "encode_neither_hit_only_ms", "encode_ssd_alone_missed_ms", "miss_late_start_ms", "round_ms", "draft_ms", "draft_gpu_idle_ms", "tail_ms", "tail_gpu_idle_ms", "neither_call_to_ids_ms", "neither_ids_to_reads_ms", "neither_reads_to_hit_ms", "issue_latency_ms", "miss_read_time_ms" };
 
 fn fieldOf(s: CycleSum, i: usize) f64 {
     const ms = struct {
@@ -583,7 +592,12 @@ fn fieldOf(s: CycleSum, i: usize) f64 {
         33 => ms(s.draft),
         34 => ms(s.draft_idle),
         35 => ms(s.tail),
-        else => ms(s.tail_idle),
+        36 => ms(s.tail_idle),
+        37 => ms(s.neither_call_ids),
+        38 => ms(s.neither_ids_reads),
+        39 => ms(s.neither_reads_hit),
+        40 => ms(s.issue),
+        else => ms(s.read_time),
     };
 }
 
@@ -593,7 +607,7 @@ fn median(xs: []f64) f64 {
     return if (xs.len % 2 == 1) xs[xs.len / 2] else (xs[xs.len / 2 - 1] + xs[xs.len / 2]) / 2;
 }
 
-const by_layer_fields = [_][]const u8{ "idle_barrier", "hit_span", "router_hit_gap", "bytes_wait", "work_and_ssd", "ssd_alone", "work_alone", "neither" };
+const by_layer_fields = [_][]const u8{ "idle_barrier", "hit_span", "router_hit_gap", "bytes_wait", "work_and_ssd", "ssd_alone", "work_alone", "neither", "issue_latency", "miss_read_time" };
 
 var per_cycle: [fields.len][max_cycles]f64 = undefined;
 var per_layer: [by_layer_fields.len][max_layers][max_cycles]f64 = undefined;
@@ -624,7 +638,7 @@ fn writeLine(w: *std.Io.Writer, rs: []const Row, vs: []const Verify, ls: []const
         for (0..fields.len) |f| per_cycle[f][n] = fieldOf(s, f);
         for (per[0..n_layers], 0..) |p, l| {
             const sp = p.split;
-            const vals = [_]?u64{ p.idle_barrier, p.hit_span, p.gap, p.wait, if (sp) |x| x.both else null, if (sp) |x| x.ssd_only else null, if (sp) |x| x.gpu_only else null, if (sp) |x| x.idle else null };
+            const vals = [_]?u64{ p.idle_barrier, p.hit_span, p.gap, p.wait, if (sp) |x| x.both else null, if (sp) |x| x.ssd_only else null, if (sp) |x| x.gpu_only else null, if (sp) |x| x.idle else null, p.issue, p.read_time };
             for (vals, 0..) |x, k| if (x) |y| {
                 per_layer[k][l][per_layer_n[k][l]] = @as(f64, @floatFromInt(y)) / 1e6;
                 per_layer_n[k][l] += 1;
