@@ -316,6 +316,12 @@ pub const LayerPolicy = struct {
         p.request_routes += 1;
     }
 
+    /// With the tally seeded, a prefill miss that is not pinned takes only an empty row (it evicts nothing, and no seed
+    /// promotion copies it): the residents the tally's preload and pins chose stay.
+    fn mayEvictInPrefill(p: *const LayerPolicy, e: u16) bool {
+        return !p.seeded or p.pin_limit == 0 or p.pinned.isSet(e);
+    }
+
     /// prepare_prefill_seed: counts the prompt's routed ids, then re-protects
     /// the resident part of its top-(capacity - protected) and marks the rest to
     /// be admitted first, protected, by the prefill routes.
@@ -350,7 +356,7 @@ pub const LayerPolicy = struct {
             p.clock += 1;
             p.recency[e] = p.clock;
         }
-        for (chosen) |e| if (p.expert_to_slot[e] == no_slot) p.seed.set(e);
+        for (chosen) |e| if (p.expert_to_slot[e] == no_slot and p.mayEvictInPrefill(e)) p.seed.set(e);
     }
 
     /// Forgets every resident and the prompt state (protection, the seed, the prompt counts, recency): what the
@@ -503,7 +509,7 @@ pub const LayerPolicy = struct {
                 // once admitted are never victims.
                 for (out.missesOf()) |e| {
                     const is_seed = p.seed.isSet(e);
-                    const slot = p.emptySlot() orelse p.probationVictim() orelse no_slot;
+                    const slot = p.emptySlot() orelse (if (p.mayEvictInPrefill(e)) p.probationVictim() else null) orelse no_slot;
                     if (is_seed) p.seed.unset(e);
                     if (slot == no_slot) {
                         transient_buf[n_transient] = e;
@@ -585,7 +591,7 @@ pub const LayerPolicy = struct {
         var best: ?u32 = null;
         var best_recency: u64 = 0;
         for (p.slot_to_expert[0..p.capacity], 0..) |e, s| {
-            if (e == no_expert or p.in_route.isSet(e) or p.protected.isSet(e) or p.held.isSet(s)) continue;
+            if (e == no_expert or p.in_route.isSet(e) or p.protected.isSet(e) or p.held.isSet(s) or p.pinned.isSet(e)) continue;
             if (best == null or p.recency[e] < best_recency) {
                 best = @intCast(s);
                 best_recency = p.recency[e];
@@ -667,8 +673,10 @@ pub const LayerPolicy = struct {
         }
     }
 
-    /// (score, last use, prompt frequency, -expert): Python's rank tuple.
+    /// (pinned, score, last use, prompt frequency, -expert): Python's rank tuple behind the tally's pins (none unseeded).
     fn rankLess(p: *const LayerPolicy, a: u16, b: u16) bool {
+        const pa = p.pinned.isSet(a);
+        if (pa != p.pinned.isSet(b)) return !pa;
         if (p.scores[a] != p.scores[b]) return p.scores[a] < p.scores[b];
         if (p.last_used[a] != p.last_used[b]) return p.last_used[a] < p.last_used[b];
         if (p.prefill_freq[a] != p.prefill_freq[b]) return p.prefill_freq[a] < p.prefill_freq[b];
