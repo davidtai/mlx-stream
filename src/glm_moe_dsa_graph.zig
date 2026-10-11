@@ -24,6 +24,7 @@ const pt = @import("glm_moe_dsa_prefill_timers.zig");
 const expert_policy = @import("sdk_ext.zig").expert.policy;
 const dsa = sdk.dsa;
 const topk_mod = @import("glm_moe_dsa_topk.zig");
+const tokroutes = @import("glm_moe_dsa_tokroutes.zig");
 
 pub const G = ops.MlxOps;
 pub const T = G.T;
@@ -642,6 +643,9 @@ pub const Routes = struct {
     dsa: bool = false,
     /// The wave probe, a diagnostic the module arms (`WaveProbe`); null: off.
     wave_probe: ?*WaveProbe = null,
+    /// The route recorder's (a diagnostic): decode calls also hand the driver the router scores of the routed layers
+    /// two and three after the call's, on its MoE input (`Experts.call`'s `deeper`).
+    predict_deeper: bool = false,
 };
 
 /// A diagnostic the module arms at construction (`GLM53_WAVE_PROBE`, off by default): each prompt layer's MLX peak above
@@ -798,7 +802,16 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             const next: ?T = if (rt.lookahead and !prompt and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2) else null;
             // A decode-lane call takes the shared expert built first and runs it during its read wait; the sum is the same.
             const shared: ?T = if (!wide) try mlp(g, lw.shared.?, x2) else null;
-            const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, if (shared) |sh| &[_]T{sh} else &.{});
+            var deeper: [2]?T = .{ null, null };
+            if (rt.predict_deeper and next != null) for (&deeper, 2..) |*dp, d| {
+                if (li + d < w.layers.len and w.layers[li + d].router != null) dp.* = try routerScores(g, w.layers[li + d].router.?, x2);
+            };
+            const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, &deeper, if (shared) |sh| &[_]T{sh} else &.{});
+            if (tokroutes.enabled() and lw.bank_layer.? < tokroutes.layers) {
+                const top = try a.alloc(u16, rows * c.n_experts_per_tok);
+                defer a.free(top);
+                tokroutes.record(!prompt, lw.bank_layer.?, start, ids, try g.hostIds(r.indices, top));
+            }
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{routed}, .routed);
             if (probe) |p| p.mark(l, .moe);
             break :blk try g.add(routed, shared orelse try mlp(g, lw.shared.?, x2));
