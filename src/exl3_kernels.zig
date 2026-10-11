@@ -234,10 +234,7 @@ pub const Refusal = error{
 /// Why the registry refused, for the one log line the caller writes.
 pub const Diag = @import("sdk").Diag;
 
-fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-    if (diag) |d| d.set(fmt, args);
-    return err;
-}
+const refuse = @import("sdk_ext/expert/bank_file.zig").refuse;
 
 // ── Signature and geometry ──
 
