@@ -75,8 +75,51 @@ const Receipt = struct {
     records: [4]PhaseRecord,
 };
 
-/// The box's runs of this bill (`receipt.py` over each run's serve.log).
-const receipts = [_]Receipt{};
+/// The box's runs of this bill on stack 3e37e40 (plugin 53b4b7e, host e3baf303): the coding workload, seed 1234, its
+/// screen with the wave probe on (`GLM53_WAVE_PROBE`) and without it.
+const receipts = [_]Receipt{
+    .{
+        .name = "v2-coding-probe",
+        .baseline = 19358449664,
+        .units = .{ .prompt = 70, .decode = 80 },
+        .target = 257698037760,
+        .request = .{ .positions = 17415, .others = 19062199640, .target = 257698037760, .units = 85 },
+        .positions = 17415,
+        .grown = 85,
+        .bill_rows = 85,
+        .live_rows = 85,
+        .file_backed_start = 15896264704,
+        .records = .{
+            .{ .phase = "module constructed", .billed = .{ .slot_rows = 170119987200, .transient_rows = 8003911680, .mtp_residents = 4752870912, .pool_staging = 89362432, .host_side = 600000000 }, .measured = .{ .footprint = 183255887040, .interval_peak = 183523971560, .mlx_active = 182876769800, .mlx_cache = 0, .mlx_peak = 182876769800, .physical = 218581221376, .file_backed = 15897608192, .speculative = 18251776, .residual = 42160664, .mlx_residual = -8 } },
+            .{ .phase = "prompt pass", .billed = .{ .slot_rows = 170119987200, .transient_rows = 8003911680, .residents = 20060757504, .mtp_residents = 4752870912, .kv = 1567014912, .mtp_kv = 23166976, .mtp_pending = 202113024, .waves = 12126835200, .mlx_cache = 17179869184, .mlx_cache_overshoot = 805306368, .pool_staging = 89362432, .host_side = 1000000000, .wire_tables = 344118640 }, .measured = .{ .footprint = 222481478224, .interval_peak = 228725025872, .mlx_active = 204727190196, .mlx_cache = 17076501692, .mlx_peak = 213648950024, .physical = 257935785984, .file_backed = 15898411008, .speculative = 18120704, .residual = 7550288160, .mlx_residual = 3207707384 } },
+            .{ .phase = "handover", .billed = .{ .slot_rows = 206578483200, .transient_rows = 1067188224, .residents = 20060757504, .mtp_residents = 4752870912, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 202113024, .waves = 207337122, .mlx_cache = 536870912, .mlx_cache_overshoot = 8916480, .pool_staging = 89362432, .host_side = 1350000000, .wire_tables = 344496648 }, .measured = .{ .footprint = 235028917280, .interval_peak = 235028917280, .mlx_active = 234347528884, .mlx_cache = 2700, .mlx_peak = 234347528896, .physical = 270502117376, .file_backed = 15898492928, .speculative = 18087936, .residual = 1854737418, .mlx_residual = 206479330 } },
+            .{ .phase = "decode", .billed = .{ .slot_rows = 206578483200, .transient_rows = 1067188224, .residents = 20060757504, .mtp_residents = 4752870912, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 202113024, .waves = 207337122, .mlx_cache = 536870912, .mlx_cache_overshoot = 8916480, .pool_staging = 89362432, .host_side = 1350000000, .wire_tables = 344496648 }, .measured = .{ .footprint = 235325936808, .interval_peak = 235478848608, .mlx_active = 234146185908, .mlx_cache = 398206901, .mlx_peak = 234217241460, .physical = 270867562496, .file_backed = 15929294848, .speculative = 24543232, .residual = 1404806090, .mlx_residual = 336766766 } },
+        },
+    },
+    .{
+        .name = "v2-coding",
+        .baseline = 19489734656,
+        .units = .{ .prompt = 70, .decode = 80 },
+        .target = 257698037760,
+        .request = .{ .positions = 17415, .others = 19165582752, .target = 257698037760, .units = 85 },
+        .positions = 17415,
+        .grown = 85,
+        .bill_rows = 85,
+        .live_rows = 85,
+        .file_backed_start = 16125607936,
+        .records = .{
+            .{ .phase = "module constructed", .billed = .{ .slot_rows = 170119987200, .transient_rows = 8003911680, .mtp_residents = 4752870912, .pool_staging = 89362432, .host_side = 600000000 }, .measured = .{ .footprint = 183255608512, .interval_peak = 183523660216, .mlx_active = 182876769800, .mlx_cache = 0, .mlx_peak = 182876769800, .physical = 218805518336, .file_backed = 16157442048, .speculative = 8945664, .residual = 42472008, .mlx_residual = -8 } },
+            .{ .phase = "prompt pass", .billed = .{ .slot_rows = 170119987200, .transient_rows = 8003911680, .residents = 20060757504, .mtp_residents = 4752870912, .kv = 1567014912, .mtp_kv = 23166976, .mtp_pending = 202113024, .waves = 12126835200, .mlx_cache = 17179869184, .mlx_cache_overshoot = 805306368, .pool_staging = 89362432, .host_side = 1000000000, .wire_tables = 344118640 }, .measured = .{ .footprint = 222559678936, .interval_peak = 228823871168, .mlx_active = 204727252772, .mlx_cache = 17155013284, .mlx_peak = 213649034184, .physical = 258270691328, .file_backed = 16158359552, .speculative = 9011200, .residual = 7451442864, .mlx_residual = 3207623224 } },
+            .{ .phase = "handover", .billed = .{ .slot_rows = 206578483200, .transient_rows = 1067188224, .residents = 20060757504, .mtp_residents = 4752870912, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 202113024, .waves = 207337122, .mlx_cache = 536870912, .mlx_cache_overshoot = 8916480, .pool_staging = 89362432, .host_side = 1350000000, .wire_tables = 344496648 }, .measured = .{ .footprint = 235028638656, .interval_peak = 235028638656, .mlx_active = 234347575076, .mlx_cache = 2700, .mlx_peak = 234347575088, .physical = 270754267136, .file_backed = 16158310400, .speculative = 9011200, .residual = 1855016042, .mlx_residual = 206433138 } },
+            .{ .phase = "decode", .billed = .{ .slot_rows = 206578483200, .transient_rows = 1067188224, .residents = 20060757504, .mtp_residents = 4752870912, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 202113024, .waves = 207337122, .mlx_cache = 536870912, .mlx_cache_overshoot = 8916480, .pool_staging = 89362432, .host_side = 1350000000, .wire_tables = 344496648 }, .measured = .{ .footprint = 235315172400, .interval_peak = 235478766496, .mlx_active = 234146232100, .mlx_cache = 387768245, .mlx_peak = 234217103048, .physical = 271005696000, .file_backed = 16162242560, .speculative = 12419072, .residual = 1404888202, .mlx_residual = 336905178 } },
+        },
+    },
+};
+
+/// MLX's bytes the host holds before the module allocates: mlx-serve seeds MLX's default random key at its start
+/// (`mlx_random_seed`: an array of 2 uint32). They sit in the load's baseline (the box before the load), not in the
+/// module's terms, so the constructed MLX bytes are the module's arrays and this key.
+const host_key_bytes: i64 = 8;
 
 test "glm bill receipts: each run's phase terms, page tables and residuals rebuild from its bill, to the byte" {
     var c = try glm53Config();
@@ -93,9 +136,10 @@ test "glm bill receipts: each run's phase terms, page tables and residuals rebui
             const pm: sdk.memory.ProcessMemory = .{ .footprint = rec.measured.footprint, .footprint_interval_peak = rec.measured.interval_peak };
             const m = rec.measured;
             try phase_mem.expectMeasured(phase_mem.recordOf(bill.PhaseTerms, rec.phase, w, w.sum(), w.device(), pm, m.mlx_active, m.mlx_cache, m.mlx_peak, m.physical, m.file_backed, m.speculative, r.file_backed_start), m, r.file_backed_start);
-            // The bill covers the phase: billed at least the footprint's high-water mark and MLX's peak.
+            // The bill covers the phase: billed at least the footprint's high-water mark and MLX's peak (constructed: the
+            // module's arrays to the byte, beside the host's key).
             try testing.expect(m.residual >= 0);
-            try testing.expect(m.mlx_residual >= 0);
+            if (std.mem.eql(u8, rec.phase, "module constructed")) try testing.expectEqual(-host_key_bytes, m.mlx_residual) else try testing.expect(m.mlx_residual >= 0);
             // The step created no page cache the bill would not see.
             try phase_mem.checkPageCache(@as(i64, @intCast(m.file_backed)) - @as(i64, @intCast(r.file_backed_start)));
         }
