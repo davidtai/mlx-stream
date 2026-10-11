@@ -427,8 +427,44 @@ pub fn tinyConfig(a: std.mem.Allocator) !glm.Config {
     return glm.Config.parse(a, text, null, null);
 }
 
-pub fn tmpRoot(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
-    return buf[0..try tmp.dir.realPath(std.testing.io, buf)];
+pub const tmpRoot = @import("expert_bank.zig").tmpRoot;
+
+/// One case of a GLM-5.3 bank's refusal table: the synthetic bank's perturbation, its refusal and words of its message.
+pub fn RefusalCase(comptime M: type) type {
+    return struct { s: M.Synth, err: anyerror, why: []const u8 };
+}
+
+/// A GLM-5.3 bank module's refusal table (`M`: its `Synth`, `writeSynth` and `Bank.open` over the tiny model): each
+/// case's bank refused with its error and a message holding `why`, and a relative bank dir refused by name.
+pub fn expectRefusals(comptime M: type, cases: []const RefusalCase(M)) !void {
+    var c = try tinyConfig(testing.allocator);
+    defer c.deinit(testing.allocator);
+    for (cases) |cs| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const bin = try M.writeSynth(testing.allocator, testing.io, tmp.dir, &c, cs.s);
+        defer testing.allocator.free(bin);
+        var rbuf: [512]u8 = undefined;
+        var diag: Diag = .{};
+        const r = M.Bank.open(testing.allocator, testing.io, try tmpRoot(&tmp, &rbuf), &c, &diag);
+        if (r) |ok| {
+            var b = ok;
+            b.deinit();
+            std.debug.print("case {any}: opened\n", .{cs.s});
+            return error.TestExpectedError;
+        } else |e| {
+            testing.expectEqual(cs.err, e) catch |x| {
+                std.debug.print("case {any}: {s}\n", .{ cs.s, diag.message() });
+                return x;
+            };
+            testing.expect(std.mem.indexOf(u8, diag.message(), cs.why) != null) catch |x| {
+                std.debug.print("want \"{s}\" in \"{s}\"\n", .{ cs.why, diag.message() });
+                return x;
+            };
+        }
+    }
+    var diag: Diag = .{};
+    try testing.expectError(error.BankDirNotAbsolute, M.Bank.open(testing.allocator, testing.io, "packs/glm", &c, &diag));
 }
 
 /// A synthetic bank (`writeSynth`) for the tiny model, opened from a temporary directory (tests).
@@ -515,8 +551,7 @@ test "glm bank: a clean synthetic bank opens: offsets, spans and digests from it
 }
 
 test "glm bank: every rule of the pack's contract refuses by name" {
-    const Case = struct { s: Synth, err: anyerror, why: []const u8 };
-    const cases = [_]Case{
+    try expectRefusals(@This(), &.{
         .{ .s = .{ .no_manifest = true }, .err = error.ManifestMissing, .why = "not found" },
         .{ .s = .{ .format = "mlx-stream-expert-manifest-affine-v2" }, .err = error.ManifestFormat, .why = "format" },
         .{ .s = .{ .mode = "mxfp4" }, .err = error.QuantNotImplemented, .why = "mxfp4" },
@@ -535,35 +570,7 @@ test "glm bank: every rule of the pack's contract refuses by name" {
         .{ .s = .{ .bad_sha = true }, .err = error.RecordSha256, .why = "sha256" },
         .{ .s = .{ .all_pass = false }, .err = error.ParityNotPassed, .why = "all_pass" },
         .{ .s = .{ .truncate_file = true }, .err = error.SidecarGeometry, .why = "experts.bin is" },
-    };
-    var c = try tinyConfig(testing.allocator);
-    defer c.deinit(testing.allocator);
-    for (cases) |cs| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const bin = try writeSynth(testing.allocator, testing.io, tmp.dir, &c, cs.s);
-        defer testing.allocator.free(bin);
-        var rbuf: [512]u8 = undefined;
-        var diag: Diag = .{};
-        const r = Bank.open(testing.allocator, testing.io, try tmpRoot(&tmp, &rbuf), &c, &diag);
-        if (r) |ok| {
-            var b = ok;
-            b.deinit();
-            std.debug.print("case {any}: opened\n", .{cs.s});
-            return error.TestExpectedError;
-        } else |e| {
-            testing.expectEqual(cs.err, e) catch |x| {
-                std.debug.print("case {any}: {s}\n", .{ cs.s, diag.message() });
-                return x;
-            };
-            testing.expect(std.mem.indexOf(u8, diag.message(), cs.why) != null) catch |x| {
-                std.debug.print("want \"{s}\" in \"{s}\"\n", .{ cs.why, diag.message() });
-                return x;
-            };
-        }
-    }
-    var diag: Diag = .{};
-    try testing.expectError(error.BankDirNotAbsolute, Bank.open(testing.allocator, testing.io, "packs/glm", &c, &diag));
+    });
 }
 
 test "glm bank: the bank of a config with other dims is refused at its dims" {

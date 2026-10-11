@@ -838,7 +838,7 @@ test "glm mtp: the pack's mtp/ opens under the trunk bank's rules: the MTP layer
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [512]u8 = undefined;
-    const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
+    const root = try exl3.tmpRoot(&tmp, &rbuf);
     const img = try exl3.writeSynth(a, testing.io, tmp.dir, &c, .{ .mtp_only = true });
     defer a.free(img);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -894,7 +894,7 @@ test "glm mtp: the EXL3 bank's arrays are the records' segments byte for byte, [
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [512]u8 = undefined;
-    const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
+    const root = try exl3.tmpRoot(&tmp, &rbuf);
     const img = try exl3.writeSynth(a, testing.io, tmp.dir, &c, .{ .mtp_only = true });
     defer a.free(img);
     var w = sdk.Weights.init(a);
@@ -938,7 +938,7 @@ test "glm mtp: the EXL3 bank's MoE on the GPU equals sushi's host decode of the 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [512]u8 = undefined;
-    const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
+    const root = try exl3.tmpRoot(&tmp, &rbuf);
     const img = try exl3.writeSynth(a, testing.io, tmp.dir, &c, .{ .mtp_only = true, .signs = true });
     defer a.free(img);
     var w = sdk.Weights.init(a);

@@ -625,8 +625,7 @@ test "glm exl3 bank: a clean synthetic bank opens: the stream layers, each exper
 }
 
 test "glm exl3 bank: every rule of the pack's contract refuses by name" {
-    const Case = struct { s: Synth, err: anyerror, why: []const u8 };
-    const cases = [_]Case{
+    try affine.expectRefusals(@This(), &.{
         .{ .s = .{ .no_manifest = true }, .err = error.ManifestMissing, .why = "not found" },
         .{ .s = .{ .format = "mlx-stream-expert-manifest-exl3-v2" }, .err = error.ManifestFormat, .why = "format" },
         .{ .s = .{ .multiplier = 0x83DCD12D }, .err = error.QuantNotImplemented, .why = "multiplier" },
@@ -644,35 +643,7 @@ test "glm exl3 bank: every rule of the pack's contract refuses by name" {
         .{ .s = .{ .bad_sha = true }, .err = error.RecordSha256, .why = "sha256" },
         .{ .s = .{ .all_pass = false }, .err = error.ParityNotPassed, .why = "all_pass" },
         .{ .s = .{ .truncate_file = true }, .err = error.SidecarGeometry, .why = "experts.bin is" },
-    };
-    var c = try affine.tinyConfig(testing.allocator);
-    defer c.deinit(testing.allocator);
-    for (cases) |cs| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const bin = try writeSynth(testing.allocator, testing.io, tmp.dir, &c, cs.s);
-        defer testing.allocator.free(bin);
-        var rbuf: [512]u8 = undefined;
-        var diag: Diag = .{};
-        const r = Bank.open(testing.allocator, testing.io, try tmpRoot(&tmp, &rbuf), &c, &diag);
-        if (r) |ok| {
-            var b = ok;
-            b.deinit();
-            std.debug.print("case {any}: opened\n", .{cs.s});
-            return error.TestExpectedError;
-        } else |e| {
-            testing.expectEqual(cs.err, e) catch |x| {
-                std.debug.print("case {any}: {s}\n", .{ cs.s, diag.message() });
-                return x;
-            };
-            testing.expect(std.mem.indexOf(u8, diag.message(), cs.why) != null) catch |x| {
-                std.debug.print("want \"{s}\" in \"{s}\"\n", .{ cs.why, diag.message() });
-                return x;
-            };
-        }
-    }
-    var diag: Diag = .{};
-    try testing.expectError(error.BankDirNotAbsolute, Bank.open(testing.allocator, testing.io, "packs/glm", &c, &diag));
+    });
 }
 
 test "glm exl3 bank: the stream reads each routed expert's minis into adjacent rows of its bank layer's slots, persistent and transient, both geometries" {
