@@ -227,13 +227,15 @@ pub const Bank = struct {
     }
 
     /// What the bill reads (`glm_moe_dsa.Geometry`): each stream layer's slots (one row an expert's minis, its experts,
-    /// its share of a unit: its experts over `maxUnits`); one slot of every geometry as the widest record (each geometry's
-    /// transient scratch holds its own rows, the bill charges them all at it); the widest mini range. The layers borrow
-    /// the bank's.
+    /// its share of a unit: its experts over `maxUnits`); one slot of every geometry it holds as the widest record (an
+    /// empty stream layer holds none; each geometry's transient scratch holds its own rows, the bill charges them all at
+    /// it); the widest mini range. The layers borrow the bank's.
     pub fn geometryOf(self: *const Bank) Geometry {
         var g: Geometry = .{ .layers = self.slots, .widest_record = 0, .widest_span = 0 };
         if (self.layers.len == 0) return g;
-        for (self.layers[0..banks_per_layer]) |*l| g.widest_record += @as(u64, l.minis) * l.logical_bytes;
+        for (self.layers[0..banks_per_layer]) |*l| if (l.n_held > 0) {
+            g.widest_record += @as(u64, l.minis) * l.logical_bytes;
+        };
         for (self.layers) |*l| {
             const gu = l.segments[gu_components].offset;
             g.widest_span = @max(g.widest_span, @max(gu, l.logical_bytes - gu));
@@ -289,6 +291,22 @@ pub const Bank = struct {
         return bank_file.peek(a, q, self.hidden, self.inter, self.n_experts, self.layers.len);
     }
 
+    /// Routed layer `r`'s stream layers once its `sd` bank layers are read: with one, the second stream layer is empty
+    /// (no experts: no rows, no route; the first's K, segments and record, so the stream keeps one transient geometry;
+    /// its base at the first's end); every expert of the layer in one of them.
+    fn closeLayer(self: *Bank, comptime file: []const u8, r: usize, sd: u32, diag: ?*Diag) Refusal!void {
+        const ne: usize = self.n_experts;
+        const first = banks_per_layer * r;
+        if (sd == 1) {
+            var l = self.layers[first];
+            l.base_offset += @as(u64, l.n_held) * l.minis * l.record_bytes;
+            l.n_held = 0;
+            self.layers[first + 1] = l;
+        }
+        for (0..ne) |e| if (self.local[first * ne + e] == no_local and self.local[(first + 1) * ne + e] == no_local)
+            return refuse(diag, error.ExpertMap, file ++ ": layer {d}: expert {d} in neither bank layer", .{ self.layers[first].model_layer, e });
+    }
+
     /// The manifest's rules against the model's config (`bank_file.open`, `a` its arena); returns the sidecar's bytes.
     pub fn adopt(self: *Bank, a: std.mem.Allocator, m: *const ManifestJson, x: Against, diag: ?*Diag) (Refusal || std.mem.Allocator.Error)!u64 {
         return switch (x.holds) {
@@ -321,8 +339,10 @@ pub const Bank = struct {
         self.n_experts = @intCast(d.n_experts);
         const ne: usize = self.n_experts;
         // 3. The bank layers: every one's segments as the format derives them, back to back, the bases contiguous;
-        // the routed layers' first (two per layer, K ascending, their experts each layer's once), then the MTP layer's.
-        // The MTP directory holds the MTP layer's alone, as its one routed layer.
+        // the routed layers' first (one per K the layer holds, K ascending, their experts each layer's once), then the
+        // MTP layer's. The MTP directory holds the MTP layer's alone, as its one routed layer. A routed layer of one K
+        // (a uniform pack: every expert in its one bank layer) still has two stream layers: its second is empty
+        // (`closeLayer`).
         var sparse: [glm.max_layers]u32 = undefined;
         const mtp_layer = [1]u32{c.n_layers};
         const routed: []const u32 = switch (holds) {
@@ -330,17 +350,24 @@ pub const Bank = struct {
             .mtp => &mtp_layer,
         };
         const n_stream = routed.len * banks_per_layer;
-        if (holds == .mtp and m.layers.len != n_stream) return refuse(diag, error.LayerGeometry, file ++ ": {d} bank layers, the MTP layer has {d} (one per K)", .{ m.layers.len, n_stream });
-        if (m.layers.len < n_stream) return refuse(diag, error.LayerGeometry, file ++ ": {d} bank layers, the {d} routed layers need {d}", .{ m.layers.len, routed.len, n_stream });
         self.layers = try gpa.alloc(Layer, n_stream);
         self.local = try gpa.alloc(u16, n_stream * ne);
         @memset(self.local, no_local);
         self.side = try gpa.alloc(u1, routed.len * ne);
         var base: u64 = 0;
         var n_minis: u64 = 0;
+        // The routed layer the next bank layer belongs to, and the bank layers it has so far.
+        var rl: usize = 0;
+        var taken: u32 = 0;
         for (m.layers, 0..) |lj, i| {
-            const streamed = i < n_stream;
-            const want_layer: u64 = if (streamed) routed[i / banks_per_layer] else c.n_layers;
+            if (rl < routed.len and taken > 0 and lj.layer != routed[rl]) {
+                try self.closeLayer(file, rl, taken, diag);
+                rl += 1;
+                taken = 0;
+            }
+            const streamed = rl < routed.len;
+            if (holds == .mtp and !streamed) return refuse(diag, error.LayerGeometry, file ++ ": {d} bank layers, the MTP layer has at most {d} (one per K)", .{ m.layers.len, banks_per_layer });
+            const want_layer: u64 = if (streamed) routed[rl] else c.n_layers;
             const want_mtp = holds == .mtp or !streamed;
             if (lj.bank_layer != i or lj.layer != want_layer or lj.mtp != want_mtp)
                 return refuse(diag, error.LayerGeometry, file ++ ": bank layer entry {d} is bank layer {d} of layer {d} (mtp {}), want layer {d} (mtp {})", .{ i, lj.bank_layer, lj.layer, lj.mtp, want_layer, want_mtp });
@@ -359,21 +386,29 @@ pub const Bank = struct {
             for (lj.experts, 0..) |e, j| if (e >= ne or (j > 0 and e <= lj.experts[j - 1]))
                 return refuse(diag, error.ExpertMap, file ++ ": bank layer {d}: experts not ascending ids below {d} at {d}", .{ i, ne, j });
             if (streamed) {
-                const r = i / banks_per_layer;
-                const sd: u1 = @intCast(i % banks_per_layer);
-                if (sd == 1 and lj.k <= m.layers[i - 1].k) return refuse(diag, error.LayerGeometry, file ++ ": layer {d}'s bank layers at K {d} then {d} (K ascending)", .{ lj.layer, m.layers[i - 1].k, lj.k });
+                const sl = banks_per_layer * rl + taken;
+                if (taken == 1 and lj.k <= self.layers[sl - 1].k) return refuse(diag, error.LayerGeometry, file ++ ": layer {d}'s bank layers at K {d} then {d} (K ascending)", .{ lj.layer, self.layers[sl - 1].k, lj.k });
                 for (lj.experts, 0..) |e, j| {
-                    if (sd == 1 and self.local[(i - 1) * ne + e] != no_local) return refuse(diag, error.ExpertMap, file ++ ": layer {d}: expert {d} in both bank layers", .{ lj.layer, e });
-                    self.local[i * ne + e] = @intCast(j);
-                    self.side[r * ne + e] = sd;
+                    if (taken == 1 and self.local[(sl - 1) * ne + e] != no_local) return refuse(diag, error.ExpertMap, file ++ ": layer {d}: expert {d} in both bank layers", .{ lj.layer, e });
+                    self.local[sl * ne + e] = @intCast(j);
+                    self.side[rl * ne + e] = @intCast(taken);
                 }
-                if (sd == 1) for (0..ne) |e| if (self.local[(i - 1) * ne + e] == no_local and self.local[i * ne + e] == no_local)
-                    return refuse(diag, error.ExpertMap, file ++ ": layer {d}: expert {d} in neither bank layer", .{ lj.layer, e });
-                self.layers[i] = .{ .model_layer = @intCast(lj.layer), .k = @intCast(lj.k), .record_bytes = lj.record_bytes, .logical_bytes = lj.logical_bytes, .base_offset = lj.base_offset, .minis = self.tp, .n_held = @intCast(lj.experts.len), .segments = want.segs };
+                self.layers[sl] = .{ .model_layer = @intCast(lj.layer), .k = @intCast(lj.k), .record_bytes = lj.record_bytes, .logical_bytes = lj.logical_bytes, .base_offset = lj.base_offset, .minis = self.tp, .n_held = @intCast(lj.experts.len), .segments = want.segs };
+                taken += 1;
+                if (taken == banks_per_layer) {
+                    try self.closeLayer(file, rl, taken, diag);
+                    rl += 1;
+                    taken = 0;
+                }
             }
             base += lj.n_minis * lj.record_bytes;
             n_minis += lj.n_minis;
         }
+        if (rl < routed.len and taken > 0) {
+            try self.closeLayer(file, rl, taken, diag);
+            rl += 1;
+        }
+        if (rl < routed.len) return refuse(diag, error.LayerGeometry, file ++ ": {d} bank layers, the {d} routed layers need one per K each", .{ m.layers.len, routed.len });
         self.slots = try gpa.alloc(LayerSlots, n_stream);
         for (self.slots, self.layers[0..n_stream]) |*sl, l| {
             sl.* = .{ .record_bytes = @as(u64, l.minis) * l.logical_bytes, .n_records = l.n_held, .share = @as(f64, @floatFromInt(l.n_held)) / @as(f64, @floatFromInt(ne / banks_per_layer)) };
@@ -446,11 +481,13 @@ const testing = std.testing;
 /// A synthetic EXL3 bank for `c`: per routed layer a K3 bank layer of its even experts and a K4 one of its odd
 /// experts, then the MTP layer's two, `tp` minis per expert of seeded bytes (with `signs`: the suh / svh segments
 /// +/-1 in f16), the records, the experts map and the sidecar. With `mtp_only`, the pack's `mtp/` alone: the MTP
-/// layer's two bank layers, its experts map, manifest and sidecar, in `mtp_dir`. Each other field perturbs one rule.
+/// layer's two bank layers, its experts map, manifest and sidecar, in `mtp_dir`. With `one_k`, a uniform pack (the
+/// converter's for `k_values` [3]): per layer one K3 bank layer of all its experts. Each other field perturbs one rule.
 pub const Synth = struct {
     tp: u32 = 4,
     signs: bool = false,
     mtp_only: bool = false,
+    one_k: bool = false,
     format: []const u8 = format,
     multiplier: u64 = 0,
     hidden_delta: u64 = 0,
@@ -482,7 +519,9 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
     const mtp_layer = [1]u32{c.n_layers};
     // The layers the experts map lists: the routed layers', or the MTP layer's in its directory.
     const mapped: []const u32 = if (s.mtp_only) &mtp_layer else routed;
-    const n_bank = (routed.len + 1) * banks_per_layer;
+    // Bank layers per layer: one with `one_k`.
+    const per: usize = if (s.one_k) 1 else banks_per_layer;
+    const n_bank = (routed.len + 1) * per;
     const bin = if (s.mtp_only) mtp_sidecar_file else "experts.bin";
     var j: std.ArrayList(u8) = .empty;
     defer j.deinit(a);
@@ -492,23 +531,23 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
     errdefer image.deinit(a);
     var rng = std.Random.DefaultPrng.init(53);
     const mult = if (s.multiplier != 0) s.multiplier else sushi.format.MCG_MULT;
-    try j.print(a, "{{\"format\":\"{s}\",\"model_type\":\"glm_moe_dsa\",\"source\":{{\"repo\":\"synthetic\",\"revision\":null}},\"quantization\":{{\"mode\":\"exl3\",\"codebook\":\"mcg\",\"codebook_multiplier\":{d},\"mcg_scalar\":0,\"k_values\":[3,4],\"tp_ranks\":{d}}},", .{ s.format, mult, s.tp });
+    try j.print(a, "{{\"format\":\"{s}\",\"model_type\":\"glm_moe_dsa\",\"source\":{{\"repo\":\"synthetic\",\"revision\":null}},\"quantization\":{{\"mode\":\"exl3\",\"codebook\":\"mcg\",\"codebook_multiplier\":{d},\"mcg_scalar\":0,\"k_values\":{s},\"tp_ranks\":{d}}},", .{ s.format, mult, if (s.one_k) "[3]" else "[3,4]", s.tp });
     try j.print(a, "\"dims\":{{\"hidden\":{d},\"inter\":{d},\"mini_inter\":{d},\"n_experts\":{d},\"n_model_layers\":{d},\"n_bank_layers\":{d}}},\"components\":[", .{ h + s.hidden_delta, c.moe_intermediate_size, mini, ne, routed.len + 1, n_bank });
     for (Component.names, 0..) |n, i| try j.print(a, "{s}\"{s}\"", .{ if (i == 0) "" else ",", n });
     try j.appendSlice(a, "],\"layers\":[");
     var base: u64 = 0;
     var first_rec = true;
     for (0..n_bank) |bl| {
-        const r = bl / banks_per_layer;
+        const r = bl / per;
         const ml: u64 = if (r < routed.len) routed[r] else c.n_layers;
-        var sd = bl % banks_per_layer;
+        var sd = bl % per;
         if (s.k_swap and bl == 2) sd = 1;
         if (s.k_swap and bl == 3) sd = 0;
         const k: u64 = if (sd == 0) 3 else 4;
-        const held = (bl % banks_per_layer) == 0;
+        const held = (bl % per) == 0;
         var members: std.ArrayList(u64) = .empty;
         defer members.deinit(a);
-        for (0..ne) |e| if ((e % 2 == 0) == held or (s.expert_both and bl == 1 and e == 0)) try members.append(a, e);
+        for (0..ne) |e| if (s.one_k or (e % 2 == 0) == held or (s.expert_both and bl == 1 and e == 0)) try members.append(a, e);
         const ms = miniSegments(h, mini, k);
         const rb = std.mem.alignForward(u64, ms.logical, record_alignment);
         const n_minis = s.tp * members.items.len;
@@ -543,7 +582,10 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
     try j.appendSlice(a, "],\"experts\":{");
     for (mapped, 0..) |ml, r| {
         try j.print(a, "{s}\"{d}\":[", .{ if (r == 0) "" else ",", ml });
-        for (0..ne) |e| try j.print(a, "{s}[{d},{d}]", .{ if (e == 0) "" else ",", if (e % 2 == 0) @as(u64, 3) else 4, e / 2 + (if (r == 1 and e == 5) s.map_delta else 0) });
+        for (0..ne) |e| {
+            const kl: [2]u64 = if (s.one_k) .{ 3, e } else .{ if (e % 2 == 0) 3 else 4, e / 2 };
+            try j.print(a, "{s}[{d},{d}]", .{ if (e == 0) "" else ",", kl[0], kl[1] + (if (r == 1 and e == 5) s.map_delta else 0) });
+        }
         try j.appendSlice(a, "]");
     }
     try j.print(a, "}},\"sidecar\":{{\"file\":\"{s}\",\"alignment\":4096,\"size\":{d}}},\"records\":[{s}],\"parity\":{{\"all_pass\":{},\"checked\":0,\"total\":0,\"method\":\"bytes-equal-source\"}}}}", .{ s.sidecar_file orelse bin, base + s.sidecar_size_delta, recs.items, s.all_pass });
@@ -647,6 +689,84 @@ test "glm exl3 bank: a clean synthetic bank opens: the stream layers, each exper
     try testing.expectEqualSlices(u32, &.{ 115, 84 }, bill_units.rowsAt(g53, 100, &r2));
     try testing.expectEqualSlices(u32, &.{ 148, 108 }, bill_units.rowsAt(g53, 128, &r2));
     try testing.expectEqualSlices(u32, &.{ 18, 13 }, bill_units.rowsAt(g53, 16, &r2));
+}
+
+test "glm exl3 bank: a uniform pack (one K3 bank layer per layer, the converter's for k_values [3]) opens with two stream layers per routed layer, the second empty: no experts, no rows, the first's geometry" {
+    const a = testing.allocator;
+    var c = try affine.tinyConfig(a);
+    defer c.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try writeSynth(a, testing.io, tmp.dir, &c, .{ .one_k = true });
+    defer a.free(img);
+    var rbuf: [512]u8 = undefined;
+    var diag: Diag = .{};
+    var b = Bank.open(a, testing.io, try tmpRoot(&tmp, &rbuf), &c, &diag) catch |e| {
+        std.debug.print("refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer b.deinit();
+    const ms3 = miniSegments(128, 16, 3);
+    const rb3 = std.mem.alignForward(u64, ms3.logical, 4096);
+    // 4 routed layers of 16 K3 experts, 4 minis each; then the MTP layer's one bank layer.
+    try testing.expectEqual(@as(usize, 8), b.layers.len);
+    try testing.expectEqual(@as(u64, 5 * 16 * 4 * rb3), img.len);
+    try testing.expectEqual(@as(u64, img.len), b.sidecar.size);
+    for (0..4) |r| {
+        const k3 = b.layers[2 * r];
+        const empty = b.layers[2 * r + 1];
+        try testing.expectEqual(@as(u32, 3), k3.k);
+        try testing.expectEqual(@as(u32, 16), k3.n_held);
+        try testing.expectEqual(@as(u32, 0), empty.n_held);
+        try testing.expectEqual(k3.k, empty.k);
+        try testing.expectEqual(k3.segments, empty.segments);
+        try testing.expectEqual(k3.base_offset + 16 * 4 * rb3, empty.base_offset);
+        for (0..16) |e| try testing.expectEqual(@as(u32, @intCast(2 * r)), b.streamLayer(@intCast(r), @intCast(e)));
+    }
+    // Expert 7 of routed layer 1: local 7, after layer 0's 16 experts.
+    try testing.expectEqual(16 * 4 * rb3 + 7 * 4 * rb3, b.recordOffset(2, 7));
+    const g = b.geometryOf();
+    var a3: [n_components]u64 = undefined;
+    for (&a3, ms3.segs) |*x, sg| x.* = 4 * sg.length;
+    try testing.expectEqual(glm.LayerSlots{ .record_bytes = 4 * ms3.logical, .n_records = 16, .share = 2, .array_bytes = a3 }, g.layers[0]);
+    try testing.expectEqual(glm.LayerSlots{ .record_bytes = 4 * ms3.logical, .n_records = 0, .share = 0, .array_bytes = a3 }, g.layers[1]);
+    // One geometry: one slot of it the widest record, one transient scratch.
+    try testing.expectEqual(4 * ms3.logical, g.widest_record);
+    try testing.expectEqual([2][n_components]u64{ a3, @splat(0) }, g.scratch);
+    // The bill's fill: units of 1/8 of the layer's 16 experts, two rows a unit; the empty layers take none.
+    try testing.expectEqual(@as(u32, 8), bill_units.maxUnits(g));
+    var rows: [8]u32 = undefined;
+    for (bill_units.rowsAt(g, 5, &rows), 0..) |x, i| try testing.expectEqual(@as(u32, if (i % 2 == 0) 10 else 0), x);
+    // GLM-5.3's uniform 3.0 bpw pack: 256 K3 experts a layer, 128 units, 192 rows at 96.
+    const s30 = [2]glm.LayerSlots{ .{ .record_bytes = 4 * 3_578_880, .n_records = 256, .share = 2 }, .{ .record_bytes = 4 * 3_578_880, .n_records = 0, .share = 0 } };
+    const g30: glm.Geometry = .{ .layers = &s30, .widest_record = 4 * 3_578_880, .widest_span = 0 };
+    try testing.expectEqual(@as(u32, 128), bill_units.maxUnits(g30));
+    var r2: [2]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{ 192, 0 }, bill_units.rowsAt(g30, 96, &r2));
+    // The stream: one transient geometry; each routed layer's experts served from its K3 stream layer.
+    @memset(&rows, 0);
+    for (0..4) |r| rows[2 * r] = 2;
+    const s = try Stream.Stream.init(a, &b, .{ .rows = &rows, .max_route_ids = 8, .transient_rows = 16, .wide_depth = 2, .records_per_part = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 } });
+    defer s.deinit();
+    try testing.expect(s.alt == null);
+    var rng = std.Random.DefaultPrng.init(7);
+    var ids: [8]u16 = undefined;
+    for (0..24) |step| {
+        const l: u32 = @intCast(2 * (step % 4));
+        const n = 1 + rng.random().uintLessThan(usize, 6);
+        var k: usize = 0;
+        while (k < n) {
+            const e = rng.random().uintLessThan(u16, 16);
+            if (std.mem.indexOfScalar(u16, ids[0..k], e) == null) {
+                ids[k] = e;
+                k += 1;
+            }
+        }
+        const r = try s.serve(l, ids[0..n]);
+        try s.expectServed(r, ids[0..n], img);
+        s.release(r);
+    }
+    try s.flush();
 }
 
 test "glm exl3 bank: every rule of the pack's contract refuses by name" {

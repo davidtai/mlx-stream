@@ -1194,6 +1194,16 @@ fn randomResidents(a: Allocator, io: std.Io, dir: std.Io.Dir, model: *const @imp
 }
 
 test "glm53 exl3 quant: on a synthetic EXL3 pack with random residents the GLM-5.3 kernels' module equals sushi's EXL3 module end to end: the prompt's logits and four decode steps'" {
+    try sushiEndToEnd(false);
+}
+
+test "glm53 exl3 quant: on a uniform synthetic EXL3 pack (one K3 bank layer per layer, each routed layer's second stream layer empty) the module equals sushi's end to end" {
+    try sushiEndToEnd(true);
+}
+
+/// The module against sushi's EXL3 module on a synthetic pack (`one_k`: a uniform one) with random residents: the
+/// prompt's logits and four decode steps', and the host waits per step.
+fn sushiEndToEnd(one_k: bool) !void {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
@@ -1204,7 +1214,7 @@ test "glm53 exl3 quant: on a synthetic EXL3 pack with random residents the GLM-5
     var model = try bank_mod.tinyConfigInter(a, 512);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const img = try bank_mod.writeSynth(a, io, tmp.dir, &model, .{ .signs = true });
+    const img = try bank_mod.writeSynth(a, io, tmp.dir, &model, .{ .signs = true, .one_k = one_k });
     defer a.free(img);
     try glm.writeResidents(a, io, tmp.dir, &model);
     try randomResidents(a, io, tmp.dir, &model, 0x5ee);
@@ -1237,7 +1247,7 @@ test "glm53 exl3 quant: on a synthetic EXL3 pack with random residents the GLM-5
         }
         m.requestEnd();
     }
-    std.debug.print("glm53 exl3 quant: host waits on the GPU per step (the prompt pass, then 4 decode steps): sushi's module {any}, ours {any}\n", .{ waits[0], waits[1] });
+    std.debug.print("glm53 exl3 quant ({s} pack): host waits on the GPU per step (the prompt pass, then 4 decode steps): sushi's module {any}, ours {any}\n", .{ if (one_k) "uniform" else "two-K", waits[0], waits[1] });
     // GLM-5.3's kernels add no wait: the same waits as sushi's binding at every step
     try testing.expectEqualSlices(u64, &waits[0], &waits[1]);
     var worst: f32 = 0;
@@ -1250,7 +1260,7 @@ test "glm53 exl3 quant: on a synthetic EXL3 pack with random residents the GLM-5
         }
         same += @intFromBool(std.mem.indexOfMax(f32, &ro) == std.mem.indexOfMax(f32, &rt));
     }
-    std.debug.print("glm53 exl3 quant: the module against sushi's EXL3 module, the prompt and 4 steps: logits max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp), argmax equal at {d} of 5\n", .{ worst, scale, worst / selfcheck.bf16Ulp(scale), same });
+    std.debug.print("glm53 exl3 quant ({s} pack): the module against sushi's EXL3 module, the prompt and 4 steps: logits max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp), argmax equal at {d} of 5\n", .{ if (one_k) "uniform" else "two-K", worst, scale, worst / selfcheck.bf16Ulp(scale), same });
     try testing.expect(scale > 0.01);
     try testing.expect(worst <= 4 * selfcheck.bf16Ulp(scale));
 }

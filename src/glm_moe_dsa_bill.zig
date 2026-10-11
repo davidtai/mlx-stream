@@ -384,6 +384,8 @@ pub fn maxUnits(g: glm.Geometry) u32 {
     if (g.layers.len == 0) return 0;
     var n: u32 = 0;
     for (g.layers) |l| {
+        // An empty stream layer (a uniform EXL3 pack's second bank layer) takes no slot at any units.
+        if (l.n_records == 0) continue;
         const experts: f64 = @floatFromInt(l.n_records / @max(l.rows_per_unit, 1));
         n = @max(n, @as(u32, @intFromFloat(@ceil(experts / l.share))));
     }

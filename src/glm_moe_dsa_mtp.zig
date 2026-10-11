@@ -245,6 +245,8 @@ pub const Exl3 = struct {
         var slot_base: [2]u32 = .{ 0, 0 };
         var next: u32 = 0;
         for (m.layers, 0..) |l, b| {
+            // An empty bank layer (a uniform pack's second) holds no expert: no arrays, no group of the MoE.
+            if (l.n_held == 0) continue;
             const n_minis = l.minis * l.n_held;
             slot_base[b] = next;
             next += n_minis;
@@ -267,12 +269,12 @@ pub const Exl3 = struct {
                 arrs[ci] = arr;
             }
             // code = trellis, rout = svh (the output side), rin = suh (the input side).
-            self.banks[b] = .{
+            self.banks[self.n_banks] = .{
                 .gate = .{ .trellis = arrs[0], .svh = arrs[1], .suh = arrs[2] },
                 .up = .{ .trellis = arrs[3], .svh = arrs[4], .suh = arrs[5] },
                 .down = .{ .trellis = arrs[6], .svh = arrs[7], .suh = arrs[8] },
             };
-            self.n_banks = b + 1;
+            self.n_banks += 1;
         }
         const base = try gpa.alloc(i32, m.n_experts);
         defer gpa.free(base);
@@ -951,7 +953,16 @@ test "glm mtp: the pack's mtp/ opens under the trunk bank's rules: the MTP layer
     defer sub.close(testing.io);
     try sub.writeFile(testing.io, .{ .sub_path = exl3.mtp_manifest_file, .data = try tmp.dir.readFileAlloc(testing.io, exl3.manifest_file, arena.allocator(), .limited(1 << 20)) });
     try testing.expectError(error.LayerGeometry, exl3.Bank.openMtp(a, testing.io, mdir, &c, &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.message(), "the MTP layer has 2") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "bank layer entry 0") != null);
+    // A uniform pack's MTP directory: one K3 bank layer of all 16 experts, the second stream layer empty.
+    a.free(try exl3.writeSynth(a, testing.io, tmp.dir, &c, .{ .mtp_only = true, .one_k = true }));
+    var m1 = try exl3.Bank.openMtp(a, testing.io, mdir, &c, &diag);
+    defer m1.deinit();
+    try testing.expectEqual(@as(usize, 2), m1.layers.len);
+    try testing.expectEqual(@as(u32, 64), m1.layers[0].minis * m1.layers[0].n_held);
+    try testing.expectEqual(@as(u32, 0), m1.layers[1].n_held);
+    try testing.expectEqual(@as(u32, 0), m1.streamLayer(0, 7));
+    try testing.expectEqual(@as(u16, 7), m1.local[7]);
     // Two ranks: the same experts in minis of twice the width.
     a.free(try exl3.writeSynth(a, testing.io, tmp.dir, &c, .{ .mtp_only = true, .tp = 2 }));
     var m2 = try exl3.Bank.openMtp(a, testing.io, mdir, &c, &diag);
