@@ -359,7 +359,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const tr = pt.now();
             const r = w.groute.items[gi].?;
             var cand: Seeds = .{};
-            seedsOf(&self.stream.layers[sl].policy, w.order.items[w.bounds.items[gi]..w.bounds.items[gi + 1]], r.plan.slotsOf(), &cand);
+            if (false) seedsOf(&self.stream.layers[sl].policy, w.order.items[w.bounds.items[gi]..w.bounds.items[gi + 1]], r.plan.slotsOf(), &cand);
             self.stream.release(r);
             w.groute.items[gi] = null;
             live.* -= 1;
