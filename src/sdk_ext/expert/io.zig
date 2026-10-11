@@ -53,6 +53,7 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_test_rules(n: i32, off: [*]const i64, code: [*]const i64, arg: [*]const i64) void;
     pub extern fn q3ld_test_delay(seed: u64, max_ns: i64) void;
     pub extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
+    pub extern fn q3ld_test_busy_log(buf: ?[*]i64, cap: i64) i64;
 } else @import("io_stub.zig").q3ld;
 
 /// Test builds only: the reader's C ABI and its status-word stride, for its own tests (its state words and scripted
