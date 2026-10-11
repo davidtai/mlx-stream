@@ -390,7 +390,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
         /// The MLX cache limit the module installs for `phase` (the bill's own term: one value for both).
         fn cacheLimit(self: *const Self, phase: bill_mod.Phase) usize {
-            return @intCast(self.billed.phases[@intFromEnum(phase)].mlx_cache);
+            // The prompt's: the bill's input (`prefillCacheBytes`), its cache term at most that (under the size classes
+            // the cache sits below it at the pass's high-water); decode's: its term.
+            return @intCast(if (phase == .prompt) self.inputs.prompt_cache else self.billed.phases[@intFromEnum(phase)].mlx_cache);
         }
 
         /// The settle's bound on the host side after a phase change's frees: the prompt phase's host terms (the read
@@ -1350,12 +1352,14 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     const sv = try Served.init(a, testing.io, &cfg, &weights, s, .{ .ceiling = 64 << 30, .wired_margin = 0 });
     defer sv.deinit();
     const m = sv.exl3;
-    // The prompt pass's cache limit the module set is the bill's prompt cache term: this box's sixteenth of its RAM.
+    // The prompt pass's cache limit the module set is the bill's own value, this box's sixteenth of its RAM; at this
+    // load's 64-token context the bill's cache term is that limit (the size classes' measured high-water holds for
+    // 16,384-row calls).
     var limit: usize = 0;
     _ = mlx.mlx_set_cache_limit(&limit, m.cacheLimit(.prompt));
-    try testing.expectEqual(m.billed.phases[@intFromEnum(bill_mod.Phase.prompt)].mlx_cache, @as(u64, limit));
+    try testing.expectEqual(m.inputs.prompt_cache, @as(u64, limit));
     try testing.expectEqual(bill_mod.prefillCacheBytes(sdk.memory.totalMemBytes()), m.inputs.prompt_cache);
-    try testing.expectEqual(m.inputs.prompt_cache, bill_mod.billOf(m.inputs).phases[@intFromEnum(bill_mod.Phase.prompt)].mlx_cache);
+    try testing.expectEqual(m.inputs.prompt_cache, m.billed.phases[@intFromEnum(bill_mod.Phase.prompt)].mlx_cache);
     // The setting's lookahead budget is the stream's.
     try testing.expectEqual(@as(u32, 3), m.stream.selector.?.budget);
     try testing.expectEqual(@as(usize, 8), m.decode_rows.len);
