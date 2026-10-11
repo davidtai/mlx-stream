@@ -8,8 +8,9 @@
 //!     A device wave (`decodeWaveDevice`) takes the routed positions' slots as a device array: a position of slot
 //!     0xFFFFFFFF or score 0 reads no weight and gives zero, and `decodeCombineDevice` sums every position.
 //!   - Prompt (`prefill`): the call's rows sorted by slot on the host, waves of at most 16 experts and `wave_rows` rows,
-//!     each through the inputs, the 128-row gate and up GEMMs (the trellis decoded per stage), the middle and the down
-//!     GEMM (the minis summed in its epilogue), then the waves joined in the call's row order; nothing waits for the GPU.
+//!     each through the 128-row gate and up GEMMs over the rows' x (the trellis decoded per stage, rotated along k and
+//!     scaled by rin), the middle and the down GEMM (the minis summed in its epilogue), then the waves joined in the
+//!     call's row order; nothing waits for the GPU.
 //! Its kernels are self-checked at accept on the load context's kernel set (compile, one launch each at the accepted
 //! dims, both Ks).
 
@@ -33,7 +34,7 @@ pub const kernel_pin: sdk_ext.kernels.Pin = .{ .manifest_sha256 = xk.manifest_sh
 pub const kernels = std.enums.values(xk.Kernel);
 pub const Arrays = bank_mod.Proj;
 
-/// Rows per prompt wave (its inputs per mini are rows x 4 x 2 x hidden f16).
+/// Rows per prompt wave.
 pub const wave_rows: u32 = 4096;
 
 /// The bank's `quantization`: exl3, the mcg codebook at the texts' multiplier, four minis per expert.
@@ -290,12 +291,13 @@ pub fn Accepted(comptime G: type) type {
         }
 
         /// Tests: the call's first wave's stages, each evaluated alone, best of `reps` -> ns per stage and that wave's rows.
-        fn stageTimes(self: *Self, g: *G, x: G.T, rows: quant.PrefillRows, bank: Bank, reps: usize) !struct { ns: [4]u64, rows: usize, experts: usize } {
+        fn stageTimes(self: *Self, g: *G, x: G.T, rows: quant.PrefillRows, bank: Bank, reps: usize, with: ?*const routes.Prompt) !struct { ns: [3]u64, rows: usize, experts: usize } {
             const k = kOf(bank.gate.trellis) orelse return error.BankArrays;
+            const pf = with orelse &self.pf[ki(k)];
             try self.sortRows(rows, bank);
             const w = self.nextWave(rows, 0);
             const bk: routes.Bank = .{ .gate = proj(bank.gate), .up = proj(bank.up), .down = proj(bank.down) };
-            var best: [4]u64 = @splat(std.math.maxInt(u64));
+            var best: [3]u64 = @splat(std.math.maxInt(u64));
             for (0..reps + 1) |rep| {
                 const m = g.mark();
                 defer g.resetTo(m);
@@ -305,7 +307,7 @@ pub fn Accepted(comptime G: type) type {
                 defer st.deinit();
                 for (std.enums.values(routes.Prompt.Stage), 0..) |at, si| {
                     const t0 = nowNs();
-                    try self.pf[ki(k)].stage(at, &st, x, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk);
+                    try pf.stage(at, &st, x, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk);
                     try g.evalAll(&.{st.last(at)});
                     if (rep > 0) best[si] = @min(best[si], nowNs() - t0);
                 }
@@ -715,6 +717,173 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
+/// The sushi binding's prefill GEMM calls and drains, where it counts them.
+fn theirStats(theirs: anytype) [2]u64 {
+    const T = @typeInfo(@TypeOf(theirs)).pointer.child;
+    return if (comptime @hasDecl(T, "prefillStats")) theirs.prefillStats() else .{ 0, 0 };
+}
+
+/// GLM53_EXL3_CEIL (with GLM53_EXL3_BENCH): the GEMM ceiling at GLM-5.3's routed shapes, 32 experts of 512 rows each
+/// (16,384 rows, a layer's 131,072 rows / 8): MLX's affine gather_qmm chain at the affine pack's quantization (4 bits,
+/// group 64; gate, up, silu x up, down, sorted rows), a plain f16 batched matmul chain at the same rows per expert, and
+/// these kernels' prompt over 32 resident experts of each bank layer; best of 5, ms per 16,384 rows and TFLOP/s.
+fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of: []const u32, b: *const bank_mod.Bank, h: usize) !void {
+    const sdk = @import("sdk");
+    const E = 32;
+    const per = 512;
+    const n = E * per;
+    const inter = 2048;
+    const hc: c_int = @intCast(h);
+    var prng = std.Random.DefaultPrng.init(0xce1);
+    const r = prng.random();
+    // a block of random words repeated (the values do not matter to the timing; the arrays are distinct memory)
+    const blk = try a.alloc(u32, 1 << 20);
+    defer a.free(blk);
+    const fill = struct {
+        fn words(al: Allocator, src: []const u32, n_words: usize) ![]u32 {
+            const out = try al.alloc(u32, n_words);
+            var i: usize = 0;
+            while (i < n_words) : (i += src.len) {
+                const m = @min(src.len, n_words - i);
+                @memcpy(out[i..][0..m], src[0..m]);
+            }
+            return out;
+        }
+    };
+    const m0 = g.mark();
+    defer g.resetTo(m0);
+    // x [n, h] bf16 (both halves of each word small floats)
+    for (blk) |*w| {
+        const lo: u16 = @truncate(@as(u32, @bitCast((r.float(f32) * 2 - 1) * 0.5)) >> 16);
+        const hi: u16 = @truncate(@as(u32, @bitCast((r.float(f32) * 2 - 1) * 0.5)) >> 16);
+        w.* = @as(u32, lo) | (@as(u32, hi) << 16);
+    }
+    const xw = try fill.words(a, blk, n * h / 2);
+    defer a.free(xw);
+    const x = try g.hostArray(std.mem.sliceAsBytes(xw), &.{ n, hc }, .bfloat16);
+    var rhs: [n]u32 = undefined;
+    for (&rhs, 0..) |*v, i| v.* = @intCast(i / per);
+    const rhsd = try g.hostArray(std.mem.sliceAsBytes(&rhs), &.{n}, .uint32);
+    // affine: w u32 random codes, scales 0.01, biases -0.08 (bf16)
+    for (blk) |*w| w.* = r.int(u32);
+    const Aff = struct { w: @TypeOf(x), s: @TypeOf(x), b: @TypeOf(x) };
+    var aff: [3]Aff = undefined;
+    for (&aff, 0..) |*p, pi| {
+        const out_d: usize = if (pi == 2) h else inter;
+        const in_d: usize = if (pi == 2) inter else h;
+        const ww = try fill.words(a, blk, E * out_d * in_d / 8);
+        defer a.free(ww);
+        const sc = try a.alloc(u16, E * out_d * in_d / 64);
+        defer a.free(sc);
+        @memset(sc, 0x3c24);
+        const bi = try a.alloc(u16, E * out_d * in_d / 64);
+        defer a.free(bi);
+        @memset(bi, 0xbda4);
+        p.* = .{
+            .w = try g.hostArray(std.mem.sliceAsBytes(ww), &.{ E, @intCast(out_d), @intCast(in_d / 8) }, .uint32),
+            .s = try g.hostArray(std.mem.sliceAsBytes(sc), &.{ E, @intCast(out_d), @intCast(in_d / 64) }, .bfloat16),
+            .b = try g.hostArray(std.mem.sliceAsBytes(bi), &.{ E, @intCast(out_d), @intCast(in_d / 64) }, .bfloat16),
+        };
+    }
+    // f16: x [E, per, h], w [E, in, out] (x @ w), values small
+    for (blk) |*w| {
+        const lo: u16 = @bitCast(@as(f16, @floatCast((r.float(f32) * 2 - 1) * 0.05)));
+        const hi: u16 = @bitCast(@as(f16, @floatCast((r.float(f32) * 2 - 1) * 0.05)));
+        w.* = @as(u32, lo) | (@as(u32, hi) << 16);
+    }
+    const x16 = try g.astype(try g.reshape(x, &.{ E, per, hc }), .float16);
+    var w16: [3]@TypeOf(x) = undefined;
+    for (&w16, 0..) |*p, pi| {
+        const out_d: usize = if (pi == 2) h else inter;
+        const in_d: usize = if (pi == 2) inter else h;
+        const ww = try fill.words(a, blk, E * out_d * in_d / 2);
+        defer a.free(ww);
+        p.* = try g.hostArray(std.mem.sliceAsBytes(ww), &.{ E, @intCast(in_d), @intCast(out_d) }, .float16);
+    }
+    try g.evalAll(&.{ x, x16, rhsd, aff[0].w, aff[1].w, aff[2].w, w16[0], w16[1], w16[2] });
+    const flop_gu = 2.0 * 2.0 * @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(h)) * inter;
+    const flop = 1.5 * flop_gu;
+    const Arm = enum { affine_chain, affine_gate, f16_chain, f16_gate, ours_k3, ours_k4 };
+    var best: [6]u64 = @splat(std.math.maxInt(u64));
+    // ours: 32 resident experts of each bank layer, 512 rows each (rows spread over the tokens)
+    var oslot: [2][n]u32 = undefined;
+    var oact: [n]u32 = undefined;
+    for (0..2) |side| {
+        var e_i: usize = 0;
+        var picked: usize = 0;
+        while (picked < E) : (e_i += 1) {
+            if (b.streamLayer(0, @intCast(e_i)) != side) continue;
+            for (0..per) |j| oslot[side][picked * per + j] = slot_of[e_i];
+            picked += 1;
+        }
+    }
+    for (&oact, 0..) |*v, i| v.* = @intCast((i * 7919) % n);
+    for (0..6) |rep| for (std.enums.values(Arm)) |arm| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const t0 = nowNs();
+        const y = switch (arm) {
+            .affine_chain, .affine_gate => blk2: {
+                const x3 = try g.reshape(x, &.{ n, 1, hc });
+                const gg = try g.gatherMatmul(x3, aff[0].w, aff[0].s, aff[0].b, rhsd, 4, 64, sdk.QuantMode.affine, true);
+                if (arm == .affine_gate) break :blk2 gg;
+                const uu = try g.gatherMatmul(x3, aff[1].w, aff[1].s, aff[1].b, rhsd, 4, 64, sdk.QuantMode.affine, true);
+                break :blk2 try g.gatherMatmul(try g.mul(try g.silu(gg), uu), aff[2].w, aff[2].s, aff[2].b, rhsd, 4, 64, sdk.QuantMode.affine, true);
+            },
+            .f16_chain, .f16_gate => blk2: {
+                const gg = try g.matmul(x16, w16[0]);
+                if (arm == .f16_gate) break :blk2 gg;
+                const uu = try g.matmul(x16, w16[1]);
+                break :blk2 try g.matmul(try g.mul(try g.silu(gg), uu), w16[2]);
+            },
+            .ours_k3, .ours_k4 => blk2: {
+                const side: usize = if (arm == .ours_k3) 0 else 1;
+                break :blk2 try ours.prefill(g, @intCast(side), x, .{ .slot = &oslot[side], .act_row = &oact }, banks[side]);
+            },
+        };
+        try g.evalAll(&.{y});
+        if (rep > 0) best[@intFromEnum(arm)] = @min(best[@intFromEnum(arm)], nowNs() - t0);
+    };
+    for (std.enums.values(Arm)) |arm| {
+        const ns = best[@intFromEnum(arm)];
+        const f: f64 = switch (arm) {
+            .affine_gate, .f16_gate => flop_gu / 2.0,
+            else => flop,
+        };
+        std.debug.print("GLM53_UBENCH ceiling {t} (32 experts x 512 rows): {d:.2} ms per 16,384 rows, {d:.1} TFLOP/s, {d:.1} ms per layer (131,072 rows)\n", .{ arm, @as(f64, @floatFromInt(ns)) / 1e6, f / @as(f64, @floatFromInt(ns)) / 1e3, @as(f64, @floatFromInt(ns)) / 1e6 * 8.0 });
+    }
+}
+
+/// The bench's experiments (GLM53_EXL3_BENCH_EXP): one text each, one needle replaced.
+const BenchExp = struct { name: []const u8, kernel: xk.Kernel, needle: []const u8, repl: []const u8 };
+const decode_call =
+    \\        if (hh != 0u) {
+    \\            g53_col<K, 1>::decode_v(t0, o, v);
+    \\            g53_col<K, 1>::decode_v(t0 + N16 * NWT, o, v + 16);
+    \\        } else {
+    \\            g53_col<K, 0>::decode_v(t0, o, v);
+    \\            g53_col<K, 0>::decode_v(t0 + N16 * NWT, o, v + 16);
+    \\        }
+;
+const decode_call_down =
+    \\            if (h != 0u) {
+    \\                g53_col<K, 1>::template decode<half>(tile, o, Bs + dst_off);
+    \\            } else {
+    \\                g53_col<K, 0>::template decode<half>(tile, o, Bs + dst_off);
+    \\            }
+;
+const no_decode = "        { threadgroup half* dd = Bs + dst_off; for (int q = 0; q < 16; ++q) dd[q] = half(0.001f * float(q)); (void)tile; }";
+const no_decode_gu = "        for (int c = 0; c < 32; ++c) v[c] = 0.001f * float(c + int(lane)); (void)t0;";
+const mma_call = "tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});";
+const bench_exps = [_]BenchExp{
+    .{ .name = "gu: no trellis decode (B constant before the rotation)", .kernel = .glm53_pf_gu, .needle = decode_call, .repl = no_decode_gu },
+    .{ .name = "gu: no rotation", .kernel = .glm53_pf_gu, .needle = "        g53_t128_quarters(v, lane);", .repl = "" },
+    .{ .name = "gu: no MMA (decode, rotation, scale alone)", .kernel = .glm53_pf_gu, .needle = mma_call, .repl = "(void)Atile; (void)Btile;" },
+    .{ .name = "down: no trellis decode (B constant)", .kernel = .glm53_pf_down, .needle = decode_call_down, .repl = no_decode },
+    .{ .name = "down: no MMA (the decode alone)", .kernel = .glm53_pf_down, .needle = mma_call, .repl = "(void)Atile; (void)Btile;" },
+    .{ .name = "down: one epilogue (the last mini's)", .kernel = .glm53_pf_down, .needle = "for (int p = 0; p * SM < valid; ++p) {", .repl = "for (int p = 0; r == 3 && p * SM < valid; ++p) {" },
+};
+
 // GLM53_EXL3_BENCH=<pack dir> (the box, lock-held): routed layer 0's 256 experts of the real pack resident (its K3 and
 // K4 bank layers), one routed layer's decode at 1, 4 and 6 rows and its prompt at 16K tokens, these kernels (decode: the
 // host tables, and the device slots) against sushi's (its decode chain and the driver's combine; its prefill over host
@@ -816,6 +985,7 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
         // arms: ours (host tables), sushi, ours (device slots: each side's wave over every position, the other side's
         // skipped)
         var best: [3]u64 = @splat(std.math.maxInt(u64));
+        var best_eval: [3]u64 = @splat(std.math.maxInt(u64));
         var distinct: [2]u32 = @splat(0);
         var dslots: [2][48]u32 = undefined;
         for (0..2) |side| for (ids[0 .. n * 8], 0..) |e, pos| {
@@ -884,11 +1054,18 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
                 };
                 x = try g.astype(try g.mul(y, try g.scalar(0.01, .bfloat16)), .bfloat16);
             }
+            const t1 = nowNs();
             try g.evalAll(&.{x});
             const dt = nowNs() - t0;
             if (rep > 0) best[arm] = @min(best[arm], dt);
+            if (rep > 0) best_eval[arm] = @min(best_eval[arm], nowNs() - t1);
         };
-        std.debug.print("GLM53_UBENCH decode rows {d} ({d} K3 + {d} K4 distinct slots): ours {d:.3} ms, ours device slots {d:.3} ms, sushi {d:.3} ms per layer (sushi / ours {d:.2}x)\n", .{ n, distinct[0], distinct[1], @as(f64, @floatFromInt(best[0])) / 1e6 / steps, @as(f64, @floatFromInt(best[2])) / 1e6 / steps, @as(f64, @floatFromInt(best[1])) / 1e6 / steps, @as(f64, @floatFromInt(best[1])) / @as(f64, @floatFromInt(best[0])) });
+        const ms = struct {
+            fn f(v: u64) f64 {
+                return @as(f64, @floatFromInt(v)) / 1e6 / steps;
+            }
+        }.f;
+        std.debug.print("GLM53_UBENCH decode rows {d} ({d} K3 + {d} K4 distinct slots), per layer (build + eval, eval alone): ours {d:.3} ms ({d:.3}), ours device slots {d:.3} ms ({d:.3}), sushi {d:.3} ms ({d:.3})\n", .{ n, distinct[0], distinct[1], ms(best[0]), ms(best_eval[0]), ms(best[2]), ms(best_eval[2]), ms(best[1]), ms(best_eval[1]) });
     }
     // prompt: 16384 tokens x top-8, each bank layer's rows in routed order in calls of 16384 rows
     const n_tok = 16384;
@@ -918,7 +1095,7 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
         }
     }
     var best: [2]u64 = @splat(std.math.maxInt(u64));
-    const q0 = .{ ours.prefillStats(), theirs.prefillStats() };
+    const q0 = .{ ours.prefillStats(), theirStats(theirs) };
     for (0..5) |rep| for (0..2) |arm| {
         const m = g.mark();
         defer g.resetTo(m);
@@ -940,13 +1117,36 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
         if (rep > 0) best[arm] = @min(best[arm], dt);
     };
     const flop = @as(f64, @floatFromInt(n_tok * 8)) * 4.0 * 3.0 * 2.0 * @as(f64, @floatFromInt(h)) * 512.0;
-    const q1 = .{ ours.prefillStats(), theirs.prefillStats() };
+    const q1 = .{ ours.prefillStats(), theirStats(theirs) };
     for (0..2) |side| {
         const pr: quant.PrefillRows = .{ .slot = side_slot[side].items[0..@min(16384, side_slot[side].items.len)], .act_row = side_act[side].items[0..@min(16384, side_act[side].items.len)] };
-        const sts = try ours.stageTimes(&g, xp, pr, banks[side], 5);
+        const sts = try ours.stageTimes(&g, xp, pr, banks[side], 5, null);
         const f = @as(f64, @floatFromInt(sts.rows)) * 2.0 * @as(f64, @floatFromInt(h)) * 512.0 * 4.0;
-        std.debug.print("GLM53_UBENCH prompt wave K{d} ({d} rows, {d} experts): prep {d:.3} ms, gate|up {d:.3} ms ({d:.1} TFLOP/s), mid {d:.3} ms, down {d:.3} ms ({d:.1} TFLOP/s)\n", .{ b.layers[side].k, sts.rows, sts.experts, @as(f64, @floatFromInt(sts.ns[0])) / 1e6, @as(f64, @floatFromInt(sts.ns[1])) / 1e6, 2 * f / @as(f64, @floatFromInt(sts.ns[1])) / 1e3, @as(f64, @floatFromInt(sts.ns[2])) / 1e6, @as(f64, @floatFromInt(sts.ns[3])) / 1e6, f / @as(f64, @floatFromInt(sts.ns[3])) / 1e3 });
+        std.debug.print("GLM53_UBENCH prompt wave K{d} ({d} rows, {d} experts): gate|up {d:.3} ms ({d:.1} TFLOP/s), mid {d:.3} ms, down {d:.3} ms ({d:.1} TFLOP/s)\n", .{ b.layers[side].k, sts.rows, sts.experts, @as(f64, @floatFromInt(sts.ns[0])) / 1e6, 2 * f / @as(f64, @floatFromInt(sts.ns[0])) / 1e3, @as(f64, @floatFromInt(sts.ns[1])) / 1e6, @as(f64, @floatFromInt(sts.ns[2])) / 1e6, f / @as(f64, @floatFromInt(sts.ns[2])) / 1e3 });
+        // GLM53_EXL3_BENCH_EXP: the stages over mutated texts (where the GEMMs' time goes; the outputs are not checked)
+        if (std.c.getenv("GLM53_EXL3_BENCH_EXP") != null) for (bench_exps) |ex| {
+            const base = xk.embedded.sources[@backingInt(ex.kernel)];
+            if (std.mem.count(u8, base, ex.needle) != 1) return error.NeedleMissing;
+            const tx = try std.mem.replaceOwned(u8, a, base, ex.needle, ex.repl);
+            defer a.free(tx);
+            const z = try a.dupeSentinel(u8, tx, 0);
+            defer a.free(z);
+            var texts: xk.Texts = undefined;
+            const mf = try xk.retexted(a, &xk.embedded, .{ .kernel = ex.kernel }, z, &texts);
+            defer a.free(mf);
+            texts.manifest = mf;
+            var dg: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(mf, &dg, .{});
+            var reg = try xk.Registry.init(a, &texts, &std.fmt.bytesToHex(dg, .lower), null);
+            defer reg.deinit();
+            var bd = try reg.bind(s, null);
+            defer bd.deinit();
+            const pfx = routes.Prompt.init(&bd, .{ .k = b.layers[side].k, .hidden = @intCast(h), .mini = 512 });
+            const ex_t = try ours.stageTimes(&g, xp, pr, banks[side], 5, &pfx);
+            std.debug.print("GLM53_UBENCH prompt wave K{d} experiment {s}: gate|up {d:.3} ms, mid {d:.3} ms, down {d:.3} ms\n", .{ b.layers[side].k, ex.name, @as(f64, @floatFromInt(ex_t.ns[0])) / 1e6, @as(f64, @floatFromInt(ex_t.ns[1])) / 1e6, @as(f64, @floatFromInt(ex_t.ns[2])) / 1e6 });
+        };
     }
+    if (std.c.getenv("GLM53_EXL3_CEIL") != null) try benchCeiling(a, &g, ours, &banks, slot_of, &b, h);
     std.debug.print("GLM53_UBENCH prompt 16384 tokens ({d} K3 + {d} K4 rows): ours {d:.1} ms ({d:.1} TFLOP/s), sushi {d:.1} ms ({d:.1} TFLOP/s) per layer ({d:.2}x); prefill GEMM calls / GPU drains ours {d} / {d}, sushi {d} / {d}\n", .{ side_slot[0].items.len, side_slot[1].items.len, @as(f64, @floatFromInt(best[0])) / 1e6, flop / @as(f64, @floatFromInt(best[0])) / 1e3, @as(f64, @floatFromInt(best[1])) / 1e6, flop / @as(f64, @floatFromInt(best[1])) / 1e3, @as(f64, @floatFromInt(best[1])) / @as(f64, @floatFromInt(best[0])), q1[0][0] - q0[0][0], q1[0][1] - q0[0][1], q1[1][0] - q0[1][0], q1[1][1] - q0[1][1] });
 }
 

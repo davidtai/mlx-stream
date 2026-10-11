@@ -14,7 +14,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
-pub const manifest_sha256 = "5bf2f6da7be4cf29945244f588bfd6597646acc5c628fd5fa59ac0a6dd982925";
+pub const manifest_sha256 = "0fec463cde8ab2f8a9b184c3dbce3e05946c225b7ca26d2bb37a1db8d28121c8";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
 const dir = "kernels/glm53_exl3/";
 
@@ -31,7 +31,6 @@ pub const Kernel = enum {
     glm53_dec_gu,
     glm53_dec_down,
     glm53_dec_combine,
-    glm53_pf_prep,
     glm53_pf_gu,
     glm53_pf_mid,
     glm53_pf_down,
@@ -444,7 +443,7 @@ fn initOrPrint(texts: *const Texts, pin: []const u8) !Registry {
 test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel is registered at GLM-5.3's dims and the fixture's, both Ks" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 8), n_kernels);
+    try testing.expectEqual(@as(usize, 7), n_kernels);
     try testing.expectEqual(@as(u32, 6144), reg.dims[0].hidden);
     try testing.expectEqual(@as(u32, 512), reg.dims[0].mini);
     for (reg.entries, 0..) |e, i| {

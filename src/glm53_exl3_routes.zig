@@ -7,9 +7,9 @@
 //!     each weight decoded once for the slot's member pairs), down (the SwiGLU middle, the down GEMV, each output block
 //!     rotated, scaled by its mini's rout, the minis summed, times the pair's score: f32 per pair); per call, combine
 //!     (each row's pairs in routed order: x's dtype).
-//!   - Prompt, per wave of a call's rows grouped by expert (one bank kind): prep (each row's inputs per mini, f16), the
-//!     gate and up GEMMs (128-row M tiles, the trellis decoded per stage), the middle, the down GEMM (the minis summed in
-//!     its epilogue): bf16 per row in the wave's order.
+//!   - Prompt, per wave of a call's rows grouped by expert (one bank kind): the gate and up GEMMs over the rows' x
+//!     (128-row M tiles, the trellis decoded per stage, rotated along k and scaled by rin: the input prepare in the
+//!     weights), the middle, the down GEMM (the minis summed in its epilogue): bf16 per row in the wave's order.
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -215,11 +215,10 @@ pub const Prompt = struct {
         return st.take();
     }
 
-    pub const Stage = enum { prep, gate_up, mid, down };
+    pub const Stage = enum { gate_up, mid, down };
 
     /// A wave's intermediates between its stages (each stage frees its inputs' arrays once launched).
     pub const Stages = struct {
-        a: [2]mlx.mlx_array = .{ .{}, .{} },
         z: [2]mlx.mlx_array = .{ .{}, .{} },
         hm: [1]mlx.mlx_array = .{.{}},
         y: [1]mlx.mlx_array = .{.{}},
@@ -227,7 +226,6 @@ pub const Prompt = struct {
         /// The array the last stage wrote (the bench evaluates it).
         pub fn last(st: *const Stages, at: Stage) mlx.mlx_array {
             return switch (at) {
-                .prep => st.a[1],
                 .gate_up => st.z[1],
                 .mid => st.hm[0],
                 .down => st.y[0],
@@ -241,7 +239,6 @@ pub const Prompt = struct {
         }
 
         pub fn deinit(st: *Stages) void {
-            free(&st.a);
             free(&st.z);
             free(&st.hm);
             free(&st.y);
@@ -260,16 +257,10 @@ pub const Prompt = struct {
         const mi: u32 = self.inst.mini;
         const rc: c_int = @intCast(rows);
         switch (at) {
-            .prep => {
-                const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(h))};
-                const cfg = cfgOf(reg.get(.glm53_pf_prep), self.inst, .{ 32 * h / 128, @intCast(rows * 4), 2 }, &.{ .{ &sh, .float16 }, .{ &sh, .float16 } });
-                try self.b.apply(.glm53_pf_prep, &.{ x, rt, bank.gate.suh, bank.up.suh }, &cfg, &st.a);
-            },
             .gate_up => {
                 const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(mi))};
                 const cfg = cfgOf(reg.get(.glm53_pf_gu), self.inst, .{ 256 * tgs_gu, 1, 1 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
-                try self.b.apply(.glm53_pf_gu, &.{ st.a[0], st.a[1], tgu, bank.gate.trellis, bank.up.trellis }, &cfg, &st.z);
-                Stages.drop(&st.a);
+                try self.b.apply(.glm53_pf_gu, &.{ x, rt, tgu, bank.gate.trellis, bank.up.trellis, bank.gate.suh, bank.up.suh }, &cfg, &st.z);
             },
             .mid => {
                 const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(mi))};
