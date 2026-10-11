@@ -470,7 +470,7 @@ const EvRig = struct {
     fn register(self: *EvRig, groups: []const []const i64) !void {
         var values: [16]u64 = undefined;
         var counts: [16]i32 = undefined;
-        var tickets: [256]i64 = undefined;
+        var tickets: [io.max_gate_tickets]i64 = undefined;
         var k: usize = 0;
         for (groups, 0..) |g, i| {
             values[i] = self.value + 1 + i;
@@ -1160,7 +1160,7 @@ test "dsv41 io cov: the event class's arming refusals, the gate ring's bounds, a
     try pool.registerGates(&.{1}, &.{1}, &.{60});
     try testing.expectError(error.GateInvalid, pool.registerGates(&.{2}, &.{1}, &.{60}));
     try testing.expectError(error.GateInvalid, pool.registerGates(&.{2}, &.{-1}, &.{}));
-    // 255 satisfied gates queue behind the unsatisfied head: the ring is full at 256 live.
+    // max_gates - 1 satisfied gates queue behind the unsatisfied head: the ring is full at max_gates live.
     var values: [io.max_gates - 1]u64 = undefined;
     for (&values, 0..) |*v, i| v.* = 2 + i;
     const zeros: [io.max_gates - 1]i32 = @splat(0);
@@ -1168,21 +1168,22 @@ test "dsv41 io cov: the event class's arming refusals, the gate ring's bounds, a
     try testing.expectEqual(@as(i32, io.max_gates), q3raw.q3ld_ev_state(&st));
     try testing.expectEqualSlices(i64, &.{ 1, 1, 0 }, st[2..5]);
     try testing.expectEqual(@as(i64, 0), word);
-    try testing.expectError(error.GatesFull, pool.registerGates(&.{257}, &.{0}, &.{}));
+    try testing.expectError(error.GatesFull, pool.registerGates(&.{io.max_gates + 1}, &.{0}, &.{}));
     // Live gates refuse a disarm.
     try testing.expectEqual(@as(c_int, -1), c.q3ld_ev_config(0, 0, 0, 0));
     // The host release forces the head (the only gate still waiting): the prefix runs to the last gate.
-    try testing.expectEqual(@as(i32, 1), c.q3ld_ev_release(256));
-    try testing.expectEqual(@as(i64, 256), word);
+    try testing.expectEqual(@as(i32, 1), c.q3ld_ev_release(io.max_gates));
+    try testing.expectEqual(@as(i64, io.max_gates), word);
     try testing.expectEqual(@as(i32, 0), q3raw.q3ld_ev_state(&st));
     try testing.expectEqual(@as(i64, 1), pool.counter(.ev_host_released));
     try testing.expectEqual(@as(i64, io.max_gates - 1), pool.counter(.ev_immediate));
     // With no live gate, a released value goes to the event too, and later gates must rise above it.
-    try testing.expectEqual(@as(i32, 0), c.q3ld_ev_release(300));
-    try testing.expectEqual(@as(i64, 300), word);
-    try testing.expectError(error.GateInvalid, pool.registerGates(&.{300}, &.{0}, &.{}));
-    try pool.registerGates(&.{301}, &.{0}, &.{});
-    try testing.expectEqual(@as(i64, 301), word);
+    const past = io.max_gates + 44;
+    try testing.expectEqual(@as(i32, 0), c.q3ld_ev_release(past));
+    try testing.expectEqual(@as(i64, past), word);
+    try testing.expectError(error.GateInvalid, pool.registerGates(&.{past}, &.{0}, &.{}));
+    try pool.registerGates(&.{past + 1}, &.{0}, &.{});
+    try testing.expectEqual(@as(i64, past + 1), word);
 }
 
 test "dsv41 io cov: a gate forced before its ticket lands ignores the late publish; the next gate's ticket still satisfies it" {
