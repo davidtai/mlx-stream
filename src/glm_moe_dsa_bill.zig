@@ -187,6 +187,25 @@ pub fn sizeClassBytes(bytes: u64) u64 {
 /// on macOS only (the build whose MLX has it). The module's own bill and the plugin's view of it (`inputsOf`) both read it.
 pub const prompt_size_classes = @import("builtin").os.tag == .macos;
 
+/// With the size classes on, the prompt pass's transient high-water under the 16 GiB limit: MLX's cache and the layer's
+/// arrays past the layer's persistent bytes and the host side. A layer's fixed-shape arrays find their classes among the
+/// buffers the layer before it freed, so the cache stays under its limit and the arrays add almost nothing past it.
+/// The wave probe's per-stage footprint high-water read 14.656 GB (coding, layer 75) and 15.259 GB (prose, layer 68) at
+/// 16,387- and 16,390-row calls (screens v2-cls-coding-probe and v2-cls-prose-probe: fold 9587275 on stack 58fb442).
+/// The prompt cache's limit under the classes is sized from it (`sizeClassCacheBytes`), for calls of
+/// `size_class_transient_rows` rows or more where the RAM gives the 16 GiB limit (`prefill_cache_max_bytes`).
+pub const size_class_transient_bytes: u64 = 15_259_000_000;
+pub const size_class_transient_rows: u64 = 16384;
+
+/// The prompt pass's MLX cache limit with the size classes on, which the module installs and the bill charges (one
+/// value: `PhaseTerms.mlx_cache`): what the measured high-water (`size_class_transient_bytes`), with every array the
+/// routing sizes at its class bound as its margin (`w.routed`, `w.gemm`), leaves beside the wave past the cross-layer
+/// arrays and the cache's one buffer past its limit; at most `limit`. The bill stays an upper bound by construction at
+/// any reuse: the cache holds at most its limit and one buffer, the layer's arrays at most the wave.
+pub fn sizeClassCacheBytes(limit: u64, w: PromptWave, waves: u64, overshoot: u64) u64 {
+    return @min(limit, (size_class_transient_bytes + w.routed + w.gemm) -| (waves -| w.cross) -| overshoot);
+}
+
 /// The prompt layer's arrays as the allocator sizes them: each at its own bytes, or with the size classes on at its class
 /// (`sizeClassBytes`); an array the routing sizes (a routed slice's output, a GEMM wave's arrays) at its class bound,
 /// 9/8 of its bytes.
@@ -225,7 +244,8 @@ pub const Inputs = struct {
     /// The allocator's size classes on for the prompt's forward layers (`sizeClassBytes`): its transient arrays at their
     /// classes.
     size_classes: bool = false,
-    /// The prompt pass's MLX cache limit (`prefillCacheBytes`): the module installs it, the bill charges it.
+    /// The prompt pass's MLX cache limit without the size classes (`prefillCacheBytes`). The limit the module installs and
+    /// the bill charges is the prompt phase's cache term: this, or with the classes on `sizeClassCacheBytes` of it.
     prompt_cache: u64,
 };
 
@@ -292,6 +312,11 @@ pub const Bill = struct {
     pub fn terms(b: Bill, phase: Phase, units: u32, prompt: u32) PhaseTerms {
         const slots = if (phase == .decode) decodeSlotBytes(b.geometry, prompt, units) else slotBytes(b.geometry, units);
         return b.phases[@intFromEnum(phase)].at(slots, phase != .construction);
+    }
+
+    /// The MLX cache limit the module installs for `phase`: the phase's cache term (one value for both).
+    pub fn cacheLimit(b: Bill, phase: Phase) u64 {
+        return b.phases[@intFromEnum(phase)].mlx_cache;
     }
 };
 
@@ -651,6 +676,14 @@ pub fn billOf(in: Inputs) Bill {
     const prompt_cache = in.prompt_cache + promptOvershoot(c, g, in.prompt_tokens, in.gemm, in.size_classes);
     const decode_cache = decode_cache_bytes + decodeCacheOvershoot(c, in.decode_positions, verify_rows);
     const prompt_waves = @max(promptWaveBytes(c, g, in.prompt_tokens, in.dsa, in.select, in.gemm, in.size_classes, prompt_cache, decode_cache), if (in.mtp != null) mtpPromptWaveBytes(c, in.prompt_tokens) else 0);
+    // The prompt cache's limit (the module installs the term): the RAM's, or with the size classes on what the measured
+    // high-water leaves beside the wave (a routed layer's routing-sized arrays its margin).
+    const call_rows = glm.maxPromptCallRows(in.prompt_tokens);
+    const prompt_overshoot = promptOvershoot(c, g, in.prompt_tokens, in.gemm, in.size_classes);
+    const prompt_cache_term = if (in.size_classes and call_rows >= size_class_transient_rows and in.prompt_cache >= prefill_cache_max_bytes)
+        sizeClassCacheBytes(in.prompt_cache, promptWaveOf(c, call_rows, in.prompt_tokens, true, true, in.dsa, in.select, in.gemm, prefillRowBytes(c, g, in.gemm), true), prompt_waves, prompt_overshoot)
+    else
+        in.prompt_cache;
     const decode_waves = @max(decodeWaveBytes(c, verify_rows, in.decode_positions), if (in.mtp) |m| mtpDecodeWaveBytes(c, m.depth, in.decode_positions) else 0);
     const pending: u64 = if (in.mtp != null) mtpPendingBytes(c, in.prompt_tokens) else 0;
     const scratch = scratchBytes(g, @as(u64, s.wide_depth) * s.max_route_ids * g.rows_per_id);
@@ -666,8 +699,8 @@ pub fn billOf(in: Inputs) Bill {
             .mtp_kv = if (in.mtp != null) mtpKvBytes(c, in.prompt_tokens) else 0,
             .mtp_pending = pending,
             .waves = prompt_waves,
-            .mlx_cache = in.prompt_cache,
-            .mlx_cache_overshoot = promptOvershoot(c, g, in.prompt_tokens, in.gemm, in.size_classes),
+            .mlx_cache = prompt_cache_term,
+            .mlx_cache_overshoot = prompt_overshoot,
             .pool_staging = pool,
             .host_side = host_side_prompt_bytes,
         },
@@ -1044,14 +1077,31 @@ test "glm bill: the allocator's size classes: a page under 1 MiB, an eighth of t
     const off = billOf(in).phases[@intFromEnum(Phase.prompt)];
     in.size_classes = true;
     const on = billOf(in).phases[@intFromEnum(Phase.prompt)];
-    // Only the prompt's transients move: the waves and the cache's one buffer past its limit; at most 12.5 % more.
+    // Only the prompt's transients move: the waves and the cache's one buffer past its limit at most 12.5 % more, and the
+    // cache's limit to what the measured high-water leaves beside the wave, under the RAM's.
     try testing.expect(on.waves > off.waves and on.waves <= off.waves + off.waves / 8 + 64 * 16384);
     try testing.expect(on.mlx_cache_overshoot >= off.mlx_cache_overshoot);
-    try testing.expectEqual(off.mlx_cache, on.mlx_cache);
+    try testing.expectEqual(prefillCacheBytes(box_exl3.ram), off.mlx_cache);
+    const rw = promptWaveOf(&c, 16448, 16448, true, true, true, .kernel, .glm53, prefillRowBytes(&c, box_exl3.geometry, .glm53), true);
+    try testing.expectEqual(size_class_transient_bytes + rw.routed + rw.gemm - (on.waves - rw.cross) - on.mlx_cache_overshoot, on.mlx_cache);
+    try testing.expect(on.mlx_cache < off.mlx_cache);
+    // The limit the module installs is the term, with the classes and without.
+    in.size_classes = true;
+    try testing.expectEqual(on.mlx_cache, billOf(in).cacheLimit(.prompt));
+    in.size_classes = false;
+    try testing.expectEqual(off.mlx_cache, billOf(in).cacheLimit(.prompt));
+    in.size_classes = true;
+    // The cache, its one buffer and the wave past the cross-layer arrays cover the measured high-water and every
+    // routing-sized array at its class.
+    try testing.expectEqual(size_class_transient_bytes + rw.routed + rw.gemm, on.mlx_cache + on.mlx_cache_overshoot + on.waves - rw.cross);
+    // A call shorter than the measured rows keeps the RAM's limit.
+    var short = in;
+    short.prompt_tokens = 4096;
+    try testing.expectEqual(prefillCacheBytes(box_exl3.ram), billOf(short).phases[@intFromEnum(Phase.prompt)].mlx_cache);
     try testing.expectEqual(off.kv + off.residents + off.slot_rows + off.transient_rows + off.mtp_residents, on.kv + on.residents + on.slot_rows + on.transient_rows + on.mtp_residents);
     const d_off = billOf(boxInputs(&c, &cfg)).phases[@intFromEnum(Phase.decode)];
     try testing.expectEqualDeep(d_off, billOf(in).phases[@intFromEnum(Phase.decode)]);
-    std.debug.print("glm bill with the size classes on: the prompt waves {d} B (off {d} B), the overshoot {d} B (off {d} B)\n", .{ on.waves, off.waves, on.mlx_cache_overshoot, off.mlx_cache_overshoot });
+    std.debug.print("glm bill with the size classes on: the prompt waves {d} B (off {d} B), the overshoot {d} B (off {d} B), the cache {d} B (off {d} B)\n", .{ on.waves, off.waves, on.mlx_cache_overshoot, off.mlx_cache_overshoot, on.mlx_cache, off.mlx_cache });
 }
 
 test "glm bill: the SDK's view fills the exact units, admits them, and refuses one more in either phase" {
