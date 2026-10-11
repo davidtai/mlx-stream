@@ -411,11 +411,12 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// in x's dtype. `next_scores` [n, n_experts] f32: the next routed layer's routing scores on this call's rows (the
         /// decode lookahead's predictor), evaluated with the ids at the routing barrier; null for none. `hoist`: arrays
         /// that do not wait on this call (the shared expert), committed behind the hit wave once the reads are issued, so
-        /// the GPU runs them during the read wait (the decode lane; the wide lane leaves them to the caller).
+        /// the GPU runs them during the read wait (the decode lane); the wide lane commits them after its routing barrier,
+        /// so the GPU runs them while the host routes.
         pub fn call(self: *Self, g: *G, layer: u32, x: T, indices: T, scores: T, next_scores: ?T, hoist: []const T) !T {
             const n: u32 = @intCast(g.shapeOf(x).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
-            if (n * k > self.stream.max_route_ids) return self.callWide(g, layer, x, indices, scores, n, k);
+            if (n * k > self.stream.max_route_ids) return self.callWide(g, layer, x, indices, scores, n, k, hoist);
             const y = if (bpl > 1) try self.callDecodeSplit(g, layer, x, indices, next_scores, n, k, hoist) else try self.callDecode(g, layer, x, indices, next_scores, n, k, hoist);
             return combine(g, y, scores, g.dtypeOf(x));
         }
@@ -843,7 +844,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         }
 
         /// The wide lane: the weighted sum `[n, hidden]`.
-        fn callWide(self: *Self, g: *G, layer: u32, x: T, indices: T, scores: T, n: u32, k: u32) !T {
+        fn callWide(self: *Self, g: *G, layer: u32, x: T, indices: T, scores: T, n: u32, k: u32, hoist: []const T) !T {
             const a = self.a;
             const w = &self.wide;
             const n_ids = n * k;
@@ -852,6 +853,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const tb = pt.now();
             try w.ids.resize(a, n_ids);
             _ = try g.hostIds(indices, w.ids.items);
+            if (hoist.len > 0) try g.asyncEval(hoist);
             pt.chargeRouted(.barrier, tb);
             w.pos.clearRetainingCapacity();
             for (w.kept.items) |o| g.release(o);

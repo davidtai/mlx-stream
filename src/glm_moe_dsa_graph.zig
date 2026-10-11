@@ -704,11 +704,12 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             const r = try route(g, c, lw.router.?, x2);
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{ x2, r.indices, r.weights }, .router);
             const next: ?T = if (rt.lookahead and !prompt and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2) else null;
-            // A decode-lane call takes the shared expert built first and runs it during its read wait; the sum is the same.
-            const shared: ?T = if (!wide) try mlp(g, lw.shared.?, x2) else null;
-            const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, if (shared) |sh| &[_]T{sh} else &.{});
+            // The call takes the shared expert built first: the decode lane runs it during its read wait, the wide lane
+            // while the host routes after its barrier; the sum is the same.
+            const shared = try mlp(g, lw.shared.?, x2);
+            const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, &.{shared});
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{routed}, .routed);
-            break :blk try g.add(routed, shared orelse try mlp(g, lw.shared.?, x2));
+            break :blk try g.add(routed, shared);
         };
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{f}, .mlp);
         const next_h = g.keep(try g.add(h1, f));
