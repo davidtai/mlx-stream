@@ -108,10 +108,7 @@ pub const Refusal = error{
 
 pub const Diag = @import("sdk").Diag;
 
-fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-    if (diag) |d| d.set(fmt, args);
-    return err;
-}
+const refuse = @import("sdk_ext/expert/bank_file.zig").refuse;
 
 /// An argument's name and dtype; an output of dtype "T" takes the launch's template dtype T.
 pub const Arg = struct { name: [:0]const u8, dtype: ?mlx.mlx_dtype };
