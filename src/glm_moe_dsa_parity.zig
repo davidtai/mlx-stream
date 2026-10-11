@@ -30,15 +30,10 @@ fn delta(a: []const f32, b: []const f32) struct { abs: f32, scale: f32 } {
     return .{ .abs = d, .scale = s };
 }
 
+/// A step's logits (the module's array, freed here) read back as f32.
 fn logitsOf(m: *module.Module, x: mlx.mlx_array, out: []f32) !void {
     defer _ = mlx.mlx_array_free(x);
-    var f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_astype(&f, x, .float32, m.g.s));
-    try mlx.check(mlx.mlx_array_eval(f));
-    const p = mlx.mlx_array_data_float32(f) orelse return error.MlxNoData;
-    if (mlx.mlx_array_size(f) != out.len) return error.LogitsSize;
-    @memcpy(out, p[0..out.len]);
+    _ = try m.g.hostF32(try m.g.astype(x, .float32), out);
 }
 
 /// Every case through one module; returns the largest delta relative to the logits' scale.

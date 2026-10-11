@@ -750,16 +750,7 @@ const TestWeights = struct {
     }
 
     fn quant(tw: TestWeights, g: *G, shape: []const c_int, sd: f32) !QLinear {
-        const w = try tw.dense(g, shape, sd);
-        var vec = mlx.mlx_vector_array{ .ctx = null };
-        try mlx.check(mlx.mlx_quantize(&vec, w, mlx.mlx_optional_int.some(glm.group_size), mlx.mlx_optional_int.some(8), "affine", .{}, g.s));
-        defer _ = mlx.mlx_vector_array_free(vec);
-        var parts: [3]T = undefined;
-        for (&parts, 0..) |*p, i| {
-            p.* = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(p, vec, i));
-            p.* = try g.adopt(p.*);
-        }
+        const parts = try ops.quantizeAffine(g, try tw.dense(g, shape, sd), glm.group_size, 8);
         return .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = 8 };
     }
 };
@@ -824,7 +815,9 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
             defer carry.deinit(&g);
             for (&layers, 0..) |*lw, l| {
                 const y = try attention(&g, &c, lw, @intCast(l), x, cl[0], cl[1], &cache, &carry, .auto, kernels);
-                outs[arm][ci * 2 + l] = try hostF32(&g, y);
+                const yf = try g.astype(y, .float32);
+                outs[arm][ci * 2 + l] = try testing.allocator.alloc(f32, @intCast(g.shapeOf(yf).numel()));
+                _ = try g.hostF32(yf, outs[arm][ci * 2 + l]);
                 if (ci == 0 and l == 0) {
                     // The first call's selection, each row's ids sorted (a row that reaches fewer keys than the top-k
                     // also holds keys past it, which neither form attends: those rows are not compared).
@@ -860,13 +853,4 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
         std.debug.print("glm attention kernels vs reference form, call {d} layer {d}: cos {d:.6}, max |d| {d:.4} (output up to {d:.3})\n", .{ i / 2, i % 2, cos, maxd, maxr });
         try testing.expect(cos > 0.999 and maxd <= 0.05 * maxr);
     }
-}
-
-fn hostF32(g: *G, x: T) ![]f32 {
-    const f = try g.astype(x, .float32);
-    try g.evalAll(&.{f});
-    const out = try testing.allocator.alloc(f32, @intCast(g.shapeOf(f).numel()));
-    errdefer testing.allocator.free(out);
-    _ = try g.hostF32(f, out);
-    return out;
 }
