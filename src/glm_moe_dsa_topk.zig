@@ -155,8 +155,9 @@ pub fn serves(k: u32) bool {
 
 /// The ids `[1, rows, k]` (int32) of each row's `k` largest scores (`scores` `[1, rows, n]` f32, row-contiguous,
 /// `k < n`), as `argpartition(scores, n - k)[..., n - k:]` orders them; null where the kernel does not serve the
-/// shape (`k` not a power of two up to 2048, or a row of 2^31 or more).
+/// shape (`k` not a power of two up to 2048, or a row of 2^31 or more) or the stream is not the GPU's.
 pub fn topk(g: *G, scores: T, k: u32) !?T {
+    if (!mlx.streamIsGpu(g.s)) return null;
     const sh = g.shapeOf(scores);
     if (sh.n != 3 or sh.dim(0) != 1) return null;
     const rows = sh.dim(1);
@@ -199,10 +200,10 @@ pub fn topk(g: *G, scores: T, k: u32) !?T {
 
 /// The ids `[rows.len, k]` (int32) of each row's `k` largest scores, `rows[r]` one row of `n_r > k` f32 scores
 /// (`[..., n_r]`, every leading dim 1; the lengths may differ), as `topk` gives them, every row in one launch (a row's
-/// threadgroup reads its own input); null where the kernel does not serve the shape.
+/// threadgroup reads its own input); null where the kernel does not serve the shape or the stream is not the GPU's.
 pub fn topkRows(g: *G, rows: []const T, k: u32) !?T {
     std.debug.assert(rows.len > 0 and rows.len <= max_rows);
-    if (!serves(k)) return null;
+    if (!serves(k) or !mlx.streamIsGpu(g.s)) return null;
     var pv: [8]i32 = @splat(0);
     for (rows, 0..) |r, i| {
         const sh = g.shapeOf(r);
