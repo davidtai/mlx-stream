@@ -56,6 +56,17 @@ pub const lookahead: struct { k: u32 = 8 } = .{};
 pub const event_watchdog_ms: u32 = 2000;
 /// The chunk-major prompt pass's chunk (`layer_major_prefill` off).
 pub const prefill_chunk_tokens: u32 = 2048;
+/// Only mlx-serve's macOS MLX has the command buffer limits' setter (patches/mlx-cb-limits.patch).
+pub const prompt_buffer_limits = @import("builtin").os.tag == .macos;
+
+/// A prompt call's MB limit per command buffer (`promptBuffers`): MLX's op limit `max_ops` of the call's activations
+/// (`rows` x `hidden` bf16), never below MLX's own `mlx_mb`. A buffer of the call's row-sized ops then commits at MLX's
+/// op count, not at nearly every op.
+pub fn promptBufferMb(rows: u64, hidden: u32, max_ops: c_int, mlx_mb: c_int) c_int {
+    const bytes = @as(u64, @intCast(@max(max_ops, 1))) * rows * hidden * @sizeOf(u16);
+    const mb = std.math.divCeil(u64, bytes, 1 << 20) catch unreachable;
+    return @intCast(@max(@as(u64, @intCast(@max(mlx_mb, 1))), @min(mb, std.math.maxInt(c_int))));
+}
 /// How far the constructed footprint may sit above the bill's construction terms (the ledger's page rounding and the
 /// host side's own movement; `phase_memory`'s, shared with DeepSeek-V4.1's module).
 pub const construction_tolerance_bytes = phase_mem.construction_tolerance_bytes;
@@ -184,6 +195,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         overrides: Overrides,
         event: ?expert_event.Event = null,
         prev_cache_limit: usize = 0,
+        /// MLX's command buffer limits (ops, MB) while a prompt's are installed (`promptBuffers`); null otherwise.
+        mlx_buffers: ?[2]c_int = null,
         bill: sdk.MemoryBill,
         /// The request's decode since its handover, for its request-end line; null before the handover and after the line.
         decode_mark: ?DecodeMark = null,
@@ -452,6 +465,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.bill.free(self.gpa);
             if (self.probe) |p| self.gpa.destroy(p);
             self.g.deinit();
+            self.mlxBuffers();
             var prev: usize = 0;
             _ = mlx.mlx_set_cache_limit(&prev, self.prev_cache_limit);
             self.gpa.destroy(self);
@@ -503,6 +517,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var at: usize = 0;
             while (at < ids.len) {
                 const end = at + if (self.cfg.layerMajor()) glm.promptCallRows(ids.len, at) else @min(chunk, ids.len - at);
+                self.promptBuffers(end - at);
                 if (logits) |x| self.g.release(x);
                 logits = null;
                 if (self.mtp) |ln| {
@@ -554,6 +569,34 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_set_alloc_size_classes(&prev, on);
         }
 
+        /// A prompt call's command buffer limits: MLX commits the GPU stream's buffer past its op limit or past its MB
+        /// limit of the ops' inputs (50 and 50 on an Ultra). A call's activations are its rows times a decode step's, so
+        /// at MLX's MB limit nearly every op of a 16K-row call is a buffer of its own (about 17,800 buffers for a 16K
+        /// prompt), and the GPU waits 0.1 to 0.3 ms at the start of each buffer after an idle one. The prompt's MB limit
+        /// is the op limit's worth of the call's activations (`promptBufferMb`), so the op limit is the one that binds:
+        /// the same kernels in the same order on the same allocations, in fewer buffers. MLX's own limits come back at
+        /// the handover (`mlxBuffers`).
+        fn promptBuffers(self: *Self, rows: u64) void {
+            // Only mlx-serve's macOS MLX (patches/mlx-cb-limits.patch) has the setter.
+            if (comptime !prompt_buffer_limits) return;
+            var ops: c_int = 0;
+            var mb: c_int = 0;
+            // 0 keeps a limit: this reads them.
+            _ = mlx.mlx_metal_set_command_buffer_limits(&ops, &mb, 0, 0);
+            const own = self.mlx_buffers orelse [2]c_int{ ops, mb };
+            _ = mlx.mlx_metal_set_command_buffer_limits(&ops, &mb, own[0], promptBufferMb(rows, self.model.hidden_size, own[0], own[1]));
+            self.mlx_buffers = own;
+        }
+
+        /// MLX's own command buffer limits back (the handover, the module's end); nothing when no prompt raised them.
+        fn mlxBuffers(self: *Self) void {
+            const own = self.mlx_buffers orelse return;
+            var ops: c_int = 0;
+            var mb: c_int = 0;
+            _ = mlx.mlx_metal_set_command_buffer_limits(&ops, &mb, own[0], own[1]);
+            self.mlx_buffers = null;
+        }
+
         /// A serial step: `ids` (decode width) after the committed positions; the last row's logits, an owned handle.
         pub fn extend(self: *Self, ids: []const u32) !mlx.mlx_array {
             if (ids.len == 0 or ids.len * self.model.n_experts_per_tok > self.routes.max_route_ids) return error.StepWiderThanRoute;
@@ -588,6 +631,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         pub fn decodeHandover(self: *Self, h: sdk.DecodeHandover) !void {
             if (self.decoding) return;
             _ = mlx.mlx_synchronize(self.g.s);
+            // Decode commits at MLX's own limits; a prompt after a failed handover raises them again.
+            self.mlxBuffers();
             const before = Mem.now();
             const transient = try self.ex.releaseTransient();
             var prev: usize = 0;
@@ -1293,6 +1338,13 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
     std.debug.print("{f}\n", .{PrecisionLine{ .by0 = &by0, .by1 = &by1 }});
 }
 
+test "glm prompt buffers: a prompt call's MB limit is MLX's op limit of its activations, never below MLX's own" {
+    // GLM-5.3's 16,387-token prompt in one call: 50 activations of 16,387 x 6,144 bf16 are 9,601.8 MB.
+    try std.testing.expectEqual(@as(c_int, 9602), promptBufferMb(16387, 6144, 50, 50));
+    try std.testing.expectEqual(@as(c_int, 50), promptBufferMb(12, 64, 50, 50));
+    try std.testing.expectEqual(@as(c_int, 7682), promptBufferMb(16387, 6144, 40, 40));
+}
+
 test "glm handover: the settle reads until the cache is empty and the footprint shows the frees, at most its wait" {
     const Fake = phase_mem.FakeReader(Mem);
     var i: usize = 0;
@@ -1395,10 +1447,23 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
         try testing.expectEqual(@as(u32, 5), d);
     }
     const prompt = [_]u32{ 3, 17, 9, 101, 44, 250, 7, 63, 12, 5, 99, 31 };
+    // MLX's command buffer limits (0 keeps a limit: this reads them).
+    var ops0: c_int = 0;
+    var mb0: c_int = 0;
+    _ = mlx.mlx_metal_set_command_buffer_limits(&ops0, &mb0, 0, 0);
     const logits = try m.prefillAt(0, &prompt);
     var t = try m.g.hostArgmax(logits);
     _ = mlx.mlx_array_free(logits);
+    // The prompt's limits stay until the handover (its one call of 12 rows), MLX's are back after it.
+    var ops: c_int = 0;
+    var mb: c_int = 0;
+    _ = mlx.mlx_metal_set_command_buffer_limits(&ops, &mb, 0, 0);
+    try testing.expectEqual([2]c_int{ ops0, mb0 }, m.mlx_buffers.?);
+    try testing.expectEqual([2]c_int{ ops0, promptBufferMb(prompt.len, m.model.hidden_size, ops0, mb0) }, [2]c_int{ ops, mb });
     try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
+    try testing.expectEqual(@as(?[2]c_int, null), m.mlx_buffers);
+    _ = mlx.mlx_metal_set_command_buffer_limits(&ops, &mb, 0, 0);
+    try testing.expectEqual([2]c_int{ ops0, mb0 }, [2]c_int{ ops, mb });
     var row: [256]f32 = undefined;
     for (0..4) |_| {
         const lg = try m.extend(&.{t});
