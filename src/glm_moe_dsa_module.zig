@@ -403,6 +403,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const s0 = self.stream.stats();
             const q0: ?[2]u64 = if (comptime @hasDecl(Math, "prefillStats")) self.math.prefillStats() else null;
             startPhase();
+            prefill_timers.begin(&self.g);
             const mem0 = Mem.now();
             const t0 = self.nowNs();
             var logits: ?mlx.mlx_array = null;
@@ -436,7 +437,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             } else null;
             _ = mlx.mlx_synchronize(self.g.s);
             log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .gemm = self.prompt_gemm, .mem = .{ .start = mem0, .end = Mem.now() } }});
-            prefill_timers.report(ids.len);
+            prefill_timers.report(ids.len, &self.g);
             return logits.?;
         }
 
