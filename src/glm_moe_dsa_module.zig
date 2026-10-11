@@ -163,6 +163,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         decode_units: u32,
         /// The bytes the handover's grow adds past the prompt rows (`bill.grownOf`), in the decode records' slot rows.
         grown_bytes: u64 = 0,
+        /// The rows the draft lane held pending at the handover: the decode records bill them.
+        decode_pending_rows: u64 = 0,
         /// The harness forced the rows (`expert_rows`): the handover grows to them, no live fill.
         forced_rows: bool,
         /// The decode rows are the split's (`glm_moe_dsa_split`), not the even split's.
@@ -388,7 +390,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
         /// The request's decode terms at its grown units: the bill at its own KV (`bill.atRequest`).
         fn requestTerms(self: *const Self) bill_mod.PhaseTerms {
-            return bill_mod.atRequest(self.inputs, self.decode_positions).termsAt(.decode, bill_mod.slotBytes(self.inputs.bank, self.prompt_units) + self.grown_bytes);
+            return bill_mod.atRequest(self.inputs, self.decode_positions, self.decode_pending_rows).termsAt(.decode, bill_mod.slotBytes(self.inputs.bank, self.prompt_units) + self.grown_bytes);
         }
 
         /// The MLX cache limit the module installs for `phase` (the bill's own term: one value for both).
@@ -603,6 +605,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const rest = bill_mod.restOfBox(box.others, self.cfg.rest_of_box_floor_bytes);
             const target = bill_mod.targetOf(self.gpu_target, self.ram, rest);
             var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_units, .rows = self.decode_units, .target = target, .gpu_target = self.gpu_target, .baseline = self.cfg.memory_baseline_bytes orelse 0, .box = box, .rest = rest };
+            self.decode_pending_rows = if (self.mtp) |ln| ln.n_pending else 0;
             const after = bill_mod.decodeAfter(self.inputs, cap);
             // The host terms are the bill's bound, or the reading where it sits above them (then the bound under-bills and
             // the live reading must not).
@@ -613,9 +616,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                     log.err("{f}\n", .{line});
                     return e;
                 };
-                line.bill_bytes = bill_mod.requestBudget(self.inputs, cap, self.prompt_units, rest, target);
+                line.bill_bytes = bill_mod.requestBudget(self.inputs, cap, self.decode_pending_rows, self.prompt_units, rest, target);
                 // The bill at the request's inputs in bytes (the receipts rebuild its budget from them).
-                log.info("glm_moe_dsa: bill at the request: {d} positions beside {d} B of the rest of the box, target {d} B: {d} B grown\n", .{ cap, rest, target, line.bill_bytes.? });
+                log.info("glm_moe_dsa: bill at the request: {d} positions, {d} MTP pending rows, beside {d} B of the rest of the box, target {d} B: {d} B grown\n", .{ cap, self.decode_pending_rows, rest, target, line.bill_bytes.? });
                 line.cap = self.cfg.expert_units_cap;
                 if (line.cap) |c| line.cap_bytes = bill_mod.grownBytes(self.inputs.bank, self.prompt_units, c);
                 const budget = @min(@min(line.live_bytes.?, line.bill_bytes.?), if (line.cap != null) line.cap_bytes else std.math.maxInt(u64));

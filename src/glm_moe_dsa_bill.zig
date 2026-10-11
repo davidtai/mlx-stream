@@ -212,6 +212,9 @@ pub const Inputs = struct {
     decode_positions: u64,
     /// The draft lane when the model sets `mtp_depth` (null: off, no term).
     mtp: ?Mtp = null,
+    /// The rows the draft lane holds pending at a request's handover (null: the construction's, the prompt call's rows,
+    /// the most the lane holds before its append).
+    decode_pending_rows: ?u64 = null,
     /// The prompt's attention on the DSA kernels (`glm_moe_dsa_graph.Routes.dsa`), else in the reference's form.
     dsa: bool,
     /// The prompt's routed GEMMs (the module's quant, `promptGemmOf`) and its spans' selection (`selectOf`).
@@ -238,7 +241,8 @@ pub const PhaseTerms = struct {
     mtp_residents: u64 = 0,
     kv: u64 = 0,
     mtp_kv: u64 = 0,
-    /// The prompt's final-normed hidden the draft lane holds (a view) until its first round.
+    /// The draft lane's pending hidden: the prompt's final-normed rows until its first round, decode's pending rows
+    /// (`mtpDecodePendingBytes`).
     mtp_pending: u64 = 0,
     waves: u64 = 0,
     mlx_cache: u64 = 0,
@@ -583,11 +587,25 @@ pub fn mtpPromptWaveBytes(c: *const glm.Config, tokens: u64) u64 {
     return r * (embed + 3 * h * bf16 + 2 * h * bf16 + h * bf16 + h * bf16 + keys);
 }
 
-/// The prompt's final-normed hidden the draft lane holds until its first round (GLM-only: `Lane.pend` keeps a view of
-/// the last call's rows): the call's rows and the pending row before them.
-pub fn mtpPendingBytes(c: *const glm.Config, tokens: u64) u64 {
+/// The prompt's final-normed hidden rows the draft lane holds before its append (GLM-only: `Lane.pend` keeps the last
+/// call's rows): the call's rows and the pending row before them.
+pub fn mtpPendingRows(tokens: u64) u64 {
     const t = glm.maxPromptCallRows(tokens);
-    return cache_mod.bufferBytes((t + @intFromBool(tokens > t)) * c.hidden_size * bf16, std.heap.pageSize());
+    return t + @intFromBool(tokens > t);
+}
+
+/// The prompt's pending hidden (`mtpPendingRows`).
+pub fn mtpPendingBytes(c: *const glm.Config, tokens: u64) u64 {
+    return cache_mod.bufferBytes(mtpPendingRows(tokens) * c.hidden_size * bf16, std.heap.pageSize());
+}
+
+/// Decode's pending hidden past a handover where the lane holds `rows` pending rows: those rows (a copy of them past
+/// each append, `Lane.append`, so the buffer holds just them), or at most `mtp.max_pending` serial rows and a pend's
+/// concat of the new rows beside them, whichever is more. The lane's pending only shrinks from `rows` or stays within
+/// `max_pending`: a round drafts from all of it.
+pub fn mtpDecodePendingBytes(c: *const glm.Config, rows: u64) u64 {
+    const row = c.hidden_size * bf16;
+    return @max(cache_mod.bufferBytes(rows * row, std.heap.pageSize()), 2 * cache_mod.bufferBytes(@as(u64, mtp_mod.max_pending) * row, std.heap.pageSize()));
 }
 
 // ── Decode (`glm_moe_dsa_graph.forwardRows` over a serial step or a verify of `rows` rows) ──
@@ -668,6 +686,7 @@ pub fn billOf(in: Inputs) Bill {
     const prompt_waves = @max(promptWaveBytes(c, g, in.prompt_tokens, in.dsa, in.select, in.gemm, in.size_classes, prompt_cache, decode_cache), if (in.mtp != null) mtpPromptWaveBytes(c, in.prompt_tokens) else 0);
     const decode_waves = @max(decodeWaveBytes(c, verify_rows, in.decode_positions), if (in.mtp) |m| mtpDecodeWaveBytes(c, m.depth, in.decode_positions) else 0);
     const pending: u64 = if (in.mtp != null) mtpPendingBytes(c, in.prompt_tokens) else 0;
+    const decode_pending: u64 = if (in.mtp != null) mtpDecodePendingBytes(c, in.decode_pending_rows orelse mtpPendingRows(in.prompt_tokens)) else 0;
     const scratch = scratchBytes(g, @as(u64, s.wide_depth) * s.max_route_ids * g.rows_per_id);
     return .{ .geometry = g, .phases = .{
         // Constructed: the slot rows and the scratch, the draft lane's residents, the pool; the trunk's residents land at
@@ -692,7 +711,7 @@ pub fn billOf(in: Inputs) Bill {
             .mtp_residents = mtp_res,
             .kv = kvBytes(c, in.decode_positions),
             .mtp_kv = if (in.mtp != null) mtpKvBytes(c, in.decode_positions) else 0,
-            .mtp_pending = pending,
+            .mtp_pending = decode_pending,
             .waves = decode_waves,
             .mlx_cache = decode_cache_bytes,
             .mlx_cache_overshoot = decodeCacheOvershoot(c, in.decode_positions, verify_rows),
@@ -798,9 +817,10 @@ pub fn loadRequirementBytes(a: std.mem.Allocator, io: std.Io, cfg: *const settin
 }
 
 /// The bill of `in` with decode at a request's `positions` (its own KV).
-pub fn atRequest(in: Inputs, positions: u64) Bill {
+pub fn atRequest(in: Inputs, positions: u64, pending_rows: u64) Bill {
     var req = in;
     req.decode_positions = positions;
+    req.decode_pending_rows = pending_rows;
     return billOf(req);
 }
 
@@ -820,8 +840,8 @@ pub fn grownBudget(fixed: u64, wired: u64, target: u64) ?u64 {
 
 /// The grown bytes the bill of `in` with decode at a request's `positions` admits under `target` past the `prompt` units'
 /// arrays (its decode terms there, the page tables over them and the grown rows); 0 when even the prompt units are over.
-pub fn requestBudget(in: Inputs, positions: u64, prompt: u32, baseline: u64, target: u64) u64 {
-    const t = atRequest(in, positions).termsAt(.decode, slotBytes(in.bank, prompt));
+pub fn requestBudget(in: Inputs, positions: u64, pending_rows: u64, prompt: u32, baseline: u64, target: u64) u64 {
+    const t = atRequest(in, positions, pending_rows).termsAt(.decode, slotBytes(in.bank, prompt));
     return grownBudget(baseline + t.sum() - t.wire_tables, t.wired(), target) orelse 0;
 }
 
@@ -829,7 +849,8 @@ pub fn requestBudget(in: Inputs, positions: u64, prompt: u32, baseline: u64, tar
 /// window 0 (the grow allocates it), the request's decode waves, the MLX decode cache and its overshoot (MLX's); the
 /// bill's decode host terms, the read pool's staging and the host side's measured bound (the footprint outside MLX).
 pub fn decodeAfter(in: Inputs, positions: u64) struct { device: u64, host: u64 } {
-    const d = atRequest(in, positions).phases[@intFromEnum(Phase.decode)];
+    // None of these terms reads the lane's pending rows (MLX's active bytes hold them at the handover).
+    const d = atRequest(in, positions, 0).phases[@intFromEnum(Phase.decode)];
     return .{ .device = d.transient_rows + d.waves + d.mlx_cache + d.mlx_cache_overshoot, .host = d.pool_staging + d.host_side };
 }
 
@@ -1027,6 +1048,10 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
     try testing.expectEqual(selectOf(&c), Select.kernel);
     // The lane's pending hidden: the prompt's 16,448 rows.
     try testing.expectEqual(@as(u64, 16448 * 6144 * 2), p.mtp_pending);
+    // Decode's at construction: the prompt call's rows the lane holds before its append.
+    try testing.expectEqual(@as(u64, 16448 * 6144 * 2), d.mtp_pending);
+    // At a handover past the append: the lane's 64 pending rows at most, and a pend's concat beside them.
+    try testing.expectEqual(@as(u64, 2 * 64 * 6144 * 2), mtpDecodePendingBytes(&c, 1));
     // The construction: no trunk residents, no KV, no wave, no cache.
     try testing.expectEqual(@as(u64, 0), k.residents + k.kv + k.waves + k.mlx_cache + k.mlx_cache_overshoot + k.mtp_pending);
     try testing.expectEqual(p.transient_rows, k.transient_rows);
@@ -1121,7 +1146,7 @@ test "glm bill: per machine size, the units the fill takes and the bytes the req
             defer mb.free(testing.allocator);
             const target = targetOf(ram - (18 << 30), ram, baseline);
             const rows = try sdk.fill(mb, baseline, target, maxUnits(in.bank), min_fill_rows);
-            const decode = @min(requestBudget(in, positions, rows.prompt, baseline, target), grownBytes(in.bank, rows.prompt, maxUnits(in.bank)));
+            const decode = @min(requestBudget(in, positions, 1, rows.prompt, baseline, target), grownBytes(in.bank, rows.prompt, maxUnits(in.bank)));
             std.debug.print("glm bill per machine: {d} GiB, target {d} B, size classes {}: {d} prompt / {d} decode units constructed, {d} B grown at the coding request\n", .{ gib, target, classes, rows.prompt, rows.decode, decode });
             // Decode's slot rows: the prompt's arrays and the grown ones.
             const slots = slotBytes(in.bank, rows.prompt) + decode;
@@ -1146,8 +1171,9 @@ test "glm bill: the bill at a request counts its slot rows exactly; a request's 
     const positions = decodeCap(&cfg, 16387 + 1024);
     // Grown from the 9d157b5 screen's 76 prompt units: decode's rows in the grow's own arrays, a byte more over the
     // target.
-    const x = requestBudget(in, positions, 76, baseline, target);
-    const req = atRequest(in, positions);
+    // The lane holds one pending row past the prompt's append.
+    const x = requestBudget(in, positions, 1, 76, baseline, target);
+    const req = atRequest(in, positions, 1);
     const at76 = slotBytes(in.bank, 76);
     try testing.expect(baseline + req.termsAt(.decode, at76 + x).sum() <= target and baseline + req.termsAt(.decode, at76 + x + 1).sum() > target);
     // The whole units in it are the SDK's fill over the request's bill.
@@ -1156,9 +1182,12 @@ test "glm bill: the bill at a request counts its slot rows exactly; a request's 
     const units = unitsIn(in.bank, 76, x);
     try testing.expectEqual((try sdk.fill(mb, baseline, target, maxUnits(in.bank), 0)).decode, units);
     try testing.expectEqual(req.terms(.decode, units, 76), req.termsAt(.decode, at76 + grownBytes(in.bank, 76, units)));
-    const worst = requestBudget(in, maxPositions(&cfg), 76, baseline, target);
+    const worst = requestBudget(in, maxPositions(&cfg), 1, 76, baseline, target);
     try testing.expect(x > worst);
-    try testing.expectEqual(@as(u64, 0), requestBudget(in, positions, 76, baseline, baseline));
+    try testing.expectEqual(@as(u64, 0), requestBudget(in, positions, 1, 76, baseline, baseline));
+    // A lane holding the prompt call's rows at the handover bills them.
+    try testing.expectEqual(@as(u64, 16388 * 6144 * 2), atRequest(in, positions, 16388).phases[@intFromEnum(Phase.decode)].mtp_pending);
+    try testing.expect(requestBudget(in, positions, 16388, 76, baseline, target) < x);
     // What decode adds past MLX's active bytes at the handover: window 0, the waves, the cache and its overshoot; the
     // decode host terms.
     const after = decodeAfter(in, positions);
@@ -1267,7 +1296,7 @@ test "glm bill: the rest-of-box floor only raises the rest the bill sits beside,
     const positions = decodeCap(&cfg, 16387 + 1024);
     const target = targetOf(box_exl3.gpu_target, box_exl3.ram, 15_400_000_000);
     const floored = targetOf(box_exl3.gpu_target, box_exl3.ram, restOfBox(15_400_000_000, 21_000_000_000));
-    try testing.expect(requestBudget(in, positions, 74, restOfBox(15_400_000_000, 21_000_000_000), floored) < requestBudget(in, positions, 74, 15_400_000_000, target));
+    try testing.expect(requestBudget(in, positions, 1, 74, restOfBox(15_400_000_000, 21_000_000_000), floored) < requestBudget(in, positions, 1, 74, 15_400_000_000, target));
 }
 
 test "glm bill: the units cap only lowers the rows, in each phase" {

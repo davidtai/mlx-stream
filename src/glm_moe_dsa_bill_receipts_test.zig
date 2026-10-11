@@ -50,7 +50,8 @@ test "glm bill receipts: the 9d157b5 screen's peaks, over its own bill, sit unde
     try testing.expect(residual >= 0);
     try testing.expect(prompt.device() >= 228_468_500_000);
     // Its decode at 86 units: the footprint's peak 237.979 GB, MLX's 236.717 GB.
-    const req = bill.atRequest(in, bill.decodeCap(&cfg, 16387 + 1024)).terms(.decode, 86, 76);
+    // Its lane kept a view of the prompt call's rows into decode.
+    const req = bill.atRequest(in, bill.decodeCap(&cfg, 16387 + 1024), bill.mtpPendingRows(16448)).terms(.decode, 86, 76);
     try testing.expect(req.sum() >= 237_979_500_000);
     try testing.expect(req.device() + req.mlx_cache >= 236_717_500_000);
     std.debug.print("\nGLM53_RECEIPT_9D157B5 {{\"prompt_billed\": {d}, \"prompt_residual\": {d}, \"decode_billed\": {d}, \"decode_residual\": {d}, \"baseline\": {d}}}\n", .{ prompt.sum(), residual, req.sum(), @as(i64, @intCast(req.sum())) - 237_979_000_000, baseline });
@@ -72,9 +73,9 @@ const Receipt = struct {
     target: u64,
     /// The units the construction's fill took.
     units: sdk.Rows,
-    /// The bill at the request: its KV positions, the rest of the box then, the target beside it, the grown bytes it
-    /// admits.
-    request: struct { positions: u64, others: u64, target: u64, bytes: u64 },
+    /// The bill at the request: its KV positions, the lane's pending rows, the rest of the box then, the target beside
+    /// it, the grown bytes it admits.
+    request: struct { positions: u64, pending_rows: u64, others: u64, target: u64, bytes: u64 },
     /// The handover's grow: the grown bytes the bill at the request and the live reading admit, the whole units in the
     /// fewer (`bill.unitsIn`) and the bytes the split's rows take within it (`bill.grownOf`).
     bill_bytes: u64,
@@ -101,7 +102,7 @@ test "glm bill receipts: each run's phase terms, page tables and residuals rebui
         errdefer std.debug.print("receipt {s}\n", .{r.name});
         const in = inputs(&c, r.gemm, r.select, true);
         const b = bill.billOf(in);
-        const req = bill.atRequest(in, r.request.positions);
+        const req = bill.atRequest(in, r.request.positions, r.request.pending_rows);
         const p = r.units.prompt;
         const slots = bill.slotBytes(in.bank, p) + r.grown_bytes;
         const want = [4]bill.PhaseTerms{ b.terms(.construction, p, p), b.terms(.prompt, p, p), req.termsAt(.decode, slots), req.termsAt(.decode, slots) };
@@ -131,7 +132,7 @@ test "glm bill receipts: the fill at each run's baseline gives its units, one mo
         try testing.expectEqual(r.target, bill.targetOf(bill.box_exl3.gpu_target, bill.box_exl3.ram, r.baseline));
         try phase_mem.expectFillEdge(mb, r.baseline, r.target, bill.maxUnits(in.bank), bill.min_fill_rows, r.units);
         try testing.expectEqual(r.request.target, bill.targetOf(bill.box_exl3.gpu_target, bill.box_exl3.ram, r.request.others));
-        try testing.expectEqual(r.request.bytes, bill.requestBudget(in, r.request.positions, r.units.prompt, r.request.others, r.request.target));
+        try testing.expectEqual(r.request.bytes, bill.requestBudget(in, r.request.positions, r.request.pending_rows, r.units.prompt, r.request.others, r.request.target));
         try testing.expectEqual(r.bill_bytes, r.request.bytes);
         const budget = @min(r.bill_bytes, r.live_bytes);
         try testing.expectEqual(r.grown, bill.unitsIn(in.bank, r.units.prompt, budget));
