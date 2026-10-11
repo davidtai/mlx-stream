@@ -32,6 +32,7 @@ const expert_routes = sdk_ext.expert.routes;
 const glm = @import("glm_moe_dsa.zig");
 const settings = @import("glm_moe_dsa_settings.zig");
 const bill_mod = @import("glm_moe_dsa_bill.zig");
+const split_mod = @import("glm_moe_dsa_split.zig");
 const graph = @import("glm_moe_dsa_graph.zig");
 const bank_mod = @import("glm_moe_dsa_bank.zig");
 const experts_mod = @import("glm_moe_dsa_experts.zig");
@@ -157,14 +158,16 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         max_context: u64,
         /// The most positions decode's KV lanes take: the billed context, `max_output` and a round's verify.
         max_positions: u64,
-        /// Each stream layer's rows (`bill.rowsAt`) at the prompt's units and at the units the handover grows to (the
-        /// construction's fill until the first handover, then its request's).
+        /// Each stream layer's rows at the prompt's units (`bill.rowsAt`) and at the units the handover grows to
+        /// (`decodeRowsAt`; the construction's fill until the first handover, then its request's).
         prompt_rows: []u32,
         decode_rows: []u32,
         prompt_units: u32,
         decode_units: u32,
         /// The harness forced the rows (`expert_rows`): the handover grows to them, no live fill.
         forced_rows: bool,
+        /// The decode rows are the split's (`glm_moe_dsa_split`), not the even split's.
+        split_rows: bool = false,
         decoding: bool = false,
         /// The bill's inputs (the handover bills its request's KV from them), the load's baseline, MLX's target (the
         /// host's ceiling less its wired margin) and the box's RAM (the handover's target, `bill.targetOf`).
@@ -277,7 +280,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.decode_rows = try gpa.alloc(u32, n_bank);
             errdefer gpa.free(self.decode_rows);
             _ = bill_mod.rowsAt(self.inputs.bank, rows.prompt, self.prompt_rows);
-            _ = bill_mod.rowsAt(self.inputs.bank, rows.decode, self.decode_rows);
+            if (self.forced_rows) _ = bill_mod.rowsAt(self.inputs.bank, rows.decode, self.decode_rows) else self.decodeRowsAt(rows.decode);
             if (n_bank > 1 and self.inputs.bank.layers.len > self.model.nSparse()) log.info("glm_moe_dsa: {d} bank layers, rows per bank layer prompt {d} / {d}, decode {d} / {d} (the first routed layer's two)\n", .{ n_bank, self.prompt_rows[0], self.prompt_rows[1], self.decode_rows[0], self.decode_rows[1] });
             self.layer_counts0 = try gpa.alloc(LayerCounts, n_bank);
             errdefer gpa.free(self.layer_counts0);
@@ -622,7 +625,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 line.bound = live.total(line.rows);
                 line.mlx_bound = live.mlxAt(line.rows);
                 self.decode_units = line.rows;
-                _ = bill_mod.rowsAt(self.inputs.bank, line.rows, self.decode_rows);
+                self.decodeRowsAt(line.rows);
             }
             try self.ex.grow(self.decode_rows);
             line.grown = Mem.now();
@@ -640,6 +643,13 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.ex.host = .{};
             if (self.mtp) |ln| ln.counts = .{};
             for (self.layer_counts0, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
+        }
+
+        /// Each stream layer's decode rows at `units` grown from the prompt's: the split's (`glm_moe_dsa_split`) on its
+        /// geometry, else the even split's (`bill.rowsAt`). The split's grown rows take at most the even split's bytes.
+        fn decodeRowsAt(self: *Self, units: u32) void {
+            self.split_rows = split_mod.decodeRows(self.inputs.bank, self.prompt_units, units, self.decode_rows) != null;
+            if (!self.split_rows) _ = bill_mod.rowsAt(self.inputs.bank, units, self.decode_rows);
         }
 
         /// The request's end (the host's finish): its decode line, once; nothing when it never decoded.
@@ -669,6 +679,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .hit_rate = hitSpread(self.layer_counts0, self.layer_counts1, self.layer_rates),
                 .rows = self.decode_rows[0],
                 .rows_alt = if (Experts.bpl > 1) self.decode_rows[1] else null,
+                .spread = if (self.split_rows) split_mod.spread(self.decode_rows) else null,
                 .mem = .{ .start = d.mem0, .end = end },
                 .box = Box.now(end),
             }});
@@ -1037,6 +1048,9 @@ pub const DecodeLine = struct {
     rows: u32,
     /// A bank of two bank layers per routed layer: the second's rows (`rows` the first's).
     rows_alt: ?u32 = null,
+    /// Uneven rows (`glm_moe_dsa_split`): per K the min, median and max over the routed layers (printed in place of
+    /// `rows`, `rows_alt`: the medians, then the spread).
+    spread: ?[2][3]u32 = null,
     mem: ?PhaseMem = null,
     /// The box at the request's end (the rest of it beside the handover's reading).
     box: ?Box = null,
@@ -1047,9 +1061,11 @@ pub const DecodeLine = struct {
         });
         if (p.hit_rate) |h| try w.print(" (hit rate per layer min {d:.0}% median {d:.0}% max {d:.0}%)", .{ h.min, h.median, h.max });
         try w.print(", {d:.2} GB from the SSD ({d:.3} GB per emitted token), lookahead {d} issued / {d} used (landed {d}, expired {d}, abandoned {d}, cancelled {d}, discarded {d}, used while in flight {d}), lookahead {d:.2} GB read / {d:.2} GB served, {d} loads skipped, {d} direct reads, host wait {d:.2} s and reads in flight {d:.2} s of {d:.2} s ({d:.1}% busy, {d:.1}% with no read in flight), {d}", .{
-            gigabytes(p.r.ssd_bytes), if (p.tokens == 0) 0 else gigabytes(p.r.ssd_bytes) / @as(f64, @floatFromInt(p.tokens)), p.r.spec_issued, p.r.spec_used, p.r.spec_landed, p.r.spec_expired, p.r.spec_abandoned, p.r.spec_cancelled, p.r.spec_discarded, p.r.spec_late, gigabytes(p.r.spec_bytes), gigabytes(p.r.spec_served_bytes), p.r.loads_skipped, p.r.direct, seconds(p.r.wait_ns), seconds(p.r.in_flight_ns), seconds(p.wall_ns), busyPct(p.r.in_flight_ns, p.wall_ns), 100 - busyPct(p.r.in_flight_ns, p.wall_ns), p.rows,
+            gigabytes(p.r.ssd_bytes), if (p.tokens == 0) 0 else gigabytes(p.r.ssd_bytes) / @as(f64, @floatFromInt(p.tokens)), p.r.spec_issued, p.r.spec_used, p.r.spec_landed, p.r.spec_expired, p.r.spec_abandoned, p.r.spec_cancelled, p.r.spec_discarded, p.r.spec_late, gigabytes(p.r.spec_bytes), gigabytes(p.r.spec_served_bytes), p.r.loads_skipped, p.r.direct, seconds(p.r.wait_ns), seconds(p.r.in_flight_ns), seconds(p.wall_ns), busyPct(p.r.in_flight_ns, p.wall_ns), 100 - busyPct(p.r.in_flight_ns, p.wall_ns), if (p.spread) |sp| sp[0][1] else p.rows,
         });
-        if (p.rows_alt) |r2| try w.print(" / {d} rows per bank layer (its two Ks)", .{r2}) else try w.writeAll(" rows per layer");
+        if (p.spread) |sp| {
+            try w.print(" / {d} rows per bank layer (its two Ks, the medians; split: min / median / max {d} / {d} / {d} and {d} / {d} / {d})", .{ sp[1][1], sp[0][0], sp[0][1], sp[0][2], sp[1][0], sp[1][1], sp[1][2] });
+        } else if (p.rows_alt) |r2| try w.print(" / {d} rows per bank layer (its two Ks)", .{r2}) else try w.writeAll(" rows per layer");
         if (p.mem) |m| try w.print("; {f}", .{m});
         if (p.box) |b| try w.print("; the box {d:.3} GB used, the rest of it {d:.3} GB", .{ gigabytes(b.used), gigabytes(b.others) });
     }
