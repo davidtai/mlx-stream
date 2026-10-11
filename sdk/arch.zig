@@ -107,6 +107,9 @@ pub const Arch = struct {
     /// G4: the arch's terms of the composed bill (waves, KV by owner, prompt state, cache limits); null = none.
     /// Pure host: it may read the model's headers through `io`, never the device.
     bill: ?*const fn (gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill,
+    /// The most tokens a request may generate past its prompt, from the arch's config with the model's settings
+    /// applied (the host serves the billed prompts plus these); null = the plugin's `generation_headroom`.
+    max_output: ?*const fn (cfg: *const anyopaque) u64 = null,
     /// A resource the arch holds once per process (an expert reader): the host claims it at the load claim, before
     /// the preflight and the weights, and releases it when the loaded model goes (or the load fails). A second load
     /// that needs it is refused by the claim's error. Null = the arch claims nothing.
@@ -116,7 +119,8 @@ pub const Arch = struct {
     /// The table of `T`, a namespace declaring the arch (a missing or mistyped declaration is a compile error
     /// naming it): name, caps, claims, Config, parse, freeConfig, shell, applySettings, loadBytes, Module, init,
     /// deinit, prefill, step, position; optional (absent when undeclared or `{}`) promptBytes, handover, requestEnd,
-    /// restorePrefix (only with `owns_decode_state`), draft_lane, bill, and the pair claimProcess / releaseProcess.
+    /// restorePrefix (only with `owns_decode_state`), draft_lane, bill, maxOutput, and the pair claimProcess /
+    /// releaseProcess.
     pub fn of(comptime T: type) Arch {
         comptime {
             const w = "arch " ++ @typeName(T);
@@ -144,6 +148,7 @@ pub const Arch = struct {
                 check.fnDecl(w, T, "restorePrefix", &.{ *T.Module, []const u32 }, u64);
             }
             if (check.has(T, "bill")) check.fnDecl(w, T, "bill", &.{ Allocator, std.Io, *const bill.BillRequest }, bill.MemoryBill);
+            if (check.has(T, "maxOutput")) check.fnDecl(w, T, "maxOutput", &.{*const T.Config}, u64);
             if (check.has(T, "claimProcess") != check.has(T, "releaseProcess")) @compileError(w ++ ": claimProcess and releaseProcess come as a pair");
             if (check.has(T, "claimProcess")) {
                 check.fnDecl(w, T, "claimProcess", &.{}, void);
@@ -205,6 +210,9 @@ pub const Arch = struct {
             fn billOf(gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill {
                 return T.bill(gpa, io, req);
             }
+            fn maxOutput(cfg: *const anyopaque) u64 {
+                return T.maxOutput(constCfg(cfg));
+            }
             fn claimProcess() anyerror!void {
                 return T.claimProcess();
             }
@@ -232,6 +240,7 @@ pub const Arch = struct {
             .restore_prefix = if (check.has(T, "restorePrefix")) W.restorePrefix else null,
             .spec = if (check.has(T, "draft_lane")) .{ .draft_lane = spec.DraftLane.of(T.Module, T.draft_lane) } else .none,
             .bill = if (check.has(T, "bill")) W.billOf else null,
+            .max_output = if (check.has(T, "maxOutput")) W.maxOutput else null,
             .claim_process = if (check.has(T, "claimProcess")) W.claimProcess else null,
             .release_process = if (check.has(T, "claimProcess")) W.releaseProcess else null,
         };

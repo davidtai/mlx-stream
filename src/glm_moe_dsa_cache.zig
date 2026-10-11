@@ -1,9 +1,10 @@
 //! GLM-5.3's decode state: per layer the attention's KV as two bounded grow lanes (`sdk_ext.kv.Lanes(G).Grow`), the
 //! normalized latent `[1, rows, kv_lora_rank]` and the roped key `[1, rows, qk_rope_head_dim]`, and on each full
 //! indexer layer the indexer's roped key `[1, rows, index_head_dim]`; every lane bf16 as the projections produce it.
-//! Each lane is allocated once, at its first append, at the module's positions (the billed context and the generation
-//! headroom), and kept across requests: a later prompt truncates the lanes to the prefix it keeps (`truncateTo`) and
-//! appends after it. An append past the cap is refused by name (`BoundedLaneFull`).
+//! Every lane holds exactly `cap` positions: the module sets the cap per phase (`resize`: a prompt's positions at its
+//! pass, the request's prompt and generation at its decode handover), and a lane is allocated at its first append or
+//! moved to a buffer of the new cap with the rows it holds. A later prompt truncates the lanes to the prefix it keeps
+//! (`truncateTo`) and appends after it. An append past the cap is refused by name (`BoundedLaneFull`).
 
 const std = @import("std");
 const sdk_ext = @import("sdk_ext.zig");
@@ -23,6 +24,8 @@ pub fn Cache(comptime G: type) type {
         /// The positions every lane holds.
         len: u32 = 0,
         cap: u32,
+        /// One position's bytes in a latent, a rope and an index lane (bf16).
+        row_bytes: [3]u64,
 
         pub fn init(a: std.mem.Allocator, c: *const glm.Config, cap: u32) !Self {
             const n = c.n_layers;
@@ -36,7 +39,38 @@ pub fn Cache(comptime G: type) type {
                 rp.* = L.Grow.init(cap, cap);
                 ix.* = if (c.isFull(@intCast(l))) L.Grow.init(cap, cap) else null;
             }
-            return .{ .a = a, .latent = latent, .rope = rope, .index = index, .cap = cap };
+            return .{ .a = a, .latent = latent, .rope = rope, .index = index, .cap = cap, .row_bytes = .{ 2 * @as(u64, c.kv_lora_rank), 2 * @as(u64, c.qk_rope_head_dim), 2 * @as(u64, c.index_head_dim) } };
+        }
+
+        /// Every lane bounded at exactly `cap` positions (at least the positions held), layer by layer: a lane with
+        /// rows moves to a `cap`-row buffer, evaluated before the next layer's, so the old and the new buffers of one
+        /// layer at most are live at once. No-op at the same cap.
+        pub fn resize(self: *Self, g: *G, cap: u32) !void {
+            if (cap < self.len) return error.BoundedLaneFull;
+            for (self.latent, self.rope, self.index, 0..) |*lt, *rp, *ix, l| {
+                const m = g.mark();
+                defer g.resetTo(m);
+                try lt.resize(g, cap);
+                try rp.resize(g, cap);
+                if (ix.*) |*x| try x.resize(g, cap);
+                var bufs: [3]T = undefined;
+                const live = self.buffers(@intCast(l), &bufs);
+                if (live.len > 0) try g.evalAll(live);
+            }
+            self.cap = cap;
+        }
+
+        /// The bytes the lanes' buffers hold now, each rounded up to `page` as MLX allocates it.
+        pub fn allocatedBytes(self: *const Self, page: u64) u64 {
+            var n: u64 = 0;
+            for (self.latent, self.rope, self.index) |lt, rp, ix| {
+                if (lt.buf != null) n += bufferBytes(@as(u64, lt.cap) * self.row_bytes[0], page);
+                if (rp.buf != null) n += bufferBytes(@as(u64, rp.cap) * self.row_bytes[1], page);
+                if (ix) |x| if (x.buf != null) {
+                    n += bufferBytes(@as(u64, x.cap) * self.row_bytes[2], page);
+                };
+            }
+            return n;
         }
 
         pub fn deinit(self: *Self, g: *G) void {
@@ -108,4 +142,30 @@ pub fn Cache(comptime G: type) type {
             return c.kvPositionBytes();
         }
     };
+}
+
+/// An MLX buffer of `n` bytes as the Metal allocator takes it: past one page, rounded up to whole pages.
+pub fn bufferBytes(n: u64, page: u64) u64 {
+    return if (n > page) std.mem.alignForward(u64, n, page) else n;
+}
+
+/// The bytes the lanes hold at `cap` positions on every layer of `c` (`Cache.allocatedBytes` once every lane is
+/// allocated), each buffer rounded up to `page`.
+pub fn bytesAt(c: *const glm.Config, cap: u64, page: u64) u64 {
+    const per_layer = bufferBytes(cap * 2 * c.kv_lora_rank, page) + bufferBytes(cap * 2 * c.qk_rope_head_dim, page);
+    return c.n_layers * per_layer + c.nFull() * bufferBytes(cap * 2 * c.index_head_dim, page);
+}
+
+const testing = std.testing;
+
+test "glm cache: the lanes' bytes at a cap are whole pages per buffer; at page multiples, the position's bytes times the cap" {
+    const text = try glm.testConfigJson(testing.allocator, "");
+    defer testing.allocator.free(text);
+    var c = try glm.Config.parse(testing.allocator, text, &glm.glm53, null);
+    defer c.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 95_232 * 16384), bytesAt(&c, 16384, 16384));
+    // 17,412 positions: every lane's buffer rounds up to its next page.
+    try testing.expectEqual(78 * (std.mem.alignForward(u64, 17412 * 1024, 16384) + std.mem.alignForward(u64, 17412 * 128, 16384)) + 21 * std.mem.alignForward(u64, 17412 * 256, 16384), bytesAt(&c, 17412, 16384));
+    try testing.expect(bytesAt(&c, 17412, 16384) >= 95_232 * 17412);
+    try testing.expectEqual(@as(u64, 100), bufferBytes(100, 16384));
 }

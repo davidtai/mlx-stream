@@ -85,15 +85,10 @@ pub fn bankArraysOf(x: [n_components]mlx.mlx_array) BankArrays {
 /// A record's two read ranges.
 pub const Spans = struct { gu_offset: u64, down_offset: u64 };
 
-/// A bank's shape as the bill and the module read it (`Bank.geometryOf`).
-pub const Geometry = struct {
-    n_layers: u32,
-    n_experts: u32,
-    /// The widest record's logical bytes: one slot row of every component.
-    widest_record: u64 = 0,
-    /// The widest gate/up or down span (a read range, a staging buffer's content).
-    widest_span: u64 = 0,
-};
+/// A bank's slot geometry as the bill and the module read it (`Bank.geometryOf`): one stream layer per routed layer,
+/// one record per expert, one row per fill unit.
+pub const Geometry = glm.Geometry;
+pub const LayerSlots = glm.LayerSlots;
 
 /// The segment table of one record at `bits`, hidden `hidden`, intermediate `inter` (the contract's order), and its
 /// logical bytes; null for dims that do not pack at group 64.
@@ -176,6 +171,8 @@ pub const Bank = struct {
     n_experts: u32 = 0,
     /// The routed layers in model order: the bank's layer index is the stream's layer.
     layers: []Layer = &.{},
+    /// Each layer's slots (`geometryOf`): its logical bytes a row, its experts, one row a unit.
+    slots: []LayerSlots = &.{},
     /// sha256 of each record's logical bytes, [layer * n_experts + expert]; stored, not verified at open
     /// (`convert_glm_bank.py --verify` does).
     digests: [][32]u8 = &.{},
@@ -190,17 +187,19 @@ pub const Bank = struct {
     }
 
     /// The bank's geometry from its manifest alone (every rule but the sidecar's file), for the bill: no reader,
-    /// no descriptor.
+    /// no descriptor. Its layers in `allocator`.
     pub fn geometry(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, diag: ?*Diag) !Geometry {
         var b = try openWith(allocator, io, dir, c, diag, false);
         defer b.deinit();
-        return b.geometryOf();
+        var g = b.geometryOf();
+        g.layers = try allocator.dupe(LayerSlots, g.layers);
+        return g;
     }
 
-    /// What the bill and the stream's options read of a bank: its routed layers, experts, and its widest record's
-    /// bytes and read span (`Stream.stagingBytes`).
+    /// What the bill and the stream's options read of a bank: each routed layer's slots, and its widest record's bytes
+    /// and read span (`Stream.stagingBytes`). The layers borrow the bank's.
     pub fn geometryOf(self: *const Bank) Geometry {
-        var g: Geometry = .{ .n_layers = @intCast(self.layers.len), .n_experts = self.n_experts };
+        var g: Geometry = .{ .layers = self.slots, .widest_record = 0, .widest_span = 0 };
         for (self.layers) |l| {
             g.widest_record = @max(g.widest_record, l.logical_bytes);
             const gu = l.segments[gu_components].offset;
@@ -236,6 +235,7 @@ pub const Bank = struct {
     pub fn deinit(self: *Bank) void {
         if (self.sidecar.fd >= 0) self.sidecar.close();
         self.allocator.free(self.layers);
+        self.allocator.free(self.slots);
         self.allocator.free(self.digests);
         if (self.sidecar_path.len > 0) self.allocator.free(self.sidecar_path);
         self.* = undefined;
@@ -309,6 +309,8 @@ pub const Bank = struct {
                 return refuse(diag, error.LayerGeometry, manifest_file ++ ": layer {d} logical / record / base {d} / {d} / {d}, want {d} / {d} / {d}", .{ ml, lj.logical_bytes, lj.record_bytes, lj.base_offset, logical, record, base });
             l.* = .{ .model_layer = ml, .record_bytes = record, .logical_bytes = logical, .base_offset = base, .segments = want };
         }
+        self.slots = try a.alloc(LayerSlots, n_layers);
+        for (self.slots, self.layers) |*sl, l| sl.* = .{ .record_bytes = l.logical_bytes, .n_records = self.n_experts };
         // 4. The sidecar.
         const sc = m.sidecar;
         const total = @as(u64, n_layers) * d.n_experts * record;

@@ -12,7 +12,8 @@ const std = @import("std");
 
 /// The SDK's version. A plugin built against another major is refused (`negotiate`); a newer minor on either
 /// side is compatible (newer hooks are optional). 2.0: a draft lane's `round` takes the request's `SamplingParams`.
-pub const api: Version = .{ .major = 2, .minor = 0 };
+/// 2.1: an arch's optional `maxOutput` (the generation a request may take past its prompt).
+pub const api: Version = .{ .major = 2, .minor = 1 };
 
 /// Compile the registered plugins' profile probes in (`-Dplugin-profile=true`); off in every served build.
 pub const plugin_profile = false;

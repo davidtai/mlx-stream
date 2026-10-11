@@ -17,6 +17,7 @@ const expert_io = sdk_ext.expert.io;
 const quant = sdk_ext.quant;
 const glm = @import("glm_moe_dsa.zig");
 const affine = @import("glm_moe_dsa_bank.zig");
+const bill_units = @import("glm_moe_dsa_bill.zig");
 const sushi = @import("mlx_host").sushi_exl3;
 
 pub const format = "mlx-stream-expert-manifest-exl3-v1";
@@ -104,7 +105,8 @@ pub fn bankArraysOf(x: [n_components]mlx.mlx_array) BankArrays {
 }
 
 pub const Spans = affine.Spans;
-pub const Geometry = affine.Geometry;
+pub const Geometry = glm.Geometry;
+pub const LayerSlots = glm.LayerSlots;
 pub const Diag = @import("sdk").Diag;
 
 /// Segment `ci`'s shape (gate / up: in = hidden, out = mini; down: in = mini, out = hidden; code = trellis
@@ -192,6 +194,8 @@ pub const Bank = struct {
     local: []u16 = &.{},
     /// [routed layer * n_experts + expert]: the expert's bank layer of its routed layer (0: the first, 1: the second).
     side: []u1 = &.{},
+    /// Each stream layer's slots (`geometryOf`): an expert's minis a row, its experts, its share of the units.
+    slots: []LayerSlots = &.{},
     sidecar_path: [:0]const u8 = "",
     sidecar: expert_io.UncachedFd = .{ .fd = -1, .size = 0 },
 
@@ -199,18 +203,21 @@ pub const Bank = struct {
         return openWith(allocator, io, dir, c, diag, true);
     }
 
-    /// The bank's geometry from its manifest alone (no sidecar descriptor), for the bill.
+    /// The bank's geometry from its manifest alone (no sidecar descriptor), for the bill. Its layers in `allocator`.
     pub fn geometry(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, diag: ?*Diag) !Geometry {
         var b = try openWith(allocator, io, dir, c, diag, false);
         defer b.deinit();
-        return b.geometryOf();
+        var g = b.geometryOf();
+        g.layers = try allocator.dupe(LayerSlots, g.layers);
+        return g;
     }
 
-    /// What the bill reads: the routed layers; the fill's units (`maxUnits`); one slot of every geometry as the
-    /// widest record (each geometry's transient scratch holds `max_route_ids` of its own), so `n_layers x
-    /// widest_record` bounds a unit's bytes (`rowsAt` rounds each bank layer's rows down); the widest mini range.
+    /// What the bill reads (`glm_moe_dsa.Geometry`): each stream layer's slots (one row an expert's minis, its experts,
+    /// its share of a unit: its experts over `maxUnits`); one slot of every geometry as the widest record (each geometry's
+    /// transient scratch holds its own rows, the bill charges them all at it); the widest mini range. The layers borrow
+    /// the bank's.
     pub fn geometryOf(self: *const Bank) Geometry {
-        var g: Geometry = .{ .n_layers = @intCast(self.layers.len / banks_per_layer), .n_experts = self.maxUnits() };
+        var g: Geometry = .{ .layers = self.slots, .widest_record = 0, .widest_span = 0 };
         if (self.layers.len == 0) return g;
         for (self.layers[0..banks_per_layer]) |*l| g.widest_record += @as(u64, l.minis) * l.logical_bytes;
         for (self.layers) |*l| {
@@ -236,6 +243,7 @@ pub const Bank = struct {
         self.allocator.free(self.layers);
         self.allocator.free(self.local);
         self.allocator.free(self.side);
+        self.allocator.free(self.slots);
         if (self.sidecar_path.len > 0) self.allocator.free(self.sidecar_path);
         self.* = undefined;
     }
@@ -357,6 +365,8 @@ pub const Bank = struct {
             base += lj.n_minis * lj.record_bytes;
             n_minis += lj.n_minis;
         }
+        self.slots = try gpa.alloc(LayerSlots, n_stream);
+        for (self.slots, self.layers[0..n_stream]) |*sl, l| sl.* = .{ .record_bytes = @as(u64, l.minis) * l.logical_bytes, .n_records = l.n_held, .share = @as(f64, @floatFromInt(l.n_held)) / @as(f64, @floatFromInt(ne / banks_per_layer)) };
         // 4. The experts map: each routed layer's experts at their bank layer's K and local index.
         for (routed, 0..) |ml, r| {
             var kb: [16]u8 = undefined;
@@ -610,8 +620,15 @@ test "glm exl3 bank: a clean synthetic bank opens: the stream layers, each exper
     b.rowsAt(5, &rows);
     for (rows) |r| try testing.expectEqual(@as(u32, 5), r);
     const g = b.geometryOf();
-    try testing.expectEqual(@as(u32, 4), g.n_layers);
+    // Eight stream layers: each an expert's four minis a row, its eight experts, one of them a unit.
+    try testing.expectEqual(@as(usize, 8), g.layers.len);
+    try testing.expectEqual(glm.LayerSlots{ .record_bytes = 4 * ms3.logical, .n_records = 8, .share = 1 }, g.layers[0]);
+    try testing.expectEqual(glm.LayerSlots{ .record_bytes = 4 * ms4.logical, .n_records = 8, .share = 1 }, g.layers[1]);
     try testing.expectEqual(4 * (ms3.logical + ms4.logical), g.widest_record);
+    // The bill's units and rows agree with the bank's own.
+    try testing.expectEqual(b.maxUnits(), bill_units.maxUnits(g));
+    var brows: [8]u32 = undefined;
+    try testing.expectEqualSlices(u32, &rows, bill_units.rowsAt(g, 5, &brows));
     try testing.expect(present(try tmpRoot(&tmp, &rbuf)));
     // GLM-5.3's split: 148 K3 and 108 K4 experts, units of 1/128 of each, rounded down.
     var two = [2]Layer{ b.layers[0], b.layers[1] };
@@ -625,6 +642,15 @@ test "glm exl3 bank: a clean synthetic bank opens: the stream layers, each exper
     try testing.expectEqualSlices(u32, &.{ 148, 108 }, &r2);
     glm53.rowsAt(16, &r2);
     try testing.expectEqualSlices(u32, &.{ 18, 13 }, &r2);
+    // The bill's at the same shares: the same rows, and a unit's exact bytes (the shares of both bank layers' slots).
+    const s53 = [2]glm.LayerSlots{ .{ .record_bytes = 4 * ms3.logical, .n_records = 148, .share = 148.0 / 128.0 }, .{ .record_bytes = 4 * ms4.logical, .n_records = 108, .share = 108.0 / 128.0 } };
+    const g53: glm.Geometry = .{ .layers = &s53, .widest_record = 4 * (ms3.logical + ms4.logical), .widest_span = 0 };
+    for ([_]u32{ 16, 100, 128 }) |u| {
+        glm53.rowsAt(u, &r2);
+        var o2: [2]u32 = undefined;
+        try testing.expectEqualSlices(u32, &r2, bill_units.rowsAt(g53, u, &o2));
+    }
+    try testing.expectEqual(@as(u32, 128), bill_units.maxUnits(g53));
 }
 
 test "glm exl3 bank: every rule of the pack's contract refuses by name" {

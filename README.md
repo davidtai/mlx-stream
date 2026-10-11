@@ -194,6 +194,7 @@ Settings (`model-settings.json`):
 | key | values | default |
 |---|---|---|
 | `ctx_size` | the longest prompt the load bills, 1 to 1,048,576 | 16,384 |
+| `max_output` | the most tokens a request may generate past its prompt, 1 to 1,048,576 | 131,072 |
 | `numeric_tier` | `stock` (the reference's op chain) | `stock` |
 | `expert_event_gates` | the GPU waits on the reads' events (`true`) or the host waits (`false`) | `true` |
 | `layer_major_prefill` | the prompt layer by layer (`true`) or chunk by chunk (`false`) | `true` |
@@ -204,23 +205,40 @@ Settings (`model-settings.json`):
 | `expert_lookahead_budget` | the decode lookahead's records read ahead per routed call, 1 to 4 | 2 |
 | `expert_lookahead_max_rank` | the decode lookahead reads ahead only the candidates at the first N top-k positions of their row, 1 to 8 | all |
 
-Memory: one slot row is one 21.2 MB record on each of the 75 routed layers (1.59 GB). The KV costs 95,232 B per
-position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16),
-held for the billed context plus 8,192 generated positions. The bill also charges the residents (from the shard
-headers), the prompt and decode transients, the MLX cache limits (2 GiB in the prompt pass, 512 MiB in decode),
-the read pool's staging and a host-side bound. The ceiling comes from the host only; the plugin sets no cap of its own.
-At a 240 GiB ceiling, a 2 GiB margin, a 10 GB baseline and the mixed build's 20.1 GB of residents, the 16K bill fills
-127 prompt and 137 decode rows per layer.
+Memory: the fill counts units of slot rows. On the affine bank a unit is one 21.2 MB record on each of the 75 routed
+layers (1.59 GB); on the EXL3 bank (`expert-manifest-exl3-v1.json`) a unit is each bank layer's share of its experts,
+rounded down (148 K3 and 108 K4 experts per routed layer over 128 units: 1.15625 slots of 14.3 MB and 0.84375 of
+19.0 MB, 2.45 GB a unit). The KV costs 95,232 B per
+position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16).
+The KV lanes hold only the current phase's positions: the prompt's during its pass, and from the decode handover the
+request's own prompt and `max_tokens`. The bill also charges the residents (from the shard headers), the prompt and
+decode transients, decode's transient window (the routed ids of the widest decode call: 8 rows serial, 8 per verify
+row with the MTP lane), the MLX cache limits (2 GiB in the prompt pass, 512 MiB in decode, each plus one freed
+buffer), the read pool's staging and the host side (the footprint outside MLX, 1.5 GB, measured on the box).
+
+The construction admits both phases of the longest request (the billed context and `max_output` generated tokens)
+under the box's target and fills the prompt rows to it. The box's target is the RAM less a 16 GiB OS reserve (the
+free pages and the file cache the box keeps), and at most what keeps the process's GPU memory within the host's
+ceiling less its wired margin. At that fill the box's wired pages pass macOS's default limit on user-wired memory
+(88 % of the RAM, vm.global_user_wire_limit), past which decode runs at half speed: raise it above them (95 % on the
+256 GB M5 Ultra). At the decode handover the module frees the prompt's transients, waits until the footprint shows
+the frees, reads its footprint and the box's used memory, and grows the decode rows to the most that the bill at the
+request's own KV and that reading both keep under the box's target, with MLX's bytes within the GPU's. The rest of
+the box is read again at each handover, so a short request decodes with more rows than the longest one. Each handover
+logs one `glm_moe_dsa: handover` line with its readings and the rows; the construction logs one `glm_moe_dsa: bill`
+line with every term and checks its footprint against the bill's construction terms (`ConstructionOverBill`). The
+ceiling comes from the host only. The arch declares `max_output` to the host (`maxOutput`, SDK 2.1).
 
 Each request logs one `glm_moe_dsa: prompt` line at the end of its prompt pass and one `glm_moe_dsa: decode` line at
 its end (the arch's `requestEnd`), with the phase's wall time, SSD bytes, records read, read-ahead or lookahead use,
 host wait on reads, and in decode the hits, misses and hit rate per layer (min, median, max), the SSD bytes per
 emitted token, the lookahead's records (used, landed, expired, abandoned, cancelled, discarded, used while still read)
-and its bytes read and served, and the share of the decode with a read in flight. A `glm_moe_dsa: decode host split`
-line gives the decode lane's host time: the routing barriers' waits, the routes, the waves' encode. A `glm_moe_dsa:
-lookahead precision` line gives, per top-k position of the candidate's best row (and per bank layer with the EXL3
-bank), the records read ahead and how many of them the next routed layer's call routed. With the EXL3 bank, the
-prompt line also counts the prefill GEMM calls and the GPU drains.
+and its bytes read and served, and the share of the decode with a read in flight; each line ends with the phase's
+memory: MLX's active and peak bytes and its cache, the footprint and its peak, and the host side. A `glm_moe_dsa:
+decode host split` line gives the decode lane's host time: the routing barriers' waits, the routes, the waves' encode.
+A `glm_moe_dsa: lookahead precision` line gives, per top-k position of the candidate's best row (and per bank layer
+with the EXL3 bank), the records read ahead and how many of them the next routed layer's call routed. With the EXL3
+bank, the prompt line also counts the prefill GEMM calls and the GPU drains.
 
 The residency policy forgets its residents and its prompt state at each prompt (`LayerPolicy.forgetAll` at the
 reverse phase change). The decode policy's transition counts and its window carry over from one request to the next.
