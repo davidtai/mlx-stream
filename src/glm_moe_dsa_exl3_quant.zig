@@ -106,7 +106,6 @@ pub fn Accepted(comptime G: type) type {
         pub fn prefill(self: *Self, g: *G, layer: u32, x: G.T, rows: quant.PrefillRows, bank: Bank) !G.T {
             _ = layer;
             const n = rows.slot.len;
-            if (n > sushi.kernels.DECODE_ROWS_MAX and self.tabledKernel(g) != null) return self.prefillTabled(g, x, rows, bank);
             try self.src.resize(self.a, n);
             for (self.src.items, 0..) |*s, i| s.* = if (rows.act_row) |ar| ar[i] else @intCast(i);
             const xs = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(self.src.items), &.{@intCast(n)}, .uint32), 0);
