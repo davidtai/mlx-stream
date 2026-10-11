@@ -202,6 +202,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         probe: ?*graph.WaveProbe = null,
         /// The positions the request's KV lanes hold since its handover (its decode terms' KV).
         decode_positions: u64 = 0,
+        /// Diagnostic: the step-tail stamps summed over the request's rounds (timeline clock, ns), and the last round's end.
+        tail: TailDiag = .{},
+        tail_end: u64 = 0,
 
         const DecodeMark = struct { s0: Stats, mem0: Mem, by0: Bk.Stream.ByRank, steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0 };
 
@@ -641,6 +644,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             };
             self.decode_mark = .{ .s0 = self.stream.stats(), .mem0 = Mem.now(), .by0 = self.stream.lookaheadByRank() };
             self.ex.host = .{};
+            self.tail = .{};
+            self.tail_end = 0;
             if (self.mtp) |ln| ln.counts = .{};
             for (self.layer_counts0, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
         }
@@ -685,6 +690,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }});
             self.phaseRecord("decode", self.requestTerms(), null);
             log.info("{f}\n", .{HostLine{ .h = self.ex.host, .wall_ns = d.wall_ns }});
+            log.info("{f}\n", .{self.tail});
             const by1 = self.stream.lookaheadByRank();
             log.info("{f}\n", .{PrecisionLine{ .by0 = &d.by0, .by1 = &by1 }});
             if (self.recorder) |rec| self.writeRoutes(rec);
@@ -764,6 +770,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// `mtpRound` with a test's `probe`.
         pub fn roundWith(self: *Self, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams, probe: ?*Probe) !sdk.DraftRound {
             const ln = self.mtp orelse return error.NoDraftLane;
+            const s0 = timeline.now();
             if (comptime timeline.enabled) timeline.cycleBegin();
             const t0 = self.nowNs();
             const peak0 = self.g.peakFrom();
@@ -776,6 +783,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const drafts = ids[1..][0..depth];
             if (depth > 0) try ln.draft(&self.g, a, &self.w, self.history.items[ln.cache.len + 1 .. len], t1, depth, drafts, if (probe) |p| p.force else &.{}, if (probe) |p| p.logits else null);
             const t_draft = self.nowNs();
+            const s1 = timeline.now();
             if (probe) |p| {
                 p.depth = depth;
                 @memcpy(p.drafts[0..depth], drafts);
@@ -784,21 +792,35 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             defer self.g.resetTo(m0);
             self.ex.row_bytes = @splat(0);
             if (comptime timeline.enabled) timeline.verifyBegin();
+            const h0 = self.ex.host;
+            self.ex.round_first = 0;
+            self.ex.round_last = 0;
             const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, self.routes, .{ .verify = true, .hidden = true });
             defer self.g.release(out.logits);
             defer self.g.release(out.hidden.?);
             // The decision's arrays in the verify's eval: the GPU goes on from the logits to the decision with no
             // round trip to the host between them.
             const dp = try mtp_mod.prepare(&self.g, out.logits, drafts, ln.mode, sampling, len);
+            const s2 = timeline.now();
             try self.g.evalAll(&.{ out.logits, out.hidden.?, dp.tok, dp.flags orelse dp.tok });
+            const s3 = timeline.now();
             if (comptime timeline.enabled) timeline.verifyEnd();
             try self.ex.flush();
             const t_verify = self.nowNs();
+            const s4 = timeline.now();
+            const waits0 = self.g.waits;
             const d = try dp.read(&self.g);
+            const s5 = timeline.now();
+            // the read is one part (`argmax` in the tail line)
+            const dd = [2]u64{ s5, s5 };
             self.cache.truncateTo(len + 1 + d.accepted);
+            const s6 = timeline.now();
             try self.history.appendSlice(self.gpa, ids[0 .. 1 + d.accepted]);
+            const s7 = timeline.now();
             const rows = d.accepted + 1;
             try ln.pend(&self.g, self.cache.len, try graph.rowSlice(&self.g, out.hidden.?, 0, @intCast(rows)), rows, depth == 0);
+            const s8 = timeline.now();
+            const tail_waits = self.g.waits - waits0;
             const tokens = try a.dupe(u32, ids[0..rows]);
             const ns = self.nowNs() - t0;
             ln.counts.rounds += 1;
@@ -819,12 +841,48 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 ln.counts.decided[mtp_mod.tenth(tp)] += 1;
                 if (i < d.accepted) ln.counts.accepted_by_p[mtp_mod.tenth(tp)] += 1;
             }
+            const s9 = timeline.now();
             if (self.recorder) |rec| rec.endStep(depth + 1, depth, d.accepted, rows, ns);
+            const s10 = timeline.now();
             if (self.decode_mark) |*dm| {
                 dm.steps += 1;
                 dm.tokens += rows;
                 dm.wall_ns += ns;
             }
+            const s11 = timeline.now();
+            if (self.decode_mark != null and depth > 0) {
+                const tl = &self.tail;
+                const h1 = self.ex.host;
+                tl.rounds += 1;
+                if (self.tail_end != 0) {
+                    tl.between += s0 -| self.tail_end;
+                    tl.between_rounds += 1;
+                }
+                tl.draft += s1 -| s0;
+                const first = if (self.ex.round_first != 0) self.ex.round_first else s2;
+                const last = if (self.ex.round_last != 0) self.ex.round_last else s2;
+                tl.pre_routed += first -| s1;
+                tl.routed += last -| first;
+                tl.barrier += h1.barrier_ns -| h0.barrier_ns;
+                tl.route += h1.route_ns -| h0.route_ns;
+                tl.wave += h1.wave_ns -| h0.wave_ns;
+                tl.post_routed += s2 -| last;
+                tl.final_wait += s3 -| s2;
+                tl.flush += s4 -| s3;
+                tl.argmax += dd[0] -| s4;
+                tl.flags += dd[1] -| dd[0];
+                tl.decide_rest += s5 -| dd[1];
+                tl.truncate += s6 -| s5;
+                tl.history += s7 -| s6;
+                tl.pend += s8 -| s7;
+                tl.book += s9 -| s8;
+                tl.recorder += s10 -| s9;
+                tl.mark += s11 -| s10;
+                tl.wall += s11 -| s0;
+                tl.tail_waits += tail_waits;
+                tl.final_wait_max = @max(tl.final_wait_max, s3 -| s2);
+            }
+            self.tail_end = timeline.now();
             return .{ .tokens = tokens, .accepted = d.accepted, .next_token = d.next };
         }
     };
@@ -1071,6 +1129,50 @@ pub const DecodeLine = struct {
         } else if (p.rows_alt) |r2| try w.print(" / {d} rows per bank layer (its two Ks)", .{r2}) else try w.writeAll(" rows per layer");
         if (p.mem) |m| try w.print("; {f}", .{m});
         if (p.box) |b| try w.print("; the box {d:.3} GB used, the rest of it {d:.3} GB", .{ gigabytes(b.used), gigabytes(b.others) });
+    }
+};
+
+/// Diagnostic: a request's drafted rounds split by host stamps (timeline clock), in ms per round at its end. `between`:
+/// from a round's end to the next round's start (the host's loop, outside the module's wall).
+pub const TailDiag = struct {
+    rounds: u64 = 0,
+    between_rounds: u64 = 0,
+    between: u64 = 0,
+    draft: u64 = 0,
+    pre_routed: u64 = 0,
+    routed: u64 = 0,
+    barrier: u64 = 0,
+    route: u64 = 0,
+    wave: u64 = 0,
+    post_routed: u64 = 0,
+    final_wait: u64 = 0,
+    final_wait_max: u64 = 0,
+    flush: u64 = 0,
+    argmax: u64 = 0,
+    flags: u64 = 0,
+    decide_rest: u64 = 0,
+    truncate: u64 = 0,
+    history: u64 = 0,
+    pend: u64 = 0,
+    book: u64 = 0,
+    recorder: u64 = 0,
+    mark: u64 = 0,
+    wall: u64 = 0,
+    tail_waits: u64 = 0,
+
+    pub fn format(p: TailDiag, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const n: f64 = @floatFromInt(@max(p.rounds, 1));
+        const nb: f64 = @floatFromInt(@max(p.between_rounds, 1));
+        const ms = struct {
+            fn f(x: u64, k: f64) f64 {
+                return @as(f64, @floatFromInt(x)) / 1e6 / k;
+            }
+        }.f;
+        try w.print("glm_moe_dsa: step tail (diag) over {d} drafted rounds, ms per round: wall {d:.3}, draft {d:.3}, pre-routed {d:.3}, routed span {d:.3} (barrier {d:.3}, routes {d:.3}, waves {d:.3}), post-routed build {d:.3}, final eval wait {d:.3} (max {d:.3}), flush {d:.3}, decide argmax read {d:.3}, flags read {d:.3}, decide rest {d:.4}, truncate {d:.4}, history {d:.4}, pend {d:.3}, bookkeeping {d:.4}, recorder {d:.4}, mark {d:.4}; GPU waits after the verify {d:.2} per round; between rounds {d:.3} over {d}", .{
+            p.rounds,             ms(p.wall, n),       ms(p.draft, n),          ms(p.pre_routed, n), ms(p.routed, n), ms(p.barrier, n),                          ms(p.route, n),       ms(p.wave, n),
+            ms(p.post_routed, n), ms(p.final_wait, n), ms(p.final_wait_max, 1), ms(p.flush, n),      ms(p.argmax, n), ms(p.flags, n),                            ms(p.decide_rest, n), ms(p.truncate, n),
+            ms(p.history, n),     ms(p.pend, n),       ms(p.book, n),           ms(p.recorder, n),   ms(p.mark, n),   @as(f64, @floatFromInt(p.tail_waits)) / n, ms(p.between, nb),    p.between_rounds,
+        });
     }
 };
 

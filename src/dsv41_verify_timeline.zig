@@ -15,9 +15,10 @@ pub var active: bool = false;
 
 /// Cycles <= max_tokens - 1 (the cell's default cap: 1,024 ids).
 pub const max_cycles = 1024;
-pub const max_layers = @import("deepseek_v41.zig").max_layers;
+/// Diagnostic build: 80, so GLM-5.3's 75 routed layers are all stamped (DeepSeek-V4.1 has 64).
+pub const max_layers = 80;
 /// Buffers past this are counted (`dropped`), not recorded.
-pub const max_buffers = 1 << 18;
+pub const max_buffers = 1 << 19;
 
 /// One committed command buffer (the shim's `Dsv41tlRow`). Times: mach_absolute_time ns.
 /// `queue`: 1 for the queue of the buffer the install saw (MLX's stream), 0 for another queue.
@@ -560,9 +561,9 @@ pub fn writeJson(w: *std.Io.Writer) !void {
 }
 
 test "dsv41 verify timeline: a default build stamps nothing and links no shim; the storage bound is static" {
-    try std.testing.expectEqual(@as(usize, (1 << 18) * 56 + 1024 * (64 * @sizeOf(Layer) + 16) + (1 << 17) * 32), storage_bytes);
+    try std.testing.expectEqual(@as(usize, (1 << 19) * 56 + 1024 * (80 * @sizeOf(Layer) + 16) + (1 << 17) * 32), storage_bytes);
     try std.testing.expectError(error.TimelineCycles, bound(1026, 40));
-    try std.testing.expectError(error.TimelineLayers, bound(1024, 65));
+    try std.testing.expectError(error.TimelineLayers, bound(1024, 81));
     try bound(1024, 40);
     if (enabled) return error.SkipZigTest;
     try std.testing.expect(!@hasDecl(c, "dsv41tl_install"));
