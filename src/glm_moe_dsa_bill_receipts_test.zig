@@ -87,8 +87,54 @@ const Receipt = struct {
     records: [4]PhaseRecord,
 };
 
-/// The box's runs of this bill (`receipt.py` over each run's serve.log).
-const receipts = [_]Receipt{};
+/// The box's runs of this bill (`receipt.py` over each run's serve.log): the B runs of the ABBA
+/// cache-rows-bc548c4-vs-e1de350-floor21 (plugin bc548c4: seeds 1234 and 4321, the coding workload, the rest of the
+/// box billed at its 21 GB floor). Their bill-at-the-request line predates the pending rows' print; the lane held one
+/// row past the prompt's append.
+const receipts = [_]Receipt{
+    .{
+        .name = "floor21-run2-seed1234",
+        .gemm = .glm53,
+        .select = .kernel,
+        .baseline = 21000000000,
+        .units = .{ .prompt = 72, .decode = 79 },
+        .target = 257698037760,
+        .request = .{ .positions = 17415, .pending_rows = 1, .others = 21000000000, .target = 257698037760, .bytes = 32253170702 },
+        .positions = 17415,
+        .bill_bytes = 32253170702,
+        .live_bytes = 32312681038,
+        .grown = 85,
+        .grown_bytes = 32250150912,
+        .file_backed_start = 15158706176,
+        .records = .{
+            .{ .phase = "module constructed", .billed = .{ .slot_rows = 174768537600, .transient_rows = 8003911680, .mtp_residents = 4752870912, .pool_staging = 102141952, .host_side = 900000000 }, .measured = .{ .footprint = 188134587040, .interval_peak = 188134587040, .mlx_active = 187525320200, .mlx_cache = 0, .mlx_peak = 187525320200, .physical = 221517692928, .file_backed = 15158804480, .speculative = 231604224, .residual = 392875104, .mlx_residual = -8 } },
+            .{ .phase = "prompt pass", .billed = .{ .slot_rows = 174768537600, .transient_rows = 8003911680, .residents = 20187962880, .mtp_residents = 4752870912, .kv = 1567014912, .mtp_kv = 23166976, .mtp_pending = 202113024, .waves = 7586283520, .mlx_cache = 17179869184, .mlx_cache_overshoot = 603979776, .pool_staging = 102141952, .host_side = 950000000, .wire_tables = 344168288 }, .measured = .{ .footprint = 227528753680, .interval_peak = 228634378000, .mlx_active = 209242037696, .mlx_cache = 17358983688, .mlx_peak = 215284873940, .physical = 261189074944, .file_backed = 15159492608, .speculative = 231587840, .residual = 7637642704, .mlx_residual = 1806987564 } },
+            .{ .phase = "handover", .billed = .{ .slot_rows = 207018688512, .transient_rows = 1067188224, .residents = 20187962880, .mtp_residents = 4752870912, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 1572864, .waves = 207337122, .mlx_cache = 268435456, .mlx_cache_overshoot = 8916480, .pool_staging = 102141952, .host_side = 1050000000, .wire_tables = 344640888 }, .measured = .{ .footprint = 235584355320, .interval_peak = 235584355320, .mlx_active = 234654031296, .mlx_cache = 2016, .mlx_peak = 234654031308, .physical = 269260472320, .file_backed = 15159476224, .speculative = 231555072, .residual = 1110658210, .mlx_residual = 266847446 } },
+            .{ .phase = "decode", .billed = .{ .slot_rows = 207018688512, .transient_rows = 1067188224, .residents = 20187962880, .mtp_residents = 4752870912, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 1572864, .waves = 207337122, .mlx_cache = 268435456, .mlx_cache_overshoot = 8916480, .pool_staging = 102141952, .host_side = 1050000000, .wire_tables = 344640888 }, .measured = .{ .footprint = 235938748376, .interval_peak = 235986278336, .mlx_active = 234654083960, .mlx_cache = 268478128, .mlx_peak = 234700884020, .physical = 269973569536, .file_backed = 15169683456, .speculative = 249495552, .residual = 708735194, .mlx_residual = 219994734 } },
+        },
+    },
+    .{
+        .name = "floor21-run3-seed4321",
+        .gemm = .glm53,
+        .select = .kernel,
+        .baseline = 21000000000,
+        .units = .{ .prompt = 72, .decode = 79 },
+        .target = 257698037760,
+        .request = .{ .positions = 17415, .pending_rows = 1, .others = 21000000000, .target = 257698037760, .bytes = 32253170702 },
+        .positions = 17415,
+        .bill_bytes = 32253170702,
+        .live_bytes = 32312696678,
+        .grown = 85,
+        .grown_bytes = 32250150912,
+        .file_backed_start = 15169667072,
+        .records = .{
+            .{ .phase = "module constructed", .billed = .{ .slot_rows = 174768537600, .transient_rows = 8003911680, .mtp_residents = 4752870912, .pool_staging = 102141952, .host_side = 900000000 }, .measured = .{ .footprint = 188134292080, .interval_peak = 188134292080, .mlx_active = 187525320200, .mlx_cache = 0, .mlx_peak = 187525320200, .physical = 222128668672, .file_backed = 15169994752, .speculative = 249610240, .residual = 393170064, .mlx_residual = -8 } },
+            .{ .phase = "prompt pass", .billed = .{ .slot_rows = 174768537600, .transient_rows = 8003911680, .residents = 20187962880, .mtp_residents = 4752870912, .kv = 1567014912, .mtp_kv = 23166976, .mtp_pending = 202113024, .waves = 7586283520, .mlx_cache = 17179869184, .mlx_cache_overshoot = 603979776, .pool_staging = 102141952, .host_side = 950000000, .wire_tables = 344168288 }, .measured = .{ .footprint = 227529982312, .interval_peak = 228514430568, .mlx_active = 209242022056, .mlx_cache = 17360719826, .mlx_peak = 215284858300, .physical = 261870174208, .file_backed = 15170158592, .speculative = 249528320, .residual = 7757590136, .mlx_residual = 1807003204 } },
+            .{ .phase = "handover", .billed = .{ .slot_rows = 207018688512, .transient_rows = 1067188224, .residents = 20187962880, .mtp_residents = 4752870912, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 1572864, .waves = 207337122, .mlx_cache = 268435456, .mlx_cache_overshoot = 8916480, .pool_staging = 102141952, .host_side = 1050000000, .wire_tables = 344640888 }, .measured = .{ .footprint = 235584043880, .interval_peak = 235584043880, .mlx_active = 234654015656, .mlx_cache = 2016, .mlx_peak = 234654015668, .physical = 269938540544, .file_backed = 15170158592, .speculative = 249528320, .residual = 1110969650, .mlx_residual = 266863086 } },
+            .{ .phase = "decode", .billed = .{ .slot_rows = 207018688512, .transient_rows = 1067188224, .residents = 20187962880, .mtp_residents = 4752870912, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 1572864, .waves = 207337122, .mlx_cache = 268435456, .mlx_cache_overshoot = 8916480, .pool_staging = 102141952, .host_side = 1050000000, .wire_tables = 344640888 }, .measured = .{ .footprint = 235964602112, .interval_peak = 235984049896, .mlx_active = 234654051936, .mlx_cache = 270195652, .mlx_peak = 234734817048, .physical = 270445281280, .file_backed = 15114108928, .speculative = 192380928, .residual = 710963634, .mlx_residual = 186061706 } },
+        },
+    },
+};
 
 /// MLX's bytes the host holds before the module allocates: mlx-serve seeds MLX's default random key at its start
 /// (`mlx_random_seed`: an array of 2 uint32). They sit in the load's baseline (the box before the load), not in the
