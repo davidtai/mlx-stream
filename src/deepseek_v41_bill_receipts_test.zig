@@ -8,11 +8,12 @@ const sdk = @import("sdk");
 const bill = @import("deepseek_v41_bill.zig");
 const module = @import("deepseek_v41_module.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
+const phase_mem = @import("phase_memory.zig");
 
 const testing = std.testing;
 
-/// A phase record's measured side (`PhaseMemory`), as the receipt printed it.
-const Record = struct { footprint: u64, interval_peak: u64, mlx_active: u64, mlx_cache: u64, mlx_peak: u64, physical: u64, file_backed: u64, speculative: u64, residual: i64, mlx_residual: i64 };
+/// A phase record's measured side (`PhaseMemory`), as the receipt printed it (`phase_memory.Measured`).
+const Record = phase_mem.Measured;
 
 const Receipt = struct {
     name: []const u8,
@@ -232,10 +233,7 @@ fn atRows(b: bill.Bill, rows: arm_mod.NativeRows) bill.Bill {
 
 fn expectRecord(phase: []const u8, billed: bill.PhaseTerms, m: Record, file_backed_start: u64) !void {
     const pm: sdk.memory.ProcessMemory = .{ .footprint = m.footprint, .footprint_interval_peak = m.interval_peak };
-    const r = bill.recordOf(phase, billed, pm, m.mlx_active, m.mlx_cache, m.mlx_peak, m.physical, m.file_backed, m.speculative, file_backed_start, 0);
-    try testing.expectEqual(m.residual, r.residual_bytes);
-    try testing.expectEqual(m.mlx_residual, r.mlx_residual_bytes);
-    try testing.expectEqual(@as(i64, @intCast(m.file_backed)) - @as(i64, @intCast(file_backed_start)), r.file_cache_created_bytes);
+    try phase_mem.expectMeasured(bill.recordOf(phase, billed, pm, m.mlx_active, m.mlx_cache, m.mlx_peak, m.physical, m.file_backed, m.speculative, file_backed_start, 0), m, file_backed_start);
 }
 
 test "dsv41 memory receipts: each served cell's phase terms, wiring tables and residuals rebuild from its bill, to the byte" {
@@ -284,8 +282,8 @@ test "dsv41 memory receipts: the fill at each cell's baseline gives the start ru
         try testing.expectEqual(want, try bill.fillOf(fb, target, n_experts));
         const mb = try bill.memoryBill(testing.allocator, b);
         defer mb.free(testing.allocator);
-        const got = try sdk.fill(mb, b.baseline, target, n_experts, bill.min_fill_rows);
-        try testing.expectEqual(want, arm_mod.NativeRows{ .prefill = got.prompt, .decode = got.decode });
+        // The SDK's view: the same rows, and its edge (`phase_memory.expectFillEdge`, the GLM receipts' check too).
+        try phase_mem.expectFillEdge(mb, b.baseline, target, n_experts, bill.min_fill_rows, .{ .prompt = want.prefill, .decode = want.decode });
         // The fill's rows are admitted; a decode row more is over the target, and so is a prompt row more.
         const at = atRows(b, want);
         try bill.admitOf(at, target);
@@ -293,8 +291,6 @@ test "dsv41 memory receipts: the fill at each cell's baseline gives the start ru
         try testing.expectEqual(at.prefillTotal(), fb.total(false, want.prefill));
         try testing.expectError(error.DecodeOverTarget, bill.admitOf(atRows(b, .{ .prefill = want.prefill, .decode = want.decode + 1 }), target));
         try testing.expectError(error.PromptOverTarget, bill.admitOf(atRows(b, .{ .prefill = want.prefill + 1, .decode = want.decode }), target));
-        try testing.expectError(error.DecodeOverTarget, sdk.admit(mb, b.baseline, .{ .prompt = want.prefill, .decode = want.decode + 1 }, target));
-        try testing.expectError(error.PromptOverTarget, sdk.admit(mb, b.baseline, .{ .prompt = want.prefill + 1, .decode = want.decode }, target));
         // The boundary is the byte: a target at the fill's larger total keeps its rows; a byte under loses a row there.
         const edge = @max(at.prefillTotal(), at.decodeTotal());
         try bill.admitOf(at, edge);

@@ -22,6 +22,7 @@ const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
 const expert_bank = @import("expert_bank.zig");
 const kvc = @import("deepseek_v41_cache.zig");
+const phase_mem = @import("phase_memory.zig");
 
 const log = @import("sdk").log;
 
@@ -186,9 +187,7 @@ pub const PhaseTerms = struct {
     prompt_buffer_allowance: u64 = 0,
 
     pub fn sum(t: PhaseTerms) u64 {
-        var n: u64 = 0;
-        inline for (@typeInfo(PhaseTerms).@"struct".field_names) |name| n += @field(t, name);
-        return n;
+        return phase_mem.sumFields(t);
     }
 };
 
@@ -206,19 +205,9 @@ pub fn wiredOf(t: PhaseTerms) u64 {
     return t.sum() - t.wire_tables - t.decode_buffer_allowance - t.prompt_buffer_allowance - t.host_reserve - t.lookahead_staging - t.wide_window - t.unbilled_overhead - t.engram_posted;
 }
 
-/// The page granule of the kernel and of the GPU (ARM64 16 KiB).
-pub const wire_page_bytes: u64 = 16_384;
-
-/// The memory the wiring of `wired` bytes costs outside the process footprint (the measurements, ledger sec. 73:
-/// +0.091-0.126 GB in every served run 19 cell): per 16 KiB page a CPU and a GPU leaf entry and the kernel's wiring record
-/// (8 B each), one CPU + GPU L2 entry per 32 MiB and L1 entry per 64 GiB. No per-buffer term: ~4,000 live buffers at
-/// construction left no room for one under the measured figure. Monotone and subadditive, so a fill's per-row step can
-/// carry `wireTables(per_row)`.
-pub fn wireTables(wired: u64) u64 {
-    return (std.math.divCeil(u64, wired, wire_page_bytes) catch unreachable) * 24 +
-        (std.math.divCeil(u64, wired, 1 << 25) catch unreachable) * 16 +
-        (std.math.divCeil(u64, wired, 1 << 36) catch unreachable) * 16;
-}
+/// The page granule and the page tables of a phase's wired bytes (`phase_memory.wireTables`, shared with GLM-5.3's bill).
+pub const wire_page_bytes = phase_mem.wire_page_bytes;
+pub const wireTables = phase_mem.wireTables;
 
 /// The wiring overhead per live buffer if all of it were per buffer (measured): the largest
 /// construction reading, 125,852,608 B (run 3bk control1), over the 4,493 buffers live there, rounded up to a KiB.
@@ -247,81 +236,32 @@ pub const wire_arrays_decode_wave: u64 = 704;
 pub const wire_arrays_prompt_wave: u64 = 5120;
 
 /// One phase boundary's memory record (NATIVE; probes at the four boundaries only: module constructed,
-/// end of the prompt pass, after the phase change, end of decode): the phase's billed terms, the
-/// process ledgers (the guard's footprint and its split), MLX's allocator (active, cache, the peak since
-/// the previous boundary), the box's pages as the guard reads them, and billed minus measured.
-pub const PhaseMemory = struct {
-    phase: []const u8,
-    billed: PhaseTerms,
-    billed_process_bytes: u64,
-    process: sdk.memory.ProcessMemory,
-    mlx_active_bytes: u64,
-    mlx_cache_bytes: u64,
-    mlx_peak_bytes: u64,
-    box_physical_used_bytes: u64,
-    box_file_backed_bytes: u64,
-    /// Speculative (read-ahead) pages: not in the guard's used count until the kernel ages them into
-    /// inactive, which it can do at any later allocation (the v6c2 / SERVED kills: 7.7 GB at the grow).
-    box_speculative_bytes: u64 = 0,
-    /// The page cache the step created: file-backed pages now less at the step's vm start (the bill assumes 0).
-    file_cache_created_bytes: i64 = 0,
-    /// The phase's billed process bytes less its measured footprint high-water mark (negative: over the bill).
-    residual_bytes: i64,
-    /// Billed MLX-device terms (slots, residents, Engram residents, waves, KV) less MLX's peak over the phase.
-    mlx_residual_bytes: i64,
-    /// The phase change's boundary only: how long the driver took to reclaim the frees before the grow.
-    settle_ms: ?u32 = null,
-    /// The box's wired pages (vm_stat), for wire_tables' proof: box wired less this process's graphics footprint
-    /// less the idle census's wired.
-    box_wired_bytes: u64 = 0,
-};
+/// end of the prompt pass, after the phase change, end of decode): the shared record (`phase_memory.Record`) over this
+/// bill's phase terms.
+pub const PhaseMemory = phase_mem.Record(PhaseTerms);
 
 /// The boundary's record from what the kernel and MLX already track (no new counter): reads the
 /// ledgers and MLX's allocator, then restarts both high-water marks for the next phase.
 /// `engram_host_bytes`: the part of the billed Engram term that is host memory (0 since the host side is billed
 /// as measured: the Engram term holds its device residents only).
 pub fn phaseMemory(phase: []const u8, billed: PhaseTerms, engram_host_bytes: u64, file_backed_start: u64) PhaseMemory {
-    var active: usize = 0;
-    var cache: usize = 0;
-    var peak: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active);
-    _ = mlx.mlx_get_cache_memory(&cache);
-    _ = mlx.mlx_get_peak_memory(&peak);
-    const pm = sdk.memory.processMemory();
-    const v = sdk.memory.vmBytes();
-    _ = mlx.mlx_reset_peak_memory();
-    sdk.memory.startFootprintInterval();
-    var r = recordOf(phase, billed, pm, active, cache, peak, sdk.memory.physicalUsedBytes(v), v.external, v.speculative, file_backed_start, engram_host_bytes);
-    r.box_wired_bytes = v.wired;
+    const v = phase_mem.Reading.now();
+    phase_mem.restart();
+    var r = recordOf(phase, billed, v.process, v.active, v.cache, v.peak, sdk.memory.physicalUsedBytes(v.vm), v.vm.external, v.vm.speculative, file_backed_start, engram_host_bytes);
+    r.box_wired_bytes = v.vm.wired;
     return r;
 }
 
-/// `phaseMemory`'s arithmetic (host-testable): the MLX-device share of the bill is every term but the
-/// host ones (lookahead staging, host reserve, the wide window's host records, the overhead, the
+/// `phaseMemory`'s arithmetic (host-testable, `phase_memory.recordOf`): the MLX-device share of the bill is every term
+/// but the host ones (lookahead staging, host reserve, the wide window's host records, the overhead, the
 /// Engram row caches) and the allocator cache.
 pub fn recordOf(phase: []const u8, billed: PhaseTerms, pm: sdk.memory.ProcessMemory, active: u64, cache: u64, peak: u64, physical: u64, file_backed: u64, speculative: u64, file_backed_start: u64, engram_host_bytes: u64) PhaseMemory {
-    const process = billed.sum();
-    const measured = @max(pm.footprint_interval_peak, pm.footprint);
     const device = billed.slot_banks + billed.residents + (billed.engram -| engram_host_bytes) + billed.waves + billed.kv;
-    return .{
-        .phase = phase,
-        .billed = billed,
-        .billed_process_bytes = process,
-        .process = pm,
-        .mlx_active_bytes = active,
-        .mlx_cache_bytes = cache,
-        .mlx_peak_bytes = @max(peak, active),
-        .box_physical_used_bytes = physical,
-        .box_file_backed_bytes = file_backed,
-        .box_speculative_bytes = speculative,
-        .file_cache_created_bytes = @as(i64, @intCast(file_backed)) - @as(i64, @intCast(file_backed_start)),
-        .residual_bytes = @as(i64, @intCast(process)) - @as(i64, @intCast(measured)),
-        .mlx_residual_bytes = @as(i64, @intCast(device)) - @as(i64, @intCast(@max(peak, active))),
-    };
+    return phase_mem.recordOf(PhaseTerms, phase, billed, billed.sum(), device, pm, active, cache, peak, physical, file_backed, speculative, file_backed_start);
 }
 
 pub fn printPhaseMemory(a: std.mem.Allocator, r: PhaseMemory) void {
-    const json = std.json.Stringify.valueAlloc(a, r, .{}) catch return;
+    const json = phase_mem.jsonOf(a, r) catch return;
     std.debug.print("NATIVE DSV41_PHASE_MEMORY {s}\n", .{json});
 }
 
@@ -790,12 +730,10 @@ pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
     return .{ .terms = terms, .per_row = per_row, .row_terms = .{ .data = .{ w.prefill_wired, w.decode_wired + b.decode_extra_records * rec, per_row, 0 }, .at = wiringAt } };
 }
 
-/// The wiring terms at `rows` (`sdk.MemoryBill.RowTerms`), exactly as `FillBill.total` re-evaluates them; `data` is
-/// each phase's wired bytes less its slot rows, and the per-row bytes.
-fn wiringAt(data: *const [4]u64, phase: sdk.MemoryBill.Phase, rows: u32) u64 {
-    const fb: FillBill = .{ .prefill_fixed = 0, .decode_fixed = 0, .per_row = data[2], .wiring = .{ .prefill_wired = data[0], .decode_wired = data[1] } };
-    return fb.total(phase == .decode, rows) - rows * data[2];
-}
+/// The wiring terms at `rows` (`sdk.MemoryBill.RowTerms`): the page tables of each phase's wired bytes less its slot rows
+/// (`data`) and the rows' bytes, exactly as `FillBill.total` re-evaluates them (`phase_memory.wiringAt`, shared with
+/// GLM-5.3's bill).
+const wiringAt = phase_mem.wiringAt;
 
 /// A bill in the fill's shape: its phases' totals less their slot rows and their wiring terms, one row on every routed
 /// layer, and each phase's wired bytes less its slot rows (the wiring terms, re-evaluated at every row count).
@@ -880,9 +818,10 @@ pub const FillBill = struct {
 };
 
 /// The request the served admission's fill bills: the standard 16K cell's prompt and token cap (a longer
-/// request is admitted, or refused by name, by the server's per-request prefill bill at its time).
-pub const fill_prompt_tokens: u64 = 16384;
-pub const fill_max_tokens: u64 = 1024;
+/// request is admitted, or refused by name, by the server's per-request prefill bill at its time; `phase_memory`'s,
+/// shared with GLM-5.3's bill).
+pub const fill_prompt_tokens = phase_mem.fill_prompt_tokens;
+pub const fill_max_tokens = phase_mem.fill_max_tokens;
 
 /// The prompt lengths whose bill bounds every length up to `max_context` (`billCovering`). Every context term but the
 /// chunk-shaped ones grows with the length; the prompt wave and the rings follow the chunk rule (`PrefillBill.chunkRows`):
@@ -1058,13 +997,14 @@ pub fn fillCovering(a: std.mem.Allocator, io: std.Io, config: settings.Config, m
     return .{ .prefill = r.prompt, .decode = r.decode };
 }
 
-/// The longest prompt the served module admits (`max_context_tokens`, else the standard request's).
+/// The longest prompt the served module admits (`max_context_tokens`, else the standard request's:
+/// `phase_memory.servedContext`).
 pub fn servedContext(config: *const settings.Config) u64 {
-    return config.max_context_tokens orelse fill_prompt_tokens;
+    return phase_mem.servedContext(config.max_context_tokens);
 }
 
-/// The fewest rows per layer the fill admits (the envelope admission's prefill floor).
-pub const min_fill_rows = 16;
+/// The fewest rows per layer the fill admits (the envelope admission's prefill floor; `phase_memory`'s).
+pub const min_fill_rows = phase_mem.min_fill_rows;
 
 
 // ── Tests ──

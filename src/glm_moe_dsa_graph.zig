@@ -646,6 +646,76 @@ pub const Routes = struct {
     max_route_ids: u32 = 48,
     /// A prompt's attention on the DSA kernels (the module's probe passed on this device).
     dsa: bool = false,
+    /// The wave probe, a diagnostic the module arms (`WaveProbe`); null: off.
+    wave_probe: ?*WaveProbe = null,
+};
+
+/// A diagnostic the module arms at construction (`GLM53_WAVE_PROBE`, off by default): each prompt layer's MLX peak above
+/// MLX's active bytes at the layer's start, by stage (the attention through the residual, the router and the routed call,
+/// the tail through the layer's eval), and MLX's cache at the layer's end. Each stage ends with an eval of what it built
+/// and restarts MLX's peak; the pass's highest peak is kept here (`peak`) for the prompt's phase record. Only with the
+/// probe on do the stage evals run.
+pub const WaveProbe = struct {
+    pub const Stage = enum { attn, moe, tail };
+    pub const Probed = struct { start: u64 = 0, attn: u64 = 0, moe: u64 = 0, tail: u64 = 0, cache: u64 = 0 };
+    layers: [glm.max_layers]Probed = @splat(.{}),
+    n: u32 = 0,
+    rows: u32 = 0,
+    positions: u32 = 0,
+    peak: u64 = 0,
+
+    fn counters() struct { active: u64, peak: u64, cache: u64 } {
+        var active: usize = 0;
+        var peak: usize = 0;
+        var cache: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active);
+        _ = mlx.mlx_get_peak_memory(&peak);
+        _ = mlx.mlx_get_cache_memory(&cache);
+        return .{ .active = active, .peak = @max(peak, active), .cache = cache };
+    }
+
+    /// A prompt call of `rows` rows ending at `positions`: the probe's layers start over.
+    pub fn call(p: *WaveProbe, rows: u32, positions: u32) void {
+        p.n = 0;
+        p.rows = rows;
+        p.positions = positions;
+    }
+
+    fn begin(p: *WaveProbe, l: u32) void {
+        const c = counters();
+        p.peak = @max(p.peak, c.peak);
+        _ = mlx.mlx_reset_peak_memory();
+        p.layers[l] = .{ .start = c.active };
+        p.n = @max(p.n, l + 1);
+    }
+
+    fn mark(p: *WaveProbe, l: u32, s: Stage) void {
+        const c = counters();
+        p.peak = @max(p.peak, c.peak);
+        _ = mlx.mlx_reset_peak_memory();
+        const x = &p.layers[l];
+        const rise = c.peak -| x.start;
+        switch (s) {
+            .attn => x.attn = rise,
+            .moe => x.moe = rise,
+            .tail => {
+                x.tail = rise;
+                x.cache = c.cache;
+            },
+        }
+    }
+
+    /// The pass's highest MLX peak, the current stage's included.
+    pub fn passPeak(p: *const WaveProbe) u64 {
+        return @max(p.peak, counters().peak);
+    }
+
+    /// One JSON line's payload: the call's rows and positions and each layer's stages (bytes).
+    pub fn format(p: WaveProbe, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{{\"rows\":{d},\"positions\":{d},\"peak\":{d},\"layers\":[", .{ p.rows, p.positions, p.peak });
+        for (p.layers[0..p.n], 0..) |x, l| try w.print("{s}[{d},{d},{d},{d},{d}]", .{ if (l == 0) "" else ",", x.start, x.attn, x.moe, x.tail, x.cache });
+        try w.writeAll("]}");
+    }
 };
 
 /// What a forward returns beyond the last row's logits.
@@ -681,9 +751,12 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
     var h = g.keep(try embed(g, w, ids));
     defer g.release(h);
     const wide = rows * c.n_experts_per_tok > rt.max_route_ids;
+    const probe: ?*WaveProbe = if (prompt) rt.wave_probe else null;
+    if (probe) |p| p.call(rows, start + rows);
     for (w.layers, 0..) |*lw, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
+        if (probe) |p| p.begin(l);
         if (pt.enabled and prompt) pt.start();
         // The predictor runs only where the read-ahead has empty rows to fill.
         if (rt.read_ahead and wide and lw.bank_layer != null and ex.readAheadRoom(lw.bank_layer.?) > 0) {
@@ -698,6 +771,11 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         const x = try rmsNorm(g, h, lw.input_norm, c.rms_norm_eps);
         const h1 = try g.add(h, try attention(g, c, lw, l, x, start, rows, cache, &carry, if (want.verify) .per_row else .auto, rt.dsa));
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{h1}, .oproj);
+        if (probe) |p| {
+            try g.evalAll(&.{h1});
+            p.mark(l, .attn);
+        }
+        defer if (probe) |p| p.mark(l, .tail);
         const x2 = try rmsNorm(g, h1, lw.post_norm, c.rms_norm_eps);
         const f = if (lw.dense) |d| try mlp(g, d, x2) else blk: {
             const r = try route(g, c, lw.router.?, x2);
@@ -707,6 +785,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             const shared: ?T = if (!wide) try mlp(g, lw.shared.?, x2) else null;
             const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, if (shared) |sh| &[_]T{sh} else &.{});
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{routed}, .routed);
+            if (probe) |p| p.mark(l, .moe);
             break :blk try g.add(routed, shared orelse try mlp(g, lw.shared.?, x2));
         };
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{f}, .mlp);
