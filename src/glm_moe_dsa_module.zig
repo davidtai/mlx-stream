@@ -38,6 +38,7 @@ const experts_mod = @import("glm_moe_dsa_experts.zig");
 const mtp_mod = @import("glm_moe_dsa_mtp.zig");
 const exl3_bank = @import("glm_moe_dsa_exl3_bank.zig");
 const exl3_quant = @import("glm_moe_dsa_exl3_quant.zig");
+const glm53_quant = @import("glm53_exl3_quant.zig");
 /// PROFILE builds (`-Dplugin-profile=true`): each draft round's verify on the GPU timeline, its summary at the
 /// request's end (`VERIFY_GPU_TIMELINE`); every other build compiles it out.
 const timeline = @import("dsv41_verify_timeline.zig");
@@ -74,10 +75,12 @@ pub const Overrides = struct {
 };
 
 /// The served modules, the MTP layer's experts from its EXL3 records in both: the affine bank through MLX's
-/// `gather_qmm`; the EXL3 bank (its K3 and K4 bank layers per routed layer) through sushi's EXL3 MoE. The pack's
-/// manifest picks one at load (`Served`).
+/// `gather_qmm`; the EXL3 bank (its K3 and K4 bank layers per routed layer) through GLM-5.3's own EXL3 kernels
+/// (`glm53_exl3_quant`). The pack's manifest picks one at load (`Served`). `Exl3SushiModule`: the EXL3 bank through
+/// sushi's EXL3 MoE, the comparison's.
 pub const Module = ModuleOf(bank_mod, quant.FromGatherMatmul(quant.GatherQmm), .exl3);
-pub const Exl3Module = ModuleOf(exl3_bank, exl3_quant, .exl3);
+pub const Exl3Module = ModuleOf(exl3_bank, glm53_quant, .exl3);
+pub const Exl3SushiModule = ModuleOf(exl3_bank, exl3_quant, .exl3);
 
 /// The module the pack's bank serves: the EXL3 one when the pack carries the EXL3 manifest, else the affine one.
 pub const Served = union(enum) {
@@ -109,6 +112,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         const Self = @This();
         const Stream = Bk.Stream.Stream;
         const Math = Q.Accepted(G);
+        /// A quant with pinned texts gets the load's kernel set over its registry, built on the module's stream.
+        const has_kernels = @hasDecl(Q, "kernel_registry");
+        const KSet = if (has_kernels) sdk_ext.kernels.Set(Q.kernel_registry) else void;
         pub const Experts = experts_mod.Experts(G, Bk, Math);
         pub const Lane = mtp_mod.Lane(mtp_kind);
 
@@ -138,6 +144,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         bank: Bk.Bank,
         stream: *Stream,
         math: *Math,
+        kset: if (has_kernels) *KSet else void,
         ex: Experts,
         cache: graph.Cache,
         /// The tokens whose KV the lanes hold, in order (the prefix a later prompt may keep).
@@ -226,7 +233,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
+            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .kset = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
             errdefer self.g.deinit();
             // The module owns its config's copy (the host's config keeps the parsed model's storage).
             self.model = if (self.cfg.model) |*m| m else unreachable;
@@ -236,7 +243,15 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             defer arena.deinit();
             const peek = try self.bank.peek(arena.allocator());
             if (Q.claims(&peek, &diag) == null) return error.QuantNotClaimed;
-            self.math = try Q.accept(G, gpa, &self.g, .{ .peek = &peek }, .{ .hidden = model.hidden_size, .inter = model.moe_intermediate_size, .top_k = model.n_experts_per_tok, .n_layers = model.nSparse(), .act = .swiglu, .input = .bfloat16 }, &diag);
+            var kref: ?sdk_ext.kernels.SetRef = null;
+            if (comptime has_kernels) {
+                self.kset = try KSet.init(gpa, .{ .device = .{ .stream = s } }, &diag);
+                // the profile hook's launch probe sees the set's launches (profile builds; a no-op otherwise)
+                self.kset.bound.observe(sdk_ext.profile.of(G).launch);
+                kref = self.kset.ref();
+            }
+            errdefer if (comptime has_kernels) self.kset.deinit();
+            self.math = try Q.accept(G, gpa, &self.g, .{ .kernels = kref, .peek = &peek }, .{ .hidden = model.hidden_size, .inter = model.moe_intermediate_size, .top_k = model.n_experts_per_tok, .n_layers = model.nSparse(), .act = .swiglu, .input = .bfloat16 }, &diag);
             errdefer self.math.deinit(&self.g);
             const n_bank: usize = self.inputs.bank.layers.len;
             self.prompt_rows = try gpa.alloc(u32, n_bank);
@@ -350,6 +365,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.stream.deinit();
             if (self.recorder) |rec| rec.deinit();
             self.math.deinit(&self.g);
+            if (comptime has_kernels) self.kset.deinit();
             self.w.deinit(self.gpa);
             self.bank.deinit();
             self.history.deinit(self.gpa);
