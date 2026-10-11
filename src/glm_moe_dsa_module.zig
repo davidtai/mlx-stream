@@ -168,6 +168,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         forced_rows: bool,
         /// DIAG (diag/pool-copy-timers): the pool's counters at the handover (`diag_counters`).
         diag0: [diag_counters.len]i64 = @splat(0),
+        gauge0: [6]i64 = @splat(0),
         decoding: bool = false,
         /// The bill's inputs (the handover bills its request's KV from them), the load's baseline, MLX's target (the
         /// host's ceiling less its wired margin) and the box's RAM (the handover's target, `bill.targetOf`).
@@ -641,6 +642,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             };
             self.decode_mark = .{ .s0 = self.stream.stats(), .mem0 = Mem.now(), .by0 = self.stream.lookaheadByRank() };
             for (&self.diag0, diag_counters) |*x, c| x.* = self.stream.pool.counter(c);
+            self.gauge0 = self.stream.pool.readGauge();
             self.ex.host = .{};
             if (self.mtp) |ln| ln.counts = .{};
             for (self.layer_counts0, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
@@ -667,6 +669,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 d[8], f.mb(d[9], d[8]), f.ms(d[10], d[8]), f.gbs(d[9], d[10]),
                 d[11], f.ms(d[12], d[11]), f.ms(d[13], d[11]),
                 @as(f64, @floatFromInt(self.stream.pool.counter(.diag_copy_max_ns))) / 1e6,
+            });
+            const g1 = self.stream.pool.readGauge();
+            log.info("glm_moe_dsa: DIAG pre-read in decode: {d:.0} calls, {d:.0} ranges issued, {d:.0} no slot, {d:.0} claims, {d:.0} started, {d:.0} bound, {d:.0} cancelled, {d:.0} expired, {d:.0} served ({d:.0} waited, {d:.3} ms each), bind waits {d:.3} ms per started; adoptions {d:.0} waited ({d:.3} ms each); speculative {d:.0} chunks, {d:.2} GB, {d:.0} claimed ({d:.0} in flight); read gauge depth {d:.2} mean at an entry, max {d}\n", .{
+                d[14], d[15], d[16], d[17], d[18], d[19], d[20], d[21], d[22], d[23], f.ms(d[24], d[23]), f.ms(d[25], d[18]), d[26], f.ms(d[27], d[26]), d[28], d[29] / 1e9, d[30], d[31],
+                if (g1[3] - self.gauge0[3] > 0) @as(f64, @floatFromInt(g1[2] - self.gauge0[2])) / @as(f64, @floatFromInt(g1[3] - self.gauge0[3])) else 0, g1[1],
             });
         }
 
@@ -1057,7 +1064,7 @@ pub const PromptLine = struct {
 };
 
 /// DIAG (diag/pool-copy-timers): the counters `diagLine` reads, in its order.
-const diag_counters = [_]sdk_ext.expert.io.Counter{ .diag_gu_ranges, .diag_gu_bytes, .diag_gu_read_ns, .diag_gu_copy_ns, .diag_dn_ranges, .diag_dn_bytes, .diag_dn_read_ns, .diag_dn_copy_ns, .adopt_ranges, .adopt_bytes, .diag_adopt_copy_ns, .diag_jobs, .diag_wake_ns, .diag_job_ns };
+const diag_counters = [_]sdk_ext.expert.io.Counter{ .diag_gu_ranges, .diag_gu_bytes, .diag_gu_read_ns, .diag_gu_copy_ns, .diag_dn_ranges, .diag_dn_bytes, .diag_dn_read_ns, .diag_dn_copy_ns, .adopt_ranges, .adopt_bytes, .diag_adopt_copy_ns, .diag_jobs, .diag_wake_ns, .diag_job_ns, .pre_calls, .pre_issued, .pre_noslot, .pre_claims, .pre_started, .pre_bound, .pre_cancelled, .pre_expired, .pre_served, .pre_waits, .pre_wait_ns, .pre_bind_wait_ns, .adopt_waits, .adopt_wait_ns, .spec_chunks, .spec_bytes, .claimed, .claimed_inflight };
 
 /// The decode's line, at the request's end. `wall_ns`: the time inside the steps.
 pub const DecodeLine = struct {
