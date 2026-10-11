@@ -467,7 +467,7 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     try cache.append(g, l, k.latent, k.k_pe, k.index);
     const kv_all = try cache.latentView(g, l);
     const pe_all = try cache.ropeView(g, l);
-    if (pt.enabled and rows > 1) {
+    if (pt.enabled and form == .auto and rows > 1) {
         var bufs: [3]T = undefined;
         _ = try pt.phase(g, cache.buffers(l, &bufs), .proj);
         _ = try pt.phase(g, &.{ q.q_nope, q.q_pe, q.qr }, .proj);
@@ -477,7 +477,7 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         const ik_all = try cache.indexView(g, l);
         if (spans) try selectSpans(g, c, ix, x, q.iq.?, ik_all, start, carry) else try select(g, c, ix, x, q.iq.?, ik_all, start, rows, carry);
     }
-    if (pt.enabled and rows > 1) {
+    if (pt.enabled and form == .auto and rows > 1) {
         var sel: std.ArrayList(T) = .empty;
         defer sel.deinit(carry.a);
         for (carry.topk) |t| if (t) |x_| try sel.append(carry.a, x_);
@@ -533,7 +533,7 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         }
         outs.clearRetainingCapacity();
     }
-    if (pt.enabled and rows > 1) pt.chargeAttn(lw.indexer != null, try pt.phase(g, &.{out}, .attn));
+    if (pt.enabled and form == .auto and rows > 1) pt.chargeAttn(lw.indexer != null, try pt.phase(g, &.{out}, .attn));
     const o2 = try g.reshape(try g.transposeAxes(out, &.{ 0, 2, 1, 3 }), &.{ n, heads * @as(c_int, @intCast(c.v_head_dim)) });
     return qlinear(g, o2, lw.o);
 }
