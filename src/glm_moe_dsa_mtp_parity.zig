@@ -333,13 +333,13 @@ test "glm mtp: a depth past the route limit, a pack without mtp/ and a config wi
     cfg.mtp_depth = 5;
     try testing.expectError(error.MtpPackMissing, plugin.loadBytes(a, testing.io, &cfg, &facts, 64 << 30));
     var diag: glm.Diag = .{};
-    try testing.expectError(error.MtpPackMissing, @import("glm_moe_dsa_bill.zig").billOf(arena.allocator(), testing.io, &cfg, 1024, &diag));
+    try testing.expectError(error.MtpPackMissing, @import("glm_moe_dsa_bill.zig").sdkBillOf(arena.allocator(), testing.io, &cfg, 1024, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "mtp/mtp-residents.safetensors") != null);
     try testing.expectError(error.MtpPackMissing, M.initWith(a, testing.io, &cfg, &weights, undefined, .{ .ceiling = 64 << 30, .wired_margin = 0 }, .{}));
-    // Off, the same pack loads its bill with no MTP term.
+    // Off, the same pack loads its bill with its MTP terms at nothing.
     cfg.mtp_depth = 0;
-    const mb = try @import("glm_moe_dsa_bill.zig").billOf(arena.allocator(), testing.io, &cfg, 1024, null);
-    for (mb.terms) |t| try testing.expect(std.mem.indexOf(u8, t.name, "MTP") == null);
+    const mb = try @import("glm_moe_dsa_bill.zig").sdkBillOf(arena.allocator(), testing.io, &cfg, 1024, null);
+    for (mb.terms) |t| if (std.mem.indexOf(u8, t.name, "MTP") != null) try testing.expectEqual([2]u64{ 0, 0 }, t.bytes);
     // A config without index_share_for_mtp_iteration drafts one token at most.
     var tmp2 = testing.tmpDir(.{});
     defer tmp2.cleanup();

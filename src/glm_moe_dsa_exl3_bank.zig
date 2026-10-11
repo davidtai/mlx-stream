@@ -237,6 +237,9 @@ pub const Bank = struct {
         for (self.layers) |*l| {
             const gu = l.segments[gu_components].offset;
             g.widest_span = @max(g.widest_span, @max(gu, l.logical_bytes - gu));
+            // A routed id's minis back to back in the file (`StreamOf.spanOf`), at the widest layer.
+            g.spec_record = @max(g.spec_record, (@as(u64, l.minis) - 1) * l.record_bytes + l.logical_bytes);
+            g.minis_per_id = @max(g.minis_per_id, l.minis);
         }
         return g;
     }
