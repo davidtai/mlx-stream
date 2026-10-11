@@ -168,6 +168,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         host: HostSplit = .{},
         /// The wide lane's combine on the GPU (`combine_source`), built at its first call.
         combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
+        /// A bank layer's last group, drained later: once the next bank layer's first group is committed, or once the
+        /// call's combine is (the GPU runs those while the host waits); its outputs are `wide.kept[k0..k1]`.
+        held: ?Held = null,
+
+        const Held = struct { r: *S.Route, sl: u32, exps: [max_route_ids]u16 = undefined, n: usize = 0, k0: usize, k1: usize };
 
         /// The routes of the prompt layer whose misses were read at its start (`stageMisses`): each route's bank layer and
         /// experts, in route order; null once the call took it.
@@ -353,16 +358,36 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// Group `gi`'s waves (`outs`, committed) drained before its slots go back (the next route may refill them), its
         /// route released, the groups after it routed on stream layer `sl` while windows are free.
         fn drainGroup(self: *Self, g: *G, w: *Wide, sl: u32, gi: usize, outs: []const T, next: *usize, live: *usize, depth: usize, comptime ahead: anytype) !void {
+            try self.drainRoute(g, w.groute.items[gi].?, sl, w.order.items[w.bounds.items[gi]..w.bounds.items[gi + 1]], outs);
+            w.groute.items[gi] = null;
+            live.* -= 1;
+            const tr = pt.now();
+            try ahead(self, w, sl, next, live, depth);
+            pt.chargeRouted(.route, tr);
+        }
+
+        /// The held group (`held`) drained.
+        fn drainHeld(self: *Self, g: *G) !void {
+            const h = self.held.?;
+            self.held = null;
+            try self.drainRoute(g, h.r, h.sl, h.exps[0..h.n], self.wide.kept.items[h.k0..h.k1]);
+        }
+
+        /// The held group's route released (an error between its hold and its drain).
+        fn dropHeld(self: *Self) void {
+            if (self.held) |h| self.stream.release(h.r);
+            self.held = null;
+        }
+
+        /// A group's waves (`outs`, committed) drained before its slots go back, its route `r` (of stream layer `sl`, the
+        /// experts `exps`) released, its seed experts copied into resident rows.
+        fn drainRoute(self: *Self, g: *G, r: *S.Route, sl: u32, exps: []const u16, outs: []const T) !void {
             const td = pt.now();
             try g.evalAll(outs);
             pt.chargeRouted(.compute, td);
-            const tr = pt.now();
-            const r = w.groute.items[gi].?;
             var cand: Seeds = .{};
-            seedsOf(&self.stream.layers[sl].policy, w.order.items[w.bounds.items[gi]..w.bounds.items[gi + 1]], r.plan.slotsOf(), &cand);
+            seedsOf(&self.stream.layers[sl].policy, exps, r.plan.slotsOf(), &cand);
             self.stream.release(r);
-            w.groute.items[gi] = null;
-            live.* -= 1;
             if (cand.n > 0) {
                 const tp = pt.now();
                 // The eval above consumed the group: its route unpinned (its rows the policy's again), then its seed
@@ -373,8 +398,6 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 _ = self.stream.promote(sl, items[0..cand.n]);
                 pt.chargeRouted(.promote, tp);
             }
-            try ahead(self, w, sl, next, live, depth);
-            pt.chargeRouted(.route, tr);
         }
 
         /// A group's seed experts (the call's hottest, `LayerPolicy.seed`) that its route read into transient rows (a
@@ -849,6 +872,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const n_ids = n * k;
             // The staged routes this call does not take (a bank layer it routes nothing on) go back at its end.
             defer self.dropStaged();
+            errdefer self.dropHeld();
             const tb = pt.now();
             try w.ids.resize(a, n_ids);
             _ = try g.hostIds(indices, w.ids.items);
@@ -943,8 +967,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             };
             try w.groute.resize(a, n_groups);
             @memset(w.groute.items, null);
-            // Windows held: the staged routes (this bank layer's, taken here, and the others').
-            var live: usize = held_other;
+            // Windows held: the staged routes (this bank layer's, taken here, and the others'), and the previous bank
+            // layer's last group.
+            var live: usize = held_other + @intFromBool(self.held != null);
             errdefer for (w.groute.items) |rt| if (rt) |r| self.stream.release(r);
             if (n_staged > 0) {
                 var gs = first_staged;
@@ -993,7 +1018,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 const start = w.bounds.items[gi];
                 if (w.groute.items[gi] == null) {
                     // No window was free for it: the group before it drains first.
-                    if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..], &next, &live, depth, ahead);
+                    if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..], &next, &live, depth, ahead) else if (self.held != null) {
+                        try self.drainHeld(g);
+                        live -= 1;
+                        try ahead(self, w, sl, &next, &live, depth);
+                    }
                     prev = null;
                 }
                 const r = w.groute.items[gi].?;
@@ -1035,10 +1064,22 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 try g.asyncEval(w.kept.items[k0..]);
                 g.resetTo(m);
                 pt.chargeRouted(.encode, tc);
-                if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..k0], &next, &live, depth, ahead);
+                if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..k0], &next, &live, depth, ahead) else if (self.held != null) {
+                    try self.drainHeld(g);
+                    live -= 1;
+                    try ahead(self, w, sl, &next, &live, depth);
+                }
                 prev = .{ .gi = gi, .k0 = k0 };
             }
-            if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..], &next, &live, depth, ahead);
+            // The last group drains later (the next bank layer's first commit, or the call's combine committed first).
+            if (prev) |pv| {
+                std.debug.assert(self.held == null);
+                const exps = w.order.items[w.bounds.items[pv.gi]..w.bounds.items[pv.gi + 1]];
+                var h: Held = .{ .r = w.groute.items[pv.gi].?, .sl = sl, .n = exps.len, .k0 = pv.k0, .k1 = w.kept.items.len };
+                @memcpy(h.exps[0..exps.len], exps);
+                self.held = h;
+                w.groute.items[pv.gi] = null;
+            }
         }
 
         /// The wide lane's join: every routed row's output in routed order, then the combine in token slices.
@@ -1058,6 +1099,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 };
                 const loc = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
                 const out = try combineOnGpu(&self.combine_kernel, g, w.kept.items, loc, scores, n, k, self.hidden, g.dtypeOf(x));
+                // The combine committed behind the last group, which then drains: the GPU runs the combine meanwhile.
+                if (self.held != null) {
+                    try g.asyncEval(&.{out});
+                    try self.drainHeld(g);
+                }
                 // The combine holds the parts until it is evaluated.
                 for (w.kept.items) |o| g.release(o);
                 w.kept.clearRetainingCapacity();
@@ -1067,6 +1113,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const tj = pt.now();
             const joined = try g.concat(w.kept.items, 0);
             try g.evalAll(&.{joined});
+            if (self.held != null) try self.drainHeld(g);
             pt.chargeRouted(.join, tj);
             const tb = pt.now();
             defer if (pt.enabled) pt.chargeRouted(.combine, tb);
