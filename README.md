@@ -193,13 +193,24 @@ sidecar. Two tiers: **fp8res** (the pack of record, about 171 GB: q/k/v and the 
 **Serving.**
 
 ```sh
-mlx-serve serve --model /abs/path/to/pack --ctx-size 17408 --no-vision --kv-quant off
+MLX_SERVE_GPU_CEILING_MB=114688 mlx-serve serve --model /abs/path/to/pack --ctx-size 17408 --no-vision --kv-quant off \
+  --no-warmup-eager --prefix-cache-entries 0 --wired-margin-gib 2
 ```
 
 `--ctx-size` (or the model's `ctx_size` in mlx-serve's model settings) is the context the bill covers; without one
 the arch bills 17,408 tokens (16,384 prompt + 1,024 generated). A 16K prompt peaks at 104-108 GB, by the rows the box
 admits: the bill fills the expert rows up to the host's GPU ceiling less its wired margin. `experts.bin` must be a real
 file or a hard link.
+
+To reproduce the measured lines ([docs/mimo.md, Reproducing the measurements](docs/mimo.md#reproducing-the-measurements)):
+the box had its wired limit raised to the ceiling (`sudo sysctl iogpu.wired_limit_mb=114688`;
+`MLX_SERVE_GPU_CEILING_MB` must not exceed it) and no other model server loaded. The cells ran the command above with
+`--ctx-size` = prompt + 16,384 (32,768 for a 16K prompt) plus `--timeout 0 --metrics --log-file off`, with no
+`MLX_STREAM_SETTINGS` or `MIMO_*` variable, and pinned the rows in the pack's `config.json`
+(`"settings": {"expert_prefill_rows": 129, "expert_rows": 146, "mtp_lane": true}` for the ladder's 16K rung; without
+it the bill fills them to the ceiling less the margin). Requests went to `/v1/completions` with the prompt rendered by
+the pack's template: card = `"temperature": 1.0, "top_p": 0.95, "seed": 1, "max_tokens": 16384` with thinking on;
+greedy = `"temperature": 0, "seed": 0` with the template's empty `<think></think>`; both with `"enable_mtp": true`.
 
 **Settings.** Every route is a construction setting in the pack's `config.json` (`expert_streaming.settings`), read
 once at load and refused by name when wrong; there is no environment variable or flag. The defaults are the measured

@@ -234,6 +234,95 @@ HumanEval on `746e7da9`, greedy and card: every failed problem is a wrong answer
 
 Expert routing on the standard 16K prompt: the busiest half moves with the context, so a dynamic cache beats a static hot set.
 
+## Reproducing the measurements
+
+Every measured line (the README's MiMo-V2.6-Flash measurements and the charts above) came from one served cell: a fresh
+server, one request and the cell's receipt. This is how those cells ran, from their receipts.
+
+**The box.** One M5 Max with 128 GB. The wired limit was raised to the server's GPU ceiling,
+`sudo sysctl iogpu.wired_limit_mb=114688` (the server logs `[wired] mode=max limit=114688 MB`);
+`MLX_SERVE_GPU_CEILING_MB` must not exceed it. No other model server was loaded (the ladder also ran with Spotlight
+off). `experts.bin` was a real file or a hard link, never a symlink. Prefill follows the GPU clock
+([Limitations](#limitations)): compare cells at matched clocks, with the fans at maximum.
+
+**The pack.** The fp8res pack of record ([mimo-pack.md](mimo-pack.md)), whose `config.json` carries the
+`expert_streaming` block shown there.
+
+**The server.** The 16K cells ran this command; each ladder rung ran the same with `--ctx-size` = its prompt + 16,384:
+
+```sh
+MLX_SERVE_GPU_CEILING_MB=114688 nice -n 19 mlx-serve serve --model /abs/path/to/pack --host 127.0.0.1 --port 8081 \
+  --ctx-size 32768 --timeout 0 --no-vision --no-warmup-eager --prefix-cache-entries 0 --metrics --log-file off \
+  --kv-quant off --wired-margin-gib 2
+```
+
+- `nice -n 19`, `--host` / `--port` and `--timeout 0` are the harness's.
+- `--ctx-size` is the context the bill covers: the prompt plus the 16,384-token cap (32,768 for a 16K prompt).
+- `--kv-quant off` keeps the BF16 KV; `--prefix-cache-entries 0` matches the arch, which has no prefix cache;
+  `--no-vision` and `--no-warmup-eager` as passed.
+- `--wired-margin-gib 2` under the 112 GiB ceiling sets the bill's target to 110 GiB (118,111,600,640 B).
+- `--metrics` serves Prometheus metrics at `/metrics`; with `--log-file off` the harness captured stdout and stderr as
+  the cell's `server.log`.
+- Environment: `MLX_SERVE_GPU_CEILING_MB=114688` (the server logs `[diag] GPU ceiling forced to 114688 MB`). The harness
+  removed every other `MLX_SERVE_*` variable, so the host's wired policy was its default, `max`. Nothing else is read
+  from the environment: the shipping host ignores `MLX_STREAM_SETTINGS`, and a served build reads no `MIMO_*` variable.
+
+**Pinned rows.** The cells pinned the rows in the pack's `config.json`, in a per-cell copy of the pack (hard links and
+a new `config.json`, as [Settings](#settings) shows):
+
+```json
+"expert_streaming": {
+  "family": "mlx-stream",
+  "format": "mlx-stream-mxfp4-expert-bank-v1",
+  "manifest": "expert-manifest.json",
+  "settings": { "expert_prefill_rows": 129, "expert_rows": 146, "mtp_lane": true }
+}
+```
+
+That is the ladder's 16K rung: each rung pinned the bill's fill for a 12.6 GB box baseline, one prompt row lower from
+64K up (the rows columns of the README's ladder). The 130 / 147 16K cells (on `746e7da9` and on the binary of record)
+pinned 130 / 147, and the 16K card and greedy pairs 134 / 152. Without the object the bill fills the rows itself, up to
+the GPU ceiling less the wired margin over the box's baseline ([Memory: the bill](#memory-the-bill)); the bill tool
+there prints the rows per context and baseline from a pack's headers, and the server logs what a load took:
+
+```text
+MiMo memory: target=118111600640 baseline=12219121664 process_bound=105808665018 prompt_rows=129 decode_rows=146 reserve_tokens=32768 kv=bf16 phase_rows=on growth_rows=17 forced=yes
+```
+
+Rows forced above the fill load with the operator-pin line ([Expert rows](#expert-rows)).
+
+**The requests.** `POST /v1/completions` with the prompt already rendered by the pack's chat template; `model` is the
+pack directory's name. Card sampling, thinking on (the template's generation prompt, ending `<|im_start|>assistant\n`):
+
+```sh
+curl -s http://127.0.0.1:8081/v1/completions -H 'Content-Type: application/json' -d '{
+  "model": "MiMo-V2.6-Flash-MOPD-fp8res-mlx-stream",
+  "prompt": "<|im_start|>user\n...<|im_end|><|im_start|>assistant\n",
+  "max_tokens": 16384, "temperature": 1.0, "top_p": 0.95, "seed": 1, "stream": false,
+  "enable_mtp": true, "enable_drafter": false, "enable_pld": false }'
+```
+
+Greedy, thinking off (the template's empty think block ends the prompt):
+
+```sh
+curl -s http://127.0.0.1:8081/v1/completions -H 'Content-Type: application/json' -d '{
+  "model": "MiMo-V2.6-Flash-MOPD-fp8res-mlx-stream",
+  "prompt": "<|im_start|>user\n...<|im_end|><|im_start|>assistant\n<think></think>",
+  "max_tokens": 1024, "temperature": 0, "seed": 0, "stream": false,
+  "enable_mtp": true, "enable_drafter": false, "enable_pld": false }'
+```
+
+No `top_k` is sent (the server logs `top_k=0`). `enable_mtp: true` arms the draft lane for the request; the host keeps
+the drafter and prompt-lookup decoding off for this arch either way.
+
+**Where the numbers come from.** Each cell left `receipt.json` (the server command and environment, the settings
+block, the request body and the numbers), `server.log` and `output.txt` in the lab's `cells/<window>/<cell>/cell/`
+directory, outside this repository. Prefill and decode are the server's own per-request line:
+`<- 16382+683 tokens (39186ms) [prefill: 978.5 tok/s, decode: 30.7 tok/s] [stop]`. TTFT is prompt tokens / prefill;
+peak is the server process's peak physical footprint, sampled every 0.5 s. `python3 scripts/mimo_charts.py` redraws
+the figures above from the numbers it carries inline, each table naming its cell directory; it needs matplotlib (on a
+Homebrew Python, install it in a venv).
+
 ## Settings
 
 Settings live in the pack's `config.json`, in the `settings` object of its `expert_streaming` block:
