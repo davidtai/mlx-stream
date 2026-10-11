@@ -685,13 +685,18 @@ pub fn residentBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *co
 }
 
 /// The pack's residents as MLX allocates them once they load (`bufferBytes` of every shard tensor), after the spec check.
-pub fn residentBufferBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Config, page: u64, diag: ?*Diag) Error!u64 {
+/// `classes`: they load with the allocator's size classes on (GLM-5.3's module: the first prompt's forward layers read
+/// them, `bill.prompt_size_classes`), each at its class (`glm_moe_dsa_cache.sizeClassBytes`).
+pub fn residentBufferBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Config, page: u64, classes: bool, diag: ?*Diag) Error!u64 {
     var ck = try Checkpoint.openIndexed(gpa, io, dir, diag);
     defer ck.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     _ = try checkResidents(try residentSpec(arena.allocator(), c), &ck, diag);
-    return bufferBytes(&ck, page);
+    if (!classes) return bufferBytes(&ck, page);
+    var n: u64 = 0;
+    for (ck.tensors.values()) |t| n += @import("glm_moe_dsa_cache.zig").sizeClassBytes(t.end - t.begin);
+    return n;
 }
 
 /// Every tensor of `ck` in its own MLX buffer: past one page, rounded up to whole pages (`glm_moe_dsa_cache.bufferBytes`).

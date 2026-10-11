@@ -163,6 +163,19 @@ pub fn Cache(comptime G: type) type {
     };
 }
 
+/// The bytes MLX's allocator takes for a request of `bytes` while its size classes are on (the patched allocator's
+/// `mlx_set_alloc_size_classes`, which GLM-5.3's module turns on only while the prompt's forward layers evaluate): the
+/// request page-rounded (16 KiB); from 1 MiB, rounded up to a step of an eighth of its power of two (at least a page),
+/// at most 12.5 % more.
+pub fn sizeClassBytes(bytes: u64) u64 {
+    const page = @import("phase_memory.zig").wire_page_bytes;
+    const s_ = if (bytes > page) std.mem.alignForward(u64, bytes, page) else bytes;
+    if (s_ < 1 << 20) return s_;
+    const top: u64 = @as(u64, 1) << @intCast(std.math.log2_int(u64, s_));
+    const step = @max(top / 8, page);
+    return (std.math.divCeil(u64, s_, step) catch unreachable) * step;
+}
+
 /// An MLX buffer of `n` bytes as the Metal allocator takes it: past one page, rounded up to whole pages.
 pub fn bufferBytes(n: u64, page: u64) u64 {
     return if (n > page) std.mem.alignForward(u64, n, page) else n;
