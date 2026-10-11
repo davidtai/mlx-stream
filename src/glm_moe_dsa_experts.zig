@@ -115,7 +115,8 @@ const n_banks = std.meta.fieldNames(BankKind).len;
 /// The decode lane's host time per call, summed: blocked in the routing barrier (the GPU up to the router, with event
 /// gates also its wait on the previous layer's bytes), the routes (the ids read, the plans, the reads submitted, the
 /// lookahead's step), the waves' encode and commit.
-pub const HostSplit = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u64 = 0, wave_ns: u64 = 0 };
+/// `joined`: the calls whose outputs were more parts than the GPU combine reads (`max_combine_parts`), joined first.
+pub const HostSplit = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u64 = 0, wave_ns: u64 = 0, joined: u64 = 0 };
 
 pub const Options = struct {
     /// The waves wait on the reads' event gates (the stream built with `event`); off: the host waits.
@@ -159,8 +160,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         row_bytes: [max_route_ids]u64 = @splat(0),
         /// The decode lane's host time, summed over calls until the caller zeroes it (`HostSplit`).
         host: HostSplit = .{},
-        /// The wide lane's combine on the GPU (`combine_source`), built at its first call.
+        /// The combine on the GPU (`combine_source`), built at its first call.
         combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
+        /// Tests: each decode-lane call's GPU combine also built as the op chain's join and combine and compared bit for
+        /// bit (`checked` the calls compared, `differed` those whose outputs differ).
+        combine_check: struct { on: bool = false, checked: u32 = 0, differed: u32 = 0 } = .{},
 
         /// The routes of the prompt layer whose misses were read at its start (`stageMisses`): each route's bank layer and
         /// experts, in route order; null once the call took it.
@@ -411,8 +415,47 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const n: u32 = @intCast(g.shapeOf(x).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
             if (n * k > self.stream.max_route_ids) return self.callWide(g, layer, x, indices, scores, n, k);
-            const y = if (bpl > 1) try self.callDecodeSplit(g, layer, x, indices, next_scores, n, k, hoist) else try self.callDecode(g, layer, x, indices, next_scores, n, k, hoist);
-            return combine(g, y, scores, g.dtypeOf(x));
+            const acc = if (bpl > 1) try self.callDecodeSplit(g, layer, x, indices, next_scores, n, k, hoist) else try self.callDecode(g, layer, x, indices, next_scores, n, k, hoist);
+            return self.joinCombine(g, &acc, scores, n, k, g.dtypeOf(x));
+        }
+
+        /// The decode lane's outputs `acc` (in wave order; `acc.pos` their routed positions) weighted by `scores` and
+        /// summed per row, in `dt`: on the GPU, at most `max_combine_parts` outputs, the combine reads each routed row
+        /// where its wave left it (`combineOnGpu`: the op chain's bits); else the rows joined in routed order and
+        /// `combine`.
+        fn joinCombine(self: *Self, g: *G, acc: *const Acc, scores: T, n: u32, k: u32, dt: ops.Dtype) !T {
+            const n_ids = n * k;
+            const outs = acc.outs[0..acc.n_outs];
+            if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0 and outs.len <= max_combine_parts) {
+                var loc: [max_route_ids]u32 = undefined;
+                var j: usize = 0;
+                for (outs, 0..) |part, pi| for (0..@intCast(g.shapeOf(part).dim(0))) |row| {
+                    loc[acc.pos[j]] = @as(u32, @intCast(pi)) << 24 | @as(u32, @intCast(row));
+                    j += 1;
+                };
+                const lc = try g.hostArray(std.mem.sliceAsBytes(loc[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
+                const out = try combineOnGpu(&self.combine_kernel, g, outs, lc, scores, n, k, self.hidden, dt);
+                if (self.combine_check.on) {
+                    const want = try combine(g, try self.joinRows(g, acc, n, k), scores, dt);
+                    var same: [1]f32 = undefined;
+                    _ = try g.hostF32(try g.sum(try g.sum(try g.astype(try g.equal(out, want), .float32), -1, false), -1, false), &same);
+                    self.combine_check.checked += 1;
+                    if (same[0] != @as(f32, @floatFromInt(n * @as(u32, @intCast(self.hidden))))) self.combine_check.differed += 1;
+                }
+                return out;
+            }
+            self.host.joined += 1;
+            return combine(g, try self.joinRows(g, acc, n, k), scores, dt);
+        }
+
+        /// `acc`'s rows in routed order, `[n, k, hidden]`.
+        fn joinRows(self: *const Self, g: *G, acc: *const Acc, n: u32, k: u32) !T {
+            const n_ids = n * k;
+            const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
+            var order: [max_route_ids]u32 = undefined;
+            for (acc.pos[0..acc.n_pos], 0..) |p, j| order[p] = @intCast(j);
+            const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
+            return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
         }
 
         /// `(y * scores[..., None]).sum(-2)` in f32, cast to `dt` (the reference's combine).
@@ -552,8 +595,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             }
         }
 
-        /// The decode lane: the routed outputs `[n, k, hidden]` in routed order.
-        fn callDecode(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
+        /// The decode lane: the routed outputs in wave order and their routed positions (`Acc`).
+        fn callDecode(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !Acc {
             const n_ids = n * k;
             const t0 = timeline.now();
             var id_buf: [max_route_ids]u16 = undefined;
@@ -611,11 +654,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             }
             self.stream.release(r);
             released = true;
-            const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
-            var order: [max_route_ids]u32 = undefined;
-            for (acc.pos[0..acc.n_pos], 0..) |p, j| order[p] = @intCast(j);
-            const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
-            return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+            return acc;
         }
 
         /// One route of a split call: its stream layer, its ids and their positions in the call (routed order), its
@@ -634,8 +673,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// expert and every route made before any wave (their reads in flight together; the last route settles the
         /// lookahead and reads ahead the next routed layer's experts over all its bank layers), every route's hit wave
         /// and the hoisted arrays in one commit, then each route's parts as fused waves, each once all its segments
-        /// landed; the outputs `[n, k, hidden]` in routed order.
-        fn callDecodeSplit(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
+        /// landed; the outputs in wave order and their routed positions (`Acc`).
+        fn callDecodeSplit(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !Acc {
             const n_ids = n * k;
             const bank = self.stream.bank;
             const t0 = timeline.now();
@@ -736,11 +775,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 self.stream.release(r);
                 sd.r = null;
             };
-            const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
-            var order: [max_route_ids]u32 = undefined;
-            for (acc.pos[0..acc.n_pos], 0..) |p, j| order[p] = @intCast(j);
-            const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
-            return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+            return acc;
         }
 
         /// Side `sd`'s positions in wave `w`, grouped by bank in first appearance: each group's rows of x through the
