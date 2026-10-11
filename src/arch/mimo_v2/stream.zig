@@ -2,7 +2,6 @@
 //! residency, asynchronous reads, windows, pinning and release; this bridge
 //! maps absolute model layers and exposes GatherQmm's {w, scales} bindings.
 const std = @import("std");
-const sdk = @import("sdk");
 const sdk_ext = @import("../../sdk_ext.zig");
 const mlx = @import("sdk").mlx;
 const bank_mod = @import("bank.zig");
@@ -40,15 +39,12 @@ pub const wide_depth: u8 = 2;
 pub const transient_rows: u32 = wide_depth * max_route_ids;
 pub const spec_threads: u32 = 2;
 pub const spec_slots: u32 = 4;
-// ---- +phase-rows: begin ----
 /// Decode's transient rows under the phase-rows route (`Options.transient_release`): the boundary frees the prompt's
 /// `transient_rows` and the grow allocates window 0 (`decodeRouteIds`) plus the stream's decode staging rows
 /// (`Stream.grow`).
 pub fn decodeTransientRows(window: DecodeWindow) u32 {
     return decodeRouteIds(window) + S.decode_staging_rows;
 }
-// ---- +phase-rows: end ----
-// ---- rows audit R3: begin ----
 /// R3 (mimo/decode-rows-audit): decode's window 0, chosen once at construction (settings `"decode_window"`). `verify`
 /// (the default) sizes it to the decode lane's widest route, `decode_lane_route_ids` = 4 rows x top-8 = 32 (a decode
 /// plan's transient loads are its distinct non-admitted misses, at most its ids: `LayerPolicy.planWith`); `route` is
@@ -66,7 +62,6 @@ pub fn decodeRouteIds(window: DecodeWindow) u32 {
         .route, .invalid => max_route_ids,
     };
 }
-// ---- rows audit R3: end ----
 pub const lookahead: S.Lookahead = .{ .k = 8, .tau = std.math.inf(f32), .budget = 2, .chunks = 4, .idle_busy = 0, .preread = true };
 
 /// Persistent rows are the caller's admitted routed-layer rows (47 for MiMo).
@@ -438,10 +433,6 @@ pub const StreamSource = struct {
         return self.stream.layers[self.relativeLayer(layer)].policy.capacity;
     }
 
-    pub fn prepareSeed(self: *StreamSource, layer: u32, ids: []const u16) !void {
-        return self.seedPrefill(layer, ids);
-    }
-
     pub fn seedPrefill(self: *StreamSource, layer: u32, ids: []const u16) !void {
         // A decode-phase wide call routes against the decode residency: the residency seed is the prompt's (the stream
         // refuses it in decode, `NotPrefill`). A phase route. (The MTP verify, M <= 4, takes the decode lane since
@@ -722,7 +713,7 @@ test "mimo sdk2 mxfp4 SDK GPU: asynchronous windows and bound six-component slot
     defer stream.deinit();
     var source = StreamSource.init(stream);
     var banks = try fixtureBindings(&source, &g);
-    try source.prepareSeed(1, &.{ 0, 1, 1, 2 });
+    try source.seedPrefill(1, &.{ 0, 1, 1, 2 });
     const first_ids = [_]u16{ 0, 1, 2, 3, 4, 5, 6, 7 };
     const second_ids = [_]u16{ 8, 9, 10, 11, 12, 13, 14, 15 };
     const first = try source.route(1, &first_ids, &.{});
@@ -800,7 +791,6 @@ fn checkFixtureCall(source: *StreamSource, g: *@import("../deepseek_v41/ops.zig"
     }
 }
 
-// ---- +phase-rows: begin ----
 // CPU (host slot memory, synthetic six-component records): the phase-rows route's boundary as Source drives it
 // (`Source.beginDecode` / `resumePrefill`): the transient release, the grow by decode - prompt rows on every layer
 // (window 0 re-created at `decodeTransientRows`), and the reverse change back to the prompt's rows and scratch.
@@ -867,9 +857,7 @@ fn phaseRowsBoundary(prompt_rows: [2]u32, decode_rows: [2]u32) !void {
     }
     try testing.expectEqual(@as(u32, 16), stream.transient.rows);
 }
-// ---- +phase-rows: end ----
 
-// ---- rows audit R3: begin ----
 // CPU (host slot memory, synthetic records, no MLX): decode's window 0 at `Options.decode_route_ids` rows. The grow
 // allocates exactly that many, every decode route's transient loads land inside it (routes of decode_route_ids distinct
 // ids, all misses, on layers whose persistent rows fill up: the window's worst case), the shrink frees exactly it, and
@@ -975,7 +963,6 @@ test "mimo rows audit R3: decode's window 0 holds decode_route_ids rows and ever
     try testing.expect(ss.decoding());
     try testing.expectEqual(window + S.decode_staging_rows, stream.transient.rows);
 }
-// ---- rows audit R3: end ----
 
 // ── HITPASS CPU tests: a host-memory MiMo stream (layer 0 dense, two routed layers, 64 experts, 4 rows each) over a
 // tmp sidecar; pool pread workers and host slot rows only. No MLX array, device or lock. ──

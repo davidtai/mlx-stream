@@ -16,7 +16,6 @@ const glue = @import("glue.zig");
 const prefill_attention = @import("prefill_attention.zig");
 const source_mod = @import("source.zig");
 const bank_mod = @import("bank.zig");
-const prepared = @import("prepared.zig");
 const kv_storage = @import("kv.zig");
 const profile = @import("profile.zig");
 const draft = @import("draft.zig");
@@ -618,7 +617,6 @@ pub const Module = struct {
         return result;
     }
 
-    // ---- rows audit R2: begin ----
     /// The prompt->decode boundary (Module.prefill / extend): the prompt pass's FP8 cache released BEFORE the source's
     /// phase change (the transient release and the growth, or under R2 the transient release alone: `growPending`), and
     /// the prompt route closed when the growth ran here and nothing in the decode phase takes it
@@ -641,7 +639,6 @@ pub const Module = struct {
             self.traceResidents(t, false);
         };
     }
-    // ---- rows audit R2: end ----
 
     /// Rows audit (evidence for the decode bill's declared and measured terms: host_runtime, compiler_runtime, mlx_cache):
     /// the decode phase's memory at the request's receipt, once per request (the lane's `[spec-stats]` receipt, never per
@@ -856,7 +853,6 @@ pub const Module = struct {
     }
 };
 
-// ---- X19 (mimo/router-bf16): begin ----
 /// The verify's router (M = 2..4): addnorm32's F32 cast of the norm times the transposed F32 copy (MLX's split-K GEMM);
 /// the returned `x` holds the logits.
 fn verifyRouterF32(self: *Module, a: Array, b: Array, w: Array, r: Router) anyerror!glue.AddNorm {
@@ -868,8 +864,6 @@ fn verifyRouterF32(self: *Module, a: Array, b: Array, w: Array, r: Router) anyer
     post.x = logits;
     return post;
 }
-
-// ---- X19: end ----
 
 /// The verify forward's read-ahead route: none (it runs in the decode phase).
 pub const verify_read_ahead: ReadAhead = readAheadOff;
@@ -942,7 +936,8 @@ pub const QLinear = struct {
     pub fn forward(q: QLinear, x: Array, s: Stream) !Array {
         return q.run(&q, x, s);
     }
-    /// The FP8 route: the release's codes x block scales in the kernels (M <= 8: GEMV; M > 8: the NAX GEMM).
+    /// The FP8 route: the release's codes x block scales (M <= 8: the GEMV; M > 8: the prompt route, bf16(code x scale)
+    /// under MLX's GEMM; fp8_linear.zig).
     fn forwardFp8(q: *const QLinear, x: Array, s: Stream) anyerror!Array {
         return fp8_linear.forward(&q.fp8, x, q.w, q.scales, s);
     }
@@ -1717,13 +1712,6 @@ pub fn concatenate(a: Array, b: Array, axis: c_int, s: Stream) !Array {
     errdefer drop(out);
     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, axis, s));
     return out;
-}
-/// `mx.async_eval(x)`: the GPU starts on `x`; nothing waits (a later eval of `x` waits for it).
-fn asyncEval(x: Array) !void {
-    const one = [_]Array{x};
-    const vec = mlx.mlx_vector_array_new_data(&one, one.len);
-    defer _ = mlx.mlx_vector_array_free(vec);
-    try mlx.check(mlx.mlx_async_eval(vec));
 }
 fn joinEvaluated(arrays: []const Array, axis: c_int, s: Stream) !Array {
     const vec = mlx.mlx_vector_array_new_data(arrays.ptr, arrays.len);

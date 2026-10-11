@@ -61,7 +61,6 @@ pub fn archBill(a: std.mem.Allocator, io: std.Io, c: settings.Config, reserve: u
     return archTerms(a, c, resident, if (c.mtp_heads) try mtpHeadsBytes(a, io, dir) else 0, reserve);
 }
 
-// ---- +attn (prefill_attention.zig): begin ----
 /// The NAX prompt route's own request arrays, billed while the route can install (any setting but the stock control;
 /// on a device without NAX the unresolved default over-bills by these bytes): a global span's K/V arrays at the span
 /// rule's rows (`attentionSpanRows`, the module's one function: one span per call up to 16,384 rows) and the
@@ -74,8 +73,6 @@ pub fn attentionRouteBytes(config: settings.Config, reserve: u64) u64 {
     return prefill_attention.spanRowBytes(c.n_kv_heads) * prefill_attention.attentionSpanRows(c.n_kv_heads, .full, call) +
         prefill_attention.passStateBillBytes(reserve);
 }
-
-// ---- +attn: end ----
 
 fn archTerms(a: std.mem.Allocator, config: settings.Config, resident: u64, mtp: u64, reserve: u64) !sdk.MemoryBill {
     const c = config.mimo;
@@ -134,8 +131,6 @@ fn archTerms(a: std.mem.Allocator, config: settings.Config, resident: u64, mtp: 
     return .{ .terms = try a.dupe(Term, &terms) };
 }
 
-
-// ---- stack-next8 M1-M3: begin ----
 /// M1+M2: the decode phase's `host_runtime` and `compiler_runtime` bytes: the measured host side
 /// (`settings.decode_host_bytes`, both terms together, compiler_runtime 0) where the readings cover the construction
 /// reserve and the phases are billed apart; else the declared pair (`host_bytes`, `compilation_bytes`).
@@ -143,7 +138,6 @@ pub fn decodeHostTerms(config: settings.Config, reserve: u64) struct { host: u64
     if (!config.phase_rows or reserve > settings.decode_host_measured_reserve) return .{ .host = settings.host_bytes, .compiler = settings.compilation_bytes };
     return .{ .host = settings.decode_host_bytes, .compiler = 0 };
 }
-// ---- stack-next8 M1-M3: end ----
 
 /// P7: MLX's cache limit through the prompt pass (`settings.Scratch`): the pooled route's `prompt_pool_cache_bytes`,
 /// else the decode phase's `allocator_cache_bytes`. MLX trims its cache to the limit after every allocation.
@@ -151,7 +145,6 @@ pub fn promptCacheBytes(config: settings.Config) u64 {
     return if (config.prefill_scratch == .pooled) mimo.prompt_pool_cache_bytes else mimo.allocator_cache_bytes;
 }
 
-// ---- rows audit R2: begin ----
 /// The FP8 prompt route's cache and its wiring (fp8_linear.PromptCache's `fp8_prompt_slots` widest projections in BF16:
 /// X18's default 3 = layer 0's gate / up / down, 402,653,184 B + 590,032 B wiring; the control's 4 adds q); 0 off the tier.
 pub fn fp8PromptBytes(config: settings.Config) u64 {
@@ -186,9 +179,7 @@ pub fn checkDeferredGrowth(b: sdk.MemoryBill, config: settings.Config) !void {
     const window0 = @as(u64, stream.decodeTransientRows(config.decode_window)) * (b.per_row / mimo.moe_layers);
     if (b.fixed(.decode) -| window0 + catchUpBytes(config.mimo) > b.fixed(.prompt)) return error.MimoCatchUpOverPrompt;
 }
-// ---- rows audit R2: end ----
 
-// ---- +phase-rows: begin ----
 /// The decode phase's widest forward: the serial lane's one row, or the draft lane's verify rows (`Module.verifyRows`
 /// refuses more). Every forward wider than this runs in the prompt phase (`Module.extend` resumes it first).
 pub fn decodeWidth(config: settings.Config) u64 {
@@ -210,7 +201,6 @@ pub fn phaseRequest(config: settings.Config, reserve: u64) struct { other: u64, 
     const overshoot = @max(cacheOvershoot(c, reserve, .decode), m * @max(@as(u64, c.vocab_size) * 4, @as(u64, c.n_heads) * reserve * 4));
     return .{ .other = other, .overshoot = overshoot };
 }
-// ---- +phase-rows: end ----
 
 /// The MTP lane's working set (`mtp_workspace`, without its wiring).
 pub fn laneWorkspace(c: mimo.Config) u64 {
@@ -222,7 +212,6 @@ fn laneRetainBytes(c: mimo.Config) u64 {
     const sliding: u64 = c.n_layers - c.fullLayers();
     return 2 * sliding * c.swa_n_kv_heads * mtp_mod.max_drafts * (c.head_dim + c.value_head_dim) * 2;
 }
-// ---- end mimo/mtp ----
 
 /// U1: MLX's cache can end one freed buffer over its limit (metal/allocator.cpp `free` recycles while the cache is
 /// under its limit), billed as DeepSeek bills it (`MLX cache overshoot`, deepseek_v41_bill.zig `cacheOvershootPrompt` /
@@ -1083,7 +1072,6 @@ test "mimo mtp bill: the lane's workspace term follows the lane (the heads stay 
     std.debug.print("MIMO_MTP_BILL heads={d} workspace={d} workspace_wired={d} per_row={d}\n", .{ 3 * mtp_mod.headPayloadBytes(c, mtp_mod.q4_storages), laneWorkspace(c), ws, on.per_row });
 }
 
-// ---- +attn (prefill_attention.zig): begin ----
 test "mimo +attn bill: module and bill read one span rule at 16K, 128K and 1M; the pass state is billed; stock bills neither; the default bills the route it installs" {
     const a = testing.allocator;
     // The NAX route named explicitly and the default bill the span rule's bytes at every reservation (NAX at every served
@@ -1129,8 +1117,6 @@ test "mimo +attn bill: module and bill read one span rule at 16K, 128K and 1M; t
         std.debug.print("MIMO_ATTN_BILL cell16k baseline={d} rows_stock={d} rows_nax={d}\n", .{ baseline, rows[0], rows[1] });
     }
 }
-// ---- +attn: end ----
-// ---- +phase-rows: begin ----
 test "mlx-stream MiMo bill: phase rows bill decode's own terms, fill each phase, and grow by decode - prompt rows" {
     const a = testing.allocator;
     const g = try bank.Geometry.init(4096, 2048, 256, 1, 47);
@@ -1228,9 +1214,7 @@ test "mlx-stream MiMo bill: phase rows forced rows: expert_rows the decode rows,
     c.expert_rows = 257;
     try testing.expectError(error.MimoExpertRows, choose(b, c, box_ceiling, box_stop));
 }
-// ---- +phase-rows: end ----
 
-// ---- rows audit (mimo/decode-rows-audit): begin ----
 /// The fp8 pack's geometry for the rows-audit bills: the FP8 residents flag and the pack's file bytes (the bill tool reads
 /// the same from the pack's headers: residents 8,895,321,472 B, sidecar 1,189,592,448 B).
 const fp8_pack_residents: u64 = 8_895_321_472;
@@ -1344,8 +1328,6 @@ test "mimo rows audit bill: the deferred growth's catch-up fits the prompt phase
     serial.mtp_heads = false;
     try checkDeferredGrowth(thin, serial);
 }
-
-// ---- rows audit: end ----
 
 test "mimo fp8res bill: the census counts two arrays per FP8 projection (codes + scales), one per BF16 one; the residents term is the pack's file bytes" {
     var bf16: mimo.Config = .{};

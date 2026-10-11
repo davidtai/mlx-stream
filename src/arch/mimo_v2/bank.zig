@@ -1,7 +1,6 @@
 //! Byte-preserving six-component MXFP4 expert records.
 const std = @import("std");
 const io_util = @import("sdk").io_util;
-const sdk = @import("sdk");
 const sdk_ext = @import("../../sdk_ext.zig");
 const mlx = @import("sdk").mlx;
 const Module = @This();

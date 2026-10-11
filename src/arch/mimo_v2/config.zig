@@ -620,8 +620,6 @@ test "mlx-stream MiMo resident storage refusals: widths, groups, mixed roles, un
     try std.testing.expectEqualStrings("MiMo V2.6 Flash config: undeclared resident projections", diag.message());
 }
 
-// ---- fp8res (`residents_format: "fp8_block128"`): begin ----
-
 const fp8_entry = "{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[64,128]}";
 const fp8_flag = ",\"residents_format\":\"fp8_block128\"";
 /// The fp8res pack's split: embed, head, q, k, v, o, mlp.
@@ -692,4 +690,3 @@ test "mlx-stream MiMo fp8res refusals: FP8 without the flag, the flag over anoth
         try std.testing.expectEqualStrings("MiMo V2.6 Flash config: resident quantization", diag.message());
     }
 }
-// ---- fp8res: end ----

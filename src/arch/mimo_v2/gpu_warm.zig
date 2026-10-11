@@ -1,9 +1,10 @@
 //! MiMo X12 `gpu_keep_warm` (mimo/gpu-warm): keep the GPU busy while the decode lane's event-gated miss parts wait for
 //! their expert bytes, so the clock the serial GPU parts (miss parts, attention, the next hit wave) run at is not the
 //! one a ~2 ms idle gap leaves behind. A construction-time route, read once (settings `"gpu_keep_warm"`):
-//!   "off" (the control and the default): nothing is installed; `StreamSource.gate` is the stock call.
-//!   "waits": a trivial resident kernel (one dependent FMA chain per thread, ONE simdgroup, its own 32 KiB buffer) on
-//!            its own Metal command queue (csrc/mimo_gpu_warm.inc: MLX's device, not MLX's stream), committed in
+//!   "off" (the control): nothing is installed; `StreamSource.gate` is the stock call.
+//!   "waits" (the default): a trivial resident kernel (one dependent FMA chain per thread, ONE simdgroup, its own
+//!            32 KiB buffer) on its own Metal command queue (csrc/mimo_gpu_warm.inc: MLX's device, not MLX's
+//!            stream), committed in
 //!            short chunks (~500 us, adapted from each chunk's GPU time) by a warm thread while the stream's
 //!            MTLSharedEvent is below the value the newest committed gated wait needs. The decode lane arms it from
 //!            `StreamSource.gate` (the decode phase only: the stream's phase, one field read): one atomic max, and a
@@ -20,8 +21,8 @@ const mlx = @import("sdk").mlx;
 
 const log = std.log.scoped(.mimo);
 
-/// The warm engine's counters (`Stats`) are written in profile and test builds only: their readers are the MTP profile's
-/// `MIMO_GPU_WARM` line and the CPU proofs. A served build's warm thread keeps only its working state.
+/// The warm engine's counters (`Stats`) are written in profile and test builds only: their readers are the MTP
+/// profile's `MIMO_GPU_WARM` line and the CPU proofs. A served build's warm thread keeps only its working state.
 const counting = @import("profile.zig").enabled or builtin.is_test;
 
 /// `off`: nothing. `waits`: warm while a committed gated wait (decode miss parts, prompt group reads) is below the

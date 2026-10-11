@@ -191,7 +191,6 @@ pub const Cache = struct {
     k: Triple = .{},
     v: Triple = .{},
     rows: u32 = 0,
-    // ---- mimo/mtp rollback (L2 merge: the SDK ring's rollback/trim entry point replaces this hunk) ----
     /// Rows a sliding cache keeps past its window for the draft lane's rollback (0 without the lane); an installed
     /// construction value, kept across requests.
     retain: u32 = 0,
@@ -203,7 +202,6 @@ pub const Cache = struct {
         std.debug.assert(n <= c.rows);
         c.rows -= n;
     }
-    // ---- end mimo/mtp rollback ----
 
     pub fn deinit(c: *Cache) void {
         c.k.deinit();

@@ -288,13 +288,6 @@ fn expectDims(v: ?std.json.Value, sh: Shape) !void {
     for (a.array.items, sh.dims[0..sh.rank]) |d, want| if (d != .integer or d.integer != want) return error.MimoMtpTensorShape;
 }
 
-/// The manifest's payload (the bill's resident term), checked against `c`; no tensor bytes read.
-pub fn payloadBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, c: mimo.Config) !u64 {
-    const text = try readManifest(a, io, dir);
-    defer a.free(text);
-    return (try Manifest.parse(a, text, c)).payload_bytes;
-}
-
 fn readManifest(a: std.mem.Allocator, io: std.Io, dir: []const u8) ![]u8 {
     var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
     defer d.close(io);
@@ -875,7 +868,7 @@ test "mimo mtp: a synthetic sidecar verifies tensor by tensor, and a flipped byt
     const m = try verifySidecar(a, io, path, c, Count{ .n = &n, .bytes = &bytes });
     try testing.expectEqual(@as(usize, 90), n);
     try testing.expectEqual(m.payload_bytes, bytes);
-    try testing.expectEqual(3 * headPayloadBytes(c, q4_storages), try payloadBytes(a, io, path, c));
+    try testing.expectEqual(3 * headPayloadBytes(c, q4_storages), m.payload_bytes);
     inline for (.{ .{ Corrupt.flip, error.MimoMtpTensorSha }, .{ Corrupt.rename, error.MimoMtpManifestTensors }, .{ Corrupt.file_sha, error.MimoMtpSidecarSha } }) |case| {
         try writeSidecar(a, io, tmp.dir, c, case[0], q4_storages);
         try testing.expectError(case[1], verifySidecar(a, io, path, c, Count{ .n = &n, .bytes = &bytes }));
@@ -1181,8 +1174,6 @@ test "mimo mtp: the token ring appends by position, restarts at a gap, keeps the
     try testing.expect(!st.ready(300)); // tokens no longer reach x_11
 }
 
-// ---- fp8res (`residents_format: "fp8_block128"`): begin ----
-
 /// The fp8res sidecar's storages: the release's split (q/k/v/gate/up/down FP8, eh_proj and o_proj BF16).
 pub const fp8_storages: Storages = blk: {
     var st: Storages = @splat(mimo.Storage.fp8_block128);
@@ -1277,4 +1268,3 @@ test "mimo mtp fp8res: the sidecar's FP8 projections parse under the trunk's fla
         try testing.expectError(error.MimoMtpTensorShape, Manifest.parse(a, text, c));
     }
 }
-// ---- fp8res: end ----

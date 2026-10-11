@@ -392,10 +392,6 @@ pub const Source = struct {
 
     /// GPU-lock owning caller only. Stream owns the process's one pool and
     /// every slot bank; the original Bank remains the only fd owner.
-    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream) !*Source {
-        return initWith(a, io, model_dir, rows, gates, stream, .{});
-    }
-
     pub fn initWith(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, opts: Options) !*Source {
         var bank = try bank_mod.Bank.open(a, io, model_dir);
         bank.geometry.requireMiMo() catch |err| {
@@ -683,7 +679,6 @@ pub const Source = struct {
         try self.ex.grow(&self.g, self.rows);
     }
 
-    // ---- rows audit R2: begin ----
     /// R2: the boundary's deferred growth, at the decode phase's first forward (Module.verifyRows / a serial step): every
     /// layer grows to the decode rows and decode's window 0 is allocated. No route ran since the boundary (the heads are
     /// dense), so the stream is as `beginDecode` left it. A no-op when nothing is pending.
@@ -699,7 +694,6 @@ pub const Source = struct {
     pub fn growPending(self: *const Source) bool {
         return self.grow_pending;
     }
-    // ---- rows audit R2: end ----
 
     /// `decodeLane` for this source's phase (the stream's phase: one field read, the phase route).
     pub fn decodeLaneAt(self: *const Source, nt: u32) bool {

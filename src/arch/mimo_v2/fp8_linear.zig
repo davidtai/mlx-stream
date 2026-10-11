@@ -14,7 +14,7 @@
 //! `mimo_fp8_dequant_bf16` writes the projection's BF16 weight (the BF16 pack's tensor, bit for bit) into a
 //! four-slot LRU (`PromptCache`, released at the end of every prompt pass, billed geometrically) and MLX's stock NAX
 //! GEMM multiplies it: the BF16 tier's prompt arithmetic exactly (fp8res1 bench: the fp8 NAX GEMM ran 0.74-0.93x of
-//! the stock GEMM and the threadgroup-tile variant 0.22-0.83x on every site; both stay staged in the microbench). The
+//! the stock GEMM and the threadgroup-tile variant 0.22-0.83x on every site; both were removed). The
 //! installed route needs no tensor units: the GEMV and the dequant are plain Metal and the prompt GEMM is MLX's own
 //! route for the device (fp8res2: the NAX-only refusal of the fp8 GEMM era is gone with that GEMM).
 //!
@@ -28,10 +28,7 @@
 //!     rounding) under MLX's stock GEMM (f32 accumulation in its NAX tile order). Rounding-class against the GEMV and
 //!     against the release (the BF16 weight rounding the decode path avoids); bit-equal to the BF16 tier's prompt GEMM
 //!     for the same input rows; a row's value does not depend on the other rows (MLX's GEMM is row-independent).
-//!   fp8 NAX GEMM (staged, not installed): per release 128-column block, the tensor unit's f32 sum of the exact products
-//!     x * (code / 256), promoted by fma(block sum, scale x 256, acc) in block order.
-//! Device self-checks: pre-ship family `fp8res` (`MIMO_FP8RES_GPU=1`); the staged microbench: `fp8res_bench`
-//! (`MIMO_FP8RES_BENCH=1`). Construction runs neither.
+//! Device self-checks: pre-ship family `fp8res` (`MIMO_FP8RES_GPU=1`); construction runs none.
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const mimo = @import("config.zig");
@@ -82,8 +79,7 @@ pub fn checkPins() !void {
 pub const gemv_kv: u32 = 8;
 pub const gemv_step: u32 = 32 * gemv_kv;
 /// The simdgroups that fill the GPU once (the M5 Max: 40 cores x ~24 resident simdgroups): a site with fewer rows
-/// splits K (KS) until it has them. Derived from the device shape and the real N; the staged microbench
-/// (`fp8res_bench`) sweeps R and KS at every site to replace it with measured geometry.
+/// splits K (KS) until it has them. Derived from the device shape and the real N.
 pub const gemv_target_simdgroups: u32 = 1024;
 
 /// One site's GEMV geometry: R rows per simdgroup (one 64-row scale row: 64 % R == 0), KS K partitions per row group
@@ -1445,18 +1441,4 @@ test "mimo fp8res GPU check: prompt route: the dequantized weight is the host bf
     std.debug.print("MIMO_FP8RES_PROMPT lru slots_used={d} cap={d} failed={d}\n", .{ hits, cache.cap, failed });
     try testing.expect(hits <= cache.cap);
     try testing.expectEqual(@as(usize, 0), failed);
-}
-
-// ---- the staged microbench (pre-ship family `fp8res_bench`: MIMO_FP8RES_BENCH=1, guarded window; measures, gates nothing) ----
-
-fn stamp() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
-/// The installed prompt route paying its dequant (the first tile / span of a layer).
-fn promptColdCall(k: *const Kernels, n: c_int, kdim: c_int, x: Array, w: Array, sc: Array, s: Stream) !Array {
-    k.prompt.?.release();
-    return promptRun(k, n, kdim, x, w, sc, s);
 }

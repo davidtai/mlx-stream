@@ -153,7 +153,6 @@ pub fn pipelinedExtraBytes(hidden: u64, inter: u64, tokens: u32) u64 {
 pub const PredictRoute = enum { f32, bf16, invalid };
 
 pub const Predictor = struct {
-    route: PredictRoute = .f32,
     rows: glue.RouterRows = .{},
     scores: *const fn (*const Predictor, *ops.MlxOps, T, T, T) anyerror!T = scoresF32,
 
@@ -161,7 +160,7 @@ pub const Predictor = struct {
     pub fn install(route: PredictRoute, geometry: bank_mod.Geometry) !Predictor {
         return switch (route) {
             .f32 => .{},
-            .bf16 => .{ .route = .bf16, .rows = try glue.RouterRows.init(geometry.hidden_size, geometry.num_experts), .scores = scoresBf16 },
+            .bf16 => .{ .rows = try glue.RouterRows.init(geometry.hidden_size, geometry.num_experts), .scores = scoresBf16 },
             .invalid => error.MimoPredictRouter,
         };
     }
@@ -320,15 +319,6 @@ pub const Math = struct {
     /// The per-pair down rows [P, H] bf16 (the scheduler's join and the arch's combine follow).
     pub fn downBanked(self: *const Math, g: *ops.MlxOps, h: T, ids: T, banks: *const [moe.n_banks]Arrays) !T {
         return self.fused.?.down(g, h, ids, banks);
-    }
-
-
-    /// One expert's 3D bank view, shared by its bounded matrix tiles.
-    fn row(g: *ops.MlxOps, p: Proj, slot: u32, in: c_int, out: c_int) !Proj {
-        const s: c_int = @intCast(slot);
-        const words = try g.slice(p.w, &.{ s, 0, 0 }, &.{ s + 1, out, @divExact(in, 8) }, &.{ 1, 1, 1 });
-        const scales = try g.slice(p.scales.?, &.{ s, 0, 0 }, &.{ s + 1, out, @divExact(in, 32) }, &.{ 1, 1, 1 });
-        return .{ .w = words, .scales = scales };
     }
 
     /// x is [1,count,K], so the existing gather operation sees the actual

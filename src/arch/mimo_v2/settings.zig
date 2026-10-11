@@ -21,7 +21,6 @@ pub const host_bytes: u64 = 1_000_000_000;
 /// (stack-next REPORT, construction check).
 pub const host_construction_bytes: u64 = 400_000_000;
 
-// ---- stack-next8 M1-M3: the decode phase's host side, measured: begin ----
 /// M1 (`host_runtime`) + M2 (`compiler_runtime`), the DECODE phase only (bill.zig `decodeHostTerms`): one measured bound
 /// for the process's host side, i.e. its footprint less MLX's active and cache (the host's allocations, the compiled
 /// graphs and Metal pipelines: what neither MLX nor any geometric term counts), the reading `Module.logDecodeMemory`
@@ -63,7 +62,6 @@ comptime {
     if (decode_host_bytes < host_construction_bytes) @compileError("decode host side under its construction bound");
     if (decode_host_bytes > host_bytes + compilation_bytes) @compileError("decode host side over the declared terms");
 }
-// ---- stack-next8 M1-M3: end ----
 
 pub const KVMode = enum { q8, bf16, invalid };
 
@@ -308,14 +306,12 @@ pub const Config = struct {
     /// platform line); `"prefill_attention": "stock"` installs the stock control, `"nax"` refuses on a device without NAX;
     /// anything else refuses by name.
     prefill_attention: ?@import("prefill_attention.zig").Route = null,
-    // ---- +phase-rows: begin ----
     /// Phase-split expert rows (audit task 8), read once at construction: the bill charges the prompt-only terms (the
     /// token and layer workspaces, the routed join, the 96 transient rows, the prompt span state and overshoot) in the
     /// prompt phase only, the fill admits prompt rows and decode rows separately, and the prompt->decode boundary frees
     /// the transient scratch and grows every slot bank by the difference (bill.zig `phaseTerms`, source.zig
     /// `beginDecode`). `"phase_rows": false` installs the control: one row count for both phases, as before.
     phase_rows: bool = true,
-    // ---- +phase-rows: end ----
     /// The prompt pass's tile drains (math.zig `Drain`), read once at construction: `"pipelined"` (the default: the
     /// measured best, cells/prefill1-bf16-20261008: 544.9/549.1 vs sync 491.5/495.7 prefill tok/s, TTFT -3.3 s, ids
     /// identical across all five cells) commits each expert projection / reduction tile and waits the one before it
@@ -389,7 +385,6 @@ pub const Config = struct {
     /// exact, cells/k2-20261009 missfree round 69.0 -> 68.3 ms, ids identical) the fused kernels (the stock ops'
     /// arithmetic); `"decode_glue": "ops"` is the control; anything else refuses by name.
     decode_glue: @import("glue.zig").Route = .fused,
-    // ---- rows audit (mimo/decode-rows-audit): begin ----
     /// R2: the boundary's growth under the MTP lane (phase rows on), read once at construction. `"after_draft"` (the
     /// default) grows every slot bank to the decode rows at the decode phase's first forward (the verify, or a serial
     /// step), after the lane's first draft: the heads' catch-up over the prompt's last `window` rows (M > 8, the FP8 prompt
@@ -405,7 +400,6 @@ pub const Config = struct {
     /// transient loads are its distinct misses); `"route"` is the control (the SDK's `max_route_ids`, 48). Exact: the same
     /// plans and slot indices; the 16 rows no decode call can reach are not allocated or billed.
     decode_window: @import("stream.zig").DecodeWindow = .verify,
-    // ---- rows audit: end ----
     /// X12 (mimo/gpu-warm, gpu_warm.zig): while the decode phase's event-gated miss parts wait for their expert bytes,
     /// a trivial resident kernel (one simdgroup, its own 32 KiB buffer) on its own Metal queue keeps the GPU busy, so
     /// the serial GPU parts after each wait do not start from an idle clock. Read once at construction: `"waits"` (the
@@ -417,9 +411,9 @@ pub const Config = struct {
     /// control at construction with one log line (`Module.init`: `route gpu_keep_warm=off reason=...`); the bill keeps
     /// the default's 1 MiB `gpu_warm` term there (an over-bill on a CPU stream only).
     gpu_keep_warm: gpu_warm.Route = .waits,
-    /// Set by `applySettings` when the request names `gpu_keep_warm` (a named setting wins over the window environment).
+    /// Set by `applySettings` when the settings name `gpu_keep_warm`: a named route refuses where the default takes the
+    /// control (`gpuKeepWarmIsDefault`; `Module.init`, a CPU stream).
     gpu_keep_warm_requested: bool = false,
-    // ---- X18 (mimo/dequant-audit): begin ----
     /// The FP8 prompt route's BF16 weight cache (fp8_linear.zig `PromptCache`; the fp8res tier only, nothing installs on
     /// the BF16 / affine tiers), read once at construction: `3` (the default) holds one layer's set (its attention's q /
     /// k / v, or layer 0's dense gate / up / down), which every prompt call order the trunk runs needs (the CPU replay
@@ -434,15 +428,12 @@ pub const Config = struct {
     /// changes an output's summation order (KS fixed per site), so every width's rows are the control's bit for bit;
     /// `"fp8_gemv_plan": "fixed"` is the control (the site plan at every width); anything else refuses by name.
     fp8_gemv_plan: fp8_linear.GemvRoute = .by_rows,
-    // ---- X18: end ----
-    // ---- X19 (mimo/router-bf16): begin ----
     /// The decode lookahead predictor's router (math.zig `PredictRoute`), read once at construction: `"bf16"` (the
     /// default) reads the router's BF16 weight through `mimo_glue_router_rows` (each row the M = 1 product: bit-equal to
     /// the control at M = 1, the M = 1 numerics at the verify's M > 1 where the control runs gather_mv's order); token-exact
     /// (the scores choose only the lookahead's pre-reads); `"predict_router": "f32"` is the control (the transposed F32
     /// copy); anything else refuses by name.
     predict_router: PredictRoute = .bf16,
-    // ---- X19: end ----
 
     pub fn withFacts(c: Config, facts: *const sdk.LoadFacts) Config {
         var out = c;
@@ -1008,7 +999,6 @@ test "mimo gpu warm settings: gpu_keep_warm waits by default (stack-next8), off 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
-// ---- +phase-rows: begin ----
 test "mimo phase rows: on by default; \"phase_rows\": false installs the equal-rows control" {
     var c: Config = .{};
     try std.testing.expect(c.phase_rows);
@@ -1018,7 +1008,6 @@ test "mimo phase rows: on by default; \"phase_rows\": false installs the equal-r
     try std.testing.expect(!c.phase_rows);
     try c.validate();
 }
-// ---- +phase-rows: end ----
 
 test "mimo settings: mtp_lane, prefill_read_ahead, phase_rows, decode_moe and prefill_attention refuse a value their key does not take, by name" {
     const cases = [_]struct { text: []const u8, err: anyerror }{
