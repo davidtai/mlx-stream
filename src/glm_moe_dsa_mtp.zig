@@ -656,7 +656,7 @@ pub fn Lane(comptime kind: BankKind) type {
             const m = g.mark();
             defer g.resetTo(m);
             const old = self.pending.?;
-            self.pending = if (n == self.n_pending) null else g.keep(try graph.rowSlice(g, old, @intCast(n), @intCast(self.n_pending)));
+            self.pending = if (n == self.n_pending) null else g.keep(try rowCopy(g, old, n, self.n_pending));
             if (self.pending) |p| try g.evalAll(&.{p});
             g.release(old);
             self.n_pending -= n;
@@ -762,7 +762,9 @@ pub fn Lane(comptime kind: BankKind) type {
                 const m = g.mark();
                 defer g.resetTo(m);
                 const old = self.pending.?;
-                self.pending = g.keep(graph.rowSlice(g, old, 0, @intCast(rows)) catch return k);
+                const kept = rowCopy(g, old, 0, rows) catch return k;
+                g.evalAll(&.{kept}) catch return k;
+                self.pending = g.keep(kept);
                 g.release(old);
                 self.n_pending = rows;
             }
@@ -779,7 +781,42 @@ pub fn Lane(comptime kind: BankKind) type {
     };
 }
 
+/// Rows [lo, hi) of `x` (its axis n - 2) as a copy, for the lane's pending rows: a slice's view keeps all of `x`
+/// alive (one pending row would hold the prompt call's whole 16,387-row hidden into the decode).
+fn rowCopy(g: *G, x: T, lo: u32, hi: u32) !T {
+    return g.take(x, try g.arange(@floatFromInt(lo), @floatFromInt(hi), 1, .uint32), @intCast(g.shapeOf(x).n - 2));
+}
+
 const testing = std.testing;
+
+test "glm mtp: the lane's kept pending rows are a copy: the rows' values, and the source's buffer leaves MLX's active memory at its release" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(testing.allocator, s);
+    defer g.deinit();
+    const rows = 4096;
+    const hidden = 1024;
+    const m = g.mark();
+    const x = g.keep(try g.reshape(try g.arange(0, rows * hidden, 1, .float32), &.{ 1, rows, hidden }));
+    try g.evalAll(&.{x});
+    g.resetTo(m);
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    const y = g.keep(try rowCopy(&g, x, rows - 2, rows));
+    try g.evalAll(&.{y});
+    g.resetTo(m);
+    defer g.release(y);
+    g.release(x);
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    // the source's 16 MiB left (a view would keep them: no fall); the copy's two rows stay, rounded up by the allocator
+    try testing.expect(before -| after >= rows * hidden * 4 / 2);
+    var got: [2 * hidden]f32 = undefined;
+    _ = try g.hostF32(try g.reshape(y, &.{-1}), &got);
+    for (got, 0..) |v, i| try testing.expectEqual(@as(f32, @floatFromInt((rows - 2) * hidden + i)), v);
+    g.resetTo(m);
+}
 
 test "glm mtp: the route limit gives depth 5; the MTP layer config is one full, routed layer" {
     try testing.expectEqual(@as(u32, 5), max_depth);
