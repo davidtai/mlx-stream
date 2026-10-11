@@ -17,8 +17,9 @@ const LayerPolicy = expert_policy.LayerPolicy;
 /// The widest per-row candidate list a selector keeps (its `k`).
 pub const max_k = 12;
 pub const max_budget = 4;
-/// Verify rows per layer call.
-pub const max_rows = 8;
+/// Verify rows per layer call: GLM-5.3's widest verify (`expert_policy.max_plan_ids` ids at top-8), which its settings
+/// assert; DeepSeek-V4.1's 8 rows fit in it.
+pub const max_rows = expert_policy.max_plan_ids / 8;
 /// Certain misses handed to one pre-read; the re-validation candidate cap.
 pub const max_candidates = 64;
 

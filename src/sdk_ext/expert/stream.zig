@@ -23,6 +23,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         pub const Phase = expert_policy.Phase;
         pub const Plan = expert_policy.Plan;
         pub const max_route_ids = expert_policy.max_route_ids;
+        /// The widest route a plan holds (a decode route up to decode's window: `Options.decode_window_rows`).
+        pub const max_plan_ids = expert_policy.max_plan_ids;
 
         /// A routed id's records: `Layer.minis` when the bank declares it (GLM-5.3's EXL3 bank: an expert's tensor-parallel
         /// minis, adjacent in the file at `Layer.record_bytes` and in the slot rows), else 1.
@@ -354,8 +356,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// The phase change's transient release installed (`releaseTransient`, then the grow's window 0); off: the whole
             /// scratch stays through decode.
             transient_release: bool = false,
-            /// Decode's window 0 under the release: the routed ids of the widest decode call (null: `max_route_ids`). A
-            /// decode route over more ids is refused by name (`RouteWiderThanWindow`).
+            /// Decode's window 0 under the release: the routed ids of the widest decode call (null: `max_route_ids`), at most
+            /// `max_plan_ids` (a verify wider than a prompt group). A decode route over more ids is refused by name
+            /// (`RouteWiderThanWindow`).
             decode_window_rows: ?u32 = null,
             /// How the grow's new rows (decode's window 0 and every layer's ext) are allocated (`GrowFill`).
             grow_fill: GrowFill = .zeros,
@@ -460,13 +463,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             layer: u32 = 0,
             plan: Plan = .{},
             /// The slot of each hit (plan.hits order).
-            hit_slots: [max_route_ids]u32 = undefined,
+            hit_slots: [max_plan_ids]u32 = undefined,
             /// Load indices in placement (file offset) order; parts are runs of it.
-            order: [max_route_ids]u8 = undefined,
+            order: [max_plan_ids]u8 = undefined,
             /// Per load (plan order): false when its slot still held the record.
-            reads: [max_route_ids]bool = undefined,
+            reads: [max_plan_ids]bool = undefined,
             n_parts: u32 = 0,
-            parts: [max_route_ids]Part = undefined,
+            parts: [max_plan_ids]Part = undefined,
             state: enum { free, live, released } = .free,
             /// Its transient window (prefill routes beside a live one: `Options.wide_depth`).
             window: u8 = 0,
@@ -482,7 +485,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// The loads (expert, slot) of part `part`, in file order: what its
             /// gate/up and down kernels read once `waitGu` / `waitDown` return.
-            pub fn partLoads(r: *const Route, part: u32, out: *[max_route_ids]expert_policy.Load) []expert_policy.Load {
+            pub fn partLoads(r: *const Route, part: u32, out: []expert_policy.Load) []expert_policy.Load {
                 const p = r.parts[part];
                 for (r.order[p.first..][0..p.n], out[0..p.n]) |li, *l| l.* = r.plan.loads[li];
                 return out[0..p.n];
@@ -495,8 +498,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         pub const max_wide_depth = 5;
         comptime {
             // Every route the stream holds is gated at most once, the gate/up gate and a down gate per part (a part at
-            // least one id): their gates fit the pool's ring.
-            std.debug.assert(route_capacity * (max_route_ids + 1) <= expert_io.max_gates);
+            // least one id of the widest plan): their gates fit the pool's ring.
+            std.debug.assert(route_capacity == expert_io.max_live_routes and route_capacity * (max_plan_ids + 1) <= expert_io.max_gates);
         }
         /// Served run 16: the phase change frees the transient scratch (`Stream.releaseTransient`) and the grow allocates decode's
         /// window 0 plus `decode_staging_rows`; the bill (deepseek_v41_bill.zig) reads this declaration.
@@ -641,7 +644,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const minis = maxMinis(bank);
                 if (opt.max_route_ids == 0 or opt.max_route_ids > max_route_ids or opt.transient_rows < opt.max_route_ids or minis > max_minis or
                     opt.records_per_part == 0 or opt.records_per_part * minis > expert_io.max_items) return error.InvalidOptions;
-                if (opt.decode_window_rows) |w| if (w == 0 or w > opt.max_route_ids) return error.InvalidOptions;
+                if (opt.decode_window_rows) |w| if (w == 0 or w > max_plan_ids) return error.InvalidOptions;
                 // One transient row must hold any layer's record; per geometry, each of the two geometries has its scratch.
                 var widest: usize = 0;
                 for (bank.layers, 0..) |*l, i| if (spanOf(l) > spanOf(&bank.layers[widest])) {
@@ -864,8 +867,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return .{ .bank = .transient, .row = slot - ls.policy.capacity };
             }
 
+            /// The widest route this phase takes: a prompt group's (`Options.max_route_ids`), or in decode its window's ids
+            /// where they are more (`Options.decode_window_rows`: a verify of more rows than a group holds).
+            pub fn routeIds(self: *const Stream) u32 {
+                return if (self.phase == .decode) @max(self.max_route_ids, self.decode_window_rows) else self.max_route_ids;
+            }
+
             /// Per routed id of `r` (plan order), its slot's bank and row.
-            pub fn refsOf(self: *const Stream, r: *const Route, out: *[max_route_ids]SlotRef) []SlotRef {
+            pub fn refsOf(self: *const Stream, r: *const Route, out: []SlotRef) []SlotRef {
                 for (r.plan.slotsOf(), out[0..r.plan.n_ids]) |slot, *ref| ref.* = self.slotRef(r.layer, slot);
                 return out[0..r.plan.n_ids];
             }
@@ -1193,7 +1202,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             fn routeWith(self: *Stream, layer: u32, ids: []const u16, scores: []const f32, step: bool) Error!*Route {
                 if (self.failed) return error.StreamFailed;
                 self.notePrecision(layer, ids, step);
-                std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
+                std.debug.assert(ids.len > 0 and ids.len <= self.routeIds());
                 // A decode route's transient loads take at most its ids' rows of window 0.
                 if (self.phase == .decode and ids.len > self.transient.rows) return self.fail(error.RouteWiderThanWindow);
                 // A layer's read-ahead lands before a route plans over its rows (a hit must never read a loading row).
@@ -1396,8 +1405,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const lo = self.gate_value;
                 const hi = lo + 1 + n;
                 self.gate_value = hi;
-                var values: [max_route_ids + 1]u64 = undefined;
-                var counts: [max_route_ids + 1]i32 = undefined;
+                var values: [max_plan_ids + 1]u64 = undefined;
+                var counts: [max_plan_ids + 1]i32 = undefined;
                 // A gate/up and a down ticket per RECORD (`max_minis` per id), the pool's bound for one registration.
                 var tickets: [expert_io.max_gate_tickets]i64 = undefined;
                 var k: usize = 0;
@@ -1445,8 +1454,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         return rr.plan.loads[a].expert < rr.plan.loads[b].expert;
                     }
                 }.less);
-                var offsets: [max_route_ids]u64 = undefined;
-                var lengths: [max_route_ids]u64 = undefined;
+                var offsets: [max_plan_ids]u64 = undefined;
+                var lengths: [max_plan_ids]u64 = undefined;
                 const geom = &bank.layers[r.layer];
                 const mn = minisOf(geom);
                 // A record's file footprint (an id of several records: all of them, the last one's pad included).
@@ -1455,7 +1464,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     offsets[k] = bank.recordOffset(r.layer, plan.loads[li].expert);
                     lengths[k] = footprint;
                 }
-                var ends_buf: [max_route_ids]u32 = undefined;
+                var ends_buf: [max_plan_ids]u32 = undefined;
                 const ends = if (plan.phase == .decode)
                     expert_policy.boundedParts(offsets[0..n], lengths[0..n], self.records_per_part, &ends_buf)
                 else blk: {

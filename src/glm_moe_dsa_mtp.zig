@@ -10,6 +10,8 @@
 //! shared_head.norm(h) of the step before) at position p + k - 1, the last pair's p. `index_share_for_mtp_iteration`
 //! (vLLM's `set_skip_topk`): such a step runs no indexer and attends the keys the first step's row selected, every
 //! committed pair's key while they fit `index_topk`; it appends nothing, so a rejected draft leaves the cache as it was.
+//! A round whose stream tail the context backs (`pldDraft`, with `mtp_pld_cap` set) drafts the tokens that followed
+//! there instead: it appends every pending pair and runs no step (`Lane.appendAll`).
 //!
 //! The residents are the published BF16 tensors of `mtp/mtp-residents.safetensors`, bound as they are: `kv_b_proj`
 //! split into the per-head `embed_q` / `unembed_out` by a reshape and slices (views of the same bytes, the reference's
@@ -28,6 +30,7 @@ const settings = @import("glm_moe_dsa_settings.zig");
 const ds = @import("deepseek_v41_dspark.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 const exl3 = @import("glm_moe_dsa_exl3_bank.zig");
+const pld = @import("mlx_host").pld_index;
 
 const G = graph.G;
 const T = G.T;
@@ -36,8 +39,11 @@ const Diag = glm.Diag;
 pub const dir_name = exl3.mtp_dir;
 pub const residents_file = "mtp-residents.safetensors";
 pub const bank_file = exl3.mtp_sidecar_file;
-/// The deepest draft a round verifies (depth + 1 rows of top-8 routes in one decode-lane call).
-pub const max_depth = settings.Config.max_mtp_depth;
+/// The most drafts a round verifies, the MTP chain's or a prompt-lookup copy's (their token and them: rows of top-8
+/// routes in one decode-lane call).
+pub const max_depth = settings.Config.max_drafts;
+/// A prompt-lookup copy's least backing: the n-gram at the stream's tail that must have occurred before.
+pub const pld_min_match = 3;
 /// Prompt pairs whose keys one append covers (the prompt pass's catch-up, in chunks).
 pub const append_rows: u32 = 2048;
 /// Serial steps whose hidden the lane keeps for a later round; past them the lane stops tracking the request.
@@ -485,6 +491,25 @@ fn typicalFlags(g: *G, lp: T, p: T, ids: []const i32, t: @FieldType(sdk.acceptan
     return g.greater(try g.reshape(try g.takeAlongAxis(p, idx, -1), &.{-1}), floor);
 }
 
+// ── prompt lookup ──
+
+/// A round's prompt-lookup draft over `stream` (the committed tokens, then the round's token t1): the continuation, up
+/// to `cap` tokens, of the earlier site whose preceding tokens match the stream's tail longest, by at least
+/// `pld_min_match` (the host's `pld_index.backedCopy`: the most recent such site on a tie, the backing counted up to 64);
+/// null without one.
+pub fn pldDraft(stream: []const u32, cap: u32) ?pld.Copy {
+    if (cap == 0) return null;
+    return pld.backedCopy(stream, cap, pld_min_match);
+}
+
+/// The PLD line's classes of a copy's backing: 3, 4-7, 8-15, 16-31, 32-64 tokens.
+pub const backing_classes = 5;
+
+/// The class of a copy backed by `match` tokens (3 .. 64).
+pub fn backingClass(match: usize) usize {
+    return @min(std.math.log2_int(usize, @max(match, 2)) -| 1, backing_classes - 1);
+}
+
 // ── the lane ──
 
 /// The lane's counters over one request (the host's `sdk.DraftStats` and the request's line).
@@ -511,6 +536,12 @@ pub const Counts = struct {
     /// and the first rejected one) and the accepted ones.
     decided: [10]u64 = @splat(0),
     accepted_by_p: [10]u64 = @splat(0),
+    /// The rounds that drafted a prompt-lookup copy (`pldDraft`) in place of the MTP chain (counted in the totals too),
+    /// their drafts and accepted drafts; per class of the copy's backing (`backingClass`) the same three.
+    pld_rounds: u64 = 0,
+    pld_drafted: u64 = 0,
+    pld_accepted: u64 = 0,
+    pld_by_backing: [backing_classes][3]u64 = @splat(@splat(0)),
 };
 
 /// The tenth of `p` (a probability): 0 .. 9.
@@ -551,6 +582,28 @@ pub const ProbLine = struct {
     pub fn format(p: ProbLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll("glm_moe_dsa: mtp acceptance by the head's top probability (accepted / decided):");
         for (p.c.decided, p.c.accepted_by_p, 0..) |d, acc, i| try w.print("{s} {d}.{d} {d}/{d}", .{ if (i == 0) "" else ",", i / 10, i % 10, acc, d });
+    }
+};
+
+/// The lane's prompt-lookup rounds at the request's end (with `mtp_pld_cap` set): their share of the rounds, their drafts
+/// and accepted drafts, the tokens a round emitted, and the same by the copy's backing.
+pub const PldLine = struct {
+    cap: u32,
+    c: Counts,
+
+    pub fn format(p: PldLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const pct = struct {
+            fn f(x: u64, of: u64) f64 {
+                return if (of == 0) 0 else 100 * @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(of));
+            }
+        }.f;
+        const r = p.c.pld_rounds;
+        try w.print("glm_moe_dsa: mtp pld cap {d}: {d} of {d} rounds ({d:.1}%), {d} drafted, {d} accepted ({d:.1}%), {d:.2} tokens per PLD round; by backing (rounds/drafted/accepted):", .{
+            p.cap, r, p.c.rounds, pct(r, p.c.rounds), p.c.pld_drafted, p.c.pld_accepted, pct(p.c.pld_accepted, p.c.pld_drafted),
+            if (r == 0) 0 else @as(f64, @floatFromInt(r + p.c.pld_accepted)) / @as(f64, @floatFromInt(r)),
+        });
+        const names = [backing_classes][]const u8{ "3", "4-7", "8-15", "16-31", "32-64" };
+        for (p.c.pld_by_backing, names, 0..) |b, n, i| try w.print("{s} {s} {d}/{d}/{d}", .{ if (i == 0) "" else ",", n, b[0], b[1], b[2] });
     }
 };
 
@@ -685,6 +738,18 @@ pub fn Lane(comptime kind: BankKind) type {
             if (self.pending) |p| try g.evalAll(&.{p});
             g.release(old);
             self.n_pending -= n;
+        }
+
+        /// A round that drafts without the head (a prompt-lookup copy): every pending pair appended, their tokens `after`
+        /// then `t1` (the round's token), so that the cache holds the target's length and nothing is pending, as after a
+        /// round's first step; the head runs no step.
+        pub fn appendAll(self: *Self, g: *G, a: std.mem.Allocator, tw: *const graph.Weights, after: []const u32, t1: u32) !void {
+            std.debug.assert(after.len + 1 == self.n_pending);
+            const tokens = try a.alloc(u32, self.n_pending);
+            defer a.free(tokens);
+            @memcpy(tokens[0..after.len], after);
+            tokens[after.len] = t1;
+            try self.append(g, tw, tokens);
         }
 
         /// The layer's output for one row `x [1, hidden]` at position `pos` over the cache as it stands, with the
@@ -843,8 +908,8 @@ test "glm mtp: the lane's kept pending rows are a copy: the rows' values, and th
     g.resetTo(m);
 }
 
-test "glm mtp: the route limit gives depth 5; the MTP layer config is one full, routed layer" {
-    try testing.expectEqual(@as(u32, 5), max_depth);
+test "glm mtp: the route limit gives 12 drafts a round; the MTP layer config is one full, routed layer" {
+    try testing.expectEqual(@as(u32, 12), max_depth);
     var c = try glm.Config.parse(testing.allocator, try tinyText(), null, null);
     defer c.deinit(testing.allocator);
     const m = layerConfig(&c);
@@ -905,6 +970,30 @@ test "glm mtp: the request's line (the ABBA harness reads it): depth, acceptance
     const u = try std.fmt.allocPrint(testing.allocator, "{f}", .{t});
     defer testing.allocator.free(u);
     try testing.expect(std.mem.startsWith(u8, u, "glm_moe_dsa: mtp depth 2 acceptance typical (delta 0.3): 2 rounds"));
+}
+
+test "glm mtp: a prompt-lookup draft continues the earlier site the stream's tail backs longest, by 3 tokens at least, up to the cap; none without one" {
+    // A copy run: the prompt's "10 11 12 13 14 15 16 17"; the stream's tail (t1 = 12) repeats its first three tokens.
+    const s = [_]u32{ 1, 2, 10, 11, 12, 13, 14, 15, 16, 17, 3, 4, 10, 11, 12 };
+    const c = pldDraft(&s, 4).?;
+    try testing.expectEqual(@as(usize, 3), c.match);
+    try testing.expectEqualSlices(u32, &.{ 13, 14, 15, 16 }, c.draft);
+    // Up to the stream's end.
+    try testing.expectEqualSlices(u32, &.{ 13, 14, 15, 16, 17, 3, 4, 10, 11, 12 }, pldDraft(&s, max_depth).?.draft);
+    try testing.expect(pldDraft(&s, 0) == null);
+    // Two tokens of backing are not a match.
+    try testing.expect(pldDraft(&[_]u32{ 1, 2, 10, 11, 13, 3, 4, 10, 11 }, 4) == null);
+    // The longer backing wins over the more recent site: "7 8 9" -> 20 beside "5 8 9" -> 21.
+    const t = [_]u32{ 7, 8, 9, 20, 5, 8, 9, 21, 7, 8, 9 };
+    try testing.expectEqualSlices(u32, &.{ 20, 5 }, pldDraft(&t, 2).?.draft);
+    for ([_]usize{ 3, 4, 7, 8, 15, 16, 31, 32, 64 }, [_]usize{ 0, 1, 1, 2, 2, 3, 3, 4, 4 }) |m, k| try testing.expectEqual(k, backingClass(m));
+}
+
+test "glm mtp: the PLD line: the prompt-lookup rounds' share, drafts, acceptance, tokens per round, and by backing" {
+    const l: PldLine = .{ .cap = 12, .c = .{ .rounds = 200, .pld_rounds = 50, .pld_drafted = 400, .pld_accepted = 300, .pld_by_backing = .{ .{ 20, 100, 40 }, .{ 10, 100, 80 }, .{ 10, 100, 90 }, .{ 5, 50, 45 }, .{ 5, 50, 45 } } } };
+    const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{l});
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("glm_moe_dsa: mtp pld cap 12: 50 of 200 rounds (25.0%), 400 drafted, 300 accepted (75.0%), 7.00 tokens per PLD round; by backing (rounds/drafted/accepted): 3 20/100/40, 4-7 10/100/80, 8-15 10/100/90, 16-31 5/50/45, 32-64 5/50/45", s);
 }
 
 test "glm mtp: the pack's mtp/ opens under the trunk bank's rules: the MTP layer's two bank layers, its experts map, the refusals by name" {

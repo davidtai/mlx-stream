@@ -768,9 +768,10 @@ pub fn servedContext(cfg: *const settings.Config) u64 {
     return phase_mem.servedContext(cfg.max_context_tokens);
 }
 
-/// Positions a decode round may append past the request's own (the verify of `mtp_depth` drafts and its token).
+/// Positions a decode round may append past the request's own (the verify of its most drafts and their token: the MTP
+/// chain's `mtp_depth` or a prompt-lookup copy's `mtp_pld_cap`, `settings.Config.maxDrafts`).
 pub fn verifyScratch(cfg: *const settings.Config) u64 {
-    return @as(u64, cfg.mtpDepth()) + 1;
+    return @as(u64, cfg.maxDrafts()) + 1;
 }
 
 /// Decode's KV positions for a request reserving `reserved` positions (its prompt and `max_tokens`).
@@ -784,9 +785,9 @@ pub fn maxPositions(cfg: *const settings.Config) u64 {
 }
 
 /// Decode's transient window: the routed ids of the widest decode call (a serial step's top-k, or a round's verify of
-/// `mtp_depth` drafts and its token).
+/// its most drafts and their token, `settings.Config.maxDrafts`).
 pub fn decodeWindowRows(cfg: *const settings.Config) u32 {
-    return (cfg.mtpDepth() + 1) * glm.routed_top_k;
+    return (cfg.maxDrafts() + 1) * glm.routed_top_k;
 }
 
 /// The stream's shape the module builds from `cfg`.
@@ -1306,6 +1307,31 @@ test "glm bill: the MTP lane adds its residents, experts and slot table, its lay
     const mb_on = try memoryBill(testing.allocator, on, null);
     defer mb_on.free(testing.allocator);
     try testing.expect(mb_on.total(.decode, 0, 100) > mb_off.total(.decode, 0, 100) + 4_752_870_912);
+}
+
+test "glm bill: prompt-lookup drafts widen decode's window, its verify's waves and positions to their cap; the prompt's groups and scratch stay" {
+    var c = try glm53Config();
+    defer c.deinit(testing.allocator);
+    const d4: settings.Config = .{ .mtp_depth = 4 };
+    const on: settings.Config = .{ .mtp_depth = 4, .mtp_pld_cap = 12 };
+    // Depth 4 verifies 5 rows; a 12-token copy 13 rows: 104 routed ids, past a prompt group's 48.
+    try testing.expectEqual(@as(u32, 40), decodeWindowRows(&d4));
+    try testing.expectEqual(@as(u32, 104), decodeWindowRows(&on));
+    try testing.expectEqual(@as(u64, 5), verifyScratch(&d4));
+    try testing.expectEqual(@as(u64, 13), verifyScratch(&on));
+    try testing.expectEqual(streamShape(&d4).max_route_ids, streamShape(&on).max_route_ids);
+    try testing.expectEqual(maxPositions(&d4) + 8, maxPositions(&on));
+    const a = billOf(boxInputs(&c, &d4));
+    const b = billOf(boxInputs(&c, &on));
+    const ad = a.phases[@intFromEnum(Phase.decode)];
+    const bd = b.phases[@intFromEnum(Phase.decode)];
+    // Decode's window 0 holds 104 routed ids' rows; the verify's waves are 13 rows'.
+    try testing.expectEqual(scratchBytes(box_exl3.geometry, 104), bd.transient_rows);
+    try testing.expect(bd.transient_rows > ad.transient_rows and bd.waves > ad.waves);
+    try testing.expectEqual(decodeWaveBytes(&c, 13, maxPositions(&on)), bd.waves);
+    // The prompt's scratch (five windows of 48 ids) does not move.
+    try testing.expectEqual(scratchBytes(box_exl3.geometry, 5 * 48), b.phases[@intFromEnum(Phase.prompt)].transient_rows);
+    try testing.expectEqual(a.phases[@intFromEnum(Phase.prompt)].transient_rows, b.phases[@intFromEnum(Phase.prompt)].transient_rows);
 }
 
 test "glm bill: on the DSA kernels the prompt wave stops growing past one call; the reference's form grows with the keys" {

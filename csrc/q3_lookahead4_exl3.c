@@ -303,8 +303,10 @@ static uint64_t pre_order = 0;
 static int32_t *pre_of = 0;   /* per ticket: 1 + the pre-range bound to that range at submit, 0 = none */
 
 /* ---- the event-gate class (lookahead4) */
-#define MAX_GATES 512         /* the live gates of every route a stream holds: 6 routes x (48 parts + 1) <= 512 */
-#define MAX_GATE_TICKETS 768  /* tickets of one registration: a gate/up and a down ticket per record, 2 x 48 ids x 8 minis */
+#define MAX_PLAN_IDS 104      /* the widest route (expert/policy.zig max_plan_ids: 13 verify rows x top-8) */
+#define MAX_LIVE_ROUTES 6     /* the routes a stream holds at once (expert/io.zig max_live_routes) */
+#define MAX_GATES (MAX_LIVE_ROUTES * (MAX_PLAN_IDS + 1))  /* every live route's gate/up gate and a down gate per part: 630 */
+#define MAX_GATE_TICKETS (2 * MAX_PLAN_IDS * MAX_ITEMS)    /* one registration: a gate/up and a down ticket per record: 1664 */
 #define EVK_OFF 0
 #define EVK_MTL 1         /* ev_obj = an MTLSharedEvent (q3ld_mtl_signal) */
 #define EVK_HOST 2        /* ev_obj = an int64 word (release store; the CPU backend and the checks) */

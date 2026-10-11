@@ -1,6 +1,7 @@
 //! GLM-5.3's config on the host side: the model directory, the parsed model config, the load's facts and the model
 //! settings it takes (`model-settings.json`) with the defaults they fall back to. The MTP draft lane is off unless
-//! `mtp_depth` sets it; its acceptance is exact unless `mtp_acceptance` names typical.
+//! `mtp_depth` sets it; its acceptance is exact unless `mtp_acceptance` names typical; its prompt-lookup drafts are off
+//! unless `mtp_pld_cap` sets their length.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -8,6 +9,8 @@ const log = @import("sdk").log;
 const glm = @import("glm_moe_dsa.zig");
 const acceptance = sdk.acceptance;
 const expert_tally = @import("sdk_ext.zig").expert.tally;
+const expert_policy = @import("sdk_ext.zig").expert.policy;
+const expert_lookahead = @import("sdk_ext.zig").expert.lookahead;
 
 /// The arch's numerics: "stock" (the reference's op chain) is the only tier; any other name is unset.
 pub const NumericTier = enum { stock };
@@ -61,6 +64,12 @@ pub const Config = struct {
     mtp_depth: ?u32 = null,
     /// A `mtp_depth` past the route limit: refused by name at load (`error.MtpDepthOverRouteLimit`).
     mtp_depth_over_limit: ?i64 = null,
+    /// The lane's prompt-lookup drafts: a round whose stream tail the context backs (`glm_moe_dsa_mtp.pldDraft`)
+    /// verifies up to this many of the tokens that followed there in place of the MTP chain (null or 0 = off; 1 ..
+    /// `max_drafts`; needs the lane).
+    mtp_pld_cap: ?u32 = null,
+    /// A `mtp_pld_cap` past the route limit: refused by name at load (`error.MtpPldCapOverRouteLimit`).
+    mtp_pld_cap_over_limit: ?i64 = null,
     /// The lane's acceptance (`sdk.acceptance`'s names: "exact", "typical"; null = exact). Another name is kept for
     /// the refusal at load (`error.MtpAcceptanceNotImplemented`).
     mtp_acceptance: ?MtpAcceptance = null,
@@ -79,9 +88,15 @@ pub const Config = struct {
     pub const max_lookahead_budget: i64 = @import("sdk_ext.zig").expert.lookahead.max_budget;
     /// The least units cap: the fill's floor (`phase_memory.min_fill_rows`), under which a load is refused.
     pub const min_units_cap: i64 = @import("phase_memory.zig").min_fill_rows;
-    /// The deepest draft a round verifies: its depth + 1 rows of top-8 routes in the stream's decode lane
-    /// (`sdk_ext.expert.policy.max_route_ids` = 48).
-    pub const max_mtp_depth: u32 = @import("sdk_ext.zig").expert.policy.max_route_ids / glm.routed_top_k - 1;
+    /// The most drafts a round verifies, from either source (the MTP chain, a prompt-lookup copy): with their token,
+    /// `max_drafts + 1` rows of top-8 routes in one decode-lane call. The stream's widest plan
+    /// (`sdk_ext.expert.policy.max_plan_ids`) and the lookahead's rows (`lookahead.max_rows`) hold them.
+    pub const max_drafts: u32 = 12;
+    /// The deepest MTP chain a round verifies (the route limit's `max_drafts`).
+    pub const max_mtp_depth: u32 = max_drafts;
+    comptime {
+        std.debug.assert((max_drafts + 1) * glm.routed_top_k <= expert_policy.max_plan_ids and max_drafts + 1 <= expert_lookahead.max_rows);
+    }
 
     pub const MtpAcceptance = enum { exact, typical, other };
 
@@ -149,6 +164,10 @@ pub const Config = struct {
             if (v.integer <= max_mtp_depth) c.mtp_depth = @intCast(v.integer) else c.mtp_depth_over_limit = v.integer;
             any = true;
         };
+        if (obj.get("mtp_pld_cap")) |v| if (v == .integer and v.integer >= 0) {
+            if (v.integer <= max_drafts) c.mtp_pld_cap = @intCast(v.integer) else c.mtp_pld_cap_over_limit = v.integer;
+            any = true;
+        };
         if (obj.get("mtp_acceptance")) |v| if (v == .string) {
             const m = acceptance.fromName(v.string);
             c.mtp_acceptance = if (m) |x| switch (x) {
@@ -169,8 +188,8 @@ pub const Config = struct {
                 any = true;
             };
         }
-        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} units_cap={d} rest_of_box_floor={d} resident_ratio={d} tally_window={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
-            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.expert_units_cap orelse 0, c.rest_of_box_floor_bytes orelse 0, c.tally.ratio, c.tally.window, c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta,
+        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} units_cap={d} rest_of_box_floor={d} resident_ratio={d} tally_window={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d} mtp_pld_cap={d}\n", .{
+            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.expert_units_cap orelse 0, c.rest_of_box_floor_bytes orelse 0, c.tally.ratio, c.tally.window, c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta, c.pldCap(),
         });
     }
 
@@ -191,6 +210,16 @@ pub const Config = struct {
         return c.mtp_depth orelse 0;
     }
 
+    /// The lane's prompt-lookup drafts per round at most (0 = off).
+    pub fn pldCap(c: *const Config) u32 {
+        return c.mtp_pld_cap orelse 0;
+    }
+
+    /// The most drafts one of the lane's rounds verifies (0: no lane): the MTP chain's or a prompt-lookup copy's.
+    pub fn maxDrafts(c: *const Config) u32 {
+        return if (c.mtpDepth() == 0) 0 else @max(c.mtpDepth(), c.pldCap());
+    }
+
     /// The lane's acceptance as the SDK names it: exact unless the setting names typical.
     pub fn mtpAcceptance(c: *const Config) acceptance.Mode {
         return if (c.mtp_acceptance == .typical) .{ .typical = c.typical() } else .exact;
@@ -204,12 +233,20 @@ pub const Config = struct {
         return if (c.mtp_acceptance) |m| @tagName(m) else "default";
     }
 
-    /// The draft lane's settings, refused by name at load: a depth past the route limit, an acceptance the lane does
-    /// not implement.
-    pub fn checkMtp(c: *const Config) error{ MtpDepthOverRouteLimit, MtpAcceptanceNotImplemented }!void {
+    /// The draft lane's settings, refused by name at load: a depth or a prompt-lookup cap past the route limit,
+    /// prompt-lookup drafts without the lane, an acceptance the lane does not implement.
+    pub fn checkMtp(c: *const Config) error{ MtpDepthOverRouteLimit, MtpPldCapOverRouteLimit, MtpPldWithoutLane, MtpAcceptanceNotImplemented }!void {
         if (c.mtp_depth_over_limit) |v| {
-            log.warn("glm_moe_dsa: load refused: mtp_depth {d} is over the route limit: a round verifies depth + 1 rows of {d} routes in one {d}-route call, so the depth is at most {d} (MtpDepthOverRouteLimit)\n", .{ v, glm.routed_top_k, @import("sdk_ext.zig").expert.policy.max_route_ids, max_mtp_depth });
+            log.warn("glm_moe_dsa: load refused: mtp_depth {d} is over the route limit: a round verifies depth + 1 rows of {d} routes in one {d}-route call, so the depth is at most {d} (MtpDepthOverRouteLimit)\n", .{ v, glm.routed_top_k, expert_policy.max_plan_ids, max_mtp_depth });
             return error.MtpDepthOverRouteLimit;
+        }
+        if (c.mtp_pld_cap_over_limit) |v| {
+            log.warn("glm_moe_dsa: load refused: mtp_pld_cap {d} is over the route limit: a round verifies its drafts + 1 rows of {d} routes in one {d}-route call, so the cap is at most {d} (MtpPldCapOverRouteLimit)\n", .{ v, glm.routed_top_k, expert_policy.max_plan_ids, max_drafts });
+            return error.MtpPldCapOverRouteLimit;
+        }
+        if (c.pldCap() > 0 and c.mtpDepth() == 0) {
+            log.warn("glm_moe_dsa: load refused: mtp_pld_cap {d} needs the draft lane (mtp_depth 0; MtpPldWithoutLane)\n", .{c.pldCap()});
+            return error.MtpPldWithoutLane;
         }
         if (c.mtp_acceptance == .other and c.mtpDepth() > 0) {
             log.warn("glm_moe_dsa: load refused: mtp_acceptance names a mode the draft lane does not implement (exact and typical are; MtpAcceptanceNotImplemented)\n", .{});
@@ -313,14 +350,14 @@ test "glm settings: max_output defaults to 128K, takes 1 to 1,048,576, and over 
     try (Config{}).checkMaxOutput();
 }
 
-test "glm settings: mtp_depth is 0 to the route limit's 5 (past it kept for the refusal); acceptance is exact unless typical is named" {
-    try testing.expectEqual(@as(u32, 5), Config.max_mtp_depth);
+test "glm settings: mtp_depth is 0 to the route limit's 12 (past it kept for the refusal); acceptance is exact unless typical is named" {
+    try testing.expectEqual(@as(u32, 12), Config.max_mtp_depth);
     try testing.expectEqual(@as(u32, 0), (Config{}).mtpDepth());
     try testing.expectEqual(@as(u32, 3), (try settingsOf("{\"mtp_depth\": 3}")).mtpDepth());
-    try testing.expectEqual(@as(u32, 5), (try settingsOf("{\"mtp_depth\": 5}")).mtpDepth());
+    try testing.expectEqual(@as(u32, 12), (try settingsOf("{\"mtp_depth\": 12}")).mtpDepth());
     try testing.expectEqual(@as(u32, 0), (try settingsOf("{\"mtp_depth\": 0}")).mtpDepth());
     try testing.expectEqual(@as(u32, 0), (try settingsOf("{\"mtp_depth\": \"3\"}")).mtpDepth());
-    const over = try settingsOf("{\"mtp_depth\": 6}");
+    const over = try settingsOf("{\"mtp_depth\": 13}");
     try testing.expectEqual(@as(u32, 0), over.mtpDepth());
     try testing.expectError(error.MtpDepthOverRouteLimit, over.checkMtp());
     try (Config{}).checkMtp();
@@ -337,6 +374,33 @@ test "glm settings: mtp_depth is 0 to the route limit's 5 (past it kept for the 
     try (try settingsOf("{\"mtp_acceptance\": \"tokenv3\"}")).checkMtp();
     try testing.expectError(error.MtpAcceptanceNotImplemented, (try settingsOf("{\"mtp_acceptance\": \"tokenv3\", \"mtp_depth\": 1}")).checkMtp());
     try testing.expectError(error.MtpAcceptanceNotImplemented, (try settingsOf("{\"mtp_acceptance\": \"fast\", \"mtp_depth\": 1}")).checkMtp());
+}
+
+test "glm settings: the route limit's 12 drafts are the widest plan's 13 rows of top-8 and the lookahead's rows; mtp_pld_cap is 0 to 12 beside the lane, past it or without the lane refused by name" {
+    // The bounds the width derives from the most drafts a round verifies.
+    try testing.expectEqual(@as(u32, 12), Config.max_drafts);
+    try testing.expectEqual(@as(u32, (Config.max_drafts + 1) * glm.routed_top_k), expert_policy.max_plan_ids);
+    try testing.expectEqual(@as(usize, Config.max_drafts + 1), expert_lookahead.max_rows);
+    try testing.expect(expert_policy.max_route_ids < expert_policy.max_plan_ids);
+    // Off by default: the MTP chain alone, its own depth the widest round.
+    try testing.expectEqual(@as(u32, 0), (Config{}).pldCap());
+    const d4 = try settingsOf("{\"mtp_depth\": 4}");
+    try testing.expectEqual(@as(u32, 0), d4.pldCap());
+    try testing.expectEqual(@as(u32, 4), d4.maxDrafts());
+    try d4.checkMtp();
+    const on = try settingsOf("{\"mtp_depth\": 4, \"mtp_pld_cap\": 12}");
+    try testing.expectEqual(@as(u32, 12), on.pldCap());
+    try testing.expectEqual(@as(u32, 12), on.maxDrafts());
+    try on.checkMtp();
+    // A cap under the depth leaves the depth the widest round.
+    try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"mtp_depth\": 4, \"mtp_pld_cap\": 2}")).maxDrafts());
+    try testing.expectEqual(@as(u32, 0), (try settingsOf("{\"mtp_pld_cap\": \"12\"}")).pldCap());
+    const over = try settingsOf("{\"mtp_depth\": 4, \"mtp_pld_cap\": 13}");
+    try testing.expectEqual(@as(u32, 0), over.pldCap());
+    try testing.expectError(error.MtpPldCapOverRouteLimit, over.checkMtp());
+    const alone = try settingsOf("{\"mtp_pld_cap\": 12}");
+    try testing.expectEqual(@as(u32, 0), alone.maxDrafts());
+    try testing.expectError(error.MtpPldWithoutLane, alone.checkMtp());
 }
 
 test "glm settings: the load facts replace the fill's inputs, the settings stay" {

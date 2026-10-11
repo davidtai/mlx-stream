@@ -70,12 +70,14 @@ pub const max_items = 8;
 pub const max_spec = 16;
 pub const max_spec_threads = 3;
 pub const max_pre = 32;
+/// Routes a stream holds at once (the C pool's MAX_LIVE_ROUTES; `stream.route_capacity`, which asserts it).
+pub const max_live_routes = 6;
 /// Live gates (the C pool's MAX_GATES): every route a stream holds at once, each the gate/up gate and a down gate per
-/// part (the stream asserts the bound).
-pub const max_gates = 512;
+/// part, a part at least one id of the widest plan (`policy.max_plan_ids`).
+pub const max_gates = max_live_routes * (policy.max_plan_ids + 1);
 /// Tickets of one gate registration (the C pool's MAX_GATE_TICKETS; the start's ABI check ties them): a gate/up and a
-/// down ticket per record of the widest route, its ids each of at most `max_items` minis.
-pub const max_gate_tickets = 2 * policy.max_route_ids * max_items;
+/// down ticket per record of the widest plan, its ids each of at most `max_items` minis.
+pub const max_gate_tickets = 2 * policy.max_plan_ids * max_items;
 /// Status words per ticket (`Result`'s fields, in order).
 const res_w = 8;
 pub const spec_state_w = 11;

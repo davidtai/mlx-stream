@@ -19,7 +19,9 @@
 //! EXL3): the prompt pass keeps every row's final-normed hidden and appends the MTP layer's keys of each pair whose next
 //! token it knows; a round drafts `mtp_depth` tokens, verifies `[t1, drafts]` in one forward of the target
 //! (`graph.Want.verify`), decides under the lane's acceptance and the request's sampling, and truncates the target's
-//! lanes to the accepted rows; the MTP layer appends nothing for a draft, so a rejection leaves its cache as it was.
+//! lanes to the accepted rows; the MTP layer appends nothing for a draft, so a rejection leaves its cache as it was. With
+//! `mtp_pld_cap` set, a round whose stream tail (the committed tokens and t1) the context backs by 3 tokens or more
+//! drafts the tokens that followed there (`mtp.pldDraft`, up to the cap) in place of the MTP chain, verified the same way.
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -39,6 +41,7 @@ const graph = @import("glm_moe_dsa_graph.zig");
 const bank_mod = @import("glm_moe_dsa_bank.zig");
 const experts_mod = @import("glm_moe_dsa_experts.zig");
 const mtp_mod = @import("glm_moe_dsa_mtp.zig");
+const pld_mod = @import("mlx_host").pld_index;
 const exl3_bank = @import("glm_moe_dsa_exl3_bank.zig");
 const exl3_quant = @import("glm_moe_dsa_exl3_quant.zig");
 const glm53_quant = @import("glm53_exl3_quant.zig");
@@ -696,6 +699,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             line.bound = live.total(self.grown_bytes);
             line.mlx_bound = live.mlxAt(self.grown_bytes);
             try self.ex.grow(self.decode_rows);
+            // Decode's calls up to its window: a verify of more rows than a prompt group holds stays on the decode lane.
+            self.routes.max_route_ids = self.stream.routeIds();
             line.grown = Mem.now();
             log.info("{f}\n", .{line});
             self.decode_positions = cap;
@@ -736,6 +741,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (self.mtp) |ln| if (ln.counts.rounds > 0) {
                 log.info("{f}\n", .{ln.line()});
                 log.info("{f}\n", .{mtp_mod.ProbLine{ .c = ln.counts }});
+                if (self.cfg.pldCap() > 0) log.info("{f}\n", .{mtp_mod.PldLine{ .cap = self.cfg.pldCap(), .c = ln.counts }});
                 ln.counts = .{};
             };
             const d = self.decode_mark orelse return;
@@ -790,6 +796,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const before = Mem.now();
             try self.stream.settleRoutes();
             _ = try self.ex.shrink(self.prompt_rows);
+            self.routes.max_route_ids = self.stream.routeIds();
             try self.resizeKv(positions);
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
@@ -818,9 +825,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             return .{ .rounds = ln.counts.rounds, .drafted = ln.counts.drafted, .accepted = ln.counts.accepted, .generated = ln.counts.generated };
         }
 
-        /// One draft round from `t1` (`sdk.DraftLane.round`): the drafts, the verify of `[t1, drafts]`, the decision,
-        /// the target truncated to the accepted rows. Without room for a draft (the request's token budget, the
-        /// lanes' end) or for a request the lane does not track, a round of `t1` alone.
+        /// One draft round from `t1` (`sdk.DraftLane.round`): the drafts (a prompt-lookup copy where the stream's tail is
+        /// backed and `mtp_pld_cap` is set, else the MTP chain), the verify of `[t1, drafts]`, the decision, the target
+        /// truncated to the accepted rows. Without room for a draft (the request's token budget, the lanes' end), or for
+        /// a request the lane does not track and no copy, a round of `t1` alone.
         pub fn mtpRound(self: *Self, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
             return self.roundWith(a, t1, accepted_cap, sampling, null);
         }
@@ -829,6 +837,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         pub const Probe = struct {
             force: []const u32 = &.{},
             depth: u32 = 0,
+            /// The drafts were a prompt-lookup copy (`mtp.pldDraft`), not the MTP chain.
+            pld: bool = false,
             drafts: [mtp_mod.max_depth]u32 = undefined,
             /// `mtp_depth` x vocab.
             logits: ?[]f32 = null,
@@ -846,14 +856,28 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const len = self.cache.len;
             if (len >= self.cache.cap) return error.ContextOverBill;
             const tracked = ln.tracked() == len and ln.n_pending >= 1;
-            const depth: u32 = if (tracked) @min(ln.depth, accepted_cap, self.cache.cap - len - 1) else 0;
+            const room = @min(accepted_cap, self.cache.cap - len - 1);
             var ids: [mtp_mod.max_depth + 1]u32 = undefined;
             ids[0] = t1;
+            // A prompt-lookup copy over the stream (the committed tokens, then t1), else the MTP chain.
+            const copy: ?pld_mod.Copy = if (self.cfg.pldCap() == 0 or room == 0) null else blk: {
+                try self.history.append(self.gpa, t1);
+                defer _ = self.history.pop();
+                const c = mtp_mod.pldDraft(self.history.items, @min(self.cfg.pldCap(), room)) orelse break :blk null;
+                @memcpy(ids[1..][0..c.draft.len], c.draft);
+                break :blk c;
+            };
+            const depth: u32 = if (copy) |c| @intCast(c.draft.len) else if (tracked) @min(ln.depth, room) else 0;
             const drafts = ids[1..][0..depth];
-            if (depth > 0) try ln.draft(&self.g, a, &self.w, self.history.items[ln.cache.len + 1 .. len], t1, depth, drafts, if (probe) |p| p.force else &.{}, if (probe) |p| p.logits else null);
+            const after: []const u32 = if (tracked) self.history.items[ln.cache.len + 1 .. len] else &.{};
+            if (copy != null) {
+                // The head runs no step: its pending pairs appended, as a round's first step leaves them.
+                if (tracked) try ln.appendAll(&self.g, a, &self.w, after, t1);
+            } else if (depth > 0) try ln.draft(&self.g, a, &self.w, after, t1, depth, drafts, if (probe) |p| p.force else &.{}, if (probe) |p| p.logits else null);
             const t_draft = self.nowNs();
             if (probe) |p| {
                 p.depth = depth;
+                p.pld = copy != null;
                 @memcpy(p.drafts[0..depth], drafts);
             }
             const m0 = self.g.mark();
@@ -892,10 +916,20 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 ln.counts.verify_bytes += b;
                 if (i > d.accepted) ln.counts.rejected_bytes += b;
             }
-            // The steps the decision reached: the accepted drafts and the first rejected one.
-            for (ln.top_p[0..@min(depth, d.accepted + 1)], 0..) |tp, i| {
-                ln.counts.decided[mtp_mod.tenth(tp)] += 1;
-                if (i < d.accepted) ln.counts.accepted_by_p[mtp_mod.tenth(tp)] += 1;
+            if (copy) |c| {
+                ln.counts.pld_rounds += 1;
+                ln.counts.pld_drafted += depth;
+                ln.counts.pld_accepted += d.accepted;
+                const by = &ln.counts.pld_by_backing[mtp_mod.backingClass(c.match)];
+                by[0] += 1;
+                by[1] += depth;
+                by[2] += d.accepted;
+            } else {
+                // The head's steps the decision reached: the accepted drafts and the first rejected one.
+                for (ln.top_p[0..@min(depth, d.accepted + 1)], 0..) |tp, i| {
+                    ln.counts.decided[mtp_mod.tenth(tp)] += 1;
+                    if (i < d.accepted) ln.counts.accepted_by_p[mtp_mod.tenth(tp)] += 1;
+                }
             }
             if (self.recorder) |rec| rec.endStep(depth + 1, depth, d.accepted, rows, ns);
             if (self.decode_mark) |*dm| {

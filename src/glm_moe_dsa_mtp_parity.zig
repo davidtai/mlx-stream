@@ -35,10 +35,15 @@ const Rig = struct {
     s: mlx.mlx_stream,
 
     fn open(a: std.mem.Allocator, dir: []const u8, depth: u32) !*Rig {
+        return openWith(a, dir, depth, 0);
+    }
+
+    /// `open` with prompt-lookup drafts of up to `pld_cap` tokens (0: off).
+    fn openWith(a: std.mem.Allocator, dir: []const u8, depth: u32, pld_cap: u32) !*Rig {
         const r = try a.create(Rig);
         errdefer a.destroy(r);
         // The module copies the config and borrows its model's storage: the rig keeps it.
-        r.cfg = .{ .model_dir = dir, .model = try glm.Config.load(a, testing.io, dir, null, null), .max_context_tokens = 64, .expert_rows = 6, .expert_prefill_rows = 4, .mtp_depth = depth };
+        r.cfg = .{ .model_dir = dir, .model = try glm.Config.load(a, testing.io, dir, null, null), .max_context_tokens = 64, .expert_rows = 6, .expert_prefill_rows = 4, .mtp_depth = depth, .mtp_pld_cap = pld_cap };
         errdefer r.cfg.deinit(a);
         r.weights = try sdk.loader.dir(testing.io, a, dir, .{});
         errdefer r.weights.deinit();
@@ -128,7 +133,9 @@ test "glm mtp parity: every round's drafts, draft logits, accepted count and nex
     defer gold.deinit();
     var worst: f32 = 0;
     var accepted: u64 = 0;
-    for (1..mtp.max_depth + 1) |depth| {
+    var deepest: u32 = 0;
+    for (gold.value.cases) |cs| deepest = @max(deepest, cs.depth);
+    for (1..deepest + 1) |depth| {
         const r = try Rig.open(a, dir, @intCast(depth));
         defer r.close(a);
         const vocab = r.m.model.vocab_size;
@@ -222,6 +229,109 @@ test "glm mtp parity: after the rounds the target's lanes and the MTP layer's eq
         try testing.expect(std.mem.eql(u8, std.mem.sliceAsBytes(rounds.rows.items), std.mem.sliceAsBytes(serial.rows.items)));
         std.debug.print("glm mtp parity {s} depth {d}: {d} target positions and {d} MTP pairs equal the serial run's ({d} values)\n", .{ cs.name, cs.depth, rounds.history.len, rounds.pairs, rounds.rows.items.len });
     }
+}
+
+test "glm mtp parity: with mtp_pld_cap a round whose stream tail the context backs drafts the copy and accepts the copied tokens the target decodes; the rounds emit the serial decode, the rounds before the first copy are the reference's MTP rounds, and the lanes equal a serial run's" {
+    const dir = fixtureDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const gold = try loadGoldens(a, dir);
+    defer gold.deinit();
+    // The short prompt's serial decode starts with one token seven times: from its fourth, the stream's tail repeats an
+    // earlier run of three, and the copy's next token is the serial decode's while the run lasts.
+    const cs = for (gold.value.cases) |*c| {
+        if (c.depth == 1 and std.mem.eql(u8, c.schedule, "mtp") and std.mem.eql(u8, c.name, "short")) break c;
+    } else return error.GoldenCaseMissing;
+    var rounds = blk: {
+        const r = try Rig.openWith(a, dir, 1, mtp.max_depth);
+        defer r.close(a);
+        var t1 = try r.begin(cs.prompt, @intCast(cs.serial.len + 8));
+        var emitted: std.ArrayList(u32) = .empty;
+        defer emitted.deinit(a);
+        var copies: u32 = 0;
+        var copied: u32 = 0;
+        var i: usize = 0;
+        while (emitted.items.len < cs.serial.len) : (i += 1) {
+            var probe: M.Probe = .{};
+            var out = try r.m.roundWith(a, t1, @intCast(cs.serial.len - emitted.items.len - 1), greedy, &probe);
+            defer out.deinit(a);
+            const at = emitted.items.len;
+            if (probe.pld) {
+                // Greedy exact: the copy's drafts accepted up to the first one the serial decode does not emit.
+                var agree: u32 = 0;
+                while (agree < probe.depth and probe.drafts[agree] == cs.serial[at + 1 + agree]) agree += 1;
+                try testing.expectEqual(agree, out.accepted);
+                copies += 1;
+                copied += out.accepted;
+            } else if (copies == 0) {
+                // No copy yet: the round is the reference's MTP round from the same state.
+                try testing.expectEqualSlices(u32, cs.rounds[i].drafts, probe.drafts[0..probe.depth]);
+                try testing.expectEqual(cs.rounds[i].accepted, out.accepted);
+                try testing.expectEqual(cs.rounds[i].next, out.next_token);
+            }
+            try emitted.appendSlice(a, out.tokens);
+            t1 = out.next_token;
+        }
+        try testing.expectEqualSlices(u32, cs.serial, emitted.items);
+        try testing.expect(copies > 0 and copied > 0);
+        try testing.expectEqual(@as(u64, copies), r.m.mtp.?.counts.pld_rounds);
+        try testing.expectEqual(@as(u64, copied), r.m.mtp.?.counts.pld_accepted);
+        std.debug.print("glm mtp parity pld {s}: {d} rounds, {d} of them copies, {d} copied tokens accepted\n", .{ cs.name, i, copies, copied });
+        try testing.expectEqual(r.m.history.items.len, r.m.cache.len);
+        break :blk try Snapshot.take(a, r);
+    };
+    defer rounds.deinit(a);
+    // A copy round's pending pairs appended without the head's step: the MTP layer's keys are a serial run's.
+    var serial = blk: {
+        const s = try Rig.open(a, dir, 1);
+        defer s.close(a);
+        _ = try s.begin(cs.prompt, 64);
+        for (rounds.history[cs.prompt.len..]) |t| _ = try s.argmaxOf(try s.m.extend(&.{t}));
+        break :blk try Snapshot.take(a, s);
+    };
+    defer serial.deinit(a);
+    try testing.expectEqualSlices(u32, rounds.history, serial.history);
+    try testing.expectEqual(rounds.history.len - 1, rounds.pairs);
+    try testing.expectEqual(rounds.pairs, serial.pairs);
+    try testing.expectEqual(rounds.rows.items.len, serial.rows.items.len);
+    try testing.expect(std.mem.eql(u8, std.mem.sliceAsBytes(rounds.rows.items), std.mem.sliceAsBytes(serial.rows.items)));
+}
+
+test "glm mtp parity: a round of 12 drafts verifies 13 rows, 104 routed ids, on the decode lane in decode's window past a prompt group's 48: its reads are billed to its rows and the rounds emit the serial decode" {
+    const dir = fixtureDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const gold = try loadGoldens(a, dir);
+    defer gold.deinit();
+    const cs = for (gold.value.cases) |*c| {
+        if (c.depth == 1 and std.mem.eql(u8, c.schedule, "mtp") and std.mem.eql(u8, c.name, "short")) break c;
+    } else return error.GoldenCaseMissing;
+    const r = try Rig.open(a, dir, mtp.max_depth);
+    defer r.close(a);
+    var t1 = try r.begin(cs.prompt, @intCast(cs.serial.len + 8));
+    try testing.expectEqual(@as(u32, (mtp.max_depth + 1) * glm.routed_top_k), r.m.stream.routeIds());
+    try testing.expectEqual(r.m.stream.routeIds(), r.m.routes.max_route_ids);
+    try testing.expect(r.m.stream.max_route_ids < r.m.stream.routeIds());
+    const ln = r.m.mtp.?;
+    var emitted: std.ArrayList(u32) = .empty;
+    defer emitted.deinit(a);
+    var first = true;
+    while (emitted.items.len < cs.serial.len) {
+        var probe: M.Probe = .{};
+        const b0 = r.m.stats().expert_bytes_read;
+        const v0 = ln.counts.verify_bytes;
+        var out = try r.m.roundWith(a, t1, @intCast(cs.serial.len - emitted.items.len - 1), greedy, &probe);
+        defer out.deinit(a);
+        if (first) {
+            try testing.expectEqual(mtp.max_depth, probe.depth);
+            const round_bytes = r.m.stats().expert_bytes_read - b0;
+            try testing.expect(round_bytes > 0);
+            // The decode lane bills each read to the first row that routes it; a wide call bills none.
+            try testing.expectEqual(round_bytes, ln.counts.verify_bytes - v0);
+            first = false;
+        }
+        try emitted.appendSlice(a, out.tokens);
+        t1 = out.next_token;
+    }
+    try testing.expectEqualSlices(u32, cs.serial, emitted.items);
 }
 
 test "glm mtp parity: a later prompt keeps the prefix the lane tracks and drafts the reference's tokens after it" {
@@ -321,11 +431,11 @@ test "glm mtp: a depth past the route limit, a pack without mtp/ and a config wi
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const facts: sdk.LoadFacts = .{ .wired_margin_bytes = 2 << 30 };
-    // mtp_depth 6: six drafts verify in seven rows of top-8 routes, 56 routed ids over the decode lane's 48.
-    const json = try std.json.parseFromSlice(std.json.Value, a, "{\"mtp_depth\": 6}", .{});
+    // mtp_depth 13: thirteen drafts verify in fourteen rows of top-8 routes, 112 routed ids over the widest plan's 104.
+    const json = try std.json.parseFromSlice(std.json.Value, a, "{\"mtp_depth\": 13}", .{});
     defer json.deinit();
     plugin.applySettings(&cfg, json.value);
-    try testing.expectEqual(@as(?i64, 6), cfg.mtp_depth_over_limit);
+    try testing.expectEqual(@as(?i64, 13), cfg.mtp_depth_over_limit);
     try testing.expectError(error.MtpDepthOverRouteLimit, plugin.loadBytes(a, testing.io, &cfg, &facts, 64 << 30));
     var weights = sdk.Weights.init(a);
     defer weights.deinit();

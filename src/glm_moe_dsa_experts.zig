@@ -5,8 +5,9 @@
 //! `gateUp`, `down`, `prefill`, `finishPrefill`) are comptime parameters: the affine bank binds MLX's `gather_qmm`
 //! (`sdk_ext.quant.FromGatherMatmul(GatherQmm)`), another bank binds its own quant with no change here or in the trunk.
 //!
-//! A call of at most `max_route_ids` routed ids (decode, short prompts) is the decode lane: the routing barrier (the ids
-//! and, with the lookahead, the next routed layer's scores read on the host), the route, the residents' wave at once,
+//! A call of at most the stream's route ids (`routeIds`: a prompt group's, or decode's window, a verify) is the decode
+//! lane: the routing barrier (the ids and, with the lookahead, the next routed layer's scores read on the host), the
+//! route, the residents' wave at once,
 //! then each miss part's gate/up after its gate/up bytes landed and its down after the rest (or every wave at once over
 //! event-gate aliases), the release; the outputs joined in routed order. A wider call is the wide lane, per bank layer:
 //! its residency seeded from the call's ids, the call's experts in groups of `max_route_ids` (its residents first, then
@@ -108,7 +109,9 @@ fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, parts: []cons
 
 pub const BankKind = sdk_ext.expert.BankKind;
 pub const SlotRef = sdk_ext.expert.SlotRef;
-pub const max_route_ids = expert_policy.max_route_ids;
+/// The routed ids one call's host arrays hold: the widest plan (a decode route of the widest verify, past a prompt
+/// group's `expert_policy.max_route_ids`).
+pub const max_route_ids = expert_policy.max_plan_ids;
 const n_banks = std.meta.fieldNames(BankKind).len;
 
 /// The driver's construction-time routes.
@@ -410,7 +413,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         pub fn call(self: *Self, g: *G, layer: u32, x: T, indices: T, scores: T, next_scores: ?T, hoist: []const T) !T {
             const n: u32 = @intCast(g.shapeOf(x).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
-            if (n * k > self.stream.max_route_ids) return self.callWide(g, layer, x, indices, scores, n, k);
+            if (n * k > self.stream.routeIds()) return self.callWide(g, layer, x, indices, scores, n, k);
             const y = if (bpl > 1) try self.callDecodeSplit(g, layer, x, indices, next_scores, n, k, hoist) else try self.callDecode(g, layer, x, indices, next_scores, n, k, hoist);
             return combine(g, y, scores, g.dtypeOf(x));
         }

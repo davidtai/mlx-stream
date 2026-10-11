@@ -648,7 +648,8 @@ pub const Routes = struct {
     read_ahead: bool = false,
     /// Decode calls hand the driver the next routed layer's scores (the stream's lookahead).
     lookahead: bool = false,
-    /// The widest call the driver's decode lane takes (the stream's `max_route_ids`).
+    /// The widest call the driver's decode lane takes (the stream's `routeIds` in the phase: a prompt group's, or
+    /// decode's window).
     max_route_ids: u32 = 48,
     /// A prompt's attention on the DSA kernels (the module's probe passed on this device).
     dsa: bool = false,

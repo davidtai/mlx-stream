@@ -11,8 +11,14 @@ const std = @import("std");
 
 pub const Phase = enum { prefill, decode };
 
-/// Widest route a plan holds: 8 verify rows x top-6 routed experts.
+/// Widest prompt group and DeepSeek-V4.1 route: 8 verify rows x top-6 routed experts.
 pub const max_route_ids = 48;
+/// Most routed ids one plan holds: a decode route of GLM-5.3's widest verify, 13 rows (12 drafts and their token,
+/// `glm_moe_dsa_settings.Config.max_drafts`) x top-8, which its settings assert; `max_route_ids` fits in it.
+pub const max_plan_ids = 104;
+comptime {
+    std.debug.assert(max_route_ids <= max_plan_ids);
+}
 pub const no_expert: u16 = std.math.maxInt(u16);
 pub const no_slot: u32 = std.math.maxInt(u32);
 
@@ -32,20 +38,20 @@ pub const Plan = struct {
     n_ids: u32 = 0,
     /// Per routed id, its slot: persistent slots are [0, capacity), the
     /// transient scratch follows them.
-    slots: [max_route_ids]u32 = undefined,
+    slots: [max_plan_ids]u32 = undefined,
     n_hits: u32 = 0,
     /// Resident experts, in first-appearance order.
-    hits: [max_route_ids]u16 = undefined,
+    hits: [max_plan_ids]u16 = undefined,
     n_misses: u32 = 0,
     /// Non-resident experts, in admission order.
-    misses: [max_route_ids]u16 = undefined,
+    misses: [max_plan_ids]u16 = undefined,
     n_loads: u32 = 0,
     /// Persistent loads in admission order, then transient loads.
-    loads: [max_route_ids]Load = undefined,
+    loads: [max_plan_ids]Load = undefined,
     /// The persistent loads: `loads[0..n_persistent]`.
     n_persistent: u32 = 0,
     n_evictions: u32 = 0,
-    evictions: [max_route_ids]Eviction = undefined,
+    evictions: [max_plan_ids]Eviction = undefined,
 
     pub fn slotsOf(p: *const Plan) []const u32 {
         return p.slots[0..p.n_ids];
@@ -90,7 +96,7 @@ pub const LayerPolicy = struct {
     counts: []f32,
     denominators: []f32,
     window_freq: []f32,
-    window: [window_limit][max_route_ids]u16 = undefined,
+    window: [window_limit][max_plan_ids]u16 = undefined,
     window_len: [window_limit]u8 = undefined,
     window_head: u32 = 0,
     window_count: u32 = 0,
@@ -183,7 +189,7 @@ pub const LayerPolicy = struct {
         errdefer p.retained.deinit(a);
         p.scores = try a.alloc(f32, n);
         errdefer a.free(p.scores);
-        p.candidates = try a.alloc(u16, n + max_route_ids);
+        p.candidates = try a.alloc(u16, n + max_plan_ids);
         errdefer a.free(p.candidates);
         p.victims = try a.alloc(u32, n);
         errdefer a.free(p.victims);
@@ -438,20 +444,20 @@ pub const LayerPolicy = struct {
         p.recency[expert] = 0;
     }
 
-    /// Resolves one route. `ids` holds at most `max_route_ids` expert ids
+    /// Resolves one route. `ids` holds at most `max_plan_ids` expert ids
     /// (< n_experts, repeats allowed: M rows x top-k); the transient scratch
-    /// must hold `max_route_ids` slots.
+    /// must hold a slot per id.
     pub fn plan(p: *LayerPolicy, ids: []const u16, phase: Phase, out: *Plan) void {
         p.planWith(ids, phase, out, .{});
     }
 
     pub fn planWith(p: *LayerPolicy, ids: []const u16, phase: Phase, out: *Plan, opts: PlanOpts) void {
-        std.debug.assert(ids.len > 0 and ids.len <= max_route_ids);
+        std.debug.assert(ids.len > 0 and ids.len <= max_plan_ids);
         std.debug.assert(phase == .prefill or opts.held.len == 0);
         for (opts.held) |s| p.held.set(s);
         defer for (opts.held) |s| p.held.unset(s);
         out.* = .{ .phase = phase, .n_ids = @intCast(ids.len) };
-        var unique_buf: [max_route_ids]u16 = undefined;
+        var unique_buf: [max_plan_ids]u16 = undefined;
         var n_unique: usize = 0;
         for (ids) |e| {
             std.debug.assert(e < p.n_experts);
@@ -485,7 +491,7 @@ pub const LayerPolicy = struct {
             p.recency[e] = p.clock;
         };
 
-        var transient_buf: [max_route_ids]u16 = undefined;
+        var transient_buf: [max_plan_ids]u16 = undefined;
         var n_transient: usize = 0;
         switch (phase) {
             .decode => {
@@ -602,8 +608,8 @@ pub const LayerPolicy = struct {
 
     /// Seed misses first, least frequent first (stable), then the rest.
     fn seedFirst(p: *const LayerPolicy, out: *Plan) void {
-        var seeds: [max_route_ids]u16 = undefined;
-        var rest: [max_route_ids]u16 = undefined;
+        var seeds: [max_plan_ids]u16 = undefined;
+        var rest: [max_plan_ids]u16 = undefined;
         var ns: usize = 0;
         var nr: usize = 0;
         for (out.missesOf()) |e| {
