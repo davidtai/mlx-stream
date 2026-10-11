@@ -855,7 +855,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// A seed expert of a prompt layer whose record landed in transient slot `from` (`promote`).
             pub const Promotion = struct { e: u16, from: u32 };
             /// The threads one `promote` splits its copies over.
-            const promote_threads = 8;
+            const promote_threads = 1;
 
             /// The prompt phase, each of `items` (in order) an expert of `layer` that is a seed expert
             /// (`LayerPolicy.seed`), whose record landed in its transient slot (a route planned before the layer's seed)
