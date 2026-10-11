@@ -39,6 +39,14 @@ pub const Arrays = bank_mod.Proj;
 /// Rows per prompt wave.
 pub const wave_rows: u32 = 4096;
 
+/// Whose kernels a phase runs: GLM-5.3's own texts or sushi's chain (the sushi binding, composed).
+pub const Kernels = enum { glm53, sushi };
+/// The prompt's: GLM-5.3's GEMMs, +23% prefill against sushi's prefill GEMM on the 16K coding ABBA.
+pub const prompt_kernels: Kernels = .glm53;
+/// The decode waves': sushi's chain, faster at every decode width than these texts' GEMVs (`decodeWave`). A decode
+/// kernel that beats it switches this alone.
+pub const decode_kernels: Kernels = .sushi;
+
 /// The bank's `quantization`: exl3, the mcg codebook at the texts' multiplier, four minis per expert.
 fn parse(peek: *const quant.BankPeek, why: ?*Diag) ?void {
     const q = peek.quantization;
@@ -132,10 +140,24 @@ pub fn Accepted(comptime G: type) type {
         }
 
         /// One decode wave: `x [m, hidden]` (each routed pair's row), `slots` its experts' slot rows -> each pair's
-        /// expert output `[m, hidden]` (its minis summed, unweighted): sushi's decode chain, faster at every decode width
-        /// than these texts' GEMVs (`decodeWave`).
+        /// expert output `[m, hidden]` bf16 (its minis summed, unweighted), on `decode_kernels`'.
         pub fn fused(self: *Self, g: *G, x: G.T, slots: []const u32, bank: Bank) !G.T {
-            return self.sushi_math.fused(g, x, slots, bank);
+            return switch (decode_kernels) {
+                .sushi => self.sushi_math.fused(g, x, slots, bank),
+                .glm53 => self.fusedGlm53(g, x, slots, bank),
+            };
+        }
+
+        /// `fused` through these texts' GEMVs: the wave's pairs (row i, its slot) over one bank kind at score 1.
+        fn fusedGlm53(self: *Self, g: *G, x: G.T, slots: []const u32, bank: Bank) !G.T {
+            const m = slots.len;
+            std.debug.assert(m <= routes.max_pairs);
+            var pairs: [routes.max_pairs][3]u32 = undefined;
+            for (slots, pairs[0..m], 0..) |sl, *p, i| p.* = .{ @intCast(i), sl, @intCast(i) };
+            const ones: [routes.max_pairs]f32 = @splat(1);
+            const sc = try g.hostArray(std.mem.sliceAsBytes(ones[0..@max(8, m)]), &.{@intCast(@max(8, m))}, .float32);
+            const banks = [3]Bank{ bank, bank, bank };
+            return g.astype(try self.decodeWave(g, x, pairs[0..m], &banks, sc), .bfloat16);
         }
 
         /// One decode wave over a bank layer: x [rows, hidden] bf16 (the call's rows), `pairs` per pair (x row, packed
@@ -206,9 +228,10 @@ pub fn Accepted(comptime G: type) type {
             return acc.?;
         }
 
-        /// x [tokens, hidden] bf16, the call's routed rows (one bank kind) -> [rows, hidden] bf16 in routed-row order.
+        /// x [tokens, hidden] bf16, the call's routed rows (one bank kind) -> [rows, hidden] bf16 in routed-row order, on
+        /// `prompt_kernels`'.
         pub fn prefill(self: *Self, g: *G, layer: u32, x: G.T, rows: quant.PrefillRows, bank: Bank) !G.T {
-            _ = layer;
+            if (comptime prompt_kernels == .sushi) return self.sushi_math.prefill(g, layer, x, rows, bank);
             const a = self.a;
             const n = rows.slot.len;
             const k = kOf(bank.gate.trellis) orelse return error.BankArrays;
@@ -639,6 +662,8 @@ test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's E
     defer for (routes_) |r| st.release(r);
     var rng = std.Random.DefaultPrng.init(0x5a3e);
     var worst: f32 = 0;
+    var fworst: f32 = 0;
+    var fscale: f32 = 0;
     var scale: f32 = 0;
     // decode widths: each row 8 distinct experts of the 16, the two bank layers' waves, the call's combine
     for (1..7) |n| {
@@ -691,6 +716,14 @@ test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's E
             for (0..np) |i| for (0..h) |q| {
                 want_y[(pos_of[i] / 8) * h + q] += sc[pos_of[i]] * yh[i * h + q];
             };
+            // the fused waves through these texts' GEMVs (`decode_kernels = .glm53`) on the same rows
+            const yg = try ours.fusedGlm53(&g, xt, slots[0..np], banks[side]);
+            var yo: [48 * 128]f32 = undefined;
+            _ = try g.hostF32(try g.astype(yg, .float32), yo[0 .. np * h]);
+            for (yh[0 .. np * h], yo[0 .. np * h]) |wv, gv| {
+                fscale = @max(fscale, @abs(wv));
+                fworst = @max(fworst, @abs(wv - gv));
+            }
         }
         const y = try ours.decodeCombine(&g, &outs, loc[0 .. n * 8], @intCast(n));
         var got: [6 * 128]f32 = undefined;
@@ -701,8 +734,9 @@ test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's E
         }
     }
     const dec_ulp = worst / selfcheck.bf16Ulp(scale);
-    std.debug.print("glm53 exl3 quant vs sushi on the same slots: decode widths 1..6 max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp)\n", .{ worst, scale, dec_ulp });
+    std.debug.print("glm53 exl3 quant vs sushi on the same slots: decode widths 1..6 max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp); the fused waves max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp)\n", .{ worst, scale, dec_ulp, fworst, fscale, fworst / selfcheck.bf16Ulp(fscale) });
     try testing.expect(scale > 0.1 and worst <= 2 * selfcheck.bf16Ulp(scale));
+    try testing.expect(fscale > 0.1 and fworst <= 2 * selfcheck.bf16Ulp(fscale));
     // prompt widths: one call per bank layer over 40 and 300 routed rows of its experts (act rows of 64 tokens)
     var pw: f32 = 0;
     var ps: f32 = 0;
