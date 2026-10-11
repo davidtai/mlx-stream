@@ -629,6 +629,12 @@ pub fn embed(g: *G, w: *const Weights, ids: []const u32) !T {
     return g.dequantizeWith(try g.take(e.w, idx, 0), try g.take(e.s, idx, 0), try g.take(e.b, idx, 0), e.bits, glm.group_size, .affine);
 }
 
+/// A prompt call reads the head's weights in its own command buffer after the tail of the layer this many from the end.
+/// Otherwise their first read after a load is the head's own, after the last layer, and the GPU waits for the pages:
+/// 155 ms with nothing else queued (the diag timeline's single gap after the layers). Read here, the last layers' GPU
+/// work runs while they come in.
+pub const head_touch_layers: usize = 3;
+
 /// The last row's logits `[1, vocab]`: the final norm and the quantized head.
 pub fn head(g: *G, c: *const glm.Config, w: *const Weights, h: T) !T {
     const rows = g.shapeOf(h).dim(0);
@@ -868,6 +874,8 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             try evals.appendSlice(a, cache.buffers(l, &bufs));
             for (carry.topk) |t| if (t) |x_| try evals.append(a, x_);
             try g.asyncEval(evals.items);
+            // The head's weights read early (`head_touch_layers`): a 1-row product, its result unused.
+            if (li + head_touch_layers == w.layers.len) try g.asyncEval(&.{try qlinear(g, try g.zeros(&.{ 1, @intCast(c.hidden_size) }, g.dtypeOf(h)), w.lm_head)});
             if (pt.enabled) _ = try pt.phase(g, &.{}, .rest);
         }
         g.release(h);
