@@ -375,13 +375,16 @@ fn attendSpans(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T
         const r: c_int = @intCast(b1 - b0);
         const m = g.mark();
         const q_lat = try qlinear(g, try rowSlice(g, q_nope, @intCast(b0), @intCast(b1)), lw.embed_q);
+        if (pt.enabled) _ = try pt.phase(g, &.{q_lat}, .attn_embed);
         const qp = try rowSlice(g, q_pe, @intCast(b0), @intCast(b1));
         // Where the span's keys fit the top-k every causal key is attended: the kernel drops a key past its query.
         const idx = carry.topk[i] orelse try g.broadcastTo(try g.reshape(try g.arange(0, @floatFromInt(nb), 1, .int32), &.{ 1, 1, nb }), &.{ 1, r, nb });
         const lat = try g.slice(kv_all, &.{ 0, 0, 0, 0 }, &.{ 1, 1, nb, kvr }, &.{ 1, 1, 1, 1 });
         const pe = try g.slice(pe_all, &.{ 0, 0, 0, 0 }, &.{ 1, 1, nb, rp }, &.{ 1, 1, 1, 1 });
         const o_lat = try g.adopt((try dsa.sparseLatentRope(g.s, q_lat, qp, lat, pe, idx, scale)) orelse return error.DsaKernelDeclined);
+        if (pt.enabled) _ = try pt.phase(g, &.{o_lat}, .attn_core);
         try outs.append(carry.a, g.keep(try qlinear(g, o_lat, lw.unembed_out)));
+        if (pt.enabled) _ = try pt.phase(g, &.{outs.items[outs.items.len - 1]}, .attn_unembed);
         g.resetTo(m);
     }
     if (outs.items.len == 1) return g.adopt(outs.items[0]);
@@ -475,9 +478,14 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     // forwardRows' prompt: a verify passes `.per_row`.
     const prompt_form = form == .auto and rows > 1;
     if (pt.enabled and prompt_form) {
+        // the projections one by one (each evaluated on its own), then the cache's buffers (the append)
+        _ = try pt.phase(g, &.{q.qr}, .proj_qa);
+        _ = try pt.phase(g, &.{ q.q_nope, q.q_pe }, .proj_qb);
+        if (q.iq) |iq| _ = try pt.phase(g, &.{iq}, .proj_iq);
+        _ = try pt.phase(g, &.{ k.latent, k.k_pe }, .proj_kv);
+        if (k.index) |ik| _ = try pt.phase(g, &.{ik}, .proj_ik);
         var bufs: [3]T = undefined;
         _ = try pt.phase(g, cache.buffers(l, &bufs), .proj);
-        _ = try pt.phase(g, &.{ q.q_nope, q.q_pe, q.qr }, .proj);
     }
     const spans = kernels and prompt_form;
     if (lw.indexer) |ix| {
@@ -547,6 +555,13 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     }
     if (pt.enabled and prompt_form) pt.chargeAttn(lw.indexer != null, try pt.phase(g, &.{out}, .attn));
     const o2 = try g.reshape(try g.transposeAxes(out, &.{ 0, 2, 1, 3 }), &.{ n, heads * @as(c_int, @intCast(c.v_head_dim)) });
+    if (pt.enabled and prompt_form) {
+        // the heads' transpose (the reshape of the transposed heads copies), then the o_proj GEMM
+        _ = try pt.phase(g, &.{o2}, .o_trans);
+        const y = try qlinear(g, o2, lw.o);
+        _ = try pt.phase(g, &.{y}, .o_gemm);
+        return y;
+    }
     return qlinear(g, o2, lw.o);
 }
 

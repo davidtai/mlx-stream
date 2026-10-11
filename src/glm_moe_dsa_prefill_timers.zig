@@ -12,7 +12,7 @@ pub const enabled: bool = if (@hasDecl(bo, "glm_prefill_timers")) bo.glm_prefill
 /// The phases of a prompt layer: the read-ahead's predictor, the q / kv / indexer projections and the cache append,
 /// the indexer's selection, the attention core, the output projection, the router, the routed experts (split below),
 /// the shared expert or the dense MLP, the residual and the layer's eval.
-pub const Phase = enum { seed, proj, index, attn, oproj, router, routed, mlp, rest };
+pub const Phase = enum { seed, proj, index, attn, oproj, router, routed, mlp, rest, proj_qa, proj_qb, proj_iq, proj_kv, proj_ik, attn_embed, attn_core, attn_unembed, o_trans, o_gemm };
 /// The routed call's split: the routing barrier (the ids to the host, their counts and order), the read-ahead's landing,
 /// the seed and the routes (reads planned and posted), the read waits, the groups' graphs, their compute drains, the
 /// staged hot experts' copies into resident rows, the join, the combine's build.
@@ -87,6 +87,15 @@ pub fn report(tokens: u64) void {
         r(.join),                          r(.combine),
         sec(ns[@intFromEnum(Phase.mlp)]),
         sec(ns[@intFromEnum(Phase.rest)]),
+    });
+    log.info("glm_moe_dsa profile: prompt split s: proj q_a+norm {d:.3}, q_b+rope {d:.3}, indexer q {d:.3}, kv_a+norm+rope {d:.3}, indexer k {d:.3}, cache append {d:.3}; attn embed_q {d:.3}, sparse kernel {d:.3}, unembed_out {d:.3}, attn rest {d:.3}; o transpose {d:.3}, o_proj GEMM {d:.3}, residual {d:.3}\n", .{
+        sec(ns[@intFromEnum(Phase.proj_qa)]),  sec(ns[@intFromEnum(Phase.proj_qb)]),
+        sec(ns[@intFromEnum(Phase.proj_iq)]),  sec(ns[@intFromEnum(Phase.proj_kv)]),
+        sec(ns[@intFromEnum(Phase.proj_ik)]),  sec(ns[@intFromEnum(Phase.proj)]),
+        sec(ns[@intFromEnum(Phase.attn_embed)]), sec(ns[@intFromEnum(Phase.attn_core)]),
+        sec(ns[@intFromEnum(Phase.attn_unembed)]), sec(ns[@intFromEnum(Phase.attn)]),
+        sec(ns[@intFromEnum(Phase.o_trans)]),  sec(ns[@intFromEnum(Phase.o_gemm)]),
+        sec(ns[@intFromEnum(Phase.oproj)]),
     });
     ns = @splat(0);
     routed_ns = @splat(0);
