@@ -828,8 +828,8 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
     }
 }
 
-/// The bench's experiments (GLM53_EXL3_BENCH_EXP): one text each, one needle replaced.
-const BenchExp = struct { name: []const u8, kernel: xk.Kernel, needle: []const u8, repl: []const u8 };
+/// The bench's experiments (GLM53_EXL3_BENCH_EXP): one text each, its needles replaced in order (each needle once).
+const BenchExp = struct { name: []const u8, kernel: xk.Kernel, edits: []const [2][]const u8 };
 const decode_call =
     \\        if (hh != 0u) {
     \\            g53_col<K, 1>::decode_v(t0, o, v);
@@ -852,14 +852,20 @@ const no_decode = "            for (int q = 0; q < 16; ++q) v[q] = 0.001f * floa
 const no_decode_gu = "        for (int c = 0; c < 32; ++c) v[c] = 0.001f * float(c + int(lane)); (void)t0;";
 const mma_call = "tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});";
 const bench_exps = [_]BenchExp{
-    .{ .name = "gu: no trellis decode (B constant before the rotation)", .kernel = .glm53_pf_gu, .needle = decode_call, .repl = no_decode_gu },
-    .{ .name = "gu: no MMA (decode, rotation, scale alone)", .kernel = .glm53_pf_gu, .needle = mma_call, .repl = "(void)Atile; (void)Btile;" },
-    .{ .name = "gu: A rows contiguous (no gather)", .kernel = .glm53_pf_gu, .needle = "xr[i][e] = x + size_t(rt[2u * uint(row0 + rr)]) * size_t(HID) + size_t(fc.x);", .repl = "xr[i][e] = x + size_t(row0 + rr) * size_t(HID) + size_t(fc.x);" },
-    .{ .name = "gu: A constant (no x loads)", .kernel = .glm53_pf_gu, .needle = "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));", .repl = "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(0.01f * float(jj + e)); (void)p;" },
-    .{ .name = "gu: one barrier per stage (races; timing only)", .kernel = .glm53_pf_gu, .needle = "        threadgroup_barrier(mem_flags::mem_threadgroup);\n        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]", .repl = "        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]" },
-    .{ .name = "down: no trellis decode (B constant)", .kernel = .glm53_pf_down, .needle = decode_call_down, .repl = no_decode },
-    .{ .name = "down: no MMA (the decode alone)", .kernel = .glm53_pf_down, .needle = mma_call, .repl = "(void)Atile; (void)Btile;" },
-    .{ .name = "down: one epilogue (the last mini's)", .kernel = .glm53_pf_down, .needle = "if (p * SM >= valid) break;", .repl = "if (r != 3 || p * SM >= valid) break;" },
+    .{ .name = "gu: no trellis decode (B constant before the rotation)", .kernel = .glm53_pf_gu, .edits = &.{.{ decode_call, no_decode_gu }} },
+    .{ .name = "gu: no MMA (decode, rotation, scale alone)", .kernel = .glm53_pf_gu, .edits = &.{.{ mma_call, "(void)Atile; (void)Btile;" }} },
+    .{ .name = "gu: A rows contiguous (no gather)", .kernel = .glm53_pf_gu, .edits = &.{.{ "xr[i][e] = x + size_t(rt[2u * uint(row0 + rr)]) * size_t(HID) + size_t(fc.x);", "xr[i][e] = x + size_t(row0 + rr) * size_t(HID) + size_t(fc.x);" }} },
+    .{ .name = "gu: A constant (no x loads)", .kernel = .glm53_pf_gu, .edits = &.{.{ "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));", "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(0.01f * float(jj + e)); (void)p;" }} },
+    .{ .name = "gu: one barrier per stage (races; timing only)", .kernel = .glm53_pf_gu, .edits = &.{.{ "        threadgroup_barrier(mem_flags::mem_threadgroup);\n        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]", "        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]" }} },
+    .{ .name = "down: no trellis decode (B constant)", .kernel = .glm53_pf_down, .edits = &.{.{ decode_call_down, no_decode }} },
+    .{ .name = "down: no MMA (the decode alone)", .kernel = .glm53_pf_down, .edits = &.{.{ mma_call, "(void)Atile; (void)Btile;" }} },
+    .{ .name = "down: one epilogue (the last mini's)", .kernel = .glm53_pf_down, .edits = &.{.{ "if (p * SM >= valid) break;", "if (r != 3 || p * SM >= valid) break;" }} },
+    // the minis' sum in the MMA accumulators: every mini's MMA kept, the last mini's epilogue alone (one rout)
+    .{ .name = "down: the minis summed in the MMA (one epilogue, every MMA kept)", .kernel = .glm53_pf_down, .edits = &.{
+        .{ "    STEEL_PRAGMA_NO_UNROLL\n    for (int r = 0; r < 4; ++r) {\n", "    NAXTile<float, TM, TN> Dtile;\n    Dtile.clear();\n    STEEL_PRAGMA_NO_UNROLL\n    for (int r = 0; r < 4; ++r) {\n" },
+        .{ "        NAXTile<float, TM, TN> Dtile;\n        Dtile.clear();\n", "" },
+        .{ "if (p * SM >= valid) break;", "if (r != 3 || p * SM >= valid) break;" },
+    } },
 };
 
 // GLM53_EXL3_BENCH=<pack dir> (the box, lock-held): routed layer 0's 256 experts of the real pack resident (its K3 and
@@ -1103,10 +1109,14 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
         std.debug.print("GLM53_UBENCH prompt wave K{d} ({d} rows, {d} experts): gate|up {d:.3} ms ({d:.1} TFLOP/s), mid {d:.3} ms, down {d:.3} ms ({d:.1} TFLOP/s)\n", .{ b.layers[side].k, sts.rows, sts.experts, @as(f64, @floatFromInt(sts.ns[0])) / 1e6, 2 * f / @as(f64, @floatFromInt(sts.ns[0])) / 1e3, @as(f64, @floatFromInt(sts.ns[1])) / 1e6, @as(f64, @floatFromInt(sts.ns[2])) / 1e6, f / @as(f64, @floatFromInt(sts.ns[2])) / 1e3 });
         // GLM53_EXL3_BENCH_EXP: the stages over mutated texts (where the GEMMs' time goes; the outputs are not checked)
         if (std.c.getenv("GLM53_EXL3_BENCH_EXP") != null) for (bench_exps) |ex| {
-            const base = xk.embedded.sources[@backingInt(ex.kernel)];
-            if (std.mem.count(u8, base, ex.needle) != 1) return error.NeedleMissing;
-            const tx = try std.mem.replaceOwned(u8, a, base, ex.needle, ex.repl);
+            var tx = try a.dupe(u8, xk.embedded.sources[@backingInt(ex.kernel)]);
             defer a.free(tx);
+            for (ex.edits) |ed| {
+                if (std.mem.count(u8, tx, ed[0]) != 1) return error.NeedleMissing;
+                const nx = try std.mem.replaceOwned(u8, a, tx, ed[0], ed[1]);
+                a.free(tx);
+                tx = nx;
+            }
             const z = try a.dupeSentinel(u8, tx, 0);
             defer a.free(z);
             var texts: xk.Texts = undefined;
