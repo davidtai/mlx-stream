@@ -792,8 +792,10 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
     try g.evalAll(&.{ x, x16, rhsd, aff[0].w, aff[1].w, aff[2].w, w16[0], w16[1], w16[2] });
     const flop_gu = 2.0 * 2.0 * @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(h)) * inter;
     const flop = 1.5 * flop_gu;
-    const Arm = enum { affine_chain, affine_gate, f16_chain, f16_gate, ours_k3, ours_k4 };
-    var best: [6]u64 = @splat(std.math.maxInt(u64));
+    const Arm = enum { affine_chain, affine_gate, f16_chain, f16_gate, ours_k3, ours_k4, once_k3, once_k4, once_dec_k3, once_dec_k4 };
+    var best: [10]u64 = @splat(std.math.maxInt(u64));
+    var once = try Once.init(a, ours.pf[0].b.reg);
+    defer once.deinit();
     // ours: 32 resident experts of each bank layer, 512 rows each (rows spread over the tokens)
     var oslot: [2][n]u32 = undefined;
     var oact: [n]u32 = undefined;
@@ -814,6 +816,18 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
         const m = g.mark();
         defer g.resetTo(m);
         const t0 = nowNs();
+        if (arm == .once_dec_k3 or arm == .once_dec_k4) {
+            const side: usize = if (arm == .once_dec_k3) 0 else 1;
+            var keep: std.ArrayList(mlx.mlx_array) = .empty;
+            defer {
+                for (keep.items) |w| _ = mlx.mlx_array_free(w);
+                keep.deinit(a);
+            }
+            _ = try oncePrefill(a, ours, &once, g, xq, .{ .slot = &oslot[side], .act_row = &oact }, banks[side], &keep);
+            try g.evalAll(keep.items);
+            if (rep > 0) best[@intFromEnum(arm)] = @min(best[@intFromEnum(arm)], nowNs() - t0);
+            continue;
+        }
         const y = switch (arm) {
             .affine_chain, .affine_gate => blk2: {
                 const x3 = try g.reshape(x, &.{ n, 1, hc });
@@ -832,6 +846,11 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
                 const side: usize = if (arm == .ours_k3) 0 else 1;
                 break :blk2 try ours.prefill(g, @intCast(side), xq, .{ .slot = &oslot[side], .act_row = &oact }, banks[side]);
             },
+            .once_k3, .once_k4 => blk2: {
+                const side: usize = if (arm == .once_k3) 0 else 1;
+                break :blk2 (try oncePrefill(a, ours, &once, g, xq, .{ .slot = &oslot[side], .act_row = &oact }, banks[side], null)).?;
+            },
+            .once_dec_k3, .once_dec_k4 => unreachable,
         };
         try g.evalAll(&.{y});
         if (rep > 0) best[@intFromEnum(arm)] = @min(best[@intFromEnum(arm)], nowNs() - t0);
@@ -842,8 +861,366 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
             .affine_gate, .f16_gate => flop_gu / 2.0,
             else => flop,
         };
+        if (arm == .once_dec_k3 or arm == .once_dec_k4) {
+            // the scratch the decodes write: 32 experts x (gate|up + down) x 2 B
+            const bytes = 32.0 * 3.0 * @as(f64, @floatFromInt(h)) * inter * 2.0;
+            std.debug.print("GLM53_UBENCH ceiling {t} (32 experts x 512 rows): {d:.2} ms per 16,384 rows, {d:.1} GB/s of f16 scratch written ({d:.2} GB), {d:.1} ms per layer (131,072 rows)\n", .{ arm, @as(f64, @floatFromInt(ns)) / 1e6, bytes / @as(f64, @floatFromInt(ns)), bytes / 1e9, @as(f64, @floatFromInt(ns)) / 1e6 * 8.0 });
+            continue;
+        }
         std.debug.print("GLM53_UBENCH ceiling {t} (32 experts x 512 rows): {d:.2} ms per 16,384 rows, {d:.1} TFLOP/s, {d:.1} ms per layer (131,072 rows)\n", .{ arm, @as(f64, @floatFromInt(ns)) / 1e6, f / @as(f64, @floatFromInt(ns)) / 1e3, @as(f64, @floatFromInt(ns)) / 1e6 * 8.0 });
     }
+    // the decode-once chain against the fused chain on the same rows, bit for bit
+    for (0..2) |side| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const pr: quant.PrefillRows = .{ .slot = &oslot[side], .act_row = &oact };
+        const yf = try ours.prefill(g, @intCast(side), xq, pr, banks[side]);
+        const yo = (try oncePrefill(a, ours, &once, g, xq, pr, banks[side], null)).?;
+        try g.evalAll(&.{ yf, yo });
+        const bf = try g.hostBytes(yf);
+        const bq = try g.hostBytes(yo);
+        var diff: usize = 0;
+        for (std.mem.bytesAsSlice(u16, bf), std.mem.bytesAsSlice(u16, bq)) |p, q| diff += @intFromBool(p != q);
+        std.debug.print("GLM53_UBENCH ceiling once K{d} against ours K{d}: {d} of {d} bf16 outputs differ\n", .{ b.layers[side].k, b.layers[side].k, diff, bf.len / 2 });
+    }
+}
+
+// GLM53_EXL3_CEIL's decode-once arms (MEASUREMENT ONLY): each prompt wave's experts decoded once into an f16 scratch in
+// the fused GEMMs' threadgroup-memory layout (the gate|up's B decoded, t128 along k, times rin; the down's B decoded),
+// then the fused GEMMs' own texts with their B loaders reading that scratch: the same halves reach threadgroup memory
+// in the same order, so the chain's output equals the fused chain's bit for bit, and the time difference is the
+// decode's redundancy against the scratch's traffic.
+const kset_raw = @import("sdk_ext/kernel_set.zig");
+
+const once_dec_gu =
+    \\    // decode-once (bench): the gate|up B of one unit (wave expert j, op = 2 mini + projection, N tile, stage s), as
+    \\    // glm53_pf_gu stages it, to W at the unit's 64 x 128 block (column-major in k, as the fused kernel's Bs).
+    \\    constexpr int BN = 64;
+    \\    constexpr int BK = 128;
+    \\    constexpr int NWT = 8 * K;
+    \\    constexpr int K16 = HID / 16;
+    \\    constexpr int N16 = MINI / 16;
+    \\    constexpr int NTILES = MINI / BN;
+    \\    constexpr int S = HID / BK;
+    \\    const uint tid = thread_index_in_threadgroup;
+    \\    const uint sg = simdgroup_index_in_threadgroup;
+    \\    const uint lane = tid & 31u;
+    \\    const int g = int(threadgroup_position_in_grid.x);
+    \\    const int s = g % S;
+    \\    const int u = g / S;
+    \\    const int n0 = (u % NTILES) * BN;
+    \\    const int op = (u / NTILES) & 7;
+    \\    const int j = (u / NTILES) >> 3;
+    \\    const int slot = tbl[j];
+    \\    const int r = op >> 1;
+    \\    const int proj = op & 1;
+    \\    const uint q = lane & 3u;
+    \\    const uint n = 8u * sg + (lane >> 2u);
+    \\    const uint hh = (n >> 3u) & 1u;
+    \\    const uint c7 = n & 7u;
+    \\    uint o[5];
+    \\    if (hh != 0u) {
+    \\        g53_col<K, 1>::offsets(c7, o);
+    \\    } else {
+    \\        g53_col<K, 0>::offsets(c7, o);
+    \\    }
+    \\    const size_t mrow = size_t(slot) * 4u + size_t(r);
+    \\    const device uint* cd = reinterpret_cast<const device uint*>(proj == 0 ? cg : cu) + mrow * size_t(K16 * N16 * NWT)
+    \\        + size_t(n0 / 16 + int(n >> 4u)) * size_t(NWT) + size_t(2u * q) * size_t(N16 * NWT);
+    \\    const device half* rin = (proj == 0 ? rg : ru) + mrow * size_t(HID) + 32u * q;
+    \\    float v[32];
+    \\    const device uint* t0 = cd + size_t(s) * size_t(8 * N16 * NWT);
+    \\    if (hh != 0u) {
+    \\        g53_col<K, 1>::decode_v(t0, o, v);
+    \\        g53_col<K, 1>::decode_v(t0 + N16 * NWT, o, v + 16);
+    \\    } else {
+    \\        g53_col<K, 0>::decode_v(t0, o, v);
+    \\        g53_col<K, 0>::decode_v(t0 + N16 * NWT, o, v + 16);
+    \\    }
+    \\    g53_t128_quarters(v, lane);
+    \\    const device half4* rv = reinterpret_cast<const device half4*>(rin + s * BK);
+    \\    uint pk[16];
+    \\    STEEL_PRAGMA_UNROLL
+    \\    for (int c = 0; c < 8; ++c) {
+    \\        const float4 w = float4(rv[c]);
+    \\        pk[2 * c] = uint(as_type<ushort>(half(v[4 * c] * w.x))) | (uint(as_type<ushort>(half(v[4 * c + 1] * w.y))) << 16u);
+    \\        pk[2 * c + 1] = uint(as_type<ushort>(half(v[4 * c + 2] * w.z))) | (uint(as_type<ushort>(half(v[4 * c + 3] * w.w))) << 16u);
+    \\    }
+    \\    device uint4* dst = reinterpret_cast<device uint4*>(W + (size_t(g) * size_t(BN) + size_t(n)) * size_t(BK) + 32u * q);
+    \\    STEEL_PRAGMA_UNROLL
+    \\    for (int c = 0; c < 4; ++c) dst[c] = uint4(pk[4 * c], pk[4 * c + 1], pk[4 * c + 2], pk[4 * c + 3]);
+;
+
+const once_dec_dn =
+    \\    // decode-once (bench): the down B of one unit (wave expert j, mini r, N tile, stage s), as glm53_pf_down stages
+    \\    // it, to W at the unit's 128 x 32 block (column-major in k, as the fused kernel's Bs without its pad).
+    \\    constexpr int BN = 128;
+    \\    constexpr int BK = 32;
+    \\    constexpr int NWT = 8 * K;
+    \\    constexpr int KT = BK / 16;
+    \\    constexpr int NT = BN / 16;
+    \\    constexpr int K16 = MINI / 16;
+    \\    constexpr int N16 = HID / 16;
+    \\    constexpr int NTILES = HID / BN;
+    \\    constexpr int S = MINI / BK;
+    \\    const uint tid = thread_index_in_threadgroup;
+    \\    const uint sg = simdgroup_index_in_threadgroup;
+    \\    const uint lane = tid & 31u;
+    \\    const int g = int(threadgroup_position_in_grid.x);
+    \\    const int s = g % S;
+    \\    const int u = g / S;
+    \\    const int n0 = (u % NTILES) * BN;
+    \\    const int r = (u / NTILES) & 3;
+    \\    const int j = (u / NTILES) >> 2;
+    \\    const int slot = tbl[j];
+    \\    const uint h = sg & 1u;
+    \\    const uint c7 = lane & 7u;
+    \\    const int t = int(lane >> 3u) + 4 * int(sg >> 1u);
+    \\    const int kt = t / NT;
+    \\    const int nt = t - kt * NT;
+    \\    const int src_off = (kt * N16 + nt) * NWT;
+    \\    uint o[5];
+    \\    if (h != 0u) {
+    \\        g53_col<K, 1>::offsets(c7, o);
+    \\    } else {
+    \\        g53_col<K, 0>::offsets(c7, o);
+    \\    }
+    \\    const size_t mrow = size_t(slot) * 4u + size_t(r);
+    \\    const device uint* tile = reinterpret_cast<const device uint*>(cd0) + mrow * size_t(K16 * N16) * size_t(NWT)
+    \\        + size_t(n0 / 16) * size_t(NWT) + size_t(s) * size_t(KT * N16 * NWT) + size_t(src_off);
+    \\    float v[16];
+    \\    if (h != 0u) {
+    \\        g53_col<K, 1>::decode_v(tile, o, v);
+    \\    } else {
+    \\        g53_col<K, 0>::decode_v(tile, o, v);
+    \\    }
+    \\    uint pk[8];
+    \\    STEEL_PRAGMA_UNROLL
+    \\    for (uint q = 0; q < 8u; ++q) {
+    \\        pk[q] = uint(as_type<ushort>(static_cast<half>(v[2u * q]))) | (uint(as_type<ushort>(static_cast<half>(v[2u * q + 1u]))) << 16u);
+    \\    }
+    \\    device uint4* dst = reinterpret_cast<device uint4*>(W + (size_t(g) * size_t(BN) + size_t(nt * 16 + 8 * int(h) + int(c7))) * size_t(BK) + size_t(kt * 16));
+    \\    dst[0] = uint4(pk[0], pk[1], pk[2], pk[3]);
+    \\    dst[1] = uint4(pk[4], pk[5], pk[6], pk[7]);
+;
+
+/// One needle of a fused text and its replacement (the decode-once GEMMs).
+const OnceEdit = struct { needle: []const u8, repl: []const u8 };
+const once_gu_edits = [_]OnceEdit{
+    .{
+        .needle =
+        \\    const size_t mrow = size_t(slot) * 4u + size_t(r);
+        \\    const device uint* cd = reinterpret_cast<const device uint*>(proj == 0 ? cg : cu) + mrow * size_t(K16 * N16 * NWT)
+        \\        + size_t(n0 / 16 + int(n >> 4u)) * size_t(NWT) + size_t(2u * q) * size_t(N16 * NWT);
+        \\    const device half* rin = (proj == 0 ? rg : ru) + mrow * size_t(HID) + 32u * q;
+        ,
+        .repl =
+        \\    (void)slot;
+        \\    const device uint4* wsrc = reinterpret_cast<const device uint4*>(W + ((size_t(j) * 8u + size_t(op)) * size_t(NTILES) + size_t(n0 / BN)) * size_t(S * BN * BK) + size_t(n) * size_t(BK) + 32u * q);
+        ,
+    },
+    .{
+        .needle =
+        \\        float v[32];
+        \\        const device uint* t0 = cd + size_t(s) * size_t(8 * N16 * NWT);
+        \\        if (hh != 0u) {
+        \\            g53_col<K, 1>::decode_v(t0, o, v);
+        \\            g53_col<K, 1>::decode_v(t0 + N16 * NWT, o, v + 16);
+        \\        } else {
+        \\            g53_col<K, 0>::decode_v(t0, o, v);
+        \\            g53_col<K, 0>::decode_v(t0 + N16 * NWT, o, v + 16);
+        \\        }
+        \\        g53_t128_quarters(v, lane);
+        \\        const device half4* rv = reinterpret_cast<const device half4*>(rin + s * BK);
+        \\        uint pk[16];
+        \\        STEEL_PRAGMA_UNROLL
+        \\        for (int c = 0; c < 8; ++c) {
+        \\            const float4 w = float4(rv[c]);
+        \\            pk[2 * c] = uint(as_type<ushort>(half(v[4 * c] * w.x))) | (uint(as_type<ushort>(half(v[4 * c + 1] * w.y))) << 16u);
+        \\            pk[2 * c + 1] = uint(as_type<ushort>(half(v[4 * c + 2] * w.z))) | (uint(as_type<ushort>(half(v[4 * c + 3] * w.w))) << 16u);
+        \\        }
+        \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\        STEEL_PRAGMA_UNROLL
+        \\        for (int c = 0; c < 4; ++c) bdst[c] = uint4(pk[4 * c], pk[4 * c + 1], pk[4 * c + 2], pk[4 * c + 3]);
+        \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ,
+        .repl =
+        \\        uint4 wv[4];
+        \\        STEEL_PRAGMA_UNROLL
+        \\        for (int c = 0; c < 4; ++c) wv[c] = wsrc[size_t(s) * size_t(BN * BK / 8) + size_t(c)];
+        \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\        STEEL_PRAGMA_UNROLL
+        \\        for (int c = 0; c < 4; ++c) bdst[c] = wv[c];
+        \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ,
+    },
+};
+const once_dn_edits = [_]OnceEdit{
+    .{
+        .needle = "        const device uint* cd = reinterpret_cast<const device uint*>(cd0) + mrow * size_t(K16 * N16) * size_t(NWT) + size_t(n0 / 16) * size_t(NWT);",
+        .repl = "        const device uint4* wb = reinterpret_cast<const device uint4*>(W + (((size_t(j) * 4u + size_t(r)) * size_t(NTILES) + size_t(n0 / BN)) * size_t(S) * size_t(BN) + size_t(nt * 16 + 8 * int(h) + int(c7))) * size_t(BK) + size_t(kt * 16));",
+    },
+    .{
+        .needle =
+        \\        uint P[5];
+        \\        auto fetch = [&](int s) {
+        \\            const device uint* tile = cd + size_t(s) * size_t(KT * N16 * NWT) + src_off;
+        \\            if (h != 0u) {
+        \\                g53_col<K, 1>::words(tile, o, P);
+        \\            } else {
+        \\                g53_col<K, 0>::words(tile, o, P);
+        \\            }
+        \\        };
+        ,
+        .repl =
+        \\        uint4 P[2];
+        \\        auto fetch = [&](int s) {
+        \\            const device uint4* tile = wb + size_t(s) * size_t(BN * BK / 8);
+        \\            P[0] = tile[0];
+        \\            P[1] = tile[1];
+        \\        };
+        ,
+    },
+    .{
+        .needle =
+        \\        auto stage_b = [&](int b) {
+        \\            float v[16];
+        \\            if (h != 0u) {
+        \\                g53_col<K, 1>::decode_p(P, v);
+        \\                g53_col<K, 1>::template store<half>(v, Bs + b * BUF + dst_off);
+        \\            } else {
+        \\                g53_col<K, 0>::decode_p(P, v);
+        \\                g53_col<K, 0>::template store<half>(v, Bs + b * BUF + dst_off);
+        \\            }
+        \\        };
+        ,
+        .repl =
+        \\        auto stage_b = [&](int b) {
+        \\            threadgroup uint4* d4 = reinterpret_cast<threadgroup uint4*>(Bs + b * BUF + dst_off);
+        \\            d4[0] = P[0];
+        \\            d4[1] = P[1];
+        \\        };
+        ,
+    },
+};
+
+/// The decode-once chain's four kernels (decode gate|up, GEMM gate|up over the scratch, decode down, GEMM down over the
+/// scratch) on the fused texts' headers; the mid is the fused chain's.
+const Once = struct {
+    k: [4]mlx.mlx_fast_metal_kernel,
+    texts: [2][:0]u8,
+    a: Allocator,
+
+    fn edited(a: Allocator, base: []const u8, edits: []const OnceEdit) ![:0]u8 {
+        var cur: []u8 = try a.dupe(u8, base);
+        for (edits) |e| {
+            if (std.mem.count(u8, cur, e.needle) != 1) {
+                a.free(cur);
+                return error.NeedleMissing;
+            }
+            const next = try std.mem.replaceOwned(u8, a, cur, e.needle, e.repl);
+            a.free(cur);
+            cur = next;
+        }
+        defer a.free(cur);
+        return a.dupeSentinel(u8, cur, 0);
+    }
+
+    fn init(a: Allocator, reg: *const xk.Registry) !Once {
+        const gu = reg.get(.glm53_pf_gu);
+        const dn = reg.get(.glm53_pf_down);
+        var o: Once = .{ .k = undefined, .texts = undefined, .a = a };
+        o.texts[0] = try edited(a, gu.source, &once_gu_edits);
+        errdefer a.free(o.texts[0]);
+        o.texts[1] = try edited(a, dn.source, &once_dn_edits);
+        errdefer a.free(o.texts[1]);
+        const specs = [4]struct { name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, src: [*:0]const u8, hdr: [*:0]const u8 }{
+            .{ .name = "glm53_once_dec_gu", .ins = &.{ "tbl", "cg", "cu", "rg", "ru" }, .outs = &.{"W"}, .src = once_dec_gu, .hdr = gu.header_text.ptr },
+            .{ .name = "glm53_once_gu", .ins = &.{ "x", "rt", "tbl", "W" }, .outs = &.{ "zg", "zu" }, .src = o.texts[0].ptr, .hdr = gu.header_text.ptr },
+            .{ .name = "glm53_once_dec_dn", .ins = &.{ "tbl", "cd0" }, .outs = &.{"W"}, .src = once_dec_dn, .hdr = dn.header_text.ptr },
+            .{ .name = "glm53_once_dn", .ins = &.{ "hm", "tbl", "W", "rout" }, .outs = &.{"y"}, .src = o.texts[1].ptr, .hdr = dn.header_text.ptr },
+        };
+        for (specs, &o.k) |sp, *kk| kk.* = kset_raw.newKernel(sp.name, sp.ins, sp.outs, sp.src, sp.hdr, true) orelse return error.KernelCreateFailed;
+        return o;
+    }
+
+    fn deinit(o: *Once) void {
+        for (o.k) |kk| _ = mlx.mlx_fast_metal_kernel_free(kk);
+        for (o.texts) |t| o.a.free(t);
+    }
+
+    /// One launch of kernel `i` at `tgs` threadgroups of 256 threads, its `n_out` outputs of one shape and dtype.
+    fn launch(o: *const Once, i: usize, s: mlx.mlx_stream, inputs: []const mlx.mlx_array, tgs: u32, shape: []const c_int, dt: mlx.mlx_dtype, n_out: usize, inst: xk.Instance, outs: []mlx.mlx_array) !void {
+        const tmpl = [_]kset_raw.TemplateArg{
+            .{ .name = "K", .value = .{ .int = @intCast(inst.k) } },
+            .{ .name = "HID", .value = .{ .int = @intCast(inst.hidden) } },
+            .{ .name = "MINI", .value = .{ .int = @intCast(inst.mini) } },
+        };
+        const shapes = [2][]const c_int{ shape, shape };
+        const dts = [2]mlx.mlx_dtype{ dt, dt };
+        const cfg = try kset_raw.buildConfig(.{ .grid = .{ 256 * tgs, 1, 1 }, .threadgroup = .{ 256, 1, 1 }, .out_shapes = shapes[0..n_out], .out_dtypes = dts[0..n_out], .template = &tmpl });
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try kset_raw.applyConfig(o.k[i], cfg, inputs, outs[0..n_out], s);
+    }
+
+    /// One prompt wave through the decode-once chain (the fused chain's `routes.Prompt.wave` geometry): the decode of
+    /// its experts' gate|up, the gate|up GEMM over it, the fused mid, the decode of their down, the down GEMM over it
+    /// -> y bf16 [rows, HID] (new; the caller frees it). `dec_only`: the two decodes alone, their scratch into `keep`.
+    fn wave(o: *const Once, pf: *const routes.Prompt, x: mlx.mlx_array, rt: mlx.mlx_array, rows: usize, ne: usize, tgu: mlx.mlx_array, tgs_gu: u32, tdn: mlx.mlx_array, tgs_dn: u32, bk: routes.Bank, dec_only: ?*std.ArrayList(mlx.mlx_array)) !?mlx.mlx_array {
+        const s = pf.b.stream;
+        const inst = pf.inst;
+        const h = inst.hidden;
+        const mi = inst.mini;
+        const rc: c_int = @intCast(rows);
+        const ugu: u32 = @intCast(ne * 8 * (mi / 64) * (h / 128));
+        const udn: u32 = @intCast(ne * 4 * (h / 128) * (mi / 32));
+        var wg: [1]mlx.mlx_array = .{.{}};
+        var wd: [1]mlx.mlx_array = .{.{}};
+        defer for ([_]mlx.mlx_array{ wg[0], wd[0] }) |w| {
+            if (w.ctx != null) _ = mlx.mlx_array_free(w);
+        };
+        try o.launch(0, s, &.{ tgu, bk.gate.trellis, bk.up.trellis, bk.gate.suh, bk.up.suh }, ugu, &.{@intCast(ugu * 64 * 128)}, .float16, 1, inst, &wg);
+        try o.launch(2, s, &.{ tdn, bk.down.trellis }, udn, &.{@intCast(udn * 128 * 32)}, .float16, 1, inst, &wd);
+        if (dec_only) |keep| {
+            try keep.append(o.a, try routes.Prompt.Stages.retain(wg[0]));
+            try keep.append(o.a, try routes.Prompt.Stages.retain(wd[0]));
+            return null;
+        }
+        var st: routes.Prompt.Stages = .{};
+        defer st.deinit();
+        const zsh = [_]c_int{rc * 4 * @as(c_int, @intCast(mi))};
+        try o.launch(1, s, &.{ x, rt, tgu, wg[0] }, tgs_gu, &zsh, .float32, 2, inst, &st.z);
+        try pf.stage(.mid, &st, x, rt, rows, tgu, tgs_gu, tdn, tgs_dn, bk);
+        try o.launch(3, s, &.{ st.hm[0], tdn, wd[0], bk.down.svh }, tgs_dn, &.{ rc, @intCast(h) }, .bfloat16, 1, inst, &st.y);
+        return st.take();
+    }
+};
+
+/// `ours.prefill` through the decode-once chain (`Once.wave` per wave, the same waves, join and order).
+fn oncePrefill(a: Allocator, ours: anytype, once: *const Once, g: anytype, x: mlx.mlx_array, rows: quant.PrefillRows, bank: anytype, dec_only: ?*std.ArrayList(mlx.mlx_array)) !?mlx.mlx_array {
+    const Q = @TypeOf(ours.*);
+    const n = rows.slot.len;
+    const k = Q.kOf(bank.gate.trellis) orelse return error.BankArrays;
+    try ours.sortRows(rows, bank);
+    const bk: routes.Bank = .{ .gate = Q.proj(bank.gate), .up = Q.proj(bank.up), .down = Q.proj(bank.down) };
+    var waves: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (waves.items) |w| _ = mlx.mlx_array_free(w);
+        waves.deinit(a);
+    }
+    var i: usize = 0;
+    while (i < n) {
+        const w = ours.nextWave(rows, i);
+        const m = g.mark();
+        const t = try ours.waveArrays(g, w);
+        if (try once.wave(&ours.pf[Q.ki(k)], x, t.rt, w.rows, w.ne, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk, dec_only)) |y| try waves.append(a, y);
+        g.resetTo(m);
+        i = w.end;
+    }
+    if (dec_only != null) return null;
+    const joined = try g.adopt(if (waves.items.len == 1) try routes.Prompt.Stages.retain(waves.items[0]) else try Q.concat(waves.items, g.s));
+    const ord = try g.hostArray(std.mem.sliceAsBytes(ours.inv.items), &.{@intCast(n)}, .uint32);
+    return try g.take(joined, ord, 0);
 }
 
 /// The bench's experiments (GLM53_EXL3_BENCH_EXP): one text each, one needle replaced.
