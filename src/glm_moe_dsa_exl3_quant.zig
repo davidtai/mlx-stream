@@ -383,6 +383,8 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
         defer math.deinit(&g);
         var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .gated = gated, .event = ev, .wide_depth = 2 });
         defer ex.deinit(&g);
+        // Every decode-lane call's GPU combine against the op chain's join and combine, bit for bit.
+        ex.combine_check.on = true;
         for (ex.banks) |bk| if (bk[0]) |arr| try math.checkBank(&g, arr, &diag);
         for (widths) |n| {
             if (n == 0) {
@@ -429,8 +431,10 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
             }
         }
         const stats = st.stats();
-        std.debug.print(label ++ " [{s}]: {d} routes, {d} hits, {d} misses, {d} B read, lookahead {d} issued / {d} used\n", .{ if (gated) "event gates" else "host waits", stats.route_calls, stats.expert_cache_hits, stats.expert_cache_misses, stats.expert_bytes_read, stats.spec_issued, stats.claimed });
+        std.debug.print(label ++ " [{s}]: {d} routes, {d} hits, {d} misses, {d} B read, lookahead {d} issued / {d} used; GPU combine {d} decode calls (bits as the op chain's: {d} differ), {d} joined\n", .{ if (gated) "event gates" else "host waits", stats.route_calls, stats.expert_cache_hits, stats.expert_cache_misses, stats.expert_bytes_read, stats.spec_issued, stats.claimed, ex.combine_check.checked, ex.combine_check.differed, ex.host.joined });
         try testing.expect(stats.expert_cache_misses > 0 and stats.transient_loads > 0);
+        try testing.expect(ex.combine_check.checked > 0);
+        try testing.expectEqual(@as(u32, 0), ex.combine_check.differed);
     }
     std.debug.print(label ++ ": streamed MoE against the host decode, max |delta| {d:.5} at outputs up to {d:.3}\n", .{ worst, scale });
     try testing.expect(scale > 0.1);
