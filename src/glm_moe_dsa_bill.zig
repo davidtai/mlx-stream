@@ -87,11 +87,6 @@ pub const host_side_readings = [_][5]u64{
     .{ 929_000_000, 0, 0, 2, 89_362_432 }, // stack 42abec0's handover: 0.929 GB
     .{ 998_000_000, 0, 0, 3, 89_362_432 }, // stack 42abec0's request end: 0.998 GB
 };
-/// The host side's rise from the handover's reading to the request's end (decode's own host state and freed pages not
-/// yet reclaimed), the term the live grow adds to its reading: measured 0.095-0.520 GB over 1,024 tokens (runs m1, m2,
-/// k1 and k2), plus 0.08 GB.
-pub const decode_host_rise_bytes: u64 = 600_000_000;
-
 /// The page tables of `wired` bytes (`phase_memory.wireTables`, shared with DeepSeek-V4.1's bill).
 pub const wireTables = phase_mem.wireTables;
 /// What the fill leaves of the box's RAM past the box's used memory (`sdk.memory.boxUsedBytes`): the free pages, the
@@ -798,32 +793,32 @@ pub fn requestRows(a: std.mem.Allocator, in: Inputs, positions: u64, prompt: u32
     return r.decode;
 }
 
-/// What decode adds past the handover's reading of a request at `positions`, beyond its grown rows: decode's window 0
-/// (the grow allocates it), the request's decode waves, the MLX decode cache and its overshoot, and the host side's
-/// rise in decode.
+/// What decode adds past MLX's active bytes at the handover of a request at `positions`, beyond its grown rows: decode's
+/// window 0 (the grow allocates it), the request's decode waves, the MLX decode cache and its overshoot (MLX's); the
+/// bill's decode host terms, the read pool's staging and the host side's measured bound (the footprint outside MLX).
 pub fn decodeAfter(in: Inputs, positions: u64) struct { device: u64, host: u64 } {
     const d = atRequest(in, positions).phases[@intFromEnum(Phase.decode)];
-    return .{ .device = d.transient_rows + d.waves + d.mlx_cache + d.mlx_cache_overshoot, .host = decode_host_rise_bytes };
+    return .{ .device = d.transient_rows + d.waves + d.mlx_cache + d.mlx_cache_overshoot, .host = d.pool_staging + d.host_side };
 }
 
-/// The handover's live reading and what decode adds past it (`liveRows`).
+/// The handover's live reading (MLX's active bytes, exact) and what decode adds past it (`liveRows`).
 pub const Live = struct {
     /// The box's target (`targetOf`) and MLX's (the host's ceiling less its wired margin; 0: none): the grow's, and past
     /// either even the prompt rows refuse the request.
     target: u64,
     gpu_target: u64 = 0,
     baseline: u64,
-    /// The footprint after the prompt's frees settled, with the request's KV lanes at its decode cap.
-    footprint: u64,
-    /// MLX's active bytes then (the wired bytes the page tables cover).
+    /// MLX's active bytes after the prompt's frees settled, with the request's KV lanes at its decode cap (the wired
+    /// bytes the page tables cover).
     mlx_bytes: u64,
     /// The persistent rows the reading holds (the prompt's) and the most a layer takes.
     prompt_rows: u32,
     max_rows: u32,
     per_row: u64,
-    /// What decode adds past the reading: MLX's (wired) and the host's (`decodeAfter`).
+    /// What decode adds past the reading (MLX's, wired) and the footprint outside MLX (the bill's decode host terms,
+    /// `decodeAfter`).
     device_after: u64,
-    host_after: u64,
+    host: u64,
     /// The stream's slots (null: `per_row` a unit): the grown rows' bytes exactly as `rowsAt` gives them.
     geometry: ?glm.Geometry = null,
 
@@ -834,11 +829,11 @@ pub const Live = struct {
         return grownBytes(g, l.prompt_rows, units);
     }
 
-    /// The box's bytes at `units`: the baseline, the reading, the grown rows, decode's additions and the page tables
-    /// of every MLX byte.
+    /// The box's bytes at `units`: the baseline, MLX's bytes (`mlxAt`), the host terms and the page tables of every
+    /// MLX byte.
     pub fn total(l: Live, units: u32) u64 {
-        const g = l.grown(units);
-        return l.baseline + l.footprint + g + l.device_after + l.host_after + wireTables(l.mlx_bytes + g + l.device_after);
+        const m = l.mlxAt(units);
+        return l.baseline + m + l.host + wireTables(m);
     }
 
     /// MLX's bytes at `units`: the reading's, the grown rows and decode's MLX additions.
@@ -1134,22 +1129,23 @@ test "glm bill: the bill at a request counts its slot rows exactly; a request's 
     const worst = try requestRows(testing.allocator, in, maxPositions(&cfg), 76, baseline, target, maxUnits(in.bank));
     try testing.expect(r > worst);
     try testing.expectEqual(@as(u32, 0), try requestRows(testing.allocator, in, positions, 76, baseline, baseline, maxUnits(in.bank)));
-    // What decode adds past the handover's reading: window 0, the waves, the cache and its overshoot; the host's rise.
+    // What decode adds past MLX's active bytes at the handover: window 0, the waves, the cache and its overshoot; the
+    // decode host terms.
     const after = decodeAfter(in, positions);
     const d = req.phases[@intFromEnum(Phase.decode)];
     try testing.expectEqual(d.transient_rows + d.waves + d.mlx_cache + d.mlx_cache_overshoot, after.device);
-    try testing.expectEqual(decode_host_rise_bytes, after.host);
+    try testing.expectEqual(d.pool_staging + d.host_side, after.host);
 }
 
 test "glm bill: the live grow fills the rows the reading leaves under the target, and refuses below the prompt rows" {
     const row: u64 = 1_592_524_800;
-    var l: Live = .{ .target = 255_550_554_112, .baseline = 12_400_000_000, .footprint = 220_000_000_000, .mlx_bytes = 219_000_000_000, .prompt_rows = 120, .max_rows = 256, .per_row = row, .device_after = 1_000_000_000, .host_after = 100_000_000 };
+    var l: Live = .{ .target = 255_550_554_112, .baseline = 12_400_000_000, .mlx_bytes = 219_000_000_000, .prompt_rows = 120, .max_rows = 256, .per_row = row, .device_after = 1_000_000_000, .host = 1_100_000_000 };
     const r = try liveRows(l);
     try testing.expect(r > 120 and l.total(r) <= l.target and l.total(r + 1) > l.target);
     try testing.expectEqual(@as(u32, 133), r);
     l.max_rows = 125;
     try testing.expectEqual(@as(u32, 125), try liveRows(l));
-    l.footprint = 243_000_000_000;
+    l.mlx_bytes = 242_000_000_000;
     try testing.expectError(error.DecodeOverTarget, liveRows(l));
 }
 
@@ -1162,7 +1158,7 @@ test "glm bill: the target is the RAM less the OS reserve, and MLX's bytes stay 
     try testing.expectEqual(17_600_000_000 + host_side_decode_bytes + 190 * gib, targetOf(190 * gib, ram, 17_600_000_000));
     try testing.expectEqual(17_600_000_000 + host_side_decode_bytes + gpu, targetOf(gpu, 0, 17_600_000_000));
     const row: u64 = 2_445_926_400;
-    var l: Live = .{ .target = targetOf(gpu, ram, 17_600_000_000), .gpu_target = gpu, .baseline = 17_600_000_000, .footprint = 214_500_000_000, .mlx_bytes = 213_600_000_000, .prompt_rows = 77, .max_rows = 175, .per_row = row, .device_after = 1_400_000_000, .host_after = 600_000_000 };
+    var l: Live = .{ .target = targetOf(gpu, ram, 17_600_000_000), .gpu_target = gpu, .baseline = 17_600_000_000, .mlx_bytes = 213_600_000_000, .prompt_rows = 77, .max_rows = 175, .per_row = row, .device_after = 1_400_000_000, .host = 1_500_000_000 };
     const r = try liveRows(l);
     try testing.expect(l.fits(r) and !l.fits(r + 1) and l.total(r + 1) > l.target);
     l.gpu_target = l.mlxAt(80);

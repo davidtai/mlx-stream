@@ -8,8 +8,8 @@
 //! terms (`ConstructionOverBill`). A request: the reverse phase change if the previous one decoded, the KV lanes at
 //! the prompt's positions, the prompt pass (layer by layer in calls of `glm_moe_dsa.promptCallRows`, or chunk by
 //! chunk), the decode handover (the transient scratch freed, the KV lanes at the request's own prompt and `max_tokens`,
-//! the footprint read once the frees show in it, the slot rows grown to what the bill at the request admits and the
-//! reading leaves under the target), serial steps. A later prompt keeps the KV of the prefix it shares with the state
+//! MLX's counters read once the host side is back at its reading before the frees, the slot rows grown to what the bill
+//! at the request admits and the reading leaves under the target), serial steps. A later prompt keeps the KV of the prefix it shares with the state
 //! (`restorePrefix`). One log line at the prompt pass's end, one at the handover and one at the request's end report
 //! the phase's reads from the stream's counters and its memory from MLX's and the kernel's (`PromptLine`,
 //! `HandoverLine`, `DecodeLine`). With `GLM53_ROUTES` set at construction, the route recorder (`expert.routes`) writes
@@ -59,12 +59,12 @@ pub const prefill_chunk_tokens: u32 = 2048;
 /// How far the constructed footprint may sit above the bill's construction terms (the ledger's page rounding and the
 /// host side's own movement; `phase_memory`'s, shared with DeepSeek-V4.1's module).
 pub const construction_tolerance_bytes = phase_mem.construction_tolerance_bytes;
-/// A phase change's settle (`phase_memory.settle`, shared with DeepSeek-V4.1's module): the footprint read every
-/// `settle_poll_ms` until it shows the frees (within `settle_tolerance_bytes`), at most `settle_max_ms`; the grow then
-/// reads the last reading.
+/// A phase change's settle (`phase_memory.settle`'s loop, shared with DeepSeek-V4.1's module; this module's condition):
+/// MLX's counters and the footprint read every `settle_poll_ms` until MLX's cache is empty and the host side is at most
+/// `settle_host_tolerance_bytes` over its reading before the frees, at most `settle_max_ms`.
 pub const settle_poll_ms = phase_mem.settle_poll_ms;
 pub const settle_max_ms = phase_mem.settle_max_ms;
-pub const settle_tolerance_bytes = phase_mem.settle_tolerance_bytes;
+pub const settle_host_tolerance_bytes: u64 = 50_000_000;
 /// The route recorder's diagnostic switch (`expert.routes`), read once at construction.
 pub const routes_env = "GLM53_ROUTES";
 /// The wave probe's diagnostic switch (`graph.WaveProbe`), read once at construction.
@@ -396,13 +396,6 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             return @intCast(self.billed.phases[@intFromEnum(phase)].mlx_cache);
         }
 
-        /// The settle's bound on the host side after a phase change's frees: the prompt phase's host terms (the read
-        /// pool's staging and the measured rest).
-        fn hostBound(self: *const Self) u64 {
-            const p = self.billed.phases[@intFromEnum(bill_mod.Phase.prompt)];
-            return p.pool_staging + p.host_side;
-        }
-
         /// One phase boundary's record (`phase_memory.Record` over the bill's terms `billed`), logged as one JSON line;
         /// then both high-water marks restart for the next phase. `peaks`: MLX's peak and the footprint's over the phase
         /// when the wave probe restarted them within it (the probe's own).
@@ -580,16 +573,16 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
         /// The phase change, once per request before its first decode step: every prompt command retired, the transient
         /// scratch freed, the MLX cache cleared and its decode limit set; the KV lanes at the request's decode positions
-        /// (its prompt and `max_tokens`, `bill.decodeCap`); the footprint read once it shows the frees (`settle`); then
-        /// the slot rows grown to the fewer of what the bill at this request's KV admits (`bill.requestRows`) and what
-        /// the reading leaves under the target for decode's own terms (`bill.liveRows`), never below the prompt rows
+        /// (its prompt and `max_tokens`, `bill.decodeCap`); MLX's counters read once the host side is back (`settle`);
+        /// then the slot rows grown to the fewer of what the bill at this request's KV admits (`bill.requestRows`) and
+        /// what MLX's active bytes leave under the target for decode's own terms (`bill.liveRows`), never below the prompt rows
         /// (forced rows: grown to them). Refused by name when even the prompt rows are over the target (the scratch
         /// comes back; the request fails, the module stays in its prompt configuration).
         pub fn decodeHandover(self: *Self, h: sdk.DecodeHandover) !void {
             if (self.decoding) return;
             _ = mlx.mlx_synchronize(self.g.s);
             const before = Mem.now();
-            const transient = try self.ex.releaseTransient();
+            _ = try self.ex.releaseTransient();
             var prev: usize = 0;
             errdefer {
                 _ = self.ex.regrowTransient() catch {};
@@ -598,12 +591,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.g.clearCache();
             _ = mlx.mlx_set_cache_limit(&prev, self.cacheLimit(.decode));
             const cap: u32 = @intCast(@min(bill_mod.decodeCap(&self.cfg, @max(h.reserved_tokens, self.cache.len)), self.max_positions));
-            const kv0 = self.kvAllocated();
             try self.resizeKv(cap);
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
             const kv1 = self.kvAllocated();
-            const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + transient + kv0), self.hostBound());
+            const st = settle(LiveReader{ .io = self.io }, before.hostSide());
             const box = Box.now(st.after);
             // The box's target beside the rest of the box as it stands now (not the load's baseline, an older reading of
             // it), for the live reading and the bill at the request alike.
@@ -612,7 +604,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (!self.forced_rows) {
                 const after = bill_mod.decodeAfter(self.inputs, cap);
                 const max_units = bill_mod.maxUnits(self.inputs.bank);
-                const live: bill_mod.Live = .{ .target = target, .gpu_target = self.gpu_target, .baseline = box.others, .footprint = st.after.footprint, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_units, .max_rows = max_units, .per_row = self.bill.per_row, .device_after = after.device, .host_after = after.host, .geometry = self.inputs.bank };
+                const live: bill_mod.Live = .{ .target = target, .gpu_target = self.gpu_target, .baseline = box.others, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_units, .max_rows = max_units, .per_row = self.bill.per_row, .device_after = after.device, .host = after.host, .geometry = self.inputs.bank };
                 line.live_rows = bill_mod.liveRows(live) catch |e| {
                     line.refused = @errorName(e);
                     log.err("{f}\n", .{line});
@@ -705,7 +697,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
         /// The reverse phase change, before a prompt of `positions` positions (its kept prefix included) after a decode:
         /// every route settled, the grown rows and window 0 freed, the KV lanes at the prompt's positions, the MLX cache
-        /// cleared, the footprint read once it shows the frees (`settle`), the prompt's scratch re-created, the prompt
+        /// cleared, MLX's counters read once the host side is back (`settle`), the prompt's scratch re-created, the prompt
         /// cache limit. Without a decode before it: the KV lanes at the prompt's positions.
         fn reverse(self: *Self, positions: u32) !void {
             if (!self.decoding) {
@@ -716,13 +708,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_synchronize(self.g.s);
             const before = Mem.now();
             try self.stream.settleRoutes();
-            const freed = try self.ex.shrink(self.prompt_rows);
-            const kv0 = self.kvAllocated();
+            _ = try self.ex.shrink(self.prompt_rows);
             try self.resizeKv(positions);
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
             const kv1 = self.kvAllocated();
-            const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + freed + kv0), self.hostBound());
+            const st = settle(LiveReader{ .io = self.io }, before.hostSide());
             _ = try self.ex.regrowTransient();
             var prev: usize = 0;
             _ = mlx.mlx_set_cache_limit(&prev, self.cacheLimit(.prompt));
@@ -853,21 +844,22 @@ pub const startPhase = phase_mem.restart;
 /// (`phase_memory.LiveReader`, shared with DeepSeek-V4.1's module).
 const LiveReader = phase_mem.LiveReader(Mem);
 
-/// After a phase change's frees: `reader` read every `settle_poll_ms` until MLX's cache is empty, the footprint is at
-/// most `expected` (the reading before the frees, less them, plus what the change allocated) and the host side at most
-/// `host_bound` (freed GPU pages the kernel has not reclaimed yet count there: m2's second handover read 6.97 GB), each
-/// within `settle_tolerance_bytes`, at most `settle_max_ms`: the footprint's ledger can trail a release while the driver
-/// retires it. The loop is `phase_memory.settle` (DeepSeek-V4.1's module's too); the condition is this module's. The last
-/// reading either way; `settled` says which (the handover logs "not settled" and goes on).
-pub fn settle(reader: anytype, expected: u64, host_bound: u64) phase_mem.Settled(Mem) {
+/// After a phase change's frees: `reader` read every `settle_poll_ms` until MLX's cache is empty and the host side (the
+/// footprint less MLX's active and cache) is at most `host_before`, its reading before the frees, plus
+/// `settle_host_tolerance_bytes`, at most `settle_max_ms`. The footprint's ledger trails MLX's frees while the driver
+/// retires them, and the freed pages read as host side until it does (m2's second handover 6.97 GB; a handover of stack
+/// f2be1ba 0.21 GB over its reading before 25 GB of frees). The frees and the KV lanes' resize are all MLX's, so the
+/// host side comes back to its reading before them. The loop is `phase_memory.settle` (DeepSeek-V4.1's module's too);
+/// the condition is this module's. The last reading either way; `settled` says which (the handover logs "not settled"
+/// and goes on).
+pub fn settle(reader: anytype, host_before: u64) phase_mem.Settled(Mem) {
     const Cond = struct {
-        expected: u64,
-        host_bound: u64,
+        host_before: u64,
         pub fn ok(c: @This(), m: Mem) bool {
-            return m.cache == 0 and m.footprint <= c.expected + settle_tolerance_bytes and m.hostSide() <= c.host_bound + settle_tolerance_bytes;
+            return m.cache == 0 and m.hostSide() <= c.host_before + settle_host_tolerance_bytes;
         }
     };
-    return phase_mem.settle(reader, settle_poll_ms, settle_max_ms, Cond{ .expected = expected, .host_bound = host_bound });
+    return phase_mem.settle(reader, settle_poll_ms, settle_max_ms, Cond{ .host_before = host_before });
 }
 
 /// A phase's memory between its start and its end readings (a prompt pass, a request's decode).
@@ -1293,31 +1285,33 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
     std.debug.print("{f}\n", .{PrecisionLine{ .by0 = &by0, .by1 = &by1 }});
 }
 
-test "glm handover: the settle reads until the cache is empty and the footprint shows the frees, at most its wait" {
+test "glm handover: the settle reads until the cache is empty and the host side is back at its reading before the frees, at most its wait" {
     const Fake = phase_mem.FakeReader(Mem);
     var i: usize = 0;
     var slept: u32 = 0;
     var cleared: u32 = 0;
-    // A late buffer in the cache, then the footprint trailing the frees, then settled.
-    const lagging = [_]Mem{ .{ .cache = 4096, .active = 89_000_000_000, .footprint = 100_000_000_000 }, .{ .active = 89_000_000_000, .footprint = 100_000_000_000 }, .{ .active = 89_000_000_000, .footprint = 90_100_000_000 } };
-    const st = settle(Fake{ .readings = &lagging, .i = &i, .slept_ms = &slept, .clears = &cleared }, 90_000_000_000, 1_250_000_000);
+    // Before the frees: the host side 0.92 GB. A late buffer in the cache, then the footprint trailing the frees, then
+    // settled.
+    const host_before: u64 = 920_000_000;
+    const lagging = [_]Mem{ .{ .cache = 4096, .active = 89_000_000_000, .footprint = 100_000_000_000 }, .{ .active = 89_000_000_000, .footprint = 100_000_000_000 }, .{ .active = 89_000_000_000, .footprint = 89_930_000_000 } };
+    const st = settle(Fake{ .readings = &lagging, .i = &i, .slept_ms = &slept, .clears = &cleared }, host_before);
     try testing.expect(st.settled);
     try testing.expectEqual(@as(u32, 2 * settle_poll_ms), st.waited_ms);
     try testing.expectEqual(@as(u32, 1), cleared);
-    try testing.expectEqual(@as(u64, 90_100_000_000), st.after.footprint);
-    // Under the expected footprint, but freed pages still in it above MLX's bytes: the settle waits for them.
+    try testing.expectEqual(@as(u64, 89_930_000_000), st.after.footprint);
+    // The footprint 0.21 GB short of its frees (the host side 1.13 GB): the settle waits for them.
     i = 0;
     slept = 0;
-    const unreclaimed = [_]Mem{ .{ .active = 80_000_000_000, .footprint = 87_000_000_000 }, .{ .active = 80_000_000_000, .footprint = 81_000_000_000 } };
-    const st3 = settle(Fake{ .readings = &unreclaimed, .i = &i, .slept_ms = &slept, .clears = &cleared }, 90_000_000_000, 1_250_000_000);
+    const trailing = [_]Mem{ .{ .active = 80_000_000_000, .footprint = 81_130_000_000 }, .{ .active = 80_000_000_000, .footprint = 80_960_000_000 } };
+    const st3 = settle(Fake{ .readings = &trailing, .i = &i, .slept_ms = &slept, .clears = &cleared }, host_before);
     try testing.expect(st3.settled);
     try testing.expectEqual(@as(u32, settle_poll_ms), st3.waited_ms);
-    try testing.expectEqual(@as(u64, 81_000_000_000), st3.after.footprint);
+    try testing.expectEqual(@as(u64, 80_960_000_000), st3.after.footprint);
     // Never down to it: the wait ends at its bound with the last reading, not settled.
     i = 0;
     slept = 0;
-    const never = [_]Mem{.{ .footprint = 100_000_000_000 }};
-    const st2 = settle(Fake{ .readings = &never, .i = &i, .slept_ms = &slept, .clears = &cleared }, 90_000_000_000, 1_250_000_000);
+    const never = [_]Mem{.{ .active = 80_000_000_000, .footprint = 81_000_000_000 }};
+    const st2 = settle(Fake{ .readings = &never, .i = &i, .slept_ms = &slept, .clears = &cleared }, host_before);
     try testing.expect(!st2.settled);
     try testing.expectEqual(settle_max_ms, st2.waited_ms);
     try testing.expectEqual(settle_max_ms, slept);
