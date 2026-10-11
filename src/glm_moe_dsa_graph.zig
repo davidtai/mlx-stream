@@ -21,6 +21,7 @@ const ops = @import("deepseek_v41_ops.zig");
 const glm = @import("glm_moe_dsa.zig");
 const cache_mod = @import("glm_moe_dsa_cache.zig");
 const pt = @import("glm_moe_dsa_prefill_timers.zig");
+const expert_policy = @import("sdk_ext.zig").expert.policy;
 const dsa = sdk.dsa;
 
 pub const G = ops.MlxOps;
@@ -579,7 +580,8 @@ pub fn head(g: *G, c: *const glm.Config, w: *const Weights, h: T) !T {
 }
 
 /// The experts read ahead for routed layer `lw` (P1's predictor): the router on the layer's input before its
-/// attention (the post-attention norm of the residual), each row's top-k counted, hottest first (ties by id).
+/// attention (the post-attention norm of the residual), each row's top-k counted, hottest first (ties by id:
+/// `rankHottest`, DeepSeek-V4.1's seed ranking).
 pub fn predictSeed(g: *G, a: std.mem.Allocator, c: *const glm.Config, lw: *const Layer, h: T, rows: u32, out: *std.ArrayList(u16)) !void {
     const xp = try rmsNorm(g, h, lw.post_norm, c.rms_norm_eps);
     const rt = try route(g, c, lw.router.?, xp);
@@ -590,13 +592,8 @@ pub fn predictSeed(g: *G, a: std.mem.Allocator, c: *const glm.Config, lw: *const
     defer a.free(counts);
     @memset(counts, 0);
     for (ids) |e| counts[e] += 1;
-    out.clearRetainingCapacity();
-    for (counts, 0..) |n, e| if (n > 0) try out.append(a, @intCast(e));
-    std.sort.pdq(u16, out.items, @as([]const u32, counts), struct {
-        fn lt(cnt: []const u32, p: u16, q: u16) bool {
-            return if (cnt[p] != cnt[q]) cnt[p] > cnt[q] else p < q;
-        }
-    }.lt);
+    try out.resize(a, counts.len);
+    out.shrinkRetainingCapacity(expert_policy.rankHottest(counts, out.items).len);
 }
 
 /// A prompt's attention runs on the DSA kernels (`Routes.dsa`): the model's dims fit them, the stream is a GPU's and
