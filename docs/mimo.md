@@ -216,9 +216,11 @@ The prompt runs whole, in calls of up to 16,384 rows. Per routed layer:
 
 `python3 scripts/mimo_charts.py` draws these from the cells behind the README's measured lines (MiMo-V2.6-Flash).
 
-![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on the shipping binary, with the previous binary from 32K to 256K](img/mimo-ladder.png)
+![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on 746e7da9, with b00df80e from 32K to 256K](img/mimo-ladder.png)
 
-The card ladder on the shipping binary `746e7da9`; the previous binary `b00df80e` ran MLX's stock attention past 32,768 context.
+The card ladder on `746e7da9` (this tree at `8e7d186`); `b00df80e` ran MLX's stock attention past 32,768 context. The
+binary of record, `4b018c54` (this tree at `05fc760`), differs from `746e7da9` only by the hot-path audit and the dead
+code sweep and reproduces its 16K cell token for token (stamp16k-g15-20261011: 998.8 / 32.30 tok/s, 688 tokens).
 
 ![Prefill and decode tok/s of the served 16K cells: three card cells and a greedy pair, by answer length and expert rows](img/mimo-16k-cells.png)
 
@@ -226,7 +228,7 @@ The served 16K cells by answer length and rows; the greedy pair's 136-token answ
 
 ![HumanEval pass@1 for greedy and card sampling, and the failed problems by class](img/mimo-humaneval.png)
 
-HumanEval on the shipping binary, greedy and card: every failed problem is a wrong answer.
+HumanEval on `746e7da9`, greedy and card: every failed problem is a wrong answer.
 
 ![Share of routes a layer's busiest half of experts covers within and across contexts, and the decode hit rate of the dynamic policy against a static top-124 set](img/mimo-routing.png)
 

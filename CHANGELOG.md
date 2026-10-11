@@ -27,13 +27,16 @@
 - SDK: `LoadFacts.effective_context` (the context the load serves), `LoadFacts.kv_quant_bits` and
   `Shell.kv_quant_bits` (optional, null by default); `sdk.plugin_profile` follows the host's profile build option when
   the host declares one. DeepSeek-V4.1 reads none of them.
-- MiMo-V2.6-Flash lines of record in the README (MiMo-V2.6-Flash): server sha256 `746e7da9` (host `2c041af6` + this
-  tree at `8e7d186`), fp8res pack, KV bf16, draft lane on, rows pinned per cell, card sampling (temperature 1.0, top_p
-  0.95, seed 1, thinking on, 16,384-token cap). The 16K card pair at 134 / 152 rows (on the predecessor `b00df80e`,
-  which installs the same routes up to 32,768 context): 996.4 / 1,003.2 tok/s prefill (mean 999.8), 28.40 / 28.10
-  tok/s decode (mean 28.25), 16.44 / 16.33 s TTFT, 107.81 GB peak. The card ladder from 1K to 1M-token prompts:
-  978.5 tok/s prefill and 30.7 tok/s decode at 16K (1,003.9 and 31.6 at 130 / 147 rows), 296.1 and 15.4 at 512K, 179.6 and 9.6 at 1M, peak 96.1-104.3 GB.
-  HumanEval pass@1: greedy 0.9451, card 0.9573 on `746e7da9` (identical counts and failing ids on `bb3c7245`).
+- MiMo-V2.6-Flash lines of record in the README (MiMo-V2.6-Flash): fp8res pack, KV bf16, draft lane on, rows pinned per
+  cell, card sampling (temperature 1.0, top_p 0.95, seed 1, thinking on, 16,384-token cap), on server sha256
+  `746e7da9` (host `2c041af6` + this tree at `8e7d186`) unless named. The binary of record, `4b018c54` (this tree at
+  `05fc760`), differs from `746e7da9` only by the hot-path audit and the dead code sweep and reproduces its 16K cell
+  token for token (stamp16k-g15-20261011: 998.8 / 32.30 tok/s prefill / decode, 688 tokens; `746e7da9`: 1,003.9 /
+  31.6). The 16K card pair at 134 / 152 rows (on `b00df80e`, which installs the same routes up to 32,768 context):
+  996.4 / 1,003.2 tok/s prefill (mean 999.8), 28.40 / 28.10 tok/s decode (mean 28.25), 16.44 / 16.33 s TTFT, 107.81 GB
+  peak. The card ladder from 1K to 1M-token prompts: 978.5 tok/s prefill and 30.7 tok/s decode at 16K (1,003.9 and
+  31.6 at 130 / 147 rows), 296.1 and 15.4 at 512K, 179.6 and 9.6 at 1M, peak 96.1-104.3 GB. HumanEval pass@1: greedy
+  0.9451, card 0.9573 on `746e7da9` (identical counts and failing ids on `bb3c7245`).
 - The MiMo bill charges the one-eval predictor's router tiles on the default `prefill_predict_evals: one` (up to
   0.43 GB in the prompt phase at 16K; it was unbilled).
 

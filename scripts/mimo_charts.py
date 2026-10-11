@@ -28,7 +28,8 @@ plt.rcParams.update({"font.family": ["Helvetica Neue", "Arial", "DejaVu Sans"], 
 
 RUNGS = ("1K", "2K", "4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K", "1M")
 
-# The card ladder on the shipping binary 746e7da9 (host mlx-serve 2c041af6 + this tree 8e7d186): one cold card request
+# The card ladder on 746e7da9 (host mlx-serve 2c041af6 + this tree at 8e7d186; the binary of record 4b018c54 reproduces its 16K
+# cell token for token): one cold card request
 # per prompt length, each on its own server, rows pinned per rung. rung: (prefill tok/s, decode tok/s).
 # Source: cells/ladder3-20261011 (summary.txt, LADDER_ROW lines).
 LADDER = {
@@ -38,14 +39,14 @@ LADDER = {
 }
 
 # The previous binary b00df80e (this tree d3a8555), MLX's stock attention above 32,768 served context, on the rungs
-# past that context. Up to 16K prompts (32,768 context) it installs the shipping binary's routes.
+# past that context. Up to 16K prompts (32,768 context) it installs the binary 746e7da9's routes.
 # Source: cells/ladder2-20261011 (summary.txt LADDER_ROW lines; 256K: chain.log RUNG_END r09-256k).
 LADDER_PREVIOUS = {"32K": (753.5, 24.4), "64K": (661.8, 21.1), "128K": (488.0, 15.8), "256K": (311.3, 9.6)}
 
 # Served cells on the standard 16K prompt (served context 32,768): (sampling, answer, rows prompt/decode,
 # prefill tok/s, decode tok/s).
 # Sources: the card pair and the greedy pair: cells/card4-20261011 (c-def-1/2 and g-def-1/2, means of 2; binary
-# b00df80e, which installs the shipping binary's routes up to 32,768 context); 130/147: cells/stamp16k-20261011
+# b00df80e, which installs the binary 746e7da9's routes up to 32,768 context); 130/147: cells/stamp16k-20261011
 # (r05-16k, 746e7da9); 129/146: cells/ladder3-20261011 (r05-16k, 746e7da9). The greedy answer stops at 136 tokens, so
 # its decode figure is ramp-dominated.
 CELLS_16K = (
@@ -55,7 +56,7 @@ CELLS_16K = (
     ("greedy", "136-token answer", "134/152", 1003.0, 23.0),
 )
 
-# HumanEval on the shipping binary 746e7da9: 164 problems, one sample each, pass@1, cap 16,384 tokens, thinking on,
+# HumanEval on 746e7da9 (plugin 8e7d186; the binary of record 4b018c54 reproduces its 16K cell token for token): 164 problems, one sample each, pass@1, cap 16,384 tokens, thinking on,
 # rows 127/145. arm: (passed, wrong answer, truncated, loop, no code, server error, decode tok/s median).
 # Source: cells/humaneval3-20261011 (REPORT.md).
 HUMANEVAL = {"greedy": (155, 9, 0, 0, 0, 0, 31.2), "card": (157, 7, 0, 0, 0, 0, 30.1)}
@@ -149,7 +150,7 @@ def ladder():
         ax.set_xticklabels(RUNGS, fontsize=19)
         ax.set_xlim(-0.55, len(RUNGS) - 0.45)
     panels[1][0].set_xlabel("prompt tokens", fontsize=20, labelpad=10)
-    legend(fig, [(BLUE, "746e7da9 (shipping): kernels at every context"),
+    legend(fig, [(BLUE, "746e7da9 (plugin 8e7d186): kernels at every context"),
                  (ORANGE, "b00df80e: stock MLX attention above 32,768 context")])
     return fig
 

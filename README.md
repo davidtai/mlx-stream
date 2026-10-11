@@ -208,11 +208,14 @@ best routes; the settings table, with each default's exactness class against its
 
 **Measurements.** One Mac (M5 Max, 128 GB), 2026-10-11, no other model server loaded; each cell its own fresh server
 and one request: the served ReleaseFast binary, the fp8res pack, KV bf16, the draft lane at its defaults, rows pinned
-per cell, the GPU ceiling at 112 GiB (`MLX_SERVE_GPU_CEILING_MB=114688`) and `--wired-margin-gib 2`. The binary of
-record: server sha256 `746e7da9` = host mlx-serve `pr/mimo-host` at `2c041af6` + this tree at `8e7d186`. The 16K card
-pair ran on its predecessor (sha256 `b00df80e`, this tree at `d3a8555`), which differs only in the attention routes
-past 32,768 context: up to 32,768 context the two install the same routes and the same bill, and give the same
-outputs.
+per cell, the GPU ceiling at 112 GiB (`MLX_SERVE_GPU_CEILING_MB=114688`) and `--wired-margin-gib 2`. The card ladder,
+the 130 / 147 16K cell and HumanEval ran on server sha256 `746e7da9` (host mlx-serve `pr/mimo-host` at `2c041af6` +
+this tree at `8e7d186`); the 16K card pair ran on `b00df80e` (this tree at `d3a8555`), which differs only in the
+attention routes past 32,768 context: up to 32,768 context the two install the same routes and the same bill, and give
+the same outputs. The binary of record, server sha256 `4b018c54` (host `2c041af6` + this tree at `05fc760`), differs
+from `746e7da9` only by the hot-path audit and the dead code sweep and reproduces its 16K cell token for token (cell
+stamp16k-g15-20261011, 2026-10-11 23:30Z: 998.8 / 32.30 tok/s prefill / decode, 16.40 s TTFT, 688 tokens to EOS,
+104.66 GB peak at 130 / 147 rows; `746e7da9`: 1,003.9 / 31.6, 16.32 s).
 
 Definitions: **card** = temperature 1.0, top_p 0.95, seed 1, no top_k, thinking on, max_tokens 16,384; **served
 context** = the context the server is started with (`--ctx-size`): the prompt fixture's length plus the 16,384-token
@@ -235,9 +238,9 @@ the model stops at 136 tokens, so its decode figure is ramp-dominated and is not
 
 ![Prefill and decode tok/s of the served 16K cells: three card cells and a greedy pair, by answer length and expert rows](docs/img/mimo-16k-cells.png)
 
-The card ladder on the binary of record: one cold request per prompt length, each on its own server; rows pinned at
-the bill's fill for a 12.6 GB box baseline (one prompt row lower from 64K up); every output complete and stopped on
-EOS.
+The card ladder on `746e7da9`: one cold request per prompt length, each on its own server; rows pinned at the bill's
+fill for a 12.6 GB box baseline (one prompt row lower from 64K up), plus a second 16K cell at 130 / 147; every output
+complete and stopped on EOS.
 
 | prompt (tokens) | served context | prompt rows | decode rows | prefill (tok/s) | TTFT (s) | decode (tok/s) | peak (GB) | output tokens |
 |---|---|---|---|---|---|---|---|---|
@@ -256,16 +259,16 @@ EOS.
 
 Prompt lengths are the fixtures', rendered for thinking off; thinking on drops their trailing `<think></think>`, so
 each request carries 2 tokens fewer. The 1K prefill figure is the cold first request: fixed startup dominates its
-11 s TTFT. The previous binary (`b00df80e`), which installed MLX's stock attention past 32,768 context, read
+11 s TTFT. The same ladder on `b00df80e`, which installed MLX's stock attention past 32,768 context, read
 753.5 / 24.4 at 32K, 661.8 / 21.1 at 64K, 488.0 / 15.8 at 128K and 311.3 / 9.6 at 256K (prefill / decode, tok/s);
-the attention kernels are now the defaults at every served context. The bf16res tier has not been measured on this
-build.
+the attention kernels are now the defaults at every served context. The bf16res tier has not been measured on these
+builds.
 
-![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on the shipping binary, with the previous binary from 32K to 256K](docs/img/mimo-ladder.png)
+![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on 746e7da9, with b00df80e from 32K to 256K](docs/img/mimo-ladder.png)
 
 HumanEval (164 problems, one sample each, pass@1, cap 16,384 tokens, thinking on, rows 127 / 145): greedy 155 / 164
 = 0.9451, card 157 / 164 = 0.9573; every failure is a wrong answer (none truncated, looped, without code or errored).
-Scored on the shipping binary `746e7da9` (host `2c041af6` + this branch at `8e7d186`); the earlier run on
+Scored on `746e7da9` (host `2c041af6` + this branch at `8e7d186`); the earlier run on
 `bb3c7245` (host `2c041af6` + plugin `d67567e`, this branch before its layout move) gave the same counts and the same
 failing problems.
 
