@@ -736,6 +736,12 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 self.last_layer = layer;
                 self.last_end = nowNs();
             }
+            // diag: 360 us of host time before the barrier's commit, a stand-in for a slower encode (the step's growth
+            // gives the encode's share of the critical path).
+            if (G == ops.MlxOps) {
+                const until = nowNs() + 360_000;
+                while (nowNs() < until) std.atomic.spinLoopHint();
+            }
             if (read_next) try g.asyncEval(&.{ indices, next_scores.? }) else try g.asyncEval(&.{indices});
             self.host.bar_commit_ns += nowNs() -| t0;
             if (read_next) {
