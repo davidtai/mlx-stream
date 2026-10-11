@@ -9,9 +9,9 @@
 //!     routed positions' slots as a device array: a position of slot 0xFFFFFFFF or score 0 reads no weight and gives
 //!     zero, and `decodeCombineDevice` sums every position. Nothing syncs with the host.
 //!   - Prompt (`prefill`): the call's rows sorted by slot on the host, waves of at most 16 experts and `wave_rows` rows,
-//!     each through the 128-row gate and up GEMMs over the rows' x (the trellis decoded per stage, rotated along k and
-//!     scaled by rin), the middle and the down GEMM (the minis summed in its epilogue), then the waves joined in the
-//!     call's row order; nothing waits for the GPU.
+//!     each through the 128-row gate and up GEMMs over the rows' x as f16 (the wide call's one astype, `beginWide`; the
+//!     trellis decoded per stage, rotated along k and scaled by rin), the middle and the down GEMM (the minis summed in
+//!     its epilogue), then the waves joined in the call's row order; nothing waits for the GPU.
 //! Its kernels are self-checked at accept on the load context's kernel set (compile, one launch each at the accepted
 //! dims, both Ks).
 
@@ -228,13 +228,26 @@ pub fn Accepted(comptime G: type) type {
             return acc.?;
         }
 
-        /// x [tokens, hidden] bf16, the call's routed rows (one bank kind) -> [rows, hidden] bf16 in routed-row order, on
-        /// `prompt_kernels`'.
+        /// The wide call's x as the prompt GEMMs read it, the array the experts driver hands every `prefill` of the
+        /// call (it calls this once per call, after the routing barrier, and drops it with the call's waves): x [rows,
+        /// hidden] bf16 as f16 (MLX's astype, committed now: the GPU runs it while the host plans the call's groups),
+        /// the bill's routed-call wave transient. Null on sushi's prompt, which reads x itself.
+        pub fn beginWide(self: *Self, g: *G, x: G.T) !?G.T {
+            _ = self;
+            if (comptime prompt_kernels == .sushi) return null;
+            const xf = try g.astype(x, .float16);
+            try g.asyncEval(&.{xf});
+            return xf;
+        }
+
+        /// x [tokens, hidden], the call's routed rows (one bank kind) -> [rows, hidden] bf16 in routed-row order, on
+        /// `prompt_kernels`': x the wide call's f16 copy (`beginWide`), else the caller's own (bf16: made f16 here).
         pub fn prefill(self: *Self, g: *G, layer: u32, x: G.T, rows: quant.PrefillRows, bank: Bank) !G.T {
             if (comptime prompt_kernels == .sushi) return self.sushi_math.prefill(g, layer, x, rows, bank);
             const a = self.a;
             const n = rows.slot.len;
             const k = kOf(bank.gate.trellis) orelse return error.BankArrays;
+            const xf = if (g.dtypeOf(x) == .float16) x else try g.astype(x, .float16);
             try self.sortRows(rows, bank);
             for (self.waves.items) |w| _ = mlx.mlx_array_free(w);
             self.waves.clearRetainingCapacity();
@@ -246,7 +259,7 @@ pub fn Accepted(comptime G: type) type {
                 const m = g.mark();
                 const t = try self.waveArrays(g, w);
                 try self.waves.ensureUnusedCapacity(a, 1);
-                self.waves.appendAssumeCapacity(try self.pf[ki(k)].wave(x, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk));
+                self.waves.appendAssumeCapacity(try self.pf[ki(k)].wave(xf, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk));
                 g.resetTo(m);
                 i = w.end;
             }
@@ -329,7 +342,9 @@ pub fn Accepted(comptime G: type) type {
             const m = g.mark();
             defer g.resetTo(m);
             const t = try self.waveArrays(g, w);
-            try g.evalAll(&.{ x, t.rt, t.tgu, t.tdn });
+            // x as the gate|up reads it (the wide call's copy is made once per call, outside the stages)
+            const xf = try g.astype(x, .float16);
+            try g.evalAll(&.{ xf, t.rt, t.tgu, t.tdn });
             // each stage's inputs: the chain run once
             var base: routes.Prompt.Stages = .{};
             defer base.deinit();
@@ -337,7 +352,7 @@ pub fn Accepted(comptime G: type) type {
             defer for (&inputs) |*st| st.deinit();
             for (std.enums.values(routes.Prompt.Stage), 0..) |at, si| {
                 inputs[si] = try base.dupe();
-                try pf.stage(at, &base, x, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk);
+                try pf.stage(at, &base, xf, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk);
                 try g.evalAll(&.{base.last(at)});
             }
             var best: [3]u64 = @splat(std.math.maxInt(u64));
@@ -352,7 +367,7 @@ pub fn Accepted(comptime G: type) type {
                 for (0..launches) |_| {
                     var st = try inputs[si].dupe();
                     defer st.deinit();
-                    try pf.stage(at, &st, x, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk);
+                    try pf.stage(at, &st, xf, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk);
                     try outs.append(self.a, try routes.Prompt.Stages.retain(st.last(at)));
                 }
                 try g.evalAll(outs.items);
@@ -792,6 +807,9 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
         }
     }
     for (&oact, 0..) |*v, i| v.* = @intCast((i * 7919) % n);
+    // ours reads the layer's one f16 copy (`beginWide`, made once for both bank layers)
+    const xq = (try ours.beginWide(g, x)).?;
+    try g.evalAll(&.{xq});
     for (0..6) |rep| for (std.enums.values(Arm)) |arm| {
         const m = g.mark();
         defer g.resetTo(m);
@@ -812,7 +830,7 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
             },
             .ours_k3, .ours_k4 => blk2: {
                 const side: usize = if (arm == .ours_k3) 0 else 1;
-                break :blk2 try ours.prefill(g, @intCast(side), x, .{ .slot = &oslot[side], .act_row = &oact }, banks[side]);
+                break :blk2 try ours.prefill(g, @intCast(side), xq, .{ .slot = &oslot[side], .act_row = &oact }, banks[side]);
             },
         };
         try g.evalAll(&.{y});
@@ -855,7 +873,7 @@ const bench_exps = [_]BenchExp{
     .{ .name = "gu: no trellis decode (B constant before the rotation)", .kernel = .glm53_pf_gu, .needle = decode_call, .repl = no_decode_gu },
     .{ .name = "gu: no MMA (decode, rotation, scale alone)", .kernel = .glm53_pf_gu, .needle = mma_call, .repl = "(void)Atile; (void)Btile;" },
     .{ .name = "gu: A rows contiguous (no gather)", .kernel = .glm53_pf_gu, .needle = "xr[i][e] = x + size_t(rt[2u * uint(row0 + rr)]) * size_t(HID) + size_t(fc.x);", .repl = "xr[i][e] = x + size_t(row0 + rr) * size_t(HID) + size_t(fc.x);" },
-    .{ .name = "gu: A constant (no x loads)", .kernel = .glm53_pf_gu, .needle = "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));", .repl = "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(0.01f * float(jj + e)); (void)p;" },
+    .{ .name = "gu: A constant (no x loads)", .kernel = .glm53_pf_gu, .needle = "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = p[jj];", .repl = "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(0.01f * float(jj + e)); (void)p;" },
     .{ .name = "gu: one barrier per stage (races; timing only)", .kernel = .glm53_pf_gu, .needle = "        threadgroup_barrier(mem_flags::mem_threadgroup);\n        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]", .repl = "        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]" },
     .{ .name = "down: no trellis decode (B constant)", .kernel = .glm53_pf_down, .needle = decode_call_down, .repl = no_decode },
     .{ .name = "down: no MMA (the decode alone)", .kernel = .glm53_pf_down, .needle = mma_call, .repl = "(void)Atile; (void)Btile;" },
@@ -1080,12 +1098,14 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
         const t0 = nowNs();
         var outs: std.ArrayList(G.T) = .empty;
         defer outs.deinit(a);
+        // ours as the driver runs it: the layer's one x copy, then both bank layers' calls over it
+        const xq = if (arm == 0) (try ours.beginWide(&g, xp)).? else xp;
         for (0..2) |side| {
             var i: usize = 0;
             while (i < side_slot[side].items.len) : (i += 16384) {
                 const e = @min(i + 16384, side_slot[side].items.len);
                 const pr: quant.PrefillRows = .{ .slot = side_slot[side].items[i..e], .act_row = side_act[side].items[i..e] };
-                const y = if (arm == 0) try ours.prefill(&g, @intCast(side), xp, pr, banks[side]) else try theirs.prefill(&g, @intCast(side), xp, pr, banks[side]);
+                const y = if (arm == 0) try ours.prefill(&g, @intCast(side), xq, pr, banks[side]) else try theirs.prefill(&g, @intCast(side), xp, pr, banks[side]);
                 try g.evalAll(&.{y});
                 try outs.append(a, y);
             }

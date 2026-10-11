@@ -809,7 +809,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             w.pos.clearRetainingCapacity();
             for (w.kept.items) |o| g.release(o);
             w.kept.clearRetainingCapacity();
-            for (0..bpl) |side| try self.wideBank(g, layer, @intCast(side), x, k);
+            // x as the math's prefill reads it (`beginWide`: GLM-5.3's kernels' f16 copy, made once for the call and
+            // dropped with its waves), else x.
+            const copy: ?T = if (@hasDecl(M, "beginWide")) try self.math.beginWide(g, x) else null;
+            defer if (copy) |c| g.drop(c);
+            for (0..bpl) |side| try self.wideBank(g, layer, @intCast(side), copy orelse x, k);
             return self.wideJoin(g, scores, x, n, k);
         }
 

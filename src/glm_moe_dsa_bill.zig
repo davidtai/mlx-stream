@@ -408,8 +408,9 @@ pub fn slotTable(a: std.mem.Allocator, g: glm.Geometry, prompt: ?u32) ![]u64 {
 
 // ── The prompt pass (`glm_moe_dsa_graph.forwardRows` over a call of `rows` rows ending at `positions`) ──
 
-/// bf16, the stream's dtype; f32, the router's and the indexer's.
+/// bf16, the stream's dtype; f16, GLM-5.3's kernels' copy of the routed input; f32, the router's and the indexer's.
 const bf16: u64 = 2;
+const f16b: u64 = 2;
 const f32b: u64 = 4;
 
 /// One prompt layer's live set at its peak, by the stages the wave probe reads (`glm_moe_dsa_graph.WaveProbe`): the
@@ -431,13 +432,16 @@ pub const PromptWave = struct {
     routed: u64 = 0,
     /// The routed call's GEMM transients in flight (`prefillGemmInflightRows`).
     gemm: u64 = 0,
+    /// GLM-5.3's kernels' f16 copy of the routed call's input (`glm53_exl3_quant.beginWide`, MLX's astype: the gate and
+    /// up GEMMs' A rows), dropped with the call's waves; the other quants read x itself.
+    routed_x: u64 = 0,
     /// The combine's output, the shared expert or the dense MLP, the residual adds.
     tail: u64 = 0,
 
     /// The largest stage: the attention, the routed call, the tail.
     pub fn total(w: PromptWave) u64 {
         const attention = w.cross + w.attn + w.spans;
-        const moe = w.cross + w.attn + w.router + w.routed + w.gemm;
+        const moe = w.cross + w.attn + w.router + w.routed + w.routed_x + w.gemm;
         const tail = w.cross + w.attn + w.router + w.routed + w.tail;
         return @max(attention, @max(moe, tail));
     }
@@ -525,6 +529,7 @@ pub fn promptWaveOf(c: *const glm.Config, rows: u64, positions: u64, full: bool,
         w.router = a.of(t * h * bf16) + a.of(t * h * f32b) + 5 * a.of(t * e * 4) + 4 * a.of(t * k * 4) + a.of(t * 4) + a.of(e * h * f32b);
         w.routed = a.routed(t * k * h * bf16);
         w.gemm = a.routed(@min(prefillGemmInflightRows(gemm), t * k) * gemm_row);
+        if (gemm == .glm53) w.routed_x = a.of(t * h * f16b);
         // The combine's output, the shared expert's four intermediates and output, the routed + shared sum, the residual.
         const si: u64 = @as(u64, c.moe_intermediate_size) * c.n_shared_experts;
         w.tail = a.of(t * h * bf16) + 4 * a.of(t * si * bf16) + a.of(t * h * bf16) + 2 * a.of(t * h * bf16);
@@ -1085,6 +1090,11 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
     std.debug.print("\nGLM53_PROMPT_WAVE {{\"cross\": {d}, \"attn\": {d}, \"spans\": {d}, \"router\": {d}, \"routed\": {d}, \"gemm\": {d}, \"tail\": {d}, \"total\": {d}, \"billed\": {d}, \"decode\": {d}}}\n", .{ w.cross, w.attn, w.spans, w.router, w.routed, w.gemm, w.tail, w.total(), p.waves, d.waves });
     try testing.expectEqual(@as(u64, 16448 * 171_328), w.attn);
     try testing.expectEqual(@as(u64, 16448 * 8 * 6144 * 2), w.routed);
+    // GLM-5.3's kernels' f16 copy of the call's input: its 16,448 rows x hidden, in the routed call's stage only (under
+    // the attention's, so the billed waves stay); sushi's prompt reads x itself.
+    try testing.expectEqual(@as(u64, 16448 * 6144 * 2), w.routed_x);
+    try testing.expectEqual(@as(u64, 0), promptWaveOf(&c, 16448, 16448, true, true, true, .kernel, .sushi, prefillRowBytes(&c, box_exl3.geometry, .sushi), false).routed_x);
+    try testing.expectEqual(@as(u64, 0), promptWaveOf(&c, 16448, 16448, true, false, true, .kernel, .glm53, prefillRowBytes(&c, box_exl3.geometry, .glm53), false).routed_x);
     try testing.expect(p.waves >= w.total());
     // A routed row's GEMM transients: GLM-5.3's kernels' 45,068 B, sushi's 172,160 B; a span's selection without
     // argpartition's ids over every key.

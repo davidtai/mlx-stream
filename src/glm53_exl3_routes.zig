@@ -7,8 +7,8 @@
 //!     each weight decoded once for the slot's member pairs), down (the SwiGLU middle, the down GEMV, each output block
 //!     rotated, scaled by its mini's rout, the minis summed, times the pair's score: f32 per pair); per call, combine
 //!     (each row's pairs in routed order: x's dtype).
-//!   - Prompt, per wave of a call's rows grouped by expert (one bank kind): the gate and up GEMMs over the rows' x
-//!     (128-row M tiles, the trellis decoded per stage, rotated along k and scaled by rin: the input prepare in the
+//!   - Prompt, per wave of a call's rows grouped by expert (one bank kind): the gate and up GEMMs over the rows' x in
+//!     f16 (128-row M tiles, the trellis decoded per stage, rotated along k and scaled by rin: the input prepare in the
 //!     weights), the middle, the down GEMM (the minis summed in its epilogue): bf16 per row in the wave's order.
 
 const std = @import("std");
@@ -209,7 +209,7 @@ pub const Prompt = struct {
         return .{ .b = b, .inst = inst };
     }
 
-    /// One wave of `rows` rows grouped by expert: x [tokens, HID] bf16, rt u32 [>= 8] (per row: x row, slot row), the
+    /// One wave of `rows` rows grouped by expert: x [tokens, HID] f16, rt u32 [>= 8] (per row: x row, slot row), the
     /// gate|up and down wave tables (i32 [80]) and their threadgroups, the bank kind's arrays -> y bf16 [rows, HID].
     pub fn wave(self: *const Prompt, x: mlx.mlx_array, rt: mlx.mlx_array, rows: usize, tgu: mlx.mlx_array, tgs_gu: u32, tdn: mlx.mlx_array, tgs_dn: u32, bank: Bank) !mlx.mlx_array {
         var st: Stages = .{};

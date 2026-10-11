@@ -393,8 +393,8 @@ pub fn decodeTables(a: Allocator, pairs: []const [3]u32) !struct { pt: []u32, gt
     return .{ .pt = pt, .gt = gt, .n_slots = n };
 }
 
-/// The prompt chain at `inst`: `numeric` 5 experts of 1, 17, 128, 129 and 40 rows against the host decode on each
-/// expert's first and last row, else one expert of one row on zero records.
+/// The prompt chain at `inst` (x as f16, then one wave): `numeric` 5 experts of 1, 17, 128, 129 and 40 rows against the
+/// host decode on each expert's first and last row, else one expert of one row on zero records.
 fn promptChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric: bool, mutation: Mutation) !Verdict {
     const s = bound.stream;
     var sc: Scope = .{ .a = a };
@@ -441,7 +441,11 @@ fn promptChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     const pr = routes.Prompt.init(bound, inst);
     var bk = bank.bank;
     if (mutation == .rin_rout) swapRinRout(&bk);
-    const y = try sc.keep(try pr.wave(x, rtd, rows, tgud, tgu.tgs, tdnd, tdn.tgs, bk));
+    // x as the served pass gives it (`beginWide`: MLX's astype)
+    var xh = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&xh, x, .float16, s));
+    _ = try sc.keep(xh);
+    const y = try sc.keep(try pr.wave(xh, rtd, rows, tgud, tgu.tgs, tdnd, tdn.tgs, bk));
     const got = try f32Of(&sc, s, y, rows * inst.hidden);
     if (!numeric) return .{ .words = got.len, .bad = 0, .metric = 0, .limit = 0 };
     const xin = try f32Of(&sc, s, x, n_tok * inst.hidden);

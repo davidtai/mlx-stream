@@ -3,7 +3,7 @@
     // folded into the weights: t128(x rin) W = x (rin t128 W) per 128-block of k. Each BK = 128 stage: every thread
     // decodes one column's 32 k of the stage (two trellis tiles), rotates them along k (t128: 32 in the thread, 4 across
     // lanes xor 1 and 2), scales them by the mini's rin and stores them in threadgroup memory; then the NAX MMA at a
-    // 128-row M tile (8 simdgroups, WM 4 x WN 2, each 32 x 32 of 128 x 64), A each row's x (bf16 to f16 in the load).
+    // 128-row M tile (8 simdgroups, WM 4 x WN 2, each 32 x 32 of 128 x 64), A each row's x (the call's f16 copy of it).
     // A threadgroup is (expert j of the wave table, M tile, op = 2 mini + projection, N tile): the table gives each
     // expert's slot, first row, rows and first threadgroup. rt: per wave row (x row, slot row). z: [rows, 4, MINI] f32
     // (times the rotation's scale).
@@ -67,7 +67,7 @@
     threadgroup uint4* bdst = reinterpret_cast<threadgroup uint4*>(Bs + n * uint(LDB) + 32u * q);
     // the A rows: this lane's four of the simdgroup's 32 (frag i, element row e: tm + 16 i + fm + 8 e), each its x row
     const short2 fc = BaseNAXFrag::get_coord();
-    const device bfloat16_t* xr[2][2];
+    const device half* xr[2][2];
     STEEL_PRAGMA_UNROLL
     for (int i = 0; i < 2; ++i) {
         STEEL_PRAGMA_UNROLL
@@ -115,9 +115,9 @@
                         thread auto& fr = Atile.frag_at(fi, kk);
                         STEEL_PRAGMA_UNROLL
                         for (int e = 0; e < 2; ++e) {
-                            const device bfloat16_t* p = xr[fi][e] + k0 + 16 * kk;
+                            const device half* p = xr[fi][e] + k0 + 16 * kk;
                             STEEL_PRAGMA_UNROLL
-                            for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));
+                            for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = p[jj];
                         }
                     }
                 }
