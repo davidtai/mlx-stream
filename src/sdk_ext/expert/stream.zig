@@ -332,7 +332,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// Transient rows shared by every layer; at least `max_route_ids`, so no
             /// route's misses can overflow them.
             transient_rows: u32 = max_route_ids,
-            /// Decode misses per completion part (one pool job).
+            /// Decode misses per completion part (a down wave and its gate).
             records_per_part: u32 = 3,
             pool: expert_io.Options = .{ .tickets = 1024 },
             /// The pool's staging buffers sized from the bank (`stagingBytes`: its widest gate/up or down span,
@@ -1433,7 +1433,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
 
             /// Loads in file order, cut into parts (decode: the bounded parts of
-            /// `records_per_part`; prefill: pool-job chunks), one pool job per part.
+            /// `records_per_part`; prefill: `max_items` chunks), one pool submit per part.
             fn submitParts(self: *Stream, r: *Route) Error!void {
                 const plan = &r.plan;
                 const n = plan.n_loads;

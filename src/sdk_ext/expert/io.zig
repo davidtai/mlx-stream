@@ -26,7 +26,6 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_spec_config(nthreads: i32, bufs: ?[*]const u64, nslots: i32, slot_bytes: i64, rec_len: i64, chunk: i64, counters: ?[*]i64) c_int;
     pub extern fn q3ld_spec_streams(idle_busy: i32) c_int;
     pub extern fn q3ld_direct_config(on: i32) c_int;
-    pub extern fn q3ld_range_jobs_config(on: i32) c_int;
     pub extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
     pub extern fn q3ld_submit(fd: i32, file_size: i64, deadline: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
     pub extern fn q3ld_spec_step_len(fd: i32, file_size: i64, cur: i64, n: i32, bases: ?[*]const i64, len: i64) i32;
@@ -64,7 +63,7 @@ pub const test_abi = if (builtin.is_test) struct {
     pub const status_words = res_w;
 } else struct {};
 
-pub const abi_version = 2026101002;
+pub const abi_version = 2026101101;
 pub const max_workers = 8;
 /// Records per job (one fill unit).
 pub const max_items = 8;
@@ -144,23 +143,22 @@ pub const Counter = enum(u8) {
     pre_waits = 55,
     pre_wait_ns = 56,
     pre_bind_wait_ns = 57,
-    pre_skip_cancels = 58,
-    pre_max_inflight = 59,
-    ev_calls = 60,
-    ev_gates = 61,
-    ev_tickets = 62,
-    ev_immediate = 63,
-    ev_signals = 64,
-    ev_signal_ns = 65,
-    ev_lag_ns = 66,
-    ev_max_live = 67,
-    ev_wd_forced = 68,
-    ev_wd_last_value = 69,
-    ev_host_released = 70,
-    ev_stop_released = 71,
-    direct_ranges = 72,
+    pre_max_inflight = 58,
+    ev_calls = 59,
+    ev_gates = 60,
+    ev_tickets = 61,
+    ev_immediate = 62,
+    ev_signals = 63,
+    ev_signal_ns = 64,
+    ev_lag_ns = 65,
+    ev_max_live = 66,
+    ev_wd_forced = 67,
+    ev_wd_last_value = 68,
+    ev_host_released = 69,
+    ev_stop_released = 70,
+    direct_ranges = 71,
 };
-pub const counters_n = 73;
+pub const counters_n = 72;
 
 /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
 /// read by `threads` threads in `chunk_bytes` preadv steps.
@@ -185,9 +183,6 @@ pub const Options = struct {
     /// A demand range whose file offset, destination rows and part lengths are all page multiples reads straight into
     /// its rows (one preadv iovec per part), with no staging and no copy; any other range takes the staging loop.
     direct: bool = false,
-    /// A demand submit queues each range as its own job (gate/up ranges first): idle workers read one submit's ranges
-    /// side by side, and a failed range no longer skips the submit's later ranges.
-    range_jobs: bool = false,
     spec: ?Spec = null,
 };
 
@@ -327,7 +322,6 @@ pub const Pool = struct {
             return error.PoolUnavailable;
         if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
         _ = c.q3ld_direct_config(@intFromBool(opt.direct));
-        _ = c.q3ld_range_jobs_config(@intFromBool(opt.range_jobs));
         var ptrs: [max_workers]u64 = undefined;
         for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
         const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
@@ -474,8 +468,9 @@ pub fn Records(comptime components: usize, comptime gate_up: usize) type {
         /// One record's destinations, a row address per component.
         pub const Rows = [components]u64;
 
-        /// One job: `rows.len` records read by one worker, every gate/up span (`gu_offsets`, `gate_up` parts) then
-        /// every down span, each part `lens[c]` bytes into `rows[i][c]`. Returns the first of its 2n tickets.
+        /// One submit: `rows.len` records, every gate/up span (`gu_offsets`, `gate_up` parts) then every down span, each
+        /// part `lens[c]` bytes into `rows[i][c]`, each span a job of its own (idle workers read them side by side, each
+        /// its own status). Returns the first of its 2n tickets.
         pub fn submit(pool: *Pool, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
             return submitOn(pool, 0, pool.demand_tickets, &pool.next_ticket, fd, gu_offsets, down_offsets, rows, lens);
         }

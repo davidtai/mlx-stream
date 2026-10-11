@@ -27,11 +27,9 @@
  *   continuation, the same syscalls and bytes) up to the first scatter copy, where it waits for the range's rows.
  *   q3ld_submit BINDS each job range (fd, offset, component lengths all equal; job without a deadline) to its pre-range:
  *   in flight / waiting -> the rows are attached and that worker scatters and finishes the loop; still QUEUED -> the
- *   pre-range is cancelled and the job reads the range itself (stock).  The job's own worker, reaching a bound range,
- *   waits until the pre-range is DONE and publishes ITS result words in ticket order (the completion-log contract of
- *   the native-issue pump is unchanged: a fill's tickets complete in index order, by one worker).  Unbound pre-ranges
- *   expire at the layer-call's settle (spec_step / spec_stepn), at the next pre_read and at quiesce; a pre-range whose
- *   job skips it (an earlier range failed) is cancelled at the bind point and never writes its rows.  A pre-running
+ *   pre-range is cancelled and the job reads the range itself (stock).  The range's own job, reaching a bound range,
+ *   waits until the pre-range is DONE and publishes ITS result words.  Unbound pre-ranges
+ *   expire at the layer-call's settle (spec_step / spec_stepn), at the next pre_read and at quiesce.  A pre-running
  *   worker counts as demand busy (the speculative queue rule sees it) and in the read gauge.  Keyed by FILE OFFSET only;
  *   plans / slots / policy never see a pre-range; exactness: a range's bytes and result words are those of the same
  *   stock read, started earlier.  Counters SC_PRE_*; inject event kinds 9 (pre start) / 10 (pre served).
@@ -56,9 +54,10 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  * transcribed unchanged) plus ONE addition: a low-priority, CHUNKED, SPECULATIVE op class, split into
  * per-HORIZON priority classes (prio 0 = the next layer, prio h-1 = h layers ahead).
  *
- * DEMAND (unchanged from q3_nativeissue.c): 4 workers, one per stock 9 MiB staging buffer, a FIFO job
- * queue, per range the stock aligned F_NOCACHE preadv loop + the scatter copy into the slot rows, the
- * result words + an ordered completion log published with a RELEASE store.  Two additions on the demand
+ * DEMAND: workers, one per stock 9 MiB staging buffer, a FIFO job queue of ONE RANGE per job (a submit
+ * queues each of its ranges, gate/up ranges first, so idle workers read them side by side; each range's
+ * status is its own), per range the stock aligned F_NOCACHE preadv loop + the scatter copy into the slot
+ * rows, the result words + an ordered completion log published with a RELEASE store.  Two additions on the demand
  * path, both keyed by FILE OFFSET only (never by layer / expert / slot):
  *   - q3ld_submit CLAIMS every speculative record that contains one of the job's ranges: an in-flight,
  *     parked or landed record is promoted (it now reads its remaining chunks back to back, ignoring the
@@ -181,7 +180,6 @@ enum {
     SC_PRE_WAITS,         /* ... of which the job worker waited for the pre-range */
     SC_PRE_WAIT_NS,
     SC_PRE_BIND_WAIT_NS,  /* pre-range workers waiting for their rows */
-    SC_PRE_SKIP_CANCELS,  /* bound pre-ranges cancelled because their job skipped the range */
     SC_PRE_MAX_INFLIGHT,  /* max pre-ranges running at a start */
     /* the event-gate class (lookahead4) */
     SC_EV_CALLS,          /* q3ld_ev_gates calls */
@@ -229,8 +227,7 @@ typedef struct {
     int fd;
     int64_t file_size;
     int64_t deadline;
-    int64_t first;      /* first ticket */
-    int32_t count;      /* ranges in the job */
+    int64_t ticket;     /* the job's one range */
 } job_t;
 
 typedef struct {
@@ -288,7 +285,7 @@ static int64_t *sc = 0;
 typedef struct {
     int state;
     int bound;            /* a demand submit attached its rows (rg.dst) */
-    int cancel;           /* expiry (unbound) / the job skipped it (bound): no scatter */
+    int cancel;           /* expired while unbound (a cancelled range is never bound): no scatter */
     int fd;
     int64_t file_size;
     int64_t tag;
@@ -490,16 +487,6 @@ static int direct_reads = 0;
 
 int q3ld_direct_config(int32_t on) {
     direct_reads = on != 0;
-    return 0;
-}
-
-/* RANGE JOBS: a demand submit queues each of its ranges as its own job (gate/up ranges first, in ticket order), so
- * idle workers read one submit's ranges side by side; a failed range no longer skips the rest of its submit (each
- * range's status is its own).  Off unless q3ld_range_jobs_config. */
-static int range_jobs = 0;
-
-int q3ld_range_jobs_config(int32_t on) {
-    range_jobs = on != 0;
     return 0;
 }
 
@@ -734,7 +721,7 @@ static void run_pre(int i, int w, char *stage) {
     for (int k = 0; k < MAX_PRE; k++) n += pre[k].state == PR_INFLIGHT;
     if (n > sc[SC_PRE_MAX_INFLIGHT]) sc[SC_PRE_MAX_INFLIGHT] = n;
     EV(9, p->rg.offset);
-    job_t job = { p->fd, p->file_size, -1, 0, 0 };
+    job_t job = { p->fd, p->file_size, -1, 0 };
     pthread_mutex_unlock(&mu);
     RANGE_DELAY();
     int64_t out[RES_W] = { 0 };
@@ -743,11 +730,10 @@ static void run_pre(int i, int w, char *stage) {
     gauge_exit();
     pthread_mutex_lock(&mu);
     busy -= 1;
-    if (status == PRE_DROPPED && !p->bound) {
+    if (status == PRE_DROPPED) {
         p->state = PR_FREE;                 /* expired unbound: nobody waits for it */
         p->cancel = 0;
     } else {
-        if (status == PRE_DROPPED) status = ST_SKIPPED;   /* bound but its job skipped it: the job frees it */
         for (int k = 1; k < RES_W; k++) p->words[k] = out[k];
         p->words[7] = w;
         p->words[0] = status;
@@ -968,72 +954,46 @@ static void *worker(void *arg) {
         job_t job = queue[qhead];
         qhead = (qhead + 1) % qcap;
         __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);
-        EV(2, job.first);
+        EV(2, job.ticket);
         busy += 1;
         pthread_mutex_unlock(&mu);
-        int failed = 0;
-        for (int32_t i = 0; i < job.count; i++) {
-            int64_t t = job.first + i;
-            int64_t *out = res + t * RES_W;
-            int pb = pre_of ? pre_of[t] : 0;
-            if (failed) {
-                if (pb) {                                  /* PRE: its pre-range must not write the rows */
-                    pre_t *p = &pre[pb - 1];
-                    pthread_mutex_lock(&mu);
-                    p->cancel = 1;
-                    sc[SC_PRE_SKIP_CANCELS] += 1;
-                    pthread_cond_broadcast(&pre_cv);
-                    while (p->state != PR_DONE) pthread_cond_wait(&pre_cv, &mu);
-                    p->state = PR_FREE; p->bound = 0; p->cancel = 0;
-                    pre_of[t] = 0;
-                    pthread_mutex_unlock(&mu);
-                }
-                out[1] = out[2] = out[3] = out[4] = 0;
-                out[5] = out[6] = q3ld_monotonic_ns();
-                out[7] = w;
-                pthread_mutex_lock(&mu);
-                out[0] = ST_SKIPPED;
-                publish(t);
-                pthread_mutex_unlock(&mu);
-                ev_flush();                                /* EVENT: a skipped range is terminal too */
-                continue;
-            }
-            int status;
-            int ww = w;
-            if (pb) {                                      /* PRE: the bound pre-range's result, in ticket order */
-                pre_t *p = &pre[pb - 1];
-                pthread_mutex_lock(&mu);
-                if (p->state != PR_DONE) {
-                    int64_t tw = q3ld_monotonic_ns();
-                    sc[SC_PRE_WAITS] += 1;
-                    while (p->state != PR_DONE) pthread_cond_wait(&pre_cv, &mu);
-                    sc[SC_PRE_WAIT_NS] += q3ld_monotonic_ns() - tw;
-                }
-                for (int k = 1; k < RES_W; k++) out[k] = p->words[k];
-                status = (int)p->words[0];
-                ww = (int)p->words[7];
-                p->state = PR_FREE; p->bound = 0; p->cancel = 0;
-                pre_of[t] = 0;
-                sc[SC_PRE_SERVED] += 1;
-                EV(10, ranges[t].offset);
-                pthread_mutex_unlock(&mu);
-            } else {
-                RANGE_DELAY();
-                status = try_adopt(&job, &ranges[t], out);
-                if (status < 0) {
-                    gauge_enter();
-                    status = run_range(&job, &ranges[t], stage, out);
-                    gauge_exit();
-                }
-            }
-            out[7] = ww;
+        const int64_t t = job.ticket;
+        int64_t *out = res + t * RES_W;
+        int pb = pre_of ? pre_of[t] : 0;
+        int status;
+        int ww = w;
+        if (pb) {                                      /* PRE: the bound pre-range's result */
+            pre_t *p = &pre[pb - 1];
             pthread_mutex_lock(&mu);
-            out[0] = status;
-            publish(t);
+            if (p->state != PR_DONE) {
+                int64_t tw = q3ld_monotonic_ns();
+                sc[SC_PRE_WAITS] += 1;
+                while (p->state != PR_DONE) pthread_cond_wait(&pre_cv, &mu);
+                sc[SC_PRE_WAIT_NS] += q3ld_monotonic_ns() - tw;
+            }
+            for (int k = 1; k < RES_W; k++) out[k] = p->words[k];
+            status = (int)p->words[0];
+            ww = (int)p->words[7];
+            p->state = PR_FREE; p->bound = 0; p->cancel = 0;
+            pre_of[t] = 0;
+            sc[SC_PRE_SERVED] += 1;
+            EV(10, ranges[t].offset);
             pthread_mutex_unlock(&mu);
-            ev_flush();                                    /* EVENT: the gate this range completed, if any */
-            if (status) failed = 1;
+        } else {
+            RANGE_DELAY();
+            status = try_adopt(&job, &ranges[t], out);
+            if (status < 0) {
+                gauge_enter();
+                status = run_range(&job, &ranges[t], stage, out);
+                gauge_exit();
+            }
         }
+        out[7] = ww;
+        pthread_mutex_lock(&mu);
+        out[0] = status;
+        publish(t);
+        pthread_mutex_unlock(&mu);
+        ev_flush();                                    /* EVENT: the gate this range completed, if any */
         pthread_mutex_lock(&mu);
         busy -= 1;
         pthread_cond_broadcast(&done_cv);
@@ -1316,7 +1276,7 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     for (int32_t i = 0; i < count; i++) {
         if (res[(first + i) * RES_W] == ST_PENDING) { pthread_mutex_unlock(&mu); return -2; }
     }
-    if (qlen + (range_jobs ? count : 1) > qcap) { pthread_mutex_unlock(&mu); return -3; }
+    if (qlen + count > qcap) { pthread_mutex_unlock(&mu); return -3; }
     for (int32_t i = 0; i < count; i++) {
         int down = i >= n;
         int32_t item = down ? i - n : i;
@@ -1355,15 +1315,13 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
         if (woke) pthread_cond_broadcast(&pre_cv);
     }
     if (nspec) claim_ranges(fd, first, count);
-    int32_t jobs = range_jobs ? count : 1;
-    for (int32_t j = 0; j < jobs; j++) {
+    for (int32_t i = 0; i < count; i++) {          /* a job per range, in ticket order: every gate/up, then every down */
         job_t *job = &queue[(qhead + qlen) % qcap];
-        job->fd = fd; job->file_size = file_size; job->deadline = deadline;
-        job->first = range_jobs ? first + j : first; job->count = range_jobs ? 1 : count;
+        job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->ticket = first + i;
         __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
     }
     EV(1, first);
-    if (jobs > 1) pthread_cond_broadcast(&work_cv); else pthread_cond_signal(&work_cv);
+    pthread_cond_broadcast(&work_cv);
     pthread_mutex_unlock(&mu);
     return 0;
 }
@@ -1965,7 +1923,7 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026101002; }              /* EXL3_LANE_PORT 2026092704, original 2026092504 */
+int32_t q3ld_abi(void) { return 2026101101; }              /* range jobs; EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }

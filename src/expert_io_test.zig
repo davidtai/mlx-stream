@@ -143,10 +143,11 @@ test "dsv41 io: pool scatters a synthetic file" {
             try testing.expect(r_gu.preadv_calls >= @as(i64, @intCast(gu_len / page)));
             try testing.expectEqual(Status.ok, pool.result(first + @as(u32, @intCast(n + i))).status);
         }
-        // One worker runs the job in ticket order: every gate/up before any down.
+        // A job per range: every ticket lands once (two workers may land them out of order).
         var order: [2 * max_items]u32 = undefined;
         const got = pool.logOrder(seq0, c.q3ld_seq(), &order);
         try testing.expectEqual(@as(usize, count), got.len);
+        std.mem.sort(u32, got, {}, std.sort.asc(u32));
         for (got, 0..) |t, k| try testing.expectEqual(first + @as(u32, @intCast(k)), t);
     }
 }
@@ -164,14 +165,14 @@ test "dsv41 io: injected faults map to status words" {
     const cases = [_]Case{
         // 1 EINTR: retried inside the call, uncounted.
         .{ .code = 1, .arg = 0, .hit = .gu1, .want = .{ .ok, .ok, .ok, .ok } },
-        // 2 EIO: that range fails with errno, the rest of the job is skipped.
-        .{ .code = 2, .arg = 0, .hit = .gu1, .want = .{ .ok, .os_error, .skipped, .skipped }, .err = @intFromEnum(std.posix.E.IO) },
+        // 2 EIO: that range fails with errno; every other range is its own job and lands.
+        .{ .code = 2, .arg = 0, .hit = .gu1, .want = .{ .ok, .os_error, .ok, .ok }, .err = @intFromEnum(std.posix.E.IO) },
         // 3 zero return: a short read.
-        .{ .code = 3, .arg = 0, .hit = .down0, .want = .{ .ok, .ok, .short, .skipped } },
+        .{ .code = 3, .arg = 0, .hit = .down0, .want = .{ .ok, .ok, .short, .ok } },
         // 4 truncated past the skip: 200 bytes land, the range continues.
         .{ .code = 4, .arg = 700, .hit = .gu1, .want = .{ .ok, .ok, .ok, .ok }, .hit_calls = 2 },
         // 4 truncated inside the skip: no byte past it, the range ends short (never a retry of the same request).
-        .{ .code = 4, .arg = 300, .hit = .gu1, .want = .{ .ok, .short, .skipped, .skipped } },
+        .{ .code = 4, .arg = 300, .hit = .gu1, .want = .{ .ok, .short, .ok, .ok } },
     };
     for (cases, 0..) |cs, round| {
         // Each range on its own page, 500 bytes in, so a rule's aligned offset names one range.
@@ -202,32 +203,38 @@ test "dsv41 io: injected faults map to status words" {
     }
 }
 
-test "dsv41 io: range jobs: one submit's ranges run on several workers, each range's status its own" {
+test "glm io: an id's 4 minis (one submit, GLM-5.3's shape: 4 gate/up and 4 down ranges) read on several workers, each range's status its own" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(40 * page);
     defer f.deinit();
-    var pool = try Pool.start(testing.allocator, .{ .workers = 4, .staging_bytes = page, .tickets = 64, .range_jobs = true });
+    var pool = try Pool.start(testing.allocator, .{ .workers = 8, .staging_bytes = page, .tickets = 64 });
     defer pool.stop();
     defer clearFaults();
+    const minis = 4;
     const lens = [n_components]u64{ 100, 100, 100, 100, 100, 100, 50, 50, 50 };
-    const gu = [2]u64{ 500, 2 * page + 500 };
-    const down = [2]u64{ 4 * page + 500, 6 * page + 500 };
-    // gu0 sleeps 200 ms first: gu1 and both downs land on other workers before it; gu1 fails alone.
+    var gu: [minis]u64 = undefined;
+    var down: [minis]u64 = undefined;
+    for (0..minis) |m| {
+        gu[m] = (2 * m) * page + 500;
+        down[m] = (2 * m + 1) * page + 500;
+    }
+    // Mini 0's gate/up sleeps 200 ms first: the other seven ranges land on other workers before it; mini 1's gate/up
+    // fails alone.
     injectFaults(&.{ 0, 2 * @as(i64, @intCast(page)) }, &.{ 5, 2 }, &.{ 200 * std.time.ns_per_ms, 0 });
-    var d = try Dests.init(2, &lens);
+    var d = try Dests.init(minis, &lens);
     defer testing.allocator.free(d.buf);
-    const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..2], &lens);
-    try pool.wait(first, 4, 10 * std.time.ns_per_s);
-    const want = [4]Status{ .ok, .os_error, .ok, .ok };
-    for (want, 0..) |w, k| try testing.expectEqual(w, pool.result(first + @as(u32, @intCast(k))).status);
+    const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..minis], &lens);
+    try pool.wait(first, 2 * minis, 10 * std.time.ns_per_s);
     const r0 = pool.result(first);
-    for (2..4) |k| {
+    try testing.expectEqual(Status.ok, r0.status);
+    for (1..2 * minis) |k| {
         const r = pool.result(first + @as(u32, @intCast(k)));
+        try testing.expectEqual(if (k == 1) Status.os_error else Status.ok, r.status);
         try testing.expect(r.worker != r0.worker);
         try testing.expect(r.t_end_ns < r0.t_end_ns);
     }
-    try d.expectRecord(0, f.image, gu[0], down[0], &lens);
-    // Record 1's gate/up failed; its down range was not skipped.
+    for (0..minis) |m| if (m != 1) try d.expectRecord(m, f.image, gu[m], down[m], &lens);
+    // Mini 1's gate/up failed; its down range landed.
     var at = down[1];
     for (gu_components..n_components) |k| {
         try testing.expectEqualSlices(u8, f.image[at..][0..lens[k]], d.part(1, k, &lens));
@@ -559,7 +566,7 @@ test "dsv41 io: a failed read is terminal for its gate" {
     try rig.waitWord(3, 10_000);
     try rig.pool.wait(f0, 4, 10 * std.time.ns_per_s);
     try rig.pool.wait(f1, 2, 10 * std.time.ns_per_s);
-    const want = [4]Status{ .os_error, .skipped, .skipped, .skipped };
+    const want = [4]Status{ .os_error, .ok, .ok, .ok };
     for (want, 0..) |w, k| try testing.expectEqual(w, rig.pool.result(f0 + @as(u32, @intCast(k))).status);
     try testing.expectEqual(@as(i64, 0), rig.pool.counter(.ev_wd_forced));
 }
@@ -695,6 +702,7 @@ fn rawSubmit(pool: *Pool, fd: i32, size: i64, deadline: i64, gu: u64, down: u64,
         at += @intCast(l);
         k += 1;
     };
+    std.debug.assert(at <= dst.len);
     const offs = [2]i64{ @intCast(gu), @intCast(down) };
     const rows = [1][*]const u64{&row};
     @memset(pool.published[first..][0..2], false);
@@ -850,7 +858,7 @@ test "dsv41 io cov: a running pool refuses a malformed job and a pending ticket 
     for (10..12) |t| try testing.expectEqual(Status.ok, pool.result(@intCast(t)).status);
 }
 
-test "dsv41 io cov: a job past its deadline publishes deadline then skipped; a zero-length range finishes before any check; a far deadline reads" {
+test "dsv41 io cov: a range past its deadline publishes deadline; a zero-length range finishes before any check; a far deadline reads" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(8 * page);
     defer f.deinit();
@@ -866,7 +874,7 @@ test "dsv41 io cov: a job past its deadline publishes deadline then skipped; a z
     try testing.expectEqual(Status.deadline, late.status);
     try testing.expectEqual(@as(i64, 0), late.payload);
     try testing.expectEqual(@as(i64, 0), late.preadv_calls);
-    try testing.expectEqual(Status.skipped, pool.result(1).status);
+    try testing.expectEqual(Status.deadline, pool.result(1).status);
     try testing.expect(std.mem.allEqual(u8, &dst, 0xAA));
     // A zero-length gate/up range has nothing to read: OK past the deadline; its down range is late.
     try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, size, 0, 500, 3 * page + 7, &.{0}, &.{200}, &dst, 2));
@@ -897,7 +905,7 @@ test "dsv41 io cov: ranges at and past the end of file, zero-length parts, a sho
     defer testing.allocator.free(dst);
     const Case = struct { gu: u64, gl: []const i64, dl: []const i64 = &.{10}, size: i64, fd: i32, want: Status, payload: i64, calls: ?i64 = null };
     const cases = [_]Case{
-        // Straddles the end: the 50 bytes that exist land, then the range is short; its down range is skipped.
+        // Straddles the end: the 50 bytes that exist land, then the range is short; its down range is its own read.
         .{ .gu = S - 50, .gl = &.{100}, .size = size, .fd = fd, .want = .short, .payload = 50, .calls = 1 },
         // Starts at the end, or a page past it: short, nothing read.
         .{ .gu = S, .gl = &.{10}, .size = size, .fd = fd, .want = .short, .payload = 0, .calls = 0 },
@@ -930,14 +938,12 @@ test "dsv41 io cov: ranges at and past the end of file, zero-length parts, a sho
         // The landed bytes are the file's (zero-length parts take no room), the rest of the rows untouched.
         if (got > 0) try testing.expectEqualSlices(u8, f.image[cs.gu..][0..got], dst[0..got]);
         try testing.expect(std.mem.allEqual(u8, dst[got..gl_total], 0xAA));
-        if (cs.want == .ok) {
-            try testing.expectEqual(Status.ok, pool.result(t + 1).status);
-            var dl_total: usize = 0;
-            for (cs.dl) |l| dl_total += @intCast(l);
-            try testing.expectEqualSlices(u8, f.image[down..][0..dl_total], dst[gl_total..][0..dl_total]);
-        } else {
-            try testing.expectEqual(Status.skipped, pool.result(t + 1).status);
-        }
+        // The down range is its own job: read in full, short past the caller's file size, the descriptor's errno.
+        var dl_total: usize = 0;
+        for (cs.dl) |l| dl_total += @intCast(l);
+        const down_want: Status = if (cs.fd < 0) .os_error else if (down + dl_total > @as(u64, @intCast(cs.size))) .short else .ok;
+        try testing.expectEqual(down_want, pool.result(t + 1).status);
+        if (down_want == .ok) try testing.expectEqualSlices(u8, f.image[down..][0..dl_total], dst[gl_total..][0..dl_total]);
         if (cs.want == .os_error) try testing.expectEqual(@as(i64, @intFromEnum(std.posix.E.BADF)), r.errno);
         if (cs.gu == page - 1) try testing.expect(r.preadv_calls >= 4);
     }
@@ -1102,7 +1108,7 @@ test "dsv41 io cov: horizon-N steps keep, promote and drop queued records; a ful
     // The stop's quiesce frees the queued records and the held workers.
 }
 
-test "dsv41 io cov: a failed job skip-cancels the pre-ranges bound to its later ranges" {
+test "dsv41 io cov: a failed range leaves the pre-ranges bound to its submit's other ranges served" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(64 * page);
     defer f.deinit();
@@ -1110,7 +1116,9 @@ test "dsv41 io cov: a failed job skip-cancels the pre-ranges bound to its later 
     defer pool.stop();
     defer clearFaults();
     try R96.armPreRead(pool, &spec_lens);
-    const ra: u64 = 2 * page + 5;
+    // ra's gate/up range starts in page 2 and ends in page 3, its down range in page 3: the fault on page 2 hits the
+    // gate/up range alone.
+    const ra: u64 = 3 * page - 6000;
     const rb: u64 = 20 * page + 9;
     try testing.expectEqual(@as(u32, 2), try R96.preRead(pool, f.ufd, 1, &.{@intCast(rb)}, &spec_lens));
     try waitFor(pool, preStarted2);
@@ -1119,11 +1127,12 @@ test "dsv41 io cov: a failed job skip-cancels the pre-ranges bound to its later 
     defer testing.allocator.free(d.buf);
     const first = try R96.submit(pool, f.ufd, &.{ ra, rb }, &.{ ra + spec_gu_len, rb + spec_gu_len }, d.rows[0..2], &spec_lens);
     try pool.wait(first, 4, 10 * std.time.ns_per_s);
-    const want = [4]Status{ .os_error, .skipped, .skipped, .skipped };
+    // ra's gate/up fails; its down range and rb's two (served by their pre-ranges) land.
+    const want = [4]Status{ .os_error, .ok, .ok, .ok };
     for (want, 0..) |w, k| try testing.expectEqual(w, pool.result(first + @as(u32, @intCast(k))).status);
+    try d.expectRecord(1, f.image, rb, rb + spec_gu_len, &spec_lens);
     try testing.expectEqual(@as(i64, 2), pool.counter(.pre_bound));
-    try testing.expectEqual(@as(i64, 2), pool.counter(.pre_skip_cancels));
-    try testing.expectEqual(@as(i64, 0), pool.counter(.pre_served));
+    try testing.expectEqual(@as(i64, 2), pool.counter(.pre_served));
     try waitFor(pool, preIdle);
 }
 
@@ -1234,14 +1243,16 @@ test "dsv41 io cov: a pool reads a record; the test event log names submit, star
     const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + spec_gu_len}, d.rows[0..1], &spec_lens);
     try pool.wait(first, 2, 10 * std.time.ns_per_s);
     try d.expectRecord(0, f.image, base, base + spec_gu_len, &spec_lens);
-    // Submit (kind 1: the job queued, no worker busy), then the worker's start (kind 2: the queue empty again).
+    // Submit (kind 1: its two ranges queued, no worker busy), then the worker's start of each (kind 2), in ticket order.
     const n: usize = @intCast(q3raw.q3ld_test_events(null, 0));
-    try testing.expectEqual(@as(usize, 2), n);
-    try testing.expectEqualSlices(i64, &.{ 1, 1, 0 }, Log.buf[0..3]);
-    try testing.expectEqualSlices(i64, &.{ 2, 0, 0 }, Log.buf[5..8]);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualSlices(i64, &.{ 1, 2, 0 }, Log.buf[0..3]);
+    try testing.expectEqualSlices(i64, &.{ 2, 1, 0 }, Log.buf[5..8]);
+    try testing.expectEqualSlices(i64, &.{ 2, 0, 0 }, Log.buf[10..13]);
     try testing.expectEqual(@as(i64, first), Log.buf[4]);
     try testing.expectEqual(@as(i64, first), Log.buf[9]);
-    try testing.expect(Log.buf[8] >= Log.buf[3]);
+    try testing.expectEqual(@as(i64, first + 1), Log.buf[14]);
+    try testing.expect(Log.buf[8] >= Log.buf[3] and Log.buf[13] >= Log.buf[8]);
 }
 
 fn specStateIs(base: i64, state: i64) bool {
@@ -1275,7 +1286,7 @@ test "dsv41 io cov: a speculative record past the end fails; one the file ends i
     for (specSlots(&slots)) |s| if (s.base == short) try testing.expectEqual(@as(i64, 3000), s.landed);
     try testing.expectEqual(@as(i64, 1), pool.counter(.failed));
     // A range inside what landed is copied out (no preadv); one past it is read the stock way and is short.
-    var dst: [4000]u8 = @splat(0xAA);
+    var dst: [4010]u8 = @splat(0xAA);
     const s_u: u64 = @intCast(short);
     try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, big, -1, s_u, s_u + 1000, &.{1000}, &.{500}, &dst, 0));
     try pool.wait(0, 2, 10 * std.time.ns_per_s);
@@ -1289,7 +1300,10 @@ test "dsv41 io cov: a speculative record past the end fails; one the file ends i
     try testing.expectEqual(Status.short, pool.result(2).status);
     try testing.expectEqual(@as(i64, 3000), pool.result(2).payload);
     try testing.expect(pool.result(2).preadv_calls >= 1);
-    try testing.expectEqual(@as(i64, 2), pool.counter(.adopt_ranges));
+    // Its down range is its own job, inside what landed: copied out.
+    try testing.expectEqual(Status.ok, pool.result(3).status);
+    try testing.expectEqual(@as(i64, 0), pool.result(3).preadv_calls);
+    try testing.expectEqual(@as(i64, 3), pool.counter(.adopt_ranges));
 }
 
 fn specStarted(n: i64) type {
@@ -1390,7 +1404,7 @@ test "dsv41 io cov: an in-flight record parks (class 1) or pauses (class 0) when
         return error.SkipZigTest;
     }
     try testing.expectEqual(Status.deadline, pool.result(0).status);
-    try testing.expectEqual(Status.skipped, pool.result(1).status);
+    try testing.expectEqual(Status.deadline, pool.result(1).status);
     try testing.expect(std.mem.allEqual(u8, &dst, 0xAA));
     try testing.expectEqual(@as(c_int, 0), rawSubmit(pool, fd, size, t0 + 60 * std.time.ns_per_s, q, q + 200, &.{100}, &.{100}, &dst, 2));
     try pool.wait(2, 2, 10 * std.time.ns_per_s);
