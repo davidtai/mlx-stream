@@ -1077,6 +1077,37 @@ test "glm bill: the SDK's view fills the exact units, admits them, and refuses o
     std.debug.print("glm bill on the box's pack at 18.144 GB beside it: {d} prompt / {d} decode units (prompt {d} B, decode {d} B of the {d} B target)\n", .{ rows.prompt, rows.decode, mb.total(.prompt, baseline, rows.prompt), mb.total(.decode, baseline, rows.decode), target });
 }
 
+test "glm bill: per machine size, the units the fill and the request's bill take grow with the RAM" {
+    var c = try glm53Config();
+    defer c.deinit(testing.allocator);
+    const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
+    // The box's other memory beside the server (19.4 GB on the M5 Ultra), the GPU's wired limit at the RAM less 16 GiB
+    // less the fill arm's 2 GiB margin; the coding request (16,387 + 1,024 tokens) at its handover.
+    const baseline: u64 = 19_400_000_000;
+    const positions = decodeCap(&cfg, 16387 + 1024);
+    var last: [3]u32 = .{ 0, 0, 0 };
+    for ([_]u64{ 128, 192, 256, 512 }) |gib| {
+        const ram = gib << 30;
+        for ([_]bool{ false, true }) |classes| {
+            var in = boxInputs(&c, &cfg);
+            in.prompt_cache = prefillCacheBytes(ram);
+            in.size_classes = classes;
+            const mb = try memoryBill(testing.allocator, billOf(in), null);
+            defer mb.free(testing.allocator);
+            const target = targetOf(ram - (18 << 30), ram, baseline);
+            const rows = try sdk.fill(mb, baseline, target, maxUnits(in.bank), min_fill_rows);
+            const decode = try requestRows(testing.allocator, in, positions, rows.prompt, baseline, target, maxUnits(in.bank));
+            std.debug.print("glm bill per machine: {d} GiB, target {d} B, size classes {}: {d} prompt / {d} decode units constructed, {d} decode units at the coding request\n", .{ gib, target, classes, rows.prompt, rows.decode, decode });
+            if (!classes) {
+                try testing.expect(rows.prompt >= last[0] and rows.decode >= last[1] and decode >= last[2]);
+                last = .{ rows.prompt, rows.decode, decode };
+            }
+        }
+    }
+    // The 512 GiB machine holds every expert in both phases.
+    try testing.expectEqual([3]u32{ 128, 128, 128 }, last);
+}
+
 test "glm bill: the bill at a request counts its slot rows exactly; a request's own KV fills more rows than the longest one's" {
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
