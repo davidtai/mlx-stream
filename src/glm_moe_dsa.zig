@@ -178,8 +178,9 @@ pub const LayerSlots = struct {
     array_bytes: [9]u64 = @splat(0),
 
     /// An empty stream layer: an EXL3 pack's routed layer of one K keeps its second bank layer empty
-    /// (`glm_moe_dsa_exl3_bank.Layer.empty`). It holds no expert: it takes no slot at any units and no row, and nothing
-    /// routes on it.
+    /// (`glm_moe_dsa_exl3_bank.Bank.closeLayer`). It holds no expert: it takes no slot at any units and no row, nothing
+    /// routes on it (so no read, no gate, no wave), and the MTP MoE has no group for it. The one rule every consumer
+    /// asks (the bill, the wide lane, the MTP lane).
     pub fn empty(l: LayerSlots) bool {
         return l.n_records == 0;
     }

@@ -246,7 +246,7 @@ pub const Exl3 = struct {
         var next: u32 = 0;
         for (m.layers, 0..) |l, b| {
             // An empty bank layer holds no expert: no arrays, no group of the MoE.
-            if (l.empty()) continue;
+            if (m.slots[b].empty()) continue;
             const n_minis = l.minis * l.n_held;
             slot_base[b] = next;
             next += n_minis;

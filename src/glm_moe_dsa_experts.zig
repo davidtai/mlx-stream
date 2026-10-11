@@ -820,7 +820,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const w = &self.wide;
             const sl = bpl * layer + side;
             // An empty bank layer: nothing routes on it.
-            if (bpl > 1) if (self.stream.bank.layers[sl].empty()) return;
+            if (bpl > 1) if (self.stream.bank.slots[sl].empty()) return;
             const group_n = self.stream.max_route_ids;
             var tp = pt.now();
             try w.first.resize(a, self.n_experts);

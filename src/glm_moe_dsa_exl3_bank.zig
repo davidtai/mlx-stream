@@ -3,8 +3,8 @@
 //! expert stream (`sdk_ext.expert.assertBank`).
 //!   - A stream layer is one bank layer: a routed layer's experts at one K, its K3 bank layer at `2 r`, its K4 bank
 //!     layer at `2 r + 1`. A routed layer of one K (a uniform pack, `k_values` [3]) has an empty bank layer at
-//!     `2 r + 1` (`Layer.empty`: no expert, so no row, no route, no gate, no wave). The MTP layer's bank layers are the
-//!     draft lane's (`mtp/`), outside the stream.
+//!     `2 r + 1` (`Bank.closeLayer`; its slots `glm.LayerSlots.empty`: no expert, so no row, no route, no read, no
+//!     gate, no wave). The MTP layer's bank layers are the draft lane's (`mtp/`), outside the stream.
 //!   - A routed id is the model's expert id; a bank layer routes only the experts it holds. Its record is the expert's
 //!     `tp` minis (one tensor-parallel rank each: nine segments, code I16 = the trellis, rout F16 = svh, rin F16 =
 //!     suh per projection), adjacent in the file and read into adjacent rows of the slot arrays (`Layer.minis`).
@@ -91,13 +91,6 @@ pub const Layer = struct {
     /// The experts this bank layer holds: the most slot rows it takes.
     n_held: u32,
     segments: [n_components]Segment,
-
-    /// The empty bank layer of a routed layer of one K (`Bank.closeLayer`): no expert, so no slot row, no route, no
-    /// gate and no wave (its slots `glm.LayerSlots.empty`); its K and segments are its routed layer's other bank
-    /// layer's, so the stream keeps no scratch for it.
-    pub fn empty(l: Layer) bool {
-        return l.n_held == 0;
-    }
 };
 
 /// One projection's slot arrays as sushi's EXL3 MoE binds them (`sushi.Proj`): trellis uint16 `[minis, in/16,
@@ -304,8 +297,8 @@ pub const Bank = struct {
     }
 
     /// Routed layer `r`'s stream layers once its `sd` bank layers are read: with one, the second stream layer is empty
-    /// (no experts: no rows, no route; the first's K, segments and record, so the stream keeps one transient geometry;
-    /// its base at the first's end); every expert of the layer in one of them.
+    /// (no expert: its slots `glm.LayerSlots.empty`; the first's K, segments and record, so the stream keeps one
+    /// transient geometry; its base at the first's end); every expert of the layer in one of them.
     fn closeLayer(self: *Bank, comptime file: []const u8, r: usize, sd: u32, diag: ?*Diag) Refusal!void {
         const ne: usize = self.n_experts;
         const first = banks_per_layer * r;
@@ -797,6 +790,90 @@ test "glm exl3 bank: a uniform pack (one K3 bank layer per layer, the converter'
         s.release(r);
     }
     try s.flush();
+}
+
+test "glm exl3 bank: a uniform pack of 256 K3 experts a routed layer: its routes, their gates, the reads ahead and the grow touch no empty layer" {
+    const a = testing.allocator;
+    const split = @import("glm_moe_dsa_split.zig");
+    const text = try glm.tinyConfigJson(a, glm.tiny_quant);
+    defer a.free(text);
+    const t256 = try std.mem.replaceOwned(u8, a, text, "\"n_routed_experts\":16,", "\"n_routed_experts\":256,");
+    defer a.free(t256);
+    var c = try glm.Config.parse(a, t256, null, null);
+    defer c.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try writeSynth(a, testing.io, tmp.dir, &c, .{ .k3_experts = 256 });
+    defer a.free(img);
+    var rbuf: [512]u8 = undefined;
+    var b = try Bank.open(a, testing.io, try tmpRoot(&tmp, &rbuf), &c, null);
+    defer b.deinit();
+    const g = b.geometryOf();
+    try testing.expectEqual(@as(usize, 8), b.layers.len);
+    // The prompt's rows at 6 units, decode's at 24: two a unit on the K3 layers, none on the empty ones; the even split
+    // (the 3.0 pack's table is GLM-5.3's dims').
+    var prompt_rows: [8]u32 = undefined;
+    _ = bill_units.rowsAt(g, 6, &prompt_rows);
+    var decode_rows: [8]u32 = undefined;
+    try testing.expect(split.decodeRows(g, 6, 24, bill_units.grownBytes(g, 6, 24), &decode_rows) == null);
+    _ = bill_units.rowsAt(g, 24, &decode_rows);
+    for (prompt_rows, decode_rows, 0..) |pr, dr, i| {
+        try testing.expectEqual(@as(u32, if (i % 2 == 0) 12 else 0), pr);
+        try testing.expectEqual(@as(u32, if (i % 2 == 0) 48 else 0), dr);
+    }
+    // Event gates on the host word and the lookahead over the next routed layer's 256 experts, as the module runs them.
+    const s = try Stream.Stream.init(a, &b, .{ .rows = &prompt_rows, .max_route_ids = 8, .transient_rows = 16, .wide_depth = 2, .transient_release = true, .records_per_part = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 }, .lookahead = .{ .k = 8, .budget = 4, .preread = false }, .event = .{} });
+    defer s.deinit();
+    // One geometry: one transient scratch.
+    try testing.expect(s.alt == null);
+    var rng = std.Random.DefaultPrng.init(11);
+    var ids: [8]u16 = undefined;
+    var scores: [256]f32 = undefined;
+    var n_gates: u64 = 0;
+    for (0..2) |phase| {
+        if (phase == 1) {
+            _ = try s.releaseTransient();
+            try s.grow(&decode_rows);
+            // The grow gives the empty layers no rows of their own.
+            for (s.layers, 0..) |*ls, sl| if (sl % 2 == 1) {
+                try testing.expectEqual(@as(u32, 0), ls.base.rows);
+                try testing.expect(ls.ext == null);
+            };
+        }
+        for (0..32) |step| {
+            const l: u32 = @intCast(step % 4);
+            const n = 1 + rng.random().uintLessThan(usize, 8);
+            var k: usize = 0;
+            while (k < n) {
+                const e = rng.random().uintLessThan(u16, 256);
+                if (std.mem.indexOfScalar(u16, ids[0..k], e) == null) {
+                    ids[k] = e;
+                    k += 1;
+                }
+            }
+            for (&scores) |*x| x.* = rng.random().float(f32);
+            // Every expert's bank layer is its routed layer's K3 one.
+            for (ids[0..n]) |e| try testing.expectEqual(2 * l, b.streamLayer(l, e));
+            const r = try s.route(2 * l, ids[0..n], &scores);
+            if (try s.gate(r)) |gt| n_gates += 1 + gt.n_parts;
+            for (0..r.n_parts) |p| try s.waitDown(r, @intCast(p));
+            try s.expectServed(r, ids[0..n], img);
+            s.release(r);
+            try s.flush();
+        }
+    }
+    try testing.expect(n_gates > 0);
+    // Nothing routed on an empty layer (so nothing read or gated for it), every K3 layer routed; no read ahead for an
+    // empty layer at any rank, some for the K3 ones.
+    for (0..b.layers.len) |sl| {
+        const lc = s.layerCounts(@intCast(sl));
+        if (sl % 2 == 1) {
+            try testing.expectEqual(sdk_ext.expert.LayerCounts{}, lc);
+        } else try testing.expect(lc.routes > 0);
+    }
+    const br = s.lookaheadByRank();
+    for (br[1]) |x| try testing.expectEqual([2]u64{ 0, 0 }, x);
+    try testing.expect(s.stats().spec_issued > 0);
 }
 
 test "glm exl3 bank: at GLM-5.3's geometry the 3.42 bpw pack's and the uniform 3.0 bpw pack's manifests give the bill's slots, its units and the split's packs" {
