@@ -287,6 +287,11 @@ test "glm mtp parity: a round's verify reads, each expert's by the first row tha
     for (ln.counts.decided) |d| decided += d;
     try testing.expectEqual(@as(u64, 1), decided);
     for (ln.counts.accepted_by_p) |acc| try testing.expectEqual(@as(u64, 0), acc);
+    // The affine decode lane's host split: its waves' four steps are its wave time, each step stamped.
+    const hs = r.m.ex.host;
+    try testing.expect(hs.calls > 0);
+    try testing.expectEqual(hs.wave_ns, hs.hit_ns + hs.commit_ns + hs.miss_ns + hs.join_ns);
+    try testing.expect(hs.hit_ns > 0 and hs.commit_ns > 0 and hs.miss_ns > 0 and hs.join_ns > 0);
     std.debug.print("glm mtp parity: a rejected round read {d} B, {d} B of it for the rejected rows; a serial step {d} B\n", .{ round_bytes, ln.counts.rejected_bytes, serial_bytes });
 }
 
