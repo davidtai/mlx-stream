@@ -45,7 +45,7 @@ pub const now = clock.now;
 
 /// The site of a command buffer: the layer's trunk, a group (its index and bank layer in the tag), a drain, the
 /// layer's tail, after the layers, an op of a fine layer.
-pub const Site = enum(u8) { none = 0, trunk = 1, group = 2, drain = 3, tail = 4, after = 5, fine = 6 };
+pub const Site = enum(u8) { none = 0, trunk = 1, group = 2, drain = 3, tail = 4, after = 5, fine = 6, touch = 7 };
 /// What the host is doing: building the trunk's graph, the read-ahead's predictor, the staged misses' routes, in the
 /// routing barrier (MLX encoding the trunk, then the wait), planning a bank layer's groups, waiting for the read-ahead,
 /// waiting for a group's reads, building a group's graph, in a group's asyncEval (MLX's encoding and commit), waiting
@@ -218,8 +218,8 @@ pub fn begin(g: *ops.MlxOps) void {
     tag(.trunk, 0, 0, 0);
 }
 
-const n_cls = 9;
-const cls_names = [n_cls][]const u8{ "untagged", "layer start (trunk)", "router sync (group 0, bank layer 0)", "bank layer 1 start (its group 0)", "group drains (groups after)", "drain-tagged", "layer end (tail)", "after the layers", "fine layers" };
+const n_cls = 10;
+const cls_names = [n_cls][]const u8{ "untagged", "layer start (trunk)", "router sync (group 0, bank layer 0)", "bank layer 1 start (its group 0)", "group drains (groups after)", "drain-tagged", "layer end (tail)", "after the layers", "fine layers", "head touch" };
 
 fn classOf(t: u64) usize {
     const site: u8 = @truncate(t >> 8);
@@ -233,6 +233,7 @@ fn classOf(t: u64) usize {
         4 => 6,
         5 => 7,
         6 => 8,
+        7 => 9,
         else => 0,
     };
 }
