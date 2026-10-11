@@ -68,6 +68,7 @@ pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, c: *const Config, facts: *c
     _ = ceiling;
     try c.checkCtxSize();
     try c.checkMaxOutput();
+    try c.checkUnitsCap();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const built = c.withFacts(facts);

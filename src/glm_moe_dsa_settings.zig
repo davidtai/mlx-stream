@@ -44,11 +44,13 @@ pub const Config = struct {
     expert_lookahead_budget: ?u32 = null,
     /// The read pool's workers (null = 8; 1 .. `max_read_workers`).
     expert_read_workers: ?u32 = null,
-    /// The most fill units the module takes (null = off; 1 or more): the construction's fill and the handover's grow
-    /// stop at it, so two arms of a measurement hold the same rows when the box beside them moves. It only lowers what
-    /// the bill and the live reading admit (never raises it), so it is always safe. The harness's forced rows
-    /// (`expert_rows`) are not capped.
+    /// The most fill units the module takes (null = off; `min_units_cap` or more): the construction's fill and the
+    /// handover's grow stop at it, so two arms of a measurement hold the same rows when the box beside them moves. It
+    /// only lowers what the bill and the live reading admit (never raises it), so it is always safe. The harness's forced
+    /// rows (`expert_rows`) are not capped.
     expert_units_cap: ?u32 = null,
+    /// An `expert_units_cap` under the fill's floor: refused by name at load (`error.UnitsCapUnderFillFloor`).
+    expert_units_cap_under_floor: ?i64 = null,
     /// The least the rest of the box (`glm_moe_dsa_module.Box.others`) reads, in bytes (null = off): the load's baseline
     /// and the handover's reading take at least this, so two arms of a measurement admit at the same target when the
     /// box beside them moves. It only lowers the admission (never raises it), so it is always safe; the twin of
@@ -75,6 +77,8 @@ pub const Config = struct {
     /// The lookahead's widest budget (`sdk_ext.expert.lookahead.max_budget`).
     pub const max_lookahead_budget: i64 = @import("sdk_ext.zig").expert.lookahead.max_budget;
     pub const max_read_workers: i64 = @import("sdk_ext.zig").expert.io.max_workers;
+    /// The least units cap: the fill's floor (`phase_memory.min_fill_rows`), under which a load is refused.
+    pub const min_units_cap: i64 = @import("phase_memory.zig").min_fill_rows;
     /// The deepest draft a round verifies: its depth + 1 rows of top-8 routes in the stream's decode lane
     /// (`sdk_ext.expert.policy.max_route_ids` = 48).
     pub const max_mtp_depth: u32 = @import("sdk_ext.zig").expert.policy.max_route_ids / glm.routed_top_k - 1;
@@ -129,7 +133,7 @@ pub const Config = struct {
             any = true;
         };
         if (obj.get("expert_units_cap")) |v| if (v == .integer and v.integer >= 1 and v.integer <= std.math.maxInt(u32)) {
-            c.expert_units_cap = @intCast(v.integer);
+            if (v.integer >= min_units_cap) c.expert_units_cap = @intCast(v.integer) else c.expert_units_cap_under_floor = v.integer;
             any = true;
         };
         if (obj.get("rest_of_box_floor_bytes")) |v| if (v == .integer and v.integer >= 1) {
@@ -246,6 +250,13 @@ pub const Config = struct {
         log.warn("glm_moe_dsa: load refused: ctx_size {d} is over the model's limit of {d} tokens (CtxSizeOverModelLimit)\n", .{ v, max_ctx_size });
         return error.CtxSizeOverModelLimit;
     }
+
+    /// A units cap under the fill's floor, refused by name (a capped fill would take fewer rows than a load may).
+    pub fn checkUnitsCap(c: *const Config) error{UnitsCapUnderFillFloor}!void {
+        const v = c.expert_units_cap_under_floor orelse return;
+        log.warn("glm_moe_dsa: load refused: expert_units_cap {d} is under the fill's floor of {d} units (UnitsCapUnderFillFloor)\n", .{ v, min_units_cap });
+        return error.UnitsCapUnderFillFloor;
+    }
 };
 
 const testing = std.testing;
@@ -285,6 +296,11 @@ test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up 
     try testing.expectEqual(@as(?u32, null), (Config{}).expert_units_cap);
     try testing.expectEqual(@as(?u32, 85), (try settingsOf("{\"expert_units_cap\": 85}")).expert_units_cap);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"expert_units_cap\": 0}")).expert_units_cap);
+    try testing.expectEqual(@as(?u32, 16), (try settingsOf("{\"expert_units_cap\": 16}")).expert_units_cap);
+    const under = try settingsOf("{\"expert_units_cap\": 15}");
+    try testing.expectEqual(@as(?u32, null), under.expert_units_cap);
+    try testing.expectError(error.UnitsCapUnderFillFloor, under.checkUnitsCap());
+    try (Config{}).checkUnitsCap();
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"expert_units_cap\": \"85\"}")).expert_units_cap);
     try testing.expectEqual(@as(?u64, null), (Config{}).rest_of_box_floor_bytes);
     try testing.expectEqual(@as(?u64, 21_000_000_000), (try settingsOf("{\"rest_of_box_floor_bytes\": 21000000000}")).rest_of_box_floor_bytes);
