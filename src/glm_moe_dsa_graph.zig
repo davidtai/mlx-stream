@@ -857,6 +857,10 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             try evals.append(a, next_h);
             try evals.appendSlice(a, cache.buffers(l, &bufs));
             for (carry.topk) |t| if (t) |x_| try evals.append(a, x_);
+            // DIAGNOSTIC (not for merge): GLM53_DIAG_TOUCH_HEAD=1 reads the head's weights (a 1-row product) in the
+            // tail of the third layer from the end, so their first use is not the head's.
+            if (pt.enabled and li + 3 == w.layers.len and std.c.getenv("GLM53_DIAG_TOUCH_HEAD") != null)
+                try evals.append(a, try qlinear(g, try g.zeros(&.{ 1, @intCast(c.hidden_size) }, g.dtypeOf(h)), w.lm_head));
             if (pt.enabled) {
                 try pt.op(g, evals.items, .tail);
                 pt.tag(.tail, l, 0, 0);
