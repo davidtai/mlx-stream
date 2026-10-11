@@ -398,13 +398,44 @@ pub const Decision = struct { accepted: u32, next: u32 };
 /// correction and the bonus are the argmax. Sampled: exact is DeepSeek-V4.1's lane rule (`ds.Sampling`: point-mass
 /// drafts accepted with probability p(draft) of the tempered, filtered row, the residual's draw at the first
 /// rejection); typical tests the same p against its own entropy and draws the correction and the bonus from p.
+/// `prepare`, one eval of its arrays, `Pending.read`.
 pub fn decide(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode, sampling: sdk.SamplingParams, base: u64) !Decision {
+    const p = try prepare(g, logits, drafts, mode, sampling, base);
+    try g.evalAll(&.{ p.tok, p.flags orelse p.tok });
+    return p.read(g);
+}
+
+/// A decision's device arrays on the verify rows' logits (`prepare`): each row's token (`tok`, uint32 [w]: the
+/// argmax or the draw) and the drafted rows' acceptance flags (`flags`, bool [drafts]; null: greedy exact, whose drafts
+/// the host compares with `tok`).
+pub const Pending = struct {
+    tok: T,
+    flags: ?T = null,
+    w: usize,
+    drafts: [max_depth]u32 = undefined,
+    n_drafts: usize,
+
+    /// The decision from the evaluated arrays, read in place (no GPU round trip after the eval that computed them).
+    pub fn read(p: *const Pending, g: *G) !Decision {
+        var tok: [max_depth + 1]u32 = undefined;
+        var flags: [max_depth]bool = undefined;
+        _ = try g.hostU32(p.tok, tok[0..p.w]);
+        if (p.flags) |f| _ = try g.hostBool(f, flags[0..p.n_drafts]);
+        var a: u32 = 0;
+        while (a < p.n_drafts) : (a += 1) {
+            const ok = if (p.flags != null) flags[a] else p.drafts[a] == tok[a];
+            if (!ok) break;
+        }
+        return .{ .accepted = a, .next = tok[a] };
+    }
+};
+
+/// `decide`'s graph, not evaluated: the caller evaluates `tok` and `flags` (a round: with the verify's own outputs).
+pub fn prepare(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode, sampling: sdk.SamplingParams, base: u64) !Pending {
     const w: usize = @intCast(g.shapeOf(logits).dim(0));
     std.debug.assert(w == drafts.len + 1 and w <= max_depth + 1);
     const nd: c_int = @intCast(drafts.len);
     const vocab = g.shapeOf(logits).dim(1);
-    var tok: [max_depth + 1]u32 = undefined;
-    var flags: [max_depth]bool = undefined;
     var idb: [max_depth]i32 = undefined;
     for (idb[0..drafts.len], drafts) |*d, v| d.* = @intCast(v);
     const typ: ?@FieldType(sdk.acceptance.Mode, "typical") = switch (mode) {
@@ -412,42 +443,32 @@ pub fn decide(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode, 
         .exact => null,
         else => return error.MtpAcceptanceNotImplemented,
     };
-    var have_flags = false;
+    var p: Pending = .{ .tok = undefined, .w = w, .n_drafts = drafts.len };
+    @memcpy(p.drafts[0..drafts.len], drafts);
     if (sampling.greedy()) {
-        _ = try g.hostU32(try g.argmax(logits, -1), tok[0..w]);
+        p.tok = try g.argmax(logits, -1);
         if (typ) |t| if (drafts.len > 0) {
             const lg = try g.astype(try g.slice(logits, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 }), .float32);
             const lp = try g.sub(lg, try g.logsumexp(lg, -1, true));
-            _ = try g.hostBool(try typicalFlags(g, lp, try g.exp(lp), idb[0..drafts.len], t), flags[0..drafts.len]);
-            have_flags = true;
+            p.flags = try typicalFlags(g, lp, try g.exp(lp), idb[0..drafts.len], t);
         };
     } else {
         const sm: ds.Sampling = .{ .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k, .min_p = sampling.min_p, .seed = sampling.seed };
         const Loop = dsl.Loop(G);
         if (typ) |t| {
             const sr = try Loop.sampledRows(g, logits, sm, base, &.{});
-            _ = try g.hostU32(sr.tok, tok[0..w]);
+            p.tok = sr.tok;
             if (drafts.len > 0) {
-                const p = try g.slice(sr.p, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 });
-                const lp = try g.log(p);
-                _ = try g.hostBool(try typicalFlags(g, lp, p, idb[0..drafts.len], t), flags[0..drafts.len]);
-                have_flags = true;
+                const pr = try g.slice(sr.p, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 });
+                p.flags = try typicalFlags(g, try g.log(pr), pr, idb[0..drafts.len], t);
             }
         } else {
             const sr = try Loop.sampledRows(g, logits, sm, base, drafts);
-            _ = try g.hostU32(sr.tok, tok[0..w]);
-            if (sr.accept) |acc| {
-                _ = try g.hostBool(acc, flags[0..drafts.len]);
-                have_flags = true;
-            }
+            p.tok = sr.tok;
+            p.flags = sr.accept;
         }
     }
-    var a: u32 = 0;
-    while (a < drafts.len) : (a += 1) {
-        const ok = if (have_flags) flags[a] else drafts[a] == tok[a];
-        if (!ok) break;
-    }
-    return .{ .accepted = a, .next = tok[a] };
+    return p;
 }
 
 /// p(draft) > min(eps, delta * exp(-H(p))) per drafted row (`lp` = log p, f32 `[d, vocab]`; zero-mass entries add
@@ -472,8 +493,8 @@ pub const Counts = struct {
     /// Rounds the lane ran without drafts (the budget's last tokens, or a request it did not track).
     serial: u64 = 0,
     wall_ns: u64 = 0,
-    /// The rounds' time in the drafts (the MTP steps) and in the verify forward (the decision and the commit are
-    /// the rest of `wall_ns`).
+    /// The rounds' time in the drafts (the MTP steps) and in the verify forward with the decision's device work (one
+    /// eval; the decision's read and the commit are the rest of `wall_ns`).
     draft_ns: u64 = 0,
     verify_ns: u64 = 0,
     /// The largest rise of MLX's high-water mark over a round's start (the round's transient, measured).
