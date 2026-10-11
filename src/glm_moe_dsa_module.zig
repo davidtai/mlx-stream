@@ -1310,9 +1310,10 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     const prompt = [_]u32{ 3, 17, 9, 101, 44, 250, 7, 63, 12, 5, 99, 31 };
     const q0 = m.math.prefillStats();
     const logits = try m.prefillAt(0, &prompt);
-    // The prompt's slices past sushi's decode rows ran the prefill GEMM over host slots: no wait on the GPU.
+    // The prompt's slices past sushi's decode rows ran the prefill GEMM over host slots: no wait on the GPU. Sushi's
+    // moePrefillHost served them only where the quant's own table did not (`prefillTabled`, the tensor units).
     const q1 = m.math.prefillStats();
-    try testing.expect(q1[0] > q0[0]);
+    try testing.expectEqual(m.math.gemm == null, q1[0] > q0[0]);
     try testing.expectEqual(q0[1], q1[1]);
     // The prompt line's counts: the pass's GEMM calls, no drain.
     try testing.expectEqual([2]u64{ q1[0] - q0[0], 0 }, m.prompt_gemm.?);
