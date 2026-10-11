@@ -207,7 +207,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const max_context = bill_mod.servedContext(cfg);
             // The prompt's attention form this device runs (the bill charges its arrays).
             const dsa = try graph.dsaKernelsRun(gpa, s, model);
-            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag), .dsa = dsa };
+            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag), .dsa = dsa, .prompt_cache = bill_mod.prefillCacheBytes(ram) };
             const mb = try bill_mod.memoryBill(gpa, bill_mod.termsOf(inputs));
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
@@ -306,7 +306,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             log.info("glm_moe_dsa: preloaded {d} experts ({d:.2} GB) into the prompt rows in {d:.2} s\n", .{ preloaded, gigabytes(Reads.of(pre0, self.stream.stats()).ssd_bytes), seconds(pre_ns) });
             self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa };
             self.g.clearCache();
-            _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, bill_mod.prefill_cache_bytes);
+            _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, self.inputs.prompt_cache);
             log.info("glm_moe_dsa: constructed ({d} routed layers, {d} experts, record {d} B, expert reads {s}, prompt {s}, prompt attention {s}, decode window {d} rows)\n", .{ n_bank, self.bank.n_experts, self.bank.geometryOf().widest_record, if (gated) "event gates" else "host waits", if (cfg.layerMajor()) "layer by layer" else "chunk by chunk", if (self.routes.dsa) "on the DSA kernels" else "in the reference's form", shape.decode_window_rows });
             try self.checkConstruction(rows.prompt);
             return self;
@@ -479,7 +479,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var prev: usize = 0;
             errdefer {
                 _ = self.ex.regrowTransient() catch {};
-                _ = mlx.mlx_set_cache_limit(&prev, bill_mod.prefill_cache_bytes);
+                _ = mlx.mlx_set_cache_limit(&prev, self.inputs.prompt_cache);
             }
             self.g.clearCache();
             _ = mlx.mlx_set_cache_limit(&prev, bill_mod.decode_cache_bytes);
@@ -598,7 +598,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + freed + kv0), bill_mod.host_side_bytes);
             _ = try self.ex.regrowTransient();
             var prev: usize = 0;
-            _ = mlx.mlx_set_cache_limit(&prev, bill_mod.prefill_cache_bytes);
+            _ = mlx.mlx_set_cache_limit(&prev, self.inputs.prompt_cache);
             self.decoding = false;
             log.info("glm_moe_dsa: reverse: footprint {d:.3} GB before the frees, {d:.3} GB after ({s} in {d} ms), KV at {d} positions {d:.3} GB, {d} rows per layer\n", .{ gigabytes(before.footprint), gigabytes(st.after.footprint), if (st.settled) "settled" else "not settled", st.waited_ms, positions, gigabytes(kv1), self.prompt_units });
         }
@@ -1299,6 +1299,12 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     const sv = try Served.init(a, testing.io, &cfg, &weights, s, .{ .ceiling = 64 << 30, .wired_margin = 0 });
     defer sv.deinit();
     const m = sv.exl3;
+    // The prompt pass's cache limit the module set is the bill's prompt cache term: this box's sixteenth of its RAM.
+    var limit: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&limit, m.inputs.prompt_cache);
+    try testing.expectEqual(m.inputs.prompt_cache, @as(u64, limit));
+    try testing.expectEqual(bill_mod.prefillCacheBytes(sdk.memory.totalMemBytes()), m.inputs.prompt_cache);
+    try testing.expectEqual(m.inputs.prompt_cache, bill_mod.termsOf(m.inputs).mlx_cache[0]);
     // The setting's lookahead budget and rank cap are the stream's.
     try testing.expectEqual(@as(u32, 3), m.stream.selector.?.budget);
     try testing.expectEqual(@as(u32, 2), m.stream.selector.?.max_rank);

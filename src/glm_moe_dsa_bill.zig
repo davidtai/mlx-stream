@@ -23,15 +23,23 @@ pub const fill_prompt_tokens: u64 = 16384;
 pub const fill_max_tokens: u64 = 1024;
 /// The fill's floor: fewer persistent rows per routed layer refuse the load by name.
 pub const min_fill_rows: u32 = 16;
-/// The MLX allocator cache the module holds through each phase (`mlx_set_cache_limit`). MLX recycles a freed buffer
-/// while the cache is under its limit, so the cache can end one buffer over it (`decodeCacheOvershoot`). The prompt
-/// pass's holds the buffers one layer frees for the next, which reuses them at their sizes: a buffer the cache dropped
-/// is a new one, made resident and zeroed by the system on its first use.
-pub const prefill_cache_bytes: u64 = 16 << 30;
+/// The MLX allocator cache the module holds through each phase (`mlx_set_cache_limit`), which the bill charges at its
+/// limit. MLX recycles a freed buffer while the cache is under its limit, so the cache can end one buffer over it
+/// (`decodeCacheOvershoot`). The prompt pass's (`prefillCacheBytes`) holds the buffers one layer frees for the next,
+/// which reuses them at their sizes: a buffer the cache dropped is a new one, made resident and zeroed by the system on
+/// its first use.
 pub const decode_cache_bytes: u64 = 512 << 20;
-/// The prompt pass's cache term: what its cache holds at the pass's footprint peak past the buffers the layer then took
-/// back from it (those are its waves, which their own term bills).
-pub const prefill_cache_peak_bytes: u64 = 2 << 30;
+/// The prompt pass's cache limit at most (on the 256 GiB M5 Ultra, a sixteenth of its RAM).
+pub const prefill_cache_max_bytes: u64 = 16 << 30;
+
+/// The prompt pass's cache limit on a box of `ram` bytes, which is also the bill's prompt-phase cache term (one value,
+/// `Inputs.prompt_cache`, for both): a sixteenth of the RAM, at most `prefill_cache_max_bytes`; with no RAM reading (0),
+/// the most. The cache fills to its limit: at 16 GiB it held 17.13 GB at the end of the coding workload's 16,387-token
+/// prompt pass on the box (screen stack-9d157b5), and a charge of 2 GiB left the pass's footprint peak 6.07 GB over the
+/// bill.
+pub fn prefillCacheBytes(ram: u64) u64 {
+    return if (ram == 0) prefill_cache_max_bytes else @min(prefill_cache_max_bytes, ram / 16);
+}
 /// The process's host side: its footprint less MLX's active and cache (the read pool's staging and tables, the
 /// manifests, the module's host state, the server and the process itself), the whole footprint outside MLX, so no
 /// other term covers a process overhead. Measured on the box at --ctx-size 16448 (runs m1, m2, k1 and k2: plugins
@@ -100,6 +108,8 @@ pub const Inputs = struct {
     mtp: ?Mtp = null,
     /// The prompt's attention on the DSA kernels (`glm_moe_dsa_graph.Routes.dsa`), else in the reference's form.
     dsa: bool,
+    /// The prompt pass's MLX cache limit (`prefillCacheBytes`): the module sets it, the bill charges it.
+    prompt_cache: u64,
 };
 
 /// Each phase's terms, decimal bytes, `[prompt, decode]`.
@@ -249,7 +259,7 @@ pub fn termsOf(in: Inputs) Terms {
         .residents = .{ in.resident_bytes, in.resident_bytes },
         .waves = .{ promptWaveBytes(c, in.prompt_tokens, in.prompt_tokens, in.dsa), decodeWaveBytes(c, in.decode_positions) },
         .kv = .{ kvBytes(c, in.prompt_tokens), kvBytes(c, in.decode_positions) },
-        .mlx_cache = .{ prefill_cache_peak_bytes, decode_cache_bytes + decodeCacheOvershoot(c, in.decode_positions, s.decode_window_rows / glm.routed_top_k) },
+        .mlx_cache = .{ in.prompt_cache, decode_cache_bytes + decodeCacheOvershoot(c, in.decode_positions, s.decode_window_rows / glm.routed_top_k) },
         .host_side = .{ host_side_bytes, host_side_bytes },
         .per_row = unitBytes(g),
         .mtp = if (in.mtp) |m| blk: {
@@ -337,7 +347,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, p
     const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
     const geo = if (exl3_bank.present(dir)) try exl3_bank.Bank.geometry(a, io, dir, model, diag) else try bank_mod.Bank.geometry(a, io, dir, model, diag);
     const residents = try glm.residentBytes(a, io, dir, model, diag);
-    return .{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .decode_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag), .dsa = glm.dsaKernelsFit(model) };
+    return .{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .decode_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag), .dsa = glm.dsaKernelsFit(model), .prompt_cache = prefillCacheBytes(sdk.memory.totalMemBytes()) };
 }
 
 /// The draft lane's bill inputs when `cfg` turns it on (its settings and the pack's MTP directory checked), else null.
@@ -482,6 +492,9 @@ fn glm53Config() !glm.Config {
     return glm.Config.parse(testing.allocator, text, &glm.glm53, null);
 }
 
+/// The prompt pass's cache limit on the 256 GiB M5 Ultra.
+const box_prompt_cache = prefillCacheBytes(256 << 30);
+
 /// GLM-5.3's affine bank at 4 bits: 75 routed layers of 256 records of 21,233,664 B, one row a unit.
 const glm53_slots: [75]glm.LayerSlots = @splat(.{ .record_bytes = 21_233_664, .n_records = 256 });
 
@@ -515,15 +528,28 @@ test "glm bill: a fill unit is every stream layer's rows per expert slot at its 
     // The transient rows count each routed id's rows.
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
-    const t = termsOf(.{ .model = &c, .bank = g, .resident_bytes = 0, .prompt_tokens = 1024, .decode_positions = 2048, .dsa = true });
+    const t = termsOf(.{ .model = &c, .bank = g, .resident_bytes = 0, .prompt_tokens = 1024, .decode_positions = 2048, .dsa = true, .prompt_cache = box_prompt_cache });
     try testing.expectEqual(@as(u64, 5 * 48 * 4 * 4_759_552), t.transient_slots[0]);
+}
+
+test "glm bill: the prompt pass's cache limit is a sixteenth of the RAM, at most 16 GiB, and the bill's prompt cache term is that limit" {
+    var c = try glm53Config();
+    defer c.deinit(testing.allocator);
+    // The 256 GiB M5 Ultra and a 24 GiB laptop.
+    for ([_][2]u64{ .{ 256 << 30, 16 << 30 }, .{ 24 << 30, 1536 << 20 } }) |box| {
+        const limit = prefillCacheBytes(box[0]);
+        try testing.expectEqual(box[1], limit);
+        const t = termsOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .prompt_tokens = 16384, .decode_positions = 16384 + 1024 + 4, .dsa = true, .prompt_cache = limit });
+        try testing.expectEqual(limit, t.mlx_cache[0]);
+    }
+    try testing.expectEqual(prefill_cache_max_bytes, prefillCacheBytes(0));
 }
 
 test "glm bill: GLM-5.3's terms at 16K: 1.59 GB a row, the KV at 95.2 KB a position, the fill under a 240 GiB ceiling" {
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{};
-    const t = termsOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16384, .decode_positions = maxPositions(&cfg), .dsa = true });
+    const t = termsOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16384, .decode_positions = maxPositions(&cfg), .dsa = true, .prompt_cache = box_prompt_cache });
     try testing.expectEqual(@as(u64, 75 * 21_233_664), t.per_row);
     // Every lane's buffer is whole pages at these positions: the KV is the position's bytes times the positions.
     try testing.expectEqual(@as(u64, 95_232 * 16384), t.kv[0]);
@@ -551,7 +577,7 @@ test "glm bill: the bill at a request counts its slot rows exactly: a unit past 
     for (&split, 0..) |*l, i| l.* = if (i % 2 == 0) .{ .record_bytes = 3_579_904, .n_records = 592, .rows_per_unit = 4, .share = 148.0 / 128.0 } else .{ .record_bytes = 4_759_552, .n_records = 432, .rows_per_unit = 4, .share = 108.0 / 128.0 };
     const g: glm.Geometry = .{ .layers = &split, .widest_record = 4_759_552, .widest_span = 3_000_000, .rows_per_id = 4 };
     const cfg: settings.Config = .{ .max_context_tokens = 16448 };
-    const in: Inputs = .{ .model = &c, .bank = g, .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16448, .decode_positions = maxPositions(&cfg), .dsa = true };
+    const in: Inputs = .{ .model = &c, .bank = g, .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16448, .decode_positions = maxPositions(&cfg), .dsa = true, .prompt_cache = box_prompt_cache };
     const t = termsOf(in);
     const mb = try memoryBill(testing.allocator, t);
     defer mb.free(testing.allocator);
@@ -569,7 +595,7 @@ test "glm bill: max_output bills the longest request's KV in decode; a request's
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{ .max_context_tokens = 16448 };
-    const in: Inputs = .{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16448, .decode_positions = maxPositions(&cfg), .dsa = true };
+    const in: Inputs = .{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16448, .decode_positions = maxPositions(&cfg), .dsa = true, .prompt_cache = box_prompt_cache };
     const gib: u64 = 1 << 30;
     const target = 240 * gib - 2 * gib;
     const mb = try memoryBill(testing.allocator, termsOf(in));
@@ -584,7 +610,7 @@ test "glm bill: max_output bills the longest request's KV in decode; a request's
     // A shorter max_output bills less decode KV.
     var short = cfg;
     short.max_output_tokens = 8192;
-    try testing.expect(termsOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .prompt_tokens = 16448, .decode_positions = maxPositions(&short), .dsa = true }).kv[1] < termsOf(in).kv[1]);
+    try testing.expect(termsOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .prompt_tokens = 16448, .decode_positions = maxPositions(&short), .dsa = true, .prompt_cache = box_prompt_cache }).kv[1] < termsOf(in).kv[1]);
 }
 
 test "glm bill: the live grow fills the rows the reading leaves under the target, and refuses below the prompt rows" {
@@ -626,7 +652,7 @@ test "glm bill: the MTP lane adds its residents and experts (4.76 GB at GLM-5.3)
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{ .mtp_depth = 3 };
-    const in: Inputs = .{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16384, .decode_positions = maxPositions(&cfg), .dsa = true };
+    const in: Inputs = .{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16384, .decode_positions = maxPositions(&cfg), .dsa = true, .prompt_cache = box_prompt_cache };
     const off = termsOf(in);
     try testing.expect(off.mtp == null);
     // The box's MTP directory: 578,488,832 B of residents, 592 K3 + 432 K4 mini records of 3,578,880 / 4,758,528 B.
@@ -678,7 +704,7 @@ test "glm bill: the bill line lists every term and each phase's total at the row
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{};
-    const mb = try memoryBill(testing.allocator, termsOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16384, .decode_positions = maxPositions(&cfg), .dsa = true }));
+    const mb = try memoryBill(testing.allocator, termsOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .stream = streamShape(&cfg), .prompt_tokens = 16384, .decode_positions = maxPositions(&cfg), .dsa = true, .prompt_cache = box_prompt_cache }));
     defer mb.free(testing.allocator);
     const rows: sdk.Rows = .{ .prompt = 100, .decode = 110 };
     const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{BillLine{ .mb = &mb, .rows = rows, .baseline = 1, .target = 3, .context = 16384, .decode_positions = maxPositions(&cfg) }});
