@@ -14,15 +14,35 @@ const ops = @import("deepseek_v41_ops.zig");
 const G = ops.MlxOps;
 const T = G.T;
 
-/// One threadgroup of 1024 threads per row; `K` (a power of two up to 2048) a template argument, the row's length in
-/// `params[0]`.
+/// One threadgroup of 1024 threads per row; `K` (a power of two up to 2048) a template argument. `topk`'s rows lie in
+/// one buffer (`scores`) at one length (`params[0]`); `topkRows`' row `r` is its own input `s<r>` at length `params[r]`.
 const source: [:0]const u8 =
     \\    const uint n = uint(params[0]);
     \\    const uint row = threadgroup_position_in_grid.y;
+    \\    const device float* srow = scores + ulong(row) * ulong(n);
+++ "\n" ++ body;
+
+fn rowsSource(comptime r: usize) [:0]const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(200_000);
+        var cases: []const u8 = "";
+        for (1..r) |i| cases = cases ++ std.fmt.comptimePrint("        case {d}: srow = s{d}; break;\n", .{ i, i });
+        break :blk std.fmt.comptimePrint(
+            \\    const uint row = threadgroup_position_in_grid.y;
+            \\    const uint n = uint(params[row]);
+            \\    const device float* srow = s0;
+            \\    switch (row) {{
+            \\{s}        default: break;
+            \\    }}
+            \\{s}
+        , .{ cases, body });
+    };
+}
+
+const body =
     \\    const uint tid = thread_position_in_threadgroup.x;
     \\    const uint lane = thread_index_in_simdgroup;
     \\    const uint sg = simdgroup_index_in_threadgroup;
-    \\    const device float* srow = scores + ulong(row) * ulong(n);
     \\    threadgroup atomic_uint hist[2048];
     \\    threadgroup uint part[32];
     \\    threadgroup uint st[6];
@@ -121,6 +141,12 @@ const source: [:0]const u8 =
 ;
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
+/// `topkRows`' kernels, one per row count (its inputs `s0 ..`).
+var rows_kernels: [max_rows]?mlx.mlx_fast_metal_kernel = @splat(null);
+
+/// The most rows `topkRows` takes in one launch: its lengths ride in `params`' eight slots (a verify has at most
+/// `max_route_ids / n_experts_per_tok` = 6 rows).
+pub const max_rows = 8;
 
 /// Whether the kernel serves a top `k`: a power of two up to 2048 (the memory bill charges the selection by it).
 pub fn serves(k: u32) bool {
@@ -158,6 +184,64 @@ pub fn topk(g: *G, scores: T, k: u32) !?T {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", @intCast(k)));
     const inputs = [_]mlx.mlx_array{ scores, params };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
+    var out = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_vector_array_get(&out, ov, 0)) catch |e| {
+        _ = mlx.mlx_array_free(out);
+        return e;
+    };
+    return try g.adopt(out);
+}
+
+/// The ids `[rows.len, k]` (int32) of each row's `k` largest scores, `rows[r]` one row of `n_r > k` f32 scores
+/// (`[..., n_r]`, every leading dim 1; the lengths may differ), as `topk` gives them, every row in one launch (a row's
+/// threadgroup reads its own input); null where the kernel does not serve the shape.
+pub fn topkRows(g: *G, rows: []const T, k: u32) !?T {
+    std.debug.assert(rows.len > 0 and rows.len <= max_rows);
+    if (!serves(k)) return null;
+    var pv: [8]i32 = @splat(0);
+    for (rows, 0..) |r, i| {
+        const sh = g.shapeOf(r);
+        const n = sh.dim(-1);
+        if (sh.numel() != n or n <= k or g.dtypeOf(r) != .float32) return null;
+        pv[i] = n;
+    }
+    inline for (1..max_rows + 1) |nr| if (rows.len == nr) return try launchRows(nr, g, rows, &pv, k);
+    unreachable;
+}
+
+fn launchRows(comptime nr: usize, g: *G, rows: []const T, pv: *const [8]i32, k: u32) !T {
+    const kern = rows_kernels[nr - 1] orelse blk: {
+        const ins = comptime names: {
+            var v: [nr + 1][*:0]const u8 = undefined;
+            for (0..nr) |i| v[i] = std.fmt.comptimePrint("s{d}", .{i});
+            v[nr] = "params";
+            break :names v;
+        };
+        const outs = [_][*:0]const u8{"out"};
+        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const kn = mlx.mlx_fast_metal_kernel_new(std.fmt.comptimePrint("glm_moe_dsa_topk_rows{d}", .{nr}), iv, ov, comptime rowsSource(nr), "", true, false);
+        if (kn.ctx == null) return error.MetalKernelCompileFailed;
+        rows_kernels[nr - 1] = kn;
+        break :blk kn;
+    };
+    const params = try g.hostArray(std.mem.sliceAsBytes(pv), &.{8}, .int32);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ @intCast(nr), @intCast(k) }, 2, .int32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1024, @intCast(nr), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", @intCast(k)));
+    var inputs: [nr + 1]mlx.mlx_array = undefined;
+    @memcpy(inputs[0..nr], rows);
+    inputs[nr] = params;
     const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -227,6 +311,56 @@ test "glm topk: each row's k largest scores in argpartition's ids and order, tie
         checked += gv.len;
     }
     std.debug.print("glm topk: {d} ids equal argpartition's, in its order\n", .{checked});
+}
+
+test "glm topk: rows of their own lengths in one launch, each its k largest in argpartition's ids and order (ties, both zeros)" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(19);
+    const rand = prng.random();
+    const k: u32 = 2048;
+    // A verify's lengths (one key more per row), and rows of other lengths on a coarse grid (ties at the threshold)
+    // with zeros of both signs; one row up to max_rows rows.
+    const sets = [_][]const u32{ &.{ 16900, 16901, 16902, 16903 }, &.{ 2049, 3000, 5000, 2100, 70000, 4097, 2500, 9000 }, &.{6000} };
+    var checked: usize = 0;
+    for (sets, 0..) |lens, si| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        var rows: [max_rows]T = undefined;
+        var want: [max_rows]T = undefined;
+        for (lens, 0..) |n, r| {
+            const v = try a.alloc(f32, n);
+            defer a.free(v);
+            for (v) |*x| x.* = switch (si) {
+                0 => rand.floatNorm(f32),
+                else => switch (rand.uintLessThan(u8, 4)) {
+                    0 => 0.0,
+                    1 => -0.0,
+                    else => @floor(rand.floatNorm(f32) * 4) / 4,
+                },
+            };
+            rows[r] = try g.hostArray(std.mem.sliceAsBytes(v), &.{ 1, 1, 1, @intCast(n) }, .float32);
+            const kth: c_int = @intCast(n - k);
+            want[r] = try g.astype(try lastSlice(&g, try g.reshape(try g.argpartition(rows[r], kth, -1), &.{ 1, 1, @intCast(n) }), kth, @intCast(n)), .uint32);
+        }
+        const got = (try topkRows(&g, rows[0..lens.len], k)).?;
+        try testing.expect(g.dtypeOf(got) == .int32);
+        const gv = try a.alloc(u32, lens.len * k);
+        defer a.free(gv);
+        _ = try g.hostU32(try g.astype(got, .uint32), gv);
+        for (0..lens.len) |r| {
+            var wv: [2048]u32 = undefined;
+            _ = try g.hostU32(want[r], &wv);
+            try testing.expectEqualSlices(u32, &wv, gv[r * k ..][0..k]);
+            checked += k;
+        }
+    }
+    std.debug.print("glm topk rows: {d} ids equal argpartition's, in its order\n", .{checked});
 }
 
 fn lastSlice(g: *G, x: T, lo: c_int, hi: c_int) !T {
