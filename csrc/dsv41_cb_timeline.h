@@ -23,6 +23,8 @@ typedef struct {
   uint64_t tag;
   uint64_t status; /* MTLCommandBufferStatus at completion (4 = completed, 5 = error) */
   uint64_t queue;  /* 1: the queue of the buffer the install saw (MLX's stream), 0: another queue */
+  uint64_t dispatches; /* compute dispatches encoded since the previous outermost commit (the encoder hook) */
+  uint64_t barriers;   /* memory barriers encoded since the previous outermost commit */
 } Dsv41tlRow;
 
 /* MLX's current command buffer on stream s (an id<MTLCommandBuffer>), NULL when the stream has no Metal encoder. */
@@ -31,6 +33,9 @@ void *dsv41tl_mlx_buffer(mlx_stream s);
  * rows[0..cap) from index 0 (the row says whether it was cmdbuf's queue). 0, or -1 (no buffer / no rows), -2 (no
  * -commit along the chain), -3 (class table full). */
 int dsv41tl_install(void *cmdbuf, Dsv41tlRow *rows, uint32_t cap);
+/* Counts the compute dispatches and memory barriers MLX encodes (each row's `dispatches` / `barriers`): hooks the
+ * compute encoder class of cmdbuf's queue once. 0, or -1 (no buffer), -5 (no encoder), -6 (no dispatch method). */
+int dsv41tl_hook_encoder(void *cmdbuf);
 /* The same for a later buffer's chain (its classes not yet hooked): the classes added, or -1, -2, -3. */
 int dsv41tl_rehook(void *cmdbuf);
 /* Every override entry, the tagged ones, the tagged ones of another queue, the hooked classes. */
