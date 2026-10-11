@@ -1015,12 +1015,15 @@ fn benchDecode4(a: Allocator, g: anytype, ours: anytype, theirs: anytype, banks:
     const Sides = enum { both, k3, k4 };
     // impl glm53: these texts' GEMVs as the driver's `fused` would call them (`fusedGlm53`: each slot decoded once for
     // its member pairs), the full wave only
-    const Impl = enum { sushi, glm53 };
+    // impl minis: sushi's grouped kernels on GLM-5.3's minis (each mini decoded once for the pairs that route it)
+    const Impl = enum { sushi, glm53, minis };
     const Arm = struct { cfg: Cfg, depth: Depth, sides: Sides, impl: Impl = .sushi };
     var arms: std.ArrayList(Arm) = .empty;
     for ([_]Cfg{ .real, .distinct, .hot }) |cfg| for (std.enums.values(Depth)) |d| try arms.append(ar, .{ .cfg = cfg, .depth = d, .sides = .both });
     for ([_]Cfg{ .real, .hot }) |cfg| for ([_]Sides{ .k3, .k4 }) |sd| for ([_]Depth{ .none, .full }) |d| try arms.append(ar, .{ .cfg = cfg, .depth = d, .sides = sd });
     for ([_]Cfg{ .real, .distinct, .hot }) |cfg| try arms.append(ar, .{ .cfg = cfg, .depth = .full, .sides = .both, .impl = .glm53 });
+    for ([_]Cfg{ .real, .distinct, .hot }) |cfg| for ([_]Depth{ .gu, .gud, .full }) |d| try arms.append(ar, .{ .cfg = cfg, .depth = d, .sides = .both, .impl = .minis });
+    for ([_]Sides{ .k3, .k4 }) |sd| try arms.append(ar, .{ .cfg = .real, .depth = .full, .sides = sd, .impl = .minis });
     for ([_]Cfg{ .real, .hot }) |cfg| for ([_]Sides{ .k3, .k4 }) |sd| try arms.append(ar, .{ .cfg = cfg, .depth = .full, .sides = sd, .impl = .glm53 });
     const steps = 32;
     const best = try ar.alloc(u64, arms.items.len);
@@ -1044,11 +1047,11 @@ fn benchDecode4(a: Allocator, g: anytype, ours: anytype, theirs: anytype, banks:
                 const out: T = if (arm.impl == .glm53) try ours.fusedGlm53(g, xt, w.slots, bk) else switch (arm.depth) {
                     .none => xt,
                     else => blk: {
-                        const inn = try kern.pairGemv(g.s, xt, bk.gate.suh, bk.up.suh, bk.gate.trellis, bk.up.trellis, w.minis, hc, mini, ns, tpc, 0);
+                        const inn = if (arm.impl == .minis) try kern.pairGemvMinis(g.s, xt, bk.gate.suh, bk.up.suh, bk.gate.trellis, bk.up.trellis, w.minis, hc, mini, ns, tpc) else try kern.pairGemv(g.s, xt, bk.gate.suh, bk.up.suh, bk.gate.trellis, bk.up.trellis, w.minis, hc, mini, ns, tpc, 0);
                         const ig = try g.adopt(inn[0]);
                         const iu = try g.adopt(inn[1]);
                         if (arm.depth == .gu) break :blk ig;
-                        const di = try g.adopt(try kern.downGemvFusedMid(g.s, ig, iu, bk.down.trellis, bk.gate.svh, bk.up.svh, bk.down.suh, w.minis, mini, hc, ns));
+                        const di = try g.adopt(if (arm.impl == .minis) try kern.downGemvFusedMidMinis(g.s, ig, iu, bk.down.trellis, bk.gate.svh, bk.up.svh, bk.down.suh, w.minis, mini, hc, ns, tpc) else try kern.downGemvFusedMid(g.s, ig, iu, bk.down.trellis, bk.gate.svh, bk.up.svh, bk.down.suh, w.minis, mini, hc, ns));
                         if (arm.depth == .gud) break :blk di;
                         break :blk try g.adopt(try kern.downFinishReduce(g.s, di, bk.down.svh, w.minis, w.ones, hc, @intCast(w.n), tpc, .bfloat16));
                     },
