@@ -900,9 +900,12 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         at("post_norm");
         const x2 = try rmsNorm(g, h1, lw.post_norm, c.rms_norm_eps);
         const f = if (lw.dense) |d| try mlp(g, d, x2) else blk: {
-            const r = try route(g, c, lw.router.?, x2);
+            // The routers' f32 input made once: this layer's routing and the lookahead's next scores read it (their
+            // own cast of an f32 array is the array).
+            const x2f = try g.astype(x2, .float32);
+            const r = try route(g, c, lw.router.?, x2f);
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{ x2, r.indices, r.weights }, .router);
-            const next: ?T = if (rt.lookahead and !prompt and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2) else null;
+            const next: ?T = if (rt.lookahead and !prompt and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2f) else null;
             // A decode-lane call takes the shared expert built first and runs it during its read wait; the sum is the same.
             const shared: ?T = if (!wide) try mlp(g, lw.shared.?, x2) else null;
             const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, if (shared) |sh| &[_]T{sh} else &.{});
