@@ -28,6 +28,8 @@ pub const policy = @import("expert/policy.zig");
 pub const stream = @import("expert/stream.zig");
 /// The lookahead selector: the next routed layer's predicted records, chosen by score over its router rows.
 pub const lookahead = @import("expert/lookahead.zig");
+/// The route recorder (a diagnostic): one request's decode routes, what served each id, and the handover's residents.
+pub const routes = @import("expert/routes.zig");
 
 /// The one reader per process: the host takes it at the load claim of an arch whose caps say `uses_expert_reader`
 /// (its source declares `uses_reader`), before the preflight and the weights, and gives it back when the loaded model
