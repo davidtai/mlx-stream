@@ -1130,6 +1130,8 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
     // The decode: top-8 routes with the next layer's scores (the lookahead), each layer's hit rate from its own routes.
     try s.grow(&.{ 6, 8, 5, 7 });
     p0 = s.stats();
+    const refreshed0 = s.pool.counter(.refreshed);
+    const noslot0 = s.pool.counter(.noslot);
     var c0: [4]LayerCounts = undefined;
     for (&c0, 0..) |*c, l| c.* = s.layerCounts(@intCast(l));
     var per_layer: [4]LayerCounts = @splat(.{});
@@ -1170,15 +1172,19 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
     try testing.expectEqual(demand_bytes, s1.expert_bytes_read - p0.expert_bytes_read);
     try testing.expectEqual(demand_bytes - (s1.adopt_bytes - p0.adopt_bytes) + (s1.spec_bytes - p0.spec_bytes), decode.ssd_bytes);
     try testing.expect(decode.spec_issued > 0 and decode.spec_used <= decode.spec_issued and decode.ahead_records == 0);
-    // The lookahead's precision: every record read ahead counted at its top-k position (the prompt pass read none
-    // ahead), its target call routing at least the ones it claimed.
+    // The lookahead's precision: every record the selector chose for the next routed layer counted at its top-k
+    // position (the prompt pass chose none), its target call routing at least the ones it claimed. The pool issued each
+    // chosen record, refreshed it (its record of an earlier step still live) or skipped it for want of a slot: which one
+    // depends on how far the reads got, the sum does not.
     const by1 = s.lookaheadByRank();
     var la: [2]u64 = .{ 0, 0 };
     for (by1[0]) |x| {
         la[0] += x[0];
         la[1] += x[1];
     }
-    try testing.expectEqual(decode.spec_issued, la[0]);
+    const refreshed: u64 = @intCast(s.pool.counter(.refreshed) - refreshed0);
+    const noslot: u64 = @intCast(s.pool.counter(.noslot) - noslot0);
+    try testing.expectEqual(decode.spec_issued + refreshed + noslot, la[0]);
     try testing.expect(la[1] >= decode.spec_used and la[1] <= la[0]);
     var c1: [4]LayerCounts = undefined;
     for (&c1, 0..) |*c, l| c.* = s.layerCounts(@intCast(l));
