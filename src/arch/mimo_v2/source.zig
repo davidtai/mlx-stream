@@ -29,7 +29,7 @@ pub const io_tickets: u32 = stream_mod.io_tickets;
 pub const predict_rows: u32 = 2048;
 /// Construction routes of the source, each read once at installation.
 pub const Options = struct {
-    /// P1: `Wide.read_ahead` + its construction self-check on the first routed layer; off = the stock wide route.
+    /// P1: `Wide.read_ahead` (the prompt's predicted read-ahead); off = the stock wide route.
     read_ahead: bool = false,
     /// L5: the decode MoE route (`moe.Route.fused`: banked texts + combine; `.stock`: grouped gather_qmm, the control;
     /// HITPASS `.hitpass`: the fused route plus the device hit pass, `Experts.Options.devroute`).
@@ -533,12 +533,9 @@ pub const Source = struct {
         if (opts.prefill_combine == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
         // ── HITPASS: a decode-phase wide call rewrites its layer's LUT (`lutAfterWide`), bound once here. ──
         if (opts.decode_moe == .hitpass) self.after_wide = lutAfterWide;
-        // P1's bit-for-bit self-check on the first ROUTED layer (layer 0 is dense), on the real stream.
-        if (opts.read_ahead) _ = try checkReadAhead(&self.stream_source, bank.geometry);
-        // Invalid native aliases fail at installation, before any generation.
-        try self.ex.checkGatesAt(&self.g, a, top_k, bank.geometry.first_moe_layer);
-        // Verification does not seed the first request's residency policy.
-        // Event values remain monotonic while routing returns to cold prefill.
+        // The verification harness's device and reader checks (P1's read-ahead parity, `checkReadAhead`; LOOKAHEAD4's
+        // gated == waited, `Experts.checkGatesAt`) run in the tests and the pre-ship gate, never here: DeepSeek-V4.1 runs
+        // them only under its `verify` override, and a served construction runs no device self-check.
         try self.beginPrefill();
         return self;
     }
@@ -912,6 +909,9 @@ test "mimo sdk2 GPU: streamed bytes match resident gathers across slot reuse" {
     defer a.free(gates);
     const source = try Source.initBank(a, try fixtureBank(a, path, geometry), &.{1}, gates, stream, .{});
     defer source.deinit();
+    // The verification harness's gated == waited check (no served construction runs it), then the residency forgotten.
+    try source.ex.checkGatesAt(&source.g, a, top_k, geometry.first_moe_layer);
+    try source.beginPrefill();
     for (0..geometry.num_experts) |expert| {
         try std.testing.expectEqual(@as(?u32, null), source.stream_source.policy(1).slotOf(@intCast(expert)));
         try std.testing.expectEqual(@as(u32, 0), source.stream_source.policy(1).prefill_freq[expert]);
@@ -1116,6 +1116,9 @@ test "mimo hitpass GPU: hitpass decode outputs are bit-equal to the fused route 
         defer a.free(gates);
         const source = try Source.initBank(a, try fixtureBank(a, path, geometry), &.{ 3, 3 }, gates, stream, .{ .decode_moe = route });
         defer source.deinit();
+        // The verification harness's gated == waited check (no served construction runs it), then the residency forgotten.
+        try source.ex.checkGatesAt(&source.g, a, top_k, geometry.first_moe_layer);
+        try source.beginPrefill();
         try std.testing.expectEqual(route == .hitpass, source.ex.devRoute());
         var rng = std.Random.DefaultPrng.init(7);
         var xs: [2 * H]f32 = undefined;
@@ -1184,8 +1187,9 @@ fn expectSourceAgreement(name: []const u8, want: []const f32, got: []const f32) 
     if (relative_l2 > 0.01) return error.MimoSourceAgreement;
 }
 
-/// P1's construction check: `max_items + 1` records (two pool jobs) of the first routed layer read ahead, then by a
-/// demand route, equal bit for bit; the layer is left as found. The shared `Experts.checkReadAhead` hardcodes layer 0.
+/// P1's read-ahead parity check, for the tests and the verification harness (a served construction runs none):
+/// `max_items + 1` records (two pool jobs) of the first routed layer read ahead, then by a demand route, equal bit for
+/// bit; the layer is left as found. The shared `Experts.checkReadAhead` hardcodes layer 0.
 pub fn checkReadAhead(ss: *stream_mod.StreamSource, g: bank_mod.Geometry) !u32 {
     return ss.checkReadAhead(g.first_moe_layer, expert_io.max_items + 1);
 }
@@ -1248,7 +1252,7 @@ pub fn fixtureGates(a: std.mem.Allocator, g: *ops.MlxOps, geometry: bank_mod.Geo
 
 // P1 read-ahead on the CPU: a host-memory MiMo stream (layer 0 dense, two routed layers, 256 experts, 124 rows each)
 // with the installed reader options. No MLX array, device or lock: host slot rows and the pool's pread workers only.
-test "mimo read-ahead: construction check on the first routed layer and 512 tickets admit all 124 rows" {
+test "mimo read-ahead: the parity check on the first routed layer and 512 tickets admit all 124 rows" {
     const testing = std.testing;
     const a = testing.allocator;
     // Ticket sizing (`Stream.readAheadSeed`): fit = min(rows, (tickets - 2 * max_items) / 2).
@@ -1286,7 +1290,7 @@ test "mimo read-ahead: construction check on the first routed layer and 512 tick
     const stream = try stream_mod.Stream.init(a, &bank, stream_mod.options(&rows, .host));
     defer stream.deinit();
     var ss = stream_mod.StreamSource.init(stream);
-    // Source.initBank's check: layer 1 (relative 0), two pool jobs, bit for bit; the layer is left as found.
+    // The parity check: layer 1 (relative 0), two pool jobs, bit for bit; the layer is left as found.
     try testing.expectEqual(@as(u32, expert_io.max_items + 1), try checkReadAhead(&ss, geom));
     try testing.expectEqual(@as(u32, 0), ss.policy(1).occupancy);
     try testing.expect(!stream.ahead.live and !stream.failed);

@@ -256,10 +256,8 @@ pub const Lane = struct {
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_eval(vec));
                 tt = mp.charge(.draft_wait, tt);
-                for (dev[0..k], ids[1 .. k + 1]) |d, *x| {
-                    const ptr = mlx.mlx_array_data_uint32(d) orelse return error.MimoDraftRead;
-                    x.* = ptr[0];
-                }
+                // Each draft is a u32 [1] the eval above materialized.
+                for (dev[0..k], ids[1 .. k + 1]) |d, *x| x.* = mlx.mlx_array_data_uint32(d).?[0];
             }
             tt = mp.charge(.draft_host, tt);
         }

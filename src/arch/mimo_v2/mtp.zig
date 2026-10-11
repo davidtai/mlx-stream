@@ -456,11 +456,7 @@ pub const Heads = struct {
             }
         };
         const m = try verifySidecar(a, io, dir, c, Sink{ .h = &out });
-        for (&out.heads) |*h| for (m.storage, 0..) |st, p| {
-            const q = h.projection(@fromBackingInt(@intCast(p)));
-            q.storage = st;
-            if (st.fp8) try q.installFp8(fp8 orelse return error.MimoFp8RouteUnbound);
-        };
+        for (&out.heads) |*h| for (m.storage, 0..) |st, p| try h.projection(@fromBackingInt(@intCast(p))).bindStorage(st, fp8);
         out.payload_bytes = m.payload_bytes;
         return out;
     }

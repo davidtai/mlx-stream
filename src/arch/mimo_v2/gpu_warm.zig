@@ -20,6 +20,10 @@ const mlx = @import("sdk").mlx;
 
 const log = std.log.scoped(.mimo);
 
+/// The warm engine's counters (`Stats`) are written in profile and test builds only: their readers are the MTP profile's
+/// `MIMO_GPU_WARM` line and the CPU proofs. A served build's warm thread keeps only its working state.
+const counting = @import("profile.zig").enabled or builtin.is_test;
+
 /// `off`: nothing. `waits`: warm while a committed gated wait (decode miss parts, prompt group reads) is below the
 /// stream's event, and while the host waits on a read-ahead (`StreamSource.awaitReadAhead`).
 pub const Route = enum {
@@ -145,8 +149,8 @@ pub const Metal = struct {
 };
 
 /// The warm engine's counters (process-wide; the profile prints a request's difference). Written by the warm thread
-/// (episodes, chunks, retired, stuck, GPU time, the current iterations) and nowhere else: the decode lane's arm adds no
-/// counter.
+/// (episodes, chunks, retired, stuck, GPU time, the current iterations) in profile and test builds only (`counting`),
+/// and nowhere else: the decode lane's arm adds no counter. `failed` is the engine's own state, in every build.
 pub const Stats = struct {
     episodes: u64 = 0,
     chunks: u64 = 0,
@@ -212,7 +216,7 @@ pub fn Engine(comptime B: type) type {
             const self = try a.create(Self);
             errdefer a.destroy(self);
             self.* = .{ .a = a, .backend = backend, .params = params, .iters = params.first_iters };
-            self.cur_iters.store(params.first_iters, .monotonic);
+            if (comptime counting) self.cur_iters.store(params.first_iters, .monotonic);
             self.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, main, .{self});
             return self;
         }
@@ -294,7 +298,7 @@ pub fn Engine(comptime B: type) type {
         /// One episode: chunks while the event is below the newest target. The event is read before every commit, so
         /// after the bytes land at most the chunks already in flight run on.
         fn warm(self: *Self) void {
-            _ = self.n_episodes.fetchAdd(1, .monotonic);
+            if (comptime counting) _ = self.n_episodes.fetchAdd(1, .monotonic);
             var seen = self.backend.eventValue();
             var moved = nowNs();
             while (true) {
@@ -312,7 +316,7 @@ pub fn Engine(comptime B: type) type {
                     moved = now;
                 } else if (now -| moved > self.params.stuck_ns) {
                     self.stuck_at = t;
-                    _ = self.n_stuck.fetchAdd(1, .monotonic);
+                    if (comptime counting) _ = self.n_stuck.fetchAdd(1, .monotonic);
                     return;
                 }
                 if (self.ring_n == max_inflight) {
@@ -325,7 +329,7 @@ pub fn Engine(comptime B: type) type {
                 self.ring[slot] = ch;
                 self.ring_iters[slot] = self.iters;
                 self.ring_n += 1;
-                _ = self.n_chunks.fetchAdd(1, .monotonic);
+                if (comptime counting) _ = self.n_chunks.fetchAdd(1, .monotonic);
             }
         }
 
@@ -335,10 +339,12 @@ pub fn Engine(comptime B: type) type {
             self.ring_head = (self.ring_head + 1) % max_inflight;
             self.ring_n -= 1;
             const ns = try self.backend.retire(ch);
-            _ = self.n_retired.fetchAdd(1, .monotonic);
+            if (comptime counting) _ = self.n_retired.fetchAdd(1, .monotonic);
             if (ns == 0) return;
-            _ = self.gpu_ns.fetchAdd(ns, .monotonic);
-            self.last_ns.store(ns, .monotonic);
+            if (comptime counting) {
+                _ = self.gpu_ns.fetchAdd(ns, .monotonic);
+                self.last_ns.store(ns, .monotonic);
+            }
             self.adapt(iters, ns);
         }
 
@@ -348,7 +354,7 @@ pub fn Engine(comptime B: type) type {
             if (ns * 5 >= target * 4 and ns * 4 <= target * 5) return;
             const next = @as(u128, iters) * target / ns;
             self.iters = @intCast(std.math.clamp(next, min_iters, max_iters));
-            self.cur_iters.store(self.iters, .monotonic);
+            if (comptime counting) self.cur_iters.store(self.iters, .monotonic);
         }
 
         fn drain(self: *Self) void {

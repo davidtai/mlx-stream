@@ -326,7 +326,7 @@ pub const StreamSource = struct {
     }
 
     /// `early`: a hot-ordered prompt call's first group plans the whole call (`Stream.planCall`); its groups then route
-    /// in order (`Stream.activateP7`). Any other route (a decode-lane call, a construction check) is the stock route.
+    /// in order (`Stream.activateP7`). Any other route (a decode-lane call, a parity check) is the stock route.
     fn routeEarly(self: *StreamSource, rel: u32, ids: []const u16, scores: []const f32) Error!*Route {
         const st = self.stream;
         if (st.phase == .prefill) {

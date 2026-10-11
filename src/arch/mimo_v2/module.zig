@@ -270,7 +270,7 @@ pub const Module = struct {
         // reset releases arrays while retaining these prebound helpers.
         errdefer for (&self.caches) |*cache| cache.deinit();
         for (&self.caches, c.layer_types) |*cache, mode| cache.* = try Cache.install(config.kv_mode, mode, c, rollback, s);
-        // P1: the predictor follows the source's installed wide route (its self-check already passed in Source.initWith).
+        // P1: the predictor follows the source's installed wide route.
         const read_ahead = source.ex.at(source.bank.geometry.first_moe_layer).readAhead();
         self.read_ahead = installReadAhead(read_ahead, config.prefill_predict_evals == .one);
         log.info("MiMo prefill_scratch={s} prefill_predict_evals={s}", .{ @tagName(config.prefill_scratch), @tagName(config.prefill_predict_evals) });
@@ -886,9 +886,12 @@ pub const QLinear = struct {
     /// (`w` BF16 [out, in], no scales or biases), or the release's FP8 (`w` U8 e4m3 codes [out, in], `scales` the f32
     /// block scales [out / 64, in / 128], no biases).
     storage: mimo.Storage = .{},
-    /// The installed route, fixed at construction: the storage's stock call (the BF16 and affine tiers, the control) or,
-    /// for FP8 storage, `forwardFp8` bound to `fp8` (fp8_linear.zig). No per-call storage branch.
-    run: *const fn (*const QLinear, Array, Stream) anyerror!Array = forwardStock,
+    /// The installed route, fixed at construction (`bindStorage`): the storage's stock call (`forwardDense` on the BF16
+    /// tier, `forwardAffine` on the affine tiers: the controls) or, for FP8 storage, `forwardFp8` bound to `fp8`
+    /// (fp8_linear.zig). No per-call storage branch.
+    run: *const fn (*const QLinear, Array, Stream) anyerror!Array = forwardAffine,
+    /// The row lookup (the embedding's), bound with `run` from the storage: `lookupDense` or `lookupAffine`.
+    take_rows: *const fn (*const QLinear, Array, Stream) anyerror!Array = lookupAffine,
     fp8: fp8_linear.Bound = .{},
     fn load(weights: *host.Weights, prefix: []const u8, input: u32, output: u32, st: mimo.Storage, fp8: ?*const fp8_linear.Kernels) !QLinear {
         var buf: [192]u8 = undefined;
@@ -896,18 +899,30 @@ pub const QLinear = struct {
             // The scales' exact grid is part of the shape check: a wrong grid refuses here, by name.
             const w = try weight(weights, try std.fmt.bufPrint(&buf, "{s}.weight", .{prefix}), &.{ @intCast(output), @intCast(input) }, .uint8);
             const sc = try weight(weights, try std.fmt.bufPrint(&buf, "{s}.weight_scale_inv", .{prefix}), &.{ @intCast(output / mimo.fp8_scale_rows), @intCast(input / mimo.fp8_scale_cols) }, .float32);
-            var q: QLinear = .{ .w = w, .scales = sc, .biases = .{}, .storage = st };
-            try q.installFp8(fp8 orelse return error.MimoFp8RouteUnbound);
+            var q: QLinear = .{ .w = w, .scales = sc, .biases = .{} };
+            try q.bindStorage(st, fp8);
             return q;
         }
         if (st.dense()) {
             const w = try weight(weights, try std.fmt.bufPrint(&buf, "{s}.weight", .{prefix}), &.{ @intCast(output), @intCast(input) }, .bfloat16);
-            return .{ .w = w, .scales = .{}, .biases = .{}, .storage = st };
+            var q: QLinear = .{ .w = w, .scales = .{}, .biases = .{} };
+            try q.bindStorage(st, fp8);
+            return q;
         }
         const w = try weight(weights, try std.fmt.bufPrint(&buf, "{s}.weight", .{prefix}), &.{ @intCast(output), @intCast(input * st.bits / 32) }, .uint32);
         const sc = try weight(weights, try std.fmt.bufPrint(&buf, "{s}.scales", .{prefix}), &.{ @intCast(output), @intCast(input / st.group) }, .bfloat16);
         const bi = try weight(weights, try std.fmt.bufPrint(&buf, "{s}.biases", .{prefix}), &.{ @intCast(output), @intCast(input / st.group) }, .bfloat16);
-        return .{ .w = w, .scales = sc, .biases = bi, .storage = st };
+        var q: QLinear = .{ .w = w, .scales = sc, .biases = bi };
+        try q.bindStorage(st, fp8);
+        return q;
+    }
+    /// Construction only (`load`, the MTP heads' `Heads.load`): the storage and its route, bound once. FP8 binds
+    /// `forwardFp8` (`installFp8`); BF16 `forwardDense` / `lookupDense`; affine `forwardAffine` / `lookupAffine`.
+    pub fn bindStorage(q: *QLinear, st: mimo.Storage, fp8: ?*const fp8_linear.Kernels) !void {
+        q.storage = st;
+        q.run = if (st.dense()) forwardDense else forwardAffine;
+        q.take_rows = if (st.dense()) lookupDense else lookupAffine;
+        if (st.fp8) try q.installFp8(fp8 orelse return error.MimoFp8RouteUnbound);
     }
     /// fp8res, construction only: bind the FP8 route to this projection's codes U8 [out, in] and f32 block scales
     /// [out / 64, in / 128] as loaded (the trunk's QLinear.load, the MTP heads' load); a shape the route's texts do not
@@ -931,23 +946,31 @@ pub const QLinear = struct {
     fn forwardFp8(q: *const QLinear, x: Array, s: Stream) anyerror!Array {
         return fp8_linear.forward(&q.fp8, x, q.w, q.scales, s);
     }
-    /// The stock route (x [.., in] -> [.., out]): dense BF16 matmul against w's transposed view, or the affine quantized
-    /// matmul at the pack's bits/group.
-    fn forwardStock(q: *const QLinear, x: Array, s: Stream) anyerror!Array {
+    /// The BF16 tier's stock route (x [.., in] -> [.., out]): the dense matmul against w's transposed view.
+    fn forwardDense(q: *const QLinear, x: Array, s: Stream) anyerror!Array {
         var out: Array = .{};
         errdefer drop(out);
-        if (q.storage.dense()) {
-            var wt: Array = .{};
-            defer drop(wt);
-            try mlx.check(mlx.mlx_transpose(&wt, q.w, s));
-            try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
-            return out;
-        }
+        var wt: Array = .{};
+        defer drop(wt);
+        try mlx.check(mlx.mlx_transpose(&wt, q.w, s));
+        try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
+        return out;
+    }
+    /// The affine tiers' stock route: the quantized matmul at the pack's bits/group.
+    fn forwardAffine(q: *const QLinear, x: Array, s: Stream) anyerror!Array {
+        var out: Array = .{};
+        errdefer drop(out);
         try mlx.check(mlx.mlx_quantized_matmul(&out, x, q.w, q.scales, q.biases, true, .some(q.storage.group), .some(q.storage.bits), "affine", s));
         return out;
     }
+    /// The rows `ids` of the table (the embedding) through the installed lookup.
     pub fn lookup(q: QLinear, ids: Array, s: Stream) !Array {
-        if (q.storage.dense()) return take(q.w, ids, s);
+        return q.take_rows(&q, ids, s);
+    }
+    fn lookupDense(q: *const QLinear, ids: Array, s: Stream) anyerror!Array {
+        return take(q.w, ids, s);
+    }
+    fn lookupAffine(q: *const QLinear, ids: Array, s: Stream) anyerror!Array {
         const w = try take(q.w, ids, s);
         defer drop(w);
         const sc = try take(q.scales, ids, s);
@@ -1320,7 +1343,7 @@ const Cache = struct {
     fn install(precision: settings.KVMode, mode: mimo.Attention, c: mimo.Config, retain_rows: u32, s: Stream) !Cache {
         var out: Cache = switch (precision) {
             .q8 => .{ .allocate_impl = allocateQ8, .update_impl = if (mode == .full) updateQ8Full else updateQ8Sliding, .deinit_impl = deinitQ8, .reset_impl = deinitQ8, .trim_impl = trimQ8 },
-            .bf16 => if (mode == .sliding) try installRing(c.swa_n_kv_heads, c.head_dim, c.value_head_dim, c.window, s) else .{},
+            .bf16 => if (mode == .sliding) try installRing(c.swa_n_kv_heads, c.head_dim, c.value_head_dim, c.window, s) else .{ .update_impl = updateBF16Full },
             .invalid => unreachable, // plan validates before array construction.
         };
         out.quantized_cache.retain = retain_rows;
@@ -1336,7 +1359,7 @@ const Cache = struct {
         try c.ring.trimBy(n);
     }
     fn trimQ8(c: *Cache, n: u32, _: Stream) anyerror!void {
-        try c.quantized_cache.trim(n);
+        c.quantized_cache.trim(n);
     }
     fn installRing(heads: u32, kd: u32, vd: u32, window: u32, s: Stream) !Cache {
         return .{ .ring = try kv_storage.SlidingRing.allocate(heads, kd, vd, window, s), .update_impl = updateRing, .deinit_impl = deinitRing, .reset_impl = resetRing, .trim_impl = trimRing };
@@ -1389,21 +1412,25 @@ const Cache = struct {
         const view = try c.quantized_cache.updateSliding(k, v, pos, n, window, s);
         return .{ .k = view.k, .v = view.v };
     }
-    // Qualified BF16 cache arithmetic remains the explicit control route.
+    /// A full layer's BF16 slab (`install`'s full route): written by position into the reserved capacity, viewed to
+    /// `pos + n`.
+    fn updateBF16Full(c: *Cache, k: Array, v: Array, pos: u64, n: u32, _: mimo.Attention, _: u32, s: Stream) !Cache {
+        const nk = try update4(c.k, k, @intCast(pos), s);
+        errdefer drop(nk);
+        const nv = try update4(c.v, v, @intCast(pos), s);
+        errdefer drop(nv);
+        const kv = try sliceTime(nk, 0, @intCast(pos + n), s);
+        errdefer drop(kv);
+        const vv = try sliceTime(nv, 0, @intCast(pos + n), s);
+        c.deinit();
+        c.k = nk;
+        c.v = nv;
+        return .{ .k = kv, .v = vv };
+    }
+    /// A bare `Cache{}`'s update (the tests' layers of either kind; installed layers bind theirs): the full slab, or the
+    /// retired sliding join + compact the ring replaced (the ring tests' reference).
     fn updateBF16(c: *Cache, k: Array, v: Array, pos: u64, n: u32, mode: mimo.Attention, window: u32, s: Stream) !Cache {
-        if (mode == .full) {
-            const nk = try update4(c.k, k, @intCast(pos), s);
-            errdefer drop(nk);
-            const nv = try update4(c.v, v, @intCast(pos), s);
-            errdefer drop(nv);
-            const kv = try sliceTime(nk, 0, @intCast(pos + n), s);
-            errdefer drop(kv);
-            const vv = try sliceTime(nv, 0, @intCast(pos + n), s);
-            c.deinit();
-            c.k = nk;
-            c.v = nv;
-            return .{ .k = kv, .v = vv };
-        }
+        if (mode == .full) return updateBF16Full(c, k, v, pos, n, mode, window, s);
         var all: Cache = .{};
         errdefer all.deinit();
         if (pos == 0) {
@@ -1527,7 +1554,7 @@ fn predictCountsOneEval(x: Array, r: Router, post_norm: Array, norm_ones: Array,
     start = 0;
     for (ids[0..tiles]) |t| {
         const end = @min(n, start + @as(c_int, source_mod.predict_rows));
-        const got = try readIds(t, scratch[0 .. @as(usize, @intCast(end - start)) * source_mod.top_k]);
+        const got = readIds(t, scratch[0 .. @as(usize, @intCast(end - start)) * source_mod.top_k]);
         for (got) |e| counts[e] += 1;
         start = end;
     }
@@ -1550,11 +1577,12 @@ fn predictGraph(x: Array, r: Router, post_norm: Array, norm_ones: Array, eps: f3
     return routes.ids;
 }
 
-/// An evaluated tile's ids copied into `out`.
-fn readIds(ids: Array, out: []u32) ![]const u32 {
-    const data = mlx.mlx_array_data_uint32(ids) orelse return error.MimoNumericalData;
+/// An evaluated tile's ids copied into `out`. The graph (`predictGraph`: u32 [rows, top_k], evaluated by the caller) and
+/// `out` (rows x top_k) agree by construction: an invariant of the callers, held by the tests.
+fn readIds(ids: Array, out: []u32) []const u32 {
+    if (std.debug.runtime_safety) std.debug.assert(mlx.mlx_array_size(ids) == out.len);
+    const data = mlx.mlx_array_data_uint32(ids).?;
     const nd = mlx.mlx_array_ndim(ids);
-    if (mlx.mlx_array_size(ids) != out.len) return error.MimoPredictorShape;
     // The top-k ids are a strided view of the partition: read through its strides (as `checkRouting` does).
     @import("../deepseek_v41/ops.zig").copyStrided(u32, u32, data, mlx.getShape(ids), mlx.mlx_array_strides(ids)[0..nd], out);
     return out;
@@ -2354,6 +2382,9 @@ test "mlx-stream GPU: actual-shape complete layers and bounded peak" {
         gates[1] = .{ .w = routed.mlp.routed.weight_t_f32, .bias = routed.mlp.routed.bias };
         const source = try source_mod.Source.initFixtureBank(a, try fixtureBank(a, std.testing.io, tmp.dir, path, geometry), &.{1}, gates, s);
         defer source.deinit();
+        // The verification harness's gated == waited check (no served construction runs it), then the residency forgotten.
+        try source.ex.checkGatesAt(&source.g, a, source_mod.top_k, geometry.first_moe_layer);
+        try source.beginPrefill();
         var ones: Array = .{};
         defer drop(ones);
         try mlx.check(mlx.mlx_ones(&ones, &.{4096}, 1, .bfloat16, s));
@@ -3650,14 +3681,14 @@ test "mimo fp8res route: QLinear.load binds forwardFp8 for FP8 storage, keeps th
     defer drop(wrong_grid);
     var bad: QLinear = .{ .w = q.w, .scales = wrong_grid, .biases = .{}, .storage = st };
     try std.testing.expectError(error.MimoResidentShape, bad.installFp8(&kernels));
-    try std.testing.expect(bad.run == &QLinear.forwardStock);
+    try std.testing.expect(bad.run == &QLinear.forwardAffine);
     bad = .{ .w = weights.get("bf16.weight").?, .scales = q.scales, .biases = .{}, .storage = st };
     try std.testing.expectError(error.MimoResidentShape, bad.installFp8(&kernels));
     // The control tiers: the BF16 tensor under BF16 storage keeps the stock route, unbound.
     const dense = try QLinear.load(&weights, "bf16", 256, 128, mimo.Storage.bf16, &kernels);
-    try std.testing.expect(dense.run == &QLinear.forwardStock and dense.fp8.kernels == null);
+    try std.testing.expect(dense.run == &QLinear.forwardDense and dense.take_rows == &QLinear.lookupDense and dense.fp8.kernels == null);
     const literal: QLinear = .{ .w = .{}, .scales = .{}, .biases = .{} };
-    try std.testing.expect(literal.run == &QLinear.forwardStock);
+    try std.testing.expect(literal.run == &QLinear.forwardAffine and literal.take_rows == &QLinear.lookupAffine);
 }
 
 /// Aperiodic BF16 values in [-amp, amp) (xorshift; no period a misplaced row could hide behind), any shape.

@@ -153,15 +153,14 @@ pub const Kernels = struct {
     /// The prompt route's BF16 weights (owned by `install`; null in host fixtures, which never run a prompt row).
     prompt: ?*PromptCache = null,
     /// R2 (rows audit): the decode phase after the growth bills no prompt cache (`settings.decodeClosesPromptRoute`):
-    /// the module closes the route there (`closePrompt`) and opens it at every prompt pass (`openPrompt`). A prompt-route
-    /// call while closed is refused by name (`promptRun`), never served from unbilled memory.
+    /// the module closes the route there (`closePrompt`) and opens it at every prompt pass (`openPrompt`). No caller makes
+    /// a prompt-route call while closed (`promptRun`'s debug assert; the tests hold it).
     prompt_closed: bool = false,
     /// X18 (mimo/dequant-audit): the GEMV's plan per call width, fixed at install (`settings.fp8_gemv_plan`); `bind`
     /// reads it once per projection (`Bound.plans`).
     gemv_route: GemvRoute = .by_rows,
 
     pub fn init() !Kernels {
-        try checkPins();
         var k: Kernels = .{};
         errdefer k.deinit();
         k.gemv = try makeKernel("mimo_fp8_gemv", texts.gemv, texts.header);
@@ -1263,7 +1262,7 @@ fn rowsOf(x: Array, m: c_int, s: Stream) !Array {
     return out;
 }
 
-/// The BF16 tier's stock route (module.zig QLinear `forwardStock`, dense): x @ wb^T.
+/// The BF16 tier's stock route (module.zig QLinear `forwardDense`): x @ wb^T.
 fn bf16Path(x: Array, wb: Array, s: Stream) !Array {
     var wt: Array = .{};
     defer drop(wt);

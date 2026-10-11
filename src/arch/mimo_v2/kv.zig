@@ -197,9 +197,10 @@ pub const Cache = struct {
     retain: u32 = 0,
 
     /// Drop the newest `n` rows (the rejected verify rows). The packed arrays keep them until the next update
-    /// overwrites (full) or compacts past them (sliding); every view reads `rows`.
-    pub fn trim(c: *Cache, n: u32) !void {
-        if (n > c.rows) return error.MimoTrimRange;
+    /// overwrites (full) or compacts past them (sliding); every view reads `rows`. The depth is the round's, bounded once
+    /// per round by `Module.trim`; a sliding cache retains `retain` (the lane's rollback rows) past its window.
+    pub fn trim(c: *Cache, n: u32) void {
+        std.debug.assert(n <= c.rows);
         c.rows -= n;
     }
     // ---- end mimo/mtp rollback ----
@@ -497,13 +498,12 @@ pub const SlidingRing = struct {
         r.v.truncateToLength(0) catch unreachable;
     }
 
-    /// Draft-lane rollback entry (unused until the draft lane lands): drop the
-    /// newest `n` rows under the SDK ring's rule that the next query's whole
-    /// window stays resident.
+    /// The draft lane's rollback (`Module.trim`, which bounds `n` by the position once per round): drop the newest `n`
+    /// rows under the SDK ring's rule that the next query's whole window stays resident (its `truncateToLength` refuses
+    /// a deeper rollback by name, `RingRollbackTooDeep`).
     pub fn trimBy(r: *SlidingRing, n: u32) !void {
         const len = r.k.logicalLen();
-        if (n > len) return error.TrimPastStart;
-        if (!r.k.canTruncateToLength(len - n)) return error.RingRollbackTooDeep;
+        std.debug.assert(n <= len);
         try r.k.truncateToLength(len - n);
         try r.v.truncateToLength(len - n);
     }
@@ -681,7 +681,7 @@ test "mimo ring CPU: serial wrap matches the eager window at 127 128 129 655 656
     // 2176 serial rows compact every 512 after the first base: both slots used.
     try std.testing.expect(slot_address[0] != 0 and slot_address[1] != 0);
 
-    // Draft-lane rollback (unused entry): trim 1-4 rows and rewrite them.
+    // Draft-lane rollback: trim 1-4 rows and rewrite them.
     for ([_]u32{ 1, 2, 3, 4 }) |n| {
         try ring.trimBy(n);
         try std.testing.expectEqual(total - n, ring.position());

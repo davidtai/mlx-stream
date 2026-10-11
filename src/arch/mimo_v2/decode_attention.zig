@@ -12,9 +12,10 @@
 //!
 //! Rounding-class against MLX SDPA (f32 MMA accumulation, exp2 online softmax). The tier is a construction-time route
 //! (`Tier`): `.kernels` (the served default at every served context) or `.stock` (the control), by settings.
-//! Construction proves the pins and the geometry once; the installed routes branch only on M and the key count, both
-//! runtime values. No key count bounds the texts (`keyRangeInvariants`): keys are `int`, row offsets `long`, the split
-//! count is fixed (32 for 4 KV heads) and each split's key slice only lengthens its loop; no buffer is sized by keys.
+//! Construction proves the geometry once (the texts' pins are build-time facts the CPU suite holds); the installed
+//! routes branch only on M and the key count, both runtime values. No key count bounds the texts
+//! (`keyRangeInvariants`): keys are `int`, row offsets `long`, the split count is fixed (32 for 4 KV heads) and each
+//! split's key slice only lengthens its loop; no buffer is sized by keys.
 //! The device self-check (`mimo GPU decode attention ...`, env + lock gated) runs in the pre-ship gate, never at
 //! construction.
 const std = @import("std");
@@ -135,7 +136,6 @@ pub const Kernels = struct {
 
     pub fn init(c: mimo.Config) !Kernels {
         try requireGeometry(c);
-        try checkPins();
         var k: Kernels = .{};
         errdefer k.deinit();
         k.split = try makeKernel("msv_dec_attn_split", &.{ "q", "k", "v", "scl" }, &.{ "pacc", "pm", "pl" }, texts.split, texts.header);

@@ -86,7 +86,6 @@ pub const Kernels = struct {
 
     pub fn init(c: mimo.Config) !Kernels {
         try requireGeometry(c);
-        try checkPins();
         var k: Kernels = .{};
         errdefer k.deinit();
         k.norm = try makeKernel("mimo_glue_norm", &.{ "x", "w" }, &.{"n"}, texts.norm);
@@ -129,7 +128,6 @@ pub const RouterRows = struct {
     /// Construction: the text is written for hidden 4096 and 256 experts (refused otherwise).
     pub fn init(hidden_size: u64, n_experts: u64) !RouterRows {
         if (hidden_size != hidden or n_experts != experts) return error.MimoGlueGeometry;
-        try checkPins();
         var r: RouterRows = .{};
         errdefer r.deinit();
         r.kernel = try makeKernel("mimo_glue_router_rows", &.{ "x", "gate" }, &.{"logits"}, texts.router_rows);
