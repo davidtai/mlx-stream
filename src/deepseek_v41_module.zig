@@ -1482,16 +1482,12 @@ pub const Module = struct {
     fn reportPrompt(self: *Module) void {
         const s0 = self.prompt_stats0 orelse return;
         self.prompt_stats0 = null;
-        const s1 = self.streamStats();
-        log.info("NATIVE prefill stream: {d} prompt tokens, read {d} B in {d} preadv, {d} misses, {d} routes\n", .{
-            self.prompt_tokens, s1.expert_bytes_read - s0.expert_bytes_read, s1.preadv_calls - s0.preadv_calls, s1.expert_cache_misses - s0.expert_cache_misses, s1.route_calls - s0.route_calls,
-        });
+        const d = self.streamStats().since(s0);
+        log.info("NATIVE prefill stream: {d} prompt tokens, read {d} B in {d} preadv, {d} misses, {d} routes\n", .{ self.prompt_tokens, d.expert_bytes_read, d.preadv_calls, d.expert_cache_misses, d.route_calls });
         const ahead = switch (self.arm) {
             inline else => |t| t.arm.hook.wide_route.read_ahead,
         };
-        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead\n", .{
-            s1.ahead_posted - s0.ahead_posted, s1.ahead_hits - s0.ahead_hits, s1.ahead_demand - s0.ahead_demand, s1.ahead_bytes - s0.ahead_bytes,
-        });
+        if (ahead) log.info("NATIVE prefill read-ahead: {d} records posted, {d} hits at the barriers, {d} seed records on demand, {d} B read ahead\n", .{ d.ahead_posted, d.ahead_hits, d.ahead_demand, d.ahead_bytes });
     }
 
     /// Positions a request's bounded lanes hold: its reservation (else the prompt plus the shell's
