@@ -26,6 +26,7 @@ const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const log = @import("sdk").log;
 const sdk_ext = @import("sdk_ext.zig");
+const builtin = @import("builtin");
 const quant = sdk_ext.quant;
 const expert_event = sdk_ext.expert.event;
 const expert_routes = sdk_ext.expert.routes;

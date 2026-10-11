@@ -728,7 +728,7 @@ test "expert policy: tally: ratio 0 plans exactly as no tally; a request's end g
     var q = try LayerPolicy.init(a, 32, 5);
     defer q.deinit(a);
     p.setTally(tally.pinLimit(0, 32), tally.alphaOf(32));
-    var half: [32]f32 = @splat(0.5);
+    const half: [32]f32 = @splat(0.5);
     p.seedTally(&half);
     var rng = std.Random.DefaultPrng.init(7);
     const r = rng.random();
