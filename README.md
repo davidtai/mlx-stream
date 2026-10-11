@@ -157,6 +157,20 @@ MLA; the lightning indexer on 21 layers) from a pack that `scripts/convert_glm_b
 The experts stream from the pack's affine bank through the same stream, read pool, residency policy, lookahead and
 event gates as DeepSeek-V4.1; the expert math is MLX's own `gather_qmm`.
 
+The construction fills each bank layer's prompt rows from the bank before the first request, in expert order (a long
+prompt routes nearly every expert). A later request keeps the residents that the previous request left in these rows, so
+a prompt reads only the experts that its layers do not hold. The prompt pass runs layer by layer, in calls of 16,384
+rows (a last call of fewer than 2,048 rows joins the call before it). In a call of at least 8 rows per expert, the
+layer's misses are read at the layer's start, before its attention, into the transient rows. Each call runs its
+residents first, then its misses, and reads each routed expert at most once. The host builds the graph of each group of
+experts while the GPU runs the group before it. When a group is done, the call's hottest experts that it read into
+transient rows are copied into resident rows (the rows the residency policy gives them), so that a layer keeps its
+call's hottest experts for the decode and the next prompt. With the EXL3 bank, the host also builds the routing table of
+each prompt slice for sushi's prefill GEMM, so that the GPU does not wait for the host. On a GPU with the tensor units
+(M5), the prompt's attention runs on mlx-serve's DSA kernels (`src/dsa_nax.zig`): the indexer's scores, each row's top
+2,048 keys kept as ids, and the latent attention over exactly those keys (the reference's one-row form), in spans whose
+own arrays stay under 2 GiB. Elsewhere, and on the CPU, it runs the reference's masked prompt form.
+
 Supported pack: a directory whose `config.json` has `"model_type": "glm_moe_dsa"` and GLM-5.3's dims, with:
 
 | file | content |
@@ -198,7 +212,7 @@ Settings (`model-settings.json`):
 | `numeric_tier` | `stock` (the reference's op chain) | `stock` |
 | `expert_event_gates` | the GPU waits on the reads' events (`true`) or the host waits (`false`) | `true` |
 | `layer_major_prefill` | the prompt layer by layer (`true`) or chunk by chunk (`false`) | `true` |
-| `expert_wide_depth` | prompt expert groups read ahead per layer, 1 to 5 | 2 |
+| `expert_wide_depth` | prompt expert groups read ahead per layer, 1 to 5 | 5 |
 | `mtp_depth` | the MTP draft lane's drafts per round, 0 to 5 (6 or more is refused at load) | 0 (off) |
 | `mtp_acceptance` | `exact` or `typical` | `exact` |
 | `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |
@@ -213,8 +227,9 @@ position (the 512 latent and 64 rope values on every layer, the 128-value indexe
 The KV lanes hold only the current phase's positions: the prompt's during its pass, and from the decode handover the
 request's own prompt and `max_tokens`. The bill also charges the residents (from the shard headers), the prompt and
 decode transients, decode's transient window (the routed ids of the widest decode call: 8 rows serial, 8 per verify
-row with the MTP lane), the MLX cache limits (2 GiB in the prompt pass, 512 MiB in decode, each plus one freed
-buffer), the read pool's staging and the host side (the footprint outside MLX, 1.5 GB, measured on the box).
+row with the MTP lane), the MLX cache (in the prompt pass what it holds at the pass's peak, 2 GiB, under its 16 GiB
+limit; in decode its 512 MiB limit plus one freed buffer), the read pool's staging and the host side (the footprint
+outside MLX, 1.5 GB, measured on the box).
 
 The construction admits both phases of the longest request (the billed context and `max_output` generated tokens)
 under the box's target and fills the prompt rows to it. The box's target is the RAM less a 16 GiB OS reserve (the
@@ -227,7 +242,8 @@ request's own KV and that reading both keep under the box's target, with MLX's b
 the box is read again at each handover, so a short request decodes with more rows than the longest one. Each handover
 logs one `glm_moe_dsa: handover` line with its readings and the rows; the construction logs one `glm_moe_dsa: bill`
 line with every term and checks its footprint against the bill's construction terms (`ConstructionOverBill`). The
-ceiling comes from the host only. The arch declares `max_output` to the host (`maxOutput`, SDK 2.1).
+ceiling comes from the host only. The arch declares `max_output` to the host (`maxOutput`, SDK 2.1). Past one
+prompt call the prompt's waves do not grow with the prompt.
 
 Each request logs one `glm_moe_dsa: prompt` line at the end of its prompt pass and one `glm_moe_dsa: decode` line at
 its end (the arch's `requestEnd`), with the phase's wall time, SSD bytes, records read, read-ahead or lookahead use,
@@ -240,8 +256,9 @@ A `glm_moe_dsa: lookahead precision` line gives, per top-k position of the candi
 with the EXL3 bank), the records read ahead and how many of them the next routed layer's call routed. With the EXL3
 bank, the prompt line also counts the prefill GEMM calls and the GPU drains.
 
-The residency policy forgets its residents and its prompt state at each prompt (`LayerPolicy.forgetAll` at the
-reverse phase change). The decode policy's transition counts and its window carry over from one request to the next.
+At each prompt the residency policy keeps the residents of the prompt rows and forgets its prompt state
+(`LayerPolicy.forgetPrompt` at the reverse phase change, `keep_residents`). The decode policy's transition counts and
+its window carry over from one request to the next.
 
 The MTP draft lane (`mtp_depth` > 0) runs the release's MTP layer (layer 78), which the MLX builds drop. The pack
 must have `mtp/` beside its shards, as `scripts/convert_glm_exl3_bank.py --mtp-only --from-pack <EXL3 pack>
@@ -265,8 +282,9 @@ the rounds' tokens against the serial decode, and both KV states after the round
 
 Not available for GLM-5.3:
 
-- a tier other than `stock`, and the pinned Metal kernels (the trunk runs on MLX's own ops);
-- a prompt over 16,384 tokens reads each routed layer's experts once per 16,384-token chunk, not once per prompt.
+- a tier other than `stock`, and the pinned Metal kernels (the trunk runs on MLX's own ops, the prompt's attention on
+  mlx-serve's DSA kernels, the routed combine on one kernel of its own);
+- a prompt over 18,431 tokens reads each routed layer's experts once per call of 16,384 rows, not once per prompt.
 
 `src/glm_moe_dsa_parity.zig` checks the arch against the reference `glm_moe_dsa.py` on a tiny model of the arch:
 `scripts/glm_moe_dsa_goldens.py` builds it, converts it with the converter and writes the reference's logits beside

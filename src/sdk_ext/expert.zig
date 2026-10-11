@@ -130,6 +130,9 @@ pub const Stats = struct {
     ahead_hits: u64 = 0,
     ahead_demand: u64 = 0,
     ahead_bytes: u64 = 0,
+    /// Prompt records copied from a transient row into a resident's row (`Stream.promote`) and their bytes.
+    promoted: u64 = 0,
+    promoted_bytes: u64 = 0,
 };
 
 /// One layer's routes so far, every phase: the unique experts per route that were resident / had to be loaded.

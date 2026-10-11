@@ -3,7 +3,8 @@
 //! A routed (token, expert) pair is one sushi row: the expert's `tp` minis (slot x tp + rank) at score 1, the
 //! router's score being the arch's combine. Sushi's chain fuses gate, up and down, so the decode lane hands a wave
 //! over once all its segments landed (`fused`, in place of `gateUp` / `down`, which refuse); a wave of any width runs
-//! the decode chain. The prompt's slices run sushi's prefill GEMM past its decode rows (`prefill`).
+//! the decode chain. The prompt's slices run sushi's prefill GEMM past its decode rows (`prefill`) with its routing table
+//! built from the slots the host holds: on the tensor units here (`prefillTabled`), elsewhere sushi's `moePrefillHost`.
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -49,12 +50,25 @@ pub fn Accepted(comptime G: type) type {
         a: Allocator,
         tp: u32,
         spec: quant.Spec,
-        /// The prompt's prefill GEMM calls (slices past sushi's decode rows), each over host-known slots.
+        /// The prompt's prefill GEMM calls through sushi's `moePrefillHost` (slices past sushi's decode rows that
+        /// `prefillTabled` does not serve: a device without the tensor units), each over host-known slots.
         prefill_gemm_calls: u64 = 0,
         /// Host scratch: each pair's minis, its x row, the scores.
         minis: std.ArrayList(u32) = .empty,
         src: std.ArrayList(u32) = .empty,
         ones: std.ArrayList(f32) = .empty,
+        /// `prefillTabled`'s scratch: the rows by mini, each row's x row (as the prepare reads it), the inverse, the
+        /// counting sort's counts, the windows.
+        sorted: std.ArrayList(u32) = .empty,
+        xrow: std.ArrayList(i32) = .empty,
+        inverse: std.ArrayList(u32) = .empty,
+        counts: std.ArrayList(u32) = .empty,
+        starts: std.ArrayList(u32) = .empty,
+        lives: std.ArrayList(u32) = .empty,
+        /// Sushi's NAX sorted GEMM (`PrefillGridSupport`), built at the first prompt slice on the GPU; null where the
+        /// device has no tensor units (sushi's `moePrefillHost` serves the slice).
+        gemm: ?mlx.mlx_fast_metal_kernel = null,
+        gemm_probed: bool = false,
 
         /// Each projection: trellis uint16 `[rows x tp, in/16, out/16, 16K]` at a K sushi decodes, suh float16
         /// `[rows x tp, in]`, svh float16 `[rows x tp, out]`.
@@ -92,6 +106,7 @@ pub fn Accepted(comptime G: type) type {
         pub fn prefill(self: *Self, g: *G, layer: u32, x: G.T, rows: quant.PrefillRows, bank: Bank) !G.T {
             _ = layer;
             const n = rows.slot.len;
+            if (n > sushi.kernels.DECODE_ROWS_MAX and self.tabledKernel(g) != null) return self.prefillTabled(g, x, rows, bank);
             try self.src.resize(self.a, n);
             for (self.src.items, 0..) |*s, i| s.* = if (rows.act_row) |ar| ar[i] else @intCast(i);
             const xs = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(self.src.items), &.{@intCast(n)}, .uint32), 0);
@@ -135,6 +150,128 @@ pub fn Accepted(comptime G: type) type {
             return .{ self.prefill_gemm_calls, sushi.kernels.prefill_drains };
         }
 
+        /// The window rows of sushi's sorted GEMM (`GEMM_WINDOW_ROWS`).
+        const gemm_window: u32 = 32;
+
+        /// Sushi's NAX sorted GEMM where this stream runs it (a GPU with tensor units), else null.
+        fn tabledKernel(self: *Self, g: *G) ?mlx.mlx_fast_metal_kernel {
+            if (self.gemm_probed) return self.gemm;
+            self.gemm_probed = true;
+            if (comptime !@hasField(G, "s")) return null;
+            if (!mlx.streamIsGpu(g.s) or !sushi.kernels.PrefillGridSupport.available()) return null;
+            const sup = sushi.kernels.PrefillGridSupport;
+            self.gemm = sup.makeKernel(sup.source, sushi.format.Decode.mcg.window) catch null;
+            return self.gemm;
+        }
+
+        /// One prompt slice through sushi's prefill GEMM (`moePrefill`'s chain: the pairs' rows through suh, the gate and
+        /// up GEMMs over each mini's run in windows of 32 rows, the middle, the down GEMM, each pair's minis reduced) with
+        /// its routing table built here from the slots: sushi's `moePrefill` reads its sorted slots back from the GPU to
+        /// build it (a sync per slice). The rows ordered by mini (a stable counting sort, as MLX's sort orders them),
+        /// each run of one mini cut in windows from its start, each row's x row read where it is (no gather), the
+        /// finish reading each pair's minis through the inverse order. The same kernels over the same rows: sushi's
+        /// output.
+        fn prefillTabled(self: *Self, g: *G, x: G.T, rows: quant.PrefillRows, bank: Bank) !G.T {
+            const a = self.a;
+            const n = rows.slot.len;
+            const tp: usize = self.tp;
+            const ns = n * tp;
+            const n_minis: usize = @intCast(mlx.getShape(bank.gate.trellis)[0]);
+            try self.minis.resize(a, ns);
+            try self.src.resize(a, ns);
+            for (rows.slot, 0..) |s, i| {
+                const xr: u32 = if (rows.act_row) |ar| ar[i] else @intCast(i);
+                for (0..tp) |r| {
+                    self.minis.items[i * tp + r] = s * self.tp + @as(u32, @intCast(r));
+                    // The prepare reads row `order / tp` of x.
+                    self.src.items[i * tp + r] = xr * self.tp + @as(u32, @intCast(r));
+                }
+            }
+            try self.counts.resize(a, n_minis + 1);
+            @memset(self.counts.items, 0);
+            for (self.minis.items) |m| self.counts.items[m + 1] += 1;
+            for (1..n_minis + 1) |i| self.counts.items[i] += self.counts.items[i - 1];
+            try self.sorted.resize(a, ns);
+            try self.xrow.resize(a, ns);
+            try self.inverse.resize(a, ns);
+            for (self.minis.items, self.src.items, 0..) |m, xr, j| {
+                const at = self.counts.items[m];
+                self.counts.items[m] += 1;
+                self.sorted.items[at] = m;
+                self.xrow.items[at] = @intCast(xr);
+                self.inverse.items[j] = at;
+            }
+            self.starts.clearRetainingCapacity();
+            self.lives.clearRetainingCapacity();
+            var p: usize = 0;
+            while (p < ns) {
+                var end = p + 1;
+                while (end < ns and self.sorted.items[end] == self.sorted.items[p]) end += 1;
+                var off = p;
+                while (off < end) : (off += gemm_window) {
+                    try self.starts.append(a, @intCast(off));
+                    try self.lives.append(a, @intCast(@min(gemm_window, end - off)));
+                }
+                p = end;
+            }
+            if (self.ones.items.len < ns) {
+                try self.ones.resize(a, ns);
+                @memset(self.ones.items, 1);
+            }
+            sushi.kernels.setDecodeParams(sushi.format.Decode.mcg);
+            const sup = sushi.kernels.PrefillGridSupport;
+            const nsc: c_int = @intCast(ns);
+            const nwin: c_int = @intCast(self.starts.items.len);
+            const h: c_int = @intCast(self.spec.hidden);
+            const mini: c_int = @intCast(self.spec.inter / self.tp);
+            const tc: c_int = @intCast(self.tp);
+            const sorted = try g.hostArray(std.mem.sliceAsBytes(self.sorted.items), &.{nsc}, .uint32);
+            const order = try g.hostArray(std.mem.sliceAsBytes(self.xrow.items), &.{nsc}, .int32);
+            const starts = try g.hostArray(std.mem.sliceAsBytes(self.starts.items), &.{nwin}, .uint32);
+            const lives = try g.hostArray(std.mem.sliceAsBytes(self.lives.items), &.{nwin}, .uint32);
+            const inverse = try g.hostArray(std.mem.sliceAsBytes(self.inverse.items), &.{nsc}, .uint32);
+            const minis = try g.hostArray(std.mem.sliceAsBytes(self.minis.items), &.{nsc}, .uint32);
+            const ones = try g.hostArray(std.mem.sliceAsBytes(self.ones.items[0..ns]), &.{nsc}, .float32);
+            const prep = try sup.prepare(g.s, x, bank.gate.suh, bank.up.suh, sorted, order, h, nsc, tc);
+            const pg = try g.adopt(prep[0]);
+            const pu = try g.adopt(prep[1]);
+            const gi = try self.gemmTabled(g, pg, bank.gate.trellis, sorted, starts, lives, nwin);
+            const ui = try self.gemmTabled(g, pu, bank.up.trellis, sorted, starts, lives, nwin);
+            const mid = try g.adopt(try sup.middle(g.s, gi, ui, bank.gate.svh, bank.up.svh, bank.down.suh, sorted, mini, nsc, 0));
+            const di = try self.gemmTabled(g, mid, bank.down.trellis, sorted, starts, lives, nwin);
+            return g.adopt(try sup.finish(g.s, di, inverse, bank.down.svh, minis, ones, h, @intCast(n), tc, .bfloat16));
+        }
+
+        /// `x [rows, in] @` each window's mini of `trellis` (`[minis, in/16, out/16, n]`): sushi's NAX sorted GEMM as its
+        /// prefill dispatches it (128 threads per 128 outputs of one window, f16 out).
+        fn gemmTabled(self: *Self, g: *G, x: G.T, trellis: G.T, eids: G.T, starts: G.T, lives: G.T, nwin: c_int) !G.T {
+            const xs = mlx.getShape(x);
+            const ts = mlx.getShape(trellis);
+            const out_dim: c_int = ts[2] * 16;
+            const rate = sushi.format.kFromPackedDim(@intCast(ts[3])) orelse return error.BadExl3Shape;
+            const cfg = mlx.mlx_fast_metal_kernel_config_new();
+            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ xs[0], out_dim }, 2, .float16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IDIM", xs[1]));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ODIM", out_dim));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WIN", @intCast(gemm_window)));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NHW", @intCast(rate.n)));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, out_dim, nwin, 1));
+            const inputs = [_]mlx.mlx_array{ x, trellis, eids, starts, lives };
+            const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+            defer _ = mlx.mlx_vector_array_free(iv);
+            var ov = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ov);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, self.gemm.?, iv, cfg, g.s));
+            var out = mlx.mlx_array_new();
+            mlx.check(mlx.mlx_vector_array_get(&out, ov, 0)) catch |e| {
+                _ = mlx.mlx_array_free(out);
+                return e;
+            };
+            return g.adopt(out);
+        }
+
         /// Nothing is left in flight (every call's graph is the caller's).
         pub fn finishPrefill(self: *Self, g: *G) !void {
             _ = .{ self, g };
@@ -142,9 +279,8 @@ pub fn Accepted(comptime G: type) type {
 
         pub fn deinit(self: *Self, g: *G) void {
             _ = g;
-            self.minis.deinit(self.a);
-            self.src.deinit(self.a);
-            self.ones.deinit(self.a);
+            if (self.gemm) |kern| _ = mlx.mlx_fast_metal_kernel_free(kern);
+            inline for (.{ &self.minis, &self.src, &self.ones, &self.sorted, &self.xrow, &self.inverse, &self.counts, &self.starts, &self.lives }) |l| l.deinit(self.a);
             self.a.destroy(self);
         }
     };
@@ -198,6 +334,229 @@ test "glm exl3 quant: claims the EXL3 bank's description and declines the affine
     narrow.inter = 256;
     try testing.expectError(error.DimsNotImplemented, accept(G, testing.allocator, undefined, .{ .peek = &p }, narrow, &diag));
     try testing.expectError(error.NoWeightDescription, accept(G, testing.allocator, undefined, .{}, spec, &diag));
+}
+
+test "glm exl3 quant: a wide prompt call with its misses staged at the layer's start (both bank layers) equals sushi's host decode, reads what the unstaged call reads and leaves its residents" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const graph = @import("glm_moe_dsa_graph.zig");
+    const G = graph.G;
+    const experts_mod = @import("glm_moe_dsa_experts.zig");
+    const Ex = experts_mod.Experts(G, bank_mod, Accepted(G));
+    var c = try bank_mod.tinyConfigInter(a, 512);
+    defer c.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try bank_mod.writeSynth(a, testing.io, tmp.dir, &c, .{ .signs = true });
+    defer a.free(img);
+    var rbuf: [512]u8 = undefined;
+    var b = try bank_mod.Bank.open(a, testing.io, try bank_mod.tmpRoot(&tmp, &rbuf), &c, null);
+    defer b.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const h: usize = c.hidden_size;
+    const k = 8;
+    const n = 16;
+    var worst: f32 = 0;
+    var scale: f32 = 0;
+    var read: [2]u64 = undefined;
+    // Each arm's residents per bank layer after its call (expert ids, slot order).
+    var residents: [2][8][2]u16 = undefined;
+    var promoted: u64 = 0;
+    for ([_]bool{ false, true }, 0..) |staged, arm| {
+        var g = try G.init(a, s);
+        defer g.deinit();
+        // Two expert slots per bank layer: most of each layer's experts are misses; five windows (three staged).
+        const prompt_rows: [8]u32 = @splat(2);
+        const st = try bank_mod.Stream.Stream.init(a, &b, .{ .rows = &prompt_rows, .max_route_ids = 48, .transient_rows = 5 * 48, .wide_depth = 5, .transient_release = true, .records_per_part = 2, .slot_memory = .{ .mlx = s }, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 4096 } });
+        defer st.deinit();
+        var diag: Diag = .{};
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const p = try b.peek(arena.allocator());
+        const math = try accept(G, a, &g, .{ .peek = &p }, .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = k, .n_layers = 4, .act = .swiglu, .input = .bfloat16 }, &diag);
+        defer math.deinit(&g);
+        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .wide_depth = 5 });
+        defer ex.deinit(&g);
+        // The same calls in both arms: row r routes expert r and seven others, so every expert is routed.
+        var rng = std.Random.DefaultPrng.init(23);
+        for (0..4) |layer| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            var xs: [n * 128]f32 = undefined;
+            for (xs[0 .. n * h]) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
+            var ids: [n * k]u16 = undefined;
+            var ids32: [n * k]i32 = undefined;
+            var sc: [n * k]f32 = undefined;
+            for (0..n) |row| {
+                var j: usize = 0;
+                while (j < k) {
+                    const e: u16 = if (j == 0) @intCast(row) else rng.random().uintLessThan(u16, 16);
+                    if (std.mem.indexOfScalar(u16, ids[row * k ..][0..j], e) != null) continue;
+                    ids[row * k + j] = e;
+                    ids32[row * k + j] = e;
+                    sc[row * k + j] = 0.05 + rng.random().float(f32) * 0.2;
+                    j += 1;
+                }
+            }
+            const nc: c_int = n;
+            const xb = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs[0 .. n * h]), &.{ nc, @intCast(h) }, .float32), .bfloat16);
+            var xin: [n * 128]f32 = undefined;
+            _ = try g.hostF32(try g.astype(xb, .float32), xin[0 .. n * h]);
+            if (staged) {
+                try ex.stageMisses(@intCast(layer));
+                // Each bank layer's experts (none resident yet) staged, one route per bank layer.
+                try testing.expectEqual(@as(usize, 2), ex.staged.n_routes);
+            }
+            const y = try ex.call(&g, @intCast(layer), xb, try g.hostArray(std.mem.sliceAsBytes(ids32[0 .. n * k]), &.{ nc, k }, .int32), try g.hostArray(std.mem.sliceAsBytes(sc[0 .. n * k]), &.{ nc, k }, .float32), null, &.{});
+            var got: [n * 128]f32 = undefined;
+            _ = try g.hostF32(try g.astype(y, .float32), got[0 .. n * h]);
+            try ex.flush();
+            try testing.expectEqual(@as(?u32, null), ex.staged.layer);
+            // Every seed expert resident (a staged one copied from its transient row), each resident row its record.
+            for (0..2) |side| {
+                const sl = 2 * layer + side;
+                const pol = &st.layers[sl].policy;
+                try testing.expectEqual(@as(usize, 0), pol.seed.count());
+                for (0..2) |slot| {
+                    const e = pol.slot_to_expert[slot];
+                    residents[arm][sl][slot] = e;
+                    if (slot == 1) std.mem.sort(u16, &residents[arm][sl], {}, std.sort.asc(u16));
+                    const geom = &b.layers[sl];
+                    const off = b.recordOffset(@intCast(sl), e);
+                    for (geom.segments, 0..) |sg, ci| {
+                        const row = st.slotRow(@intCast(sl), @intCast(slot), @enumFromInt(ci));
+                        for (0..geom.minis) |mi| try testing.expectEqualSlices(u8, img[off + mi * geom.record_bytes + sg.offset ..][0..sg.length], row[mi * sg.length ..][0..sg.length]);
+                    }
+                }
+            }
+            var want: [n * 128]f32 = undefined;
+            hostMoe(img, &b, @intCast(layer), xin[0 .. n * h], ids[0 .. n * k], sc[0 .. n * k], k, want[0 .. n * h]);
+            for (want[0 .. n * h], got[0 .. n * h]) |wv, gv| {
+                scale = @max(scale, @abs(wv));
+                worst = @max(worst, @abs(wv - gv));
+            }
+        }
+        read[arm] = st.stats().expert_bytes_read;
+        if (staged) promoted = st.stats().promoted;
+    }
+    std.debug.print("glm exl3 quant staged: max |delta| {d:.5} at outputs up to {d:.3}; {d} B read unstaged, {d} B staged; {d} records made resident from transient rows\n", .{ worst, scale, read[0], read[1], promoted });
+    try testing.expect(scale > 0.1);
+    try testing.expect(worst <= 0.03 * scale);
+    // Every expert of every layer read once in both arms; the staged call leaves the residents the unstaged one does
+    // (its two hottest per bank layer), those its staged route had not put in a prompt row copied from transient rows.
+    try testing.expectEqual(read[0], read[1]);
+    try testing.expectEqual(residents[0], residents[1]);
+    try testing.expect(promoted > 0 and promoted <= 4 * 2 * 2);
+}
+
+test "glm exl3 quant: a prompt slice over either host-built routing table (this quant's, sushi's moePrefillHost) equals sushi's moe bit for bit (K3 and K4, runs past one window)" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const G = @import("glm_moe_dsa_graph.zig").G;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const q = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try std.fmt.allocPrint(arena.allocator(), "{{\"mode\":\"exl3\",\"codebook\":\"mcg\",\"codebook_multiplier\":{d},\"tp_ranks\":4}}", .{sushi.format.MCG_MULT}), .{});
+    const hidden: u32 = 256;
+    const inter: u32 = 512;
+    const p: quant.BankPeek = .{ .quantization = q, .hidden = hidden, .inter = inter, .n_experts = 8, .n_layers = 2, .layers = &.{} };
+    var diag: Diag = .{};
+    const ok = try accept(G, a, &g, .{ .peek = &p }, .{ .hidden = hidden, .inter = inter, .top_k = 8, .n_layers = 2, .act = .swiglu, .input = .bfloat16 }, &diag);
+    defer ok.deinit(&g);
+    if (ok.tabledKernel(&g) == null) return error.SkipZigTest;
+    const tp = ok.tp;
+    const mini = inter / tp;
+    // Six slot rows (24 minis); 40 pairs (past sushi's 16 decode rows) and 300 (runs of one mini past 32 rows).
+    const rows_n: u32 = 6;
+    var prng = std.Random.DefaultPrng.init(5);
+    const rand = prng.random();
+    const Gen = struct {
+        fn proj(gg: *G, ra: std.Random, al: std.mem.Allocator, n_minis: u32, in: u32, out: u32, nhw: u32) !Arrays(G.T) {
+            const t = try al.alloc(u16, n_minis * (in / 16) * (out / 16) * nhw);
+            defer al.free(t);
+            for (t) |*v| v.* = ra.int(u16);
+            const suh = try al.alloc(u16, n_minis * in);
+            defer al.free(suh);
+            for (suh) |*v| v.* = @bitCast(@as(f16, @floatCast(if (ra.boolean()) 1.0 + 0.5 * ra.float(f32) else -1.0 - 0.5 * ra.float(f32))));
+            const svh = try al.alloc(u16, n_minis * out);
+            defer al.free(svh);
+            for (svh) |*v| v.* = @bitCast(@as(f16, @floatCast(0.01 + 0.02 * ra.float(f32))));
+            return .{
+                .trellis = try gg.hostArray(std.mem.sliceAsBytes(t), &.{ @intCast(n_minis), @intCast(in / 16), @intCast(out / 16), @intCast(nhw) }, .uint16),
+                .suh = try gg.hostArray(std.mem.sliceAsBytes(suh), &.{ @intCast(n_minis), @intCast(in) }, .float16),
+                .svh = try gg.hostArray(std.mem.sliceAsBytes(svh), &.{ @intCast(n_minis), @intCast(out) }, .float16),
+            };
+        }
+    };
+    var checked: usize = 0;
+    for ([_]u32{ 48, 64 }) |nhw| {
+        const m0 = g.mark();
+        defer g.resetTo(m0);
+        const bank: quant.BankArrays(Arrays(G.T)) = .{
+            .gate = try Gen.proj(&g, rand, a, rows_n * tp, hidden, mini, nhw),
+            .up = try Gen.proj(&g, rand, a, rows_n * tp, hidden, mini, nhw),
+            .down = try Gen.proj(&g, rand, a, rows_n * tp, mini, hidden, nhw),
+        };
+        for ([_]u32{ 40, 300 }) |n| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            const tokens = n + 10;
+            const xv = try a.alloc(f32, tokens * hidden);
+            defer a.free(xv);
+            for (xv) |*v| v.* = rand.floatNorm(f32);
+            const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xv), &.{ @intCast(tokens), @intCast(hidden) }, .float32), .bfloat16);
+            const slot = try a.alloc(u32, n);
+            defer a.free(slot);
+            const act = try a.alloc(u32, n);
+            defer a.free(act);
+            for (slot, act) |*sl, *ar| {
+                sl.* = rand.uintLessThan(u32, rows_n);
+                ar.* = rand.uintLessThan(u32, tokens);
+            }
+            // Sushi's moe over the gathered rows (the slice's path before the host-built tables), against this quant's
+            // table (`prefillTabled`) and sushi's (`run` past the decode rows: `moePrefillHost`).
+            const xs = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(act), &.{@intCast(n)}, .uint32), 0);
+            const minis = try a.alloc(u32, n * tp);
+            defer a.free(minis);
+            for (slot, 0..) |sl, i| for (0..tp) |r| {
+                minis[i * tp + r] = sl * tp + @as(u32, @intCast(r));
+            };
+            const ones = try a.alloc(f32, n * tp);
+            defer a.free(ones);
+            @memset(ones, 1);
+            const nc: c_int = @intCast(n);
+            const tc: c_int = @intCast(tp);
+            const sb: sushi.Bank = .{ .gate = .{ .trellis = bank.gate.trellis, .suh = bank.gate.suh, .svh = bank.gate.svh }, .up = .{ .trellis = bank.up.trellis, .suh = bank.up.suh, .svh = bank.up.svh }, .down = .{ .trellis = bank.down.trellis, .suh = bank.down.suh, .svh = bank.down.svh } };
+            const want = try g.reshape(try g.adopt(try sushi.moe(g.s, try g.reshape(xs, &.{ 1, nc, @intCast(hidden) }), sb, try g.hostArray(std.mem.sliceAsBytes(minis), &.{ 1, nc, tc }, .uint32), try g.hostArray(std.mem.sliceAsBytes(ones), &.{ 1, nc, tc }, .float32), .mcg, false)), &.{ nc, @intCast(hidden) });
+            const got = try ok.prefillTabled(&g, x, .{ .slot = slot, .act_row = act }, bank);
+            const host = try ok.run(&g, xs, slot, bank, false);
+            const wv = try a.alloc(f32, n * hidden);
+            defer a.free(wv);
+            const gv = try a.alloc(f32, n * hidden);
+            defer a.free(gv);
+            const hv = try a.alloc(f32, n * hidden);
+            defer a.free(hv);
+            _ = try g.hostF32(try g.astype(want, .float32), wv);
+            _ = try g.hostF32(try g.astype(got, .float32), gv);
+            _ = try g.hostF32(try g.astype(host, .float32), hv);
+            var big: f32 = 0;
+            for (wv, gv, hv) |w, v, hh| {
+                try testing.expect(std.math.isFinite(w));
+                try testing.expectEqual(@as(u32, @bitCast(w)), @as(u32, @bitCast(v)));
+                try testing.expectEqual(@as(u32, @bitCast(w)), @as(u32, @bitCast(hh)));
+                big = @max(big, @abs(w));
+            }
+            try testing.expect(big > 0);
+            checked += wv.len;
+        }
+    }
+    std.debug.print("glm exl3 quant tabled: {d} outputs of each host-built table equal sushi's moe bit for bit\n", .{checked});
 }
 
 /// The host reference of one routed layer's call: each row's experts' minis decoded by sushi's own host path
@@ -397,7 +756,10 @@ test "glm exl3 quant: a prompt slice's prefill over host slots equals sushi's mo
         ac.* = @intCast(i % tokens);
     }
     const drains0 = sushi.kernels.prefill_drains;
-    const got = try math.prefill(&g, 0, x, .{ .slot = &slot, .act_row = &act }, bank);
+    // The slice through sushi's moePrefillHost (`run` past the decode rows; `prefill` takes `prefillTabled` where the
+    // device has the tensor units).
+    const xs_rows = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(&act), &.{40}, .uint32), 0);
+    const got = try math.run(&g, xs_rows, &slot, bank, false);
     try testing.expectEqual(@as(u64, 1), math.prefill_gemm_calls);
     var gv: [40 * h]f32 = undefined;
     _ = try g.hostF32(try g.astype(got, .float32), &gv);
@@ -408,7 +770,6 @@ test "glm exl3 quant: a prompt slice's prefill over host slots equals sushi's mo
         minis[i * tp + r] = sl * tp + @as(u32, @intCast(r));
     };
     const ones: [40 * tp]f32 = @splat(1);
-    const xs_rows = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(&act), &.{40}, .uint32), 0);
     const sb: sushi.Bank = .{ .gate = .{ .trellis = bank.gate.trellis, .suh = bank.gate.suh, .svh = bank.gate.svh }, .up = .{ .trellis = bank.up.trellis, .suh = bank.up.suh, .svh = bank.up.svh }, .down = .{ .trellis = bank.down.trellis, .suh = bank.down.suh, .svh = bank.down.svh } };
     const want = try g.reshape(try g.adopt(try sushi.moe(g.s, try g.reshape(xs_rows, &.{ 1, 40, h }), sb, try g.hostArray(std.mem.sliceAsBytes(&minis), &.{ 1, 40, tp }, .uint32), try g.hostArray(std.mem.sliceAsBytes(&ones), &.{ 1, 40, tp }, .float32), .mcg, false)), &.{ 40, h });
     try testing.expectEqual(drains0 + 1, sushi.kernels.prefill_drains);

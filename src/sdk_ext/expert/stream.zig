@@ -352,6 +352,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             decode_window_rows: ?u32 = null,
             /// How the grow's new rows (decode's window 0 and every layer's ext) are allocated (`GrowFill`).
             grow_fill: GrowFill = .zeros,
+            /// The reverse phase change keeps the residents of each layer's prompt rows (`shrink`): a later prompt finds
+            /// them; off, it forgets them, as at construction.
+            keep_residents: bool = false,
             /// G7: the arch's read-ahead records (`ReadAheadProbe`), in the prefill-timers build only.
             read_ahead_probe: ProbeSlot = no_probe,
         };
@@ -501,6 +504,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             release_installed: bool = false,
             /// The grow's allocation, installed at construction (`Options.grow_fill`).
             grow_fill: GrowFill = .zeros,
+            /// `Options.keep_residents`.
+            keep_residents: bool = false,
             /// The prompt phase's scratch rows and windows (`Options`): `regrowTransient` re-creates them for a later prompt.
             prompt_transient_rows: u32 = 0,
             prompt_wide_depth: u8 = 1,
@@ -536,6 +541,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             held_layer: u32 = 0,
             /// A route's held-slot scratch (live routes' slots and `held_base`).
             held_scratch: std.ArrayList(u32) = .empty,
+            /// `promote`'s copies, reused across calls.
+            promote_copies: std.ArrayList(Copy) = .empty,
             read_ns: u64 = 0,
             /// `read_ns` of results with no preadv (copy-only adoptions).
             copy_only_ns: u64 = 0,
@@ -718,6 +725,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .geom_of = geom_of,
                     .release_installed = opt.transient_release,
                     .grow_fill = opt.grow_fill,
+                    .keep_residents = opt.keep_residents,
                     .prompt_transient_rows = opt.transient_rows,
                     .prompt_wide_depth = opt.wide_depth,
                     .probe = opt.read_ahead_probe,
@@ -749,6 +757,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 a.free(self.layers);
                 self.held_base.deinit(a);
                 self.held_scratch.deinit(a);
+                self.promote_copies.deinit(a);
                 self.transient.deinit();
                 a.free(self.transient_meta);
                 if (self.alt) |*x| {
@@ -834,6 +843,95 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (r.plan.loadsOf()) |l| if (l.persistent) {
                     try self.held_base.append(self.allocator, l.slot);
                     self.locate(r.layer, l.slot).meta.pins += 1;
+                };
+            }
+
+            /// A seed expert of a prompt layer whose record landed in transient slot `from` (`promote`).
+            pub const Promotion = struct { e: u16, from: u32 };
+            /// The threads one `promote` splits its copies over.
+            const promote_threads = 8;
+
+            /// The prompt phase, each of `items` (in order) an expert of `layer` that is a seed expert
+            /// (`LayerPolicy.seed`), whose record landed in its transient slot (a route planned before the layer's seed)
+            /// and that no wave reads any more: the record copied into the row `LayerPolicy.admitSeed` gives it (an empty
+            /// row, else the coldest probationary resident's that no live route pins), the expert resident there. The
+            /// copies run on `promote_threads` threads. Stops at the first item that finds no row; returns the experts
+            /// made resident.
+            pub fn promote(self: *Stream, layer: u32, items: []const Promotion) u32 {
+                std.debug.assert(self.phase == .prefill);
+                const ls = &self.layers[layer];
+                const p = &ls.policy;
+                const pinned = &self.held_scratch;
+                pinned.clearRetainingCapacity();
+                for (ls.meta[0..p.capacity], 0..) |m, s| if (m.pins != 0 or m.state == .loading) {
+                    pinned.append(self.allocator, @intCast(s)) catch return 0;
+                };
+                const copies = &self.promote_copies;
+                copies.clearRetainingCapacity();
+                var done: u32 = 0;
+                var bytes: u64 = 0;
+                for (items) |it| {
+                    const src = self.locate(layer, it.from).meta;
+                    if (it.from < p.capacity or src.state != .ready or src.layer != layer or src.expert != it.e) break;
+                    // A transient row of another geometry than the layer's rows (one scratch at the widest layer) is not
+                    // copied.
+                    const same = for (0..n_components) |c| {
+                        if (self.slotRow(layer, it.from, @enumFromInt(c)).len != ls.base.row_bytes[c]) break false;
+                    } else true;
+                    if (!same) break;
+                    copies.ensureUnusedCapacity(self.allocator, n_components) catch break;
+                    const to = p.admitSeed(it.e, pinned.items) orelse break;
+                    for (0..n_components) |c| {
+                        const dst = self.slotRow(layer, to, @enumFromInt(c));
+                        copies.appendAssumeCapacity(.{ .dst = dst, .src = self.slotRow(layer, it.from, @enumFromInt(c)) });
+                        bytes += dst.len;
+                    }
+                    // Not read before the copies below: the host is the only reader until the next route.
+                    ls.meta[to] = .{ .state = .ready, .layer = @intCast(layer), .expert = it.e };
+                    done += 1;
+                }
+                copyParallel(copies.items, bytes);
+                self.counters.promoted += done;
+                self.counters.promoted_bytes += bytes;
+                return done;
+            }
+
+            const Copy = struct { dst: []u8, src: []const u8 };
+
+            /// The bytes of `copies` (`total` of them) split in `promote_threads` equal runs, one thread each (the
+            /// calling thread runs the last; a thread that fails to start leaves its run to the calling thread).
+            fn copyParallel(copies: []const Copy, total: u64) void {
+                if (total == 0) return;
+                const per = (total + promote_threads - 1) / promote_threads;
+                const run = struct {
+                    fn f(cs: []const Copy, lo: u64, hi: u64) void {
+                        var at: u64 = 0;
+                        for (cs) |c| {
+                            const a = at;
+                            at += c.dst.len;
+                            if (at <= lo or a >= hi) continue;
+                            const s0: usize = @intCast(@max(lo, a) - a);
+                            const s1: usize = @intCast(@min(hi, at) - a);
+                            @memcpy(c.dst[s0..s1], c.src[s0..s1]);
+                        }
+                    }
+                }.f;
+                var threads: [promote_threads - 1]?std.Thread = @splat(null);
+                for (&threads, 0..) |*t, i| t.* = std.Thread.spawn(.{}, run, .{ copies, i * per, @min(total, (i + 1) * per) }) catch null;
+                run(copies, (promote_threads - 1) * per, total);
+                for (threads, 0..) |t, i| if (t) |th| th.join() else run(copies, i * per, @min(total, (i + 1) * per));
+            }
+
+            /// Every resident's prompt row of `layer` held (pinned, never a victim) until `releaseHeld`: routes planned
+            /// meanwhile load their misses into transient rows (a prompt layer's misses read before its call).
+            pub fn holdResidents(self: *Stream, layer: u32) !void {
+                std.debug.assert(self.phase == .prefill);
+                if (self.held_base.items.len > 0 and self.held_layer != layer) return error.HeldOtherLayer;
+                self.held_layer = layer;
+                const p = &self.layers[layer].policy;
+                for (p.slot_to_expert[0..p.capacity], 0..) |e, sl| if (e != expert_policy.no_expert) {
+                    try self.held_base.append(self.allocator, @intCast(sl));
+                    self.locate(layer, @intCast(sl)).meta.pins += 1;
                 };
             }
 
@@ -1368,6 +1466,23 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (first_error) |e| return self.fail(e);
             }
 
+            /// Construction (the prompt phase, nothing live): each layer's empty prompt rows filled with the experts of
+            /// `order(layer)` in turn, read and landed as a read-ahead leaves them (unprotected residents a prompt's seed
+            /// re-protects). Returns the records read.
+            pub fn preload(self: *Stream, ctx: anytype, comptime order: fn (@TypeOf(ctx), u32) []const u16) !u64 {
+                if (self.phase != .prefill) return error.NotPrefill;
+                var n: u64 = 0;
+                for (0..self.layers.len) |l| {
+                    const layer: u32 = @intCast(l);
+                    try self.readAheadSeed(layer, order(ctx, layer));
+                    for (self.ahead.reads[0..self.ahead.n]) |rd| n += @intFromBool(rd);
+                    try self.awaitReadAhead(layer);
+                }
+                // No prompt routed what the preload read.
+                self.ahead.tallied = true;
+                return n;
+            }
+
             /// P1's construction self-check: `experts` of `layer` (none resident, one route wide) read ahead, hashed, zeroed and
             /// forgotten, then read again by a demand route; each record's bytes must equal both ways, bit for bit. The layer
             /// is left as found (the experts not resident, their rows empty).
@@ -1605,9 +1720,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         m.* = .{};
                     }
                     ls.policy.shrink(rows) catch unreachable;
-                    // The one place that decides which residents a later prompt finds: none, as at construction (its
-                    // schedule then equals the first prompt's; slot bytes stay, a load of the same record skips its read).
-                    _ = ls.policy.forgetAll();
+                    // The one place that decides which residents a later prompt finds: those of the prompt rows
+                    // (`keep_residents`, their prompt state cleared), or none, as at construction (its schedule then equals
+                    // the first prompt's; slot bytes stay, a load of the same record skips its read).
+                    if (self.keep_residents) ls.policy.forgetPrompt() else _ = ls.policy.forgetAll();
                     if (ls.ext) |*e| e.deinit();
                     ls.ext = null;
                 }

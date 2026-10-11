@@ -6,10 +6,10 @@
 //! residents, starts the stream (prompt rows, the read pool sized from the bank's widest span, the decode lookahead,
 //! the event gates), allocates nothing else until a prompt, and checks its footprint against the bill's construction
 //! terms (`ConstructionOverBill`). A request: the reverse phase change if the previous one decoded, the KV lanes at
-//! the prompt's positions, the prompt pass (layer by layer over the whole prompt, or chunk by chunk), the decode
-//! handover (the transient scratch freed, the KV lanes at the request's own prompt and `max_tokens`, the footprint
-//! read once the frees show in it, the slot rows grown to what the bill at the request admits and the reading leaves
-//! under the target), serial steps. A later prompt keeps the KV of the prefix it shares with the state
+//! the prompt's positions, the prompt pass (layer by layer in calls of `glm_moe_dsa.promptCallRows`, or chunk by
+//! chunk), the decode handover (the transient scratch freed, the KV lanes at the request's own prompt and `max_tokens`,
+//! the footprint read once the frees show in it, the slot rows grown to what the bill at the request admits and the
+//! reading leaves under the target), serial steps. A later prompt keeps the KV of the prefix it shares with the state
 //! (`restorePrefix`). One log line at the prompt pass's end, one at the handover and one at the request's end report
 //! the phase's reads from the stream's counters and its memory from MLX's and the kernel's (`PromptLine`,
 //! `HandoverLine`, `DecodeLine`).
@@ -39,6 +39,7 @@ const exl3_quant = @import("glm_moe_dsa_exl3_quant.zig");
 /// PROFILE builds (`-Dplugin-profile=true`): each draft round's verify on the GPU timeline, its summary at the
 /// request's end (`VERIFY_GPU_TIMELINE`); every other build compiles it out.
 const timeline = @import("dsv41_verify_timeline.zig");
+const prefill_timers = @import("glm_moe_dsa_prefill_timers.zig");
 
 const G = graph.G;
 const Stats = sdk_ext.expert.Stats;
@@ -106,6 +107,23 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         const Math = Q.Accepted(G);
         pub const Experts = experts_mod.Experts(G, Bk, Math);
         pub const Lane = mtp_mod.Lane(mtp_kind);
+
+        /// `Stream.preload`'s order: each bank layer's experts in id order (with several bank layers per routed layer,
+        /// each holds only its own).
+        const Preload = struct {
+            bank: *const Bk.Bank,
+            buf: []u16,
+
+            fn order(p: *Preload, layer: u32) []const u16 {
+                var n: usize = 0;
+                for (0..p.buf.len) |e| {
+                    if (Experts.bpl > 1 and p.bank.streamLayer(layer / Experts.bpl, @intCast(e)) != layer) continue;
+                    p.buf[n] = @intCast(e);
+                    n += 1;
+                }
+                return p.buf[0..n];
+            }
+        };
 
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -180,7 +198,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const gpu_target = host.ceiling -| host.wired_margin;
             const ram = sdk.memory.totalMemBytes();
             const max_context = bill_mod.servedContext(cfg);
-            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag) };
+            // The prompt's attention form this device runs (the bill charges its arrays).
+            const dsa = try graph.dsaKernelsRun(gpa, s, model);
+            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag), .dsa = dsa };
             const mb = try bill_mod.memoryBill(gpa, bill_mod.termsOf(inputs));
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
@@ -244,6 +264,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
                 .pool = .{ .workers = shape.workers, .tickets = 1024 * Bk.Stream.maxMinis(&self.bank), .direct = true },
                 .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget(), .max_rank = cfg.lookaheadMaxRank() },
+                .keep_residents = true,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
             });
             errdefer self.stream.deinit();
@@ -259,10 +280,20 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             errdefer self.cache.deinit(&self.g);
             if (cfg.mtpDepth() > 0) self.mtp = try Lane.open(gpa, io, &self.g, dir, model, cfg.mtpDepth(), cfg.mtpAcceptance(), @intCast(max_context), cfg.nocache_weights orelse true, &diag);
             errdefer if (self.mtp) |ln| ln.deinit(&self.g);
-            self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids };
+            // The prompt rows filled before the first request, each bank layer's in expert order (a long prompt routes
+            // nearly every expert, so any filled row is a hit); a later request finds its predecessor's residents
+            // (`keep_residents`).
+            var pre: Preload = .{ .bank = &self.bank, .buf = try gpa.alloc(u16, self.bank.n_experts) };
+            defer gpa.free(pre.buf);
+            const pre0 = self.stream.stats();
+            const t_pre = std.Io.Timestamp.now(io, .awake);
+            const preloaded = try self.stream.preload(&pre, Preload.order);
+            const pre_ns: u64 = @intCast(t_pre.untilNow(io, .awake).nanoseconds);
+            log.info("glm_moe_dsa: preloaded {d} experts ({d:.2} GB) into the prompt rows in {d:.2} s\n", .{ preloaded, gigabytes(Reads.of(pre0, self.stream.stats()).ssd_bytes), seconds(pre_ns) });
+            self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa };
             self.g.clearCache();
             _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, bill_mod.prefill_cache_bytes);
-            log.info("glm_moe_dsa: constructed ({d} routed layers, {d} experts, record {d} B, expert reads {s}, prompt {s}, decode window {d} rows)\n", .{ n_bank, self.bank.n_experts, self.bank.geometryOf().widest_record, if (gated) "event gates" else "host waits", if (cfg.layerMajor()) "layer by layer" else "chunk by chunk", shape.decode_window_rows });
+            log.info("glm_moe_dsa: constructed ({d} routed layers, {d} experts, record {d} B, expert reads {s}, prompt {s}, prompt attention {s}, decode window {d} rows)\n", .{ n_bank, self.bank.n_experts, self.bank.geometryOf().widest_record, if (gated) "event gates" else "host waits", if (cfg.layerMajor()) "layer by layer" else "chunk by chunk", if (self.routes.dsa) "on the DSA kernels" else "in the reference's form", shape.decode_window_rows });
             try self.checkConstruction(rows.prompt);
             return self;
         }
@@ -360,10 +391,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const t0 = self.nowNs();
             var logits: ?mlx.mlx_array = null;
             errdefer if (logits) |x| self.g.release(x);
-            const chunk: usize = if (self.cfg.layerMajor()) ids.len else self.overrides.prefill_chunk orelse prefill_chunk_tokens;
+            // Layer by layer in calls of `glm.promptCallRows`, or chunk by chunk.
+            const chunk: usize = self.overrides.prefill_chunk orelse prefill_chunk_tokens;
             var at: usize = 0;
             while (at < ids.len) {
-                const end = @min(at + chunk, ids.len);
+                const end = at + if (self.cfg.layerMajor()) glm.promptCallRows(ids.len, at) else @min(chunk, ids.len - at);
                 if (logits) |x| self.g.release(x);
                 logits = null;
                 if (self.mtp) |ln| {
@@ -388,6 +420,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             } else null;
             _ = mlx.mlx_synchronize(self.g.s);
             log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .gemm = self.prompt_gemm, .mem = .{ .start = mem0, .end = Mem.now() } }});
+            prefill_timers.report(ids.len);
             return logits.?;
         }
 
@@ -804,6 +837,9 @@ pub const Reads = struct {
     /// Loads whose slot still held the record (no read); demand ranges read straight into their rows.
     loads_skipped: u64 = 0,
     direct: u64 = 0,
+    /// Prompt records copied from a transient row into a resident's row (`Stream.promote`), and their bytes.
+    promoted: u64 = 0,
+    promoted_bytes: u64 = 0,
     /// Host time blocked in the read waits; wall time with any read in flight.
     wait_ns: u64 = 0,
     in_flight_ns: u64 = 0,
@@ -833,6 +869,8 @@ pub const Reads = struct {
             .spec_served_bytes = d(s0.adopt_bytes, s1.adopt_bytes),
             .loads_skipped = d(s0.loads_skipped, s1.loads_skipped),
             .direct = d(s0.direct_ranges, s1.direct_ranges),
+            .promoted = d(s0.promoted, s1.promoted),
+            .promoted_bytes = d(s0.promoted_bytes, s1.promoted_bytes),
             .wait_ns = d(s0.read_wait_ns, s1.read_wait_ns),
             .in_flight_ns = d(s0.read_wall_ns, s1.read_wall_ns),
         };
@@ -889,6 +927,7 @@ pub const PromptLine = struct {
             p.tokens, seconds(p.wall_ns), perSecond(p.tokens, p.wall_ns), gigabytes(p.r.ssd_bytes), p.r.demand_records, p.r.ahead_records, p.r.ahead_hits, seconds(p.r.wait_ns),
         });
         if (p.gemm) |q| try w.print(", {d} prefill GEMM calls, {d} GPU drains", .{ q[0], q[1] });
+        if (p.r.promoted > 0) try w.print(", {d} records made resident from transient rows ({d:.2} GB copied)", .{ p.r.promoted, gigabytes(p.r.promoted_bytes) });
         if (p.mem) |m| try w.print("; {f}", .{m});
     }
 };
