@@ -90,10 +90,10 @@ pub fn Accepted(comptime G: type) type {
         report: selfcheck.Report = .{},
         /// The prompt's prefill GEMM calls (each call's waves over host-known slots).
         prefill_gemm_calls: u64 = 0,
-        /// The prompt pass's x as f16 [rows, hidden] (`beginWide`): one buffer every wide call of the pass writes, freed
-        /// at the handover (`releasePrompt`); its rows, and the last write's launch (the waves' order after it).
+        /// The prompt pass's x as f16 [the load's widest wide call, hidden] (`beginWide`): one buffer every wide call
+        /// of the pass writes, freed at the handover (`releasePrompt`); the last write's launch (the waves' order after
+        /// it).
         x16: ?G.T = null,
-        x16_rows: usize = 0,
         x16_tok: ?G.T = null,
         /// per K (3, 4): the decode and prompt chains
         dec: [2]routes.Decode,
@@ -233,20 +233,20 @@ pub fn Accepted(comptime G: type) type {
             return acc.?;
         }
 
-        /// The wide call's x as the prompt GEMMs read it, the array the experts driver hands every `prefill` of the call
-        /// (it calls this once per call, after the routing barrier): x [rows, hidden] bf16 as f16 in the prompt pass's
-        /// one buffer, allocated at the pass's first call (again only for a wider call) and written in place by the fill
-        /// (`routes.Prompt.fill`, committed now: the GPU runs it while the host plans the call's groups), whose launch the
-        /// waves are ordered after. Nothing reads the buffer when a call writes it: the driver drains every group of a
-        /// call before it returns. Freed at the handover (`releasePrompt`). Sushi's prompt reads x itself.
-        pub fn beginWide(self: *Self, g: *G, x: G.T) !G.T {
+        /// The wide call's x as the prompt GEMMs read it, the array the experts driver hands every `prefill` of the
+        /// call (it calls this once per call, after the routing barrier): x [n, hidden] bf16 as f16 in the prompt
+        /// pass's one buffer of `rows` rows (the widest wide call the load bills, `glm.maxPromptCallRows` at its served
+        /// context: the bill's "routed x as f16" term to the byte), allocated once, at the pass's first call, and
+        /// written in place by the fill (`routes.Prompt.fill`, committed now: the GPU runs it while the host plans the
+        /// call's groups), whose launch the waves are ordered after. Nothing reads the buffer when a call writes it:
+        /// the driver drains every group of a call before it returns. Freed at the handover (`releasePrompt`). Sushi's
+        /// prompt reads x itself.
+        pub fn beginWide(self: *Self, g: *G, x: G.T, rows: usize) !G.T {
             if (comptime prompt_kernels == .sushi) return x;
             const n: usize = @intCast(g.shapeOf(x).dim(0));
-            if (self.x16 == null or self.x16_rows < n) {
-                self.dropPrompt(g);
-                self.x16 = g.keep(try g.zeros(&.{ @intCast(n), @intCast(self.hidden) }, .float16));
-                self.x16_rows = n;
-            }
+            if (n > rows) return error.PromptCallTooWide;
+            if (self.x16 == null) self.x16 = g.keep(try g.zeros(&.{ @intCast(rows), @intCast(self.hidden) }, .float16));
+            std.debug.assert(@as(usize, @intCast(g.shapeOf(self.x16.?).dim(0))) == rows);
             if (self.x16_tok) |t| g.release(t);
             self.x16_tok = null;
             // Either K's route: the fill has no K.
@@ -269,7 +269,6 @@ pub fn Accepted(comptime G: type) type {
         fn dropPrompt(self: *Self, g: *G) void {
             if (self.x16) |b| g.release(b);
             self.x16 = null;
-            self.x16_rows = 0;
         }
 
         fn activeBytes() u64 {
@@ -850,7 +849,7 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
         }
     }
     for (&oact, 0..) |*v, i| v.* = @intCast((i * 7919) % n);
-    const xq = try ours.beginWide(g, x);
+    const xq = try ours.beginWide(g, x, n);
     try g.evalAll(&.{ours.x16_tok.?});
     for (0..6) |rep| for (std.enums.values(Arm)) |arm| {
         const m = g.mark();
@@ -875,7 +874,7 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
                 break :blk2 try ours.prefill(g, @intCast(side), xq, .{ .slot = &oslot[side], .act_row = &oact }, banks[side]);
             },
             .x16_fill => blk2: {
-                _ = try ours.beginWide(g, x);
+                _ = try ours.beginWide(g, x, n);
                 break :blk2 ours.x16_tok.?;
             },
         };
@@ -1149,7 +1148,7 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
         var outs: std.ArrayList(G.T) = .empty;
         defer outs.deinit(a);
         // ours as the driver runs it: the layer's one x copy, then both bank layers' calls over it
-        const xq = if (arm == 0) try ours.beginWide(&g, xp) else xp;
+        const xq = if (arm == 0) try ours.beginWide(&g, xp, n_tok) else xp;
         for (0..2) |side| {
             var i: usize = 0;
             while (i < side_slot[side].items.len) : (i += 16384) {

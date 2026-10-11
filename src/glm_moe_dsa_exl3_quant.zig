@@ -227,7 +227,7 @@ test "glm exl3 quant: a wide prompt call with its misses staged at the layer's s
         const p = try b.peek(arena.allocator());
         const math = try accept(G, a, &g, .{ .peek = &p }, .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = k, .n_layers = 4, .act = .swiglu, .input = .bfloat16 }, &diag);
         defer math.deinit(&g);
-        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .wide_depth = 5 });
+        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .wide_depth = 5, .prompt_rows = n });
         defer ex.deinit(&g);
         // The same calls in both arms: row r routes expert r and seven others, so every expert is routed.
         var rng = std.Random.DefaultPrng.init(23);
@@ -381,7 +381,7 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
         qctx.peek = &p;
         const math = try Q.accept(G, a, &g, qctx, .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = k, .n_layers = 4, .act = .swiglu, .input = .bfloat16 }, &diag);
         defer math.deinit(&g);
-        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .gated = gated, .event = ev, .wide_depth = 2 });
+        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .gated = gated, .event = ev, .wide_depth = 2, .prompt_rows = std.mem.max(u32, widths) });
         defer ex.deinit(&g);
         for (ex.banks) |bk| if (bk[0]) |arr| try math.checkBank(&g, arr, &diag);
         for (widths) |n| {

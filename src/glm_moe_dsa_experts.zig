@@ -124,6 +124,9 @@ pub const Options = struct {
     event: ?expert_event.Event = null,
     /// The wide lane's groups in flight (at most the stream's `wide_depth`).
     wide_depth: u8 = 1,
+    /// The widest wide call the load bills (`glm.maxPromptCallRows` at its served context): the math's prompt arrays
+    /// are sized once at it (`beginWide`).
+    prompt_rows: u32,
 };
 
 pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
@@ -812,7 +815,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             for (w.kept.items) |o| g.release(o);
             w.kept.clearRetainingCapacity();
             // x as the math's prefill reads it, made once for the call (`beginWide`: GLM-5.3's kernels' f16 copy), else x.
-            const xm = if (@hasDecl(M, "beginWide")) try self.math.beginWide(g, x) else x;
+            const xm = if (@hasDecl(M, "beginWide")) try self.math.beginWide(g, x, self.opt.prompt_rows) else x;
             for (0..bpl) |side| try self.wideBank(g, layer, @intCast(side), xm, k);
             return self.wideJoin(g, scores, x, n, k);
         }

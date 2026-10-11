@@ -319,7 +319,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (gated and !gpu) self.event = try expert_event.createHost(@constCast(self.stream.eventWord().?), @as(i64, event_watchdog_ms) * std.time.ns_per_ms);
             self.w = try graph.Weights.bind(gpa, weights, model, &diag);
             errdefer self.w.deinit(gpa);
-            self.ex = try Experts.init(gpa, &self.g, self.stream, self.math, model.hidden_size, .{ .gated = gated, .event = self.event, .wide_depth = shape.wide_depth });
+            self.ex = try Experts.init(gpa, &self.g, self.stream, self.math, model.hidden_size, .{ .gated = gated, .event = self.event, .wide_depth = shape.wide_depth, .prompt_rows = @intCast(glm.maxPromptCallRows(max_context)) });
             errdefer self.ex.deinit(&self.g);
             // The slot arrays are the quant's signature (every routed layer's base bank).
             for (self.ex.banks) |b| if (b[@backingInt(experts_mod.BankKind.base)]) |arr| try self.math.checkBank(&self.g, arr, &diag);
@@ -1398,11 +1398,11 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     const logits = try m.prefillAt(0, &prompt);
     var t = try m.g.hostArgmax(logits);
     _ = mlx.mlx_array_free(logits);
-    // The prompt pass's f16 copy of the routed input (GLM-5.3's kernels, `beginWide`): its free gives back its bill
-    // term at this prompt's call, and the bill's own term (at the billed context) covers it.
+    // The prompt pass's f16 copy of the routed input (GLM-5.3's kernels, `beginWide`): one allocation at the load's
+    // widest wide call, whose free gives back the bill's prompt term to the byte.
     const x_copy = m.math.releasePrompt(&m.g);
-    try testing.expectEqual(bill_mod.promptXCopyBytes(&model, prompt.len, m.inputs.gemm, m.inputs.size_classes), x_copy);
-    try testing.expect(x_copy > 0 and x_copy <= m.billed.phases[@intFromEnum(bill_mod.Phase.prompt)].routed_x_f16);
+    try testing.expect(x_copy > 0);
+    try testing.expectEqual(m.billed.phases[@intFromEnum(bill_mod.Phase.prompt)].routed_x_f16, x_copy);
     try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
     var row: [256]f32 = undefined;
     for (0..4) |_| {
