@@ -55,19 +55,39 @@ const PatternFile = struct {
     }
 };
 
-/// Nine destination rows per record, `lens[c]` bytes each, in one buffer.
+/// Nine destination rows per record, `lens[c]` bytes each, in one buffer: the test allocator's (`init`, the caller
+/// frees `buf`), or whole pages with the rows from byte `skew` on (`initPages`, freed by `deinit`).
 const Dests = struct {
     buf: []u8,
     rows: [max_items][n_components]u64,
     at: [max_items][n_components]usize,
+    pages: []align(std.heap.page_size_min) u8 = &.{},
 
     fn init(n: usize, lens: *const [n_components]u64) !Dests {
-        var d: Dests = .{ .buf = undefined, .rows = undefined, .at = undefined };
+        return layout(try testing.allocator.alloc(u8, totalOf(lens) * n), n, lens, 0);
+    }
+
+    fn initPages(n: usize, lens: *const [n_components]u64, skew: usize) !Dests {
+        const pages = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), totalOf(lens) * n + std.heap.pageSize());
+        var d = layout(pages, n, lens, skew);
+        d.pages = pages;
+        return d;
+    }
+
+    fn deinit(self: *Dests) void {
+        std.heap.page_allocator.free(self.pages);
+    }
+
+    fn totalOf(lens: *const [n_components]u64) usize {
         var total: usize = 0;
         for (lens.*) |l| total += l;
-        d.buf = try testing.allocator.alloc(u8, total * n);
+        return total;
+    }
+
+    fn layout(buf: []u8, n: usize, lens: *const [n_components]u64, skew: usize) Dests {
+        var d: Dests = .{ .buf = buf, .rows = undefined, .at = undefined };
         @memset(d.buf, 0xAA);
-        var off: usize = 0;
+        var off: usize = skew;
         for (0..n) |i| for (lens.*, 0..) |l, k| {
             d.at[i][k] = off;
             d.rows[i][k] = @intFromPtr(d.buf.ptr) + off;
@@ -1430,40 +1450,6 @@ test "dsv41 io cov: a file shorter than its job's size, ending inside a range's 
     try testing.expectEqual(@as(i64, 200), pool.result(0).payload);
 }
 
-/// Page-aligned destination rows (each part a whole number of pages) for `n` records.
-const PageDests = struct {
-    buf: []align(std.heap.page_size_min) u8,
-    rows: [max_items][n_components]u64,
-
-    fn init(n: usize, lens: *const [n_components]u64, skew: usize) !PageDests {
-        var total: usize = 0;
-        for (lens.*) |l| total += l;
-        const page = std.heap.pageSize();
-        var d: PageDests = .{ .buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), total * n + page), .rows = undefined };
-        @memset(d.buf, 0xAA);
-        var off: usize = skew;
-        for (0..n) |i| for (lens.*, 0..) |l, k| {
-            d.rows[i][k] = @intFromPtr(d.buf.ptr) + off;
-            off += l;
-        };
-        return d;
-    }
-
-    fn deinit(self: *PageDests) void {
-        std.heap.page_allocator.free(self.buf);
-    }
-
-    fn expectRecord(self: *const PageDests, i: usize, image: []const u8, gu: u64, down: u64, lens: *const [n_components]u64) !void {
-        var at = gu;
-        for (0..n_components) |k| {
-            if (k == gu_components) at = down;
-            const row: [*]const u8 = @ptrFromInt(self.rows[i][k]);
-            try testing.expectEqualSlices(u8, image[at..][0..lens[k]], row[0..lens[k]]);
-            at += lens[k];
-        }
-    }
-};
-
 test "glm io: with direct reads a page-aligned range lands straight in its rows; an unaligned one, or the pool without them, takes the staging loop; every range lands the file's bytes" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(96 * page);
@@ -1481,7 +1467,7 @@ test "glm io: with direct reads a page-aligned range lands straight in its rows;
     for ([_]Case{ .{ .direct = true, .skew = 0, .want = 2 * n }, .{ .direct = true, .skew = 64, .want = 0 }, .{ .direct = false, .skew = 0, .want = 0 } }) |cs| {
         var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 64, .direct = cs.direct });
         defer pool.stop();
-        var d = try PageDests.init(n, &lens, cs.skew);
+        var d = try Dests.initPages(n, &lens, cs.skew);
         defer d.deinit();
         const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..n], &lens);
         try pool.wait(first, 2 * n, 10 * std.time.ns_per_s);
@@ -1498,7 +1484,7 @@ test "glm io: with direct reads a page-aligned range lands straight in its rows;
     var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 64, .direct = true });
     defer pool.stop();
     defer clearFaults();
-    var d = try PageDests.init(n, &lens, 0);
+    var d = try Dests.initPages(n, &lens, 0);
     defer d.deinit();
     injectFault(gu[1], 4, @intCast(5 * page / 2));
     const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..n], &lens);

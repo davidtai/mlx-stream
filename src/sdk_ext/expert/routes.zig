@@ -309,6 +309,44 @@ pub const Recorder = struct {
     }
 };
 
+/// A route file read back (tests): its header and each part's bytes, in the file's order.
+pub const Parts = struct {
+    header: Header,
+    prompt_rows: []const u8,
+    decode_rows: []const u8,
+    counts: []const u8,
+    residents: []const u8,
+    steps: []const u8,
+    routes: []const u8,
+
+    /// `img`'s parts at its header's counts; `error.RouteFileSize` when its bytes are not exactly them.
+    pub fn of(img: []const u8) error{RouteFileSize}!Parts {
+        if (img.len < @sizeOf(Header)) return error.RouteFileSize;
+        const h = std.mem.bytesToValue(Header, img[0..@sizeOf(Header)]);
+        const per_layer: usize = h.n_layers;
+        const per_expert = per_layer * h.n_experts;
+        const lens = [_]usize{ per_layer * 4, per_layer * 4, per_expert * 4, per_expert * 2, @as(usize, h.n_steps) * @sizeOf(Step), @as(usize, h.n_routes) * @sizeOf(Route) };
+        var total: usize = @sizeOf(Header);
+        for (lens) |n| total += n;
+        if (img.len != total) return error.RouteFileSize;
+        var parts: [lens.len][]const u8 = undefined;
+        var off: usize = @sizeOf(Header);
+        for (&parts, lens) |*p, n| {
+            p.* = img[off..][0..n];
+            off += n;
+        }
+        return .{ .header = h, .prompt_rows = parts[0], .decode_rows = parts[1], .counts = parts[2], .residents = parts[3], .steps = parts[4], .routes = parts[5] };
+    }
+
+    pub fn step(p: *const Parts, i: usize) Step {
+        return std.mem.bytesToValue(Step, p.steps[i * @sizeOf(Step) ..][0..@sizeOf(Step)]);
+    }
+
+    pub fn route(p: *const Parts, i: usize) Route {
+        return std.mem.bytesToValue(Route, p.routes[i * @sizeOf(Route) ..][0..@sizeOf(Route)]);
+    }
+};
+
 const testing = std.testing;
 
 test "expert routes: the switch follows the host's convention, a value starting with / names the directory" {
@@ -362,18 +400,16 @@ test "expert routes: a plan's hits, loads, evictions and reads become each id's 
     const img = try rec.image(a);
     defer a.free(img);
     try testing.expectEqual(@as(usize, 64 + 2 * 2 * 4 + 2 * 16 * 4 + 2 * 16 * 2 + 2 * 24 + 2 * 160), img.len);
-    const h = std.mem.bytesToValue(Header, img[0..64]);
+    const im = try Parts.of(img);
+    const h = im.header;
     try testing.expectEqualSlices(u8, "GLMROUTE", &h.magic);
     try testing.expectEqual(@as(u32, 37), h.prompt_tokens);
     try testing.expectEqual(@as(u32, 2), h.n_routes);
     try testing.expectEqual(@as(u32, 2), h.n_steps);
     try testing.expectEqual(@as(u32, 0), h.dropped);
-    var off: usize = 64 + 2 * 2 * 4;
-    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, img[off + 4 ..][0..4], .little));
-    off += 2 * 16 * 4 + 2 * 16 * 2;
-    const s0 = std.mem.bytesToValue(Step, img[off..][0..24]);
-    try testing.expectEqual(Step{ .first_route = 0, .n_routes = 1, .rows = 2, .drafted = 1, .accepted = 1, .emitted = 2, .wall_us = 12_345 }, s0);
-    const r1 = std.mem.bytesToValue(Route, img[off + 2 * 24 + 160 ..][0..160]);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, im.counts[4..8], .little));
+    try testing.expectEqual(Step{ .first_route = 0, .n_routes = 1, .rows = 2, .drafted = 1, .accepted = 1, .emitted = 2, .wall_us = 12_345 }, im.step(0));
+    const r1 = im.route(1);
     try testing.expectEqual(@as(u16, 1), r1.layer);
     try testing.expectEqual(@as(u32, 1), r1.step);
     try testing.expectEqualSlices(u16, &.{ 9, 5 }, r1.ids[0..2]);
@@ -421,5 +457,5 @@ test "expert routes: a call over two bank layers is one route, each id flagged b
     try testing.expectEqual(@as(u16, 0), rec.routes.items[1].layer);
     const img = try rec.image(a);
     defer a.free(img);
-    try testing.expectEqual(@as(u32, 2), std.mem.bytesToValue(Header, img[0..64]).banks_per_layer);
+    try testing.expectEqual(@as(u32, 2), (try Parts.of(img)).header.banks_per_layer);
 }
