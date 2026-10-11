@@ -352,7 +352,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 // The eval above consumed the group: its route unpinned (its rows the policy's again), then its seed
                 // experts copied while their transient rows still hold them (the next route may take the window).
                 try self.stream.flush();
-                for (cand.items[0..cand.n]) |cd| if (!self.stream.promote(sl, cd.e, cd.slot)) break;
+                var items: [max_route_ids]S.Stream.Promotion = undefined;
+                for (cand.items[0..cand.n], items[0..cand.n]) |cd, *it| it.* = .{ .e = cd.e, .from = cd.slot };
+                _ = self.stream.promote(sl, items[0..cand.n]);
                 pt.chargeRouted(.promote, tp);
             }
             try ahead(self, w, sl, next, live, depth);

@@ -529,6 +529,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             held_layer: u32 = 0,
             /// A route's held-slot scratch (live routes' slots and `held_base`).
             held_scratch: std.ArrayList(u32) = .empty,
+            /// `promote`'s copies, reused across calls.
+            promote_copies: std.ArrayList(Copy) = .empty,
             read_ns: u64 = 0,
             /// `read_ns` of results with no preadv (copy-only adoptions).
             copy_only_ns: u64 = 0,
@@ -731,6 +733,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 a.free(self.layers);
                 self.held_base.deinit(a);
                 self.held_scratch.deinit(a);
+                self.promote_copies.deinit(a);
                 self.transient.deinit();
                 a.free(self.transient_meta);
                 if (self.alt) |*x| {
@@ -819,35 +822,80 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 };
             }
 
-            /// The prompt phase, `layer`'s expert `e` a seed expert (`LayerPolicy.seed`) whose record landed in transient
-            /// slot `from` (a route planned before the layer's seed) and that no wave reads any more: the record copied
-            /// into the row `LayerPolicy.admitSeed` gives it (an empty row, else the coldest probationary resident's that
-            /// no live route pins), the expert resident there. False where no row is left (nothing changes).
-            pub fn promote(self: *Stream, layer: u32, e: u16, from: u32) bool {
+            /// A seed expert of a prompt layer whose record landed in transient slot `from` (`promote`).
+            pub const Promotion = struct { e: u16, from: u32 };
+            /// The threads one `promote` splits its copies over.
+            const promote_threads = 8;
+
+            /// The prompt phase, each of `items` (in order) an expert of `layer` that is a seed expert
+            /// (`LayerPolicy.seed`), whose record landed in its transient slot (a route planned before the layer's seed)
+            /// and that no wave reads any more: the record copied into the row `LayerPolicy.admitSeed` gives it (an empty
+            /// row, else the coldest probationary resident's that no live route pins), the expert resident there. The
+            /// copies run on `promote_threads` threads. Stops at the first item that finds no row; returns the experts
+            /// made resident.
+            pub fn promote(self: *Stream, layer: u32, items: []const Promotion) u32 {
                 std.debug.assert(self.phase == .prefill);
                 const ls = &self.layers[layer];
                 const p = &ls.policy;
-                const src = self.locate(layer, from).meta;
-                if (from < p.capacity or src.state != .ready or src.layer != layer or src.expert != e) return false;
-                // A transient row of another geometry than the layer's rows (one scratch at the widest layer) is not copied.
-                for (0..n_components) |c| if (self.slotRow(layer, from, @enumFromInt(c)).len != ls.base.row_bytes[c]) return false;
                 const pinned = &self.held_scratch;
                 pinned.clearRetainingCapacity();
                 for (ls.meta[0..p.capacity], 0..) |m, s| if (m.pins != 0 or m.state == .loading) {
-                    pinned.append(self.allocator, @intCast(s)) catch return false;
+                    pinned.append(self.allocator, @intCast(s)) catch return 0;
                 };
-                const to = p.admitSeed(e, pinned.items) orelse return false;
+                const copies = &self.promote_copies;
+                copies.clearRetainingCapacity();
+                var done: u32 = 0;
                 var bytes: u64 = 0;
-                for (0..n_components) |c| {
-                    const dst = self.slotRow(layer, to, @enumFromInt(c));
-                    const s = self.slotRow(layer, from, @enumFromInt(c));
-                    @memcpy(dst, s);
-                    bytes += dst.len;
+                for (items) |it| {
+                    const src = self.locate(layer, it.from).meta;
+                    if (it.from < p.capacity or src.state != .ready or src.layer != layer or src.expert != it.e) break;
+                    // A transient row of another geometry than the layer's rows (one scratch at the widest layer) is not
+                    // copied.
+                    const same = for (0..n_components) |c| {
+                        if (self.slotRow(layer, it.from, @enumFromInt(c)).len != ls.base.row_bytes[c]) break false;
+                    } else true;
+                    if (!same) break;
+                    copies.ensureUnusedCapacity(self.allocator, n_components) catch break;
+                    const to = p.admitSeed(it.e, pinned.items) orelse break;
+                    for (0..n_components) |c| {
+                        const dst = self.slotRow(layer, to, @enumFromInt(c));
+                        copies.appendAssumeCapacity(.{ .dst = dst, .src = self.slotRow(layer, it.from, @enumFromInt(c)) });
+                        bytes += dst.len;
+                    }
+                    // Not read before the copies below: the host is the only reader until the next route.
+                    ls.meta[to] = .{ .state = .ready, .layer = @intCast(layer), .expert = it.e };
+                    done += 1;
                 }
-                ls.meta[to] = .{ .state = .ready, .layer = @intCast(layer), .expert = e };
-                self.counters.promoted += 1;
+                copyParallel(copies.items, bytes);
+                self.counters.promoted += done;
                 self.counters.promoted_bytes += bytes;
-                return true;
+                return done;
+            }
+
+            const Copy = struct { dst: []u8, src: []const u8 };
+
+            /// The bytes of `copies` (`total` of them) split in `promote_threads` equal runs, one thread each (the
+            /// calling thread runs the last; a thread that fails to start leaves its run to the calling thread).
+            fn copyParallel(copies: []const Copy, total: u64) void {
+                if (total == 0) return;
+                const per = (total + promote_threads - 1) / promote_threads;
+                const run = struct {
+                    fn f(cs: []const Copy, lo: u64, hi: u64) void {
+                        var at: u64 = 0;
+                        for (cs) |c| {
+                            const a = at;
+                            at += c.dst.len;
+                            if (at <= lo or a >= hi) continue;
+                            const s0: usize = @intCast(@max(lo, a) - a);
+                            const s1: usize = @intCast(@min(hi, at) - a);
+                            @memcpy(c.dst[s0..s1], c.src[s0..s1]);
+                        }
+                    }
+                }.f;
+                var threads: [promote_threads - 1]?std.Thread = @splat(null);
+                for (&threads, 0..) |*t, i| t.* = std.Thread.spawn(.{}, run, .{ copies, i * per, @min(total, (i + 1) * per) }) catch null;
+                run(copies, (promote_threads - 1) * per, total);
+                for (threads, 0..) |t, i| if (t) |th| th.join() else run(copies, i * per, @min(total, (i + 1) * per));
             }
 
             /// Every resident's prompt row of `layer` held (pinned, never a victim) until `releaseHeld`: routes planned
