@@ -17,7 +17,7 @@ pub const Phase = enum { seed, proj, index, attn, oproj, router, routed, mlp, re
 /// The routed call's split: the routing barrier (the ids to the host, their counts and order), the read-ahead's landing,
 /// the seed and the routes (reads planned and posted), the read waits, the groups' graphs, their compute drains, the
 /// staged hot experts' copies into resident rows, the join, the combine's build.
-pub const Routed = enum { barrier, ahead, route, wait, encode, compute, promote, join, combine };
+pub const Routed = enum { barrier, ahead, route, wait, encode, compute, promote, join, combine, commit };
 
 const n_phases = @typeInfo(Phase).@"enum".field_names.len;
 const n_routed = @typeInfo(Routed).@"enum".field_names.len;
@@ -225,13 +225,14 @@ pub fn report(tokens: u64, g: *ops.MlxOps) void {
         var in_phases: u64 = 0;
         for (waits) |x| in_phases += x;
         const total = g.waits - w_begin - rt_n;
-        log.info("glm_moe_dsa profile waits: prompt {d} tokens, {d} host waits on the GPU (MlxOps.waits, the round trips left out): in the phases {d} (seed {d}, proj {d}, index {d}, attn {d}, oproj {d}, router {d}, routed {d}, mlp {d}, rest {d}), after the layers {d}; routed charges: barrier {d}, ahead {d}, route {d}, wait {d}, encode {d}, compute {d}, promote {d}, join {d}, combine {d}; round trip on an idle GPU over {d} layers: eval mean {d:.3} ms (max {d:.3}), synchronize after it mean {d:.3} ms\n", .{
+        log.info("glm_moe_dsa profile waits: prompt {d} tokens, {d} host waits on the GPU (MlxOps.waits, the round trips left out): in the phases {d} (seed {d}, proj {d}, index {d}, attn {d}, oproj {d}, router {d}, routed {d}, mlp {d}, rest {d}), after the layers {d}; routed charges: barrier {d}, ahead {d}, route {d}, wait {d}, encode {d} (of them asyncEval {d}), compute {d}, promote {d}, join {d}, combine {d}; round trip on an idle GPU over {d} layers: eval mean {d:.3} ms (max {d:.3}), synchronize after it mean {d:.3} ms\n", .{
             tokens,                                        total,                                     in_phases,
             waits[@intFromEnum(Phase.seed)],               waits[@intFromEnum(Phase.proj)],           waits[@intFromEnum(Phase.index)],
             waits[@intFromEnum(Phase.attn)],               waits[@intFromEnum(Phase.oproj)],          waits[@intFromEnum(Phase.router)],
             waits[@intFromEnum(Phase.routed)],             waits[@intFromEnum(Phase.mlp)],            waits[@intFromEnum(Phase.rest)],
             total -| in_phases,                            routed_n[@intFromEnum(Routed.barrier)],    routed_n[@intFromEnum(Routed.ahead)],
             routed_n[@intFromEnum(Routed.route)],          routed_n[@intFromEnum(Routed.wait)],       routed_n[@intFromEnum(Routed.encode)],
+            routed_n[@intFromEnum(Routed.commit)],
             routed_n[@intFromEnum(Routed.compute)],        routed_n[@intFromEnum(Routed.promote)],    routed_n[@intFromEnum(Routed.join)],
             routed_n[@intFromEnum(Routed.combine)],        rt_n,                                      if (rt_n > 0) @as(f64, @floatFromInt(rt_eval_ns / rt_n)) / 1e6 else 0,
             @as(f64, @floatFromInt(rt_eval_max)) / 1e6,    if (rt_n > 0) @as(f64, @floatFromInt(rt_sync_ns / rt_n)) / 1e6 else 0,
@@ -250,7 +251,7 @@ pub fn report(tokens: u64, g: *ops.MlxOps) void {
             return sec(routed_ns[@intFromEnum(b)]);
         }
     }.of;
-    log.info("glm_moe_dsa profile: prompt {d} tokens, phases {d:.2} s: seed {d:.2}, proj {d:.2}, index {d:.2}, attn {d:.2} (full {d:.2}, shared {d:.2}), oproj {d:.2}, router {d:.2}, routed {d:.2} (barrier {d:.2}, ahead {d:.2}, route {d:.2}, wait {d:.2}, encode {d:.2}, compute {d:.2}, promote {d:.2}, join {d:.2}, combine {d:.2}), mlp {d:.2}, rest {d:.2}\n", .{
+    log.info("glm_moe_dsa profile: prompt {d} tokens, phases {d:.2} s: seed {d:.2}, proj {d:.2}, index {d:.2}, attn {d:.2} (full {d:.2}, shared {d:.2}), oproj {d:.2}, router {d:.2}, routed {d:.2} (barrier {d:.2}, ahead {d:.2}, route {d:.2}, wait {d:.2}, encode {d:.2} (of it asyncEval {d:.2}), compute {d:.2}, promote {d:.2}, join {d:.2}, combine {d:.2}), mlp {d:.2}, rest {d:.2}\n", .{
         tokens,                            sec(total),
         sec(ns[@intFromEnum(Phase.seed)]), sec(ns[@intFromEnum(Phase.proj)]),
         sec(ns[@intFromEnum(Phase.index)]), sec(ns[@intFromEnum(Phase.attn)]),
@@ -259,6 +260,7 @@ pub fn report(tokens: u64, g: *ops.MlxOps) void {
         sec(ns[@intFromEnum(Phase.routed)]), r(.barrier),
         r(.ahead),                         r(.route),
         r(.wait),                          r(.encode),
+        r(.commit),
         r(.compute),                       r(.promote),
         r(.join),                          r(.combine),
         sec(ns[@intFromEnum(Phase.mlp)]),
