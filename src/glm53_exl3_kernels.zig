@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
-pub const manifest_sha256 = "2ee212a3ba9982f85d50f39cb9418f87b1e9845b45845969c2a75cd7a90073da";
+pub const manifest_sha256 = "a64942f02c4181096238c6927908af04bfd535edb4d037aaf61d67232d86a79f";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
 const dir = "kernels/glm53_exl3/";
 
