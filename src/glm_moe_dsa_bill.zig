@@ -183,6 +183,10 @@ pub fn sizeClassBytes(bytes: u64) u64 {
     return (std.math.divCeil(u64, s_, step) catch unreachable) * step;
 }
 
+/// Whether the module turns the allocator's size classes on for the prompt's forward layers: the patched MLX's switch,
+/// on macOS only (the build whose MLX has it). The module's own bill and the plugin's view of it (`inputsOf`) both read it.
+pub const prompt_size_classes = @import("builtin").os.tag == .macos;
+
 /// The prompt layer's arrays as the allocator sizes them: each at its own bytes, or with the size classes on at its class
 /// (`sizeClassBytes`); an array the routing sizes (a routed slice's output, a GEMM wave's arrays) at its class bound,
 /// 9/8 of its bytes.
@@ -756,7 +760,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, p
     const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
     const geo = if (exl3_bank.present(dir)) try exl3_bank.Bank.geometry(a, io, dir, model, diag) else try bank_mod.Bank.geometry(a, io, dir, model, diag);
     const residents = try glm.residentBufferBytes(a, io, dir, model, std.heap.pageSize(), diag);
-    return .{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .decode_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag), .dsa = glm.dsaKernelsFit(model), .gemm = if (exl3_bank.present(dir)) promptGemmOf(glm53_quant) else .affine, .select = selectOf(model), .prompt_cache = prefillCacheBytes(sdk.memory.totalMemBytes()) };
+    return .{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .decode_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag), .dsa = glm.dsaKernelsFit(model), .gemm = if (exl3_bank.present(dir)) promptGemmOf(glm53_quant) else .affine, .select = selectOf(model), .prompt_cache = prefillCacheBytes(sdk.memory.totalMemBytes()), .size_classes = prompt_size_classes };
 }
 
 /// The draft lane's bill inputs when `cfg` turns it on (its settings and the pack's MTP directory checked), else null.
