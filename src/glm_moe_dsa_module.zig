@@ -456,8 +456,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             defer self.gpa.free(key);
             self.tally_path = try expert_tally.pathOf(self.gpa, key);
             const path = self.tally_path orelse {
-                log.info("glm_moe_dsa: expert tally: no HOME, no tally file: every request after the first pins from the last one's rates
-", .{});
+                log.info("glm_moe_dsa: expert tally: no HOME, no tally file: every request after the first pins from the last one's rates\n", .{});
                 return;
             };
             switch (try expert_tally.read(self.gpa, self.io, path, n_layers, n_experts)) {
@@ -465,13 +464,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                     defer self.gpa.free(r);
                     @memcpy(self.tally_rates, r);
                     self.stream.seedTally(r);
-                    log.info("glm_moe_dsa: expert tally: read {s}: the preload fills the prompt rows hottest first, and the top {d} of each layer's experts by rate are pinned (window {d} routes)
-", .{ path, self.cfg.tally.ratio, self.cfg.tally.window });
+                    log.info("glm_moe_dsa: expert tally: read {s}: the preload fills the prompt rows hottest first, and the top {d} of each layer's experts by rate are pinned (window {d} routes)\n", .{ path, self.cfg.tally.ratio, self.cfg.tally.window });
                 },
-                .missing => log.info("glm_moe_dsa: expert tally: no file at {s}: this load plans as a first run (ratio {d}, window {d} routes), its requests' ends write it
-", .{ path, self.cfg.tally.ratio, self.cfg.tally.window }),
-                .mismatched => log.warn("glm_moe_dsa: expert tally: {s} is not this stream's ({d} layers of {d} experts, version {d}): ignored, this load plans as a first run
-", .{ path, n_layers, n_experts, expert_tally.version }),
+                .missing => log.info("glm_moe_dsa: expert tally: no file at {s}: this load plans as a first run (ratio {d}, window {d} routes), its requests' ends write it\n", .{ path, self.cfg.tally.ratio, self.cfg.tally.window }),
+                .mismatched => log.warn("glm_moe_dsa: expert tally: {s} is not this stream's ({d} layers of {d} experts, version {d}): ignored, this load plans as a first run\n", .{ path, n_layers, n_experts, expert_tally.version }),
             }
         }
 
@@ -489,12 +485,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const path = self.tally_path orelse return;
             if (routed == 0) return;
             expert_tally.write(self.gpa, self.io, path, self.tally_rates, @intCast(self.bank.layers.len), self.bank.n_experts, self.cfg.tally.window) catch |e| {
-                log.warn("glm_moe_dsa: expert tally: not written to {s}: {s}
-", .{ path, @errorName(e) });
+                log.warn("glm_moe_dsa: expert tally: not written to {s}: {s}\n", .{ path, @errorName(e) });
                 return;
             };
-            log.info("glm_moe_dsa: expert tally: written to {s} ({d} of {d} stream layers routed in the decode)
-", .{ path, routed, self.bank.layers.len });
+            log.info("glm_moe_dsa: expert tally: written to {s} ({d} of {d} stream layers routed in the decode)\n", .{ path, routed, self.bank.layers.len });
         }
 
         pub fn deinit(self: *Self) void {
