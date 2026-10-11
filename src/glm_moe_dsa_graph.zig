@@ -365,8 +365,6 @@ fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T,
 /// fit `index_topk`) and their softmax on the tensor units, the latent output back through `unembed_out`. `[1, heads,
 /// rows, v_head_dim]`.
 fn attendSpans(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T, kv_all: T, pe_all: T, start: u32, scale: f32, carry: *Carry) !T {
-    const kvr: c_int = @intCast(c.kv_lora_rank);
-    const rp: c_int = @intCast(c.qk_rope_head_dim);
     var outs: std.ArrayList(T) = .empty;
     defer outs.deinit(carry.a);
     errdefer for (outs.items) |o| g.release(o);
@@ -376,14 +374,9 @@ fn attendSpans(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T
         const nb: c_int = @intCast(start + b1);
         const r: c_int = @intCast(b1 - b0);
         const m = g.mark();
-        const q_lat = try qlinear(g, try rowSlice(g, q_nope, @intCast(b0), @intCast(b1)), lw.embed_q);
-        const qp = try rowSlice(g, q_pe, @intCast(b0), @intCast(b1));
         // Where the span's keys fit the top-k every causal key is attended: the kernel drops a key past its query.
         const idx = carry.topk[i] orelse try g.broadcastTo(try g.reshape(try g.arange(0, @floatFromInt(nb), 1, .int32), &.{ 1, 1, nb }), &.{ 1, r, nb });
-        const lat = try g.slice(kv_all, &.{ 0, 0, 0, 0 }, &.{ 1, 1, nb, kvr }, &.{ 1, 1, 1, 1 });
-        const pe = try g.slice(pe_all, &.{ 0, 0, 0, 0 }, &.{ 1, 1, nb, rp }, &.{ 1, 1, 1, 1 });
-        const o_lat = try g.adopt((try dsa.sparseLatentRope(g.s, q_lat, qp, lat, pe, idx, scale)) orelse return error.DsaKernelDeclined);
-        try outs.append(carry.a, g.keep(try qlinear(g, o_lat, lw.unembed_out)));
+        try outs.append(carry.a, g.keep(try attendSpan(g, c, lw, try rowSlice(g, q_nope, @intCast(b0), @intCast(b1)), try rowSlice(g, q_pe, @intCast(b0), @intCast(b1)), kv_all, pe_all, nb, idx, scale)));
         g.resetTo(m);
     }
     if (outs.items.len == 1) return g.adopt(outs.items[0]);
@@ -392,6 +385,31 @@ fn attendSpans(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T
     outs.clearRetainingCapacity();
     return out;
 }
+
+/// One span on the DSA kernel: its rows' queries `[1, heads, rows, ·]` (the last rows of the lane's first `nb` keys),
+/// each row over its own keys in `idx` (int32 `[1, rows, width]`), the query absorbed through `embed_q`, the latent
+/// output back through `unembed_out`: `[1, heads, rows, v_head_dim]`.
+fn attendSpan(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T, kv_all: T, pe_all: T, nb: c_int, idx: T, scale: f32) !T {
+    const kvr: c_int = @intCast(c.kv_lora_rank);
+    const rp: c_int = @intCast(c.qk_rope_head_dim);
+    const q_lat = try qlinear(g, q_nope, lw.embed_q);
+    const lat = try g.slice(kv_all, &.{ 0, 0, 0, 0 }, &.{ 1, 1, nb, kvr }, &.{ 1, 1, 1, 1 });
+    const pe = try g.slice(pe_all, &.{ 0, 0, 0, 0 }, &.{ 1, 1, nb, rp }, &.{ 1, 1, 1, 1 });
+    const o_lat = try g.adopt((try dsa.sparseLatentRope(g.s, q_lat, q_pe, lat, pe, idx, scale)) orelse return error.DsaKernelDeclined);
+    return qlinear(g, o_lat, lw.unembed_out);
+}
+
+/// The draft lane's verify on the DSA kernel (`kernels`, every row past `index_topk` keys): the rows as one span, each
+/// over its own selection; within bf16 rounding of the per-row form (the tests' bound), not bit for bit.
+fn attendRows(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T, kv_all: T, pe_all: T, start: u32, rows: u32, scale: f32, carry: *const Carry) !T {
+    var ids: [max_verify_rows]T = undefined;
+    for (ids[0..rows], carry.topk[0..rows]) |*x, t| x.* = try g.reshape(t.?, &.{ 1, 1, @intCast(c.index_topk) });
+    const idx = try g.astype(try g.concat(ids[0..rows], 1), .int32);
+    return attendSpan(g, c, lw, q_nope, q_pe, kv_all, pe_all, @intCast(start + rows), idx, scale);
+}
+
+/// The widest verify `attendRows` takes (the stream's 48 routed ids over top-8: 6 rows).
+const max_verify_rows = 6;
 
 /// Layer `lw`'s query over its input `x [rows, hidden]` (normed) at positions `[start, start + rows)`: the q latent
 /// (the indexer's query input), per head the nope part and the roped part, and on a full layer the indexer's roped
@@ -452,6 +470,12 @@ pub fn absorbedRow(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_p
     return qlinear(g, try sdpa(g, qa, kv_sel, kv_sel, @floatCast(scale64), scores), lw.unembed_out);
 }
 
+/// Every one of the first `rows` rows has its own selection (each attends past `index_topk` keys).
+fn allSelected(carry: *const Carry, rows: u32) bool {
+    for (carry.topk[0..rows]) |t| if (t == null) return false;
+    return true;
+}
+
 /// How a forward of several rows attends: `.auto` (one row absorbed, several in the prompt form), or `.per_row` (each
 /// row absorbed over the keys up to its own position, as serial steps run it: the draft lane's verify).
 pub const Form = enum { auto, per_row };
@@ -490,6 +514,8 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         out = try attendSpans(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, start, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(qhd)))), carry);
     } else if (rows == 1) {
         out = try absorbedRow(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, carry.topk[0]);
+    } else if (form == .per_row and kernels and rows <= max_verify_rows and allSelected(carry, rows)) {
+        out = try attendRows(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, start, rows, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(qhd)))), carry);
     } else if (form == .per_row) {
         var outs: std.ArrayList(T) = .empty;
         defer outs.deinit(carry.a);
@@ -776,6 +802,179 @@ const TestWeights = struct {
     }
 };
 
+/// The kernel-dims model's two attention layers (`kernelDimsConfigJson`): a full one with the indexer, then a shared
+/// one; random 8-bit projections, unit norms.
+fn kernelDimsLayers(g: *G, c: *const glm.Config, tw: TestWeights) ![2]Layer {
+    const h: c_int = @intCast(c.n_heads);
+    const hid: c_int = @intCast(c.hidden_size);
+    const ql: c_int = @intCast(c.q_lora_rank);
+    const kvr: c_int = @intCast(c.kv_lora_rank);
+    const nope: c_int = @intCast(c.qk_nope_head_dim);
+    const qhd: c_int = @intCast(c.qHeadDim());
+    const vd: c_int = @intCast(c.v_head_dim);
+    const ih: c_int = @intCast(c.index_n_heads);
+    const ihd: c_int = @intCast(c.index_head_dim);
+    var layers: [2]Layer = undefined;
+    for (&layers, 0..) |*lw, l| {
+        lw.* = .{
+            .input_norm = try g.ones(&.{hid}, .bfloat16),
+            .post_norm = try g.ones(&.{hid}, .bfloat16),
+            .q_a = try tw.quant(g, &.{ ql, hid }, 0.1),
+            .q_a_norm = try g.ones(&.{ql}, .bfloat16),
+            .q_b = try tw.quant(g, &.{ h * qhd, ql }, 0.15),
+            .kv_a = try tw.quant(g, &.{ kvr + @as(c_int, @intCast(c.qk_rope_head_dim)), hid }, 0.1),
+            .kv_a_norm = try g.ones(&.{kvr}, .bfloat16),
+            .embed_q = try tw.quant(g, &.{ h, kvr, nope }, 0.15),
+            .unembed_out = try tw.quant(g, &.{ h, vd, kvr }, 0.05),
+            .o = try tw.quant(g, &.{ hid, h * vd }, 0.02),
+        };
+        if (l == 0) lw.indexer = .{
+            .wq_b = try tw.dense(g, &.{ ih * ihd, ql }, 0.15),
+            .wk = try tw.dense(g, &.{ ihd, hid }, 0.1),
+            .k_norm_w = try g.ones(&.{ihd}, .bfloat16),
+            .k_norm_b = try g.zeros(&.{ihd}, .bfloat16),
+            .weights_proj = try tw.dense(g, &.{ ih, hid }, 0.1),
+        };
+    }
+    return layers;
+}
+
+test "glm attention: a verify on the DSA kernel attends each row's own selection within bf16 rounding of the per-row form" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const text = try kernelDimsConfigJson(a);
+    defer a.free(text);
+    var c = try glm.Config.parse(a, text, null, null);
+    defer c.deinit(a);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!try dsaKernelsRun(a, s, &c)) return error.SkipZigTest;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(71);
+    const tw: TestWeights = .{ .rand = prng.random() };
+    const hid: c_int = @intCast(c.hidden_size);
+    var layers = try kernelDimsLayers(&g, &c, tw);
+    // A 200-row prompt fills both lanes in the reference's form; then a 4-row verify at 200 (every row past the top-k),
+    // per row and on the kernel, the same selections.
+    const prompt = try tw.dense(&g, &.{ 200, hid }, 1);
+    const rows_v = try tw.dense(&g, &.{ 4, hid }, 1);
+    var outs: [2][2][]f32 = undefined;
+    for ([_]bool{ false, true }, 0..) |kernels, arm| {
+        var cache = try Cache.init(a, &c, 256);
+        defer cache.deinit(&g);
+        {
+            var carry = try Carry.init(a, &c, 200, 200, false);
+            defer carry.deinit(&g);
+            for (&layers, 0..) |*lw, l| _ = try attention(&g, &c, lw, @intCast(l), prompt, 0, 200, &cache, &carry, .auto, false);
+            cache.commit(200);
+        }
+        var carry = try Carry.perRow(a, 4);
+        defer carry.deinit(&g);
+        for (&layers, 0..) |*lw, l| outs[arm][l] = try hostF32(&g, try attention(&g, &c, lw, @intCast(l), rows_v, 200, 4, &cache, &carry, .per_row, kernels));
+    }
+    defer for (outs) |arm| for (arm) |o| a.free(o);
+    for (outs[0], outs[1], 0..) |ref, got, l| {
+        var maxd: f32 = 0;
+        var maxr: f32 = 0;
+        for (ref, got) |r, x| {
+            maxd = @max(maxd, @abs(r - x));
+            maxr = @max(maxr, @abs(r));
+        }
+        const ulp = std.math.pow(f32, 2, @floor(std.math.log2(maxr)) - 7);
+        std.debug.print("glm attention verify on the DSA kernel vs per row, layer {d}: max |d| {d:.5} at outputs up to {d:.3} ({d:.2} bf16 ulp of the scale)\n", .{ l, maxd, maxr, maxd / ulp });
+        try testing.expect(maxr > 0.1 and maxd <= 8 * ulp);
+    }
+}
+
+/// A forward's routed experts that give zero (the trunk's attention under test; the shared expert stays).
+const NoExperts = struct {
+    fn readAheadRoom(_: *NoExperts, _: u32) u32 {
+        return 0;
+    }
+    fn readAheadSeed(_: *NoExperts, _: u32, _: []const u16) !void {}
+    fn stageMisses(_: *NoExperts, _: u32) !void {}
+    fn dropStaged(_: *NoExperts) void {}
+    fn call(_: *NoExperts, g: *G, _: u32, x: T, _: T, _: T, _: ?T, _: []const T) !T {
+        return g.zeros(&.{ g.shapeOf(x).dim(0), g.shapeOf(x).dim(1) }, g.dtypeOf(x));
+    }
+};
+
+test "glm verify: on the DSA kernel a round's logits stay within bf16 rounding of the serial steps' and keep their argmax" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const text = try kernelDimsConfigJson(a);
+    defer a.free(text);
+    var c = try glm.Config.parse(a, text, null, null);
+    defer c.deinit(a);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!try dsaKernelsRun(a, s, &c)) return error.SkipZigTest;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(97);
+    const tw: TestWeights = .{ .rand = prng.random() };
+    const hid: c_int = @intCast(c.hidden_size);
+    const inter: c_int = @intCast(c.intermediate_size);
+    const vocab: c_int = @intCast(c.vocab_size);
+    // The config's layers: two dense ones (the first full), then a sparse one with the shared selection, its routed
+    // experts zero (`NoExperts`), its router and shared expert real.
+    const two = try kernelDimsLayers(&g, &c, tw);
+    var layers: [3]Layer = .{ two[0], two[1], (try kernelDimsLayers(&g, &c, tw))[1] };
+    for (layers[0..2]) |*lw| lw.dense = .{ .gate = try tw.quant(&g, &.{ inter, hid }, 0.1), .up = try tw.quant(&g, &.{ inter, hid }, 0.1), .down = try tw.quant(&g, &.{ hid, inter }, 0.1) };
+    const mi: c_int = @intCast(c.moe_intermediate_size);
+    layers[2].router = .{ .w = try tw.dense(&g, &.{ @intCast(c.n_routed_experts), hid }, 0.1), .bias = try g.zeros(&.{@intCast(c.n_routed_experts)}, .float32) };
+    layers[2].shared = .{ .gate = try tw.quant(&g, &.{ mi, hid }, 0.1), .up = try tw.quant(&g, &.{ mi, hid }, 0.1), .down = try tw.quant(&g, &.{ hid, mi }, 0.1) };
+    layers[2].bank_layer = 0;
+    const w: Weights = .{ .embed = try tw.quant(&g, &.{ vocab, hid }, 1), .norm = try g.ones(&.{hid}, .bfloat16), .lm_head = try tw.quant(&g, &.{ vocab, hid }, 0.1), .layers = &layers };
+    var ids: [204]u32 = undefined;
+    for (&ids) |*t| t.* = prng.random().uintLessThan(u32, @intCast(vocab));
+    var ex: NoExperts = .{};
+    const v: usize = @intCast(vocab);
+    // The serial steps after a 200-token prompt (the reference's forms), then the same 4 tokens as one verify on the
+    // DSA kernel over a second lane filled by the same prompt.
+    var serial: [4 * 256]f32 = undefined;
+    var verify: [4 * 256]f32 = undefined;
+    {
+        var cache = try Cache.init(a, &c, 256);
+        defer cache.deinit(&g);
+        const m = g.mark();
+        defer g.resetTo(m);
+        const p = try forward(&g, a, &c, &w, ids[0..200], 0, &cache, &ex, .{});
+        g.release(p);
+        for (0..4) |i| {
+            const lg = try forward(&g, a, &c, &w, ids[200 + i ..][0..1], @intCast(200 + i), &cache, &ex, .{});
+            defer g.release(lg);
+            _ = try g.hostF32(try g.astype(lg, .float32), serial[i * v ..][0..v]);
+        }
+    }
+    {
+        var cache = try Cache.init(a, &c, 256);
+        defer cache.deinit(&g);
+        const m = g.mark();
+        defer g.resetTo(m);
+        const p = try forward(&g, a, &c, &w, ids[0..200], 0, &cache, &ex, .{});
+        g.release(p);
+        const out = try forwardRows(&g, a, &c, &w, ids[200..204], 200, &cache, &ex, .{ .dsa = true }, .{ .verify = true });
+        defer g.release(out.logits);
+        _ = try g.hostF32(try g.astype(out.logits, .float32), verify[0 .. 4 * v]);
+    }
+    for (0..4) |i| {
+        const ref = serial[i * v ..][0..v];
+        const got = verify[i * v ..][0..v];
+        var maxd: f32 = 0;
+        var maxr: f32 = 0;
+        for (ref, got) |r, x| {
+            maxd = @max(maxd, @abs(r - x));
+            maxr = @max(maxr, @abs(r));
+        }
+        const ulp = std.math.pow(f32, 2, @floor(std.math.log2(maxr)) - 7);
+        std.debug.print("glm verify on the DSA kernel vs the serial steps, row {d}: logits max |d| {d:.5} at logits up to {d:.3} ({d:.2} bf16 ulp of the scale), argmax {d} / {d}\n", .{ i, maxd, maxr, maxd / ulp, std.mem.indexOfMax(f32, ref), std.mem.indexOfMax(f32, got) });
+        try testing.expect(maxr > 0.1 and maxd <= 8 * ulp);
+        try testing.expectEqual(std.mem.indexOfMax(f32, ref), std.mem.indexOfMax(f32, got));
+    }
+}
+
 test "glm attention: a prompt on the DSA kernels selects the reference's keys and matches its prompt form" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
@@ -791,37 +990,8 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
     defer g.deinit();
     var prng = std.Random.DefaultPrng.init(53);
     const tw: TestWeights = .{ .rand = prng.random() };
-    const h: c_int = @intCast(c.n_heads);
     const hid: c_int = @intCast(c.hidden_size);
-    const ql: c_int = @intCast(c.q_lora_rank);
-    const kvr: c_int = @intCast(c.kv_lora_rank);
-    const nope: c_int = @intCast(c.qk_nope_head_dim);
-    const qhd: c_int = @intCast(c.qHeadDim());
-    const vd: c_int = @intCast(c.v_head_dim);
-    const ih: c_int = @intCast(c.index_n_heads);
-    const ihd: c_int = @intCast(c.index_head_dim);
-    var layers: [2]Layer = undefined;
-    for (&layers, 0..) |*lw, l| {
-        lw.* = .{
-            .input_norm = try g.ones(&.{hid}, .bfloat16),
-            .post_norm = try g.ones(&.{hid}, .bfloat16),
-            .q_a = try tw.quant(&g, &.{ ql, hid }, 0.1),
-            .q_a_norm = try g.ones(&.{ql}, .bfloat16),
-            .q_b = try tw.quant(&g, &.{ h * qhd, ql }, 0.15),
-            .kv_a = try tw.quant(&g, &.{ kvr + @as(c_int, @intCast(c.qk_rope_head_dim)), hid }, 0.1),
-            .kv_a_norm = try g.ones(&.{kvr}, .bfloat16),
-            .embed_q = try tw.quant(&g, &.{ h, kvr, nope }, 0.15),
-            .unembed_out = try tw.quant(&g, &.{ h, vd, kvr }, 0.05),
-            .o = try tw.quant(&g, &.{ hid, h * vd }, 0.02),
-        };
-        if (l == 0) lw.indexer = .{
-            .wq_b = try tw.dense(&g, &.{ ih * ihd, ql }, 0.15),
-            .wk = try tw.dense(&g, &.{ ihd, hid }, 0.1),
-            .k_norm_w = try g.ones(&.{ihd}, .bfloat16),
-            .k_norm_b = try g.zeros(&.{ihd}, .bfloat16),
-            .weights_proj = try tw.dense(&g, &.{ ih, hid }, 0.1),
-        };
-    }
+    var layers = try kernelDimsLayers(&g, &c, tw);
     // Two prompt calls (200 rows, then 40 more): spans past the top-k, the selection carried to the shared layer.
     const calls = [_][2]u32{ .{ 0, 200 }, .{ 200, 40 } };
     var xs: [calls.len]T = undefined;
