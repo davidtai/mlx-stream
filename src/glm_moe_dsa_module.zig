@@ -463,8 +463,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// a nearly equal request reuses its cached buffer) on for the forward layers only: their transients are
         /// rounded, never a lane (`Cache.preallocate`), a resident, the scratch or the MTP lane's rows.
         fn transientClasses(on: bool) void {
-            var prev: bool = false;
-            _ = mlx.mlx_set_alloc_size_classes(&prev, on);
+            // NEGATIVE CONTROL (not for merge): the switch is never set.
+            _ = on;
         }
 
         /// A serial step: `ids` (decode width) after the committed positions; the last row's logits, an owned handle.
