@@ -49,6 +49,19 @@ pub inline fn phase(g: *ops.MlxOps, xs: []const ops.MlxOps.T, p: Phase) !u64 {
     return d;
 }
 
+/// DIAG, not for merge: the output projection's split, charged to `oproj` too: the attention output's copy to rows, the
+/// GEMM (the rest of the phase is the residual add).
+pub var oproj_split_ns: [2]u64 = @splat(0);
+
+pub inline fn oprojSub(g: *ops.MlxOps, xs: []const ops.MlxOps.T, i: usize) !void {
+    if (comptime !enabled) return;
+    try g.evalAll(xs);
+    const t = now();
+    oproj_split_ns[i] += t - last;
+    ns[@intFromEnum(Phase.oproj)] += t - last;
+    last = t;
+}
+
 /// The time since `t0` charged to the routed call's `r` (the routed phase's total is its own).
 pub inline fn chargeRouted(r: Routed, t0: Stamp) void {
     if (comptime !enabled) return;
@@ -88,6 +101,8 @@ pub fn report(tokens: u64) void {
         sec(ns[@intFromEnum(Phase.mlp)]),
         sec(ns[@intFromEnum(Phase.rest)]),
     });
+    log.info("glm_moe_dsa profile: oproj split: copy {d:.2}, gemm {d:.2}, add {d:.2}\n", .{ sec(oproj_split_ns[0]), sec(oproj_split_ns[1]), sec(ns[@intFromEnum(Phase.oproj)] - oproj_split_ns[0] - oproj_split_ns[1]) });
+    oproj_split_ns = @splat(0);
     ns = @splat(0);
     routed_ns = @splat(0);
     attn_full_ns = 0;

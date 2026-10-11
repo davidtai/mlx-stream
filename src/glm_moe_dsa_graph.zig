@@ -535,6 +535,18 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     }
     if (pt.enabled and rows > 1) pt.chargeAttn(lw.indexer != null, try pt.phase(g, &.{out}, .attn));
     const o2 = try g.reshape(try g.transposeAxes(out, &.{ 0, 2, 1, 3 }), &.{ n, heads * @as(c_int, @intCast(c.v_head_dim)) });
+    if (pt.enabled and rows > 1) {
+        var oc_raw = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_contiguous(&oc_raw, o2, false, g.s)) catch |e| {
+            _ = mlx.mlx_array_free(oc_raw);
+            return e;
+        };
+        const oc = try g.adopt(oc_raw);
+        try pt.oprojSub(g, &.{oc}, 0);
+        const y = try qlinear(g, oc, lw.o);
+        try pt.oprojSub(g, &.{y}, 1);
+        return y;
+    }
     return qlinear(g, o2, lw.o);
 }
 
