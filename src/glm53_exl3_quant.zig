@@ -854,6 +854,10 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
 // Depths: none (the wave's take and the step's join alone), gate|up, gate|up + mid|down, the full chain (+ the reduce).
 // Each step's next x reads one element of every wave's output, so the steps run in order; 32 steps per eval, best of 7.
 // The read kernel streams the slot rows' trellis words once per listed mini (16 launches an eval, independent).
+fn nbytesOf(x: mlx.mlx_array) u64 {
+    return mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+}
+
 fn benchDecode4(a: Allocator, g: anytype, theirs: anytype, banks: anytype, slot_of: []const u32, b: *const bank_mod.Bank, h: usize) !void {
     const T = mlx.mlx_array;
     const kern = sushi.kernels;
@@ -873,10 +877,10 @@ fn benchDecode4(a: Allocator, g: anytype, theirs: anytype, banks: anytype, slot_
     for (0..2) |side| {
         const bk = banks[side];
         const n_rows: u64 = @intCast(mlx.getShape(bk.gate.trellis)[0]);
-        mini_bytes[side] = mlx.mlx_array_nbytes(bk.gate.trellis) / n_rows;
-        if (mlx.mlx_array_nbytes(bk.down.trellis) / n_rows != mini_bytes[side] or mlx.mlx_array_nbytes(bk.up.trellis) / n_rows != mini_bytes[side]) return error.BenchShape;
-        scale_bytes[side] = (mlx.mlx_array_nbytes(bk.gate.suh) + mlx.mlx_array_nbytes(bk.up.suh) + mlx.mlx_array_nbytes(bk.down.suh) +
-            mlx.mlx_array_nbytes(bk.gate.svh) + mlx.mlx_array_nbytes(bk.up.svh) + mlx.mlx_array_nbytes(bk.down.svh)) / n_rows;
+        mini_bytes[side] = nbytesOf(bk.gate.trellis) / n_rows;
+        if (nbytesOf(bk.down.trellis) / n_rows != mini_bytes[side] or nbytesOf(bk.up.trellis) / n_rows != mini_bytes[side]) return error.BenchShape;
+        scale_bytes[side] = (nbytesOf(bk.gate.suh) + nbytesOf(bk.up.suh) + nbytesOf(bk.down.suh) +
+            nbytesOf(bk.gate.svh) + nbytesOf(bk.up.svh) + nbytesOf(bk.down.svh)) / n_rows;
     }
     // 22 distinct experts; 4 rows: row 0 experts 0-7, row 1 8-14 and 0, row 2 15-21 and 1, row 3 2-6
     const D = 22;
