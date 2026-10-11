@@ -477,14 +477,15 @@ pub fn absorbedRow(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_p
     return qlinear(g, o_, lw.unembed_out);
 }
 
-/// How a forward of several rows attends: `.auto` (one row absorbed, several in the prompt form), or `.per_row` (each
-/// row absorbed over the keys up to its own position, as serial steps run it: the draft lane's verify).
-pub const Form = enum { auto, per_row };
+/// How a forward of several rows attends: `.auto` (one row absorbed, several in the prompt form), `.per_row` (each
+/// row absorbed over the keys up to its own position, as serial steps run it: the draft lane's verify), or `.span`
+/// (the verify's rows as one prompt span on the DSA kernels: each row over its own keys, not a serial step's bits).
+pub const Form = enum { auto, per_row, span };
 
 /// Layer `l`'s attention over its input `x [rows, hidden]` (normed) at positions `[start, start + rows)`: the new KV
 /// appended, the indexer's selection made (full layers) or read from `carry` (shared), the output `[rows, hidden]`.
-/// `.per_row` takes a `Carry.perRow` (one block per row). A prompt (`.auto`) on the DSA kernels (`kernels`) runs
-/// `selectSpans` and `attendSpans`.
+/// `.per_row` takes a `Carry.perRow` (one block per row). A prompt (`.auto`) or `.span` on the DSA kernels (`kernels`)
+/// runs `selectSpans` and `attendSpans`.
 pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, start: u32, rows: u32, cache: *Cache, carry: *Carry, form: Form, kernels: bool) !T {
     const heads: c_int = @intCast(c.n_heads);
     const qhd: c_int = @intCast(c.qHeadDim());
@@ -501,7 +502,7 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         _ = try pt.phase(g, cache.buffers(l, &bufs), .proj);
         _ = try pt.phase(g, &.{ q.q_nope, q.q_pe, q.qr }, .proj);
     }
-    const spans = kernels and form == .auto and rows > 1;
+    const spans = kernels and form != .per_row and rows > 1;
     if (lw.indexer) |ix| {
         const ik_all = try cache.indexView(g, l);
         if (spans) try selectSpans(g, c, ix, x, q.iq.?, ik_all, start, carry) else try select(g, c, ix, x, q.iq.?, ik_all, start, rows, carry);
@@ -779,8 +780,8 @@ pub const WaveProbe = struct {
 
 /// What a forward returns beyond the last row's logits.
 pub const Want = struct {
-    /// The draft lane's verify: every row's logits, the attention per row (`Form.per_row`), and the decode lane's
-    /// routes (no per-layer evaluation, the lookahead's scores).
+    /// The draft lane's verify: every row's logits, the attention per row (`Form.per_row`; on the DSA kernels its rows
+    /// as one span, `Form.span`), and the decode lane's routes (no per-layer evaluation, the lookahead's scores).
     verify: bool = false,
     /// Every row's final-normed hidden `[rows, hidden]` kept (the MTP layer's input).
     hidden: bool = false,
@@ -802,7 +803,8 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
 pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, ex: anytype, rt: Routes, want: Want) !Out {
     const rows: u32 = @intCast(ids.len);
     const prompt = rows > 1 and !want.verify;
-    var carry = if (want.verify) try Carry.perRow(a, rows) else try Carry.init(a, c, rows, start + rows, rt.dsa);
+    const form: Form = if (!want.verify) .auto else if (rt.dsa and rows > 1) .span else .per_row;
+    var carry = if (form == .per_row) try Carry.perRow(a, rows) else try Carry.init(a, c, rows, start + rows, rt.dsa);
     defer carry.deinit(g);
     var seed: std.ArrayList(u16) = .empty;
     defer seed.deinit(a);
@@ -831,7 +833,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{}, .seed);
         at("input_norm");
         const x = try rmsNorm(g, h, lw.input_norm, c.rms_norm_eps);
-        const att_ = try attention(g, c, lw, l, x, start, rows, cache, &carry, if (want.verify) .per_row else .auto, rt.dsa);
+        const att_ = try attention(g, c, lw, l, x, start, rows, cache, &carry, form, rt.dsa);
         at("residual1");
         const h1 = try g.add(h, att_);
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{h1}, .oproj);
@@ -912,7 +914,65 @@ const TestWeights = struct {
         const parts = try ops.quantizeAffine(g, try tw.dense(g, shape, sd), glm.group_size, 8);
         return .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = 8 };
     }
+
+    /// The attention of a full layer and a shared one at `c`'s dims (unit norms).
+    fn attentionLayers(tw: TestWeights, g: *G, c: *const glm.Config) ![2]Layer {
+        const h: c_int = @intCast(c.n_heads);
+        const hid: c_int = @intCast(c.hidden_size);
+        const ql: c_int = @intCast(c.q_lora_rank);
+        const kvr: c_int = @intCast(c.kv_lora_rank);
+        const nope: c_int = @intCast(c.qk_nope_head_dim);
+        const qhd: c_int = @intCast(c.qHeadDim());
+        const vd: c_int = @intCast(c.v_head_dim);
+        const ih: c_int = @intCast(c.index_n_heads);
+        const ihd: c_int = @intCast(c.index_head_dim);
+        var layers: [2]Layer = undefined;
+        for (&layers, 0..) |*lw, l| {
+            lw.* = .{
+                .input_norm = try g.ones(&.{hid}, .bfloat16),
+                .post_norm = try g.ones(&.{hid}, .bfloat16),
+                .q_a = try tw.quant(g, &.{ ql, hid }, 0.1),
+                .q_a_norm = try g.ones(&.{ql}, .bfloat16),
+                .q_b = try tw.quant(g, &.{ h * qhd, ql }, 0.15),
+                .kv_a = try tw.quant(g, &.{ kvr + @as(c_int, @intCast(c.qk_rope_head_dim)), hid }, 0.1),
+                .kv_a_norm = try g.ones(&.{kvr}, .bfloat16),
+                .embed_q = try tw.quant(g, &.{ h, kvr, nope }, 0.15),
+                .unembed_out = try tw.quant(g, &.{ h, vd, kvr }, 0.05),
+                .o = try tw.quant(g, &.{ hid, h * vd }, 0.02),
+            };
+            if (l == 0) lw.indexer = .{
+                .wq_b = try tw.dense(g, &.{ ih * ihd, ql }, 0.15),
+                .wk = try tw.dense(g, &.{ ihd, hid }, 0.1),
+                .k_norm_w = try g.ones(&.{ihd}, .bfloat16),
+                .k_norm_b = try g.zeros(&.{ihd}, .bfloat16),
+                .weights_proj = try tw.dense(g, &.{ ih, hid }, 0.1),
+            };
+        }
+        return layers;
+    }
 };
+
+/// Each output's agreement with its reference: the cosine and the largest difference against the largest reference
+/// value, printed; `cos > 0.999` and `max |d| <= 0.05 * max |ref|`.
+fn expectClose(comptime what: []const u8, refs: []const []f32, gots: []const []f32) !void {
+    for (refs, gots, 0..) |ref, got, i| {
+        var dot: f64 = 0;
+        var nr: f64 = 0;
+        var ng: f64 = 0;
+        var maxd: f32 = 0;
+        var maxr: f32 = 0;
+        for (ref, got) |r, x| {
+            dot += r * x;
+            nr += r * r;
+            ng += x * x;
+            maxd = @max(maxd, @abs(r - x));
+            maxr = @max(maxr, @abs(r));
+        }
+        const cos = dot / @sqrt(nr * ng);
+        std.debug.print(what ++ ", call {d} layer {d}: cos {d:.6}, max |d| {d:.4} (output up to {d:.3})\n", .{ i / 2, i % 2, cos, maxd, maxr });
+        try testing.expect(cos > 0.999 and maxd <= 0.05 * maxr);
+    }
+}
 
 test "glm wave probe: a layer's stages are its rises over the layer's start; the line carries every layer" {
     var p: WaveProbe = .{};
@@ -945,37 +1005,8 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
     defer g.deinit();
     var prng = std.Random.DefaultPrng.init(53);
     const tw: TestWeights = .{ .rand = prng.random() };
-    const h: c_int = @intCast(c.n_heads);
     const hid: c_int = @intCast(c.hidden_size);
-    const ql: c_int = @intCast(c.q_lora_rank);
-    const kvr: c_int = @intCast(c.kv_lora_rank);
-    const nope: c_int = @intCast(c.qk_nope_head_dim);
-    const qhd: c_int = @intCast(c.qHeadDim());
-    const vd: c_int = @intCast(c.v_head_dim);
-    const ih: c_int = @intCast(c.index_n_heads);
-    const ihd: c_int = @intCast(c.index_head_dim);
-    var layers: [2]Layer = undefined;
-    for (&layers, 0..) |*lw, l| {
-        lw.* = .{
-            .input_norm = try g.ones(&.{hid}, .bfloat16),
-            .post_norm = try g.ones(&.{hid}, .bfloat16),
-            .q_a = try tw.quant(&g, &.{ ql, hid }, 0.1),
-            .q_a_norm = try g.ones(&.{ql}, .bfloat16),
-            .q_b = try tw.quant(&g, &.{ h * qhd, ql }, 0.15),
-            .kv_a = try tw.quant(&g, &.{ kvr + @as(c_int, @intCast(c.qk_rope_head_dim)), hid }, 0.1),
-            .kv_a_norm = try g.ones(&.{kvr}, .bfloat16),
-            .embed_q = try tw.quant(&g, &.{ h, kvr, nope }, 0.15),
-            .unembed_out = try tw.quant(&g, &.{ h, vd, kvr }, 0.05),
-            .o = try tw.quant(&g, &.{ hid, h * vd }, 0.02),
-        };
-        if (l == 0) lw.indexer = .{
-            .wq_b = try tw.dense(&g, &.{ ih * ihd, ql }, 0.15),
-            .wk = try tw.dense(&g, &.{ ihd, hid }, 0.1),
-            .k_norm_w = try g.ones(&.{ihd}, .bfloat16),
-            .k_norm_b = try g.zeros(&.{ihd}, .bfloat16),
-            .weights_proj = try tw.dense(&g, &.{ ih, hid }, 0.1),
-        };
-    }
+    const layers = try tw.attentionLayers(&g, &c);
     // Two prompt calls (200 rows, then 40 more): spans past the top-k, the selection carried to the shared layer.
     const calls = [_][2]u32{ .{ 0, 200 }, .{ 200, 40 } };
     var xs: [calls.len]T = undefined;
@@ -1011,21 +1042,63 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
     defer for (sel) |x| a.free(x);
     const reach = (c.index_topk - 1) * c.index_topk;
     try testing.expectEqualSlices(u32, sel[0][reach..], sel[1][reach..]);
-    for (outs[0], outs[1], 0..) |ref, got, i| {
-        var dot: f64 = 0;
-        var nr: f64 = 0;
-        var ng: f64 = 0;
-        var maxd: f32 = 0;
-        var maxr: f32 = 0;
-        for (ref, got) |r, x| {
-            dot += r * x;
-            nr += r * r;
-            ng += x * x;
-            maxd = @max(maxd, @abs(r - x));
-            maxr = @max(maxr, @abs(r));
+    try expectClose("glm attention kernels vs reference form", &outs[0], &outs[1]);
+}
+
+test "glm attention: the verify's rows as one span on the DSA kernels select each row's keys and match the per-row verify" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const text = try kernelDimsConfigJson(a);
+    defer a.free(text);
+    var c = try glm.Config.parse(a, text, null, null);
+    defer c.deinit(a);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!try dsaKernelsRun(a, s, &c)) return error.SkipZigTest;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(54);
+    const tw: TestWeights = .{ .rand = prng.random() };
+    const hid: c_int = @intCast(c.hidden_size);
+    const layers = try tw.attentionLayers(&g, &c);
+    // A 200-row prompt on the kernels, then two verifies of 4 rows (keys past the top-k), the per-row form against
+    // the span's, each arm over its own copy of the same cache.
+    const p0: u32 = 200;
+    const prompt = try tw.dense(&g, &.{ @intCast(p0), hid }, 1);
+    const vs = [_]T{ try tw.dense(&g, &.{ 4, hid }, 1), try tw.dense(&g, &.{ 4, hid }, 1) };
+    var outs: [2][vs.len * 2][]f32 = undefined;
+    var sel: [2][vs.len][]u32 = undefined;
+    for ([_]Form{ .per_row, .span }, 0..) |form, arm| {
+        var cache = try Cache.init(a, &c, 256);
+        defer cache.deinit(&g);
+        {
+            var carry = try Carry.init(a, &c, p0, p0, true);
+            defer carry.deinit(&g);
+            for (&layers, 0..) |*lw, l| _ = try attention(&g, &c, lw, @intCast(l), prompt, 0, p0, &cache, &carry, .auto, true);
+            cache.commit(p0);
         }
-        const cos = dot / @sqrt(nr * ng);
-        std.debug.print("glm attention kernels vs reference form, call {d} layer {d}: cos {d:.6}, max |d| {d:.4} (output up to {d:.3})\n", .{ i / 2, i % 2, cos, maxd, maxr });
-        try testing.expect(cos > 0.999 and maxd <= 0.05 * maxr);
+        for (vs, 0..) |x, vi| {
+            const start = p0 + 4 * @as(u32, @intCast(vi));
+            var carry = if (form == .per_row) try Carry.perRow(a, 4) else try Carry.init(a, &c, 4, start + 4, true);
+            defer carry.deinit(&g);
+            for (&layers, 0..) |*lw, l| {
+                const yf = try g.astype(try attention(&g, &c, lw, @intCast(l), x, start, 4, &cache, &carry, form, true), .float32);
+                outs[arm][vi * 2 + l] = try a.alloc(f32, @intCast(g.shapeOf(yf).numel()));
+                _ = try g.hostF32(yf, outs[arm][vi * 2 + l]);
+                if (l == 0) {
+                    var ids: std.ArrayList(T) = .empty;
+                    defer ids.deinit(a);
+                    for (carry.topk) |t| try ids.append(a, try g.reshape(t.?, &.{ -1, @intCast(c.index_topk) }));
+                    const all = try g.sort(try g.astype(try g.concat(ids.items, 0), .uint32), -1);
+                    sel[arm][vi] = try a.alloc(u32, 4 * c.index_topk);
+                    _ = try g.hostU32(all, sel[arm][vi]);
+                }
+            }
+            cache.commit(4);
+        }
     }
+    defer for (outs) |arm| for (arm) |o| a.free(o);
+    defer for (sel) |arm| for (arm) |x| a.free(x);
+    for (sel[0], sel[1]) |want, got| try testing.expectEqualSlices(u32, want, got);
+    try expectClose("glm verify span vs per row", &outs[0], &outs[1]);
 }

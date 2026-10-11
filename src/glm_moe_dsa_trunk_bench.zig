@@ -292,7 +292,7 @@ test "glm trunk bench: the verify's trunk per layer, by command buffer and op by
     try wr.print("{{\"kind\":\"config\",\"layers\":{d},\"rows\":{d},\"len0\":{d},\"cap\":{d},\"reps\":{d},\"full\":[", .{ n_layers, rows_n, len0, cap, reps });
     for (0..n_layers) |l| try wr.print("{s}{}", .{ if (l == 0) "" else ",", c.isFull(@intCast(l)) });
     try wr.writeAll("]}\n");
-    const routes: graph.Routes = .{ .read_ahead = false, .lookahead = true, .max_route_ids = 48, .dsa = false };
+    const routes: graph.Routes = .{ .read_ahead = false, .lookahead = true, .max_route_ids = 48, .dsa = try graph.dsaKernelsRun(a, s, &c) };
     // A calibration: an eval of a one-element add, alone (the command buffer's own span).
     {
         const r0 = counts()[0];
