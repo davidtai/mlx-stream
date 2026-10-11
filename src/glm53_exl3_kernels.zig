@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
-pub const manifest_sha256 = "e03389a3295242904c6ae3393f4c9bc309351e1e34b66b20d6234d0a34217ca9";
+pub const manifest_sha256 = "be812cbfb809d299382bd7dd35a5a341454369f10fb99fda49354869612a405c";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
 const dir = "kernels/glm53_exl3/";
 
@@ -412,8 +412,13 @@ test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel 
     try testing.expect(std.mem.indexOf(u8, reg.get(.glm53_pf_gu).header_text, "g53_mcg2") != null and std.mem.indexOf(u8, reg.get(.glm53_pf_gu).header_text, "tile_matmad_nax") != null);
     try testing.expectEqual(Family.prompt, reg.get(.glm53_pf_down).family);
     try testing.expect(reg.get(.glm53_dec_gu).per_k and !reg.get(.glm53_dec_prep).per_k);
-    // the down stage binds every bank kind's five arrays: 19 inputs
-    try testing.expectEqual(@as(usize, 19), reg.get(.glm53_dec_down).inputs.len);
+    // the down stage binds the slot table and every bank kind's five arrays: 20 inputs; the decode GEMVs group a slot's
+    // members (MAXM), two output tiles over eight simdgroups (gu) and a 128-block over sixteen (down) a threadgroup
+    try testing.expectEqual(@as(usize, 20), reg.get(.glm53_dec_down).inputs.len);
+    for ([_]Kernel{ .glm53_dec_gu, .glm53_dec_down }, [_]u32{ 256, 512 }) |k, tg| {
+        try testing.expectEqual([3]u32{ tg, 1, 1 }, reg.get(k).threadgroup);
+        try testing.expectEqualStrings("MAXM", reg.get(k).template[3]);
+    }
     var diag: Diag = .{};
     try testing.expectError(error.InstanceNotRegistered, reg.instance(.glm53_dec_gu, .{ .k = 3, .hidden = 5120, .mini = 576 }, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "glm53_dec_gu is not registered at K 3, hidden 5120, mini 576") != null);
@@ -450,7 +455,7 @@ test "glm53 exl3 kernels: a tampered text or header, another pin, another bank o
         .{ .needle = "\"name\":\"glm53_pf_mid\"", .repl = "\"name\":\"glm53_pf_mid2\"", .err = error.UnknownKernel, .names = "glm53_pf_mid2" },
         .{ .needle = "\"name\":\"glm53_pf_mid\"", .repl = "\"name\":\"glm53_pf_gu\"", .err = error.DuplicateKernel, .names = "glm53_pf_gu listed twice" },
         .{ .needle = "\"format\":\"mlx-stream-glm53-exl3-kernels-v1\"", .repl = "\"format\":\"mlx-stream-glm53-exl3-kernels-v2\"", .err = error.ManifestFormat, .names = "v2" },
-        .{ .needle = "\"threadgroup\":[128,1,1]", .repl = "\"threadgroup\":[2048,1,1]", .err = error.SchemaInvalid, .names = "threadgroup 2048x1x1" },
+        .{ .needle = "\"threadgroup\":[512,1,1]", .repl = "\"threadgroup\":[2048,1,1]", .err = error.SchemaInvalid, .names = "threadgroup 2048x1x1" },
     }) |c| {
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, embedded.manifest, c.needle));
         const m = try std.mem.replaceOwned(u8, a, embedded.manifest, c.needle, c.repl);

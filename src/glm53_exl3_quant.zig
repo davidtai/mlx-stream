@@ -606,6 +606,13 @@ test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's E
     var fworst: f32 = 0;
     var fscale: f32 = 0;
     var scale: f32 = 0;
+    // each pair's output (fused: minis summed, score 1, bf16) against the f32 host decode of its expert's records, these
+    // texts' GEMVs and sushi's chain; and the words where `fused` (the decode lane's waves) differs from these texts'
+    var rscale: f32 = 0;
+    var oerr: f32 = 0;
+    var serr: f32 = 0;
+    var fused_differ: usize = 0;
+    var fused_words: usize = 0;
     // decode widths: each row 8 distinct experts of the 16, the two bank layers' waves, the call's combine
     for (1..7) |n| {
         const m = g.mark();
@@ -665,6 +672,23 @@ test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's E
                 fscale = @max(fscale, @abs(wv));
                 fworst = @max(fworst, @abs(wv - gv));
             }
+            var xr: [48 * 128]f32 = undefined;
+            _ = try g.hostF32(try g.astype(xt, .float32), xr[0 .. np * h]);
+            var ref: [128]f32 = undefined;
+            const one = [1]f32{1};
+            for (0..np) |i| {
+                old_quant.hostMoe(img, &b, 0, xr[i * h ..][0..h], ids[pos_of[i]..][0..1], &one, 1, ref[0..h]);
+                for (ref[0..h], yo[i * h ..][0..h], yh[i * h ..][0..h]) |rv, ov, sv| {
+                    rscale = @max(rscale, @abs(rv));
+                    oerr = @max(oerr, @abs(ov - rv));
+                    serr = @max(serr, @abs(sv - rv));
+                }
+            }
+            const yf = try ours.fused(&g, xt, slots[0..np], banks[side]);
+            var yfh: [48 * 128]f32 = undefined;
+            _ = try g.hostF32(try g.astype(yf, .float32), yfh[0 .. np * h]);
+            for (yfh[0 .. np * h], yo[0 .. np * h]) |fv, ov| fused_differ += @intFromBool(@as(u32, @bitCast(fv)) != @as(u32, @bitCast(ov)));
+            fused_words += np * h;
         }
         const y = try ours.decodeCombine(&g, &outs, loc[0 .. n * 8], @intCast(n));
         var got: [6 * 128]f32 = undefined;
@@ -678,6 +702,11 @@ test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's E
     std.debug.print("glm53 exl3 quant vs sushi on the same slots: decode widths 1..6 max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp); the fused waves max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp)\n", .{ worst, scale, dec_ulp, fworst, fscale, fworst / selfcheck.bf16Ulp(fscale) });
     try testing.expect(scale > 0.1 and worst <= 2 * selfcheck.bf16Ulp(scale));
     try testing.expect(fscale > 0.1 and fworst <= 2 * selfcheck.bf16Ulp(fscale));
+    // the bound: each pair's bf16 output within one bf16 ulp of the f32 host decode's scale, and no farther from it
+    // than sushi's chain
+    const rulp = selfcheck.bf16Ulp(rscale);
+    std.debug.print("glm53 exl3 quant decode waves vs the f32 host decode of the records (pairs, minis summed, bf16): these texts max |d| {d:.5} ({d:.2} bf16 ulp at {d:.3}), sushi's {d:.5} ({d:.2} ulp); fused differs from these texts in {d} of {d} words\n", .{ oerr, oerr / rulp, rscale, serr, serr / rulp, fused_differ, fused_words });
+    try testing.expect(rscale > 0.1 and oerr <= rulp and oerr <= serr);
     // prompt widths: one call per bank layer over 40 and 300 routed rows of its experts (act rows of 64 tokens)
     var pw: f32 = 0;
     var ps: f32 = 0;
@@ -708,6 +737,8 @@ test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's E
     };
     std.debug.print("glm53 exl3 quant vs sushi on the same slots: prompt widths 40 and 300 max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp)\n", .{ pw, ps, pw / selfcheck.bf16Ulp(ps) });
     try testing.expect(ps > 0.1 and pw <= 2 * selfcheck.bf16Ulp(ps));
+    // the decode lane's waves (`fused`) are these texts' GEMVs, word for word
+    try testing.expectEqual(@as(usize, 0), fused_differ);
 }
 
 fn nowNs() u64 {
@@ -872,10 +903,10 @@ fn nbytesOf(x: mlx.mlx_array) u64 {
 const dec_exps = [_]BenchExp{
     .{ .name = "prep: nothing (returns)", .kernel = .glm53_dec_prep, .needle = "    if (packed == 0xffffffffu || sc[pos] == 0.0f) return;", .repl = "    if (true) return;" },
     .{ .name = "gu: nothing (returns)", .kernel = .glm53_dec_gu, .needle = "    if (packed == 0xffffffffu) return;", .repl = "    if (true) return;" },
-    .{ .name = "gu: an eighth of the k-tiles", .kernel = .glm53_dec_gu, .needle = "    for (uint tk = 0u; tk < IT; ++tk) {", .repl = "    for (uint tk = 0u; tk < IT / 8u; ++tk) {" },
-    .{ .name = "down: nothing (zeros)", .kernel = .glm53_dec_down, .needle = "    if (packed == 0xffffffffu || sc[pos] == 0.0f) {", .repl = "    if (true) {" },
-    .{ .name = "down: no middle", .kernel = .glm53_dec_down, .needle = "    for (uint job = sg; job < 4u * NIB; job += 8u) {", .repl = "    for (uint job = sg; job < 0u; job += 8u) {" },
-    .{ .name = "down: one mini's GEMV", .kernel = .glm53_dec_down, .needle = "    for (uint r = 0u; r < 4u; ++r) {\n        const device uint* tw", .repl = "    for (uint r = 0u; r < 1u; ++r) {\n        const device uint* tw" },
+    .{ .name = "gu: an eighth of the k-tiles", .kernel = .glm53_dec_gu, .needle = "    for (uint tk = sg; tk < IT; tk += SGS) {", .repl = "    for (uint tk = sg; tk < IT / 8u; tk += SGS) {" },
+    .{ .name = "down: nothing (returns)", .kernel = .glm53_dec_down, .needle = "    if (n_live == 0u) return;", .repl = "    if (true) return;" },
+    .{ .name = "down: no middle", .kernel = .glm53_dec_down, .needle = "    for (uint job = sg; job < uint(MAXM) * 4u * NIB; job += SGS) {", .repl = "    for (uint job = sg; job < 0u; job += SGS) {" },
+    .{ .name = "down: half the minis' GEMV", .kernel = .glm53_dec_down, .needle = "    for (uint r = sg >> 3u; r < 4u; r += 2u) {", .repl = "    for (uint r = sg >> 3u; r < 2u; r += 2u) {" },
 };
 
 /// One experiment's registry over its mutated text, bound on the bench's stream, and its decode chains (K3, K4).

@@ -560,7 +560,7 @@ test "glm53 selfcheck: each chain check fails on a wrong codebook, a wrong K, a 
         std.debug.print("glm53 selfcheck mutations {t} K{d}: clean {d:.3} ulp; codebook {d} bad, rank sum {d} bad of {d}\n", .{ fam, k, clean.metric, cb.bad, rank.bad, rank.words });
         if (fam == .decode) {
             // the device mode's pair of score 0 through the down (its slot's NaN rin and rout read)
-            const skip = try mutatedText(a, s, .{ .kernel = .glm53_dec_down }, "if (packed == 0xffffffffu || sc[pos] == 0.0f) {", "if (packed == 0xffffffffu) {", fam, inst);
+            const skip = try mutatedText(a, s, .{ .kernel = .glm53_dec_down }, "live[j] = packed != 0xffffffffu && j < cnt && sc[pos[j]] != 0.0f;", "live[j] = packed != 0xffffffffu && j < cnt;", fam, inst);
             try testing.expect(!skip.ok and skip.bad > 0);
             std.debug.print("glm53 selfcheck mutations decode K{d}: score-0 skip dropped {d} bad of {d}\n", .{ k, skip.bad, skip.words });
         }
