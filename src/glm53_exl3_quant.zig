@@ -856,6 +856,7 @@ const bench_exps = [_]BenchExp{
     .{ .name = "gu: no MMA (decode, rotation, scale alone)", .kernel = .glm53_pf_gu, .edits = &.{.{ mma_call, "(void)Atile; (void)Btile;" }} },
     .{ .name = "gu: A rows contiguous (no gather)", .kernel = .glm53_pf_gu, .edits = &.{.{ "xr[i][e] = x + size_t(rt[2u * uint(row0 + rr)]) * size_t(HID) + size_t(fc.x);", "xr[i][e] = x + size_t(row0 + rr) * size_t(HID) + size_t(fc.x);" }} },
     .{ .name = "gu: A constant (no x loads)", .kernel = .glm53_pf_gu, .edits = &.{.{ "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));", "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(0.01f * float(jj + e)); (void)p;" }} },
+    .{ .name = "gu: MMA alone (no trellis decode, A constant)", .kernel = .glm53_pf_gu, .edits = &.{ .{ decode_call, no_decode_gu }, .{ "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));", "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(0.01f * float(jj + e)); (void)p;" } } },
     .{ .name = "gu: one barrier per stage (races; timing only)", .kernel = .glm53_pf_gu, .edits = &.{.{ "        threadgroup_barrier(mem_flags::mem_threadgroup);\n        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]", "        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]" }} },
     .{ .name = "down: no trellis decode (B constant)", .kernel = .glm53_pf_down, .edits = &.{.{ decode_call_down, no_decode }} },
     .{ .name = "down: no MMA (the decode alone)", .kernel = .glm53_pf_down, .edits = &.{.{ mma_call, "(void)Atile; (void)Btile;" }} },
@@ -867,6 +868,40 @@ const bench_exps = [_]BenchExp{
         .{ "if (p * SM >= valid) break;", "if (r != 3 || p * SM >= valid) break;" },
     } },
 };
+
+/// The stage times of `pr`'s first wave over one bank layer (`label` names the shape), and with GLM53_EXL3_BENCH_EXP the
+/// same over each experiment's mutated text (where the GEMMs' time goes; the outputs are not checked).
+fn stageReport(a: Allocator, g: anytype, s: mlx.mlx_stream, ours: anytype, xp: anytype, pr: quant.PrefillRows, bank: anytype, k: u32, h: usize, label: []const u8) !void {
+    const sts = try ours.stageTimes(g, xp, pr, bank, 16, null);
+    const f = @as(f64, @floatFromInt(sts.rows)) * 2.0 * @as(f64, @floatFromInt(h)) * 512.0 * 4.0;
+    std.debug.print("GLM53_UBENCH {s} K{d} ({d} rows, {d} experts): gate|up {d:.3} ms ({d:.1} TFLOP/s), mid {d:.3} ms, down {d:.3} ms ({d:.1} TFLOP/s)\n", .{ label, k, sts.rows, sts.experts, @as(f64, @floatFromInt(sts.ns[0])) / 1e6, 2 * f / @as(f64, @floatFromInt(sts.ns[0])) / 1e3, @as(f64, @floatFromInt(sts.ns[1])) / 1e6, @as(f64, @floatFromInt(sts.ns[2])) / 1e6, f / @as(f64, @floatFromInt(sts.ns[2])) / 1e3 });
+    if (std.c.getenv("GLM53_EXL3_BENCH_EXP") == null) return;
+    for (bench_exps) |ex| {
+        var tx = try a.dupe(u8, xk.embedded.sources[@backingInt(ex.kernel)]);
+        defer a.free(tx);
+        for (ex.edits) |ed| {
+            if (std.mem.count(u8, tx, ed[0]) != 1) return error.NeedleMissing;
+            const nx = try std.mem.replaceOwned(u8, a, tx, ed[0], ed[1]);
+            a.free(tx);
+            tx = nx;
+        }
+        const z = try a.dupeSentinel(u8, tx, 0);
+        defer a.free(z);
+        var texts: xk.Texts = undefined;
+        const mf = try xk.retexted(a, &xk.embedded, .{ .kernel = ex.kernel }, z, &texts);
+        defer a.free(mf);
+        texts.manifest = mf;
+        var dg: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(mf, &dg, .{});
+        var reg = try xk.Registry.init(a, &texts, &std.fmt.bytesToHex(dg, .lower), null);
+        defer reg.deinit();
+        var bd = try reg.bind(s, null);
+        defer bd.deinit();
+        const pfx = routes.Prompt.init(&bd, .{ .k = k, .hidden = @intCast(h), .mini = 512 });
+        const ex_t = try ours.stageTimes(g, xp, pr, bank, 16, &pfx);
+        std.debug.print("GLM53_UBENCH {s} K{d} experiment {s}: gate|up {d:.3} ms, mid {d:.3} ms, down {d:.3} ms\n", .{ label, k, ex.name, @as(f64, @floatFromInt(ex_t.ns[0])) / 1e6, @as(f64, @floatFromInt(ex_t.ns[1])) / 1e6, @as(f64, @floatFromInt(ex_t.ns[2])) / 1e6 });
+    }
+}
 
 // GLM53_EXL3_BENCH=<pack dir> (the box, lock-held): routed layer 0's 256 experts of the real pack resident (its K3 and
 // K4 bank layers), one routed layer's decode at 1, 4 and 6 rows and its prompt at 16K tokens, these kernels (decode: the
@@ -1104,36 +1139,23 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
     const q1 = .{ ours.prefillStats(), theirStats(theirs) };
     for (0..2) |side| {
         const pr: quant.PrefillRows = .{ .slot = side_slot[side].items[0..@min(16384, side_slot[side].items.len)], .act_row = side_act[side].items[0..@min(16384, side_act[side].items.len)] };
-        const sts = try ours.stageTimes(&g, xp, pr, banks[side], 16, null);
-        const f = @as(f64, @floatFromInt(sts.rows)) * 2.0 * @as(f64, @floatFromInt(h)) * 512.0 * 4.0;
-        std.debug.print("GLM53_UBENCH prompt wave K{d} ({d} rows, {d} experts): gate|up {d:.3} ms ({d:.1} TFLOP/s), mid {d:.3} ms, down {d:.3} ms ({d:.1} TFLOP/s)\n", .{ b.layers[side].k, sts.rows, sts.experts, @as(f64, @floatFromInt(sts.ns[0])) / 1e6, 2 * f / @as(f64, @floatFromInt(sts.ns[0])) / 1e3, @as(f64, @floatFromInt(sts.ns[1])) / 1e6, @as(f64, @floatFromInt(sts.ns[2])) / 1e6, f / @as(f64, @floatFromInt(sts.ns[2])) / 1e3 });
-        // GLM53_EXL3_BENCH_EXP: the stages over mutated texts (where the GEMMs' time goes; the outputs are not checked)
-        if (std.c.getenv("GLM53_EXL3_BENCH_EXP") != null) for (bench_exps) |ex| {
-            var tx = try a.dupe(u8, xk.embedded.sources[@backingInt(ex.kernel)]);
-            defer a.free(tx);
-            for (ex.edits) |ed| {
-                if (std.mem.count(u8, tx, ed[0]) != 1) return error.NeedleMissing;
-                const nx = try std.mem.replaceOwned(u8, a, tx, ed[0], ed[1]);
-                a.free(tx);
-                tx = nx;
-            }
-            const z = try a.dupeSentinel(u8, tx, 0);
-            defer a.free(z);
-            var texts: xk.Texts = undefined;
-            const mf = try xk.retexted(a, &xk.embedded, .{ .kernel = ex.kernel }, z, &texts);
-            defer a.free(mf);
-            texts.manifest = mf;
-            var dg: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(mf, &dg, .{});
-            var reg = try xk.Registry.init(a, &texts, &std.fmt.bytesToHex(dg, .lower), null);
-            defer reg.deinit();
-            var bd = try reg.bind(s, null);
-            defer bd.deinit();
-            const pfx = routes.Prompt.init(&bd, .{ .k = b.layers[side].k, .hidden = @intCast(h), .mini = 512 });
-            const ex_t = try ours.stageTimes(&g, xp, pr, banks[side], 16, &pfx);
-            std.debug.print("GLM53_UBENCH prompt wave K{d} experiment {s}: gate|up {d:.3} ms, mid {d:.3} ms, down {d:.3} ms\n", .{ b.layers[side].k, ex.name, @as(f64, @floatFromInt(ex_t.ns[0])) / 1e6, @as(f64, @floatFromInt(ex_t.ns[1])) / 1e6, @as(f64, @floatFromInt(ex_t.ns[2])) / 1e6 });
-        };
+        try stageReport(a, &g, s, ours, xp, pr, banks[side], b.layers[side].k, h, "prompt wave");
     }
+    // GLM53_EXL3_CEIL: the same at the ceiling's shape, 16 experts of 512 rows (a real prompt group's rows per expert)
+    if (std.c.getenv("GLM53_EXL3_CEIL") != null) for (0..2) |side| {
+        const per = 512;
+        var cslot: [16 * per]u32 = undefined;
+        var cact: [16 * per]u32 = undefined;
+        var picked: usize = 0;
+        for (0..ne) |e_i| {
+            if (picked == 16) break;
+            if (b.streamLayer(0, @intCast(e_i)) != side) continue;
+            for (0..per) |j| cslot[picked * per + j] = slot_of[e_i];
+            picked += 1;
+        }
+        for (cact[0 .. picked * per], 0..) |*v, i| v.* = @intCast((i * 7919) % n_tok);
+        try stageReport(a, &g, s, ours, xp, .{ .slot = cslot[0 .. picked * per], .act_row = cact[0 .. picked * per] }, banks[side], b.layers[side].k, h, "ceiling wave");
+    };
     if (std.c.getenv("GLM53_EXL3_CEIL") != null) try benchCeiling(a, &g, ours, &banks, slot_of, &b, h);
     std.debug.print("GLM53_UBENCH prompt 16384 tokens ({d} K3 + {d} K4 rows): ours {d:.1} ms ({d:.1} TFLOP/s), sushi {d:.1} ms ({d:.1} TFLOP/s) per layer ({d:.2}x); prefill GEMM calls / GPU drains ours {d} / {d}, sushi {d} / {d}\n", .{ side_slot[0].items.len, side_slot[1].items.len, @as(f64, @floatFromInt(best[0])) / 1e6, flop / @as(f64, @floatFromInt(best[0])) / 1e3, @as(f64, @floatFromInt(best[1])) / 1e6, flop / @as(f64, @floatFromInt(best[1])) / 1e3, @as(f64, @floatFromInt(best[1])) / @as(f64, @floatFromInt(best[0])), q1[0][0] - q0[0][0], q1[0][1] - q0[0][1], q1[1][0] - q0[1][0], q1[1][1] - q0[1][1] });
 }
