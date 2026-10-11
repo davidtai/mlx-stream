@@ -344,7 +344,7 @@ pub const PerLayer = struct { idle_barrier: u64 = 0, hit_span: ?u64 = null, gap:
 /// submit) and `idle_tail` (after the last layer's hit submit); `read` the stream's read gauge over the routed calls;
 /// `miss_busy` the GPU busy time after the hit submit of the layers that missed; `wait` the summed gated waits on miss
 /// bytes (`PerLayer.wait`) and `work` = busy - wait; `hit_span` / `gap` summed over the layers that have them.
-pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_barrier: u64 = 0, idle_encode: u64 = 0, idle_tail: u64 = 0, read: u64 = 0, miss_busy: u64 = 0, buffers: u32 = 0, layers: u32 = 0, truncated: bool = false, work: u64 = 0, wait: u64 = 0, wait_gu: u64 = 0, hit_span: u64 = 0, hit_layers: u32 = 0, gap: u64 = 0, gap_layers: u32 = 0, gated: u32 = 0, unsignalled: u32 = 0 };
+pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_barrier: u64 = 0, idle_encode: u64 = 0, idle_tail: u64 = 0, read: u64 = 0, miss_busy: u64 = 0, buffers: u32 = 0, layers: u32 = 0, truncated: bool = false, work: u64 = 0, wait: u64 = 0, wait_gu: u64 = 0, hit_span: u64 = 0, hit_layers: u32 = 0, gap: u64 = 0, gap_layers: u32 = 0, gated: u32 = 0, unsignalled: u32 = 0, waited: u32 = 0, short_waited: u32 = 0 };
 
 pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []const Signal, scratch: []Span, per: []PerLayer) CycleSum {
     var s: CycleSum = .{};
@@ -411,6 +411,9 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
         const wait = @min(sd, w[1]) -| b;
         per[i].wait = wait;
         s.wait += wait;
+        // DIAGNOSTIC: the layers whose GPU waited on bytes after its hit wave, and those that waited under 0.25 ms.
+        s.waited += @intFromBool(wait > 0);
+        s.short_waited += @intFromBool(wait > 0 and wait < 250_000);
         if (signalOf(sig, l.gate_gu)) |sg| {
             per[i].wait_gu = @min(sg, w[1]) -| b;
             s.wait_gu += per[i].wait_gu.?;
@@ -420,7 +423,7 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
     return s;
 }
 
-const fields = [_][]const u8{ "wall_ms", "busy_ms", "gpu_work_ms", "bytes_wait_ms", "bytes_wait_gu_ms", "idle_ms", "idle_barrier_ms", "idle_barrier_per_layer_ms", "idle_encode_ms", "idle_tail_ms", "hit_span_ms", "hit_span_per_layer_ms", "router_hit_gap_ms", "router_hit_gap_per_layer_ms", "read_busy_ms", "miss_layer_busy_ms", "buffers", "gated_layers", "unsignalled_gates" };
+const fields = [_][]const u8{ "wall_ms", "busy_ms", "gpu_work_ms", "bytes_wait_ms", "bytes_wait_gu_ms", "idle_ms", "idle_barrier_ms", "idle_barrier_per_layer_ms", "idle_encode_ms", "idle_tail_ms", "hit_span_ms", "hit_span_per_layer_ms", "router_hit_gap_ms", "router_hit_gap_per_layer_ms", "read_busy_ms", "miss_layer_busy_ms", "buffers", "gated_layers", "unsignalled_gates", "routed_layers", "no_wait_layers", "short_wait_layers" };
 
 fn fieldOf(s: CycleSum, i: usize) f64 {
     const ms = struct {
@@ -452,7 +455,10 @@ fn fieldOf(s: CycleSum, i: usize) f64 {
         15 => ms(s.miss_busy),
         16 => @floatFromInt(s.buffers),
         17 => @floatFromInt(s.gated),
-        else => @floatFromInt(s.unsignalled),
+        18 => @floatFromInt(s.unsignalled),
+        19 => @floatFromInt(s.layers),
+        20 => @floatFromInt(s.layers -| s.waited),
+        else => @floatFromInt(s.short_waited),
     };
 }
 
