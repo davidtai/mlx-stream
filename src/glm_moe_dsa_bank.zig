@@ -202,8 +202,14 @@ pub const Bank = struct {
             const gu = l.segments[gu_components].offset;
             g.widest_span = @max(g.widest_span, @max(gu, l.logical_bytes - gu));
         }
-        // One record per expert: a routed id's span is its record.
+        // One record per expert: a routed id's span is its record; one scratch, at the widest layer's arrays.
         g.spec_record = g.widest_record;
+        for (self.slots) |sl| {
+            if (sl.record_bytes == g.widest_record) {
+                g.scratch[0] = sl.array_bytes;
+                break;
+            }
+        }
         return g;
     }
 
@@ -286,7 +292,10 @@ pub const Bank = struct {
             l.* = .{ .model_layer = ml, .record_bytes = record, .logical_bytes = logical, .base_offset = base, .segments = want };
         }
         self.slots = try a.alloc(LayerSlots, n_layers);
-        for (self.slots, self.layers) |*sl, l| sl.* = .{ .record_bytes = l.logical_bytes, .n_records = self.n_experts };
+        for (self.slots, self.layers) |*sl, l| {
+            sl.* = .{ .record_bytes = l.logical_bytes, .n_records = self.n_experts };
+            for (&sl.array_bytes, l.segments) |*x, sg| x.* = sg.length;
+        }
         // 4. The sidecar.
         const sc = m.sidecar;
         const total = @as(u64, n_layers) * d.n_experts * record;

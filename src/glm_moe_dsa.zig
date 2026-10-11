@@ -172,6 +172,10 @@ pub const LayerSlots = struct {
     rows_per_unit: u32 = 1,
     /// The layer's expert slots per fill unit (the bank module's split; `rowsAt` rounds it): 1 for an even fill.
     share: f64 = 1,
+    /// Each slot array's bytes per slot row: the stream allocates one MLX array per record segment, a row's minis times
+    /// the segment's length a row, each array's buffer page-rounded (`glm_moe_dsa_bill.slotArrays`). All zero: one
+    /// array of `record_bytes` a row.
+    array_bytes: [9]u64 = @splat(0),
 };
 
 /// A bank's slot geometry: the bill fills in units (`glm_moe_dsa_bill.unitBytes`, `maxUnits`), the module gives each
@@ -191,6 +195,9 @@ pub const Geometry = struct {
     /// A routed id's span in the file at the stream's widest layer (`StreamOf.spanOf`): the lookahead's speculative slot
     /// holds one (the read pool's staging, the bill's `poolStagingBytes`).
     spec_record: u64 = 0,
+    /// The transient scratches' slot arrays per row (`LayerSlots.array_bytes` of the widest layer, and with a scratch
+    /// per geometry the other's; all zero: `widest_record` a row).
+    scratch: [2][9]u64 = @splat(@splat(0)),
 };
 
 pub const Config = struct {

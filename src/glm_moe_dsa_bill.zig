@@ -64,9 +64,14 @@ pub const host_side_decode_bytes: u64 = 1_350_000_000;
 /// cache at the boundary, and the boundary (0 construction, 1 prompt pass, 2 handover, 3 decode). Runs m1, m2, k1 and k2
 /// (plugins a2aa9bf and 4bf1112, MTP off) read 0.240-0.475 GB constructed, 0.693-0.837 GB at the prompt pass's end and
 /// the handover, 0.789-1.216 GB at the requests' end (the 1.216 GB reading with MLX's cache at 0: unreclaimed pages);
-/// screen stack-9d157b5 (0.386 / 0.685 / 0.684 / 0.783 GB) is pinned here to the byte.
+/// screen stack-9d157b5 read 0.386 / 0.685 / 0.684 / 0.783 GB (its construction pinned here to the byte), and the
+/// phase records of this bill's screens are pinned to the byte.
 pub const host_side_readings = [_][4]u64{
-    .{ 197_916_120_504, 197_530_209_800, 0, 0 },
+    .{ 197_916_120_504, 197_530_209_800, 0, 0 }, // stack-9d157b5 constructed: 0.386 GB
+    .{ 183_255_346_344, 182_876_769_800, 0, 0 }, // diag-coding constructed: 0.379 GB
+    .{ 222_534_267_376, 204_727_402_052, 17_129_442_392, 1 }, // diag-coding prompt pass: 0.677 GB
+    .{ 235_028_278_184, 234_347_724_356, 2700, 2 }, // diag-coding handover: 0.681 GB
+    .{ 235_320_611_984, 234_146_381_380, 393_242_549, 3 }, // diag-coding decode: 0.781 GB
 };
 /// The host side's rise from the handover's reading to the request's end (decode's own host state and freed pages not
 /// yet reclaimed), the term the live grow adds to its reading: measured 0.095-0.520 GB over 1,024 tokens (runs m1, m2,
@@ -96,11 +101,15 @@ pub fn targetOf(gpu_target: u64, ram: u64, others: u64) u64 {
 /// The routed call's GEMM rows in flight in a prompt layer, a margin: the wide lane encodes each group's slices before
 /// the group ahead of it has drained (`glm_moe_dsa_experts.wideBank`), and MLX keeps a slice's buffers until its command
 /// buffer completes, so how many routed rows' transients coexist depends on the GPU's pace against the host's. Sized
-/// from the wave probe's readings (`GLM53_WAVE_PROBE`).
-pub const prefill_gemm_inflight_rows: u64 = 32768;
+/// from the wave probe's readings (`GLM53_WAVE_PROBE`): the routed stage's rise over the layer's start, less the
+/// layer's own residents and KV lanes (their first use lands in it) and the stage's other arrays, read 3.48-5.97 GB
+/// over the 75 routed layers of the coding prompt (screen diag-coding: 34,657 rows' transients at most), rounded up to
+/// 9 x 4,096 rows.
+pub const prefill_gemm_inflight_rows: u64 = 36864;
 /// The attention spans in flight in a prompt layer, a margin for the same reason (the spans run in one eval: MLX's
-/// encoder runs up to ten command buffers ahead of the GPU).
-pub const attention_spans_in_flight: u64 = 2;
+/// encoder runs up to ten command buffers ahead of the GPU): the attention stage's rise past its held arrays read
+/// 2.09-2.42 GB on every layer kind (screen diag-coding), more than two of a shared layer's spans: every span of a call.
+pub const attention_spans_in_flight: u64 = 3;
 
 /// The read pool's tickets per mini record of a routed id (the module's stream: `Stream.Options.pool.tickets`).
 pub const pool_tickets_per_mini: u32 = 1024;
@@ -201,9 +210,11 @@ pub const Bill = struct {
     geometry: glm.Geometry,
     phases: [3]PhaseTerms,
 
-    /// The phase's terms at `units` fill units.
-    pub fn terms(b: Bill, phase: Phase, units: u32) PhaseTerms {
-        return b.phases[@intFromEnum(phase)].at(slotBytes(b.geometry, units), phase != .construction);
+    /// The phase's terms at `units` fill units; decode's past the `prompt` units the grow kept (its rows in their own
+    /// arrays, `decodeSlotBytes`).
+    pub fn terms(b: Bill, phase: Phase, units: u32, prompt: u32) PhaseTerms {
+        const slots = if (phase == .decode) decodeSlotBytes(b.geometry, prompt, units) else slotBytes(b.geometry, units);
+        return b.phases[@intFromEnum(phase)].at(slots, phase != .construction);
     }
 };
 
@@ -222,11 +233,45 @@ pub fn rowsAt(g: glm.Geometry, units: u32, out: []u32) []u32 {
     return out[0..g.layers.len];
 }
 
-/// The slot rows' bytes at `units`, exactly as `rowsAt` gives them.
+/// One stream layer's slot arrays over `rows` rows (GLM-only: its bank's slot geometry): each segment's array, its buffer
+/// page-rounded as MLX allocates it (`glm_moe_dsa_cache.bufferBytes`).
+pub fn slotArrays(l: glm.LayerSlots, rows: u64) u64 {
+    if (std.mem.allEqual(u64, &l.array_bytes, 0)) return rows * l.record_bytes;
+    var n: u64 = 0;
+    for (l.array_bytes) |b| n += cache_mod.bufferBytes(rows * b, std.heap.pageSize());
+    return n;
+}
+
+/// The slot rows' bytes at `units`, exactly as `rowsAt` gives them (the stream's arrays at the prompt's rows).
 pub fn slotBytes(g: glm.Geometry, units: u32) u64 {
     var n: u64 = 0;
-    for (g.layers) |l| n += @as(u64, l.rows_per_unit) * slotsAt(l, units) * l.record_bytes;
+    for (g.layers) |l| n += slotArrays(l, @as(u64, l.rows_per_unit) * slotsAt(l, units));
     return n;
+}
+
+/// The rows a grow from `from` units to `to` adds, in their own arrays (`Stream.grow`'s ext rows).
+pub fn grownBytes(g: glm.Geometry, from: u32, to: u32) u64 {
+    if (to <= from) return 0;
+    var n: u64 = 0;
+    for (g.layers) |l| n += slotArrays(l, @as(u64, l.rows_per_unit) * (slotsAt(l, to) - slotsAt(l, from)));
+    return n;
+}
+
+/// Decode's slot rows at `units` after a grow from the `prompt` units: the prompt's arrays and the grown ones.
+pub fn decodeSlotBytes(g: glm.Geometry, prompt: u32, units: u32) u64 {
+    return slotBytes(g, @min(prompt, units)) + grownBytes(g, prompt, units);
+}
+
+/// The transient scratch's bytes at `rows` rows: each geometry's arrays (`Geometry.scratch`), page-rounded.
+pub fn scratchBytes(g: glm.Geometry, rows: u64) u64 {
+    var n: u64 = 0;
+    var any = false;
+    for (g.scratch) |geo| {
+        if (std.mem.allEqual(u64, &geo, 0)) continue;
+        any = true;
+        for (geo) |b| n += cache_mod.bufferBytes(rows * b, std.heap.pageSize());
+    }
+    return if (any) n else rows * g.widest_record;
 }
 
 /// One fill unit's bytes at the shares, rounded up: the fill's linear step (`sdk.MemoryBill.per_row`); the slot table
@@ -249,10 +294,11 @@ pub fn maxUnits(g: glm.Geometry) u32 {
     return n;
 }
 
-/// The slot rows' bytes at every unit count `0 .. maxUnits` (`sdk.MemoryBill.slot_table`), in `a`.
-pub fn slotTable(a: std.mem.Allocator, g: glm.Geometry) ![]u64 {
+/// The slot rows' bytes at every unit count `0 .. maxUnits` (`sdk.MemoryBill.slot_table`), in `a`: the prompt's arrays,
+/// or with `prompt` set (a request's handover) decode's past those units (`decodeSlotBytes`).
+pub fn slotTable(a: std.mem.Allocator, g: glm.Geometry, prompt: ?u32) ![]u64 {
     const t = try a.alloc(u64, maxUnits(g) + 1);
-    for (t, 0..) |*x, u| x.* = slotBytes(g, @intCast(u));
+    for (t, 0..) |*x, u| x.* = if (prompt) |p| decodeSlotBytes(g, p, @intCast(u)) else slotBytes(g, @intCast(u));
     return t;
 }
 
@@ -497,7 +543,7 @@ pub fn billOf(in: Inputs) Bill {
     const verify_rows: u64 = s.decode_window_rows / glm.routed_top_k;
     const decode_waves = @max(decodeWaveBytes(c, verify_rows, in.decode_positions), if (in.mtp) |m| mtpDecodeWaveBytes(c, m.depth, in.decode_positions) else 0);
     const pending: u64 = if (in.mtp != null) mtpPendingBytes(c, in.prompt_tokens) else 0;
-    const scratch = @as(u64, s.wide_depth) * s.max_route_ids * g.rows_per_id * g.widest_record;
+    const scratch = scratchBytes(g, @as(u64, s.wide_depth) * s.max_route_ids * g.rows_per_id);
     return .{ .geometry = g, .phases = .{
         // Constructed: the slot rows and the scratch, the draft lane's residents, the pool; the trunk's residents land at
         // the first forward (the loader's lazy arrays), the KV at the first prompt.
@@ -516,7 +562,7 @@ pub fn billOf(in: Inputs) Bill {
             .host_side = host_side_prompt_bytes,
         },
         .{
-            .transient_rows = @as(u64, s.decode_window_rows) * g.rows_per_id * g.widest_record,
+            .transient_rows = scratchBytes(g, @as(u64, s.decode_window_rows) * g.rows_per_id),
             .residents = in.resident_bytes,
             .mtp_residents = mtp_res,
             .kv = kvBytes(c, in.decode_positions),
@@ -533,9 +579,9 @@ pub fn billOf(in: Inputs) Bill {
 
 /// The terms as the SDK's bill (`sdk.MemoryBill`): each `PhaseTerms` field one named term in the prompt and decode
 /// phases, the construction's own bytes where they differ (`Term.construction`), the host side a declared bound, the
-/// slot rows exact (`slot_table`) and the page tables following them (`phase_memory.wiringAt`). The baseline stays out
-/// (the fill and the admission take it).
-pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
+/// slot rows exact (`slot_table`: with `prompt`, decode's past those units) and the page tables following them
+/// (`phase_memory.wiringAt`). The baseline stays out (the fill and the admission take it).
+pub fn memoryBill(a: std.mem.Allocator, b: Bill, prompt: ?u32) !sdk.MemoryBill {
     const T = sdk.MemoryBill.Term;
     const c = b.phases[@intFromEnum(Phase.construction)];
     const p = b.phases[@intFromEnum(Phase.prompt)];
@@ -555,7 +601,7 @@ pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
         .{ .name = "wire tables", .bytes = .{ wireTables(p.wired()), wireTables(d.wired()) }, .at_construction = false, .with_rows = true },
     });
     errdefer a.free(terms);
-    return .{ .terms = terms, .per_row = unitBytes(b.geometry), .slot_table = try slotTable(a, b.geometry), .row_terms = .{ .data = .{ p.wired(), d.wired(), 0, 0 }, .at = phase_mem.wiringAt } };
+    return .{ .terms = terms, .per_row = unitBytes(b.geometry), .slot_table = try slotTable(a, b.geometry, prompt), .row_terms = .{ .data = .{ p.wired(), d.wired(), 0, 0 }, .at = phase_mem.wiringAt } };
 }
 
 /// The context the module bills: the model's `ctx_size`, else the standard request's (`phase_memory.servedContext`).
@@ -594,7 +640,7 @@ pub fn streamShape(cfg: *const settings.Config) StreamShape {
 /// kernels where the dims fit them (a device without the tensor units runs the reference's form, which the module's own
 /// bill charges), and with `mtp_depth` set the draft lane's (the served EXL3 bank's MTP directory). Pure host.
 pub fn sdkBillOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, prompt_tokens: u64, diag: ?*glm.Diag) !sdk.MemoryBill {
-    return memoryBill(a, billOf(try inputsOf(a, io, cfg, prompt_tokens, .exl3, diag)));
+    return memoryBill(a, billOf(try inputsOf(a, io, cfg, prompt_tokens, .exl3, diag)), null);
 }
 
 /// The bill's inputs of `cfg`'s pack (the construction's: decode at `maxPositions`). Pure host.
@@ -633,9 +679,9 @@ pub fn atRequest(in: Inputs, positions: u64) Bill {
 }
 
 /// The most decode units the bill of `in` with decode at a request's `positions` admits under `target` (at most
-/// `max_units`): the SDK's fill over the request's bill (its slot rows exact).
-pub fn requestRows(a: std.mem.Allocator, in: Inputs, positions: u64, baseline: u64, target: u64, max_units: u32) !u32 {
-    const mb = try memoryBill(a, atRequest(in, positions));
+/// `max_units`), grown from the `prompt` units: the SDK's fill over the request's bill (its slot rows exact).
+pub fn requestRows(a: std.mem.Allocator, in: Inputs, positions: u64, prompt: u32, baseline: u64, target: u64, max_units: u32) !u32 {
+    const mb = try memoryBill(a, atRequest(in, positions), prompt);
     defer mb.free(a);
     const r = sdk.fill(mb, baseline, target, max_units, 0) catch return 0;
     return r.decode;
@@ -670,11 +716,11 @@ pub const Live = struct {
     /// The stream's slots (null: `per_row` a unit): the grown rows' bytes exactly as `rowsAt` gives them.
     geometry: ?glm.Geometry = null,
 
-    /// The rows' bytes from the prompt units to `units`.
+    /// The rows' bytes from the prompt units to `units` (the grow's own arrays).
     pub fn grown(l: Live, units: u32) u64 {
         if (units <= l.prompt_rows) return 0;
         const g = l.geometry orelse return @as(u64, units - l.prompt_rows) * l.per_row;
-        return slotBytes(g, units) -| slotBytes(g, l.prompt_rows);
+        return grownBytes(g, l.prompt_rows, units);
     }
 
     /// The box's bytes at `units`: the baseline, the reading, the grown rows, decode's additions and the page tables
@@ -750,14 +796,21 @@ fn glm53Geometry() bank_mod.Geometry {
 /// layer of 148 experts and a K4 one of 108, four minis an expert (3,578,880 / 4,758,528 B, in records of 3,579,904 /
 /// 4,759,552 B), every layer alike (its manifest's 150 stream layers).
 pub const box_exl3 = struct {
-    pub const k3: glm.LayerSlots = .{ .record_bytes = 4 * 3_578_880, .n_records = 148, .share = 148.0 / 128.0 };
-    pub const k4: glm.LayerSlots = .{ .record_bytes = 4 * 4_758_528, .n_records = 108, .share = 108.0 / 128.0 };
+    /// A slot row's arrays at K `k`: each of the nine segments over an expert's four minis (`exl3_bank.miniSegments`).
+    fn arrays(k: u64) [9]u64 {
+        const segs = exl3_bank.miniSegments(6144, 512, k).segs;
+        var a: [9]u64 = undefined;
+        for (&a, segs) |*x, sg| x.* = 4 * sg.length;
+        return a;
+    }
+    pub const k3: glm.LayerSlots = .{ .record_bytes = 4 * 3_578_880, .n_records = 148, .share = 148.0 / 128.0, .array_bytes = arrays(3) };
+    pub const k4: glm.LayerSlots = .{ .record_bytes = 4 * 4_758_528, .n_records = 108, .share = 108.0 / 128.0, .array_bytes = arrays(4) };
     pub const slots: [150]glm.LayerSlots = blk: {
         var s: [150]glm.LayerSlots = undefined;
         for (&s, 0..) |*l, i| l.* = if (i % 2 == 0) k3 else k4;
         break :blk s;
     };
-    pub const geometry: glm.Geometry = .{ .layers = &slots, .widest_record = 4 * (3_578_880 + 4_758_528), .widest_span = 3_172_352, .minis_per_id = 4, .spec_record = 3 * 4_759_552 + 4_758_528 };
+    pub const geometry: glm.Geometry = .{ .layers = &slots, .widest_record = 4 * (3_578_880 + 4_758_528), .widest_span = 3_172_352, .minis_per_id = 4, .spec_record = 3 * 4_759_552 + 4_758_528, .scratch = .{ arrays(4), arrays(3) } };
     /// The trunk's residents as MLX allocates them (its 2,680 shard tensors' buffers; 20,060,118,528 B in the shards).
     pub const resident_bytes: u64 = 20_060_757_504;
     /// The MTP directory: 23 residents of 578,488,832 B, the experts' 18 arrays of 4,174,381,056 B and their slot table.
@@ -786,16 +839,20 @@ test "glm bill: a fill unit is every stream layer's rows per expert slot at its 
     const r = rowsAt(g, 76, &o);
     try testing.expectEqual(@as(u32, 87), r[0]);
     try testing.expectEqual(@as(u32, 64), r[1]);
-    // The screen's preload: 11,325 experts, 184.77 GB.
-    try testing.expectEqual(@as(u64, 184_772_505_600), slotBytes(g, 76));
-    // Rounded down, the rows never pass the units' linear bytes; the table is the exact bytes at every count.
-    const table = try slotTable(testing.allocator, g);
+    // The screen's preload: 11,325 experts, 184.77 GB of records in arrays page-rounded as MLX allocates them: the
+    // K3 layers' three 87 x 4 KiB svh / suh arrays round up a page each (75 x 3 x 4,096 B), the construction's MLX bytes
+    // 197,530,209,800 B with the scratch and the draft lane (8 B more than the bill).
+    try testing.expectEqual(@as(u64, 184_772_505_600 + 75 * 3 * 4096), slotBytes(g, 76));
+    try testing.expectEqual(@as(u64, 197_530_209_792), slotBytes(g, 76) + scratchBytes(g, 240) + box_exl3.mtp.resident_bytes + box_exl3.mtp.expert_bytes);
+    // The table is the slot arrays' bytes at every count; past the prompt's units the grow's rows are their own arrays.
+    const table = try slotTable(testing.allocator, g, null);
     defer testing.allocator.free(table);
     try testing.expectEqual(@as(usize, 129), table.len);
-    for (table, 0..) |x, u| {
-        try testing.expectEqual(slotBytes(g, @intCast(u)), x);
-        try testing.expect(x <= u * unitBytes(g));
-    }
+    for (table, 0..) |x, u| try testing.expectEqual(slotBytes(g, @intCast(u)), x);
+    const grown = try slotTable(testing.allocator, g, 76);
+    defer testing.allocator.free(grown);
+    try testing.expectEqual(slotBytes(g, 76) + grownBytes(g, 76, 86), grown[86]);
+    try testing.expectEqual(table[76], grown[76]);
 }
 
 test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on the box's EXL3 pack" {
@@ -841,7 +898,7 @@ test "glm bill: the SDK's view fills the exact units, admits them, and refuses o
     const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
     const in = boxInputs(&c, &cfg);
     const b = billOf(in);
-    const mb = try memoryBill(testing.allocator, b);
+    const mb = try memoryBill(testing.allocator, b, null);
     defer mb.free(testing.allocator);
     const baseline: u64 = 18_144_149_504;
     const target = targetOf(box_exl3.gpu_target, box_exl3.ram, baseline);
@@ -849,15 +906,16 @@ test "glm bill: the SDK's view fills the exact units, admits them, and refuses o
     const rows = try sdk.fill(mb, baseline, target, maxUnits(in.bank), min_fill_rows);
     // The phases' totals are their terms' sums at the units (the slot rows exact, the page tables over the wired bytes).
     for ([_]Phase{ .prompt, .decode }, [_]u32{ rows.prompt, rows.decode }, [_]sdk.MemoryBill.Phase{ .prompt, .decode }) |ph, u, sp| {
-        const t = b.terms(ph, u);
+        // Construction's fill plans decode in the prompt's arrays (the handover bills the grow's own).
+        const t = b.terms(ph, u, u);
         try testing.expectEqual(baseline + t.sum(), mb.total(sp, baseline, u));
         try testing.expect(baseline + t.sum() <= target);
-        try testing.expect(baseline + b.terms(ph, u + 1).sum() > target or u == maxUnits(in.bank) or (ph == .prompt and u == rows.decode));
+        try testing.expect(baseline + b.terms(ph, u + 1, u + 1).sum() > target or u == maxUnits(in.bank) or (ph == .prompt and u == rows.decode));
     }
     try phase_mem.expectFillEdge(mb, baseline, target, maxUnits(in.bank), min_fill_rows, rows);
     // The construction terms at the prompt units: the slot rows, the scratch, the draft lane, the pool, the host side.
-    try testing.expectEqual(b.terms(.construction, rows.prompt).sum(), mb.constructionBytes(rows.prompt));
-    try testing.expectEqual(@max(b.terms(.prompt, rows.prompt).sum(), b.terms(.decode, rows.decode).sum()), mb.processBound(rows));
+    try testing.expectEqual(b.terms(.construction, rows.prompt, rows.prompt).sum(), mb.constructionBytes(rows.prompt));
+    try testing.expectEqual(@max(b.terms(.prompt, rows.prompt, rows.prompt).sum(), b.terms(.decode, rows.decode, rows.decode).sum()), mb.processBound(rows));
     std.debug.print("glm bill on the box's pack at 18.144 GB beside it: {d} prompt / {d} decode units (prompt {d} B, decode {d} B of the {d} B target)\n", .{ rows.prompt, rows.decode, mb.total(.prompt, baseline, rows.prompt), mb.total(.decode, baseline, rows.decode), target });
 }
 
@@ -870,12 +928,13 @@ test "glm bill: the bill at a request counts its slot rows exactly; a request's 
     const target = targetOf(box_exl3.gpu_target, box_exl3.ram, baseline);
     // The coding workload: 16,387 prompt + 1,024 generated tokens, the verify's 4 positions.
     const positions = decodeCap(&cfg, 16387 + 1024);
-    const r = try requestRows(testing.allocator, in, positions, baseline, target, maxUnits(in.bank));
+    // Grown from the 9d157b5 screen's 76 prompt units: decode's rows in the grow's own arrays.
+    const r = try requestRows(testing.allocator, in, positions, 76, baseline, target, maxUnits(in.bank));
     const req = atRequest(in, positions);
-    try testing.expect(baseline + req.terms(.decode, r).sum() <= target and baseline + req.terms(.decode, r + 1).sum() > target);
-    const worst = try requestRows(testing.allocator, in, maxPositions(&cfg), baseline, target, maxUnits(in.bank));
+    try testing.expect(baseline + req.terms(.decode, r, 76).sum() <= target and baseline + req.terms(.decode, r + 1, 76).sum() > target);
+    const worst = try requestRows(testing.allocator, in, maxPositions(&cfg), 76, baseline, target, maxUnits(in.bank));
     try testing.expect(r > worst);
-    try testing.expectEqual(@as(u32, 0), try requestRows(testing.allocator, in, positions, baseline, baseline, maxUnits(in.bank)));
+    try testing.expectEqual(@as(u32, 0), try requestRows(testing.allocator, in, positions, 76, baseline, baseline, maxUnits(in.bank)));
     // What decode adds past the handover's reading: window 0, the waves, the cache and its overshoot; the host's rise.
     const after = decodeAfter(in, positions);
     const d = req.phases[@intFromEnum(Phase.decode)];
@@ -934,9 +993,9 @@ test "glm bill: the MTP lane adds its residents, experts and slot table, its lay
     // Deeper drafts bill at least as much decode wave.
     in.mtp.?.depth = 5;
     try testing.expect(billOf(in).phases[@intFromEnum(Phase.decode)].waves >= on.phases[@intFromEnum(Phase.decode)].waves);
-    const mb_off = try memoryBill(testing.allocator, off);
+    const mb_off = try memoryBill(testing.allocator, off, null);
     defer mb_off.free(testing.allocator);
-    const mb_on = try memoryBill(testing.allocator, on);
+    const mb_on = try memoryBill(testing.allocator, on, null);
     defer mb_on.free(testing.allocator);
     try testing.expect(mb_on.total(.decode, 0, 100) > mb_off.total(.decode, 0, 100) + 4_752_870_912);
 }
@@ -959,7 +1018,7 @@ test "glm bill: the bill line lists every term and each phase's total at the uni
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{ .mtp_depth = 3 };
-    const mb = try memoryBill(testing.allocator, billOf(boxInputs(&c, &cfg)));
+    const mb = try memoryBill(testing.allocator, billOf(boxInputs(&c, &cfg)), null);
     defer mb.free(testing.allocator);
     const rows: sdk.Rows = .{ .prompt = 70, .decode = 80 };
     const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{BillLine{ .mb = &mb, .rows = rows, .baseline = 1, .target = 3, .context = 16384, .decode_positions = maxPositions(&cfg) }});
