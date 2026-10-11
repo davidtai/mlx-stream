@@ -1007,8 +1007,8 @@ pub const HostLine = struct {
         try w.print("glm_moe_dsa: decode host split over {d} routed calls: barrier waits {d:.2} s, routes {d:.2} s, wave encode {d:.2} s", .{
             p.h.calls, seconds(p.h.barrier_ns), seconds(p.h.route_ns), seconds(p.h.wave_ns),
         });
-        if (comptime experts_mod.split_steps) try w.print(" (hit waves built {d:.2} s, their commit {d:.2} s, miss waves built {d:.2} s, the join {d:.2} s)", .{
-            seconds(p.h.hit_ns), seconds(p.h.commit_ns), seconds(p.h.miss_ns), seconds(p.h.join_ns),
+        if (comptime experts_mod.split_steps) try w.print(" (hit waves built {d:.2} s, their commit {d:.2} s, miss waves built {d:.2} s, the join {d:.2} s; the barrier's commit {d:.2} s; between calls the trunk built {d:.2} s over {d} gaps, {d} arrays; {d} arrays in the calls)", .{
+            seconds(p.h.hit_ns), seconds(p.h.commit_ns), seconds(p.h.miss_ns), seconds(p.h.join_ns), seconds(p.h.bar_commit_ns), seconds(p.h.build_ns), p.h.gaps, p.h.ops_trunk, p.h.ops_call,
         });
         try w.print(", the rest {d:.2} s of {d:.2} s", .{ seconds(other), seconds(p.wall_ns) });
     }

@@ -149,6 +149,8 @@ pub const MlxOps = struct {
     /// The host's waits on the GPU so far: every evaluation that blocks (`evalAll`) and every read of an array's values
     /// (`hostIds`, `hostU32`, `hostF32`, `hostBool`, `hostArgmax`); `asyncEval` waits for nothing.
     waits: u64 = 0,
+    /// (diag) The arrays made so far (each `track`).
+    made: u64 = 0,
     /// `nn.silu` / `nn.softplus` are `mx.compile(shapeless=True)` regions in
     /// the Python oracle; the same closures are compiled here (a compiled
     /// graph is not output-preserving against the op chain).
@@ -405,6 +407,7 @@ pub const MlxOps = struct {
     }
 
     fn track(g: *MlxOps, a: T) !T {
+        g.made += 1;
         g.live.append(g.gpa, a) catch |e| {
             _ = mlx.mlx_array_free(a);
             return e;

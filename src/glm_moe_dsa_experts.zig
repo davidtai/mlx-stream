@@ -125,6 +125,14 @@ pub const HostSplit = struct {
     commit_ns: u64 = 0,
     miss_ns: u64 = 0,
     join_ns: u64 = 0,
+    /// (diag) The barrier's arrays committed (MLX's encode of the graph since the last commit), inside `barrier_ns`.
+    bar_commit_ns: u64 = 0,
+    /// (diag) The host time between consecutive routed calls of a forward (the trunk's graph built), over `gaps`
+    /// gaps, and the arrays made there; the arrays made inside the calls.
+    build_ns: u64 = 0,
+    gaps: u64 = 0,
+    ops_trunk: u64 = 0,
+    ops_call: u64 = 0,
 };
 
 /// A call's stamps inside its waves (`HostSplit`'s four steps): the hit waves built, committed, the miss waves built.
@@ -132,7 +140,7 @@ const Stamps = struct { hit: u64 = 0, commit: u64 = 0, miss: u64 = 0 };
 
 /// The four steps are stamped in PROFILE builds (`-Dplugin-profile=true`, as the verify timeline) and in the tests; a
 /// served build reads no clock for them.
-pub const split_steps = timeline.enabled or @import("builtin").is_test;
+pub const split_steps = true; // diag: every build
 
 /// The host split's clock: the read pool's (`sdk_ext.expert.io.Pool.nowNs`), in the split's u64 ns.
 fn nowNs() u64 {
@@ -183,6 +191,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         host: HostSplit = .{},
         /// The wide lane's combine on the GPU (`combine_source`), built at its first call.
         combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
+        /// (diag) The last decode-lane call's end, layer and arrays made by then.
+        last_end: u64 = 0,
+        last_layer: u32 = 0,
+        made_end: u64 = 0,
 
         /// The routes of the prompt layer whose misses were read at its start (`stageMisses`): each route's bank layer and
         /// experts, in route order; null once the call took it.
@@ -710,6 +722,22 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             var score_buf: [sdk_ext.expert.lookahead.max_rows * 512]f32 = undefined;
             var sc: []const f32 = &.{};
             const read_next = next_scores != null and self.stream.route_lookahead and n * self.n_experts <= score_buf.len;
+            // diag: the trunk built since the previous routed call of this forward; the barrier's arrays committed first.
+            const made0: u64 = if (@hasField(G, "made")) g.made else 0;
+            if (self.last_end != 0 and layer == self.last_layer + 1) {
+                self.host.build_ns += t0 -| self.last_end;
+                self.host.gaps += 1;
+                self.host.ops_trunk += made0 -| self.made_end;
+            }
+            defer {
+                const made1: u64 = if (@hasField(G, "made")) g.made else 0;
+                self.host.ops_call += made1 -| made0;
+                self.made_end = made1;
+                self.last_layer = layer;
+                self.last_end = nowNs();
+            }
+            if (read_next) try g.asyncEval(&.{ indices, next_scores.? }) else try g.asyncEval(&.{indices});
+            self.host.bar_commit_ns += nowNs() -| t0;
             if (read_next) {
                 try g.evalAll(&.{ indices, next_scores.? });
                 sc = try g.hostF32(next_scores.?, score_buf[0 .. n * self.n_experts]);
