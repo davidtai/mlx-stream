@@ -284,7 +284,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
                 .pool = .{ .workers = shape.workers, .tickets = 1024 * Bk.Stream.maxMinis(&self.bank), .direct = true },
                 .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
-                .keep_residents = true,
+                .keep_residents = false,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
             });
             errdefer self.stream.deinit();
@@ -310,11 +310,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             // The prompt rows filled before the first request, each bank layer's in expert order (a long prompt routes
             // nearly every expert, so any filled row is a hit); a later request finds its predecessor's residents
             // (`keep_residents`).
-            var pre: Preload = .{ .bank = &self.bank, .buf = try gpa.alloc(u16, self.bank.n_experts) };
+            const pre: Preload = .{ .bank = &self.bank, .buf = try gpa.alloc(u16, self.bank.n_experts) };
             defer gpa.free(pre.buf);
             const pre0 = self.stream.stats();
             const t_pre = std.Io.Timestamp.now(io, .awake);
-            const preloaded = try self.stream.preload(&pre, Preload.order);
+            const preloaded: u64 = 0;
             const pre_ns: u64 = @intCast(t_pre.untilNow(io, .awake).nanoseconds);
             log.info("glm_moe_dsa: preloaded {d} experts ({d:.2} GB) into the prompt rows in {d:.2} s\n", .{ preloaded, gigabytes(Reads.of(pre0, self.stream.stats()).ssd_bytes), seconds(pre_ns) });
             self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa };
