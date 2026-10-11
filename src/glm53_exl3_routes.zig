@@ -7,9 +7,10 @@
 //!     each weight decoded once for the slot's member pairs), down (the SwiGLU middle, the down GEMV, each output block
 //!     rotated, scaled by its mini's rout, the minis summed, times the pair's score: f32 per pair); per call, combine
 //!     (each row's pairs in routed order: x's dtype).
-//!   - Prompt, per wave of a call's rows grouped by expert (one bank kind): the gate and up GEMMs over the rows' x
-//!     (128-row M tiles, the trellis decoded per stage, rotated along k and scaled by rin: the input prepare in the
-//!     weights), the middle, the down GEMM (the minis summed in its epilogue): bf16 per row in the wave's order.
+//!   - Prompt, per call: x as f16 into one buffer the caller holds (`Prompt.fill`); per wave of the call's rows grouped
+//!     by expert (one bank kind): the gate and up GEMMs over the rows' f16 x (128-row M tiles, the trellis decoded per
+//!     stage, rotated along k and scaled by rin: the input prepare in the weights), the middle, the down GEMM (the minis
+//!     summed in its epilogue): bf16 per row in the wave's order.
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -209,12 +210,25 @@ pub const Prompt = struct {
         return .{ .b = b, .inst = inst };
     }
 
-    /// One wave of `rows` rows grouped by expert: x [tokens, HID] bf16, rt u32 [>= 8] (per row: x row, slot row), the
-    /// gate|up and down wave tables (i32 [80]) and their threadgroups, the bank kind's arrays -> y bf16 [rows, HID].
-    pub fn wave(self: *const Prompt, x: mlx.mlx_array, rt: mlx.mlx_array, rows: usize, tgu: mlx.mlx_array, tgs_gu: u32, tdn: mlx.mlx_array, tgs_dn: u32, bank: Bank) !mlx.mlx_array {
+    /// The call's x [rows, HID] bf16 as f16 into `dst` (f16 [>= rows, HID], row-contiguous), written in place: the
+    /// returned u32 [8] orders a wave's gate|up after the write (`wave`'s xt). The caller holds `dst` and writes it
+    /// again only once nothing reads it.
+    pub fn fill(self: *const Prompt, x: mlx.mlx_array, dst: mlx.mlx_array, rows: usize) !mlx.mlx_array {
+        const e = self.b.reg.get(.glm53_pf_x16);
+        const sh = [_]c_int{8};
+        const cfg = cfgOf(e, self.inst, .{ @intCast(rows * self.inst.hidden / 8), 1, 1 }, &.{.{ &sh, .uint32 }});
+        var tok: [1]mlx.mlx_array = undefined;
+        try self.b.apply(.glm53_pf_x16, &.{ x, dst }, &cfg, &tok);
+        return tok[0];
+    }
+
+    /// One wave of `rows` rows grouped by expert: x [tokens, HID] f16 (the call's x as f16), xt u32 [8] (the `fill`
+    /// that wrote x, or any u32 [>= 8] for an x MLX computed), rt u32 [>= 8] (per row: x row, slot row), the gate|up and
+    /// down wave tables (i32 [80]) and their threadgroups, the bank kind's arrays -> y bf16 [rows, HID].
+    pub fn wave(self: *const Prompt, x: mlx.mlx_array, xt: mlx.mlx_array, rt: mlx.mlx_array, rows: usize, tgu: mlx.mlx_array, tgs_gu: u32, tdn: mlx.mlx_array, tgs_dn: u32, bank: Bank) !mlx.mlx_array {
         var st: Stages = .{};
         defer st.deinit();
-        for (std.enums.values(Stage)) |at| try self.stage(at, &st, x, rt, rows, tgu, tgs_gu, tdn, tgs_dn, bank);
+        for (std.enums.values(Stage)) |at| try self.stage(at, &st, x, xt, rt, rows, tgu, tgs_gu, tdn, tgs_dn, bank);
         return st.take();
     }
 
@@ -271,7 +285,7 @@ pub const Prompt = struct {
     };
 
     /// One stage of a wave (`wave`'s order), its outputs into `st`.
-    pub fn stage(self: *const Prompt, at: Stage, st: *Stages, x: mlx.mlx_array, rt: mlx.mlx_array, rows: usize, tgu: mlx.mlx_array, tgs_gu: u32, tdn: mlx.mlx_array, tgs_dn: u32, bank: Bank) !void {
+    pub fn stage(self: *const Prompt, at: Stage, st: *Stages, x: mlx.mlx_array, xt: mlx.mlx_array, rt: mlx.mlx_array, rows: usize, tgu: mlx.mlx_array, tgs_gu: u32, tdn: mlx.mlx_array, tgs_dn: u32, bank: Bank) !void {
         const reg = self.b.reg;
         const h: u32 = self.inst.hidden;
         const mi: u32 = self.inst.mini;
@@ -280,7 +294,7 @@ pub const Prompt = struct {
             .gate_up => {
                 const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(mi))};
                 const cfg = cfgOf(reg.get(.glm53_pf_gu), self.inst, .{ 256 * tgs_gu, 1, 1 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
-                try self.b.apply(.glm53_pf_gu, &.{ x, rt, tgu, bank.gate.trellis, bank.up.trellis, bank.gate.suh, bank.up.suh }, &cfg, &st.z);
+                try self.b.apply(.glm53_pf_gu, &.{ x, xt, rt, tgu, bank.gate.trellis, bank.up.trellis, bank.gate.suh, bank.up.suh }, &cfg, &st.z);
             },
             .mid => {
                 const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(mi))};

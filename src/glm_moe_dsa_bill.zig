@@ -242,6 +242,8 @@ pub const PhaseTerms = struct {
     /// The prompt's final-normed hidden the draft lane holds (a view) until its first round.
     mtp_pending: u64 = 0,
     waves: u64 = 0,
+    /// The prompt pass's f16 copy of the routed input (`promptXCopyBytes`), held to the handover.
+    routed_x_f16: u64 = 0,
     mlx_cache: u64 = 0,
     mlx_cache_overshoot: u64 = 0,
     /// The read pool's staging buffers and the lookahead's speculative slots (host pages).
@@ -256,7 +258,7 @@ pub const PhaseTerms = struct {
 
     /// The terms MLX's active bytes hold.
     pub fn device(t: PhaseTerms) u64 {
-        return t.slot_rows + t.transient_rows + t.residents + t.mtp_residents + t.kv + t.mtp_kv + t.mtp_pending + t.waves;
+        return t.slot_rows + t.transient_rows + t.residents + t.mtp_residents + t.kv + t.mtp_kv + t.mtp_pending + t.waves + t.routed_x_f16;
     }
 
     /// The wired bytes the page tables cover: every MLX byte (its active bytes and its cache).
@@ -377,8 +379,9 @@ pub fn slotTable(a: std.mem.Allocator, g: glm.Geometry, prompt: ?u32) ![]u64 {
 
 // ── The prompt pass (`glm_moe_dsa_graph.forwardRows` over a call of `rows` rows ending at `positions`) ──
 
-/// bf16, the stream's dtype; f32, the router's and the indexer's.
+/// bf16, the stream's dtype; f16, the routed GEMMs' input copy; f32, the router's and the indexer's.
 const bf16: u64 = 2;
+const f16b: u64 = 2;
 const f32b: u64 = 4;
 
 /// One prompt layer's live set at its peak, by the stages the wave probe reads (`glm_moe_dsa_graph.WaveProbe`): the
@@ -571,6 +574,16 @@ pub fn mtpPendingBytes(c: *const glm.Config, tokens: u64) u64 {
     return cache_mod.bufferBytes((t + @intFromBool(tokens > t)) * c.hidden_size * bf16, std.heap.pageSize());
 }
 
+/// The prompt pass's f16 copy of the routed input on GLM-5.3's kernels (GLM-only: `glm53_exl3_quant.beginWide`, the
+/// gate and up GEMMs' A rows): one buffer of the pass's widest call, its rows x hidden in f16, allocated at the pass's
+/// first wide call (inside the forward: with the size classes on, at its class) and held until the handover frees it
+/// (`releasePrompt`). The other quants read x itself: 0.
+pub fn promptXCopyBytes(c: *const glm.Config, tokens: u64, gemm: PromptGemm, classes: bool) u64 {
+    if (gemm != .glm53) return 0;
+    const b = glm.maxPromptCallRows(tokens) * c.hidden_size * f16b;
+    return if (classes) sizeClassBytes(b) else cache_mod.bufferBytes(b, std.heap.pageSize());
+}
+
 // ── Decode (`glm_moe_dsa_graph.forwardRows` over a serial step or a verify of `rows` rows) ──
 
 /// One decode forward's live set over `positions` keys at `rows` rows (the verify's per-row attention), by
@@ -662,6 +675,7 @@ pub fn billOf(in: Inputs) Bill {
             .mtp_kv = if (in.mtp != null) mtpKvBytes(c, in.prompt_tokens) else 0,
             .mtp_pending = pending,
             .waves = prompt_waves,
+            .routed_x_f16 = promptXCopyBytes(c, in.prompt_tokens, in.gemm, in.size_classes),
             .mlx_cache = in.prompt_cache,
             .mlx_cache_overshoot = promptOvershoot(c, g, in.prompt_tokens, in.gemm, in.size_classes),
             .pool_staging = pool,
@@ -700,6 +714,7 @@ pub fn memoryBill(a: std.mem.Allocator, b: Bill, prompt: ?u32) !sdk.MemoryBill {
         .{ .name = "MTP KV", .bytes = .{ p.mtp_kv, d.mtp_kv }, .at_construction = false },
         .{ .name = "MTP pending hidden", .bytes = .{ p.mtp_pending, d.mtp_pending }, .at_construction = false },
         .{ .name = "waves", .bytes = .{ p.waves, d.waves }, .at_construction = false },
+        .{ .name = "routed x as f16", .bytes = .{ p.routed_x_f16, d.routed_x_f16 }, .at_construction = false },
         .{ .name = "MLX allocator cache", .bytes = .{ p.mlx_cache, d.mlx_cache }, .at_construction = false },
         .{ .name = "MLX cache overshoot", .bytes = .{ p.mlx_cache_overshoot, d.mlx_cache_overshoot }, .at_construction = false },
         .{ .name = "read pool staging", .bytes = .{ p.pool_staging, d.pool_staging }, .at_construction = true, .construction = c.pool_staging },
@@ -1002,8 +1017,18 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
     try testing.expectEqual(selectOf(&c), Select.kernel);
     // The lane's pending hidden: the prompt's 16,448 rows.
     try testing.expectEqual(@as(u64, 16448 * 6144 * 2), p.mtp_pending);
+    // GLM-5.3's kernels' f16 copy of the routed input: the call's 16,448 rows x hidden, MLX's active bytes (`device`),
+    // the prompt pass only; the other quants read x itself.
+    try testing.expectEqual(@as(u64, 16448 * 6144 * 2), p.routed_x_f16);
+    try testing.expectEqual(p.slot_rows + p.transient_rows + p.residents + p.mtp_residents + p.kv + p.mtp_kv + p.mtp_pending + p.waves + p.routed_x_f16, p.device());
+    try testing.expectEqual(@as(u64, 0), d.routed_x_f16);
+    for ([_]PromptGemm{ .sushi, .affine }) |q| {
+        var other = boxInputs(&c, &cfg);
+        other.gemm = q;
+        try testing.expectEqual(@as(u64, 0), billOf(other).phases[@intFromEnum(Phase.prompt)].routed_x_f16);
+    }
     // The construction: no trunk residents, no KV, no wave, no cache.
-    try testing.expectEqual(@as(u64, 0), k.residents + k.kv + k.waves + k.mlx_cache + k.mlx_cache_overshoot + k.mtp_pending);
+    try testing.expectEqual(@as(u64, 0), k.residents + k.kv + k.waves + k.mlx_cache + k.mlx_cache_overshoot + k.mtp_pending + k.routed_x_f16);
     try testing.expectEqual(p.transient_rows, k.transient_rows);
     // The decode cache at its limit and one freed buffer: the index keys in f32 over every position.
     try testing.expectEqual(decode_cache_bytes, d.mlx_cache);
@@ -1040,9 +1065,12 @@ test "glm bill: the allocator's size classes: a page under 1 MiB, an eighth of t
     const off = billOf(in).phases[@intFromEnum(Phase.prompt)];
     in.size_classes = true;
     const on = billOf(in).phases[@intFromEnum(Phase.prompt)];
-    // Only the prompt's transients move: the waves and the cache's one buffer past its limit; at most 12.5 % more.
+    // Only the prompt's transients move: the waves, the cache's one buffer past its limit and the routed input's f16
+    // copy (202,113,024 B; at its class 208 MiB); at most 12.5 % more.
     try testing.expect(on.waves > off.waves and on.waves <= off.waves + off.waves / 8 + 64 * 16384);
     try testing.expect(on.mlx_cache_overshoot >= off.mlx_cache_overshoot);
+    try testing.expectEqual(@as(u64, 202_113_024), off.routed_x_f16);
+    try testing.expectEqual(@as(u64, 13 * (16 << 20)), on.routed_x_f16);
     try testing.expectEqual(off.mlx_cache, on.mlx_cache);
     try testing.expectEqual(off.kv + off.residents + off.slot_rows + off.transient_rows + off.mtp_residents, on.kv + on.residents + on.slot_rows + on.transient_rows + on.mtp_residents);
     const d_off = billOf(boxInputs(&c, &cfg)).phases[@intFromEnum(Phase.decode)];
