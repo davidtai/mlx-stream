@@ -7,6 +7,7 @@ const sdk = @import("sdk");
 const log = @import("sdk").log;
 const glm = @import("glm_moe_dsa.zig");
 const acceptance = sdk.acceptance;
+const expert_tally = @import("sdk_ext.zig").expert.tally;
 
 /// The arch's numerics: "stock" (the reference's op chain) is the only tier; any other name is unset.
 pub const NumericTier = enum { stock };
@@ -54,6 +55,8 @@ pub const Config = struct {
     /// box beside them moves. It only lowers the admission (never raises it), so it is always safe; the twin of
     /// `expert_units_cap` for an arm whose gain is the rows themselves.
     rest_of_box_floor_bytes: ?u64 = null,
+    /// The expert stream's rate tally (`expert_resident_ratio`, `expert_tally_window`): every model's keys and defaults.
+    tally: expert_tally.Settings = .{},
     /// The MTP draft lane's drafts per round (null or 0 = off; 1 .. `max_mtp_depth`).
     mtp_depth: ?u32 = null,
     /// A `mtp_depth` past the route limit: refused by name at load (`error.MtpDepthOverRouteLimit`).
@@ -133,6 +136,7 @@ pub const Config = struct {
             c.rest_of_box_floor_bytes = @intCast(v.integer);
             any = true;
         };
+        if (c.tally.apply(obj)) any = true;
         if (obj.get("ctx_size")) |v| if (v == .integer and v.integer >= 1) {
             if (v.integer <= max_ctx_size) c.max_context_tokens = @intCast(v.integer) else c.ctx_size_over_limit = v.integer;
             any = true;
@@ -165,8 +169,8 @@ pub const Config = struct {
                 any = true;
             };
         }
-        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} units_cap={d} rest_of_box_floor={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
-            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.expert_units_cap orelse 0, c.rest_of_box_floor_bytes orelse 0, c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta,
+        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} units_cap={d} rest_of_box_floor={d} resident_ratio={d} tally_window={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
+            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.expert_units_cap orelse 0, c.rest_of_box_floor_bytes orelse 0, c.tally.ratio, c.tally.window, c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta,
         });
     }
 

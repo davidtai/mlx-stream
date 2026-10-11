@@ -18,6 +18,7 @@ const std = @import("std");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const sdk_ext = @import("sdk_ext.zig");
+const builtin = @import("builtin");
 const settings = @import("deepseek_v41_settings.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("deepseek_v41_ops.zig");
@@ -568,6 +569,10 @@ pub const Module = struct {
     gate: PhaseGate = .{},
     /// The shell's io (the phase change's bounded settle waits on it).
     io: std.Io = undefined,
+    /// The rate tally's file (null: none, as in test builds) and the rates each request's end writes to it.
+    tally_path: ?[]u8 = null,
+    tally_rates: []f32 = &.{},
+    tally_window: u32 = 0,
     /// The harness's route overrides the Module was built with (the bill reads the same ones).
     overrides: RouteOverrides = .{},
     /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
@@ -588,6 +593,7 @@ pub const Module = struct {
     /// `init` with a harness's route overrides (the served path passes none).
     pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, ov: RouteOverrides) !*Module {
         try checkCtxSize(config);
+        try config.tally.check("deepseek_v41");
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
@@ -921,6 +927,7 @@ pub const Module = struct {
             inline else => |t| try t.arm.stream.forgetResidents(),
         };
         log.info("NATIVE construction residents forgotten: {d} rows (the warm-up's); every layer's protection, seed and prompt counts cleared\n", .{forgotten});
+        try self.openTally(config);
         // The bill at the admitted rows (the boundaries' bounds read it); the verification harness checks the constructed
         // footprint against it (`checkConstruction`).
         try self.billAdmitted(io, &admitted, ceiling_bytes);
@@ -1042,9 +1049,62 @@ pub const Module = struct {
         log.info("NATIVE decode host side: end of decode {d} B (after the grow {d} B; footprint {d} B, MLX active {d} B, cache {d} B)\n", .{ self.decode_host.end.?, after, m.footprint, m.active, m.cache });
     }
 
+    /// The rate tally's file read (`expert.tally`; the stream's tally seeded from it: the pins) and the rates its writes
+    /// start from. Test builds keep no file (their HOME is the box user's).
+    fn openTally(self: *Module, config: *const settings.Config) !void {
+        const st = switch (self.arm) {
+            inline else => |t| t.arm.stream,
+        };
+        const n_layers: u32 = @intCast(st.layers.len);
+        const n_experts: u32 = st.bank.n_experts;
+        self.tally_rates = try self.gpa.alloc(f32, @as(usize, n_layers) * n_experts);
+        @memset(self.tally_rates, 0);
+        errdefer {
+            if (self.tally_path) |p| self.gpa.free(p);
+            self.tally_path = null;
+            self.gpa.free(self.tally_rates);
+            self.tally_rates = &.{};
+        }
+        self.tally_window = config.tally.window;
+        if (builtin.is_test) return;
+        const key = try sdk_ext.expert.tally.keyOf(self.gpa, "deepseek_v41", config.expert_bank_dir orelse "model");
+        defer self.gpa.free(key);
+        self.tally_path = try sdk_ext.expert.tally.pathOf(self.gpa, key);
+        const path = self.tally_path orelse return;
+        switch (try sdk_ext.expert.tally.read(self.gpa, self.io, path, n_layers, n_experts)) {
+            .rates => |r| {
+                defer self.gpa.free(r);
+                @memcpy(self.tally_rates, r);
+                st.seedTally(r);
+                log.info("NATIVE expert tally: read {s}: the top {d} of each layer's experts by rate are pinned (window {d} routes)\n", .{ path, config.tally.ratio, config.tally.window });
+            },
+            .missing => log.info("NATIVE expert tally: no file at {s}: this load plans as a first run, its requests' ends write it\n", .{path}),
+            .mismatched => log.warn("NATIVE expert tally: {s} is not this stream's ({d} layers of {d} experts): ignored, this load plans as a first run\n", .{ path, n_layers, n_experts }),
+        }
+    }
+
+    /// The request's end for the tally: each layer's decode rates folded in (the tally pins from now on), the file
+    /// written. A failure is logged; the request is not failed.
+    fn endTally(self: *Module) void {
+        if (self.tally_rates.len == 0) return;
+        const st = switch (self.arm) {
+            inline else => |t| t.arm.stream,
+        };
+        const routed = st.endTally(self.tally_rates);
+        const path = self.tally_path orelse return;
+        if (routed == 0) return;
+        sdk_ext.expert.tally.write(self.gpa, self.io, path, self.tally_rates, @intCast(st.layers.len), st.bank.n_experts, self.tally_window) catch |e| {
+            log.warn("NATIVE expert tally: not written to {s}: {s}\n", .{ path, @errorName(e) });
+            return;
+        };
+        log.info("NATIVE expert tally: written to {s} ({d} of {d} layers routed in the decode)\n", .{ path, routed, st.layers.len });
+    }
+
     pub fn deinit(self: *Module) void {
         self.recordDecodeEnd();
         const gpa = self.gpa;
+        if (self.tally_path) |p| gpa.free(p);
+        if (self.tally_rates.len > 0) gpa.free(self.tally_rates);
         self.dropTurnBoundary();
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);
@@ -1555,6 +1615,7 @@ pub const Module = struct {
         // A request that ended in its prompt phase with nothing released needs nothing more.
         if (self.prompt_ready) return;
         self.recordDecodeEnd();
+        self.endTally();
         const vm0: ?VmMark = if (self.overrides.verify) VmMark.now() else null;
         var x: ReverseLive = .{ .m = self, .before = BoundaryMemory.now(), .coming = coming };
         reverseSteps(&x) catch |e| {
@@ -2166,6 +2227,7 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
         .lookahead = lookahead,
         .ceiling = ceiling,
         .wide_depth = config.dsv41WideDepth(),
+        .tally = .{ .ratio = config.tally.ratio, .window = config.tally.window },
     };
 }
 

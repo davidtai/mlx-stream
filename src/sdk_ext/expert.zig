@@ -32,6 +32,9 @@ pub const bank_file = @import("expert/bank_file.zig");
 pub const lookahead = @import("expert/lookahead.zig");
 /// The route recorder (a diagnostic): one request's decode routes, what served each id, and the handover's residents.
 pub const routes = @import("expert/routes.zig");
+/// The rate tally's settings and file (every model's residency: the top share of each layer's experts by request rate
+/// pinned, the rates carried from run to run under ~/.mlx-stream/<model key>/).
+pub const tally = @import("expert/tally.zig");
 
 /// The one reader per process: the host takes it at the load claim of an arch whose caps say `uses_expert_reader`
 /// (its source declares `uses_reader`), before the preflight and the weights, and gives it back when the loaded model

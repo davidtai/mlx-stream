@@ -44,6 +44,7 @@ pub const GrowFill = S.GrowFill;
 const ProbeSlot = S.ProbeSlot;
 const no_probe = S.no_probe;
 pub const Lookahead = S.Lookahead;
+pub const Tally = S.Tally;
 pub const Event = S.Event;
 pub const Gates = S.Gates;
 pub const Stats = S.Stats;

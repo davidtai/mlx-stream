@@ -18,6 +18,8 @@ pub const Config = struct {
     /// beside it; owned by the host's config.
     expert_bank_dir: ?[]const u8 = null,
     engram_token_map_path: ?[]const u8 = null,
+    /// The expert stream's rate tally (`expert_resident_ratio`, `expert_tally_window`): every model's keys and defaults.
+    tally: sdk_ext.expert.tally.Settings = .{},
     /// The prompt pass's bill for the prefill admission.
     dsv41_prefill: ?v41.PrefillBill = null,
     /// The shell's facts: routed experts and layers.
@@ -107,6 +109,7 @@ pub const Config = struct {
                 any = true;
             }
         };
+        if (c.tally.apply(obj)) any = true;
         if (obj.get("expert_wide_cold_rows")) |v| if (v == .integer and v.integer >= 1 and v.integer <= 8) {
             c.expert_wide_cold_rows = @intCast(v.integer);
             any = true;

@@ -364,6 +364,18 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             keep_residents: bool = false,
             /// G7: the arch's read-ahead records (`ReadAheadProbe`), in the prefill-timers build only.
             read_ahead_probe: ProbeSlot = no_probe,
+            /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
+            tally: ?Tally = null,
+        };
+
+        /// The rate tally's settings (`expert.tally.Settings`) and the stream's geometry: each stream layer pins at most
+        /// floor(`ratio` x its experts) experts, the rate's half-life `window` decode routes of the layer.
+        pub const Tally = struct {
+            ratio: f64,
+            window: u32,
+            /// Per stream layer the experts it serves (a bank of several stream layers per routed layer splits them);
+            /// null: the bank's `n_experts` each.
+            layer_experts: ?[]const u32 = null,
         };
 
         /// The grow's new rows: `zeros` evaluates MLX zeros (a GPU fill of every row); `unfilled` takes MLX-owned buffers without
@@ -687,9 +699,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     ls.base.deinit();
                     a.free(ls.meta);
                 };
-                for (layers, opt.rows, bank.layers) |*ls, rows, *geom| {
+                if (opt.tally) |t| if (t.layer_experts) |le| if (le.len != n_layers) return error.InvalidOptions;
+                for (layers, opt.rows, bank.layers, 0..) |*ls, rows, *geom, li| {
                     var policy = try LayerPolicy.init(a, bank.n_experts, rows);
                     errdefer policy.deinit(a);
+                    if (opt.tally) |t| {
+                        const experts = if (t.layer_experts) |le| le[li] else bank.n_experts;
+                        policy.setTally(expert.tally.pinLimit(t.ratio, experts), expert.tally.alphaOf(t.window));
+                    }
                     var base = try Rows.init(geom, rows, opt.slot_memory);
                     errdefer base.deinit();
                     const meta = try a.alloc(SlotMeta, bank.n_experts);
@@ -1095,7 +1112,33 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// A request's start: every layer's prompt counts zeroed (they would otherwise add up across requests). The
             /// policy's rank tie-break reads them too, so request 1 (zeroed by the construction's forget) is unchanged.
             pub fn resetPromptCounts(self: *Stream) void {
-                for (self.layers) |*ls| @memset(ls.policy.prefill_freq, 0);
+                for (self.layers) |*ls| {
+                    @memset(ls.policy.prefill_freq, 0);
+                    // The prompt's pins at the rows it has (the tally's rates as the last request left them).
+                    ls.policy.refreshPins();
+                }
+            }
+
+            /// Every layer's tally seeded from `rates` (`n_experts` per stream layer, in layer order: a tally file's).
+            pub fn seedTally(self: *Stream, rates: []const f32) void {
+                const n = self.bank.n_experts;
+                std.debug.assert(rates.len == self.layers.len * n);
+                for (self.layers, 0..) |*ls, l| ls.policy.seedTally(rates[l * n ..][0..n]);
+            }
+
+            /// The request's end (`LayerPolicy.endRequest`): each layer that routed in its decode writes its decode rates into
+            /// its `n_experts` of `out`; every tally is seeded from now on. Returns the layers that routed.
+            pub fn endTally(self: *Stream, out: []f32) u32 {
+                const n = self.bank.n_experts;
+                std.debug.assert(out.len == self.layers.len * n);
+                var routed: u32 = 0;
+                for (self.layers, 0..) |*ls, l| routed += @intFromBool(ls.policy.endRequest(out[l * n ..][0..n]));
+                return routed;
+            }
+
+            /// Whether the tally pins (seeded on its first layer: every layer is seeded together).
+            pub fn tallySeeded(self: *const Stream) bool {
+                return self.layers.len > 0 and self.layers[0].policy.seeded and self.layers[0].policy.pin_limit > 0;
             }
 
             /// The last `seedPrefill` of `layer`: its seed's ranks (the call's hottest experts, hottest first).
@@ -1626,9 +1669,24 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn preload(self: *Stream, ctx: anytype, comptime order: fn (@TypeOf(ctx), u32) []const u16) !u64 {
                 if (self.phase != .prefill) return error.NotPrefill;
                 var n: u64 = 0;
+                const by_rate = try self.allocator.alloc(u16, self.bank.n_experts);
+                defer self.allocator.free(by_rate);
                 for (0..self.layers.len) |l| {
                     const layer: u32 = @intCast(l);
-                    try self.readAheadSeed(layer, order(ctx, layer));
+                    const arch_order = order(ctx, layer);
+                    // A seeded tally fills the rows hottest first (rate descending, the arch's order among equal rates).
+                    const p = &self.layers[l].policy;
+                    const ids = if (p.seeded and p.pin_limit > 0) blk: {
+                        const out = by_rate[0..arch_order.len];
+                        @memcpy(out, arch_order);
+                        std.sort.insertion(u16, out, @as([]const f32, p.rate), struct {
+                            fn hotter(rs: []const f32, x: u16, y: u16) bool {
+                                return rs[x] > rs[y];
+                            }
+                        }.hotter);
+                        break :blk out;
+                    } else arch_order;
+                    try self.readAheadSeed(layer, ids);
                     for (self.ahead.reads[0..self.ahead.n]) |rd| n += @intFromBool(rd);
                     try self.awaitReadAhead(layer);
                 }

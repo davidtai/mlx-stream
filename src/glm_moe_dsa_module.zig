@@ -29,6 +29,7 @@ const sdk_ext = @import("sdk_ext.zig");
 const quant = sdk_ext.quant;
 const expert_event = sdk_ext.expert.event;
 const expert_routes = sdk_ext.expert.routes;
+const expert_tally = sdk_ext.expert.tally;
 const glm = @import("glm_moe_dsa.zig");
 const settings = @import("glm_moe_dsa_settings.zig");
 const bill_mod = @import("glm_moe_dsa_bill.zig");
@@ -203,6 +204,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         probe: ?*graph.WaveProbe = null,
         /// The positions the request's KV lanes hold since its handover (its decode terms' KV).
         decode_positions: u64 = 0,
+        /// The rate tally's file (`expert.tally.pathOf`; null: none, as in test builds) and the rates each request's end
+        /// writes to it (every stream layer's `n_experts`).
+        tally_path: ?[]u8 = null,
+        tally_rates: []f32 = &.{},
 
         const DecodeMark = struct { s0: Stats, mem0: Mem, by0: Bk.Stream.ByRank, steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0 };
 
@@ -214,6 +219,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             try cfg.checkCtxSize();
             try cfg.checkMaxOutput();
             try cfg.checkUnitsCap();
+            try cfg.tally.check("glm_moe_dsa");
             try cfg.checkMtp();
             const file_backed_start = sdk.memory.vmBytes().external;
             const dir = cfg.model_dir orelse return error.GlmPackDir;
@@ -295,6 +301,13 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const gpu = mlx.streamIsGpu(s);
             if (gated and gpu) self.event = try expert_event.createMetal();
             const shape = bill_mod.streamShape(cfg);
+            // The rate tally's geometry: each stream layer's experts (a routed layer's bank layers split its experts).
+            const layer_experts = try gpa.alloc(u32, n_bank);
+            defer gpa.free(layer_experts);
+            for (layer_experts, 0..) |*n, sl| {
+                n.* = 0;
+                for (0..self.bank.n_experts) |e| n.* += @intFromBool(Experts.bpl == 1 or self.bank.streamLayer(@intCast(sl / Experts.bpl), @intCast(e)) == sl);
+            }
             self.stream = try Stream.init(gpa, &self.bank, .{
                 .rows = self.prompt_rows,
                 .max_route_ids = shape.max_route_ids,
@@ -309,8 +322,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
                 .keep_residents = true,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
+                .tally = .{ .ratio = cfg.tally.ratio, .window = cfg.tally.window, .layer_experts = layer_experts },
             });
             errdefer self.stream.deinit();
+            try self.openTally(dir);
+            errdefer self.closeTally();
             if (expert_routes.dirOf(std.c.getenv(routes_env))) |d| {
                 self.recorder = try expert_routes.Recorder.init(gpa, @intCast(n_bank), self.bank.n_experts, model.n_experts_per_tok, Experts.bpl);
                 self.routes_dir = d;
@@ -427,8 +443,63 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             return self.cache.allocatedBytes(page) + if (self.mtp) |ln| ln.cache.allocatedBytes(page) else 0;
         }
 
+        /// The rate tally's file read (the load seeds the stream's tally from it: the preload's order and the pins) and the
+        /// rates its writes start from. Test builds keep no file (their HOME is the box user's).
+        fn openTally(self: *Self, dir: []const u8) !void {
+            const n_layers: u32 = @intCast(self.bank.layers.len);
+            const n_experts: u32 = self.bank.n_experts;
+            self.tally_rates = try self.gpa.alloc(f32, @as(usize, n_layers) * n_experts);
+            @memset(self.tally_rates, 0);
+            errdefer self.closeTally();
+            if (builtin.is_test) return;
+            const key = try expert_tally.keyOf(self.gpa, "glm_moe_dsa", dir);
+            defer self.gpa.free(key);
+            self.tally_path = try expert_tally.pathOf(self.gpa, key);
+            const path = self.tally_path orelse {
+                log.info("glm_moe_dsa: expert tally: no HOME, no tally file: every request after the first pins from the last one's rates
+", .{});
+                return;
+            };
+            switch (try expert_tally.read(self.gpa, self.io, path, n_layers, n_experts)) {
+                .rates => |r| {
+                    defer self.gpa.free(r);
+                    @memcpy(self.tally_rates, r);
+                    self.stream.seedTally(r);
+                    log.info("glm_moe_dsa: expert tally: read {s}: the preload fills the prompt rows hottest first, and the top {d} of each layer's experts by rate are pinned (window {d} routes)
+", .{ path, self.cfg.tally.ratio, self.cfg.tally.window });
+                },
+                .missing => log.info("glm_moe_dsa: expert tally: no file at {s}: this load plans as a first run (ratio {d}, window {d} routes), its requests' ends write it
+", .{ path, self.cfg.tally.ratio, self.cfg.tally.window }),
+                .mismatched => log.warn("glm_moe_dsa: expert tally: {s} is not this stream's ({d} layers of {d} experts, version {d}): ignored, this load plans as a first run
+", .{ path, n_layers, n_experts, expert_tally.version }),
+            }
+        }
+
+        fn closeTally(self: *Self) void {
+            if (self.tally_path) |p| self.gpa.free(p);
+            self.tally_path = null;
+            self.gpa.free(self.tally_rates);
+            self.tally_rates = &.{};
+        }
+
+        /// The request's end for the tally: each stream layer's decode rates folded in (the tally pins from now on), the
+        /// file written. A failure is logged; the request is not failed.
+        fn endTally(self: *Self) void {
+            const routed = self.stream.endTally(self.tally_rates);
+            const path = self.tally_path orelse return;
+            if (routed == 0) return;
+            expert_tally.write(self.gpa, self.io, path, self.tally_rates, @intCast(self.bank.layers.len), self.bank.n_experts, self.cfg.tally.window) catch |e| {
+                log.warn("glm_moe_dsa: expert tally: not written to {s}: {s}
+", .{ path, @errorName(e) });
+                return;
+            };
+            log.info("glm_moe_dsa: expert tally: written to {s} ({d} of {d} stream layers routed in the decode)
+", .{ path, routed, self.bank.layers.len });
+        }
+
         pub fn deinit(self: *Self) void {
             _ = mlx.mlx_synchronize(self.g.s);
+            self.closeTally();
             if (self.mtp) |ln| ln.deinit(&self.g);
             self.cache.deinit(&self.g);
             self.ex.deinit(&self.g);
@@ -691,6 +762,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             log.info("{f}\n", .{HostLine{ .h = self.ex.host, .wall_ns = d.wall_ns }});
             const by1 = self.stream.lookaheadByRank();
             log.info("{f}\n", .{PrecisionLine{ .by0 = &d.by0, .by1 = &by1 }});
+            self.endTally();
             if (self.recorder) |rec| self.writeRoutes(rec);
         }
 

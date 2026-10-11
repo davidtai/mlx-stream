@@ -96,6 +96,8 @@ pub const Options = struct {
     transient_release: bool = false,
     /// The grow's new rows' allocation (`expert_stream.Options.grow_fill`; the Module's route).
     grow_fill: expert_stream.GrowFill = .zeros,
+    /// The stream's rate tally (`expert_stream.Options.tally`; null: off).
+    tally: ?expert_stream.Tally = null,
     /// The draft head's resident bytes for the admission: null charges the
     /// envelope's own head, 0 the full DSpark head (the binding sets it for a
     /// DSpark decode); a `draft_subset` sets it to the subset's pruned bytes.
@@ -290,6 +292,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .transient_rows = @as(u32, opt.wide_depth) * expert_policy.max_route_ids,
                 .transient_release = opt.transient_release,
                 .grow_fill = opt.grow_fill,
+                .tally = opt.tally,
                 .read_ahead_probe = if (comptime expert_stream.read_ahead_probed) .{ .barrier = prefill_timers.readAheadBarrier, .admission = prefill_timers.readAheadAdmission, .posted = prefill_timers.readAheadPosted } else {},
             }) catch |e| return refuse(diag, e, "stream: {s}", .{@errorName(e)});
             errdefer self.stream.deinit();

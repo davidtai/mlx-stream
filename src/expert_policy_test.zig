@@ -604,3 +604,234 @@ fn policyInitDeinit(a: std.mem.Allocator, n_experts: u32, capacity: u32) !void {
 test "dsv41 policy: every allocation failure of the residency policy's construction unwinds without a leak" {
     try std.testing.checkAllAllocationFailures(testing.allocator, policyInitDeinit, .{ 16, 4 });
 }
+
+// ── The rate tally (`LayerPolicy.setTally`, `sdk_ext.expert.tally`) ──
+
+const tally = @import("sdk_ext.zig").expert.tally;
+
+/// The resident experts in ascending order.
+fn residentsOf(p: *const LayerPolicy, buf: []u16) []u16 {
+    var n: usize = 0;
+    for (p.slot_to_expert[0..p.capacity]) |e| if (e != no_expert) {
+        buf[n] = e;
+        n += 1;
+    };
+    std.sort.pdq(u16, buf[0..n], {}, std.sort.asc(u16));
+    return buf[0..n];
+}
+
+fn expectPins(p: *const LayerPolicy, want: []const u16) !void {
+    var n: usize = 0;
+    for (0..p.n_experts) |e| if (p.isPinned(@intCast(e))) {
+        try testing.expect(n < want.len and want[n] == e);
+        n += 1;
+    };
+    try testing.expectEqual(want.len, n);
+}
+
+/// Route t of a cycle over experts 3 .. 15, three a route.
+fn cycleRoute(t: usize) [3]u16 {
+    return .{ @intCast(3 + (3 * t) % 13), @intCast(3 + (3 * t + 1) % 13), @intCast(3 + (3 * t + 2) % 13) };
+}
+
+test "expert policy tally: decode never evicts the pinned top of the rate; the other rows churn as the transition window plans them" {
+    // 16 experts, 6 rows, ratio 0.2: 3 pins. A window long enough that 40 routes leave the pins where the file put them.
+    const a = testing.allocator;
+    var p = try LayerPolicy.init(a, 16, 6);
+    defer p.deinit(a);
+    p.setTally(tally.pinLimit(0.2, 16), tally.alphaOf(100_000));
+    var rates: [16]f32 = @splat(0.01);
+    rates[0] = 0.9;
+    rates[1] = 0.8;
+    rates[2] = 0.7;
+    p.seedTally(&rates);
+    try expectPins(&p, &.{ 0, 1, 2 });
+    var out: Plan = .{};
+    p.plan(&.{ 0, 1, 2 }, .decode, &out);
+    var buf: [16]u16 = undefined;
+    for (0..40) |t| {
+        const ids = cycleRoute(t);
+        p.plan(&ids, .decode, &out);
+        try checkPlan(&p, &ids, &out, max_route_ids);
+        for (out.evictionsOf()) |ev| try testing.expect(ev.previous > 2);
+        const res = residentsOf(&p, &buf);
+        try testing.expectEqual(@as(usize, 6), res.len);
+        try testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, res[0..3]);
+        // The swap rows hold this route's three.
+        for (ids) |e| try testing.expect(p.slotOf(e) != null);
+    }
+    try expectPins(&p, &.{ 0, 1, 2 });
+    // The same routes without a tally: the transition window evicts the three at the second route.
+    var q = try LayerPolicy.init(a, 16, 6);
+    defer q.deinit(a);
+    q.plan(&.{ 0, 1, 2 }, .decode, &out);
+    for (0..40) |t| {
+        const ids = cycleRoute(t);
+        q.plan(&ids, .decode, &out);
+    }
+    for ([_]u16{ 0, 1, 2 }) |e| try testing.expectEqual(@as(?u32, null), q.slotOf(e));
+}
+
+test "expert policy tally: a pinned resident keeps its row where the transition window would give it to the miss" {
+    // One row (the transition test above): without the tally, [2] evicts 1 and [1] is then served transient.
+    const a = testing.allocator;
+    var p = try LayerPolicy.init(a, 8, 1);
+    defer p.deinit(a);
+    p.setTally(1, tally.alphaOf(100_000));
+    var rates: [8]f32 = @splat(0);
+    rates[1] = 0.5;
+    p.seedTally(&rates);
+    var out: Plan = .{};
+    p.plan(&.{1}, .decode, &out);
+    try testing.expectEqualSlices(Load, &.{.{ .expert = 1, .slot = 0, .persistent = true }}, out.loadsOf());
+    p.plan(&.{2}, .decode, &out);
+    try testing.expectEqualSlices(Load, &.{.{ .expert = 2, .slot = 1, .persistent = false }}, out.loadsOf());
+    try testing.expectEqual(@as(u32, 0), out.n_evictions);
+    p.plan(&.{ 1, 1 }, .decode, &out);
+    try testing.expectEqualSlices(u16, &.{1}, out.hitsOf());
+    try testing.expectEqual(@as(u32, 0), out.n_loads);
+}
+
+test "expert policy tally: seeded, a prefill miss that is not pinned evicts nothing and is no seed; a pinned one evicts the coldest probationer" {
+    const a = testing.allocator;
+    var p = try LayerPolicy.init(a, 16, 3);
+    defer p.deinit(a);
+    p.setTally(2, tally.alphaOf(32));
+    var rates: [16]f32 = @splat(0);
+    rates[5] = 0.9;
+    rates[6] = 0.8;
+    p.seedTally(&rates);
+    try expectPins(&p, &.{ 5, 6 });
+    // The rows filled as a preload leaves them (read ahead, unprotected), then the prompt's seed: 7 (3 rows), 5 (2), 1 (1).
+    var ra: [4]LayerPolicy.ReadAhead = undefined;
+    try testing.expectEqual(@as(usize, 3), p.admitReadAhead(&.{ 1, 2, 3 }, &ra).len);
+    p.prepareSeed(&.{ 7, 7, 7, 5, 5, 1 });
+    try testing.expect(p.seed.isSet(5));
+    try testing.expect(!p.seed.isSet(7));
+    var out: Plan = .{};
+    p.plan(&.{ 7, 5 }, .prefill, &out);
+    try checkPlan(&p, &.{ 7, 5 }, &out, max_route_ids);
+    // 5 takes 2's row (2 is the coldest unprotected resident: 1 is the seed's, re-protected); 7 is served transient.
+    try testing.expectEqualSlices(Load, &.{
+        .{ .expert = 5, .slot = 1, .persistent = true },
+        .{ .expert = 7, .slot = 3, .persistent = false },
+    }, out.loadsOf());
+    try testing.expectEqualSlices(Eviction, &.{.{ .slot = 1, .previous = 2, .next = 5 }}, out.evictionsOf());
+    var buf: [16]u16 = undefined;
+    try testing.expectEqualSlices(u16, &.{ 1, 3, 5 }, residentsOf(&p, &buf));
+}
+
+test "expert policy tally: ratio 0 plans exactly as no tally; a request's end gives each expert's share of the decode routes and seeds the pins" {
+    const a = testing.allocator;
+    var p = try LayerPolicy.init(a, 32, 5);
+    defer p.deinit(a);
+    var q = try LayerPolicy.init(a, 32, 5);
+    defer q.deinit(a);
+    p.setTally(tally.pinLimit(0, 32), tally.alphaOf(32));
+    var half: [32]f32 = @splat(0.5);
+    p.seedTally(&half);
+    var rng = std.Random.DefaultPrng.init(7);
+    const r = rng.random();
+    var ids: [max_route_ids]u16 = undefined;
+    var routed: [32]u32 = @splat(0);
+    var decode_routes: u32 = 0;
+    var op: Plan = .{};
+    var oq: Plan = .{};
+    for (0..300) |step| {
+        const n = r.intRangeAtMost(usize, 1, 12);
+        for (ids[0..n]) |*e| e.* = @intCast(r.intRangeLessThan(u32, 0, if (step % 4 == 0) 32 else 10));
+        const phase: Phase = if (step < 40) .prefill else .decode;
+        if (phase == .prefill and step % 10 == 0) {
+            p.prepareSeed(ids[0..n]);
+            q.prepareSeed(ids[0..n]);
+        }
+        p.plan(ids[0..n], phase, &op);
+        q.plan(ids[0..n], phase, &oq);
+        try testing.expectEqualSlices(u32, oq.slotsOf(), op.slotsOf());
+        try testing.expectEqualSlices(Load, oq.loadsOf(), op.loadsOf());
+        try testing.expectEqualSlices(Eviction, oq.evictionsOf(), op.evictionsOf());
+        if (phase == .decode) {
+            decode_routes += 1;
+            var seen: [32]bool = @splat(false);
+            for (ids[0..n]) |e| if (!seen[e]) {
+                seen[e] = true;
+                routed[e] += 1;
+            };
+        }
+    }
+    var share: [32]f32 = undefined;
+    try testing.expect(p.endRequest(&share));
+    for (share, routed) |s, c| try testing.expectEqual(@as(f32, @floatFromInt(c)) / @as(f32, @floatFromInt(decode_routes)), s);
+    // No tally on: nothing to give.
+    try testing.expect(!q.endRequest(&share));
+    // Unseeded, a tally counts but pins nothing; its request's end seeds it: the top 2 by rate from then on.
+    var u = try LayerPolicy.init(a, 8, 3);
+    defer u.deinit(a);
+    u.setTally(2, tally.alphaOf(4));
+    for (0..20) |_| {
+        u.plan(&.{ 4, 6 }, .decode, &op);
+        u.plan(&.{ 4, 1 }, .decode, &op);
+    }
+    try expectPins(&u, &.{});
+    var s8: [8]f32 = @splat(0);
+    try testing.expect(u.endRequest(&s8));
+    try testing.expectEqual(@as(f32, 1), s8[4]);
+    try testing.expectEqual(@as(f32, 0.5), s8[6]);
+    try expectPins(&u, &.{ 1, 4 });
+}
+
+test "expert policy tally: the settings' defaults, their keys, and the values refused by name" {
+    const parse = struct {
+        fn of(text: []const u8) !tally.Settings {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
+            var s: tally.Settings = .{};
+            _ = s.apply(v.object);
+            return s;
+        }
+    };
+    const d: tally.Settings = .{};
+    try testing.expectEqual(@as(f64, 0.5), d.ratio);
+    try testing.expectEqual(@as(u32, 32), d.window);
+    try d.check("test");
+    try testing.expectEqual(@as(f64, 0.3), (try parse.of("{\"expert_resident_ratio\": 0.3}")).ratio);
+    try testing.expectEqual(@as(f64, 0), (try parse.of("{\"expert_resident_ratio\": 0}")).ratio);
+    try testing.expectEqual(@as(f64, 1), (try parse.of("{\"expert_resident_ratio\": 1}")).ratio);
+    try testing.expectEqual(@as(f64, 0.5), (try parse.of("{\"expert_resident_ratio\": \"0.3\"}")).ratio);
+    try testing.expectError(error.ResidentRatioOutOfRange, (try parse.of("{\"expert_resident_ratio\": 1.5}")).check("test"));
+    try testing.expectError(error.ResidentRatioOutOfRange, (try parse.of("{\"expert_resident_ratio\": -0.1}")).check("test"));
+    try testing.expectEqual(@as(u32, 64), (try parse.of("{\"expert_tally_window\": 64}")).window);
+    try testing.expectError(error.TallyWindowOutOfRange, (try parse.of("{\"expert_tally_window\": 0}")).check("test"));
+    try testing.expectEqual(@as(u32, 32), (try parse.of("{\"expert_tally_window\": 2.5}")).window);
+    // GLM-5.3's EXL3 bank layers: 148 and 108 experts.
+    try testing.expectEqual(@as(u32, 74), tally.pinLimit(0.5, 148));
+    try testing.expectEqual(@as(u32, 54), tally.pinLimit(0.5, 108));
+    try testing.expectEqual(@as(u32, 0), tally.pinLimit(0, 148));
+    try testing.expectEqual(@as(u32, 148), tally.pinLimit(1, 148));
+    try testing.expectEqual(@as(u32, 44), tally.pinLimit(0.3, 148));
+    try testing.expectApproxEqAbs(@as(f32, 0.0214), tally.alphaOf(32), 1e-4);
+}
+
+test "expert policy tally: the file round-trips its rates; a missing file, another geometry and a short file are not read" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/model-key/" ++ tally.file_name, .{root});
+    defer testing.allocator.free(path);
+    try testing.expect(try tally.read(testing.allocator, io, path, 2, 4) == .missing);
+    const rates = [_]f32{ 0.5, 0, 0.25, 1, 0.125, 0.75, 0, 0 };
+    try tally.write(testing.allocator, io, path, &rates, 2, 4, 32);
+    const got = try tally.read(testing.allocator, io, path, 2, 4);
+    defer if (got == .rates) testing.allocator.free(got.rates);
+    try testing.expectEqualSlices(f32, &rates, got.rates);
+    try testing.expect(try tally.read(testing.allocator, io, path, 4, 2) == .mismatched);
+    try testing.expect(try tally.read(testing.allocator, io, path, 2, 8) == .mismatched);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "MLXSTALY" });
+    try testing.expect(try tally.read(testing.allocator, io, path, 2, 4) == .mismatched);
+    const key = try tally.keyOf(testing.allocator, "glm_moe_dsa", "/Users/x/glm53/pack-exl3-3.42bpw/");
+    defer testing.allocator.free(key);
+    try testing.expectEqualStrings("glm_moe_dsa-pack-exl3-3.42bpw", key);
+}

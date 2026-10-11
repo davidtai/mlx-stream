@@ -105,6 +105,19 @@ pub const LayerPolicy = struct {
     /// Persistent slots another live route of this layer still serves from
     /// (`PlanOpts.held`, set for one plan): never a victim.
     held: std.DynamicBitSetUnmanaged,
+    // The rate tally (`setTally`, `sdk_ext.expert.tally`): per expert an EMA of "a decode route of this layer requests
+    // it" (`rate`, `alpha` = 1 - 2^(-1/window)). Once seeded (a tally file read, or a request ended) the top
+    // `pin_limit` experts by rate, at most the capacity, are pinned: never a victim, first in the decode cut, and the
+    // only prefill misses that may evict. Off (no `setTally`) or unseeded: the plans are those without a tally.
+    rate: []f32,
+    pinned: std.DynamicBitSetUnmanaged,
+    /// This request's decode routes, and per expert the routes that requested it (`endRequest`).
+    request_counts: []u32,
+    request_routes: u32 = 0,
+    alpha: f32 = 0,
+    pin_limit: u32 = 0,
+    seeded: bool = false,
+    pin_scratch: []u16,
 
     /// A plan beside other live routes of the layer: their slots (`held`) are
     /// never victims, and its transient loads take rows from `transient_base`.
@@ -138,6 +151,10 @@ pub const LayerPolicy = struct {
             .available = undefined,
             .admission = undefined,
             .held = undefined,
+            .rate = undefined,
+            .pinned = undefined,
+            .request_counts = undefined,
+            .pin_scratch = undefined,
         };
         errdefer a.free(p.slot_to_expert);
         p.expert_to_slot = try a.alloc(u32, n);
@@ -175,6 +192,16 @@ pub const LayerPolicy = struct {
         p.admission = try a.alloc(u32, n);
         errdefer a.free(p.admission);
         p.held = try std.DynamicBitSetUnmanaged.initEmpty(a, n);
+        errdefer p.held.deinit(a);
+        p.rate = try a.alloc(f32, n);
+        errdefer a.free(p.rate);
+        p.pinned = try std.DynamicBitSetUnmanaged.initEmpty(a, n);
+        errdefer p.pinned.deinit(a);
+        p.request_counts = try a.alloc(u32, n);
+        errdefer a.free(p.request_counts);
+        p.pin_scratch = try a.alloc(u16, n);
+        @memset(p.rate, 0);
+        @memset(p.request_counts, 0);
         @memset(p.slot_to_expert, no_expert);
         @memset(p.expert_to_slot, no_slot);
         @memset(p.prefill_freq, 0);
@@ -208,12 +235,85 @@ pub const LayerPolicy = struct {
         a.free(p.available);
         a.free(p.admission);
         p.held.deinit(a);
+        a.free(p.rate);
+        p.pinned.deinit(a);
+        a.free(p.request_counts);
+        a.free(p.pin_scratch);
         p.* = undefined;
     }
 
     pub fn slotOf(p: *const LayerPolicy, expert: u16) ?u32 {
         const s = p.expert_to_slot[expert];
         return if (s == no_slot) null else s;
+    }
+
+    /// The rate tally on: at most `pin_limit` experts pinned (the ratio's share of the layer's experts), the rate an EMA
+    /// of factor `alpha` per decode route. Unseeded until `seedTally` or `endRequest`.
+    pub fn setTally(p: *LayerPolicy, pin_limit: u32, alpha: f32) void {
+        p.pin_limit = @min(pin_limit, p.n_experts);
+        p.alpha = alpha;
+    }
+
+    /// The rates a tally file (or another layer's state) holds, one per expert: the tally seeded, the pins chosen.
+    pub fn seedTally(p: *LayerPolicy, rates: []const f32) void {
+        std.debug.assert(rates.len == p.n_experts);
+        for (p.rate, rates) |*r, x| r.* = if (x > 0 and x <= 1) x else 0;
+        p.seeded = true;
+        p.refreshPins();
+    }
+
+    /// The request's end: `out` (one per expert) set to this request's decode rate (each expert's share of the layer's
+    /// decode routes) where the layer routed in its decode, the request's counts zeroed, the tally seeded from now on (a
+    /// later request on this load pins). Returns whether the layer routed in the request's decode.
+    pub fn endRequest(p: *LayerPolicy, out: []f32) bool {
+        std.debug.assert(out.len == p.n_experts);
+        if (p.alpha == 0) return false;
+        const routes = p.request_routes;
+        if (routes > 0) {
+            const n: f32 = @floatFromInt(routes);
+            for (out, p.request_counts) |*o, c| o.* = @as(f32, @floatFromInt(c)) / n;
+        }
+        @memset(p.request_counts, 0);
+        p.request_routes = 0;
+        p.seeded = true;
+        p.refreshPins();
+        return routes > 0;
+    }
+
+    /// The pins at the tally's rates: the top `min(pin_limit, capacity)` experts of positive rate, ties by the lower id.
+    /// None while unseeded.
+    pub fn refreshPins(p: *LayerPolicy) void {
+        p.pinned.unsetAll();
+        const k = @min(p.pin_limit, p.capacity);
+        if (!p.seeded or k == 0) return;
+        var n: usize = 0;
+        for (p.rate, 0..) |r, e| if (r > 0) {
+            p.pin_scratch[n] = @intCast(e);
+            n += 1;
+        };
+        const ranked = p.pin_scratch[0..n];
+        std.sort.pdq(u16, ranked, @as([]const f32, p.rate), struct {
+            fn hotter(rs: []const f32, x: u16, y: u16) bool {
+                return if (rs[x] != rs[y]) rs[x] > rs[y] else x < y;
+            }
+        }.hotter);
+        for (ranked[0..@min(k, n)]) |e| p.pinned.set(e);
+    }
+
+    pub fn isPinned(p: *const LayerPolicy, e: u16) bool {
+        return p.pinned.isSet(e);
+    }
+
+    /// One decode route of the layer (its unique experts) into the rate and the request's counts.
+    fn tallyRoute(p: *LayerPolicy, unique: []const u16) void {
+        if (p.alpha == 0) return;
+        const keep = 1 - p.alpha;
+        for (p.rate) |*r| r.* *= keep;
+        for (unique) |e| {
+            p.rate[e] += p.alpha;
+            p.request_counts[e] += 1;
+        }
+        p.request_routes += 1;
     }
 
     /// prepare_prefill_seed: counts the prompt's routed ids, then re-protects
@@ -361,6 +461,7 @@ pub const LayerPolicy = struct {
             p.epoch += 1;
             for (ids) |e| p.last_used[e] = p.epoch;
             p.observe(unique);
+            p.tallyRoute(unique);
         }
         for (unique) |e| {
             if (p.expert_to_slot[e] != no_slot) {
@@ -581,6 +682,7 @@ pub const LayerPolicy = struct {
     fn transitionAdmissions(p: *LayerPolicy, out: *const Plan) []u32 {
         const admission = p.admission;
         if (out.n_misses == 0) return admission;
+        if (p.seeded) p.refreshPins();
         p.computeScores();
         const cap = p.capacity;
         var n_cand: usize = 0;
