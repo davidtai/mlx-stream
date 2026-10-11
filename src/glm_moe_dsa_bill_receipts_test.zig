@@ -25,15 +25,17 @@ fn glm53Config() !glm.Config {
 /// The fill arm's model settings and context.
 const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
 
-fn inputs(c: *const glm.Config) bill.Inputs {
+/// The box's inputs with the run's prompt kernels: its routed GEMMs and its spans' selection.
+fn inputs(c: *const glm.Config, gemm: bill.PromptGemm, select: bill.Select) bill.Inputs {
     const b = bill.box_exl3;
-    return .{ .model = c, .bank = b.geometry, .resident_bytes = b.resident_bytes, .stream = bill.streamShape(&cfg), .prompt_tokens = bill.servedContext(&cfg), .decode_positions = bill.maxPositions(&cfg), .mtp = b.mtp, .dsa = true, .prompt_cache = bill.prefillCacheBytes(b.ram) };
+    return .{ .model = c, .bank = b.geometry, .resident_bytes = b.resident_bytes, .stream = bill.streamShape(&cfg), .prompt_tokens = bill.servedContext(&cfg), .decode_positions = bill.maxPositions(&cfg), .mtp = b.mtp, .dsa = true, .gemm = gemm, .select = select, .prompt_cache = bill.prefillCacheBytes(b.ram) };
 }
 
 test "glm bill receipts: the 9d157b5 screen's peaks, over its own bill, sit under this bill at its inputs and units" {
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
-    const in = inputs(&c);
+    // The screen ran sushi's prompt GEMM and argpartition's selection.
+    const in = inputs(&c, .sushi, .argpartition);
     const b = bill.billOf(in);
     // The screen's load: the baseline 18,144,149,504 B, 76 prompt units, the handover's 86 at its 17,415 positions.
     const baseline: u64 = 18_144_149_504;
@@ -59,6 +61,10 @@ const PhaseRecord = struct { phase: []const u8, billed: bill.PhaseTerms, measure
 /// the four `glm_moe_dsa: phase memory` records).
 const Receipt = struct {
     name: []const u8,
+    /// The run's prompt kernels (stack 3e37e40: sushi's GEMM and argpartition; from 42abec0: GLM-5.3's kernels and the
+    /// top-k kernel).
+    gemm: bill.PromptGemm,
+    select: bill.Select,
     /// The load's baseline (the rest of the box at load) and the box's target then.
     baseline: u64,
     target: u64,
@@ -75,11 +81,13 @@ const Receipt = struct {
     records: [4]PhaseRecord,
 };
 
-/// The box's runs of this bill on stack 3e37e40 (plugin 53b4b7e, host e3baf303): the coding workload, seed 1234, its
-/// screen with the wave probe on (`GLM53_WAVE_PROBE`) and without it.
+/// The box's runs of this bill: the coding workload, seed 1234, a screen with the wave probe on (`GLM53_WAVE_PROBE`) and
+/// one without it, on stack 3e37e40 (plugin 53b4b7e, host e3baf303).
 const receipts = [_]Receipt{
     .{
         .name = "v2-coding-probe",
+        .gemm = .sushi,
+        .select = .argpartition,
         .baseline = 19358449664,
         .units = .{ .prompt = 70, .decode = 80 },
         .target = 257698037760,
@@ -98,6 +106,8 @@ const receipts = [_]Receipt{
     },
     .{
         .name = "v2-coding",
+        .gemm = .sushi,
+        .select = .argpartition,
         .baseline = 19489734656,
         .units = .{ .prompt = 70, .decode = 80 },
         .target = 257698037760,
@@ -124,10 +134,10 @@ const host_key_bytes: i64 = 8;
 test "glm bill receipts: each run's phase terms, page tables and residuals rebuild from its bill, to the byte" {
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
-    const in = inputs(&c);
-    const b = bill.billOf(in);
     for (receipts) |r| {
         errdefer std.debug.print("receipt {s}\n", .{r.name});
+        const in = inputs(&c, r.gemm, r.select);
+        const b = bill.billOf(in);
         const req = bill.atRequest(in, r.request.positions);
         const p = r.units.prompt;
         const want = [4]bill.PhaseTerms{ b.terms(.construction, p, p), b.terms(.prompt, p, p), req.terms(.decode, r.grown, p), req.terms(.decode, r.grown, p) };
@@ -149,11 +159,11 @@ test "glm bill receipts: each run's phase terms, page tables and residuals rebui
 test "glm bill receipts: the fill at each run's baseline gives its units, one more in either phase is refused, and the bill at the request gives its units" {
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
-    const in = inputs(&c);
-    const mb = try bill.memoryBill(testing.allocator, bill.billOf(in), null);
-    defer mb.free(testing.allocator);
     for (receipts) |r| {
         errdefer std.debug.print("receipt {s}\n", .{r.name});
+        const in = inputs(&c, r.gemm, r.select);
+        const mb = try bill.memoryBill(testing.allocator, bill.billOf(in), null);
+        defer mb.free(testing.allocator);
         try testing.expectEqual(r.target, bill.targetOf(bill.box_exl3.gpu_target, bill.box_exl3.ram, r.baseline));
         try phase_mem.expectFillEdge(mb, r.baseline, r.target, bill.maxUnits(in.bank), bill.min_fill_rows, r.units);
         try testing.expectEqual(r.request.target, bill.targetOf(bill.box_exl3.gpu_target, bill.box_exl3.ram, r.request.others));

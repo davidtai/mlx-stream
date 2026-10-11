@@ -27,6 +27,9 @@ const io_mod = @import("sdk_ext.zig").expert.io;
 const mtp_mod = @import("glm_moe_dsa_mtp.zig");
 const exl3_bank = @import("glm_moe_dsa_exl3_bank.zig");
 const phase_mem = @import("phase_memory.zig");
+const topk_mod = @import("glm_moe_dsa_topk.zig");
+const glm53_quant = @import("glm53_exl3_quant.zig");
+const sushi_quant = @import("glm_moe_dsa_exl3_quant.zig");
 
 /// The request a construction bills when the model sets no context (`ctx_size`), and the fill's floor (shared with
 /// DeepSeek-V4.1's bill, `phase_memory`).
@@ -131,6 +134,26 @@ pub const StreamShape = struct {
 /// their slot table as MLX allocates them (the lane measures them at its open and refuses more, `checkMtp`).
 pub const Mtp = struct { depth: u32, resident_bytes: u64, expert_bytes: u64 };
 
+/// Whose kernels run the prompt's routed GEMMs, each with its own arrays per routed row (`prefillRowBytes`): MLX's
+/// `gather_qmm` on the affine bank, sushi's EXL3 MoE (`glm_moe_dsa_exl3_quant`), GLM-5.3's own EXL3 kernels
+/// (`glm53_exl3_quant`).
+pub const PromptGemm = enum { affine, sushi, glm53 };
+
+/// The prompt GEMM of the module's quant `Q`.
+pub fn promptGemmOf(comptime Q: type) PromptGemm {
+    if (Q == glm53_quant) return if (glm53_quant.prompt_kernels == .glm53) .glm53 else .sushi;
+    return if (Q == sushi_quant) .sushi else .affine;
+}
+
+/// How a prompt span on the DSA kernels keeps each row's top keys (`glm_moe_dsa_graph.selectSpans`): the top-k kernel
+/// (`glm_moe_dsa_topk`, where it serves the model's top-k), else MLX's argpartition over every key.
+pub const Select = enum { kernel, argpartition };
+
+/// The selection `selectSpans` runs for model `c`.
+pub fn selectOf(c: *const glm.Config) Select {
+    return if (topk_mod.serves(c.index_topk)) .kernel else .argpartition;
+}
+
 /// What one bill reads: the model, the bank's geometry, the residents' bytes, the stream's shape and the positions
 /// each phase's KV lanes hold.
 pub const Inputs = struct {
@@ -148,6 +171,9 @@ pub const Inputs = struct {
     mtp: ?Mtp = null,
     /// The prompt's attention on the DSA kernels (`glm_moe_dsa_graph.Routes.dsa`), else in the reference's form.
     dsa: bool,
+    /// The prompt's routed GEMMs (the module's quant, `promptGemmOf`) and its spans' selection (`selectOf`).
+    gemm: PromptGemm,
+    select: Select,
     /// The prompt pass's MLX cache limit (`prefillCacheBytes`): the module installs it, the bill charges it.
     prompt_cache: u64,
 };
@@ -342,26 +368,31 @@ fn spansOf(c: *const glm.Config, rows: u64, positions: u64) struct { rows: u64, 
     return .{ .rows = r, .n = std.math.divCeil(u64, rows, r) catch unreachable };
 }
 
-/// The routed call's GEMM transient bytes per routed row through the bank's quant (each a GLM-only allocation: the
-/// quant's own arrays). EXL3 (sushi's prefill GEMM, `glm_moe_dsa_exl3_quant.prefillTabled`): per tensor-parallel mini
-/// the prepared gate and up inputs (f16, `hidden` each), the gate and up outputs (f16, `mini` each), the middle (f16,
-/// `mini`), the down output (f16, `hidden`), and the host tables' copies (u32 / i32 / f32, eight words). The affine bank
-/// (`sdk_ext.quant.FromGatherMatmul`): the gathered input, the gate and up outputs and the SwiGLU's two arrays, the down
-/// output, the order arrays.
-pub fn prefillRowBytes(c: *const glm.Config, g: glm.Geometry) u64 {
+/// The routed call's GEMM transient bytes per routed row through the module's quant (each a GLM-only allocation: the
+/// quant's own arrays). GLM-5.3's kernels (`glm53_exl3_quant.prefill`, `glm53_exl3_routes.Prompt.wave`): the gate and
+/// up outputs (f32, every mini's intermediate each), the middle (f16), the wave's down output and the waves' join (bf16,
+/// `hidden` each), the wave's row table (the x row and the slot, u32) and the call's order (u32). Sushi's EXL3 MoE: per
+/// tensor-parallel mini the prepared gate and up inputs (f16, `hidden` each), the gate and up outputs (f16, `mini`
+/// each), the middle (f16, `mini`), the down output (f16, `hidden`), and the routing table's eight words; the output's
+/// reshape. The affine bank (`sdk_ext.quant.FromGatherMatmul`): the gathered input, the gate and up outputs and the
+/// SwiGLU's two arrays, the down output, the order arrays.
+pub fn prefillRowBytes(c: *const glm.Config, g: glm.Geometry, gemm: PromptGemm) u64 {
     const h: u64 = c.hidden_size;
     const inter: u64 = c.moe_intermediate_size;
-    if (g.minis_per_id > 1) {
-        const tp: u64 = g.minis_per_id;
-        const mini = inter / tp;
-        return tp * (2 * h * bf16 + 3 * mini * bf16 + h * bf16 + 8 * 4) + h * bf16;
-    }
-    return 2 * h * bf16 + 4 * inter * bf16 + 3 * 4;
+    return switch (gemm) {
+        .glm53 => 2 * inter * f32b + inter * bf16 + 2 * h * bf16 + 3 * 4,
+        .sushi => blk: {
+            const tp: u64 = @max(g.minis_per_id, 1);
+            const mini = inter / tp;
+            break :blk tp * (2 * h * bf16 + 3 * mini * bf16 + h * bf16 + 8 * 4) + h * bf16;
+        },
+        .affine => 2 * h * bf16 + 4 * inter * bf16 + 3 * 4,
+    };
 }
 
 /// One prompt layer's wave (`PromptWave`) at `rows` rows over `positions` keys: `full` an indexer layer, `sparse` a
 /// routed one, `dsa` the attention on the DSA kernels, `gemm_row` the routed call's bytes per routed row in flight.
-pub fn promptWaveOf(c: *const glm.Config, rows: u64, positions: u64, full: bool, sparse: bool, dsa: bool, gemm_row: u64) PromptWave {
+pub fn promptWaveOf(c: *const glm.Config, rows: u64, positions: u64, full: bool, sparse: bool, dsa: bool, select: Select, gemm_row: u64) PromptWave {
     const t = rows;
     const p = positions;
     const h: u64 = c.hidden_size;
@@ -389,10 +420,12 @@ pub fn promptWaveOf(c: *const glm.Config, rows: u64, positions: u64, full: bool,
     if (full and dsa) per_row += ih * (bf16 + 2 * f32b);
     w.attn = t * per_row;
     if (dsa) {
-        // A span: the indexer's f32 score and its partition over the keys and the kept ids (a full layer), the query's
-        // contiguous nope rows, the absorbed query and the latent output; the spans' outputs before their join.
+        // A span: the indexer's f32 score over the keys (and argpartition's u32 ids over them) and the kept ids (a full
+        // layer), the query's contiguous nope rows, the absorbed query and the latent output; the spans' outputs before
+        // their join.
         const sp = spansOf(c, t, p);
-        const span = sp.rows * ((if (full) 8 * p + 4 * topk else 0) + heads * (nope + 2 * kv) * bf16);
+        const score: u64 = if (select == .kernel) 4 * p else 8 * p;
+        const span = sp.rows * ((if (full) score + 4 * topk else 0) + heads * (nope + 2 * kv) * bf16);
         w.spans = @min(sp.n, attention_spans_in_flight) * span + if (sp.n > 1) t * heads * v * bf16 else 0;
     } else {
         // The reference's form: the latent expanded per head over every key, and the query blocks' score arrays.
@@ -418,28 +451,29 @@ pub fn promptWaveOf(c: *const glm.Config, rows: u64, positions: u64, full: bool,
 
 /// The prompt pass's widest wave at `tokens` prompt rows (every call up to `glm.maxPromptCallRows`, over every key up
 /// to the context): every layer kind of the model's (`full` x `sparse`) at its largest.
-pub fn promptWaveBytes(c: *const glm.Config, g: glm.Geometry, tokens: u64, dsa: bool) u64 {
+pub fn promptWaveBytes(c: *const glm.Config, g: glm.Geometry, tokens: u64, dsa: bool, select: Select, gemm: PromptGemm) u64 {
     const t = glm.maxPromptCallRows(tokens);
-    const row = prefillRowBytes(c, g);
+    const row = prefillRowBytes(c, g, gemm);
     var worst: u64 = 0;
     for (0..c.n_layers) |li| {
         const l: u32 = @intCast(li);
-        worst = @max(worst, promptWaveOf(c, t, tokens, c.isFull(l), c.isSparse(l), dsa, row).total());
+        worst = @max(worst, promptWaveOf(c, t, tokens, c.isFull(l), c.isSparse(l), dsa, select, row).total());
     }
     return worst;
 }
 
-/// The prompt pass's largest single buffer (MLX's cache can end one over its limit): a routed slice's prepared input or
-/// down output (f16, every mini of `glm.group_slice_rows` rows), the query projection, the attention's output and its
-/// copy, the router's f32 input, a dense layer's intermediate, a span's indexer score, the embedding's codes.
-pub fn promptOvershoot(c: *const glm.Config, g: glm.Geometry, tokens: u64) u64 {
+/// The prompt pass's largest single buffer (MLX's cache can end one over its limit): a routed slice's widest array
+/// (`glm.group_slice_rows` rows: sushi's prepared input or down output, f16 over every mini; GLM-5.3's kernels' join or
+/// the affine bank's gathered input, `hidden` wide), the query projection, the attention's output and its copy, the
+/// router's f32 input, a dense layer's intermediate, a span's indexer score, the embedding's codes.
+pub fn promptOvershoot(c: *const glm.Config, g: glm.Geometry, tokens: u64, gemm: PromptGemm) u64 {
     const t = glm.maxPromptCallRows(tokens);
     const h: u64 = c.hidden_size;
     const heads: u64 = c.n_heads;
     const slice = @min(glm.group_slice_rows, t * c.n_experts_per_tok);
     const sp = spansOf(c, t, tokens);
     const page = std.heap.pageSize();
-    var b: u64 = @as(u64, g.minis_per_id) * slice * h * bf16;
+    var b: u64 = @as(u64, if (gemm == .sushi) @max(g.minis_per_id, 1) else 1) * slice * h * bf16;
     b = @max(b, t * heads * (c.qk_nope_head_dim + c.qk_rope_head_dim) * bf16);
     b = @max(b, t * heads * c.v_head_dim * bf16);
     b = @max(b, t * h * f32b);
@@ -539,7 +573,7 @@ pub fn billOf(in: Inputs) Bill {
     const s = in.stream;
     const pool = poolStagingBytes(g, s);
     const mtp_res: u64 = if (in.mtp) |m| m.resident_bytes + m.expert_bytes else 0;
-    const prompt_waves = @max(promptWaveBytes(c, g, in.prompt_tokens, in.dsa), if (in.mtp != null) mtpPromptWaveBytes(c, in.prompt_tokens) else 0);
+    const prompt_waves = @max(promptWaveBytes(c, g, in.prompt_tokens, in.dsa, in.select, in.gemm), if (in.mtp != null) mtpPromptWaveBytes(c, in.prompt_tokens) else 0);
     const verify_rows: u64 = s.decode_window_rows / glm.routed_top_k;
     const decode_waves = @max(decodeWaveBytes(c, verify_rows, in.decode_positions), if (in.mtp) |m| mtpDecodeWaveBytes(c, m.depth, in.decode_positions) else 0);
     const pending: u64 = if (in.mtp != null) mtpPendingBytes(c, in.prompt_tokens) else 0;
@@ -557,7 +591,7 @@ pub fn billOf(in: Inputs) Bill {
             .mtp_pending = pending,
             .waves = prompt_waves,
             .mlx_cache = in.prompt_cache,
-            .mlx_cache_overshoot = promptOvershoot(c, g, in.prompt_tokens),
+            .mlx_cache_overshoot = promptOvershoot(c, g, in.prompt_tokens, in.gemm),
             .pool_staging = pool,
             .host_side = host_side_prompt_bytes,
         },
@@ -643,13 +677,14 @@ pub fn sdkBillOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, 
     return memoryBill(a, billOf(try inputsOf(a, io, cfg, prompt_tokens, .exl3, diag)), null);
 }
 
-/// The bill's inputs of `cfg`'s pack (the construction's: decode at `maxPositions`). Pure host.
+/// The bill's inputs of `cfg`'s pack (the construction's: decode at `maxPositions`), the EXL3 bank's prompt GEMMs the
+/// served EXL3 module's (`glm_moe_dsa_module.Exl3Module`: GLM-5.3's kernels). Pure host.
 pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, prompt_tokens: u64, kind: mtp_mod.BankKind, diag: ?*glm.Diag) !Inputs {
     const dir = cfg.model_dir orelse return error.GlmPackDir;
     const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
     const geo = if (exl3_bank.present(dir)) try exl3_bank.Bank.geometry(a, io, dir, model, diag) else try bank_mod.Bank.geometry(a, io, dir, model, diag);
     const residents = try glm.residentBufferBytes(a, io, dir, model, std.heap.pageSize(), diag);
-    return .{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .decode_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag), .dsa = glm.dsaKernelsFit(model), .prompt_cache = prefillCacheBytes(sdk.memory.totalMemBytes()) };
+    return .{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .decode_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag), .dsa = glm.dsaKernelsFit(model), .gemm = if (exl3_bank.present(dir)) promptGemmOf(glm53_quant) else .affine, .select = selectOf(model), .prompt_cache = prefillCacheBytes(sdk.memory.totalMemBytes()) };
 }
 
 /// The draft lane's bill inputs when `cfg` turns it on (its settings and the pack's MTP directory checked), else null.
@@ -820,8 +855,9 @@ pub const box_exl3 = struct {
     pub const gpu_target: u64 = 255_550_554_112;
 };
 
+/// The box's served EXL3 module: GLM-5.3's prompt kernels, the spans' top-k kernel.
 fn boxInputs(c: *const glm.Config, cfg: *const settings.Config) Inputs {
-    return .{ .model = c, .bank = box_exl3.geometry, .resident_bytes = box_exl3.resident_bytes, .stream = streamShape(cfg), .prompt_tokens = servedContext(cfg), .decode_positions = maxPositions(cfg), .mtp = if (cfg.mtpDepth() > 0) box_exl3.mtp else null, .dsa = true, .prompt_cache = prefillCacheBytes(box_exl3.ram) };
+    return .{ .model = c, .bank = box_exl3.geometry, .resident_bytes = box_exl3.resident_bytes, .stream = streamShape(cfg), .prompt_tokens = servedContext(cfg), .decode_positions = maxPositions(cfg), .mtp = if (cfg.mtpDepth() > 0) box_exl3.mtp else null, .dsa = true, .gemm = .glm53, .select = selectOf(c), .prompt_cache = prefillCacheBytes(box_exl3.ram) };
 }
 
 test "glm bill: a fill unit is every stream layer's rows per expert slot at its share; the slot table holds the rows' exact bytes" {
@@ -873,9 +909,12 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
     try testing.expectEqual(@as(u64, 4_752_870_912), p.mtp_residents);
     // The read pool: four 3,194,880 B staging buffers, four speculative slots of a K4 expert's span, 4,096 tickets.
     try testing.expectEqual(@as(u64, 4 * 3_194_880 + 4 * 19_070_976 + 4096 * 73), p.pool_staging);
-    // The prompt cache at its limit; one freed buffer past it at most: a routed slice's 16,384 rows x 4 minis in f16.
+    // The prompt cache at its limit; one freed buffer past it at most: the attention's output over the 16,448 rows
+    // (GLM-5.3's kernels' widest routed array, a slice's join, is 16,384 rows x hidden; sushi's every mini of it).
     try testing.expectEqual(@as(u64, 16 << 30), p.mlx_cache);
-    try testing.expectEqual(@as(u64, 4 * 16384 * 6144 * 2), p.mlx_cache_overshoot);
+    try testing.expectEqual(@as(u64, 16448 * 64 * 256 * 2), p.mlx_cache_overshoot);
+    try testing.expectEqual(@as(u64, 4 * 16384 * 6144 * 2), promptOvershoot(&c, box_exl3.geometry, 16448, .sushi));
+    try testing.expectEqual(selectOf(&c), Select.kernel);
     // The lane's pending hidden: the prompt's 16,448 rows.
     try testing.expectEqual(@as(u64, 16448 * 6144 * 2), p.mtp_pending);
     // The construction: no trunk residents, no KV, no wave, no cache.
@@ -885,11 +924,17 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
     try testing.expectEqual(decode_cache_bytes, d.mlx_cache);
     try testing.expectEqual(@as(u64, maxPositions(&cfg) * 128 * 4), d.mlx_cache_overshoot);
     // The prompt wave's stages on a sparse full layer at 16,448 rows.
-    const w = promptWaveOf(&c, 16448, 16448, true, true, true, prefillRowBytes(&c, box_exl3.geometry));
+    const w = promptWaveOf(&c, 16448, 16448, true, true, true, .kernel, prefillRowBytes(&c, box_exl3.geometry, .glm53));
     std.debug.print("\nGLM53_PROMPT_WAVE {{\"cross\": {d}, \"attn\": {d}, \"spans\": {d}, \"router\": {d}, \"routed\": {d}, \"gemm\": {d}, \"tail\": {d}, \"total\": {d}, \"billed\": {d}, \"decode\": {d}}}\n", .{ w.cross, w.attn, w.spans, w.router, w.routed, w.gemm, w.tail, w.total(), p.waves, d.waves });
     try testing.expectEqual(@as(u64, 16448 * 171_328), w.attn);
     try testing.expectEqual(@as(u64, 16448 * 8 * 6144 * 2), w.routed);
     try testing.expect(p.waves >= w.total());
+    // A routed row's GEMM transients: GLM-5.3's kernels' 45,068 B, sushi's 172,160 B; a span's selection without
+    // argpartition's ids over every key.
+    try testing.expectEqual(@as(u64, 45_068), prefillRowBytes(&c, box_exl3.geometry, .glm53));
+    try testing.expectEqual(@as(u64, 172_160), prefillRowBytes(&c, box_exl3.geometry, .sushi));
+    const wa = promptWaveOf(&c, 16448, 16448, true, true, true, .argpartition, prefillRowBytes(&c, box_exl3.geometry, .glm53));
+    try testing.expectEqual(@as(u64, 3 * spansOf(&c, 16448, 16448).rows * 4 * 16448), wa.spans - w.spans);
 }
 
 test "glm bill: the SDK's view fills the exact units, admits them, and refuses one more in either phase" {
@@ -1006,11 +1051,11 @@ test "glm bill: on the DSA kernels the prompt wave stops growing past one call; 
     const g = box_exl3.geometry;
     var prev: u64 = 0;
     for ([_]u64{ 1024, 4096, 16384 }) |n| {
-        const w = promptWaveBytes(&c, g, n, true);
+        const w = promptWaveBytes(&c, g, n, true, .kernel, .glm53);
         try testing.expect(w > prev);
         prev = w;
     }
-    try testing.expect(promptWaveBytes(&c, g, 1048576, false) > promptWaveBytes(&c, g, 32768, false) + 30_000_000_000);
+    try testing.expect(promptWaveBytes(&c, g, 1048576, false, .kernel, .glm53) > promptWaveBytes(&c, g, 32768, false, .kernel, .glm53) + 30_000_000_000);
     try testing.expect(decodeWaveBytes(&c, 4, 131072) > decodeWaveBytes(&c, 4, 16384));
 }
 
