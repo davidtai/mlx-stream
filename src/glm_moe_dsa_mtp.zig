@@ -24,6 +24,7 @@ const log = sdk.log;
 const glm = @import("glm_moe_dsa.zig");
 const graph = @import("glm_moe_dsa_graph.zig");
 const settings = @import("glm_moe_dsa_settings.zig");
+const build_flags = @import("build_flags.zig");
 const ds = @import("deepseek_v41_dspark.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
 
@@ -498,53 +499,71 @@ pub const Decision = struct { accepted: u32, next: u32 };
 /// correction and the bonus are the argmax. Sampled: exact is DeepSeek-V4.1's lane rule (`ds.Sampling`: point-mass
 /// drafts accepted with probability p(draft) of the tempered, filtered row, the residual's draw at the first
 /// rejection); typical tests the same p against its own entropy and draws the correction and the bonus from p.
-pub fn decide(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode, sampling: sdk.SamplingParams, base: u64) !Decision {
+/// The drafts are the device array `drafts` (u32 `[n]`, null for none) the draft lane left; the decision reads back,
+/// in one read, every row's token, the drafts' acceptance flags (typical, or a sampled request's) and the drafts
+/// themselves, into `out_drafts` (`n` of them).
+pub fn decide(g: *G, logits: T, drafts: ?T, out_drafts: []u32, mode: sdk.acceptance.Mode, sampling: sdk.SamplingParams, base: u64) !Decision {
     const w: usize = @intCast(g.shapeOf(logits).dim(0));
-    std.debug.assert(w == drafts.len + 1 and w <= max_depth + 1);
-    const nd: c_int = @intCast(drafts.len);
+    const n = out_drafts.len;
+    std.debug.assert(w == n + 1 and w <= max_depth + 1 and (n == 0) == (drafts == null));
+    const nd: c_int = @intCast(n);
     const vocab = g.shapeOf(logits).dim(1);
-    var tok: [max_depth + 1]u32 = undefined;
-    var flags: [max_depth]bool = undefined;
-    var idb: [max_depth]i32 = undefined;
-    for (idb[0..drafts.len], drafts) |*d, v| d.* = @intCast(v);
     const typ: ?@FieldType(sdk.acceptance.Mode, "typical") = switch (mode) {
         .typical => |t| t,
         .exact => null,
         else => return error.MtpAcceptanceNotImplemented,
     };
-    var have_flags = false;
+    // Each draft as an index (int32 `[n, 1]`).
+    const idx: ?T = if (drafts) |d| try g.reshape(try g.astype(d, .int32), &.{ nd, 1 }) else null;
+    var tok_dev: T = undefined;
+    var flags_dev: ?T = null;
     if (sampling.greedy()) {
-        _ = try g.hostU32(try g.argmax(logits, -1), tok[0..w]);
-        if (typ) |t| if (drafts.len > 0) {
+        tok_dev = try g.argmax(logits, -1);
+        if (typ) |t| if (n > 0) {
             const lg = try g.astype(try g.slice(logits, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 }), .float32);
             const lp = try g.sub(lg, try g.logsumexp(lg, -1, true));
-            _ = try g.hostBool(try typicalFlags(g, lp, try g.exp(lp), idb[0..drafts.len], t), flags[0..drafts.len]);
-            have_flags = true;
+            flags_dev = try typicalFlags(g, lp, try g.exp(lp), idx.?, t);
         };
     } else {
         const sm: ds.Sampling = .{ .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k, .min_p = sampling.min_p, .seed = sampling.seed };
         const Loop = dsl.Loop(G);
         if (typ) |t| {
-            const sr = try Loop.sampledRows(g, logits, sm, base, &.{});
-            _ = try g.hostU32(sr.tok, tok[0..w]);
-            if (drafts.len > 0) {
+            const sr = try Loop.sampledRowsAt(g, logits, sm, base, null, 0);
+            tok_dev = sr.tok;
+            if (n > 0) {
                 const p = try g.slice(sr.p, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 });
-                const lp = try g.log(p);
-                _ = try g.hostBool(try typicalFlags(g, lp, p, idb[0..drafts.len], t), flags[0..drafts.len]);
-                have_flags = true;
+                flags_dev = try typicalFlags(g, try g.log(p), p, idx.?, t);
             }
         } else {
-            const sr = try Loop.sampledRows(g, logits, sm, base, drafts);
-            _ = try g.hostU32(sr.tok, tok[0..w]);
-            if (sr.accept) |acc| {
-                _ = try g.hostBool(acc, flags[0..drafts.len]);
-                have_flags = true;
-            }
+            // Each row's draft, -1 past the drafted rows.
+            const xs: ?T = if (idx) |x| try g.concat(&.{ x, try g.full(&.{ 1, 1 }, try g.scalar(-1, .int32), .int32) }, 0) else null;
+            const sr = try Loop.sampledRowsAt(g, logits, sm, base, xs, n);
+            tok_dev = sr.tok;
+            flags_dev = sr.accept;
         }
     }
+    // One read: the tokens, the flags (as u32), the drafts.
+    var parts: [3]T = undefined;
+    var np: usize = 0;
+    parts[np] = try g.astype(tok_dev, .uint32);
+    np += 1;
+    if (flags_dev) |f| {
+        parts[np] = try g.astype(f, .uint32);
+        np += 1;
+    }
+    if (drafts) |d| {
+        parts[np] = d;
+        np += 1;
+    }
+    var buf: [3 * max_depth + 1]u32 = undefined;
+    const nr = w + (if (flags_dev != null) n else 0) + n;
+    _ = try g.hostU32(if (np == 1) parts[0] else try g.concat(parts[0..np], 0), buf[0..nr]);
+    const tok = buf[0..w];
+    const flags: ?[]const u32 = if (flags_dev != null) buf[w..][0..n] else null;
+    @memcpy(out_drafts, buf[nr - n .. nr]);
     var a: u32 = 0;
-    while (a < drafts.len) : (a += 1) {
-        const ok = if (have_flags) flags[a] else drafts[a] == tok[a];
+    while (a < n) : (a += 1) {
+        const ok = if (flags) |f| f[a] != 0 else out_drafts[a] == tok[a];
         if (!ok) break;
     }
     return .{ .accepted = a, .next = tok[a] };
@@ -552,12 +571,11 @@ pub fn decide(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode, 
 
 /// p(draft) > min(eps, delta * exp(-H(p))) per drafted row (`lp` = log p, f32 `[d, vocab]`; zero-mass entries add
 /// nothing to the entropy).
-fn typicalFlags(g: *G, lp: T, p: T, ids: []const i32, t: @FieldType(sdk.acceptance.Mode, "typical")) !T {
+fn typicalFlags(g: *G, lp: T, p: T, idx: T, t: @FieldType(sdk.acceptance.Mode, "typical")) !T {
     const zero = try g.scalar(0, .float32);
     const plogp = try g.where(try g.greater(p, zero), try g.mul(p, lp), zero);
     const entropy = try g.neg(try g.sum(plogp, -1, false));
     const floor = try g.minimum(try g.scalar(t.eps, .float32), try g.mul(try g.scalar(t.delta, .float32), try g.exp(try g.neg(entropy))));
-    const idx = try g.hostArray(std.mem.sliceAsBytes(ids), &.{ @intCast(ids.len), 1 }, .int32);
     return g.greater(try g.reshape(try g.takeAlongAxis(p, idx, -1), &.{-1}), floor);
 }
 
@@ -701,7 +719,9 @@ pub fn Lane(comptime kind: BankKind) type {
         /// The final-normed hidden `[rows, hidden]` of the target positions after the tracked ones, pending. Past
         /// `max_pending` serial positions (a request the lane does not draft) the lane stops tracking: the rows are
         /// dropped and `tracked` stays behind the target.
-        pub fn pend(self: *Self, g: *G, target_len: u64, hidden: T, rows: u32, serial: bool) !void {
+        /// `defer_eval`: the rows stay a lazy graph the next draft reads on the GPU (the decode round's); else evaluated
+        /// here (a prompt's, whose rows can be many).
+        pub fn pend(self: *Self, g: *G, target_len: u64, hidden: T, rows: u32, serial: bool, defer_eval: bool) !void {
             if (self.tracked() + rows != target_len) return;
             if (serial and self.n_pending + rows > max_pending) {
                 if (!self.untracked_logged) log.info("glm_moe_dsa: MTP lane: {d} serial steps past its last round, the lane stops tracking this request\n", .{self.n_pending});
@@ -712,7 +732,7 @@ pub fn Lane(comptime kind: BankKind) type {
             defer g.resetTo(m);
             const all = if (self.pending) |p| try g.concat(&.{ p, hidden }, 0) else hidden;
             const kept = g.keep(all);
-            try g.evalAll(&.{kept});
+            if (!defer_eval) try g.evalAll(&.{kept});
             if (self.pending) |p| g.release(p);
             self.pending = kept;
             self.n_pending += rows;
@@ -720,8 +740,13 @@ pub fn Lane(comptime kind: BankKind) type {
 
         /// The pairs input `eh_proj(cat[enorm(embed(tokens)), hnorm(hidden)])` `[n, hidden]`.
         fn input(self: *const Self, g: *G, tw: *const graph.Weights, tokens: []const u32, hidden: T) !T {
+            return self.inputAt(g, tw, try g.hostArray(std.mem.sliceAsBytes(tokens), &.{@intCast(tokens.len)}, .uint32), hidden);
+        }
+
+        /// `input` of the tokens in a device array `idx` (u32 `[n]`).
+        fn inputAt(self: *const Self, g: *G, tw: *const graph.Weights, idx: T, hidden: T) !T {
             const c = &self.cfg1;
-            const e = try graph.rmsNorm(g, try graph.embed(g, tw, tokens), self.head.enorm, c.rms_norm_eps);
+            const e = try graph.rmsNorm(g, try graph.embedAt(g, tw, idx), self.head.enorm, c.rms_norm_eps);
             const hn = try graph.rmsNorm(g, try g.astype(hidden, g.dtypeOf(e)), self.head.hnorm, c.rms_norm_eps);
             return graph.linear(g, try g.concat(&.{ e, hn }, 1), self.head.eh_proj);
         }
@@ -742,15 +767,17 @@ pub fn Lane(comptime kind: BankKind) type {
                 const k = try graph.keysOf(g, &self.cfg1, lw, a_in, self.cache.len, end - at);
                 try self.cache.append(g, 0, k.latent, k.k_pe, k.index);
                 self.cache.commit(end - at);
-                var bufs: [3]T = undefined;
-                try g.evalAll(self.cache.buffers(0, &bufs));
+                // A chunk before another is evaluated (a prompt's pairs, many); the last stays for the draft to read.
+                if (end < n) {
+                    var bufs: [3]T = undefined;
+                    try g.evalAll(self.cache.buffers(0, &bufs));
+                }
                 at = end;
             }
             const m = g.mark();
             defer g.resetTo(m);
             const old = self.pending.?;
             self.pending = if (n == self.n_pending) null else g.keep(try graph.rowSlice(g, old, @intCast(n), @intCast(self.n_pending)));
-            if (self.pending) |p| try g.evalAll(&.{p});
             g.release(old);
             self.n_pending -= n;
         }
@@ -785,10 +812,13 @@ pub fn Lane(comptime kind: BankKind) type {
         }
 
         /// A round's drafts after `t1` (the token after the target's last position): the pending pairs appended (their
-        /// tokens `after` then `t1`), the first step on the last of them, then `depth - 1` steps on the drafts. `force`
-        /// (a test's) replaces the first drafts. `logits_out` (a test's, `depth` x vocab) gets each step's logits.
-        pub fn draft(self: *Self, g: *G, a: std.mem.Allocator, tw: *const graph.Weights, after: []const u32, t1: u32, depth: u32, out: []u32, force: []const u32, logits_out: ?[]f32) !void {
-            std.debug.assert(after.len + 1 == self.n_pending and out.len >= depth and depth >= 1);
+        /// tokens `after` then `t1`), the first step on the last of them, then `depth - 1` steps on the drafts, each
+        /// step's token the argmax on the device, embedded there for the next: the drafts u32 `[depth]` as a kept device
+        /// array (the caller releases it; the decision reads them back). Nothing here waits for the GPU but a probe's
+        /// reads: `force` (a test's) replaces the first drafts, `logits_out` (a test's, `depth` x vocab) gets each
+        /// step's logits, and in PROFILE builds and the tests the head's top probability per step (`top_p`).
+        pub fn draft(self: *Self, g: *G, a: std.mem.Allocator, tw: *const graph.Weights, after: []const u32, t1: u32, depth: u32, force: []const u32, logits_out: ?[]f32) !T {
+            std.debug.assert(after.len + 1 == self.n_pending and depth >= 1 and depth <= max_depth);
             const tokens = try a.alloc(u32, self.n_pending);
             defer a.free(tokens);
             @memcpy(tokens[0..after.len], after);
@@ -811,30 +841,25 @@ pub fn Lane(comptime kind: BankKind) type {
             const topk = try self.ownSelection(g, a, x, pos);
             defer if (topk) |t| g.release(t);
             const vocab: usize = c.vocab_size;
+            var steps: [max_depth]T = undefined;
             for (0..depth) |step| {
                 const s: u32 = @intCast(step);
                 const h = try self.row(g, x, pos + s, topk);
-                const normed = g.keep(try graph.rmsNorm(g, h, self.head.head_norm, c.rms_norm_eps));
-                defer g.release(normed);
+                const normed = try graph.rmsNorm(g, h, self.head.head_norm, c.rms_norm_eps);
                 const lg = try graph.qlinear(g, normed, tw.lm_head);
                 if (logits_out) |lo| _ = try g.hostF32(try g.astype(lg, .float32), lo[step * vocab ..][0..vocab]);
-                // The argmax and the head's top probability `exp(max - logsumexp)`, read together.
                 const lf = try g.reshape(try g.astype(lg, .float32), &.{-1});
-                const am = try g.argmax(lf, 0);
-                const top = try g.exp(try g.sub(try g.max(lf, 0, false), try g.logsumexp(lf, 0, false)));
-                try g.evalAll(&.{ am, top });
-                var tok: [1]u32 = undefined;
-                var tp: [1]f32 = undefined;
-                _ = try g.hostU32(am, &tok);
-                _ = try g.hostF32(top, &tp);
-                self.top_p[step] = tp[0];
-                out[step] = if (step < force.len) force[step] else tok[0];
-                if (step + 1 < depth) {
-                    x = try self.input(g, tw, out[step..][0..1], normed);
+                // The step's token on the device: the argmax, or a test's forced draft.
+                steps[step] = if (step < force.len) try g.hostArray(std.mem.sliceAsBytes(force[step..][0..1]), &.{1}, .uint32) else try g.reshape(try g.argmax(lf, 0), &.{1});
+                if (comptime build_flags.glm_decode_probes) {
+                    // The head's top probability `exp(max - logsumexp)` (the acceptance-by-probability line's).
+                    var tp: [1]f32 = undefined;
+                    _ = try g.hostF32(try g.reshape(try g.exp(try g.sub(try g.max(lf, 0, false), try g.logsumexp(lf, 0, false))), &.{1}), &tp);
+                    self.top_p[step] = tp[0];
                 }
+                if (step + 1 < depth) x = try self.inputAt(g, tw, steps[step], normed);
             }
-            var bufs: [3]T = undefined;
-            try g.evalAll(self.cache.buffers(0, &bufs));
+            return g.keep(if (depth == 1) steps[0] else try g.concat(steps[0..depth], 0));
         }
 
         /// The lane's part of a prefix restore: `n` target positions match the new prompt. Returns the positions the

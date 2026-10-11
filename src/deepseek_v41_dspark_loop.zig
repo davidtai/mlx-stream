@@ -427,6 +427,16 @@ pub fn Loop(comptime G: type) type {
         /// reaches v x the row's total, v = `ds.drawV(seed, pos)`, pos = `base` + row + 1 (the drawn token's absolute
         /// position). Two host arrays of W floats. `tok` is uint32 [W], as the argmax rows.
         pub fn sampledRows(g: *G, row2: T, sm: ds.Sampling, base: u64, drafts: []const u32) !SampledRows {
+            const w: usize = @intCast(g.shapeOf(row2).dim(0));
+            var xb: [ds.max_block + 1]i32 = undefined;
+            for (xb[0..w], 0..) |*x, i| x.* = if (i < drafts.len) @intCast(drafts[i]) else -1;
+            const xs: ?T = if (drafts.len > 0) try g.hostArray(std.mem.sliceAsBytes(xb[0..w]), &.{ @intCast(w), 1 }, .int32) else null;
+            return sampledRowsAt(g, row2, sm, base, xs, drafts.len);
+        }
+
+        /// `sampledRows` with each row's draft as a device array: `xs` int32 `[rows, 1]` (-1 on every row past the
+        /// `n_drafts` drafted ones), null for none.
+        pub fn sampledRowsAt(g: *G, row2: T, sm: ds.Sampling, base: u64, xs_drafts: ?T, n_drafts: usize) !SampledRows {
             const sh = g.shapeOf(row2);
             const w = sh.dim(0);
             const vocab = sh.dim(1);
@@ -461,26 +471,22 @@ pub fn Loop(comptime G: type) type {
             }
             const lf = if (keep) |k| try g.where(k, lt, ninf) else lt;
             const p = try g.softmax(lf, -1);
-            // The draws' uniforms and each row's draft (-1: none, every row past the drafted ones).
+            // The draws' uniforms (each row's draft: `xs_drafts`).
             const nw: usize = @intCast(w);
             var vb: [ds.max_block + 1]f32 = undefined;
-            var xb: [ds.max_block + 1]i32 = undefined;
-            for (vb[0..nw], xb[0..nw], 0..) |*v, *x, i| {
-                v.* = ds.drawV(sm.seed, base + i + 1);
-                x.* = if (i < drafts.len) @intCast(drafts[i]) else -1;
-            }
+            for (vb[0..nw], 0..) |*v, i| v.* = ds.drawV(sm.seed, base + i + 1);
             const vv = try g.hostArray(std.mem.sliceAsBytes(vb[0..nw]), &.{ w, 1 }, .float32);
             var src = p;
             var accept: ?T = null;
-            if (drafts.len > 0) {
-                const xs = try g.hostArray(std.mem.sliceAsBytes(xb[0..nw]), &.{ w, 1 }, .int32);
+            if (n_drafts > 0) {
+                const xs = xs_drafts.?;
                 const rank = try g.reshape(try g.arange(0, @floatFromInt(vocab), 1, .int32), &.{ 1, vocab });
                 // The residual (p - q)+ for a point-mass q at x: p with x zeroed (rows without a draft: p).
                 src = try g.where(try g.equal(rank, xs), zero, p);
                 var ub: [ds.max_block + 1]f32 = undefined;
-                for (ub[0..drafts.len], 0..) |*u, i| u.* = ds.drawU(sm.seed, base + i + 1);
-                const uu = try g.hostArray(std.mem.sliceAsBytes(ub[0..drafts.len]), &.{@intCast(drafts.len)}, .float32);
-                const nd: c_int = @intCast(drafts.len);
+                for (ub[0..n_drafts], 0..) |*u, i| u.* = ds.drawU(sm.seed, base + i + 1);
+                const uu = try g.hostArray(std.mem.sliceAsBytes(ub[0..n_drafts]), &.{@intCast(n_drafts)}, .float32);
+                const nd: c_int = @intCast(n_drafts);
                 const px = try g.takeAlongAxis(try g.slice(p, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 }), try g.slice(xs, &.{ 0, 0 }, &.{ nd, 1 }, &.{ 1, 1 }), -1);
                 accept = try g.less(uu, try g.reshape(px, &.{-1}));
             }

@@ -566,7 +566,11 @@ pub fn routerScores(g: *G, r: Router, x: T) !T {
 
 /// The quantized embedding of `ids` (`nn.QuantizedEmbedding`): the rows' codes, scales and biases dequantized.
 pub fn embed(g: *G, w: *const Weights, ids: []const u32) !T {
-    const idx = try g.hostArray(std.mem.sliceAsBytes(ids), &.{@intCast(ids.len)}, .uint32);
+    return embedAt(g, w, try g.hostArray(std.mem.sliceAsBytes(ids), &.{@intCast(ids.len)}, .uint32));
+}
+
+/// `embed` of the ids in a device array `idx` (u32 `[n]`).
+pub fn embedAt(g: *G, w: *const Weights, idx: T) !T {
     const e = w.embed;
     return g.dequantizeWith(try g.take(e.w, idx, 0), try g.take(e.s, idx, 0), try g.take(e.b, idx, 0), e.bits, glm.group_size, .affine);
 }
@@ -650,6 +654,9 @@ pub const Want = struct {
     verify: bool = false,
     /// Every row's final-normed hidden `[rows, hidden]` kept (the MTP layer's input).
     hidden: bool = false,
+    /// The rows' ids as a device array (u32 `[rows]`: the verify's, its drafts left on the device by the draft lane),
+    /// embedded in place of `ids`' values; `ids` still gives the rows.
+    ids_device: ?T = null,
 };
 
 /// A forward's kept results: the logits (`[1, vocab]`, or `[rows, vocab]` under `Want.verify`) and the final-normed
@@ -673,7 +680,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
     defer seed.deinit(a);
     const m0 = g.mark();
     defer g.resetTo(m0);
-    var h = g.keep(try embed(g, w, ids));
+    var h = g.keep(if (want.ids_device) |d| try embedAt(g, w, d) else try embed(g, w, ids));
     defer g.release(h);
     const wide = rows * c.n_experts_per_tok > rt.max_route_ids;
     for (w.layers, 0..) |*lw, li| {
