@@ -1001,6 +1001,73 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
     }
 }
 
+test "glm attention: the reference indexer's top-k is the top-k kernel's (int32 ids) and argpartition's ids in its order, over a verify's rows and a prompt's blocks, at GLM-5.3's top-k" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const text = try kernelDimsConfigJson(a, glm53_dims);
+    defer a.free(text);
+    var c = try glm.Config.parse(a, text, null, null);
+    defer c.deinit(a);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(57);
+    const tw: TestWeights = .{ .rand = prng.random() };
+    const hid: c_int = @intCast(c.hidden_size);
+    const ih: c_int = @intCast(c.index_n_heads);
+    const layers = try tw.attentionLayers(&g, &c);
+    const lw = &layers[0];
+    const ix = lw.indexer.?;
+    const topk = c.index_topk;
+    // A verify of 4 rows past three top-ks of keys (one block per row), and a prompt of 96 rows past the top-k.
+    const calls = [_]struct { start: u32, rows: u32, verify: bool }{ .{ .start = 3 * topk + 100, .rows = 4, .verify = true }, .{ .start = topk + 40, .rows = 96, .verify = false } };
+    var checked: usize = 0;
+    for (calls) |cl| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        var cache = try Cache.init(a, &c, cl.start + cl.rows);
+        defer cache.deinit(&g);
+        try cache.append(&g, 0, try tw.dense(&g, &.{ 1, @intCast(cl.start), @intCast(c.kv_lora_rank) }, 1), try tw.dense(&g, &.{ 1, @intCast(cl.start), @intCast(c.qk_rope_head_dim) }, 1), try tw.dense(&g, &.{ 1, @intCast(cl.start), @intCast(c.index_head_dim) }, 1));
+        cache.commit(cl.start);
+        const x = try tw.dense(&g, &.{ @intCast(cl.rows), hid }, 1);
+        const q = try queryOf(&g, &c, lw, x, cl.start, cl.rows);
+        const k = try keysOf(&g, &c, lw, x, cl.start, cl.rows);
+        try cache.append(&g, 0, k.latent, k.k_pe, k.index);
+        const ik_all = try cache.indexView(&g, 0);
+        var carry = if (cl.verify) try Carry.perRow(a, cl.rows) else try Carry.init(a, &c, cl.rows, cl.start + cl.rows, false);
+        defer carry.deinit(&g);
+        try select(&g, &c, ix, x, q.iq.?, ik_all, cl.start, cl.rows, &carry);
+        // The same scores through argpartition, each block masked causally (a call of several rows).
+        const scale = std.math.pow(f64, @floatFromInt(c.index_n_heads), -0.5) * std.math.pow(f64, @floatFromInt(c.index_head_dim), -0.5);
+        const wts = try g.mul(try g.astype(try linear(&g, x, ix.weights_proj), .float32), try g.scalar(scale, .float32));
+        const k32 = try g.astype(ik_all, .float32);
+        for (0..carry.nBlocks()) |i| {
+            const b0 = carry.bounds[i];
+            const b1 = carry.bounds[i + 1];
+            const nb = cl.start + b1;
+            const qb = try g.astype(try rowSlice(&g, q.iq.?, @intCast(b0), @intCast(b1)), .float32);
+            var sc = try g.maximum(try g.matmul(qb, try swapLast(&g, try rowSlice(&g, k32, 0, @intCast(nb)))), try g.scalar(0, .float32));
+            const wb = try g.slice(wts, &.{ @intCast(b0), 0 }, &.{ @intCast(b1), ih }, &.{ 1, 1 });
+            sc = try g.sum(try g.mul(sc, try g.reshape(try g.transposeAxes(wb, &.{ 1, 0 }), &.{ 1, ih, @intCast(b1 - b0), 1 })), 1, true);
+            sc = try g.where(try causalMask(&g, cl.start + b0, b1 - b0, nb), sc, try g.scalar(-std.math.inf(f64), .float32));
+            const kth: c_int = @intCast(nb - topk);
+            const want = try lastSlice(&g, try g.argpartition(sc, kth, -1), kth, @intCast(nb));
+            const got = carry.topk[i].?;
+            try testing.expect(g.dtypeOf(got) == .int32);
+            const n: usize = @intCast(g.shapeOf(want).numel());
+            try testing.expectEqual(n, @as(usize, @intCast(g.shapeOf(got).numel())));
+            const gv = try a.alloc(u32, 2 * n);
+            defer a.free(gv);
+            _ = try g.hostU32(try g.astype(got, .uint32), gv[0..n]);
+            _ = try g.hostU32(try g.astype(want, .uint32), gv[n..]);
+            try testing.expectEqualSlices(u32, gv[n..], gv[0..n]);
+            checked += n;
+        }
+    }
+    std.debug.print("glm attention: the reference indexer's top-k, {d} ids equal argpartition's in its order\n", .{checked});
+}
+
 test "glm attention: the verify's rows through embed_q and unembed_out at once equal the row-by-row absorbed attention bit for bit at GLM-5.3's head dims" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
