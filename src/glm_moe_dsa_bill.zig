@@ -963,6 +963,19 @@ test "glm bill: a fill unit is every stream layer's rows per expert slot at its 
     try testing.expectEqual(table[76], grown[76]);
 }
 
+test "glm bill: the prompt pass's cache limit is a sixteenth of the RAM, at most 16 GiB, and the bill's prompt cache term is that limit" {
+    var c = try glm53Config();
+    defer c.deinit(testing.allocator);
+    // The 256 GiB M5 Ultra and a 24 GiB laptop.
+    for ([_][2]u64{ .{ 256 << 30, 16 << 30 }, .{ 24 << 30, 1536 << 20 } }) |box| {
+        const limit = prefillCacheBytes(box[0]);
+        try testing.expectEqual(box[1], limit);
+        const b = billOf(.{ .model = &c, .bank = glm53Geometry(), .resident_bytes = 20_100_000_000, .prompt_tokens = 16384, .decode_positions = 16384 + 1024 + 4, .dsa = true, .gemm = .affine, .select = selectOf(&c), .prompt_cache = limit });
+        try testing.expectEqual(limit, b.phases[@intFromEnum(Phase.prompt)].mlx_cache);
+    }
+    try testing.expectEqual(prefill_cache_max_bytes, prefillCacheBytes(0));
+}
+
 test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on the box's EXL3 pack" {
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
