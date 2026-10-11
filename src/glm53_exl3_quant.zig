@@ -792,8 +792,8 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
     try g.evalAll(&.{ x, x16, rhsd, aff[0].w, aff[1].w, aff[2].w, w16[0], w16[1], w16[2] });
     const flop_gu = 2.0 * 2.0 * @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(h)) * inter;
     const flop = 1.5 * flop_gu;
-    const Arm = enum { affine_chain, affine_gate, f16_chain, f16_gate, ours_k3, ours_k4, once_k3, once_k4, once_dec_k3, once_dec_k4 };
-    var best: [10]u64 = @splat(std.math.maxInt(u64));
+    const Arm = enum { affine_chain, affine_gate, f16_chain, f16_gate, ours_k3, ours_k4, once_k3, once_k4, once_gu_k3, once_dn_k3, once_dec_k3, once_dec_k4 };
+    var best: [12]u64 = @splat(std.math.maxInt(u64));
     var once = try Once.init(a, ours.pf[0].b.reg);
     defer once.deinit();
     // ours: 32 resident experts of each bank layer, 512 rows each (rows spread over the tokens)
@@ -815,6 +815,11 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
     for (0..6) |rep| for (std.enums.values(Arm)) |arm| {
         const m = g.mark();
         defer g.resetTo(m);
+        once.which = switch (arm) {
+            .once_gu_k3 => .gu,
+            .once_dn_k3 => .dn,
+            else => .both,
+        };
         const t0 = nowNs();
         if (arm == .once_dec_k3 or arm == .once_dec_k4) {
             const side: usize = if (arm == .once_dec_k3) 0 else 1;
@@ -846,8 +851,8 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
                 const side: usize = if (arm == .ours_k3) 0 else 1;
                 break :blk2 try ours.prefill(g, @intCast(side), xq, .{ .slot = &oslot[side], .act_row = &oact }, banks[side]);
             },
-            .once_k3, .once_k4 => blk2: {
-                const side: usize = if (arm == .once_k3) 0 else 1;
+            .once_k3, .once_k4, .once_gu_k3, .once_dn_k3 => blk2: {
+                const side: usize = if (arm == .once_k4) 1 else 0;
                 break :blk2 (try oncePrefill(a, ours, &once, g, xq, .{ .slot = &oslot[side], .act_row = &oact }, banks[side], null)).?;
             },
             .once_dec_k3, .once_dec_k4 => unreachable,
@@ -870,7 +875,8 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
         std.debug.print("GLM53_UBENCH ceiling {t} (32 experts x 512 rows): {d:.2} ms per 16,384 rows, {d:.1} TFLOP/s, {d:.1} ms per layer (131,072 rows)\n", .{ arm, @as(f64, @floatFromInt(ns)) / 1e6, f / @as(f64, @floatFromInt(ns)) / 1e3, @as(f64, @floatFromInt(ns)) / 1e6 * 8.0 });
     }
     // the decode-once chain against the fused chain on the same rows, bit for bit
-    for (0..2) |side| {
+    for ([_]usize{ 0, 0, 0, 1 }, [_]@TypeOf(once.which){ .both, .gu, .dn, .both }) |side, which| {
+        once.which = which;
         const m = g.mark();
         defer g.resetTo(m);
         const pr: quant.PrefillRows = .{ .slot = &oslot[side], .act_row = &oact };
@@ -881,7 +887,7 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
         const bq = try g.hostBytes(yo);
         var diff: usize = 0;
         for (std.mem.bytesAsSlice(u16, bf), std.mem.bytesAsSlice(u16, bq)) |p, q| diff += @intFromBool(p != q);
-        std.debug.print("GLM53_UBENCH ceiling once K{d} against ours K{d}: {d} of {d} bf16 outputs differ\n", .{ b.layers[side].k, b.layers[side].k, diff, bf.len / 2 });
+        std.debug.print("GLM53_UBENCH ceiling once K{d} ({t}) against ours K{d}: {d} of {d} bf16 outputs differ\n", .{ b.layers[side].k, which, b.layers[side].k, diff, bf.len / 2 });
     }
 }
 
@@ -1110,6 +1116,8 @@ const Once = struct {
     k: [4]mlx.mlx_fast_metal_kernel,
     texts: [2][:0]u8,
     a: Allocator,
+    /// The GEMMs that read a scratch (the other through its fused text).
+    which: enum { both, gu, dn } = .both,
 
     fn edited(a: Allocator, base: []const u8, edits: []const OnceEdit) ![:0]u8 {
         var cur: []u8 = try a.dupe(u8, base);
@@ -1179,19 +1187,25 @@ const Once = struct {
         defer for ([_]mlx.mlx_array{ wg[0], wd[0] }) |w| {
             if (w.ctx != null) _ = mlx.mlx_array_free(w);
         };
-        try o.launch(0, s, &.{ tgu, bk.gate.trellis, bk.up.trellis, bk.gate.suh, bk.up.suh }, ugu, &.{@intCast(ugu * 64 * 128)}, .float16, 1, inst, &wg);
-        try o.launch(2, s, &.{ tdn, bk.down.trellis }, udn, &.{@intCast(udn * 128 * 32)}, .float16, 1, inst, &wd);
+        const dgu = o.which != .dn;
+        const ddn = o.which != .gu;
+        if (dgu) try o.launch(0, s, &.{ tgu, bk.gate.trellis, bk.up.trellis, bk.gate.suh, bk.up.suh }, ugu, &.{@intCast(ugu * 64 * 128)}, .float16, 1, inst, &wg);
+        if (ddn) try o.launch(2, s, &.{ tdn, bk.down.trellis }, udn, &.{@intCast(udn * 128 * 32)}, .float16, 1, inst, &wd);
         if (dec_only) |keep| {
-            try keep.append(o.a, try routes.Prompt.Stages.retain(wg[0]));
-            try keep.append(o.a, try routes.Prompt.Stages.retain(wd[0]));
+            if (dgu) try keep.append(o.a, try routes.Prompt.Stages.retain(wg[0]));
+            if (ddn) try keep.append(o.a, try routes.Prompt.Stages.retain(wd[0]));
             return null;
         }
         var st: routes.Prompt.Stages = .{};
         defer st.deinit();
         const zsh = [_]c_int{rc * 4 * @as(c_int, @intCast(mi))};
-        try o.launch(1, s, &.{ x, rt, tgu, wg[0] }, tgs_gu, &zsh, .float32, 2, inst, &st.z);
+        if (dgu) {
+            try o.launch(1, s, &.{ x, rt, tgu, wg[0] }, tgs_gu, &zsh, .float32, 2, inst, &st.z);
+        } else try pf.stage(.gate_up, &st, x, rt, rows, tgu, tgs_gu, tdn, tgs_dn, bk);
         try pf.stage(.mid, &st, x, rt, rows, tgu, tgs_gu, tdn, tgs_dn, bk);
-        try o.launch(3, s, &.{ st.hm[0], tdn, wd[0], bk.down.svh }, tgs_dn, &.{ rc, @intCast(h) }, .bfloat16, 1, inst, &st.y);
+        if (ddn) {
+            try o.launch(3, s, &.{ st.hm[0], tdn, wd[0], bk.down.svh }, tgs_dn, &.{ rc, @intCast(h) }, .bfloat16, 1, inst, &st.y);
+        } else try pf.stage(.down, &st, x, rt, rows, tgu, tgs_gu, tdn, tgs_dn, bk);
         return st.take();
     }
 };
