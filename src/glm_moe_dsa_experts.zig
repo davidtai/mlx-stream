@@ -992,7 +992,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 }
                 try self.math.finishPrefill(g);
                 pt.tag(.group, layer, side, gi);
+                const ta = pt.now();
                 try g.asyncEval(w.kept.items[k0..]);
+                pt.chargeRouted(.commit, ta);
                 g.resetTo(m);
                 pt.chargeRouted(.encode, tc);
                 if (prev) |pv| try self.drainGroup(g, w, sl, pv.gi, w.kept.items[pv.k0..k0], &next, &live, depth, ahead);
