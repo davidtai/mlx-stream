@@ -529,7 +529,7 @@ test "glm exl3 quant: a prompt slice over the host-built routing table equals su
 
 /// The host reference of one routed layer's call: each row's experts' minis decoded by sushi's own host path
 /// (`format.project`) from the records, SwiGLU between, the minis summed at the expert's score.
-fn hostMoe(img: []const u8, b: *const bank_mod.Bank, layer: u32, xs: []const f32, ids: []const u16, sc: []const f32, k: usize, out: []f32) void {
+pub fn hostMoe(img: []const u8, b: *const bank_mod.Bank, layer: u32, xs: []const f32, ids: []const u16, sc: []const f32, k: usize, out: []f32) void {
     const h: usize = @intCast(b.hidden);
     const mini: usize = @intCast(b.mini_inter);
     var t_in: [512]f32 = undefined;

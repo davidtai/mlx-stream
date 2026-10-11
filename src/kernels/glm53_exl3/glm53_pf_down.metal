@@ -1,0 +1,164 @@
+
+    // GLM-5.3 EXL3 prompt, stage 4: the down GEMM of a wave's experts at BM 128 x BN 128 (16 simdgroups, WM 4 x WN 4,
+    // each a 32 x 32 share), each of the expert's four minis in turn: its BK = 64 stages decoded into threadgroup memory
+    // (one 16-weight column per thread), the NAX MMA, then the epilogue: 32 rows at a time staged in threadgroup memory,
+    // each row's 128-column block rotated (t128, lane l holding columns 4 l .. 4 l + 3) and scaled by the mini's rout,
+    // summed over the minis in registers. y: [rows, HID] bf16 in the wave's row order (rows grouped by expert).
+    constexpr int BM = 128;
+    constexpr int BN = 128;
+    constexpr int BK = 64;
+    constexpr int WN = 4;
+    constexpr int SM = 32;
+    constexpr int SN = 32;
+    constexpr int SK = 32;
+    constexpr int TM = 2;
+    constexpr int TN = 2;
+    constexpr int TK = 2;
+    constexpr int NSG = 16;
+    constexpr int LDB = BK + 8;
+    constexpr int KT = BK / 16;
+    constexpr int NT = BN / 16;
+    constexpr int NWT = 8 * K;
+    constexpr int K16 = MINI / 16;
+    constexpr int N16 = HID / 16;
+    constexpr int NTILES = HID / BN;
+    constexpr int S = MINI / BK;
+    constexpr int LDA = 4 * MINI;
+    constexpr int LDS = BN + 4;
+    threadgroup uint4 smem[BN * LDB * 2 / 16];
+    threadgroup half* Bs = reinterpret_cast<threadgroup half*>(smem);
+    threadgroup float* St = reinterpret_cast<threadgroup float*>(smem);
+
+    const uint tid = thread_index_in_threadgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = tid & 31u;
+    const int g = int(threadgroup_position_in_grid.x);
+    int j = 0;
+    STEEL_PRAGMA_UNROLL
+    for (int q = 1; q < 16; ++q) {
+        j = tbl[48 + q] <= g ? q : j;
+    }
+    const int slot = tbl[j];
+    const int row0 = tbl[16 + j];
+    const int rows = tbl[32 + j];
+    const int local = g - tbl[48 + j];
+    const int tiles_m = (rows + BM - 1) / BM;
+    const int nt_all = local / tiles_m;
+    const int m0 = (local - nt_all * tiles_m) * BM;
+    const int n0 = nt_all * BN;
+    const int tm = SM * int(sg / WN);
+    const short tn = short(SN * int(sg % WN));
+    const int valid = min(BM, rows - m0);
+    const int sgp_sm = min(SM, max(0, valid - tm));
+    const uint h = sg & 1u;
+    const uint c7 = lane & 7u;
+    // 32 tiles x 16 columns = 512 jobs: tile t = (lane >> 3) + 4 (sg >> 1)
+    const int t = int(lane >> 3u) + 4 * int(sg >> 1u);
+    const int kt = t / NT;
+    const int nt = t - kt * NT;
+    const int dst_off = (nt * 16 + 8 * int(h) + int(c7)) * LDB + kt * 16;
+    const int src_off = (kt * N16 + nt) * NWT;
+    uint o[5];
+    if (h != 0u) {
+        g53_col<K, 1>::offsets(c7, o);
+    } else {
+        g53_col<K, 0>::offsets(c7, o);
+    }
+    const bool full = sgp_sm == SM;
+    float yacc[4][2][4];
+    STEEL_PRAGMA_UNROLL
+    for (int p = 0; p < 4; ++p) {
+        STEEL_PRAGMA_UNROLL
+        for (int q = 0; q < 2; ++q) {
+            STEEL_PRAGMA_UNROLL
+            for (int c = 0; c < 4; ++c) yacc[p][q][c] = 0.0f;
+        }
+    }
+    STEEL_PRAGMA_NO_UNROLL
+    for (int r = 0; r < 4; ++r) {
+        const size_t mrow = size_t(slot) * 4u + size_t(r);
+        const device uint* cd = reinterpret_cast<const device uint*>(cd0) + mrow * size_t(K16 * N16) * size_t(NWT) + size_t(n0 / 16) * size_t(NWT);
+        const device half* xa = hm + (size_t(row0) + size_t(m0 + tm)) * size_t(LDA) + size_t(r) * size_t(MINI);
+        NAXTile<float, TM, TN> Dtile;
+        Dtile.clear();
+        for (int s = 0; s < S; ++s) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const device uint* tile = cd + size_t(s) * size_t(KT * N16 * NWT) + src_off;
+            if (h != 0u) {
+                g53_col<K, 1>::template decode<half>(tile, o, Bs + dst_off);
+            } else {
+                g53_col<K, 0>::template decode<half>(tile, o, Bs + dst_off);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sgp_sm > 0) {
+                STEEL_PRAGMA_NO_UNROLL
+                for (int i = 0; i < 2; ++i) {
+                    NAXTile<half, TM, TK> Atile;
+                    NAXTile<half, TN, TK> Btile;
+                    volatile int compiler_barrier;
+                    if (full) {
+                        Atile.load(xa + s * BK + i * SK, LDA);
+                    } else {
+                        Atile.load_safe(xa + s * BK + i * SK, LDA, short2(SK, sgp_sm));
+                    }
+                    Btile.template load<half, LDB, 1>(Bs + tn * LDB + i * SK);
+                    tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
+                    (void)compiler_barrier;
+                }
+            }
+        }
+        // the epilogue: band p's WN simdgroups stage their 32 rows, every simdgroup rotates rows rr = sg, sg + 16
+        const device half* ro = rout + mrow * size_t(HID) + size_t(n0) + 4u * lane;
+        const float4 rv = float4(float(ro[0]), float(ro[1]), float(ro[2]), float(ro[3]));
+        STEEL_PRAGMA_NO_UNROLL
+        for (int p = 0; p * SM < valid; ++p) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tm == p * SM) {
+                Dtile.template store<float, LDS, 1>(St + tn);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            STEEL_PRAGMA_UNROLL
+            for (int q = 0; q < 2; ++q) {
+                const int rr = int(sg) + NSG * q;
+                if (p * SM + rr >= valid) continue;
+                const threadgroup float* src = St + rr * LDS + 4 * int(lane);
+                float w[4];
+                STEEL_PRAGMA_UNROLL
+                for (int c = 0; c < 4; ++c) w[c] = src[c];
+                const float a0 = w[0] + w[1];
+                const float a1 = w[0] - w[1];
+                const float a2 = w[2] + w[3];
+                const float a3 = w[2] - w[3];
+                w[0] = a0 + a2;
+                w[2] = a0 - a2;
+                w[1] = a1 + a3;
+                w[3] = a1 - a3;
+                STEEL_PRAGMA_UNROLL
+                for (uint hh = 1u; hh < 32u; hh <<= 1u) {
+                    const bool upper = (lane & hh) != 0u;
+                    STEEL_PRAGMA_UNROLL
+                    for (int c = 0; c < 4; ++c) {
+                        const float oth = simd_shuffle_xor(w[c], (ushort) hh);
+                        w[c] = upper ? (oth - w[c]) : (w[c] + oth);
+                    }
+                }
+                yacc[p][q][0] += w[0] * 0.08838834764831845f * rv.x;
+                yacc[p][q][1] += w[1] * 0.08838834764831845f * rv.y;
+                yacc[p][q][2] += w[2] * 0.08838834764831845f * rv.z;
+                yacc[p][q][3] += w[3] * 0.08838834764831845f * rv.w;
+            }
+        }
+    }
+    STEEL_PRAGMA_UNROLL
+    for (int p = 0; p < 4; ++p) {
+        STEEL_PRAGMA_UNROLL
+        for (int q = 0; q < 2; ++q) {
+            const int rr = p * SM + int(sg) + NSG * q;
+            if (rr >= valid) continue;
+            device bfloat16_t* yp = y + (size_t(row0) + size_t(m0 + rr)) * size_t(HID) + size_t(n0) + 4u * lane;
+            yp[0] = bfloat16_t(yacc[p][q][0]);
+            yp[1] = bfloat16_t(yacc[p][q][1]);
+            yp[2] = bfloat16_t(yacc[p][q][2]);
+            yp[3] = bfloat16_t(yacc[p][q][3]);
+        }
+    }
