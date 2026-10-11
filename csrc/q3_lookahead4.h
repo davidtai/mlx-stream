@@ -103,6 +103,7 @@ void q3ld_test_delay(uint64_t seed, int64_t max_ns);
 void q3ld_test_spec_delay(int64_t max_ns);
 int64_t q3ld_test_events(int64_t *buf, int64_t cap);
 int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap);
+int64_t q3ld_test_busy_log(int64_t *buf, int64_t cap);
 #endif
 
 #ifdef __cplusplus
