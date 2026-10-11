@@ -82,6 +82,10 @@ const no_deadline: i64 = -1;
 pub const Status = enum(i64) { ok = 0, short = 1, os_error = 2, deadline = 3, skipped = 4, pending = -1, _ };
 
 /// One range's status words, as the worker published them.
+/// A demand job's times for a PROFILE build's read log (`Stream.readLog`): its routed layer, whether it read (a copy
+/// out of a speculative record does not), its submit, the worker's start and end (the pool's clock, ns).
+pub const ReadRec = extern struct { layer: u32, read: u32, submit_ns: i64, start_ns: i64, end_ns: i64 };
+
 pub const Result = struct {
     status: Status,
     preadv_calls: i64,

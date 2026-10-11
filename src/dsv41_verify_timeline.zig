@@ -6,6 +6,7 @@
 //! summary (`VERIFY_GPU_TIMELINE`) and the raw rows (`writeJson`) are made after the decode.
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+const ReadRec = @import("sdk_ext.zig").expert.io.ReadRec;
 const dt = @import("dsv41_decode_timers.zig");
 
 pub const enabled = dt.enabled;
@@ -53,6 +54,13 @@ var signals: [max_signals]Signal = undefined;
 var n_signals: usize = 0;
 var busy: [max_busy]BusySpan = undefined;
 var n_busy: usize = 0;
+/// The decode's demand jobs (`setReads`, before `line`): the read pool's occupancy in the summary.
+var reads: []const ReadRec = &.{};
+
+/// The stream's read log for the summary (`Stream.readLog`; it outlives the `line` call).
+pub fn setReads(rs: []const ReadRec) void {
+    reads = rs;
+}
 /// Cycles begun (`cycleBegin`), and the one in progress.
 pub var cycles: u32 = 0;
 var cur: u32 = 0;
@@ -413,7 +421,7 @@ pub const PerLayer = struct { idle_barrier: u64 = 0, hit_span: ?u64 = null, gap:
 /// submit) and `idle_tail` (after the last layer's hit submit); `read` the stream's read gauge over the routed calls;
 /// `miss_busy` the GPU busy time after the hit submit of the layers that missed; `wait` the summed gated waits on miss
 /// bytes (`PerLayer.wait`) and `work` = busy - wait; `hit_span` / `gap` summed over the layers that have them.
-pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_barrier: u64 = 0, idle_encode: u64 = 0, idle_tail: u64 = 0, read: u64 = 0, miss_busy: u64 = 0, buffers: u32 = 0, layers: u32 = 0, truncated: bool = false, work: u64 = 0, wait: u64 = 0, wait_gu: u64 = 0, hit_span: u64 = 0, hit_layers: u32 = 0, gap: u64 = 0, gap_layers: u32 = 0, gated: u32 = 0, unsignalled: u32 = 0, split: Split = .{}, layers_split: Split = .{}, round: u64 = 0, draft: u64 = 0, draft_idle: u64 = 0, tail: u64 = 0, tail_idle: u64 = 0, bar_neither: u64 = 0, enc_neither_missed: u64 = 0, enc_neither_hits: u64 = 0, enc_ssd_missed: u64 = 0, late: u64 = 0, neither_call_ids: u64 = 0, neither_ids_reads: u64 = 0, neither_reads_hit: u64 = 0, issue: u64 = 0, read_time: u64 = 0 };
+pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_barrier: u64 = 0, idle_encode: u64 = 0, idle_tail: u64 = 0, read: u64 = 0, miss_busy: u64 = 0, buffers: u32 = 0, layers: u32 = 0, truncated: bool = false, work: u64 = 0, wait: u64 = 0, wait_gu: u64 = 0, hit_span: u64 = 0, hit_layers: u32 = 0, gap: u64 = 0, gap_layers: u32 = 0, gated: u32 = 0, unsignalled: u32 = 0, split: Split = .{}, layers_split: Split = .{}, round: u64 = 0, draft: u64 = 0, draft_idle: u64 = 0, tail: u64 = 0, tail_idle: u64 = 0, bar_neither: u64 = 0, enc_neither_missed: u64 = 0, enc_neither_hits: u64 = 0, enc_ssd_missed: u64 = 0, late: u64 = 0, neither_call_ids: u64 = 0, neither_ids_reads: u64 = 0, neither_reads_hit: u64 = 0, issue: u64 = 0, read_time: u64 = 0, jobs: u32 = 0, queue: u64 = 0, service: u64 = 0, queued_idle: u64 = 0, enc_queued_idle_missed: u64 = 0 };
 
 /// `ssd`: the pool's busy spans. The splits are over the GPU's work (its busy union less its gated waits on bytes):
 /// `split` the verify's whole window, `layers_split` the routed layers' windows summed, and of those the barrier
@@ -421,9 +429,12 @@ pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_
 /// submit, after a layer that missed or not) idle time, the barrier window's in three parts (to the ids read, to the
 /// route's reads submitted, to the hit wave's submit). `issue`: the host from the ids read to the reads submitted;
 /// `read_time`: per gated layer, its reads submitted to its last bytes landed; `late`: the miss waves' GPU start after
-/// their bytes landed. `draft` / `tail`: the cycle's draft before the verify and the rest after it to `next_draft` (the next
+/// their bytes landed. `jobs` / `queue` / `service`: the verify's demand jobs, their summed time queued (submit to the
+/// worker's start) and in a worker; `queued_idle`: the time a job sat queued with no read in flight, and of it the
+/// missed layers' encode windows' (`enc_queued_idle_missed`), from `queued` (the jobs' queued spans, merged).
+/// `draft` / `tail`: the cycle's draft before the verify and the rest after it to `next_draft` (the next
 /// cycle's start, 0 for none), and the GPU's idle time in them; `round` the cycle's start to the next's.
-pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []const Signal, ssd: []const Span, next_draft: u64, scratch: []Span, work_scratch: []Span, per: []PerLayer) CycleSum {
+pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []const Signal, ssd: []const Span, queued: []const Span, jobs: []const ReadRec, next_draft: u64, scratch: []Span, work_scratch: []Span, per: []PerLayer) CycleSum {
     var s: CycleSum = .{};
     for (per) |*p| p.* = .{};
     if (v.end <= v.begin) return s;
@@ -517,6 +528,15 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
     // The GPU's work: its busy union less the gated waits (in layer order, so sorted).
     const work = subtractSpans(u, waits[0..n_waits], work_scratch);
     s.split = splitIn(work, ssd, v.begin, v.end);
+    // The read pool's occupancy: the verify's demand jobs, and the time one sat queued with no read in flight.
+    for (jobs) |j| {
+        const sub: u64 = @intCast(@max(j.submit_ns, 0));
+        if (sub < v.begin or sub >= v.end) continue;
+        s.jobs += 1;
+        s.queue += @intCast(@max(j.start_ns - j.submit_ns, 0));
+        s.service += @intCast(@max(j.end_ns - j.start_ns, 0));
+    }
+    s.queued_idle = splitIn(queued, ssd, v.begin, v.end).gpu_only;
     for (ls, 0..) |l, i| {
         if (P.t(l, .call) == 0) continue;
         var next_call: u64 = v.end;
@@ -537,12 +557,13 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
         if (l.missed) {
             s.enc_neither_missed += enc.idle;
             s.enc_ssd_missed += enc.ssd_only;
+            s.enc_queued_idle_missed += splitIn(queued, ssd, P.t(l, .hit), next_call).gpu_only;
         } else s.enc_neither_hits += enc.idle;
     }
     return s;
 }
 
-const fields = [_][]const u8{ "wall_ms", "busy_ms", "gpu_work_ms", "bytes_wait_ms", "bytes_wait_gu_ms", "idle_ms", "idle_barrier_ms", "idle_barrier_per_layer_ms", "idle_encode_ms", "idle_tail_ms", "hit_span_ms", "hit_span_per_layer_ms", "router_hit_gap_ms", "router_hit_gap_per_layer_ms", "read_busy_ms", "miss_layer_busy_ms", "buffers", "gated_layers", "unsignalled_gates", "work_and_ssd_ms", "ssd_alone_ms", "work_alone_ms", "neither_ms", "layers_work_and_ssd_ms", "layers_ssd_alone_ms", "layers_work_alone_ms", "layers_neither_ms", "barrier_neither_ms", "encode_neither_missed_ms", "encode_neither_hit_only_ms", "encode_ssd_alone_missed_ms", "miss_late_start_ms", "round_ms", "draft_ms", "draft_gpu_idle_ms", "tail_ms", "tail_gpu_idle_ms", "neither_call_to_ids_ms", "neither_ids_to_reads_ms", "neither_reads_to_hit_ms", "issue_latency_ms", "miss_read_time_ms" };
+const fields = [_][]const u8{ "wall_ms", "busy_ms", "gpu_work_ms", "bytes_wait_ms", "bytes_wait_gu_ms", "idle_ms", "idle_barrier_ms", "idle_barrier_per_layer_ms", "idle_encode_ms", "idle_tail_ms", "hit_span_ms", "hit_span_per_layer_ms", "router_hit_gap_ms", "router_hit_gap_per_layer_ms", "read_busy_ms", "miss_layer_busy_ms", "buffers", "gated_layers", "unsignalled_gates", "work_and_ssd_ms", "ssd_alone_ms", "work_alone_ms", "neither_ms", "layers_work_and_ssd_ms", "layers_ssd_alone_ms", "layers_work_alone_ms", "layers_neither_ms", "barrier_neither_ms", "encode_neither_missed_ms", "encode_neither_hit_only_ms", "encode_ssd_alone_missed_ms", "miss_late_start_ms", "round_ms", "draft_ms", "draft_gpu_idle_ms", "tail_ms", "tail_gpu_idle_ms", "neither_call_to_ids_ms", "neither_ids_to_reads_ms", "neither_reads_to_hit_ms", "issue_latency_ms", "miss_read_time_ms", "demand_jobs", "job_queue_ms", "job_service_ms", "queued_no_read_ms", "encode_missed_queued_no_read_ms" };
 
 fn fieldOf(s: CycleSum, i: usize) f64 {
     const ms = struct {
@@ -597,7 +618,12 @@ fn fieldOf(s: CycleSum, i: usize) f64 {
         38 => ms(s.neither_ids_reads),
         39 => ms(s.neither_reads_hit),
         40 => ms(s.issue),
-        else => ms(s.read_time),
+        41 => ms(s.read_time),
+        42 => @floatFromInt(s.jobs),
+        43 => ms(s.queue),
+        44 => ms(s.service),
+        45 => ms(s.queued_idle),
+        else => ms(s.enc_queued_idle_missed),
     };
 }
 
@@ -615,6 +641,32 @@ var per_layer_n: [by_layer_fields.len][max_layers]usize = undefined;
 var span_scratch: [8192]Span = undefined;
 var ssd_scratch: [max_busy]Span = undefined;
 var work_spans: [8192 + max_layers]Span = undefined;
+var queued_spans: [max_busy]Span = undefined;
+
+/// The jobs' queued spans (submit to the worker's start), sorted and merged into `out`.
+fn queuedSpans(jobs: []const ReadRec, out: []Span) []Span {
+    var n: usize = 0;
+    for (jobs) |j| {
+        if (j.start_ns <= j.submit_ns or j.submit_ns <= 0 or n == out.len) continue;
+        out[n] = .{ @intCast(j.submit_ns), @intCast(j.start_ns) };
+        n += 1;
+    }
+    std.mem.sort(Span, out[0..n], {}, struct {
+        fn lt(_: void, x: Span, y: Span) bool {
+            return x[0] < y[0];
+        }
+    }.lt);
+    var m: usize = 0;
+    for (out[0..n]) |sp| {
+        if (m > 0 and sp[0] <= out[m - 1][1]) {
+            out[m - 1][1] = @max(out[m - 1][1], sp[1]);
+        } else {
+            out[m] = sp;
+            m += 1;
+        }
+    }
+    return out[0..m];
+}
 
 /// `VERIFY_GPU_TIMELINE {...}` over the stored verifies: per-cycle medians and means, per-layer medians (over the
 /// cycles where the layer has the quantity), the buffer and signal counts (`pending`: rows whose handler had not run
@@ -631,10 +683,11 @@ fn writeLine(w: *std.Io.Writer, rs: []const Row, vs: []const Verify, ls: []const
     var verify_buffers: u64 = 0;
     var per: [max_layers]PerLayer = undefined;
     per_layer_n = @splat(@splat(0));
+    const queued = queuedSpans(reads, &queued_spans);
     for (vs, 0..) |v, ci| {
         if (v.end <= v.begin) continue;
         const next_draft: u64 = if (ci + 1 < vs.len) vs[ci + 1].draft else 0;
-        const s = cycleSum(rs, v, ls[ci][0..n_layers], @intCast(ci), sig, ssd, next_draft, &span_scratch, &work_spans, per[0..n_layers]);
+        const s = cycleSum(rs, v, ls[ci][0..n_layers], @intCast(ci), sig, ssd, queued, reads, next_draft, &span_scratch, &work_spans, per[0..n_layers]);
         for (0..fields.len) |f| per_cycle[f][n] = fieldOf(s, f);
         for (per[0..n_layers], 0..) |p, l| {
             const sp = p.split;
@@ -813,7 +866,7 @@ test "dsv41 verify timeline (profile builds): a hand-made verify: busy union, id
     var scratch: [8]Span = undefined;
     var work_s: [12]Span = undefined;
     var per: [3]PerLayer = undefined;
-    const s = cycleSum(&rs, .{ .begin = 100, .end = 300 }, &ls, 0, &sig, &.{}, 0, &scratch, &work_s, &per);
+    const s = cycleSum(&rs, .{ .begin = 100, .end = 300 }, &ls, 0, &sig, &.{}, &.{}, &.{}, 0, &scratch, &work_s, &per);
     // busy: 105..120, 124..200, 205..215 = 15 + 76 + 10 = 101; idle 99
     try std.testing.expectEqual(@as(u64, 200), s.wall);
     try std.testing.expectEqual(@as(u64, 101), s.busy);
@@ -842,7 +895,7 @@ test "dsv41 verify timeline (profile builds): a hand-made verify: busy union, id
     try std.testing.expectEqual(@as(u32, 4), s.buffers);
     try std.testing.expectEqual(@as(u32, 2), s.layers);
     // a signal log that stops short leaves the gate unsignalled (no wait counted)
-    const s2 = cycleSum(&rs, .{ .begin = 100, .end = 300 }, &ls, 0, sig[0..2], &.{}, 0, &scratch, &work_s, &per);
+    const s2 = cycleSum(&rs, .{ .begin = 100, .end = 300 }, &ls, 0, sig[0..2], &.{}, &.{}, &.{}, 0, &scratch, &work_s, &per);
     try std.testing.expectEqual(@as(u32, 1), s2.unsignalled);
     try std.testing.expectEqual(@as(u64, 0), s2.wait);
     // the install refuses without an MLX command buffer (no device touched)

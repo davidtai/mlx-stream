@@ -469,6 +469,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (comptime timeline.enabled) if (self.mtp != null) {
                 // The timeline's storage holds DeepSeek-V4.1's 64 layers: GLM-5.3's first 64 routed layers are stamped (the
                 // verify's GPU busy and idle cover every layer).
+                self.stream.clearReadLog();
                 timeline.install(self.g.s, @intCast(@min(h.reserved_tokens -| h.prompt_tokens, timeline.max_cycles + 1)), @intCast(@min(self.bank.layers.len / Experts.bpl, timeline.max_layers))) catch |e|
                     log.warn("glm_moe_dsa: the verify timeline is off ({s})\n", .{@errorName(e)});
             };
@@ -484,6 +485,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 const pending = timeline.settle(self.g.s, 2000);
                 timeline.uninstall();
                 var tb: [16384]u8 = undefined;
+                timeline.setReads(self.stream.readLog());
                 log.info("glm_moe_dsa: {s}\n", .{timeline.line(&tb, pending)});
             };
             if (self.mtp) |ln| if (ln.counts.rounds > 0) {
