@@ -1279,7 +1279,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// then reads ahead the next layer's predicted records (keyed by offset).
             fn speculate(self: *Stream, r: *const Route, scores: []const f32) Error!void {
                 if (comptime multi_bank) return self.speculateBanks(r, scores);
-                const next = r.layer + 1;
+                return self.specAt(r.tag, r.layer + 1, r.rec, scores);
+            }
+
+            /// The speculative step tagged `tag` for stream layer `next` (`rec`: the recorder's route, or none).
+            fn specAt(self: *Stream, tag: i64, next: u32, rec: u32, scores: []const f32) Error!void {
                 var bases: [expert_lookahead.max_budget]i64 = undefined;
                 var n: usize = 0;
                 var len: u64 = 0;
@@ -1288,7 +1292,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
                     var ranks: [expert_lookahead.max_budget]u8 = undefined;
                     const picked = sel.selectWith(scores, &self.layers[next].policy, expert_lookahead.residentIn, chosen[0..sel.budget], ranks[0..sel.budget]);
-                    if (self.recorder) |rec| rec.spec(r.rec, picked);
+                    if (self.recorder) |rc| rc.spec(rec, picked);
                     for (picked) |e| {
                         bases[n] = @intCast(self.bank.recordOffset(next, e));
                         n += 1;
@@ -1296,7 +1300,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     self.notePending(next, picked, ranks[0..picked.len], null);
                     len = spanOf(&self.bank.layers[next]);
                 }
-                _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0..n], len) catch
+                _ = self.pool.specStep(self.bank.sidecar, tag, bases[0..n], len) catch
                     return self.fail(error.SpecRefused);
             }
 
@@ -1304,8 +1308,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// layer's experts over all its bank layers, each checked against its own bank layer's residency, each record
             /// its bank layer's span (one step of records of different lengths).
             fn speculateBanks(self: *Stream, r: *const Route, scores: []const f32) Error!void {
+                return self.specBanksAt(r.tag, r.layer / B.banks_per_layer + 1, r.rec, scores);
+            }
+
+            /// `speculateBanks`' step tagged `tag` for routed layer `next` (`rec`: the recorder's route, or none).
+            fn specBanksAt(self: *Stream, tag: i64, next: u32, rec: u32, scores: []const f32) Error!void {
                 const bpl = B.banks_per_layer;
-                const next: u32 = r.layer / bpl + 1;
                 var bases: [expert_lookahead.max_budget]i64 = undefined;
                 var lens: [expert_lookahead.max_budget]i64 = undefined;
                 var n: usize = 0;
@@ -1321,7 +1329,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
                     var ranks: [expert_lookahead.max_budget]u8 = undefined;
                     const picked = sel.selectWith(scores, Ctx{ .s = self, .routed = next }, resident, chosen[0..sel.budget], ranks[0..sel.budget]);
-                    if (self.recorder) |rec| rec.spec(r.rec, picked);
+                    if (self.recorder) |rc| rc.spec(rec, picked);
                     var side: [expert_lookahead.max_budget]u8 = undefined;
                     for (picked) |e| {
                         const sl = self.bank.streamLayer(next, e);
@@ -1332,8 +1340,22 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     }
                     self.notePending(next, picked, ranks[0..picked.len], side[0..n]);
                 }
-                _ = self.pool.specStepLens(self.bank.sidecar, r.tag, bases[0..n], lens[0..n]) catch
+                _ = self.pool.specStepLens(self.bank.sidecar, tag, bases[0..n], lens[0..n]) catch
                     return self.fail(error.SpecRefused);
+            }
+
+            /// The speculative step for routed layer `routed` before its first route, from host scores (rows x
+            /// n_experts f32): the lookahead of a routed layer no routed layer precedes (the first, on the last dense
+            /// layer's MoE input). It takes its own tag and settles what is older; the layer's first route claims its
+            /// records and the layer's last route settles the rest. Off before the phase change, on a stream without the
+            /// lookahead class and for empty scores.
+            pub fn speculateAhead(self: *Stream, routed: u32, scores: []const f32) Error!void {
+                if (self.failed) return error.StreamFailed;
+                if (!self.route_lookahead or self.phase != .decode or scores.len == 0) return;
+                const tag = self.clock + 1;
+                self.clock = tag;
+                if (comptime multi_bank) return self.specBanksAt(tag, routed, expert_routes.none, scores);
+                return self.specAt(tag, routed, expert_routes.none, scores);
             }
 
             /// Event gates for a live route's reads, registered before the GPU commits

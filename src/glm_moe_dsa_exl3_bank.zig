@@ -786,3 +786,70 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
     s.release(q1);
     try s.flush();
 }
+
+test "glm exl3 bank: the host's speculative step for a routed layer before its first route: its first route claims the records, its last route settles the rest" {
+    const a = testing.allocator;
+    var c = try affine.tinyConfig(a);
+    defer c.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try writeSynth(a, testing.io, tmp.dir, &c, .{});
+    defer a.free(img);
+    var rbuf: [512]u8 = undefined;
+    var b = try Bank.open(a, testing.io, try tmpRoot(&tmp, &rbuf), &c, null);
+    defer b.deinit();
+    var rows: [8]u32 = undefined;
+    @memset(&rows, 2);
+    const s = try Stream.Stream.init(a, &b, .{ .rows = &rows, .max_route_ids = 8, .transient_rows = 16, .wide_depth = 2, .transient_release = true, .records_per_part = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 }, .lookahead = .{ .k = 8, .budget = 4, .preread = false } });
+    defer s.deinit();
+    var scores: [16]f32 = @splat(0);
+    scores[5] = 9;
+    scores[2] = 8.5;
+    scores[6] = 8;
+    scores[7] = 7.5;
+    // Before the phase change the step reads nothing.
+    try s.speculateAhead(1, &scores);
+    try testing.expectEqual(@as(u64, 0), s.stats().spec_issued);
+    _ = try s.releaseTransient();
+    try s.grow(&rows);
+    const q3raw = struct {
+        extern fn q3ld_test_spec_hold(starts: i32) void;
+        extern fn q3ld_test_spec_held(n: i32, timeout_ns: i64) i32;
+    };
+    q3raw.q3ld_test_spec_hold(2);
+    defer q3raw.q3ld_test_spec_hold(-1);
+    // Routed layer 1's experts 5 (K4), 2 (K3), 6 (K3), 7 (K4) from the host's scores, no route before them: 5 and 2
+    // start and wait at the hold, 6 and 7 stay queued.
+    try s.speculateAhead(1, &scores);
+    try testing.expectEqual(@as(u64, 4), s.stats().spec_issued);
+    try testing.expectEqual(@as(i32, 0), q3raw.q3ld_test_spec_held(2, 10 * std.time.ns_per_s));
+    // Routed layer 1's call routes 2 and 0 (K3, held), then 5 and 1 (K4, its last route): it claims 2 and 5 and reads
+    // 0 and 1 itself; its last route settles 6 and 7, still queued.
+    const q0 = try s.routeHeld(2, &.{ 2, 0 });
+    const q1 = try s.route(3, &.{ 5, 1 }, &.{});
+    for ([_]*Stream.Route{ q0, q1 }) |r| for (0..r.n_parts) |p| try s.waitDown(r, @intCast(p));
+    const st = s.stats();
+    try testing.expectEqual(@as(u64, 2), st.claimed);
+    try testing.expectEqual(@as(u64, 0), st.spec_cancelled);
+    try testing.expectEqual(@as(u64, 2), st.spec_expired);
+    try testing.expectEqual(@as(u64, 2 * 4 * 2), st.adopt_ranges);
+    for ([_]struct { r: *Stream.Route, l: u32, ids: [2]u16 }{ .{ .r = q0, .l = 2, .ids = .{ 2, 0 } }, .{ .r = q1, .l = 3, .ids = .{ 5, 1 } } }) |x| {
+        const geom = &b.layers[x.l];
+        for (x.r.plan.slotsOf(), x.ids) |slot, e| {
+            const off = b.recordOffset(x.l, e);
+            for (geom.segments, 0..) |sg, ci| {
+                const row = s.slotRow(x.l, slot, @enumFromInt(ci));
+                for (0..geom.minis) |mi| try testing.expectEqualSlices(u8, img[off + mi * geom.record_bytes + sg.offset ..][0..sg.length], row[mi * sg.length ..][0..sg.length]);
+            }
+        }
+    }
+    // The precision counts the host's step at the layer's last route: 5 and 2 read ahead and routed, 6 and 7 not.
+    const br = s.lookaheadByRank();
+    for ([_]u1{ 1, 0, 0, 1 }, [_]u64{ 1, 1, 0, 0 }, 0..) |sd, routed, r| {
+        try testing.expectEqual([2]u64{ 1, routed }, br[sd][r]);
+        try testing.expectEqual([2]u64{ 0, 0 }, br[1 - sd][r]);
+    }
+    s.release(q0);
+    s.release(q1);
+    try s.flush();
+}
