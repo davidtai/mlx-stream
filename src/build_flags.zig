@@ -9,4 +9,4 @@ pub const dsv41_decode_timers: bool = sdk.plugin_profile;
 /// The prompt pass routed-call timers (dsv41_prefill_timers.zig).
 pub const dsv41_prefill_timers: bool = sdk.plugin_profile;
 /// GLM-5.3's prompt-pass phase split (glm_moe_dsa_prefill_timers.zig).
-pub const glm_prefill_timers: bool = sdk.plugin_profile;
+pub const glm_prefill_timers: bool = false; // MEASUREMENT branch: the verify runs as served (the timers sync inside attention at rows > 1)

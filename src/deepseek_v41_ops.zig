@@ -139,6 +139,11 @@ const contexts_per_region = 2;
 
 // ── MLX backend ──
 
+/// MEASUREMENT ONLY (the GLM trunk bench, exp/glm-trunk-bench): called with every array the MLX backend tracks, the
+/// code's current stage in `bench_stage`; null in every other run.
+pub var bench_hook: ?*const fn (mlx.mlx_array) void = null;
+pub var bench_stage: []const u8 = "";
+
 pub const MlxOps = struct {
     pub const T = mlx.mlx_array;
     pub const profile_hook = package_profile;
@@ -409,6 +414,7 @@ pub const MlxOps = struct {
             _ = mlx.mlx_array_free(a);
             return e;
         };
+        if (bench_hook) |h| h(a);
         return a;
     }
 
