@@ -67,6 +67,14 @@ pub fn promptBufferMb(rows: u64, hidden: u32, max_ops: c_int, mlx_mb: c_int) c_i
     const mb = std.math.divCeil(u64, bytes, 1 << 20) catch unreachable;
     return @intCast(@max(@as(u64, @intCast(@max(mlx_mb, 1))), @min(mb, std.math.maxInt(c_int))));
 }
+
+/// MLX's command buffer limits now (ops, MB): the setter with 0 for both keeps them and returns them.
+fn bufferLimits() [2]c_int {
+    var ops: c_int = 0;
+    var mb: c_int = 0;
+    _ = mlx.mlx_metal_set_command_buffer_limits(&ops, &mb, 0, 0);
+    return .{ ops, mb };
+}
 /// How far the constructed footprint may sit above the bill's construction terms (the ledger's page rounding and the
 /// host side's own movement; `phase_memory`'s, shared with DeepSeek-V4.1's module).
 pub const construction_tolerance_bytes = phase_mem.construction_tolerance_bytes;
@@ -579,11 +587,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         fn promptBuffers(self: *Self, rows: u64) void {
             // Only mlx-serve's macOS MLX (patches/mlx-cb-limits.patch) has the setter.
             if (comptime !prompt_buffer_limits) return;
+            const own = self.mlx_buffers orelse bufferLimits();
             var ops: c_int = 0;
             var mb: c_int = 0;
-            // 0 keeps a limit: this reads them.
-            _ = mlx.mlx_metal_set_command_buffer_limits(&ops, &mb, 0, 0);
-            const own = self.mlx_buffers orelse [2]c_int{ ops, mb };
             _ = mlx.mlx_metal_set_command_buffer_limits(&ops, &mb, own[0], promptBufferMb(rows, self.model.hidden_size, own[0], own[1]));
             self.mlx_buffers = own;
         }
@@ -1447,23 +1453,20 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
         try testing.expectEqual(@as(u32, 5), d);
     }
     const prompt = [_]u32{ 3, 17, 9, 101, 44, 250, 7, 63, 12, 5, 99, 31 };
-    // MLX's command buffer limits (0 keeps a limit: this reads them).
-    var ops0: c_int = 0;
-    var mb0: c_int = 0;
-    _ = mlx.mlx_metal_set_command_buffer_limits(&ops0, &mb0, 0, 0);
+    const own = if (comptime prompt_buffer_limits) bufferLimits() else undefined;
     const logits = try m.prefillAt(0, &prompt);
     var t = try m.g.hostArgmax(logits);
     _ = mlx.mlx_array_free(logits);
-    // The prompt's limits stay until the handover (its one call of 12 rows), MLX's are back after it.
-    var ops: c_int = 0;
-    var mb: c_int = 0;
-    _ = mlx.mlx_metal_set_command_buffer_limits(&ops, &mb, 0, 0);
-    try testing.expectEqual([2]c_int{ ops0, mb0 }, m.mlx_buffers.?);
-    try testing.expectEqual([2]c_int{ ops0, promptBufferMb(prompt.len, m.model.hidden_size, ops0, mb0) }, [2]c_int{ ops, mb });
+    if (comptime prompt_buffer_limits) {
+        // The prompt's command buffer limits (its one call of 12 rows) stay until the handover; MLX's are back after it.
+        try testing.expectEqual(own, m.mlx_buffers.?);
+        try testing.expectEqual([2]c_int{ own[0], promptBufferMb(prompt.len, m.model.hidden_size, own[0], own[1]) }, bufferLimits());
+    }
     try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
-    try testing.expectEqual(@as(?[2]c_int, null), m.mlx_buffers);
-    _ = mlx.mlx_metal_set_command_buffer_limits(&ops, &mb, 0, 0);
-    try testing.expectEqual([2]c_int{ ops0, mb0 }, [2]c_int{ ops, mb });
+    if (comptime prompt_buffer_limits) {
+        try testing.expectEqual(@as(?[2]c_int, null), m.mlx_buffers);
+        try testing.expectEqual(own, bufferLimits());
+    }
     var row: [256]f32 = undefined;
     for (0..4) |_| {
         const lg = try m.extend(&.{t});
