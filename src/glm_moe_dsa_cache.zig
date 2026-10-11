@@ -42,6 +42,30 @@ pub fn Cache(comptime G: type) type {
             return .{ .a = a, .latent = latent, .rope = rope, .index = index, .cap = cap, .row_bytes = .{ 2 * @as(u64, c.kv_lora_rank), 2 * @as(u64, c.qk_rope_head_dim), 2 * @as(u64, c.index_head_dim) } };
         }
 
+        /// Every empty lane allocated at its bound (bf16 zeros, as its first append would), evaluated: a prompt pass then
+        /// appends into lanes it does not allocate, so the allocator's size classes (on for the pass's transients) never
+        /// round a lane.
+        pub fn preallocate(self: *Self, g: *G, c: *const glm.Config) !void {
+            // Only the kept handles outlive this: a first append then writes its lane in place (no other reference).
+            const m = g.mark();
+            defer g.resetTo(m);
+            var news: std.ArrayList(T) = .empty;
+            defer news.deinit(self.a);
+            for (self.latent, self.rope, self.index) |*lt, *rp, *ix| {
+                const dims = [3]u32{ c.kv_lora_rank, c.qk_rope_head_dim, c.index_head_dim };
+                const lanes = [3]?*L.Grow{ lt, rp, if (ix.*) |*x| x else null };
+                for (lanes, dims) |lane_, d| {
+                    const lane = lane_ orelse continue;
+                    if (lane.buf != null) continue;
+                    const cap = lane.bounded_cap orelse continue;
+                    lane.buf = g.keep(try g.zeros(&.{ 1, @intCast(cap), @intCast(d) }, .bfloat16));
+                    lane.cap = cap;
+                    try news.append(self.a, lane.buf.?);
+                }
+            }
+            if (news.items.len > 0) try g.evalAll(news.items);
+        }
+
         /// Every lane bounded at exactly `cap` positions (at least the positions held), layer by layer: a lane with
         /// rows moves to a `cap`-row buffer, evaluated before the next layer's, so the old and the new buffers of one
         /// layer at most are live at once. No-op at the same cap.

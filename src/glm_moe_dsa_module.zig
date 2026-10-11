@@ -22,6 +22,7 @@
 //! lanes to the accepted rows; the MTP layer appends nothing for a draft, so a rejection leaves its cache as it was.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const log = @import("sdk").log;
@@ -412,6 +413,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 return error.ContextOverBill;
             }
             try self.reverse(@intCast(start + ids.len));
+            // The lanes the pass appends to are allocated before the allocator's size classes go on for its transients.
+            try self.cache.preallocate(&self.g, self.model);
             self.stream.resetPromptCounts();
             if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth());
             const s0 = self.stream.stats();
@@ -428,7 +431,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 if (logits) |x| self.g.release(x);
                 logits = null;
                 if (self.mtp) |ln| {
-                    const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes, .{ .hidden = true });
+                    const out = blk: {
+                        transientClasses(true);
+                        defer transientClasses(false);
+                        break :blk try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes, .{ .hidden = true });
+                    };
                     logits = out.logits;
                     defer self.g.release(out.hidden.?);
                     try self.history.appendSlice(self.gpa, ids[at..end]);
@@ -436,7 +443,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                     try ln.pend(&self.g, self.cache.len, out.hidden.?, @intCast(end - at), false);
                     if (ln.tracked() == self.cache.len) try ln.append(&self.g, &self.w, self.history.items[ln.cache.len + 1 ..]);
                 } else {
-                    logits = try graph.forward(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes);
+                    logits = blk: {
+                        transientClasses(true);
+                        defer transientClasses(false);
+                        break :blk try graph.forward(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes);
+                    };
                     try self.history.appendSlice(self.gpa, ids[at..end]);
                 }
                 at = end;
@@ -447,6 +458,16 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .mem = .{ .start = mem0, .end = Mem.now() } }});
             prefill_timers.report(ids.len);
             return logits.?;
+        }
+
+        /// The allocator's size classes (a request of 1 MB or more rounded up to one of 8 classes per power of two, so
+        /// a nearly equal request reuses its cached buffer) on for the forward layers only: their transients are
+        /// rounded, never a lane (`Cache.preallocate`), a resident, the scratch or the MTP lane's rows.
+        fn transientClasses(on: bool) void {
+            // Only mlx-serve's macOS MLX (patches/mlx-alloc-size-classes.patch) has the switch.
+            if (comptime builtin.os.tag != .macos) return;
+            var prev: bool = false;
+            _ = mlx.mlx_set_alloc_size_classes(&prev, on);
         }
 
         /// A serial step: `ids` (decode width) after the committed positions; the last row's logits, an owned handle.
