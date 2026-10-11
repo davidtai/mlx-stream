@@ -42,7 +42,7 @@ pub const Config = struct {
     expert_wide_depth: ?u8 = null,
     /// The decode lookahead's records read ahead per routed call (null = 2; 1 .. `max_lookahead_budget`).
     expert_lookahead_budget: ?u32 = null,
-    /// The read pool's workers (null = 4; 1 .. `max_read_workers`).
+    /// The read pool's workers (null = 8; 1 .. `max_read_workers`).
     expert_read_workers: ?u32 = null,
     /// The MTP draft lane's drafts per round (null or 0 = off; 1 .. `max_mtp_depth`).
     mtp_depth: ?u32 = null,
@@ -219,7 +219,7 @@ pub const Config = struct {
     }
 
     pub fn readWorkers(c: *const Config) u32 {
-        return c.expert_read_workers orelse 4;
+        return c.expert_read_workers orelse 8;
     }
 
     /// A `ctx_size` over the model's limit, refused by name (never a silent fall back to the standard context).
@@ -260,10 +260,10 @@ test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up 
     try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_lookahead_budget\": 4}")).lookaheadBudget());
     try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 5}")).lookaheadBudget());
     try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 0}")).lookaheadBudget());
-    try testing.expectEqual(@as(u32, 4), (Config{}).readWorkers());
-    try testing.expectEqual(@as(u32, 8), (try settingsOf("{\"expert_read_workers\": 8}")).readWorkers());
-    try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_read_workers\": 9}")).readWorkers());
-    try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_read_workers\": 0}")).readWorkers());
+    try testing.expectEqual(@as(u32, 8), (Config{}).readWorkers());
+    try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_read_workers\": 4}")).readWorkers());
+    try testing.expectEqual(@as(u32, 8), (try settingsOf("{\"expert_read_workers\": 9}")).readWorkers());
+    try testing.expectEqual(@as(u32, 8), (try settingsOf("{\"expert_read_workers\": 0}")).readWorkers());
     try testing.expectEqual(@as(?u32, 131072), (try settingsOf("{\"ctx_size\": 131072}")).max_context_tokens);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": \"131072\"}")).max_context_tokens);
     const over = try settingsOf("{\"ctx_size\": 2097152}");

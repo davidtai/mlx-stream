@@ -996,8 +996,8 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
     try testing.expectEqual(@as(u64, 23_166_976), p.mtp_kv);
     // The lane's residents, experts and slot table: the open measured 4,752,870,912 B on the box.
     try testing.expectEqual(@as(u64, 4_752_870_912), p.mtp_residents);
-    // The read pool: four 3,194,880 B staging buffers, four speculative slots of a K4 expert's span, 4,096 tickets.
-    try testing.expectEqual(@as(u64, 4 * 3_194_880 + 4 * 19_070_976 + 4096 * 73), p.pool_staging);
+    // The read pool: eight 3,194,880 B staging buffers, four speculative slots of a K4 expert's span, 4,096 tickets.
+    try testing.expectEqual(@as(u64, 8 * 3_194_880 + 4 * 19_070_976 + 4096 * 73), p.pool_staging);
     // The prompt cache at its limit; one freed buffer past it at most: the attention's output over the 16,448 rows
     // (GLM-5.3's kernels' widest routed array, a slice's join, is 16,384 rows x hidden; sushi's every mini of it).
     try testing.expectEqual(@as(u64, 16 << 30), p.mlx_cache);

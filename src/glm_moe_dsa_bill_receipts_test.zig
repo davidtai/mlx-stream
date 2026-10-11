@@ -22,8 +22,8 @@ fn glm53Config() !glm.Config {
     return glm.Config.parse(testing.allocator, text, &glm.glm53, null);
 }
 
-/// The fill arm's model settings and context.
-const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
+/// The fill arm's model settings and context (its runs read with four workers).
+const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3, .expert_read_workers = 4 };
 
 /// The box's inputs with the run's prompt kernels: its routed GEMMs and its spans' selection.
 fn inputs(c: *const glm.Config, gemm: bill.PromptGemm, select: bill.Select) bill.Inputs {
