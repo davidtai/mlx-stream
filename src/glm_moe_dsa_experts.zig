@@ -402,6 +402,17 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             st.n_routes = 0;
         }
 
+        /// The lookahead of routed layer `layer`, which no routed layer precedes (the first): its routing scores
+        /// `[n, n_experts]` f32 on a decode call's rows, read on the host and handed to the stream before the layer's
+        /// first route (`Stream.speculateAhead`). Nothing is evaluated on a stream without the lookahead class.
+        pub fn speculateAhead(self: *Self, g: *G, layer: u32, scores: T) !void {
+            if (!self.stream.route_lookahead) return;
+            var score_buf: [sdk_ext.expert.lookahead.max_rows * 512]f32 = undefined;
+            const n: u32 = @intCast(g.shapeOf(scores).dim(0));
+            if (n * self.n_experts > score_buf.len) return;
+            try self.stream.speculateAhead(layer, try g.hostF32(scores, score_buf[0 .. n * self.n_experts]));
+        }
+
         /// One routed-layer call: x [n, hidden], indices [n, k] int32, scores [n, k] f32 -> the weighted sum [n, hidden]
         /// in x's dtype. `next_scores` [n, n_experts] f32: the next routed layer's routing scores on this call's rows (the
         /// decode lookahead's predictor), evaluated with the ids at the routing barrier; null for none. `hoist`: arrays

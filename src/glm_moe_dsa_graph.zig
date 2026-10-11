@@ -792,7 +792,18 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         }
         defer if (probe) |p| p.mark(l, .tail);
         const x2 = try rmsNorm(g, h1, lw.post_norm, c.rms_norm_eps);
-        const f = if (lw.dense) |d| try mlp(g, d, x2) else blk: {
+        const f = if (lw.dense) |d| blk: {
+            // The last dense layer of a decode-lane call reads the first routed layer's scores: committed apart and read
+            // behind the MLP's commit, so the GPU runs the MLP while the stream reads ahead.
+            const ahead: ?T = if (rt.lookahead and !prompt and !wide and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2) else null;
+            if (ahead) |sc| try g.asyncEval(&.{sc});
+            const y = try mlp(g, d, x2);
+            if (ahead) |sc| {
+                try g.asyncEval(&.{y});
+                try ex.speculateAhead(g, w.layers[li + 1].bank_layer.?, sc);
+            }
+            break :blk y;
+        } else blk: {
             const r = try route(g, c, lw.router.?, x2);
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{ x2, r.indices, r.weights }, .router);
             const next: ?T = if (rt.lookahead and !prompt and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2) else null;
