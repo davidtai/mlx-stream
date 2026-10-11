@@ -560,11 +560,12 @@ pub fn route(g: *G, c: *const glm.Config, r: Router, x: T) !Routing {
     return .{ .indices = try g.astype(inds, .int32), .weights = w };
 }
 
-/// The routing criterion of router `r` on `x` (sigmoid + bias, f32 `[n, n_experts]`): the lookahead's predictor of the
-/// next routed layer.
+/// The routing criterion of router `r` on `x`, approximate (sigmoid + bias in f32 `[n, n_experts]` of logits in the
+/// router's dtype: one pass over its bf16 weight, not `route`'s f32 copy of it): the lookahead's predictor of the next
+/// routed layer, which picks only what is read ahead.
 pub fn routerScores(g: *G, r: Router, x: T) !T {
-    const logits = try g.matmul(try g.astype(x, .float32), try g.transpose(try g.astype(r.w, .float32)));
-    return g.astype(try g.add(try g.sigmoid(logits), r.bias), .float32);
+    const logits = try g.matmul(try g.astype(x, g.dtypeOf(r.w)), try g.transpose(r.w));
+    return g.astype(try g.add(try g.sigmoid(try g.astype(logits, .float32)), r.bias), .float32);
 }
 
 /// The quantized embedding of `ids` (`nn.QuantizedEmbedding`): the rows' codes, scales and biases dequantized.
