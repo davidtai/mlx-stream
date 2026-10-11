@@ -340,7 +340,7 @@ pub const FakeSource = struct {
 
     /// DEVROUTE: as `StreamSource.residentLut`.
     pub fn residentLut(self: *const FakeSource, layer: u32, out: []u32) void {
-        lutOf(&self.policies[layer], self, layer, out);
+        lutOf(&self.policies[layer], self, layer, out, 0);
     }
 
     pub fn decoding(self: *const FakeSource) bool {

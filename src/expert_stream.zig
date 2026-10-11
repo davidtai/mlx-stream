@@ -107,10 +107,10 @@ pub fn traceBank(g: anytype, geom: *const Layer, rows: u32) !BankArraysOf(@TypeO
 }
 
 /// DEVROUTE's resident map of one layer from its policy: each resident expert's persistent slot as its packed
-/// (bank << 24 | row) through `src.slotRef`; non-resident experts 0.
-pub fn lutOf(pol: *const expert_policy.LayerPolicy, src: anytype, layer: u32, out: []u32) void {
+/// (bank << 24 | row) through `src.slotRef`; non-resident experts `miss`.
+pub fn lutOf(pol: *const expert_policy.LayerPolicy, src: anytype, layer: u32, out: []u32, miss: u32) void {
     for (out, 0..) |*o, e| {
-        o.* = 0;
+        o.* = miss;
         if (e >= pol.n_experts) continue;
         const s = pol.slotOf(@intCast(e)) orelse continue;
         if (s >= pol.capacity) continue;
@@ -173,7 +173,7 @@ pub const StreamSource = struct {
     /// DEVROUTE: layer `layer`'s resident map as the device reads it: `out[e]` = the packed (bank << 24 | row) of
     /// expert e's persistent slot, else 0 (a miss: the device row is computed from base row 0 and never joined).
     pub fn residentLut(self: *const StreamSource, layer: u32, out: []u32) void {
-        lutOf(&self.stream.layers[layer].policy, self.stream, layer, out);
+        lutOf(&self.stream.layers[layer].policy, self.stream, layer, out, 0);
     }
 
     /// The decode phase (the grown banks; DEVROUTE's LUTs exist).

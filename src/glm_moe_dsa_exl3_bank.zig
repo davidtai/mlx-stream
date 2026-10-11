@@ -557,12 +557,19 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
 
 /// The tiny model's config with `inter` routed intermediate (the kernels' Hadamard blocks need minis of 128).
 pub fn tinyConfigInter(a: std.mem.Allocator, inter: u32) !glm.Config {
+    return tinyConfigExperts(a, inter, 16);
+}
+
+/// `tinyConfigInter` with `n_experts` routed experts (GLM-5.3's 256: its bank layers' expert count).
+pub fn tinyConfigExperts(a: std.mem.Allocator, inter: u32, n_experts: u32) !glm.Config {
     const text = try glm.tinyConfigJson(a, glm.tiny_quant);
     defer a.free(text);
     var buf: [64]u8 = undefined;
     const t2 = try std.mem.replaceOwned(u8, a, text, "\"moe_intermediate_size\":64,", try std.fmt.bufPrint(&buf, "\"moe_intermediate_size\":{d},", .{inter}));
     defer a.free(t2);
-    return glm.Config.parse(a, t2, null, null);
+    const t3 = try std.mem.replaceOwned(u8, a, t2, "\"n_routed_experts\":16,", try std.fmt.bufPrint(&buf, "\"n_routed_experts\":{d},", .{n_experts}));
+    defer a.free(t3);
+    return glm.Config.parse(a, t3, null, null);
 }
 
 pub const tmpRoot = affine.tmpRoot;

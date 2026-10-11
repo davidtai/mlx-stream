@@ -148,6 +148,17 @@ pub fn Accepted(comptime G: type) type {
             };
         }
 
+        /// `fused` over a device array of minis (`sushi_quant`'s `fusedDevice`), on sushi's chain only.
+        pub const skip_slot: ?u32 = if (decode_kernels == .sushi) sushi_quant.Accepted(G).skip_slot else null;
+
+        pub fn fusedDevice(self: *Self, g: *G, x: G.T, minis: G.T, bank: Bank) !G.T {
+            return self.sushi_math.fusedDevice(g, x, minis, bank);
+        }
+
+        pub fn decodeMinis(self: *const Self) u32 {
+            return self.sushi_math.decodeMinis();
+        }
+
         /// `fused` through these texts' GEMVs: the wave's pairs (row i, its slot) over one bank kind at score 1.
         fn fusedGlm53(self: *Self, g: *G, x: G.T, slots: []const u32, bank: Bank) !G.T {
             const m = slots.len;
@@ -518,6 +529,17 @@ test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver 
             return 2 * selfcheck.bf16Ulp(scale);
         }
     }.f);
+}
+
+test "glm53 exl3 quant: GPU_HITS at GLM-5.3's geometry (256 experts, 4 minis, two bank layers, 48 ids) keeps the host's bits and never serves a table that lags a route" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var kd: Diag = .{};
+    const set = try ks.Set.init(testing.allocator, .{ .device = .{ .stream = s } }, &kd);
+    defer set.deinit();
+    try old_quant.expectGpuHits(@This(), "glm53 exl3 quant", s, .{ .kernels = set.ref() });
 }
 
 test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's EXL3 chain agree within bf16 rounding, decode widths 1 to 6 and prompt widths" {

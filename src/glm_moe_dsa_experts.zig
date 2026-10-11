@@ -106,6 +106,35 @@ fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, parts: []cons
     return g.adopt(out);
 }
 
+/// GPU_HITS' slot lists: per routed position p and mini r (thread p x TP + r), its expert's entry in each bank layer's
+/// resident table (kind << 24 | row, or `table_miss`) as the mini row x TP + r of that bank layer's chain of its kind
+/// (base, ext), every other chain's at the skip slot.
+fn hitsSource(comptime bpl: u32) [:0]const u8 {
+    comptime var src: []const u8 =
+        \\    const uint i = thread_position_in_grid.x;
+        \\    if (i >= uint(N)) return;
+        \\    const uint p = i / uint(TP);
+        \\    const uint e = uint(ids[p]);
+        \\    const uint r = i - p * uint(TP);
+        \\    uint v;
+        \\
+    ;
+    inline for (0..bpl) |b| src = src ++ std.fmt.comptimePrint(
+        \\    v = t{d}[e];
+        \\    m{d}[i] = (v != 0xFFFFFFFFu && (v >> 24) == 0u) ? (v & 0xFFFFFFu) * uint(TP) + r : 0xFFFFFFFFu;
+        \\    m{d}[i] = (v != 0xFFFFFFFFu && (v >> 24) == 1u) ? (v & 0xFFFFFFu) * uint(TP) + r : 0xFFFFFFFFu;
+        \\
+    , .{ b, 2 * b, 2 * b + 1 });
+    return std.fmt.comptimePrint("{s}", .{src});
+}
+
+/// GPU_HITS' resident tables' entry for an expert not resident in the bank layer.
+const table_miss: u32 = 0xFFFF_FFFF;
+/// GPU_HITS: a decode wave position served on the host though the wave is 0 (the table and the plan disagree).
+const host_hit_wave: u8 = 0xFE;
+/// GPU_HITS: a position no chain serves.
+const no_chain: u8 = 0xFF;
+
 pub const BankKind = sdk_ext.expert.BankKind;
 pub const SlotRef = sdk_ext.expert.SlotRef;
 pub const max_route_ids = expert_policy.max_route_ids;
@@ -139,6 +168,19 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         pub const bpl: u32 = if (@hasDecl(Bk, "banks_per_layer")) Bk.banks_per_layer else 1;
         /// The quant fuses gate, up and down (`M.fused`): each wave runs once all its segments landed.
         const fused = @hasDecl(M, "fused_waves") and M.fused_waves;
+        /// GPU_HITS: each decode call's resident experts start on the GPU right after the router: the routed ids through
+        /// each bank layer's resident table (`tables`) into the quant's decode chain over every position (`fusedDevice`),
+        /// committed with the hoisted arrays before the host waits on the ids; after the barrier the host builds only the
+        /// parts (transient hits, hits the table did not serve, misses). The same experts, rows and combine as the host's
+        /// hit wave. MLX on a GPU stream, a bank of several bank layers per routed layer, a quant whose decode wave runs
+        /// over a device array of minis with a skip slot (`fusedDevice`, `skip_slot`, `decodeMinis`); every other call
+        /// (the prompt phase, a CPU stream, non-bf16 rows, the wide lane) runs the host's hit wave.
+        pub const gpu_hits_able = G == ops.MlxOps and bpl > 1 and @hasDecl(M, "fusedDevice") and M.skip_slot != null;
+        const hits_source = hitsSource(bpl);
+        comptime {
+            // The kernel's literal: the tables' miss and the quant's skip slot.
+            if (gpu_hits_able and (M.skip_slot.? != 0xFFFF_FFFF or table_miss != 0xFFFF_FFFF)) @compileError("GPU_HITS' sentinels are 0xFFFFFFFF");
+        }
         comptime {
             if (bpl > 1 and !fused) @compileError("a bank of several bank layers per routed layer streams through a fused quant");
         }
@@ -161,6 +203,33 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         host: HostSplit = .{},
         /// The wide lane's combine on the GPU (`combine_source`), built at its first call.
         combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
+        /// GPU_HITS: per bank layer its resident table, u32 [n_experts] in host memory the GPU reads: expert e's
+        /// persistent slot as kind << 24 | row (`expert_stream.lutOf`), else `table_miss`. Empty without GPU_HITS.
+        ///
+        /// The invariant: at a call's lookup, each table is its bank layer's policy as the call's route will plan from.
+        /// - In the decode phase a bank layer's residency changes only in its own route (`promote` and the read-ahead
+        ///   seed are the prompt's), and `grow` writes every table.
+        /// - `stamps[sl]` is bank layer sl's routed records (`routeStamp`) when its table was written. A GPU_HITS call
+        ///   writes the table of each bank layer it routed right after the route; before every lookup, `gpuHits`
+        ///   rewrites a table whose stamp lags (a route outside GPU_HITS: the wide lane, a call whose tables held no
+        ///   resident). So a table never lags a route at its lookup.
+        /// - One buffer is enough: the GPU reads a table only in the lookup, which has ended when the call's routing
+        ///   barrier returns; the host writes a table only after that barrier, or before the next lookup is committed.
+        /// - The plan checks the table anyway: a hit is the GPU's only when the table word the lookup read is the plan's
+        ///   slot; any other hit, and every word that names a slot for an expert the plan does not hit, is the host's
+        ///   (`gpu_mismatch`). The GPU never serves a row the plan does not.
+        tables: []T = &.{},
+        /// Per bank layer, whether its table holds a base and an ext resident (a chain runs only for a kind it holds).
+        held: [][2]bool = &.{},
+        stamps: []u64 = &.{},
+        /// The tables hold the policies: from `grow` to `shrink` (the decode phase).
+        tables_live: bool = false,
+        hits_kernel: ?mlx.mlx_fast_metal_kernel = null,
+        /// GPU_HITS' counts: the hits the GPU served; the hits and words the plan's check gave the host (0 under the
+        /// invariant); the tables rewritten before a lookup because their stamp lagged.
+        gpu_served: u64 = 0,
+        gpu_mismatch: u64 = 0,
+        gpu_stale: u64 = 0,
 
         /// The routes of the prompt layer whose misses were read at its start (`stageMisses`): each route's bank layer and
         /// experts, in route order; null once the call took it.
@@ -211,11 +280,42 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 b.* = @splat(null);
                 for ([_]BankKind{ .base, .transient }) |kind| b[@backingInt(kind)] = try bind(stream, @intCast(l), kind);
             }
-            _ = g;
-            return .{ .a = a, .stream = stream, .math = math, .hidden = @intCast(hidden), .n_experts = stream.bank.n_experts, .banks = banks, .opt = opt };
+            var self: Self = .{ .a = a, .stream = stream, .math = math, .hidden = @intCast(hidden), .n_experts = stream.bank.n_experts, .banks = banks, .opt = opt };
+            if (comptime gpu_hits_able) try self.initTables(g);
+            return self;
+        }
+
+        /// GPU_HITS: every bank layer's table, all `table_miss` until `grow` writes them.
+        fn initTables(self: *Self, g: *G) !void {
+            const n = self.stream.layers.len;
+            const held = try self.a.alloc([2]bool, n);
+            errdefer self.a.free(held);
+            @memset(held, .{ false, false });
+            const stamps = try self.a.alloc(u64, n);
+            errdefer self.a.free(stamps);
+            @memset(stamps, 0);
+            const tables = try self.a.alloc(T, n);
+            errdefer self.a.free(tables);
+            const none = try self.a.alloc(u32, self.n_experts);
+            defer self.a.free(none);
+            @memset(none, table_miss);
+            for (tables, 0..) |*t, i| t.* = g.keep(g.hostArray(std.mem.sliceAsBytes(none), &.{@intCast(self.n_experts)}, .uint32) catch |e| {
+                for (tables[0..i]) |x| g.release(x);
+                return e;
+            });
+            self.tables = tables;
+            self.held = held;
+            self.stamps = stamps;
         }
 
         pub fn deinit(self: *Self, g: *G) void {
+            for (self.tables) |x| g.release(x);
+            if (self.tables.len > 0) {
+                self.a.free(self.tables);
+                self.a.free(self.held);
+                self.a.free(self.stamps);
+            }
+            if (self.hits_kernel) |kern| _ = mlx.mlx_fast_metal_kernel_free(kern);
             if (self.combine_kernel) |kern| _ = mlx.mlx_fast_metal_kernel_free(kern);
             self.staged.experts.deinit(self.a);
             self.wide.deinit(self.a, g);
@@ -254,10 +354,36 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 b[@backingInt(BankKind.transient)] = try bind(self.stream, @intCast(l), .transient);
             }
             self.transient_released = false;
+            if (comptime gpu_hits_able) for (0..self.tables.len) |l| self.writeTable(@intCast(l));
+            self.tables_live = self.tables.len > 0;
+        }
+
+        /// GPU_HITS: bank layer `sl`'s table from its policy, stamped.
+        fn writeTable(self: *Self, sl: u32) void {
+            const words = self.tableWords(sl);
+            expert_stream.lutOf(&self.stream.layers[sl].policy, self.stream, sl, words, table_miss);
+            self.held[sl] = .{ false, false };
+            for (words) |w| if (w != table_miss) {
+                self.held[sl][w >> 24] = true;
+            };
+            self.stamps[sl] = self.routeStamp(sl);
+        }
+
+        /// Bank layer `sl`'s routed records so far: every route of it adds its ids (each a hit or a miss), so the count
+        /// moves at each of its routes and only then.
+        fn routeStamp(self: *const Self, sl: u32) u64 {
+            const c = self.stream.layerCounts(sl);
+            return c.hits + c.misses;
+        }
+
+        fn tableWords(self: *const Self, sl: u32) []u32 {
+            const p = mlx.mlx_array_data_uint32(self.tables[sl]).?;
+            return @constCast(p)[0..self.n_experts];
         }
 
         /// The reverse phase change's free: the grown rows' and window 0's bindings nulled, then the stream frees them.
         pub fn shrink(self: *Self, prompt_rows: []const u32) !u64 {
+            self.tables_live = false;
             for (self.banks) |*b| {
                 b[@backingInt(BankKind.ext)] = null;
                 b[@backingInt(BankKind.transient)] = null;
@@ -644,6 +770,12 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             var score_buf: [sdk_ext.expert.lookahead.max_rows * 512]f32 = undefined;
             var sc: []const f32 = &.{};
             const read_next = next_scores != null and self.stream.route_lookahead and n * self.n_experts <= score_buf.len;
+            // GPU_HITS: each position's chain (2 x bank layer + kind) when the GPU serves it, else none.
+            var dev_chain: [max_route_ids]u8 = @splat(no_chain);
+            const chains = if (comptime gpu_hits_able) try self.gpuHits(g, layer, x, indices, if (read_next) next_scores.? else null, n, k, hoist) else @as([2 * bpl]?T, @splat(null));
+            const gpu = for (chains) |c| {
+                if (c != null) break true;
+            } else false;
             if (read_next) {
                 try g.evalAll(&.{ indices, next_scores.? });
                 sc = try g.hostF32(next_scores.?, score_buf[0 .. n * self.n_experts]);
@@ -685,23 +817,25 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 var parts: [max_route_ids][]const expert_policy.Load = undefined;
                 for (0..r.n_parts) |p| parts[p] = r.partLoads(@intCast(p), &bufs[p]);
                 expert_stream.wavesOf(&r.plan, r.hit_slots[0..r.plan.n_hits], parts[0..r.n_parts], sd.waves[0..sd.n]);
+                if (comptime gpu_hits_able) if (gpu) self.gpuServed(sd, @intCast(i), &chains, &dev_chain);
             }
             if (comptime timeline.enabled) timeline.point(layer, .route, 0, false);
             const t2 = timeline.now();
             defer self.noteHost(t0, t1, t2);
             var acc: Acc = .{};
-            // Every route's hit wave and the hoisted arrays in one commit, ahead of every wait on a read.
+            // Every route's hit wave and the hoisted arrays in one commit, ahead of every wait on a read (GPU_HITS: the
+            // hits its tables did not serve, the hoisted arrays already committed).
             var early: [bpl * n_banks + 4]T = undefined;
             var n_early: usize = 0;
-            for (&sides) |*sd| if (sd.r != null) for (try self.fusedWave(g, sd, x, k, 0, &acc, null)) |o| {
+            for (&sides) |*sd| if (sd.r != null) for (try self.fusedWave(g, sd, x, k, if (gpu) host_hit_wave else 0, &acc, null)) |o| {
                 early[n_early] = o;
                 n_early += 1;
             };
-            for (hoist) |h| {
+            if (!gpu) for (hoist) |h| {
                 if (n_early == early.len) break;
                 early[n_early] = h;
                 n_early += 1;
-            }
+            };
             if (n_early > 0) try g.asyncEval(early[0..n_early]);
             if (comptime timeline.enabled) timeline.point(layer, .hit, 0, false);
             var prev: []const T = &.{};
@@ -736,11 +870,160 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 self.stream.release(r);
                 sd.r = null;
             };
-            const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
+            // The join: the GPU's chains (each every position's row) first, then the host's waves; each position its row.
+            var srcs: [2 * bpl + 2 * max_route_ids]T = undefined;
+            var n_src: usize = 0;
+            var at: [2 * bpl]u32 = undefined;
+            for (chains, &at) |c, *o| if (c) |y| {
+                o.* = @intCast(n_src * n_ids);
+                srcs[n_src] = y;
+                n_src += 1;
+            };
+            const host0: u32 = @intCast(n_src * n_ids);
+            @memcpy(srcs[n_src..][0..acc.n_outs], acc.outs[0..acc.n_outs]);
+            n_src += acc.n_outs;
             var order: [max_route_ids]u32 = undefined;
-            for (acc.pos[0..acc.n_pos], 0..) |p, j| order[p] = @intCast(j);
+            for (acc.pos[0..acc.n_pos], 0..) |p, j| order[p] = host0 + @as(u32, @intCast(j));
+            for (dev_chain[0..n_ids], order[0..n_ids], 0..) |c, *o, p| if (c != no_chain) {
+                o.* = at[c] + @as(u32, @intCast(p));
+            };
+            const joined = try g.concat(srcs[0..n_src], 0);
             const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
             return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+        }
+
+        /// GPU_HITS on this call: installed, the tables live (the decode phase), a call within the decode lane on the GPU,
+        /// bf16 rows.
+        fn gpuOn(self: *const Self, g: *G, x: T, n: u32, k: u32) bool {
+            return self.tables_live and self.stream.phase == .decode and n * k <= max_route_ids and
+                g.dtypeOf(x) == .bfloat16 and mlx.streamIsGpu(g.s);
+        }
+
+        /// GPU_HITS: the routed ids through each bank layer's table (one launch, committed with the routing barrier's
+        /// arrays), then per bank layer and resident kind the quant's decode chain over every position at x's row p / k,
+        /// committed with the hoisted arrays; nothing waits. Each chain's output (`[n x k, hidden]`, by position), or null
+        /// where it has no resident (every chain null: GPU_HITS is off for the call).
+        fn gpuHits(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) ![2 * bpl]?T {
+            var chains: [2 * bpl]?T = @splat(null);
+            if (!self.gpuOn(g, x, n, k)) return chains;
+            // The invariant (`tables`): a table whose bank layer routed since its write is rewritten before the lookup.
+            for (0..bpl) |side| {
+                const sl = bpl * layer + @as(u32, @intCast(side));
+                if (self.stamps[sl] == self.routeStamp(sl)) continue;
+                self.writeTable(sl);
+                self.gpu_stale += 1;
+            }
+            const n_ids = n * k;
+            const minis = try self.hitMinis(g, layer, indices, n_ids);
+            var bar: [2 + 2 * bpl]T = undefined;
+            bar[0] = indices;
+            var n_bar: usize = 1;
+            if (next_scores) |ns| {
+                bar[1] = ns;
+                n_bar = 2;
+            }
+            @memcpy(bar[n_bar..][0 .. 2 * bpl], &minis);
+            n_bar += 2 * bpl;
+            try g.asyncEval(bar[0..n_bar]);
+            var tok: [max_route_ids]i32 = undefined;
+            for (tok[0..n_ids], 0..) |*t, p| t.* = @intCast(p / k);
+            const xr = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(tok[0..n_ids]), &.{@intCast(n_ids)}, .int32), 0);
+            var early: [2 * bpl + 4]T = undefined;
+            var n_early: usize = 0;
+            for (0..bpl) |side| for ([_]BankKind{ .base, .ext }, 0..) |kind, ki| {
+                const sl = bpl * layer + @as(u32, @intCast(side));
+                if (!self.held[sl][ki]) continue;
+                const arrays = self.banks[sl][@backingInt(kind)] orelse continue;
+                const y = try self.math.fusedDevice(g, xr, minis[2 * side + ki], arrays);
+                chains[2 * side + ki] = y;
+                early[n_early] = y;
+                n_early += 1;
+            };
+            if (n_early == 0) return chains;
+            for (hoist) |h| {
+                if (n_early == early.len) break;
+                early[n_early] = h;
+                n_early += 1;
+            }
+            try g.asyncEval(early[0..n_early]);
+            // The barrier: the tables' read has ended when it returns.
+            try g.evalAll(bar[0..n_bar]);
+            return chains;
+        }
+
+        /// GPU_HITS: the plan's check of side `sd`'s table (`tables`), then its table from the policy its route left.
+        /// Position p's word is the plan's when it is the hit's persistent slot (kind << 24 | row), or `table_miss` for a
+        /// miss or a transient hit. A persistent hit whose word is the plan's is the GPU's (`dev_chain`); every other hit
+        /// goes to the host's wave (`host_hit_wave`); a word that is not the plan's is counted (`gpu_mismatch`).
+        fn gpuServed(self: *Self, sd: *Side, side: u32, chains: *const [2 * bpl]?T, dev_chain: *[max_route_ids]u8) void {
+            const words = self.tableWords(sd.sl);
+            for (sd.waves[0..sd.n], sd.refs[0..sd.n], sd.ids[0..sd.n], sd.pos[0..sd.n]) |*w, ref, e, pos| {
+                const hit = w.* == 0;
+                const want: u32 = if (hit and ref.bank != .transient) @as(u32, @backingInt(ref.bank)) << 24 | ref.row else table_miss;
+                const c = 2 * side + (want >> 24);
+                if (words[e] != want) {
+                    self.gpu_mismatch += 1;
+                } else if (want != table_miss and chains[c] != null) {
+                    dev_chain[pos] = @intCast(c);
+                    self.gpu_served += 1;
+                    continue;
+                }
+                if (hit) w.* = host_hit_wave;
+            }
+            self.writeTable(sd.sl);
+        }
+
+        /// GPU_HITS: one launch of `hitsSource` over routed layer `layer`'s bank layers' tables: per chain (2 x bank layer
+        /// + kind) its minis u32 [n_ids x minis per pair].
+        fn hitMinis(self: *Self, g: *G, layer: u32, indices: T, n_ids: u32) ![2 * bpl]T {
+            const names = comptime blk: {
+                var v: [1 + bpl][*:0]const u8 = undefined;
+                v[0] = "ids";
+                for (0..bpl) |b| v[1 + b] = std.fmt.comptimePrint("t{d}", .{b});
+                break :blk v;
+            };
+            const outs = comptime blk: {
+                var v: [2 * bpl][*:0]const u8 = undefined;
+                for (0..2 * bpl) |c| v[c] = std.fmt.comptimePrint("m{d}", .{c});
+                break :blk v;
+            };
+            const kern = self.hits_kernel orelse blk: {
+                const iv = mlx.mlx_vector_string_new_data(&names, names.len);
+                defer _ = mlx.mlx_vector_string_free(iv);
+                const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+                defer _ = mlx.mlx_vector_string_free(ov);
+                const kn = mlx.mlx_fast_metal_kernel_new("glm_moe_dsa_gpu_hits", iv, ov, hits_source, "", true, false);
+                if (kn.ctx == null) return error.MetalKernelCompileFailed;
+                self.hits_kernel = kn;
+                break :blk kn;
+            };
+            const tp = self.math.decodeMinis();
+            const total: c_int = @intCast(n_ids * tp);
+            const cfg = mlx.mlx_fast_metal_kernel_config_new();
+            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            for (0..2 * bpl) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{total}, 1, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, total, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(total, 256), 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", total));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TP", @intCast(tp)));
+            var inputs: [1 + bpl]mlx.mlx_array = undefined;
+            inputs[0] = try g.reshape(indices, &.{@intCast(n_ids)});
+            for (0..bpl) |b| inputs[1 + b] = self.tables[bpl * layer + b];
+            const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+            defer _ = mlx.mlx_vector_array_free(iv);
+            var ov = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ov);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
+            var res: [2 * bpl]T = undefined;
+            for (&res, 0..) |*r, c| {
+                var o = mlx.mlx_array_new();
+                mlx.check(mlx.mlx_vector_array_get(&o, ov, c)) catch |e| {
+                    _ = mlx.mlx_array_free(o);
+                    return e;
+                };
+                r.* = try g.adopt(o);
+            }
+            return res;
         }
 
         /// Side `sd`'s positions in wave `w`, grouped by bank in first appearance: each group's rows of x through the

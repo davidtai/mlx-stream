@@ -98,6 +98,22 @@ pub fn Accepted(comptime G: type) type {
             return self.run(g, xs, rows.slot, bank, false);
         }
 
+        /// The minis per routed pair (each pair's slot row s holds minis s x tp + r).
+        pub fn decodeMinis(self: *const Self) u32 {
+            return self.tp;
+        }
+
+        /// A decode-chain mini that the chain skips (`fusedDevice`); null on a host whose sushi has no skip.
+        pub const skip_slot: ?u32 = if (@hasDecl(sushi.kernels, "SKIP_SLOT")) sushi.kernels.SKIP_SLOT else null;
+
+        /// One decode wave whose minis are a device array: `x [m, hidden]` (each pair's row), `minis` u32 [m x tp] (pair
+        /// i's slot row s as s x tp + r, or all `skip_slot` for a pair the wave does not serve) -> `[m, hidden]`, a
+        /// served pair's row the bits `fused` gives it, a skipped pair's row unwritten.
+        pub fn fusedDevice(self: *Self, g: *G, x: G.T, minis: G.T, bank: Bank) !G.T {
+            const m: usize = @intCast(g.shapeOf(x).dim(0));
+            return self.runInds(g, x, try g.reshape(minis, &.{ 1, @intCast(m), @intCast(self.tp) }), m, bank, true);
+        }
+
         fn run(self: *Self, g: *G, x: G.T, slots: []const u32, bank: Bank, decode_chain: bool) !G.T {
             const m = slots.len;
             const tp: usize = self.tp;
@@ -105,6 +121,12 @@ pub fn Accepted(comptime G: type) type {
             for (slots, 0..) |s, i| for (0..tp) |r| {
                 self.minis.items[i * tp + r] = s * self.tp + @as(u32, @intCast(r));
             };
+            const inds = try g.hostArray(std.mem.sliceAsBytes(self.minis.items), &.{ 1, @intCast(m), @intCast(tp) }, .uint32);
+            return self.runInds(g, x, inds, m, bank, decode_chain);
+        }
+
+        fn runInds(self: *Self, g: *G, x: G.T, inds: G.T, m: usize, bank: Bank, decode_chain: bool) !G.T {
+            const tp: usize = self.tp;
             if (self.ones.items.len < m * tp) {
                 try self.ones.resize(self.a, m * tp);
                 @memset(self.ones.items, 1);
@@ -112,7 +134,6 @@ pub fn Accepted(comptime G: type) type {
             const mc: c_int = @intCast(m);
             const tc: c_int = @intCast(tp);
             const h: c_int = @intCast(self.spec.hidden);
-            const inds = try g.hostArray(std.mem.sliceAsBytes(self.minis.items), &.{ 1, mc, tc }, .uint32);
             const sc = try g.hostArray(std.mem.sliceAsBytes(self.ones.items[0 .. m * tp]), &.{ 1, mc, tc }, .float32);
             const sb: sushi.Bank = .{
                 .gate = .{ .trellis = bank.gate.trellis, .suh = bank.gate.suh, .svh = bank.gate.svh },
@@ -341,7 +362,9 @@ pub fn hostMoe(img: []const u8, b: *const bank_mod.Bank, layer: u32, xs: []const
 /// bank layers, every lane (the prompt's wide lane, the decode lane), host waits and event gates, on the GPU stream `s`
 /// (tests). `Q` is the quant (its `Accepted` and `accept`; `ctx` its accept context, the bank's peek added), `label`
 /// the lines' name, `widths` the calls' rows (0: the phase change), `bound(scale)` the largest |delta| allowed at
-/// outputs up to `scale`. One body for every EXL3 quant over this bank.
+/// outputs up to `scale`. Each mode runs with GPU_HITS off (`tables_live` false: the host's hit wave serves every hit) and
+/// on (where the quant has it): the same calls give the same bits, and the GPU serves hits. One body for every EXL3 quant
+/// over this bank.
 pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.mlx_stream, ctx: quant.Context, widths: []const u32, comptime bound: fn (f32) f32) !void {
     const a = testing.allocator;
     const graph = @import("glm_moe_dsa_graph.zig");
@@ -360,10 +383,17 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
     defer b.deinit();
     const h: usize = c.hidden_size;
     const k = 8;
-    var rng = std.Random.DefaultPrng.init(11);
     var worst: f32 = 0;
     var scale: f32 = 0;
-    for ([_]bool{ false, true }) |gated| {
+    var off_bits: std.ArrayList(f32) = .empty;
+    defer off_bits.deinit(a);
+    for ([_][2]bool{ .{ false, false }, .{ false, true }, .{ true, false }, .{ true, true } }) |mode| {
+        const gated = mode[0];
+        const gpu = mode[1];
+        if (gpu and !Ex.gpu_hits_able) continue;
+        if (!gpu) off_bits.clearRetainingCapacity();
+        var at: usize = 0;
+        var rng = std.Random.DefaultPrng.init(11);
         var g = try G.init(a, s);
         defer g.deinit();
         var ev: ?expert_event.Event = null;
@@ -388,6 +418,7 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
             if (n == 0) {
                 _ = try ex.releaseTransient();
                 try ex.grow(&decode_rows);
+                if (!gpu) ex.tables_live = false;
                 continue;
             }
             for (0..4) |layer| {
@@ -426,15 +457,170 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
                     scale = @max(scale, @abs(wv));
                     worst = @max(worst, @abs(wv - gv));
                 }
+                if (gpu) {
+                    try testing.expectEqualSlices(u32, @ptrCast(off_bits.items[at..][0 .. n * h]), @ptrCast(got[0 .. n * h]));
+                } else try off_bits.appendSlice(a, got[0 .. n * h]);
+                at += n * h;
             }
         }
         const stats = st.stats();
-        std.debug.print(label ++ " [{s}]: {d} routes, {d} hits, {d} misses, {d} B read, lookahead {d} issued / {d} used\n", .{ if (gated) "event gates" else "host waits", stats.route_calls, stats.expert_cache_hits, stats.expert_cache_misses, stats.expert_bytes_read, stats.spec_issued, stats.claimed });
+        std.debug.print(label ++ " [{s}{s}]: {d} routes, {d} hits, {d} misses, {d} B read, lookahead {d} issued / {d} used, {d} hits on the GPU\n", .{ if (gated) "event gates" else "host waits", if (gpu) ", GPU_HITS" else "", stats.route_calls, stats.expert_cache_hits, stats.expert_cache_misses, stats.expert_bytes_read, stats.spec_issued, stats.claimed, ex.gpu_served });
         try testing.expect(stats.expert_cache_misses > 0 and stats.transient_loads > 0);
+        if (gpu) {
+            try testing.expect(ex.gpu_served > 0);
+            try testing.expectEqual(@as(u64, 0), ex.gpu_mismatch);
+        } else try testing.expectEqual(@as(u64, 0), ex.gpu_served);
     }
     std.debug.print(label ++ ": streamed MoE against the host decode, max |delta| {d:.5} at outputs up to {d:.3}\n", .{ worst, scale });
     try testing.expect(scale > 0.1);
     try testing.expect(worst <= bound(scale));
+}
+
+/// GPU_HITS at GLM-5.3's geometry: 256 experts in two bank layers of 128, 4 minis each, decode calls of 1 to 6 rows of 8
+/// ids (48 at the widest), most ids among each layer's hot experts, host waits and event gates. Every call's output has
+/// the bits of the same call with GPU_HITS off (`tables_live` false: the host's hit wave serves every hit), and the GPU
+/// serves hits. A table that lags one route is caught, never served: put back after each decode call to its words, held
+/// kinds and stamp from before the call's route, the next lookup rewrites it (`gpu_stale`); put back to its words and
+/// held kinds only (its stamp current: a write the driver missed), the plan's check gives every hit whose word is not the
+/// plan's to the host (`gpu_mismatch`), and the bits stay the off path's.
+pub fn expectGpuHits(comptime Q: type, comptime label: []const u8, s: mlx.mlx_stream, ctx: quant.Context) !void {
+    const a = testing.allocator;
+    const graph = @import("glm_moe_dsa_graph.zig");
+    const G = graph.G;
+    const experts_mod = @import("glm_moe_dsa_experts.zig");
+    const expert_event = sdk_ext.expert.event;
+    const Ex = experts_mod.Experts(G, bank_mod, Q.Accepted(G));
+    if (!Ex.gpu_hits_able) return error.SkipZigTest;
+    const n_experts = 256;
+    const hot = 96;
+    var c = try bank_mod.tinyConfigExperts(a, 512, n_experts);
+    defer c.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try bank_mod.writeSynth(a, testing.io, tmp.dir, &c, .{ .signs = true });
+    defer a.free(img);
+    var rbuf: [512]u8 = undefined;
+    var b = try bank_mod.Bank.open(a, testing.io, try bank_mod.tmpRoot(&tmp, &rbuf), &c, null);
+    defer b.deinit();
+    try testing.expectEqual(@as(u32, n_experts), b.n_experts);
+    const h: usize = c.hidden_size;
+    const k = 8;
+    const n_sl = 8;
+    const Lag = enum { none, stamp, words };
+    const Mode = struct { gpu: bool, lag: Lag };
+    const modes = [_]Mode{ .{ .gpu = false, .lag = .none }, .{ .gpu = true, .lag = .none }, .{ .gpu = true, .lag = .stamp }, .{ .gpu = true, .lag = .words } };
+    // The prompt (the wide lane at 9 rows, the decode lane at 3), the phase change, then decode calls of 1 to 6 rows.
+    const widths = [_]u32{ 9, 9, 3, 0, 1, 6, 3, 6, 4, 2, 5, 6, 1, 6, 3 };
+    var off_bits: std.ArrayList(u32) = .empty;
+    defer off_bits.deinit(a);
+    for ([_]bool{ false, true }) |gated| for (modes) |mode| {
+        if (!mode.gpu) off_bits.clearRetainingCapacity();
+        var at: usize = 0;
+        var rng = std.Random.DefaultPrng.init(29);
+        var g = try G.init(a, s);
+        defer g.deinit();
+        var ev: ?expert_event.Event = null;
+        if (gated) ev = try expert_event.createMetal();
+        const prompt_rows: [n_sl]u32 = @splat(32);
+        const decode_rows: [n_sl]u32 = @splat(64);
+        const st = try bank_mod.Stream.Stream.init(a, &b, .{ .rows = &prompt_rows, .max_route_ids = 48, .transient_rows = 96, .wide_depth = 2, .transient_release = true, .records_per_part = 2, .slot_memory = .{ .mlx = s }, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 4096 }, .lookahead = .{ .k = 8, .budget = 2 }, .event = if (ev) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = 2000 } else null });
+        defer st.deinit();
+        var diag: Diag = .{};
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const p = try b.peek(arena.allocator());
+        var qctx = ctx;
+        qctx.peek = &p;
+        const math = try Q.accept(G, a, &g, qctx, .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = k, .n_layers = 4, .act = .swiglu, .input = .bfloat16 }, &diag);
+        defer math.deinit(&g);
+        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .gated = gated, .event = ev, .wide_depth = 2 });
+        defer ex.deinit(&g);
+        var decoding = false;
+        for (widths) |n| {
+            if (n == 0) {
+                _ = try ex.releaseTransient();
+                try ex.grow(&decode_rows);
+                if (!mode.gpu) ex.tables_live = false;
+                decoding = true;
+                continue;
+            }
+            for (0..4) |layer| {
+                const m = g.mark();
+                defer g.resetTo(m);
+                var xs: [9 * 128]f32 = undefined;
+                for (xs[0 .. n * h]) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
+                var ids32: [9 * k]i32 = undefined;
+                var sc: [9 * k]f32 = undefined;
+                for (0..n) |row| {
+                    var j: usize = 0;
+                    while (j < k) {
+                        const e: i32 = @intCast(if (rng.random().uintLessThan(u32, 8) != 0) rng.random().uintLessThan(u32, hot) else rng.random().uintLessThan(u32, n_experts));
+                        if (std.mem.indexOfScalar(i32, ids32[row * k ..][0..j], e) != null) continue;
+                        ids32[row * k + j] = e;
+                        sc[row * k + j] = 0.05 + rng.random().float(f32) * 0.2;
+                        j += 1;
+                    }
+                }
+                const nc: c_int = @intCast(n);
+                const xb = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs[0 .. n * h]), &.{ nc, @intCast(h) }, .float32), .bfloat16);
+                var next: [9 * n_experts]f32 = undefined;
+                for (next[0 .. n * n_experts]) |*v| v.* = rng.random().float(f32);
+                const nx = try g.hostArray(std.mem.sliceAsBytes(next[0 .. n * n_experts]), &.{ nc, n_experts }, .float32);
+                // The tables of the layer's bank layers before the call's route (each bank layer's table, held kinds, stamp).
+                var words: [2][n_experts]u32 = undefined;
+                var held: [2][2]bool = undefined;
+                var stamps: [2]u64 = undefined;
+                const lag = decoding and mode.lag != .none;
+                if (lag) for (0..2) |side| {
+                    const sl = 2 * layer + side;
+                    @memcpy(&words[side], mlx.mlx_array_data_uint32(ex.tables[sl]).?[0..n_experts]);
+                    held[side] = ex.held[sl];
+                    stamps[side] = ex.stamps[sl];
+                };
+                const y = try ex.call(&g, @intCast(layer), xb, try g.hostArray(std.mem.sliceAsBytes(ids32[0 .. n * k]), &.{ nc, k }, .int32), try g.hostArray(std.mem.sliceAsBytes(sc[0 .. n * k]), &.{ nc, k }, .float32), nx, &.{});
+                var got: [9 * 128]f32 = undefined;
+                _ = try g.hostF32(try g.astype(y, .float32), got[0 .. n * h]);
+                try ex.flush();
+                if (lag) for (0..2) |side| {
+                    const sl = 2 * layer + side;
+                    @memcpy(@constCast(mlx.mlx_array_data_uint32(ex.tables[sl]).?)[0..n_experts], &words[side]);
+                    ex.held[sl] = held[side];
+                    if (mode.lag == .stamp) ex.stamps[sl] = stamps[side];
+                };
+                const bits: []const u32 = @ptrCast(got[0 .. n * h]);
+                if (mode.gpu) {
+                    try testing.expectEqualSlices(u32, off_bits.items[at..][0 .. n * h], bits);
+                } else try off_bits.appendSlice(a, bits);
+                at += n * h;
+            }
+        }
+        const stats = st.stats();
+        std.debug.print(label ++ " at 256 experts [{s}, GPU_HITS {s}{s}]: {d} routes, {d} hits, {d} misses, {d} hits on the GPU, {d} words the plan's check refused, {d} stale tables rewritten\n", .{ if (gated) "event gates" else "host waits", if (mode.gpu) "on" else "off", switch (mode.lag) {
+            .none => "",
+            .stamp => ", tables a route behind",
+            .words => ", tables a route behind, stamps current",
+        }, stats.route_calls, stats.expert_cache_hits, stats.expert_cache_misses, ex.gpu_served, ex.gpu_mismatch, ex.gpu_stale });
+        try testing.expect(stats.expert_cache_misses > 0);
+        if (!mode.gpu) {
+            try testing.expectEqual(@as(u64, 0), ex.gpu_served);
+            continue;
+        }
+        try testing.expect(ex.gpu_served > 0);
+        switch (mode.lag) {
+            .none => {
+                try testing.expectEqual(@as(u64, 0), ex.gpu_mismatch);
+                try testing.expectEqual(@as(u64, 0), ex.gpu_stale);
+            },
+            .stamp => {
+                try testing.expectEqual(@as(u64, 0), ex.gpu_mismatch);
+                try testing.expect(ex.gpu_stale > 0);
+            },
+            .words => {
+                try testing.expect(ex.gpu_mismatch > 0);
+                try testing.expectEqual(@as(u64, 0), ex.gpu_stale);
+            },
+        }
+    };
 }
 
 test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's host decode of the records: both bank layers, every lane, host waits and event gates" {
@@ -448,4 +634,12 @@ test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's hos
             return 0.03 * scale;
         }
     }.f);
+}
+
+test "glm exl3 quant: GPU_HITS at GLM-5.3's geometry (256 experts, 4 minis, two bank layers, 48 ids) keeps the host's bits and never serves a table that lags a route" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    try expectGpuHits(@This(), "glm exl3 quant", s, .{});
 }
