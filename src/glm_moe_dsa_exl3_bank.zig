@@ -792,6 +792,14 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
             }
         }
     }
+    // Their top-k positions in the one row (5, 2, 6, 7 at 0 .. 3), each in its own bank layer: each read ahead and routed.
+    const br = s.lookaheadByRank();
+    for ([_]u16{ 5, 2, 6, 7 }, [_]u1{ 1, 0, 0, 1 }, 0..) |e, sd, r| {
+        try testing.expectEqual(@as(u32, 2) + sd, b.streamLayer(1, e));
+        try testing.expectEqual([2]u64{ 1, 1 }, br[sd][r]);
+        try testing.expectEqual([2]u64{ 0, 0 }, br[1 - sd][r]);
+    }
+    for (br) |side| for (side[4..]) |x| try testing.expectEqual([2]u64{ 0, 0 }, x);
     s.release(q0);
     s.release(q1);
     try s.flush();

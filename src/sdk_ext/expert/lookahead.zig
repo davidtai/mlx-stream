@@ -37,6 +37,8 @@ pub fn SelectorOf(comptime routed_top_k: u32) type {
         /// inf keeps each row's plain top-K.
         tau: f32,
         budget: u32,
+        /// Candidates of a row's top-k position at or past this are never read ahead (`max_k`: none dropped).
+        max_rank: u32 = max_k,
         seen: std.DynamicBitSetUnmanaged,
 
         pub fn init(a: std.mem.Allocator, n_experts: u32, k: u32, tau: f32, budget: u32) !Selector {
@@ -58,12 +60,12 @@ pub fn SelectorOf(comptime routed_top_k: u32) type {
                 fn f(p: *const LayerPolicy, e: u16) bool {
                     return p.slotOf(e) != null;
                 }
-            }.f, out);
+            }.f, out, null);
         }
 
         /// `select` with the residency asked of `resident(ctx, expert)` (the next layer's experts over several
         /// policies: one per bank layer).
-        pub fn selectWith(self: *Selector, scores: []const f32, ctx: anytype, comptime resident: fn (@TypeOf(ctx), u16) bool, out: []u16) []u16 {
+        pub fn selectWith(self: *Selector, scores: []const f32, ctx: anytype, comptime resident: fn (@TypeOf(ctx), u16) bool, out: []u16, ranks: ?[]u8) []u16 {
             std.debug.assert(scores.len % self.n_experts == 0 and scores.len / self.n_experts <= max_rows);
             var entries: [max_rows * max_k]Entry = undefined;
             const ordered = self.order(scores, &entries);
@@ -72,6 +74,7 @@ pub fn SelectorOf(comptime routed_top_k: u32) type {
                 if (self.seen.isSet(en.expert)) continue;
                 self.seen.set(en.expert);
                 if (resident(ctx, en.expert)) continue;
+                if (ranks) |r| r[n] = en.rank;
                 out[n] = en.expert;
                 n += 1;
                 if (n == out.len) break;
@@ -104,6 +107,7 @@ pub fn SelectorOf(comptime routed_top_k: u32) type {
                 for (top[0..cnt], 0..) |e, rank| {
                     const v = row[e];
                     if (finite and !(v >= threshold)) continue;
+                    if (rank >= self.max_rank) continue;
                     entries[n] = .{ .rank = @intCast(rank), .score = v, .expert = e };
                     n += 1;
                 }

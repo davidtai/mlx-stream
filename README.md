@@ -202,6 +202,7 @@ Settings (`model-settings.json`):
 | `mtp_acceptance` | `exact` or `typical` | `exact` |
 | `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |
 | `expert_lookahead_budget` | the decode lookahead's records read ahead per routed call, 1 to 4 | 2 |
+| `expert_lookahead_max_rank` | the decode lookahead reads ahead only the candidates at the first N top-k positions of their row, 1 to 8 | all |
 
 Memory: one slot row is one 21.2 MB record on each of the 75 routed layers (1.59 GB). The KV costs 95,232 B per
 position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16),
@@ -216,8 +217,10 @@ its end (the arch's `requestEnd`), with the phase's wall time, SSD bytes, record
 host wait on reads, and in decode the hits, misses and hit rate per layer (min, median, max), the SSD bytes per
 emitted token, the lookahead's records (used, landed, expired, abandoned, cancelled, discarded, used while still read)
 and its bytes read and served, and the share of the decode with a read in flight. A `glm_moe_dsa: decode host split`
-line gives the decode lane's host time: the routing barriers' waits, the routes, the waves' encode. With the EXL3 bank,
-the prompt line also counts the prefill GEMM calls and the GPU drains.
+line gives the decode lane's host time: the routing barriers' waits, the routes, the waves' encode. A `glm_moe_dsa:
+lookahead precision` line gives, per top-k position of the candidate's best row (and per bank layer with the EXL3
+bank), the records read ahead and how many of them the next routed layer's call routed. With the EXL3 bank, the
+prompt line also counts the prefill GEMM calls and the GPU drains.
 
 The residency policy forgets its residents and its prompt state at each prompt (`LayerPolicy.forgetAll` at the
 reverse phase change). The decode policy's transition counts and its window carry over from one request to the next.

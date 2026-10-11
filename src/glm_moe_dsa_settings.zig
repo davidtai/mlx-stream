@@ -36,6 +36,9 @@ pub const Config = struct {
     expert_wide_depth: ?u8 = null,
     /// The decode lookahead's records read ahead per routed call (null = 2; 1 .. `max_lookahead_budget`).
     expert_lookahead_budget: ?u32 = null,
+    /// The decode lookahead reads ahead only the candidates at the first N top-k positions of their row (null = all of
+    /// them; 1 .. `max_lookahead_rank`).
+    expert_lookahead_max_rank: ?u32 = null,
     /// The MTP draft lane's drafts per round (null or 0 = off; 1 .. `max_mtp_depth`).
     mtp_depth: ?u32 = null,
     /// A `mtp_depth` past the route limit: refused by name at load (`error.MtpDepthOverRouteLimit`).
@@ -52,6 +55,8 @@ pub const Config = struct {
     pub const max_wide_depth: i64 = 5;
     /// The lookahead's widest budget (`sdk_ext.expert.lookahead.max_budget`).
     pub const max_lookahead_budget: i64 = @import("sdk_ext.zig").expert.lookahead.max_budget;
+    /// The lookahead's candidates per row: the routed top-k.
+    pub const max_lookahead_rank: i64 = glm.routed_top_k;
     /// The deepest draft a round verifies: its depth + 1 rows of top-8 routes in the stream's decode lane
     /// (`sdk_ext.expert.policy.max_route_ids` = 48).
     pub const max_mtp_depth: u32 = @import("sdk_ext.zig").expert.policy.max_route_ids / glm.routed_top_k - 1;
@@ -101,6 +106,10 @@ pub const Config = struct {
             c.expert_lookahead_budget = @intCast(v.integer);
             any = true;
         };
+        if (obj.get("expert_lookahead_max_rank")) |v| if (v == .integer and v.integer >= 1 and v.integer <= max_lookahead_rank) {
+            c.expert_lookahead_max_rank = @intCast(v.integer);
+            any = true;
+        };
         if (obj.get("ctx_size")) |v| if (v == .integer and v.integer >= 1) {
             if (v.integer <= max_ctx_size) c.max_context_tokens = @intCast(v.integer) else c.ctx_size_over_limit = v.integer;
             any = true;
@@ -129,8 +138,8 @@ pub const Config = struct {
                 any = true;
             };
         }
-        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} billed_context={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
-            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.max_context_tokens orelse 0, c.mtpDepth(), c.acceptanceName(), c.typical().delta,
+        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} lookahead_max_rank={?d} billed_context={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
+            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.expert_lookahead_max_rank, c.max_context_tokens orelse 0, c.mtpDepth(), c.acceptanceName(), c.typical().delta,
         });
     }
 
@@ -185,6 +194,11 @@ pub const Config = struct {
         return c.expert_lookahead_budget orelse 2;
     }
 
+    /// The selector's rank cap (`sdk_ext.expert.lookahead.max_k`: none dropped).
+    pub fn lookaheadMaxRank(c: *const Config) u32 {
+        return c.expert_lookahead_max_rank orelse @import("sdk_ext.zig").expert.lookahead.max_k;
+    }
+
     /// A `ctx_size` over the model's limit, refused by name (never a silent fall back to the standard context).
     pub fn checkCtxSize(c: *const Config) error{CtxSizeOverModelLimit}!void {
         const v = c.ctx_size_over_limit orelse return;
@@ -223,6 +237,11 @@ test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up 
     try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_lookahead_budget\": 4}")).lookaheadBudget());
     try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 5}")).lookaheadBudget());
     try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 0}")).lookaheadBudget());
+    try testing.expectEqual(@as(u32, 12), (Config{}).lookaheadMaxRank());
+    try testing.expectEqual(@as(u32, 1), (try settingsOf("{\"expert_lookahead_max_rank\": 1}")).lookaheadMaxRank());
+    try testing.expectEqual(@as(u32, 8), (try settingsOf("{\"expert_lookahead_max_rank\": 8}")).lookaheadMaxRank());
+    try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"expert_lookahead_max_rank\": 9}")).expert_lookahead_max_rank);
+    try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"expert_lookahead_max_rank\": 0}")).expert_lookahead_max_rank);
     try testing.expectEqual(@as(?u32, 131072), (try settingsOf("{\"ctx_size\": 131072}")).max_context_tokens);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": \"131072\"}")).max_context_tokens);
     const over = try settingsOf("{\"ctx_size\": 2097152}");
