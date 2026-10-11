@@ -176,6 +176,13 @@ pub const LayerSlots = struct {
     /// the segment's length a row, each array's buffer page-rounded (`glm_moe_dsa_bill.slotArrays`). All zero: one
     /// array of `record_bytes` a row.
     array_bytes: [9]u64 = @splat(0),
+
+    /// An empty stream layer: an EXL3 pack's routed layer of one K keeps its second bank layer empty
+    /// (`glm_moe_dsa_exl3_bank.Layer.empty`). It holds no expert: it takes no slot at any units and no row, and nothing
+    /// routes on it.
+    pub fn empty(l: LayerSlots) bool {
+        return l.n_records == 0;
+    }
 };
 
 /// A bank's slot geometry: the bill fills in units (`glm_moe_dsa_bill.unitBytes`, `maxUnits`), the module gives each
@@ -198,6 +205,9 @@ pub const Geometry = struct {
     /// The transient scratches' slot arrays per row (`LayerSlots.array_bytes` of the widest layer, and with a scratch
     /// per geometry the other's; all zero: `widest_record` a row).
     scratch: [2][9]u64 = @splat(@splat(0)),
+    /// An EXL3 bank's K values (bit k for each K of its manifest's `quantization.k_values`): the decode split's key
+    /// (`glm_moe_dsa_split.packOf`). 0: another bank.
+    k_mask: u16 = 0,
 };
 
 pub const Config = struct {

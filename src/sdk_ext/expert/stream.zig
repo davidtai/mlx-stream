@@ -1223,6 +1223,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 c.persistent_loads += plan.n_persistent;
                 c.transient_loads += plan.n_loads - plan.n_persistent;
                 c.loads_skipped += skipped;
+                ls.counts.routes += 1;
                 ls.counts.hits += plan.n_hits;
                 ls.counts.misses += plan.n_misses;
                 r.state = .live;

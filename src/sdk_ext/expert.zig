@@ -154,8 +154,9 @@ pub const Stats = struct {
     }
 };
 
-/// One layer's routes so far, every phase: the unique experts per route that were resident / had to be loaded.
-pub const LayerCounts = struct { hits: u64 = 0, misses: u64 = 0 };
+/// One layer's routes so far, every phase: the routes, the unique experts per route that were resident / had to be
+/// loaded.
+pub const LayerCounts = struct { routes: u64 = 0, hits: u64 = 0, misses: u64 = 0 };
 
 /// A source's refusals at run time. A failure is sticky: every later call refuses as `StreamFailed`.
 pub const Error = error{

@@ -1201,9 +1201,9 @@ test "glm53 exl3 quant: on a uniform synthetic EXL3 pack (one K3 bank layer per 
     try sushiEndToEnd(true);
 }
 
-/// The module against sushi's EXL3 module on a synthetic pack (`one_k`: a uniform one) with random residents: the
+/// The module against sushi's EXL3 module on a synthetic pack (`uniform`: one K3 bank layer per layer) with random residents: the
 /// prompt's logits and four decode steps', and the host waits per step.
-fn sushiEndToEnd(one_k: bool) !void {
+fn sushiEndToEnd(uniform: bool) !void {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
@@ -1214,7 +1214,7 @@ fn sushiEndToEnd(one_k: bool) !void {
     var model = try bank_mod.tinyConfigInter(a, 512);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const img = try bank_mod.writeSynth(a, io, tmp.dir, &model, .{ .signs = true, .one_k = one_k });
+    const img = try bank_mod.writeSynth(a, io, tmp.dir, &model, .{ .signs = true, .k3_experts = if (uniform) model.n_routed_experts else null });
     defer a.free(img);
     try glm.writeResidents(a, io, tmp.dir, &model);
     try randomResidents(a, io, tmp.dir, &model, 0x5ee);
@@ -1246,8 +1246,14 @@ fn sushiEndToEnd(one_k: bool) !void {
             if (step == 0) try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
         }
         m.requestEnd();
+        // The uniform pack's empty stream layers (each routed layer's second): no route on any over the prompt pass and
+        // the decode steps (so no gate and no wave), every K3 one routed.
+        if (uniform) for (0..m.stream.layers.len) |sl| {
+            const n = m.stream.layerCounts(@intCast(sl)).routes;
+            if (sl % 2 == 1) try testing.expectEqual(@as(u64, 0), n) else try testing.expect(n > 0);
+        };
     }
-    std.debug.print("glm53 exl3 quant ({s} pack): host waits on the GPU per step (the prompt pass, then 4 decode steps): sushi's module {any}, ours {any}\n", .{ if (one_k) "uniform" else "two-K", waits[0], waits[1] });
+    std.debug.print("glm53 exl3 quant ({s} pack): host waits on the GPU per step (the prompt pass, then 4 decode steps): sushi's module {any}, ours {any}\n", .{ if (uniform) "uniform" else "two-K", waits[0], waits[1] });
     // GLM-5.3's kernels add no wait: the same waits as sushi's binding at every step
     try testing.expectEqualSlices(u64, &waits[0], &waits[1]);
     var worst: f32 = 0;
@@ -1260,7 +1266,7 @@ fn sushiEndToEnd(one_k: bool) !void {
         }
         same += @intFromBool(std.mem.indexOfMax(f32, &ro) == std.mem.indexOfMax(f32, &rt));
     }
-    std.debug.print("glm53 exl3 quant ({s} pack): the module against sushi's EXL3 module, the prompt and 4 steps: logits max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp), argmax equal at {d} of 5\n", .{ if (one_k) "uniform" else "two-K", worst, scale, worst / selfcheck.bf16Ulp(scale), same });
+    std.debug.print("glm53 exl3 quant ({s} pack): the module against sushi's EXL3 module, the prompt and 4 steps: logits max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp), argmax equal at {d} of 5\n", .{ if (uniform) "uniform" else "two-K", worst, scale, worst / selfcheck.bf16Ulp(scale), same });
     try testing.expect(scale > 0.01);
     try testing.expect(worst <= 4 * selfcheck.bf16Ulp(scale));
 }

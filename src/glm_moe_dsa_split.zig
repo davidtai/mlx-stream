@@ -1,8 +1,11 @@
-//! GLM-5.3's decode rows per bank layer on the box's EXL3 pack (`bill.box_exl3`: per routed layer a K3 bank layer of
-//! 148 experts and a K4 one of 108). The handover's grow gives the bank layers uneven rows at the even split's bytes: a
-//! row saves more misses on some layers than on others (on the first routed layers the most). GLM-only: the table and
-//! the curves are this pack's, from four recorded decodes pooled (coding at two seeds, prose, and a coding run of an
-//! earlier build); a stream of another geometry keeps the even split (`bill.rowsAt`).
+//! GLM-5.3's decode rows per bank layer on the box's EXL3 packs: the 3.42 bpw pack (`bill.box_exl3`: per routed layer a
+//! K3 bank layer of 148 experts and a K4 one of 108) and the uniform 3.0 bpw pack (`bill.box_exl3_30`: per routed layer
+//! one K3 bank layer of 256, its second stream layer empty; its table and curves in `glm_moe_dsa_split_k3.zig`). The
+//! handover's grow gives the bank layers uneven rows at the even split's bytes: a row saves more misses on some layers
+//! than on others (on the first routed layers the most). GLM-only: the tables and the curves are these packs', from four
+//! recorded decodes pooled (coding at two seeds, prose, and a coding run of an earlier build; the 3.0 pack's replayed at
+//! its record size). The table is the one of the bank's K values (its manifest's `k_values`, `packOf`); a stream of
+//! other Ks or of another geometry keeps the even split (`bill.rowsAt`).
 //!
 //! At `units` grown from the prompt's: each bank layer keeps its share of the reference table's slot bytes, rounded to
 //! rows, at least its prompt rows (the stream grows and never shrinks) and at most its experts. Then the grown rows'
@@ -10,13 +13,18 @@
 //! split's `bill.grownBytes`): while they are over, the layer whose last row saves the fewest misses gives it up; while
 //! a row fits, the layer whose next row saves the most takes it (ties to the lower layer). A row's misses come from its
 //! layer's curve, linear between the stored rows. A miss reads the slot's bytes, so the misses of the two Ks compare as
-//! they are. At the reference units the procedure gives the table back (a test pins it).
+//! they are. An empty stream layer keeps no rows. At the reference units the procedure gives the table back (a test
+//! pins it).
 
 const std = @import("std");
 const glm = @import("glm_moe_dsa.zig");
 const bill = @import("glm_moe_dsa_bill.zig");
+const k3 = @import("glm_moe_dsa_split_k3.zig");
 
-/// The stream layers the table covers: 75 routed layers, two Ks each.
+/// The packs the tables cover (`packOf`): the 3.42 bpw pack's K3 and K4 bank layers, the 3.0 bpw pack's K3 one.
+pub const Pack = enum { k3_k4, k3 };
+
+/// The stream layers a table covers: 75 routed layers, two stream layers each.
 const n_bank = 150;
 /// The curves' rows: `lo`, `lo + step`, ... up to each bank layer's experts.
 const lo = 8;
@@ -193,8 +201,20 @@ const curves_k4 = [75][26]u16{
     .{ 2006, 1726, 1500, 1296, 1131, 1004, 886, 776, 677, 604, 532, 471, 409, 355, 306, 263, 223, 185, 152, 122, 96, 77, 62, 53, 45, 44 },
 };
 
-fn curve(bl: usize) []const u16 {
-    return if (bl % 2 == 0) &curves_k3[bl / 2] else &curves_k4[bl / 2];
+/// Stream layer `bl`'s curve (none: the 3.0 pack's empty layers).
+fn curve(p: Pack, bl: usize) []const u16 {
+    return switch (p) {
+        .k3_k4 => if (bl % 2 == 0) &curves_k3[bl / 2] else &curves_k4[bl / 2],
+        .k3 => if (bl % 2 == 0) &k3.curves[bl / 2] else &.{},
+    };
+}
+
+/// Stream layer `bl`'s rows at the pack's reference.
+fn refRow(p: Pack, bl: usize) u32 {
+    return switch (p) {
+        .k3_k4 => ref_rows[bl],
+        .k3 => if (bl % 2 == 0) k3.ref_rows[bl / 2] else 0,
+    };
 }
 
 /// 4 x a curve at `r` rows: linear between the stored rows, flat outside them.
@@ -207,19 +227,28 @@ fn at4(c: []const u16, r: u32) i64 {
 }
 
 /// What row `r` of stream layer `bl` saves (from `r - 1` rows to `r`), in the units of `at4`.
-fn gain(bl: usize, r: u32) i64 {
-    const c = curve(bl);
+fn gain(p: Pack, bl: usize, r: u32) i64 {
+    const c = curve(p, bl);
     return at4(c, r - 1) - at4(c, r);
 }
 
-/// Whether `g` is the table's geometry: the box pack's 150 stream layers, K3 and K4 in turn.
-fn isTables(g: glm.Geometry) bool {
-    if (g.layers.len != n_bank) return false;
-    for (g.layers, 0..) |l, i| {
-        const want = if (i % 2 == 0) bill.box_exl3.k3 else bill.box_exl3.k4;
-        if (l.record_bytes != want.record_bytes or l.n_records != want.n_records or l.rows_per_unit != want.rows_per_unit) return false;
+/// The table of the bank's K values (`Geometry.k_mask`, its manifest's `k_values`): K3 and K4 the 3.42 pack's, K3
+/// alone the 3.0 pack's; null for other Ks, or when the geometry is not the table's (its 150 stream layers' slots).
+pub fn packOf(g: glm.Geometry) ?Pack {
+    const p: Pack = switch (g.k_mask) {
+        1 << 3 | 1 << 4 => .k3_k4,
+        1 << 3 => .k3,
+        else => return null,
+    };
+    const want: *const [n_bank]glm.LayerSlots = switch (p) {
+        .k3_k4 => &bill.box_exl3.slots,
+        .k3 => &bill.box_exl3_30.slots,
+    };
+    if (g.layers.len != n_bank) return null;
+    for (g.layers, want) |l, w| {
+        if (l.record_bytes != w.record_bytes or l.n_records != w.n_records or l.rows_per_unit != w.rows_per_unit) return null;
     }
-    return true;
+    return p;
 }
 
 fn experts(l: glm.LayerSlots) u32 {
@@ -231,7 +260,7 @@ fn experts(l: glm.LayerSlots) u32 {
 /// past its prompt rows; not the slot rows' total). Any budget is safe: a layer gives up rows only down to its prompt
 /// rows. Null when `g` is not the table's geometry.
 pub fn decodeRows(g: glm.Geometry, prompt: u32, units: u32, budget: u64, out: []u32) ?[]u32 {
-    if (!isTables(g)) return null;
+    const p = packOf(g) orelse return null;
     const from = @min(prompt, units);
     var floor: [n_bank]u32 = undefined;
     var even: [n_bank]u32 = undefined;
@@ -241,12 +270,12 @@ pub fn decodeRows(g: glm.Geometry, prompt: u32, units: u32, budget: u64, out: []
     // The reference's shares of the slot bytes at the even split's bytes.
     var at_even: u128 = 0;
     var at_ref: u128 = 0;
-    for (g.layers, even, ref_rows) |l, e, r| {
+    for (g.layers, even, 0..) |l, e, i| {
         at_even += @as(u128, e) * l.record_bytes;
-        at_ref += @as(u128, r) * l.record_bytes;
+        at_ref += @as(u128, refRow(p, i)) * l.record_bytes;
     }
-    for (rows, g.layers, floor, ref_rows) |*x, l, f, r| {
-        const want: u32 = @intCast((@as(u128, r) * at_even + at_ref / 2) / at_ref);
+    for (rows, g.layers, floor, 0..) |*x, l, f, i| {
+        const want: u32 = @intCast((@as(u128, refRow(p, i)) * at_even + at_ref / 2) / at_ref);
         x.* = std.math.clamp(want, f, experts(l));
     }
     // The grown rows' bytes fixed to the budget.
@@ -255,7 +284,7 @@ pub fn decodeRows(g: glm.Geometry, prompt: u32, units: u32, budget: u64, out: []
     while (used > budget) {
         var best: ?usize = null;
         for (rows, floor, 0..) |x, f, i| {
-            if (x > f and (best == null or gain(i, x) < gain(best.?, rows[best.?]))) best = i;
+            if (x > f and (best == null or gain(p, i, x) < gain(p, best.?, rows[best.?]))) best = i;
         }
         const i = best.?;
         const l = g.layers[i];
@@ -269,7 +298,7 @@ pub fn decodeRows(g: glm.Geometry, prompt: u32, units: u32, budget: u64, out: []
             if (x >= experts(l)) continue;
             const add = bill.slotArrays(l, x + 1 - f) - bill.slotArrays(l, x - f);
             if (used + add > budget) continue;
-            if (best == null or gain(i, x + 1) > gain(best.?, rows[best.?] + 1)) {
+            if (best == null or gain(p, i, x + 1) > gain(p, best.?, rows[best.?] + 1)) {
                 best = i;
                 best_add = add;
             }
@@ -321,14 +350,40 @@ test "glm split: at the reference units the table comes back as it is, within th
     var m_split: i64 = 0;
     var m_even: i64 = 0;
     for (rows, even, 0..) |x, e, i| {
-        m_split += at4(curve(i), x) * @as(i64, @intCast(g.layers[i].record_bytes / 1024));
-        m_even += at4(curve(i), e) * @as(i64, @intCast(g.layers[i].record_bytes / 1024));
+        m_split += at4(curve(.k3_k4, i), x) * @as(i64, @intCast(g.layers[i].record_bytes / 1024));
+        m_even += at4(curve(.k3_k4, i), e) * @as(i64, @intCast(g.layers[i].record_bytes / 1024));
+    }
+    try testing.expect(m_split * 100 < m_even * 90);
+}
+
+test "glm split: the uniform 3.0 pack's table: at its reference units it comes back as it is, its empty stream layers keep no rows, within the bill's slot rows" {
+    const g = bill.box_exl3_30.geometry;
+    try testing.expectEqual(Pack.k3, packOf(g).?);
+    try testing.expectEqual(Pack.k3_k4, packOf(bill.box_exl3.geometry).?);
+    var out: [n_bank]u32 = undefined;
+    const rows = decodeRows(g, k3.ref_prompt_units, k3.ref_units, bill.grownBytes(g, k3.ref_prompt_units, k3.ref_units), &out).?;
+    for (rows, 0..) |x, i| try testing.expectEqual(refRow(.k3, i), x);
+    try testing.expect(slotBytesOf(g, k3.ref_prompt_units, rows) <= bill.decodeSlotBytes(g, k3.ref_prompt_units, k3.ref_units));
+    // The even split: two rows a unit on every K3 layer, none on the empty ones; the table saves misses on its curves
+    // at the same bytes.
+    var even: [n_bank]u32 = undefined;
+    _ = bill.rowsAt(g, k3.ref_units, &even);
+    var m_split: i64 = 0;
+    var m_even: i64 = 0;
+    for (rows, even, 0..) |x, e, i| {
+        try testing.expectEqual(@as(u32, if (i % 2 == 0) 2 * k3.ref_units else 0), e);
+        if (i % 2 == 1) continue;
+        m_split += at4(curve(.k3, i), x);
+        m_even += at4(curve(.k3, i), e);
     }
     try testing.expect(m_split * 100 < m_even * 90);
 }
 
 test "glm split: at other budgets every layer keeps its prompt rows, the bill's slot rows bound the split's, and no row that fits is left" {
-    const g = bill.box_exl3.geometry;
+    for ([_]glm.Geometry{ bill.box_exl3.geometry, bill.box_exl3_30.geometry }) |g| try otherBudgets(g);
+}
+
+fn otherBudgets(g: glm.Geometry) !void {
     const cases = [_][2]u32{ .{ 72, 85 }, .{ 60, 75 }, .{ 72, 100 }, .{ 40, 120 }, .{ 72, 72 }, .{ 100, 128 } };
     for (cases) |cs| {
         var out: [n_bank]u32 = undefined;

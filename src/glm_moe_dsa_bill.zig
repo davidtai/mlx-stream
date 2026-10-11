@@ -384,8 +384,8 @@ pub fn maxUnits(g: glm.Geometry) u32 {
     if (g.layers.len == 0) return 0;
     var n: u32 = 0;
     for (g.layers) |l| {
-        // An empty stream layer (a uniform EXL3 pack's second bank layer) takes no slot at any units.
-        if (l.n_records == 0) continue;
+        // An empty stream layer takes no slot at any units.
+        if (l.empty()) continue;
         const experts: f64 = @floatFromInt(l.n_records / @max(l.rows_per_unit, 1));
         n = @max(n, @as(u32, @intFromFloat(@ceil(experts / l.share))));
     }
@@ -949,7 +949,7 @@ fn glm53Geometry() bank_mod.Geometry {
 /// 4,759,552 B), every layer alike (its manifest's 150 stream layers).
 pub const box_exl3 = struct {
     /// A slot row's arrays at K `k`: each of the nine segments over an expert's four minis (`exl3_bank.miniSegments`).
-    fn arrays(k: u64) [9]u64 {
+    pub fn arrays(k: u64) [9]u64 {
         const segs = exl3_bank.miniSegments(6144, 512, k).segs;
         var a: [9]u64 = undefined;
         for (&a, segs) |*x, sg| x.* = 4 * sg.length;
@@ -962,7 +962,7 @@ pub const box_exl3 = struct {
         for (&s, 0..) |*l, i| l.* = if (i % 2 == 0) k3 else k4;
         break :blk s;
     };
-    pub const geometry: glm.Geometry = .{ .layers = &slots, .widest_record = 4 * (3_578_880 + 4_758_528), .widest_span = 3_172_352, .minis_per_id = 4, .spec_record = 3 * 4_759_552 + 4_758_528, .scratch = .{ arrays(4), arrays(3) } };
+    pub const geometry: glm.Geometry = .{ .layers = &slots, .widest_record = 4 * (3_578_880 + 4_758_528), .widest_span = 3_172_352, .minis_per_id = 4, .spec_record = 3 * 4_759_552 + 4_758_528, .scratch = .{ arrays(4), arrays(3) }, .k_mask = 1 << 3 | 1 << 4 };
     /// The trunk's residents as MLX allocates them (its 2,680 shard tensors' buffers; 20,060,118,528 B in the shards),
     /// and at their size classes (the first prompt's forward layers read them with the classes on: the embedding's and
     /// the head's codes 55,050,240 B over each, 127,205,376 B over in all).
@@ -973,6 +973,20 @@ pub const box_exl3 = struct {
     /// The box's RAM and the fill arm's GPU target (the 245,760 MB wired limit less the 2 GiB margin).
     pub const ram: u64 = 274_877_906_944;
     pub const gpu_target: u64 = 255_550_554_112;
+};
+
+/// The uniform EXL3 pack (davidsyoung GLM-5.3 EXL3 TR3 3.0 bpw, ~/glm53/pack-exl3-3.0bpw): per routed layer one K3 bank
+/// layer of all 256 experts (two slot rows a unit) and an empty second stream layer of its geometry
+/// (`exl3_bank.Bank.closeLayer`).
+pub const box_exl3_30 = struct {
+    pub const k3: glm.LayerSlots = .{ .record_bytes = 4 * 3_578_880, .n_records = 256, .share = 2, .array_bytes = box_exl3.arrays(3) };
+    pub const empty: glm.LayerSlots = .{ .record_bytes = 4 * 3_578_880, .n_records = 0, .share = 0, .array_bytes = box_exl3.arrays(3) };
+    pub const slots: [150]glm.LayerSlots = blk: {
+        var s: [150]glm.LayerSlots = undefined;
+        for (&s, 0..) |*l, i| l.* = if (i % 2 == 0) k3 else empty;
+        break :blk s;
+    };
+    pub const geometry: glm.Geometry = .{ .layers = &slots, .widest_record = 4 * 3_578_880, .widest_span = 2_385_920, .minis_per_id = 4, .spec_record = 3 * 3_579_904 + 3_578_880, .scratch = .{ box_exl3.arrays(3), @splat(0) }, .k_mask = 1 << 3 };
 };
 
 /// The box's served EXL3 module: GLM-5.3's prompt kernels, the spans' top-k kernel.

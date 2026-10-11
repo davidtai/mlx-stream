@@ -2,7 +2,9 @@
 //! converter `scripts/convert_glm_exl3_bank.py` writes, docs/glm53-exl3-pack-format.md) as a bank module for the
 //! expert stream (`sdk_ext.expert.assertBank`).
 //!   - A stream layer is one bank layer: a routed layer's experts at one K, its K3 bank layer at `2 r`, its K4 bank
-//!     layer at `2 r + 1`. The MTP layer's bank layers are the draft lane's (`mtp/`), outside the stream.
+//!     layer at `2 r + 1`. A routed layer of one K (a uniform pack, `k_values` [3]) has an empty bank layer at
+//!     `2 r + 1` (`Layer.empty`: no expert, so no row, no route, no gate, no wave). The MTP layer's bank layers are the
+//!     draft lane's (`mtp/`), outside the stream.
 //!   - A routed id is the model's expert id; a bank layer routes only the experts it holds. Its record is the expert's
 //!     `tp` minis (one tensor-parallel rank each: nine segments, code I16 = the trellis, rout F16 = svh, rin F16 =
 //!     suh per projection), adjacent in the file and read into adjacent rows of the slot arrays (`Layer.minis`).
@@ -89,6 +91,13 @@ pub const Layer = struct {
     /// The experts this bank layer holds: the most slot rows it takes.
     n_held: u32,
     segments: [n_components]Segment,
+
+    /// The empty bank layer of a routed layer of one K (`Bank.closeLayer`): no expert, so no slot row, no route, no
+    /// gate and no wave (its slots `glm.LayerSlots.empty`); its K and segments are its routed layer's other bank
+    /// layer's, so the stream keeps no scratch for it.
+    pub fn empty(l: Layer) bool {
+        return l.n_held == 0;
+    }
 };
 
 /// One projection's slot arrays as sushi's EXL3 MoE binds them (`sushi.Proj`): trellis uint16 `[minis, in/16,
@@ -168,7 +177,7 @@ const RecordJson = struct { bank_layer: u64, mini: u64, expert: u64, rank: u64, 
 const ManifestJson = struct {
     format: []const u8,
     model_type: []const u8,
-    quantization: struct { mode: []const u8, codebook: []const u8, codebook_multiplier: u64, tp_ranks: u64 },
+    quantization: struct { mode: []const u8, codebook: []const u8, codebook_multiplier: u64, tp_ranks: u64, k_values: []const u64 },
     dims: struct { hidden: u64, inter: u64, mini_inter: u64, n_experts: u64 },
     components: []const []const u8,
     layers: []const LayerJson,
@@ -196,7 +205,9 @@ pub const Bank = struct {
     tp: u32 = 0,
     /// The routed ids' range: the model's experts.
     n_experts: u32 = 0,
-    /// The stream layers: routed layer r's K3 bank layer at 2 r, its K4 bank layer at 2 r + 1.
+    /// The manifest's `quantization.k_values` (bit k): every bank layer's K is one of them.
+    k_mask: u16 = 0,
+    /// The stream layers: routed layer r's K3 bank layer at 2 r, its K4 bank layer (or an empty one) at 2 r + 1.
     layers: []Layer = &.{},
     /// [stream layer * n_experts + expert]: the expert's index among its bank layer's experts (`no_local`: not there).
     local: []u16 = &.{},
@@ -227,13 +238,14 @@ pub const Bank = struct {
     }
 
     /// What the bill reads (`glm_moe_dsa.Geometry`): each stream layer's slots (one row an expert's minis, its experts,
-    /// its share of a unit: its experts over `maxUnits`); one slot of every geometry it holds as the widest record (an
-    /// empty stream layer holds none; each geometry's transient scratch holds its own rows, the bill charges them all at
-    /// it); the widest mini range. The layers borrow the bank's.
+    /// its share of a unit: its experts over `maxUnits`); one slot of every geometry as the widest record (each
+    /// geometry's transient scratch holds its own rows, the bill charges them all at it); the widest mini range; the K
+    /// values (the split's key). The layers borrow the bank's.
     pub fn geometryOf(self: *const Bank) Geometry {
-        var g: Geometry = .{ .layers = self.slots, .widest_record = 0, .widest_span = 0 };
+        var g: Geometry = .{ .layers = self.slots, .widest_record = 0, .widest_span = 0, .k_mask = self.k_mask };
         if (self.layers.len == 0) return g;
-        for (self.layers[0..banks_per_layer]) |*l| if (l.n_held > 0) {
+        // One slot of each geometry (each K) of the first routed layer's stream layers: an empty one has its other's.
+        for (self.layers[0..banks_per_layer], 0..) |*l, i| if (i == 0 or l.k != self.layers[0].k) {
             g.widest_record += @as(u64, l.minis) * l.logical_bytes;
         };
         for (self.layers) |*l| {
@@ -338,6 +350,13 @@ pub const Bank = struct {
         self.tp = @intCast(q.tp_ranks);
         self.n_experts = @intCast(d.n_experts);
         const ne: usize = self.n_experts;
+        // The K values: ascending, each a K the trellis takes.
+        for (q.k_values, 0..) |k, i| {
+            if (k == 0 or k > 8 or sushi.format.kFromPackedDim(@intCast(16 * k)) == null or (i > 0 and k <= q.k_values[i - 1]))
+                return refuse(diag, error.QuantNotImplemented, file ++ ": k_values {any}: not ascending Ks of the trellis", .{q.k_values});
+            self.k_mask |= @as(u16, 1) << @intCast(k);
+        }
+        if (q.k_values.len == 0) return refuse(diag, error.QuantNotImplemented, file ++ ": k_values is empty", .{});
         // 3. The bank layers: every one's segments as the format derives them, back to back, the bases contiguous;
         // the routed layers' first (one per K the layer holds, K ascending, their experts each layer's once), then the
         // MTP layer's. The MTP directory holds the MTP layer's alone, as its one routed layer. A routed layer of one K
@@ -371,7 +390,7 @@ pub const Bank = struct {
             const want_mtp = holds == .mtp or !streamed;
             if (lj.bank_layer != i or lj.layer != want_layer or lj.mtp != want_mtp)
                 return refuse(diag, error.LayerGeometry, file ++ ": bank layer entry {d} is bank layer {d} of layer {d} (mtp {}), want layer {d} (mtp {})", .{ i, lj.bank_layer, lj.layer, lj.mtp, want_layer, want_mtp });
-            if (lj.k == 0 or lj.k > 8 or sushi.format.kFromPackedDim(@intCast(16 * lj.k)) == null) return refuse(diag, error.QuantNotImplemented, file ++ ": bank layer {d} at K {d}", .{ i, lj.k });
+            if (lj.k == 0 or lj.k > 8 or (self.k_mask >> @intCast(lj.k)) & 1 == 0) return refuse(diag, error.QuantNotImplemented, file ++ ": bank layer {d} at K {d}, not in k_values {any}", .{ i, lj.k, q.k_values });
             if (lj.n_minis != q.tp_ranks * lj.experts.len or lj.base_offset != base)
                 return refuse(diag, error.LayerGeometry, file ++ ": bank layer {d}: {d} minis for {d} experts, base {d} (want {d})", .{ i, lj.n_minis, lj.experts.len, lj.base_offset, base });
             const want = miniSegments(d.hidden, d.mini_inter, lj.k);
@@ -481,13 +500,18 @@ const testing = std.testing;
 /// A synthetic EXL3 bank for `c`: per routed layer a K3 bank layer of its even experts and a K4 one of its odd
 /// experts, then the MTP layer's two, `tp` minis per expert of seeded bytes (with `signs`: the suh / svh segments
 /// +/-1 in f16), the records, the experts map and the sidecar. With `mtp_only`, the pack's `mtp/` alone: the MTP
-/// layer's two bank layers, its experts map, manifest and sidecar, in `mtp_dir`. With `one_k`, a uniform pack (the
-/// converter's for `k_values` [3]): per layer one K3 bank layer of all its experts. Each other field perturbs one rule.
+/// layer's two bank layers, its experts map, manifest and sidecar, in `mtp_dir`. With `k3_experts` n, each layer's
+/// first n experts at K3 and the rest at K4; n = all of them is a uniform pack (the converter's for `k_values` [3]): one
+/// K3 bank layer per layer. With `manifest_only`, the manifest alone (every record's sha256 zero, no sidecar written):
+/// the real geometry for `Bank.geometry`. Each other field perturbs one rule.
 pub const Synth = struct {
     tp: u32 = 4,
     signs: bool = false,
     mtp_only: bool = false,
-    one_k: bool = false,
+    k3_experts: ?u32 = null,
+    manifest_only: bool = false,
+    /// The manifest's `k_values` (null: the bank layers' Ks).
+    k_values: ?[]const u8 = null,
     format: []const u8 = format,
     multiplier: u64 = 0,
     hidden_delta: u64 = 0,
@@ -519,8 +543,9 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
     const mtp_layer = [1]u32{c.n_layers};
     // The layers the experts map lists: the routed layers', or the MTP layer's in its directory.
     const mapped: []const u32 = if (s.mtp_only) &mtp_layer else routed;
-    // Bank layers per layer: one with `one_k`.
-    const per: usize = if (s.one_k) 1 else banks_per_layer;
+    // Bank layers per layer: one when every expert is at K3.
+    const uniform = if (s.k3_experts) |n| n == ne else false;
+    const per: usize = if (uniform) 1 else banks_per_layer;
     const n_bank = (routed.len + 1) * per;
     const bin = if (s.mtp_only) mtp_sidecar_file else "experts.bin";
     var j: std.ArrayList(u8) = .empty;
@@ -531,7 +556,7 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
     errdefer image.deinit(a);
     var rng = std.Random.DefaultPrng.init(53);
     const mult = if (s.multiplier != 0) s.multiplier else sushi.format.MCG_MULT;
-    try j.print(a, "{{\"format\":\"{s}\",\"model_type\":\"glm_moe_dsa\",\"source\":{{\"repo\":\"synthetic\",\"revision\":null}},\"quantization\":{{\"mode\":\"exl3\",\"codebook\":\"mcg\",\"codebook_multiplier\":{d},\"mcg_scalar\":0,\"k_values\":{s},\"tp_ranks\":{d}}},", .{ s.format, mult, if (s.one_k) "[3]" else "[3,4]", s.tp });
+    try j.print(a, "{{\"format\":\"{s}\",\"model_type\":\"glm_moe_dsa\",\"source\":{{\"repo\":\"synthetic\",\"revision\":null}},\"quantization\":{{\"mode\":\"exl3\",\"codebook\":\"mcg\",\"codebook_multiplier\":{d},\"mcg_scalar\":0,\"k_values\":{s},\"tp_ranks\":{d}}},", .{ s.format, mult, s.k_values orelse if (uniform) "[3]" else "[3,4]", s.tp });
     try j.print(a, "\"dims\":{{\"hidden\":{d},\"inter\":{d},\"mini_inter\":{d},\"n_experts\":{d},\"n_model_layers\":{d},\"n_bank_layers\":{d}}},\"components\":[", .{ h + s.hidden_delta, c.moe_intermediate_size, mini, ne, routed.len + 1, n_bank });
     for (Component.names, 0..) |n, i| try j.print(a, "{s}\"{s}\"", .{ if (i == 0) "" else ",", n });
     try j.appendSlice(a, "],\"layers\":[");
@@ -547,7 +572,10 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
         const held = (bl % per) == 0;
         var members: std.ArrayList(u64) = .empty;
         defer members.deinit(a);
-        for (0..ne) |e| if (s.one_k or (e % 2 == 0) == held or (s.expert_both and bl == 1 and e == 0)) try members.append(a, e);
+        for (0..ne) |e| {
+            const at_k3 = if (s.k3_experts) |n| e < n else e % 2 == 0;
+            if (at_k3 == held or (s.expert_both and bl == 1 and e == 0)) try members.append(a, e);
+        }
         const ms = miniSegments(h, mini, k);
         const rb = std.mem.alignForward(u64, ms.logical, record_alignment);
         const n_minis = s.tp * members.items.len;
@@ -561,15 +589,17 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
         }
         try j.appendSlice(a, "]}");
         for (0..n_minis) |mi| {
-            const at = image.items.len;
-            try image.appendNTimes(a, 0, @intCast(rb));
-            const rec = image.items[at..][0..@intCast(ms.logical)];
-            rng.random().bytes(rec);
-            if (s.signs) for (ms.segs, 0..) |sg, ci| if (ci % 3 != 0) for (0..sg.length / 2) |i| {
-                std.mem.writeInt(u16, rec[sg.offset + 2 * i ..][0..2], if (rng.random().boolean()) 0x3C00 else 0xBC00, .little);
-            };
-            var dg: [32]u8 = undefined;
-            Sha256.hash(rec, &dg, .{});
+            var dg: [32]u8 = @splat(0);
+            if (!s.manifest_only) {
+                const at = image.items.len;
+                try image.appendNTimes(a, 0, @intCast(rb));
+                const rec = image.items[at..][0..@intCast(ms.logical)];
+                rng.random().bytes(rec);
+                if (s.signs) for (ms.segs, 0..) |sg, ci| if (ci % 3 != 0) for (0..sg.length / 2) |i| {
+                    std.mem.writeInt(u16, rec[sg.offset + 2 * i ..][0..2], if (rng.random().boolean()) 0x3C00 else 0xBC00, .little);
+                };
+                Sha256.hash(rec, &dg, .{});
+            }
             const hex = std.fmt.bytesToHex(dg, .lower);
             if (s.drop_record and bl == 1 and mi == 3) continue;
             const mm = if (s.dup_record and bl == 1 and mi == 3) mi - 1 else mi;
@@ -583,7 +613,7 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
     for (mapped, 0..) |ml, r| {
         try j.print(a, "{s}\"{d}\":[", .{ if (r == 0) "" else ",", ml });
         for (0..ne) |e| {
-            const kl: [2]u64 = if (s.one_k) .{ 3, e } else .{ if (e % 2 == 0) 3 else 4, e / 2 };
+            const kl: [2]u64 = if (s.k3_experts) |n| (if (e < n) .{ 3, e } else .{ 4, e - n }) else .{ if (e % 2 == 0) 3 else 4, e / 2 };
             try j.print(a, "{s}[{d},{d}]", .{ if (e == 0) "" else ",", kl[0], kl[1] + (if (r == 1 and e == 5) s.map_delta else 0) });
         }
         try j.appendSlice(a, "]");
@@ -593,7 +623,7 @@ pub fn writeSynth(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *const g
     const out = if (s.mtp_only) try dir.openDir(io, mtp_dir, .{}) else dir;
     defer if (s.mtp_only) out.close(io);
     if (!s.no_manifest) try out.writeFile(io, .{ .sub_path = if (s.mtp_only) mtp_manifest_file else manifest_file, .data = j.items });
-    try out.writeFile(io, .{ .sub_path = bin, .data = if (s.truncate_file) image.items[0 .. image.items.len - 4096] else image.items });
+    if (!s.manifest_only) try out.writeFile(io, .{ .sub_path = bin, .data = if (s.truncate_file) image.items[0 .. image.items.len - 4096] else image.items });
     return image.toOwnedSlice(a);
 }
 
@@ -697,7 +727,7 @@ test "glm exl3 bank: a uniform pack (one K3 bank layer per layer, the converter'
     defer c.deinit(a);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const img = try writeSynth(a, testing.io, tmp.dir, &c, .{ .one_k = true });
+    const img = try writeSynth(a, testing.io, tmp.dir, &c, .{ .k3_experts = c.n_routed_experts });
     defer a.free(img);
     var rbuf: [512]u8 = undefined;
     var diag: Diag = .{};
@@ -769,11 +799,46 @@ test "glm exl3 bank: a uniform pack (one K3 bank layer per layer, the converter'
     try s.flush();
 }
 
+test "glm exl3 bank: at GLM-5.3's geometry the 3.42 bpw pack's and the uniform 3.0 bpw pack's manifests give the bill's slots, its units and the split's packs" {
+    const a = testing.allocator;
+    const split = @import("glm_moe_dsa_split.zig");
+    const text = try glm.testConfigJson(a, ",\"model.embed_tokens\":{\"group_size\":64,\"bits\":8},\"lm_head\":{\"group_size\":64,\"bits\":8}");
+    defer a.free(text);
+    var c = try glm.Config.parse(a, text, &glm.glm53, null);
+    defer c.deinit(a);
+    // 148 K3 and 108 K4 experts a routed layer (which ones does not change the slots); all 256 at K3.
+    inline for (.{ .{ 148, bill_units.box_exl3.geometry, split.Pack.k3_k4 }, .{ 256, bill_units.box_exl3_30.geometry, split.Pack.k3 } }) |x| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        a.free(try writeSynth(a, testing.io, tmp.dir, &c, .{ .k3_experts = x[0], .manifest_only = true }));
+        var rbuf: [512]u8 = undefined;
+        var diag: Diag = .{};
+        const g = Bank.geometry(a, testing.io, try tmpRoot(&tmp, &rbuf), &c, &diag) catch |e| {
+            std.debug.print("refused: {s}\n", .{diag.message()});
+            return e;
+        };
+        defer a.free(g.layers);
+        const want: glm.Geometry = x[1];
+        try testing.expectEqual(@as(usize, 150), g.layers.len);
+        for (want.layers, g.layers) |w, l| try testing.expectEqual(w, l);
+        try testing.expectEqual(want.widest_record, g.widest_record);
+        try testing.expectEqual(want.widest_span, g.widest_span);
+        try testing.expectEqual(want.minis_per_id, g.minis_per_id);
+        try testing.expectEqual(want.spec_record, g.spec_record);
+        try testing.expectEqual(want.scratch, g.scratch);
+        try testing.expectEqual(want.k_mask, g.k_mask);
+        try testing.expectEqual(x[2], split.packOf(g).?);
+        try testing.expectEqual(@as(u32, 128), bill_units.maxUnits(g));
+    }
+}
+
 test "glm exl3 bank: every rule of the pack's contract refuses by name" {
     try affine.expectRefusals(@This(), &.{
         .{ .s = .{ .no_manifest = true }, .err = error.ManifestMissing, .why = "not found" },
         .{ .s = .{ .format = "mlx-stream-expert-manifest-exl3-v2" }, .err = error.ManifestFormat, .why = "format" },
         .{ .s = .{ .multiplier = 0x83DCD12D }, .err = error.QuantNotImplemented, .why = "multiplier" },
+        .{ .s = .{ .k_values = "[4,3]" }, .err = error.QuantNotImplemented, .why = "not ascending" },
+        .{ .s = .{ .k_values = "[3]" }, .err = error.QuantNotImplemented, .why = "not in k_values" },
         .{ .s = .{ .hidden_delta = 128 }, .err = error.DimsMismatch, .why = "hidden 256" },
         .{ .s = .{ .seg_len_delta = 2 }, .err = error.LayerGeometry, .why = "segment up_proj.rout" },
         .{ .s = .{ .base_delta = 4096 }, .err = error.LayerGeometry, .why = "base" },

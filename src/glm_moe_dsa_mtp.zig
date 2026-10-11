@@ -245,8 +245,8 @@ pub const Exl3 = struct {
         var slot_base: [2]u32 = .{ 0, 0 };
         var next: u32 = 0;
         for (m.layers, 0..) |l, b| {
-            // An empty bank layer (a uniform pack's second) holds no expert: no arrays, no group of the MoE.
-            if (l.n_held == 0) continue;
+            // An empty bank layer holds no expert: no arrays, no group of the MoE.
+            if (l.empty()) continue;
             const n_minis = l.minis * l.n_held;
             slot_base[b] = next;
             next += n_minis;
@@ -955,7 +955,7 @@ test "glm mtp: the pack's mtp/ opens under the trunk bank's rules: the MTP layer
     try testing.expectError(error.LayerGeometry, exl3.Bank.openMtp(a, testing.io, mdir, &c, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "bank layer entry 0") != null);
     // A uniform pack's MTP directory: one K3 bank layer of all 16 experts, the second stream layer empty.
-    a.free(try exl3.writeSynth(a, testing.io, tmp.dir, &c, .{ .mtp_only = true, .one_k = true }));
+    a.free(try exl3.writeSynth(a, testing.io, tmp.dir, &c, .{ .mtp_only = true, .k3_experts = c.n_routed_experts }));
     var m1 = try exl3.Bank.openMtp(a, testing.io, mdir, &c, &diag);
     defer m1.deinit();
     try testing.expectEqual(@as(usize, 2), m1.layers.len);
