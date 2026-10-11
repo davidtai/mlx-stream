@@ -715,11 +715,14 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
         /// Each stream layer's decode rows grown from the prompt's within `budget` grown bytes, `units` the whole units in
         /// it (`bill.unitsIn`): the split's (`glm_moe_dsa_split`) on its geometry, filled to the budget; else the even
-        /// split's at the units (`bill.rowsAt`).
+        /// split's at the units (`bill.rowsAt`), with a line saying so.
         fn decodeRowsAt(self: *Self, units: u32, budget: u64) void {
             self.decode_units = units;
             self.split_rows = split_mod.decodeRows(self.inputs.bank, self.prompt_units, units, budget, self.decode_rows) != null;
-            if (!self.split_rows) _ = bill_mod.rowsAt(self.inputs.bank, units, self.decode_rows);
+            if (!self.split_rows) {
+                log.info("glm_moe_dsa: decode rows: no split table for this pack (K mask 0x{x}, {d} stream layers): the even split\n", .{ self.inputs.bank.k_mask, self.inputs.bank.layers.len });
+                _ = bill_mod.rowsAt(self.inputs.bank, units, self.decode_rows);
+            }
         }
 
         /// The request's end (the host's finish): its decode line, once; nothing when it never decoded.

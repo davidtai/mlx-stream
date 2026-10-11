@@ -24,8 +24,11 @@ const k3 = @import("glm_moe_dsa_split_k3.zig");
 /// The packs the tables cover (`packOf`): the 3.42 bpw pack's K3 and K4 bank layers, the 3.0 bpw pack's K3 one.
 pub const Pack = enum { k3_k4, k3 };
 
-/// The stream layers a table covers: 75 routed layers, two stream layers each.
-const n_bank = 150;
+/// The stream layers a table covers: the box packs' (75 routed layers, two stream layers each).
+const n_bank = bill.box_exl3.slots.len;
+comptime {
+    std.debug.assert(bill.box_exl3_30.slots.len == n_bank);
+}
 /// The curves' rows: `lo`, `lo + step`, ... up to each bank layer's experts.
 const lo = 8;
 const step = 4;
@@ -46,7 +49,7 @@ pub const ref_rows = [n_bank]u8{
 
 /// Per bank layer the plugin's misses per thousand emitted tokens at rows 8, 12, ..., 148 (K3) and 8, 12, ..., 108
 /// (K4): the mean of the four decodes, non-increasing.
-const curves_k3 = [75][36]u16{
+const curves_k3 = [n_bank / 2][curveRows(bill.box_exl3.k3)]u16{
     .{ 4271, 4058, 3859, 3666, 3483, 3304, 3132, 2964, 2818, 2666, 2521, 2363, 2223, 2091, 1967, 1837, 1706, 1593, 1465, 1352, 1245, 1142, 1045, 938, 840, 743, 654, 563, 484, 405, 326, 263, 202, 143, 93, 64 },
     .{ 4215, 4020, 3834, 3650, 3479, 3308, 3130, 2982, 2834, 2689, 2549, 2411, 2272, 2134, 2000, 1873, 1746, 1626, 1508, 1392, 1284, 1170, 1059, 960, 860, 760, 656, 574, 492, 421, 344, 268, 199, 144, 89, 64 },
     .{ 4378, 4143, 3939, 3741, 3548, 3355, 3172, 3000, 2832, 2673, 2517, 2361, 2220, 2075, 1932, 1803, 1667, 1543, 1421, 1302, 1184, 1073, 972, 877, 777, 683, 591, 509, 431, 358, 292, 229, 170, 123, 84, 64 },
@@ -123,7 +126,7 @@ const curves_k3 = [75][36]u16{
     .{ 3398, 3072, 2786, 2543, 2320, 2117, 1936, 1770, 1617, 1474, 1360, 1250, 1143, 1050, 955, 867, 787, 715, 646, 582, 524, 468, 408, 356, 312, 273, 235, 201, 162, 135, 109, 88, 75, 66, 63, 62 },
     .{ 3638, 3319, 3033, 2780, 2561, 2349, 2172, 2001, 1846, 1693, 1547, 1416, 1309, 1198, 1087, 988, 907, 828, 752, 675, 605, 540, 474, 414, 361, 308, 257, 212, 172, 137, 114, 91, 73, 65, 61, 61 },
 };
-const curves_k4 = [75][26]u16{
+const curves_k4 = [n_bank / 2][curveRows(bill.box_exl3.k4)]u16{
     .{ 3066, 2861, 2662, 2487, 2317, 2154, 1997, 1852, 1719, 1582, 1454, 1321, 1198, 1081, 975, 859, 756, 663, 570, 475, 387, 303, 218, 146, 88, 47 },
     .{ 3123, 2910, 2724, 2546, 2374, 2210, 2056, 1902, 1739, 1597, 1460, 1334, 1217, 1094, 975, 861, 755, 656, 556, 465, 376, 298, 220, 157, 98, 47 },
     .{ 2920, 2719, 2537, 2368, 2205, 2053, 1903, 1764, 1626, 1493, 1368, 1247, 1134, 1019, 906, 804, 708, 620, 527, 441, 356, 275, 208, 146, 88, 47 },
@@ -249,6 +252,11 @@ pub fn packOf(g: glm.Geometry) ?Pack {
         if (l.record_bytes != w.record_bytes or l.n_records != w.n_records or l.rows_per_unit != w.rows_per_unit) return null;
     }
     return p;
+}
+
+/// The rows a bank layer's curve stores: `lo`, `lo + step`, ... up to its experts.
+fn curveRows(l: glm.LayerSlots) usize {
+    return (experts(l) - lo) / step + 1;
 }
 
 fn experts(l: glm.LayerSlots) u32 {
