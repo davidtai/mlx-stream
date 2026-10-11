@@ -398,11 +398,14 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         }
 
         /// One phase boundary's record (`phase_memory.Record` over the bill's terms `billed`), logged as one JSON line;
-        /// then both high-water marks restart for the next phase. `peak`: MLX's peak over the phase when the wave probe
-        /// restarted it within the phase (the probe's own).
-        fn phaseRecord(self: *Self, phase: []const u8, billed: bill_mod.PhaseTerms, peak: ?u64) void {
+        /// then both high-water marks restart for the next phase. `peaks`: MLX's peak and the footprint's over the phase
+        /// when the wave probe restarted them within it (the probe's own).
+        fn phaseRecord(self: *Self, phase: []const u8, billed: bill_mod.PhaseTerms, peaks: ?Peaks) void {
             var r = phase_mem.Reading.now();
-            if (peak) |p| r.peak = @max(r.peak, p);
+            if (peaks) |p| {
+                r.peak = @max(r.peak, p.mlx);
+                r.process.footprint_interval_peak = @max(r.process.footprint_interval_peak, p.footprint);
+            }
             phase_mem.restart();
             const rec = phase_mem.recordAt(bill_mod.PhaseTerms, phase, billed, billed.sum(), billed.device(), r, self.file_backed_start);
             var buf: [4096]u8 = undefined;
@@ -511,10 +514,17 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             try self.g.evalAll(&.{logits.?});
             try self.ex.flush();
             _ = mlx.mlx_synchronize(self.g.s);
-            log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .mem = .{ .start = mem0, .end = Mem.now() } }});
+            // The wave probe restarted both high-water marks at each of its marks: the pass's are its own.
+            const peaks: ?Peaks = if (self.probe) |p| p.passPeaks() else null;
+            var mem1 = Mem.now();
+            if (peaks) |p| {
+                mem1.peak = @max(mem1.peak, p.mlx);
+                mem1.footprint_peak = @max(mem1.footprint_peak, p.footprint);
+            }
+            log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .mem = .{ .start = mem0, .end = mem1 } }});
             prefill_timers.report(ids.len);
             if (self.probe) |p| log.info("glm_moe_dsa: wave probe {f}\n", .{p.*});
-            self.phaseRecord("prompt pass", self.billed.terms(.prompt, self.prompt_units, self.prompt_units), if (self.probe) |p| p.passPeak() else null);
+            self.phaseRecord("prompt pass", self.billed.terms(.prompt, self.prompt_units, self.prompt_units), peaks);
             return logits.?;
         }
 
@@ -786,6 +796,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 /// MLX's allocator and this process's footprint at a boundary (MLX's counters, the kernel's ledgers:
 /// `phase_memory.Ledgers`, the shared reading).
 pub const Mem = phase_mem.Ledgers;
+/// The wave probe's pass high-water marks.
+const Peaks = graph.WaveProbe.Peaks;
 
 /// The box's used memory beside this process's (`sdk.memory.boxUsedBytes`, read right after `mem`): what the rest of
 /// the box holds is the used memory less this process's footprint and the page tables of its MLX bytes.
