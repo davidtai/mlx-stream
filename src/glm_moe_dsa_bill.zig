@@ -148,8 +148,14 @@ pub const StreamShape = struct {
     decode_window_rows: u32 = 48,
     /// The decode lookahead's speculative records per call.
     lookahead_budget: u32 = 2,
-    workers: u32 = 4,
+    /// The read pool's workers (`read_workers`).
+    workers: u32 = read_workers,
 };
+
+/// The read pool's workers: as many ranges in flight as the box's SSD needs for its full rate (it reads 16.1 GB/s at
+/// queue depth 4 and 16.4 at 8). With a job per range, decode at 4 / 6 / 8 / 12 workers ran 13.2 / 13.5 / 13.4 / 13.5
+/// tok/s (7a101e7, seed 1234, 85 units): flat past 6; 8 is the depth at which the drive reaches its full rate.
+pub const read_workers: u32 = 8;
 
 /// The MTP draft lane's part of a bill (`glm_moe_dsa_mtp.facts`): its depth, and its residents, its experts' arrays and
 /// their slot table as MLX allocates them (the lane measures them at its open and refuses more, `checkMtp`).
@@ -778,7 +784,7 @@ pub fn decodeWindowRows(cfg: *const settings.Config) u32 {
 
 /// The stream's shape the module builds from `cfg`.
 pub fn streamShape(cfg: *const settings.Config) StreamShape {
-    return .{ .wide_depth = cfg.wideDepth(), .decode_window_rows = decodeWindowRows(cfg), .lookahead_budget = cfg.lookaheadBudget(), .workers = cfg.readWorkers() };
+    return .{ .wide_depth = cfg.wideDepth(), .decode_window_rows = decodeWindowRows(cfg), .lookahead_budget = cfg.lookaheadBudget() };
 }
 
 /// The bill of `cfg`'s pack for prompts up to `prompt_tokens` (the SDK's view, `memoryBill`): the residents from the

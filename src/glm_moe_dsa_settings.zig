@@ -42,8 +42,6 @@ pub const Config = struct {
     expert_wide_depth: ?u8 = null,
     /// The decode lookahead's records read ahead per routed call (null = 2; 1 .. `max_lookahead_budget`).
     expert_lookahead_budget: ?u32 = null,
-    /// The read pool's workers (null = 8; 1 .. `max_read_workers`).
-    expert_read_workers: ?u32 = null,
     /// The most fill units the module takes (null = off; `min_units_cap` or more): the construction's fill and the
     /// handover's grow stop at it, so two arms of a measurement hold the same rows when the box beside them moves. It
     /// only lowers what the bill and the live reading admit (never raises it), so it is always safe. The harness's forced
@@ -76,7 +74,6 @@ pub const Config = struct {
     pub const max_wide_depth: i64 = 5;
     /// The lookahead's widest budget (`sdk_ext.expert.lookahead.max_budget`).
     pub const max_lookahead_budget: i64 = @import("sdk_ext.zig").expert.lookahead.max_budget;
-    pub const max_read_workers: i64 = @import("sdk_ext.zig").expert.io.max_workers;
     /// The least units cap: the fill's floor (`phase_memory.min_fill_rows`), under which a load is refused.
     pub const min_units_cap: i64 = @import("phase_memory.zig").min_fill_rows;
     /// The deepest draft a round verifies: its depth + 1 rows of top-8 routes in the stream's decode lane
@@ -126,10 +123,6 @@ pub const Config = struct {
         };
         if (obj.get("expert_lookahead_budget")) |v| if (v == .integer and v.integer >= 1 and v.integer <= max_lookahead_budget) {
             c.expert_lookahead_budget = @intCast(v.integer);
-            any = true;
-        };
-        if (obj.get("expert_read_workers")) |v| if (v == .integer and v.integer >= 1 and v.integer <= max_read_workers) {
-            c.expert_read_workers = @intCast(v.integer);
             any = true;
         };
         if (obj.get("expert_units_cap")) |v| if (v == .integer and v.integer >= 1 and v.integer <= std.math.maxInt(u32)) {
@@ -240,10 +233,6 @@ pub const Config = struct {
         return c.expert_lookahead_budget orelse 2;
     }
 
-    pub fn readWorkers(c: *const Config) u32 {
-        return c.expert_read_workers orelse 8;
-    }
-
     /// A `ctx_size` over the model's limit, refused by name (never a silent fall back to the standard context).
     pub fn checkCtxSize(c: *const Config) error{CtxSizeOverModelLimit}!void {
         const v = c.ctx_size_over_limit orelse return;
@@ -289,10 +278,6 @@ test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up 
     try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_lookahead_budget\": 4}")).lookaheadBudget());
     try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 5}")).lookaheadBudget());
     try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 0}")).lookaheadBudget());
-    try testing.expectEqual(@as(u32, 8), (Config{}).readWorkers());
-    try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_read_workers\": 4}")).readWorkers());
-    try testing.expectEqual(@as(u32, 8), (try settingsOf("{\"expert_read_workers\": 9}")).readWorkers());
-    try testing.expectEqual(@as(u32, 8), (try settingsOf("{\"expert_read_workers\": 0}")).readWorkers());
     try testing.expectEqual(@as(?u32, null), (Config{}).expert_units_cap);
     try testing.expectEqual(@as(?u32, 85), (try settingsOf("{\"expert_units_cap\": 85}")).expert_units_cap);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"expert_units_cap\": 0}")).expert_units_cap);
