@@ -268,6 +268,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             errdefer if (comptime has_kernels) self.kset.deinit();
             self.math = try Q.accept(G, gpa, &self.g, .{ .kernels = kref, .peek = &peek }, .{ .hidden = model.hidden_size, .inter = model.moe_intermediate_size, .top_k = model.n_experts_per_tok, .n_layers = model.nSparse(), .act = .swiglu, .input = .bfloat16 }, &diag);
             errdefer self.math.deinit(&self.g);
+            // The quant's self-check freed its arrays into MLX's cache: emptied, so the stream's arrays and the draft lane's
+            // are allocated at their own sizes (a cached buffer serves a request up to two pages smaller than itself).
+            self.g.clearCache();
             const n_bank: usize = self.inputs.bank.layers.len;
             self.prompt_rows = try gpa.alloc(u32, n_bank);
             errdefer gpa.free(self.prompt_rows);

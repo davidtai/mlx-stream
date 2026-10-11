@@ -678,6 +678,9 @@ pub fn Lane(comptime kind: BankKind) type {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
             self.* = .{ .gpa = gpa, .cfg1 = layerConfig(c), .weights = w, .head = undefined, .bank = undefined, .cache = undefined, .depth = depth, .mode = mode };
+            // MLX's cache emptied first: a buffer it holds would serve one of the lane's arrays at the cached buffer's
+            // size (up to two pages more), and the lane's bytes are billed at their own.
+            _ = mlx.mlx_clear_cache();
             var active0: usize = 0;
             _ = mlx.mlx_get_active_memory(&active0);
             self.head = try Head.bind(g, &self.weights, c, diag);
