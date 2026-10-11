@@ -168,6 +168,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         forced_rows: bool,
         /// The decode rows are the split's (`glm_moe_dsa_split`), not the even split's.
         split_rows: bool = false,
+        /// DIAG (diag/pool-copy-timers): the pool's counters at the handover (`diag_counters`).
+        diag0: [diag_counters.len]i64 = @splat(0),
         decoding: bool = false,
         /// The bill's inputs (the handover bills its request's KV from them), the load's baseline, MLX's target (the
         /// host's ceiling less its wired margin) and the box's RAM (the handover's target, `bill.targetOf`).
@@ -640,6 +642,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                     log.warn("glm_moe_dsa: the verify timeline is off ({s})\n", .{@errorName(e)});
             };
             self.decode_mark = .{ .s0 = self.stream.stats(), .mem0 = Mem.now(), .by0 = self.stream.lookaheadByRank() };
+            for (&self.diag0, diag_counters) |*x, c| x.* = self.stream.pool.counter(c);
             self.ex.host = .{};
             if (self.mtp) |ln| ln.counts = .{};
             for (self.layer_counts0, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
@@ -650,6 +653,30 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         fn decodeRowsAt(self: *Self, units: u32) void {
             self.split_rows = split_mod.decodeRows(self.inputs.bank, self.prompt_units, units, self.decode_rows) != null;
             if (!self.split_rows) _ = bill_mod.rowsAt(self.inputs.bank, units, self.decode_rows);
+        }
+
+        /// DIAG: the pool's staging copies and reads in this decode, per range kind, and its jobs' wake and run times.
+        fn diagLine(self: *Self) void {
+            var d: [diag_counters.len]f64 = undefined;
+            for (&d, diag_counters, self.diag0) |*x, c, b| x.* = @floatFromInt(self.stream.pool.counter(c) - b);
+            const f = struct {
+                fn ms(ns: f64, n: f64) f64 {
+                    return if (n > 0) ns / n / 1e6 else 0;
+                }
+                fn mb(bytes: f64, n: f64) f64 {
+                    return if (n > 0) bytes / n / 1e6 else 0;
+                }
+                fn gbs(bytes: f64, ns: f64) f64 {
+                    return if (ns > 0) bytes / ns else 0;
+                }
+            };
+            log.info("glm_moe_dsa: DIAG pool in decode: gate/up {d:.0} ranges of {d:.3} MB, preadv {d:.3} ms ({d:.2} GB/s), copy {d:.3} ms ({d:.2} GB/s) per range; down {d:.0} ranges of {d:.3} MB, preadv {d:.3} ms ({d:.2} GB/s), copy {d:.3} ms ({d:.2} GB/s) per range; adopted {d:.0} ranges of {d:.3} MB, copy {d:.3} ms ({d:.2} GB/s) per range; {d:.0} jobs: wake {d:.3} ms, run {d:.3} ms per job; the load's longest copy {d:.3} ms\n", .{
+                d[0], f.mb(d[1], d[0]), f.ms(d[2], d[0]), f.gbs(d[1], d[2]), f.ms(d[3], d[0]), f.gbs(d[1], d[3]),
+                d[4], f.mb(d[5], d[4]), f.ms(d[6], d[4]), f.gbs(d[5], d[6]), f.ms(d[7], d[4]), f.gbs(d[5], d[7]),
+                d[8], f.mb(d[9], d[8]), f.ms(d[10], d[8]), f.gbs(d[9], d[10]),
+                d[11], f.ms(d[12], d[11]), f.ms(d[13], d[11]),
+                @as(f64, @floatFromInt(self.stream.pool.counter(.diag_copy_max_ns))) / 1e6,
+            });
         }
 
         /// The request's end (the host's finish): its decode line, once; nothing when it never decoded.
@@ -685,6 +712,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }});
             self.phaseRecord("decode", self.requestTerms(), null);
             log.info("{f}\n", .{HostLine{ .h = self.ex.host, .wall_ns = d.wall_ns }});
+            self.diagLine();
             const by1 = self.stream.lookaheadByRank();
             log.info("{f}\n", .{PrecisionLine{ .by0 = &d.by0, .by1 = &by1 }});
             if (self.recorder) |rec| self.writeRoutes(rec);
@@ -1037,6 +1065,9 @@ pub const PromptLine = struct {
         if (p.mem) |m| try w.print("; {f}", .{m});
     }
 };
+
+/// DIAG (diag/pool-copy-timers): the counters `diagLine` reads, in its order.
+const diag_counters = [_]sdk_ext.expert.io.Counter{ .diag_gu_ranges, .diag_gu_bytes, .diag_gu_read_ns, .diag_gu_copy_ns, .diag_dn_ranges, .diag_dn_bytes, .diag_dn_read_ns, .diag_dn_copy_ns, .adopt_ranges, .adopt_bytes, .diag_adopt_copy_ns, .diag_jobs, .diag_wake_ns, .diag_job_ns };
 
 /// The decode's line, at the request's end. `wall_ns`: the time inside the steps.
 pub const DecodeLine = struct {

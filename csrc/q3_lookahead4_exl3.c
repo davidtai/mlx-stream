@@ -197,6 +197,10 @@ enum {
     SC_EV_HOST_RELEASED,  /* gates the host released (error paths) */
     SC_EV_STOP_RELEASED,  /* live gates released at stop */
     SC_DIRECT_RANGES,     /* demand ranges read straight into their rows (q3ld_direct_config: no staging, no copy) */
+    /* DIAG (diag/pool-copy-timers, not for merge): the staging path per range kind (gate/up: 4 parts or more) */
+    SC_DIAG_GU_RANGES, SC_DIAG_GU_BYTES, SC_DIAG_GU_READ_NS, SC_DIAG_GU_COPY_NS,
+    SC_DIAG_DN_RANGES, SC_DIAG_DN_BYTES, SC_DIAG_DN_READ_NS, SC_DIAG_DN_COPY_NS,
+    SC_DIAG_ADOPT_COPY_NS, SC_DIAG_COPY_MAX_NS, SC_DIAG_JOBS, SC_DIAG_WAKE_NS, SC_DIAG_JOB_NS,
     SC_N
 };
 
@@ -231,6 +235,7 @@ typedef struct {
     int64_t deadline;
     int64_t first;      /* first ticket */
     int32_t count;      /* ranges in the job */
+    int64_t t_queued;   /* DIAG: the submit's clock */
 } job_t;
 
 typedef struct {
@@ -475,6 +480,18 @@ static void gauge_enter(void) {
     pthread_mutex_unlock(&mu);
 }
 
+/* DIAG: one staging-path range's read and copy times into its kind's counters (no lock: atomics) */
+static void diag_range(const range_t *rg, int64_t bytes, int64_t read_ns, int64_t copy_ns) {
+    if (!sc) return;
+    int gu = rg->ndst >= 4;
+    __atomic_fetch_add(&sc[gu ? SC_DIAG_GU_RANGES : SC_DIAG_DN_RANGES], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&sc[gu ? SC_DIAG_GU_BYTES : SC_DIAG_DN_BYTES], bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&sc[gu ? SC_DIAG_GU_READ_NS : SC_DIAG_DN_READ_NS], read_ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&sc[gu ? SC_DIAG_GU_COPY_NS : SC_DIAG_DN_COPY_NS], copy_ns, __ATOMIC_RELAXED);
+    int64_t m = __atomic_load_n(&sc[SC_DIAG_COPY_MAX_NS], __ATOMIC_RELAXED);
+    while (copy_ns > m && !__atomic_compare_exchange_n(&sc[SC_DIAG_COPY_MAX_NS], &m, copy_ns, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
 static void gauge_exit(void) {
     pthread_mutex_lock(&mu);
     if (gauge[0] > 0) {
@@ -547,6 +564,7 @@ static int run_range_direct(const job_t *job, const range_t *rg, int64_t *out) {
 static int run_range(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
     if (direct_ok(job, rg)) return run_range_direct(job, rg, out);
     int64_t calls = 0, returned = 0, read_total = 0, t_start = 0;
+    int64_t diag_read = 0, diag_copy = 0;
     int status = ST_OK;
     int32_t d = 0;
     int64_t d_off = 0;
@@ -572,7 +590,9 @@ static int run_range(const job_t *job, const range_t *rg, char *stage, int64_t *
             if (LATE(job->deadline)) { status = ST_DEADLINE; break; }
             calls++;
             if (!t_start) t_start = q3ld_monotonic_ns();
+            int64_t tr0 = q3ld_monotonic_ns();
             r = do_preadv(job->fd, &iov, 1, (off_t)aligned_offset);
+            diag_read += q3ld_monotonic_ns() - tr0;
             if (r < 0) { out[4] = errno; status = ST_OSERR; break; }
             returned += r;
             if (LATE(job->deadline)) { status = ST_DEADLINE; break; }
@@ -585,6 +605,7 @@ static int run_range(const job_t *job, const range_t *rg, char *stage, int64_t *
         if (payload <= 0) { status = ST_SHORT; break; }
         const char *src = stage + skip;
         int64_t left = payload;
+        int64_t tc0 = q3ld_monotonic_ns();
         while (left > 0) {
             int64_t room = rg->len[d] - d_off;
             int64_t n = left < room ? left : room;
@@ -592,6 +613,7 @@ static int run_range(const job_t *job, const range_t *rg, char *stage, int64_t *
             src += n; left -= n; d_off += n;
             if (d_off == rg->len[d]) { d++; d_off = 0; while (d < rg->ndst && rg->len[d] == 0) d++; }
         }
+        diag_copy += q3ld_monotonic_ns() - tc0;
         read_total += payload;
     }
     out[1] = calls;
@@ -599,6 +621,7 @@ static int run_range(const job_t *job, const range_t *rg, char *stage, int64_t *
     out[3] = read_total;
     out[5] = t_start ? t_start : q3ld_monotonic_ns();
     out[6] = q3ld_monotonic_ns();
+    diag_range(rg, read_total, diag_read, diag_copy);
     return status;
 }
 
@@ -608,6 +631,7 @@ static int run_range(const job_t *job, const range_t *rg, char *stage, int64_t *
 static int run_range_pre(const job_t *job, pre_t *pr, char *stage, int64_t *out) {
     const range_t *rg = &pr->rg;
     int64_t calls = 0, returned = 0, read_total = 0, t_start = 0;
+    int64_t diag_read = 0, diag_copy = 0;
     int status = ST_OK;
     int32_t d = 0;
     int64_t d_off = 0;
@@ -634,7 +658,9 @@ static int run_range_pre(const job_t *job, pre_t *pr, char *stage, int64_t *out)
             if (LATE(job->deadline)) { status = ST_DEADLINE; break; }
             calls++;
             if (!t_start) t_start = q3ld_monotonic_ns();
+            int64_t tr0 = q3ld_monotonic_ns();
             r = do_preadv(job->fd, &iov, 1, (off_t)aligned_offset);
+            diag_read += q3ld_monotonic_ns() - tr0;
             if (r < 0) { out[4] = errno; status = ST_OSERR; break; }
             returned += r;
             if (LATE(job->deadline)) { status = ST_DEADLINE; break; }
@@ -657,6 +683,7 @@ static int run_range_pre(const job_t *job, pre_t *pr, char *stage, int64_t *out)
         }
         const char *src = stage + skip;
         int64_t left = payload;
+        int64_t tc0 = q3ld_monotonic_ns();
         while (left > 0) {
             int64_t room = rg->len[d] - d_off;
             int64_t n = left < room ? left : room;
@@ -664,6 +691,7 @@ static int run_range_pre(const job_t *job, pre_t *pr, char *stage, int64_t *out)
             src += n; left -= n; d_off += n;
             if (d_off == rg->len[d]) { d++; d_off = 0; while (d < rg->ndst && rg->len[d] == 0) d++; }
         }
+        diag_copy += q3ld_monotonic_ns() - tc0;
         read_total += payload;
     }
     out[1] = calls;
@@ -671,6 +699,7 @@ static int run_range_pre(const job_t *job, pre_t *pr, char *stage, int64_t *out)
     out[3] = read_total;
     out[5] = t_start ? t_start : q3ld_monotonic_ns();
     out[6] = q3ld_monotonic_ns();
+    diag_range(rg, read_total, diag_read, diag_copy);
     return status;
 }
 
@@ -724,7 +753,7 @@ static void run_pre(int i, int w, char *stage) {
     for (int k = 0; k < MAX_PRE; k++) n += pre[k].state == PR_INFLIGHT;
     if (n > sc[SC_PRE_MAX_INFLIGHT]) sc[SC_PRE_MAX_INFLIGHT] = n;
     EV(9, p->rg.offset);
-    job_t job = { p->fd, p->file_size, -1, 0, 0 };
+    job_t job = { p->fd, p->file_size, -1, 0, 0, 0 };
     pthread_mutex_unlock(&mu);
     RANGE_DELAY();
     int64_t out[RES_W] = { 0 };
@@ -825,6 +854,7 @@ static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
         if (rg->len[d]) memcpy((char *)(uintptr_t)rg->dst[d], src, (size_t)rg->len[d]);
         src += rg->len[d];
     }
+    if (sc) __atomic_fetch_add(&sc[SC_DIAG_ADOPT_COPY_NS], q3ld_monotonic_ns() - t_start, __ATOMIC_RELAXED);
     pthread_mutex_lock(&mu);
     s->readers -= 1;
     s->adopted += 1;
@@ -960,6 +990,8 @@ static void *worker(void *arg) {
         __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);
         EV(2, job.first);
         busy += 1;
+        int64_t t_deq = q3ld_monotonic_ns();
+        if (sc) { sc[SC_DIAG_JOBS] += 1; sc[SC_DIAG_WAKE_NS] += t_deq - job.t_queued; }
         pthread_mutex_unlock(&mu);
         int failed = 0;
         for (int32_t i = 0; i < job.count; i++) {
@@ -1026,6 +1058,7 @@ static void *worker(void *arg) {
         }
         pthread_mutex_lock(&mu);
         busy -= 1;
+        if (sc) sc[SC_DIAG_JOB_NS] += q3ld_monotonic_ns() - t_deq;
         pthread_cond_broadcast(&done_cv);
         pthread_cond_broadcast(&spec_cv);          /* the demand side got shallower */
         pthread_mutex_unlock(&mu);
@@ -1347,6 +1380,7 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     if (nspec) claim_ranges(fd, first, count);
     job_t *job = &queue[(qhead + qlen) % qcap];
     job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->first = first; job->count = count;
+    job->t_queued = q3ld_monotonic_ns();
     __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
     EV(1, first);
     pthread_cond_signal(&work_cv);
