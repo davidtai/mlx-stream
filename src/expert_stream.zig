@@ -107,16 +107,74 @@ pub fn traceBank(g: anytype, geom: *const Layer, rows: u32) !BankArraysOf(@TypeO
 }
 
 /// DEVROUTE's resident map of one layer from its policy: each resident expert's persistent slot as its packed
-/// (bank << 24 | row) through `src.slotRef`; non-resident experts 0.
-pub fn lutOf(pol: *const expert_policy.LayerPolicy, src: anytype, layer: u32, out: []u32) void {
+/// (bank << 24 | row) through `src.slotRef`; non-resident experts `miss`.
+pub fn lutOf(pol: *const expert_policy.LayerPolicy, src: anytype, layer: u32, out: []u32, miss: u32) void {
     for (out, 0..) |*o, e| {
-        o.* = 0;
+        o.* = miss;
         if (e >= pol.n_experts) continue;
         const s = pol.slotOf(@intCast(e)) orelse continue;
         if (s >= pol.capacity) continue;
         const ref = src.slotRef(layer, s);
         o.* = (@as(u32, @backingInt(ref.bank)) << 24) | ref.row;
     }
+}
+
+/// DEVROUTE's resident LUTs: per layer two u32 [n_experts] host arrays written in place (kept) from the source's
+/// `residentLut(layer, out)`. A layer's next decode call reads `current`; after its route, `afterRoute` writes the
+/// policy into the other LUT, which the layer's next call reads, so the host never writes a LUT a committed wave may
+/// still read.
+pub fn DevLuts(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        lut: [][2]G.T = &.{},
+        parity: []u1 = &.{},
+
+        /// Both LUTs of every layer written from `src`; the first call allocates `n_layers` pairs of `n_experts`.
+        pub fn writeAll(self: *Self, a: std.mem.Allocator, g: *G, n_layers: usize, n_experts: u32, src: anytype) !void {
+            if (self.lut.len == 0) {
+                self.lut = try a.alloc([2]G.T, n_layers);
+                self.parity = try a.alloc(u1, n_layers);
+                const zeros = try a.alloc(u32, n_experts);
+                defer a.free(zeros);
+                @memset(zeros, 0);
+                for (self.lut) |*pair| for (pair) |*x| {
+                    x.* = g.keep(try g.hostArray(std.mem.sliceAsBytes(zeros), &.{@intCast(n_experts)}, .uint32));
+                };
+            }
+            for (self.lut, self.parity, 0..) |pair, *par, l| {
+                for (pair) |x| src.residentLut(@intCast(l), try words(g, x));
+                par.* = 0;
+            }
+        }
+
+        /// Layer `layer`'s LUT for its next call: the policy after this call's route, in the LUT this call did not read.
+        pub fn afterRoute(self: *Self, g: *G, layer: u32, src: anytype) !void {
+            const next = self.parity[layer] +% 1;
+            src.residentLut(layer, try words(g, self.lut[layer][next]));
+            self.parity[layer] = next;
+        }
+
+        /// The LUT layer `layer`'s next call reads.
+        pub fn current(self: *const Self, layer: u32) G.T {
+            return self.lut[layer][self.parity[layer]];
+        }
+
+        /// `current`'s words, the memory the device reads.
+        pub fn currentWords(self: *const Self, g: *G, layer: u32) ![]u32 {
+            return words(g, self.current(layer));
+        }
+
+        pub fn deinit(self: *Self, a: std.mem.Allocator, g: *G) void {
+            for (self.lut) |pair| for (pair) |x| g.release(x);
+            a.free(self.lut);
+            a.free(self.parity);
+            self.* = .{};
+        }
+
+        fn words(g: *G, x: G.T) ![]u32 {
+            return std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(x))));
+        }
+    };
 }
 
 // ── StreamSource: the stream as an expert source (the EXL3 source's side of the contract) ──
@@ -173,7 +231,7 @@ pub const StreamSource = struct {
     /// DEVROUTE: layer `layer`'s resident map as the device reads it: `out[e]` = the packed (bank << 24 | row) of
     /// expert e's persistent slot, else 0 (a miss: the device row is computed from base row 0 and never joined).
     pub fn residentLut(self: *const StreamSource, layer: u32, out: []u32) void {
-        lutOf(&self.stream.layers[layer].policy, self.stream, layer, out);
+        lutOf(&self.stream.layers[layer].policy, self.stream, layer, out, 0);
     }
 
     /// The decode phase (the grown banks; DEVROUTE's LUTs exist).

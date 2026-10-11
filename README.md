@@ -201,6 +201,10 @@ the arch loads it in place of the affine bank:
 - The expert math is sushi's EXL3 MoE (`lib/sushi`). Each routed (token, expert) pair is one row of its 4 minis.
   Decode waves run the decode chain. A prompt slice past 16 pairs runs sushi's prefill GEMM; on the tensor units the
   plugin builds its routing table from the slots the host holds (`prefillTabled`), so nothing waits for the GPU.
+- In decode the hits run on the device (DEVROUTE): the routed ids go through each bank layer's table of residents
+  into GLM-5.3's EXL3 decode wave (`glm53_exl3`), which the call commits with the shared expert behind the router,
+  before the host reads the ids. The host then builds only the miss parts (the same kernels' decode waves), and one
+  combine sums each row's pairs.
 - The fill counts units: one unit is 1/128 of each bank layer's experts (148 K3 and 108 K4 experts per layer),
   rounded down per bank layer.
 

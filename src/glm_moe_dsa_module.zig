@@ -298,7 +298,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (gated and !gpu) self.event = try expert_event.createHost(@constCast(self.stream.eventWord().?), @as(i64, event_watchdog_ms) * std.time.ns_per_ms);
             self.w = try graph.Weights.bind(gpa, weights, model, &diag);
             errdefer self.w.deinit(gpa);
-            self.ex = try Experts.init(gpa, &self.g, self.stream, self.math, model.hidden_size, .{ .gated = gated, .event = self.event, .wide_depth = shape.wide_depth });
+            self.ex = try Experts.init(gpa, &self.g, self.stream, self.math, model.hidden_size, .{ .gated = gated, .event = self.event, .wide_depth = shape.wide_depth, .devroute = Experts.devroute_able });
             errdefer self.ex.deinit(&self.g);
             // The slot arrays are the quant's signature (every routed layer's base bank).
             for (self.ex.banks) |b| if (b[@backingInt(experts_mod.BankKind.base)]) |arr| try self.math.checkBank(&self.g, arr, &diag);
@@ -520,7 +520,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 self.decode_units = line.rows;
                 _ = bill_mod.rowsAt(self.inputs.bank, line.rows, self.decode_rows);
             }
-            try self.ex.grow(self.decode_rows);
+            try self.ex.grow(&self.g, self.decode_rows);
             line.grown = Mem.now();
             log.info("{f}\n", .{line});
             startPhase();

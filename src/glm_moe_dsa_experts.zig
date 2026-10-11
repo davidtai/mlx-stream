@@ -8,11 +8,14 @@
 //! A call of at most `max_route_ids` routed ids (decode, short prompts) is the decode lane: the routing barrier (the ids
 //! and, with the lookahead, the next routed layer's scores read on the host), the route, the residents' wave at once,
 //! then each miss part's gate/up after its gate/up bytes landed and its down after the rest (or every wave at once over
-//! event-gate aliases), the release; the outputs joined in routed order. A wider call is the wide lane, per bank layer:
-//! its residency seeded from the call's ids, the call's experts in groups of `max_route_ids` (its residents first, then
-//! the misses read at the layer's start (`stageMisses`), then the rest, each hottest first) routed up to `wide_depth`
-//! ahead, each group's rows per bank through the math's `prefill` in slices, committed as built and drained (while the
-//! host builds the next) before the group's slots go back; then the combine (on the GPU one launch over the groups' outputs, else the join and the op chain in token slices).
+//! event-gate aliases), the release; the outputs joined in routed order. DEVROUTE (`Options.devroute`, a quant with a
+//! device wave): the hits are each bank layer's device wave (the routed ids through its resident LUT), committed with
+//! the hoisted arrays before the barrier's wait; the parts are the quant's decode waves; its combine sums them. A wider
+//! call is the wide lane, per bank layer: its residency seeded from the call's ids, the call's experts in groups of
+//! `max_route_ids` (its residents first, then the misses read at the layer's start (`stageMisses`), then the rest, each
+//! hottest first) routed up to `wide_depth` ahead, each group's rows per bank through the math's `prefill` in slices,
+//! committed as built and drained (while the host builds the next) before the group's slots go back; then the combine
+//! (on the GPU one launch over the groups' outputs, else the join and the op chain in token slices).
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
@@ -110,6 +113,9 @@ pub const BankKind = sdk_ext.expert.BankKind;
 pub const SlotRef = sdk_ext.expert.SlotRef;
 pub const max_route_ids = expert_policy.max_route_ids;
 const n_banks = std.meta.fieldNames(BankKind).len;
+/// DEVROUTE's slot for a position the device wave does not serve: the quant's decode waves read no weight there and
+/// give zero.
+const skip_slot: u32 = 0xFFFF_FFFF;
 
 /// The driver's construction-time routes.
 /// The decode lane's host time per call, summed: blocked in the routing barrier (the GPU up to the router, with event
@@ -131,6 +137,11 @@ pub const Options = struct {
     event: ?expert_event.Event = null,
     /// The wide lane's groups in flight (at most the stream's `wide_depth`).
     wide_depth: u8 = 1,
+    /// DEVROUTE (decode, `Experts.devroute_able`): each call's hit waves on the device, the routed ids through each bank
+    /// layer's resident LUT into the quant's device wave, committed with the hoisted arrays behind the routing barrier's
+    /// arrays before the host waits on them (HOIST_FIRST); after the route the host builds only the miss parts (the
+    /// quant's decode waves), and the quant's combine sums every position from its wave.
+    devroute: bool = false,
 };
 
 pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
@@ -146,6 +157,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         pub const bpl: u32 = if (@hasDecl(Bk, "banks_per_layer")) Bk.banks_per_layer else 1;
         /// The quant fuses gate, up and down (`M.fused`): each wave runs once all its segments landed.
         const fused = @hasDecl(M, "fused_waves") and M.fused_waves;
+        /// DEVROUTE (`Options.devroute`): a bank of several bank layers per routed layer whose quant has the device wave,
+        /// the decode wave and the combine (`decodeWaveDevice`, `decodeWave`, `decodeCombine`).
+        pub const devroute_able = bpl > 1 and @hasDecl(M, "decodeWaveDevice") and @hasDecl(M, "decodeWave") and @hasDecl(M, "decodeCombine");
         comptime {
             if (bpl > 1 and !fused) @compileError("a bank of several bank layers per routed layer streams through a fused quant");
         }
@@ -168,6 +182,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         host: HostSplit = .{},
         /// The wide lane's combine on the GPU (`combine_source`), built at its first call.
         combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
+        /// DEVROUTE: each bank layer's resident LUTs, written at the grow and after each route (empty without it).
+        dev: expert_stream.DevLuts(G) = .{},
+        /// DEVROUTE: the routed positions whose LUT entry the route's plan contradicted (a hit the device wave did not
+        /// serve at the plan's slot, served by a host wave; or a miss it served); 0 in every test.
+        dev_mismatch: u64 = 0,
 
         /// The routes of the prompt layer whose misses were read at its start (`stageMisses`): each route's bank layer and
         /// experts, in route order; null once the call took it.
@@ -209,6 +228,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         };
 
         pub fn init(a: std.mem.Allocator, g: *G, stream: *Stream, math: *M, hidden: u32, opt: Options) !Self {
+            if (opt.devroute and !devroute_able) return error.DevrouteNotInQuant;
             if (opt.gated and !stream.gated) return error.GatedNeedsStreamEvent;
             if (opt.gated and G == ops.MlxOps and opt.event == null) return error.GatedNeedsEvent;
             if (opt.wide_depth < 1 or opt.wide_depth > stream.wide_depth) return error.WideDepthExceedsStream;
@@ -223,6 +243,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         }
 
         pub fn deinit(self: *Self, g: *G) void {
+            self.dev.deinit(self.a, g);
             if (self.combine_kernel) |kern| _ = mlx.mlx_fast_metal_kernel_free(kern);
             self.staged.experts.deinit(self.a);
             self.wide.deinit(self.a, g);
@@ -253,15 +274,28 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             return self.stream.releaseTransient();
         }
 
-        /// The one phase change: the stream grows; the grown rows and decode's window 0 are bound.
-        pub fn grow(self: *Self, decode_rows: []const u32) !void {
+        /// The one phase change: the stream grows; the grown rows and decode's window 0 are bound; DEVROUTE's LUTs are
+        /// written from the grown policies (the decode's first calls read them).
+        pub fn grow(self: *Self, g: *G, decode_rows: []const u32) !void {
             try self.stream.grow(decode_rows);
             for (self.banks, 0..) |*b, l| {
                 b[@backingInt(BankKind.ext)] = try bind(self.stream, @intCast(l), .ext);
                 b[@backingInt(BankKind.transient)] = try bind(self.stream, @intCast(l), .transient);
             }
             self.transient_released = false;
+            if (self.opt.devroute) try self.dev.writeAll(self.a, g, self.banks.len, self.n_experts, LutSource{ .stream = self.stream });
         }
+
+        /// DEVROUTE's LUT source (`expert_stream.DevLuts`): each bank layer's residents through `expert_stream.lutOf`,
+        /// every other expert at `skip_slot`, so the device wave reads no weight for it (a GLM-5.3 piece: its quant's
+        /// waves skip that slot, DeepSeek-V4.1's banked texts compute base row 0 and its join replaces the row).
+        const LutSource = struct {
+            stream: *const Stream,
+
+            pub fn residentLut(self: LutSource, layer: u32, out: []u32) void {
+                expert_stream.lutOf(&self.stream.layers[layer].policy, self.stream, layer, out, skip_slot);
+            }
+        };
 
         /// The reverse phase change's free: the grown rows' and window 0's bindings nulled, then the stream frees them.
         pub fn shrink(self: *Self, prompt_rows: []const u32) !u64 {
@@ -416,8 +450,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const n: u32 = @intCast(g.shapeOf(x).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
             if (n * k > self.stream.max_route_ids) return self.callWide(g, layer, x, indices, scores, n, k);
-            const y = if (bpl > 1) try self.callDecodeSplit(g, layer, x, indices, next_scores, n, k, hoist) else try self.callDecode(g, layer, x, indices, next_scores, n, k, hoist);
-            return combine(g, y, scores, g.dtypeOf(x));
+            if (bpl > 1) return self.callDecodeSplit(g, layer, x, indices, scores, next_scores, n, k, hoist);
+            return combine(g, try self.callDecode(g, layer, x, indices, next_scores, n, k, hoist), scores, g.dtypeOf(x));
         }
 
         /// `(y * scores[..., None]).sum(-2)` in f32, cast to `dt` (the reference's combine).
@@ -681,8 +715,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// expert and every route made before any wave (their reads in flight together; the last route settles the
         /// lookahead and reads ahead the next routed layer's experts over all its bank layers), every route's hit wave
         /// and the hoisted arrays in one commit, then each route's parts as fused waves, each once all its segments
-        /// landed; the outputs `[n, k, hidden]` in routed order.
-        fn callDecodeSplit(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
+        /// landed; the outputs joined in routed order and combined with `scores`: `[n, hidden]` in x's dtype. DEVROUTE
+        /// (`devOn`): the hit waves are the device's, committed with the hoisted arrays before the barrier's wait; the
+        /// parts and any hit the device did not serve are the quant's decode waves; the quant's combine sums them.
+        fn callDecodeSplit(self: *Self, g: *G, layer: u32, x: T, indices: T, scores: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
             const n_ids = n * k;
             const bank = self.stream.bank;
             const t0 = nowNs();
@@ -691,6 +727,35 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             var score_buf: [sdk_ext.expert.lookahead.max_rows * 512]f32 = undefined;
             var sc: []const f32 = &.{};
             const read_next = next_scores != null and self.stream.route_lookahead and n * self.n_experts <= score_buf.len;
+            // Comptime false for a quant without the device wave, so its branches are not analyzed.
+            const dev_on = if (comptime devroute_able) self.devOn(g, x, n, k) else false;
+            // DEVROUTE: the barrier's arrays committed, then every bank layer's device hit wave and the hoisted arrays
+            // behind them, before the host waits (the GPU runs them while the host wakes, routes and encodes the parts).
+            var src: Sources = .{};
+            if (dev_on) {
+                const flat = try g.reshape(indices, &.{@intCast(n_ids)});
+                for (0..bpl) |i| {
+                    const sl = bpl * layer + @as(u32, @intCast(i));
+                    const slots = try g.take(self.dev.current(sl), flat, 0);
+                    try src.add(try self.math.decodeWaveDevice(g, x, slots, &(try self.banks3(sl, null)), scores));
+                }
+                var bar: [2]T = .{ indices, undefined };
+                var n_bar: usize = 1;
+                if (read_next) {
+                    bar[1] = next_scores.?;
+                    n_bar = 2;
+                }
+                try g.asyncEval(bar[0..n_bar]);
+                var early: [bpl + 4]T = undefined;
+                @memcpy(early[0..bpl], src.items[0..bpl]);
+                var n_early: usize = bpl;
+                for (hoist) |h| {
+                    if (n_early == early.len) break;
+                    early[n_early] = h;
+                    n_early += 1;
+                }
+                try g.asyncEval(early[0..n_early]);
+            }
             if (read_next) {
                 try g.evalAll(&.{ indices, next_scores.? });
                 sc = try g.hostF32(next_scores.?, score_buf[0 .. n * self.n_experts]);
@@ -737,21 +802,28 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const t2 = nowNs();
             defer self.noteHost(t0, t1, t2);
             var acc: Acc = .{};
-            // Every route's hit wave and the hoisted arrays in one commit, ahead of every wait on a read.
-            var early: [bpl * n_banks + 4]T = undefined;
-            var n_early: usize = 0;
-            for (&sides) |*sd| if (sd.r != null) for (try self.fusedWave(g, sd, x, k, 0, &acc, null)) |o| {
-                early[n_early] = o;
-                n_early += 1;
-            };
-            for (hoist) |h| {
-                if (n_early == early.len) break;
-                early[n_early] = h;
-                n_early += 1;
+            // DEVROUTE: per routed position its source in the combine (source << 24 | its row there).
+            var loc: [max_route_ids]u32 = @splat(skip_slot);
+            if (dev_on) {
+                for (&sides, 0..) |*sd, i| if (sd.r != null) try self.devServed(g, sd, @intCast(i), x, scores, k, &src, &loc);
+            } else {
+                // Every route's hit wave and the hoisted arrays in one commit, ahead of every wait on a read.
+                var early: [bpl * n_banks + 4]T = undefined;
+                var n_early: usize = 0;
+                for (&sides) |*sd| if (sd.r != null) for (try self.fusedWave(g, sd, x, k, 0, &acc, null)) |o| {
+                    early[n_early] = o;
+                    n_early += 1;
+                };
+                for (hoist) |h| {
+                    if (n_early == early.len) break;
+                    early[n_early] = h;
+                    n_early += 1;
+                }
+                if (n_early > 0) try g.asyncEval(early[0..n_early]);
             }
-            if (n_early > 0) try g.asyncEval(early[0..n_early]);
             if (comptime timeline.enabled) timeline.point(layer, .hit, 0, false);
             var prev: []const T = &.{};
+            var prev_dev: [1]T = undefined;
             var missed = false;
             var gu_first: u64 = 0;
             for (&sides) |*sd| if (sd.r) |r| {
@@ -770,24 +842,116 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                             const arrays = self.banks[sd.sl][b] orelse return error.SlotArraysUnbound;
                             over[b] = try self.waitAll(g, arrays, gates.down_first + p, prev);
                         }
-                        prev = try self.fusedWave(g, sd, x, k, @intCast(p + 1), &acc, &over);
+                        if (dev_on) {
+                            if (try self.hostWave(g, sd, x, scores, k, @intCast(p + 1), null, &over, &src, &loc)) |y| {
+                                prev_dev[0] = y;
+                                prev = &prev_dev;
+                            }
+                        } else prev = try self.fusedWave(g, sd, x, k, @intCast(p + 1), &acc, &over);
                     }
                 } else for (0..r.n_parts) |p| {
                     try self.stream.waitGu(r, @intCast(p));
                     try self.stream.waitDown(r, @intCast(p));
-                    try g.asyncEval(try self.fusedWave(g, sd, x, k, @intCast(p + 1), &acc, null));
+                    if (dev_on) {
+                        if (try self.hostWave(g, sd, x, scores, k, @intCast(p + 1), null, null, &src, &loc)) |y| try g.asyncEval(&.{y});
+                    } else try g.asyncEval(try self.fusedWave(g, sd, x, k, @intCast(p + 1), &acc, null));
                 }
             };
             if (comptime timeline.enabled) timeline.point(layer, .end, self.readGauge(), missed);
             for (&sides) |*sd| if (sd.r) |r| {
                 self.stream.release(r);
                 sd.r = null;
+                // DEVROUTE: the bank layer's next call reads the policy after this route (the other LUT of its pair).
+                if (dev_on) try self.dev.afterRoute(g, sd.sl, LutSource{ .stream = self.stream });
             };
+            if (dev_on) {
+                for (loc[0..n_ids]) |l| std.debug.assert(l != skip_slot);
+                return self.math.decodeCombine(g, src.items[0..src.n], loc[0..n_ids], n);
+            }
             const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
             var order: [max_route_ids]u32 = undefined;
             for (acc.pos[0..acc.n_pos], 0..) |p, j| order[p] = @intCast(j);
             const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
-            return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+            return combine(g, try g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden }), scores, g.dtypeOf(x));
+        }
+
+        /// DEVROUTE on this call: installed, the decode phase (the LUTs written), a call of the quant's top-k within its
+        /// widest decode wave, bf16 rows.
+        fn devOn(self: *const Self, g: *G, x: T, n: u32, k: u32) bool {
+            return self.opt.devroute and self.stream.phase == .decode and self.dev.lut.len > 0 and k == M.top_k and
+                n * k <= M.max_decode_rows and g.dtypeOf(x) == .bfloat16;
+        }
+
+        /// DEVROUTE's combine sources: the bank layers' device waves first (source i: bank layer i of the call), then
+        /// each host wave (`hostWave`) in the order built; every one f32 `[pairs, hidden]`, each pair times its score.
+        const Sources = struct {
+            items: [bpl + 2 * max_route_ids]T = undefined,
+            n: usize = 0,
+
+            fn add(s: *Sources, y: T) !void {
+                if (s.n == s.items.len) return error.TooManyWaves;
+                s.items[s.n] = y;
+                s.n += 1;
+            }
+        };
+
+        /// DEVROUTE: side `sd`'s hits from its device wave (source `side`) where the LUT the wave read holds the plan's
+        /// slot; any other hit through a host wave (`dev_mismatch` counts it, and every miss the LUT held resident).
+        fn devServed(self: *Self, g: *G, sd: *const Side, side: u32, x: T, scores: T, k: u32, src: *Sources, loc: *[max_route_ids]u32) !void {
+            const lut = try self.dev.currentWords(g, sd.sl);
+            var fix: [max_route_ids]bool = @splat(false);
+            var n_fix: u32 = 0;
+            for (sd.waves[0..sd.n], sd.refs[0..sd.n], sd.ids[0..sd.n], sd.pos[0..sd.n], 0..) |w, ref, e, pos, i| {
+                const packed_slot = (@as(u32, @backingInt(ref.bank)) << 24) | ref.row;
+                if (w != 0) {
+                    if (lut[e] != skip_slot) self.dev_mismatch += 1;
+                } else if (lut[e] == packed_slot) {
+                    loc[pos] = (side << 24) | @as(u32, pos);
+                } else {
+                    fix[i] = true;
+                    n_fix += 1;
+                }
+            }
+            if (n_fix == 0) return;
+            self.dev_mismatch += n_fix;
+            _ = try self.hostWave(g, sd, x, scores, k, 0, &fix, null, src, loc);
+        }
+
+        /// DEVROUTE: side `sd`'s positions in wave `w` (those `only` marks, when given) through the quant's decode wave
+        /// over `over`'s waited arrays (else the bank layer's), each pair's output times its score: a combine source,
+        /// each position's row in it in `loc`; null when the wave has no position.
+        fn hostWave(self: *Self, g: *G, sd: *const Side, x: T, scores: T, k: u32, w: u8, only: ?*const [max_route_ids]bool, over: ?*const [n_banks]?Arrays, src: *Sources, loc: *[max_route_ids]u32) !?T {
+            var pairs: [max_route_ids][3]u32 = undefined;
+            var m: u32 = 0;
+            const at: u32 = @intCast(src.n);
+            for (sd.waves[0..sd.n], sd.refs[0..sd.n], sd.pos[0..sd.n], 0..) |wv, ref, pos, i| {
+                if (wv != w) continue;
+                if (only) |o| if (!o[i]) continue;
+                const p32: u32 = pos;
+                pairs[m] = .{ p32 / k, (@as(u32, @backingInt(ref.bank)) << 24) | ref.row, p32 };
+                loc[pos] = (at << 24) | m;
+                m += 1;
+            }
+            if (m == 0) return null;
+            const y = try self.math.decodeWave(g, x, pairs[0..m], &(try self.banks3(sd.sl, over)), scores);
+            try src.add(y);
+            return y;
+        }
+
+        /// Bank layer `sl`'s three bank kinds' arrays for the quant's decode waves (`over`'s waited arrays when given):
+        /// a kind without arrays takes another kind's (no slot names it).
+        fn banks3(self: *const Self, sl: u32, over: ?*const [n_banks]?Arrays) ![3]Arrays {
+            comptime std.debug.assert(n_banks == 3);
+            const bs = if (over) |o| o.* else self.banks[sl];
+            var fill: ?Arrays = null;
+            for (bs) |b| if (b != null) {
+                fill = b;
+                break;
+            };
+            const f = fill orelse return error.SlotArraysUnbound;
+            var out: [3]Arrays = undefined;
+            for (&out, bs) |*o, b| o.* = b orelse f;
+            return out;
         }
 
         /// Side `sd`'s positions in wave `w`, grouped by bank in first appearance: each group's rows of x through the

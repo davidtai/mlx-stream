@@ -384,7 +384,7 @@ test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's hos
         for ([_]u32{ 9, 3, 1, 0, 1, 3, 6, 1 }) |n| {
             if (n == 0) {
                 _ = try ex.releaseTransient();
-                try ex.grow(&decode_rows);
+                try ex.grow(&g, &decode_rows);
                 continue;
             }
             for (0..4) |layer| {

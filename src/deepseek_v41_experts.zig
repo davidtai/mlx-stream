@@ -340,7 +340,7 @@ pub const FakeSource = struct {
 
     /// DEVROUTE: as `StreamSource.residentLut`.
     pub fn residentLut(self: *const FakeSource, layer: u32, out: []u32) void {
-        lutOf(&self.policies[layer], self, layer, out);
+        lutOf(&self.policies[layer], self, layer, out, 0);
     }
 
     pub fn decoding(self: *const FakeSource) bool {
@@ -835,12 +835,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// `post_hit` nothing), so the GPU runs the hoist while the host wakes, routes and encodes the hit wave.
         pre_barrier: *const PreBarrierFn = preBarrierNone,
         post_hit: *const PostHitFn = postHitHoist,
-        /// DEVROUTE (`Options.devroute`): per layer two resident LUTs (u32 [n_experts], host arrays written in place, kept),
-        /// the one each layer's next decode call reads (`dev_parity`): a call reads one, its route's result is written
-        /// into the other, so the host never writes a LUT a committed wave may still read. Empty without the route.
+        /// DEVROUTE (`Options.devroute`): per layer two resident LUTs (`expert_stream.DevLuts`): a call reads one, its
+        /// route's result is written into the other. Empty without the route.
         devroute: bool = false,
-        dev_lut: [][2]T = &.{},
-        dev_parity: []u1 = &.{},
+        dev: expert_stream.DevLuts(G) = .{},
 
         const GateUpWaveFn = fn (self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, w: u8, over: ?*const [n_banks]?Arrays) anyerror!Wave;
         const DownWaveFn = fn (self: *Self, g: *G, layer: u32, wave: *const Wave, acc: *Acc, over: ?*const [n_banks]?Arrays) anyerror![]const T;
@@ -948,21 +946,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         fn devLutsAtGrowIn(self: *Self, g: *G) !void {
-            if (self.dev_lut.len == 0) {
-                const n_l = self.banks.len;
-                self.dev_lut = try self.a.alloc([2]T, n_l);
-                self.dev_parity = try self.a.alloc(u1, n_l);
-                const zeros = try self.a.alloc(u32, self.n_experts);
-                defer self.a.free(zeros);
-                @memset(zeros, 0);
-                for (self.dev_lut) |*pair| for (pair) |*x| {
-                    x.* = g.keep(try g.hostArray(std.mem.sliceAsBytes(zeros), &.{@intCast(self.n_experts)}, .uint32));
-                };
-            }
-            for (self.dev_lut, self.dev_parity, 0..) |pair, *par, l| {
-                for (pair) |x| self.source.residentLut(@intCast(l), std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(x)))));
-                par.* = 0;
-            }
+            return self.dev.writeAll(self.a, g, self.banks.len, self.n_experts, self.source);
         }
 
         /// DEVROUTE: layer `layer`'s LUT for its next call, from the policy after this call's route; that call reads it.
@@ -973,9 +957,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         fn devLutAfterRouteIn(self: *Self, g: *G, layer: u32) !void {
-            const next = self.dev_parity[layer] +% 1;
-            self.source.residentLut(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next])))));
-            self.dev_parity[layer] = next;
+            return self.dev.afterRoute(g, layer, self.source);
         }
 
         /// DEVROUTE: the call's every routed pair through the banked texts, the slots from the layer's LUT on the device
@@ -989,7 +971,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
         fn devWaveIn(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !T {
             const nk: c_int = @intCast(n * k);
-            const lut = self.dev_lut[layer][self.dev_parity[layer]];
+            const lut = self.dev.current(layer);
             const ids = try g.take(lut, try g.reshape(indices, &.{nk}), 0);
             var tok: [max_route_ids]i32 = undefined;
             for (tok[0 .. n * k], 0..) |*t, p| t.* = @intCast(p / k);
@@ -1054,9 +1036,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.dev_lut) |pair| for (pair) |x| self.g.release(x);
-            self.a.free(self.dev_lut);
-            self.a.free(self.dev_parity);
+            self.dev.deinit(self.a, self.g);
             self.wide.deinit(self.a);
             self.a.free(self.banks);
             self.* = undefined;
@@ -4367,9 +4347,9 @@ test "dsv41 experts: DEVROUTE: in decode the device hit wave is committed behind
     defer ex.deinit();
     try testing.expect(ex.devRoute());
     // A decode-width prompt call (before the grow) runs the stock body: no LUT yet.
-    try testing.expectEqual(@as(usize, 0), ex.dev_lut.len);
+    try testing.expectEqual(@as(usize, 0), ex.dev.lut.len);
     try ex.grow(&g, &.{ 8, 8 });
-    try testing.expectEqual(@as(usize, 2), ex.dev_lut.len);
+    try testing.expectEqual(@as(usize, 2), ex.dev.lut.len);
     src.log.clearRetainingCapacity();
     src.trace = &g;
     var script: Script = .{ .calls = &.{ &.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 7, 1, 7, 9, 3 } } };
@@ -4377,7 +4357,7 @@ test "dsv41 experts: DEVROUTE: in decode the device hit wave is committed behind
     const xf = try g.input(&.{ 2, 256 }, .bfloat16);
     const idx = try g.input(&.{ 2, 3 }, .int32);
     for (0..2) |call_i| {
-        const before = ex.dev_parity[0];
+        const before = ex.dev.parity[0];
         const start = g.nodes.items.len;
         const out = try ex.at(0).routedHoist(&g, xf, idx, &.{});
         try testing.expect(g.shapeOf(out).eql(ops.Shape.of(&.{ 2, 3, 256 })));
@@ -4400,11 +4380,11 @@ test "dsv41 experts: DEVROUTE: in decode the device hit wave is committed behind
         // of gate/up + down = 4; call 2: one part = 2)
         try testing.expectEqual(@as(usize, 2), commits_before_read);
         try testing.expectEqual(@as(usize, if (call_i == 0) 4 else 2), commits_after_route);
-        try testing.expect(ex.dev_parity[0] != before);
+        try testing.expect(ex.dev.parity[0] != before);
         // the LUT the next call reads is the policy after this route
         var want: [16]u32 = undefined;
         src.residentLut(0, &want);
-        const got = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[0][ex.dev_parity[0]]))));
+        const got = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev.current(0)))));
         try testing.expectEqualSlices(u32, &want, got);
     }
     try ex.flush();
@@ -4462,7 +4442,7 @@ const DevHoistRun = struct {
         const tail = [_]u32{ try g.input(&.{ 2, 256 }, .float32), try g.input(&.{ 2, 3 }, .float32) };
         const first = g.nodes.items.len;
         for (0..2) |call| {
-            const parity0 = if (devroute) ex.dev_parity[0] else 0;
+            const parity0 = if (devroute) ex.dev.parity[0] else 0;
             const n0 = g.nodes.items.len;
             const c0 = g.commit_spans.items.len;
             const out_arr = try ex.at(0).routedHoist(&g, xf, idx, &tail);
@@ -4490,10 +4470,10 @@ const DevHoistRun = struct {
                 if (i >= r_at and cls != 'H') out.post_route[call] += 1;
             };
             if (devroute) {
-                out.flipped[call] = ex.dev_parity[0] != parity0;
+                out.flipped[call] = ex.dev.parity[0] != parity0;
                 var want: [16]u32 = undefined;
                 src.residentLut(0, &want);
-                const got = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[0][ex.dev_parity[0]]))));
+                const got = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev.current(0)))));
                 out.lut_ok[call] = std.mem.eql(u32, &want, got);
             }
         }

@@ -504,7 +504,7 @@ test "glm53 exl3 quant: claims GLM-5.3's EXL3 bank only; accept refuses what the
 
 const old_quant = sushi_quant;
 
-test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver equals sushi's host decode of the records: both bank layers, every lane, host waits and event gates" {
+test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver equals sushi's host decode of the records: both bank layers, every lane, host waits and event gates, with and without DEVROUTE" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const G = @import("glm_moe_dsa_graph.zig").G;
@@ -531,7 +531,9 @@ test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver 
     var rng = std.Random.DefaultPrng.init(11);
     var worst: f32 = 0;
     var scale: f32 = 0;
-    for ([_]bool{ false, true }) |gated| {
+    for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true }, .{ true, true } }) |mode| {
+        const gated = mode[0];
+        const devroute = mode[1];
         var g = try G.init(a, s);
         defer g.deinit();
         var ev: ?expert_event.Event = null;
@@ -547,14 +549,14 @@ test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver 
         const p = try b.peek(arena.allocator());
         const math = try accept(G, a, &g, .{ .kernels = set.ref(), .peek = &p }, .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = k, .n_layers = 4, .act = .swiglu, .input = .bfloat16 }, &diag);
         defer math.deinit(&g);
-        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .gated = gated, .event = ev, .wide_depth = 2 });
+        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .gated = gated, .event = ev, .wide_depth = 2, .devroute = devroute });
         defer ex.deinit(&g);
         for (ex.banks) |bk| if (bk[0]) |arr| try math.checkBank(&g, arr, &diag);
         // The prompt phase's widths (9 rows: the wide lane; 3 and 1: the decode lane), then the decode phase's 1 to 6.
         for ([_]u32{ 9, 3, 1, 0, 1, 3, 6, 2, 4, 5, 1 }) |n| {
             if (n == 0) {
                 _ = try ex.releaseTransient();
-                try ex.grow(&decode_rows);
+                try ex.grow(&g, &decode_rows);
                 continue;
             }
             for (0..4) |layer| {
@@ -596,8 +598,10 @@ test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver 
             }
         }
         const stats = st.stats();
-        std.debug.print("glm53 exl3 quant [{s}]: {d} routes, {d} hits, {d} misses, lookahead {d} issued / {d} used\n", .{ if (gated) "event gates" else "host waits", stats.route_calls, stats.expert_cache_hits, stats.expert_cache_misses, stats.spec_issued, stats.claimed });
+        std.debug.print("glm53 exl3 quant [{s}{s}]: {d} routes, {d} hits, {d} misses, lookahead {d} issued / {d} used\n", .{ if (gated) "event gates" else "host waits", if (devroute) ", DEVROUTE" else "", stats.route_calls, stats.expert_cache_hits, stats.expert_cache_misses, stats.spec_issued, stats.claimed });
         try testing.expect(stats.expert_cache_misses > 0 and stats.transient_loads > 0);
+        // DEVROUTE: every hit the plan made the device wave served at the plan's slot, and no miss.
+        try testing.expectEqual(@as(u64, 0), ex.dev_mismatch);
     }
     std.debug.print("glm53 exl3 quant: streamed MoE against the host decode, max |delta| {d:.5} at outputs up to {d:.3} ({d:.2} bf16 ulp of the scale)\n", .{ worst, scale, worst / selfcheck.bf16Ulp(scale) });
     try testing.expect(scale > 0.1);
