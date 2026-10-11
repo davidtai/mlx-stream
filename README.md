@@ -168,6 +168,27 @@ Supported pack: a directory whose `config.json` has `"model_type": "glm_moe_dsa"
 The source builds are `pipenetwork/GLM-5.3-MLX-mixed-4_8bit` (4-bit experts, 8-bit trunk) and
 `pipenetwork/GLM-5.3-MLX-4bit`. A bank of 3-bit experts (`mixed-3_6bit`) uses the same format at `bits` 3.
 
+An EXL3 pack serves the routed experts of `davidsyoung/GLM-5.3-EXL3-TR3-3.42bpw` with the affine pack's trunk
+(`scripts/convert_glm_exl3_bank.py`, docs/glm53-exl3-pack-format.md). When the pack has `expert-manifest-exl3-v1.json`,
+the arch loads it in place of the affine bank:
+
+| file | content |
+|---|---|
+| `experts.bin` | per routed layer a K3 and a K4 bank layer; one record per mini-expert (one tensor-parallel rank of one expert: nine segments, the trellis `code` I16 and `rout` / `rin` F16 per projection, bytes as published); 3,579,904 B at K3, 4,759,552 B at K4 |
+| `expert-manifest-exl3-v1.json` | the bank layers, segments, records, each expert's bank layer and local index; the arch refuses a manifest that does not match `config.json` by name |
+| `model-*.safetensors`, `model.safetensors.index.json`, `config.json` | the affine pack's (hard links) |
+| `mtp/` | the MTP layer's directory (below) |
+
+- A routed id is an expert of one bank layer. Its slot holds its 4 minis in adjacent rows, read as 4 records.
+- A call's ids split by bank layer: the K3 and K4 routes are live together and their reads run in parallel.
+- The lookahead reads ahead the next routed layer's experts over both its bank layers, each record at its own bank
+  layer's length.
+- The expert math is sushi's EXL3 MoE (`lib/sushi`, the davidtai fork). Each routed (token, expert) pair is one row of
+  its 4 minis. Decode waves run the decode chain. A prompt slice past 16 pairs runs the prefill GEMM over the slots the
+  host holds, so nothing waits for the GPU.
+- The fill counts units: one unit is 1/128 of each bank layer's experts (148 K3 and 108 K4 experts per layer),
+  rounded down per bank layer.
+
 Settings (`model-settings.json`):
 
 | key | values | default |
@@ -180,6 +201,7 @@ Settings (`model-settings.json`):
 | `mtp_depth` | the MTP draft lane's drafts per round, 0 to 5 (6 or more is refused at load) | 0 (off) |
 | `mtp_acceptance` | `exact` or `typical` | `exact` |
 | `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |
+| `expert_lookahead_budget` | the decode lookahead's records read ahead per routed call, 1 to 4 | 2 |
 
 Memory: one slot row is one 21.2 MB record on each of the 75 routed layers (1.59 GB). The KV costs 95,232 B per
 position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16),
@@ -191,7 +213,14 @@ At a 240 GiB ceiling, a 2 GiB margin, a 10 GB baseline and the mixed build's 20.
 
 Each request logs one `glm_moe_dsa: prompt` line at the end of its prompt pass and one `glm_moe_dsa: decode` line at
 its end (the arch's `requestEnd`), with the phase's wall time, SSD bytes, records read, read-ahead or lookahead use,
-host wait on reads, and in decode the hits, misses and hit rate per layer (min, median, max).
+host wait on reads, and in decode the hits, misses and hit rate per layer (min, median, max), the SSD bytes per
+emitted token, the lookahead's records (used, landed, expired, abandoned, cancelled, discarded, used while still read)
+and its bytes read and served, and the share of the decode with a read in flight. A `glm_moe_dsa: decode host split`
+line gives the decode lane's host time: the routing barriers' waits, the routes, the waves' encode. With the EXL3 bank,
+the prompt line also counts the prefill GEMM calls and the GPU drains.
+
+The residency policy forgets its residents and its prompt state at each prompt (`LayerPolicy.forgetAll` at the
+reverse phase change). The decode policy's transition counts and its window carry over from one request to the next.
 
 The MTP draft lane (`mtp_depth` > 0) runs the release's MTP layer (layer 78), which the MLX builds drop. The pack
 must have `mtp/` beside its shards, as `scripts/convert_glm_exl3_bank.py --mtp-only --from-pack <EXL3 pack>
@@ -205,7 +234,9 @@ first reuses the first step's indexer selection (`index_share_for_mtp_iteration`
 layer's cache. Exact acceptance takes the argmax for a greedy request, and DeepSeek-V4.1's point-mass rule (the draft
 accepted with its probability under the tempered, filtered target) for a sampled one. Typical acceptance is used only
 when `mtp_acceptance` names it. Each request logs one `glm_moe_dsa: mtp` line: depth, acceptance, rounds, drafted,
-accepted, the rate, the accepted and emitted tokens per round, tok/s and the time in the drafts and in the verify.
+accepted, the rate, the accepted and emitted tokens per round, tok/s and the time in the drafts and in the verify,
+and the verify's SSD bytes (per emitted token, and the share only rejected rows read). A second line gives the
+acceptance by the head's top probability, per tenth.
 
 `src/glm_moe_dsa_mtp_parity.zig` checks the lane on a tiny model with an MTP layer (`scripts/glm_moe_dsa_mtp_goldens.py`,
 `GLM53_MTP_PARITY=<its pack>`): every round's drafts and draft logits against the reference's modules at depth 1 to 5,
