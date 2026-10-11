@@ -453,3 +453,121 @@ test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's hos
         }
     }.f);
 }
+
+/// One case of the test below: `n_pairs` pairs over `n_experts` experts at rate K (`k`), through sushi's chain.
+fn minisBytesMatch(a: Allocator, s: mlx.mlx_stream, k: u32, n_pairs: usize, n_experts: usize, seed: u64) !void {
+    const kern = sushi.kernels;
+    const tp = 4;
+    const h = 6144;
+    const mini = 512;
+    const rows = n_experts * tp;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    // the bank: random trellis words, the scales at the pack's magnitudes (|suh| ~0.01, |svh| ~1)
+    const tile_words = (h / 16) * (mini / 16) * 16 * k;
+    var tr: [3][]u16 = undefined;
+    for (&tr) |*t| {
+        t.* = try ar.alloc(u16, rows * tile_words);
+        for (t.*) |*v| v.* = r.int(u16);
+    }
+    const mags = [4]f32{ 0.0126, 1.03, 0.0083, 1.009 };
+    const lens = [4]usize{ h, mini, mini, h };
+    var sc: [4][]f16 = undefined;
+    for (&sc, mags, lens) |*b, mag, len| {
+        b.* = try ar.alloc(f16, rows * len);
+        for (b.*) |*v| v.* = @floatCast(if (r.boolean()) mag else -mag);
+    }
+    const xs = try ar.alloc(f32, n_pairs * h);
+    for (xs) |*v| v.* = r.floatNorm(f32) * 0.5;
+    // each pair its expert's minis: slot = expert row x 4 + rank
+    const slots_h = try ar.alloc(u32, n_pairs * tp);
+    for (0..n_pairs) |p| {
+        const e = r.uintLessThan(u32, @intCast(n_experts));
+        for (0..tp) |q| slots_h[p * tp + q] = e * tp + @as(u32, @intCast(q));
+    }
+    const ones = try ar.alloc(f32, n_pairs * tp);
+    @memset(ones, 1);
+    const ci = struct {
+        fn f(v: usize) c_int {
+            return @intCast(v);
+        }
+    }.f;
+    const arr: [10]mlx.mlx_array = .{
+        mlx.mlx_array_new_data(tr[0].ptr, &[_]c_int{ ci(rows), h / 16, mini / 16, ci(16 * k) }, 4, .uint16),
+        mlx.mlx_array_new_data(tr[1].ptr, &[_]c_int{ ci(rows), h / 16, mini / 16, ci(16 * k) }, 4, .uint16),
+        mlx.mlx_array_new_data(tr[2].ptr, &[_]c_int{ ci(rows), mini / 16, h / 16, ci(16 * k) }, 4, .uint16),
+        mlx.mlx_array_new_data(sc[0].ptr, &[_]c_int{ ci(rows), h }, 2, .float16),
+        mlx.mlx_array_new_data(sc[1].ptr, &[_]c_int{ ci(rows), mini }, 2, .float16),
+        mlx.mlx_array_new_data(sc[2].ptr, &[_]c_int{ ci(rows), mini }, 2, .float16),
+        mlx.mlx_array_new_data(sc[3].ptr, &[_]c_int{ ci(rows), h }, 2, .float16),
+        mlx.mlx_array_new_data(slots_h.ptr, &[_]c_int{ci(n_pairs * tp)}, 1, .uint32),
+        mlx.mlx_array_new_data(ones.ptr, &[_]c_int{ci(n_pairs * tp)}, 1, .float32),
+        mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ ci(n_pairs), h }, 2, .float32),
+    };
+    defer for (arr) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    const tg, const tu, const td, const suh, const svh, const suhd, const svhd, const slots, const scores = .{ arr[0], arr[1], arr[2], arr[3], arr[4], arr[5], arr[6], arr[7], arr[8] };
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, arr[9], .bfloat16, s));
+    const ns: c_int = ci(n_pairs * tp);
+    const bytes = struct {
+        fn of(al: Allocator, st: mlx.mlx_stream, v: mlx.mlx_array) ![]const u8 {
+            var c = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(c);
+            try mlx.check(mlx.mlx_astype(&c, v, .float32, st));
+            try mlx.check(mlx.mlx_array_eval(c));
+            const p = mlx.mlx_array_data_float32(c) orelse return error.Unreadable;
+            return al.dupe(u8, std.mem.sliceAsBytes(p[0..mlx.mlx_array_size(c)]));
+        }
+    }.of;
+    errdefer std.debug.print("minis case K{d}: {d} pairs over {d} experts\n", .{ k, n_pairs, n_experts });
+    // the pair planes
+    const want = try kern.pairGemv(s, x, suh, suh, tg, tu, slots, h, mini, ns, tp, 0);
+    defer _ = mlx.mlx_array_free(want[0]);
+    defer _ = mlx.mlx_array_free(want[1]);
+    const got = try kern.pairGemvMinis(s, x, suh, suh, tg, tu, slots, h, mini, ns, tp);
+    defer _ = mlx.mlx_array_free(got[0]);
+    defer _ = mlx.mlx_array_free(got[1]);
+    for ([2]mlx.mlx_array{ want[0], want[1] }, [2]mlx.mlx_array{ got[0], got[1] }) |w, g| try testing.expectEqualSlices(u8, try bytes(ar, s, w), try bytes(ar, s, g));
+    // the fused-mid down over the same planes
+    const dw = try kern.downGemvFusedMid(s, want[0], want[1], td, svh, svh, suhd, slots, mini, h, ns);
+    defer _ = mlx.mlx_array_free(dw);
+    const dg = try kern.downGemvFusedMidMinis(s, want[0], want[1], td, svh, svh, suhd, slots, mini, h, ns, tp);
+    defer _ = mlx.mlx_array_free(dg);
+    try testing.expectEqualSlices(u8, try bytes(ar, s, dw), try bytes(ar, s, dg));
+    // the chain as the binding calls it, through the single-slot kernels and then the minis kernels
+    var chain: [2][]const u8 = undefined;
+    for ([2]bool{ true, false }, &chain) |off, *out| {
+        kern.setGroupedOffForTest(off);
+        const y = try kern.moeSwigluFused(s, x, tg, suh, svh, tu, suh, svh, td, suhd, svhd, slots, scores, .bfloat16);
+        defer _ = mlx.mlx_array_free(y);
+        out.* = try bytes(ar, s, y);
+        try testing.expectEqual(!off and n_pairs >= 2, kern.groupedEngagedForTest());
+    }
+    try testing.expectEqualSlices(u8, chain[0], chain[1]);
+}
+
+// GLM-5.3's routed pairs through sushi's decode chain as `fused` calls it: each pair its expert's four 512-wide minis
+// over hidden 6144. Sushi's minis kernels decode each mini once for the pairs that route it; against its single-slot
+// kernels the pair planes, the fused-mid down over the same planes and the chain's bf16 output are the same bits, at K3
+// and K4: 48 ids over 12 experts (most repeat, past two members), the hit wave's 29 over 22, two pairs of one expert,
+// 33 pairs of 33 experts (none repeat) and a lone pair.
+test "glm exl3 quant: sushi's chain decodes each GLM-5.3 mini once for the pairs that route it, to the single-slot kernels' bits (4 minis of 512, hidden 6144, 48 ids, K3 and K4)" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    sushi.kernels.setDecodeParams(.mcg);
+    defer sushi.kernels.setGroupedOffForTest(false);
+    for ([_]u32{ 3, 4 }) |k| {
+        try minisBytesMatch(testing.allocator, s, k, 48, 12, 900 + k);
+        try minisBytesMatch(testing.allocator, s, k, 29, 22, 930 + k);
+        try minisBytesMatch(testing.allocator, s, k, 2, 1, 960 + k);
+        try minisBytesMatch(testing.allocator, s, k, 33, 33, 990 + k);
+        try minisBytesMatch(testing.allocator, s, k, 1, 1, 1020 + k);
+    }
+}
