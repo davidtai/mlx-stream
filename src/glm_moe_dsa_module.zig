@@ -589,7 +589,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (self.decoding) return;
             _ = mlx.mlx_synchronize(self.g.s);
             const before = Mem.now();
-            const transient = try self.ex.releaseTransient();
+            const transient = try self.ex.releaseTransient(&self.g);
             var prev: usize = 0;
             errdefer {
                 _ = self.ex.regrowTransient() catch {};
@@ -1398,6 +1398,11 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     const logits = try m.prefillAt(0, &prompt);
     var t = try m.g.hostArgmax(logits);
     _ = mlx.mlx_array_free(logits);
+    // The prompt pass's f16 copy of the routed input (GLM-5.3's kernels, `beginWide`): its free gives back its bill
+    // term at this prompt's call, and the bill's own term (at the billed context) covers it.
+    const x_copy = m.math.releasePrompt(&m.g);
+    try testing.expectEqual(bill_mod.promptXCopyBytes(&model, prompt.len, m.inputs.gemm, m.inputs.size_classes), x_copy);
+    try testing.expect(x_copy > 0 and x_copy <= m.billed.phases[@intFromEnum(bill_mod.Phase.prompt)].routed_x_f16);
     try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
     var row: [256]f32 = undefined;
     for (0..4) |_| {

@@ -386,7 +386,7 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
         for (ex.banks) |bk| if (bk[0]) |arr| try math.checkBank(&g, arr, &diag);
         for (widths) |n| {
             if (n == 0) {
-                _ = try ex.releaseTransient();
+                _ = try ex.releaseTransient(&g);
                 try ex.grow(&decode_rows);
                 continue;
             }

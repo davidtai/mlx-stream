@@ -239,11 +239,13 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             };
         }
 
-        /// The phase change's first free: every transient binding nulled, then the stream frees the scratch.
-        pub fn releaseTransient(self: *Self) !u64 {
+        /// The phase change's first free: every transient binding nulled, then the stream frees the scratch, and the
+        /// math its prompt pass's own arrays (`releasePrompt`, where it holds any): the bytes freed.
+        pub fn releaseTransient(self: *Self, g: *G) !u64 {
             for (self.banks) |*b| b[@backingInt(BankKind.transient)] = null;
             self.transient_released = true;
-            return self.stream.releaseTransient();
+            const bytes = try self.stream.releaseTransient();
+            return bytes + if (@hasDecl(M, "releasePrompt")) self.math.releasePrompt(g) else 0;
         }
 
         /// The one phase change: the stream grows; the grown rows and decode's window 0 are bound.
@@ -809,7 +811,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             w.pos.clearRetainingCapacity();
             for (w.kept.items) |o| g.release(o);
             w.kept.clearRetainingCapacity();
-            for (0..bpl) |side| try self.wideBank(g, layer, @intCast(side), x, k);
+            // x as the math's prefill reads it, made once for the call (`beginWide`: GLM-5.3's kernels' f16 copy), else x.
+            const xm = if (@hasDecl(M, "beginWide")) try self.math.beginWide(g, x) else x;
+            for (0..bpl) |side| try self.wideBank(g, layer, @intCast(side), xm, k);
             return self.wideJoin(g, scores, x, n, k);
         }
 
