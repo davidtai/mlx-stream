@@ -840,6 +840,21 @@ const TestWeights = struct {
     }
 };
 
+test "glm wave probe: a layer's stages are its rises over the layer's start; the line carries every layer" {
+    var p: WaveProbe = .{};
+    p.call(16387, 16387);
+    p.layers[0] = .{ .start = 197_000_000_000, .attn = 4_000_000_000, .moe = 9_000_000_000, .tail = 6_000_000_000, .cache = 17_000_000_000 };
+    p.layers[1] = .{ .start = 198_000_000_000, .attn = 3_000_000_000 };
+    p.n = 2;
+    p.peak = 207_000_000_000;
+    const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{p});
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("{\"rows\":16387,\"positions\":16387,\"peak\":207000000000,\"layers\":[[197000000000,4000000000,9000000000,6000000000,17000000000],[198000000000,3000000000,0,0,0]]}", s);
+    // A new call starts the layers over.
+    p.call(2048, 18435);
+    try testing.expectEqual(@as(u32, 0), p.n);
+}
+
 test "glm attention: a prompt on the DSA kernels selects the reference's keys and matches its prompt form" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
