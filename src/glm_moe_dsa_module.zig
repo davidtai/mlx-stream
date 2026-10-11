@@ -787,11 +787,14 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, self.routes, .{ .verify = true, .hidden = true });
             defer self.g.release(out.logits);
             defer self.g.release(out.hidden.?);
-            try self.g.evalAll(&.{ out.logits, out.hidden.? });
+            // The decision's arrays in the verify's eval: the GPU goes on from the logits to the decision with no
+            // round trip to the host between them.
+            const dp = try mtp_mod.prepare(&self.g, out.logits, drafts, ln.mode, sampling, len);
+            try self.g.evalAll(&.{ out.logits, out.hidden.?, dp.tok, dp.flags orelse dp.tok });
             if (comptime timeline.enabled) timeline.verifyEnd();
             try self.ex.flush();
             const t_verify = self.nowNs();
-            const d = try mtp_mod.decide(&self.g, out.logits, drafts, ln.mode, sampling, len);
+            const d = try dp.read(&self.g);
             self.cache.truncateTo(len + 1 + d.accepted);
             try self.history.appendSlice(self.gpa, ids[0 .. 1 + d.accepted]);
             const rows = d.accepted + 1;
