@@ -2,9 +2,10 @@
     // GLM-5.3 EXL3 prompt, stage 3: the down GEMM of a wave's experts at BM 64 x BN 128 (8 simdgroups, WM 2 x WN 4, each
     // a 32 x 32 share), each of the expert's four minis in turn: its BK = 32 stages decoded into threadgroup memory (one
     // 16-weight column per thread), double-buffered (a stage's trellis words read before its predecessor's MMA, decoded
-    // after it, one barrier per stage), the NAX MMA, then the epilogue: 32 rows at a time staged in threadgroup memory,
-    // each row's 128-column block rotated (t128, lane l holding columns 4 l .. 4 l + 3) and scaled by the mini's rout,
-    // summed over the minis in registers. y: [rows, HID] bf16 in the wave's row order (rows grouped by expert).
+    // after it, one barrier per stage), the NAX MMA, then the epilogue: each row's 128-column block rotated (t128: its
+    // first five stages on the MMA fragments, then 32 rows at a time staged in threadgroup memory, the last two with lane
+    // l holding columns l + 32 b) and scaled by the mini's rout, summed over the minis in registers. y: [rows, HID] bf16
+    // in the wave's row order (rows grouped by expert).
     constexpr int BM = 64;
     constexpr int BN = 128;
     constexpr int BK = 32;
@@ -128,9 +129,52 @@
             if (more) stage_b((s + 1) & 1);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        // the epilogue: band p's WN simdgroups stage their 32 rows, every simdgroup rotates rows rr = sg + 8 q
-        const device half* ro = rout + mrow * size_t(HID) + size_t(n0) + 4u * lane;
-        const float4 rv = float4(float(ro[0]), float(ro[1]), float(ro[2]), float(ro[3]));
+        // the epilogue: the 128-column block's t128, its stages in order (the butterflies of
+        // exl3/dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1.metal). Column bits 0-4 on the MMA fragments: 0-1 in
+        // the thread, 2 and 3 across lanes xor 1 and xor 8, 4 across the two N fragments; then band p's WN simdgroups
+        // stage their 32 rows and every simdgroup takes rows rr = sg + 8 q, lane l columns l + 32 b: bits 5-6 in the
+        // thread, scaled by the mini's rout and summed over the minis in registers.
+        STEEL_PRAGMA_UNROLL
+        for (int f = 0; f < TM * TN; ++f) {
+            STEEL_PRAGMA_UNROLL
+            for (int er = 0; er < 2; ++er) {
+                thread auto& d = Dtile.val_frags[f];
+                const float a0 = d[4 * er] + d[4 * er + 1];
+                const float a1 = d[4 * er] - d[4 * er + 1];
+                const float a2 = d[4 * er + 2] + d[4 * er + 3];
+                const float a3 = d[4 * er + 2] - d[4 * er + 3];
+                d[4 * er] = a0 + a2;
+                d[4 * er + 2] = a0 - a2;
+                d[4 * er + 1] = a1 + a3;
+                d[4 * er + 3] = a1 - a3;
+            }
+        }
+        STEEL_PRAGMA_UNROLL
+        for (ushort hh = 1; hh <= 8; hh <<= 3) {
+            const bool upper = (lane & uint(hh)) != 0u;
+            STEEL_PRAGMA_UNROLL
+            for (int f = 0; f < TM * TN; ++f) {
+                STEEL_PRAGMA_UNROLL
+                for (int e = 0; e < 8; ++e) {
+                    const float oth = simd_shuffle_xor(Dtile.val_frags[f][e], hh);
+                    Dtile.val_frags[f][e] = upper ? (oth - Dtile.val_frags[f][e]) : (Dtile.val_frags[f][e] + oth);
+                }
+            }
+        }
+        STEEL_PRAGMA_UNROLL
+        for (int i = 0; i < TM; ++i) {
+            STEEL_PRAGMA_UNROLL
+            for (int e = 0; e < 8; ++e) {
+                const float lo = Dtile.frag_at(i, 0)[e];
+                const float up = Dtile.frag_at(i, 1)[e];
+                Dtile.frag_at(i, 0)[e] = lo + up;
+                Dtile.frag_at(i, 1)[e] = lo - up;
+            }
+        }
+        const device half* ro = rout + mrow * size_t(HID) + size_t(n0) + lane;
+        float rv[4];
+        STEEL_PRAGMA_UNROLL
+        for (int c = 0; c < 4; ++c) rv[c] = float(ro[32 * c]);
         STEEL_PRAGMA_UNROLL
         for (int p = 0; p < BM / SM; ++p) {
             if (p * SM >= valid) break;
@@ -143,12 +187,10 @@
             for (int q = 0; q < 4; ++q) {
                 const int rr = int(sg) + NSG * q;
                 if (p * SM + rr >= valid) continue;
-                const threadgroup float* src = St + rr * LDS + 4 * int(lane);
+                const threadgroup float* src = St + rr * LDS + int(lane);
                 float w[4];
                 STEEL_PRAGMA_UNROLL
-                for (int c = 0; c < 4; ++c) w[c] = src[c];
-                // the 128-column block's t128, bits 0-1 in registers then 2-6 across lanes: the epilogue butterflies of
-                // exl3/dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1.metal
+                for (int c = 0; c < 4; ++c) w[c] = src[32 * c];
                 const float a0 = w[0] + w[1];
                 const float a1 = w[0] - w[1];
                 const float a2 = w[2] + w[3];
@@ -158,18 +200,7 @@
                 w[1] = a1 + a3;
                 w[3] = a1 - a3;
                 STEEL_PRAGMA_UNROLL
-                for (uint hh = 1u; hh < 32u; hh <<= 1u) {
-                    const bool upper = (lane & hh) != 0u;
-                    STEEL_PRAGMA_UNROLL
-                    for (int c = 0; c < 4; ++c) {
-                        const float oth = simd_shuffle_xor(w[c], (ushort) hh);
-                        w[c] = upper ? (oth - w[c]) : (w[c] + oth);
-                    }
-                }
-                yacc[p][q][0] += w[0] * G53_HSC * rv.x;
-                yacc[p][q][1] += w[1] * G53_HSC * rv.y;
-                yacc[p][q][2] += w[2] * G53_HSC * rv.z;
-                yacc[p][q][3] += w[3] * G53_HSC * rv.w;
+                for (int c = 0; c < 4; ++c) yacc[p][q][c] += w[c] * G53_HSC * rv[c];
             }
         }
     }
@@ -179,10 +210,8 @@
         for (int q = 0; q < 4; ++q) {
             const int rr = p * SM + int(sg) + NSG * q;
             if (rr >= valid) continue;
-            device bfloat16_t* yp = y + (size_t(row0) + size_t(m0 + rr)) * size_t(HID) + size_t(n0) + 4u * lane;
-            yp[0] = bfloat16_t(yacc[p][q][0]);
-            yp[1] = bfloat16_t(yacc[p][q][1]);
-            yp[2] = bfloat16_t(yacc[p][q][2]);
-            yp[3] = bfloat16_t(yacc[p][q][3]);
+            device bfloat16_t* yp = y + (size_t(row0) + size_t(m0 + rr)) * size_t(HID) + size_t(n0) + lane;
+            STEEL_PRAGMA_UNROLL
+            for (int c = 0; c < 4; ++c) yp[32 * c] = bfloat16_t(yacc[p][q][c]);
         }
     }
