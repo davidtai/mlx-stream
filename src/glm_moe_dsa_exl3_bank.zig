@@ -241,17 +241,6 @@ pub const Bank = struct {
         return g;
     }
 
-    /// The fill's units: a unit is 1/`maxUnits` of every bank layer's experts.
-    pub fn maxUnits(self: *const Bank) u32 {
-        return self.n_experts / banks_per_layer;
-    }
-
-    /// Each stream layer's slot rows at `units`: its experts' share, rounded down (never above what the unit bills).
-    pub fn rowsAt(self: *const Bank, units: u32, out: []u32) void {
-        const d = self.maxUnits();
-        for (self.layers, out) |*l, *r| r.* = @intCast(@min(@as(u64, units) * l.n_held / d, l.n_held));
-    }
-
     pub fn deinit(self: *Bank) void {
         if (self.sidecar.fd >= 0) self.sidecar.close();
         self.allocator.free(self.layers);
@@ -613,43 +602,26 @@ test "glm exl3 bank: a clean synthetic bank opens: the stream layers, each exper
     // The sidecar holds the MTP layer's bank layers too.
     try testing.expectEqual(@as(u64, img.len), b.sidecar.size);
     try testing.expectEqual(@as(u64, 5 * 8 * 4 * (rb3 + rb4)), img.len);
-    // The fill: units of 1/8 of each bank layer's 8 experts; a unit's bound covers both geometries' slots.
-    try testing.expectEqual(@as(u32, 8), b.maxUnits());
-    var rows: [8]u32 = undefined;
-    b.rowsAt(5, &rows);
-    for (rows) |r| try testing.expectEqual(@as(u32, 5), r);
     const g = b.geometryOf();
     // Eight stream layers: each an expert's four minis a row, its eight experts, one of them a unit.
     try testing.expectEqual(@as(usize, 8), g.layers.len);
     try testing.expectEqual(glm.LayerSlots{ .record_bytes = 4 * ms3.logical, .n_records = 8, .share = 1 }, g.layers[0]);
     try testing.expectEqual(glm.LayerSlots{ .record_bytes = 4 * ms4.logical, .n_records = 8, .share = 1 }, g.layers[1]);
     try testing.expectEqual(4 * (ms3.logical + ms4.logical), g.widest_record);
-    // The bill's units and rows agree with the bank's own.
-    try testing.expectEqual(b.maxUnits(), bill_units.maxUnits(g));
-    var brows: [8]u32 = undefined;
-    try testing.expectEqualSlices(u32, &rows, bill_units.rowsAt(g, 5, &brows));
+    // The bill's fill over the bank's geometry: units of 1/8 of each bank layer's 8 experts; a unit's bound covers both
+    // geometries' slots.
+    try testing.expectEqual(@as(u32, 8), bill_units.maxUnits(g));
+    var rows: [8]u32 = undefined;
+    for (bill_units.rowsAt(g, 5, &rows)) |r| try testing.expectEqual(@as(u32, 5), r);
     try testing.expect(present(try tmpRoot(&tmp, &rbuf)));
     // GLM-5.3's split: 148 K3 and 108 K4 experts, units of 1/128 of each, rounded down.
-    var two = [2]Layer{ b.layers[0], b.layers[1] };
-    two[0].n_held = 148;
-    two[1].n_held = 108;
-    const glm53: Bank = .{ .allocator = a, .n_experts = 256, .layers = &two };
-    var r2: [2]u32 = undefined;
-    glm53.rowsAt(100, &r2);
-    try testing.expectEqualSlices(u32, &.{ 115, 84 }, &r2);
-    glm53.rowsAt(128, &r2);
-    try testing.expectEqualSlices(u32, &.{ 148, 108 }, &r2);
-    glm53.rowsAt(16, &r2);
-    try testing.expectEqualSlices(u32, &.{ 18, 13 }, &r2);
-    // The bill's at the same shares: the same rows, and a unit's exact bytes (the shares of both bank layers' slots).
     const s53 = [2]glm.LayerSlots{ .{ .record_bytes = 4 * ms3.logical, .n_records = 148, .share = 148.0 / 128.0 }, .{ .record_bytes = 4 * ms4.logical, .n_records = 108, .share = 108.0 / 128.0 } };
     const g53: glm.Geometry = .{ .layers = &s53, .widest_record = 4 * (ms3.logical + ms4.logical), .widest_span = 0 };
-    for ([_]u32{ 16, 100, 128 }) |u| {
-        glm53.rowsAt(u, &r2);
-        var o2: [2]u32 = undefined;
-        try testing.expectEqualSlices(u32, &r2, bill_units.rowsAt(g53, u, &o2));
-    }
     try testing.expectEqual(@as(u32, 128), bill_units.maxUnits(g53));
+    var r2: [2]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{ 115, 84 }, bill_units.rowsAt(g53, 100, &r2));
+    try testing.expectEqualSlices(u32, &.{ 148, 108 }, bill_units.rowsAt(g53, 128, &r2));
+    try testing.expectEqualSlices(u32, &.{ 18, 13 }, bill_units.rowsAt(g53, 16, &r2));
 }
 
 test "glm exl3 bank: every rule of the pack's contract refuses by name" {
