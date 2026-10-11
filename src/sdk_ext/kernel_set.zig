@@ -200,6 +200,401 @@ pub fn KernelSet(comptime R: type) type {
     };
 }
 
+// ── What every pinned registry shares (`exl3_kernels`, `glm53_exl3_kernels`) ──
+// The texts' sha256 pins against a manifest, the manifest's headers and kernels by name, the mlx fast-kernel objects,
+// launch configs and launches over them with the decode-timers build's launch probe, and the self-check's results,
+// report, depth, verdict and array scope. A registry keeps its own manifest schema, checks and refusal set; these take
+// its message prefix.
+
+const KDiag = @import("sdk").Diag;
+const bo = @import("../build_flags.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+/// The lowercase hex sha256 of `bytes`.
+pub fn shaHex(bytes: []const u8) [64]u8 {
+    var d: [32]u8 = undefined;
+    Sha256.hash(bytes, &d, .{});
+    return std.fmt.bytesToHex(d, .lower);
+}
+
+/// A 64-hex sha256 as bytes; null for any other string.
+pub fn hexSha(s: []const u8) ?[32]u8 {
+    if (s.len != 64) return null;
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, s) catch return null;
+    return out;
+}
+
+pub const TextError = error{ SchemaInvalid, TextSha256Mismatch };
+
+/// `text` against its manifest record (`sha256` hex, `bytes`), refused by name: "<prefix>: <what> ...".
+pub fn checkText(text: []const u8, sha256: []const u8, bytes: u64, comptime prefix: []const u8, what: []const u8, diag: ?*KDiag) TextError!void {
+    const want = hexSha(sha256) orelse {
+        if (diag) |d| d.set(prefix ++ ": {s}: sha256 \"{s}\" is not 64 hex", .{ what, sha256 });
+        return error.SchemaInvalid;
+    };
+    var d: [32]u8 = undefined;
+    Sha256.hash(text, &d, .{});
+    if (!std.mem.eql(u8, &d, &want) or text.len != bytes) {
+        if (diag) |dg| dg.set(prefix ++ ": {s} text ({d} B) differs from the manifest ({d} B, sha256 {s})", .{ what, text.len, bytes, sha256 });
+        return error.TextSha256Mismatch;
+    }
+}
+
+/// A template argument of a launch: an int or a dtype.
+pub const TemplateValue = union(enum) { int: i32, dtype: mlx.mlx_dtype };
+pub const TemplateArg = struct { name: [:0]const u8, value: TemplateValue };
+
+/// The mlx fast-kernel object of one text (its inputs' and outputs' names in the signature's order, `header` before
+/// `source`); null when mlx refuses it.
+pub fn newKernel(name: [*:0]const u8, inputs: []const [*:0]const u8, outputs: []const [*:0]const u8, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool) ?mlx.mlx_fast_metal_kernel {
+    const vin = mlx.mlx_vector_string_new_data(@constCast(inputs.ptr), inputs.len);
+    defer _ = mlx.mlx_vector_string_free(vin);
+    const vout = mlx.mlx_vector_string_new_data(@constCast(outputs.ptr), outputs.len);
+    defer _ = mlx.mlx_vector_string_free(vout);
+    const k = mlx.mlx_fast_metal_kernel_new(name, vin, vout, source, header, ensure_row_contiguous, false);
+    return if (k.ctx == null) null else k;
+}
+
+/// One launch's outputs (shapes and dtypes), grid (threads), threadgroup and template arguments.
+pub const Launch = struct {
+    grid: [3]u32,
+    threadgroup: [3]u32,
+    out_shapes: []const []const c_int,
+    out_dtypes: []const mlx.mlx_dtype,
+    template: []const TemplateArg,
+};
+
+/// The mlx config of one launch, built once and handed to every launch at that geometry (`apply`); the caller frees it
+/// (`mlx_fast_metal_kernel_config_free`) once its last launch has returned.
+pub fn buildConfig(l: Launch) error{MlxError}!mlx.mlx_fast_metal_kernel_config {
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    for (l.out_shapes, l.out_dtypes) |sh, dt| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, sh.len, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @intCast(l.grid[0]), @intCast(l.grid[1]), @intCast(l.grid[2])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, @intCast(l.threadgroup[0]), @intCast(l.threadgroup[1]), @intCast(l.threadgroup[2])));
+    for (l.template) |t| switch (t.value) {
+        .int => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t.name.ptr, v)),
+        .dtype => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, t.name.ptr, v)),
+    };
+    return c;
+}
+
+/// One launch of `kernel` with `config` on `stream`; `outs` receives the launch's outputs (new arrays, caller frees).
+pub fn applyConfig(kernel: mlx.mlx_fast_metal_kernel, config: mlx.mlx_fast_metal_kernel_config, inputs: []const mlx.mlx_array, outs: []mlx.mlx_array, stream: mlx.mlx_stream) error{MlxError}!void {
+    const vin = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(vin);
+    var vout = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vout);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&vout, kernel, vin, config, stream));
+    for (outs, 0..) |*o, i| {
+        o.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(o, vout, i));
+    }
+}
+
+/// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
+/// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
+pub const launch_observed: bool = if (@hasDecl(bo, "dsv41_decode_timers")) bo.dsv41_decode_timers else false;
+/// A launch config's template key (`launchKey`), kept with its prepared config.
+pub const LaunchKey = if (launch_observed) u64 else void;
+/// The observer a profile hook installs: the kernel's name, the launch key and the inputs.
+pub const Observer = if (launch_observed) ?*const fn ([]const u8, u64, []const mlx.mlx_array) void else void;
+
+/// The template key of a launch config's template arguments (name, then the value's bytes).
+pub fn launchKey(names: []const []const u8, values: []const i64) u64 {
+    var h = std.hash.Wyhash.init(0x5eed);
+    for (names, values) |n, v| {
+        h.update(n);
+        h.update(std.mem.asBytes(&v));
+    }
+    return h.final();
+}
+
+/// `launchKey` of a launch's template arguments (an int's value, a dtype's tag); nothing outside the decode-timers build.
+pub fn templateKey(template: []const TemplateArg) LaunchKey {
+    if (comptime !launch_observed) return {};
+    var names: [16][]const u8 = undefined;
+    var values: [16]i64 = undefined;
+    const nt = @min(template.len, names.len);
+    for (template[0..nt], names[0..nt], values[0..nt]) |t, *n, *v| {
+        n.* = t.name;
+        v.* = switch (t.value) {
+            .int => |x| x,
+            .dtype => |x| @backingInt(x),
+        };
+    }
+    return launchKey(names[0..nt], values[0..nt]);
+}
+
+/// The manifest against its pin (hex sha256), refused by name ("<prefix>: manifest sha256 ... is not the pinned ...");
+/// its hex.
+pub fn checkPin(manifest: []const u8, pin: []const u8, comptime prefix: []const u8, diag: ?*KDiag) error{ManifestNotPinned}![64]u8 {
+    const got = shaHex(manifest);
+    if (!std.mem.eql(u8, &got, pin)) {
+        if (diag) |d| d.set(prefix ++ ": manifest sha256 {s} is not the pinned {s}", .{ &got, pin });
+        return error.ManifestNotPinned;
+    }
+    return got;
+}
+
+/// The manifest's header records (`id`, `sha256`, `bytes`), each once and naming a `Header` this build embeds, each
+/// against its embedded text (`texts`, in `Header` order); every header listed.
+pub fn adoptHeaders(comptime Header: type, texts: []const [:0]const u8, records: anytype, comptime prefix: []const u8, diag: ?*KDiag) (TextError || error{ UnknownHeader, MissingHeader })!void {
+    var seen: std.EnumSet(Header) = .empty;
+    for (records) |h| {
+        const name: []const u8 = if (@TypeOf(h.id) == ?[]const u8) h.id orelse "" else h.id;
+        const id = std.meta.stringToEnum(Header, name) orelse {
+            if (diag) |d| d.set(prefix ++ ": manifest header \"{s}\" is not one this build embeds", .{name});
+            return error.UnknownHeader;
+        };
+        if (seen.contains(id)) {
+            if (diag) |d| d.set(prefix ++ ": header {t} listed twice", .{id});
+            return error.SchemaInvalid;
+        }
+        seen.insert(id);
+        try checkText(texts[@backingInt(id)], h.sha256, h.bytes, prefix, @tagName(id), diag);
+    }
+    const n = std.meta.fieldNames(Header).len;
+    if (seen.count() != n) {
+        if (diag) |d| d.set(prefix ++ ": the manifest lists {d} of {d} headers", .{ seen.count(), n });
+        return error.MissingHeader;
+    }
+}
+
+/// The manifest's kernels by name: each once (`admit`) and every one listed (`done`).
+pub fn Tally(comptime Kernel: type) type {
+    return struct {
+        const Self = @This();
+        seen: std.EnumSet(Kernel) = .empty,
+
+        pub fn admit(t: *Self, name: []const u8, comptime prefix: []const u8, diag: ?*KDiag) error{ UnknownKernel, DuplicateKernel }!Kernel {
+            const k = std.meta.stringToEnum(Kernel, name) orelse {
+                if (diag) |d| d.set(prefix ++ ": manifest kernel \"{s}\" is not one this build implements", .{name});
+                return error.UnknownKernel;
+            };
+            if (t.seen.contains(k)) {
+                if (diag) |d| d.set(prefix ++ ": {t} listed twice", .{k});
+                return error.DuplicateKernel;
+            }
+            t.seen.insert(k);
+            return k;
+        }
+
+        pub fn done(t: *const Self, comptime prefix: []const u8, diag: ?*KDiag) error{MissingKernel}!void {
+            const n = std.meta.fieldNames(Kernel).len;
+            if (t.seen.count() == n) return;
+            var it = t.seen.complement().iterator();
+            if (diag) |d| d.set(prefix ++ ": the manifest does not list {t} ({d} of {d})", .{ it.next().?, t.seen.count(), n });
+            return error.MissingKernel;
+        }
+    };
+}
+
+/// One launch's mlx config (output shapes and dtypes, grid, threadgroup, template arguments), built once
+/// (`Bound.prepare`) and handed to every launch at that geometry (`applyPrepared`). mlx copies what a launch needs when
+/// it is applied, so `deinit` is safe once the last `applyPrepared` using it has returned.
+pub fn Prepared(comptime Kernel: type) type {
+    return struct {
+        kernel: Kernel,
+        config: mlx.mlx_fast_metal_kernel_config,
+        n_out: usize,
+        /// its template arguments' key (the observer's; profile builds only)
+        tkey: LaunchKey = if (launch_observed) 0 else {},
+
+        pub fn deinit(self: *@This()) void {
+            _ = mlx.mlx_fast_metal_kernel_config_free(self.config);
+            self.* = undefined;
+        }
+    };
+}
+
+/// The kernels of registry `R` built on one GPU stream (`R.Registry.bind`); freed after that stream has drained. `R`
+/// supplies `Registry`, `Kernel`, `n_kernels`, `max_outputs`, `LaunchConfig` and
+///     launchOf(reg, k, cfg, shapes: *[max_outputs][]const c_int, template: *[16]TemplateArg) Launch
+/// (the registry's config as the mlx launch; the slices may point into `shapes` and `template`).
+pub fn BoundOf(comptime R: type) type {
+    return struct {
+        const Self = @This();
+        reg: *const R.Registry,
+        stream: mlx.mlx_stream,
+        kernels: [R.n_kernels]mlx.mlx_fast_metal_kernel,
+        /// the profile hook's launch probe (`observe`); void outside the decode-timers build
+        observer: Observer = if (launch_observed) null else {},
+
+        pub fn deinit(self: *Self) void {
+            for (self.kernels) |k| {
+                if (k.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(k);
+            }
+            self.* = undefined;
+        }
+
+        /// Every later launch reaches the hook's launch probe `L` (`sdk_ext.profile.Hook.launch`), at construction,
+        /// before the first: a no-op unless the build observes launches and `L` is enabled.
+        pub fn observe(self: *Self, comptime L: type) void {
+            if (comptime launch_observed and L.enabled) self.observer = &L.kernel;
+        }
+
+        /// A launch's mlx config built once (a route's construction): `applyPrepared` hands it to the kernel with no
+        /// per-launch config work. The caller owns it (`Prepared.deinit`).
+        pub fn prepare(self: *const Self, k: R.Kernel, cfg: *const R.LaunchConfig) error{MlxError}!Prepared(R.Kernel) {
+            var shapes: [R.max_outputs][]const c_int = undefined;
+            var template: [16]TemplateArg = undefined;
+            const l = R.launchOf(self.reg, k, cfg, &shapes, &template);
+            const c = try buildConfig(l);
+            return .{ .kernel = k, .config = c, .n_out = l.out_shapes.len, .tkey = templateKey(l.template) };
+        }
+
+        /// One launch of a prepared config; `outs` receives `p.n_out` new arrays (caller frees).
+        pub fn applyPrepared(self: *const Self, p: *const Prepared(R.Kernel), inputs: []const mlx.mlx_array, outs: []mlx.mlx_array) error{MlxError}!void {
+            if (comptime launch_observed) if (self.observer) |f| f(@tagName(p.kernel), p.tkey, inputs);
+            try applyConfig(self.kernels[@backingInt(p.kernel)], p.config, inputs, outs[0..p.n_out], self.stream);
+        }
+
+        /// One launch of `k` with `cfg`, its config built for this launch only; `outs` receives the launch's outputs
+        /// (new arrays, caller frees): the per-call path of routes whose geometry varies per call.
+        pub fn apply(self: *const Self, k: R.Kernel, inputs: []const mlx.mlx_array, cfg: *const R.LaunchConfig, outs: []mlx.mlx_array) error{MlxError}!void {
+            var p = try self.prepare(k, cfg);
+            defer p.deinit();
+            try self.applyPrepared(&p, inputs, outs);
+        }
+    };
+}
+
+/// The self-check's depth:
+/// - `compile` (the construction's acceptance): every kernel compiles, binds and completes one launch; no numeric
+///   comparison (the server's startup runs no numeric probes). A kernel that does not refuses the load by name.
+/// - `full` (the device test and the window's smoke tests): every check the manifest lists.
+pub const CheckDepth = enum { compile, full };
+
+/// The self-check's results, report, plan and verdict over a registry's `Kernel` and `Check` enums.
+pub fn Checks(comptime Kernel: type, comptime Check: type) type {
+    return struct {
+        pub const Result = struct {
+            kernel: Kernel,
+            check: Check,
+            site: []const u8 = "",
+            words: u64 = 0,
+            bad: u64 = 0,
+            metric: f64 = 0,
+            limit: f64 = 0,
+            ok: bool = false,
+            err: []const u8 = "",
+            /// the latched MLX message of a raised check (owned by the Report); "" otherwise
+            msg: []const u8 = "",
+        };
+
+        pub const Report = struct {
+            results: std.ArrayList(Result) = .empty,
+            /// the copies of the latched MLX messages the results point at
+            msgs: std.ArrayList([]u8) = .empty,
+
+            pub fn deinit(self: *Report, a: std.mem.Allocator) void {
+                for (self.msgs.items) |m| a.free(m);
+                self.msgs.deinit(a);
+                self.results.deinit(a);
+            }
+
+            /// Records a check that raised: its error name and the latched MLX message (copied).
+            pub fn appendRaised(self: *Report, a: std.mem.Allocator, k: Kernel, c: Check, err: anyerror, msg: []const u8) !void {
+                try self.msgs.ensureUnusedCapacity(a, 1);
+                try self.results.ensureUnusedCapacity(a, 1);
+                const copy = try a.dupe(u8, msg);
+                self.msgs.appendAssumeCapacity(copy);
+                self.results.appendAssumeCapacity(.{ .kernel = k, .check = c, .ok = false, .err = @errorName(err), .msg = copy });
+            }
+
+            pub fn failures(self: *const Report) usize {
+                var n: usize = 0;
+                for (self.results.items) |r| n += @intFromBool(!r.ok);
+                return n;
+            }
+
+            /// One JSON object per result, one per line (the window keeps it as its receipt).
+            pub fn writeJsonLines(self: *const Report, a: std.mem.Allocator) ![]u8 {
+                var j: std.ArrayList(u8) = .empty;
+                errdefer j.deinit(a);
+                for (self.results.items) |r| {
+                    try j.print(a, "{{\"kernel\":\"{t}\",\"check\":\"{t}\",\"site\":\"{s}\",\"words\":{d},\"bad\":{d},\"metric\":{e},\"limit\":{e},\"ok\":{},\"err\":\"{s}\"", .{ r.kernel, r.check, r.site, r.words, r.bad, r.metric, r.limit, r.ok, r.err });
+                    // a raised check carries the MLX message (a line without one is byte-identical to before)
+                    if (r.msg.len > 0) {
+                        try j.appendSlice(a, ",\"msg\":\"");
+                        try appendJsonEscaped(&j, a, r.msg);
+                        try j.append(a, '"');
+                    }
+                    try j.appendSlice(a, "}\n");
+                }
+                return j.toOwnedSlice(a);
+            }
+        };
+
+        /// The checks of `want`'s entries (anything with `kernel` and `checks`) at `depth`, per kernel, in registry
+        /// order: at `compile` only `Check.compile`.
+        pub fn plan(entries: anytype, want: std.EnumSet(Kernel), depth: CheckDepth) std.EnumArray(Kernel, std.EnumSet(Check)) {
+            var out: std.EnumArray(Kernel, std.EnumSet(Check)) = .initFill(.empty);
+            for (entries) |*e| {
+                if (!want.contains(e.kernel)) continue;
+                out.set(e.kernel, if (depth == .compile) e.checks.intersectWith(comptime std.EnumSet(Check).initOne(.compile)) else e.checks);
+            }
+            return out;
+        }
+
+        /// The acceptance verdict over a finished plan: refused (error.SelfCheckFailed, `diag` naming the first failing
+        /// kernel / check / site, "<prefix>: self-check ...") unless every result passed and the plan ran.
+        pub fn judge(report: *const Report, comptime prefix: []const u8, diag: ?*KDiag) error{SelfCheckFailed}!void {
+            if (report.results.items.len == 0) {
+                if (diag) |d| d.set(prefix ++ ": self-check produced no result", .{});
+                return error.SelfCheckFailed;
+            }
+            for (report.results.items) |r| {
+                if (r.ok) continue;
+                if (diag) |d| d.set(prefix ++ ": self-check {t} {t} {s} failed ({d} of {d} words, metric {e} limit {e}, {s})", .{ r.kernel, r.check, r.site, r.bad, r.words, r.metric, r.limit, r.err });
+                return error.SelfCheckFailed;
+            }
+        }
+    };
+}
+
+/// `s` as the body of a JSON string: quote, backslash and control bytes escaped.
+pub fn appendJsonEscaped(j: *std.ArrayList(u8), a: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '"' => try j.appendSlice(a, "\\\""),
+        '\\' => try j.appendSlice(a, "\\\\"),
+        '\n' => try j.appendSlice(a, "\\n"),
+        '\t' => try j.appendSlice(a, "\\t"),
+        '\r' => try j.appendSlice(a, "\\r"),
+        0...8, 11, 12, 14...0x1f, 0x7f => try j.print(a, "\\u{x:0>4}", .{c}),
+        else => try j.append(a, c),
+    };
+}
+
+/// MLX arrays one check creates, freed together.
+pub const Scope = struct {
+    a: std.mem.Allocator,
+    arrays: std.ArrayList(mlx.mlx_array) = .empty,
+
+    /// `arr` kept until `deinit` (freed now when it cannot be kept).
+    pub fn keep(sc: *Scope, arr: mlx.mlx_array) !mlx.mlx_array {
+        sc.arrays.append(sc.a, arr) catch |e| {
+            _ = mlx.mlx_array_free(arr);
+            return e;
+        };
+        return arr;
+    }
+
+    /// A new array of `bytes` (copied), kept.
+    pub fn host(sc: *Scope, bytes: []const u8, shape: []const c_int, dt: mlx.mlx_dtype) !mlx.mlx_array {
+        const x = mlx.mlx_array_new_data(bytes.ptr, shape.ptr, @intCast(shape.len), dt);
+        if (x.ctx == null) return error.MlxError;
+        return sc.keep(x);
+    }
+
+    pub fn deinit(sc: *Scope) void {
+        for (sc.arrays.items) |x| _ = mlx.mlx_array_free(x);
+        sc.arrays.deinit(sc.a);
+    }
+};
+
 const testing = std.testing;
 
 /// A three-kernel registry without Metal: texts are names, the pin is their join, binding counts, the self-check plan
@@ -439,4 +834,33 @@ test "sdk kernel set: the consumers partition the kernels and the headers, or th
     // a buffer too small for the message returns the buffer itself
     var tiny: [4]u8 = undefined;
     try testing.expectEqual(@as(usize, 4), FS.partitionError(&s.reg, &.{ &.{.k0}, &.{.k1} }, &tiny).?.len);
+}
+
+test "sdk kernel set: the shared registry pieces: a text matches its record only at its own sha256 and size, refused by name otherwise" {
+    const text = "kernel text";
+    const hex = shaHex(text);
+    try checkText(text, &hex, text.len, "test kernels", "k0", null);
+    var diag: KDiag = .{};
+    try testing.expectError(error.TextSha256Mismatch, checkText("kernel texT", &hex, text.len, "test kernels", "k0", &diag));
+    try testing.expect(std.mem.startsWith(u8, diag.message(), "test kernels: k0 text (11 B) differs from the manifest"));
+    try testing.expectError(error.TextSha256Mismatch, checkText(text, &hex, text.len + 1, "test kernels", "k0", null));
+    try testing.expectError(error.SchemaInvalid, checkText(text, "abc", text.len, "test kernels", "k0", &diag));
+    try testing.expect(hexSha(&hex) != null and hexSha("zz") == null);
+}
+
+test "sdk kernel set: the shared self-check verdict refuses an empty plan and names the first failing kernel, check and site" {
+    const K = enum { k0, k1 };
+    const C = enum { compile, parity };
+    const S = Checks(K, C);
+    var r: S.Report = .{};
+    defer r.deinit(testing.allocator);
+    var diag: KDiag = .{};
+    try testing.expectError(error.SelfCheckFailed, S.judge(&r, "test kernels", &diag));
+    try testing.expectEqualStrings("test kernels: self-check produced no result", diag.message());
+    try r.results.append(testing.allocator, .{ .kernel = .k0, .check = .compile, .ok = true });
+    try S.judge(&r, "test kernels", &diag);
+    try r.results.append(testing.allocator, .{ .kernel = .k1, .check = .parity, .site = "s1", .words = 8, .bad = 2, .err = "words differ" });
+    try testing.expectError(error.SelfCheckFailed, S.judge(&r, "test kernels", &diag));
+    try testing.expect(std.mem.startsWith(u8, diag.message(), "test kernels: self-check k1 parity s1 failed (2 of 8 words"));
+    try testing.expectEqual(@as(usize, 1), r.failures());
 }

@@ -246,6 +246,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var kref: ?sdk_ext.kernels.SetRef = null;
             if (comptime has_kernels) {
                 self.kset = try KSet.init(gpa, .{ .device = .{ .stream = s } }, &diag);
+                // the profile hook's launch probe sees the set's launches (profile builds; a no-op otherwise)
+                self.kset.bound.observe(sdk_ext.profile.of(G).launch);
                 kref = self.kset.ref();
             }
             errdefer if (comptime has_kernels) self.kset.deinit();

@@ -9,6 +9,7 @@ const std = @import("std");
 const mlx = @import("sdk").mlx;
 const log = @import("sdk").log;
 const xk = @import("exl3_kernels.zig");
+const kset = @import("sdk_ext/kernel_set.zig");
 
 const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;
@@ -17,76 +18,9 @@ const Entry = xk.Entry;
 const Vars = xk.Vars;
 const Var = xk.Var;
 
-pub const Result = struct {
-    kernel: Kernel,
-    check: Check,
-    site: []const u8 = "",
-    words: u64 = 0,
-    bad: u64 = 0,
-    metric: f64 = 0,
-    limit: f64 = 0,
-    ok: bool = false,
-    err: []const u8 = "",
-    /// the latched MLX message of a raised check (owned by the Report); "" otherwise
-    msg: []const u8 = "",
-};
-
-pub const Report = struct {
-    results: std.ArrayList(Result) = .empty,
-    /// the copies of the latched MLX messages the results point at
-    msgs: std.ArrayList([]u8) = .empty,
-
-    pub fn deinit(self: *Report, a: Allocator) void {
-        for (self.msgs.items) |m| a.free(m);
-        self.msgs.deinit(a);
-        self.results.deinit(a);
-    }
-
-    /// Records a check that raised: its error name and the latched MLX message (copied).
-    pub fn appendRaised(self: *Report, a: Allocator, k: Kernel, c: Check, err: anyerror, msg: []const u8) !void {
-        try self.msgs.ensureUnusedCapacity(a, 1);
-        try self.results.ensureUnusedCapacity(a, 1);
-        const copy = try a.dupe(u8, msg);
-        self.msgs.appendAssumeCapacity(copy);
-        self.results.appendAssumeCapacity(.{ .kernel = k, .check = c, .ok = false, .err = @errorName(err), .msg = copy });
-    }
-
-    pub fn failures(self: *const Report) usize {
-        var n: usize = 0;
-        for (self.results.items) |r| n += @intFromBool(!r.ok);
-        return n;
-    }
-
-    /// One JSON object per result, one per line (the window keeps it as its receipt).
-    pub fn writeJsonLines(self: *const Report, a: Allocator) ![]u8 {
-        var j: std.ArrayList(u8) = .empty;
-        errdefer j.deinit(a);
-        for (self.results.items) |r| {
-            try j.print(a, "{{\"kernel\":\"{t}\",\"check\":\"{t}\",\"site\":\"{s}\",\"words\":{d},\"bad\":{d},\"metric\":{e},\"limit\":{e},\"ok\":{},\"err\":\"{s}\"", .{ r.kernel, r.check, r.site, r.words, r.bad, r.metric, r.limit, r.ok, r.err });
-            // a raised check carries the MLX message (a line without one is byte-identical to before)
-            if (r.msg.len > 0) {
-                try j.appendSlice(a, ",\"msg\":\"");
-                try appendJsonEscaped(&j, a, r.msg);
-                try j.append(a, '"');
-            }
-            try j.appendSlice(a, "}\n");
-        }
-        return j.toOwnedSlice(a);
-    }
-};
-
-/// `s` as the body of a JSON string: quote, backslash and control bytes escaped.
-fn appendJsonEscaped(j: *std.ArrayList(u8), a: Allocator, s: []const u8) !void {
-    for (s) |c| switch (c) {
-        '"' => try j.appendSlice(a, "\\\""),
-        '\\' => try j.appendSlice(a, "\\\\"),
-        '\n' => try j.appendSlice(a, "\\n"),
-        '\t' => try j.appendSlice(a, "\\t"),
-        '\r' => try j.appendSlice(a, "\\r"),
-        0...8, 11, 12, 14...0x1f, 0x7f => try j.print(a, "\\u{x:0>4}", .{c}),
-        else => try j.append(a, c),
-    };
-}
+const scaffold = kset.Checks(Kernel, Check);
+pub const Result = scaffold.Result;
+pub const Report = scaffold.Report;
 
 /// Which (kernel, check) pairs this executor implements; the host test holds the manifest to it.
 pub fn implemented(k: Kernel, c: Check) bool {
@@ -283,18 +217,16 @@ fn checkFormTwin(h: *H, k: Kernel) !void {
 /// - `full` (the device test, `DSV41_SELFCHECK_DEVICE`, and the window smoke tests): every check of the manifest: the
 ///   exact references (host f64, the MLX chain, the decode table, the join, golden tiles, compositions), the per-site row
 ///   invariance and the twins. The numeric probes live there only.
-pub const Depth = enum { compile, full };
+pub const Depth = kset.CheckDepth;
 
 /// The checks of `want`'s entries at `depth`, per kernel, in registry order (`stubPlan` runs the same plan).
 pub fn plan(reg: *const xk.Registry, want: std.EnumSet(Kernel), depth: Depth) std.EnumArray(Kernel, std.EnumSet(Check)) {
-    var out: std.EnumArray(Kernel, std.EnumSet(Check)) = .initFill(.empty);
+    var out = scaffold.plan(&reg.entries, want, depth);
+    // layout_guard is never run: its oracle was MLX's own mxfp8 quantized_matmul (MLX's to verify, not ours);
+    // the rcproj kernels' f64 checks cover them.
     for (&reg.entries) |*e| {
-        if (!want.contains(e.kernel)) continue;
-        var cs = e.checks;
-        // layout_guard is never run: its oracle was MLX's own mxfp8 quantized_matmul (MLX's to verify, not ours);
-        // the rcproj kernels' f64 checks cover them.
+        var cs = out.get(e.kernel);
         cs.remove(.layout_guard);
-        if (depth == .compile) cs = cs.intersectWith(comptime std.EnumSet(Check).initOne(.compile));
         out.set(e.kernel, cs);
     }
     return out;
@@ -348,15 +280,7 @@ pub fn accept(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, rep
 /// the first failing kernel / check / site) unless every result passed and the plan ran.
 pub fn judge(report: *const Report, diag: ?*xk.Diag) error{SelfCheckFailed}!void {
     logResults(report, if (std.c.getenv("DSV41_SELFCHECK_REPORT")) |v| v[0] == '1' else false);
-    if (report.results.items.len == 0) {
-        if (diag) |d| d.set("exl3 kernels: self-check produced no result", .{});
-        return error.SelfCheckFailed;
-    }
-    for (report.results.items) |r| {
-        if (r.ok) continue;
-        if (diag) |d| d.set("exl3 kernels: self-check {t} {t} {s} failed ({d} of {d} words, metric {e} limit {e}, {s})", .{ r.kernel, r.check, r.site, r.bad, r.words, r.metric, r.limit, r.err });
-        return error.SelfCheckFailed;
-    }
+    return scaffold.judge(report, "exl3 kernels", diag);
 }
 
 /// One line per failed result (every result when `all`): kernel, check, site, words / bad, metric / limit, the error
@@ -405,23 +329,7 @@ const H = struct {
 };
 
 /// MLX arrays created by one check, freed together.
-const Scope = struct {
-    a: Allocator,
-    arrays: std.ArrayList(mlx.mlx_array) = .empty,
-
-    fn keep(sc: *Scope, arr: mlx.mlx_array) !mlx.mlx_array {
-        sc.arrays.append(sc.a, arr) catch |e| {
-            _ = mlx.mlx_array_free(arr);
-            return e;
-        };
-        return arr;
-    }
-
-    fn deinit(sc: *Scope) void {
-        for (sc.arrays.items) |x| _ = mlx.mlx_array_free(x);
-        sc.arrays.deinit(sc.a);
-    }
-};
+const Scope = kset.Scope;
 
 fn op(sc: *Scope, comptime f: anytype, args: anytype) !mlx.mlx_array {
     var r = mlx.mlx_array_new();

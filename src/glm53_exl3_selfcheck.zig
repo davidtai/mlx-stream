@@ -9,6 +9,7 @@ const std = @import("std");
 const mlx = @import("sdk").mlx;
 const log = @import("sdk").log;
 const xk = @import("glm53_exl3_kernels.zig");
+const kset = @import("sdk_ext/kernel_set.zig");
 const routes = @import("glm53_exl3_routes.zig");
 const sushi = @import("mlx_host").sushi_exl3;
 
@@ -16,41 +17,14 @@ const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;
 const Check = xk.Check;
 
-pub const Result = struct {
-    kernel: Kernel,
-    check: Check,
-    words: u64 = 0,
-    bad: u64 = 0,
-    metric: f64 = 0,
-    limit: f64 = 0,
-    ok: bool = false,
-    err: []const u8 = "",
-};
-
-pub const Report = struct {
-    results: std.ArrayList(Result) = .empty,
-
-    pub fn deinit(self: *Report, a: Allocator) void {
-        self.results.deinit(a);
-    }
-
-    pub fn failures(self: *const Report) usize {
-        var n: usize = 0;
-        for (self.results.items) |r| n += @intFromBool(!r.ok);
-        return n;
-    }
-};
-
-pub const Depth = enum { compile, full };
+const scaffold = kset.Checks(Kernel, Check);
+pub const Result = scaffold.Result;
+pub const Report = scaffold.Report;
+pub const Depth = kset.CheckDepth;
 
 /// The checks of `want`'s entries at `depth`, per kernel.
 pub fn plan(reg: *const xk.Registry, want: std.EnumSet(Kernel), depth: Depth) std.EnumArray(Kernel, std.EnumSet(Check)) {
-    var out: std.EnumArray(Kernel, std.EnumSet(Check)) = .initFill(.empty);
-    for (&reg.entries) |*e| {
-        if (!want.contains(e.kernel)) continue;
-        out.set(e.kernel, if (depth == .compile) e.checks.intersectWith(comptime std.EnumSet(Check).initOne(.compile)) else e.checks);
-    }
-    return out;
+    return scaffold.plan(&reg.entries, want, depth);
 }
 
 /// The plan over `subset` at `depth` on the bound kernels, at every dims the manifest registers.
@@ -99,16 +73,11 @@ pub fn runSubsetAt(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound
 /// The verdict over a finished plan: refused (error.SelfCheckFailed, `diag` naming the first failure) unless every
 /// result passed and the plan ran.
 pub fn judge(report: *const Report, diag: ?*xk.Diag) error{SelfCheckFailed}!void {
-    if (report.results.items.len == 0) {
-        if (diag) |d| d.set("glm53 exl3 kernels: self-check produced no result", .{});
-        return error.SelfCheckFailed;
-    }
-    for (report.results.items) |r| {
-        if (r.ok) continue;
+    for (report.results.items) |r| if (!r.ok) {
         log.err("[glm53 selfcheck] FAIL {t} {t}: {d} of {d} words, metric {e} limit {e}, {s}\n", .{ r.kernel, r.check, r.bad, r.words, r.metric, r.limit, r.err });
-        if (diag) |d| d.set("glm53 exl3 kernels: self-check {t} {t} failed ({d} of {d} words, metric {e} limit {e}, {s})", .{ r.kernel, r.check, r.bad, r.words, r.metric, r.limit, r.err });
-        return error.SelfCheckFailed;
-    }
+        break;
+    };
+    return scaffold.judge(report, "glm53 exl3 kernels", diag);
 }
 
 /// A defect injected between a chain and its reference (the tests' proof that a check fails on a wrong chain): `k`
@@ -143,29 +112,7 @@ pub fn runChainMutated(a: Allocator, bound: *const xk.Bound, fam: xk.Family, ins
 const Verdict = struct { words: u64, bad: u64, metric: f64, limit: f64 };
 
 /// Arrays freed together.
-pub const Scope = struct {
-    a: Allocator,
-    xs: std.ArrayList(mlx.mlx_array) = .empty,
-
-    pub fn add(sc: *Scope, x: mlx.mlx_array) !mlx.mlx_array {
-        sc.xs.append(sc.a, x) catch |e| {
-            _ = mlx.mlx_array_free(x);
-            return e;
-        };
-        return x;
-    }
-
-    pub fn host(sc: *Scope, bytes: []const u8, shape: []const c_int, dt: mlx.mlx_dtype) !mlx.mlx_array {
-        const x = mlx.mlx_array_new_data(bytes.ptr, shape.ptr, @intCast(shape.len), dt);
-        if (x.ctx == null) return error.MlxError;
-        return sc.add(x);
-    }
-
-    pub fn deinit(sc: *Scope) void {
-        for (sc.xs.items) |x| _ = mlx.mlx_array_free(x);
-        sc.xs.deinit(sc.a);
-    }
-};
+pub const Scope = kset.Scope;
 
 /// A bank kind's arrays for the three projections at (K, dims), `slots` slot rows of four minis each: seeded bytes
 /// (with `seed`, else zeros), kept on the host for the reference.
@@ -286,7 +233,7 @@ pub fn verdictOf(got: []const f32, want: []const f32) Verdict {
 fn f32Of(sc: *Scope, s: mlx.mlx_stream, x: mlx.mlx_array, n: usize) ![]const f32 {
     var f = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&f, x, .float32, s));
-    _ = try sc.add(f);
+    _ = try sc.keep(f);
     try mlx.check(mlx.mlx_array_eval(f));
     return (mlx.mlx_array_data_float32(f) orelse return error.MlxNoData)[0..n];
 }
@@ -295,7 +242,7 @@ fn bf16Rows(sc: *Scope, s: mlx.mlx_stream, xs: []const f32, rows: usize, hid: us
     const xf = try sc.host(std.mem.sliceAsBytes(xs), &.{ @intCast(rows), @intCast(hid) }, .float32);
     var xb = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&xb, xf, .bfloat16, s));
-    return sc.add(xb);
+    return sc.keep(xb);
 }
 
 /// The decode chain at `inst`: `numeric` 2 rows x top-8 over 3 bank kinds of 6 slots (rows sharing slots) against the host
@@ -353,11 +300,11 @@ fn decodeChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     defer cmb.deinit();
     var bk = [3]routes.Bank{ banks[0].bank, banks[1].bank, banks[2].bank };
     if (mutation == .rin_rout) for (&bk) |*b| swapRinRout(b);
-    const y = try sc.add(try dec.wave(x, pt, gt, n_pairs, tabs.n_slots, &bk, scd));
+    const y = try sc.keep(try dec.wave(x, pt, gt, n_pairs, tabs.n_slots, &bk, scd));
     var ct: [routes.max_rows * routes.top_k]u32 = @splat(0xffffffff);
     for (pairs[0..n_pairs], 0..) |pr, i| ct[pr[2]] = @intCast(i);
     const ctd = try sc.host(std.mem.sliceAsBytes(ct[0..@max(8, n_rows * routes.top_k)]), &.{@intCast(@max(8, n_rows * routes.top_k))}, .uint32);
-    const out = try sc.add(try cmb.launch(&.{y}, ctd, null, n_rows, true));
+    const out = try sc.keep(try cmb.launch(&.{y}, ctd, null, n_rows, true));
     // The device mode over every routed position: every 5th position skipped by its slot, every 7th by its score (its
     // slot the NaN one: a pair that read it would give NaN). The combine sums every position (the host does not know the
     // skips): a skipped pair's row must be zero.
@@ -376,11 +323,11 @@ fn decodeChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     }
     const dsd = try sc.host(std.mem.sliceAsBytes(dslots[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
     const dscd = try sc.host(std.mem.sliceAsBytes(dscores[0..n_ids]), &.{@intCast(n_ids)}, .float32);
-    const yd = try sc.add(try dec.waveDevice(x, dsd, n_ids, &bk, dscd));
+    const yd = try sc.keep(try dec.waveDevice(x, dsd, n_ids, &bk, dscd));
     var every: [routes.max_rows * routes.top_k]u32 = undefined;
     for (&every, 0..) |*c, q| c.* = @intCast(q);
     const dctd = try sc.host(std.mem.sliceAsBytes(every[0..@max(8, n_ids)]), &.{@intCast(@max(8, n_ids))}, .uint32);
-    const dout = try sc.add(try cmb.launch(&.{yd}, dctd, null, n_rows, true));
+    const dout = try sc.keep(try cmb.launch(&.{yd}, dctd, null, n_rows, true));
     const got = try f32Of(&sc, s, out, n_rows * inst.hidden);
     const dgot = try f32Of(&sc, s, dout, n_rows * inst.hidden);
     const yrows = try f32Of(&sc, s, yd, n_ids * inst.hidden);
@@ -494,7 +441,7 @@ fn promptChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     const pr = routes.Prompt.init(bound, inst);
     var bk = bank.bank;
     if (mutation == .rin_rout) swapRinRout(&bk);
-    const y = try sc.add(try pr.wave(x, rtd, rows, tgud, tgu.tgs, tdnd, tdn.tgs, bk));
+    const y = try sc.keep(try pr.wave(x, rtd, rows, tgud, tgu.tgs, tdnd, tdn.tgs, bk));
     const got = try f32Of(&sc, s, y, rows * inst.hidden);
     if (!numeric) return .{ .words = got.len, .bad = 0, .metric = 0, .limit = 0 };
     const xin = try f32Of(&sc, s, x, n_tok * inst.hidden);

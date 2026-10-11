@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
-const kreg = @import("sdk_ext/kernel_registry.zig");
+const kset = @import("sdk_ext/kernel_set.zig");
 /// The registry's self-check plan (`sdk_ext.kernels.KernelSet(R)` runs it at the quant's accept).
 pub const selfcheck = @import("glm53_exl3_selfcheck.zig");
 
@@ -153,10 +153,7 @@ pub const Registry = struct {
 
     /// Parses the manifest, checks it against `pin` (hex sha256) and every text against it, once.
     pub fn init(gpa: Allocator, texts: *const Texts, pin: []const u8, diag: ?*Diag) (Refusal || Allocator.Error)!Registry {
-        var d: [32]u8 = undefined;
-        Sha256.hash(texts.manifest, &d, .{});
-        const got = std.fmt.bytesToHex(d, .lower);
-        if (!std.mem.eql(u8, &got, pin)) return refuse(diag, error.ManifestNotPinned, "glm53 exl3 kernels: manifest sha256 {s} is not the pinned {s}", .{ &got, pin });
+        const got = try kset.checkPin(texts.manifest, pin, "glm53 exl3 kernels", diag);
         var reg: Registry = .{ .arena = .init(gpa), .entries = undefined, .headers = texts.headers, .dims = &.{}, .maxm = 0, .manifest_hex = got };
         errdefer reg.arena.deinit();
         const a = reg.arena.allocator();
@@ -176,26 +173,18 @@ pub const Registry = struct {
         }
         reg.dims = dims;
         reg.maxm = m.maxm;
-        var seen_h: std.EnumSet(Header) = .empty;
+        try kset.adoptHeaders(Header, &texts.headers, m.headers, "glm53 exl3 kernels", diag);
+        // each header at its own file (two are DeepSeek-V4.1's texts)
         for (m.headers) |h| {
-            const id = std.meta.stringToEnum(Header, h.id) orelse return refuse(diag, error.UnknownHeader, "glm53 exl3 kernels: manifest header \"{s}\" is not one this build embeds", .{h.id});
-            if (seen_h.contains(id)) return refuse(diag, error.SchemaInvalid, "glm53 exl3 kernels: header {t} listed twice", .{id});
-            seen_h.insert(id);
+            const id = std.meta.stringToEnum(Header, h.id).?;
             if (!std.mem.eql(u8, h.file, headerFile(id))) return refuse(diag, error.SchemaInvalid, "glm53 exl3 kernels: header {t} is file \"{s}\", not {s}", .{ id, h.file, headerFile(id) });
-            try kreg.checkText(texts.headers[@backingInt(id)], h.sha256, h.bytes, "glm53 exl3 kernels", @tagName(id), diag);
         }
-        if (seen_h.count() != n_headers) return refuse(diag, error.MissingHeader, "glm53 exl3 kernels: the manifest lists {d} of {d} headers", .{ seen_h.count(), n_headers });
-        var seen: std.EnumSet(Kernel) = .empty;
+        var tally: kset.Tally(Kernel) = .{};
         for (m.kernels) |jk| {
-            const k = std.meta.stringToEnum(Kernel, jk.name) orelse return refuse(diag, error.UnknownKernel, "glm53 exl3 kernels: manifest kernel \"{s}\" is not one this build implements", .{jk.name});
-            if (seen.contains(k)) return refuse(diag, error.DuplicateKernel, "glm53 exl3 kernels: {t} listed twice", .{k});
-            seen.insert(k);
+            const k = try tally.admit(jk.name, "glm53 exl3 kernels", diag);
             reg.entries[@backingInt(k)] = try adoptKernel(a, texts, k, jk, dims, diag);
         }
-        if (seen.count() != n_kernels) {
-            var it = seen.complement().iterator();
-            return refuse(diag, error.MissingKernel, "glm53 exl3 kernels: the manifest does not list {t} ({d} of {d})", .{ it.next().?, seen.count(), n_kernels });
-        }
+        try tally.done("glm53 exl3 kernels", diag);
         return reg;
     }
 
@@ -227,7 +216,7 @@ pub const Registry = struct {
             var out_names: [max_outputs][*:0]const u8 = undefined;
             for (e.inputs, 0..) |arg, n| in_names[n] = arg.name.ptr;
             for (e.outputs, 0..) |arg, n| out_names[n] = arg.name.ptr;
-            b.kernels[i] = kreg.newKernel(@tagName(e.kernel), in_names[0..e.inputs.len], out_names[0..e.outputs.len], e.source.ptr, e.header_text.ptr, true) orelse
+            b.kernels[i] = kset.newKernel(@tagName(e.kernel), in_names[0..e.inputs.len], out_names[0..e.outputs.len], e.source.ptr, e.header_text.ptr, true) orelse
                 return refuse(diag, error.KernelCreateFailed, "glm53 exl3 kernels: mlx_fast_metal_kernel_new({t}) failed", .{e.kernel});
         }
         return b;
@@ -247,59 +236,20 @@ pub const LaunchConfig = struct {
     out_dtypes: [max_outputs]mlx.mlx_dtype = @splat(.float32),
 };
 
-/// A launch's mlx config built once (`Bound.prepare`) and handed to every launch at that geometry.
-pub const Prepared = struct {
-    kernel: Kernel,
-    config: mlx.mlx_fast_metal_kernel_config,
-    n_out: usize,
+pub const Prepared = kset.Prepared(Kernel);
 
-    pub fn deinit(self: *Prepared) void {
-        _ = mlx.mlx_fast_metal_kernel_config_free(self.config);
-        self.* = undefined;
-    }
-};
+/// The kernels built on one GPU stream (`Registry.bind`); freed after that stream has drained: `prepare` builds a
+/// launch's mlx config once, `applyPrepared` launches it, `apply` builds one for one launch (the prompt's per-wave
+/// grids), `observe` installs the profile hook's launch probe.
+pub const Bound = kset.BoundOf(@This());
 
-/// The kernels built on one GPU stream; freed after that stream has drained.
-pub const Bound = struct {
-    reg: *const Registry,
-    stream: mlx.mlx_stream,
-    kernels: [n_kernels]mlx.mlx_fast_metal_kernel,
-
-    pub fn deinit(self: *Bound) void {
-        for (self.kernels) |k| if (k.ctx != null) {
-            _ = mlx.mlx_fast_metal_kernel_free(k);
-        };
-        self.* = undefined;
-    }
-
-    /// The profile hook's launch probe: these kernels report no launch keys.
-    pub fn observe(self: *Bound, comptime L: type) void {
-        _ = .{ self, L };
-    }
-
-    pub fn prepare(self: *const Bound, k: Kernel, cfg: *const LaunchConfig) error{MlxError}!Prepared {
-        const e = self.reg.get(k);
-        var template: [max_template]kreg.TemplateArg = undefined;
-        for (e.template, template[0..e.template.len], 0..) |name, *t, i| t.* = .{ .name = name, .value = if (std.mem.eql(u8, name, "T")) .{ .dtype = cfg.dtype } else .{ .int = cfg.ints[i] } };
-        var shapes: [max_outputs][]const c_int = undefined;
-        for (0..cfg.n_out) |i| shapes[i] = cfg.out_shapes[i][0..cfg.out_ranks[i]];
-        const c = try kreg.buildConfig(.{ .grid = cfg.grid, .threadgroup = cfg.threadgroup, .out_shapes = shapes[0..cfg.n_out], .out_dtypes = cfg.out_dtypes[0..cfg.n_out], .template = template[0..e.template.len] });
-        return .{ .kernel = k, .config = c, .n_out = cfg.n_out };
-    }
-
-    /// One launch of a prepared config; `outs` receives `p.n_out` new arrays (caller frees).
-    pub fn applyPrepared(self: *const Bound, p: *const Prepared, inputs: []const mlx.mlx_array, outs: []mlx.mlx_array) error{MlxError}!void {
-        std.debug.assert(inputs.len == self.reg.get(p.kernel).inputs.len);
-        try kreg.apply(self.kernels[@backingInt(p.kernel)], p.config, inputs, outs[0..p.n_out], self.stream);
-    }
-
-    /// One launch with a config built for it alone (the prompt's per-wave grids).
-    pub fn apply(self: *const Bound, k: Kernel, inputs: []const mlx.mlx_array, cfg: *const LaunchConfig, outs: []mlx.mlx_array) error{MlxError}!void {
-        var p = try self.prepare(k, cfg);
-        defer p.deinit();
-        try self.applyPrepared(&p, inputs, outs);
-    }
-};
+/// `cfg` as the mlx launch (`Bound.prepare`): the entry's template parameters in its order, `T` the config's dtype.
+pub fn launchOf(reg: *const Registry, k: Kernel, cfg: *const LaunchConfig, shapes: *[max_outputs][]const c_int, template: *[16]kset.TemplateArg) kset.Launch {
+    const e = reg.get(k);
+    for (e.template, template[0..e.template.len], 0..) |name, *t, i| t.* = .{ .name = name, .value = if (std.mem.eql(u8, name, "T")) .{ .dtype = cfg.dtype } else .{ .int = cfg.ints[i] } };
+    for (0..cfg.n_out) |i| shapes[i] = cfg.out_shapes[i][0..cfg.out_ranks[i]];
+    return .{ .grid = cfg.grid, .threadgroup = cfg.threadgroup, .out_shapes = shapes[0..cfg.n_out], .out_dtypes = cfg.out_dtypes[0..cfg.n_out], .template = template[0..e.template.len] };
+}
 
 // ── Manifest adoption (once, at init) ──
 
@@ -339,7 +289,7 @@ fn adoptArgs(a: Allocator, js: []const JArg, max: usize, k: Kernel, diag: ?*Diag
 
 fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, dims: []const Instance, diag: ?*Diag) (Refusal || Allocator.Error)!Entry {
     const source = texts.sources[@backingInt(k)];
-    try kreg.checkText(source, j.source.sha256, j.source.bytes, "glm53 exl3 kernels", @tagName(k), diag);
+    try kset.checkText(source, j.source.sha256, j.source.bytes, "glm53 exl3 kernels", @tagName(k), diag);
     if (j.headers.len == 0 or j.headers.len > max_headers) return refuse(diag, error.SchemaInvalid, "glm53 exl3 kernels: {t}: {d} headers", .{ k, j.headers.len });
     const headers = try a.alloc(Header, j.headers.len);
     var hbytes: usize = 0;
@@ -383,7 +333,7 @@ fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, dims: [
         .source = source,
         .headers = headers,
         .header_text = htext,
-        .text_sha256 = kreg.hexSha(j.source.sha256).?,
+        .text_sha256 = kset.hexSha(j.source.sha256).?,
         .inputs = try adoptArgs(a, j.inputs, max_inputs, k, diag),
         .outputs = try adoptArgs(a, j.outputs, max_outputs, k, diag),
         .template = template,
@@ -398,7 +348,7 @@ fn adoptKernel(a: Allocator, texts: *const Texts, k: Kernel, j: JKernel, dims: [
 
 const testing = std.testing;
 
-const shaHex = kreg.shaHex;
+const shaHex = kset.shaHex;
 
 /// `texts` with `which`'s text replaced by `text` and the manifest re-pinned to it (caller frees the returned manifest):
 /// a registry built over a mutated text (the self-check's mutation tests).

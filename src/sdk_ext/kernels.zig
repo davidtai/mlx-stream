@@ -10,8 +10,6 @@ pub const Pin = struct {
     manifest_sha256: []const u8,
 };
 
-/// What every pinned registry shares: the texts' sha256 pins and the mlx fast-kernel objects, configs and launches.
-pub const registry = @import("kernel_registry.zig");
 /// The kernel set over registry `R`: `Set`, its `Device`, the consumers' partition checks.
 pub const KernelSet = @import("kernel_set.zig").KernelSet;
 /// A load's kernel set as a quant's accept receives it, erased with its registry's pin.
