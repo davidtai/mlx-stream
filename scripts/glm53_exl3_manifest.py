@@ -31,15 +31,16 @@ def banks(prefix, dtype):
 
 KERNELS = [
     {"name": "glm53_dec_prep", "family": "decode", "header": "glm53_dec", "threadgroup": [32, 1, 1],
-     "template": ["HID", "MINI"], "k": False,
-     "inputs": [arg("x", "bfloat16"), arg("pt", "uint32")] + banks("rg", "float16") + banks("ru", "float16"),
+     "template": ["HID", "MINI", "DEV", "TOPK"], "k": False,
+     "inputs": [arg("x", "bfloat16"), arg("pt", "uint32"), arg("sc", "float32")] + banks("rg", "float16") + banks("ru", "float16"),
      "outputs": [arg("ug", "float16"), arg("uu", "float16")]},
     {"name": "glm53_dec_gu", "family": "decode", "header": "glm53_dec", "threadgroup": [128, 1, 1],
-     "template": ["K", "HID", "MINI", "MAXM"], "k": True,
-     "inputs": [arg("ug", "float16"), arg("uu", "float16"), arg("gt", "int32")] + banks("cg", "uint16") + banks("cu", "uint16"),
+     "template": ["K", "HID", "MINI", "MAXM", "DEV"], "k": True,
+     "inputs": [arg("ug", "float16"), arg("uu", "float16"), arg("gt", "uint32"), arg("pt", "uint32"), arg("sc", "float32")]
+     + banks("cg", "uint16") + banks("cu", "uint16"),
      "outputs": [arg("zg", "float32"), arg("zu", "float32")]},
     {"name": "glm53_dec_down", "family": "decode", "header": "glm53_dec", "threadgroup": [256, 1, 1],
-     "template": ["K", "HID", "MINI"], "k": True,
+     "template": ["K", "HID", "MINI", "DEV", "TOPK"], "k": True,
      "inputs": [arg("zg", "float32"), arg("zu", "float32"), arg("pt", "uint32"), arg("sc", "float32")]
      + banks("og", "float16") + banks("ou", "float16") + banks("di", "float16") + banks("cd", "uint16") + banks("do", "float16"),
      "outputs": [arg("y", "float32")]},

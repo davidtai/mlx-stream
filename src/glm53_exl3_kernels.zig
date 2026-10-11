@@ -14,7 +14,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
-pub const manifest_sha256 = "f22143499e91830dec6e71dd29bc6d0e322746816a170b60eff5ab56ce34bd07";
+pub const manifest_sha256 = "5bf2f6da7be4cf29945244f588bfd6597646acc5c628fd5fa59ac0a6dd982925";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
 const dir = "kernels/glm53_exl3/";
 
@@ -49,7 +49,7 @@ pub const n_kernels = std.meta.fieldNames(Kernel).len;
 pub const n_headers = std.meta.fieldNames(Header).len;
 pub const max_inputs = 20;
 pub const max_outputs = 2;
-pub const max_template = 4;
+pub const max_template = 5;
 pub const max_rank = 4;
 
 pub const Texts = struct {

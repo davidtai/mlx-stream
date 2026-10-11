@@ -176,7 +176,8 @@ pub const SynthBank = struct {
     rin: [3][]u16,
     bank: routes.Bank = undefined,
 
-    pub fn init(a: Allocator, sc: *Scope, inst: xk.Instance, slots: usize, seed: ?u64) !SynthBank {
+    /// `slots` slots of random records (`seed`) or zeros; `nan_slot`'s rin and rout NaN (a launch that reads it gives NaN).
+    pub fn init(a: Allocator, sc: *Scope, inst: xk.Instance, slots: usize, seed: ?u64, nan_slot: ?usize) !SynthBank {
         var b: SynthBank = .{ .slots = slots, .code = undefined, .rout = undefined, .rin = undefined };
         var prng = std.Random.DefaultPrng.init(seed orelse 0);
         const rng = prng.random();
@@ -203,6 +204,10 @@ pub const SynthBank = struct {
                 @memset(b.code[p], 0);
                 @memset(b.rout[p], 0);
                 @memset(b.rin[p], 0);
+            }
+            if (nan_slot) |ns| {
+                @memset(b.rout[p][ns * 4 * out_d ..][0 .. 4 * out_d], 0x7e00);
+                @memset(b.rin[p][ns * 4 * in_d ..][0 .. 4 * in_d], 0x7e00);
             }
             const ci: c_int = @intCast(minis);
             projs[p] = .{
@@ -294,7 +299,7 @@ fn bf16Rows(sc: *Scope, s: mlx.mlx_stream, xs: []const f32, rows: usize, hid: us
 }
 
 /// The decode chain at `inst`: `numeric` 2 rows x top-8 over 3 bank kinds of 6 slots (rows sharing slots) against the host
-/// decode, else one pair on zero records.
+/// decode, else one pair on zero records; then the device mode over the same positions, some skipped.
 fn decodeChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric: bool, mutation: Mutation) !Verdict {
     const s = bound.stream;
     var sc: Scope = .{ .a = a };
@@ -305,8 +310,9 @@ fn decodeChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     var nb: usize = 0;
     defer for (banks[0..nb]) |*b| b.deinit(a);
     const rec: xk.Instance = if (mutation == .k) .{ .k = 7 - inst.k, .hidden = inst.hidden, .mini = inst.mini } else inst;
+    // a seventh slot past the pairs' of NaN rin and rout: the device mode's pairs of score 0 name it
     for (&banks, 0..) |*b, i| {
-        b.* = try SynthBank.init(a, &sc, rec, n_slots, if (numeric) 0x6c3 + i else null);
+        b.* = try SynthBank.init(a, &sc, rec, n_slots + 1, if (numeric) 0x6c3 + i else null, if (numeric) n_slots else null);
         nb += 1;
     }
     var prng = std.Random.DefaultPrng.init(0x53d);
@@ -339,7 +345,7 @@ fn decodeChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
         tabs.pt[4 * i] = (tabs.pt[4 * i] + 1) % @as(u32, @intCast(n_rows));
     };
     const pt = try sc.host(std.mem.sliceAsBytes(tabs.pt), &.{@intCast(tabs.pt.len)}, .uint32);
-    const gt = try sc.host(std.mem.sliceAsBytes(tabs.gt), &.{@intCast(tabs.gt.len)}, .int32);
+    const gt = try sc.host(std.mem.sliceAsBytes(tabs.gt), &.{@intCast(tabs.gt.len)}, .uint32);
     const scd = try sc.host(std.mem.sliceAsBytes(scores[0 .. n_rows * routes.top_k]), &.{@intCast(n_rows * routes.top_k)}, .float32);
     var dec = routes.Decode.init(bound, inst);
     defer dec.deinit();
@@ -352,25 +358,62 @@ fn decodeChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     for (pairs[0..n_pairs], 0..) |pr, i| ct[pr[2]] = @intCast(i);
     const ctd = try sc.host(std.mem.sliceAsBytes(ct[0..@max(8, n_rows * routes.top_k)]), &.{@intCast(@max(8, n_rows * routes.top_k))}, .uint32);
     const out = try sc.add(try cmb.launch(&.{y}, ctd, null, n_rows, true));
+    // The device mode over every routed position: every 5th position skipped by its slot, every 7th by its score (its
+    // slot the NaN one: a pair that read it would give NaN). The combine sums every position (the host does not know the
+    // skips): a skipped pair's row must be zero.
+    const n_ids = n_rows * routes.top_k;
+    var dslots: [routes.max_rows * routes.top_k]u32 = @splat(0xffffffff);
+    var dscores = scores;
+    var served: [routes.max_rows * routes.top_k]bool = @splat(false);
+    for (pairs[0..n_pairs]) |pr| dslots[pr[2]] = pr[1];
+    for (0..n_ids) |q| {
+        if (q % 7 == 3) {
+            dscores[q] = 0;
+            dslots[q] = (@as(u32, @intCast(q % 3)) << 24) | @as(u32, @intCast(n_slots));
+        }
+        if (q % 5 == 4) dslots[q] = 0xffffffff;
+        served[q] = dslots[q] != 0xffffffff and dscores[q] != 0;
+    }
+    const dsd = try sc.host(std.mem.sliceAsBytes(dslots[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
+    const dscd = try sc.host(std.mem.sliceAsBytes(dscores[0..n_ids]), &.{@intCast(n_ids)}, .float32);
+    const yd = try sc.add(try dec.waveDevice(x, dsd, n_ids, &bk, dscd));
+    var every: [routes.max_rows * routes.top_k]u32 = undefined;
+    for (&every, 0..) |*c, q| c.* = @intCast(q);
+    const dctd = try sc.host(std.mem.sliceAsBytes(every[0..@max(8, n_ids)]), &.{@intCast(@max(8, n_ids))}, .uint32);
+    const dout = try sc.add(try cmb.launch(&.{yd}, dctd, null, n_rows, true));
     const got = try f32Of(&sc, s, out, n_rows * inst.hidden);
-    if (!numeric) return .{ .words = got.len, .bad = 0, .metric = 0, .limit = 0 };
+    const dgot = try f32Of(&sc, s, dout, n_rows * inst.hidden);
+    const yrows = try f32Of(&sc, s, yd, n_ids * inst.hidden);
+    if (!numeric) return .{ .words = got.len + dgot.len, .bad = 0, .metric = 0, .limit = 0 };
+    var nonzero: u64 = 0;
+    for (0..n_ids) |q| if (!served[q]) {
+        for (yrows[q * inst.hidden ..][0..inst.hidden]) |v| nonzero += @intFromBool(v != 0);
+    };
     const xin = try f32Of(&sc, s, x, n_rows * inst.hidden);
     const want = try a.alloc(f32, n_rows * inst.hidden);
     defer a.free(want);
     @memset(want, 0);
     const tmp = try a.alloc(f32, inst.hidden);
     defer a.free(tmp);
+    const dwant = try a.alloc(f32, n_rows * inst.hidden);
+    defer a.free(dwant);
+    @memset(dwant, 0);
     for (pairs[0..n_pairs]) |pr| {
         try banks[pr[1] >> 24].hostPair(a, rec, pr[1] & 0xffffff, xin[pr[0] * inst.hidden ..][0..inst.hidden], scores[pr[2]], tmp);
         for (want[pr[0] * inst.hidden ..][0..inst.hidden], tmp) |*w, t| w.* += t;
+        if (served[pr[2]]) for (dwant[pr[0] * inst.hidden ..][0..inst.hidden], tmp) |*w, t| {
+            w.* += t;
+        };
     }
-    return verdictOf(got, want);
+    const v = verdictOf(got, want);
+    const dv = verdictOf(dgot, dwant);
+    return .{ .words = v.words + dv.words, .bad = v.bad + dv.bad + nonzero, .metric = @max(v.metric, dv.metric), .limit = 1 };
 }
 
 /// A decode wave's tables: pt (per pair: x row, packed slot, routed position, 0) and gt (per distinct slot: packed slot,
 /// members, the member pairs; a slot of more pairs than `routes.max_members` takes several entries), each at least 8
 /// words (an MLX input below 8 elements binds as `constant`).
-pub fn decodeTables(a: Allocator, pairs: []const [3]u32) !struct { pt: []u32, gt: []i32, n_slots: usize } {
+pub fn decodeTables(a: Allocator, pairs: []const [3]u32) !struct { pt: []u32, gt: []u32, n_slots: usize } {
     const mm = routes.max_members;
     const pt = try a.alloc(u32, @max(8, 4 * pairs.len));
     errdefer a.free(pt);
@@ -380,7 +423,7 @@ pub fn decodeTables(a: Allocator, pairs: []const [3]u32) !struct { pt: []u32, gt
         pt[4 * i + 1] = pr[1];
         pt[4 * i + 2] = pr[2];
     }
-    const gt = try a.alloc(i32, @max(8, (2 + mm) * pairs.len));
+    const gt = try a.alloc(u32, @max(8, (2 + mm) * pairs.len));
     errdefer a.free(gt);
     @memset(gt, 0);
     var used: [routes.max_pairs]bool = @splat(false);
@@ -388,7 +431,7 @@ pub fn decodeTables(a: Allocator, pairs: []const [3]u32) !struct { pt: []u32, gt
     for (pairs, 0..) |pr, i| {
         if (used[i]) continue;
         const g = gt[(2 + mm) * n ..][0 .. 2 + mm];
-        g[0] = @bitCast(pr[1]);
+        g[0] = pr[1];
         var cnt: usize = 0;
         for (pairs[i..], i..) |q, j| {
             if (used[j] or q[1] != pr[1]) continue;
@@ -414,7 +457,7 @@ fn promptChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     const counts: []const u32 = if (numeric) &counts_n else &counts_c;
     const n_slots = counts.len;
     const rec: xk.Instance = if (mutation == .k) .{ .k = 7 - inst.k, .hidden = inst.hidden, .mini = inst.mini } else inst;
-    var bank = try SynthBank.init(a, &sc, rec, n_slots, if (numeric) 0x9f1 else null);
+    var bank = try SynthBank.init(a, &sc, rec, n_slots, if (numeric) 0x9f1 else null, null);
     defer bank.deinit(a);
     var rows: usize = 0;
     for (counts) |c| rows += c;

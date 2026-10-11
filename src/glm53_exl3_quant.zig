@@ -5,9 +5,11 @@
 //!     launch per stage (`decodeWave`: the inputs per mini, the gate and up GEMVs per distinct slot, the down with the
 //!     SwiGLU middle, the minis' sum and the pair's score fused in); per call, every row's pairs summed in routed order
 //!     (`decodeCombine`). x is read by row, the slot arrays by slot; nothing syncs with the host.
+//!     A device wave (`decodeWaveDevice`) takes the routed positions' slots as a device array: a position of slot
+//!     0xFFFFFFFF or score 0 reads no weight and gives zero, and `decodeCombineDevice` sums every position.
 //!   - Prompt (`prefill`): the call's rows sorted by slot on the host, waves of at most 16 experts and `wave_rows` rows,
 //!     each through the inputs, the 128-row gate and up GEMMs (the trellis decoded per stage), the middle and the down
-//!     GEMM (the minis summed in its epilogue), then the waves joined in the call's row order.
+//!     GEMM (the minis summed in its epilogue), then the waves joined in the call's row order; nothing waits for the GPU.
 //! Its kernels are self-checked at accept on the load context's kernel set (compile, one launch each at the accepted
 //! dims, both Ks).
 
@@ -31,9 +33,8 @@ pub const kernel_pin: sdk_ext.kernels.Pin = .{ .manifest_sha256 = xk.manifest_sh
 pub const kernels = std.enums.values(xk.Kernel);
 pub const Arrays = bank_mod.Proj;
 
-/// Rows per prompt wave (its inputs per mini are rows x 4 x 2 x hidden f16) and the waves left in flight.
+/// Rows per prompt wave (its inputs per mini are rows x 4 x 2 x hidden f16).
 pub const wave_rows: u32 = 4096;
-pub const waves_in_flight: u32 = 2;
 
 /// The bank's `quantization`: exl3, the mcg codebook at the texts' multiplier, four minis per expert.
 fn parse(peek: *const quant.BankPeek, why: ?*Diag) ?void {
@@ -75,6 +76,8 @@ pub fn Accepted(comptime G: type) type {
         hidden: u32,
         mini: u32,
         report: selfcheck.Report = .{},
+        /// The prompt's prefill GEMM calls (each call's waves over host-known slots).
+        prefill_gemm_calls: u64 = 0,
         /// per K (3, 4): the decode and prompt chains
         dec: [2]routes.Decode,
         pf: [2]routes.Prompt,
@@ -85,7 +88,6 @@ pub fn Accepted(comptime G: type) type {
         inv: std.ArrayList(u32) = .empty,
         rt: std.ArrayList(u32) = .empty,
         waves: std.ArrayList(mlx.mlx_array) = .empty,
-        flight: std.ArrayList(mlx.mlx_array) = .empty,
 
         fn kOf(trellis: mlx.mlx_array) ?u32 {
             const sh = mlx.getShape(trellis);
@@ -140,10 +142,23 @@ pub fn Accepted(comptime G: type) type {
             defer self.a.free(tabs.pt);
             defer self.a.free(tabs.gt);
             const pt = try g.hostArray(std.mem.sliceAsBytes(tabs.pt), &.{@intCast(tabs.pt.len)}, .uint32);
-            const gt = try g.hostArray(std.mem.sliceAsBytes(tabs.gt), &.{@intCast(tabs.gt.len)}, .int32);
+            const gt = try g.hostArray(std.mem.sliceAsBytes(tabs.gt), &.{@intCast(tabs.gt.len)}, .uint32);
             var rb: [3]routes.Bank = undefined;
             for (banks, &rb) |b, *o| o.* = .{ .gate = proj(b.gate), .up = proj(b.up), .down = proj(b.down) };
-            return g.adopt(try self.dec[ki(k)].wave(x, pt, gt, pairs.len, tabs.n_slots, &rb, try g.reshape(sc, &.{-1})));
+            return g.adopt(try self.dec[ki(k)].wave(x, pt, gt, pairs.len, tabs.n_slots, &rb, sc));
+        }
+
+        /// One decode wave over the call's every routed position, the slots a device array (e.g. the routed ids through a
+        /// resident table): x [rows, hidden] bf16, slots u32 [rows x top-k] (each position's packed slot bank << 24 | row,
+        /// 0xFFFFFFFF where this wave does not serve it), `banks` the bank kinds' arrays, sc [rows, top-k] f32 -> f32
+        /// [rows x top-k, hidden]: each served position's output times its score at its routed position; a skipped
+        /// position (or one of score 0) reads no weight and gives zero.
+        pub fn decodeWaveDevice(self: *Self, g: *G, x: G.T, slots: G.T, banks: *const [3]Bank, sc: G.T) !G.T {
+            const k = kOf(banks[0].gate.trellis) orelse return error.BankArrays;
+            const n_ids: usize = @intCast(mlx.mlx_array_size(slots));
+            var rb: [3]routes.Bank = undefined;
+            for (banks, &rb) |b, *o| o.* = .{ .gate = proj(b.gate), .up = proj(b.up), .down = proj(b.down) };
+            return g.adopt(try self.dec[ki(k)].waveDevice(x, slots, n_ids, &rb, sc));
         }
 
         fn proj(p: A) routes.Proj {
@@ -170,6 +185,19 @@ pub fn Accepted(comptime G: type) type {
                 if (last) return acc.?;
                 s0 = s1;
             }
+        }
+
+        /// The call's combine over device waves (`decodeWaveDevice`): [rows, hidden] bf16, each row's routed positions
+        /// summed in routed order over every source (a source's skipped positions are zero).
+        pub fn decodeCombineDevice(self: *Self, g: *G, sources: []const G.T, n_rows: u32) !G.T {
+            const n_ids = n_rows * routes.top_k;
+            std.debug.assert(n_ids <= routes.max_pairs and sources.len >= 1);
+            var every: [routes.max_pairs]u32 = undefined;
+            for (&every, 0..) |*c, q| c.* = @intCast(q);
+            const ctd = try g.hostArray(std.mem.sliceAsBytes(every[0..@max(8, n_ids)]), &.{@intCast(@max(8, n_ids))}, .uint32);
+            var acc: ?G.T = null;
+            for (sources, 0..) |src, i| acc = try g.adopt(try self.cmb.launch(&.{src}, ctd, acc, n_rows, i + 1 == sources.len));
+            return acc.?;
         }
 
         /// x [tokens, hidden] bf16, the call's routed rows (one bank kind) -> [rows, hidden] bf16 in routed-row order.
@@ -201,6 +229,7 @@ pub fn Accepted(comptime G: type) type {
             }
             for (self.waves.items) |w| _ = mlx.mlx_array_free(w);
             self.waves.clearRetainingCapacity();
+            self.prefill_gemm_calls += 1;
             const bk: routes.Bank = .{ .gate = proj(bank.gate), .up = proj(bank.up), .down = proj(bank.down) };
             const pf = &self.pf[ki(k)];
             const tiles_gu = routes.tilesGateUp(self.mini);
@@ -231,13 +260,7 @@ pub fn Accepted(comptime G: type) type {
                 const tgud = try g.hostArray(std.mem.sliceAsBytes(&tgu.t), &.{80}, .int32);
                 const tdnd = try g.hostArray(std.mem.sliceAsBytes(&tdn.t), &.{80}, .int32);
                 try self.waves.ensureUnusedCapacity(a, 1);
-                try self.flight.ensureUnusedCapacity(a, 1);
-                const y = try pf.wave(x, rtd, w_rows, tgud, tgu.tgs, tdnd, tdn.tgs, bk);
-                self.waves.appendAssumeCapacity(y);
-                // a wave waits for all but `waves_in_flight - 1` older ones, so their inputs per mini go back
-                while (self.flight.items.len >= waves_in_flight) try self.drainOne(g);
-                try g.asyncEval(&.{y});
-                self.flight.appendAssumeCapacity(g.keep(y));
+                self.waves.appendAssumeCapacity(try pf.wave(x, rtd, w_rows, tgud, tgu.tgs, tdnd, tdn.tgs, bk));
                 g.resetTo(m);
                 i = j;
             }
@@ -259,23 +282,22 @@ pub fn Accepted(comptime G: type) type {
             return out;
         }
 
-        fn drainOne(self: *Self, g: *G) !void {
-            const y = self.flight.orderedRemove(0);
-            defer g.release(y);
-            try g.evalAll(&.{y});
+        /// The prompt's prefill GEMM calls and its waits on the GPU (none: the waves' tables are the host's).
+        pub fn prefillStats(self: *const Self) [2]u64 {
+            return .{ self.prefill_gemm_calls, 0 };
         }
 
-        /// The prompt's boundary: every wave still in flight evaluated.
+        /// Nothing is left in flight (every call's graph is the caller's).
         pub fn finishPrefill(self: *Self, g: *G) !void {
-            while (self.flight.items.len > 0) try self.drainOne(g);
+            _ = .{ self, g };
         }
 
         pub fn deinit(self: *Self, g: *G) void {
-            for (self.flight.items) |y| g.release(y);
+            _ = g;
             for (self.waves.items) |w| _ = mlx.mlx_array_free(w);
             for (&self.dec) |*d| d.deinit();
             self.cmb.deinit();
-            inline for (.{ &self.counts, &self.order, &self.inv, &self.rt, &self.waves, &self.flight }) |l| l.deinit(self.a);
+            inline for (.{ &self.counts, &self.order, &self.inv, &self.rt, &self.waves }) |l| l.deinit(self.a);
             self.report.deinit(self.a);
             self.a.destroy(self);
         }
@@ -643,4 +665,258 @@ test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's E
     };
     std.debug.print("glm53 exl3 quant vs sushi on the same slots: prompt widths 40 and 300 max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp)\n", .{ pw, ps, pw / selfcheck.bf16Ulp(ps) });
     try testing.expect(ps > 0.1 and pw <= 2 * selfcheck.bf16Ulp(ps));
+}
+
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.UPTIME_RAW, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+// GLM53_EXL3_BENCH=<pack dir> (the box, lock-held): routed layer 0's 256 experts of the real pack resident (its K3 and
+// K4 bank layers), one routed layer's decode at 1, 4 and 6 rows and its prompt at 16K tokens, these kernels (decode: the
+// host tables, and the device slots) against sushi's (its decode chain and the driver's combine; its prefill over host
+// slots), arms interleaved, best of 7 (decode: 16 chained calls, each call's output the next one's input).
+test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (16K tokens) on the real pack's records, these kernels against sushi's" {
+    const dir = std.mem.span(std.c.getenv("GLM53_EXL3_BENCH") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    const G = @import("glm_moe_dsa_graph.zig").G;
+    const glm = @import("glm_moe_dsa.zig");
+    var cdiag: Diag = .{};
+    var c = glm.Config.load(a, io, dir, null, &cdiag) catch |e| {
+        std.debug.print("config refused: {s}\n", .{cdiag.message()});
+        return e;
+    };
+    defer c.deinit(a);
+    var b = try bank_mod.Bank.open(a, io, dir, &c, &cdiag);
+    defer b.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var kd: Diag = .{};
+    const set = try ks.Set.init(a, .{ .device = .{ .stream = s } }, &kd);
+    defer set.deinit();
+    const ne: usize = b.n_experts;
+    const rows = try a.alloc(u32, b.layers.len);
+    defer a.free(rows);
+    @memset(rows, 0);
+    rows[0] = b.layers[0].n_held;
+    rows[1] = b.layers[1].n_held;
+    const st = try bank_mod.Stream.Stream.init(a, &b, .{ .rows = rows, .max_route_ids = 48, .transient_rows = 48, .records_per_part = 2, .slot_memory = .{ .mlx = s }, .staging_from_bank = true, .pool = .{ .workers = 8, .tickets = 8192 } });
+    defer st.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const p = try b.peek(arena.allocator());
+    const h: usize = c.hidden_size;
+    const spec: quant.Spec = .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = 8, .n_layers = c.nSparse(), .act = .swiglu, .input = .bfloat16 };
+    var diag: Diag = .{};
+    const ours = accept(G, a, &g, .{ .kernels = set.ref(), .peek = &p }, spec, &diag) catch |e| {
+        std.debug.print("accept refused: {s}\n", .{diag.message()});
+        return e;
+    };
+    defer ours.deinit(&g);
+    const theirs = try old_quant.accept(G, a, &g, .{ .peek = &p }, spec, &diag);
+    defer theirs.deinit(&g);
+    // every expert of routed layer 0 into its bank layer's base rows
+    const slot_of = try a.alloc(u32, ne);
+    defer a.free(slot_of);
+    const t_load = nowNs();
+    for (0..2) |side| {
+        var ids: std.ArrayList(u16) = .empty;
+        defer ids.deinit(a);
+        for (0..ne) |e| if (b.streamLayer(0, @intCast(e)) == side) try ids.append(a, @intCast(e));
+        var i: usize = 0;
+        while (i < ids.items.len) : (i += 48) {
+            const grp = ids.items[i..@min(i + 48, ids.items.len)];
+            const r = try st.route(@intCast(side), grp, &.{});
+            for (0..r.n_parts) |q| {
+                try st.waitGu(r, @intCast(q));
+                try st.waitDown(r, @intCast(q));
+            }
+            var refs: [sdk_ext.expert.policy.max_route_ids]sdk_ext.expert.SlotRef = undefined;
+            _ = st.refsOf(r, &refs);
+            for (grp, refs[0..grp.len]) |e, ref| {
+                try testing.expectEqual(sdk_ext.expert.BankKind.base, ref.bank);
+                slot_of[e] = ref.row;
+            }
+            st.release(r);
+        }
+    }
+    try st.flush();
+    std.debug.print("GLM53_UBENCH layer 0: {d} K{d} + {d} K{d} experts resident in {d:.1} s\n", .{ b.layers[0].n_held, b.layers[0].k, b.layers[1].n_held, b.layers[1].k, @as(f64, @floatFromInt(nowNs() - t_load)) / 1e9 });
+    var banks: [2]quant.BankArrays(Arrays(G.T)) = undefined;
+    for (0..2) |side| banks[side] = st.bankArrays(@intCast(side), .base).?;
+    var rng = std.Random.DefaultPrng.init(0x61b);
+    // decode
+    for ([_]usize{ 1, 4, 6 }) |n| {
+        var ids: [48]u16 = undefined;
+        var sc: [48]f32 = undefined;
+        for (0..n) |row| {
+            var j: usize = 0;
+            while (j < 8) {
+                const e = rng.random().uintLessThan(u16, @intCast(ne));
+                if (std.mem.indexOfScalar(u16, ids[row * 8 ..][0..j], e) != null) continue;
+                ids[row * 8 + j] = e;
+                sc[row * 8 + j] = 0.05 + rng.random().float(f32) * 0.2;
+                j += 1;
+            }
+        }
+        const nc: c_int = @intCast(n);
+        var xs: [6 * 6144]f32 = undefined;
+        for (xs[0 .. n * h]) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
+        const x0 = g.keep(try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs[0 .. n * h]), &.{ nc, @intCast(h) }, .float32), .bfloat16));
+        defer g.release(x0);
+        const scd = g.keep(try g.hostArray(std.mem.sliceAsBytes(sc[0 .. n * 8]), &.{ nc, 8 }, .float32));
+        defer g.release(scd);
+        const steps = 16;
+        // arms: ours (host tables), sushi, ours (device slots: each side's wave over every position, the other side's
+        // skipped)
+        var best: [3]u64 = @splat(std.math.maxInt(u64));
+        var distinct: [2]u32 = @splat(0);
+        var dslots: [2][48]u32 = undefined;
+        for (0..2) |side| for (ids[0 .. n * 8], 0..) |e, pos| {
+            dslots[side][pos] = if (b.streamLayer(0, e) == side) slot_of[e] else 0xffffffff;
+        };
+        const dsd = [2]G.T{
+            g.keep(try g.hostArray(std.mem.sliceAsBytes(dslots[0][0 .. n * 8]), &.{@intCast(n * 8)}, .uint32)),
+            g.keep(try g.hostArray(std.mem.sliceAsBytes(dslots[1][0 .. n * 8]), &.{@intCast(n * 8)}, .uint32)),
+        };
+        defer for (dsd) |d| g.release(d);
+        for (0..8) |rep| for (0..3) |arm| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            var x = x0;
+            const t0 = nowNs();
+            for (0..steps) |step| {
+                var outs: [2]G.T = undefined;
+                var loc: [48]u32 = undefined;
+                var n_out: usize = 0;
+                var want: [2]G.T = undefined;
+                var nw: usize = 0;
+                var order_pos: [48]u32 = undefined;
+                var n_order: usize = 0;
+                for (0..2) |side| {
+                    var pairs: [48][3]u32 = undefined;
+                    var tok: [48]i32 = undefined;
+                    var slots: [48]u32 = undefined;
+                    var np: u32 = 0;
+                    for (ids[0 .. n * 8], 0..) |e, pos| {
+                        if (b.streamLayer(0, e) != side) continue;
+                        pairs[np] = .{ @intCast(pos / 8), slot_of[e], @intCast(pos) };
+                        tok[np] = @intCast(pos / 8);
+                        slots[np] = slot_of[e];
+                        loc[pos] = (@as(u32, @intCast(n_out)) << 24) | np;
+                        order_pos[n_order] = @intCast(pos);
+                        n_order += 1;
+                        np += 1;
+                    }
+                    if (np == 0) continue;
+                    if (rep == 0 and arm == 0 and step == 0) {
+                        const tabs = try selfcheck.decodeTables(a, pairs[0..np]);
+                        distinct[side] += @intCast(tabs.n_slots);
+                        a.free(tabs.pt);
+                        a.free(tabs.gt);
+                    }
+                    const bk3 = [3]quant.BankArrays(Arrays(G.T)){ banks[side], banks[side], banks[side] };
+                    if (arm == 0) {
+                        outs[n_out] = try ours.decodeWave(&g, x, pairs[0..np], &bk3, scd);
+                    } else if (arm == 2) {
+                        outs[n_out] = try ours.decodeWaveDevice(&g, x, dsd[side], &bk3, scd);
+                    } else {
+                        const xt = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(tok[0..np]), &.{@intCast(np)}, .int32), 0);
+                        want[nw] = try theirs.fused(&g, xt, slots[0..np], banks[side]);
+                        nw += 1;
+                    }
+                    n_out += 1;
+                }
+                const y = if (arm == 0) try ours.decodeCombine(&g, outs[0..n_out], loc[0 .. n * 8], @intCast(n)) else if (arm == 2) try ours.decodeCombineDevice(&g, outs[0..n_out], @intCast(n)) else blk: {
+                    // the driver's join and combine
+                    const joined = try g.concat(want[0..nw], 0);
+                    var inv: [48]u32 = undefined;
+                    for (order_pos[0..n_order], 0..) |pp, j| inv[pp] = @intCast(j);
+                    const yo = try g.reshape(try g.take(joined, try g.hostArray(std.mem.sliceAsBytes(inv[0 .. n * 8]), &.{@intCast(n * 8)}, .uint32), 0), &.{ nc, 8, @intCast(h) });
+                    const w = try g.expandDims(scd, -1);
+                    break :blk try g.astype(try g.sum(try g.mul(yo, w), -2, false), .bfloat16);
+                };
+                x = try g.astype(try g.mul(y, try g.scalar(0.01, .bfloat16)), .bfloat16);
+            }
+            try g.evalAll(&.{x});
+            const dt = nowNs() - t0;
+            if (rep > 0) best[arm] = @min(best[arm], dt);
+        };
+        std.debug.print("GLM53_UBENCH decode rows {d} ({d} K3 + {d} K4 distinct slots): ours {d:.3} ms, ours device slots {d:.3} ms, sushi {d:.3} ms per layer (sushi / ours {d:.2}x)\n", .{ n, distinct[0], distinct[1], @as(f64, @floatFromInt(best[0])) / 1e6 / steps, @as(f64, @floatFromInt(best[2])) / 1e6 / steps, @as(f64, @floatFromInt(best[1])) / 1e6 / steps, @as(f64, @floatFromInt(best[1])) / @as(f64, @floatFromInt(best[0])) });
+    }
+    // prompt: 16384 tokens x top-8, each bank layer's rows in routed order in calls of 16384 rows
+    const n_tok = 16384;
+    const xs = try a.alloc(f32, n_tok * h);
+    defer a.free(xs);
+    for (xs) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
+    const xp = g.keep(try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs), &.{ n_tok, @intCast(h) }, .float32), .bfloat16));
+    defer g.release(xp);
+    try g.evalAll(&.{xp});
+    var side_slot: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    var side_act: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    defer for (&side_slot, &side_act) |*l, *m| {
+        l.deinit(a);
+        m.deinit(a);
+    };
+    for (0..n_tok) |t| {
+        var chosen: [8]u16 = undefined;
+        var j: usize = 0;
+        while (j < 8) {
+            const e = rng.random().uintLessThan(u16, @intCast(ne));
+            if (std.mem.indexOfScalar(u16, chosen[0..j], e) != null) continue;
+            chosen[j] = e;
+            j += 1;
+            const side = b.streamLayer(0, e);
+            try side_slot[side].append(a, slot_of[e]);
+            try side_act[side].append(a, @intCast(t));
+        }
+    }
+    var best: [2]u64 = @splat(std.math.maxInt(u64));
+    const q0 = .{ ours.prefillStats(), theirs.prefillStats() };
+    for (0..5) |rep| for (0..2) |arm| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const t0 = nowNs();
+        var outs: std.ArrayList(G.T) = .empty;
+        defer outs.deinit(a);
+        for (0..2) |side| {
+            var i: usize = 0;
+            while (i < side_slot[side].items.len) : (i += 16384) {
+                const e = @min(i + 16384, side_slot[side].items.len);
+                const pr: quant.PrefillRows = .{ .slot = side_slot[side].items[i..e], .act_row = side_act[side].items[i..e] };
+                const y = if (arm == 0) try ours.prefill(&g, @intCast(side), xp, pr, banks[side]) else try theirs.prefill(&g, @intCast(side), xp, pr, banks[side]);
+                try g.evalAll(&.{y});
+                try outs.append(a, y);
+            }
+        }
+        if (arm == 0) try ours.finishPrefill(&g);
+        const dt = nowNs() - t0;
+        if (rep > 0) best[arm] = @min(best[arm], dt);
+    };
+    const flop = @as(f64, @floatFromInt(n_tok * 8)) * 4.0 * 3.0 * 2.0 * @as(f64, @floatFromInt(h)) * 512.0;
+    const q1 = .{ ours.prefillStats(), theirs.prefillStats() };
+    std.debug.print("GLM53_UBENCH prompt 16384 tokens ({d} K3 + {d} K4 rows): ours {d:.1} ms ({d:.1} TFLOP/s), sushi {d:.1} ms ({d:.1} TFLOP/s) per layer ({d:.2}x); prefill GEMM calls / GPU drains ours {d} / {d}, sushi {d} / {d}\n", .{ side_slot[0].items.len, side_slot[1].items.len, @as(f64, @floatFromInt(best[0])) / 1e6, flop / @as(f64, @floatFromInt(best[0])) / 1e3, @as(f64, @floatFromInt(best[1])) / 1e6, flop / @as(f64, @floatFromInt(best[1])) / 1e3, @as(f64, @floatFromInt(best[1])) / @as(f64, @floatFromInt(best[0])), q1[0][0] - q0[0][0], q1[0][1] - q0[0][1], q1[1][0] - q0[1][0], q1[1][1] - q0[1][1] });
+}
+
+// GLM53_EXL3_TINY_PACK=<dir>: the tiny fixture's EXL3 pack written there (the bench's smoke off the box).
+test "glm53 exl3 bench: the tiny fixture's EXL3 pack (GLM53_EXL3_TINY_PACK)" {
+    const out = std.mem.span(std.c.getenv("GLM53_EXL3_TINY_PACK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const glm = @import("glm_moe_dsa.zig");
+    var model = try bank_mod.tinyConfigInter(a, 512);
+    defer model.deinit(a);
+    std.Io.Dir.cwd().createDirPath(testing.io, out) catch {};
+    var d = try std.Io.Dir.cwd().openDir(testing.io, out, .{});
+    defer d.close(testing.io);
+    a.free(try bank_mod.writeSynth(a, testing.io, d, &model, .{ .signs = true }));
+    try glm.writeResidents(a, testing.io, d, &model);
+    const text = try glm.tinyConfigJson(a, glm.tiny_quant);
+    defer a.free(text);
+    const t2 = try std.mem.replaceOwned(u8, a, text, "\"moe_intermediate_size\":64,", "\"moe_intermediate_size\":512,");
+    defer a.free(t2);
+    try d.writeFile(testing.io, .{ .sub_path = "config.json", .data = t2 });
 }

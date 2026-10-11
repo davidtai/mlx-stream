@@ -55,6 +55,13 @@ fn cfgOf(e: *const xk.Entry, inst: xk.Instance, grid: [3]u32, outs: []const stru
     return c;
 }
 
+/// Template parameter `name` of the entry set to `v` (no-op when the entry has none).
+fn setInt(c: *xk.LaunchConfig, e: *const xk.Entry, name: []const u8, v: i32) void {
+    for (e.template, 0..) |t, i| if (std.mem.eql(u8, t, name)) {
+        c.ints[i] = v;
+    };
+}
+
 /// A table of prepared configs indexed by a count 1..N, built at first use.
 fn Plans(comptime N: usize) type {
     return struct {
@@ -73,53 +80,77 @@ fn Plans(comptime N: usize) type {
     };
 }
 
-/// The decode chain of one bank layer's geometry (K, dims).
+/// The decode chain of one bank layer's geometry (K, dims): its waves over host tables (`wave`) or over a device array of
+/// the call's routed positions' packed slots (`waveDevice`).
 pub const Decode = struct {
     b: *const xk.Bound,
     inst: xk.Instance,
-    prep: Plans(max_pairs) = .{},
-    down: Plans(max_pairs) = .{},
-    /// the gu GEMV's: its grid counts the slots, its outputs the pairs
+    /// per mode (host tables, device slots), indexed by pairs
+    prep: [2]Plans(max_pairs) = .{ .{}, .{} },
+    down: [2]Plans(max_pairs) = .{ .{}, .{} },
+    /// the host mode's gu GEMV: its grid counts the slots, its outputs the pairs
     gu: [max_pairs]Plans(max_pairs) = @splat(.{}),
+    gu_dev: Plans(max_pairs) = .{},
 
     pub fn init(b: *const xk.Bound, inst: xk.Instance) Decode {
         return .{ .b = b, .inst = inst };
     }
 
     pub fn deinit(self: *Decode) void {
-        self.prep.deinit();
-        self.down.deinit();
+        for (&self.prep) |*p| p.deinit();
+        for (&self.down) |*p| p.deinit();
         for (&self.gu) |*p| p.deinit();
+        self.gu_dev.deinit();
     }
 
-    /// One wave: x [rows, HID] bf16, pt u32 [>= 8] (per pair: x row, packed slot, routed position, 0), gt i32 [>= 8]
+    /// One wave: x [rows, HID] bf16, pt u32 [>= 8] (per pair: x row, packed slot, routed position, 0), gt u32 [>= 8]
     /// (per distinct slot: packed slot, members, member pairs), `banks` the bank kinds' arrays (packed bank 0..2), sc f32
-    /// [rows x top-k] -> y f32 [pairs, HID] (each pair's output times its score).
+    /// [rows x top-k] -> y f32 [pairs, HID] (each pair's output times its score; a pair of score 0 reads no weight, its
+    /// row zero).
     pub fn wave(self: *Decode, x: mlx.mlx_array, pt: mlx.mlx_array, gt: mlx.mlx_array, n_pairs: usize, n_slots: usize, banks: *const [3]Bank, sc: mlx.mlx_array) !mlx.mlx_array {
         std.debug.assert(n_slots >= 1 and n_slots <= n_pairs and n_pairs <= max_pairs);
+        return self.chain(false, x, pt, gt, n_pairs, n_slots, banks, sc);
+    }
+
+    /// One wave over the call's every routed position: slots u32 [n_ids] (each position's packed slot bank << 24 | row,
+    /// 0xFFFFFFFF: skipped), x row position / top-k -> y f32 [n_ids, HID] (a skipped pair, or one of score 0, reads no
+    /// weight, its row zero).
+    pub fn waveDevice(self: *Decode, x: mlx.mlx_array, slots: mlx.mlx_array, n_ids: usize, banks: *const [3]Bank, sc: mlx.mlx_array) !mlx.mlx_array {
+        std.debug.assert(n_ids >= 1 and n_ids <= max_pairs);
+        return self.chain(true, x, slots, slots, n_ids, n_ids, banks, sc);
+    }
+
+    fn chain(self: *Decode, dev: bool, x: mlx.mlx_array, pt: mlx.mlx_array, gt: mlx.mlx_array, n_pairs: usize, n_slots: usize, banks: *const [3]Bank, sc: mlx.mlx_array) !mlx.mlx_array {
         const reg = self.b.reg;
         const h: u32 = self.inst.hidden;
         const mi: u32 = self.inst.mini;
         const np: c_int = @intCast(n_pairs);
+        const di = @intFromBool(dev);
         var u: [2]mlx.mlx_array = .{ .{}, .{} };
         var z: [2]mlx.mlx_array = .{ .{}, .{} };
         defer free(&u);
         defer free(&z);
         {
+            const e = reg.get(.glm53_dec_prep);
             const sh = [_]c_int{np * 4 * @as(c_int, @intCast(h))};
-            const cfg = cfgOf(reg.get(.glm53_dec_prep), self.inst, .{ 32 * h / 128, @intCast(n_pairs * 4), 2 }, &.{ .{ &sh, .float16 }, .{ &sh, .float16 } });
-            const p = try self.prep.get(self.b, .glm53_dec_prep, n_pairs, &cfg);
-            try self.b.applyPrepared(p, &.{ x, pt, banks[0].gate.suh, banks[1].gate.suh, banks[2].gate.suh, banks[0].up.suh, banks[1].up.suh, banks[2].up.suh }, &u);
+            var cfg = cfgOf(e, self.inst, .{ 32 * h / 128, @intCast(n_pairs * 4), 2 }, &.{ .{ &sh, .float16 }, .{ &sh, .float16 } });
+            setInt(&cfg, e, "DEV", di);
+            const p = try self.prep[di].get(self.b, .glm53_dec_prep, n_pairs, &cfg);
+            try self.b.applyPrepared(p, &.{ x, pt, sc, banks[0].gate.suh, banks[1].gate.suh, banks[2].gate.suh, banks[0].up.suh, banks[1].up.suh, banks[2].up.suh }, &u);
         }
         {
+            const e = reg.get(.glm53_dec_gu);
             const sh = [_]c_int{np * 4 * @as(c_int, @intCast(mi))};
-            const cfg = cfgOf(reg.get(.glm53_dec_gu), self.inst, .{ 32 * mi / 16, @intCast(n_slots * 4), 2 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
-            const p = try self.gu[n_pairs - 1].get(self.b, .glm53_dec_gu, n_slots, &cfg);
-            try self.b.applyPrepared(p, &.{ u[0], u[1], gt, banks[0].gate.trellis, banks[1].gate.trellis, banks[2].gate.trellis, banks[0].up.trellis, banks[1].up.trellis, banks[2].up.trellis }, &z);
+            var cfg = cfgOf(e, self.inst, .{ 32 * mi / 16, @intCast(n_slots * 4), 2 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
+            setInt(&cfg, e, "DEV", di);
+            const p = if (dev) try self.gu_dev.get(self.b, .glm53_dec_gu, n_pairs, &cfg) else try self.gu[n_pairs - 1].get(self.b, .glm53_dec_gu, n_slots, &cfg);
+            try self.b.applyPrepared(p, &.{ u[0], u[1], gt, pt, sc, banks[0].gate.trellis, banks[1].gate.trellis, banks[2].gate.trellis, banks[0].up.trellis, banks[1].up.trellis, banks[2].up.trellis }, &z);
         }
+        const e = reg.get(.glm53_dec_down);
         const sh = [_]c_int{ np, @intCast(h) };
-        const cfg = cfgOf(reg.get(.glm53_dec_down), self.inst, .{ 256 * h / 128, @intCast(n_pairs), 1 }, &.{.{ &sh, .float32 }});
-        const p = try self.down.get(self.b, .glm53_dec_down, n_pairs, &cfg);
+        var cfg = cfgOf(e, self.inst, .{ 256 * h / 128, @intCast(n_pairs), 1 }, &.{.{ &sh, .float32 }});
+        setInt(&cfg, e, "DEV", di);
+        const p = try self.down[di].get(self.b, .glm53_dec_down, n_pairs, &cfg);
         var y: [1]mlx.mlx_array = undefined;
         try self.b.applyPrepared(p, &.{ z[0], z[1], pt, sc, banks[0].gate.svh, banks[1].gate.svh, banks[2].gate.svh, banks[0].up.svh, banks[1].up.svh, banks[2].up.svh, banks[0].down.suh, banks[1].down.suh, banks[2].down.suh, banks[0].down.trellis, banks[1].down.trellis, banks[2].down.trellis, banks[0].down.svh, banks[1].down.svh, banks[2].down.svh }, &y);
         return y[0];

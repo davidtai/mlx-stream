@@ -4,7 +4,8 @@
     // mini over that middle, and the output block sum_r t128(zd_r) * scale * rout_d[r] times the pair's score, f32.
     // Eight simdgroups: the middle's 4 x MINI/128 blocks among them, then simdgroup s the output tile s of the block for
     // every mini, then simdgroup 0 the block's rotation and the minis' sum. pt: per pair (x row, slot packed bank << 24 |
-    // row, routed position, 0); sc: the router's weights by routed position.
+    // row, routed position, 0); DEV: the call's routed positions are the pairs, pt their packed slots; sc: the router's
+    // weights by routed position. A pair skips at slot 0xFFFFFFFF or score 0: no read, its output block zero.
     constexpr uint IT = uint(MINI) / 16u;
     constexpr uint OT = uint(HID) / 16u;
     constexpr uint NW = 8u * uint(K);
@@ -15,8 +16,18 @@
     const uint lane = thread_index_in_simdgroup;
     const uint blk = threadgroup_position_in_grid.x;
     const uint p = threadgroup_position_in_grid.y;
-    const uint packed = pt[4u * p + 1u];
-    const uint pos = pt[4u * p + 2u];
+    const uint packed = DEV ? pt[p] : pt[4u * p + 1u];
+    const uint pos = DEV ? p : pt[4u * p + 2u];
+    if (packed == 0xffffffffu || sc[pos] == 0.0f) {
+        if (sg == 0u) {
+            device float* yp = y + size_t(p) * uint(HID) + blk * 128u + lane;
+            yp[0] = 0.0f;
+            yp[32] = 0.0f;
+            yp[64] = 0.0f;
+            yp[96] = 0.0f;
+        }
+        return;
+    }
     const uint bank = packed >> 24u;
     const size_t srow = size_t(packed & 0xffffffu) * 4u;
     const device half* rg = bank == 0u ? og0 : (bank == 1u ? og1 : og2);
