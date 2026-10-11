@@ -22,7 +22,6 @@
 //! lanes to the accepted rows; the MTP layer appends nothing for a draft, so a rejection leaves its cache as it was.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const log = @import("sdk").log;
@@ -227,7 +226,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const max_context = bill_mod.servedContext(cfg);
             // The prompt's attention form this device runs (the bill charges its arrays).
             const dsa = try graph.dsaKernelsRun(gpa, s, model);
-            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag), .dsa = dsa, .gemm = comptime bill_mod.promptGemmOf(Q), .select = bill_mod.selectOf(model), .prompt_cache = bill_mod.prefillCacheBytes(ram), .size_classes = comptime builtin.os.tag == .macos };
+            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag), .dsa = dsa, .gemm = comptime bill_mod.promptGemmOf(Q), .select = bill_mod.selectOf(model), .prompt_cache = bill_mod.prefillCacheBytes(ram), .size_classes = bill_mod.prompt_size_classes };
             const billed = bill_mod.billOf(inputs);
             const mb = try bill_mod.memoryBill(gpa, billed, null);
             errdefer mb.free(gpa);
@@ -546,8 +545,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// a nearly equal request reuses its cached buffer) on for the forward layers only: their transients are
         /// rounded, never a lane (`Cache.preallocate`), a resident, the scratch or the MTP lane's rows.
         fn transientClasses(on: bool) void {
-            // Only mlx-serve's macOS MLX (patches/mlx-alloc-size-classes.patch) has the switch.
-            if (comptime builtin.os.tag != .macos) return;
+            // Only mlx-serve's macOS MLX (patches/mlx-alloc-size-classes.patch) has the switch: the bill reads the same.
+            if (comptime !bill_mod.prompt_size_classes) return;
             var prev: bool = false;
             _ = mlx.mlx_set_alloc_size_classes(&prev, on);
         }
