@@ -67,6 +67,7 @@ comptime {
     _ = @import("glm_moe_dsa_graph.zig");
     _ = @import("glm_moe_dsa_experts.zig");
     _ = @import("glm_moe_dsa_topk.zig");
+    _ = @import("glm_moe_dsa_route.zig");
     _ = @import("glm_moe_dsa_split.zig");
     _ = @import("glm_moe_dsa_trunk_bench.zig");
     _ = @import("glm_moe_dsa_module.zig");
