@@ -599,6 +599,13 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             }
         }
 
+        /// The gated miss waves committed as soon as they are built (`acc`'s outputs from `first`): each waits on the GPU
+        /// for its bytes and runs once they land, while the host builds the next layer; their outputs stay in `acc` for
+        /// the join. Exact: the same arrays, only their commit moves ahead of the next routing barrier's eval.
+        fn commitMisses(g: *G, acc: *const Acc, first: usize) !void {
+            if (acc.n_outs > first) try g.asyncEval(acc.outs[first..acc.n_outs]);
+        }
+
         /// The decode lane: the routed outputs `[n, k, hidden]` in routed order.
         fn callDecode(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
             const n_ids = n * k;
@@ -647,7 +654,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             }
             if (n_early > 0) try g.asyncEval(early[0..n_early]);
             if (self.opt.gated) {
+                const first_miss = acc.n_outs;
                 if (try self.stream.gate(r)) |gates| try self.gatedParts(g, layer, x, k, sv, gates, &acc);
+                try commitMisses(g, &acc, first_miss);
             } else for (0..sv.n_parts) |p| {
                 const part: u32 = @intCast(p);
                 try self.stream.waitGu(r, part);
@@ -754,6 +763,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             var prev: []const T = &.{};
             var missed = false;
             var gu_first: u64 = 0;
+            const first_miss = acc.n_outs;
             for (&sides) |*sd| if (sd.r) |r| {
                 missed = missed or r.n_parts > 0;
                 if (self.opt.gated) {
@@ -778,6 +788,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     try g.asyncEval(try self.fusedWave(g, sd, x, k, @intCast(p + 1), &acc, null));
                 }
             };
+            if (self.opt.gated) try commitMisses(g, &acc, first_miss);
             if (comptime timeline.enabled) timeline.point(layer, .end, self.readGauge(), missed);
             for (&sides) |*sd| if (sd.r) |r| {
                 self.stream.release(r);
