@@ -842,16 +842,22 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
 
 const testing = std.testing;
 
-/// The kernels' dims on a small trunk: 64 heads, the 512-wide latent with a 64-wide roped key, 4 indexer heads of
-/// 128, the top 64 keys; a full layer and a shared one (the routed third is never run), every projection 8-bit affine.
-fn kernelDimsConfigJson(a: std.mem.Allocator) ![]u8 {
+/// The head dims and the top-k of a test trunk: the DSA kernels' test (`kernel_dims`) or GLM-5.3's (`glm53_dims`).
+const AttnDims = struct { nope: u32, v: u32, topk: u32 };
+const kernel_dims: AttnDims = .{ .nope = 64, .v = 64, .topk = 64 };
+const glm53_dims: AttnDims = .{ .nope = 192, .v = 256, .topk = 2048 };
+
+/// A small trunk at the DSA kernels' dims: 64 heads, the 512-wide latent with a 64-wide roped key, 4 indexer heads of
+/// 128, `d`'s head dims and top-k; a full layer and a shared one (the routed third is never run), every projection
+/// 8-bit affine.
+fn kernelDimsConfigJson(a: std.mem.Allocator, d: AttnDims) ![]u8 {
     return std.fmt.allocPrint(a, "{{\"model_type\":\"glm_moe_dsa\",\"attention_bias\":false,\"eos_token_id\":[1],\"first_k_dense_replace\":2,\"hidden_act\":\"silu\"," ++
-        "\"hidden_size\":128,\"index_head_dim\":128,\"index_n_heads\":4,\"index_topk\":64,\"indexer_rope_interleave\":true,\"intermediate_size\":128,\"kv_lora_rank\":512," ++
+        "\"hidden_size\":128,\"index_head_dim\":128,\"index_n_heads\":4,\"index_topk\":{d},\"indexer_rope_interleave\":true,\"intermediate_size\":128,\"kv_lora_rank\":512," ++
         "\"max_position_embeddings\":4096,\"moe_intermediate_size\":64,\"moe_layer_freq\":1,\"n_group\":1,\"n_routed_experts\":16,\"n_shared_experts\":1,\"norm_topk_prob\":true," ++
-        "\"num_attention_heads\":64,\"num_experts_per_tok\":8,\"num_hidden_layers\":3,\"num_key_value_heads\":64,\"q_lora_rank\":64,\"qk_nope_head_dim\":64,\"qk_rope_head_dim\":64," ++
+        "\"num_attention_heads\":64,\"num_experts_per_tok\":8,\"num_hidden_layers\":3,\"num_key_value_heads\":64,\"q_lora_rank\":64,\"qk_nope_head_dim\":{d},\"qk_rope_head_dim\":64," ++
         "\"rms_norm_eps\":1e-05,\"rope_interleave\":true,\"rope_parameters\":{{\"rope_theta\":10000,\"rope_type\":\"default\"}},\"routed_scaling_factor\":2.5,\"scoring_func\":\"sigmoid\"," ++
-        "\"tie_word_embeddings\":false,\"topk_group\":1,\"topk_method\":\"noaux_tc\",\"v_head_dim\":64,\"vocab_size\":256," ++
-        "\"indexer_types\":[\"full\",\"shared\",\"shared\"],\"mlp_layer_types\":[\"dense\",\"dense\",\"sparse\"],\"quantization\":{{\"group_size\":64,\"bits\":8}}}}", .{});
+        "\"tie_word_embeddings\":false,\"topk_group\":1,\"topk_method\":\"noaux_tc\",\"v_head_dim\":{d},\"vocab_size\":256," ++
+        "\"indexer_types\":[\"full\",\"shared\",\"shared\"],\"mlp_layer_types\":[\"dense\",\"dense\",\"sparse\"],\"quantization\":{{\"group_size\":64,\"bits\":8}}}}", .{ d.topk, d.nope, d.v });
 }
 
 const TestWeights = struct {
@@ -869,6 +875,42 @@ const TestWeights = struct {
     fn quant(tw: TestWeights, g: *G, shape: []const c_int, sd: f32) !QLinear {
         const parts = try ops.quantizeAffine(g, try tw.dense(g, shape, sd), glm.group_size, 8);
         return .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = 8 };
+    }
+
+    /// The attention of a full layer and a shared one at `c`'s dims (unit norms).
+    fn attentionLayers(tw: TestWeights, g: *G, c: *const glm.Config) ![2]Layer {
+        const h: c_int = @intCast(c.n_heads);
+        const hid: c_int = @intCast(c.hidden_size);
+        const ql: c_int = @intCast(c.q_lora_rank);
+        const kvr: c_int = @intCast(c.kv_lora_rank);
+        const nope: c_int = @intCast(c.qk_nope_head_dim);
+        const qhd: c_int = @intCast(c.qHeadDim());
+        const vd: c_int = @intCast(c.v_head_dim);
+        const ih: c_int = @intCast(c.index_n_heads);
+        const ihd: c_int = @intCast(c.index_head_dim);
+        var layers: [2]Layer = undefined;
+        for (&layers, 0..) |*lw, l| {
+            lw.* = .{
+                .input_norm = try g.ones(&.{hid}, .bfloat16),
+                .post_norm = try g.ones(&.{hid}, .bfloat16),
+                .q_a = try tw.quant(g, &.{ ql, hid }, 0.1),
+                .q_a_norm = try g.ones(&.{ql}, .bfloat16),
+                .q_b = try tw.quant(g, &.{ h * qhd, ql }, 0.15),
+                .kv_a = try tw.quant(g, &.{ kvr + @as(c_int, @intCast(c.qk_rope_head_dim)), hid }, 0.1),
+                .kv_a_norm = try g.ones(&.{kvr}, .bfloat16),
+                .embed_q = try tw.quant(g, &.{ h, kvr, nope }, 0.15),
+                .unembed_out = try tw.quant(g, &.{ h, vd, kvr }, 0.05),
+                .o = try tw.quant(g, &.{ hid, h * vd }, 0.02),
+            };
+            if (l == 0) lw.indexer = .{
+                .wq_b = try tw.dense(g, &.{ ih * ihd, ql }, 0.15),
+                .wk = try tw.dense(g, &.{ ihd, hid }, 0.1),
+                .k_norm_w = try g.ones(&.{ihd}, .bfloat16),
+                .k_norm_b = try g.zeros(&.{ihd}, .bfloat16),
+                .weights_proj = try tw.dense(g, &.{ ih, hid }, 0.1),
+            };
+        }
+        return layers;
     }
 };
 
@@ -891,7 +933,7 @@ test "glm wave probe: a layer's stages are its rises over the layer's start; the
 test "glm attention: a prompt on the DSA kernels selects the reference's keys and matches its prompt form" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
-    const text = try kernelDimsConfigJson(a);
+    const text = try kernelDimsConfigJson(a, kernel_dims);
     defer a.free(text);
     var c = try glm.Config.parse(a, text, null, null);
     defer c.deinit(a);
@@ -903,37 +945,8 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
     defer g.deinit();
     var prng = std.Random.DefaultPrng.init(53);
     const tw: TestWeights = .{ .rand = prng.random() };
-    const h: c_int = @intCast(c.n_heads);
     const hid: c_int = @intCast(c.hidden_size);
-    const ql: c_int = @intCast(c.q_lora_rank);
-    const kvr: c_int = @intCast(c.kv_lora_rank);
-    const nope: c_int = @intCast(c.qk_nope_head_dim);
-    const qhd: c_int = @intCast(c.qHeadDim());
-    const vd: c_int = @intCast(c.v_head_dim);
-    const ih: c_int = @intCast(c.index_n_heads);
-    const ihd: c_int = @intCast(c.index_head_dim);
-    var layers: [2]Layer = undefined;
-    for (&layers, 0..) |*lw, l| {
-        lw.* = .{
-            .input_norm = try g.ones(&.{hid}, .bfloat16),
-            .post_norm = try g.ones(&.{hid}, .bfloat16),
-            .q_a = try tw.quant(&g, &.{ ql, hid }, 0.1),
-            .q_a_norm = try g.ones(&.{ql}, .bfloat16),
-            .q_b = try tw.quant(&g, &.{ h * qhd, ql }, 0.15),
-            .kv_a = try tw.quant(&g, &.{ kvr + @as(c_int, @intCast(c.qk_rope_head_dim)), hid }, 0.1),
-            .kv_a_norm = try g.ones(&.{kvr}, .bfloat16),
-            .embed_q = try tw.quant(&g, &.{ h, kvr, nope }, 0.15),
-            .unembed_out = try tw.quant(&g, &.{ h, vd, kvr }, 0.05),
-            .o = try tw.quant(&g, &.{ hid, h * vd }, 0.02),
-        };
-        if (l == 0) lw.indexer = .{
-            .wq_b = try tw.dense(&g, &.{ ih * ihd, ql }, 0.15),
-            .wk = try tw.dense(&g, &.{ ihd, hid }, 0.1),
-            .k_norm_w = try g.ones(&.{ihd}, .bfloat16),
-            .k_norm_b = try g.zeros(&.{ihd}, .bfloat16),
-            .weights_proj = try tw.dense(&g, &.{ ih, hid }, 0.1),
-        };
-    }
+    const layers = try tw.attentionLayers(&g, &c);
     // Two prompt calls (200 rows, then 40 more): spans past the top-k, the selection carried to the shared layer.
     const calls = [_][2]u32{ .{ 0, 200 }, .{ 200, 40 } };
     var xs: [calls.len]T = undefined;
@@ -986,4 +999,66 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
         std.debug.print("glm attention kernels vs reference form, call {d} layer {d}: cos {d:.6}, max |d| {d:.4} (output up to {d:.3})\n", .{ i / 2, i % 2, cos, maxd, maxr });
         try testing.expect(cos > 0.999 and maxd <= 0.05 * maxr);
     }
+}
+
+test "glm attention: the verify's rows through embed_q and unembed_out at once equal the row-by-row absorbed attention bit for bit at GLM-5.3's head dims" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const text = try kernelDimsConfigJson(a, glm53_dims);
+    defer a.free(text);
+    var c = try glm.Config.parse(a, text, null, null);
+    defer c.deinit(a);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(55);
+    const tw: TestWeights = .{ .rand = prng.random() };
+    const hid: c_int = @intCast(c.hidden_size);
+    const heads: c_int = @intCast(c.n_heads);
+    const vd: c_int = @intCast(c.v_head_dim);
+    const layers = try tw.attentionLayers(&g, &c);
+    // KV lanes past the top-k (every row selects), then two verifies of 4 rows; each arm from the same lanes.
+    const n0: u32 = c.index_topk + 100;
+    const rows: u32 = 4;
+    var cache = try Cache.init(a, &c, n0 + 2 * rows);
+    defer cache.deinit(&g);
+    for (0..layers.len) |l| try cache.append(&g, @intCast(l), try tw.dense(&g, &.{ 1, @intCast(n0), @intCast(c.kv_lora_rank) }, 1), try tw.dense(&g, &.{ 1, @intCast(n0), @intCast(c.qk_rope_head_dim) }, 1), if (l == 0) try tw.dense(&g, &.{ 1, @intCast(n0), @intCast(c.index_head_dim) }, 1) else null);
+    cache.commit(n0);
+    const xs = [_]T{ try tw.dense(&g, &.{ @intCast(rows), hid }, 1), try tw.dense(&g, &.{ @intCast(rows), hid }, 1) };
+    var outs: [2][xs.len * 2][]f32 = undefined;
+    for (0..2) |arm| {
+        cache.truncateTo(n0);
+        for (xs, 0..) |x, vi| {
+            const start = n0 + rows * @as(u32, @intCast(vi));
+            var carry = try Carry.perRow(a, rows);
+            defer carry.deinit(&g);
+            for (&layers, 0..) |*lw, li| {
+                const l: u32 = @intCast(li);
+                const y = if (arm == 0) try attention(&g, &c, lw, l, x, start, rows, &cache, &carry, .per_row, false) else blk: {
+                    // The row-by-row form: each row's absorbedRow, joined, through o.
+                    const q = try queryOf(&g, &c, lw, x, start, rows);
+                    const k = try keysOf(&g, &c, lw, x, start, rows);
+                    try cache.append(&g, l, k.latent, k.k_pe, k.index);
+                    const kv_all = try cache.latentView(&g, l);
+                    const pe_all = try cache.ropeView(&g, l);
+                    if (lw.indexer) |ix| try select(&g, &c, ix, x, q.iq.?, try cache.indexView(&g, l), start, rows, &carry);
+                    var per: [rows]T = undefined;
+                    for (&per, 0..) |*o, i| {
+                        const r: c_int = @intCast(i);
+                        const nk: c_int = @intCast(start + i + 1);
+                        o.* = try absorbedRow(&g, &c, lw, try rowSlice(&g, q.q_nope, r, r + 1), try rowSlice(&g, q.q_pe, r, r + 1), try rowSlice(&g, kv_all, 0, nk), try rowSlice(&g, pe_all, 0, nk), carry.topk[i]);
+                    }
+                    const out = try g.concat(&per, 2);
+                    break :blk try qlinear(&g, try g.reshape(try g.transposeAxes(out, &.{ 0, 2, 1, 3 }), &.{ @intCast(rows), heads * vd }), lw.o);
+                };
+                outs[arm][vi * 2 + li] = try a.alloc(f32, @intCast(g.shapeOf(y).numel()));
+                _ = try g.hostF32(try g.astype(y, .float32), outs[arm][vi * 2 + li]);
+            }
+            cache.commit(rows);
+        }
+    }
+    defer for (outs) |arm| for (arm) |o| a.free(o);
+    // bf16 to f32 keeps every bit (both zeros apart): the outputs' bits compared.
+    for (outs[0], outs[1]) |got, want| try testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(want)), std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(got)));
 }
