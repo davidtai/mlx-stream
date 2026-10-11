@@ -252,9 +252,10 @@ host wait on reads, and in decode the hits, misses and hit rate per layer (min, 
 emitted token, the lookahead's records (used, landed, expired, abandoned, cancelled, discarded, used while still read)
 and its bytes read and served, and the share of the decode with a read in flight; each line ends with the phase's
 memory: MLX's active and peak bytes and its cache, the footprint and its peak, and the host side. A `glm_moe_dsa:
-decode host split` line gives the decode lane's host time: the routing barriers' waits, the routes, the waves' encode.
-A `glm_moe_dsa: lookahead precision` line gives, per top-k position of the candidate's best row (and per bank layer
-with the EXL3 bank), the records read ahead and how many of them the next routed layer's call routed. With the EXL3
+decode host split` line gives the decode lane's host time: the routing barriers' waits, the routes, the waves' encode
+(in PROFILE builds in four steps: the hit waves built, their commit, the miss waves built, the join). A `glm_moe_dsa: lookahead precision` line gives, per top-k position of the candidate's best row (and per bank layer
+with the EXL3 bank), the records the lookahead chose and how many of them the next routed layer's call routed (a
+record chosen again while its read is still held is counted again and not read again). With the EXL3
 bank, the prompt line also counts the prefill GEMM calls and the GPU drains.
 
 At each prompt the residency policy keeps the residents of the prompt rows and forgets its prompt state
