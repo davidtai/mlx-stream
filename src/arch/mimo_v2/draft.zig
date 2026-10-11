@@ -233,9 +233,11 @@ pub const Lane = struct {
 
     /// One round (the module's `draft_lane.round`): [t1, the accepted drafts] (owned by `a`) and the next token.
     pub fn round(m: *tm.Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
-        const self = m.lane orelse return error.MimoNoDraftLane;
+        // The host runs a round only on an armed lane (`blockSize` > 0: the lane is installed) after a prompt pass:
+        // invariants of the host contract, held by the lane tests.
+        std.debug.assert(m.lane != null and m.pos > 0);
+        const self = m.lane.?;
         const p = m.pos;
-        if (p == 0) return error.MimoDraftNoPrompt;
         var tt = if (comptime mp.enabled) mp.roundBegin(m.source.stream_source.stats()) else mp.now();
         try self.state.pushTokens(p, &.{t1});
         // Drafts: the installed depth, the host's cap, the reserved positions after t1; none when the heads' history

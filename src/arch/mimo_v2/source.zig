@@ -737,10 +737,9 @@ pub const Source = struct {
             // once per forward, as DeepSeek does.
             return g.keep(output);
         }
-        // R3: decode's narrow window 0 holds one decode-lane route; a decode-phase wide call (its groups up to
-        // `max_route_ids` ids; no decode caller makes one: Module resumes the prompt phase for any forward wider than the
-        // decode lane) is refused by name before it routes.
-        if (self.narrow_window and self.sdk_stream.phase == .decode) return error.MimoDecodeWideCall;
+        // R3: decode's narrow window 0 holds one decode-lane route; no decode caller makes a wide call (Module resumes the
+        // prompt phase for any forward wider than the decode lane). An invariant of the callers, held by the tests.
+        std.debug.assert(!(self.narrow_window and self.sdk_stream.phase == .decode));
         const hook = self.ex.at(layer);
         const parts = try hook.routedParts(g, x, try g.astype(expert_ids, .int32));
         defer hook.releaseParts(g);

@@ -83,8 +83,11 @@ pub fn loadBytes(a: std.mem.Allocator, io: std.Io, c: *const Config, facts: *con
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var floor = c.withFacts(facts);
-    // Forced rows (host facts, else the settings) bill as forced; otherwise the fill's floor.
-    floor.expert_rows = floor.expert_rows orelse floor.expert_prefill_rows orelse mimo.default_expert_rows;
+    // The load preflight's requirement: the process bound at the fill's floor rows, forced rows or not (DeepSeek's
+    // `loadBytes`, deepseek_v41_plugin.zig). Forced rows are an operator pin the construction honours (`bills.choose`
+    // reports how far they sit over the fill), never a preflight refusal.
+    floor.expert_rows = mimo.default_expert_rows;
+    floor.expert_prefill_rows = mimo.default_expert_rows;
     const plan = try bills.plan(arena.allocator(), io, floor, ceiling, facts.wired_margin_bytes);
     return plan.bill.processBound(plan.rows);
 }

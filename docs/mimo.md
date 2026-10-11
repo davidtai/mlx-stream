@@ -104,7 +104,10 @@ rule (the max-shape reading plus 0.02 GB for a long decode, rounded up to the ne
   that, and with `phase_rows: false`, decode bills the declared pair (1.0 GB host, 512 MiB compiler);
 - in the prompt phase: the declared pair.
 
-A load whose host side exceeds its construction bound fails with `ConstructionOverBill`.
+The bill is a report, not a gate. After construction the footprint and the host side are compared with the bill's
+construction terms; an overage logs a `construction check: ... (an under-bill: proceeding)` warning and the load
+continues. The box's live guard is the safety net. The load preflight (`loadBytes`) bills the fill's floor rows, as
+DeepSeek-V4.1 does.
 
 `MIMO_BANK=<pack> zig build test -Dmlx-serve=../mlx-serve -Dtest-filter="the bill tool prints every term"` prints
 every term and the rows per context for a pack, from its headers.
@@ -112,9 +115,11 @@ every term and the rows per context for a pack, from its headers.
 ## Expert rows
 
 - **AUTO** (the default): the fill admits the most prompt rows and decode rows whose bill fits the target.
-- **Forced:** `expert_rows` (decode rows) and `expert_prefill_rows` (prompt rows); either alone forces both. A forced
-  count over the fill is refused by name with the admitted maximum, never admitted; prompt rows above decode rows are
-  refused (`MimoPhaseRows`).
+- **Forced:** `expert_rows` (decode rows) and `expert_prefill_rows` (prompt rows); either alone forces both. Forced
+  rows are an operator contract and always load as named, as DeepSeek-V4.1's do. Over the fill, construction logs
+  `forced rows <prompt>/<decode> exceed the fill by <N> bytes at baseline <B>; proceeding (operator pin)`. Only
+  impossible counts refuse: zero rows or more decode rows than the 256 experts (`MimoExpertRows`), and prompt rows
+  above decode rows (`MimoPhaseRows`).
 - **Per-layer split** (`expert_rows_by_layer`). The default `derived` adds a fixed offset per routed layer to the
   admitted rows (from +82 to -44, summing to 0, so every bill term is the uniform split's). The offsets were derived
   from six route traces of non-benchmark prompts and held out on the benchmark prompts. Measured on the bf16res pack

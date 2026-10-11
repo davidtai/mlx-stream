@@ -278,8 +278,9 @@ fn dequantRun(kernel: Kernel, w: Array, scales: Array, n: c_int, kdim: c_int, s:
 
 /// The prompt route: x [M, K] @ bf16(code x scale)^T through MLX's stock matmul (the BF16 tier's QLinear arithmetic).
 pub fn promptRun(kernels: *const Kernels, n: c_int, kdim: c_int, x: Array, w: Array, scales: Array, s: Stream) !Array {
-    // R2: the decode phase after the growth has no billed prompt cache (a prompt-route call there is a broken invariant).
-    if (kernels.prompt_closed) return error.MimoFp8PromptRouteClosed;
+    // R2: the decode phase after the growth has no billed prompt cache; its calls are M <= 8 (the GEMV), so no prompt-route
+    // call reaches a closed route. An invariant of the callers, held by the tests.
+    std.debug.assert(!kernels.prompt_closed);
     const wb = try kernels.prompt.?.get(kernels, w, scales, n, kdim, s);
     var wt: Array = .{};
     defer drop(wt);

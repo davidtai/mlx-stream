@@ -373,8 +373,9 @@ pub const Module = struct {
 
     /// Once, at construction: the residents materialized (the nocache reader fills their buffers lazily, so the first
     /// request would load them and the footprint would hold none of the bytes the bill keeps for them), every command
-    /// retired and the cache cleared; then the footprint within DeepSeek's tolerance of the bill's construction terms
-    /// (`bills.checkBuilt`) and the host side (the footprint less MLX active and cache) within its measured bound.
+    /// retired and the cache cleared; then the footprint reported against the bill's construction terms (DeepSeek's
+    /// tolerance, `bills.checkBuilt`) and the host side (the footprint less MLX active and cache) against its measured
+    /// bound: a warn line when over, never a refusal.
     /// The residents' page-cache proof follows the materialization: the box's file-backed pages from `file_start` (the
     /// guard counts file cache in its physical used; a cached resident load lands there on top of the footprint).
     fn checkConstruction(self: *Module, b: host.MemoryBill, rows: u32, weights: *host.Weights, file_start: u64) !void {
@@ -397,17 +398,15 @@ pub const Module = struct {
         _ = mlx.mlx_get_cache_memory(&cache);
         const billed = b.constructionBytes(rows);
         const host_side = footprint -| active -| cache;
-        log.info("MiMo construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B, {d} residents), billed construction terms {d} B, residual {d} B (billed less footprint: positive = over-billed; refused when the footprint exceeds the bill by more than the tolerance {d} B)", .{ footprint, active, cache, host_side, n, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(footprint)), bills.construction_tolerance_bytes });
-        bills.checkBuilt(b, rows, footprint) catch |e| {
-            log.err("construction check: the footprint {d} B exceeds the billed construction terms {d} B by more than {d} B", .{ footprint, billed, bills.construction_tolerance_bytes });
-            return e;
-        };
+        log.info("MiMo construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B, {d} residents), billed construction terms {d} B, residual {d} B (billed less footprint: positive = over-billed; reported when the footprint exceeds the bill by more than the tolerance {d} B)", .{ footprint, active, cache, host_side, n, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(footprint)), bills.construction_tolerance_bytes });
+        // A report, not a refusal (DeepSeek runs its construction check only under its verify override): an under-bill
+        // is a bill bug for the bill tests and the window guard, never a reason for the served load to stop.
+        bills.checkBuilt(b, rows, footprint) catch
+            log.warn("construction check: the footprint {d} B exceeds the billed construction terms {d} B by more than {d} B (an under-bill: proceeding)", .{ footprint, billed, bills.construction_tolerance_bytes });
         for (b.terms) |t| {
             if (!t.measured) continue;
-            host.checkMeasured(t, host_side) catch |e| {
-                log.err("construction check: the host side {d} B exceeds its billed bound {s} {d} B", .{ host_side, t.name, t.atConstruction() });
-                return e;
-            };
+            host.checkMeasured(t, host_side) catch
+                log.warn("construction check: the host side {d} B exceeds its billed bound {s} {d} B (an under-bill: proceeding)", .{ host_side, t.name, t.atConstruction() });
         }
     }
 
@@ -830,8 +829,10 @@ pub const Module = struct {
     /// hidden and F32 logits, lazy: the lane folds its decision graph into their one eval, then `flushVerify`. The
     /// position advances by every row; the lane rolls the rejected rows back with `trim`.
     pub fn verifyRows(self: *Module, ids: []const u32) !struct { logits: Array, hidden: Array } {
-        if (ids.len == 0 or ids.len > draft.verify_rows or self.reserve == 0 or self.pos + ids.len > self.reserve) return error.MimoContextLimit;
-        try self.checkTokens(ids);
+        // The lane builds at most `draft.verify_rows` rows from the trunk's and the heads' own argmax (in the vocabulary by
+        // construction): invariants of the lane. The position against the request's reservation is the request's own value.
+        std.debug.assert(ids.len > 0 and ids.len <= draft.verify_rows);
+        if (self.reserve == 0 or self.pos + ids.len > self.reserve) return error.MimoContextLimit;
         errdefer self.reset();
         // R2: the round's draft (the heads' catch-up after a prompt pass) ran at the prompt rows; the growth comes now.
         try self.finishGrow();

@@ -29,6 +29,9 @@ pub const Plan = struct {
     baseline: u64,
     fixed_bytes: u64,
     reserve: u64,
+    /// Forced rows only: how far the bill at the forced rows sits over the target (0 = within; the fill's rows always
+    /// are). A report, never a refusal: forced rows are an operator contract (`choose`).
+    over_fill: u64 = 0,
 };
 
 pub fn requestBytes(c: mimo.Config, reserve: u64) u64 {
@@ -174,10 +177,10 @@ pub fn catchUpBytes(c: mimo.Config) u64 {
     return 2 * mtp_mod.n_heads * per_head;
 }
 
-/// R2, once at construction: under the deferred growth the catch-up runs after the boundary's frees and before the growth,
-/// at the prompt rows, holding the decode phase's terms (less window 0, not yet allocated) plus its transient: that must fit
-/// the prompt phase's fixed bytes, so the admitted prompt total bounds it. Refused by name otherwise (never at the served
-/// shapes: the prompt pass's workspaces alone exceed the catch-up several times over).
+/// R2, a bill invariant the tests hold (never a load check): under the deferred growth the catch-up runs after the
+/// boundary's frees and before the growth, at the prompt rows, holding the decode phase's terms (less window 0, not yet
+/// allocated) plus its transient: that must fit the prompt phase's fixed bytes, so the prompt total bounds it (at every
+/// standard context the prompt pass's workspaces alone exceed the catch-up several times over: the rows-audit test).
 pub fn checkDeferredGrowth(b: sdk.MemoryBill, config: settings.Config) !void {
     if (!config.defersGrowth()) return;
     const window0 = @as(u64, stream.decodeTransientRows(config.decode_window)) * (b.per_row / mimo.moe_layers);
@@ -376,11 +379,12 @@ fn slotWiring(data: *const [4]u64, phase: sdk.MemoryBill.Phase, rows: u32) u64 {
     return wireTables(data[if (phase == .prompt) 0 else 2] + rows * data[1]);
 }
 
+/// Once per load: the bill and the rows. The bill is a report and a fill, never a refusal of a pin: forced rows load as
+/// named (`choose`), and the deferred growth's catch-up bound (`checkDeferredGrowth`) is a bill test, not a load check.
 pub fn plan(a: std.mem.Allocator, io: std.Io, c: settings.Config, ceiling: u64, stop: u64) !Plan {
     try c.validate();
     const b = try completeBill(a, io, c, c.reserveTokens());
     errdefer b.free(a);
-    try checkDeferredGrowth(b, c);
     return choose(b, c, ceiling, stop);
 }
 
@@ -396,8 +400,9 @@ pub fn completeBill(a: std.mem.Allocator, io: std.Io, c: settings.Config, reserv
 /// Exactly one source supplies rows and its nonlinear wiring rule. Names and
 /// term values are borrowed; only the joined term array is owned by this bill.
 fn compose(a: std.mem.Allocator, arch: sdk.MemoryBill, slots: sdk.MemoryBill) !sdk.MemoryBill {
-    if (arch.per_row != 0 or arch.row_terms != null) return error.MimoBillMultipleRowSources;
-    if (slots.per_row == 0 or slots.row_terms == null) return error.MimoBillRowSourceMissing;
+    // Invariants of the two bills' code (archBill has no row terms; sourceBill always has them): the bill tests hold them.
+    std.debug.assert(arch.per_row == 0 and arch.row_terms == null);
+    std.debug.assert(slots.per_row != 0 and slots.row_terms != null);
     const terms = try a.alloc(Term, arch.terms.len + slots.terms.len);
     @memcpy(terms[0..arch.terms.len], arch.terms);
     @memcpy(terms[arch.terms.len..], slots.terms);
@@ -426,15 +431,26 @@ fn choose(b: sdk.MemoryBill, c: settings.Config, ceiling: u64, stop: u64) !Plan 
         if (c.expert_prefill_rows) |n| if (n != count) return error.MimoPhaseRows;
         break :blk .{ .prompt = count, .decode = count };
     };
-    sdk.admit(b, baseline, rows, target) catch |e| {
-        // The fill's rows always pass; only forced rows reach here. Refused, never admitted over the bound, with the
-        // admitted maximum named.
-        const max = admittedMaximum(b, c, baseline, target);
-        log.warn("MiMo forced rows refused ({s}): prompt_rows={d} decode_rows={d} exceed the admitted maximum prompt_rows={d} decode_rows={d} (baseline={d} target={d})", .{ @errorName(e), rows.prompt, rows.decode, if (max) |m| m.prompt else 0, if (max) |m| m.decode else 0, baseline, target });
-        return error.MimoForcedRowsOverFill;
-    };
+    // Forced rows are an operator contract, honoured as named (DeepSeek's `--expert-rows`, deepseek_v41_module.zig
+    // `Module.init`: no admission of forced rows). The bill reports how far they sit over the fill; the box's live
+    // guard is the safety net. The fill's own rows are within the target by construction.
+    const over = overFillBytes(b, baseline, rows, target);
+    if (over > 0) {
+        var line: [160]u8 = undefined;
+        log.warn("{s}", .{forcedRowsLine(&line, rows, over, baseline)});
+    }
     const reserve = c.reserveTokens();
-    return .{ .bill = b, .rows = rows, .target = target, .baseline = baseline, .fixed_bytes = b.processBound(rows) - requestForConfig(c, reserve), .reserve = reserve };
+    return .{ .bill = b, .rows = rows, .target = target, .baseline = baseline, .fixed_bytes = b.processBound(rows) - requestForConfig(c, reserve), .reserve = reserve, .over_fill = over };
+}
+
+/// The forced rows' report line (`choose`, when they sit over the fill).
+pub fn forcedRowsLine(buf: []u8, rows: sdk.Rows, over: u64, baseline: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "forced rows {d}/{d} exceed the fill by {d} bytes at baseline {d}; proceeding (operator pin)", .{ rows.prompt, rows.decode, over, baseline }) catch buf[0..0];
+}
+
+/// How far the bill at `rows` sits over `target` in its larger phase (0: both phases within). A report.
+pub fn overFillBytes(b: sdk.MemoryBill, baseline: u64, rows: sdk.Rows, target: u64) u64 {
+    return @max(b.total(.prompt, baseline, rows.prompt) -| target, b.total(.decode, baseline, rows.decode) -| target);
 }
 
 /// Whether `c` forces its rows (host facts or the `expert_rows` / `expert_prefill_rows` settings).
@@ -642,11 +658,18 @@ test "mlx-stream MiMo bill: X20 / X21 the read schedule is in no term: early_who
     }
 }
 
-test "mlx-stream MiMo bill: forced rows, baseline and device stop cannot bypass admission" {
+test "mlx-stream MiMo bill: forced rows load as named over the fill (an operator pin, reported); impossible rows and a missing baseline refuse" {
     const b = try fixtureBill(testing.allocator);
     defer b.free(testing.allocator);
     var c: settings.Config = .{ .memory_baseline_bytes = 10_000_000_000, .expert_rows = 256 };
-    try testing.expectError(error.MimoForcedRowsOverFill, choose(b, c, 120_000_000_000, 2_000_000_000));
+    const all = try choose(b, c, 120_000_000_000, 2_000_000_000);
+    try testing.expectEqual(sdk.Rows{ .prompt = 256, .decode = 256 }, all.rows);
+    try testing.expect(all.over_fill > 0);
+    try testing.expectEqual(overFillBytes(b, 10_000_000_000, all.rows, all.target), all.over_fill);
+    var line: [160]u8 = undefined;
+    try testing.expectEqualStrings("forced rows 135/153 exceed the fill by 1234 bytes at baseline 10000000000; proceeding (operator pin)", forcedRowsLine(&line, .{ .prompt = 135, .decode = 153 }, 1234, 10_000_000_000));
+    c.expert_rows = 257;
+    try testing.expectError(error.MimoExpertRows, choose(b, c, 120_000_000_000, 2_000_000_000));
     c.expert_rows = 8;
     c.expert_prefill_rows = 9;
     try testing.expectError(error.MimoPhaseRows, choose(b, c, 120_000_000_000, 2_000_000_000));
@@ -656,7 +679,9 @@ test "mlx-stream MiMo bill: forced rows, baseline and device stop cannot bypass 
     c.memory_baseline_bytes = null;
     try testing.expectError(error.MimoMemoryBaselineMissing, choose(b, c, 120_000_000_000, 2_000_000_000));
     c.memory_baseline_bytes = 109_000_000_000;
-    try testing.expectError(error.MimoForcedRowsOverFill, choose(b, c, 120_000_000_000, 2_000_000_000));
+    const high = try choose(b, c, 120_000_000_000, 2_000_000_000);
+    try testing.expectEqual(sdk.Rows{ .prompt = 8, .decode = 8 }, high.rows);
+    try testing.expect(high.over_fill > 0);
 }
 
 test "mlx-stream MiMo bill: a per-layer rows split (expert_rows_by_layer) bills exactly as the uniform rows it redistributes" {
@@ -717,15 +742,17 @@ test "mlx-stream MiMo bill: a per-layer rows split (expert_rows_by_layer) bills 
     }
 }
 
-test "mlx-stream MiMo bill: the upstream 8 GiB wired margin refuses the rows the pinned 2 GiB margin admits" {
+test "mlx-stream MiMo bill: the rows the pinned 2 GiB margin fills sit over the upstream 8 GiB margin's target (reported, loaded)" {
     const b = try fixtureBill(testing.allocator);
     defer b.free(testing.allocator);
     var c: settings.Config = .{ .memory_baseline_bytes = 10_000_000_000 };
     const pinned = try choose(b, c, box_ceiling, box_stop);
     c.expert_rows = pinned.rows.decode;
     c.expert_prefill_rows = pinned.rows.prompt; // +phase-rows
-    _ = try choose(b, c, box_ceiling, box_stop);
-    try testing.expectError(error.MimoForcedRowsOverFill, choose(b, c, box_ceiling, 8 << 30));
+    try testing.expectEqual(@as(u64, 0), (try choose(b, c, box_ceiling, box_stop)).over_fill);
+    const upstream = try choose(b, c, box_ceiling, 8 << 30);
+    try testing.expectEqual(pinned.rows, upstream.rows);
+    try testing.expect(upstream.over_fill > 0);
 }
 
 test "mlx-stream MiMo bill: a context the box cannot hold is refused at construction, before any allocation" {
@@ -739,8 +766,9 @@ test "mlx-stream MiMo bill: a context the box cannot hold is refused at construc
     const long = try fixtureBillAt(a, c, 0, c.reserveTokens());
     defer long.free(a);
     try testing.expectError(error.NativeBillDoesNotFit, choose(long, c, box_ceiling, box_stop));
+    // Forced rows load as named; the bill reports the overage (the box's live guard is the safety net).
     c.expert_rows = 8;
-    try testing.expectError(error.MimoForcedRowsOverFill, choose(long, c, box_ceiling, box_stop));
+    try testing.expect((try choose(long, c, box_ceiling, box_stop)).over_fill > 0);
 }
 
 test "mlx-stream MiMo bill: a request within the billed context never outgrows the construction admission" {
@@ -872,17 +900,18 @@ test "mlx-stream MiMo bill: an explicit small cache is admitted without requirin
     try testing.expectEqual(target, p.bill.total(.prompt, baseline, 1));
 }
 
-/// The bill tool's forced-rows line: the forced rows, admitted or refused by name, and the admitted maximum.
+/// The bill tool's forced-rows line: the forced rows, within the fill or over it by how many bytes, and the fill's
+/// maximum (a report: forced rows always load).
 fn printForced(b: sdk.MemoryBill, c: settings.Config, ceiling: u64, stop: u64) void {
     const base = c.memory_baseline_bytes orelse 0;
     const max = admittedMaximum(b, c, base, ceiling -| stop);
-    const verdict: []const u8 = if (choose(b, c, ceiling, stop)) |_| "admitted" else |e| @errorName(e);
-    std.debug.print("  FORCED kv={s} ctx={d} baseline={d} forced=yes expert_rows={?d} expert_prefill_rows={?d} verdict={s} max_prompt_rows={d} max_decode_rows={d}\n", .{
-        @tagName(c.kv_mode), c.reserveTokens(), base, c.expert_rows, c.expert_prefill_rows, verdict, if (max) |m| m.prompt else 0, if (max) |m| m.decode else 0,
+    const over: ?u64 = if (choose(b, c, ceiling, stop)) |p| p.over_fill else |_| null;
+    std.debug.print("  FORCED kv={s} ctx={d} baseline={d} forced=yes expert_rows={?d} expert_prefill_rows={?d} over_fill={?d} max_prompt_rows={d} max_decode_rows={d}\n", .{
+        @tagName(c.kv_mode), c.reserveTokens(), base, c.expert_rows, c.expert_prefill_rows, over, if (max) |m| m.prompt else 0, if (max) |m| m.decode else 0,
     });
 }
 
-test "mlx-stream MiMo bill: forced rows over the fill are refused with the admitted maximum; at the fill admitted" {
+test "mlx-stream MiMo bill: forced rows over the fill load as named with the overage reported; at or under the fill none" {
     const a = testing.allocator;
     var c: settings.Config = .{ .memory_baseline_bytes = 10_000_000_000 };
     const b = try fixtureBillAt(a, c, 0, settings.fill_reserve_tokens);
@@ -895,19 +924,22 @@ test "mlx-stream MiMo bill: forced rows over the fill are refused with the admit
     c.expert_prefill_rows = fill.prompt;
     try testing.expect(isForced(c));
     try testing.expectEqual(fill, (try choose(b, c, box_ceiling, box_stop)).rows);
+    try testing.expectEqual(@as(u64, 0), (try choose(b, c, box_ceiling, box_stop)).over_fill);
     // Below the fill (the ABBA pin): admitted at the pin.
     c.expert_rows = fill.prompt - 2;
     c.expert_prefill_rows = fill.prompt - 4;
     try testing.expectEqual(sdk.Rows{ .prompt = fill.prompt - 4, .decode = fill.prompt - 2 }, (try choose(b, c, box_ceiling, box_stop)).rows);
     printForced(b, c, box_ceiling, box_stop);
-    // One row over in either phase: refused by name, never admitted.
+    // One row over in either phase: loaded at the pin, the overage reported.
     c.expert_prefill_rows = fill.prompt + 1;
     c.expert_rows = @max(fill.decode, fill.prompt + 1);
-    try testing.expectError(error.MimoForcedRowsOverFill, choose(b, c, box_ceiling, box_stop));
+    const over_prompt = try choose(b, c, box_ceiling, box_stop);
+    try testing.expectEqual(sdk.Rows{ .prompt = fill.prompt + 1, .decode = @max(fill.decode, fill.prompt + 1) }, over_prompt.rows);
+    try testing.expect(over_prompt.over_fill > 0);
     if (fill.decode < c.mimo.n_routed_experts) {
         c.expert_prefill_rows = fill.prompt;
         c.expert_rows = fill.decode + 1;
-        try testing.expectError(error.MimoForcedRowsOverFill, choose(b, c, box_ceiling, box_stop));
+        try testing.expect((try choose(b, c, box_ceiling, box_stop)).over_fill > 0);
         printForced(b, c, box_ceiling, box_stop);
     }
     // The control (`phase_rows` off): one count, bounded by the smaller phase.
@@ -916,9 +948,9 @@ test "mlx-stream MiMo bill: forced rows over the fill are refused with the admit
     const one = admittedMaximum(b, c, c.memory_baseline_bytes.?, box_ceiling - box_stop).?;
     try testing.expectEqual(one.prompt, one.decode);
     c.expert_rows = one.decode;
-    _ = try choose(b, c, box_ceiling, box_stop);
+    try testing.expectEqual(@as(u64, 0), (try choose(b, c, box_ceiling, box_stop)).over_fill);
     c.expert_rows = one.decode + 1;
-    try testing.expectError(error.MimoForcedRowsOverFill, choose(b, c, box_ceiling, box_stop));
+    try testing.expect((try choose(b, c, box_ceiling, box_stop)).over_fill > 0);
 }
 
 // MIMO_BANK=<prepared pack> (headers only, no payload): the bill tool. Every term in bytes and the filled rows at the
@@ -1188,10 +1220,14 @@ test "mlx-stream MiMo bill: phase rows forced rows: expert_rows the decode rows,
     try testing.expectError(error.MimoPhaseRows, choose(b, c, box_ceiling, box_stop));
     c.expert_rows = null;
     try testing.expectEqual(sdk.Rows{ .prompt = 121, .decode = 121 }, (try choose(b, c, box_ceiling, box_stop)).rows);
-    // A decode row count past the decode bound is refused by name at construction.
+    // A decode row count past the fill's decode bound loads as named (the overage reported); past the experts it refuses.
     c.expert_prefill_rows = 8;
     c.expert_rows = 255;
-    try testing.expectError(error.MimoForcedRowsOverFill, choose(b, c, box_ceiling, box_stop));
+    const wide = try choose(b, c, box_ceiling, box_stop);
+    try testing.expectEqual(sdk.Rows{ .prompt = 8, .decode = 255 }, wide.rows);
+    try testing.expect(wide.over_fill > 0);
+    c.expert_rows = 257;
+    try testing.expectError(error.MimoExpertRows, choose(b, c, box_ceiling, box_stop));
 }
 // ---- +phase-rows: end ----
 
