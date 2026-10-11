@@ -49,6 +49,11 @@ pub const Config = struct {
     /// the bill and the live reading admit (never raises it), so it is always safe. The harness's forced rows
     /// (`expert_rows`) are not capped.
     expert_units_cap: ?u32 = null,
+    /// The least the rest of the box (`glm_moe_dsa_module.Box.others`) reads, in bytes (null = off): the load's baseline
+    /// and the handover's reading take at least this, so two arms of a measurement admit at the same target when the
+    /// box beside them moves. It only lowers the admission (never raises it), so it is always safe; the twin of
+    /// `expert_units_cap` for an arm whose gain is the rows themselves.
+    rest_of_box_floor_bytes: ?u64 = null,
     /// The MTP draft lane's drafts per round (null or 0 = off; 1 .. `max_mtp_depth`).
     mtp_depth: ?u32 = null,
     /// A `mtp_depth` past the route limit: refused by name at load (`error.MtpDepthOverRouteLimit`).
@@ -127,6 +132,10 @@ pub const Config = struct {
             c.expert_units_cap = @intCast(v.integer);
             any = true;
         };
+        if (obj.get("rest_of_box_floor_bytes")) |v| if (v == .integer and v.integer >= 1) {
+            c.rest_of_box_floor_bytes = @intCast(v.integer);
+            any = true;
+        };
         if (obj.get("ctx_size")) |v| if (v == .integer and v.integer >= 1) {
             if (v.integer <= max_ctx_size) c.max_context_tokens = @intCast(v.integer) else c.ctx_size_over_limit = v.integer;
             any = true;
@@ -159,8 +168,8 @@ pub const Config = struct {
                 any = true;
             };
         }
-        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} units_cap={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
-            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.expert_units_cap orelse 0, c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta,
+        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} units_cap={d} rest_of_box_floor={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
+            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.expert_units_cap orelse 0, c.rest_of_box_floor_bytes orelse 0, c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta,
         });
     }
 
@@ -277,6 +286,9 @@ test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up 
     try testing.expectEqual(@as(?u32, 85), (try settingsOf("{\"expert_units_cap\": 85}")).expert_units_cap);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"expert_units_cap\": 0}")).expert_units_cap);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"expert_units_cap\": \"85\"}")).expert_units_cap);
+    try testing.expectEqual(@as(?u64, null), (Config{}).rest_of_box_floor_bytes);
+    try testing.expectEqual(@as(?u64, 21_000_000_000), (try settingsOf("{\"rest_of_box_floor_bytes\": 21000000000}")).rest_of_box_floor_bytes);
+    try testing.expectEqual(@as(?u64, null), (try settingsOf("{\"rest_of_box_floor_bytes\": 0}")).rest_of_box_floor_bytes);
     try testing.expectEqual(@as(?u32, 131072), (try settingsOf("{\"ctx_size\": 131072}")).max_context_tokens);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": \"131072\"}")).max_context_tokens);
     const over = try settingsOf("{\"ctx_size\": 2097152}");

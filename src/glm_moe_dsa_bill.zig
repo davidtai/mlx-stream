@@ -859,6 +859,12 @@ pub fn liveRows(l: Live) error{DecodeOverTarget}!u32 {
     return @intCast(r);
 }
 
+/// The rest of the box the bill sits beside: the reading `rest`, at least `floor`
+/// (`settings.Config.rest_of_box_floor_bytes`; null: the reading).
+pub fn restOfBox(rest: u64, floor: ?u64) u64 {
+    return @max(rest, floor orelse 0);
+}
+
 /// `rows` at most `cap` units in each phase (`settings.Config.expert_units_cap`; null: as they are).
 pub fn capRows(rows: sdk.Rows, cap: ?u32) sdk.Rows {
     const c = cap orelse return rows;
@@ -1210,6 +1216,20 @@ test "glm bill: on the DSA kernels the prompt wave stops growing past one call; 
     // with a limit of 0 every layer's wave adds whole.
     try testing.expect(promptWaveBytes(&c, g, 16384, true, .kernel, .glm53, false, 0, 0) >= promptWaveBytes(&c, g, 16384, true, .kernel, .glm53, false, 17 << 30, 0));
     try testing.expect(decodeWaveBytes(&c, 4, 131072) > decodeWaveBytes(&c, 4, 16384));
+}
+
+test "glm bill: the rest-of-box floor only raises the rest the bill sits beside, so it only lowers the rows" {
+    try testing.expectEqual(@as(u64, 15_400_000_000), restOfBox(15_400_000_000, null));
+    try testing.expectEqual(@as(u64, 21_000_000_000), restOfBox(15_400_000_000, 21_000_000_000));
+    try testing.expectEqual(@as(u64, 22_000_000_000), restOfBox(22_000_000_000, 21_000_000_000));
+    var c = try glm53Config();
+    defer c.deinit(testing.allocator);
+    const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
+    const in = boxInputs(&c, &cfg);
+    const positions = decodeCap(&cfg, 16387 + 1024);
+    const target = targetOf(box_exl3.gpu_target, box_exl3.ram, 15_400_000_000);
+    const floored = targetOf(box_exl3.gpu_target, box_exl3.ram, restOfBox(15_400_000_000, 21_000_000_000));
+    try testing.expect(try requestRows(testing.allocator, in, positions, 74, restOfBox(15_400_000_000, 21_000_000_000), floored, maxUnits(in.bank)) < try requestRows(testing.allocator, in, positions, 74, 15_400_000_000, target, maxUnits(in.bank)));
 }
 
 test "glm bill: the units cap only lowers the rows, in each phase" {
