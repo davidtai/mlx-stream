@@ -24,6 +24,7 @@ const pt = @import("glm_moe_dsa_prefill_timers.zig");
 const expert_policy = @import("sdk_ext.zig").expert.policy;
 const dsa = sdk.dsa;
 const topk_mod = @import("glm_moe_dsa_topk.zig");
+const route_mod = @import("glm_moe_dsa_route.zig");
 
 pub const G = ops.MlxOps;
 pub const T = G.T;
@@ -602,17 +603,17 @@ pub fn mlp(g: *G, m: Mlp, x: T) !T {
 pub const Routing = struct { indices: T, weights: T };
 
 /// `group_expert_select` at n_group 1: fp32 logits `x @ w.T`, sigmoid, the correction bias for the choice, the
-/// top-k by argpartition, the sigmoid scores of the chosen normalized (`norm_topk_prob`) and scaled.
+/// top-k by argpartition, the sigmoid scores of the chosen normalized (`norm_topk_prob`) and scaled. After the sigmoid
+/// one kernel on the GPU (`glm_moe_dsa_route.top`, the chain's bits), MLX's chain on a CPU stream.
 pub fn route(g: *G, c: *const glm.Config, r: Router, x: T) !Routing {
-    const k: c_int = @intCast(c.n_experts_per_tok);
     const logits = try g.matmul(try g.astype(x, .float32), try g.transpose(try g.astype(r.w, .float32)));
     const sig = try g.sigmoid(logits);
-    const sc = try g.add(sig, r.bias);
-    const inds = try lastSlice(g, try g.argpartition(try g.neg(sc), k - 1, -1), 0, k);
-    var w = try g.takeAlongAxis(sig, inds, -1);
-    if (c.norm_topk_prob) w = try g.div(w, try g.sum(w, -1, true));
-    w = try g.mul(w, try g.scalar(c.routed_scaling_factor, .float32));
-    return .{ .indices = try g.astype(inds, .int32), .weights = w };
+    const k = c.n_experts_per_tok;
+    const rt = if (mlx.streamIsGpu(g.s) and route_mod.serves(c.n_routed_experts, k))
+        try route_mod.top(g, sig, r.bias, k, c.norm_topk_prob, c.routed_scaling_factor)
+    else
+        try route_mod.chain(g, sig, r.bias, k, c.norm_topk_prob, c.routed_scaling_factor);
+    return .{ .indices = rt.indices, .weights = rt.weights };
 }
 
 /// The routing criterion of router `r` on `x` (sigmoid + bias, f32 `[n, n_experts]`): the lookahead's predictor of the
