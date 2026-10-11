@@ -226,7 +226,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const max_context = bill_mod.servedContext(cfg);
             // The prompt's attention form this device runs (the bill charges its arrays).
             const dsa = try graph.dsaKernelsRun(gpa, s, model);
-            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag), .dsa = dsa, .prompt_cache = bill_mod.prefillCacheBytes(ram) };
+            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag), .dsa = dsa, .gemm = comptime bill_mod.promptGemmOf(Q), .select = bill_mod.selectOf(model), .prompt_cache = bill_mod.prefillCacheBytes(ram) };
             const billed = bill_mod.billOf(inputs);
             const mb = try bill_mod.memoryBill(gpa, billed, null);
             errdefer mb.free(gpa);
