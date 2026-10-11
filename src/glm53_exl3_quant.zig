@@ -832,11 +832,11 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
 const BenchExp = struct { name: []const u8, kernel: xk.Kernel, edits: []const [2][]const u8 };
 const decode_call =
     \\        if (hh != 0u) {
-    \\            g53_col<K, 1>::decode_v(t0, o, v);
-    \\            g53_col<K, 1>::decode_v(t0 + N16 * NWT, o, v + 16);
+    \\            g53_col<K, 1>::decode_p(P[0], v);
+    \\            g53_col<K, 1>::decode_p(P[1], v + 16);
     \\        } else {
-    \\            g53_col<K, 0>::decode_v(t0, o, v);
-    \\            g53_col<K, 0>::decode_v(t0 + N16 * NWT, o, v + 16);
+    \\            g53_col<K, 0>::decode_p(P[0], v);
+    \\            g53_col<K, 0>::decode_p(P[1], v + 16);
     \\        }
 ;
 const decode_call_down =
@@ -849,7 +849,7 @@ const decode_call_down =
     \\            }
 ;
 const no_decode = "            for (int q = 0; q < 16; ++q) v[q] = 0.001f * float(q); (void)P; g53_col<K, 0>::template store<half>(v, Bs + b * BUF + dst_off);";
-const no_decode_gu = "        for (int c = 0; c < 32; ++c) v[c] = 0.001f * float(c + int(lane)); (void)t0;";
+const no_decode_gu = "        for (int c = 0; c < 32; ++c) v[c] = 0.001f * float(c + int(lane)); (void)P;";
 const mma_call = "tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});";
 const bench_exps = [_]BenchExp{
     .{ .name = "gu: no trellis decode (B constant before the rotation)", .kernel = .glm53_pf_gu, .edits = &.{.{ decode_call, no_decode_gu }} },

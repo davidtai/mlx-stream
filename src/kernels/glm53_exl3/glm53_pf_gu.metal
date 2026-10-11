@@ -2,11 +2,12 @@
     // GLM-5.3 EXL3 prompt, stage 1: the gate and up GEMMs of a wave's experts over the rows' x itself, the input prepare
     // folded into the weights: t128(x rin) W = x (rin t128 W) per 128-block of k. Each BK = 128 stage: every thread
     // decodes one column's 32 k of the stage (two trellis tiles), rotates them along k (t128: 32 in the thread, 4 across
-    // lanes xor 1 and 2), scales them by the mini's rin and stores them in threadgroup memory; then the NAX MMA at a
-    // 128-row M tile (8 simdgroups, WM 4 x WN 2, each 32 x 32 of 128 x 64), A each row's x (bf16 to f16 in the load).
-    // A threadgroup is (expert j of the wave table, M tile, op = 2 mini + projection, N tile): the table gives each
-    // expert's slot, first row, rows and first threadgroup. rt: per wave row (x row, slot row). z: [rows, 4, MINI] f32
-    // (times the rotation's scale).
+    // lanes xor 1 and 2), scales them by the mini's rin and stores them in threadgroup memory, the decode trailing the
+    // previous stage's MMA (the words read before it, decoded after it); then the NAX MMA at a 128-row M tile (8
+    // simdgroups, WM 4 x WN 2, each 32 x 32 of 128 x 64), A each row's x (bf16 to f16 in the load). A threadgroup is
+    // (expert j of the wave table, M tile, op = 2 mini + projection, N tile): the table gives each expert's slot, first
+    // row, rows and first threadgroup. rt: per wave row (x row, slot row). z: [rows, 4, MINI] f32 (times the rotation's
+    // scale).
     constexpr int BM = 128;
     constexpr int BN = 64;
     constexpr int BK = 128;
@@ -80,29 +81,47 @@
     const bool full = sgp_sm == SM;
     NAXTile<float, TM, TN> Dtile;
     Dtile.clear();
-    for (int s = 0; s < S; ++s) {
-        float v[32];
+    // stage s's B column: its trellis words read before stage s - 1's MMA, decoded, rotated and scaled by rin after it
+    // (f16 pairs in pk), stored at stage s's start
+    uint P[2][5];
+    uint pk[16];
+    auto fetch = [&](int s) {
         const device uint* t0 = cd + size_t(s) * size_t(8 * N16 * NWT);
         if (hh != 0u) {
-            g53_col<K, 1>::decode_v(t0, o, v);
-            g53_col<K, 1>::decode_v(t0 + N16 * NWT, o, v + 16);
+            g53_col<K, 1>::words(t0, o, P[0]);
+            g53_col<K, 1>::words(t0 + N16 * NWT, o, P[1]);
         } else {
-            g53_col<K, 0>::decode_v(t0, o, v);
-            g53_col<K, 0>::decode_v(t0 + N16 * NWT, o, v + 16);
+            g53_col<K, 0>::words(t0, o, P[0]);
+            g53_col<K, 0>::words(t0 + N16 * NWT, o, P[1]);
+        }
+    };
+    auto prepare = [&](int s) {
+        float v[32];
+        if (hh != 0u) {
+            g53_col<K, 1>::decode_p(P[0], v);
+            g53_col<K, 1>::decode_p(P[1], v + 16);
+        } else {
+            g53_col<K, 0>::decode_p(P[0], v);
+            g53_col<K, 0>::decode_p(P[1], v + 16);
         }
         g53_t128_quarters(v, lane);
         const device half4* rv = reinterpret_cast<const device half4*>(rin + s * BK);
-        uint pk[16];
         STEEL_PRAGMA_UNROLL
         for (int c = 0; c < 8; ++c) {
             const float4 w = float4(rv[c]);
             pk[2 * c] = uint(as_type<ushort>(half(v[4 * c] * w.x))) | (uint(as_type<ushort>(half(v[4 * c + 1] * w.y))) << 16u);
             pk[2 * c + 1] = uint(as_type<ushort>(half(v[4 * c + 2] * w.z))) | (uint(as_type<ushort>(half(v[4 * c + 3] * w.w))) << 16u);
         }
+    };
+    fetch(0);
+    prepare(0);
+    for (int s = 0; s < S; ++s) {
+        const bool more = s + 1 < S;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         STEEL_PRAGMA_UNROLL
         for (int c = 0; c < 4; ++c) bdst[c] = uint4(pk[4 * c], pk[4 * c + 1], pk[4 * c + 2], pk[4 * c + 3]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (more) fetch(s + 1);
         if (sgp_sm > 0) {
             STEEL_PRAGMA_NO_UNROLL
             for (int i = 0; i < 4; ++i) {
@@ -128,6 +147,7 @@
                 (void)compiler_barrier;
             }
         }
+        if (more) prepare(s + 1);
     }
     if (sgp_sm > 0) {
         STEEL_PRAGMA_UNROLL
