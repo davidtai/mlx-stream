@@ -302,7 +302,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const preloaded = try self.stream.preload(&pre, Preload.order);
             const pre_ns: u64 = @intCast(t_pre.untilNow(io, .awake).nanoseconds);
             log.info("glm_moe_dsa: preloaded {d} experts ({d:.2} GB) into the prompt rows in {d:.2} s\n", .{ preloaded, gigabytes(Reads.of(pre0, self.stream.stats()).ssd_bytes), seconds(pre_ns) });
-            self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa };
+            self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa, .predict_deeper = self.recorder != null };
             self.g.clearCache();
             _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, self.inputs.prompt_cache);
             log.info("glm_moe_dsa: constructed ({d} routed layers, {d} experts, record {d} B, expert reads {s}, prompt {s}, prompt attention {s}, decode window {d} rows)\n", .{ n_bank, self.bank.n_experts, self.bank.geometryOf().widest_record, if (gated) "event gates" else "host waits", if (cfg.layerMajor()) "layer by layer" else "chunk by chunk", if (self.routes.dsa) "on the DSA kernels" else "in the reference's form", shape.decode_window_rows });
@@ -397,7 +397,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }
             try self.reverse(@intCast(start + ids.len));
             self.stream.resetPromptCounts();
-            if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth());
+            if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth(), experts_mod.nowNs());
             const s0 = self.stream.stats();
             startPhase();
             const mem0 = Mem.now();

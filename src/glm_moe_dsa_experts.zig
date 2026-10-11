@@ -117,8 +117,8 @@ const n_banks = std.meta.fieldNames(BankKind).len;
 /// lookahead's step), the waves' encode and commit.
 pub const HostSplit = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u64 = 0, wave_ns: u64 = 0 };
 
-/// A monotonic clock for the host split (ns).
-fn nowNs() u64 {
+/// A monotonic clock for the host split (ns); the route recorder's too.
+pub fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.UPTIME_RAW, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
@@ -166,6 +166,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         row_bytes: [max_route_ids]u64 = @splat(0),
         /// The decode lane's host time, summed over calls until the caller zeroes it (`HostSplit`).
         host: HostSplit = .{},
+        /// The route recorder's route of the last decode call (`expert.routes.none`: none).
+        rec_route: u32 = sdk_ext.expert.routes.none,
         /// The wide lane's combine on the GPU (`combine_source`), built at its first call.
         combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
 
@@ -412,11 +414,13 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// decode lookahead's predictor), evaluated with the ids at the routing barrier; null for none. `hoist`: arrays
         /// that do not wait on this call (the shared expert), committed behind the hit wave once the reads are issued, so
         /// the GPU runs them during the read wait (the decode lane; the wide lane leaves them to the caller).
-        pub fn call(self: *Self, g: *G, layer: u32, x: T, indices: T, scores: T, next_scores: ?T, hoist: []const T) !T {
+        /// `deeper`: the recorder's predictors past the next layer (`graph.Routes.predict_deeper`), null where none.
+        pub fn call(self: *Self, g: *G, layer: u32, x: T, indices: T, scores: T, next_scores: ?T, deeper: []const ?T, hoist: []const T) !T {
             const n: u32 = @intCast(g.shapeOf(x).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
             if (n * k > self.stream.max_route_ids) return self.callWide(g, layer, x, indices, scores, n, k);
             const y = if (bpl > 1) try self.callDecodeSplit(g, layer, x, indices, next_scores, n, k, hoist) else try self.callDecode(g, layer, x, indices, next_scores, n, k, hoist);
+            self.recordDeeper(g, deeper);
             return combine(g, y, scores, g.dtypeOf(x));
         }
 
@@ -599,6 +603,21 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             }
         }
 
+        /// The recorder's predictors past the next layer for the last decode call's route (distances 2 and 3): read on the
+        /// host here, a diagnostic's wait.
+        fn recordDeeper(self: *Self, g: *G, deeper: []const ?T) void {
+            const rec = self.stream.recorder orelse return;
+            if (self.rec_route == sdk_ext.expert.routes.none) return;
+            defer self.rec_route = sdk_ext.expert.routes.none;
+            var buf: [sdk_ext.expert.routes.pred_rows * 512]f32 = undefined;
+            for (deeper, 2..) |dp, d| if (dp) |x| {
+                const n: usize = @intCast(g.shapeOf(x).numel());
+                if (n > buf.len) continue;
+                const sc = g.hostF32(x, buf[0..n]) catch continue;
+                rec.predict(self.rec_route, @intCast(d), sc);
+            };
+        }
+
         /// The decode lane: the routed outputs `[n, k, hidden]` in routed order.
         fn callDecode(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
             const n_ids = n * k;
@@ -615,6 +634,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const t1 = nowNs();
             const r = try self.stream.route(layer, ids, sc);
             const t2 = nowNs();
+            if (self.stream.recorder) |rec| if (self.stream.phase == .decode) {
+                self.rec_route = r.rec;
+                rec.stamp(r.rec, t1);
+                rec.predict(r.rec, 1, sc);
+            };
             defer self.noteHost(t0, t1, t2);
             var released = false;
             errdefer if (!released) self.stream.release(r);
@@ -714,8 +738,13 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             for (sides, 0..) |sd, i| if (sd.n > 0) {
                 last = i;
             };
-            // The route recorder (a diagnostic): one route of the call, each bank layer's route flags its own ids.
-            if (self.stream.recorder) |rec| if (self.stream.phase == .decode) rec.call(layer, ids);
+            // The route recorder (a diagnostic): one route of the call, each bank layer's route flags its own ids; its
+            // barrier's time and the next layer's scores (the lookahead's predictor, distance 1).
+            if (self.stream.recorder) |rec| if (self.stream.phase == .decode) {
+                self.rec_route = rec.call(layer, ids);
+                rec.stamp(self.rec_route, t1);
+                rec.predict(self.rec_route, 1, sc);
+            };
             defer if (self.stream.recorder) |rec| rec.endCall();
             for (&sides, 0..) |*sd, i| {
                 if (sd.n == 0) continue;

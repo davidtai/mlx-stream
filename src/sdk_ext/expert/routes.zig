@@ -5,8 +5,10 @@
 //!
 //! What it keeps:
 //! - per decode call of a routed layer: its layer, its step, the forward's rows, the routed ids in the router's flat
-//!   order (row r's top-k at `[r * k, (r + 1) * k)`), per id what served it (`Flag`), and the lookahead's records for
-//!   the next routed layer. A bank of several bank layers per routed layer (`banks_per_layer`, GLM-5.3's EXL3: K3 and
+//!   order (row r's top-k at `[r * k, (r + 1) * k)`), per id what served it (`Flag`), the lookahead's records for
+//!   the next routed layer, the time of its routing barrier (`stamp`) and, per row, the top `pred_k` experts of the
+//!   routers of the `pred_depth` layers after it as scored on this call's MoE input (`predict`: distance 1 is the
+//!   lookahead's own predictor, 2 and 3 the layers past it). A bank of several bank layers per routed layer (`banks_per_layer`, GLM-5.3's EXL3: K3 and
 //!   K4) routes a call once per bank layer: the arch opens the call (`call`) and each of its routes fills its ids'
 //!   flags in it;
 //! - per step: its rows, drafts, accepted drafts, emitted tokens and wall time;
@@ -23,12 +25,17 @@ const std = @import("std");
 const policy = @import("policy.zig");
 
 pub const magic = "GLMROUTE".*;
-pub const version: u32 = 2;
+pub const version: u32 = 3;
 pub const max_ids = policy.max_route_ids;
 /// The lookahead's records per call (`lookahead.max_budget`).
 pub const max_spec = 4;
 /// A route index for a route the recorder did not keep.
 pub const none: u32 = std.math.maxInt(u32);
+/// The predictors recorded per call: the routers of the next `pred_depth` layers, each row's top `pred_k`.
+pub const pred_depth = 3;
+pub const pred_k = 16;
+/// Rows per call the predictions hold (a route's at most `max_ids` ids over a top-k of at least 6).
+pub const pred_rows = 8;
 
 /// What served one routed id (bits; the same for each repeat of an expert in a route).
 pub const Flag = struct {
@@ -90,10 +97,16 @@ pub const Route = extern struct {
     flags: [max_ids]u8,
     /// The records read ahead for the next layer (`policy.no_expert`: none).
     spec: [max_spec]u16,
+    /// The call's routing barrier: us after the request's start (`begin`).
+    t_us: u32,
+    /// Per predictor distance (1 .. `pred_depth`) and row, its top `pred_k` experts by score (`policy.no_expert`: none)
+    /// and their scores.
+    pred: [pred_depth][pred_rows][pred_k]u16,
+    pred_score: [pred_depth][pred_rows][pred_k]f32,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(Header) == 64 and @sizeOf(Step) == 24 and @sizeOf(Route) == 160);
+    std.debug.assert(@sizeOf(Header) == 64 and @sizeOf(Step) == 24 and @sizeOf(Route) == 2468);
 }
 
 /// Files named so far in this process (`nextFile`): a model loaded again never reuses a name.
@@ -136,6 +149,8 @@ pub const Recorder = struct {
     /// The open call (`call`): the route its bank layers' routes fill.
     open: u32 = none,
     dropped: u32 = 0,
+    /// The request's start (`begin`), ns on the caller's clock.
+    t0_ns: u64 = 0,
 
     /// `n_layers` bank layers, `bpl` of them per routed layer.
     pub fn init(a: std.mem.Allocator, n_layers: u32, n_experts: u32, top_k: u32, bpl: u32) !*Recorder {
@@ -155,7 +170,7 @@ pub const Recorder = struct {
         const scratch = try a.alloc(u8, ne);
         @memset(scratch, 0);
         self.* = .{ .a = a, .n_layers = n_layers, .bpl = bpl, .n_experts = n_experts, .top_k = top_k, .prompt_rows = prompt_rows, .decode_rows = decode_rows, .counts = counts, .residents = residents, .scratch = scratch };
-        self.begin(0, 0);
+        self.begin(0, 0, 0);
         return self;
     }
 
@@ -171,8 +186,9 @@ pub const Recorder = struct {
         a.destroy(self);
     }
 
-    /// A request's start: what the recorder kept is dropped.
-    pub fn begin(self: *Recorder, prompt_tokens: u32, mtp_depth: u32) void {
+    /// A request's start at `t0_ns` (the caller's clock, as `stamp`'s): what the recorder kept is dropped.
+    pub fn begin(self: *Recorder, prompt_tokens: u32, mtp_depth: u32, t0_ns: u64) void {
+        self.t0_ns = t0_ns;
         self.routes.clearRetainingCapacity();
         self.steps.clearRetainingCapacity();
         self.step = 0;
@@ -201,8 +217,9 @@ pub const Recorder = struct {
 
     /// A decode call of routed layer `layer` over several bank layers: `ids` as routed (rows x k). Each bank layer's
     /// route fills its ids' flags in it until `endCall`.
-    pub fn call(self: *Recorder, layer: u32, ids: []const u16) void {
+    pub fn call(self: *Recorder, layer: u32, ids: []const u16) u32 {
         self.open = self.add(layer, ids);
+        return self.open;
     }
 
     pub fn endCall(self: *Recorder) void {
@@ -219,7 +236,7 @@ pub const Recorder = struct {
             self.dropped += 1;
             return none;
         };
-        r.* = .{ .layer = @intCast(layer), .n_ids = @intCast(ids.len), .rows = @intCast(ids.len / self.top_k), .step = self.step, .ids = @splat(policy.no_expert), .flags = @splat(0), .spec = @splat(policy.no_expert) };
+        r.* = .{ .layer = @intCast(layer), .n_ids = @intCast(ids.len), .rows = @intCast(ids.len / self.top_k), .step = self.step, .ids = @splat(policy.no_expert), .flags = @splat(0), .spec = @splat(policy.no_expert), .t_us = 0, .pred = @splat(@splat(@splat(policy.no_expert))), .pred_score = @splat(@splat(@splat(0))) };
         @memcpy(r.ids[0..ids.len], ids);
         return index;
     }
@@ -242,6 +259,38 @@ pub const Recorder = struct {
         }
         for (ids) |e| sc[e] = 0;
         return index;
+    }
+
+    /// Route `index`'s routing barrier at `t_ns` (the caller's clock, as `begin`'s).
+    pub fn stamp(self: *Recorder, index: u32, t_ns: u64) void {
+        if (index == none) return;
+        self.routes.items[index].t_us = @intCast(@min((t_ns -| self.t0_ns) / std.time.ns_per_us, std.math.maxInt(u32)));
+    }
+
+    /// Route `index`'s predictor at `distance` (1 .. `pred_depth`): `scores` its rows' router scores (`rows` x
+    /// `n_experts`, row-major), each row's top `pred_k` kept by score (ties: the lower id first).
+    pub fn predict(self: *Recorder, index: u32, distance: u32, scores: []const f32) void {
+        if (index == none or distance == 0 or distance > pred_depth) return;
+        const r = &self.routes.items[index];
+        const ne = self.n_experts;
+        const rows = @min(scores.len / ne, pred_rows);
+        for (0..rows) |row| {
+            const sc = scores[row * ne ..][0..ne];
+            const ids = &r.pred[distance - 1][row];
+            const vals = &r.pred_score[distance - 1][row];
+            var n: usize = 0;
+            for (sc, 0..) |v, e| {
+                if (n == pred_k and !(v > vals[n - 1] or (v == vals[n - 1] and e < ids[n - 1]))) continue;
+                var at = if (n < pred_k) n else pred_k - 1;
+                if (n < pred_k) n += 1;
+                while (at > 0 and (v > vals[at - 1] or (v == vals[at - 1] and e < ids[at - 1]))) : (at -= 1) {
+                    ids[at] = ids[at - 1];
+                    vals[at] = vals[at - 1];
+                }
+                ids[at] = @intCast(e);
+                vals[at] = v;
+            }
+        }
     }
 
     /// The records route `index`'s lookahead read ahead for the next routed layer.
@@ -326,7 +375,7 @@ test "expert routes: a plan's hits, loads, evictions and reads become each id's 
     const a = testing.allocator;
     const rec = try Recorder.init(a, 2, 16, 2, 1);
     defer rec.deinit();
-    rec.begin(37, 1);
+    rec.begin(37, 1, 0);
     var p = try policy.LayerPolicy.init(a, 16, 3);
     defer p.deinit(a);
     var plan: policy.Plan = .{};
@@ -361,7 +410,7 @@ test "expert routes: a plan's hits, loads, evictions and reads become each id's 
 
     const img = try rec.image(a);
     defer a.free(img);
-    try testing.expectEqual(@as(usize, 64 + 2 * 2 * 4 + 2 * 16 * 4 + 2 * 16 * 2 + 2 * 24 + 2 * 160), img.len);
+    try testing.expectEqual(@as(usize, 64 + 2 * 2 * 4 + 2 * 16 * 4 + 2 * 16 * 2 + 2 * 24 + 2 * 2468), img.len);
     const h = std.mem.bytesToValue(Header, img[0..64]);
     try testing.expectEqualSlices(u8, "GLMROUTE", &h.magic);
     try testing.expectEqual(@as(u32, 37), h.prompt_tokens);
@@ -373,7 +422,7 @@ test "expert routes: a plan's hits, loads, evictions and reads become each id's 
     off += 2 * 16 * 4 + 2 * 16 * 2;
     const s0 = std.mem.bytesToValue(Step, img[off..][0..24]);
     try testing.expectEqual(Step{ .first_route = 0, .n_routes = 1, .rows = 2, .drafted = 1, .accepted = 1, .emitted = 2, .wall_us = 12_345 }, s0);
-    const r1 = std.mem.bytesToValue(Route, img[off + 2 * 24 + 160 ..][0..160]);
+    const r1 = std.mem.bytesToValue(Route, img[off + 2 * 24 + 2468 ..][0..2468]);
     try testing.expectEqual(@as(u16, 1), r1.layer);
     try testing.expectEqual(@as(u32, 1), r1.step);
     try testing.expectEqualSlices(u16, &.{ 9, 5 }, r1.ids[0..2]);
@@ -384,7 +433,7 @@ test "expert routes: a call over two bank layers is one route, each id flagged b
     // One routed layer of two bank layers (8 experts each side of the id range): bank layer 0 holds even ids, 1 odd.
     const rec = try Recorder.init(a, 2, 16, 2, 2);
     defer rec.deinit();
-    rec.begin(1, 0);
+    rec.begin(1, 0, 0);
     var even = try policy.LayerPolicy.init(a, 16, 2);
     defer even.deinit(a);
     var odd = try policy.LayerPolicy.init(a, 16, 2);
@@ -397,7 +446,7 @@ test "expert routes: a call over two bank layers is one route, each id flagged b
     rec.handover(1, odd.prefill_freq, odd.slot_to_expert[0..odd.capacity], 2);
     // Two rows of top-2: [2, 3], [4, 3].
     const ids = [_]u16{ 2, 3, 4, 3 };
-    rec.call(0, &ids);
+    _ = rec.call(0, &ids);
     even.plan(&.{ 2, 4 }, .decode, &plan);
     const k3 = rec.route(0, &.{ 2, 4 }, &plan, &.{true});
     odd.plan(&.{ 3, 3 }, .decode, &plan);
@@ -422,4 +471,32 @@ test "expert routes: a call over two bank layers is one route, each id flagged b
     const img = try rec.image(a);
     defer a.free(img);
     try testing.expectEqual(@as(u32, 2), std.mem.bytesToValue(Header, img[0..64]).banks_per_layer);
+}
+
+test "expert routes: a call's predictors keep each row's top experts by score at their distance, and its stamp the barrier's time" {
+    const a = testing.allocator;
+    const rec = try Recorder.init(a, 2, 20, 2, 1);
+    defer rec.deinit();
+    rec.begin(4, 1, 1_000_000);
+    const idx = rec.call(1, &.{ 3, 4, 5, 6 });
+    rec.stamp(idx, 3_500_000);
+    try testing.expectEqual(@as(u32, 2500), rec.routes.items[idx].t_us);
+    // Two rows over 20 experts: row 0 scores e at e, row 1 at -e with a tie at 0.5 between 7 and 2.
+    var sc: [40]f32 = undefined;
+    for (0..20) |e| {
+        sc[e] = @floatFromInt(e);
+        sc[20 + e] = -@as(f32, @floatFromInt(e));
+    }
+    sc[20 + 7] = 0.5;
+    sc[20 + 2] = 0.5;
+    rec.predict(idx, 2, &sc);
+    const r = rec.routes.items[idx];
+    try testing.expectEqualSlices(u16, &.{ 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4 }, &r.pred[1][0]);
+    try testing.expectEqual(@as(f32, 19), r.pred_score[1][0][0]);
+    try testing.expectEqualSlices(u16, &.{ 2, 7, 0, 1, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15 }, &r.pred[1][1]);
+    // Distance 1 and 3 stay empty; a distance past the depth is ignored.
+    try testing.expectEqual(policy.no_expert, r.pred[0][0][0]);
+    try testing.expectEqual(policy.no_expert, r.pred[2][1][15]);
+    rec.predict(idx, 4, &sc);
+    rec.endCall();
 }

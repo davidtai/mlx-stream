@@ -641,6 +641,9 @@ pub const Routes = struct {
     max_route_ids: u32 = 48,
     /// A prompt's attention on the DSA kernels (the module's probe passed on this device).
     dsa: bool = false,
+    /// The route recorder's (a diagnostic): decode calls also hand the driver the router scores of the routed layers
+    /// two and three after the call's, on its MoE input (`Experts.call`'s `deeper`).
+    predict_deeper: bool = false,
 };
 
 /// What a forward returns beyond the last row's logits.
@@ -700,7 +703,11 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             const next: ?T = if (rt.lookahead and !prompt and li + 1 < w.layers.len and w.layers[li + 1].router != null) try routerScores(g, w.layers[li + 1].router.?, x2) else null;
             // A decode-lane call takes the shared expert built first and runs it during its read wait; the sum is the same.
             const shared: ?T = if (!wide) try mlp(g, lw.shared.?, x2) else null;
-            const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, if (shared) |sh| &[_]T{sh} else &.{});
+            var deeper: [2]?T = .{ null, null };
+            if (rt.predict_deeper and next != null) for (&deeper, 2..) |*dp, d| {
+                if (li + d < w.layers.len and w.layers[li + d].router != null) dp.* = try routerScores(g, w.layers[li + d].router.?, x2);
+            };
+            const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, &deeper, if (shared) |sh| &[_]T{sh} else &.{});
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{routed}, .routed);
             break :blk try g.add(routed, shared orelse try mlp(g, lw.shared.?, x2));
         };
