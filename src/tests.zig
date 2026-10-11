@@ -32,6 +32,7 @@ comptime {
     _ = @import("deepseek_v41_plugin.zig");
     _ = @import("root.zig");
     _ = @import("exl3_source.zig");
+    _ = @import("phase_memory.zig");
     _ = @import("deepseek_v41_bill.zig");
     _ = @import("deepseek_v41_bill_receipts_test.zig");
     _ = @import("deepseek_v41_bill_mini_test.zig");
@@ -61,6 +62,7 @@ comptime {
     _ = @import("glm_moe_dsa_exl3_quant.zig");
     _ = @import("glm_moe_dsa_settings.zig");
     _ = @import("glm_moe_dsa_bill.zig");
+    _ = @import("glm_moe_dsa_bill_receipts_test.zig");
     _ = @import("glm_moe_dsa_cache.zig");
     _ = @import("glm_moe_dsa_graph.zig");
     _ = @import("glm_moe_dsa_experts.zig");

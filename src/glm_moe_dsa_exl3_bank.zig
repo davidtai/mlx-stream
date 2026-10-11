@@ -237,7 +237,20 @@ pub const Bank = struct {
         for (self.layers) |*l| {
             const gu = l.segments[gu_components].offset;
             g.widest_span = @max(g.widest_span, @max(gu, l.logical_bytes - gu));
+            // A routed id's minis back to back in the file (`StreamOf.spanOf`), at the widest layer.
+            g.spec_record = @max(g.spec_record, (@as(u64, l.minis) - 1) * l.record_bytes + l.logical_bytes);
+            g.minis_per_id = @max(g.minis_per_id, l.minis);
         }
+        // A transient scratch per geometry (the stream's): the widest span's arrays, then the other's.
+        var widest: usize = 0;
+        for (self.slots, 0..) |sl, i| if (sl.record_bytes > self.slots[widest].record_bytes) {
+            widest = i;
+        };
+        g.scratch[0] = self.slots[widest].array_bytes;
+        for (self.slots) |sl| if (!std.mem.eql(u64, &sl.array_bytes, &g.scratch[0])) {
+            g.scratch[1] = sl.array_bytes;
+            break;
+        };
         return g;
     }
 
@@ -362,7 +375,10 @@ pub const Bank = struct {
             n_minis += lj.n_minis;
         }
         self.slots = try gpa.alloc(LayerSlots, n_stream);
-        for (self.slots, self.layers[0..n_stream]) |*sl, l| sl.* = .{ .record_bytes = @as(u64, l.minis) * l.logical_bytes, .n_records = l.n_held, .share = @as(f64, @floatFromInt(l.n_held)) / @as(f64, @floatFromInt(ne / banks_per_layer)) };
+        for (self.slots, self.layers[0..n_stream]) |*sl, l| {
+            sl.* = .{ .record_bytes = @as(u64, l.minis) * l.logical_bytes, .n_records = l.n_held, .share = @as(f64, @floatFromInt(l.n_held)) / @as(f64, @floatFromInt(ne / banks_per_layer)) };
+            for (&sl.array_bytes, l.segments) |*x, sg| x.* = @as(u64, l.minis) * sg.length;
+        }
         // 4. The experts map: each routed layer's experts at their bank layer's K and local index.
         for (routed, 0..) |ml, r| {
             var kb: [16]u8 = undefined;
@@ -605,9 +621,18 @@ test "glm exl3 bank: a clean synthetic bank opens: the stream layers, each exper
     const g = b.geometryOf();
     // Eight stream layers: each an expert's four minis a row, its eight experts, one of them a unit.
     try testing.expectEqual(@as(usize, 8), g.layers.len);
-    try testing.expectEqual(glm.LayerSlots{ .record_bytes = 4 * ms3.logical, .n_records = 8, .share = 1 }, g.layers[0]);
-    try testing.expectEqual(glm.LayerSlots{ .record_bytes = 4 * ms4.logical, .n_records = 8, .share = 1 }, g.layers[1]);
+    // Each slot array a row: a segment over the expert's four minis (the bill rounds each array's buffer to its pages).
+    var a3: [n_components]u64 = undefined;
+    var a4: [n_components]u64 = undefined;
+    for (&a3, &a4, ms3.segs, ms4.segs) |*x3, *x4, s3, s4| {
+        x3.* = 4 * s3.length;
+        x4.* = 4 * s4.length;
+    }
+    try testing.expectEqual(glm.LayerSlots{ .record_bytes = 4 * ms3.logical, .n_records = 8, .share = 1, .array_bytes = a3 }, g.layers[0]);
+    try testing.expectEqual(glm.LayerSlots{ .record_bytes = 4 * ms4.logical, .n_records = 8, .share = 1, .array_bytes = a4 }, g.layers[1]);
     try testing.expectEqual(4 * (ms3.logical + ms4.logical), g.widest_record);
+    // A transient scratch per geometry: the K4 layers' arrays (the widest), then the K3 layers'.
+    try testing.expectEqual([2][n_components]u64{ a4, a3 }, g.scratch);
     // The bill's fill over the bank's geometry: units of 1/8 of each bank layer's 8 experts; a unit's bound covers both
     // geometries' slots.
     try testing.expectEqual(@as(u32, 8), bill_units.maxUnits(g));

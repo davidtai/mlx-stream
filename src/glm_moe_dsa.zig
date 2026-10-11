@@ -172,6 +172,10 @@ pub const LayerSlots = struct {
     rows_per_unit: u32 = 1,
     /// The layer's expert slots per fill unit (the bank module's split; `rowsAt` rounds it): 1 for an even fill.
     share: f64 = 1,
+    /// Each slot array's bytes per slot row: the stream allocates one MLX array per record segment, a row's minis times
+    /// the segment's length a row, each array's buffer page-rounded (`glm_moe_dsa_bill.slotArrays`). All zero: one
+    /// array of `record_bytes` a row.
+    array_bytes: [9]u64 = @splat(0),
 };
 
 /// A bank's slot geometry: the bill fills in units (`glm_moe_dsa_bill.unitBytes`, `maxUnits`), the module gives each
@@ -185,6 +189,15 @@ pub const Geometry = struct {
     widest_span: u64,
     /// Slot rows one routed id takes.
     rows_per_id: u32 = 1,
+    /// A routed id's records (an EXL3 expert's tensor-parallel minis; 1 for one record per expert): the routed call's
+    /// GEMM runs per mini (the bill's `prefillRowBytes`).
+    minis_per_id: u32 = 1,
+    /// A routed id's span in the file at the stream's widest layer (`StreamOf.spanOf`): the lookahead's speculative slot
+    /// holds one (the read pool's staging, the bill's `poolStagingBytes`).
+    spec_record: u64 = 0,
+    /// The transient scratches' slot arrays per row (`LayerSlots.array_bytes` of the widest layer, and with a scratch
+    /// per geometry the other's; all zero: `widest_record` a row).
+    scratch: [2][9]u64 = @splat(@splat(0)),
 };
 
 pub const Config = struct {
@@ -669,6 +682,23 @@ pub fn residentBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *co
     defer arena.deinit();
     const spec = try residentSpec(arena.allocator(), c);
     return checkResidents(spec, &ck, diag);
+}
+
+/// The pack's residents as MLX allocates them once they load (`bufferBytes` of every shard tensor), after the spec check.
+pub fn residentBufferBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Config, page: u64, diag: ?*Diag) Error!u64 {
+    var ck = try Checkpoint.openIndexed(gpa, io, dir, diag);
+    defer ck.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    _ = try checkResidents(try residentSpec(arena.allocator(), c), &ck, diag);
+    return bufferBytes(&ck, page);
+}
+
+/// Every tensor of `ck` in its own MLX buffer: past one page, rounded up to whole pages (`glm_moe_dsa_cache.bufferBytes`).
+pub fn bufferBytes(ck: *const Checkpoint, page: u64) u64 {
+    var n: u64 = 0;
+    for (ck.tensors.values()) |t| n += @import("glm_moe_dsa_cache.zig").bufferBytes(t.end - t.begin, page);
+    return n;
 }
 
 /// A pack's resident shard for tests: every spec tensor of `c` zero-filled in one `model.safetensors`, and its index.

@@ -640,6 +640,96 @@ pub const Routes = struct {
     max_route_ids: u32 = 48,
     /// A prompt's attention on the DSA kernels (the module's probe passed on this device).
     dsa: bool = false,
+    /// The wave probe, a diagnostic the module arms (`WaveProbe`); null: off.
+    wave_probe: ?*WaveProbe = null,
+};
+
+/// A diagnostic the module arms at construction (`GLM53_WAVE_PROBE`, off by default): each prompt layer's MLX peak above
+/// MLX's active bytes at the layer's start, by stage (the attention through the residual, the router and the routed call,
+/// the tail through the layer's eval), and MLX's cache at the layer's end. Each stage ends with an eval of what it built
+/// and restarts MLX's peak; the pass's highest peak is kept here (`peak`) for the prompt's phase record. Only with the
+/// probe on do the stage evals run.
+pub const WaveProbe = struct {
+    pub const Stage = enum { attn, moe, tail };
+    /// One layer: MLX's active bytes, MLX's cache and the footprint at its start; per stage MLX's peak as a rise over
+    /// the start and the footprint's high-water over the stage; MLX's cache at the tail's end.
+    pub const Probed = struct { start: u64 = 0, attn: u64 = 0, moe: u64 = 0, tail: u64 = 0, cache: u64 = 0, cache_start: u64 = 0, footprint: u64 = 0, fp: [3]u64 = @splat(0) };
+    layers: [glm.max_layers]Probed = @splat(.{}),
+    n: u32 = 0,
+    rows: u32 = 0,
+    positions: u32 = 0,
+    /// The pass's high-water marks so far: MLX's peak and the footprint's (each restarts at every mark).
+    peak: u64 = 0,
+    footprint_peak: u64 = 0,
+
+    const Counters = struct { active: u64, peak: u64, cache: u64, footprint: u64, footprint_peak: u64 };
+
+    fn counters() Counters {
+        var active: usize = 0;
+        var peak: usize = 0;
+        var cache: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active);
+        _ = mlx.mlx_get_peak_memory(&peak);
+        _ = mlx.mlx_get_cache_memory(&cache);
+        const pm = sdk.memory.processMemory();
+        return .{ .active = active, .peak = @max(peak, active), .cache = cache, .footprint = pm.footprint, .footprint_peak = @max(pm.footprint_interval_peak, pm.footprint) };
+    }
+
+    /// The marks so far into the pass's, both restarted.
+    fn restart(p: *WaveProbe, c: Counters) void {
+        p.peak = @max(p.peak, c.peak);
+        p.footprint_peak = @max(p.footprint_peak, c.footprint_peak);
+        _ = mlx.mlx_reset_peak_memory();
+        sdk.memory.startFootprintInterval();
+    }
+
+    /// A prompt call of `rows` rows ending at `positions`: the probe's layers start over.
+    pub fn call(p: *WaveProbe, rows: u32, positions: u32) void {
+        p.n = 0;
+        p.rows = rows;
+        p.positions = positions;
+    }
+
+    fn begin(p: *WaveProbe, l: u32) void {
+        const c = counters();
+        p.restart(c);
+        p.layers[l] = .{ .start = c.active, .cache_start = c.cache, .footprint = c.footprint };
+        p.n = @max(p.n, l + 1);
+    }
+
+    fn mark(p: *WaveProbe, l: u32, s: Stage) void {
+        const c = counters();
+        p.restart(c);
+        const x = &p.layers[l];
+        const rise = c.peak -| x.start;
+        x.fp[@intFromEnum(s)] = c.footprint_peak;
+        switch (s) {
+            .attn => x.attn = rise,
+            .moe => x.moe = rise,
+            .tail => {
+                x.tail = rise;
+                x.cache = c.cache;
+            },
+        }
+    }
+
+    /// The pass's high-water marks: MLX's peak and the footprint's.
+    pub const Peaks = struct { mlx: u64, footprint: u64 };
+
+    /// The pass's high-water marks, the current stage's included.
+    pub fn passPeaks(p: *const WaveProbe) Peaks {
+        const c = counters();
+        return .{ .mlx = @max(p.peak, c.peak), .footprint = @max(p.footprint_peak, c.footprint_peak) };
+    }
+
+    /// One JSON line's payload: the call's rows and positions and each layer's readings (bytes): MLX's start, its rises
+    /// at the attention, the routed call and the tail, its cache at the tail's end and at the start, the footprint at
+    /// the start and its high-water over each stage.
+    pub fn format(p: WaveProbe, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{{\"rows\":{d},\"positions\":{d},\"peak\":{d},\"footprint_peak\":{d},\"layers\":[", .{ p.rows, p.positions, p.peak, p.footprint_peak });
+        for (p.layers[0..p.n], 0..) |x, l| try w.print("{s}[{d},{d},{d},{d},{d},{d},{d},{d},{d},{d}]", .{ if (l == 0) "" else ",", x.start, x.attn, x.moe, x.tail, x.cache, x.cache_start, x.footprint, x.fp[0], x.fp[1], x.fp[2] });
+        try w.writeAll("]}");
+    }
 };
 
 /// What a forward returns beyond the last row's logits.
@@ -676,9 +766,12 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
     var h = g.keep(try embed(g, w, ids));
     defer g.release(h);
     const wide = rows * c.n_experts_per_tok > rt.max_route_ids;
+    const probe: ?*WaveProbe = if (prompt) rt.wave_probe else null;
+    if (probe) |p| p.call(rows, start + rows);
     for (w.layers, 0..) |*lw, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
+        if (probe) |p| p.begin(l);
         if (pt.enabled and prompt) pt.start();
         // The predictor runs only where the read-ahead has empty rows to fill.
         if (rt.read_ahead and wide and lw.bank_layer != null and ex.readAheadRoom(lw.bank_layer.?) > 0) {
@@ -693,6 +786,11 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         const x = try rmsNorm(g, h, lw.input_norm, c.rms_norm_eps);
         const h1 = try g.add(h, try attention(g, c, lw, l, x, start, rows, cache, &carry, if (want.verify) .per_row else .auto, rt.dsa));
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{h1}, .oproj);
+        if (probe) |p| {
+            try g.evalAll(&.{h1});
+            p.mark(l, .attn);
+        }
+        defer if (probe) |p| p.mark(l, .tail);
         const x2 = try rmsNorm(g, h1, lw.post_norm, c.rms_norm_eps);
         const f = if (lw.dense) |d| try mlp(g, d, x2) else blk: {
             const r = try route(g, c, lw.router.?, x2);
@@ -702,6 +800,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             const shared: ?T = if (!wide) try mlp(g, lw.shared.?, x2) else null;
             const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, if (shared) |sh| &[_]T{sh} else &.{});
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{routed}, .routed);
+            if (probe) |p| p.mark(l, .moe);
             break :blk try g.add(routed, shared orelse try mlp(g, lw.shared.?, x2));
         };
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{f}, .mlp);
@@ -760,6 +859,22 @@ const TestWeights = struct {
         return .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = 8 };
     }
 };
+
+test "glm wave probe: a layer's stages are its rises over the layer's start; the line carries every layer" {
+    var p: WaveProbe = .{};
+    p.call(16387, 16387);
+    p.layers[0] = .{ .start = 197_000_000_000, .attn = 4_000_000_000, .moe = 9_000_000_000, .tail = 6_000_000_000, .cache = 17_000_000_000, .cache_start = 17_100_000_000, .footprint = 214_800_000_000, .fp = .{ 218_000_000_000, 221_000_000_000, 219_000_000_000 } };
+    p.layers[1] = .{ .start = 198_000_000_000, .attn = 3_000_000_000 };
+    p.n = 2;
+    p.peak = 207_000_000_000;
+    p.footprint_peak = 221_000_000_000;
+    const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{p});
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("{\"rows\":16387,\"positions\":16387,\"peak\":207000000000,\"footprint_peak\":221000000000,\"layers\":[[197000000000,4000000000,9000000000,6000000000,17000000000,17100000000,214800000000,218000000000,221000000000,219000000000],[198000000000,3000000000,0,0,0,0,0,0,0,0]]}", s);
+    // A new call starts the layers over.
+    p.call(2048, 18435);
+    try testing.expectEqual(@as(u32, 0), p.n);
+}
 
 test "glm attention: a prompt on the DSA kernels selects the reference's keys and matches its prompt form" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;

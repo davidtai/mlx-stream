@@ -84,9 +84,11 @@ pub fn bill(gpa: std.mem.Allocator, io: std.Io, req: *const sdk.BillRequest) !sd
     const c: *const Config = @ptrCast(@alignCast(req.cfg));
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const mb = try bill_mod.billOf(arena.allocator(), io, c, req.prompt_tokens, null);
+    const mb = try bill_mod.sdkBillOf(arena.allocator(), io, c, req.prompt_tokens, null);
     var out = mb;
     out.terms = try gpa.dupe(sdk.MemoryBill.Term, mb.terms);
+    errdefer gpa.free(out.terms);
+    out.slot_table = try gpa.dupe(u64, mb.slot_table);
     return out;
 }
 

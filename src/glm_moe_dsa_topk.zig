@@ -122,6 +122,11 @@ const source: [:0]const u8 =
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 
+/// Whether the kernel serves a top `k`: a power of two up to 2048 (the memory bill charges the selection by it).
+pub fn serves(k: u32) bool {
+    return k > 0 and k <= 2048 and std.math.isPowerOfTwo(k);
+}
+
 /// The ids `[1, rows, k]` (int32) of each row's `k` largest scores (`scores` `[1, rows, n]` f32, row-contiguous,
 /// `k < n`), as `argpartition(scores, n - k)[..., n - k:]` orders them; null where the kernel does not serve the
 /// shape (`k` not a power of two up to 2048, or a row of 2^31 or more).
@@ -130,7 +135,7 @@ pub fn topk(g: *G, scores: T, k: u32) !?T {
     if (sh.n != 3 or sh.dim(0) != 1) return null;
     const rows = sh.dim(1);
     const n = sh.dim(2);
-    if (k == 0 or k > 2048 or !std.math.isPowerOfTwo(k) or n <= k or g.dtypeOf(scores) != .float32) return null;
+    if (!serves(k) or n <= k or g.dtypeOf(scores) != .float32) return null;
     const kern = kernel orelse blk: {
         const ins = [_][*:0]const u8{ "scores", "params" };
         const outs = [_][*:0]const u8{"out"};
