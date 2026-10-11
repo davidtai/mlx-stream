@@ -73,7 +73,7 @@ var hm_cur: Host = .none;
 /// The fine layers (`GLM53_FINE_LAYERS`), the one running now and its op labels' totals.
 pub const Op = enum(u8) { q_a, q_a_norm, q_b, q_rope, iq_proj, iq_rope, kv_a, kv_norm, k_rope, ik_proj, ik_norm, ik_rope, p_proj, p_index, p_attn, o_transpose, o_proj, p_oproj, post_norm, p_router, p_routed, mlp_gate, mlp_silu, mlp_up, mlp_mul, mlp_down, p_mlp, tail };
 const n_ops = @typeInfo(Op).@"enum".field_names.len;
-var fine_set: std.StaticBitSet(128) = .initEmpty();
+var fine_set: std.StaticBitSet(128) = .empty;
 var fine_cur: ?u32 = null;
 var fine_label: Op = .q_a;
 var fine_wall: [128][n_ops]u64 = undefined;
@@ -203,7 +203,7 @@ pub fn begin(g: *ops.MlxOps) void {
     hm_n = 0;
     hm_cur = .none;
     fine_cur = null;
-    fine_set = .initEmpty();
+    fine_set = .empty;
     fine_wall = @splat(@splat(0));
     fine_n = @splat(@splat(0));
     if (std.c.getenv("GLM53_FINE_LAYERS")) |v| {
