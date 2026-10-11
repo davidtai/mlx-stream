@@ -15,8 +15,7 @@ pub var active: bool = false;
 
 /// Cycles <= max_tokens - 1 (the cell's default cap: 1,024 ids).
 pub const max_cycles = 1024;
-/// Routed layers stamped per cycle: DeepSeek-V4.1's layers and GLM-5.3's routed layers.
-pub const max_layers = @max(@import("deepseek_v41.zig").max_layers, @import("glm_moe_dsa.zig").max_layers);
+pub const max_layers = @import("deepseek_v41.zig").max_layers;
 /// Buffers past this are counted (`dropped`), not recorded.
 pub const max_buffers = 1 << 18;
 
