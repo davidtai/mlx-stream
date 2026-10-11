@@ -46,7 +46,8 @@ pub inline fn start() void {
 /// `xs` evaluated, the time since the previous phase's end charged to `p`; returns the time charged.
 pub inline fn phase(g: *ops.MlxOps, xs: []const ops.MlxOps.T, p: Phase) !u64 {
     if (comptime !enabled) return 0;
-    if (xs.len > 0) try g.evalAll(xs);
+    // DIAGNOSTIC (waits inventory): no eval at a phase's end, so the timers read the prompt pass's own waits.
+    _ = .{ g, xs };
     const t = now();
     const d = t - last;
     ns[@intFromEnum(p)] += d;
