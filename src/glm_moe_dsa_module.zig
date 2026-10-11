@@ -244,7 +244,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 log.err("glm_moe_dsa: admission refused before construction: {s} (prompt {d} B, decode {d} B, target {d} B)\n", .{ @errorName(e), mb.total(.prompt, baseline, rows.prompt), mb.total(.decode, baseline, rows.decode), target });
                 return e;
             };
-            log.info("glm_moe_dsa: admission {d} prompt / {d} decode units of {d} B ({d}-token context, {d} generated, baseline {d} B, target {d} B, the GPU's {d} B), units cap {d} (0: off), rest-of-box floor {d} B (0: off)\n", .{ rows.prompt, rows.decode, mb.per_row, max_context, cfg.maxOutput(), baseline, target, gpu_target, if (cfg.expert_rows == null) cfg.expert_units_cap orelse 0 else 0, cfg.rest_of_box_floor_bytes orelse 0 });
+            log.info("glm_moe_dsa: admission {d} prompt / {d} decode units of {d} B ({d}-token context, {d} generated, baseline {d} B, target {d} B, the GPU's {d} B), units cap {d} (0: off), rest-of-box floor {d} B (0: off; the baseline read {d} B)\n", .{ rows.prompt, rows.decode, mb.per_row, max_context, cfg.maxOutput(), baseline, target, gpu_target, if (cfg.expert_rows == null) cfg.expert_units_cap orelse 0 else 0, cfg.rest_of_box_floor_bytes orelse 0, cfg.memory_baseline_bytes orelse 0 });
             log.info("{f}\n", .{bill_mod.BillLine{ .mb = &mb, .rows = rows, .baseline = baseline, .target = target, .context = max_context, .decode_positions = inputs.decode_positions }});
 
             const self = try gpa.create(Self);
@@ -373,7 +373,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const box = Box.now(m);
             var cc = phase_mem.Construction.of(self.bill, prompt_rows, m.footprint, m.active, m.cache);
             cc.host_known = self.billed.phases[@intFromEnum(bill_mod.Phase.construction)].pool_staging;
-            log.info("glm_moe_dsa: construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (tolerance {d} B); the box {d} B used, the rest of it {d} B (the load's baseline {d} B)\n", .{ m.footprint, m.active, m.cache, m.hostSide(), cc.billed, cc.residual(), construction_tolerance_bytes, box.used, box.others, self.baseline });
+            log.info("glm_moe_dsa: construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (tolerance {d} B); the box {d} B used, the rest of it {d} B (the load's baseline {d} B, billed at {d} B)\n", .{ m.footprint, m.active, m.cache, m.hostSide(), cc.billed, cc.residual(), construction_tolerance_bytes, box.used, box.others, self.cfg.memory_baseline_bytes orelse 0, self.baseline });
             cc.checkFootprint(construction_tolerance_bytes) catch |e| {
                 log.err("glm_moe_dsa: load refused: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B ({s})\n", .{ m.footprint, cc.billed, construction_tolerance_bytes, @errorName(e) });
                 return e;
@@ -599,7 +599,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             // it), at least its floor, for the live reading and the bill at the request alike.
             const rest = bill_mod.restOfBox(box.others, self.cfg.rest_of_box_floor_bytes);
             const target = bill_mod.targetOf(self.gpu_target, self.ram, rest);
-            var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_units, .rows = self.decode_units, .target = target, .gpu_target = self.gpu_target, .baseline = self.baseline, .box = box, .rest = rest };
+            var line: HandoverLine = .{ .before = before, .after = st.after, .settle_ms = st.waited_ms, .settled = st.settled, .positions = cap, .kv_bytes = kv1, .prompt_rows = self.prompt_units, .rows = self.decode_units, .target = target, .gpu_target = self.gpu_target, .baseline = self.cfg.memory_baseline_bytes orelse 0, .box = box, .rest = rest };
             if (!self.forced_rows) {
                 const after = bill_mod.decodeAfter(self.inputs, cap);
                 const max_units = bill_mod.maxUnits(self.inputs.bank);
@@ -892,7 +892,8 @@ pub const HandoverLine = struct {
     refused: ?[]const u8 = null,
     /// The units cap (`expert_units_cap`; null: off).
     cap: ?u32 = null,
-    /// The rest of the box the grow sat beside (`bill.restOfBox`: the reading, at least its floor; 0: the reading).
+    /// The rest of the box the grow sat beside (`bill.restOfBox`: the reading, at least its floor; 0: the reading). The
+    /// load's baseline (`baseline`) is the reading.
     rest: u64 = 0,
 
     pub fn format(p: HandoverLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
