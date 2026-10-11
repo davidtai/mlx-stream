@@ -1990,6 +1990,20 @@ pub const TraceOps = struct {
 
 const testing = std.testing;
 
+/// Tests: `mx.quantize(w, group, bits, "affine")` as mlx-lm stores a layer: words, scales and biases, in `g`'s scope.
+pub fn quantizeAffine(g: *MlxOps, w: MlxOps.T, group: u32, bits: u32) ![3]MlxOps.T {
+    var vec = mlx.mlx_vector_array{ .ctx = null };
+    try mlx.check(mlx.mlx_quantize(&vec, w, mlx.mlx_optional_int.some(@intCast(group)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, g.s));
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var parts: [3]MlxOps.T = undefined;
+    for (&parts, 0..) |*p, i| {
+        p.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(p, vec, i));
+        p.* = try g.adopt(p.*);
+    }
+    return parts;
+}
+
 test "dsv41 ops: promotion follows MLX's table" {
     try testing.expectEqual(Dtype.float32, promote(.bfloat16, .float32));
     try testing.expectEqual(Dtype.float32, promote(.bfloat16, .float16));
@@ -2221,15 +2235,7 @@ test "dsv41 smoke 0b: an affine 4-bit group-64 bank: gatherMatmul with biases eq
     var ws: [4 * 64 * 128]f32 = undefined;
     for (&ws, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 29)) - 14)) / 32.0;
     const w = try g.astype(try g.hostArray(std.mem.sliceAsBytes(&ws), &.{ 4, 64, 128 }, .float32), .bfloat16);
-    var vec = mlx.mlx_vector_array{ .ctx = null };
-    try mlx.check(mlx.mlx_quantize(&vec, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
-    defer _ = mlx.mlx_vector_array_free(vec);
-    var parts: [3]mlx.mlx_array = undefined;
-    for (&parts, 0..) |*p, i| {
-        p.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(p, vec, i));
-        p.* = try g.adopt(p.*);
-    }
+    const parts = try quantizeAffine(&g, w, 64, 4);
     try testing.expectEqualSlices(c_int, &.{ 4, 64, 16 }, g.shapeOf(parts[0]).slice());
     try testing.expectEqualSlices(c_int, &.{ 4, 64, 2 }, g.shapeOf(parts[2]).slice());
     var xs: [3 * 128]f32 = undefined;

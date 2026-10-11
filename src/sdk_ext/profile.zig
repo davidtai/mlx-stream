@@ -1,6 +1,6 @@
 //! G7, profile builds: a plugin's profile instruments reach the code of its other kinds as a hook its arch injects at
-//! comptime, never as an import, so no kind imports another's profiling. The SDK declares the probes' shapes and the
-//! hooks that compile to nothing; it carries no timer or counter of its own.
+//! comptime, never as an import, so no kind imports another's profiling. The SDK declares the probes' shapes, the
+//! hooks that compile to nothing and the probes' one clock (`Clock`); it carries no timer or counter of its own.
 //!
 //! The backend type an arch binds its quant and its source with declares the hook (`pub const profile_hook: Hook`);
 //! the generic code they share reads it with `of(Backend)`, once, at comptime. A backend that declares none (a host
@@ -27,6 +27,21 @@ pub const Hook = struct {
 
 /// The hook of a backend that declares none.
 pub const off: Hook = .{};
+
+/// A probe file's clock: `Stamp` is the monotonic clock in ns where its probes are compiled in (`enabled`), else
+/// `void`, and `now` reads nothing.
+pub fn Clock(comptime enabled: bool) type {
+    return struct {
+        pub const Stamp = if (enabled) u64 else void;
+
+        pub inline fn now() Stamp {
+            if (comptime !enabled) return {};
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        }
+    };
+}
 
 pub const prefill_off = struct {
     pub const enabled = false;

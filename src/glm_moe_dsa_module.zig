@@ -885,34 +885,30 @@ pub const Reads = struct {
     in_flight_ns: u64 = 0,
 
     pub fn of(s0: Stats, s1: Stats) Reads {
-        const d = struct {
-            fn f(a: u64, b: u64) u64 {
-                return b -| a;
-            }
-        }.f;
+        const d = s1.since(s0);
         return .{
-            .ssd_bytes = (d(s0.expert_bytes_read, s1.expert_bytes_read) -| d(s0.adopt_bytes, s1.adopt_bytes)) + d(s0.spec_bytes, s1.spec_bytes),
-            .demand_records = d(s0.persistent_loads + s0.transient_loads, s1.persistent_loads + s1.transient_loads) -| d(s0.loads_skipped, s1.loads_skipped),
-            .ahead_records = d(s0.ahead_posted, s1.ahead_posted),
-            .ahead_hits = d(s0.ahead_hits, s1.ahead_hits),
-            .hits = d(s0.expert_cache_hits, s1.expert_cache_hits),
-            .misses = d(s0.expert_cache_misses, s1.expert_cache_misses),
-            .spec_issued = d(s0.spec_issued, s1.spec_issued),
-            .spec_used = d(s0.claimed, s1.claimed),
-            .spec_landed = d(s0.spec_landed, s1.spec_landed),
-            .spec_expired = d(s0.spec_expired, s1.spec_expired),
-            .spec_abandoned = d(s0.spec_abandoned, s1.spec_abandoned),
-            .spec_cancelled = d(s0.spec_cancelled, s1.spec_cancelled),
-            .spec_discarded = d(s0.spec_discarded, s1.spec_discarded),
-            .spec_late = d(s0.spec_claimed_inflight, s1.spec_claimed_inflight),
-            .spec_bytes = d(s0.spec_bytes, s1.spec_bytes),
-            .spec_served_bytes = d(s0.adopt_bytes, s1.adopt_bytes),
-            .loads_skipped = d(s0.loads_skipped, s1.loads_skipped),
-            .direct = d(s0.direct_ranges, s1.direct_ranges),
-            .promoted = d(s0.promoted, s1.promoted),
-            .promoted_bytes = d(s0.promoted_bytes, s1.promoted_bytes),
-            .wait_ns = d(s0.read_wait_ns, s1.read_wait_ns),
-            .in_flight_ns = d(s0.read_wall_ns, s1.read_wall_ns),
+            .ssd_bytes = (d.expert_bytes_read -| d.adopt_bytes) + d.spec_bytes,
+            .demand_records = (d.persistent_loads + d.transient_loads) -| d.loads_skipped,
+            .ahead_records = d.ahead_posted,
+            .ahead_hits = d.ahead_hits,
+            .hits = d.expert_cache_hits,
+            .misses = d.expert_cache_misses,
+            .spec_issued = d.spec_issued,
+            .spec_used = d.claimed,
+            .spec_landed = d.spec_landed,
+            .spec_expired = d.spec_expired,
+            .spec_abandoned = d.spec_abandoned,
+            .spec_cancelled = d.spec_cancelled,
+            .spec_discarded = d.spec_discarded,
+            .spec_late = d.spec_claimed_inflight,
+            .spec_bytes = d.spec_bytes,
+            .spec_served_bytes = d.adopt_bytes,
+            .loads_skipped = d.loads_skipped,
+            .direct = d.direct_ranges,
+            .promoted = d.promoted,
+            .promoted_bytes = d.promoted_bytes,
+            .wait_ns = d.read_wait_ns,
+            .in_flight_ns = d.read_wall_ns,
         };
     }
 };

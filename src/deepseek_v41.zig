@@ -1639,7 +1639,7 @@ fn stToMlx(d: StDtype) mlx.mlx_dtype {
 }
 
 fn expectLoaded(w: *const sdk.Weights, name: []const u8, dtype: mlx.mlx_dtype, shape: []const u64, diag: ?*Diag) Refusal!void {
-    const a = w.get(name) orelse return refuse(diag, error.TensorMissing, "{s}: not in the loaded weights", .{name});
+    const a = try w.need(name, diag, error.TensorMissing, "not in the loaded weights");
     if (mlx.mlx_array_dtype(a) != dtype) return refuse(diag, error.TensorDtype, "{s}: loaded as {s}, want {s}", .{ name, @tagName(mlx.mlx_array_dtype(a)), @tagName(dtype) });
     const got = mlx.getShape(a);
     var same = got.len == shape.len;
@@ -2019,9 +2019,7 @@ pub fn writeMini(a: std.mem.Allocator, tmp: *std.testing.TmpDir, spec: []const P
     return all;
 }
 
-fn tmpRoot(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
-    return buf[0..try tmp.dir.realPath(testing.io, buf)];
-}
+const tmpRoot = sdk.testing.tmpRoot;
 
 test "dsv41 weights: a synthetic mini checkpoint maps every tensor and reads its bytes back" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

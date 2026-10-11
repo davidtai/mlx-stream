@@ -676,30 +676,22 @@ pub fn writeResidents(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, c: *con
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const spec = try residentSpec(arena.allocator(), c);
-    var hdr: std.ArrayList(u8) = .empty;
-    defer hdr.deinit(a);
     var idx: std.ArrayList(u8) = .empty;
     defer idx.deinit(a);
-    try hdr.appendSlice(a, "{\"__metadata__\":{\"format\":\"mlx\"}");
     try idx.appendSlice(a, "{\"weight_map\":{");
+    const st = @import("sdk").testing;
+    const ts = try arena.allocator().alloc(st.StTensor, spec.len);
     var off: u64 = 0;
-    for (spec, 0..) |p, i| {
+    for (spec, ts, 0..) |*p, *t, i| {
         var n: u64 = p.dtypes[0].size();
         for (p.shapeOf()) |d| n *= d;
-        try hdr.print(a, ",\"{s}\":{{\"dtype\":\"{t}\",\"shape\":[", .{ p.name, p.dtypes[0] });
-        for (p.shapeOf(), 0..) |d, k| try hdr.print(a, "{s}{d}", .{ if (k == 0) "" else ",", d });
-        try hdr.print(a, "],\"data_offsets\":[{d},{d}]}}", .{ off, off + n });
+        t.* = .{ .name = p.name, .dtype = @tagName(p.dtypes[0]), .shape = p.shapeOf(), .len = n };
         try idx.print(a, "{s}\"{s}\":\"model.safetensors\"", .{ if (i == 0) "" else ",", p.name });
         off += n;
     }
-    try hdr.append(a, '}');
-    while (hdr.items.len % 8 != 0) try hdr.append(a, ' ');
     try idx.print(a, "}},\"metadata\":{{\"total_size\":{d}}}}}", .{off});
-    const file = try a.alloc(u8, 8 + hdr.items.len + off);
+    const file = try st.safetensors(a, ts, .{ .metadata = true, .pad = true });
     defer a.free(file);
-    @memset(file, 0);
-    std.mem.writeInt(u64, file[0..8], hdr.items.len, .little);
-    @memcpy(file[8..][0..hdr.items.len], hdr.items);
     try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file });
     try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = idx.items });
 }

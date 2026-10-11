@@ -994,35 +994,36 @@ const StreamPhase = struct {
     evictions: u64 = 0,
 
     fn of(a: expert_stream.Stats, b: expert_stream.Stats) StreamPhase {
+        const d = b.since(a);
         return .{
-            .route_calls = b.route_calls -| a.route_calls,
-            .hits = b.expert_cache_hits -| a.expert_cache_hits,
-            .misses = b.expert_cache_misses -| a.expert_cache_misses,
-            .bytes_read = b.expert_bytes_read -| a.expert_bytes_read,
-            .preadv_calls = b.preadv_calls -| a.preadv_calls,
-            .read_busy_s = @as(f64, @floatFromInt(b.read_wall_ns -| a.read_wall_ns)) / 1e9,
-            .read_seconds = b.expert_read_seconds - a.expert_read_seconds,
-            .adopt_copy_seconds = b.adopt_copy_seconds - a.adopt_copy_seconds,
+            .route_calls = d.route_calls,
+            .hits = d.expert_cache_hits,
+            .misses = d.expert_cache_misses,
+            .bytes_read = d.expert_bytes_read,
+            .preadv_calls = d.preadv_calls,
+            .read_busy_s = @as(f64, @floatFromInt(d.read_wall_ns)) / 1e9,
+            .read_seconds = d.expert_read_seconds,
+            .adopt_copy_seconds = d.adopt_copy_seconds,
             .read_seconds_preadv = (b.expert_read_seconds - b.adopt_copy_seconds) - (a.expert_read_seconds - a.adopt_copy_seconds),
-            .ahead_posted = b.ahead_posted -| a.ahead_posted,
-            .ahead_hits = b.ahead_hits -| a.ahead_hits,
-            .ahead_demand = b.ahead_demand -| a.ahead_demand,
-            .ahead_bytes = b.ahead_bytes -| a.ahead_bytes,
-            .claimed = b.claimed -| a.claimed,
-            .spec_issued = b.spec_issued -| a.spec_issued,
-            .spec_landed = b.spec_landed -| a.spec_landed,
-            .spec_bytes = b.spec_bytes -| a.spec_bytes,
-            .adopt_ranges = b.adopt_ranges -| a.adopt_ranges,
-            .adopt_bytes = b.adopt_bytes -| a.adopt_bytes,
-            .pre_issued = b.pre_issued -| a.pre_issued,
-            .pre_served = b.pre_served -| a.pre_served,
-            .pre_expired = b.pre_expired -| a.pre_expired,
-            .gates = b.gates -| a.gates,
-            .gates_forced = b.gates_forced -| a.gates_forced,
-            .persistent_loads = b.persistent_loads -| a.persistent_loads,
-            .transient_loads = b.transient_loads -| a.transient_loads,
-            .loads_skipped = b.loads_skipped -| a.loads_skipped,
-            .evictions = b.expert_cache_evictions -| a.expert_cache_evictions,
+            .ahead_posted = d.ahead_posted,
+            .ahead_hits = d.ahead_hits,
+            .ahead_demand = d.ahead_demand,
+            .ahead_bytes = d.ahead_bytes,
+            .claimed = d.claimed,
+            .spec_issued = d.spec_issued,
+            .spec_landed = d.spec_landed,
+            .spec_bytes = d.spec_bytes,
+            .adopt_ranges = d.adopt_ranges,
+            .adopt_bytes = d.adopt_bytes,
+            .pre_issued = d.pre_issued,
+            .pre_served = d.pre_served,
+            .pre_expired = d.pre_expired,
+            .gates = d.gates,
+            .gates_forced = d.gates_forced,
+            .persistent_loads = d.persistent_loads,
+            .transient_loads = d.transient_loads,
+            .loads_skipped = d.loads_skipped,
+            .evictions = d.expert_cache_evictions,
         };
     }
 };
@@ -3533,7 +3534,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     const r = try md.model.forward(g, &st, inputs.prompt, .{ .logits = .last, .main_hidden = true }, &arm.hook, &probe);
     try g.evalAll(&.{r.logits.?});
     const wall_s = secondsSince(io, t0);
-    const s1 = stats_of(@ptrCast(&arm.hook));
+    const d = stats_of(@ptrCast(&arm.hook)).since(s0);
     const secs = struct {
         fn f(ns: u64) f64 {
             return @as(f64, @floatFromInt(ns)) / 1e9;
@@ -3542,7 +3543,7 @@ test "dsv41 served cell: the prompt pass profiled by stage and chunk (profiling 
     var total: u64 = 0;
     for (probe.ns[0..probe.n]) |x| total += x;
     std.debug.print("\nPREFILL_PROFILE {{\"prompt_tokens\": {d}, \"probed_wall_s\": {d:.3}, \"stage_sum_s\": {d:.3}, \"chunks\": {d}, \"read_bytes\": {d}, \"read_busy_s\": {d:.3}, \"misses\": {d}, \"routed_read_busy_s\": {d:.3}}}\n", .{
-        inputs.prompt.len, wall_s, secs(total), probe.layers_done / probe.n_layers, s1.expert_bytes_read - s0.expert_bytes_read, secs(s1.read_wall_ns - s0.read_wall_ns), s1.expert_cache_misses - s0.expert_cache_misses, secs(probe.read_wall_ns),
+        inputs.prompt.len, wall_s, secs(total), probe.layers_done / probe.n_layers, d.expert_bytes_read, secs(d.read_wall_ns), d.expert_cache_misses, secs(probe.read_wall_ns),
     });
     for (probe.names[0..probe.n], probe.ns[0..probe.n]) |name, ns| std.debug.print("PREFILL_PROFILE_STAGE {{\"stage\": \"{s}\", \"s\": {d:.3}, \"share\": {d:.4}}}\n", .{ name, secs(ns), @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
     // Per stage, MLX's high-water mark above the pass's start (the constructed residents): which stage sets the transient.

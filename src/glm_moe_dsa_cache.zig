@@ -136,11 +136,6 @@ pub fn Cache(comptime G: type) type {
             }
             self.len = @min(self.len, n);
         }
-
-        /// One position's bytes over every lane (`glm_moe_dsa.Config.kvPositionBytes`, the bill's).
-        pub fn positionBytes(c: *const glm.Config) u64 {
-            return c.kvPositionBytes();
-        }
     };
 }
 

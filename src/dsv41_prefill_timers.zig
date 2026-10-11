@@ -39,14 +39,9 @@ pub const ReadAheadLayer = struct { predicted: u32 = 0, admitted: u32 = 0, poste
 pub var ra: [max_layers]ReadAheadLayer = @splat(.{});
 pub var ra_counts: [max_layers][max_experts]u32 = @splat(@splat(0));
 
-pub const Stamp = if (enabled) u64 else void;
-
-pub inline fn now() Stamp {
-    if (comptime !enabled) return {};
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+const clock = sdk_ext.profile.Clock(enabled);
+pub const Stamp = clock.Stamp;
+pub const now = clock.now;
 
 /// Charge the time since `t0` to `b` (and to the current mode's split).
 pub inline fn charge(b: Bucket, t0: Stamp) void {

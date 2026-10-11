@@ -2,9 +2,9 @@
 //! forward's layer evaluated on its own and its wall time charged to it, accumulated over one prompt pass and printed
 //! at its end. In every other build `enabled` is false and each call below compiles to nothing.
 
-const std = @import("std");
 const bo = @import("build_flags.zig");
 const ops = @import("deepseek_v41_ops.zig");
+const sdk_ext = @import("sdk_ext.zig");
 const log = @import("sdk").log;
 
 pub const enabled: bool = if (@hasDecl(bo, "glm_prefill_timers")) bo.glm_prefill_timers else false;
@@ -28,14 +28,9 @@ pub var attn_full_ns: u64 = 0;
 pub var attn_shared_ns: u64 = 0;
 var last: u64 = 0;
 
-pub const Stamp = if (enabled) u64 else void;
-
-pub inline fn now() Stamp {
-    if (comptime !enabled) return {};
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+const clock = sdk_ext.profile.Clock(enabled);
+pub const Stamp = clock.Stamp;
+pub const now = clock.now;
 
 /// The phase clock's start (a layer's first phase).
 pub inline fn start() void {

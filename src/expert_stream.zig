@@ -487,26 +487,12 @@ const SynthBank = expert_bank.SynthBank;
 
 const test_pool: expert_io.Options = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 };
 
-/// Routes `ids` and waits for every part (gate/up first, as the kernels do).
-fn serve(s: *Stream, layer: u32, ids: []const u16) !*Route {
-    const r = try s.route(layer, ids, &.{});
-    for (0..r.n_parts) |p| {
-        try s.waitGu(r, @intCast(p));
-        try s.waitDown(r, @intCast(p));
-    }
-    return r;
-}
+/// Routes `ids` and waits for every part (the stream's `serve`).
+const serve = Stream.serve;
 
-/// Every routed id's slot holds its record's bytes.
+/// Every routed id's slot holds its record's bytes (the stream's `expectServed` over the bank's image).
 fn expectServed(s: *Stream, sb: *const SynthBank, r: *const Route, ids: []const u16) !void {
-    const geom = &sb.bank.layers[r.layer];
-    for (ids, r.plan.slotsOf()) |e, slot| {
-        const off = sb.bank.recordOffset(r.layer, e);
-        for (geom.segments, 0..) |seg, c| {
-            const want = sb.image[off + seg.offset ..][0..seg.length];
-            try testing.expectEqualSlices(u8, want, s.slotRow(r.layer, slot, @enumFromInt(c))[0..seg.length]);
-        }
-    }
+    return s.expectServed(r, ids, sb.image);
 }
 
 fn readsOf(r: *const Route) u64 {

@@ -123,33 +123,26 @@ test "glm routes: the recorder keeps every decode route as the stream served it,
     const img = try tmp.dir.readFileAlloc(testing.io, "routes.bin", a, .limited(64 << 20));
     defer a.free(img);
 
-    const h = std.mem.bytesToValue(routes.Header, img[0..@sizeOf(routes.Header)]);
-    try testing.expectEqualSlices(u8, &routes.magic, &h.magic);
-    try testing.expectEqual(routes.Header{ .n_layers = 4, .n_experts = 16, .top_k = 8, .prompt_tokens = 3, .mtp_depth = 3, .n_routes = n_steps * 4, .n_steps = n_steps, .dropped = 0, .banks_per_layer = 1 }, h);
-    var off: usize = @sizeOf(routes.Header);
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]u32{ 4, 6, 3, 5 }), img[off..][0 .. 4 * 4]);
-    off += 4 * 4;
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&decode_rows), img[off..][0 .. 4 * 4]);
-    off += 4 * 4;
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(counts), img[off..][0 .. counts.len * 4]);
-    off += counts.len * 4;
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(residents), img[off..][0 .. residents.len * 2]);
-    off += residents.len * 2;
+    // The file's parts (`Parts.of` refuses any other length).
+    const im = try routes.Parts.of(img);
+    try testing.expectEqualSlices(u8, &routes.magic, &im.header.magic);
+    try testing.expectEqual(routes.Header{ .n_layers = 4, .n_experts = 16, .top_k = 8, .prompt_tokens = 3, .mtp_depth = 3, .n_routes = n_steps * 4, .n_steps = n_steps, .dropped = 0, .banks_per_layer = 1 }, im.header);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]u32{ 4, 6, 3, 5 }), im.prompt_rows);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&decode_rows), im.decode_rows);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(counts), im.counts);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(residents), im.residents);
     var first: u32 = 0;
     for (0..n_steps) |step| {
-        const st = std.mem.bytesToValue(routes.Step, img[off..][0..@sizeOf(routes.Step)]);
         const rows: u16 = if (step % 2 == 0) 1 else 4;
-        try testing.expectEqual(routes.Step{ .first_route = first, .n_routes = 4, .rows = rows, .drafted = rows - 1, .accepted = rows / 2, .emitted = rows / 2 + 1, .wall_us = @intCast(step) }, st);
+        try testing.expectEqual(routes.Step{ .first_route = first, .n_routes = 4, .rows = rows, .drafted = rows - 1, .accepted = rows / 2, .emitted = rows / 2 + 1, .wall_us = @intCast(step) }, im.step(step));
         first += 4;
-        off += @sizeOf(routes.Step);
     }
-    try testing.expectEqual(off + n_steps * 4 * @sizeOf(routes.Route), img.len);
     var adopted: u64 = 0;
     var any_spec = false;
     var seen = try std.DynamicBitSetUnmanaged.initEmpty(a, ne);
     defer seen.deinit(a);
     for (want[0 .. n_steps * 4], 0..) |w, i| {
-        const r = std.mem.bytesToValue(routes.Route, img[off + i * @sizeOf(routes.Route) ..][0..@sizeOf(routes.Route)]);
+        const r = im.route(i);
         try testing.expectEqual(@as(u16, @intCast(i % 4)), r.layer);
         try testing.expectEqual(@as(u32, @intCast(i / 4)), r.step);
         try testing.expectEqual(w.n, r.n_ids);

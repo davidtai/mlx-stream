@@ -506,102 +506,18 @@ const old_quant = sushi_quant;
 
 test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver equals sushi's host decode of the records: both bank layers, every lane, host waits and event gates" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const a = testing.allocator;
-    const G = @import("glm_moe_dsa_graph.zig").G;
-    const experts_mod = @import("glm_moe_dsa_experts.zig");
-    const expert_event = sdk_ext.expert.event;
-    const Ex = experts_mod.Experts(G, bank_mod, Accepted(G));
-    var c = try bank_mod.tinyConfigInter(a, 512);
-    defer c.deinit(a);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const img = try bank_mod.writeSynth(a, testing.io, tmp.dir, &c, .{ .signs = true });
-    defer a.free(img);
-    var rbuf: [512]u8 = undefined;
-    var b = try bank_mod.Bank.open(a, testing.io, try bank_mod.tmpRoot(&tmp, &rbuf), &c, null);
-    defer b.deinit();
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var kd: Diag = .{};
-    const set = try ks.Set.init(a, .{ .device = .{ .stream = s } }, &kd);
+    const set = try ks.Set.init(testing.allocator, .{ .device = .{ .stream = s } }, &kd);
     defer set.deinit();
-    const h: usize = c.hidden_size;
-    const k = 8;
-    var rng = std.Random.DefaultPrng.init(11);
-    var worst: f32 = 0;
-    var scale: f32 = 0;
-    for ([_]bool{ false, true }) |gated| {
-        var g = try G.init(a, s);
-        defer g.deinit();
-        var ev: ?expert_event.Event = null;
-        if (gated) ev = try expert_event.createMetal();
-        // Two expert slots per bank layer (8 held): misses, evictions and transient rows in every call.
-        const prompt_rows: [8]u32 = @splat(2);
-        const decode_rows: [8]u32 = @splat(3);
-        const st = try bank_mod.Stream.Stream.init(a, &b, .{ .rows = &prompt_rows, .max_route_ids = 48, .transient_rows = 96, .wide_depth = 2, .transient_release = true, .records_per_part = 2, .slot_memory = .{ .mlx = s }, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 4096 }, .lookahead = .{ .k = 8, .budget = 2 }, .event = if (ev) |e| .{ .backend = .{ .metal = e.object }, .watchdog_ms = 2000 } else null });
-        defer st.deinit();
-        var diag: Diag = .{};
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const p = try b.peek(arena.allocator());
-        const math = try accept(G, a, &g, .{ .kernels = set.ref(), .peek = &p }, .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = k, .n_layers = 4, .act = .swiglu, .input = .bfloat16 }, &diag);
-        defer math.deinit(&g);
-        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .gated = gated, .event = ev, .wide_depth = 2 });
-        defer ex.deinit(&g);
-        for (ex.banks) |bk| if (bk[0]) |arr| try math.checkBank(&g, arr, &diag);
-        // The prompt phase's widths (9 rows: the wide lane; 3 and 1: the decode lane), then the decode phase's 1 to 6.
-        for ([_]u32{ 9, 3, 1, 0, 1, 3, 6, 2, 4, 5, 1 }) |n| {
-            if (n == 0) {
-                _ = try ex.releaseTransient();
-                try ex.grow(&decode_rows);
-                continue;
-            }
-            for (0..4) |layer| {
-                const m = g.mark();
-                defer g.resetTo(m);
-                var xs: [9 * 128]f32 = undefined;
-                for (xs[0 .. n * h]) |*v| v.* = rng.random().floatNorm(f32) * 0.5;
-                var ids: [9 * k]u16 = undefined;
-                var ids32: [9 * k]i32 = undefined;
-                var sc: [9 * k]f32 = undefined;
-                for (0..n) |row| {
-                    var j: usize = 0;
-                    while (j < k) {
-                        const e = rng.random().uintLessThan(u16, 16);
-                        if (std.mem.indexOfScalar(u16, ids[row * k ..][0..j], e) != null) continue;
-                        ids[row * k + j] = e;
-                        ids32[row * k + j] = e;
-                        sc[row * k + j] = 0.05 + rng.random().float(f32) * 0.2;
-                        j += 1;
-                    }
-                }
-                const nc: c_int = @intCast(n);
-                const xb = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs[0 .. n * h]), &.{ nc, @intCast(h) }, .float32), .bfloat16);
-                var xin: [9 * 128]f32 = undefined;
-                _ = try g.hostF32(try g.astype(xb, .float32), xin[0 .. n * h]);
-                var next: [9 * 16]f32 = undefined;
-                for (next[0 .. n * 16]) |*v| v.* = rng.random().float(f32);
-                const nx = try g.hostArray(std.mem.sliceAsBytes(next[0 .. n * 16]), &.{ nc, 16 }, .float32);
-                const y = try ex.call(&g, @intCast(layer), xb, try g.hostArray(std.mem.sliceAsBytes(ids32[0 .. n * k]), &.{ nc, k }, .int32), try g.hostArray(std.mem.sliceAsBytes(sc[0 .. n * k]), &.{ nc, k }, .float32), nx, &.{});
-                var got: [9 * 128]f32 = undefined;
-                _ = try g.hostF32(try g.astype(y, .float32), got[0 .. n * h]);
-                try ex.flush();
-                var want: [9 * 128]f32 = undefined;
-                old_quant.hostMoe(img, &b, @intCast(layer), xin[0 .. n * h], ids[0 .. n * k], sc[0 .. n * k], k, want[0 .. n * h]);
-                for (want[0 .. n * h], got[0 .. n * h]) |wv, gv| {
-                    scale = @max(scale, @abs(wv));
-                    worst = @max(worst, @abs(wv - gv));
-                }
-            }
+    // The prompt phase's widths (9 rows: the wide lane; 3 and 1: the decode lane), then the decode phase's 1 to 6.
+    try old_quant.expectStreamedMoe(@This(), "glm53 exl3 quant", s, .{ .kernels = set.ref() }, &.{ 9, 3, 1, 0, 1, 3, 6, 2, 4, 5, 1 }, struct {
+        fn f(scale: f32) f32 {
+            return 2 * selfcheck.bf16Ulp(scale);
         }
-        const stats = st.stats();
-        std.debug.print("glm53 exl3 quant [{s}]: {d} routes, {d} hits, {d} misses, lookahead {d} issued / {d} used\n", .{ if (gated) "event gates" else "host waits", stats.route_calls, stats.expert_cache_hits, stats.expert_cache_misses, stats.spec_issued, stats.claimed });
-        try testing.expect(stats.expert_cache_misses > 0 and stats.transient_loads > 0);
-    }
-    std.debug.print("glm53 exl3 quant: streamed MoE against the host decode, max |delta| {d:.5} at outputs up to {d:.3} ({d:.2} bf16 ulp of the scale)\n", .{ worst, scale, worst / selfcheck.bf16Ulp(scale) });
-    try testing.expect(scale > 0.1);
-    try testing.expect(worst <= 2 * selfcheck.bf16Ulp(scale));
+    }.f);
 }
 
 test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's EXL3 chain agree within bf16 rounding, decode widths 1 to 6 and prompt widths" {

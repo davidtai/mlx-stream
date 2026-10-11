@@ -117,13 +117,6 @@ const n_banks = std.meta.fieldNames(BankKind).len;
 /// lookahead's step), the waves' encode and commit.
 pub const HostSplit = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u64 = 0, wave_ns: u64 = 0 };
 
-/// A monotonic clock for the host split (ns).
-fn nowNs() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.UPTIME_RAW, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
 pub const Options = struct {
     /// The waves wait on the reads' event gates (the stream built with `event`); off: the host waits.
     gated: bool = false,
@@ -560,7 +553,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// The decode lane: the routed outputs `[n, k, hidden]` in routed order.
         fn callDecode(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
             const n_ids = n * k;
-            const t0 = nowNs();
+            const t0 = timeline.now();
             var id_buf: [max_route_ids]u16 = undefined;
             var score_buf: [sdk_ext.expert.lookahead.max_rows * 512]f32 = undefined;
             var sc: []const f32 = &.{};
@@ -570,9 +563,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 sc = try g.hostF32(next_scores.?, score_buf[0 .. n * self.n_experts]);
             }
             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
-            const t1 = nowNs();
+            const t1 = timeline.now();
             const r = try self.stream.route(layer, ids, sc);
-            const t2 = nowNs();
+            const t2 = timeline.now();
             defer self.noteHost(t0, t1, t2);
             var released = false;
             errdefer if (!released) self.stream.release(r);
@@ -643,7 +636,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         fn callDecodeSplit(self: *Self, g: *G, layer: u32, x: T, indices: T, next_scores: ?T, n: u32, k: u32, hoist: []const T) !T {
             const n_ids = n * k;
             const bank = self.stream.bank;
-            const t0 = nowNs();
+            const t0 = timeline.now();
             if (comptime timeline.enabled) timeline.point(layer, .call, self.readGauge(), false);
             var id_buf: [max_route_ids]u16 = undefined;
             var score_buf: [sdk_ext.expert.lookahead.max_rows * 512]f32 = undefined;
@@ -654,7 +647,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 sc = try g.hostF32(next_scores.?, score_buf[0 .. n * self.n_experts]);
             }
             const ids = try g.hostIds(indices, id_buf[0..n_ids]);
-            const t1 = nowNs();
+            const t1 = timeline.now();
             if (comptime timeline.enabled) timeline.point(layer, .barrier, 0, false);
             var sides: [bpl]Side = @splat(.{});
             for (&sides, 0..) |*sd, i| sd.sl = bpl * layer + @as(u32, @intCast(i));
@@ -692,7 +685,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 expert_stream.wavesOf(&r.plan, r.hit_slots[0..r.plan.n_hits], parts[0..r.n_parts], sd.waves[0..sd.n]);
             }
             if (comptime timeline.enabled) timeline.point(layer, .route, 0, false);
-            const t2 = nowNs();
+            const t2 = timeline.now();
             defer self.noteHost(t0, t1, t2);
             var acc: Acc = .{};
             // Every route's hit wave and the hoisted arrays in one commit, ahead of every wait on a read.
@@ -788,7 +781,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
 
         /// A decode-lane call's host split: barrier [t0, t1), routes [t1, t2), waves [t2, now).
         fn noteHost(self: *Self, t0: u64, t1: u64, t2: u64) void {
-            const t3 = nowNs();
+            const t3 = timeline.now();
             self.host.calls += 1;
             self.host.barrier_ns += t1 -| t0;
             self.host.route_ns += t2 -| t1;

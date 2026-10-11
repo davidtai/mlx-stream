@@ -72,6 +72,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             return true;
         }
 
+        /// One slot row of component `c` in `layer`'s slots: the segment of each of a routed id's records, back to back.
+        /// Host rows and MLX rows alike.
+        pub fn rowBytes(layer: *const Layer, c: usize) u64 {
+            return layer.segments[c].length * minisOf(layer);
+        }
+
         pub const HostSlotRows = struct {
             rows: u32,
             row_bytes: [n_components]u64,
@@ -82,9 +88,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var s: HostSlotRows = .{ .rows = rows, .row_bytes = undefined, .banks = undefined };
                 var n: usize = 0;
                 errdefer for (s.banks[0..n]) |b| std.heap.page_allocator.free(b);
-                for (layer.segments, 0..) |seg, c| {
-                    s.row_bytes[c] = seg.length * minisOf(layer);
-                    const bytes = std.math.mul(u64, seg.length, rows) catch return error.OutOfMemory;
+                for (layer.segments, 0..) |_, c| {
+                    s.row_bytes[c] = rowBytes(layer, c);
+                    const bytes = std.math.mul(u64, s.row_bytes[c], rows) catch return error.OutOfMemory;
                     s.banks[c] = try std.heap.page_allocator.alloc(u8, @intCast(bytes));
                     n += 1;
                 }
@@ -140,7 +146,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_zeros(&b.arrays[c], &shape, seg.rank + 1, dtype, stream));
-                    b.row_bytes[c] = seg.length * minisOf(layer);
+                    b.row_bytes[c] = rowBytes(layer, c);
                 }
                 return b;
             }
@@ -156,7 +162,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
                     if (dsv41_alloc_uninit(&b.arrays[c], &shape, seg.rank + 1, dtype) != 0) return error.MlxUnfilledAlloc;
-                    b.row_bytes[c] = seg.length * minisOf(layer);
+                    b.row_bytes[c] = rowBytes(layer, c);
                 }
                 try b.bind();
                 return b;
@@ -800,6 +806,30 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return loc.rows.row(c, loc.row);
             }
 
+            /// Tests: routes `ids` on `layer` with no scores and waits for every part (gate/up first, as the kernels do).
+            pub fn serve(self: *Stream, layer: u32, ids: []const u16) Error!*Route {
+                const r = try self.route(layer, ids, &.{});
+                for (0..r.n_parts) |p| {
+                    try self.waitGu(r, @intCast(p));
+                    try self.waitDown(r, @intCast(p));
+                }
+                return r;
+            }
+
+            /// Tests: each routed id of `r` (`ids`, in plan order) is served from a slot whose rows hold its records'
+            /// segments as `image` (the bank's experts.bin) holds them, each of the id's records at its stride.
+            pub fn expectServed(self: *Stream, r: *const Route, ids: []const u16, image: []const u8) !void {
+                const l = &self.bank.layers[r.layer];
+                for (ids, r.plan.slotsOf()) |e, slot| {
+                    const off = self.bank.recordOffset(r.layer, e);
+                    for (l.segments, 0..) |seg, c| {
+                        const row = self.slotRow(r.layer, slot, @enumFromInt(c));
+                        try std.testing.expectEqual(minisOf(l) * seg.length, row.len);
+                        for (0..minisOf(l)) |mi| try std.testing.expectEqualSlices(u8, image[off + mi * miniStride(l) + seg.offset ..][0..seg.length], row[mi * seg.length ..][0..seg.length]);
+                    }
+                }
+            }
+
             /// The bank holding a layer's slot and the slot's row in it.
             pub fn slotRef(self: *const Stream, layer: u32, slot: u32) SlotRef {
                 const ls = &self.layers[layer];
@@ -1151,11 +1181,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const sel = &self.selector.?;
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
                     var ranks: [expert_lookahead.max_budget]u8 = undefined;
-                    const picked = sel.selectWith(scores, &self.layers[next].policy, struct {
-                        fn f(p: *const LayerPolicy, e: u16) bool {
-                            return p.slotOf(e) != null;
-                        }
-                    }.f, chosen[0..sel.budget], ranks[0..sel.budget]);
+                    const picked = sel.selectWith(scores, &self.layers[next].policy, expert_lookahead.residentIn, chosen[0..sel.budget], ranks[0..sel.budget]);
                     if (self.recorder) |rec| rec.spec(r.rec, picked);
                     for (picked) |e| {
                         bases[n] = @intCast(self.bank.recordOffset(next, e));

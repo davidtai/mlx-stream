@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const bo = @import("build_flags.zig");
+const sdk_ext = @import("sdk_ext.zig");
 
 pub const enabled: bool = if (@hasDecl(bo, "dsv41_decode_timers")) bo.dsv41_decode_timers else false;
 
@@ -46,14 +47,9 @@ pub var ns: [n_buckets]u64 = @splat(0);
 pub var cycles: u64 = 0;
 pub var routed_calls: u64 = 0;
 
-pub const Stamp = if (enabled) u64 else void;
-
-pub inline fn now() Stamp {
-    if (comptime !enabled) return {};
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+const clock = sdk_ext.profile.Clock(enabled);
+pub const Stamp = clock.Stamp;
+pub const now = clock.now;
 
 /// Charge the time since `t0` to `b`; returns now (the next span's start).
 pub inline fn charge(b: Bucket, t0: Stamp) Stamp {

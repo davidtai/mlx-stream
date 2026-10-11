@@ -26,6 +26,8 @@ pub const Event = event.Event;
 pub const policy = @import("expert/policy.zig");
 /// The expert stream over a bank module (`assertBank`): slot rows, routes, residency, reads, lookahead, gates, release.
 pub const stream = @import("expert/stream.zig");
+/// A bank's open around its own manifest rules: the manifest read, the sidecar opened for the reader, the peek.
+pub const bank_file = @import("expert/bank_file.zig");
 /// The lookahead selector: the next routed layer's predicted records, chosen by score over its router rows.
 pub const lookahead = @import("expert/lookahead.zig");
 /// The route recorder (a diagnostic): one request's decode routes, what served each id, and the handover's residents.
@@ -135,6 +137,21 @@ pub const Stats = struct {
     /// Prompt records copied from a transient row into a resident's row (`Stream.promote`) and their bytes.
     promoted: u64 = 0,
     promoted_bytes: u64 = 0,
+
+    /// The counters since `prev`, an earlier snapshot of the same stream: each field's difference, at least zero.
+    pub fn since(s: Stats, prev: Stats) Stats {
+        var d: Stats = .{};
+        inline for (@typeInfo(Stats).@"struct".field_names) |name| {
+            const now = @field(s, name);
+            const then = @field(prev, name);
+            @field(d, name) = switch (@TypeOf(now)) {
+                u64 => now -| then,
+                f64 => @max(now - then, 0),
+                else => @compileError("Stats." ++ name ++ ": a counter is u64 or f64"),
+            };
+        }
+        return d;
+    }
 };
 
 /// One layer's routes so far, every phase: the unique experts per route that were resident / had to be loaded.
@@ -279,6 +296,20 @@ fn expectMethod(comptime S: type, comptime name: []const u8, comptime params: []
 }
 
 const testing = std.testing;
+
+test "sdk expert: Stats.since is each counter's difference, at least zero" {
+    const s0: Stats = .{ .route_calls = 3, .expert_bytes_read = 100, .expert_read_seconds = 0.25, .spec_issued = 9 };
+    const s1: Stats = .{ .route_calls = 10, .expert_bytes_read = 4196, .expert_read_seconds = 1.0, .spec_issued = 2, .promoted = 5 };
+    const d = s1.since(s0);
+    try testing.expectEqual(@as(u64, 7), d.route_calls);
+    try testing.expectEqual(@as(u64, 4096), d.expert_bytes_read);
+    try testing.expectEqual(@as(f64, 0.75), d.expert_read_seconds);
+    try testing.expectEqual(@as(u64, 5), d.promoted);
+    // A counter below its earlier snapshot (a new stream's) gives zero, not a wrap.
+    try testing.expectEqual(@as(u64, 0), d.spec_issued);
+    try testing.expectEqual(@as(f64, 0), s0.since(s1).expert_read_seconds);
+    try testing.expectEqual(Stats{}, s1.since(s1));
+}
 
 test "sdk expert: one reader per process: a second taker is refused by name until the first gives it back" {
     try takeReader();

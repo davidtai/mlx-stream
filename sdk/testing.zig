@@ -78,6 +78,47 @@ pub fn expectBillBoundsLoad(comptime A: type, gpa: std.mem.Allocator, io: std.Io
     try std.testing.expectEqual(try A.loadBytes(gpa, io, cfg, facts, req.ceiling), mb.processBound(floor));
 }
 
+// ── Fixture files (cpu) ──
+
+/// A test directory's absolute path, in `buf` (a bank or a loader opens absolute paths only).
+pub fn tmpRoot(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
+    return buf[0..try tmp.dir.realPath(std.testing.io, buf)];
+}
+
+/// One tensor of a fixture safetensors file: its name, the file's name for its dtype, its shape and its `len` bytes
+/// (`bytes`, else zeros).
+pub const StTensor = struct { name: []const u8, dtype: []const u8, shape: []const u64, len: u64, bytes: ?[]const u8 = null };
+
+/// A safetensors image of `tensors` in order: the 8-byte little-endian header length, the JSON header, the data.
+/// `metadata` adds mlx-lm's `"__metadata__":{"format":"mlx"}`; `pad` pads the header with spaces to a multiple of 8.
+/// Caller frees.
+pub fn safetensors(a: std.mem.Allocator, tensors: []const StTensor, opts: struct { metadata: bool = false, pad: bool = false }) ![]u8 {
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(a);
+    try hdr.append(a, '{');
+    if (opts.metadata) try hdr.appendSlice(a, "\"__metadata__\":{\"format\":\"mlx\"}");
+    var off: u64 = 0;
+    for (tensors, 0..) |t, i| {
+        if (i > 0 or opts.metadata) try hdr.append(a, ',');
+        try hdr.print(a, "\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[", .{ t.name, t.dtype });
+        for (t.shape, 0..) |d, k| try hdr.print(a, "{s}{d}", .{ if (k == 0) "" else ",", d });
+        try hdr.print(a, "],\"data_offsets\":[{d},{d}]}}", .{ off, off + t.len });
+        off += t.len;
+    }
+    try hdr.append(a, '}');
+    if (opts.pad) while (hdr.items.len % 8 != 0) try hdr.append(a, ' ');
+    const file = try a.alloc(u8, @intCast(8 + hdr.items.len + off));
+    @memset(file, 0);
+    std.mem.writeInt(u64, file[0..8], hdr.items.len, .little);
+    @memcpy(file[8..][0..hdr.items.len], hdr.items);
+    var at = 8 + hdr.items.len;
+    for (tensors) |t| {
+        if (t.bytes) |b| @memcpy(file[at..][0..b.len], b);
+        at += @intCast(t.len);
+    }
+    return file;
+}
+
 // ── Fakes for the host's tests (cpu) ──
 
 pub const FakeOptions = struct {
