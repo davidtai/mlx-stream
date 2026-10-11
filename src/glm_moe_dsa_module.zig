@@ -583,6 +583,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                     return e;
                 };
                 line.bill_rows = try bill_mod.requestRows(self.gpa, self.inputs, cap, box.others, target, max_units);
+                // The bill at the request's inputs in bytes (the receipts rebuild its units from them).
+                log.info("glm_moe_dsa: bill at the request: {d} positions beside {d} B of the rest of the box, target {d} B: {d} units\n", .{ cap, box.others, target, line.bill_rows.? });
                 line.rows = @max(@min(line.live_rows.?, line.bill_rows.?), self.prompt_units);
                 line.bound = live.total(line.rows);
                 line.mlx_bound = live.mlxAt(line.rows);

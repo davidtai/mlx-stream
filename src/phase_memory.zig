@@ -329,6 +329,47 @@ test "phase memory: wire tables bill 24 B a page, 16 B per 32 MiB and per 64 GiB
     try testing.expect(wireTables(91_398_000_000 + 532_623_360) <= wireTables(91_398_000_000) + wireTables(532_623_360));
 }
 
+test "phase memory: the settle reads until its condition holds, clears a late cache, and stops at its wait" {
+    const Cond = struct {
+        bound: u64,
+        pub fn ok(c: @This(), m: Ledgers) bool {
+            return m.cache == 0 and m.footprint <= c.bound;
+        }
+    };
+    var i: usize = 0;
+    var slept: u32 = 0;
+    var clears: u32 = 0;
+    const readings = [_]Ledgers{ .{ .cache = 4096, .footprint = 100 }, .{ .footprint = 100 }, .{ .footprint = 90 } };
+    const st = settle(FakeReader(Ledgers){ .readings = &readings, .i = &i, .slept_ms = &slept, .clears = &clears }, settle_poll_ms, settle_max_ms, Cond{ .bound = 90 });
+    try testing.expect(st.settled);
+    try testing.expectEqual(@as(u32, 2 * settle_poll_ms), st.waited_ms);
+    try testing.expectEqual(@as(u32, 1), clears);
+    i = 0;
+    slept = 0;
+    const never = settle(FakeReader(Ledgers){ .readings = readings[0..1], .i = &i, .slept_ms = &slept }, settle_poll_ms, settle_max_ms, Cond{ .bound = 90 });
+    try testing.expect(!never.settled);
+    try testing.expectEqual(settle_max_ms, never.waited_ms);
+}
+
+test "phase memory: the construction check bills the construction terms at the prompt rows and bounds the measured host side" {
+    const terms = [_]sdk.MemoryBill.Term{
+        .{ .name = "residents", .bytes = .{ 100, 100 }, .at_construction = true },
+        .{ .name = "host side", .bytes = .{ 30, 30 }, .at_construction = true, .measured = true, .construction = 20 },
+    };
+    const mb: sdk.MemoryBill = .{ .terms = &terms, .per_row = 10 };
+    var c = Construction.of(mb, 3, 140, 100, 0);
+    try testing.expectEqual(@as(u64, 150), c.billed);
+    try testing.expectEqual(@as(i64, 10), c.residual());
+    try c.checkFootprint(0);
+    // A host side of 40 B, 15 B of it a term billed by construction: 25 B over the measured bound of 20.
+    c.host_known = 15;
+    try testing.expectEqual(@as(u64, 25), c.measuredHost());
+    try testing.expectEqualStrings("host side", c.overMeasured(mb).?.name);
+    c.host_known = 20;
+    try testing.expect(c.overMeasured(mb) == null);
+    try testing.expectError(error.ConstructionOverBill, Construction.of(mb, 3, 151, 100, 0).checkFootprint(0));
+}
+
 test "phase memory: a record's residuals are the billed process less the footprint's high-water mark, the device terms less MLX's peak" {
     const T = struct { a: u64 = 0, b: u64 = 0 };
     const t: T = .{ .a = 7, .b = 5 };
