@@ -438,7 +438,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             ticket: u32 = 0,
             n_reads: u32 = 0,
             settled: bool = false,
+            /// PROFILE builds: its jobs' submit time (the pool's clock), for the read log (`readLog`).
+            submit_ns: i64 = 0,
         };
+
+        /// PROFILE builds' read log: per demand job (each record's gate/up and down) its `expert_io.ReadRec`.
+        pub const ReadRec = expert_io.ReadRec;
+        pub const read_log_on = @import("sdk").plugin_profile;
 
         pub const Route = struct {
             layer: u32 = 0,
@@ -557,6 +563,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             n_ahead_pending: u8 = 0,
             ahead_pending_layer: u32 = 0,
             by_rank: ByRank = @splat(@splat(.{ 0, 0 })),
+            /// PROFILE builds' read log (`ReadRec`), this decode's (`clearReadLog` at its handover).
+            read_log: if (read_log_on) std.ArrayList(ReadRec) else void = if (read_log_on) .empty else {},
             preread: bool = false,
             /// Decode layer calls so far; a call's pre-reads and speculative records
             /// carry its tag, settled by its own step.
@@ -754,6 +762,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn deinit(self: *Stream) void {
                 const a = self.allocator;
                 self.pool.stop();
+                if (comptime read_log_on) self.read_log.deinit(a);
                 for (self.layers) |*ls| {
                     ls.policy.deinit(a);
                     ls.base.deinit();
@@ -1131,6 +1140,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.n_ahead_pending = 0;
             }
 
+            /// PROFILE builds: this decode's demand jobs (`ReadRec`), empty in every other build.
+            pub fn readLog(self: *const Stream) []const ReadRec {
+                return if (comptime read_log_on) self.read_log.items else &.{};
+            }
+
+            pub fn clearReadLog(self: *Stream) void {
+                if (comptime read_log_on) self.read_log.clearRetainingCapacity();
+            }
+
             /// The lookahead's records read ahead and of them those the target call routed, per bank layer of a routed
             /// layer and top-k position.
             pub fn lookaheadByRank(self: *const Stream) ByRank {
@@ -1304,6 +1322,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         nr = self.entries(r.layer, l.slot, l.expert, &rows, &gu, &down, nr);
                     }
                     if (nr > 0) {
+                        if (comptime read_log_on) part.submit_ns = expert_io.Pool.nowNs();
                         part.ticket = B.Records.submit(self.pool, bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &ls.lens) catch |e| return self.fail(e);
                         part.n_reads = nr;
                     } else part.settled = true;
@@ -1368,6 +1387,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         self.counters.expert_bytes_read += @intCast(@max(res.payload, 0));
                         self.counters.preadv_calls += @intCast(@max(res.preadv_calls, 0));
                         self.noteRead(res);
+                        if (comptime read_log_on) if (self.phase == .decode) self.read_log.append(self.allocator, .{ .layer = if (comptime multi_bank) r.layer / B.banks_per_layer else r.layer, .read = @intFromBool(res.preadv_calls > 0), .submit_ns = p.submit_ns, .start_ns = res.t_start_ns, .end_ns = res.t_end_ns }) catch {};
                     }
                 }
                 p.settled = true;
