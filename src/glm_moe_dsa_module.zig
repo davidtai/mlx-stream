@@ -42,6 +42,7 @@ const exl3_quant = @import("glm_moe_dsa_exl3_quant.zig");
 /// request's end (`VERIFY_GPU_TIMELINE`); every other build compiles it out.
 const timeline = @import("dsv41_verify_timeline.zig");
 const prefill_timers = @import("glm_moe_dsa_prefill_timers.zig");
+const phase_mem = @import("phase_memory.zig");
 
 const G = graph.G;
 const Stats = sdk_ext.expert.Stats;
@@ -53,16 +54,19 @@ pub const lookahead: struct { k: u32 = 8 } = .{};
 pub const event_watchdog_ms: u32 = 2000;
 /// The chunk-major prompt pass's chunk (`layer_major_prefill` off).
 pub const prefill_chunk_tokens: u32 = 2048;
-/// How far the constructed footprint may sit above the bill's construction terms (DeepSeek-V4.1's
-/// `construction_tolerance_bytes`: the ledger's page rounding and the host side's own movement).
-pub const construction_tolerance_bytes: u64 = 250_000_000;
-/// A phase change's settle: the footprint read every `settle_poll_ms` until it shows the frees (within
-/// `settle_tolerance_bytes`), at most `settle_max_ms`; the grow then reads the last reading.
-pub const settle_poll_ms: u32 = 5;
-pub const settle_max_ms: u32 = 10_000;
-pub const settle_tolerance_bytes: u64 = 250_000_000;
+/// How far the constructed footprint may sit above the bill's construction terms (the ledger's page rounding and the
+/// host side's own movement; `phase_memory`'s, shared with DeepSeek-V4.1's module).
+pub const construction_tolerance_bytes = phase_mem.construction_tolerance_bytes;
+/// A phase change's settle (`phase_memory.settle`, shared with DeepSeek-V4.1's module): the footprint read every
+/// `settle_poll_ms` until it shows the frees (within `settle_tolerance_bytes`), at most `settle_max_ms`; the grow then
+/// reads the last reading.
+pub const settle_poll_ms = phase_mem.settle_poll_ms;
+pub const settle_max_ms = phase_mem.settle_max_ms;
+pub const settle_tolerance_bytes = phase_mem.settle_tolerance_bytes;
 /// The route recorder's diagnostic switch (`expert.routes`), read once at construction.
 pub const routes_env = "GLM53_ROUTES";
+/// The wave probe's diagnostic switch (`graph.WaveProbe`), read once at construction.
+pub const wave_probe_env = "GLM53_WAVE_PROBE";
 
 /// What the host hands the construction: the GPU ceiling and the wired margin (`LoadCtx`), never read elsewhere.
 pub const Host = struct { ceiling: u64, wired_margin: u64 };
@@ -158,6 +162,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// The bill's inputs (the handover bills its request's KV from them), the load's baseline, MLX's target (the
         /// host's ceiling less its wired margin) and the box's RAM (the handover's target, `bill.targetOf`).
         inputs: bill_mod.Inputs,
+        /// The construction's bill, rows-free (`bill.Bill`): the phase records' billed terms, the cache limits the module
+        /// installs, the settle's host-side bound.
+        billed: bill_mod.Bill,
         baseline: u64,
         gpu_target: u64,
         ram: u64,
@@ -179,6 +186,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// The route recorder (`routes_env`; null: off) and the directory its files go to.
         recorder: ?*expert_routes.Recorder = null,
         routes_dir: []const u8 = "",
+        /// The box's file-backed pages when the construction started: each phase record's page cache is counted from them.
+        file_backed_start: u64 = 0,
+        /// The wave probe (`wave_probe_env`; null: off).
+        probe: ?*graph.WaveProbe = null,
+        /// The positions the request's KV lanes hold since its handover (its decode terms' KV).
+        decode_positions: u64 = 0,
 
         const DecodeMark = struct { s0: Stats, mem0: Mem, by0: Bk.Stream.ByRank, steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0 };
 
@@ -190,12 +203,13 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             try cfg.checkCtxSize();
             try cfg.checkMaxOutput();
             try cfg.checkMtp();
+            const file_backed_start = sdk.memory.vmBytes().external;
             const dir = cfg.model_dir orelse return error.GlmPackDir;
             const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
             var diag: glm.Diag = .{};
             errdefer if (diag.len > 0) log.err("glm_moe_dsa: load refused: {s}\n", .{diag.message()});
             // The pack, host-side, before any slot bank: the residents against the spec, the bank's manifest.
-            const resident_bytes = try glm.residentBytes(gpa, io, dir, model, &diag);
+            const resident_bytes = try glm.residentBufferBytes(gpa, io, dir, model, std.heap.pageSize(), &diag);
             var bank = try Bk.Bank.open(gpa, io, dir, model, &diag);
             errdefer bank.deinit();
             // The admission: the prompt phase billed at the context, decode at the longest request (the context and
@@ -206,7 +220,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             // The prompt's attention form this device runs (the bill charges its arrays).
             const dsa = try graph.dsaKernelsRun(gpa, s, model);
             const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag), .dsa = dsa, .prompt_cache = bill_mod.prefillCacheBytes(ram) };
-            const mb = try bill_mod.memoryBill(gpa, bill_mod.termsOf(inputs));
+            const billed = bill_mod.billOf(inputs);
+            const mb = try bill_mod.memoryBill(gpa, billed);
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
             const target = bill_mod.targetOf(gpu_target, ram, baseline);
@@ -226,7 +241,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
+            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .billed = billed, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
             errdefer self.g.deinit();
             // The module owns its config's copy (the host's config keeps the parsed model's storage).
             self.model = if (self.cfg.model) |*m| m else unreachable;
@@ -267,7 +282,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .slot_memory = .{ .mlx = s },
                 .staging_from_bank = true,
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
-                .pool = .{ .workers = shape.workers, .tickets = 1024 * Bk.Stream.maxMinis(&self.bank), .direct = true },
+                .pool = .{ .workers = shape.workers, .tickets = bill_mod.pool_tickets_per_mini * Bk.Stream.maxMinis(&self.bank), .direct = true },
                 .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
                 .keep_residents = true,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
@@ -292,6 +307,15 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             errdefer self.cache.deinit(&self.g);
             if (cfg.mtpDepth() > 0) self.mtp = try Lane.open(gpa, io, &self.g, dir, model, cfg.mtpDepth(), cfg.mtpAcceptance(), @intCast(max_context), cfg.nocache_weights orelse true, &diag);
             errdefer if (self.mtp) |ln| ln.deinit(&self.g);
+            // The lane's open measured what it holds (the DeepSeek-V4.1 way: a measured install against its billed term).
+            if (self.mtp) |ln| {
+                const term = self.billed.phases[@intFromEnum(bill_mod.Phase.prompt)].mtp_residents;
+                log.info("glm_moe_dsa: MTP lane: {d} B measured at its open, {d} B billed, residual {d} B\n", .{ ln.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(ln.measured_bytes)) });
+                if (ln.measured_bytes > term) {
+                    log.err("glm_moe_dsa: load refused: the MTP lane holds {d} B, over its billed {d} B (ConstructionOverBill)\n", .{ ln.measured_bytes, term });
+                    return error.ConstructionOverBill;
+                }
+            }
             // The prompt rows filled before the first request, each bank layer's in expert order (a long prompt routes
             // nearly every expert, so any filled row is a hit); a later request finds its predecessor's residents
             // (`keep_residents`).
@@ -303,31 +327,73 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const pre_ns: u64 = @intCast(t_pre.untilNow(io, .awake).nanoseconds);
             log.info("glm_moe_dsa: preloaded {d} experts ({d:.2} GB) into the prompt rows in {d:.2} s\n", .{ preloaded, gigabytes(Reads.of(pre0, self.stream.stats()).ssd_bytes), seconds(pre_ns) });
             self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa };
+            self.file_backed_start = file_backed_start;
+            if (std.c.getenv(wave_probe_env) != null) {
+                self.probe = try gpa.create(graph.WaveProbe);
+                self.probe.?.* = .{};
+                self.routes.wave_probe = self.probe;
+                log.info("glm_moe_dsa: {s} is set: each prompt layer's MLX peak by stage is logged at the pass's end\n", .{wave_probe_env});
+            }
+            errdefer if (self.probe) |p| gpa.destroy(p);
             self.g.clearCache();
-            _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, self.inputs.prompt_cache);
+            _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, self.cacheLimit(.prompt));
             log.info("glm_moe_dsa: constructed ({d} routed layers, {d} experts, record {d} B, expert reads {s}, prompt {s}, prompt attention {s}, decode window {d} rows)\n", .{ n_bank, self.bank.n_experts, self.bank.geometryOf().widest_record, if (gated) "event gates" else "host waits", if (cfg.layerMajor()) "layer by layer" else "chunk by chunk", if (self.routes.dsa) "on the DSA kernels" else "in the reference's form", shape.decode_window_rows });
             try self.checkConstruction(rows.prompt);
+            self.phaseRecord("module constructed", self.billed.terms(.construction, self.prompt_units), null);
             return self;
         }
 
         /// Once, at construction (every command retired, MLX's cache cleared): the footprint within
-        /// `construction_tolerance_bytes` of the bill's construction terms at the prompt rows, and the host side within
-        /// its measured bound; refused by name (`ConstructionOverBill`).
+        /// `construction_tolerance_bytes` of the bill's construction terms at the prompt rows, and the host side past the
+        /// read pool's staging within its measured bound; refused by name (`ConstructionOverBill`). The arithmetic is
+        /// `phase_memory.Construction`'s (DeepSeek-V4.1's module's too).
         fn checkConstruction(self: *Self, prompt_rows: u32) !void {
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
             const m = Mem.now();
             const box = Box.now(m);
-            const billed = self.bill.constructionBytes(prompt_rows);
-            log.info("glm_moe_dsa: construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (tolerance {d} B); the box {d} B used, the rest of it {d} B (the load's baseline {d} B)\n", .{ m.footprint, m.active, m.cache, m.hostSide(), billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(m.footprint)), construction_tolerance_bytes, box.used, box.others, self.baseline });
-            sdk.checkConstruction(billed, m.footprint, construction_tolerance_bytes) catch |e| {
-                log.err("glm_moe_dsa: load refused: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B ({s})\n", .{ m.footprint, billed, construction_tolerance_bytes, @errorName(e) });
+            var cc = phase_mem.Construction.of(self.bill, prompt_rows, m.footprint, m.active, m.cache);
+            cc.host_known = self.billed.phases[@intFromEnum(bill_mod.Phase.construction)].pool_staging;
+            log.info("glm_moe_dsa: construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (tolerance {d} B); the box {d} B used, the rest of it {d} B (the load's baseline {d} B)\n", .{ m.footprint, m.active, m.cache, m.hostSide(), cc.billed, cc.residual(), construction_tolerance_bytes, box.used, box.others, self.baseline });
+            cc.checkFootprint(construction_tolerance_bytes) catch |e| {
+                log.err("glm_moe_dsa: load refused: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B ({s})\n", .{ m.footprint, cc.billed, construction_tolerance_bytes, @errorName(e) });
                 return e;
             };
-            for (self.bill.terms) |t| if (t.measured) sdk.checkMeasured(t, m.hostSide()) catch |e| {
-                log.err("glm_moe_dsa: load refused: the {s} {d} B exceeds its billed bound {d} B ({s})\n", .{ t.name, m.hostSide(), t.atConstruction(), @errorName(e) });
-                return e;
-            };
+            if (cc.overMeasured(self.bill)) |t| {
+                log.err("glm_moe_dsa: load refused: the {s} {d} B exceeds its billed bound {d} B (ConstructionOverBill)\n", .{ t.name, cc.measuredHost(), t.atConstruction() });
+                return error.ConstructionOverBill;
+            }
+        }
+
+        /// The request's decode terms at its grown units: the bill at its own KV (`bill.atRequest`).
+        fn requestTerms(self: *const Self) bill_mod.PhaseTerms {
+            return bill_mod.atRequest(self.inputs, self.decode_positions).terms(.decode, self.decode_units);
+        }
+
+        /// The MLX cache limit the module installs for `phase` (the bill's own term: one value for both).
+        fn cacheLimit(self: *const Self, phase: bill_mod.Phase) usize {
+            return @intCast(self.billed.phases[@intFromEnum(phase)].mlx_cache);
+        }
+
+        /// The settle's bound on the host side after a phase change's frees: the prompt phase's host terms (the read
+        /// pool's staging and the measured rest).
+        fn hostBound(self: *const Self) u64 {
+            const p = self.billed.phases[@intFromEnum(bill_mod.Phase.prompt)];
+            return p.pool_staging + p.host_side;
+        }
+
+        /// One phase boundary's record (`phase_memory.Record` over the bill's terms `billed`), logged as one JSON line;
+        /// then both high-water marks restart for the next phase. `peak`: MLX's peak over the phase when the wave probe
+        /// restarted it within the phase (the probe's own).
+        fn phaseRecord(self: *Self, phase: []const u8, billed: bill_mod.PhaseTerms, peak: ?u64) void {
+            var r = phase_mem.Reading.now();
+            if (peak) |p| r.peak = @max(r.peak, p);
+            phase_mem.restart();
+            const rec = phase_mem.recordAt(bill_mod.PhaseTerms, phase, billed, billed.sum(), billed.device(), r, self.file_backed_start);
+            var buf: [4096]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&buf);
+            const json = phase_mem.jsonOf(fba.allocator(), rec) catch return;
+            log.info("glm_moe_dsa: phase memory {s}\n", .{json});
         }
 
         /// Every KV lane (the target's and the draft lane's) bounded at `cap` positions (`Cache.resize`).
@@ -359,6 +425,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.gpa.free(self.layer_counts1);
             self.gpa.free(self.layer_rates);
             self.bill.free(self.gpa);
+            if (self.probe) |p| self.gpa.destroy(p);
             self.g.deinit();
             var prev: usize = 0;
             _ = mlx.mlx_set_cache_limit(&prev, self.prev_cache_limit);
@@ -430,6 +497,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_synchronize(self.g.s);
             log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .mem = .{ .start = mem0, .end = Mem.now() } }});
             prefill_timers.report(ids.len);
+            if (self.probe) |p| log.info("glm_moe_dsa: wave probe {f}\n", .{p.*});
+            self.phaseRecord("prompt pass", self.billed.terms(.prompt, self.prompt_units), if (self.probe) |p| p.passPeak() else null);
             return logits.?;
         }
 
@@ -472,17 +541,17 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var prev: usize = 0;
             errdefer {
                 _ = self.ex.regrowTransient() catch {};
-                _ = mlx.mlx_set_cache_limit(&prev, self.inputs.prompt_cache);
+                _ = mlx.mlx_set_cache_limit(&prev, self.cacheLimit(.prompt));
             }
             self.g.clearCache();
-            _ = mlx.mlx_set_cache_limit(&prev, bill_mod.decode_cache_bytes);
+            _ = mlx.mlx_set_cache_limit(&prev, self.cacheLimit(.decode));
             const cap: u32 = @intCast(@min(bill_mod.decodeCap(&self.cfg, @max(h.reserved_tokens, self.cache.len)), self.max_positions));
             const kv0 = self.kvAllocated();
             try self.resizeKv(cap);
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
             const kv1 = self.kvAllocated();
-            const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + transient + kv0), bill_mod.host_side_bytes);
+            const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + transient + kv0), self.hostBound());
             const box = Box.now(st.after);
             // The box's target beside the rest of the box as it stands now (not the load's baseline, an older reading of
             // it), for the live reading and the bill at the request alike.
@@ -507,7 +576,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             try self.ex.grow(self.decode_rows);
             line.grown = Mem.now();
             log.info("{f}\n", .{line});
-            startPhase();
+            self.decode_positions = cap;
+            self.phaseRecord("handover", self.requestTerms(), null);
             self.decoding = true;
             if (comptime timeline.enabled) if (self.mtp != null) {
                 // The timeline's storage holds DeepSeek-V4.1's 64 layers: GLM-5.3's first 64 routed layers are stamped (the
@@ -551,6 +621,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .mem = .{ .start = d.mem0, .end = end },
                 .box = Box.now(end),
             }});
+            self.phaseRecord("decode", self.requestTerms(), null);
             log.info("{f}\n", .{HostLine{ .h = self.ex.host, .wall_ns = d.wall_ns }});
             const by1 = self.stream.lookaheadByRank();
             log.info("{f}\n", .{PrecisionLine{ .by0 = &d.by0, .by1 = &by1 }});
@@ -588,10 +659,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
             const kv1 = self.kvAllocated();
-            const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + freed + kv0), bill_mod.host_side_bytes);
+            const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + freed + kv0), self.hostBound());
             _ = try self.ex.regrowTransient();
             var prev: usize = 0;
-            _ = mlx.mlx_set_cache_limit(&prev, self.inputs.prompt_cache);
+            _ = mlx.mlx_set_cache_limit(&prev, self.cacheLimit(.prompt));
             self.decoding = false;
             log.info("glm_moe_dsa: reverse: footprint {d:.3} GB before the frees, {d:.3} GB after ({s} in {d} ms), KV at {d} positions {d:.3} GB, {d} rows per layer\n", .{ gigabytes(before.footprint), gigabytes(st.after.footprint), if (st.settled) "settled" else "not settled", st.waited_ms, positions, gigabytes(kv1), self.prompt_units });
         }
@@ -694,32 +765,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
     };
 }
 
-/// MLX's allocator and this process's footprint at a boundary (MLX's counters, the kernel's ledgers).
-pub const Mem = struct {
-    active: u64 = 0,
-    cache: u64 = 0,
-    /// MLX's peak active bytes since the phase's start (`startPhase`).
-    peak: u64 = 0,
-    footprint: u64 = 0,
-    /// The footprint's high-water mark since the phase's start.
-    footprint_peak: u64 = 0,
-
-    pub fn now() Mem {
-        var active: usize = 0;
-        var cache: usize = 0;
-        var peak: usize = 0;
-        _ = mlx.mlx_get_active_memory(&active);
-        _ = mlx.mlx_get_cache_memory(&cache);
-        _ = mlx.mlx_get_peak_memory(&peak);
-        const pm = sdk.memory.processMemory();
-        return .{ .active = active, .cache = cache, .peak = @max(peak, active), .footprint = pm.footprint, .footprint_peak = @max(pm.footprint_interval_peak, pm.footprint) };
-    }
-
-    /// The footprint less MLX's active and cache: the read pool, the tables, the server and the process.
-    pub fn hostSide(m: Mem) u64 {
-        return m.footprint -| m.active -| m.cache;
-    }
-};
+/// MLX's allocator and this process's footprint at a boundary (MLX's counters, the kernel's ledgers:
+/// `phase_memory.Ledgers`, the shared reading).
+pub const Mem = phase_mem.Ledgers;
 
 /// The box's used memory beside this process's (`sdk.memory.boxUsedBytes`, read right after `mem`): what the rest of
 /// the box holds is the used memory less this process's footprint and the page tables of its MLX bytes.
@@ -733,51 +781,28 @@ pub const Box = struct {
     }
 };
 
-/// A phase's start: MLX's peak and the footprint's interval peak restarted.
-pub fn startPhase() void {
-    _ = mlx.mlx_reset_peak_memory();
-    sdk.memory.startFootprintInterval();
-}
+/// A phase's start: MLX's peak and the footprint's interval peak restarted (`phase_memory.restart`).
+pub const startPhase = phase_mem.restart;
 
-/// The live boundary reader (`settle`): MLX's counters and the footprint; waits on the host's io.
-const LiveReader = struct {
-    io: std.Io,
+/// The live boundary reader (`settle`): MLX's counters and the footprint; waits on the host's io
+/// (`phase_memory.LiveReader`, shared with DeepSeek-V4.1's module).
+const LiveReader = phase_mem.LiveReader(Mem);
 
-    fn now(_: LiveReader) Mem {
-        return Mem.now();
-    }
-
-    fn sleep(r: LiveReader, ms: u32) void {
-        std.Io.sleep(r.io, .fromMilliseconds(ms), .awake) catch {};
-    }
-
-    /// A buffer that reached MLX's cache after the boundary's clear (a command's temporaries dropped at its
-    /// completion) goes back to the system before the next reading.
-    fn clearCache(_: LiveReader) void {
-        _ = mlx.mlx_clear_cache();
-    }
-};
-
-/// After a phase change's frees (DeepSeek-V4.1's settle): `reader` read every `settle_poll_ms` until MLX's cache is
-/// empty, the footprint is at most `expected` (the reading before the frees, less them, plus what the change allocated)
-/// and the host side at most `host_bound` (freed GPU pages the kernel has not reclaimed yet count there: m2's second
-/// handover read 6.97 GB), each within `settle_tolerance_bytes`, at most `settle_max_ms`: the footprint's ledger can
-/// trail a release while the driver retires it. The last reading either way; `settled` says which.
-pub fn settle(reader: anytype, expected: u64, host_bound: u64) struct { after: Mem, waited_ms: u32, settled: bool } {
-    const ok = struct {
-        fn f(m: Mem, e: u64, h: u64) bool {
-            return m.cache == 0 and m.footprint <= e + settle_tolerance_bytes and m.hostSide() <= h + settle_tolerance_bytes;
+/// After a phase change's frees: `reader` read every `settle_poll_ms` until MLX's cache is empty, the footprint is at
+/// most `expected` (the reading before the frees, less them, plus what the change allocated) and the host side at most
+/// `host_bound` (freed GPU pages the kernel has not reclaimed yet count there: m2's second handover read 6.97 GB), each
+/// within `settle_tolerance_bytes`, at most `settle_max_ms`: the footprint's ledger can trail a release while the driver
+/// retires it. The loop is `phase_memory.settle` (DeepSeek-V4.1's module's too); the condition is this module's. The last
+/// reading either way; `settled` says which (the handover logs "not settled" and goes on).
+pub fn settle(reader: anytype, expected: u64, host_bound: u64) phase_mem.Settled(Mem) {
+    const Cond = struct {
+        expected: u64,
+        host_bound: u64,
+        pub fn ok(c: @This(), m: Mem) bool {
+            return m.cache == 0 and m.footprint <= c.expected + settle_tolerance_bytes and m.hostSide() <= c.host_bound + settle_tolerance_bytes;
         }
-    }.f;
-    var m = reader.now();
-    var waited: u32 = 0;
-    while (!ok(m, expected, host_bound) and waited < settle_max_ms) {
-        if (m.cache != 0) reader.clearCache();
-        reader.sleep(settle_poll_ms);
-        waited += settle_poll_ms;
-        m = reader.now();
-    }
-    return .{ .after = m, .waited_ms = waited, .settled = ok(m, expected, host_bound) };
+    };
+    return phase_mem.settle(reader, settle_poll_ms, settle_max_ms, Cond{ .expected = expected, .host_bound = host_bound });
 }
 
 /// A phase's memory between its start and its end readings (a prompt pass, a request's decode).
@@ -1193,29 +1218,13 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
 }
 
 test "glm handover: the settle reads until the cache is empty and the footprint shows the frees, at most its wait" {
-    const Fake = struct {
-        readings: []const Mem,
-        i: *usize,
-        slept: *u32,
-        cleared: *u32,
-        fn now(f: @This()) Mem {
-            const m = f.readings[@min(f.i.*, f.readings.len - 1)];
-            f.i.* += 1;
-            return m;
-        }
-        fn sleep(f: @This(), ms: u32) void {
-            f.slept.* += ms;
-        }
-        fn clearCache(f: @This()) void {
-            f.cleared.* += 1;
-        }
-    };
+    const Fake = phase_mem.FakeReader(Mem);
     var i: usize = 0;
     var slept: u32 = 0;
     var cleared: u32 = 0;
     // A late buffer in the cache, then the footprint trailing the frees, then settled.
     const lagging = [_]Mem{ .{ .cache = 4096, .active = 89_000_000_000, .footprint = 100_000_000_000 }, .{ .active = 89_000_000_000, .footprint = 100_000_000_000 }, .{ .active = 89_000_000_000, .footprint = 90_100_000_000 } };
-    const st = settle(Fake{ .readings = &lagging, .i = &i, .slept = &slept, .cleared = &cleared }, 90_000_000_000, 1_250_000_000);
+    const st = settle(Fake{ .readings = &lagging, .i = &i, .slept_ms = &slept, .clears = &cleared }, 90_000_000_000, 1_250_000_000);
     try testing.expect(st.settled);
     try testing.expectEqual(@as(u32, 2 * settle_poll_ms), st.waited_ms);
     try testing.expectEqual(@as(u32, 1), cleared);
@@ -1224,7 +1233,7 @@ test "glm handover: the settle reads until the cache is empty and the footprint 
     i = 0;
     slept = 0;
     const unreclaimed = [_]Mem{ .{ .active = 80_000_000_000, .footprint = 87_000_000_000 }, .{ .active = 80_000_000_000, .footprint = 81_000_000_000 } };
-    const st3 = settle(Fake{ .readings = &unreclaimed, .i = &i, .slept = &slept, .cleared = &cleared }, 90_000_000_000, 1_250_000_000);
+    const st3 = settle(Fake{ .readings = &unreclaimed, .i = &i, .slept_ms = &slept, .clears = &cleared }, 90_000_000_000, 1_250_000_000);
     try testing.expect(st3.settled);
     try testing.expectEqual(@as(u32, settle_poll_ms), st3.waited_ms);
     try testing.expectEqual(@as(u64, 81_000_000_000), st3.after.footprint);
@@ -1232,7 +1241,7 @@ test "glm handover: the settle reads until the cache is empty and the footprint 
     i = 0;
     slept = 0;
     const never = [_]Mem{.{ .footprint = 100_000_000_000 }};
-    const st2 = settle(Fake{ .readings = &never, .i = &i, .slept = &slept, .cleared = &cleared }, 90_000_000_000, 1_250_000_000);
+    const st2 = settle(Fake{ .readings = &never, .i = &i, .slept_ms = &slept, .clears = &cleared }, 90_000_000_000, 1_250_000_000);
     try testing.expect(!st2.settled);
     try testing.expectEqual(settle_max_ms, st2.waited_ms);
     try testing.expectEqual(settle_max_ms, slept);
@@ -1288,10 +1297,10 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     const m = sv.exl3;
     // The prompt pass's cache limit the module set is the bill's prompt cache term: this box's sixteenth of its RAM.
     var limit: usize = 0;
-    _ = mlx.mlx_set_cache_limit(&limit, m.inputs.prompt_cache);
-    try testing.expectEqual(m.inputs.prompt_cache, @as(u64, limit));
+    _ = mlx.mlx_set_cache_limit(&limit, m.cacheLimit(.prompt));
+    try testing.expectEqual(m.billed.phases[@intFromEnum(bill_mod.Phase.prompt)].mlx_cache, @as(u64, limit));
     try testing.expectEqual(bill_mod.prefillCacheBytes(sdk.memory.totalMemBytes()), m.inputs.prompt_cache);
-    try testing.expectEqual(m.inputs.prompt_cache, bill_mod.termsOf(m.inputs).mlx_cache[0]);
+    try testing.expectEqual(m.inputs.prompt_cache, bill_mod.billOf(m.inputs).phases[@intFromEnum(bill_mod.Phase.prompt)].mlx_cache);
     // The setting's lookahead budget is the stream's.
     try testing.expectEqual(@as(u32, 3), m.stream.selector.?.budget);
     try testing.expectEqual(@as(usize, 8), m.decode_rows.len);

@@ -205,6 +205,8 @@ pub const Bank = struct {
             const gu = l.segments[gu_components].offset;
             g.widest_span = @max(g.widest_span, @max(gu, l.logical_bytes - gu));
         }
+        // One record per expert: a routed id's span is its record.
+        g.spec_record = g.widest_record;
         return g;
     }
 

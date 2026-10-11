@@ -1959,16 +1959,15 @@ fn cellBool(comptime name: []const u8, v: []const u8) !bool {
 }
 
 /// The window's proofs, the harness's to assert (the served path judges only its own ledgers): the page
-/// cache the step created by the end of construction, and the box's pages at the phase change. A guarded
-/// window's guard counts the whole box (other processes included), so these hold the harness's run to it.
-pub const page_cache_tolerance_bytes: u64 = 500_000_000;
+/// cache the step created by the end of construction (`phase_memory.checkPageCache`, shared with GLM-5.3's records),
+/// and the box's pages at the phase change. A guarded window's guard counts the whole box (other processes included),
+/// so these hold the harness's run to it.
+pub const page_cache_tolerance_bytes = @import("phase_memory.zig").page_cache_tolerance_bytes;
 pub const box_tolerance_bytes: u64 = 500_000_000;
 
 /// The load left no page cache to be aged into the guard's count later (v6c2: 15 GB of speculative pages from
 /// unaligned F_NOCACHE reads, 7.7 GB aged in at the grow).
-pub fn checkPageCache(created: i64) error{ConstructionLeftPageCache}!void {
-    if (created > @as(i64, @intCast(page_cache_tolerance_bytes))) return error.ConstructionLeftPageCache;
-}
+pub const checkPageCache = @import("phase_memory.zig").checkPageCache;
 
 /// One fresh reading of the box's physical pages beside this process's footprint, for the harnesses' box proofs.
 /// Read through a vm_stat child: XNU rate-limits host_statistics64 for non-platform binaries (2-10 fresh calls

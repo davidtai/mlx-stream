@@ -187,6 +187,14 @@ pub fn slotBytes(record_bytes: u64, page: u64) u64 {
     return std.mem.alignForward(u64, record_bytes, page) + 2 * page;
 }
 
+/// The host bytes `Pool.start` maps and allocates for `opt` (a bill's read pool term): each worker's staging buffer,
+/// the speculative slots, and each ticket's result words, log word and published flag.
+pub fn poolBytes(opt: Options, page: u64) u64 {
+    var n = @as(u64, opt.workers) * opt.staging_bytes + @as(u64, opt.tickets) * (res_w * @sizeOf(i64) + @sizeOf(i64) + @sizeOf(bool));
+    if (opt.spec) |s| n += @as(u64, s.slots) * slotBytes(s.record_bytes, page);
+    return n;
+}
+
 /// Page-aligned chunk so `chunks` chunks cover a staging slot.
 pub fn chunkBytes(chunks: u32, record_bytes: u64, page: u64) u64 {
     return (std.math.divCeil(u64, slotBytes(record_bytes, page), chunks * page) catch unreachable) * page;

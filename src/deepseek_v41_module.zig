@@ -29,6 +29,7 @@ const trunk_routes = @import("dsv41_kernel_routes.zig");
 const selfcheck = @import("exl3_selfcheck.zig");
 const arm_mod = @import("deepseek_v41_arm.zig");
 const bill_mod = @import("deepseek_v41_bill.zig");
+const phase_mem = @import("phase_memory.zig");
 const expert_admission = @import("expert_admission.zig");
 const graph = @import("deepseek_v41_graph.zig");
 const routes = @import("deepseek_v41_routes.zig");
@@ -967,23 +968,23 @@ pub const Module = struct {
         self.g.clearCache();
         const measured = sdk.memory.footprint().now;
         const mb = try bill_mod.memoryBill(arena.allocator(), b);
-        const billed = mb.constructionBytes(b.prefill_rows);
         var mlx_active: usize = 0;
         var mlx_cache: usize = 0;
         _ = mlx.mlx_get_active_memory(&mlx_active);
         _ = mlx.mlx_get_cache_memory(&mlx_cache);
-        log.info("NATIVE construction check: MLX active {d} B, MLX cache {d} B, host side {d} B (the footprint less both)\n", .{ mlx_active, mlx_cache, measured -| mlx_active -| mlx_cache });
-        log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)\n", .{ measured, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(measured)), construction_tolerance_bytes });
-        sdk.checkConstruction(billed, measured, construction_tolerance_bytes) catch |e| {
-            log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B\n", .{ measured, billed, construction_tolerance_bytes });
+        // The check's arithmetic (`phase_memory.Construction`, shared with GLM-5.3's module); the words are this module's.
+        const cc = phase_mem.Construction.of(mb, b.prefill_rows, measured, mlx_active, mlx_cache);
+        log.info("NATIVE construction check: MLX active {d} B, MLX cache {d} B, host side {d} B (the footprint less both)\n", .{ mlx_active, mlx_cache, cc.hostSide() });
+        log.info("NATIVE construction check: footprint {d} B, billed construction terms {d} B, residual {d} B (tolerance {d} B)\n", .{ measured, cc.billed, cc.residual(), construction_tolerance_bytes });
+        cc.checkFootprint(construction_tolerance_bytes) catch |e| {
+            log.err("construction check: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B\n", .{ measured, cc.billed, construction_tolerance_bytes });
             return e;
         };
         // The bill's measured bound (the host side) against its one measurement here.
-        const host_side = measured -| mlx_active -| mlx_cache;
-        for (mb.terms) |t| if (t.measured) sdk.checkMeasured(t, host_side) catch |e| {
-            log.err("construction check: the host side {d} B exceeds its billed bound {d} B\n", .{ host_side, t.bytes[0] });
-            return e;
-        };
+        if (cc.overMeasured(mb)) |t| {
+            log.err("construction check: the host side {d} B exceeds its billed bound {d} B\n", .{ cc.hostSide(), t.bytes[0] });
+            return error.ConstructionOverBill;
+        }
     }
 
     /// The expert source at the admitted rows, its banks checked against the quant (again at the phase change).
@@ -1961,8 +1962,8 @@ pub fn numericTier(t: settings.NumericTier) routes.Tier {
 }
 
 /// How far the constructed footprint may sit above the bill's construction terms (the ledger's
-/// residual threshold; cell4 measured 0.59 GB UNDER them).
-pub const construction_tolerance_bytes: u64 = 250_000_000;
+/// residual threshold; cell4 measured 0.59 GB UNDER them; `phase_memory`'s, shared with GLM-5.3's module).
+pub const construction_tolerance_bytes = phase_mem.construction_tolerance_bytes;
 
 /// MLX's allocator and this process's footprint at a phase boundary: this process's own ledgers, which the
 /// boundary judges. The box's pages are not read here: host_statistics64 is rate-limited box-wide for
@@ -2083,33 +2084,19 @@ pub const PhaseGate = struct {
 };
 
 
-/// The live boundary reader: MLX's counters, the footprint, vm_stat; waits on the shell's io.
-const LiveReader = struct {
-    io: std.Io,
-
-    fn now(_: LiveReader) BoundaryMemory {
-        return BoundaryMemory.now();
-    }
-
-    fn sleep(self: LiveReader, ms: u32) void {
-        std.Io.sleep(self.io, .fromMilliseconds(ms), .awake) catch {};
-    }
-
-    /// A buffer that reached MLX's cache after the boundary's clear (a late release: a command buffer's temporaries
-    /// dropped at its completion) is returned to the system before the next reading.
-    fn clearCache(_: LiveReader) void {
-        _ = mlx.mlx_clear_cache();
-    }
-};
+/// The live boundary reader: MLX's counters and the footprint; waits on the shell's io; a buffer that reached MLX's
+/// cache after the boundary's clear (a late release: a command buffer's temporaries dropped at its completion) is
+/// returned to the system before the next reading (`phase_memory.LiveReader`, shared with GLM-5.3's module).
+const LiveReader = phase_mem.LiveReader(BoundaryMemory);
 
 /// The footprint may sit this far above its expected drop at the boundary (the ledger's page rounding
-/// and the host side's own movement).
-pub const phase_change_tolerance_bytes: u64 = 250_000_000;
+/// and the host side's own movement; `phase_memory.settle_tolerance_bytes`).
+pub const phase_change_tolerance_bytes = phase_mem.settle_tolerance_bytes;
 /// The reclaim wait: read every `phase_change_poll_ms`, refuse after `phase_change_settle_ms`.
 pub const phase_change_poll_ms: u32 = 250;
-/// The phase change's poll under `until_freed` (its bound, not the poll, sets the wait).
-pub const phase_change_until_freed_poll_ms: u32 = 5;
-pub const phase_change_settle_ms: u32 = 10_000;
+/// The phase change's poll under `until_freed` (its bound, not the poll, sets the wait; `phase_memory.settle_poll_ms`).
+pub const phase_change_until_freed_poll_ms = phase_mem.settle_poll_ms;
+pub const phase_change_settle_ms = phase_mem.settle_max_ms;
 
 fn footprintFreed(before: BoundaryMemory, after: BoundaryMemory, freed_device: u64) bool {
     return after.footprint + before.cache + freed_device <= before.footprint + phase_change_tolerance_bytes;
@@ -2126,17 +2113,19 @@ fn settled(before: BoundaryMemory, m: BoundaryMemory, freed_device: u64, bound: 
 /// `bound` (`until_freed`), sits at most at it, at most `phase_change_settle_ms`; the one check then judges the last
 /// reading.
 pub fn settle(reader: anytype, before: BoundaryMemory, freed_device: u64, poll_ms: u32, bound: ?u64) struct { after: BoundaryMemory, waited_ms: u32 } {
-    var m = reader.now();
-    var waited: u32 = 0;
-    while (!settled(before, m, freed_device, bound) and waited < phase_change_settle_ms) {
-        // A buffer released into the cache after the boundary's clear: cleared again, so the settle cannot end on a
-        // reading the one check refuses (PhaseChangeCacheNotEmpty, a sticky boundary refusal).
-        if (m.cache != 0) reader.clearCache();
-        reader.sleep(poll_ms);
-        waited += poll_ms;
-        m = reader.now();
-    }
-    return .{ .after = m, .waited_ms = waited };
+    // The shared loop (`phase_memory.settle`): a buffer released into the cache after the boundary's clear is cleared
+    // again, so the settle cannot end on a reading the one check refuses (PhaseChangeCacheNotEmpty, a sticky boundary
+    // refusal).
+    const Cond = struct {
+        before: BoundaryMemory,
+        freed_device: u64,
+        bound: ?u64,
+        pub fn ok(c: @This(), m: BoundaryMemory) bool {
+            return settled(c.before, m, c.freed_device, c.bound);
+        }
+    };
+    const st = phase_mem.settle(reader, poll_ms, phase_change_settle_ms, Cond{ .before = before, .freed_device = freed_device, .bound = bound });
+    return .{ .after = st.after, .waited_ms = st.waited_ms };
 }
 
 /// The phase boundary's one check, before the grow, on this process's own ledgers: the MLX cache empty (every
@@ -3011,27 +3000,7 @@ test "dsv41 memory: the phase boundary refuses a grow over unreleased buffers, b
 }
 
 /// A scripted boundary reader: `readings[i]` at the i-th read (the last one repeats), no real sleep.
-const FakeReader = struct {
-    readings: []const BoundaryMemory,
-    i: *usize,
-    slept_ms: *u32,
-    /// The settle's cache clears (null: not counted).
-    clears: ?*u32 = null,
-
-    fn now(self: FakeReader) BoundaryMemory {
-        const r = self.readings[@min(self.i.*, self.readings.len - 1)];
-        self.i.* += 1;
-        return r;
-    }
-
-    fn sleep(self: FakeReader, ms: u32) void {
-        self.slept_ms.* += ms;
-    }
-
-    fn clearCache(self: FakeReader) void {
-        if (self.clears) |c| c.* += 1;
-    }
-};
+const FakeReader = phase_mem.FakeReader(BoundaryMemory);
 
 test "dsv41 memory: a buffer reaching MLX's cache after the boundary's clear is cleared in the settle, never a sticky PhaseChangeCacheNotEmpty" {
     const before: BoundaryMemory = .{ .active = 85_358_000_000, .cache = 4_627_000_000, .footprint = 91_915_000_000 };

@@ -23,6 +23,7 @@ const sdk = @import("sdk");
 const log = sdk.log;
 const glm = @import("glm_moe_dsa.zig");
 const graph = @import("glm_moe_dsa_graph.zig");
+const cache_mod = @import("glm_moe_dsa_cache.zig");
 const settings = @import("glm_moe_dsa_settings.zig");
 const ds = @import("deepseek_v41_dspark.zig");
 const dsl = @import("deepseek_v41_dspark_loop.zig");
@@ -138,7 +139,9 @@ pub fn checkResidents(spec: []const glm.Param, ck: *const glm.Checkpoint, diag: 
     return bytes;
 }
 
-/// What the lane holds besides its KV, from the pack's headers and manifest (the bill's terms).
+/// What the lane holds besides its KV, from the pack's headers and manifest (the bill's terms), as MLX allocates it: the
+/// residents (each tensor its buffer), and the experts' arrays (each bank layer's segment over its minis) with their slot
+/// table (`Exl3.base`, an i32 per expert). The lane measures them at its open (`Lane.measured`).
 pub const Facts = struct { resident_bytes: u64, expert_bytes: u64 };
 
 /// The MTP directory of the pack at `dir` checked from its headers (the residents against the spec, the EXL3
@@ -154,15 +157,19 @@ pub fn facts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.
         else => return refuse(diag, error.MtpPackMissing, "{s}: {s}", .{ path, @errorName(e) }),
     };
     defer ck.deinit();
-    const resident_bytes = try checkResidents(try residentSpec(a, c, kind), &ck, diag);
+    _ = try checkResidents(try residentSpec(a, c, kind), &ck, diag);
+    const page = std.heap.pageSize();
+    const resident_bytes = glm.bufferBytes(&ck, page);
     const expert_bytes = switch (kind) {
         .dense => 0,
         .exl3 => blk: {
             const mdir = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, dir_name });
             const m = try Manifest.load(a, io, mdir, c, diag);
             var n: u64 = 0;
-            for (m.layers) |l| n += @as(u64, l.n_minis) * l.logical_bytes;
-            break :blk n;
+            for (m.layers) |l| for (l.segments) |sg| {
+                n += cache_mod.bufferBytes(@as(u64, l.n_minis) * sg.length, page);
+            };
+            break :blk n + cache_mod.bufferBytes(@as(u64, c.n_routed_experts) * @sizeOf(i32), page);
         },
     };
     return .{ .resident_bytes = resident_bytes, .expert_bytes = expert_bytes };
@@ -653,6 +660,9 @@ pub fn Lane(comptime kind: BankKind) type {
         top_p: [max_depth]f32 = @splat(0),
         /// Logged once per request that the lane stopped tracking.
         untracked_logged: bool = false,
+        /// MLX's active bytes the open added (its residents, its experts' arrays and their slot table), measured once:
+        /// the module holds them to the bill's term (`glm_moe_dsa_bill.Mtp`).
+        measured_bytes: u64 = 0,
 
         /// The lane over the pack at `dir` (its `mtp/`), `depth` drafts a round, `cap` positions in its cache.
         pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, c: *const glm.Config, depth: u32, mode: sdk.acceptance.Mode, cap: u32, nocache: bool, diag: ?*Diag) !*Self {
@@ -680,7 +690,8 @@ pub fn Lane(comptime kind: BankKind) type {
             while (it.next()) |v| try mlx.check(mlx.mlx_array_eval(v.*));
             var active1: usize = 0;
             _ = mlx.mlx_get_active_memory(&active1);
-            log.info("glm_moe_dsa: MTP lane depth {d}, acceptance {s}, {d} residents ({s}), {d} B resident with its experts (measured)\n", .{ depth, sdk.acceptance.name(mode), self.weights.count(), path, active1 -| active0 });
+            self.measured_bytes = active1 -| active0;
+            log.info("glm_moe_dsa: MTP lane depth {d}, acceptance {s}, {d} residents ({s}), {d} B resident with its experts (measured)\n", .{ depth, sdk.acceptance.name(mode), self.weights.count(), path, self.measured_bytes });
             return self;
         }
 
