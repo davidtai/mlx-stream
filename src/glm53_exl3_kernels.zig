@@ -14,7 +14,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
-pub const manifest_sha256 = "0fec463cde8ab2f8a9b184c3dbce3e05946c225b7ca26d2bb37a1db8d28121c8";
+pub const manifest_sha256 = "74bde426a9baa188bb66a375cf05963e6d60cf4ce72f9ac74e5ec39bd469f152";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
 const dir = "kernels/glm53_exl3/";
 
@@ -494,7 +494,7 @@ test "glm53 exl3 kernels: a tampered text or header, another pin, another bank o
         .{ .needle = "\"name\":\"glm53_pf_mid\"", .repl = "\"name\":\"glm53_pf_mid2\"", .err = error.UnknownKernel, .names = "glm53_pf_mid2" },
         .{ .needle = "\"name\":\"glm53_pf_mid\"", .repl = "\"name\":\"glm53_pf_gu\"", .err = error.DuplicateKernel, .names = "glm53_pf_gu listed twice" },
         .{ .needle = "\"format\":\"mlx-stream-glm53-exl3-kernels-v1\"", .repl = "\"format\":\"mlx-stream-glm53-exl3-kernels-v2\"", .err = error.ManifestFormat, .names = "v2" },
-        .{ .needle = "\"threadgroup\":[512,1,1]", .repl = "\"threadgroup\":[2048,1,1]", .err = error.SchemaInvalid, .names = "threadgroup 2048x1x1" },
+        .{ .needle = "\"threadgroup\":[128,1,1]", .repl = "\"threadgroup\":[2048,1,1]", .err = error.SchemaInvalid, .names = "threadgroup 2048x1x1" },
     }) |c| {
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, embedded.manifest, c.needle));
         const m = try std.mem.replaceOwned(u8, a, embedded.manifest, c.needle, c.repl);

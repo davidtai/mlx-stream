@@ -278,8 +278,8 @@ pub fn Accepted(comptime G: type) type {
 
         /// A wave's device tables: its rows' (x row, slot) and its gate|up and down wave tables.
         fn waveArrays(self: *const Self, g: *G, w: WaveSpec) !struct { rt: G.T, tgu: G.T, tgs_gu: u32, tdn: G.T, tgs_dn: u32 } {
-            const tgu = routes.waveTable(w.slots[0..w.ne], w.cnts[0..w.ne], routes.tilesGateUp(self.mini));
-            const tdn = routes.waveTable(w.slots[0..w.ne], w.cnts[0..w.ne], routes.tilesDown(self.hidden));
+            const tgu = routes.waveTable(w.slots[0..w.ne], w.cnts[0..w.ne], routes.tilesGateUp(self.mini), routes.bm_gate_up);
+            const tdn = routes.waveTable(w.slots[0..w.ne], w.cnts[0..w.ne], routes.tilesDown(self.hidden), routes.bm_down);
             const nrt = @max(8, 2 * w.rows);
             return .{
                 .rt = try g.hostArray(std.mem.sliceAsBytes(self.rt.items[2 * w.first ..][0..nrt]), &.{@intCast(nrt)}, .uint32),
@@ -881,7 +881,7 @@ const bench_exps = [_]BenchExp{
     .{ .name = "gu: no MMA (decode, rotation, scale alone)", .kernel = .glm53_pf_gu, .needle = mma_call, .repl = "(void)Atile; (void)Btile;" },
     .{ .name = "down: no trellis decode (B constant)", .kernel = .glm53_pf_down, .needle = decode_call_down, .repl = no_decode },
     .{ .name = "down: no MMA (the decode alone)", .kernel = .glm53_pf_down, .needle = mma_call, .repl = "(void)Atile; (void)Btile;" },
-    .{ .name = "down: one epilogue (the last mini's)", .kernel = .glm53_pf_down, .needle = "for (int p = 0; p * SM < valid; ++p) {", .repl = "for (int p = 0; r == 3 && p * SM < valid; ++p) {" },
+    .{ .name = "down: one epilogue (the last mini's)", .kernel = .glm53_pf_down, .needle = "if (p * SM >= valid) break;", .repl = "if (r != 3 || p * SM >= valid) break;" },
 };
 
 // GLM53_EXL3_BENCH=<pack dir> (the box, lock-held): routed layer 0's 256 experts of the real pack resident (its K3 and

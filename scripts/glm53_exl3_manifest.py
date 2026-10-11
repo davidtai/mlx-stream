@@ -57,7 +57,7 @@ KERNELS = [
      "template": ["HID", "MINI"], "k": False,
      "inputs": [arg("zg", "float32"), arg("zu", "float32"), arg("rt", "uint32"), arg("og", "float16"), arg("ou", "float16"), arg("di", "float16")],
      "outputs": [arg("hm", "float16")]},
-    {"name": "glm53_pf_down", "family": "prompt", "header": "glm53_nax", "threadgroup": [512, 1, 1],
+    {"name": "glm53_pf_down", "family": "prompt", "header": "glm53_nax", "threadgroup": [256, 1, 1],
      "template": ["K", "HID", "MINI"], "k": True,
      "inputs": [arg("hm", "float16"), arg("tbl", "int32"), arg("cd0", "uint16"), arg("rout", "float16")],
      "outputs": [arg("y", "bfloat16")]},

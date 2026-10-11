@@ -487,8 +487,8 @@ fn promptChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
         rt_dev[2 * q] = (rt[2 * q] + 1) % @as(u32, @intCast(n_tok));
     };
     const rtd = try sc.host(std.mem.sliceAsBytes(rt_dev), &.{@intCast(rt_dev.len)}, .uint32);
-    const tgu = routes.waveTable(slots[0..n_slots], counts, routes.tilesGateUp(inst.mini));
-    const tdn = routes.waveTable(slots[0..n_slots], counts, routes.tilesDown(inst.hidden));
+    const tgu = routes.waveTable(slots[0..n_slots], counts, routes.tilesGateUp(inst.mini), routes.bm_gate_up);
+    const tdn = routes.waveTable(slots[0..n_slots], counts, routes.tilesDown(inst.hidden), routes.bm_down);
     const tgud = try sc.host(std.mem.sliceAsBytes(&tgu.t), &.{80}, .int32);
     const tdnd = try sc.host(std.mem.sliceAsBytes(&tdn.t), &.{80}, .int32);
     const pr = routes.Prompt.init(bound, inst);

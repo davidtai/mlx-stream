@@ -31,14 +31,16 @@ pub const max_members = 2;
 pub const combine_sources = 16;
 /// The prompt wave table: at most 16 experts.
 pub const wave_experts = 16;
-/// Threadgroups per 128-row M tile: the gate|up GEMM's (2 projections x 4 minis x MINI / 64 N tiles), the down's (HID /
-/// 128 N tiles).
+/// Threadgroups per M tile: the gate|up GEMM's (2 projections x 4 minis x MINI / 64 N tiles per 128 rows), the down's
+/// (HID / 128 N tiles per 64 rows).
 pub fn tilesGateUp(mini: u32) u32 {
     return 8 * mini / 64;
 }
 pub fn tilesDown(hidden: u32) u32 {
     return hidden / 128;
 }
+pub const bm_gate_up = 128;
+pub const bm_down = 64;
 
 fn free(xs: []const mlx.mlx_array) void {
     for (xs) |x| _ = mlx.mlx_array_free(x);
@@ -270,7 +272,7 @@ pub const Prompt = struct {
             },
             .down => {
                 const sh = [_]c_int{ rc, @intCast(h) };
-                const cfg = cfgOf(reg.get(.glm53_pf_down), self.inst, .{ 512 * tgs_dn, 1, 1 }, &.{.{ &sh, .bfloat16 }});
+                const cfg = cfgOf(reg.get(.glm53_pf_down), self.inst, .{ 256 * tgs_dn, 1, 1 }, &.{.{ &sh, .bfloat16 }});
                 try self.b.apply(.glm53_pf_down, &.{ st.hm[0], tdn, bank.down.trellis, bank.down.svh }, &cfg, &st.y);
                 Stages.drop(&st.hm);
             },
@@ -279,10 +281,10 @@ pub const Prompt = struct {
 };
 
 /// A prompt wave table: per expert j (<= 16) slot, first row, rows, first threadgroup (INT_MAX unused); [64] experts,
-/// [65] threadgroups; `tiles` threadgroups per 128-row M tile.
+/// [65] threadgroups; `tiles` threadgroups per `bm`-row M tile.
 pub const WaveTable = struct { t: [80]i32, tgs: u32 };
 
-pub fn waveTable(slots: []const u32, counts: []const u32, tiles: u32) WaveTable {
+pub fn waveTable(slots: []const u32, counts: []const u32, tiles: u32, bm: u32) WaveTable {
     std.debug.assert(slots.len == counts.len and slots.len <= wave_experts);
     var t: [80]i32 = @splat(0);
     var row0: i32 = 0;
@@ -297,7 +299,7 @@ pub fn waveTable(slots: []const u32, counts: []const u32, tiles: u32) WaveTable 
         t[32 + j] = @intCast(counts[j]);
         t[48 + j] = tg;
         row0 += @intCast(counts[j]);
-        tg += @intCast((counts[j] + 127) / 128 * tiles);
+        tg += @intCast((counts[j] + bm - 1) / bm * tiles);
     }
     t[64] = @intCast(slots.len);
     t[65] = tg;

@@ -1,10 +1,10 @@
 
-    // GLM-5.3 EXL3 prompt, stage 4: the down GEMM of a wave's experts at BM 128 x BN 128 (16 simdgroups, WM 4 x WN 4,
-    // each a 32 x 32 share), each of the expert's four minis in turn: its BK = 64 stages decoded into threadgroup memory
-    // (one 16-weight column per thread), the NAX MMA, then the epilogue: 32 rows at a time staged in threadgroup memory,
+    // GLM-5.3 EXL3 prompt, stage 3: the down GEMM of a wave's experts at BM 64 x BN 128 (8 simdgroups, WM 2 x WN 4, each
+    // a 32 x 32 share), each of the expert's four minis in turn: its BK = 64 stages decoded into threadgroup memory (two
+    // 16-weight columns per thread), the NAX MMA, then the epilogue: 32 rows at a time staged in threadgroup memory,
     // each row's 128-column block rotated (t128, lane l holding columns 4 l .. 4 l + 3) and scaled by the mini's rout,
     // summed over the minis in registers. y: [rows, HID] bf16 in the wave's row order (rows grouped by expert).
-    constexpr int BM = 128;
+    constexpr int BM = 64;
     constexpr int BN = 128;
     constexpr int BK = 64;
     constexpr int WN = 4;
@@ -14,7 +14,7 @@
     constexpr int TM = 2;
     constexpr int TN = 2;
     constexpr int TK = 2;
-    constexpr int NSG = 16;
+    constexpr int NSG = 8;
     constexpr int LDB = BK + 8;
     constexpr int KT = BK / 16;
     constexpr int NT = BN / 16;
@@ -52,12 +52,14 @@
     const int sgp_sm = min(SM, max(0, valid - tm));
     const uint h = sg & 1u;
     const uint c7 = lane & 7u;
-    // 32 tiles x 16 columns = 512 jobs: tile t = (lane >> 3) + 4 (sg >> 1)
+    // 32 tiles x 16 columns = 512 jobs, two per thread: tiles t = (lane >> 3) + 4 (sg >> 1) and t + 16 (k tile + 2)
     const int t = int(lane >> 3u) + 4 * int(sg >> 1u);
     const int kt = t / NT;
     const int nt = t - kt * NT;
     const int dst_off = (nt * 16 + 8 * int(h) + int(c7)) * LDB + kt * 16;
     const int src_off = (kt * N16 + nt) * NWT;
+    constexpr int dst_step = 32;
+    constexpr int src_step = 2 * N16 * NWT;
     uint o[5];
     if (h != 0u) {
         g53_col<K, 1>::offsets(c7, o);
@@ -65,11 +67,11 @@
         g53_col<K, 0>::offsets(c7, o);
     }
     const bool full = sgp_sm == SM;
-    float yacc[4][2][4];
+    float yacc[BM / SM][4][4];
     STEEL_PRAGMA_UNROLL
-    for (int p = 0; p < 4; ++p) {
+    for (int p = 0; p < BM / SM; ++p) {
         STEEL_PRAGMA_UNROLL
-        for (int q = 0; q < 2; ++q) {
+        for (int q = 0; q < 4; ++q) {
             STEEL_PRAGMA_UNROLL
             for (int c = 0; c < 4; ++c) yacc[p][q][c] = 0.0f;
         }
@@ -86,8 +88,10 @@
             const device uint* tile = cd + size_t(s) * size_t(KT * N16 * NWT) + src_off;
             if (h != 0u) {
                 g53_col<K, 1>::template decode<half>(tile, o, Bs + dst_off);
+                g53_col<K, 1>::template decode<half>(tile + src_step, o, Bs + dst_off + dst_step);
             } else {
                 g53_col<K, 0>::template decode<half>(tile, o, Bs + dst_off);
+                g53_col<K, 0>::template decode<half>(tile + src_step, o, Bs + dst_off + dst_step);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sgp_sm > 0) {
@@ -107,18 +111,19 @@
                 }
             }
         }
-        // the epilogue: band p's WN simdgroups stage their 32 rows, every simdgroup rotates rows rr = sg, sg + 16
+        // the epilogue: band p's WN simdgroups stage their 32 rows, every simdgroup rotates rows rr = sg + 8 q
         const device half* ro = rout + mrow * size_t(HID) + size_t(n0) + 4u * lane;
         const float4 rv = float4(float(ro[0]), float(ro[1]), float(ro[2]), float(ro[3]));
-        STEEL_PRAGMA_NO_UNROLL
-        for (int p = 0; p * SM < valid; ++p) {
+        STEEL_PRAGMA_UNROLL
+        for (int p = 0; p < BM / SM; ++p) {
+            if (p * SM >= valid) break;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (tm == p * SM) {
                 Dtile.template store<float, LDS, 1>(St + tn);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             STEEL_PRAGMA_UNROLL
-            for (int q = 0; q < 2; ++q) {
+            for (int q = 0; q < 4; ++q) {
                 const int rr = int(sg) + NSG * q;
                 if (p * SM + rr >= valid) continue;
                 const threadgroup float* src = St + rr * LDS + 4 * int(lane);
@@ -150,9 +155,9 @@
         }
     }
     STEEL_PRAGMA_UNROLL
-    for (int p = 0; p < 4; ++p) {
+    for (int p = 0; p < BM / SM; ++p) {
         STEEL_PRAGMA_UNROLL
-        for (int q = 0; q < 2; ++q) {
+        for (int q = 0; q < 4; ++q) {
             const int rr = p * SM + int(sg) + NSG * q;
             if (rr >= valid) continue;
             device bfloat16_t* yp = y + (size_t(row0) + size_t(m0 + rr)) * size_t(HID) + size_t(n0) + 4u * lane;
