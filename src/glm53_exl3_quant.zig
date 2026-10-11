@@ -841,14 +841,14 @@ const decode_call =
 ;
 const decode_call_down =
     \\            if (h != 0u) {
-    \\                g53_col<K, 1>::template decode<half>(tile, o, Bs + dst_off);
-    \\                g53_col<K, 1>::template decode<half>(tile + src_step, o, Bs + dst_off + dst_step);
+    \\                g53_col<K, 1>::decode_p(P, v);
+    \\                g53_col<K, 1>::template store<half>(v, Bs + b * BUF + dst_off);
     \\            } else {
-    \\                g53_col<K, 0>::template decode<half>(tile, o, Bs + dst_off);
-    \\                g53_col<K, 0>::template decode<half>(tile + src_step, o, Bs + dst_off + dst_step);
+    \\                g53_col<K, 0>::decode_p(P, v);
+    \\                g53_col<K, 0>::template store<half>(v, Bs + b * BUF + dst_off);
     \\            }
 ;
-const no_decode = "            { threadgroup half* dd = Bs + dst_off; for (int q = 0; q < 16; ++q) { dd[q] = half(0.001f * float(q)); dd[q + dst_step] = half(0.002f * float(q)); } (void)tile; }";
+const no_decode = "            for (int q = 0; q < 16; ++q) v[q] = 0.001f * float(q); (void)P; g53_col<K, 0>::template store<half>(v, Bs + b * BUF + dst_off);";
 const no_decode_gu = "        for (int c = 0; c < 32; ++c) v[c] = 0.001f * float(c + int(lane)); (void)t0;";
 const mma_call = "tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});";
 const bench_exps = [_]BenchExp{
