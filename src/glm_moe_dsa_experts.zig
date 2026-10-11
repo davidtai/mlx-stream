@@ -26,12 +26,13 @@ const glm = @import("glm_moe_dsa.zig");
 const timeline = @import("dsv41_verify_timeline.zig");
 const pt = @import("glm_moe_dsa_prefill_timers.zig");
 
-/// The wide lane's combine (`combineOnGpu`): one thread per token and 4 hidden values, the token's `K` routed rows in
-/// routed order, each read from its part (`loc`: the part in the top 8 bits, the row in the low 24).
 /// Metal binds at most 31 buffers to a kernel; the combine's other three are `loc`, `w` and `out`.
 const metal_buffer_slots = 31;
 const max_combine_parts = metal_buffer_slots - 3;
+/// The combine (`combineOnGpu`): one thread per token and 4 hidden values, the token's `K` routed rows in routed
+/// order, each read from its part (`loc`: the part in the top 8 bits, the row in the low 24).
 const combine_source = blk: {
+    @setEvalBranchQuota(1000 * max_combine_parts);
     var cases: []const u8 = "";
     for (0..max_combine_parts) |i| cases = cases ++ std.fmt.comptimePrint("        case {d}: part = p{d}; break;\n", .{ i, i });
     break :blk std.fmt.comptimePrint("{s}{s}{s}", .{ combine_head, cases, combine_tail });
@@ -64,6 +65,7 @@ const combine_tail =
 fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, parts: []const ops.MlxOps.T, loc: ops.MlxOps.T, scores: ops.MlxOps.T, n: u32, k: u32, hidden: c_int, dt: ops.Dtype) !ops.MlxOps.T {
     std.debug.assert(parts.len > 0 and parts.len <= max_combine_parts);
     const names = comptime blk: {
+        @setEvalBranchQuota(1000 * max_combine_parts);
         var v: [max_combine_parts + 2][*:0]const u8 = undefined;
         for (0..max_combine_parts) |i| v[i] = std.fmt.comptimePrint("p{d}", .{i});
         v[max_combine_parts] = "loc";
