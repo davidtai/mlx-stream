@@ -1403,6 +1403,48 @@ test "dsv41 io cov: an in-flight record parks (class 1) or pauses (class 0) when
     try testing.expectEqual(@as(i64, 1), pool.counter(.claimed_inflight));
 }
 
+test "glm io: claim cut: a record claimed in flight stops after its chunk in progress; a range below the cut waits for it, a range past it reads from the file" {
+    // Timing-guarded like the park test: the record's first chunk sleeps 400 ms in the pool; a box that stalls the
+    // test thread past it skips.
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(64 * page);
+    defer f.deinit();
+    const rec: u64 = 3 * page;
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 4 * page, .tickets = 128, .range_jobs = true, .claim_cut = true, .spec = .{ .threads = 1, .slots = 2, .record_bytes = rec, .chunk_bytes = page } });
+    defer pool.stop();
+    defer clearFaults();
+    const Q: u64 = 30 * page;
+    injectFault(Q, 5, 400 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{@intCast(Q)}, rec));
+    try waitFor(pool, specStarted(1).f);
+    // The gate/up range sits in the record's first chunk (in flight), the down range in its third.
+    const gu = Q + 10;
+    const down = Q + 2 * page + 10;
+    var d = try Dests.init(1, &spec_lens);
+    defer testing.allocator.free(d.buf);
+    const first = try R96.submit(pool, f.ufd, &.{gu}, &.{down}, d.rows[0..1], &spec_lens);
+    try pool.wait(first, 2, 10 * std.time.ns_per_s);
+    if (pool.counter(.claimed_inflight) != 1) {
+        std.debug.print("SPECPROBE skipped: the record landed before its claim (box loaded)\n", .{});
+        return error.SkipZigTest;
+    }
+    try d.expectRecord(0, f.image, gu, down, &spec_lens);
+    const r_gu = pool.result(first);
+    const r_down = pool.result(first + 1);
+    try testing.expectEqual(Status.ok, r_gu.status);
+    try testing.expectEqual(Status.ok, r_down.status);
+    // Below the cut: copied out of the record once its first chunk landed. Past it: read from the file, before.
+    try testing.expectEqual(@as(i64, 0), r_gu.preadv_calls);
+    try testing.expect(r_down.preadv_calls >= 1);
+    try testing.expect(r_down.t_end_ns < r_gu.t_end_ns);
+    try testing.expectEqual(@as(i64, 1), pool.counter(.claim_cuts));
+    try testing.expectEqual(@as(i64, 1), pool.counter(.cut_reads));
+    try testing.expectEqual(@as(i64, 1), pool.counter(.adopt_ranges));
+    // The record ends at the cut: one chunk read, no more.
+    try waitFor(@as(i64, @intCast(Q)), landedAt);
+    try testing.expectEqual(@as(i64, 1), pool.counter(.spec_chunks));
+}
+
 test "dsv41 io cov: q3ld_stop alone wakes and joins a worker held at a pre-range's bind point" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(64 * page);
