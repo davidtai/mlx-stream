@@ -310,7 +310,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .slot_memory = .{ .mlx = s },
                 .staging_from_bank = true,
                 .records_per_part = diagEnv("GLM_DIAG_RPP", @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank))),
-                .pool = .{ .workers = shape.workers, .tickets = bill_mod.pool_tickets_per_mini * Bk.Stream.maxMinis(&self.bank), .direct = true, .range_jobs = diagEnv("GLM_DIAG_RANGE_JOBS", 1) != 0, .claim_cut = diagEnv("GLM_DIAG_CUT", 1) != 0 },
+                .pool = .{ .workers = shape.workers, .tickets = bill_mod.pool_tickets_per_mini * Bk.Stream.maxMinis(&self.bank), .direct = true, .range_jobs = diagEnv("GLM_DIAG_RANGE_JOBS", 1) != 0, .claim_cut = diagEnv("GLM_DIAG_CUT", 0) != 0, .gu_first = diagEnv("GLM_DIAG_GU_FIRST", 1) != 0 },
                 .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
                 .keep_residents = true,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
@@ -708,7 +708,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var cut: [3]f64 = undefined;
             for (&cut, 0..) |*x, i| x.* = @floatFromInt(st.pool.counterAt(sdk_ext.expert.io.diag_wait_first + 35 + i) - self.lat0[12 + i]);
             log.info("glm_moe_dsa: DIAG adoption in decode (claim cut {d}): {d:.0} routes with a gate/up range from a speculative record, submit -> last gate/up {d:.3} ms each, {d:.0} of them last; the others {d:.0} routes {d:.3} ms each; {d:.0} records cut, {d:.0} ranges read past a cut, {d:.0} records ended at the cut\n", .{
-                diagEnv("GLM_DIAG_CUT", 1), an, f.ms(@floatFromInt(st.diag_adopt_gu_lat_ns - self.lat0[10]), an), @as(f64, @floatFromInt(st.diag_last_gu_adopted - self.lat0[11])),
+                diagEnv("GLM_DIAG_CUT", 0), an, f.ms(@floatFromInt(st.diag_adopt_gu_lat_ns - self.lat0[10]), an), @as(f64, @floatFromInt(st.diag_last_gu_adopted - self.lat0[11])),
                 ln - an, f.ms(@as(f64, @floatFromInt(st.diag_gu_lat_ns - self.lat0[2])) - @as(f64, @floatFromInt(st.diag_adopt_gu_lat_ns - self.lat0[10])), ln - an),
                 cut[0], cut[1], cut[2],
             });
