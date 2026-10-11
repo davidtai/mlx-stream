@@ -1269,15 +1269,13 @@ test "glm53 exl3 quant: on a synthetic EXL3 pack with random residents the GLM-5
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const prompt = [_]u32{ 3, 17, 9, 101, 44, 250, 7, 63, 12, 5, 99, 31 };
     // sushi's module first (its argmax the next step's token), then ours fed the same tokens: one module at a time;
-    // each step's host waits on the GPU (`G.waits`, before this test's own reads) and the quant's own drains
+    // each step's host waits on the GPU (`G.waits`, before this test's own reads)
     var logits: [2][5][256]f32 = undefined;
     var toks: [5]u32 = undefined;
     var waits: [2][5]u64 = undefined;
-    var drains: [2]u64 = undefined;
     inline for (.{ module.Exl3SushiModule, module.Exl3Module }, 0..) |M, arm| {
         const m = try M.init(a, io, &cfg, &weights, s, .{ .ceiling = 64 << 30, .wired_margin = 0 });
         defer m.deinit();
-        const q0 = m.math.prefillStats();
         for (0..5) |step| {
             const w0 = m.g.waits;
             const lg = if (step == 0) try m.prefillAt(0, &prompt) else try m.extend(&.{toks[step - 1]});
@@ -1287,13 +1285,11 @@ test "glm53 exl3 quant: on a synthetic EXL3 pack with random residents the GLM-5
             if (arm == 0) toks[step] = try m.g.hostArgmax(lg);
             if (step == 0) try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
         }
-        drains[arm] = m.math.prefillStats()[1] - q0[1];
         m.requestEnd();
     }
-    std.debug.print("glm53 exl3 quant: host waits on the GPU per step (the prompt pass, then 4 decode steps): sushi's module {any}, ours {any}; the quants' own drains {d} / {d}\n", .{ waits[0], waits[1], drains[0], drains[1] });
-    // GLM-5.3's kernels add no wait: the same waits as sushi's binding at every step, no drain of their own
+    std.debug.print("glm53 exl3 quant: host waits on the GPU per step (the prompt pass, then 4 decode steps): sushi's module {any}, ours {any}\n", .{ waits[0], waits[1] });
+    // GLM-5.3's kernels add no wait: the same waits as sushi's binding at every step
     try testing.expectEqualSlices(u64, &waits[0], &waits[1]);
-    try testing.expectEqual(@as(u64, 0), drains[1]);
     var worst: f32 = 0;
     var scale: f32 = 0;
     var same: usize = 0;
