@@ -59,12 +59,9 @@ pub const prefill_chunk_tokens: u32 = 2048;
 /// How far the constructed footprint may sit above the bill's construction terms (the ledger's page rounding and the
 /// host side's own movement; `phase_memory`'s, shared with DeepSeek-V4.1's module).
 pub const construction_tolerance_bytes = phase_mem.construction_tolerance_bytes;
-/// A phase change's settle (`phase_memory.settle`'s loop, shared with DeepSeek-V4.1's module; this module's condition):
-/// MLX's counters and the footprint read every `settle_poll_ms` until MLX's cache is empty and the host side is at most
-/// `settle_host_tolerance_bytes` over its reading before the frees, at most `settle_max_ms`.
+/// A phase change's settle (`settle`).
 pub const settle_poll_ms = phase_mem.settle_poll_ms;
 pub const settle_max_ms = phase_mem.settle_max_ms;
-pub const settle_host_tolerance_bytes: u64 = 50_000_000;
 /// The route recorder's diagnostic switch (`expert.routes`), read once at construction.
 pub const routes_env = "GLM53_ROUTES";
 /// The wave probe's diagnostic switch (`graph.WaveProbe`), read once at construction.
@@ -605,7 +602,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (!self.forced_rows) {
                 const after = bill_mod.decodeAfter(self.inputs, cap);
                 const max_units = bill_mod.maxUnits(self.inputs.bank);
-                const live: bill_mod.Live = .{ .target = target, .gpu_target = self.gpu_target, .baseline = rest, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_units, .max_rows = max_units, .per_row = self.bill.per_row, .device_after = after.device, .host = after.host, .geometry = self.inputs.bank };
+                // The host terms are the bill's bound, or the reading where it sits above them (then the bound under-bills
+                // and the live reading must not).
+                const live: bill_mod.Live = .{ .target = target, .gpu_target = self.gpu_target, .baseline = rest, .mlx_bytes = st.after.active, .prompt_rows = self.prompt_units, .max_rows = max_units, .per_row = self.bill.per_row, .device_after = after.device, .host = @max(after.host, st.after.hostSide()), .geometry = self.inputs.bank };
                 line.live_rows = bill_mod.liveRows(live) catch |e| {
                     line.refused = @errorName(e);
                     log.err("{f}\n", .{line});
@@ -845,22 +844,12 @@ pub const startPhase = phase_mem.restart;
 /// (`phase_memory.LiveReader`, shared with DeepSeek-V4.1's module).
 const LiveReader = phase_mem.LiveReader(Mem);
 
-/// After a phase change's frees: `reader` read every `settle_poll_ms` until MLX's cache is empty and the host side (the
-/// footprint less MLX's active and cache) is at most `host_before`, its reading before the frees, plus
-/// `settle_host_tolerance_bytes`, at most `settle_max_ms`. The footprint's ledger trails MLX's frees while the driver
-/// retires them, and the freed pages read as host side until it does (m2's second handover 6.97 GB; a handover of stack
-/// f2be1ba 0.21 GB over its reading before 25 GB of frees). The frees and the KV lanes' resize are all MLX's, so the
-/// host side comes back to its reading before them. The loop is `phase_memory.settle` (DeepSeek-V4.1's module's too);
-/// the condition is this module's. The last reading either way; `settled` says which (the handover logs "not settled"
-/// and goes on).
+/// After a phase change's frees (all MLX's: the scratch or the grown rows, the cache, the KV lanes' resize), `reader`
+/// read until the host side is back at `host_before` (`phase_memory.HostSideBack`): the grow and the phase record then
+/// read MLX's bytes and the footprint without freed pages the driver has not retired yet. The last reading either way;
+/// `settled` says which (the handover logs "not settled" and goes on).
 pub fn settle(reader: anytype, host_before: u64) phase_mem.Settled(Mem) {
-    const Cond = struct {
-        host_before: u64,
-        pub fn ok(c: @This(), m: Mem) bool {
-            return m.cache == 0 and m.hostSide() <= c.host_before + settle_host_tolerance_bytes;
-        }
-    };
-    return phase_mem.settle(reader, settle_poll_ms, settle_max_ms, Cond{ .host_before = host_before });
+    return phase_mem.settle(reader, settle_poll_ms, settle_max_ms, phase_mem.HostSideBack(Mem){ .host_before = host_before });
 }
 
 /// A phase's memory between its start and its end readings (a prompt pass, a request's decode).
@@ -1319,6 +1308,37 @@ test "glm handover: the settle reads until the cache is empty and the host side 
     try testing.expect(!st2.settled);
     try testing.expectEqual(settle_max_ms, st2.waited_ms);
     try testing.expectEqual(settle_max_ms, slept);
+}
+
+test "glm handover: the settle waits past the stack f2be1ba handover reading that the footprint test took 0.226 GB early" {
+    // Before the frees: the footprint 225.033 GB, MLX active 206.944 GB and cache 17.166 GB (the host side 0.923 GB). The
+    // handover freed the 8.004 GB scratch and resized the KV lanes from 1.586 to 1.685 GB.
+    const before: Mem = .{ .active = 206_944_070_968, .cache = 17_165_538_394, .footprint = 225_033_000_000 };
+    const scratch: u64 = 8_003_911_680;
+    const kv0: u64 = 1_586_298_880;
+    const kv1: u64 = 1_685_258_240;
+    // The readings after them: the footprint 12.8 GB behind the frees, then 0.226 GB behind (the reading the run took),
+    // then back.
+    const readings = [_]Mem{
+        .{ .active = 199_038_725_432, .footprint = 211_801_191_784 },
+        .{ .active = 199_039_000_000, .footprint = 200_188_000_000 },
+        .{ .active = 199_039_000_000, .footprint = 199_969_000_000 },
+    };
+    // The footprint test the module had: within 0.25 GB of the reading before less the frees plus the resize, and the
+    // host side within 0.25 GB of the prompt phase's host terms (1.039 GB). It takes the second reading.
+    const footprint_test = struct {
+        fn ok(m: Mem, b: Mem) bool {
+            const expected = (b.footprint + kv1) -| (b.cache + scratch + kv0);
+            return m.cache == 0 and m.footprint <= expected + 250_000_000 and m.hostSide() <= 1_039_362_432 + 250_000_000;
+        }
+    }.ok;
+    try testing.expect(!footprint_test(readings[0], before) and footprint_test(readings[1], before));
+    var i: usize = 0;
+    var slept: u32 = 0;
+    const st = settle(phase_mem.FakeReader(Mem){ .readings = &readings, .i = &i, .slept_ms = &slept }, before.hostSide());
+    try testing.expect(st.settled);
+    try testing.expectEqual(readings[2], st.after);
+    try testing.expectEqual(@as(u32, 2 * settle_poll_ms), st.waited_ms);
 }
 
 test "glm handover: the handover line reports the readings, the rows each bound allows and decode's bound" {

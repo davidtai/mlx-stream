@@ -227,6 +227,26 @@ pub const settle_poll_ms: u32 = 5;
 pub const settle_max_ms: u32 = 10_000;
 pub const settle_tolerance_bytes: u64 = 250_000_000;
 
+/// How far over its reading before a phase change's frees the host side may read once they settled
+/// (`HostSideBack`): the ledger's page rounding and the host's own movement between the two readings.
+pub const settle_host_tolerance_bytes: u64 = 50_000_000;
+
+/// A settle condition (`settle`) for a phase change whose frees are all MLX's: MLX's cache empty and the host side (the
+/// footprint less MLX's active and cache) back at most `settle_host_tolerance_bytes` over `host_before`, its reading
+/// before the frees. Until the driver retires a freed buffer the footprint still carries it, and it reads as host side:
+/// a footprint test with a tolerance takes such a reading, and whatever reads the footprint next counts the freed bytes
+/// twice. DeepSeek-V4.1's module waits on its footprint instead: its `until_freed` holds the footprint under an absolute
+/// bound (the decode bill's), which a reading with the freed pages still in it fails as well.
+pub fn HostSideBack(comptime R: type) type {
+    return struct {
+        host_before: u64,
+
+        pub fn ok(c: @This(), m: R) bool {
+            return m.cache == 0 and m.hostSide() <= c.host_before + settle_host_tolerance_bytes;
+        }
+    };
+}
+
 /// The live boundary reader of a reading type `R` (`R.now()`): waits on the host's io; a buffer that reached MLX's cache
 /// after the boundary's clear (a command's temporaries dropped at its completion) goes back to the system before the
 /// next reading.
@@ -349,6 +369,18 @@ test "phase memory: the settle reads until its condition holds, clears a late ca
     const never = settle(FakeReader(Ledgers){ .readings = readings[0..1], .i = &i, .slept_ms = &slept }, settle_poll_ms, settle_max_ms, Cond{ .bound = 90 });
     try testing.expect(!never.settled);
     try testing.expectEqual(settle_max_ms, never.waited_ms);
+}
+
+test "phase memory: a settle on the host side waits while the footprint still carries the freed pages" {
+    var i: usize = 0;
+    var slept: u32 = 0;
+    // The host side 0.92 GB before the frees; after them 1.13 GB (0.21 GB of freed pages), then 0.93 GB.
+    const readings = [_]Ledgers{ .{ .active = 80_000_000_000, .footprint = 81_130_000_000 }, .{ .active = 80_000_000_000, .footprint = 80_930_000_000 } };
+    const st = settle(FakeReader(Ledgers){ .readings = &readings, .i = &i, .slept_ms = &slept }, settle_poll_ms, settle_max_ms, HostSideBack(Ledgers){ .host_before = 920_000_000 });
+    try testing.expect(st.settled);
+    try testing.expectEqual(@as(u64, 80_930_000_000), st.after.footprint);
+    try testing.expect(!(HostSideBack(Ledgers){ .host_before = 920_000_000 }).ok(.{ .active = 80_000_000_000, .footprint = 80_970_000_001, .cache = 0 }));
+    try testing.expect(!(HostSideBack(Ledgers){ .host_before = 920_000_000 }).ok(.{ .active = 80_000_000_000, .footprint = 80_930_000_000, .cache = 1 }));
 }
 
 test "phase memory: the construction check bills the construction terms at the prompt rows and bounds the measured host side" {
