@@ -171,6 +171,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// DIAG (diag/pool-copy-timers): the pool's counters at the handover (`diag_counters`).
         diag0: [diag_counters.len]i64 = @splat(0),
         gauge0: [6]i64 = @splat(0),
+        wait0: [35]i64 = @splat(0),
         decoding: bool = false,
         /// The bill's inputs (the handover bills its request's KV from them), the load's baseline, MLX's target (the
         /// host's ceiling less its wired margin) and the box's RAM (the handover's target, `bill.targetOf`).
@@ -305,7 +306,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .decode_window_rows = shape.decode_window_rows * self.inputs.bank.rows_per_id,
                 .slot_memory = .{ .mlx = s },
                 .staging_from_bank = true,
-                .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
+                .records_per_part = diagEnv("GLM_DIAG_RPP", @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank))),
                 .pool = .{ .workers = shape.workers, .tickets = bill_mod.pool_tickets_per_mini * Bk.Stream.maxMinis(&self.bank), .direct = true },
                 .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
                 .keep_residents = true,
@@ -645,6 +646,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.decode_mark = .{ .s0 = self.stream.stats(), .mem0 = Mem.now(), .by0 = self.stream.lookaheadByRank() };
             for (&self.diag0, diag_counters) |*x, c| x.* = self.stream.pool.counter(c);
             self.gauge0 = self.stream.pool.readGauge();
+            for (&self.wait0, 0..) |*x, i| x.* = self.stream.pool.counterAt(sdk_ext.expert.io.diag_wait_first + i);
             self.ex.host = .{};
             if (self.mtp) |ln| ln.counts = .{};
             for (self.layer_counts0, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
@@ -678,6 +680,19 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 d[8], f.mb(d[9], d[8]), f.ms(d[10], d[8]), f.gbs(d[9], d[10]),
                 d[11], f.ms(d[12], d[11]), f.ms(d[13], d[11]),
                 @as(f64, @floatFromInt(self.stream.pool.counter(.diag_copy_max_ns))) / 1e6,
+            });
+            var w: [35]f64 = undefined;
+            for (&w, 0..) |*x, i| x.* = @floatFromInt(self.stream.pool.counterAt(sdk_ext.expert.io.diag_wait_first + i) - self.wait0[i]);
+            const wall: f64 = @max(1, w[24] + w[25] + w[26] + w[27] + w[28] + w[29] + w[30] + w[31] + w[32]);
+            log.info("glm_moe_dsa: DIAG job wait in decode ({d} workers, {d} records per part): by jobs queued ahead at submit 0/1/2/3/4+: {d:.0}/{d:.0}/{d:.0}/{d:.0}/{d:.0} jobs, {d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3} ms each; a worker free at submit {d:.0} jobs {d:.3} ms each (max {d:.3}), none free {d:.0} jobs {d:.3} ms each ({d:.0} with a pre-range running); wait < 8/32/128/512/1024/2048/4096/more us: {d:.0}/{d:.0}/{d:.0}/{d:.0}/{d:.0}/{d:.0}/{d:.0}/{d:.0}\n", .{
+                diagEnv("GLM_DIAG_WORKERS", 4), self.stream.records_per_part,
+                w[0], w[1], w[2], w[3], w[4], f.ms(w[5], w[0]), f.ms(w[6], w[1]), f.ms(w[7], w[2]), f.ms(w[8], w[3]), f.ms(w[9], w[4]),
+                w[10], f.ms(w[11], w[10]), @as(f64, @floatFromInt(self.stream.pool.counterAt(sdk_ext.expert.io.diag_wait_first + 12))) / 1e6, w[13], f.ms(w[14], w[13]), w[15],
+                w[16], w[17], w[18], w[19], w[20], w[21], w[22], w[23],
+            });
+            log.info("glm_moe_dsa: DIAG pool occupancy in decode: busy workers 0/1/2/3/4/5/6/7/8+ share of time: {d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3}; mean queue {d:.3} jobs; a job queued while a worker is free {d:.3} s\n", .{
+                w[24] / wall, w[25] / wall, w[26] / wall, w[27] / wall, w[28] / wall, w[29] / wall, w[30] / wall, w[31] / wall, w[32] / wall,
+                w[33] / wall, w[34] / 1e9,
             });
             const g1 = self.stream.pool.readGauge();
             log.info("glm_moe_dsa: DIAG pre-read in decode: {d:.0} calls, {d:.0} ranges issued, {d:.0} no slot, {d:.0} claims, {d:.0} started, {d:.0} bound, {d:.0} cancelled, {d:.0} expired, {d:.0} served ({d:.0} waited, {d:.3} ms each), bind waits {d:.3} ms per started; adoptions {d:.0} waited ({d:.3} ms each); speculative {d:.0} chunks, {d:.2} GB, {d:.0} claimed ({d:.0} in flight); read gauge depth {d:.2} mean at an entry, max {d}\n", .{
@@ -1072,6 +1087,12 @@ pub const PromptLine = struct {
         if (p.mem) |m| try w.print("; {f}", .{m});
     }
 };
+
+/// DIAG (diag/pool-wait): an integer knob from the environment, else `default`.
+fn diagEnv(comptime name: [:0]const u8, default: u32) u32 {
+    const v = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(u32, std.mem.span(v), 10) catch default;
+}
 
 /// DIAG (diag/pool-copy-timers): the counters `diagLine` reads, in its order.
 const diag_counters = [_]sdk_ext.expert.io.Counter{ .diag_gu_ranges, .diag_gu_bytes, .diag_gu_read_ns, .diag_gu_copy_ns, .diag_dn_ranges, .diag_dn_bytes, .diag_dn_read_ns, .diag_dn_copy_ns, .adopt_ranges, .adopt_bytes, .diag_adopt_copy_ns, .diag_jobs, .diag_wake_ns, .diag_job_ns, .pre_calls, .pre_issued, .pre_noslot, .pre_claims, .pre_started, .pre_bound, .pre_cancelled, .pre_expired, .pre_served, .pre_waits, .pre_wait_ns, .pre_bind_wait_ns, .adopt_waits, .adopt_wait_ns, .spec_chunks, .spec_bytes, .claimed, .claimed_inflight };
