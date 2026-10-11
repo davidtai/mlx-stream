@@ -463,6 +463,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             gates: ?Gates = null,
             /// Its record in the route recorder (`Stream.recorder`).
             rec: u32 = expert_routes.none,
+            /// DIAG (diag/pool-wait): its submit's clock and its reads' last ends (every range, the gate/up ranges).
+            diag_t0: i64 = 0,
+            diag_end: i64 = 0,
+            diag_gu_end: i64 = 0,
 
             pub fn partsOf(r: *const Route) []const Part {
                 return r.parts[0..r.n_parts];
@@ -526,6 +530,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             wide_depth: u8 = 1,
             phase: Phase = .prefill,
             failed: bool = false,
+            /// DIAG (diag/pool-wait): decode routes with reads; their submit -> last range end and submit -> last gate/up
+            /// end, summed; the first as a histogram (< 0.5, 1, 2, 4, 8 ms, more).
+            diag_lat_n: i64 = 0,
+            diag_lat_ns: i64 = 0,
+            diag_gu_lat_ns: i64 = 0,
+            diag_lat_hist: [6]i64 = @splat(0),
             routes: [route_capacity]Route = @splat(.{}),
             /// Free routes (a stack) and released ones awaiting the next flush, in
             /// release order: `route` and `flush` touch only these, never the ring.
@@ -1418,6 +1428,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     break :blk ends_buf[0..k];
                 };
                 const ls = &self.layers[r.layer];
+                r.diag_t0 = expert_io.Pool.nowNs();
                 var start: u32 = 0;
                 for (ends) |end| {
                     var part: Part = .{ .first = start, .n = end - start };
@@ -1492,6 +1503,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     for (0..count) |k| {
                         const res = self.pool.result(p.ticket + @as(u32, @intCast(k)));
                         if (res.status != .ok) ok = false;
+                        r.diag_end = @max(r.diag_end, res.t_end_ns);
+                        if (k < p.n_reads) r.diag_gu_end = @max(r.diag_gu_end, res.t_end_ns);
                         self.counters.expert_bytes_read += @intCast(@max(res.payload, 0));
                         self.counters.preadv_calls += @intCast(@max(res.preadv_calls, 0));
                         self.noteRead(res);
@@ -1704,6 +1717,16 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     for (r.parts[0..r.n_parts]) |*p| self.settle(r, p) catch |e| {
                         if (first_error == null) first_error = e;
                     };
+                    if (self.phase == .decode and r.diag_t0 > 0 and r.diag_end > r.diag_t0) {
+                        const lat = r.diag_end - r.diag_t0;
+                        self.diag_lat_n += 1;
+                        self.diag_lat_ns += lat;
+                        self.diag_gu_lat_ns += @max(r.diag_gu_end - r.diag_t0, 0);
+                        var h: usize = 0;
+                        var lim: i64 = 500_000;
+                        while (h < 5 and lat >= lim) : (h += 1) lim *= 2;
+                        self.diag_lat_hist[h] += 1;
+                    }
                     for (r.hit_slots[0..r.plan.n_hits]) |s| self.locate(r.layer, s).meta.pins -= 1;
                     for (r.plan.loadsOf()) |l| self.locate(r.layer, l.slot).meta.pins -= 1;
                     r.state = .free;

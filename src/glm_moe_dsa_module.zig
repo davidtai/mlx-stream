@@ -173,6 +173,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         gauge0: [6]i64 = @splat(0),
         wait0: [35]i64 = @splat(0),
         diag_workers: u32 = 0,
+        lat0: [9]i64 = @splat(0),
         decoding: bool = false,
         /// The bill's inputs (the handover bills its request's KV from them), the load's baseline, MLX's target (the
         /// host's ceiling less its wired margin) and the box's RAM (the handover's target, `bill.targetOf`).
@@ -649,6 +650,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             for (&self.diag0, diag_counters) |*x, c| x.* = self.stream.pool.counter(c);
             self.gauge0 = self.stream.pool.readGauge();
             for (&self.wait0, 0..) |*x, i| x.* = self.stream.pool.counterAt(sdk_ext.expert.io.diag_wait_first + i);
+            self.lat0 = [3]i64{ self.stream.diag_lat_n, self.stream.diag_lat_ns, self.stream.diag_gu_lat_ns } ++ self.stream.diag_lat_hist;
             self.ex.host = .{};
             if (self.mtp) |ln| ln.counts = .{};
             for (self.layer_counts0, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
@@ -695,6 +697,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             log.info("glm_moe_dsa: DIAG pool occupancy in decode: busy workers 0/1/2/3/4/5/6/7/8+ share of time: {d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3}/{d:.3}; mean queue {d:.3} jobs; a job queued while a worker is free {d:.3} s\n", .{
                 w[24] / wall, w[25] / wall, w[26] / wall, w[27] / wall, w[28] / wall, w[29] / wall, w[30] / wall, w[31] / wall, w[32] / wall,
                 w[33] / wall, w[34] / 1e9,
+            });
+            const st = self.stream;
+            const ln: f64 = @floatFromInt(st.diag_lat_n - self.lat0[0]);
+            log.info("glm_moe_dsa: DIAG read latency in decode: {d:.0} routes with reads (a bank layer's call), submit -> last range landed {d:.3} ms, -> last gate/up range landed {d:.3} ms each; < 0.5/1/2/4/8/more ms: {d}/{d}/{d}/{d}/{d}/{d}\n", .{
+                ln, f.ms(@floatFromInt(st.diag_lat_ns - self.lat0[1]), ln), f.ms(@floatFromInt(st.diag_gu_lat_ns - self.lat0[2]), ln),
+                st.diag_lat_hist[0] - self.lat0[3], st.diag_lat_hist[1] - self.lat0[4], st.diag_lat_hist[2] - self.lat0[5], st.diag_lat_hist[3] - self.lat0[6], st.diag_lat_hist[4] - self.lat0[7], st.diag_lat_hist[5] - self.lat0[8],
             });
             const g1 = self.stream.pool.readGauge();
             log.info("glm_moe_dsa: DIAG pre-read in decode: {d:.0} calls, {d:.0} ranges issued, {d:.0} no slot, {d:.0} claims, {d:.0} started, {d:.0} bound, {d:.0} cancelled, {d:.0} expired, {d:.0} served ({d:.0} waited, {d:.3} ms each), bind waits {d:.3} ms per started; adoptions {d:.0} waited ({d:.3} ms each); speculative {d:.0} chunks, {d:.2} GB, {d:.0} claimed ({d:.0} in flight); read gauge depth {d:.2} mean at an entry, max {d}\n", .{
