@@ -64,7 +64,7 @@ pub fn prefillCacheBytes(ram: u64) u64 {
 /// pages the kernel has not reclaimed yet read here too, but they were MLX's bytes a moment before, which MLX's terms
 /// bound: the bounds leave them out (the phase's footprint peak, its residual, holds the sum). The construction's
 /// readings are its footprint's high-water (the loaders' host buffers, freed before its end).
-pub const host_side_construction_bytes: u64 = 900_000_000;
+pub const host_side_construction_bytes: u64 = 1_150_000_000;
 pub const host_side_prompt_bytes: u64 = 950_000_000;
 pub const host_side_decode_bytes: u64 = 1_050_000_000;
 /// The readings the host-side bounds cover (the box's runs, at --ctx-size 16448): the footprint, MLX active and MLX
@@ -77,8 +77,9 @@ pub const host_side_decode_bytes: u64 = 1_050_000_000;
 /// the host) 0.592-0.594 / 0.894-0.895 / 0.894-0.929 / 0.997-0.998 GB (ABBAs stack-42abec0-vs-3e37e40,
 /// decode-42abec0-vs-3e37e40, stack-42abec0-devroute); stack 27f97d6's (eight read workers: 102,141,952 B of staging)
 /// 0.912-0.913 GB at the requests' end (ABBA rangejobs-27f97d6-w8-vs-stack-f2be1ba); the sampler's decode on stack
-/// f2be1ba (diag cachemem 79d1891) at most 0.931 GB but in its two seconds of unreclaimed pages. This bill's phase
-/// records are pinned to the byte (the receipts).
+/// f2be1ba (diag cachemem 79d1891) at most 0.931 GB but in its two seconds of unreclaimed pages; the closing runs of
+/// e96bfe4 on the uniform 3.0 pack 1.036 GB past the staging at their construction's high-water (0.531 GB steady), its
+/// source not yet found (an open item). This bill's phase records are pinned to the byte (the receipts).
 pub const host_side_readings = [_][5]u64{
     .{ 197_916_120_504, 197_530_209_800, 0, 0, 89_362_432 }, // stack-9d157b5 constructed: 0.386 GB
     .{ 183_255_346_344, 182_876_769_800, 0, 0, 89_362_432 }, // diag-coding constructed: 0.379 GB
@@ -96,6 +97,7 @@ pub const host_side_readings = [_][5]u64{
     .{ 240_651_068_424, 239_216_954_640, 419_342_868, 3, 102_141_952 }, // rangejobs-27f97d6 run 3's request end: 0.913 GB
     .{ 1_020_000_000, 0, 0, 3, 89_362_432 }, // diag cachemem (f2be1ba) decode, the sampler's steady seconds: 0.931 GB
     .{ 1_031_000_000, 0, 0, 3, 102_141_952 }, // diag cachemem (27f97d6, the pending copy) decode, the same: 0.929 GB
+    .{ 195_611_398_824, 194_498_366_984, 0, 0, 76_976_128 }, // closing e96bfe4 (the 3.0 pack) construction's high-water: 1.036 GB
 };
 /// The page tables of `wired` bytes (`phase_memory.wireTables`, shared with DeepSeek-V4.1's bill).
 pub const wireTables = phase_mem.wireTables;
@@ -1362,8 +1364,8 @@ test "glm bill: the bill line lists every term and each phase's total at the uni
 test "glm bill: every measured host side sits under its phase's bound" {
     const bounds = [4]u64{ host_side_construction_bytes, host_side_prompt_bytes, host_side_decode_bytes, host_side_decode_bytes };
     for (host_side_readings) |r| try testing.expect((r[0] -| r[1] -| r[2]) -| r[4] <= bounds[r[3]]);
-    // Each bound: the largest reading past the staging (constructed 0.772 and the prompt pass 0.806 GB, stack 42abec0's;
-    // the handover and decode 0.931 GB, the sampler's) plus 0.1 GB, rounded up to 50 MB.
+    // Each bound: the largest reading past the staging (constructed 1.036 GB, the 3.0 pack's closing runs; the prompt
+    // pass 0.806 GB, stack 42abec0's; the handover and decode 0.931 GB, the sampler's) plus 0.1 GB, rounded up to 50 MB.
     var top: [3]u64 = .{ 0, 0, 0 };
     for (host_side_readings) |r| {
         const i = @min(r[3], 2);

@@ -98,6 +98,9 @@ const Receipt = struct {
     live_bytes: u64,
     /// The arm's units cap (`expert_units_cap`; null: off): the grow takes at most its grown bytes.
     cap: ?u32 = null,
+    /// The construction's host-side bound the run billed (`bill.host_side_construction_bytes` then): its records rebuild
+    /// at it, and today's bound must cover what the run measured.
+    ran_host_side_construction: u64 = bill.host_side_construction_bytes,
     grown: u32,
     grown_bytes: u64,
     positions: u64,
@@ -122,6 +125,7 @@ const receipts = [_]Receipt{
         .bill_bytes = 28469226438,
         .live_bytes = 28528778586,
         .cap = 96,
+        .ran_host_side_construction = 900_000_000,
         .grown = 96,
         .grown_bytes = 19326910464,
         .file_backed_start = 19418972160,
@@ -145,6 +149,7 @@ const receipts = [_]Receipt{
         .bill_bytes = 28495026118,
         .live_bytes = 28554578266,
         .cap = 96,
+        .ran_host_side_construction = 900_000_000,
         .grown = 96,
         .grown_bytes = 19326910464,
         .file_backed_start = 19427590144,
@@ -172,15 +177,18 @@ test "glm bill receipts: each run's phase terms, page tables and residuals rebui
         const req = bill.atRequest(in, r.request.positions, r.request.pending_rows);
         const p = r.units.prompt;
         const slots = bill.slotBytes(in.bank, p) + r.grown_bytes;
-        const want = [4]bill.PhaseTerms{ b.terms(.construction, p, p), b.terms(.prompt, p, p), req.termsAt(.decode, slots), req.termsAt(.decode, slots) };
-        for (r.records, want) |rec, w| {
+        const today = [4]bill.PhaseTerms{ b.terms(.construction, p, p), b.terms(.prompt, p, p), req.termsAt(.decode, slots), req.termsAt(.decode, slots) };
+        // The bill as the run billed it: today's, its construction's host side at the run's bound.
+        var want = today;
+        want[0].host_side = r.ran_host_side_construction;
+        for (r.records, want, today) |rec, w, t| {
             try testing.expectEqualDeep(w, rec.billed);
             const pm: sdk.memory.ProcessMemory = .{ .footprint = rec.measured.footprint, .footprint_interval_peak = rec.measured.interval_peak };
             const m = rec.measured;
             try phase_mem.expectMeasured(phase_mem.recordOf(bill.PhaseTerms, rec.phase, w, w.sum(), w.device(), pm, m.mlx_active, m.mlx_cache, m.mlx_peak, m.physical, m.file_backed, m.speculative, r.file_backed_start), m, r.file_backed_start);
-            // The bill covers the phase: billed at least the footprint's high-water mark and MLX's peak (constructed: the
-            // module's arrays to the byte, beside the host's key).
-            try testing.expect(m.residual >= 0);
+            // Today's bill covers the phase: billed at least the footprint's high-water mark and MLX's peak (constructed:
+            // the module's arrays to the byte, beside the host's key).
+            try testing.expect(m.residual + @as(i64, @intCast(t.sum())) - @as(i64, @intCast(w.sum())) >= 0);
             if (std.mem.eql(u8, rec.phase, "module constructed")) try testing.expectEqual(-host_key_bytes, m.mlx_residual) else try testing.expect(m.mlx_residual >= 0);
             // The step created no page cache the bill would not see.
             try phase_mem.checkPageCache(@as(i64, @intCast(m.file_backed)) - @as(i64, @intCast(r.file_backed_start)));
