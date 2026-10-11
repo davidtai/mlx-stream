@@ -148,6 +148,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         bill: sdk.MemoryBill,
         /// The request's decode since its handover, for its request-end line; null before the handover and after the line.
         decode_mark: ?DecodeMark = null,
+        /// The last prompt pass's prefill GEMM calls and GPU drains (an EXL3 quant's; null for another quant).
+        prompt_gemm: ?[2]u64 = null,
         /// Each routed layer's counts at the handover and at the request's end, and the line's hit rates.
         layer_counts0: []LayerCounts,
         layer_counts1: []LayerCounts,
@@ -155,7 +157,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// The MTP draft lane (null: `mtp_depth` 0).
         mtp: ?*Lane = null,
 
-        const DecodeMark = struct { s0: Stats, mem0: Mem, steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0 };
+        const DecodeMark = struct { s0: Stats, mem0: Mem, by0: Bk.Stream.ByRank, steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0 };
 
         pub fn init(gpa: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host) !*Self {
             return initWith(gpa, io, cfg, weights, s, host, .{});
@@ -241,7 +243,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .staging_from_bank = true,
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
                 .pool = .{ .workers = shape.workers, .tickets = 1024 * Bk.Stream.maxMinis(&self.bank), .direct = true },
-                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
+                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget(), .max_rank = cfg.lookaheadMaxRank() },
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
             });
             errdefer self.stream.deinit();
@@ -352,6 +354,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             try self.reverse(@intCast(start + ids.len));
             self.stream.resetPromptCounts();
             const s0 = self.stream.stats();
+            const q0: ?[2]u64 = if (comptime @hasDecl(Math, "prefillStats")) self.math.prefillStats() else null;
             startPhase();
             const mem0 = Mem.now();
             const t0 = self.nowNs();
@@ -379,8 +382,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }
             try self.g.evalAll(&.{logits.?});
             try self.ex.flush();
+            self.prompt_gemm = if (q0) |a| blk: {
+                const b = self.math.prefillStats();
+                break :blk .{ b[0] - a[0], b[1] - a[1] };
+            } else null;
             _ = mlx.mlx_synchronize(self.g.s);
-            log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .mem = .{ .start = mem0, .end = Mem.now() } }});
+            log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .gemm = self.prompt_gemm, .mem = .{ .start = mem0, .end = Mem.now() } }});
             return logits.?;
         }
 
@@ -465,7 +472,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 timeline.install(self.g.s, @intCast(@min(h.reserved_tokens -| h.prompt_tokens, timeline.max_cycles + 1)), @intCast(@min(self.bank.layers.len / Experts.bpl, timeline.max_layers))) catch |e|
                     log.warn("glm_moe_dsa: the verify timeline is off ({s})\n", .{@errorName(e)});
             };
-            self.decode_mark = .{ .s0 = self.stream.stats(), .mem0 = Mem.now() };
+            self.decode_mark = .{ .s0 = self.stream.stats(), .mem0 = Mem.now(), .by0 = self.stream.lookaheadByRank() };
             self.ex.host = .{};
             if (self.mtp) |ln| ln.counts = .{};
             for (self.layer_counts0, 0..) |*c, l| c.* = self.stream.layerCounts(@intCast(l));
@@ -502,6 +509,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .box = Box.now(end),
             }});
             log.info("{f}\n", .{HostLine{ .h = self.ex.host, .wall_ns = d.wall_ns }});
+            const by1 = self.stream.lookaheadByRank();
+            log.info("{f}\n", .{PrecisionLine{ .by0 = &d.by0, .by1 = &by1 }});
         }
 
         /// The reverse phase change, before a prompt of `positions` positions (its kept prefix included) after a decode:
@@ -871,12 +880,15 @@ pub const PromptLine = struct {
     tokens: u64,
     wall_ns: u64,
     r: Reads,
+    /// The EXL3 quant's prefill GEMM calls and its waits on the GPU in the pass (null for a quant without them).
+    gemm: ?[2]u64 = null,
     mem: ?PhaseMem = null,
 
     pub fn format(p: PromptLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("glm_moe_dsa: prompt {d} tokens in {d:.2} s ({d:.1} tok/s): {d:.2} GB from the SSD, {d} records on demand, {d} read ahead ({d} routed), host wait {d:.2} s", .{
             p.tokens, seconds(p.wall_ns), perSecond(p.tokens, p.wall_ns), gigabytes(p.r.ssd_bytes), p.r.demand_records, p.r.ahead_records, p.r.ahead_hits, seconds(p.r.wait_ns),
         });
+        if (p.gemm) |q| try w.print(", {d} prefill GEMM calls, {d} GPU drains", .{ q[0], q[1] });
         if (p.mem) |m| try w.print("; {f}", .{m});
     }
 };
@@ -922,7 +934,55 @@ pub const HostLine = struct {
     }
 };
 
+/// The decode lookahead's precision at the request's end: per bank layer of a routed layer (K ascending; one for the
+/// affine bank) and top-k position of the candidate's best row, the records read ahead and of them those the target
+/// call routed, between the stream's counts at the handover (`by0`) and at the end (`by1`).
+pub const PrecisionLine = struct {
+    by0: []const [sdk_ext.expert.lookahead.max_k][2]u64,
+    by1: []const [sdk_ext.expert.lookahead.max_k][2]u64,
+
+    pub fn format(p: PrecisionLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll("glm_moe_dsa: lookahead precision per top-k position (read ahead / of them routed by the target call)");
+        for (p.by0, p.by1, 0..) |side0, side1, si| {
+            if (p.by1.len > 1) try w.print("{s} bank layer {d}:", .{ if (si == 0) ":" else ";", si }) else try w.writeAll(":");
+            var all: [2]u64 = .{ 0, 0 };
+            for (side0, side1, 0..) |x0, x1, r| if (x1[0] > x0[0]) {
+                const x = [2]u64{ x1[0] - x0[0], x1[1] - x0[1] };
+                try w.print(" #{d} {d}/{d} ({d:.0}%),", .{ r, x[0], x[1], pct(x[1], x[0]) });
+                all[0] += x[0];
+                all[1] += x[1];
+            };
+            try w.print(" all {d}/{d} ({d:.0}%)", .{ all[0], all[1], pct(all[1], all[0]) });
+        }
+    }
+
+    fn pct(n: u64, d: u64) f64 {
+        return if (d == 0) 0 else 100 * @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(d));
+    }
+};
+
 const testing = std.testing;
+
+test "glm stats lines: the lookahead's precision per top-k position, per bank layer, from fixed counters" {
+    const a = testing.allocator;
+    // The counts at the handover (an earlier request's) and at the end.
+    var two0: [2][sdk_ext.expert.lookahead.max_k][2]u64 = @splat(@splat(.{ 0, 0 }));
+    two0[0][0] = .{ 5, 4 };
+    two0[1][3] = .{ 2, 1 };
+    var two: [2][sdk_ext.expert.lookahead.max_k][2]u64 = two0;
+    two[0][0] = .{ 45, 34 };
+    two[0][2] = .{ 10, 2 };
+    two[1][1] = .{ 8, 6 };
+    const l2 = try std.fmt.allocPrint(a, "{f}", .{PrecisionLine{ .by0 = &two0, .by1 = &two }});
+    defer a.free(l2);
+    try testing.expectEqualStrings("glm_moe_dsa: lookahead precision per top-k position (read ahead / of them routed by the target call): bank layer 0: #0 40/30 (75%), #2 10/2 (20%), all 50/32 (64%); bank layer 1: #1 8/6 (75%), all 8/6 (75%)", l2);
+    const l1 = try std.fmt.allocPrint(a, "{f}", .{PrecisionLine{ .by0 = two0[1..], .by1 = two[1..] }});
+    defer a.free(l1);
+    try testing.expectEqualStrings("glm_moe_dsa: lookahead precision per top-k position (read ahead / of them routed by the target call): #1 8/6 (75%), all 8/6 (75%)", l1);
+    const l0 = try std.fmt.allocPrint(a, "{f}", .{PrecisionLine{ .by0 = two0[1..], .by1 = two0[1..] }});
+    defer a.free(l0);
+    try testing.expectEqualStrings("glm_moe_dsa: lookahead precision per top-k position (read ahead / of them routed by the target call): all 0/0 (0%)", l0);
+}
 
 test "glm stats lines: the prompt and decode lines and the per-layer hit spread, from fixed counters" {
     const s0: Stats = .{ .expert_bytes_read = 100, .adopt_bytes = 10, .spec_bytes = 5, .persistent_loads = 3, .transient_loads = 1, .loads_skipped = 1, .expert_cache_hits = 7, .expert_cache_misses = 4 };
@@ -939,6 +999,9 @@ test "glm stats lines: the prompt and decode lines and the per-layer hit spread,
     const p = try std.fmt.allocPrint(a, "{f}", .{PromptLine{ .tokens = 1008, .wall_ns = 31_500_000_000, .r = r }});
     defer a.free(p);
     try testing.expectEqualStrings("glm_moe_dsa: prompt 1008 tokens in 31.50 s (32.0 tok/s): 9.00 GB from the SSD, 380 records on demand, 50 read ahead (40 routed), host wait 1.50 s", p);
+    const pg = try std.fmt.allocPrint(a, "{f}", .{PromptLine{ .tokens = 1008, .wall_ns = 31_500_000_000, .r = r, .gemm = .{ 40, 0 } }});
+    defer a.free(pg);
+    try testing.expect(std.mem.endsWith(u8, pg, "host wait 1.50 s, 40 prefill GEMM calls, 0 GPU drains"));
     const d = try std.fmt.allocPrint(a, "{f}", .{DecodeLine{ .steps = 40, .tokens = 128, .wall_ns = 25_000_000_000, .r = r, .hit_rate = hitSpread(&c0, &c1, &rates), .rows = 136 }});
     defer a.free(d);
     const hl = try std.fmt.allocPrint(a, "{f}", .{HostLine{ .h = .{ .calls = 300, .barrier_ns = 9_000_000_000, .route_ns = 1_500_000_000, .wave_ns = 2_250_000_000 }, .wall_ns = 25_000_000_000 }});
@@ -1050,6 +1113,16 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
     try testing.expectEqual(demand_bytes, s1.expert_bytes_read - p0.expert_bytes_read);
     try testing.expectEqual(demand_bytes - (s1.adopt_bytes - p0.adopt_bytes) + (s1.spec_bytes - p0.spec_bytes), decode.ssd_bytes);
     try testing.expect(decode.spec_issued > 0 and decode.spec_used <= decode.spec_issued and decode.ahead_records == 0);
+    // The lookahead's precision: every record read ahead counted at its top-k position (the prompt pass read none
+    // ahead), its target call routing at least the ones it claimed.
+    const by1 = s.lookaheadByRank();
+    var la: [2]u64 = .{ 0, 0 };
+    for (by1[0]) |x| {
+        la[0] += x[0];
+        la[1] += x[1];
+    }
+    try testing.expectEqual(decode.spec_issued, la[0]);
+    try testing.expect(la[1] >= decode.spec_used and la[1] <= la[0]);
     var c1: [4]LayerCounts = undefined;
     for (&c1, 0..) |*c, l| c.* = s.layerCounts(@intCast(l));
     var rates: [4]f64 = undefined;
@@ -1058,6 +1131,8 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
     try testing.expectEqual(hitSpread(&@as([4]LayerCounts, @splat(.{})), &per_layer, &want_rates).?, spread);
     // 24 layer calls: 6 steps of the bank's 4 routed layers.
     std.debug.print("{f}\n", .{DecodeLine{ .steps = 6, .tokens = 6, .wall_ns = wall, .r = decode, .hit_rate = spread, .rows = 6 }});
+    const by0: @TypeOf(by1) = @splat(@splat(.{ 0, 0 }));
+    std.debug.print("{f}\n", .{PrecisionLine{ .by0 = &by0, .by1 = &by1 }});
 }
 
 test "glm handover: the settle reads until the cache is empty and the footprint shows the frees, at most its wait" {
@@ -1144,7 +1219,7 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     try glm.writeResidents(a, testing.io, tmp.dir, &model);
     var rbuf: [512]u8 = undefined;
     const dir = try exl3_bank.tmpRoot(&tmp, &rbuf);
-    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3, .expert_lookahead_budget = 3 };
+    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3, .expert_lookahead_budget = 3, .expert_lookahead_max_rank = 2 };
     defer cfg.deinit(a);
     var weights = try sdk.loader.dir(testing.io, a, dir, .{});
     defer weights.deinit();
@@ -1154,15 +1229,23 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     const sv = try Served.init(a, testing.io, &cfg, &weights, s, .{ .ceiling = 64 << 30, .wired_margin = 0 });
     defer sv.deinit();
     const m = sv.exl3;
-    // The setting's lookahead budget is the stream's.
+    // The setting's lookahead budget and rank cap are the stream's.
     try testing.expectEqual(@as(u32, 3), m.stream.selector.?.budget);
+    try testing.expectEqual(@as(u32, 2), m.stream.selector.?.max_rank);
     try testing.expectEqual(@as(usize, 8), m.decode_rows.len);
     for (m.prompt_rows, m.decode_rows) |p, d| {
         try testing.expectEqual(@as(u32, 3), p);
         try testing.expectEqual(@as(u32, 5), d);
     }
     const prompt = [_]u32{ 3, 17, 9, 101, 44, 250, 7, 63, 12, 5, 99, 31 };
+    const q0 = m.math.prefillStats();
     const logits = try m.prefillAt(0, &prompt);
+    // The prompt's slices past sushi's decode rows ran the prefill GEMM over host slots: no wait on the GPU.
+    const q1 = m.math.prefillStats();
+    try testing.expect(q1[0] > q0[0]);
+    try testing.expectEqual(q0[1], q1[1]);
+    // The prompt line's counts: the pass's GEMM calls, no drain.
+    try testing.expectEqual([2]u64{ q1[0] - q0[0], 0 }, m.prompt_gemm.?);
     var t = try m.g.hostArgmax(logits);
     _ = mlx.mlx_array_free(logits);
     try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });

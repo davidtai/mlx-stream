@@ -55,6 +55,31 @@ test "dsv41 lookahead: the union is ordered by best rank over rows, then score" 
     try testing.expectEqualSlices(u16, &.{ 7, 1, 9, 4 }, sel.select(&s, &res, out[0..sel.budget]));
 }
 
+test "dsv41 lookahead: the chosen experts' top-k positions come back with them, and a rank cap drops the candidates past it" {
+    const a = testing.allocator;
+    var sel = try Selector.init(a, 16, 8, std.math.inf(f32), 4);
+    defer sel.deinit(a);
+    var res = try policyWith(a, 16, &.{ 3, 5, 12 });
+    defer res.deinit(a);
+    const s = rowsOf(16, 2, .{
+        &.{ .{ 3, 0.9 }, .{ 7, 0.8 }, .{ 1, 0.7 }, .{ 9, 0.6 }, .{ 4, 0.5 }, .{ 2, 0.4 }, .{ 11, 0.3 }, .{ 5, 0.2 }, .{ 13, 0.1 } },
+        &.{ .{ 7, 0.95 }, .{ 5, 0.85 }, .{ 3, 0.75 }, .{ 12, 0.65 }, .{ 1, 0.55 }, .{ 0, 0.45 }, .{ 2, 0.35 }, .{ 8, 0.25 }, .{ 14, 0.15 } },
+    });
+    const resident = struct {
+        fn f(p: *const LayerPolicy, e: u16) bool {
+            return p.slotOf(e) != null;
+        }
+    }.f;
+    var out: [max_budget]u16 = undefined;
+    var ranks: [max_budget]u8 = undefined;
+    try testing.expectEqualSlices(u16, &.{ 7, 1, 9, 4 }, sel.selectWith(&s, &res, resident, &out, &ranks));
+    try testing.expectEqualSlices(u8, &.{ 0, 2, 3, 4 }, &ranks);
+    // Only the candidates at the first 3 positions of their row: 7 (0) and 1 (2) are not resident.
+    sel.max_rank = 3;
+    try testing.expectEqualSlices(u16, &.{ 7, 1 }, sel.selectWith(&s, &res, resident, &out, &ranks));
+    try testing.expectEqualSlices(u8, &.{ 0, 2 }, ranks[0..2]);
+}
+
 test "dsv41 lookahead: tau keeps a candidate within tau of its row's sixth score" {
     const a = testing.allocator;
     var none = try policyWith(a, 16, &.{});

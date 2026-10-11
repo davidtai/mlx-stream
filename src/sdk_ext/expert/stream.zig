@@ -56,6 +56,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         /// A bank of several bank layers per routed layer (`B.banks_per_layer`, its `Bank.streamLayer`): the
         /// lookahead reads ahead over all the next routed layer's bank layers.
         pub const multi_bank = @hasDecl(B, "banks_per_layer") and B.banks_per_layer > 1;
+        /// The bank layers per routed layer (the lookahead's precision is counted per one).
+        pub const sides: usize = if (multi_bank) B.banks_per_layer else 1;
+        /// Per bank layer of a routed layer (`sides`), per top-k position: the records read ahead, and those the target
+        /// call routed.
+        pub const ByRank = [sides][expert_lookahead.max_k][2]u64;
 
         /// Two layers whose slot rows are interchangeable: the same records per id and the same segments.
         pub fn sameGeometry(x: *const Layer, y: *const Layer) bool {
@@ -384,6 +389,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// demand jobs run (0 = demand idle).
             idle_busy: u32 = 0,
             preread: bool = true,
+            /// Candidates past this top-k position of their best row are never read ahead (`max_k`: none dropped).
+            max_rank: u32 = expert_lookahead.max_k,
         };
 
         pub const Event = struct {
@@ -533,6 +540,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// `read_ns` of results with no preadv (copy-only adoptions).
             copy_only_ns: u64 = 0,
             selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null,
+            /// The lookahead's precision: the records read ahead for the next routed layer (their experts, the top-k
+            /// position each was chosen at, the bank layer it is in) until that layer's call routes, then per bank layer
+            /// and position the records read ahead and those the call routed (`by_rank`).
+            ahead_pending: [expert_lookahead.max_budget]struct { expert: u16, rank: u8, side: u8, routed: bool } = undefined,
+            n_ahead_pending: u8 = 0,
+            ahead_pending_layer: u32 = 0,
+            by_rank: ByRank = @splat(@splat(.{ 0, 0 })),
             preread: bool = false,
             /// Decode layer calls so far; a call's pre-reads and speculative records
             /// carry its tag, settled by its own step.
@@ -628,7 +642,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     };
                 }
                 var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
-                if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
+                if (opt.lookahead) |la| {
+                    selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
+                    selector.?.max_rank = la.max_rank;
+                }
                 errdefer if (selector) |*sel| sel.deinit(a);
                 // The pool writes the event word until it stops.
                 var word: ?*i64 = null;
@@ -896,6 +913,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             fn routeWith(self: *Stream, layer: u32, ids: []const u16, scores: []const f32, step: bool) Error!*Route {
                 if (self.failed) return error.StreamFailed;
+                self.notePrecision(layer, ids, step);
                 std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
                 // A decode route's transient loads take at most its ids' rows of window 0.
                 if (self.phase == .decode and ids.len > self.transient.rows) return self.fail(error.RouteWiderThanWindow);
@@ -986,6 +1004,39 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     return self.fail(error.PreReadRefused);
             }
 
+            /// The routed layer a stream layer belongs to.
+            fn routedOf(layer: u32) u32 {
+                return if (comptime multi_bank) layer / B.banks_per_layer else layer;
+            }
+
+            /// The records read ahead for routed layer `layer`'s call: the ones its ids route are marked; at the call's
+            /// last route (`last`) every one is counted at its top-k position (`by_rank`) and forgotten.
+            fn notePrecision(self: *Stream, layer: u32, ids: []const u16, last: bool) void {
+                if (self.n_ahead_pending == 0 or routedOf(layer) != self.ahead_pending_layer) return;
+                for (self.ahead_pending[0..self.n_ahead_pending]) |*p| {
+                    if (std.mem.indexOfScalar(u16, ids, p.expert) != null) p.routed = true;
+                }
+                if (!last) return;
+                for (self.ahead_pending[0..self.n_ahead_pending]) |p| {
+                    self.by_rank[p.side][p.rank][0] += 1;
+                    self.by_rank[p.side][p.rank][1] += @intFromBool(p.routed);
+                }
+                self.n_ahead_pending = 0;
+            }
+
+            /// The lookahead's records read ahead and of them those the target call routed, per bank layer of a routed
+            /// layer and top-k position.
+            pub fn lookaheadByRank(self: *const Stream) ByRank {
+                return self.by_rank;
+            }
+
+            /// The records just read ahead for routed layer `routed` (`side`: each one's bank layer of it, null = 0).
+            fn notePending(self: *Stream, routed: u32, experts: []const u16, ranks: []const u8, side: ?[]const u8) void {
+                self.ahead_pending_layer = routed;
+                for (experts, ranks, self.ahead_pending[0..experts.len], 0..) |e, r, *p, i| p.* = .{ .expert = e, .rank = r, .side = if (side) |sd| sd[i] else 0, .routed = false };
+                self.n_ahead_pending = @intCast(experts.len);
+            }
+
             /// Settles every record read ahead for this call that it did not claim,
             /// then reads ahead the next layer's predicted records (keyed by offset).
             fn speculate(self: *Stream, r: *const Route, scores: []const f32) Error!void {
@@ -997,10 +1048,17 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (scores.len > 0 and next < self.layers.len) {
                     const sel = &self.selector.?;
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
-                    for (sel.select(scores, &self.layers[next].policy, chosen[0..sel.budget])) |e| {
+                    var ranks: [expert_lookahead.max_budget]u8 = undefined;
+                    const picked = sel.selectWith(scores, &self.layers[next].policy, struct {
+                        fn f(p: *const LayerPolicy, e: u16) bool {
+                            return p.slotOf(e) != null;
+                        }
+                    }.f, chosen[0..sel.budget], ranks[0..sel.budget]);
+                    for (picked) |e| {
                         bases[n] = @intCast(self.bank.recordOffset(next, e));
                         n += 1;
                     }
+                    self.notePending(next, picked, ranks[0..picked.len], null);
                     len = spanOf(&self.bank.layers[next]);
                 }
                 _ = self.pool.specStep(self.bank.sidecar, r.tag, bases[0..n], len) catch
@@ -1026,12 +1084,17 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         }
                     }.f;
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
-                    for (sel.selectWith(scores, Ctx{ .s = self, .routed = next }, resident, chosen[0..sel.budget])) |e| {
+                    var ranks: [expert_lookahead.max_budget]u8 = undefined;
+                    const picked = sel.selectWith(scores, Ctx{ .s = self, .routed = next }, resident, chosen[0..sel.budget], ranks[0..sel.budget]);
+                    var side: [expert_lookahead.max_budget]u8 = undefined;
+                    for (picked) |e| {
                         const sl = self.bank.streamLayer(next, e);
                         bases[n] = @intCast(self.bank.recordOffset(sl, e));
                         lens[n] = @intCast(spanOf(&self.bank.layers[sl]));
+                        side[n] = @intCast(sl - bpl * next);
                         n += 1;
                     }
+                    self.notePending(next, picked, ranks[0..picked.len], side[0..n]);
                 }
                 _ = self.pool.specStepLens(self.bank.sidecar, r.tag, bases[0..n], lens[0..n]) catch
                     return self.fail(error.SpecRefused);

@@ -827,6 +827,10 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
     s.release(r0);
     s.release(r1);
     try testing.expectEqual(@as(u64, 4), s.stats().spec_issued);
+    // The demand reads done, the two speculative threads start (a chunk starts with at most one demand job running):
+    // 50 ms later records 5 and 2 are in flight (their first chunk held 100-200 ms) and 6 and 7 still queued.
+    var ts: std.c.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&ts, null);
     // Routed layer 1's call: its held K3 route claims 2 (in flight) and reads 6 itself (queued); nothing is settled
     // before its K4 route, which claims 5 and reads 7 itself. Every mini's two ranges of 2 and 5 are served from the
     // records (5's read at its K4 span).
@@ -848,6 +852,14 @@ test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts o
             }
         }
     }
+    // Their top-k positions in the one row (5, 2, 6, 7 at 0 .. 3), each in its own bank layer: each read ahead and routed.
+    const br = s.lookaheadByRank();
+    for ([_]u16{ 5, 2, 6, 7 }, [_]u1{ 1, 0, 0, 1 }, 0..) |e, sd, r| {
+        try testing.expectEqual(@as(u32, 2) + sd, b.streamLayer(1, e));
+        try testing.expectEqual([2]u64{ 1, 1 }, br[sd][r]);
+        try testing.expectEqual([2]u64{ 0, 0 }, br[1 - sd][r]);
+    }
+    for (br) |side| for (side[4..]) |x| try testing.expectEqual([2]u64{ 0, 0 }, x);
     s.release(q0);
     s.release(q1);
     try s.flush();
