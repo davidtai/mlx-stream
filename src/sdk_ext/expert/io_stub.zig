@@ -91,6 +91,9 @@ pub const q3ld = struct {
     pub fn q3ld_test_ev_log(_: ?[*]i64, _: i64) i64 {
         return 0;
     }
+    pub fn q3ld_test_busy_log(_: ?[*]i64, _: i64) i64 {
+        return 0;
+    }
 };
 
 /// `dsv41ev_*`: every event creation refuses.
