@@ -287,8 +287,9 @@ pub const Carry = struct {
 /// The indexer of full layer `l` over the forward's rows: per query block the top `index_topk` keys by the fp32
 /// score (relu'd per head, weighted by `weights_proj` at `n_heads^-0.5 * head_dim^-0.5`, summed over heads), masked
 /// causally in a block of several rows (a one-row block's keys all precede its row); argpartition's ids in its order
-/// (`glm_moe_dsa_topk` where it serves the shape); null where the block's keys fit `index_topk` (every causal key is
-/// attended). Kept in `carry`.
+/// (`glm_moe_dsa_topk` where it serves the shape: a block of several rows alone, the one-row blocks of a verify in one
+/// launch, `topk_mod.max_rows` at a time); null where the block's keys fit `index_topk` (every causal key is attended).
+/// Kept in `carry`.
 pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, rows: u32, carry: *Carry) !void {
     const keys = start + rows;
     const topk = c.index_topk;
@@ -300,6 +301,9 @@ pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, 
     const ihd: f64 = @floatFromInt(c.index_head_dim);
     const wts = try g.mul(try g.astype(try linear(g, x, ix.weights_proj), .float32), try g.scalar(std.math.pow(f64, ih, -0.5) * std.math.pow(f64, ihd, -0.5), .float32));
     const k32 = try g.astype(ik_all, .float32);
+    var held: [topk_mod.max_rows]Held = undefined;
+    var n_held: usize = 0;
+    defer for (held[0..n_held]) |h| g.release(h.s);
     for (0..carry.nBlocks()) |i| {
         const b0 = carry.bounds[i];
         const b1 = carry.bounds[i + 1];
@@ -309,6 +313,7 @@ pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, 
             continue;
         }
         const m = g.mark();
+        defer g.resetTo(m);
         const qb = try g.astype(try rowSlice(g, iq, @intCast(b0), @intCast(b1)), .float32);
         var s = try g.matmul(qb, try swapLast(g, try rowSlice(g, k32, 0, @intCast(nb))));
         s = try g.maximum(s, try g.scalar(0, .float32));
@@ -316,13 +321,45 @@ pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, 
         const w4 = try g.reshape(try g.transposeAxes(wb, &.{ 1, 0 }), &.{ 1, @intCast(c.index_n_heads), @intCast(b1 - b0), 1 });
         s = try g.sum(try g.mul(s, w4), 1, true);
         const r: c_int = @intCast(b1 - b0);
-        if (r > 1) s = try g.where(try causalMask(g, start + b0, b1 - b0, nb), s, try g.scalar(-std.math.inf(f64), .float32));
+        if (r == 1) {
+            held[n_held] = .{ .i = i, .s = g.keep(s) };
+            n_held += 1;
+            if (n_held == held.len) {
+                try selectRows(g, topk, carry, held[0..n_held]);
+                for (held[0..n_held]) |h| g.release(h.s);
+                n_held = 0;
+            }
+            continue;
+        }
+        s = try g.where(try causalMask(g, start + b0, b1 - b0, nb), s, try g.scalar(-std.math.inf(f64), .float32));
         const idx = if (try topk_mod.topk(g, try g.reshape(s, &.{ 1, r, @intCast(nb) }), topk)) |t| try g.reshape(t, &.{ 1, 1, r, @intCast(topk) }) else blk: {
             const kth: c_int = @intCast(nb - topk);
             break :blk try lastSlice(g, try g.argpartition(s, kth, -1), kth, @intCast(nb));
         };
         carry.set(g, i, idx);
-        g.resetTo(m);
+    }
+    if (n_held > 0) try selectRows(g, topk, carry, held[0..n_held]);
+}
+
+/// A one-row block's scores `[1, 1, 1, keys]` held for `selectRows`, and its block.
+const Held = struct { i: usize, s: T };
+
+/// The top `topk` ids of each held one-row block in one launch (`topk_mod.topkRows`), each block's `[1, 1, 1, topk]`
+/// int32 in `carry`; argpartition's per block where the kernel does not serve `topk`.
+fn selectRows(g: *G, topk: u32, carry: *Carry, held: []const Held) !void {
+    const m = g.mark();
+    defer g.resetTo(m);
+    var ss: [topk_mod.max_rows]T = undefined;
+    for (held, 0..) |h, j| ss[j] = h.s;
+    const k: c_int = @intCast(topk);
+    if (try topk_mod.topkRows(g, ss[0..held.len], topk)) |ids| {
+        for (held, 0..) |h, j| {
+            const jr: c_int = @intCast(j);
+            carry.set(g, h.i, try g.reshape(try g.slice(ids, &.{ jr, 0 }, &.{ jr + 1, k }, &.{ 1, 1 }), &.{ 1, 1, 1, k }));
+        }
+    } else for (held) |h| {
+        const nb = g.shapeOf(h.s).dim(-1);
+        carry.set(g, h.i, try lastSlice(g, try g.argpartition(h.s, nb - k, -1), nb - k, nb));
     }
 }
 
