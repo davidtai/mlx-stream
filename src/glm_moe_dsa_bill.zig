@@ -170,6 +170,34 @@ pub fn selectOf(c: *const glm.Config) Select {
     return if (topk_mod.serves(c.index_topk)) .kernel else .argpartition;
 }
 
+/// The bytes MLX's allocator takes for a request of `bytes` while its size classes are on (the patched allocator's
+/// `mlx_set_alloc_size_classes`, which the module turns on only while the prompt's forward layers evaluate): the request
+/// page-rounded (16 KiB); from 1 MiB, rounded up to a step of an eighth of its power of two (at least a page), at most
+/// 12.5 % more.
+pub fn sizeClassBytes(bytes: u64) u64 {
+    const page = phase_mem.wire_page_bytes;
+    const s_ = if (bytes > page) std.mem.alignForward(u64, bytes, page) else bytes;
+    if (s_ < 1 << 20) return s_;
+    const top: u64 = @as(u64, 1) << @intCast(std.math.log2_int(u64, s_));
+    const step = @max(top / 8, page);
+    return (std.math.divCeil(u64, s_, step) catch unreachable) * step;
+}
+
+/// The prompt layer's arrays as the allocator sizes them: each at its own bytes, or with the size classes on at its class
+/// (`sizeClassBytes`); an array the routing sizes (a routed slice's output, a GEMM wave's arrays) at its class bound,
+/// 9/8 of its bytes.
+const PromptAlloc = struct {
+    classes: bool,
+
+    fn of(a: PromptAlloc, bytes: u64) u64 {
+        return if (a.classes) sizeClassBytes(bytes) else bytes;
+    }
+
+    fn routed(a: PromptAlloc, bytes: u64) u64 {
+        return if (a.classes) bytes + bytes / 8 else bytes;
+    }
+};
+
 /// What one bill reads: the model, the bank's geometry, the residents' bytes, the stream's shape and the positions
 /// each phase's KV lanes hold.
 pub const Inputs = struct {
@@ -190,6 +218,9 @@ pub const Inputs = struct {
     /// The prompt's routed GEMMs (the module's quant, `promptGemmOf`) and its spans' selection (`selectOf`).
     gemm: PromptGemm,
     select: Select,
+    /// The allocator's size classes on for the prompt's forward layers (`sizeClassBytes`): its transient arrays at their
+    /// classes.
+    size_classes: bool = false,
     /// The prompt pass's MLX cache limit (`prefillCacheBytes`): the module installs it, the bill charges it.
     prompt_cache: u64,
 };
@@ -411,7 +442,7 @@ pub fn prefillRowBytes(c: *const glm.Config, g: glm.Geometry, gemm: PromptGemm) 
 
 /// One prompt layer's wave (`PromptWave`) at `rows` rows over `positions` keys: `full` an indexer layer, `sparse` a
 /// routed one, `dsa` the attention on the DSA kernels, `gemm_row` the routed call's bytes per routed row in flight.
-pub fn promptWaveOf(c: *const glm.Config, rows: u64, positions: u64, full: bool, sparse: bool, dsa: bool, select: Select, gemm: PromptGemm, gemm_row: u64) PromptWave {
+pub fn promptWaveOf(c: *const glm.Config, rows: u64, positions: u64, full: bool, sparse: bool, dsa: bool, select: Select, gemm: PromptGemm, gemm_row: u64, classes: bool) PromptWave {
     const t = rows;
     const p = positions;
     const h: u64 = c.hidden_size;
@@ -427,47 +458,49 @@ pub fn promptWaveOf(c: *const glm.Config, rows: u64, positions: u64, full: bool,
     const e: u64 = c.n_routed_experts;
     const k: u64 = c.n_experts_per_tok;
     const embed_bits: u64 = c.quant.bitsOf("model.embed_tokens");
+    const a: PromptAlloc = .{ .classes = classes };
     var w: PromptWave = .{};
     // h; the embedding's ids, codes, scales and biases and its dequantized rows (the forward's scope); the selection.
-    w.cross = t * h * bf16 + t * (4 + h * embed_bits / 8 + 2 * (h / glm.group_size) * bf16 + h * bf16) + if (p > topk) t * topk * 4 else 0;
+    w.cross = a.of(t * h * bf16) + a.of(t * 4) + a.of(t * h * embed_bits / 8) + 2 * a.of(t * (h / glm.group_size) * bf16) + a.of(t * h * bf16) +
+        if (p > topk) a.of(t * topk * 4) else 0;
     // The input norm, q_a and its norm, q_b, the roped query part, the latent projection, its norm, the roped key; on a
     // full layer the indexer's query (its projection and its rope) and key (projection, norm, rope); the attention's
     // output and its transposed copy, the output projection, the residual.
-    var per_row: u64 = h * bf16 + 2 * ql * bf16 + heads * (nope + rope) * bf16 + heads * rope * bf16 + (kv + rope) * bf16 + kv * bf16 + rope * bf16 +
-        2 * heads * v * bf16 + 2 * h * bf16;
-    if (full) per_row += 2 * ih * id * bf16 + 3 * id * bf16;
-    if (full and dsa) per_row += ih * (bf16 + 2 * f32b);
-    w.attn = t * per_row;
+    w.attn = a.of(t * h * bf16) + 2 * a.of(t * ql * bf16) + a.of(t * heads * (nope + rope) * bf16) + a.of(t * heads * rope * bf16) +
+        a.of(t * (kv + rope) * bf16) + a.of(t * kv * bf16) + a.of(t * rope * bf16) + 2 * a.of(t * heads * v * bf16) + 2 * a.of(t * h * bf16);
+    if (full) w.attn += 2 * a.of(t * ih * id * bf16) + 3 * a.of(t * id * bf16);
+    if (full and dsa) w.attn += a.of(t * ih * bf16) + 2 * a.of(t * ih * f32b);
     if (dsa) {
         // A span: the indexer's f32 score over the keys (and argpartition's u32 ids over them) and the kept ids (a full
         // layer), the query's contiguous nope rows, the absorbed query and the latent output; the spans' outputs before
         // their join.
         const sp = spansOf(c, t, p);
-        const score: u64 = if (select == .kernel) 4 * p else 8 * p;
-        const span = sp.rows * ((if (full) score + 4 * topk else 0) + heads * (nope + 2 * kv) * bf16);
+        const r = sp.rows;
+        const score: u64 = (if (select == .kernel) @as(u64, 1) else 2) * a.of(r * p * 4);
+        const span = (if (full) score + a.of(r * topk * 4) else 0) + a.of(r * heads * nope * bf16) + 2 * a.of(r * heads * kv * bf16);
         const inflight = if (!sparse) attention_spans_in_flight.dense else if (full) attention_spans_in_flight.full else attention_spans_in_flight.shared;
-        const outs = if (sp.n > 1) t * heads * v * bf16 else 0;
+        const outs = if (sp.n > 1) a.of(t * heads * v * bf16) else 0;
         w.spans = @min(sp.n, inflight) * span + outs;
         w.all_spans = sp.n * span + outs;
     } else {
         // The reference's form: the latent expanded per head over every key, and the query blocks' score arrays.
-        w.attn += heads * p * (nope + v) * bf16;
-        w.spans = 8 * glm.score_budget_bytes + t * heads * v * bf16;
+        w.attn += a.of(heads * p * nope * bf16) + a.of(heads * p * v * bf16);
+        w.spans = 8 * a.of(glm.score_budget_bytes) + a.of(t * heads * v * bf16);
         w.all_spans = w.spans;
     }
     if (sparse) {
         // The post-attention norm, the router's f32 input and logits, its sigmoid, biased and negated copies and
         // partition, the top-k's weights and ids, and the router's f32 weight; every routed row's output (bf16).
-        w.router = t * (h * bf16 + h * f32b + 5 * e * 4 + 4 * k * 4 + 4) + e * h * f32b;
-        w.routed = t * k * h * bf16;
-        w.gemm = @min(prefillGemmInflightRows(gemm), t * k) * gemm_row;
+        w.router = a.of(t * h * bf16) + a.of(t * h * f32b) + 5 * a.of(t * e * 4) + 4 * a.of(t * k * 4) + a.of(t * 4) + a.of(e * h * f32b);
+        w.routed = a.routed(t * k * h * bf16);
+        w.gemm = a.routed(@min(prefillGemmInflightRows(gemm), t * k) * gemm_row);
         // The combine's output, the shared expert's four intermediates and output, the routed + shared sum, the residual.
         const si: u64 = @as(u64, c.moe_intermediate_size) * c.n_shared_experts;
-        w.tail = t * (h * bf16 + 4 * si * bf16 + h * bf16 + 2 * h * bf16);
+        w.tail = a.of(t * h * bf16) + 4 * a.of(t * si * bf16) + a.of(t * h * bf16) + 2 * a.of(t * h * bf16);
     } else {
-        w.router = t * h * bf16;
+        w.router = a.of(t * h * bf16);
         // The dense MLP's four intermediates and its output (the layer's sum), the residual.
-        w.tail = t * (4 * @as(u64, c.intermediate_size) * bf16 + 2 * h * bf16);
+        w.tail = 4 * a.of(t * @as(u64, c.intermediate_size) * bf16) + 2 * a.of(t * h * bf16);
     }
     return w;
 }
@@ -479,14 +512,14 @@ pub fn promptWaveOf(c: *const glm.Config, rows: u64, positions: u64, full: bool,
 /// the cache the pass began with (`start_cache`) and the arrays of the dense layer before it: each dense layer builds
 /// the same shapes, and under the limit MLX keeps what one frees for the next, which takes its buffers back. So a dense
 /// layer's wave adds only what passes the limit.
-pub fn promptWaveBytes(c: *const glm.Config, g: glm.Geometry, tokens: u64, dsa: bool, select: Select, gemm: PromptGemm, cache_limit: u64, start_cache: u64) u64 {
+pub fn promptWaveBytes(c: *const glm.Config, g: glm.Geometry, tokens: u64, dsa: bool, select: Select, gemm: PromptGemm, classes: bool, cache_limit: u64, start_cache: u64) u64 {
     const t = glm.maxPromptCallRows(tokens);
     const row = prefillRowBytes(c, g, gemm);
     var worst: u64 = 0;
     var before: u64 = start_cache;
     for (0..c.n_layers) |li| {
         const l: u32 = @intCast(li);
-        const w = promptWaveOf(c, t, tokens, c.isFull(l), c.isSparse(l), dsa, select, gemm, row);
+        const w = promptWaveOf(c, t, tokens, c.isFull(l), c.isSparse(l), dsa, select, gemm, row, classes);
         if (c.isSparse(l)) {
             worst = @max(worst, w.total());
         } else {
@@ -502,7 +535,7 @@ pub fn promptWaveBytes(c: *const glm.Config, g: glm.Geometry, tokens: u64, dsa: 
 /// (`glm.group_slice_rows` rows: sushi's prepared input or down output, f16 over every mini; GLM-5.3's kernels' join or
 /// the affine bank's gathered input, `hidden` wide), the query projection, the attention's output and its copy, the
 /// router's f32 input, a dense layer's intermediate, a span's indexer score, the embedding's codes.
-pub fn promptOvershoot(c: *const glm.Config, g: glm.Geometry, tokens: u64, gemm: PromptGemm) u64 {
+pub fn promptOvershoot(c: *const glm.Config, g: glm.Geometry, tokens: u64, gemm: PromptGemm, classes: bool) u64 {
     const t = glm.maxPromptCallRows(tokens);
     const h: u64 = c.hidden_size;
     const heads: u64 = c.n_heads;
@@ -516,7 +549,7 @@ pub fn promptOvershoot(c: *const glm.Config, g: glm.Geometry, tokens: u64, gemm:
     b = @max(b, t * @as(u64, c.intermediate_size) * bf16);
     b = @max(b, sp.rows * tokens * 4);
     b = @max(b, t * h * c.quant.bitsOf("model.embed_tokens") / 8);
-    return cache_mod.bufferBytes(b, page);
+    return if (classes) sizeClassBytes(b) else cache_mod.bufferBytes(b, page);
 }
 
 /// The draft lane's prompt part (GLM-only: the MTP layer's catch-up, `glm_moe_dsa_mtp.Lane.append`): one append's
@@ -611,9 +644,9 @@ pub fn billOf(in: Inputs) Bill {
     const mtp_res: u64 = if (in.mtp) |m| m.resident_bytes + m.expert_bytes else 0;
     const verify_rows: u64 = s.decode_window_rows / glm.routed_top_k;
     // The prompt's cache term (its limit and one freed buffer), and the cache a later prompt starts with: decode's.
-    const prompt_cache = in.prompt_cache + promptOvershoot(c, g, in.prompt_tokens, in.gemm);
+    const prompt_cache = in.prompt_cache + promptOvershoot(c, g, in.prompt_tokens, in.gemm, in.size_classes);
     const decode_cache = decode_cache_bytes + decodeCacheOvershoot(c, in.decode_positions, verify_rows);
-    const prompt_waves = @max(promptWaveBytes(c, g, in.prompt_tokens, in.dsa, in.select, in.gemm, prompt_cache, decode_cache), if (in.mtp != null) mtpPromptWaveBytes(c, in.prompt_tokens) else 0);
+    const prompt_waves = @max(promptWaveBytes(c, g, in.prompt_tokens, in.dsa, in.select, in.gemm, in.size_classes, prompt_cache, decode_cache), if (in.mtp != null) mtpPromptWaveBytes(c, in.prompt_tokens) else 0);
     const decode_waves = @max(decodeWaveBytes(c, verify_rows, in.decode_positions), if (in.mtp) |m| mtpDecodeWaveBytes(c, m.depth, in.decode_positions) else 0);
     const pending: u64 = if (in.mtp != null) mtpPendingBytes(c, in.prompt_tokens) else 0;
     const scratch = scratchBytes(g, @as(u64, s.wide_depth) * s.max_route_ids * g.rows_per_id);
@@ -630,7 +663,7 @@ pub fn billOf(in: Inputs) Bill {
             .mtp_pending = pending,
             .waves = prompt_waves,
             .mlx_cache = in.prompt_cache,
-            .mlx_cache_overshoot = promptOvershoot(c, g, in.prompt_tokens, in.gemm),
+            .mlx_cache_overshoot = promptOvershoot(c, g, in.prompt_tokens, in.gemm, in.size_classes),
             .pool_staging = pool,
             .host_side = host_side_prompt_bytes,
         },
@@ -952,7 +985,7 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
     // (GLM-5.3's kernels' widest routed array, a slice's join, is 16,384 rows x hidden; sushi's every mini of it).
     try testing.expectEqual(@as(u64, 16 << 30), p.mlx_cache);
     try testing.expectEqual(@as(u64, 16448 * 64 * 256 * 2), p.mlx_cache_overshoot);
-    try testing.expectEqual(@as(u64, 4 * 16384 * 6144 * 2), promptOvershoot(&c, box_exl3.geometry, 16448, .sushi));
+    try testing.expectEqual(@as(u64, 4 * 16384 * 6144 * 2), promptOvershoot(&c, box_exl3.geometry, 16448, .sushi, false));
     try testing.expectEqual(selectOf(&c), Select.kernel);
     // The lane's pending hidden: the prompt's 16,448 rows.
     try testing.expectEqual(@as(u64, 16448 * 6144 * 2), p.mtp_pending);
@@ -963,7 +996,7 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
     try testing.expectEqual(decode_cache_bytes, d.mlx_cache);
     try testing.expectEqual(@as(u64, maxPositions(&cfg) * 128 * 4), d.mlx_cache_overshoot);
     // The prompt wave's stages on a sparse full layer at 16,448 rows.
-    const w = promptWaveOf(&c, 16448, 16448, true, true, true, .kernel, .glm53, prefillRowBytes(&c, box_exl3.geometry, .glm53));
+    const w = promptWaveOf(&c, 16448, 16448, true, true, true, .kernel, .glm53, prefillRowBytes(&c, box_exl3.geometry, .glm53), false);
     std.debug.print("\nGLM53_PROMPT_WAVE {{\"cross\": {d}, \"attn\": {d}, \"spans\": {d}, \"router\": {d}, \"routed\": {d}, \"gemm\": {d}, \"tail\": {d}, \"total\": {d}, \"billed\": {d}, \"decode\": {d}}}\n", .{ w.cross, w.attn, w.spans, w.router, w.routed, w.gemm, w.tail, w.total(), p.waves, d.waves });
     try testing.expectEqual(@as(u64, 16448 * 171_328), w.attn);
     try testing.expectEqual(@as(u64, 16448 * 8 * 6144 * 2), w.routed);
@@ -972,10 +1005,36 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
     // argpartition's ids over every key.
     try testing.expectEqual(@as(u64, 45_068), prefillRowBytes(&c, box_exl3.geometry, .glm53));
     try testing.expectEqual(@as(u64, 172_160), prefillRowBytes(&c, box_exl3.geometry, .sushi));
-    const wa = promptWaveOf(&c, 16448, 16448, true, true, true, .argpartition, .glm53, prefillRowBytes(&c, box_exl3.geometry, .glm53));
+    const wa = promptWaveOf(&c, 16448, 16448, true, true, true, .argpartition, .glm53, prefillRowBytes(&c, box_exl3.geometry, .glm53), false);
     try testing.expectEqual(@as(u64, attention_spans_in_flight.full * spansOf(&c, 16448, 16448).rows * 4 * 16448), wa.spans - w.spans);
     // The wave term is a routed layer's widest stage: the dense layers start with a cache short of its limit.
     try testing.expectEqual(p.waves, w.total());
+}
+
+test "glm bill: the allocator's size classes: a page under 1 MiB, an eighth of the power of two above; the prompt's transients at them" {
+    try testing.expectEqual(@as(u64, 100), sizeClassBytes(100));
+    try testing.expectEqual(@as(u64, 32768), sizeClassBytes(16385));
+    try testing.expectEqual(@as(u64, 1 << 20), sizeClassBytes(1 << 20));
+    // Just past 1 MiB: steps of 128 KiB.
+    try testing.expectEqual(@as(u64, (1 << 20) + (128 << 10)), sizeClassBytes((1 << 20) + 1));
+    // 16,448 rows x hidden in bf16 (202,113,024 B): past 128 MiB, steps of 16 MiB: 208 MiB.
+    try testing.expectEqual(@as(u64, 13 * (16 << 20)), sizeClassBytes(16448 * 6144 * 2));
+    for ([_]u64{ 1 << 20, 3 << 20, 202_113_024, 5_000_000_007, 1 << 33 }) |x| try testing.expect(sizeClassBytes(x) >= x and sizeClassBytes(x) <= x + x / 8 + 16384);
+    var c = try glm53Config();
+    defer c.deinit(testing.allocator);
+    const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
+    var in = boxInputs(&c, &cfg);
+    const off = billOf(in).phases[@intFromEnum(Phase.prompt)];
+    in.size_classes = true;
+    const on = billOf(in).phases[@intFromEnum(Phase.prompt)];
+    // Only the prompt's transients move: the waves and the cache's one buffer past its limit; at most 12.5 % more.
+    try testing.expect(on.waves > off.waves and on.waves <= off.waves + off.waves / 8 + 64 * 16384);
+    try testing.expect(on.mlx_cache_overshoot >= off.mlx_cache_overshoot);
+    try testing.expectEqual(off.mlx_cache, on.mlx_cache);
+    try testing.expectEqual(off.kv + off.residents + off.slot_rows + off.transient_rows + off.mtp_residents, on.kv + on.residents + on.slot_rows + on.transient_rows + on.mtp_residents);
+    const d_off = billOf(boxInputs(&c, &cfg)).phases[@intFromEnum(Phase.decode)];
+    try testing.expectEqualDeep(d_off, billOf(in).phases[@intFromEnum(Phase.decode)]);
+    std.debug.print("glm bill with the size classes on: the prompt waves {d} B (off {d} B), the overshoot {d} B (off {d} B)\n", .{ on.waves, off.waves, on.mlx_cache_overshoot, off.mlx_cache_overshoot });
 }
 
 test "glm bill: the SDK's view fills the exact units, admits them, and refuses one more in either phase" {
@@ -1092,14 +1151,14 @@ test "glm bill: on the DSA kernels the prompt wave stops growing past one call; 
     const g = box_exl3.geometry;
     var prev: u64 = 0;
     for ([_]u64{ 1024, 4096, 16384 }) |n| {
-        const w = promptWaveBytes(&c, g, n, true, .kernel, .glm53, 17 << 30, 0);
+        const w = promptWaveBytes(&c, g, n, true, .kernel, .glm53, false, 17 << 30, 0);
         try testing.expect(w > prev);
         prev = w;
     }
-    try testing.expect(promptWaveBytes(&c, g, 1048576, false, .kernel, .glm53, 17 << 30, 0) > promptWaveBytes(&c, g, 32768, false, .kernel, .glm53, 17 << 30, 0) + 30_000_000_000);
+    try testing.expect(promptWaveBytes(&c, g, 1048576, false, .kernel, .glm53, false, 17 << 30, 0) > promptWaveBytes(&c, g, 32768, false, .kernel, .glm53, false, 17 << 30, 0) + 30_000_000_000);
     // A dense layer's wave adds only past the cache's limit: with the cache at 0 the routed layers' widest stage binds,
     // with a limit of 0 every layer's wave adds whole.
-    try testing.expect(promptWaveBytes(&c, g, 16384, true, .kernel, .glm53, 0, 0) >= promptWaveBytes(&c, g, 16384, true, .kernel, .glm53, 17 << 30, 0));
+    try testing.expect(promptWaveBytes(&c, g, 16384, true, .kernel, .glm53, false, 0, 0) >= promptWaveBytes(&c, g, 16384, true, .kernel, .glm53, false, 17 << 30, 0));
     try testing.expect(decodeWaveBytes(&c, 4, 131072) > decodeWaveBytes(&c, 4, 16384));
 }
 
