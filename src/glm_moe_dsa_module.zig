@@ -1090,8 +1090,8 @@ pub const HostLine = struct {
 
     pub fn format(p: HostLine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const other = p.wall_ns -| (p.h.barrier_ns + p.h.route_ns + p.h.wave_ns);
-        try w.print("glm_moe_dsa: decode host split over {d} routed calls: barrier waits {d:.2} s, routes {d:.2} s, wave encode {d:.2} s, the rest {d:.2} s of {d:.2} s", .{
-            p.h.calls, seconds(p.h.barrier_ns), seconds(p.h.route_ns), seconds(p.h.wave_ns), seconds(other), seconds(p.wall_ns),
+        try w.print("glm_moe_dsa: decode host split over {d} routed calls: barrier waits {d:.2} s, routes {d:.2} s, wave encode {d:.2} s, the rest {d:.2} s of {d:.2} s; {d} calls joined before the combine", .{
+            p.h.calls, seconds(p.h.barrier_ns), seconds(p.h.route_ns), seconds(p.h.wave_ns), seconds(other), seconds(p.wall_ns), p.h.joined,
         });
     }
 };
@@ -1165,7 +1165,7 @@ test "glm stats lines: the prompt and decode lines and the per-layer hit spread,
     defer a.free(d);
     const hl = try std.fmt.allocPrint(a, "{f}", .{HostLine{ .h = .{ .calls = 300, .barrier_ns = 9_000_000_000, .route_ns = 1_500_000_000, .wave_ns = 2_250_000_000 }, .wall_ns = 25_000_000_000 }});
     defer a.free(hl);
-    try testing.expectEqualStrings("glm_moe_dsa: decode host split over 300 routed calls: barrier waits 9.00 s, routes 1.50 s, wave encode 2.25 s, the rest 12.25 s of 25.00 s", hl);
+    try testing.expectEqualStrings("glm_moe_dsa: decode host split over 300 routed calls: barrier waits 9.00 s, routes 1.50 s, wave encode 2.25 s, the rest 12.25 s of 25.00 s; 0 calls joined before the combine", hl);
     try testing.expectEqualStrings("glm_moe_dsa: decode 40 steps, 128 tokens in 25.00 s (5.1 tok/s): 1000 routed records, 600 hits, 400 misses (hit rate per layer min 25% median 50% max 75%), 9.00 GB from the SSD (0.070 GB per emitted token), lookahead 90 issued / 60 used (landed 70, expired 12, abandoned 5, cancelled 3, discarded 7, used while in flight 4), lookahead 2.00 GB read / 1.00 GB served, 20 loads skipped, 300 direct reads, host wait 1.50 s and reads in flight 2.25 s of 25.00 s (9.0% busy, 91.0% with no read in flight), 136 rows per layer", d);
 }
 

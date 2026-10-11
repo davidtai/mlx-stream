@@ -28,7 +28,9 @@ const pt = @import("glm_moe_dsa_prefill_timers.zig");
 
 /// The wide lane's combine (`combineOnGpu`): one thread per token and 4 hidden values, the token's `K` routed rows in
 /// routed order, each read from its part (`loc`: the part in the top 8 bits, the row in the low 24).
-const max_combine_parts = 24;
+/// Metal binds at most 31 buffers to a kernel; the combine's other three are `loc`, `w` and `out`.
+const metal_buffer_slots = 31;
+const max_combine_parts = metal_buffer_slots - 3;
 const combine_source = blk: {
     var cases: []const u8 = "";
     for (0..max_combine_parts) |i| cases = cases ++ std.fmt.comptimePrint("        case {d}: part = p{d}; break;\n", .{ i, i });
@@ -436,11 +438,15 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 const lc = try g.hostArray(std.mem.sliceAsBytes(loc[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
                 const out = try combineOnGpu(&self.combine_kernel, g, outs, lc, scores, n, k, self.hidden, dt);
                 if (self.combine_check.on) {
+                    // f32 holds every bf16 bit (both zeros apart): the bits compared on the host.
                     const want = try combine(g, try self.joinRows(g, acc, n, k), scores, dt);
-                    var same: [1]f32 = undefined;
-                    _ = try g.hostF32(try g.sum(try g.sum(try g.astype(try g.equal(out, want), .float32), -1, false), -1, false), &same);
+                    const len = n * @as(usize, @intCast(self.hidden));
+                    const got_v = try self.a.alloc(f32, 2 * len);
+                    defer self.a.free(got_v);
+                    _ = try g.hostF32(try g.astype(out, .float32), got_v[0..len]);
+                    _ = try g.hostF32(try g.astype(want, .float32), got_v[len..]);
                     self.combine_check.checked += 1;
-                    if (same[0] != @as(f32, @floatFromInt(n * @as(u32, @intCast(self.hidden))))) self.combine_check.differed += 1;
+                    if (!std.mem.eql(u8, std.mem.sliceAsBytes(got_v[0..len]), std.mem.sliceAsBytes(got_v[len..]))) self.combine_check.differed += 1;
                 }
                 return out;
             }
