@@ -896,6 +896,263 @@ fn benchCeiling(a: Allocator, g: anytype, ours: anytype, banks: anytype, slot_of
     }
 }
 
+// GLM53_EXL3_DEC4 (with GLM53_EXL3_BENCH; the box, lock-held): sushi's decode chain at 4 rows on routed layer 0's
+// resident experts, its stages one at a time, against the box's read rate over the same slot rows and the same chain
+// with its weights in cache. Rows: 4 rows of 8 routes over 22 distinct experts, 29 pairs (7 experts on two rows, 3
+// routes missed), each pair one sushi row of the expert's minis as the driver's wave calls it (`fused`). Configs: real
+// (those pairs), distinct (each expert once, 22 pairs), hot (the real pairs, every pair of a bank layer on one expert).
+// Depths: none (the wave's take and the step's join alone), gate|up, gate|up + mid|down, the full chain (+ the reduce).
+// Each step's next x reads one element of every wave's output, so the steps run in order; 32 steps per eval, best of 7.
+// The read kernel streams the slot rows' trellis words once per listed mini (16 launches an eval, independent).
+fn benchDecode4(a: Allocator, g: anytype, theirs: anytype, banks: anytype, slot_of: []const u32, b: *const bank_mod.Bank, h: usize) !void {
+    const T = mlx.mlx_array;
+    const kern = sushi.kernels;
+    kern.setDecodeParams(.mcg);
+    const tp: u32 = theirs.tp;
+    const tpc: c_int = @intCast(tp);
+    const hc: c_int = @intCast(h);
+    const mini: c_int = mlx.getShape(banks[0].gate.trellis)[2] * 16;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const m0 = g.mark();
+    defer g.resetTo(m0);
+    // bytes per mini: each projection's trellis words (gate, up, down equal), and the suh / svh scales
+    var mini_bytes: [2]u64 = undefined;
+    var scale_bytes: [2]u64 = undefined;
+    for (0..2) |side| {
+        const bk = banks[side];
+        const n_rows: u64 = @intCast(mlx.getShape(bk.gate.trellis)[0]);
+        mini_bytes[side] = mlx.mlx_array_nbytes(bk.gate.trellis) / n_rows;
+        if (mlx.mlx_array_nbytes(bk.down.trellis) / n_rows != mini_bytes[side] or mlx.mlx_array_nbytes(bk.up.trellis) / n_rows != mini_bytes[side]) return error.BenchShape;
+        scale_bytes[side] = (mlx.mlx_array_nbytes(bk.gate.suh) + mlx.mlx_array_nbytes(bk.up.suh) + mlx.mlx_array_nbytes(bk.down.suh) +
+            mlx.mlx_array_nbytes(bk.gate.svh) + mlx.mlx_array_nbytes(bk.up.svh) + mlx.mlx_array_nbytes(bk.down.svh)) / n_rows;
+    }
+    // 22 distinct experts; 4 rows: row 0 experts 0-7, row 1 8-14 and 0, row 2 15-21 and 1, row 3 2-6
+    const D = 22;
+    var prng = std.Random.DefaultPrng.init(0xdec4);
+    const r = prng.random();
+    var ex: [D]u16 = undefined;
+    var nd: usize = 0;
+    while (nd < D) {
+        const e = r.uintLessThan(u16, @intCast(b.n_experts));
+        if (std.mem.indexOfScalar(u16, ex[0..nd], e) != null) continue;
+        ex[nd] = e;
+        nd += 1;
+    }
+    const Pair = struct { row: u32, e: u16, first: bool };
+    var pairs: [29]Pair = undefined;
+    var np: usize = 0;
+    const addPair = struct {
+        fn f(ps: *[29]Pair, n: *usize, row: u32, e: u16, first: bool) void {
+            ps[n.*] = .{ .row = row, .e = e, .first = first };
+            n.* += 1;
+        }
+    }.f;
+    for (0..8) |i| addPair(&pairs, &np, 0, ex[i], true);
+    for (8..15) |i| addPair(&pairs, &np, 1, ex[i], true);
+    addPair(&pairs, &np, 1, ex[0], false);
+    for (15..22) |i| addPair(&pairs, &np, 2, ex[i], true);
+    addPair(&pairs, &np, 2, ex[1], false);
+    for (2..7) |i| addPair(&pairs, &np, 3, ex[i], false);
+    std.debug.assert(np == 29);
+    var hot: [2]?u32 = .{ null, null };
+    var nd_side: [2]u32 = .{ 0, 0 };
+    for (ex) |e| {
+        const side = b.streamLayer(0, e);
+        nd_side[side] += 1;
+        if (hot[side] == null) hot[side] = slot_of[e];
+    }
+    if (hot[0] == null or hot[1] == null) return error.BenchShape;
+    const Cfg = enum { real, distinct, hot };
+    const Wave = struct { n: u32, tok: T, minis: T, ones: T };
+    var waves: [3][2]Wave = undefined;
+    for (std.enums.values(Cfg)) |cfg| for (0..2) |side| {
+        var tok: std.ArrayList(i32) = .empty;
+        var mn: std.ArrayList(u32) = .empty;
+        for (pairs) |p| {
+            if (b.streamLayer(0, p.e) != side) continue;
+            if (cfg == .distinct and !p.first) continue;
+            const slot = if (cfg == .hot) hot[side].? else slot_of[p.e];
+            try tok.append(ar, @intCast(p.row));
+            for (0..tp) |q| try mn.append(ar, slot * tp + @as(u32, @intCast(q)));
+        }
+        const ones = try ar.alloc(f32, mn.items.len);
+        @memset(ones, 1);
+        const n: c_int = @intCast(tok.items.len);
+        waves[@intFromEnum(cfg)][side] = .{
+            .n = @intCast(tok.items.len),
+            .tok = g.keep(try g.hostArray(std.mem.sliceAsBytes(tok.items), &.{n}, .int32)),
+            .minis = g.keep(try g.hostArray(std.mem.sliceAsBytes(mn.items), &.{n * tpc}, .uint32)),
+            .ones = g.keep(try g.hostArray(std.mem.sliceAsBytes(ones), &.{n * tpc}, .float32)),
+        };
+    };
+    defer for (waves) |ws| for (ws) |w| {
+        g.release(w.tok);
+        g.release(w.minis);
+        g.release(w.ones);
+    };
+    var xs: [4 * 6144]f32 = undefined;
+    for (xs[0 .. 4 * h]) |*v| v.* = r.floatNorm(f32) * 0.5;
+    const x0 = g.keep(try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs[0 .. 4 * h]), &.{ 4, hc }, .float32), .bfloat16));
+    defer g.release(x0);
+    const zero_u: [1]u32 = .{0};
+    const idx0 = g.keep(try g.hostArray(std.mem.sliceAsBytes(&zero_u), &.{1}, .uint32));
+    defer g.release(idx0);
+    const zero = g.keep(try g.scalar(0, .bfloat16));
+    defer g.release(zero);
+    try g.evalAll(&.{ x0, idx0, zero });
+    for (waves) |ws| for (ws) |w| try g.evalAll(&.{ w.tok, w.minis, w.ones });
+    std.debug.print("GLM53_DEC4 setup: {d} minis of {d} per expert; K{d} {d} + {d} B per mini (trellis per projection, scales), K{d} {d} + {d} B; experts K3 / K4 {d} / {d}; pairs real {d} / {d}, distinct {d} / {d}\n", .{ tp, mini, b.layers[0].k, mini_bytes[0], scale_bytes[0], b.layers[1].k, mini_bytes[1], scale_bytes[1], nd_side[0], nd_side[1], waves[0][0].n, waves[0][1].n, waves[1][0].n, waves[1][1].n });
+    const Depth = enum { none, gu, gud, full };
+    const Sides = enum { both, k3, k4 };
+    const Arm = struct { cfg: Cfg, depth: Depth, sides: Sides };
+    var arms: std.ArrayList(Arm) = .empty;
+    for ([_]Cfg{ .real, .distinct, .hot }) |cfg| for (std.enums.values(Depth)) |d| try arms.append(ar, .{ .cfg = cfg, .depth = d, .sides = .both });
+    for ([_]Cfg{ .real, .hot }) |cfg| for ([_]Sides{ .k3, .k4 }) |sd| for ([_]Depth{ .none, .full }) |d| try arms.append(ar, .{ .cfg = cfg, .depth = d, .sides = sd });
+    const steps = 32;
+    const best = try ar.alloc(u64, arms.items.len);
+    const best_eval = try ar.alloc(u64, arms.items.len);
+    @memset(best, std.math.maxInt(u64));
+    @memset(best_eval, std.math.maxInt(u64));
+    for (0..8) |rep| for (arms.items, 0..) |arm, ai| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const t0 = nowNs();
+        var x = x0;
+        for (0..steps) |_| {
+            var dep: ?T = null;
+            for (0..2) |side| {
+                if ((arm.sides == .k3 and side != 0) or (arm.sides == .k4 and side != 1)) continue;
+                const w = waves[@intFromEnum(arm.cfg)][side];
+                if (w.n == 0) continue;
+                const bk = banks[side];
+                const ns: c_int = @as(c_int, @intCast(w.n)) * tpc;
+                const xt = try g.take(x, w.tok, 0);
+                const out: T = switch (arm.depth) {
+                    .none => xt,
+                    else => blk: {
+                        const inn = try kern.pairGemv(g.s, xt, bk.gate.suh, bk.up.suh, bk.gate.trellis, bk.up.trellis, w.minis, hc, mini, ns, tpc, 0);
+                        const ig = try g.adopt(inn[0]);
+                        const iu = try g.adopt(inn[1]);
+                        if (arm.depth == .gu) break :blk ig;
+                        const di = try g.adopt(try kern.downGemvFusedMid(g.s, ig, iu, bk.down.trellis, bk.gate.svh, bk.up.svh, bk.down.suh, w.minis, mini, hc, ns));
+                        if (arm.depth == .gud) break :blk di;
+                        break :blk try g.adopt(try kern.downFinishReduce(g.s, di, bk.down.svh, w.minis, w.ones, hc, @intCast(w.n), tpc, .bfloat16));
+                    },
+                };
+                const d = try g.astype(try g.sum(try g.take(out, idx0, 0), -1, true), .bfloat16);
+                dep = if (dep) |p| try g.add(p, d) else d;
+            }
+            x = try g.add(x, try g.mul(dep.?, zero));
+        }
+        const t1 = nowNs();
+        try g.evalAll(&.{x});
+        const t2 = nowNs();
+        if (rep > 0) {
+            best[ai] = @min(best[ai], t2 - t0);
+            best_eval[ai] = @min(best_eval[ai], t2 - t1);
+        }
+    };
+    for (arms.items, 0..) |arm, ai| {
+        var bytes: u64 = 0;
+        var n_pairs: u32 = 0;
+        var n_ex: u32 = 0;
+        for (0..2) |side| {
+            if ((arm.sides == .k3 and side != 0) or (arm.sides == .k4 and side != 1)) continue;
+            const w = waves[@intFromEnum(arm.cfg)][side];
+            n_pairs += w.n;
+            const e_side: u32 = if (arm.cfg == .hot) 1 else nd_side[side];
+            n_ex += e_side;
+            bytes += @as(u64, e_side) * tp * (3 * mini_bytes[side] + scale_bytes[side]);
+        }
+        const ms_eval = @as(f64, @floatFromInt(best_eval[ai])) / 1e6 / steps;
+        std.debug.print("GLM53_DEC4 chain {t} {t} {t}: {d} pairs over {d} experts ({d} B distinct): eval {d:.4} ms per step, build + eval {d:.4} ms\n", .{ arm.cfg, arm.sides, arm.depth, n_pairs, n_ex, bytes, ms_eval, @as(f64, @floatFromInt(best[ai])) / 1e6 / steps });
+    }
+    // the read kernel: each listed mini's three trellis rows, uint4 words, 256 threads x CH words a threadgroup
+    const ch: c_int = 4096;
+    const rd_src =
+        \\const uint lid = uint(thread_position_in_threadgroup.x);
+        \\const uint chunk = uint(threadgroup_position_in_grid.x);
+        \\const uint m = uint(threadgroup_position_in_grid.y);
+        \\const uint p = uint(threadgroup_position_in_grid.z);
+        \\const device uint16_t* src = p == 0u ? tg : (p == 1u ? tu : td);
+        \\const device uint4* w = (const device uint4*)src + (size_t)minis[m] * (size_t)WPM + (size_t)chunk * (size_t)CH;
+        \\uint4 acc = uint4(0u);
+        \\for (uint i = lid; i < uint(CH); i += 256u) acc ^= w[i];
+        \\const uint nch = uint(WPM) / uint(CH);
+        \\out[((size_t)(p * uint(NM) + m) * nch + chunk) * 256u + lid] = acc.x ^ acc.y ^ acc.z ^ acc.w;
+    ;
+    const rd_ins: []const [*:0]const u8 = &.{ "tg", "tu", "td", "minis" };
+    const rd_outs: []const [*:0]const u8 = &.{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(rd_ins.ptr, rd_ins.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(rd_outs.ptr, rd_outs.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const rk = mlx.mlx_fast_metal_kernel_new("glm53_dec4_read", in_vec, out_vec, rd_src, "", true, false);
+    if (rk.ctx == null) return error.MetalKernelCompileFailed;
+    defer _ = mlx.mlx_fast_metal_kernel_free(rk);
+    const Rd = struct { name: []const u8, side: usize, minis: T, nm: c_int, cfg: mlx.mlx_fast_metal_kernel_config, bytes: u64, reps: usize };
+    var rds: std.ArrayList(Rd) = .empty;
+    defer for (rds.items) |rd| {
+        _ = mlx.mlx_fast_metal_kernel_config_free(rd.cfg);
+        g.release(rd.minis);
+    };
+    for (0..2) |side| {
+        const wpm: c_int = @intCast(mini_bytes[side] / 16);
+        if (@rem(wpm, ch) != 0) return error.BenchShape;
+        // each config's distinct experts' minis, its pairs' minis, the hot pairs' minis, every held expert's minis
+        var lists: [4]std.ArrayList(u32) = .{ .empty, .empty, .empty, .empty };
+        for (ex) |e| if (b.streamLayer(0, e) == side) for (0..tp) |q| try lists[0].append(ar, slot_of[e] * tp + @as(u32, @intCast(q)));
+        for (pairs) |p| if (b.streamLayer(0, p.e) == side) for (0..tp) |q| {
+            try lists[1].append(ar, slot_of[p.e] * tp + @as(u32, @intCast(q)));
+            try lists[2].append(ar, hot[side].? * tp + @as(u32, @intCast(q)));
+        };
+        for (0..b.n_experts) |e| if (b.streamLayer(0, @intCast(e)) == side) for (0..tp) |q| try lists[3].append(ar, slot_of[e] * tp + @as(u32, @intCast(q)));
+        const names = [4][]const u8{ "real distinct experts", "real pairs", "hot pairs", "every held expert" };
+        for (lists, names, 0..) |l, nm_s, li| {
+            const nm: c_int = @intCast(l.items.len);
+            const c = mlx.mlx_fast_metal_kernel_config_new();
+            const osh = [_]c_int{3 * nm * @divExact(wpm, ch) * 256};
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &osh, 1, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 256 * @divExact(wpm, ch), nm, 3));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 256, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "WPM", wpm));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "CH", ch));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NM", nm));
+            const md = g.keep(try g.hostArray(std.mem.sliceAsBytes(l.items), &.{nm}, .uint32));
+            try g.evalAll(&.{md});
+            try rds.append(ar, .{ .name = nm_s, .side = side, .minis = md, .nm = nm, .cfg = c, .bytes = @as(u64, @intCast(nm)) * 3 * mini_bytes[side], .reps = if (li == 3) 2 else 16 });
+        }
+    }
+    const rbest = try ar.alloc(u64, rds.items.len);
+    @memset(rbest, std.math.maxInt(u64));
+    for (0..8) |rep| for (rds.items, 0..) |rd, ri| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const bk = banks[rd.side];
+        var outs: [16]T = undefined;
+        for (0..rd.reps) |i| {
+            const ins = [_]T{ bk.gate.trellis, bk.up.trellis, bk.down.trellis, rd.minis };
+            const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+            defer _ = mlx.mlx_vector_array_free(iv);
+            var ov = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ov);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, rk, iv, rd.cfg, g.s));
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&o, ov, 0));
+            outs[i] = try g.adopt(o);
+        }
+        const t0 = nowNs();
+        try g.evalAll(outs[0..rd.reps]);
+        if (rep > 0) rbest[ri] = @min(rbest[ri], nowNs() - t0);
+    };
+    for (rds.items, 0..) |rd, ri| {
+        const ns: f64 = @floatFromInt(rbest[ri]);
+        std.debug.print("GLM53_DEC4 read K{d} {s}: {d} minis, {d} B a launch, {d} launches in {d:.4} ms: {d:.4} ms a launch, {d:.1} GB/s\n", .{ b.layers[rd.side].k, rd.name, rd.nm, rd.bytes, rd.reps, ns / 1e6, ns / 1e6 / @as(f64, @floatFromInt(rd.reps)), @as(f64, @floatFromInt(rd.bytes * rd.reps)) / ns });
+    }
+}
+
 /// The bench's experiments (GLM53_EXL3_BENCH_EXP): one text each, one needle replaced.
 const BenchExp = struct { name: []const u8, kernel: xk.Kernel, needle: []const u8, repl: []const u8 };
 const decode_call =
@@ -1005,6 +1262,7 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
     std.debug.print("GLM53_UBENCH layer 0: {d} K{d} + {d} K{d} experts resident in {d:.1} s\n", .{ b.layers[0].n_held, b.layers[0].k, b.layers[1].n_held, b.layers[1].k, @as(f64, @floatFromInt(nowNs() - t_load)) / 1e9 });
     var banks: [2]quant.BankArrays(Arrays(G.T)) = undefined;
     for (0..2) |side| banks[side] = st.bankArrays(@intCast(side), .base).?;
+    if (std.c.getenv("GLM53_EXL3_DEC4") != null) return benchDecode4(a, &g, theirs, &banks, slot_of, &b, h);
     var rng = std.Random.DefaultPrng.init(0x61b);
     // decode
     for ([_]usize{ 1, 4, 6 }) |n| {
