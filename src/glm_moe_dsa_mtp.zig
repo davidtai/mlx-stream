@@ -656,7 +656,11 @@ pub fn Lane(comptime kind: BankKind) type {
             const m = g.mark();
             defer g.resetTo(m);
             const old = self.pending.?;
-            self.pending = if (n == self.n_pending) null else g.keep(try graph.rowSlice(g, old, @intCast(n), @intCast(self.n_pending)));
+            self.pending = if (n == self.n_pending) null else if (std.c.getenv("GLM53_PEND_COPY") != null) blk: {
+                // DIAG: the rest gathered into its own buffer (a slice view keeps the whole call's hidden alive).
+                const ax: c_int = @intCast(g.shapeOf(old).n - 2);
+                break :blk g.keep(try g.take(old, try g.arange(@floatFromInt(n), @floatFromInt(self.n_pending), 1, .uint32), ax));
+            } else g.keep(try graph.rowSlice(g, old, @intCast(n), @intCast(self.n_pending)));
             if (self.pending) |p| try g.evalAll(&.{p});
             g.release(old);
             self.n_pending -= n;

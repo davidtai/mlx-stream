@@ -202,6 +202,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         probe: ?*graph.WaveProbe = null,
         /// The positions the request's KV lanes hold since its handover (its decode terms' KV).
         decode_positions: u64 = 0,
+        /// DIAG (GLM53_MEM_SAMPLE_MS): the host-side sampler.
+        sampler: ?*MemSampler = null,
 
         const DecodeMark = struct { s0: Stats, mem0: Mem, by0: Bk.Stream.ByRank, steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0 };
 
@@ -360,6 +362,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, self.cacheLimit(.prompt));
             log.info("glm_moe_dsa: constructed ({d} routed layers, {d} experts, record {d} B, expert reads {s}, prompt {s}, prompt attention {s}, decode window {d} rows)\n", .{ n_bank, self.bank.n_experts, self.bank.geometryOf().widest_record, if (gated) "event gates" else "host waits", if (cfg.layerMajor()) "layer by layer" else "chunk by chunk", if (self.routes.dsa) "on the DSA kernels" else "in the reference's form", shape.decode_window_rows });
             try self.checkConstruction(rows.prompt);
+            if (std.c.getenv("GLM53_MEM_SAMPLE_MS")) |v| {
+                const ms = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 20;
+                self.sampler = MemSampler.start(gpa, ms) catch null;
+                log.info("glm_moe_dsa: DIAG mem sampler every {d} ms\n", .{ms});
+            }
             self.phaseRecord("module constructed", self.billed.terms(.construction, self.prompt_units, self.prompt_units), null);
             return self;
         }
@@ -418,6 +425,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var fba = std.heap.FixedBufferAllocator.init(&buf);
             const json = phase_mem.jsonOf(fba.allocator(), rec) catch return;
             log.info("glm_moe_dsa: phase memory {s}\n", .{json});
+            if (self.sampler) |sm| sm.report(phase);
         }
 
         /// Every KV lane (the target's and the draft lane's) bounded at `cap` positions (`Cache.resize`).
@@ -433,6 +441,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         }
 
         pub fn deinit(self: *Self) void {
+            if (self.sampler) |sm| sm.stop(self.gpa);
             _ = mlx.mlx_synchronize(self.g.s);
             if (self.mtp) |ln| ln.deinit(&self.g);
             self.cache.deinit(&self.g);
@@ -596,7 +605,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 _ = mlx.mlx_set_cache_limit(&prev, self.cacheLimit(.prompt));
             }
             self.g.clearCache();
-            _ = mlx.mlx_set_cache_limit(&prev, self.cacheLimit(.decode));
+            const dlim: usize = if (std.c.getenv("GLM53_DECODE_CACHE_BYTES")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch self.cacheLimit(.decode) else self.cacheLimit(.decode);
+            if (dlim != self.cacheLimit(.decode)) log.info("glm_moe_dsa: DIAG decode cache limit {d} B (billed {d} B)\n", .{ dlim, self.cacheLimit(.decode) });
+            _ = mlx.mlx_set_cache_limit(&prev, dlim);
             const cap: u32 = @intCast(@min(bill_mod.decodeCap(&self.cfg, @max(h.reserved_tokens, self.cache.len)), self.max_positions));
             const kv0 = self.kvAllocated();
             try self.resizeKv(cap);
@@ -830,6 +841,80 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 /// MLX's allocator and this process's footprint at a boundary (MLX's counters, the kernel's ledgers:
 /// `phase_memory.Ledgers`, the shared reading).
 pub const Mem = phase_mem.Ledgers;
+
+/// DIAG: a background reader of MLX's counters and the process's ledgers every `ms`: per phase the most host side
+/// (footprint - active - cache), CPU side (footprint - graphics), GPU memory outside MLX (graphics - active - cache),
+/// footprint and MLX bytes; per second of the phase the most host side (MB).
+pub const MemSampler = struct {
+    const A = std.atomic.Value(u64);
+    ms: u32,
+    quit: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+    host: A = .init(0),
+    neg_min_host: A = .init(0),
+    cpu: A = .init(0),
+    gpu_other: A = .init(0),
+    fp: A = .init(0),
+    mlx_b: A = .init(0),
+    n: A = .init(0),
+    t0: A = .init(0),
+    secs: [1024]A = @splat(.init(0)),
+
+    pub fn start(a: std.mem.Allocator, ms: u32) !*MemSampler {
+        const sm = try a.create(MemSampler);
+        sm.* = .{ .ms = ms };
+        sm.t0.store(monoNs(), .release);
+        sm.thread = try std.Thread.spawn(.{}, loop, .{sm});
+        return sm;
+    }
+
+    fn loop(sm: *MemSampler) void {
+        while (!sm.quit.load(.acquire)) {
+            var active: usize = 0;
+            var cache: usize = 0;
+            _ = mlx.mlx_get_active_memory(&active);
+            _ = mlx.mlx_get_cache_memory(&cache);
+            const pm = sdk.memory.processMemory();
+            const m: u64 = active + cache;
+            const host = pm.footprint -| m;
+            _ = sm.host.fetchMax(host, .acq_rel);
+            _ = sm.neg_min_host.fetchMax(std.math.maxInt(u64) - host, .acq_rel);
+            _ = sm.cpu.fetchMax(pm.footprint -| pm.graphics_footprint, .acq_rel);
+            _ = sm.gpu_other.fetchMax(pm.graphics_footprint -| m, .acq_rel);
+            _ = sm.fp.fetchMax(pm.footprint, .acq_rel);
+            _ = sm.mlx_b.fetchMax(m, .acq_rel);
+            _ = sm.n.fetchAdd(1, .acq_rel);
+            const sec: usize = @intCast((monoNs() -| sm.t0.load(.acquire)) / std.time.ns_per_s);
+            if (sec < sm.secs.len) _ = sm.secs[sec].fetchMax(host / 1_000_000, .acq_rel);
+            var ts: std.c.timespec = .{ .sec = @intCast(sm.ms / 1000), .nsec = @intCast(@as(u64, sm.ms % 1000) * std.time.ns_per_ms) };
+            _ = std.c.nanosleep(&ts, null);
+        }
+    }
+
+    pub fn report(sm: *MemSampler, phase: []const u8) void {
+        const n = sm.n.swap(0, .acq_rel);
+        const mn = std.math.maxInt(u64) - sm.neg_min_host.swap(0, .acq_rel);
+        log.info("glm_moe_dsa: DIAG mem sampler {s}: {d} samples, host side max {d} B min {d} B, CPU side max {d} B, GPU outside MLX max {d} B, footprint max {d} B, MLX active+cache max {d} B\n", .{ phase, n, sm.host.swap(0, .acq_rel), if (n == 0) 0 else mn, sm.cpu.swap(0, .acq_rel), sm.gpu_other.swap(0, .acq_rel), sm.fp.swap(0, .acq_rel), sm.mlx_b.swap(0, .acq_rel) });
+        const now: usize = @intCast((monoNs() -| sm.t0.load(.acquire)) / std.time.ns_per_s);
+        var buf: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        for (sm.secs[0..@min(now + 1, sm.secs.len)]) |*x| w.print("{d} ", .{x.swap(0, .acq_rel)}) catch break;
+        sm.t0.store(monoNs(), .release);
+        log.info("glm_moe_dsa: DIAG mem sampler {s} host side MB per second: {s}\n", .{ phase, w.buffered() });
+    }
+
+    fn monoNs() u64 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
+
+    pub fn stop(sm: *MemSampler, a: std.mem.Allocator) void {
+        sm.quit.store(true, .release);
+        sm.thread.join();
+        a.destroy(sm);
+    }
+};
 /// The wave probe's pass high-water marks.
 const Peaks = graph.WaveProbe.Peaks;
 
