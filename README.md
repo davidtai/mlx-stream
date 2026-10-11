@@ -225,11 +225,20 @@ rounded down (148 K3 and 108 K4 experts per routed layer over 128 units: 1.15625
 19.0 MB, 2.45 GB a unit). The KV costs 95,232 B per
 position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16).
 The KV lanes hold only the current phase's positions: the prompt's during its pass, and from the decode handover the
-request's own prompt and `max_tokens`. The bill also charges the residents (from the shard headers), the prompt and
-decode transients, decode's transient window (the routed ids of the widest decode call: 8 rows serial, 8 per verify
-row with the MTP lane), the MLX cache limits (in the prompt pass a sixteenth of the RAM, at most 16 GiB, which the
-cache fills; in decode 512 MiB plus one freed buffer), the read pool's staging and the host side (the footprint
-outside MLX, 1.5 GB, measured on the box).
+request's own prompt and `max_tokens`. The bill (`src/glm_moe_dsa_bill.zig`) is built the way DeepSeek-V4.1's is, on
+the machinery both bills share (`src/phase_memory.zig`): each phase's terms come from the shard headers, the bank's
+manifest, the arrays the module allocates and the limits it installs. The slot rows are billed exactly as the module
+gives them. The residents are billed as MLX allocates them, and not at construction: the host's loader keeps them lazy
+until the first forward. The prompt and decode waves are billed from the arrays a layer's scope holds, by stage. The
+transient rows are the prompt's scratch and decode's window (the routed ids of the widest decode call: 8 rows serial,
+8 per verify row with the MTP lane). The MLX cache limits are billed at the values the module installs (in the prompt
+pass a sixteenth of the RAM, at most 16 GiB; in decode 512 MiB), each with one freed buffer past it. The read pool's
+staging is billed from its own sizes. Three terms are margins sized from the box's readings: the host side past the
+staging, and the prompt's routed GEMM work and attention spans in flight. At construction, the end of the prompt pass,
+the decode handover and the request's end the module logs one `glm_moe_dsa: phase memory` record: the billed terms,
+MLX's active, cache and peak bytes, the footprint and its peak, the box's pages, and billed less measured. With
+`GLM53_WAVE_PROBE` set, the prompt pass also logs each layer's MLX peak by stage (`glm_moe_dsa: wave probe`). The
+receipts test (`src/glm_moe_dsa_bill_receipts_test.zig`) rebuilds the box's runs from their records.
 
 The construction admits both phases of the longest request (the billed context and `max_output` generated tokens)
 under the box's target and fills the prompt rows to it. The box's target is the RAM less a 16 GiB OS reserve (the
