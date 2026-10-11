@@ -17,6 +17,7 @@ const mlx = sdk.mlx;
 const ops = @import("deepseek_v41_ops.zig");
 const glm = @import("glm_moe_dsa.zig");
 const graph = @import("glm_moe_dsa_graph.zig");
+const experts = @import("glm_moe_dsa_experts.zig");
 const timeline = @import("dsv41_verify_timeline.zig");
 
 const G = ops.MlxOps;
@@ -125,6 +126,7 @@ const Rand = struct {
 const Stub = struct {
     parts: [3]T,
     perm: [rows_n * 8]u32,
+    combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
     /// The chain mode's tags: (layer + 1) << 8 | phase (1 barrier, 2 hoist, 3 the rest up to the next barrier).
     tagging: bool = false,
 
@@ -150,14 +152,15 @@ const Stub = struct {
         if (self.tagging) setTag((@as(u64, layer) + 1) << 8 | 2);
         if (hoist.len > 0) try g.asyncEval(hoist);
         if (self.tagging) setTag((@as(u64, layer) + 1) << 8 | 3);
-        ops.bench_stage = "combine.join";
-        const joined = try g.concat(&self.parts, 0);
-        const ord = try g.hostArray(std.mem.sliceAsBytes(self.perm[0 .. n * k]), &.{@intCast(n * k)}, .uint32);
-        ops.bench_stage = "combine.take";
-        const y = try g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), hidden });
-        ops.bench_stage = "combine.wsum";
-        const w = try g.expandDims(scores, -1);
-        return g.astype(try g.sum(try g.mul(y, w), -2, false), g.dtypeOf(x));
+        // The decode lane's GPU combine (experts.joinCombine): each routed row read where its part holds it.
+        ops.bench_stage = "combine.gpu";
+        var loc: [rows_n * 8]u32 = undefined;
+        for (self.perm[0 .. n * k], 0..) |jr, p| {
+            const pi: u32 = if (jr < 12) 0 else if (jr < 24) 1 else 2;
+            loc[p] = pi << 24 | (jr - 12 * pi);
+        }
+        const lc = try g.hostArray(std.mem.sliceAsBytes(loc[0 .. n * k]), &.{@intCast(n * k)}, .uint32);
+        return experts.combineOnGpu(&self.combine_kernel, g, &self.parts, lc, scores, @intCast(n), @intCast(k), hidden, g.dtypeOf(x));
     }
 };
 

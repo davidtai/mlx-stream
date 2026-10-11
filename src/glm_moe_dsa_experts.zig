@@ -62,7 +62,7 @@ const combine_tail =
 /// row is row `loc[t * k + j] & 0xFFFFFF` of part `loc[t * k + j] >> 24`, u32 `[n * k]`) as one launch: each token's
 /// rows weighted and summed in f32 in routed order, products and sums rounded apart (no contraction), cast to `dt`;
 /// the op chain's bits.
-fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, parts: []const ops.MlxOps.T, loc: ops.MlxOps.T, scores: ops.MlxOps.T, n: u32, k: u32, hidden: c_int, dt: ops.Dtype) !ops.MlxOps.T {
+pub fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, parts: []const ops.MlxOps.T, loc: ops.MlxOps.T, scores: ops.MlxOps.T, n: u32, k: u32, hidden: c_int, dt: ops.Dtype) !ops.MlxOps.T {
     std.debug.assert(parts.len > 0 and parts.len <= max_combine_parts);
     const names = comptime blk: {
         @setEvalBranchQuota(1000 * max_combine_parts);
