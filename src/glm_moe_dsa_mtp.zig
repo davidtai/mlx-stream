@@ -969,36 +969,11 @@ test "glm mtp: the EXL3 bank's MoE on the GPU equals sushi's host decode of the 
     const y = try b.moe(&g, xb, try g.hostArray(std.mem.sliceAsBytes(&ids), &.{ n, k }, .int32), try g.hostArray(std.mem.sliceAsBytes(&sc), &.{ n, k }, .float32));
     var got: [n * 128]f32 = undefined;
     _ = try g.hostF32(try g.astype(y, .float32), &got);
-    // The host reference: sushi's own decode (`format.project`) of each mini's three projections from the records.
-    var want: [n * 128]f32 = @splat(0);
-    const mini: usize = @intCast(m.mini_inter);
-    var t_in: [512]f32 = undefined;
-    var inner: [512]f32 = undefined;
-    var gate: [512]f32 = undefined;
-    var up: [512]f32 = undefined;
-    var down: [512]f32 = undefined;
-    for (0..n) |row| for (0..k) |j| {
-        const e: u32 = @intCast(ids[row * k + j]);
-        const sl = m.streamLayer(0, @intCast(e));
-        const l = &m.layers[sl];
-        const rate = sushi.format.kFromPackedDim(16 * l.k).?;
-        for (0..m.tp) |r| {
-            const rec = img[m.recordOffset(sl, e) + r * l.record_bytes ..];
-            const seg = struct {
-                fn f(ll: *const exl3.Layer, bytes: []const u8, ci: usize) []const u16 {
-                    const sg = ll.segments[ci];
-                    return @alignCast(std.mem.bytesAsSlice(u16, bytes[sg.offset..][0..sg.length]));
-                }
-            }.f;
-            const x = xin[row * h ..][0..h];
-            sushi.format.project(x, seg(l, rec, 0), seg(l, rec, 2), seg(l, rec, 1), h, mini, rate, .mcg, t_in[0..h], inner[0..mini], gate[0..mini]);
-            sushi.format.project(x, seg(l, rec, 3), seg(l, rec, 5), seg(l, rec, 4), h, mini, rate, .mcg, t_in[0..h], inner[0..mini], up[0..mini]);
-            var act: [512]f32 = undefined;
-            for (act[0..mini], gate[0..mini], up[0..mini]) |*o, gv, uv| o.* = gv / (1 + @exp(-gv)) * uv;
-            sushi.format.project(act[0..mini], seg(l, rec, 6), seg(l, rec, 8), seg(l, rec, 7), mini, h, rate, .mcg, t_in[0..mini], inner[0..h], down[0..h]);
-            for (want[row * h ..][0..h], down[0..h]) |*o, d| o.* += sc[row * k + j] * d;
-        }
-    };
+    // The host reference: sushi's own decode of each mini's three projections from the records (the EXL3 quant's).
+    var ids16: [n * k]u16 = undefined;
+    for (&ids16, ids) |*d, e| d.* = @intCast(e);
+    var want: [n * 128]f32 = undefined;
+    @import("glm_moe_dsa_exl3_quant.zig").hostMoe(img, &m, 0, &xin, &ids16, &sc, k, &want);
     var scale: f32 = 0;
     var worst: f32 = 0;
     for (want, got) |x, y_| {

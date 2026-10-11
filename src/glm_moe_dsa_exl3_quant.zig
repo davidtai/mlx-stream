@@ -560,8 +560,9 @@ test "glm exl3 quant: a prompt slice over either host-built routing table (this 
 }
 
 /// The host reference of one routed layer's call: each row's experts' minis decoded by sushi's own host path
-/// (`format.project`) from the records, SwiGLU between, the minis summed at the expert's score.
-fn hostMoe(img: []const u8, b: *const bank_mod.Bank, layer: u32, xs: []const f32, ids: []const u16, sc: []const f32, k: usize, out: []f32) void {
+/// (`format.project`) from the records, SwiGLU between, the minis summed at the expert's score (tests; the MTP lane's
+/// bank too, its one routed layer 0).
+pub fn hostMoe(img: []const u8, b: *const bank_mod.Bank, layer: u32, xs: []const f32, ids: []const u16, sc: []const f32, k: usize, out: []f32) void {
     const h: usize = @intCast(b.hidden);
     const mini: usize = @intCast(b.mini_inter);
     var t_in: [512]f32 = undefined;
@@ -594,14 +595,18 @@ fn hostMoe(img: []const u8, b: *const bank_mod.Bank, layer: u32, xs: []const f32
     }
 }
 
-test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's host decode of the records: both bank layers, every lane, host waits and event gates" {
-    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+/// The streamed EXL3 bank's MoE through the experts driver against sushi's host decode of the records (`hostMoe`): both
+/// bank layers, every lane (the prompt's wide lane, the decode lane), host waits and event gates, on the GPU stream `s`
+/// (tests). `Q` is the quant (its `Accepted` and `accept`; `ctx` its accept context, the bank's peek added), `label`
+/// the lines' name, `widths` the calls' rows (0: the phase change), `bound(scale)` the largest |delta| allowed at
+/// outputs up to `scale`. One body for every EXL3 quant over this bank.
+pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.mlx_stream, ctx: quant.Context, widths: []const u32, comptime bound: fn (f32) f32) !void {
     const a = testing.allocator;
     const graph = @import("glm_moe_dsa_graph.zig");
     const G = graph.G;
     const experts_mod = @import("glm_moe_dsa_experts.zig");
     const expert_event = sdk_ext.expert.event;
-    const Ex = experts_mod.Experts(G, bank_mod, Accepted(G));
+    const Ex = experts_mod.Experts(G, bank_mod, Q.Accepted(G));
     var c = try bank_mod.tinyConfigInter(a, 512);
     defer c.deinit(a);
     var tmp = std.testing.tmpDir(.{});
@@ -611,9 +616,6 @@ test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's hos
     var rbuf: [512]u8 = undefined;
     var b = try bank_mod.Bank.open(a, testing.io, try bank_mod.tmpRoot(&tmp, &rbuf), &c, null);
     defer b.deinit();
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const h: usize = c.hidden_size;
     const k = 8;
     var rng = std.Random.DefaultPrng.init(11);
@@ -633,13 +635,14 @@ test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's hos
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const p = try b.peek(arena.allocator());
-        const math = try accept(G, a, &g, .{ .peek = &p }, .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = k, .n_layers = 4, .act = .swiglu, .input = .bfloat16 }, &diag);
+        var qctx = ctx;
+        qctx.peek = &p;
+        const math = try Q.accept(G, a, &g, qctx, .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = k, .n_layers = 4, .act = .swiglu, .input = .bfloat16 }, &diag);
         defer math.deinit(&g);
         var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .gated = gated, .event = ev, .wide_depth = 2 });
         defer ex.deinit(&g);
         for (ex.banks) |bk| if (bk[0]) |arr| try math.checkBank(&g, arr, &diag);
-        // The prompt phase's widths (9 rows: the wide lane; 3 and 1: the decode lane), then the decode phase's.
-        for ([_]u32{ 9, 3, 1, 0, 1, 3, 6, 1 }) |n| {
+        for (widths) |n| {
             if (n == 0) {
                 _ = try ex.releaseTransient();
                 try ex.grow(&decode_rows);
@@ -684,12 +687,25 @@ test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's hos
             }
         }
         const stats = st.stats();
-        std.debug.print("glm exl3 quant [{s}]: {d} routes, {d} hits, {d} misses, {d} B read, lookahead {d} issued / {d} used\n", .{ if (gated) "event gates" else "host waits", stats.route_calls, stats.expert_cache_hits, stats.expert_cache_misses, stats.expert_bytes_read, stats.spec_issued, stats.claimed });
+        std.debug.print(label ++ " [{s}]: {d} routes, {d} hits, {d} misses, {d} B read, lookahead {d} issued / {d} used\n", .{ if (gated) "event gates" else "host waits", stats.route_calls, stats.expert_cache_hits, stats.expert_cache_misses, stats.expert_bytes_read, stats.spec_issued, stats.claimed });
         try testing.expect(stats.expert_cache_misses > 0 and stats.transient_loads > 0);
     }
-    std.debug.print("glm exl3 quant: streamed MoE against the host decode, max |delta| {d:.5} at outputs up to {d:.3}\n", .{ worst, scale });
+    std.debug.print(label ++ ": streamed MoE against the host decode, max |delta| {d:.5} at outputs up to {d:.3}\n", .{ worst, scale });
     try testing.expect(scale > 0.1);
-    try testing.expect(worst <= 0.03 * scale);
+    try testing.expect(worst <= bound(scale));
+}
+
+test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's host decode of the records: both bank layers, every lane, host waits and event gates" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    // The prompt phase's widths (9 rows: the wide lane; 3 and 1: the decode lane), then the decode phase's.
+    try expectStreamedMoe(@This(), "glm exl3 quant", s, .{}, &.{ 9, 3, 1, 0, 1, 3, 6, 1 }, struct {
+        fn f(scale: f32) f32 {
+            return 0.03 * scale;
+        }
+    }.f);
 }
 
 test "glm exl3 quant: a prompt slice's prefill over host slots equals sushi's moe of the same pairs bit for bit, and never waits for the GPU" {
