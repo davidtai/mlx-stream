@@ -22,6 +22,7 @@ const glm = @import("glm_moe_dsa.zig");
 const cache_mod = @import("glm_moe_dsa_cache.zig");
 const pt = @import("glm_moe_dsa_prefill_timers.zig");
 const dsa = sdk.dsa;
+const topk_mod = @import("glm_moe_dsa_topk.zig");
 
 pub const G = ops.MlxOps;
 pub const T = G.T;
@@ -323,7 +324,8 @@ pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, 
 
 /// `select` on the DSA kernels, a prompt's spans: the head-summed scores of each span's rows over the keys it reaches
 /// on the tensor units (f32, the products of the same bf16 values accumulated in f32), the top `index_topk` kept as
-/// i32 ids `[1, rows, index_topk]`; null where the span's keys fit `index_topk`.
+/// i32 ids `[1, rows, index_topk]` (`glm_moe_dsa_topk`: argpartition's ids in its order); null where the span's keys
+/// fit `index_topk`.
 fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, carry: *Carry) !void {
     const topk = c.index_topk;
     const ih: c_int = @intCast(c.index_n_heads);
@@ -348,9 +350,12 @@ fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T,
         const wb = try g.reshape(try g.slice(wts, &.{ @intCast(b0), 0 }, &.{ @intCast(b1), ih }, &.{ 1, 1 }), &.{ 1, r, ih });
         const kb = try g.slice(ik, &.{ 0, 0, 0 }, &.{ 1, @intCast(nb), ihd }, &.{ 1, 1, 1 });
         const scores = try g.adopt((try dsa.indexerScores(g.s, qb, wb, kb, @intCast(start + b0), 1)) orelse return error.DsaKernelDeclined);
-        const kth: c_int = @intCast(nb - topk);
-        const idx = try lastSlice(g, try g.argpartition(scores, kth, -1), kth, @intCast(nb));
-        carry.set(g, i, try g.astype(idx, .int32));
+        // argpartition's ids in its order, by the top-k kernel where it serves the shape.
+        const idx = (try topk_mod.topk(g, scores, topk)) orelse blk: {
+            const kth: c_int = @intCast(nb - topk);
+            break :blk try g.astype(try lastSlice(g, try g.argpartition(scores, kth, -1), kth, @intCast(nb)), .int32);
+        };
+        carry.set(g, i, idx);
         g.resetTo(m);
     }
 }
