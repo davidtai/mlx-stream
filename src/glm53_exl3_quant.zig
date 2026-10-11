@@ -856,6 +856,15 @@ const bench_exps = [_]BenchExp{
     .{ .name = "gu: no MMA (decode, rotation, scale alone)", .kernel = .glm53_pf_gu, .edits = &.{.{ mma_call, "(void)Atile; (void)Btile;" }} },
     .{ .name = "gu: A rows contiguous (no gather)", .kernel = .glm53_pf_gu, .edits = &.{.{ "xr[i][e] = x + size_t(rt[2u * uint(row0 + rr)]) * size_t(HID) + size_t(fc.x);", "xr[i][e] = x + size_t(row0 + rr) * size_t(HID) + size_t(fc.x);" }} },
     .{ .name = "gu: A constant (no x loads)", .kernel = .glm53_pf_gu, .edits = &.{.{ "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));", "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(0.01f * float(jj + e)); (void)p;" }} },
+    // the x loads kept, their conversion out: each bf16's bits read as a half (garbage values; timing only)
+    .{ .name = "gu: A loads without the bf16 to f16 conversion", .kernel = .glm53_pf_gu, .edits = &.{.{ "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));", "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = as_type<half>(as_type<ushort>(p[jj]));" }} },
+    // the same loads from an f16 copy of x (the gather path kept; values as the conversion makes them)
+    .{ .name = "gu: A loads from f16 rows (bits only; timing)", .kernel = .glm53_pf_gu, .edits = &.{
+        .{ "const device bfloat16_t* xr[2][2];", "const device half* xr[2][2];" },
+        .{ "xr[i][e] = x + size_t(rt[2u * uint(row0 + rr)]) * size_t(HID) + size_t(fc.x);", "xr[i][e] = reinterpret_cast<const device half*>(x) + size_t(rt[2u * uint(row0 + rr)]) * size_t(HID) + size_t(fc.x);" },
+        .{ "const device bfloat16_t* p = xr[fi][e] + k0 + 16 * kk;", "const device half* p = xr[fi][e] + k0 + 16 * kk;" },
+        .{ "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));", "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = p[jj];" },
+    } },
     .{ .name = "gu: MMA alone (no trellis decode, A constant)", .kernel = .glm53_pf_gu, .edits = &.{ .{ decode_call, no_decode_gu }, .{ "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(float(p[jj]));", "for (int jj = 0; jj < 4; ++jj) fr[4 * e + jj] = half(0.01f * float(jj + e)); (void)p;" } } },
     .{ .name = "gu: one barrier per stage (races; timing only)", .kernel = .glm53_pf_gu, .edits = &.{.{ "        threadgroup_barrier(mem_flags::mem_threadgroup);\n        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]", "        STEEL_PRAGMA_UNROLL\n        for (int c = 0; c < 4; ++c) bdst[c]" }} },
     .{ .name = "down: no trellis decode (B constant)", .kernel = .glm53_pf_down, .edits = &.{.{ decode_call_down, no_decode }} },
