@@ -269,6 +269,17 @@ static int64_t *res = 0, nt = 0, *logbuf = 0, logn = 0, *gauge = 0;
 static range_t *ranges = 0;
 static job_t *queue = 0;
 static int64_t qcap = 0, qhead = 0, qlen = 0;
+/* GATE/UP FIRST (with range jobs): a submit's down ranges wait in their own ring behind every queued gate/up range,
+ * so a call's gate/up wave is not held behind an earlier route's down ranges; qlen counts both rings.  Off unless
+ * q3ld_gu_first_config. */
+static job_t *dqueue = 0;
+static int64_t dqhead = 0, dlen = 0, mlen = 0;
+static int gu_first = 0;
+
+int q3ld_gu_first_config(int32_t on) {
+    gu_first = on != 0;
+    return 0;
+}
 static uint64_t seq = 0;
 
 static spec_t spec[MAX_SPEC];
@@ -965,8 +976,9 @@ static void *worker(void *arg) {
             pthread_mutex_unlock(&mu);
             continue;
         }
-        job_t job = queue[qhead];
-        qhead = (qhead + 1) % qcap;
+        job_t job;
+        if (mlen > 0) { job = queue[qhead]; qhead = (qhead + 1) % qcap; mlen -= 1; }
+        else { job = dqueue[dqhead]; dqhead = (dqhead + 1) % qcap; dlen -= 1; }
         __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);
         EV(2, job.first);
         busy += 1;
@@ -1270,11 +1282,13 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     }
     ranges = (range_t *)calloc((size_t)n_tickets, sizeof(range_t));
     queue = (job_t *)calloc((size_t)n_tickets, sizeof(job_t));
+    free(dqueue);
+    dqueue = (job_t *)calloc((size_t)n_tickets, sizeof(job_t));
     pre_of = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
     gate_of = (int64_t *)calloc((size_t)n_tickets, sizeof(int64_t));
-    if (!ranges || !queue || !pre_of || !gate_of) {
-        free(ranges); free(queue); free(pre_of); free(gate_of);
-        ranges = 0; queue = 0; pre_of = 0; gate_of = 0;
+    if (!ranges || !queue || !pre_of || !gate_of || !dqueue) {
+        free(ranges); free(queue); free(pre_of); free(gate_of); free(dqueue);
+        ranges = 0; queue = 0; pre_of = 0; gate_of = 0; dqueue = 0;
         pthread_mutex_unlock(&mu);
         return -ENOMEM;
     }
@@ -1283,7 +1297,7 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     memset(gates, 0, sizeof(gates));                  /* EVENT: armed later by q3ld_ev_config */
     g_head = g_tail = 0; ev_hi = ev_target = ev_sent = 0; ev_target_t = 0; ev_kind = EVK_OFF; ev_obj = 0;
     wd_stop = 0; wd_running = 0;
-    qcap = n_tickets; qhead = 0; __atomic_store_n(&qlen, 0, __ATOMIC_RELAXED);
+    qcap = n_tickets; qhead = 0; __atomic_store_n(&qlen, 0, __ATOMIC_RELAXED); dqhead = dlen = mlen = 0;
     res = res_arr; nt = n_tickets; logbuf = log_arr; logn = n_log; gauge = gauge_arr;
     staging_bytes = sbytes; page_size = psize;
     __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); busy = 0; seq = 0;
@@ -1357,7 +1371,9 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     if (nspec) claim_ranges(fd, first, count);
     int32_t jobs = range_jobs ? count : 1;
     for (int32_t j = 0; j < jobs; j++) {
-        job_t *job = &queue[(qhead + qlen) % qcap];
+        int to_down = range_jobs && gu_first && j >= n;
+        job_t *job = to_down ? &dqueue[(dqhead + dlen) % qcap] : &queue[(qhead + mlen) % qcap];
+        if (to_down) dlen += 1; else mlen += 1;
         job->fd = fd; job->file_size = file_size; job->deadline = deadline;
         job->first = range_jobs ? first + j : first; job->count = range_jobs ? 1 : count;
         __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
@@ -1639,7 +1655,7 @@ int q3ld_stop(void) {
     }
     running = 0; nworkers = 0; nspec_started = 0; __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); nspec = 0; nspec_threads = 0; spec_configured = 0;
     spec_idle_busy = SPEC_MAX_DEMAND_BUSY;
-    free(ranges); free(queue); free(pre_of); ranges = 0; queue = 0; pre_of = 0;
+    free(ranges); free(queue); free(pre_of); free(dqueue); ranges = 0; queue = 0; pre_of = 0; dqueue = 0;
     for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
     pre_on = 0; pre_ngu = pre_ndown = 0; pre_gu_total = 0;
     res = 0; logbuf = 0; gauge = 0; sc = 0;

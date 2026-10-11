@@ -235,6 +235,47 @@ test "dsv41 io: range jobs: one submit's ranges run on several workers, each ran
     }
 }
 
+test "glm io: gate/up first: with range jobs a later submit's gate/up ranges run before an earlier submit's down ranges" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(64 * page);
+    defer f.deinit();
+    var pool = try Pool.start(testing.allocator, .{ .workers = 1, .staging_bytes = page, .tickets = 64, .range_jobs = true, .gu_first = true });
+    defer pool.stop();
+    defer clearFaults();
+    const lens = [n_components]u64{ 100, 100, 100, 100, 100, 100, 50, 50, 50 };
+    // Every range on its own page, 500 bytes in; A's first gate/up range sleeps 300 ms, so B is queued behind it.
+    var gu: [4]u64 = undefined;
+    var down: [4]u64 = undefined;
+    for (0..4) |i| {
+        gu[i] = (2 * i) * page + 500;
+        down[i] = (2 * i + 1) * page + 500;
+    }
+    injectFault(gu[0] - 500, 5, 300 * std.time.ns_per_ms);
+    var da = try Dests.init(2, &lens);
+    defer testing.allocator.free(da.buf);
+    var db = try Dests.init(2, &lens);
+    defer testing.allocator.free(db.buf);
+    const seq0 = c.q3ld_seq();
+    const a_first = try R96.submit(pool, f.ufd, gu[0..2], down[0..2], da.rows[0..2], &lens);
+    const b_first = try R96.submit(pool, f.ufd, gu[2..4], down[2..4], db.rows[0..2], &lens);
+    const t_b = c.q3ld_monotonic_ns();
+    try pool.wait(a_first, 4, 10 * std.time.ns_per_s);
+    try pool.wait(b_first, 4, 10 * std.time.ns_per_s);
+    if (pool.result(a_first).t_end_ns < t_b) {
+        std.debug.print("SPECPROBE skipped: A's first range ended before B's submit (box loaded)\n", .{});
+        return error.SkipZigTest;
+    }
+    for (0..2) |i| {
+        try da.expectRecord(i, f.image, gu[i], down[i], &lens);
+        try db.expectRecord(i, f.image, gu[2 + i], down[2 + i], &lens);
+    }
+    // One worker: A's gate/up ranges, B's gate/up ranges, then A's downs, then B's.
+    var order: [8]u32 = undefined;
+    const got = pool.logOrder(seq0, c.q3ld_seq(), &order);
+    const want = [8]u32{ a_first, a_first + 1, b_first, b_first + 1, a_first + 2, a_first + 3, b_first + 2, b_first + 3 };
+    try testing.expectEqualSlices(u32, &want, got);
+}
+
 test "dsv41 io: stop joins and restarts" {
     try testing.expectEqual(@as(i32, abi_version), c.q3ld_abi());
     var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = std.heap.pageSize(), .tickets = 16 });

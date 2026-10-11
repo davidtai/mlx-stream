@@ -26,6 +26,7 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_spec_streams(idle_busy: i32) c_int;
     pub extern fn q3ld_direct_config(on: i32) c_int;
     pub extern fn q3ld_range_jobs_config(on: i32) c_int;
+    pub extern fn q3ld_gu_first_config(on: i32) c_int;
     pub extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
     pub extern fn q3ld_submit(fd: i32, file_size: i64, deadline: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
     pub extern fn q3ld_spec_step_len(fd: i32, file_size: i64, cur: i64, n: i32, bases: ?[*]const i64, len: i64) i32;
@@ -183,6 +184,9 @@ pub const Options = struct {
     /// A demand submit queues each range as its own job (gate/up ranges first): idle workers read one submit's ranges
     /// side by side, and a failed range no longer skips the submit's later ranges.
     range_jobs: bool = false,
+    /// With `range_jobs`: a submit's down ranges wait behind every queued gate/up range (a call's gate/up wave is not
+    /// held behind an earlier route's down ranges).
+    gu_first: bool = false,
     spec: ?Spec = null,
 };
 
@@ -323,6 +327,7 @@ pub const Pool = struct {
         if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
         _ = c.q3ld_direct_config(@intFromBool(opt.direct));
         _ = c.q3ld_range_jobs_config(@intFromBool(opt.range_jobs));
+        _ = c.q3ld_gu_first_config(@intFromBool(opt.gu_first));
         var ptrs: [max_workers]u64 = undefined;
         for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
         const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);

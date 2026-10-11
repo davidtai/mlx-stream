@@ -71,6 +71,9 @@ pub const q3ld = struct {
     pub fn q3ld_range_jobs_config(_: i32) c_int {
         return -1;
     }
+    pub fn q3ld_gu_first_config(_: i32) c_int {
+        return -1;
+    }
     pub fn q3ld_abi() i32 {
         return 0;
     }
