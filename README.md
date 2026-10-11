@@ -303,7 +303,7 @@ csrc/                      the C read pool, the MLX event / alloc shims (with Mi
 src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
 docs/                      design notes and the path map from the in-tree layout
 scripts/                   test_dsv41.sh, compile_kernels_offline.py, compile_mimo_kernels_offline.py,
-                           prepare_mimo_pack.py (planned: docs/mimo-pack.md)
+                           prepare_mimo_pack.py   the pack builder (docs/mimo-pack.md)
 ```
 
 This repository was imported from the mlx-serve fork at commit d38ef038, without its history. `docs/PATH_MAP.md`

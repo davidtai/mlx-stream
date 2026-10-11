@@ -78,16 +78,17 @@ File sizes (GB):
 
 ## Building a pack
 
-> **Planned.** `scripts/prepare_mimo_pack.py` is not in this repository yet. The command and steps below are its
-> design; until it lands, the packs we measured were built by the commands of record in the next section.
+> **Not yet run end to end.** `scripts/prepare_mimo_pack.py` is in this repository but has not built a pack yet; the
+> packs we measured were built by the commands of record in the next section. Its acceptance is below.
 
 ```sh
-# planned: scripts/prepare_mimo_pack.py is not written yet
-python3 scripts/prepare_mimo_pack.py --repo XiaomiMiMo/MiMo-V2.6-Flash-MOPD \
-    --revision 2479e2d0029eca9a34cc7e7f55a121925f81908e --tier fp8res \
-    --src ~/models/mimo-src --out ~/models/MiMo-V2.6-Flash-MOPD-fp8res \
+python3 scripts/prepare_mimo_pack.py all --tier fp8res --src ~/models/mimo-src \
+    --out ~/models/MiMo-V2.6-Flash-MOPD-fp8res --mlx-serve ../mlx-serve \
     [--bank-from <bf16res pack>] [--delete-verified]
 ```
+
+The release revision (`2479e2d0029eca9a34cc7e7f55a121925f81908e`) and the sha256 of every input file are pinned in
+`scripts/mimo_mopd_2479e2d0.sha256.json`; any mismatch refuses with the file name and both values.
 
 One script, release safetensors in, a servable pack out. Stdlib and numpy; mlx and torch only inside the residents
 step, where mlx-serve's converter needs them. No absolute paths, resumable through a journal, uncached reads. Steps, in
@@ -108,9 +109,9 @@ order:
 5. **config, tokenizer and template, by rule from the release**: `model_type: mimo_v2_flash`, `architectures`,
    `attention_projection_layout: split_qkv`, the `expert_streaming` block, the per-projection `quantization` block
    (and `residents_format: fp8_block128` on fp8res), the vision keys removed; `tokenizer.json`,
-   `tokenizer_config.json`, `generation_config.json` and `chat_template.jinja` copied from the release. Open: the
-   release's `eos_token_id` is 151645; our packs list `[151643, 151645, 151672]`. Which one the script writes is not
-   decided.
+   `tokenizer_config.json`, `generation_config.json` and `chat_template.jinja` copied from the release. `eos_token_id`:
+   the release's config.json says 151645 (written by default, `--eos-from release`); its generation_config.json lists
+   `[151643, 151645, 151672]`, which our packs carry in config.json (`--eos-from pack-of-record`).
 6. **verify**: every file's sha256 into `pack-sha256.txt`; a random sample of bank records checked for parity; on
    fp8res, bf16(code x scale) equals the BF16 tensor for every FP8 projection; then the arch's own construction check
    on the pack (see [Checking a pack](#checking-a-pack)).
@@ -169,7 +170,7 @@ step 5 of the bf16res build copied them from, which have since been deleted. So:
   for one, `8524fc93...` against `413a7845...` for the other).
 - The bf16res assembly cannot be rerun: its `RL_PACK` input is gone.
 
-The planned script removes this gap by writing the config by rule and copying the tokenizer files from the release.
+The script removes this gap by writing the config by rule and copying the tokenizer files from the release.
 A pack it builds can then tokenize differently from ours, which is why its acceptance includes an ids comparison.
 
 ## Disk and time
