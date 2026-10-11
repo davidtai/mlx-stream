@@ -434,6 +434,12 @@ pub fn keysOf(g: *G, c: *const glm.Config, lw: *const Layer, x: T, start: u32, r
 /// the keys `kv` / `pe` (`[1, 1, n, ·]`) or the `topk` rows of them, one shared key and value head, the output back
 /// through unembed_out: `[1, heads, 1, v_head_dim]`.
 pub fn absorbedRow(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T, kv: T, pe: T, topk: ?T) !T {
+    return qlinear(g, try absorbedLatent(g, c, try qlinear(g, q_nope, lw.embed_q), q_pe, kv, pe, topk), lw.unembed_out);
+}
+
+/// `absorbedRow` in the latent: the row's query already through embed_q (`q_lat`, `[1, heads, 1, kv_lora_rank]`), the
+/// output before unembed_out (`[1, heads, 1, kv_lora_rank]`).
+fn absorbedLatent(g: *G, c: *const glm.Config, q_lat: T, q_pe: T, kv: T, pe: T, topk: ?T) !T {
     const kvr: c_int = @intCast(c.kv_lora_rank);
     const rp: c_int = @intCast(c.qk_rope_head_dim);
     const scale64: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(c.qHeadDim())));
@@ -446,8 +452,7 @@ pub fn absorbedRow(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_p
         pe_sel = try g.takeAlongAxis(pe, try g.broadcastTo(idx, &.{ 1, 1, kk, rp }), 2);
     }
     const scores = try g.matmul(try g.mul(q_pe, try g.scalar(scale64, g.dtypeOf(q_pe))), try swapLast(g, pe_sel));
-    const qa = try qlinear(g, q_nope, lw.embed_q);
-    return qlinear(g, try sdpa(g, qa, kv_sel, kv_sel, @floatCast(scale64), scores), lw.unembed_out);
+    return sdpa(g, q_lat, kv_sel, kv_sel, @floatCast(scale64), scores);
 }
 
 /// How a forward of several rows attends: `.auto` (one row absorbed, several in the prompt form), or `.per_row` (each
@@ -489,14 +494,19 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     } else if (rows == 1) {
         out = try absorbedRow(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, carry.topk[0]);
     } else if (form == .per_row) {
+        // `absorbedRow` per row, the rows through embed_q and unembed_out in one launch each: the rows on the leading
+        // axis, so each is still its own one-row product (the batch only moves the kernel's pointers: the same sums).
+        const kvr: c_int = @intCast(c.kv_lora_rank);
+        const q_lat = try qlinear(g, try g.transposeAxes(q.q_nope, &.{ 2, 1, 0, 3 }), lw.embed_q);
         var outs: std.ArrayList(T) = .empty;
         defer outs.deinit(carry.a);
         for (0..rows) |i| {
             const r: c_int = @intCast(i);
             const nk: c_int = @intCast(start + i + 1);
-            try outs.append(carry.a, try absorbedRow(g, c, lw, try rowSlice(g, q.q_nope, r, r + 1), try rowSlice(g, q.q_pe, r, r + 1), try rowSlice(g, kv_all, 0, nk), try rowSlice(g, pe_all, 0, nk), carry.topk[i]));
+            const ql = try g.slice(q_lat, &.{ r, 0, 0, 0 }, &.{ r + 1, heads, 1, kvr }, &.{ 1, 1, 1, 1 });
+            try outs.append(carry.a, try absorbedLatent(g, c, ql, try rowSlice(g, q.q_pe, r, r + 1), try rowSlice(g, kv_all, 0, nk), try rowSlice(g, pe_all, 0, nk), carry.topk[i]));
         }
-        out = try g.concat(outs.items, 2);
+        out = try g.transposeAxes(try qlinear(g, try g.concat(outs.items, 0), lw.unembed_out), &.{ 2, 1, 0, 3 });
     } else {
         // The prompt form: the latent expanded per head (k through embed_q, v through unembed_out), in query blocks.
         const scale64: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(qhd)));
