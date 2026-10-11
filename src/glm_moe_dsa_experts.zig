@@ -491,53 +491,11 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         fn waitAll(self: *Self, g: *G, ps: anytype, value: u64, deps: []const T) !@TypeOf(ps) {
             const P = @TypeOf(ps);
             var out = ps;
-            if (G != ops.MlxOps) {
-                inline for (comptime std.meta.fieldNames(P)) |pf| {
-                    const p = @field(ps, pf);
-                    if (@typeInfo(@TypeOf(p)) == .optional) {
-                        if (p) |q| @field(out, pf) = try self.waitArrays(g, q, value, deps);
-                    } else @field(out, pf) = try self.waitArrays(g, p, value, deps);
-                }
-                return out;
-            }
-            var xs: [32]T = undefined;
-            var n: usize = 0;
             inline for (comptime std.meta.fieldNames(P)) |pf| {
-                const po = @field(ps, pf);
-                const pv = if (@typeInfo(@TypeOf(po)) == .optional) po else @as(?@TypeOf(po), po);
-                if (pv) |p| inline for (comptime std.meta.fieldNames(@TypeOf(p))) |f| {
-                    const v = @field(p, f);
-                    const x: ?T = if (@TypeOf(v) == T) v else v;
-                    if (x) |arr| {
-                        xs[n] = arr;
-                        n += 1;
-                    }
-                };
-            }
-            if (n == 0) return out;
-            var os: [32]T = undefined;
-            for (os[0..n]) |*o| o.* = mlx.mlx_array_new();
-            expert_event.wait(xs[0..n], self.opt.event.?, value, deps, false, g.s, os[0..n]) catch |e| {
-                for (os[0..n]) |o| _ = mlx.mlx_array_free(o);
-                return e;
-            };
-            var i: usize = 0;
-            inline for (comptime std.meta.fieldNames(P)) |pf| {
-                const po = @field(ps, pf);
-                const is_opt = @typeInfo(@TypeOf(po)) == .optional;
-                const pv = if (is_opt) po else @as(?@TypeOf(po), po);
-                if (pv) |p| {
-                    var q = p;
-                    inline for (comptime std.meta.fieldNames(@TypeOf(p))) |f| {
-                        const v = @field(p, f);
-                        const x: ?T = if (@TypeOf(v) == T) v else v;
-                        if (x != null) {
-                            @field(q, f) = try g.adopt(os[i]);
-                            i += 1;
-                        }
-                    }
-                    @field(out, pf) = q;
-                }
+                const p = @field(ps, pf);
+                if (@typeInfo(@TypeOf(p)) == .optional) {
+                    if (p) |q| @field(out, pf) = try self.waitArrays(g, q, value, deps);
+                } else @field(out, pf) = try self.waitArrays(g, p, value, deps);
             }
             return out;
         }
