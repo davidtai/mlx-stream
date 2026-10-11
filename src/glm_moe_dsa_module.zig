@@ -440,6 +440,14 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             return self.cache.allocatedBytes(page) + if (self.mtp) |ln| ln.cache.allocatedBytes(page) else 0;
         }
 
+        /// DIAG: MLX's active and cache bytes and the KV lanes' bytes after every command retired.
+        fn diagMem(self: *Self, tag: []const u8) void {
+            _ = mlx.mlx_synchronize(self.g.s);
+            const m = Mem.now();
+            const pend_rows: u64 = if (self.mtp) |ln| ln.n_pending else 0;
+            log.info("glm_moe_dsa: DIAG mem {s}: MLX active {d} B, cache {d} B, KV {d} B, MTP pending rows {d}, footprint {d} B\n", .{ tag, m.active, m.cache, self.kvAllocated(), pend_rows, m.footprint });
+        }
+
         pub fn deinit(self: *Self) void {
             if (self.sampler) |sm| sm.stop(self.gpa);
             _ = mlx.mlx_synchronize(self.g.s);
@@ -496,9 +504,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 log.warn("glm_moe_dsa: a {d}-token prompt is over the {d} tokens this load billed (ContextOverBill)\n", .{ start + ids.len, self.max_context });
                 return error.ContextOverBill;
             }
+            self.diagMem("prefill start");
             try self.reverse(@intCast(start + ids.len));
             // The lanes the pass appends to are allocated before the allocator's size classes go on for its transients.
             try self.cache.preallocate(&self.g, self.model);
+            self.diagMem("lanes preallocated");
             self.stream.resetPromptCounts();
             if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth());
             const s0 = self.stream.stats();
@@ -535,6 +545,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                     try self.history.appendSlice(self.gpa, ids[at..end]);
                 }
                 at = end;
+                if (logits) |x| try self.g.evalAll(&.{x});
+                self.diagMem("prompt call");
             }
             try self.g.evalAll(&.{logits.?});
             try self.ex.flush();
@@ -614,6 +626,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
             const kv1 = self.kvAllocated();
+            self.diagMem("handover lanes resized");
             const st = settle(LiveReader{ .io = self.io }, (before.footprint + kv1) -| (before.cache + transient + kv0), self.hostBound());
             const box = Box.now(st.after);
             // The box's target beside the rest of the box as it stands now (not the load's baseline, an older reading of
@@ -639,6 +652,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 self.decodeRowsAt(line.rows);
             }
             try self.ex.grow(self.decode_rows);
+            self.diagMem("handover grown");
             line.grown = Mem.now();
             log.info("{f}\n", .{line});
             self.decode_positions = cap;
