@@ -1,10 +1,10 @@
 //! GLM-5.3's EXL3 routed-expert quant `glm53_exl3` (C2, `sdk_ext.quant`): the pinned kernels of
 //! `glm53_exl3_kernels` over the EXL3 bank's slot arrays (`glm_moe_dsa_exl3_bank`), specialized to GLM-5.3 (hidden 6144,
 //! a mini's intermediate 512, four minis per expert, K 3 and 4, the mcg codebook, SwiGLU unclamped, top-8).
-//!   - Decode: the decode lane's fused waves run sushi's decode chain (`fused`, the sushi binding composed), faster
-//!     at every decode width than these texts' GEMVs. The GEMVs stay callable over a routed layer's pairs: per wave over
-//!     one bank layer, the three bank kinds in one launch per stage (`decodeWave`: the inputs per mini, the gate and up
-//!     GEMVs per distinct slot, the down with the SwiGLU middle, the minis' sum and the pair's score fused in); per
+//!   - Decode: the decode lane's fused waves run these texts' GEMVs (`fused`; sushi's decode chain, the sushi binding
+//!     composed, is the tests' parity reference). Per wave over one bank layer, the three bank kinds in one launch per
+//!     stage (`decodeWave`: the inputs per mini, the gate and up GEMVs per distinct slot, the down per distinct slot with
+//!     its members' SwiGLU middles, the minis' sum and each pair's score fused in; each weight decoded once a slot); per
 //!     call, every row's pairs summed in routed order (`decodeCombine`); a device wave (`decodeWaveDevice`) takes the
 //!     routed positions' slots as a device array: a position of slot 0xFFFFFFFF or score 0 reads no weight and gives
 //!     zero, and `decodeCombineDevice` sums every position. Nothing syncs with the host.
@@ -43,9 +43,8 @@ pub const wave_rows: u32 = 4096;
 pub const Kernels = enum { glm53, sushi };
 /// The prompt's: GLM-5.3's GEMMs, +23% prefill against sushi's prefill GEMM on the 16K coding ABBA.
 pub const prompt_kernels: Kernels = .glm53;
-/// The decode waves': sushi's chain, faster at every decode width than these texts' GEMVs (`decodeWave`). A decode
-/// kernel that beats it switches this alone.
-pub const decode_kernels: Kernels = .sushi;
+/// The decode waves': these texts' GEMVs (`decodeWave`), each weight decoded once a slot for its member pairs.
+pub const decode_kernels: Kernels = .glm53;
 
 /// The bank's `quantization`: exl3, the mcg codebook at the texts' multiplier, four minis per expert.
 fn parse(peek: *const quant.BankPeek, why: ?*Diag) ?void {
@@ -75,7 +74,7 @@ pub fn Accepted(comptime G: type) type {
         const Bank = quant.BankArrays(A);
         /// A decode wave's widest pair count (6 verify rows x top-8).
         pub const max_decode_rows: u32 = routes.max_pairs;
-        /// The decode lane hands each wave over once its segments landed (`fused`: sushi's decode chain).
+        /// The decode lane hands each wave over once its segments landed (`fused`: `decode_kernels`' chain).
         pub const fused_waves = true;
         /// A decode slot's member pairs per GEMV (`decodeWave`'s gt).
         pub const slot_members = routes.max_members;
@@ -83,7 +82,7 @@ pub fn Accepted(comptime G: type) type {
         pub const combine_sources = routes.combine_sources;
         a: Allocator,
         set: *const ks.Set,
-        /// The decode waves' chain: sushi's binding over the same bank (`fused`).
+        /// Sushi's binding over the same bank: the chain of a phase whose kernels are `.sushi`.
         sushi_math: *sushi_quant.Accepted(G),
         hidden: u32,
         mini: u32,
