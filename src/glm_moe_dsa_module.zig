@@ -799,6 +799,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             defer self.g.release(out.logits);
             defer self.g.release(out.hidden.?);
             const s2 = timeline.now();
+            if (comptime timeline.enabled) timeline.verifyEval();
             try self.g.evalAll(&.{ out.logits, out.hidden.? });
             const s3 = timeline.now();
             if (comptime timeline.enabled) timeline.verifyEnd();

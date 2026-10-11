@@ -32,7 +32,8 @@ pub const Point = enum(u8) { call, barrier, route, hit, end };
 /// `gate_gu` / `gate_down`: the stream event's values the layer's gated miss parts wait for (its gate/up value and its
 /// last down part's), 0 without a gated part.
 pub const Layer = struct { t: [5]u64 = @splat(0), read_call: u64 = 0, read_end: u64 = 0, missed: bool = false, gate_gu: u64 = 0, gate_down: u64 = 0 };
-pub const Verify = struct { begin: u64 = 0, end: u64 = 0 };
+/// `eval`: the host's call of the verify's final eval (0: not stamped; the tail is then one part).
+pub const Verify = struct { begin: u64 = 0, end: u64 = 0, eval: u64 = 0 };
 
 /// The read pool's event-signal log (`q3ld_test_ev_log`, compiled in the profile and test builds): per signal the
 /// value handed to the event, the host time of the signal call, the time the satisfied prefix advanced (the bytes
@@ -145,6 +146,13 @@ pub fn verifyBegin() void {
     verifies[cur].begin = now();
     in_verify = true;
     tag(.verify);
+}
+
+/// The verify's final eval is called (the host has built the graph after the last routed layer).
+pub fn verifyEval() void {
+    if (comptime !enabled) return;
+    if (!active or !in_verify) return;
+    verifies[cur].eval = now();
 }
 
 pub fn verifyEnd() void {
@@ -337,15 +345,18 @@ fn lastEnd(rs: []const Row, cyc: u32, a: u64, b: u64) ?u64 {
 /// Per routed layer (ns): `idle_barrier` (GPU idle from the barrier's submit to the hit wave's), `hit_span` (the hit
 /// wave's buffers, first GPU start to last end), `gap` (the routing barrier's buffer end to the hit wave's first start),
 /// `wait` / `wait_gu` (the layer's gated miss parts: from the GPU start of the first buffer after its hit wave to the
-/// signal of its last down value / of its gate-up value, capped at those buffers' end).
-pub const PerLayer = struct { idle_barrier: u64 = 0, hit_span: ?u64 = null, gap: ?u64 = null, wait: ?u64 = null, wait_gu: ?u64 = null };
+/// signal of its last down value / of its gate-up value, capped at those buffers' end); `wall` (its call to the next
+/// stamped layer's call, the last layer's to the final eval's call) and `idle_post_hit` (the GPU idle from its hit
+/// submit to that end).
+pub const PerLayer = struct { idle_barrier: u64 = 0, hit_span: ?u64 = null, gap: ?u64 = null, wait: ?u64 = null, wait_gu: ?u64 = null, wall: u64 = 0, idle_post_hit: u64 = 0 };
 
 /// One verify (ns): its wall, the GPU's busy union inside it and the idle rest, split by the host's stamps into
 /// `idle_barrier`, `idle_encode` (before the first layer, and between a layer's hit submit and the next layer's barrier
-/// submit) and `idle_tail` (after the last layer's hit submit); `read` the stream's read gauge over the routed calls;
+/// submit) and `idle_tail` (after the last layer's hit submit; with the final eval's stamp, split at it into
+/// `idle_tail_build` and `idle_tail_eval`, their host walls `tail_build` and `tail_eval`); `read` the stream's read gauge over the routed calls;
 /// `miss_busy` the GPU busy time after the hit submit of the layers that missed; `wait` the summed gated waits on miss
 /// bytes (`PerLayer.wait`) and `work` = busy - wait; `hit_span` / `gap` summed over the layers that have them.
-pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_barrier: u64 = 0, idle_encode: u64 = 0, idle_tail: u64 = 0, read: u64 = 0, miss_busy: u64 = 0, buffers: u32 = 0, layers: u32 = 0, truncated: bool = false, work: u64 = 0, wait: u64 = 0, wait_gu: u64 = 0, hit_span: u64 = 0, hit_layers: u32 = 0, gap: u64 = 0, gap_layers: u32 = 0, gated: u32 = 0, unsignalled: u32 = 0 };
+pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_barrier: u64 = 0, idle_encode: u64 = 0, idle_tail: u64 = 0, idle_tail_build: u64 = 0, idle_tail_eval: u64 = 0, tail_build: u64 = 0, tail_eval: u64 = 0, read: u64 = 0, miss_busy: u64 = 0, buffers: u32 = 0, layers: u32 = 0, truncated: bool = false, work: u64 = 0, wait: u64 = 0, wait_gu: u64 = 0, hit_span: u64 = 0, hit_layers: u32 = 0, gap: u64 = 0, gap_layers: u32 = 0, gated: u32 = 0, unsignalled: u32 = 0 };
 
 pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []const Signal, scratch: []Span, per: []PerLayer) CycleSum {
     var s: CycleSum = .{};
@@ -389,17 +400,26 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
         last = i;
     }
     s.idle_tail = idleIn(u, prev_hit, v.end);
+    const ev = if (v.eval > prev_hit and v.eval <= v.end) v.eval else v.end;
+    s.idle_tail_build = idleIn(u, prev_hit, ev);
+    s.idle_tail_eval = idleIn(u, ev, v.end);
+    s.tail_build = ev - prev_hit;
+    s.tail_eval = v.end - ev;
     if (first) |f| s.read = ls[last.?].read_end -| ls[f].read_call;
     for (ls, 0..) |l, i| {
         if (P.t(l, .call) == 0) continue;
         // the next stamped layer's barrier (its eval commits the miss waves), or the verify's end
         var next_call: u64 = v.end;
         var next_barrier: u64 = v.end;
+        var layer_end: u64 = ev;
         for (ls[i + 1 ..]) |n| if (P.t(n, .call) != 0) {
             next_call = P.t(n, .call);
             next_barrier = P.t(n, .barrier);
+            layer_end = next_call;
             break;
         };
+        per[i].wall = layer_end -| P.t(l, .call);
+        per[i].idle_post_hit = idleIn(u, P.t(l, .hit), layer_end);
         if (l.missed) s.miss_busy += busyIn(u, P.t(l, .hit), next_call);
         if (l.gate_down == 0) continue;
         s.gated += 1;
@@ -421,7 +441,7 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
     return s;
 }
 
-const fields = [_][]const u8{ "wall_ms", "busy_ms", "gpu_work_ms", "bytes_wait_ms", "bytes_wait_gu_ms", "idle_ms", "idle_barrier_ms", "idle_barrier_per_layer_ms", "idle_encode_ms", "idle_tail_ms", "hit_span_ms", "hit_span_per_layer_ms", "router_hit_gap_ms", "router_hit_gap_per_layer_ms", "read_busy_ms", "miss_layer_busy_ms", "buffers", "gated_layers", "unsignalled_gates" };
+const fields = [_][]const u8{ "wall_ms", "busy_ms", "gpu_work_ms", "bytes_wait_ms", "bytes_wait_gu_ms", "idle_ms", "idle_barrier_ms", "idle_barrier_per_layer_ms", "idle_encode_ms", "idle_tail_ms", "tail_build_wall_ms", "idle_tail_build_ms", "tail_eval_wall_ms", "idle_tail_eval_ms", "hit_span_ms", "hit_span_per_layer_ms", "router_hit_gap_ms", "router_hit_gap_per_layer_ms", "read_busy_ms", "miss_layer_busy_ms", "buffers", "gated_layers", "unsignalled_gates" };
 
 fn fieldOf(s: CycleSum, i: usize) f64 {
     const ms = struct {
@@ -445,14 +465,18 @@ fn fieldOf(s: CycleSum, i: usize) f64 {
         7 => per(s.idle_barrier, s.layers),
         8 => ms(s.idle_encode),
         9 => ms(s.idle_tail),
-        10 => ms(s.hit_span),
-        11 => per(s.hit_span, s.hit_layers),
-        12 => ms(s.gap),
-        13 => per(s.gap, s.gap_layers),
-        14 => ms(s.read),
-        15 => ms(s.miss_busy),
-        16 => @floatFromInt(s.buffers),
-        17 => @floatFromInt(s.gated),
+        10 => ms(s.tail_build),
+        11 => ms(s.idle_tail_build),
+        12 => ms(s.tail_eval),
+        13 => ms(s.idle_tail_eval),
+        14 => ms(s.hit_span),
+        15 => per(s.hit_span, s.hit_layers),
+        16 => ms(s.gap),
+        17 => per(s.gap, s.gap_layers),
+        18 => ms(s.read),
+        19 => ms(s.miss_busy),
+        20 => @floatFromInt(s.buffers),
+        21 => @floatFromInt(s.gated),
         else => @floatFromInt(s.unsignalled),
     };
 }
@@ -463,7 +487,7 @@ fn median(xs: []f64) f64 {
     return if (xs.len % 2 == 1) xs[xs.len / 2] else (xs[xs.len / 2 - 1] + xs[xs.len / 2]) / 2;
 }
 
-const by_layer_fields = [_][]const u8{ "idle_barrier", "hit_span", "router_hit_gap", "bytes_wait" };
+const by_layer_fields = [_][]const u8{ "idle_barrier", "hit_span", "router_hit_gap", "bytes_wait", "layer_wall", "idle_post_hit" };
 
 var per_cycle: [fields.len][max_cycles]f64 = undefined;
 var per_layer: [by_layer_fields.len][max_layers][max_cycles]f64 = undefined;
@@ -490,7 +514,7 @@ fn writeLine(w: *std.Io.Writer, rs: []const Row, vs: []const Verify, ls: []const
         const s = cycleSum(rs, v, ls[ci][0..n_layers], @intCast(ci), sig, &span_scratch, per[0..n_layers]);
         for (0..fields.len) |f| per_cycle[f][n] = fieldOf(s, f);
         for (per[0..n_layers], 0..) |p, l| {
-            const vals = [_]?u64{ p.idle_barrier, p.hit_span, p.gap, p.wait };
+            const vals = [_]?u64{ p.idle_barrier, p.hit_span, p.gap, p.wait, if (p.wall > 0) p.wall else null, if (p.wall > 0) p.idle_post_hit else null };
             for (vals, 0..) |x, k| if (x) |y| {
                 per_layer[k][l][per_layer_n[k][l]] = @as(f64, @floatFromInt(y)) / 1e6;
                 per_layer_n[k][l] += 1;
@@ -561,7 +585,7 @@ pub fn writeJson(w: *std.Io.Writer) !void {
 }
 
 test "dsv41 verify timeline: a default build stamps nothing and links no shim; the storage bound is static" {
-    try std.testing.expectEqual(@as(usize, (1 << 19) * 56 + 1024 * (80 * @sizeOf(Layer) + 16) + (1 << 17) * 32), storage_bytes);
+    try std.testing.expectEqual(@as(usize, (1 << 19) * 56 + 1024 * (80 * @sizeOf(Layer) + 24) + (1 << 17) * 32), storage_bytes);
     try std.testing.expectError(error.TimelineCycles, bound(1026, 40));
     try std.testing.expectError(error.TimelineLayers, bound(1024, 81));
     try bound(1024, 40);
@@ -653,6 +677,13 @@ test "dsv41 verify timeline (profile builds): a hand-made verify: busy union, id
     try std.testing.expectEqual(@as(u64, 5), s.idle_encode);
     try std.testing.expectEqual(@as(u64, 90), s.idle_tail);
     try std.testing.expectEqual(s.idle, s.idle_barrier + s.idle_encode + s.idle_tail);
+    // no eval stamp: the tail is one part; layer 0 [110, 150): post-hit [130, 150) busy; layer 1 [150, 300): post-hit 90
+    try std.testing.expectEqual(@as(u64, 90), s.idle_tail_build);
+    try std.testing.expectEqual(@as(u64, 0), s.idle_tail_eval);
+    try std.testing.expectEqual(@as(u64, 40), per[0].wall);
+    try std.testing.expectEqual(@as(u64, 0), per[0].idle_post_hit);
+    try std.testing.expectEqual(@as(u64, 150), per[1].wall);
+    try std.testing.expectEqual(@as(u64, 90), per[1].idle_post_hit);
     // hit spans 124..140 = 16 and 205..215 = 10; router-to-hit gaps 124 - 120 = 4 and 205 - 200 = 5
     try std.testing.expectEqual(@as(?u64, 16), per[0].hit_span);
     try std.testing.expectEqual(@as(?u64, 10), per[1].hit_span);
@@ -670,6 +701,14 @@ test "dsv41 verify timeline (profile builds): a hand-made verify: busy union, id
     try std.testing.expectEqual(@as(u64, 20), s.miss_busy);
     try std.testing.expectEqual(@as(u32, 4), s.buffers);
     try std.testing.expectEqual(@as(u32, 2), s.layers);
+    // the final eval called at 250: the tail splits at it, [170, 250) idle 200..205 + 215..250 = 40, [250, 300) 50
+    const se = cycleSum(&rs, .{ .begin = 100, .end = 300, .eval = 250 }, &ls, 0, &sig, &scratch, &per);
+    try std.testing.expectEqual(@as(u64, 40), se.idle_tail_build);
+    try std.testing.expectEqual(@as(u64, 50), se.idle_tail_eval);
+    try std.testing.expectEqual(@as(u64, 80), se.tail_build);
+    try std.testing.expectEqual(@as(u64, 50), se.tail_eval);
+    try std.testing.expectEqual(se.idle_tail, se.idle_tail_build + se.idle_tail_eval);
+    try std.testing.expectEqual(@as(u64, 100), per[1].wall);
     // a signal log that stops short leaves the gate unsignalled (no wait counted)
     const s2 = cycleSum(&rs, .{ .begin = 100, .end = 300 }, &ls, 0, sig[0..2], &scratch, &per);
     try std.testing.expectEqual(@as(u32, 1), s2.unsignalled);
