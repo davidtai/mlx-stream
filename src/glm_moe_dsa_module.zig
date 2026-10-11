@@ -326,7 +326,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             // The lanes allocate at their first append; each prompt and each handover sets their positions (`resizeKv`).
             self.cache = try graph.Cache.init(gpa, model, @intCast(max_context));
             errdefer self.cache.deinit(&self.g);
-            if (cfg.mtpDepth() > 0) self.mtp = try Lane.open(gpa, io, &self.g, dir, model, cfg.mtpDepth(), cfg.mtpAcceptance(), @intCast(max_context), cfg.nocache_weights orelse true, &diag);
+            if (cfg.mtpDepth() > 0) {
+                self.mtp = try Lane.open(gpa, io, &self.g, dir, model, cfg.mtpDepth(), cfg.mtpAcceptance(), @intCast(max_context), cfg.nocache_weights orelse true, &diag);
+                self.mtp.?.min_p = cfg.mtpDraftMinP();
+            }
             errdefer if (self.mtp) |ln| ln.deinit(&self.g);
             // The lane's open measured what it holds (the DeepSeek-V4.1 way: a measured install against its billed term).
             if (self.mtp) |ln| {
@@ -770,11 +773,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const len = self.cache.len;
             if (len >= self.cache.cap) return error.ContextOverBill;
             const tracked = ln.tracked() == len and ln.n_pending >= 1;
-            const depth: u32 = if (tracked) @min(ln.depth, accepted_cap, self.cache.cap - len - 1) else 0;
+            const drafted: u32 = if (tracked) @min(ln.depth, accepted_cap, self.cache.cap - len - 1) else 0;
             var ids: [mtp_mod.max_depth + 1]u32 = undefined;
             ids[0] = t1;
+            // The drafts the round verifies: the lane's, up to its first step under `min_p`.
+            const depth: u32 = if (drafted > 0) try ln.draft(&self.g, a, &self.w, self.history.items[ln.cache.len + 1 .. len], t1, drafted, ids[1..][0..drafted], if (probe) |p| p.force else &.{}, if (probe) |p| p.logits else null) else 0;
             const drafts = ids[1..][0..depth];
-            if (depth > 0) try ln.draft(&self.g, a, &self.w, self.history.items[ln.cache.len + 1 .. len], t1, depth, drafts, if (probe) |p| p.force else &.{}, if (probe) |p| p.logits else null);
             const t_draft = self.nowNs();
             if (probe) |p| {
                 p.depth = depth;
@@ -795,14 +799,16 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.cache.truncateTo(len + 1 + d.accepted);
             try self.history.appendSlice(self.gpa, ids[0 .. 1 + d.accepted]);
             const rows = d.accepted + 1;
-            try ln.pend(&self.g, self.cache.len, try graph.rowSlice(&self.g, out.hidden.?, 0, @intCast(rows)), rows, depth == 0);
+            try ln.pend(&self.g, self.cache.len, try graph.rowSlice(&self.g, out.hidden.?, 0, @intCast(rows)), rows, drafted == 0);
             const tokens = try a.dupe(u32, ids[0..rows]);
             const ns = self.nowNs() - t0;
             ln.counts.rounds += 1;
             ln.counts.drafted += depth;
             ln.counts.accepted += d.accepted;
             ln.counts.generated += rows;
-            ln.counts.serial += @intFromBool(depth == 0);
+            ln.counts.serial += @intFromBool(drafted == 0);
+            ln.counts.cut += drafted - depth;
+            ln.counts.cut_rounds += @intFromBool(depth < drafted);
             ln.counts.wall_ns += ns;
             ln.counts.draft_ns += t_draft - t0;
             ln.counts.verify_ns += t_verify - t_draft;

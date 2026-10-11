@@ -290,6 +290,58 @@ test "glm mtp parity: a round's verify reads, each expert's by the first row tha
     std.debug.print("glm mtp parity: a rejected round read {d} B, {d} B of it for the rejected rows; a serial step {d} B\n", .{ round_bytes, ln.counts.rejected_bytes, serial_bytes });
 }
 
+/// The rounds of `cs`'s prompt with the lane's `min_p` until they emit the serial decode's tokens: each round verifies
+/// the drafts before its first step under `min_p` and runs no step after it. `tps` gets every step's top probability.
+fn cutRounds(a: std.mem.Allocator, dir: []const u8, cs: *const Case, min_p: f32, tps: ?*std.ArrayList(f32)) !mtp.Counts {
+    const r = try Rig.open(a, dir, cs.depth);
+    defer r.close(a);
+    const ln = r.m.mtp.?;
+    ln.min_p = min_p;
+    var t1 = try r.begin(cs.prompt, @intCast(cs.serial.len + 8));
+    var emitted: std.ArrayList(u32) = .empty;
+    defer emitted.deinit(a);
+    while (emitted.items.len < cs.serial.len) {
+        var probe: M.Probe = .{};
+        var out = try r.m.roundWith(a, t1, std.math.maxInt(u32), greedy, &probe);
+        defer out.deinit(a);
+        for (ln.top_p[0..probe.depth]) |p| try testing.expect(p >= min_p);
+        const ran = if (probe.depth < cs.depth) blk: {
+            try testing.expect(ln.top_p[probe.depth] < min_p);
+            break :blk probe.depth + 1;
+        } else cs.depth;
+        if (tps) |l| try l.appendSlice(a, ln.top_p[0..ran]);
+        try emitted.appendSlice(a, out.tokens);
+        t1 = out.next_token;
+    }
+    try testing.expectEqualSlices(u32, cs.serial, emitted.items[0..cs.serial.len]);
+    return ln.counts;
+}
+
+test "glm mtp parity: under mtp_draft_min_p a round verifies the drafts before its first step under it and runs no step after it; the rounds still emit the serial greedy decode's tokens" {
+    const dir = fixtureDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const gold = try loadGoldens(a, dir);
+    defer gold.deinit();
+    const cs = for (gold.value.cases) |*c| {
+        if (c.depth == 3 and std.mem.eql(u8, c.schedule, "mtp")) break c;
+    } else return error.SkipZigTest;
+    // Off: no cut. The median of the steps' top probabilities then cuts some drafts and keeps some.
+    var tps: std.ArrayList(f32) = .empty;
+    defer tps.deinit(a);
+    const off = try cutRounds(a, dir, cs, 0, &tps);
+    try testing.expectEqual(@as(u64, 0), off.cut);
+    std.mem.sort(f32, tps.items, {}, std.sort.asc(f32));
+    const mid = try cutRounds(a, dir, cs, tps.items[tps.items.len / 2], null);
+    try testing.expect(mid.cut > 0 and mid.cut_rounds > 0 and mid.drafted > 0);
+    // Over every probability: each round verifies t1 alone, as a serial step.
+    const all = try cutRounds(a, dir, cs, 2, null);
+    try testing.expectEqual(@as(u64, 0), all.drafted);
+    try testing.expectEqual(all.rounds, all.cut_rounds);
+    try testing.expectEqual(all.rounds * cs.depth, all.cut);
+    try testing.expectEqual(all.rounds, all.generated);
+    std.debug.print("glm mtp parity: min_p {d:.4} cut {d} drafts in {d} of {d} rounds, {d} drafts verified\n", .{ tps.items[tps.items.len / 2], mid.cut, mid.cut_rounds, mid.rounds, mid.drafted });
+}
+
 // ── refusals and decisions (no fixture) ──
 
 /// A synthetic pack of the tiny model with the release's MTP fields in its config (`index_share` as given).

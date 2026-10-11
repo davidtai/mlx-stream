@@ -217,6 +217,7 @@ Settings (`model-settings.json`):
 | `mtp_depth` | the MTP draft lane's drafts per round, 0 to 5 (6 or more is refused at load) | 0 (off) |
 | `mtp_acceptance` | `exact` or `typical` | `exact` |
 | `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |
+| `mtp_draft_min_p` | a round's drafts end before the first draft whose head top probability is under it, 0 to 1 exclusive | off |
 | `expert_lookahead_budget` | the decode lookahead's records read ahead per routed call, 1 to 4 | 2 |
 
 Memory: the fill counts units of slot rows. On the affine bank a unit is one 21.2 MB record on each of the 75 routed

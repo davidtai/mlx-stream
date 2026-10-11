@@ -1,6 +1,7 @@
 //! GLM-5.3's config on the host side: the model directory, the parsed model config, the load's facts and the model
 //! settings it takes (`model-settings.json`) with the defaults they fall back to. The MTP draft lane is off unless
-//! `mtp_depth` sets it; its acceptance is exact unless `mtp_acceptance` names typical.
+//! `mtp_depth` sets it; its acceptance is exact unless `mtp_acceptance` names typical; every round drafts `mtp_depth`
+//! unless `mtp_draft_min_p` sets the head's top probability a draft needs.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -51,6 +52,9 @@ pub const Config = struct {
     mtp_acceptance: ?MtpAcceptance = null,
     /// The typical acceptance's delta (null = `sdk.acceptance.DEFAULT_TYPICAL_DELTA`); read only under typical.
     mtp_typical_delta: ?f32 = null,
+    /// A round's drafts end before the first draft whose head top probability is under this (null = off: every round
+    /// drafts `mtp_depth`; 0 < p < 1). The acceptance and the request's sampling are as without it.
+    mtp_draft_min_p: ?f32 = null,
 
     /// The longest `ctx_size` the bill takes (GLM-5.3's max_position_embeddings).
     pub const max_ctx_size: i64 = 1 << 20;
@@ -143,8 +147,18 @@ pub const Config = struct {
                 any = true;
             };
         }
-        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
-            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta,
+        if (obj.get("mtp_draft_min_p")) |v| {
+            const p: ?f64 = switch (v) {
+                .float => |f| f,
+                else => null,
+            };
+            if (p) |x| if (std.math.isFinite(x) and x > 0 and x < 1) {
+                c.mtp_draft_min_p = @floatCast(x);
+                any = true;
+            };
+        }
+        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d} mtp_draft_min_p={d}\n", .{
+            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta, c.mtpDraftMinP(),
         });
     }
 
@@ -163,6 +177,11 @@ pub const Config = struct {
     /// The lane's drafts per round (0 = off).
     pub fn mtpDepth(c: *const Config) u32 {
         return c.mtp_depth orelse 0;
+    }
+
+    /// The head's top probability a draft needs to be verified (0 = off).
+    pub fn mtpDraftMinP(c: *const Config) f32 {
+        return c.mtp_draft_min_p orelse 0;
     }
 
     /// The lane's acceptance as the SDK names it: exact unless the setting names typical.
@@ -292,6 +311,14 @@ test "glm settings: mtp_depth is 0 to the route limit's 5 (past it kept for the 
     try (try settingsOf("{\"mtp_acceptance\": \"tokenv3\"}")).checkMtp();
     try testing.expectError(error.MtpAcceptanceNotImplemented, (try settingsOf("{\"mtp_acceptance\": \"tokenv3\", \"mtp_depth\": 1}")).checkMtp());
     try testing.expectError(error.MtpAcceptanceNotImplemented, (try settingsOf("{\"mtp_acceptance\": \"fast\", \"mtp_depth\": 1}")).checkMtp());
+}
+
+test "glm settings: mtp_draft_min_p is off unless set to a probability strictly between 0 and 1" {
+    try testing.expectEqual(@as(f32, 0), (Config{}).mtpDraftMinP());
+    try testing.expectEqual(@as(f32, 0.5), (try settingsOf("{\"mtp_draft_min_p\": 0.5}")).mtpDraftMinP());
+    try testing.expectEqual(@as(f32, 0.3), (try settingsOf("{\"mtp_depth\": 3, \"mtp_draft_min_p\": 0.3}")).mtpDraftMinP());
+    for ([_][]const u8{ "{\"mtp_draft_min_p\": 0}", "{\"mtp_draft_min_p\": 1}", "{\"mtp_draft_min_p\": 1.5}", "{\"mtp_draft_min_p\": -0.2}", "{\"mtp_draft_min_p\": \"0.5\"}", "{\"mtp_draft_min_p\": 0.0}" }) |j|
+        try testing.expectEqual(@as(f32, 0), (try settingsOf(j)).mtpDraftMinP());
 }
 
 test "glm settings: the load facts replace the fill's inputs, the settings stay" {

@@ -486,6 +486,10 @@ pub const Counts = struct {
     /// and the first rejected one) and the accepted ones.
     decided: [10]u64 = @splat(0),
     accepted_by_p: [10]u64 = @splat(0),
+    /// The round's drafts it did not verify (`Lane.min_p`: the step under it and the steps not run after it), and the
+    /// rounds that cut any.
+    cut: u64 = 0,
+    cut_rounds: u64 = 0,
 };
 
 /// The tenth of `p` (a probability): 0 .. 9.
@@ -498,6 +502,8 @@ pub const Line = struct {
     depth: u32,
     mode: []const u8,
     delta: f32,
+    /// `Lane.min_p` (0: off, nothing more printed).
+    min_p: f32 = 0,
     c: Counts,
 
     pub fn format(p: Line, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -516,6 +522,7 @@ pub const Line = struct {
         try w.print(", verify reads {d:.2} GB ({d:.3} GB per emitted token), {d:.2} GB of it for rejected rows only", .{
             gb, if (p.c.generated == 0) 0 else gb / @as(f64, @floatFromInt(p.c.generated)), @as(f64, @floatFromInt(p.c.rejected_bytes)) / 1e9,
         });
+        if (p.min_p > 0) try w.print(", {d} drafts cut in {d} rounds (the head's top probability under {d})", .{ p.c.cut, p.c.cut_rounds, p.min_p });
     }
 };
 
@@ -551,6 +558,9 @@ pub fn Lane(comptime kind: BankKind) type {
         counts: Counts = .{},
         /// The head's top probability at each step of the last round's drafts.
         top_p: [max_depth]f32 = @splat(0),
+        /// A round's drafts end before the first step whose head top probability is under this (that draft and the
+        /// steps after it are not made into verify rows); 0: every round drafts `depth` (the model's `mtp_draft_min_p`).
+        min_p: f32 = 0,
         /// Logged once per request that the lane stopped tracking.
         untracked_logged: bool = false,
         /// MLX's active bytes the open added (its residents, its experts' arrays and their slot table), measured once:
@@ -692,9 +702,11 @@ pub fn Lane(comptime kind: BankKind) type {
         }
 
         /// A round's drafts after `t1` (the token after the target's last position): the pending pairs appended (their
-        /// tokens `after` then `t1`), the first step on the last of them, then `depth - 1` steps on the drafts. `force`
-        /// (a test's) replaces the first drafts. `logits_out` (a test's, `depth` x vocab) gets each step's logits.
-        pub fn draft(self: *Self, g: *G, a: std.mem.Allocator, tw: *const graph.Weights, after: []const u32, t1: u32, depth: u32, out: []u32, force: []const u32, logits_out: ?[]f32) !void {
+        /// tokens `after` then `t1`), the first step on the last of them, then up to `depth - 1` steps on the drafts.
+        /// Returns the drafts the round verifies, `out[0..n]`: `depth`, or the step whose head top probability is under
+        /// `min_p` (its draft dropped, no step after it run). `force` (a test's) replaces the first drafts.
+        /// `logits_out` (a test's, `depth` x vocab) gets each step's logits.
+        pub fn draft(self: *Self, g: *G, a: std.mem.Allocator, tw: *const graph.Weights, after: []const u32, t1: u32, depth: u32, out: []u32, force: []const u32, logits_out: ?[]f32) !u32 {
             std.debug.assert(after.len + 1 == self.n_pending and out.len >= depth and depth >= 1);
             const tokens = try a.alloc(u32, self.n_pending);
             defer a.free(tokens);
@@ -718,6 +730,7 @@ pub fn Lane(comptime kind: BankKind) type {
             const topk = try self.ownSelection(g, a, x, pos);
             defer if (topk) |t| g.release(t);
             const vocab: usize = c.vocab_size;
+            var n: u32 = depth;
             for (0..depth) |step| {
                 const s: u32 = @intCast(step);
                 const h = try self.row(g, x, pos + s, topk);
@@ -736,12 +749,17 @@ pub fn Lane(comptime kind: BankKind) type {
                 _ = try g.hostF32(top, &tp);
                 self.top_p[step] = tp[0];
                 out[step] = if (step < force.len) force[step] else tok[0];
+                if (tp[0] < self.min_p) {
+                    n = @intCast(step);
+                    break;
+                }
                 if (step + 1 < depth) {
                     x = try self.input(g, tw, out[step..][0..1], normed);
                 }
             }
             var bufs: [3]T = undefined;
             try g.evalAll(self.cache.buffers(0, &bufs));
+            return n;
         }
 
         /// The lane's part of a prefix restore: `n` target positions match the new prompt. Returns the positions the
@@ -774,7 +792,7 @@ pub fn Lane(comptime kind: BankKind) type {
             return .{ .depth = self.depth, .mode = sdk.acceptance.name(self.mode), .delta = switch (self.mode) {
                 .typical => |t| t.delta,
                 else => 0,
-            }, .c = self.counts };
+            }, .min_p = self.min_p, .c = self.counts };
         }
     };
 }
@@ -843,6 +861,14 @@ test "glm mtp: the request's line (the ABBA harness reads it): depth, acceptance
     const u = try std.fmt.allocPrint(testing.allocator, "{f}", .{t});
     defer testing.allocator.free(u);
     try testing.expect(std.mem.startsWith(u8, u, "glm_moe_dsa: mtp depth 2 acceptance typical (delta 0.3): 2 rounds"));
+    try testing.expect(std.mem.indexOf(u8, u, "cut") == null);
+    var cut = t;
+    cut.min_p = 0.5;
+    cut.c.cut = 7;
+    cut.c.cut_rounds = 4;
+    const v = try std.fmt.allocPrint(testing.allocator, "{f}", .{cut});
+    defer testing.allocator.free(v);
+    try testing.expect(std.mem.endsWith(u8, v, "for rejected rows only, 7 drafts cut in 4 rounds (the head's top probability under 0.5)"));
 }
 
 test "glm mtp: the pack's mtp/ opens under the trunk bank's rules: the MTP layer's two bank layers, its experts map, the refusals by name" {
