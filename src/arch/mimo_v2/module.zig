@@ -173,18 +173,15 @@ pub const Module = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const plan = try bills.plan(arena.allocator(), io, config.*, ceiling, stop);
-        // +attn: the prompt attention route, once (design-prefill §3b), and its checked range, before any load.
-        // The DEFAULT routes to the stock control on a device without NAX (a platform route) and past the NAX route's
-        // checked keys, one line each; a NAMED nax refuses there by name (`resolveServed`).
+        // +attn: the prompt attention route, once (design-prefill §3b), at every served context, before any load.
+        // The DEFAULT routes to the stock control on a device without NAX (a platform route, one line); a NAMED nax
+        // refuses there by name (`resolve`).
         const has_nax = prefill_attention.deviceHasNax(s);
-        const attention_route = try prefill_attention.resolveServed(config.prefill_attention, has_nax, plan.reserve);
-        if (config.prefill_attention == null) {
+        const attention_route = try prefill_attention.resolve(config.prefill_attention, has_nax);
+        try prefill_attention.requireKeyRange(attention_route, plan.reserve);
+        if (config.prefill_attention == null and !has_nax) {
             var line: [256]u8 = undefined;
-            if (!has_nax) {
-                log.info("{s}", .{settings.prefillAttentionPlatformLine(&line)});
-            } else if (prefill_attention.defaultTakesStock(null, plan.reserve)) {
-                log.info("{s}", .{settings.prefillAttentionStockLine(&line, plan.reserve)});
-            }
+            log.info("{s}", .{settings.prefillAttentionPlatformLine(&line)});
         }
         // mimo/layer-rows: the admitted rows split over the routed layers (`settings.LayerRows`, once: the uniform control
         // is the splat; a split keeps both phases' totals, so the plan's bill is the split's).
@@ -291,12 +288,8 @@ pub const Module = struct {
             log.info("MIMO_MTP_PROFILE armed: lane=\"{s}\" rounds_cap={d} gpu_timeline={} trace_rounds={}", .{ l.name(), mtp_profile.max_rounds, gpu, self.trace != null });
         };
         // L4: the M <= 8 attention route, installed once per layer (`decode_attention`; stock = the control).
-        // The default past the kernels' checked keys takes the stock control (settings `decodeAttentionTier`, one line).
+        // Kernels at every served context (settings `validate` proved the texts' key range once).
         const decode_tier = config.decodeAttentionTier();
-        if (decode_tier != config.decode_attention) {
-            var line: [256]u8 = undefined;
-            log.info("{s}", .{settings.decodeAttentionStockLine(&line, plan.reserve)});
-        }
         if (decode_tier == .kernels) self.decode_kernels = try decode_attention.Kernels.init(c);
         errdefer self.decode_kernels.deinit();
         for (&self.layers, c.layer_types) |*layer, mode| layer.attention.decode = decode_attention.install(decode_tier, mode, plan.reserve, &self.decode_kernels);
@@ -2918,12 +2911,19 @@ fn checkNaxLongKeys32k(a: std.mem.Allocator, s: Stream, kernel: *const prefill_a
         prefill_attention.passCount(prefill_attention.query_tile_rows, 32_768, c.window) != 1 or
         prefill_attention.passStateBillBytes(32_768) != 2 * prefill_attention.passStateBytes(prefill_attention.query_tile_rows)) return error.MimoNumericalSpan;
     std.debug.print("MIMO_NAX_ATTENTION span32k: call={d} span={d} span_bytes={d}/{d} passes(512 rows: 24576)=3 (32768)=4 sliding=1 pass_state_bill={d}\n", .{ call, span, prefill_attention.spanRowBytes(c.n_kv_heads) * span, prefill_attention.span_target_bytes, prefill_attention.passStateBillBytes(32_768) });
+    try checkNaxKeys(a, s, kernel, &.{ 24_576, 32_768 });
+}
+
+/// `+attn` over `key_counts` keys: the last 64 query rows of a global 512-row tile at each key count, in the passes the
+/// real tile takes (`passEdges` at 512 groups: ~8,192-key passes, at most `max_passes`), on the 2-head fixture, against
+/// the eager oracle, and bit-equal to one dispatch.
+fn checkNaxKeys(a: std.mem.Allocator, s: Stream, kernel: *const prefill_attention.Kernel, key_counts: []const usize) !void {
     const heads: usize = 2;
     const kd: usize = 192;
     const vd: usize = 128;
     const rows: usize = 64;
     const scale: f32 = 1 / @sqrt(@as(f32, kd));
-    for ([_]usize{ 24_576, 32_768 }) |keys| {
+    for (key_counts) |keys| {
         const offset = keys - rows;
         const qdata = try a.alloc(f32, heads * rows * kd);
         defer a.free(qdata);
@@ -2954,7 +2954,7 @@ fn checkNaxLongKeys32k(a: std.mem.Allocator, s: Stream, kernel: *const prefill_a
         var edges_buf: [prefill_attention.max_passes + 1]c_int = undefined;
         // The real tile's grid (64 heads x 512 rows / 64 = 512 groups) picks the passes.
         const edges = prefill_attention.passEdges(&edges_buf, 64 * @as(c_int, @intCast(prefill_attention.query_tile_rows / 64)), nk, 0);
-        if (edges.len - 1 != keys / 8192) return error.MimoNumericalSpan;
+        if (edges.len - 1 != @min(keys / 8192, prefill_attention.max_passes)) return error.MimoNumericalSpan;
         const single = try kernel.dispatch(q, k, v, scale, 0, .{}, &.{ 0, nk }, 2, s);
         defer drop(single);
         const passes = try kernel.dispatch(q, k, v, scale, 0, .{}, edges, 2, s);
@@ -3037,6 +3037,53 @@ test "mimo GPU32K +attn: NAX prefill attention at 24,576 and 32,768 keys in real
     try mlx.check(mlx.mlx_get_peak_memory(&peak));
     std.debug.print("MIMO_NAX_ATTENTION32K peak: mlx={d} bound={d}\n", .{ peak, bound });
     if (peak > bound) return error.MimoNumericalPeakExceeded;
+}
+
+/// The long `+attn` check's key counts: the card ladder's contexts past 32,768 and the checkpoint's 1,048,576 (64 passes
+/// of 16,384 keys there).
+const nax_long_keys = [_]usize{ 49_152, 147_456, 278_528, 1_048_576 };
+
+/// Static bound of the long `+attn` check (one key count at a time, the widest): attn32kBound's per-key terms at
+/// 1,048,576 keys (host f32 Q/K/V + device f32 and BF16 copies) plus its 904 MiB allowances.
+pub fn attnLongBound() u64 {
+    const per_key: u64 = (192 + 128) * (4 + 4 + 2);
+    return 1_048_576 * per_key + (8 << 20) + (256 << 20) + (512 << 20) + (128 << 20);
+}
+
+test "mimo GPULONG +attn: NAX prefill attention at 49,152 / 147,456 / 278,528 / 1,048,576 keys in real-tile passes vs the eager oracle" {
+    _ = std.c.getenv("MIMO_Q4_GPU") orelse return error.SkipZigTest;
+    const guard = std.c.getenv("_GPU_WINDOW_LOCKED") orelse return error.GpuLockRequired;
+    if (!std.mem.eql(u8, std.mem.span(guard), "1")) return error.GpuLockRequired;
+    const ceiling: u64 = 6 << 30;
+    const bound = attnLongBound();
+    std.debug.print("MIMO_NAX_ATTENTION_LONG static: bound={d} ceiling={d}\n", .{ bound, ceiling });
+    if (bound > ceiling) return error.MimoNumericalAdmission;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!prefill_attention.deviceHasNax(s)) return error.MimoNaxDeviceRequired;
+    var old_limit: usize = 0;
+    try mlx.check(mlx.mlx_set_memory_limit(&old_limit, ceiling));
+    defer {
+        var ignored: usize = 0;
+        _ = mlx.mlx_set_memory_limit(&ignored, old_limit);
+    }
+    try mlx.check(mlx.mlx_reset_peak_memory());
+    var nax = try prefill_attention.Kernel.init(s);
+    defer nax.deinit();
+    for (nax_long_keys) |keys| {
+        try checkNaxKeys(std.testing.allocator, s, &nax, &.{keys});
+        try mlx.check(mlx.mlx_synchronize(s));
+        try mlx.check(mlx.mlx_clear_cache());
+    }
+    var peak: usize = 0;
+    try mlx.check(mlx.mlx_get_peak_memory(&peak));
+    std.debug.print("MIMO_NAX_ATTENTION_LONG peak: mlx={d} bound={d}\n", .{ peak, bound });
+    if (peak > bound) return error.MimoNumericalPeakExceeded;
+}
+
+test "mimo +attn CPU: the long NAX check reaches the checkpoint's context inside its declared ceiling" {
+    try std.testing.expect(attnLongBound() <= 6 << 30);
+    try std.testing.expectEqual(@as(usize, @intCast((settings.Config{}).mimo.max_position_embeddings)), nax_long_keys[nax_long_keys.len - 1]);
 }
 
 /// Aperiodic BF16 history rows (xorshift; `fixtureInput` repeats every 257 rows, which a misplaced-by-257k row would

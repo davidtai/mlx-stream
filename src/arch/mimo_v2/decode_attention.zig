@@ -11,9 +11,10 @@
 //!   dispatch over the L2 `SlidingRing` view (656-row slots, head stride 656 x D, row stride D).
 //!
 //! Rounding-class against MLX SDPA (f32 MMA accumulation, exp2 online softmax). The tier is a construction-time route
-//! (`Tier`): `.kernels` (the served default: the 32K device self-checks passed, pre-ship `dec_attn32k` 2026-10-08) or
-//! `.stock` (the control), by settings. Construction proves the pins, the geometry and the served context against the
-//! checked range (`checked_keys`) once; the installed routes branch only on M and the key count, both runtime values.
+//! (`Tier`): `.kernels` (the served default at every served context) or `.stock` (the control), by settings.
+//! Construction proves the pins and the geometry once; the installed routes branch only on M and the key count, both
+//! runtime values. No key count bounds the texts (`keyRangeInvariants`): keys are `int`, row offsets `long`, the split
+//! count is fixed (32 for 4 KV heads) and each split's key slice only lengthens its loop; no buffer is sized by keys.
 //! The device self-check (`mimo GPU decode attention ...`, env + lock gated) runs in the pre-ship gate, never at
 //! construction.
 const std = @import("std");
@@ -34,27 +35,15 @@ pub fn parseTier(text: []const u8) Tier {
 pub const max_rows: c_int = 8;
 /// Upstream `MIN_KEYS_ONE_ROW`: one query row below this many keys stays on MLX's vector kernel.
 pub const one_row_min_keys: u32 = 8192;
-/// The widest key count the device self-checks prove: pre-ship family `dec_attn32k` (PASS 2/2, 2026-10-08T13:29Z,
-/// stack 1737d62; reports/.../mimo/preship/runs/attn32k-20261008T131759Z): full layers M = 1 / 4 / 8 to 32,768 keys
-/// (far-needle at 32,768), sliding to position 32,767, the served ring + global slab history to 32,767. A served
-/// context past it is refused at construction on the kernel tier (`requireCheckedContext`), never routed to stock.
-pub const checked_keys: u64 = 32_768;
+/// The kernels' key-count limit: the texts index keys as `int` (chunk, k0, k1, lim, c0 + r) and form element offsets as
+/// `long` (key x row stride), so a view holds at most `maxInt(i32) / 2` keys; the served context is at most the
+/// checkpoint's `max_position_embeddings` (1,048,576; settings `validate`), 1,024x inside it (`keyRangeInvariants`).
+pub const max_keys: u64 = std.math.maxInt(i32) / 2;
 
-/// Once, at construction (settings `decodeAttentionTier`, the bill and Module.init read the same function): the default
-/// tier ("kernels", not named in the request's settings) means kernels where they are device-checked. Past
-/// `checked_keys` the default takes the stock control (Module.init logs `settings.decodeAttentionStockLine`); a served context is a
-/// construction parameter, so this is a construction-time route, not a per-request branch. An explicit "kernels" keeps the
-/// tier, and `requireCheckedContext` refuses it past the range by name (nothing serves an unchecked kernel).
-pub fn effectiveTier(setting: Tier, requested: bool, served_context: u64) Tier {
-    return if (setting == .kernels and !requested and served_context > checked_keys) .stock else setting;
-}
-
-/// Once, at construction (settings `validate`): the kernel tier serves at most `checked_keys` keys. A decode step's
-/// keys are pos + M <= the served context (Module `extend` / `verifyRows` refuse past the reservation).
-pub fn requireCheckedContext(tier: Tier, served_context: u64) !void {
-    if (tier != .kernels or served_context <= checked_keys) return;
-    std.log.scoped(.mimo).warn("refused: decode_attention=kernels is device-checked to {d} keys; the served context {d} is past it (serve at most {d}, or set \"decode_attention\":\"stock\")", .{ checked_keys, served_context, checked_keys });
-    return error.MimoDecodeAttentionContextUnchecked;
+/// Once, at construction (`Kernels.init`): the served context is inside the texts' index range (a comptime-known
+/// checkpoint bound in practice; this refuses a config that would widen it).
+pub fn requireKeyRange(served_context: u64) !void {
+    if (served_context > max_keys) return error.MimoDecodeAttentionKeyRange;
 }
 const target_tgs: c_int = 128;
 const bk: c_int = 32;
@@ -321,6 +310,7 @@ fn drop(x: Array) void {
 
 const testing = std.testing;
 const kv = @import("kv.zig");
+const settings_mod = @import("settings.zig");
 
 test "mimo decode attention CPU: the manifest and every text match their pins" {
     try checkPins();
@@ -470,7 +460,7 @@ test "mimo decode attention CPU: split geometry at 16K..32K and 1M keys covers e
     // slice j reads [j*chunk, min(N, (j+1)*chunk)). Indices are int (keys) and long (key * row stride); nothing is
     // 16-bit but the lane coordinates (< 32), and no buffer is sized by a key count (partials are [rows, splits, 128]).
     const c: mimo.Config = .{};
-    for ([_]c_int{ 8192, 16_383, 16_384, 16_385, 20_480, 23_000, 24_576, 32_767, 32_768, 32_776, 65_536, 1 << 20 }) |keys| {
+    for ([_]c_int{ 8192, 16_383, 16_384, 16_385, 20_480, 23_000, 24_576, 32_767, 32_768, 32_776, 49_152, 65_536, 147_456, 278_528, 1 << 20 }) |keys| {
         var m: c_int = 1;
         while (m <= max_rows) : (m += 1) {
             const l = splitLaunch(4, 16, m, keys);
@@ -495,8 +485,10 @@ test "mimo decode attention CPU: split geometry at 16K..32K and 1M keys covers e
             try testing.expect(keys <= std.math.maxInt(i32) / 2);
         }
     }
-    // The 32K served workspace: partials independent of the key count.
+    // The served workspace: partials independent of the key count, to the checkpoint's 1,048,576.
     try testing.expectEqual(workspaceBytes(8, 16_384), workspaceBytes(8, 32_768));
+    try testing.expectEqual(workspaceBytes(8, 16_384), workspaceBytes(8, 1 << 20));
+    try testing.expect((settings_mod.Config{}).mimo.max_position_embeddings <= max_keys);
 }
 
 test "mimo decode attention CPU: routes install once by tier, kind and served context" {
@@ -519,55 +511,39 @@ test "mimo decode attention CPU: routes install once by tier, kind and served co
     try testing.expectError(error.MimoDecodeAttentionGeometry, requireGeometry(odd));
 }
 
-test "mimo decode attention CPU: ungated default: kernels at every served context to the checked range, the stock control past it (an explicit kernels request refused there by number)" {
+test "mimo decode attention CPU: the kernels are the default route at every served context to the checkpoint's 1,048,576 keys; stock only when named" {
     // David 2026-10-08 ("typical should be generally usable"): the default tier is the kernels for every request shape
     // the served context admits (greedy or sampled, any M <= 8, any key count up to the context). The one stock M = 1
     // cutoff below `one_row_min_keys` is a route on the runtime key count (bitwise the control there), not a tier.
-    const settings = @import("settings.zig");
     const sdk = @import("sdk");
-    try testing.expectEqual(Tier.kernels, (settings.Config{}).decode_attention);
+    try testing.expectEqual(Tier.kernels, (settings_mod.Config{}).decode_attention);
     var k: Kernels = .{};
-    for ([_]u64{ 1, 4_096, one_row_min_keys - 1, one_row_min_keys, 17_408, 24_576, checked_keys }) |context| {
+    const max_ctx = (settings_mod.Config{}).mimo.max_position_embeddings;
+    try testing.expectEqual(@as(u64, 1_048_576), max_ctx);
+    for ([_]u64{ 1, 4_096, one_row_min_keys - 1, one_row_min_keys, 17_408, 24_576, 32_768, 33_792, 49_152, 81_920, 131_072, 147_456, 278_528, 1_047_488, max_ctx }) |context| {
         const facts: sdk.LoadFacts = .{ .memory_baseline_bytes = 10_000_000_000, .wired_margin_bytes = 2_000_000_000, .effective_context = context };
-        const c = (settings.Config{}).withFacts(&facts);
+        const c = (settings_mod.Config{}).withFacts(&facts);
         try c.validate();
-        const full = install(c.decode_attention, .full, c.reserveTokens(), &k);
-        const sliding = install(c.decode_attention, .sliding, c.reserveTokens(), &k);
+        try testing.expectEqual(Tier.kernels, c.decodeAttentionTier());
+        const full = install(c.decodeAttentionTier(), .full, c.reserveTokens(), &k);
+        const sliding = install(c.decodeAttentionTier(), .sliding, c.reserveTokens(), &k);
         try testing.expect(full.run != runStock and full.kernels != null);
         try testing.expect(sliding.run == runWindow and sliding.kernels != null);
         const want: Run = if (context < one_row_min_keys) runFullRowsOnly else runFullCutoff;
         try testing.expect(full.run == want);
-    }
-    // The host's default reservation (no effective context: 16K prompt + 1K) is inside the checked range.
-    try (settings.Config{}).validate();
-    try testing.expect((settings.Config{}).reserveTokens() <= checked_keys);
-    // At the checked range the default keeps the kernels.
-    {
-        const facts: sdk.LoadFacts = .{ .memory_baseline_bytes = 10_000_000_000, .wired_margin_bytes = 2_000_000_000, .effective_context = checked_keys };
-        try testing.expectEqual(Tier.kernels, (settings.Config{}).withFacts(&facts).decodeAttentionTier());
-    }
-    // Past the checked range: the DEFAULT takes the stock control (validates, one log line at construction); an EXPLICIT
-    // "kernels" is refused at construction by name (the log line carries both numbers); the stock control serves any
-    // context the checkpoint admits.
-    const explicit = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"decode_attention\":\"kernels\"}", .{});
-    defer explicit.deinit();
-    for ([_]u64{ checked_keys + 1, 33_792, 65_536, 131_072, (settings.Config{}).mimo.max_position_embeddings }) |context| {
-        const facts: sdk.LoadFacts = .{ .memory_baseline_bytes = 10_000_000_000, .wired_margin_bytes = 2_000_000_000, .effective_context = context };
-        const auto = (settings.Config{}).withFacts(&facts);
-        try auto.validate();
-        try testing.expectEqual(Tier.stock, auto.decodeAttentionTier());
-        try testing.expectEqual(Tier.kernels, auto.decode_attention); // the setting is unchanged: "kernels where checked"
-        var asked: settings.Config = .{};
-        asked.applySettings(explicit.value);
-        asked = asked.withFacts(&facts);
-        try testing.expectEqual(Tier.kernels, asked.decodeAttentionTier());
-        try testing.expectError(error.MimoDecodeAttentionContextUnchecked, asked.validate());
-        try testing.expectError(error.MimoDecodeAttentionContextUnchecked, requireCheckedContext(.kernels, context));
-        var control: settings.Config = .{ .decode_attention = .stock };
+        // The stock control is a named construction-time route at the same contexts.
+        var control: settings_mod.Config = .{ .decode_attention = .stock };
         control = control.withFacts(&facts);
         try control.validate();
-        try requireCheckedContext(.stock, context);
+        try testing.expect(install(control.decodeAttentionTier(), .full, control.reserveTokens(), &k).run == runStock);
     }
+    // The host's default reservation (no effective context: 16K prompt + 1K) is on the kernels too.
+    try (settings_mod.Config{}).validate();
+    try testing.expectEqual(Tier.kernels, (settings_mod.Config{}).decodeAttentionTier());
+    // The texts' index range is the one bound, and it refuses at construction past the checkpoint's context only.
+    try requireKeyRange(max_ctx);
+    try requireKeyRange(max_keys);
+    try testing.expectError(error.MimoDecodeAttentionKeyRange, requireKeyRange(max_keys + 1));
 }
 
 test "mimo decode attention CPU: the M <= 8 workspace fits the request's transient terms it replaces" {
@@ -998,6 +974,85 @@ test "mimo GPU32K decode attention: split-K full to 32,768 keys and windowed sli
     if (peak > bound) return error.MimoDecodeAttentionPeakExceeded;
 }
 
+/// The served range past 32,768 keys to the checkpoint's 1,048,576 (the card ladder's 49,152 / 81,920 / 147,456 /
+/// 278,528 contexts and the top): full layers M = 1 / 4 / 8 and far needles (key 37 + 4,096 j, ~1M positions back at
+/// the top), sliding layers at the matching positions (the ring has wrapped up to ~8,000 times). One case at a time.
+const cases_long = [_]Case{
+    .{ .name = "full_1row_49152", .mode = .full, .hk = 4, .rows = 1, .keys_or_pos = 49_152 },
+    .{ .name = "full_verify8_49152", .mode = .full, .hk = 4, .rows = 8, .keys_or_pos = 49_152 },
+    .{ .name = "full_1row_147456", .mode = .full, .hk = 4, .rows = 1, .keys_or_pos = 147_456 },
+    .{ .name = "full_verify4_147456", .mode = .full, .hk = 4, .rows = 4, .keys_or_pos = 147_456 },
+    .{ .name = "full_1row_278528", .mode = .full, .hk = 4, .rows = 1, .keys_or_pos = 278_528 },
+    .{ .name = "full_verify8_278528", .mode = .full, .hk = 4, .rows = 8, .keys_or_pos = 278_528 },
+    .{ .name = "full_1row_278528_needle", .mode = .full, .hk = 4, .rows = 1, .keys_or_pos = 278_528, .needle = true },
+    .{ .name = "full_1row_1048576", .mode = .full, .hk = 4, .rows = 1, .keys_or_pos = 1_048_576 },
+    .{ .name = "full_verify4_1048576", .mode = .full, .hk = 4, .rows = 4, .keys_or_pos = 1_048_576 },
+    .{ .name = "full_1row_1048576_needle", .mode = .full, .hk = 4, .rows = 1, .keys_or_pos = 1_048_576, .needle = true },
+    .{ .name = "sliding_pos49151", .mode = .sliding, .hk = 8, .rows = 1, .keys_or_pos = 49_151, .sink_kind = .distinct },
+    .{ .name = "sliding_verify4_pos278527", .mode = .sliding, .hk = 8, .rows = 4, .keys_or_pos = 278_527, .sink_kind = .distinct },
+    .{ .name = "sliding_pos1048575", .mode = .sliding, .hk = 8, .rows = 1, .keys_or_pos = 1_048_575, .sink_kind = .distinct },
+    .{ .name = "sliding_verify8_pos1048568", .mode = .sliding, .hk = 8, .rows = 8, .keys_or_pos = 1_048_568, .sink_kind = .distinct },
+};
+
+/// Static bound of one long case (selfCheckBound32k's terms at the case's key count and rows): the device BF16 slab, MLX
+/// SDPA's unfused f32 scores + probabilities if it takes that route, partials, outputs, mask, each twice, plus the
+/// 256 MiB cache and 512 MiB compiler allowances. The test's bound is the widest case's.
+pub fn selfCheckBoundCase(cs: Case) u64 {
+    const keys: u64 = if (cs.mode == .full) cs.keys_or_pos else 656;
+    const rows: u64 = @intCast(cs.rows);
+    const slab: u64 = 4 * (keys + 64) * (kd + vd) * 2;
+    const scores: u64 = 2 * 64 * rows * keys * 4;
+    const device = slab + 2 * 64 * rows * kd + 64 * rows * 32 * (vd + 2) * 4 + 4 * 64 * rows * vd * 4 + rows * keys + scores;
+    return 2 * device + (256 << 20) + (512 << 20);
+}
+
+pub fn selfCheckBoundLong() u64 {
+    var bound: u64 = 0;
+    for (cases_long) |cs| bound = @max(bound, selfCheckBoundCase(cs));
+    return bound;
+}
+
+test "mimo GPULONG decode attention: split-K full to 1,048,576 keys and windowed sliding to position 1,048,575 vs eager, f64 truth and MLX SDPA" {
+    const enabled = std.c.getenv("MIMO_DEC_ATTN_GPU") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.SkipZigTest;
+    const guard = std.c.getenv("_GPU_WINDOW_LOCKED") orelse return error.GpuLockRequired;
+    if (!std.mem.eql(u8, std.mem.span(guard), "1")) return error.GpuLockRequired;
+    const ceiling: u64 = 12 << 30;
+    const bound = selfCheckBoundLong();
+    std.debug.print("MIMO_DEC_ATTN_LONG static: bound={d} ceiling={d}\n", .{ bound, ceiling });
+    if (bound > ceiling) return error.MimoDecodeAttentionAdmission;
+    mlx.installErrorHandler();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var old_limit: usize = 0;
+    try mlx.check(mlx.mlx_set_memory_limit(&old_limit, ceiling));
+    defer {
+        var ignored: usize = 0;
+        _ = mlx.mlx_set_memory_limit(&ignored, old_limit);
+    }
+    try mlx.check(mlx.mlx_reset_peak_memory());
+    var kernels = try Kernels.init(.{});
+    defer kernels.deinit();
+    for (cases_long) |cs| {
+        try runCase(testing.allocator, &kernels, cs, s);
+        try mlx.check(mlx.mlx_synchronize(s));
+        try mlx.check(mlx.mlx_clear_cache());
+    }
+    var peak: usize = 0;
+    try mlx.check(mlx.mlx_get_peak_memory(&peak));
+    std.debug.print("MIMO_DEC_ATTN_LONG peak: mlx={d} bound={d}\n", .{ peak, bound });
+    if (peak > bound) return error.MimoDecodeAttentionPeakExceeded;
+}
+
+test "mimo decode attention CPU: the long self-check's cases fit its declared ceiling and reach the checkpoint's context" {
+    try testing.expect(selfCheckBoundLong() <= 12 << 30);
+    var widest: u32 = 0;
+    for (cases_long) |cs| if (cs.mode == .full) {
+        widest = @max(widest, cs.keys_or_pos);
+    };
+    try testing.expectEqual(@as(u32, @intCast((settings_mod.Config{}).mimo.max_position_embeddings)), widest);
+}
+
 test "mimo GPU decode attention: split-K full and windowed sliding agree with the eager oracle and f64 truth" {
     const enabled = std.c.getenv("MIMO_DEC_ATTN_GPU") orelse return error.SkipZigTest;
     if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.SkipZigTest;
@@ -1025,11 +1080,4 @@ test "mimo GPU decode attention: split-K full and windowed sliding agree with th
     try mlx.check(mlx.mlx_get_peak_memory(&peak));
     std.debug.print("MIMO_DEC_ATTN peak: mlx={d} bound={d}\n", .{ peak, bound });
     if (peak > bound) return error.MimoDecodeAttentionPeakExceeded;
-}
-
-test "mimo decode attention CPU: the default tier routes to stock past the checked keys; a named tier is never re-routed" {
-    try testing.expectEqual(Tier.kernels, effectiveTier(.kernels, false, checked_keys));
-    try testing.expectEqual(Tier.stock, effectiveTier(.kernels, false, checked_keys + 1));
-    try testing.expectEqual(Tier.kernels, effectiveTier(.kernels, true, checked_keys + 1));
-    try testing.expectEqual(Tier.stock, effectiveTier(.stock, true, 1));
 }

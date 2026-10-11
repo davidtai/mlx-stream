@@ -68,7 +68,7 @@ pub fn archBill(a: std.mem.Allocator, io: std.Io, c: settings.Config, reserve: u
 /// key-range passes' fp32 state hand-off (two live 17.0 MB states once a 512-row tile passes 12,256 keys). The stock
 /// route's mask and pad terms (config.requestBytes) stay billed on both routes.
 pub fn attentionRouteBytes(config: settings.Config, reserve: u64) u64 {
-    if (reserve == 0 or config.prefill_attention == .stock or prefill_attention.defaultTakesStock(config.prefill_attention, reserve)) return 0;
+    if (reserve == 0 or config.prefill_attention == .stock) return 0;
     const c = config.mimo;
     const call = @min(reserve, @as(u64, mimo.prefill_max_tokens));
     return prefill_attention.spanRowBytes(c.n_kv_heads) * prefill_attention.attentionSpanRows(c.n_kv_heads, .full, call) +
@@ -966,7 +966,7 @@ test "mlx-stream MiMo bill: the bill tool prints every term and the rows per con
     var it = std.mem.splitScalar(u8, if (std.c.getenv("MIMO_BILL_BASELINES_GB")) |v| std.mem.span(v) else "9.2,10.0,10.6,12.0", ',');
     while (it.next()) |field| : (n_base += 1) baselines[n_base] = @intFromFloat(@round(try std.fmt.parseFloat(f64, field) * 1e9));
     const target = ceiling -| box_stop;
-    const contexts = [_]u64{ 16_384, 17_408, 32_768, 33_792, 131_072, 1_047_488 };
+    const contexts = [_]u64{ 16_384, 17_408, 32_768, 33_792, 131_072, 147_456, 1_047_488, 1_048_576 };
     // MIMO_BILL_ROWS / MIMO_BILL_PROMPT_ROWS: forced rows (the `expert_rows` / `expert_prefill_rows` settings), one
     // FORCED line per context and baseline: admitted or refused, beside the admitted maximum.
     const forced_env: struct { rows: ?u32, prompt: ?u32 } = .{
@@ -986,8 +986,7 @@ test "mlx-stream MiMo bill: the bill tool prints every term and the rows per con
         for (contexts) |ctx| {
             c.effective_context = ctx;
             c.phase_rows = true;
-            // The defaults: past the device-checked keys both attention routes take the stock control at construction
-            // (settings `decodeAttentionTier`, prefill_attention `defaultTakesStock`); the bill reads the same functions.
+            // The defaults: the kernels and NAX at every served context (settings `decodeAttentionTier`).
             const b = try completeBill(a, io, c, c.reserveTokens());
             defer b.free(a);
             // +phase-rows: the control's bill (one row count) beside the arm's.
@@ -995,7 +994,7 @@ test "mlx-stream MiMo bill: the bill tool prints every term and the rows per con
             cc.phase_rows = false;
             const bc = try completeBill(a, io, cc, cc.reserveTokens());
             defer bc.free(a);
-            std.debug.print("\nkv={s} ctx={d} decode_attention={s} prefill_attention={s} per_row={d}\n  {s:<22} {s:>15} {s:>15} {s}\n", .{ @tagName(mode), ctx, @tagName(c.decodeAttentionTier()), if (prefill_attention.defaultTakesStock(c.prefill_attention, c.reserveTokens())) "stock" else "nax_where_present", b.per_row, "term", "prompt B", "decode B", "construction" });
+            std.debug.print("\nkv={s} ctx={d} decode_attention={s} prefill_attention={s} per_row={d}\n  {s:<22} {s:>15} {s:>15} {s}\n", .{ @tagName(mode), ctx, @tagName(c.decodeAttentionTier()), if (c.prefill_attention == .stock) "stock" else "nax_where_present", b.per_row, "term", "prompt B", "decode B", "construction" });
             for (b.terms) |t| std.debug.print("  {s:<22} {d:>15} {d:>15} {s}\n", .{ t.name, t.bytes[0], t.bytes[1], if (t.at_construction) "yes" else "" });
             std.debug.print("  {s:<22} {d:>15} {d:>15}\n", .{ "fixed", b.fixed(.prompt), b.fixed(.decode) });
             for (baselines[0..n_base]) |base| {
@@ -1087,8 +1086,8 @@ test "mimo mtp bill: the lane's workspace term follows the lane (the heads stay 
 // ---- +attn (prefill_attention.zig): begin ----
 test "mimo +attn bill: module and bill read one span rule at 16K, 128K and 1M; the pass state is billed; stock bills neither; the default bills the route it installs" {
     const a = testing.allocator;
-    // The NAX route named explicitly (the span rule's bytes at every reservation; the module refuses an explicit nax past
-    // the checked keys at construction); the default bills NAX within the checked keys and the stock control past them.
+    // The NAX route named explicitly and the default bill the span rule's bytes at every reservation (NAX at every served
+    // context); the stock control bills neither.
     const nax: settings.Config = .{ .prefill_attention = .nax };
     const default: settings.Config = .{};
     const stock: settings.Config = .{ .prefill_attention = .stock };
@@ -1102,7 +1101,7 @@ test "mimo +attn bill: module and bill read one span rule at 16K, 128K and 1M; t
         const state: u64 = 2 * 17_039_360;
         try testing.expectEqual(prefill_attention.spanRowBytes(m.n_kv_heads) * module_span + state, attentionRouteBytes(nax, prompt));
         try testing.expectEqual(@as(u64, 0), attentionRouteBytes(stock, prompt));
-        try testing.expectEqual(if (prompt > prefill_attention.checked_keys) @as(u64, 0) else attentionRouteBytes(nax, prompt), attentionRouteBytes(default, prompt));
+        try testing.expectEqual(attentionRouteBytes(nax, prompt), attentionRouteBytes(default, prompt));
         const with = try fixtureBillAt(a, nax, 0, prompt);
         defer with.free(a);
         const without = try fixtureBillAt(a, stock, 0, prompt);

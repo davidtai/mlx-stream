@@ -106,33 +106,16 @@ pub fn resolve(requested: ?Route, has_nax: bool) !Route {
     return if (has_nax) .nax else .stock;
 }
 
-/// The widest key count the NAX device checks prove: pre-ship family `attn32k` (`mimo GPU32K +attn`, PASS 1/1,
-/// 2026-10-08T13:29Z, stack 1737d62): 24,576 and 32,768 keys in real-tile passes (3 and 4), multi-pass bit-equal to one
-/// dispatch, within 0.02 of the eager oracle. The NAX route serves at most this context (`requireCheckedContext`).
-pub const checked_keys: u64 = 32_768;
+/// No key count bounds the route (`keyRangeInvariants`): the texts index key blocks and positions as `int` and form
+/// element offsets as `int64_t` (key block x BK x row stride); a pass's state is sized by query rows, not keys; the
+/// pass count is capped at `max_passes`, so past 64 x 8,192 keys a pass covers ceil(nk / 64) key blocks (16,384 keys at
+/// 1,048,576), whose dispatch work (512 rows x 16,384 keys x 64 heads = 5.4e8) stays under the ~1.5e9-unit IOGPU
+/// preemption cliff. `max_keys` is the `int` range of the positions the texts form (qL_off + BQ, kb x BK).
+pub const max_keys: u64 = std.math.maxInt(i32) / 2;
 
-/// Once, at construction (Module.init): `resolve`, then the checked range. The default (no "prefill_attention" in the
-/// request's settings) means NAX where it is device-checked: past `checked_keys` it takes the stock control (Module.init
-/// logs `settings.prefillAttentionStockLine`; the bill reads `defaultTakesStock`). The served context is a construction
-/// parameter: a construction-time route, never a per-call branch. An explicit "nax" past the range refuses by number.
-pub fn resolveServed(requested: ?Route, has_nax: bool, served_context: u64) !Route {
-    const route = try resolve(requested, has_nax);
-    if (route == .nax and defaultTakesStock(requested, served_context)) return .stock;
-    try requireCheckedContext(route, served_context);
-    return route;
-}
-
-/// The default route past the checked keys is the stock control (module and bill read this one function).
-pub fn defaultTakesStock(requested: ?Route, served_context: u64) bool {
-    return requested == null and served_context > checked_keys;
-}
-
-/// Once, at construction (Module.init, inside `resolveServed`): the NAX route serves at most `checked_keys` keys; an
-/// explicit "nax" past it is refused by number (never a silent stock route; the default and the stock control serve it).
-pub fn requireCheckedContext(route: Route, served_context: u64) !void {
-    if (route != .nax or served_context <= checked_keys) return;
-    std.log.scoped(.mimo).warn("refused: prefill_attention=nax is device-checked to {d} keys; the served context {d} is past it (serve at most {d}, or set \"prefill_attention\":\"stock\")", .{ checked_keys, served_context, checked_keys });
-    return error.MimoNaxAttentionContextUnchecked;
+/// Once, at construction (Module.init): the served context is inside the texts' index range.
+pub fn requireKeyRange(route: Route, served_context: u64) !void {
+    if (route == .nax and served_context > max_keys) return error.MimoNaxAttentionKeyRange;
 }
 
 // ---- span rule (design §4): module and bill read this one function ----
@@ -369,24 +352,35 @@ test "mimo +attn span: one global span per call up to 16,384 rows, the ring's ti
     try std.testing.expect(spanRowBytes(c.n_kv_heads) * attentionSpanRows(c.n_kv_heads, .full, 16_384) <= span_target_bytes);
 }
 
-test "mimo +attn range: NAX at every served context to its checked 32,768 keys, refused past it by name, stock unbounded" {
-    for ([_]u64{ 1, 8, 512, 12_256, 16_384, 17_408, 24_576, checked_keys }) |context| try requireCheckedContext(.nax, context);
-    for ([_]u64{ checked_keys + 1, 65_536, 1 << 20 }) |context| {
-        try std.testing.expectError(error.MimoNaxAttentionContextUnchecked, requireCheckedContext(.nax, context));
-        try requireCheckedContext(.stock, context);
+test "mimo +attn range: NAX at every served context to the checkpoint's 1,048,576 keys; pass work stays under the preemption cliff" {
+    const settings = @import("settings.zig");
+    const max_ctx = (settings.Config{}).mimo.max_position_embeddings;
+    for ([_]u64{ 1, 8, 512, 12_256, 16_384, 17_408, 24_576, 32_768, 33_792, 49_152, 81_920, 147_456, 278_528, max_ctx }) |context| {
+        try requireKeyRange(.nax, context);
+        try std.testing.expectEqual(Route.nax, try resolve(null, true));
+        // The heaviest pass of a 512-row tile at this many keys (64 heads; ceil over the pass edges).
+        var buf: [max_passes + 1]c_int = undefined;
+        const nk: c_int = @intCast((context + 31) / 32);
+        const edges = passEdges(&buf, 64 * @divTrunc(@as(c_int, @intCast(query_tile_rows)), 64), nk, 0);
+        var widest: i64 = 0;
+        for (edges[0 .. edges.len - 1], edges[1..]) |lo, hi| widest = @max(widest, hi - lo);
+        try std.testing.expect(@as(u64, query_tile_rows) * @as(u64, @intCast(widest)) * 32 * heads < 1_500_000_000);
+        // The pass state is sized by query rows only.
+        try std.testing.expect(passStateBillBytes(context) <= 2 * passStateBytes(query_tile_rows));
     }
-    // The served cell's context (32,768) and the host's default (16K + 1K) are inside the range.
-    try requireCheckedContext(.nax, @import("settings.zig").fill_reserve_tokens);
+    try std.testing.expect(max_ctx <= max_keys);
+    try std.testing.expectError(error.MimoNaxAttentionKeyRange, requireKeyRange(.nax, max_keys + 1));
+    try requireKeyRange(.stock, max_keys + 1);
 }
 
-test "mimo +attn CPU: the default prompt route is NAX within the checked keys and the stock control past them; an explicit nax past them refuses by number" {
-    try std.testing.expectEqual(Route.nax, try resolveServed(null, true, checked_keys));
-    try std.testing.expectEqual(Route.stock, try resolveServed(null, true, 33_792));
-    try std.testing.expectEqual(Route.stock, try resolveServed(null, true, 131_072));
-    try std.testing.expectEqual(Route.stock, try resolveServed(null, false, 33_792));
-    try std.testing.expectEqual(Route.stock, try resolveServed(.stock, true, 33_792));
-    try std.testing.expectEqual(Route.nax, try resolveServed(.nax, true, checked_keys));
-    try std.testing.expectError(error.MimoNaxAttentionContextUnchecked, resolveServed(.nax, true, 33_792));
-    try std.testing.expectError(error.MimoNaxAttentionUnavailable, resolveServed(.nax, false, 17_408));
-    try std.testing.expect(defaultTakesStock(null, 33_792) and !defaultTakesStock(null, checked_keys) and !defaultTakesStock(.nax, 33_792));
+test "mimo +attn CPU: the default prompt route is NAX at every served context on a NAX device; stock only when named or without NAX" {
+    try std.testing.expectEqual(Route.nax, try resolve(null, true));
+    try std.testing.expectEqual(Route.nax, try resolve(.nax, true));
+    try std.testing.expectEqual(Route.stock, try resolve(.stock, true));
+    try std.testing.expectEqual(Route.stock, try resolve(null, false));
+    try std.testing.expectError(error.MimoNaxAttentionUnavailable, resolve(.nax, false));
+    try std.testing.expectEqual(@as(u32, 64), passCount(query_tile_rows, 1 << 20, 0));
+    try std.testing.expectEqual(@as(u32, 34), passCount(query_tile_rows, 278_528, 0));
+    try std.testing.expectEqual(@as(u32, 18), passCount(query_tile_rows, 147_456, 0));
+    try std.testing.expectEqual(@as(u32, 6), passCount(query_tile_rows, 49_152, 0));
 }

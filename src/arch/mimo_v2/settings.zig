@@ -222,18 +222,6 @@ pub fn unknownSetting(raw: std.json.ObjectMap) ?[]const u8 {
 // ---- default routes: a DEFAULT picks a construction-time route from a construction-time fact and logs it once;
 // a NAMED value that cannot install refuses by name. Each line names the route, the fact and the setting that pins it.
 
-/// `decode_attention` default past the kernels' checked keys.
-pub fn decodeAttentionStockLine(buf: []u8, served_context: u64) []const u8 {
-    const k = @import("decode_attention.zig").checked_keys;
-    return std.fmt.bufPrint(buf, "route decode_attention=stock reason=ctx>{d} keys (kernels device-checked to {d}) pin=decode_attention ctx={d}", .{ k, k, served_context }) catch buf[0..0];
-}
-
-/// `prefill_attention` default past the NAX route's checked keys.
-pub fn prefillAttentionStockLine(buf: []u8, served_context: u64) []const u8 {
-    const k = @import("prefill_attention.zig").checked_keys;
-    return std.fmt.bufPrint(buf, "route prefill_attention=stock reason=ctx>{d} keys (NAX device-checked to {d}) pin=prefill_attention ctx={d}", .{ k, k, served_context }) catch buf[0..0];
-}
-
 /// `prefill_attention` default on a device without NAX (a platform route, like the CPU stream's keep-warm route).
 pub fn prefillAttentionPlatformLine(buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "route prefill_attention=stock reason=platform (this device has no NAX) pin=prefill_attention", .{}) catch buf[0..0];
@@ -298,12 +286,10 @@ pub const Config = struct {
     /// L4: M <= 8 attention over the BF16 cache views by kernels (the default) or the unchanged MLX SDPA call
     /// (`"decode_attention": "stock"`, the control). Kernels are the default again since the 32K device self-checks
     /// passed (pre-ship `dec_attn32k`, 2026-10-08; the 16K x 16K card-cell divergence was one sampled run per arm, no
-    /// failing check). The default means kernels where checked: past their checked range (`decode_attention.checked_keys`)
-    /// the served context takes the stock control at construction (`decodeAttentionTier`, one log line); an explicit
-    /// `"decode_attention": "kernels"` past the range is refused by name in `validate`. Read once at construction.
+    /// failing check). The kernels serve every served context (no key-count gate: decode_attention.zig
+    /// `max_keys` is the texts' index range, 1,024x the checkpoint's context); the stock control is installed only when
+    /// named. Read once at construction.
     decode_attention: decode_attention.Tier = .kernels,
-    /// Set by `applySettings` when the request names `decode_attention` (an explicit tier is never re-routed).
-    decode_attention_requested: bool = false,
     /// L5 fused decode MoE (design-decode-fusion 2c), read once at construction; `"decode_moe": "stock"` installs the
     /// grouped gather_qmm route (the control). An unknown value refuses by name. HITPASS (2d): the default `"hitpass"`
     /// adds the device hit pass to the fused route; `"decode_moe": "fused"` is the fused route without it (its control).
@@ -318,9 +304,9 @@ pub const Config = struct {
     /// Set by `applySettings` when the request names `decode_moe_kernel` (the stock route's refusal is for an explicit k1).
     decode_moe_kernel_requested: bool = false,
     /// `+attn` (design-prefill §3b): the prompt attention route, resolved once at construction
-    /// (prefill_attention.zig `resolveServed`): null = NAX on a NAX device within the device-checked keys, else the stock
-    /// route (past the checked keys: one log line); `"prefill_attention": "stock"` installs the stock control, `"nax"`
-    /// refuses on a device without NAX and past the checked keys; anything else refuses by name.
+    /// (prefill_attention.zig `resolve`): null = NAX on a NAX device at every served context, else the stock route (one
+    /// platform line); `"prefill_attention": "stock"` installs the stock control, `"nax"` refuses on a device without NAX;
+    /// anything else refuses by name.
     prefill_attention: ?@import("prefill_attention.zig").Route = null,
     // ---- +phase-rows: begin ----
     /// Phase-split expert rows (audit task 8), read once at construction: the bill charges the prompt-only terms (the
@@ -469,10 +455,10 @@ pub const Config = struct {
         return out;
     }
 
-    /// The decode attention tier construction installs (Module.init), the bill and `validate` read: the setting, except
-    /// that the default "kernels" past the device-checked keys takes the stock control (decode_attention.effectiveTier).
+    /// The decode attention tier construction installs (Module.init), the bill and `validate` read: the setting, at every
+    /// served context (no key-count route).
     pub fn decodeAttentionTier(c: Config) decode_attention.Tier {
-        return decode_attention.effectiveTier(c.decode_attention, c.decode_attention_requested, c.reserveTokens());
+        return c.decode_attention;
     }
 
     pub fn reserveTokens(c: Config) u64 {
@@ -504,7 +490,7 @@ pub const Config = struct {
             if (context == 0 or context > c.mimo.max_position_embeddings) return error.MimoContextLimit;
         }
         if (c.reserveTokens() == 0) return error.MimoContextLimit;
-        try decode_attention.requireCheckedContext(c.decodeAttentionTier(), c.reserveTokens());
+        if (c.decodeAttentionTier() == .kernels) try decode_attention.requireKeyRange(c.reserveTokens());
         const expected: *const fn (mimo.Config, u64) kv.Bound = if (c.kv_mode == .q8) kv.q8Bound else kv.bf16Bound;
         if (c.request_bound != expected) return error.MimoKVModeNotBound;
         if (c.draft_tier == .invalid) return error.MimoDraftTierUnsupported;
@@ -581,7 +567,6 @@ pub const Config = struct {
         if (raw.object.get("draft_depth")) |v| c.draft_depth = if (v == .integer and v.integer >= 1 and v.integer <= trained_draft_depth) @intCast(v.integer) else 0;
         if (raw.object.get("decode_attention")) |v| {
             c.decode_attention = if (v == .string) decode_attention.parseTier(v.string) else .invalid;
-            c.decode_attention_requested = true;
         }
         if (raw.object.get("decode_moe")) |v| {
             const r = if (v == .string) std.meta.stringToEnum(@import("moe.zig").Route, v.string) else null;
@@ -710,8 +695,8 @@ test "mimo SDK2 construction facts bind precision and refuse context outside the
     for ([_]u64{ 1, 17_408, 32_768, base.mimo.max_position_embeddings }) |context| {
         var bounded = facts;
         bounded.effective_context = context;
-        // The checkpoint's whole context on the stock decode control (the kernel tier's range: decode_attention.zig).
-        const c = (if (context > decode_attention.checked_keys) Config{ .decode_attention = .stock } else base).withFacts(&bounded);
+        // The checkpoint's whole context on the default kernels (decode_attention.zig: no key-count gate).
+        const c = base.withFacts(&bounded);
         try c.validate();
         try std.testing.expectEqual(context, c.reserveTokens());
         try std.testing.expectEqual(KVMode.bf16, c.kv_mode);
@@ -1364,24 +1349,24 @@ test "mimo settings: a NAMED value that cannot install refuses by name; the DEFA
         }
     };
     var buf: [256]u8 = undefined;
-    // decode_attention past 32,768 keys: the default routes to stock (validates); a named kernels refuses.
+    // decode_attention past 32,768 keys: the default and a named kernels both install the kernels (no context route).
     const past = facts.at(33_792);
     const d = (Config{}).withFacts(&past);
     try d.validate();
-    try std.testing.expectEqual(decode_attention.Tier.stock, d.decodeAttentionTier());
-    try std.testing.expectEqualStrings("route decode_attention=stock reason=ctx>32768 keys (kernels device-checked to 32768) pin=decode_attention ctx=33792", decodeAttentionStockLine(&buf, 33_792));
+    try std.testing.expectEqual(decode_attention.Tier.kernels, d.decodeAttentionTier());
     var named: Config = .{};
     const kernels = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"decode_attention\":\"kernels\"}", .{});
     defer kernels.deinit();
     named.applySettings(kernels.value);
-    try std.testing.expectError(error.MimoDecodeAttentionContextUnchecked, named.withFacts(&past).validate());
-    // prefill_attention past 32,768 keys and on a device without NAX: the default routes to stock; a named nax refuses.
+    try named.withFacts(&past).validate();
+    try std.testing.expectEqual(decode_attention.Tier.kernels, named.withFacts(&past).decodeAttentionTier());
+    // prefill_attention on a device without NAX: the default routes to stock (one platform line); a named nax refuses.
+    // Past 32,768 keys the default and a named nax are NAX.
     const pa = @import("prefill_attention.zig");
-    try std.testing.expectEqual(pa.Route.stock, try pa.resolveServed(null, true, 33_792));
-    try std.testing.expectEqual(pa.Route.stock, try pa.resolveServed(null, false, 17_408));
-    try std.testing.expectError(error.MimoNaxAttentionContextUnchecked, pa.resolveServed(.nax, true, 33_792));
-    try std.testing.expectError(error.MimoNaxAttentionUnavailable, pa.resolveServed(.nax, false, 17_408));
-    try std.testing.expectEqualStrings("route prefill_attention=stock reason=ctx>32768 keys (NAX device-checked to 32768) pin=prefill_attention ctx=33792", prefillAttentionStockLine(&buf, 33_792));
+    try std.testing.expectEqual(pa.Route.nax, try pa.resolve(null, true));
+    try std.testing.expectEqual(pa.Route.nax, try pa.resolve(.nax, true));
+    try std.testing.expectEqual(pa.Route.stock, try pa.resolve(null, false));
+    try std.testing.expectError(error.MimoNaxAttentionUnavailable, pa.resolve(.nax, false));
     try std.testing.expectEqualStrings("route prefill_attention=stock reason=platform (this device has no NAX) pin=prefill_attention", prefillAttentionPlatformLine(&buf));
     // expert_rows_by_layer where the derived split does not fit: the default routes to uniform; a named derived refuses.
     const tight: sdk.Rows = .{ .prompt = 44, .decode = 56 };

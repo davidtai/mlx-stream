@@ -136,8 +136,8 @@ pass groups its tiles by slot bank, so its outputs are rounding-class across row
 
 Each decode forward (one row serially, up to four under the draft lane):
 
-- **Attention.** At M <= 8, kernels over the BF16 KV views (`decode_attention: kernels`), device-checked to 32,768
-  keys. Past that, the default installs MLX's SDPA at construction with one log line; a named `kernels` is refused.
+- **Attention.** At M <= 8, kernels over the BF16 KV views (`decode_attention: kernels`) at every served context, to
+  the checkpoint's 1,048,576 keys; `decode_attention: stock` installs MLX's SDPA (the control).
   The KV is BF16 by default; `kv_quant: 8` stores it as affine Q8 group 64.
 - **Glue.** Norms, residual adds, the router and the top-8 selection in fused kernels (`decode_glue: fused`), the
   stock ops' arithmetic.
@@ -183,9 +183,9 @@ The prompt runs whole, in calls of up to 16,384 rows. Per routed layer:
 - **Read-ahead** (`prefill_read_ahead`). A predictor on the layer's input ranks its experts, and the predicted records
   are read into the persistent rows while the layer's attention runs. The predictor's router tiles are evaluated in
   one eval per call (`prefill_predict_evals: one`).
-- **Attention.** On a device with NAX, a NAX kernel for the 192 / 128 head widths with sinks, device-checked to 32,768
-  keys (`prefill_attention`, unset = NAX where it is checked). On a device without NAX, or past the checked keys, the
-  default installs MLX's attention at construction with one log line; a named `nax` is refused there.
+- **Attention.** On a device with NAX, a NAX kernel for the 192 / 128 head widths with sinks at every served context
+  (`prefill_attention`, unset = NAX). On a device without NAX the default installs MLX's attention at construction with
+  one log line; a named `nax` is refused there. `prefill_attention: stock` installs MLX's attention (the control).
 - **Expert tiles.** The experts run as sorted GEMM tiles grouped by slot bank. Each tile is handed only the slice of
   its bank its slots span (`prefill_bank_view: window`). Tiles drain pipelined: each projection and reduction tile is
   committed while the one before it finishes (`prefill_drain: pipelined`; the bill charges the second tile in flight).
@@ -244,14 +244,12 @@ Settings live in the pack's `config.json`, in the `settings` object of its `expe
 
 Construction logs the route it installs for each setting. A named value that cannot install is refused by name. A
 default that cannot install takes an explicit route at construction, from a fact fixed for the model's lifetime, and
-logs one line naming the route, the reason and the setting that would pin it. Five defaults do this:
-`decode_attention` and `prefill_attention` past 32,768 keys, `prefill_attention` on a device without NAX,
-`prefill_combine` under a host wired policy other than `max`, `expert_rows_by_layer` where the derived offsets do not
-fit the admitted rows, and `gpu_keep_warm` on a CPU stream. The lines read:
+logs one line naming the route, the reason and the setting that would pin it. Four defaults do this:
+`prefill_attention` on a device without NAX, `prefill_combine` under a host wired policy other than `max`,
+`expert_rows_by_layer` where the derived offsets do not fit the admitted rows, and `gpu_keep_warm` on a CPU stream. The
+lines read:
 
 ```text
-route decode_attention=stock reason=ctx>32768 keys (kernels device-checked to 32768) pin=decode_attention ctx=65536
-route prefill_attention=stock reason=ctx>32768 keys (NAX device-checked to 32768) pin=prefill_attention ctx=65536
 route prefill_attention=stock reason=platform (this device has no NAX) pin=prefill_attention
 route expert_rows_by_layer=uniform reason=derived split does not fit the admitted rows prompt=44 decode=56 pin=expert_rows_by_layer
 route prefill_combine=fused reason=host wired policy fit (inplace needs max) pin=prefill_combine
@@ -270,7 +268,7 @@ ids can change at near-ties. **lossy** = emits tokens the target would not have 
 | `draft_tier` | `typical`, `exact` | `typical` | `exact` | lossy ([The draft lane](#the-draft-lane)) |
 | `draft_delta` | a number in (0, 1] | `0.5` | | lossy |
 | `draft_depth` | `1`, `2`, `3` | `3` | | as `draft_tier` |
-| `decode_attention` | `kernels`, `stock` | `kernels` (stock past 32,768 keys) | `stock` | rounding-class |
+| `decode_attention` | `kernels`, `stock` | `kernels` | `stock` | rounding-class |
 | `decode_moe` | `hitpass`, `fused`, `stock` | `hitpass` | `fused` (and `fused`'s control `stock`) | exact against `fused`; `fused` is rounding-class against `stock` |
 | `decode_moe_kernel` | `k1`, `banked` | `k1` | `banked` | exact (a named `k1` with `decode_moe: stock` is refused) |
 | `decode_glue` | `fused`, `ops` | `fused` | `ops` | exact |
@@ -280,7 +278,7 @@ ids can change at near-ties. **lossy** = emits tokens the target would not have 
 | `predict_router` | `bf16`, `f32` | `bf16` | `f32` | token-exact |
 | `fp8_prompt_slots` | `3`, `4` | `3` | `4` | exact (fp8res only) |
 | `fp8_gemv_plan` | `by_rows`, `fixed` | `by_rows` | `fixed` | exact (fp8res only) |
-| `prefill_attention` | `nax`, `stock` | unset: NAX on a NAX device within 32,768 keys | `stock` | rounding-class |
+| `prefill_attention` | `nax`, `stock` | unset: NAX on a NAX device | `stock` | rounding-class |
 | `prefill_read_ahead` | `true`, `false` | `true` | `false` | exact |
 | `prefill_read_schedule` | `early_whole_trim`, `early_whole`, `early`, `current`, `auto` | `early_whole_trim` | `early_whole`, `current` | exact |
 | `prefill_read_schedule_threshold` | an integer 1..1,048,576, only with `auto` | `8192` | | exact |
@@ -322,9 +320,6 @@ skip without their inputs.
 
 ## Limitations
 
-- **32,768-key checked range.** The decode attention kernels and the NAX prompt attention are device-checked to 32,768
-  keys. Past that the defaults install MLX's stock routes (one log line each) and a named `kernels` or `nax` is
-  refused. Longer contexts run, on the stock routes.
 - **GPU clock.** macOS holds the GPU at about 1,470-1,560 MHz active, lower when hot. Measured cells swing about 6 %
   in prefill with the clock, not with the code: compare cells at matched clocks, with the fans at maximum.
 - **Greedy ids depend on rows.** Tokens are reproducible only at fixed rows: two AUTO-row runs that admit different
