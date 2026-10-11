@@ -69,6 +69,56 @@ pub const settle_tolerance_bytes = phase_mem.settle_tolerance_bytes;
 pub const routes_env = "GLM53_ROUTES";
 /// The wave probe's diagnostic switch (`graph.WaveProbe`), read once at construction.
 pub const wave_probe_env = "GLM53_WAVE_PROBE";
+/// The verify span's diagnostic switch (`VerifyDiag`), read once at construction.
+pub const verify_diag_env = "GLM53_VERIFY_SPAN_DIAG";
+
+/// A diagnostic the module arms at construction (`verify_diag_env`, off by default; only where the verify runs as one
+/// span on the DSA kernels): each round's verify also runs row by row first from the same state (its KV appends
+/// truncated, its expert reads served again), and the two logits are compared per row: the largest difference in bf16
+/// ulps of the larger value, and whether the argmax is the same. A line per round, the totals carried.
+pub const VerifyDiag = struct {
+    rounds: u64 = 0,
+    rows: u64 = 0,
+    argmax_differ: u64 = 0,
+    max_ulps: f32 = 0,
+    ref: std.ArrayList(f32) = .empty,
+    got: std.ArrayList(f32) = .empty,
+
+    /// One bf16 ulp at `v` (8 significant bits): 2^(floor(log2 |v|) - 7), the subnormal step below the smallest normal.
+    pub fn bf16Ulp(v: f32) f32 {
+        const a = @abs(v);
+        if (a < std.math.floatMin(f32)) return std.math.ldexp(@as(f32, 1), -133);
+        return std.math.ldexp(@as(f32, 1), std.math.frexp(a).exponent - 8);
+    }
+
+    /// Row by row over `rows` rows of `vocab`: the round's largest ulps and argmax differences, into the totals.
+    pub fn compare(self: *VerifyDiag, rows: usize, vocab: usize) struct { ulps: f32, differ: u32 } {
+        var worst: f32 = 0;
+        var differ: u32 = 0;
+        for (0..rows) |r| {
+            const ref = self.ref.items[r * vocab ..][0..vocab];
+            const got = self.got.items[r * vocab ..][0..vocab];
+            var ar: usize = 0;
+            var ag: usize = 0;
+            for (ref, got, 0..) |x, y, i| {
+                worst = @max(worst, @abs(x - y) / bf16Ulp(@max(@abs(x), @abs(y))));
+                if (x > ref[ar]) ar = i;
+                if (y > got[ag]) ag = i;
+            }
+            differ += @intFromBool(ar != ag);
+        }
+        self.rounds += 1;
+        self.rows += rows;
+        self.argmax_differ += differ;
+        self.max_ulps = @max(self.max_ulps, worst);
+        return .{ .ulps = worst, .differ = differ };
+    }
+
+    pub fn deinit(self: *VerifyDiag, a: std.mem.Allocator) void {
+        self.ref.deinit(a);
+        self.got.deinit(a);
+    }
+};
 
 /// What the host hands the construction: the GPU ceiling and the wired margin (`LoadCtx`), never read elsewhere.
 pub const Host = struct { ceiling: u64, wired_margin: u64 };
@@ -200,6 +250,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         file_backed_start: u64 = 0,
         /// The wave probe (`wave_probe_env`; null: off).
         probe: ?*graph.WaveProbe = null,
+        /// The verify span's diagnostic (`verify_diag_env`; null: off).
+        verify_diag: ?*VerifyDiag = null,
         /// The positions the request's KV lanes hold since its handover (its decode terms' KV).
         decode_positions: u64 = 0,
 
@@ -356,6 +408,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 log.info("glm_moe_dsa: {s} is set: each prompt layer's MLX peak by stage is logged at the pass's end\n", .{wave_probe_env});
             }
             errdefer if (self.probe) |p| gpa.destroy(p);
+            if (std.c.getenv(verify_diag_env) != null and self.routes.dsa) {
+                self.verify_diag = try gpa.create(VerifyDiag);
+                self.verify_diag.?.* = .{};
+                log.info("glm_moe_dsa: {s} is set: each verify also runs row by row and the logits are compared per row\n", .{verify_diag_env});
+            }
+            errdefer if (self.verify_diag) |v| gpa.destroy(v);
             self.g.clearCache();
             _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, self.cacheLimit(.prompt));
             log.info("glm_moe_dsa: constructed ({d} routed layers, {d} experts, record {d} B, expert reads {s}, prompt {s}, prompt attention {s}, decode window {d} rows)\n", .{ n_bank, self.bank.n_experts, self.bank.geometryOf().widest_record, if (gated) "event gates" else "host waits", if (cfg.layerMajor()) "layer by layer" else "chunk by chunk", if (self.routes.dsa) "on the DSA kernels" else "in the reference's form", shape.decode_window_rows });
@@ -451,6 +509,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.gpa.free(self.layer_rates);
             self.bill.free(self.gpa);
             if (self.probe) |p| self.gpa.destroy(p);
+            if (self.verify_diag) |v| {
+                v.deinit(self.gpa);
+                self.gpa.destroy(v);
+            }
             self.g.deinit();
             var prev: usize = 0;
             _ = mlx.mlx_set_cache_limit(&prev, self.prev_cache_limit);
@@ -783,12 +845,32 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             }
             const m0 = self.g.mark();
             defer self.g.resetTo(m0);
+            const vocab: usize = self.model.vocab_size;
+            if (self.verify_diag != null and depth > 0) {
+                const vd = self.verify_diag.?;
+                // The row-by-row verify from the same state; its KV appends dropped.
+                var rt = self.routes;
+                rt.verify_span = false;
+                const ref = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, rt, .{ .verify = true });
+                defer self.g.release(ref.logits);
+                try vd.ref.resize(self.gpa, (depth + 1) * vocab);
+                _ = try self.g.hostF32(try self.g.astype(ref.logits, .float32), vd.ref.items);
+                try self.ex.flush();
+                self.cache.truncateTo(len);
+            }
             self.ex.row_bytes = @splat(0);
             if (comptime timeline.enabled) timeline.verifyBegin();
             const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, self.routes, .{ .verify = true, .hidden = true });
             defer self.g.release(out.logits);
             defer self.g.release(out.hidden.?);
             try self.g.evalAll(&.{ out.logits, out.hidden.? });
+            if (self.verify_diag != null and depth > 0) {
+                const vd = self.verify_diag.?;
+                try vd.got.resize(self.gpa, (depth + 1) * vocab);
+                _ = try self.g.hostF32(try self.g.astype(out.logits, .float32), vd.got.items);
+                const r = vd.compare(depth + 1, vocab);
+                log.info("glm_moe_dsa: verify span diag round {d}: {d} rows, max {d:.1} bf16 ulps, argmax differs in {d}; so far {d} rows, max {d:.1} ulps, argmax differs in {d}\n", .{ vd.rounds, depth + 1, r.ulps, r.differ, vd.rows, vd.max_ulps, vd.argmax_differ });
+            }
             if (comptime timeline.enabled) timeline.verifyEnd();
             try self.ex.flush();
             const t_verify = self.nowNs();

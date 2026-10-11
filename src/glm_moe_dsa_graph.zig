@@ -641,6 +641,8 @@ pub const Routes = struct {
     max_route_ids: u32 = 48,
     /// A prompt's attention on the DSA kernels (the module's probe passed on this device).
     dsa: bool = false,
+    /// With `dsa`: the verify's rows as one span on the kernels (`Form.span`); off: row by row (`Form.per_row`).
+    verify_span: bool = true,
     /// The wave probe, a diagnostic the module arms (`WaveProbe`); null: off.
     wave_probe: ?*WaveProbe = null,
 };
@@ -758,7 +760,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
 pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, ex: anytype, rt: Routes, want: Want) !Out {
     const rows: u32 = @intCast(ids.len);
     const prompt = rows > 1 and !want.verify;
-    const form: Form = if (!want.verify) .auto else if (rt.dsa and rows > 1) .span else .per_row;
+    const form: Form = if (!want.verify) .auto else if (rt.dsa and rt.verify_span and rows > 1) .span else .per_row;
     var carry = if (form == .per_row) try Carry.perRow(a, rows) else try Carry.init(a, c, rows, start + rows, rt.dsa);
     defer carry.deinit(g);
     var seed: std.ArrayList(u16) = .empty;
