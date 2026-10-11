@@ -218,7 +218,6 @@ Settings (`model-settings.json`):
 | `mtp_acceptance` | `exact` or `typical` | `exact` |
 | `mtp_typical_delta` | the typical acceptance's delta, read only under `typical` | 0.2 |
 | `expert_lookahead_budget` | the decode lookahead's records read ahead per routed call, 1 to 4 | 2 |
-| `expert_lookahead_max_rank` | the decode lookahead reads ahead only the candidates at the first N top-k positions of their row, 1 to 8 | all |
 
 Memory: the fill counts units of slot rows. On the affine bank a unit is one 21.2 MB record on each of the 75 routed
 layers (1.59 GB); on the EXL3 bank (`expert-manifest-exl3-v1.json`) a unit is each bank layer's share of its experts,

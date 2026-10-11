@@ -37,8 +37,6 @@ pub fn SelectorOf(comptime routed_top_k: u32) type {
         /// inf keeps each row's plain top-K.
         tau: f32,
         budget: u32,
-        /// Candidates of a row's top-k position at or past this are never read ahead (`max_k`: none dropped).
-        max_rank: u32 = max_k,
         seen: std.DynamicBitSetUnmanaged,
 
         pub fn init(a: std.mem.Allocator, n_experts: u32, k: u32, tau: f32, budget: u32) !Selector {
@@ -107,7 +105,6 @@ pub fn SelectorOf(comptime routed_top_k: u32) type {
                 for (top[0..cnt], 0..) |e, rank| {
                     const v = row[e];
                     if (finite and !(v >= threshold)) continue;
-                    if (rank >= self.max_rank) continue;
                     entries[n] = .{ .rank = @intCast(rank), .score = v, .expert = e };
                     n += 1;
                 }

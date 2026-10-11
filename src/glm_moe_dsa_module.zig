@@ -268,7 +268,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .staging_from_bank = true,
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
                 .pool = .{ .workers = shape.workers, .tickets = 1024 * Bk.Stream.maxMinis(&self.bank), .direct = true },
-                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget(), .max_rank = cfg.lookaheadMaxRank() },
+                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
                 .keep_residents = true,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
             });
@@ -1276,7 +1276,7 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     try glm.writeResidents(a, testing.io, tmp.dir, &model);
     var rbuf: [512]u8 = undefined;
     const dir = try exl3_bank.tmpRoot(&tmp, &rbuf);
-    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3, .expert_lookahead_budget = 3, .expert_lookahead_max_rank = 2 };
+    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3, .expert_lookahead_budget = 3 };
     defer cfg.deinit(a);
     var weights = try sdk.loader.dir(testing.io, a, dir, .{});
     defer weights.deinit();
@@ -1292,9 +1292,8 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     try testing.expectEqual(m.inputs.prompt_cache, @as(u64, limit));
     try testing.expectEqual(bill_mod.prefillCacheBytes(sdk.memory.totalMemBytes()), m.inputs.prompt_cache);
     try testing.expectEqual(m.inputs.prompt_cache, bill_mod.termsOf(m.inputs).mlx_cache[0]);
-    // The setting's lookahead budget and rank cap are the stream's.
+    // The setting's lookahead budget is the stream's.
     try testing.expectEqual(@as(u32, 3), m.stream.selector.?.budget);
-    try testing.expectEqual(@as(u32, 2), m.stream.selector.?.max_rank);
     try testing.expectEqual(@as(usize, 8), m.decode_rows.len);
     for (m.prompt_rows, m.decode_rows) |p, d| {
         try testing.expectEqual(@as(u32, 3), p);
