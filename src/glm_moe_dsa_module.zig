@@ -92,7 +92,9 @@ pub const VerifyDiag = struct {
     }
 
     /// Row by row over `rows` rows of `vocab`: the round's largest ulps and argmax differences, into the totals.
-    pub fn compare(self: *VerifyDiag, rows: usize, vocab: usize) struct { ulps: f32, differ: u32 } {
+    /// Per row: the largest difference in bf16 ulps at the row's scale (its largest |logit| in the row-by-row
+    /// logits) and, where the argmax differs, the row-by-row logits' top-1 minus their value at the span's argmax.
+    pub fn compare(self: *VerifyDiag, rows: usize, vocab: usize, gaps: *[8]f32) struct { ulps: f32, differ: u32 } {
         var worst: f32 = 0;
         var differ: u32 = 0;
         for (0..rows) |r| {
@@ -100,12 +102,19 @@ pub const VerifyDiag = struct {
             const got = self.got.items[r * vocab ..][0..vocab];
             var ar: usize = 0;
             var ag: usize = 0;
+            var scale: f32 = 0;
+            var maxd: f32 = 0;
             for (ref, got, 0..) |x, y, i| {
-                worst = @max(worst, @abs(x - y) / bf16Ulp(@max(@abs(x), @abs(y))));
+                scale = @max(scale, @abs(x));
+                maxd = @max(maxd, @abs(x - y));
                 if (x > ref[ar]) ar = i;
                 if (y > got[ag]) ag = i;
             }
-            differ += @intFromBool(ar != ag);
+            worst = @max(worst, maxd / bf16Ulp(scale));
+            if (ar != ag) {
+                if (differ < gaps.len) gaps[differ] = ref[ar] - ref[ag];
+                differ += 1;
+            }
         }
         self.rounds += 1;
         self.rows += rows;
@@ -868,8 +877,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 const vd = self.verify_diag.?;
                 try vd.got.resize(self.gpa, (depth + 1) * vocab);
                 _ = try self.g.hostF32(try self.g.astype(out.logits, .float32), vd.got.items);
-                const r = vd.compare(depth + 1, vocab);
-                log.info("glm_moe_dsa: verify span diag round {d}: {d} rows, max {d:.1} bf16 ulps, argmax differs in {d}; so far {d} rows, max {d:.1} ulps, argmax differs in {d}\n", .{ vd.rounds, depth + 1, r.ulps, r.differ, vd.rows, vd.max_ulps, vd.argmax_differ });
+                var gaps: [8]f32 = @splat(0);
+                const r = vd.compare(depth + 1, vocab, &gaps);
+                log.info("glm_moe_dsa: verify span diag round {d}: {d} rows, max {d:.2} bf16 ulps at the row's scale, argmax differs in {d} (top-1 minus the span's pick: {d:.4} {d:.4} {d:.4} {d:.4}); so far {d} rows, max {d:.2} ulps, argmax differs in {d}\n", .{ vd.rounds, depth + 1, r.ulps, r.differ, gaps[0], gaps[1], gaps[2], gaps[3], vd.rows, vd.max_ulps, vd.argmax_differ });
             }
             if (comptime timeline.enabled) timeline.verifyEnd();
             try self.ex.flush();
