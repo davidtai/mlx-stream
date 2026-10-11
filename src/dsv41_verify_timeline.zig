@@ -38,14 +38,20 @@ pub const Verify = struct { begin: u64 = 0, end: u64 = 0 };
 /// landed) and the call's ns. Past the cap the pool stops logging (`signals_full`).
 pub const max_signals = 1 << 17;
 pub const Signal = [4]i64;
+/// The read pool's busy spans (`q3ld_test_busy_log`): each [start, end) host time with any read in flight, sorted and
+/// disjoint. Past the cap the pool stops logging (`busy_full`).
+pub const max_busy = 1 << 17;
+pub const BusySpan = [2]i64;
 
-pub const storage_bytes = max_buffers * @sizeOf(Row) + max_cycles * (max_layers * @sizeOf(Layer) + @sizeOf(Verify)) + max_signals * @sizeOf(Signal);
+pub const storage_bytes = max_buffers * @sizeOf(Row) + max_cycles * (max_layers * @sizeOf(Layer) + @sizeOf(Verify)) + max_signals * @sizeOf(Signal) + max_busy * @sizeOf(BusySpan);
 
 var rows: [max_buffers]Row = undefined;
 var layers: [max_cycles][max_layers]Layer = undefined;
 var verifies: [max_cycles]Verify = undefined;
 var signals: [max_signals]Signal = undefined;
 var n_signals: usize = 0;
+var busy: [max_busy]BusySpan = undefined;
+var n_busy: usize = 0;
 /// Cycles begun (`cycleBegin`), and the one in progress.
 pub var cycles: u32 = 0;
 var cur: u32 = 0;
@@ -65,10 +71,11 @@ const c = if (enabled) struct {
     pub extern fn dsv41tl_hooked_names(out: [*]u8, cap: usize) usize;
     pub extern fn dsv41tl_selftest(rows: [*]Row, cap: u32) c_int;
     pub extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
+    pub extern fn q3ld_test_busy_log(buf: ?[*]i64, cap: i64) i64;
 } else struct {};
 // The guards below (`@hasDecl(c, ...)`) see only pub declarations: a profile build must reach every shim call.
 comptime {
-    if (enabled) for (.{ "dsv41tl_tag", "dsv41tl_rehook", "dsv41tl_counts", "dsv41tl_hook_stats", "dsv41tl_hooked_names", "q3ld_test_ev_log" }) |n| {
+    if (enabled) for (.{ "dsv41tl_tag", "dsv41tl_rehook", "dsv41tl_counts", "dsv41tl_hook_stats", "dsv41tl_hooked_names", "q3ld_test_ev_log", "q3ld_test_busy_log" }) |n| {
         if (!@hasDecl(c, n)) @compileError("dsv41 verify timeline: the shim's " ++ n ++ " is not reachable");
     };
 }
@@ -87,6 +94,7 @@ pub fn install(s: mlx.mlx_stream, max_tokens: u32, layer_count: u32) !void {
     if (rc != 0) return error.TimelineNoCommandBuffer;
     stream = s;
     _ = c.q3ld_test_ev_log(@ptrCast(&signals), max_signals);
+    _ = c.q3ld_test_busy_log(@ptrCast(&busy), max_busy);
     arm(layer_count);
 }
 
@@ -115,6 +123,7 @@ fn arm(layer_count: u32) void {
     cur = 0;
     in_verify = false;
     n_signals = 0;
+    n_busy = 0;
     t0 = now();
     active = true;
 }
@@ -214,6 +223,7 @@ pub fn uninstall() void {
     if (comptime !enabled) return;
     disarm();
     if (comptime @hasDecl(c, "q3ld_test_ev_log")) _ = c.q3ld_test_ev_log(null, -1);
+    if (comptime @hasDecl(c, "q3ld_test_busy_log")) _ = c.q3ld_test_busy_log(null, -1);
     active = false;
 }
 
@@ -231,6 +241,7 @@ pub fn settle(s: mlx.mlx_stream, timeout_ms: u64) u32 {
     disarm();
     _ = mlx.mlx_synchronize(s);
     n_signals = @intCast(@min(c.q3ld_test_ev_log(null, 0), max_signals));
+    n_busy = @intCast(@min(c.q3ld_test_busy_log(null, 0), max_busy));
     const start = now();
     while (true) {
         const k = counts();
@@ -298,6 +309,37 @@ fn idleIn(u: []const Span, a: u64, b: u64) u64 {
     return (b - a) - busyIn(u, a, b);
 }
 
+/// [a, b) split between the GPU's busy union and the SSD's busy spans (both sorted and disjoint): both busy, the SSD
+/// alone, the GPU alone, both idle.
+pub const Split = struct { both: u64 = 0, ssd_only: u64 = 0, gpu_only: u64 = 0, idle: u64 = 0 };
+
+pub fn splitIn(gpu: []const Span, ssd: []const Span, a: u64, b: u64) Split {
+    if (b <= a) return .{};
+    const g = busyIn(gpu, a, b);
+    const s = busyIn(ssd, a, b);
+    var both: u64 = 0;
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < gpu.len and j < ssd.len) {
+        const x = @max(@max(gpu[i][0], ssd[j][0]), a);
+        const y = @min(@min(gpu[i][1], ssd[j][1]), b);
+        if (y > x) both += y - x;
+        if (gpu[i][1] < ssd[j][1]) i += 1 else j += 1;
+    }
+    return .{ .both = both, .ssd_only = s - both, .gpu_only = g - both, .idle = (b - a) - (g + s - both) };
+}
+
+/// The pool's busy log as spans (its entries are already sorted and disjoint; an empty one is dropped).
+fn ssdSpans(log: []const BusySpan, out: []Span) []Span {
+    var n: usize = 0;
+    for (log) |e| {
+        if (e[1] <= e[0] or n == out.len) continue;
+        out[n] = .{ @intCast(e[0]), @intCast(e[1]) };
+        n += 1;
+    }
+    return out[0..n];
+}
+
 /// The first logged signal at or past `value` (the log's values never decrease): its signal-call time.
 fn signalOf(sig: []const Signal, value: u64) ?u64 {
     var lo: usize = 0;
@@ -337,16 +379,20 @@ fn lastEnd(rs: []const Row, cyc: u32, a: u64, b: u64) ?u64 {
 /// wave's buffers, first GPU start to last end), `gap` (the routing barrier's buffer end to the hit wave's first start),
 /// `wait` / `wait_gu` (the layer's gated miss parts: from the GPU start of the first buffer after its hit wave to the
 /// signal of its last down value / of its gate-up value, capped at those buffers' end).
-pub const PerLayer = struct { idle_barrier: u64 = 0, hit_span: ?u64 = null, gap: ?u64 = null, wait: ?u64 = null, wait_gu: ?u64 = null };
+/// `split`: the layer's window (its barrier's submit to the next stamped layer's, the last to the verify's end) split
+/// between the GPU and the SSD (`splitIn`).
+pub const PerLayer = struct { idle_barrier: u64 = 0, hit_span: ?u64 = null, gap: ?u64 = null, wait: ?u64 = null, wait_gu: ?u64 = null, split: ?Split = null };
 
 /// One verify (ns): its wall, the GPU's busy union inside it and the idle rest, split by the host's stamps into
 /// `idle_barrier`, `idle_encode` (before the first layer, and between a layer's hit submit and the next layer's barrier
 /// submit) and `idle_tail` (after the last layer's hit submit); `read` the stream's read gauge over the routed calls;
 /// `miss_busy` the GPU busy time after the hit submit of the layers that missed; `wait` the summed gated waits on miss
 /// bytes (`PerLayer.wait`) and `work` = busy - wait; `hit_span` / `gap` summed over the layers that have them.
-pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_barrier: u64 = 0, idle_encode: u64 = 0, idle_tail: u64 = 0, read: u64 = 0, miss_busy: u64 = 0, buffers: u32 = 0, layers: u32 = 0, truncated: bool = false, work: u64 = 0, wait: u64 = 0, wait_gu: u64 = 0, hit_span: u64 = 0, hit_layers: u32 = 0, gap: u64 = 0, gap_layers: u32 = 0, gated: u32 = 0, unsignalled: u32 = 0 };
+pub const CycleSum = struct { wall: u64 = 0, busy: u64 = 0, idle: u64 = 0, idle_barrier: u64 = 0, idle_encode: u64 = 0, idle_tail: u64 = 0, read: u64 = 0, miss_busy: u64 = 0, buffers: u32 = 0, layers: u32 = 0, truncated: bool = false, work: u64 = 0, wait: u64 = 0, wait_gu: u64 = 0, hit_span: u64 = 0, hit_layers: u32 = 0, gap: u64 = 0, gap_layers: u32 = 0, gated: u32 = 0, unsignalled: u32 = 0, split: Split = .{}, layers_split: Split = .{} };
 
-pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []const Signal, scratch: []Span, per: []PerLayer) CycleSum {
+/// `ssd`: the pool's busy spans; `CycleSum.split` the verify's whole window between the GPU and them, `layers_split`
+/// the routed layers' windows summed.
+pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []const Signal, ssd: []const Span, scratch: []Span, per: []PerLayer) CycleSum {
     var s: CycleSum = .{};
     for (per) |*p| p.* = .{};
     if (v.end <= v.begin) return s;
@@ -356,6 +402,7 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
     s.truncated = u.len == scratch.len;
     s.busy = busyIn(u, v.begin, v.end);
     s.idle = s.wall - s.busy;
+    s.split = splitIn(u, ssd, v.begin, v.end);
     var prev_hit: u64 = v.begin;
     var first: ?usize = null;
     var last: ?usize = null;
@@ -400,6 +447,9 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
             break;
         };
         if (l.missed) s.miss_busy += busyIn(u, P.t(l, .hit), next_call);
+        const sp = splitIn(u, ssd, P.t(l, .call), next_call);
+        per[i].split = sp;
+        inline for (.{ "both", "ssd_only", "gpu_only", "idle" }) |f| @field(s.layers_split, f) += @field(sp, f);
         if (l.gate_down == 0) continue;
         s.gated += 1;
         const w = spanOf(rs, cyc, P.t(l, .hit) + 1, next_barrier) orelse continue;
@@ -420,7 +470,7 @@ pub fn cycleSum(rs: []const Row, v: Verify, ls: []const Layer, cyc: u32, sig: []
     return s;
 }
 
-const fields = [_][]const u8{ "wall_ms", "busy_ms", "gpu_work_ms", "bytes_wait_ms", "bytes_wait_gu_ms", "idle_ms", "idle_barrier_ms", "idle_barrier_per_layer_ms", "idle_encode_ms", "idle_tail_ms", "hit_span_ms", "hit_span_per_layer_ms", "router_hit_gap_ms", "router_hit_gap_per_layer_ms", "read_busy_ms", "miss_layer_busy_ms", "buffers", "gated_layers", "unsignalled_gates" };
+const fields = [_][]const u8{ "wall_ms", "busy_ms", "gpu_work_ms", "bytes_wait_ms", "bytes_wait_gu_ms", "idle_ms", "idle_barrier_ms", "idle_barrier_per_layer_ms", "idle_encode_ms", "idle_tail_ms", "hit_span_ms", "hit_span_per_layer_ms", "router_hit_gap_ms", "router_hit_gap_per_layer_ms", "read_busy_ms", "miss_layer_busy_ms", "buffers", "gated_layers", "unsignalled_gates", "gpu_and_ssd_busy_ms", "ssd_only_ms", "gpu_only_ms", "both_idle_ms", "layers_gpu_and_ssd_busy_ms", "layers_ssd_only_ms", "layers_gpu_only_ms", "layers_both_idle_ms" };
 
 fn fieldOf(s: CycleSum, i: usize) f64 {
     const ms = struct {
@@ -452,7 +502,15 @@ fn fieldOf(s: CycleSum, i: usize) f64 {
         15 => ms(s.miss_busy),
         16 => @floatFromInt(s.buffers),
         17 => @floatFromInt(s.gated),
-        else => @floatFromInt(s.unsignalled),
+        18 => @floatFromInt(s.unsignalled),
+        19 => ms(s.split.both),
+        20 => ms(s.split.ssd_only),
+        21 => ms(s.split.gpu_only),
+        22 => ms(s.split.idle),
+        23 => ms(s.layers_split.both),
+        24 => ms(s.layers_split.ssd_only),
+        25 => ms(s.layers_split.gpu_only),
+        else => ms(s.layers_split.idle),
     };
 }
 
@@ -462,23 +520,24 @@ fn median(xs: []f64) f64 {
     return if (xs.len % 2 == 1) xs[xs.len / 2] else (xs[xs.len / 2 - 1] + xs[xs.len / 2]) / 2;
 }
 
-const by_layer_fields = [_][]const u8{ "idle_barrier", "hit_span", "router_hit_gap", "bytes_wait" };
+const by_layer_fields = [_][]const u8{ "idle_barrier", "hit_span", "router_hit_gap", "bytes_wait", "gpu_and_ssd_busy", "ssd_only", "gpu_only", "both_idle" };
 
 var per_cycle: [fields.len][max_cycles]f64 = undefined;
 var per_layer: [by_layer_fields.len][max_layers][max_cycles]f64 = undefined;
 var per_layer_n: [by_layer_fields.len][max_layers]usize = undefined;
 var span_scratch: [8192]Span = undefined;
+var ssd_scratch: [max_busy]Span = undefined;
 
 /// `VERIFY_GPU_TIMELINE {...}` over the stored verifies: per-cycle medians and means, per-layer medians (over the
 /// cycles where the layer has the quantity), the buffer and signal counts (`pending`: rows whose handler had not run
 /// at `settle`).
 pub fn line(buf: []u8, pending: u32) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
-    writeLine(&w, rows[0..@min(counts()[0], max_buffers)], verifies[0..cycles], layers[0..cycles], signals[0..n_signals], pending) catch return buf[0..0];
+    writeLine(&w, rows[0..@min(counts()[0], max_buffers)], verifies[0..cycles], layers[0..cycles], signals[0..n_signals], ssdSpans(busy[0..n_busy], &ssd_scratch), pending) catch return buf[0..0];
     return w.buffered();
 }
 
-fn writeLine(w: *std.Io.Writer, rs: []const Row, vs: []const Verify, ls: []const [max_layers]Layer, sig: []const Signal, pending: u32) !void {
+fn writeLine(w: *std.Io.Writer, rs: []const Row, vs: []const Verify, ls: []const [max_layers]Layer, sig: []const Signal, ssd: []const Span, pending: u32) !void {
     var n: usize = 0;
     var truncated: u32 = 0;
     var verify_buffers: u64 = 0;
@@ -486,10 +545,11 @@ fn writeLine(w: *std.Io.Writer, rs: []const Row, vs: []const Verify, ls: []const
     per_layer_n = @splat(@splat(0));
     for (vs, 0..) |v, ci| {
         if (v.end <= v.begin) continue;
-        const s = cycleSum(rs, v, ls[ci][0..n_layers], @intCast(ci), sig, &span_scratch, per[0..n_layers]);
+        const s = cycleSum(rs, v, ls[ci][0..n_layers], @intCast(ci), sig, ssd, &span_scratch, per[0..n_layers]);
         for (0..fields.len) |f| per_cycle[f][n] = fieldOf(s, f);
         for (per[0..n_layers], 0..) |p, l| {
-            const vals = [_]?u64{ p.idle_barrier, p.hit_span, p.gap, p.wait };
+            const sp = p.split;
+            const vals = [_]?u64{ p.idle_barrier, p.hit_span, p.gap, p.wait, if (sp) |x| x.both else null, if (sp) |x| x.ssd_only else null, if (sp) |x| x.gpu_only else null, if (sp) |x| x.idle else null };
             for (vals, 0..) |x, k| if (x) |y| {
                 per_layer[k][l][per_layer_n[k][l]] = @as(f64, @floatFromInt(y)) / 1e6;
                 per_layer_n[k][l] += 1;
@@ -505,7 +565,7 @@ fn writeLine(w: *std.Io.Writer, rs: []const Row, vs: []const Verify, ls: []const
     for (rs) |r| other_rows += @intFromBool(r.queue == 0);
     var names: [512]u8 = undefined;
     const nlen: usize = if (comptime @hasDecl(c, "dsv41tl_hooked_names")) c.dsv41tl_hooked_names(&names, names.len) else 0;
-    try w.print("VERIFY_GPU_TIMELINE {{\"cycles\": {d}, \"verifies\": {d}, \"layers\": {d}, \"buffers\": {d}, \"verify_buffers\": {d}, \"dropped\": {d}, \"pending\": {d}, \"truncated_cycles\": {d}, \"signals\": {d}, \"signals_full\": {}, \"hook\": {{\"calls\": {d}, \"tagged\": {d}, \"other_queue\": {d}, \"other_queue_rows\": {d}, \"classes\": {d}, \"names\": \"{s}\"}}, \"clock\": \"mach_absolute ns; GPUStartTime / GPUEndTime per committed MTLCommandBuffer; bytes_wait to the read pool's host call of setSignaledValue\"", .{ cycles, n, n_layers, rs.len, verify_buffers, k[2], pending, truncated, sig.len, sig.len >= max_signals, hs[0], hs[1], hs[2], other_rows, hs[3], names[0..nlen] });
+    try w.print("VERIFY_GPU_TIMELINE {{\"cycles\": {d}, \"verifies\": {d}, \"layers\": {d}, \"buffers\": {d}, \"verify_buffers\": {d}, \"dropped\": {d}, \"pending\": {d}, \"truncated_cycles\": {d}, \"signals\": {d}, \"signals_full\": {}, \"ssd_busy_spans\": {d}, \"busy_full\": {}, \"hook\": {{\"calls\": {d}, \"tagged\": {d}, \"other_queue\": {d}, \"other_queue_rows\": {d}, \"classes\": {d}, \"names\": \"{s}\"}}, \"clock\": \"mach_absolute ns; GPUStartTime / GPUEndTime per committed MTLCommandBuffer; bytes_wait to the read pool's host call of setSignaledValue\"", .{ cycles, n, n_layers, rs.len, verify_buffers, k[2], pending, truncated, sig.len, sig.len >= max_signals, ssd.len, n_busy >= max_busy, hs[0], hs[1], hs[2], other_rows, hs[3], names[0..nlen] });
     inline for (.{ "median", "mean" }) |kind| {
         try w.print(", \"{s}\": {{", .{kind});
         for (fields, 0..) |name, f| {
@@ -560,7 +620,7 @@ pub fn writeJson(w: *std.Io.Writer) !void {
 }
 
 test "dsv41 verify timeline: a default build stamps nothing and links no shim; the storage bound is static" {
-    try std.testing.expectEqual(@as(usize, (1 << 18) * 56 + 1024 * (64 * @sizeOf(Layer) + 16) + (1 << 17) * 32), storage_bytes);
+    try std.testing.expectEqual(@as(usize, (1 << 18) * 56 + 1024 * (64 * @sizeOf(Layer) + 16) + (1 << 17) * 32 + (1 << 17) * 16), storage_bytes);
     try std.testing.expectError(error.TimelineCycles, bound(1026, 40));
     try std.testing.expectError(error.TimelineLayers, bound(1024, 65));
     try bound(1024, 40);
@@ -572,6 +632,22 @@ test "dsv41 verify timeline: a default build stamps nothing and links no shim; t
     gate(0, 1, 2, 1);
     try std.testing.expectEqual(@as(u32, 0), cycles);
     try std.testing.expect(!active);
+}
+
+test "dsv41 verify timeline: a window split between the GPU's busy union and the SSD's busy spans: both, each alone, both idle" {
+    // GPU busy 10..30 and 50..70; SSD busy 20..60 and 80..90; the window [0, 100).
+    const gpu = [_]Span{ .{ 10, 30 }, .{ 50, 70 } };
+    const ssd = [_]Span{ .{ 20, 60 }, .{ 80, 90 } };
+    // both: 20..30 and 50..60 = 20; the GPU alone 10..20 and 60..70 = 20; the SSD alone 30..50 and 80..90 = 30; idle 30
+    try std.testing.expectEqual(Split{ .both = 20, .ssd_only = 30, .gpu_only = 20, .idle = 30 }, splitIn(&gpu, &ssd, 0, 100));
+    // the window clips: [25, 55) has both 25..30 and 50..55, the SSD alone 30..50, nothing else
+    try std.testing.expectEqual(Split{ .both = 10, .ssd_only = 20, .gpu_only = 0, .idle = 0 }, splitIn(&gpu, &ssd, 25, 55));
+    try std.testing.expectEqual(Split{ .idle = 10 }, splitIn(&gpu, &.{}, 90, 100));
+    try std.testing.expectEqual(Split{}, splitIn(&gpu, &ssd, 50, 50));
+    // the pool's log: an empty or reversed entry is dropped
+    var out: [4]Span = undefined;
+    const log = [_]BusySpan{ .{ 5, 9 }, .{ 12, 12 }, .{ 20, 15 }, .{ 30, 40 } };
+    try std.testing.expectEqualSlices(Span, &.{ .{ 5, 9 }, .{ 30, 40 } }, ssdSpans(&log, &out));
 }
 
 // Profile builds, a device step (DSV41_PHASE0B_MLX=1; no model): MLX's own buffers on the GPU stream reach the hook.
@@ -641,7 +717,7 @@ test "dsv41 verify timeline (profile builds): a hand-made verify: busy union, id
     const sig = [_]Signal{ .{ 5, 90, 89, 1 }, .{ 7, 150, 149, 1 }, .{ 9, 180, 178, 1 } };
     var scratch: [8]Span = undefined;
     var per: [3]PerLayer = undefined;
-    const s = cycleSum(&rs, .{ .begin = 100, .end = 300 }, &ls, 0, &sig, &scratch, &per);
+    const s = cycleSum(&rs, .{ .begin = 100, .end = 300 }, &ls, 0, &sig, &.{}, &scratch, &per);
     // busy: 105..120, 124..200, 205..215 = 15 + 76 + 10 = 101; idle 99
     try std.testing.expectEqual(@as(u64, 200), s.wall);
     try std.testing.expectEqual(@as(u64, 101), s.busy);
@@ -670,7 +746,7 @@ test "dsv41 verify timeline (profile builds): a hand-made verify: busy union, id
     try std.testing.expectEqual(@as(u32, 4), s.buffers);
     try std.testing.expectEqual(@as(u32, 2), s.layers);
     // a signal log that stops short leaves the gate unsignalled (no wait counted)
-    const s2 = cycleSum(&rs, .{ .begin = 100, .end = 300 }, &ls, 0, sig[0..2], &scratch, &per);
+    const s2 = cycleSum(&rs, .{ .begin = 100, .end = 300 }, &ls, 0, sig[0..2], &.{}, &scratch, &per);
     try std.testing.expectEqual(@as(u32, 1), s2.unsignalled);
     try std.testing.expectEqual(@as(u64, 0), s2.wait);
     // the install refuses without an MLX command buffer (no device touched)

@@ -131,6 +131,37 @@ test "dsv41 io: pool scatters a synthetic file" {
     }
 }
 
+test "dsv41 io: the read gauge's busy spans (the profile's SSD timeline) are sorted, disjoint and sum to its in-flight time" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(64 * page + 321);
+    defer f.deinit();
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 64 });
+    defer pool.stop();
+    const lens = [n_components]u64{ page + 3, 17, 4099, 1, 777, 2 * page + 5, 1000, page - 1, 33 };
+    var log: [64][2]i64 = undefined;
+    try testing.expectEqual(@as(i64, 0), c.q3ld_test_busy_log(@ptrCast(&log), log.len));
+    defer _ = c.q3ld_test_busy_log(null, -1);
+    const g0 = pool.readGauge()[4];
+    for (0..3) |round| {
+        var d = try Dests.init(2, &lens);
+        defer testing.allocator.free(d.buf);
+        const gu = [2]u64{ 7 + round * 13, 7 + round * 13 + 5 * page + 11 };
+        const down = [2]u64{ 40 * page + 3, 42 * page + 10 };
+        const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..2], &lens);
+        try pool.wait(first, 4, 10 * std.time.ns_per_s);
+    }
+    const g1 = pool.readGauge()[4];
+    const n: usize = @intCast(c.q3ld_test_busy_log(null, 0));
+    try testing.expect(n > 0 and n <= log.len);
+    var sum: i64 = 0;
+    for (log[0..n], 0..) |sp, i| {
+        try testing.expect(sp[1] > sp[0]);
+        if (i > 0) try testing.expect(sp[0] >= log[i - 1][1]);
+        sum += sp[1] - sp[0];
+    }
+    try testing.expectEqual(g1 - g0, sum);
+}
+
 test "dsv41 io: injected faults map to status words" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(40 * page);
