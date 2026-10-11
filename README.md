@@ -196,14 +196,15 @@ buffer), the read pool's staging and the host side (the footprint outside MLX, 1
 The construction admits both phases of the longest request (the billed context and `max_output` generated tokens)
 under the box's target and fills the prompt rows to it. The box's target is the RAM less a 16 GiB OS reserve (the
 free pages and the file cache the box keeps), and at most what keeps the process's GPU memory within the host's
-ceiling less its wired margin. At the decode handover the module frees the prompt's transients, waits until the
-footprint shows the frees, reads its footprint and the box's used memory, and grows the decode rows to the most that
-the bill at the request's own KV and that reading both keep under the box's target, with MLX's bytes within the
-GPU's. The rest of the box is read again at each handover, so a short request decodes with more rows than the longest
-one. Each handover logs one `glm_moe_dsa: handover` line with its readings and the rows; the construction logs one
-`glm_moe_dsa: bill` line with every term and checks its footprint against the bill's construction terms
-(`ConstructionOverBill`). The ceiling comes from the host only. The arch declares `max_output` to the host
-(`maxOutput`, SDK 2.1).
+ceiling less its wired margin. At that fill the box's wired pages pass macOS's default limit on user-wired memory
+(88 % of the RAM, vm.global_user_wire_limit), past which decode runs at half speed: raise it above them (95 % on the
+256 GB M5 Ultra). At the decode handover the module frees the prompt's transients, waits until the footprint shows
+the frees, reads its footprint and the box's used memory, and grows the decode rows to the most that the bill at the
+request's own KV and that reading both keep under the box's target, with MLX's bytes within the GPU's. The rest of
+the box is read again at each handover, so a short request decodes with more rows than the longest one. Each handover
+logs one `glm_moe_dsa: handover` line with its readings and the rows; the construction logs one `glm_moe_dsa: bill`
+line with every term and checks its footprint against the bill's construction terms (`ConstructionOverBill`). The
+ceiling comes from the host only. The arch declares `max_output` to the host (`maxOutput`, SDK 2.1).
 
 Each request logs one `glm_moe_dsa: prompt` line at the end of its prompt pass and one `glm_moe_dsa: decode` line at
 its end (the arch's `requestEnd`), with the phase's wall time, SSD bytes, records read, read-ahead or lookahead use,
