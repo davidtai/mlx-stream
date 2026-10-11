@@ -354,6 +354,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         /// route released, the groups after it routed on stream layer `sl` while windows are free.
         fn drainGroup(self: *Self, g: *G, w: *Wide, sl: u32, gi: usize, outs: []const T, next: *usize, live: *usize, depth: usize, comptime ahead: anytype) !void {
             const td = pt.now();
+            pt.tag(.drain, sl / bpl, sl % bpl, gi);
             try g.evalAll(outs);
             pt.chargeRouted(.compute, td);
             const tr = pt.now();
@@ -1032,6 +1033,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     std.debug.assert(w.pos.items.len - p0 == w.slot.items.len);
                 }
                 try self.math.finishPrefill(g);
+                pt.tag(.group, layer, side, gi);
                 try g.asyncEval(w.kept.items[k0..]);
                 g.resetTo(m);
                 pt.chargeRouted(.encode, tc);
