@@ -198,10 +198,10 @@ Settings (`model-settings.json`):
 Memory: one slot row is one 21.2 MB record on each of the 75 routed layers (1.59 GB). The KV costs 95,232 B per
 position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16),
 held for the billed context plus 8,192 generated positions. The bill also charges the residents (from the shard
-headers), the prompt and decode transients, the MLX cache limits (2 GiB in the prompt pass, 512 MiB in decode),
+headers), the prompt and decode transients, the MLX cache limits (16 GiB in the prompt pass, 512 MiB in decode),
 the read pool's staging and a host-side bound. The ceiling comes from the host only; the plugin sets no cap of its own.
 At a 240 GiB ceiling, a 2 GiB margin, a 10 GB baseline and the mixed build's 20.1 GB of residents, the 16K bill fills
-128 prompt and 137 decode rows per layer. Past one prompt call the prompt's waves do not grow with the prompt.
+116 prompt and 137 decode rows per layer. Past one prompt call the prompt's waves do not grow with the prompt.
 
 Each request logs one `glm_moe_dsa: prompt` line at the end of its prompt pass and one `glm_moe_dsa: decode` line at
 its end (the arch's `requestEnd`), with the phase's wall time, SSD bytes, records read, read-ahead or lookahead use,

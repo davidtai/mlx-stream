@@ -20,8 +20,10 @@ pub const fill_max_tokens: u64 = 1024;
 pub const generation_headroom: u64 = 8192;
 /// The fill's floor: fewer persistent rows per routed layer refuse the load by name.
 pub const min_fill_rows: u32 = 16;
-/// The MLX allocator cache the module holds through each phase (`mlx_set_cache_limit`).
-pub const prefill_cache_bytes: u64 = 2 << 30;
+/// The MLX allocator cache the module holds through each phase (`mlx_set_cache_limit`). The prompt pass's holds the
+/// buffers one layer frees for the next, which reuses them at their sizes: a buffer the cache dropped is a new one,
+/// made resident and zeroed by the system on its first use.
+pub const prefill_cache_bytes: u64 = 16 << 30;
 pub const decode_cache_bytes: u64 = 512 << 20;
 /// The process's host side (its footprint less MLX's active and cache: the read pool's tables, the manifests'
 /// digests, the module's host state, the process itself): a declared bound until the box measures it.
