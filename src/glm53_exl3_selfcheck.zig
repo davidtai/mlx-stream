@@ -576,7 +576,7 @@ fn mutatedText(a: Allocator, s: mlx.mlx_stream, which: xk.TextRef, needle: []con
     return runChainMutated(a, &b, fam, inst, .chain, .none);
 }
 
-test "glm53 selfcheck: each chain check fails on a wrong codebook, a wrong K, a missing rank, swapped rin and rout, and a wrong row order" {
+test "glm53 selfcheck: each chain check fails on a wrong codebook, a wrong K, a missing rank, swapped rin and rout, a wrong row order, and a device pair of score 0 computed" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
@@ -608,5 +608,11 @@ test "glm53 selfcheck: each chain check fails on a wrong codebook, a wrong K, a 
             try mutatedText(a, s, .{ .kernel = .glm53_pf_down }, "for (int r = 0; r < 4; ++r) {", "for (int r = 0; r < 3; ++r) {", fam, inst);
         try testing.expect(!rank.ok and rank.bad > 0);
         std.debug.print("glm53 selfcheck mutations {t} K{d}: clean {d:.3} ulp; codebook {d} bad, rank sum {d} bad of {d}\n", .{ fam, k, clean.metric, cb.bad, rank.bad, rank.words });
+        if (fam == .decode) {
+            // the device mode's pair of score 0 through the down (its slot's NaN rin and rout read)
+            const skip = try mutatedText(a, s, .{ .kernel = .glm53_dec_down }, "if (packed == 0xffffffffu || sc[pos] == 0.0f) {", "if (packed == 0xffffffffu) {", fam, inst);
+            try testing.expect(!skip.ok and skip.bad > 0);
+            std.debug.print("glm53 selfcheck mutations decode K{d}: score-0 skip dropped {d} bad of {d}\n", .{ k, skip.bad, skip.words });
+        }
     };
 }

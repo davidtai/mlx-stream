@@ -206,8 +206,35 @@ pub fn Accepted(comptime G: type) type {
             const a = self.a;
             const n = rows.slot.len;
             const k = kOf(bank.gate.trellis) orelse return error.BankArrays;
+            try self.sortRows(rows, bank);
+            for (self.waves.items) |w| _ = mlx.mlx_array_free(w);
+            self.waves.clearRetainingCapacity();
+            self.prefill_gemm_calls += 1;
+            const bk: routes.Bank = .{ .gate = proj(bank.gate), .up = proj(bank.up), .down = proj(bank.down) };
+            var i: usize = 0;
+            while (i < n) {
+                const w = self.nextWave(rows, i);
+                const m = g.mark();
+                const t = try self.waveArrays(g, w);
+                try self.waves.ensureUnusedCapacity(a, 1);
+                self.waves.appendAssumeCapacity(try self.pf[ki(k)].wave(x, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk));
+                g.resetTo(m);
+                i = w.end;
+            }
+            const joined = try g.adopt(if (self.waves.items.len == 1) g.keep(self.waves.items[0]) else try concat(self.waves.items, g.s));
+            for (self.waves.items) |w| _ = mlx.mlx_array_free(w);
+            self.waves.clearRetainingCapacity();
+            const ord = try g.hostArray(std.mem.sliceAsBytes(self.inv.items), &.{@intCast(n)}, .uint32);
+            return g.take(joined, ord, 0);
+        }
+
+        /// The call's rows by slot (a stable counting sort, each expert's rows in their call order): `order` (sorted ->
+        /// call row), `inv` (call row -> sorted), `rt` (per sorted row: x row, slot; 8 words past the end, as an MLX input
+        /// below 8 elements binds as `constant`).
+        fn sortRows(self: *Self, rows: quant.PrefillRows, bank: Bank) !void {
+            const a = self.a;
+            const n = rows.slot.len;
             const n_slots: usize = @intCast(@divExact(mlx.getShape(bank.gate.trellis)[0], 4));
-            // the rows by slot (a stable counting sort), each expert's rows in their call order
             try self.counts.resize(a, n_slots + 1);
             @memset(self.counts.items, 0);
             for (rows.slot) |s| self.counts.items[s + 1] += 1;
@@ -220,55 +247,70 @@ pub fn Accepted(comptime G: type) type {
                 self.inv.items[i] = at;
                 self.counts.items[s] += 1;
             }
-            // a wave's table is at least 8 words (an MLX input below 8 elements binds as `constant`): 8 past the end
             try self.rt.resize(a, 2 * n + 8);
             @memset(self.rt.items, 0);
             for (self.order.items, 0..) |o, i| {
                 self.rt.items[2 * i] = if (rows.act_row) |ar| ar[o] else o;
                 self.rt.items[2 * i + 1] = rows.slot[o];
             }
-            for (self.waves.items) |w| _ = mlx.mlx_array_free(w);
-            self.waves.clearRetainingCapacity();
-            self.prefill_gemm_calls += 1;
-            const bk: routes.Bank = .{ .gate = proj(bank.gate), .up = proj(bank.up), .down = proj(bank.down) };
-            const pf = &self.pf[ki(k)];
-            const tiles_gu = routes.tilesGateUp(self.mini);
-            const tiles_dn = routes.tilesDown(self.hidden);
-            // waves: experts in slot order, at most 16 and `wave_rows` rows (a larger expert alone)
-            var i: usize = 0;
-            while (i < n) {
-                var slots: [routes.wave_experts]u32 = undefined;
-                var cnts: [routes.wave_experts]u32 = undefined;
-                var ne: usize = 0;
-                var w_rows: usize = 0;
-                var j = i;
-                while (j < n and ne < routes.wave_experts) {
-                    const s = rows.slot[self.order.items[j]];
-                    var e = j;
-                    while (e < n and rows.slot[self.order.items[e]] == s) e += 1;
-                    if (ne > 0 and w_rows + (e - j) > wave_rows) break;
-                    slots[ne] = s;
-                    cnts[ne] = @intCast(e - j);
-                    ne += 1;
-                    w_rows += e - j;
-                    j = e;
-                }
-                const tgu = routes.waveTable(slots[0..ne], cnts[0..ne], tiles_gu);
-                const tdn = routes.waveTable(slots[0..ne], cnts[0..ne], tiles_dn);
-                const m = g.mark();
-                const rtd = try g.hostArray(std.mem.sliceAsBytes(self.rt.items[2 * i ..][0..@max(8, 2 * w_rows)]), &.{@intCast(@max(8, 2 * w_rows))}, .uint32);
-                const tgud = try g.hostArray(std.mem.sliceAsBytes(&tgu.t), &.{80}, .int32);
-                const tdnd = try g.hostArray(std.mem.sliceAsBytes(&tdn.t), &.{80}, .int32);
-                try self.waves.ensureUnusedCapacity(a, 1);
-                self.waves.appendAssumeCapacity(try pf.wave(x, rtd, w_rows, tgud, tgu.tgs, tdnd, tdn.tgs, bk));
-                g.resetTo(m);
-                i = j;
+        }
+
+        const WaveSpec = struct { slots: [routes.wave_experts]u32, cnts: [routes.wave_experts]u32, ne: usize, first: usize, rows: usize, end: usize };
+
+        /// The wave from sorted row `i`: experts in slot order, at most 16 and `wave_rows` rows (a larger expert alone).
+        fn nextWave(self: *const Self, rows: quant.PrefillRows, i: usize) WaveSpec {
+            const n = rows.slot.len;
+            var w: WaveSpec = .{ .slots = undefined, .cnts = undefined, .ne = 0, .first = i, .rows = 0, .end = i };
+            while (w.end < n and w.ne < routes.wave_experts) {
+                const s = rows.slot[self.order.items[w.end]];
+                var e = w.end;
+                while (e < n and rows.slot[self.order.items[e]] == s) e += 1;
+                if (w.ne > 0 and w.rows + (e - w.end) > wave_rows) break;
+                w.slots[w.ne] = s;
+                w.cnts[w.ne] = @intCast(e - w.end);
+                w.ne += 1;
+                w.rows += e - w.end;
+                w.end = e;
             }
-            const joined = try g.adopt(if (self.waves.items.len == 1) g.keep(self.waves.items[0]) else try concat(self.waves.items, g.s));
-            for (self.waves.items) |w| _ = mlx.mlx_array_free(w);
-            self.waves.clearRetainingCapacity();
-            const ord = try g.hostArray(std.mem.sliceAsBytes(self.inv.items), &.{@intCast(n)}, .uint32);
-            return g.take(joined, ord, 0);
+            return w;
+        }
+
+        /// A wave's device tables: its rows' (x row, slot) and its gate|up and down wave tables.
+        fn waveArrays(self: *const Self, g: *G, w: WaveSpec) !struct { rt: G.T, tgu: G.T, tgs_gu: u32, tdn: G.T, tgs_dn: u32 } {
+            const tgu = routes.waveTable(w.slots[0..w.ne], w.cnts[0..w.ne], routes.tilesGateUp(self.mini));
+            const tdn = routes.waveTable(w.slots[0..w.ne], w.cnts[0..w.ne], routes.tilesDown(self.hidden));
+            const nrt = @max(8, 2 * w.rows);
+            return .{
+                .rt = try g.hostArray(std.mem.sliceAsBytes(self.rt.items[2 * w.first ..][0..nrt]), &.{@intCast(nrt)}, .uint32),
+                .tgu = try g.hostArray(std.mem.sliceAsBytes(&tgu.t), &.{80}, .int32),
+                .tgs_gu = tgu.tgs,
+                .tdn = try g.hostArray(std.mem.sliceAsBytes(&tdn.t), &.{80}, .int32),
+                .tgs_dn = tdn.tgs,
+            };
+        }
+
+        /// Tests: the call's first wave's stages, each evaluated alone, best of `reps` -> ns per stage and that wave's rows.
+        fn stageTimes(self: *Self, g: *G, x: G.T, rows: quant.PrefillRows, bank: Bank, reps: usize) !struct { ns: [4]u64, rows: usize, experts: usize } {
+            const k = kOf(bank.gate.trellis) orelse return error.BankArrays;
+            try self.sortRows(rows, bank);
+            const w = self.nextWave(rows, 0);
+            const bk: routes.Bank = .{ .gate = proj(bank.gate), .up = proj(bank.up), .down = proj(bank.down) };
+            var best: [4]u64 = @splat(std.math.maxInt(u64));
+            for (0..reps + 1) |rep| {
+                const m = g.mark();
+                defer g.resetTo(m);
+                const t = try self.waveArrays(g, w);
+                try g.evalAll(&.{ x, t.rt, t.tgu, t.tdn });
+                var st: routes.Prompt.Stages = .{};
+                defer st.deinit();
+                for (std.enums.values(routes.Prompt.Stage), 0..) |at, si| {
+                    const t0 = nowNs();
+                    try self.pf[ki(k)].stage(at, &st, x, t.rt, w.rows, t.tgu, t.tgs_gu, t.tdn, t.tgs_dn, bk);
+                    try g.evalAll(&.{st.last(at)});
+                    if (rep > 0) best[si] = @min(best[si], nowNs() - t0);
+                }
+            }
+            return .{ .ns = best, .rows = w.rows, .experts = w.ne };
         }
 
         fn concat(xs: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -899,6 +941,12 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
     };
     const flop = @as(f64, @floatFromInt(n_tok * 8)) * 4.0 * 3.0 * 2.0 * @as(f64, @floatFromInt(h)) * 512.0;
     const q1 = .{ ours.prefillStats(), theirs.prefillStats() };
+    for (0..2) |side| {
+        const pr: quant.PrefillRows = .{ .slot = side_slot[side].items[0..@min(16384, side_slot[side].items.len)], .act_row = side_act[side].items[0..@min(16384, side_act[side].items.len)] };
+        const sts = try ours.stageTimes(&g, xp, pr, banks[side], 5);
+        const f = @as(f64, @floatFromInt(sts.rows)) * 2.0 * @as(f64, @floatFromInt(h)) * 512.0 * 4.0;
+        std.debug.print("GLM53_UBENCH prompt wave K{d} ({d} rows, {d} experts): prep {d:.3} ms, gate|up {d:.3} ms ({d:.1} TFLOP/s), mid {d:.3} ms, down {d:.3} ms ({d:.1} TFLOP/s)\n", .{ b.layers[side].k, sts.rows, sts.experts, @as(f64, @floatFromInt(sts.ns[0])) / 1e6, @as(f64, @floatFromInt(sts.ns[1])) / 1e6, 2 * f / @as(f64, @floatFromInt(sts.ns[1])) / 1e3, @as(f64, @floatFromInt(sts.ns[2])) / 1e6, @as(f64, @floatFromInt(sts.ns[3])) / 1e6, f / @as(f64, @floatFromInt(sts.ns[3])) / 1e3 });
+    }
     std.debug.print("GLM53_UBENCH prompt 16384 tokens ({d} K3 + {d} K4 rows): ours {d:.1} ms ({d:.1} TFLOP/s), sushi {d:.1} ms ({d:.1} TFLOP/s) per layer ({d:.2}x); prefill GEMM calls / GPU drains ours {d} / {d}, sushi {d} / {d}\n", .{ side_slot[0].items.len, side_slot[1].items.len, @as(f64, @floatFromInt(best[0])) / 1e6, flop / @as(f64, @floatFromInt(best[0])) / 1e3, @as(f64, @floatFromInt(best[1])) / 1e6, flop / @as(f64, @floatFromInt(best[1])) / 1e3, @as(f64, @floatFromInt(best[1])) / @as(f64, @floatFromInt(best[0])), q1[0][0] - q0[0][0], q1[0][1] - q0[0][1], q1[1][0] - q0[1][0], q1[1][1] - q0[1][1] });
 }
 
@@ -919,4 +967,105 @@ test "glm53 exl3 bench: the tiny fixture's EXL3 pack (GLM53_EXL3_TINY_PACK)" {
     const t2 = try std.mem.replaceOwned(u8, a, text, "\"moe_intermediate_size\":64,", "\"moe_intermediate_size\":512,");
     defer a.free(t2);
     try d.writeFile(testing.io, .{ .sub_path = "config.json", .data = t2 });
+}
+
+/// The tiny fixture's residents at random (`writeResidents` writes zeros): the packed weights random bits, the affine
+/// scales small and the biases centring the codes (`bits` per tensor from the config's quantization), the norms near 1,
+/// every other float small.
+fn randomResidents(a: Allocator, io: std.Io, dir: std.Io.Dir, model: *const @import("glm_moe_dsa.zig").Config, seed: u64) !void {
+    const file = try dir.readFileAlloc(io, "model.safetensors", a, .unlimited);
+    defer a.free(file);
+    const hlen: usize = @intCast(std.mem.readInt(u64, file[0..8], .little));
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, file[8..][0..hlen], .{});
+    defer parsed.deinit();
+    const data = file[8 + hlen ..];
+    var prng = std.Random.DefaultPrng.init(seed);
+    const r = prng.random();
+    var it = parsed.value.object.iterator();
+    while (it.next()) |kv| {
+        const tname = kv.key_ptr.*;
+        if (std.mem.eql(u8, tname, "__metadata__")) continue;
+        const o = kv.value_ptr.object;
+        const dt = o.get("dtype").?.string;
+        const offs = o.get("data_offsets").?.array.items;
+        const bytes = data[@intCast(offs[0].integer)..@intCast(offs[1].integer)];
+        if (std.mem.eql(u8, dt, "U32")) {
+            r.bytes(bytes);
+            continue;
+        }
+        const path = tname[0 .. std.mem.lastIndexOfScalar(u8, tname, '.') orelse tname.len];
+        const levels: f32 = @floatFromInt((@as(u32, 1) << @intCast(model.quant.bitsOf(path))) - 1);
+        const scale: f32 = 0.08 / levels;
+        const f32s = std.mem.eql(u8, dt, "F32");
+        const width: usize = if (f32s) 4 else 2;
+        for (0..bytes.len / width) |i| {
+            const v: f32 = if (std.mem.endsWith(u8, tname, ".scales"))
+                scale * (0.75 + 0.5 * r.float(f32))
+            else if (std.mem.endsWith(u8, tname, ".biases"))
+                -0.5 * levels * scale * (0.75 + 0.5 * r.float(f32))
+            else if (std.mem.indexOf(u8, tname, "norm") != null)
+                0.75 + 0.5 * r.float(f32)
+            else
+                (r.float(f32) * 2 - 1) * 0.05;
+            if (f32s) {
+                std.mem.writeInt(u32, bytes[4 * i ..][0..4], @bitCast(v), .little);
+            } else std.mem.writeInt(u16, bytes[2 * i ..][0..2], @truncate(@as(u32, @bitCast(v)) >> 16), .little);
+        }
+    }
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file });
+}
+
+test "glm53 exl3 quant: on a synthetic EXL3 pack with random residents the GLM-5.3 kernels' module equals sushi's EXL3 module end to end: the prompt's logits and four decode steps'" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    const glm = @import("glm_moe_dsa.zig");
+    const module = @import("glm_moe_dsa_module.zig");
+    const settings = @import("glm_moe_dsa_settings.zig");
+    const sdk = @import("sdk");
+    var model = try bank_mod.tinyConfigInter(a, 512);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try bank_mod.writeSynth(a, io, tmp.dir, &model, .{ .signs = true });
+    defer a.free(img);
+    try glm.writeResidents(a, io, tmp.dir, &model);
+    try randomResidents(a, io, tmp.dir, &model, 0x5ee);
+    var rbuf: [512]u8 = undefined;
+    const dir = try bank_mod.tmpRoot(&tmp, &rbuf);
+    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3, .expert_lookahead_budget = 3 };
+    defer cfg.deinit(a);
+    var weights = try sdk.loader.dir(io, a, dir, .{});
+    defer weights.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const prompt = [_]u32{ 3, 17, 9, 101, 44, 250, 7, 63, 12, 5, 99, 31 };
+    // sushi's module first (its argmax the next step's token), then ours fed the same tokens: one module at a time
+    var logits: [2][5][256]f32 = undefined;
+    var toks: [5]u32 = undefined;
+    inline for (.{ module.Exl3SushiModule, module.Exl3Module }, 0..) |M, arm| {
+        const m = try M.init(a, io, &cfg, &weights, s, .{ .ceiling = 64 << 30, .wired_margin = 0 });
+        defer m.deinit();
+        for (0..5) |step| {
+            const lg = if (step == 0) try m.prefillAt(0, &prompt) else try m.extend(&.{toks[step - 1]});
+            defer _ = mlx.mlx_array_free(lg);
+            _ = try m.g.hostF32(try m.g.astype(lg, .float32), &logits[arm][step]);
+            if (arm == 0) toks[step] = try m.g.hostArgmax(lg);
+            if (step == 0) try m.decodeHandover(.{ .prompt_tokens = prompt.len, .reserved_tokens = prompt.len + 4, .native_draft = false });
+        }
+        m.requestEnd();
+    }
+    var worst: f32 = 0;
+    var scale: f32 = 0;
+    var same: usize = 0;
+    for (logits[1], logits[0]) |ro, rt| {
+        for (ro, rt) |o, w| {
+            scale = @max(scale, @abs(w));
+            worst = @max(worst, @abs(o - w));
+        }
+        same += @intFromBool(std.mem.indexOfMax(f32, &ro) == std.mem.indexOfMax(f32, &rt));
+    }
+    std.debug.print("glm53 exl3 quant: the module against sushi's EXL3 module, the prompt and 4 steps: logits max |d| {d:.5} at {d:.3} ({d:.2} bf16 ulp), argmax equal at {d} of 5\n", .{ worst, scale, worst / selfcheck.bf16Ulp(scale), same });
+    try testing.expect(scale > 0.01);
+    try testing.expect(worst <= 4 * selfcheck.bf16Ulp(scale));
 }

@@ -209,36 +209,81 @@ pub const Prompt = struct {
     /// One wave of `rows` rows grouped by expert: x [tokens, HID] bf16, rt u32 [>= 8] (per row: x row, slot row), the
     /// gate|up and down wave tables (i32 [80]) and their threadgroups, the bank kind's arrays -> y bf16 [rows, HID].
     pub fn wave(self: *const Prompt, x: mlx.mlx_array, rt: mlx.mlx_array, rows: usize, tgu: mlx.mlx_array, tgs_gu: u32, tdn: mlx.mlx_array, tgs_dn: u32, bank: Bank) !mlx.mlx_array {
+        var st: Stages = .{};
+        defer st.deinit();
+        for (std.enums.values(Stage)) |at| try self.stage(at, &st, x, rt, rows, tgu, tgs_gu, tdn, tgs_dn, bank);
+        return st.take();
+    }
+
+    pub const Stage = enum { prep, gate_up, mid, down };
+
+    /// A wave's intermediates between its stages (each stage frees its inputs' arrays once launched).
+    pub const Stages = struct {
+        a: [2]mlx.mlx_array = .{ .{}, .{} },
+        z: [2]mlx.mlx_array = .{ .{}, .{} },
+        hm: [1]mlx.mlx_array = .{.{}},
+        y: [1]mlx.mlx_array = .{.{}},
+
+        /// The array the last stage wrote (the bench evaluates it).
+        pub fn last(st: *const Stages, at: Stage) mlx.mlx_array {
+            return switch (at) {
+                .prep => st.a[1],
+                .gate_up => st.z[1],
+                .mid => st.hm[0],
+                .down => st.y[0],
+            };
+        }
+
+        pub fn take(st: *Stages) mlx.mlx_array {
+            const y = st.y[0];
+            st.y[0] = .{};
+            return y;
+        }
+
+        pub fn deinit(st: *Stages) void {
+            free(&st.a);
+            free(&st.z);
+            free(&st.hm);
+            free(&st.y);
+        }
+
+        fn drop(xs: []mlx.mlx_array) void {
+            free(xs);
+            for (xs) |*x| x.* = .{};
+        }
+    };
+
+    /// One stage of a wave (`wave`'s order), its outputs into `st`.
+    pub fn stage(self: *const Prompt, at: Stage, st: *Stages, x: mlx.mlx_array, rt: mlx.mlx_array, rows: usize, tgu: mlx.mlx_array, tgs_gu: u32, tdn: mlx.mlx_array, tgs_dn: u32, bank: Bank) !void {
         const reg = self.b.reg;
         const h: u32 = self.inst.hidden;
         const mi: u32 = self.inst.mini;
         const rc: c_int = @intCast(rows);
-        var a: [2]mlx.mlx_array = .{ .{}, .{} };
-        var z: [2]mlx.mlx_array = .{ .{}, .{} };
-        var hm: [1]mlx.mlx_array = .{.{}};
-        defer free(&a);
-        defer free(&z);
-        defer free(&hm);
-        {
-            const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(h))};
-            const cfg = cfgOf(reg.get(.glm53_pf_prep), self.inst, .{ 32 * h / 128, @intCast(rows * 4), 2 }, &.{ .{ &sh, .float16 }, .{ &sh, .float16 } });
-            try self.b.apply(.glm53_pf_prep, &.{ x, rt, bank.gate.suh, bank.up.suh }, &cfg, &a);
+        switch (at) {
+            .prep => {
+                const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(h))};
+                const cfg = cfgOf(reg.get(.glm53_pf_prep), self.inst, .{ 32 * h / 128, @intCast(rows * 4), 2 }, &.{ .{ &sh, .float16 }, .{ &sh, .float16 } });
+                try self.b.apply(.glm53_pf_prep, &.{ x, rt, bank.gate.suh, bank.up.suh }, &cfg, &st.a);
+            },
+            .gate_up => {
+                const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(mi))};
+                const cfg = cfgOf(reg.get(.glm53_pf_gu), self.inst, .{ 256 * tgs_gu, 1, 1 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
+                try self.b.apply(.glm53_pf_gu, &.{ st.a[0], st.a[1], tgu, bank.gate.trellis, bank.up.trellis }, &cfg, &st.z);
+                Stages.drop(&st.a);
+            },
+            .mid => {
+                const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(mi))};
+                const cfg = cfgOf(reg.get(.glm53_pf_mid), self.inst, .{ 32 * mi / 128, @intCast(rows * 4), 1 }, &.{.{ &sh, .float16 }});
+                try self.b.apply(.glm53_pf_mid, &.{ st.z[0], st.z[1], rt, bank.gate.svh, bank.up.svh, bank.down.suh }, &cfg, &st.hm);
+                Stages.drop(&st.z);
+            },
+            .down => {
+                const sh = [_]c_int{ rc, @intCast(h) };
+                const cfg = cfgOf(reg.get(.glm53_pf_down), self.inst, .{ 512 * tgs_dn, 1, 1 }, &.{.{ &sh, .bfloat16 }});
+                try self.b.apply(.glm53_pf_down, &.{ st.hm[0], tdn, bank.down.trellis, bank.down.svh }, &cfg, &st.y);
+                Stages.drop(&st.hm);
+            },
         }
-        {
-            const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(mi))};
-            const cfg = cfgOf(reg.get(.glm53_pf_gu), self.inst, .{ 256 * tgs_gu, 1, 1 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
-            try self.b.apply(.glm53_pf_gu, &.{ a[0], a[1], tgu, bank.gate.trellis, bank.up.trellis }, &cfg, &z);
-        }
-        {
-            const sh = [_]c_int{rc * 4 * @as(c_int, @intCast(mi))};
-            const cfg = cfgOf(reg.get(.glm53_pf_mid), self.inst, .{ 32 * mi / 128, @intCast(rows * 4), 1 }, &.{.{ &sh, .float16 }});
-            try self.b.apply(.glm53_pf_mid, &.{ z[0], z[1], rt, bank.gate.svh, bank.up.svh, bank.down.suh }, &cfg, &hm);
-        }
-        const sh = [_]c_int{ rc, @intCast(h) };
-        const cfg = cfgOf(reg.get(.glm53_pf_down), self.inst, .{ 512 * tgs_dn, 1, 1 }, &.{.{ &sh, .bfloat16 }});
-        var y: [1]mlx.mlx_array = undefined;
-        try self.b.apply(.glm53_pf_down, &.{ hm[0], tdn, bank.down.trellis, bank.down.svh }, &cfg, &y);
-        return y[0];
     }
 };
 
