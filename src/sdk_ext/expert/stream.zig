@@ -72,6 +72,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             return true;
         }
 
+        /// One slot row of component `c` in `layer`'s slots: the segment of each of a routed id's records, back to back.
+        /// Host rows and MLX rows alike.
+        pub fn rowBytes(layer: *const Layer, c: usize) u64 {
+            return layer.segments[c].length * minisOf(layer);
+        }
+
         pub const HostSlotRows = struct {
             rows: u32,
             row_bytes: [n_components]u64,
@@ -82,9 +88,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var s: HostSlotRows = .{ .rows = rows, .row_bytes = undefined, .banks = undefined };
                 var n: usize = 0;
                 errdefer for (s.banks[0..n]) |b| std.heap.page_allocator.free(b);
-                for (layer.segments, 0..) |seg, c| {
-                    s.row_bytes[c] = seg.length * minisOf(layer);
-                    const bytes = std.math.mul(u64, seg.length, rows) catch return error.OutOfMemory;
+                for (layer.segments, 0..) |_, c| {
+                    s.row_bytes[c] = rowBytes(layer, c);
+                    const bytes = std.math.mul(u64, s.row_bytes[c], rows) catch return error.OutOfMemory;
                     s.banks[c] = try std.heap.page_allocator.alloc(u8, @intCast(bytes));
                     n += 1;
                 }
@@ -140,7 +146,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
                     try mlx.check(mlx.mlx_zeros(&b.arrays[c], &shape, seg.rank + 1, dtype, stream));
-                    b.row_bytes[c] = seg.length * minisOf(layer);
+                    b.row_bytes[c] = rowBytes(layer, c);
                 }
                 return b;
             }
@@ -156,7 +162,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
                     if (dsv41_alloc_uninit(&b.arrays[c], &shape, seg.rank + 1, dtype) != 0) return error.MlxUnfilledAlloc;
-                    b.row_bytes[c] = seg.length * minisOf(layer);
+                    b.row_bytes[c] = rowBytes(layer, c);
                 }
                 try b.bind();
                 return b;

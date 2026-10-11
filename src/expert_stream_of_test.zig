@@ -174,3 +174,85 @@ test "dsv41 bank contract: a bank whose gate/up span exceeds the pool's 9 MiB st
     defer s.deinit();
     try testing.expectEqual(StreamOf(MxBank, false).stagingBytes(&bank), s.pool.staging.len);
 }
+
+/// MxBank's records as GLM-5.3's EXL3 bank holds them: a routed id's `minis` records adjacent in the file at
+/// `record_bytes`, and in its slot's rows (`Layer.minis`).
+const MinisBank = struct {
+    pub const n_components = MxBank.n_components;
+    pub const gu_components = MxBank.gu_components;
+    pub const Records = MxBank.Records;
+    pub const Component = MxBank.Component;
+    pub const BankArrays = MxBank.BankArrays;
+    pub const routed_top_k = MxBank.routed_top_k;
+    pub const mlxDtype = MxBank.mlxDtype;
+    pub const bankArraysOf = MxBank.bankArraysOf;
+    pub const Layer = struct { logical_bytes: u64, record_bytes: u64, minis: u32, segments: [n_components]MxBank.Segment };
+
+    pub const Bank = struct {
+        layers: []Layer,
+        n_experts: u32,
+        sidecar: sdk_ext.expert.UncachedFd,
+
+        /// The id's first record; its others follow at `record_bytes`.
+        pub fn recordOffset(self: *const Bank, layer: u32, expert: u32) u64 {
+            const l = &self.layers[layer];
+            return (@as(u64, layer) * self.n_experts + expert) * l.minis * l.record_bytes;
+        }
+
+        pub fn spans(self: *const Bank, layer: u32, expert: u32) MxBank.Spans {
+            const off = self.recordOffset(layer, expert);
+            return .{ .gu_offset = off, .down_offset = off + self.layers[layer].segments[gu_components].offset };
+        }
+    };
+};
+
+const MinisOf = StreamOf(MinisBank, false);
+
+test "dsv41 bank contract: host slot rows of a bank of 4 records per routed id: each bank holds all its rows, the last persistent and the last transient row written and read back" {
+    const a = testing.allocator;
+    const minis = 4;
+    const mx = MxBank.layerOf(256, 128);
+    const geom: MinisBank.Layer = .{ .logical_bytes = mx.logical_bytes, .record_bytes = std.mem.alignForward(u64, mx.logical_bytes, 4096), .minis = minis, .segments = mx.segments };
+    var layers = [_]MinisBank.Layer{ geom, geom };
+    const n_experts: u32 = 12;
+    const image = try a.alloc(u8, layers.len * n_experts * minis * geom.record_bytes);
+    defer a.free(image);
+    for (image, 0..) |*b, k| b.* = @truncate(k *% 2654435761 >> 9);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = image });
+    var root: [512]u8 = undefined;
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/experts.bin", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    defer a.free(path);
+    const fd = try sdk_ext.expert.openUncached(path.ptr, null);
+    defer fd.close();
+    const bank: MinisBank.Bank = .{ .layers = &layers, .n_experts = n_experts, .sidecar = fd };
+
+    // Layer 0 has 3 persistent rows; layer 1 has none, so its misses take the transient rows.
+    const s = try MinisOf.Stream.init(a, &bank, .{ .rows = &.{ 3, 0 }, .max_route_ids = 4, .transient_rows = 4, .records_per_part = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 } });
+    defer s.deinit();
+    // A row is a segment of each of the 4 records, back to back: each component's bank is its rows times that.
+    for ([_]*const MinisOf.Rows{ &s.layers[0].base, &s.transient }) |rows| {
+        for (rows.backing.host.banks, geom.segments) |b, seg| try testing.expectEqual(rows.rows * minis * seg.length, b.len);
+    }
+    // Layer 0's three misses fill its rows 0, 1 and 2; layer 1's four take transient rows 0 to 3.
+    const Case = struct { layer: u32, ids: []const u16, last: u32 };
+    for ([_]Case{ .{ .layer = 0, .ids = &.{ 7, 2, 10 }, .last = 2 }, .{ .layer = 1, .ids = &.{ 5, 0, 11, 3 }, .last = 3 } }) |x| {
+        const r = try s.route(x.layer, x.ids, &.{});
+        for (0..r.n_parts) |p| {
+            try s.waitGu(r, @intCast(p));
+            try s.waitDown(r, @intCast(p));
+        }
+        try testing.expect(std.mem.indexOfScalar(u32, r.plan.slotsOf(), x.last) != null);
+        for (x.ids, r.plan.slotsOf()) |e, slot| {
+            const off = bank.recordOffset(x.layer, e);
+            for (geom.segments, 0..) |seg, c| {
+                const row = s.slotRow(x.layer, slot, @enumFromInt(c));
+                try testing.expectEqual(minis * seg.length, row.len);
+                for (0..minis) |mi| try testing.expectEqualSlices(u8, image[off + mi * geom.record_bytes + seg.offset ..][0..seg.length], row[mi * seg.length ..][0..seg.length]);
+            }
+        }
+        s.release(r);
+    }
+    try s.flush();
+}
