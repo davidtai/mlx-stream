@@ -39,6 +39,95 @@ var rt_eval_ns: u64 = 0;
 var rt_eval_max: u64 = 0;
 var rt_sync_ns: u64 = 0;
 
+/// DIAGNOSTIC (GPU timeline): every command buffer the prompt pass commits, with Metal's GPU start and end (the
+/// profile build's commit hook, csrc/dsv41_cb_timeline.mm), tagged with the site whose eval committed it; after the
+/// prompt, the GPU's busy and idle time, each idle gap charged to the site of the buffer that ended it.
+pub const Site = enum(u8) { none = 0, trunk = 1, group = 2, drain = 3, tail = 4, after = 5, probe = 6 };
+const Row = @import("dsv41_verify_timeline.zig").Row;
+const tl_cap: u32 = 1 << 16;
+var tl_rows: [tl_cap]Row = undefined;
+var tl_on: bool = false;
+extern fn dsv41tl_mlx_buffer(s: mlx.mlx_stream) ?*anyopaque;
+extern fn dsv41tl_install(buf: ?*anyopaque, rows: [*]Row, cap: u32) c_int;
+extern fn dsv41tl_tag(tag: u64) void;
+extern fn dsv41tl_counts(out: *[3]u32) void;
+
+/// The site of the next commits: routed layer `layer`, bank layer `side`, group `idx`.
+pub inline fn tag(site: Site, layer: u32, side: u32, idx: usize) void {
+    if (comptime !enabled) return;
+    if (!tl_on) return;
+    dsv41tl_tag((@as(u64, layer) + 1) << 24 | @as(u64, side) << 16 | @as(u64, @intFromEnum(site)) << 8 | @as(u64, @min(idx, 255)));
+}
+
+fn summarize(rs: []const Row, dropped: u32) void {
+    // Classes: the site, and for groups: 0 the first group of bank layer 0, 1 the first of bank layer 1, 2 the rest.
+    const n_cls = 10;
+    const names = [n_cls][]const u8{ "untagged", "trunk", "group0 side0", "group0 side1", "groups after", "drain", "tail", "after", "probe", "other" };
+    var busy: [n_cls]u64 = @splat(0);
+    var gap: [n_cls]u64 = @splat(0);
+    var gap_n: [n_cls]u64 = @splat(0);
+    var gap_max: [n_cls]u64 = @splat(0);
+    var bufs: [n_cls]u64 = @splat(0);
+    var host_late: [n_cls]u64 = @splat(0);
+    var end_max: u64 = 0;
+    var first: u64 = 0;
+    var busy_all: u64 = 0;
+    var bad: u64 = 0;
+    for (rs, 0..) |r, i| {
+        if (r.gpu_end <= r.gpu_start or r.gpu_start == 0) {
+            bad += 1;
+            continue;
+        }
+        const site: u8 = @truncate(r.tag >> 8);
+        const side: u8 = @truncate(r.tag >> 16);
+        const idx: u8 = @truncate(r.tag);
+        const cls: usize = switch (site) {
+            0 => 0,
+            1 => 1,
+            2 => if (idx == 0) (if (side == 0) @as(usize, 2) else 3) else 4,
+            3 => 5,
+            4 => 6,
+            5 => 7,
+            6 => 8,
+            else => 9,
+        };
+        bufs[cls] += 1;
+        busy[cls] += r.gpu_end - r.gpu_start;
+        if (i == 0 or first == 0) {
+            first = r.gpu_start;
+            end_max = r.gpu_end;
+            busy_all += r.gpu_end - r.gpu_start;
+            continue;
+        }
+        if (r.gpu_start > end_max) {
+            const d = r.gpu_start - end_max;
+            gap[cls] += d;
+            gap_n[cls] += 1;
+            gap_max[cls] = @max(gap_max[cls], d);
+            // The host committed it after the GPU had gone idle: the host's own time made the gap.
+            if (r.host_commit > end_max) host_late[cls] += r.host_commit - end_max;
+            busy_all += r.gpu_end - r.gpu_start;
+        } else if (r.gpu_end > end_max) {
+            busy_all += r.gpu_end - end_max;
+        }
+        end_max = @max(end_max, r.gpu_end);
+    }
+    const span = end_max -| first;
+    const f = struct {
+        fn s(x: u64) f64 {
+            return @as(f64, @floatFromInt(x)) / 1e9;
+        }
+        fn ms(x: u64) f64 {
+            return @as(f64, @floatFromInt(x)) / 1e6;
+        }
+    };
+    log.info("glm_moe_dsa profile timeline: {d} command buffers ({d} dropped, {d} without GPU times), GPU span {d:.3} s, busy {d:.3} s, idle {d:.3} s\n", .{ rs.len, dropped, bad, f.s(span), f.s(busy_all), f.s(span -| busy_all) });
+    for (0..n_cls) |c| {
+        if (bufs[c] == 0) continue;
+        log.info("glm_moe_dsa profile timeline:   {s}: {d} buffers, busy {d:.3} s; idle before them {d:.3} s in {d} gaps (largest {d:.3} ms), of it {d:.3} s committed after the GPU went idle\n", .{ names[c], bufs[c], f.s(busy[c]), f.s(gap[c]), gap_n[c], f.ms(gap_max[c]), f.s(host_late[c]) });
+    }
+}
+
 pub const Stamp = if (enabled) u64 else void;
 
 pub inline fn now() Stamp {
@@ -73,6 +162,10 @@ pub fn begin(g: *ops.MlxOps) void {
     if (comptime !enabled) return;
     w_begin = g.waits;
     last_w = g.waits;
+    const rc = dsv41tl_install(dsv41tl_mlx_buffer(g.s), &tl_rows, tl_cap);
+    tl_on = rc == 0;
+    if (!tl_on) log.info("glm_moe_dsa profile timeline: not installed ({d})\n", .{rc});
+    tag(.trunk, 0, 0, 0);
 }
 
 /// At every 8th layer, after its eval (the GPU idle): one tiny eval and a synchronize timed; their waits left out of
@@ -83,6 +176,7 @@ pub fn roundTrip(g: *ops.MlxOps, l: u32) !void {
     const one = [_]f32{1.0};
     const x = try g.hostArray(std.mem.sliceAsBytes(&one), &.{1}, .float32);
     const y = try g.add(x, x);
+    tag(.probe, l, 0, 0);
     const t0 = now();
     try g.evalAll(&.{y});
     const t1 = now();
@@ -114,6 +208,19 @@ fn sec(x: u64) f64 {
 /// The prompt pass's split, one line, then the counters zeroed.
 pub fn report(tokens: u64, g: *ops.MlxOps) void {
     if (comptime !enabled) return;
+    if (tl_on) {
+        dsv41tl_tag(0);
+        _ = mlx.mlx_synchronize(g.s);
+        var k: [3]u32 = undefined;
+        const tw = now();
+        while (true) {
+            dsv41tl_counts(&k);
+            if (k[1] >= @min(k[0], tl_cap) or now() - tw > 5 * std.time.ns_per_s) break;
+            std.Thread.yield() catch {};
+        }
+        summarize(tl_rows[0..@min(k[0], tl_cap)], k[2]);
+        tl_on = false;
+    }
     {
         var in_phases: u64 = 0;
         for (waits) |x| in_phases += x;

@@ -686,6 +686,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         const l: u32 = @intCast(li);
         const m = g.mark();
         if (pt.enabled and prompt) pt.start();
+        if (pt.enabled and prompt) pt.tag(.trunk, l, 0, 0);
         // The predictor runs only where the read-ahead has empty rows to fill.
         if (rt.read_ahead and wide and lw.bank_layer != null and ex.readAheadRoom(lw.bank_layer.?) > 0) {
             try predictSeed(g, a, c, lw, h, rows, &seed);
@@ -719,14 +720,15 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             try evals.append(a, next_h);
             try evals.appendSlice(a, cache.buffers(l, &bufs));
             for (carry.topk) |t| if (t) |x_| try evals.append(a, x_);
+            if (pt.enabled) pt.tag(.tail, l, 0, 0);
             try g.asyncEval(evals.items);
             if (pt.enabled) _ = try pt.phase(g, &.{}, .rest);
-            if (pt.enabled) try pt.roundTrip(g, l);
         }
         g.release(h);
         h = next_h;
         g.resetTo(m);
     }
+    if (pt.enabled and prompt) pt.tag(.after, 0, 0, 0);
     cache.commit(rows);
     if (!want.verify and !want.hidden) return .{ .logits = g.keep(try head(g, c, w, h)) };
     // Row by row the same as `head`: the final norm per row, the head over the rows wanted.
