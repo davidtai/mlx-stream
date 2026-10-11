@@ -26,6 +26,10 @@ const dsa = sdk.dsa;
 const topk_mod = @import("glm_moe_dsa_topk.zig");
 
 pub const G = ops.MlxOps;
+/// MEASUREMENT ONLY (exp/glm-trunk-bench): the trunk bench's stage label.
+inline fn at(comptime label: []const u8) void {
+    ops.bench_stage = label;
+}
 pub const T = G.T;
 pub const Cache = cache_mod.Cache(G);
 
@@ -295,7 +299,9 @@ pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, 
     }
     const ih: f64 = @floatFromInt(c.index_n_heads);
     const ihd: f64 = @floatFromInt(c.index_head_dim);
+    at("select.wts");
     const wts = try g.mul(try g.astype(try linear(g, x, ix.weights_proj), .float32), try g.scalar(std.math.pow(f64, ih, -0.5) * std.math.pow(f64, ihd, -0.5), .float32));
+    at("select.k32");
     const k32 = try g.astype(ik_all, .float32);
     for (0..carry.nBlocks()) |i| {
         const b0 = carry.bounds[i];
@@ -306,14 +312,18 @@ pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, 
             continue;
         }
         const m = g.mark();
+        at("select.scores");
         const qb = try g.astype(try rowSlice(g, iq, @intCast(b0), @intCast(b1)), .float32);
         var s = try g.matmul(qb, try swapLast(g, try rowSlice(g, k32, 0, @intCast(nb))));
+        at("select.relu_wsum");
         s = try g.maximum(s, try g.scalar(0, .float32));
         const wb = try g.slice(wts, &.{ @intCast(b0), 0 }, &.{ @intCast(b1), @intCast(c.index_n_heads) }, &.{ 1, 1 });
         const w4 = try g.reshape(try g.transposeAxes(wb, &.{ 1, 0 }), &.{ 1, @intCast(c.index_n_heads), @intCast(b1 - b0), 1 });
         s = try g.sum(try g.mul(s, w4), 1, true);
+        at("select.mask");
         if (rows > 1) s = try g.where(try causalMask(g, start + b0, b1 - b0, nb), s, try g.scalar(-std.math.inf(f64), .float32));
         const kth: c_int = @intCast(nb - topk);
+        at("select.argpartition");
         const idx = try lastSlice(g, try g.argpartition(s, kth, -1), kth, @intCast(nb));
         carry.set(g, i, idx);
         g.resetTo(m);
@@ -401,9 +411,15 @@ pub fn queryOf(g: *G, c: *const glm.Config, lw: *const Layer, x: T, start: u32, 
     const qhd: c_int = @intCast(c.qHeadDim());
     const nope: c_int = @intCast(c.qk_nope_head_dim);
     const n: c_int = @intCast(rows);
-    const qr = try rmsNorm(g, try qlinear(g, x, lw.q_a), lw.q_a_norm, glm.latent_norm_eps);
+    at("q.q_a");
+    const qa_ = try qlinear(g, x, lw.q_a);
+    at("q.q_a_norm");
+    const qr = try rmsNorm(g, qa_, lw.q_a_norm, glm.latent_norm_eps);
+    at("q.q_b");
     const q = try g.transposeAxes(try g.reshape(try qlinear(g, qr, lw.q_b), &.{ 1, n, heads, qhd }), &.{ 0, 2, 1, 3 });
+    at("q.rope");
     var out: Query = .{ .qr = qr, .q_nope = try lastSlice(g, q, 0, nope), .q_pe = try rope(g, try lastSlice(g, q, nope, qhd), c.qk_rope_head_dim, c.rope_theta, start) };
+    at("q.indexer");
     if (lw.indexer) |ix| out.iq = try rope(g, try g.transposeAxes(try g.reshape(try linear(g, qr, ix.wq_b), &.{ 1, n, @intCast(c.index_n_heads), @intCast(c.index_head_dim) }), &.{ 0, 2, 1, 3 }), c.qk_rope_head_dim, c.rope_theta, start);
     return out;
 }
@@ -418,10 +434,15 @@ pub fn keysOf(g: *G, c: *const glm.Config, lw: *const Layer, x: T, start: u32, r
     const rp: c_int = @intCast(rd);
     const kvr: c_int = @intCast(c.kv_lora_rank);
     const n: c_int = @intCast(rows);
+    at("kv.kv_a");
     const ckv = try qlinear(g, x, lw.kv_a);
+    at("kv.latent_norm");
     const latent = try rmsNorm(g, try lastSlice(g, ckv, 0, kvr), lw.kv_a_norm, glm.latent_norm_eps);
+    at("kv.k_pe_rope");
     const k_pe = try rope(g, try g.reshape(try lastSlice(g, ckv, kvr, kvr + rp), &.{ 1, 1, n, rp }), rd, c.rope_theta, start);
+    at("kv.reshape");
     var out: Keys = .{ .latent = try g.reshape(latent, &.{ 1, n, kvr }), .k_pe = try g.reshape(k_pe, &.{ 1, n, rp }) };
+    at("kv.indexer");
     if (lw.indexer) |ix| {
         const ihd: c_int = @intCast(c.index_head_dim);
         const ik = try rope(g, try g.reshape(try layerNorm(g, try linear(g, x, ix.wk), ix.k_norm_w, ix.k_norm_b, glm.index_norm_eps), &.{ 1, 1, n, ihd }), rd, c.rope_theta, start);
@@ -445,13 +466,16 @@ fn absorbedLatent(g: *G, c: *const glm.Config, q_lat: T, q_pe: T, kv: T, pe: T, 
     const scale64: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(c.qHeadDim())));
     var kv_sel = kv;
     var pe_sel = pe;
+    at("attn.gather");
     if (topk) |t| {
         const kk: c_int = @intCast(c.index_topk);
         const idx = try g.reshape(t, &.{ 1, 1, kk, 1 });
         kv_sel = try g.takeAlongAxis(kv, try g.broadcastTo(idx, &.{ 1, 1, kk, kvr }), 2);
         pe_sel = try g.takeAlongAxis(pe, try g.broadcastTo(idx, &.{ 1, 1, kk, rp }), 2);
     }
+    at("attn.pe_scores");
     const scores = try g.matmul(try g.mul(q_pe, try g.scalar(scale64, g.dtypeOf(q_pe))), try swapLast(g, pe_sel));
+    at("attn.sdpa");
     return sdpa(g, q_lat, kv_sel, kv_sel, @floatCast(scale64), scores);
 }
 
@@ -469,7 +493,9 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     const n: c_int = @intCast(rows);
     const q = try queryOf(g, c, lw, x, start, rows);
     const k = try keysOf(g, c, lw, x, start, rows);
+    at("kv.append");
     try cache.append(g, l, k.latent, k.k_pe, k.index);
+    at("kv.views");
     const kv_all = try cache.latentView(g, l);
     const pe_all = try cache.ropeView(g, l);
     // forwardRows' prompt: a verify passes `.per_row`.
@@ -499,16 +525,21 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         // `absorbedRow` per row, the rows through embed_q and unembed_out in one launch each: the rows on the leading
         // axis, so each is still its own one-row product (the batch only moves the kernel's pointers: the same sums).
         const kvr: c_int = @intCast(c.kv_lora_rank);
+        at("attn.embed_q");
         const q_lat = try qlinear(g, try g.transposeAxes(q.q_nope, &.{ 2, 1, 0, 3 }), lw.embed_q);
         var outs: std.ArrayList(T) = .empty;
         defer outs.deinit(carry.a);
         for (0..rows) |i| {
             const r: c_int = @intCast(i);
             const nk: c_int = @intCast(start + i + 1);
+            at("attn.row_slices");
             const ql = try g.slice(q_lat, &.{ r, 0, 0, 0 }, &.{ r + 1, heads, 1, kvr }, &.{ 1, 1, 1, 1 });
             try outs.append(carry.a, try absorbedLatent(g, c, ql, try rowSlice(g, q.q_pe, r, r + 1), try rowSlice(g, kv_all, 0, nk), try rowSlice(g, pe_all, 0, nk), carry.topk[i]));
         }
-        out = try g.transposeAxes(try qlinear(g, try g.concat(outs.items, 0), lw.unembed_out), &.{ 2, 1, 0, 3 });
+        at("attn.concat");
+        const cat = try g.concat(outs.items, 0);
+        at("attn.unembed_out");
+        out = try g.transposeAxes(try qlinear(g, cat, lw.unembed_out), &.{ 2, 1, 0, 3 });
     } else {
         // The prompt form: the latent expanded per head (k through embed_q, v through unembed_out), in query blocks.
         const scale64: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(qhd)));
@@ -546,13 +577,24 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         outs.clearRetainingCapacity();
     }
     if (pt.enabled and prompt_form) pt.chargeAttn(lw.indexer != null, try pt.phase(g, &.{out}, .attn));
+    at("o.reshape");
     const o2 = try g.reshape(try g.transposeAxes(out, &.{ 0, 2, 1, 3 }), &.{ n, heads * @as(c_int, @intCast(c.v_head_dim)) });
+    at("o_proj");
     return qlinear(g, o2, lw.o);
 }
 
 /// `down(silu(gate(x)) * up(x))` (the dense MLP and the shared expert).
 pub fn mlp(g: *G, m: Mlp, x: T) !T {
-    return qlinear(g, try g.mul(try g.silu(try qlinear(g, x, m.gate)), try qlinear(g, x, m.up)), m.down);
+    at("shared.gate");
+    const ga = try qlinear(g, x, m.gate);
+    at("shared.silu");
+    const sg = try g.silu(ga);
+    at("shared.up");
+    const up = try qlinear(g, x, m.up);
+    at("shared.mul");
+    const hm = try g.mul(sg, up);
+    at("shared.down");
+    return qlinear(g, hm, m.down);
 }
 
 /// One routed layer's routing: the top-k expert ids `[n, k]` (int32) and their weights `[n, k]` (f32).
@@ -562,7 +604,9 @@ pub const Routing = struct { indices: T, weights: T };
 /// top-k by argpartition, the sigmoid scores of the chosen normalized (`norm_topk_prob`) and scaled.
 pub fn route(g: *G, c: *const glm.Config, r: Router, x: T) !Routing {
     const k: c_int = @intCast(c.n_experts_per_tok);
+    at("route.logits");
     const logits = try g.matmul(try g.astype(x, .float32), try g.transpose(try g.astype(r.w, .float32)));
+    at("route.chain");
     const sig = try g.sigmoid(logits);
     const sc = try g.add(sig, r.bias);
     const inds = try lastSlice(g, try g.argpartition(try g.neg(sc), k - 1, -1), 0, k);
@@ -575,6 +619,7 @@ pub fn route(g: *G, c: *const glm.Config, r: Router, x: T) !Routing {
 /// The routing criterion of router `r` on `x` (sigmoid + bias, f32 `[n, n_experts]`): the lookahead's predictor of the
 /// next routed layer.
 pub fn routerScores(g: *G, r: Router, x: T) !T {
+    at("next_scores");
     const logits = try g.matmul(try g.astype(x, .float32), try g.transpose(try g.astype(r.w, .float32)));
     return g.astype(try g.add(try g.sigmoid(logits), r.bias), .float32);
 }
@@ -775,6 +820,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
     defer seed.deinit(a);
     const m0 = g.mark();
     defer g.resetTo(m0);
+    at("embed");
     var h = g.keep(try embed(g, w, ids));
     defer g.release(h);
     const wide = rows * c.n_experts_per_tok > rt.max_route_ids;
@@ -795,14 +841,18 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         if (prompt and wide and lw.bank_layer != null and rows * c.n_experts_per_tok >= 8 * c.n_routed_experts) try ex.stageMisses(lw.bank_layer.?);
         errdefer ex.dropStaged();
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{}, .seed);
+        at("input_norm");
         const x = try rmsNorm(g, h, lw.input_norm, c.rms_norm_eps);
-        const h1 = try g.add(h, try attention(g, c, lw, l, x, start, rows, cache, &carry, if (want.verify) .per_row else .auto, rt.dsa));
+        const att_ = try attention(g, c, lw, l, x, start, rows, cache, &carry, if (want.verify) .per_row else .auto, rt.dsa);
+        at("residual1");
+        const h1 = try g.add(h, att_);
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{h1}, .oproj);
         if (probe) |p| {
             try g.evalAll(&.{h1});
             p.mark(l, .attn);
         }
         defer if (probe) |p| p.mark(l, .tail);
+        at("post_norm");
         const x2 = try rmsNorm(g, h1, lw.post_norm, c.rms_norm_eps);
         const f = if (lw.dense) |d| try mlp(g, d, x2) else blk: {
             const r = try route(g, c, lw.router.?, x2);
@@ -813,9 +863,12 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
             const routed = try ex.call(g, lw.bank_layer.?, x2, r.indices, r.weights, next, if (shared) |sh| &[_]T{sh} else &.{});
             if (pt.enabled and prompt) _ = try pt.phase(g, &.{routed}, .routed);
             if (probe) |p| p.mark(l, .moe);
-            break :blk try g.add(routed, shared orelse try mlp(g, lw.shared.?, x2));
+            const sh2 = shared orelse try mlp(g, lw.shared.?, x2);
+            at("residual2");
+            break :blk try g.add(routed, sh2);
         };
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{f}, .mlp);
+        at("residual2");
         const next_h = g.keep(try g.add(h1, f));
         if (prompt) {
             var bufs: [3]T = undefined;
@@ -832,6 +885,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         g.resetTo(m);
     }
     cache.commit(rows);
+    at("head");
     if (!want.verify and !want.hidden) return .{ .logits = g.keep(try head(g, c, w, h)) };
     // Row by row the same as `head`: the final norm per row, the head over the rows wanted.
     const normed = try rmsNorm(g, h, w.norm, c.rms_norm_eps);

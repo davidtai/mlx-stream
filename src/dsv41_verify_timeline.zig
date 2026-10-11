@@ -21,7 +21,7 @@ pub const max_buffers = 1 << 18;
 
 /// One committed command buffer (the shim's `Dsv41tlRow`). Times: mach_absolute_time ns.
 /// `queue`: 1 for the queue of the buffer the install saw (MLX's stream), 0 for another queue.
-pub const Row = extern struct { host_commit: u64 = 0, gpu_start: u64 = 0, gpu_end: u64 = 0, host_done: u64 = 0, tag: u64 = 0, status: u64 = 0, queue: u64 = 0 };
+pub const Row = extern struct { host_commit: u64 = 0, gpu_start: u64 = 0, gpu_end: u64 = 0, host_done: u64 = 0, tag: u64 = 0, status: u64 = 0, queue: u64 = 0, dispatches: u64 = 0, barriers: u64 = 0 };
 
 pub const Phase = enum(u8) { draft = 1, verify = 2, rest = 3 };
 
@@ -560,7 +560,7 @@ pub fn writeJson(w: *std.Io.Writer) !void {
 }
 
 test "dsv41 verify timeline: a default build stamps nothing and links no shim; the storage bound is static" {
-    try std.testing.expectEqual(@as(usize, (1 << 18) * 56 + 1024 * (64 * @sizeOf(Layer) + 16) + (1 << 17) * 32), storage_bytes);
+    try std.testing.expectEqual(@as(usize, (1 << 18) * 72 + 1024 * (64 * @sizeOf(Layer) + 16) + (1 << 17) * 32), storage_bytes);
     try std.testing.expectError(error.TimelineCycles, bound(1026, 40));
     try std.testing.expectError(error.TimelineLayers, bound(1024, 65));
     try bound(1024, 40);

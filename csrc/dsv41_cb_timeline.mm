@@ -35,6 +35,9 @@ static std::atomic<uint64_t> g_tagged{0};
 static std::atomic<uint64_t> g_other_queue{0};
 /* The thread's current outer call: the object whose -commit is running and how deep along its chain. A -commit of
  * another object made from inside it starts at depth 0 (its own outermost call, recorded). */
+/* The encoder hook's counts since the previous outermost commit (MLX encodes and commits on one thread per stream). */
+static std::atomic<uint64_t> g_disp{0};
+static std::atomic<uint64_t> g_barr{0};
 static thread_local int t_depth = 0;
 static thread_local id t_self = nil;
 /* install / rehook run on one thread (the inference thread): hook_chain is not reentrant. Plain statics: the first
@@ -69,6 +72,8 @@ static void tl_commit(id self, SEL sel) {
   if (orig == NULL) abort();   /* dispatch reached the override through a hooked class: the original exists */
   if (depth == 0) {
     g_calls.fetch_add(1, std::memory_order_relaxed);
+    uint64_t disp = g_disp.exchange(0, std::memory_order_relaxed);
+    uint64_t barr = g_barr.exchange(0, std::memory_order_relaxed);
     uint64_t tag = g_tag.load(std::memory_order_relaxed);
     if (tag != 0) {
       g_tagged.fetch_add(1, std::memory_order_relaxed);
@@ -80,6 +85,8 @@ static void tl_commit(id self, SEL sel) {
         r->tag = tag;
         r->queue = (uint64_t)same;
         r->host_commit = dsv41tl_now();
+        r->dispatches = disp;
+        r->barriers = barr;
         [(id<MTLCommandBuffer>)self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
           r->gpu_start = (uint64_t)(cb.GPUStartTime * 1e9);
           r->gpu_end = (uint64_t)(cb.GPUEndTime * 1e9);
@@ -138,6 +145,57 @@ static int hook_chain(id obj) {
   if (!found) return -2;
   if (g_nseen < TL_MAX_SEEN) g_seen[g_nseen++] = dyn;
   return added;
+}
+
+// The compute encoder's dispatches and memory barriers, counted: each selector's implementation along the encoder's
+// class chain replaced by a counting trampoline that calls the original.
+typedef void (*DispTgImp)(id, SEL, MTLSize, MTLSize);
+typedef void (*BarScopeImp)(id, SEL, NSUInteger);
+typedef void (*BarResImp)(id, SEL, const id *, NSUInteger);
+static DispTgImp g_orig_tg = NULL;
+static DispTgImp g_orig_th = NULL;
+static BarScopeImp g_orig_bs = NULL;
+static BarResImp g_orig_br = NULL;
+static void tl_disp_tg(id self, SEL sel, MTLSize a, MTLSize b) {
+  g_disp.fetch_add(1, std::memory_order_relaxed);
+  g_orig_tg(self, sel, a, b);
+}
+static void tl_disp_th(id self, SEL sel, MTLSize a, MTLSize b) {
+  g_disp.fetch_add(1, std::memory_order_relaxed);
+  g_orig_th(self, sel, a, b);
+}
+static void tl_bar_scope(id self, SEL sel, NSUInteger scope) {
+  g_barr.fetch_add(1, std::memory_order_relaxed);
+  g_orig_bs(self, sel, scope);
+}
+static void tl_bar_res(id self, SEL sel, const id *res, NSUInteger n) {
+  g_barr.fetch_add(1, std::memory_order_relaxed);
+  g_orig_br(self, sel, res, n);
+}
+
+static int hook_encoder(id cmdbuf) {
+  if (g_orig_tg != NULL) return 0;
+  id<MTLCommandQueue> q = [(id<MTLCommandBuffer>)cmdbuf commandQueue];
+  id<MTLCommandBuffer> tmp = [q commandBuffer];
+  id<MTLComputeCommandEncoder> enc = [tmp computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+  if (enc == nil) return -5;
+  Class c = object_getClass(enc);
+  [enc endEncoding];
+  Method m;
+  if ((m = class_getInstanceMethod(c, @selector(dispatchThreadgroups:threadsPerThreadgroup:))) == NULL) return -6;
+  g_orig_tg = (DispTgImp)method_setImplementation(m, (IMP)tl_disp_tg);
+  if ((m = class_getInstanceMethod(c, @selector(dispatchThreads:threadsPerThreadgroup:))) != NULL)
+    g_orig_th = (DispTgImp)method_setImplementation(m, (IMP)tl_disp_th);
+  if ((m = class_getInstanceMethod(c, @selector(memoryBarrierWithScope:))) != NULL)
+    g_orig_bs = (BarScopeImp)method_setImplementation(m, (IMP)tl_bar_scope);
+  if ((m = class_getInstanceMethod(c, @selector(memoryBarrierWithResources:count:))) != NULL)
+    g_orig_br = (BarResImp)method_setImplementation(m, (IMP)tl_bar_res);
+  return 0;
+}
+
+int dsv41tl_hook_encoder(void *cmdbuf) {
+  if (cmdbuf == NULL) return -1;
+  return hook_encoder((id)cmdbuf);
 }
 
 int dsv41tl_install(void *cmdbuf, Dsv41tlRow *rows, uint32_t cap) {
