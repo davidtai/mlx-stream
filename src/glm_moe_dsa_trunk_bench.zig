@@ -1,7 +1,7 @@
 //! MEASUREMENT ONLY (exp/glm-trunk-bench, never merged): GLM-5.3's decode trunk at the verify's rows on random weights
 //! of the release's shapes (the projections 8-bit affine as the pack holds them, the indexer and the router bf16, the
 //! router's bias f32), each layer's KV lanes filled to the coding workload's mid-decode context. A PROFILE build
-//! (`plugin_profile`, the command-buffer timeline shim) with `GLM53_TRUNK_BENCH=<out.jsonl>` runs it; else it skips.
+//! (`plugin_profile`, the command-buffer timeline shim) runs it: the records to `GLM53_TRUNK_BENCH=<out.jsonl>`, else to stderr.
 //!
 //! `graph.forwardRows` in the verify's form over `n_layers` routed layers (full and shared in the release's 1:3
 //! schedule) and a stub driver that does the decode lane's trunk side: the routing barrier (the ids and the next
@@ -213,7 +213,8 @@ fn rowsSummary(rs: []const Row) struct { n: usize, gpu: u64, span: u64, disp: u6
 
 test "glm trunk bench: the verify's trunk per layer, by command buffer and op by op (GLM53_TRUNK_BENCH)" {
     if (comptime !timeline.enabled) return error.SkipZigTest;
-    const out_path = std.c.getenv("GLM53_TRUNK_BENCH") orelse return error.SkipZigTest;
+    // Unset: the records go to stderr (suites.sh copies the build log back), one line each after a marker.
+    const out_path = std.c.getenv("GLM53_TRUNK_BENCH");
     const a = std.heap.c_allocator;
     const reps: usize = if (std.c.getenv("GLM53_TRUNK_BENCH_REPS")) |r| try std.fmt.parseInt(usize, std.mem.span(r), 10) else 6;
     const text = try configJson(a);
@@ -394,6 +395,8 @@ test "glm trunk bench: the verify's trunk per layer, by command buffer and op by
             }
         }
     }
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(out_path), .data = aw.written() });
-    std.debug.print("glm trunk bench: written to {s}\n", .{out_path});
+    if (out_path) |op| {
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = std.mem.span(op), .data = aw.written() });
+        std.debug.print("glm trunk bench: written to {s}\n", .{op});
+    } else std.debug.print("glm trunk bench records:\n{s}glm trunk bench records end\n", .{aw.written()});
 }
