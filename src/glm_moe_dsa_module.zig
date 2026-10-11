@@ -762,6 +762,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             drafts: [mtp_mod.max_depth]u32 = undefined,
             /// `mtp_depth` x vocab.
             logits: ?[]f32 = null,
+            /// The host's waits on the GPU (`G.waits`) from the verify's eval to the lane's pend: the decision's read
+            /// and the commit.
+            decision_waits: u64 = 0,
         };
 
         /// `mtpRound` with a test's `probe`.
@@ -790,14 +793,19 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const out = try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[0 .. depth + 1], len, &self.cache, &self.ex, self.routes, .{ .verify = true, .hidden = true });
             defer self.g.release(out.logits);
             defer self.g.release(out.hidden.?);
-            try self.g.evalAll(&.{ out.logits, out.hidden.? });
+            // The decision's arrays in the verify's eval: the GPU goes on from the logits to the decision with no
+            // round trip to the host between them.
+            const dp = try mtp_mod.prepare(&self.g, out.logits, drafts, ln.mode, sampling, len);
+            try self.g.evalAll(&.{ out.logits, out.hidden.?, dp.tok, dp.flags orelse dp.tok });
+            const waits_verify = self.g.waits;
             if (comptime timeline.enabled) timeline.verifyEnd();
             try self.ex.flush();
             const t_verify = self.nowNs();
-            const d = try mtp_mod.decide(&self.g, out.logits, drafts, ln.mode, sampling, len);
+            const d = try dp.read(&self.g);
             self.cache.truncateTo(len + 1 + d.accepted);
             try self.history.appendSlice(self.gpa, ids[0 .. 1 + d.accepted]);
             const rows = d.accepted + 1;
+            if (probe) |p| p.decision_waits = self.g.waits - waits_verify;
             try ln.pend(&self.g, self.cache.len, try graph.rowSlice(&self.g, out.hidden.?, 0, @intCast(rows)), rows, depth == 0);
             const tokens = try a.dupe(u32, ids[0..rows]);
             const ns = self.nowNs() - t0;

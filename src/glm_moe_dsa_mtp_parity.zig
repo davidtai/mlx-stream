@@ -112,6 +112,8 @@ fn runCase(a: std.mem.Allocator, r: *Rig, cs: *const Case, vocab: usize) !f32 {
         };
         try testing.expectEqual(rd.accepted, out.accepted);
         try testing.expectEqual(rd.next, out.next_token);
+        // The decision is computed by the verify's eval: no wait between it and the lane's pend.
+        try testing.expectEqual(@as(u64, 0), probe.decision_waits);
         try emitted.appendSlice(a, out.tokens);
         t1 = out.next_token;
     }
@@ -368,12 +370,23 @@ test "glm mtp: the lane arms clean requests only, exact as greedy or stochastic,
     try testing.expectEqual(sdk.DraftArm.off, plugin.draft_lane.arm(&m, .{ .greedy = false, .clean = false }));
 }
 
-/// The decisions on host logits `rows` (f32 [w, vocab]) through the lane's device graph.
+/// The decisions on host logits `rows` (f32 [w, vocab]) through the lane's device graph, as the round makes them:
+/// `prepare` waits for nothing, `DecisionArrays.read` refuses arrays no eval produced and after one eval reads them
+/// with no wait; `decide` gives the same decision.
 fn decideHost(g: *G, rows: []const f32, w: usize, drafts: []const u32, mode: sdk.acceptance.Mode, sp: sdk.SamplingParams, base: u64) !mtp.Decision {
     const m = g.mark();
     defer g.resetTo(m);
     const lg = try g.hostArray(std.mem.sliceAsBytes(rows), &.{ @intCast(w), @intCast(rows.len / w) }, .float32);
-    return mtp.decide(g, lg, drafts, mode, sp, base);
+    const w0 = g.waits;
+    const p = try mtp.prepare(g, lg, drafts, mode, sp, base);
+    try testing.expectEqual(w0, g.waits);
+    try testing.expectError(error.NotEvaluated, p.read(g));
+    try g.evalAll(&.{ p.tok, p.flags orelse p.tok });
+    const w1 = g.waits;
+    const d = try p.read(g);
+    try testing.expectEqual(w1, g.waits);
+    try testing.expectEqual(d, try mtp.decide(g, lg, drafts, mode, sp, base));
+    return d;
 }
 
 test "glm mtp: the decisions equal the host references: argmax, typical at temperature 1, the sampled point-mass rule, sampled typical" {

@@ -147,7 +147,8 @@ pub const MlxOps = struct {
     s: mlx.mlx_stream,
     live: std.ArrayList(mlx.mlx_array) = .empty,
     /// The host's waits on the GPU so far: every evaluation that blocks (`evalAll`) and every read of an array's values
-    /// (`hostIds`, `hostU32`, `hostF32`, `hostBool`, `hostArgmax`); `asyncEval` waits for nothing.
+    /// (`hostIds`, `hostU32`, `hostF32`, `hostBool`, `hostArgmax`); `asyncEval` waits for nothing, nor do `readU32` and
+    /// `readBool` (they read what an earlier eval produced).
     waits: u64 = 0,
     /// `nn.silu` / `nn.softplus` are `mx.compile(shapeless=True)` regions in
     /// the Python oracle; the same closures are compiled here (a compiled
@@ -986,6 +987,29 @@ pub const MlxOps = struct {
         if (mlx.mlx_array_size(x) != out.len) return error.HostReadSize;
         std.debug.assert(mlx.mlx_array_dtype(x) == .bool_);
         return readInPlace(bool, bool, x, mlx.mlx_array_data_bool(x), out);
+    }
+
+    /// The values of `x`, which an earlier eval produced, copied row-major into `out` (x's size): no wait, and
+    /// `error.NotEvaluated` when no eval has produced `x`.
+    pub fn readU32(_: *MlxOps, x: T, out: []u32) ![]const u32 {
+        try produced(x);
+        if (mlx.mlx_array_size(x) != out.len) return error.HostReadSize;
+        std.debug.assert(mlx.mlx_array_dtype(x) == .uint32);
+        return readInPlace(u32, u32, x, mlx.mlx_array_data_uint32(x), out);
+    }
+
+    /// `readU32` for a bool array.
+    pub fn readBool(_: *MlxOps, x: T, out: []bool) ![]const bool {
+        try produced(x);
+        if (mlx.mlx_array_size(x) != out.len) return error.HostReadSize;
+        std.debug.assert(mlx.mlx_array_dtype(x) == .bool_);
+        return readInPlace(bool, bool, x, mlx.mlx_array_data_bool(x), out);
+    }
+
+    fn produced(x: T) !void {
+        var ok = false;
+        try mlx.check(mlx._mlx_array_is_available(&ok, x));
+        if (!ok) return error.NotEvaluated;
     }
 
     /// Greedy pick: `mx.argmax` over every logit of `x` (one row), evaluated and read.
