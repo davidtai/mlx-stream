@@ -115,7 +115,7 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
 #include <unistd.h>
 
 #define RES_W 8
-#define MAX_WORKERS 8
+#define MAX_WORKERS 16
 #define MAX_COMP 6
 #define MAX_ITEMS 8
 #define ST_PENDING (-1)

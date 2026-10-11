@@ -65,7 +65,7 @@ pub const test_abi = if (builtin.is_test) struct {
 } else struct {};
 
 pub const abi_version = 2026101002;
-pub const max_workers = 8;
+pub const max_workers = 16;
 /// Records per job (one fill unit).
 pub const max_items = 8;
 pub const max_spec = 16;
