@@ -276,6 +276,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
 
         /// After the forward's last eval: settles and unpins released calls.
         pub fn flush(self: *Self) !void {
+            // The call's promotions landed before anything reads their rows (the next request, decode's grow).
+            self.stream.settleCopies();
             try self.stream.flush();
         }
 
@@ -359,7 +361,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             if (cand.n > 0) {
                 const tp = pt.now();
                 // The eval above consumed the group: its route unpinned (its rows the policy's again), then its seed
-                // experts copied while their transient rows still hold them (the next route may take the window).
+                // experts' copies handed to the copier (a route into their window waits for them).
                 try self.stream.flush();
                 var items: [max_route_ids]S.Stream.Promotion = undefined;
                 for (cand.items[0..cand.n], items[0..cand.n]) |cd, *it| it.* = .{ .e = cd.e, .from = cd.slot };

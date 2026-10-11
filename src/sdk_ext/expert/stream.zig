@@ -550,6 +550,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             held_scratch: std.ArrayList(u32) = .empty,
             /// `promote`'s copies, reused across calls.
             promote_copies: std.ArrayList(Copy) = .empty,
+            /// `promote`'s copies run here, behind the host: a route that loads into a window first waits for the
+            /// batches that read from it (`waitWindow`), a persistent load of a layer for that layer's batches.
+            copier: Copier = .{},
             read_ns: u64 = 0,
             /// `read_ns` of results with no preadv (copy-only adoptions).
             copy_only_ns: u64 = 0,
@@ -754,6 +757,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// Stops the pool (draining its reads) before freeing the rows it writes.
             pub fn deinit(self: *Stream) void {
                 const a = self.allocator;
+                self.stopCopier();
                 self.pool.stop();
                 for (self.layers) |*ls| {
                     ls.policy.deinit(a);
@@ -886,8 +890,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// (`LayerPolicy.seed`), whose record landed in its transient slot (a route planned before the layer's seed)
             /// and that no wave reads any more: the record copied into the row `LayerPolicy.admitSeed` gives it (an empty
             /// row, else the coldest probationary resident's that no live route pins), the expert resident there. The
-            /// copies run on `promote_threads` threads. Stops at the first item that finds no row; returns the experts
-            /// made resident.
+            /// copies go to the copier (`promote_threads` threads, behind the host; a route into a source's window, a
+            /// persistent load of the layer and `settleCopies` wait for them). Stops at the first item that finds no
+            /// row; returns the experts made resident.
             pub fn promote(self: *Stream, layer: u32, items: []const Promotion) u32 {
                 std.debug.assert(self.phase == .prefill);
                 const ls = &self.layers[layer];
@@ -917,17 +922,113 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         copies.appendAssumeCapacity(.{ .dst = dst, .src = self.slotRow(layer, it.from, @enumFromInt(c)) });
                         bytes += dst.len;
                     }
-                    // Not read before the copies below: the host is the only reader until the next route.
+                    // Not read before its copy lands: no later route of this call routes `it.e` again, and the call's end
+                    // settles the copies.
                     ls.meta[to] = .{ .state = .ready, .layer = @intCast(layer), .expert = it.e };
                     done += 1;
                 }
-                copyParallel(copies.items, bytes);
+                self.submitCopies(layer, copies.items, bytes, items[0..done]);
                 self.counters.promoted += done;
                 self.counters.promoted_bytes += bytes;
                 return done;
             }
 
             const Copy = struct { dst: []u8, src: []const u8 };
+
+            /// One promotion's copies, in submission order (`seq`).
+            const Batch = struct { copies: []Copy, bytes: u64, seq: u64 };
+
+            /// The thread that runs the batches in order, its queue and the fences: `done` is the last batch copied,
+            /// `window_seq[w]` the last batch reading from transient window `w`, `layer_seq` the last writing a layer's
+            /// rows. Its memory is libc's (the host and the copier both touch the queue).
+            const Copier = struct {
+                mutex: std.Io.Mutex = .init,
+                cond: std.Io.Condition = .init,
+                queue: std.ArrayList(Batch) = .empty,
+                thread: ?std.Thread = null,
+                submitted: u64 = 0,
+                done: u64 = 0,
+                stopping: bool = false,
+                window_seq: [max_wide_depth]u64 = @splat(0),
+                layer_seq: std.ArrayList(u64) = .empty,
+
+                const io = std.Io.Threaded.global_single_threaded.io();
+
+                fn loop(c: *Copier) void {
+                    c.mutex.lockUncancelable(io);
+                    defer c.mutex.unlock(io);
+                    while (true) {
+                        while (c.queue.items.len == 0 and !c.stopping) c.cond.waitUncancelable(io, &c.mutex);
+                        if (c.queue.items.len == 0) return;
+                        const b = c.queue.orderedRemove(0);
+                        c.mutex.unlock(io);
+                        copyParallel(b.copies, b.bytes);
+                        std.heap.c_allocator.free(b.copies);
+                        c.mutex.lockUncancelable(io);
+                        c.done = b.seq;
+                        c.cond.broadcast(io);
+                    }
+                }
+
+                fn waitFor(c: *Copier, seq: u64) void {
+                    if (c.thread == null) return;
+                    c.mutex.lockUncancelable(io);
+                    defer c.mutex.unlock(io);
+                    while (c.done < seq) c.cond.waitUncancelable(io, &c.mutex);
+                }
+            };
+
+            /// `copies` (one promotion of `layer`, from the transient slots of `items`) handed to the copier; run here
+            /// when it cannot take them.
+            fn submitCopies(self: *Stream, layer: u32, copies: []const Copy, bytes: u64, items: []const Promotion) void {
+                if (bytes == 0) return;
+                const c = &self.copier;
+                const ca = std.heap.c_allocator;
+                const owned = ca.dupe(Copy, copies) catch return copyParallel(copies, bytes);
+                if (c.thread == null) {
+                    c.layer_seq.resize(ca, self.layers.len) catch {
+                        ca.free(owned);
+                        return copyParallel(copies, bytes);
+                    };
+                    @memset(c.layer_seq.items, 0);
+                    c.thread = std.Thread.spawn(.{}, Copier.loop, .{c}) catch {
+                        ca.free(owned);
+                        return copyParallel(copies, bytes);
+                    };
+                }
+                c.mutex.lockUncancelable(Copier.io);
+                defer c.mutex.unlock(Copier.io);
+                c.queue.append(ca, .{ .copies = owned, .bytes = bytes, .seq = c.submitted + 1 }) catch {
+                    c.mutex.unlock(Copier.io);
+                    copyParallel(owned, bytes);
+                    ca.free(owned);
+                    c.mutex.lockUncancelable(Copier.io);
+                    return;
+                };
+                c.submitted += 1;
+                const cap = self.layers[layer].policy.capacity;
+                for (items) |it| c.window_seq[(it.from - cap) / self.max_route_ids] = c.submitted;
+                c.layer_seq.items[layer] = c.submitted;
+                c.cond.signal(Copier.io);
+            }
+
+            /// Every promotion's copies landed (the prompt's end, the phase change, a forget, the stream's end).
+            pub fn settleCopies(self: *Stream) void {
+                self.copier.waitFor(self.copier.submitted);
+            }
+
+            fn stopCopier(self: *Stream) void {
+                const c = &self.copier;
+                const t = c.thread orelse return;
+                c.mutex.lockUncancelable(Copier.io);
+                c.stopping = true;
+                c.cond.broadcast(Copier.io);
+                c.mutex.unlock(Copier.io);
+                t.join();
+                c.thread = null;
+                c.queue.deinit(std.heap.c_allocator);
+                c.layer_seq.deinit(std.heap.c_allocator);
+            }
 
             /// The bytes of `copies` (`total` of them) split in `promote_threads` equal runs, one thread each (the
             /// calling thread runs the last; a thread that fails to start leaves its run to the calling thread).
@@ -977,6 +1078,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// an exact (layer, expert, slot) match. Refused while anything is live; returns the residents forgotten.
             pub fn forgetResidents(self: *Stream) !u32 {
                 if (self.phase != .prefill) return error.NotPrefill;
+                self.settleCopies();
                 try self.flush();
                 for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
                 if (self.ahead.live or self.held_base.items.len > 0) return error.RoutesLive;
@@ -1076,9 +1178,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     held_set.appendSlice(self.allocator, self.held_base.items) catch return self.fail(error.RoutesExhausted);
                 const window: u8 = @intCast(@ctz(~used_windows));
                 if (window >= self.wide_depth) return self.fail(error.RoutesExhausted);
+                // The window's rows may still be a promotion's sources.
+                self.copier.waitFor(self.copier.window_seq[window]);
                 r.* = .{ .layer = layer, .window = window };
                 const ls = &self.layers[layer];
                 ls.policy.planWith(ids, self.phase, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held_set.items });
+                // A persistent load may take a row a promotion of this layer still writes.
+                if (r.plan.n_persistent > 0 and self.copier.thread != null) self.copier.waitFor(self.copier.layer_seq.items[layer]);
                 const plan = &r.plan;
                 for (plan.hitsOf(), r.hit_slots[0..plan.n_hits]) |e, *s| {
                     s.* = ls.policy.slotOf(e).?;
@@ -1618,6 +1724,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// whole transient scratch, with grow's preconditions; `grow` allocates decode's window 0. MLX rows: the
             /// allocator's active bytes must drop by the scratch's, else a holder survived. Returns the bytes freed.
             pub fn releaseTransient(self: *Stream) !u64 {
+                self.settleCopies();
                 if (!self.release_installed) return error.TransientReleaseNotInstalled;
                 if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
                 if (self.phase != .prefill) return error.AlreadyGrown;
@@ -1655,6 +1762,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// decode routes from here on. Needs every route released and the scratch released first: decode's window 0
             /// (plus `decode_staging_rows`) is allocated here, before the added rows.
             pub fn grow(self: *Stream, decode_rows: []const u32) !void {
+                self.settleCopies();
                 if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
                 if (self.phase != .prefill) return error.AlreadyGrown;
                 if (self.failed) return error.StreamFailed;
@@ -1818,6 +1926,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// The reverse phase change's allocation, after its frees landed: the prompt's scratch (`Options.transient_rows`
             /// rows, `wide_depth` windows) re-created, so the next prompt routes as the first did. Returns its bytes.
             pub fn regrowTransient(self: *Stream) !u64 {
+                self.settleCopies();
                 if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
                 if (self.phase != .prefill) return error.AlreadyGrown;
                 if (self.failed) return error.StreamFailed;
