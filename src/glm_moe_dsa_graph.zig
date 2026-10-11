@@ -121,10 +121,7 @@ pub const Weights = struct {
     fn get(w: *const sdk.Weights, prefix: []const u8, rest: []const u8, diag: ?*glm.Diag) !T {
         var buf: [192]u8 = undefined;
         const name = if (prefix.len == 0) rest else try std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, rest });
-        return w.get(name) orelse {
-            if (diag) |d| d.set("{s}: not in the loaded weights", .{name});
-            return error.TensorMissing;
-        };
+        return w.need(name, diag, error.TensorMissing, "not in the loaded weights");
     }
 
     fn quant(w: *const sdk.Weights, c: *const glm.Config, prefix: []const u8, rest: []const u8, diag: ?*glm.Diag) !QLinear {

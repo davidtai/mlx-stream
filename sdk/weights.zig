@@ -4,6 +4,7 @@
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const log = @import("mlx_host").log;
+const Diag = @import("peek.zig").Diag;
 
 /// Holds all loaded weights as mlx arrays, keyed by name.
 pub const Weights = struct {
@@ -28,6 +29,14 @@ pub const Weights = struct {
 
     pub fn get(self: *const Weights, name: []const u8) ?mlx.mlx_array {
         return self.map.get(name);
+    }
+
+    /// The tensor `name`, else `err` with `diag` (when given) set to "<name>: <why>": a load's refusal by name.
+    pub fn need(self: *const Weights, name: []const u8, diag: ?*Diag, err: anytype, comptime why: []const u8) @TypeOf(err)!mlx.mlx_array {
+        return self.map.get(name) orelse {
+            if (diag) |d| d.set("{s}: " ++ why, .{name});
+            return err;
+        };
     }
 
     /// Hand the map a new array under `name`, freeing the one it held (load-time

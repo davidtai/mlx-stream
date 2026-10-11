@@ -306,8 +306,7 @@ pub const Exl3 = struct {
 
 fn get(w: *const sdk.Weights, prefix: []const u8, rest: []const u8, diag: ?*Diag) !T {
     var buf: [192]u8 = undefined;
-    const name = try std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, rest });
-    return w.get(name) orelse refuse(diag, error.MtpTensorMissing, "{s}: not in the MTP residents", .{name});
+    return w.need(try std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, rest }), diag, error.MtpTensorMissing, "not in the MTP residents");
 }
 
 // ── the head ──
