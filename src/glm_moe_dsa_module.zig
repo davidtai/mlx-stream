@@ -228,7 +228,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const dsa = try graph.dsaKernelsRun(gpa, s, model);
             const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag), .dsa = dsa, .prompt_cache = bill_mod.prefillCacheBytes(ram) };
             const billed = bill_mod.billOf(inputs);
-            const mb = try bill_mod.memoryBill(gpa, billed);
+            const mb = try bill_mod.memoryBill(gpa, billed, null);
             errdefer mb.free(gpa);
             const baseline = cfg.memory_baseline_bytes orelse 0;
             const target = bill_mod.targetOf(gpu_target, ram, baseline);
@@ -354,7 +354,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_set_cache_limit(&self.prev_cache_limit, self.cacheLimit(.prompt));
             log.info("glm_moe_dsa: constructed ({d} routed layers, {d} experts, record {d} B, expert reads {s}, prompt {s}, prompt attention {s}, decode window {d} rows)\n", .{ n_bank, self.bank.n_experts, self.bank.geometryOf().widest_record, if (gated) "event gates" else "host waits", if (cfg.layerMajor()) "layer by layer" else "chunk by chunk", if (self.routes.dsa) "on the DSA kernels" else "in the reference's form", shape.decode_window_rows });
             try self.checkConstruction(rows.prompt);
-            self.phaseRecord("module constructed", self.billed.terms(.construction, self.prompt_units), null);
+            self.phaseRecord("module constructed", self.billed.terms(.construction, self.prompt_units, self.prompt_units), null);
             return self;
         }
 
@@ -382,7 +382,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
         /// The request's decode terms at its grown units: the bill at its own KV (`bill.atRequest`).
         fn requestTerms(self: *const Self) bill_mod.PhaseTerms {
-            return bill_mod.atRequest(self.inputs, self.decode_positions).terms(.decode, self.decode_units);
+            return bill_mod.atRequest(self.inputs, self.decode_positions).terms(.decode, self.decode_units, self.prompt_units);
         }
 
         /// The MLX cache limit the module installs for `phase` (the bill's own term: one value for both).
@@ -514,7 +514,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             log.info("{f}\n", .{PromptLine{ .tokens = ids.len, .wall_ns = self.nowNs() - t0, .r = .of(s0, self.stream.stats()), .mem = .{ .start = mem0, .end = Mem.now() } }});
             prefill_timers.report(ids.len);
             if (self.probe) |p| log.info("glm_moe_dsa: wave probe {f}\n", .{p.*});
-            self.phaseRecord("prompt pass", self.billed.terms(.prompt, self.prompt_units), if (self.probe) |p| p.passPeak() else null);
+            self.phaseRecord("prompt pass", self.billed.terms(.prompt, self.prompt_units, self.prompt_units), if (self.probe) |p| p.passPeak() else null);
             return logits.?;
         }
 
@@ -582,7 +582,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                     log.err("{f}\n", .{line});
                     return e;
                 };
-                line.bill_rows = try bill_mod.requestRows(self.gpa, self.inputs, cap, box.others, target, max_units);
+                line.bill_rows = try bill_mod.requestRows(self.gpa, self.inputs, cap, self.prompt_units, box.others, target, max_units);
                 // The bill at the request's inputs in bytes (the receipts rebuild its units from them).
                 log.info("glm_moe_dsa: bill at the request: {d} positions beside {d} B of the rest of the box, target {d} B: {d} units\n", .{ cap, box.others, target, line.bill_rows.? });
                 line.rows = @max(@min(line.live_rows.?, line.bill_rows.?), self.prompt_units);
