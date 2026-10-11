@@ -48,9 +48,12 @@ pub const decode_wave_fixed_bytes: u64 = 64 << 20;
 pub const wireTables = @import("deepseek_v41_bill.zig").wireTables;
 /// What the fill leaves of the box's RAM past the box's used memory (`sdk.memory.boxUsedBytes`): the free pages, the
 /// file cache and the speculative pages that macOS and the other processes run in. Measured on the 256 GB M5 Ultra at
-/// --ctx-size 16448, the coding workload: decode at full speed with 24.1 GB of the RAM left (run x1: 15.6 GB of it free,
-/// 7.6 GB file cache), 16 % slower with 20.6 GB left when a 15.8 GB file cache held the free pages to 3.4 GB (run d3).
-/// 16 GiB fills the process to 240 GB beside 17.6 GB of the rest of the box.
+/// --ctx-size 16448, the coding workload, EXL3 3.42 bpw, typical depth 3: decode at full speed with 21.6 GB of the RAM
+/// left (run x4: 10.3 GB of it free) and with 20.0 GB left (run x5: 6.1 GB free), and 16 % slower with 20.6 GB left
+/// when a 15.8 GB file cache held the free pages to 3.4 GB (run d3, affine). At 16 GiB the fill took the process to a
+/// 238.0 GB peak beside 17.8 GB of the rest of the box (ABBA bill-exl3-cd65722-m2-vs-a7133a3-m14: decode +27.2 %).
+/// The fill's wired pages pass 88 % of the RAM: decode needs the kernel's user wire limit above them
+/// (vm.global_user_wire_limit; at 88 % decode ran at half speed, run x3').
 pub const os_reserve_bytes: u64 = 16 << 30;
 
 /// The box's used memory the fill reaches beside `others` (the rest of the box): the RAM less the OS reserve, and at
