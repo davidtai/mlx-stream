@@ -7,6 +7,7 @@
 const std = @import("std");
 const io_util = @import("sdk").io_util;
 const expert_io = @import("sdk_ext.zig").expert.io;
+const bank_file = @import("sdk_ext.zig").expert.bank_file;
 const mlx = @import("sdk").mlx;
 
 /// Record segments in on-disk order: the gate/up span is the first six, the
@@ -228,7 +229,9 @@ pub const Bank = struct {
         defer v2.deinit(allocator);
         try bank.adoptV2(&v2, implemented, diag);
         bank.sidecar_path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, v2.sidecar.?.file }, 0);
-        try bank.openSidecar(diag);
+        // The pool's descriptor: a regular file holding every record, the page cache bypassed and read-ahead off
+        // (reads are whole spans).
+        bank.sidecar = try bank_file.openSidecar(bank.sidecar_path, bank.sidecar_size, .at_least, diag);
         try bank.checkV1(io, dir, v2.sidecar.?.file, diag);
         return bank;
     }
@@ -292,7 +295,7 @@ pub const Bank = struct {
         const sc = v2.sidecar orelse return refuse(diag, error.ManifestSyntax, "v2: no sidecar", .{});
         if (sc.size != total) return refuse(diag, error.SidecarGeometry, "v2: sidecar.size {d} != {d}", .{ sc.size, total });
         if (sc.alignment != record_alignment) return refuse(diag, error.SidecarGeometry, "v2: sidecar alignment {d} != {d}", .{ sc.alignment, record_alignment });
-        if (!plainName(sc.file)) return refuse(diag, error.SidecarGeometry, "v2: sidecar file \"{s}\" is not a plain file name", .{sc.file});
+        if (!bank_file.plainName(sc.file)) return refuse(diag, error.SidecarGeometry, "v2: sidecar file \"{s}\" is not a plain file name", .{sc.file});
         self.sidecar_size = total;
 
         const n_rec = table.len * d.n_experts;
@@ -313,21 +316,6 @@ pub const Bank = struct {
             self.digests[i].padded = r.sha256 orelse return refuse(diag, error.RecordSha256, "v2: record ({d},{d}) has no sha256", .{ r.layer, r.expert });
         }
         if (v2.all_pass != true) return refuse(diag, error.ParityNotPassed, "v2: parity.all_pass is not true", .{});
-    }
-
-    /// The pool's descriptor: no symlink, a regular file holding every record,
-    /// the page cache bypassed and read-ahead off (reads are whole spans).
-    fn openSidecar(self: *Bank, diag: ?*Diag) !void {
-        var errno: c_int = 0;
-        const f = expert_io.openUncached(self.sidecar_path.ptr, &errno) catch |e| return switch (e) {
-            error.NotFound => refuse(diag, error.SidecarMissing, "{s}: not found", .{self.sidecar_path}),
-            error.OpenFailed => refuse(diag, error.SidecarOpen, "{s}: open(O_RDONLY | O_NOFOLLOW) failed, errno {d}", .{ self.sidecar_path, errno }),
-            error.StatFailed => refuse(diag, error.SidecarOpen, "{s}: fstat failed", .{self.sidecar_path}),
-            error.NotRegularFile => refuse(diag, error.SidecarGeometry, "{s} is not a regular file", .{self.sidecar_path}),
-            error.NoCacheRefused => refuse(diag, error.SidecarOpen, "{s}: F_NOCACHE / F_RDAHEAD refused", .{self.sidecar_path}),
-        };
-        self.sidecar = f;
-        if (f.size < self.sidecar_size) return refuse(diag, error.SidecarGeometry, "{s} is {d} B < {d}", .{ self.sidecar_path, f.size, self.sidecar_size });
     }
 
     /// The runtime (v1) manifest must describe exactly the v2 records:
@@ -414,10 +402,6 @@ fn containsStr(set: []const []const u8, s: []const u8) bool {
 
 fn containsInt(set: []const u32, v: u32) bool {
     return std.mem.indexOfScalar(u32, set, v) != null;
-}
-
-fn plainName(s: []const u8) bool {
-    return s.len > 0 and std.mem.indexOfScalar(u8, s, '/') == null and !std.mem.eql(u8, s, ".") and !std.mem.eql(u8, s, "..");
 }
 
 /// Manifest segments (v2: record-relative, base 0; v1: absolute, base =

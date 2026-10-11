@@ -26,6 +26,8 @@ pub const Event = event.Event;
 pub const policy = @import("expert/policy.zig");
 /// The expert stream over a bank module (`assertBank`): slot rows, routes, residency, reads, lookahead, gates, release.
 pub const stream = @import("expert/stream.zig");
+/// A bank's open around its own manifest rules: the manifest read, the sidecar opened for the reader, the peek.
+pub const bank_file = @import("expert/bank_file.zig");
 /// The lookahead selector: the next routed layer's predicted records, chosen by score over its router rows.
 pub const lookahead = @import("expert/lookahead.zig");
 /// The route recorder (a diagnostic): one request's decode routes, what served each id, and the handover's residents.

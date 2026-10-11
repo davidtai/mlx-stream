@@ -9,13 +9,13 @@ const std = @import("std");
 const mlx = @import("sdk").mlx;
 const sdk_ext = @import("sdk_ext.zig");
 const expert_io = sdk_ext.expert.io;
+const bank_file = sdk_ext.expert.bank_file;
 const quant = sdk_ext.quant;
 const glm = @import("glm_moe_dsa.zig");
 
 pub const format = "mlx-stream-expert-manifest-affine-v1";
 pub const manifest_file = "expert-manifest-affine-v1.json";
 pub const record_alignment: u64 = 4096;
-const max_manifest_bytes = 64 << 20;
 
 // ── the bank contract (`sdk_ext.expert.assertBank`) ──
 
@@ -143,10 +143,7 @@ pub const Refusal = error{
     ParityNotPassed,
 };
 
-fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
-    if (diag) |d| d.set(fmt, args);
-    return err;
-}
+const refuse = bank_file.refuse;
 
 const SegJson = struct { component: []const u8, dtype: []const u8, shape: []const u64, offset: u64, length: u64 };
 const LayerJson = struct { layer: u64, index: u64, record_bytes: u64, logical_bytes: u64, base_offset: u64, segments: []const SegJson };
@@ -183,13 +180,13 @@ pub const Bank = struct {
     /// Parses `dir`'s manifest, checks it against the model's config (rules 1-6 of the pack's contract) and opens
     /// experts.bin, once.
     pub fn open(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, diag: ?*Diag) !Bank {
-        return openWith(allocator, io, dir, c, diag, true);
+        return bank_file.open(Bank, ManifestJson, manifest_file, allocator, io, dir, c, diag, true);
     }
 
     /// The bank's geometry from its manifest alone (every rule but the sidecar's file), for the bill: no reader,
     /// no descriptor. Its layers in `allocator`.
     pub fn geometry(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, diag: ?*Diag) !Geometry {
-        var b = try openWith(allocator, io, dir, c, diag, false);
+        var b = try bank_file.open(Bank, ManifestJson, manifest_file, allocator, io, dir, c, diag, false);
         defer b.deinit();
         var g = b.geometryOf();
         g.layers = try allocator.dupe(LayerSlots, g.layers);
@@ -206,30 +203,6 @@ pub const Bank = struct {
             g.widest_span = @max(g.widest_span, @max(gu, l.logical_bytes - gu));
         }
         return g;
-    }
-
-    fn openWith(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, diag: ?*Diag, sidecar: bool) !Bank {
-        if (!std.fs.path.isAbsolute(dir)) return refuse(diag, error.BankDirNotAbsolute, "bank dir \"{s}\" is not an absolute path", .{dir});
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const path = try std.fmt.allocPrint(a, "{s}/" ++ manifest_file, .{dir});
-        const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_manifest_bytes)) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.FileNotFound => return refuse(diag, error.ManifestMissing, manifest_file ++ ": not found in {s}", .{dir}),
-            else => return refuse(diag, error.ManifestMissing, manifest_file ++ ": {s}", .{@errorName(e)}),
-        };
-        const m = std.json.parseFromSliceLeaky(ManifestJson, a, text, .{ .ignore_unknown_fields = true }) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return refuse(diag, error.ManifestSyntax, manifest_file ++ ": {s}", .{@errorName(e)}),
-        };
-        var bank: Bank = .{ .allocator = allocator };
-        errdefer bank.deinit();
-        try bank.adopt(&m, c, diag);
-        if (!sidecar) return bank;
-        bank.sidecar_path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, m.sidecar.file }, 0);
-        try bank.openSidecar(m.sidecar.size, diag);
-        return bank;
     }
 
     pub fn deinit(self: *Bank) void {
@@ -259,10 +232,11 @@ pub const Bank = struct {
     /// and dims, in `a`.
     pub fn peek(self: *const Bank, a: std.mem.Allocator) !quant.BankPeek {
         const q = try std.fmt.allocPrint(a, "{{\"mode\":\"affine\",\"bits\":{d},\"group_size\":{d}}}", .{ self.bits, glm.group_size });
-        return .{ .quantization = try std.json.parseFromSliceLeaky(std.json.Value, a, q, .{}), .hidden = self.hidden, .inter = self.inter, .n_experts = self.n_experts, .n_layers = self.layers.len, .layers = &.{} };
+        return bank_file.peek(a, q, self.hidden, self.inter, self.n_experts, self.layers.len);
     }
 
-    fn adopt(self: *Bank, m: *const ManifestJson, c: *const glm.Config, diag: ?*Diag) !void {
+    /// The pack's rules against the model's config (`bank_file.open`); returns the records' bytes.
+    pub fn adopt(self: *Bank, _: std.mem.Allocator, m: *const ManifestJson, c: *const glm.Config, diag: ?*Diag) (Refusal || std.mem.Allocator.Error)!u64 {
         const a = self.allocator;
         // 1. The format.
         if (!std.mem.eql(u8, m.format, format)) return refuse(diag, error.ManifestFormat, manifest_file ++ ": format \"{s}\" is not " ++ format, .{m.format});
@@ -314,7 +288,7 @@ pub const Bank = struct {
         // 4. The sidecar.
         const sc = m.sidecar;
         const total = @as(u64, n_layers) * d.n_experts * record;
-        if (!plainName(sc.file)) return refuse(diag, error.SidecarGeometry, manifest_file ++ ": sidecar file \"{s}\" is not a plain file name", .{sc.file});
+        if (!bank_file.plainName(sc.file)) return refuse(diag, error.SidecarGeometry, manifest_file ++ ": sidecar file \"{s}\" is not a plain file name", .{sc.file});
         if (sc.alignment != record_alignment) return refuse(diag, error.SidecarGeometry, manifest_file ++ ": sidecar alignment {d}, want {d}", .{ sc.alignment, record_alignment });
         if (sc.size != total) return refuse(diag, error.SidecarGeometry, manifest_file ++ ": sidecar size {d}, want {d} layers x {d} experts x {d} B = {d}", .{ sc.size, n_layers, d.n_experts, record, total });
         // 5. The records: every (layer, expert) once, at its offset.
@@ -341,26 +315,9 @@ pub const Bank = struct {
         }
         // 6. The converter's parity.
         if (!m.parity.all_pass) return refuse(diag, error.ParityNotPassed, manifest_file ++ ": parity.all_pass is not true", .{});
-    }
-
-    /// The pool's descriptor: no symlink, a regular file of exactly the records' bytes, the page cache bypassed.
-    fn openSidecar(self: *Bank, size: u64, diag: ?*Diag) !void {
-        var errno: c_int = 0;
-        const f = expert_io.openUncached(self.sidecar_path.ptr, &errno) catch |e| return switch (e) {
-            error.NotFound => refuse(diag, error.SidecarMissing, "{s}: not found", .{self.sidecar_path}),
-            error.OpenFailed => refuse(diag, error.SidecarOpen, "{s}: open(O_RDONLY | O_NOFOLLOW) failed, errno {d}", .{ self.sidecar_path, errno }),
-            error.StatFailed => refuse(diag, error.SidecarOpen, "{s}: fstat failed", .{self.sidecar_path}),
-            error.NotRegularFile => refuse(diag, error.SidecarGeometry, "{s} is not a regular file", .{self.sidecar_path}),
-            error.NoCacheRefused => refuse(diag, error.SidecarOpen, "{s}: F_NOCACHE / F_RDAHEAD refused", .{self.sidecar_path}),
-        };
-        self.sidecar = f;
-        if (f.size != size) return refuse(diag, error.SidecarGeometry, "{s} is {d} B, the manifest's sidecar {d} B", .{ self.sidecar_path, f.size, size });
+        return total;
     }
 };
-
-fn plainName(s: []const u8) bool {
-    return s.len > 0 and std.mem.indexOfScalar(u8, s, '/') == null and !std.mem.eql(u8, s, ".") and !std.mem.eql(u8, s, "..");
-}
 
 // ── synthetic packs (tests) ──
 
