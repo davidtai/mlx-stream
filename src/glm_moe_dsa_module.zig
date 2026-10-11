@@ -802,6 +802,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             // round trip to the host between them.
             const dp = try mtp_mod.prepare(&self.g, out.logits, drafts, ln.mode, sampling, len);
             const s2 = timeline.now();
+            if (comptime timeline.enabled) timeline.verifyEval();
             try self.g.evalAll(&.{ out.logits, out.hidden.?, dp.tok, dp.flags orelse dp.tok });
             const s3 = timeline.now();
             if (comptime timeline.enabled) timeline.verifyEnd();
