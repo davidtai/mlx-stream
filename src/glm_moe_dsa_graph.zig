@@ -314,7 +314,8 @@ pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, 
         const wb = try g.slice(wts, &.{ @intCast(b0), 0 }, &.{ @intCast(b1), @intCast(c.index_n_heads) }, &.{ 1, 1 });
         const w4 = try g.reshape(try g.transposeAxes(wb, &.{ 1, 0 }), &.{ 1, @intCast(c.index_n_heads), @intCast(b1 - b0), 1 });
         s = try g.sum(try g.mul(s, w4), 1, true);
-        if (rows > 1) s = try g.where(try causalMask(g, start + b0, b1 - b0, nb), s, try g.scalar(-std.math.inf(f64), .float32));
+        // A block of one row reaches exactly its own keys [0, its position]: the causal mask is all true there.
+        if (rows > 1 and b1 - b0 > 1) s = try g.where(try causalMask(g, start + b0, b1 - b0, nb), s, try g.scalar(-std.math.inf(f64), .float32));
         const kth: c_int = @intCast(nb - topk);
         const idx = try lastSlice(g, try g.argpartition(s, kth, -1), kth, @intCast(nb));
         carry.set(g, i, idx);
@@ -436,20 +437,27 @@ pub fn keysOf(g: *G, c: *const glm.Config, lw: *const Layer, x: T, start: u32, r
 /// the keys `kv` / `pe` (`[1, 1, n, ·]`) or the `topk` rows of them, one shared key and value head, the output back
 /// through unembed_out: `[1, heads, 1, v_head_dim]`.
 pub fn absorbedRow(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T, kv: T, pe: T, topk: ?T) !T {
-    const kvr: c_int = @intCast(c.kv_lora_rank);
-    const rp: c_int = @intCast(c.qk_rope_head_dim);
-    const scale64: f64 = 1.0 / @sqrt(@as(f64, @floatFromInt(c.qHeadDim())));
+    return absorbedRowScaled(g, c, lw, q_nope, try g.mul(q_pe, try g.scalar(absorbedScale(c), g.dtypeOf(q_pe))), kv, pe, topk);
+}
+
+/// The absorbed attention's softmax scale, `1 / sqrt(q_head_dim)`.
+fn absorbedScale(c: *const glm.Config) f64 {
+    return 1.0 / @sqrt(@as(f64, @floatFromInt(c.qHeadDim())));
+}
+
+/// `absorbedRow` with its roped query already times the scale (the per-row verify scales every row at once); the
+/// `topk` rows gathered from the keys by one take each.
+fn absorbedRowScaled(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe_scaled: T, kv: T, pe: T, topk: ?T) !T {
     var kv_sel = kv;
     var pe_sel = pe;
     if (topk) |t| {
-        const kk: c_int = @intCast(c.index_topk);
-        const idx = try g.reshape(t, &.{ 1, 1, kk, 1 });
-        kv_sel = try g.takeAlongAxis(kv, try g.broadcastTo(idx, &.{ 1, 1, kk, kvr }), 2);
-        pe_sel = try g.takeAlongAxis(pe, try g.broadcastTo(idx, &.{ 1, 1, kk, rp }), 2);
+        const idx = try g.reshape(t, &.{@intCast(c.index_topk)});
+        kv_sel = try g.take(kv, idx, 2);
+        pe_sel = try g.take(pe, idx, 2);
     }
-    const scores = try g.matmul(try g.mul(q_pe, try g.scalar(scale64, g.dtypeOf(q_pe))), try swapLast(g, pe_sel));
+    const scores = try g.matmul(q_pe_scaled, try swapLast(g, pe_sel));
     const qa = try qlinear(g, q_nope, lw.embed_q);
-    return qlinear(g, try sdpa(g, qa, kv_sel, kv_sel, @floatCast(scale64), scores), lw.unembed_out);
+    return qlinear(g, try sdpa(g, qa, kv_sel, kv_sel, @floatCast(absorbedScale(c)), scores), lw.unembed_out);
 }
 
 /// How a forward of several rows attends: `.auto` (one row absorbed, several in the prompt form), or `.per_row` (each
@@ -493,10 +501,16 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     } else if (form == .per_row) {
         var outs: std.ArrayList(T) = .empty;
         defer outs.deinit(carry.a);
+        // Every row's roped query scaled at once; a row with a selection gathers its keys from the whole lane (its ids
+        // are below its own position), a row without one attends the keys up to its position.
+        const q_pe_scaled = try g.mul(q.q_pe, try g.scalar(absorbedScale(c), g.dtypeOf(q.q_pe)));
         for (0..rows) |i| {
             const r: c_int = @intCast(i);
             const nk: c_int = @intCast(start + i + 1);
-            try outs.append(carry.a, try absorbedRow(g, c, lw, try rowSlice(g, q.q_nope, r, r + 1), try rowSlice(g, q.q_pe, r, r + 1), try rowSlice(g, kv_all, 0, nk), try rowSlice(g, pe_all, 0, nk), carry.topk[i]));
+            const sel = carry.topk[i];
+            const kv = if (sel != null) kv_all else try rowSlice(g, kv_all, 0, nk);
+            const pe = if (sel != null) pe_all else try rowSlice(g, pe_all, 0, nk);
+            try outs.append(carry.a, try absorbedRowScaled(g, c, lw, try rowSlice(g, q.q_nope, r, r + 1), try rowSlice(g, q_pe_scaled, r, r + 1), kv, pe, sel));
         }
         out = try g.concat(outs.items, 2);
     } else {
