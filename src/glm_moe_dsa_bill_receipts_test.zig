@@ -26,18 +26,32 @@ fn glm53Config() !glm.Config {
 /// The fill arm's model settings and context (the read pool's eight workers, its default).
 const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
 
-/// The box's inputs with the run's prompt kernels: its routed GEMMs and its spans' selection, and the allocator's size
-/// classes (the prompt's transients and the residents at their classes; the screen before them ran without).
-fn inputs(c: *const glm.Config, gemm: bill.PromptGemm, select: bill.Select, classes: bool) bill.Inputs {
-    const b = bill.box_exl3;
-    return .{ .model = c, .bank = b.geometry, .resident_bytes = if (classes) b.resident_class_bytes else b.resident_bytes, .stream = bill.streamShape(&cfg), .prompt_tokens = bill.servedContext(&cfg), .decode_positions = bill.maxPositions(&cfg), .mtp = b.mtp, .dsa = true, .gemm = gemm, .select = select, .prompt_cache = bill.prefillCacheBytes(b.ram), .size_classes = classes };
+/// The box's EXL3 packs: the 3.42 bpw pack (`bill.box_exl3`) and the uniform 3.0 bpw one (`bill.box_exl3_30`).
+const Pack = enum { exl3_342, exl3_30 };
+
+/// A pack's geometry, residents and MTP directory as the bill reads them.
+const PackFacts = struct { geometry: glm.Geometry, resident_bytes: u64, resident_class_bytes: u64, mtp: bill.Mtp };
+
+fn factsOf(p: Pack) PackFacts {
+    return switch (p) {
+        .exl3_342 => .{ .geometry = bill.box_exl3.geometry, .resident_bytes = bill.box_exl3.resident_bytes, .resident_class_bytes = bill.box_exl3.resident_class_bytes, .mtp = bill.box_exl3.mtp },
+        .exl3_30 => .{ .geometry = bill.box_exl3_30.geometry, .resident_bytes = bill.box_exl3_30.resident_bytes, .resident_class_bytes = bill.box_exl3_30.resident_class_bytes, .mtp = bill.box_exl3_30.mtp },
+    };
+}
+
+/// The box's inputs with the run's pack and prompt kernels: its routed GEMMs and its spans' selection, and the
+/// allocator's size classes (the prompt's transients and the residents at their classes; the screen before them ran
+/// without).
+fn inputs(c: *const glm.Config, pack: Pack, gemm: bill.PromptGemm, select: bill.Select, classes: bool) bill.Inputs {
+    const f = factsOf(pack);
+    return .{ .model = c, .bank = f.geometry, .resident_bytes = if (classes) f.resident_class_bytes else f.resident_bytes, .stream = bill.streamShape(&cfg), .prompt_tokens = bill.servedContext(&cfg), .decode_positions = bill.maxPositions(&cfg), .mtp = f.mtp, .dsa = true, .gemm = gemm, .select = select, .prompt_cache = bill.prefillCacheBytes(bill.box_exl3.ram), .size_classes = classes };
 }
 
 test "glm bill receipts: the 9d157b5 screen's peaks, over its own bill, sit under this bill at its inputs and units" {
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     // The screen ran sushi's prompt GEMM and argpartition's selection.
-    const in = inputs(&c, .sushi, .argpartition, false);
+    const in = inputs(&c, .exl3_342, .sushi, .argpartition, false);
     const b = bill.billOf(in);
     // The screen's load: the baseline 18,144,149,504 B, 76 prompt units, the handover's 86 at its 17,415 positions.
     const baseline: u64 = 18_144_149_504;
@@ -64,6 +78,8 @@ const PhaseRecord = struct { phase: []const u8, billed: bill.PhaseTerms, measure
 /// the four `glm_moe_dsa: phase memory` records).
 const Receipt = struct {
     name: []const u8,
+    /// The run's pack.
+    pack: Pack = .exl3_342,
     /// The run's prompt kernels (stack 3e37e40: sushi's GEMM and argpartition; from 42abec0: GLM-5.3's kernels and the
     /// top-k kernel).
     gemm: bill.PromptGemm,
@@ -80,6 +96,8 @@ const Receipt = struct {
     /// fewer (`bill.unitsIn`) and the bytes the split's rows take within it (`bill.grownOf`).
     bill_bytes: u64,
     live_bytes: u64,
+    /// The arm's units cap (`expert_units_cap`; null: off): the grow takes at most its grown bytes.
+    cap: ?u32 = null,
     grown: u32,
     grown_bytes: u64,
     positions: u64,
@@ -87,12 +105,57 @@ const Receipt = struct {
     records: [4]PhaseRecord,
 };
 
-/// The box's runs of this bill (`receipt.py` over each run's serve.log). The floor ABBA's B runs
-/// (cache-rows-bc548c4-vs-e1de350-floor21, plugin bc548c4) rebuild at 981ff6a, the last commit before GLM-5.3's
-/// kernels read the routed input from one f16 copy per wide call: with the size classes on, the copy makes the routed
-/// call's stage the prompt wave's widest (7,668,348,928 B against their 7,586,283,520). Two runs of the final head
-/// (seeds 1234 and 4321) pin this bill.
-const receipts = [_]Receipt{};
+/// The box's runs of this bill (`receipt.py` over each run's serve.log): the closing runs of the final head (bundle
+/// serve-stack-e96bfe4, plugin e96bfe4; the folded 57bf1e0 and 46de294 change no bill term), the uniform 3.0 bpw pack at
+/// the units cap of 96, the coding workload at seeds 1234 and 4321.
+const receipts = [_]Receipt{
+    .{
+        .name = "closing-e96bfe4-seed1234",
+        .pack = .exl3_30,
+        .gemm = .glm53,
+        .select = .kernel,
+        .baseline = 14188773376,
+        .units = .{ .prompt = 87, .decode = 93 },
+        .target = 257698037760,
+        .request = .{ .positions = 17415, .pending_rows = 1, .others = 13866493616, .target = 257698037760, .bytes = 28469226438 },
+        .positions = 17415,
+        .bill_bytes = 28469226438,
+        .live_bytes = 28528778586,
+        .cap = 96,
+        .grown = 96,
+        .grown_bytes = 19326910464,
+        .file_backed_start = 19418972160,
+        .records = .{
+            .{ .phase = "module constructed", .billed = .{ .slot_rows = 186819379200, .transient_rows = 3435724800, .mtp_residents = 4243262976, .pool_staging = 76976128, .host_side = 900000000 }, .measured = .{ .footprint = 195106544304, .interval_peak = 195611398824, .mlx_active = 194498366984, .mlx_cache = 0, .mlx_peak = 194498366984, .physical = 227931209728, .file_backed = 19425181696, .speculative = 1026457600, .residual = -136055720, .mlx_residual = -8 } },
+            .{ .phase = "prompt pass", .billed = .{ .slot_rows = 186819379200, .transient_rows = 3435724800, .residents = 20187962880, .mtp_residents = 4243262976, .kv = 1567014912, .mtp_kv = 23166976, .mtp_pending = 202113024, .waves = 7668348928, .mlx_cache = 17179869184, .mlx_cache_overshoot = 603979776, .pool_staging = 76976128, .host_side = 950000000, .wire_tables = 354506304 }, .measured = .{ .footprint = 234504543984, .interval_peak = 234751466480, .mlx_active = 216215042668, .mlx_cache = 17362193626, .mlx_peak = 222242149160, .physical = 267456561152, .file_backed = 19425361920, .speculative = 1026310144, .residual = 8560838608, .mlx_residual = 1904824536 } },
+            .{ .phase = "handover", .billed = .{ .slot_rows = 206146289664, .transient_rows = 458096640, .residents = 20187962880, .mtp_residents = 4243262976, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 1572864, .waves = 207337122, .mlx_cache = 268435456, .mlx_cache_overshoot = 8916480, .pool_staging = 76976128, .host_side = 1050000000, .wire_tables = 341723296 }, .measured = .{ .footprint = 233591380856, .interval_peak = 234505166576, .mlx_active = 232662891116, .mlx_cache = 864, .mlx_peak = 232662891128, .physical = 266546413568, .file_backed = 19425361920, .speculative = 1026310144, .residual = 170665170, .mlx_residual = 266889258 } },
+            .{ .phase = "decode", .billed = .{ .slot_rows = 206146289664, .transient_rows = 458096640, .residents = 20187962880, .mtp_residents = 4243262976, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 1572864, .waves = 207337122, .mlx_cache = 268435456, .mlx_cache_overshoot = 8916480, .pool_staging = 76976128, .host_side = 1050000000, .wire_tables = 341723296 }, .measured = .{ .footprint = 233934672752, .interval_peak = 233967407984, .mlx_active = 232662926700, .mlx_cache = 270466212, .mlx_peak = 232761399996, .physical = 266892328960, .file_backed = 19427622912, .speculative = 1026310144, .residual = 708423762, .mlx_residual = 168380390 } },
+        },
+    },
+    .{
+        .name = "closing-e96bfe4-seed4321",
+        .pack = .exl3_30,
+        .gemm = .glm53,
+        .select = .kernel,
+        .baseline = 14288437248,
+        .units = .{ .prompt = 87, .decode = 93 },
+        .target = 257698037760,
+        .request = .{ .positions = 17415, .pending_rows = 1, .others = 13840656120, .target = 257698037760, .bytes = 28495026118 },
+        .positions = 17415,
+        .bill_bytes = 28495026118,
+        .live_bytes = 28554578266,
+        .cap = 96,
+        .grown = 96,
+        .grown_bytes = 19326910464,
+        .file_backed_start = 19427590144,
+        .records = .{
+            .{ .phase = "module constructed", .billed = .{ .slot_rows = 186819379200, .transient_rows = 3435724800, .mtp_residents = 4243262976, .pool_staging = 76976128, .host_side = 900000000 }, .measured = .{ .footprint = 195106364080, .interval_peak = 195611906680, .mlx_active = 194498366984, .mlx_cache = 0, .mlx_peak = 194498366984, .physical = 227862953984, .file_backed = 19428245504, .speculative = 1026424832, .residual = -136563576, .mlx_residual = -8 } },
+            .{ .phase = "prompt pass", .billed = .{ .slot_rows = 186819379200, .transient_rows = 3435724800, .residents = 20187962880, .mtp_residents = 4243262976, .kv = 1567014912, .mtp_kv = 23166976, .mtp_pending = 202113024, .waves = 7668348928, .mlx_cache = 17179869184, .mlx_cache_overshoot = 603979776, .pool_staging = 76976128, .host_side = 950000000, .wire_tables = 354506304 }, .measured = .{ .footprint = 234505297528, .interval_peak = 234764770144, .mlx_active = 216215042668, .mlx_cache = 17362193626, .mlx_peak = 222242149160, .physical = 267415322624, .file_backed = 19428458496, .speculative = 1026883584, .residual = 8547534944, .mlx_residual = 1904824536 } },
+            .{ .phase = "handover", .billed = .{ .slot_rows = 206146289664, .transient_rows = 458096640, .residents = 20187962880, .mtp_residents = 4243262976, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 1572864, .waves = 207337122, .mlx_cache = 268435456, .mlx_cache_overshoot = 8916480, .pool_staging = 76976128, .host_side = 1050000000, .wire_tables = 341723296 }, .measured = .{ .footprint = 233592380208, .interval_peak = 234505920120, .mlx_active = 232662891116, .mlx_cache = 864, .mlx_peak = 232662891128, .physical = 266504208384, .file_backed = 19428458496, .speculative = 1026883584, .residual = 169911626, .mlx_residual = 266889258 } },
+            .{ .phase = "decode", .billed = .{ .slot_rows = 206146289664, .transient_rows = 458096640, .residents = 20187962880, .mtp_residents = 4243262976, .kv = 1660698624, .mtp_kv = 24559616, .mtp_pending = 1572864, .waves = 207337122, .mlx_cache = 268435456, .mlx_cache_overshoot = 8916480, .pool_staging = 76976128, .host_side = 1050000000, .wire_tables = 341723296 }, .measured = .{ .footprint = 233961280440, .interval_peak = 233967080376, .mlx_active = 232662926700, .mlx_cache = 269478648, .mlx_peak = 232760507164, .physical = 266864934912, .file_backed = 19429310464, .speculative = 1026883584, .residual = 708751370, .mlx_residual = 169273222 } },
+        },
+    },
+};
 
 /// MLX's bytes the host holds before the module allocates: mlx-serve seeds MLX's default random key at its start
 /// (`mlx_random_seed`: an array of 2 uint32). They sit in the load's baseline (the box before the load), not in the
@@ -104,7 +167,7 @@ test "glm bill receipts: each run's phase terms, page tables and residuals rebui
     defer c.deinit(testing.allocator);
     for (receipts) |r| {
         errdefer std.debug.print("receipt {s}\n", .{r.name});
-        const in = inputs(&c, r.gemm, r.select, true);
+        const in = inputs(&c, r.pack, r.gemm, r.select, true);
         const b = bill.billOf(in);
         const req = bill.atRequest(in, r.request.positions, r.request.pending_rows);
         const p = r.units.prompt;
@@ -130,7 +193,7 @@ test "glm bill receipts: the fill at each run's baseline gives its units, one mo
     defer c.deinit(testing.allocator);
     for (receipts) |r| {
         errdefer std.debug.print("receipt {s}\n", .{r.name});
-        const in = inputs(&c, r.gemm, r.select, true);
+        const in = inputs(&c, r.pack, r.gemm, r.select, true);
         const mb = try bill.memoryBill(testing.allocator, bill.billOf(in), null);
         defer mb.free(testing.allocator);
         try testing.expectEqual(r.target, bill.targetOf(bill.box_exl3.gpu_target, bill.box_exl3.ram, r.baseline));
@@ -138,7 +201,8 @@ test "glm bill receipts: the fill at each run's baseline gives its units, one mo
         try testing.expectEqual(r.request.target, bill.targetOf(bill.box_exl3.gpu_target, bill.box_exl3.ram, r.request.others));
         try testing.expectEqual(r.request.bytes, bill.requestBudget(in, r.request.positions, r.request.pending_rows, r.units.prompt, r.request.others, r.request.target));
         try testing.expectEqual(r.bill_bytes, r.request.bytes);
-        const budget = @min(r.bill_bytes, r.live_bytes);
+        const cap_bytes = if (r.cap) |cp| bill.grownBytes(in.bank, r.units.prompt, cp) else std.math.maxInt(u64);
+        const budget = @min(@min(r.bill_bytes, r.live_bytes), cap_bytes);
         try testing.expectEqual(r.grown, bill.unitsIn(in.bank, r.units.prompt, budget));
         var prompt_rows: [150]u32 = undefined;
         var rows: [150]u32 = undefined;

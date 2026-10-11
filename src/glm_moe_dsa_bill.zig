@@ -998,6 +998,12 @@ pub const box_exl3_30 = struct {
         break :blk s;
     };
     pub const geometry: glm.Geometry = .{ .layers = &slots, .widest_record = 4 * 3_578_880, .widest_span = 2_385_920, .minis_per_id = 4, .spec_record = 3 * 3_579_904 + 3_578_880, .scratch = .{ box_exl3.arrays(3), @splat(0) }, .k_mask = 1 << 3 };
+    /// The trunk's residents: the 3.42 pack's (the converter takes them from the same mixed 4/8-bit pack).
+    pub const resident_bytes = box_exl3.resident_bytes;
+    pub const resident_class_bytes = box_exl3.resident_class_bytes;
+    /// The MTP directory: the 3.42 pack's 23 residents of 578,488,832 B, the experts' 1,024 K3 minis of 3,664,773,120 B
+    /// over two bank layers (the closing runs' "MTP experts" line) and their slot table.
+    pub const mtp: Mtp = .{ .depth = 3, .resident_bytes = 578_488_832, .expert_bytes = 3_664_773_120 + 1024 };
 };
 
 /// The box's served EXL3 module: GLM-5.3's prompt kernels, the spans' top-k kernel.
