@@ -742,7 +742,7 @@ pub fn decodeWindowRows(cfg: *const settings.Config) u32 {
 
 /// The stream's shape the module builds from `cfg`.
 pub fn streamShape(cfg: *const settings.Config) StreamShape {
-    return .{ .wide_depth = cfg.wideDepth(), .decode_window_rows = decodeWindowRows(cfg), .lookahead_budget = cfg.lookaheadBudget() };
+    return .{ .wide_depth = cfg.wideDepth(), .decode_window_rows = decodeWindowRows(cfg), .lookahead_budget = cfg.lookaheadBudget(), .workers = cfg.readWorkers() };
 }
 
 /// The bill of `cfg`'s pack for prompts up to `prompt_tokens` (the SDK's view, `memoryBill`): the residents from the

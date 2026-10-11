@@ -42,6 +42,8 @@ pub const Config = struct {
     expert_wide_depth: ?u8 = null,
     /// The decode lookahead's records read ahead per routed call (null = 2; 1 .. `max_lookahead_budget`).
     expert_lookahead_budget: ?u32 = null,
+    /// The read pool's workers (null = 4; 1 .. `max_read_workers`).
+    expert_read_workers: ?u32 = null,
     /// The MTP draft lane's drafts per round (null or 0 = off; 1 .. `max_mtp_depth`).
     mtp_depth: ?u32 = null,
     /// A `mtp_depth` past the route limit: refused by name at load (`error.MtpDepthOverRouteLimit`).
@@ -62,6 +64,7 @@ pub const Config = struct {
     pub const max_wide_depth: i64 = 5;
     /// The lookahead's widest budget (`sdk_ext.expert.lookahead.max_budget`).
     pub const max_lookahead_budget: i64 = @import("sdk_ext.zig").expert.lookahead.max_budget;
+    pub const max_read_workers: i64 = @import("sdk_ext.zig").expert.io.max_workers;
     /// The deepest draft a round verifies: its depth + 1 rows of top-8 routes in the stream's decode lane
     /// (`sdk_ext.expert.policy.max_route_ids` = 48).
     pub const max_mtp_depth: u32 = @import("sdk_ext.zig").expert.policy.max_route_ids / glm.routed_top_k - 1;
@@ -109,6 +112,10 @@ pub const Config = struct {
         };
         if (obj.get("expert_lookahead_budget")) |v| if (v == .integer and v.integer >= 1 and v.integer <= max_lookahead_budget) {
             c.expert_lookahead_budget = @intCast(v.integer);
+            any = true;
+        };
+        if (obj.get("expert_read_workers")) |v| if (v == .integer and v.integer >= 1 and v.integer <= max_read_workers) {
+            c.expert_read_workers = @intCast(v.integer);
             any = true;
         };
         if (obj.get("ctx_size")) |v| if (v == .integer and v.integer >= 1) {
@@ -211,6 +218,10 @@ pub const Config = struct {
         return c.expert_lookahead_budget orelse 2;
     }
 
+    pub fn readWorkers(c: *const Config) u32 {
+        return c.expert_read_workers orelse 4;
+    }
+
     /// A `ctx_size` over the model's limit, refused by name (never a silent fall back to the standard context).
     pub fn checkCtxSize(c: *const Config) error{CtxSizeOverModelLimit}!void {
         const v = c.ctx_size_over_limit orelse return;
@@ -249,6 +260,10 @@ test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up 
     try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_lookahead_budget\": 4}")).lookaheadBudget());
     try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 5}")).lookaheadBudget());
     try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 0}")).lookaheadBudget());
+    try testing.expectEqual(@as(u32, 4), (Config{}).readWorkers());
+    try testing.expectEqual(@as(u32, 8), (try settingsOf("{\"expert_read_workers\": 8}")).readWorkers());
+    try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_read_workers\": 9}")).readWorkers());
+    try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_read_workers\": 0}")).readWorkers());
     try testing.expectEqual(@as(?u32, 131072), (try settingsOf("{\"ctx_size\": 131072}")).max_context_tokens);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"ctx_size\": \"131072\"}")).max_context_tokens);
     const over = try settingsOf("{\"ctx_size\": 2097152}");

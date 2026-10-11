@@ -493,6 +493,16 @@ int q3ld_direct_config(int32_t on) {
     return 0;
 }
 
+/* RANGE JOBS: a demand submit queues each of its ranges as its own job (gate/up ranges first, in ticket order), so
+ * idle workers read one submit's ranges side by side; a failed range no longer skips the rest of its submit (each
+ * range's status is its own).  Off unless q3ld_range_jobs_config. */
+static int range_jobs = 0;
+
+int q3ld_range_jobs_config(int32_t on) {
+    range_jobs = on != 0;
+    return 0;
+}
+
 static int direct_ok(const job_t *job, const range_t *rg) {
     if (!direct_reads || rg->offset % page_size) return 0;
     int64_t total = 0;
@@ -1306,7 +1316,7 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     for (int32_t i = 0; i < count; i++) {
         if (res[(first + i) * RES_W] == ST_PENDING) { pthread_mutex_unlock(&mu); return -2; }
     }
-    if (qlen >= qcap) { pthread_mutex_unlock(&mu); return -3; }
+    if (qlen + (range_jobs ? count : 1) > qcap) { pthread_mutex_unlock(&mu); return -3; }
     for (int32_t i = 0; i < count; i++) {
         int down = i >= n;
         int32_t item = down ? i - n : i;
@@ -1345,11 +1355,15 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
         if (woke) pthread_cond_broadcast(&pre_cv);
     }
     if (nspec) claim_ranges(fd, first, count);
-    job_t *job = &queue[(qhead + qlen) % qcap];
-    job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->first = first; job->count = count;
-    __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
+    int32_t jobs = range_jobs ? count : 1;
+    for (int32_t j = 0; j < jobs; j++) {
+        job_t *job = &queue[(qhead + qlen) % qcap];
+        job->fd = fd; job->file_size = file_size; job->deadline = deadline;
+        job->first = range_jobs ? first + j : first; job->count = range_jobs ? 1 : count;
+        __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
+    }
     EV(1, first);
-    pthread_cond_signal(&work_cv);
+    if (jobs > 1) pthread_cond_broadcast(&work_cv); else pthread_cond_signal(&work_cv);
     pthread_mutex_unlock(&mu);
     return 0;
 }

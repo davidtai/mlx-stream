@@ -202,6 +202,39 @@ test "dsv41 io: injected faults map to status words" {
     }
 }
 
+test "dsv41 io: range jobs: one submit's ranges run on several workers, each range's status its own" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(40 * page);
+    defer f.deinit();
+    var pool = try Pool.start(testing.allocator, .{ .workers = 4, .staging_bytes = page, .tickets = 64, .range_jobs = true });
+    defer pool.stop();
+    defer clearFaults();
+    const lens = [n_components]u64{ 100, 100, 100, 100, 100, 100, 50, 50, 50 };
+    const gu = [2]u64{ 500, 2 * page + 500 };
+    const down = [2]u64{ 4 * page + 500, 6 * page + 500 };
+    // gu0 sleeps 200 ms first: gu1 and both downs land on other workers before it; gu1 fails alone.
+    injectFaults(&.{ 0, 2 * @as(i64, @intCast(page)) }, &.{ 5, 2 }, &.{ 200 * std.time.ns_per_ms, 0 });
+    var d = try Dests.init(2, &lens);
+    defer testing.allocator.free(d.buf);
+    const first = try R96.submit(pool, f.ufd, &gu, &down, d.rows[0..2], &lens);
+    try pool.wait(first, 4, 10 * std.time.ns_per_s);
+    const want = [4]Status{ .ok, .os_error, .ok, .ok };
+    for (want, 0..) |w, k| try testing.expectEqual(w, pool.result(first + @as(u32, @intCast(k))).status);
+    const r0 = pool.result(first);
+    for (2..4) |k| {
+        const r = pool.result(first + @as(u32, @intCast(k)));
+        try testing.expect(r.worker != r0.worker);
+        try testing.expect(r.t_end_ns < r0.t_end_ns);
+    }
+    try d.expectRecord(0, f.image, gu[0], down[0], &lens);
+    // Record 1's gate/up failed; its down range was not skipped.
+    var at = down[1];
+    for (gu_components..n_components) |k| {
+        try testing.expectEqualSlices(u8, f.image[at..][0..lens[k]], d.part(1, k, &lens));
+        at += lens[k];
+    }
+}
+
 test "dsv41 io: stop joins and restarts" {
     try testing.expectEqual(@as(i32, abi_version), c.q3ld_abi());
     var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = std.heap.pageSize(), .tickets = 16 });
