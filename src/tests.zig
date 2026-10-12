@@ -110,4 +110,8 @@ comptime {
     _ = @import("arch/glm_moe_dsa/glm53_exl3/selfcheck.zig");
     _ = @import("arch/glm_moe_dsa/glm53_exl3/routes.zig");
     _ = @import("arch/glm_moe_dsa/glm53_exl3/quant.zig");
+    _ = @import("arch/glm5_next/decode_kernels.zig");
+    _ = @import("arch/glm5_next/decode_kernels_selfcheck.zig");
+    _ = @import("arch/glm5_next/decode_kernels_ref.zig");
+    _ = @import("arch/glm5_next/decode_kernels_parity.zig");
 }
