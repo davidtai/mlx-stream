@@ -125,4 +125,8 @@ comptime {
     // GLM-5.3's refusal on a host without its surface: its own file, compiled only on such a host (the GLM tests above
     // skip there).
     if (!@import("host_caps.zig").glm) _ = @import("arch/glm_moe_dsa/host_surface_test.zig");
+    _ = @import("arch/glm5_next/decode_kernels.zig");
+    _ = @import("arch/glm5_next/decode_kernels_selfcheck.zig");
+    _ = @import("arch/glm5_next/decode_kernels_ref.zig");
+    _ = @import("arch/glm5_next/decode_kernels_parity.zig");
 }
