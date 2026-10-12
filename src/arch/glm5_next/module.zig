@@ -218,12 +218,20 @@ pub const Module = struct {
         };
         self.gates = try self.w.gates(gpa, self.c.decode_predict);
         errdefer gpa.free(self.gates);
-        // The expert source at the plan's rows, every routed layer alike.
+        // The expert source at the plan's rows: every routed layer alike (`expert_rows_by_layer: uniform`, the default), or
+        // the setting's split of the decode rows at the same total (prompt rows min(plan's, the layer's decode)).
         const n_moe = model.moeLayers();
         const prompt_rows = try arena.allocator().alloc(u32, n_moe);
         const decode_rows = try arena.allocator().alloc(u32, n_moe);
-        @memset(prompt_rows, plan.rows.prompt);
-        @memset(decode_rows, plan.rows.decode);
+        settings.layerRows(self.c.expert_rows_by_layer, plan.rows, model.n_routed_experts, prompt_rows, decode_rows) catch |e| {
+            log.err("glm5_next: load refused: expert_rows_by_layer does not fit the plan's rows {d}/{d} ({s})\n", .{ plan.rows.prompt, plan.rows.decode, @errorName(e) });
+            return e;
+        };
+        if (self.c.expert_rows_by_layer == .offsets) {
+            var sum_p: u64 = 0;
+            for (prompt_rows) |r| sum_p += r;
+            log.info("glm5_next expert rows by layer installed: decode {any} (sum {d} = {d} x {d}), prompt {any} (sum {d}); bill unchanged\n", .{ decode_rows, @as(u64, plan.rows.decode) * n_moe, n_moe, plan.rows.decode, prompt_rows, sum_p });
+        }
         // `gpu_keep_warm` (MiMo's X12): the DEFAULT on a CPU stream resolves to the control here, once, with one line; a
         // named route still refuses by name there (the install).
         const warm_route = self.c.warmRoute(gpu_warm.gpuStream(s));
@@ -231,7 +239,7 @@ pub const Module = struct {
         self.src = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally);
         errdefer self.src.deinit();
         // The rate tally (`expert_resident_ratio` > 0): its file read once (the first request's pins), its line.
-        try self.openTally(dir, plan.rows.decode);
+        try self.openTally(dir, std.mem.min(u32, decode_rows));
         errdefer self.closeTally();
         if (self.src.warm != null) log.info("glm5_next gpu keep-warm installed: gpu_keep_warm=waits source={s} (MiMo X12: a {d}-thread spin on its own Metal queue in chunks of ~{d} us while the stream's gated parts and the read-ahead wait for their bytes; no model array touched; bill {d} B)\n", .{ if (self.c.gpu_keep_warm_requested) "setting" else "default", gpu_warm.threads, gpu_warm.chunk_target_ns / std.time.ns_per_us, gpu_warm.bill_bytes });
         if (self.c.decode_predict == .bf16) log.info("glm5_next decode predictor installed: the lookahead's scores on the routers' BF16 weights ([experts, hidden], MLX gemv; the F32 copies stay the prompt routing's)\n", .{});
