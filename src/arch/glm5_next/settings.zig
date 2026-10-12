@@ -7,7 +7,9 @@
 //! mHC hcPre chain, the router and top-8 texts, the combine with the shared expert's add, glue.zig; `ops`, the stock op
 //! chains, the control); `decode_kda` the decode lane's KDA layer (`fused`, the default: one text a layer, kda_decode.zig;
 //! `ops`, the op chain, the control); `decode_dsa` the decode lane's sparse latent attention (`fused`, the default: two
-//! texts, dsa_decode.zig; `ops`, the op chain, the control); `logits_dump_dir` (an absolute directory) installs the logits dump route for the KL gate
+//! texts, dsa_decode.zig; `ops`, the op chain, the control); `decode_predict` the lookahead predictor's router weight
+//! (`bf16`, the default: the stored BF16 weight; `f32`, the transposed F32 copy, the control); `decode_swiglu` the decode lane's MLP activation
+//! (`fused`, the default: one text, swiglu.zig; `ops`, the op chain, the control); `logits_dump_dir` (an absolute directory) installs the logits dump route for the KL gate
 //! (dump.zig): absent, nothing of it is built.
 
 const std = @import("std");
@@ -26,7 +28,7 @@ pub const allocator_cache_bytes: u64 = 256 << 20;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "logits_dump_dir" };
 
 /// The decode lane's routed-expert route, installed once at construction: `stock` MLX's gather_qmm nvfp4 (two gathers
 /// and the clamped SwiGLU, then a gather per down), `fused` the NVFP4 decode texts (decode_kernels.zig: MiMo's k1 family
@@ -47,6 +49,15 @@ pub const DecodeKda = enum { ops, fused };
 /// (MiMo's dec_attn split pattern for MLA over the selected latent rows) and MiMo's merge text; `ops` the op chain (the
 /// control). Rounding-class against `ops`.
 pub const DecodeDsa = enum { ops, fused };
+/// The lookahead predictor's scores (the next routed layer's router on this layer's routed input; they pick reads only,
+/// never an expert or a weight of a forward), installed once at construction: `bf16` the router's BF16 weight as stored
+/// [experts, hidden] (MiMo X19 `predict_router: bf16`: half the bytes of the F32 copy, no input cast); `f32` the
+/// transposed F32 copy (the control). Token-exact: the forward's routing never reads them.
+pub const DecodePredict = enum { f32, bf16 };
+/// The decode lane's MLP activation (the dense MLPs' and the shared experts' clamped SwiGLU), installed once at
+/// construction (swiglu.zig): `fused` one text between the gate / up GEMVs and the down GEMV; `ops` the op chain (the
+/// control). Rounding-class against `ops`.
+pub const DecodeSwiglu = enum { ops, fused };
 /// The longest dump directory a setting may name.
 pub const max_dump_dir: usize = 480;
 
@@ -75,6 +86,10 @@ pub const Config = struct {
     decode_kda: DecodeKda = .fused,
     /// The decode lane's DSA sparse latent attention (dsa_decode.zig): `fused` (the default) or `ops` (the control).
     decode_dsa: DecodeDsa = .fused,
+    /// The lookahead predictor's router weight: `bf16` (the default) or `f32` (the control).
+    decode_predict: DecodePredict = .bf16,
+    /// The decode lane's MLP activation (swiglu.zig): `fused` (the default) or `ops` (the control).
+    decode_swiglu: DecodeSwiglu = .fused,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -86,7 +101,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, dump_dir: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, dump_dir: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -111,6 +126,14 @@ pub const Config = struct {
         if (raw.object.get("decode_dsa")) |v| {
             const route: ?DecodeDsa = if (v == .string) std.meta.stringToEnum(DecodeDsa, v.string) else null;
             if (route) |r| c.decode_dsa = r else c.malformed.decode_dsa = true;
+        }
+        if (raw.object.get("decode_predict")) |v| {
+            const route: ?DecodePredict = if (v == .string) std.meta.stringToEnum(DecodePredict, v.string) else null;
+            if (route) |r| c.decode_predict = r else c.malformed.decode_predict = true;
+        }
+        if (raw.object.get("decode_swiglu")) |v| {
+            const route: ?DecodeSwiglu = if (v == .string) std.meta.stringToEnum(DecodeSwiglu, v.string) else null;
+            if (route) |r| c.decode_swiglu = r else c.malformed.decode_swiglu = true;
         }
         if (raw.object.get("logits_dump_dir")) |v| {
             const ok = v == .string and v.string.len > 1 and v.string.len <= max_dump_dir and v.string[0] == '/' and std.mem.indexOfScalar(u8, v.string, 0) == null;
@@ -158,6 +181,8 @@ pub const Config = struct {
         if (c.malformed.decode_glue) return error.Glm5NextDecodeGlueSetting;
         if (c.malformed.decode_kda) return error.Glm5NextDecodeKdaSetting;
         if (c.malformed.decode_dsa) return error.Glm5NextDecodeDsaSetting;
+        if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
+        if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
         if (c.kv_quant_bits) |b| if (b != 0 and b != 16) return error.Glm5NextKvQuantUnsupported;
         if (c.expert_rows) |d| if (d > c.model.n_routed_experts) return error.Glm5NextExpertRows;
         if (c.expert_prefill_rows) |p| if (p > c.model.n_routed_experts) return error.Glm5NextExpertRows;
@@ -218,6 +243,14 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(DecodeDsa.fused, pinned.decode_dsa);
     try testing.expectEqual(DecodeDsa.ops, (try parseSettings("{\"decode_dsa\":\"ops\"}")).decode_dsa);
     try testing.expectError(error.Glm5NextDecodeDsaSetting, (try parseSettings("{\"decode_dsa\":\"nax\"}")).validate());
+    // The lookahead predictor: bf16 unless named; f32 (the control) by name; anything else refused by name.
+    try testing.expectEqual(DecodePredict.bf16, pinned.decode_predict);
+    try testing.expectEqual(DecodePredict.f32, (try parseSettings("{\"decode_predict\":\"f32\"}")).decode_predict);
+    try testing.expectError(error.Glm5NextDecodePredictSetting, (try parseSettings("{\"decode_predict\":\"fp8\"}")).validate());
+    // The decode MLP activation: fused unless named; ops (the control) by name; anything else refused by name.
+    try testing.expectEqual(DecodeSwiglu.fused, pinned.decode_swiglu);
+    try testing.expectEqual(DecodeSwiglu.ops, (try parseSettings("{\"decode_swiglu\":\"ops\"}")).decode_swiglu);
+    try testing.expectError(error.Glm5NextDecodeSwigluSetting, (try parseSettings("{\"decode_swiglu\":true}")).validate());
     // The decode glue: fused unless named; ops (the control) by name; anything else refused by name.
     try testing.expectEqual(DecodeGlue.fused, pinned.decode_glue);
     try testing.expectEqual(DecodeGlue.ops, (try parseSettings("{\"decode_glue\":\"ops\"}")).decode_glue);

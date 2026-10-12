@@ -41,6 +41,8 @@ pub const fused_kernels_bytes: u64 = 16 << 20;
 pub const glue_kernels_bytes: u64 = 8 << 20;
 /// The fused KDA decode text (kda_decode.zig: four widths), its pipelines and configs, declared (`kda_kernels` term).
 pub const kda_kernels_bytes: u64 = 4 << 20;
+/// The decode MLP activation text (swiglu.zig: eight launch configs), declared (`swiglu_kernels` term).
+pub const swiglu_kernels_bytes: u64 = 1 << 20;
 /// The fused DSA decode texts (dsa_decode.zig: the split's four widths and MiMo's merge), declared, plus the split's
 /// partials at the decode lane's widest call (pacc f32 [H x 4, 16, 512] and pm / pl), geometric (`dsa_kernels` term).
 pub fn dsaKernelsBytes(c: *const glm.Config) u64 {
@@ -149,6 +151,8 @@ pub const Inputs = struct {
     decode_kda: settings.DecodeKda = .ops,
     /// The decode lane's DSA sparse latent attention (`settings.DecodeDsa`).
     decode_dsa: settings.DecodeDsa = .ops,
+    /// The decode lane's MLP activation (`settings.DecodeSwiglu`).
+    decode_swiglu: settings.DecodeSwiglu = .ops,
     /// The MTP lane's construction facts (`mtp_lane` on; null: the serial control, none of the lane's terms).
     mtp: ?mtp.Facts = null,
     page: u64 = 16_384,
@@ -446,6 +450,8 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
         .{ .name = "kda_kernels", .bytes = @splat(if (in.decode_kda == .fused) kda_kernels_bytes else 0), .at_construction = true },
         // `decode_dsa: fused`: the DSA decode texts and the split's partials, declared; 0 under `ops`.
         .{ .name = "dsa_kernels", .bytes = @splat(if (in.decode_dsa == .fused) dsaKernelsBytes(&in.model) else 0), .at_construction = true },
+        // `decode_swiglu: fused`: the MLP activation text, declared; 0 under `ops`.
+        .{ .name = "swiglu_kernels", .bytes = @splat(if (in.decode_swiglu == .fused) swiglu_kernels_bytes else 0), .at_construction = true },
         .{ .name = "slot_wiring", .bytes = @splat(0), .at_construction = false, .with_rows = true },
     };
     return .{
@@ -490,6 +496,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .decode_glue = cfg.decode_glue,
         .decode_kda = cfg.decode_kda,
         .decode_dsa = cfg.decode_dsa,
+        .decode_swiglu = cfg.decode_swiglu,
         .mtp = lane,
         .page = page,
     };

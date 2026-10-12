@@ -25,6 +25,8 @@ const dsa = @import("dsa.zig");
 const experts = @import("experts.zig");
 const nvfp4 = @import("nvfp4.zig");
 const glue = @import("glue.zig");
+const settings = @import("settings.zig");
+const swiglu = @import("swiglu.zig");
 /// Profile builds: the prompt pass's stage marks (MiMo's timeline, armed by `GLM5_NEXT_PREFILL_TIMELINE`); every mark
 /// compiles to nothing in a served build.
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
@@ -255,11 +257,12 @@ pub const Weights = struct {
         return x;
     }
 
-    /// The gates the expert scheduler's lookahead reads, one per model layer (a dense layer's empty): the router's
-    /// transposed F32 copy and its correction bias.
-    pub fn gates(w: *const Weights, a: std.mem.Allocator) ![]experts.Gate {
+    /// The gates the expert scheduler's lookahead reads, one per model layer (a dense layer's empty): the router's weight
+    /// the installed predictor reads (`decode_predict`: `bf16` the stored BF16 [experts, hidden], `f32` the transposed
+    /// F32 copy) and its correction bias.
+    pub fn gates(w: *const Weights, a: std.mem.Allocator, predict: settings.DecodePredict) ![]experts.Gate {
         const out = try a.alloc(experts.Gate, w.layers.len);
-        for (out, w.layers) |*gt, lw| gt.* = if (lw.router) |r| .{ .w = r.w_t, .bias = r.bias } else .{ .w = .{ .ctx = null }, .bias = .{ .ctx = null } };
+        for (out, w.layers) |*gt, lw| gt.* = if (lw.router) |r| .{ .w = if (predict == .bf16) r.w else r.w_t, .bias = r.bias } else .{ .w = .{ .ctx = null }, .bias = .{ .ctx = null } };
         return out;
     }
 };
@@ -502,6 +505,13 @@ pub fn mlp(g: *G, c: *const glm.Config, m: Mlp, x: T) !T {
     return linear(g, act, m.down);
 }
 
+/// A decode-lane MLP (x [rows, hidden], rows <= 4): the activation on the fused text where the module installed it
+/// (`decode_swiglu: fused`, swiglu.zig), the op chain otherwise (`mlp`). The GEMVs are `linear`'s either way.
+fn mlpDecode(g: *G, c: *const glm.Config, m: Mlp, x: T, sw: ?*const swiglu.Kernels, width: swiglu.Width, rows: u32) !T {
+    const k = sw orelse return mlp(g, c, m, x);
+    return linear(g, try swiglu.activate(g, k, width, try linear(g, x, m.gate), try linear(g, x, m.up), rows), m.down);
+}
+
 /// A prompt call's dense MLP over `x` [rows, hidden] in tiles of `dense_tile_rows` rows: each tile committed as built
 /// and the tile before it waited (at most `spans_in_flight` tiles' intermediates live), the tiles joined. The same rows
 /// through the same graph as `mlp`: each output row depends on its own input row only.
@@ -595,6 +605,8 @@ pub const Routes = struct {
     /// The decode lane's KDA layer (`decode_kda`, kda.zig `Step`): the op chain unless the module installed the fused
     /// text (kda_decode.zig). The prompt's wide calls and the MTP verify's capture always run the op chain.
     kda: kda.Step = .{},
+    /// The decode lane's MLP activation (`decode_swiglu`): the op chain unless the module installed the fused text.
+    swiglu: ?*const swiglu.Kernels = null,
 };
 
 /// What a forward hands back after its last layer (a comptime route per call site):
@@ -689,9 +701,9 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             nx.* = try rmsNorm(g, cl.x, lw.post_norm, c.rms_norm_eps);
         }
         const x = try g.reshape(if (n_spans == 1) normed[0] else try g.concat(normed, 1), &.{ @intCast(rows), hidden });
-        const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, x, rows) else try mlp(g, c, d, x)) else blk: {
+        const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, x, rows) else try mlpDecode(g, c, d, x, routes.swiglu, .dense, rows)) else blk: {
             const r = try route(g, c, lw.router.?, x);
-            const shared = try mlp(g, c, lw.shared.?, x);
+            const shared = if (prompt) try mlp(g, c, lw.shared.?, x) else try mlpDecode(g, c, lw.shared.?, x, routes.swiglu, .shared, rows);
             // A prompt call commits the shared expert before its routed call (the GPU runs it while the host routes and
             // the first group's reads land); a decode-lane call hands it over as the call's hoist (run during its read
             // wait). The sum is the same either way.
@@ -800,11 +812,11 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
         g.release(stream);
         stream = g.keep(pf.h.?);
         const x = try g.reshape(pf.normed, &.{ r, hidden });
-        const f = if (lw.dense) |d| try mlp(g, c, d, x) else blk: {
+        const f = if (lw.dense) |d| try mlpDecode(g, c, d, x, routes.swiglu, .dense, rows) else blk: {
             const rt = lw.router.?;
             const routing = try glue.route(g, k, rt.w, rt.bias, x, rows);
             // The shared expert is the call's hoist (committed during its read wait); the combine text adds it.
-            const shared = try mlp(g, c, lw.shared.?, x);
+            const shared = try mlpDecode(g, c, lw.shared.?, x, routes.swiglu, .shared, rows);
             break :blk try g.adopt(try src.forwardShared(l, x, routing.ids, routing.weights, shared, k));
         };
         pend = Pending.of(g, try g.reshape(f, &.{ 1, r, hidden }), pf.post, pf.comb, stream);
@@ -864,6 +876,7 @@ test {
     _ = @import("kda_decode_parity.zig");
     _ = @import("dsa_decode.zig");
     _ = @import("dsa_decode_parity.zig");
+    _ = @import("swiglu.zig");
 }
 
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {

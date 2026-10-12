@@ -33,8 +33,9 @@ The block's optional `settings` object takes `expert_prefill_rows` and `expert_r
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
 is installed when true; off, the serial control, by default: below), `decode_moe` (the decode lane's expert route:
 `hitpass`, the default, `fused` or `stock`; anything else refused by name), `decode_glue` (the decode lane's glue:
-`fused`, the default, or `ops`), `decode_kda` and `decode_dsa` (the decode lane's KDA layer and DSA attention: `fused`,
-the default, or `ops`) and `logits_dump_dir` (below). Any other key refuses the load by name.
+`fused`, the default, or `ops`), `decode_kda`, `decode_dsa` and `decode_swiglu` (the decode lane's KDA layer, DSA attention and
+MLP activation: `fused`, the default, or `ops`), `decode_predict` (the lookahead predictor's router weight: `bf16`, the
+default, or `f32`) and `logits_dump_dir` (below). Any other key refuses the load by name.
 
 Residents: the text trunk loads (`model.language_model.layers.{0..44}.*`, `embed_tokens`, `norm`, `lm_head`: 1,178
 tensors, 17,842,673,276 B as MLX allocates them); the vision tower, the MTP layer (45) and the DSA layers' FP8 KV scales
@@ -103,6 +104,19 @@ same route. Logs `glm5_next decode DSA installed: the sparse latent attention in
 another geometry by name and launches its texts once at construction (the compile check); the routes line names both
 (`decode_kda=`, `decode_dsa=`).
 
+## The decode MLP activation and the lookahead predictor
+
+`decode_swiglu` (`swiglu.zig`): `fused` (the default) runs the clamped SwiGLU of the decode lane's dense MLPs and shared
+experts (silu(min(gate, 10)) x clip(up, -10, 10)) as one text between the gate / up GEMVs and the down GEMV, where the
+op chain runs five dispatches; f32 arithmetic and one BF16 rounding (rounding-class against `ops`). The GEMVs stay MLX's
+BF16 gemv (at the box's bandwidth) or whichever weight format's GEMV is bound: the seam. Logs `glm5_next decode SwiGLU
+installed: ...`; the prompt pass keeps the op chain.
+
+`decode_predict`: `bf16` (the default) scores the lookahead's next-layer prediction on the router's stored BF16 weight
+(MiMo X19's `predict_router: bf16`): half the bytes of the transposed F32 copy and no input cast. The scores pick the
+lookahead's reads only, never an expert of a forward, so the route is token-exact. `f32` is the control. Logs
+`glm5_next decode predictor installed: ...`. The routes line names both (`decode_predict=`, `decode_swiglu=`).
+
 ## The prompt pass
 
 Calls of at most 16,384 rows, layer by layer. Per routed layer, P1 posts the predicted seed (the layer's router on its
@@ -141,7 +155,7 @@ the billed context at construction), `kda_state`, `mlx_cache`, `mlx_cache_oversh
 predictor's, `decode_kernels` (the fused decode route's set and prepared launches, declared 16 MiB under `fused` and
 `hitpass`; 0 on `stock`), `glue_kernels` (the fused glue's texts, declared 8 MiB; 0 under `ops`), `kda_kernels` (the KDA
 decode text, declared 4 MiB), `dsa_kernels` (the DSA decode texts, declared 4 MiB, and the split's partials at four rows,
-8,421,376 B), `slot_wiring`). `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
+8,421,376 B), `swiglu_kernels` (the MLP activation text, declared 1 MiB), `slot_wiring`). `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
 
     GLM5_BANK=<pack> GLM5_BILL_BASELINES_GB=10.6,12.0,12.6,13.0 MLX_DEFAULT_DEVICE=cpu \
       zig build mlx-stream-test -Dtest-filter="the bill tool prints every term" -j4

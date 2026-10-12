@@ -43,6 +43,14 @@ pub const StreamSource = B.StreamSource;
 pub const Math = mimo_math.MathOf(nvfp4.Format);
 pub const Experts = shared_experts.ExpertsWith(ops.MlxOps, StreamSource, Math, .{ .prefill = true, .gated = true, .lookahead = true });
 pub const Gate = Experts.Gate;
+
+/// `decode_predict: bf16`: the next routed layer's scores from its router's BF16 weight as stored ([experts, hidden], MLX's
+/// gemv over x [n, hidden]), then the sigmoid and the correction as MiMo's F32 route: f32 [n, experts]. Half the F32
+/// copy's bytes and no input cast; the scores pick the lookahead's reads only.
+fn scoresBf16(_: *const mimo_math.Predictor, g: *ops.MlxOps, x: T, router: T, correction: T) anyerror!T {
+    const logits = try g.matmul(x, try g.transpose(router));
+    return g.add(try g.sigmoid(try g.astype(logits, .float32)), correction);
+}
 pub const Residents = B.S.Residents;
 
 /// MiMo's construction routes, fixed here (its stack of record; each exact against its control).
@@ -141,7 +149,7 @@ pub const Source = struct {
     /// Construction (the GPU stream, under the caller's lock): the bank opened, the stream at `rows`, the scheduler
     /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
     /// routed layer's.
-    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe) !*Source {
+    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict) !*Source {
         var bank = try bank_mod.Bank.open(a, io, model_dir);
         errdefer bank.deinit();
         const geo = bank.geometry;
@@ -194,7 +202,12 @@ pub const Source = struct {
         errdefer math.deinit(&self.g);
         math.drain = try Math.drainsOf(drain);
         math.bank_view = try Math.bankViewsOf(bank_view);
-        math.predictor = try mimo_math.Predictor.install(.f32, geo);
+        // The lookahead predictor (`decode_predict`): the scores on the router's BF16 weight (`scoresBf16`), or MiMo's F32
+        // route (the control); the gate table holds the matching weight (graph.zig `gates`).
+        math.predictor = switch (predict) {
+            .f32 => try mimo_math.Predictor.install(.f32, geo),
+            .bf16 => .{ .scores = scoresBf16 },
+        };
         // The decode lane's route: the fused NVFP4 texts installed here (their compile self-check, the launches prepared
         // per wave width), refused by name, under `fused` and `hitpass`; the stock gathers otherwise.
         if (decode_moe != .stock) {
