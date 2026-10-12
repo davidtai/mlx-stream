@@ -2084,6 +2084,39 @@ test "dsv41 stream: the keep route: a continuation's prompt finds the residents 
     }
 }
 
+test "dsv41 stream: a refused settle after the keep route: forgetResidents with the scratch still absent leaves the forget route's state; the next prompt plans as the first did" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, turn_opt);
+    defer s.deinit();
+    var first: [2]Plan = undefined;
+    var again: [2]Plan = undefined;
+    for (0..2) |req| {
+        try promptAndDecode(s, &sb, turn_prompt, &turn_decode, if (req == 0) &first else &again);
+        // The keep route's free (a continuation was coming), then its settle refused: the Module forgets the kept
+        // residents at once (`Module.requestEndFor`), and only the next request's change re-creates the scratch.
+        _ = try s.shrink(&.{ 4, 4 }, .keep);
+        try testing.expect(s.transient_released);
+        try testing.expectEqual(@as(u64, 8), s.residentCount());
+        try testing.expectEqual(@as(u32, 8), try s.forgetResidents());
+        for (s.layers) |*ls| {
+            try testing.expectEqual(@as(u32, 0), ls.policy.occupancy);
+            for (ls.policy.slot_to_expert) |e| try testing.expectEqual(expert_policy.no_expert, e);
+            try testing.expectEqual(@as(usize, 0), ls.policy.protected.count());
+            try testing.expectEqual(@as(usize, 0), ls.policy.seed.count());
+            for (ls.policy.prefill_freq, ls.policy.recency) |f, rc| try testing.expect(f == 0 and rc == 0);
+            try testing.expectEqual(@as(u64, 0), ls.policy.clock);
+        }
+        _ = try s.regrowTransient();
+    }
+    for (first, again) |x, y| {
+        try testing.expectEqualSlices(u32, x.slotsOf(), y.slotsOf());
+        try testing.expectEqualSlices(u16, x.missesOf(), y.missesOf());
+        try testing.expectEqualSlices(expert_policy.Load, x.loadsOf(), y.loadsOf());
+        try testing.expectEqual(@as(u32, 0), y.n_hits);
+    }
+}
+
 test "dsv41 stream: a request cancelled in its prompt phase: its live and held routes are settled at its end, and the next prompt routes" {
     var sb = try SynthBank.open(32);
     defer sb.close();
