@@ -335,7 +335,7 @@ pub const Bank = struct {
 const testing = std.testing;
 
 /// Deterministic, position-dependent bytes (`expert_bank.fillPattern`).
-pub const fillPattern = @import("expert_bank.zig").fillPattern;
+pub const fillPattern = @import("expert/bank.zig").fillPattern;
 
 /// A synthetic bank: `experts.bin` (every record its own pattern) and its manifest, for a config's sparse layers; each
 /// field below perturbs one rule. The geometry is written out here independently of `layerSegments`.

@@ -137,6 +137,8 @@ pub const Stats = struct {
     ahead_hits: u64 = 0,
     ahead_demand: u64 = 0,
     ahead_bytes: u64 = 0,
+    /// P7 overlap: read-ahead records never read because the call's plans evict them before any hit (`p7Tail`).
+    ahead_dropped: u64 = 0,
     /// Prompt records copied from a transient row into a resident's row (`Stream.promote`) and their bytes.
     promoted: u64 = 0,
     promoted_bytes: u64 = 0,

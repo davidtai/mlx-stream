@@ -146,7 +146,7 @@ pub const StreamShape = struct {
     max_route_ids: u32 = 48,
     /// Prompt routes live at once in one layer (`settings.wideDepth`).
     wide_depth: u8 = 5,
-    /// Decode's transient window (`Stream.Options.decode_window_rows`): the widest decode call's routed ids.
+    /// Decode's transient window (`Stream.Options.decode_route_ids`): the widest decode call's routed ids.
     decode_window_rows: u32 = 48,
     /// The decode lookahead's speculative records per call.
     lookahead_budget: u32 = 2,

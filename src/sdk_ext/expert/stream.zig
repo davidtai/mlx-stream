@@ -323,12 +323,47 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
         // ── Stream: per-layer slot pools, routes, deferred release, growth ──
 
+        /// P7 (mimo/p7-prefill-reads): the prompt pass's read schedule, a construction-time route (`Options.prompt_reads`).
+        /// `stock` (the control): the read-ahead posts every admitted record, in file order, while the layer's attention
+        /// runs, and the call lands all of it before its seed; the executor routes group g -- plans it and posts its reads --
+        /// when its depth schedule reaches it (g < depth at the call's start, else once group g - depth drained).
+        /// `overlap`: the same admissions and the same plans, with the reads moved. Every group of the call is planned at
+        /// its first route (`planCall`) by the same `planWith` over the same ids, with the held set (the persistent slots of
+        /// the `depth - 1` plans before it) and the transient window the stock schedule gives it, so every slot, bank, tile
+        /// and kernel is the stock schedule's. The read-ahead posts its first `depth x max_route_ids` records (the groups
+        /// routed at the call's start) in the prediction's rank order; the rest wait for the plans, which read those a
+        /// group hits before any evicts them and drop those evicted first (the stock schedule reads them twice). Each
+        /// group's reads are posted, in group order, as soon as their rows are free (every earlier group reading a row has
+        /// drained, the read-ahead record it overwrites has landed); a group's route returns once the read-ahead records it
+        /// hits have landed. The same records land in the same rows before any kernel reads them: exact by construction.
+        pub const PromptReads = enum { stock, overlap };
+
+        /// P7 `overlap` only (`Options.prompt_ahead`): how much of the read-ahead posts while the layer's attention runs.
+        /// `head` (try 2's form): its first `depth x max_route_ids` records in rank order, the rest resolved by the call's
+        /// plans after the attention (read when a group hits them first, dropped when evicted first). `whole`: every
+        /// admitted record in rank order, as the stock schedule posts them all (no tail, nothing dropped: a record the plans
+        /// evict before any hit is read and then overwritten, the stock schedule's double read), so the drive reads the
+        /// tail during the attention instead of after it, ahead of the call's misses. Neither moves an admission, a plan,
+        /// a slot or a kernel: the same records land in the same rows before any kernel reads them.
+        /// `whole_trim` (X21, mimo/ahead-trim): `whole`, then at the call's plans every read-ahead job no reader worker
+        /// has taken yet is withdrawn from the pool's queue (`Pool.withdraw`; it wrote no row) and its records are
+        /// resolved by the plans as `head`'s tail is (`p7Withdraw`, `p7Tail`): read once if a group hits them first (or
+        /// none touches them), dropped if a plan evicts them first. The head/tail boundary is where the drive stands when
+        /// the plans exist: a long attention leaves nothing queued (`whole`'s schedule), a short one leaves the tail
+        /// (`head`'s schedule without `head`'s idle drive). Same admissions, plans, slots and kernels.
+        pub const AheadPost = enum { head, whole, whole_trim };
+
         pub const Options = struct {
             /// Persistent rows per routed layer for the prefill phase: the caller's
             /// admission result (nothing here sizes memory).
             rows: []const u32,
             /// Widest route the caller passes (verify rows x top-k).
             max_route_ids: u32 = max_route_ids,
+            /// Widest DECODE route the caller passes (its decode lane's rows x top-k): decode's window 0 holds this many
+            /// rows (plus `decode_staging_rows`). 0 = `max_route_ids` (the control: every caller before this field).
+            /// A decode plan's transient loads number at most its distinct ids (`LayerPolicy.planWith`), so a caller whose
+            /// decode routes never exceed it never writes past the window.
+            decode_route_ids: u32 = 0,
             /// Transient rows shared by every layer; at least `max_route_ids`, so no
             /// route's misses can overflow them.
             transient_rows: u32 = max_route_ids,
@@ -354,9 +389,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// The phase change's transient release installed (`releaseTransient`, then the grow's window 0); off: the whole
             /// scratch stays through decode.
             transient_release: bool = false,
-            /// Decode's window 0 under the release: the routed ids of the widest decode call (null: `max_route_ids`). A
-            /// decode route over more ids is refused by name (`RouteWiderThanWindow`).
-            decode_window_rows: ?u32 = null,
             /// How the grow's new rows (decode's window 0 and every layer's ext) are allocated (`GrowFill`).
             grow_fill: GrowFill = .zeros,
             /// The reverse phase change keeps the residents of each layer's prompt rows (`shrink`): a later prompt finds
@@ -364,6 +396,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             keep_residents: bool = false,
             /// G7: the arch's read-ahead records (`ReadAheadProbe`), in the prefill-timers build only.
             read_ahead_probe: ProbeSlot = no_probe,
+            /// P7: the prompt pass's read schedule (`PromptReads`; `stock` is the control).
+            prompt_reads: PromptReads = .stock,
+            /// P7 `overlap`: the read-ahead posted with the attention (`AheadPost`); `whole` and `whole_trim` need `overlap`.
+            prompt_ahead: AheadPost = .head,
+            /// The read-ahead's admission bound in records; null: the stock rule, from the pool's tickets. A route that
+            /// widens the ticket ring pins it to the narrower ring's bound so the admissions stay the control's.
+            ahead_cap: ?u32 = null,
             /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
             tally: ?Tally = null,
         };
@@ -537,8 +576,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             probe: ProbeSlot = no_probe,
             memory: SlotMemory = .host,
             max_route_ids: u32,
-            /// Decode's window 0 rows (`Options.decode_window_rows`).
-            decode_window_rows: u32 = 0,
+            /// Decode's window 0 rows (`Options.decode_route_ids`, resolved): the widest decode route.
+            decode_route_ids: u32,
             records_per_part: u32,
             wide_depth: u8 = 1,
             phase: Phase = .prefill,
@@ -598,6 +637,16 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// The route recorder, a diagnostic its arch arms (`expert.routes`): every decode route, the handover's
             /// residents and prompt counts. Null: off.
             recorder: ?*expert_routes.Recorder = null,
+            /// P7 (`Options.prompt_reads`, `prompt_ahead`, `ahead_cap`).
+            prompt_reads: PromptReads = .stock,
+            prompt_ahead: AheadPost = .head,
+            ahead_cap: ?u32 = null,
+            /// P7 overlap: the prompt call being scheduled; per row (a layer's persistent slots [0, n_experts), then the
+            /// transient rows) the record its plans leave and its last reader; per persistent slot the read-ahead job
+            /// writing it (`no_job`: none). Empty under `stock`.
+            p7: P7 = .{},
+            p7_rows: []P7Row = &.{},
+            ahead_job: []u8 = &.{},
 
             /// P1's read-ahead of one layer: `loads[0..n]` (expert, slot) in file order, `reads[i]` false when the
             /// slot still held the record; its pool jobs `parts[0..n_parts]` over them (a Route's tickets).
@@ -608,13 +657,44 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 layer: u32 = 0,
                 n: u32 = 0,
                 n_parts: u32 = 0,
+                /// Records [0, posted) have jobs; P7 overlap leaves [posted, n) to the call's plans (`p7Tail`); `whole_trim`
+                /// moves `posted` back over the jobs it withdraws at the plans (`p7Withdraw`).
+                posted: u32 = 0,
                 loads: []LayerPolicy.ReadAhead,
                 reads: []bool,
                 parts: []Part,
+                /// Per job: landed (its reads waited, its rows' states set and unpinned).
+                landed: []bool,
             };
 
             /// The second geometry's transient scratch: its rows, their meta and the layer whose geometry it has.
             const AltTransient = struct { rows: Rows, meta: []SlotMeta, layer: u32 };
+
+            /// P7 overlap: one prompt call's schedule, from `planCall` to its last group's `releaseP7`.
+            pub const P7 = struct {
+                live: bool = false,
+                layer: u32 = 0,
+                distinct: []const u16 = &.{},
+                width: u32 = 0,
+                n_groups: u32 = 0,
+                activated: u32 = 0,
+                released: u32 = 0,
+                /// The next part to post, in group order.
+                post_g: u32 = 0,
+                post_p: u32 = 0,
+                /// Per group: its route (an index into `routes`) and its transient window.
+                route: [route_capacity]u8 = undefined,
+                window: [route_capacity]u8 = undefined,
+                /// Per group and part: the last earlier group reading one of its rows (-1: none) and the read-ahead jobs
+                /// writing one of them (a bit per job).
+                key: [route_capacity][max_route_ids]i8 = undefined,
+                ra: [route_capacity][max_route_ids]u64 = undefined,
+            };
+
+            /// P7 overlap: a row as the call's plans leave it: the record it will hold (the stock route's "the slot still
+            /// holds the record" test) and its last planned reader this call (-1: none).
+            pub const P7Row = struct { layer: u16 = 0, expert: u16 = 0, ready: bool = false, reader: i8 = -1 };
+            const no_job: u8 = std.math.maxInt(u8);
 
             const LayerSlots = struct {
                 policy: LayerPolicy,
@@ -639,9 +719,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (opt.rows) |r| if (r > bank.n_experts) return error.InvalidRows;
                 if (opt.wide_depth < 1 or opt.wide_depth > max_wide_depth or opt.transient_rows < @as(u32, opt.wide_depth) * opt.max_route_ids) return error.InvalidOptions;
                 const minis = maxMinis(bank);
+                if (opt.decode_route_ids > opt.max_route_ids) return error.InvalidOptions;
                 if (opt.max_route_ids == 0 or opt.max_route_ids > max_route_ids or opt.transient_rows < opt.max_route_ids or minis > max_minis or
                     opt.records_per_part == 0 or opt.records_per_part * minis > expert_io.max_items) return error.InvalidOptions;
-                if (opt.decode_window_rows) |w| if (w == 0 or w > opt.max_route_ids) return error.InvalidOptions;
                 // One transient row must hold any layer's record; per geometry, each of the two geometries has its scratch.
                 var widest: usize = 0;
                 for (bank.layers, 0..) |*l, i| if (spanOf(l) > spanOf(&bank.layers[widest])) {
@@ -733,8 +813,21 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer a.free(ahead_loads);
                 const ahead_reads = try a.alloc(bool, bank.n_experts);
                 errdefer a.free(ahead_reads);
-                const ahead_parts = try a.alloc(Part, std.math.divCeil(u32, bank.n_experts, expert_io.max_items / minis) catch unreachable);
+                // A job holds at most max_items / minis records (each mini one item); one more job than that division:
+                // P7 overlap posts the read-ahead in two runs (head, then tail).
+                const ahead_parts = try a.alloc(Part, (std.math.divCeil(u32, bank.n_experts, expert_io.max_items / minis) catch unreachable) + 1);
                 errdefer a.free(ahead_parts);
+                const ahead_landed = try a.alloc(bool, ahead_parts.len);
+                errdefer a.free(ahead_landed);
+                @memset(ahead_landed, false);
+                // P7 overlap: a job is a bit of a part's blockers (u64), groups index the route ring.
+                if (opt.prompt_reads == .overlap and ahead_parts.len > 64) return error.InvalidOptions;
+                if (opt.prompt_ahead != .head and opt.prompt_reads != .overlap) return error.InvalidOptions;
+                const p7_rows: []P7Row = if (opt.prompt_reads == .overlap) try a.alloc(P7Row, bank.n_experts + opt.transient_rows) else &.{};
+                errdefer if (p7_rows.len > 0) a.free(p7_rows);
+                const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts) else &.{};
+                errdefer if (ahead_job.len > 0) a.free(ahead_job);
+                @memset(ahead_job, no_job);
                 const pool = try expert_io.Pool.start(a, pool_opt);
                 errdefer pool.stop();
                 if (opt.lookahead) |la| if (la.preread) try B.Records.armPreRead(pool, &layers[widest].lens);
@@ -763,7 +856,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .probe = opt.read_ahead_probe,
                     .memory = opt.slot_memory,
                     .max_route_ids = opt.max_route_ids,
-                    .decode_window_rows = opt.decode_window_rows orelse opt.max_route_ids,
+                    .decode_route_ids = if (opt.decode_route_ids == 0) opt.max_route_ids else opt.decode_route_ids,
                     .records_per_part = opt.records_per_part,
                     .wide_depth = opt.wide_depth,
                     .selector = selector,
@@ -771,7 +864,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .event_word = word,
                     .gated = opt.event != null,
                     .owner = std.Thread.getCurrentId(),
-                    .ahead = .{ .loads = ahead_loads, .reads = ahead_reads, .parts = ahead_parts },
+                    .ahead = .{ .loads = ahead_loads, .reads = ahead_reads, .parts = ahead_parts, .landed = ahead_landed },
+                    .prompt_reads = opt.prompt_reads,
+                    .prompt_ahead = opt.prompt_ahead,
+                    .ahead_cap = opt.ahead_cap,
+                    .p7_rows = p7_rows,
+                    .ahead_job = ahead_job,
                 };
                 return self;
             }
@@ -803,6 +901,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 a.free(self.ahead.loads);
                 a.free(self.ahead.reads);
                 a.free(self.ahead.parts);
+                a.free(self.ahead.landed);
+                if (self.p7_rows.len > 0) a.free(self.p7_rows);
+                if (self.ahead_job.len > 0) a.free(self.ahead_job);
                 a.destroy(self);
             }
 
@@ -1141,6 +1242,24 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return self.layers.len > 0 and self.layers[0].policy.seeded and self.layers[0].policy.pin_limit > 0;
             }
 
+            /// P7 `overlap`: a request's read-ahead post (`AheadPost`), set once at the request's start by an arch that
+            /// chooses it per request (MiMo's `prefill_read_schedule: auto`, by the prompt's length). Only at a request's
+            /// start: refused on a `stock` stream, outside the prompt phase, on a failed stream, while anything of a prompt
+            /// pass is live (a read-ahead, a route, a planned call, a held slot) and once any layer holds a resident (the
+            /// request's first read-ahead or route admitted one; `forgetResidents` starts the next request empty), so a
+            /// request's prompt pass never changes it. `readAheadSeed` reads it at each layer's post as it reads the
+            /// construction value, and the call's plans read it for `whole_trim`'s withdraw (X21; `auto` never sets
+            /// `whole_trim`); nothing else does.
+            pub fn setPromptAhead(self: *Stream, post: AheadPost) !void {
+                if (self.prompt_reads != .overlap) return error.InvalidOptions;
+                if (self.phase != .prefill) return error.NotPrefill;
+                if (self.failed) return error.StreamFailed;
+                if (self.ahead.live or self.p7.live or self.held_base.items.len > 0) return error.RoutesLive;
+                for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
+                for (self.layers) |*ls| if (ls.policy.occupancy != 0) return error.PromptStarted;
+                self.prompt_ahead = post;
+            }
+
             /// The last `seedPrefill` of `layer`: its seed's ranks (the call's hottest experts, hottest first).
             pub fn seedRanks(self: *const Stream, layer: u32) u32 {
                 return self.layers[layer].policy.seed_ranks;
@@ -1151,7 +1270,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn seedPrefill(self: *Stream, layer: u32, ids: []const u16) !void {
                 if (self.phase != .prefill) return error.NotPrefill;
                 const ah = &self.ahead;
-                if (ah.live and ah.layer == layer) try self.awaitReadAhead(layer);
+                // P7 overlap: the seed reads residency only; the read-ahead lands where a plan needs it (`planCall`).
+                if (self.prompt_reads == .stock and ah.live and ah.layer == layer) try self.awaitReadAhead(layer);
                 const policy = &self.layers[layer].policy;
                 policy.prepareSeed(ids);
                 // P1's engagement, once at the layer's barrier: the records read ahead that its call routes, and its seed's
@@ -1194,8 +1314,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.failed) return error.StreamFailed;
                 self.notePrecision(layer, ids, step);
                 std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
-                // A decode route's transient loads take at most its ids' rows of window 0.
-                if (self.phase == .decode and ids.len > self.transient.rows) return self.fail(error.RouteWiderThanWindow);
+                // Decode's window 0 holds `decode_route_ids` rows: a decode route is never wider (the caller's contract).
+                std.debug.assert(self.phase != .decode or ids.len <= self.decode_route_ids);
                 // A layer's read-ahead lands before a route plans over its rows (a hit must never read a loading row).
                 if (self.ahead.live and self.ahead.layer == layer) try self.awaitReadAhead(layer);
                 const lookahead = self.route_lookahead;
@@ -1570,13 +1690,18 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// P1: layer `layer`'s predicted seed (`experts`, hottest first) read into its empty persistent rows, no route, while
             /// its attention runs: `LayerPolicy.admitReadAhead` (unprotected; the seed re-protects its choices), pool jobs of
             /// `max_items` within the ticket ring. `awaitReadAhead` or a route of the layer lands it; a live one lands first.
+            /// `stock`: every record now, in file order. P7 `overlap`: the prediction's rank order (the admission order), its
+            /// first `wide_depth x max_route_ids` records now (the groups the call routes at its start); the rest wait for
+            /// the call's plans (`planCall`: `p7Tail`), or for the layer's await (every record then). `whole` and
+            /// `whole_trim`: every record now (`whole_trim` withdraws the jobs still queued at the plans: `p7Withdraw`).
             pub fn readAheadSeed(self: *Stream, layer: u32, experts: []const u16) !void {
                 if (self.failed) return error.StreamFailed;
                 if (self.phase != .prefill) return error.NotPrefill;
                 if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
                 const ah = &self.ahead;
                 const mn = minisOf(&self.bank.layers[layer]);
-                const fit = @min(ah.loads.len, (self.pool.published.len - 2 * expert_io.max_items) / (2 * mn));
+                // The ticket ring's room in records (each record's minis take a gate/up and a down ticket apiece).
+                const fit = @min(ah.loads.len, self.ahead_cap orelse (self.pool.published.len - 2 * expert_io.max_items) / (2 * mn));
                 const admitted = self.layers[layer].policy.admitReadAhead(experts, ah.loads[0..fit]);
                 if (comptime read_ahead_probed) if (self.probe) |pr| {
                     // The predicted seed: the ranking's top as many as the layer's unprotected rows (the seed's rule); blocked:
@@ -1589,13 +1714,22 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     pr.admission(layer, top, @intCast(admitted.len), blocked);
                 };
                 const n: u32 = @intCast(admitted.len);
-                ah.* = .{ .layer = layer, .n = n, .loads = ah.loads, .reads = ah.reads, .parts = ah.parts };
+                ah.* = .{ .layer = layer, .n = n, .loads = ah.loads, .reads = ah.reads, .parts = ah.parts, .landed = ah.landed };
                 if (n == 0) return;
-                std.sort.pdq(LayerPolicy.ReadAhead, admitted, {}, struct {
-                    fn less(_: void, x: LayerPolicy.ReadAhead, y: LayerPolicy.ReadAhead) bool {
-                        return x.expert < y.expert;
-                    }
-                }.less);
+                const now: u32 = switch (self.prompt_reads) {
+                    .stock => blk: {
+                        std.sort.pdq(LayerPolicy.ReadAhead, admitted, {}, struct {
+                            fn less(_: void, x: LayerPolicy.ReadAhead, y: LayerPolicy.ReadAhead) bool {
+                                return x.expert < y.expert;
+                            }
+                        }.less);
+                        break :blk n;
+                    },
+                    .overlap => switch (self.prompt_ahead) {
+                        .head => @min(n, @as(u32, self.wide_depth) * self.max_route_ids),
+                        .whole, .whole_trim => n,
+                    },
+                };
                 for (admitted, ah.reads[0..n]) |l, *rd| {
                     const m = self.locate(layer, l.slot).meta;
                     if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
@@ -1604,20 +1738,30 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     m.pins = 1;
                 }
                 ah.live = true;
+                if (self.ahead_job.len > 0) @memset(self.ahead_job, no_job);
+                try self.postAheadJobs(layer, now);
+            }
+
+            /// The read-ahead's jobs over its admitted records [`posted`, `to`): pool jobs of `max_items` records each.
+            fn postAheadJobs(self: *Stream, layer: u32, to: u32) Error!void {
+                const ah = &self.ahead;
                 const lens = &self.layers[layer].lens;
-                var start: u32 = 0;
-                while (start < n) {
-                    const end = @min(start + expert_io.max_items / mn, n);
+                const mn = minisOf(&self.bank.layers[layer]);
+                var start: u32 = ah.posted;
+                while (start < to) {
+                    const end = @min(start + expert_io.max_items / mn, to);
                     var part: Part = .{ .first = start, .n = end - start };
                     var rows: [expert_io.max_items][n_components]u64 = undefined;
                     var gu: [expert_io.max_items]u64 = undefined;
                     var down: [expert_io.max_items]u64 = undefined;
                     var nr: u32 = 0;
                     var posted: u32 = 0;
-                    for (admitted[start..end], ah.reads[start..end]) |l, rd| if (rd) {
+                    for (ah.loads[start..end], ah.reads[start..end]) |l, rd| {
+                        if (self.ahead_job.len > 0) self.ahead_job[l.slot] = @intCast(ah.n_parts);
+                        if (!rd) continue;
                         nr = self.entries(layer, l.slot, l.expert, &rows, &gu, &down, nr);
                         posted += 1;
-                    };
+                    }
                     if (nr > 0) {
                         part.ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |e| return self.fail(e);
                         part.n_reads = nr;
@@ -1625,22 +1769,38 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         if (comptime read_ahead_probed) if (self.probe) |pr| pr.posted(layer, posted);
                     } else part.settled = true;
                     ah.parts[ah.n_parts] = part;
+                    ah.landed[ah.n_parts] = false;
                     ah.n_parts += 1;
                     start = end;
                 }
+                ah.posted = to;
             }
 
             /// P1: lands layer `layer`'s read-ahead (none live for it: nothing to do). Every job waited and its
             /// rows ready, the rows' pins dropped; a record that failed is forgotten by the policy and fails the
-            /// stream, as a route's failed load does.
+            /// stream, as a route's failed load does. Records still waiting for a plan (P7 overlap) are read first.
             pub fn awaitReadAhead(self: *Stream, layer: u32) Error!void {
                 const ah = &self.ahead;
                 if (!ah.live or ah.layer != layer) return;
+                if (ah.posted < ah.n) try self.postAheadJobs(layer, ah.n);
                 ah.live = false;
-                const policy = &self.layers[layer].policy;
                 var first_error: ?Error = null;
-                for (ah.parts[0..ah.n_parts]) |*p| {
-                    if (p.settled) continue;
+                for (0..ah.n_parts) |j| self.landAheadJob(@intCast(j)) catch |e| {
+                    if (first_error == null) first_error = e;
+                };
+                if (first_error) |e| return e;
+            }
+
+            /// Lands read-ahead job `j` once: its reads waited, its rows' states set (a failed record forgotten by the
+            /// policy, the stream failed), its rows unpinned.
+            fn landAheadJob(self: *Stream, j: u32) Error!void {
+                const ah = &self.ahead;
+                if (ah.landed[j]) return;
+                ah.landed[j] = true;
+                const p = &ah.parts[j];
+                const policy = &self.layers[ah.layer].policy;
+                var failure: ?Error = null;
+                if (!p.settled) {
                     p.settled = true;
                     const count = 2 * p.n_reads;
                     const waited = self.waitReads(p.ticket, count);
@@ -1654,13 +1814,370 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         self.noteRead(res);
                     };
                     for (ah.loads[p.first..][0..p.n], ah.reads[p.first..][0..p.n]) |l, rd| if (rd) {
-                        self.locate(layer, l.slot).meta.state = if (ok) .ready else .failed;
+                        self.locate(ah.layer, l.slot).meta.state = if (ok) .ready else .failed;
                         if (!ok) policy.invalidate(l.expert);
                     };
-                    if (!ok and first_error == null) first_error = if (waited) |_| error.ReadFailed else |e| e;
+                    if (!ok) failure = if (waited) |_| error.ReadFailed else |e| e;
                 }
-                for (ah.loads[0..ah.n]) |l| self.locate(layer, l.slot).meta.pins -= 1;
-                if (first_error) |e| return self.fail(e);
+                for (ah.loads[p.first..][0..p.n]) |l| self.locate(ah.layer, l.slot).meta.pins -= 1;
+                if (failure) |e| return self.fail(e);
+            }
+
+            /// Whether read-ahead job `j` has landed or its reads have all completed (never blocks).
+            fn aheadJobDone(self: *Stream, j: u32) bool {
+                const ah = &self.ahead;
+                if (ah.landed[j] or ah.parts[j].settled) return true;
+                const p = ah.parts[j];
+                self.pool.wait(p.ticket, 2 * p.n_reads, 0) catch return false;
+                return true;
+            }
+
+            /// P7 overlap: the bit of the read-ahead job writing persistent slot `slot` of `layer` while it has not landed
+            /// (0 otherwise).
+            fn aheadJobBit(self: *const Stream, layer: u32, slot: u32) u64 {
+                const ah = &self.ahead;
+                if (!ah.live or ah.layer != layer or slot >= self.layers[layer].policy.capacity) return 0;
+                const j = self.ahead_job[slot];
+                if (j == no_job or ah.landed[j]) return 0;
+                return @as(u64, 1) << @intCast(j);
+            }
+
+            // ── P7 overlap: the prompt call's plans ahead, its reads posted when their rows are free ──
+
+            /// P7 overlap: a prompt call's groups -- `distinct` in groups of `width`, in the order the executor routes them,
+            /// at its depth `wide_depth` -- all planned now as the stock schedule plans them (the same `planWith` per group
+            /// over the same ids, with the held set and transient window that schedule gives it); the read-ahead's waiting
+            /// records (`whole_trim`: with its jobs still queued, withdrawn: `p7Withdraw`) resolved by the plans (`p7Tail`);
+            /// every read whose row is free posted, in group order. The executor then routes the groups in order
+            /// (`activateP7`) and releases them in order (`releaseP7`).
+            pub fn planCall(self: *Stream, layer: u32, distinct: []const u16, width: u32) Error!void {
+                if (self.failed) return error.StreamFailed;
+                std.debug.assert(self.prompt_reads == .overlap and self.phase == .prefill);
+                if (self.p7.live) return self.fail(error.RoutesLive);
+                try self.flush();
+                if (self.n_free != route_capacity or self.held_base.items.len > 0) return self.fail(error.RoutesLive);
+                if (width == 0 or width > self.max_route_ids) return self.fail(error.RoutesExhausted);
+                const n_groups: u32 = @intCast((distinct.len + width - 1) / width);
+                if (n_groups == 0 or n_groups > route_capacity) return self.fail(error.RoutesExhausted);
+                const p = &self.p7;
+                p.* = .{ .live = true, .layer = layer, .distinct = distinct, .width = width, .n_groups = n_groups };
+                const ls = &self.layers[layer];
+                const cap = ls.policy.capacity;
+                const depth: u32 = self.wide_depth;
+                for (0..n_groups) |gi| {
+                    const g: u32 = @intCast(gi);
+                    // The stock schedule routes group g beside groups g - depth + 1 .. g - 1 (`route`): their windows are
+                    // taken and their persistent slots held.
+                    const held = &self.held_scratch;
+                    held.clearRetainingCapacity();
+                    var used: u8 = 0;
+                    var q: u32 = g -| (depth - 1);
+                    while (q < g) : (q += 1) {
+                        used |= @as(u8, 1) << @intCast(p.window[q]);
+                        const o = &self.routes[p.route[q]];
+                        for (o.hit_slots[0..o.plan.n_hits]) |hs| if (hs < cap) {
+                            held.append(self.allocator, hs) catch return self.fail(error.RoutesExhausted);
+                        };
+                        for (o.plan.loadsOf()) |l| if (l.persistent) {
+                            held.append(self.allocator, l.slot) catch return self.fail(error.RoutesExhausted);
+                        };
+                    }
+                    const window: u8 = @intCast(@ctz(~used));
+                    if (window >= depth) return self.fail(error.RoutesExhausted);
+                    self.n_free -= 1;
+                    const ri = self.free[self.n_free];
+                    const r = &self.routes[ri];
+                    r.* = .{ .layer = layer, .window = window, .state = .live };
+                    p.route[g] = ri;
+                    p.window[g] = window;
+                    ls.policy.planWith(self.p7Group(g), .prefill, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held.items });
+                    for (r.plan.hitsOf(), r.hit_slots[0..r.plan.n_hits]) |e, *slot| slot.* = ls.policy.slotOf(e).?;
+                }
+                if (self.prompt_ahead == .whole_trim) try self.p7Withdraw(layer);
+                try self.p7Tail(layer);
+                try self.p7Rows(layer);
+                for (0..n_groups) |g| try self.p7Parts(@intCast(g));
+                try self.p7Post(0);
+            }
+
+            /// Group `g` of the scheduled call: its ids, as the executor routes them.
+            fn p7Group(self: *const Stream, g: u32) []const u16 {
+                const p = &self.p7;
+                return p.distinct[g * p.width .. @min((g + 1) * p.width, p.distinct.len)];
+            }
+
+            /// A row's index in `p7_rows`: persistent slots first, the transient rows after `n_experts`.
+            fn p7Index(self: *const Stream, layer: u32, slot: u32) usize {
+                const cap = self.layers[layer].policy.capacity;
+                return if (slot < cap) slot else self.bank.n_experts + (slot - cap);
+            }
+
+            /// P7 `whole_trim`: at the call's plans, the read-ahead's jobs no reader worker has taken yet are withdrawn from
+            /// the pool's queue (`Pool.withdraw`, last job first: the pool's one FIFO starts jobs in post order, so the
+            /// withdrawn jobs are always the post's last ones) and their records wait again, from the first withdrawn job's
+            /// record on, for `p7Tail` to resolve them as it resolves `head`'s tail. A withdrawn job read nothing and wrote
+            /// no row; a job a worker has taken runs as posted. Plans, slots and kernels are untouched.
+            fn p7Withdraw(self: *Stream, layer: u32) Error!void {
+                const ah = &self.ahead;
+                if (!ah.live or ah.layer != layer) return;
+                var first = ah.n_parts;
+                var unread: u64 = 0;
+                // A job's reads are its records' minis, one gate/up and one down range each.
+                const mn = minisOf(&self.bank.layers[layer]);
+                while (first > 0) {
+                    const j = first - 1;
+                    if (ah.landed[j]) break;
+                    const p = &ah.parts[j];
+                    // A job of records whose rows already held them has no reads (no ticket): nothing to withdraw.
+                    if (!p.settled) {
+                        const withdrawn = self.pool.withdraw(p.ticket) catch return self.fail(error.SubmitRefused);
+                        if (!withdrawn) break;
+                        unread += p.n_reads / mn;
+                    }
+                    first = j;
+                }
+                if (first == ah.n_parts) return;
+                const from = ah.parts[first].first;
+                // Their rows wait for the plans again: no job writes them (`p7Tail` posts the kept ones anew).
+                for (ah.loads[from..ah.n]) |l| self.ahead_job[l.slot] = no_job;
+                ah.n_parts = first;
+                ah.posted = from;
+                // `ahead_posted` counts records read ahead: the withdrawn reads never ran (`p7Tail` counts the kept again).
+                self.counters.ahead_posted -= unread;
+            }
+
+            /// P7 overlap: the read-ahead's records the head left (`readAheadSeed`), resolved by the call's plans: read
+            /// (posted now, ordered by the first group that hits them) when a group hits one before any evicts it, or when
+            /// no group touches it; dropped when evicted first -- its row is then the evicting load's, and the record is read
+            /// once (where a plan loads it again) instead of twice.
+            fn p7Tail(self: *Stream, layer: u32) Error!void {
+                const ah = &self.ahead;
+                if (!ah.live or ah.layer != layer or ah.posted == ah.n) return;
+                const p = &self.p7;
+                // Each waiting record's fate: the first group hitting it (kept), or evicting it first (dropped: the sentinel).
+                const dropped: u8 = std.math.maxInt(u8);
+                var first: [256]u8 = undefined;
+                const tail = ah.n - ah.posted;
+                if (tail > first.len) return self.fail(error.RoutesExhausted);
+                for (ah.loads[ah.posted..ah.n], ah.reads[ah.posted..ah.n], first[0..tail]) |l, rd, *f| {
+                    f.* = @intCast(p.n_groups);
+                    groups: for (0..p.n_groups) |g| {
+                        const r = &self.routes[p.route[g]];
+                        for (r.hit_slots[0..r.plan.n_hits]) |s| if (s == l.slot) {
+                            f.* = @intCast(g);
+                            break :groups;
+                        };
+                        for (r.plan.evictionsOf()) |ev| if (ev.slot == l.slot and ev.previous == l.expert) {
+                            // Only a record still to be read is dropped (one whose row already held it costs nothing).
+                            f.* = if (rd) dropped else @intCast(g);
+                            break :groups;
+                        };
+                    }
+                }
+                // Kept records first, by their first group; dropped records after them (never posted).
+                var i: u32 = 1;
+                while (i < tail) : (i += 1) {
+                    var k = i;
+                    while (k > 0 and first[k - 1] > first[k]) : (k -= 1) {
+                        std.mem.swap(u8, &first[k - 1], &first[k]);
+                        std.mem.swap(LayerPolicy.ReadAhead, &ah.loads[ah.posted + k - 1], &ah.loads[ah.posted + k]);
+                        std.mem.swap(bool, &ah.reads[ah.posted + k - 1], &ah.reads[ah.posted + k]);
+                    }
+                }
+                var kept: u32 = 0;
+                while (kept < tail and first[kept] != dropped) kept += 1;
+                for (ah.loads[ah.posted + kept .. ah.n]) |l| {
+                    const m = self.locate(layer, l.slot).meta;
+                    m.state = .empty;
+                    m.pins -= 1;
+                    self.counters.ahead_dropped += 1;
+                }
+                ah.n = ah.posted + kept;
+                try self.postAheadJobs(layer, ah.n);
+            }
+
+            /// P7 overlap: every row's record and reader as the call starts (the slot meta, a read-ahead record counted as
+            /// landed: the stock schedule plans after the whole read-ahead landed).
+            fn p7Rows(self: *Stream, layer: u32) Error!void {
+                const ls = &self.layers[layer];
+                const cap = ls.policy.capacity;
+                const n_e = self.bank.n_experts;
+                const ah = &self.ahead;
+                const ra_live = ah.live and ah.layer == layer;
+                if (self.transient.rows > self.p7_rows.len - n_e) return self.fail(error.RoutesExhausted);
+                for (self.p7_rows[0..cap], ls.meta[0..cap], 0..) |*v, m, s| {
+                    const ra = ra_live and self.ahead_job[s] != no_job;
+                    if (m.state == .loading and !ra) return self.fail(error.SlotStillPinned);
+                    v.* = .{ .layer = m.layer, .expert = m.expert, .ready = m.state == .ready or (m.state == .loading and ra), .reader = -1 };
+                }
+                for (self.p7_rows[n_e..][0..self.transient.rows], self.transient_meta[0..self.transient.rows]) |*v, m| {
+                    if (m.state == .loading) return self.fail(error.SlotStillPinned);
+                    v.* = .{ .layer = m.layer, .expert = m.expert, .ready = m.state == .ready, .reader = -1 };
+                }
+            }
+
+            /// P7 overlap: group `g`'s loads -- whether each reads (the stock test on the rows the earlier plans leave), the
+            /// last earlier group reading its row, the read-ahead job writing it -- cut into parts by (that reader, read-ahead
+            /// blocked, file order) at `max_items`; the stock route's counters.
+            fn p7Parts(self: *Stream, g: u32) Error!void {
+                const p = &self.p7;
+                const layer = p.layer;
+                const r = &self.routes[p.route[g]];
+                const plan = &r.plan;
+                const depth: u32 = self.wide_depth;
+                var key: [max_route_ids]i8 = undefined;
+                var ra: [max_route_ids]u64 = undefined;
+                var skipped: u64 = 0;
+                for (plan.loadsOf(), 0..) |l, i| {
+                    const v = &self.p7_rows[self.p7Index(layer, l.slot)];
+                    const held = v.ready and v.layer == layer and v.expert == l.expert;
+                    r.reads[i] = !held;
+                    skipped += @intFromBool(held);
+                    // The stock schedule never plans a row a live route reads: its last reader is `depth` or more groups back.
+                    if (v.reader >= 0 and @as(u32, @intCast(v.reader)) + depth > g) return self.fail(error.SlotStillPinned);
+                    key[i] = v.reader;
+                    ra[i] = self.aheadJobBit(layer, l.slot);
+                    v.layer = @intCast(layer);
+                    v.expert = l.expert;
+                    v.ready = true;
+                }
+                for (r.hit_slots[0..plan.n_hits]) |s| self.p7_rows[self.p7Index(layer, s)].reader = @intCast(g);
+                for (plan.loadsOf()) |l| self.p7_rows[self.p7Index(layer, l.slot)].reader = @intCast(g);
+                const n = plan.n_loads;
+                for (r.order[0..n], 0..) |*o, i| o.* = @intCast(i);
+                const Ctx = struct { plan: *const Plan, key: *const [max_route_ids]i8, ra: *const [max_route_ids]u64 };
+                std.sort.insertion(u8, r.order[0..n], Ctx{ .plan = plan, .key = &key, .ra = &ra }, struct {
+                    fn less(c: Ctx, a: u8, b: u8) bool {
+                        if (c.key[a] != c.key[b]) return c.key[a] < c.key[b];
+                        if ((c.ra[a] != 0) != (c.ra[b] != 0)) return c.ra[a] == 0;
+                        return c.plan.loads[a].expert < c.plan.loads[b].expert;
+                    }
+                }.less);
+                r.n_parts = 0;
+                var start: u32 = 0;
+                while (start < n) {
+                    const k0 = key[r.order[start]];
+                    const b0 = ra[r.order[start]] != 0;
+                    var end = start + 1;
+                    while (end < n and end - start < expert_io.max_items and key[r.order[end]] == k0 and (ra[r.order[end]] != 0) == b0) end += 1;
+                    var m: u64 = 0;
+                    for (r.order[start..end]) |li| m |= ra[li];
+                    r.parts[r.n_parts] = .{ .first = start, .n = end - start };
+                    p.key[g][r.n_parts] = k0;
+                    p.ra[g][r.n_parts] = m;
+                    r.n_parts += 1;
+                    start = end;
+                }
+                const c = &self.counters;
+                c.route_calls += 1;
+                c.expert_cache_hits += plan.n_hits;
+                c.expert_cache_misses += plan.n_misses;
+                c.expert_cache_evictions += plan.n_evictions;
+                c.persistent_loads += plan.n_persistent;
+                c.transient_loads += plan.n_loads - plan.n_persistent;
+                c.loads_skipped += skipped;
+            }
+
+            /// P7 overlap: posts the call's parts in group order from the next unposted one. A part whose reading group has
+            /// not been released stops the walk; so does (groups from `force_upto` on) one whose read-ahead jobs have not
+            /// completed. Groups below `force_upto` are being routed: their read-ahead jobs land here (blocking).
+            fn p7Post(self: *Stream, force_upto: u32) Error!void {
+                const p = &self.p7;
+                const ah = &self.ahead;
+                const ra_live = ah.live and ah.layer == p.layer;
+                while (p.post_g < p.n_groups) : ({
+                    p.post_g += 1;
+                    p.post_p = 0;
+                }) {
+                    const g = p.post_g;
+                    const r = &self.routes[p.route[g]];
+                    const force = g < force_upto;
+                    while (p.post_p < r.n_parts) : (p.post_p += 1) {
+                        const pi = p.post_p;
+                        const key = p.key[g][pi];
+                        if (key >= 0 and @as(u32, @intCast(key)) >= p.released) {
+                            if (force) return self.fail(error.SlotStillPinned);
+                            return;
+                        }
+                        if (ra_live) {
+                            var m = p.ra[g][pi];
+                            while (m != 0) : (m &= m - 1) {
+                                const j: u32 = @ctz(m);
+                                if (!force and !self.aheadJobDone(j)) return;
+                                try self.landAheadJob(j);
+                            }
+                        }
+                        try self.p7Submit(r, pi);
+                    }
+                }
+            }
+
+            /// P7 overlap: one part's loads as the stock route takes them (a row a live route still serves from is never
+            /// refilled; a read marks its row loading; every load pins its row) and its pool job.
+            fn p7Submit(self: *Stream, r: *Route, pi: u32) Error!void {
+                const plan = &r.plan;
+                const part = &r.parts[pi];
+                const ls = &self.layers[r.layer];
+                var rows: [expert_io.max_items][n_components]u64 = undefined;
+                var gu: [expert_io.max_items]u64 = undefined;
+                var down: [expert_io.max_items]u64 = undefined;
+                var nr: u32 = 0;
+                for (r.order[part.first..][0..part.n]) |li| {
+                    const l = plan.loads[li];
+                    const loc = self.locate(r.layer, l.slot);
+                    const m = loc.meta;
+                    if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
+                    if (r.reads[li]) {
+                        m.* = .{ .state = .loading, .layer = @intCast(r.layer), .expert = l.expert };
+                        rows[nr] = loc.rows.rowDest(loc.row);
+                        const sp = self.bank.spans(r.layer, l.expert);
+                        gu[nr] = sp.gu_offset;
+                        down[nr] = sp.down_offset;
+                        nr += 1;
+                    }
+                    m.pins = 1;
+                }
+                if (nr > 0) {
+                    part.ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &ls.lens) catch |e| return self.fail(e);
+                    part.n_reads = nr;
+                } else part.settled = true;
+            }
+
+            /// P7 overlap: the executor routes group `activated` (its depth schedule reached it): the planned route, every
+            /// part of it and of the groups before it posted (their blockers are gone by the stock schedule's own order; the
+            /// read-ahead jobs they wait on land here), the read-ahead records it hits landed, its hits pinned.
+            pub fn activateP7(self: *Stream, ids: []const u16) Error!*Route {
+                if (self.failed) return error.StreamFailed;
+                const p = &self.p7;
+                std.debug.assert(p.live);
+                const g = p.activated;
+                if (g >= p.n_groups) return self.fail(error.RoutesExhausted);
+                const want = self.p7Group(g);
+                if (ids.ptr != want.ptr or ids.len != want.len) return self.fail(error.RoutesLive);
+                try self.flush();
+                try self.p7Post(g + 1);
+                const r = &self.routes[p.route[g]];
+                for (r.hit_slots[0..r.plan.n_hits]) |s| {
+                    const bit = self.aheadJobBit(p.layer, s);
+                    if (bit != 0) try self.landAheadJob(@ctz(bit));
+                    self.locate(p.layer, s).meta.pins += 1;
+                }
+                p.activated += 1;
+                return r;
+            }
+
+            /// P7 overlap: the executor releases the call's groups in order; the call's schedule ends with the last. Out
+            /// of order (an error path's cleanup) the schedule no longer holds: the stream fails.
+            pub fn releaseP7(self: *Stream, r: *Route) void {
+                const p = &self.p7;
+                if (!p.live or p.released >= p.activated or &self.routes[p.route[p.released]] != r) {
+                    self.failed = true;
+                    if (r.state == .live) self.release(r);
+                    return;
+                }
+                self.release(r);
+                p.released += 1;
+                if (p.released == p.n_groups) p.live = false;
             }
 
             /// Construction (the prompt phase, nothing live): each layer's empty prompt rows filled with the experts of
@@ -1854,7 +2371,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     a.free(alt_meta0);
                 };
                 if (self.transient_released) {
-                    const n0 = self.decode_window_rows + decode_staging_rows;
+                    // Decode's window 0 holds the widest decode route (`decode_route_ids`), per geometry (a bank of two
+                    // stream geometries keeps a window of each).
+                    const n0 = self.decode_route_ids + decode_staging_rows;
                     const geoms = [2]?u32{ self.transient_layer, if (self.alt) |x| x.layer else null };
                     for (geoms, [2]*?Rows{ &window0, &alt0 }, [2]*[]SlotMeta{ &meta0, &alt_meta0 }) |gl, w, m| {
                         const geom = &self.bank.layers[gl orelse continue];

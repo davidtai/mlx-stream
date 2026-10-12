@@ -58,10 +58,10 @@ Code at 29c3d43:
 
 - `src/sdk_ext/expert/io.zig:216`: the uncached SSD reader
 - `src/sdk_ext/expert/policy.zig:332`: slot residency per layer
-- `src/deepseek_v41_bill.zig:455`: the memory bill that sizes the slots
+- `src/arch/deepseek_v41/bill.zig:455`: the memory bill that sizes the slots
 - `expert-manifest-v2.json` (model directory): record geometry
-- `src/deepseek_v41_graph.zig:2078`: the predictor
-- `src/deepseek_v41_model.zig:713`: the prompt-pass driver, called at :836
+- `src/arch/deepseek_v41/graph.zig:2078`: the predictor
+- `src/arch/deepseek_v41/model.zig:713`: the prompt-pass driver, called at :836
 - `src/sdk_ext/expert/stream.zig:746,1029,1094`: barrier, issue, land
 - `src/sdk_ext/expert/lookahead.zig:56`: decode selection
 

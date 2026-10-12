@@ -25,8 +25,7 @@ const glm = @import("glm_moe_dsa.zig");
 const graph = @import("glm_moe_dsa_graph.zig");
 const cache_mod = @import("glm_moe_dsa_cache.zig");
 const settings = @import("glm_moe_dsa_settings.zig");
-const ds = @import("deepseek_v41_dspark.zig");
-const dsl = @import("deepseek_v41_dspark_loop.zig");
+const acceptance = @import("sdk_ext.zig").acceptance;
 const exl3 = @import("glm_moe_dsa_exl3_bank.zig");
 
 const G = graph.G;
@@ -397,9 +396,10 @@ pub const Decision = struct { accepted: u32, next: u32 };
 /// `drafts` against `logits` under `mode` and the request's sampling (`base`: the absolute position of row 0, the
 /// sampled draws' key). Greedy: exact accepts a draft equal to its row's argmax; typical accepts one whose probability
 /// at temperature 1 exceeds min(eps, delta * exp(-entropy)) (the host's `sdk.acceptance.typicalThreshold`); the
-/// correction and the bonus are the argmax. Sampled: exact is DeepSeek-V4.1's lane rule (`ds.Sampling`: point-mass
-/// drafts accepted with probability p(draft) of the tempered, filtered row, the residual's draw at the first
-/// rejection); typical tests the same p against its own entropy and draws the correction and the bonus from p.
+/// correction and the bonus are the argmax. Sampled: every draft lane's rules (`sdk_ext.acceptance`): exact is the
+/// point-mass rule (`sampledRows`: drafts accepted with probability p(draft) of the tempered, filtered row, the
+/// residual's draw at the first rejection); typical (`typicalRows`) tests the same p against its own entropy and draws
+/// the correction and the bonus from p.
 /// `prepare`, one eval of its arrays, `DecisionArrays.read`.
 pub fn decide(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode, sampling: sdk.SamplingParams, base: u64) !Decision {
     const p = try prepare(g, logits, drafts, mode, sampling, base);
@@ -437,11 +437,7 @@ pub const DecisionArrays = struct {
 pub fn prepare(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode, sampling: sdk.SamplingParams, base: u64) !DecisionArrays {
     const w: usize = @intCast(g.shapeOf(logits).dim(0));
     std.debug.assert(w == drafts.len + 1 and w <= max_depth + 1);
-    const nd: c_int = @intCast(drafts.len);
-    const vocab = g.shapeOf(logits).dim(1);
-    var idb: [max_depth]i32 = undefined;
-    for (idb[0..drafts.len], drafts) |*d, v| d.* = @intCast(v);
-    const typ: ?@FieldType(sdk.acceptance.Mode, "typical") = switch (mode) {
+    const typ: ?acceptance.Typical = switch (mode) {
         .typical => |t| t,
         .exact => null,
         else => return error.MtpAcceptanceNotImplemented,
@@ -451,38 +447,15 @@ pub fn prepare(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode,
     if (sampling.greedy()) {
         p.tok = try g.argmax(logits, -1);
         if (typ) |t| if (drafts.len > 0) {
-            const lg = try g.astype(try g.slice(logits, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 }), .float32);
-            const lp = try g.sub(lg, try g.logsumexp(lg, -1, true));
-            p.flags = try typicalFlags(g, lp, try g.exp(lp), idb[0..drafts.len], t);
+            p.flags = try acceptance.typicalFlags(g, logits, drafts, t);
         };
     } else {
-        const sm: ds.Sampling = .{ .temperature = sampling.temperature, .top_p = sampling.top_p, .top_k = sampling.top_k, .min_p = sampling.min_p, .seed = sampling.seed };
-        const Loop = dsl.Loop(G);
-        if (typ) |t| {
-            const sr = try Loop.sampledRows(g, logits, sm, base, &.{});
-            p.tok = sr.tok;
-            if (drafts.len > 0) {
-                const pr = try g.slice(sr.p, &.{ 0, 0 }, &.{ nd, vocab }, &.{ 1, 1 });
-                p.flags = try typicalFlags(g, try g.log(pr), pr, idb[0..drafts.len], t);
-            }
-        } else {
-            const sr = try Loop.sampledRows(g, logits, sm, base, drafts);
-            p.tok = sr.tok;
-            p.flags = sr.accept;
-        }
+        const sm = acceptance.Params.of(sampling);
+        const sr = if (typ) |t| try acceptance.typicalRows(g, logits, sm, base, drafts, t) else try acceptance.sampledRows(g, logits, sm, base, drafts);
+        p.tok = sr.tok;
+        p.flags = sr.accept;
     }
     return p;
-}
-
-/// p(draft) > min(eps, delta * exp(-H(p))) per drafted row (`lp` = log p, f32 `[d, vocab]`; zero-mass entries add
-/// nothing to the entropy).
-fn typicalFlags(g: *G, lp: T, p: T, ids: []const i32, t: @FieldType(sdk.acceptance.Mode, "typical")) !T {
-    const zero = try g.scalar(0, .float32);
-    const plogp = try g.where(try g.greater(p, zero), try g.mul(p, lp), zero);
-    const entropy = try g.neg(try g.sum(plogp, -1, false));
-    const floor = try g.minimum(try g.scalar(t.eps, .float32), try g.mul(try g.scalar(t.delta, .float32), try g.exp(try g.neg(entropy))));
-    const idx = try g.hostArray(std.mem.sliceAsBytes(ids), &.{ @intCast(ids.len), 1 }, .int32);
-    return g.greater(try g.reshape(try g.takeAlongAxis(p, idx, -1), &.{-1}), floor);
 }
 
 // ── the lane ──

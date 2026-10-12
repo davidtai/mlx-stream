@@ -44,7 +44,7 @@ const exl3_quant = @import("glm_moe_dsa_exl3_quant.zig");
 const glm53_quant = @import("glm53_exl3_quant.zig");
 /// PROFILE builds (`-Dplugin-profile=true`): each draft round's verify on the GPU timeline, its summary at the
 /// request's end (`VERIFY_GPU_TIMELINE`); every other build compiles it out.
-const timeline = @import("dsv41_verify_timeline.zig");
+const timeline = @import("arch/deepseek_v41/verify_timeline.zig");
 const prefill_timers = @import("glm_moe_dsa_prefill_timers.zig");
 const phase_mem = @import("phase_memory.zig");
 
@@ -315,7 +315,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .transient_rows = @as(u32, shape.wide_depth) * shape.max_route_ids * self.inputs.bank.rows_per_id,
                 .wide_depth = shape.wide_depth,
                 .transient_release = true,
-                .decode_window_rows = shape.decode_window_rows * self.inputs.bank.rows_per_id,
+                .decode_route_ids = shape.decode_window_rows * self.inputs.bank.rows_per_id,
                 .slot_memory = .{ .mlx = s },
                 .staging_from_bank = true,
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),

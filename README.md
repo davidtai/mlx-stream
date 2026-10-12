@@ -1,26 +1,37 @@
 # mlx-stream
 
-mlx-stream is a plugin for [mlx-serve](https://github.com/ddalcu/mlx-serve). It serves **DeepSeek-V4.1-Flash** on
-Apple Silicon from an **EXL3 3.0 bpw expert bank streamed from SSD**. The routed experts stay on disk as packed
-per-expert records; the resident trunk (attention, shared experts, the head) loads once. A lookahead read pool brings
-the routed rows in for each layer, so the model runs on a Mac whose memory cannot hold all of its experts.
+mlx-stream is a plugin for [mlx-serve](https://github.com/ddalcu/mlx-serve). It serves two mixture-of-experts models
+on Apple Silicon with their routed experts **streamed from SSD**: **DeepSeek-V4.1-Flash** from an **EXL3 3.0 bpw
+expert bank**, and **MiMo-V2.6-Flash** from an **MXFP4 expert bank** (the release's own expert bytes, repacked). The
+routed experts stay on disk as packed per-expert records; the resident trunk (attention, dense and shared layers, the
+head) loads once. A lookahead read pool brings the routed rows in for each layer, so each model runs on a Mac whose
+memory cannot hold all of its experts.
 
 What it contains:
 
 - the `deepseek_v41` arch: the module-owned decode state (KV lanes, Engram rows), the prompt pass in waves, the
   serial and DSpark draft decode, and the memory bill the host admits against;
-- the EXL3 quant its routed experts use (K = 3, mul1 codebook, 128-wide Hadamard with suh / svh), with Metal kernels
-  pinned by a manifest hash and specialised to the model's shapes (hidden 5120, intermediate 2304);
-- the expert source that streams them: the packed-record reader, the C read pool, the residency policy, and the MLX
-  event gates that order reads and kernels.
+- the `mimo_v2_flash` arch: MiMo-V2.6-Flash over an FP8 or BF16 resident trunk, its MXFP4 expert bank, the draft lane
+  over the pack's three MTP heads, and its own memory bill, with Metal kernels pinned by manifest hashes
+  ([docs/mimo.md](docs/mimo.md));
+- the EXL3 quant DeepSeek-V4.1's routed experts use (K = 3, mul1 codebook, 128-wide Hadamard with suh / svh), with
+  Metal kernels pinned by a manifest hash and specialised to the model's shapes (hidden 5120, intermediate 2304);
+- the expert source that streams both arches' experts: the packed-record reader, the C read pool, the
+  residency policy, and the MLX event gates that order reads and kernels;
+- the draft lanes' acceptance (`sdk_ext.acceptance`): one set of rules, one sampled path and one seeded draw for
+  DSpark and MiMo's MTP lane.
 
-Decode levers that are still being evaluated ship **off by default** (see Environment switches).
+DeepSeek-V4.1's decode levers that are still being evaluated ship **off by default** (see Environment switches).
 
-The plugin also serves **GLM-5.3** (`glm_moe_dsa`) from an affine expert bank through the same stream (see GLM-5.3).
+The supported models:
 
-The supported DeepSeek-V4.1 model is the DeepSeek-V4.1-Flash streaming EXL3 3.0 bpw package (a model directory whose
-`config.json` has `"model_type": "deepseek_v41"` and whose expert bank has a v2 expert manifest). No weights are
-included in this repository.
+- the DeepSeek-V4.1-Flash streaming EXL3 3.0 bpw package (a model directory whose `config.json` has
+  `"model_type": "deepseek_v41"` and whose expert bank has a v2 expert manifest);
+- a MiMo-V2.6-Flash pack (a model directory whose `config.json` has `"model_type": "mimo_v2_flash"` and an
+  `expert_streaming` block; [docs/mimo-pack.md](docs/mimo-pack.md) says how to prepare one);
+- a GLM-5.3 pack (`"model_type": "glm_moe_dsa"`; see GLM-5.3).
+
+No weights are included in this repository.
 
 ## How mlx-serve consumes it
 
@@ -29,8 +40,12 @@ included in this repository.
   cache) and `mlx_stream` (rooted at `src/root.zig`, importing `sdk`). Both reach the host through one import,
   `mlx_host` (its MLX, log and MTP acceptance modes).
 - One host file calls the plugin: mlx-serve's `src/arch/mlx_stream.zig`. A `deepseek_v41` model directory with
-  `experts.bin` is the plugin's; the host renders the template, samples and schedules, and the plugin runs the
-  forward (`arch.prefill` / `arch.step`), the prefix resume, the decode handover and the DSpark draft lane.
+  `experts.bin` is the plugin's, and so is a `mimo_v2_flash` pack that declares `expert_streaming` (an upstream MiMo
+  checkpoint without it stays on mlx-serve's resident `mimo_v2` arch). The host renders the template, samples and
+  schedules; the plugin runs the forward (`arch.prefill` / `arch.step`), DeepSeek-V4.1's prefix resume and decode
+  handover, and each arch's draft lane.
+- One expert reader per process: the arch that loads first holds it, and a second load that needs it fails at its
+  claim with `ExpertReaderInUse`.
 - The host compiles `csrc/` against its own staged MLX, because the event and alloc shims include MLX's private
   headers. The plugin is macOS-only; the Linux and iOS graphs build mlx-serve's stub, which refuses the pack by name.
 
@@ -50,10 +65,19 @@ From the host checkout the suites are `zig build mlx-stream-test` (part of `zig 
 `zig build mlx-stream-conformance`.
 
 `scripts/test_dsv41.sh` runs every `dsv41 ` test of the plugin and the host on the CPU, and adds the bank tests when
-`DSV41_BANK` is set. The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model
-or run on the GPU skip unless their own inputs are given.
+`DSV41_BANK` is set. MiMo-V2.6-Flash's tests run through a filter, and its bill tool reads a prepared pack's headers
+(no payload) and prints every bill term and the rows it admits per context:
 
-## Memory and context length
+```sh
+zig build test -Dmlx-serve=../mlx-serve -Dtest-filter=mimo
+MIMO_BANK=/abs/path/to/pack zig build test -Dmlx-serve=../mlx-serve -Dtest-filter="the bill tool prints every term"
+```
+
+The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model or run on the GPU
+skip unless their own inputs are given. Device cells set the GPU ceiling with the host's
+`MLX_SERVE_GPU_CEILING_MB=114688` (112 GiB).
+
+## Memory and context length (DeepSeek-V4.1)
 
 The module bills its memory before it allocates anything. At load it fills the expert slot rows up to the box's
 ceiling (the GPU working set, less the host's wired margin) against an itemized bill of every term it will hold, and
@@ -123,9 +147,13 @@ How the long prompts stay inside the bill:
   bill's own arenas) live on pages unmapped at their end, so libc's large-block cache does not keep them in the
   footprint; the bill's host term is 1.00 GB.
 
-## Environment switches
+## Environment switches (DeepSeek-V4.1)
 
-The served path reads three environment variables, all at construction. Its routes, schedules and memory bill come
+MiMo-V2.6-Flash's served path has no environment switch of its own: its routes come from the pack's settings
+([docs/mimo.md, Settings](docs/mimo.md#settings)), and its four profile switches compile only into profile builds.
+
+DeepSeek-V4.1's served path reads two environment variables, both at construction, and GLM-5.3's one (`GLM53_ROUTES`,
+below). DeepSeek-V4.1's routes, schedules and memory bill come
 from the tier defaults and the model settings (`model-settings.json`: `numeric_tier`, `ctx_size`, `expert_event_gates`,
 `layer_major_prefill`, `expert_wide_*`, `embedding_host_rows`), never from the environment.
 
@@ -150,6 +178,130 @@ served behavior.
 
 The test suites also read their own inputs (`DSV41_BANK`, device-only smoke switches, fixture paths, the cell
 harness's rows, baseline and output paths); each such test skips without its input.
+
+## MiMo-V2.6-Flash
+
+The `mimo_v2_flash` arch serves Xiaomi's MiMo-V2.6-Flash (48 layers, 47 of them routing each token to 8 of 256
+experts). The 12,032 routed experts stay on the SSD as one record file of the release's MXFP4 bytes and stream through
+the same reader as DeepSeek-V4.1's. The trunk is resident in the release's FP8 or in BF16, and the pack's three
+trained MTP heads drive a draft lane. [docs/mimo.md](docs/mimo.md) describes the arch: its claim, bill, decode path,
+draft lane, prompt pass, settings and limits.
+
+**Packs.** The arch serves a prepared pack, not the release checkpoint: `config.json` with an `expert_streaming`
+block, the residents in `model.safetensors`, the expert bank (`experts.bin`, `expert-manifest.json`) and the MTP
+sidecar. Two tiers: **fp8res** (the pack of record, about 171 GB: q/k/v and the dense MLP in the release's FP8) and
+**bf16res** (about 175 GB). [docs/mimo-pack.md](docs/mimo-pack.md) lists the files and how to build a pack from
+`XiaomiMiMo/MiMo-V2.6-Flash-MOPD`.
+
+**Serving.**
+
+```sh
+MLX_SERVE_GPU_CEILING_MB=114688 mlx-serve serve --model /abs/path/to/pack --ctx-size 17408 --no-vision --kv-quant off \
+  --no-warmup-eager --prefix-cache-entries 0 --wired-margin-gib 2
+```
+
+`--ctx-size` (or the model's `ctx_size` in mlx-serve's model settings) is the context the bill covers; without one
+the arch bills 17,408 tokens (16,384 prompt + 1,024 generated). A 16K prompt peaks at 104-108 GB, by the rows the box
+admits: the bill fills the expert rows up to the host's GPU ceiling less its wired margin. `experts.bin` must be a real
+file or a hard link.
+
+To reproduce the measured lines ([docs/mimo.md, Reproducing the measurements](docs/mimo.md#reproducing-the-measurements)):
+the box had its wired limit raised to the ceiling (`sudo sysctl iogpu.wired_limit_mb=114688`;
+`MLX_SERVE_GPU_CEILING_MB` must not exceed it) and no other model server loaded. The cells ran the command above with
+`--ctx-size` = prompt + 16,384 (32,768 for a 16K prompt) plus `--timeout 0 --metrics --log-file off`, with no
+`MLX_STREAM_SETTINGS` or `MIMO_*` variable, and pinned the rows in the pack's `config.json`
+(`"settings": {"expert_prefill_rows": 129, "expert_rows": 146, "mtp_lane": true}` for the ladder's 16K rung; without
+it the bill fills them to the ceiling less the margin). Requests went to `/v1/completions` with the prompt rendered by
+the pack's template: card = `"temperature": 1.0, "top_p": 0.95, "seed": 1, "max_tokens": 16384` with thinking on;
+greedy = `"temperature": 0, "seed": 0` with the template's empty `<think></think>`; both with `"enable_mtp": true`.
+
+**Settings.** Every route is a construction setting in the pack's `config.json` (`expert_streaming.settings`), read
+once at load and refused by name when wrong; there is no environment variable or flag. The defaults are the measured
+best routes; the settings table, with each default's exactness class against its control, is in
+[docs/mimo.md](docs/mimo.md#settings).
+
+**Measurements.** One Mac (M5 Max, 128 GB), 2026-10-11, no other model server loaded; each cell its own fresh server
+and one request: the served ReleaseFast binary, the fp8res pack, KV bf16, the draft lane at its defaults, rows pinned
+per cell, the GPU ceiling at 112 GiB (`MLX_SERVE_GPU_CEILING_MB=114688`) and `--wired-margin-gib 2`. The card ladder,
+the 130 / 147 16K cell and HumanEval ran on server sha256 `746e7da9` (host mlx-serve `pr/mimo-host` at `2c041af6` +
+this tree at `8e7d186`); the 16K card pair ran on `b00df80e` (this tree at `d3a8555`), which differs only in the
+attention routes past 32,768 context: up to 32,768 context the two install the same routes and the same bill, and give
+the same outputs. The binary of record, server sha256 `4b018c54` (host `2c041af6` + this tree at `05fc760`), differs
+from `746e7da9` only by the hot-path audit and the dead code sweep and reproduces its 16K cell token for token (cell
+stamp16k-g15-20261011, 2026-10-11 23:30Z: 998.8 / 32.30 tok/s prefill / decode, 16.40 s TTFT, 688 tokens to EOS,
+104.66 GB peak at 130 / 147 rows; `746e7da9`: 1,003.9 / 31.6, 16.32 s).
+
+Definitions: **card** = temperature 1.0, top_p 0.95, seed 1, no top_k, thinking on, max_tokens 16,384; **served
+context** = the context the server is started with (`--ctx-size`): the prompt fixture's length plus the 16,384-token
+cap; **prompt rows / decode rows** = expert slot rows per routed layer; **prefill** = prompt tokens / prompt wall
+time, tok/s; **TTFT** = request start to the first token, s; **decode** = generated tokens / decode wall time, tok/s;
+**peak** = the server's peak footprint over the request, GB (decimal).
+
+The 16K card pair (the standard 16K prompt, 16,382 tokens with thinking on; served context 32,768; rows 134 / 152):
+
+| cell | prefill (tok/s) | TTFT (s) | decode (tok/s) | peak (GB) | output tokens |
+|---|---|---|---|---|---|
+| 1 | 996.4 | 16.44 | 28.40 | 107.81 | 16,384 |
+| 2 | 1,003.2 | 16.33 | 28.10 | 107.81 | 16,384 |
+| mean | 999.8 | | 28.25 | | |
+
+The two cells' token ids are identical, and both loop from the same point to the 16,384-token cap (sampling at seed
+1; recorded). The draft lane: 3.59 tokens and 74.3 misses per round, 127 ms per round. A greedy pair on the same
+prompt and rows (thinking off, 16,384 tokens; temperature 0, 1,024-token cap) read 1,002.1 / 1,004.0 tok/s prefill;
+the model stops at 136 tokens, so its decode figure is ramp-dominated and is not quoted.
+
+![Prefill and decode tok/s of the served 16K cells: three card cells and a greedy pair, by answer length and expert rows](docs/img/mimo-16k-cells.png)
+
+The card ladder on `746e7da9`: one cold request per prompt length, each on its own server; rows pinned at the bill's
+fill for a 12.6 GB box baseline (one prompt row lower from 64K up), plus a second 16K cell at 130 / 147; every output
+complete and stopped on EOS.
+
+| prompt (tokens) | served context | prompt rows | decode rows | prefill (tok/s) | TTFT (s) | decode (tok/s) | peak (GB) | output tokens |
+|---|---|---|---|---|---|---|---|---|
+| 1,023 | 17,407 | 130 | 147 | 92.3 | 11.06 | 31.6 | 104.31 | 659 |
+| 2,048 | 18,432 | 129 | 146 | 178.3 | 11.48 | 33.1 | 103.71 | 683 |
+| 4,096 | 20,480 | 129 | 146 | 345.5 | 11.85 | 32.2 | 103.76 | 655 |
+| 8,192 | 24,576 | 129 | 146 | 654.4 | 12.52 | 30.9 | 103.85 | 664 |
+| 16,384 | 32,768 | 129 | 146 | 978.5 | 16.74 | 30.7 | 104.04 | 683 |
+| 16,384 | 32,768 | 130 | 147 | 1,003.9 | 16.32 | 31.6 | 104.66 | 688 |
+| 32,768 | 49,152 | 128 | 144 | 827.8 | 39.58 | 31.3 | 103.16 | 676 |
+| 65,536 | 81,920 | 125 | 142 | 743.9 | 88.10 | 29.1 | 102.66 | 624 |
+| 131,072 | 147,456 | 121 | 139 | 599.9 | 218.49 | 25.7 | 102.29 | 620 |
+| 262,144 | 278,528 | 114 | 133 | 439.9 | 595.91 | 21.3 | 101.54 | 651 |
+| 524,287 | 540,671 | 98 | 120 | 296.1 | 1,770.63 | 15.4 | 99.42 | 622 |
+| 1,032,192 | 1,048,576 | 67 | 96 | 179.6 | 5,747.16 | 9.6 | 96.08 | 639 |
+
+Prompt lengths are the fixtures', rendered for thinking off; thinking on drops their trailing `<think></think>`, so
+each request carries 2 tokens fewer. The 1K prefill figure is the cold first request: fixed startup dominates its
+11 s TTFT. The attention kernels are the defaults at every served context, to the checkpoint's 1,048,576 keys. The
+bf16res tier has not been measured on these builds.
+
+![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on 746e7da9](docs/img/mimo-ladder.png)
+
+[![1K–1M sweep summary on 746e7da9: decode, prefill, TTFT, memory peaks and completion tokens](docs/benchmarks/mimo-v26-flash/summary.png)](docs/benchmarks/mimo-v26-flash/README.md)
+
+HumanEval (164 problems, one sample each, pass@1, cap 16,384 tokens, thinking on, rows 127 / 145): greedy 155 / 164
+= 0.9451, card 157 / 164 = 0.9573; every failure is a wrong answer (none truncated, looped, without code or errored).
+Scored on `746e7da9` (host `2c041af6` + this branch at `8e7d186`); the earlier run on
+`bb3c7245` (host `2c041af6` + plugin `d67567e`, this branch before its layout move) gave the same counts and the same
+failing problems.
+
+**Known limitations.**
+
+- **Greedy ids depend on rows.** Tokens are reproducible only at fixed rows: two runs that admit different rows can
+  diverge within the first tokens. The fp8res and bf16res tiers also diverge (rounding-class).
+- **Greedy thinking-off answers are short.** On the 16K standard prompt the model stops at 136 tokens, so a greedy
+  cell there does not measure decode.
+- **The 16K card cells loop.** At 134 / 152 rows both card cells loop from the same point and run to the
+  16,384-token cap (recorded; sampling at seed 1).
+- **Typical acceptance is lossy** by design ([docs/mimo.md, The draft lane](docs/mimo.md#the-draft-lane)); set
+  `draft_tier: exact` for distribution-preserving sampling.
+- **GPU clock.** macOS holds the GPU at about 1,470-1,560 MHz active, lower when hot; prefill swings about 6 % with
+  it. Compare cells at matched clocks.
+- **Long-context geometry.** Above 128K context the decode attention's split count (32) and the NAX prompt
+  attention's pass cap (64) stay at the donor geometry: a performance limit, not a correctness one.
+- **Forced rows spend the guard margin.** Rows forced above the bill's fill load with an operator-pin log line and
+  spend the margin the box's live guard keeps.
 
 ## GLM-5.3
 
@@ -317,7 +469,7 @@ Hadamard with suh / svh). They are independent implementations with disjoint cla
 | Rates | K 2..4, mixes, mul1 and mcg | K = 3, mul1 |
 | Kernels | generated for any shape | pinned Metal texts for this model's shapes, behind a manifest hash |
 
-`src/exl3_sushi_parity.zig` decodes sushi's own K3 mul1 fixture (`lib/sushi/src/exl3/fixtures/exl3_k3_linear.safetensors`
+`src/exl3/sushi_parity.zig` decodes sushi's own K3 mul1 fixture (`lib/sushi/src/exl3/fixtures/exl3_k3_linear.safetensors`
 in the host checkout) through this plugin's decoder and checks the result against sushi's reference bit for bit.
 
 ## Layout
@@ -328,16 +480,27 @@ sdk/                       the arch contract's types (`sdk` module), the weight 
 src/root.zig               the archs the host calls (`arch`, `archs`, `sdk`, `default_context`) and the tests' surface
 src/tests.zig              the test root (`zig build mlx-stream-test` in the host)
 src/conformance.zig        the conformance suite's root
-src/deepseek_v41_host.zig  the harnesses' and bank tests' bridge (config parse, loaders, memory knobs), test-only
-src/*.zig                  the DeepSeek-V4.1 arch, the EXL3 quant and kernels, the expert stream
-src/glm_moe_dsa*.zig       the GLM-5.3 arch, its affine bank, bill, module and parity test
-src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile)
+src/arch/deepseek_v41/     the DeepSeek-V4.1 arch, with its tests
+src/arch/deepseek_v41/host.zig  the harnesses' and bank tests' bridge (config parse, loaders, memory knobs), test-only
+src/arch/mimo_v2/          the MiMo-V2.6-Flash arch: settings, bill, forward, expert source, draft lane, tests
+src/arch/mimo_v2/kernels/  its pinned Metal kernel texts and their six manifests (embedded at compile time)
+src/exl3/                  the EXL3 quant, kernels, source and self-checks
+src/expert/                the expert stream: bank, stream, admission and lookahead, with their tests
+src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile,
+                           the draft lanes' acceptance)
+src/glm_moe_dsa*.zig       the GLM-5.3 arch, its banks, bill, module, draft lane and parity tests
+src/glm53_exl3_*.zig       GLM-5.3's EXL3 kernels, routes, quant and self-check (texts in src/kernels/glm53_exl3/)
 src/kernels/exl3/          the pinned Metal kernel texts and their manifest (embedded at compile time)
-src/fixtures/              test fixtures (bank peek, prefill wave samples, DSpark lookup and receipt stats)
-csrc/                      the C read pool, the MLX event / alloc shims and the profile-only timeline sources
+src/fixtures/              test fixtures (bank peek, prefill wave samples, DSpark lookup and receipt stats, the MiMo
+                           config)
+csrc/                      the C read pool, the MLX event / alloc shims (with MiMo's GPU address and keep-warm shims)
+                           and the profile-only timeline and power sources
 src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
 docs/                      design notes and the path map from the in-tree layout
-scripts/                   test_dsv41.sh, compile_kernels_offline.py, glm_moe_dsa_goldens.py
+scripts/                   test_dsv41.sh, compile_kernels_offline.py, compile_mimo_kernels_offline.py,
+                           prepare_mimo_pack.py   the pack builder (docs/mimo-pack.md)
+                           glm_moe_dsa_goldens.py, glm_moe_dsa_mtp_goldens.py, glm_split_k3_table.py,
+                           glm53_exl3_manifest.py
 ```
 
 This repository was imported from the mlx-serve fork at commit d38ef038, without its history. `docs/PATH_MAP.md`

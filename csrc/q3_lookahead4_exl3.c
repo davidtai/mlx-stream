@@ -101,6 +101,18 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  *   - the stock entry points (q3ld_spec_step / _spec_stepn / _pre_read) behave as before (len = rec_len, the armed
  *     lengths): a uniform-record bank reads exactly as with the original pool.  ABI 2026092704 (original 2026092504).
  * ABI 2026100201.
+ *
+ * WITHDRAW (mimo/ahead-trim, 2026-10-10; ABI 2026101001; over range jobs ABI 2026101201): q3ld_withdraw(first) takes
+ *   a submit that no worker has started back out of the queue, by its first ticket: every range job of it (a submit
+ *   queues one job per range, sub_len[first] of them, adjacent in the FIFO and in ticket order), all or none; the jobs
+ *   behind them keep their order.  Its tickets get ST_WITHDRAWN words (nothing read: no preadv, payload 0, no row
+ *   written) and are published in ticket order under the pool mutex, so they are terminal for waits and free for the
+ *   ring's next submit.  A submit a worker has started (its first range taken: the FIFO takes its ranges in ticket
+ *   order) runs as submitted, every range of it (0 = not queued).  Refused (-2) for a submit whose bytes are promised
+ *   elsewhere: a ticket bound to a pre-range or waited on by a live event gate.  Its owner calls it when the job's records are no longer
+ *   needed before the drive reached them (P7 early_whole_trim: the read-ahead jobs still queued when the prompt call's
+ *   plans exist).  It never touches the speculative class (no claim is released; the prompt pass issues none).
+ *   Inject event kind 11 (withdrawn).
  */
 #include <errno.h>
 #include <mach/mach_time.h>
@@ -123,6 +135,7 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
 #define ST_OSERR 2
 #define ST_DEADLINE 3
 #define ST_SKIPPED 4
+#define ST_WITHDRAWN 5       /* q3ld_withdraw: the job left the queue unstarted; nothing read, no row written */
 
 #define MAX_SPEC 16
 #define MAX_SPEC_THREADS 3
@@ -301,6 +314,7 @@ static int64_t pre_lens[2 * MAX_COMP];
 static int64_t pre_gu_total = 0;
 static uint64_t pre_order = 0;
 static int32_t *pre_of = 0;   /* per ticket: 1 + the pre-range bound to that range at submit, 0 = none */
+static int32_t *sub_len = 0;  /* WITHDRAW: per ticket, the range jobs of the submit it starts (0: it starts none) */
 
 /* ---- the event-gate class (lookahead4) */
 #define MAX_GATES 512         /* the live gates of every route a stream holds: 6 routes x (48 parts + 1) <= 512 */
@@ -343,7 +357,8 @@ static int nrules = 0;
 static uint64_t rng = 0;
 static int64_t delay_max = 0, spec_delay_max = 0;
 /* event log: kind (1 demand submit, 2 demand start, 3 spec start by thread 0, 8 spec start by a thread >= 1, 7 claimed
- * chunk start, 4 spec end, 5 adopt, 9 pre-range start, 10 pre-range served), qlen, busy, t, arg */
+ * chunk start, 4 spec end, 5 adopt, 9 pre-range start, 10 pre-range served, 11 demand job withdrawn), qlen, busy, t,
+ * arg */
 static int64_t *evlog = 0, evcap = 0, evn = 0;
 
 void q3ld_test_rules(int32_t n, const int64_t *off, const int64_t *code, const int64_t *arg) {
@@ -1231,10 +1246,11 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     ranges = (range_t *)calloc((size_t)n_tickets, sizeof(range_t));
     queue = (job_t *)calloc((size_t)n_tickets, sizeof(job_t));
     pre_of = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
+    sub_len = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
     gate_of = (int64_t *)calloc((size_t)n_tickets, sizeof(int64_t));
-    if (!ranges || !queue || !pre_of || !gate_of) {
-        free(ranges); free(queue); free(pre_of); free(gate_of);
-        ranges = 0; queue = 0; pre_of = 0; gate_of = 0;
+    if (!ranges || !queue || !pre_of || !sub_len || !gate_of) {
+        free(ranges); free(queue); free(pre_of); free(sub_len); free(gate_of);
+        ranges = 0; queue = 0; pre_of = 0; sub_len = 0; gate_of = 0;
         pthread_mutex_unlock(&mu);
         return -ENOMEM;
     }
@@ -1292,6 +1308,7 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
         for (int k = 1; k < RES_W; k++) out[k] = 0;
         out[0] = ST_PENDING;
         pre_of[first + i] = 0;
+        sub_len[first + i] = i == 0 ? count : 0;       /* WITHDRAW: the submit's range jobs, on its first ticket */
         gate_of[first + i] = 0;                        /* EVENT: a gate maps a ticket only after this submit */
     }
     if (pre_on && deadline < 0) {                  /* PRE: bind (in flight / waiting / done) or cancel (queued) */
@@ -1324,6 +1341,45 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     pthread_cond_broadcast(&work_cv);
     pthread_mutex_unlock(&mu);
     return 0;
+}
+
+/* WITHDRAW: take the submit whose first ticket is `first` back out of the FIFO while no worker has started it: its
+ * sub_len[first] range jobs, adjacent in the queue in ticket order (one submit queues them under the pool mutex), leave
+ * it together, the jobs behind them keeping their order; its tickets get ST_WITHDRAWN words (no preadv, payload 0, no
+ * row written) and are published in ticket order.  The FIFO takes a submit's ranges in ticket order, so its first
+ * range still queued means none of it was taken.  Returns 1 withdrawn; 0 not queued (a worker started it and every
+ * range of it runs as submitted, it is done, or no submit starts at `first`); -1 not running / bad ticket; -2 refused
+ * (a ticket bound to a pre-range or waited on by a live event gate: its bytes are promised elsewhere). */
+int q3ld_withdraw(int64_t first) {
+    if (first < 0) return -1;
+    pthread_mutex_lock(&mu);
+    if (!running || first >= nt) { pthread_mutex_unlock(&mu); return -1; }
+    const int32_t count = sub_len[first];
+    if (count < 1) { pthread_mutex_unlock(&mu); return 0; }
+    int64_t k = 0;
+    while (k < qlen && queue[(qhead + k) % qcap].ticket != first) k++;
+    if (k == qlen) { pthread_mutex_unlock(&mu); return 0; }
+    for (int32_t i = 0; i < count; i++) {           /* the submit's ranges, adjacent and in ticket order */
+        if (k + i >= qlen || queue[(qhead + k + i) % qcap].ticket != first + i) { pthread_mutex_unlock(&mu); return 0; }
+        int64_t t = first + i;
+        if (pre_of[t] || (gate_of[t] && gate_live(gate_of[t] - 1))) { pthread_mutex_unlock(&mu); return -2; }
+    }
+    for (int64_t m = k; m + count < qlen; m++) queue[(qhead + m) % qcap] = queue[(qhead + m + count) % qcap];
+    __atomic_store_n(&qlen, qlen - count, __ATOMIC_RELAXED);
+    sub_len[first] = 0;
+    int64_t now = q3ld_monotonic_ns();
+    for (int32_t i = 0; i < count; i++) {
+        int64_t *out = res + (first + i) * RES_W;
+        out[1] = out[2] = out[3] = out[4] = 0;
+        out[5] = out[6] = now;
+        out[7] = -1;
+        out[0] = ST_WITHDRAWN;
+        publish(first + i);
+    }
+    EV(11, first);
+    pthread_cond_broadcast(&spec_cv);          /* the demand queue got shallower: the speculative queue rule may pass */
+    pthread_mutex_unlock(&mu);
+    return 1;
 }
 
 /* settle every unclaimed record with tag <= cur: QUEUED dropped, parked dropped, running abandoned at the next
@@ -1597,7 +1653,7 @@ int q3ld_stop(void) {
     }
     running = 0; nworkers = 0; nspec_started = 0; __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); nspec = 0; nspec_threads = 0; spec_configured = 0;
     spec_idle_busy = SPEC_MAX_DEMAND_BUSY;
-    free(ranges); free(queue); free(pre_of); ranges = 0; queue = 0; pre_of = 0;
+    free(ranges); free(queue); free(pre_of); free(sub_len); ranges = 0; queue = 0; pre_of = 0; sub_len = 0;
     for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
     pre_on = 0; pre_ngu = pre_ndown = 0; pre_gu_total = 0;
     res = 0; logbuf = 0; gauge = 0; sc = 0;
@@ -1923,7 +1979,7 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026101101; }              /* range jobs; EXL3_LANE_PORT 2026092704, original 2026092504 */
+int32_t q3ld_abi(void) { return 2026101201; }              /* WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }

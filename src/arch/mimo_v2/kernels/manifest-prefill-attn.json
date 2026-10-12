@@ -1,0 +1,794 @@
+{
+ "format": "mlx-stream-mimo-kernels-v1",
+ "headers": [
+  {
+   "bytes": 23554,
+   "file": "nax_attn_tiles.metal",
+   "id": "nax",
+   "sha256": "b510169e09786999553106f8f13ea7ef89212110894a0eda0ae8849bdf3d1a21",
+   "upstream": "src/kernels/nax_tiles.metal"
+  }
+ ],
+ "kernels": [
+  {
+   "atomic_outputs": false,
+   "class": "rounding-class",
+   "ensure_row_contiguous": false,
+   "family": "nax_attention",
+   "header": {
+    "id": "nax"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "q",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 64
+      },
+      {
+       "m": 1,
+       "v": "L"
+      },
+      {
+       "m": 192
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "k",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "HK"
+      },
+      {
+       "m": 1,
+       "v": "KL"
+      },
+      {
+       "m": 192
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "v",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 1,
+       "v": "HK"
+      },
+      {
+       "m": 1,
+       "v": "KL"
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "sinks",
+     "shape": [
+      {
+       "m": 1,
+       "v": "SINKS_N"
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "state",
+     "shape": [
+      {
+       "m": 1,
+       "v": "STATE_N"
+      }
+     ]
+    },
+    {
+     "dtype": "int32",
+     "name": "params",
+     "shape": [
+      {
+       "m": 16
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      1024,
+      64,
+      1
+     ],
+     "note": "sliding: window 128 + sinks, one pass (ring view 127 + 512 keys)",
+     "output_dtypes": [
+      "bfloat16",
+      "float32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "WM"
+      },
+      {
+       "int": 1,
+       "name": "WN"
+      },
+      {
+       "int": 128,
+       "name": "WINDOW"
+      },
+      {
+       "bool": true,
+       "name": "ALIGN_Q"
+      },
+      {
+       "bool": false,
+       "name": "ALIGN_K"
+      },
+      {
+       "bool": true,
+       "name": "HAS_SINKS"
+      },
+      {
+       "bool": true,
+       "name": "FIRST"
+      },
+      {
+       "bool": true,
+       "name": "LAST"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "L",
+       "value": 512
+      },
+      {
+       "name": "HK",
+       "value": 8
+      },
+      {
+       "name": "KL",
+       "value": 639
+      },
+      {
+       "name": "SINKS_N",
+       "value": 64
+      },
+      {
+       "name": "STATE_N",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      64,
+      1
+     ],
+     "note": "global: causal, no sinks, one pass (kL < 12,288)",
+     "output_dtypes": [
+      "bfloat16",
+      "float32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "WM"
+      },
+      {
+       "int": 1,
+       "name": "WN"
+      },
+      {
+       "int": 0,
+       "name": "WINDOW"
+      },
+      {
+       "bool": true,
+       "name": "ALIGN_Q"
+      },
+      {
+       "bool": false,
+       "name": "ALIGN_K"
+      },
+      {
+       "bool": false,
+       "name": "HAS_SINKS"
+      },
+      {
+       "bool": true,
+       "name": "FIRST"
+      },
+      {
+       "bool": true,
+       "name": "LAST"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "L",
+       "value": 512
+      },
+      {
+       "name": "HK",
+       "value": 4
+      },
+      {
+       "name": "KL",
+       "value": 4000
+      },
+      {
+       "name": "SINKS_N",
+       "value": 1
+      },
+      {
+       "name": "STATE_N",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      1024,
+      64,
+      1
+     ],
+     "note": "global: aligned keys, one pass",
+     "output_dtypes": [
+      "bfloat16",
+      "float32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "WM"
+      },
+      {
+       "int": 1,
+       "name": "WN"
+      },
+      {
+       "int": 0,
+       "name": "WINDOW"
+      },
+      {
+       "bool": true,
+       "name": "ALIGN_Q"
+      },
+      {
+       "bool": true,
+       "name": "ALIGN_K"
+      },
+      {
+       "bool": false,
+       "name": "HAS_SINKS"
+      },
+      {
+       "bool": true,
+       "name": "FIRST"
+      },
+      {
+       "bool": true,
+       "name": "LAST"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "L",
+       "value": 512
+      },
+      {
+       "name": "HK",
+       "value": 4
+      },
+      {
+       "name": "KL",
+       "value": 4096
+      },
+      {
+       "name": "SINKS_N",
+       "value": 1
+      },
+      {
+       "name": "STATE_N",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      2048,
+      64,
+      1
+     ],
+     "note": "global multi-pass first (WN=2): state_out 64 x 512 x 130 f32 = 17,039,360 B",
+     "output_dtypes": [
+      "bfloat16",
+      "float32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 2,
+       "name": "WM"
+      },
+      {
+       "int": 2,
+       "name": "WN"
+      },
+      {
+       "int": 0,
+       "name": "WINDOW"
+      },
+      {
+       "bool": true,
+       "name": "ALIGN_Q"
+      },
+      {
+       "bool": true,
+       "name": "ALIGN_K"
+      },
+      {
+       "bool": false,
+       "name": "HAS_SINKS"
+      },
+      {
+       "bool": true,
+       "name": "FIRST"
+      },
+      {
+       "bool": false,
+       "name": "LAST"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "L",
+       "value": 512
+      },
+      {
+       "name": "HK",
+       "value": 4
+      },
+      {
+       "name": "KL",
+       "value": 16384
+      },
+      {
+       "name": "SINKS_N",
+       "value": 1
+      },
+      {
+       "name": "STATE_N",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      2048,
+      64,
+      1
+     ],
+     "note": "global multi-pass middle: state in + state_out",
+     "output_dtypes": [
+      "bfloat16",
+      "float32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 2,
+       "name": "WM"
+      },
+      {
+       "int": 2,
+       "name": "WN"
+      },
+      {
+       "int": 0,
+       "name": "WINDOW"
+      },
+      {
+       "bool": true,
+       "name": "ALIGN_Q"
+      },
+      {
+       "bool": true,
+       "name": "ALIGN_K"
+      },
+      {
+       "bool": false,
+       "name": "HAS_SINKS"
+      },
+      {
+       "bool": false,
+       "name": "FIRST"
+      },
+      {
+       "bool": false,
+       "name": "LAST"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "L",
+       "value": 512
+      },
+      {
+       "name": "HK",
+       "value": 4
+      },
+      {
+       "name": "KL",
+       "value": 16384
+      },
+      {
+       "name": "SINKS_N",
+       "value": 1
+      },
+      {
+       "name": "STATE_N",
+       "value": 4259840
+      }
+     ]
+    },
+    {
+     "grid": [
+      2048,
+      64,
+      1
+     ],
+     "note": "global multi-pass last: state in, out [1, 512, 64, 128]",
+     "output_dtypes": [
+      "bfloat16",
+      "float32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 2,
+       "name": "WM"
+      },
+      {
+       "int": 2,
+       "name": "WN"
+      },
+      {
+       "int": 0,
+       "name": "WINDOW"
+      },
+      {
+       "bool": true,
+       "name": "ALIGN_Q"
+      },
+      {
+       "bool": true,
+       "name": "ALIGN_K"
+      },
+      {
+       "bool": false,
+       "name": "HAS_SINKS"
+      },
+      {
+       "bool": false,
+       "name": "FIRST"
+      },
+      {
+       "bool": true,
+       "name": "LAST"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "L",
+       "value": 512
+      },
+      {
+       "name": "HK",
+       "value": 4
+      },
+      {
+       "name": "KL",
+       "value": 16384
+      },
+      {
+       "name": "SINKS_N",
+       "value": 1
+      },
+      {
+       "name": "STATE_N",
+       "value": 4259840
+      }
+     ]
+    },
+    {
+     "grid": [
+      128,
+      64,
+      1
+     ],
+     "note": "sliding tail tile (rows % 64 != 0)",
+     "output_dtypes": [
+      "bfloat16",
+      "float32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "WM"
+      },
+      {
+       "int": 1,
+       "name": "WN"
+      },
+      {
+       "int": 128,
+       "name": "WINDOW"
+      },
+      {
+       "bool": false,
+       "name": "ALIGN_Q"
+      },
+      {
+       "bool": false,
+       "name": "ALIGN_K"
+      },
+      {
+       "bool": true,
+       "name": "HAS_SINKS"
+      },
+      {
+       "bool": true,
+       "name": "FIRST"
+      },
+      {
+       "bool": true,
+       "name": "LAST"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "L",
+       "value": 9
+      },
+      {
+       "name": "HK",
+       "value": 8
+      },
+      {
+       "name": "KL",
+       "value": 136
+      },
+      {
+       "name": "SINKS_N",
+       "value": 64
+      },
+      {
+       "name": "STATE_N",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      128,
+      64,
+      1
+     ],
+     "note": "global tail tile (rows % 64 != 0), one pass (groups < 512)",
+     "output_dtypes": [
+      "bfloat16",
+      "float32"
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "WM"
+      },
+      {
+       "int": 1,
+       "name": "WN"
+      },
+      {
+       "int": 0,
+       "name": "WINDOW"
+      },
+      {
+       "bool": false,
+       "name": "ALIGN_Q"
+      },
+      {
+       "bool": false,
+       "name": "ALIGN_K"
+      },
+      {
+       "bool": false,
+       "name": "HAS_SINKS"
+      },
+      {
+       "bool": true,
+       "name": "FIRST"
+      },
+      {
+       "bool": true,
+       "name": "LAST"
+      }
+     ],
+     "threadgroup": [
+      128,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "L",
+       "value": 9
+      },
+      {
+       "name": "HK",
+       "value": 4
+      },
+      {
+       "name": "KL",
+       "value": 16009
+      },
+      {
+       "name": "SINKS_N",
+       "value": 1
+      },
+      {
+       "name": "STATE_N",
+       "value": 1
+      }
+     ]
+    }
+   ],
+   "name": "msv_nax_attn_192_128",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "out"
+    },
+    {
+     "dtype": "float32",
+     "name": "state_out"
+    }
+   ],
+   "phase": "prefill",
+   "provenance": "donor: reports/dsv41-f39-tcq3-runtime/mimo/donors/nax_attention (mlx-serve origin/mimo-v2 @ 7a9e392f; oMLX @ 5dcfe243; MLX steel_attention_nax, Apple MIT); texts byte-identical to the donor",
+   "route": "prefill_attention = .nax (src/mimo_v2/prefill_attention.zig), installed once at construction on a NAX device",
+   "self_check": {
+    "bound": "max_abs <= 0.015625 (the fixture tolerance), cosine reported",
+    "gate": "module.zig numericalSelfCheck -> checkNaxAttention (guarded device test \"mlx-stream GPU: MiMo Q4 routing rotary SWA sink numerical checks\")",
+    "oracle": "Xiaomi eager CPU oracle of checkAttentionMode (BF16 QK, post-matmul scale, FP32 softmax, BF16 P and AV)",
+    "points": [
+     "window boundary (offsets 0..160 across key 128, sliding)",
+     "sinks (sliding)",
+     "8,192 keys (global)",
+     "16,384 keys (global)",
+     "key-range passes == one dispatch bit for bit (WN=2)"
+    ]
+   },
+   "source": {
+    "bytes": 476,
+    "file": "nax_attn_192_128.metal",
+    "sha256": "8d2cb4b4a2fa58f217890727a74599ca3d5113eaf6ccedeb2e17ad35fa7bfc43"
+   },
+   "upstream": "src/nax_attention.zig SOURCE; header = src/kernels/nax_tiles.metal ++ src/kernels/nax_attention.metal",
+   "vars": [
+    {
+     "lo": 1,
+     "name": "L"
+    },
+    {
+     "lo": 1,
+     "name": "HK"
+    },
+    {
+     "lo": 1,
+     "name": "KL"
+    },
+    {
+     "lo": 1,
+     "name": "SINKS_N"
+    },
+    {
+     "lo": 1,
+     "name": "STATE_N"
+    }
+   ]
+  }
+ ],
+ "port_addenda": [
+  {
+   "bytes": 17454,
+   "file": "nax_attn_core.metal",
+   "id": "nax",
+   "sha256": "20241c4eab1c666aa4bf33d4fadb6fd4c88ca1f251b81cfa2e401ad6c8bee17f",
+   "upstream": "src/kernels/nax_attention.metal (@embedFile concat after nax_tiles.metal)"
+  }
+ ]
+}

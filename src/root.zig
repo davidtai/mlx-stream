@@ -1,7 +1,7 @@
 //! mlx-stream: the native streaming stack as one plugin: the DeepSeek-V4.1 arch, the EXL3 quant it binds (the routed
-//! experts' kernels over the package's pinned registry) and the EXL3 expert source that streams them; the GLM-5.3 arch
-//! over its affine expert bank through the same stream. Built only where
-//! the macOS-only sources are. The module imports its own `sdk` (sdk/) and the host's `mlx_host`.
+//! experts' kernels over the package's pinned registry) and the EXL3 expert source that streams them; MiMo-V2.6-Flash
+//! and GLM-5.3 over the same expert reader. Built only where the macOS-only sources are. The module imports its own
+//! `sdk` (sdk/) and the host's `mlx_host`.
 
 
 pub const plugin = sdk.Plugin{
@@ -12,25 +12,43 @@ pub const plugin = sdk.Plugin{
     .macos_only = true,
     // The host registers the arch; the EXL3 quant and the EXL3 expert source are its internals, bound at comptime
     // (sdk_ext.zig).
-    .provides = .{ .arch = @import("deepseek_v41_plugin.zig") },
+    .provides = .{ .arch = @import("arch/deepseek_v41/plugin.zig") },
+};
+
+/// MiMo-V2.6-Flash's prepared MXFP4 streaming pack: the package's second arch, over the same expert reader.
+pub const plugin_mimo = sdk.Plugin{
+    .name = "mlx-stream-mimo",
+    .api = .{ .major = 2, .minor = 0 },
+    .mlx = "v0.32.3",
+    .macos_only = true,
+    .provides = .{ .arch = @import("arch/mimo_v2/root.zig") },
+};
+
+/// What the host's glue calls for the second arch: its entry points, the context a load bills when the model sets
+/// none, and the positions a request may generate past that context (none: MiMo reserves generation inside it).
+pub const mimo = struct {
+    pub const arch = @import("arch/mimo_v2/root.zig");
+    pub const default_context: u64 = @import("arch/mimo_v2/settings.zig").fill_reserve_tokens;
+    pub const generation_headroom: u64 = 0;
 };
 
 /// What the host's tests read of the package, reached through the registry (`plugins.mlx_stream_testing`, null when a
 /// build leaves the plugin out): the arch's config fixture and settings type, the modules the host's reader proof
 /// drives, and the pins the conformance tests compare.
 pub const testing = struct {
-    pub const v41 = @import("deepseek_v41.zig");
-    pub const engram = @import("deepseek_v41_engram.zig");
-    pub const Settings = @import("deepseek_v41_settings.zig").Config;
+    pub const v41 = @import("arch/deepseek_v41/deepseek_v41.zig");
+    pub const engram = @import("arch/deepseek_v41/engram.zig");
+    pub const Settings = @import("arch/deepseek_v41/settings.zig").Config;
 };
 
 /// What the host's glue (mlx-serve `src/arch/mlx_stream.zig`) calls: the arch's entry points and their contract types.
-pub const arch = @import("deepseek_v41_plugin.zig");
-/// Every arch the plugin serves, in claim order: the glue that dispatches by `claims(peek)` iterates these.
-pub const archs = .{ @import("deepseek_v41_plugin.zig"), @import("glm_moe_dsa_plugin.zig") };
+pub const arch = @import("arch/deepseek_v41/plugin.zig");
+/// Every arch the glue dispatches by `claims(peek)`, in claim order: DeepSeek-V4.1 and GLM-5.3 (MiMo has its own
+/// entry, `mimo`, with its own context and headroom).
+pub const archs = .{ @import("arch/deepseek_v41/plugin.zig"), @import("glm_moe_dsa_plugin.zig") };
 pub const sdk = @import("sdk");
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
-pub const default_context: u64 = @import("deepseek_v41_bill.zig").fill_prompt_tokens;
+pub const default_context: u64 = @import("arch/deepseek_v41/bill.zig").fill_prompt_tokens;
 /// Positions a request may generate past its prompt (the KV lanes' bound) for an arch without its own `maxOutput`
 /// (DeepSeek-V4.1's).
-pub const generation_headroom: u64 = @import("deepseek_v41_module.zig").generation_headroom;
+pub const generation_headroom: u64 = @import("arch/deepseek_v41/module.zig").generation_headroom;

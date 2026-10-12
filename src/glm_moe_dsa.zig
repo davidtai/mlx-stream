@@ -5,7 +5,7 @@
 //! router logits); the routed experts stream from the affine bank (`glm_moe_dsa_bank.zig`), never from these shards.
 
 const std = @import("std");
-const v41 = @import("deepseek_v41.zig");
+const v41 = @import("arch/deepseek_v41/deepseek_v41.zig");
 
 /// The shard headers of a pack (`deepseek_v41.Checkpoint`: 8-byte length + JSON, never tensor data).
 pub const Checkpoint = v41.Checkpoint;

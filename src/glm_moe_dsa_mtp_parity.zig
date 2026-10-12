@@ -391,7 +391,7 @@ fn decideHost(g: *G, rows: []const f32, w: usize, drafts: []const u32, mode: sdk
 
 test "glm mtp: the decisions equal the host references: argmax, typical at temperature 1, the sampled point-mass rule, sampled typical" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const ds = @import("deepseek_v41_dspark.zig");
+    const ds = @import("sdk_ext.zig").acceptance;
     const acc = sdk.acceptance;
     const a = testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
@@ -408,7 +408,7 @@ test "glm mtp: the decisions equal the host references: argmax, typical at tempe
     // Greedy typical: draft 4 at row 0 (not the argmax) passes at delta 0.3, draft 0 at row 1 does not.
     const typ: acc.Mode = .{ .typical = .{ .delta = 0.3 } };
     var p: [3][vocab]f64 = undefined;
-    for (0..3) |r| ds.refDistribution(rows[r * vocab ..][0..vocab], .{ .temperature = 1 }, &p[r]);
+    for (0..3) |r| ds.distribution(rows[r * vocab ..][0..vocab], .{ .temperature = 1 }, &p[r]);
     try testing.expect(p[0][4] > acc.typicalThreshold(&p[0], 0.3, 1.0) and p[1][0] <= acc.typicalThreshold(&p[1], 0.3, 1.0));
     try testing.expectEqual(mtp.Decision{ .accepted = 1, .next = 4 }, try decideHost(&g, &rows, 3, &.{ 4, 0 }, typ, .{ .temperature = 0 }, 0));
     // Sampled exact (the point-mass rule) and sampled typical against the host references, over many seeds.
@@ -418,15 +418,15 @@ test "glm mtp: the decisions equal the host references: argmax, typical at tempe
     for (0..64) |seed| {
         var sp = sp_base;
         sp.seed = seed;
-        const sm: ds.Sampling = .{ .temperature = sp.temperature, .top_p = sp.top_p, .seed = sp.seed };
+        const sm = ds.Params.of(sp);
         const base: u64 = 40;
         const drafts = [_]u32{ 2, 4 };
         var want: mtp.Decision = .{ .accepted = 0, .next = 0 };
         var q: [3][vocab]f64 = undefined;
-        for (0..3) |r| ds.refDistribution(rows[r * vocab ..][0..vocab], sm, &q[r]);
+        for (0..3) |r| ds.distribution(rows[r * vocab ..][0..vocab], sm, &q[r]);
         for (0..3) |r| {
             const pos = base + r + 1;
-            const step = ds.refSpec(&q[r], if (r < drafts.len) drafts[r] else null, ds.drawU(sp.seed, pos), ds.drawV(sp.seed, pos));
+            const step = ds.specStep(&q[r], if (r < drafts.len) drafts[r] else null, null, ds.drawU(sp.seed, pos), ds.drawV(sp.seed, pos));
             if (step.accept) {
                 want.accepted += 1;
                 continue;
@@ -445,7 +445,7 @@ test "glm mtp: the decisions equal the host references: argmax, typical at tempe
                 wt.accepted += 1;
                 continue;
             }
-            wt.next = ds.refDraw(&q[r], ds.drawV(sp.seed, base + r + 1));
+            wt.next = ds.draw(&q[r], ds.drawV(sp.seed, base + r + 1));
             break;
         }
         try testing.expectEqual(wt, try decideHost(&g, &rows, 3, &drafts, typ, sp, base));

@@ -19,6 +19,9 @@ pub const q3ld = struct {
     pub fn q3ld_submit(_: i32, _: i64, _: i64, _: i32, _: i32, _: i32, _: [*]const i64, _: [*]const [*]const u64, _: [*]const i64, _: i64) c_int {
         return -1;
     }
+    pub fn q3ld_withdraw(_: i64) c_int {
+        return -1;
+    }
     pub fn q3ld_spec_step_len(_: i32, _: i64, _: i64, _: i32, _: ?[*]const i64, _: i64) i32 {
         return -1;
     }

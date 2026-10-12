@@ -5,11 +5,14 @@
 > registry, the KV lanes and the profile probes described below live in this repo (`src/sdk_ext.zig`). The arch's
 > process claim (`claimProcess` / `releaseProcess`) replaces the `uses_expert_reader` capability, `/v1/models` and
 > `/props` name the arch only, and the profile options are one host switch, `-Dplugin-profile`. Paths of the form
-> `src/mlx_stream/X` are `src/X` here (docs/PATH_MAP.md).
+> `src/mlx_stream/X` map to their place here in docs/PATH_MAP.md.
 >
 > Since the plugin serves through `mlx_host`, the small SDK is this repo's own `sdk/` too, and mlx-serve has no plugin
 > registry: one host file (`src/arch/mlx_stream.zig`) calls the arch, the host pins this repo as a submodule in place
 > of `HOST_PIN`, and the conformance suite has no registry test.
+>
+> MiMo-V2.6-Flash now ships as the package's second arch, beside DeepSeek-V4.1: see
+> [MiMo-V2.6-Flash, the second arch](#mimo-v26-flash-the-second-arch) and [mimo.md](mimo.md).
 
 Plugins add model architectures, quantization formats and expert-weight storage to mlx-serve without a fork. This
 document describes the plugin SDK as built on the `mlx-stream/sdk` branch, and mlx-stream, the plugin it was built
@@ -89,6 +92,10 @@ step that compiles (install, `check`, `test`, `test-build`, `conformance`, `sdk-
 What the served path needs from the host comes through the SDK: the loaded weights and the host's loaders
 (`sdk.Weights`, `sdk.LoadCtx.loader`), the GPU ceiling and wired margin (`LoadCtx.ceiling`,
 `LoadFacts.wired_margin_bytes`), the memory ledgers (`sdk.memory`), and the reads past the page cache (`io_util`).
+Two optional load facts carry the host's per-model choices to the bill: `LoadFacts.effective_context` (the context
+the load serves: the model's `ctx_size`, else the arch's own default, stamped before billing) and
+`LoadFacts.kv_quant_bits` (a KV precision the host chose: 0 = BF16, 8 = affine 8-bit). `Shell.kv_quant_bits` reports
+the precision the arch installed. All three are null by default; DeepSeek-V4.1 reads none of them.
 
 ## Arch hooks (G1-G4)
 
@@ -101,7 +108,7 @@ The arch kind takes the opt-in the proposal leans toward in its open questions: 
 |---|---|---|
 | G1 | `caps.owns_decode_state` | The arch keeps its per-request decode state (KV lanes, rings, draft caches) instead of the host's `KVCache`. The host turns off the prefix cache and batched decode for it and admits one request at a time. |
 | G2 | `handover` | Runs once per request between the prompt pass and the first decode step: free the prompt pass's buffers, clear the MLX cache, wait for memory to settle, allocate the decode buffers. `sdk.lifecycle` checks the order; the release step is present exactly when the arch installs a release route. |
-| G3 | `draft_lane` | The arch's own speculative decode loop over its own state. Per request, the lane picks its mode (`off`, `greedy`, `typical`, `stochastic`) from what the host knows of the request (`sdk.ArmRequest`: whether it is greedy, and whether it asks for logprobs, a grammar or penalties). The host still dispatches, stops and emits. `sdk.Spec` also names a host-driven `mtp_head`, empty until an arch claims it. |
+| G3 | `draft_lane` | The arch's own speculative decode loop over its own state. Per request, the lane picks its mode (`off`, `greedy`, `typical`, `stochastic`) from what the host knows of the request (`sdk.ArmRequest`: whether it is greedy, and whether it asks for logprobs, a grammar or penalties). The host still dispatches, stops and emits. `sdk.Spec` also names a host-driven `mtp_head`, empty until an arch claims it. Both arches' lanes take their acceptance decisions from `sdk_ext.acceptance` (below). |
 | G4 | `loadBytes`, `promptBytes`, `bill` | Memory. The required `loadBytes` sizes the load preflight and `promptBytes` the prompt admission. `bill` returns an itemized `sdk.MemoryBill` for a host-only `BillRequest` (the ceiling and the stop are its arguments), each term an upper bound. The terms flagged `at_construction` are compared once with the footprint after construction (`ConstructionOverBill`), and a term flagged `measured` with its one measurement there. A term not linear in the slot rows (the page tables over the wired bytes) is flagged `with_rows`: the fill, the admission and the process bound evaluate it through the bill's `row_terms` at the rows they ask for. |
 
 ## SDK modules (G5-G7)
@@ -110,7 +117,8 @@ The arch kind takes the opt-in the proposal leans toward in its open questions: 
 |---|---|---|
 | G5 | `sdk.kernels` | A pinned kernel registry. One manifest pins every Metal source by its sha256. `KernelSet(R)` builds the registry's kernels once per load and splits them among its consumers; each consumer runs the manifest's self-checks for its own kernels when it accepts the set. |
 | G6 | `sdk.expert` | The expert source surface: the reader (one per process), the event gate, the residency policy, the lookahead selector, the record layout, the source contract, the bank contract and the stream over it (`sdk.expert.stream`). |
-| G7 | `sdk.profile` | Profile timers across a plugin's kinds, with no imports between them. Generic code reads the probes its backend type declares (`sdk.profile.of`). A non-generic site, such as the kernel launcher or the expert stream, gets a probe its arch installs at construction; outside profile builds the probe's type is `void`. The SDK has no timers of its own. |
+| G7 | `sdk.profile` | Profile timers across a plugin's kinds, with no imports between them. Generic code reads the probes its backend type declares (`sdk.profile.of`). A non-generic site, such as the kernel launcher or the expert stream, gets a probe its arch installs at construction; outside profile builds the probe's type is `void`. The SDK has no timers of its own. A profile build is the host's choice: `sdk.plugin_profile` is true exactly when the host declares `plugin_profile` (its profile build option), else false. |
+| | `sdk_ext.acceptance` | The draft lanes' acceptance: one rule set (`exact`, and `typical`, Medusa's typical acceptance at a delta), one sampled path (exact speculative sampling over the request's tempered, filtered target) and one seeded draw keyed by (seed, absolute position), for every arch's draft lane. A lane drafts and verifies on its own state and hands the module the verify rows; it gets back how many drafts are accepted and the token after them. `accept` / `sampledRows` apply the rule to greedy requests and exact speculative sampling to sampled ones (DeepSeek-V4.1's DSpark lane, decisions unchanged from its own code, pinned by a characterization of the previous tree); `acceptGeneral` / `typicalRows` apply the rule to every request (MiMo's MTP lane). |
 
 ## The quant kind
 
@@ -144,6 +152,13 @@ record has `components` tensors, the first `gate_up` of them for the gate and up
 Reads go through an `UncachedFd` from `openUncached` (`O_NOFOLLOW`, `F_NOCACHE`, read-ahead off), so bank reads bypass
 the page cache.
 
+The reader can take a queued job back: `Pool.withdraw` (`q3ld_withdraw`) removes a demand job that no worker has taken
+yet, by its first ticket, and publishes its tickets as `withdrawn` (nothing read, no row written; the jobs behind it
+keep their order). A job a worker already took, or whose bytes a pre-range or a live event gate is waiting on, runs as
+submitted. `Pool.quiesce` expires unbound reads and waits for the pool's activity to stop. These moved the reader's
+ABI from 2026100201 to 2026101001; `io.zig`'s `abi_version` and the C pool move in lock-step, and a mismatch refuses
+the pool at start.
+
 A plugin whose experts live in one record file gets the whole stream (slot rows, routes, residency, reads, lookahead,
 event gates, the transient release, growth) from `sdk.expert.stream.StreamOf(B, probed)`, where `B` is its bank module,
 checked by `sdk.expert.assertBank` at compile time. The bank module provides:
@@ -155,6 +170,12 @@ checked by `sdk.expert.assertBank` at compile time. The bank module provides:
 - `Bank`: `layers` (one per routed layer), `n_experts`, `sidecar` (the record file's `UncachedFd`), `recordOffset(layer,
   expert)` and `spans(layer, expert)` (the gate/up and down offsets);
 - `BankArrays` and `bankArraysOf`: the slot arrays as its quant binds them.
+
+The stream's construction options include the prompt pass's read schedule (`prompt_reads`: `stock` or `overlap`;
+`prompt_ahead`, how the read-ahead is posted; `ahead_cap`) and the decode window (`decode_route_ids`, the transient rows
+decode can reach, when narrower than the widest route). Their defaults are the stock schedule and the full window,
+which DeepSeek-V4.1 takes; MiMo installs its own (mimo.md, The prompt pass). Slot arrays take their dtype from the
+bank (`B.mlxDtype`).
 
 The stream is the same code for every bank: the instance is fixed at compile time, with no runtime branch on the bank.
 mlx-stream instantiates it over its EXL3 bank (9 components, 6 in gate/up). An MXFP4 bank of six components (4 in
@@ -190,7 +211,8 @@ reaches a plugin only through the registry.
 
 What an arch like MiMo (a module-owned decode state, its routed experts repacked into one record file of six MXFP4
 components with gate/up = 4, eight experts routed per token, MLX's own `gather_qmm` for the expert math) writes, and what
-it gets from the SDK as it stands.
+it gets from the SDK as it stands. MiMo-V2.6-Flash took this path; [the section below](#mimo-v26-flash-the-second-arch)
+says where it went further.
 
 It writes:
 
@@ -202,7 +224,8 @@ It writes:
    `loadBytes` (its load preflight), `Module` + `init(LoadCtx, Config)` / `deinit` / `prefill` / `step` / `position`, and
    optionally `promptBytes`, `handover` (its phase change), `bill` (its itemized `sdk.MemoryBill`) and `spec.draft_lane`.
    `init` reads its residents from `LoadCtx.weights` (`sdk.Weights`), any sidecar through `LoadCtx.loader`, the GPU
-   ceiling from `LoadCtx.ceiling` and the wired margin from `LoadCtx.facts.wired_margin_bytes`.
+   ceiling from `LoadCtx.ceiling` and the wired margin from `LoadCtx.facts.wired_margin_bytes`; the context it bills
+   from `LoadFacts.effective_context` and a host-chosen KV precision from `LoadFacts.kv_quant_bits`.
 3. **A bank module** for its expert file: `n_components = 6`, `gu_components = 4`, `Records`, a `Component` enum, a
    `Layer` (six segments: weight U32 / scales U8 per projection), `mlxDtype`, `Bank` (`layers`, `n_experts`, an
    `UncachedFd` from `sdk.expert.openUncached`, `recordOffset`, `spans`), `BankArrays` / `bankArraysOf` (the six slot
@@ -222,6 +245,7 @@ It gets:
 - **The host's side**: registry routing by claim, the load preflight and prompt admission from its own numbers,
   single-flight admission and no prefix cache or batched decode (from `owns_decode_state`), the handover called once per
   request, the reader taken at its load claim, and `-Dslim` / `-D<plugin>=false` builds.
+- **A draft lane's acceptance**: `sdk_ext.acceptance` (the exact and typical rules, the sampled path, seeded draws).
 - **Conformance**: the CPU lane (claims decline what is not theirs, no Metal device, the import probe) by registering.
 
 What it does not get yet: an `sdk.KVCache` for an arch over the host's cache, and a host load path that asks the `quant`
@@ -243,13 +267,44 @@ The migration changes these behaviors; each fails with a named error:
 4. A second model whose expert source uses the reader fails at its load claim, before its weights load, with
    `ExpertReaderInUse`.
 
-## MiMo, the second plugin
+## MiMo-V2.6-Flash, the second arch
 
-MiMo (Astra's port) is planned as the second plugin: its arch would register beside DeepSeek-V4.1's, and its MXFP4
-expert source would implement the same contract over `Records(6, 4)`, with the same reader and residency policy. The
-contract puts the MoE math in the arch; if MiMo needs it elsewhere, the contract changes. An arch that keeps its own
-decode state can register today (G1). An arch over the host's `KVCache` needs `sdk.KVCache`, which is not built yet.
-MiMo will show what else the SDK lacks.
+MiMo-V2.6-Flash (`mimo_v2_flash`, `src/arch/mimo_v2/`) ships in this package beside DeepSeek-V4.1, through the same host
+glue and the same expert reader. [mimo.md](mimo.md) documents the arch and [mimo-pack.md](mimo-pack.md) its packs.
+Against the steps above:
+
+- **The arch file** (`src/arch/mimo_v2/root.zig`) declares `caps` `owns_decode_state`, `prefill_whole_prompt`,
+  `prefill_yields_last_logits` and `residents_past_page_cache`; `claims` at `native` only for `model_type:
+  mimo_v2_flash` with an `expert_streaming` block; `applyLoadFacts`, which binds the host's facts (the context, the KV
+  precision, forced rows, the memory baseline) once before the bill; `loadBytes`, `promptBytes` and `bill`; and
+  `claimProcess` / `releaseProcess` for the reader. It declares no `handover`: its phase change (freeing the prompt
+  scratch, growing the slot banks to the decode rows) runs inside the module at the first decode forward. It has no
+  prefix resume.
+- **The bank module** (`bank.zig`) is `Records(6, 4)`: gate, up and down as U32 codes plus U8 scales, records of
+  13,369,344 B whose gate/up and down spans are 16 KiB-aligned. The stream is `StreamOf` over it, the same code as the
+  EXL3 bank's.
+- **The MoE math** went beyond `FromGatherMatmul(GatherQmm)`. Decode runs fused MXFP4 kernels with a device pass over
+  the resident experts; MLX's `gather_qmm` stays as the stock route. The prompt pass runs sorted GEMM tiles over the
+  slot banks and combines the experts' outputs with one kernel per layer. Its Metal texts are pinned by six manifests
+  of its own (`src/arch/mimo_v2/kernels/`), compiled offline by `scripts/compile_mimo_kernels_offline.py`.
+- **Memory.** The fill admits prompt rows and decode rows apart (`sdk.Rows`), the slot banks grow at the phase change,
+  and the host side is a `measured` term checked once at construction, as DeepSeek-V4.1's is.
+- **Settings** come from the pack, not the host: the `settings` object of `config.json`'s `expert_streaming` block,
+  which `parse` reads from the `ConfigPeek` once and validates by name. The host adds no flag or environment variable.
+- **Draft lane.** `spec.draft_lane` over the pack's three MTP heads, with `sdk_ext.acceptance`'s `acceptGeneral`.
+
+What the SDK gained for it (each optional or a construction default, so DeepSeek-V4.1 keeps its route):
+
+- `sdk_ext.acceptance`, shared by both draft lanes; DSpark re-pointed onto it with unchanged decisions;
+- `LoadFacts.effective_context`, `LoadFacts.kv_quant_bits` and `Shell.kv_quant_bits`;
+- the stream's read-schedule and decode-window options, and slot arrays typed by the bank;
+- the reader's `withdraw` and `quiesce` (ABI 2026101001);
+- `sdk.plugin_profile` from the host's profile build option;
+- comptime seams in `deepseek_v41_experts` through which a math may declare its own projection, predictor and prompt
+  threshold; DeepSeek-V4.1 declares none and compiles its original sequence.
+
+The conformance suite checks that each arch claims only its own pack and that both share one reader claim
+(`ExpertReaderInUse`). MiMo, like DeepSeek-V4.1, owns its decode state, so `sdk.KVCache` is still not built.
 
 ## Not built yet
 

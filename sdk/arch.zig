@@ -32,7 +32,12 @@ pub const Caps = struct {
 };
 
 /// The parsed model's facts the host keeps on its own config.
-pub const Shell = struct { num_experts: u32 = 0, num_layers: u32 = 0 };
+pub const Shell = struct {
+    num_experts: u32 = 0,
+    num_layers: u32 = 0,
+    /// The installed KV precision (0 = bf16, 8 = affine 8-bit); null when the arch has no choice.
+    kv_quant_bits: ?u8 = null,
+};
 
 /// The host's generic streamed-expert facts at load (CLI flags and the preflight's sample).
 pub const LoadFacts = struct {
@@ -44,6 +49,10 @@ pub const LoadFacts = struct {
     expert_prefill_rows: ?u32 = null,
     /// The loader's page-cache setting for resident weights (`nocache_weights`; null = the arch's default).
     nocache_weights: ?bool = null,
+    /// The context the load serves (the model's `ctx_size`, else the arch's default context), stamped before billing.
+    effective_context: ?u64 = null,
+    /// A construction-time KV precision choice (0 = bf16, 8 = affine 8-bit); null = the arch's default.
+    kv_quant_bits: ?u8 = null,
     /// What a plan leaves unplanned under the GPU memory ceiling (`--wired-margin-gib` / `--wired-margin`), stamped
     /// once at load; the arch never reads the host's flag.
     wired_margin_bytes: u64,

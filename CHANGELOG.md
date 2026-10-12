@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
+  as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
+  DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the
+  pack's three MTP heads drive a draft lane (depth 1-3, typical or exact acceptance). The arch claims only a prepared
+  pack (`model_type: mimo_v2_flash` plus the `expert_streaming` block), bills prompt rows and decode rows apart with
+  the host side at its measured readings, and ships its Metal kernels pinned by six manifests
+  (src/arch/mimo_v2/kernels/, `scripts/compile_mimo_kernels_offline.py`). See docs/mimo.md and docs/mimo-pack.md.
+- MiMo-V2.6-Flash's settings live in the pack: the `settings` object of `config.json`'s `expert_streaming` block, read
+  once at construction. An unknown key, a wrong type or an unknown value refuses the load by name. No environment
+  variable or CLI flag selects a route; the host's per-model `ctx_size`, `kv_quant` and `mtp` stay the host's load
+  facts. A lab A/B uses a copy of `config.json` with every other pack file hard-linked.
+- `sdk_ext.acceptance`: one acceptance module for every draft lane (the exact and typical rules, the sampled path,
+  seeded draws keyed by position). DeepSeek-V4.1's DSpark lane now uses it with the same decisions, pinned by a
+  characterization frozen on the previous tree; its four sampling tests moved into the `acceptance` suite. The
+  rule-on-every-request form (`acceptGeneral`) is MiMo's only.
+- Expert reader: `q3ld_withdraw` (`Pool.withdraw`) takes a queued job that no worker has started back out of the
+  queue, by its first ticket: nothing is read and no row written (status `withdrawn`); a job already taken, or whose
+  bytes a pre-range or a live event gate is waiting on, runs as submitted. `Pool.quiesce` expires unbound reads and
+  waits for the pool's activity to stop. The reader's ABI moves from 2026100201 to 2026101001. DeepSeek-V4.1 calls
+  neither.
+- Expert stream: the prompt pass's read schedule and a decode window narrower than the widest route are construction
+  options; DeepSeek-V4.1 passes neither and keeps the stock schedule. Slot arrays take their dtype from the bank.
+- SDK: `LoadFacts.effective_context` (the context the load serves), `LoadFacts.kv_quant_bits` and
+  `Shell.kv_quant_bits` (optional, null by default); `sdk.plugin_profile` follows the host's profile build option when
+  the host declares one. DeepSeek-V4.1 reads none of them.
+- MiMo-V2.6-Flash lines of record in the README (MiMo-V2.6-Flash): fp8res pack, KV bf16, draft lane on, rows pinned per
+  cell, card sampling (temperature 1.0, top_p 0.95, seed 1, thinking on, 16,384-token cap), on server sha256
+  `746e7da9` (host `2c041af6` + this tree at `8e7d186`) unless named. The binary of record, `4b018c54` (this tree at
+  `05fc760`), differs from `746e7da9` only by the hot-path audit and the dead code sweep and reproduces its 16K cell
+  token for token (stamp16k-g15-20261011: 998.8 / 32.30 tok/s prefill / decode, 688 tokens; `746e7da9`: 1,003.9 /
+  31.6). The 16K card pair at 134 / 152 rows (on `b00df80e`, which installs the same routes up to 32,768 context):
+  996.4 / 1,003.2 tok/s prefill (mean 999.8), 28.40 / 28.10 tok/s decode (mean 28.25), 16.44 / 16.33 s TTFT, 107.81 GB
+  peak. The card ladder from 1K to 1M-token prompts: 978.5 tok/s prefill and 30.7 tok/s decode at 16K (1,003.9 and
+  31.6 at 130 / 147 rows), 296.1 and 15.4 at 512K, 179.6 and 9.6 at 1M, peak 96.1-104.3 GB. HumanEval pass@1: greedy
+  0.9451, card 0.9573 on `746e7da9` (identical counts and failing ids on `bb3c7245`).
+- The MiMo bill charges the one-eval predictor's router tiles on the default `prefill_predict_evals: one` (up to
+  0.43 GB in the prompt phase at 16K; it was unbilled).
 - GLM-5.3's memory bill fills to the box: the KV lanes hold each phase's positions (a prompt's at its pass, the
   request's own prompt and `max_tokens` from its handover); `max_output` (default 131,072) bills the longest request
   at construction; the decode handover settles the prompt's frees, reads the footprint and the box, and grows the
