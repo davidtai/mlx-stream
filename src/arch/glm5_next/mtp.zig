@@ -538,7 +538,7 @@ pub const Lane = struct {
         for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         self.held_bytes = heldOf(&held, std.heap.pageSize());
-        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, max_depth, verify_rows, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
+        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=coupled_sample bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, max_depth, verify_rows, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
         return self;
     }
 
@@ -682,7 +682,12 @@ pub const Lane = struct {
     /// (their tokens `after`, then `t1`; the last one through the layer), the first draft from the last pair's row, each
     /// further one from the previous draft and its normed output at the next position. The draft rows leave the lanes
     /// at the end: the lanes hold the trunk's pairs only.
-    pub fn draft(self: *Lane, g: *G, w: *const graph.Weights, after: []const u32, t1: u32, depth: u32, out: []u32) !void {
+    /// Coupled drafts: a sampled request's draft at position p is the head's own draw at the target's uniform
+    /// (`acceptance.sampledRows` on the head's row: the request's filter, the token-order inverse CDF, u = drawV(seed,
+    /// p)), the very rule and uniform the verify draws the target's token with, so a draft is kept whenever the two
+    /// distributions put u in the same token (P = 1 - the CDFs' disagreement, against p(argmax q) for an argmax draft).
+    /// The emitted tokens stay the target's draws (exact; serial == lane). A greedy request drafts the argmax.
+    pub fn draft(self: *Lane, g: *G, w: *const graph.Weights, after: []const u32, t1: u32, depth: u32, out: []u32, sm: ?acc.Params, len: u64) !void {
         std.debug.assert(after.len + 1 == self.n_pending and depth >= 1 and depth <= max_depth and out.len >= depth);
         try self.append(g, w, after);
         const c = self.c;
@@ -693,7 +698,12 @@ pub const Lane = struct {
         for (0..depth) |step| {
             const out_row = try self.layer(g, x, start + @as(u32, @intCast(step)));
             const normed = try graph.rmsNorm(g, out_row, self.head.head_norm, c.rms_norm_eps);
-            const am = try g.argmax(try g.reshape(try g.astype(try graph.linear(g, normed, w.head), .float32), &.{-1}), 0);
+            const logits = try g.astype(try graph.linear(g, normed, w.head), .float32);
+            // Draft `step` is the token at position len + 1 + step (t1 is at len): the target row's uniform there.
+            const am = if (sm) |p|
+                (try acc.sampledRows(g, try g.reshape(logits, &.{ 1, @intCast(c.vocab_size) }), p, len + step, &.{})).tok
+            else
+                try g.argmax(try g.reshape(logits, &.{-1}), 0);
             try g.evalAll(&.{am});
             var tok: [1]u32 = undefined;
             _ = try g.hostU32(am, &tok);
