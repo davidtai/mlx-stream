@@ -481,6 +481,9 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         // the projections one by one (each evaluated on its own), then the cache's buffers (the append)
         _ = try pt.phase(g, &.{q.qr}, .proj_qa);
         _ = try pt.phase(g, &.{ q.q_nope, q.q_pe }, .proj_qb);
+        // q_b's GEMM alone again on the same input (first touch against steady state), then q_a's
+        _ = try pt.phase(g, &.{try qlinear(g, q.qr, lw.q_b)}, .proj_qb2);
+        _ = try pt.phase(g, &.{try qlinear(g, x, lw.q_a)}, .proj_qa2);
         if (q.iq) |iq| _ = try pt.phase(g, &.{iq}, .proj_iq);
         _ = try pt.phase(g, &.{ k.latent, k.k_pe }, .proj_kv);
         if (k.index) |ik| _ = try pt.phase(g, &.{ik}, .proj_ik);
@@ -560,6 +563,8 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         _ = try pt.phase(g, &.{o2}, .o_trans);
         const y = try qlinear(g, o2, lw.o);
         _ = try pt.phase(g, &.{y}, .o_gemm);
+        // the same GEMM again on the same inputs (its weights and input now touched): first touch against steady state
+        _ = try pt.phase(g, &.{try qlinear(g, o2, lw.o)}, .o_gemm2);
         return y;
     }
     return qlinear(g, o2, lw.o);
