@@ -183,8 +183,8 @@ pub const Weights = struct {
             };
             const lg: L = .{ .pre = pre, .map = map, .diag = diag, .c = c, .l = l, .route = fp8_route };
             lw.* = .{
-                .input_norm = try lg.get("input_layernorm.weight", &.{h}),
-                .post_norm = try lg.get("post_attention_layernorm.weight", &.{h}),
+                .input_norm = try checked(lg, "input_layernorm.weight", &.{h}, l, diag),
+                .post_norm = try checked(lg, "post_attention_layernorm.weight", &.{h}, l, diag),
                 .hc_attn = .{
                     .fn_rows = try w.own(a, try f32Copy(s, try lg.get("hc_attn_fn", &.{ hc_mix, hch }), false)),
                     .base = try w.own(a, try f32Copy(s, try lg.get("hc_attn_base", &.{hc_mix}), false)),
@@ -375,7 +375,7 @@ fn aLogCheck(dt: mlx.mlx_dtype, layer: u32, diag: ?*sdk.Diag) !void {
 }
 
 /// Which layers hold a rule's tensor.
-pub const RuleLayers = enum { kda, moe };
+pub const RuleLayers = enum { all, kda, moe };
 /// A per-layer tensor a route reads in its stored dtype (or converts once at the bind), the layers that hold it, and the
 /// dtypes the bind takes for it. One table: the bind's refusals (`dtypeCheck`) and the pack-header test (GLM5_BANK) read
 /// it, so a real pack's dtype is checked against every route before a load, never found by a refusal in a window.
@@ -391,6 +391,9 @@ pub const dtype_rules = [_]DtypeRule{
     .{ .suffix = "self_attn.f_b_proj.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
     .{ .suffix = "self_attn.g_b_proj.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
     .{ .suffix = "self_attn.o_norm.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    // The mHC norms: hcPre's plan (ops.HcPlan) launches every sublayer's norm in the stream's dtype (BF16).
+    .{ .suffix = "input_layernorm.weight", .layers = .all, .accepted = &.{.bfloat16}, .desc = "BF16 (the stream's dtype)" },
+    .{ .suffix = "post_attention_layernorm.weight", .layers = .all, .accepted = &.{.bfloat16}, .desc = "BF16 (the stream's dtype)" },
     // The router: the glue's router text and the BF16 predictor read the weight as BF16; the correction bias is F32.
     .{ .suffix = "mlp.gate.weight", .layers = .moe, .accepted = &.{.bfloat16}, .desc = "BF16" },
     .{ .suffix = "mlp.gate.e_score_correction_bias", .layers = .moe, .accepted = &.{.float32}, .desc = "F32" },
@@ -933,9 +936,9 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
         defer g.resetTo(m);
         // The attention sublayer: its collapse and norm, with the previous sublayer's expand (none before layer 0).
         const pa = if (pend) |*p|
-            try glue.pre(g, c, null, &p.deferred, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, lw.input_norm)
+            try glue.pre(g, k, null, &p.deferred, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, lw.input_norm)
         else
-            try glue.pre(g, c, stream, null, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, lw.input_norm);
+            try glue.pre(g, k, stream, null, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, lw.input_norm);
         if (pend) |*p| {
             p.release(g);
             pend = null;
@@ -952,7 +955,7 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
         };
         pend = Pending.of(g, out, pa.post, pa.comb, stream);
         // The FFN sublayer: the attention's expand folded into its collapse and norm.
-        const pf = try glue.pre(g, c, null, &pend.?.deferred, lw.hc_ffn.fn_rows, lw.hc_ffn.scale, lw.hc_ffn.base, lw.post_norm);
+        const pf = try glue.pre(g, k, null, &pend.?.deferred, lw.hc_ffn.fn_rows, lw.hc_ffn.scale, lw.hc_ffn.base, lw.post_norm);
         pend.?.release(g);
         pend = null;
         g.release(stream);
@@ -969,7 +972,7 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
     }
     cache.len = start + rows;
     // The last sublayer's expand, materialized: the stream the head reads.
-    const final = try g.adopt(try pend.?.deferred.materialize(g.s));
+    const final = try g.adopt(try ops.materialize(g.s, &k.hc, &pend.?.deferred));
     const spans = [_]T{final};
     if (head == .hidden or head == .verify) {
         const final_rows = try normedRows(g, c, w, &spans, rows);
@@ -1026,6 +1029,7 @@ test {
     _ = @import("swiglu.zig");
     _ = @import("fp8.zig");
     _ = @import("fp8_parity.zig");
+    _ = @import("determinism_gpu.zig");
 }
 
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {
@@ -1274,6 +1278,7 @@ test "glm5_next graph: every tensor the routes bind has a dtype its rule takes i
         var l: u32 = 0;
         while (l < c.n_layers) : (l += 1) {
             const holds = switch (r.layers) {
+                .all => true,
                 .kda => !c.isDsa(l),
                 .moe => c.isMoe(l),
             };

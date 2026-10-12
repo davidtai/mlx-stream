@@ -65,7 +65,12 @@ fn rmsNorm(g: *G, x: T, w: T, eps: f32) !T {
 /// The module's construction-time routes: the indexer's prompt scores and the sparse latent attention on the NAX
 /// kernels (`dsa_nax`) where the device runs them (`fits`: Flash's dims are the kernels'); the decode lane's sparse
 /// latent attention on the fused texts (`decode_dsa: fused`, dsa_decode.zig) when the module installed them.
-pub const Routes = struct { nax: bool = false, sparse: ?*const dsa_decode.Kernels = null };
+pub const Routes = struct {
+    nax: bool = false,
+    sparse: ?*const dsa_decode.Kernels = null,
+    /// The indexer's decode launches, prepared at the module's construction (`ops.SelectPlan`).
+    select: ?*ops.SelectPlan = null,
+};
 
 /// The NAX kernels' shapes (`mlx_host.dsa_nax`): the 512-wide latent, heads in 32s, the indexer's 128-wide keys.
 pub fn fits(c: *const glm.Config) bool {
@@ -73,7 +78,7 @@ pub fn fits(c: *const glm.Config) bool {
 }
 
 pub fn indexer(c: *const glm.Config, routes: Routes) ops.Indexer {
-    return .{ .topk = @intCast(c.index_topk), .kpool = @intCast(c.index_kpool), .heads = @intCast(c.index_n_heads), .head_dim = @intCast(c.index_head_dim), .nax = routes.nax };
+    return .{ .topk = @intCast(c.index_topk), .kpool = @intCast(c.index_kpool), .heads = @intCast(c.index_n_heads), .head_dim = @intCast(c.index_head_dim), .nax = routes.nax, .plan = routes.select };
 }
 
 /// x [1, R, hidden] at positions [start, start + R) -> [1, R, hidden]; the rows appended to `lanes`.

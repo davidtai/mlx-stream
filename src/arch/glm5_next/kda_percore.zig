@@ -454,6 +454,8 @@ test "glm5_next kda percore GPU: the installed per-core prompt route vs the per-
     std.debug.print("GLM5N_KDA_PERCORE_PARITY plan={d}x{d}x{d} launchable 64x128={any} 76x108={any} 128x64={any}\n", .{ own.ntg, own.rows, own.per_core, can[0], can[1], can[2] });
     var worst_y: f64 = 0;
     var worst_s: f64 = 0;
+    // The per-token route's kernels and launches, as the module installs them.
+    try kda.install(&c);
     for ([_]usize{ 29, 100, 1024 }) |t| {
         var cs = try Case.init(a, @intCast(heads), t, 43 + t);
         defer cs.deinit(a);

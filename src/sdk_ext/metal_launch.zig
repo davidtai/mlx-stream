@@ -41,7 +41,7 @@ const std = @import("std");
 const testing = std.testing;
 
 extern "c" fn mlxlc_test_config(config: mlx.mlx_fast_metal_kernel_config, out: *[9]c_int) void;
-extern "c" fn mlxlc_test_bench(k: mlx.mlx_fast_metal_kernel, config: mlx.mlx_fast_metal_kernel_config, inputs: mlx.mlx_vector_array, iters: c_int, unevaluated: bool, out: *[3]i64) c_int;
+extern "c" fn mlxlc_test_bench(k: mlx.mlx_fast_metal_kernel, config: mlx.mlx_fast_metal_kernel_config, n_in: c_int, ndims: [*]const c_int, shapes: [*]const c_int, dtypes: [*]const mlx.mlx_dtype, iters: c_int, out: *[3]i64) c_int;
 extern "c" fn dsv41_alloc_last_error() [*:0]const u8;
 
 test "metal_launch: the shim reads mlx-c's config as mlx-c wrote it (grid, threadgroup, outputs, template args, no init value)" {
@@ -76,7 +76,7 @@ const Case = struct {
     tmpl_bf16: []const [*:0]const u8 = &.{},
 };
 
-fn bench(a: std.mem.Allocator, cs: Case, unevaluated: bool) ![3]i64 {
+fn bench(cs: Case) ![3]i64 {
     const iv = mlx.mlx_vector_string_new_data(cs.ins.ptr, cs.ins.len);
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(cs.outs.ptr, cs.outs.len);
@@ -90,22 +90,16 @@ fn bench(a: std.mem.Allocator, cs: Case, unevaluated: bool) ![3]i64 {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, cs.tg[0], cs.tg[1], cs.tg[2]));
     for (cs.tmpl_bf16) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, t, .bfloat16));
     for (cs.tmpl_int) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t[0], t[1]));
-    var arrays: [8]mlx.mlx_array = undefined;
-    for (cs.shapes, cs.dtypes, 0..) |sh, dt, i| {
-        var n: usize = 1;
-        for (sh) |d| n *= @intCast(d);
-        const bytes = try a.alloc(u8, n * 4);
-        defer a.free(bytes);
-        @memset(bytes, 0);
-        arrays[i] = mlx.mlx_array_new_data(bytes.ptr, sh.ptr, @intCast(sh.len), dt);
+    var ndims: [8]c_int = undefined;
+    var shapes: [32]c_int = undefined;
+    var at: usize = 0;
+    for (cs.shapes, 0..) |sh, i| {
+        ndims[i] = @intCast(sh.len);
+        @memcpy(shapes[at .. at + sh.len], sh);
+        at += sh.len;
     }
-    defer for (arrays[0..cs.shapes.len]) |x| {
-        _ = mlx.mlx_array_free(x);
-    };
-    const vin = mlx.mlx_vector_array_new_data(&arrays, cs.shapes.len);
-    defer _ = mlx.mlx_vector_array_free(vin);
     var out: [3]i64 = undefined;
-    if (mlxlc_test_bench(k, c, vin, 2000, unevaluated, &out) != 0) {
+    if (mlxlc_test_bench(k, c, @intCast(cs.shapes.len), &ndims, &shapes, cs.dtypes.ptr, 2000, &out) != 0) {
         std.debug.print("mlxlc_test_bench: {s}\n", .{dsv41_alloc_last_error()});
         return error.MlxError;
     }
@@ -113,7 +107,6 @@ fn bench(a: std.mem.Allocator, cs: Case, unevaluated: bool) ![3]i64 {
 }
 
 test "metal_launch: host cost per launch, MLX's apply (source rebuilt and hashed) vs the cached launch, on the decode texts" {
-    const a = testing.allocator;
     const cases = [_]Case{
         .{
             .name = "glm5n_swiglu",
@@ -159,10 +152,12 @@ test "metal_launch: host cost per launch, MLX's apply (source rebuilt and hashed
             .tmpl_int = &.{ .{ "M", 1 }, .{ "N", 512 }, .{ "K", 4096 }, .{ "R", 4 }, .{ "KS", 1 }, .{ "RG", 4 } },
         },
     };
-    for (cases) |cs| for ([_]bool{ false, true }) |unev| {
-        const r = try bench(a, cs, unev);
-        std.debug.print("MLX_LAUNCH_HOST kernel={s} inputs={s} source_bytes={d} mlx_apply_ns={d} cached_ns={d}\n", .{ cs.name, if (unev) "unevaluated" else "available", r[2], r[0], r[1] });
+    for (cases) |cs| {
+        const r = try bench(cs);
+        std.debug.print("MLX_LAUNCH_HOST kernel={s} source_bytes={d} mlx_apply_ns={d} cached_ns={d}\n", .{ cs.name, r[2], r[0], r[1] });
         // The cached launch never rebuilds the source: it must cost less than MLX's apply.
         try testing.expect(r[1] < r[0]);
-    };
+    }
+    // Graphs only: no buffer was allocated, so the CPU lane created no device.
+    try @import("sdk").testing.expectNoDevice();
 }

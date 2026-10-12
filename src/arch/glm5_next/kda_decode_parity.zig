@@ -141,6 +141,8 @@ test "glm5next kda decode GPU: the fused text against the op chain (rows 1..4, t
         .o = .{ .bf16 = try W.mk(&g, a, r, &kept, &.{ h, dim }, 1.0 / @sqrt(@as(f32, @floatFromInt(dim))), 0.0) },
     };
     var diag: @import("sdk").Diag = .{};
+    // The op chain's recurrence: its kernels and launches as the module installs them.
+    try kda.install(&c);
     var k = kda_decode.install(a, s, &c, &.{&w}, &diag) catch |e| {
         std.debug.print("glm5next kda decode install refused: {s}\n", .{diag.message()});
         return e;
