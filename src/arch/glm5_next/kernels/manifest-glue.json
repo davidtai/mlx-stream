@@ -1,0 +1,237 @@
+{
+ "format": "mlx-stream-glm5next-glue-kernels-v1",
+ "headers": [
+  {
+   "bytes": 738,
+   "file": "header_glm5n_glue.metal",
+   "id": "glm5n_glue",
+   "sha256": "6bab9e2ca4ae508bd2f6dec8f5638bd218ca0161f3c80bdf4dd5010acbf93833"
+  },
+  {
+   "bytes": 633,
+   "file": "header_glm5n_combine.metal",
+   "id": "glm5n_combine",
+   "sha256": "82e9d3c3c425164d73522e8ca59208212487ca19f8e6d628ca63e35b32d8ff16"
+  }
+ ],
+ "kernels": [
+  {
+   "class": "rounding-class (the router product in MLX gemv bm1/bn8 order on the BF16 weight; stock: gemv_t on the F32 copy)",
+   "family": "glue",
+   "grid": [
+    256,
+    "E/4",
+    1
+   ],
+   "header": {
+    "id": "glm5n_glue"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "x",
+     "shape": [
+      "M",
+      4096
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "gate",
+     "shape": [
+      "E",
+      4096
+     ]
+    }
+   ],
+   "instances": [
+    {
+     "E": 288,
+     "M": 1
+    },
+    {
+     "E": 288,
+     "M": 2
+    },
+    {
+     "E": 288,
+     "M": 3
+    },
+    {
+     "E": 288,
+     "M": 4
+    }
+   ],
+   "name": "glm5n_glue_router",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "logits",
+     "shape": [
+      "M",
+      "E"
+     ]
+    }
+   ],
+   "source": {
+    "bytes": 2471,
+    "file": "glm5n_glue_router.metal",
+    "sha256": "c3d329868582f41f9a60d88fdd8c713eddf1ed7dd15b7b97454c919f1b4a6a0c"
+   },
+   "template": [
+    "T",
+    "M",
+    "E"
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ]
+  },
+  {
+   "class": "exact given the logits (the stock tail: sigmoid, bias, stable top-8, normalize, routed_scaling)",
+   "family": "glue",
+   "grid": [
+    "E",
+    "M",
+    1
+   ],
+   "header": {
+    "id": "glm5n_glue"
+   },
+   "inputs": [
+    {
+     "dtype": "float32",
+     "name": "logits",
+     "shape": [
+      "M",
+      "E"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "bias",
+     "shape": [
+      "E"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "consts",
+     "shape": [
+      8
+     ]
+    }
+   ],
+   "instances": [
+    {
+     "E": 288
+    }
+   ],
+   "name": "glm5n_glue_top8",
+   "outputs": [
+    {
+     "dtype": "int32",
+     "name": "ids",
+     "shape": [
+      "M",
+      8
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "weights",
+     "shape": [
+      "M",
+      8
+     ]
+    }
+   ],
+   "source": {
+    "bytes": 1906,
+    "file": "glm5n_glue_top8.metal",
+    "sha256": "1c46a2abdb760b6ea9fab7a5995a1e028c523e7b86486e37298e34b8d7fb29c3"
+   },
+   "template": [
+    "E"
+   ],
+   "threadgroup": [
+    "E",
+    1,
+    1
+   ]
+  },
+  {
+   "class": "exact given its inputs (combineStock, then the bf16 add of the shared expert)",
+   "family": "combine",
+   "grid": [
+    4096,
+    "M",
+    1
+   ],
+   "header": {
+    "id": "glm5n_combine"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "rows",
+     "shape": [
+      "M*8",
+      4096
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "w",
+     "shape": [
+      "M",
+      8
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "shared",
+     "shape": [
+      "M",
+      4096
+     ]
+    }
+   ],
+   "instances": [
+    {
+     "H": 4096,
+     "TOPK": 8
+    }
+   ],
+   "name": "glm5n_moe_combine",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y",
+     "shape": [
+      "M",
+      4096
+     ]
+    }
+   ],
+   "source": {
+    "bytes": 1085,
+    "file": "glm5n_moe_combine.metal",
+    "sha256": "bc5d18b44cf27021a97a9324d2109dad669ba8660510c01196ff7710bb0f2c86"
+   },
+   "template": [
+    "T",
+    "TOPK",
+    "H"
+   ],
+   "threadgroup": [
+    256,
+    1,
+    1
+   ]
+  }
+ ],
+ "lane": "glm5next/decode-stack (decode_glue: fused)"
+}

@@ -425,8 +425,10 @@ pub const Head = struct {
             .idx_gate_t = try head.own(a, try graph.f32Copy(s, try lg.get("self_attn.indexer.index_kpool_compress_gate", &.{ ihd, h }), true)),
             .idx_ape = try head.own(a, try graph.f32Copy(s, try lg.get("self_attn.indexer.index_kpool_compress_ape", &.{ @intCast(c.index_kpool), ihd }), false)),
         };
+        const gate_w = try lg.get("mlp.gate.weight", &.{ e, h });
         head.router = .{
-            .w_t = try head.own(a, try graph.f32Copy(s, try lg.get("mlp.gate.weight", &.{ e, h }), true)),
+            .w = gate_w,
+            .w_t = try head.own(a, try graph.f32Copy(s, gate_w, true)),
             .bias = try lg.get("mlp.gate.e_score_correction_bias", &.{e}),
         };
         if (mlx.mlx_array_dtype(head.router.bias) != .float32) return refuse(diag, error.Glm5NextMtpResidentDtype, "mlp.gate.e_score_correction_bias is not F32", .{});

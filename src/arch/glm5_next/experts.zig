@@ -24,6 +24,7 @@ const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
 const bank_mod = @import("bank.zig");
 const nvfp4 = @import("nvfp4.zig");
 const settings = @import("settings.zig");
+const glue = @import("glue.zig");
 const profile = @import("../mimo_v2/profile.zig");
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
 const route_trace = @import("../mimo_v2/route_trace.zig");
@@ -340,6 +341,23 @@ pub const Source = struct {
         try self.ex.flush();
         profile.charge(.join, join_start);
         return self.parts_combine(self, g, parts.outs, parts.loc, route_weights, nt);
+    }
+
+    /// The decode lane's routed call under the fused glue (`decode_glue: fused`, glue.zig; the module's fused trunk is
+    /// its only caller, on the decode lane): `forward`'s decode lane, the glue's i32 ids as the scheduler reads them, the
+    /// shared expert `shared` committed during the call's read wait (`forward`'s hoist), and the combine text adding the
+    /// shared expert's rows: the routed sum plus the shared expert, bf16 [nt, H], a KEPT handle the caller adopts (lazy,
+    /// as `forward`'s decode lane).
+    pub fn forwardShared(self: *Source, layer: u32, x: T, ids: T, route_weights: T, shared: T, k: *const glue.Kernels) !T {
+        const g = &self.g;
+        defer g.reset();
+        const nt: u32 = @intCast(g.shapeOf(x).d[0]);
+        profile.call();
+        const routed = try self.ex.at(layer).routedHoist(g, x, ids, &.{shared});
+        const encode_start = profile.now();
+        const output = try glue.combineShared(g, k, routed, route_weights, shared, nt);
+        profile.charge(.encode, encode_start);
+        return g.keep(output);
     }
 
     /// P1: layer `layer`'s predicted experts, hottest first, read into its free persistent rows ahead of its call.
