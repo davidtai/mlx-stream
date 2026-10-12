@@ -7,7 +7,8 @@
     // simdgroup j member j's rotations and the minis' sum. gt: per slot (packed bank << 24 | row, members, member pairs);
     // pt: per pair (x row, slot packed bank << 24 | row, routed position, 0); DEV: the call's routed positions are the
     // slots and the pairs, gt their packed slots (one member each); sc: the router's weights by routed position. A member
-    // of score 0, or of a slot at 0xFFFFFFFF, reads nothing: its output block zero.
+    // of score 0, or of a slot at 0xFFFFFFFF, reads nothing: its output block zero. y is T (f32 for the call's combine,
+    // bf16 for a fused wave's pairs).
     constexpr uint IT = uint(MINI) / 16u;
     constexpr uint OT = uint(HID) / 16u;
     constexpr uint NW = 8u * uint(K);
@@ -34,11 +35,11 @@
     }
     for (uint j = 0u; j < uint(MAXM); ++j) {
         if (sg == j && j < cnt && !live[j]) {
-            device float* yp = y + size_t(mem[j]) * uint(HID) + blk * 128u + lane;
-            yp[0] = 0.0f;
-            yp[32] = 0.0f;
-            yp[64] = 0.0f;
-            yp[96] = 0.0f;
+            device T* yp = y + size_t(mem[j]) * uint(HID) + blk * 128u + lane;
+            yp[0] = T(0.0f);
+            yp[32] = T(0.0f);
+            yp[64] = T(0.0f);
+            yp[96] = T(0.0f);
         }
     }
     if (n_live == 0u) return;
@@ -118,9 +119,9 @@
             yb += tt * float4(float(ro[ob]), float(ro[ob + 32u]), float(ro[ob + 64u]), float(ro[ob + 96u]));
         }
         yb *= sc[pos[j]];
-        device float* yp = y + size_t(mem[j]) * uint(HID) + blk * 128u + lane;
-        yp[0] = yb.x;
-        yp[32] = yb.y;
-        yp[64] = yb.z;
-        yp[96] = yb.w;
+        device T* yp = y + size_t(mem[j]) * uint(HID) + blk * 128u + lane;
+        yp[0] = T(yb.x);
+        yp[32] = T(yb.y);
+        yp[64] = T(yb.z);
+        yp[96] = T(yb.w);
     }

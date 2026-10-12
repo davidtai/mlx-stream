@@ -46,10 +46,10 @@ KERNELS = [
      + banks("cg", "uint16") + banks("cu", "uint16"),
      "outputs": [arg("zg", "float32"), arg("zu", "float32")]},
     {"name": "glm53_dec_down", "family": "decode", "headers": ["dig2"] + DEC, "threadgroup": [512, 1, 1],
-     "template": ["K", "HID", "MINI", "MAXM", "DEV"], "k": True,
+     "template": ["K", "HID", "MINI", "MAXM", "DEV", "T"], "k": True,
      "inputs": [arg("zg", "float32"), arg("zu", "float32"), arg("gt", "uint32"), arg("pt", "uint32"), arg("sc", "float32")]
      + banks("og", "float16") + banks("ou", "float16") + banks("di", "float16") + banks("cd", "uint16") + banks("do", "float16"),
-     "outputs": [arg("y", "float32")]},
+     "outputs": [arg("y", "T")]},
     {"name": "glm53_dec_combine", "family": "decode", "headers": ["glm53_common"], "threadgroup": [256, 1, 1],
      "template": ["T", "HID", "TOPK", "ACC"], "k": False,
      "inputs": [arg("s" + str(i), "float32") for i in range(16)] + [arg("ct", "uint32"), arg("acc", "float32")],

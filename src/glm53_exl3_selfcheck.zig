@@ -300,7 +300,9 @@ fn decodeChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     defer cmb.deinit();
     var bk = [3]routes.Bank{ banks[0].bank, banks[1].bank, banks[2].bank };
     if (mutation == .rin_rout) for (&bk) |*b| swapRinRout(b);
-    const y = try sc.keep(try dec.wave(x, pt, gt, n_pairs, tabs.n_slots, &bk, scd));
+    const y = try sc.keep(try dec.wave(x, pt, gt, n_pairs, tabs.n_slots, &bk, scd, .float32));
+    // the same wave written bf16 (a fused wave's pairs): each word the f32 wave's rounded
+    const yb = try sc.keep(try dec.wave(x, pt, gt, n_pairs, tabs.n_slots, &bk, scd, .bfloat16));
     var ct: [routes.max_rows * routes.top_k]u32 = @splat(0xffffffff);
     for (pairs[0..n_pairs], 0..) |pr, i| ct[pr[2]] = @intCast(i);
     const ctd = try sc.host(std.mem.sliceAsBytes(ct[0..@max(8, n_rows * routes.top_k)]), &.{@intCast(@max(8, n_rows * routes.top_k))}, .uint32);
@@ -331,7 +333,11 @@ fn decodeChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     const got = try f32Of(&sc, s, out, n_rows * inst.hidden);
     const dgot = try f32Of(&sc, s, dout, n_rows * inst.hidden);
     const yrows = try f32Of(&sc, s, yd, n_ids * inst.hidden);
-    if (!numeric) return .{ .words = got.len + dgot.len, .bad = 0, .metric = 0, .limit = 0 };
+    const yw = try f32Of(&sc, s, y, n_pairs * inst.hidden);
+    const ybw = try f32Of(&sc, s, yb, n_pairs * inst.hidden);
+    if (!numeric) return .{ .words = got.len + dgot.len + ybw.len, .bad = 0, .metric = 0, .limit = 0 };
+    var unrounded: u64 = 0;
+    for (yw, ybw) |fw, bw| unrounded += @intFromBool(!(@abs(bw - fw) <= 0.5 * bf16Ulp(@abs(fw))));
     var nonzero: u64 = 0;
     for (0..n_ids) |q| if (!served[q]) {
         for (yrows[q * inst.hidden ..][0..inst.hidden]) |v| nonzero += @intFromBool(v != 0);
@@ -354,7 +360,7 @@ fn decodeChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
     }
     const v = verdictOf(got, want);
     const dv = verdictOf(dgot, dwant);
-    return .{ .words = v.words + dv.words, .bad = v.bad + dv.bad + nonzero, .metric = @max(v.metric, dv.metric), .limit = 1 };
+    return .{ .words = v.words + dv.words + ybw.len, .bad = v.bad + dv.bad + nonzero + unrounded, .metric = @max(v.metric, dv.metric), .limit = 1 };
 }
 
 /// A decode wave's tables: pt (per pair: x row, packed slot, routed position, 0) and gt (per distinct slot: packed slot,

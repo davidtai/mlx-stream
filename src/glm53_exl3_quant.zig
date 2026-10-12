@@ -161,7 +161,7 @@ pub fn Accepted(comptime G: type) type {
             const ones: [routes.max_pairs]f32 = @splat(1);
             const sc = try g.hostArray(std.mem.sliceAsBytes(ones[0..@max(8, m)]), &.{@intCast(@max(8, m))}, .float32);
             const banks = [3]Bank{ bank, bank, bank };
-            return g.astype(try self.decodeWaveWith(g, x, pairs[0..m], &banks, sc, with), .bfloat16);
+            return self.decodeWaveWith(g, x, pairs[0..m], &banks, sc, with, .bfloat16);
         }
 
         /// One decode wave over a bank layer: x [rows, hidden] bf16 (the call's rows), `pairs` per pair (x row, packed
@@ -169,10 +169,11 @@ pub fn Accepted(comptime G: type) type {
         /// another's), sc the router's weights [rows, top-k] f32 -> f32 [pairs, hidden], each pair's output times its
         /// score. `scratch`: the pair and slot tables' host words (`decodeTables`).
         pub fn decodeWave(self: *Self, g: *G, x: G.T, pairs: []const [3]u32, banks: *const [3]Bank, sc: G.T) !G.T {
-            return self.decodeWaveWith(g, x, pairs, banks, sc, null);
+            return self.decodeWaveWith(g, x, pairs, banks, sc, null, .float32);
         }
 
-        fn decodeWaveWith(self: *Self, g: *G, x: G.T, pairs: []const [3]u32, banks: *const [3]Bank, sc: G.T, with: ?*routes.Decode) !G.T {
+        /// `decodeWave` over `with`'s chain (else the bank's K's), its output of dtype `out` (f32; bf16 for `fused`).
+        fn decodeWaveWith(self: *Self, g: *G, x: G.T, pairs: []const [3]u32, banks: *const [3]Bank, sc: G.T, with: ?*routes.Decode, out: mlx.mlx_dtype) !G.T {
             const k = kOf(banks[0].gate.trellis) orelse return error.BankArrays;
             const dec = with orelse &self.dec[ki(k)];
             const tabs = try selfcheck.decodeTablesM(self.a, pairs, dec.maxm);
@@ -182,7 +183,7 @@ pub fn Accepted(comptime G: type) type {
             const gt = try g.hostArray(std.mem.sliceAsBytes(tabs.gt), &.{@intCast(tabs.gt.len)}, .uint32);
             var rb: [3]routes.Bank = undefined;
             for (banks, &rb) |b, *o| o.* = .{ .gate = proj(b.gate), .up = proj(b.up), .down = proj(b.down) };
-            return g.adopt(try dec.wave(x, pt, gt, pairs.len, tabs.n_slots, &rb, sc));
+            return g.adopt(try dec.wave(x, pt, gt, pairs.len, tabs.n_slots, &rb, sc, out));
         }
 
         /// One decode wave over the call's every routed position, the slots a device array (e.g. the routed ids through a

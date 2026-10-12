@@ -93,9 +93,10 @@ pub const Decode = struct {
     maxm: u32 = max_members,
     /// per mode (host tables, device slots), indexed by pairs
     prep: [2]Plans(max_pairs) = .{ .{}, .{} },
-    /// the host mode's GEMVs: their grids count the slots, their outputs the pairs
+    /// the host mode's GEMVs: their grids count the slots, their outputs the pairs; the down's per output dtype (f32,
+    /// bf16)
     gu: [max_pairs]Plans(max_pairs) = @splat(.{}),
-    down: [max_pairs]Plans(max_pairs) = @splat(.{}),
+    down: [2][max_pairs]Plans(max_pairs) = @splat(@splat(.{})),
     gu_dev: Plans(max_pairs) = .{},
     down_dev: Plans(max_pairs) = .{},
 
@@ -106,18 +107,18 @@ pub const Decode = struct {
     pub fn deinit(self: *Decode) void {
         for (&self.prep) |*p| p.deinit();
         for (&self.gu) |*p| p.deinit();
-        for (&self.down) |*p| p.deinit();
+        for (&self.down) |*pp| for (pp) |*p| p.deinit();
         self.gu_dev.deinit();
         self.down_dev.deinit();
     }
 
     /// One wave: x [rows, HID] bf16, pt u32 [>= 8] (per pair: x row, packed slot, routed position, 0), gt u32 [>= 8]
     /// (per distinct slot: packed slot, members, member pairs), `banks` the bank kinds' arrays (packed bank 0..2), sc f32
-    /// [rows x top-k] -> y f32 [pairs, HID] (each pair's output times its score; a pair of score 0 reads no weight, its
-    /// row zero).
-    pub fn wave(self: *Decode, x: mlx.mlx_array, pt: mlx.mlx_array, gt: mlx.mlx_array, n_pairs: usize, n_slots: usize, banks: *const [3]Bank, sc: mlx.mlx_array) !mlx.mlx_array {
-        std.debug.assert(n_slots >= 1 and n_slots <= n_pairs and n_pairs <= max_pairs);
-        return self.chain(false, x, pt, gt, n_pairs, n_slots, banks, sc);
+    /// [rows x top-k] -> y [pairs, HID] of dtype `out` (f32 or bf16: each pair's output times its score; a pair of score
+    /// 0 reads no weight, its row zero).
+    pub fn wave(self: *Decode, x: mlx.mlx_array, pt: mlx.mlx_array, gt: mlx.mlx_array, n_pairs: usize, n_slots: usize, banks: *const [3]Bank, sc: mlx.mlx_array, out: mlx.mlx_dtype) !mlx.mlx_array {
+        std.debug.assert(n_slots >= 1 and n_slots <= n_pairs and n_pairs <= max_pairs and (out == .float32 or out == .bfloat16));
+        return self.chain(false, x, pt, gt, n_pairs, n_slots, banks, sc, out);
     }
 
     /// One wave over the call's every routed position: slots u32 [n_ids] (each position's packed slot bank << 24 | row,
@@ -125,10 +126,10 @@ pub const Decode = struct {
     /// weight, its row zero).
     pub fn waveDevice(self: *Decode, x: mlx.mlx_array, slots: mlx.mlx_array, n_ids: usize, banks: *const [3]Bank, sc: mlx.mlx_array) !mlx.mlx_array {
         std.debug.assert(n_ids >= 1 and n_ids <= max_pairs);
-        return self.chain(true, x, slots, slots, n_ids, n_ids, banks, sc);
+        return self.chain(true, x, slots, slots, n_ids, n_ids, banks, sc, .float32);
     }
 
-    fn chain(self: *Decode, dev: bool, x: mlx.mlx_array, pt: mlx.mlx_array, gt: mlx.mlx_array, n_pairs: usize, n_slots: usize, banks: *const [3]Bank, sc: mlx.mlx_array) !mlx.mlx_array {
+    fn chain(self: *Decode, dev: bool, x: mlx.mlx_array, pt: mlx.mlx_array, gt: mlx.mlx_array, n_pairs: usize, n_slots: usize, banks: *const [3]Bank, sc: mlx.mlx_array, out: mlx.mlx_dtype) !mlx.mlx_array {
         const reg = self.b.reg;
         const h: u32 = self.inst.hidden;
         const mi: u32 = self.inst.mini;
@@ -159,10 +160,11 @@ pub const Decode = struct {
         const e = reg.get(.glm53_dec_down);
         const sh = [_]c_int{ np, @intCast(h) };
         // a threadgroup per 128-block of the output and slot
-        var cfg = cfgOf(e, self.inst, .{ e.threadgroup[0] * (h / 128), @intCast(n_slots), 1 }, &.{.{ &sh, .float32 }});
+        var cfg = cfgOf(e, self.inst, .{ e.threadgroup[0] * (h / 128), @intCast(n_slots), 1 }, &.{.{ &sh, out }});
+        cfg.dtype = out;
         setInt(&cfg, e, "DEV", di);
         setInt(&cfg, e, "MAXM", @intCast(self.maxm));
-        const p = if (dev) try self.down_dev.get(self.b, .glm53_dec_down, n_pairs, &cfg) else try self.down[n_pairs - 1].get(self.b, .glm53_dec_down, n_slots, &cfg);
+        const p = if (dev) try self.down_dev.get(self.b, .glm53_dec_down, n_pairs, &cfg) else try self.down[@intFromBool(out == .bfloat16)][n_pairs - 1].get(self.b, .glm53_dec_down, n_slots, &cfg);
         var y: [1]mlx.mlx_array = undefined;
         try self.b.applyPrepared(p, &.{ z[0], z[1], gt, pt, sc, banks[0].gate.svh, banks[1].gate.svh, banks[2].gate.svh, banks[0].up.svh, banks[1].up.svh, banks[2].up.svh, banks[0].down.suh, banks[1].down.suh, banks[2].down.suh, banks[0].down.trellis, banks[1].down.trellis, banks[2].down.trellis, banks[0].down.svh, banks[1].down.svh, banks[2].down.svh }, &y);
         return y[0];
