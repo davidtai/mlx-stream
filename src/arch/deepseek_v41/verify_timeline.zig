@@ -311,7 +311,8 @@ fn tagPhase(t: u64) u8 {
     return @truncate(t);
 }
 
-const Span = [2]u64;
+/// A host- or GPU-clock interval [start, end) (the prompt timeline's too, `mimo_v2/prefill_timeline.zig`).
+pub const Span = [2]u64;
 
 /// The busy union of the cycle's buffers inside [lo, hi), merged and sorted (into `out`).
 fn busyUnion(rs: []const Row, cyc: u32, lo: u64, hi: u64, out: []Span) []Span {
@@ -342,7 +343,7 @@ fn busyUnion(rs: []const Row, cyc: u32, lo: u64, hi: u64, out: []Span) []Span {
 }
 
 /// The busy time of `u` inside [a, b).
-fn busyIn(u: []const Span, a: u64, b: u64) u64 {
+pub fn busyIn(u: []const Span, a: u64, b: u64) u64 {
     var s: u64 = 0;
     for (u) |sp| {
         const x = @max(sp[0], a);
@@ -358,7 +359,7 @@ fn idleIn(u: []const Span, a: u64, b: u64) u64 {
 }
 
 /// The first logged signal at or past `value` (the log's values never decrease): its signal-call time.
-fn signalOf(sig: []const Signal, value: u64) ?u64 {
+pub fn signalOf(sig: []const Signal, value: u64) ?u64 {
     var lo: usize = 0;
     var hi: usize = sig.len;
     while (lo < hi) {

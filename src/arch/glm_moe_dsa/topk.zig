@@ -12,6 +12,7 @@
 //! pinned registry's (`trunk_kernels`: kernels/glm_moe_dsa/), built and run once at the module's construction.
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const mlx = @import("sdk").mlx;
 const ops = @import("../deepseek_v41/ops.zig");
 const trunk = @import("trunk_kernels.zig");
@@ -78,6 +79,7 @@ fn launch(g: *G, bound: *const trunk.Bound, kern: trunk.Kernel, inputs: []const 
 const testing = std.testing;
 
 test "glm topk: each row's k largest scores in argpartition's ids and order, ties, both zeros and masked tails included" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
@@ -137,6 +139,7 @@ test "glm topk: each row's k largest scores in argpartition's ids and order, tie
 }
 
 test "glm topk: rows of their own lengths in one launch, each its k largest in argpartition's ids and order (ties, both zeros)" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();

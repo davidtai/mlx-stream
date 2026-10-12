@@ -5,6 +5,7 @@
 //! (topk.zig against argpartition's ids and order, experts.zig against the op chain's bits).
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const mlx = @import("sdk").mlx;
 const log = @import("sdk").log;
 const xk = @import("trunk_kernels.zig");
@@ -128,6 +129,7 @@ fn launchZeros(a: Allocator, bound: *const xk.Bound, k: Kernel, inst: xk.Instanc
 const testing = std.testing;
 
 test "glm trunk selfcheck: the stub device's plan gives one compile result per kernel; a scripted failure refuses by name" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const KS = kset.KernelSet(xk);
     var diag: xk.Diag = .{};
     const set = try KS.Set.init(testing.allocator, .{ .device = .{ .stub = .{} } }, &diag);
@@ -146,6 +148,7 @@ test "glm trunk selfcheck: the stub device's plan gives one compile result per k
 }
 
 test "glm trunk selfcheck: every kernel builds and completes a launch at every registered instantiation on the GPU" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();

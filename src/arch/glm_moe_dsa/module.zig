@@ -22,6 +22,7 @@
 //! lanes to the accepted rows; the MTP layer appends nothing for a draft, so a rejection leaves its cache as it was.
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const log = @import("sdk").log;
@@ -1287,6 +1288,7 @@ pub const PrecisionLine = struct {
 const testing = std.testing;
 
 test "glm stats lines: the lookahead's precision per top-k position, per bank layer, from fixed counters" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     // The counts at the handover (an earlier request's) and at the end.
     var two0: [2][sdk_ext.expert.lookahead.max_k][2]u64 = @splat(@splat(.{ 0, 0 }));
@@ -1308,6 +1310,7 @@ test "glm stats lines: the lookahead's precision per top-k position, per bank la
 }
 
 test "glm stats lines: the prompt and decode lines and the per-layer hit spread, from fixed counters" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const s0: Stats = .{ .expert_bytes_read = 100, .adopt_bytes = 10, .spec_bytes = 5, .persistent_loads = 3, .transient_loads = 1, .loads_skipped = 1, .expert_cache_hits = 7, .expert_cache_misses = 4 };
     const s1: Stats = .{ .expert_bytes_read = 8_000_000_100, .adopt_bytes = 1_000_000_010, .spec_bytes = 2_000_000_005, .persistent_loads = 303, .transient_loads = 101, .loads_skipped = 21, .expert_cache_hits = 607, .expert_cache_misses = 404, .ahead_posted = 50, .ahead_hits = 40, .spec_issued = 90, .claimed = 60, .read_wait_ns = 1_500_000_000, .read_wall_ns = 2_250_000_000, .spec_landed = 70, .spec_expired = 12, .spec_abandoned = 5, .spec_cancelled = 3, .spec_discarded = 7, .direct_ranges = 300, .spec_claimed_inflight = 4 };
     const r = Reads.of(s0, s1);
@@ -1331,6 +1334,7 @@ test "glm stats lines: the prompt and decode lines and the per-layer hit spread,
 }
 
 test "glm stats lines: a prompt pass with read-ahead and a decode with the lookahead on the synthetic bank read back exactly" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var sb = try bank_mod.SynthBank.open();
     defer sb.close();
     const b = &sb.bank;
@@ -1462,6 +1466,7 @@ test "glm stats lines: a prompt pass with read-ahead and a decode with the looka
 }
 
 test "glm handover: the settle reads until the cache is empty and the host side is back at its reading before the frees, at most its wait" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const Fake = phase_mem.FakeReader(Mem);
     var i: usize = 0;
     var slept: u32 = 0;
@@ -1494,6 +1499,7 @@ test "glm handover: the settle reads until the cache is empty and the host side 
 }
 
 test "glm handover: the settle waits past the stack f2be1ba handover reading that the footprint test took 0.226 GB early" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     // Before the frees: the footprint 225.033 GB, MLX active 206.944 GB and cache 17.166 GB (the host side 0.923 GB). The
     // handover freed the 8.004 GB scratch and resized the KV lanes from 1.586 to 1.685 GB.
     const before: Mem = .{ .active = 206_944_070_968, .cache = 17_165_538_394, .footprint = 225_033_000_000 };
@@ -1525,6 +1531,7 @@ test "glm handover: the settle waits past the stack f2be1ba handover reading tha
 }
 
 test "glm handover: the handover line reports the readings, the rows each bound allows and decode's bound" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var l: HandoverLine = .{ .before = .{ .footprint = 225_500_000_000 }, .after = .{ .footprint = 221_000_000_000, .active = 220_400_000_000 }, .settle_ms = 15, .settled = true, .positions = 17_415, .kv_bytes = 1_660_000_000, .prompt_rows = 126, .rows = 136, .grown_bytes = 24_459_264_000, .bill_bytes = 24_500_000_000, .live_bytes = 26_900_000_000, .bound = 255_000_000_000, .mlx_bound = 238_000_000_000, .target = 255_550_554_112, .gpu_target = 255_550_554_112, .baseline = 12_402_409_472, .box = .{ .used = 233_900_000_000, .others = 12_600_000_000 }, .grown = .{ .footprint = 237_100_000_000 } };
     const s = try std.fmt.allocPrint(a, "{f}", .{l});
@@ -1558,6 +1565,7 @@ test "glm handover: the handover line reports the readings, the rows each bound 
 }
 
 test "glm box: the box's used memory holds this process's footprint, and the rest of the box is what is left" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     if (comptime !@import("builtin").os.tag.isDarwin()) return error.SkipZigTest;
     const block = try std.heap.page_allocator.alloc(u8, 64 << 20);
     defer std.heap.page_allocator.free(block);
@@ -1569,6 +1577,7 @@ test "glm box: the box's used memory holds this process's footprint, and the res
 }
 
 test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3 module, each bank layer's rows its share of the units, and a prompt and decode steps run on the GPU" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     var model = try exl3_bank.tinyConfigInter(a, 512);
@@ -1624,6 +1633,7 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
 }
 
 test "glm residents: the constructed module holds every resident in its own MLX buffer, before any forward" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     var model = try exl3_bank.tinyConfigInter(a, 512);

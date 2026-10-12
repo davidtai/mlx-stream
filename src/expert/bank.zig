@@ -5,6 +5,7 @@
 //! first-boot checks (bankv2, exl3_lane) are their oracle.
 
 const std = @import("std");
+const kset = @import("../sdk_ext/kernel_set.zig");
 const io_util = @import("sdk").io_util;
 const expert_io = @import("../sdk_ext.zig").expert.io;
 const bank_file = @import("../sdk_ext.zig").expert.bank_file;
@@ -853,7 +854,6 @@ const max_synth_layers = 8;
 /// returns the experts.bin image (caller frees).
 pub fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u8 {
     const io = std.testing.io;
-    const Sha256 = std.crypto.hash.sha2.Sha256;
     const nl = s.k.len;
     std.debug.assert(nl >= 2 and nl <= max_synth_layers);
     var segs: [max_synth_layers][9]SynthSeg = undefined;
@@ -878,11 +878,8 @@ pub fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u
     for (0..nl) |l| for (0..s.n_experts) |e| {
         const off = base[l] + e * rb[l];
         fillPattern(bin[off .. off + logical[l]], 1 + l * 1000 + e);
-        var d: [32]u8 = undefined;
-        Sha256.hash(bin[off .. off + logical[l]], &d, .{});
-        lsha[l * s.n_experts + e] = std.fmt.bytesToHex(d, .lower);
-        Sha256.hash(bin[off .. off + rb[l]], &d, .{});
-        psha[l * s.n_experts + e] = std.fmt.bytesToHex(d, .lower);
+        lsha[l * s.n_experts + e] = kset.shaHex(bin[off .. off + logical[l]]);
+        psha[l * s.n_experts + e] = kset.shaHex(bin[off .. off + rb[l]]);
     };
 
     var j: std.ArrayList(u8) = .empty;

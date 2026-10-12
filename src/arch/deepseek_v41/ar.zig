@@ -6,6 +6,7 @@
 //! the host dry path is the model test "the AR dry path ...".
 
 const std = @import("std");
+const kset = @import("../../sdk_ext/kernel_set.zig");
 const builtin = @import("builtin");
 const mlx = @import("sdk").mlx;
 const host_bridge = @import("host.zig");
@@ -139,9 +140,7 @@ const StepHashes = struct {
         if (self.n == 0) memProbe("dsv41 ar", "prompt (residents bound on first use, the prompt's forwards)");
         const n = mlx.mlx_array_size(logits);
         const p = mlx.mlx_array_data_float32(logits) orelse return error.MlxNoData;
-        var d: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(p[0..n]), &d, .{});
-        self.out[self.n] = std.fmt.bytesToHex(d, .lower);
+        self.out[self.n] = kset.shaHex(std.mem.sliceAsBytes(p[0..n]));
         self.n += 1;
     }
 };
@@ -558,11 +557,9 @@ test "dsv41 ar: the served schedule through the served module records its greedy
     }
     memProbe("dsv41 ar served", "decode (the generated tokens)");
 
-    var d: [32]u8 = undefined;
     const le = try a.alloc(u8, 4 * out.len);
     for (out, 0..) |v, i| std.mem.writeInt(u32, le[4 * i ..][0..4], v, .little);
-    std.crypto.hash.sha2.Sha256.hash(le, &d, .{});
-    const ids_sha = std.fmt.bytesToHex(d, .lower);
+    const ids_sha = kset.shaHex(le);
     var first: ?usize = null;
     if (override == null) for (out, ref.generated_ids, 0..) |mine, theirs, i| if (mine != theirs) {
         first = i;
@@ -856,10 +853,9 @@ fn stepOf(a: std.mem.Allocator, logits: mlx.mlx_array, s: mlx.mlx_stream) !Step 
     try mlx.check(mlx.mlx_array_eval(f));
     const n = mlx.mlx_array_size(f);
     const row = (mlx.mlx_array_data_float32(f) orelse return error.MlxNoData)[0..n];
-    var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(row), &d, .{});
+    const sha = kset.shaHex(std.mem.sliceAsBytes(row));
     const t = top2Of(row);
-    return .{ .logits_sha256 = try a.dupe(u8, &std.fmt.bytesToHex(d, .lower)), .top2 = t, .margin = @floatCast(row[t[0]] - row[t[1]]) };
+    return .{ .logits_sha256 = try a.dupe(u8, &sha), .top2 = t, .margin = @floatCast(row[t[0]] - row[t[1]]) };
 }
 
 /// The two highest entries, ties to the lower id (MLX argmax's pick for the first).

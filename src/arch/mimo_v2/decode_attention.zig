@@ -24,7 +24,7 @@ const mimo = @import("config.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
 const Kernel = mlx.mlx_fast_metal_kernel;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const kset = @import("../../sdk_ext/kernel_set.zig");
 
 pub const Tier = enum { kernels, stock, invalid };
 
@@ -63,22 +63,15 @@ pub const texts = struct {
 };
 /// sha256 of kernels/manifest-dec-attn.json, which records every text's sha256 (checked against `text_pins` by a CPU test).
 pub const manifest_sha256 = "6d15c8c43eed1ec6765445eb9fbb7b7bc4f3c2e0e50979aaeef58cb46f57e001";
-pub const text_pins = [_]struct { file: []const u8, text: []const u8, sha256: []const u8 }{
+pub const text_pins = [_]kset.TextPin{
     .{ .file = "dec_attn_header_mma.metal", .text = texts.header, .sha256 = "5d70530f61a08aead840a7ac7a03ef087b40a16d23b7de5371b0be42426cb821" },
     .{ .file = "dec_attn_split.metal", .text = texts.split, .sha256 = "e8d8eaaa5eff9cf105752e3c894103691c23c17befaf24eceb99c24eb5d025d4" },
     .{ .file = "dec_attn_merge.metal", .text = texts.merge, .sha256 = "1c43462d81fe43b9eb6988346685518d8f812880bcba61ee7f4b42be57aa8a2a" },
     .{ .file = "dec_attn_window.metal", .text = texts.window, .sha256 = "8b83077c17db8a2f0ead905fb547625538d83972e806ee88c570c0d762aa54ba" },
 };
 
-fn hexOf(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
-
 pub fn checkPins() !void {
-    if (!std.mem.eql(u8, &hexOf(texts.manifest), manifest_sha256)) return error.MimoDecodeAttentionManifestNotPinned;
-    for (text_pins) |p| if (!std.mem.eql(u8, &hexOf(p.text), p.sha256)) return error.MimoDecodeAttentionTextNotPinned;
+    return kset.checkTextPins(texts.manifest, manifest_sha256, &text_pins, error.MimoDecodeAttentionManifestNotPinned, error.MimoDecodeAttentionTextNotPinned);
 }
 
 /// The geometry the texts are written for; anything else is refused at construction.
@@ -314,27 +307,7 @@ const settings_mod = @import("settings.zig");
 
 test "mimo decode attention CPU: the manifest and every text match their pins" {
     try checkPins();
-    const J = struct {
-        headers: []const struct { file: []const u8, sha256: []const u8, bytes: usize },
-        kernels: []const struct { name: []const u8, source: struct { file: []const u8, sha256: []const u8, bytes: usize } },
-    };
-    const m = try std.json.parseFromSlice(J, testing.allocator, texts.manifest, .{ .ignore_unknown_fields = true });
-    defer m.deinit();
-    var seen: usize = 0;
-    for (text_pins) |p| {
-        for (m.value.headers) |h| if (std.mem.eql(u8, h.file, p.file)) {
-            try testing.expectEqualStrings(p.sha256, h.sha256);
-            try testing.expectEqual(p.text.len, h.bytes);
-            seen += 1;
-        };
-        for (m.value.kernels) |k| if (std.mem.eql(u8, k.source.file, p.file)) {
-            try testing.expectEqualStrings(p.sha256, k.source.sha256);
-            try testing.expectEqual(p.text.len, k.source.bytes);
-            seen += 1;
-        };
-    }
-    try testing.expectEqual(text_pins.len, seen);
-    try testing.expectEqual(@as(usize, 3), m.value.kernels.len);
+    try kset.expectManifestPins(texts.manifest, &text_pins, 3);
 }
 
 test "mimo decode attention CPU: launch geometry equals the manifest's launch samples and the donor's" {

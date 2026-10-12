@@ -299,11 +299,8 @@ fn drop(x: Array) void {
 // ---- CPU tests (no device) ----
 
 test "mimo +attn pins: the embedded kernel texts and manifest are the donor's bytes" {
-    const hex = std.fmt.bytesToHex;
-    var d: [32]u8 = undefined;
     inline for (.{ .{ tiles_text, pins.tiles }, .{ core_text, pins.core }, .{ source_text, pins.source }, .{ manifest_text, pins.manifest } }) |p| {
-        std.crypto.hash.sha2.Sha256.hash(p[0], &d, .{});
-        try std.testing.expectEqualStrings(p[1], &hex(d, .lower));
+        try std.testing.expectEqualStrings(p[1], &@import("../../sdk_ext/kernel_set.zig").shaHex(p[0]));
     }
     // The manifest pins each text by the same digest.
     for ([_][]const u8{ pins.tiles, pins.core, pins.source }) |pin| try std.testing.expect(std.mem.indexOf(u8, manifest_text, pin) != null);

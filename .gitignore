@@ -6,3 +6,4 @@ zig-out-*/
 .claude/
 .vscode/
 *.log
+__pycache__/

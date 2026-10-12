@@ -8,6 +8,7 @@
 //! block and scores each draft (`confidence_head`).
 
 const std = @import("std");
+const kset = @import("../../sdk_ext/kernel_set.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("ops.zig");
 const graph = @import("graph.zig");
@@ -915,11 +916,6 @@ fn writeSubsetFile(tmp: *std.testing.TmpDir, name: []const u8, text: []const u8,
     return std.fmt.bufPrint(path_buf, "{s}/{s}", .{ root[0..try tmp.dir.realPath(testing.io, &root)], name });
 }
 
-fn subsetSha(text: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(text, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
 
 test "dsv41 dspark head: a pinned subset file loads; every routed id maps to its compact slot, the rest to slot 0" {
     var tmp = std.testing.tmpDir(.{});
@@ -930,7 +926,7 @@ test "dsv41 dspark head: a pinned subset file loads; every routed id maps to its
     ;
     var pb: [700]u8 = undefined;
     const path = try writeSubsetFile(&tmp, "s.json", text, &pb);
-    const sha = subsetSha(text);
+    const sha = kset.shaHex(text);
     var s = try Subset.load(testing.allocator, testing.io, .{ .path = path, .sha256 = &sha }, null);
     defer s.deinit();
     try testing.expectEqualStrings("test", s.kind);
@@ -965,7 +961,7 @@ test "dsv41 dspark head: an unpinned, malformed or unordered subset file is refu
         var nb: [16]u8 = undefined;
         var pb2: [700]u8 = undefined;
         const p = try writeSubsetFile(&tmp, try std.fmt.bufPrint(&nb, "c{d}.json", .{i}), cs.text, &pb2);
-        const sha = subsetSha(cs.text);
+        const sha = kset.shaHex(cs.text);
         try testing.expectError(cs.err, Subset.load(testing.allocator, testing.io, .{ .path = p, .sha256 = &sha }, null));
     }
     try testing.expectError(error.SubsetFile, Subset.load(testing.allocator, testing.io, .{ .path = "/nonexistent/s.json", .sha256 = &zero }, null));

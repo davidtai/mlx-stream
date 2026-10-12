@@ -11,7 +11,8 @@ const log = @import("sdk").log;
 const xk = @import("kernels.zig");
 const kset = @import("../../../sdk_ext/kernel_set.zig");
 const routes = @import("routes.zig");
-const sushi = @import("mlx_host").sushi_exl3;
+const host_caps = @import("../../../host_caps.zig");
+const sushi = if (host_caps.sushi_exl3) @import("mlx_host").sushi_exl3 else @compileError("glm_moe_dsa: this host exports no sushi_exl3 (host_caps): the reference must sit behind host_caps.glm");
 
 const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;
@@ -482,6 +483,7 @@ fn gpuSet(a: Allocator, s: mlx.mlx_stream) !*ks.Set {
 }
 
 test "glm53 selfcheck: the full plan on the device, every kernel at every registered dims and K: each chain within one bf16 ulp of sushi's host decode" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
@@ -528,6 +530,7 @@ fn mutatedText(a: Allocator, s: mlx.mlx_stream, which: xk.TextRef, needle: []con
 }
 
 test "glm53 selfcheck: each chain check fails on a wrong codebook, a wrong K, a missing rank, swapped rin and rout, a wrong row order, and a device pair of score 0 computed" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();

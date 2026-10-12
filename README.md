@@ -281,8 +281,9 @@ bf16res tier has not been measured on these builds.
 
 [![1K–1M sweep summary on 746e7da9: decode, prefill, TTFT, memory peaks and completion tokens](docs/benchmarks/mimo-v26-flash/summary.png)](docs/benchmarks/mimo-v26-flash/README.md)
 
-HumanEval (164 problems, one sample each, pass@1, cap 16,384 tokens, thinking on, rows 127 / 145): greedy 155 / 164
-= 0.9451, card 157 / 164 = 0.9573; every failure is a wrong answer (none truncated, looped, without code or errored).
+HumanEval (164 problems, one sample each, pass@1, rows 127 / 145), two arms with their own settings: greedy (temperature 0,
+seed 0, thinking off, cap 8,192 tokens) 155 / 164 = 0.9451; card (temperature 1.0, top_p 0.95, seed 1, thinking on, cap
+16,384 tokens) 157 / 164 = 0.9573. Every failure is a wrong answer (none truncated, looped, without code or errored).
 Scored on `746e7da9` (host `2c041af6` + this branch at `8e7d186`); the earlier run on
 `bb3c7245` (host `2c041af6` + plugin `d67567e`, this branch before its layout move) gave the same counts and the same
 failing problems.
@@ -308,7 +309,7 @@ failing problems.
 
 The `glm_moe_dsa` arch serves GLM-5.3 (744B, 78 layers: 3 dense, 75 MoE with 256 experts, top-8 and one shared expert;
 MLA; the lightning indexer on 21 layers) from a pack of resident shards and an expert bank (the pack converters,
-`scripts/convert_glm_bank.py` and `scripts/convert_glm_exl3_bank.py`, and the pack formats come with PR #5). The
+`scripts/convert_glm_bank.py` and `scripts/convert_glm_exl3_bank.py`, and the pack formats are in this repository). The
 experts stream from the pack's bank through the same stream, read pool, residency policy, lookahead and event gates as
 DeepSeek-V4.1; on the affine bank the expert math is MLX's own `gather_qmm`, on the EXL3 bank see below.
 
@@ -444,7 +445,7 @@ At each prompt the residency policy keeps the residents of the prompt rows and f
 The decode policy's transition counts and its window carry over from one request to the next.
 
 The MTP draft lane (`mtp_depth` > 0) runs the release's MTP layer (layer 78), which the MLX builds drop. The pack
-must have `mtp/` beside its shards, as PR #5's `scripts/convert_glm_exl3_bank.py --mtp-only --from-pack <EXL3 pack>
+must have `mtp/` beside its shards, as `scripts/convert_glm_exl3_bank.py --mtp-only --from-pack <EXL3 pack>
 --dst <pack>/mtp` writes it: `mtp-residents.safetensors` (the layer's BF16 tensors as published),
 `mtp-experts.bin` and `mtp-manifest-exl3-v1.json` (its 256 experts as the EXL3 build's mini-expert records). Without
 `mtp/`, the load is refused by name. The experts stay resident (4.17 GB) and run through sushi's EXL3 MoE on the
@@ -515,6 +516,35 @@ Hadamard with suh / svh). They are independent implementations with disjoint cla
 `src/exl3/sushi_parity.zig` decodes sushi's own K3 mul1 fixture (`lib/sushi/src/exl3/fixtures/exl3_k3_linear.safetensors`
 in the host checkout) through this plugin's decoder and checks the result against sushi's reference bit for bit.
 
+## GLM-5.3 pack
+
+`scripts/convert_glm_bank.py` converts a Hugging Face MLX snapshot of GLM-5.3 (`model_type` `glm_moe_dsa`, affine
+3- or 4-bit experts, group 64) into a pack: the routed experts in `experts.bin` with the manifest
+`expert-manifest-affine-v1.json`, and the other tensors in safetensors shards. It needs Python 3 and numpy.
+
+```sh
+scripts/convert_glm_bank.py --src <snapshot> --dst <pack> --verify all \
+    --source-repo pipenetwork/GLM-5.3-MLX-mixed-4_8bit --source-revision <sha>
+```
+
+`--resume` continues a stopped run. `docs/glm53-pack-format.md` gives the format. The converter's tests:
+`python -I -m pytest scripts/test_convert_glm_bank.py` (needs mlx, numpy, pytest).
+
+`scripts/convert_glm_exl3_bank.py --src <EXL3 snapshot> --dst <pack> --residents-from <affine pack>` converts the
+EXL3 snapshot (mcg trellis experts at K3 or K4, 4 ranks) into an EXL3 pack: one record per mini-expert in
+`experts.bin`, hard links to the residents of an affine pack on the same filesystem and `mtp-residents.safetensors`.
+`docs/glm53-exl3-pack-format.md` gives the format. Its tests: `scripts/test_convert_glm_exl3_bank.py`.
+`--mtp-only --from-pack <EXL3 pack> --dst <affine pack>/mtp` writes the MTP layer alone (its residents, its experts
+in `mtp-experts.bin`, `mtp-manifest-exl3-v1.json`) for the MTP draft lane of an affine pack.
+
+`scripts/convert_glm_mxfp4_bank.py --src <MXFP4 snapshot> --dst <pack> --verify all` converts the compressed-tensors
+MXFP4 snapshot (`RedHatAI/GLM-5.3-MXFP4`: FP4 E2M1 codes, an E8M0 scale per 32 inputs) into an MXFP4 pack: one
+six-segment record per routed expert in `experts.bin` with `expert-manifest-mxfp4-v1.json`, the residents under MLX's
+mxfp4 labels (`.weight` U32, `.scales` U8, the bytes unchanged) and the MTP layer in `mtp/`. It needs Python 3 only.
+`docs/glm53-mxfp4-pack-format.md` gives the format. Its tests: `scripts/test_convert_glm_mxfp4_bank.py`.
+`scripts/test_glm_mxfp4_packing.py` checks on the release's own bytes that MLX's mxfp4 reads them as
+compressed-tensors does (needs the network, torch and compressed-tensors).
+
 ## Layout
 
 ```
@@ -546,6 +576,8 @@ scripts/                   test_dsv41.sh, compile_kernels_offline.py, compile_mi
                            prepare_mimo_pack.py   the pack builder (docs/mimo-pack.md)
                            glm_moe_dsa_goldens.py, glm_moe_dsa_mtp_goldens.py, glm_split_k3_table.py,
                            glm53_exl3_manifest.py, glm_trunk_manifest.py
+                           convert_glm_bank.py, convert_glm_exl3_bank.py, convert_glm_mxfp4_bank.py   the GLM-5.3
+                           pack converters (docs/glm53-*pack-format.md), with their tests
 ```
 
 This repository was imported from the mlx-serve fork at commit d38ef038, without its history. `docs/PATH_MAP.md`

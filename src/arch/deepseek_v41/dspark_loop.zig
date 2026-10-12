@@ -7,6 +7,7 @@
 //! commits by trimming the target and seeding the draft windows.
 
 const std = @import("std");
+const kset = @import("../../sdk_ext/kernel_set.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("ops.zig");
 const graph = @import("graph.zig");
@@ -2137,9 +2138,7 @@ test "dsv41 dspark loop: a pinned subset head keeps only its experts, maps every
     var root: [512]u8 = undefined;
     var pbuf: [700]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/subset.json", .{root[0..try rig.m.tmp.dir.realPath(testing.io, &root)]});
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
+    const hex = kset.shaHex(text);
     var sub = try dh.Subset.load(a, testing.io, .{ .path = path, .sha256 = &hex }, null);
     defer sub.deinit();
     var dl: DropLookup = .{ .inner = &lookup4 };

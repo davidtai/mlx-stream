@@ -12,7 +12,8 @@ const mlx = @import("sdk").mlx;
 const sdk_ext = @import("../../sdk_ext.zig");
 const quant = sdk_ext.quant;
 const bank_mod = @import("exl3_bank.zig");
-const sushi = @import("mlx_host").sushi_exl3;
+const host_caps = @import("../../host_caps.zig");
+const sushi = if (host_caps.sushi_exl3) @import("mlx_host").sushi_exl3 else @compileError("glm_moe_dsa: this host exports no sushi_exl3 (host_caps): the reference must sit behind host_caps.glm");
 
 const Allocator = std.mem.Allocator;
 const Diag = quant.Diag;
@@ -159,6 +160,7 @@ comptime {
 const testing = std.testing;
 
 test "glm exl3 quant: claims the EXL3 bank's description and declines the affine one; accept refuses what sushi's chain does not run" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -187,6 +189,7 @@ test "glm exl3 quant: claims the EXL3 bank's description and declines the affine
 }
 
 test "glm exl3 quant: a wide prompt call with its misses staged at the layer's start (both bank layers) equals sushi's host decode, reads what the unstaged call reads and leaves its residents" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const graph = @import("graph.zig");
@@ -445,6 +448,7 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
 }
 
 test "glm exl3 quant: the streamed EXL3 bank's MoE on the GPU equals sushi's host decode of the records: both bank layers, every lane, host waits and event gates" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);

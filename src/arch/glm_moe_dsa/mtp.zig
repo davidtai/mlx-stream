@@ -178,7 +178,8 @@ pub fn facts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.
     return .{ .resident_bytes = resident_bytes, .expert_bytes = expert_bytes };
 }
 
-const sushi = @import("mlx_host").sushi_exl3;
+const host_caps = @import("../../host_caps.zig");
+const sushi = if (host_caps.sushi_exl3) @import("mlx_host").sushi_exl3 else @compileError("glm_moe_dsa: this host exports no sushi_exl3 (host_caps): the reference must sit behind host_caps.glm");
 
 // ── the routed experts ──
 
@@ -797,6 +798,7 @@ fn rowCopy(g: *G, x: T, lo: u32, hi: u32) !T {
 const testing = std.testing;
 
 test "glm mtp: the lane's kept pending rows are a copy: the rows' values, and the source's buffer leaves MLX's active memory at its release" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -826,6 +828,7 @@ test "glm mtp: the lane's kept pending rows are a copy: the rows' values, and th
 }
 
 test "glm mtp: the route limit gives depth 5; the MTP layer config is one full, routed layer" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try testing.expectEqual(@as(u32, 5), max_depth);
     var c = try glm.Config.parse(testing.allocator, try tinyText(), null, null);
     defer c.deinit(testing.allocator);
@@ -836,6 +839,7 @@ test "glm mtp: the route limit gives depth 5; the MTP layer config is one full, 
 }
 
 test "glm mtp: the release's MTP residents (23 BF16 tensors, the box's file) pass the spec; the config's flags gate the lane" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const text = try glm.testConfigJson(testing.allocator, "");
     defer testing.allocator.free(text);
     var c = try glm.Config.parse(testing.allocator, text, &glm.glm53, null);
@@ -873,6 +877,7 @@ fn tinyText() ![]const u8 {
 }
 
 test "glm mtp: the request's line (the ABBA harness reads it): depth, acceptance, rounds, drafted, accepted, rate, per round, tok/s" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const l: Line = .{ .depth = 3, .mode = "exact", .delta = 0, .c = .{ .rounds = 348, .drafted = 1042, .accepted = 676, .generated = 1024, .wall_ns = 207_560_000_000, .draft_ns = 9_000_000_000, .verify_ns = 190_000_000_000, .peak_rise = 312_400_000, .verify_bytes = 2_100_000_000_000, .rejected_bytes = 230_000_000_000, .decided = .{ 9, 0, 0, 0, 0, 0, 0, 0, 30, 990 }, .accepted_by_p = .{ 1, 0, 0, 0, 0, 0, 0, 0, 20, 655 } } };
     const s = try std.fmt.allocPrint(testing.allocator, "{f}", .{l});
     defer testing.allocator.free(s);
@@ -890,6 +895,7 @@ test "glm mtp: the request's line (the ABBA harness reads it): depth, acceptance
 }
 
 test "glm mtp: the pack's mtp/ opens under the trunk bank's rules: the MTP layer's two bank layers, its experts map, the refusals by name" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var c = try glm.Config.parse(a, try tinyText(), null, null);
     defer c.deinit(a);
@@ -954,6 +960,7 @@ test "glm mtp: the pack's mtp/ opens under the trunk bank's rules: the MTP layer
 }
 
 test "glm mtp: the EXL3 bank's arrays are the records' segments byte for byte, [minis, ...], and each expert's first slot is its bank offset + local x tp" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     var c = try glm.Config.parse(a, try tinyText(), null, null);
@@ -994,6 +1001,7 @@ test "glm mtp: the EXL3 bank's arrays are the records' segments byte for byte, [
 }
 
 test "glm mtp: the EXL3 bank's MoE on the GPU equals sushi's host decode of the same records (each routed expert = its 4 minis at its score)" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     // hidden 128 and minis of 128 (inter 512 over 4 ranks): the kernels' Hadamard blocks.

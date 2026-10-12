@@ -8,6 +8,7 @@
 //! MLX device allowed (DSV41_PHASE0B_MLX=1); skipped otherwise.
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const glm = @import("glm_moe_dsa.zig");
@@ -83,6 +84,7 @@ fn runCases(a: std.mem.Allocator, dir: []const u8, gold: *const Goldens, gpu: bo
 }
 
 test "glm parity 0b: the tiny model's logits through the streamed module equal the reference's, every case, both expert-read routes" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("GLM53_PARITY") orelse return error.SkipZigTest);
     const a = testing.allocator;

@@ -280,53 +280,7 @@ pub const RcSite = enum { wq_a, wkv, wq_b, wo_b, woa, head };
 
 /// One site on q3rc_mxfp8_fma at its pinned geometry, a launch plan per M = 1..8: `Kernels.run`.
 pub fn RcProj(comptime G: type) type {
-    return struct {
-        const Self = @This();
-        pub const max_rows = 8;
-        e: *const Entry,
-        site: RcSite,
-        plans: RowPlans(G, max_rows),
-        w: G.T,
-        scales: G.T,
-
-        /// `w` the packed mxfp8 weight (u32 [G N, K / 4]), `scales` its e8m0 scales (u8 [G N, K / 32]).
-        pub fn init(g: *G, reg: *const xk.Registry, site: RcSite, w: G.T, scales: G.T, diag: ?*xk.Diag) !Self {
-            const e = reg.get(.q3rc_mxfp8_fma);
-            const s = e.site(@tagName(site)) orelse unreachable;
-            var vars: Vars = .initFill(0);
-            xk.siteVars(s, &vars);
-            try expectInput(G, g, e, "w", w, &vars, diag);
-            try expectInput(G, g, e, "scales", scales, &vars, diag);
-            return .{ .e = e, .site = site, .plans = try .init(g, e, @tagName(site), diag), .w = g.keep(w), .scales = g.keep(scales) };
-        }
-
-        pub fn deinit(self: *Self, g: *G) void {
-            self.plans.deinit(g);
-            g.release(self.w);
-            g.release(self.scales);
-        }
-
-        /// The `QuantizedLinear.__call__` seam (these linears carry no bias): x [..., K] with
-        /// 1..8 rows -> y [..., N].
-        pub fn linear(self: *const Self, g: *G, x: G.T) !G.T {
-            const sh = dims(G, g, x);
-            const lead = sh.slice()[0 .. sh.n - 1];
-            var m: c_int = 1;
-            for (lead) |d| m *= d;
-            const y = try self.call(g, try g.reshape(x, &.{ m, sh.slice()[sh.n - 1] }));
-            var shape: Shape = .of(lead);
-            shape.d[shape.n] = @intCast(self.plans.cfg[0].out_shapes[0][1]);
-            shape.n += 1;
-            return g.reshape(y, shape.slice());
-        }
-
-        /// x [M, G K] bf16 (row-contiguous), M = 1..8 -> y [M, G N] bf16.
-        pub fn call(self: *const Self, g: *G, x: G.T) !G.T {
-            var out: [1]G.T = undefined;
-            try self.plans.launch(g, rowsOf(G, g, x, 0), &.{ self.w, self.scales, x }, &out);
-            return out[0];
-        }
-    };
+    return FmaSiteProj(G, RcSite);
 }
 
 // ── DRAFTRC proj (DSV41_DECODE_DRAFTRC member proj): the DSpark draft block's rcproj sites ──
@@ -340,18 +294,31 @@ pub const DraftSite = enum { wq_a, wkv, wq_b, wo_b, woa, main_proj, shared_w13, 
 /// draft-only sites), f32 x -> q3drc_mxfp8_fma_f32x; the output has x's dtype; a plan per M =
 /// 1..8 at the site's pinned geometry. The dtype is the call site's (fixed at construction).
 pub fn DraftProj(comptime G: type) type {
+    return FmaSiteProj(G, DraftSite);
+}
+
+/// `RcProj` and `DraftProj`: one mxfp8 FMA site (`Site`: `RcSite` or `DraftSite`) bound to its text at construction
+/// (`init`: the verify sites' text, or the draft's by site and x dtype); the same plans, weights and calls.
+fn FmaSiteProj(comptime G: type, comptime Site: type) type {
     return struct {
         const Self = @This();
         pub const max_rows = 8;
         e: *const Entry,
-        site: DraftSite,
+        site: Site,
         plans: RowPlans(G, max_rows),
         w: G.T,
         scales: G.T,
 
+        pub const init = if (Site == RcSite) initRc else initDraft;
+
+        /// `w` the packed mxfp8 weight (u32 [G N, K / 4]), `scales` its e8m0 scales (u8 [G N, K / 32]).
+        fn initRc(g: *G, reg: *const xk.Registry, site: RcSite, w: G.T, scales: G.T, diag: ?*xk.Diag) !Self {
+            return bind(g, reg.get(.q3rc_mxfp8_fma), site, w, scales, diag);
+        }
+
         /// `x_dtype` bf16 or f32 (the call site's activations), `w` the packed mxfp8 weight (u32
         /// [G N, K / 4]), `scales` its e8m0 scales (u8 [G N, K / 32]).
-        pub fn init(g: *G, reg: *const xk.Registry, site: DraftSite, x_dtype: Dtype, w: G.T, scales: G.T, diag: ?*xk.Diag) !Self {
+        fn initDraft(g: *G, reg: *const xk.Registry, site: DraftSite, x_dtype: Dtype, w: G.T, scales: G.T, diag: ?*xk.Diag) !Self {
             const draft_only = switch (site) {
                 .main_proj, .shared_w13, .shared_w2 => true,
                 else => false,
@@ -361,6 +328,10 @@ pub fn DraftProj(comptime G: type) type {
                 .float32 => reg.get(.q3drc_mxfp8_fma_f32x),
                 else => return refuse(diag, error.TemplateNotRegistered, "exl3 kernel ops: draft {t} at x {t}: the registry carries bf16 and f32 x", .{ site, x_dtype }),
             };
+            return bind(g, e, site, w, scales, diag);
+        }
+
+        fn bind(g: *G, e: *const Entry, site: Site, w: G.T, scales: G.T, diag: ?*xk.Diag) !Self {
             const s = e.site(@tagName(site)) orelse unreachable;
             var vars: Vars = .initFill(0);
             xk.siteVars(s, &vars);
@@ -375,8 +346,8 @@ pub fn DraftProj(comptime G: type) type {
             g.release(self.scales);
         }
 
-        /// The draft's `QuantizedLinear.__call__` seam (`Tr.qlinear`): x [..., G K] with 1..8 rows ->
-        /// y [..., G N] at x's dtype.
+        /// The `QuantizedLinear.__call__` seam (these linears carry no bias; the draft's `Tr.qlinear`): x [..., G K]
+        /// with 1..8 rows -> y [..., G N] at x's dtype.
         pub fn linear(self: *const Self, g: *G, x: G.T) !G.T {
             const sh = dims(G, g, x);
             const lead = sh.slice()[0 .. sh.n - 1];
@@ -389,7 +360,8 @@ pub fn DraftProj(comptime G: type) type {
             return g.reshape(y, shape.slice());
         }
 
-        /// x [M, G K] (row-contiguous, the construction dtype), M = 1..8 -> y [M, G N].
+        /// x [M, G K] (row-contiguous: bf16 at the verify sites, the construction dtype at the draft's), M = 1..8 ->
+        /// y [M, G N].
         pub fn call(self: *const Self, g: *G, x: G.T) !G.T {
             var out: [1]G.T = undefined;
             try self.plans.launch(g, rowsOf(G, g, x, 0), &.{ self.w, self.scales, x }, &out);

@@ -3,6 +3,7 @@
 //! `mtp_depth` sets it; its acceptance is exact unless `mtp_acceptance` names typical.
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const sdk = @import("sdk");
 const log = @import("sdk").log;
 const glm = @import("glm_moe_dsa.zig");
@@ -263,6 +264,7 @@ fn settingsOf(json: []const u8) !Config {
 }
 
 test "glm settings: numeric_tier names stock only; the gates and the prompt order are bools; anything else is unset" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try testing.expectEqual(@as(?NumericTier, .stock), (try settingsOf("{\"numeric_tier\": \"stock\"}")).numeric_tier);
     try testing.expectEqual(@as(?NumericTier, null), (try settingsOf("{\"numeric_tier\": \"served\"}")).numeric_tier);
     try testing.expectEqual(@as(?bool, false), (try settingsOf("{\"expert_event_gates\": false}")).expert_event_gates);
@@ -274,6 +276,7 @@ test "glm settings: numeric_tier names stock only; the gates and the prompt orde
 }
 
 test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up to it, over the limit it is kept for the refusal" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try testing.expectEqual(@as(?u8, 5), (try settingsOf("{\"expert_wide_depth\": 5}")).expert_wide_depth);
     try testing.expectEqual(@as(?u8, null), (try settingsOf("{\"expert_wide_depth\": 6}")).expert_wide_depth);
     try testing.expectEqual(@as(?u8, null), (try settingsOf("{\"expert_wide_depth\": 0}")).expert_wide_depth);
@@ -303,6 +306,7 @@ test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up 
 }
 
 test "glm settings: max_output defaults to 128K, takes 1 to 1,048,576, and over the limit is kept for the refusal" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try testing.expectEqual(@as(u32, 131072), (Config{}).maxOutput());
     try testing.expectEqual(@as(u32, 4096), (try settingsOf("{\"max_output\": 4096}")).maxOutput());
     try testing.expectEqual(@as(u32, 131072), (try settingsOf("{\"max_output\": 0}")).maxOutput());
@@ -314,6 +318,7 @@ test "glm settings: max_output defaults to 128K, takes 1 to 1,048,576, and over 
 }
 
 test "glm settings: mtp_depth is 0 to the route limit's 5 (past it kept for the refusal); acceptance is exact unless typical is named" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try testing.expectEqual(@as(u32, 5), Config.max_mtp_depth);
     try testing.expectEqual(@as(u32, 0), (Config{}).mtpDepth());
     try testing.expectEqual(@as(u32, 3), (try settingsOf("{\"mtp_depth\": 3}")).mtpDepth());
@@ -340,6 +345,7 @@ test "glm settings: mtp_depth is 0 to the route limit's 5 (past it kept for the 
 }
 
 test "glm settings: the load facts replace the fill's inputs, the settings stay" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var s = try settingsOf("{\"expert_wide_depth\": 3}");
     s.expert_rows = 99;
     const c = s.withFacts(&.{ .memory_baseline_bytes = 9_000_000_000, .expert_prefill_rows = 120, .nocache_weights = false, .wired_margin_bytes = 2 << 30 });

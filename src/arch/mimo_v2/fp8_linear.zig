@@ -36,7 +36,7 @@ const prefill_attention = @import("prefill_attention.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
 const Kernel = mlx.mlx_fast_metal_kernel;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const kset = @import("../../sdk_ext/kernel_set.zig");
 const log = std.log.scoped(.mimo);
 
 /// The widest call the GEMV takes: decode, the MTP verify window (M = 4), a head's rows; M > 8 is the prompt GEMM.
@@ -55,21 +55,14 @@ pub const texts = struct {
 };
 /// sha256 of kernels/manifest-fp8res.json, which records every text's sha256 (checked against `text_pins` by a CPU test).
 pub const manifest_sha256 = "cca35a908631a91cacc6e34554b5fb3abb36180a35ae005b5f7206aaa6541e30";
-pub const text_pins = [_]struct { file: []const u8, text: []const u8, sha256: []const u8 }{
+pub const text_pins = [_]kset.TextPin{
     .{ .file = "header_fp8res.metal", .text = texts.header, .sha256 = "3a6e4b978ebe35816d9e1474f9da300302a5ac46c1103a144fd91148c87e1d6d" },
     .{ .file = "mimo_fp8_gemv.metal", .text = texts.gemv, .sha256 = "69c5f783f59aa9a347375ecd6ab327420ec7f4665b0ef07db29d7e6583dfa33b" },
     .{ .file = "mimo_fp8_dequant_bf16.metal", .text = texts.dequant, .sha256 = "6530ac20bf944f5c4153e62e467a1c89de104e52855f3dbba3a6d007ac06ffdb" },
 };
 
-fn hexOf(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
-
 pub fn checkPins() !void {
-    if (!std.mem.eql(u8, &hexOf(texts.manifest), manifest_sha256)) return error.MimoFp8ManifestNotPinned;
-    for (text_pins) |p| if (!std.mem.eql(u8, &hexOf(p.text), p.sha256)) return error.MimoFp8TextNotPinned;
+    return kset.checkTextPins(texts.manifest, manifest_sha256, &text_pins, error.MimoFp8ManifestNotPinned, error.MimoFp8TextNotPinned);
 }
 
 // ---- geometry (host arithmetic; CPU-tested at the real shapes) ----
@@ -625,27 +618,7 @@ const testing = std.testing;
 
 test "mimo fp8res CPU: the manifest and every text match their pins" {
     try checkPins();
-    const J = struct {
-        headers: []const struct { file: []const u8, sha256: []const u8, bytes: usize },
-        kernels: []const struct { name: []const u8, source: struct { file: []const u8, sha256: []const u8, bytes: usize } },
-    };
-    const m = try std.json.parseFromSlice(J, testing.allocator, texts.manifest, .{ .ignore_unknown_fields = true });
-    defer m.deinit();
-    var seen: usize = 0;
-    for (text_pins) |p| {
-        for (m.value.headers) |h| if (std.mem.eql(u8, h.file, p.file)) {
-            try testing.expectEqualStrings(p.sha256, h.sha256);
-            try testing.expectEqual(p.text.len, h.bytes);
-            seen += 1;
-        };
-        for (m.value.kernels) |k| if (std.mem.eql(u8, k.source.file, p.file)) {
-            try testing.expectEqualStrings(p.sha256, k.source.sha256);
-            try testing.expectEqual(p.text.len, k.source.bytes);
-            seen += 1;
-        };
-    }
-    try testing.expectEqual(text_pins.len, seen);
-    try testing.expectEqual(@as(usize, 2), m.value.kernels.len);
+    try kset.expectManifestPins(texts.manifest, &text_pins, 2);
 }
 
 test "mimo fp8res CPU: e4m3 decode: the kernels' half trick is the OCP value / 256 for all 254 codes; code x scale == decode x (scale x 256)" {

@@ -239,7 +239,9 @@ The served 16K cells by answer length and rows; the greedy pair's 136-token answ
 
 ![HumanEval pass@1 for greedy and card sampling, and the failed problems by class](img/mimo-humaneval.png)
 
-HumanEval on `746e7da9`, greedy and card: every failed problem is a wrong answer.
+HumanEval on `746e7da9`, two arms with their own settings: greedy (temperature 0, seed 0, thinking off, 8,192-token cap)
+155 / 164 = 0.9451; card (temperature 1.0, top_p 0.95, seed 1, thinking on, 16,384-token cap) 157 / 164 = 0.9573. Every
+failed problem is a wrong answer.
 
 ![Share of routes a layer's busiest half of experts covers within and across contexts, and the decode hit rate of the dynamic policy against a static top-124 set](img/mimo-routing.png)
 

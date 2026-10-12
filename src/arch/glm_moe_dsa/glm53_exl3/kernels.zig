@@ -6,6 +6,7 @@
 //! (the load context owns it; the quant self-checks its kernels at accept).
 
 const std = @import("std");
+const host_caps = @import("../../../host_caps.zig");
 const mlx = @import("sdk").mlx;
 const kset = @import("../../../sdk_ext/kernel_set.zig");
 /// The registry's self-check plan (`sdk_ext.kernels.KernelSet(R)` runs it at the quant's accept).
@@ -390,6 +391,7 @@ fn initOrPrint(texts: *const Texts, pin: []const u8) !Registry {
 }
 
 test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel is registered at GLM-5.3's dims and the fixture's, both Ks" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
     try testing.expectEqual(@as(usize, 7), n_kernels);
@@ -421,6 +423,7 @@ test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel 
 }
 
 test "glm53 exl3 kernels: a tampered text or header, another pin, another bank or an unknown kernel is refused by name" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var diag: Diag = .{};
     {
@@ -466,6 +469,7 @@ test "glm53 exl3 kernels: a tampered text or header, another pin, another bank o
 }
 
 test "glm53 exl3 kernels: a re-pinned mutated text builds a registry (the self-check's mutations)" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     const src = embedded.sources[@backingInt(Kernel.glm53_dec_down)];
     const mutated = try std.mem.replaceOwned(u8, a, src, "for (uint r = 0u; r < 4u; ++r) {\n            const threadgroup float* zr", "for (uint r = 0u; r < 3u; ++r) {\n            const threadgroup float* zr");

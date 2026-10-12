@@ -7,6 +7,7 @@
 //! bank (`expert_bank.zig`), never from these shards.
 
 const std = @import("std");
+const kset = @import("../../sdk_ext/kernel_set.zig");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const sdk_ext = @import("../../sdk_ext.zig");
@@ -2150,9 +2151,7 @@ test "dsv41 weights: the real bank's config, 49 shard headers and Engram sidecar
         try testing.expectEqual(r.begin, t.begin);
         try testing.expectEqual(r.end, t.end);
         const bytes = try readTensor(a, k, r.name);
-        var d: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
-        try testing.expectEqualStrings(r.sha256, &std.fmt.bytesToHex(d, .lower));
+        try testing.expectEqualStrings(r.sha256, &kset.shaHex(bytes));
         // head16 is Python's raw[:16]: shorter for a tensor under 16 bytes (hc_attn_scale, 12).
         var head: [16]u8 = undefined;
         const want = try std.fmt.hexToBytes(&head, r.head16);

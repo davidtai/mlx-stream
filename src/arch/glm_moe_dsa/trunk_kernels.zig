@@ -8,6 +8,7 @@
 //! route's kernels once at the model's instantiation there (`selfcheck`), never inside a request.
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const mlx = @import("sdk").mlx;
 const kset = @import("../../sdk_ext/kernel_set.zig");
 /// The registry's self-check plan (`sdk_ext.kernels.KernelSet(R)` runs it; the module at its construction).
@@ -400,6 +401,7 @@ fn initOrPrint(texts: *const Texts, pin: []const u8) !Registry {
 }
 
 test "glm trunk kernels: the embedded manifest is the pinned one; the top-k and the combine at the instantiations this build serves" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
     for (reg.entries, 0..) |e, i| {
@@ -429,6 +431,7 @@ test "glm trunk kernels: the embedded manifest is the pinned one; the top-k and 
 }
 
 test "glm trunk kernels: a tampered text or header, another pin, an unknown kernel or other instantiations are refused by name" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var diag: Diag = .{};
     {
@@ -472,6 +475,7 @@ test "glm trunk kernels: a tampered text or header, another pin, an unknown kern
 }
 
 test "glm trunk kernels: the launches the routes and the self-check share" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const t = topkLaunch(3, 2048, true);
     try testing.expectEqual([3]u32{ 1024, 3, 1 }, t.grid);
     try testing.expectEqualSlices(c_int, &.{ 3, 2048 }, t.out_shapes[0][0..t.out_ranks[0]]);

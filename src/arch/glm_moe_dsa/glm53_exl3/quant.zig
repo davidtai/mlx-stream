@@ -456,13 +456,15 @@ comptime {
 }
 
 const testing = std.testing;
-const sushi = @import("mlx_host").sushi_exl3;
+const host_caps = @import("../../../host_caps.zig");
+const sushi = if (host_caps.sushi_exl3) @import("mlx_host").sushi_exl3 else @compileError("glm_moe_dsa: this host exports no sushi_exl3 (host_caps): the reference must sit behind host_caps.glm");
 
 fn peekOf(a: Allocator, q: []const u8) !quant.BankPeek {
     return .{ .quantization = try std.json.parseFromSliceLeaky(std.json.Value, a, q, .{}), .hidden = 6144, .inter = 2048, .n_experts = 256, .n_layers = 150, .layers = &.{} };
 }
 
 test "glm53 exl3 quant: claims GLM-5.3's EXL3 bank only; accept refuses what the texts do not implement, by name, before any launch" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -520,6 +522,7 @@ test "glm53 exl3 quant: claims GLM-5.3's EXL3 bank only; accept refuses what the
 const old_quant = sushi_quant;
 
 test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver equals sushi's host decode of the records: both bank layers, every lane, host waits and event gates" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -536,6 +539,7 @@ test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver 
 }
 
 test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's EXL3 chain agree within bf16 rounding, decode widths 1 to 6 and prompt widths" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const G = @import("../graph.zig").G;
@@ -885,6 +889,7 @@ const bench_exps = [_]BenchExp{
 // host tables, and the device slots) against sushi's (its decode chain and the driver's combine; its prefill over host
 // slots), arms interleaved, best of 7 (decode: 16 chained calls, each call's output the next one's input).
 test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (16K tokens) on the real pack's records, these kernels against sushi's" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("GLM53_EXL3_BENCH") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = testing.io;
@@ -1150,6 +1155,7 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
 
 // GLM53_EXL3_TINY_PACK=<dir>: the tiny fixture's EXL3 pack written there (the bench's smoke off the box).
 test "glm53 exl3 bench: the tiny fixture's EXL3 pack (GLM53_EXL3_TINY_PACK)" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const out = std.mem.span(std.c.getenv("GLM53_EXL3_TINY_PACK") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const glm = @import("../glm_moe_dsa.zig");
@@ -1214,10 +1220,12 @@ fn randomResidents(a: Allocator, io: std.Io, dir: std.Io.Dir, model: *const @imp
 }
 
 test "glm53 exl3 quant: on a synthetic EXL3 pack with random residents the GLM-5.3 kernels' module equals sushi's EXL3 module end to end: the prompt's logits and four decode steps'" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try sushiEndToEnd(false);
 }
 
 test "glm53 exl3 quant: on a uniform synthetic EXL3 pack (one K3 bank layer per layer, each routed layer's second stream layer empty) the module equals sushi's end to end" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try sushiEndToEnd(true);
 }
 

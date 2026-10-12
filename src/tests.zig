@@ -112,4 +112,7 @@ comptime {
     _ = @import("arch/glm_moe_dsa/glm53_exl3/selfcheck.zig");
     _ = @import("arch/glm_moe_dsa/glm53_exl3/routes.zig");
     _ = @import("arch/glm_moe_dsa/glm53_exl3/quant.zig");
+    // GLM-5.3's refusal on a host without its surface: its own file, compiled only on such a host (the GLM tests above
+    // skip there).
+    if (!@import("host_caps.zig").glm) _ = @import("arch/glm_moe_dsa/host_surface_test.zig");
 }

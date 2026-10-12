@@ -338,6 +338,43 @@ pub fn checkPin(manifest: []const u8, pin: []const u8, comptime prefix: []const 
     return got;
 }
 
+/// A text pinned in code by its sha256 (hex), under the file name its manifest lists (a family without a registry:
+/// MiMo's decode attention, fp8res and glue texts).
+pub const TextPin = struct { file: []const u8, text: []const u8, sha256: []const u8 };
+
+/// Once, at construction: the manifest is the pinned one (`checkPin`) and every text matches its pin (`checkText`, at
+/// the text's own length), else the family's named refusal (`manifest_err`, `text_err`).
+pub fn checkTextPins(manifest: []const u8, manifest_sha256: []const u8, pins: []const TextPin, comptime manifest_err: anytype, comptime text_err: anytype) (@TypeOf(manifest_err) || @TypeOf(text_err))!void {
+    _ = checkPin(manifest, manifest_sha256, "", null) catch return manifest_err;
+    for (pins) |p| checkText(p.text, p.sha256, p.text.len, "", p.file, null) catch return text_err;
+}
+
+/// The CPU test of a family's manifest (`headers` and `kernels[].source`, each with `file`, `sha256`, `bytes`): every
+/// pinned text matches its pin and is listed once, its record matching the text (`checkText`); the manifest lists
+/// `n_kernels` kernels (test code only).
+pub fn expectManifestPins(manifest: []const u8, pins: []const TextPin, n_kernels: usize) !void {
+    const J = struct {
+        headers: []const struct { file: []const u8, sha256: []const u8, bytes: usize },
+        kernels: []const struct { name: []const u8, source: struct { file: []const u8, sha256: []const u8, bytes: usize } },
+    };
+    const m = try std.json.parseFromSlice(J, testing.allocator, manifest, .{ .ignore_unknown_fields = true });
+    defer m.deinit();
+    var seen: usize = 0;
+    for (pins) |p| {
+        try testing.expectEqualStrings(&shaHex(p.text), p.sha256);
+        for (m.value.headers) |h| if (std.mem.eql(u8, h.file, p.file)) {
+            try checkText(p.text, h.sha256, h.bytes, "manifest pins", h.file, null);
+            seen += 1;
+        };
+        for (m.value.kernels) |k| if (std.mem.eql(u8, k.source.file, p.file)) {
+            try checkText(p.text, k.source.sha256, k.source.bytes, "manifest pins", k.source.file, null);
+            seen += 1;
+        };
+    }
+    try testing.expectEqual(pins.len, seen);
+    try testing.expectEqual(n_kernels, m.value.kernels.len);
+}
+
 /// The manifest's header records (`id`, `sha256`, `bytes`), each once and naming a `Header` this build embeds, each
 /// against its embedded text (`texts`, in `Header` order); every header listed.
 pub fn adoptHeaders(comptime Header: type, texts: []const [:0]const u8, records: anytype, comptime prefix: []const u8, diag: ?*KDiag) (TextError || error{ UnknownHeader, MissingHeader })!void {
