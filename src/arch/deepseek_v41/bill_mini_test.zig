@@ -249,6 +249,27 @@ test "dsv41 memory mini: the plugin's bill hook is the floor bill's term-wise vi
     try testing.expectEqual(nr, arm_mod.NativeRows{ .prefill = rows.prompt, .decode = rows.decode });
 }
 
+test "dsv41 memory mini: uniform stock still admits at its exact pre-compact floor budget" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tm = try miniBank(a);
+    defer tm.destroy();
+    const b = try bill.billAtFloor(a, io, configOf(tm), prompt, max_tokens, null, ceiling, ov);
+    const mb = try bill.memoryBill(testing.allocator, b);
+    defer mb.free(testing.allocator);
+    const rows: sdk.Rows = .{ .prompt = bill.min_fill_rows, .decode = bill.min_fill_rows };
+    // Uniform stock owns no compact source/route tables. Its pre-compact phase
+    // budget must still admit; even a small positive surcharge would refuse it.
+    const target = b.baseline + b.processBound() - b.expert_metadata;
+    try bill.admitMemoryBill(b, mb, rows, target);
+    if (b.prefillTotal() >= b.decodeTotal()) {
+        try testing.expectError(error.PromptOverTarget, bill.admitMemoryBill(b, mb, rows, target - 1));
+    } else {
+        try testing.expectError(error.DecodeOverTarget, bill.admitMemoryBill(b, mb, rows, target - 1));
+    }
+}
+
 test "dsv41 memory mini: the served bill keeps multi-turn's prompt boundary in the retained prompt state; a pinned prompt does not" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

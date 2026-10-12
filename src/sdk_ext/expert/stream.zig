@@ -1087,7 +1087,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                             for (l.segments[0..gu_components]) |sg| gu += sg.length;
                             if (l.segments[0].offset != 0 or l.segments[gu_components].offset != gu) return error.MixedGeometry;
                             if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
-                        };
+                        }
                     }
                 }
                 var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
@@ -2148,12 +2148,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn readAheadSeed(self: *Stream, layer: u32, experts: []const u16) !void {
                 if (self.failed) return error.StreamFailed;
                 if (self.phase != .prefill) return error.NotPrefill;
-                // Uniform banks keep the stock cursor and scheduling contract. Settled live routes no longer own
-                // unread results; mixed banks' seed suffix is independent even while demand reads remain unsettled.
-                if (!self.mixed) for (&self.routes) |*route_| {
-                    if (route_.state == .free) continue;
-                    for (route_.partsOf()) |part| if (part.n_reads != 0 and !part.settled) return error.RoutesLive;
-                };
                 if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
                 const ah = &self.ahead;
                 const mn = minisOf(&self.bank.layers[layer]);

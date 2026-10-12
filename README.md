@@ -69,10 +69,45 @@ accumulation or reduction order or adding kernel launches. Fixed-layout K3 and p
 The six prior microbenchmark wins are kept as revalidation artifacts, not installed engine wins. The repair
 baseline contains their reverted texts. Their previous combined engine gain was 0.16%, below the promotion gate;
 only a rebased candidate passing actual served acceptance may be adopted.
+The final-rebase saved-six candidate was also measured in the actual Jayleaton hybrid engine
+on 2026-10-12, using separate source-attested binaries and served ABBA. Output and complete usage
+matched. Its nominal median decode gain was 5.31%, but baseline drift was 11.13% and one matched
+sample regressed, so the throughput gate rejected it. A clean owned-server attach trace recorded
+6,440 enclosing compact/banked shader samples; those do not prove execution of the conditional or
+ambiguous changed paths. The changed-path dispatch gate also rejected it. No saved delta is promoted.
 The `mul1h_rate` header composes the unchanged stock K3 header with a separately hash-pinned addendum.
+
+#### Stock 3.0 review measurement — acceptance pending
+
+Measured on 2026-10-12 on the same M5 Max 128 GB host (`mlx-serve` `c6165fe`), with independently
+built baseline PR11 `f22ad15` (binary `95ed21f5`) and the repaired candidate (binary `bef0e801`).
+The candidate contains none of the six saved optimization deltas. Both use the stock 3.0 streaming
+pack, context 17,472, no draft lanes or prefix cache, and frozen llmprobe 0.6.16 code/count requests
+targeting its approximately 16K rung. Values average each revision's two ABBA-arm medians.
+
+| Served cell | Baseline tok/s | Repair tok/s | Change |
+|---|---:|---:|---:|
+| Short decode | 14.449 | 14.468 | +0.13% |
+| 16K code prefill | 601.259 | 600.205 | -0.18% |
+| 16K code decode | 11.739 | 11.741 | +0.01% |
+| 16K count prefill | 598.621 | 607.952 | +1.56% |
+| 16K count decode | 14.702 | 15.245 | +3.70% |
+
+All four arms and 24 long requests completed, at 16,201 code / 16,161 count native prompt tokens.
+Delivered reasoning/content, finish reasons, complete usage and frozen request hashes match; token IDs
+are not exposed. This is **not accepted stock neutrality or an optimization win**: the first Instruments
+target PID handshake failed, admission rows were measured under different live memory baselines,
+and count-prefill control drift exceeded the 3% guard. The subsequently identified stock metadata
+surcharge is now compact-only. Independent host-only `servedBill`/`servedFill` reports match the
+merged baseline exactly at all four recorded memory facts, over every uniform row count and legal
+extra-record suffix. The stock budget-boundary regression fails before this correction and passes
+afterward in ReleaseSafe. These later source reports are not associated with the earlier candidate
+binary and do not retroactively accept the table. No thermal/fan equivalence is claimed.
+
 
 | Published source | Expert contract | Status |
 |---|---|---|
+| Stock 3.0 streaming repack | Uniform K3 gate/up/down; native non-expert tensors | Same-host served comparison above; neutrality acceptance pending. |
 | [Pollard 3.5](https://huggingface.co/bot-lab-21/DeepSeek-V4.1-Flash-EXL3-3.5bpw-Pollard/tree/f129e31a81e1337aa33e129e2d847fc7e37c8733) | K3/K4 per projection; native non-expert tensors | Complete-checkpoint serving validated with a checked streaming repack. |
 | [Spark 2.77](https://huggingface.co/0xSero/DeepSeek-V4.1-Flash-Spark/tree/9e3bbeabbb39fa2cf6e37e1cecfbd2fd0290329f) | K2/K3/K5 per expert; native trunk/draft | Complete-checkpoint serving validated with a checked streaming repack selecting `exl3/plan/J268-ho-v31-K5n.json`, not unused alternate tensors. |
 | [Jayleaton 2.8](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw/tree/915e1d0de8ee0a99944c5bc88ab802a639c63380) | K2–K5 per expert/projection | Expert-only hybrid validated with the original K3 pack's native trunk/draft; not a complete-checkpoint port. |

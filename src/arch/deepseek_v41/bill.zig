@@ -501,10 +501,10 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
     errdefer if (compact) |costs| costs.deinit(a);
     const per_row = if (compact) |costs| costs.per_row else geometry.persistent_row_bytes;
     var metadata = p.bank.metadataBytes();
-    const old_parts = std.math.divCeil(u32, p.bank.n_experts, sdk_ext.expert.io.max_items) catch unreachable;
-    metadata += @as(u64, p.bank.n_experts - old_parts) * @sizeOf(expert_stream.Part);
-    metadata += (2 * @as(u64, p.bank.n_experts) + @as(u64, xp.max_route_ids) * opts.wide_depth) * @sizeOf(u32);
     if (compact != null) {
+        const old_parts = std.math.divCeil(u32, p.bank.n_experts, sdk_ext.expert.io.max_items) catch unreachable;
+        metadata += @as(u64, p.bank.n_experts - old_parts) * @sizeOf(expert_stream.Part);
+        metadata += (2 * @as(u64, p.bank.n_experts) + @as(u64, xp.max_route_ids) * opts.wide_depth) * @sizeOf(u32);
         metadata += p.bank.layers.len * @sizeOf(exl3.LayerRates);
         metadata += compact.?.code_prefix.len * @sizeOf([3]u64);
         var selected: [512]bool = undefined;

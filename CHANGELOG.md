@@ -14,6 +14,18 @@
 - Keep six prior compact microbenchmark wins as separate rebased revalidation inputs, not installed
   engine wins: the repair baseline contains reverted texts; the previous combined served comparison
   gained only 0.16% and was rejected.
+- Rebase the isolated review repair onto final merged PR11 `f22ad15`. The same-host stock 3.0
+  served ABBA completed all 24 approximately-16K code/count requests with matching delivered
+  output and usage. README records the measured table; profiler ownership and admission
+  neutrality remain explicit failing/pending gates, not accepted performance wins.
+- Restrict compact source/route metadata surcharges to compact banks; uniform stock still admits
+  at its exact pre-compact floor budget. The admission-boundary regression fails before the fix and
+  passes afterward in ReleaseSafe; independent same-facts served billing matches the merged
+  baseline across the uniform row and extra-record domain.
+- Remeasure all six saved deltas in the final-rebase actual hybrid engine with exact delivered
+  output/usage parity and a clean owned-server attach capture. The nominal 5.31% median gain is
+  rejected: control drift is 11.13%, a matched sample regresses, and changed-path dispatch is
+  unproven despite enclosing compact/banked shader samples. No microbenchmark delta is promoted.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the

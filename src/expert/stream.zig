@@ -1501,7 +1501,7 @@ test "dsv41 stream: uniform speculative reads retain selector priority rather th
     try s.flush();
 }
 
-test "dsv41 stream: settled stock routes survive a layer seed and skipped loads do not advance tickets" {
+test "dsv41 stream: pending stock routes survive empty and populated layer seeds without skipped-load ticket consumption" {
     var sb = try SynthBank.open(32);
     defer sb.close();
     const s = try Stream.init(testing.allocator, &sb.bank, .{
@@ -1511,8 +1511,13 @@ test "dsv41 stream: settled stock routes survive a layer seed and skipped loads 
         .pool = la_pool,
     });
     defer s.deinit();
-    const first = try serve(s, 0, &.{ 4, 2 });
+    const first = try s.route(0, &.{ 4, 2 }, &.{});
+    try s.readAheadSeed(1, &.{});
     try s.readAheadSeed(1, &.{ 9, 7 });
+    for (0..first.n_parts) |part| {
+        try s.waitGu(first, @intCast(part));
+        try s.waitDown(first, @intCast(part));
+    }
     try testing.expect(first.state == .live);
     try expectServed(s, &sb, first, &.{ 4, 2 });
     s.release(first);
@@ -3127,7 +3132,9 @@ test "dsv41 compact stream: construction bounds admit six heterogeneous gated ro
     const stream = try Stream.init(testing.allocator, &fixture.bank, options);
     defer stream.deinit();
     var ids: [route_capacity][48]u16 = undefined;
-    for (&ids, 0..) |*group, g| for (group, 0..) |*expert, i| expert.* = @intCast(g * 48 + i);
+    for (&ids, 0..) |*group, g| {
+        for (group, 0..) |*expert, i| expert.* = @intCast(g * 48 + i);
+    }
     var owned: [route_capacity]*Route = undefined;
     var final_value: u64 = 0;
     for (&owned, ids, 0..) |*route, selected, i| {
