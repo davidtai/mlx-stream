@@ -45,7 +45,7 @@ KERNELS = [
      "inputs": [arg("ug", "float16"), arg("uu", "float16"), arg("gt", "uint32"), arg("pt", "uint32"), arg("sc", "float32")]
      + banks("cg", "uint16") + banks("cu", "uint16"),
      "outputs": [arg("zg", "float32"), arg("zu", "float32")]},
-    {"name": "glm53_dec_down", "family": "decode", "headers": ["dig2"] + DEC, "threadgroup": [1024, 1, 1],
+    {"name": "glm53_dec_down", "family": "decode", "headers": ["dig2"] + DEC, "threadgroup": [512, 1, 1],
      "template": ["K", "HID", "MINI", "MAXM", "DEV", "T"], "k": True,
      "inputs": [arg("zg", "float32"), arg("zu", "float32"), arg("gt", "uint32"), arg("pt", "uint32"), arg("sc", "float32")]
      + banks("og", "float16") + banks("ou", "float16") + banks("di", "float16") + banks("cd", "uint16") + banks("do", "float16"),

@@ -44,6 +44,10 @@ pub fn tilesDown(hidden: u32) u32 {
     return hidden / 128;
 }
 pub const bm_gate_up = 128;
+/// Output tiles a decode gu threadgroup takes: at K3 four (a k-row's 4 x 96 B are whole 128-byte lines), else two.
+pub fn guTiles(k: u32) u32 {
+    return if (k == 3) 4 else 2;
+}
 pub const bm_down = 64;
 
 fn free(xs: []const mlx.mlx_array) void {
@@ -152,8 +156,7 @@ pub const Decode = struct {
         {
             const e = reg.get(.glm53_dec_gu);
             const sh = [_]c_int{np * 4 * @as(c_int, @intCast(mi))};
-            // two output tiles a threadgroup
-            var cfg = cfgOf(e, self.inst, .{ e.threadgroup[0] * (mi / 32), @intCast(n_slots * 4), 2 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
+            var cfg = cfgOf(e, self.inst, .{ e.threadgroup[0] * (mi / 16 / guTiles(self.inst.k)), @intCast(n_slots * 4), 2 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
             setInt(&cfg, e, "DEV", di);
             setInt(&cfg, e, "MAXM", @intCast(self.maxm));
             const p = if (dev) try self.gu_dev.get(self.b, .glm53_dec_gu, n_pairs, &cfg) else try self.gu[n_pairs - 1].get(self.b, .glm53_dec_gu, n_slots, &cfg);

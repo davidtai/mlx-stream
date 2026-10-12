@@ -1,7 +1,8 @@
 
-    // GLM-5.3 EXL3 decode, stage 2: the gate and up GEMVs of every mini of a wave's slots. A threadgroup per (two
-    // adjacent output tiles, slot x mini, projection): its eight simdgroups split the k-tiles (simdgroup s every eighth
-    // from s; both tiles' words of a k-tile load before either decodes), decoding each weight once for the slot's members
+    // GLM-5.3 EXL3 decode, stage 2: the gate and up GEMVs of every mini of a wave's slots. A threadgroup per (TPG
+    // adjacent output tiles, slot x mini, projection; at K3 four, a k-row's 4 x 96 B whole 128-byte lines, else two): its
+    // eight simdgroups split the k-tiles (simdgroup s every eighth from s; the tiles' words of a k-tile load before any
+    // decodes, the input once for them), decoding each weight once for the slot's members
     // (the wave's pairs routed to it: up to MAXM rows), then the threadgroup sums the eight partial columns.
     // gt: per slot (packed bank << 24 | row, members, member pairs); DEV: the call's routed positions are the slots, gt
     // their packed slots (one member each). A member skips at score 0 (its routed position from pt), a slot at
@@ -10,7 +11,7 @@
     constexpr uint OT = uint(MINI) / 16u;
     constexpr uint NW = 8u * uint(K);
     constexpr uint SGS = 8u;
-    constexpr uint TPG = 2u;
+    constexpr uint TPG = K == 3 ? 4u : 2u;
     threadgroup float part[SGS * uint(MAXM) * TPG * 16u];
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;

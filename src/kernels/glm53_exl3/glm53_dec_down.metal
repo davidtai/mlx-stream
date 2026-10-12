@@ -2,8 +2,8 @@
     // GLM-5.3 EXL3 decode, stage 3, per (128-block of the output, slot): the SwiGLU middle of each member pair's four
     // minis (t128(t128(zg) rout_g * scale) and t128(zu) rout_u * scale, silu(g) u, t128(h rin_d) * scale), the down GEMV
     // of each mini over those middles (each weight decoded once for the slot's members), and each member's output block
-    // sum_r t128(zd_r) * scale * rout_d[r] times its score, f32. 32 simdgroups: the middles' MAXM x 4 x MINI/128
-    // blocks among them, then simdgroup s the output tile s & 7 of the block for mini s >> 3, then
+    // sum_r t128(zd_r) * scale * rout_d[r] times its score, f32. Sixteen simdgroups: the middles' MAXM x 4 x MINI/128
+    // blocks among them, then simdgroup s the output tile s & 7 of the block for minis s >> 3 and s >> 3 + 2, then
     // simdgroup j member j's rotations and the minis' sum. gt: per slot (packed bank << 24 | row, members, member pairs);
     // pt: per pair (x row, slot packed bank << 24 | row, routed position, 0); DEV: the call's routed positions are the
     // slots and the pairs, gt their packed slots (one member each); sc: the router's weights by routed position. A member
@@ -13,7 +13,7 @@
     constexpr uint OT = uint(HID) / 16u;
     constexpr uint NW = 8u * uint(K);
     constexpr uint NIB = uint(MINI) / 128u;
-    constexpr uint SGS = 32u;
+    constexpr uint SGS = 16u;
     threadgroup float mid[uint(MAXM) * 4u * uint(MINI)];
     threadgroup float zd[uint(MAXM) * 4u * 128u];
     const uint sg = simdgroup_index_in_threadgroup;
@@ -84,8 +84,7 @@
     const uint t = sg & 7u;
     const uint tn = blk * 8u + t;
     const g53_lane_plan pl = g53_plan<K>(lane);
-    {
-        const uint r = sg >> 3u;
+    for (uint r = sg >> 3u; r < 4u; r += 2u) {
         const device uint* tw = reinterpret_cast<const device uint*>(code) + ((srow + r) * (IT * OT) + tn) * NW;
         float acc[MAXM][8];
         for (uint j = 0u; j < uint(MAXM); ++j) {
