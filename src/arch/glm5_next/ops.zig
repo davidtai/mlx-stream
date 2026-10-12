@@ -413,8 +413,12 @@ const HC_PRE_BODY =
 ;
 const HC_DEFER_HVAL = "#define HVAL(k) msv_hc_hval<T, HC, D>((k), y + row * D, post_in + row * HC, comb_in + row * HC * HC, h_in + row * HC * D)\n";
 const HC_PRE_SOURCE = "#define HVAL(k) float(x[row * K + (k)])\n#define STORE_H(k, v)\n#define TAIL4(k) float4(*(const device vec<T, 4>*)(x + row * K + (k)))\n" ++ HC_PRE_BODY;
-// The tail reads the stream the other threadgroups stored, two elements per 32-bit atomic.
-const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ "#define STORE_H(k, v) h[row * K + (k)] = T(v)\n#define TAIL4(k) msv_hc_load4<T>(h + row * K, (k))\n" ++ HC_PRE_BODY;
+// The tail (the last threadgroup's collapse) recomputes the four stream elements it needs from the kernel's inputs
+// (`HVAL`: the value every threadgroup stores, rounded to T) rather than reading what the other threadgroups stored:
+// no value crosses threadgroups but the atomically exchanged partials, so the result never depends on when another
+// core's plain stores become visible (the stream the threadgroups store is the launch's `h` output, read by the next
+// sublayer only after the launch).
+const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ "#define STORE_H(k, v) h[row * K + (k)] = T(v)\n#define TAIL4(k) float4(HVAL((k)), HVAL((k) + 1), HVAL((k) + 2), HVAL((k) + 3))\n" ++ HC_PRE_BODY;
 const HC_MATERIALIZE_SOURCE = HC_DEFER_HVAL ++ "const int k = int(thread_position_in_grid.x);\nconst uint row = thread_position_in_grid.y;\nh[row * HC * D + k] = T(HVAL(k));\n";
 const Kernel = mlx.mlx_fast_metal_kernel;
 const Config = mlx.mlx_fast_metal_kernel_config;

@@ -923,6 +923,7 @@ test {
     _ = @import("dsa_decode.zig");
     _ = @import("dsa_decode_parity.zig");
     _ = @import("swiglu.zig");
+    _ = @import("determinism_gpu.zig");
 }
 
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {
