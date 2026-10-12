@@ -101,6 +101,9 @@ const Receipt = struct {
     /// The construction's host-side bound the run billed (`bill.host_side_construction_bytes` then): its records rebuild
     /// at it, and today's bound must cover what the run measured.
     ran_host_side_construction: u64 = bill.host_side_construction_bytes,
+    /// The trunk's residents the run's construction billed (null: today's term). The runs before the module read them at
+    /// construction (`sdk.Weights.materialize`) billed none: the loader's lazy arrays landed in the first prompt.
+    ran_construction_residents: ?u64 = null,
     grown: u32,
     grown_bytes: u64,
     positions: u64,
@@ -126,6 +129,7 @@ const receipts = [_]Receipt{
         .live_bytes = 28528778586,
         .cap = 96,
         .ran_host_side_construction = 900_000_000,
+        .ran_construction_residents = 0,
         .grown = 96,
         .grown_bytes = 19326910464,
         .file_backed_start = 19418972160,
@@ -150,6 +154,7 @@ const receipts = [_]Receipt{
         .live_bytes = 28554578266,
         .cap = 96,
         .ran_host_side_construction = 900_000_000,
+        .ran_construction_residents = 0,
         .grown = 96,
         .grown_bytes = 19326910464,
         .file_backed_start = 19427590144,
@@ -178,9 +183,11 @@ test "glm bill receipts: each run's phase terms, page tables and residuals rebui
         const p = r.units.prompt;
         const slots = bill.slotBytes(in.bank, p) + r.grown_bytes;
         const today = [4]bill.PhaseTerms{ b.terms(.construction, p, p), b.terms(.prompt, p, p), req.termsAt(.decode, slots), req.termsAt(.decode, slots) };
-        // The bill as the run billed it: today's, its construction's host side at the run's bound.
+        // The bill as the run billed it: today's, its construction's host side at the run's bound and its residents
+        // as it billed them.
         var want = today;
         want[0].host_side = r.ran_host_side_construction;
+        if (r.ran_construction_residents) |n| want[0].residents = n;
         for (r.records, want, today) |rec, w, t| {
             try testing.expectEqualDeep(w, rec.billed);
             const pm: sdk.memory.ProcessMemory = .{ .footprint = rec.measured.footprint, .footprint_interval_peak = rec.measured.interval_peak };

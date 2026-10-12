@@ -3,8 +3,8 @@
 //! the pack (the residents against the spec from the shard headers, the bank's manifest, the quant's claim), bills
 //! both phases for the longest request the load takes (the billed context and `max_output` generated tokens) and
 //! fills the slot rows under the host's ceiling less its wired margin before any slot bank is allocated, binds the
-//! residents, starts the stream (prompt rows, the read pool sized from the bank's widest span, the decode lookahead,
-//! the event gates), allocates nothing else until a prompt, and checks its footprint against the bill's construction
+//! residents and reads them into their buffers, starts the stream (prompt rows, the read pool sized from the bank's
+//! widest span, the decode lookahead, the event gates), allocates nothing else until a prompt, and checks its footprint against the bill's construction
 //! terms (`ConstructionOverBill`). A request: the reverse phase change if the previous one decoded, the KV lanes at
 //! the prompt's positions, the prompt pass (layer by layer in calls of `glm_moe_dsa.promptCallRows`, or chunk by
 //! chunk), the decode handover (the transient scratch freed, the KV lanes at the request's own prompt and `max_tokens`,
@@ -338,6 +338,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (gated and !gpu) self.event = try expert_event.createHost(@constCast(self.stream.eventWord().?), @as(i64, event_watchdog_ms) * std.time.ns_per_ms);
             self.w = try graph.Weights.bind(gpa, weights, model, &diag);
             errdefer self.w.deinit(gpa);
+            try self.residentsNow(weights);
             self.ex = try Experts.init(gpa, &self.g, self.stream, self.math, model.hidden_size, .{ .gated = gated, .event = self.event, .wide_depth = shape.wide_depth });
             errdefer self.ex.deinit(&self.g);
             // The slot arrays are the quant's signature (every routed layer's base bank).
@@ -381,6 +382,23 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             try self.checkConstruction(rows.prompt);
             self.phaseRecord("module constructed", self.billed.terms(.construction, self.prompt_units, self.prompt_units), null);
             return self;
+        }
+
+        /// The trunk's residents read into their buffers at construction, as the draft lane's are at its open: the
+        /// loader's arrays are lazy, and each layer's would be read inside the first prompt, its qmms waiting on the
+        /// SSD beside the expert stream's reads. Their bytes as MLX counts them, beside the bill's term (the
+        /// construction check holds the footprint to it).
+        fn residentsNow(self: *Self, weights: *const sdk.Weights) !void {
+            self.g.clearCache();
+            var active0: usize = 0;
+            _ = mlx.mlx_get_active_memory(&active0);
+            const t0 = std.Io.Timestamp.now(self.io, .awake);
+            try weights.materialize();
+            const ns: u64 = @intCast(t0.untilNow(self.io, .awake).nanoseconds);
+            var active1: usize = 0;
+            _ = mlx.mlx_get_active_memory(&active1);
+            const term = self.billed.phases[@intFromEnum(bill_mod.Phase.construction)].residents;
+            log.info("glm_moe_dsa: {d} residents read into their buffers in {d:.2} s: {d} B measured, {d} B billed, residual {d} B\n", .{ weights.count(), seconds(ns), active1 -| active0, term, @as(i64, @intCast(term)) - @as(i64, @intCast(active1 -| active0)) });
         }
 
         /// Once, at construction (every command retired, MLX's cache cleared): the footprint within

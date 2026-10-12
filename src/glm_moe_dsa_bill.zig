@@ -13,8 +13,8 @@
 //! ASSUMPTIONS the bill rests on, each checked where it runs:
 //! - The step creates no page cache (the bank reads past it, the residents load past it): each phase record carries
 //!   `file_cache_created_bytes`, which the receipts hold to `phase_memory.checkPageCache`.
-//! - The host's loader leaves the trunk's residents lazy (`sdk.loader`: MLX's safetensors reader), so they land at the
-//!   first forward and the construction holds none of them; the construction check refuses by name if they are there.
+//! - The module reads the trunk's residents into their buffers at construction (`sdk.Weights.materialize`; the host's
+//!   loader leaves them lazy), as the draft lane does its own: the construction holds them.
 //! - A layer's scope holds every array the layer builds until its end (`MlxOps.mark` / `resetTo`); a sub-scope (a span,
 //!   a routed group) frees its arrays once their consumers ran.
 
@@ -704,9 +704,9 @@ pub fn billOf(in: Inputs) Bill {
     const decode_pending: u64 = if (in.mtp != null) mtpDecodePendingBytes(c, in.decode_pending_rows orelse mtpPendingRows(in.prompt_tokens)) else 0;
     const scratch = scratchBytes(g, @as(u64, s.wide_depth) * s.max_route_ids * g.rows_per_id);
     return .{ .geometry = g, .phases = .{
-        // Constructed: the slot rows and the scratch, the draft lane's residents, the pool; the trunk's residents land at
-        // the first forward (the loader's lazy arrays), the KV at the first prompt.
-        .{ .transient_rows = scratch, .mtp_residents = mtp_res, .pool_staging = pool, .host_side = host_side_construction_bytes },
+        // Constructed: the slot rows and the scratch, the trunk's and the draft lane's residents, the pool; the KV at the
+        // first prompt.
+        .{ .transient_rows = scratch, .residents = in.resident_bytes, .mtp_residents = mtp_res, .pool_staging = pool, .host_side = host_side_construction_bytes },
         .{
             .transient_rows = scratch,
             .residents = in.resident_bytes,
@@ -1087,8 +1087,9 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
     try testing.expectEqual(@as(u64, 16448 * 6144 * 2), d.mtp_pending);
     // At a handover past the append: the lane's 64 pending rows at most, and a pend's concat beside them.
     try testing.expectEqual(@as(u64, 2 * 64 * 6144 * 2), mtpDecodePendingBytes(&c, 1));
-    // The construction: no trunk residents, no KV, no wave, no cache.
-    try testing.expectEqual(@as(u64, 0), k.residents + k.kv + k.waves + k.mlx_cache + k.mlx_cache_overshoot + k.mtp_pending);
+    // The construction: the trunk's residents, no KV, no wave, no cache.
+    try testing.expectEqual(p.residents, k.residents);
+    try testing.expectEqual(@as(u64, 0), k.kv + k.waves + k.mlx_cache + k.mlx_cache_overshoot + k.mtp_pending);
     try testing.expectEqual(p.transient_rows, k.transient_rows);
     // The decode cache at its limit and one freed buffer: the index keys in f32 over every position.
     try testing.expectEqual(decode_cache_bytes, d.mlx_cache);

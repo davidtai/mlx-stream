@@ -48,6 +48,18 @@ pub const Weights = struct {
         }
     }
 
+    /// Every array read into its own MLX buffer now, in one evaluation (the loader's arrays are lazy: each would be
+    /// read at its first use, inside the forward that uses it; one evaluation lets MLX's IO threads read them in
+    /// parallel). The buffers are the arrays' own (`Load` allocates each at its size): no copy, no transient past MLX's
+    /// read staging.
+    pub fn materialize(self: *const Weights) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var it = self.map.valueIterator();
+        while (it.next()) |v| try mlx.check(mlx.mlx_vector_array_append_value(vec, v.*));
+        try mlx.check(mlx.mlx_eval(vec));
+    }
+
     pub fn count(self: *const Weights) u32 {
         return @intCast(self.map.count());
     }

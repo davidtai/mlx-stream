@@ -607,8 +607,7 @@ pub fn Lane(comptime kind: BankKind) type {
             errdefer self.bank.deinit();
             self.cache = try graph.Cache.init(gpa, &self.cfg1, cap);
             // The residents resident now (a lazy load would land in the first round), and their bytes as MLX counts them.
-            var it = self.weights.map.valueIterator();
-            while (it.next()) |v| try mlx.check(mlx.mlx_array_eval(v.*));
+            try self.weights.materialize();
             var active1: usize = 0;
             _ = mlx.mlx_get_active_memory(&active1);
             self.measured_bytes = active1 -| active0;
