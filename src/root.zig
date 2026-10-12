@@ -32,6 +32,15 @@ pub const mimo = struct {
     pub const generation_headroom: u64 = 0;
 };
 
+/// What the host's glue calls for the third arch: GLM-5.3's entry points, the context a load bills when the model sets
+/// none (the standard request) and the generation a request may take past it until a parse has read the model's
+/// `max_output` (its default, 128K: the glue reads the arch's `maxOutput` once it has the model's settings).
+pub const glm = struct {
+    pub const arch = @import("arch/glm_moe_dsa/plugin.zig");
+    pub const default_context: u64 = @import("phase_memory.zig").fill_prompt_tokens;
+    pub const generation_headroom: u64 = @import("arch/glm_moe_dsa/settings.zig").Config.default_max_output;
+};
+
 /// What the host's tests read of the package, reached through the registry (`plugins.mlx_stream_testing`, null when a
 /// build leaves the plugin out): the arch's config fixture and settings type, the modules the host's reader proof
 /// drives, and the pins the conformance tests compare.
@@ -43,8 +52,8 @@ pub const testing = struct {
 
 /// What the host's glue (mlx-serve `src/arch/mlx_stream.zig`) calls: the arch's entry points and their contract types.
 pub const arch = @import("arch/deepseek_v41/plugin.zig");
-/// Every arch the glue dispatches by `claims(peek)`, in claim order: DeepSeek-V4.1 and GLM-5.3 (MiMo has its own
-/// entry, `mimo`, with its own context and headroom).
+/// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order: DeepSeek-V4.1 and GLM-5.3
+/// (the conformance suite's list; the host's glue binds each arch by its own entry: the root's, `mimo` and `glm`).
 pub const archs = .{ @import("arch/deepseek_v41/plugin.zig"), @import("arch/glm_moe_dsa/plugin.zig") };
 pub const sdk = @import("sdk");
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.

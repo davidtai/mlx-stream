@@ -716,7 +716,7 @@ pub fn residentBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *co
 
 /// The pack's residents as MLX allocates them once they load (`bufferBytes` of every shard tensor), after the spec check.
 /// `classes`: they load with the allocator's size classes on (GLM-5.3's module: the first prompt's forward layers read
-/// them, `bill.prompt_size_classes`), each at its class (`glm_moe_dsa_cache.sizeClassBytes`).
+/// them when the process's MLX has the switch, `bill.sizeClassSwitch`), each at its class (`glm_moe_dsa_cache.sizeClassBytes`).
 pub fn residentBufferBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Config, page: u64, classes: bool, diag: ?*Diag) Error!u64 {
     var ck = try Checkpoint.openIndexed(gpa, io, dir, diag);
     defer ck.deinit();

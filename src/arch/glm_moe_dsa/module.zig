@@ -102,6 +102,13 @@ pub const Served = union(enum) {
         return self;
     }
 
+    /// The longest prompt the construction billed: the host's glue refuses a longer one before any work.
+    pub fn maxContext(self: *const Served) u64 {
+        return switch (self.*) {
+            inline else => |m| m.max_context,
+        };
+    }
+
     pub fn deinit(self: *Served) void {
         const gpa = switch (self.*) {
             inline else => |m| m.gpa,
@@ -172,6 +179,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         decode_pending_rows: u64 = 0,
         /// The harness forced the rows (`expert_rows`): the handover grows to them, no live fill.
         forced_rows: bool,
+        /// The allocator's size-class switch the construction bound (`transientClasses`).
+        size_classes: bill_mod.SizeClassSwitch,
         /// The decode rows are the split's (`glm_moe_dsa_split`), not the even split's.
         split_rows: bool = false,
         decoding: bool = false,
@@ -239,7 +248,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             var diag: glm.Diag = .{};
             errdefer if (diag.len > 0) log.err("glm_moe_dsa: load refused: {s}\n", .{diag.message()});
             // The pack, host-side, before any slot bank: the residents against the spec, the bank's manifest.
-            const resident_bytes = try glm.residentBufferBytes(gpa, io, dir, model, std.heap.pageSize(), bill_mod.prompt_size_classes, &diag);
+            // The allocator's size classes when the process's MLX has the switch (the bill charges them exactly then).
+            const size_classes = bill_mod.sizeClassSwitch();
+            const resident_bytes = try glm.residentBufferBytes(gpa, io, dir, model, std.heap.pageSize(), size_classes != null, &diag);
             var bank = try Bk.Bank.open(gpa, io, dir, model, &diag);
             errdefer bank.deinit();
             // The admission: the prompt phase billed at the context, decode at the longest request (the context and
@@ -253,7 +264,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             // The draft lane's bill (its pack refused by name here, before the stream is read).
             const mtp_inputs = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag);
             const select: bill_mod.Select = if (topk_mod.serves(model.index_topk) and mlx.streamIsGpu(s)) .kernel else .argpartition;
-            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = mtp_inputs, .dsa = dsa, .gemm = comptime bill_mod.promptGemmOf(Q), .select = select, .prompt_cache = bill_mod.prefillCacheBytes(ram), .size_classes = bill_mod.prompt_size_classes };
+            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = mtp_inputs, .dsa = dsa, .gemm = comptime bill_mod.promptGemmOf(Q), .select = select, .prompt_cache = bill_mod.prefillCacheBytes(ram), .size_classes = size_classes != null };
             const billed = bill_mod.billOf(inputs);
             const mb = try bill_mod.memoryBill(gpa, billed, null);
             errdefer mb.free(gpa);
@@ -275,7 +286,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .kset = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .billed = billed, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
+            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .kset = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .size_classes = size_classes orelse &noSizeClasses, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .billed = billed, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
             errdefer self.g.deinit();
             // The module owns its config's copy (the host's config keeps the parsed model's storage).
             self.model = if (self.cfg.model) |*m| m else unreachable;
@@ -611,8 +622,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 logits = null;
                 if (self.mtp) |ln| {
                     const out = blk: {
-                        transientClasses(true);
-                        defer transientClasses(false);
+                        self.transientClasses(true);
+                        defer self.transientClasses(false);
                         break :blk try graph.forwardRows(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes, .{ .hidden = true });
                     };
                     logits = out.logits;
@@ -623,8 +634,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                     if (ln.tracked() == self.cache.len) try ln.append(&self.g, &self.w, self.history.items[ln.cache.len + 1 ..]);
                 } else {
                     logits = blk: {
-                        transientClasses(true);
-                        defer transientClasses(false);
+                        self.transientClasses(true);
+                        defer self.transientClasses(false);
                         break :blk try graph.forward(&self.g, self.gpa, self.model, &self.w, ids[at..end], @intCast(self.cache.len), &self.cache, &self.ex, self.routes);
                     };
                     try self.history.appendSlice(self.gpa, ids[at..end]);
@@ -650,12 +661,18 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
         /// The allocator's size classes (a request of 1 MB or more rounded up to one of 8 classes per power of two, so
         /// a nearly equal request reuses its cached buffer) on for the forward layers only: their transients are
-        /// rounded, never a lane (`Cache.preallocate`), a resident, the scratch or the MTP lane's rows.
-        fn transientClasses(on: bool) void {
-            // Only mlx-serve's macOS MLX (patches/mlx-alloc-size-classes.patch) has the switch: the bill reads the same.
-            if (comptime !bill_mod.prompt_size_classes) return;
+        /// rounded, never a lane (`Cache.preallocate`), a resident, the scratch or the MTP lane's rows. The switch the
+        /// construction bound (`size_classes`): the patched MLX's, else `noSizeClasses`.
+        fn transientClasses(self: *const Self, on: bool) void {
             var prev: bool = false;
-            _ = mlx.mlx_set_alloc_size_classes(&prev, on);
+            _ = self.size_classes(&prev, on);
+        }
+
+        /// A stock MLX has no size classes: the module leaves the allocator as it is, and the bill charged no classes.
+        fn noSizeClasses(prev: *bool, on: bool) callconv(.c) c_int {
+            _ = on;
+            prev.* = false;
+            return 0;
         }
 
         /// A serial step: `ids` (decode width) after the committed positions; the last row's logits, an owned handle.

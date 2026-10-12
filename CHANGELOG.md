@@ -47,6 +47,11 @@
   profile builds only; the tally folded in at each request's end; the construction check raised by the bytes other
   models hold in the process (#8's reading); the draft lane's sampled decisions on `sdk_ext.acceptance`. The quality
   tier of the headline and the ceilings it carries are named in README (GLM-5.3's measurements).
+- GLM-5.3 on the host's typed glue: the root exports `glm` (the arch, the standard request's context, the 128K
+  `max_output` default) beside `mimo`, and the module answers the context it billed (`Served.maxContext`). The
+  allocator's size-class switch (`mlx_set_alloc_size_classes`, mlx-serve's patched MLX) is looked up by name at
+  construction (`bill.sizeClassSwitch`): a stock MLX links and serves with no size classes, and the bill charges them
+  exactly when the module turns them on.
 - GLM-5.3's memory bill fills to the box: the KV lanes hold each phase's positions (a prompt's at its pass, the
   request's own prompt and `max_tokens` from its handover); `max_output` (default 131,072) bills the longest request
   at construction; the decode handover settles the prompt's frees, reads the footprint and the box, and grows the

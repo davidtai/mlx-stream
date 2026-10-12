@@ -176,9 +176,20 @@ pub fn selectOf(c: *const glm.Config) Select {
 /// The bytes MLX's allocator takes for a request while its size classes are on (`glm_moe_dsa_cache.sizeClassBytes`).
 pub const sizeClassBytes = cache_mod.sizeClassBytes;
 
-/// Whether the module turns the allocator's size classes on for the prompt's forward layers: the patched MLX's switch,
-/// on macOS only (the build whose MLX has it). The module's own bill and the plugin's view of it (`inputsOf`) both read it.
-pub const prompt_size_classes = @import("builtin").os.tag == .macos;
+/// The allocator's size-class switch (`mlx_set_alloc_size_classes`: mlx-serve's patched MLX,
+/// patches/mlx-alloc-size-classes.patch), which the module turns on for the prompt's forward layers.
+pub const SizeClassSwitch = *const fn (res: *bool, on: bool) callconv(.c) c_int;
+
+/// The switch when the process's MLX exports it, looked up by name (null on a stock MLX, and off macOS): the plugin links
+/// against either MLX. The module's construction (which binds it) and the plugin's view of its bill (`inputsOf`) read the
+/// same lookup, so the bill charges size classes exactly when the module turns them on.
+pub fn sizeClassSwitch() ?SizeClassSwitch {
+    if (comptime @import("builtin").os.tag != .macos) return null;
+    // RTLD_DEFAULT ((void *)-2 on Darwin): every image the process has loaded, libmlxc among them.
+    const any_image: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
+    const f = std.c.dlsym(any_image, "mlx_set_alloc_size_classes") orelse return null;
+    return @ptrCast(@alignCast(f));
+}
 
 /// The prompt layer's arrays as the allocator sizes them: each at its own bytes, or with the size classes on at its class
 /// (`sizeClassBytes`); an array the routing sizes (a routed slice's output, a GEMM wave's arrays) at its class bound,
@@ -801,8 +812,9 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, p
     const dir = cfg.model_dir orelse return error.GlmPackDir;
     const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
     const geo = if (exl3_bank.present(dir)) try exl3_bank.Bank.geometry(a, io, dir, model, diag) else try bank_mod.Bank.geometry(a, io, dir, model, diag);
-    const residents = try glm.residentBufferBytes(a, io, dir, model, std.heap.pageSize(), prompt_size_classes, diag);
-    return .{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .decode_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag), .dsa = glm.dsaKernelsFit(model), .gemm = if (exl3_bank.present(dir)) promptGemmOf(glm53_quant) else .affine, .select = selectOf(model), .prompt_cache = prefillCacheBytes(sdk.memory.totalMemBytes()), .size_classes = prompt_size_classes };
+    const classes = sizeClassSwitch() != null;
+    const residents = try glm.residentBufferBytes(a, io, dir, model, std.heap.pageSize(), classes, diag);
+    return .{ .model = model, .bank = geo, .resident_bytes = residents, .stream = streamShape(cfg), .prompt_tokens = prompt_tokens, .decode_positions = maxPositions(cfg), .mtp = try mtpOf(a, io, cfg, kind, diag), .dsa = glm.dsaKernelsFit(model), .gemm = if (exl3_bank.present(dir)) promptGemmOf(glm53_quant) else .affine, .select = selectOf(model), .prompt_cache = prefillCacheBytes(sdk.memory.totalMemBytes()), .size_classes = classes };
 }
 
 /// The draft lane's bill inputs when `cfg` turns it on (its settings and the pack's MTP directory checked), else null.
