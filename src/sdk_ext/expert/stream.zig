@@ -2000,20 +2000,41 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     }
                 };
                 const order: RecordOrder = .{ .bank = bank, .layer = r.layer, .mixed = self.group_geometry };
-                std.sort.insertion(u8, r.order[0..n], Order{ .records = order, .plan = plan }, Order.less);
+                if (self.mixed) {
+                    std.sort.insertion(u8, r.order[0..n], Order{ .records = order, .plan = plan }, Order.less);
+                } else {
+                    std.sort.insertion(u8, r.order[0..n], @as(*const Route, r), struct {
+                        fn less(rr: *const Route, a: u8, b: u8) bool {
+                            return rr.plan.loads[a].expert < rr.plan.loads[b].expert;
+                        }
+                    }.less);
+                }
                 var offsets: [max_route_ids]u64 = undefined;
                 var lengths: [max_route_ids]u64 = undefined;
-                for (r.order[0..n], 0..) |li, k| {
-                    offsets[k] = bank.recordOffset(r.layer, plan.loads[li].expert);
-                    const geom = recordGeometry(bank, r.layer, plan.loads[li].expert);
-                    lengths[k] = if (minisOf(geom) > 1) minisOf(geom) * miniStride(geom) else geom.logical_bytes;
+                if (self.mixed) {
+                    for (r.order[0..n], 0..) |li, k| {
+                        offsets[k] = bank.recordOffset(r.layer, plan.loads[li].expert);
+                        const geom = recordGeometry(bank, r.layer, plan.loads[li].expert);
+                        lengths[k] = if (minisOf(geom) > 1) minisOf(geom) * miniStride(geom) else geom.logical_bytes;
+                    }
+                } else {
+                    const geom = &bank.layers[r.layer];
+                    const mn = minisOf(geom);
+                    const footprint = if (mn > 1) mn * miniStride(geom) else geom.logical_bytes;
+                    for (r.order[0..n], 0..) |li, k| {
+                        offsets[k] = bank.recordOffset(r.layer, plan.loads[li].expert);
+                        lengths[k] = footprint;
+                    }
                 }
                 var ends_buf: [max_route_ids]u32 = undefined;
                 var n_ends: usize = 0;
                 var group_start: u32 = 0;
                 while (group_start < n) {
-                    var group_end = group_start + 1;
-                    while (group_end < n and order.same(plan.loads[r.order[group_start]].expert, plan.loads[r.order[group_end]].expert)) : (group_end += 1) {}
+                    var group_end = n;
+                    if (self.group_geometry) {
+                        group_end = group_start + 1;
+                        while (group_end < n and order.same(plan.loads[r.order[group_start]].expert, plan.loads[r.order[group_end]].expert)) : (group_end += 1) {}
+                    }
                     if (plan.phase == .decode) {
                         var local_ends: [max_route_ids]u32 = undefined;
                         for (expert_policy.boundedParts(offsets[group_start..group_end], lengths[group_start..group_end], self.records_per_part, &local_ends)) |end| {
@@ -2044,8 +2065,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         nr = self.entries(r.layer, l.slot, l.expert, &rows, &gu, &down, nr);
                     }
                     if (nr > 0) {
-                        const lens = lengthsOf(recordGeometry(bank, r.layer, plan.loads[r.order[start]].expert));
-                        part.ticket = try self.submitRoute(r, gu[0..nr], down[0..nr], rows[0..nr], &lens);
+                        if (self.mixed) {
+                            const lens = lengthsOf(recordGeometry(bank, r.layer, plan.loads[r.order[start]].expert));
+                            part.ticket = try self.submitRoute(r, gu[0..nr], down[0..nr], rows[0..nr], &lens);
+                        } else {
+                            part.ticket = B.Records.submit(self.pool, bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &self.layers[r.layer].lens) catch |e| return self.fail(e);
+                        }
                         part.n_reads = nr;
                     } else part.settled = true;
                     r.parts[r.n_parts] = part;
@@ -2204,10 +2229,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const mn = minisOf(&self.bank.layers[layer]);
                 var start: u32 = ah.posted;
                 while (start < to) {
-                    const order: RecordOrder = .{ .bank = self.bank, .layer = layer };
-                    var end = start + 1;
-                    while (end < @min(start + expert_io.max_items / mn, to) and order.same(ah.loads[start].expert, ah.loads[end].expert)) : (end += 1) {}
-                    const lens = lengthsOf(recordGeometry(self.bank, layer, ah.loads[start].expert));
+                    var end = @min(start + expert_io.max_items / mn, to);
+                    if (self.group_geometry) {
+                        const order: RecordOrder = .{ .bank = self.bank, .layer = layer, .mixed = true };
+                        end = start + 1;
+                        while (end < @min(start + expert_io.max_items / mn, to) and order.same(ah.loads[start].expert, ah.loads[end].expert)) : (end += 1) {}
+                    }
                     var part: Part = .{ .first = start, .n = end - start };
                     var rows: [expert_io.max_items][n_components]u64 = undefined;
                     var gu: [expert_io.max_items]u64 = undefined;
@@ -2221,10 +2248,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         posted += 1;
                     }
                     if (nr > 0) {
-                        part.ticket = if (self.mixed)
-                            B.Records.submitRange(self.pool, route_capacity * self.ticket_stride, self.pool.demand_tickets, &ah.ticket_next, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &lens) catch |e| return self.fail(e)
-                        else
-                            B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &lens) catch |e| return self.fail(e);
+                        part.ticket = if (self.mixed) blk: {
+                            const lens = lengthsOf(recordGeometry(self.bank, layer, ah.loads[start].expert));
+                            break :blk B.Records.submitRange(self.pool, route_capacity * self.ticket_stride, self.pool.demand_tickets, &ah.ticket_next, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &lens) catch |e| return self.fail(e);
+                        } else
+                            B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &self.layers[layer].lens) catch |e| return self.fail(e);
                         part.n_reads = nr;
                         self.counters.ahead_posted += posted;
                         if (comptime read_ahead_probed) if (self.probe) |pr| pr.posted(layer, posted);

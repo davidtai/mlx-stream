@@ -80,29 +80,31 @@ The `mul1h_rate` header composes the unchanged stock K3 header with a separately
 #### Stock 3.0 review measurement — acceptance pending
 
 Measured on 2026-10-12 on the same M5 Max 128 GB host (`mlx-serve` `c6165fe`), with independently
-built baseline PR11 `f22ad15` (binary `95ed21f5`) and the repaired candidate (binary `bef0e801`).
+built baseline PR11 `f22ad15` (binary `95ed21f5`) and the repaired candidate (binary `5509f963`).
 The candidate contains none of the six saved optimization deltas. Both use the stock 3.0 streaming
 pack, context 17,472, no draft lanes or prefix cache, and frozen llmprobe 0.6.16 code/count requests
 targeting its approximately 16K rung. Values average each revision's two ABBA-arm medians.
 
 | Served cell | Baseline tok/s | Repair tok/s | Change |
 |---|---:|---:|---:|
-| Short decode | 14.449 | 14.468 | +0.13% |
-| 16K code prefill | 601.259 | 600.205 | -0.18% |
-| 16K code decode | 11.739 | 11.741 | +0.01% |
-| 16K count prefill | 598.621 | 607.952 | +1.56% |
-| 16K count decode | 14.702 | 15.245 | +3.70% |
+| Short decode | 16.568 | 16.737 | +1.02% |
+| 16K code prefill | 585.907 | 575.506 | -1.78% |
+| 16K code decode | 15.216 | 15.315 | +0.65% |
+| 16K count prefill | 582.377 | 574.260 | -1.39% |
+| 16K count decode | 16.898 | 16.808 | -0.53% |
 
-All four arms and 24 long requests completed, at 16,201 code / 16,161 count native prompt tokens.
+All four arms and 24 long requests completed, at 16,224 code / 16,184 count native prompt tokens.
 Delivered reasoning/content, finish reasons, complete usage and frozen request hashes match; token IDs
-are not exposed. This is **not accepted stock neutrality or an optimization win**: the first Instruments
-target PID handshake failed, admission rows were measured under different live memory baselines,
-and count-prefill control drift exceeded the 3% guard. The subsequently identified stock metadata
-surcharge is now compact-only. Independent host-only `servedBill`/`servedFill` reports match the
-merged baseline exactly at all four recorded memory facts, over every uniform row count and legal
-extra-record suffix. The stock budget-boundary regression fails before this correction and passes
-afterward in ReleaseSafe. These later source reports are not associated with the earlier candidate
-binary and do not retroactively accept the table. No thermal/fan equivalence is claimed.
+are not exposed. Both owned-server attach traces saved and drained cleanly, recording positive stock
+EXL3 shader samples with matching sampled launch-name sets. Independent source-associated host-only
+`servedBill`/`servedFill` reports match the merged baseline exactly at all recorded memory facts over
+every uniform row count and legal extra-record suffix, and reproduce each engine's observed admission.
+This is **not accepted stock neutrality or an optimization win**: two individual prefill comparisons
+were -3.48% and -3.52%, outside the 3% regression guard. The table precedes the subsequent restoration
+of uniform submission's original id ordering, constant footprint and cached segment lengths; geometry
+scans are now limited to mixed geometry. That source is undergoing fresh served validation.
+The stock budget-boundary regression fails before the compact-only metadata correction and passes
+afterward in ReleaseSafe. No thermal/fan equivalence is claimed.
 
 
 | Published source | Expert contract | Status |
