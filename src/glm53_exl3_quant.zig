@@ -174,14 +174,14 @@ pub fn Accepted(comptime G: type) type {
 
         fn decodeWaveWith(self: *Self, g: *G, x: G.T, pairs: []const [3]u32, banks: *const [3]Bank, sc: G.T, with: ?*routes.Decode) !G.T {
             const k = kOf(banks[0].gate.trellis) orelse return error.BankArrays;
-            const tabs = try selfcheck.decodeTables(self.a, pairs);
+            const dec = with orelse &self.dec[ki(k)];
+            const tabs = try selfcheck.decodeTablesM(self.a, pairs, dec.maxm);
             defer self.a.free(tabs.pt);
             defer self.a.free(tabs.gt);
             const pt = try g.hostArray(std.mem.sliceAsBytes(tabs.pt), &.{@intCast(tabs.pt.len)}, .uint32);
             const gt = try g.hostArray(std.mem.sliceAsBytes(tabs.gt), &.{@intCast(tabs.gt.len)}, .uint32);
             var rb: [3]routes.Bank = undefined;
             for (banks, &rb) |b, *o| o.* = .{ .gate = proj(b.gate), .up = proj(b.up), .down = proj(b.down) };
-            const dec = with orelse &self.dec[ki(k)];
             return g.adopt(try dec.wave(x, pt, gt, pairs.len, tabs.n_slots, &rb, sc));
         }
 
@@ -899,12 +899,16 @@ fn nbytesOf(x: mlx.mlx_array) u64 {
 }
 
 /// GLM53_EXL3_DEC4's experiments on these texts' decode chain: one text each, one needle replaced.
-const dec_exps = [_]BenchExp{
-    .{ .name = "prep: nothing (returns)", .kernel = .glm53_dec_prep, .needle = "    if (packed == 0xffffffffu || sc[pos] == 0.0f) return;", .repl = "    if (true) return;" },
+const DecExp = struct { name: []const u8, kernel: xk.Kernel, needle: []const u8, repl: []const u8, members: u32 = routes.max_members };
+const dec_exps = [_]DecExp{
+    .{ .name = "one member a slot (no grouping)", .kernel = .glm53_dec_gu, .needle = "", .repl = "", .members = 1 },
+    .{ .name = "gu: inputs constant (no x loads)", .kernel = .glm53_dec_gu, .needle = "            const float4 xv = float4(xm[j][tk * 4u]);", .repl = "            const float4 xv = float4(0.001f * float(tk + j));" },
+    .{ .name = "gu: weights constant (no trellis reads, no decode)", .kernel = .glm53_dec_gu, .needle = "        for (uint o = 0u; o < TPG; ++o) g53_lane_weights<K>(tw + size_t(tk) * (OT * NW) + o * NW, pl, w8[o]);", .repl = "        for (uint o = 0u; o < TPG; ++o) for (uint q = 0u; q < 8u; ++q) w8[o][q] = half(0.001f * float(q + o + tk));" },
+    .{ .name = "gu: trellis reads, no decode", .kernel = .glm53_dec_gu, .needle = "        for (uint o = 0u; o < TPG; ++o) g53_lane_weights<K>(tw + size_t(tk) * (OT * NW) + o * NW, pl, w8[o]);", .repl = "        for (uint o = 0u; o < TPG; ++o) { const device uint* ww = tw + size_t(tk) * (OT * NW) + o * NW; const uint lo = ww[pl.a]; const uint hi = ww[pl.b]; for (uint q = 0u; q < 8u; ++q) w8[o][q] = as_type<half2>((lo >> q) ^ hi).x; }" },
+    .{ .name = "down: weights constant (no trellis reads, no decode)", .kernel = .glm53_dec_down, .needle = "            g53_lane_weights<K>(tw + size_t(tk) * (OT * NW), pl, w8);", .repl = "            for (uint q = 0u; q < 8u; ++q) w8[q] = half(0.001f * float(q + tk));" },
     .{ .name = "gu: nothing (returns)", .kernel = .glm53_dec_gu, .needle = "    if (packed == 0xffffffffu) return;", .repl = "    if (true) return;" },
     .{ .name = "gu: an eighth of the k-tiles", .kernel = .glm53_dec_gu, .needle = "    for (uint tk = sg; tk < IT; tk += SGS) {", .repl = "    for (uint tk = sg; tk < IT / 8u; tk += SGS) {" },
     .{ .name = "down: nothing (returns)", .kernel = .glm53_dec_down, .needle = "    if (n_live == 0u) return;", .repl = "    if (true) return;" },
-    .{ .name = "down: no middle", .kernel = .glm53_dec_down, .needle = "    for (uint job = sg; job < uint(MAXM) * 4u * NIB; job += SGS) {", .repl = "    for (uint job = sg; job < 0u; job += SGS) {" },
     .{ .name = "down: half the minis' GEMV", .kernel = .glm53_dec_down, .needle = "    for (uint r = sg >> 3u; r < 4u; r += 2u) {", .repl = "    for (uint r = sg >> 3u; r < 2u; r += 2u) {" },
 };
 
@@ -917,7 +921,23 @@ const DecExpRun = struct {
     bd: xk.Bound,
     dec: [2]routes.Decode,
 
-    fn init(e: *DecExpRun, a: Allocator, ex: BenchExp, s: mlx.mlx_stream, inst0: xk.Instance, k1: u32) !void {
+    fn init(e: *DecExpRun, a: Allocator, ex: DecExp, s: mlx.mlx_stream, inst0: xk.Instance, k1: u32) !void {
+        var inst1 = inst0;
+        inst1.k = k1;
+        if (ex.needle.len == 0) {
+            // the texts as they are, the chain at `members`
+            e.src = try a.dupeSentinel(u8, "", 0);
+            errdefer a.free(e.src);
+            e.mf = try a.dupe(u8, "");
+            errdefer a.free(e.mf);
+            e.texts = xk.embedded;
+            e.reg = try xk.Registry.init(a, &e.texts, xk.manifest_sha256, null);
+            errdefer e.reg.deinit();
+            e.bd = try e.reg.bind(s, null);
+            e.dec = .{ .init(&e.bd, inst0), .init(&e.bd, inst1) };
+            for (&e.dec) |*d| d.maxm = ex.members;
+            return;
+        }
         const base = xk.embedded.sources[@backingInt(ex.kernel)];
         if (std.mem.count(u8, base, ex.needle) != 1) return error.NeedleMissing;
         const tx = try std.mem.replaceOwned(u8, a, base, ex.needle, ex.repl);
@@ -932,9 +952,8 @@ const DecExpRun = struct {
         e.reg = try xk.Registry.init(a, &e.texts, &std.fmt.bytesToHex(dg, .lower), null);
         errdefer e.reg.deinit();
         e.bd = try e.reg.bind(s, null);
-        var inst1 = inst0;
-        inst1.k = k1;
         e.dec = .{ .init(&e.bd, inst0), .init(&e.bd, inst1) };
+        for (&e.dec) |*d| d.maxm = ex.members;
     }
 
     fn deinit(e: *DecExpRun, a: Allocator) void {

@@ -360,8 +360,14 @@ fn decodeChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
 /// A decode wave's tables: pt (per pair: x row, packed slot, routed position, 0) and gt (per distinct slot: packed slot,
 /// members, the member pairs; a slot of more pairs than `routes.max_members` takes several entries), each at least 8
 /// words (an MLX input below 8 elements binds as `constant`).
-pub fn decodeTables(a: Allocator, pairs: []const [3]u32) !struct { pt: []u32, gt: []u32, n_slots: usize } {
-    const mm = routes.max_members;
+pub fn decodeTables(a: Allocator, pairs: []const [3]u32) !Tables {
+    return decodeTablesM(a, pairs, routes.max_members);
+}
+
+pub const Tables = struct { pt: []u32, gt: []u32, n_slots: usize };
+
+/// `decodeTables` at `mm` members a slot entry (the decode chain's `maxm`).
+pub fn decodeTablesM(a: Allocator, pairs: []const [3]u32, mm: usize) !Tables {
     const pt = try a.alloc(u32, @max(8, 4 * pairs.len));
     errdefer a.free(pt);
     @memset(pt, 0);

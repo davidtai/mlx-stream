@@ -89,6 +89,8 @@ fn Plans(comptime N: usize) type {
 pub const Decode = struct {
     b: *const xk.Bound,
     inst: xk.Instance,
+    /// a slot entry's members (the GEMVs' MAXM; the host tables' `decodeTablesM`)
+    maxm: u32 = max_members,
     /// per mode (host tables, device slots), indexed by pairs
     prep: [2]Plans(max_pairs) = .{ .{}, .{} },
     /// the host mode's GEMVs: their grids count the slots, their outputs the pairs
@@ -150,6 +152,7 @@ pub const Decode = struct {
             // two output tiles a threadgroup
             var cfg = cfgOf(e, self.inst, .{ e.threadgroup[0] * (mi / 32), @intCast(n_slots * 4), 2 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
             setInt(&cfg, e, "DEV", di);
+            setInt(&cfg, e, "MAXM", @intCast(self.maxm));
             const p = if (dev) try self.gu_dev.get(self.b, .glm53_dec_gu, n_pairs, &cfg) else try self.gu[n_pairs - 1].get(self.b, .glm53_dec_gu, n_slots, &cfg);
             try self.b.applyPrepared(p, &.{ u[0], u[1], gt, pt, sc, banks[0].gate.trellis, banks[1].gate.trellis, banks[2].gate.trellis, banks[0].up.trellis, banks[1].up.trellis, banks[2].up.trellis }, &z);
         }
@@ -158,6 +161,7 @@ pub const Decode = struct {
         // a threadgroup per 128-block of the output and slot
         var cfg = cfgOf(e, self.inst, .{ e.threadgroup[0] * (h / 128), @intCast(n_slots), 1 }, &.{.{ &sh, .float32 }});
         setInt(&cfg, e, "DEV", di);
+        setInt(&cfg, e, "MAXM", @intCast(self.maxm));
         const p = if (dev) try self.down_dev.get(self.b, .glm53_dec_down, n_pairs, &cfg) else try self.down[n_pairs - 1].get(self.b, .glm53_dec_down, n_slots, &cfg);
         var y: [1]mlx.mlx_array = undefined;
         try self.b.applyPrepared(p, &.{ z[0], z[1], gt, pt, sc, banks[0].gate.svh, banks[1].gate.svh, banks[2].gate.svh, banks[0].up.svh, banks[1].up.svh, banks[2].up.svh, banks[0].down.suh, banks[1].down.suh, banks[2].down.suh, banks[0].down.trellis, banks[1].down.trellis, banks[2].down.trellis, banks[0].down.svh, banks[1].down.svh, banks[2].down.svh }, &y);
