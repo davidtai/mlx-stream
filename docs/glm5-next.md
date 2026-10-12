@@ -303,7 +303,8 @@ open holds is held to its billed terms (`mtp_bank + mtp_tables + mtp_kv`, else `
 
 A request: the prompt pass hands the lane every row's final-normed hidden (`graph.Head.hidden`), each pair whose next
 token the prompt gives appended to the head's lanes; a round (the host's `draft_lane.round`) drafts up to 3 tokens
-after t1, verifies [t1, drafts] in one decode-lane forward (`Head.verify`: every row's logits and hidden; each KDA
+after t1 as one device graph (`mtp.chainDrafts`: each draft's argmax feeds the next pair's embedding on the device; one
+eval and one read of the drafts, before the verify; the install line names it, `drafts=device_chain`), verifies [t1, drafts] in one decode-lane forward (`Head.verify`: every row's logits and hidden; each KDA
 layer's per-row states captured by the host's `capture_seq` recurrence), decides by the exact rule inside the verify's
 eval (greedy: the verify rows' argmax; sampled: sample-then-verify, every row's token the target's position-keyed draw, the serial step's), then rolls back to the kept rows (the DSA
 lanes truncated; on a partial accept every KDA state restored from the capture by a copy, no re-forward) and pends the

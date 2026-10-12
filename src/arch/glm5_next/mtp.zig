@@ -114,6 +114,27 @@ pub fn draftsAt(depth: u32, tracked: u64, n_pending: u32, len: u64, accepted_cap
     return mimo_draft.draftCount(tracked == len and n_pending >= 1, depth, accepted_cap, reserve, len);
 }
 
+/// A round's drafts as one device graph over op backend `Ops` (`argmax`, `reshape`, `concat`, `evalAll`, `hostU32`) and
+/// the draft head `head` (`step(g, x, pos)`: the layer at `pos`, its normed row and f32 logits [vocab]; `input(g, idx,
+/// normed)`: the next pair's input from the token ids `idx` on the device). Step s runs at position `start + s`; its
+/// argmax (uint32 [1]) is draft s and feeds step s + 1's input without leaving the device. One eval and one read bring
+/// the `depth` drafts to the host, before the verify (the stepwise chain synced once a step). Every op is the stepwise
+/// chain's: the index array holds the value the host would upload, so each embedding row, each step and each draft is
+/// the same, bit for bit.
+pub fn chainDrafts(comptime Ops: type, g: *Ops, head: anytype, x0: Ops.T, start: u32, depth: u32, out: []u32) !void {
+    std.debug.assert(depth >= 1 and depth <= max_depth and out.len >= depth);
+    var ids: [max_depth]Ops.T = undefined;
+    var x = x0;
+    for (0..depth) |s| {
+        const r = try head.step(g, x, start + @as(u32, @intCast(s)));
+        ids[s] = try g.reshape(try g.argmax(r.logits, 0), &.{1});
+        if (s + 1 < depth) x = try head.input(g, ids[s], r.normed);
+    }
+    const all = if (depth == 1) ids[0] else try g.concat(ids[0..depth], 0);
+    try g.evalAll(&.{all});
+    _ = try g.hostU32(all, out[0..depth]);
+}
+
 /// The request's acceptance by draft position (the receipt's `pos_tested` / `pos_kept`): `tested[i]` counts the rounds
 /// whose draft i + 1 was decided (drafts 1 .. i accepted), `kept[i]` those that accepted it. The exact rule keeps a
 /// prefix, so a round of `drafted` drafts with `accepted` kept decides positions 1 .. min(accepted + 1, drafted) and
@@ -572,7 +593,7 @@ pub const Lane = struct {
         for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         self.held_bytes = heldOf(&held, std.heap.pageSize());
-        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
+        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=device_chain bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
         return self;
     }
 
@@ -650,8 +671,12 @@ pub const Lane = struct {
 
     /// The pairs input `eh_proj(cat[rms(embed(tokens), enorm), rms(hidden, hnorm)])` [n, hidden].
     fn input(self: *const Lane, g: *G, w: *const graph.Weights, tokens: []const u32, hidden: T) !T {
+        return self.inputAt(g, w, try g.hostArray(std.mem.sliceAsBytes(tokens), &.{@intCast(tokens.len)}, .uint32), hidden);
+    }
+
+    /// `input` at the token ids `idx` (uint32 [n]) already on the device: a draft's argmax, the chain's next pair.
+    fn inputAt(self: *const Lane, g: *G, w: *const graph.Weights, idx: T, hidden: T) !T {
         const c = self.c;
-        const idx = try g.hostArray(std.mem.sliceAsBytes(tokens), &.{@intCast(tokens.len)}, .uint32);
         const e = try graph.rmsNorm(g, try g.take(w.embed, idx, 0), self.head.enorm, c.rms_norm_eps);
         const hn = try graph.rmsNorm(g, try g.astype(hidden, g.dtypeOf(e)), self.head.hnorm, c.rms_norm_eps);
         return graph.linear(g, try g.concat(&.{ e, hn }, -1), self.head.eh_proj);
@@ -719,28 +744,34 @@ pub const Lane = struct {
         self.n_pending -= n;
     }
 
+    /// One draft step of the chain (`chainDrafts`): the layer on the pair input `x` at position `pos`, its final-normed
+    /// row and its f32 logits [vocab] (the trunk's untied head).
+    const ChainHead = struct {
+        lane: *Lane,
+        w: *const graph.Weights,
+
+        pub fn step(h: ChainHead, g: *G, x: T, pos: u32) !struct { normed: T, logits: T } {
+            const out_row = try h.lane.layer(g, x, pos);
+            const normed = try graph.rmsNorm(g, out_row, h.lane.head.head_norm, h.lane.c.rms_norm_eps);
+            return .{ .normed = normed, .logits = try g.reshape(try g.astype(try graph.linear(g, normed, h.w.head), .float32), &.{-1}) };
+        }
+
+        pub fn input(h: ChainHead, g: *G, idx: T, hidden: T) !T {
+            return h.lane.inputAt(g, h.w, idx, hidden);
+        }
+    };
+
     /// A round's `depth` drafts into `out` after `t1` (the token at the trunk's length): the pending pairs appended
     /// (their tokens `after`, then `t1`; the last one through the layer), the first draft from the last pair's row, each
-    /// further one from the previous draft and its normed output at the next position. The draft rows leave the lanes
-    /// at the end: the lanes hold the trunk's pairs only.
+    /// further one from the previous draft and its normed output at the next position, chained on the device and read
+    /// once (`chainDrafts`). The draft rows leave the lanes at the end: the lanes hold the trunk's pairs only.
     pub fn draft(self: *Lane, g: *G, w: *const graph.Weights, after: []const u32, t1: u32, depth: u32, out: []u32) !void {
         std.debug.assert(after.len + 1 == self.n_pending and depth >= 1 and depth <= max_depth and out.len >= depth);
         try self.append(g, w, after);
-        const c = self.c;
         const m0 = g.mark();
         defer g.resetTo(m0);
         const start = self.pairs();
-        var x = try self.input(g, w, &.{t1}, self.pending.?);
-        for (0..depth) |step| {
-            const out_row = try self.layer(g, x, start + @as(u32, @intCast(step)));
-            const normed = try graph.rmsNorm(g, out_row, self.head.head_norm, c.rms_norm_eps);
-            const am = try g.argmax(try g.reshape(try g.astype(try graph.linear(g, normed, w.head), .float32), &.{-1}), 0);
-            try g.evalAll(&.{am});
-            var tok: [1]u32 = undefined;
-            _ = try g.hostU32(am, &tok);
-            out[step] = tok[0];
-            if (step + 1 < depth) x = try self.input(g, w, out[step..][0..1], normed);
-        }
+        try chainDrafts(G, g, ChainHead{ .lane = self, .w = w }, try self.input(g, w, &.{t1}, self.pending.?), start, depth, out);
         self.latent.truncateTo(start + 1);
         self.index.truncateTo(start + 1);
         g.release(self.pending.?);
