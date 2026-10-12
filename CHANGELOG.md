@@ -46,9 +46,8 @@
   reserve, MLX's bytes within the host's ceiling less its wired margin; decode's transient window holds the widest
   decode call's ids (8 rows serial); the host side is one measured term (1.5 GB; the unbilled overhead term is gone);
   the construction checks its footprint (`ConstructionOverBill`). The SDK's arch table gains the optional `maxOutput`
-  hook (SDK 2.1) and `sdk.memory.boxUsedBytes`; the expert stream takes decode's window rows
-  (`Options.decode_window_rows`, default `max_route_ids`) and the KV grow lane a `resize`. DeepSeek-V4.1's paths are
-  unchanged.
+  hook (SDK 2.1) and `sdk.memory.boxUsedBytes`; decode's window is the expert stream's `Options.decode_route_ids`
+  (MiMo's, allocated per geometry) and the KV grow lane gains a `resize`.
 - GLM-5.3: the MTP draft lane over the release's MTP layer (`mtp_depth`, `mtp_acceptance`, `mtp_typical_delta`;
   off by default, exact acceptance unless typical is named), its experts resident from the EXL3 build's records
   through sushi's EXL3 MoE; `convert_glm_exl3_bank.py --mtp-only` writes the pack's `mtp/` directory.
@@ -66,7 +65,21 @@
   counts its host wait on reads (`Stats.read_wait_ns`) and each layer's hits and misses (`layerCounts`).
 - The expert stream takes its slot arrays' dtypes from the bank module and can size its read pool's staging from the
   bank (`Stream.Options.staging_from_bank`); MlxOps gains affine matmuls with biases at a tensor's own bits and group.
-  DeepSeek-V4.1's paths are unchanged.
+- What GLM-5.3's work changes for DeepSeek-V4.1 (and MiMo), which share the stream, the reader and the registry:
+  - the reader queues one job per demand range (gate/up ranges first), the only demand path: a submit's ranges read on
+    idle workers side by side, each with its own status; a failed range no longer skips the rest of its submit (the
+    stream fails either way). `q3ld_withdraw` takes a submit's range jobs together, all or none. Reader ABI 2026101201.
+    No DeepSeek-V4.1 or MiMo measurement yet (GLM-5.3: +29 % decode).
+  - the rate tally (`expert_resident_ratio`, `expert_tally_window`, `expert_tally_file`; `sdk_ext.expert.tally`): per
+    expert an EMA of its decode routes, the top share pinned against the transition window, the rates carried in
+    ~/.mlx-stream/<arch>-<model dir>/expert-tally.bin. Off for DeepSeek-V4.1 by default (ratio 0: no tally, no file,
+    the plans of before); on at 0.5 for GLM-5.3, where it was measured. `expert_tally_file: pinned` reads the file and
+    never writes it, `off` keeps none: a cell's arms start from the same state.
+  - DeepSeek-V4.1's EXL3 kernel registry runs on the shared `sdk_ext/kernel_set.zig` (its refusals through
+    `bank_file`, the same message and error); its bill and module read the shared `phase_memory.zig` (value-identical);
+    `expert_wide_depth` honors every depth the stream takes (1 to 5; 3 and 4 were ignored before); the gate ring holds
+    512 gates of up to 768 tickets.
+  - opt-in reads straight into the slot rows (`expert_io.Options.direct`, no staging, no copy) for page-aligned ranges.
 - The plugin carries its own `sdk` module (sdk/: the arch contract, the weight loader, the reads past the page cache)
   and reaches mlx-serve only through `mlx_host`; mlx-serve calls the arch from one glue file. `HOST_PIN`, the
   conformance suite's host-registry test and the host test bridge's dependence on host internals are gone.

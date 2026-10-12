@@ -18,8 +18,9 @@ pub const Config = struct {
     /// beside it; owned by the host's config.
     expert_bank_dir: ?[]const u8 = null,
     engram_token_map_path: ?[]const u8 = null,
-    /// The expert stream's rate tally (`expert_resident_ratio`, `expert_tally_window`): every model's keys and defaults.
-    tally: sdk_ext.expert.tally.Settings = .{},
+    /// The expert stream's rate tally (`expert_resident_ratio`, `expert_tally_window`, `expert_tally_file`): off by
+    /// default (ratio 0) until a DeepSeek-V4.1 measurement shows it; its window and ratio were chosen on GLM-5.3's routes.
+    tally: sdk_ext.expert.tally.Settings = .{ .ratio = 0 },
     /// The prompt pass's bill for the prefill admission.
     dsv41_prefill: ?v41.PrefillBill = null,
     /// The shell's facts: routed experts and layers.

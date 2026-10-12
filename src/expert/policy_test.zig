@@ -804,6 +804,16 @@ test "expert policy: tally: the settings' defaults, their keys, and the values r
     try testing.expectEqual(@as(u32, 64), (try parse.of("{\"expert_tally_window\": 64}")).window);
     try testing.expectError(error.TallyWindowOutOfRange, (try parse.of("{\"expert_tally_window\": 0}")).check("test"));
     try testing.expectEqual(@as(u32, 32), (try parse.of("{\"expert_tally_window\": 2.5}")).window);
+    // The file's use: read and written by default, pinned (read only) or off for a cell; another name refused by name.
+    try testing.expect(d.readsFile() and d.writesFile());
+    const pinned = try parse.of("{\"expert_tally_file\": \"pinned\"}");
+    try testing.expect(pinned.readsFile() and !pinned.writesFile());
+    const off = try parse.of("{\"expert_tally_file\": \"off\"}");
+    try testing.expect(!off.readsFile() and !off.writesFile() and off.enabled());
+    try testing.expectError(error.TallyFileUnknown, (try parse.of("{\"expert_tally_file\": \"ro\"}")).check("test"));
+    // A ratio of 0 is no tally: nothing counted, no file read or written, whatever the file's setting.
+    const none = try parse.of("{\"expert_resident_ratio\": 0, \"expert_tally_file\": \"on\"}");
+    try testing.expect(!none.enabled() and !none.readsFile() and !none.writesFile());
     // GLM-5.3's EXL3 bank layers: 148 and 108 experts.
     try testing.expectEqual(@as(u32, 74), tally.pinLimit(0.5, 148));
     try testing.expectEqual(@as(u32, 54), tally.pinLimit(0.5, 108));

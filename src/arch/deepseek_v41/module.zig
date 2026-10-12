@@ -569,10 +569,12 @@ pub const Module = struct {
     gate: PhaseGate = .{},
     /// The shell's io (the phase change's bounded settle waits on it).
     io: std.Io = undefined,
-    /// The rate tally's file (null: none, as in test builds) and the rates each request's end writes to it.
+    /// The rate tally's file (null: none, as in test builds or under `expert_tally_file: off`) and the rates each request's
+    /// end folds in (empty: no tally, the default); `tally_write` whether that end writes the file (`pinned`: never).
     tally_path: ?[]u8 = null,
     tally_rates: []f32 = &.{},
     tally_window: u32 = 0,
+    tally_write: bool = false,
     /// The harness's route overrides the Module was built with (the bill reads the same ones).
     overrides: RouteOverrides = .{},
     /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
@@ -1050,8 +1052,10 @@ pub const Module = struct {
     }
 
     /// The rate tally's file read (`expert.tally`; the stream's tally seeded from it: the pins) and the rates its writes
-    /// start from. Test builds keep no file (their HOME is the box user's).
+    /// start from. Nothing without a tally (the default: ratio 0); no file under `expert_tally_file: off` or in test
+    /// builds (their HOME is the box user's).
     fn openTally(self: *Module, config: *const settings.Config) !void {
+        if (!config.tally.enabled()) return;
         const st = switch (self.arm) {
             inline else => |t| t.arm.stream,
         };
@@ -1066,7 +1070,8 @@ pub const Module = struct {
             self.tally_rates = &.{};
         }
         self.tally_window = config.tally.window;
-        if (builtin.is_test) return;
+        self.tally_write = config.tally.writesFile();
+        if (builtin.is_test or !config.tally.readsFile()) return;
         const key = try sdk_ext.expert.tally.keyOf(self.gpa, "deepseek_v41", config.expert_bank_dir orelse "model");
         defer self.gpa.free(key);
         self.tally_path = try sdk_ext.expert.tally.pathOf(self.gpa, key);
@@ -1078,7 +1083,7 @@ pub const Module = struct {
                 st.seedTally(r);
                 log.info("NATIVE expert tally: read {s}: the top {d} of each layer's experts by rate are pinned (window {d} routes)\n", .{ path, config.tally.ratio, config.tally.window });
             },
-            .missing => log.info("NATIVE expert tally: no file at {s}: this load plans as a first run, its requests' ends write it\n", .{path}),
+            .missing => log.info("NATIVE expert tally: no file at {s}: this load plans as a first run{s}\n", .{ path, if (self.tally_write) ", its requests' ends write it" else " (pinned: never written)" }),
             .mismatched => log.warn("NATIVE expert tally: {s} is not this stream's ({d} layers of {d} experts): ignored, this load plans as a first run\n", .{ path, n_layers, n_experts }),
         }
     }
@@ -1092,7 +1097,7 @@ pub const Module = struct {
         };
         const routed = st.endTally(self.tally_rates);
         const path = self.tally_path orelse return;
-        if (routed == 0) return;
+        if (routed == 0 or !self.tally_write) return;
         sdk_ext.expert.tally.write(self.gpa, self.io, path, self.tally_rates, @intCast(st.layers.len), st.bank.n_experts, self.tally_window) catch |e| {
             log.warn("NATIVE expert tally: not written to {s}: {s}\n", .{ path, @errorName(e) });
             return;
@@ -2227,7 +2232,8 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
         .lookahead = lookahead,
         .ceiling = ceiling,
         .wide_depth = config.dsv41WideDepth(),
-        .tally = .{ .ratio = config.tally.ratio, .window = config.tally.window },
+        // Off by default (ratio 0: no tally, as before it existed); on only where the model's settings ask for it.
+        .tally = if (config.tally.enabled()) .{ .ratio = config.tally.ratio, .window = config.tally.window } else null,
     };
 }
 

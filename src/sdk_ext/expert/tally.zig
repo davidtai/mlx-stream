@@ -3,7 +3,10 @@
 //! rest of the rows run the transition-window policy. The tally file carries the rates from one run to the next: the
 //! load reads it (the preload fills the prompt rows hottest first, and prefill evicts for pinned experts only), each
 //! request's end writes it. A first run with no file plans as the stream did before the tally. Every model the expert
-//! stream serves takes these two settings with these defaults; the file lives under ~/.mlx-stream/<model key>/.
+//! stream serves takes these settings; each arch sets its own default ratio (`Settings.ratio`): GLM-5.3 0.5, where it
+//! was measured; DeepSeek-V4.1 0, off until a DeepSeek-V4.1 measurement. A ratio of 0 is no tally at all: the stream
+//! gets none, nothing is counted, no file is read or written. The file lives under ~/.mlx-stream/<model key>/; a
+//! cell holds it fixed with `expert_tally_file` (`pinned`: read at the load, never written; `off`: no file).
 
 const std = @import("std");
 const log = @import("sdk").log;
@@ -32,14 +35,36 @@ pub const Header = extern struct {
     window: u32,
 };
 
-/// The model-settings.json keys: `expert_resident_ratio` (a number on [0, 1]) and `expert_tally_window` (an integer of at
-/// least 1 route). A value of another type is ignored (the default stays); a number outside its range is refused at
-/// load by name (`check`).
+/// The tally file's use (`expert_tally_file`): `on` reads it at the load and writes it at each request's end; `pinned`
+/// reads it and never writes it (a cell's arms all start from the same file); `off` neither reads nor writes one (the
+/// tally runs in the process alone, every load a first run).
+pub const File = enum { on, pinned, off };
+
+/// The model-settings.json keys: `expert_resident_ratio` (a number on [0, 1]), `expert_tally_window` (an integer of at
+/// least 1 route) and `expert_tally_file` ("on", "pinned" or "off"). A value of another type is ignored (the default
+/// stays); a number outside its range, or another name, is refused at load by name (`check`).
 pub const Settings = struct {
     ratio: f64 = default_ratio,
     window: u32 = default_window,
+    file: File = .on,
     ratio_out_of_range: ?f64 = null,
     window_out_of_range: ?i64 = null,
+    file_unknown: bool = false,
+
+    /// Whether the stream keeps a tally at all: a ratio of 0 pins nothing, so nothing is counted either.
+    pub fn enabled(s: Settings) bool {
+        return s.ratio > 0;
+    }
+
+    /// Whether the load reads the tally file.
+    pub fn readsFile(s: Settings) bool {
+        return s.enabled() and s.file != .off;
+    }
+
+    /// Whether each request's end writes the tally file.
+    pub fn writesFile(s: Settings) bool {
+        return s.enabled() and s.file == .on;
+    }
 
     /// The keys of one model's settings object; returns whether either was present.
     pub fn apply(s: *Settings, obj: std.json.ObjectMap) bool {
@@ -59,11 +84,15 @@ pub const Settings = struct {
             if (v.integer >= 1 and v.integer <= std.math.maxInt(u32)) s.window = @intCast(v.integer) else s.window_out_of_range = v.integer;
             any = true;
         };
+        if (obj.get("expert_tally_file")) |v| if (v == .string) {
+            if (std.meta.stringToEnum(File, v.string)) |f| s.file = f else s.file_unknown = true;
+            any = true;
+        };
         return any;
     }
 
     /// The load's refusal of an impossible value, by name (`arch` prefixes the line).
-    pub fn check(s: Settings, comptime arch: []const u8) error{ ResidentRatioOutOfRange, TallyWindowOutOfRange }!void {
+    pub fn check(s: Settings, comptime arch: []const u8) error{ ResidentRatioOutOfRange, TallyWindowOutOfRange, TallyFileUnknown }!void {
         if (s.ratio_out_of_range) |r| {
             log.warn(arch ++ ": load refused: expert_resident_ratio {d} is outside [0, 1] (ResidentRatioOutOfRange)\n", .{r});
             return error.ResidentRatioOutOfRange;
@@ -71,6 +100,10 @@ pub const Settings = struct {
         if (s.window_out_of_range) |w| {
             log.warn(arch ++ ": load refused: expert_tally_window {d} is not a whole number of routes of at least 1 (TallyWindowOutOfRange)\n", .{w});
             return error.TallyWindowOutOfRange;
+        }
+        if (s.file_unknown) {
+            log.warn(arch ++ ": load refused: expert_tally_file names none of on, pinned, off (TallyFileUnknown)\n", .{});
+            return error.TallyFileUnknown;
         }
     }
 };

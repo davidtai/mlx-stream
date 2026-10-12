@@ -323,7 +323,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
                 .keep_residents = true,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
-                .tally = .{ .ratio = cfg.tally.ratio, .window = cfg.tally.window, .layer_experts = layer_experts },
+                .tally = if (cfg.tally.enabled()) .{ .ratio = cfg.tally.ratio, .window = cfg.tally.window, .layer_experts = layer_experts } else null,
             });
             errdefer self.stream.deinit();
             try self.openTally(dir);
@@ -463,14 +463,16 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         }
 
         /// The rate tally's file read (the load seeds the stream's tally from it: the preload's order and the pins) and the
-        /// rates its writes start from. Test builds keep no file (their HOME is the box user's).
+        /// rates its writes start from. Nothing at ratio 0 (no tally); no file under `expert_tally_file: off` or in test
+        /// builds (their HOME is the box user's).
         fn openTally(self: *Self, dir: []const u8) !void {
+            if (!self.cfg.tally.enabled()) return;
             const n_layers: u32 = @intCast(self.bank.layers.len);
             const n_experts: u32 = self.bank.n_experts;
             self.tally_rates = try self.gpa.alloc(f32, @as(usize, n_layers) * n_experts);
             @memset(self.tally_rates, 0);
             errdefer self.closeTally();
-            if (builtin.is_test) return;
+            if (builtin.is_test or !self.cfg.tally.readsFile()) return;
             const key = try expert_tally.keyOf(self.gpa, "glm_moe_dsa", dir);
             defer self.gpa.free(key);
             self.tally_path = try expert_tally.pathOf(self.gpa, key);
@@ -485,7 +487,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                     self.stream.seedTally(r);
                     log.info("glm_moe_dsa: expert tally: read {s}: the preload fills the prompt rows hottest first, and the top {d} of each layer's experts by rate are pinned (window {d} routes)\n", .{ path, self.cfg.tally.ratio, self.cfg.tally.window });
                 },
-                .missing => log.info("glm_moe_dsa: expert tally: no file at {s}: this load plans as a first run (ratio {d}, window {d} routes), its requests' ends write it\n", .{ path, self.cfg.tally.ratio, self.cfg.tally.window }),
+                .missing => log.info("glm_moe_dsa: expert tally: no file at {s}: this load plans as a first run (ratio {d}, window {d} routes){s}\n", .{ path, self.cfg.tally.ratio, self.cfg.tally.window, if (self.cfg.tally.writesFile()) ", its requests' ends write it" else " (pinned: never written)" }),
                 .mismatched => log.warn("glm_moe_dsa: expert tally: {s} is not this stream's ({d} layers of {d} experts, version {d}): ignored, this load plans as a first run\n", .{ path, n_layers, n_experts, expert_tally.version }),
             }
         }
@@ -493,16 +495,17 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         fn closeTally(self: *Self) void {
             if (self.tally_path) |p| self.gpa.free(p);
             self.tally_path = null;
-            self.gpa.free(self.tally_rates);
+            if (self.tally_rates.len > 0) self.gpa.free(self.tally_rates);
             self.tally_rates = &.{};
         }
 
         /// The request's end for the tally: each stream layer's decode rates folded in (the tally pins from now on), the
         /// file written. A failure is logged; the request is not failed.
         fn endTally(self: *Self) void {
+            if (self.tally_rates.len == 0) return;
             const routed = self.stream.endTally(self.tally_rates);
             const path = self.tally_path orelse return;
-            if (routed == 0) return;
+            if (routed == 0 or !self.cfg.tally.writesFile()) return;
             expert_tally.write(self.gpa, self.io, path, self.tally_rates, @intCast(self.bank.layers.len), self.bank.n_experts, self.cfg.tally.window) catch |e| {
                 log.warn("glm_moe_dsa: expert tally: not written to {s}: {s}\n", .{ path, @errorName(e) });
                 return;
