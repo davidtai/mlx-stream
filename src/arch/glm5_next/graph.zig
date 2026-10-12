@@ -625,6 +625,14 @@ pub const Routing = struct { indices: T, weights: T };
 /// Prefill host idle (g21c profile: the dense stage's GPU idle, ~5-7 ms a routed layer while the host built the 16 spans'
 /// collapse and norm graphs with nothing committed): a prompt call's span collapse and norm committed as built. The same
 /// graph and values, only the commit point moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+/// Decode host idle (g21c profile, 684 of 1,024 serial forwards: 5.7 ms a forward of GPU idle inside call -> barrier,
+/// while the host built each routed layer's attention, glue and router with nothing committed after the previous layer's
+/// miss parts): a decode-lane layer's attention output committed as built. The same graph and values, only the commit
+/// point moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+pub fn commitAttention(comptime Ops: type, g: *Ops, out: Ops.T) !void {
+    try g.asyncEval(&.{out});
+}
+
 pub fn commitSpanNorm(comptime Ops: type, g: *Ops, normed: Ops.T) !void {
     try g.asyncEval(&.{normed});
 }
@@ -963,6 +971,9 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
                 try routes.kda.run(routes.kda.ctx, g, c, kw, pa.normed, &cache.kda[lw.slot]),
             .dsa => |*dw| try dsa.forward(g, c, dw, pa.normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes.dsa),
         };
+        // Decode host idle: the attention sublayer committed as built (the GPU runs it while the host builds the FFN's
+        // glue and router up to the routing barrier).
+        try commitAttention(G, g, out);
         pend = Pending.of(g, out, pa.post, pa.comb, stream);
         // The FFN sublayer: the attention's expand folded into its collapse and norm.
         const pf = try glue.pre(g, k, null, &pend.?.deferred, lw.hc_ffn.fn_rows, lw.hc_ffn.scale, lw.hc_ffn.base, lw.post_norm);
@@ -1070,6 +1081,19 @@ test "glm5_next graph: prompt lever 4 commits the routing barrier's ids and weig
     try testing.expectEqualSlices(Trace.T, &.{shared}, g.committed.items[g.commit_spans.items[1][0]..g.commit_spans.items[1][1]]);
     // Only the two commit markers: no node of a graph is built or evaluated here.
     try testing.expectEqual(nodes + 2, g.nodes.items.len);
+    try testing.expectEqual(@as(usize, 0), g.evals.items.len);
+}
+
+test "glm5_next graph: decode host idle commits a layer's attention output alone, as built (one commit; nothing evaluated)" {
+    const Trace = ops_be.TraceOps;
+    var g = Trace.init(testing.allocator);
+    defer g.deinit();
+    const out = try g.input(&.{ 1, 1, 4096 }, .bfloat16);
+    const nodes = g.nodes.items.len;
+    try commitAttention(Trace, &g, out);
+    try testing.expectEqual(@as(usize, 1), g.commit_spans.items.len);
+    try testing.expectEqualSlices(Trace.T, &.{out}, g.committed.items[g.commit_spans.items[0][0]..g.commit_spans.items[0][1]]);
+    try testing.expectEqual(nodes + 1, g.nodes.items.len);
     try testing.expectEqual(@as(usize, 0), g.evals.items.len);
 }
 
