@@ -1,17 +1,19 @@
 //! GLM-5.3-Flash's routed experts as an NVFP4 expert bank: `experts.bin` beside `expert-manifest.json`, the pack's
 //! ModelOpt NVFP4 bytes copied as they are into MLX's nvfp4 layout (group 16, bits 4).
 //!
-//! One record per (MoE layer, expert), nine components back to back in this order:
-//!   gate gu span:  gate_proj.weight  U32 [inter, hidden / 8]   E2M1 codes, element j of a word in bits 4 * (j % 8)
+//! One record per (MoE layer, expert) in the `nvfp4-gud-9part` layout (the converter's, docs/glm5-next-pack.md): nine
+//! parts back to back, per projection (gate, up, down) its words, its scales and its global scale:
+//!   gate/up span:  gate_proj.weight  U32 [inter, hidden / 8]   E2M1 codes, element j of a word in bits 4 * (j % 8)
 //!                  gate_proj.scales  U8  [inter, hidden / 16]  E4M3 block scales, one per 16 inputs
-//!                  up_proj.weight, up_proj.scales              as gate's
-//!                  gate_proj.global_scale, up_proj.global_scale  F32 []
+//!                  gate_proj.global_scale  F32 []
+//!                  up_proj.weight, up_proj.scales, up_proj.global_scale  as gate's
 //!   down span:     down_proj.weight  U32 [hidden, inter / 8], down_proj.scales U8 [hidden, inter / 16],
 //!                  down_proj.global_scale F32 []
 //! A global scale is the f32 MLX's nvfp4 takes (`g`, the tensor's amax: ModelOpt's weight_scale_2 x 2688, so that
 //! g / 2688 == weight_scale_2 in f32). Each projection's global scale sits in the span its weights do, so a slot's
 //! scale lands with the bytes its wave waits for (the stream's event gates cover a span, not a record). Records start
-//! every `record_bytes` (the components' `logical_bytes` rounded up to a page); the padding is never read. The stream
+//! every `record_bytes` here (the manifest's `record_stride`: the parts' bytes, here `logical_bytes` and the manifest's
+//! `record_bytes`, rounded up to a page); the padding is never read. The stream
 //! scatters each component into its own slot array: a global scale's is f32 [rows], the array MLX's gather_qmm takes
 //! as its per-expert global scale.
 //!
@@ -35,12 +37,14 @@ pub const bits = 4;
 pub const page = 4096;
 pub const Records = sdk_ext.expert.Records(n_components, gu_components);
 pub const Dtype = enum { U32, U8, F32 };
+/// The record's layout name in the manifest (`layout`).
+pub const layout = "nvfp4-gud-9part";
 pub const Component = enum(u8) {
     gate_weight,
     gate_scales,
+    gate_global_scale,
     up_weight,
     up_scales,
-    gate_global_scale,
     up_global_scale,
     down_weight,
     down_scales,
@@ -49,8 +53,8 @@ pub const Component = enum(u8) {
         return names[@backingInt(c)];
     }
     const names = [_][]const u8{
-        "gate_proj.weight",       "gate_proj.scales",     "up_proj.weight",   "up_proj.scales",          "gate_proj.global_scale",
-        "up_proj.global_scale",   "down_proj.weight",     "down_proj.scales", "down_proj.global_scale",
+        "gate_proj.weight",     "gate_proj.scales", "gate_proj.global_scale", "up_proj.weight",         "up_proj.scales",
+        "up_proj.global_scale", "down_proj.weight", "down_proj.scales",       "down_proj.global_scale",
     };
 };
 /// A component's place in the record; `rank` 0 is a scalar (its slot array is [rows]).
@@ -78,8 +82,8 @@ pub const BankArrays = BankArraysOf(mlx.mlx_array);
 
 pub fn bankArraysOf(arrays: [n_components]mlx.mlx_array) BankArrays {
     return .{
-        .gate = .{ .w = arrays[0], .scales = arrays[1], .global_scale = arrays[4] },
-        .up = .{ .w = arrays[2], .scales = arrays[3], .global_scale = arrays[5] },
+        .gate = .{ .w = arrays[0], .scales = arrays[1], .global_scale = arrays[2] },
+        .up = .{ .w = arrays[3], .scales = arrays[4], .global_scale = arrays[5] },
         .down = .{ .w = arrays[6], .scales = arrays[7], .global_scale = arrays[8] },
     };
 }
@@ -200,9 +204,8 @@ pub const Geometry = struct {
             const c = @backingInt(w);
             place(&g.segments[c], &off, .U32, 2, .{ inter, hidden / 8 }, inter * hidden / 2);
             place(&g.segments[c + 1], &off, .U8, 2, .{ inter, hidden / group_size }, inter * hidden / group_size);
+            place(&g.segments[c + 2], &off, .F32, 0, .{ 0, 0 }, 4);
         }
-        place(&g.segments[@backingInt(Component.gate_global_scale)], &off, .F32, 0, .{ 0, 0 }, 4);
-        place(&g.segments[@backingInt(Component.up_global_scale)], &off, .F32, 0, .{ 0, 0 }, 4);
         g.gate_up_bytes = off;
         place(&g.segments[@backingInt(Component.down_weight)], &off, .U32, 2, .{ hidden, inter / 8 }, hidden * inter / 2);
         place(&g.segments[@backingInt(Component.down_scales)], &off, .U8, 2, .{ hidden, inter / group_size }, hidden * inter / group_size);
@@ -226,20 +229,26 @@ pub const Geometry = struct {
     }
 };
 
+/// The manifest the converter writes (scripts/convert_glm5next_nvfp4.py, docs/glm5-next-pack.md): `record_bytes` the
+/// parts' bytes (`Geometry.logical_bytes`), `record_stride` the records' stride (`Geometry.record_bytes`), `parts` the
+/// nine parts in record order.
 const Manifest = struct {
     format: []const u8,
     data_file: []const u8,
+    layout: []const u8,
+    alignment: u64,
     hidden_size: u64,
     intermediate_size: u64,
     num_experts: u64,
     first_moe_layer: u64,
     num_moe_layers: u64,
     record_bytes: u64,
-    logical_bytes: u64,
+    record_stride: u64,
     gate_up_bytes: u64,
+    down_bytes: u64,
     quantization: struct { mode: []const u8, bits: u32, group_size: u32 },
     source: struct { repository: []const u8, revision: []const u8 },
-    segments: []const struct { name: []const u8, dtype: []const u8, shape: []const u64, offset: u64, length: u64 },
+    parts: []const struct { name: []const u8, dtype: []const u8, shape: []const u64, offset: u64, length: u64 },
     records: []const struct { layer: u64, expert: u64, offset: u64, length: u64, sha256: []const u8 },
     output_files: std.json.Value,
 };
@@ -259,12 +268,12 @@ pub const Bank = struct {
         const parsed = try std.json.parseFromSlice(Manifest, a, text, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const m = parsed.value;
-        if (!std.mem.eql(u8, m.format, format) or !std.mem.eql(u8, m.data_file, "experts.bin")) return error.InvalidFormat;
+        if (!std.mem.eql(u8, m.format, format) or !std.mem.eql(u8, m.data_file, "experts.bin") or !std.mem.eql(u8, m.layout, layout) or m.alignment != page) return error.InvalidFormat;
         if (!std.mem.eql(u8, m.quantization.mode, "nvfp4") or m.quantization.bits != bits or m.quantization.group_size != group_size) return error.InvalidQuantization;
         const g = try Geometry.init(m.hidden_size, m.intermediate_size, m.num_experts, m.first_moe_layer, m.num_moe_layers);
-        if (m.record_bytes != g.record_bytes or m.logical_bytes != g.logical_bytes or m.gate_up_bytes != g.gate_up_bytes) return error.InvalidGeometry;
-        if (m.segments.len != n_components) return error.InvalidSegment;
-        for (m.segments, g.segments, 0..) |got, want, i| {
+        if (m.record_stride != g.record_bytes or m.record_bytes != g.logical_bytes or m.gate_up_bytes != g.gate_up_bytes or m.down_bytes != g.logical_bytes - g.gate_up_bytes) return error.InvalidGeometry;
+        if (m.parts.len != n_components) return error.InvalidSegment;
+        for (m.parts, g.segments, 0..) |got, want, i| {
             const component: Component = @fromBackingInt(@intCast(i));
             if (!std.mem.eql(u8, got.name, component.name()) or !std.mem.eql(u8, got.dtype, @tagName(want.dtype)) or
                 !std.mem.eql(u64, got.shape, want.shape[0..want.rank]) or got.offset != want.offset or got.length != want.length)
@@ -413,8 +422,10 @@ test "glm5_next nvfp4 bank: Flash's record keeps every projection's global scale
         try testing.expectEqual(@as(u8, 0), s.rank);
         try testing.expectEqual(@as(u64, 4), s.length);
     }
-    // The gate and up scales lie in the gate/up span; down's in the down span.
-    try testing.expect(g.segments[4].offset + 4 <= g.gate_up_bytes and g.segments[5].offset + 4 == g.gate_up_bytes);
+    // The gate and up global scales lie in the gate/up span (each after its projection's scales); down's in the down span.
+    try testing.expect(g.segments[2].offset + 4 <= g.gate_up_bytes and g.segments[5].offset + 4 == g.gate_up_bytes);
+    try testing.expectEqual(@as(u64, 4_718_592), g.segments[2].offset);
+    try testing.expectEqual(@as(u64, 4_718_596), g.segments[3].offset);
     try testing.expect(g.segments[8].offset >= g.gate_up_bytes and g.segments[8].offset + 4 == g.logical_bytes);
     // The components are back to back (the reader's scatter).
     var off: u64 = 0;
@@ -451,7 +462,7 @@ test "glm5_next nvfp4 SDK bank: nine ranked components, records at the page stri
     try testing.expectEqual(g.recordOffset(3, 7), b.recordOffset(0, 7));
     try testing.expectEqual(g.recordOffset(44, 287), b.recordOffset(1, 287));
     try testing.expectEqual(g.recordOffset(44, 287) + g.gate_up_bytes, b.spans(1, 287).down_offset);
-    try testing.expectEqual(mlx.mlx_dtype.float32, mlxDtype(layers[0].segments[4].dtype));
+    try testing.expectEqual(mlx.mlx_dtype.float32, mlxDtype(layers[0].segments[2].dtype));
     var owner = try Bank.parse(testing.allocator, fixture);
     defer owner.deinit();
     try testing.expectError(error.SidecarNotOpen, SDKBank.init(testing.allocator, &owner));
@@ -469,9 +480,10 @@ test "glm5_next nvfp4 bank: the manifest's topology, components and record place
     for ([_]Case{
         .{ .from = "\"nvfp4\"", .to = "\"mxfp4\"", .err = error.InvalidQuantization },
         .{ .from = "\"group_size\":16", .to = "\"group_size\":32", .err = error.InvalidQuantization },
-        .{ .from = "\"record_bytes\":4096", .to = "\"record_bytes\":3468", .err = error.InvalidGeometry },
+        .{ .from = "\"record_stride\":4096", .to = "\"record_stride\":3468", .err = error.InvalidGeometry },
+        .{ .from = "\"layout\":\"nvfp4-gud-9part\"", .to = "\"layout\":\"nvfp4-9part\"", .err = error.InvalidFormat },
         .{ .from = "\"name\":\"up_proj.global_scale\"", .to = "\"name\":\"down_proj.global_scale\"", .err = error.InvalidSegment },
-        .{ .from = "\"dtype\":\"F32\",\"shape\":[],\"offset\":2304", .to = "\"dtype\":\"F16\",\"shape\":[],\"offset\":2304", .err = error.InvalidSegment },
+        .{ .from = "\"dtype\":\"F32\",\"shape\":[],\"offset\":1152", .to = "\"dtype\":\"F16\",\"shape\":[],\"offset\":1152", .err = error.InvalidSegment },
         .{ .from = "\"offset\":4096,\"length\":3468", .to = "\"offset\":3468,\"length\":3468", .err = error.InvalidRecord },
         .{ .from = "\"format\":\"mlx-stream-nvfp4-expert-bank-v1\"", .to = "\"format\":\"mlx-stream-mxfp4-expert-bank-v1\"", .err = error.InvalidFormat },
     }) |c| {
@@ -504,16 +516,16 @@ test "glm5_next nvfp4 decoder: E4M3 and E2M1 as MLX reads them, the group scale 
 
 /// A tiny bank's manifest: hidden 64, inter 32, two experts of MoE layer 3; logical 3,468 B, records every page.
 const fixture =
-    \\{"format":"mlx-stream-nvfp4-expert-bank-v1","data_file":"experts.bin",
+    \\{"format":"mlx-stream-nvfp4-expert-bank-v1","data_file":"experts.bin","layout":"nvfp4-gud-9part","alignment":4096,
     \\"hidden_size":64,"intermediate_size":32,"num_experts":2,"first_moe_layer":3,"num_moe_layers":1,
-    \\"record_bytes":4096,"logical_bytes":3468,"gate_up_bytes":2312,"quantization":{"mode":"nvfp4","bits":4,"group_size":16},
+    \\"record_bytes":3468,"record_stride":4096,"gate_up_bytes":2312,"down_bytes":1156,"quantization":{"mode":"nvfp4","bits":4,"group_size":16},
     \\"source":{"repository":"fixture","revision":"0123456789012345678901234567890123456789"},
-    \\"segments":[
+    \\"parts":[
     \\{"name":"gate_proj.weight","dtype":"U32","shape":[32,8],"offset":0,"length":1024},
     \\{"name":"gate_proj.scales","dtype":"U8","shape":[32,4],"offset":1024,"length":128},
-    \\{"name":"up_proj.weight","dtype":"U32","shape":[32,8],"offset":1152,"length":1024},
-    \\{"name":"up_proj.scales","dtype":"U8","shape":[32,4],"offset":2176,"length":128},
-    \\{"name":"gate_proj.global_scale","dtype":"F32","shape":[],"offset":2304,"length":4},
+    \\{"name":"gate_proj.global_scale","dtype":"F32","shape":[],"offset":1152,"length":4},
+    \\{"name":"up_proj.weight","dtype":"U32","shape":[32,8],"offset":1156,"length":1024},
+    \\{"name":"up_proj.scales","dtype":"U8","shape":[32,4],"offset":2180,"length":128},
     \\{"name":"up_proj.global_scale","dtype":"F32","shape":[],"offset":2308,"length":4},
     \\{"name":"down_proj.weight","dtype":"U32","shape":[64,4],"offset":2312,"length":1024},
     \\{"name":"down_proj.scales","dtype":"U8","shape":[64,2],"offset":3336,"length":128},

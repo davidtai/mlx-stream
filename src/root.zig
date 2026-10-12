@@ -3,7 +3,6 @@
 //! and GLM-5.3 over the same expert reader. Built only where the macOS-only sources are. The module imports its own
 //! `sdk` (sdk/) and the host's `mlx_host`.
 
-
 pub const plugin = sdk.Plugin{
     .name = "mlx-stream",
     .api = .{ .major = 2, .minor = 1 },
@@ -39,6 +38,15 @@ pub const glm = struct {
     pub const arch = @import("arch/glm_moe_dsa/plugin.zig");
     pub const default_context: u64 = @import("phase_memory.zig").fill_prompt_tokens;
     pub const generation_headroom: u64 = @import("arch/glm_moe_dsa/settings.zig").Config.default_max_output;
+};
+
+/// What the host's glue calls for the fourth arch: GLM-5.3-Flash (`glm5_next`, the NVFP4 pack): its entry points, the
+/// context a load bills when the model sets none (the standard request: 16,384 prompt tokens and 1,024 generated) and
+/// the positions a request may generate past it (none: the context holds the generation, as MiMo's does).
+pub const glm5_next = struct {
+    pub const arch = @import("arch/glm5_next/root.zig");
+    pub const default_context: u64 = @import("arch/glm5_next/settings.zig").fill_reserve_tokens;
+    pub const generation_headroom: u64 = 0;
 };
 
 /// What the host's tests read of the package, reached through the registry (`plugins.mlx_stream_testing`, null when a

@@ -55,8 +55,8 @@ const Synth = struct {
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(a);
         try text.print(a, "{{\"format\":\"{s}\",\"data_file\":\"experts.bin\",\"hidden_size\":{d},\"intermediate_size\":{d},\"num_experts\":{d},\"first_moe_layer\":{d},\"num_moe_layers\":{d},", .{ bank.format, hidden, inter, experts, first, layers });
-        try text.print(a, "\"record_bytes\":{d},\"logical_bytes\":{d},\"gate_up_bytes\":{d},\"quantization\":{{\"mode\":\"nvfp4\",\"bits\":4,\"group_size\":16}},", .{ g.record_bytes, g.logical_bytes, g.gate_up_bytes });
-        try text.appendSlice(a, "\"source\":{\"repository\":\"synthetic\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\"},\"segments\":[");
+        try text.print(a, "\"layout\":\"{s}\",\"alignment\":{d},\"record_bytes\":{d},\"record_stride\":{d},\"gate_up_bytes\":{d},\"down_bytes\":{d},\"quantization\":{{\"mode\":\"nvfp4\",\"bits\":4,\"group_size\":16}},", .{ bank.layout, bank.page, g.logical_bytes, g.record_bytes, g.gate_up_bytes, g.logical_bytes - g.gate_up_bytes });
+        try text.appendSlice(a, "\"source\":{\"repository\":\"synthetic\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\"},\"parts\":[");
         for (g.segments, 0..) |s, c| {
             try text.print(a, "{s}{{\"name\":\"{s}\",\"dtype\":\"{t}\",\"shape\":[", .{ if (c == 0) "" else ",", @as(Component, @fromBackingInt(@intCast(c))).name(), s.dtype });
             for (s.shape[0..s.rank], 0..) |d, k| try text.print(a, "{s}{d}", .{ if (k == 0) "" else ",", d });
