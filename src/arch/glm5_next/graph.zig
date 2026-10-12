@@ -622,6 +622,13 @@ pub const Routing = struct { indices: T, weights: T };
 /// (~15 ms a layer in the profile), so the call's plans and reads start that much sooner in a drive-bound MoE stage; the
 /// GPU runs the shared expert behind the router, ahead of the first group's tiles. The same graphs and values, only the
 /// commit order moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+/// Prefill host idle (g21c profile: the dense stage's GPU idle, ~5-7 ms a routed layer while the host built the 16 spans'
+/// collapse and norm graphs with nothing committed): a prompt call's span collapse and norm committed as built. The same
+/// graph and values, only the commit point moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+pub fn commitSpanNorm(comptime Ops: type, g: *Ops, normed: Ops.T) !void {
+    try g.asyncEval(&.{normed});
+}
+
 pub fn commitRoutingFirst(comptime Ops: type, g: *Ops, indices: Ops.T, weights: Ops.T, shared: Ops.T) !void {
     try g.asyncEval(&.{ indices, weights });
     try g.asyncEval(&.{shared});
@@ -829,6 +836,9 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             cl.* = try ops.collapse(g.s, sp, lw.hc_ffn.fn_rows, lw.hc_ffn.scale, lw.hc_ffn.base, c.hc_iters, c.hc_eps, c.rms_norm_eps);
             n_cols += 1;
             nx.* = try rmsNorm(g, cl.x, lw.post_norm, c.rms_norm_eps);
+            // Prefill host idle: a prompt call commits each span's collapse and norm as built (the GPU runs them while
+            // the host builds the next span's), as the attention loop commits its spans; decode stays lazy.
+            if (prompt) try commitSpanNorm(G, g, nx.*);
         }
         const x = try g.reshape(if (n_spans == 1) normed[0] else try g.concat(normed, 1), &.{ @intCast(rows), hidden });
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, x, rows) else try mlpDecode(g, c, d, x, routes.swiglu, .dense, rows)) else blk: {
@@ -1060,6 +1070,19 @@ test "glm5_next graph: prompt lever 4 commits the routing barrier's ids and weig
     try testing.expectEqualSlices(Trace.T, &.{shared}, g.committed.items[g.commit_spans.items[1][0]..g.commit_spans.items[1][1]]);
     // Only the two commit markers: no node of a graph is built or evaluated here.
     try testing.expectEqual(nodes + 2, g.nodes.items.len);
+    try testing.expectEqual(@as(usize, 0), g.evals.items.len);
+}
+
+test "glm5_next graph: prefill host idle commits a span's collapse and norm alone, as built (one commit; nothing evaluated)" {
+    const Trace = ops_be.TraceOps;
+    var g = Trace.init(testing.allocator);
+    defer g.deinit();
+    const normed = try g.input(&.{ 1, 1024, 4096 }, .bfloat16);
+    const nodes = g.nodes.items.len;
+    try commitSpanNorm(Trace, &g, normed);
+    try testing.expectEqual(@as(usize, 1), g.commit_spans.items.len);
+    try testing.expectEqualSlices(Trace.T, &.{normed}, g.committed.items[g.commit_spans.items[0][0]..g.commit_spans.items[0][1]]);
+    try testing.expectEqual(nodes + 1, g.nodes.items.len);
     try testing.expectEqual(@as(usize, 0), g.evals.items.len);
 }
 
