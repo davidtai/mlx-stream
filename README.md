@@ -62,9 +62,6 @@ Compact caches concatenate each slot's actual code capacity instead of padding a
 U64 descriptors carry code-word offsets and logical rates; immutable slot capacities bound every refill.
 Persistent and transient arenas, descriptor arrays, growth and construction peaks are billed from those capacities.
 Only settled slots enter the device lookup table; the missing-slot sentinel is distinct from the valid slot zero.
-Compact decode selects each expert's bit width once and shares packed-weight decoding across up to three rows
-that select the same expert. Direct and three-bank GEMVs use two-tile loop unrolling without changing F32
-accumulation or reduction order or adding kernel launches. Fixed-layout K3 and prefill kernels are unchanged.
 
 The six prior microbenchmark wins are kept as revalidation artifacts, not installed engine wins. The repair
 baseline contains their reverted texts. Their previous combined engine gain was 0.16%, below the promotion gate;
@@ -75,6 +72,11 @@ matched. Its nominal median decode gain was 5.31%, but baseline drift was 11.13%
 sample regressed, so the throughput gate rejected it. A clean owned-server attach trace recorded
 6,440 enclosing compact/banked shader samples; those do not prove execution of the conditional or
 ambiguous changed paths. The changed-path dispatch gate also rejected it. No saved delta is promoted.
+After the uniform-stock submission restoration, the source07 saved-six candidate was measured
+again against its own source-attested hybrid baseline. Exact output/usage matched; the nominal
+median gain was 3.54%, but baseline drift was 5.27% and two matched samples regressed (-3.82% and
+-2.27%). A clean warmed attach capture recorded 6,006 positive enclosing samples, without proving
+the changed conditional/helper paths. Throughput and changed-path gates reject this batch too.
 The `mul1h_rate` header composes the unchanged stock K3 header with a separately hash-pinned addendum.
 
 #### Stock 3.0 review measurement — acceptance pending
@@ -125,6 +127,14 @@ uses four actual uncached 16K requests before short timing in every ABBA arm, in
 short matched decode differences reach -15.70%, despite its low short baseline drift. The setup
 still does not establish performance neutrality or a causal attribution to the repair; no guard
 is relaxed and no optimization is promoted.
+The source07 repaired-stock Auto comparison also completes with all four original measured ABBA
+arms, 24 measured long requests and 16 conditioning requests retained. Its original deadline
+expired during candidate profiling; after explicit completion authorization, only that missing
+capture and independent host-only proof were completed, with zero timing requests repeated.
+Output/usage/hashes, sampled stock shader sets, clean owned profiling and exact same-facts
+admission pass. Performance neutrality remains rejected: code/count baseline drift is 7.96%/9.84%;
+the worst matched prefill and short-decode differences are -10.76%/-10.17%. Original timeout
+receipts remain separate from the completed rejection decision.
 Owned-server profiling now warms for 192 tokens before attaching Instruments, then captures 32
 tokens. Both conditioned stock captures save/drain cleanly with matching sampled shader sets.
 A separate actual hybrid capture records 6,407 positive enclosing compact/banked samples, exact

@@ -44,6 +44,15 @@
   save before target drain with exact output/usage parity and released GPU leases. Hybrid proof
   distinguishes positive enclosing samples from unproven changed-helper execution; promotion
   guards remain unchanged.
+- Complete the source07 repaired-stock Auto decision from its four witnessed ABBA arms after the
+  old deadline expired during candidate profiling. Only the missing capture and host admission
+  proof are continued; no timing request is repeated. Correctness/dispatch/admission pass,
+  performance neutrality remains rejected, and original timeout receipts are retained.
+- Revalidate saved six deltas on source07's actual hybrid engine: nominal +3.54%, but two matched
+  regressions and 5.27% baseline drift fail throughput acceptance. Warmed enclosing shader samples
+  do not prove changed-helper execution. The saved deltas remain excluded.
+- Drop the obsolete `row_costs`/`decode_base_rows` SDK proposal; mixed EXL3 support uses the
+  merged SDK contract and does not require a separate all-plugin API migration.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the
