@@ -52,8 +52,18 @@ const G = graph.G;
 const Stats = sdk_ext.expert.Stats;
 const LayerCounts = sdk_ext.expert.LayerCounts;
 
-/// The decode lookahead: the next routed layer's top-8 candidates (its records per call: `expert_lookahead_budget`).
+/// The decode lookahead: the next routed layer's top-8 candidates, each kept when its score is at least its row's 8th
+/// score plus the layer's margin (`lookaheadTau`), at most `expert_lookahead_budget` records a call (the slots' bound).
 pub const lookahead: struct { k: u32 = 8 } = .{};
+/// The margins in the router's criterion (sigmoid + bias) for routed layers 25-49 and the rest: at the four-record cap they cover today's misses with 25 % fewer vain bytes and 5.4 % fewer bytes in 25-49 (pregate traces 7ab0f4b, seeds 1234 and 4321, cap 96).
+pub const lookahead_margin: struct { first: u32 = 25, last: u32 = 49, inner: f32 = 0.006, outer: f32 = 0.004 } = .{};
+
+/// The selector's tau for reading ahead routed layer `next`: minus its margin (the selector keeps a score at least the
+/// row's 8th score minus tau).
+pub fn lookaheadTau(next: u32) f32 {
+    const m = lookahead_margin;
+    return -(if (next >= m.first and next <= m.last) m.inner else m.outer);
+}
 /// A gate whose bytes never land is forced after this (and fails the stream).
 pub const event_watchdog_ms: u32 = 2000;
 /// The chunk-major prompt pass's chunk (`layer_major_prefill` off).
@@ -320,7 +330,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .staging_from_bank = true,
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
                 .pool = .{ .workers = shape.workers, .tickets = bill_mod.pool_tickets_per_mini * Bk.Stream.maxMinis(&self.bank), .direct = true },
-                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
+                .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget(), .tau_of = lookaheadTau },
                 .keep_residents = true,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
                 .tally = .{ .ratio = cfg.tally.ratio, .window = cfg.tally.window, .layer_experts = layer_experts },
@@ -1581,4 +1591,42 @@ test "glm residents: the constructed module holds every resident in its own MLX 
         n += 1;
     }
     try testing.expect(n > 0);
+
+test "glm lookahead: a candidate is kept at its row's 8th score plus the margin (0.006 in routed layers 25-49, 0.004 elsewhere), at most the four records the slots hold" {
+    const la = sdk_ext.expert.lookahead;
+    try testing.expectEqual(@as(f32, -0.004), lookaheadTau(0));
+    try testing.expectEqual(@as(f32, -0.004), lookaheadTau(24));
+    try testing.expectEqual(@as(f32, -0.006), lookaheadTau(25));
+    try testing.expectEqual(@as(f32, -0.006), lookaheadTau(49));
+    try testing.expectEqual(@as(f32, -0.004), lookaheadTau(50));
+    // The default budget is the selector's widest: the slots' (and the bill's) bound.
+    try testing.expectEqual(@as(u32, la.max_budget), (settings.Config{}).lookaheadBudget());
+    var sel = try la.SelectorOf(glm.routed_top_k).init(testing.allocator, 16, lookahead.k, lookaheadTau(0), la.max_budget);
+    defer sel.deinit(testing.allocator);
+    const none = struct {
+        fn f(_: void, _: u16) bool {
+            return false;
+        }
+    }.f;
+    // One row of 16 experts each: experts 0-7 its top 8 (the 8th, expert 7, at 1.0), 8-15 at 0.5.
+    const Case = struct { top: [8]f32, tau: f32, want: []const u16 };
+    const cases = [_]Case{
+        // Every score within 0.004 of the 8th: nothing read ahead.
+        .{ .top = .{ 1.003, 1.002, 1.002, 1.001, 1.001, 1.0005, 1.0002, 1.0 }, .tau = lookaheadTau(10), .want = &.{} },
+        // One clear of 0.004, none of 0.006.
+        .{ .top = .{ 1.005, 1.003, 1.002, 1.001, 1.001, 1.0005, 1.0002, 1.0 }, .tau = lookaheadTau(10), .want = &.{0} },
+        .{ .top = .{ 1.005, 1.003, 1.002, 1.001, 1.001, 1.0005, 1.0002, 1.0 }, .tau = lookaheadTau(30), .want = &.{} },
+        // Two clear of 0.006, four of 0.004.
+        .{ .top = .{ 1.02, 1.008, 1.005, 1.0045, 1.003, 1.001, 1.0005, 1.0 }, .tau = lookaheadTau(30), .want = &.{ 0, 1 } },
+        .{ .top = .{ 1.02, 1.008, 1.005, 1.0045, 1.003, 1.001, 1.0005, 1.0 }, .tau = lookaheadTau(10), .want = &.{ 0, 1, 2, 3 } },
+        // Six clear of 0.004: the first four by rank.
+        .{ .top = .{ 1.03, 1.02, 1.01, 1.009, 1.008, 1.007, 1.0005, 1.0 }, .tau = lookaheadTau(10), .want = &.{ 0, 1, 2, 3 } },
+    };
+    for (cases) |cs| {
+        var row: [16]f32 = @splat(0.5);
+        @memcpy(row[0..8], &cs.top);
+        sel.tau = cs.tau;
+        var out: [la.max_budget]u16 = undefined;
+        try testing.expectEqualSlices(u16, cs.want, sel.selectWith(&row, {}, none, &out, null));
+    }
 }

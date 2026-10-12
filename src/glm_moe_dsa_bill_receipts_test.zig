@@ -23,8 +23,8 @@ fn glm53Config() !glm.Config {
     return glm.Config.parse(testing.allocator, text, &glm.glm53, null);
 }
 
-/// The fill arm's model settings and context (the read pool's eight workers, its default).
-const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
+/// The fill arm's model settings and context (the read pool's eight workers, its default; the lookahead's budget of 2 those runs read at).
+const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3, .expert_lookahead_budget = 2 };
 
 /// The box's EXL3 packs: the 3.42 bpw pack (`bill.box_exl3`) and the uniform 3.0 bpw one (`bill.box_exl3_30`).
 const Pack = enum { exl3_342, exl3_30 };

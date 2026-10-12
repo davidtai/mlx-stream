@@ -41,7 +41,7 @@ pub const Config = struct {
     layer_major_prefill: ?bool = null,
     /// Prompt routes live at once in one layer (null = 2).
     expert_wide_depth: ?u8 = null,
-    /// The decode lookahead's records read ahead per routed call (null = 2; 1 .. `max_lookahead_budget`).
+    /// The decode lookahead's most records read ahead per routed call (null = `max_lookahead_budget`; 1 .. it).
     expert_lookahead_budget: ?u32 = null,
     /// The most fill units the module takes (null = off; `min_units_cap` or more): the construction's fill and the
     /// handover's grow stop at it, so two arms of a measurement hold the same rows when the box beside them moves. It
@@ -234,7 +234,7 @@ pub const Config = struct {
     }
 
     pub fn lookaheadBudget(c: *const Config) u32 {
-        return c.expert_lookahead_budget orelse 2;
+        return c.expert_lookahead_budget orelse @as(u32, @intCast(max_lookahead_budget));
     }
 
     /// A `ctx_size` over the model's limit, refused by name (never a silent fall back to the standard context).
@@ -277,11 +277,12 @@ test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up 
     try testing.expectEqual(@as(?u8, 5), (try settingsOf("{\"expert_wide_depth\": 5}")).expert_wide_depth);
     try testing.expectEqual(@as(?u8, null), (try settingsOf("{\"expert_wide_depth\": 6}")).expert_wide_depth);
     try testing.expectEqual(@as(?u8, null), (try settingsOf("{\"expert_wide_depth\": 0}")).expert_wide_depth);
-    try testing.expectEqual(@as(u32, 2), (Config{}).lookaheadBudget());
+    try testing.expectEqual(@as(u32, 4), (Config{}).lookaheadBudget());
     try testing.expectEqual(@as(u32, 1), (try settingsOf("{\"expert_lookahead_budget\": 1}")).lookaheadBudget());
     try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_lookahead_budget\": 4}")).lookaheadBudget());
-    try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 5}")).lookaheadBudget());
-    try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 0}")).lookaheadBudget());
+    try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_lookahead_budget\": 5}")).lookaheadBudget());
+    try testing.expectEqual(@as(u32, 4), (try settingsOf("{\"expert_lookahead_budget\": 0}")).lookaheadBudget());
+    try testing.expectEqual(@as(u32, 2), (try settingsOf("{\"expert_lookahead_budget\": 2}")).lookaheadBudget());
     try testing.expectEqual(@as(?u32, null), (Config{}).expert_units_cap);
     try testing.expectEqual(@as(?u32, 85), (try settingsOf("{\"expert_units_cap\": 85}")).expert_units_cap);
     try testing.expectEqual(@as(?u32, null), (try settingsOf("{\"expert_units_cap\": 0}")).expert_units_cap);

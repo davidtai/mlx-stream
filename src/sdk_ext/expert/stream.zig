@@ -403,6 +403,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             k: u32 = 8,
             /// inf keeps each row's plain top-K.
             tau: f32 = std.math.inf(f32),
+            /// The tau for reading ahead routed layer `routed` (null: `tau` for every layer).
+            tau_of: ?*const fn (routed: u32) f32 = null,
             /// Records read ahead per layer call; 2 x budget staging slots.
             budget: u32 = 2,
             /// Chunks per speculative record: 1, 2, 4 or 8.
@@ -574,6 +576,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// `read_ns` of results with no preadv (copy-only adoptions).
             copy_only_ns: u64 = 0,
             selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null,
+            /// The selector's tau per target routed layer (`Lookahead.tau_of`; null: its own).
+            lookahead_tau_of: ?*const fn (routed: u32) f32 = null,
             /// The lookahead's precision: the records read ahead for the next routed layer (their experts, the top-k
             /// position each was chosen at, the bank layer it is in) until that layer's call routes, then per bank layer
             /// and position the records read ahead and those the call routed (`by_rank`).
@@ -679,7 +683,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     };
                 }
                 var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
-                if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
+                if (opt.lookahead) |la| {
+                    if (la.tau_of) |f| for (0..bank.layers.len / sides) |l| {
+                        const t = f(@intCast(l));
+                        if (std.math.isNan(t) or t == -std.math.inf(f32)) return error.InvalidOptions;
+                    };
+                    selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
+                }
                 errdefer if (selector) |*sel| sel.deinit(a);
                 // The pool writes the event word until it stops.
                 var word: ?*i64 = null;
@@ -767,6 +777,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .records_per_part = opt.records_per_part,
                     .wide_depth = opt.wide_depth,
                     .selector = selector,
+                    .lookahead_tau_of = if (opt.lookahead) |la| la.tau_of else null,
                     .preread = if (opt.lookahead) |la| la.preread else false,
                     .event_word = word,
                     .gated = opt.event != null,
@@ -1334,6 +1345,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var len: u64 = 0;
                 if (scores.len > 0 and next < self.layers.len) {
                     const sel = &self.selector.?;
+                    if (self.lookahead_tau_of) |f| sel.tau = f(next);
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
                     var ranks: [expert_lookahead.max_budget]u8 = undefined;
                     const picked = sel.selectWith(scores, &self.layers[next].policy, expert_lookahead.residentIn, chosen[0..sel.budget], ranks[0..sel.budget]);
@@ -1360,6 +1372,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var n: usize = 0;
                 if (scores.len > 0 and next < self.layers.len / bpl) {
                     const sel = &self.selector.?;
+                    if (self.lookahead_tau_of) |f| sel.tau = f(next);
                     const Ctx = struct { s: *const Stream, routed: u32 };
                     const resident = struct {
                         fn f(c: Ctx, e: u16) bool {
