@@ -109,11 +109,27 @@ rejected: short-decode baseline drift was 10.17%, count-decode baseline drift wa
 prefill comparisons also exceeded the 3% guard. The unchanged baseline's live memory reading changed
 from 19.66 GB to 25.62 GB, changing admission from 116/147 to 105/136 prefill/decode rows. These timing
 results establish neither neutrality nor a causal attribution to the restored stock submission work.
-A separate PR11-versus-PR11 control, with identical plugin/host source attestations and no repair delta,
-also failed the same guards: the unchanged baseline binary drifted 3.41% on short decode, 5.15% on code
-decode and 7.70% on count decode; a matched prefill sample changed -5.42%. Correctness, launch sets,
-profiling and exact same-facts admission passed. The measurement setup is therefore not stable enough
-to establish performance neutrality; this control does not establish that the repair is neutral.
+Unchanged PR11 source A/A controls, with independently built binaries for each role and no repair
+delta, also fail the same strict guards:
+
+| Control condition | Short baseline drift | Code baseline drift | Count baseline drift | Worst matched prefill | Sampled stock launch sets |
+|---|---:|---:|---:|---:|---|
+| AC High Power | 3.41% | 5.15% | 7.70% | -5.42% | Match |
+| AC Auto | 2.21% | 6.25% | 6.59% | -4.20% | Mismatch |
+| AC Auto, preconditioned | 0.52% | 0.54% | 4.41% | -21.82% | Match |
+
+All controls match delivered output/usage and exact same-facts admission. The unconditioned Auto
+capture's sampled launch-set mismatch is not an exhaustive dispatch difference. Preconditioning
+uses four actual uncached 16K requests before short timing in every ABBA arm, in addition to the
+24 measured long requests; their outputs, usage and hashes match too. The conditioned control's
+short matched decode differences reach -15.70%, despite its low short baseline drift. The setup
+still does not establish performance neutrality or a causal attribution to the repair; no guard
+is relaxed and no optimization is promoted.
+Owned-server profiling now warms for 192 tokens before attaching Instruments, then captures 32
+tokens. Both conditioned stock captures save/drain cleanly with matching sampled shader sets.
+A separate actual hybrid capture records 6,407 positive enclosing compact/banked samples, exact
+output/usage parity, trace save before target drain and GPU lease release. It proves profiler
+operation, not changed-helper execution; the stricter changed-path promotion gate is unchanged.
 The stock budget-boundary regression fails before the compact-only metadata correction and passes
 afterward in ReleaseSafe. No thermal/fan equivalence is claimed.
 

@@ -36,6 +36,14 @@
   launch sets, profiling and same-facts admission pass, but the unchanged baseline drifts beyond
   the guards (3.41% short decode, 5.15% code decode, 7.70% count decode). Performance acceptance
   remains unresolved; no acceptance thresholds are relaxed.
+- Revalidate unchanged PR11 controls in AC Auto, including four actual uncached 16K preconditioning
+  requests per ABBA arm. Generated outputs/usage/hashes and exact same-facts admission match;
+  preconditioned sampled launch sets also match. Strict performance acceptance still fails,
+  including a -21.82% matched prefill difference; Auto and preconditioning do not establish neutrality.
+- Warm controller-owned profiler targets before Instruments attach. Actual stock and hybrid captures
+  save before target drain with exact output/usage parity and released GPU leases. Hybrid proof
+  distinguishes positive enclosing samples from unproven changed-helper execution; promotion
+  guards remain unchanged.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the
