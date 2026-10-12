@@ -22,7 +22,9 @@ const glm = @import("glm_moe_dsa.zig");
 const cache_mod = @import("cache.zig");
 const pt = @import("prefill_timers.zig");
 const expert_policy = @import("../../sdk_ext.zig").expert.policy;
-const dsa = sdk.dsa;
+/// The host's DeepSeek sparse attention kernels (the indexer's scores, the latent attention over selected rows): GLM-5.3's
+/// own need of the host surface, not the SDK's.
+const dsa = @import("mlx_host").dsa_nax;
 const topk_mod = @import("topk.zig");
 
 pub const G = ops.MlxOps;
