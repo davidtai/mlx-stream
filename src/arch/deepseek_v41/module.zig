@@ -347,8 +347,8 @@ pub const ReverseRecord = struct {
     vm_prompt_ready: ?VmMark = null,
     freed_bytes: u64,
     regrown_bytes: u64 = 0,
-    /// The prompt rows' residents for the coming request (`reverseResidents`) and how many it finds over every layer (set
-    /// once the settle passed).
+    /// The prompt rows' residents for the coming request (`reverseResidents`; `keep` when no grown rows were freed, the
+    /// residents untouched) and how many it finds over every layer (set once the settle passed).
     residents: expert_stream.Residents = .forget,
     kept_residents: u64 = 0,
     settle_ms: u32,
@@ -1621,8 +1621,10 @@ pub const Module = struct {
                 if (m.state) |*st| st.deinit(&m.g, m.gpa);
                 m.state = null;
             }
-            x.residents = reverseResidents(x.coming);
+            // The route only when this change frees the grown rows: without them (the phase change was refused before its
+            // grow) no shrink runs and the residents stay as they are, so the record names `keep`.
             x.shrunk = m.grown();
+            x.residents = if (x.shrunk) reverseResidents(x.coming) else .keep;
             const freed = if (x.shrunk) switch (m.arm) {
                 inline else => |t| try t.arm.shrink(x.residents),
             } else 0;
