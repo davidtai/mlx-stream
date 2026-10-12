@@ -48,6 +48,8 @@ comptime {
     _ = @import("arch/glm5_next/dump.zig");
     _ = @import("arch/glm5_next/root.zig");
     _ = @import("arch/glm5_next/module.zig");
+    _ = @import("arch/glm5_next/mtp.zig");
+    _ = @import("arch/glm5_next/mtp_test.zig");
     _ = @import("arch/mimo_v2/stream_source.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");

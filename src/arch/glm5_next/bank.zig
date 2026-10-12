@@ -39,6 +39,11 @@ pub const Records = sdk_ext.expert.Records(n_components, gu_components);
 pub const Dtype = enum { U32, U8, F32 };
 /// The record's layout name in the manifest (`layout`).
 pub const layout = "nvfp4-gud-9part";
+/// A bank's two files in the pack: the routed experts' and the MTP layer's NVFP4 draft bank (`mtp.zig` holds it
+/// resident). Both are this layout and this manifest form (docs/glm5-next-pack.md: one code path reads both).
+pub const Files = struct { manifest: []const u8, data: []const u8 };
+pub const routed_files: Files = .{ .manifest = "expert-manifest.json", .data = "experts.bin" };
+pub const mtp_files: Files = .{ .manifest = "mtp-expert-manifest-nvfp4.json", .data = "mtp-experts-nvfp4.bin" };
 pub const Component = enum(u8) {
     gate_weight,
     gate_scales,
@@ -265,10 +270,15 @@ pub const Bank = struct {
     /// The manifest against the geometry it declares, every record's place and digest declared. The payload is the
     /// converter's to verify: opening a model never reads or hashes the bank.
     pub fn parse(a: std.mem.Allocator, text: []const u8) !Bank {
+        return parseFor(a, text, routed_files);
+    }
+
+    /// `parse` of the manifest of the bank in `files` (its `data_file` and its `output_files` entry are `files.data`).
+    pub fn parseFor(a: std.mem.Allocator, text: []const u8, files: Files) !Bank {
         const parsed = try std.json.parseFromSlice(Manifest, a, text, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const m = parsed.value;
-        if (!std.mem.eql(u8, m.format, format) or !std.mem.eql(u8, m.data_file, "experts.bin") or !std.mem.eql(u8, m.layout, layout) or m.alignment != page) return error.InvalidFormat;
+        if (!std.mem.eql(u8, m.format, format) or !std.mem.eql(u8, m.data_file, files.data) or !std.mem.eql(u8, m.layout, layout) or m.alignment != page) return error.InvalidFormat;
         if (!std.mem.eql(u8, m.quantization.mode, "nvfp4") or m.quantization.bits != bits or m.quantization.group_size != group_size) return error.InvalidQuantization;
         const g = try Geometry.init(m.hidden_size, m.intermediate_size, m.num_experts, m.first_moe_layer, m.num_moe_layers);
         if (m.record_stride != g.record_bytes or m.record_bytes != g.logical_bytes or m.gate_up_bytes != g.gate_up_bytes or m.down_bytes != g.logical_bytes - g.gate_up_bytes) return error.InvalidGeometry;
@@ -293,7 +303,7 @@ pub const Bank = struct {
             digest.* = try parseDigest(r.sha256);
         }
         if (m.output_files != .object) return error.InvalidOutputFile;
-        const out = m.output_files.object.get("experts.bin") orelse return error.InvalidOutputFile;
+        const out = m.output_files.object.get(files.data) orelse return error.InvalidOutputFile;
         if (out != .object) return error.InvalidOutputFile;
         const size = out.object.get("size") orelse return error.InvalidOutputFile;
         const digest = out.object.get("sha256") orelse return error.InvalidOutputFile;
@@ -314,9 +324,14 @@ pub const Bank = struct {
     /// Construction only: the F_NOCACHE reader's fd; never follows an experts.bin symlink, and refuses a truncated or
     /// extended file.
     pub fn open(a: std.mem.Allocator, io: std.Io, dir: []const u8) !Bank {
-        var b = try readManifest(a, io, dir);
+        return openOf(a, io, dir, routed_files);
+    }
+
+    /// `open` of the bank in `files` beside the pack at `dir`.
+    pub fn openOf(a: std.mem.Allocator, io: std.Io, dir: []const u8, files: Files) !Bank {
+        var b = try readManifest(a, io, dir, files);
         errdefer b.deinit();
-        const path = try std.fmt.allocPrintSentinel(a, "{s}/experts.bin", .{dir}, 0);
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, files.data }, 0);
         defer a.free(path);
         b.sidecar_fd = try io_util.openNoCache(path, .{ .follow_symlinks = false });
         var st: std.c.Stat = undefined;
@@ -343,18 +358,18 @@ fn parseDigest(hex: []const u8) ![32]u8 {
     return digest;
 }
 
-fn readManifest(a: std.mem.Allocator, io: std.Io, dir: []const u8) !Bank {
+fn readManifest(a: std.mem.Allocator, io: std.Io, dir: []const u8, files: Files) !Bank {
     if (!std.fs.path.isAbsolute(dir)) return error.BankDirNotAbsolute;
-    const path = try std.fs.path.join(a, &.{ dir, "expert-manifest.json" });
+    const path = try std.fs.path.join(a, &.{ dir, files.manifest });
     defer a.free(path);
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20));
     defer a.free(text);
-    return Bank.parse(a, text);
+    return Bank.parseFor(a, text, files);
 }
 
 /// The manifest's geometry, validated, for admission and configuration: no sidecar, no MLX, no reader.
 pub fn inspect(a: std.mem.Allocator, io: std.Io, dir: []const u8) !Geometry {
-    var bank = try readManifest(a, io, dir);
+    var bank = try readManifest(a, io, dir, routed_files);
     defer bank.deinit();
     return bank.geometry;
 }
