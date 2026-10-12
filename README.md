@@ -245,6 +245,9 @@ and one code arm has 6.20% relative MAD. This run does not establish K3 neutrali
 causally attribute these differences to the PR. No stock performance-neutrality claim
 or engine win is made; the draft remains gated.
 
+Completion reporting follows the retained timing/profile receipt roots: 64 valid response
+receipts across this run and profile recovery, not optimization-search iterations.
+
 
 | Published source | Expert contract | Status |
 |---|---|---|

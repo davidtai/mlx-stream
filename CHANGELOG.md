@@ -81,6 +81,8 @@
 - Keep K3 neutrality unproven: unchanged 3% guards reject with 7.21% code baseline drift,
   -6.52%/-3.56% worst matched long decode/prefill changes and -8.35% worst short decode.
   No causal PR regression or performance-neutrality claim; no gate is waived.
+- Completion reporting follows sealed timing/profile receipt roots through offline
+  adjudication; the exercised final report retains 64 valid responses, not zero requests.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the
