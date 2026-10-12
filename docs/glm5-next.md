@@ -282,7 +282,9 @@ prints a table per served context (17,408; 18,432; 20,480; 24,576; 32,766; 32,76
 - `mlx-stream glm5_next installed: 45 layers; 34 KDA, 11 DSA; residents BF16 1178 tensors read in ...` (MiMo's
   punctuation; g19 printed `45 layers (34 KDA, 11 DSA); ...`); under `fp8_block128`: `... residents FP8 439 + BF16 739
   tensors read in ...`
-- `glm5_next MTP lane: off ...`, `glm5_next routes: ... call_rows=16384 residents=bf16|fp8_block128`,
+- `glm5_next MTP lane: off ...`, `glm5_next routes: dsa_nax= prompt_combine= read_schedule= drain= bank_view=
+  decode_moe= span_rows=1024 call_rows=16384 kda=percore|stock residents=bf16|fp8_block128 decode_glue= decode_kda=
+  decode_dsa= decode_predict= decode_swiglu=`, the four `glm5_next prompt lever N: ...` lines,
   `glm5_next admission baseline: ...`, `glm5_next construction check: ...`
 - `forced rows P/D exceed the fill by N bytes at baseline B; proceeding (operator pin)` when a pin sits over the fill
 - at each request's end: `glm5_next decode memory: footprint= mlx_active= mlx_cache= mlx_peak= ...` and `glm5_next decode: steps= tokens= wall_s= tok_s= ssd_bytes= ssd_bytes_per_token=`
