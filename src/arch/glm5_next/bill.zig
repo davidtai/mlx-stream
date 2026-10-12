@@ -36,6 +36,9 @@ const bf16: u64 = 2;
 const f32b: u64 = 4;
 /// The fused decode route's kernel set and prepared launches, declared (`decode_kernels` term).
 pub const fused_kernels_bytes: u64 = 16 << 20;
+/// The fused decode glue's texts (glue.zig: three texts, the router's four widths, hcPre's two variants), their
+/// pipelines and launch configurations, declared (`glue_kernels` term).
+pub const glue_kernels_bytes: u64 = 8 << 20;
 
 pub const Plan = struct {
     bill: sdk.MemoryBill,
@@ -132,6 +135,8 @@ pub const Inputs = struct {
     combine: prefill_combine.Route = .inplace,
     /// The decode lane's expert route (`settings.DecodeMoe`).
     decode_moe: settings.DecodeMoe = .stock,
+    /// The decode lane's glue (`settings.DecodeGlue`).
+    decode_glue: settings.DecodeGlue = .ops,
     /// The MTP lane's construction facts (`mtp_lane` on; null: the serial control, none of the lane's terms).
     mtp: ?mtp.Facts = null,
     page: u64 = 16_384,
@@ -419,10 +424,12 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
         .{ .name = "spec_runtime", .bytes = @splat(@as(u64, mimo_stream.spec_threads) * (2 << 20)), .at_construction = true },
         .{ .name = "predictor_workspace", .bytes = .{ predictorBytes(g, t), predictorBytes(g, experts.decode_lane_rows) }, .at_construction = false },
         .{ .name = "predictor_runtime", .bytes = @splat(16 << 20), .at_construction = false },
-        // `decode_moe: fused`: the NVFP4 decode texts' set (its library, two pipelines per registered instantiation) and
-        // the launches prepared per wave width (decode_kernels.zig `Fused`), declared; its waves' rows are the decode
-        // wave's (`request`). 0 on the stock route.
-        .{ .name = "decode_kernels", .bytes = @splat(if (in.decode_moe == .fused) fused_kernels_bytes else 0), .at_construction = true },
+        // `decode_moe: fused` and `hitpass`: the NVFP4 decode texts' set (its library, two pipelines per registered
+        // instantiation) and the launches prepared per wave width (decode_kernels.zig `Fused`), declared; its waves' rows
+        // are the decode wave's (`request`). 0 on the stock route.
+        .{ .name = "decode_kernels", .bytes = @splat(if (in.decode_moe != .stock) fused_kernels_bytes else 0), .at_construction = true },
+        // `decode_glue: fused`: the glue's texts, pipelines and configs (glue.zig), declared; 0 under `ops`.
+        .{ .name = "glue_kernels", .bytes = @splat(if (in.decode_glue == .fused) glue_kernels_bytes else 0), .at_construction = true },
         .{ .name = "slot_wiring", .bytes = @splat(0), .at_construction = false, .with_rows = true },
     };
     return .{
@@ -464,6 +471,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .reserve = reserve,
         .combine = experts.combineRoute(),
         .decode_moe = cfg.decode_moe,
+        .decode_glue = cfg.decode_glue,
         .mtp = lane,
         .page = page,
     };
@@ -569,6 +577,20 @@ test "glm5_next bill: the terms sum to the bill, the slot wiring is the one row 
     defer bf.free(a);
     try testing.expectEqual(b.fixed(.prompt) + fused_kernels_bytes, bf.fixed(.prompt));
     try testing.expectEqual(b.fixed(.decode) + fused_kernels_bytes, bf.fixed(.decode));
+    // hitpass binds the same texts: the same term.
+    fused_in.decode_moe = .hitpass;
+    const bh = try billOf(a, &fused_in);
+    defer bh.free(a);
+    try testing.expectEqual(bf.fixed(.prompt), bh.fixed(.prompt));
+    try testing.expectEqual(bf.fixed(.decode), bh.fixed(.decode));
+    // The fused glue adds its declared texts (a construction term, both phases); 0 under ops.
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(b, "glue_kernels"));
+    var glue_in = in;
+    glue_in.decode_glue = .fused;
+    const bg = try billOf(a, &glue_in);
+    defer bg.free(a);
+    try testing.expectEqual(b.fixed(.prompt) + glue_kernels_bytes, bg.fixed(.prompt));
+    try testing.expectEqual(b.fixed(.decode) + glue_kernels_bytes, bg.fixed(.decode));
     const target = box_ceiling - box_stop;
     const rows = try sdk.fill(b, 12_600_000_000, target, 288, min_rows);
     try testing.expect(rows.prompt >= min_rows and rows.prompt <= rows.decode and rows.decode <= 288);

@@ -7,7 +7,8 @@
 //! schedule `early_whole_trim`, the pooled prompt scratch, the decode window at the decode lane's widest route, phase
 //! rows (the boundary frees the prompt's scratch and grows each layer to its decode rows; the next prompt shrinks back,
 //! residents forgotten as MiMo's are). The decode lane's experts run the construction's route (`settings.DecodeMoe`):
-//! MLX's gathers, or the fused NVFP4 decode texts (decode_kernels.zig) over the three banks at once.
+//! MLX's gathers, the fused NVFP4 decode texts (decode_kernels.zig) over the three banks at once, or those texts with the
+//! device hit pass (`hitpass`, the default: the scheduler's DEVROUTE, each call's hit wave from the layer's resident LUT).
 //! A routed call's output is the weighted sum of its experts [nt, H] bf16; the trunk adds the shared expert.
 
 const std = @import("std");
@@ -195,8 +196,8 @@ pub const Source = struct {
         math.bank_view = try Math.bankViewsOf(bank_view);
         math.predictor = try mimo_math.Predictor.install(.f32, geo);
         // The decode lane's route: the fused NVFP4 texts installed here (their compile self-check, the launches prepared
-        // per wave width), refused by name; the stock gathers otherwise.
-        if (decode_moe == .fused) {
+        // per wave width), refused by name, under `fused` and `hitpass`; the stock gathers otherwise.
+        if (decode_moe != .stock) {
             var diag: sdk.Diag = .{};
             math.fused = nvfp4.FusedDecode.install(a, stream, geo.hidden_size, geo.intermediate_size, top_k, 10.0, &diag) catch |e| {
                 log.err("glm5_next: the fused decode route refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
@@ -222,9 +223,14 @@ pub const Source = struct {
             .n_routed_experts = geo.num_experts,
             .n_experts_per_tok = top_k,
         };
-        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true }, .banked = decode_moe == .fused });
+        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true }, .banked = decode_moe != .stock, .devroute = decode_moe == .hitpass });
         errdefer self.ex.deinit();
         if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
+        switch (decode_moe) {
+            .stock => {},
+            .fused => log.info("glm5_next decode experts installed: decode_moe=fused (the NVFP4 k1 texts over the three banks, one launch of each per wave; the hit wave routed on the host)\n", .{}),
+            .hitpass => log.info("glm5_next decode experts installed: decode_moe=hitpass (the NVFP4 k1 texts over the three banks; each call's hit wave from the layer's resident slot LUT behind the routing barrier, the miss parts after the route)\n", .{}),
+        }
         try self.beginPrefill();
         return self;
     }

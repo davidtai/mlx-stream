@@ -1,8 +1,9 @@
 //! glm5_next's construction config: the pack's model (config.zig), the pack's `expert_streaming.settings` (read once at
 //! construction; a key that is not a setting refuses the load by name) and the host's load facts. MiMo's contract: the
 //! operator pins the rows with `expert_prefill_rows` / `expert_rows` (either alone forces both); `mtp_lane` installs the
-//! MTP draft lane (mtp.zig; off, the serial control, by default); `decode_moe` the decode lane's expert route (`stock`, MLX's
-//! gathers, the default; `fused`, the NVFP4 decode texts); `decode_glue` the decode lane's glue (`fused`, the default: the
+//! MTP draft lane (mtp.zig; off, the serial control, by default); `decode_moe` the decode lane's expert route (`hitpass`,
+//! the default: the NVFP4 decode texts with the device hit pass; `fused`, the texts with the host-routed hit wave, its
+//! control; `stock`, MLX's gathers, the texts' control); `decode_glue` the decode lane's glue (`fused`, the default: the
 //! mHC hcPre chain, the router and top-8 texts, the combine with the shared expert's add, glue.zig; `ops`, the stock op
 //! chains, the control); `logits_dump_dir` (an absolute directory) installs the logits dump route for the KL gate
 //! (dump.zig): absent, nothing of it is built.
@@ -27,8 +28,11 @@ pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "m
 
 /// The decode lane's routed-expert route, installed once at construction: `stock` MLX's gather_qmm nvfp4 (two gathers
 /// and the clamped SwiGLU, then a gather per down), `fused` the NVFP4 decode texts (decode_kernels.zig: MiMo's k1 family
-/// over the bank; one launch of each per wave, rounding-class against the stock route).
-pub const DecodeMoe = enum { stock, fused };
+/// over the bank; one launch of each per wave, rounding-class against the stock route), `hitpass` (the default: MiMo's
+/// HITPASS, the shared scheduler's DEVROUTE) the fused texts with each decode-lane call's hit wave dispatched from the
+/// layer's device-resident slot LUT behind the routing barrier's arrays, before the host reads the ids (the host then
+/// routes and builds only the miss parts, whose rows replace their pairs in the join): exact against `fused`.
+pub const DecodeMoe = enum { stock, fused, hitpass };
 /// The decode lane's glue, installed once at construction (glue.zig): `fused` the hcPre chain (each sublayer's collapse
 /// and norm with the previous expand in one dispatch), the router and top-8 texts and the combine with the shared expert's
 /// add; `ops` the stock op chains (the control). Rounding-class against `ops`.
@@ -54,7 +58,7 @@ pub const Config = struct {
     expert_rows: ?u32 = null,
     expert_prefill_rows: ?u32 = null,
     mtp_lane: bool = false,
-    decode_moe: DecodeMoe = .stock,
+    decode_moe: DecodeMoe = .hitpass,
     /// The decode lane's glue (glue.zig `Route`): `fused` (the default) or `ops` (the stock op chains, the control).
     decode_glue: DecodeGlue = .fused,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
@@ -173,9 +177,11 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expect(pinned.dumpDir() == null);
     try testing.expectError(error.Glm5NextLogitsDumpDir, (try parseSettings("{\"logits_dump_dir\":\"relative/dir\"}")).validate());
     try testing.expectError(error.Glm5NextLogitsDumpDir, (try parseSettings("{\"logits_dump_dir\":7}")).validate());
-    // The decode route: stock unless named; fused by name; anything else refused by name.
-    try testing.expectEqual(DecodeMoe.stock, pinned.decode_moe);
+    // The decode route: hitpass unless named; fused and stock (the controls) by name; anything else refused by name.
+    try testing.expectEqual(DecodeMoe.hitpass, pinned.decode_moe);
     try testing.expectEqual(DecodeMoe.fused, (try parseSettings("{\"decode_moe\":\"fused\"}")).decode_moe);
+    try testing.expectEqual(DecodeMoe.stock, (try parseSettings("{\"decode_moe\":\"stock\"}")).decode_moe);
+    try testing.expectEqual(DecodeMoe.hitpass, (try parseSettings("{\"decode_moe\":\"hitpass\"}")).decode_moe);
     try (try parseSettings("{\"decode_moe\":\"stock\"}")).validate();
     try testing.expectError(error.Glm5NextDecodeMoeSetting, (try parseSettings("{\"decode_moe\":\"k1\"}")).validate());
     try testing.expectError(error.Glm5NextDecodeMoeSetting, (try parseSettings("{\"decode_moe\":1}")).validate());
