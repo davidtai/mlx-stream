@@ -7,6 +7,9 @@
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const host_caps = @import("../../host_caps.zig");
+/// Profile builds: the DSA split's `indexer` / `topk` marks in the prompt's selection (`selectRows`), with the scores
+/// committed between them while the prompt timeline records; compiled out of a served build.
+const ptl = @import("../mimo_v2/prefill_timeline.zig");
 /// The host's DSA kernels (`mlx_host.dsa_nax`): only a host that exports them builds a glm5_next module (root.zig).
 const dsa = if (host_caps.dsa_nax) @import("mlx_host").dsa_nax else @compileError("glm5_next: this host exports no dsa_nax (host_caps): the module must sit behind host_caps.dsa_nax");
 
@@ -1152,6 +1155,7 @@ fn selectRows(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, idx_cac
         try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
         return out;
     } else {
+        if (comptime ptl.enabled) ptl.stage(.indexer);
         // Scores: sum_h w_h * relu(q_h . pool_key) * Dh^-0.5, f32; pools a query cannot see lose.
         const pk = try storedPoolKeys(s, idx_cache, p, ix);
         defer _ = mlx.mlx_array_free(pk);
@@ -1169,6 +1173,12 @@ fn selectRows(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, idx_cac
             _ = mlx.mlx_array_free(masked);
             masked = nax;
         } else try maskedScores(s, &masked, q_idx, ws, pk, q_start, p, ix);
+        if (comptime ptl.enabled) if (ptl.recording()) {
+            const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{masked}, 1);
+            defer _ = mlx.mlx_vector_array_free(v);
+            try mlx.check(mlx.mlx_async_eval(v));
+            ptl.stage(.topk);
+        };
         var neg = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(neg);
         try mlx.check(mlx.mlx_negative(&neg, masked, s));

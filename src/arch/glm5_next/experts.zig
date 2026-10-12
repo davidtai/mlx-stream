@@ -24,13 +24,18 @@ const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
 const bank_mod = @import("bank.zig");
 const nvfp4 = @import("nvfp4.zig");
 const settings = @import("settings.zig");
+const profile = @import("../mimo_v2/profile.zig");
+const ptl = @import("../mimo_v2/prefill_timeline.zig");
+const route_trace = @import("../mimo_v2/route_trace.zig");
 const log = sdk.log;
 
 const T = mlx.mlx_array;
 
 pub const top_k: u32 = 8;
+/// Profile builds: the route trace over the bank's 288 experts (u16 ids, `GLM5_NEXT_ROUTE_TRACE`).
+pub const Trace = route_trace.TraceOf(u16, "glm5_next-route-trace-v2");
 /// The bridge over the NVFP4 bank: its {w, scales, global_scale} slot bindings, its read pool's 10 MiB staging.
-const B = bridge.For(bank_mod, .{ .Arrays = bank_mod.Arrays, .staging_bytes = settings.reader_staging_bytes });
+const B = bridge.For(bank_mod, .{ .Arrays = bank_mod.Arrays, .staging_bytes = settings.reader_staging_bytes, .Trace = Trace });
 pub const Stream = B.Stream;
 pub const StreamSource = B.StreamSource;
 pub const Math = mimo_math.MathOf(nvfp4.Format);
@@ -76,16 +81,26 @@ fn combineStock(g: *ops.MlxOps, routed: T, route_weights: T) !T {
 
 /// The prompt combine over the wide call's sources read in place (P7 `inplace`, the host's wired policy `max`).
 fn partsCombineInplace(self: *const Source, g: *ops.MlxOps, outs: []const T, loc: T, route_weights: T, nt: u32) !T {
+    if (comptime ptl.enabled) ptl.tile(.reduce, nt, 0, &.{});
+    const encode_start = profile.now();
     const output = try self.combine_kernel.callInplace(g, outs, loc, route_weights, nt);
+    profile.charge(.encode, encode_start);
+    const drain_start = profile.now();
     try g.evalAll(&.{output});
+    profile.charge(.drain, drain_start);
     return g.keep(output);
 }
 
 /// The same text over at most `prefill_combine.sources` bound sources (the scheduler merges the rest): under any other
 /// wired policy (the in-place form needs every source in MLX's residency sets).
 fn partsCombineFused(self: *const Source, g: *ops.MlxOps, outs: []const T, loc: T, route_weights: T, nt: u32) !T {
+    if (comptime ptl.enabled) ptl.tile(.reduce, nt, 0, &.{});
+    const encode_start = profile.now();
     const output = try self.combine_kernel.call(g, outs, loc, route_weights, nt);
+    profile.charge(.encode, encode_start);
+    const drain_start = profile.now();
     try g.evalAll(&.{output});
+    profile.charge(.drain, drain_start);
     return g.keep(output);
 }
 
@@ -303,9 +318,13 @@ pub const Source = struct {
         const g = &self.g;
         defer g.reset();
         const nt: u32 = @intCast(g.shapeOf(x).d[0]);
+        profile.call();
         if (self.decodeLaneAt(nt)) {
             const routed = try self.ex.at(layer).routedHoist(g, x, try g.astype(expert_ids, .int32), hoist);
-            return g.keep(try combineStock(g, routed, route_weights));
+            const encode_start = profile.now();
+            const output = try combineStock(g, routed, route_weights);
+            profile.charge(.encode, encode_start);
+            return g.keep(output);
         }
         // Decode's window 0 holds one decode-lane route: no decode-phase call is wide (the module resumes the prompt
         // phase for any wider forward). An invariant of the callers.
@@ -313,9 +332,13 @@ pub const Source = struct {
         const hook = self.ex.at(layer);
         const parts = try hook.routedParts(g, x, try g.astype(expert_ids, .int32));
         defer hook.releaseParts(g);
+        if (comptime ptl.enabled) ptl.stage(.join);
+        const join_start = profile.now();
+        // The tiles are evaluated; this evaluates the merged source, if any.
         try g.evalAll(parts.outs);
         try mlx.check(mlx.mlx_synchronize(g.s));
         try self.ex.flush();
+        profile.charge(.join, join_start);
         return self.parts_combine(self, g, parts.outs, parts.loc, route_weights, nt);
     }
 

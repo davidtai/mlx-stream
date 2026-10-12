@@ -95,6 +95,36 @@ prints a table per served context (17,408; 18,432; 20,480; 24,576; 32,766; 32,76
 - `forced rows P/D exceed the fill by N bytes at baseline B; proceeding (operator pin)` when a pin sits over the fill
 - at each request's end: `glm5_next decode memory: footprint= mlx_active= mlx_cache= mlx_peak= ...` and `glm5_next decode: steps= tokens= wall_s= tok_s= ssd_bytes= ssd_bytes_per_token=`
 
+## The profile build
+
+A profile build (the host's `-Dplugin-profile=true`; never a served build) compiles MiMo's diagnostics in
+(`glm5_next/profile.zig`). Each switch is read once at construction:
+
+- `GLM5_NEXT_ROUTE_TRACE=<prefix>`: the request's route trace (`glm5_next-route-trace-v2`: MiMo's v2 layout with u16
+  expert ids, `<prefix>-r<k>.prompt.u16`, `.decode.u16`, ...), and the prompt timeline's TSVs beside it. Line:
+  `GLM5_NEXT_ROUTE_TRACE armed: prefix=<P> format=glm5_next-route-trace-v2`.
+- `GLM5_NEXT_PREFILL_TIMELINE=1` (`0` off; anything else refuses the load): MiMo's prompt-pass timeline for the first
+  prompt pass, `GLM5_NEXT_PREFILL_TIMELINE armed: ...`, then `GLM5_NEXT_PREFILL_TIMELINE {...}` and
+  `<P>-r0.prefill-{layers,tiles,cbs}.tsv`. Its stages, in the line's and the TSV's order: `edge predict attn indexer topk
+  sparse router dense moe join gather reduce output tail`. On a DSA layer the indexer's pool scores (`indexer`), the
+  top-k selection (`topk`) and the sparse latent attention (`sparse`) each run under their own mark, with a profile-only
+  eval at each boundary while the timeline records; `attn` keeps the norms, the projections and the KDA route. `dense`
+  is layers 0-2's dense MLP and, on a routed layer, the FFN's collapse and norm with the shared expert (committed before
+  the routing barrier); `router` the routed call's barrier and setup; `tail` the expand and the layer's output.
+- `GLM5_NEXT_GPU_TIMELINE=1` (`0` off; anything else refuses): DSV's verify GPU timeline over the serial decode's
+  forwards (`GLM5_NEXT_GPU_TIMELINE armed: serial forwards, cycles_cap=1024`): one cycle per forward with one verify,
+  the first request's first 1,024 forwards; at the request's end `VERIFY_GPU_TIMELINE_REPAIR`, `VERIFY_GPU_TIMELINE {...}`
+  (GPU busy, `bytes_wait_ms` read-wait, idle, per layer) and `<P>-r0.gpu-timeline.json`.
+
+Every request of a profile build prints MiMo's phase lines at each phase's end (`GLM5_NEXT_PROFILE phase=prefill|decode`,
+`GLM5_NEXT_AHEAD`, `GLM5_NEXT_AHEAD_LOOKAHEAD`, `GLM5_NEXT_IO`) and DSV's `DECODE_TIMERS {...}` at the decode's end (a
+serial cycle is a token).
+
+Memory: the profile build's own bytes sit outside the bill (the profile cell reserves 0.25 GB on the baseline,
+`GLM_PROFILE_RESERVE_GB`): the timelines' static storage (~12 MB prompt, ~24 MB verify), the route trace's request
+buffers (~11 MB prompt ids at 16,384 tokens, ~11 MB decode ids and ~16 MB predictor records at its 4,096 decode
+calls) and the TSV / JSON text built once at an end (each at most ~15 MB): at most ~0.1 GB.
+
 ## The logits dump (the KL gate)
 
 `settings.logits_dump_dir` (an absolute directory) installs the dump route at construction; absent, the module builds

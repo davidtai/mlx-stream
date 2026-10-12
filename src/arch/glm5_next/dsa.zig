@@ -12,6 +12,9 @@ const mlx = sdk.mlx;
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const ops = @import("ops.zig");
+/// Profile builds: the DSA split's marks (`indexer`, `topk`, `sparse`) and their evals, only while the prompt timeline
+/// records; compiled out of a served build.
+const ptl = @import("../mimo_v2/prefill_timeline.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -137,11 +140,25 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
             const x_s = try g.slice(x, &.{ 0, sparse_from, 0 }, &.{ 1, rows, @intCast(c.hidden_size) }, &.{ 1, 1, 1 });
             const wts = try g.mul(try g.astype(try linear(g, x_s, w.idx_wproj), .float32), try g.scalar(1.0 / @sqrt(@as(f64, @floatFromInt(ih))), .float32));
             const idx_cache = try g.reshape(index_view, &.{ 1, t, 2 * ihd });
+            // Profile builds, the prompt timeline recording: the indexer's inputs committed under `attn`, so each mark
+            // of the split (`ops.selectRows`: indexer, topk; here: sparse) times only its own work.
+            if (comptime ptl.enabled) if (ptl.recording()) try g.asyncEval(&.{ q_abs, q_idx, wts, idx_cache, latent4 });
             const sel = try g.adopt(try ops.selectTokens(g.s, q_idx, wts, idx_cache, ix));
+            if (comptime ptl.enabled) if (ptl.recording()) {
+                try g.asyncEval(&.{sel});
+                ptl.stage(.sparse);
+            };
             // The NAX route (installed at construction where the device has the tensor units and Flash's dims fit the
             // kernels) on a multi-row call; the op chain's otherwise. An installed route never falls back.
-            if (routes.nax and n > 8) break :blk try g.adopt((try ops.sparseLatentNax(g.s, q_abs, latent4, sel, scale)) orelse return error.Glm5NextNaxShape);
-            break :blk try g.adopt(try ops.sparseLatentAttention(g.s, q_abs, latent4, sel, scale, 64));
+            const o_sparse = if (routes.nax and n > 8)
+                try g.adopt((try ops.sparseLatentNax(g.s, q_abs, latent4, sel, scale)) orelse return error.Glm5NextNaxShape)
+            else
+                try g.adopt(try ops.sparseLatentAttention(g.s, q_abs, latent4, sel, scale, 64));
+            if (comptime ptl.enabled) if (ptl.recording()) {
+                try g.asyncEval(&.{o_sparse});
+                ptl.stage(.attn);
+            };
+            break :blk o_sparse;
         };
         // The attended latent lifted to values: o_lat @ wv^T per head.
         parts[1] = try g.matmul(o_lat, try g.transposeAxes(w.wv, &.{ 0, 2, 1 }));

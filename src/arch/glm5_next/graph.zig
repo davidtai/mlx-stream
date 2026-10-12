@@ -24,6 +24,9 @@ const kda = @import("kda.zig");
 const dsa = @import("dsa.zig");
 const experts = @import("experts.zig");
 const nvfp4 = @import("nvfp4.zig");
+/// Profile builds: the prompt pass's stage marks (MiMo's timeline, armed by `GLM5_NEXT_PREFILL_TIMELINE`); every mark
+/// compiles to nothing in a served build.
+const ptl = @import("../mimo_v2/prefill_timeline.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -549,7 +552,12 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
         const l: u32 = @intCast(li);
         const m = g.mark();
         defer g.resetTo(m);
+        if (comptime ptl.enabled) {
+            ptl.layer(l);
+            ptl.stage(.predict);
+        }
         if (prompt and lw.router != null) try readAhead(g, c, lw, spans, src, l);
+        if (comptime ptl.enabled) ptl.stage(.attn);
         // The attention, span by span (the KDA state and the DSA lanes carry from one span to the next); in a prompt
         // call each span is committed as built and the span before it waited, so at most `spans_in_flight` run at once.
         var prev: ?T = null;
@@ -570,7 +578,10 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             prev = next;
         }
         // The MLP over every row at once: each span's collapse, the rows joined, the dense MLP or the MoE (the routed
-        // experts' weighted sum and the shared expert), each span's expand.
+        // experts' weighted sum and the shared expert), each span's expand. (Profile marks: `dense` the FFN's collapse
+        // and norm with the dense MLP tiles or the shared expert committed before the routing barrier, `router` the
+        // routed call, `tail` the expand and the layer's output evaluated.)
+        if (comptime ptl.enabled) ptl.stage(.dense);
         var n_cols: usize = 0;
         defer for (cols[0..n_cols]) |*cl| cl.deinit();
         for (spans, cols, normed) |sp, *cl, *nx| {
@@ -586,9 +597,11 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             // the first group's reads land); a decode-lane call hands it over as the call's hoist (run during its read
             // wait). The sum is the same either way.
             if (prompt) try g.asyncEval(&.{shared});
+            if (comptime ptl.enabled) ptl.stage(.router);
             const routed = try g.adopt(try src.forward(l, x, r.indices, r.weights, if (prompt) &.{} else &.{shared}));
             break :blk try g.add(routed, shared);
         };
+        if (comptime ptl.enabled) ptl.stage(.tail);
         for (spans, cols[0..n_spans], 0..) |*sp, *cl, i| {
             const lo: c_int = @intCast(i * span_rows);
             const hi: c_int = @intCast(@min(rows, (i + 1) * span_rows));
@@ -604,6 +617,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             src.promptLayerEnd();
         }
     }
+    if (comptime ptl.enabled) ptl.leaveLayers();
     cache.len = start + rows;
     if (head == .dump) try dumpRows(g, c, w, spans, sink);
     // The last row: the stream's mean over its hc streams, the final norm, the head, f32.

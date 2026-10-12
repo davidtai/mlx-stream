@@ -19,6 +19,9 @@ const kda = @import("kda.zig");
 const dsa = @import("dsa.zig");
 const dump = @import("dump.zig");
 const pagecache = @import("../mimo_v2/pagecache.zig");
+/// Profile builds only (glm5_next/profile.zig): the route trace, the prompt timeline, the phase lines, the decode
+/// timers and the serial forwards' GPU timeline; every call compiles to nothing in a served build.
+const gprof = @import("profile.zig");
 const prefill_attention = @import("../mimo_v2/prefill_attention.zig");
 
 const T = mlx.mlx_array;
@@ -91,6 +94,7 @@ pub const Module = struct {
         log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d}\n", .{ routes.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows });
         log.info("mlx-stream glm5_next installed: {d} layers; {d} KDA, {d} DSA; residents BF16 {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed ({d} sources), {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nKda(), model.nDsa(), weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, n_moe, plan.rows.prompt, graph.prompt_call_rows });
         log.info("glm5_next memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv=bf16 phase_rows=on growth_rows={d} forced={s}\n", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, plan.rows.decode - plan.rows.prompt, if (bill.isForced(cfg)) "yes" else "no" });
+        if (comptime gprof.enabled) try gprof.arm(gpa, io, self.src, model.n_layers, s);
         self.checkConstruction(plan.bill, plan.rows.prompt);
         return self;
     }
@@ -126,6 +130,7 @@ pub const Module = struct {
 
     pub fn deinit(self: *Module) void {
         _ = mlx.mlx_synchronize(self.g.s);
+        if (comptime gprof.enabled) gprof.disarm(self.src);
         self.src.deinit();
         self.cache.deinit(&self.g);
         self.w.deinit(self.gpa);
@@ -169,9 +174,16 @@ pub const Module = struct {
         try self.beginPrompt(ids);
         const logits = try self.promptCalls(ids, .last, {});
         errdefer self.g.release(logits);
+        try self.enterDecode(ids.len);
+        return logits;
+    }
+
+    /// The prompt pass's end -> the decode phase (the source's phase change), the request's decode accounting.
+    fn enterDecode(self: *Module, prompt_tokens: usize) !void {
+        if (comptime gprof.enabled) gprof.promptEnd(self.src);
         try self.src.beginDecode();
         self.decode = .{ .active = true, .s0 = self.src.stats() };
-        return logits;
+        if (comptime gprof.enabled) gprof.decodeBegin(self.src, self.reserve -| prompt_tokens);
     }
 
     /// The logits dump route: the served prompt pass, every row's logits written to one file before it returns.
@@ -188,8 +200,7 @@ pub const Module = struct {
         const name = std.fmt.bufPrint(&name_buf, "{s}", .{w.final}) catch "";
         try w.finish(ids);
         log.info("glm5_next logits_dump: wrote {s} rows={d}\n", .{ name, ids.len });
-        try self.src.beginDecode();
-        self.decode = .{ .active = true, .s0 = self.src.stats() };
+        try self.enterDecode(ids.len);
         return logits;
     }
 
@@ -197,6 +208,7 @@ pub const Module = struct {
         try self.src.beginPrefill();
         _ = try self.src.chooseReadSchedule(ids.len);
         self.cache.restart(&self.g);
+        if (comptime gprof.enabled) gprof.promptBegin(self.src, ids, self.reserve);
     }
 
     /// The prompt's calls (at most `graph.prompt_call_rows` rows each, layer by layer): the last call's logits,
@@ -231,6 +243,7 @@ pub const Module = struct {
             return logits;
         }
         const t0 = self.nowNs();
+        const tp = gprof.stepBegin(ids[0]);
         const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids, self.cache.len, &self.cache, self.src, self.routes, .last, {});
         errdefer self.g.release(logits);
         // The logits and every KDA state: a conv tail feeds no output of its own step.
@@ -240,6 +253,7 @@ pub const Module = struct {
         try self.cache.stateArrays(&evals, self.gpa);
         try self.g.evalAll(evals.items);
         try self.src.flush();
+        gprof.stepEnd(tp);
         self.decode.steps += 1;
         self.decode.tokens += ids.len;
         self.decode.wall_ns += self.nowNs() - t0;
@@ -251,6 +265,7 @@ pub const Module = struct {
         if (!self.decode.active) return;
         const d = self.decode;
         self.decode = .{};
+        if (comptime gprof.enabled) gprof.decodeEnd(self.src);
         const footprint = sdk.memory.footprint().now;
         var active: usize = 0;
         var cache: usize = 0;

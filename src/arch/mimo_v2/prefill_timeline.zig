@@ -28,6 +28,14 @@
 //!   output  the reduction tiles' concatenate [n, H], evaluated
 //!   tail    the layer's residual add, evaluated
 //!
+//! GLM-5.3-Flash (glm5_next) arms the same timeline (`wantFor(io, .glm5_next)`: `GLM5_NEXT_PREFILL_TIMELINE`, its lines
+//! tagged `GLM5_NEXT_`) with three more stages on its DSA layers, right after `attn` in its line and TSV:
+//!   indexer the indexer's pool scores (NAX or composed), evaluated
+//!   topk    the top-k pool selection and its token expansion, evaluated
+//!   sparse  the sparse latent attention over the selected tokens, evaluated
+//! (`attn` keeps the rest: the norms, the projections, the KDA route). The stages are appended to the enum, so MiMo's tags
+//! and its lines (its eleven stages, `Arch.mimo`'s order) are unchanged.
+//!
 //! The run's line `MIMO_PREFILL_TIMELINE {...}`: the wall (first mark to the end), per stage the host ms, the GPU busy
 //! ms (union of its buffers), the GPU idle ms while the host was in it, the drive's busy ms and the fresh Metal
 //! buffers; the MoE tiles split by MLX's kernel path (sorted rhs NAX GEMM vs per-row gather_qmv, `quantized.cpp`
@@ -43,13 +51,40 @@ const gpu_power = @import("gpu_power.zig");
 /// The command-buffer rows, the signal log's entries, the host clock and the span arithmetic are the verify timeline's
 /// (the same shim and pool log).
 const verify_timeline = @import("../deepseek_v41/verify_timeline.zig");
-const log = std.log.scoped(.mimo);
 
 pub const enabled = profile.enabled;
 
-pub const Stage = enum(u8) { edge, predict, attn, router, dense, moe, join, gather, reduce, output, tail };
+pub const Stage = enum(u8) { edge, predict, attn, router, dense, moe, join, gather, reduce, output, tail, indexer, topk, sparse };
 pub const n_stages = @typeInfo(Stage).@"enum".field_names.len;
 pub const TileKind = enum(u8) { moe, reduce };
+
+/// The arch that armed the timeline: its lines' tag (`<TAG>_PREFILL_TIMELINE`, `<TAG>_GPU_POWER_PREFILL`, the switch's
+/// env), its log scope and its stages in its line's and TSV's order.
+pub const Arch = enum { mimo, glm5_next };
+
+pub fn tagOf(comptime a: Arch) []const u8 {
+    return switch (a) {
+        .mimo => "MIMO",
+        .glm5_next => "GLM5_NEXT",
+    };
+}
+
+pub fn logOf(comptime a: Arch) type {
+    return switch (a) {
+        .mimo => std.log.scoped(.mimo),
+        .glm5_next => std.log.scoped(.glm5_next),
+    };
+}
+
+pub const mimo_order = [_]Stage{ .edge, .predict, .attn, .router, .dense, .moe, .join, .gather, .reduce, .output, .tail };
+pub const glm5_next_order = [_]Stage{ .edge, .predict, .attn, .indexer, .topk, .sparse, .router, .dense, .moe, .join, .gather, .reduce, .output, .tail };
+
+pub fn orderOf(a: Arch) []const Stage {
+    return switch (a) {
+        .mimo => &mimo_order,
+        .glm5_next => &glm5_next_order,
+    };
+}
 
 /// One committed command buffer (the shim's `Dsv41tlRow`).
 pub const Row = verify_timeline.Row;
@@ -84,6 +119,7 @@ const c = if (enabled) struct {
 } else struct {};
 
 const State = struct {
+    arch: Arch = .mimo,
     /// X12: the GPU's energy / DVFS / thermal counters over the prompt pass (IOReport; `MIMO_GPU_POWER_PREFILL`).
     power: ?gpu_power.Sampler = null,
     power0: ?*anyopaque = null,
@@ -116,17 +152,31 @@ pub const now = verify_timeline.now;
 
 /// Construction: `MIMO_PREFILL_TIMELINE` read once (`"1"` arms it; unset or `"0"` leaves it off; anything else refuses).
 pub fn want(io: std.Io) !bool {
+    return wantFor(io, .mimo) catch return error.MimoPrefillTimelineSetting;
+}
+
+/// Construction: arch `a`'s switch (`<TAG>_PREFILL_TIMELINE`) read once, as `want`.
+pub fn wantFor(io: std.Io, comptime a: Arch) error{PrefillTimelineSetting}!bool {
     if (comptime !enabled) return false;
-    const env = std.c.getenv("MIMO_PREFILL_TIMELINE") orelse return false;
+    const name = comptime tagOf(a) ++ "_PREFILL_TIMELINE";
+    const env = std.c.getenv(name) orelse return false;
     const v = std.mem.span(env);
     if (std.mem.eql(u8, v, "0")) return false;
     if (!std.mem.eql(u8, v, "1")) {
-        log.err("MIMO_PREFILL_TIMELINE={s} refused: 0 | 1", .{v});
-        return error.MimoPrefillTimelineSetting;
+        logOf(a).err(name ++ "={s} refused: 0 | 1", .{v});
+        return error.PrefillTimelineSetting;
     }
     state.wanted = true;
+    state.arch = a;
     state.io = io;
     return true;
+}
+
+/// The timeline is recording a prompt pass (profile builds; false in every other build): an arch's profile-only evals
+/// at its stage boundaries (glm5_next's DSA split) run only then.
+pub fn recording() bool {
+    if (comptime !enabled) return false;
+    return state.active;
 }
 
 /// The prompt phase begins: the first one of the process installs the hook on `s`'s queue and arms the storage.
@@ -136,7 +186,10 @@ pub fn begin(s: mlx.mlx_stream) void {
     const rc = c.dsv41tl_install(c.dsv41tl_mlx_buffer(s), &Storage.rows, max_rows);
     if (rc != 0) {
         state.done = true;
-        return log.info("MIMO_PREFILL_TIMELINE_UNAVAILABLE {{\"reason\": \"install rc {d}\"}}", .{rc});
+        switch (state.arch) {
+            inline else => |a| logOf(a).info(comptime tagOf(a) ++ "_PREFILL_TIMELINE_UNAVAILABLE {{\"reason\": \"install rc {d}\"}}", .{rc}),
+        }
+        return;
     }
     state.nb_ok = c.dsv41nb_install() == 0;
     _ = c.q3ld_test_ev_log(@ptrCast(&Storage.signals), max_signals);
@@ -293,13 +346,22 @@ pub fn finish(a: std.mem.Allocator, base: ?[]const u8, hidden: u32, inter: u32) 
         .dropped_tiles = state.tiles_dropped,
         .newbuffer = state.nb_ok,
         .model_queue_only = true,
+        .order = orderOf(state.arch),
     };
-    const sum = summarize(a, in) catch |e| return log.err("MIMO_PREFILL_TIMELINE summary: {s}", .{@errorName(e)});
+    switch (state.arch) {
+        inline else => |arch| finishAs(arch, a, base, in),
+    }
+}
+
+fn finishAs(comptime arch: Arch, a: std.mem.Allocator, base: ?[]const u8, in: Input) void {
+    const alog = logOf(arch);
+    const tag = comptime tagOf(arch);
+    const sum = summarize(a, in) catch |e| return alog.err(tag ++ "_PREFILL_TIMELINE summary: {s}", .{@errorName(e)});
     defer sum.deinit(a);
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
-    writeLine(&aw.writer, in, sum) catch return;
-    log.info("{s}", .{aw.written()});
+    writeLineOf(tag, &aw.writer, in, sum) catch return;
+    alog.info("{s}", .{aw.written()});
     // X12: the prompt pass's GPU energy, active-time mean MHz and thermal limiting (the pass's window, system-wide).
     if (state.power) |*p| if (state.power0) |p0| {
         const p1 = p.sample();
@@ -309,15 +371,15 @@ pub fn finish(a: std.mem.Allocator, base: ?[]const u8, hidden: u32, inter: u32) 
         if (p.delta(p0, p1)) |d| {
             var pb: [1024]u8 = undefined;
             var w: std.Io.Writer = .fixed(&pb);
-            w.writeAll("MIMO_GPU_POWER_PREFILL ") catch {};
+            w.writeAll(tag ++ "_GPU_POWER_PREFILL ") catch {};
             gpu_power.json(&w, d, p.mhz[0..p.n_mhz]) catch {};
-            log.info("{s}", .{w.buffered()});
+            alog.info("{s}", .{w.buffered()});
         } else |_| {}
     };
     if (base) |b| if (state.io) |io| {
-        writeFile(a, io, b, ".prefill-layers.tsv", in, sum, writeLayers);
-        writeFile(a, io, b, ".prefill-tiles.tsv", in, sum, writeTiles);
-        writeFile(a, io, b, ".prefill-cbs.tsv", in, sum, writeRows);
+        writeFile(arch, a, io, b, ".prefill-layers.tsv", in, sum, writeLayers);
+        writeFile(arch, a, io, b, ".prefill-tiles.tsv", in, sum, writeTiles);
+        writeFile(arch, a, io, b, ".prefill-cbs.tsv", in, sum, writeRows);
     };
 }
 
@@ -336,6 +398,8 @@ pub const Input = struct {
     dropped_marks: u32 = 0,
     dropped_tiles: u32 = 0,
     newbuffer: bool = true,
+    /// The stages the line and the layers TSV print, in order (the arch's: `orderOf`).
+    order: []const Stage = &mimo_order,
     /// X12 (mimo/gpu-warm): count only the MLX stream queue's buffers (`Row.queue` 1); the warm engine's chunks run on
     /// their own queue and would fill the gpu_idle they exist to cover. The real summary sets it; hand-made rows keep
     /// every row.
@@ -544,14 +608,20 @@ pub fn tflops(rows: u64, hidden: u32, inter: u32, ns: u64) f64 {
 }
 
 pub fn writeLine(w: *std.Io.Writer, in: Input, s: Sum) !void {
+    return writeLineOf("MIMO", w, in, s);
+}
+
+/// The run's line under `tag` (`<tag>_PREFILL_TIMELINE {...}`), its stages `in.order`'s.
+pub fn writeLineOf(comptime tag: []const u8, w: *std.Io.Writer, in: Input, s: Sum) !void {
     var host_sum: u64 = 0;
     for (s.stages) |st| host_sum += st.host;
-    try w.print("MIMO_PREFILL_TIMELINE {{\"wall_ms\": {d:.3}, \"gpu_busy_ms\": {d:.3}, \"gpu_idle_ms\": {d:.3}, \"io_busy_ms\": {d:.3}, \"host_residual_ms\": {d:.3}, \"stages\": {{", .{
+    try w.print(tag ++ "_PREFILL_TIMELINE {{\"wall_ms\": {d:.3}, \"gpu_busy_ms\": {d:.3}, \"gpu_idle_ms\": {d:.3}, \"io_busy_ms\": {d:.3}, \"host_residual_ms\": {d:.3}, \"stages\": {{", .{
         ms(s.wall), ms(s.busy), ms(s.wall -| s.busy), ms(s.io), ms(s.wall) - ms(host_sum),
     });
-    for (s.stages, 0..) |st, i| {
+    for (in.order, 0..) |stg, i| {
+        const st = s.stages[@intFromEnum(stg)];
         try w.print("{s}\"{s}\": {{\"host_ms\": {d:.3}, \"gpu_ms\": {d:.3}, \"gpu_idle_ms\": {d:.3}, \"io_busy_ms\": {d:.3}, \"newbuf\": {d}, \"newbuf_mb\": {d:.1}, \"marks\": {d}, \"cbs\": {d}}}", .{
-            if (i == 0) "" else ", ", @tagName(@as(Stage, @enumFromInt(i))), ms(st.host), ms(st.gpu), ms(st.idle), ms(st.io), st.nb_calls, @as(f64, @floatFromInt(st.nb_bytes)) / 1e6, st.marks, st.cbs,
+            if (i == 0) "" else ", ", @tagName(stg), ms(st.host), ms(st.gpu), ms(st.idle), ms(st.io), st.nb_calls, @as(f64, @floatFromInt(st.nb_bytes)) / 1e6, st.marks, st.cbs,
         });
     }
     try w.print("}}, \"moe\": {{", .{});
@@ -567,10 +637,10 @@ pub fn writeLine(w: *std.Io.Writer, in: Input, s: Sum) !void {
     });
 }
 
-pub fn writeLayers(w: *std.Io.Writer, _: Input, s: Sum) anyerror!void {
+pub fn writeLayers(w: *std.Io.Writer, in: Input, s: Sum) anyerror!void {
     try w.print("layer", .{});
-    for (0..n_stages) |i| {
-        const n = @tagName(@as(Stage, @enumFromInt(i)));
+    for (in.order) |stg| {
+        const n = @tagName(stg);
         try w.print("\t{s}_host_ms\t{s}_gpu_ms\t{s}_idle_ms", .{ n, n, n });
     }
     try w.print("\tio_busy_ms\tnewbuf\tnewbuf_mb\tmoe_tiles\tmoe_rows\tmoe_qmv_tiles\tmoe_gpu_ms\tmoe_wait_ms\n", .{});
@@ -582,8 +652,11 @@ pub fn writeLayers(w: *std.Io.Writer, _: Input, s: Sum) anyerror!void {
         var io: u64 = 0;
         var nb: u64 = 0;
         var nbb: u64 = 0;
-        for (l.stages) |st| {
+        for (in.order) |stg| {
+            const st = l.stages[@intFromEnum(stg)];
             try w.print("\t{d:.3}\t{d:.3}\t{d:.3}", .{ ms(st.host), ms(st.gpu), ms(st.idle) });
+        }
+        for (l.stages) |st| {
             io += st.io;
             nb += st.nb_calls;
             nbb += st.nb_bytes;
@@ -625,13 +698,15 @@ pub fn writeRows(w: *std.Io.Writer, in: Input, _: Sum) anyerror!void {
     }
 }
 
-fn writeFile(a: std.mem.Allocator, io: std.Io, base: []const u8, ext: []const u8, in: Input, s: Sum, comptime body: fn (*std.Io.Writer, Input, Sum) anyerror!void) void {
+fn writeFile(comptime arch: Arch, a: std.mem.Allocator, io: std.Io, base: []const u8, ext: []const u8, in: Input, s: Sum, comptime body: fn (*std.Io.Writer, Input, Sum) anyerror!void) void {
+    const alog = logOf(arch);
+    const tag = comptime tagOf(arch);
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
-    body(&aw.writer, in, s) catch |e| return log.err("MIMO_PREFILL_TIMELINE {s}: {s}", .{ ext, @errorName(e) });
+    body(&aw.writer, in, s) catch |e| return alog.err(tag ++ "_PREFILL_TIMELINE {s}: {s}", .{ ext, @errorName(e) });
     const path = std.fmt.allocPrint(a, "{s}{s}", .{ base, ext }) catch return;
     defer a.free(path);
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = aw.written() }) catch |e| log.err("MIMO_PREFILL_TIMELINE write {s}: {s}", .{ path, @errorName(e) });
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = aw.written() }) catch |e| alog.err(tag ++ "_PREFILL_TIMELINE write {s}: {s}", .{ path, @errorName(e) });
 }
 
 // ── tests (any build: the summary is pure; the hooks are checked compiled out in a served build) ──
@@ -740,6 +815,62 @@ test "mimo prefill timeline: stages partition the wall; GPU busy, idle, exposed 
     try writeTiles(&lw.writer, in, s);
     try writeRows(&lw.writer, in, s);
     try testing.expect(std.mem.indexOf(u8, lw.written(), "rhs_bm32") != null);
+}
+
+test "glm5_next prefill timeline: the DSA split's stages sit after attn in its line and TSV; MiMo's order keeps its eleven" {
+    const a = testing.allocator;
+    // A DSA layer: attn [10,20) indexer [20,25) topk [25,28) sparse [28,40) attn [40,45) router [45,50), end 50.
+    const marks = [_]Mark{
+        .{ .t = 0, .stage = .edge },
+        .{ .t = 10, .stage = .attn, .layer = 3 },
+        .{ .t = 20, .stage = .indexer, .layer = 3 },
+        .{ .t = 25, .stage = .topk, .layer = 3 },
+        .{ .t = 28, .stage = .sparse, .layer = 3 },
+        .{ .t = 40, .stage = .attn, .layer = 3 },
+        .{ .t = 45, .stage = .router, .layer = 3 },
+    };
+    const rows = [_]Row{
+        .{ .gpu_start = 11, .gpu_end = 19, .tag = stageTag(.attn, 3) },
+        .{ .gpu_start = 21, .gpu_end = 24, .tag = stageTag(.indexer, 3) },
+        .{ .gpu_start = 26, .gpu_end = 27, .tag = stageTag(.topk, 3) },
+        .{ .gpu_start = 29, .gpu_end = 39, .tag = stageTag(.sparse, 3) },
+    };
+    const in: Input = .{ .rows = &rows, .marks = &marks, .tiles = &.{}, .signals = &.{}, .t_end = 50, .hidden = 4096, .inter = 2048, .order = &glm5_next_order };
+    const s = try summarize(a, in);
+    defer s.deinit(a);
+    try testing.expectEqual(@as(u64, 3), s.layers[3].stages[@intFromEnum(Stage.indexer)].gpu);
+    try testing.expectEqual(@as(u64, 10), s.layers[3].stages[@intFromEnum(Stage.sparse)].gpu);
+    try testing.expectEqual(@as(u64, 15), s.stages[@intFromEnum(Stage.attn)].host);
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try writeLineOf("GLM5_NEXT", &aw.writer, in, s);
+    const line = aw.written();
+    try testing.expect(std.mem.startsWith(u8, line, "GLM5_NEXT_PREFILL_TIMELINE {\"wall_ms\": "));
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, line["GLM5_NEXT_PREFILL_TIMELINE ".len..], .{});
+    defer parsed.deinit();
+    const stages = parsed.value.object.get("stages").?.object;
+    try testing.expectEqual(@as(usize, 14), stages.count());
+    try testing.expectEqualStrings("indexer", stages.keys()[3]);
+    try testing.expectEqualStrings("sparse", stages.keys()[5]);
+    try testing.expectEqualStrings("router", stages.keys()[6]);
+    try testing.expectEqual(@as(f64, 0), parsed.value.object.get("host_residual_ms").?.float);
+    var lw: std.Io.Writer.Allocating = .init(a);
+    defer lw.deinit();
+    try writeLayers(&lw.writer, in, s);
+    const tsv = lw.written();
+    try testing.expect(std.mem.startsWith(u8, tsv, "layer\tedge_host_ms\tedge_gpu_ms\tedge_idle_ms\tpredict_host_ms"));
+    try testing.expect(std.mem.indexOf(u8, tsv, "\tattn_idle_ms\tindexer_host_ms\tindexer_gpu_ms\tindexer_idle_ms\ttopk_host_ms") != null);
+    try testing.expect(std.mem.indexOf(u8, tsv, "\tsparse_idle_ms\trouter_host_ms") != null);
+    // MiMo's line: its eleven stages, none of the DSA split's.
+    var mw: std.Io.Writer.Allocating = .init(a);
+    defer mw.deinit();
+    const mimo_in: Input = .{ .rows = &rows, .marks = &marks, .tiles = &.{}, .signals = &.{}, .t_end = 50, .hidden = 4096, .inter = 2048 };
+    try writeLine(&mw.writer, mimo_in, s);
+    try testing.expect(std.mem.startsWith(u8, mw.written(), "MIMO_PREFILL_TIMELINE {\"wall_ms\": "));
+    try testing.expect(std.mem.indexOf(u8, mw.written(), "\"indexer\"") == null);
+    const mp = try std.json.parseFromSlice(std.json.Value, a, mw.written()["MIMO_PREFILL_TIMELINE ".len..], .{});
+    defer mp.deinit();
+    try testing.expectEqual(@as(usize, 11), mp.value.object.get("stages").?.object.count());
 }
 
 test "mimo prefill timeline: a buffer Metal reports with GPUStartTime 0 is timed from its host commit, not from 0" {

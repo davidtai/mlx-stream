@@ -31,6 +31,8 @@ pub const Params = struct {
     /// The read pool's staging per worker: at least the bank's widest gate/up or down span, page-rounded, plus a page
     /// (`StreamOf.stagingBytes`).
     staging_bytes: u64,
+    /// Profile builds: the route trace's type (route_trace.zig `TraceOf`: u8 ids for at most 256 experts, MiMo's).
+    Trace: type = route_trace.Trace,
 };
 
 /// The bridge over `bank_mod` (an SDK bank module: `bank_mod.SDK` for `StreamOf`, its `Layer`, `n_components`, `mlxDtype`,
@@ -146,8 +148,8 @@ pub fn For(comptime bank_mod: type, comptime params: Params) type {
         pub const StreamSource = struct {
             stream: *Stream,
             calls: [n_routes]Call = @splat(.{}),
-            /// Profile builds only (`mimo-route-trace-v1`): the request's route trace, when one is armed.
-            trace: if (profile.enabled) ?*route_trace.Trace else void = if (profile.enabled) null else {},
+            /// Profile builds only (`mimo-route-trace-v2`, `params.Trace`): the request's route trace, when one is armed.
+            trace: if (profile.enabled) ?*params.Trace else void = if (profile.enabled) null else {},
             /// `MIMO_DIAG=missfree` (profile builds; the CPU tests): the decode phase's misses served from resident slots
             /// (`diag.MissFree`). Owned by the source that armed it. `void` in a served build.
             missfree: if (diag.compiled) ?*diag.MissFree else void = if (diag.compiled) null else {},
