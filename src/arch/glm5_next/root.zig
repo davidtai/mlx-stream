@@ -13,6 +13,7 @@ const settings = @import("settings.zig");
 const bank = @import("bank.zig");
 const bills = @import("bill.zig");
 const module = @import("module.zig");
+const mtp = @import("mtp.zig");
 
 pub const name = "glm5_next";
 pub const family = "mlx-stream";
@@ -166,32 +167,46 @@ pub fn requestEnd(m: *Module) void {
     m.requestEnd();
 }
 
-/// The draft lane: none yet (serial; the MTP lane is the module's phase 4). blockSize 0 is the host's readiness signal:
-/// it arms nothing and every request stays serial.
+/// The draft lane: the MTP lane (`mtp_lane`, mtp.zig, MiMo's draft-lane seam) when the construction installed it,
+/// else serial (blockSize 0: the host arms nothing and every request stays serial).
 pub const draft_lane = struct {
     pub fn blockSize(m: *const Module) u32 {
-        _ = m;
-        return 0;
+        if (comptime !host_caps.dsa_nax) unreachable;
+        return if (m.mtp != null) mtp.verify_rows else 0;
     }
 
     pub fn laneName(m: *const Module) []const u8 {
-        _ = m;
-        return "serial";
+        if (comptime !host_caps.dsa_nax) unreachable;
+        return if (m.mtp != null) mtp.lane_name else "serial";
     }
 
+    /// The exact rule's arms (MiMo's): a clean greedy request `.greedy`, a clean sampled one `.stochastic`; logprobs,
+    /// grammar and penalties stay serial.
     pub fn arm(m: *const Module, req: sdk.ArmRequest) sdk.DraftArm {
-        _ = .{ m, req };
-        return .off;
+        if (comptime !host_caps.dsa_nax) unreachable;
+        if (m.mtp == null) return .off;
+        return mtp.armOf(req);
     }
 
+    /// The host runs a round only on an armed lane (`blockSize` > 0: the construction installed it) after a prompt pass:
+    /// the host contract's invariant (MiMo's), not re-checked per round.
     pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
-        _ = .{ m, a, t1, accepted_cap, sampling };
-        return error.Glm5NextNoDraftLane;
+        if (comptime !host_caps.dsa_nax) unreachable;
+        std.debug.assert(m.mtp != null);
+        return m.mtpRound(a, t1, accepted_cap, sampling);
     }
 
     pub fn stats(m: *const Module) sdk.DraftStats {
-        _ = m;
-        return .{};
+        if (comptime !host_caps.dsa_nax) unreachable;
+        const lane = m.mtp orelse return .{};
+        return .{ .rounds = lane.stats.rounds, .drafted = lane.stats.drafted, .accepted = lane.stats.accepted, .generated = lane.stats.generated };
+    }
+
+    /// The request's receipt line (MiMo's: rounds, accepted per round, misses and bytes per round); the host logs it
+    /// with `[spec-stats]`.
+    pub fn receipt(m: *Module, buf: []u8) []const u8 {
+        if (comptime !host_caps.dsa_nax) unreachable;
+        return m.laneReceipt(buf);
     }
 };
 
@@ -247,13 +262,34 @@ test "glm5_next parse: the settings block is applied at parse; a non-object bloc
     }
 }
 
-test "glm5_next arch table: the registry builds it (a serial draft lane, no prefix restore, no handover)" {
+test "glm5_next arch table: the registry builds it (the draft lane surface, no prefix restore, no handover); no lane, serial" {
     const vt = comptime sdk.Arch.of(@This());
     try testing.expect(vt.request_end != null);
     try testing.expect(vt.restore_prefix == null and vt.handover == null);
     try testing.expect(vt.spec == .draft_lane);
+    if (comptime !host_caps.dsa_nax) return error.SkipZigTest;
     var m: Module = undefined;
+    m.mtp = null;
     try testing.expectEqual(@as(u32, 0), draft_lane.blockSize(&m));
     try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(&m, .{ .greedy = true, .clean = true }));
     try testing.expectEqualStrings("serial", draft_lane.laneName(&m));
+    try testing.expectEqual(@as(u64, 0), draft_lane.stats(&m).rounds);
+    var rbuf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), draft_lane.receipt(&m, &rbuf).len);
+    // With the lane installed the arms are the exact rule's (mtp.armOf): greedy, stochastic; an unclean request serial.
+    try testing.expectEqual(sdk.DraftArm.greedy, mtp.armOf(.{ .greedy = true, .clean = true }));
+    try testing.expectEqual(sdk.DraftArm.stochastic, mtp.armOf(.{ .greedy = false, .clean = true }));
+    try testing.expectEqual(sdk.DraftArm.off, mtp.armOf(.{ .greedy = true, .clean = false }));
+    // The installed lane through the host's table: its verify rows, its name, its arms and its counters.
+    var lane: mtp.Lane = undefined;
+    lane.stats = .{};
+    m.mtp = &lane;
+    const tbl = vt.spec.draft_lane;
+    try testing.expectEqual(@as(u32, 4), tbl.block_size(&m));
+    try testing.expectEqualStrings("glm5_next-mtp exact", tbl.lane_name(&m));
+    try testing.expectEqual(sdk.DraftArm.greedy, tbl.arm(&m, .{ .greedy = true, .clean = true }));
+    try testing.expectEqual(sdk.DraftArm.stochastic, tbl.arm(&m, .{ .greedy = false, .clean = true }));
+    try testing.expectEqual(sdk.DraftArm.off, tbl.arm(&m, .{ .greedy = false, .clean = false }));
+    lane.stats.add(3, 2);
+    try testing.expectEqual(sdk.DraftStats{ .rounds = 1, .drafted = 3, .accepted = 2, .generated = 3 }, tbl.stats(&m));
 }

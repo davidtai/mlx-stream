@@ -1155,7 +1155,7 @@ fn selectRows(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, idx_cac
         try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
         return out;
     } else {
-        if (comptime ptl.enabled) ptl.stage(.indexer);
+        if (comptime ptl.enabled) if (ptl.recording()) ptl.stage(.indexer);
         // Scores: sum_h w_h * relu(q_h . pool_key) * Dh^-0.5, f32; pools a query cannot see lose.
         const pk = try storedPoolKeys(s, idx_cache, p, ix);
         defer _ = mlx.mlx_array_free(pk);

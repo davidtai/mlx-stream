@@ -172,11 +172,12 @@ pub fn wantFor(io: std.Io, comptime a: Arch) error{PrefillTimelineSetting}!bool 
     return true;
 }
 
-/// The timeline is recording a prompt pass (profile builds; false in every other build): an arch's profile-only evals
-/// at its stage boundaries (glm5_next's DSA split) run only then.
+/// The timeline is recording a prompt pass inside one of the model's layers (profile builds; false in every other
+/// build): an arch's profile-only marks and evals at its stage boundaries (glm5_next's DSA split) run only then, never
+/// for work outside the layers (the edge, glm5_next's MTP lane catching up between prompt calls).
 pub fn recording() bool {
     if (comptime !enabled) return false;
-    return state.active;
+    return state.active and state.layer != no_layer;
 }
 
 /// The prompt phase begins: the first one of the process installs the hook on `s`'s queue and arms the storage.

@@ -15,6 +15,8 @@ const settings = @import("settings.zig");
 const bank = @import("bank.zig");
 const graph = @import("graph.zig");
 const experts = @import("experts.zig");
+const kda = @import("kda.zig");
+const mtp = @import("mtp.zig");
 const mimo_math = @import("../mimo_v2/math.zig");
 const mimo_stream = @import("../mimo_v2/stream.zig");
 const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
@@ -130,6 +132,8 @@ pub const Inputs = struct {
     combine: prefill_combine.Route = .inplace,
     /// The decode lane's expert route (`settings.DecodeMoe`).
     decode_moe: settings.DecodeMoe = .stock,
+    /// The MTP lane's construction facts (`mtp_lane` on; null: the serial control, none of the lane's terms).
+    mtp: ?mtp.Facts = null,
     page: u64 = 16_384,
 };
 
@@ -266,7 +270,15 @@ pub fn bufferCensus(in: *const Inputs) u64 {
     const g = in.geometry;
     const construction = in.residents.tensors + graph.Weights.ownedArrays(c) + (g.num_moe_layers + 1) * bank.n_components + 2 * c.nDsa() + 2 * c.nKda();
     const tiles = (@as(u64, graph.prompt_call_rows) * c.n_experts_per_tok + mimo_math.projection_rows - 1) / mimo_math.projection_rows + mimo_stream.max_route_ids;
-    return construction + 2 * (tiles + 2 * (graph.prompt_call_rows / graph.span_rows) + 256);
+    const lane: u64 = if (in.mtp != null) laneBuffers(c) else 0;
+    return construction + 2 * (tiles + 2 * (graph.prompt_call_rows / graph.span_rows) + 256) + lane;
+}
+
+/// The MTP lane's live buffers (`bufferCensus`, `mtp_lane` on): at construction the layer's residents, the draft bank's
+/// nine arrays, the head's three f32 tables and its two lanes; in a round, every KDA layer's capture (its state rows and
+/// conv window) and a partial accept's restored state and conv tail, counted twice as a forward's arrays are.
+pub fn laneBuffers(c: *const glm.Config) u64 {
+    return mtp.n_residents + bank.n_components + 3 + 2 + 2 * (4 * @as(u64, c.nKda()));
 }
 
 fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
@@ -276,12 +288,30 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
     const kv = kvBytes(c, in.reserve, page);
     const states = kdaStateBytes(c, page);
     const t: u64 = @min(in.reserve, graph.prompt_call_rows);
-    const waves: [2]u64 = .{ promptWaveBytes(c, t, in.reserve), decodeWaveBytes(c, in.reserve) };
+    // The MTP lane's verify runs `mtp.verify_rows` rows through the decode lane (every row's logits and hidden).
+    const decode_rows: u64 = if (in.mtp != null) mtp.verify_rows else 1;
+    const waves: [2]u64 = .{ promptWaveBytes(c, t, in.reserve), decode_rows * decodeWaveBytes(c, in.reserve) };
     const cache: [2]u64 = .{ experts.prompt_cache_bytes, experts.decode_cache_bytes };
     const overshoot: [2]u64 = .{ overshootBytes(in, .prompt), overshootBytes(in, .decode) };
     const resident = in.residents.bytes;
+    // The MTP lane (`mtp_lane` on): its own terms and the arch's for it (`laneTerms`); what it holds on the GPU from the
+    // open (the bank, the layer's residents, the head's tables and lanes) is wired with the trunk's residents, its
+    // request arrays (pending rows, waves, the KDA captures, the hidden taps) with the request's.
+    const lane: ?[6]Term = if (in.mtp) |f| mtp.terms(f, c, in.reserve, page) else null;
+    const lane_arch: ?[3]Term = if (in.mtp != null) laneTerms(in) else null;
+    var lane_held: u64 = 0;
+    var lane_request: [2]u64 = .{ 0, 0 };
+    if (in.mtp) |f| lane_held = f.bank_bytes + f.resident_bytes + f.table_bytes + mtp.kvBytes(c, in.reserve, page);
+    if (lane) |lt| for (lt) |x| if (!x.at_construction) {
+        lane_request[0] += x.bytes[0];
+        lane_request[1] += x.bytes[1];
+    };
+    if (lane_arch) |la| for (la) |x| if (!x.at_construction) {
+        lane_request[0] += x.bytes[0];
+        lane_request[1] += x.bytes[1];
+    };
     var wired: [2]u64 = undefined;
-    for (&wired, cache, overshoot) |*w, ch, o| w.* = resident + owned.tables + owned.routers + kv + ch + settings.compilation_bytes + o;
+    for (&wired, cache, overshoot) |*w, ch, o| w.* = resident + owned.tables + owned.routers + kv + ch + settings.compilation_bytes + o + lane_held;
     const terms = [_]Term{
         .{ .name = "residents", .bytes = @splat(resident), .at_construction = true },
         .{ .name = "trunk_f32_tables", .bytes = @splat(owned.tables), .at_construction = true },
@@ -295,9 +325,33 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         .{ .name = "resident_wiring", .bytes = .{ wireTables(wired[0]), wireTables(wired[1]) }, .at_construction = false },
         .{ .name = "buffer_allowance", .bytes = @splat(wire_buffer_bytes * bufferCensus(in)), .at_construction = false },
         .{ .name = "request", .bytes = waves, .at_construction = false },
-        .{ .name = "request_wiring", .bytes = .{ wireTables(waves[0] + states), wireTables(waves[1] + states) }, .at_construction = false },
+        .{ .name = "request_wiring", .bytes = .{ wireTables(waves[0] + states + lane_request[0]), wireTables(waves[1] + states + lane_request[1]) }, .at_construction = false },
     };
-    return a.dupe(Term, &terms);
+    const lt = lane orelse return a.dupe(Term, &terms);
+    const la = lane_arch.?;
+    const out = try a.alloc(Term, terms.len + lt.len + la.len);
+    @memcpy(out[0..terms.len], &terms);
+    @memcpy(out[terms.len..][0..lt.len], &lt);
+    @memcpy(out[terms.len + lt.len ..], &la);
+    return out;
+}
+
+/// The MTP lane's terms the arch bills beside the lane's own (`mtp.terms`):
+///   mtp_kda_capture  the verify's per-row KDA states (`kda.Capture`: `verify_rows` rows of every KDA layer's state and
+///                    conv tail) and a partial accept's restored copy of one row, decode only
+///   mtp_taps         the forwards' final-normed hidden rows (`graph.Head.hidden` / `.verify`): the rows' mean over the
+///                    hc streams and its norm, a prompt call's rows / a verify's
+///   mtp_history      the request's token ids (the lane's pairs' next tokens), held from construction
+pub fn laneTerms(in: *const Inputs) [3]Term {
+    const c = &in.model;
+    const h: u64 = c.hidden_size;
+    const t: u64 = @min(in.reserve, graph.prompt_call_rows);
+    const capture = (@as(u64, mtp.verify_rows) + 1) * c.nKda() * kda.Capture.rowBytes(c);
+    return .{
+        .{ .name = "mtp_kda_capture", .bytes = .{ 0, capture }, .at_construction = false },
+        .{ .name = "mtp_taps", .bytes = .{ 2 * t * h * bf16, 2 * @as(u64, mtp.verify_rows) * h * bf16 }, .at_construction = false },
+        .{ .name = "mtp_history", .bytes = @splat((in.reserve + mtp.verify_rows) * 4), .at_construction = true },
+    };
 }
 
 // ── The expert source's terms (MiMo's route: experts.zig) ──
@@ -394,6 +448,15 @@ pub fn billOf(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
 pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, reserve: u64) !Inputs {
     const dir = cfg.model_dir orelse return error.Glm5NextPackDir;
     const page = std.heap.pageSize();
+    // The MTP lane's facts (the draft bank's manifest, the MTP layer's shard headers), refused by name when absent.
+    var lane: ?mtp.Facts = null;
+    if (cfg.mtp_lane) {
+        var diag: sdk.Diag = .{};
+        lane = mtp.facts(a, io, dir, &cfg.model, page, &diag) catch |e| {
+            if (diag.len > 0) sdk.log.err("{s}\n", .{diag.message()});
+            return e;
+        };
+    }
     return .{
         .model = cfg.model,
         .geometry = try bank.inspect(a, io, dir),
@@ -401,6 +464,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .reserve = reserve,
         .combine = experts.combineRoute(),
         .decode_moe = cfg.decode_moe,
+        .mtp = lane,
         .page = page,
     };
 }
@@ -515,6 +579,36 @@ test "glm5_next bill: the terms sum to the bill, the slot wiring is the one row 
     try testing.expectEqual(wireTables(termOf(b, "slot_transient")[0] + rows.prompt * b.per_row), b.row_terms.?.at(&b.row_terms.?.data, .prompt, rows.prompt, rows.prompt * b.per_row));
 }
 
+test "glm5_next bill: the MTP lane adds its terms, the verify's rows on the decode wave and its KDA captures; off, none" {
+    const a = testing.allocator;
+    var in = try fixtureInputs(32_768);
+    const off = try billOf(a, &in);
+    defer off.free(a);
+    in.mtp = .{ .bank_bytes = 4_076_866_944, .resident_bytes = 369_670_784, .table_bytes = 6_817_792 };
+    const on = try billOf(a, &in);
+    defer on.free(a);
+    for ([_][]const u8{ "mtp_bank", "mtp_residents", "mtp_tables", "mtp_kv", "mtp_pending", "mtp_wave", "mtp_kda_capture", "mtp_taps", "mtp_history" }) |name| {
+        var found = false;
+        for (on.terms) |x| found = found or std.mem.eql(u8, x.name, name);
+        try testing.expect(found);
+        for (off.terms) |x| try testing.expect(!std.mem.eql(u8, x.name, name));
+    }
+    // The verify's 4 rows on the decode wave; the prompt wave unchanged.
+    try testing.expectEqual(termOf(off, "request")[0], termOf(on, "request")[0]);
+    try testing.expectEqual(4 * termOf(off, "request")[1], termOf(on, "request")[1]);
+    // The captures: (4 + 1) rows of 34 KDA layers' state and conv tail, decode only.
+    try testing.expectEqual([2]u64{ 0, 5 * 34 * (4_194_304 + 294_912) }, termOf(on, "mtp_kda_capture"));
+    try testing.expect(on.fixed(.decode) > off.fixed(.decode) + 4_076_866_944);
+    // The lane's GPU arrays are wired (its held ones with the residents, its request ones with the request's) and its
+    // buffers counted: each wiring term at least the page tables of what the lane adds, the census its buffers.
+    const held = in.mtp.?.bank_bytes + in.mtp.?.resident_bytes + in.mtp.?.table_bytes + termOf(on, "mtp_kv")[0];
+    for (0..2) |ph| {
+        try testing.expect(termOf(on, "resident_wiring")[ph] >= termOf(off, "resident_wiring")[ph] + wireTables(held) - 64);
+        try testing.expect(termOf(on, "request_wiring")[ph] > termOf(off, "request_wiring")[ph]);
+        try testing.expectEqual(termOf(off, "buffer_allowance")[ph] + wire_buffer_bytes * laneBuffers(&in.model), termOf(on, "buffer_allowance")[ph]);
+    }
+}
+
 test "glm5_next bill: every term is non-decreasing in the billed context (the ladder bounds a rung by the next printed table)" {
     const a = testing.allocator;
     var prev: ?sdk.MemoryBill = null;
@@ -578,9 +672,11 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
         std.debug.print("config refused: {s}\n", .{diag.message()});
         return e;
     };
-    var cfg: settings.Config = .{ .model = model, .model_dir = dir, .wired_margin_bytes = box_stop };
+    // `GLM5_BILL_MTP=1`: the bill with the MTP lane installed (its terms, the verify's rows, the KDA captures).
+    const lane = if (std.c.getenv("GLM5_BILL_MTP")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    var cfg: settings.Config = .{ .model = model, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane };
     const res = try residentBytes(a, io, dir, &model, std.heap.pageSize());
-    std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows });
+    std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off" });
     for (tool_contexts) |ctx| {
         cfg.effective_context = ctx;
         const b = try completeBill(a, io, &cfg, cfg.reserveTokens());

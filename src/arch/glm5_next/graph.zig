@@ -272,7 +272,7 @@ fn need(map: *const sdk.Weights, name: []const u8, shape: []const c_int, diag: ?
 }
 
 /// `x` as f32 in a buffer of its own (transposed when asked), evaluated: never the weight map's buffer.
-fn f32Copy(s: mlx.mlx_stream, x: T, transposed: bool) !T {
+pub fn f32Copy(s: mlx.mlx_stream, x: T, transposed: bool) !T {
     var t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(t);
     if (transposed) try mlx.check(mlx.mlx_transpose(&t, x, s)) else _ = mlx.mlx_array_set(&t, x);
@@ -288,7 +288,7 @@ fn f32Copy(s: mlx.mlx_stream, x: T, transposed: bool) !T {
 }
 
 /// kv_b_proj [heads * (nope + v), latent] as [heads, nope + v, latent], rows [lo, hi) of each head: a view.
-fn view(s: mlx.mlx_stream, kv_b: T, shape: []const c_int, lo: c_int, hi: c_int) !T {
+pub fn view(s: mlx.mlx_stream, kv_b: T, shape: []const c_int, lo: c_int, hi: c_int) !T {
     var r3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(r3);
     try mlx.check(mlx.mlx_reshape(&r3, kv_b, shape.ptr, shape.len, s));
@@ -334,6 +334,8 @@ pub const Cache = struct {
     latent: []dsa.Lane,
     index: []dsa.Lane,
     kda: []kda.State,
+    /// The MTP verify's captures, one per KDA layer (`Head.verify`): released after each round (`rollback`).
+    capture: []kda.Capture,
     len: u32 = 0,
     cap: u32,
 
@@ -343,12 +345,15 @@ pub const Cache = struct {
         const index = try a.alloc(dsa.Lane, c.nDsa());
         errdefer a.free(index);
         const kda_states = try a.alloc(kda.State, c.nKda());
+        errdefer a.free(kda_states);
+        const captures = try a.alloc(kda.Capture, c.nKda());
         for (latent, index) |*lt, *ix| {
             lt.* = dsa.Lane.init(cap, cap);
             ix.* = dsa.Lane.init(cap, cap);
         }
         for (kda_states) |*st| st.* = .{};
-        return .{ .a = a, .latent = latent, .index = index, .kda = kda_states, .cap = cap };
+        for (captures) |*cp| cp.* = .{};
+        return .{ .a = a, .latent = latent, .index = index, .kda = kda_states, .capture = captures, .cap = cap };
     }
 
     pub fn deinit(self: *Cache, g: *G) void {
@@ -357,9 +362,11 @@ pub const Cache = struct {
             ix.deinit(g);
         }
         for (self.kda) |*st| st.reset(g);
+        for (self.capture) |*cp| cp.release(g);
         self.a.free(self.latent);
         self.a.free(self.index);
         self.a.free(self.kda);
+        self.a.free(self.capture);
         self.* = undefined;
     }
 
@@ -387,7 +394,43 @@ pub const Cache = struct {
             ix.truncateTo(0);
         }
         for (self.kda) |*st| st.reset(g);
+        for (self.capture) |*cp| cp.release(g);
         self.len = 0;
+    }
+
+    /// The MTP round's rollback after a verify of `rows` rows at `start` that kept `kept` of them (t1 and the accepted
+    /// drafts): the DSA lanes truncated to the kept positions; every KDA state the capture's at row `kept - 1` (a partial
+    /// accept; a full one keeps the verify's own final state); the captures released; the length the kept positions.
+    pub fn rollback(self: *Cache, g: *G, c: *const glm.Config, start: u32, rows: u32, kept: u32) !void {
+        std.debug.assert(kept >= 1 and kept <= rows and self.len == start + rows);
+        const len = start + kept;
+        for (self.latent, self.index) |*lt, *ix| {
+            lt.truncateTo(len);
+            ix.truncateTo(len);
+        }
+        if (kept < rows) {
+            const m = g.mark();
+            defer g.resetTo(m);
+            var restored: std.ArrayList(T) = .empty;
+            defer restored.deinit(self.a);
+            for (self.kda, self.capture) |*st, *cp| {
+                try kda.restore(g, c, st, cp, kept - 1);
+                try restored.append(self.a, st.conv.?);
+                try restored.append(self.a, st.rec.?);
+            }
+            // The copies evaluated now, so the captures' buffers go with their handles below.
+            try g.evalAll(restored.items);
+        }
+        for (self.capture) |*cp| cp.release(g);
+        self.len = len;
+    }
+
+    /// The verify's captures (every KDA layer's state rows and conv window): evaluated with the verify.
+    pub fn captureArrays(self: *const Cache, out: *std.ArrayList(T), a: std.mem.Allocator) !void {
+        for (self.capture) |cp| {
+            if (cp.seq) |x| try out.append(a, x);
+            if (cp.window) |x| try out.append(a, x);
+        }
     }
 
     /// The layer's arrays an evaluation of its forward covers (lanes and states).
@@ -416,18 +459,18 @@ pub const Cache = struct {
     }
 };
 
-fn linear(g: *G, x: T, w: T) !T {
+pub fn linear(g: *G, x: T, w: T) !T {
     return g.matmul(x, try g.transpose(w));
 }
 
-fn rmsNorm(g: *G, x: T, w: T, eps: f32) !T {
+pub fn rmsNorm(g: *G, x: T, w: T, eps: f32) !T {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_rms_norm(&o, x, w, eps, g.s));
     return g.adopt(o);
 }
 
 /// silu(min(gate, limit)) * clip(up, -limit, limit) (the SDK's clamped SwiGLU: mlx-serve's `clampedSwiGLU`), then down.
-fn mlp(g: *G, c: *const glm.Config, m: Mlp, x: T) !T {
+pub fn mlp(g: *G, c: *const glm.Config, m: Mlp, x: T) !T {
     const act = try sdk_ext.quant.activation(G, g, .{ .swiglu_clamped = c.swiglu_limit }, try linear(g, x, m.gate), try linear(g, x, m.up));
     return linear(g, act, m.down);
 }
@@ -475,12 +518,16 @@ pub fn route(g: *G, c: *const glm.Config, r: Router, x: T) !Routing {
 
 /// The sublayer attention of layer `lw` on `stream` [1, R, hc, hidden] (rows at `start`): the collapse, the norm, KDA or
 /// DSA, the expand -> the new stream.
-fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start: u32, cache: *Cache, routes: dsa.Routes) !T {
+fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start: u32, cache: *Cache, routes: dsa.Routes, comptime head: Head) !T {
     var col = try ops.collapse(g.s, stream, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, c.hc_iters, c.hc_eps, c.rms_norm_eps);
     defer col.deinit();
     const normed = try rmsNorm(g, col.x, lw.input_norm, c.rms_norm_eps);
     const out = switch (lw.attn) {
-        .kda => |*kw| try kda.forward(g, c, kw, normed, &cache.kda[lw.slot]),
+        // The MTP verify captures every row's state (`Cache.rollback`); every other call advances the state alone.
+        .kda => |*kw| if (head == .verify)
+            try kda.forwardCapture(g, c, kw, normed, &cache.kda[lw.slot], &cache.capture[lw.slot])
+        else
+            try kda.forward(g, c, kw, normed, &cache.kda[lw.slot]),
         .dsa => |*dw| try dsa.forward(g, c, dw, normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes),
     };
     return g.adopt(try ops.expand(g.s, out, stream, &col));
@@ -511,7 +558,17 @@ fn readAhead(g: *G, c: *const glm.Config, lw: *const Layer, spans: []const T, sr
     try src.readAheadSeed(layer, expert_policy.rankHottest(counts, &src.ahead_ranked));
 }
 
-pub const Head = enum { last, dump };
+/// What a forward hands back after its last layer (a comptime route per call site):
+///   last    the last row's logits f32 [1, vocab] (the served prompt pass and serial steps without the MTP lane)
+///   dump    `last`, and every row's logits to the dump route's sink (the KL gate)
+///   hidden  `last`, and every row's final-normed hidden [rows, hidden] bf16 into `Taps.hidden` (the MTP lane's pairs:
+///           the prompt pass and serial steps with the lane on)
+///   verify  every row's logits f32 [rows, vocab] and final-normed hidden (`Taps.hidden`), each KDA layer's per-row
+///           states captured (the MTP lane's verify; `Cache.rollback`)
+pub const Head = enum { last, dump, hidden, verify };
+
+/// The hidden rows a `hidden` / `verify` forward hands back (a kept handle the caller releases).
+pub const Taps = struct { hidden: ?T = null };
 
 /// One forward of `ids` at positions [start, start + ids.len) through every layer (each layer's state advanced in
 /// `cache`), the routed experts through `src`: the last row's logits f32 [1, vocab], a kept handle the caller frees.
@@ -563,7 +620,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
         var prev: ?T = null;
         for (spans, 0..) |*sp, i| {
             const ms = g.mark();
-            const next = g.keep(try attentionSpan(g, c, lw, sp.*, start + @as(u32, @intCast(i * span_rows)), cache, routes));
+            const next = g.keep(try attentionSpan(g, c, lw, sp.*, start + @as(u32, @intCast(i * span_rows)), cache, routes, head));
             g.resetTo(ms);
             g.release(sp.*);
             sp.* = next;
@@ -620,12 +677,28 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
     if (comptime ptl.enabled) ptl.leaveLayers();
     cache.len = start + rows;
     if (head == .dump) try dumpRows(g, c, w, spans, sink);
+    if (head == .hidden or head == .verify) {
+        const final_rows = try normedRows(g, c, w, spans, rows);
+        sink.hidden = g.keep(final_rows);
+        // The verify's rows: every row's logits from the same normed rows.
+        if (head == .verify) return g.keep(try g.astype(try linear(g, final_rows, w.head), .float32));
+    }
     // The last row: the stream's mean over its hc streams, the final norm, the head, f32.
     const last = spans[n_spans - 1];
     const lr = g.shapeOf(last).dim(1);
     const row = try g.slice(last, &.{ 0, lr - 1, 0, 0 }, &.{ 1, lr, hc, hidden }, &.{ 1, 1, 1, 1 });
     const mean = try g.reshape(try g.mean(row, 2, false), &.{ 1, hidden });
     return g.keep(try g.astype(try linear(g, try rmsNorm(g, mean, w.norm, c.rms_norm_eps), w.head), .float32));
+}
+
+/// Every row's final-normed hidden [rows, hidden] (bf16): the stream's mean over its hc streams, the final norm (the
+/// head's input: the MTP lane's pairs take the hidden the lm_head reads).
+fn normedRows(g: *G, c: *const glm.Config, w: *const Weights, spans: []const T, rows: u32) !T {
+    const hidden: c_int = @intCast(c.hidden_size);
+    var means: [prompt_call_rows / span_rows + 1]T = undefined;
+    for (spans, means[0..spans.len]) |sp, *mn| mn.* = try g.mean(sp, 2, false);
+    const all = if (spans.len == 1) means[0] else try g.concat(means[0..spans.len], 1);
+    return rmsNorm(g, try g.reshape(all, &.{ @intCast(rows), hidden }), w.norm, c.rms_norm_eps);
 }
 
 /// The dump route's rows: every row of every span through the final norm and the head, f32, `dump_chunk_rows` at a time,

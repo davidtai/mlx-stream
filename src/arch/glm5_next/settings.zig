@@ -1,7 +1,7 @@
 //! glm5_next's construction config: the pack's model (config.zig), the pack's `expert_streaming.settings` (read once at
 //! construction; a key that is not a setting refuses the load by name) and the host's load facts. MiMo's contract: the
-//! operator pins the rows with `expert_prefill_rows` / `expert_rows` (either alone forces both); `mtp_lane` names the
-//! draft lane (not served yet: refused by name when on); `decode_moe` the decode lane's expert route (`stock`, MLX's
+//! operator pins the rows with `expert_prefill_rows` / `expert_rows` (either alone forces both); `mtp_lane` installs the
+//! MTP draft lane (mtp.zig; off, the serial control, by default); `decode_moe` the decode lane's expert route (`stock`, MLX's
 //! gathers, the default; `fused`, the NVFP4 decode texts); `logits_dump_dir` (an absolute directory) installs the logits
 //! dump route for the KL gate (dump.zig): absent, nothing of it is built.
 
@@ -117,7 +117,6 @@ pub const Config = struct {
         if (c.malformed.mtp_lane) return error.Glm5NextMtpLaneSetting;
         if (c.malformed.dump_dir) return error.Glm5NextLogitsDumpDir;
         if (c.malformed.decode_moe) return error.Glm5NextDecodeMoeSetting;
-        if (c.mtp_lane) return error.Glm5NextMtpLaneNotServed;
         if (c.kv_quant_bits) |b| if (b != 0 and b != 16) return error.Glm5NextKvQuantUnsupported;
         if (c.expert_rows) |d| if (d > c.model.n_routed_experts) return error.Glm5NextExpertRows;
         if (c.expert_prefill_rows) |p| if (p > c.model.n_routed_experts) return error.Glm5NextExpertRows;
@@ -147,7 +146,11 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectError(error.Glm5NextExpertRowsSetting, (try parseSettings("{\"expert_rows\":\"130\"}")).validate());
     try testing.expectError(error.Glm5NextPhaseRows, (try parseSettings("{\"expert_rows\":120,\"expert_prefill_rows\":121}")).validate());
     try testing.expectError(error.Glm5NextExpertRows, (try parseSettings("{\"expert_rows\":289}")).validate());
-    try testing.expectError(error.Glm5NextMtpLaneNotServed, (try parseSettings("{\"mtp_lane\":true}")).validate());
+    // The lane: off by default, on by name; anything but a bool refused.
+    try testing.expect(!(try parseSettings("{}")).mtp_lane);
+    const on = try parseSettings("{\"mtp_lane\":true}");
+    try on.validate();
+    try testing.expect(on.mtp_lane);
     try testing.expectError(error.Glm5NextMtpLaneSetting, (try parseSettings("{\"mtp_lane\":1}")).validate());
     try (try parseSettings("{\"mtp_lane\":false}")).validate();
     // The dump route: an absolute directory, else refused by name; absent, none.

@@ -168,6 +168,15 @@ pub fn stepEnd(t0: dt.Stamp) void {
     if (state.phase == .decode) state.steps += 1;
 }
 
+/// An MTP round's end (its verify was the step's forward, `stepBegin` traced t1): the round's accepted drafts and its
+/// further tokens in the trace (`tokens` = [t1, the accepted drafts]).
+pub fn roundEnd(accepted: u32, tokens: []const u32) void {
+    if (comptime !enabled) return;
+    const t = state.trace orelse return;
+    t.roundAccepted(accepted);
+    for (tokens[1..]) |id| t.decodeToken(id);
+}
+
 /// The request's end (the decode phase's): the phase lines, `DECODE_TIMERS`, the GPU timeline's line and file, the
 /// trace's files.
 pub fn decodeEnd(src: *experts.Source) void {

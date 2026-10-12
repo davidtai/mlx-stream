@@ -405,19 +405,19 @@ pub const Head = struct {
             .q_b = try lg.get("self_attn.q_b_proj.weight", &.{ heads * hd, ql }),
             .kv_a = try lg.get("self_attn.kv_a_proj_with_mqa.weight", &.{ r, h }),
             .kv_a_norm = try lg.get("self_attn.kv_a_layernorm.weight", &.{r}),
-            .wk = try head.own(a, try kvbView(s, kv_b, &.{ heads, 2 * hd, r }, 0, hd)),
-            .wv = try head.own(a, try kvbView(s, kv_b, &.{ heads, 2 * hd, r }, hd, 2 * hd)),
+            .wk = try head.own(a, try graph.view(s, kv_b, &.{ heads, 2 * hd, r }, 0, hd)),
+            .wv = try head.own(a, try graph.view(s, kv_b, &.{ heads, 2 * hd, r }, hd, 2 * hd)),
             .o = try lg.get("self_attn.o_proj.weight", &.{ h, heads * hd }),
             .idx_wq_b = try lg.get("self_attn.indexer.wq_b.weight", &.{ ih * ihd, ql }),
             .idx_wk = try lg.get("self_attn.indexer.wk.weight", &.{ ihd, h }),
             .idx_k_norm_w = try lg.get("self_attn.indexer.k_norm.weight", &.{ihd}),
             .idx_k_norm_b = try lg.get("self_attn.indexer.k_norm.bias", &.{ihd}),
             .idx_wproj = try lg.get("self_attn.indexer.weights_proj.weight", &.{ ih, h }),
-            .idx_gate_t = try head.own(a, try f32Copy(s, try lg.get("self_attn.indexer.index_kpool_compress_gate", &.{ ihd, h }), true)),
-            .idx_ape = try head.own(a, try f32Copy(s, try lg.get("self_attn.indexer.index_kpool_compress_ape", &.{ @intCast(c.index_kpool), ihd }), false)),
+            .idx_gate_t = try head.own(a, try graph.f32Copy(s, try lg.get("self_attn.indexer.index_kpool_compress_gate", &.{ ihd, h }), true)),
+            .idx_ape = try head.own(a, try graph.f32Copy(s, try lg.get("self_attn.indexer.index_kpool_compress_ape", &.{ @intCast(c.index_kpool), ihd }), false)),
         };
         head.router = .{
-            .w_t = try head.own(a, try f32Copy(s, try lg.get("mlp.gate.weight", &.{ e, h }), true)),
+            .w_t = try head.own(a, try graph.f32Copy(s, try lg.get("mlp.gate.weight", &.{ e, h }), true)),
             .bias = try lg.get("mlp.gate.e_score_correction_bias", &.{e}),
         };
         if (mlx.mlx_array_dtype(head.router.bias) != .float32) return refuse(diag, error.Glm5NextMtpResidentDtype, "mlp.gate.e_score_correction_bias is not F32", .{});
@@ -449,49 +449,6 @@ pub const Head = struct {
         return graph.bufferBytes(h * c.n_routed_experts * 4, page) + graph.bufferBytes(h * c.index_head_dim * 4, page) + graph.bufferBytes(@as(u64, c.index_kpool) * c.index_head_dim * 4, page);
     }
 };
-
-/// `x` as f32 in a buffer of its own (transposed when asked), evaluated (graph.zig's `f32Copy`).
-fn f32Copy(s: mlx.mlx_stream, x: T, transposed: bool) !T {
-    var t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(t);
-    if (transposed) try mlx.check(mlx.mlx_transpose(&t, x, s)) else _ = mlx.mlx_array_set(&t, x);
-    var f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_astype(&f, t, .float32, s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_contiguous(&out, f, false, s));
-    try mlx.check(mlx.mlx_array_eval(out));
-    return out;
-}
-
-/// kv_b_proj [heads * 2 * head_dim, latent] as [heads, 2 * head_dim, latent], rows [lo, hi) of each head: a view
-/// (graph.zig's `view`).
-fn kvbView(s: mlx.mlx_stream, kv_b: T, shape: []const c_int, lo: c_int, hi: c_int) !T {
-    var r3 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(r3);
-    try mlx.check(mlx.mlx_reshape(&r3, kv_b, shape.ptr, shape.len, s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_slice(&out, r3, &[_]c_int{ 0, lo, 0 }, 3, &[_]c_int{ shape[0], hi, shape[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-    return out;
-}
-
-fn linear(g: *G, x: T, w: T) !T {
-    return g.matmul(x, try g.transpose(w));
-}
-
-fn rmsNorm(g: *G, x: T, w: T, eps: f32) !T {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_fast_rms_norm(&o, x, w, eps, g.s));
-    return g.adopt(o);
-}
-
-/// The clamped SwiGLU MLP (graph.zig's `mlp`: the SDK's `swiglu_clamped` at the model's limit).
-fn mlp(g: *G, c: *const glm.Config, m: graph.Mlp, x: T) !T {
-    const act = try sdk_ext.quant.activation(G, g, .{ .swiglu_clamped = c.swiglu_limit }, try linear(g, x, m.gate), try linear(g, x, m.up));
-    return linear(g, act, m.down);
-}
 
 // ── the lane ──
 
@@ -559,7 +516,7 @@ pub const Lane = struct {
         var active1: usize = 0;
         _ = mlx.mlx_get_active_memory(&active1);
         self.measured_bytes = active1 -| active0;
-        log.info("glm5_next MTP lane: lane=\"{s}\" depth={d} verify_rows={d} bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, max_depth, verify_rows, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
+        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, max_depth, verify_rows, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
         return self;
     }
 
@@ -597,6 +554,17 @@ pub const Lane = struct {
         return .{ .latent = &self.latent, .index = &self.index };
     }
 
+    /// A serial step of `rows` after the trunk's `len` positions is one the lane keeps (`pend`): the lane follows the
+    /// trunk and its pending rows stay within `max_pending`. Past them it stops following the request (logged once);
+    /// the module's step then takes the served forward.
+    pub fn keepsStep(self: *Lane, len: u64, rows: u32) bool {
+        if (self.tracked() != len) return false;
+        if (self.n_pending + rows <= max_pending) return true;
+        if (!self.untracked_logged) log.info("glm5_next MTP lane: {d} serial steps past its last round, the lane stops tracking this request\n", .{self.n_pending});
+        self.untracked_logged = true;
+        return false;
+    }
+
     /// The final-normed hidden `[rows, hidden]` (bf16) of the trunk positions after the tracked ones, pending. Past
     /// `max_pending` serial positions (a request the lane does not draft) the lane stops tracking: the rows are dropped
     /// and `tracked` stays behind the trunk (no round drafts until the next request).
@@ -621,9 +589,9 @@ pub const Lane = struct {
     fn input(self: *const Lane, g: *G, w: *const graph.Weights, tokens: []const u32, hidden: T) !T {
         const c = self.c;
         const idx = try g.hostArray(std.mem.sliceAsBytes(tokens), &.{@intCast(tokens.len)}, .uint32);
-        const e = try rmsNorm(g, try g.take(w.embed, idx, 0), self.head.enorm, c.rms_norm_eps);
-        const hn = try rmsNorm(g, try g.astype(hidden, g.dtypeOf(e)), self.head.hnorm, c.rms_norm_eps);
-        return linear(g, try g.concat(&.{ e, hn }, -1), self.head.eh_proj);
+        const e = try graph.rmsNorm(g, try g.take(w.embed, idx, 0), self.head.enorm, c.rms_norm_eps);
+        const hn = try graph.rmsNorm(g, try g.astype(hidden, g.dtypeOf(e)), self.head.hnorm, c.rms_norm_eps);
+        return graph.linear(g, try g.concat(&.{ e, hn }, -1), self.head.eh_proj);
     }
 
     /// The routed experts of `x` [n, hidden] at the router's choice: each (row, route) one gather row against the
@@ -650,12 +618,12 @@ pub const Lane = struct {
         const c = self.c;
         const n = g.shapeOf(x).dim(0);
         const h: c_int = @intCast(c.hidden_size);
-        const a_in = try rmsNorm(g, x, self.head.input_norm, c.rms_norm_eps);
+        const a_in = try graph.rmsNorm(g, x, self.head.input_norm, c.rms_norm_eps);
         const att = try dsa.forward(g, c, &self.head.attn, try g.reshape(a_in, &.{ 1, n, h }), start, self.lanes(), self.routes);
         const h1 = try g.add(x, try g.reshape(att, &.{ n, h }));
-        const m = try rmsNorm(g, h1, self.head.post_norm, c.rms_norm_eps);
+        const m = try graph.rmsNorm(g, h1, self.head.post_norm, c.rms_norm_eps);
         const r = try graph.route(g, c, self.head.router, m);
-        return g.add(h1, try g.add(try self.routed(g, m, r), try mlp(g, c, self.head.shared, m)));
+        return g.add(h1, try g.add(try self.routed(g, m, r), try graph.mlp(g, c, self.head.shared, m)));
     }
 
     /// The pending pairs whose next token `tokens` gives (`tokens[i]` follows pending row i), at most `tokens.len`:
@@ -673,7 +641,7 @@ pub const Lane = struct {
             defer g.resetTo(m);
             const rows = try g.slice(self.pending.?, &.{ @intCast(at), 0 }, &.{ @intCast(end), h }, &.{ 1, 1 });
             const x = try self.input(g, w, tokens[at..end], rows);
-            const a_in = try rmsNorm(g, x, self.head.input_norm, c.rms_norm_eps);
+            const a_in = try graph.rmsNorm(g, x, self.head.input_norm, c.rms_norm_eps);
             _ = try dsa.forward(g, c, &self.head.attn, try g.reshape(a_in, &.{ 1, @intCast(end - at), h }), self.pairs(), self.lanes(), self.routes);
             try g.evalAll(&.{ self.latent.buf.?, self.index.buf.? });
             at = end;
@@ -702,8 +670,8 @@ pub const Lane = struct {
         var x = try self.input(g, w, &.{t1}, self.pending.?);
         for (0..depth) |step| {
             const out_row = try self.layer(g, x, start + @as(u32, @intCast(step)));
-            const normed = try rmsNorm(g, out_row, self.head.head_norm, c.rms_norm_eps);
-            const am = try g.argmax(try g.reshape(try g.astype(try linear(g, normed, w.head), .float32), &.{-1}), 0);
+            const normed = try graph.rmsNorm(g, out_row, self.head.head_norm, c.rms_norm_eps);
+            const am = try g.argmax(try g.reshape(try g.astype(try graph.linear(g, normed, w.head), .float32), &.{-1}), 0);
             try g.evalAll(&.{am});
             var tok: [1]u32 = undefined;
             _ = try g.hostU32(am, &tok);

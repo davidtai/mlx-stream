@@ -1,4 +1,19 @@
-# glm5_next MTP draft lane: what the arch wires (phase 4)
+# glm5_next MTP draft lane: what the arch wires (phase 4, wired at glm5next/arch's phase 4 merge)
+
+**Status: wired** (`glm5next/arch` after 68559e2). The integration points below are in `module.zig`, `graph.zig`,
+`kda.zig`, `bill.zig`, `settings.zig` and `root.zig`, with these choices:
+
+- Routes are construction-time (`module.promptRoute`, `module.stepRoute`): `mtp_lane` off installs g19b's prompt pass
+  and step unchanged; on, the lane's. The dump route (`logits_dump_dir`) wins over the lane's prompt pass.
+- The lane's serial step pends its hidden only while the lane keeps the step (`Lane.keepsStep`: the lane follows the
+  trunk, within `max_pending`); otherwise it takes the served forward (`.last`).
+- A round with no drafts (the cap, the context, the lane not following) is one serial forward (`.hidden`, no capture).
+- The verify's KDA captures run the host's `capture_seq` kernel text as `kda.forwardCapture`, its own comptime
+  instance of the KDA forward; a partial accept restores every layer's state from the capture by a copy
+  (`graph.Cache.rollback`).
+- `draft_lane.round` asserts the host contract (the lane installed) instead of checking it per round.
+- Bill: besides the terms below, the lane's GPU arrays are in `resident_wiring` / `request_wiring` and its buffers in
+  `buffer_allowance` (`bill.laneBuffers`); the bill tool prints the lane's bill with `GLM5_BILL_MTP=1`.
 
 Branch `glm5next/mtp-lane`, on `glm5next/arch` 371faa6. The lane is `src/arch/glm5_next/mtp.zig`. It runs the
 release's MTP layer (`model.language_model.layers.45`) as a draft head at depth 3, with exact acceptance, on MiMo's
@@ -15,8 +30,8 @@ follows the host's `glm_mtp.zig`; its oracle is mlx-vlm's `glm5_next_mtp`.
 - `bank.zig` (additive): `Files`, `routed_files`, `mtp_files`, `Bank.parseFor`, `Bank.openOf`. `parse`, `open` and
   `inspect` are unchanged for the routed bank, and its tests pass.
 - `tests.zig`: registers `mtp.zig` and `mtp_test.zig`.
-- `mtp.zig` keeps private copies of `graph.zig`'s private helpers: `f32Copy`, `view` (as `kvbView`), `linear`,
-  `rmsNorm` and `mlp`. Once `graph.zig` exports them, delete the copies.
+- `mtp.zig` uses `graph.zig`'s helpers, exported at the phase 4 merge (`f32Copy`, `view`, `linear`, `rmsNorm`, `mlp`);
+  its private copies are gone.
 
 ## Integration points
 

@@ -30,9 +30,10 @@ The arch claims a `config.json` with `model_type` `glm5_next` and the block
 ```
 
 The block's optional `settings` object takes `expert_prefill_rows` and `expert_rows` (an operator pin: either alone
-forces both; loaded as named, the overage over the fill reported), `mtp_lane` (refused by name when true: the draft lane
-is not served yet), `decode_moe` (the decode lane's expert route: `stock`, the default, or `fused`; anything else refused
-by name) and `logits_dump_dir` (below). Any other key refuses the load by name.
+forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
+is installed when true; off, the serial control, by default: below), `decode_moe` (the decode lane's expert route:
+`stock`, the default, or `fused`; anything else refused by name) and `logits_dump_dir` (below). Any other key refuses
+the load by name.
 
 Residents: the text trunk loads (`model.language_model.layers.{0..44}.*`, `embed_tokens`, `norm`, `lm_head`: 1,178
 tensors, 17,842,673,276 B as MLX allocates them); the vision tower, the MTP layer (45) and the DSA layers' FP8 KV scales
@@ -94,6 +95,40 @@ prints a table per served context (17,408; 18,432; 20,480; 24,576; 32,766; 32,76
 - `glm5_next MTP lane: off ...`, `glm5_next routes: ...`, `glm5_next admission baseline: ...`, `glm5_next construction check: ...`
 - `forced rows P/D exceed the fill by N bytes at baseline B; proceeding (operator pin)` when a pin sits over the fill
 - at each request's end: `glm5_next decode memory: footprint= mlx_active= mlx_cache= mlx_peak= ...` and `glm5_next decode: steps= tokens= wall_s= tok_s= ssd_bytes= ssd_bytes_per_token=`
+
+## The MTP draft lane
+
+`mtp_lane: true` installs the release's MTP layer as a draft head at depth 3 with exact acceptance (`mtp.zig`, on
+MiMo's draft-lane seam; `MTP.md` lists its integration points). At construction: the MTP layer's 25 residents kept in
+the weight map and read with the trunk, the draft bank (`mtp-experts-nvfp4.bin`, all 288 experts resident in NVFP4)
+read into MLX and checked record by record against its manifest, the head's lanes at the billed positions; what the
+open holds is held to its billed terms (`mtp_bank + mtp_tables + mtp_kv`, else `ConstructionOverBill`). Line:
+`glm5_next MTP lane installed: lane="glm5_next-mtp exact" depth=3 verify_rows=4 ...` (off: `glm5_next MTP lane: off
+(serial; set {"mtp_lane":true})`).
+
+A request: the prompt pass hands the lane every row's final-normed hidden (`graph.Head.hidden`), each pair whose next
+token the prompt gives appended to the head's lanes; a round (the host's `draft_lane.round`) drafts up to 3 tokens
+after t1, verifies [t1, drafts] in one decode-lane forward (`Head.verify`: every row's logits and hidden; each KDA
+layer's per-row states captured by the host's `capture_seq` recurrence), decides by the exact rule inside the verify's
+eval (greedy: the verify rows' argmax; sampled: exact speculative sampling), then rolls back to the kept rows (the DSA
+lanes truncated; on a partial accept every KDA state restored from the capture by a copy, no re-forward) and pends the
+kept rows' hidden. A round without drafts (the lane not tracking, the cap, the context) is a serial step. The request's
+receipt is MiMo's `[spec-stats]` line (rounds, accepted per round, misses and bytes per round).
+
+Bill (with the lane): the lane's own terms (`mtp_bank`, `mtp_residents`, `mtp_tables`, `mtp_kv`, `mtp_pending`,
+`mtp_wave`), the decode wave at the verify's 4 rows (`request`), `mtp_kda_capture` (5 rows of every KDA layer's state
+and conv tail: the verify's 4 and a partial accept's copy, 763,166,720 B, decode only), `mtp_taps` (the hidden rows'
+mean and norm: a prompt call's, a verify's) and `mtp_history` (the request's token ids); the lane's GPU arrays are
+wired with the trunk's (its held ones in `resident_wiring`, its request ones in `request_wiring`) and its buffers
+counted in `buffer_allowance` (`bill.laneBuffers`). The bill tool prints the lane's bill with `GLM5_BILL_MTP=1`. The
+verify computes its rows at M = 4 where a serial step computes M = 1: a greedy lane's tokens are the verify rows'
+argmax, rounding-class against the serial control's.
+
+Routes (construction time, `module.promptRoute` / `module.stepRoute`): off, the served prompt pass and the served step
+(g19b's code: `graph.forward`'s `.last` instance, `kda.forward` without the capture); on, the lane's pass and step
+(`.hidden`: the step's hidden pended while the lane follows the request, `Lane.keepsStep`, else the served forward) and
+the round (`Module.mtpRound`). The KDA capture is its own comptime instance (`kda.forwardCapture`), reached only from a
+verify.
 
 ## The profile build
 
