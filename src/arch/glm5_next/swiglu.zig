@@ -9,6 +9,8 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const kset = @import("../../sdk_ext/kernel_set.zig");
@@ -53,7 +55,7 @@ pub const Kernels = struct {
     consts: T = .{ .ctx = null },
 
     pub fn deinit(k: *Kernels) void {
-        if (k.swiglu.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(k.swiglu);
+        if (k.swiglu.ctx != null) _ = mtl.mlx_fast_metal_kernel_free(k.swiglu);
         for (k.cfg) |row| for (row) |c| if (c.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(c);
         };
@@ -80,7 +82,7 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const glm.Config, de
         defer _ = mlx.mlx_vector_string_free(in_vec);
         const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(out_vec);
-        k.swiglu = mlx.mlx_fast_metal_kernel_new("glm5n_swiglu", in_vec, out_vec, texts.swiglu, "", true, false);
+        k.swiglu = mtl.mlx_fast_metal_kernel_new("glm5n_swiglu", in_vec, out_vec, texts.swiglu, "", true, false);
         if (k.swiglu.ctx == null) return error.Glm5NextSwigluKernel;
     }
     for (k.widths, 0..) |wd, wi| for (0..max_rows) |ri| {
@@ -123,7 +125,7 @@ pub fn activate(g: *G, k: *const Kernels, w: Width, gate: T, up: T, rows: u32) !
     defer _ = mlx.mlx_vector_array_free(in);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k.swiglu, in, k.cfg[@backingInt(w)][rows - 1], g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, k.swiglu, in, k.cfg[@backingInt(w)][rows - 1], g.s));
     var out = mlx.mlx_array_new();
     mlx.check(mlx.mlx_vector_array_get(&out, ov, 0)) catch |e| {
         _ = mlx.mlx_array_free(out);

@@ -14,6 +14,8 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const kda = @import("kda.zig");
@@ -38,10 +40,10 @@ pub const texts = struct {
     pub const decode = @embedFile("kernels/glm5n_kda_decode.metal");
 };
 /// sha256 of kernels/manifest-kda.json, which records the texts' sha256 (checked against the pins by a CPU test).
-pub const manifest_sha256 = "709eb9206182ec95aba76d3ed461d33ff49dd60a3968259234067274074306e1";
+pub const manifest_sha256 = "f8ba2a6e2d60bf71986cf13cb03d85a98354d4461408d12dba610f0d99812ada";
 pub const text_pins = [_]kset.TextPin{
     .{ .file = "header_glm5n_kda.metal", .text = texts.header, .sha256 = "b28e8e1c60e71c9031b34cf2aaeb3e4e4afac0bc795d541c96bc7af61be2a069" },
-    .{ .file = "glm5n_kda_decode.metal", .text = texts.decode, .sha256 = "61bc7c74ae3ef10970e7d80f756231d601c04b5c91d53b90e5ec52c4b5b79bad" },
+    .{ .file = "glm5n_kda_decode.metal", .text = texts.decode, .sha256 = "cdb0fafddd6734ef51874601ed2ede2a2c729bcf85b08cc6d8abeff8e5a4dc68" },
 };
 
 pub fn checkPins() !void {
@@ -65,7 +67,7 @@ pub const Kernels = struct {
     consts: T = .{ .ctx = null },
 
     pub fn deinit(k: *Kernels) void {
-        if (k.decode.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(k.decode);
+        if (k.decode.ctx != null) _ = mtl.mlx_fast_metal_kernel_free(k.decode);
         for (k.cfg) |c| if (c.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(c);
         };
@@ -82,7 +84,9 @@ pub fn grid(c: *const glm.Config) [3]c_int {
     return .{ threads * @as(c_int, @intCast(c.kda_heads)), 1, 1 };
 }
 
-pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const glm.Config, first: *const kda.Weights, diag: *sdk.Diag) !Kernels {
+/// `checks`: one KDA layer of each weight-dtype variant the model holds (`variants`): the compile check launches the text
+/// over each, so every variant MLX instantiates is built once here.
+pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const glm.Config, checks: []const *const kda.Weights, diag: *sdk.Diag) !Kernels {
     requireGeometry(c) catch |e| {
         diag.set("glm5_next decode_kda=fused: the model is not the text's (KDA head {d}, conv {d}; the text takes 128 and 4)", .{ c.kda_head_dim, c.kda_conv });
         return e;
@@ -98,7 +102,7 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const glm.Config, fi
         defer _ = mlx.mlx_vector_string_free(in_vec);
         const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
         defer _ = mlx.mlx_vector_string_free(out_vec);
-        k.decode = mlx.mlx_fast_metal_kernel_new("glm5n_kda_decode", in_vec, out_vec, texts.decode, texts.header, true, false);
+        k.decode = mtl.mlx_fast_metal_kernel_new("glm5n_kda_decode", in_vec, out_vec, texts.decode, texts.header, true, false);
         if (k.decode.ctx == null) return error.Glm5NextKdaDecodeKernel;
     }
     const qkv: c_int = @intCast(c.kdaDim());
@@ -122,12 +126,33 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const glm.Config, fi
     const cv = [8]f32{ 1.0 / @sqrt(@as(f32, @floatFromInt(c.kda_head_dim))), 1e-6, c.rms_norm_eps, c.kda_lower_bound, 1.0 / @as(f32, @floatFromInt(c.kda_head_dim)), 0, 0, 0 };
     k.consts = mlx.mlx_array_new_data(&cv, &[_]c_int{8}, 1, .float32);
     if (k.consts.ctx == null) return error.MlxError;
-    compileCheck(a, s, c, &k, first) catch |err| {
+    for (checks) |w| compileCheck(a, s, c, &k, w) catch |err| {
         var eb: [400]u8 = undefined;
-        diag.set("glm5_next decode_kda=fused: the compile check failed ({s}): {s}", .{ @errorName(err), mlx.takeError(&eb) orelse "" });
+        diag.set("glm5_next decode_kda=fused: the compile check failed ({s}; conv {t}, f_b {t}, g_b {t}, o_norm {t}): {s}", .{ @errorName(err), mlx.mlx_array_dtype(w.conv_raw), mlx.mlx_array_dtype(w.f_b), mlx.mlx_array_dtype(w.g_b), mlx.mlx_array_dtype(w.o_norm), mlx.takeError(&eb) orelse "" });
         return err;
     };
     return k;
+}
+
+/// The weights the text reads in their stored dtype (each a separate kernel variant for MLX: the conv, f_b, g_b, o_norm).
+pub const Variant = [4]mlx.mlx_dtype;
+
+pub fn variantOf(w: *const kda.Weights) Variant {
+    return .{ mlx.mlx_array_dtype(w.conv_raw), mlx.mlx_array_dtype(w.f_b), mlx.mlx_array_dtype(w.g_b), mlx.mlx_array_dtype(w.o_norm) };
+}
+
+/// The first layer of each distinct `Variant` among `layers` into `out` (the pack of record has two: the conv F32 on
+/// layers 0-2, BF16 after); returns the count, refused by name past `out.len`.
+pub fn variants(layers: []const *const kda.Weights, out: []*const kda.Weights) error{Glm5NextKdaDecodeVariants}!usize {
+    var n: usize = 0;
+    outer: for (layers) |w| {
+        const v = variantOf(w);
+        for (out[0..n]) |o| if (std.mem.eql(mlx.mlx_dtype, &variantOf(o), &v)) continue :outer;
+        if (n == out.len) return error.Glm5NextKdaDecodeVariants;
+        out[n] = w;
+        n += 1;
+    }
+    return n;
 }
 
 /// One launch at one row over zeros and the first KDA layer's tables, evaluated (Metal compiles the text at its first
@@ -173,7 +198,7 @@ pub fn step(g: *G, k: *const Kernels, c: *const glm.Config, w: *const kda.Weight
     defer _ = mlx.mlx_vector_array_free(in);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k.decode, in, k.cfg[rows - 1], g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, k.decode, in, k.cfg[rows - 1], g.s));
     var outs: [3]T = undefined;
     for (&outs, 0..) |*o, i| {
         var y = mlx.mlx_array_new();
@@ -201,7 +226,7 @@ test "glm5_next kda_decode: GLM-5.3-Flash's geometry is the text's; one 1,024-th
     for ([_]glm.Config{ .{ .kda_head_dim = 64 }, .{ .kda_conv = 3 } }) |bad| try testing.expectError(error.Glm5NextKdaDecodeGeometry, requireGeometry(&bad));
     // The text's sections index 1,024 threads: the conv's 3 x 128, the gate stages' 2 x 128 rows x 4, the norms' 2 x 4 rows.
     try testing.expectEqual(@as(u32, 2 * 128 * 4), @as(u32, @intCast(threads)));
-    try testing.expect(std.mem.indexOf(u8, texts.decode, "const device T* wl = (which == 0 ? fb_w : gb_w) + size_t(row) * DK + ql * VPT;") != null);
+    try testing.expect(std.mem.indexOf(u8, texts.decode, "const device auto* wl = (which == 0 ? fb_w : gb_w) + size_t(row) * DK + ql * VPT;") != null);
     try testing.expect(std.mem.indexOf(u8, texts.decode, "conv_state_out[r * NP + gc] = static_cast<float>(win[TOK + r]);") != null);
     try testing.expectEqual(@as(usize, 15), input_names.len);
 }

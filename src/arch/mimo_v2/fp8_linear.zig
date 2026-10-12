@@ -31,6 +31,8 @@
 //! Device self-checks: pre-ship family `fp8res` (`MIMO_FP8RES_GPU=1`); construction runs none.
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const mimo = @import("config.zig");
 const prefill_attention = @import("prefill_attention.zig");
 const Array = mlx.mlx_array;
@@ -159,7 +161,7 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         for ([_]Kernel{ k.gemv, k.dequant }) |x| if (x.ctx != null) {
-            _ = mlx.mlx_fast_metal_kernel_free(x);
+            _ = mtl.mlx_fast_metal_kernel_free(x);
         };
         if (k.prompt) |c| c.release();
         k.* = .{};
@@ -257,7 +259,7 @@ fn dequantRun(kernel: Kernel, w: Array, scales: Array, n: c_int, kdim: c_int, s:
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, kernel, in_vec, c, s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&outs, kernel, in_vec, c, s));
     var out: Array = .{};
     errdefer drop(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outs, 0));
@@ -305,7 +307,7 @@ fn makeKernelIo(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [
     const out_vec = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     // x is read as [M, K] rows, w / scales are the residents (row-contiguous by construction).
-    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
+    const k = mtl.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
     if (k.ctx == null) return error.MimoFp8Kernel;
     return k;
 }
@@ -386,7 +388,7 @@ fn apply(kernel: Kernel, c: mlx.mlx_fast_metal_kernel_config, x: Array, w: Array
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, kernel, in_vec, c, s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&outs, kernel, in_vec, c, s));
     var out: Array = .{};
     errdefer drop(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outs, 0));

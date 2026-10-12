@@ -18,6 +18,8 @@
 //! rounding-class alternative the m4attr family times; no route binds it (the routed plan is FMA 0 by comptime check).
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const ops = @import("../deepseek_v41/ops.zig");
 const quant = @import("../../sdk_ext.zig").quant;
 const bank_mod = @import("bank.zig");
@@ -249,7 +251,7 @@ pub const Fused = struct {
 
     pub fn deinit(self: *Fused) void {
         for ([_]mlx.mlx_fast_metal_kernel{ self.k_gate_up_pair, self.k_down_pair, self.k_gate_up_union, self.k_down_union, self.k_gate_up_k1, self.k_down_k1, self.k_combine }) |k| if (k.ctx != null) {
-            _ = mlx.mlx_fast_metal_kernel_free(k);
+            _ = mtl.mlx_fast_metal_kernel_free(k);
         };
         for (self.gate_up_cfg, self.down_cfg) |c, d| for ([_]mlx.mlx_fast_metal_kernel_config{ c, d }) |x| if (x.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(x);
@@ -303,7 +305,7 @@ fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, source: [*:0]cons
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
+    const k = mtl.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
     if (k.ctx == null) return error.MimoFusedMoeKernel;
     return k;
 }
@@ -327,7 +329,7 @@ fn apply(g: *ops.MlxOps, kernel: mlx.mlx_fast_metal_kernel, inputs: []const T, c
     defer _ = mlx.mlx_vector_array_free(in);
     var outputs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel, in, cfg, g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&outputs, kernel, in, cfg, g.s));
     var out = mlx.mlx_array_new();
     mlx.check(mlx.mlx_vector_array_get(&out, outputs, 0)) catch |e| {
         _ = mlx.mlx_array_free(out);

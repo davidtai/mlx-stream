@@ -13,6 +13,8 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const fp8 = @import("fp8.zig");
@@ -237,7 +239,7 @@ fn recurSeqKernel() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("glm5_next_gated_delta_vec_seq", iv, ov, recur_seq_source, "", true, false);
+    const k = mtl.mlx_fast_metal_kernel_new("glm5_next_gated_delta_vec_seq", iv, ov, recur_seq_source, "", true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     seq_kernel = k;
     return k;
@@ -269,7 +271,7 @@ fn recurSeq(g: *G, q: T, k: T, v: T, gate: T, beta: T, state: T, rows: c_int, hv
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
     var outs: [3]T = undefined;
     for (&outs, 0..) |*o, i| {
         var x = mlx.mlx_array_new();
@@ -287,7 +289,7 @@ fn recurKernel() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("glm5_next_gated_delta_vec", iv, ov, recur_source, "", true, false);
+    const k = mtl.mlx_fast_metal_kernel_new("glm5_next_gated_delta_vec", iv, ov, recur_source, "", true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     kernel = k;
     return k;
@@ -315,7 +317,7 @@ fn recur(g: *G, q: T, k: T, v: T, gate: T, beta: T, state: T, rows: c_int, hv: c
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
     var y = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
     const yt = try g.adopt(y);
