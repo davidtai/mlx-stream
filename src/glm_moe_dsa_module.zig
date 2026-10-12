@@ -1531,3 +1531,36 @@ test "glm exl3 module: on a synthetic EXL3 pack the served union builds the EXL3
     try testing.expect(m.ex.host.barrier_ns > 0 and m.ex.host.route_ns > 0 and m.ex.host.wave_ns > 0);
     m.requestEnd();
 }
+
+test "glm residents: the constructed module holds every resident in its own MLX buffer, before any forward" {
+    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    var model = try exl3_bank.tinyConfigInter(a, 512);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const img = try exl3_bank.writeSynth(a, testing.io, tmp.dir, &model, .{ .signs = true });
+    defer a.free(img);
+    try glm.writeResidents(a, testing.io, tmp.dir, &model);
+    var rbuf: [512]u8 = undefined;
+    const dir = try exl3_bank.tmpRoot(&tmp, &rbuf);
+    var cfg: settings.Config = .{ .model_dir = dir, .model = model, .max_context_tokens = 64, .expert_rows = 5, .expert_prefill_rows = 3 };
+    defer cfg.deinit(a);
+    // The host's loader as the served path calls it (`residents_past_page_cache`): lazy arrays, none read yet.
+    var weights = try sdk.loader.dir(testing.io, a, dir, .{ .nocache = true });
+    defer weights.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const sv = try Served.init(a, testing.io, &cfg, &weights, s, .{ .ceiling = 64 << 30, .wired_margin = 0 });
+    defer sv.deinit();
+    var it = weights.map.iterator();
+    var n: u32 = 0;
+    while (it.next()) |e| {
+        errdefer std.debug.print("resident {s} not in its buffer at construction\n", .{e.key_ptr.*});
+        var ok = false;
+        try mlx.check(mlx._mlx_array_is_available(&ok, e.value_ptr.*));
+        try testing.expect(ok);
+        n += 1;
+    }
+    try testing.expect(n > 0);
+}
