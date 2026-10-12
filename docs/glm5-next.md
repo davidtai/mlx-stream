@@ -9,8 +9,8 @@ Terms as in [mimo.md](mimo.md): **pack**, **residents**, **rows** (prompt rows, 
 
 Code: `src/arch/glm5_next/` (`root.zig` the arch contract, `settings.zig` the settings, `config.zig` the model,
 `bill.zig` the bill, `module.zig` construction and requests, `graph.zig` the forward, `kda.zig` / `dsa.zig` / `ops.zig`
-the attention and the hyper-connections, `experts.zig` the expert source, `nvfp4.zig` the projection format, `bank.zig`
-the bank, `dump.zig` the logits dump); the gather shim is `csrc/glm5_gather_qmm.inc`.
+the attention and the hyper-connections, `glue.zig` the decode lane's fused glue, `experts.zig` the expert source, `nvfp4.zig` the projection format, `bank.zig` the bank, `dump.zig` the logits dump); the
+gather shim is `csrc/glm5_gather_qmm.inc`.
 
 ## The model
 
@@ -32,8 +32,8 @@ The arch claims a `config.json` with `model_type` `glm5_next` and the block
 The block's optional `settings` object takes `expert_prefill_rows` and `expert_rows` (an operator pin: either alone
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
 is installed when true; off, the serial control, by default: below), `decode_moe` (the decode lane's expert route:
-`stock`, the default, or `fused`; anything else refused by name) and `logits_dump_dir` (below). Any other key refuses
-the load by name.
+`hitpass`, the default, `fused` or `stock`; anything else refused by name), `decode_glue` (the decode lane's glue:
+`fused`, the default, or `ops`) and `logits_dump_dir` (below). Any other key refuses the load by name.
 
 Residents: the text trunk loads (`model.language_model.layers.{0..44}.*`, `embed_tokens`, `norm`, `lm_head`: 1,178
 tensors, 17,842,673,276 B as MLX allocates them); the vision tower, the MTP layer (45) and the DSA layers' FP8 KV scales
@@ -56,12 +56,31 @@ The gathers are MLX's `gather_qmm` in `nvfp4` mode (group 16) with each slot's f
 shim (`glm5_gather_qmm_nvfp4`: MLX's C++ op; mlx-c's `mlx_gather_qmm` has no global scale and is not changed): MLX folds
 g / 2688 into each group scale, so there is no output scaling and no extra rounding.
 
-The decode lane's experts take the route `decode_moe` names, installed once at construction: `stock` (the default) runs
-the gathers above per bank; `fused` installs the NVFP4 decode texts (`decode_kernels.zig`, MiMo's k1 family over the
-NVFP4 bank: the pinned set built on the module's stream, its compile check at every registered instantiation, the
-launches prepared per wave width up to 64 pairs) and binds the shared scheduler's banked waves, one launch of each text
-per wave over the three banks. A refused install refuses the load by name; the route never falls back. The routes line
-names the installed route (`decode_moe=`).
+The decode lane's experts take the route `decode_moe` names, installed once at construction: `stock` runs the gathers
+above per bank; `fused` installs the NVFP4 decode texts (`decode_kernels.zig`, MiMo's k1 family over the NVFP4 bank: the
+pinned set built on the module's stream, its compile check at every registered instantiation, the launches prepared per
+wave width up to 64 pairs) and binds the shared scheduler's banked waves, one launch of each text per wave over the
+three banks; `hitpass` (the default, MiMo's HITPASS on the scheduler's DEVROUTE) is `fused` with each decode-lane call's
+hit wave dispatched from the layer's device-resident slot LUT behind the routing barrier's arrays, before the host reads
+the ids: the host then routes and builds only the miss parts, whose rows replace their pairs in the join (exact against
+`fused`; `fused` is rounding-class against `stock`). A refused install refuses the load by name; the route never falls
+back. The routes line names the installed route (`decode_moe=`); `fused` and `hitpass` log
+`glm5_next decode experts installed: decode_moe=<route> (...)`.
+
+## The decode glue
+
+`decode_glue` (installed once at construction; `glue.zig`) fuses the decode lane's glue (one row, or the MTP verify's
+<= 4 in decode; a wide call keeps the stock glue): `fused` (the default) runs each sublayer's mHC collapse and its norm in
+one `hcPre` dispatch that also applies the previous sublayer's expand (the host's oMLX `hc_pre_fused` chain in `ops.zig`,
+unchanged; the last expand is materialized for the head), the router's product and its top-8 tail in two texts
+(`glm5n_glue_router`: MiMo's `mimo_glue_router_rows` over the router's BF16 weight at 288 experts; `glm5n_glue_top8`:
+MiMo's `mimo_glue_top8` with routed_scaling and i32 ids) and the routed combine with the shared expert's add in one
+(`glm5n_moe_combine`: MiMo's `mimo_moe_combine` plus the bf16 add). `ops` is the stock op chains (the control). The
+texts are pinned (`kernels/manifest-glue.json`); the install refuses another geometry by name and launches each text
+once over the model's own tables (the compile check; it also fixes hcPre's threadgroup width), logging
+`glm5_next decode glue installed: hcPre chain (...)`. Rounding-class against `ops`: hcPre sums the mixes and the norm's
+squares in its own order and the router's product runs MLX gemv's order on the BF16 weight where the stock runs gemv_t
+on the F32 copy; the top-8 tail and the combine are the stock expressions. The routes line names it (`decode_glue=`).
 
 ## The prompt pass
 
@@ -98,8 +117,8 @@ MiMo's form: the arch's terms (`residents`, `trunk_f32_tables`, `router_f32`, `k
 the billed context at construction), `kda_state`, `mlx_cache`, `mlx_cache_overshoot`, `compiler_runtime`,
 `host_runtime`, the wiring terms, `request` (the prompt wave / the decode wave)) and the source's (`slot_transient`,
 `slot_rounding`, `reader_staging`, `source_metadata`, `expert_workspace`, the event and speculation runtimes, the
-predictor's, `decode_kernels` (the fused decode route's set and prepared launches, declared 16 MiB; 0 on `stock`),
-`slot_wiring`). `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
+predictor's, `decode_kernels` (the fused decode route's set and prepared launches, declared 16 MiB under `fused` and
+`hitpass`; 0 on `stock`), `glue_kernels` (the fused glue's texts, declared 8 MiB; 0 under `ops`), `slot_wiring`). `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
 
     GLM5_BANK=<pack> GLM5_BILL_BASELINES_GB=10.6,12.0,12.6,13.0 MLX_DEFAULT_DEVICE=cpu \
       zig build mlx-stream-test -Dtest-filter="the bill tool prints every term" -j4
