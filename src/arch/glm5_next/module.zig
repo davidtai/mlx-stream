@@ -78,7 +78,7 @@ pub const Module = struct {
         const decode_rows = try arena.allocator().alloc(u32, n_moe);
         @memset(prompt_rows, plan.rows.prompt);
         @memset(decode_rows, plan.rows.decode);
-        self.src = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s);
+        self.src = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe);
         errdefer self.src.deinit();
         self.cache = try graph.Cache.init(gpa, &self.c.model, @intCast(plan.reserve));
         errdefer self.cache.deinit(&self.g);
@@ -88,8 +88,8 @@ pub const Module = struct {
             log.info("glm5_next logits_dump: on dir={s} chunk_rows={d} chunk_bytes={d} (one safetensors file per prompt pass: logits F32 [prompt rows, {d}], token_ids I32, ids_int32_sha256; written before the request returns)\n", .{ d, graph.dump_chunk_rows, dump.chunkBytes(graph.dump_chunk_rows, model.vocab_size, model.hidden_size), model.vocab_size });
         }
         log.info("glm5_next MTP lane: off (serial; the draft lane is not served yet)\n", .{});
-        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe=stock span_rows={d} call_rows={d}\n", .{ routes.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), graph.span_rows, graph.prompt_call_rows });
-        log.info("mlx-stream glm5_next installed: {d} layers ({d} KDA, {d} DSA); residents BF16 {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed ({d} sources), {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nKda(), model.nDsa(), weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, n_moe, plan.rows.prompt, graph.prompt_call_rows });
+        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d}\n", .{ routes.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows });
+        log.info("mlx-stream glm5_next installed: {d} layers; {d} KDA, {d} DSA; residents BF16 {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed ({d} sources), {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nKda(), model.nDsa(), weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, n_moe, plan.rows.prompt, graph.prompt_call_rows });
         log.info("glm5_next memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv=bf16 phase_rows=on growth_rows={d} forced={s}\n", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, plan.rows.decode - plan.rows.prompt, if (bill.isForced(cfg)) "yes" else "no" });
         self.checkConstruction(plan.bill, plan.rows.prompt);
         return self;

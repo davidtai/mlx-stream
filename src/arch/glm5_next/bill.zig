@@ -32,6 +32,8 @@ pub const construction_tolerance_bytes: u64 = 250_000_000;
 
 const bf16: u64 = 2;
 const f32b: u64 = 4;
+/// The fused decode route's kernel set and prepared launches, declared (`decode_kernels` term).
+pub const fused_kernels_bytes: u64 = 16 << 20;
 
 pub const Plan = struct {
     bill: sdk.MemoryBill,
@@ -126,6 +128,8 @@ pub const Inputs = struct {
     reserve: u64,
     /// The prompt combine the host's wired policy installs (experts.zig `combineRoute`).
     combine: prefill_combine.Route = .inplace,
+    /// The decode lane's expert route (`settings.DecodeMoe`).
+    decode_moe: settings.DecodeMoe = .stock,
     page: u64 = 16_384,
 };
 
@@ -361,6 +365,10 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
         .{ .name = "spec_runtime", .bytes = @splat(@as(u64, mimo_stream.spec_threads) * (2 << 20)), .at_construction = true },
         .{ .name = "predictor_workspace", .bytes = .{ predictorBytes(g, t), predictorBytes(g, experts.decode_lane_rows) }, .at_construction = false },
         .{ .name = "predictor_runtime", .bytes = @splat(16 << 20), .at_construction = false },
+        // `decode_moe: fused`: the NVFP4 decode texts' set (its library, two pipelines per registered instantiation) and
+        // the launches prepared per wave width (decode_kernels.zig `Fused`), declared; its waves' rows are the decode
+        // wave's (`request`). 0 on the stock route.
+        .{ .name = "decode_kernels", .bytes = @splat(if (in.decode_moe == .fused) fused_kernels_bytes else 0), .at_construction = true },
         .{ .name = "slot_wiring", .bytes = @splat(0), .at_construction = false, .with_rows = true },
     };
     return .{
@@ -392,6 +400,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .residents = try residentBytes(a, io, dir, &cfg.model, page),
         .reserve = reserve,
         .combine = experts.combineRoute(),
+        .decode_moe = cfg.decode_moe,
         .page = page,
     };
 }
@@ -488,6 +497,14 @@ test "glm5_next bill: the terms sum to the bill, the slot wiring is the one row 
     try testing.expectEqual(b.fixed(.prompt), sums[0]);
     try testing.expectEqual(b.fixed(.decode), sums[1]);
     try testing.expectEqual(@as(u64, 42 * 14_159_872), b.per_row);
+    // The fused decode route adds its declared kernel set (a construction term, both phases); 0 on the stock route.
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(b, "decode_kernels"));
+    var fused_in = in;
+    fused_in.decode_moe = .fused;
+    const bf = try billOf(a, &fused_in);
+    defer bf.free(a);
+    try testing.expectEqual(b.fixed(.prompt) + fused_kernels_bytes, bf.fixed(.prompt));
+    try testing.expectEqual(b.fixed(.decode) + fused_kernels_bytes, bf.fixed(.decode));
     const target = box_ceiling - box_stop;
     const rows = try sdk.fill(b, 12_600_000_000, target, 288, min_rows);
     try testing.expect(rows.prompt >= min_rows and rows.prompt <= rows.decode and rows.decode <= 288);

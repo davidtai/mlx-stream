@@ -31,7 +31,8 @@ The arch claims a `config.json` with `model_type` `glm5_next` and the block
 
 The block's optional `settings` object takes `expert_prefill_rows` and `expert_rows` (an operator pin: either alone
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (refused by name when true: the draft lane
-is not served yet) and `logits_dump_dir` (below). Any other key refuses the load by name.
+is not served yet), `decode_moe` (the decode lane's expert route: `stock`, the default, or `fused`; anything else refused
+by name) and `logits_dump_dir` (below). Any other key refuses the load by name.
 
 Residents: the text trunk loads (`model.language_model.layers.{0..44}.*`, `embed_tokens`, `norm`, `lm_head`: 1,178
 tensors, 17,842,673,276 B as MLX allocates them); the vision tower, the MTP layer (45) and the DSA layers' FP8 KV scales
@@ -52,8 +53,14 @@ policy the fused combine is installed (one log line).
 
 The gathers are MLX's `gather_qmm` in `nvfp4` mode (group 16) with each slot's f32 global scale, through the plugin's
 shim (`glm5_gather_qmm_nvfp4`: MLX's C++ op; mlx-c's `mlx_gather_qmm` has no global scale and is not changed): MLX folds
-g / 2688 into each group scale, so there is no output scaling and no extra rounding. The decode lane runs the stock
-gathers; the fused NVFP4 decode kernels are a construction-time route to come.
+g / 2688 into each group scale, so there is no output scaling and no extra rounding.
+
+The decode lane's experts take the route `decode_moe` names, installed once at construction: `stock` (the default) runs
+the gathers above per bank; `fused` installs the NVFP4 decode texts (`decode_kernels.zig`, MiMo's k1 family over the
+NVFP4 bank: the pinned set built on the module's stream, its compile check at every registered instantiation, the
+launches prepared per wave width up to 64 pairs) and binds the shared scheduler's banked waves, one launch of each text
+per wave over the three banks. A refused install refuses the load by name; the route never falls back. The routes line
+names the installed route (`decode_moe=`).
 
 ## The prompt pass
 
@@ -70,8 +77,8 @@ MiMo's form: the arch's terms (`residents`, `trunk_f32_tables`, `router_f32`, `k
 the billed context at construction), `kda_state`, `mlx_cache`, `mlx_cache_overshoot`, `compiler_runtime`,
 `host_runtime`, the wiring terms, `request` (the prompt wave / the decode wave)) and the source's (`slot_transient`,
 `slot_rounding`, `reader_staging`, `source_metadata`, `expert_workspace`, the event and speculation runtimes, the
-predictor's, `slot_wiring`). `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8
-rows. The bill tool:
+predictor's, `decode_kernels` (the fused decode route's set and prepared launches, declared 16 MiB; 0 on `stock`),
+`slot_wiring`). `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
 
     GLM5_BANK=<pack> GLM5_BILL_BASELINES_GB=10.6,12.0,12.6,13.0 MLX_DEFAULT_DEVICE=cpu \
       zig build mlx-stream-test -Dtest-filter="the bill tool prints every term" -j4
@@ -82,7 +89,8 @@ prints a table per served context (17,408; 18,432; 20,480; 24,576; 32,766; 32,76
 ## Receipt lines
 
 - `glm5_next memory: target= baseline= process_bound= prompt_rows= decode_rows= reserve_tokens= kv=bf16 phase_rows=on growth_rows= forced=yes|no`
-- `mlx-stream glm5_next installed: 45 layers (34 KDA, 11 DSA); ...`
+- `mlx-stream glm5_next installed: 45 layers; 34 KDA, 11 DSA; residents BF16 ...` (MiMo's punctuation; g19 printed
+  `45 layers (34 KDA, 11 DSA); ...`)
 - `glm5_next MTP lane: off ...`, `glm5_next routes: ...`, `glm5_next admission baseline: ...`, `glm5_next construction check: ...`
 - `forced rows P/D exceed the fill by N bytes at baseline B; proceeding (operator pin)` when a pin sits over the fill
 - at each request's end: `glm5_next decode memory: footprint= mlx_active= mlx_cache= mlx_peak= ...` and `glm5_next decode: steps= tokens= wall_s= tok_s= ssd_bytes= ssd_bytes_per_token=`

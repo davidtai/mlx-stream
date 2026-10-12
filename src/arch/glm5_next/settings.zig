@@ -1,7 +1,8 @@
 //! glm5_next's construction config: the pack's model (config.zig), the pack's `expert_streaming.settings` (read once at
 //! construction; a key that is not a setting refuses the load by name) and the host's load facts. MiMo's contract: the
 //! operator pins the rows with `expert_prefill_rows` / `expert_rows` (either alone forces both); `mtp_lane` names the
-//! draft lane (not served yet: refused by name when on); `logits_dump_dir` (an absolute directory) installs the logits
+//! draft lane (not served yet: refused by name when on); `decode_moe` the decode lane's expert route (`stock`, MLX's
+//! gathers, the default; `fused`, the NVFP4 decode texts); `logits_dump_dir` (an absolute directory) installs the logits
 //! dump route for the KL gate (dump.zig): absent, nothing of it is built.
 
 const std = @import("std");
@@ -20,7 +21,12 @@ pub const allocator_cache_bytes: u64 = 256 << 20;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "logits_dump_dir" };
+
+/// The decode lane's routed-expert route, installed once at construction: `stock` MLX's gather_qmm nvfp4 (two gathers
+/// and the clamped SwiGLU, then a gather per down), `fused` the NVFP4 decode texts (decode_kernels.zig: MiMo's k1 family
+/// over the bank; one launch of each per wave, rounding-class against the stock route).
+pub const DecodeMoe = enum { stock, fused };
 /// The longest dump directory a setting may name.
 pub const max_dump_dir: usize = 480;
 
@@ -42,6 +48,7 @@ pub const Config = struct {
     expert_rows: ?u32 = null,
     expert_prefill_rows: ?u32 = null,
     mtp_lane: bool = false,
+    decode_moe: DecodeMoe = .stock,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -53,7 +60,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, dump_dir: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, dump_dir: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -62,6 +69,10 @@ pub const Config = struct {
         if (raw.object.get("expert_prefill_rows")) |v| c.expert_prefill_rows = c.rowsSetting(v);
         if (raw.object.get("mtp_lane")) |v| {
             if (v == .bool) c.mtp_lane = v.bool else c.malformed.mtp_lane = true;
+        }
+        if (raw.object.get("decode_moe")) |v| {
+            const route: ?DecodeMoe = if (v == .string) std.meta.stringToEnum(DecodeMoe, v.string) else null;
+            if (route) |r| c.decode_moe = r else c.malformed.decode_moe = true;
         }
         if (raw.object.get("logits_dump_dir")) |v| {
             const ok = v == .string and v.string.len > 1 and v.string.len <= max_dump_dir and v.string[0] == '/' and std.mem.indexOfScalar(u8, v.string, 0) == null;
@@ -105,6 +116,7 @@ pub const Config = struct {
         if (c.malformed.rows) return error.Glm5NextExpertRowsSetting;
         if (c.malformed.mtp_lane) return error.Glm5NextMtpLaneSetting;
         if (c.malformed.dump_dir) return error.Glm5NextLogitsDumpDir;
+        if (c.malformed.decode_moe) return error.Glm5NextDecodeMoeSetting;
         if (c.mtp_lane) return error.Glm5NextMtpLaneNotServed;
         if (c.kv_quant_bits) |b| if (b != 0 and b != 16) return error.Glm5NextKvQuantUnsupported;
         if (c.expert_rows) |d| if (d > c.model.n_routed_experts) return error.Glm5NextExpertRows;
@@ -145,6 +157,12 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expect(pinned.dumpDir() == null);
     try testing.expectError(error.Glm5NextLogitsDumpDir, (try parseSettings("{\"logits_dump_dir\":\"relative/dir\"}")).validate());
     try testing.expectError(error.Glm5NextLogitsDumpDir, (try parseSettings("{\"logits_dump_dir\":7}")).validate());
+    // The decode route: stock unless named; fused by name; anything else refused by name.
+    try testing.expectEqual(DecodeMoe.stock, pinned.decode_moe);
+    try testing.expectEqual(DecodeMoe.fused, (try parseSettings("{\"decode_moe\":\"fused\"}")).decode_moe);
+    try (try parseSettings("{\"decode_moe\":\"stock\"}")).validate();
+    try testing.expectError(error.Glm5NextDecodeMoeSetting, (try parseSettings("{\"decode_moe\":\"k1\"}")).validate());
+    try testing.expectError(error.Glm5NextDecodeMoeSetting, (try parseSettings("{\"decode_moe\":1}")).validate());
     // The host's facts: its rows win; its context is the reserve.
     const facts: sdk.LoadFacts = .{ .memory_baseline_bytes = 10, .expert_rows = 90, .effective_context = 32_768, .wired_margin_bytes = 2 << 30 };
     const built = pinned.withFacts(&facts);

@@ -6,7 +6,8 @@
 //! in-place text over the wide call's sources). Every route is MiMo's stack of record, installed once here: the read
 //! schedule `early_whole_trim`, the pooled prompt scratch, the decode window at the decode lane's widest route, phase
 //! rows (the boundary frees the prompt's scratch and grows each layer to its decode rows; the next prompt shrinks back,
-//! residents forgotten as MiMo's are). The decode lane runs MLX's gathers (the fused MXFP4 texts have no NVFP4 form).
+//! residents forgotten as MiMo's are). The decode lane's experts run the construction's route (`settings.DecodeMoe`):
+//! MLX's gathers, or the fused NVFP4 decode texts (decode_kernels.zig) over the three banks at once.
 //! A routed call's output is the weighted sum of its experts [nt, H] bf16; the trunk adds the shared expert.
 
 const std = @import("std");
@@ -123,7 +124,7 @@ pub const Source = struct {
     /// Construction (the GPU stream, under the caller's lock): the bank opened, the stream at `rows`, the scheduler
     /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
     /// routed layer's.
-    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream) !*Source {
+    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe) !*Source {
         var bank = try bank_mod.Bank.open(a, io, model_dir);
         errdefer bank.deinit();
         const geo = bank.geometry;
@@ -177,6 +178,15 @@ pub const Source = struct {
         math.drain = try Math.drainsOf(drain);
         math.bank_view = try Math.bankViewsOf(bank_view);
         math.predictor = try mimo_math.Predictor.install(.f32, geo);
+        // The decode lane's route: the fused NVFP4 texts installed here (their compile self-check, the launches prepared
+        // per wave width), refused by name; the stock gathers otherwise.
+        if (decode_moe == .fused) {
+            var diag: sdk.Diag = .{};
+            math.fused = nvfp4.FusedDecode.install(a, stream, geo.hidden_size, geo.intermediate_size, top_k, 10.0, &diag) catch |e| {
+                log.err("glm5_next: the fused decode route refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                return e;
+            };
+        }
         self.combine_route = combineRoute();
         switch (self.combine_route) {
             .inplace => {
@@ -196,7 +206,7 @@ pub const Source = struct {
             .n_routed_experts = geo.num_experts,
             .n_experts_per_tok = top_k,
         };
-        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true } });
+        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true }, .banked = decode_moe == .fused });
         errdefer self.ex.deinit();
         if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
         try self.beginPrefill();
