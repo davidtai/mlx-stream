@@ -138,6 +138,11 @@ pub const Module = struct {
         return self.cache.len;
     }
 
+    /// The longest prompt this load billed (the host refuses a longer one before any work).
+    pub fn maxContext(self: *const Module) u64 {
+        return self.reserve;
+    }
+
     fn nowNs(self: *const Module) u64 {
         return @intCast(std.Io.Timestamp.now(self.io, .awake).nanoseconds);
     }

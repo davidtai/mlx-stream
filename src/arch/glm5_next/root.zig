@@ -166,6 +166,35 @@ pub fn requestEnd(m: *Module) void {
     m.requestEnd();
 }
 
+/// The draft lane: none yet (serial; the MTP lane is the module's phase 4). blockSize 0 is the host's readiness signal:
+/// it arms nothing and every request stays serial.
+pub const draft_lane = struct {
+    pub fn blockSize(m: *const Module) u32 {
+        _ = m;
+        return 0;
+    }
+
+    pub fn laneName(m: *const Module) []const u8 {
+        _ = m;
+        return "serial";
+    }
+
+    pub fn arm(m: *const Module, req: sdk.ArmRequest) sdk.DraftArm {
+        _ = .{ m, req };
+        return .off;
+    }
+
+    pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
+        _ = .{ m, a, t1, accepted_cap, sampling };
+        return error.Glm5NextNoDraftLane;
+    }
+
+    pub fn stats(m: *const Module) sdk.DraftStats {
+        _ = m;
+        return .{};
+    }
+};
+
 const testing = std.testing;
 
 test "glm5_next claims: the pack's NVFP4 declaration claims it; other packs and models decline" {
@@ -218,8 +247,13 @@ test "glm5_next parse: the settings block is applied at parse; a non-object bloc
     }
 }
 
-test "glm5_next arch table: the registry builds it (no draft lane: serial)" {
+test "glm5_next arch table: the registry builds it (a serial draft lane, no prefix restore, no handover)" {
     const vt = comptime sdk.Arch.of(@This());
     try testing.expect(vt.request_end != null);
     try testing.expect(vt.restore_prefix == null and vt.handover == null);
+    try testing.expect(vt.spec == .draft_lane);
+    var m: Module = undefined;
+    try testing.expectEqual(@as(u32, 0), draft_lane.blockSize(&m));
+    try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(&m, .{ .greedy = true, .clean = true }));
+    try testing.expectEqualStrings("serial", draft_lane.laneName(&m));
 }
