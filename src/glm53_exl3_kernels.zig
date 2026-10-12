@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
-pub const manifest_sha256 = "7a6b5b4856e839e2c9e8eb315dc1e7e065ca1ba576f048f2a764b91796e4caaf";
+pub const manifest_sha256 = "14eb6dab08cdb5e078cca4c660e9b20d42e56096eaa4cb48574bbf751d811028";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
 const dir = "kernels/glm53_exl3/";
 
@@ -30,7 +30,6 @@ pub const tp_ranks: u32 = 4;
 pub const Kernel = enum {
     glm53_dec_gu,
     glm53_dec_down,
-    glm53_dec_fin,
     glm53_dec_combine,
     glm53_pf_gu,
     glm53_pf_mid,
@@ -392,7 +391,7 @@ fn initOrPrint(texts: *const Texts, pin: []const u8) !Registry {
 test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel is registered at GLM-5.3's dims and the fixture's, both Ks" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 7), n_kernels);
+    try testing.expectEqual(@as(usize, 6), n_kernels);
     try testing.expectEqual(@as(u32, 6144), reg.dims[0].hidden);
     try testing.expectEqual(@as(u32, 512), reg.dims[0].mini);
     for (reg.entries, 0..) |e, i| {
@@ -414,12 +413,10 @@ test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel 
     try testing.expect(reg.get(.glm53_dec_gu).per_k and !reg.get(.glm53_dec_combine).per_k);
     // the gu makes its members' inputs (x, the bank kinds' rin) in each threadgroup: 16 inputs
     try testing.expectEqual(@as(usize, 16), reg.get(.glm53_dec_gu).inputs.len);
-    // the down binds the slot table and every bank kind's middle arrays and trellis (17 inputs), the output stage the
-    // bank kinds' rout (6); the decode GEMVs group a slot's members (MAXM), two output tiles over eight simdgroups a
-    // threadgroup
-    try testing.expectEqual(@as(usize, 17), reg.get(.glm53_dec_down).inputs.len);
-    try testing.expectEqual(@as(usize, 6), reg.get(.glm53_dec_fin).inputs.len);
-    for ([_]Kernel{ .glm53_dec_gu, .glm53_dec_down }, [_]u32{ 256, 256 }) |k, tg| {
+    // the down stage binds the slot table and every bank kind's five arrays: 20 inputs; the decode GEMVs group a slot's
+    // members (MAXM), output tiles over eight simdgroups (gu) and a 128-block over sixteen (down) a threadgroup
+    try testing.expectEqual(@as(usize, 20), reg.get(.glm53_dec_down).inputs.len);
+    for ([_]Kernel{ .glm53_dec_gu, .glm53_dec_down }, [_]u32{ 256, 512 }) |k, tg| {
         try testing.expectEqual([3]u32{ tg, 1, 1 }, reg.get(k).threadgroup);
         try testing.expectEqualStrings("MAXM", reg.get(k).template[3]);
     }
@@ -459,7 +456,7 @@ test "glm53 exl3 kernels: a tampered text or header, another pin, another bank o
         .{ .needle = "\"name\":\"glm53_pf_mid\"", .repl = "\"name\":\"glm53_pf_mid2\"", .err = error.UnknownKernel, .names = "glm53_pf_mid2" },
         .{ .needle = "\"name\":\"glm53_pf_mid\"", .repl = "\"name\":\"glm53_pf_gu\"", .err = error.DuplicateKernel, .names = "glm53_pf_gu listed twice" },
         .{ .needle = "\"format\":\"mlx-stream-glm53-exl3-kernels-v1\"", .repl = "\"format\":\"mlx-stream-glm53-exl3-kernels-v2\"", .err = error.ManifestFormat, .names = "v2" },
-        .{ .needle = "\"template\":[\"HID\",\"DEV\",\"T\"],\"threadgroup\":[32,1,1]", .repl = "\"template\":[\"HID\",\"DEV\",\"T\"],\"threadgroup\":[2048,1,1]", .err = error.SchemaInvalid, .names = "threadgroup 2048x1x1" },
+        .{ .needle = "\"threadgroup\":[512,1,1]", .repl = "\"threadgroup\":[2048,1,1]", .err = error.SchemaInvalid, .names = "threadgroup 2048x1x1" },
     }) |c| {
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, embedded.manifest, c.needle));
         const m = try std.mem.replaceOwned(u8, a, embedded.manifest, c.needle, c.repl);
