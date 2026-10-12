@@ -38,6 +38,8 @@ const gprof = @import("profile.zig");
 const prefill_attention = @import("../mimo_v2/prefill_attention.zig");
 const warm = @import("warm.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
+const expert_tally = @import("../../sdk_ext.zig").expert.tally;
+const builtin = @import("builtin");
 
 const T = mlx.mlx_array;
 
@@ -84,6 +86,10 @@ pub const Module = struct {
     step_pass: *const fn (*Module, []const u32) anyerror!T,
     /// The MTP round the construction installed: its verify over the installed decode glue.
     round_pass: *const fn (*Module, std.mem.Allocator, u32, u32, sdk.SamplingParams) anyerror!sdk.DraftRound,
+    /// The rate tally's file (`expert_tally.pathOf`; null: none, as in test builds or under `expert_tally_file: off`)
+    /// and the rates each request's end folds in and writes (layers x experts; empty: no tally, ratio 0).
+    tally_path: ?[]u8 = null,
+    tally_rates: []f32 = &.{},
 
     const Decode = struct { steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0, s0: @import("../../sdk_ext.zig").expert.Stats = .{}, active: bool = false };
 
@@ -222,8 +228,11 @@ pub const Module = struct {
         // named route still refuses by name there (the install).
         const warm_route = self.c.warmRoute(gpu_warm.gpuStream(s));
         if (warm_route != self.c.gpu_keep_warm) log.info("glm5_next route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits)\n", .{@tagName(self.c.gpu_keep_warm)});
-        self.src = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route);
+        self.src = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally);
         errdefer self.src.deinit();
+        // The rate tally (`expert_resident_ratio` > 0): its file read once (the first request's pins), its line.
+        try self.openTally(dir, plan.rows.decode);
+        errdefer self.closeTally();
         if (self.src.warm != null) log.info("glm5_next gpu keep-warm installed: gpu_keep_warm=waits source={s} (MiMo X12: a {d}-thread spin on its own Metal queue in chunks of ~{d} us while the stream's gated parts and the read-ahead wait for their bytes; no model array touched; bill {d} B)\n", .{ if (self.c.gpu_keep_warm_requested) "setting" else "default", gpu_warm.threads, gpu_warm.chunk_target_ns / std.time.ns_per_us, gpu_warm.bill_bytes });
         if (self.c.decode_predict == .bf16) log.info("glm5_next decode predictor installed: the lookahead's scores on the routers' BF16 weights ([experts, hidden], MLX gemv; the F32 copies stay the prompt routing's)\n", .{});
         self.cache = try graph.Cache.init(gpa, &self.c.model, @intCast(plan.reserve));
@@ -238,7 +247,7 @@ pub const Module = struct {
             log.info("glm5_next logits_dump: on dir={s} chunk_rows={d} chunk_bytes={d} (one safetensors file per prompt pass: logits F32 [prompt rows, {d}], token_ids I32, ids_int32_sha256; written before the request returns)\n", .{ d, graph.dump_chunk_rows, dump.chunkBytes(graph.dump_chunk_rows, model.vocab_size, model.hidden_size), model.vocab_size });
         }
         if (self.mtp == null) log.info("glm5_next MTP lane: off (serial; set {{\"mtp_lane\":true}})\n", .{});
-        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s} residents={s} decode_glue={s} decode_kda={s} decode_dsa={s} decode_predict={s} decode_swiglu={s} gpu_keep_warm={s}\n", .{ routes.dsa.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route), @tagName(self.c.model.residents_format), @tagName(self.c.decode_glue), @tagName(self.c.decode_kda), @tagName(self.c.decode_dsa), @tagName(self.c.decode_predict), @tagName(self.c.decode_swiglu), @tagName(warm_route) });
+        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s} residents={s} decode_glue={s} decode_kda={s} decode_dsa={s} decode_predict={s} decode_swiglu={s} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ routes.dsa.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route), @tagName(self.c.model.residents_format), @tagName(self.c.decode_glue), @tagName(self.c.decode_kda), @tagName(self.c.decode_dsa), @tagName(self.c.decode_predict), @tagName(self.c.decode_swiglu), @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
         // The prompt levers' engagement lines (glm5next/prefill-levers; docs/glm5-next.md "Prompt levers").
         if (experts.prompt_relocate) log.info("glm5_next prompt lever 1: read-ahead relocation engaged (a read-ahead record the plans evict before any hit is copied at the plans into its later transient row: read once; exact)\n", .{});
         log.info("glm5_next prompt lever 3: prompt kernels warmed at load in {d} ms (KDA layer {d}: {d} spans; dense layer {d}: one {d}-row tile; DSA layer {d}: {d} spans of {d} rows; the {s} combine; token-identical)\n", .{ warmed.ns / std.time.ns_per_ms, warmed.plan.kda_layer, warmed.plan.kda_spans, warmed.plan.dense_layer, graph.dense_tile_rows, warmed.plan.dsa_layer, warmed.plan.dsa_spans, graph.span_rows, @tagName(self.src.combine_route) });
@@ -288,9 +297,68 @@ pub const Module = struct {
             log.warn("glm5_next construction check: the footprint {d} B exceeds the billed construction terms {d} B by more than {d} B (an under-bill: proceeding)\n", .{ footprint, billed, bill.construction_tolerance_bytes });
     }
 
+    /// The rate tally at construction (glm_moe_dsa's `openTally`): nothing at ratio 0 (no tally: the stream got none);
+    /// else the rates its requests' ends fold in, and the file read (`expert_tally_file` on / pinned) to seed the first
+    /// request's pins; never in test builds (their HOME is the box user's). One line either way.
+    fn openTally(self: *Module, dir: []const u8, decode_rows: u32) !void {
+        const t = self.c.tally;
+        if (!t.enabled()) {
+            log.info("glm5_next expert tally: off (expert_resident_ratio 0: no rate tally, no pins, no file)\n", .{});
+            return;
+        }
+        const shape = self.src.tallyShape();
+        self.tally_rates = try self.gpa.alloc(f32, @as(usize, shape.layers) * shape.experts);
+        @memset(self.tally_rates, 0);
+        errdefer self.closeTally();
+        const pins = @min(expert_tally.pinLimit(t.ratio, shape.experts), decode_rows);
+        var status: []const u8 = "no file (expert_tally_file off): every request after the first pins from the last one's rates";
+        if (!builtin.is_test and t.readsFile()) {
+            const key = try expert_tally.keyOf(self.gpa, "glm5_next", dir);
+            defer self.gpa.free(key);
+            self.tally_path = try expert_tally.pathOf(self.gpa, key);
+            if (self.tally_path) |path| switch (try expert_tally.read(self.gpa, self.io, path, shape.layers, shape.experts)) {
+                .rates => |r| {
+                    defer self.gpa.free(r);
+                    @memcpy(self.tally_rates, r);
+                    self.src.seedTally(r);
+                    status = "file read: the first request pins from it";
+                },
+                .missing => status = "no file yet: the first request plans as without a tally",
+                .mismatched => {
+                    log.warn("glm5_next expert tally: {s} is not this stream's ({d} layers of {d} experts, version {d}): ignored\n", .{ path, shape.layers, shape.experts, expert_tally.version });
+                    status = "file of another geometry ignored: the first request plans as without a tally";
+                },
+            } else status = "no HOME, no file: every request after the first pins from the last one's rates";
+        }
+        log.info("glm5_next expert tally installed: expert_resident_ratio={d} pins={d} of {d} decode rows a layer, window {d} routes, expert_tally_file={s} path={s}; {s}\n", .{ t.ratio, pins, decode_rows, t.window, @tagName(t.file), if (self.tally_path) |p| p else "none", status });
+    }
+
+    fn closeTally(self: *Module) void {
+        if (self.tally_path) |p| self.gpa.free(p);
+        self.tally_path = null;
+        if (self.tally_rates.len > 0) self.gpa.free(self.tally_rates);
+        self.tally_rates = &.{};
+    }
+
+    /// The request's end for the tally (glm_moe_dsa's `endTally`): each layer's decode rates folded in (the next request
+    /// pins from them), the file written under `expert_tally_file: on`. A failure is logged; the request is not failed.
+    fn endTally(self: *Module) void {
+        if (self.tally_rates.len == 0) return;
+        const routed = self.src.endTally(self.tally_rates);
+        const path = self.tally_path orelse return;
+        if (routed == 0 or !self.c.tally.writesFile()) return;
+        const shape = self.src.tallyShape();
+        expert_tally.write(self.gpa, self.io, path, self.tally_rates, shape.layers, shape.experts, self.c.tally.window) catch |e| {
+            log.warn("glm5_next expert tally: not written to {s}: {s}\n", .{ path, @errorName(e) });
+            return;
+        };
+        log.info("glm5_next expert tally: written to {s} ({d} of {d} layers routed in the decode)\n", .{ path, routed, shape.layers });
+    }
+
     pub fn deinit(self: *Module) void {
         _ = mlx.mlx_synchronize(self.g.s);
         if (comptime gprof.enabled) gprof.disarm(self.src);
+        self.closeTally();
         if (self.mtp) |lane| {
             lane.deinit(&self.g);
             self.gpa.free(self.history);
@@ -603,6 +671,7 @@ pub const Module = struct {
         });
         const s1 = self.src.stats();
         const tok_s: f64 = if (d.wall_ns > 0) @as(f64, @floatFromInt(d.tokens)) * 1e9 / @as(f64, @floatFromInt(d.wall_ns)) else 0;
+        self.endTally();
         log.info("glm5_next decode: steps={d} tokens={d} wall_s={d:.3} tok_s={d:.2} ssd_bytes={d} ssd_bytes_per_token={d}\n", .{ d.steps, d.tokens, @as(f64, @floatFromInt(d.wall_ns)) / 1e9, tok_s, s1.expert_bytes_read -| d.s0.expert_bytes_read, if (d.tokens > 0) (s1.expert_bytes_read -| d.s0.expert_bytes_read) / d.tokens else 0 });
     }
 };

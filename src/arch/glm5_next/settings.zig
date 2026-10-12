@@ -12,12 +12,15 @@
 //! (`fused`, the default: one text, swiglu.zig; `ops`, the op chain, the control); `gpu_keep_warm` MiMo's X12 route
 //! (`waits`, the default: a one-simdgroup spin on its own Metal queue while the stream's gated parts and read-ahead wait
 //! for their bytes, mimo_v2/gpu_warm.zig; `off`, the control); `logits_dump_dir` (an absolute directory) installs the
-//! logits dump route for the KL gate (dump.zig): absent, nothing of it is built.
+//! logits dump route for the KL gate (dump.zig): absent, nothing of it is built. `expert_resident_ratio`,
+//! `expert_tally_window` and `expert_tally_file` set the expert stream's rate tally (sdk_ext/expert/tally.zig, every
+//! streamed arch's keys; glm5_next's default ratio `default_tally_ratio`).
 
 const std = @import("std");
 const sdk = @import("sdk");
 const glm = @import("config.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
+const expert_tally = @import("../../sdk_ext.zig").expert.tally;
 
 /// The context a load bills when the model sets none: the standard request (16,384 prompt tokens and 1,024 generated).
 pub const fill_reserve_tokens: u64 = 16_384 + 1_024;
@@ -66,11 +69,21 @@ comptime {
 }
 /// MLX's buffer cache limit through the request (the decode phase's and the prompt pass's).
 pub const allocator_cache_bytes: u64 = 256 << 20;
+/// The expert stream's rate tally on glm5_next (sdk_ext/expert/tally.zig, policy.zig: per layer and expert an EMA of the
+/// decode routes' request rate; the top `expert_resident_ratio` of each layer's experts by rate pinned in the persistent
+/// rows, never victims, first in; with a seeded tally a prompt miss that is not pinned evicts nothing; the file
+/// ~/.mlx-stream/glm5_next-<pack dir>/expert-tally.bin read at the load, written at each request's end). The default
+/// ratio: 0 (off). The policy's exact replay on the profile cell's route trace (4,096 serial decode tokens at 140 rows,
+/// 0 plan mismatches; pins from the first 2,048 tokens' route shares): at Flash's ~50 % residency, ratio 0.5 pins
+/// min(144, rows) = every decode row (a static resident set) and misses +7.2 % in-sample / +34.0 % on the next 2,048
+/// tokens; 0.25 -2.5 % / +1.1 %; 0.375 -4.0 % / +4.0 %; pins from the prompt's counts +13..+190 %. No ratio gains out of
+/// sample (and that trace is the benchmark prompt's own: a ceiling at best). A load names a ratio to turn it on.
+pub const default_tally_ratio: f64 = 0;
 /// The reader's staging per worker: Flash's gate/up span (9,437,192 B) plus its page alignment and a page (bank.zig).
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "logits_dump_dir" };
 
 /// The decode lane's routed-expert route, installed once at construction: `stock` MLX's gather_qmm nvfp4 (two gathers
 /// and the clamped SwiGLU, then a gather per down), `fused` the NVFP4 decode texts (decode_kernels.zig: MiMo's k1 family
@@ -139,6 +152,9 @@ pub const Config = struct {
     gpu_keep_warm: gpu_warm.Route = .waits,
     /// The settings named `gpu_keep_warm` (a named route refuses where the default resolves to the control).
     gpu_keep_warm_requested: bool = false,
+    /// The expert stream's rate tally (`expert_resident_ratio`, `expert_tally_window`, `expert_tally_file`): every
+    /// streamed arch's keys (`expert_tally.Settings`), glm5_next's default ratio.
+    tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -189,6 +205,7 @@ pub const Config = struct {
             if (route == .invalid) c.malformed.gpu_keep_warm = true else c.gpu_keep_warm = route;
             c.gpu_keep_warm_requested = true;
         }
+        _ = c.tally.apply(raw.object);
         if (raw.object.get("logits_dump_dir")) |v| {
             const ok = v == .string and v.string.len > 1 and v.string.len <= max_dump_dir and v.string[0] == '/' and std.mem.indexOfScalar(u8, v.string, 0) == null;
             if (ok) {
@@ -248,6 +265,7 @@ pub const Config = struct {
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
         if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
+        try c.tally.check("glm5_next");
         if (c.kv_quant_bits) |b| if (b != 0 and b != 16) return error.Glm5NextKvQuantUnsupported;
         if (c.expert_rows) |d| if (d > c.model.n_routed_experts) return error.Glm5NextExpertRows;
         if (c.expert_prefill_rows) |p| if (p > c.model.n_routed_experts) return error.Glm5NextExpertRows;
@@ -344,6 +362,19 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(gpu_warm.Route.waits, warm_named.warmRoute(false));
     try testing.expectError(error.Glm5NextGpuKeepWarmSetting, (try parseSettings("{\"gpu_keep_warm\":\"all\"}")).validate());
     try testing.expectError(error.Glm5NextGpuKeepWarmSetting, (try parseSettings("{\"gpu_keep_warm\":true}")).validate());
+    // The rate tally: the default ratio unless named; the keys parsed; an impossible value refused by name.
+    try testing.expectEqual(default_tally_ratio, pinned.tally.ratio);
+    try testing.expectEqual(expert_tally.default_window, pinned.tally.window);
+    try testing.expectEqual(expert_tally.File.on, pinned.tally.file);
+    const tallied = try parseSettings("{\"expert_resident_ratio\":0.25,\"expert_tally_window\":16,\"expert_tally_file\":\"pinned\"}");
+    try tallied.validate();
+    try testing.expectEqual(@as(f64, 0.25), tallied.tally.ratio);
+    try testing.expectEqual(@as(u32, 16), tallied.tally.window);
+    try testing.expect(tallied.tally.readsFile() and !tallied.tally.writesFile());
+    try testing.expect(!(try parseSettings("{\"expert_resident_ratio\":0,\"expert_tally_file\":\"on\"}")).tally.readsFile());
+    try testing.expectError(error.ResidentRatioOutOfRange, (try parseSettings("{\"expert_resident_ratio\":1.5}")).validate());
+    try testing.expectError(error.TallyWindowOutOfRange, (try parseSettings("{\"expert_tally_window\":0}")).validate());
+    try testing.expectError(error.TallyFileUnknown, (try parseSettings("{\"expert_tally_file\":\"benchmark\"}")).validate());
     // The host's facts: its rows win; its context is the reserve.
     const facts: sdk.LoadFacts = .{ .memory_baseline_bytes = 10, .expert_rows = 90, .effective_context = 32_768, .wired_margin_bytes = 2 << 30 };
     const built = pinned.withFacts(&facts);
