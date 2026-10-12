@@ -899,17 +899,18 @@ fn nbytesOf(x: mlx.mlx_array) u64 {
 }
 
 /// GLM53_EXL3_DEC4's experiments on these texts' decode chain: one text each, one needle replaced.
-const DecExp = struct { name: []const u8, kernel: xk.Kernel, needle: []const u8, repl: []const u8, members: u32 = routes.max_members };
+const DecExp = struct { name: []const u8, kernel: xk.Kernel, subs: []const [2][]const u8 = &.{}, members: u32 = routes.max_members, all: bool = false };
+const half_mid = [_][2][]const u8{
+    .{ "    threadgroup float mid[uint(MAXM) * 4u * uint(MINI)];", "    threadgroup half mid[uint(MAXM) * 4u * uint(MINI)];" },
+    .{ "        threadgroup float* mb = mid + (jm * 4u + r) * uint(MINI) + ib * 128u + g53_lane_slot(lane);", "        threadgroup half* mb = mid + (jm * 4u + r) * uint(MINI) + ib * 128u + g53_lane_slot(lane);" },
+    .{ "if (live[j]) g53_fma8(acc[j], reinterpret_cast<const threadgroup float4*>(mid + (j * 4u + r) * uint(MINI))[tk * 4u + (lane & 3u)], w8);", "if (live[j]) g53_fma8(acc[j], float4(reinterpret_cast<const threadgroup half4*>(mid + (j * 4u + r) * uint(MINI))[tk * 4u + (lane & 3u)]), w8);" },
+};
 const dec_exps = [_]DecExp{
-    .{ .name = "one member a slot (no grouping)", .kernel = .glm53_dec_gu, .needle = "", .repl = "", .members = 1 },
-    .{ .name = "gu: inputs constant (no x loads)", .kernel = .glm53_dec_gu, .needle = "            const float4 xv = float4(xm[j][tk * 4u]);", .repl = "            const float4 xv = float4(0.001f * float(tk + j));" },
-    .{ .name = "gu: weights constant (no trellis reads, no decode)", .kernel = .glm53_dec_gu, .needle = "        for (uint o = 0u; o < TPG; ++o) g53_lane_weights<K>(tw + size_t(tk) * (OT * NW) + o * NW, pl, w8[o]);", .repl = "        for (uint o = 0u; o < TPG; ++o) for (uint q = 0u; q < 8u; ++q) w8[o][q] = half(0.001f * float(q + o + tk));" },
-    .{ .name = "gu: trellis reads, no decode", .kernel = .glm53_dec_gu, .needle = "        for (uint o = 0u; o < TPG; ++o) g53_lane_weights<K>(tw + size_t(tk) * (OT * NW) + o * NW, pl, w8[o]);", .repl = "        for (uint o = 0u; o < TPG; ++o) { const device uint* ww = tw + size_t(tk) * (OT * NW) + o * NW; const uint lo = ww[pl.a]; const uint hi = ww[pl.b]; for (uint q = 0u; q < 8u; ++q) w8[o][q] = as_type<half2>((lo >> q) ^ hi).x; }" },
-    .{ .name = "down: weights constant (no trellis reads, no decode)", .kernel = .glm53_dec_down, .needle = "            g53_lane_weights<K>(tw + size_t(tk) * (OT * NW), pl, w8);", .repl = "            for (uint q = 0u; q < 8u; ++q) w8[q] = half(0.001f * float(q + tk));" },
-    .{ .name = "gu: nothing (returns)", .kernel = .glm53_dec_gu, .needle = "    if (packed == 0xffffffffu) return;", .repl = "    if (true) return;" },
-    .{ .name = "gu: an eighth of the k-tiles", .kernel = .glm53_dec_gu, .needle = "    for (uint tk = sg; tk < IT; tk += SGS) {", .repl = "    for (uint tk = sg; tk < IT / 8u; tk += SGS) {" },
-    .{ .name = "down: nothing (returns)", .kernel = .glm53_dec_down, .needle = "    if (n_live == 0u) return;", .repl = "    if (true) return;" },
-    .{ .name = "down: half the minis' GEMV", .kernel = .glm53_dec_down, .needle = "    for (uint r = sg >> 3u; r < 4u; r += 2u) {", .repl = "    for (uint r = sg >> 3u; r < 2u; r += 2u) {" },
+    .{ .name = "one member a slot (no grouping)", .kernel = .glm53_dec_gu, .members = 1, .all = true },
+    .{ .name = "down: the middles f16 in threadgroup memory", .kernel = .glm53_dec_down, .subs = &half_mid, .all = true },
+    .{ .name = "one member a slot, down: the middles f16", .kernel = .glm53_dec_down, .subs = &half_mid, .members = 1, .all = true },
+    .{ .name = "gu: nothing (returns)", .kernel = .glm53_dec_gu, .subs = &.{.{ "    if (packed == 0xffffffffu) return;", "    if (true) return;" }} },
+    .{ .name = "down: nothing (returns)", .kernel = .glm53_dec_down, .subs = &.{.{ "    if (n_live == 0u) return;", "    if (true) return;" }} },
 };
 
 /// One experiment's registry over its mutated text, bound on the bench's stream, and its decode chains (K3, K4).
@@ -924,7 +925,7 @@ const DecExpRun = struct {
     fn init(e: *DecExpRun, a: Allocator, ex: DecExp, s: mlx.mlx_stream, inst0: xk.Instance, k1: u32) !void {
         var inst1 = inst0;
         inst1.k = k1;
-        if (ex.needle.len == 0) {
+        if (ex.subs.len == 0) {
             // the texts as they are, the chain at `members`
             e.src = try a.dupeSentinel(u8, "", 0);
             errdefer a.free(e.src);
@@ -938,10 +939,14 @@ const DecExpRun = struct {
             for (&e.dec) |*d| d.maxm = ex.members;
             return;
         }
-        const base = xk.embedded.sources[@backingInt(ex.kernel)];
-        if (std.mem.count(u8, base, ex.needle) != 1) return error.NeedleMissing;
-        const tx = try std.mem.replaceOwned(u8, a, base, ex.needle, ex.repl);
+        var tx = try a.dupe(u8, xk.embedded.sources[@backingInt(ex.kernel)]);
         defer a.free(tx);
+        for (ex.subs) |sub| {
+            if (std.mem.count(u8, tx, sub[0]) != 1) return error.NeedleMissing;
+            const t2 = try std.mem.replaceOwned(u8, a, tx, sub[0], sub[1]);
+            a.free(tx);
+            tx = t2;
+        }
         e.src = try a.dupeSentinel(u8, tx, 0);
         errdefer a.free(e.src);
         e.mf = try xk.retexted(a, &xk.embedded, .{ .kernel = ex.kernel }, e.src, &e.texts);
@@ -1087,7 +1092,10 @@ fn benchDecode4(a: Allocator, g: anytype, ours: anytype, theirs: anytype, banks:
         try run.init(a, dx, g.s, .{ .k = b.layers[0].k, .hidden = @intCast(h), .mini = @intCast(mini) }, b.layers[1].k);
         n_exps += 1;
     }
-    for (0..dec_exps.len) |ei| for ([_]Cfg{ .real, .hot }) |cfg| for ([_]Sides{ .k3, .k4 }) |sd| try arms.append(ar, .{ .cfg = cfg, .depth = .full, .sides = sd, .impl = .glm53, .exp = ei });
+    for (dec_exps, 0..) |dx, ei| {
+        if (dx.all) for ([_]Cfg{ .real, .distinct, .hot }) |cfg| try arms.append(ar, .{ .cfg = cfg, .depth = .full, .sides = .both, .impl = .glm53, .exp = ei });
+        for ([_]Cfg{ .real, .hot }) |cfg| for ([_]Sides{ .k3, .k4 }) |sd| try arms.append(ar, .{ .cfg = cfg, .depth = .full, .sides = sd, .impl = .glm53, .exp = ei });
+    }
     const steps = 32;
     const best = try ar.alloc(u64, arms.items.len);
     const best_eval = try ar.alloc(u64, arms.items.len);
