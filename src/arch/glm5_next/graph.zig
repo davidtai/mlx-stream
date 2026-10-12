@@ -862,6 +862,8 @@ test {
     _ = @import("glue_parity.zig");
     _ = @import("kda_decode.zig");
     _ = @import("kda_decode_parity.zig");
+    _ = @import("dsa_decode.zig");
+    _ = @import("dsa_decode_parity.zig");
 }
 
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {

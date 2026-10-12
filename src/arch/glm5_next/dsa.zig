@@ -12,6 +12,7 @@ const mlx = sdk.mlx;
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const ops = @import("ops.zig");
+const dsa_decode = @import("dsa_decode.zig");
 /// Profile builds: the DSA split's marks (`indexer`, `topk`, `sparse`) and their evals, only while the prompt timeline
 /// records; compiled out of a served build.
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
@@ -59,8 +60,9 @@ fn rmsNorm(g: *G, x: T, w: T, eps: f32) !T {
 }
 
 /// The module's construction-time routes: the indexer's prompt scores and the sparse latent attention on the NAX
-/// kernels (`dsa_nax`) where the device runs them (`fits`: Flash's dims are the kernels').
-pub const Routes = struct { nax: bool = false };
+/// kernels (`dsa_nax`) where the device runs them (`fits`: Flash's dims are the kernels'); the decode lane's sparse
+/// latent attention on the fused texts (`decode_dsa: fused`, dsa_decode.zig) when the module installed them.
+pub const Routes = struct { nax: bool = false, sparse: ?*const dsa_decode.Kernels = null };
 
 /// The NAX kernels' shapes (`mlx_host.dsa_nax`): the 512-wide latent, heads in 32s, the indexer's 128-wide keys.
 pub fn fits(c: *const glm.Config) bool {
@@ -150,8 +152,11 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
             };
             // The NAX route (installed at construction where the device has the tensor units and Flash's dims fit the
             // kernels) on a multi-row call; the op chain's otherwise. An installed route never falls back.
+            // The decode lane's rows (n <= 4) on the fused texts where installed (a row-count route).
             const o_sparse = if (routes.nax and n > 8)
                 try g.adopt((try ops.sparseLatentNax(g.s, q_abs, latent4, sel, scale)) orelse return error.Glm5NextNaxShape)
+            else if (routes.sparse != null and n <= dsa_decode.max_rows)
+                try dsa_decode.attend(g, routes.sparse.?, q_abs, latent4, sel, @intCast(n))
             else
                 try g.adopt(try ops.sparseLatentAttention(g.s, q_abs, latent4, sel, scale, 64));
             if (comptime ptl.enabled) if (ptl.recording()) {

@@ -41,6 +41,12 @@ pub const fused_kernels_bytes: u64 = 16 << 20;
 pub const glue_kernels_bytes: u64 = 8 << 20;
 /// The fused KDA decode text (kda_decode.zig: four widths), its pipelines and configs, declared (`kda_kernels` term).
 pub const kda_kernels_bytes: u64 = 4 << 20;
+/// The fused DSA decode texts (dsa_decode.zig: the split's four widths and MiMo's merge), declared, plus the split's
+/// partials at the decode lane's widest call (pacc f32 [H x 4, 16, 512] and pm / pl), geometric (`dsa_kernels` term).
+pub fn dsaKernelsBytes(c: *const glm.Config) u64 {
+    const rows: u64 = @as(u64, c.n_heads) * @import("dsa_decode.zig").max_rows;
+    return (4 << 20) + rows * @import("dsa_decode.zig").slices * (@import("dsa_decode.zig").latent + 2) * 4;
+}
 
 pub const Plan = struct {
     bill: sdk.MemoryBill,
@@ -141,6 +147,8 @@ pub const Inputs = struct {
     decode_glue: settings.DecodeGlue = .ops,
     /// The decode lane's KDA layer (`settings.DecodeKda`).
     decode_kda: settings.DecodeKda = .ops,
+    /// The decode lane's DSA sparse latent attention (`settings.DecodeDsa`).
+    decode_dsa: settings.DecodeDsa = .ops,
     /// The MTP lane's construction facts (`mtp_lane` on; null: the serial control, none of the lane's terms).
     mtp: ?mtp.Facts = null,
     page: u64 = 16_384,
@@ -436,6 +444,8 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
         .{ .name = "glue_kernels", .bytes = @splat(if (in.decode_glue == .fused) glue_kernels_bytes else 0), .at_construction = true },
         // `decode_kda: fused`: the KDA decode text, declared; 0 under `ops`.
         .{ .name = "kda_kernels", .bytes = @splat(if (in.decode_kda == .fused) kda_kernels_bytes else 0), .at_construction = true },
+        // `decode_dsa: fused`: the DSA decode texts and the split's partials, declared; 0 under `ops`.
+        .{ .name = "dsa_kernels", .bytes = @splat(if (in.decode_dsa == .fused) dsaKernelsBytes(&in.model) else 0), .at_construction = true },
         .{ .name = "slot_wiring", .bytes = @splat(0), .at_construction = false, .with_rows = true },
     };
     return .{
@@ -479,6 +489,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .decode_moe = cfg.decode_moe,
         .decode_glue = cfg.decode_glue,
         .decode_kda = cfg.decode_kda,
+        .decode_dsa = cfg.decode_dsa,
         .mtp = lane,
         .page = page,
     };
@@ -605,6 +616,13 @@ test "glm5_next bill: the terms sum to the bill, the slot wiring is the one row 
     const bk = try billOf(a, &kda_in);
     defer bk.free(a);
     try testing.expectEqual(b.fixed(.prompt) + kda_kernels_bytes, bk.fixed(.prompt));
+    // The fused DSA texts and their partials likewise; 0 under ops.
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(b, "dsa_kernels"));
+    var dsa_in = in;
+    dsa_in.decode_dsa = .fused;
+    const bd = try billOf(a, &dsa_in);
+    defer bd.free(a);
+    try testing.expectEqual(b.fixed(.decode) + (4 << 20) + 64 * 4 * 16 * 514 * 4, bd.fixed(.decode));
     const target = box_ceiling - box_stop;
     const rows = try sdk.fill(b, 12_600_000_000, target, 288, min_rows);
     try testing.expect(rows.prompt >= min_rows and rows.prompt <= rows.decode and rows.decode <= 288);
