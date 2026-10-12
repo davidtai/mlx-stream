@@ -903,7 +903,6 @@ fn nbytesOf(x: mlx.mlx_array) u64 {
 const DecExp = struct { name: []const u8, kernel: xk.Kernel, subs: []const [2][]const u8 = &.{}, members: u32 = routes.max_members, all: bool = false };
 const dec_exps = [_]DecExp{
     .{ .name = "gu: nothing (returns)", .kernel = .glm53_dec_gu, .subs = &.{.{ "    if (packed == 0xffffffffu) return;", "    if (true) return;" }} },
-    .{ .name = "mid: nothing (returns)", .kernel = .glm53_dec_mid, .subs = &.{.{ "    if (packed == 0xffffffffu || sc[pos] == 0.0f) return;", "    if (true) return;" }} },
     .{ .name = "down: nothing (returns)", .kernel = .glm53_dec_down, .subs = &.{.{ "    if (n_live == 0u) return;", "    if (true) return;" }} },
 };
 

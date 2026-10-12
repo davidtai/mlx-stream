@@ -4,11 +4,10 @@
 //! intermediates are freed here once launched (the pending graph keeps them).
 //!   - Decode, per wave of a routed layer's pairs over one bank layer (its three bank kinds through packed slots, bank
 //!     << 24 | row): prep (each pair's gate and up inputs per mini, f16, lane order), gu (the GEMVs per distinct slot,
-//!     output tiles a threadgroup by K, the k-tiles split among its simdgroups, each weight decoded once for the slot's
-//!     member pairs), mid (each pair's SwiGLU middle per mini, once), down (per distinct slot and 128-block of the output:
-//!     the down GEMV over its members' middles, each weight decoded once for them, each output block rotated, scaled by
-//!     its mini's rout, the minis summed, times the pair's score: f32 or bf16 per pair); per call, combine (each row's
-//!     pairs in routed order: x's dtype).
+//!     two output tiles a threadgroup, the k-tiles split among its simdgroups, each weight decoded once for the slot's
+//!     member pairs), down (per distinct slot and 128-block of the output: its members' SwiGLU middles, the down GEMV,
+//!     each weight decoded once for them, each output block rotated, scaled by its mini's rout, the minis summed, times
+//!     the pair's score: f32 per pair); per call, combine (each row's pairs in routed order: x's dtype).
 //!   - Prompt, per wave of a call's rows grouped by expert (one bank kind): the gate and up GEMMs over the rows' x in
 //!     f16 (128-row M tiles, the trellis decoded per stage, rotated along k and scaled by rin: the input prepare in the
 //!     weights), the middle, the down GEMM (the minis summed in its epilogue): bf16 per row in the wave's order.
@@ -100,7 +99,6 @@ pub const Decode = struct {
     maxm: u32 = max_members,
     /// per mode (host tables, device slots), indexed by pairs
     prep: [2]Plans(max_pairs) = .{ .{}, .{} },
-    mid: [2]Plans(max_pairs) = .{ .{}, .{} },
     /// the host mode's GEMVs: their grids count the slots, their outputs the pairs; the down's per output dtype (f32,
     /// bf16)
     gu: [max_pairs]Plans(max_pairs) = @splat(.{}),
@@ -114,7 +112,6 @@ pub const Decode = struct {
 
     pub fn deinit(self: *Decode) void {
         for (&self.prep) |*p| p.deinit();
-        for (&self.mid) |*p| p.deinit();
         for (&self.gu) |*p| p.deinit();
         for (&self.down) |*pp| for (pp) |*p| p.deinit();
         self.gu_dev.deinit();
@@ -146,10 +143,8 @@ pub const Decode = struct {
         const di = @intFromBool(dev);
         var u: [2]mlx.mlx_array = .{ .{}, .{} };
         var z: [2]mlx.mlx_array = .{ .{}, .{} };
-        var hm: [1]mlx.mlx_array = .{.{}};
         defer free(&u);
         defer free(&z);
-        defer free(&hm);
         {
             const e = reg.get(.glm53_dec_prep);
             const sh = [_]c_int{np * 4 * @as(c_int, @intCast(h))};
@@ -167,14 +162,6 @@ pub const Decode = struct {
             const p = if (dev) try self.gu_dev.get(self.b, .glm53_dec_gu, n_pairs, &cfg) else try self.gu[n_pairs - 1].get(self.b, .glm53_dec_gu, n_slots, &cfg);
             try self.b.applyPrepared(p, &.{ u[0], u[1], gt, pt, sc, banks[0].gate.trellis, banks[1].gate.trellis, banks[2].gate.trellis, banks[0].up.trellis, banks[1].up.trellis, banks[2].up.trellis }, &z);
         }
-        {
-            const e = reg.get(.glm53_dec_mid);
-            const sh = [_]c_int{np * 4 * @as(c_int, @intCast(mi))};
-            var cfg = cfgOf(e, self.inst, .{ 32 * mi / 128, @intCast(n_pairs * 4), 1 }, &.{.{ &sh, .float32 }});
-            setInt(&cfg, e, "DEV", di);
-            const p = try self.mid[di].get(self.b, .glm53_dec_mid, n_pairs, &cfg);
-            try self.b.applyPrepared(p, &.{ z[0], z[1], pt, sc, banks[0].gate.svh, banks[1].gate.svh, banks[2].gate.svh, banks[0].up.svh, banks[1].up.svh, banks[2].up.svh, banks[0].down.suh, banks[1].down.suh, banks[2].down.suh }, &hm);
-        }
         const e = reg.get(.glm53_dec_down);
         const sh = [_]c_int{ np, @intCast(h) };
         // a threadgroup per 128-block of the output and slot
@@ -184,7 +171,7 @@ pub const Decode = struct {
         setInt(&cfg, e, "MAXM", @intCast(self.maxm));
         const p = if (dev) try self.down_dev.get(self.b, .glm53_dec_down, n_pairs, &cfg) else try self.down[@intFromBool(out == .bfloat16)][n_pairs - 1].get(self.b, .glm53_dec_down, n_slots, &cfg);
         var y: [1]mlx.mlx_array = undefined;
-        try self.b.applyPrepared(p, &.{ hm[0], gt, pt, sc, banks[0].down.trellis, banks[1].down.trellis, banks[2].down.trellis, banks[0].down.svh, banks[1].down.svh, banks[2].down.svh }, &y);
+        try self.b.applyPrepared(p, &.{ z[0], z[1], gt, pt, sc, banks[0].gate.svh, banks[1].gate.svh, banks[2].gate.svh, banks[0].up.svh, banks[1].up.svh, banks[2].up.svh, banks[0].down.suh, banks[1].down.suh, banks[2].down.suh, banks[0].down.trellis, banks[1].down.trellis, banks[2].down.trellis, banks[0].down.svh, banks[1].down.svh, banks[2].down.svh }, &y);
         return y[0];
     }
 };
