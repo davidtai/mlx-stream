@@ -28,6 +28,8 @@ const mlx = sdk.mlx;
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const mimo_fp8 = @import("../mimo_v2/fp8_linear.zig");
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig): no per-call source rebuild.
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -206,7 +208,7 @@ fn dequantRun(kernel: mlx.mlx_fast_metal_kernel, w: T, scales: T, n: c_int, kdim
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, kernel, in_vec, c, s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&outs, kernel, in_vec, c, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outs, 0));
