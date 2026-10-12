@@ -158,7 +158,10 @@ test "dsv41 bank contract: a bank whose gate/up span exceeds the pool's 9 MiB st
     try testing.expectEqual(std.mem.alignForward(u64, 14_155_776, page) + page, StreamOf(MxBank, false).stagingBytes(&bank));
     const opt: StreamOf(MxBank, false).Options = .{ .rows = &.{1}, .max_route_ids = 1, .transient_rows = 1, .lookahead = .{ .budget = 1 }, .pool = .{ .workers = 1, .tickets = 256 } };
     // The pool's default staging (9 MiB) cannot hold the gate/up span: the pre-read is refused at construction.
-    try testing.expectError(error.InvalidOptions, MxStream.init(testing.allocator, &bank, opt));
+    if (MxStream.init(testing.allocator, &bank, opt)) |unexpected| {
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| try testing.expectEqual(@as(anyerror, error.InvalidOptions), err);
     var sized = opt;
     sized.staging_from_bank = true;
     const s = try MxStream.init(testing.allocator, &bank, sized);

@@ -120,6 +120,9 @@ pub const LayerPolicy = struct {
     pin_limit: u32 = 0,
     seeded: bool = false,
     pin_scratch: []u16,
+    /// Borrowed immutable construction-owned code capacities; empty for uniform banks.
+    needs: []const [3]u32 = &.{},
+    capacities: []const [3]u32 = &.{},
 
     /// A plan beside other live routes of the layer: their slots (`held`) are
     /// never victims, and its transient loads take rows from `transient_base`.
@@ -427,13 +430,32 @@ pub const LayerPolicy = struct {
         for (experts) |e| {
             if (n == out.len) break;
             if (e >= p.n_experts or p.expert_to_slot[e] != no_slot) continue;
-            const slot = p.emptySlot() orelse break;
+            const slot = p.emptyFitting(e, false, &.{}) orelse p.emptyFitting(e, true, &.{}) orelse continue;
             p.slot_to_expert[slot] = e;
             p.expert_to_slot[e] = slot;
             p.occupancy += 1;
             p.clock += 1;
             p.recency[e] = p.clock;
             out[n] = .{ .expert = e, .slot = slot };
+            n += 1;
+        }
+        return out[0..n];
+    }
+
+    /// A construction-check cohort with simultaneous empty-slot placement, without changing residency.
+    pub fn readAheadCheckCohort(p: *const LayerPolicy, out: []u16) []u16 {
+        std.debug.assert(out.len <= max_route_ids);
+        var reserved: [max_route_ids]u32 = undefined;
+        var n: usize = 0;
+        var e = p.n_experts;
+        while (e > 0 and n < out.len) {
+            e -= 1;
+            const expert: u16 = @intCast(e);
+            if (p.slotOf(expert) != null) continue;
+            const slot = p.emptyFitting(expert, false, reserved[0..n]) orelse
+                p.emptyFitting(expert, true, reserved[0..n]) orelse continue;
+            reserved[n] = slot;
+            out[n] = expert;
             n += 1;
         }
         return out[0..n];
@@ -521,7 +543,11 @@ pub const LayerPolicy = struct {
                 // once admitted are never victims.
                 for (out.missesOf()) |e| {
                     const is_seed = p.seed.isSet(e);
-                    const slot = p.emptySlot() orelse (if (p.mayEvictInPrefill(e)) p.probationVictim() else null) orelse no_slot;
+                    const may_evict = p.mayEvictInPrefill(e);
+                    const slot = p.emptyFitting(e, false, &.{}) orelse
+                        (if (may_evict) p.probationFitting(e, false) else null) orelse
+                        p.emptyFitting(e, true, &.{}) orelse
+                        (if (may_evict) p.probationFitting(e, true) else null) orelse no_slot;
                     if (is_seed) p.seed.unset(e);
                     if (slot == no_slot) {
                         transient_buf[n_transient] = e;
@@ -567,9 +593,24 @@ pub const LayerPolicy = struct {
         p.expert_to_slot[e] = slot;
     }
 
-    fn emptySlot(p: *const LayerPolicy) ?u32 {
+    fn fits(p: *const LayerPolicy, expert: u16, slot: usize, larger: bool) bool {
+        if (p.needs.len == 0) return !larger;
+        const need = p.needs[expert];
+        const cap = p.capacities[slot];
+        var exact = true;
+        for (need, cap) |n, c| {
+            if (n > c) return false;
+            exact = exact and n == c;
+        }
+        return if (larger) !exact else exact;
+    }
+
+    fn emptyFitting(p: *const LayerPolicy, expert: u16, larger: bool, reserved: []const u32) ?u32 {
         if (p.occupancy >= p.capacity) return null;
-        for (p.slot_to_expert[0..p.capacity], 0..) |e, s| if (e == no_expert) return @intCast(s);
+        for (p.slot_to_expert[0..p.capacity], 0..) |e, s| {
+            if (e == no_expert and !p.held.isSet(s) and
+                std.mem.indexOfScalar(u32, reserved, @intCast(s)) == null and p.fits(expert, s, larger)) return @intCast(s);
+        }
         return null;
     }
 
@@ -581,7 +622,8 @@ pub const LayerPolicy = struct {
         std.debug.assert(p.seed.isSet(e) and p.expert_to_slot[e] == no_slot);
         for (held) |s| p.held.set(s);
         defer for (held) |s| p.held.unset(s);
-        const slot = p.emptySlot() orelse p.probationVictim() orelse return null;
+        const slot = p.emptyFitting(e, false, &.{}) orelse p.probationFitting(e, false) orelse
+            p.emptyFitting(e, true, &.{}) orelse p.probationFitting(e, true) orelse return null;
         const victim = p.slot_to_expert[slot];
         if (victim != no_expert) {
             p.expert_to_slot[victim] = no_slot;
@@ -597,13 +639,11 @@ pub const LayerPolicy = struct {
         return slot;
     }
 
-    /// The coldest probationary resident (lowest (recency, slot)) that this
-    /// route does not hold; prefill never evicts a protected expert.
-    fn probationVictim(p: *const LayerPolicy) ?u32 {
+    fn probationFitting(p: *const LayerPolicy, expert: u16, larger: bool) ?u32 {
         var best: ?u32 = null;
         var best_recency: u64 = 0;
         for (p.slot_to_expert[0..p.capacity], 0..) |e, s| {
-            if (e == no_expert or p.in_route.isSet(e) or p.protected.isSet(e) or p.held.isSet(s) or p.pinned.isSet(e)) continue;
+            if (e == no_expert or p.in_route.isSet(e) or p.protected.isSet(e) or p.held.isSet(s) or p.pinned.isSet(e) or !p.fits(expert, s, larger)) continue;
             if (best == null or p.recency[e] < best_recency) {
                 best = @intCast(s);
                 best_recency = p.recency[e];
@@ -703,6 +743,7 @@ pub const LayerPolicy = struct {
         const admission = p.admission;
         if (out.n_misses == 0) return admission;
         p.computeScores();
+        if (p.needs.len != 0) return p.capacityAdmissions(out);
         const cap = p.capacity;
         var n_cand: usize = 0;
         var n_evictable: usize = 0;
@@ -756,6 +797,37 @@ pub const LayerPolicy = struct {
             next += 1;
         }
         return admission;
+    }
+
+    /// Decode ranks supersede prefill protection; destinations must still fit each projection.
+    fn capacityAdmissions(p: *LayerPolicy, out: *const Plan) []u32 {
+        const candidates = p.candidates[0..out.n_misses];
+        @memcpy(candidates, out.missesOf());
+        std.sort.insertion(u16, candidates, @as(*const LayerPolicy, p), struct {
+            fn greater(pp: *const LayerPolicy, x: u16, y: u16) bool {
+                return pp.rankLess(y, x);
+            }
+        }.greater);
+        const used = p.available[0..p.capacity];
+        @memset(used, 0);
+        for (candidates) |expert| {
+            for ([_]bool{ false, true }) |larger| {
+                var best: ?u32 = null;
+                for (p.slot_to_expert[0..p.capacity], 0..) |resident, slot| {
+                    if (used[slot] != 0 or p.held.isSet(slot) or !p.fits(expert, slot, larger)) continue;
+                    if (resident != no_expert and (p.in_route.isSet(resident) or !p.rankLess(resident, expert))) continue;
+                    if (best == null or resident == no_expert or
+                        (p.slot_to_expert[best.?] != no_expert and p.rankLess(resident, p.slot_to_expert[best.?]))) best = @intCast(slot);
+                    if (resident == no_expert) break;
+                }
+                if (best) |slot| {
+                    used[slot] = 1;
+                    p.admission[expert] = slot;
+                    break;
+                }
+            }
+        }
+        return p.admission;
     }
 };
 

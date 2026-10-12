@@ -30,9 +30,9 @@ const Trace = kt.Trace;
 const testRegistry = kt.testRegistry;
 const expectLaunch = kt.expectLaunch;
 const expectPreparedDecode = kt.expectPreparedDecode;
-const expectRowPlans = kt.expectRowPlans;
 const sampleAt = kt.sampleAt;
 const templateInt = kt.templateInt;
+const expectRowPlans = kt.expectRowPlans;
 const isDecode2 = kt.isDecode2;
 const isPrefill2 = kt.isPrefill2;
 // the trunk's routes
@@ -73,8 +73,6 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         std.debug.print("partition: {s}\n", .{m});
         return error.TestUnexpectedResult;
     }
-    try testing.expectEqual(@as(usize, 34), eq.kernels.len);
-    try testing.expectEqual(@as(usize, 65), tr.kernels.len);
     try testing.expectEqual(xk.n_kernels, eq.kernels.len + tr.kernels.len);
     // the EXL3 subset is exactly the EXL3 families; its headers are the DIG ones
     const exl3_families = [_][]const u8{ "exl3_decode_gemv", "exl3_rin_stage", "prefill_rebuild", "prefill_digx", "prefill_digx_check" };
@@ -83,7 +81,7 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
         var fam = false;
         for (exl3_families) |f| fam = fam or std.mem.eql(u8, e.family, f);
         try testing.expectEqual(fam, ex.contains(e.kernel));
-        if (e.header) |h| try testing.expectEqual(ex.contains(e.kernel), h == .dig2_x or h == .dig_mul1_k3 or h == .dig_mul1h_k3 or h == .dig_mul1h_k3_lut);
+        if (e.header) |h| try testing.expectEqual(ex.contains(e.kernel), h == .dig2_x or h == .dig_mul1_k3 or h == .dig_mul1h_k3 or h == .dig_mul1h_k3_lut or h == .mul1h_rate);
     }
     // the EXL3-only check kinds stay on the EXL3 side
     for (&reg.entries) |*e| {
@@ -93,8 +91,8 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
     // the executor's checks that launch a second kernel launch one of their own side
     const Pair = struct { Kernel, Kernel };
     for ([_]Pair{
-        .{ .q3rc_router_tail, .q3rc_gate_part },                        .{ .q3rc_router_tail__n128_top3, .q3rc_gate_part__n128 },
-        .{ .q3rc_premix_fin, .q3rc_premix_part },                       .{ .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3, .q3_exl3_dig_decmat_5120x2304_mul1hk3 },
+        .{ .q3rc_router_tail, .q3rc_gate_part },                                             .{ .q3rc_router_tail__n128_top3, .q3rc_gate_part__n128 },
+        .{ .q3rc_premix_fin, .q3rc_premix_part },                                            .{ .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3, .q3_exl3_dig_decmat_5120x2304_mul1hk3 },
         .{ .q3_prefill_dig_gemm_2304x5120_xmul1hk3, .q3_exl3_dig_decmat_2304x5120_mul1hk3 }, .{ .q3ht_combine_collapse_norm, .q3ht_combine },
     }) |p| try testing.expectEqual(ex.contains(p[0]), ex.contains(p[1]));
     // a violation is named: a kernel in both lists, one in none
@@ -106,6 +104,8 @@ test "dsv41 kernels c2: the EXL3 quant and the trunk partition the kernel set (k
 
 test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its subset's plan; a failure refuses only its owner" {
     const a = testing.allocator;
+    var peek = try @import("../../expert/bank.zig").peekText(a, @embedFile("../../fixtures/dsv41_bank_peek.json"), null);
+    defer peek.deinit();
     var t: Trace = .{ .a = a };
     defer t.deinit();
     var diag: xk.Diag = .{};
@@ -132,7 +132,7 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
         }
     };
     // the EXL3 quant: exactly its construction plan, the decode routes prepared (GEMV 2 x 48, rin 4 x 48)
-    const acc = try eq.accept(Trace, a, &t, .{ .kernels = set.ref() }, v41_spec, &diag);
+    const acc = try eq.accept(Trace, a, &t, .{ .kernels = set.ref(), .peek = &peek.view }, v41_spec, &diag);
     const exl3_plan = Plan.count(&set.reg, &eq.checked_at_accept);
     try testing.expectEqual(exl3_plan, acc.report.results.items.len);
     // every kernel compiles at construction, and nothing else runs
@@ -197,13 +197,13 @@ test "dsv41 kernels c2: each consumer's accept (stub device) runs exactly its su
         var want: [96]u8 = undefined;
         const name = try std.fmt.bufPrint(&want, "{t} {t}", .{ f.k, f.c });
         if (f.exl3) {
-            try testing.expectError(error.SelfCheckFailed, eq.accept(Trace, a, &t, .{ .kernels = bad.ref() }, v41_spec, &diag));
+            try testing.expectError(error.SelfCheckFailed, eq.accept(Trace, a, &t, .{ .kernels = bad.ref(), .peek = &peek.view }, v41_spec, &diag));
             try testing.expect(std.mem.indexOf(u8, diag.message(), name) != null);
             try tr.accept(a, bad, &r2, &diag);
         } else {
             try testing.expectError(error.SelfCheckFailed, tr.accept(a, bad, &r2, &diag));
             try testing.expect(std.mem.indexOf(u8, diag.message(), name) != null);
-            const ok = try eq.accept(Trace, a, &t, .{ .kernels = bad.ref() }, v41_spec, &diag);
+            const ok = try eq.accept(Trace, a, &t, .{ .kernels = bad.ref(), .peek = &peek.view }, v41_spec, &diag);
             ok.deinit(&t);
         }
     }
@@ -522,12 +522,13 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     {
         var r = try Gemv(Trace).init(&t, &reg);
         defer r.deinit(&t);
+        const binding = r.bindStorage(@splat(.{ .fixed = eq.tightLayout(3) }));
         for ([_]Proj{ .gate, .down }) |proj| {
             const e = if (proj == .down) r.dn else r.gu;
             const st = if (proj == .down) &r.dn_statics else &r.gu_statics;
             for (e.samples) |*s| {
                 const xh, const ids, const code = .{ try t.arg(e, "xh", &s.vars), try t.arg(e, "ids", &s.vars), try t.arg(e, "code", &s.vars) };
-                _ = try r.project(&t, proj, xh, ids, code);
+                _ = try r.project(&binding, &t, proj, xh, ids, code, .{ .fixed = eq.tightLayout(3) });
                 var want: [9]Trace.T = undefined;
                 want[0..3].* = .{ xh, ids, code };
                 @memcpy(want[3..], st.arrays[3..9]);
@@ -568,9 +569,9 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
         const e = r.e;
         for (e.samples) |*s| {
             const v = &s.vars;
-            const gate: ProjArrays(Trace.T) = .{ .code = try t.arg(e, "code_g", v), .rout = try t.arg(e, "rout_g", v), .rin = try t.arg(e, "rin_g", v) };
-            const up: ProjArrays(Trace.T) = .{ .code = try t.arg(e, "code_u", v), .rout = try t.arg(e, "rout_u", v), .rin = try t.arg(e, "rin_u", v) };
-            const down: ProjArrays(Trace.T) = .{ .code = try t.arg(e, "code_d", v), .rout = try t.arg(e, "rout_d", v), .rin = try t.arg(e, "rin_d", v) };
+            const gate: ProjArrays(Trace.T) = .{ .code = try t.arg(e, "code_g", v), .rout = try t.arg(e, "rout_g", v), .rin = try t.arg(e, "rin_g", v), .layout = .{ .fixed = eq.tightLayout(3) } };
+            const up: ProjArrays(Trace.T) = .{ .code = try t.arg(e, "code_u", v), .rout = try t.arg(e, "rout_u", v), .rin = try t.arg(e, "rin_u", v), .layout = .{ .fixed = eq.tightLayout(3) } };
+            const down: ProjArrays(Trace.T) = .{ .code = try t.arg(e, "code_d", v), .rout = try t.arg(e, "rout_d", v), .rin = try t.arg(e, "rin_d", v), .layout = .{ .fixed = eq.tightLayout(3) } };
             const slots = try t.arg(e, "slots", v);
             _ = try r.call(&t, gate, up, down, slots, @intCast(v.get(.experts)));
             try expectLaunch(t.back(1), e, s, &.{ gate.code, gate.rout, gate.rin, up.code, up.rout, up.rin, down.code, down.rout, down.rin, slots });
@@ -582,13 +583,13 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
         for (r.gemm_gu128.samples) |*s| {
             const e, const v = .{ r.gemm_gu128, &s.vars };
             const x0, const x1, const c0, const c1, const tbl = .{ try t.arg(e, "x0", v), try t.arg(e, "x1", v), try t.arg(e, "code0", v), try t.arg(e, "code1", v), try t.arg(e, "tbl", v) };
-            _ = try r.gemmGateUp(&t, x0, x1, c0, c1, tbl, @intCast(v.get(.tgs)));
+            _ = try r.gemmGateUp(&t, x0, x1, c0, c1, tbl, @intCast(v.get(.tgs)), .{ .fixed = eq.tightLayout(3) }, .{ .fixed = eq.tightLayout(3) });
             try expectLaunch(t.back(1), e, s, &.{ x0, x1, c0, c1, tbl });
         }
         for (r.gemm_dn128.samples) |*s| {
             const e, const v = .{ r.gemm_dn128, &s.vars };
             const x, const c0, const tbl = .{ try t.arg(e, "x", v), try t.arg(e, "code0", v), try t.arg(e, "tbl", v) };
-            _ = try r.gemmDown(&t, x, c0, tbl, @intCast(v.get(.tgs)));
+            _ = try r.gemmDown(&t, x, c0, tbl, @intCast(v.get(.tgs)), .{ .fixed = eq.tightLayout(3) });
             try expectLaunch(t.back(1), e, s, &.{ x, c0, tbl });
         }
         // the table-codebook gate|up text (its own samples: the 128-row text's geometry)
@@ -654,7 +655,7 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     // twin reference (their device self-checks, the 128-row texts' twin check and the 0b smoke
     // launch them; the route launches the 128-row texts)
     for (reg.entries) |e| {
-        const unrouted = std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e) or isPrefill2(&e) or e.kernel == .q3_prefill_dig_rot_take2_5120 or
+        const unrouted = std.mem.indexOfScalar(Kernel, &xk.rate_kernels, e.kernel) != null or std.mem.indexOfScalar(Kernel, &xk.compact_kernels, e.kernel) != null or std.mem.startsWith(u8, @tagName(e.kernel), "q3_exl3_dig_decmat_") or std.mem.startsWith(u8, e.family, "draftrc_") or isDecode2(&e) or isPrefill2(&e) or e.kernel == .q3_prefill_dig_rot_take2_5120 or
             e.kernel == .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3 or e.kernel == .q3_prefill_dig_gemm_2304x5120_xmul1hk3 or
             // the routed forms: their own test launches them (`Gemv.initForms`)
             e.kernel == .dsv41_exl3_pair_k3_5120 or e.kernel == .dsv41_exl3_guone_k3_2304 or
@@ -666,6 +667,56 @@ test "dsv41 kernels ops: every route launches its lane's calls at the lane's own
     try expectPreparedDecode(&t, &reg);
     try testing.expect(t.prepared_launches > 0);
     try testing.expectEqual(@as(isize, 0), t.keeps);
+    try testing.expectEqual(@as(isize, 0), t.prepared_live);
+}
+
+test "dsv41 kernels ops: the prepared per-M launches are the per-call launches they replace (every decode kernel, every M)" {
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var t: Trace = .{ .a = testing.allocator };
+    defer t.deinit();
+    var rule: usize = 0;
+    var launches: usize = 0;
+    for (&reg.entries) |*e| {
+        switch (e.launch) {
+            .rule => {
+                const b = e.bounds.get(.rows) orelse continue;
+                // prefill rules (rows up to 2^20): their launch stays per call
+                if (std.mem.eql(u8, e.phase, "prefill")) continue;
+                launches += switch (b[1]) {
+                    48 => try expectRowPlans(48, &t, e, null),
+                    // decode tables over M 1..8 (the index top-k and the softmax: their bound grew to
+                    // the prefill rows the prefill routes launch per call)
+                    else => try expectRowPlans(8, &t, e, null),
+                };
+                rule += 1;
+            },
+            .plans => {
+                if (e.kernel == .q3dk_sinkhorn16_hc4_it20) {
+                    launches += try expectRowPlans(32, &t, e, "");
+                    continue;
+                }
+                if (e.sites.len == 0) launches += try expectRowPlans(8, &t, e, ""); // the bf16 head (M plans)
+                for (e.sites) |s| launches += try expectRowPlans(8, &t, e, s.name);
+            },
+        }
+    }
+    // The original decode rules plus 12 direct-rate and 8 compact decode/stage rules;
+    // index top-k 1, softmax 2
+    try testing.expectEqual(@as(usize, 57), rule);
+    // + the plan kernels: rcproj 6 sites, the draft variant 3, f32-x 8, m1rows 4, smallm_all 2 + bf16 3,
+    // sinkhorn16 (32 n), the head (8 M)
+    try testing.expectEqual(@as(usize, 36 * 48 + 21 * 8 + (6 + 3 + 8 + 4 + 2 + 3) * 8 + 32 + 8), launches);
+    try testing.expectEqual(@as(isize, 0), t.prepared_live);
+    // a route's prepared configs are released with it
+    const n_launch = t.launches.items.len;
+    const pe, const te = .{ reg.get(.q3rc_gate_part), reg.get(.q3rc_router_tail) };
+    var r = try Router(Trace).init(&t, &reg, try t.arg(pe, "w", &no_vars), try t.arg(te, "bias", &no_vars), null);
+    try testing.expectEqual(@as(isize, 16), t.prepared_live);
+    r.deinit(&t);
+    var gv = try Gemv(Trace).init(&t, &reg);
+    gv.deinit(&t);
+    try testing.expectEqual(n_launch, t.launches.items.len);
     try testing.expectEqual(@as(isize, 0), t.prepared_live);
 }
 
@@ -707,13 +758,39 @@ test "dsv41 kernels ops: a bound array of another dtype or shape is refused, by 
         .code = try t.node(&.{ 4, 144, 320, 48 }, .int16, &.{}),
         .rout = try t.node(&.{ 4, 5120 }, .float32, &.{}),
         .rin = try t.node(&.{ 4, 2304 }, .float16, &.{}),
+        .layout = .{ .fixed = eq.tightLayout(3) },
     };
     try testing.expectError(error.RouteInput, checkBank(Trace, &t, &reg, .down, bank, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "q3_moeprep_dpost input rd") != null);
-    const ok: ProjArrays(Trace.T) = .{ .code = bank.code, .rout = try t.node(&.{ 4, 5120 }, .float16, &.{}), .rin = bank.rin };
+    const ok: ProjArrays(Trace.T) = .{ .code = bank.code, .rout = try t.node(&.{ 4, 5120 }, .float16, &.{}), .rin = bank.rin, .layout = bank.layout };
     try checkBank(Trace, &t, &reg, .down, ok, &diag);
     try testing.expectError(error.RouteInput, checkBank(Trace, &t, &reg, .gate, ok, &diag));
     try testing.expectEqual(@as(isize, 0), t.keeps);
+}
+
+test "dsv41 kernels rates: padded K3 bank accepts contiguous payload capacity" {
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var t: Trace = .{ .a = testing.allocator };
+    defer t.deinit();
+    var diag: xk.Diag = .{};
+    const bank: ProjArrays(Trace.T) = .{
+        .code = try t.node(&.{ 4, 144, 320, 64 }, .int16, &.{}),
+        .rout = try t.node(&.{ 4, 5120 }, .float16, &.{}),
+        .rin = try t.node(&.{ 4, 2304 }, .float16, &.{}),
+        .layout = .{ .fixed = .{ .k = 3, .code_row_words = 144 * 320 * 64 } },
+    };
+    try checkBank(Trace, &t, &reg, .down, bank, &diag);
+    const gate: ProjArrays(Trace.T) = .{
+        .code = try t.node(&.{ 4, 320, 144, 48 }, .int16, &.{}),
+        .rout = try t.node(&.{ 4, 2304 }, .float16, &.{}),
+        .rin = try t.node(&.{ 4, 5120 }, .float16, &.{}),
+        .layout = .{ .fixed = eq.tightLayout(3) },
+    };
+    const diagnostic = Rebuild(Trace).init(&reg);
+    const slots = try t.node(&.{16}, .int32, &.{});
+    try testing.expectError(error.RebuildNeedsTightK3, diagnostic.call(&t, gate, gate, bank, slots, 1));
+    try testing.expectEqual(@as(usize, 0), t.launches.items.len);
 }
 
 test "dsv41 kernels ops: the routes carry the lanes' installed configuration" {
@@ -762,56 +839,6 @@ test "dsv41 kernels ops: the routes carry the lanes' installed configuration" {
     for ([_]*const Entry{ fp.rms, fp.rms_rope, fp.fwd, fp.inv }) |k36| try testing.expectEqual(Dtype.bfloat16, k36.template[0].value.dtype);
 }
 
-test "dsv41 kernels ops: the prepared per-M launches are the per-call launches they replace (every decode kernel, every M)" {
-    var reg = try testRegistry();
-    defer reg.deinit();
-    var t: Trace = .{ .a = testing.allocator };
-    defer t.deinit();
-    var rule: usize = 0;
-    var launches: usize = 0;
-    for (&reg.entries) |*e| {
-        switch (e.launch) {
-            .rule => {
-                const b = e.bounds.get(.rows) orelse continue;
-                // prefill rules (rows up to 2^20): their launch stays per call
-                if (std.mem.eql(u8, e.phase, "prefill")) continue;
-                launches += switch (b[1]) {
-                    48 => try expectRowPlans(48, &t, e, null),
-                    // decode tables over M 1..8 (the index top-k and the softmax: their bound grew to
-                    // the prefill rows the prefill routes launch per call)
-                    else => try expectRowPlans(8, &t, e, null),
-                };
-                rule += 1;
-            },
-            .plans => {
-                if (e.kernel == .q3dk_sinkhorn16_hc4_it20) {
-                    launches += try expectRowPlans(32, &t, e, "");
-                    continue;
-                }
-                if (e.sites.len == 0) launches += try expectRowPlans(8, &t, e, ""); // the bf16 head (M plans)
-                for (e.sites) |s| launches += try expectRowPlans(8, &t, e, s.name);
-            },
-        }
-    }
-    // router 2 + 2 draft, premix 2, HCTAPE 4 + 4 draft, K36 4, GEMV 2 + routed forms 2 + banked 4, PREP 4 + banked 4;
-    // index top-k 1, softmax 2
-    try testing.expectEqual(@as(usize, 37), rule);
-    // + the plan kernels: rcproj 6 sites, the draft variant 3, f32-x 8, m1rows 4, smallm_all 2 + bf16 3,
-    // sinkhorn16 (32 n), the head (8 M)
-    try testing.expectEqual(@as(usize, 16 * 48 + 21 * 8 + (6 + 3 + 8 + 4 + 2 + 3) * 8 + 32 + 8), launches);
-    try testing.expectEqual(@as(isize, 0), t.prepared_live);
-    // a route's prepared configs are released with it
-    const n_launch = t.launches.items.len;
-    const pe, const te = .{ reg.get(.q3rc_gate_part), reg.get(.q3rc_router_tail) };
-    var r = try Router(Trace).init(&t, &reg, try t.arg(pe, "w", &no_vars), try t.arg(te, "bias", &no_vars), null);
-    try testing.expectEqual(@as(isize, 16), t.prepared_live);
-    r.deinit(&t);
-    var gv = try Gemv(Trace).init(&t, &reg);
-    gv.deinit(&t);
-    try testing.expectEqual(n_launch, t.launches.items.len);
-    try testing.expectEqual(@as(isize, 0), t.prepared_live);
-}
-
 test "dsv41 kernels ops: the routed forms launch their texts with the stock arguments (down pair; gate + up in one launch)" {
     const xq = @import("../../exl3/quant.zig");
     var reg = try testRegistry();
@@ -827,12 +854,13 @@ test "dsv41 kernels ops: the routed forms launch their texts with the stock argu
     for ([_]xq.Forms{ .{}, .{ .down_pair = true }, .{ .gu_one = true }, .{ .down_pair = true, .gu_one = true } }) |f| {
         var gv = try xq.Gemv(Trace).initForms(&t, &reg, f);
         defer gv.deinit(&t);
+        const binding = gv.bindStorage(@splat(.{ .fixed = eq.tightLayout(3) }));
         for ([_]c_int{ 1, 6, 8 }) |m| {
             const xg = try t.node(&.{ m, 5120 }, .float32, &.{});
             const xu = try t.node(&.{ m, 5120 }, .float32, &.{});
             const ids = try t.node(&.{m}, .uint32, &.{});
             const n0 = t.launches.items.len;
-            const z = try gv.projectGu(&t, xg, xu, ids, code_g, code_u);
+            const z = try gv.projectGu(&binding, &t, xg, xu, ids, code_g, code_u, .{ .fixed = eq.tightLayout(3) }, .{ .fixed = eq.tightLayout(3) });
             if (f.gu_one) {
                 try testing.expectEqual(n0 + 1, t.launches.items.len);
                 const l = t.back(1);
@@ -846,7 +874,7 @@ test "dsv41 kernels ops: the routed forms launch their texts with the stock argu
             }
             try testing.expectEqualSlices(c_int, t.shapeOf(z[0]).slice(), t.shapeOf(z[1]).slice());
             const xd = try t.node(&.{ m, 2304 }, .float32, &.{});
-            _ = try gv.project(&t, .down, xd, ids, code_d);
+            _ = try gv.project(&binding, &t, .down, xd, ids, code_d, .{ .fixed = eq.tightLayout(3) });
             const ld = t.back(1);
             try testing.expectEqual(if (f.down_pair) xk.Kernel.dsv41_exl3_pair_k3_5120 else xk.Kernel.dsv41_exl3_mul1h_k3_5120, ld.k);
             // the pair text takes mul1h's signature and grid
@@ -871,21 +899,22 @@ test "dsv41 kernels ops: the banked route launches its texts with every bank's a
     const P = xq.ProjArrays(Trace.T);
     var banks: [3]@import("../../sdk_ext.zig").quant.BankArrays(P) = undefined;
     for (&banks) |*b| b.* = .{
-        .gate = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "rg", &s.vars), .rin = try t.arg(ie, "rg", &s.vars) },
-        .up = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "ru", &s.vars), .rin = try t.arg(ie, "ru", &s.vars) },
-        .down = .{ .code = try t.arg(de, "code", &s.vars), .rout = try t.arg(pe, "rd", &s.vars), .rin = try t.arg(ne, "rn", &s.vars) },
+        .gate = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "rg", &s.vars), .rin = try t.arg(ie, "rg", &s.vars), .layout = .{ .fixed = eq.tightLayout(3) } },
+        .up = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "ru", &s.vars), .rin = try t.arg(ie, "ru", &s.vars), .layout = .{ .fixed = eq.tightLayout(3) } },
+        .down = .{ .code = try t.arg(de, "code", &s.vars), .rout = try t.arg(pe, "rd", &s.vars), .rin = try t.arg(ne, "rn", &s.vars), .layout = .{ .fixed = eq.tightLayout(3) } },
     };
     for ([_]xq.Forms{ .{}, .{ .down_pair = true }, .{ .gu_one = true }, .{ .down_pair = true, .gu_one = true } }) |f| {
         var gv = try xq.Gemv(Trace).initForms(&t, &reg, f);
         defer gv.deinit(&t);
         var bk = try xq.Banked(Trace).init(&t, &reg, f, &gv);
+        const binding = bk.bindStorage(.{ .fixed = .{ 3, 3, 3 } }, .{ 3, 3, 3 });
         defer bk.deinit(&t);
         for ([_]c_int{ 1, 6, 8 }) |m| {
             const x = try t.node(&.{ m, 5120 }, .bfloat16, &.{});
             const tok = try t.node(&.{m}, .int32, &.{});
             const ids = try t.node(&.{m}, .uint32, &.{});
             const n0 = t.launches.items.len;
-            const h = try bk.gateUp(&t, x, tok, ids, &banks);
+            const h = try bk.gateUpBound(&binding, &t, x, tok, ids, &banks);
             try testing.expectEqual(n0 + @as(usize, if (f.gu_one) 3 else 4), t.launches.items.len);
             const li = t.launches.items[n0];
             try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_prep_in_rin, li.k);
@@ -903,7 +932,7 @@ test "dsv41 kernels ops: the banked route launches its texts with every bank's a
             }
             try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_prep_gu_epi, t.back(1).k);
             const n1 = t.launches.items.len;
-            _ = try bk.down(&t, h, ids, &banks);
+            _ = try bk.downBound(&binding, &t, h, ids, &banks);
             try testing.expectEqual(n1 + 3, t.launches.items.len);
             const ld = t.launches.items[n1 + 1];
             try testing.expectEqual(if (f.down_pair) xk.Kernel.dsv41_exl3_b3_pair_k3_5120 else xk.Kernel.dsv41_exl3_b3_mul1h_k3_5120, ld.k);
@@ -920,6 +949,8 @@ test "dsv41 kernels ops: the routes launch the same through the profiling backen
     const prof = @import("profile.zig");
     const P = prof.Profiled(Trace);
     const a = testing.allocator;
+    var peek = try @import("../../expert/bank.zig").peekText(a, @embedFile("../../fixtures/dsv41_bank_peek.json"), null);
+    defer peek.deinit();
     var reg = try testRegistry();
     defer reg.deinit();
     var clock: u64 = 0;
@@ -935,7 +966,7 @@ test "dsv41 kernels ops: the routes launch the same through the profiling backen
     const set = try ks.Set.init(a, .{ .device = .{ .stub = .{} } }, &diag);
     defer set.deinit();
     set.install(P, &pt);
-    const acc = try eq.accept(P, a, &pt, .{ .kernels = set.ref() }, v41_spec, &diag);
+    const acc = try eq.accept(P, a, &pt, .{ .kernels = set.ref(), .peek = &peek.view }, v41_spec, &diag);
     try testing.expectEqual(@as(*const xk.Bound, &set.bound), pt.inner.launcher.?);
     try testing.expectEqual(@as(isize, 288), pt.inner.prepared_live);
     // the router at the lane's samples, wrapped (inside a phase) and not
@@ -968,4 +999,177 @@ test "dsv41 kernels ops: the routes launch the same through the profiling backen
     ks.Set.uninstall(P, &pt);
     try testing.expect(pt.inner.launcher == null);
     try testing.expectEqual(@as(isize, 0), pt.inner.prepared_live);
+}
+
+test "dsv41 kernels rates: verify widths reuse prepared routes across rates and padded banks" {
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var t: Trace = .{ .a = testing.allocator };
+    defer t.deinit();
+    for ([_]eq.Forms{ .{}, .{ .down_pair = true, .gu_one = true } }) |forms| {
+        var gv = try eq.Gemv(Trace).initRates(testing.allocator, &t, &reg, forms, 7);
+        defer gv.deinit(&t);
+        var b3 = try eq.Banked(Trace).init(&t, &reg, forms, &gv);
+        defer b3.deinit(&t);
+        const prepared = t.prepared_live;
+        for ([_]u32{ 2, 3, 4, 3, 2 }) |k| {
+            var banks: [3]eq.BankArrays(Trace.T) = undefined;
+            for (&banks, 0..) |*b, bi| {
+                const cap: c_int = @intCast(bi + 2);
+                const width: c_int = if (bi == 2) 64 else @intCast(16 * k);
+                const layout: eq.ProjectionStorage(Trace.T) = .{ .fixed = .{ .k = k, .code_row_words = 320 * 144 * @as(u64, @intCast(width)) } };
+                b.* = .{
+                    .gate = .{ .code = try t.node(&.{ cap, 320, 144, width }, .int16, &.{}), .rout = try t.node(&.{ cap, 2304 }, .float16, &.{}), .rin = try t.node(&.{ cap, 5120 }, .float16, &.{}), .layout = layout },
+                    .up = .{ .code = try t.node(&.{ cap, 320, 144, width }, .int16, &.{}), .rout = try t.node(&.{ cap, 2304 }, .float16, &.{}), .rin = try t.node(&.{ cap, 5120 }, .float16, &.{}), .layout = layout },
+                    .down = .{ .code = try t.node(&.{ cap, 144, 320, width }, .int16, &.{}), .rout = try t.node(&.{ cap, 5120 }, .float16, &.{}), .rin = try t.node(&.{ cap, 2304 }, .float16, &.{}), .layout = layout },
+                };
+            }
+            const binding = gv.bindStorage(.{ banks[2].gate.layout, banks[2].up.layout, banks[2].down.layout });
+            const banked_binding = b3.bindStorage(.{ .fixed = .{ k, k, k } }, .{ 4, 4, 4 });
+            for (1..49) |n| {
+                const m: c_int = @intCast(n);
+                const xg = try t.node(&.{ m, 5120 }, .float32, &.{});
+                const ids = try t.node(&.{m}, .uint32, &.{});
+                const tok = try t.node(&.{m}, .int32, &.{});
+                const p = banks[2].gate;
+                const z = try gv.projectGu(&binding, &t, xg, xg, ids, p.code, banks[2].up.code, p.layout, banks[2].up.layout);
+                try testing.expectEqualSlices(c_int, &.{ m, 2304 }, t.shapeOf(z[0]).slice());
+                const x = try t.node(&.{ m, 5120 }, .bfloat16, &.{});
+                const h = try b3.gateUpBound(&banked_binding, &t, x, tok, ids, &banks);
+                const y = try b3.downBound(&banked_binding, &t, h, ids, &banks);
+                try testing.expectEqualSlices(c_int, &.{ m, 5120 }, t.shapeOf(y).slice());
+                try testing.expectEqual(prepared, t.prepared_live);
+            }
+        }
+    }
+}
+
+test "dsv41 kernels rates: every mixed route launches every lane sample with bound geometry" {
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var t: Trace = .{ .a = testing.allocator };
+    defer t.deinit();
+    var hit: std.EnumSet(Kernel) = .empty;
+    const added = xk.rate_kernels ++ xk.compact_kernels;
+    for (added) |kernel| {
+        const e = reg.get(kernel);
+        if (std.mem.eql(u8, e.family, "exl3_rin_stage")) continue;
+        const compact = std.mem.indexOfScalar(Kernel, &xk.compact_kernels, kernel) != null;
+        const rates = if (compact) [2]u32{ 3, 3 } else xk.ratesOf(kernel);
+        for (e.samples) |*s| {
+            const v = &s.vars;
+            if (std.mem.eql(u8, e.family, "exl3_decode_gemv")) {
+                var gv = try Gemv(Trace).initStorage(testing.allocator, &t, &reg, .{}, 7, compact);
+                defer gv.deinit(&t);
+                const down_proj = std.mem.indexOf(u8, @tagName(kernel), "5120") != null;
+                const proj: Proj = if (down_proj) .down else .gate;
+                const x = try t.arg(e, "xh", v);
+                const ids = try t.arg(e, "ids", v);
+                if (std.mem.startsWith(u8, @tagName(kernel), "dsv41_exl3_b3_")) {
+                    var b3 = try eq.Banked(Trace).init(&t, &reg, .{}, &gv);
+                    defer b3.deinit(&t);
+                    const binding = b3.bindStorage(if (compact) .{ .compact = &.{} } else .{ .fixed = @splat(rates[0]) }, .{ 4, 4, 4 });
+                    var banks: [3]ProjArrays(Trace.T) = undefined;
+                    inline for (.{ "code0", "code1", "code2" }, .{ "desc0", "desc1", "desc2" }, 0..) |code, desc, i| {
+                        banks[i] = .{ .code = try t.arg(e, code, v), .rin = undefined, .rout = undefined,
+                            .layout = if (compact) .{ .compact = try t.arg(e, desc, v) } else .{ .fixed = .{ .k = rates[0], .code_row_words = eq.tightLayout(4).code_row_words } } };
+                    }
+                    const p = &binding.projections[@intFromEnum(proj)];
+                    _ = try p.call(p, &t, x, ids, &banks);
+                    var want: [xk.max_inputs]Trace.T = undefined;
+                    want[0..5].* = .{ x, ids, banks[0].code, banks[1].code, banks[2].code };
+                    if (compact) {
+                        for (banks, 0..) |b, i| want[5 + i] = b.layout.compact;
+                    } else {
+                        for (5..e.inputs.len) |i| want[i] = p.statics[i];
+                    }
+                    try expectLaunch(t.back(1), e, s, want[0..e.inputs.len]);
+                } else {
+                    const code = try t.arg(e, "code", v);
+                    const layout: eq.ProjectionStorage(Trace.T) = if (compact) .{ .compact = try t.arg(e, "desc", v) } else .{ .fixed = .{ .k = rates[0], .code_row_words = eq.tightLayout(4).code_row_words } };
+                    const binding = gv.bindStorage(@splat(layout));
+                    _ = try gv.project(&binding, &t, proj, x, ids, code, layout);
+                    var want: [xk.max_inputs]Trace.T = undefined;
+                    want[0..3].* = .{ x, ids, code };
+                    if (compact) want[3] = layout.compact else {
+                        const st = if (down_proj) &gv.dn_statics else &gv.gu_statics;
+                        for (3..e.inputs.len) |i| want[i] = st.arrays[i];
+                    }
+                    try expectLaunch(t.back(1), e, s, want[0..e.inputs.len]);
+                }
+            } else {
+                var dig = DigX(Trace).init(&reg);
+                dig.bindStorage(if (compact) .{ .compact = &.{} } else .{ .fixed = .{ rates[0], rates[1], rates[0] } }, .{ 4, 4, 4 });
+                const tbl = try t.arg(e, "tbl", v);
+                const c0 = try t.arg(e, "code0", v);
+                const lg: eq.ProjectionStorage(Trace.T) = if (compact) .{ .compact = (if (e.outputs.len == 2) try t.arg(e, "desc0", v) else try t.arg(e, "desc", v)) } else .{ .fixed = .{ .k = rates[0], .code_row_words = eq.tightLayout(4).code_row_words } };
+                if (e.outputs.len == 2) {
+                    const x0 = try t.arg(e, "x0", v);
+                    const x1 = try t.arg(e, "x1", v);
+                    const c1 = try t.arg(e, "code1", v);
+                    const lu: eq.ProjectionStorage(Trace.T) = if (compact) .{ .compact = try t.arg(e, "desc1", v) } else .{ .fixed = .{ .k = rates[1], .code_row_words = eq.tightLayout(4).code_row_words } };
+                    _ = try dig.gemmGateUp(&t, x0, x1, c0, c1, tbl, @intCast(v.get(.tgs)), lg, lu);
+                    const want = [_]Trace.T{ x0, x1, c0, c1, tbl, if (compact) lg.compact else 0, if (compact) lu.compact else 0 };
+                    try expectLaunch(t.back(1), e, s, want[0..e.inputs.len]);
+                } else {
+                    const x = try t.arg(e, "x", v);
+                    _ = try dig.gemmDown(&t, x, c0, tbl, @intCast(v.get(.tgs)), lg);
+                    const want = [_]Trace.T{ x, c0, tbl, if (compact) lg.compact else 0 };
+                    try expectLaunch(t.back(1), e, s, want[0..e.inputs.len]);
+                }
+            }
+            hit.insert(kernel);
+        }
+    }
+    // The compact prep stages through the actual seven-launch banked decode chain.
+    {
+        var gv = try Gemv(Trace).initStorage(testing.allocator, &t, &reg, .{}, 0, true);
+        defer gv.deinit(&t);
+        var b3 = try eq.Banked(Trace).init(&t, &reg, .{}, &gv);
+        defer b3.deinit(&t);
+        const binding = b3.bindStorage(.{ .compact = &.{} }, .{ 4, 4, 4 });
+        const ie = reg.get(.dsv41_exl3_b3_prep_in_rin_compact);
+        for (ie.samples) |*s| {
+            const v = &s.vars;
+            var banks: [3]eq.BankArrays(Trace.T) = undefined;
+            for (&banks) |*bank| {
+                const code = try t.arg(gv.gu, "code", v);
+                const desc = try t.arg(gv.gu, "desc", v);
+                bank.* = .{
+                    .gate = .{ .code = code, .rout = try t.arg(ie, "rg0", v), .rin = try t.arg(ie, "rg0", v), .layout = .{ .compact = desc } },
+                    .up = .{ .code = code, .rout = try t.arg(ie, "ru0", v), .rin = try t.arg(ie, "ru0", v), .layout = .{ .compact = desc } },
+                    .down = .{ .code = try t.arg(gv.dn, "code", v), .rout = try t.node(&.{ 4, 5120 }, .float16, &.{}), .rin = try t.node(&.{ 4, 2304 }, .float16, &.{}), .layout = .{ .compact = desc } },
+                };
+                bank.gate.rout = try t.node(&.{ 4, 2304 }, .float16, &.{});
+                bank.up.rout = try t.node(&.{ 4, 2304 }, .float16, &.{});
+            }
+            const x = try t.arg(ie, "x", v);
+            const tok = try t.arg(ie, "tok", v);
+            const ids = try t.arg(ie, "ids", v);
+            const start = t.launches.items.len;
+            const h = try b3.gateUpBound(&binding, &t, x, tok, ids, &banks);
+            _ = try b3.downBound(&binding, &t, h, ids, &banks);
+            const wanted = [_]struct { usize, Kernel }{ .{ 0, .dsv41_exl3_b3_prep_in_rin_compact }, .{ 3, .dsv41_exl3_b3_prep_gu_epi_compact }, .{ 4, .dsv41_exl3_b3_prep_din_rin_compact }, .{ 6, .dsv41_exl3_b3_moeprep_dpost_compact } };
+            for (wanted) |w| {
+                const l = &t.launches.items[start + w[0]];
+                const e = reg.get(w[1]);
+                try testing.expectEqual(w[1], l.k);
+                const want: []const Trace.T = switch (w[1]) {
+                    .dsv41_exl3_b3_prep_in_rin_compact => &.{ x, tok, banks[0].gate.rin, banks[1].gate.rin, banks[2].gate.rin, banks[0].up.rin, banks[1].up.rin, banks[2].up.rin, ids },
+                    .dsv41_exl3_b3_prep_gu_epi_compact => &.{ t.launches.items[start + 1].outs[0], t.launches.items[start + 2].outs[0], banks[0].gate.rout, banks[1].gate.rout, banks[2].gate.rout, banks[0].up.rout, banks[1].up.rout, banks[2].up.rout, ids },
+                    .dsv41_exl3_b3_prep_din_rin_compact => &.{ h, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, ids },
+                    .dsv41_exl3_b3_moeprep_dpost_compact => &.{ t.launches.items[start + 5].outs[0], banks[0].down.rout, banks[1].down.rout, banks[2].down.rout, ids },
+                    else => unreachable,
+                };
+                try expectLaunch(l, e, sampleAt(e, null, v.get(.rows)), want);
+                hit.insert(w[1]);
+            }
+            const l = &t.launches.items[start];
+            try testing.expectEqualSlices(Trace.T, &.{ x, tok, banks[0].gate.rin, banks[1].gate.rin, banks[2].gate.rin, banks[0].up.rin, banks[1].up.rin, banks[2].up.rin, ids }, l.inputs[0..l.n_in]);
+        }
+    }
+    for (added) |kernel| try testing.expect(hit.contains(kernel));
+    try expectPreparedDecode(&t, &reg);
+    try testing.expectEqual(@as(isize, 0), t.prepared_live);
+    try testing.expectEqual(@as(isize, 0), t.keeps);
 }

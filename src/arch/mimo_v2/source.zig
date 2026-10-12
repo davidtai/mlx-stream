@@ -342,7 +342,7 @@ fn lutAfterWide(self: *Source, layer: u32) !void {
 /// read before this forward began.
 pub fn lutAfterRoute(ex: anytype, g: anytype, layer: u32) !void {
     const next = ex.dev_parity[layer] +% 1;
-    ex.source.residentLut(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[layer][next])))));
+    ex.source.residentLut(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[layer][next])))), ex.math.devrouteMissingId());
     ex.dev_parity[layer] = next;
 }
 // ── end HITPASS ──

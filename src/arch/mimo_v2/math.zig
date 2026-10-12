@@ -311,6 +311,11 @@ pub const Math = struct {
     /// L5: the shared scheduler's banked waves (bound by `Options.banked`, only with `fused` installed): every pair of
     /// a wave in one text over the three banks, ids packed `bank << 24 | row`, x [P, H] one row per pair.
     pub const has_banked = true;
+    /// Stock HITPASS misses read base row zero; the scheduler never joins those device rows.
+    pub const devroute_missing_id: u32 = 0;
+    pub fn devrouteMissingId(_: *const Math) u32 {
+        return devroute_missing_id;
+    }
 
     pub fn gateUpBanked(self: *const Math, g: *ops.MlxOps, x: T, ids: T, banks: *const [moe.n_banks]Arrays) !T {
         return self.fused.?.gateUp(g, x, ids, banks);

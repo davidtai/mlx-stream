@@ -116,6 +116,9 @@ test "mimo verify lane: the phase route: one row either phase, M <= 4 in decode 
 /// activation's four ops, one drain) so the census can count it.
 pub const LaneMath = struct {
     pub const has_banked = true;
+    pub fn devrouteMissingId(_: *const LaneMath) u32 {
+        return prefill_math.Math.devroute_missing_id;
+    }
     pub const has_parts = true;
     pub const decode_forward_rows = prefill_math.Math.decode_forward_rows;
     pub const prefill_min_tokens = prefill_math.Math.prefill_min_tokens;
@@ -321,7 +324,7 @@ fn laneRun(a: std.mem.Allocator, arm: Arm, report: bool) !void {
         // The hit pass: one device wave over the 32 pairs; the layer's LUT rewritten after the route.
         try testing.expect(ex.dev_parity[1] != p0);
         var lut: [n_experts]u32 = undefined;
-        ss.residentLut(1, &lut);
+        ss.residentLut(1, &lut, ex.math.devrouteMissingId());
         try testing.expectEqualSlices(u32, &lut, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[1][ex.dev_parity[1]])))));
     }
 

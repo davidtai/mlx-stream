@@ -169,7 +169,7 @@ test "dsv41 memory mini: the fill and its admission agree; one more row in eithe
     with_records.decode_extra_records = k;
     const bk = try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, with_records);
     try testing.expect(bk.decodeTotal() <= target);
-    try testing.expectEqual(b.slot_decode + k * (b.slot_decode / (5 * @as(u64, nr.decode) + b.transient_decode_rows)), bk.slot_decode);
+    try testing.expectEqual(b.slot_decode + b.slot_prefix[k], bk.slot_decode);
 }
 
 test "dsv41 memory mini: each route the bill reads moves its own term by geometry" {
@@ -249,6 +249,27 @@ test "dsv41 memory mini: the plugin's bill hook is the floor bill's term-wise vi
     try testing.expectEqual(nr, arm_mod.NativeRows{ .prefill = rows.prompt, .decode = rows.decode });
 }
 
+test "dsv41 memory mini: uniform stock still admits at its exact pre-compact floor budget" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tm = try miniBank(a);
+    defer tm.destroy();
+    const b = try bill.billAtFloor(a, io, configOf(tm), prompt, max_tokens, null, ceiling, ov);
+    const mb = try bill.memoryBill(testing.allocator, b);
+    defer mb.free(testing.allocator);
+    const rows: sdk.Rows = .{ .prompt = bill.min_fill_rows, .decode = bill.min_fill_rows };
+    // Uniform stock owns no compact source/route tables. Its pre-compact phase
+    // budget must still admit; even a small positive surcharge would refuse it.
+    const target = b.baseline + b.processBound() - b.expert_metadata;
+    try bill.admitMemoryBill(b, mb, rows, target);
+    if (b.prefillTotal() >= b.decodeTotal()) {
+        try testing.expectError(error.PromptOverTarget, bill.admitMemoryBill(b, mb, rows, target - 1));
+    } else {
+        try testing.expectError(error.DecodeOverTarget, bill.admitMemoryBill(b, mb, rows, target - 1));
+    }
+}
+
 test "dsv41 memory mini: the served bill keeps multi-turn's prompt boundary in the retained prompt state; a pinned prompt does not" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -279,4 +300,141 @@ test "dsv41 memory mini: the served bill keeps multi-turn's prompt boundary in t
     try testing.expectEqual(exact.prompt_state, pinned.prompt_state);
     try testing.expectEqual(@as(u64, 0), pinned.turn_boundary);
     try testing.expectEqual(exact.decodeTotal(), pinned.decodeTotal());
+}
+
+test "dsv41 integer rates: mixed bill owns exact persistent transient and prefix costs" {
+    const Case = struct { synth: expert_bank.Synth, prefix: [6]u64 };
+    for ([_]Case{
+        .{ .synth = .{ .k = &.{ 2, 4, 3, 2, 4 }, .n_experts = n_experts }, .prefix = .{ 0, 2112, 5760, 8640, 10752, 14400 } },
+        .{ .synth = .{ .projection_k = &.{ .{ 4, 2, 2 }, .{ 2, 4, 4 }, .{ 3, 3, 3 }, .{ 4, 2, 2 }, .{ 2, 4, 4 } }, .n_experts = n_experts }, .prefix = .{ 0, 2624, 5760, 8640, 11264, 14400 } },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const tm = try miniBank(a);
+        defer tm.destroy();
+        _ = try expert_bank.writeSynth(a, &tm.tmp, case.synth);
+        var mixed = ov;
+        mixed.bank_geometry.?.k = &.{ 2, 3, 4 };
+        var config = configOf(tm);
+        config.expert_prefill_rows = 16;
+        config.expert_rows = 20;
+        const b = try billAfterScratch(&config, mixed);
+        defer b.deinit(testing.allocator);
+        try testing.expectEqual(@as(u64, 16 * 14400) + b.transient_rows * 3648, b.slot_prefill);
+        try testing.expectEqual(@as(u64, 20 * 14400) + b.transient_decode_rows * 3648, b.slot_decode);
+        const mb = try bill.memoryBill(testing.allocator, b);
+        defer mb.free(testing.allocator);
+        try testing.expectEqual(@as(u64, 14400), mb.per_row);
+        const fb = bill.fillBillOf(b);
+        try testing.expectEqual(@as(u64, 14400), fb.per_row);
+        try testing.expectEqualSlices(u64, &case.prefix, fb.slot_prefix[0..6]);
+        var bd: expert_bank.Diag = .{};
+        var bank = try expert_bank.Bank.open(a, io, tm.root, mixed.bank_geometry.?, &bd);
+        defer bank.deinit();
+        const pool_opt: arm_mod.Options = .{
+            .model_dir = tm.root,
+            .baseline_bytes = null,
+            .slot_memory = .host,
+            .pool = .{ .tickets = 16 },
+        };
+        const sized = arm_mod.poolOptions(&bank, pool_opt);
+        const minimum = @import("../../expert/stream.zig").minimumTickets(&bank, .{ .rows = &.{n_experts} });
+        try testing.expectEqual(minimum, @as(u64, sized.tickets));
+        const geo = try @import("../../expert/stream.zig").StorageGeometry.initBank(&bank);
+        const io_pool = @import("../../sdk_ext.zig").expert.io;
+        const ticket_delta = io_pool.poolBytes(sized, std.heap.pageSize()) - io_pool.poolBytes(pool_opt.pool, std.heap.pageSize());
+        try testing.expectEqual(ticket_delta, arm_mod.poolGrowthBytes(&bank, pool_opt, &geo, pool_opt.pool.workers * pool_opt.pool.staging_bytes));
+        var large = pool_opt;
+        large.pool.tickets = sized.tickets + 17;
+        try testing.expectEqual(large.pool.tickets, arm_mod.poolOptions(&bank, large).tickets);
+        const stream_opt: @import("../../expert/stream.zig").Options = .{
+            .rows = &.{ 16, 16, 16, 16, 16 },
+            .transient_rows = @intCast(b.transient_rows),
+            .wide_depth = @intCast(config.dsv41WideDepth()),
+            .transient_release = module.transientRelease(mixed),
+            .pool = arm_mod.poolOptions(&bank, .{ .model_dir = tm.root, .baseline_bytes = null, .slot_memory = .host, .pool = .{ .workers = 2, .staging_bytes = 16384 } }),
+        };
+        const st = try @import("../../expert/stream.zig").Stream.init(testing.allocator, &bank, stream_opt);
+        defer st.deinit();
+        try testing.expectEqual(@as(usize, stream_opt.pool.tickets), st.pool.log.len);
+        var allocated: u64 = 0;
+        for (st.layers) |*l| for (l.base.row_bytes) |bytes| {
+            allocated += bytes * l.base.rows;
+        };
+        for (st.transient.row_bytes) |bytes| allocated += bytes * st.transient.rows;
+        try testing.expectEqual(b.slot_prefill, allocated);
+        for (1..5) |extra| {
+            mixed.decode_extra_records = @intCast(extra);
+            const bx = try billAfterScratch(&config, mixed);
+            defer bx.deinit(testing.allocator);
+            try testing.expectEqual(b.slot_decode + case.prefix[extra], bx.slot_decode);
+            try testing.expectEqual(fb.totalSlots(true, 20 * 14400 + case.prefix[extra]), bx.decodeTotal());
+            try testing.expectEqual(@as(u32, @intCast(extra)), bill.fillExtraRecords(b, bx.decodeTotal()));
+            const mx = try bill.memoryBill(testing.allocator, bx);
+            defer mx.free(testing.allocator);
+            try testing.expectEqual(bx.processBound(), mx.processBound(.{ .prompt = 16, .decode = 20 }));
+        }
+    }
+}
+
+fn billAfterScratch(config: *const settings.Config, routes: module.RouteOverrides) !bill.Bill {
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const b = try bill.billAt(scratch.allocator(), io, config, prompt, max_tokens, null, ceiling, routes);
+    return b.retained(testing.allocator);
+}
+
+test "dsv41 memory mini: real compact bill producer owns its SDK table after native arena destruction" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena_live = true;
+    defer if (arena_live) arena.deinit();
+    const a = arena.allocator();
+    const tm = try miniBank(a);
+    defer tm.destroy();
+    _ = try expert_bank.writeVariableSynthWith(a, &tm.tmp, .{
+        .hidden = 64,
+        .inter = 32,
+        .n_experts = n_experts,
+        .n_layers = 5,
+        .rates = &.{ .{ 2, 4, 2 }, .{ 4, 2, 4 } },
+    });
+    var mixed = ov;
+    mixed.bank_geometry.?.k = &.{ 2, 4 };
+    var config = configOf(tm);
+    config.expert_prefill_rows = 16;
+    config.expert_rows = 27;
+    var native = try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, mixed);
+    const prompt_total = native.prefillTotal();
+    const decode_total = native.decodeTotal();
+    const construction = native.constructionTerms().sum();
+    const baseline = native.baseline;
+    const retained = try native.retained(testing.allocator);
+    defer retained.deinit(testing.allocator);
+    const mb = try bill.memoryBill(testing.allocator, native);
+    defer mb.free(testing.allocator);
+    @memset(std.mem.sliceAsBytes(@constCast(native.compact_costs.?.code_prefix)), 0xa5);
+    native = undefined;
+    arena.deinit();
+    arena_live = false;
+    try testing.expectEqual(prompt_total, retained.prefillTotal());
+    try testing.expectEqual(decode_total, retained.decodeTotal());
+    const retained_sdk = try bill.memoryBill(testing.allocator, retained);
+    defer retained_sdk.free(testing.allocator);
+    try testing.expectEqual(decode_total, retained_sdk.total(.decode, baseline, 27));
+    try testing.expectEqual(prompt_total, mb.total(.prompt, baseline, 16));
+    try testing.expectEqual(@as(usize, 3 * (n_experts + 1)), mb.slot_table.len);
+    for (0..n_experts + 1) |row| try testing.expectEqual(
+        @min(
+            retained.compact_costs.?.slots(0, @intCast(row), 0),
+            retained.compact_costs.?.slots(@min(retained.prefill_rows, @as(u32, @intCast(row))), @intCast(row), 0),
+        ),
+        mb.slots(@intCast(row)),
+    );
+    try testing.expectEqual(decode_total, mb.total(.decode, baseline, 27));
+    try testing.expectEqual(construction, mb.constructionBytes(16));
+    try bill.admitMemoryBill(retained, mb, .{ .prompt = 16, .decode = 27 }, @max(prompt_total, decode_total));
+    try testing.expectError(error.DecodeBaseRowsMismatch, bill.admitMemoryBill(retained, mb, .{ .prompt = 17, .decode = 27 }, std.math.maxInt(u64)));
+    const filled = try bill.fillOf(bill.fillBillOf(retained), std.math.maxInt(u64), n_experts);
+    try testing.expectEqual(arm_mod.NativeRows{ .prefill = n_experts, .decode = n_experts }, filled);
 }

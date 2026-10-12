@@ -2130,9 +2130,6 @@ test "dsv41 weights: the real bank's config, 49 shard headers and Engram sidecar
     const em = try WeightMap.build(testing.allocator, try engramSpec(a, &c), &eck, &diag);
     try testing.expectEqual(@as(u64, 8), em.totalTensors());
     try testing.expectEqual(@as(u64, 0), em.skipped_tensors);
-    std.debug.print("dsv41 weights: {d} resident tensors, {d} bytes; per module:", .{ m.totalTensors(), m.totalBytes() });
-    for (m.bytes_by_module, 0..) |bytes, i| if (bytes > 0) std.debug.print(" {s}={d}", .{ @tagName(@as(Module, @fromBackingInt(@intCast(i)))), bytes });
-    std.debug.print("\n", .{});
 
     const fixture = std.mem.span(std.c.getenv("DSV41_M0_FIXTURE") orelse return);
     const Rec = struct { name: []const u8, file: []const u8, dtype: []const u8, shape: []const u64, begin: u64, end: u64, sha256: []const u8, head16: []const u8 };
@@ -2158,5 +2155,4 @@ test "dsv41 weights: the real bank's config, 49 shard headers and Engram sidecar
         try testing.expectEqual(@min(bytes.len, head.len), want.len);
         try testing.expectEqualSlices(u8, want, bytes[0..want.len]);
     }
-    std.debug.print("dsv41 weights: {d} fixture tensors byte-equal to the Python reader\n", .{fx.tensors.len});
 }

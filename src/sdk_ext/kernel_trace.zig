@@ -453,7 +453,7 @@ pub fn KernelTrace(comptime R: type) type {
             defer prep.deinit(t);
             var per = try RowPlans(TracePerCall, n).init(&pc, e, site, null);
             defer per.deinit(&pc);
-            const ins: [16]Trace.T = @splat(0);
+            const ins: [xk.max_inputs]Trace.T = @splat(0);
             var o1: [xk.max_outputs]Trace.T = undefined;
             var o2: [xk.max_outputs]Trace.T = undefined;
             for (1..n + 1) |m| {
@@ -471,6 +471,9 @@ pub fn KernelTrace(comptime R: type) type {
                 try testing.expect(std.meta.eql(a.cfg, b.cfg) and std.meta.eql(a.cfg, want));
             }
             try testing.expectError(error.RowsOutOfPlan, prep.at(0));
+            try testing.expectError(error.RowsOutOfPlan, prep.at(n + 1));
+            try testing.expectError(error.RowsOutOfPlan, per.at(0));
+            try testing.expectError(error.RowsOutOfPlan, per.at(n + 1));
             return n;
         }
 

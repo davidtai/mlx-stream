@@ -149,7 +149,7 @@ fn run(a: std.mem.Allocator, arm: Arm) !void {
         // The device LUT after the route: every expert maps to its substitute's resident slot (no miss sentinel).
         const lut = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[1][ex.dev_parity[1]]))));
         var want: [n_experts]u32 = undefined;
-        ss.residentLut(1, &want);
+        ss.residentLut(1, &want, ex.math.devrouteMissingId());
         try testing.expectEqualSlices(u32, &want, lut);
         for (0..n_experts) |e| {
             const slot = ss.policy(1).slotOf(mf.sub(0, @intCast(e))).?;

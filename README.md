@@ -1,7 +1,7 @@
 # mlx-stream
 
 mlx-stream is a plugin for [mlx-serve](https://github.com/ddalcu/mlx-serve). It serves two mixture-of-experts models
-on Apple Silicon with their routed experts **streamed from SSD**: **DeepSeek-V4.1-Flash** from an **EXL3 3.0 bpw
+on Apple Silicon with their routed experts **streamed from SSD**: **DeepSeek-V4.1-Flash** from an **EXL3 MUL1
 expert bank**, and **MiMo-V2.6-Flash** from an **MXFP4 expert bank** (the release's own expert bytes, repacked). The
 routed experts stay on disk as packed per-expert records; the resident trunk (attention, dense and shared layers, the
 head) loads once. A lookahead read pool brings the routed rows in for each layer, so each model runs on a Mac whose
@@ -14,7 +14,7 @@ What it contains:
 - the `mimo_v2_flash` arch: MiMo-V2.6-Flash over an FP8 or BF16 resident trunk, its MXFP4 expert bank, the draft lane
   over the pack's three MTP heads, and its own memory bill, with Metal kernels pinned by manifest hashes
   ([docs/mimo.md](docs/mimo.md));
-- the EXL3 quant DeepSeek-V4.1's routed experts use (K = 3, mul1 codebook, 128-wide Hadamard with suh / svh), with
+- the EXL3 quant DeepSeek-V4.1's routed experts use (K2–K5 per compact projection, MUL1, 128-wide Hadamard with suh / svh), with
   Metal kernels pinned by a manifest hash and specialised to the model's shapes (hidden 5120, intermediate 2304);
 - the expert source that streams both arches' experts: the packed-record reader, the C read pool, the
   residency policy, and the MLX event gates that order reads and kernels;
@@ -25,13 +25,240 @@ DeepSeek-V4.1's decode levers that are still being evaluated ship **off by defau
 
 The supported models:
 
-- the DeepSeek-V4.1-Flash streaming EXL3 3.0 bpw package (a model directory whose `config.json` has
-  `"model_type": "deepseek_v41"` and whose expert bank has a v2 expert manifest);
+- the DeepSeek-V4.1-Flash streaming EXL3 MUL1 packages (a model directory whose `config.json` has
+  `"model_type": "deepseek_v41"` and whose expert bank has a checked v2 or v3 expert manifest);
 - a MiMo-V2.6-Flash pack (a model directory whose `config.json` has `"model_type": "mimo_v2_flash"` and an
   `expert_streaming` block; [docs/mimo-pack.md](docs/mimo-pack.md) says how to prepare one);
 - a GLM-5.3 pack (`"model_type": "glm_moe_dsa"`; see GLM-5.3).
 
 No weights are included in this repository.
+The existing EXL3 3.0-bpw streaming package remains supported; source EXL3 safetensors repositories require a
+streaming repack, not just a config rename. Resident trunk, draft and Engram formats are unchanged. No weights are included.
+
+### Expert rates and public packs
+
+Each v2 layer declares exactly one of `"K": 3` (uniform gate/up/down) or `"projection_K": [3, 3, 4]`
+(gate/up/down order). All experts in a layer share that triple. Both/neither declarations, unsupported rates and
+disagreement with the nine source segments are refused. Mixed entries omit `K`, so older readers fail closed.
+The SDK peek uses `bits == 0` for mixed layers; logical source segment shapes carry the individual rates.
+
+Logical tiles are contiguous inside each expert row even when a cache allocation has a wider physical stride.
+Persistent storage is billed per layer, extra rows by their exact layer-prefix cost, and shared transient storage
+by each component's maximum. Enlarged page-rounded preread buffers are charged separately from the K3 reserve.
+Tight K3 keeps its existing kernels; K2/K4 and padded/mixed banks use direct decode and tiled prefill, not full
+BF16 expert materialization.
+
+Routes are bound once per layer from accepted rates and physical storage geometry. Installed fused-down
+routes do not fall back to chained launches. Uniform banks retain the stock stream priority, window,
+held-set and policy rules; geometry grouping and construction-sized ticket ranges apply only to mixed banks.
+
+For per-expert mixtures, `expert-manifest-v3.json` is self-contained (`format: "mtplx-expert-manifest-v3"`):
+`classes` describes each nine-segment record layout and its gate/up/down `projection_K`; `records` selects
+exactly one class, sidecar range, padded SHA256 and logical SHA256 for every layer/expert pair. Segment shapes,
+lengths, record bounds, non-overlap and complete coverage are checked before allocation. The v2 companion
+manifest is not required. Fixed v2 banks remain K2/K3/K4; compact v3 classes admit K2/K3/K4/K5.
+
+Compact caches concatenate each slot's actual code capacity instead of padding all experts to the widest rate.
+U64 descriptors carry code-word offsets and logical rates; immutable slot capacities bound every refill.
+Persistent and transient arenas, descriptor arrays, growth and construction peaks are billed from those capacities.
+Only settled slots enter the device lookup table; the missing-slot sentinel is distinct from the valid slot zero.
+
+The six prior microbenchmark wins are kept as revalidation artifacts, not installed engine wins. The repair
+baseline contains their reverted texts. Their previous combined engine gain was 0.16%, below the promotion gate;
+only a rebased candidate passing actual served acceptance may be adopted.
+The final-rebase saved-six candidate was also measured in the actual Jayleaton hybrid engine
+on 2026-10-12, using separate source-attested binaries and served ABBA. Output and complete usage
+matched. Its nominal median decode gain was 5.31%, but baseline drift was 11.13% and one matched
+sample regressed, so the throughput gate rejected it. A clean owned-server attach trace recorded
+6,440 enclosing compact/banked shader samples; those do not prove execution of the conditional or
+ambiguous changed paths. The changed-path dispatch gate also rejected it. No saved delta is promoted.
+After the uniform-stock submission restoration, the source07 saved-six candidate was measured
+again against its own source-attested hybrid baseline. Exact output/usage matched; the nominal
+median gain was 3.54%, but baseline drift was 5.27% and two matched samples regressed (-3.82% and
+-2.27%). A clean warmed attach capture recorded 6,006 positive enclosing samples, without proving
+the changed conditional/helper paths. Throughput and changed-path gates reject this batch too.
+The `mul1h_rate` header composes the unchanged stock K3 header with a separately hash-pinned addendum.
+
+#### Stock 3.0 review measurement — acceptance pending
+
+Measured on 2026-10-12 on the same M5 Max 128 GB host (`mlx-serve` `c6165fe`), with independently
+built baseline PR11 `f22ad15` (binary `95ed21f5`) and the repaired candidate (binary `5509f963`).
+The candidate contains none of the six saved optimization deltas. Both use the stock 3.0 streaming
+pack, context 17,472, no draft lanes or prefix cache, and frozen llmprobe 0.6.16 code/count requests
+targeting its approximately 16K rung. Values average each revision's two ABBA-arm medians.
+
+| Served cell | Baseline tok/s | Repair tok/s | Change |
+|---|---:|---:|---:|
+| Short decode | 16.568 | 16.737 | +1.02% |
+| 16K code prefill | 585.907 | 575.506 | -1.78% |
+| 16K code decode | 15.216 | 15.315 | +0.65% |
+| 16K count prefill | 582.377 | 574.260 | -1.39% |
+| 16K count decode | 16.898 | 16.808 | -0.53% |
+
+All four arms and 24 long requests completed, at 16,224 code / 16,184 count native prompt tokens.
+Delivered reasoning/content, finish reasons, complete usage and frozen request hashes match; token IDs
+are not exposed. Both owned-server attach traces saved and drained cleanly, recording positive stock
+EXL3 shader samples with matching sampled launch-name sets. Independent source-associated host-only
+`servedBill`/`servedFill` reports match the merged baseline exactly at all recorded memory facts over
+every uniform row count and legal extra-record suffix, and reproduce each engine's observed admission.
+This is **not accepted stock neutrality or an optimization win**: two individual prefill comparisons
+were -3.48% and -3.52%, outside the 3% regression guard. The table precedes the restoration of uniform
+submission's original id ordering, constant footprint and cached segment lengths; geometry scans now
+run only for mixed geometry. A fresh source-attested candidate (`6d02c546`) completed another 24 long
+requests at 16,201 code / 16,161 count native prompt tokens, again passing delivered-output/usage,
+sampled stock launch sets, clean attach profiling and exact same-facts admission. Neutrality remains
+rejected: short-decode baseline drift was 10.17%, count-decode baseline drift was 13.42%, and individual
+prefill comparisons also exceeded the 3% guard. The unchanged baseline's live memory reading changed
+from 19.66 GB to 25.62 GB, changing admission from 116/147 to 105/136 prefill/decode rows. These timing
+results establish neither neutrality nor a causal attribution to the restored stock submission work.
+Unchanged PR11 source A/A controls, with independently built binaries for each role and no repair
+delta, also fail the same strict guards:
+
+| Control condition | Short baseline drift | Code baseline drift | Count baseline drift | Worst matched prefill | Sampled stock launch sets |
+|---|---:|---:|---:|---:|---|
+| AC High Power | 3.41% | 5.15% | 7.70% | -5.42% | Match |
+| AC Auto | 2.21% | 6.25% | 6.59% | -4.20% | Mismatch |
+| AC Auto, preconditioned | 0.52% | 0.54% | 4.41% | -21.82% | Match |
+
+All controls match delivered output/usage and exact same-facts admission. The unconditioned Auto
+capture's sampled launch-set mismatch is not an exhaustive dispatch difference. Preconditioning
+uses four actual uncached 16K requests before short timing in every ABBA arm, in addition to the
+24 measured long requests; their outputs, usage and hashes match too. The conditioned control's
+short matched decode differences reach -15.70%, despite its low short baseline drift. The setup
+still does not establish performance neutrality or a causal attribution to the repair; no guard
+is relaxed and no optimization is promoted.
+The source07 repaired-stock Auto comparison also completes with all four original measured ABBA
+arms, 24 measured long requests and 16 conditioning requests retained. Its original deadline
+expired during candidate profiling; after explicit completion authorization, only that missing
+capture and independent host-only proof were completed, with zero timing requests repeated.
+Output/usage/hashes, sampled stock shader sets, clean owned profiling and exact same-facts
+admission pass. Performance neutrality remains rejected: code/count baseline drift is 7.96%/9.84%;
+the worst matched prefill and short-decode differences are -10.76%/-10.17%. Original timeout
+receipts remain separate from the completed rejection decision.
+Owned-server profiling now warms for 192 tokens before attaching Instruments, then captures 32
+tokens. Both conditioned stock captures save/drain cleanly with matching sampled shader sets.
+A separate actual hybrid capture records 6,407 positive enclosing compact/banked samples, exact
+output/usage parity, trace save before target drain and GPU lease release. It proves profiler
+operation, not changed-helper execution; the stricter changed-path promotion gate is unchanged.
+The stock budget-boundary regression fails before the compact-only metadata correction and passes
+afterward in ReleaseSafe. No thermal/fan equivalence is claimed.
+
+#### Current-main 3.0 replay — rejected, not neutral
+
+The current-main replay is based on `ca49e236f9a0677cd7b45ffd6279bd26d1d8cc88`.
+The synthetic-bank merge retains both projection-specific layer counts and the upstream hash
+helpers. Full `mlx-stream-test` and `mlx-stream-conformance` completed successfully with
+`-Doptimize=safe` on that repaired native source. Earlier measurements remain scoped to PR11/f22.
+
+The fresh source-associated engine run retained all four ABBA arms, 24 measured long requests
+and 16 long conditioning requests on the same host and original calibrated harness. All cells
+completed 192 tokens. The approximate 16K rungs have the matched native counts shown below.
+
+| ABBA arm | Cell | Native prompt tokens | Median prefill tok/s | Median decode tok/s |
+|---|---|---:|---:|---:|
+| 0 baseline | Code | 16172 | 592.266 | 14.563 |
+| 0 baseline | Count | 16132 | 610.988 | 17.074 |
+| 1 candidate | Code | 16172 | 551.339 | 13.915 |
+| 1 candidate | Count | 16132 | 557.414 | 15.997 |
+| 2 candidate | Code | 16172 | 533.298 | 14.708 |
+| 2 candidate | Count | 16132 | 532.892 | 16.211 |
+| 3 baseline | Code | 16172 | 545.478 | 14.932 |
+| 3 baseline | Count | 16132 | 544.333 | 16.238 |
+
+Delivered output, reasoning, usage and request hashes match; exact same-facts admission also
+passes. Acceptance is rejected: observed sampled shader-name sets differ, and unchanged
+performance guards fail. Worst matched long prefill/decode changes are -12.35%/-9.43%;
+worst short decode is -5.69%. Code/count baseline drift is 2.53%/4.90%.
+Owned stock captures contain 9,509/9,030 positive samples and clean up fully. The candidate-only
+sampled names are stock `dsv41_exl3_mul1h_k3_2304` and `q3_prefill_fused_exl3x3_mul1lut_k3`.
+A sampled-set difference is not an exhaustive launch-change proof; it remains an acceptance
+failure, not waived. No neutrality, thermal/fan equivalence or engine win is claimed.
+
+The six saved micro deltas also reapply exactly to source08, but their rebased actual hybrid
+engine comparison is rejected. Delivered output/usage match; nominal median decode change is
+-1.50%, worst matched sample -12.23%, and baseline drift 3.78%. Throughput fails independently
+of dispatch attribution. The clean warmed capture contains 6,260 enclosing compact/banked
+samples, zero verified changed-helper samples, and no changed kernel has proven linkage.
+All owned processes exit normally and the GPU lease is released. These deltas remain excluded:
+source applicability is confirmed, engine benefit is not.
+
+#### Native drafting configuration and saved-delta retry
+
+The rejected stock and saved-delta validator tables above use forced serial decoding:
+their launch arguments include `--no-mtp`. They must not be compared as normal served
+throughput against the earlier DSpark-enabled K3/Jayleaton results. An installed native
+draft lane is not evidence of execution; the host gates DSpark off when MTP is disabled.
+
+A same-binary, same-historical-fixture diagnostic recovered normal throughput without
+rebooting, purging caches or changing power policy. Each entry is a median of three
+uncached 192-token completions; native execution markers and loaded runtime images were checked.
+
+| Diagnostic configuration | Median delivered tok/s |
+|---|---:|
+| Current-main K3, serial, two launches | 15.76 / 16.40 |
+| Current-main K3, DSpark, two launches | 28.75 / 25.36 |
+| Repaired K3, DSpark | 28.43 |
+| Repaired Jayleaton hybrid, DSpark | 24.08 |
+
+The same DSpark baseline still varies between launches despite matching cache rows and
+output. A separate single-server run cycles the original three fixtures four times,
+requires zero cached tokens and retains matching per-fixture output. Its median delivery
+rate is 28.17 tok/s; loaded GPU temperature peaks at 77.51 C, with no swapouts across the run.
+This diagnoses the headline configuration mismatch, not the cause of all inter-launch drift,
+nor full stock 16K neutrality. No ENOSPC-corruption or thermal-causality claim is made.
+
+All six saved deltas were then retried on source08's actual Jayleaton engine with native
+MTP/DSpark enabled. The harness requires `spec=dspark` execution markers for every arm and
+the owned profile target; throughput, output/usage and changed-path gates are unchanged.
+Output/usage parity passes. Nominal median gain is +1.84%, but the >=2% median / >=1% every
+matched sample rule fails, with two matched changes of -0.34%/-0.09% and 3.38% baseline drift.
+The clean trace has 2,425 enclosing samples and zero verified changed-path samples.
+The retry is rejected for promotion; all six remain excluded.
+
+#### Native DSpark 16K K3 comparison — completed, rejected
+
+The requested source08 comparison now completes on the actual stock 3.0 pack:
+current-main `ca49e236` versus repaired native source `c46a1c5a`, on the same host/harness,
+with native MTP/DSpark required in every arm and both profile targets. All 24 measured
+16K requests and 16 long conditioning requests complete; actual inputs are 16,172/16,132
+tokens, with 192 uncached completion tokens. Calibration uses 32 completion tokens because
+a one-token DSpark completion legitimately has no positive decode timing interval.
+
+| ABBA arm | Code median native tok/s | Count median native tok/s |
+|---|---:|---:|
+| Baseline A | 23.824 | 29.140 |
+| PR B | 25.918 | 30.067 |
+| PR C | 25.455 | 29.348 |
+| Baseline D | 25.542 | 29.599 |
+
+Full output/reasoning/usage/request-hash parity, exact same-facts admission and sampled
+stock shader-name equality pass. Live admission facts differ; identical-facts reports
+reproduce both formulas exactly, not a claim that live cache sizes were identical.
+Recovered owned captures contain 2,684 baseline / 2,796 PR positive stock samples.
+The initial empty capture is retained. Profile recovery repeats no timing requests;
+offline reconstruction restores JSON choice-key types without relaxing exact parity.
+All owned targets/tracers drain and GPU leases are released.
+
+The unchanged 3% performance/noise/drift gates reject: code baseline drift is 7.21%,
+worst matched long decode/prefill changes are -6.52%/-3.56%, worst short decode is -8.35%,
+and one code arm has 6.20% relative MAD. This run does not establish K3 neutrality or
+causally attribute these differences to the PR. No stock performance-neutrality claim
+or engine win is made; the draft remains gated.
+
+Completion reporting follows the retained timing/profile receipt roots: 64 valid response
+receipts across this run and profile recovery, not optimization-search iterations.
+
+
+| Published source | Expert contract | Status |
+|---|---|---|
+| Stock 3.0 streaming repack | Uniform K3 gate/up/down; native non-expert tensors | Native DSpark 16K comparison completed; performance guards rejected, neutrality unproven. |
+| [Pollard 3.5](https://huggingface.co/bot-lab-21/DeepSeek-V4.1-Flash-EXL3-3.5bpw-Pollard/tree/f129e31a81e1337aa33e129e2d847fc7e37c8733) | K3/K4 per projection; native non-expert tensors | Complete-checkpoint serving validated with a checked streaming repack. |
+| [Spark 2.77](https://huggingface.co/0xSero/DeepSeek-V4.1-Flash-Spark/tree/9e3bbeabbb39fa2cf6e37e1cecfbd2fd0290329f) | K2/K3/K5 per expert; native trunk/draft | Complete-checkpoint serving validated with a checked streaming repack selecting `exl3/plan/J268-ho-v31-K5n.json`, not unused alternate tensors. |
+| [Jayleaton 2.8](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw/tree/915e1d0de8ee0a99944c5bc88ab802a639c63380) | K2–K5 per expert/projection | Expert-only hybrid validated with the original K3 pack's native trunk/draft; not a complete-checkpoint port. |
+| [Mia 2.9](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw/tree/64ba41b6c916a587db06eae2e19b7845f7be6e6b) | K2/K3 routed layers, plus EXL3 trunk/draft | Not a drop-in checkpoint; replacing its trunk/draft would create a different model. |
+
+Advertised bpw is an average, not the bit width used by every projection.
+MCG, fractional decoder rates, K6–K8 and EXL3 trunk/draft tensors remain unsupported.
 
 ## How mlx-serve consumes it
 
@@ -55,7 +282,7 @@ The plugin builds only inside a host. This repo's `build.zig` runs the host's bu
 `-Dmlx-stream-dir=<this checkout>` (default host: `../mlx-serve`, or pass `-Dmlx-serve=/path`):
 
 ```sh
-zig build test -Dmlx-serve=../mlx-serve         # the plugin's tests (the host's mlx-stream-test step)
+zig build test -Dmlx-serve=../mlx-serve         # host plugin tests plus the SDK memory-bill tests
 zig build conformance -Dmlx-serve=../mlx-serve  # the plugin conformance suite (CPU lane, no device)
 zig build refusals -Dmlx-serve=../mlx-serve     # the sdk_ext contracts' compile-time refusals (compile only)
 zig build serve -Dmlx-serve=../mlx-serve        # the host's ReleaseFast server with this plugin
@@ -63,10 +290,18 @@ zig build serve -Dmlx-serve=../mlx-serve        # the host's ReleaseFast server 
 
 From the host checkout the suites are `zig build mlx-stream-test` (part of `zig build test`) and
 `zig build mlx-stream-conformance`.
+The standalone build defaults to ReleaseSafe. Tests and conformance retain Debug or ReleaseSafe checks
+even when `-Doptimize=ReleaseFast` is requested for the native benchmark; `serve` builds ReleaseFast.
+The SDK memory-bill tests run separately because Zig does not collect tests through a foreign module import.
+Compact phase tables, owned callback backing, coupled fill and admission belong to the DeepSeek architecture;
+the shared SDK memory-bill API is unchanged.
 
 `scripts/test_dsv41.sh` runs every `dsv41 ` test of the plugin and the host on the CPU, and adds the bank tests when
 `DSV41_BANK` is set. MiMo-V2.6-Flash's tests run through a filter, and its bill tool reads a prepared pack's headers
 (no payload) and prints every bill term and the rows it admits per context:
+The original 3.0-bank regression pins 49 shards. Optional `DSV41_M0_FIXTURE` checks compare tensor dtypes,
+shapes, payload hashes, shard filenames and byte offsets against the matching checkpoint fixture.
+The real-bank EXL3 admission test checks the manifest against the runtime decoder contract without loading the model.
 
 ```sh
 zig build test -Dmlx-serve=../mlx-serve -Dtest-filter=mimo
@@ -177,8 +412,130 @@ served behavior.
 | `DSV41_CELL_PREFILL_SUB` | cell | the cache's sub-chunk | the prompt rows per layer-major call; `whole` runs the prompt in one call. |
 | `DSV41_CELL_MAX_CONTEXT` | cell (bill tool) | 16,384 | the longest prompt the construction bills; the server takes it from `ctx_size`. |
 
-The test suites also read their own inputs (`DSV41_BANK`, device-only smoke switches, fixture paths, the cell
-harness's rows, baseline and output paths); each such test skips without its input.
+The test suites also read their own inputs (`DSV41_BANK`, device-only smoke switches, fixture paths and cell
+harness inputs). Legacy asset-gated tests skip without their inputs; the new independent GPU rate tests fail
+if GPU testing is requested but their required assets are missing.
+
+### Quant correctness checks
+
+Run the host's `mlx-stream-test` and `mlx-stream-conformance` targets with `-Doptimize=safe` or `debug` and
+`-Dmlx-stream-dir=/path/to/checkout`. Inline regressions cover malformed manifests, logical/physical strides,
+nonzero cache slots across growth/shrink/reuse, compact class capacities, owned bills, source identity, and actual preread/scatter.
+
+Build the standalone test binary with `test-build -Dtest-filter="dsv41 kernels ops gpu:"`, then run it with
+`DSV41_KERNELS_GPU=1`, `SUSHI_EXL3_K2_FIXTURE`, `SUSHI_EXL3_K3_FIXTURE` and `SUSHI_EXL3_K4_FIXTURE` pointing to
+the host's `lib/sushi/src/exl3/fixtures/exl3_k{2,3,4}_linear.safetensors`. Set `DSV41_PUBLIC_DOWN_FIXTURE` to a
+canonical Pollard layer-0/expert-0 `w2` fixture extracted as below. Hold the GPU lock
+for device checks. The tests exercise full-width prepared decode/verify, three banks, mixed projection rates,
+routed forms and carried BF16 prefill against independent public weights; report skips separately.
+
+The Pollard capture is the four unchanged `layers.0.ffn.experts.0.w2.{trellis,suh,svh,mul1}` tensors from
+`model-00003-of-00048.safetensors` at the revision linked above; it is a tensor extraction, not a requantization.
+Download that shard, then create the consumer test fixture with:
+
+```sh
+python3 scripts/extract_pollard_fixture.py /path/to/model-00003-of-00048.safetensors /path/to/pollard-down.safetensors
+DSV41_PUBLIC_DOWN_FIXTURE=/path/to/pollard-down.safetensors python3 scripts/test_extract_pollard_fixture.py
+```
+
+The helper reads only the source header and selected payloads. It writes trellis, suh, svh, mul1 in that order,
+with no metadata, compact JSON (`dtype`, `shape`, `data_offsets` key order), contiguous payloads, an 8-byte-aligned
+space-padded header and a little-endian u64 header length. Source JSON formatting, metadata and tensor order
+do not affect the result. The complete canonical fixture must match SHA256
+`53fa4386b151bd4b7adc58299b45a9abfeb46fd537121d174c09688e3c11fc9e` before writing; changed selected payloads
+are refused. The GPU gate retains this exact identity check. The extraction tests skip without their fixture
+environment variable; an explicitly missing or mismatched fixture fails.
+
+The original real-bank weight regression pins shard count, shard filenames and byte offsets in addition to
+logical tensor schemas and reference payload hashes. Public Spark/Jay expert gates authenticate the actual
+loaded source and inner/public reference payload bytes before oracle reconstruction or device setup.
+
+For the manifest's compile and numerical probes, build with `-Dtest-filter="dsv41 pre-ship gate:"` and run the
+standalone binary with `DSV41_SELFCHECK_DEVICE=1`. This includes integer-rate and compact kernels, not just K3 construction.
+
+For compact numerical checks, build `test-build -Dtest-filter="exl3 mixed"` and run the standalone binary with
+the GPU and K2/K3/K4 variables above, plus `SUSHI_EXL3_K5_FIXTURE` and `DSV41_SPARK_K{2,3,5}_REFERENCE`.
+Generate each rate's reference in a separate directory with
+`scripts/capture_exl3_cpu_reference.py --reference-root PATH --calibration-fixtures PATH --rate K --sample PATH --output PATH`.
+The outputs are `exl3_kK_linear.safetensors` and `spark-kK-reference.safetensors`; the selected full experts are
+K2 layer-0/expert-0, K3 layer-10/expert-1 and K5 layer-0/expert-2. Their unchanged samples are pinned below.
+The oracle is the unmodified [PonyExl3 CPU reference](https://github.com/beamivalice/PonyExl3/tree/8e7fa6b1556f59fc669e25087903b279b9b0346f),
+not mlx-stream output or an ExLlamaV3 CUDA capture. It first checks all 65,536 MUL1 entries and calibrates against
+Sushi's K2/K3/K4 fixtures; the receipt records library, input, output and comparison-policy provenance.
+
+The compact GPU gate covers K2–K5 mixtures, all three banks, repeated experts and odd group tails, carried BF16
+waves across 128-row boundaries, poisoned missing slots, published Spark/Jay experts and down-code offsets
+beyond 4 GiB. Full-expert prefill checks bounded
+independent arithmetic plus exact terminal rounding: F32 outputs match Pony-inner CPU references with per-block
+FP16 activation stores and f32 projection/SwiGLU boundaries at the original dense-public f64 RMS/64 budget.
+Paired BF16 outputs must equal CPU nearest-even rounding of those verified F32 outputs, bit for bit, for each
+width and offset using identical BF16 inputs; direct and banked decode retain the external public-weight reference.
+Nonfinite reference values are rejected. Device-disabled tests skip; enabling the compact GPU gate requires
+its assets, and missing assets fail rather than count as numerical passes.
+
+Run the capture tool's tests with `python3 scripts/test_capture_exl3_cpu_reference.py`. Set
+`PONY_EXL3_REFERENCE`, `SUSHI_EXL3_FIXTURES` and all three `DSV41_SPARK_K{2,3,5}_SAMPLE` paths to exercise the real
+capture pipeline, including corrupted reference/trellis/scale rejection; missing enabled assets are not numerical passes.
+
+The optional `published Jayleaton mixed K4 K5` GPU test uses `DSV41_JAY_K4_REFERENCE` and
+`DSV41_JAY_K5_REFERENCE` for layer-0/expert-14 (K3/K3/K4) and layer-3/expert-340 (K4/K4/K5) from
+[`jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw/tree/915e1d0de8ee0a99944c5bc88ab802a639c63380).
+These mixed-projection Pony reference fixtures are separate from the uniform-rate Spark capture command above.
+Both are required when either is supplied; neither supplied skips this test. In addition to the numerical checks,
+it pins all twelve embedded source tensors' bytes after validating their names, dtypes and shapes, without
+pinning platform-dependent floating-point reference outputs.
+
+To reproduce a pinned sample, download its selected shard from the Spark revision linked above, then extract only
+the unchanged reference tensors below. This creates a test fixture, not a streaming pack; canonical container
+encoding makes each hash reproducible without depending on a safetensors writer version.
+
+```sh
+python3 - 5 /path/to/L00.part.safetensors /path/to/sample.safetensors <<'PY'
+import hashlib, json, struct, sys
+from pathlib import Path
+
+rate = int(sys.argv[1])
+cases = {
+    2: (0, 0, "exl3/q31/K2/L00.part.safetensors", "108fe9acee54485f014d32fc770ae5673cb92582ed25d3a990d8bc29d30ea526"),
+    3: (10, 1, "exl3/q31/K3/L10.part.safetensors", "aba3c9f13766c9bf7bbae904cde140ae760a2f569943e03b7ecbc23bb6ab2438"),
+    5: (0, 2, "exl3/qn/K5/L00.part.safetensors", "d7db53973044421de435e62901243205ba0e1868fb0056bd5da19673db0af014"),
+}
+layer, expert, shard, digest = cases[rate]
+header = {"__metadata__": {
+    "source_repo": "0xSero/DeepSeek-V4.1-Flash-Spark",
+    "source_revision": "9e3bbeabbb39fa2cf6e37e1cecfbd2fd0290329f",
+    "source_shard": shard, "layer": str(layer), "expert": str(expert), "rate": str(rate),
+}} if rate == 5 else {}
+chunks, offset = [], 0
+with Path(sys.argv[2]).open("rb") as source:
+    size = struct.unpack("<Q", source.read(8))[0]
+    tensors = json.loads(source.read(size))
+    for projection in ("w1", "w2", "w3"):
+        for component in ("mul1", "suh", "svh", "trellis"):
+            name = f"layers.{layer}.ffn.experts.{expert}.{projection}.{component}"
+            tensor = tensors[name]
+            lo, hi = tensor["data_offsets"]
+            source.seek(8 + size + lo)
+            data = source.read(hi - lo)
+            header[name] = {"dtype": tensor["dtype"], "shape": tensor["shape"],
+                            "data_offsets": [offset, offset + len(data)]}
+            chunks.append(data)
+            offset += len(data)
+encoded = json.dumps(header, separators=(",", ":"), sort_keys=rate != 5).encode()
+encoded += b" " * (-len(encoded) % 8)
+blob = struct.pack("<Q", len(encoded)) + encoded + b"".join(chunks)
+if hashlib.sha256(blob).hexdigest() != digest:
+    raise ValueError("selected Spark tensors do not match the pinned sample")
+with Path(sys.argv[3]).open("xb") as output:
+    output.write(blob)
+PY
+```
+
+Kernel-ops and prefill-wave replay metadata is now v2, with explicit logical rates and physical row strides.
+For existing K3 fixtures, run `python3 scripts/migrate_exl3_fixture_layouts.py old-spec.json spec.json` in the
+same fixture directory. The utility validates the old K3 shapes, records the source-spec hash and preserves
+input/output descriptors and oracle payloads. Its tests run with
+`python3 -m unittest discover -s scripts -p 'test_migrate_exl3_fixture_layouts.py'`.
 
 ## MiMo-V2.6-Flash
 
@@ -510,11 +867,12 @@ Hadamard with suh / svh). They are independent implementations with disjoint cla
 |---|---|---|
 | Model | `qwen4_exp` (`quantization_config.expert_quant`) | `deepseek_v41` (inside the arch) |
 | Expert banks | resident | streamed from SSD as packed per-expert records |
-| Rates | K 2..4, mixes, mul1 and mcg | K = 3, mul1 |
+| Rates | K 2..4, mixes, mul1 and mcg | fixed K2–K4; compact K2–K5 per expert/projection, mul1 |
 | Kernels | generated for any shape | pinned Metal texts for this model's shapes, behind a manifest hash |
 
-`src/exl3/sushi_parity.zig` decodes sushi's own K3 mul1 fixture (`lib/sushi/src/exl3/fixtures/exl3_k3_linear.safetensors`
-in the host checkout) through this plugin's decoder and checks the result against sushi's reference bit for bit.
+`src/exl3/sushi_parity.zig` checks the independent public K2/K3/K4 MUL1 fixtures, including full H128 and scales.
+`src/exl3/kernel_ops_gate.zig` uses their reference weights for full-width GPU projections and routed operations;
+these numerical tolerances are not a claim of bitwise full-model equivalence or lossless-teacher quality.
 
 ## GLM-5.3 pack
 

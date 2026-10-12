@@ -2,6 +2,87 @@
 
 ## Unreleased
 
+- EXL3 mixed-bank review repairs: retain uniform-bank stream/policy behavior, allocate and bill mixed
+  ticket ranges at construction, and install per-layer kernel routes from accepted physical geometry.
+  Installed fused-down routes no longer fall back to chains. Compact phase billing uses the existing
+  SDK `row_terms`/owned `slot_table` contract without changing the shared memory-bill API.
+- Restore EXL3 route-launch and row-plan regressions, the `exl3-mul1-k3` identity, conformance manifest
+  pin, 133-kernel/18-header/17-predecessor inventory and original real-bank shard/offset assertions.
+  `mul1h_rate` is a hash-pinned addendum to the unchanged stock header; two unpublished predecessor
+  pins are removed. Public expert gates pin actual reference payloads; the compact PHASE0B gate skips
+  noncompact banks before device setup. Standalone tests default to ReleaseSafe and never use ReleaseFast.
+- Keep six prior compact microbenchmark wins as separate rebased revalidation inputs, not installed
+  engine wins: the repair baseline contains reverted texts; the previous combined served comparison
+  gained only 0.16% and was rejected.
+- Rebase the isolated review repair onto final merged PR11 `f22ad15`. The same-host stock 3.0
+  served ABBA completed all 24 approximately-16K code/count requests with matching delivered
+  output and usage. README records the measured table; both owned attach profiler captures
+  and exact source-associated same-facts admission pass, but prefill neutrality remains rejected.
+- Restrict compact source/route metadata surcharges to compact banks; uniform stock still admits
+  at its exact pre-compact floor budget. The admission-boundary regression fails before the fix and
+  passes afterward in ReleaseSafe; independent same-facts served billing matches the merged
+  baseline across the uniform row and extra-record domain.
+- Remeasure all six saved deltas in the final-rebase actual hybrid engine with exact delivered
+  output/usage parity and a clean owned-server attach capture. The nominal 5.31% median gain is
+  rejected: control drift is 11.13%, a matched sample regresses, and changed-path dispatch is
+  unproven despite enclosing compact/banked shader samples. No microbenchmark delta is promoted.
+- Restore uniform-bank submission's original expert-id ordering, constant layer footprint
+  and cached segment lengths; per-record geometry grouping/scans run only for mixed geometry.
+  Safe stream consumer regressions pass. Fresh served stock validation completed 24 long requests,
+  with exact output/usage, sampled stock launch sets, clean profiler captures and same-facts admission.
+  Performance neutrality is still rejected: 10.17% short-decode and 13.42% count-decode baseline drift,
+  with a changing live memory baseline. No timing failure is causally attributed to the source repair.
+- Run a no-change PR11-versus-PR11 served control with identical source attestations. Correctness,
+  launch sets, profiling and same-facts admission pass, but the unchanged baseline drifts beyond
+  the guards (3.41% short decode, 5.15% code decode, 7.70% count decode). Performance acceptance
+  remains unresolved; no acceptance thresholds are relaxed.
+- Revalidate unchanged PR11 controls in AC Auto, including four actual uncached 16K preconditioning
+  requests per ABBA arm. Generated outputs/usage/hashes and exact same-facts admission match;
+  preconditioned sampled launch sets also match. Strict performance acceptance still fails,
+  including a -21.82% matched prefill difference; Auto and preconditioning do not establish neutrality.
+- Warm controller-owned profiler targets before Instruments attach. Actual stock and hybrid captures
+  save before target drain with exact output/usage parity and released GPU leases. Hybrid proof
+  distinguishes positive enclosing samples from unproven changed-helper execution; promotion
+  guards remain unchanged.
+- Complete the source07 repaired-stock Auto decision from its four witnessed ABBA arms after the
+  old deadline expired during candidate profiling. Only the missing capture and host admission
+  proof are continued; no timing request is repeated. Correctness/dispatch/admission pass,
+  performance neutrality remains rejected, and original timeout receipts are retained.
+- Revalidate saved six deltas on source07's actual hybrid engine: nominal +3.54%, but two matched
+  regressions and 5.27% baseline drift fail throughput acceptance. Warmed enclosing shader samples
+  do not prove changed-helper execution. The saved deltas remain excluded.
+- Drop the obsolete `row_costs`/`decode_base_rows` SDK proposal; mixed EXL3 support uses the
+  merged SDK contract and does not require a separate all-plugin API migration.
+- Rebase the published draft onto current main `ca49e236`, preserving projection-specific
+  synthetic-bank layer counts and upstream hash helpers. Full repaired-source test/conformance
+  commands complete successfully in ReleaseSafe; the draft is conflict-free.
+- Complete current-main/source08 stock 3.0 ABBA with all 24 measured long requests and 16 long
+  conditioning requests. Delivered output/usage/hashes and exact same-facts admission match,
+  but sampled shader-name sets differ and unchanged performance guards reject: worst matched
+  long prefill/decode -12.35%/-9.43%. Both owned profiler captures save and clean up normally.
+  README records the actual same-host/harness table; neutrality is not claimed or waived.
+- Reapply all six saved deltas exactly to current-main/source08 and benchmark the actual hybrid
+  engine. Output/usage parity passes, but nominal median decode change is -1.50%, worst matched
+  sample -12.23%, and baseline drift 3.78%. Throughput and changed-path attribution both fail.
+  The clean warmed capture contains 6,260 enclosing samples, not proof of changed-helper
+  execution. All six remain excluded; no optimizer is restarted or engine win promoted.
+- Diagnose the apparent K3/Jayleaton slowdown as a benchmark-mode mismatch: earlier fast
+  serving used native DSpark, while the rejection validators explicitly disabled MTP.
+  Controlled current-binary drafting toggles recover K3/Jayleaton throughput without a
+  reboot or cache purge. Inter-launch drift remains separate from stock-neutrality proof.
+- Retry all six saved deltas with native MTP/DSpark execution required in each measured arm
+  and profile. Output/usage parity passes; nominal +1.84% is rejected by unchanged throughput
+  and changed-path gates. Two matched samples regress, baseline drift is 3.38%, and enclosing
+  samples do not prove changed-helper execution. None is promoted.
+- Complete native MTP/DSpark stock K3 16K ABBA: all 24 measured and 16 conditioning
+  requests finish uncached. Output/usage/hashes, exact same-facts admission and sampled
+  stock shader-name equality pass. Recover both owned stock profiles without retiming;
+  initial empty capture and artifact-reconstruction failures remain preserved.
+- Keep K3 neutrality unproven: unchanged 3% guards reject with 7.21% code baseline drift,
+  -6.52%/-3.56% worst matched long decode/prefill changes and -8.35% worst short decode.
+  No causal PR regression or performance-neutrality claim; no gate is waived.
+- Completion reporting follows sealed timing/profile receipt roots through offline
+  adjudication; the exercised final report retains 64 valid responses, not zero requests.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the
@@ -99,6 +180,12 @@
     `expert_wide_depth` honors every depth the stream takes (1 to 5; 3 and 4 were ignored before); the gate ring holds
     512 gates of up to 768 tickets.
   - opt-in reads straight into the slot rows (`expert_io.Options.direct`, no staging, no copy) for page-aligned ranges.
+- Add a standalone real-expert EXL3 benchmark for direct and three-bank decode, with correctness-gated variant screening and isolated Metal profiling, without loading a model or server.
+- Speed up compact mixed-rate expert decoding by sharing weight decoding across repeated expert rows and tuning loop unrolling without changing numerical outputs.
+- Let mixed-rate expert caches replace cold prompt experts during decode while preserving slot-capacity and in-flight ownership checks.
+- Stream compact K2–K5 per-expert MUL1 mixtures without widest-rate cache padding, with capacity-aware admission and settled-only device routing.
+- Stream K2/K3/K4 MUL1 experts with mixed projection rates, exact cache/read-buffer accounting, and independent GPU regressions while retaining the tight K3 path.
+- Include separately billed expert metadata in the construction verifier's host-memory allowance.
 - The plugin carries its own `sdk` module (sdk/: the arch contract, the weight loader, the reads past the page cache)
   and reaches mlx-serve only through `mlx_host`; mlx-serve calls the arch from one glue file. `HOST_PIN`, the
   conformance suite's host-registry test and the host test bridge's dependence on host internals are gone.
