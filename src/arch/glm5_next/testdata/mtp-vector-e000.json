@@ -1,0 +1,81 @@
+{
+ "what": "glm5_next MTP draft bank test vector: mtp-experts-nvfp4.bin record decoded by the reference reader",
+ "layout": "nvfp4-gud-9part",
+ "reader": {
+  "file": "glm5next_nvfp4_reader.py",
+  "sha256": "f18e62f23287875accff4a387fd53f9f6066d99992b74f6eed87da9980aa7849"
+ },
+ "arithmetic": "inv = f32(g / 2688); s = f32(e4m3 * inv); w = f32(s * e2m1); fp16 = RNE(w); row-major [out, in]",
+ "check_mtp": {
+  "layer": 45,
+  "expert": 0,
+  "record_sha256": "03cb5dad4542b142782733eb43a56d078d856046f156278180a924dbc7cc1314",
+  "projections": {
+   "gate_proj": {
+    "g_f32_hex": "3e900000",
+    "rel_rms_vs_bf16": 0.09490642067202726,
+    "max_abs_over_amax": 0.08730157216389973
+   },
+   "up_proj": {
+    "g_f32_hex": "3e5effff",
+    "rel_rms_vs_bf16": 0.09421630211687664,
+    "max_abs_over_amax": 0.07078796865694191
+   },
+   "down_proj": {
+    "g_f32_hex": "3f900000",
+    "rel_rms_vs_bf16": 0.09487859189411062,
+    "max_abs_over_amax": 0.038411458333333336
+   }
+  }
+ },
+ "records": [
+  {
+   "layer": 45,
+   "expert": 0,
+   "record_sha256": "03cb5dad4542b142782733eb43a56d078d856046f156278180a924dbc7cc1314",
+   "g": [
+    "3e900000",
+    "3e5effff",
+    "3f900000"
+   ],
+   "weight_scale_2": [
+    "38db6db7",
+    "38a9e79e",
+    "39db6db7"
+   ],
+   "gate": {
+    "shape": [
+     2048,
+     4096
+    ],
+    "g_f32_hex": "3e900000",
+    "f32_sha256": "d4e27cb9ce9ff30713eb449f702f13bc5c116f02328df4678d71133f5167016c",
+    "fp16_sha256": "74decd04b8c691914e2c5a2997af6a4bff72f41cd01fc73c2f85e88989ab1738",
+    "fp16_sum": 92.36731195449829,
+    "fp16_abs_sum": 137964.4964632988
+   },
+   "up": {
+    "shape": [
+     2048,
+     4096
+    ],
+    "g_f32_hex": "3e5effff",
+    "f32_sha256": "f4648ef3a4f13d56fdd1e2a84d998c554785722d75e1bc9bc788e2daa69c983e",
+    "fp16_sha256": "df776e2e2af0a255920397644940c796a9d3fba8cc0dc9b7009ae8ce1a117517",
+    "fp16_sum": -9.535091400146484,
+    "fp16_abs_sum": 141997.9761352539
+   },
+   "down": {
+    "shape": [
+     4096,
+     2048
+    ],
+    "g_f32_hex": "3f900000",
+    "f32_sha256": "f3c91fd5a52668fc48b080b39b9d9b1674fa5cd3939c4325e6d314dcd07451b8",
+    "fp16_sha256": "9dcb29f52cda6227fff9d7cfc5f02201ae41e206db01ad729156d3f08ba858f8",
+    "fp16_sum": -104.99684762954712,
+    "fp16_abs_sum": 144879.94166612625
+   }
+  }
+ ]
+}
