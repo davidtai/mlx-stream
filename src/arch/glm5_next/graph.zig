@@ -434,7 +434,7 @@ pub const Cache = struct {
     }
 
     /// The layer's arrays an evaluation of its forward covers (lanes and states).
-    fn buffers(self: *const Cache, lw: *const Layer, out: *[2]T) []const T {
+    pub fn buffers(self: *const Cache, lw: *const Layer, out: *[2]T) []const T {
         var n: usize = 0;
         switch (lw.attn) {
             .dsa => for ([_]?T{ self.latent[lw.slot].buf, self.index[lw.slot].buf }) |b| if (b) |x| {
@@ -518,7 +518,7 @@ pub fn route(g: *G, c: *const glm.Config, r: Router, x: T) !Routing {
 
 /// The sublayer attention of layer `lw` on `stream` [1, R, hc, hidden] (rows at `start`): the collapse, the norm, KDA or
 /// DSA, the expand -> the new stream.
-fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start: u32, cache: *Cache, routes: dsa.Routes, comptime head: Head) !T {
+pub fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start: u32, cache: *Cache, routes: dsa.Routes, comptime head: Head) !T {
     var col = try ops.collapse(g.s, stream, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, c.hc_iters, c.hc_eps, c.rms_norm_eps);
     defer col.deinit();
     const normed = try rmsNorm(g, col.x, lw.input_norm, c.rms_norm_eps);

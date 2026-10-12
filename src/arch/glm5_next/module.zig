@@ -26,6 +26,7 @@ const pagecache = @import("../mimo_v2/pagecache.zig");
 /// timers and the serial forwards' GPU timeline; every call compiles to nothing in a served build.
 const gprof = @import("profile.zig");
 const prefill_attention = @import("../mimo_v2/prefill_attention.zig");
+const warm = @import("warm.zig");
 
 const T = mlx.mlx_array;
 
@@ -114,6 +115,8 @@ pub const Module = struct {
         self.cache = try graph.Cache.init(gpa, &self.c.model, @intCast(plan.reserve));
         errdefer self.cache.deinit(&self.g);
         try self.cache.preallocate(&self.g, &self.c.model);
+        // Prompt lever 3: the prompt pass's first-use kernel builds run here, not inside the first request (warm.zig).
+        const warmed = try warm.run(&self.g, io, &self.c.model, &self.w, &self.cache, self.src, routes);
         self.prompt_pass = promptPassOf(promptRoute(&self.c));
         self.step_pass = stepPassOf(stepRoute(&self.c));
         if (self.c.dumpDir()) |d| {
@@ -123,6 +126,7 @@ pub const Module = struct {
         log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d}\n", .{ routes.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows });
         // The prompt levers' engagement lines (glm5next/prefill-levers; docs/glm5-next.md "Prompt levers").
         if (experts.prompt_relocate) log.info("glm5_next prompt lever 1: read-ahead relocation engaged (a read-ahead record the plans evict before any hit is copied at the plans into its later transient row: read once; exact)\n", .{});
+        log.info("glm5_next prompt lever 3: prompt kernels warmed at load in {d} ms (KDA layer {d}: {d} spans; dense layer {d}: one {d}-row tile; DSA layer {d}: {d} spans of {d} rows; the {s} combine; token-identical)\n", .{ warmed.ns / std.time.ns_per_ms, warmed.plan.kda_layer, warmed.plan.kda_spans, warmed.plan.dense_layer, graph.dense_tile_rows, warmed.plan.dsa_layer, warmed.plan.dsa_spans, graph.span_rows, @tagName(self.src.combine_route) });
         log.info("mlx-stream glm5_next installed: {d} layers; {d} KDA, {d} DSA; residents BF16 {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed ({d} sources), {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nKda(), model.nDsa(), weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, n_moe, plan.rows.prompt, graph.prompt_call_rows });
         log.info("glm5_next memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv=bf16 phase_rows=on growth_rows={d} forced={s}\n", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, plan.rows.decode - plan.rows.prompt, if (bill.isForced(cfg)) "yes" else "no" });
         if (comptime gprof.enabled) try gprof.arm(gpa, io, self.src, model.n_layers, s);

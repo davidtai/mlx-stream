@@ -75,10 +75,11 @@ routes line); an installed NAX route never falls back.
 ## Prompt levers
 
 The 16K prompt pass's levers from the prefill analysis (`reports/.../mimo/glm5next-prefill-gpu-levers-20261012.md`),
-each a construction-time route with one engagement line at load (the pair harness greps them). An exact lever is
-installed unconditionally; a rounding-class one is a settings key whose default is the stock control.
+numbered as the analysis ranks them (2 and 6 are other lanes'), each a construction-time route with one engagement line
+at load (the pair harness greps them). An exact lever is installed unconditionally; a rounding-class one is a settings
+key whose default is the stock control.
 
-1. **Read-ahead relocation** (exact). The profile read 33.8 records per layer twice: P1's read-ahead reads its
+- **Lever 1, read-ahead relocation** (exact). The profile read 33.8 records per layer twice: P1's read-ahead reads its
    mispredicted records (predicted hot, actually ranked past the prompt rows) into persistent rows during the attention,
    an earlier group's seed miss then takes each such row before any group hits the record, and the record's own group
    reads it again, into a transient row, inside the drive-bound MoE stage (209 ms of reads against 154 ms of tiles per
@@ -91,6 +92,22 @@ installed unconditionally; a rounding-class one is a settings key whose default 
    streams leave it off. Line: `glm5_next prompt lever 1: read-ahead relocation engaged (...)`. Expected -0.8 to
    -1.5 s at 16K (the analysis's model -1.51 s for all double reads); the profile build's `GLM5_NEXT_IO skipped_loads=`
    counts the relocated loads (0 in the control's first request).
+
+- **Lever 3, prompt kernels warmed at load** (token-identical; `warm.zig`). The profile's first request idled 0.60 s on
+  first use: layer 0's attention (233 ms over later layers') and dense MLP (104 ms), layer 3's DSA indexer, top-k and
+  sparse texts (~220 ms) and its combine (48 ms): MLX builds a custom kernel's library, and a pipeline per
+  specialization, at its first dispatch. The load now dispatches each once at the prompt pass's shapes, on zeros,
+  nothing checked: the first KDA layer's attention over two 1,024-row spans, the first dense layer's MLP over one
+  2,048-row tile, the first DSA layer's attention over a whole call's 16 spans (the dense prefix, then the sparse rows
+  at every key count to 16,384; a billed context under one call: its whole spans) and the installed combine over one
+  token. It leaves no request state: the cache restarted (KDA states cleared; the DSA lanes' lengths 0, a request reads
+  only the positions it appended), the expert source untouched, MLX's cache cleared before the construction check. Its
+  memory is the prompt pass's (two spans in flight, one dense tile), inside the request terms, which hold nothing at the
+  load. A prompt longer than one call reaches key counts the warm does not (compiled on first use, as before). A layout
+  without a KDA, a dense or a DSA layer refuses the load (`Glm5NextWarmLayout`). Line: `glm5_next prompt lever 3: prompt
+  kernels warmed at load in <ms> ms (KDA layer 0: 2 spans; dense layer 0: one 2048-row tile; DSA layer 3: 16 spans of
+  1024 rows; the inplace combine; token-identical)`. Expected -0.5 to -0.6 s of TTFT on the first request after a load
+  (every cell measures one); a warm server never paid it.
 
 ## The bill
 
