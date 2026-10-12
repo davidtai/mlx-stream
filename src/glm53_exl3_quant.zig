@@ -183,6 +183,14 @@ pub fn Accepted(comptime G: type) type {
             const gt = try g.hostArray(std.mem.sliceAsBytes(tabs.gt), &.{@intCast(tabs.gt.len)}, .uint32);
             var rb: [3]routes.Bank = undefined;
             for (banks, &rb) |b, *o| o.* = .{ .gate = proj(b.gate), .up = proj(b.up), .down = proj(b.down) };
+            const md = dec.maxm_down orelse dec.maxm;
+            if (md != dec.maxm) {
+                const t2 = try selfcheck.decodeTablesM(self.a, pairs, md);
+                defer self.a.free(t2.pt);
+                defer self.a.free(t2.gt);
+                const gt2 = try g.hostArray(std.mem.sliceAsBytes(t2.gt), &.{@intCast(t2.gt.len)}, .uint32);
+                return g.adopt(try dec.waveSplit(x, pt, gt, tabs.n_slots, gt2, t2.n_slots, pairs.len, &rb, sc, out));
+            }
             return g.adopt(try dec.wave(x, pt, gt, pairs.len, tabs.n_slots, &rb, sc, out));
         }
 
@@ -900,8 +908,11 @@ fn nbytesOf(x: mlx.mlx_array) u64 {
 }
 
 /// GLM53_EXL3_DEC4's experiments on these texts' decode chain: one text each, one needle replaced.
-const DecExp = struct { name: []const u8, kernel: xk.Kernel, subs: []const [2][]const u8 = &.{}, members: u32 = routes.max_members, all: bool = false };
+const DecExp = struct { name: []const u8, kernel: xk.Kernel, subs: []const [2][]const u8 = &.{}, members: u32 = routes.max_members, members_down: ?u32 = null, all: bool = false };
 const dec_exps = [_]DecExp{
+    .{ .name = "two members a slot", .kernel = .glm53_dec_gu, .members = 2, .all = true },
+    .{ .name = "gu two members a slot, down one", .kernel = .glm53_dec_gu, .members = 2, .members_down = 1, .all = true },
+    .{ .name = "gu one member a slot, down two", .kernel = .glm53_dec_gu, .members = 1, .members_down = 2, .all = true },
     .{ .name = "gu: nothing (returns)", .kernel = .glm53_dec_gu, .subs = &.{.{ "    if (packed == 0xffffffffu) return;", "    if (true) return;" }} },
     .{ .name = "down: nothing (returns)", .kernel = .glm53_dec_down, .subs = &.{.{ "    if (n_live == 0u) return;", "    if (true) return;" }} },
 };
@@ -929,7 +940,10 @@ const DecExpRun = struct {
             errdefer e.reg.deinit();
             e.bd = try e.reg.bind(s, null);
             e.dec = .{ .init(&e.bd, inst0), .init(&e.bd, inst1) };
-            for (&e.dec) |*d| d.maxm = ex.members;
+            for (&e.dec) |*d| {
+            d.maxm = ex.members;
+            d.maxm_down = ex.members_down;
+        }
             return;
         }
         var tx = try a.dupe(u8, xk.embedded.sources[@backingInt(ex.kernel)]);
@@ -951,7 +965,10 @@ const DecExpRun = struct {
         errdefer e.reg.deinit();
         e.bd = try e.reg.bind(s, null);
         e.dec = .{ .init(&e.bd, inst0), .init(&e.bd, inst1) };
-        for (&e.dec) |*d| d.maxm = ex.members;
+        for (&e.dec) |*d| {
+            d.maxm = ex.members;
+            d.maxm_down = ex.members_down;
+        }
     }
 
     fn deinit(e: *DecExpRun, a: Allocator) void {
