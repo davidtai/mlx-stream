@@ -1,7 +1,8 @@
 //! glm5_next's construction config: the pack's model (config.zig), the pack's `expert_streaming.settings` (read once at
 //! construction; a key that is not a setting refuses the load by name) and the host's load facts. MiMo's contract: the
 //! operator pins the rows with `expert_prefill_rows` / `expert_rows` (either alone forces both); `mtp_lane` installs the
-//! MTP draft lane (mtp.zig; off, the serial control, by default); `decode_moe` the decode lane's expert route (`hitpass`,
+//! MTP draft lane (mtp.zig; off, the serial control, by default) and `draft_depth` its drafts per round (1 .. 3, default
+//! 3); `decode_moe` the decode lane's expert route (`hitpass`,
 //! the default: the NVFP4 decode texts with the device hit pass; `fused`, the texts with the host-routed hit wave, its
 //! control; `stock`, MLX's gathers, the texts' control); `decode_glue` the decode lane's glue (`fused`, the default: the
 //! mHC hcPre chain, the router and top-8 texts, the combine with the shared expert's add, glue.zig; `ops`, the stock op
@@ -28,7 +29,12 @@ pub const allocator_cache_bytes: u64 = 256 << 20;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "logits_dump_dir" };
+
+/// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): `draft_depth`'s default and
+/// the most it admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
+/// `draft_depth`: the bill is the trained depth's).
+pub const trained_draft_depth: u32 = 3;
 
 /// The decode lane's routed-expert route, installed once at construction: `stock` MLX's gather_qmm nvfp4 (two gathers
 /// and the clamped SwiGLU, then a gather per down), `fused` the NVFP4 decode texts (decode_kernels.zig: MiMo's k1 family
@@ -79,6 +85,10 @@ pub const Config = struct {
     expert_rows: ?u32 = null,
     expert_prefill_rows: ?u32 = null,
     mtp_lane: bool = false,
+    /// Drafts per round (`"draft_depth"`: an integer 1 .. `trained_draft_depth`, default the trained depth): a round
+    /// drafts at most this many and verifies 1 + them. Read once at construction (`mtp.Lane.open`); 0 marks a value
+    /// outside 1 .. 3 or not an integer (refused by name in `validate`). Without the lane it is inert.
+    draft_depth: u32 = trained_draft_depth,
     decode_moe: DecodeMoe = .hitpass,
     /// The decode lane's glue (glue.zig `Route`): `fused` (the default) or `ops` (the stock op chains, the control).
     decode_glue: DecodeGlue = .fused,
@@ -111,6 +121,7 @@ pub const Config = struct {
         if (raw.object.get("mtp_lane")) |v| {
             if (v == .bool) c.mtp_lane = v.bool else c.malformed.mtp_lane = true;
         }
+        if (raw.object.get("draft_depth")) |v| c.draft_depth = if (v == .integer and v.integer >= 1 and v.integer <= trained_draft_depth) @intCast(v.integer) else 0;
         if (raw.object.get("decode_moe")) |v| {
             const route: ?DecodeMoe = if (v == .string) std.meta.stringToEnum(DecodeMoe, v.string) else null;
             if (route) |r| c.decode_moe = r else c.malformed.decode_moe = true;
@@ -176,6 +187,7 @@ pub const Config = struct {
     pub fn validate(c: Config) !void {
         if (c.malformed.rows) return error.Glm5NextExpertRowsSetting;
         if (c.malformed.mtp_lane) return error.Glm5NextMtpLaneSetting;
+        if (c.draft_depth == 0 or c.draft_depth > trained_draft_depth) return error.Glm5NextDraftDepthRange;
         if (c.malformed.dump_dir) return error.Glm5NextLogitsDumpDir;
         if (c.malformed.decode_moe) return error.Glm5NextDecodeMoeSetting;
         // The draft lane binds the MTP layer's residents BF16 (its spec); a pack declaring them FP8 cannot serve the lane.
@@ -221,6 +233,22 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expect(on.mtp_lane);
     try testing.expectError(error.Glm5NextMtpLaneSetting, (try parseSettings("{\"mtp_lane\":1}")).validate());
     try (try parseSettings("{\"mtp_lane\":false}")).validate();
+    // The lane's depth: the trained 3 unless named; 1 .. 3 by name; anything else refused by name.
+    try testing.expectEqual(trained_draft_depth, on.draft_depth);
+    try testing.expectEqual(@as(u32, 3), trained_draft_depth);
+    for ([_]struct { []const u8, u32 }{
+        .{ "{\"mtp_lane\":true,\"draft_depth\":1}", 1 },
+        .{ "{\"mtp_lane\":true,\"draft_depth\":2}", 2 },
+        .{ "{\"mtp_lane\":true,\"draft_depth\":3}", 3 },
+    }) |case| {
+        const c = try parseSettings(case[0]);
+        try c.validate();
+        try testing.expectEqual(case[1], c.draft_depth);
+    }
+    for ([_][]const u8{
+        "{\"draft_depth\":0}",   "{\"draft_depth\":4}",     "{\"draft_depth\":-1}",   "{\"draft_depth\":2.0}",
+        "{\"draft_depth\":2.5}", "{\"draft_depth\":\"2\"}", "{\"draft_depth\":true}", "{\"draft_depth\":null}",
+    }) |text| try testing.expectError(error.Glm5NextDraftDepthRange, (try parseSettings(text)).validate());
     // The dump route: an absolute directory, else refused by name; absent, none.
     const dumped = try parseSettings("{\"logits_dump_dir\":\"/tmp/kl/incoming\"}");
     try dumped.validate();

@@ -33,7 +33,8 @@ The arch claims a `config.json` with `model_type` `glm5_next` and the block
 
 The block's optional `settings` object takes `expert_prefill_rows` and `expert_rows` (an operator pin: either alone
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
-is installed when true; off, the serial control, by default: below), `decode_moe` (the decode lane's expert route:
+is installed when true; off, the serial control, by default: below), `draft_depth` (the lane's drafts per round: an
+integer 1 .. 3, default 3; anything else refused by name), `decode_moe` (the decode lane's expert route:
 `hitpass`, the default, `fused` or `stock`; anything else refused by name), `decode_glue` (the decode lane's glue:
 `fused`, the default, or `ops`), `decode_kda`, `decode_dsa` and `decode_swiglu` (the decode lane's KDA layer, DSA
 attention and MLP activation: `fused`, the default, or `ops`), `decode_predict` (the lookahead predictor's router
@@ -291,7 +292,8 @@ prints a table per served context (17,408; 18,432; 20,480; 24,576; 32,766; 32,76
 
 ## The MTP draft lane
 
-`mtp_lane: true` installs the release's MTP layer as a draft head at depth 3 with exact acceptance (`mtp.zig`, on
+`mtp_lane: true` installs the release's MTP layer as a draft head at depth 3 (`draft_depth` 1 .. 3 sets it; the
+lanes, the bill and the host's block stay sized at 3, MiMo's rule) with exact acceptance (`mtp.zig`, on
 MiMo's draft-lane seam; `MTP.md` lists its integration points). At construction: the MTP layer's 25 residents kept in
 the weight map and read with the trunk, the draft bank (`mtp-experts-nvfp4.bin`, all 288 experts resident in NVFP4)
 read into MLX and checked record by record against its manifest, the head's lanes at the billed positions; what the
@@ -306,7 +308,9 @@ layer's per-row states captured by the host's `capture_seq` recurrence), decides
 eval (greedy: the verify rows' argmax; sampled: sample-then-verify, every row's token the target's position-keyed draw, the serial step's), then rolls back to the kept rows (the DSA
 lanes truncated; on a partial accept every KDA state restored from the capture by a copy, no re-forward) and pends the
 kept rows' hidden. A round without drafts (the lane not tracking, the cap, the context) is a serial step. The request's
-receipt is MiMo's `[spec-stats]` line (rounds, accepted per round, misses and bytes per round).
+receipt is MiMo's `[spec-stats]` line (rounds, accepted per round, misses and bytes per round) and the lane's tail
+` depth=<d> pos_tested=a,b,c pos_kept=x,y,z` (per draft position: the rounds that decided it, the rounds that kept it;
+position i's acceptance is kept / tested).
 
 Bill (with the lane): the lane's own terms (`mtp_bank`, `mtp_residents`, `mtp_tables`, `mtp_kv`, `mtp_pending`,
 `mtp_wave`), the decode wave at the verify's 4 rows (`request`), `mtp_kda_capture` (5 rows of every KDA layer's state
