@@ -675,32 +675,14 @@ test "mimo sdk2 mxfp4 SDK GPU: asynchronous windows and bound six-component slot
             @memset(bytes[offset..][0..seg.length], value);
         }
     };
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = &bytes });
-    var dir_buf: [512]u8 = undefined;
-    var path_buf: [600]u8 = undefined;
-    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
-    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/experts.bin", .{dir}, 0);
-    const fd = try sdk_ext.expert.openUncached(path, null);
-    defer fd.close();
-    // Fixture metadata only; this scope owns the fd and closes it once.
-    const owner: bank_mod.Bank = .{
-        .allocator = a,
-        .geometry = geom,
-        .digests = &.{},
-        .source_repository = "synthetic",
-        .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_fd = fd.fd,
-        .sidecar_file_size = fd.size,
-    };
-    var bank = try bank_mod.SDKBank.init(a, &owner);
-    defer bank.deinit();
+    var side: bank_mod.TestSidecar = undefined;
+    try side.init(a, geom, &bytes);
+    defer side.deinit();
     const mlx_stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(mlx_stream);
     var g = try @import("../deepseek_v41/ops.zig").MlxOps.init(a, mlx_stream);
     defer g.deinit();
-    const stream = try Stream.init(a, &bank, .{
+    const stream = try Stream.init(a, &side.bank, .{
         .rows = &.{ 1, 1 },
         .max_route_ids = 8,
         .transient_rows = 16,
@@ -809,31 +791,14 @@ fn phaseRowsBoundary(prompt_rows: [2]u32, decode_rows: [2]u32) !void {
     const a = testing.allocator;
     const geom = try bank_mod.Geometry.init(32, 32, 64, 1, 2);
     var bytes: [2 * 64 * 1632]u8 = @splat(7);
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = &bytes });
-    var dir_buf: [512]u8 = undefined;
-    var path_buf: [600]u8 = undefined;
-    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
-    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/experts.bin", .{dir}, 0);
-    const fd = try sdk_ext.expert.openUncached(path, null);
-    defer fd.close();
-    const owner: bank_mod.Bank = .{
-        .allocator = a,
-        .geometry = geom,
-        .digests = &.{},
-        .source_repository = "synthetic",
-        .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_fd = fd.fd,
-        .sidecar_file_size = fd.size,
-    };
-    var bank = try bank_mod.SDKBank.init(a, &owner);
-    defer bank.deinit();
+    var side: bank_mod.TestSidecar = undefined;
+    try side.init(a, geom, &bytes);
+    defer side.deinit();
     var opts = options(&prompt_rows, .host);
     opts.max_route_ids = 8;
     opts.transient_rows = 16;
     opts.transient_release = true; // the route `Source.initBank` installs with decode rows
-    const stream = try Stream.init(a, &bank, opts);
+    const stream = try Stream.init(a, &side.bank, opts);
     defer stream.deinit();
     try testing.expectEqual(@as(u64, 16 * geom.record_bytes), try stream.releaseTransient());
     try stream.grow(&decode_rows);
@@ -869,26 +834,9 @@ test "mimo rows audit R3: decode's window 0 holds decode_route_ids rows and ever
     const bytes = try a.alloc(u8, geom.total_bytes);
     defer a.free(bytes);
     @memset(bytes, 5);
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = bytes });
-    var dir_buf: [512]u8 = undefined;
-    var path_buf: [600]u8 = undefined;
-    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
-    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/experts.bin", .{dir}, 0);
-    const fd = try sdk_ext.expert.openUncached(path, null);
-    defer fd.close();
-    const owner: bank_mod.Bank = .{
-        .allocator = a,
-        .geometry = geom,
-        .digests = &.{},
-        .source_repository = "synthetic",
-        .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_fd = fd.fd,
-        .sidecar_file_size = fd.size,
-    };
-    var bank = try bank_mod.SDKBank.init(a, &owner);
-    defer bank.deinit();
+    var side: bank_mod.TestSidecar = undefined;
+    try side.init(a, geom, bytes);
+    defer side.deinit();
     const prompt_rows = [_]u32{ 2, 2 };
     const decode_rows = [_]u32{ 3, 3 };
     const window: u32 = 4;
@@ -898,9 +846,9 @@ test "mimo rows audit R3: decode's window 0 holds decode_route_ids rows and ever
     opts.transient_release = true;
     // Wider than the widest route: refused by name at construction.
     opts.decode_route_ids = 9;
-    try testing.expectError(error.InvalidOptions, Stream.init(a, &bank, opts));
+    try testing.expectError(error.InvalidOptions, Stream.init(a, &side.bank, opts));
     opts.decode_route_ids = window;
-    const stream = try Stream.init(a, &bank, opts);
+    const stream = try Stream.init(a, &side.bank, opts);
     defer stream.deinit();
     try testing.expectEqual(@as(u64, 16 * geom.record_bytes), try stream.releaseTransient());
     var ss = StreamSource.init(stream);
@@ -969,14 +917,11 @@ test "mimo rows audit R3: decode's window 0 holds decode_route_ids rows and ever
 
 const HitFixture = struct {
     const geom_args = .{ 32, 32, 64, 1, 2 };
-    tmp: std.testing.TmpDir,
     bytes: []u8,
-    fd: sdk_ext.expert.io.UncachedFd,
-    owner: bank_mod.Bank,
-    bank: bank_mod.SDKBank,
+    side: bank_mod.TestSidecar,
     stream: *Stream,
 
-    /// In place: the stream retains `&f.bank`, the SDK bank `&f.owner`.
+    /// In place: the stream retains `&f.side.bank`, the SDK bank `&f.side.owner`.
     fn init(f: *HitFixture, a: std.mem.Allocator, rows: []const u32) !void {
         return f.initOpts(a, options(rows, .host));
     }
@@ -989,34 +934,14 @@ const HitFixture = struct {
             const offset = geom.recordOffset(@intCast(layer + 1), @intCast(expert)) + seg.offset;
             for (f.bytes[offset..][0..seg.length], 0..) |*b, i| b.* = @truncate(layer * 131 + expert * 7 + component * 3 + i);
         };
-        f.tmp = std.testing.tmpDir(.{});
-        errdefer f.tmp.cleanup();
-        try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "experts.bin", .data = f.bytes });
-        var dir_buf: [512]u8 = undefined;
-        var path_buf: [600]u8 = undefined;
-        const dir = dir_buf[0..try f.tmp.dir.realPath(std.testing.io, &dir_buf)];
-        const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/experts.bin", .{dir}, 0);
-        f.fd = try sdk_ext.expert.openUncached(path, null);
-        errdefer f.fd.close();
-        f.owner = .{
-            .allocator = a,
-            .geometry = geom,
-            .digests = &.{},
-            .source_repository = "synthetic",
-            .source_revision = "0000000000000000000000000000000000000000",
-            .sidecar_fd = f.fd.fd,
-            .sidecar_file_size = f.fd.size,
-        };
-        f.bank = try bank_mod.SDKBank.init(a, &f.owner);
-        errdefer f.bank.deinit();
-        f.stream = try Stream.init(a, &f.bank, opts);
+        try f.side.init(a, geom, f.bytes);
+        errdefer f.side.deinit();
+        f.stream = try Stream.init(a, &f.side.bank, opts);
     }
 
     fn deinit(f: *HitFixture, a: std.mem.Allocator) void {
         f.stream.deinit();
-        f.bank.deinit();
-        f.fd.close();
-        f.tmp.cleanup();
+        f.side.deinit();
         a.free(f.bytes);
     }
 };
@@ -1041,7 +966,7 @@ const P7Call = struct {
 
 /// Every component row of `slot` (relative layer `rel`) holds expert `e`'s record bytes from the sidecar.
 fn p7ExpectRecord(f: *HitFixture, rel: u32, slot: u32, e: u16) !void {
-    const geom = f.owner.geometry;
+    const geom = f.side.owner.geometry;
     for (geom.segments, 0..) |seg, c| {
         const want = f.bytes[geom.recordOffset(rel + 1, e) + seg.offset ..][0..seg.length];
         const got = f.stream.slotRow(rel, slot, @enumFromInt(c))[0..seg.length];
@@ -2019,29 +1944,12 @@ test "mimo mtp lane: prefill -> first decode tick -> the verify's decode-phase w
     const bytes = try a.alloc(u8, geom.total_bytes);
     defer a.free(bytes);
     for (bytes, 0..) |*b, i| b.* = @truncate(i * 7);
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = bytes });
-    var dir_buf: [512]u8 = undefined;
-    var path_buf: [600]u8 = undefined;
-    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
-    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/experts.bin", .{dir}, 0);
-    const fd = try sdk_ext.expert.openUncached(path, null);
-    defer fd.close();
-    const owner: bank_mod.Bank = .{
-        .allocator = a,
-        .geometry = geom,
-        .digests = &.{},
-        .source_repository = "synthetic",
-        .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_fd = fd.fd,
-        .sidecar_file_size = fd.size,
-    };
-    var bank = try bank_mod.SDKBank.init(a, &owner);
-    defer bank.deinit();
+    var side: bank_mod.TestSidecar = undefined;
+    try side.init(a, geom, bytes);
+    defer side.deinit();
     {
         const rows = [_]u32{ 4, 4 };
-        const stream = try Stream.init(a, &bank, options(&rows, .host));
+        const stream = try Stream.init(a, &side.bank, options(&rows, .host));
         defer stream.deinit();
         var source = StreamSource.init(stream);
         const Wide = struct {

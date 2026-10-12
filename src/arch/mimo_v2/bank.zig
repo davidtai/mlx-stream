@@ -300,6 +300,44 @@ pub fn inspect(a: std.mem.Allocator, io: std.Io, dir: []const u8) !Geometry {
     return bank.geometry;
 }
 
+/// A synthetic pack's sidecar for the stream and source tests: `bytes` written to a temporary `experts.bin`, opened past
+/// the page cache, its owner `Bank` and the `SDKBank` over it. In place: the SDK bank keeps `&owner` (test code only).
+pub const TestSidecar = struct {
+    tmp: std.testing.TmpDir,
+    fd: sdk_ext.expert.UncachedFd,
+    owner: Bank,
+    bank: SDKBank,
+
+    pub fn init(f: *TestSidecar, a: std.mem.Allocator, geom: Geometry, bytes: []const u8) !void {
+        f.tmp = std.testing.tmpDir(.{});
+        errdefer f.tmp.cleanup();
+        try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "experts.bin", .data = bytes });
+        var dir_buf: [512]u8 = undefined;
+        var path_buf: [600]u8 = undefined;
+        const dir = dir_buf[0..try f.tmp.dir.realPath(std.testing.io, &dir_buf)];
+        const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/experts.bin", .{dir}, 0);
+        f.fd = try sdk_ext.expert.openUncached(path, null);
+        errdefer f.fd.close();
+        f.owner = .{
+            .allocator = a,
+            .geometry = geom,
+            .digests = &.{},
+            .source_repository = "synthetic",
+            .source_revision = "0000000000000000000000000000000000000000",
+            .sidecar_fd = f.fd.fd,
+            .sidecar_file_size = f.fd.size,
+        };
+        f.bank = try SDKBank.init(a, &f.owner);
+    }
+
+    /// After the streams over `bank` are gone.
+    pub fn deinit(f: *TestSidecar) void {
+        f.bank.deinit();
+        f.fd.close();
+        f.tmp.cleanup();
+    }
+};
+
 test "mimo sdk2 mxfp4 bank: MiMo geometry preserves U32 weights and U8 scales" {
     const g = try Geometry.init(4096, 2048, 256, 1, 47);
     try std.testing.expectEqual(@as(u64, 13_369_344), g.record_bytes);

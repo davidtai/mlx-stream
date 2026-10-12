@@ -29,11 +29,8 @@ pub const n_experts: u32 = 64;
 /// random FP4 words; the stream over it with `memory`'s slot rows (and the lookahead class when `lookahead`).
 pub const Fixture = struct {
     geom: bank_mod.Geometry,
-    tmp: std.testing.TmpDir,
     bytes: []u8,
-    fd: sdk_ext.expert.io.UncachedFd,
-    owner: bank_mod.Bank,
-    bank: bank_mod.SDKBank,
+    side: bank_mod.TestSidecar,
     stream: *stream_mod.Stream,
 
     pub fn init(f: *Fixture, a: std.mem.Allocator, hidden: u32, inter: u32, rows: []const u32, memory: stream_mod.SlotMemory, lookahead: bool) !void {
@@ -54,37 +51,17 @@ pub const Fixture = struct {
                 .U8 => @intCast(123 + next(&state) % 5),
             };
         };
-        f.tmp = std.testing.tmpDir(.{});
-        errdefer f.tmp.cleanup();
-        try f.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "experts.bin", .data = f.bytes });
-        var dir_buf: [512]u8 = undefined;
-        var path_buf: [600]u8 = undefined;
-        const dir = dir_buf[0..try f.tmp.dir.realPath(std.testing.io, &dir_buf)];
-        const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/experts.bin", .{dir}, 0);
-        f.fd = try sdk_ext.expert.openUncached(path, null);
-        errdefer f.fd.close();
-        f.owner = .{
-            .allocator = a,
-            .geometry = f.geom,
-            .digests = &.{},
-            .source_repository = "synthetic",
-            .source_revision = "0000000000000000000000000000000000000000",
-            .sidecar_fd = f.fd.fd,
-            .sidecar_file_size = f.fd.size,
-        };
-        f.bank = try bank_mod.SDKBank.init(a, &f.owner);
-        errdefer f.bank.deinit();
+        try f.side.init(a, f.geom, f.bytes);
+        errdefer f.side.deinit();
         var opts = stream_mod.options(rows, memory);
         if (lookahead) opts.lookahead = stream_mod.lookahead;
         if (gated) opts.event = .{ .backend = .host, .watchdog_ms = 10_000 };
-        f.stream = try stream_mod.Stream.init(a, &f.bank, opts);
+        f.stream = try stream_mod.Stream.init(a, &f.side.bank, opts);
     }
 
     pub fn deinit(f: *Fixture, a: std.mem.Allocator) void {
         f.stream.deinit();
-        f.bank.deinit();
-        f.fd.close();
-        f.tmp.cleanup();
+        f.side.deinit();
         a.free(f.bytes);
     }
 

@@ -1261,28 +1261,11 @@ test "mimo read-ahead: the parity check on the first routed layer and 512 ticket
         const offset = geom.recordOffset(@intCast(layer + 1), @intCast(expert)) + seg.offset;
         for (bytes[offset..][0..seg.length], 0..) |*b, i| b.* = @truncate(layer * 131 + expert * 7 + component * 3 + i);
     };
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = bytes });
-    var dir_buf: [512]u8 = undefined;
-    var path_buf: [600]u8 = undefined;
-    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
-    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/experts.bin", .{dir}, 0);
-    const fd = try @import("../../sdk_ext.zig").expert.openUncached(path, null);
-    defer fd.close();
-    const owner: bank_mod.Bank = .{
-        .allocator = a,
-        .geometry = geom,
-        .digests = &.{},
-        .source_repository = "synthetic",
-        .source_revision = "0000000000000000000000000000000000000000",
-        .sidecar_fd = fd.fd,
-        .sidecar_file_size = fd.size,
-    };
-    var bank = try bank_mod.SDKBank.init(a, &owner);
-    defer bank.deinit();
+    var side: bank_mod.TestSidecar = undefined;
+    try side.init(a, geom, bytes);
+    defer side.deinit();
     const rows = [_]u32{ rows_at_fill, rows_at_fill };
-    const stream = try stream_mod.Stream.init(a, &bank, stream_mod.options(&rows, .host));
+    const stream = try stream_mod.Stream.init(a, &side.bank, stream_mod.options(&rows, .host));
     defer stream.deinit();
     var ss = stream_mod.StreamSource.init(stream);
     // The parity check: layer 1 (relative 0), two pool jobs, bit for bit; the layer is left as found.
