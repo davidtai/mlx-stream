@@ -33,7 +33,8 @@ The block's optional `settings` object takes `expert_prefill_rows` and `expert_r
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
 is installed when true; off, the serial control, by default: below), `decode_moe` (the decode lane's expert route:
 `hitpass`, the default, `fused` or `stock`; anything else refused by name), `decode_glue` (the decode lane's glue:
-`fused`, the default, or `ops`) and `logits_dump_dir` (below). Any other key refuses the load by name.
+`fused`, the default, or `ops`), `decode_kda` and `decode_dsa` (the decode lane's KDA layer and DSA attention: `fused`,
+the default, or `ops`) and `logits_dump_dir` (below). Any other key refuses the load by name.
 
 Residents: the text trunk loads (`model.language_model.layers.{0..44}.*`, `embed_tokens`, `norm`, `lm_head`: 1,178
 tensors, 17,842,673,276 B as MLX allocates them); the vision tower, the MTP layer (45) and the DSA layers' FP8 KV scales
@@ -82,6 +83,26 @@ once over the model's own tables (the compile check; it also fixes hcPre's threa
 squares in its own order and the router's product runs MLX gemv's order on the BF16 weight where the stock runs gemv_t
 on the F32 copy; the top-8 tail and the combine are the stock expressions. The routes line names it (`decode_glue=`).
 
+## The decode KDA layer and DSA attention
+
+`decode_kda` (`kda_decode.zig`): `fused` (the default) runs each KDA layer of the decode lane (one row, or a served step
+of the MTP lane; the MTP verify's capture keeps the op chain) as one text, the host's oMLX KDA decode kernel
+(`src/kernels/kda_decode.metal` at glm5next/host a8f6c6b8; oMLX 0.7.0, Apache-2.0) in its BF16-gate variant: the short
+conv and SiLU, the gate's second stages over the BF16 f_b / g_b rows, the q/k L2 norms, the gate and beta, the
+vector-gated delta rule over the f32 state and the gated RMSNorm, one 1,024-thread threadgroup per head. The projections
+stay GEMVs outside the text (the weight format's seam), and the text keeps the module's state layout (the f32 conv tail,
+the f32 recurrent state), so the prompt pass's op chain and the decode text hand the state over unchanged. `ops` is the
+op chain (the control); rounding-class against it. Logs `glm5_next decode KDA installed: one text a layer (...)`.
+
+`decode_dsa` (`dsa_decode.zig`): `fused` (the default) runs the decode lane's sparse latent attention (the selected 2,048
+pooled tokens and the partial pool's tail) as two texts: a split text in MiMo's dec_attn pattern for MLA (each of 16
+slices of the selection keeps an online softmax in exp2 units over its gathered latent rows, a simdgroup per head, eight
+heads per threadgroup) and MiMo's `dec_attn_merge.metal` unchanged, where the op chain runs about fifteen dispatches.
+f32 throughout: rounding-class against the op chain (bf16 scores and probabilities there). The MTP lane's head takes the
+same route. Logs `glm5_next decode DSA installed: the sparse latent attention in two texts (...)`. Each install refuses
+another geometry by name and launches its texts once at construction (the compile check); the routes line names both
+(`decode_kda=`, `decode_dsa=`).
+
 ## The prompt pass
 
 Calls of at most 16,384 rows, layer by layer. Per routed layer, P1 posts the predicted seed (the layer's router on its
@@ -118,7 +139,9 @@ the billed context at construction), `kda_state`, `mlx_cache`, `mlx_cache_oversh
 `host_runtime`, the wiring terms, `request` (the prompt wave / the decode wave)) and the source's (`slot_transient`,
 `slot_rounding`, `reader_staging`, `source_metadata`, `expert_workspace`, the event and speculation runtimes, the
 predictor's, `decode_kernels` (the fused decode route's set and prepared launches, declared 16 MiB under `fused` and
-`hitpass`; 0 on `stock`), `glue_kernels` (the fused glue's texts, declared 8 MiB; 0 under `ops`), `slot_wiring`). `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
+`hitpass`; 0 on `stock`), `glue_kernels` (the fused glue's texts, declared 8 MiB; 0 under `ops`), `kda_kernels` (the KDA
+decode text, declared 4 MiB), `dsa_kernels` (the DSA decode texts, declared 4 MiB, and the split's partials at four rows,
+8,421,376 B), `slot_wiring`). `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
 
     GLM5_BANK=<pack> GLM5_BILL_BASELINES_GB=10.6,12.0,12.6,13.0 MLX_DEFAULT_DEVICE=cpu \
       zig build mlx-stream-test -Dtest-filter="the bill tool prints every term" -j4
