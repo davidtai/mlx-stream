@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
-pub const manifest_sha256 = "bb5ae4cdc3a876a49638fcac38119f8e01771e1096007c8ad81100261815f604";
+pub const manifest_sha256 = "51bedd3cce4aa4b487b5db32c38d0e62bde3dc3abbb8309af8aa656d1f4d6612";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
 const dir = "kernels/glm53_exl3/";
 
@@ -413,9 +413,9 @@ test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel 
     try testing.expectEqual(Family.prompt, reg.get(.glm53_pf_down).family);
     try testing.expect(reg.get(.glm53_dec_gu).per_k and !reg.get(.glm53_dec_prep).per_k);
     // the down stage binds the slot table and every bank kind's five arrays: 20 inputs; the decode GEMVs group a slot's
-    // members (MAXM), two output tiles over eight simdgroups (gu) and a 128-block over sixteen (down) a threadgroup
+    // members (MAXM), two output tiles over eight simdgroups (gu) and a 128-block over 32 (down) a threadgroup
     try testing.expectEqual(@as(usize, 20), reg.get(.glm53_dec_down).inputs.len);
-    for ([_]Kernel{ .glm53_dec_gu, .glm53_dec_down }, [_]u32{ 256, 512 }) |k, tg| {
+    for ([_]Kernel{ .glm53_dec_gu, .glm53_dec_down }, [_]u32{ 256, 1024 }) |k, tg| {
         try testing.expectEqual([3]u32{ tg, 1, 1 }, reg.get(k).threadgroup);
         try testing.expectEqualStrings("MAXM", reg.get(k).template[3]);
     }
@@ -455,7 +455,7 @@ test "glm53 exl3 kernels: a tampered text or header, another pin, another bank o
         .{ .needle = "\"name\":\"glm53_pf_mid\"", .repl = "\"name\":\"glm53_pf_mid2\"", .err = error.UnknownKernel, .names = "glm53_pf_mid2" },
         .{ .needle = "\"name\":\"glm53_pf_mid\"", .repl = "\"name\":\"glm53_pf_gu\"", .err = error.DuplicateKernel, .names = "glm53_pf_gu listed twice" },
         .{ .needle = "\"format\":\"mlx-stream-glm53-exl3-kernels-v1\"", .repl = "\"format\":\"mlx-stream-glm53-exl3-kernels-v2\"", .err = error.ManifestFormat, .names = "v2" },
-        .{ .needle = "\"threadgroup\":[512,1,1]", .repl = "\"threadgroup\":[2048,1,1]", .err = error.SchemaInvalid, .names = "threadgroup 2048x1x1" },
+        .{ .needle = "\"threadgroup\":[1024,1,1]", .repl = "\"threadgroup\":[2048,1,1]", .err = error.SchemaInvalid, .names = "threadgroup 2048x1x1" },
     }) |c| {
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, embedded.manifest, c.needle));
         const m = try std.mem.replaceOwned(u8, a, embedded.manifest, c.needle, c.repl);

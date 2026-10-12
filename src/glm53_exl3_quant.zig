@@ -901,15 +901,7 @@ fn nbytesOf(x: mlx.mlx_array) u64 {
 
 /// GLM53_EXL3_DEC4's experiments on these texts' decode chain: one text each, one needle replaced.
 const DecExp = struct { name: []const u8, kernel: xk.Kernel, subs: []const [2][]const u8 = &.{}, members: u32 = routes.max_members, all: bool = false };
-const half_mid = [_][2][]const u8{
-    .{ "    threadgroup float mid[uint(MAXM) * 4u * uint(MINI)];", "    threadgroup half mid[uint(MAXM) * 4u * uint(MINI)];" },
-    .{ "        threadgroup float* mb = mid + (jm * 4u + r) * uint(MINI) + ib * 128u + g53_lane_slot(lane);", "        threadgroup half* mb = mid + (jm * 4u + r) * uint(MINI) + ib * 128u + g53_lane_slot(lane);" },
-    .{ "if (live[j]) g53_fma8(acc[j], reinterpret_cast<const threadgroup float4*>(mid + (j * 4u + r) * uint(MINI))[tk * 4u + (lane & 3u)], w8);", "if (live[j]) g53_fma8(acc[j], float4(reinterpret_cast<const threadgroup half4*>(mid + (j * 4u + r) * uint(MINI))[tk * 4u + (lane & 3u)]), w8);" },
-};
 const dec_exps = [_]DecExp{
-    .{ .name = "one member a slot (no grouping)", .kernel = .glm53_dec_gu, .members = 1, .all = true },
-    .{ .name = "down: the middles f16 in threadgroup memory", .kernel = .glm53_dec_down, .subs = &half_mid, .all = true },
-    .{ .name = "one member a slot, down: the middles f16", .kernel = .glm53_dec_down, .subs = &half_mid, .members = 1, .all = true },
     .{ .name = "gu: nothing (returns)", .kernel = .glm53_dec_gu, .subs = &.{.{ "    if (packed == 0xffffffffu) return;", "    if (true) return;" }} },
     .{ .name = "down: nothing (returns)", .kernel = .glm53_dec_down, .subs = &.{.{ "    if (n_live == 0u) return;", "    if (true) return;" }} },
 };

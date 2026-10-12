@@ -27,8 +27,10 @@ pub const Bank = struct { gate: Proj, up: Proj, down: Proj };
 pub const max_pairs = 48;
 pub const max_rows = 6;
 pub const top_k = 8;
-/// A decode slot's members (pairs sharing its weight decode): more spill the GEMV's accumulators.
-pub const max_members = 2;
+/// A decode slot's members (pairs sharing its weight decode; the GEMVs' MAXM): one. A second member's accumulators cost
+/// the GEMVs more in occupancy than the shared reads save (the L2 serves a slot's repeats): DEC4 at M=4, distinct both
+/// 0.533 ms at two against 0.418 at one, real both 0.566 against 0.523, hot both 0.392 against 0.434.
+pub const max_members = 1;
 /// The combine's sources per launch (more chain through its accumulator).
 pub const combine_sources = 16;
 /// The prompt wave table: at most 16 experts.
