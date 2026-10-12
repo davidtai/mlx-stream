@@ -481,8 +481,12 @@ pub const Lane = struct {
     untracked_logged: bool = false,
     /// The request's counters (MiMo's: rounds, drafted, accepted, generated, corrected; the stream's at the decode start).
     stats: mimo_draft.Stats = .{},
-    /// MLX's active bytes the open added (the head's tables and views, the bank, the lanes), measured once: the module
-    /// holds them to the bill's terms.
+    /// What the open holds, from its own arrays (`heldOf`: the bank's nine, the head's three f32 tables, the two lanes,
+    /// each at MLX's allocation size): the module holds it to the bill's terms, which `heldBytes` derives from the same
+    /// shapes (`holdCheck`).
+    held_bytes: u64 = 0,
+    /// MLX's active bytes the open added, measured once (reported: it also counts what MLX keeps beside the arrays, such
+    /// as the scalars a fill reads, and buffers its cache hands back larger than asked).
     measured_bytes: u64 = 0,
 
     /// The lane over the pack at `dir`: the draft bank (refused by name when absent), the head bound from `map` (the
@@ -525,6 +529,10 @@ pub const Lane = struct {
         var active1: usize = 0;
         _ = mlx.mlx_get_active_memory(&active1);
         self.measured_bytes = active1 -| active0;
+        var held: [bank.n_components + 5]u64 = undefined;
+        for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        self.held_bytes = heldOf(&held, std.heap.pageSize());
         log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, max_depth, verify_rows, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
         return self;
     }
@@ -699,6 +707,24 @@ pub const Lane = struct {
         return self.stats.line(buf, lane_name, now);
     }
 };
+
+/// Bytes held by arrays of `nbytes` each, at MLX's allocation size (`graph.bufferBytes`: page-rounded past a page).
+pub fn heldOf(nbytes: []const u64, page: u64) u64 {
+    var n: u64 = 0;
+    for (nbytes) |b| n += graph.bufferBytes(b, page);
+    return n;
+}
+
+/// What the lane's open holds at `positions` billed positions, from the draft bank's geometry and the model: the bill's
+/// `mtp_bank + mtp_tables + mtp_kv`. The open's `held_bytes` (its arrays) equals it by construction: the same shapes.
+pub fn heldBytes(g: *const bank.Geometry, c: *const glm.Config, positions: u64, page: u64) u64 {
+    return DraftBank.arrayBytes(g, page) + Head.tableBytes(c, page) + kvBytes(c, positions, page);
+}
+
+/// The module's construction check: what the open holds, at most what the bill holds for it.
+pub fn holdCheck(held: u64, billed: u64) error{ConstructionOverBill}!void {
+    if (held > billed) return error.ConstructionOverBill;
+}
 
 // ── the bill's terms ──
 

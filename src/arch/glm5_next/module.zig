@@ -92,11 +92,11 @@ pub const Module = struct {
             const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), routes, &diag);
             errdefer lane.deinit(&self.g);
             const term = termBytes(plan.bill, "mtp_bank") + termBytes(plan.bill, "mtp_tables") + termBytes(plan.bill, "mtp_kv");
-            log.info("glm5_next MTP lane: {d} B measured at its open, {d} B billed (mtp_bank + mtp_tables + mtp_kv), residual {d} B\n", .{ lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.measured_bytes)) });
-            if (lane.measured_bytes > term) {
-                log.err("glm5_next: load refused: the MTP lane holds {d} B, over its billed {d} B (ConstructionOverBill)\n", .{ lane.measured_bytes, term });
-                return error.ConstructionOverBill;
-            }
+            log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv), residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
+            mtp.holdCheck(lane.held_bytes, term) catch |e| {
+                log.err("glm5_next: load refused: the MTP lane holds {d} B, over its billed {d} B (ConstructionOverBill)\n", .{ lane.held_bytes, term });
+                return e;
+            };
             self.history = try gpa.alloc(u32, plan.reserve + mtp.verify_rows);
             self.mtp = lane;
         }
