@@ -36,14 +36,10 @@ def banks(prefix, dtype):
 
 
 KERNELS = [
-    {"name": "glm53_dec_prep", "family": "decode", "headers": ["dig2"] + DEC, "threadgroup": [32, 1, 1],
-     "template": ["HID", "MINI", "DEV", "TOPK"], "k": False,
-     "inputs": [arg("x", "bfloat16"), arg("pt", "uint32"), arg("sc", "float32")] + banks("rg", "float16") + banks("ru", "float16"),
-     "outputs": [arg("ug", "float16"), arg("uu", "float16")]},
     {"name": "glm53_dec_gu", "family": "decode", "headers": DEC, "threadgroup": [256, 1, 1],
-     "template": ["K", "HID", "MINI", "MAXM", "DEV"], "k": True,
-     "inputs": [arg("ug", "float16"), arg("uu", "float16"), arg("gt", "uint32"), arg("pt", "uint32"), arg("sc", "float32")]
-     + banks("cg", "uint16") + banks("cu", "uint16"),
+     "template": ["K", "HID", "MINI", "MAXM", "DEV", "TOPK"], "k": True,
+     "inputs": [arg("x", "bfloat16"), arg("gt", "uint32"), arg("pt", "uint32"), arg("sc", "float32")]
+     + banks("rg", "float16") + banks("ru", "float16") + banks("cg", "uint16") + banks("cu", "uint16"),
      "outputs": [arg("zg", "float32"), arg("zu", "float32")]},
     {"name": "glm53_dec_down", "family": "decode", "headers": ["dig2"] + DEC, "threadgroup": [512, 1, 1],
      "template": ["K", "HID", "MINI", "MAXM", "DEV", "T"], "k": True,

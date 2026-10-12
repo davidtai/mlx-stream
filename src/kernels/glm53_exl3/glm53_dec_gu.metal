@@ -1,17 +1,19 @@
 
-    // GLM-5.3 EXL3 decode, stage 2: the gate and up GEMVs of every mini of a wave's slots. A threadgroup per (TPG
-    // adjacent output tiles, slot x mini, projection; at K3 four, a k-row's 4 x 96 B whole 128-byte lines, else two): its
-    // eight simdgroups split the k-tiles (simdgroup s every eighth from s; the tiles' words of a k-tile load before any
-    // decodes, the input once for them), decoding each weight once for the slot's members
-    // (the wave's pairs routed to it: up to MAXM rows), then the threadgroup sums the eight partial columns.
-    // gt: per slot (packed bank << 24 | row, members, member pairs); DEV: the call's routed positions are the slots, gt
-    // their packed slots (one member each). A member skips at score 0 (its routed position from pt), a slot at
+    // GLM-5.3 EXL3 decode, stage 1: the gate and up GEMVs of every mini of a wave's slots. A threadgroup per (two
+    // adjacent output tiles, slot x mini, projection): its eight simdgroups first make each member's input for the mini
+    // and projection, t128(x[row] * rin) as f16 in GEMV lane order (DeepSeek-V4.1's dig2_round), into threadgroup memory;
+    // then split the k-tiles (simdgroup s every eighth from s; both tiles' words of a k-tile load before either decodes),
+    // decoding each weight once for the slot's members (the wave's pairs routed to it: up to MAXM rows); then the
+    // threadgroup sums the eight partial columns. gt: per slot (packed bank << 24 | row, members, member pairs); pt: per
+    // pair (x row, slot, routed position, 0); DEV: the call's routed positions are the slots, gt their packed slots (one
+    // member each, its x row position / TOPK). A member skips at score 0 (its routed position from pt), a slot at
     // 0xFFFFFFFF: a slot without a live member reads nothing. z[pair][mini] = W^T u[pair][mini], f32.
     constexpr uint IT = uint(HID) / 16u;
     constexpr uint OT = uint(MINI) / 16u;
     constexpr uint NW = 8u * uint(K);
     constexpr uint SGS = 8u;
-    constexpr uint TPG = K == 3 ? 4u : 2u;
+    constexpr uint TPG = 2u;
+    threadgroup half xs[uint(MAXM) * uint(HID)];
     threadgroup float part[SGS * uint(MAXM) * TPG * 16u];
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
@@ -37,12 +39,30 @@
     if (n_live == 0u) return;
     const uint bank = packed >> 24u;
     const size_t mrow = size_t(packed & 0xffffffu) * 4u + r;
+    const device half* rin = proj == 0u ? (bank == 0u ? rg0 : (bank == 1u ? rg1 : rg2)) : (bank == 0u ? ru0 : (bank == 1u ? ru1 : ru2));
+    for (uint j = 0u; j < uint(MAXM); ++j) {
+        if (!live[j]) continue;
+        const uint tok = DEV ? mem[j] / uint(TOPK) : pt[4u * mem[j]];
+        const size_t xb = size_t(tok) * uint(HID);
+        const size_t rb = mrow * uint(HID);
+        for (uint b = sg; b < uint(HID) / 128u; b += SGS) {
+            const uint c0 = b * 128u + lane;
+            float4 v;
+            for (uint q = 0u; q < 4u; ++q) v[q] = float(x[xb + c0 + 32u * q]) * float(rin[rb + c0 + 32u * q]);
+            v = g53_fwht128(v, ushort(lane)) * G53_HSC;
+            threadgroup half* o = xs + j * uint(HID) + b * 128u + g53_lane_slot(lane);
+            o[0] = half(v.x);
+            o[32] = half(v.y);
+            o[64] = half(v.z);
+            o[96] = half(v.w);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const device ushort* code = proj == 0u ? (bank == 0u ? cg0 : (bank == 1u ? cg1 : cg2)) : (bank == 0u ? cu0 : (bank == 1u ? cu1 : cu2));
     const device uint* tw = reinterpret_cast<const device uint*>(code) + (mrow * (IT * OT) + tn0) * NW;
-    const device half* xin = proj == 0u ? ug : uu;
-    const device half4* xm[MAXM];
+    const threadgroup half4* xm[MAXM];
     for (uint j = 0u; j < uint(MAXM); ++j) {
-        xm[j] = reinterpret_cast<const device half4*>(xin + (size_t(mem[j]) * 4u + r) * uint(HID)) + (lane & 3u);
+        xm[j] = reinterpret_cast<const threadgroup half4*>(xs + j * uint(HID)) + (lane & 3u);
     }
     float acc[MAXM][TPG][8];
     for (uint j = 0u; j < uint(MAXM); ++j) {

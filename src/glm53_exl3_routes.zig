@@ -3,11 +3,11 @@
 //! the first such call) and launches one stage chain per call; every array it returns is new (the caller frees it), the
 //! intermediates are freed here once launched (the pending graph keeps them).
 //!   - Decode, per wave of a routed layer's pairs over one bank layer (its three bank kinds through packed slots, bank
-//!     << 24 | row): prep (each pair's gate and up inputs per mini, f16, lane order), gu (the GEMVs per distinct slot,
-//!     two output tiles a threadgroup, the k-tiles split among its simdgroups, each weight decoded once for the slot's
-//!     member pairs), down (per distinct slot and 128-block of the output: its members' SwiGLU middles, the down GEMV,
-//!     each weight decoded once for them, each output block rotated, scaled by its mini's rout, the minis summed, times
-//!     the pair's score: f32 per pair); per call, combine (each row's pairs in routed order: x's dtype).
+//!     << 24 | row): gu (the GEMVs per distinct slot, two output tiles a threadgroup, each member's input per mini made
+//!     in the threadgroup (f16, lane order), the k-tiles split among its simdgroups, each weight decoded once for the
+//!     slot's member pairs), down (per distinct slot and 128-block of the output: its members' SwiGLU middles, the down
+//!     GEMV, each weight decoded once for them, each output block rotated, scaled by its mini's rout, the minis summed,
+//!     times the pair's score: f32 or bf16 per pair); per call, combine (each row's pairs in routed order: x's dtype).
 //!   - Prompt, per wave of a call's rows grouped by expert (one bank kind): the gate and up GEMMs over the rows' x in
 //!     f16 (128-row M tiles, the trellis decoded per stage, rotated along k and scaled by rin: the input prepare in the
 //!     weights), the middle, the down GEMM (the minis summed in its epilogue): bf16 per row in the wave's order.
@@ -44,10 +44,6 @@ pub fn tilesDown(hidden: u32) u32 {
     return hidden / 128;
 }
 pub const bm_gate_up = 128;
-/// Output tiles a decode gu threadgroup takes: at K3 four (a k-row's 4 x 96 B are whole 128-byte lines), else two.
-pub fn guTiles(k: u32) u32 {
-    return if (k == 3) 4 else 2;
-}
 pub const bm_down = 64;
 
 fn free(xs: []const mlx.mlx_array) void {
@@ -99,8 +95,6 @@ pub const Decode = struct {
     maxm: u32 = max_members,
     /// the down's members when they differ from the gu's (the bench's; its own slot table, `waveSplit`)
     maxm_down: ?u32 = null,
-    /// per mode (host tables, device slots), indexed by pairs
-    prep: [2]Plans(max_pairs) = .{ .{}, .{} },
     /// the host mode's GEMVs: their grids count the slots, their outputs the pairs; the down's per output dtype (f32,
     /// bf16)
     gu: [max_pairs]Plans(max_pairs) = @splat(.{}),
@@ -113,7 +107,6 @@ pub const Decode = struct {
     }
 
     pub fn deinit(self: *Decode) void {
-        for (&self.prep) |*p| p.deinit();
         for (&self.gu) |*p| p.deinit();
         for (&self.down) |*pp| for (pp) |*p| p.deinit();
         self.gu_dev.deinit();
@@ -148,26 +141,17 @@ pub const Decode = struct {
         const mi: u32 = self.inst.mini;
         const np: c_int = @intCast(n_pairs);
         const di = @intFromBool(dev);
-        var u: [2]mlx.mlx_array = .{ .{}, .{} };
         var z: [2]mlx.mlx_array = .{ .{}, .{} };
-        defer free(&u);
         defer free(&z);
-        {
-            const e = reg.get(.glm53_dec_prep);
-            const sh = [_]c_int{np * 4 * @as(c_int, @intCast(h))};
-            var cfg = cfgOf(e, self.inst, .{ 32 * h / 128, @intCast(n_pairs * 4), 2 }, &.{ .{ &sh, .float16 }, .{ &sh, .float16 } });
-            setInt(&cfg, e, "DEV", di);
-            const p = try self.prep[di].get(self.b, .glm53_dec_prep, n_pairs, &cfg);
-            try self.b.applyPrepared(p, &.{ x, pt, sc, banks[0].gate.suh, banks[1].gate.suh, banks[2].gate.suh, banks[0].up.suh, banks[1].up.suh, banks[2].up.suh }, &u);
-        }
         {
             const e = reg.get(.glm53_dec_gu);
             const sh = [_]c_int{np * 4 * @as(c_int, @intCast(mi))};
-            var cfg = cfgOf(e, self.inst, .{ e.threadgroup[0] * (mi / 16 / guTiles(self.inst.k)), @intCast(n_slots * 4), 2 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
+            // two output tiles a threadgroup
+            var cfg = cfgOf(e, self.inst, .{ e.threadgroup[0] * (mi / 32), @intCast(n_slots * 4), 2 }, &.{ .{ &sh, .float32 }, .{ &sh, .float32 } });
             setInt(&cfg, e, "DEV", di);
             setInt(&cfg, e, "MAXM", @intCast(self.maxm));
             const p = if (dev) try self.gu_dev.get(self.b, .glm53_dec_gu, n_pairs, &cfg) else try self.gu[n_pairs - 1].get(self.b, .glm53_dec_gu, n_slots, &cfg);
-            try self.b.applyPrepared(p, &.{ u[0], u[1], gt, pt, sc, banks[0].gate.trellis, banks[1].gate.trellis, banks[2].gate.trellis, banks[0].up.trellis, banks[1].up.trellis, banks[2].up.trellis }, &z);
+            try self.b.applyPrepared(p, &.{ x, gt, pt, sc, banks[0].gate.suh, banks[1].gate.suh, banks[2].gate.suh, banks[0].up.suh, banks[1].up.suh, banks[2].up.suh, banks[0].gate.trellis, banks[1].gate.trellis, banks[2].gate.trellis, banks[0].up.trellis, banks[1].up.trellis, banks[2].up.trellis }, &z);
         }
         const e = reg.get(.glm53_dec_down);
         const sh = [_]c_int{ np, @intCast(h) };

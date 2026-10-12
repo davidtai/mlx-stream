@@ -3,8 +3,9 @@
 //! a mini's intermediate 512, four minis per expert, K 3 and 4, the mcg codebook, SwiGLU unclamped, top-8).
 //!   - Decode: the decode lane's fused waves run these texts' GEMVs (`fused`; sushi's decode chain, the sushi binding
 //!     composed, is the tests' parity reference). Per wave over one bank layer, the three bank kinds in one launch per
-//!     stage (`decodeWave`: the inputs per mini, the gate and up GEMVs per distinct slot, the down per distinct slot with
-//!     its members' SwiGLU middles, the minis' sum and each pair's score fused in; each weight decoded once a slot); per
+//!     stage (`decodeWave`: the gate and up GEMVs per distinct slot, each member's input per mini made in the
+//!     threadgroup; the down per distinct slot with its members' SwiGLU middles, the minis' sum and each pair's score
+//!     fused in; each weight decoded once a slot entry); per
 //!     call, every row's pairs summed in routed order (`decodeCombine`); a device wave (`decodeWaveDevice`) takes the
 //!     routed positions' slots as a device array: a position of slot 0xFFFFFFFF or score 0 reads no weight and gives
 //!     zero, and `decodeCombineDevice` sums every position. Nothing syncs with the host.

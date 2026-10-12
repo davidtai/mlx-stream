@@ -1,5 +1,5 @@
 
-    // GLM-5.3 EXL3 decode, stage 3, per (128-block of the output, slot): the SwiGLU middle of each member pair's four
+    // GLM-5.3 EXL3 decode, stage 2, per (128-block of the output, slot): the SwiGLU middle of each member pair's four
     // minis (t128(t128(zg) rout_g * scale) and t128(zu) rout_u * scale, silu(g) u, t128(h rin_d) * scale), the down GEMV
     // of each mini over those middles (each weight decoded once for the slot's members), and each member's output block
     // sum_r t128(zd_r) * scale * rout_d[r] times its score, f32. Sixteen simdgroups: the middles' MAXM x 4 x MINI/128

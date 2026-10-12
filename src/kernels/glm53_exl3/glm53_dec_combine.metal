@@ -1,5 +1,5 @@
 
-    // GLM-5.3 EXL3 decode, stage 4: each row's routed pairs summed in routed order (their scores applied by stage 3),
+    // GLM-5.3 EXL3 decode, stage 3: each row's routed pairs summed in routed order (their scores applied by stage 2),
     // f32, written as T. ct: per (row, routed j) the pair's source wave << 24 | its row in that wave's output, or
     // 0xFFFFFFFF where an earlier combine of the chain summed it (into acc, when ACC). One thread per 4 hidden values.
     const uint t = thread_position_in_grid.y;

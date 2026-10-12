@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
-pub const manifest_sha256 = "d669b8bb6f4b49c1c3ba49bf5da33aaaa20f1d57b1b585f74e9fa1cb7ed383a3";
+pub const manifest_sha256 = "14eb6dab08cdb5e078cca4c660e9b20d42e56096eaa4cb48574bbf751d811028";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
 const dir = "kernels/glm53_exl3/";
 
@@ -28,7 +28,6 @@ pub const tp_ranks: u32 = 4;
 
 /// Every kernel of the registry; the tag is the kernel's MLX name and its file name.
 pub const Kernel = enum {
-    glm53_dec_prep,
     glm53_dec_gu,
     glm53_dec_down,
     glm53_dec_combine,
@@ -392,7 +391,7 @@ fn initOrPrint(texts: *const Texts, pin: []const u8) !Registry {
 test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel is registered at GLM-5.3's dims and the fixture's, both Ks" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
-    try testing.expectEqual(@as(usize, 7), n_kernels);
+    try testing.expectEqual(@as(usize, 6), n_kernels);
     try testing.expectEqual(@as(u32, 6144), reg.dims[0].hidden);
     try testing.expectEqual(@as(u32, 512), reg.dims[0].mini);
     for (reg.entries, 0..) |e, i| {
@@ -411,7 +410,9 @@ test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel 
     try testing.expectEqualSlices(Header, &.{.dig2}, reg.get(.glm53_pf_mid).headers);
     try testing.expect(std.mem.indexOf(u8, reg.get(.glm53_pf_gu).header_text, "g53_mcg2") != null and std.mem.indexOf(u8, reg.get(.glm53_pf_gu).header_text, "tile_matmad_nax") != null);
     try testing.expectEqual(Family.prompt, reg.get(.glm53_pf_down).family);
-    try testing.expect(reg.get(.glm53_dec_gu).per_k and !reg.get(.glm53_dec_prep).per_k);
+    try testing.expect(reg.get(.glm53_dec_gu).per_k and !reg.get(.glm53_dec_combine).per_k);
+    // the gu makes its members' inputs (x, the bank kinds' rin) in each threadgroup: 16 inputs
+    try testing.expectEqual(@as(usize, 16), reg.get(.glm53_dec_gu).inputs.len);
     // the down stage binds the slot table and every bank kind's five arrays: 20 inputs; the decode GEMVs group a slot's
     // members (MAXM), output tiles over eight simdgroups (gu) and a 128-block over sixteen (down) a threadgroup
     try testing.expectEqual(@as(usize, 20), reg.get(.glm53_dec_down).inputs.len);
