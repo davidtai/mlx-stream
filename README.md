@@ -277,7 +277,7 @@ builds.
 
 ![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on 746e7da9, with b00df80e from 32K to 256K](docs/img/mimo-ladder.png)
 
-[![1K–1M sweep summary: decode, decode gain, prefill, TTFT and memory peaks, 746e7da9 against b00df80e](docs/benchmarks/mimo-v26-flash/summary.png)](docs/benchmarks/mimo-v26-flash/README.md)
+[![1K–1M sweep summary on 746e7da9: decode, prefill, TTFT, memory peaks and completion tokens](docs/benchmarks/mimo-v26-flash/summary.png)](docs/benchmarks/mimo-v26-flash/README.md)
 
 HumanEval (164 problems, one sample each, pass@1, cap 16,384 tokens, thinking on, rows 127 / 145): greedy 155 / 164
 = 0.9451, card 157 / 164 = 0.9573; every failure is a wrong answer (none truncated, looped, without code or errored).
