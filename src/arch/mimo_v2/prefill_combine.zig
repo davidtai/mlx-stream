@@ -474,6 +474,7 @@ test "mimo prefill combine text: the stock reduction's fold, stated in the text 
 }
 
 test "mimo prefill combine CPU: the fused text's host reference is bit-equal to the stock gather + reduction route at real shapes" {
+    try @import("mtp.zig").requireWindow();
     const a = testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);

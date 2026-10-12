@@ -2853,6 +2853,7 @@ fn checkNaxLongKeys(a: std.mem.Allocator, s: Stream, kernel: *const prefill_atte
 }
 
 test "mimo ring CPU: 2K prompt + 256 decode hands every layer the retired compaction's exact K/V views" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -3307,6 +3308,7 @@ test "mimo GPU32K decode attention: BF16 ring and global slab views equal the ea
 }
 
 test "mimo kv history CPU: BF16 ring and global slab views equal the eager history through decode, rollback and wraps" {
+    try @import("mtp.zig").requireWindow();
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     try checkKvHistory(std.testing.allocator, s, 1_024, 2_048, &.{ .{ .pos = 1_300, .rows = 1 }, .{ .pos = 1_300, .rows = 4 }, .{ .pos = 2_047, .rows = 1 }, .{ .pos = 2_047, .rows = 4 } });
@@ -3645,6 +3647,7 @@ test "mimo install log: the residents' storage is named apart from the streamed 
 // MLX CPU stream (the gates' MLX_DEFAULT_DEVICE=cpu): no kernel is applied; the route is installed and inspected. The
 // shape refusals are exercised on `installFp8` (QLinear.load's `weight` logs a refusal at error level first).
 test "mimo fp8res route: QLinear.load binds forwardFp8 for FP8 storage, keeps the stock route for BF16 / affine; a wrong scale grid, BF16 bytes under an FP8 declaration and a missing route refuse by name" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     var weights = host.Weights.init(a);
     defer weights.deinit();
@@ -3704,6 +3707,7 @@ fn attn2Random(a: std.mem.Allocator, shape: []const c_int, seed: u32, amp: f32) 
 // MLX CPU stream: the one-eval predictor's counts (whole call and tail) equal the control's per-tile predictor's on a
 // synthetic routed layer over three full router tiles and a 37-row tail tile.
 test "mimo prefill predict evals CPU: the one-eval predictor counts equal the per-tile predictor's" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);

@@ -1125,6 +1125,7 @@ fn joinProbeCase(a: std.mem.Allocator, g: *ops.MlxOps, name: []const u8, nt: u32
 }
 
 test "mimo join CPU: joinless gather + combine is bit-equal to the joined control" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -1175,6 +1176,7 @@ test "mimo join CPU: joinless gather + combine is bit-equal to the joined contro
 }
 
 test "mimo join CPU: prefillParts tiles and positions rebuild prefill's rows exactly" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -1388,6 +1390,7 @@ fn bankViewCompare(a: std.mem.Allocator, g: *ops.MlxOps, full_math: *Math, windo
 const bank_view_path_names = [_][]const u8{ "rhs_bm32", "rhs_bm64", "qmv" };
 
 test "mimo prefill bank view CPU: windowed tiles are bit-equal to the full bank at real shapes (1 to 1,024 rows over 1-9 experts)" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -1470,6 +1473,7 @@ test "mimo bankview GPU: windowed sorted-GEMM tiles are byte-equal to the full b
 }
 
 test "mimo prefill drain CPU: pipelined projection and reduction tiles are bit-equal to the sync control" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -1608,6 +1612,7 @@ test "mimo prefill drain: the pipelined route bills one more projection tile and
 }
 
 test "mimo barrier predictor CPU: a verify's rows take the gathered GEMV within F32 rounding of the GEMM and with its top-8; M = 1 keeps the GEMM graph bit for bit" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);

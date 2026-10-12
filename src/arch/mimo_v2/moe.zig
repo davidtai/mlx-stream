@@ -1072,6 +1072,7 @@ test "mimo moe SiLU: the text's f32 SiLU (one rounding, then the bf16 multiply) 
     try testing.expectEqual(@as(f32, 0.005889892578125), siluMulRef(0.01171875, 1));
     const gt = bf16Round(0.01171875);
     try testing.expectEqual(@as(f32, 0.00592041015625), bf16Round(bf16Round(gt * bf16Round(sigmoidRef(gt))) * 1));
+    try @import("mtp.zig").requireWindow();
     // Against the arch's MLX graph on the CPU stream, over a spread of bf16 gates and ups: the reference must match
     // bit for bit wherever MLX's CPU exp agrees with libm's to the rounding (reported), and never be more than one
     // bf16 ulp away.
@@ -1112,6 +1113,7 @@ test "mimo moe SiLU: the text's f32 SiLU (one rounding, then the bf16 multiply) 
 }
 
 test "mimo moe combine: the text's fold is bit-equal to the arch's score-weighted sum (f32 inputs, router order)" {
+    try @import("mtp.zig").requireWindow();
     const a = testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);

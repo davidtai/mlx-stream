@@ -228,6 +228,7 @@ test "mimo attention rejection diagnostic accepts pinned 192 128 force fused rea
 // the real 64/4 heads and 192/128 widths, so the unfused CPU path returns the same bits. Offsets cross the 128-key
 // window boundary and the 512-row tile boundary; the first case is a cold prompt tile.
 test "mimo +mask CPU: causal mode equals the host array mask bit for bit across the window and tile boundaries" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const kv = @import("kv.zig");
     const s = mlx.mlx_default_cpu_stream_new();

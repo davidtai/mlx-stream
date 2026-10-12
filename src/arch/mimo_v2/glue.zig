@@ -951,6 +951,7 @@ test "mimo glue CPU: top-8 by rank equals MLX's stable block merge sort (ids in 
 }
 
 test "mimo glue CPU: the models compute the stock graph: residual add bit for bit, norms within 1 BF16 ulp, ids and weights of MLX CPU's route" {
+    try @import("mtp.zig").requireWindow();
     // MLX's CPU backend runs the stock ops with its own reduction orders (the GPU's are the models above), so only the
     // element-wise add is bitwise here; the rest within its rounding, on tie-free real-shaped fixtures.
     const module = @import("module.zig");

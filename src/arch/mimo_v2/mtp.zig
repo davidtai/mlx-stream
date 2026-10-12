@@ -807,6 +807,14 @@ pub fn requireMlxWindow() !void {
     if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.GpuLockRequired;
 }
 
+/// The gate of the tests that run MLX on the CPU stream: they construct the Metal device as well (MLX's
+/// `default_stream`, the CPU's included, counts the GPU devices, and every array buffer comes from the Metal
+/// allocator), so they run only inside a guarded window (`_GPU_WINDOW_LOCKED`) and skip in the CPU lane, whose
+/// no-device checks (deepseek_v41/parity.zig, expert/stream.zig) they would fail.
+pub fn requireWindow() !void {
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.SkipZigTest;
+}
+
 test "mimo mtp: the head's tensor table under the trunk's geometry (30 per head, 329,273,408 params)" {
     const c: mimo.Config = .{};
     // The table holds every storage's suffixes (fp8res added the FP8 block scales); a Q4 head stores 30 of them.

@@ -418,6 +418,7 @@ test "mimo decode attention CPU: window bound arithmetic at positions 127 128 12
 }
 
 test "mimo decode attention CPU: ring views carry head stride 656 x D and 16-byte rows at the named positions" {
+    try @import("mtp.zig").requireWindow();
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const c: mimo.Config = .{};

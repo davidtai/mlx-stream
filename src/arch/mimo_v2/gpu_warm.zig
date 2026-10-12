@@ -524,6 +524,7 @@ test "mimo gpu warm route: \"off\" / \"waits\" parse; anything else is invalid (
 }
 
 test "mimo gpu warm route: install refuses an invalid route and a CPU stream by name before any device work; off installs nothing" {
+    try @import("mtp.zig").requireWindow();
     const a = testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);

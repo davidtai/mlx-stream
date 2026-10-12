@@ -620,6 +620,7 @@ fn expectEagerView(a: std.mem.Allocator, view: DenseView, k: Array, v: Array, po
 }
 
 test "mimo ring CPU: serial wrap matches the eager window at 127 128 129 655 656 2175, sinks untouched, slots donated" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -705,6 +706,7 @@ test "mimo ring CPU: serial wrap matches the eager window at 127 128 129 655 656
 }
 
 test "mimo ring CPU: a view held across a step loses donation (the detector's negative control)" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);

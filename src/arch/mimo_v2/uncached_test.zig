@@ -60,6 +60,7 @@ test "mimo residents uncached: the page-cache proof's bound is DSV's 500 MB" {
 }
 
 test "mimo residents uncached: the nocache loader's arrays equal the cached loader's byte for byte, and leave the file uncached (MLX CPU)" {
+    try @import("mtp.zig").requireWindow();
     const a = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

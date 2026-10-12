@@ -486,6 +486,7 @@ fn hostBits(a: std.mem.Allocator, g: *ops.MlxOps, x: mlx.mlx_array) ![]u32 {
 }
 
 test "mimo verify lane CPU: the decode lane's M = 2, 3, 4 rows are bit-equal to M = 1 per row and to the stock gather_qmm per pair; the combine per row" {
+    try @import("mtp.zig").requireWindow();
     const a = testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);

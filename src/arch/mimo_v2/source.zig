@@ -790,6 +790,7 @@ fn p7ScratchPass(a: std.mem.Allocator, g: *ops.MlxOps, scratch: @import("setting
 }
 
 test "mimo p7 prefill scratch CPU: pooled is bit-equal to fresh (allocation only), the pool holds the freed tiles, the cache limit is restored" {
+    try @import("mtp.zig").requireWindow();
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
