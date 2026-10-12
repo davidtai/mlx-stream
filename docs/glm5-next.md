@@ -303,7 +303,7 @@ A request: the prompt pass hands the lane every row's final-normed hidden (`grap
 token the prompt gives appended to the head's lanes; a round (the host's `draft_lane.round`) drafts up to 3 tokens
 after t1, verifies [t1, drafts] in one decode-lane forward (`Head.verify`: every row's logits and hidden; each KDA
 layer's per-row states captured by the host's `capture_seq` recurrence), decides by the exact rule inside the verify's
-eval (greedy: the verify rows' argmax; sampled: exact speculative sampling), then rolls back to the kept rows (the DSA
+eval (greedy: the verify rows' argmax; sampled: sample-then-verify, every row's token the target's position-keyed draw, the serial step's), then rolls back to the kept rows (the DSA
 lanes truncated; on a partial accept every KDA state restored from the capture by a copy, no re-forward) and pends the
 kept rows' hidden. A round without drafts (the lane not tracking, the cap, the context) is a serial step. The request's
 receipt is MiMo's `[spec-stats]` line (rounds, accepted per round, misses and bytes per round).
@@ -322,6 +322,21 @@ Routes (construction time, `module.promptRoute` / `module.stepRoute`): off, the 
 (`.hidden`: the step's hidden pended while the lane follows the request, `Lane.keepsStep`, else the served forward) and
 the round (`Module.mtpRound`). The KDA capture is its own comptime instance (`kda.forwardCapture`), reached only from a
 verify.
+
+## One sampler
+
+Every token the plugin hands the host comes from one stream (`sdk_ext.sampler`, `sdk_ext.acceptance.drawAt`: splitmix64
+over the request's seed, the token's absolute position and the draw index). The host arms every clean request before
+its prompt pass (`draft_lane.arm`, blockSize 1 without a lane); the arch binds its sampler there, and for a sampled
+request the prompt's last row and each serial step's row reach the host as the one-hot of the plugin's draw. A lane's
+verify draws the same token at the same position (sample-then-verify), so a seeded request yields the same ids serial or
+drafted, on every mlx-stream arch at equal rows. Unarmed requests (logprobs, grammar, penalties, `--no-mtp`) keep the
+host's sampler; greedy requests keep their logits (the host's argmax). A bound request logs `mlx-stream sampler: request
+bound (the plugin draws every token) lane="<lane>" ...` once, at its prompt pass. By construction a lane-less module
+reports blockSize 1 (`/props`: block_size 1, mtp_loaded true) and its requests default to `enable_mtp`: that is how
+the host arms them; the decode stays serial (`arm` answers off). The path-identical serial control is `mtp_lane` off
+served WITHOUT `--no-mtp` (`--no-mtp` keeps the host's sampler). Open: the host's masked special tokens are not passed
+to the plugin's draw (a follow-up: the mask in `ArmRequest`).
 
 ## The profile build
 

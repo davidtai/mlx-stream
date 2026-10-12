@@ -20,6 +20,8 @@ pub const profile = @import("sdk_ext/profile.zig");
 pub const ops = @import("sdk_ext/ops.zig");
 /// The draft lanes' acceptance: the exact and typical rules, the sampled path, the seeded draws (every arch's lane).
 pub const acceptance = @import("sdk_ext/acceptance.zig");
+/// The serial sampler: the plugin's position-keyed token for every row it hands the host (one stream with the lanes').
+pub const sampler = @import("sdk_ext/sampler.zig");
 /// The KV seam: lane storage, routes and bounded caps for a module-owned decode state.
 pub const kv = @import("sdk_ext/kv.zig");
 /// `kv`'s conformance helpers (CPU lane).

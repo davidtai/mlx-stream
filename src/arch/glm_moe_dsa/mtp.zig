@@ -403,8 +403,8 @@ pub const Decision = struct { accepted: u32, next: u32 };
 /// sampled draws' key). Greedy: exact accepts a draft equal to its row's argmax; typical accepts one whose probability
 /// at temperature 1 exceeds min(eps, delta * exp(-entropy)) (the host's `sdk.acceptance.typicalThreshold`); the
 /// correction and the bonus are the argmax. Sampled: every draft lane's rules (`sdk_ext.acceptance`): exact is the
-/// point-mass rule (`sampledRows`: drafts accepted with probability p(draft) of the tempered, filtered row, the
-/// residual's draw at the first rejection); typical (`typicalRows`) tests the same p against its own entropy and draws
+/// sample-then-verify rule (`sampledRows`: every row's token the tempered, filtered row's position-keyed draw, a draft
+/// accepted when it is that token: the serial step's tokens); typical (`typicalRows`) tests the same p against its own entropy and draws
 /// the correction and the bonus from p.
 /// `prepare`, one eval of its arrays, `DecisionArrays.read`.
 pub fn decide(g: *G, logits: T, drafts: []const u32, mode: sdk.acceptance.Mode, sampling: sdk.SamplingParams, base: u64) !Decision {

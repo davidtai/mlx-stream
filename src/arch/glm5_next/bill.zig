@@ -377,6 +377,9 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         .{ .name = "buffer_allowance", .bytes = @splat(wire_buffer_bytes * bufferCensus(in)), .at_construction = false },
         .{ .name = "request", .bytes = waves, .at_construction = false },
         .{ .name = "request_wiring", .bytes = .{ wireTables(waves[0] + states + lane_request[0]), wireTables(waves[1] + states + lane_request[1]) }, .at_construction = false },
+        // The plugin's sampler on a row it hands the host (`sdk_ext.sampler.chosen`: the tempered row, its sort, keep
+        // mask, softmax, cumulative sum, draw and one-hot): eight f32 vocab rows at most, the prompt's last row or a step's.
+        .{ .name = "sampler", .bytes = @splat(8 * @as(u64, c.vocab_size) * f32b), .at_construction = false },
     };
     const lt = lane orelse return a.dupe(Term, &terms);
     const la = lane_arch.?;

@@ -73,7 +73,9 @@ pub const DraftLane = struct {
     block_size: *const fn (m: *const anyopaque) u32,
     /// The lane as installed, for the server log and the receipts.
     lane_name: *const fn (m: *const anyopaque) []const u8,
-    arm: *const fn (m: *const anyopaque, req: ArmRequest) DraftArm,
+    /// The request's arming, before its prompt pass: the arch binds its sampler here (mlx-stream: the plugin draws every
+    /// token of a clean request), whatever it answers.
+    arm: *const fn (m: *anyopaque, req: ArmRequest) DraftArm,
     /// One round; `sampling` is the request's (the value `arm` received).
     round: *const fn (m: *anyopaque, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: SamplingParams) anyerror!DraftRound,
     stats: *const fn (m: *const anyopaque) DraftStats,
@@ -85,7 +87,7 @@ pub const DraftLane = struct {
             const w = "draft_lane " ++ @typeName(L);
             check.fnDecl(w, L, "blockSize", &.{*const M}, u32);
             check.fnDecl(w, L, "laneName", &.{*const M}, []const u8);
-            check.fnDecl(w, L, "arm", &.{ *const M, ArmRequest }, DraftArm);
+            check.fnDecl(w, L, "arm", &.{ *M, ArmRequest }, DraftArm);
             check.fnDecl(w, L, "round", &.{ *M, std.mem.Allocator, u32, u32, SamplingParams }, DraftRound);
             check.fnDecl(w, L, "stats", &.{*const M}, DraftStats);
         }
@@ -96,7 +98,7 @@ pub const DraftLane = struct {
             fn laneName(m: *const anyopaque) []const u8 {
                 return L.laneName(@ptrCast(@alignCast(m)));
             }
-            fn arm(m: *const anyopaque, req: ArmRequest) DraftArm {
+            fn arm(m: *anyopaque, req: ArmRequest) DraftArm {
                 return L.arm(@ptrCast(@alignCast(m)), req);
             }
             fn round(m: *anyopaque, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: SamplingParams) anyerror!DraftRound {
@@ -121,7 +123,7 @@ test "sdk spec: a draft lane's table calls its namespace on the erased module" {
         pub fn laneName(_: *const M) []const u8 {
             return "fake";
         }
-        pub fn arm(_: *const M, req: ArmRequest) DraftArm {
+        pub fn arm(_: *M, req: ArmRequest) DraftArm {
             return if (req.greedy and req.clean) .typical else .off;
         }
         pub fn round(m: *M, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: SamplingParams) !DraftRound {
