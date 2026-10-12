@@ -48,6 +48,13 @@ pub const read_schedule: mimo_stream.ReadSchedule = .early_whole_trim;
 pub const drain: mimo_math.Drain = .pipelined;
 pub const bank_view: mimo_math.BankView = .window;
 pub const decode_window: mimo_stream.DecodeWindow = .verify;
+/// Prompt lever 1 (glm5next/prefill-levers): the overlap schedule's relocation (`Options.prompt_relocate`). A read-ahead
+/// record the call's plans evict before any group hits it (a misprediction: an earlier group's seed miss takes its row)
+/// and load again later in the call into a transient row no earlier group reads is copied at the plans from its
+/// read-ahead row into that row, so it is read once, not twice (the profile's 33.8 double reads per layer, read again
+/// inside the drive-bound MoE stage). The same plans, slots and kernels, the record's own bytes in its row before any
+/// kernel reads it: exact by construction, installed unconditionally.
+pub const prompt_relocate = true;
 /// P7 `pooled`: MLX's cache limit through the prompt pass, purged at a prompt layer's end once half full; decode keeps
 /// its own limit (`decode_cache_bytes`).
 pub const prompt_cache_bytes: usize = 2 << 30;
@@ -62,6 +69,17 @@ pub const max_experts: u32 = 288;
 comptime {
     if (Math.prefill_min_tokens != decode_lane_rows + 1) @compileError("glm5_next: the scheduler's wide threshold is not the decode lane's bound");
     if (mimo_stream.decode_lane_route_ids != decode_lane_rows * top_k) @compileError("glm5_next: decode's window 0 is not the decode lane's route");
+}
+
+/// The stream's construction options (pure: the CPU tests read them): MiMo's event gates and lookahead over `rows`, the
+/// phase rows' transient release, the read schedule's overlap route with prompt lever 1's relocation, decode's window 0.
+pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event) !B.Options {
+    var opts = B.eventOptions(rows, memory, event);
+    opts.transient_release = true;
+    try B.applyReadSchedule(&opts, read_schedule);
+    opts.prompt_relocate = prompt_relocate;
+    opts.decode_route_ids = mimo_stream.decodeRouteIds(decode_window);
+    return opts;
 }
 
 /// The phase route of a routed call (MiMo's `decodeLane`): one row in either phase, up to `decode_lane_rows` in decode.
@@ -171,11 +189,7 @@ pub const Source = struct {
         // refused here, once, if a bank's spans outgrow it.
         if (B.S.stagingBytes(&self.sdk_bank) > settings.reader_staging_bytes) return error.Glm5NextReaderStaging;
         const event = try expert_event.createMetal();
-        var opts = B.eventOptions(self.rows, .{ .mlx = stream }, event);
-        opts.transient_release = true;
-        try B.applyReadSchedule(&opts, read_schedule);
-        opts.decode_route_ids = mimo_stream.decodeRouteIds(decode_window);
-        self.sdk_stream = try Stream.init(a, &self.sdk_bank, opts);
+        self.sdk_stream = try Stream.init(a, &self.sdk_bank, try streamOptions(self.rows, .{ .mlx = stream }, event));
         errdefer self.sdk_stream.deinit();
         self.stream_source = StreamSource.init(self.sdk_stream);
         try self.stream_source.installReadSchedule(read_schedule, mimo_stream.default_read_schedule_threshold);
@@ -351,3 +365,16 @@ pub const Source = struct {
         return self.stream_source.stats();
     }
 };
+
+test "glm5_next experts: the stream's options install the overlap schedule early_whole_trim with prompt lever 1's relocation (exact), the phase rows' release and decode's window" {
+    const testing = std.testing;
+    const rows = [_]u32{ 124, 124 };
+    const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 });
+    try testing.expectEqual(B.S.PromptReads.overlap, opts.prompt_reads);
+    try testing.expectEqual(B.S.AheadPost.whole_trim, opts.prompt_ahead);
+    try testing.expect(opts.prompt_relocate);
+    try testing.expect(opts.transient_release);
+    try testing.expectEqual(mimo_stream.decodeRouteIds(decode_window), opts.decode_route_ids);
+    try testing.expectEqual(@as(u64, 123), opts.event.?.backend.metal);
+    try testing.expectEqualSlices(u32, &rows, opts.rows);
+}

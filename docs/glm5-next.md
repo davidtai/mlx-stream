@@ -46,11 +46,11 @@ refuse by name (`Glm5NextHostSurfaceMissing`).
 MiMo's stack of record, through the shared seams: the SDK stream over the NVFP4 bank (`mimo_v2/stream_source.For`), the
 shared DeepSeek scheduler (`ExpertsWith`: the decode lane, the wide prompt lane, the wide feed, P1's read-ahead), MiMo's
 expert math over the NVFP4 format (`mimo_v2/math.MathOf(nvfp4.Format)`: sorted NAX gathers per bank, the window bank
-view, pipelined drains) and MiMo's in-place prompt combine. Routes installed once: read schedule `early_whole_trim`,
-pooled prompt scratch (2 GiB cache, purged at a layer's end once half full), decode window 32 rows, phase rows (the
-prompt's scratch freed at the phase change, each layer grown to its decode rows, shrunk back at the next prompt,
-residents forgotten per request as MiMo's are). The in-place combine needs the host's wired policy `max`; under another
-policy the fused combine is installed (one log line).
+view, pipelined drains) and MiMo's in-place prompt combine. Routes installed once: read schedule `early_whole_trim`
+(with the read-ahead relocation: "Prompt levers" below), pooled prompt scratch (2 GiB cache, purged at a layer's end
+once half full), decode window 32 rows, phase rows (the prompt's scratch freed at the phase change, each layer grown to
+its decode rows, shrunk back at the next prompt, residents forgotten per request as MiMo's are). The in-place combine
+needs the host's wired policy `max`; under another policy the fused combine is installed (one log line).
 
 The gathers are MLX's `gather_qmm` in `nvfp4` mode (group 16) with each slot's f32 global scale, through the plugin's
 shim (`glm5_gather_qmm_nvfp4`: MLX's C++ op; mlx-c's `mlx_gather_qmm` has no global scale and is not changed): MLX folds
@@ -71,6 +71,26 @@ KDA state and the DSA lanes carry from span to span); the dense MLP of layers 0-
 the MoE over every row at once (the shared expert committed first); the layer's output evaluated at its end. DSA's
 indexer scores and sparse latent attention run on the NAX kernels where the device has them (`dsa_nax=true` in the
 routes line); an installed NAX route never falls back.
+
+## Prompt levers
+
+The 16K prompt pass's levers from the prefill analysis (`reports/.../mimo/glm5next-prefill-gpu-levers-20261012.md`),
+each a construction-time route with one engagement line at load (the pair harness greps them). An exact lever is
+installed unconditionally; a rounding-class one is a settings key whose default is the stock control.
+
+1. **Read-ahead relocation** (exact). The profile read 33.8 records per layer twice: P1's read-ahead reads its
+   mispredicted records (predicted hot, actually ranked past the prompt rows) into persistent rows during the attention,
+   an earlier group's seed miss then takes each such row before any group hits the record, and the record's own group
+   reads it again, into a transient row, inside the drive-bound MoE stage (209 ms of reads against 154 ms of tiles per
+   layer). The SDK stream's overlap schedule now relocates such a record at the call's plans
+   (`Options.prompt_relocate`, `Stream.p7Relocate`): when its later load is into a transient row no earlier group of
+   the call loads, the record is copied from its read-ahead row into that row (its read-ahead job landed first; the
+   copies run before the call posts any read), and that load holds its record and reads nothing. The plans, slots and
+   kernels are the control's, and every row holds the record's own bytes before any kernel reads it. A record whose
+   later row an earlier group loads (group 5's rows follow group 3's in window 1) is read again, as before. MiMo's
+   streams leave it off. Line: `glm5_next prompt lever 1: read-ahead relocation engaged (...)`. Expected -0.8 to
+   -1.5 s at 16K (the analysis's model -1.51 s for all double reads); the profile build's `GLM5_NEXT_IO skipped_loads=`
+   counts the relocated loads (0 in the control's first request).
 
 ## The bill
 
