@@ -1,19 +1,26 @@
 //! GLM-5.3-Flash's Kimi Delta Attention (KDA) layers: the q / k / v projections through the short causal conv and SiLU,
 //! the per-head L2 norms, the per-channel bounded-sigmoid forget gate from the low-rank `f` projections, beta = sigmoid(b),
 //! the delta-rule recurrence over an f32 state, and the gated RMSNorm (sigmoid of the low-rank `g` projections) into the
-//! output projection. The recurrence is mlx-serve's stock gated-delta kernel with the per-channel gate (`transformer.zig`
-//! `gdnKernelSource(vectorized = true)`, mlx-lm's `_make_gated_delta_kernel(vectorized=True)`: the exact recurrence, one
-//! token at a time), copied here; the host's per-core and fused decode kernels are not used (the per-core kernel needs
-//! 64 GPU cores for Flash's 64 heads, the decode kernel quantized gate projections). The MTP lane's verify
-//! (`forwardCapture`) runs the host's capture variant of the same kernel (`gdnKernelSource(vectorized, capture_seq)`):
-//! besides the final state it writes the state after every row but the last, so a partial accept restores row a's state
-//! (`restore`) by a copy, with no re-forward.
+//! output projection. The per-token route runs mlx-serve's stock gated-delta kernel with the per-channel gate
+//! (`transformer.zig` `gdnKernelSource(vectorized = true)`, mlx-lm's `_make_gated_delta_kernel(vectorized=True)`: the exact
+//! recurrence, one token at a time), copied here, over the materialized f32 gate. A span wider than the decode lane (the
+//! prompt pass's) runs the prompt route installed at construction (kda_percore.zig: the host's per-core kernel where this
+//! GPU takes it, else the per-token route); the host's fused decode kernel is not used (it needs quantized gate
+//! projections). The MTP lane's verify (`forwardCapture`) runs the host's capture variant of the stock kernel
+//! (`gdnKernelSource(vectorized, capture_seq)`): besides the final state it writes the state after every row but the
+//! last, so a partial accept restores row a's state (`restore`) by a copy, with no re-forward.
 
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
+const kda_percore = @import("kda_percore.zig");
+
+comptime {
+    // kda_percore.zig's tests run with this file's (src/tests.zig lists kda.zig).
+    _ = kda_percore;
+}
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -30,6 +37,9 @@ pub const Weights = struct {
     g_b: T,
     /// beta's projection [heads, hidden].
     b: T,
+    /// f32 [hv]: A_log as its own F32 table, converted once at bind (the pack stores F32 or BF16 by layer); the per-core
+    /// kernel takes exp(A_log) of it itself.
+    a_log: T,
     /// f32 [hv * dk]: exp(A_log) of each head repeated over its key channels (the gate's constant factor, built once).
     a_exp: T,
     /// f32 [hv * dk].
@@ -149,18 +159,21 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
     const inv_dk = 1.0 / @as(f64, @floatFromInt(dk));
     const qs = try g.mul(try rmsNormOnes(g, q, ones, 1e-6), try g.scalar(inv_dk, .bfloat16));
     const ks = try g.mul(try rmsNormOnes(g, k, ones, 1e-6), try g.scalar(@sqrt(inv_dk), .bfloat16));
-    // The forget gate per key channel, f32: exp(lb * sigmoid(exp(A_log) * (a + dt_bias))).
+    // The forget gate's pre-activation per key channel (each route makes the gate of it), beta, the state.
     const a = try linear(g, try linear(g, x, w.f_a), w.f_b);
-    const a32 = try g.astype(try g.add(a, w.dt_bias), .float32);
-    const gate = try g.exp(try g.mul(try g.sigmoid(try g.mul(w.a_exp, a32)), try g.scalar(c.kda_lower_bound, .float32)));
     const beta = try g.sigmoid(try linear(g, x, w.b));
     const state = st.rec orelse try g.zeros(&.{ 1, hv, dk, dk }, .float32);
     const r = if (capture) blk: {
-        const rs = try recurSeq(g, qs, ks, v, gate, beta, state, rows, hv, dk);
+        // The MTP verify's rows: the stock kernel's capture variant over the f32 gate.
+        const rs = try recurSeq(g, qs, ks, v, try gateOf(g, c, w, a), beta, state, rows, hv, dk);
         cap.release(g);
         cap.* = .{ .seq = g.keep(rs.seq), .window = g.keep(window), .rows = @intCast(rows) };
         break :blk Recur{ .y = rs.y, .state = rs.state };
-    } else try recur(g, qs, ks, v, gate, beta, state, rows, hv, dk);
+    } else blk: {
+        // The span's route: past the decode lane the prompt route installed at construction, else the per-token route.
+        const route = kda_percore.spanRoute(rows);
+        break :blk try route(g, c, w, qs, ks, v, a, beta, state);
+    };
     // The gated RMSNorm: rms_norm(y) per head (o_norm) times sigmoid(g_b(g_a(x))).
     const z = try g.reshape(try linear(g, try linear(g, x, w.g_a), w.g_b), &head4);
     var yn = mlx.mlx_array_new();
@@ -170,7 +183,24 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
     return linear(g, try g.reshape(gated, &.{ 1, rows, dim }), w.o);
 }
 
-const Recur = struct { y: T, state: T };
+pub const Recur = struct { y: T, state: T };
+
+/// A recurrence route over one span: q, k, v [1, R, hv, dk] bf16 (q / k normalized and scaled), the gate's pre-activation
+/// `a` [1, R, hv * dk], beta [1, R, hv], the state f32 [1, hv, dv, dk] -> y [1, R, hv, dv] bf16 and the state after the
+/// span's last row.
+pub const RecurFn = fn (g: *G, c: *const glm.Config, w: *const Weights, q: T, k: T, v: T, a: T, beta: T, state: T) anyerror!Recur;
+
+/// The forget gate per key channel, f32, exp(lb * sigmoid(exp(A_log) * (a + dt_bias))): the stock kernels' input.
+fn gateOf(g: *G, c: *const glm.Config, w: *const Weights, a: T) !T {
+    const a32 = try g.astype(try g.add(a, w.dt_bias), .float32);
+    return g.exp(try g.mul(try g.sigmoid(try g.mul(w.a_exp, a32)), try g.scalar(c.kda_lower_bound, .float32)));
+}
+
+/// The per-token route: the f32 gate (`gateOf`), then the stock kernel (`recur`). Every decode-lane span takes it, and
+/// the prompt pass's where the construction declined the per-core route.
+pub fn recurStock(g: *G, c: *const glm.Config, w: *const Weights, q: T, k: T, v: T, a: T, beta: T, state: T) anyerror!Recur {
+    return recur(g, q, k, v, try gateOf(g, c, w, a), beta, state, g.shapeOf(q).dim(1), @intCast(c.kda_heads), @intCast(c.kda_head_dim));
+}
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 
