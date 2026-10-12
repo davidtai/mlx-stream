@@ -47,7 +47,7 @@ pub const texts = struct {
 };
 /// sha256 of kernels/manifest-glue.json, which records every glue text's sha256 (checked against the pins by a CPU test).
 pub const manifest_sha256 = "561df962d8065264a93a5b002a97c566e4173c143d42721c28b8eb5fed2cd7af";
-pub const text_pins = [_]struct { file: []const u8, text: []const u8, sha256: []const u8 }{
+pub const text_pins = [_]kset.TextPin{
     .{ .file = "header_mimo_glue.metal", .text = texts.header, .sha256 = "75784dde518a7b706e3276c32add41325d28e5bfaa1cff03a68dc40057bf9e51" },
     .{ .file = "mimo_glue_norm.metal", .text = texts.norm, .sha256 = "3008660a5d8e36446aa0e2b4057798655ebbaa3f01496c748e7733147ffe31a6" },
     .{ .file = "mimo_glue_addnorm.metal", .text = texts.addnorm, .sha256 = "f547c88792eaca9cf98ca093c693245985516a44f88ce66e5011e3bd9944eb2c" },
@@ -58,8 +58,7 @@ pub const text_pins = [_]struct { file: []const u8, text: []const u8, sha256: []
 };
 
 pub fn checkPins() !void {
-    if (!std.mem.eql(u8, &kset.shaHex(texts.manifest), manifest_sha256)) return error.MimoGlueManifestNotPinned;
-    for (text_pins) |p| if (!std.mem.eql(u8, &kset.shaHex(p.text), p.sha256)) return error.MimoGlueTextNotPinned;
+    return kset.checkTextPins(texts.manifest, manifest_sha256, &text_pins, error.MimoGlueManifestNotPinned, error.MimoGlueTextNotPinned);
 }
 
 /// The geometry the texts are written for (hidden 4096, 256 experts, top 8, eps 1e-6); anything else is refused at
@@ -617,28 +616,7 @@ fn fillBf(r: *Rng, out: []f32, amp: f32) void {
 
 test "mimo glue CPU: the manifest and every K2 text match their pins" {
     try checkPins();
-    const J = struct {
-        headers: []const struct { file: []const u8, sha256: []const u8, bytes: usize },
-        kernels: []const struct { name: []const u8, source: struct { file: []const u8, sha256: []const u8, bytes: usize } },
-    };
-    const m = try std.json.parseFromSlice(J, testing.allocator, texts.manifest, .{ .ignore_unknown_fields = true });
-    defer m.deinit();
-    var seen: usize = 0;
-    for (text_pins) |p| {
-        try testing.expectEqualStrings(&kset.shaHex(p.text), p.sha256);
-        for (m.value.headers) |h| if (std.mem.eql(u8, h.file, p.file)) {
-            try testing.expectEqualStrings(p.sha256, h.sha256);
-            try testing.expectEqual(p.text.len, h.bytes);
-            seen += 1;
-        };
-        for (m.value.kernels) |k| if (std.mem.eql(u8, k.source.file, p.file)) {
-            try testing.expectEqualStrings(p.sha256, k.source.sha256);
-            try testing.expectEqual(p.text.len, k.source.bytes);
-            seen += 1;
-        };
-    }
-    try testing.expectEqual(text_pins.len, seen);
-    try testing.expectEqual(@as(usize, 6), m.value.kernels.len);
+    try kset.expectManifestPins(texts.manifest, &text_pins, 6);
     try requireGeometry(.{});
     var odd: mimo.Config = .{};
     odd.rms_norm_eps = 1e-5;
