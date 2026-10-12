@@ -42,16 +42,23 @@ fn factsOf(p: Pack) PackFacts {
 /// The box's inputs with the run's pack and prompt kernels: its routed GEMMs and its spans' selection, and the
 /// allocator's size classes (the prompt's transients and the residents at their classes; the screen before them ran
 /// without).
-fn inputs(c: *const glm.Config, pack: Pack, gemm: bill.PromptGemm, select: bill.Select, classes: bool) bill.Inputs {
+fn inputs(c: *const glm.Config, pack: Pack, gemm: bill.PromptGemm, select: bill.Select, classes: bool, gemm_rows_in_flight: u64) bill.Inputs {
     const f = factsOf(pack);
-    return .{ .model = c, .bank = f.geometry, .resident_bytes = if (classes) f.resident_class_bytes else f.resident_bytes, .stream = bill.streamShape(&cfg), .prompt_tokens = bill.servedContext(&cfg), .decode_positions = bill.maxPositions(&cfg), .mtp = f.mtp, .dsa = true, .gemm = gemm, .select = select, .prompt_cache = bill.prefillCacheBytes(bill.box_exl3.ram), .size_classes = classes };
+    return .{ .model = c, .bank = f.geometry, .resident_bytes = if (classes) f.resident_class_bytes else f.resident_bytes, .stream = bill.streamShape(&cfg), .prompt_tokens = bill.servedContext(&cfg), .decode_positions = bill.maxPositions(&cfg), .mtp = f.mtp, .dsa = true, .gemm = gemm, .select = select, .prompt_cache = bill.prefillCacheBytes(bill.box_exl3.ram), .size_classes = classes, .gemm_rows_in_flight = gemm_rows_in_flight };
+}
+
+/// The GEMM rows in flight the runs before the wide lane's slice window billed: the margins read off the wave probe
+/// (GLM-5.3's kernels 20,480 rows, sushi's MoE 36,864). Every receipt here ran before the window.
+fn ranGemmRowsInFlight(gemm: bill.PromptGemm) u64 {
+    return if (gemm == .glm53) 20480 else 36864;
 }
 
 test "glm bill receipts: the 9d157b5 screen's peaks, over its own bill, sit under this bill at its inputs and units" {
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
-    // The screen ran sushi's prompt GEMM and argpartition's selection.
-    const in = inputs(&c, .exl3_342, .sushi, .argpartition, false);
+    // The screen ran sushi's prompt GEMM and argpartition's selection, before the slice window (its encode ran as far
+    // ahead as the GPU let it: the margin of then).
+    const in = inputs(&c, .exl3_342, .sushi, .argpartition, false, ranGemmRowsInFlight(.sushi));
     const b = bill.billOf(in);
     // The screen's load: the baseline 18,144,149,504 B, 76 prompt units, the handover's 86 at its 17,415 positions.
     const baseline: u64 = 18_144_149_504;
@@ -177,15 +184,21 @@ test "glm bill receipts: each run's phase terms, page tables and residuals rebui
     defer c.deinit(testing.allocator);
     for (receipts) |r| {
         errdefer std.debug.print("receipt {s}\n", .{r.name});
-        const in = inputs(&c, r.pack, r.gemm, r.select, true);
-        const b = bill.billOf(in);
-        const req = bill.atRequest(in, r.request.positions, r.request.pending_rows);
+        // Today's bill (the slice window's GEMM rows), and the bill as the run billed it (the margin of then).
+        const in_today = inputs(&c, r.pack, r.gemm, r.select, true, bill.gemm_rows_in_flight_window);
+        const in = inputs(&c, r.pack, r.gemm, r.select, true, ranGemmRowsInFlight(r.gemm));
         const p = r.units.prompt;
         const slots = bill.slotBytes(in.bank, p) + r.grown_bytes;
-        const today = [4]bill.PhaseTerms{ b.terms(.construction, p, p), b.terms(.prompt, p, p), req.termsAt(.decode, slots), req.termsAt(.decode, slots) };
-        // The bill as the run billed it: today's, its construction's host side at the run's bound and its residents
-        // as it billed them.
-        var want = today;
+        const today = blk: {
+            const b = bill.billOf(in_today);
+            const req = bill.atRequest(in_today, r.request.positions, r.request.pending_rows);
+            break :blk [4]bill.PhaseTerms{ b.terms(.construction, p, p), b.terms(.prompt, p, p), req.termsAt(.decode, slots), req.termsAt(.decode, slots) };
+        };
+        const b = bill.billOf(in);
+        const req = bill.atRequest(in, r.request.positions, r.request.pending_rows);
+        // The bill as the run billed it: its construction's host side at the run's bound, its residents as it billed
+        // them, its prompt waves at the margin of then.
+        var want = [4]bill.PhaseTerms{ b.terms(.construction, p, p), b.terms(.prompt, p, p), req.termsAt(.decode, slots), req.termsAt(.decode, slots) };
         want[0].host_side = r.ran_host_side_construction;
         if (r.ran_construction_residents) |n| want[0].residents = n;
         for (r.records, want, today) |rec, w, t| {
@@ -208,7 +221,7 @@ test "glm bill receipts: the fill at each run's baseline gives its units, one mo
     defer c.deinit(testing.allocator);
     for (receipts) |r| {
         errdefer std.debug.print("receipt {s}\n", .{r.name});
-        const in = inputs(&c, r.pack, r.gemm, r.select, true);
+        const in = inputs(&c, r.pack, r.gemm, r.select, true, ranGemmRowsInFlight(r.gemm));
         const mb = try bill.memoryBill(testing.allocator, bill.billOf(in), null);
         defer mb.free(testing.allocator);
         try testing.expectEqual(r.target, bill.targetOf(bill.box_exl3.gpu_target, bill.box_exl3.ram, r.baseline));

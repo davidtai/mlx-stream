@@ -202,10 +202,36 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             inv: std.ArrayList(u32) = .empty,
             kept: std.ArrayList(T) = .empty,
             side_ids: std.ArrayList(u16) = .empty,
+            /// The call's GEMM slices in flight (indices into `kept`): the slice window (`glm.prompt_gemm_slices_in_flight`).
+            window: SliceWindow = .{},
 
             fn deinit(w: *Wide, a: std.mem.Allocator, g: *G) void {
                 for (w.kept.items) |x| g.release(x);
                 inline for (.{ &w.ids, &w.first, &w.distinct, &w.order, &w.count, &w.by_group, &w.group_at, &w.bounds, &w.egroup, &w.groute, &w.staged_mark, &w.slot, &w.act, &w.pos, &w.inv, &w.kept, &w.side_ids }) |l| l.deinit(a);
+            }
+        };
+
+        /// A routed call's GEMM slices in flight, at most `glm.prompt_gemm_slices_in_flight`: each slice is committed as
+        /// it is built (`commit`), and before the next is built the oldest still in flight is waited for (`admit`), so
+        /// its transients are back in MLX's cache. The bill charges exactly this (`bill.gemm_rows_in_flight_window`): the
+        /// schedule bounds the slices' transients on any box, not the GPU's pace against the host's.
+        const SliceWindow = struct {
+            const cap: usize = glm.prompt_gemm_slices_in_flight;
+            ring: [cap]usize = undefined,
+            head: usize = 0,
+            n: usize = 0,
+
+            fn admit(sw: *SliceWindow, g: *G, kept: []const T) !void {
+                if (sw.n < cap) return;
+                try g.evalAll(&.{kept[sw.ring[sw.head]]});
+                sw.head = (sw.head + 1) % cap;
+                sw.n -= 1;
+            }
+
+            fn commit(sw: *SliceWindow, g: *G, kept: []const T, at: usize) !void {
+                try g.asyncEval(&.{kept[at]});
+                sw.ring[(sw.head + sw.n) % cap] = at;
+                sw.n += 1;
             }
         };
 
@@ -852,6 +878,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             w.pos.clearRetainingCapacity();
             for (w.kept.items) |o| g.release(o);
             w.kept.clearRetainingCapacity();
+            w.window = .{};
             // x as the math's prefill reads it (`beginWide`: GLM-5.3's kernels' f16 copy, made once for the call and
             // dropped with its waves), else x.
             const copy: ?T = if (@hasDecl(M, "beginWide")) try self.math.beginWide(g, x) else null;
@@ -1024,12 +1051,15 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     }
                     if (w.slot.items.len == 0) continue;
                     const arrays = self.banks[sl][@backingInt(kind)] orelse return error.SlotArraysUnbound;
-                    // The group's rows of this bank in slices (each slice's transient bounded, `group_slice_rows`).
+                    // The group's rows of this bank in slices (each slice's transient bounded, `group_slice_rows`), at most
+                    // the slice window's in flight.
                     var s0: usize = 0;
                     while (s0 < w.slot.items.len) : (s0 += glm.group_slice_rows) {
                         const s1 = @min(s0 + glm.group_slice_rows, w.slot.items.len);
+                        try w.window.admit(g, w.kept.items);
                         const y = try self.math.prefill(g, sl, x, .{ .slot = w.slot.items[s0..s1], .act_row = w.act.items[s0..s1] }, arrays);
                         try w.kept.append(a, g.keep(y));
+                        try w.window.commit(g, w.kept.items, w.kept.items.len - 1);
                     }
                     std.debug.assert(w.pos.items.len - p0 == w.slot.items.len);
                 }
@@ -1063,6 +1093,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 // The combine holds the parts until it is evaluated.
                 for (w.kept.items) |o| g.release(o);
                 w.kept.clearRetainingCapacity();
+                w.window = .{};
                 return out;
             }
             // The join: every routed row's output in routed order, then the combine in token slices.
@@ -1074,6 +1105,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             defer if (pt.enabled) pt.chargeRouted(.combine, tb);
             for (w.kept.items) |o| g.release(o);
             w.kept.clearRetainingCapacity();
+            w.window = .{};
             for (w.pos.items, 0..) |p, j| w.inv.items[p] = @intCast(j);
             if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0) {
                 const inv = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);

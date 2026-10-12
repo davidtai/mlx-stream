@@ -365,11 +365,46 @@ fn selectRows(g: *G, topk: u32, carry: *Carry, held: []const Held) !void {
     }
 }
 
+/// A layer's attention spans in flight, at most `cap` (`glm.attentionSpansInFlight` of its kind): each span's result is
+/// committed as it is built (`commit`), and before the next span is built the oldest still in flight is waited for
+/// (`admit`), so its transients (the indexer's scores over the keys, the latent attention's arrays) are back in MLX's
+/// cache. The bill charges exactly this (`glm_moe_dsa_bill.PromptWave.spans`): the schedule bounds the spans' arrays on
+/// any box, not the GPU's pace against the host's encode.
+pub const SpanWindow = struct {
+    cap: u32,
+    ring: [glm.max_attention_spans_in_flight]T = undefined,
+    head: u32 = 0,
+    n: u32 = 0,
+
+    pub fn of(full: bool, sparse: bool) SpanWindow {
+        return .{ .cap = glm.attentionSpansInFlight(full, sparse) };
+    }
+
+    fn admit(w: *SpanWindow, g: *G) !void {
+        if (w.n < w.cap) return;
+        try g.evalAll(&.{w.ring[w.head]});
+        w.head = (w.head + 1) % w.cap;
+        w.n -= 1;
+    }
+
+    fn commit(w: *SpanWindow, g: *G, x: T) !void {
+        try g.asyncEval(&.{x});
+        w.ring[(w.head + w.n) % w.cap] = x;
+        w.n += 1;
+    }
+
+    /// The window forgotten before its arrays' owners release them (none is waited for again).
+    fn clear(w: *SpanWindow) void {
+        w.head = 0;
+        w.n = 0;
+    }
+};
+
 /// `select` on the DSA kernels, a prompt's spans: the head-summed scores of each span's rows over the keys it reaches
 /// on the tensor units (f32, the products of the same bf16 values accumulated in f32), the top `index_topk` kept as
 /// i32 ids `[1, rows, index_topk]` (`glm_moe_dsa_topk`: argpartition's ids in its order); null where the span's keys
 /// fit `index_topk`.
-fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, carry: *Carry) !void {
+fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, carry: *Carry, win: *SpanWindow) !void {
     const topk = c.index_topk;
     const ih: c_int = @intCast(c.index_n_heads);
     const ihd: c_int = @intCast(c.index_head_dim);
@@ -387,6 +422,7 @@ fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T,
             carry.set(g, i, null);
             continue;
         }
+        try win.admit(g);
         const m = g.mark();
         const r: c_int = @intCast(b1 - b0);
         const qb = try g.slice(iq_rows, &.{ 0, @intCast(b0), 0, 0 }, &.{ 1, @intCast(b1), ih, ihd }, &.{ 1, 1, 1, 1 });
@@ -399,6 +435,7 @@ fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T,
             break :blk try g.astype(try lastSlice(g, try g.argpartition(scores, kth, -1), kth, @intCast(nb)), .int32);
         };
         carry.set(g, i, idx);
+        try win.commit(g, carry.topk[i].?);
         g.resetTo(m);
     }
 }
@@ -407,7 +444,7 @@ fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T,
 /// scores over the span's selected keys (the latent rows and their roped keys; every causal key where the span's keys
 /// fit `index_topk`) and their softmax on the tensor units, the latent output back through `unembed_out`. `[1, heads,
 /// rows, v_head_dim]`.
-fn attendSpans(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T, kv_all: T, pe_all: T, start: u32, scale: f32, carry: *Carry) !T {
+fn attendSpans(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T, kv_all: T, pe_all: T, start: u32, scale: f32, carry: *Carry, win: *SpanWindow) !T {
     const kvr: c_int = @intCast(c.kv_lora_rank);
     const rp: c_int = @intCast(c.qk_rope_head_dim);
     var outs: std.ArrayList(T) = .empty;
@@ -418,6 +455,7 @@ fn attendSpans(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T
         const b1 = carry.bounds[i + 1];
         const nb: c_int = @intCast(start + b1);
         const r: c_int = @intCast(b1 - b0);
+        try win.admit(g);
         const m = g.mark();
         const q_lat = try qlinear(g, try rowSlice(g, q_nope, @intCast(b0), @intCast(b1)), lw.embed_q);
         const qp = try rowSlice(g, q_pe, @intCast(b0), @intCast(b1));
@@ -427,8 +465,11 @@ fn attendSpans(g: *G, c: *const glm.Config, lw: *const Layer, q_nope: T, q_pe: T
         const pe = try g.slice(pe_all, &.{ 0, 0, 0, 0 }, &.{ 1, 1, nb, rp }, &.{ 1, 1, 1, 1 });
         const o_lat = try g.adopt((try dsa.sparseLatentRope(g.s, q_lat, qp, lat, pe, idx, scale)) orelse return error.DsaKernelDeclined);
         try outs.append(carry.a, g.keep(try qlinear(g, o_lat, lw.unembed_out)));
+        try win.commit(g, outs.items[outs.items.len - 1]);
         g.resetTo(m);
     }
+    // The outputs leave this scope (joined, released): the window holds none of them past it.
+    win.clear();
     if (outs.items.len == 1) return g.adopt(outs.items[0]);
     const out = try g.concat(outs.items, 2);
     for (outs.items) |o| g.release(o);
@@ -525,9 +566,11 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
         _ = try pt.phase(g, &.{ q.q_nope, q.q_pe, q.qr }, .proj);
     }
     const spans = kernels and prompt_form;
+    // The layer's spans in flight: its kind's window (the bill's).
+    var win = SpanWindow.of(c.isFull(l), c.isSparse(l));
     if (lw.indexer) |ix| {
         const ik_all = try cache.indexView(g, l);
-        if (spans) try selectSpans(g, c, ix, x, q.iq.?, ik_all, start, carry) else try select(g, c, ix, x, q.iq.?, ik_all, start, rows, carry);
+        if (spans) try selectSpans(g, c, ix, x, q.iq.?, ik_all, start, carry, &win) else try select(g, c, ix, x, q.iq.?, ik_all, start, rows, carry);
     }
     if (pt.enabled and prompt_form) {
         var sel: std.ArrayList(T) = .empty;
@@ -537,7 +580,7 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     }
     var out: T = undefined;
     if (spans) {
-        out = try attendSpans(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, start, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(qhd)))), carry);
+        out = try attendSpans(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, start, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(qhd)))), carry, &win);
     } else if (rows == 1) {
         out = try absorbedRow(g, c, lw, q.q_nope, q.q_pe, kv_all, pe_all, carry.topk[0]);
     } else if (form == .per_row) {

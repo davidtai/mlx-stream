@@ -37,6 +37,25 @@ pub const score_budget_bytes: u64 = 256 << 20;
 pub const group_slice_rows: u64 = 16384;
 pub const combine_slice_tokens: u64 = 2048;
 
+/// The prompt pass's work in flight, bounded by construction (the bill charges exactly these, `glm_moe_dsa_bill`): a
+/// routed call's GEMM slices are committed one by one, and the slice `prompt_gemm_slices_in_flight` back is waited for
+/// before the next is built (`glm_moe_dsa_experts`, `SliceWindow`); a layer's attention spans the same way,
+/// `attentionSpansInFlight` of them (`glm_moe_dsa_graph.SpanWindow`). Before the windows these counts were margins
+/// read off the M5 Ultra's prompts (how far the host's encode ran ahead of the GPU); now they hold on any box.
+pub const prompt_gemm_slices_in_flight: u64 = 2;
+/// The routed rows a call's GEMMs hold in flight at most: the slices in flight, each at most `group_slice_rows`.
+pub const prompt_gemm_rows_in_flight: u64 = prompt_gemm_slices_in_flight * group_slice_rows;
+/// The attention spans in flight per layer kind: the routed full layers', the routed shared layers' and the dense
+/// layers' (the counts the measured bill charged before the window held them: its probe read at most 1.62, 2.43 and
+/// 2.22 spans).
+pub const attention_spans_in_flight: struct { full: u32, shared: u32, dense: u32 } = .{ .full = 2, .shared = 3, .dense = 3 };
+pub const max_attention_spans_in_flight: u32 = @max(attention_spans_in_flight.full, @max(attention_spans_in_flight.shared, attention_spans_in_flight.dense));
+
+/// The attention spans in flight of a layer of kind (`full`, `sparse`): `attention_spans_in_flight`'s.
+pub fn attentionSpansInFlight(full: bool, sparse: bool) u32 {
+    return if (!sparse) attention_spans_in_flight.dense else if (full) attention_spans_in_flight.full else attention_spans_in_flight.shared;
+}
+
 /// The rows of the prompt pass's call at row `at` of a `total`-row prompt: `prompt_call_rows`, or every row left when
 /// fewer than `prompt_call_rows + prompt_tail_rows` are.
 pub fn promptCallRows(total: u64, at: u64) u64 {
