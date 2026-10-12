@@ -622,6 +622,24 @@ pub const Routing = struct { indices: T, weights: T };
 /// (~15 ms a layer in the profile), so the call's plans and reads start that much sooner in a drive-bound MoE stage; the
 /// GPU runs the shared expert behind the router, ahead of the first group's tiles. The same graphs and values, only the
 /// commit order moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+/// Prefill host idle (g21c profile: the tail -> next layer's attention gap, 5.2 ms a layer, GPU idle while the host purged
+/// MLX's cache after the tail's evaluation): a prompt layer's purge (`Source.promptLayerEnd`: MLX's cache cleared once
+/// half full) runs after the next layer's first attention span is committed, so the GPU starts that span first. The
+/// cache stays under its limit (MLX frees on allocation past it), so no bill term moves; no value changes: exact.
+pub const DeferredPurge = struct {
+    pending: bool = false,
+
+    pub fn layerEnd(p: *DeferredPurge) void {
+        p.pending = true;
+    }
+
+    pub fn afterFirstCommit(p: *DeferredPurge, src: anytype) void {
+        if (!p.pending) return;
+        p.pending = false;
+        src.promptLayerEnd();
+    }
+};
+
 /// Prefill host idle (g21c profile: the dense stage's GPU idle, ~5-7 ms a routed layer while the host built the 16 spans'
 /// collapse and norm graphs with nothing committed): a prompt call's span collapse and norm committed as built. The same
 /// graph and values, only the commit point moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
@@ -788,6 +806,8 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
     // Prompt lever 5: the next routed layer's predictor, built and evaluated with each layer's output.
     var ahead: Ahead = .{};
     defer ahead.release(g);
+    // Prefill host idle: a prompt layer's cache purge runs after the next layer's first span is committed.
+    var purge: DeferredPurge = .{};
     for (w.layers, 0..) |*lw, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
@@ -822,6 +842,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             commit[0] = next;
             @memcpy(commit[1 .. 1 + b.len], b);
             try g.asyncEval(commit[0 .. 1 + b.len]);
+            if (i == 0) purge.afterFirstCommit(src);
             if (prev) |p| try g.evalAll(&.{p});
             prev = next;
         }
@@ -882,11 +903,12 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
                 n_outs += 1;
             }
             try g.evalAll(outs[0..n_outs]);
-            src.promptLayerEnd();
+            purge.layerEnd();
             // `fp8_block128`: the layer's BF16 weights released (no later layer reads them; fp8.zig `promptBytes`).
             if (w.fp8) |r| r.layerEnd();
         }
     }
+    purge.afterFirstCommit(src);
     if (comptime ptl.enabled) ptl.leaveLayers();
     cache.len = start + rows;
     if (head == .dump) try dumpRows(g, c, w, spans, sink);
@@ -1071,6 +1093,28 @@ test "glm5_next graph: prompt lever 4 commits the routing barrier's ids and weig
     // Only the two commit markers: no node of a graph is built or evaluated here.
     try testing.expectEqual(nodes + 2, g.nodes.items.len);
     try testing.expectEqual(@as(usize, 0), g.evals.items.len);
+}
+
+test "glm5_next graph: prefill host idle's deferred purge runs once, after the next layer's first commit, and at the pass's end" {
+    const Fake = struct {
+        purges: u32 = 0,
+        pub fn promptLayerEnd(f: *@This()) void {
+            f.purges += 1;
+        }
+    };
+    var src: Fake = .{};
+    var p: DeferredPurge = .{};
+    p.afterFirstCommit(&src); // layer 0's first span: nothing pending
+    try testing.expectEqual(@as(u32, 0), src.purges);
+    p.layerEnd(); // layer 0's end: deferred
+    try testing.expectEqual(@as(u32, 0), src.purges);
+    p.afterFirstCommit(&src); // layer 1's first span committed: layer 0's purge
+    try testing.expectEqual(@as(u32, 1), src.purges);
+    p.afterFirstCommit(&src); // no second purge
+    try testing.expectEqual(@as(u32, 1), src.purges);
+    p.layerEnd();
+    p.afterFirstCommit(&src); // the pass's end
+    try testing.expectEqual(@as(u32, 2), src.purges);
 }
 
 test "glm5_next graph: prefill host idle commits a span's collapse and norm alone, as built (one commit; nothing evaluated)" {
