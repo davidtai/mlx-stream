@@ -417,8 +417,8 @@ A `glm_moe_dsa: lookahead precision` line gives, per top-k position of the candi
 with the EXL3 bank), the records read ahead and how many of them the next routed layer's call routed.
 
 At each prompt the residency policy keeps the residents of the prompt rows and forgets its prompt state
-(`LayerPolicy.forgetPrompt` at the reverse phase change, `keep_residents`). The decode policy's transition counts and
-its window carry over from one request to the next.
+(`LayerPolicy.forgetPrompt` at the reverse phase change: GLM-5.3 passes `keep` to `Stream.shrink` for every request).
+The decode policy's transition counts and its window carry over from one request to the next.
 
 The MTP draft lane (`mtp_depth` > 0) runs the release's MTP layer (layer 78), which the MLX builds drop. The pack
 must have `mtp/` beside its shards, as `scripts/convert_glm_exl3_bank.py --mtp-only --from-pack <EXL3 pack>

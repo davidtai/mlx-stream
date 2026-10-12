@@ -56,8 +56,8 @@
   bill charges with the same functions; each routed expert read at most once per call, a layer's misses read at its
   start and its hottest made resident from the transient rows (`Stream.promote`); the routed combine in one kernel
   over the groups' outputs; with the EXL3 bank, each prompt slice's routing table built on the host. The construction
-  fills the prompt rows before the first request, and a request keeps the residents of the one before
-  (`Stream.Options.keep_residents`).
+  fills the prompt rows before the first request, and a request keeps the residents of the one before (its reverse
+  change passes `keep` to `Stream.shrink`, the per-request route of #12).
 - GLM-5.3 (`glm_moe_dsa`): a second arch over the same expert stream, from a pack of resident shards and an affine
   expert bank (`expert-manifest-affine-v1.json`). Serial decode, the `stock` tier, MLX's `gather_qmm` for the experts.
   `src/root.zig` exports both archs as `archs`; `arch` stays DeepSeek-V4.1's. Each request logs a prompt line and a

@@ -327,7 +327,6 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .records_per_part = @min(3, sdk_ext.expert.io.max_items / Bk.Stream.maxMinis(&self.bank)),
                 .pool = .{ .workers = shape.workers, .tickets = bill_mod.pool_tickets_per_mini * Bk.Stream.maxMinis(&self.bank), .direct = true },
                 .lookahead = .{ .k = lookahead.k, .budget = cfg.lookaheadBudget() },
-                .keep_residents = true,
                 .event = if (!gated) null else if (gpu) .{ .backend = .{ .metal = self.event.?.object }, .watchdog_ms = event_watchdog_ms } else .{ .backend = .host, .watchdog_ms = event_watchdog_ms },
                 .tally = if (cfg.tally.enabled()) .{ .ratio = cfg.tally.ratio, .window = cfg.tally.window, .layer_experts = layer_experts } else null,
             });
@@ -364,8 +363,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 }
             }
             // The prompt rows filled before the first request, each bank layer's in expert order (a long prompt routes
-            // nearly every expert, so any filled row is a hit); a later request finds its predecessor's residents
-            // (`keep_residents`).
+            // nearly every expert, so any filled row is a hit); a later request finds its predecessor's residents (the
+            // reverse change keeps them, `reverse`).
             var pre: Preload = .{ .bank = &self.bank, .buf = try gpa.alloc(u16, self.bank.n_experts) };
             defer gpa.free(pre.buf);
             const pre0 = self.stream.stats();
@@ -816,7 +815,9 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_synchronize(self.g.s);
             const before = Mem.now();
             try self.stream.settleRoutes();
-            _ = try self.ex.shrink(self.prompt_rows);
+            // The reverse change's residents, per request (`Stream.shrink`): GLM-5.3 keeps the prompt rows' residents for
+            // every later prompt (a long prompt routes nearly every expert, and the preload and the tally chose them).
+            _ = try self.ex.shrink(self.prompt_rows, .keep);
             try self.resizeKv(positions);
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();

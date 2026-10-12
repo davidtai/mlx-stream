@@ -1278,12 +1278,13 @@ test "dsv41 served cell: the typical tier's 16K cell through the served module, 
     md.phase_observer = marks.observer();
 
     // DSV41_CELL_REQUESTS (1..3, default 1): the same prompt again through the same Module, each after the previous
-    // request's end (`Module.requestEnd`, the reverse phase change, as the server's finishSlot runs it: off both clocks);
-    // request k > 1 writes its receipt beside the first (`<out>.req<k>.json`).
+    // request's end (`Module.requestEnd`, the reverse phase change off both clocks; the served path runs it at the next
+    // prefill instead, with the coming request known); request k > 1 writes its receipt beside the first
+    // (`<out>.req<k>.json`).
     const n_req: u32 = if (envStr("DSV41_CELL_REQUESTS")) |v| std.fmt.parseInt(u32, v, 10) catch return error.CellRequests else 1;
     if (n_req < 1 or n_req > 3) return error.CellRequests;
-    // DSV41_CELL_REQUEST_END=prefill: the shell's end is skipped (an errored request that never reached finishSlot), so
-    // the next request's prefill runs the pending reverse change on its own clock.
+    // DSV41_CELL_REQUEST_END=prefill: the harness's end is skipped, so the next request's prefill runs the pending reverse
+    // change on its own clock (the served path's order).
     const end_at_prefill = if (envStr("DSV41_CELL_REQUEST_END")) |v| (if (std.mem.eql(u8, v, "prefill")) true else if (std.mem.eql(u8, v, "end")) false else return error.CellRequestEnd) else false;
     for (0..n_req) |k| {
         if (k > 0) {

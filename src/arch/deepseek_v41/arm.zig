@@ -338,9 +338,10 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
             self.grown = true;
         }
 
-        /// The reverse phase change's free, back to the admitted prompt rows (`Experts.shrink`). Returns the bytes freed.
-        pub fn shrink(self: *Self) !u64 {
-            const bytes = try self.hook.shrink(self.prefill_rows);
+        /// The reverse phase change's free, back to the admitted prompt rows (`Experts.shrink`), their residents forgotten
+        /// or kept (`residents`). Returns the bytes freed.
+        pub fn shrink(self: *Self, residents: expert_stream.Residents) !u64 {
+            const bytes = try self.hook.shrink(self.prefill_rows, residents);
             self.grown = false;
             return bytes;
         }

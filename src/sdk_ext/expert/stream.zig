@@ -391,9 +391,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             transient_release: bool = false,
             /// How the grow's new rows (decode's window 0 and every layer's ext) are allocated (`GrowFill`).
             grow_fill: GrowFill = .zeros,
-            /// The reverse phase change keeps the residents of each layer's prompt rows (`shrink`): a later prompt finds
-            /// them; off, it forgets them, as at construction.
-            keep_residents: bool = false,
             /// G7: the arch's read-ahead records (`ReadAheadProbe`), in the prefill-timers build only.
             read_ahead_probe: ProbeSlot = no_probe,
             /// P7: the prompt pass's read schedule (`PromptReads`; `stock` is the control).
@@ -421,6 +418,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         /// a fill. Exact either way: a row is read only through a slot whose meta says its record landed (`SlotMeta.state`), and
         /// every record lands by its read into the row before that state is set.
         pub const GrowFill = enum { zeros, unfilled };
+
+        /// What the reverse phase change (`Stream.shrink`) leaves in the prompt rows for the next prompt: `forget` (no resident,
+        /// as at construction) or `keep` (the residents decode left there, their bytes and meta as their reads landed). The
+        /// rows themselves are the same either way.
+        pub const Residents = enum { forget, keep };
 
         /// G7: the prompt pass's read-ahead records, in the package's prefill-timers build only: the arch that builds the
         /// stream hands it these probes; every other build has no field, call or branch for them.
@@ -567,8 +569,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             release_installed: bool = false,
             /// The grow's allocation, installed at construction (`Options.grow_fill`).
             grow_fill: GrowFill = .zeros,
-            /// `Options.keep_residents`.
-            keep_residents: bool = false,
             /// The prompt phase's scratch rows and windows (`Options`): `regrowTransient` re-creates them for a later prompt.
             prompt_transient_rows: u32 = 0,
             prompt_wide_depth: u8 = 1,
@@ -850,7 +850,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .geom_of = geom_of,
                     .release_installed = opt.transient_release,
                     .grow_fill = opt.grow_fill,
-                    .keep_residents = opt.keep_residents,
                     .prompt_transient_rows = opt.transient_rows,
                     .prompt_wide_depth = opt.wide_depth,
                     .probe = opt.read_ahead_probe,
@@ -2429,10 +2428,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             /// The reverse phase change's free (the return to the prompt phase before a later prompt; the caller synchronized
             /// first): every route settled and unpinned (a cancelled request's included), each layer's grown rows freed and the residents in them
-            /// forgotten (`LayerPolicy.shrink`), decode's window 0 freed under the release route; the stream is in its prompt
-            /// phase with the scratch absent until `regrowTransient`, which the caller runs only after these frees landed.
+            /// forgotten (`LayerPolicy.shrink`), the prompt rows' residents forgotten or kept (`residents`), decode's window 0
+            /// freed under the release route; the stream is in its prompt phase with the scratch absent until `regrowTransient`,
+            /// which the caller runs only after these frees landed. The bytes freed do not depend on `residents`.
             /// Returns the bytes freed. MLX rows: the allocator's active bytes must drop by them, else a holder survived.
-            pub fn shrink(self: *Stream, prompt_rows: []const u32) !u64 {
+            pub fn shrink(self: *Stream, prompt_rows: []const u32, residents: Residents) !u64 {
                 if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
                 if (self.phase != .decode) return error.NotGrown;
                 if (self.failed) return error.StreamFailed;
@@ -2456,10 +2456,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         m.* = .{};
                     }
                     ls.policy.shrink(rows) catch unreachable;
-                    // The one place that decides which residents a later prompt finds: those of the prompt rows
-                    // (`keep_residents`, their prompt state cleared), or none, as at construction (its schedule then equals
-                    // the first prompt's; slot bytes stay, a load of the same record skips its read).
-                    if (self.keep_residents) ls.policy.forgetPrompt() else _ = ls.policy.forgetAll();
+                    // The one place that decides which residents a later prompt finds. `forget`: none, as at construction (its
+                    // schedule then equals the first prompt's; slot bytes stay, a load of the same record skips its read).
+                    // `keep`: those decode left in the prompt rows, whose bytes and meta nothing touched since their reads
+                    // landed (every route settled above); only the prompt state goes.
+                    _ = switch (residents) {
+                        .forget => ls.policy.forgetAll(),
+                        .keep => ls.policy.forgetPrompt(),
+                    };
                     if (ls.ext) |*e| e.deinit();
                     ls.ext = null;
                 }
@@ -2495,6 +2499,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.releaseHeld();
                 try self.flush();
                 for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
+            }
+
+            /// Residents over every layer's persistent rows (the reverse change's record: what the next prompt finds).
+            pub fn residentCount(self: *const Stream) u64 {
+                var n: u64 = 0;
+                for (self.layers) |*ls| n += ls.policy.occupancy;
+                return n;
             }
 
             /// The prompt scratch's bytes (`regrowTransient` allocates them).

@@ -291,13 +291,13 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         }
 
         /// The reverse phase change's free: the grown rows' and window 0's bindings nulled, then the stream frees them.
-        pub fn shrink(self: *Self, prompt_rows: []const u32) !u64 {
+        pub fn shrink(self: *Self, prompt_rows: []const u32, residents: S.Residents) !u64 {
             for (self.banks) |*b| {
                 b[@backingInt(BankKind.ext)] = null;
                 b[@backingInt(BankKind.transient)] = null;
             }
             self.transient_released = true;
-            return self.stream.shrink(prompt_rows);
+            return self.stream.shrink(prompt_rows, residents);
         }
 
         /// The reverse phase change's allocation: the prompt's scratch re-created and bound.
