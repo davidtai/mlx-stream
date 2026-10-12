@@ -18,6 +18,8 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const log = sdk.log;
 const glm = @import("config.zig");
 const kda = @import("kda.zig");
@@ -134,7 +136,7 @@ fn kernel() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("glm5_next_kda_percore", iv, ov, kernel_source, "", true, false);
+    const k = mtl.mlx_fast_metal_kernel_new("glm5_next_kda_percore", iv, ov, kernel_source, "", true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     kernel_obj = k;
     return k;
@@ -175,7 +177,7 @@ fn launch(g: *G, kern: mlx.mlx_fast_metal_kernel, plan: Plan, lb: T, q: T, k: T,
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
     var y = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
     const yt = try g.adopt(y);

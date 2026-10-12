@@ -13,6 +13,8 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const kset = @import("../../sdk_ext/kernel_set.zig");
@@ -69,7 +71,7 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         for ([_]Kernel{ k.split, k.merge }) |x| if (x.ctx != null) {
-            _ = mlx.mlx_fast_metal_kernel_free(x);
+            _ = mtl.mlx_fast_metal_kernel_free(x);
         };
         for (k.split_cfg ++ k.merge_cfg) |c| if (c.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -89,7 +91,7 @@ fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
+    const k = mtl.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
     if (k.ctx == null) return error.Glm5NextDsaDecodeKernel;
     return k;
 }
@@ -172,7 +174,7 @@ pub fn attend(g: *G, k: *const Kernels, q_abs: T, lat: T, sel: T, rows: u32) !T 
         defer _ = mlx.mlx_vector_array_free(in);
         var ov = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(ov);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k.split, in, k.split_cfg[rows - 1], g.s));
+        try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, k.split, in, k.split_cfg[rows - 1], g.s));
         for (&parts, 0..) |*p, i| {
             var x = mlx.mlx_array_new();
             mlx.check(mlx.mlx_vector_array_get(&x, ov, i)) catch |e| {
@@ -186,7 +188,7 @@ pub fn attend(g: *G, k: *const Kernels, q_abs: T, lat: T, sel: T, rows: u32) !T 
     defer _ = mlx.mlx_vector_array_free(in);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k.merge, in, k.merge_cfg[rows - 1], g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, k.merge, in, k.merge_cfg[rows - 1], g.s));
     var out = mlx.mlx_array_new();
     mlx.check(mlx.mlx_vector_array_get(&out, ov, 0)) catch |e| {
         _ = mlx.mlx_array_free(out);

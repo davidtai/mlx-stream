@@ -14,6 +14,8 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const kda = @import("kda.zig");
@@ -64,7 +66,7 @@ pub const Kernels = struct {
     consts: T = .{ .ctx = null },
 
     pub fn deinit(k: *Kernels) void {
-        if (k.decode.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(k.decode);
+        if (k.decode.ctx != null) _ = mtl.mlx_fast_metal_kernel_free(k.decode);
         for (k.cfg) |c| if (c.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(c);
         };
@@ -97,7 +99,7 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const glm.Config, fi
         defer _ = mlx.mlx_vector_string_free(in_vec);
         const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
         defer _ = mlx.mlx_vector_string_free(out_vec);
-        k.decode = mlx.mlx_fast_metal_kernel_new("glm5n_kda_decode", in_vec, out_vec, texts.decode, texts.header, true, false);
+        k.decode = mtl.mlx_fast_metal_kernel_new("glm5n_kda_decode", in_vec, out_vec, texts.decode, texts.header, true, false);
         if (k.decode.ctx == null) return error.Glm5NextKdaDecodeKernel;
     }
     const qkv: c_int = @intCast(c.kdaDim());
@@ -170,7 +172,7 @@ pub fn step(g: *G, k: *const Kernels, c: *const glm.Config, w: *const kda.Weight
     defer _ = mlx.mlx_vector_array_free(in);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k.decode, in, k.cfg[rows - 1], g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, k.decode, in, k.cfg[rows - 1], g.s));
     var outs: [3]T = undefined;
     for (&outs, 0..) |*o, i| {
         var y = mlx.mlx_array_new();

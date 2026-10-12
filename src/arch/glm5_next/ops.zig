@@ -6,6 +6,8 @@
 //! `hc_sinkhorn_collapse`.
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const host_caps = @import("../../host_caps.zig");
 /// Profile builds: the DSA split's `indexer` / `topk` marks in the prompt's selection (`selectRows`), with the scores
 /// committed between them while the prompt timeline records; compiled out of a served build.
@@ -260,7 +262,7 @@ fn mixes(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array, eps: 
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        const k = mlx.mlx_fast_metal_kernel_new("glm5_hc_mixes", iv, ov, MIXES_SOURCE, "#include <metal_simdgroup_matrix>\n", true, false);
+        const k = mtl.mlx_fast_metal_kernel_new("glm5_hc_mixes", iv, ov, MIXES_SOURCE, "#include <metal_simdgroup_matrix>\n", true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         mixes_kernel = k;
         break :blk k;
@@ -284,7 +286,7 @@ fn mixes(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array, eps: 
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
     var m = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(m);
     try mlx.check(mlx.mlx_vector_array_get(&m, ov, 0));
@@ -305,7 +307,7 @@ pub fn collapse(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        const k = mlx.mlx_fast_metal_kernel_new("glm5_hc_sinkhorn_collapse", iv, ov, COLLAPSE_SOURCE, GATES_HEADER, true, false);
+        const k = mtl.mlx_fast_metal_kernel_new("glm5_hc_sinkhorn_collapse", iv, ov, COLLAPSE_SOURCE, GATES_HEADER, true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         collapse_kernel = k;
         break :blk k;
@@ -330,7 +332,7 @@ pub fn collapse(s: mlx.mlx_stream, stream: mlx.mlx_array, fn_rows: mlx.mlx_array
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel, iv, cfg, s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kernel, iv, cfg, s));
     var out: Collapsed = .{ .x = mlx.mlx_array_new(), .post = mlx.mlx_array_new(), .comb = mlx.mlx_array_new() };
     errdefer out.deinit();
     try mlx.check(mlx.mlx_vector_array_get(&out.x, ov, 0));
@@ -487,7 +489,7 @@ pub const Deferred = struct {
         defer _ = mlx.mlx_vector_array_free(iv);
         var ov = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(ov);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
+        try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
@@ -532,7 +534,7 @@ fn hcKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, src, GATES_HEADER, true, false);
+    const k = mtl.mlx_fast_metal_kernel_new(name, iv, ov, src, GATES_HEADER, true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     slot.* = k;
     return k;
@@ -591,7 +593,7 @@ pub fn hcPre(s: mlx.mlx_stream, x: ?mlx.mlx_array, deferred: ?*const Deferred, f
         }
         var ov = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(ov);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
+        try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
         var out: Pre = .{ .normed = mlx.mlx_array_new(), .post = mlx.mlx_array_new(), .comb = mlx.mlx_array_new(), .h = mlx.mlx_array_new() };
         errdefer out.deinit();
         try mlx.check(mlx.mlx_vector_array_get(&out.normed, ov, 0));
@@ -643,7 +645,7 @@ pub fn expand(s: mlx.mlx_stream, x: mlx.mlx_array, stream: mlx.mlx_array, c: *co
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        const k = mlx.mlx_fast_metal_kernel_new("glm5_hc_expand", iv, ov, EXPAND_SOURCE, "", true, false);
+        const k = mtl.mlx_fast_metal_kernel_new("glm5_hc_expand", iv, ov, EXPAND_SOURCE, "", true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         expand_kernel = k;
         break :blk k;
@@ -664,7 +666,7 @@ pub fn expand(s: mlx.mlx_stream, x: mlx.mlx_array, stream: mlx.mlx_array, c: *co
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
@@ -745,7 +747,7 @@ pub fn withPooledKeys(s: mlx.mlx_stream, prev: mlx.mlx_array, chunk: mlx.mlx_arr
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        const k = mlx.mlx_fast_metal_kernel_new("glm5_dsa_pooled_rows", iv, ov, POOLED_ROWS_SOURCE, "", true, false);
+        const k = mtl.mlx_fast_metal_kernel_new("glm5_dsa_pooled_rows", iv, ov, POOLED_ROWS_SOURCE, "", true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         pooled_rows_kernel = k;
         break :blk k;
@@ -812,7 +814,7 @@ fn expandSelection(s: mlx.mlx_stream, sel: mlx.mlx_array, q_start: c_int, p: c_i
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        const k = mlx.mlx_fast_metal_kernel_new("glm5_dsa_expand_sel", iv, ov, EXPAND_SEL_SOURCE, "", true, false);
+        const k = mtl.mlx_fast_metal_kernel_new("glm5_dsa_expand_sel", iv, ov, EXPAND_SEL_SOURCE, "", true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         expand_sel_kernel = k;
         break :blk k;
@@ -834,7 +836,7 @@ fn expandSelection(s: mlx.mlx_stream, sel: mlx.mlx_array, q_start: c_int, p: c_i
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
@@ -1029,7 +1031,7 @@ fn decodeKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []c
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, src, header, true, false);
+    const k = mtl.mlx_fast_metal_kernel_new(name, iv, ov, src, header, true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     slot.* = k;
     return k;
@@ -1040,7 +1042,7 @@ fn applyOne(s: mlx.mlx_stream, kern: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fas
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));

@@ -10,6 +10,8 @@ const std = @import("std");
 pub const expert = @import("sdk_ext/expert.zig");
 /// G5: the kernel registry (routes, sets, the trace backend).
 pub const kernels = @import("sdk_ext/kernels.zig");
+/// Every MLX custom kernel's launch through the plugin's launch cache (no per-call source rebuild and hash).
+pub const metal_launch = @import("sdk_ext/metal_launch.zig");
 /// C2: the routed-expert quant contract and the generic gather quant (`GatherQmm` through `FromGatherMatmul`).
 pub const quant = @import("sdk_ext/quant.zig");
 /// G7: profile probes, injected by the arch's backend type (`of(Backend)`); off everywhere else.

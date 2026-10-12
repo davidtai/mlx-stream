@@ -15,6 +15,8 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const graph = @import("graph.zig");
@@ -154,7 +156,7 @@ test "glm5next glue GPU: router + top-8 texts against the stock route; the combi
             defer _ = mlx.mlx_vector_array_free(in);
             var ov = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(ov);
-            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k.top8, in, k.top8_cfg[m - 1], stream));
+            try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, k.top8, in, k.top8_cfg[m - 1], stream));
             for (&tail, 0..) |*o, i| {
                 var y = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_vector_array_get(&y, ov, i));
@@ -178,7 +180,7 @@ test "glm5next glue GPU: router + top-8 texts against the stock route; the combi
             defer _ = mlx.mlx_vector_array_free(in);
             var ov = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(ov);
-            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k.router, in, k.router_cfg[m - 1], stream));
+            try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, k.router, in, k.router_cfg[m - 1], stream));
             var y = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
             lg[0] = try g.adopt(y);
@@ -211,7 +213,7 @@ test "glm5next glue GPU: router + top-8 texts against the stock route; the combi
                 defer _ = mlx.mlx_vector_array_free(in);
                 var ov = mlx.mlx_vector_array_new();
                 defer _ = mlx.mlx_vector_array_free(ov);
-                try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k.router, in, k.router_cfg[0], stream));
+                try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, k.router, in, k.router_cfg[0], stream));
                 var y = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
                 l1[0] = try g.adopt(y);
