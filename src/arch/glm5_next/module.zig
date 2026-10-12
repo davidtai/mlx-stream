@@ -596,8 +596,10 @@ pub const Module = struct {
         _ = mlx.mlx_get_active_memory(&active);
         _ = mlx.mlx_get_cache_memory(&cache);
         _ = mlx.mlx_get_peak_memory(&peak);
+        // The decode phase's billed host side (MiMo's M1+M2: the measured bound where the readings cover the reserve).
+        const dh = bill.decodeHostTerms(self.reserve);
         log.info("glm5_next decode memory: footprint={d} mlx_active={d} mlx_cache={d} mlx_peak={d} footprint_less_mlx={d} billed_host_runtime={d} billed_mlx_cache={d} billed_compiler_runtime={d}\n", .{
-            footprint, active, cache, peak, footprint -| active -| cache, settings.host_bytes, experts.decode_cache_bytes, settings.compilation_bytes,
+            footprint, active, cache, peak, footprint -| active -| cache, dh.host, experts.decode_cache_bytes, dh.compiler,
         });
         const s1 = self.src.stats();
         const tok_s: f64 = if (d.wall_ns > 0) @as(f64, @floatFromInt(d.tokens)) * 1e9 / @as(f64, @floatFromInt(d.wall_ns)) else 0;

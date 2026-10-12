@@ -25,6 +25,45 @@ pub const fill_reserve_tokens: u64 = 16_384 + 1_024;
 pub const host_bytes: u64 = 1_000_000_000;
 pub const host_construction_bytes: u64 = 400_000_000;
 pub const compilation_bytes: u64 = 512 << 20;
+
+/// MiMo's M1 (`host_runtime`) + M2 (`compiler_runtime`) for glm5_next, the DECODE phase only (bill.zig
+/// `decodeHostTerms`): one measured bound for the process's host side, its footprint less MLX's active and cache (the
+/// host's allocations, the compiled graphs and Metal pipelines: what neither MLX nor a geometric term counts), the
+/// reading `Module.requestEnd` prints in its `glm5_next decode memory:` line. The rule is MiMo's and DeepSeek's: the
+/// max-shape reading + 0.02 GB for a long decode, rounded up to the next 50 MB. Readings: all 112 of the served and
+/// profile cells of 2026-10-12 (reports/.../mimo/cells/glm5next-*/**/server.log, stub runs excluded): BF16 and FP8
+/// packs, serial and the MTP lane, 1, 1,024, 10,403 and 16,384 decode tokens, reserves 4,096 and 32,768; host side
+/// 494.8-833.3 MB, the largest 833,268,278 B (g21b-vs-g21c 03-B: FP8, lane on, 115/131, MLX's cache read 0 at the end);
+/// the 16K-token decodes read 494.8 and 550.2 MB (no growth with decode length). Hence 900 MB in decode for host_runtime
+/// and compiler_runtime TOGETHER (the reading cannot split them): compiler_runtime's decode bytes are 0 and
+/// host_runtime's are this. The prompt phase keeps both declared terms (no prompt-phase reading), and so does every
+/// reserve the readings do not cover (`decode_host_measured_reserve`: 32,768, the largest read). MLX's cache term stays
+/// declared (bounded by its limit and the overshoot term, not by a snapshot). Releases 636,870,912 B in decode.
+pub const decode_host_reading_bytes: u64 = 833_268_278;
+pub const decode_host_long_decode_bytes: u64 = 20_000_000;
+pub const decode_host_bytes: u64 = (std.math.divCeil(u64, decode_host_reading_bytes + decode_host_long_decode_bytes, 50_000_000) catch unreachable) * 50_000_000;
+/// The largest construction reserve (tokens) the readings cover; above it the decode phase bills the declared terms.
+pub const decode_host_measured_reserve: u64 = 32_768;
+/// The no-under-bill fixture (bill.zig test "M1-M3"): each reading's footprint, MLX active, MLX cache, its cell's process
+/// bound and reserve: the largest host side of each pack and lane, the largest cache, the own-fill cells, the long
+/// decodes and the smallest reserve.
+pub const decode_host_readings = [_][5]u64{
+    .{ 95_305_026_376, 94_471_758_098, 0, 98_472_578_980, 32_768 }, // g21b-vs-g21c 03-B (FP8, lane; the largest host side)
+    .{ 95_617_616_664, 94_528_430_319, 276_389_478, 98_467_622_820, 32_768 }, // g19m-vs-g21b 02-B (FP8, lane; the largest cache)
+    .{ 96_932_302_648, 95_861_683_071, 268_727_143, 99_189_569_332, 32_768 }, // g19m-serial-vs-lane 02-B (BF16, lane)
+    .{ 97_995_707_200, 97_264_520_570, 8_586_644, 100_176_321_724, 32_768 }, // g19f-vs-g19f-stack3 03-B (BF16, serial)
+    .{ 103_666_213_752, 103_047_808_854, 8_586_644, 105_510_501_940, 32_768 }, // g19q-vs-g19q3 02-B (FP8, serial, own fill)
+    .{ 102_456_024_728, 101_606_242_482, 268_732_608, 105_024_025_756, 32_768 }, // g19-vs-g21c-ownfill 02-B (FP8, lane, own fill)
+    .{ 103_207_182_840, 102_615_296_446, 8_586_644, 105_492_585_324, 32_768 }, // g19-vs-g21c-ownfill 01-A (BF16, serial, own fill)
+    .{ 103_223_075_320, 102_615_296_446, 57_622_863, 105_492_585_324, 32_768 }, // glm5next-16k r05-16k (10,403 tokens)
+    .{ 103_118_643_680, 102_615_296_446, 8_586_644, 105_492_589_484, 32_768 }, // profile16k p16k (16,384 tokens)
+    .{ 86_480_924_336, 85_916_160_054, 28_309_072, 88_319_536_788, 4_096 }, // KL on the FP8 pack (reserve 4,096)
+};
+comptime {
+    // The decode phase holds the constructed module's host side too.
+    if (decode_host_bytes < host_construction_bytes) @compileError("decode host side under its construction bound");
+    if (decode_host_bytes > host_bytes + compilation_bytes) @compileError("decode host side over the declared terms");
+}
 /// MLX's buffer cache limit through the request (the decode phase's and the prompt pass's).
 pub const allocator_cache_bytes: u64 = 256 << 20;
 /// The reader's staging per worker: Flash's gate/up span (9,437,192 B) plus its page alignment and a page (bank.zig).
