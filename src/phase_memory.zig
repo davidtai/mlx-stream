@@ -164,6 +164,9 @@ pub const Construction = struct {
     cache: u64,
     /// The host side's part a bill names by construction (GLM-5.3's read pool staging): the measured terms bound the rest.
     host_known: u64 = 0,
+    /// The bytes the host's other models hold in this process (`foreignBytes`, read once at the check): the footprint
+    /// is the whole process's, the bill this module's, so both bounds rise by them (bytes held now, never a peak).
+    foreign: u64 = 0,
 
     pub fn of(mb: sdk.MemoryBill, prompt_rows: u32, footprint: u64, active: u64, cache: u64) Construction {
         return .{ .billed = mb.constructionBytes(prompt_rows), .footprint = footprint, .active = active, .cache = cache };
@@ -174,17 +177,18 @@ pub const Construction = struct {
     }
 
     pub fn residual(c: Construction) i64 {
-        return @as(i64, @intCast(c.billed)) - @as(i64, @intCast(c.footprint));
+        return @as(i64, @intCast(c.billed + c.foreign)) - @as(i64, @intCast(c.footprint));
     }
 
-    /// The footprint within `tolerance` of the construction terms (`sdk.checkConstruction`).
+    /// The footprint within `tolerance` of the construction terms and the other models' bytes (`sdk.checkConstruction`).
     pub fn checkFootprint(c: Construction, tolerance: u64) error{ConstructionOverBill}!void {
-        return sdk.checkConstruction(c.billed, c.footprint, tolerance);
+        return sdk.checkConstruction(c.billed + c.foreign, c.footprint, tolerance);
     }
 
-    /// The host side the measured terms bound: past the part the bill names by construction.
+    /// The host side the measured terms bound: past the part the bill names by construction and the other models' bytes
+    /// (a model outside MLX holds them on the host side; one on MLX leaves this bound the looser by them).
     pub fn measuredHost(c: Construction) u64 {
-        return c.hostSide() -| c.host_known;
+        return c.hostSide() -| c.host_known -| c.foreign;
     }
 
     /// The first measured term the measured host side exceeds (`sdk.checkMeasured`), null when none does.
@@ -193,6 +197,18 @@ pub const Construction = struct {
         return null;
     }
 };
+
+/// The bytes the host's other models hold in this process: #8's `sdk.memory.foreignBytes` (the host keeps it current),
+/// 0 where the SDK has no such reading yet. The construction checks raise their bounds by it (`Construction.foreign`).
+pub fn foreignBytes() u64 {
+    return if (comptime @hasDecl(sdk.memory, "foreignBytes")) sdk.memory.foreignBytes() else 0;
+}
+
+comptime {
+    // #8 publishes the setter and the reading together: a setter without the reading this file calls would silently
+    // read 0.
+    if (@hasDecl(sdk.memory, "setForeignBytes") and !@hasDecl(sdk.memory, "foreignBytes")) @compileError("phase_memory: sdk.memory.setForeignBytes without foreignBytes");
+}
 
 /// MLX's allocator and this process's footprint at a boundary, without the box's pages (host_statistics64 is
 /// rate-limited box-wide for non-platform binaries, so a settle's polls read only this process's own ledgers): MLX's
@@ -400,6 +416,24 @@ test "phase memory: the construction check bills the construction terms at the p
     c.host_known = 20;
     try testing.expect(c.overMeasured(mb) == null);
     try testing.expectError(error.ConstructionOverBill, Construction.of(mb, 3, 151, 100, 0).checkFootprint(0));
+    // Another model in the process holds 60 B: the footprint passes the bill by them, and both bounds rise by them.
+    var f = Construction.of(mb, 3, 200, 100, 0);
+    f.host_known = 20;
+    try testing.expectError(error.ConstructionOverBill, f.checkFootprint(0));
+    f.foreign = 60;
+    try f.checkFootprint(0);
+    try testing.expectEqual(@as(i64, 10), f.residual());
+    try testing.expect(f.overMeasured(mb) == null);
+    // Fewer than the 50 B the footprint passes the bill by: refused, and the measured host side is over its bound.
+    f.foreign = 49;
+    try testing.expectError(error.ConstructionOverBill, f.checkFootprint(0));
+    try testing.expectEqualStrings("host side", f.overMeasured(mb).?.name);
+    // The reading the check takes: #8's, where the SDK publishes it.
+    if (comptime @hasDecl(sdk.memory, "setForeignBytes")) {
+        sdk.memory.setForeignBytes(60);
+        defer sdk.memory.setForeignBytes(0);
+        try testing.expectEqual(@as(u64, 60), foreignBytes());
+    } else try testing.expectEqual(@as(u64, 0), foreignBytes());
 }
 
 test "phase memory: a record's residuals are the billed process less the footprint's high-water mark, the device terms less MLX's peak" {

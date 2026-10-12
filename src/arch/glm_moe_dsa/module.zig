@@ -431,9 +431,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const box = try Box.now(m);
             var cc = phase_mem.Construction.of(self.bill, prompt_rows, m.footprint, m.active, m.cache);
             cc.host_known = self.billed.phases[@intFromEnum(bill_mod.Phase.construction)].pool_staging;
-            log.info("glm_moe_dsa: construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (tolerance {d} B); the box {d} B used, the rest of it {d} B (the load's baseline {d} B, billed at {d} B)\n", .{ m.footprint, m.active, m.cache, m.hostSide(), cc.billed, cc.residual(), construction_tolerance_bytes, box.used, box.others, self.cfg.memory_baseline_bytes orelse 0, self.baseline });
+            // Another model in the process (the host's reading, #8): the footprint holds its bytes, the bill does not.
+            cc.foreign = phase_mem.foreignBytes();
+            log.info("glm_moe_dsa: construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, other models in the process {d} B, residual {d} B (tolerance {d} B); the box {d} B used, the rest of it {d} B (the load's baseline {d} B, billed at {d} B)\n", .{ m.footprint, m.active, m.cache, m.hostSide(), cc.billed, cc.foreign, cc.residual(), construction_tolerance_bytes, box.used, box.others, self.cfg.memory_baseline_bytes orelse 0, self.baseline });
             cc.checkFootprint(construction_tolerance_bytes) catch |e| {
-                log.err("glm_moe_dsa: load refused: the constructed footprint {d} B exceeds the billed construction terms {d} B by more than {d} B ({s})\n", .{ m.footprint, cc.billed, construction_tolerance_bytes, @errorName(e) });
+                log.err("glm_moe_dsa: load refused: the constructed footprint {d} B exceeds the billed construction terms {d} B and the other models' {d} B by more than {d} B ({s})\n", .{ m.footprint, cc.billed, cc.foreign, construction_tolerance_bytes, @errorName(e) });
                 return e;
             };
             if (cc.overMeasured(self.bill)) |t| {
