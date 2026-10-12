@@ -65,27 +65,15 @@ const Synth = struct {
                 std.mem.writeInt(u32, rec[@intCast(gs.offset)..][0..4], @bitCast(scale), .little);
             }
         }
-        var text: std.ArrayList(u8) = .empty;
-        defer text.deinit(a);
-        try text.print(a, "{{\"format\":\"{s}\",\"data_file\":\"{s}\",\"hidden_size\":{d},\"intermediate_size\":{d},\"num_experts\":{d},\"first_moe_layer\":{d},\"num_moe_layers\":1,", .{ bank.format, bank.mtp_files.data, g.hidden_size, g.intermediate_size, g.num_experts, g.first_moe_layer });
-        try text.print(a, "\"layout\":\"{s}\",\"alignment\":{d},\"record_bytes\":{d},\"record_stride\":{d},\"gate_up_bytes\":{d},\"down_bytes\":{d},\"quantization\":{{\"mode\":\"nvfp4\",\"bits\":4,\"group_size\":16}},", .{ layout, bank.page, g.logical_bytes, g.record_bytes, g.gate_up_bytes, g.logical_bytes - g.gate_up_bytes });
-        try text.appendSlice(a, "\"source\":{\"repository\":\"synthetic\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\"},\"parts\":[");
-        for (g.segments, 0..) |s, ci| {
-            try text.print(a, "{s}{{\"name\":\"{s}\",\"dtype\":\"{t}\",\"shape\":[", .{ if (ci == 0) "" else ",", @as(Component, @fromBackingInt(@intCast(ci))).name(), s.dtype });
-            for (s.shape[0..s.rank], 0..) |d, k| try text.print(a, "{s}{d}", .{ if (k == 0) "" else ",", d });
-            try text.print(a, "],\"offset\":{d},\"length\":{d}}}", .{ s.offset, s.length });
-        }
-        try text.appendSlice(a, "],\"records\":[");
-        for (0..g.num_experts) |i| {
-            var d: [32]u8 = undefined;
-            Sha256.hash(data[i * g.record_bytes ..][0..@intCast(g.logical_bytes)], &d, .{});
-            try text.print(a, "{s}{{\"layer\":{d},\"expert\":{d},\"offset\":{d},\"length\":{d},\"sha256\":\"{x}\"}}", .{ if (i == 0) "" else ",", g.first_moe_layer, i, i * g.record_bytes, g.logical_bytes, d });
-        }
+        const digests = try a.alloc([32]u8, g.num_experts);
+        defer a.free(digests);
+        for (digests, 0..) |*d, i| Sha256.hash(data[i * g.record_bytes ..][0..@intCast(g.logical_bytes)], d, .{});
         var whole: [32]u8 = undefined;
         Sha256.hash(data, &whole, .{});
-        try text.print(a, "],\"output_files\":{{\"{s}\":{{\"size\":{d},\"sha256\":\"{x}\"}}}}}}", .{ bank.mtp_files.data, g.total_bytes, whole });
+        const text = try manifestText(a, &g, layout, digests, whole);
+        defer a.free(text);
         try dir.writeFile(io, .{ .sub_path = bank.mtp_files.data, .data = data });
-        try dir.writeFile(io, .{ .sub_path = bank.mtp_files.manifest, .data = text.items });
+        try dir.writeFile(io, .{ .sub_path = bank.mtp_files.manifest, .data = text });
         return .{ .geom = g, .data = data };
     }
 
@@ -98,6 +86,71 @@ const Synth = struct {
         return self.data[@as(usize, expert) * @as(usize, @intCast(self.geom.record_bytes)) ..][0..@intCast(self.geom.logical_bytes)];
     }
 };
+
+/// A draft bank's manifest in the pack's form for `g` (`layout` its record layout), record i's sha256 `digests[i]`, the
+/// data file's `whole` (opening never hashes the bank: only its form is checked).
+fn manifestText(a: std.mem.Allocator, g: *const bank.Geometry, layout: []const u8, digests: []const [32]u8, whole: [32]u8) ![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(a);
+    try text.print(a, "{{\"format\":\"{s}\",\"data_file\":\"{s}\",\"hidden_size\":{d},\"intermediate_size\":{d},\"num_experts\":{d},\"first_moe_layer\":{d},\"num_moe_layers\":1,", .{ bank.format, bank.mtp_files.data, g.hidden_size, g.intermediate_size, g.num_experts, g.first_moe_layer });
+    try text.print(a, "\"layout\":\"{s}\",\"alignment\":{d},\"record_bytes\":{d},\"record_stride\":{d},\"gate_up_bytes\":{d},\"down_bytes\":{d},\"quantization\":{{\"mode\":\"nvfp4\",\"bits\":4,\"group_size\":16}},", .{ layout, bank.page, g.logical_bytes, g.record_bytes, g.gate_up_bytes, g.logical_bytes - g.gate_up_bytes });
+    try text.appendSlice(a, "\"source\":{\"repository\":\"synthetic\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\"},\"parts\":[");
+    for (g.segments, 0..) |s, ci| {
+        try text.print(a, "{s}{{\"name\":\"{s}\",\"dtype\":\"{t}\",\"shape\":[", .{ if (ci == 0) "" else ",", @as(Component, @fromBackingInt(@intCast(ci))).name(), s.dtype });
+        for (s.shape[0..s.rank], 0..) |d, k| try text.print(a, "{s}{d}", .{ if (k == 0) "" else ",", d });
+        try text.print(a, "],\"offset\":{d},\"length\":{d}}}", .{ s.offset, s.length });
+    }
+    try text.appendSlice(a, "],\"records\":[");
+    for (digests, 0..) |d, i| try text.print(a, "{s}{{\"layer\":{d},\"expert\":{d},\"offset\":{d},\"length\":{d},\"sha256\":\"{x}\"}}", .{ if (i == 0) "" else ",", g.first_moe_layer, i, i * g.record_bytes, g.logical_bytes, d });
+    try text.print(a, "],\"output_files\":{{\"{s}\":{{\"size\":{d},\"sha256\":\"{x}\"}}}}}}", .{ bank.mtp_files.data, g.total_bytes, whole });
+    return text.toOwnedSlice(a);
+}
+
+/// A draft bank in the pack's form at `g` whose data file is sparse (sized by `ftruncate`: a record reads as zeros) but
+/// for the records `written`, each filled from a seeded generator at its place in the file. Returns their bytes, in
+/// `written`'s order (the caller frees each and the list).
+fn writeSparse(a: std.mem.Allocator, io: std.Io, tmp: std.Io.Dir, dir: []const u8, g: *const bank.Geometry, written: []const u32, seed: u64) ![][]u8 {
+    const rec_len: usize = @intCast(g.logical_bytes);
+    const zeros = try a.alloc(u8, rec_len);
+    defer a.free(zeros);
+    @memset(zeros, 0);
+    var zero_digest: [32]u8 = undefined;
+    Sha256.hash(zeros, &zero_digest, .{});
+    const digests = try a.alloc([32]u8, g.num_experts);
+    defer a.free(digests);
+    @memset(digests, zero_digest);
+    const recs = try a.alloc([]u8, written.len);
+    var n_recs: usize = 0;
+    errdefer {
+        for (recs[0..n_recs]) |r| a.free(r);
+        a.free(recs);
+    }
+    var prng = std.Random.DefaultPrng.init(seed);
+    for (written) |e| {
+        recs[n_recs] = try a.alloc(u8, rec_len);
+        n_recs += 1;
+        prng.random().bytes(recs[n_recs - 1]);
+        Sha256.hash(recs[n_recs - 1], &digests[e], .{});
+    }
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, bank.mtp_files.data }, 0);
+    defer a.free(path);
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return error.TestUnexpectedResult;
+    defer _ = std.c.close(fd);
+    if (std.c.ftruncate(fd, @intCast(g.total_bytes)) != 0) return error.TestUnexpectedResult;
+    for (written, recs) |e, r| {
+        var done: usize = 0;
+        while (done < r.len) {
+            const n = std.c.pwrite(fd, r[done..].ptr, r.len - done, @intCast(@as(u64, e) * g.record_bytes + done));
+            if (n <= 0) return error.TestUnexpectedResult;
+            done += @intCast(n);
+        }
+    }
+    const text = try manifestText(a, g, bank.layout, digests, @splat(0));
+    defer a.free(text);
+    try tmp.writeFile(io, .{ .sub_path = bank.mtp_files.manifest, .data = text });
+    return recs;
+}
 
 /// The MTP layer's residents of `c` as one shard (`model-00001-of-00001.safetensors`, zero payload) and its index; `skip`
 /// leaves that spec entry out, `bad_shape` gives it one more row.
@@ -190,6 +243,113 @@ test "glm5_next mtp bank: a synthetic draft bank opens through the routed bank's
     var off_form = try Synth.write(a, io, tmp.dir, &c, 7, "nvfp4-gud-3part");
     defer off_form.deinit(a);
     try testing.expectError(error.Glm5NextMtpBankManifest, mtp.DraftBank.open(a, io, dir, &c, &diag));
+    try noDevice();
+}
+
+test "glm5_next mtp bank: a read of more records than one submit takes (17: submits of 8, 8 and 1) lands every record in its row, byte for byte" {
+    // The lane's open reads all 288 records: every submit but the last is full (8 records, 16 tickets). A full submit's
+    // ticket count once overflowed the type `@min` narrowed it to (u4) and the read waited on no ticket.
+    const a = testing.allocator;
+    const io = testing.io;
+    var c = toyConfig();
+    c.n_routed_experts = 17;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = try dirPath(io, tmp.dir, &buf);
+    var synth = try Synth.write(a, io, tmp.dir, &c, 0x17, bank.layout);
+    defer synth.deinit(a);
+    var diag: sdk.Diag = .{};
+    var db = try mtp.DraftBank.open(a, io, dir, &c, &diag);
+    defer db.deinit();
+    var rows = try mtp.Slots.HostSlotRows.init(db.layer(), 17);
+    defer rows.deinit();
+    var ids: [17]u32 = undefined;
+    var at: [17]u32 = undefined;
+    for (&ids, &at, 0..) |*e, *r, i| {
+        e.* = @intCast((i * 5) % 17);
+        r.* = @intCast(i);
+    }
+    try db.read(a, &rows, &ids, &at, &diag);
+    for (ids, at) |e, r| {
+        const rec = synth.record(e);
+        for (synth.geom.segments, 0..) |s, ci| try testing.expectEqualSlices(u8, rec[@intCast(s.offset)..][0..@intCast(s.length)], rows.row(@fromBackingInt(@intCast(ci)), r));
+    }
+    try noDevice();
+}
+
+test "glm5_next mtp bank: one read spanning past 2 GiB and 4 GiB of the data file (a sparse bank) lands every record at its 64-bit offset, byte for byte, in submits of 8" {
+    // The reader preads each range in staging-sized steps at 64-bit offsets: no single read spans the bank, none takes an
+    // offset past INT_MAX or UINT32_MAX wrong. 1,300 records of 3,543,040 B: 4,605,952,000 B, sparse but for four.
+    const a = testing.allocator;
+    const io = testing.io;
+    var c = toyConfig();
+    c.hidden_size = 2048;
+    c.moe_intermediate_size = 1024;
+    c.n_routed_experts = 1300;
+    const g = try bank.Geometry.init(c.hidden_size, c.moe_intermediate_size, c.n_routed_experts, c.n_layers, 1);
+    try testing.expect(g.total_bytes > 1 << 32 and 607 * g.record_bytes > 1 << 31 and 1213 * g.record_bytes > 1 << 32);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = try dirPath(io, tmp.dir, &buf);
+    const written = [_]u32{ 0, 607, 1213, 1299 };
+    const recs = try writeSparse(a, io, tmp.dir, dir, &g, &written, 0x2617);
+    defer {
+        for (recs) |r| a.free(r);
+        a.free(recs);
+    }
+    var diag: sdk.Diag = .{};
+    var db = mtp.DraftBank.open(a, io, dir, &c, &diag) catch |e| {
+        std.debug.print("{s}\n", .{diag.message()});
+        return e;
+    };
+    defer db.deinit();
+    try testing.expectEqual(g.total_bytes, db.view.sidecar.size);
+    // Nine records (a full submit, then one) across the file, the written ones among them; every digest checked.
+    const ids = [_]u32{ 1299, 0, 150, 300, 607, 900, 1100, 1213, 450 };
+    const at = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+    var rows = try mtp.Slots.HostSlotRows.init(db.layer(), ids.len);
+    defer rows.deinit();
+    db.read(a, &rows, &ids, &at, &diag) catch |e| {
+        std.debug.print("{s}\n", .{diag.message()});
+        return e;
+    };
+    for (written, recs) |e, rec| {
+        const r = std.mem.indexOfScalar(u32, &ids, e).?;
+        for (g.segments, 0..) |s, ci| try testing.expectEqualSlices(u8, rec[@intCast(s.offset)..][0..@intCast(s.length)], rows.row(@fromBackingInt(@intCast(ci)), @intCast(r)));
+    }
+    try noDevice();
+}
+
+test "glm5_next mtp bank: a data file that does not open read only past the page cache (unreadable, a symlink) is refused by name with its errno, never read" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const c = toyConfig();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = try dirPath(io, tmp.dir, &buf);
+    var synth = try Synth.write(a, io, tmp.dir, &c, 0x0ef, bank.layout);
+    defer synth.deinit(a);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, bank.mtp_files.data }, 0);
+    defer a.free(path);
+    var diag: sdk.Diag = .{};
+    // Unreadable (mode 0): the uncached open fails (EACCES); the refusal names the file, the open's error and errno.
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(path.ptr, 0));
+    if (std.c.access(path.ptr, std.c.R_OK) != 0) {
+        try testing.expectError(error.Glm5NextMtpBankFile, mtp.DraftBank.open(a, io, dir, &c, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), bank.mtp_files.data) != null);
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "OpenFailed (errno 13)") != null);
+    }
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(path.ptr, 0o644));
+    // A symlink to the bank: the reader never follows one (ELOOP), as the routed bank's experts.bin.
+    const real = try std.fmt.allocPrintSentinel(a, "{s}/real.bin", .{dir}, 0);
+    defer a.free(real);
+    try testing.expectEqual(@as(c_int, 0), std.c.rename(path.ptr, real.ptr));
+    try testing.expectEqual(@as(c_int, 0), std.c.symlink(real.ptr, path.ptr));
+    try testing.expectError(error.Glm5NextMtpBankFile, mtp.DraftBank.open(a, io, dir, &c, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "OpenFailed (errno 62)") != null);
     try noDevice();
 }
 

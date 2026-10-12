@@ -275,17 +275,22 @@ pub const DraftBank = struct {
 
     /// The bank beside the pack at `dir`: refused by name when absent (`Glm5NextMtpBankMissing`), when its manifest is
     /// not the routed bank's form or not this model's MTP layer (`Glm5NextMtpBankManifest`, `Glm5NextMtpGeometry`), and
-    /// when its data file is not the manifest's size (`Glm5NextMtpBankFile`).
+    /// when its data file does not open read only past the page cache (no symlink) or is not the manifest's size
+    /// (`Glm5NextMtpBankFile`, with the open's errno).
     pub fn open(a: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, diag: ?*sdk.Diag) !DraftBank {
         for ([_][]const u8{ bank.mtp_files.manifest, bank.mtp_files.data }) |f| {
             const p = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, f }, 0);
             defer a.free(p);
             if (std.c.access(p.ptr, std.c.F_OK) != 0) return refuse(diag, error.Glm5NextMtpBankMissing, "{s}: no draft bank (mtp_lane needs {s} and {s} beside the pack: scripts/quantize_glm5next_mtp_nvfp4.py quantize)", .{ p, bank.mtp_files.data, bank.mtp_files.manifest });
         }
-        var owner = bank.Bank.openOf(a, io, dir, bank.mtp_files) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.SidecarGeometry, error.SidecarOpen, error.FileNotFound, error.OpenFailed => return refuse(diag, error.Glm5NextMtpBankFile, "{s}/{s}: {s} (not the manifest's size, or not a regular file)", .{ dir, bank.mtp_files.data, @errorName(e) }),
-            else => return refuse(diag, error.Glm5NextMtpBankManifest, "{s}/{s}: {s} (not the routed bank's nvfp4-gud-9part form)", .{ dir, bank.mtp_files.manifest, @errorName(e) }),
+        var owner = bank.Bank.openOf(a, io, dir, bank.mtp_files) catch |e| {
+            const errno = std.c._errno().*;
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                // The data file's own: its uncached open (read only, F_NOCACHE, no symlink), its stat, its size.
+                error.FileNotFound, error.OpenFailed, error.NoCacheFcntl, error.NoCacheUnsupported, error.SidecarOpen, error.SidecarGeometry => refuse(diag, error.Glm5NextMtpBankFile, "{s}/{s}: {s} (errno {d}): the data file does not open read only past the page cache, or is not the manifest's size", .{ dir, bank.mtp_files.data, @errorName(e), errno }),
+                else => refuse(diag, error.Glm5NextMtpBankManifest, "{s}/{s}: {s} (not the routed bank's nvfp4-gud-9part form)", .{ dir, bank.mtp_files.manifest, @errorName(e) }),
+            };
         };
         errdefer owner.deinit();
         const g = &owner.geometry;
@@ -312,8 +317,10 @@ pub const DraftBank = struct {
     }
 
     /// Records `experts[i]` into row `rows_at[i]` of `rows` (host or MLX slot rows: `rowDest`), through the routed bank's
-    /// reader (`bank.Records.submit`, its gate/up and down spans, `max_items` records a job), then each record's nine
-    /// parts (its 14,155,788 data bytes in order) against its manifest sha256 (`Glm5NextMtpBankDigest`).
+    /// reader (`bank.Records.submit`, its gate/up and down spans, `max_items` records a submit, every range read in
+    /// staging-sized preads at 64-bit offsets), then each record's nine parts (its 14,155,788 data bytes in order) against
+    /// its manifest sha256 (`Glm5NextMtpBankDigest`). A range that does not land is refused with its status, errno and
+    /// bytes (`Glm5NextMtpBankRead`).
     pub fn read(b: *const DraftBank, a: std.mem.Allocator, rows: anytype, ids: []const u32, rows_at: []const u32, diag: ?*sdk.Diag) !void {
         std.debug.assert(ids.len == rows_at.len);
         var pool = try expert_io.Pool.start(a, .{ .staging_bytes = settings.reader_staging_bytes });
@@ -322,7 +329,9 @@ pub const DraftBank = struct {
         for (&lens, b.layer().segments) |*l, s| l.* = s.length;
         var at: usize = 0;
         while (at < ids.len) {
-            const n = @min(expert_io.max_items, ids.len - at);
+            // `usize`, never the type `@min` narrows to from the comptime `max_items` (u4: `2 * n` overflows at a full
+            // submit of 8; in a ReleaseFast build the wait then covered no ticket and the reads raced the checks).
+            const n: usize = @min(expert_io.max_items, ids.len - at);
             var gu: [expert_io.max_items]u64 = undefined;
             var down: [expert_io.max_items]u64 = undefined;
             var dests: [expert_io.max_items]bank.Records.Rows = undefined;
@@ -336,7 +345,7 @@ pub const DraftBank = struct {
             pool.wait(first, @intCast(2 * n), 120 * std.time.ns_per_s) catch |e| return refuse(diag, error.Glm5NextMtpBankRead, "{s}: the reader did not finish ({s})", .{ bank.mtp_files.data, @errorName(e) });
             for (0..2 * n) |t| {
                 const r = pool.result(first + @as(u32, @intCast(t)));
-                if (r.status != .ok) return refuse(diag, error.Glm5NextMtpBankRead, "{s}: expert {d}: read status {d}", .{ bank.mtp_files.data, ids[at + t % n], @backingInt(r.status) });
+                if (r.status != .ok) return refuse(diag, error.Glm5NextMtpBankRead, "{s}: expert {d}: {s} range: read status {d} errno {d}, {d} bytes landed of {d} returned in {d} preads", .{ bank.mtp_files.data, ids[at + t % n], if (t < n) "gate/up" else "down", @backingInt(r.status), r.errno, r.payload, r.bytes_returned, r.preadv_calls });
             }
             at += n;
         }
