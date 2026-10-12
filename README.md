@@ -281,8 +281,9 @@ bf16res tier has not been measured on these builds.
 
 [![1K–1M sweep summary on 746e7da9: decode, prefill, TTFT, memory peaks and completion tokens](docs/benchmarks/mimo-v26-flash/summary.png)](docs/benchmarks/mimo-v26-flash/README.md)
 
-HumanEval (164 problems, one sample each, pass@1, cap 16,384 tokens, thinking on, rows 127 / 145): greedy 155 / 164
-= 0.9451, card 157 / 164 = 0.9573; every failure is a wrong answer (none truncated, looped, without code or errored).
+HumanEval (164 problems, one sample each, pass@1, rows 127 / 145), two arms with their own settings: greedy (temperature 0,
+seed 0, thinking off, cap 8,192 tokens) 155 / 164 = 0.9451; card (temperature 1.0, top_p 0.95, seed 1, thinking on, cap
+16,384 tokens) 157 / 164 = 0.9573. Every failure is a wrong answer (none truncated, looped, without code or errored).
 Scored on `746e7da9` (host `2c041af6` + this branch at `8e7d186`); the earlier run on
 `bb3c7245` (host `2c041af6` + plugin `d67567e`, this branch before its layout move) gave the same counts and the same
 failing problems.
