@@ -41,10 +41,14 @@ KERNELS = [
      "inputs": [arg("x", "bfloat16"), arg("gt", "uint32"), arg("pt", "uint32"), arg("sc", "float32")]
      + banks("rg", "float16") + banks("ru", "float16") + banks("cg", "uint16") + banks("cu", "uint16"),
      "outputs": [arg("zg", "float32"), arg("zu", "float32")]},
-    {"name": "glm53_dec_down", "family": "decode", "headers": ["dig2"] + DEC, "threadgroup": [512, 1, 1],
-     "template": ["K", "HID", "MINI", "MAXM", "DEV", "T"], "k": True,
+    {"name": "glm53_dec_down", "family": "decode", "headers": ["dig2"] + DEC, "threadgroup": [256, 1, 1],
+     "template": ["K", "HID", "MINI", "MAXM", "DEV"], "k": True,
      "inputs": [arg("zg", "float32"), arg("zu", "float32"), arg("gt", "uint32"), arg("pt", "uint32"), arg("sc", "float32")]
-     + banks("og", "float16") + banks("ou", "float16") + banks("di", "float16") + banks("cd", "uint16") + banks("do", "float16"),
+     + banks("og", "float16") + banks("ou", "float16") + banks("di", "float16") + banks("cd", "uint16"),
+     "outputs": [arg("zd", "float32")]},
+    {"name": "glm53_dec_fin", "family": "decode", "headers": DEC, "threadgroup": [32, 1, 1],
+     "template": ["HID", "DEV", "T"], "k": False,
+     "inputs": [arg("zd", "float32"), arg("pt", "uint32"), arg("sc", "float32")] + banks("do", "float16"),
      "outputs": [arg("y", "T")]},
     {"name": "glm53_dec_combine", "family": "decode", "headers": ["glm53_common"], "threadgroup": [256, 1, 1],
      "template": ["T", "HID", "TOPK", "ACC"], "k": False,

@@ -565,14 +565,14 @@ test "glm53 selfcheck: each chain check fails on a wrong codebook, a wrong K, a 
         try testing.expect(!cb.ok and cb.bad > 0);
         // the rank sum: three of the four minis summed
         const rank = if (fam == .decode)
-            try mutatedText(a, s, .{ .kernel = .glm53_dec_down }, "for (uint r = 0u; r < 4u; ++r) {\n            const threadgroup float* zr", "for (uint r = 0u; r < 3u; ++r) {\n            const threadgroup float* zr", fam, inst)
+            try mutatedText(a, s, .{ .kernel = .glm53_dec_fin }, "for (uint r = 0u; r < 4u; ++r) {", "for (uint r = 0u; r < 3u; ++r) {", fam, inst)
         else
             try mutatedText(a, s, .{ .kernel = .glm53_pf_down }, "for (int r = 0; r < 4; ++r) {", "for (int r = 0; r < 3; ++r) {", fam, inst);
         try testing.expect(!rank.ok and rank.bad > 0);
         std.debug.print("glm53 selfcheck mutations {t} K{d}: clean {d:.3} ulp; codebook {d} bad, rank sum {d} bad of {d}\n", .{ fam, k, clean.metric, cb.bad, rank.bad, rank.words });
         if (fam == .decode) {
             // the device mode's pair of score 0 through the down (its slot's NaN rin and rout read)
-            const skip = try mutatedText(a, s, .{ .kernel = .glm53_dec_down }, "live[j] = packed != 0xffffffffu && j < cnt && sc[pos[j]] != 0.0f;", "live[j] = packed != 0xffffffffu && j < cnt;", fam, inst);
+            const skip = try mutatedText(a, s, .{ .kernel = .glm53_dec_fin }, "if (packed == 0xffffffffu || sc[pos] == 0.0f) {", "if (packed == 0xffffffffu) {", fam, inst);
             try testing.expect(!skip.ok and skip.bad > 0);
             std.debug.print("glm53 selfcheck mutations decode K{d}: score-0 skip dropped {d} bad of {d}\n", .{ k, skip.bad, skip.words });
         }
