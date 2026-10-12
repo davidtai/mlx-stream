@@ -101,7 +101,7 @@ pub const Weights = struct {
     pub fn ownedBytes(c: *const glm.Config, page: u64) struct { tables: u64, routers: u64 } {
         const hc_mix: u64 = (2 + @as(u64, c.hc_mult)) * c.hc_mult;
         const mhc = 2 * (bufferBytes(hc_mix * c.hc_mult * c.hidden_size * 4, page) + bufferBytes(hc_mix * 4, page) + bufferBytes(3 * 4, page));
-        const kda_tables = 2 * bufferBytes(@as(u64, c.kdaDim()) * 4, page) + bufferBytes(@as(u64, c.kdaConvDim()) * c.kda_conv * 4, page);
+        const kda_tables = 2 * bufferBytes(@as(u64, c.kdaDim()) * 4, page) + bufferBytes(@as(u64, c.kda_heads) * 4, page) + bufferBytes(@as(u64, c.kdaConvDim()) * c.kda_conv * 4, page);
         const dsa_tables = bufferBytes(@as(u64, c.hidden_size) * c.index_head_dim * 4, page) + bufferBytes(@as(u64, c.index_kpool) * c.index_head_dim * 4, page);
         return .{
             .tables = c.n_layers * mhc + c.nKda() * kda_tables + c.nDsa() * dsa_tables,
@@ -111,7 +111,7 @@ pub const Weights = struct {
 
     /// The owned arrays' count (the bill's buffer census).
     pub fn ownedArrays(c: *const glm.Config) u64 {
-        return c.n_layers * 6 + c.nKda() * 3 + c.nDsa() * 4 + c.moeLayers();
+        return c.n_layers * 6 + c.nKda() * 4 + c.nDsa() * 4 + c.moeLayers();
     }
 
     pub fn bind(a: std.mem.Allocator, s: mlx.mlx_stream, map: *const sdk.Weights, c: *const glm.Config, diag: ?*sdk.Diag) !Weights {
@@ -194,6 +194,7 @@ pub const Weights = struct {
                 const hv: c_int = @intCast(c.kda_heads);
                 const dk: c_int = @intCast(c.kda_head_dim);
                 const dim = hv * dk;
+                const a_log = try lg.get("self_attn.A_log", &.{hv});
                 lw.attn = .{ .kda = .{
                     .q = try lg.get("self_attn.q_proj.weight", &.{ dim, h }),
                     .k = try lg.get("self_attn.k_proj.weight", &.{ dim, h }),
@@ -203,7 +204,8 @@ pub const Weights = struct {
                     .g_a = try lg.get("self_attn.g_a_proj.weight", &.{ dk, h }),
                     .g_b = try lg.get("self_attn.g_b_proj.weight", &.{ dim, dk }),
                     .b = try lg.get("self_attn.b_proj.weight", &.{ hv, h }),
-                    .a_exp = try w.own(a, try aExp(s, try lg.get("self_attn.A_log", &.{hv}), hv, dk)),
+                    .a_log = try w.own(a, try aLogTable(s, a_log, l, diag)),
+                    .a_exp = try w.own(a, try aExp(s, a_log, hv, dk)),
                     .dt_bias = try w.own(a, try f32Copy(s, try lg.get("self_attn.dt_bias", &.{dim}), false)),
                     .conv_w = try w.own(a, try convLayout(s, try lg.get("self_attn.conv1d.weight", &.{ 3 * dim, 1, @intCast(c.kda_conv) }))),
                     .o_norm = try lg.get("self_attn.o_norm.weight", &.{dk}),
@@ -318,6 +320,23 @@ fn aExp(s: mlx.mlx_stream, a_log: T, hv: c_int, dk: c_int) !T {
     try mlx.check(mlx.mlx_exp(&out, flat, s));
     try mlx.check(mlx.mlx_array_eval(out));
     return out;
+}
+
+/// The A_log dtypes the bind takes (the pack of record stores F32 on layers 0-2 and BF16 on the rest): the floats the
+/// device converts to f32 exactly.
+pub fn aLogAccepted(dt: mlx.mlx_dtype) bool {
+    return dt == .float32 or dt == .bfloat16 or dt == .float16;
+}
+
+/// `layer`'s A_log dtype as the bind takes it; any other refuses the load by name.
+fn aLogCheck(dt: mlx.mlx_dtype, layer: u32, diag: ?*sdk.Diag) !void {
+    if (!aLogAccepted(dt)) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} self_attn.A_log is {t}, not a float (F32, BF16 or F16)", .{ layer, dt });
+}
+
+/// A_log [heads] of `layer` as its own F32 table, evaluated, once (the per-core prompt route reads it: kda_percore.zig).
+fn aLogTable(s: mlx.mlx_stream, a_log: T, layer: u32, diag: ?*sdk.Diag) !T {
+    try aLogCheck(mlx.mlx_array_dtype(a_log), layer, diag);
+    return f32Copy(s, a_log, false);
 }
 
 /// The pack's depthwise conv [C, 1, K] (HF) as MLX's conv1d reads it, [C, K, 1], f32, evaluated.
@@ -742,10 +761,115 @@ test "glm5_next graph: the owned f32 tables' bytes and the call geometry" {
     const c: glm.Config = .{};
     const page: u64 = 16384;
     const o = Weights.ownedBytes(&c, page);
-    // 90 hyper-connections ([24, 16384] + [24] + [3] f32), 34 KDA layers' exp(A_log) and dt_bias [8192] and conv
-    // [24576, 4], 11 DSA layers' pool gate [4096, 128] and ape [4, 128]; 42 routers [4096, 288] f32.
-    try testing.expectEqual(@as(u64, 90 * (1_572_864 + 96 + 12) + 34 * (2 * 32_768 + 393_216) + 11 * (2_097_152 + 2048)), o.tables);
+    // 90 hyper-connections ([24, 16384] + [24] + [3] f32), 34 KDA layers' exp(A_log) and dt_bias [8192], A_log [64] and
+    // conv [24576, 4], 11 DSA layers' pool gate [4096, 128] and ape [4, 128]; 42 routers [4096, 288] f32.
+    try testing.expectEqual(@as(u64, 90 * (1_572_864 + 96 + 12) + 34 * (2 * 32_768 + 256 + 393_216) + 11 * (2_097_152 + 2048)), o.tables);
+    try testing.expectEqual(@as(u64, 45 * 6 + 34 * 4 + 11 * 4 + 42), Weights.ownedArrays(&c));
     try testing.expectEqual(@as(u64, 42 * 4_718_592), o.routers);
     try testing.expectEqual(@as(u32, 16_384), prompt_call_rows);
     try testing.expect(prompt_call_rows % span_rows == 0 and dump_chunk_rows <= span_rows);
+}
+
+test "glm5_next graph: the bind takes A_log in F32 and BF16 (the pack's dtypes) and F16, and refuses any other dtype by name" {
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 }) |dt| try aLogCheck(dt, 4, null);
+    for ([_]mlx.mlx_dtype{ .bool_, .uint8, .uint32, .int8, .int32, .int64, .float64, .complex64 }) |dt| {
+        var diag: sdk.Diag = .{};
+        try testing.expectError(error.Glm5NextResidentDtype, aLogCheck(dt, 7, &diag));
+        var buf: [96]u8 = undefined;
+        const want = try std.fmt.bufPrint(&buf, "layer 7 self_attn.A_log is {t}, not a float", .{dt});
+        try testing.expect(std.mem.indexOf(u8, diag.message(), want) != null);
+    }
+}
+
+/// A safetensors dtype name as MLX's dtype (null: none).
+fn safetensorsDtype(name: []const u8) ?mlx.mlx_dtype {
+    const table = [_]struct { []const u8, mlx.mlx_dtype }{
+        .{ "BOOL", .bool_ },  .{ "U8", .uint8 },     .{ "U16", .uint16 }, .{ "U32", .uint32 }, .{ "U64", .uint64 },
+        .{ "I8", .int8 },     .{ "I16", .int16 },    .{ "I32", .int32 },  .{ "I64", .int64 },  .{ "F16", .float16 },
+        .{ "F32", .float32 }, .{ "F64", .float64 },  .{ "BF16", .bfloat16 },
+    };
+    for (table) |e| if (std.mem.eql(u8, e[0], name)) return e[1];
+    return null;
+}
+
+/// A shard's safetensors header, read past the page cache (F_NOCACHE) and parsed.
+fn shardHeader(a: std.mem.Allocator, dir: []const u8, shard: []const u8) !std.json.Parsed(std.json.Value) {
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, shard }, 0);
+    defer a.free(path);
+    const fd = try sdk.io_util.openNoCache(path.ptr, .{});
+    defer _ = std.c.close(fd);
+    var prefix: [8]u8 = undefined;
+    if (std.c.pread(fd, &prefix, prefix.len, 0) != prefix.len) return error.Glm5NextResidentShard;
+    const len = std.mem.readInt(u64, &prefix, .little);
+    if (len < 2 or len > 64 << 20) return error.Glm5NextResidentShard;
+    const header = try a.alloc(u8, @intCast(len));
+    defer a.free(header);
+    var done: usize = 0;
+    while (done < header.len) {
+        const n = std.c.pread(fd, header[done..].ptr, header.len - done, @intCast(8 + done));
+        if (n <= 0) return error.Glm5NextResidentShard;
+        done += @intCast(n);
+    }
+    return std.json.parseFromSlice(std.json.Value, a, header, .{ .allocate = .alloc_always });
+}
+
+// GLM5_BANK=<pack> (headers only, no payload): every KDA layer's A_log dtype as the pack's shards declare it, each one the
+// bind converts; the dtype histogram printed (the pack of record: F32 on layers 0-2, BF16 on the other 31).
+test "glm5_next graph: every KDA layer's A_log dtype in the pack's headers is one the bind converts (GLM5_BANK)" {
+    const dir = std.mem.span(std.c.getenv("GLM5_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    defer d.close(io);
+    const config_text = try d.readFileAlloc(io, "config.json", a, .limited(1 << 20));
+    defer a.free(config_text);
+    var cdiag: glm.Diag = .{};
+    const c = glm.Config.parse(a, config_text, &cdiag) catch |e| {
+        std.debug.print("config refused: {s}\n", .{cdiag.message()});
+        return e;
+    };
+    const raw = try d.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 << 20));
+    defer a.free(raw);
+    const index = try std.json.parseFromSlice(std.json.Value, a, raw, .{ .allocate = .alloc_always });
+    defer index.deinit();
+    const wm = index.value.object.get("weight_map").?.object;
+    var headers: std.StringArrayHashMapUnmanaged(std.json.Parsed(std.json.Value)) = .empty;
+    defer {
+        for (headers.values()) |*h| h.deinit();
+        headers.deinit(a);
+    }
+    var hist: std.StringArrayHashMapUnmanaged(u32) = .empty;
+    defer hist.deinit(a);
+    var n: u32 = 0;
+    var l: u32 = 0;
+    while (l < c.n_layers) : (l += 1) {
+        if (c.isDsa(l)) continue;
+        var nb: [96]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "model.language_model.layers.{d}.self_attn.A_log", .{l});
+        const shard = (wm.get(name) orelse return error.Glm5NextResidentMissing).string;
+        if (headers.get(shard) == null) {
+            const header = try shardHeader(a, dir, shard);
+            errdefer header.deinit();
+            try headers.put(a, shard, header);
+        }
+        const desc = headers.get(shard).?.value.object.get(name) orelse return error.Glm5NextResidentMissing;
+        const dtype = desc.object.get("dtype").?.string;
+        const dt = safetensorsDtype(dtype) orelse {
+            std.debug.print("layer {d} self_attn.A_log: dtype {s} has no MLX dtype\n", .{ l, dtype });
+            return error.Glm5NextResidentDtype;
+        };
+        var ldiag: sdk.Diag = .{};
+        aLogCheck(dt, l, &ldiag) catch |e| {
+            std.debug.print("{s}\n", .{ldiag.message()});
+            return e;
+        };
+        const h = try hist.getOrPut(a, dtype);
+        if (!h.found_existing) h.value_ptr.* = 0;
+        h.value_ptr.* += 1;
+        n += 1;
+    }
+    try testing.expectEqual(c.nKda(), n);
+    std.debug.print("\nGLM5_NEXT A_LOG pack={s} kda_layers={d} dtypes:", .{ dir, n });
+    for (hist.keys(), hist.values()) |k, v| std.debug.print(" {s}={d}", .{ k, v });
+    std.debug.print("\n", .{});
 }
