@@ -6,192 +6,34 @@
 //! in the same order. Zeros of either sign tie, as they compare equal; a NaN (the indexer writes none) sorts as its
 //! bits do. Not the host's glm5_next TOPK_EXPAND: that selects one decode query's pooled scores and writes its pools
 //! in chronological order (ties to the lower index); the prompt needs argpartition's ids, in its order, for every row.
+//!
+//! The texts (one threadgroup of 1024 threads per row, `K` a template argument; the one-buffer form reads its rows from
+//! `scores` at one length `params[0]`, the rows form row `r` from its own input `s<r>` at length `params[r]`) are the
+//! pinned registry's (`trunk_kernels`: kernels/glm_moe_dsa/), built and run once at the module's construction.
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const ops = @import("../deepseek_v41/ops.zig");
+const trunk = @import("trunk_kernels.zig");
 
 const G = ops.MlxOps;
 const T = G.T;
 
-/// One threadgroup of 1024 threads per row; `K` (a power of two up to 2048) a template argument. `topk`'s rows lie in
-/// one buffer (`scores`) at one length (`params[0]`); `topkRows`' row `r` is its own input `s<r>` at length `params[r]`.
-const source: [:0]const u8 =
-    \\    const uint n = uint(params[0]);
-    \\    const uint row = threadgroup_position_in_grid.y;
-    \\    const device float* srow = scores + ulong(row) * ulong(n);
-++ "\n" ++ body;
-
-fn rowsSource(comptime r: usize) [:0]const u8 {
-    return comptime blk: {
-        @setEvalBranchQuota(200_000);
-        var cases: []const u8 = "";
-        for (1..r) |i| cases = cases ++ std.fmt.comptimePrint("        case {d}: srow = s{d}; break;\n", .{ i, i });
-        break :blk std.fmt.comptimePrint(
-            \\    const uint row = threadgroup_position_in_grid.y;
-            \\    const uint n = uint(params[row]);
-            \\    const device float* srow = s0;
-            \\    switch (row) {{
-            \\{s}        default: break;
-            \\    }}
-            \\{s}
-        , .{ cases, body });
-    };
-}
-
-const body =
-    \\    const uint tid = thread_position_in_threadgroup.x;
-    \\    const uint lane = thread_index_in_simdgroup;
-    \\    const uint sg = simdgroup_index_in_threadgroup;
-    \\    threadgroup atomic_uint hist[2048];
-    \\    threadgroup uint part[32];
-    \\    threadgroup uint st[6];
-    \\    threadgroup atomic_uint taken;
-    \\    threadgroup ulong sel[K];
-    \\    // st: the composite prefix (value key, index), its masks, the elements still to take.
-    \\    if (tid == 0) {
-    \\        st[0] = 0; st[1] = 0; st[2] = 0; st[3] = 0; st[4] = uint(K); st[5] = 0;
-    \\        atomic_store_explicit(&taken, 0u, memory_order_relaxed);
-    \\    }
-    \\    uint ibits = 0;
-    \\    while ((1u << ibits) < n) ibits++;
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    // Passes over the composite key from its top: the value key in 11 + 11 + 10 bits, then the index in 11-bit
-    \\    // digits (only while the threshold's ties outnumber the elements still to take).
-    \\    const uint passes = 3 + (ibits + 10) / 11;
-    \\    for (uint p = 0; p < passes; ++p) {
-    \\        const bool on_value = p < 3;
-    \\        const uint width = on_value ? (p < 2 ? 11u : 10u) : min(11u, ibits - (p - 3) * 11u);
-    \\        const uint shift = on_value ? (p == 0 ? 21u : (p == 1 ? 10u : 0u)) : ibits - (p - 3) * 11u - width;
-    \\        const uint nbins = 1u << width;
-    \\        if (p >= 3 && st[5] == 1u) break;
-    \\        for (uint b = tid; b < 2048u; b += 1024u) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        const uint pv = st[0], mv = st[1], pi = st[2], mi = st[3];
-    \\        for (uint i = tid; i < n; i += 1024u) {
-    \\            const float f = srow[i];
-    \\            uint u = as_type<uint>(f);
-    \\            if (f == 0.0f) u = 0u;
-    \\            const uint kv = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-    \\            if ((kv & mv) != pv || (i & mi) != pi) continue;
-    \\            const uint d = ((on_value ? kv : i) >> shift) & (nbins - 1u);
-    \\            atomic_fetch_add_explicit(&hist[d], 1u, memory_order_relaxed);
-    \\        }
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        // Thread t holds bins nbins - 1 - 2t and nbins - 2 - 2t: its inclusive prefix counts the elements from the
-    \\        // top bin down to its lower bin.
-    \\        const int bh = int(nbins) - 1 - 2 * int(tid);
-    \\        const int bl = bh - 1;
-    \\        const uint ch = bh >= 0 ? atomic_load_explicit(&hist[bh], memory_order_relaxed) : 0u;
-    \\        const uint cl = bl >= 0 ? atomic_load_explicit(&hist[bl], memory_order_relaxed) : 0u;
-    \\        const uint s = ch + cl;
-    \\        const uint inc = simd_prefix_inclusive_sum(s);
-    \\        if (lane == 31) part[sg] = inc;
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        uint before = 0;
-    \\        for (uint k = 0; k < sg; ++k) before += part[k];
-    \\        const uint upto = before + inc;
-    \\        const uint above = upto - s;
-    \\        const uint need = st[4];
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        if (above < need && upto >= need) {
-    \\            uint bin, left, ties;
-    \\            if (above + ch >= need) { bin = uint(bh); left = need - above; ties = ch; }
-    \\            else { bin = uint(bl); left = need - above - ch; ties = cl; }
-    \\            if (on_value) { st[0] = pv | (bin << shift); st[1] = mv | ((nbins - 1u) << shift); }
-    \\            else { st[2] = pi | (bin << shift); st[3] = mi | ((nbins - 1u) << shift); }
-    \\            st[4] = left;
-    \\            // Every element of the bin taken: no lower digit decides among them.
-    \\            st[5] = ties == left ? 1u : 0u;
-    \\        }
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    }
-    \\    // The k elements at or above the threshold: the prefix's elements whose remaining digits are all taken (the
-    \\    // threshold's bin, kept whole) and every element whose composite key is above the prefix.
-    \\    const uint pv = st[0], mv = st[1], pi = st[2], mi = st[3];
-    \\    for (uint i = tid; i < n; i += 1024u) {
-    \\        const float f = srow[i];
-    \\        uint u = as_type<uint>(f);
-    \\        if (f == 0.0f) u = 0u;
-    \\        const uint kv = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-    \\        const bool hi_v = (kv & mv) > pv;
-    \\        const bool eq_v = (kv & mv) == pv;
-    \\        const bool keep = hi_v || (eq_v && ((i & mi) >= pi));
-    \\        if (keep) {
-    \\            const uint at = atomic_fetch_add_explicit(&taken, 1u, memory_order_relaxed);
-    \\            if (at < uint(K)) sel[at] = (ulong(kv) << 32) | ulong(i);
-    \\        }
-    \\    }
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    // Ascending (value, index): a bitonic sort of the k composite keys.
-    \\    for (uint size = 2; size <= uint(K); size <<= 1) {
-    \\        for (uint stride = size >> 1; stride > 0; stride >>= 1) {
-    \\            for (uint t = tid; t < uint(K) / 2u; t += 1024u) {
-    \\                const uint i = (t / stride) * 2u * stride + (t % stride);
-    \\                const uint j = i + stride;
-    \\                const bool up = (i & size) == 0u;
-    \\                const ulong a = sel[i];
-    \\                const ulong b = sel[j];
-    \\                if ((a > b) == up) { sel[i] = b; sel[j] = a; }
-    \\            }
-    \\            threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        }
-    \\    }
-    \\    for (uint j = tid; j < uint(K); j += 1024u) out[ulong(row) * uint(K) + j] = int(uint(sel[j] & 0xffffffffu));
-;
-
 /// The most rows `topkRows` takes in one launch: its lengths ride in `params`' eight slots (a verify has at most
 /// `max_route_ids / n_experts_per_tok` = 6 rows).
-pub const max_rows = 8;
+pub const max_rows = trunk.max_topk_rows;
 
-/// Whether the kernel serves a top `k`: a power of two up to 2048 (the memory bill charges the selection by it).
+/// Whether the kernel serves a top `k`: an instantiation the registry registers (`trunk_kernels.topk_instances`; the
+/// memory bill charges the selection by it).
 pub fn serves(k: u32) bool {
-    return k > 0 and k <= 2048 and std.math.isPowerOfTwo(k);
+    return trunk.registersTopk(k);
 }
 
-/// The top-k kernels of one load, built at its construction (`build`: each compiled and run once at the model's top-k,
-/// the construction's acceptance), never inside a prompt. The module builds them only where the route takes them (a GPU
-/// stream, a top-k the kernel serves, `serves`); elsewhere the graph's route is argpartition.
+/// The top-k route of one load over the trunk set's kernels (`trunk_kernels`), which the module built and ran once at the
+/// model's top-k at its construction (the acceptance), never inside a prompt. The module installs it only where the
+/// route takes it (a GPU stream, a top-k the registry serves, `serves`); elsewhere the graph's route is argpartition.
 pub const Kernels = struct {
-    one: mlx.mlx_fast_metal_kernel,
-    rows: [max_rows]mlx.mlx_fast_metal_kernel,
-
-    pub fn build(g: *G, k: u32) !Kernels {
-        std.debug.assert(serves(k) and mlx.streamIsGpu(g.s));
-        var ks: Kernels = .{ .one = try newKernel("glm_moe_dsa_topk", &.{ "scores", "params" }, source), .rows = undefined };
-        var built: usize = 0;
-        errdefer {
-            _ = mlx.mlx_fast_metal_kernel_free(ks.one);
-            for (ks.rows[0..built]) |kn| _ = mlx.mlx_fast_metal_kernel_free(kn);
-        }
-        inline for (1..max_rows + 1) |nr| {
-            const ins = comptime names: {
-                var v: [nr + 1][]const u8 = undefined;
-                for (0..nr) |i| v[i] = std.fmt.comptimePrint("s{d}", .{i});
-                v[nr] = "params";
-                break :names v;
-            };
-            ks.rows[nr - 1] = try newKernel(std.fmt.comptimePrint("glm_moe_dsa_topk_rows{d}", .{nr}), &ins, comptime rowsSource(nr));
-            built += 1;
-        }
-        // The acceptance: one launch of each at the model's top-k over k + 1 zeros (ties throughout), evaluated.
-        const m = g.mark();
-        defer g.resetTo(m);
-        const n: c_int = @intCast(k + 1);
-        var outs: [max_rows + 1]T = undefined;
-        outs[0] = try ks.topk(g, try g.zeros(&.{ 1, 1, n }, .float32), k);
-        var rows: [max_rows]T = undefined;
-        for (&rows) |*r| r.* = try g.zeros(&.{ 1, 1, 1, n }, .float32);
-        for (1..max_rows + 1) |nr| outs[nr] = try ks.topkRows(g, rows[0..nr], k);
-        try g.evalAll(&outs);
-        return ks;
-    }
-
-    pub fn deinit(ks: *Kernels) void {
-        _ = mlx.mlx_fast_metal_kernel_free(ks.one);
-        for (ks.rows) |kn| _ = mlx.mlx_fast_metal_kernel_free(kn);
-        ks.* = undefined;
-    }
+    bound: *const trunk.Bound,
 
     /// The ids `[1, rows, k]` (int32) of each row's `k` largest scores (`scores` `[1, rows, n]` f32, row-contiguous,
     /// `k < n`), as `argpartition(scores, n - k)[..., n - k:]` orders them. The route's invariants (a GPU stream, `k`
@@ -203,7 +45,7 @@ pub const Kernels = struct {
         // Eight slots: an input of fewer is bound in the constant address space.
         const pv = [8]i32{ sh.dim(2), 0, 0, 0, 0, 0, 0, 0 };
         const params = try g.hostArray(std.mem.sliceAsBytes(&pv), &.{8}, .int32);
-        return launch(g, ks.one, &.{ scores, params }, &[_]c_int{ 1, rows, @intCast(k) }, rows, k);
+        return launch(g, ks.bound, .glm_moe_dsa_topk, &.{ scores, params }, trunk.topkLaunch(@intCast(rows), k, false));
     }
 
     /// The ids `[rows.len, k]` (int32) of each row's `k` largest scores, `rows[r]` one row of `n_r > k` f32 scores
@@ -222,46 +64,15 @@ pub const Kernels = struct {
         var inputs: [max_rows + 1]T = undefined;
         @memcpy(inputs[0..rows.len], rows);
         inputs[rows.len] = params;
-        const nr: c_int = @intCast(rows.len);
-        return launch(g, ks.rows[rows.len - 1], inputs[0 .. rows.len + 1], &[_]c_int{ nr, @intCast(k) }, nr, k);
+        return launch(g, ks.bound, trunk.topkRowsKernel(rows.len), inputs[0 .. rows.len + 1], trunk.topkLaunch(@intCast(rows.len), k, true));
     }
 };
 
-fn newKernel(comptime name: [:0]const u8, comptime ins: []const []const u8, src: [:0]const u8) !mlx.mlx_fast_metal_kernel {
-    const in_names = comptime blk: {
-        var v: [ins.len][*:0]const u8 = undefined;
-        for (ins, 0..) |n, i| v[i] = (n ++ "\x00")[0..n.len :0];
-        break :blk v;
-    };
-    const outs = [_][*:0]const u8{"out"};
-    const iv = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
-    defer _ = mlx.mlx_vector_string_free(iv);
-    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
-    defer _ = mlx.mlx_vector_string_free(ov);
-    const kn = mlx.mlx_fast_metal_kernel_new(name, iv, ov, src, "", true, false);
-    if (kn.ctx == null) return error.MetalKernelCompileFailed;
-    return kn;
-}
-
-/// One launch of `kern` over `inputs` with an int32 output of `out_shape` (1024 threads per row, `K` = `k`).
-fn launch(g: *G, kern: mlx.mlx_fast_metal_kernel, inputs: []const T, out_shape: []const c_int, rows: c_int, k: u32) !T {
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, out_shape.ptr, out_shape.len, .int32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1024, rows, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", @intCast(k)));
-    const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
-    defer _ = mlx.mlx_vector_array_free(iv);
-    var ov = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
-    var out = mlx.mlx_array_new();
-    mlx.check(mlx.mlx_vector_array_get(&out, ov, 0)) catch |e| {
-        _ = mlx.mlx_array_free(out);
-        return e;
-    };
-    return try g.adopt(out);
+/// One launch of the registry's kernel `kern` over `inputs` at `cfg`: its int32 ids, adopted by `g`.
+fn launch(g: *G, bound: *const trunk.Bound, kern: trunk.Kernel, inputs: []const T, cfg: trunk.LaunchConfig) !T {
+    var outs: [1]mlx.mlx_array = undefined;
+    try bound.apply(kern, inputs, &cfg, &outs);
+    return g.adopt(outs[0]);
 }
 
 const testing = std.testing;
@@ -274,8 +85,9 @@ test "glm topk: each row's k largest scores in argpartition's ids and order, tie
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var g = try G.init(a, s);
     defer g.deinit();
-    var ks = try Kernels.build(&g, 2048);
-    defer ks.deinit();
+    const set = try trunk.openForTest(a, s);
+    defer set.deinit();
+    const ks: Kernels = .{ .bound = &set.bound };
     var prng = std.Random.DefaultPrng.init(17);
     const rand = prng.random();
     var checked: usize = 0;
@@ -332,8 +144,9 @@ test "glm topk: rows of their own lengths in one launch, each its k largest in a
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var g = try G.init(a, s);
     defer g.deinit();
-    var ks = try Kernels.build(&g, 2048);
-    defer ks.deinit();
+    const set = try trunk.openForTest(a, s);
+    defer set.deinit();
+    const ks: Kernels = .{ .bound = &set.bound };
     var prng = std.Random.DefaultPrng.init(19);
     const rand = prng.random();
     const k: u32 = 2048;

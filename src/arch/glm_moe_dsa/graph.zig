@@ -26,6 +26,7 @@ const expert_policy = @import("../../sdk_ext.zig").expert.policy;
 /// own need of the host surface, not the SDK's.
 const dsa = @import("mlx_host").dsa_nax;
 const topk_mod = @import("topk.zig");
+const trunk_kernels = @import("trunk_kernels.zig");
 
 pub const G = ops.MlxOps;
 pub const T = G.T;
@@ -1036,8 +1037,9 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
     var g = try G.init(a, s);
     defer g.deinit();
     // The top-k kernels the served route builds on a GPU stream, in both arms (the selection's route).
-    var ks = try topk_mod.Kernels.build(&g, c.index_topk);
-    defer ks.deinit();
+    const tset = try trunk_kernels.openForTest(a, s);
+    defer tset.deinit();
+    const ks: topk_mod.Kernels = .{ .bound = &tset.bound };
     var prng = std.Random.DefaultPrng.init(53);
     const tw: TestWeights = .{ .rand = prng.random() };
     const hid: c_int = @intCast(c.hidden_size);
@@ -1107,8 +1109,9 @@ test "glm attention: the reference indexer's top-k is the top-k kernel's (int32 
     defer _ = mlx.mlx_stream_free(s);
     var g = try G.init(a, s);
     defer g.deinit();
-    var ks = try topk_mod.Kernels.build(&g, c.index_topk);
-    defer ks.deinit();
+    const tset = try trunk_kernels.openForTest(a, s);
+    defer tset.deinit();
+    const ks: topk_mod.Kernels = .{ .bound = &tset.bound };
     var prng = std.Random.DefaultPrng.init(57);
     const tw: TestWeights = .{ .rand = prng.random() };
     const hid: c_int = @intCast(c.hidden_size);
@@ -1176,8 +1179,9 @@ test "glm attention: the verify's rows through embed_q and unembed_out at once e
     defer _ = mlx.mlx_stream_free(s);
     var g = try G.init(a, s);
     defer g.deinit();
-    var ks = try topk_mod.Kernels.build(&g, c.index_topk);
-    defer ks.deinit();
+    const tset = try trunk_kernels.openForTest(a, s);
+    defer tset.deinit();
+    const ks: topk_mod.Kernels = .{ .bound = &tset.bound };
     var prng = std.Random.DefaultPrng.init(55);
     const tw: TestWeights = .{ .rand = prng.random() };
     const hid: c_int = @intCast(c.hidden_size);

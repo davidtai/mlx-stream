@@ -363,6 +363,9 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
     var rng = std.Random.DefaultPrng.init(11);
     var worst: f32 = 0;
     var scale: f32 = 0;
+    // The decode lane's GPU combine: the trunk registry's kernel at the fixture's hidden size.
+    const tset = try @import("trunk_kernels.zig").openForTest(a, s);
+    defer tset.deinit();
     for ([_]bool{ false, true }) |gated| {
         var g = try G.init(a, s);
         defer g.deinit();
@@ -381,7 +384,7 @@ pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.ml
         qctx.peek = &p;
         const math = try Q.accept(G, a, &g, qctx, .{ .hidden = @intCast(h), .inter = c.moe_intermediate_size, .top_k = k, .n_layers = 4, .act = .swiglu, .input = .bfloat16 }, &diag);
         defer math.deinit(&g);
-        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .gated = gated, .event = ev, .wide_depth = 2 });
+        var ex = try Ex.init(a, &g, st, math, @intCast(h), .{ .gated = gated, .event = ev, .wide_depth = 2, .combine = &tset.bound });
         defer ex.deinit(&g);
         // Every decode-lane call's GPU combine against the op chain's join and combine, bit for bit.
         ex.combine_check.on = true;

@@ -98,6 +98,8 @@ comptime {
     _ = @import("arch/glm_moe_dsa/graph.zig");
     _ = @import("arch/glm_moe_dsa/experts.zig");
     _ = @import("arch/glm_moe_dsa/topk.zig");
+    _ = @import("arch/glm_moe_dsa/trunk_kernels.zig");
+    _ = @import("arch/glm_moe_dsa/trunk_selfcheck.zig");
     _ = @import("arch/glm_moe_dsa/split.zig");
     _ = @import("arch/glm_moe_dsa/module.zig");
     _ = @import("arch/glm_moe_dsa/plugin.zig");

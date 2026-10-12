@@ -533,6 +533,8 @@ src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, k
                            the draft lanes' acceptance)
 src/arch/glm_moe_dsa/      the GLM-5.3 arch: its banks, bill, module, draft lane and parity tests
 src/arch/glm_moe_dsa/glm53_exl3/  GLM-5.3's EXL3 kernels, routes, quant and self-check (texts in src/kernels/glm53_exl3/)
+src/arch/glm_moe_dsa/trunk_kernels.zig  GLM-5.3's trunk kernels (top-k, routed combine) and their self-check (texts in
+                           src/kernels/glm_moe_dsa/)
 src/kernels/exl3/          the pinned Metal kernel texts and their manifest (embedded at compile time)
 src/fixtures/              test fixtures (bank peek, prefill wave samples, DSpark lookup and receipt stats, the MiMo
                            config)
@@ -543,7 +545,7 @@ docs/                      design notes and the path map from the in-tree layout
 scripts/                   test_dsv41.sh, compile_kernels_offline.py, compile_mimo_kernels_offline.py,
                            prepare_mimo_pack.py   the pack builder (docs/mimo-pack.md)
                            glm_moe_dsa_goldens.py, glm_moe_dsa_mtp_goldens.py, glm_split_k3_table.py,
-                           glm53_exl3_manifest.py
+                           glm53_exl3_manifest.py, glm_trunk_manifest.py
 ```
 
 This repository was imported from the mlx-serve fork at commit d38ef038, without its history. `docs/PATH_MAP.md`

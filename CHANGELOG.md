@@ -47,6 +47,12 @@
   profile builds only; the tally folded in at each request's end; the construction check raised by the bytes other
   models hold in the process (#8's reading); the draft lane's sampled decisions on `sdk_ext.acceptance`. The quality
   tier of the headline and the ceilings it carries are named in README (GLM-5.3's measurements).
+- GLM-5.3's trunk kernels (the indexer's top-k in its one-buffer and 1-8 rows forms, the decode lane's routed combine)
+  are a pinned registry of their own over `sdk_ext.kernels.KernelSet` (`trunk_kernels`, texts and manifest in
+  src/kernels/glm_moe_dsa/, `scripts/glm_trunk_manifest.py`): every text checked against the manifest's pin, the
+  kernels built on the module's GPU stream and each route's kernels launched once at the model's instantiation at
+  construction (`trunk_selfcheck.runRoutes`); an instantiation the manifest does not register gets no kernel route
+  (argpartition, the op chain's combine). The texts are the ones the routes compiled before, byte for byte.
 - GLM-5.3 on the host's typed glue: the root exports `glm` (the arch, the standard request's context, the 128K
   `max_output` default) beside `mimo`, and the module answers the context it billed (`Served.maxContext`). The
   allocator's size-class switch (`mlx_set_alloc_size_classes`, mlx-serve's patched MLX) is looked up by name at

@@ -39,6 +39,7 @@ const bill_mod = @import("bill.zig");
 const split_mod = @import("split.zig");
 const graph = @import("graph.zig");
 const topk_mod = @import("topk.zig");
+const trunk = @import("trunk_kernels.zig");
 const bank_mod = @import("bank.zig");
 const experts_mod = @import("experts.zig");
 const mtp_mod = @import("mtp.zig");
@@ -196,8 +197,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// Decode's window rows (`bill.decodeWindowRows`): a decode call over more routed ids is refused.
         window_ids: u32,
         routes: graph.Routes,
-        /// The indexer's top-k kernels where the construction's route takes them (`graph.Routes.topk`); built once.
+        /// The indexer's top-k route over the trunk set where the construction takes it (`graph.Routes.topk`).
         topk_kernels: ?topk_mod.Kernels = null,
+        /// The trunk's kernels (the indexer's top-k, the routed combine): the pinned set (`trunk_kernels`) built at
+        /// construction where a route takes one of them, each route's kernels run once there at the model's
+        /// instantiation; null on a CPU stream or where neither route is the kernels'.
+        trunk_set: ?*trunk.Set = null,
         overrides: Overrides,
         event: ?expert_event.Event = null,
         prev_cache_limit: usize = 0,
@@ -365,7 +370,30 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.w = try graph.Weights.bind(gpa, weights, model, &diag);
             errdefer self.w.deinit(gpa);
             try self.residentsNow(weights);
-            self.ex = try Experts.init(gpa, &self.g, self.stream, self.math, model.hidden_size, .{ .gated = gated, .event = self.event, .wide_depth = shape.wide_depth, .combine_gpu = gpu and model.hidden_size % 4 == 0 });
+            // The trunk's kernel routes (the indexer's top-k, the routed combine) on a GPU stream at instantiations the
+            // registry serves: its pinned set built here and each route's kernels run once at the model's instantiation
+            // (`trunk_selfcheck.runRoutes`), never inside a request; elsewhere argpartition and the op chain's combine.
+            const combine_route = gpu and trunk.registersCombine(model.n_experts_per_tok, model.hidden_size);
+            if (select == .kernel or combine_route) self.trunk_set = try trunk.Set.init(gpa, .{ .device = .{ .stream = s } }, &diag);
+            errdefer if (self.trunk_set) |t| t.deinit();
+            if (self.trunk_set) |t| {
+                // the profile hook's launch probe sees the set's launches (profile builds; a no-op otherwise)
+                t.bound.observe(sdk_ext.profile.of(G).launch);
+                var routes_at: [trunk.topk_kernels.len + 1]trunk.selfcheck.Route = undefined;
+                var n_routes: usize = 0;
+                if (select == .kernel) for (trunk.topk_kernels) |k| {
+                    routes_at[n_routes] = .{ .kernel = k, .at = .{ .k = model.index_topk } };
+                    n_routes += 1;
+                };
+                if (combine_route) {
+                    routes_at[n_routes] = .{ .kernel = .glm_moe_dsa_combine, .at = .{ .k = model.n_experts_per_tok, .hidden = model.hidden_size } };
+                    n_routes += 1;
+                }
+                var report: trunk.selfcheck.Report = .{};
+                defer report.deinit(gpa);
+                try trunk.selfcheck.runRoutes(gpa, &t.reg, &t.bound, routes_at[0..n_routes], &report, &diag);
+            }
+            self.ex = try Experts.init(gpa, &self.g, self.stream, self.math, model.hidden_size, .{ .gated = gated, .event = self.event, .wide_depth = shape.wide_depth, .combine = if (combine_route) &self.trunk_set.?.bound else null });
             errdefer self.ex.deinit(&self.g);
             // The slot arrays are the quant's signature (every routed layer's base bank).
             for (self.ex.banks) |b| if (b[@backingInt(experts_mod.BankKind.base)]) |arr| try self.math.checkBank(&self.g, arr, &diag);
@@ -393,9 +421,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const preloaded = try self.stream.preload(&pre, Preload.order);
             const pre_ns: u64 = @intCast(t_pre.untilNow(io, .awake).nanoseconds);
             log.info("glm_moe_dsa: preloaded {d} experts ({d:.2} GB) into the prompt rows in {d:.2} s\n", .{ preloaded, gigabytes(Reads.of(pre0, self.stream.stats()).ssd_bytes), seconds(pre_ns) });
-            // The top-k kernels built and run once here where the route takes them, never inside a prompt.
-            if (select == .kernel) self.topk_kernels = try topk_mod.Kernels.build(&self.g, model.index_topk);
-            errdefer if (self.topk_kernels) |*k| k.deinit();
+            // The top-k route over the trunk set (its kernels run once at construction above), never built in a prompt.
+            if (select == .kernel) self.topk_kernels = .{ .bound = &self.trunk_set.?.bound };
             self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa, .topk = if (self.topk_kernels) |*k| k else null };
             if (self.mtp) |ln| ln.topk = self.routes.topk;
             self.file_backed_start = file_backed_start;
@@ -555,7 +582,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (self.recorder) |rec| rec.deinit();
             self.math.deinit(&self.g);
             if (comptime has_kernels) self.kset.deinit();
-            if (self.topk_kernels) |*k| k.deinit();
+            if (self.trunk_set) |t| t.deinit();
             self.w.deinit(self.gpa);
             self.bank.deinit();
             self.history.deinit(self.gpa);
