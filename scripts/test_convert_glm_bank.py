@@ -258,6 +258,10 @@ def test_refuses_wrong_shape(tmp_path):
     bad = switch_name(3, "down.scales")
     shard = os.path.join(src, "model-00002-of-00002.safetensors")
     s = mx.load(shard)
+    # Read the shard before overwriting it: mlx 0.32.2 truncates the target
+    # before it evaluates lazy inputs (fixed upstream in MLX #4434), and the
+    # failed reads leave deferred stream errors that fail two later tests.
+    mx.eval(s)
     s[bad] = mx.zeros((N_EXP, HIDDEN, 2), dtype=mx.bfloat16)
     mx.save_safetensors(shard, s, metadata={"format": "mlx"})
     r = convert(src, str(tmp_path / "dst"))
