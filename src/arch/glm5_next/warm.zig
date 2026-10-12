@@ -7,7 +7,9 @@
 //! pass runs: the first KDA layer's attention over two spans of `graph.span_rows` rows, the first dense layer's MLP over
 //! one tile of `graph.dense_tile_rows` rows, the first DSA layer's attention over a whole prompt call's spans (positions
 //! 0 to `graph.prompt_call_rows`, or the billed context's whole spans below it: the dense prefix, then the sparse rows at
-//! every key count a call reaches) and the installed prompt combine over one token. Inputs are zeros; nothing is checked (a compile warm, not a self-check).
+//! every key count a call reaches), the installed prompt combine over one token, and (prompt lever 5) the first routed
+//! layer's predictor over one span (its router graph and the expert counts). Inputs are zeros; nothing is checked (a
+//! compile warm, not a self-check).
 //! What it leaves: the request cache restarted (every KDA state cleared, the DSA lanes' lengths 0: their buffers keep
 //! the warm's rows past any request's length, and a request reads only the positions it appended), the expert source
 //! untouched (no route, read or slot), MLX's cache cleared. Token-identical: no request state is changed. Its memory is
@@ -35,6 +37,8 @@ pub const Plan = struct {
     /// The first DSA layer: its attention over a whole prompt call's spans (the billed context's whole spans below one call).
     dsa_layer: u32,
     dsa_spans: u32,
+    /// The first routed layer: its predictor over one span (prompt lever 5's counts).
+    routed_layer: u32,
 };
 
 /// The warm's layers: GLM-5.3-Flash's layout (a KDA layer, a dense layer, a DSA layer: layers 0, 0 and 3), the DSA spans
@@ -49,13 +53,14 @@ pub fn plan(c: *const glm.Config, cap: u32) !Plan {
             if (dsa_layer == null) dsa_layer = l;
         } else if (kda_layer == null) kda_layer = l;
     }
-    if (kda_layer == null or dsa_layer == null or c.first_k_dense == 0) return error.Glm5NextWarmLayout;
+    if (kda_layer == null or dsa_layer == null or c.first_k_dense == 0 or c.first_k_dense >= c.n_layers) return error.Glm5NextWarmLayout;
     return .{
         .kda_layer = kda_layer.?,
         .kda_spans = graph.spans_in_flight,
         .dense_layer = 0,
         .dsa_layer = dsa_layer.?,
         .dsa_spans = @min(graph.prompt_call_rows, cap) / graph.span_rows,
+        .routed_layer = c.first_k_dense,
     };
 }
 
@@ -77,6 +82,10 @@ pub fn run(g: *G, io: std.Io, c: *const glm.Config, w: *const graph.Weights, cac
         const d = w.layers[p.dense_layer].dense orelse return error.Glm5NextWarmLayout;
         const x = try g.zeros(&.{ @intCast(graph.dense_tile_rows), hidden }, .bfloat16);
         try g.evalAll(&.{try graph.mlp(g, c, d, x)});
+        var ahead: graph.Ahead = .{};
+        defer ahead.release(g);
+        try graph.predictor(g, c, &w.layers[p.routed_layer], p.routed_layer, &.{zero}, &ahead);
+        try g.evalAll(&.{ahead.counts.?});
         try src.warmCombine();
     }
     try mlx.check(mlx.mlx_synchronize(g.s));
@@ -122,6 +131,7 @@ test "glm5_next warm: Flash's plan warms layer 0's KDA attention over two spans 
     try testing.expectEqual(@as(u32, 0), p.dense_layer);
     try testing.expectEqual(@as(u32, 3), p.dsa_layer);
     try testing.expectEqual(@as(u32, 16), p.dsa_spans);
+    try testing.expectEqual(@as(u32, 3), p.routed_layer);
     try testing.expectEqual(@as(u32, graph.prompt_call_rows), p.dsa_spans * graph.span_rows);
     // The DSA spans reach the sparse rows (past the dense prefix: every pool fits the top-k up to `dense_end`).
     const dense_end = (c.index_topk / c.index_kpool + 1) * c.index_kpool - 1;

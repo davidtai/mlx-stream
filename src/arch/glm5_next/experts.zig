@@ -59,8 +59,6 @@ pub const prompt_relocate = true;
 /// its own limit (`decode_cache_bytes`).
 pub const prompt_cache_bytes: usize = 2 << 30;
 pub const decode_cache_bytes: usize = 256 << 20;
-/// P1's predictor: the router tile (one eval per call, `prefill_predict_evals: one`).
-pub const predict_rows: u32 = 2048;
 /// The prompt pass's routed calls take the wide lane; the decode lane takes a decode-phase call of at most
 /// `decode_lane_rows` rows (a serial token; the MTP verify's 4 rows in phase 4).
 pub const decode_lane_rows: u32 = Math.decode_forward_rows;
@@ -149,8 +147,7 @@ pub const Source = struct {
     parts_combine: *const PartsCombineFn = partsCombineInplace,
     combine_kernel: prefill_combine.Kernel = .{},
     combine_route: prefill_combine.Route = .inplace,
-    /// P1's host scratch (reused): one tile's predicted ids, the call's counts, the ranking.
-    ahead_ids: [predict_rows * top_k]u32 = undefined,
+    /// P1's host scratch (reused): the call's predicted counts (read back from the GPU, prompt lever 5), the ranking.
     ahead_counts: [max_experts]u32 = undefined,
     ahead_ranked: [max_experts]u16 = undefined,
 

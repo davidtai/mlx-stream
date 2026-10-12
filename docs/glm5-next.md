@@ -66,7 +66,8 @@ names the installed route (`decode_moe=`).
 ## The prompt pass
 
 Calls of at most 16,384 rows, layer by layer. Per routed layer, P1 posts the predicted seed (the layer's router on its
-collapsed attention input) before the attention; the attention runs in spans of 1,024 rows, at most two committed (the
+collapsed attention input, counted per expert on the GPU and evaluated with the previous layer's output: lever 5 below)
+before the attention; the attention runs in spans of 1,024 rows, at most two committed (the
 KDA state and the DSA lanes carry from span to span); the dense MLP of layers 0-2 in tiles of 2,048 rows, two committed;
 the MoE over every row at once (the routing barrier's ids and weights committed first, then the shared expert: lever 4
 below); the layer's output evaluated at its end. DSA's
@@ -119,6 +120,27 @@ key whose default is the stock control.
   moved. The decode lane is unchanged (its shared expert is the routed call's hoist). Line: `glm5_next prompt lever 4:
   routing barrier committed before the shared expert (...)`. Expected -0.3 to -0.6 s at 16K alone (the analysis; about
   -0.2 s after the fused KDA prologue).
+
+- **Lever 5, the predictor's counts on the GPU, committed behind the previous layer's tail** (token-identical;
+  `graph.predictor`, `graph.expertCounts`). P1's predictor read every row's top-k back (131K ids at 16K) and counted them
+  on the host, and was built only after the previous layer's output was evaluated: 4.5 ms of GPU idle per routed layer
+  at the boundary. A prompt call now commits a layer's tail, builds the next routed layer's predictor on that output
+  while the GPU runs it, commits it behind the tail and evaluates both together; the predictor compares each row's top-k
+  with every expert id and sums them per expert on the GPU (exact integer counts: the host's tally of the same ids), so
+  one 288-value read back gives the counts. The same counts, the same ranking, the same read-ahead. The layer's own
+  arrays are released before the boundary (the tail's graph holds what it reads), so the boundary holds the stream, the
+  tail's inputs and the predictor (the bill's `boundary` stage, under the attention stage at every width: the prompt
+  wave is unchanged). A call's first routed layer that no layer of the call precedes builds it at its own start, as
+  before. The warm (lever 3) dispatches the predictor once. The profile build's `predict` stage now holds the read back
+  and the post; the predictor's GPU work runs in the previous layer's `tail`. Line: `glm5_next prompt lever 5: predictor
+  counts on the GPU, committed behind the previous layer's tail (...)`. Expected about -0.15 s at 16K (the boundary's
+  idle; the analysis's -0.3 to -0.5 s included the two parts below).
+  Not built here: reusing the predictor's collapses in the attention (one collapse per span, not two) would hold the 16
+  spans' collapsed rows through the attention, the prompt wave's widest stage (+135.5 MB at 16K), which moves the fill
+  from 124 to 123 prompt rows at the 12.6 GB baseline; and a BF16 predictor GEMM is rounding-class in the prompt pass
+  (the predicted ranking fixes the read-ahead's admissions, hence each expert's persistent row, hence which rows fall in
+  a bank's per-row `gather_qmv` tail tile), so it needs a settings route with the F32 control and the router's BF16
+  binding the decode-stack lane adds (`Router.w`).
 
 ## The bill
 
