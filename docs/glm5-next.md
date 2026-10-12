@@ -68,7 +68,8 @@ names the installed route (`decode_moe=`).
 Calls of at most 16,384 rows, layer by layer. Per routed layer, P1 posts the predicted seed (the layer's router on its
 collapsed attention input) before the attention; the attention runs in spans of 1,024 rows, at most two committed (the
 KDA state and the DSA lanes carry from span to span); the dense MLP of layers 0-2 in tiles of 2,048 rows, two committed;
-the MoE over every row at once (the shared expert committed first); the layer's output evaluated at its end. DSA's
+the MoE over every row at once (the routing barrier's ids and weights committed first, then the shared expert: lever 4
+below); the layer's output evaluated at its end. DSA's
 indexer scores and sparse latent attention run on the NAX kernels where the device has them (`dsa_nax=true` in the
 routes line); an installed NAX route never falls back.
 
@@ -108,6 +109,16 @@ key whose default is the stock control.
   kernels warmed at load in <ms> ms (KDA layer 0: 2 spans; dense layer 0: one 2048-row tile; DSA layer 3: 16 spans of
   1024 rows; the inplace combine; token-identical)`. Expected -0.5 to -0.6 s of TTFT on the first request after a load
   (every cell measures one); a warm server never paid it.
+
+- **Lever 4, routing barrier before the shared expert** (exact; `graph.commitRoutingFirst`). A prompt call committed the
+  shared expert's 16K-row GEMMs before the router's graph, so the routed call's barrier (its host read of the ids)
+  waited behind them (~15 ms a layer; layer 20 of the profile: the router's buffer started when the shared expert's
+  ended). A prompt call now commits the routing barrier's ids and weights first, then the shared expert: the barrier
+  waits for the router alone, the call's plans and reads start sooner in the drive-bound MoE stage, and the GPU runs the
+  shared expert behind the router, ahead of the first group's tiles. The same graphs and values; only the commit order
+  moved. The decode lane is unchanged (its shared expert is the routed call's hoist). Line: `glm5_next prompt lever 4:
+  routing barrier committed before the shared expert (...)`. Expected -0.3 to -0.6 s at 16K alone (the analysis; about
+  -0.2 s after the fused KDA prologue).
 
 ## The bill
 
@@ -181,8 +192,9 @@ A profile build (the host's `-Dplugin-profile=true`; never a served build) compi
   sparse router dense moe join gather reduce output tail`. On a DSA layer the indexer's pool scores (`indexer`), the
   top-k selection (`topk`) and the sparse latent attention (`sparse`) each run under their own mark, with a profile-only
   eval at each boundary while the timeline records; `attn` keeps the norms, the projections and the KDA route. `dense`
-  is layers 0-2's dense MLP and, on a routed layer, the FFN's collapse and norm with the shared expert (committed before
-  the routing barrier); `router` the routed call's barrier and setup; `tail` the expand and the layer's output.
+  is layers 0-2's dense MLP and, on a routed layer, the FFN's collapse and norm with the router's and the shared expert's
+  commits (the routing barrier's arrays first: lever 4); `router` the routed call's barrier and setup; `tail` the expand
+  and the layer's output.
 - `GLM5_NEXT_GPU_TIMELINE=1` (`0` off; anything else refuses): DSV's verify GPU timeline over the serial decode's
   forwards (`GLM5_NEXT_GPU_TIMELINE armed: serial forwards, cycles_cap=1024`): one cycle per forward with one verify,
   the first request's first 1,024 forwards; at the request's end `VERIFY_GPU_TIMELINE_REPAIR`, `VERIFY_GPU_TIMELINE {...}`

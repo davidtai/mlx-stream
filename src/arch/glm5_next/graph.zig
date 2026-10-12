@@ -501,6 +501,17 @@ fn mlpTiles(g: *G, a: std.mem.Allocator, c: *const glm.Config, m: Mlp, x: T, row
 
 pub const Routing = struct { indices: T, weights: T };
 
+/// Prompt lever 4 (glm5next/prefill-levers): a prompt call's MoE commits, the routing barrier's arrays first (the routed
+/// ids and weights: the router's graph over the FFN's collapse and norm), then the shared expert. The routed call's
+/// barrier (its host read of the ids) then waits for the router alone, not behind the shared expert's 16K-row GEMMs
+/// (~15 ms a layer in the profile), so the call's plans and reads start that much sooner in a drive-bound MoE stage; the
+/// GPU runs the shared expert behind the router, ahead of the first group's tiles. The same graphs and values, only the
+/// commit order moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+pub fn commitRoutingFirst(comptime Ops: type, g: *Ops, indices: Ops.T, weights: Ops.T, shared: Ops.T) !void {
+    try g.asyncEval(&.{ indices, weights });
+    try g.asyncEval(&.{shared});
+}
+
 /// noaux_tc at one group: f32 logits on the transposed F32 router, sigmoid, the correction bias for the choice, the
 /// top-k, the chosen sigmoid scores normalized (`norm_topk_prob`, + 1e-20) and scaled. x [n, hidden] -> ids u32 [n, k],
 /// weights f32 [n, k].
@@ -650,10 +661,10 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, x, rows) else try mlp(g, c, d, x)) else blk: {
             const r = try route(g, c, lw.router.?, x);
             const shared = try mlp(g, c, lw.shared.?, x);
-            // A prompt call commits the shared expert before its routed call (the GPU runs it while the host routes and
-            // the first group's reads land); a decode-lane call hands it over as the call's hoist (run during its read
-            // wait). The sum is the same either way.
-            if (prompt) try g.asyncEval(&.{shared});
+            // Prompt lever 4: a prompt call commits the routing barrier's arrays, then the shared expert (the GPU runs it
+            // behind the router while the host routes and the first group's reads land); a decode-lane call hands it over
+            // as the call's hoist (run during its read wait). The sum is the same either way.
+            if (prompt) try commitRoutingFirst(G, g, r.indices, r.weights, shared);
             if (comptime ptl.enabled) ptl.stage(.router);
             const routed = try g.adopt(try src.forward(l, x, r.indices, r.weights, if (prompt) &.{} else &.{shared}));
             break :blk try g.add(routed, shared);
@@ -736,6 +747,23 @@ test "glm5_next graph: the kept residents are the trunk's (no vision tower, no M
         "model.language_model.layers.3.self_attn.k_proj.k_scale", "model.language_model.layers.3.self_attn.v_proj.v_scale",
         "model.language_model.layers.x.input_layernorm.weight",
     }) |n| try testing.expect(!keptResident(&c, n));
+}
+
+test "glm5_next graph: prompt lever 4 commits the routing barrier's ids and weights, then the shared expert (two commits, in that order; nothing else)" {
+    const Trace = ops_be.TraceOps;
+    var g = Trace.init(testing.allocator);
+    defer g.deinit();
+    const ids = try g.input(&.{ 16, 8 }, .uint32);
+    const weights = try g.input(&.{ 16, 8 }, .float32);
+    const shared = try g.input(&.{ 16, 4096 }, .bfloat16);
+    const nodes = g.nodes.items.len;
+    try commitRoutingFirst(Trace, &g, ids, weights, shared);
+    try testing.expectEqual(@as(usize, 2), g.commit_spans.items.len);
+    try testing.expectEqualSlices(Trace.T, &.{ ids, weights }, g.committed.items[g.commit_spans.items[0][0]..g.commit_spans.items[0][1]]);
+    try testing.expectEqualSlices(Trace.T, &.{shared}, g.committed.items[g.commit_spans.items[1][0]..g.commit_spans.items[1][1]]);
+    // Only the two commit markers: no node of a graph is built or evaluated here.
+    try testing.expectEqual(nodes + 2, g.nodes.items.len);
+    try testing.expectEqual(@as(usize, 0), g.evals.items.len);
 }
 
 test "glm5_next graph: the owned f32 tables' bytes and the call geometry" {
