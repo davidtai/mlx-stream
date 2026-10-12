@@ -24,6 +24,7 @@ const kda = @import("kda.zig");
 const dsa = @import("dsa.zig");
 const experts = @import("experts.zig");
 const nvfp4 = @import("nvfp4.zig");
+const fp8 = @import("fp8.zig");
 /// Profile builds: the prompt pass's stage marks (MiMo's timeline, armed by `GLM5_NEXT_PREFILL_TIMELINE`); every mark
 /// compiles to nothing in a served build.
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
@@ -42,7 +43,8 @@ pub const dump_chunk_rows: u32 = 256;
 /// A prompt call's dense MLP (layers 0-2: 12,288 wide) in tiles of this many rows, at most `spans_in_flight` committed.
 pub const dense_tile_rows: u32 = 2048;
 
-pub const Mlp = struct { gate: T, up: T, down: T };
+/// A SwiGLU MLP's projections (the dense layers' and the shared experts'): BF16, or the FP8 route's (fp8.zig).
+pub const Mlp = struct { gate: fp8.Linear, up: fp8.Linear, down: fp8.Linear };
 /// The router: BF16 [experts, hidden] as stored, its transposed F32 copy [hidden, experts] (the routing product and the
 /// lookahead's predictor read it) and the F32 correction bias [experts].
 pub const Router = struct { w_t: T, bias: T };
@@ -88,6 +90,9 @@ pub const Weights = struct {
     head: T,
     layers: []Layer,
     owned: std.ArrayList(T) = .empty,
+    /// `residents_format: fp8_block128`: the FP8 route every FP8 projection is bound to (module-owned; a prompt layer's end
+    /// releases its BF16 weights, `forward`); null under `bf16`.
+    fp8: ?*fp8.Route = null,
 
     pub fn deinit(w: *Weights, a: std.mem.Allocator) void {
         for (w.owned.items) |x| _ = mlx.mlx_array_free(x);
@@ -114,7 +119,13 @@ pub const Weights = struct {
         return c.n_layers * 6 + c.nKda() * 4 + c.nDsa() * 4 + c.moeLayers();
     }
 
-    pub fn bind(a: std.mem.Allocator, s: mlx.mlx_stream, map: *const sdk.Weights, c: *const glm.Config, diag: ?*sdk.Diag) !Weights {
+    /// The residents route per site, by the pack's declarations (`glm.Config.siteIsFp8`; fp8.zig `siteTensors`, one table
+    /// with the CPU tests): a trunk site (`glm.Config.fp8Sites` / `fp8MlpSites`) declared FP8 binds as codes U8 [out, in]
+    /// with F32 scales [out / 64, in / 128] on `fp8_route` (installed by the module when the pack declares any); every other
+    /// one BF16 [out, in] on the stock matmul (all of them under `bf16`). A missing scale, another dtype or an off-grid shape
+    /// refuses the load by name.
+    pub fn bind(a: std.mem.Allocator, s: mlx.mlx_stream, map: *const sdk.Weights, c: *const glm.Config, fp8_route: ?*fp8.Route, diag: ?*sdk.Diag) !Weights {
+        if ((c.fp8Declared() > 0) != (fp8_route != null)) return error.Glm5NextResidentsRoute;
         const layers = try a.alloc(Layer, c.n_layers);
         errdefer a.free(layers);
         const h: c_int = @intCast(c.hidden_size);
@@ -124,6 +135,7 @@ pub const Weights = struct {
             .norm = try need(map, "model.language_model.norm.weight", &.{h}, diag),
             .head = try need(map, "lm_head.weight", &.{ vocab, h }, diag),
             .layers = layers,
+            .fp8 = fp8_route,
         };
         errdefer {
             for (w.owned.items) |x| _ = mlx.mlx_array_free(x);
@@ -141,12 +153,31 @@ pub const Weights = struct {
                 pre: []const u8,
                 map: *const sdk.Weights,
                 diag: ?*sdk.Diag,
+                c: *const glm.Config,
+                l: u32,
+                route: ?*fp8.Route,
                 fn get(self: @This(), comptime suffix: []const u8, shape: []const c_int) !T {
                     var nb: [160]u8 = undefined;
                     return need(self.map, std.fmt.bufPrint(&nb, "{s}" ++ suffix, .{self.pre}) catch unreachable, shape, self.diag);
                 }
+                /// A trunk site [out, in] as the pack declares it (fp8.zig `siteTensors`).
+                fn proj(self: @This(), comptime suffix: []const u8, out: c_int, in: c_int) !fp8.Linear {
+                    const format: glm.ResidentsFormat = if (self.c.siteIsFp8(self.l, suffix)) .fp8_block128 else .bf16;
+                    const want = fp8.siteTensors(format, @intCast(out), @intCast(in));
+                    const wt = try self.get(suffix ++ ".weight", &want.weight_shape);
+                    const dt: mlx.mlx_dtype = switch (want.weight) {
+                        .u8 => .uint8,
+                        .bf16 => .bfloat16,
+                        .f32 => .float32,
+                    };
+                    if (mlx.mlx_array_dtype(wt) != dt) return refuse(self.diag, error.Glm5NextResidentDtype, "{s}" ++ suffix ++ ".weight is {s}; declared {s}, it binds {s}", .{ self.pre, @tagName(mlx.mlx_array_dtype(wt)), @tagName(format), @tagName(dt) });
+                    const ss = want.scales orelse return .{ .bf16 = wt };
+                    const sc = try self.get(suffix ++ ".weight_scale_inv", &ss);
+                    if (mlx.mlx_array_dtype(sc) != .float32) return refuse(self.diag, error.Glm5NextResidentDtype, "{s}" ++ suffix ++ ".weight_scale_inv is {s}; declared fp8_block128, it binds float32", .{ self.pre, @tagName(mlx.mlx_array_dtype(sc)) });
+                    return .{ .fp8 = fp8.bind(self.route.?, wt, sc, @intCast(out), @intCast(in)) catch |e| return refuse(self.diag, e, "{s}" ++ suffix ++ " [{d}, {d}] has no FP8 GEMV plan", .{ self.pre, out, in }) };
+                }
             };
-            const lg: L = .{ .pre = pre, .map = map, .diag = diag };
+            const lg: L = .{ .pre = pre, .map = map, .diag = diag, .c = c, .l = l, .route = fp8_route };
             lw.* = .{
                 .input_norm = try lg.get("input_layernorm.weight", &.{h}),
                 .post_norm = try lg.get("post_attention_layernorm.weight", &.{h}),
@@ -172,16 +203,16 @@ pub const Weights = struct {
                 const ihd: c_int = @intCast(c.index_head_dim);
                 const kv_b = try lg.get("self_attn.kv_b_proj.weight", &.{ heads * 2 * hd, r });
                 lw.attn = .{ .dsa = .{
-                    .q_a = try lg.get("self_attn.q_a_proj.weight", &.{ ql, h }),
+                    .q_a = try lg.proj("self_attn.q_a_proj", ql, h),
                     .q_a_norm = try lg.get("self_attn.q_a_layernorm.weight", &.{ql}),
-                    .q_b = try lg.get("self_attn.q_b_proj.weight", &.{ heads * hd, ql }),
-                    .kv_a = try lg.get("self_attn.kv_a_proj_with_mqa.weight", &.{ r, h }),
+                    .q_b = try lg.proj("self_attn.q_b_proj", heads * hd, ql),
+                    .kv_a = try lg.proj("self_attn.kv_a_proj_with_mqa", r, h),
                     .kv_a_norm = try lg.get("self_attn.kv_a_layernorm.weight", &.{r}),
                     .wk = try w.own(a, try view(s, kv_b, &.{ heads, 2 * hd, r }, 0, hd)),
                     .wv = try w.own(a, try view(s, kv_b, &.{ heads, 2 * hd, r }, hd, 2 * hd)),
-                    .o = try lg.get("self_attn.o_proj.weight", &.{ h, heads * hd }),
-                    .idx_wq_b = try lg.get("self_attn.indexer.wq_b.weight", &.{ ih * ihd, ql }),
-                    .idx_wk = try lg.get("self_attn.indexer.wk.weight", &.{ ihd, h }),
+                    .o = try lg.proj("self_attn.o_proj", h, heads * hd),
+                    .idx_wq_b = try lg.proj("self_attn.indexer.wq_b", ih * ihd, ql),
+                    .idx_wk = try lg.proj("self_attn.indexer.wk", ihd, h),
                     .idx_k_norm_w = try lg.get("self_attn.indexer.k_norm.weight", &.{ihd}),
                     .idx_k_norm_b = try lg.get("self_attn.indexer.k_norm.bias", &.{ihd}),
                     .idx_wproj = try lg.get("self_attn.indexer.weights_proj.weight", &.{ ih, h }),
@@ -196,20 +227,20 @@ pub const Weights = struct {
                 const dim = hv * dk;
                 const a_log = try lg.get("self_attn.A_log", &.{hv});
                 lw.attn = .{ .kda = .{
-                    .q = try lg.get("self_attn.q_proj.weight", &.{ dim, h }),
-                    .k = try lg.get("self_attn.k_proj.weight", &.{ dim, h }),
-                    .v = try lg.get("self_attn.v_proj.weight", &.{ dim, h }),
-                    .f_a = try lg.get("self_attn.f_a_proj.weight", &.{ dk, h }),
+                    .q = try lg.proj("self_attn.q_proj", dim, h),
+                    .k = try lg.proj("self_attn.k_proj", dim, h),
+                    .v = try lg.proj("self_attn.v_proj", dim, h),
+                    .f_a = try lg.proj("self_attn.f_a_proj", dk, h),
                     .f_b = try lg.get("self_attn.f_b_proj.weight", &.{ dim, dk }),
-                    .g_a = try lg.get("self_attn.g_a_proj.weight", &.{ dk, h }),
+                    .g_a = try lg.proj("self_attn.g_a_proj", dk, h),
                     .g_b = try lg.get("self_attn.g_b_proj.weight", &.{ dim, dk }),
-                    .b = try lg.get("self_attn.b_proj.weight", &.{ hv, h }),
+                    .b = try lg.proj("self_attn.b_proj", hv, h),
                     .a_log = try w.own(a, try aLogTable(s, a_log, l, diag)),
                     .a_exp = try w.own(a, try aExp(s, a_log, hv, dk)),
                     .dt_bias = try w.own(a, try f32Copy(s, try lg.get("self_attn.dt_bias", &.{dim}), false)),
                     .conv_w = try w.own(a, try convLayout(s, try lg.get("self_attn.conv1d.weight", &.{ 3 * dim, 1, @intCast(c.kda_conv) }))),
                     .o_norm = try lg.get("self_attn.o_norm.weight", &.{dk}),
-                    .o = try lg.get("self_attn.o_proj.weight", &.{ h, dim }),
+                    .o = try lg.proj("self_attn.o_proj", h, dim),
                 } };
                 lw.slot = n_kda;
                 n_kda += 1;
@@ -223,16 +254,16 @@ pub const Weights = struct {
                 };
                 if (mlx.mlx_array_dtype(lw.router.?.bias) != .float32) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} gate.e_score_correction_bias is not F32", .{l});
                 lw.shared = .{
-                    .gate = try lg.get("mlp.shared_experts.gate_proj.weight", &.{ si, h }),
-                    .up = try lg.get("mlp.shared_experts.up_proj.weight", &.{ si, h }),
-                    .down = try lg.get("mlp.shared_experts.down_proj.weight", &.{ h, si }),
+                    .gate = try lg.proj("mlp.shared_experts.gate_proj", si, h),
+                    .up = try lg.proj("mlp.shared_experts.up_proj", si, h),
+                    .down = try lg.proj("mlp.shared_experts.down_proj", h, si),
                 };
             } else {
                 const inter: c_int = @intCast(c.intermediate_size);
                 lw.dense = .{
-                    .gate = try lg.get("mlp.gate_proj.weight", &.{ inter, h }),
-                    .up = try lg.get("mlp.up_proj.weight", &.{ inter, h }),
-                    .down = try lg.get("mlp.down_proj.weight", &.{ h, inter }),
+                    .gate = try lg.proj("mlp.gate_proj", inter, h),
+                    .up = try lg.proj("mlp.up_proj", inter, h),
+                    .down = try lg.proj("mlp.down_proj", h, inter),
                 };
             }
         }
@@ -490,8 +521,8 @@ pub fn rmsNorm(g: *G, x: T, w: T, eps: f32) !T {
 
 /// silu(min(gate, limit)) * clip(up, -limit, limit) (the SDK's clamped SwiGLU: mlx-serve's `clampedSwiGLU`), then down.
 pub fn mlp(g: *G, c: *const glm.Config, m: Mlp, x: T) !T {
-    const act = try sdk_ext.quant.activation(G, g, .{ .swiglu_clamped = c.swiglu_limit }, try linear(g, x, m.gate), try linear(g, x, m.up));
-    return linear(g, act, m.down);
+    const act = try sdk_ext.quant.activation(G, g, .{ .swiglu_clamped = c.swiglu_limit }, try fp8.project(g, m.gate, x), try fp8.project(g, m.up, x));
+    return fp8.project(g, m.down, act);
 }
 
 /// A prompt call's dense MLP over `x` [rows, hidden] in tiles of `dense_tile_rows` rows: each tile committed as built
@@ -760,6 +791,8 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             }
             try g.evalAll(outs[0..n_outs]);
             src.promptLayerEnd();
+            // `fp8_block128`: the layer's BF16 weights released (no later layer reads them; fp8.zig `promptBytes`).
+            if (w.fp8) |r| r.layerEnd();
         }
     }
     if (comptime ptl.enabled) ptl.leaveLayers();
@@ -811,6 +844,12 @@ fn dumpRows(g: *G, c: *const glm.Config, w: *const Weights, spans: []const T, si
 }
 
 const testing = std.testing;
+
+test {
+    // The FP8 residents route's CPU tests and its window parity test (skipped without its switches).
+    _ = @import("fp8.zig");
+    _ = @import("fp8_parity.zig");
+}
 
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {
     const c: glm.Config = .{};

@@ -9,8 +9,8 @@ Terms as in [mimo.md](mimo.md): **pack**, **residents**, **rows** (prompt rows, 
 
 Code: `src/arch/glm5_next/` (`root.zig` the arch contract, `settings.zig` the settings, `config.zig` the model,
 `bill.zig` the bill, `module.zig` construction and requests, `graph.zig` the forward, `kda.zig` / `dsa.zig` / `ops.zig`
-the attention and the hyper-connections, `experts.zig` the expert source, `nvfp4.zig` the projection format, `bank.zig`
-the bank, `dump.zig` the logits dump); the gather shim is `csrc/glm5_gather_qmm.inc`.
+the attention and the hyper-connections, `fp8.zig` the residents route, `experts.zig` the expert source, `nvfp4.zig` the
+projection format, `bank.zig` the bank, `dump.zig` the logits dump); the gather shim is `csrc/glm5_gather_qmm.inc`.
 
 ## The model
 
@@ -33,13 +33,48 @@ The block's optional `settings` object takes `expert_prefill_rows` and `expert_r
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
 is installed when true; off, the serial control, by default: below), `decode_moe` (the decode lane's expert route:
 `stock`, the default, or `fused`; anything else refused by name) and `logits_dump_dir` (below). Any other key refuses
-the load by name.
+the load by name. The residents' format is the pack's own top-level `residents_format` (below), not a setting.
 
 Residents: the text trunk loads (`model.language_model.layers.{0..44}.*`, `embed_tokens`, `norm`, `lm_head`: 1,178
 tensors, 17,842,673,276 B as MLX allocates them); the vision tower, the MTP layer (45) and the DSA layers' FP8 KV scales
 are dropped from the weight map before anything is read, and are not billed. Every bound tensor's shape is checked once
-at construction. The host must export the DSA kernels (`mlx_host.dsa_nax`); otherwise the parse and the construction
+at construction. The FP8-residents pack (`GLM-5.3-Flash-NVFP4-fp8res-mlx-stream`) keeps 1,617 of them: 439 FP8
+projections as codes and scales, and the 739 others (below). The host must export the DSA kernels (`mlx_host.dsa_nax`); otherwise the parse and the construction
 refuse by name (`Glm5NextHostSurfaceMissing`).
+
+## The residents format
+
+The pack's top-level `residents_format` picks the trunk's residents route once at construction (`fp8.zig`):
+
+- absent or `bf16` (the control): every trunk projection BF16 [out, in] through MLX's matmul;
+- `fp8_block128`: each trunk site the pack's `quantization` declares FP8 (`{"mode": "fp8_e4m3", "bits": 8, "block":
+  [64, 128]}`) as e4m3fn codes U8 [out, in] (`.weight`) with F32 scales [out / 64, in / 128] (`.weight_scale_inv`;
+  value = code x scale; the pack's tiles are 128 x 128, a last 64-row group one tile) on MiMo's fp8res route
+  (`mimo_v2/fp8_linear.zig`, its texts and pins unchanged); every other site BF16 on the stock matmul. The 439 sites:
+  every KDA layer's q / k / v / o / f_a / g_a / b, every DSA layer's q_a / q_b / kv_a / o and its indexer's wk / wq_b,
+  the shared experts, the dense MLPs. The full set (`GLM-5.3-Flash-NVFP4-fp8res-mlx-stream`) declares all 439; the pack
+  lane's hybrid set 190 (`dsa,indexer_wk,shared,dense`). The lm_head, embeddings, mHC tables, KDA's f_b / g_b, the
+  routers, kv_b, the indexer's weights_proj and pool gate and the MTP layer stay BF16 in either.
+
+An FP8 declaration off the trunk's sites, an FP8 declaration without the format, or the format with no FP8 declaration
+refuses the parse by name (`Glm5NextResidentsFormat`). The bind checks each site against one table (`fp8.siteTensors`,
+which the CPU tests also check the pack's shard headers against): a missing scale tensor, another dtype or an off-grid
+shape refuses the load by name. An FP8-declared MTP layer refuses the draft lane (`Glm5NextMtpResidentsFp8`).
+
+A call routes only on its rows M, MiMo's rule: M <= 8 (decode, the MTP verify's 4, a short prompt call) runs
+`mimo_fp8_gemv` over the codes and scales (f32 FMA over code x scale; the plan per width fixed at construction, so row m
+of an M-row call is the M = 1 call's row bit for bit); M > 8 (the prompt pass) runs the BF16 path's own GEMM
+(`x @ w^T`, MLX's matmul) over the projection's BF16 weight, which `mimo_fp8_dequant_bf16` writes (bf16(code x scale),
+one rounding) into the route's LRU on the layer's first span. The LRU has 7 slots, one layer's attention set (a KDA
+layer's seven), so a layer's spans dequantize each projection once (MiMo's 3 would re-dequantize a KDA layer's seven
+in every span: a CPU test replays the trunk's real call orders). A prompt layer's end releases the layer's weights; the
+phase change closes the route. The FP8 trunk is lossy against the BF16 pack (the KL gate): the prompt pass is the BF16
+path's arithmetic on bf16(code x scale) weights, decode the f32 product.
+
+The routes line names the route (`residents=bf16|fp8_block128`); `fp8_block128` also logs
+`glm5_next residents installed: residents=fp8_block128 (439 of the trunk's 439 sites FP8 ...)` before the read, and the
+load line counts both kinds (`residents FP8 439 + BF16 739 tensors read in ...`: each FP8 projection is two tensors, its
+codes and its scales).
 
 ## The expert route
 
@@ -169,7 +204,11 @@ the billed context at construction), `kda_state`, `mlx_cache`, `mlx_cache_oversh
 `host_runtime`, the wiring terms, `request` (the prompt wave / the decode wave)) and the source's (`slot_transient`,
 `slot_rounding`, `reader_staging`, `source_metadata`, `expert_workspace`, the event and speculation runtimes, the
 predictor's, `decode_kernels` (the fused decode route's set and prepared launches, declared 16 MiB; 0 on `stock`),
-`slot_wiring`). `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
+`slot_wiring`). Under `fp8_block128` the `residents` term reads the FP8 codes and scales from the shards' headers as
+stored, and `fp8_prompt_weights` bills the prompt route's BF16 weights in the prompt phase: the widest layer's FP8 set
+in BF16 (the full set: layers 0-2, KDA with the dense MLP, 573,046,784 B; the hybrid set: a dense MLP, 301,989,888 B)
+and its wiring, geometric over the layers' declared site shapes (a layer's end releases its set); the decode phase bills
+none. `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
 
     GLM5_BANK=<pack> GLM5_BILL_BASELINES_GB=10.6,12.0,12.6,13.0 MLX_DEFAULT_DEVICE=cpu \
       zig build mlx-stream-test -Dtest-filter="the bill tool prints every term" -j4
@@ -180,9 +219,11 @@ prints a table per served context (17,408; 18,432; 20,480; 24,576; 32,766; 32,76
 ## Receipt lines
 
 - `glm5_next memory: target= baseline= process_bound= prompt_rows= decode_rows= reserve_tokens= kv=bf16 phase_rows=on growth_rows= forced=yes|no`
-- `mlx-stream glm5_next installed: 45 layers; 34 KDA, 11 DSA; residents BF16 ...` (MiMo's punctuation; g19 printed
-  `45 layers (34 KDA, 11 DSA); ...`)
-- `glm5_next MTP lane: off ...`, `glm5_next routes: ...`, `glm5_next admission baseline: ...`, `glm5_next construction check: ...`
+- `mlx-stream glm5_next installed: 45 layers; 34 KDA, 11 DSA; residents BF16 1178 tensors read in ...` (MiMo's
+  punctuation; g19 printed `45 layers (34 KDA, 11 DSA); ...`); under `fp8_block128`: `... residents FP8 439 + BF16 739
+  tensors read in ...`
+- `glm5_next MTP lane: off ...`, `glm5_next routes: ... call_rows=16384 residents=bf16|fp8_block128`,
+  `glm5_next admission baseline: ...`, `glm5_next construction check: ...`
 - `forced rows P/D exceed the fill by N bytes at baseline B; proceeding (operator pin)` when a pin sits over the fill
 - at each request's end: `glm5_next decode memory: footprint= mlx_active= mlx_cache= mlx_peak= ...` and `glm5_next decode: steps= tokens= wall_s= tok_s= ssd_bytes= ssd_bytes_per_token=`
 
@@ -269,7 +310,9 @@ a time: 256 x 154,880 x (2 + 4) B of head output and its f32 copy plus the chunk
 ## Device checks
 
 The std-16k cell (`cells/glm5next-16k-20261012`) is the device check; the KL cell (`cells/glm5next-kl-20261012`) runs
-the dump route. The bank's window-gated tests (`glm5_next nvfp4 bank`) compare MLX's dequantization with the host
+the dump route. The FP8 route's window test (`fp8_parity.zig`, `GLM5NEXT_FP8_GPU=1` under `_GPU_WINDOW_LOCKED=1`, else
+skipped) runs `fp8.project` at every distinct trunk FP8 site shape: the GEMV at M = 1..8 bit for bit MiMo's kernel-order
+host emulation, the prompt route at M = 9 bit for bit the stock matmul over the host's bf16(code x scale). The bank's window-gated tests (`glm5_next nvfp4 bank`) compare MLX's dequantization with the host
 decoder on the GPU stream.
 
 ## Limits

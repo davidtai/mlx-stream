@@ -17,6 +17,7 @@ const graph = @import("graph.zig");
 const experts = @import("experts.zig");
 const kda = @import("kda.zig");
 const mtp = @import("mtp.zig");
+const fp8 = @import("fp8.zig");
 const mimo_math = @import("../mimo_v2/math.zig");
 const mimo_stream = @import("../mimo_v2/stream.zig");
 const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
@@ -104,6 +105,12 @@ pub fn residentBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, c: *cons
         }
     }
     return out;
+}
+
+/// The FP8 prompt route's cache and its wiring (fp8.zig `promptBytes`); 0 under bf16.
+pub fn fp8PromptBytes(c: *const glm.Config, page: u64) u64 {
+    const b = fp8.promptBytes(c, page);
+    return b + wireTables(b);
 }
 
 fn glm_kept(c: *const glm.Config, name: []const u8) bool {
@@ -335,6 +342,11 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         .{ .name = "trunk_f32_tables", .bytes = @splat(owned.tables), .at_construction = true },
         .{ .name = "router_f32", .bytes = @splat(owned.routers), .at_construction = true },
         .{ .name = "kv_lanes", .bytes = @splat(kv), .at_construction = true },
+        // `residents_format: fp8_block128`: the prompt route's BF16 weights (fp8.zig `promptBytes`: the widest layer's FP8
+        // set in BF16, geometric over the layers' site shapes; a prompt layer's end releases its set) and their wiring; the
+        // decode phase holds none (the route is closed there). 0 under bf16 (the residents term carries the FP8 codes and
+        // scales by the shards' headers either way).
+        .{ .name = "fp8_prompt_weights", .bytes = .{ fp8PromptBytes(&in.model, in.page), 0 }, .at_construction = false },
         .{ .name = "kda_state", .bytes = @splat(states), .at_construction = false },
         .{ .name = "mlx_cache", .bytes = cache, .at_construction = false },
         .{ .name = "mlx_cache_overshoot", .bytes = overshoot, .at_construction = false },
@@ -587,6 +599,18 @@ test "glm5_next bill: the terms sum to the bill, the slot wiring is the one row 
     defer bf.free(a);
     try testing.expectEqual(b.fixed(.prompt) + fused_kernels_bytes, bf.fixed(.prompt));
     try testing.expectEqual(b.fixed(.decode) + fused_kernels_bytes, bf.fixed(.decode));
+    // The FP8 residents' prompt route: its BF16 weights in the prompt phase only (0 under bf16).
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(b, "fp8_prompt_weights"));
+    var fp8_in = in;
+    fp8_in.model = fp8.fullSet(in.model);
+    const b8 = try billOf(a, &fp8_in);
+    defer b8.free(a);
+    const want8 = fp8PromptBytes(&fp8_in.model, fp8_in.page);
+    // The widest layer's FP8 set in BF16 (fp8.zig `promptBytes`: layers 0-2, 573,046,784 B) and its wiring.
+    try testing.expectEqual(@as(u64, 573_046_784) + wireTables(573_046_784), want8);
+    try testing.expectEqual([2]u64{ want8, 0 }, termOf(b8, "fp8_prompt_weights"));
+    try testing.expectEqual(b.fixed(.prompt) + want8, b8.fixed(.prompt));
+    try testing.expectEqual(b.fixed(.decode), b8.fixed(.decode));
     const target = box_ceiling - box_stop;
     const rows = try sdk.fill(b, 12_600_000_000, target, 288, min_rows);
     try testing.expect(rows.prompt >= min_rows and rows.prompt <= rows.decode and rows.decode <= 288);

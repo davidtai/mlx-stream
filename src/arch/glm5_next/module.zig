@@ -19,6 +19,7 @@ const kda = @import("kda.zig");
 const kda_percore = @import("kda_percore.zig");
 const dsa = @import("dsa.zig");
 const dump = @import("dump.zig");
+const fp8 = @import("fp8.zig");
 const mtp = @import("mtp.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const acc = @import("../../sdk_ext.zig").acceptance;
@@ -42,6 +43,9 @@ pub const Module = struct {
     src: *experts.Source,
     cache: graph.Cache,
     routes: dsa.Routes,
+    /// `residents_format: fp8_block128`: the FP8 residents route (fp8.zig), installed before the residents bind (every
+    /// FP8 projection points here); null under `bf16`.
+    fp8_route: ?*fp8.Route = null,
     /// The positions the load billed (the lanes' bound).
     reserve: u64,
     rows: sdk.Rows,
@@ -79,8 +83,15 @@ pub const Module = struct {
         // The residents: every tensor the trunk does not read dropped unread (the vision tower, the MTP layer, the FP8 KV
         // scales: never billed), the rest bound by name and shape, then read into their buffers at once.
         try dropUnread(gpa, weights, &self.c.model, self.c.mtp_lane);
-        self.w = try graph.Weights.bind(gpa, s, weights, &self.c.model, &diag);
+        // The residents' route by the pack's `residents_format`, once: `fp8_block128` installs the FP8 route before the bind
+        // (MiMo's texts: no device work until a call) and binds every trunk site the pack declares FP8 to it; every other
+        // site (all of them under `bf16`, the control) binds BF16 on the stock matmul.
+        if (self.c.model.fp8Declared() > 0) self.fp8_route = try fp8.Route.install(gpa);
+        errdefer if (self.fp8_route) |r| r.destroy(gpa);
+        self.w = try graph.Weights.bind(gpa, s, weights, &self.c.model, self.fp8_route, &diag);
         errdefer self.w.deinit(gpa);
+        if (self.fp8_route != null)
+            log.info("glm5_next residents installed: residents=fp8_block128 ({d} of the trunk's {d} sites FP8 on MiMo's fp8res route: GEMV at M<={d}, prompt M>{d} = bf16(code x scale) in an LRU of {d} slots released at every prompt layer's end + the stock GEMM, bound {d} B; the other sites, lm_head, embeddings, mHC, f_b/g_b, routers, kv_b, the indexer's weights_proj and the MTP layer BF16)\n", .{ model.fp8Declared(), model.fp8TrunkSites(), fp8.gemv_max_rows, fp8.gemv_max_rows, fp8.prompt_slots, fp8.promptBytes(model, std.heap.pageSize()) });
         const t_read = std.Io.Timestamp.now(io, .awake);
         try weights.materialize();
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
@@ -126,13 +137,20 @@ pub const Module = struct {
             log.info("glm5_next logits_dump: on dir={s} chunk_rows={d} chunk_bytes={d} (one safetensors file per prompt pass: logits F32 [prompt rows, {d}], token_ids I32, ids_int32_sha256; written before the request returns)\n", .{ d, graph.dump_chunk_rows, dump.chunkBytes(graph.dump_chunk_rows, model.vocab_size, model.hidden_size), model.vocab_size });
         }
         if (self.mtp == null) log.info("glm5_next MTP lane: off (serial; set {{\"mtp_lane\":true}})\n", .{});
-        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s}\n", .{ routes.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route) });
+        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s} residents={s}\n", .{ routes.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route), @tagName(self.c.model.residents_format) });
         // The prompt levers' engagement lines (glm5next/prefill-levers; docs/glm5-next.md "Prompt levers").
         if (experts.prompt_relocate) log.info("glm5_next prompt lever 1: read-ahead relocation engaged (a read-ahead record the plans evict before any hit is copied at the plans into its later transient row: read once; exact)\n", .{});
         log.info("glm5_next prompt lever 3: prompt kernels warmed at load in {d} ms (KDA layer {d}: {d} spans; dense layer {d}: one {d}-row tile; DSA layer {d}: {d} spans of {d} rows; the {s} combine; token-identical)\n", .{ warmed.ns / std.time.ns_per_ms, warmed.plan.kda_layer, warmed.plan.kda_spans, warmed.plan.dense_layer, graph.dense_tile_rows, warmed.plan.dsa_layer, warmed.plan.dsa_spans, graph.span_rows, @tagName(self.src.combine_route) });
         log.info("glm5_next prompt lever 4: routing barrier committed before the shared expert (the routed ids and weights, then the shared expert's GEMMs; exact)\n", .{});
         log.info("glm5_next prompt lever 5: predictor counts on the GPU, committed behind the previous layer's tail (one read back of the expert counts; token-identical)\n", .{});
-        log.info("mlx-stream glm5_next installed: {d} layers; {d} KDA, {d} DSA; residents BF16 {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed ({d} sources), {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nKda(), model.nDsa(), weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, n_moe, plan.rows.prompt, graph.prompt_call_rows });
+        // The residents' counts by route: `BF16 <n>` (the control's line), or `FP8 <projections> + BF16 <the rest>` (each FP8
+        // projection two tensors: its codes and its scales).
+        var rb: [64]u8 = undefined;
+        const residents = if (self.fp8_route != null)
+            std.fmt.bufPrint(&rb, "FP8 {d} + BF16 {d}", .{ model.fp8Declared(), weights.count() - 2 * model.fp8Declared() }) catch unreachable
+        else
+            std.fmt.bufPrint(&rb, "BF16 {d}", .{weights.count()}) catch unreachable;
+        log.info("mlx-stream glm5_next installed: {d} layers; {d} KDA, {d} DSA; residents {s} tensors read in {d:.2} s; experts NVFP4 g16 streamed ({d} sources), {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nKda(), model.nDsa(), residents, @as(f64, @floatFromInt(read_ns)) / 1e9, n_moe, plan.rows.prompt, graph.prompt_call_rows });
         log.info("glm5_next memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv=bf16 phase_rows=on growth_rows={d} forced={s}\n", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, plan.rows.decode - plan.rows.prompt, if (bill.isForced(cfg)) "yes" else "no" });
         if (comptime gprof.enabled) try gprof.arm(gpa, io, self.src, model.n_layers, s);
         self.checkConstruction(plan.bill, plan.rows.prompt);
@@ -179,6 +197,7 @@ pub const Module = struct {
         self.src.deinit();
         self.cache.deinit(&self.g);
         self.w.deinit(self.gpa);
+        if (self.fp8_route) |r| r.destroy(self.gpa);
         self.gpa.free(self.gates);
         self.g.deinit();
         self.gpa.destroy(self);
@@ -225,6 +244,8 @@ pub const Module = struct {
 
     /// The prompt pass's end -> the decode phase (the source's phase change), the request's decode accounting.
     fn enterDecode(self: *Module, prompt_tokens: usize) !void {
+        // The FP8 prompt route's BF16 weights released (MLX's cache is cleared by the source's phase change below).
+        if (self.fp8_route) |r| r.close();
         if (comptime gprof.enabled) gprof.promptEnd(self.src);
         try self.src.beginDecode();
         self.decode = .{ .active = true, .s0 = self.src.stats() };
@@ -251,6 +272,7 @@ pub const Module = struct {
     }
 
     fn beginPrompt(self: *Module, ids: []const u32) !void {
+        if (self.fp8_route) |r| r.open();
         try self.src.beginPrefill();
         _ = try self.src.chooseReadSchedule(ids.len);
         self.cache.restart(&self.g);
@@ -342,8 +364,10 @@ pub const Module = struct {
         if (!self.src.decodeLaneAt(@intCast(ids.len))) {
             // Wider than the decode lane: the prompt phase for it, then decode again.
             try self.src.resumePrefill();
+            if (self.fp8_route) |r| r.open();
             const logits = try self.promptCalls(ids, .last, {});
             errdefer self.g.release(logits);
+            if (self.fp8_route) |r| r.close();
             try self.src.beginDecode();
             return logits;
         }
