@@ -34,7 +34,8 @@ The arch claims a `config.json` with `model_type` `glm5_next` and the block
 The block's optional `settings` object takes `expert_prefill_rows` and `expert_rows` (an operator pin: either alone
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
 is installed when true; off, the serial control, by default: below), `draft_depth` (the lane's drafts per round: an
-integer 1 .. 3, default 3; anything else refused by name), `decode_moe` (the decode lane's expert route:
+integer 1 .. 3, default 3; anything else refused by name), `draft_gate` (the lane's confidence gate: theta in [0, 1),
+default 0 = off; below), `decode_moe` (the decode lane's expert route:
 `hitpass`, the default, `fused` or `stock`; anything else refused by name), `decode_glue` (the decode lane's glue:
 `fused`, the default, or `ops`), `decode_kda`, `decode_dsa` and `decode_swiglu` (the decode lane's KDA layer, DSA
 attention and MLP activation: `fused`, the default, or `ops`), `decode_predict` (the lookahead predictor's router
@@ -311,7 +312,13 @@ lanes truncated; on a partial accept every KDA state restored from the capture b
 kept rows' hidden. A round without drafts (the lane not tracking, the cap, the context) is a serial step. The request's
 receipt is MiMo's `[spec-stats]` line (rounds, accepted per round, misses and bytes per round) and the lane's tail
 ` depth=<d> pos_tested=a,b,c pos_kept=x,y,z` (per draft position: the rounds that decided it, the rounds that kept it;
-position i's acceptance is kept / tested).
+position i's acceptance is kept / tested). Each draft's top-1 probability under the head (q = exp(max - logsumexp) of
+its logits) is read in the round's one sync with the drafts; the request's end logs the calibration, those counts by q
+(`glm5_next MTP lane calibration: depth=<d> q_bins=10 pos1=t/k,... pos2=... pos3=...`, bin floor(10 q)).
+`draft_gate` (theta, default 0 = off) verifies a round's leading drafts whose cumulative q stays at or above theta
+(`mtp.gatedDrafts`; the rest are dropped before the verify, their rows saved); the install line ends `draft_gate=`.
+Design: build/g21c-dc/DESIGN-CONFIDENCE-GATE.md in the reports tree (theta = the lane's tokens per ms x the marginal
+verify row's ms, about 0.52 .. 0.60 at 115/131).
 
 Bill (with the lane): the lane's own terms (`mtp_bank`, `mtp_residents`, `mtp_tables`, `mtp_kv`, `mtp_pending`,
 `mtp_wave`), the decode wave at the verify's 4 rows (`request`), `mtp_kda_capture` (5 rows of every KDA layer's state

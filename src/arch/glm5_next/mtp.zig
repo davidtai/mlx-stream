@@ -114,26 +114,78 @@ pub fn draftsAt(depth: u32, tracked: u64, n_pending: u32, len: u64, accepted_cap
     return mimo_draft.draftCount(tracked == len and n_pending >= 1, depth, accepted_cap, reserve, len);
 }
 
-/// A round's drafts as one device graph over op backend `Ops` (`argmax`, `reshape`, `concat`, `evalAll`, `hostU32`) and
-/// the draft head `head` (`step(g, x, pos)`: the layer at `pos`, its normed row and f32 logits [vocab]; `input(g, idx,
-/// normed)`: the next pair's input from the token ids `idx` on the device). Step s runs at position `start + s`; its
-/// argmax (uint32 [1]) is draft s and feeds step s + 1's input without leaving the device. One eval and one read bring
-/// the `depth` drafts to the host, before the verify (the stepwise chain synced once a step). Every op is the stepwise
-/// chain's: the index array holds the value the host would upload, so each embedding row, each step and each draft is
-/// the same, bit for bit.
-pub fn chainDrafts(comptime Ops: type, g: *Ops, head: anytype, x0: Ops.T, start: u32, depth: u32, out: []u32) !void {
-    std.debug.assert(depth >= 1 and depth <= max_depth and out.len >= depth);
+/// A round's drafts as one device graph over op backend `Ops` (`argmax`, `reshape`, `concat`, `max`, `logsumexp`, `sub`,
+/// `exp`, `evalAll`, `hostU32`, `hostF32`) and the draft head `head` (`step(g, x, pos)`: the layer at `pos`, its normed
+/// row and f32 logits [vocab]; `input(g, idx, normed)`: the next pair's input from the token ids `idx` on the device).
+/// Step s runs at position `start + s`; its argmax (uint32 [1]) is draft s and feeds step s + 1's input without leaving
+/// the device. One eval brings the `depth` drafts to the host, before the verify (the stepwise chain synced once a step),
+/// with each draft's top-1 probability under the head (`q_out`: exp(max - logsumexp) of the step's logits, a side branch
+/// of the same graph read after the same eval). Every op on the drafts' path is the stepwise chain's: the index array
+/// holds the value the host would upload, so each embedding row, each step and each draft is the same, bit for bit.
+pub fn chainDrafts(comptime Ops: type, g: *Ops, head: anytype, x0: Ops.T, start: u32, depth: u32, out: []u32, q_out: []f32) !void {
+    std.debug.assert(depth >= 1 and depth <= max_depth and out.len >= depth and q_out.len >= depth);
     var ids: [max_depth]Ops.T = undefined;
+    var qs: [max_depth]Ops.T = undefined;
     var x = x0;
     for (0..depth) |s| {
         const r = try head.step(g, x, start + @as(u32, @intCast(s)));
         ids[s] = try g.reshape(try g.argmax(r.logits, 0), &.{1});
+        qs[s] = try g.reshape(try g.exp(try g.sub(try g.max(r.logits, 0, false), try g.logsumexp(r.logits, 0, false))), &.{1});
         if (s + 1 < depth) x = try head.input(g, ids[s], r.normed);
     }
     const all = if (depth == 1) ids[0] else try g.concat(ids[0..depth], 0);
-    try g.evalAll(&.{all});
+    const q_all = if (depth == 1) qs[0] else try g.concat(qs[0..depth], 0);
+    try g.evalAll(&.{ all, q_all });
     _ = try g.hostU32(all, out[0..depth]);
+    _ = try g.hostF32(q_all, q_out[0..depth]);
 }
+
+/// The draft gate (`settings.draft_gate`, theta): of a round's `q.len` drafts, the leading ones whose cumulative top-1
+/// probability q_1 x .. x q_s stays at or above theta are verified, the rest dropped (the verify's rows saved). theta 0
+/// (the default, off) keeps every draft. The products only fall, so the first one under theta ends the prefix.
+pub fn gatedDrafts(q: []const f32, theta: f32) u32 {
+    std.debug.assert(q.len <= max_depth);
+    var cum: f32 = 1;
+    for (q, 0..) |p, s| {
+        cum *= p;
+        if (cum < theta) return @intCast(s);
+    }
+    return @intCast(q.len);
+}
+
+/// The request's acceptance by draft position and the head's top-1 probability q (the calibration the draft gate reads):
+/// `tested[i][b]` counts the rounds whose draft i + 1 was decided with q in bin b (b = floor(q x `q_bins`), q = 1 in the
+/// last), `kept[i][b]` those that accepted it. Position i + 1's acceptance at q is kept[i][b] / tested[i][b].
+pub const Calib = struct {
+    pub const q_bins = 10;
+    tested: [max_depth][q_bins]u32 = @splat(@splat(0)),
+    kept: [max_depth][q_bins]u32 = @splat(@splat(0)),
+
+    pub fn binOf(q: f32) usize {
+        if (!(q > 0)) return 0;
+        return @min(q_bins - 1, @as(usize, @intFromFloat(q * q_bins)));
+    }
+
+    /// A round of `drafted` drafts verified with `accepted` kept, the drafts' q in `q` (the prefix `drafted` read).
+    pub fn add(c: *Calib, drafted: u32, accepted: u32, q: []const f32) void {
+        std.debug.assert(accepted <= drafted and drafted <= max_depth and q.len >= drafted);
+        const decided: u32 = @min(accepted + 1, drafted);
+        for (0..decided) |i| c.tested[i][binOf(q[i])] += 1;
+        for (0..accepted) |i| c.kept[i][binOf(q[i])] += 1;
+    }
+
+    /// `depth=<d> q_bins=10 pos1=t/k,t/k,.. pos2=.. pos3=..` (every position up to `max_depth`, each bin's tested / kept)
+    /// into `buf`; empty when it does not fit.
+    pub fn write(c: *const Calib, buf: []u8, depth: u32) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.print("depth={d} q_bins={d}", .{ depth, q_bins }) catch return buf[0..0];
+        for (c.tested, c.kept, 0..) |t, k, i| {
+            w.print(" pos{d}=", .{i + 1}) catch return buf[0..0];
+            for (t, k, 0..) |tb, kb, b| w.print("{s}{d}/{d}", .{ if (b == 0) "" else ",", tb, kb }) catch return buf[0..0];
+        }
+        return w.buffered();
+    }
+};
 
 /// The request's acceptance by draft position (the receipt's `pos_tested` / `pos_kept`): `tested[i]` counts the rounds
 /// whose draft i + 1 was decided (drafts 1 .. i accepted), `kept[i]` those that accepted it. The exact rule keeps a
@@ -536,10 +588,14 @@ pub const Lane = struct {
     untracked_logged: bool = false,
     /// Drafts per round at most (`settings.draft_depth`, 1 .. `max_depth`; construction).
     depth: u32 = max_depth,
+    /// The draft gate's theta (`settings.draft_gate`; 0: off, every draft verified; `gatedDrafts`; construction).
+    gate: f32 = 0,
     /// The request's counters (MiMo's: rounds, drafted, accepted, generated, corrected; the stream's at the decode start).
     stats: mimo_draft.Stats = .{},
     /// The request's acceptance by draft position (the receipt's tail).
     pos: Positions = .{},
+    /// The request's acceptance by draft position and the head's top-1 probability (the request end's calibration line).
+    calib: Calib = .{},
     /// What the open holds, from its own arrays (`heldOf`: the bank's nine, the head's three f32 tables, the two lanes,
     /// each at MLX's allocation size): the module holds it to the bill's terms, which `heldBytes` derives from the same
     /// shapes (`holdCheck`).
@@ -551,8 +607,9 @@ pub const Lane = struct {
     /// The lane over the pack at `dir`: the draft bank (refused by name when absent), the head bound from `map` (the
     /// arch's weight map with the MTP layer's residents kept and read), every record read into the bank's MLX arrays and
     /// checked, the lanes allocated at `cap` positions plus `max_depth`; `depth` drafts a round at most (`draft_depth`,
-    /// 1 .. `max_depth`, validated with the settings). Device work: the module's construction, under the GPU lock.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, depth: u32, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
+    /// 1 .. `max_depth`) and `gate` the draft gate's theta (`draft_gate`, 0 off), both validated with the settings.
+    /// Device work: the module's construction, under the GPU lock.
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, depth: u32, gate: f32, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
         std.debug.assert(depth >= 1 and depth <= max_depth);
         var db = try DraftBank.open(gpa, io, dir, c, diag);
         defer db.deinit();
@@ -562,7 +619,7 @@ pub const Lane = struct {
         const self = try gpa.create(Lane);
         errdefer gpa.destroy(self);
         const lanes_cap = cap + max_depth;
-        self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth };
+        self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth, .gate = gate };
         self.head = try Head.bind(gpa, g.s, map, c, diag);
         errdefer self.head.deinit(gpa);
         const n: u32 = c.n_routed_experts;
@@ -593,7 +650,7 @@ pub const Lane = struct {
         for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         self.held_bytes = heldOf(&held, std.heap.pageSize());
-        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=device_chain bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
+        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=device_chain bank={s} experts={d} lanes={d} positions measured_bytes={d} draft_gate={d:.3}\n", .{ lane_name, depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, gate });
         return self;
     }
 
@@ -616,12 +673,15 @@ pub const Lane = struct {
         self.untracked_logged = false;
         self.stats = .{};
         self.pos = .{};
+        self.calib = .{};
     }
 
-    /// A round's counters: `drafted` drafts, `accepted` of them kept (MiMo's `Stats` and the per-position counts).
-    pub fn record(self: *Lane, drafted: u32, accepted: u32) void {
+    /// A round's counters: `drafted` drafts verified, `accepted` of them kept, the drafts' top-1 probabilities `q`
+    /// (MiMo's `Stats`, the per-position counts and their calibration).
+    pub fn record(self: *Lane, drafted: u32, accepted: u32, q: []const f32) void {
         self.stats.add(drafted, accepted);
         self.pos.add(drafted, accepted);
+        self.calib.add(drafted, accepted, q);
     }
 
     /// The pairs in the lanes.
@@ -764,14 +824,15 @@ pub const Lane = struct {
     /// A round's `depth` drafts into `out` after `t1` (the token at the trunk's length): the pending pairs appended
     /// (their tokens `after`, then `t1`; the last one through the layer), the first draft from the last pair's row, each
     /// further one from the previous draft and its normed output at the next position, chained on the device and read
-    /// once (`chainDrafts`). The draft rows leave the lanes at the end: the lanes hold the trunk's pairs only.
-    pub fn draft(self: *Lane, g: *G, w: *const graph.Weights, after: []const u32, t1: u32, depth: u32, out: []u32) !void {
+    /// once with each draft's top-1 probability into `q` (`chainDrafts`). The draft rows leave the lanes at the end: the
+    /// lanes hold the trunk's pairs only.
+    pub fn draft(self: *Lane, g: *G, w: *const graph.Weights, after: []const u32, t1: u32, depth: u32, out: []u32, q: []f32) !void {
         std.debug.assert(after.len + 1 == self.n_pending and depth >= 1 and depth <= max_depth and out.len >= depth);
         try self.append(g, w, after);
         const m0 = g.mark();
         defer g.resetTo(m0);
         const start = self.pairs();
-        try chainDrafts(G, g, ChainHead{ .lane = self, .w = w }, try self.input(g, w, &.{t1}, self.pending.?), start, depth, out);
+        try chainDrafts(G, g, ChainHead{ .lane = self, .w = w }, try self.input(g, w, &.{t1}, self.pending.?), start, depth, out, q);
         self.latent.truncateTo(start + 1);
         self.index.truncateTo(start + 1);
         g.release(self.pending.?);
@@ -784,6 +845,12 @@ pub const Lane = struct {
     pub fn line(self: *const Lane, buf: []u8, now: sdk_ext.expert.Stats) []const u8 {
         const head = self.stats.line(buf, lane_name, now);
         return buf[0 .. head.len + self.pos.write(buf[head.len..], self.depth).len];
+    }
+
+    /// The request's calibration (`Calib.write`), for its own line at the request's end (the host's receipt buffer holds
+    /// MiMo's line and the per-position tail only).
+    pub fn calibLine(self: *const Lane, buf: []u8) []const u8 {
+        return self.calib.write(buf, self.depth);
     }
 };
 

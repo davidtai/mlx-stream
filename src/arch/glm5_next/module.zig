@@ -194,7 +194,7 @@ pub const Module = struct {
         // The MTP lane (`mtp_lane`): its draft bank read into MLX and checked, its head bound from the kept residents,
         // its lanes at the billed positions; what its open holds against its billed terms (ConstructionOverBill).
         if (self.c.mtp_lane) {
-            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.c.draft_depth, self.routes.dsa, &diag);
+            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.c.draft_depth, self.c.draft_gate, self.routes.dsa, &diag);
             errdefer lane.deinit(&self.g);
             const term = termBytes(plan.bill, "mtp_bank") + termBytes(plan.bill, "mtp_tables") + termBytes(plan.bill, "mtp_kv");
             log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv), residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
@@ -521,10 +521,14 @@ pub const Module = struct {
         try self.checkTokens(&.{t1});
         // The round's wall, its drafts included (the request's decode line rates the rounds as a serial step's tokens).
         const t0 = self.nowNs();
-        const k = mtp.draftsAt(lane.depth, lane.tracked(), lane.n_pending, len, accepted_cap, self.reserve);
+        const drafted = mtp.draftsAt(lane.depth, lane.tracked(), lane.n_pending, len, accepted_cap, self.reserve);
         var ids: [mtp.verify_rows]u32 = undefined;
+        var q: [mtp.max_depth]f32 = undefined;
         ids[0] = t1;
-        if (k > 0) try lane.draft(g, &self.w, self.history[lane.pairs() + 1 .. len], t1, k, ids[1 .. k + 1]);
+        if (drafted > 0) try lane.draft(g, &self.w, self.history[lane.pairs() + 1 .. len], t1, drafted, ids[1 .. drafted + 1], q[0..drafted]);
+        // The draft gate (`draft_gate`): the leading drafts whose cumulative top-1 probability stays at or above theta are
+        // verified (theta 0, the default: every draft).
+        const k = mtp.gatedDrafts(q[0..drafted], lane.gate);
         const rows: u32 = k + 1;
         const drafts = ids[1..rows];
         const tp = gprof.stepBegin(t1);
@@ -553,9 +557,9 @@ pub const Module = struct {
         try self.cache.rollback(g, &self.c.model, len, rows, kept + 1);
         gprof.stepEnd(tp);
         const committed = try g.slice(hidden, &.{ 0, 0 }, &.{ @intCast(kept + 1), @intCast(self.c.model.hidden_size) }, &.{ 1, 1 });
-        try lane.pend(g, len + 1 + kept, committed, kept + 1, k == 0);
+        try lane.pend(g, len + 1 + kept, committed, kept + 1, drafted == 0);
         @memcpy(self.history[len..][0 .. kept + 1], ids[0 .. kept + 1]);
-        lane.record(k, kept);
+        lane.record(k, kept, q[0..k]);
         const tokens = try a.dupe(u32, ids[0..plan.emitted]);
         if (comptime gprof.enabled) gprof.roundEnd(kept, tokens);
         self.decode.steps += 1;
@@ -582,6 +586,11 @@ pub const Module = struct {
         if (!self.decode.active) return;
         const d = self.decode;
         self.decode = .{};
+        // The lane's calibration: each draft position's tested / kept counts by the head's top-1 probability q.
+        if (self.mtp) |lane| if (lane.stats.rounds > 0) {
+            var cb: [1024]u8 = undefined;
+            log.info("glm5_next MTP lane calibration: {s}\n", .{lane.calibLine(&cb)});
+        };
         if (comptime gprof.enabled) gprof.decodeEnd(self.src);
         const footprint = sdk.memory.footprint().now;
         var active: usize = 0;
