@@ -1548,13 +1548,15 @@ pub const Module = struct {
         return self.forward(ids);
     }
 
-    /// The reverse phase change (decode -> prompt), once per finished request: the served shell calls it at the request's
-    /// end, after its last token went out (off both clocks); the next prefill runs it when an errored request's end did
-    /// not. The order is the bill's (ledger 101): the request's state and the decode-only rows freed first (the grown
-    /// rows and window 0; a cancelled request's routes settled and unpinned before), the MLX cache cleared, then the
-    /// settle until the footprint is at most the prompt bill less the terms not yet live (`reverseBound`), and ONLY
-    /// then the prompt's scratch and cache limit back. Residents and Engram persist. A no-op when the
-    /// Module already holds its prompt configuration; a refusal is the boundary's (every later request refused).
+    /// The reverse phase change (decode -> prompt), once per finished request, at a harness's own request end (off both
+    /// clocks; `Coming.unknown`: the kept boundary stays, the prompt rows' residents are forgotten). The served path never
+    /// calls it (the SDK has no request-end hook): the next request's prefill runs the change (`prefillAt`, `requestEndFor`)
+    /// with the coming request known, so a continuation keeps the prompt rows' residents. The order is the bill's (ledger
+    /// 101): the request's state and the decode-only rows freed first (the grown rows and window 0; a cancelled request's
+    /// routes settled and unpinned before), the MLX cache cleared, then the settle until the footprint is at most the
+    /// prompt bill less the terms not yet live (`reverseBound`), and ONLY then the prompt's scratch and cache limit back.
+    /// Engram persists. A no-op when the Module already holds its prompt configuration; a refusal is the boundary's
+    /// (every later request refused).
     pub fn requestEnd(self: *Module) !void {
         return self.requestEndFor(.unknown);
     }
