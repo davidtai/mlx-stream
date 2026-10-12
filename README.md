@@ -51,6 +51,59 @@ From the host checkout the suites are `zig build mlx-stream-test` (part of `zig 
 `DSV41_BANK` is set. The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model
 or run on the GPU skip unless their own inputs are given.
 
+### Independent official-reference fixtures
+
+`src/deepseek_v41_reference_test.zig` compares the real `HashState.advance` / `trim` against the official
+`NgramHashState.forward`: both layers, all 24 columns, masked spans, empty input, every two-way split, single-token
+decode and rollback after a different draft. The sparse token map preserves original token IDs and their official
+compressed IDs; it does not test the pack's token-map loader or reimplement tokenizer normalization.
+
+The device test compares `Trunk.engramRows` (FP8) and `MlxOps.dequantize` (FP4) against independently generated BF16
+values, bit for bit, including signed zero. Shapes 7×64 and 35×96 cross packed-word, 32-value scale-group and
+32-output-row scale boundaries. A separate Engram case uses independently scaled 256-value rows and checks the
+full `[2, 2, 24, 256]` output shape. The cases cover all finite E4M3 code magnitudes and all FP4 nibbles with finite
+normal E8M0 scales. Official linear FP8 scales shared across 32 output rows are explicitly expanded to MLX's
+per-row contract; the Engram case needs no scale expansion across rows.
+NaN/Inf, extreme E8M0 scales, dynamic activation/cache quantization, GEMM accumulation and full-model parity are
+**not** covered. These are independent-reference comparisons, not comparisons between two plugin routes.
+
+The checked fixtures derive from [DeepSeek-V4.1-Flash at
+`2cba9e42aa026125f3ed06c6d98c1db82f7ca027`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/tree/2cba9e42aa026125f3ed06c6d98c1db82f7ca027).
+The dumper checks SHA256 for `inference/engram.py`, `inference/kernel.py`, `config.json` and `tokenizer.json`.
+Those four files are byte-identical at the served pack's original-source revision
+`dba1be0a40aa45a94ad051997016db3960a90277`; this says nothing about other files or converted model weights.
+Engram executes official CPU code; dequantization uses Torch E4M3/E8M0/BF16 casts and the official FP4 level table,
+not TileLang/CUDA execution. Attribution is in NOTICE.
+
+Reproduce with the exercised Python 3.14 environment (no model weights or external metadata probe):
+
+```sh
+python3.14 -m venv /tmp/dsv41-reference-env
+/tmp/dsv41-reference-env/bin/pip install torch==2.14.1 numpy==2.4.2 sympy==1.14.0 tokenizers==0.21.4
+REF=/tmp/dsv41-official-reference
+REV=2cba9e42aa026125f3ed06c6d98c1db82f7ca027
+mkdir -p "$REF/inference"
+for file in inference/engram.py inference/kernel.py config.json tokenizer.json; do
+  curl -fL "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/$REV/$file" -o "$REF/$file"
+done
+/tmp/dsv41-reference-env/bin/python scripts/dump_dsv41_reference_fixtures.py --reference "$REF" --output /tmp/dsv41-regenerated
+cmp src/fixtures/dsv41_official_engram.json /tmp/dsv41-regenerated/dsv41_official_engram.json
+cmp src/fixtures/dsv41_official_dequant.json /tmp/dsv41-regenerated/dsv41_official_dequant.json
+```
+
+From the host checkout, build the filtered binary and run it directly for each device (changing environment
+variables alone does not invalidate Zig's cached test-run result):
+
+```sh
+zig build test-build -Doptimize=ReleaseFast -Dmlx-stream-dir=../mlx-stream -Dtest-filter="dsv41 official reference"
+env -u DSV41_REFERENCE_DEVICE zig-out/tests/mlx-stream-test
+DSV41_REFERENCE_DEVICE=cpu zig-out/tests/mlx-stream-test
+DSV41_REFERENCE_DEVICE=gpu zig-out/tests/mlx-stream-test
+```
+
+Hash tests always run without a device. The unset selector skips only dequantization; `cpu` and `gpu` exercise it
+on the named device. Both MLX modes may initialize Metal; run them outside a live server or model run. No pack is needed.
+
 ## Memory and context length
 
 The module bills its memory before it allocates anything. At load it fills the expert slot rows up to the box's

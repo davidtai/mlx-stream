@@ -53,3 +53,18 @@ reproduce.
 DeepSeek-V4.1-Flash
 The DeepSeek-V4.1-Flash release's `inference/model.py` is the reference for the
 `deepseek_v41` architecture. No model weights are included in this repository.
+
+The independent consumer fixtures src/fixtures/dsv41_official_{engram,dequant}.json
+and scripts/dump_dsv41_reference_fixtures.py use the official Engram CPU forward
+and stored FP8/FP4 decoding specification at revision
+2cba9e42aa026125f3ed06c6d98c1db82f7ca027:
+https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash
+Copyright (c) 2023 DeepSeek, MIT License (the permission notice and disclaimer
+in LICENSE apply). The official code is loaded externally, not vendored.
+
+These fixtures and their dumper are adapted from Sushi's independent
+DeepSeek-V4.1 consumer fixtures (MIT):
+Copyright (c) 2026 Theinruj Toranavikrai
+Copyright (c) 2026 David Dalcu
+They contain synthetic numerical inputs and tokenizer-derived hash metadata,
+not model weights or conversion tools.

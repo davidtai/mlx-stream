@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- DeepSeek-V4.1 Engram hashing and stored FP8/FP4 decoding now have reproducible independent official-reference numerical coverage on CPU and GPU.
 - The plugin carries its own `sdk` module (sdk/: the arch contract, the weight loader, the reads past the page cache)
   and reaches mlx-serve only through `mlx_host`; mlx-serve calls the arch from one glue file. `HOST_PIN`, the
   conformance suite's host-registry test and the host test bridge's dependence on host internals are gone.
