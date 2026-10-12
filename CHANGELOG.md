@@ -28,8 +28,10 @@
   unproven despite enclosing compact/banked shader samples. No microbenchmark delta is promoted.
 - Restore uniform-bank submission's original expert-id ordering, constant layer footprint
   and cached segment lengths; per-record geometry grouping/scans run only for mixed geometry.
-  Safe stream consumer regressions pass. Fresh served stock validation remains required;
-  this removes added stock work without attributing the earlier timing failure to it.
+  Safe stream consumer regressions pass. Fresh served stock validation completed 24 long requests,
+  with exact output/usage, sampled stock launch sets, clean profiler captures and same-facts admission.
+  Performance neutrality is still rejected: 10.17% short-decode and 13.42% count-decode baseline drift,
+  with a changing live memory baseline. No timing failure is causally attributed to the source repair.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the

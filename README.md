@@ -100,9 +100,15 @@ EXL3 shader samples with matching sampled launch-name sets. Independent source-a
 `servedBill`/`servedFill` reports match the merged baseline exactly at all recorded memory facts over
 every uniform row count and legal extra-record suffix, and reproduce each engine's observed admission.
 This is **not accepted stock neutrality or an optimization win**: two individual prefill comparisons
-were -3.48% and -3.52%, outside the 3% regression guard. The table precedes the subsequent restoration
-of uniform submission's original id ordering, constant footprint and cached segment lengths; geometry
-scans are now limited to mixed geometry. That source is undergoing fresh served validation.
+were -3.48% and -3.52%, outside the 3% regression guard. The table precedes the restoration of uniform
+submission's original id ordering, constant footprint and cached segment lengths; geometry scans now
+run only for mixed geometry. A fresh source-attested candidate (`6d02c546`) completed another 24 long
+requests at 16,201 code / 16,161 count native prompt tokens, again passing delivered-output/usage,
+sampled stock launch sets, clean attach profiling and exact same-facts admission. Neutrality remains
+rejected: short-decode baseline drift was 10.17%, count-decode baseline drift was 13.42%, and individual
+prefill comparisons also exceeded the 3% guard. The unchanged baseline's live memory reading changed
+from 19.66 GB to 25.62 GB, changing admission from 116/147 to 105/136 prefill/decode rows. These timing
+results establish neither neutrality nor a causal attribution to the restored stock submission work.
 The stock budget-boundary regression fails before the compact-only metadata correction and passes
 afterward in ReleaseSafe. No thermal/fan equivalence is claimed.
 
