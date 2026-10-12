@@ -5,7 +5,8 @@
 //! the default: the NVFP4 decode texts with the device hit pass; `fused`, the texts with the host-routed hit wave, its
 //! control; `stock`, MLX's gathers, the texts' control); `decode_glue` the decode lane's glue (`fused`, the default: the
 //! mHC hcPre chain, the router and top-8 texts, the combine with the shared expert's add, glue.zig; `ops`, the stock op
-//! chains, the control); `logits_dump_dir` (an absolute directory) installs the logits dump route for the KL gate
+//! chains, the control); `decode_kda` the decode lane's KDA layer (`fused`, the default: one text a layer, kda_decode.zig;
+//! `ops`, the op chain, the control); `logits_dump_dir` (an absolute directory) installs the logits dump route for the KL gate
 //! (dump.zig): absent, nothing of it is built.
 
 const std = @import("std");
@@ -24,7 +25,7 @@ pub const allocator_cache_bytes: u64 = 256 << 20;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "decode_kda", "logits_dump_dir" };
 
 /// The decode lane's routed-expert route, installed once at construction: `stock` MLX's gather_qmm nvfp4 (two gathers
 /// and the clamped SwiGLU, then a gather per down), `fused` the NVFP4 decode texts (decode_kernels.zig: MiMo's k1 family
@@ -37,6 +38,10 @@ pub const DecodeMoe = enum { stock, fused, hitpass };
 /// and norm with the previous expand in one dispatch), the router and top-8 texts and the combine with the shared expert's
 /// add; `ops` the stock op chains (the control). Rounding-class against `ops`.
 pub const DecodeGlue = enum { ops, fused };
+/// The decode lane's KDA layer, installed once at construction (kda_decode.zig): `fused` the host's oMLX KDA decode text
+/// in its BF16-gate variant (the conv, the gate stages, the norms, the gate, the delta rule and the gated norm in one
+/// dispatch; the projections stay GEMVs); `ops` the op chain (the control). Rounding-class against `ops`.
+pub const DecodeKda = enum { ops, fused };
 /// The longest dump directory a setting may name.
 pub const max_dump_dir: usize = 480;
 
@@ -61,6 +66,8 @@ pub const Config = struct {
     decode_moe: DecodeMoe = .hitpass,
     /// The decode lane's glue (glue.zig `Route`): `fused` (the default) or `ops` (the stock op chains, the control).
     decode_glue: DecodeGlue = .fused,
+    /// The decode lane's KDA layer (kda_decode.zig): `fused` (the default) or `ops` (the op chain, the control).
+    decode_kda: DecodeKda = .fused,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -72,7 +79,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, dump_dir: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, dump_dir: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -89,6 +96,10 @@ pub const Config = struct {
         if (raw.object.get("decode_glue")) |v| {
             const route: ?DecodeGlue = if (v == .string) std.meta.stringToEnum(DecodeGlue, v.string) else null;
             if (route) |r| c.decode_glue = r else c.malformed.decode_glue = true;
+        }
+        if (raw.object.get("decode_kda")) |v| {
+            const route: ?DecodeKda = if (v == .string) std.meta.stringToEnum(DecodeKda, v.string) else null;
+            if (route) |r| c.decode_kda = r else c.malformed.decode_kda = true;
         }
         if (raw.object.get("logits_dump_dir")) |v| {
             const ok = v == .string and v.string.len > 1 and v.string.len <= max_dump_dir and v.string[0] == '/' and std.mem.indexOfScalar(u8, v.string, 0) == null;
@@ -134,6 +145,7 @@ pub const Config = struct {
         if (c.malformed.dump_dir) return error.Glm5NextLogitsDumpDir;
         if (c.malformed.decode_moe) return error.Glm5NextDecodeMoeSetting;
         if (c.malformed.decode_glue) return error.Glm5NextDecodeGlueSetting;
+        if (c.malformed.decode_kda) return error.Glm5NextDecodeKdaSetting;
         if (c.kv_quant_bits) |b| if (b != 0 and b != 16) return error.Glm5NextKvQuantUnsupported;
         if (c.expert_rows) |d| if (d > c.model.n_routed_experts) return error.Glm5NextExpertRows;
         if (c.expert_prefill_rows) |p| if (p > c.model.n_routed_experts) return error.Glm5NextExpertRows;
@@ -185,6 +197,11 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try (try parseSettings("{\"decode_moe\":\"stock\"}")).validate();
     try testing.expectError(error.Glm5NextDecodeMoeSetting, (try parseSettings("{\"decode_moe\":\"k1\"}")).validate());
     try testing.expectError(error.Glm5NextDecodeMoeSetting, (try parseSettings("{\"decode_moe\":1}")).validate());
+    // The decode KDA layer: fused unless named; ops (the control) by name; anything else refused by name.
+    try testing.expectEqual(DecodeKda.fused, pinned.decode_kda);
+    try testing.expectEqual(DecodeKda.ops, (try parseSettings("{\"decode_kda\":\"ops\"}")).decode_kda);
+    try testing.expectError(error.Glm5NextDecodeKdaSetting, (try parseSettings("{\"decode_kda\":\"percore\"}")).validate());
+    try testing.expectError(error.Glm5NextDecodeKdaSetting, (try parseSettings("{\"decode_kda\":0}")).validate());
     // The decode glue: fused unless named; ops (the control) by name; anything else refused by name.
     try testing.expectEqual(DecodeGlue.fused, pinned.decode_glue);
     try testing.expectEqual(DecodeGlue.ops, (try parseSettings("{\"decode_glue\":\"ops\"}")).decode_glue);

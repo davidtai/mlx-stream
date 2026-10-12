@@ -197,6 +197,8 @@ pub const Weights = struct {
                 const dk: c_int = @intCast(c.kda_head_dim);
                 const dim = hv * dk;
                 const a_log = try lg.get("self_attn.A_log", &.{hv});
+                const conv_raw = try lg.get("self_attn.conv1d.weight", &.{ 3 * dim, 1, @intCast(c.kda_conv) });
+                if (mlx.mlx_array_dtype(conv_raw) != .bfloat16) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} self_attn.conv1d.weight is not BF16", .{l});
                 lw.attn = .{ .kda = .{
                     .q = try lg.get("self_attn.q_proj.weight", &.{ dim, h }),
                     .k = try lg.get("self_attn.k_proj.weight", &.{ dim, h }),
@@ -209,7 +211,8 @@ pub const Weights = struct {
                     .a_log = try w.own(a, try aLogTable(s, a_log, l, diag)),
                     .a_exp = try w.own(a, try aExp(s, a_log, hv, dk)),
                     .dt_bias = try w.own(a, try f32Copy(s, try lg.get("self_attn.dt_bias", &.{dim}), false)),
-                    .conv_w = try w.own(a, try convLayout(s, try lg.get("self_attn.conv1d.weight", &.{ 3 * dim, 1, @intCast(c.kda_conv) }))),
+                    .conv_w = try w.own(a, try convLayout(s, conv_raw)),
+                    .conv_raw = conv_raw,
                     .o_norm = try lg.get("self_attn.o_norm.weight", &.{dk}),
                     .o = try lg.get("self_attn.o_proj.weight", &.{ h, dim }),
                 } };
@@ -542,7 +545,7 @@ pub fn route(g: *G, c: *const glm.Config, r: Router, x: T) !Routing {
 
 /// The sublayer attention of layer `lw` on `stream` [1, R, hc, hidden] (rows at `start`): the collapse, the norm, KDA or
 /// DSA, the expand -> the new stream.
-fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start: u32, cache: *Cache, routes: dsa.Routes, comptime head: Head) !T {
+fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start: u32, cache: *Cache, routes: Routes, decode_lane: bool, comptime head: Head) !T {
     var col = try ops.collapse(g.s, stream, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, c.hc_iters, c.hc_eps, c.rms_norm_eps);
     defer col.deinit();
     const normed = try rmsNorm(g, col.x, lw.input_norm, c.rms_norm_eps);
@@ -550,9 +553,11 @@ fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start
         // The MTP verify captures every row's state (`Cache.rollback`); every other call advances the state alone.
         .kda => |*kw| if (head == .verify)
             try kda.forwardCapture(g, c, kw, normed, &cache.kda[lw.slot], &cache.capture[lw.slot])
+        else if (decode_lane)
+            try routes.kda.run(routes.kda.ctx, g, c, kw, normed, &cache.kda[lw.slot])
         else
             try kda.forward(g, c, kw, normed, &cache.kda[lw.slot]),
-        .dsa => |*dw| try dsa.forward(g, c, dw, normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes),
+        .dsa => |*dw| try dsa.forward(g, c, dw, normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes.dsa),
     };
     return g.adopt(try ops.expand(g.s, out, stream, &col));
 }
@@ -587,6 +592,9 @@ fn readAhead(g: *G, c: *const glm.Config, lw: *const Layer, spans: []const T, sr
 pub const Routes = struct {
     dsa: dsa.Routes = .{},
     glue: ?*const glue.Kernels = null,
+    /// The decode lane's KDA layer (`decode_kda`, kda.zig `Step`): the op chain unless the module installed the fused
+    /// text (kda_decode.zig). The prompt's wide calls and the MTP verify's capture always run the op chain.
+    kda: kda.Step = .{},
 };
 
 /// What a forward hands back after its last layer (a comptime route per call site):
@@ -654,7 +662,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
         var prev: ?T = null;
         for (spans, 0..) |*sp, i| {
             const ms = g.mark();
-            const next = g.keep(try attentionSpan(g, c, lw, sp.*, start + @as(u32, @intCast(i * span_rows)), cache, routes.dsa, head));
+            const next = g.keep(try attentionSpan(g, c, lw, sp.*, start + @as(u32, @intCast(i * span_rows)), cache, routes, !prompt, head));
             g.resetTo(ms);
             g.release(sp.*);
             sp.* = next;
@@ -781,7 +789,7 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
             .kda => |*kw| if (head == .verify)
                 try kda.forwardCapture(g, c, kw, pa.normed, &cache.kda[lw.slot], &cache.capture[lw.slot])
             else
-                try kda.forward(g, c, kw, pa.normed, &cache.kda[lw.slot]),
+                try routes.kda.run(routes.kda.ctx, g, c, kw, pa.normed, &cache.kda[lw.slot]),
             .dsa => |*dw| try dsa.forward(g, c, dw, pa.normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes.dsa),
         };
         pend = Pending.of(g, out, pa.post, pa.comb, stream);
@@ -852,6 +860,8 @@ test {
     // The fused glue's CPU tests and its window parity test (skipped without its switches).
     _ = @import("glue.zig");
     _ = @import("glue_parity.zig");
+    _ = @import("kda_decode.zig");
+    _ = @import("kda_decode_parity.zig");
 }
 
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {

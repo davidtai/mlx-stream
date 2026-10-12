@@ -39,6 +39,8 @@ pub const fused_kernels_bytes: u64 = 16 << 20;
 /// The fused decode glue's texts (glue.zig: three texts, the router's four widths, hcPre's two variants), their
 /// pipelines and launch configurations, declared (`glue_kernels` term).
 pub const glue_kernels_bytes: u64 = 8 << 20;
+/// The fused KDA decode text (kda_decode.zig: four widths), its pipelines and configs, declared (`kda_kernels` term).
+pub const kda_kernels_bytes: u64 = 4 << 20;
 
 pub const Plan = struct {
     bill: sdk.MemoryBill,
@@ -137,6 +139,8 @@ pub const Inputs = struct {
     decode_moe: settings.DecodeMoe = .stock,
     /// The decode lane's glue (`settings.DecodeGlue`).
     decode_glue: settings.DecodeGlue = .ops,
+    /// The decode lane's KDA layer (`settings.DecodeKda`).
+    decode_kda: settings.DecodeKda = .ops,
     /// The MTP lane's construction facts (`mtp_lane` on; null: the serial control, none of the lane's terms).
     mtp: ?mtp.Facts = null,
     page: u64 = 16_384,
@@ -430,6 +434,8 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
         .{ .name = "decode_kernels", .bytes = @splat(if (in.decode_moe != .stock) fused_kernels_bytes else 0), .at_construction = true },
         // `decode_glue: fused`: the glue's texts, pipelines and configs (glue.zig), declared; 0 under `ops`.
         .{ .name = "glue_kernels", .bytes = @splat(if (in.decode_glue == .fused) glue_kernels_bytes else 0), .at_construction = true },
+        // `decode_kda: fused`: the KDA decode text, declared; 0 under `ops`.
+        .{ .name = "kda_kernels", .bytes = @splat(if (in.decode_kda == .fused) kda_kernels_bytes else 0), .at_construction = true },
         .{ .name = "slot_wiring", .bytes = @splat(0), .at_construction = false, .with_rows = true },
     };
     return .{
@@ -472,6 +478,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .combine = experts.combineRoute(),
         .decode_moe = cfg.decode_moe,
         .decode_glue = cfg.decode_glue,
+        .decode_kda = cfg.decode_kda,
         .mtp = lane,
         .page = page,
     };
@@ -591,6 +598,13 @@ test "glm5_next bill: the terms sum to the bill, the slot wiring is the one row 
     defer bg.free(a);
     try testing.expectEqual(b.fixed(.prompt) + glue_kernels_bytes, bg.fixed(.prompt));
     try testing.expectEqual(b.fixed(.decode) + glue_kernels_bytes, bg.fixed(.decode));
+    // The fused KDA text likewise; 0 under ops.
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(b, "kda_kernels"));
+    var kda_in = in;
+    kda_in.decode_kda = .fused;
+    const bk = try billOf(a, &kda_in);
+    defer bk.free(a);
+    try testing.expectEqual(b.fixed(.prompt) + kda_kernels_bytes, bk.fixed(.prompt));
     const target = box_ceiling - box_stop;
     const rows = try sdk.fill(b, 12_600_000_000, target, 288, min_rows);
     try testing.expect(rows.prompt >= min_rows and rows.prompt <= rows.decode and rows.decode <= 288);
