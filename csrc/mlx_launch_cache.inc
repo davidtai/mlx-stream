@@ -155,6 +155,22 @@ class LaunchCached : public mx::Primitive {
   std::tuple<int, int, int> tg_;
 };
 
+// Tests: a graph input with no data and no producer that runs (the benchmark's inputs: nothing is allocated, so the
+// CPU lane creates no device).
+class Placeholder : public mx::Primitive {
+ public:
+  using mx::Primitive::Primitive;
+  void eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) override {
+    throw std::runtime_error("mlxlc placeholder evaluated");
+  }
+  void eval_gpu(const std::vector<mx::array>&, std::vector<mx::array>&) override {
+    throw std::runtime_error("mlxlc placeholder evaluated");
+  }
+  const char* name() const override {
+    return "MlxlcPlaceholder";
+  }
+};
+
 Variant* find_variant(Cache& c, const ConfigCpp& cfg, const std::vector<mx::array>& ins) {
   for (auto& v : c.variants) {
     if (v->in_class.size() != ins.size() || v->out_dtypes != cfg.output_dtypes || v->template_args != cfg.template_args)
@@ -287,22 +303,23 @@ void mlxlc_test_config(mlx_fast_metal_kernel_config config, int out[9]) {
   out[8] = c.init_value ? 1 : 0;
 }
 
-// Tests (CPU, no device): host ns per launch over `iters` launches of `k` with `config` on `inputs`, graphs built on an
-// explicit GPU stream and never evaluated; `unevaluated`: the inputs first become unevaluated graph nodes (reshapes
-// on that stream), as a decode launch's activations arrive. out[0]: MLX's apply plus the encode-time work it adds per launch (the hash of
+// Tests (CPU, no device: no buffer is allocated): host ns per launch over `iters` launches of `k` with `config` on
+// `n_in` inputs given by shape and dtype (placeholder graph nodes on an explicit GPU stream, unevaluated as a decode
+// launch's activations arrive; the graphs are never evaluated). out[0]: MLX's apply plus the encode-time work it adds per launch (the hash of
 // the generated source and the library name, custom_kernel.cpp); out[1]: the cached launch (a variant marked resolved
 // with a placeholder pipeline that is never encoded); out[2]: the generated source's bytes. 0, or -1 (g_error).
-int mlxlc_test_bench(mlx_fast_metal_kernel k, mlx_fast_metal_kernel_config config, const mlx_vector_array inputs,
-                     int iters, bool unevaluated, int64_t out[3]) {
+int mlxlc_test_bench(mlx_fast_metal_kernel k, mlx_fast_metal_kernel_config config, int n_in, const int* ndims,
+                     const int* shapes, const mlx_dtype* dtypes, int iters, int64_t out[3]) {
   try {
     auto s = mx::Stream(0, mx::Device::gpu);
     mlx_stream ms = mlx_stream_new_(s);
     auto cache = mlxlc::cache_of(k.ctx);
     if (!cache) throw std::runtime_error("mlxlc_test_bench: the kernel was not made through mlxlc_kernel_new");
     const auto& cfg = *static_cast<const mlxlc::ConfigCpp*>(config.ctx);
-    std::vector<mx::array> ins = mlx_vector_array_get_(inputs);
-    if (unevaluated)
-      for (auto& x : ins) x = mx::reshape(x, x.shape(), s);
+    std::vector<mx::array> ins;
+    for (int i = 0, at = 0; i < n_in; at += ndims[i], i++)
+      ins.push_back(mx::array(mx::Shape(shapes + at, shapes + at + ndims[i]), mlx_dtype_to_cpp(dtypes[i]),
+                              std::make_shared<mlxlc::Placeholder>(s), {}));
     mlx_vector_array vin = mlx_vector_array_new();
     mlx_vector_array_set_(vin, ins);
     size_t bytes = 0;
