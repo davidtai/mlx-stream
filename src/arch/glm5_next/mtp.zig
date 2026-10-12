@@ -57,8 +57,10 @@ const Term = sdk.MemoryBill.Term;
 /// types over the same bank module.
 pub const Slots = sdk_ext.expert.stream.StreamOf(bank.SDK, false);
 
-/// Drafts per round (the trained MTP layer chained, as the host's default depth): a round verifies 1 + `max_depth` rows.
-pub const max_depth: u32 = 3;
+/// Drafts per round at most (the trained MTP layer chained, as the host's default depth; `settings.draft_depth` installs
+/// 1 .. `max_depth`): a round verifies 1 + the lane's depth rows. The lanes, the bill and the host's block are sized at
+/// `max_depth` whatever the installed depth.
+pub const max_depth: u32 = settings.trained_draft_depth;
 pub const verify_rows: u32 = max_depth + 1;
 /// The lane's acceptance: exact only.
 pub const rule: acc.Rule = .exact;
@@ -105,12 +107,39 @@ pub fn armOf(req: sdk.ArmRequest) sdk.DraftArm {
     return if (req.greedy) .greedy else .stochastic;
 }
 
-/// A round's drafts at the trunk's length `len` (t1 at position `len`): `max_depth` under the host's accepted cap and the
-/// positions the load billed (`reserve`: the verify writes len .. len + k), none while the lane does not track the
-/// trunk (`tracked`: its pairs and pending rows end at `len`, the last one pending) (MiMo's `draft.draftCount`).
-pub fn draftsAt(tracked: u64, n_pending: u32, len: u64, accepted_cap: u32, reserve: u64) u32 {
-    return mimo_draft.draftCount(tracked == len and n_pending >= 1, max_depth, accepted_cap, reserve, len);
+/// A round's drafts at the trunk's length `len` (t1 at position `len`): the lane's `depth` under the host's accepted cap
+/// and the positions the load billed (`reserve`: the verify writes len .. len + k), none while the lane does not track
+/// the trunk (`tracked`: its pairs and pending rows end at `len`, the last one pending) (MiMo's `draft.draftCount`).
+pub fn draftsAt(depth: u32, tracked: u64, n_pending: u32, len: u64, accepted_cap: u32, reserve: u64) u32 {
+    return mimo_draft.draftCount(tracked == len and n_pending >= 1, depth, accepted_cap, reserve, len);
 }
+
+/// The request's acceptance by draft position (the receipt's `pos_tested` / `pos_kept`): `tested[i]` counts the rounds
+/// whose draft i + 1 was decided (drafts 1 .. i accepted), `kept[i]` those that accepted it. The exact rule keeps a
+/// prefix, so a round of `drafted` drafts with `accepted` kept decides positions 1 .. min(accepted + 1, drafted) and
+/// keeps 1 .. accepted. Position i + 1's acceptance is kept[i] / tested[i].
+pub const Positions = struct {
+    tested: [max_depth]u64 = @splat(0),
+    kept: [max_depth]u64 = @splat(0),
+
+    pub fn add(p: *Positions, drafted: u32, accepted: u32) void {
+        std.debug.assert(accepted <= drafted and drafted <= max_depth);
+        const decided: u32 = @min(accepted + 1, drafted);
+        for (p.tested[0..decided]) |*t| t.* += 1;
+        for (p.kept[0..accepted]) |*k| k.* += 1;
+    }
+
+    /// ` depth=<depth> pos_tested=a,b,c pos_kept=x,y,z` (the lane's depth, then every position up to `max_depth`)
+    /// into `buf`; empty when it does not fit.
+    pub fn write(p: *const Positions, buf: []u8, depth: u32) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.print(" depth={d} pos_tested=", .{depth}) catch return buf[0..0];
+        for (p.tested, 0..) |t, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", t }) catch return buf[0..0];
+        w.writeAll(" pos_kept=") catch return buf[0..0];
+        for (p.kept, 0..) |k, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", k }) catch return buf[0..0];
+        return w.buffered();
+    }
+};
 
 // ── the MTP layer's residents (the shards' headers) ──
 
@@ -484,8 +513,12 @@ pub const Lane = struct {
     pending: ?T = null,
     n_pending: u32 = 0,
     untracked_logged: bool = false,
+    /// Drafts per round at most (`settings.draft_depth`, 1 .. `max_depth`; construction).
+    depth: u32 = max_depth,
     /// The request's counters (MiMo's: rounds, drafted, accepted, generated, corrected; the stream's at the decode start).
     stats: mimo_draft.Stats = .{},
+    /// The request's acceptance by draft position (the receipt's tail).
+    pos: Positions = .{},
     /// What the open holds, from its own arrays (`heldOf`: the bank's nine, the head's three f32 tables, the two lanes,
     /// each at MLX's allocation size): the module holds it to the bill's terms, which `heldBytes` derives from the same
     /// shapes (`holdCheck`).
@@ -496,9 +529,10 @@ pub const Lane = struct {
 
     /// The lane over the pack at `dir`: the draft bank (refused by name when absent), the head bound from `map` (the
     /// arch's weight map with the MTP layer's residents kept and read), every record read into the bank's MLX arrays and
-    /// checked, the lanes allocated at `cap` positions plus `max_depth`. Device work: the module's construction, under
-    /// the GPU lock.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
+    /// checked, the lanes allocated at `cap` positions plus `max_depth`; `depth` drafts a round at most (`draft_depth`,
+    /// 1 .. `max_depth`, validated with the settings). Device work: the module's construction, under the GPU lock.
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, depth: u32, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
+        std.debug.assert(depth >= 1 and depth <= max_depth);
         var db = try DraftBank.open(gpa, io, dir, c, diag);
         defer db.deinit();
         _ = mlx.mlx_clear_cache();
@@ -507,7 +541,7 @@ pub const Lane = struct {
         const self = try gpa.create(Lane);
         errdefer gpa.destroy(self);
         const lanes_cap = cap + max_depth;
-        self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes };
+        self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth };
         self.head = try Head.bind(gpa, g.s, map, c, diag);
         errdefer self.head.deinit(gpa);
         const n: u32 = c.n_routed_experts;
@@ -538,7 +572,7 @@ pub const Lane = struct {
         for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         self.held_bytes = heldOf(&held, std.heap.pageSize());
-        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, max_depth, verify_rows, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
+        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
         return self;
     }
 
@@ -560,6 +594,13 @@ pub const Lane = struct {
         self.n_pending = 0;
         self.untracked_logged = false;
         self.stats = .{};
+        self.pos = .{};
+    }
+
+    /// A round's counters: `drafted` drafts, `accepted` of them kept (MiMo's `Stats` and the per-position counts).
+    pub fn record(self: *Lane, drafted: u32, accepted: u32) void {
+        self.stats.add(drafted, accepted);
+        self.pos.add(drafted, accepted);
     }
 
     /// The pairs in the lanes.
@@ -707,9 +748,11 @@ pub const Lane = struct {
         self.n_pending = 0;
     }
 
-    /// The request's line at its end (MiMo's receipt form; the expert stream's counters at the decode start and now).
+    /// The request's line at its end (MiMo's receipt form; the expert stream's counters at the decode start and now),
+    /// then the lane's depth and its acceptance by draft position (`Positions.write`).
     pub fn line(self: *const Lane, buf: []u8, now: sdk_ext.expert.Stats) []const u8 {
-        return self.stats.line(buf, lane_name, now);
+        const head = self.stats.line(buf, lane_name, now);
+        return buf[0 .. head.len + self.pos.write(buf[head.len..], self.depth).len];
     }
 };
 

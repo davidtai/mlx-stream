@@ -508,7 +508,7 @@ test "glm5_next mtp acceptance: the exact rule at depth 1..3 emits the target's 
         var rounds: u32 = 0;
         var accepted_total: u64 = 0;
         while (len < n - 4) {
-            const k = mtp.draftsAt(len, 1, len, cap, 1 << 20);
+            const k = mtp.draftsAt(cap, len, 1, len, 1000, 1 << 20);
             try testing.expectEqual(cap, k);
             var drafts: [mtp.max_depth]u32 = undefined;
             var logits: [(mtp.max_depth + 1) * V]f32 = undefined;
@@ -535,11 +535,16 @@ test "glm5_next mtp acceptance: the exact rule at depth 1..3 emits the target's 
         try testing.expect(rounds < len); // the drafts were accepted at times: fewer rounds than tokens
         if (seed == 0) std.debug.print("GLM5N_MTP_EXACT depth={d} tokens={d} rounds={d} accepted={d} tokens_per_round={d:.3}\n", .{ cap, len, rounds, accepted_total, @as(f64, @floatFromInt(len - 1)) / @as(f64, @floatFromInt(rounds)) });
     };
-    // Untracked (a lane behind the trunk) or no room: no drafts; the host's cap and the billed positions bound the rest.
-    try testing.expectEqual(@as(u32, 0), mtp.draftsAt(9, 1, 10, 9, 1000));
-    try testing.expectEqual(@as(u32, 0), mtp.draftsAt(10, 0, 10, 9, 1000));
-    try testing.expectEqual(@as(u32, 2), mtp.draftsAt(10, 1, 10, 9, 13));
-    try testing.expectEqual(@as(u32, 1), mtp.draftsAt(10, 1, 10, 1, 1000));
+    // Untracked (a lane behind the trunk) or no room: no drafts; the lane's depth, the host's cap and the billed
+    // positions bound the rest.
+    try testing.expectEqual(@as(u32, 0), mtp.draftsAt(3, 9, 1, 10, 9, 1000));
+    try testing.expectEqual(@as(u32, 0), mtp.draftsAt(3, 10, 0, 10, 9, 1000));
+    try testing.expectEqual(@as(u32, 2), mtp.draftsAt(3, 10, 1, 10, 9, 13));
+    try testing.expectEqual(@as(u32, 1), mtp.draftsAt(3, 10, 1, 10, 1, 1000));
+    try testing.expectEqual(@as(u32, 3), mtp.draftsAt(3, 10, 1, 10, 9, 1000));
+    try testing.expectEqual(@as(u32, 2), mtp.draftsAt(2, 10, 1, 10, 9, 1000));
+    try testing.expectEqual(@as(u32, 1), mtp.draftsAt(1, 10, 1, 10, 9, 1000));
+    try testing.expectEqual(@as(u32, 1), mtp.draftsAt(2, 10, 1, 10, 1, 1000));
     // Sampled (temperature 1, top_p 0.95): at one context, the token after t1 over seeded rounds with the lane's
     // point-mass draft (the head's argmax) follows the request's own target p (exact speculative sampling).
     {
@@ -623,6 +628,25 @@ test "glm5_next mtp bill: the lane's terms by construction (the bank's nine arra
         const n = positions + mtp.max_depth;
         try testing.expectEqual(graph.bufferBytes(n * 512 * 2, page) + graph.bufferBytes(n * 256 * 2, page), pt[3].bytes[0]);
     }
+    try noDevice();
+}
+
+test "glm5_next mtp positions: a round decides drafts 1 .. min(accepted + 1, drafted) and keeps 1 .. accepted; the receipt's tail names the depth and every position" {
+    var p: mtp.Positions = .{};
+    // (drafted, accepted): a full accept, a first-draft reject, a reject at 2, a reject at 3, a capped round fully
+    // accepted, a round without drafts.
+    for ([_][2]u32{ .{ 3, 3 }, .{ 3, 0 }, .{ 3, 1 }, .{ 3, 2 }, .{ 2, 2 }, .{ 0, 0 } }) |r| p.add(r[0], r[1]);
+    try testing.expectEqualSlices(u64, &.{ 5, 4, 2 }, &p.tested);
+    try testing.expectEqualSlices(u64, &.{ 4, 3, 1 }, &p.kept);
+    // Every kept draft is counted once (MiMo's `accepted`), every decided one once.
+    var st: mimo_draft.Stats = .{};
+    for ([_][2]u32{ .{ 3, 3 }, .{ 3, 0 }, .{ 3, 1 }, .{ 3, 2 }, .{ 2, 2 }, .{ 0, 0 } }) |r| st.add(r[0], r[1]);
+    try testing.expectEqual(st.accepted, p.kept[0] + p.kept[1] + p.kept[2]);
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings(" depth=3 pos_tested=5,4,2 pos_kept=4,3,1", p.write(&buf, 3));
+    try testing.expectEqualStrings(" depth=2 pos_tested=0,0,0 pos_kept=0,0,0", (mtp.Positions{}).write(&buf, 2));
+    // A buffer too short for the tail: nothing (the receipt keeps MiMo's line).
+    try testing.expectEqual(@as(usize, 0), p.write(buf[0..12], 3).len);
     try noDevice();
 }
 
