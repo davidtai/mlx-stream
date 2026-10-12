@@ -30,6 +30,8 @@ const builtin = @import("builtin");
 const quant = sdk_ext.quant;
 const expert_event = sdk_ext.expert.event;
 const expert_routes = sdk_ext.expert.routes;
+/// The route recorder's builds (profile and test): `expert.stream.recording`.
+const recording = sdk_ext.expert.stream.recording;
 const expert_tally = sdk_ext.expert.tally;
 const glm = @import("glm_moe_dsa.zig");
 const settings = @import("settings.zig");
@@ -340,12 +342,13 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             errdefer self.stream.deinit();
             try self.openTally(dir);
             errdefer self.closeTally();
-            if (expert_routes.dirOf(std.c.getenv(routes_env))) |d| {
+            // The recorder exists in profile builds only (`expert.stream.recording`): a served build reads no switch.
+            if (comptime recording) if (expert_routes.dirOf(std.c.getenv(routes_env))) |d| {
                 self.recorder = try expert_routes.Recorder.init(gpa, @intCast(n_bank), self.bank.n_experts, model.n_experts_per_tok, Experts.bpl);
                 self.routes_dir = d;
                 self.stream.recorder = self.recorder;
                 log.info("glm_moe_dsa: {s} is set: each request's decode routes are written under {s}\n", .{ routes_env, d });
-            }
+            };
             errdefer if (self.recorder) |rec| rec.deinit();
             if (gated and !gpu) self.event = try expert_event.createHost(@constCast(self.stream.eventWord().?), @as(i64, event_watchdog_ms) * std.time.ns_per_ms);
             self.w = try graph.Weights.bind(gpa, weights, model, &diag);
@@ -590,7 +593,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             // The lanes the pass appends to are allocated before the allocator's size classes go on for its transients.
             try self.cache.preallocate(&self.g, self.model);
             self.stream.resetPromptCounts();
-            if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth());
+            if (comptime recording) if (self.recorder) |rec| rec.begin(@intCast(ids.len), self.mtpDepth());
             const s0 = self.stream.stats();
             startPhase();
             const mem0 = Mem.now();
@@ -673,7 +676,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 d.tokens += ids.len;
                 d.wall_ns += self.nowNs() - t0;
             }
-            if (self.recorder) |rec| rec.endStep(@intCast(ids.len), 0, 0, @intCast(ids.len), self.nowNs() - t0);
+            if (comptime recording) if (self.recorder) |rec| rec.endStep(@intCast(ids.len), 0, 0, @intCast(ids.len), self.nowNs() - t0);
             return logits;
         }
 
@@ -773,7 +776,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             };
             if (self.mtp) |ln| if (ln.counts.rounds > 0) {
                 log.info("{f}\n", .{ln.line()});
-                log.info("{f}\n", .{mtp_mod.ProbLine{ .c = ln.counts }});
+                if (comptime mtp_mod.histograms) log.info("{f}\n", .{mtp_mod.ProbLine{ .c = ln.counts }});
                 ln.counts = .{};
             };
             const d = self.decode_mark orelse return;
@@ -799,7 +802,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const by1 = self.stream.lookaheadByRank();
             log.info("{f}\n", .{PrecisionLine{ .by0 = &d.by0, .by1 = &by1 }});
             self.endTally();
-            if (self.recorder) |rec| self.writeRoutes(rec);
+            if (comptime recording) if (self.recorder) |rec| self.writeRoutes(rec);
         }
 
         /// The route recorder's file of the request that ended. A failure is logged; the request is not failed.
@@ -933,11 +936,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 if (i > d.accepted) ln.counts.rejected_bytes += b;
             }
             // The steps the decision reached: the accepted drafts and the first rejected one.
-            for (ln.top_p[0..@min(depth, d.accepted + 1)], 0..) |tp, i| {
+            if (comptime mtp_mod.histograms) for (ln.top_p[0..@min(depth, d.accepted + 1)], 0..) |tp, i| {
                 ln.counts.decided[mtp_mod.tenth(tp)] += 1;
                 if (i < d.accepted) ln.counts.accepted_by_p[mtp_mod.tenth(tp)] += 1;
-            }
-            if (self.recorder) |rec| rec.endStep(depth + 1, depth, d.accepted, rows, ns);
+            };
+            if (comptime recording) if (self.recorder) |rec| rec.endStep(depth + 1, depth, d.accepted, rows, ns);
             if (self.decode_mark) |*dm| {
                 dm.steps += 1;
                 dm.tokens += rows;

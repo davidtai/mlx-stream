@@ -28,6 +28,10 @@ const settings = @import("settings.zig");
 const acceptance = @import("../../sdk_ext.zig").acceptance;
 const exl3 = @import("exl3_bank.zig");
 const topk_mod = @import("topk.zig");
+const bo = @import("../../build_flags.zig");
+/// The acceptance-by-top-probability histogram (`Counts.decided`, `accepted_by_p`, `ProbLine`) and the per-step
+/// reduction it reads: a diagnostic, in profile builds (`build_flags.glm_mtp_histograms`) and the tests only.
+pub const histograms: bool = bo.glm_mtp_histograms or @import("builtin").is_test;
 
 const G = graph.G;
 const T = G.T;
@@ -725,16 +729,19 @@ pub fn Lane(comptime kind: BankKind) type {
                 defer g.release(normed);
                 const lg = try graph.qlinear(g, normed, tw.lm_head);
                 if (logits_out) |lo| _ = try g.hostF32(try g.astype(lg, .float32), lo[step * vocab ..][0..vocab]);
-                // The argmax and the head's top probability `exp(max - logsumexp)`, read together.
+                // The argmax; where the histogram is compiled in, the head's top probability `exp(max - logsumexp)` read
+                // with it.
                 const lf = try g.reshape(try g.astype(lg, .float32), &.{-1});
                 const am = try g.argmax(lf, 0);
-                const top = try g.exp(try g.sub(try g.max(lf, 0, false), try g.logsumexp(lf, 0, false)));
-                try g.evalAll(&.{ am, top });
                 var tok: [1]u32 = undefined;
-                var tp: [1]f32 = undefined;
+                if (comptime histograms) {
+                    const top = try g.exp(try g.sub(try g.max(lf, 0, false), try g.logsumexp(lf, 0, false)));
+                    try g.evalAll(&.{ am, top });
+                    var tp: [1]f32 = undefined;
+                    _ = try g.hostF32(top, &tp);
+                    self.top_p[step] = tp[0];
+                } else try g.evalAll(&.{am});
                 _ = try g.hostU32(am, &tok);
-                _ = try g.hostF32(top, &tp);
-                self.top_p[step] = tp[0];
                 out[step] = if (step < force.len) force[step] else tok[0];
                 if (step + 1 < depth) {
                     x = try self.input(g, tw, out[step..][0..1], normed);

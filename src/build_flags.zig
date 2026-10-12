@@ -10,3 +10,6 @@ pub const dsv41_decode_timers: bool = sdk.plugin_profile;
 pub const dsv41_prefill_timers: bool = sdk.plugin_profile;
 /// GLM-5.3's prompt-pass phase split (arch/glm_moe_dsa/prefill_timers.zig).
 pub const glm_prefill_timers: bool = sdk.plugin_profile;
+/// GLM-5.3's draft lane's acceptance by the head's top probability (each draft step's top-probability reduction and its
+/// histogram, arch/glm_moe_dsa/mtp.zig).
+pub const glm_mtp_histograms: bool = sdk.plugin_profile;

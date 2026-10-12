@@ -106,9 +106,11 @@ pub const LayerPolicy = struct {
     /// (`PlanOpts.held`, set for one plan): never a victim.
     held: std.DynamicBitSetUnmanaged,
     // The rate tally (`setTally`, `sdk_ext.expert.tally`): per expert an EMA of "a decode route of this layer requests
-    // it" (`rate`, `alpha` = 1 - 2^(-1/window)). Once seeded (a tally file read, or a request ended) the top
-    // `pin_limit` experts by rate, at most the capacity, are pinned: never a victim, first in the decode cut, and the
-    // only prefill misses that may evict. Off (no `setTally`) or unseeded: the plans are those without a tally.
+    // it" (`rate`, `alpha` = 1 - 2^(-1/window) a route), folded in at each request's end from the request's counts
+    // (`endRequest`: a decode route only counts its experts). Once seeded (a tally file read, or a request ended) the
+    // top `pin_limit` experts by rate, at most the capacity, are pinned for the next request: never a victim, first in
+    // the decode cut, and the only prefill misses that may evict. Off (no `setTally`) or unseeded: the plans are those
+    // without a tally.
     rate: []f32,
     pinned: std.DynamicBitSetUnmanaged,
     /// This request's decode routes, and per expert the routes that requested it (`endRequest`).
@@ -263,15 +265,21 @@ pub const LayerPolicy = struct {
     }
 
     /// The request's end: `out` (one per expert) set to this request's decode rate (each expert's share of the layer's
-    /// decode routes) where the layer routed in its decode, the request's counts zeroed, the tally seeded from now on (a
-    /// later request on this load pins). Returns whether the layer routed in the request's decode.
+    /// decode routes) where the layer routed in its decode; the rate folded in over the request's routes (R of them:
+    /// rate x (1 - alpha)^R + (1 - (1 - alpha)^R) x the share, the per-route EMA with the request's routes taken as
+    /// one uniform run); the request's counts zeroed; the pins chosen again, the tally seeded from now on (a later
+    /// request on this load pins). Returns whether the layer routed in the request's decode.
     pub fn endRequest(p: *LayerPolicy, out: []f32) bool {
         std.debug.assert(out.len == p.n_experts);
         if (p.alpha == 0) return false;
         const routes = p.request_routes;
         if (routes > 0) {
             const n: f32 = @floatFromInt(routes);
-            for (out, p.request_counts) |*o, c| o.* = @as(f32, @floatFromInt(c)) / n;
+            const decay = std.math.pow(f32, 1 - p.alpha, n);
+            for (out, p.request_counts, p.rate) |*o, c, *r| {
+                o.* = @as(f32, @floatFromInt(c)) / n;
+                r.* = r.* * decay + (1 - decay) * o.*;
+            }
         }
         @memset(p.request_counts, 0);
         p.request_routes = 0;
@@ -304,15 +312,11 @@ pub const LayerPolicy = struct {
         return p.pinned.isSet(e);
     }
 
-    /// One decode route of the layer (its unique experts) into the rate and the request's counts.
+    /// One decode route of the layer (its unique experts) into the request's counts: the rate takes them at the
+    /// request's end (`endRequest`), not per route.
     fn tallyRoute(p: *LayerPolicy, unique: []const u16) void {
         if (p.alpha == 0) return;
-        const keep = 1 - p.alpha;
-        for (p.rate) |*r| r.* *= keep;
-        for (unique) |e| {
-            p.rate[e] += p.alpha;
-            p.request_counts[e] += 1;
-        }
+        for (unique) |e| p.request_counts[e] += 1;
         p.request_routes += 1;
     }
 
@@ -698,7 +702,6 @@ pub const LayerPolicy = struct {
     fn transitionAdmissions(p: *LayerPolicy, out: *const Plan) []u32 {
         const admission = p.admission;
         if (out.n_misses == 0) return admission;
-        if (p.seeded) p.refreshPins();
         p.computeScores();
         const cap = p.capacity;
         var n_cand: usize = 0;

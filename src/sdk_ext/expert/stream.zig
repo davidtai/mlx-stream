@@ -3,12 +3,16 @@
 //! arrays at compile time, so an instance is the same code as a stream written for that bank.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("sdk").mlx;
 const expert = @import("../expert.zig");
 const expert_io = @import("io.zig");
 const expert_policy = @import("policy.zig");
 const expert_lookahead = @import("lookahead.zig");
 const expert_routes = @import("routes.zig");
+/// The route recorder (`expert.routes`) is a diagnostic: its hooks compile into profile builds (`sdk.plugin_profile`) and
+/// the tests only; a served build has no recorder branch on any route.
+pub const recording: bool = @import("sdk").plugin_profile or builtin.is_test;
 
 /// `probed`: the plugin's prefill-timers build (its read-ahead probes compiled in; every other build has no field, call or
 /// branch for them).
@@ -1368,7 +1372,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (!held) m.* = .{ .state = .loading, .layer = @intCast(layer), .expert = l.expert };
                     m.pins = 1;
                 }
-                if (self.recorder) |rec| if (self.phase == .decode) {
+                if (comptime recording) if (self.recorder) |rec| if (self.phase == .decode) {
                     r.rec = rec.route(layer, ids, plan, r.reads[0..plan.n_loads]);
                 };
                 try self.submitParts(r);
@@ -1456,7 +1460,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
                     var ranks: [expert_lookahead.max_budget]u8 = undefined;
                     const picked = sel.selectWith(scores, &self.layers[next].policy, expert_lookahead.residentIn, chosen[0..sel.budget], ranks[0..sel.budget]);
-                    if (self.recorder) |rec| rec.spec(r.rec, picked);
+                    if (comptime recording) if (self.recorder) |rec| rec.spec(r.rec, picked);
                     for (picked) |e| {
                         bases[n] = @intCast(self.bank.recordOffset(next, e));
                         n += 1;
@@ -1489,7 +1493,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var chosen: [expert_lookahead.max_budget]u16 = undefined;
                     var ranks: [expert_lookahead.max_budget]u8 = undefined;
                     const picked = sel.selectWith(scores, Ctx{ .s = self, .routed = next }, resident, chosen[0..sel.budget], ranks[0..sel.budget]);
-                    if (self.recorder) |rec| rec.spec(r.rec, picked);
+                    if (comptime recording) if (self.recorder) |rec| rec.spec(r.rec, picked);
                     var side: [expert_lookahead.max_budget]u8 = undefined;
                     for (picked) |e| {
                         const sl = self.bank.streamLayer(next, e);
@@ -1677,7 +1681,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     self.locate(r.layer, l.slot).meta.state = if (ok) .ready else .failed;
                     if (!ok and l.persistent) ls.policy.invalidate(l.expert);
                     // The recorder: a gate/up range that ran no preadv was copied out of a lookahead record.
-                    if (self.recorder) |rec| if (ok) {
+                    if (comptime recording) if (self.recorder) |rec| if (ok) {
                         const gu = self.pool.result(p.ticket + i);
                         rec.settled(r.rec, l.expert, gu.preadv_calls == 0 and gu.payload > 0);
                     };
@@ -2414,6 +2418,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (self.layers, decode_rows, exts) |*ls, rows, e| {
                     ls.ext = e;
                     ls.policy.grow(rows) catch unreachable;
+                    // The tally's pins at decode's capacity, once per request (a route never re-ranks them).
+                    ls.policy.refreshPins();
                 }
                 self.phase = .decode;
                 // Decode routes take one window: no decode plan ever runs beside a live route's held slots (the decode
@@ -2421,7 +2427,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.wide_depth = 1;
                 self.route_lookahead = self.selector != null;
                 self.route_preread = self.route_lookahead and self.preread;
-                if (self.recorder) |rec| for (self.layers, 0..) |*ls, l| {
+                if (comptime recording) if (self.recorder) |rec| for (self.layers, 0..) |*ls, l| {
                     rec.handover(@intCast(l), ls.policy.prefill_freq, ls.policy.slot_to_expert[0..ls.policy.capacity], ls.base.rows);
                 };
             }
