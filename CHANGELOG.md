@@ -39,6 +39,14 @@
   0.9451, card 0.9573 on `746e7da9` (identical counts and failing ids on `bb3c7245`).
 - The MiMo bill charges the one-eval predictor's router tiles on the default `prefill_predict_evals: one` (up to
   0.43 GB in the prompt phase at 16K; it was unbilled).
+- GLM-5.3 on main (#11 merged over #10 and #12; the review's fixes): the arch under src/arch/glm_moe_dsa/; the box's
+  used memory from host_statistics64 (`sdk.memory.boxUsedBytes` is null without a reading; a load refuses such a box,
+  `BoxReadingUnavailable`); the prompt's GEMM slices and attention spans in flight held by the schedule and billed at
+  those bounds; the indexer's top-k and the routed combine on construction-time routes, their kernels built and run
+  once at construction; the reader's direct reads off; the route recorder and the draft lane's acceptance histogram in
+  profile builds only; the tally folded in at each request's end; the construction check raised by the bytes other
+  models hold in the process (#8's reading); the draft lane's sampled decisions on `sdk_ext.acceptance`. The quality
+  tier of the headline and the ceilings it carries are named in README (GLM-5.3's measurements).
 - GLM-5.3's memory bill fills to the box: the KV lanes hold each phase's positions (a prompt's at its pass, the
   request's own prompt and `max_tokens` from its handover); `max_output` (default 131,072) bills the longest request
   at construction; the decode handover settles the prompt's frees, reads the footprint and the box, and grows the
@@ -50,12 +58,12 @@
   (MiMo's, allocated per geometry) and the KV grow lane gains a `resize`.
 - GLM-5.3: the MTP draft lane over the release's MTP layer (`mtp_depth`, `mtp_acceptance`, `mtp_typical_delta`;
   off by default, exact acceptance unless typical is named), its experts resident from the EXL3 build's records
-  through sushi's EXL3 MoE; `convert_glm_exl3_bank.py --mtp-only` writes the pack's `mtp/` directory.
+  through sushi's EXL3 MoE; PR #5's `convert_glm_exl3_bank.py --mtp-only` writes the pack's `mtp/` directory.
 - GLM-5.3 prompt pass: the attention over each row's selected keys on mlx-serve's DSA kernels (the indexer's scores
   and the latent attention on the tensor units), in layer-major calls of 16,384 rows and spans under 2 GiB that the
   bill charges with the same functions; each routed expert read at most once per call, a layer's misses read at its
   start and its hottest made resident from the transient rows (`Stream.promote`); the routed combine in one kernel
-  over the groups' outputs; with the EXL3 bank, each prompt slice's routing table built on the host. The construction
+  over the groups' outputs (the EXL3 bank's prompt GEMMs on GLM-5.3's own kernels since). The construction
   fills the prompt rows before the first request, and a request keeps the residents of the one before (its reverse
   change passes `keep` to `Stream.shrink`, the per-request route of #12).
 - GLM-5.3 (`glm_moe_dsa`): a second arch over the same expert stream, from a pack of resident shards and an affine
