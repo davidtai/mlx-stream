@@ -48,12 +48,17 @@ pub const read_schedule: mimo_stream.ReadSchedule = .early_whole_trim;
 pub const drain: mimo_math.Drain = .pipelined;
 pub const bank_view: mimo_math.BankView = .window;
 pub const decode_window: mimo_stream.DecodeWindow = .verify;
+/// Prompt lever 1 (glm5next/prefill-levers): the overlap schedule's relocation (`Options.prompt_relocate`). A read-ahead
+/// record the call's plans evict before any group hits it (a misprediction: an earlier group's seed miss takes its row)
+/// and load again later in the call into a transient row no earlier group reads is copied at the plans from its
+/// read-ahead row into that row, so it is read once, not twice (the profile's 33.8 double reads per layer, read again
+/// inside the drive-bound MoE stage). The same plans, slots and kernels, the record's own bytes in its row before any
+/// kernel reads it: exact by construction, installed unconditionally.
+pub const prompt_relocate = true;
 /// P7 `pooled`: MLX's cache limit through the prompt pass, purged at a prompt layer's end once half full; decode keeps
 /// its own limit (`decode_cache_bytes`).
 pub const prompt_cache_bytes: usize = 2 << 30;
 pub const decode_cache_bytes: usize = 256 << 20;
-/// P1's predictor: the router tile (one eval per call, `prefill_predict_evals: one`).
-pub const predict_rows: u32 = 2048;
 /// The prompt pass's routed calls take the wide lane; the decode lane takes a decode-phase call of at most
 /// `decode_lane_rows` rows (a serial token; the MTP verify's 4 rows in phase 4).
 pub const decode_lane_rows: u32 = Math.decode_forward_rows;
@@ -62,6 +67,17 @@ pub const max_experts: u32 = 288;
 comptime {
     if (Math.prefill_min_tokens != decode_lane_rows + 1) @compileError("glm5_next: the scheduler's wide threshold is not the decode lane's bound");
     if (mimo_stream.decode_lane_route_ids != decode_lane_rows * top_k) @compileError("glm5_next: decode's window 0 is not the decode lane's route");
+}
+
+/// The stream's construction options (pure: the CPU tests read them): MiMo's event gates and lookahead over `rows`, the
+/// phase rows' transient release, the read schedule's overlap route with prompt lever 1's relocation, decode's window 0.
+pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event) !B.Options {
+    var opts = B.eventOptions(rows, memory, event);
+    opts.transient_release = true;
+    try B.applyReadSchedule(&opts, read_schedule);
+    opts.prompt_relocate = prompt_relocate;
+    opts.decode_route_ids = mimo_stream.decodeRouteIds(decode_window);
+    return opts;
 }
 
 /// The phase route of a routed call (MiMo's `decodeLane`): one row in either phase, up to `decode_lane_rows` in decode.
@@ -131,8 +147,7 @@ pub const Source = struct {
     parts_combine: *const PartsCombineFn = partsCombineInplace,
     combine_kernel: prefill_combine.Kernel = .{},
     combine_route: prefill_combine.Route = .inplace,
-    /// P1's host scratch (reused): one tile's predicted ids, the call's counts, the ranking.
-    ahead_ids: [predict_rows * top_k]u32 = undefined,
+    /// P1's host scratch (reused): the call's predicted counts (read back from the GPU, prompt lever 5), the ranking.
     ahead_counts: [max_experts]u32 = undefined,
     ahead_ranked: [max_experts]u16 = undefined,
 
@@ -171,11 +186,7 @@ pub const Source = struct {
         // refused here, once, if a bank's spans outgrow it.
         if (B.S.stagingBytes(&self.sdk_bank) > settings.reader_staging_bytes) return error.Glm5NextReaderStaging;
         const event = try expert_event.createMetal();
-        var opts = B.eventOptions(self.rows, .{ .mlx = stream }, event);
-        opts.transient_release = true;
-        try B.applyReadSchedule(&opts, read_schedule);
-        opts.decode_route_ids = mimo_stream.decodeRouteIds(decode_window);
-        self.sdk_stream = try Stream.init(a, &self.sdk_bank, opts);
+        self.sdk_stream = try Stream.init(a, &self.sdk_bank, try streamOptions(self.rows, .{ .mlx = stream }, event));
         errdefer self.sdk_stream.deinit();
         self.stream_source = StreamSource.init(self.sdk_stream);
         try self.stream_source.installReadSchedule(read_schedule, mimo_stream.default_read_schedule_threshold);
@@ -342,6 +353,30 @@ pub const Source = struct {
         return self.parts_combine(self, g, parts.outs, parts.loc, route_weights, nt);
     }
 
+    /// Prompt lever 3 (warm.zig): the installed prompt combine's text built by its first dispatch (MLX compiles a custom
+    /// kernel's library then) over one token of zero rows, evaluated and dropped. No route, read or slot is touched.
+    pub fn warmCombine(self: *Source) !void {
+        const g = &self.g;
+        const m = g.mark();
+        defer g.resetTo(m);
+        const h: c_int = @intCast(self.bank.geometry.hidden_size);
+        const rows = try g.zeros(&.{ @intCast(top_k), h }, .bfloat16);
+        try g.evalAll(&.{rows});
+        // Token 0's routed position k reads row k of the one source.
+        var pairs: [2 * top_k]i32 = undefined;
+        for (0..top_k) |k| {
+            pairs[2 * k] = 0;
+            pairs[2 * k + 1] = @intCast(k);
+        }
+        const loc = try g.hostArray(std.mem.sliceAsBytes(&pairs), &.{ 1, @intCast(top_k), 2 }, .int32);
+        const weights = try g.zeros(&.{ 1, @intCast(top_k) }, .float32);
+        const out = switch (self.combine_route) {
+            .inplace => try self.combine_kernel.callInplace(g, &.{rows}, loc, weights, 1),
+            else => try self.combine_kernel.call(g, &.{rows}, loc, weights, 1),
+        };
+        try g.evalAll(&.{out});
+    }
+
     /// P1: layer `layer`'s predicted experts, hottest first, read into its free persistent rows ahead of its call.
     pub fn readAheadSeed(self: *Source, layer: u32, ranked: []const u16) !void {
         try self.ex.at(layer).readAheadSeed(ranked);
@@ -351,3 +386,16 @@ pub const Source = struct {
         return self.stream_source.stats();
     }
 };
+
+test "glm5_next experts: the stream's options install the overlap schedule early_whole_trim with prompt lever 1's relocation (exact), the phase rows' release and decode's window" {
+    const testing = std.testing;
+    const rows = [_]u32{ 124, 124 };
+    const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 });
+    try testing.expectEqual(B.S.PromptReads.overlap, opts.prompt_reads);
+    try testing.expectEqual(B.S.AheadPost.whole_trim, opts.prompt_ahead);
+    try testing.expect(opts.prompt_relocate);
+    try testing.expect(opts.transient_release);
+    try testing.expectEqual(mimo_stream.decodeRouteIds(decode_window), opts.decode_route_ids);
+    try testing.expectEqual(@as(u64, 123), opts.event.?.backend.metal);
+    try testing.expectEqualSlices(u32, &rows, opts.rows);
+}

@@ -404,6 +404,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// The read-ahead's admission bound in records; null: the stock rule, from the pool's tickets. A route that
             /// widens the ticket ring pins it to the narrower ring's bound so the admissions stay the control's.
             ahead_cap: ?u32 = null,
+            /// P7 `overlap` relocation (glm5next/prefill-levers lever 1): at a call's plans, every read-ahead record the plans
+            /// evict before any group hits it and load again later in the call into a transient row no earlier group of the
+            /// call reads is copied from its read-ahead row into that transient row (`p7Relocate`), so that load holds its
+            /// record and reads nothing: the record is read once, not twice. Needs `overlap` and one slot geometry (every
+            /// layer's rows interchangeable with the transient rows); off (the control): every such record is read again.
+            prompt_relocate: bool = false,
             /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
             tally: ?Tally = null,
         };
@@ -645,6 +651,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             prompt_reads: PromptReads = .stock,
             prompt_ahead: AheadPost = .head,
             ahead_cap: ?u32 = null,
+            /// P7 overlap relocation (`Options.prompt_relocate`), fixed at construction.
+            prompt_relocate: bool = false,
             /// P7 overlap: the prompt call being scheduled; per row (a layer's persistent slots [0, n_experts), then the
             /// transient rows) the record its plans leave and its last reader; per persistent slot the read-ahead job
             /// writing it (`no_job`: none). Empty under `stock`.
@@ -827,6 +835,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 // P7 overlap: a job is a bit of a part's blockers (u64), groups index the route ring.
                 if (opt.prompt_reads == .overlap and ahead_parts.len > 64) return error.InvalidOptions;
                 if (opt.prompt_ahead != .head and opt.prompt_reads != .overlap) return error.InvalidOptions;
+                // Relocation copies a layer's persistent row into a transient row: one geometry, rows interchangeable.
+                if (opt.prompt_relocate) {
+                    if (opt.prompt_reads != .overlap or alt_layer != null) return error.InvalidOptions;
+                    for (bank.layers) |*l| if (!sameGeometry(l, &bank.layers[widest])) return error.InvalidOptions;
+                }
                 const p7_rows: []P7Row = if (opt.prompt_reads == .overlap) try a.alloc(P7Row, bank.n_experts + opt.transient_rows) else &.{};
                 errdefer if (p7_rows.len > 0) a.free(p7_rows);
                 const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts) else &.{};
@@ -871,9 +884,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .prompt_reads = opt.prompt_reads,
                     .prompt_ahead = opt.prompt_ahead,
                     .ahead_cap = opt.ahead_cap,
+                    .prompt_relocate = opt.prompt_relocate,
                     .p7_rows = p7_rows,
                     .ahead_job = ahead_job,
                 };
+                // Relocation's copies (`p7Relocate`): at most every persistent row's components per call, reserved once.
+                if (opt.prompt_relocate) try self.promote_copies.ensureTotalCapacity(a, @as(usize, n_components) * bank.n_experts);
                 return self;
             }
 
@@ -1898,6 +1914,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 if (self.prompt_ahead == .whole_trim) try self.p7Withdraw(layer);
                 try self.p7Tail(layer);
+                if (self.prompt_relocate) try self.p7Relocate(layer);
                 try self.p7Rows(layer);
                 for (0..n_groups) |g| try self.p7Parts(@intCast(g));
                 try self.p7Post(0);
@@ -1997,6 +2014,60 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 ah.n = ah.posted + kept;
                 try self.postAheadJobs(layer, ah.n);
+            }
+
+            /// P7 overlap relocation (`Options.prompt_relocate`): each read-ahead record whose first event in the call's plans
+            /// is its row's eviction (an earlier group's seed or miss load takes the row before any group hits the record)
+            /// and that a later group loads again into a transient row no earlier group of the call reads (loads only: a
+            /// transient row is never a hit) is copied, now, from its read-ahead row into that transient row, every
+            /// component's row whole, and the row's meta made the record's: `p7Rows` then counts the row as holding it and
+            /// `p7Parts` makes that load a held one (no read). The record's read-ahead job is landed first (its rows hold
+            /// their records); the copies run before the call posts any read (`p7Post`), so no read writes a source row
+            /// before it is copied and no group reads a target row before the copy (every earlier group of the call reads
+            /// other rows; the previous call's routes are flushed). Plans, slots and kernels are the stock schedule's, and a
+            /// target row holds the bytes a read of the record would write (a row-for-row copy of the record's read):
+            /// exact by construction.
+            fn p7Relocate(self: *Stream, layer: u32) Error!void {
+                const ah = &self.ahead;
+                if (!ah.live or ah.layer != layer) return;
+                const p = &self.p7;
+                const cap = self.layers[layer].policy.capacity;
+                const copies = &self.promote_copies;
+                copies.clearRetainingCapacity();
+                var bytes: u64 = 0;
+                records: for (ah.loads[0..ah.n]) |l| {
+                    // The record's first event, in group order: a hit keeps it in place; its row's eviction marks it.
+                    const evicted: usize = first: for (0..p.n_groups) |gi| {
+                        const r = &self.routes[p.route[gi]];
+                        for (r.hit_slots[0..r.plan.n_hits]) |s| if (s == l.slot) continue :records;
+                        for (r.plan.evictionsOf()) |ev| if (ev.slot == l.slot and ev.previous == l.expert) break :first gi;
+                    } else continue :records;
+                    // Its load in a later group: a transient row that no group before that one loads.
+                    const to: u32 = later: for (evicted + 1..p.n_groups) |gi| {
+                        const r = &self.routes[p.route[gi]];
+                        for (r.plan.loadsOf()) |ld| if (ld.expert == l.expert) {
+                            if (ld.slot < cap) continue :records;
+                            for (0..gi) |gj| for (self.routes[p.route[gj]].plan.loadsOf()) |x| if (x.slot == ld.slot) continue :records;
+                            break :later ld.slot;
+                        };
+                    } else continue :records;
+                    // The source row holds the record once its job has landed (a record its row already held has a job too).
+                    const j = self.ahead_job[l.slot];
+                    if (j != no_job) try self.landAheadJob(j);
+                    const src = self.locate(layer, l.slot).meta;
+                    std.debug.assert(src.state == .ready and src.layer == layer and src.expert == l.expert);
+                    // Capacity reserved at construction: every persistent row's components.
+                    for (0..n_components) |c| {
+                        const dst = self.slotRow(layer, to, @enumFromInt(c));
+                        copies.appendAssumeCapacity(.{ .dst = dst, .src = self.slotRow(layer, l.slot, @enumFromInt(c)) });
+                        bytes += dst.len;
+                    }
+                    self.locate(layer, to).meta.* = .{ .state = .ready, .layer = @intCast(layer), .expert = l.expert };
+                }
+                if (bytes == 0) return;
+                // No promotion still reads a transient row (none on an overlap stream; settled here regardless).
+                self.settleCopies();
+                copyParallel(copies.items, bytes);
             }
 
             /// P7 overlap: every row's record and reader as the call starts (the slot meta, a read-ahead record counted as

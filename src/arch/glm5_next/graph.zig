@@ -453,7 +453,7 @@ pub const Cache = struct {
     }
 
     /// The layer's arrays an evaluation of its forward covers (lanes and states).
-    fn buffers(self: *const Cache, lw: *const Layer, out: *[2]T) []const T {
+    pub fn buffers(self: *const Cache, lw: *const Layer, out: *[2]T) []const T {
         var n: usize = 0;
         switch (lw.attn) {
             .dsa => for ([_]?T{ self.latent[lw.slot].buf, self.index[lw.slot].buf }) |b| if (b) |x| {
@@ -520,6 +520,17 @@ fn mlpTiles(g: *G, a: std.mem.Allocator, c: *const glm.Config, m: Mlp, x: T, row
 
 pub const Routing = struct { indices: T, weights: T };
 
+/// Prompt lever 4 (glm5next/prefill-levers): a prompt call's MoE commits, the routing barrier's arrays first (the routed
+/// ids and weights: the router's graph over the FFN's collapse and norm), then the shared expert. The routed call's
+/// barrier (its host read of the ids) then waits for the router alone, not behind the shared expert's 16K-row GEMMs
+/// (~15 ms a layer in the profile), so the call's plans and reads start that much sooner in a drive-bound MoE stage; the
+/// GPU runs the shared expert behind the router, ahead of the first group's tiles. The same graphs and values, only the
+/// commit order moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+pub fn commitRoutingFirst(comptime Ops: type, g: *Ops, indices: Ops.T, weights: Ops.T, shared: Ops.T) !void {
+    try g.asyncEval(&.{ indices, weights });
+    try g.asyncEval(&.{shared});
+}
+
 /// noaux_tc at one group: f32 logits on the transposed F32 router, sigmoid, the correction bias for the choice, the
 /// top-k, the chosen sigmoid scores normalized (`norm_topk_prob`, + 1e-20) and scaled. x [n, hidden] -> ids u32 [n, k],
 /// weights f32 [n, k].
@@ -537,7 +548,7 @@ pub fn route(g: *G, c: *const glm.Config, r: Router, x: T) !Routing {
 
 /// The sublayer attention of layer `lw` on `stream` [1, R, hc, hidden] (rows at `start`): the collapse, the norm, KDA or
 /// DSA, the expand -> the new stream.
-fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start: u32, cache: *Cache, routes: dsa.Routes, comptime head: Head) !T {
+pub fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start: u32, cache: *Cache, routes: dsa.Routes, comptime head: Head) !T {
     var col = try ops.collapse(g.s, stream, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, c.hc_iters, c.hc_eps, c.rms_norm_eps);
     defer col.deinit();
     const normed = try rmsNorm(g, col.x, lw.input_norm, c.rms_norm_eps);
@@ -552,29 +563,59 @@ fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start
     return g.adopt(try ops.expand(g.s, out, stream, &col));
 }
 
-/// P1 (a prompt call of a routed layer): the router on the layer's collapsed attention input (its post-attention norm),
-/// the call's predicted top-k counted over every row (one eval), ranked hottest first and posted to the stream, which
-/// reads them into the layer's free persistent rows while the attention runs. The prediction only picks reads.
-fn readAhead(g: *G, c: *const glm.Config, lw: *const Layer, spans: []const T, src: *experts.Source, layer: u32) !void {
-    const m = g.mark();
-    defer g.resetTo(m);
+/// A prompt call's spans at most.
+const max_spans = prompt_call_rows / span_rows + 1;
+
+/// P1's predictor of one routed layer for a prompt call (prompt lever 5): the call's predicted top-k counted per expert
+/// on the GPU (u32 [experts]: one small read back in place of every row's ids and the host's tally). Built on the layer's
+/// input spans at the previous layer's end, committed behind that layer's tail and evaluated with it (`forward`: no host
+/// gap at the boundary), or at the layer's own start for a call's first routed layer that no layer of the call precedes.
+pub const Ahead = struct {
+    layer: ?u32 = null,
+    counts: ?T = null,
+
+    pub fn release(a: *Ahead, g: *G) void {
+        if (a.counts) |x| g.release(x);
+        a.* = .{};
+    }
+};
+
+/// Routed layer `l`'s predictor over the call's input `spans` (`Ahead`), unevaluated: the router on each span's collapsed
+/// attention input (its post-attention norm), every row's top-k compared with each expert id and summed (exact integer
+/// counts: the host's tally of the same ids, so the same ranking and the same read-ahead), the spans' counts added. The
+/// counts are kept; the graph's intermediates belong to the caller's scope.
+pub fn predictor(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, spans: []const T, ahead: *Ahead) !void {
+    std.debug.assert(ahead.layer == null and spans.len <= max_spans);
     const r = lw.router.?;
-    var ids: [prompt_call_rows / span_rows + 1]T = undefined;
-    for (spans, ids[0..spans.len]) |sp, *out| {
+    const n: c_int = @intCast(c.n_routed_experts);
+    const k: c_int = @intCast(c.n_experts_per_tok);
+    const ids_row = try g.reshape(try g.arange(0, @floatFromInt(n), 1, .uint32), &.{ 1, n });
+    var total: ?T = null;
+    for (spans) |sp| {
         var col = try ops.collapse(g.s, sp, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, c.hc_iters, c.hc_eps, c.rms_norm_eps);
         defer col.deinit();
         const sh = g.shapeOf(col.x);
         const x = try g.reshape(try rmsNorm(g, col.x, lw.post_norm, c.rms_norm_eps), &.{ sh.dim(1), sh.dim(2) });
-        out.* = (try route(g, c, r, x)).indices;
+        const span_counts = try expertCounts(G, g, (try route(g, c, r, x)).indices, sh.dim(1), k, ids_row);
+        total = if (total) |t| try g.add(t, span_counts) else span_counts;
     }
-    try g.evalAll(ids[0..spans.len]);
-    const counts = src.ahead_counts[0..c.n_routed_experts];
-    @memset(counts, 0);
-    for (ids[0..spans.len]) |x| {
-        const n: usize = @intCast(g.shapeOf(x).dim(0) * g.shapeOf(x).dim(1));
-        for (try g.readU32(x, src.ahead_ids[0..n])) |e| counts[e] += 1;
-    }
-    try src.readAheadSeed(layer, expert_policy.rankHottest(counts, &src.ahead_ranked));
+    ahead.counts = g.keep(try g.astype(total.?, .uint32));
+    ahead.layer = l;
+}
+
+/// Each expert's routed rows in `ids` (u32 [rows, k]): the ids compared with every expert id (`all_ids`, u32 [1, n]) and
+/// summed per expert, int32 [n] (integer sums: exactly the host's tally of the same ids). `Ops`: the module's MLX backend
+/// (the CPU tests trace it).
+pub fn expertCounts(comptime Ops: type, g: *Ops, ids: Ops.T, rows: c_int, k: c_int, all_ids: Ops.T) !Ops.T {
+    return g.sum(try g.equal(try g.reshape(ids, &.{ rows * k, 1 }), all_ids), 0, false);
+}
+
+/// P1: routed layer `l`'s predicted counts (evaluated) ranked hottest first and posted to the stream, which reads the
+/// seed into the layer's free persistent rows while the attention runs. The prediction only picks reads.
+fn postReadAhead(g: *G, c: *const glm.Config, ahead: *const Ahead, src: *experts.Source, l: u32) !void {
+    std.debug.assert(ahead.layer.? == l);
+    const counts = try g.readU32(ahead.counts.?, src.ahead_counts[0..c.n_routed_experts]);
+    try src.readAheadSeed(l, expert_policy.rankHottest(counts, &src.ahead_ranked));
 }
 
 /// What a forward hands back after its last layer (a comptime route per call site):
@@ -624,6 +665,9 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
     defer a.free(cols);
     const normed = try a.alloc(T, n_spans);
     defer a.free(normed);
+    // Prompt lever 5: the next routed layer's predictor, built and evaluated with each layer's output.
+    var ahead: Ahead = .{};
+    defer ahead.release(g);
     for (w.layers, 0..) |*lw, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
@@ -632,7 +676,15 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             ptl.layer(l);
             ptl.stage(.predict);
         }
-        if (prompt and lw.router != null) try readAhead(g, c, lw, spans, src, l);
+        if (prompt and lw.router != null) {
+            // Built at the previous layer's end; a call's first routed layer with no earlier layer in the call builds it here.
+            if (ahead.layer == null) {
+                try predictor(g, c, lw, l, spans, &ahead);
+                try g.evalAll(&.{ahead.counts.?});
+            }
+            try postReadAhead(g, c, &ahead, src, l);
+            ahead.release(g);
+        }
         if (comptime ptl.enabled) ptl.stage(.attn);
         // The attention, span by span (the KDA state and the DSA lanes carry from one span to the next); in a prompt
         // call each span is committed as built and the span before it waited, so at most `spans_in_flight` run at once.
@@ -669,10 +721,10 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, x, rows) else try mlp(g, c, d, x)) else blk: {
             const r = try route(g, c, lw.router.?, x);
             const shared = try mlp(g, c, lw.shared.?, x);
-            // A prompt call commits the shared expert before its routed call (the GPU runs it while the host routes and
-            // the first group's reads land); a decode-lane call hands it over as the call's hoist (run during its read
-            // wait). The sum is the same either way.
-            if (prompt) try g.asyncEval(&.{shared});
+            // Prompt lever 4: a prompt call commits the routing barrier's arrays, then the shared expert (the GPU runs it
+            // behind the router while the host routes and the first group's reads land); a decode-lane call hands it over
+            // as the call's hoist (run during its read wait). The sum is the same either way.
+            if (prompt) try commitRoutingFirst(G, g, r.indices, r.weights, shared);
             if (comptime ptl.enabled) ptl.stage(.router);
             const routed = try g.adopt(try src.forward(l, x, r.indices, r.weights, if (prompt) &.{} else &.{shared}));
             break :blk try g.add(routed, shared);
@@ -686,10 +738,27 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             g.release(sp.*);
             sp.* = next;
         }
+        // The expands hold the collapses they read.
+        for (cols[0..n_cols]) |*cl| cl.deinit();
+        n_cols = 0;
         // MiMo's tail: a prompt layer's output evaluated before the next layer starts (bounding its graph), then the
-        // pooled scratch's purge. A decode step's stays lazy: the next routing barrier evaluates it.
+        // pooled scratch's purge. A decode step's stays lazy: the next routing barrier evaluates it. Prompt lever 5: the
+        // tail is committed, the next routed layer's predictor built on its output while the GPU runs it, then committed
+        // behind it and evaluated with it (no host gap at the boundary). The layer's own arrays are released first (the
+        // tail's graph holds what it reads): the boundary holds the stream, the tail's inputs and the predictor's arrays,
+        // not the MoE stage's (bill.zig `promptWaveBytes`: `boundary`).
         if (prompt) {
-            try g.evalAll(spans);
+            g.resetTo(m);
+            try g.asyncEval(spans);
+            var outs: [max_spans + 1]T = undefined;
+            @memcpy(outs[0..n_spans], spans);
+            var n_outs = n_spans;
+            if (li + 1 < w.layers.len and w.layers[li + 1].router != null) {
+                try predictor(g, c, &w.layers[li + 1], l + 1, spans, &ahead);
+                outs[n_outs] = ahead.counts.?;
+                n_outs += 1;
+            }
+            try g.evalAll(outs[0..n_outs]);
             src.promptLayerEnd();
         }
     }
@@ -755,6 +824,77 @@ test "glm5_next graph: the kept residents are the trunk's (no vision tower, no M
         "model.language_model.layers.3.self_attn.k_proj.k_scale", "model.language_model.layers.3.self_attn.v_proj.v_scale",
         "model.language_model.layers.x.input_layernorm.weight",
     }) |n| try testing.expect(!keptResident(&c, n));
+}
+
+test "glm5_next graph: prompt lever 4 commits the routing barrier's ids and weights, then the shared expert (two commits, in that order; nothing else)" {
+    const Trace = ops_be.TraceOps;
+    var g = Trace.init(testing.allocator);
+    defer g.deinit();
+    const ids = try g.input(&.{ 16, 8 }, .uint32);
+    const weights = try g.input(&.{ 16, 8 }, .float32);
+    const shared = try g.input(&.{ 16, 4096 }, .bfloat16);
+    const nodes = g.nodes.items.len;
+    try commitRoutingFirst(Trace, &g, ids, weights, shared);
+    try testing.expectEqual(@as(usize, 2), g.commit_spans.items.len);
+    try testing.expectEqualSlices(Trace.T, &.{ ids, weights }, g.committed.items[g.commit_spans.items[0][0]..g.commit_spans.items[0][1]]);
+    try testing.expectEqualSlices(Trace.T, &.{shared}, g.committed.items[g.commit_spans.items[1][0]..g.commit_spans.items[1][1]]);
+    // Only the two commit markers: no node of a graph is built or evaluated here.
+    try testing.expectEqual(nodes + 2, g.nodes.items.len);
+    try testing.expectEqual(@as(usize, 0), g.evals.items.len);
+}
+
+test "glm5_next graph: prompt lever 5's expert counts compare every row's top-k with each expert id and sum per expert: int32 [experts] (the trace backend: no device)" {
+    const Trace = ops_be.TraceOps;
+    var g = Trace.init(testing.allocator);
+    defer g.deinit();
+    const ids = try g.input(&.{ 1024, 8 }, .uint32);
+    const all_ids = try g.input(&.{ 1, 288 }, .uint32);
+    const counts = try expertCounts(Trace, &g, ids, 1024, 8, all_ids);
+    try testing.expectEqualSlices(c_int, &.{288}, g.shapeOf(counts).slice());
+    try testing.expectEqual(mlx.mlx_dtype.int32, g.dtypeOf(counts));
+    try testing.expectEqual(@as(usize, 0), g.evals.items.len);
+}
+
+test "glm5_next graph: prompt lever 5's expert counts in MLX (two spans added, u32) are the host's tally of the same ids, so the read-ahead's ranking is the control's (guarded window: MLX's CPU stream creates the Metal device)" {
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const n: u32 = 288;
+    const k: u32 = 8;
+    const rows: u32 = 96;
+    var prng = std.Random.DefaultPrng.init(0x51ed);
+    const rng = prng.random();
+    var want: [n]u32 = @splat(0);
+    const all_ids = try g.reshape(try g.arange(0, @floatFromInt(n), 1, .uint32), &.{ 1, n });
+    var total: ?T = null;
+    for (0..2) |_| {
+        // Every row's top-k distinct, skewed toward low ids (hot experts) so the ranking has ties and gaps.
+        var ids: [rows * k]u32 = undefined;
+        for (0..rows) |r| {
+            var j: usize = 0;
+            while (j < k) {
+                const u = rng.float(f32);
+                const e: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(n - 1)), u * u * @as(f32, @floatFromInt(n))));
+                if (std.mem.indexOfScalar(u32, ids[r * k ..][0..j], e) != null) continue;
+                ids[r * k + j] = e;
+                want[e] += 1;
+                j += 1;
+            }
+        }
+        const x = try g.hostArray(std.mem.sliceAsBytes(&ids), &.{ rows, k }, .uint32);
+        const span_counts = try expertCounts(G, &g, x, rows, k, all_ids);
+        total = if (total) |t| try g.add(t, span_counts) else span_counts;
+    }
+    const counts = try g.astype(total.?, .uint32);
+    try g.evalAll(&.{counts});
+    var got: [n]u32 = undefined;
+    try testing.expectEqualSlices(u32, &want, try g.readU32(counts, &got));
+    var rank_want: [n]u16 = undefined;
+    var rank_got: [n]u16 = undefined;
+    try testing.expectEqualSlices(u16, expert_policy.rankHottest(&want, &rank_want), expert_policy.rankHottest(&got, &rank_got));
 }
 
 test "glm5_next graph: the owned f32 tables' bytes and the call geometry" {

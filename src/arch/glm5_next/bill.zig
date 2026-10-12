@@ -219,15 +219,33 @@ pub fn denseRowBytes(c: *const glm.Config) u64 {
 
 /// The prompt pass's wave at its widest call (`t` rows over `keys` keys): the call's stream twice (a layer's input and
 /// its output until the layer's eval), plus the widest stage: P1's predictor over every row, the attention's spans in
-/// flight (KDA's or DSA's, the widest) with the DSA dense prefix, the dense MLP's tiles in flight, or the MoE stage.
+/// flight (KDA's or DSA's, the widest) with the DSA dense prefix, the dense MLP's tiles in flight, the MoE stage, or a
+/// layer's end (prompt lever 5: the tail's inputs, the FFN's output and its two summands with the FFN's collapses, beside
+/// the next routed layer's predictor over every row, committed behind the tail).
 pub fn promptWaveBytes(c: *const glm.Config, t: u64, keys: u64) u64 {
     const s: u64 = @min(t, graph.span_rows);
-    const stream = 2 * t * c.hc_mult * c.hidden_size * bf16;
-    const predictor = t * (moeRowBytes(c) - 2 * @as(u64, c.hidden_size) * bf16);
+    const h: u64 = c.hidden_size;
+    const stream = 2 * t * c.hc_mult * h * bf16;
+    const predictor = t * (moeRowBytes(c) - 2 * h * bf16);
     const attention = @as(u64, graph.spans_in_flight) * s * @max(kdaRowBytes(c), dsaRowBytes(c, keys)) + dsaDenseBytes(c);
-    const dense = @as(u64, graph.spans_in_flight) * @as(u64, @min(t, graph.dense_tile_rows)) * denseRowBytes(c) + t * @as(u64, c.hidden_size) * bf16 * 2;
+    const dense = @as(u64, graph.spans_in_flight) * @as(u64, @min(t, graph.dense_tile_rows)) * denseRowBytes(c) + t * h * bf16 * 2;
     const moe = t * moeRowBytes(c);
-    return stream + @max(@max(predictor, attention), @max(dense, moe));
+    const boundary = t * (3 * h * bf16 + collapseRowBytes(c) + predictorRowBytes(c));
+    return stream + @max(@max(predictor, attention), @max(@max(dense, moe), boundary));
+}
+
+/// One row of a sublayer's collapse (`ops.collapse`): its mixes, the collapsed row, the post and comb gates, the norm.
+pub fn collapseRowBytes(c: *const glm.Config) u64 {
+    const hc: u64 = c.hc_mult;
+    return (2 + hc) * hc * f32b + @as(u64, c.hidden_size) * bf16 + hc * f32b + hc * hc * f32b + @as(u64, c.hidden_size) * bf16;
+}
+
+/// One row of P1's predictor (`graph.predictor`): the collapse, the router's f32 input, logits, sigmoid, biased, negated
+/// and partitioned scores, the top-k and its weights, the top-k compared with every expert id (bool).
+pub fn predictorRowBytes(c: *const glm.Config) u64 {
+    const e: u64 = c.n_routed_experts;
+    const k: u64 = c.n_experts_per_tok;
+    return collapseRowBytes(c) + @as(u64, c.hidden_size) * f32b + 5 * e * f32b + 4 * k * 4 + k * e;
 }
 
 /// The decode wave: a step's graph between two routing barriers (two layers' arrays at one row, the widest layer kind at
@@ -607,6 +625,18 @@ test "glm5_next bill: the MTP lane adds its terms, the verify's rows on the deco
         try testing.expect(termOf(on, "request_wiring")[ph] > termOf(off, "request_wiring")[ph]);
         try testing.expectEqual(termOf(off, "buffer_allowance")[ph] + wire_buffer_bytes * laneBuffers(&in.model), termOf(on, "buffer_allowance")[ph]);
     }
+}
+
+test "glm5_next bill: prompt lever 5's layer end (the tail's inputs beside the next routed layer's predictor) stays under the attention stage at every call width: the prompt wave is unchanged" {
+    const c: glm.Config = .{};
+    for ([_]u64{ 1, 5, 512, 1024, 2048, 4096, 8192, 16_384 }) |t| for ([_]u64{ 16_384, 32_768, 1 << 20 }) |keys| {
+        const s: u64 = @min(t, graph.span_rows);
+        const attention = @as(u64, graph.spans_in_flight) * s * @max(kdaRowBytes(&c), dsaRowBytes(&c, keys)) + dsaDenseBytes(&c);
+        const boundary = t * (3 * @as(u64, c.hidden_size) * bf16 + collapseRowBytes(&c) + predictorRowBytes(&c));
+        try testing.expect(boundary < attention);
+        // The predictor's own row (the stage before lever 5 billed it as the MoE row less its output) still covers it.
+        try testing.expect(predictorRowBytes(&c) <= moeRowBytes(&c) - 2 * @as(u64, c.hidden_size) * bf16);
+    };
 }
 
 test "glm5_next bill: every term is non-decreasing in the billed context (the ladder bounds a rung by the next printed table)" {

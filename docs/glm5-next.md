@@ -46,11 +46,11 @@ refuse by name (`Glm5NextHostSurfaceMissing`).
 MiMo's stack of record, through the shared seams: the SDK stream over the NVFP4 bank (`mimo_v2/stream_source.For`), the
 shared DeepSeek scheduler (`ExpertsWith`: the decode lane, the wide prompt lane, the wide feed, P1's read-ahead), MiMo's
 expert math over the NVFP4 format (`mimo_v2/math.MathOf(nvfp4.Format)`: sorted NAX gathers per bank, the window bank
-view, pipelined drains) and MiMo's in-place prompt combine. Routes installed once: read schedule `early_whole_trim`,
-pooled prompt scratch (2 GiB cache, purged at a layer's end once half full), decode window 32 rows, phase rows (the
-prompt's scratch freed at the phase change, each layer grown to its decode rows, shrunk back at the next prompt,
-residents forgotten per request as MiMo's are). The in-place combine needs the host's wired policy `max`; under another
-policy the fused combine is installed (one log line).
+view, pipelined drains) and MiMo's in-place prompt combine. Routes installed once: read schedule `early_whole_trim`
+(with the read-ahead relocation: "Prompt levers" below), pooled prompt scratch (2 GiB cache, purged at a layer's end
+once half full), decode window 32 rows, phase rows (the prompt's scratch freed at the phase change, each layer grown to
+its decode rows, shrunk back at the next prompt, residents forgotten per request as MiMo's are). The in-place combine
+needs the host's wired policy `max`; under another policy the fused combine is installed (one log line).
 
 The gathers are MLX's `gather_qmm` in `nvfp4` mode (group 16) with each slot's f32 global scale, through the plugin's
 shim (`glm5_gather_qmm_nvfp4`: MLX's C++ op; mlx-c's `mlx_gather_qmm` has no global scale and is not changed): MLX folds
@@ -66,9 +66,11 @@ names the installed route (`decode_moe=`).
 ## The prompt pass
 
 Calls of at most 16,384 rows, layer by layer. Per routed layer, P1 posts the predicted seed (the layer's router on its
-collapsed attention input) before the attention; the attention runs in spans of 1,024 rows, at most two committed (the
+collapsed attention input, counted per expert on the GPU and evaluated with the previous layer's output: lever 5 below)
+before the attention; the attention runs in spans of 1,024 rows, at most two committed (the
 KDA state and the DSA lanes carry from span to span); the dense MLP of layers 0-2 in tiles of 2,048 rows, two committed;
-the MoE over every row at once (the shared expert committed first); the layer's output evaluated at its end. DSA's
+the MoE over every row at once (the routing barrier's ids and weights committed first, then the shared expert: lever 4
+below); the layer's output evaluated at its end. DSA's
 indexer scores and sparse latent attention run on the NAX kernels where the device has them (`dsa_nax=true` in the
 routes line); an installed NAX route never falls back.
 
@@ -91,6 +93,74 @@ load by name); `trunk_f32_tables` bills the 34 tables (256 B each) and the buffe
 the per-token route's five f32 gate stages, which the per-core route never builds. The window's parity test:
 `GLM5NEXT_KDA_PERCORE_GPU=1 _GPU_WINDOW_LOCKED=1`,
 `-Dtest-filter="glm5_next kda percore GPU"`.
+
+## Prompt levers
+
+The 16K prompt pass's levers from the prefill analysis (`reports/.../mimo/glm5next-prefill-gpu-levers-20261012.md`),
+numbered as the analysis ranks them (2 and 6 are other lanes'), each a construction-time route with one engagement line
+at load (the pair harness greps them). An exact lever is installed unconditionally; a rounding-class one is a settings
+key whose default is the stock control.
+
+- **Lever 1, read-ahead relocation** (exact). The profile read 33.8 records per layer twice: P1's read-ahead reads its
+   mispredicted records (predicted hot, actually ranked past the prompt rows) into persistent rows during the attention,
+   an earlier group's seed miss then takes each such row before any group hits the record, and the record's own group
+   reads it again, into a transient row, inside the drive-bound MoE stage (209 ms of reads against 154 ms of tiles per
+   layer). The SDK stream's overlap schedule now relocates such a record at the call's plans
+   (`Options.prompt_relocate`, `Stream.p7Relocate`): when its later load is into a transient row no earlier group of
+   the call loads, the record is copied from its read-ahead row into that row (its read-ahead job landed first; the
+   copies run before the call posts any read), and that load holds its record and reads nothing. The plans, slots and
+   kernels are the control's, and every row holds the record's own bytes before any kernel reads it. A record whose
+   later row an earlier group loads (group 5's rows follow group 3's in window 1) is read again, as before. MiMo's
+   streams leave it off. Line: `glm5_next prompt lever 1: read-ahead relocation engaged (...)`. Expected -0.8 to
+   -1.5 s at 16K (the analysis's model -1.51 s for all double reads); the profile build's `GLM5_NEXT_IO skipped_loads=`
+   counts the relocated loads (0 in the control's first request).
+
+- **Lever 3, prompt kernels warmed at load** (token-identical; `warm.zig`). The profile's first request idled 0.60 s on
+  first use: layer 0's attention (233 ms over later layers') and dense MLP (104 ms), layer 3's DSA indexer, top-k and
+  sparse texts (~220 ms) and its combine (48 ms): MLX builds a custom kernel's library, and a pipeline per
+  specialization, at its first dispatch. The load now dispatches each once at the prompt pass's shapes, on zeros,
+  nothing checked: the first KDA layer's attention over two 1,024-row spans, the first dense layer's MLP over one
+  2,048-row tile, the first DSA layer's attention over a whole call's 16 spans (the dense prefix, then the sparse rows
+  at every key count to 16,384; a billed context under one call: its whole spans) and the installed combine over one
+  token. It leaves no request state: the cache restarted (KDA states cleared; the DSA lanes' lengths 0, a request reads
+  only the positions it appended), the expert source untouched, MLX's cache cleared before the construction check. Its
+  memory is the prompt pass's (two spans in flight, one dense tile), inside the request terms, which hold nothing at the
+  load. A prompt longer than one call reaches key counts the warm does not (compiled on first use, as before). A layout
+  without a KDA, a dense or a DSA layer refuses the load (`Glm5NextWarmLayout`). Line: `glm5_next prompt lever 3: prompt
+  kernels warmed at load in <ms> ms (KDA layer 0: 2 spans; dense layer 0: one 2048-row tile; DSA layer 3: 16 spans of
+  1024 rows; the inplace combine; token-identical)`. Expected -0.5 to -0.6 s of TTFT on the first request after a load
+  (every cell measures one); a warm server never paid it.
+
+- **Lever 4, routing barrier before the shared expert** (exact; `graph.commitRoutingFirst`). A prompt call committed the
+  shared expert's 16K-row GEMMs before the router's graph, so the routed call's barrier (its host read of the ids)
+  waited behind them (~15 ms a layer; layer 20 of the profile: the router's buffer started when the shared expert's
+  ended). A prompt call now commits the routing barrier's ids and weights first, then the shared expert: the barrier
+  waits for the router alone, the call's plans and reads start sooner in the drive-bound MoE stage, and the GPU runs the
+  shared expert behind the router, ahead of the first group's tiles. The same graphs and values; only the commit order
+  moved. The decode lane is unchanged (its shared expert is the routed call's hoist). Line: `glm5_next prompt lever 4:
+  routing barrier committed before the shared expert (...)`. Expected -0.3 to -0.6 s at 16K alone (the analysis; about
+  -0.2 s after the fused KDA prologue).
+
+- **Lever 5, the predictor's counts on the GPU, committed behind the previous layer's tail** (token-identical;
+  `graph.predictor`, `graph.expertCounts`). P1's predictor read every row's top-k back (131K ids at 16K) and counted them
+  on the host, and was built only after the previous layer's output was evaluated: 4.5 ms of GPU idle per routed layer
+  at the boundary. A prompt call now commits a layer's tail, builds the next routed layer's predictor on that output
+  while the GPU runs it, commits it behind the tail and evaluates both together; the predictor compares each row's top-k
+  with every expert id and sums them per expert on the GPU (exact integer counts: the host's tally of the same ids), so
+  one 288-value read back gives the counts. The same counts, the same ranking, the same read-ahead. The layer's own
+  arrays are released before the boundary (the tail's graph holds what it reads), so the boundary holds the stream, the
+  tail's inputs and the predictor (the bill's `boundary` stage, under the attention stage at every width: the prompt
+  wave is unchanged). A call's first routed layer that no layer of the call precedes builds it at its own start, as
+  before. The warm (lever 3) dispatches the predictor once. The profile build's `predict` stage now holds the read back
+  and the post; the predictor's GPU work runs in the previous layer's `tail`. Line: `glm5_next prompt lever 5: predictor
+  counts on the GPU, committed behind the previous layer's tail (...)`. Expected about -0.15 s at 16K (the boundary's
+  idle; the analysis's -0.3 to -0.5 s included the two parts below).
+  Not built here: reusing the predictor's collapses in the attention (one collapse per span, not two) would hold the 16
+  spans' collapsed rows through the attention, the prompt wave's widest stage (+135.5 MB at 16K), which moves the fill
+  from 124 to 123 prompt rows at the 12.6 GB baseline; and a BF16 predictor GEMM is rounding-class in the prompt pass
+  (the predicted ranking fixes the read-ahead's admissions, hence each expert's persistent row, hence which rows fall in
+  a bank's per-row `gather_qmv` tail tile), so it needs a settings route with the F32 control and the router's BF16
+  binding the decode-stack lane adds (`Router.w`).
 
 ## The bill
 
@@ -164,8 +234,9 @@ A profile build (the host's `-Dplugin-profile=true`; never a served build) compi
   sparse router dense moe join gather reduce output tail`. On a DSA layer the indexer's pool scores (`indexer`), the
   top-k selection (`topk`) and the sparse latent attention (`sparse`) each run under their own mark, with a profile-only
   eval at each boundary while the timeline records; `attn` keeps the norms, the projections and the KDA route. `dense`
-  is layers 0-2's dense MLP and, on a routed layer, the FFN's collapse and norm with the shared expert (committed before
-  the routing barrier); `router` the routed call's barrier and setup; `tail` the expand and the layer's output.
+  is layers 0-2's dense MLP and, on a routed layer, the FFN's collapse and norm with the router's and the shared expert's
+  commits (the routing barrier's arrays first: lever 4); `router` the routed call's barrier and setup; `tail` the expand
+  and the layer's output.
 - `GLM5_NEXT_GPU_TIMELINE=1` (`0` off; anything else refuses): DSV's verify GPU timeline over the serial decode's
   forwards (`GLM5_NEXT_GPU_TIMELINE armed: serial forwards, cycles_cap=1024`): one cycle per forward with one verify,
   the first request's first 1,024 forwards; at the request's end `VERIFY_GPU_TIMELINE_REPAIR`, `VERIFY_GPU_TIMELINE {...}`
