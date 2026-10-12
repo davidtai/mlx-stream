@@ -356,138 +356,69 @@ pub const Field = struct { name: []const u8, f: *const fn (Round) f64 };
 fn f(x: u64) f64 {
     return @floatFromInt(x);
 }
-pub const fields = [_]Field{
-    .{ .name = "round_ms", .f = &struct {
+/// A column that is one `Round` field: in ms (a `_ns` field), or as counted.
+fn msOf(comptime field: []const u8) *const fn (Round) f64 {
+    return &struct {
         fn g(r: Round) f64 {
-            return f(r.round_ns) / ms;
+            return f(@field(r, field)) / ms;
         }
-    }.g },
+    }.g;
+}
+fn countOf(comptime field: []const u8) *const fn (Round) f64 {
+    return &struct {
+        fn g(r: Round) f64 {
+            return f(@field(r, field));
+        }
+    }.g;
+}
+pub const fields = [_]Field{
+    .{ .name = "round_ms", .f = msOf("round_ns") },
     .{ .name = "draft_ms", .f = &struct {
         fn g(r: Round) f64 {
             return f(r.draft_build_ns + r.draft_wait_ns + r.draft_host_ns) / ms;
         }
     }.g },
-    .{ .name = "draft_build_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.draft_build_ns) / ms;
-        }
-    }.g },
-    .{ .name = "draft_wait_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.draft_wait_ns) / ms;
-        }
-    }.g },
-    .{ .name = "draft_host_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.draft_host_ns) / ms;
-        }
-    }.g },
-    .{ .name = "verify_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.verify_ns) / ms;
-        }
-    }.g },
-    .{ .name = "verify_barrier_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.barrier_ns) / ms;
-        }
-    }.g },
-    .{ .name = "verify_route_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.route_ns) / ms;
-        }
-    }.g },
-    .{ .name = "verify_read_wait_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.read_wait_ns) / ms;
-        }
-    }.g },
+    .{ .name = "draft_build_ms", .f = msOf("draft_build_ns") },
+    .{ .name = "draft_wait_ms", .f = msOf("draft_wait_ns") },
+    .{ .name = "draft_host_ms", .f = msOf("draft_host_ns") },
+    .{ .name = "verify_ms", .f = msOf("verify_ns") },
+    .{ .name = "verify_barrier_ms", .f = msOf("barrier_ns") },
+    .{ .name = "verify_route_ms", .f = msOf("route_ns") },
+    .{ .name = "verify_read_wait_ms", .f = msOf("read_wait_ns") },
     .{ .name = "verify_encode_ms", .f = &struct {
         fn g(r: Round) f64 {
             return f(r.verify_ns -| (r.barrier_ns + r.route_ns + r.read_wait_ns)) / ms;
         }
     }.g },
-    .{ .name = "verify_eval_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.verify_eval_ns) / ms;
-        }
-    }.g },
-    .{ .name = "accept_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.accept_ns) / ms;
-        }
-    }.g },
-    .{ .name = "trim_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.trim_ns) / ms;
-        }
-    }.g },
-    .{ .name = "tail_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.tail_ns) / ms;
-        }
-    }.g },
+    .{ .name = "verify_eval_ms", .f = msOf("verify_eval_ns") },
+    .{ .name = "accept_ms", .f = msOf("accept_ns") },
+    .{ .name = "trim_ms", .f = msOf("trim_ns") },
+    .{ .name = "tail_ms", .f = msOf("tail_ns") },
     .{ .name = "other_ms", .f = &struct {
         fn g(r: Round) f64 {
             const charged = r.draft_build_ns + r.draft_wait_ns + r.draft_host_ns + r.verify_ns + r.verify_eval_ns + r.accept_ns + r.trim_ns + r.tail_ns;
             return f(r.round_ns -| charged) / ms;
         }
     }.g },
-    .{ .name = "rows", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.rows);
-        }
-    }.g },
-    .{ .name = "accepted", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.accepted);
-        }
-    }.g },
-    .{ .name = "routed_calls", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.routed_calls);
-        }
-    }.g },
-    .{ .name = "misses", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.misses);
-        }
-    }.g },
-    .{ .name = "hits", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.hits);
-        }
-    }.g },
+    .{ .name = "rows", .f = countOf("rows") },
+    .{ .name = "accepted", .f = countOf("accepted") },
+    .{ .name = "routed_calls", .f = countOf("routed_calls") },
+    .{ .name = "misses", .f = countOf("misses") },
+    .{ .name = "hits", .f = countOf("hits") },
     .{ .name = "read_mb", .f = &struct {
         fn g(r: Round) f64 {
             return f(r.bytes) / 1e6;
         }
     }.g },
-    .{ .name = "read_wall_ms", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.read_wall_ns) / ms;
-        }
-    }.g },
+    .{ .name = "read_wall_ms", .f = msOf("read_wall_ns") },
     .{ .name = "union_per_layer", .f = &struct {
         fn g(r: Round) f64 {
             return if (r.routed_calls == 0) 0 else f(r.union_sum) / f(r.routed_calls);
         }
     }.g },
-    .{ .name = "union_max", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.union_max);
-        }
-    }.g },
-    .{ .name = "ahead_claimed", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.claimed);
-        }
-    }.g },
-    .{ .name = "pre_served", .f = &struct {
-        fn g(r: Round) f64 {
-            return f(r.pre_served);
-        }
-    }.g },
+    .{ .name = "union_max", .f = countOf("union_max") },
+    .{ .name = "ahead_claimed", .f = countOf("claimed") },
+    .{ .name = "pre_served", .f = countOf("pre_served") },
     .{ .name = "ahead_coverage", .f = &struct {
         fn g(r: Round) f64 {
             return if (r.misses == 0) 0 else f(r.claimed) / f(r.misses);
