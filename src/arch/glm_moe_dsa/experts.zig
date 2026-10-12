@@ -15,6 +15,7 @@
 //! host builds the next) before the group's slots go back; then the combine (on the GPU one launch over the groups' outputs, else the join and the op chain in token slices).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("sdk").mlx;
 const sdk_ext = @import("../../sdk_ext.zig");
 const expert_policy = sdk_ext.expert.policy;
@@ -62,8 +63,9 @@ const combine_tail =
 /// row is row `loc[t * k + j] & 0xFFFFFF` of part `loc[t * k + j] >> 24`, u32 `[n * k]`) as one launch: each token's
 /// rows weighted and summed in f32 in routed order, products and sums rounded apart (no contraction), cast to `dt`;
 /// the op chain's bits.
-fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, parts: []const ops.MlxOps.T, loc: ops.MlxOps.T, scores: ops.MlxOps.T, n: u32, k: u32, hidden: c_int, dt: ops.Dtype) !ops.MlxOps.T {
-    std.debug.assert(parts.len > 0 and parts.len <= max_combine_parts);
+/// The combine kernel, built once at the decode lane's construction (`Experts.init` with `Options.combine_gpu`), never
+/// inside a request.
+fn buildCombine() !mlx.mlx_fast_metal_kernel {
     const names = comptime blk: {
         @setEvalBranchQuota(1000 * max_combine_parts);
         var v: [max_combine_parts + 2][*:0]const u8 = undefined;
@@ -72,17 +74,18 @@ fn combineOnGpu(slot: *?mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, parts: []cons
         v[max_combine_parts + 1] = "w";
         break :blk v;
     };
-    const kern = slot.* orelse blk: {
-        const outs = [_][*:0]const u8{"out"};
-        const iv = mlx.mlx_vector_string_new_data(&names, names.len);
-        defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
-        defer _ = mlx.mlx_vector_string_free(ov);
-        const kn = mlx.mlx_fast_metal_kernel_new("glm_moe_dsa_combine", iv, ov, combine_source, "#pragma METAL fp contract(off)\n", true, false);
-        if (kn.ctx == null) return error.MetalKernelCompileFailed;
-        slot.* = kn;
-        break :blk kn;
-    };
+    const outs = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const kn = mlx.mlx_fast_metal_kernel_new("glm_moe_dsa_combine", iv, ov, combine_source, "#pragma METAL fp contract(off)\n", true, false);
+    if (kn.ctx == null) return error.MetalKernelCompileFailed;
+    return kn;
+}
+
+fn combineOnGpu(kern: mlx.mlx_fast_metal_kernel, g: *ops.MlxOps, parts: []const ops.MlxOps.T, loc: ops.MlxOps.T, scores: ops.MlxOps.T, n: u32, k: u32, hidden: c_int, dt: ops.Dtype) !ops.MlxOps.T {
+    std.debug.assert(parts.len > 0 and parts.len <= max_combine_parts and @rem(hidden, 4) == 0);
     const h4: c_int = @divExact(hidden, 4);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -125,6 +128,9 @@ pub const HostSplit = struct { calls: u64 = 0, barrier_ns: u64 = 0, route_ns: u6
 pub const Options = struct {
     /// The waves wait on the reads' event gates (the stream built with `event`); off: the host waits.
     gated: bool = false,
+    /// The routed combine on the GPU kernel (`combineOnGpu`, built and run once at `init`): the construction's route on
+    /// a GPU stream with a hidden size of a multiple of 4; off: the op chain's join and combine.
+    combine_gpu: bool = false,
     /// The MLX event the stream signals (gated MLX backends).
     event: ?expert_event.Event = null,
     /// The wide lane's groups in flight (at most the stream's `wide_depth`).
@@ -164,11 +170,15 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         row_bytes: [max_route_ids]u64 = @splat(0),
         /// The decode lane's host time, summed over calls until the caller zeroes it (`HostSplit`).
         host: HostSplit = .{},
-        /// The combine on the GPU (`combine_source`), built at its first call.
+        /// The combine on the GPU (`combine_source`), built and run once at `init` where the route takes it
+        /// (`Options.combine_gpu`); null: the op chain's combine.
         combine_kernel: ?mlx.mlx_fast_metal_kernel = null,
-        /// Tests: each decode-lane call's GPU combine also built as the op chain's join and combine and compared bit for
-        /// bit (`checked` the calls compared, `differed` those whose outputs differ).
-        combine_check: struct { on: bool = false, checked: u32 = 0, differed: u32 = 0 } = .{},
+        /// Test builds only: each decode-lane call's GPU combine also built as the op chain's join and combine and
+        /// compared bit for bit (`checked` the calls compared, `differed` those whose outputs differ). A served build has
+        /// no field and no branch for it.
+        combine_check: if (builtin.is_test) CombineCheck else void = if (builtin.is_test) .{} else {},
+
+        const CombineCheck = struct { on: bool = false, checked: u32 = 0, differed: u32 = 0 };
 
         /// The routes of the prompt layer whose misses were read at its start (`stageMisses`): each route's bank layer and
         /// experts, in route order; null once the call took it.
@@ -245,8 +255,24 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                 b.* = @splat(null);
                 for ([_]BankKind{ .base, .transient }) |kind| b[@backingInt(kind)] = try bind(stream, @intCast(l), kind);
             }
-            _ = g;
-            return .{ .a = a, .stream = stream, .math = math, .hidden = @intCast(hidden), .n_experts = stream.bank.n_experts, .banks = banks, .opt = opt };
+            // The combine route: the kernel built and run once now (one token's one routed row, the acceptance), never in a
+            // request.
+            var combine_kernel: ?mlx.mlx_fast_metal_kernel = null;
+            if (comptime G == ops.MlxOps) if (opt.combine_gpu) {
+                std.debug.assert(mlx.streamIsGpu(g.s) and hidden % 4 == 0);
+                const kern = try buildCombine();
+                errdefer _ = mlx.mlx_fast_metal_kernel_free(kern);
+                const m = g.mark();
+                defer g.resetTo(m);
+                const h: c_int = @intCast(hidden);
+                const loc = [_]u32{0};
+                const w = [_]f32{1};
+                const part = try g.zeros(&.{ 1, h }, .bfloat16);
+                const out = try combineOnGpu(kern, g, &.{part}, try g.hostArray(std.mem.sliceAsBytes(&loc), &.{1}, .uint32), try g.hostArray(std.mem.sliceAsBytes(&w), &.{ 1, 1 }, .float32), 1, 1, h, .bfloat16);
+                try g.evalAll(&.{out});
+                combine_kernel = kern;
+            };
+            return .{ .a = a, .stream = stream, .math = math, .hidden = @intCast(hidden), .n_experts = stream.bank.n_experts, .banks = banks, .opt = opt, .combine_kernel = combine_kernel };
         }
 
         pub fn deinit(self: *Self, g: *G) void {
@@ -456,7 +482,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
         fn joinCombine(self: *Self, g: *G, acc: *const Acc, scores: T, n: u32, k: u32, dt: ops.Dtype) !T {
             const n_ids = n * k;
             const outs = acc.outs[0..acc.n_outs];
-            if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0 and outs.len <= max_combine_parts) {
+            // The construction's route (`combine_kernel`), then the call's own value: the parts the kernel binds.
+            if (comptime G == ops.MlxOps) if (self.combine_kernel) |kern| if (outs.len <= max_combine_parts) {
                 var loc: [max_route_ids]u32 = undefined;
                 var j: usize = 0;
                 for (outs, 0..) |part, pi| for (0..@intCast(g.shapeOf(part).dim(0))) |row| {
@@ -464,8 +491,8 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     j += 1;
                 };
                 const lc = try g.hostArray(std.mem.sliceAsBytes(loc[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
-                const out = try combineOnGpu(&self.combine_kernel, g, outs, lc, scores, n, k, self.hidden, dt);
-                if (self.combine_check.on) {
+                const out = try combineOnGpu(kern, g, outs, lc, scores, n, k, self.hidden, dt);
+                if (comptime builtin.is_test) if (self.combine_check.on) {
                     // f32 holds every bf16 bit (both zeros apart): the bits compared on the host.
                     const want = try combine(g, try self.joinRows(g, acc, n, k), scores, dt);
                     const len = n * @as(usize, @intCast(self.hidden));
@@ -475,9 +502,9 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     _ = try g.hostF32(try g.astype(want, .float32), got_v[len..]);
                     self.combine_check.checked += 1;
                     if (!std.mem.eql(u8, std.mem.sliceAsBytes(got_v[0..len]), std.mem.sliceAsBytes(got_v[len..]))) self.combine_check.differed += 1;
-                }
+                };
                 return out;
-            }
+            };
             self.host.joined += 1;
             return combine(g, try self.joinRows(g, acc, n, k), scores, dt);
         }
@@ -1080,7 +1107,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             const n_ids = n * k;
             try w.inv.resize(a, n_ids);
             // On the GPU the combine reads each routed row where its group's call left it (no join).
-            if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0 and w.kept.items.len <= max_combine_parts) {
+            if (comptime G == ops.MlxOps) if (self.combine_kernel) |kern| if (w.kept.items.len <= max_combine_parts) {
                 const tb = pt.now();
                 defer if (pt.enabled) pt.chargeRouted(.combine, tb);
                 var j: usize = 0;
@@ -1089,13 +1116,13 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
                     j += 1;
                 };
                 const loc = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
-                const out = try combineOnGpu(&self.combine_kernel, g, w.kept.items, loc, scores, n, k, self.hidden, g.dtypeOf(x));
+                const out = try combineOnGpu(kern, g, w.kept.items, loc, scores, n, k, self.hidden, g.dtypeOf(x));
                 // The combine holds the parts until it is evaluated.
                 for (w.kept.items) |o| g.release(o);
                 w.kept.clearRetainingCapacity();
                 w.window = .{};
                 return out;
-            }
+            };
             // The join: every routed row's output in routed order, then the combine in token slices.
             const tj = pt.now();
             const joined = try g.concat(w.kept.items, 0);
@@ -1107,10 +1134,10 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
             w.kept.clearRetainingCapacity();
             w.window = .{};
             for (w.pos.items, 0..) |p, j| w.inv.items[p] = @intCast(j);
-            if (G == ops.MlxOps and mlx.streamIsGpu(g.s) and @rem(self.hidden, 4) == 0) {
+            if (comptime G == ops.MlxOps) if (self.combine_kernel) |kern| {
                 const inv = try g.hostArray(std.mem.sliceAsBytes(w.inv.items), &.{@intCast(n_ids)}, .uint32);
-                return combineOnGpu(&self.combine_kernel, g, &.{joined}, inv, scores, n, k, self.hidden, g.dtypeOf(x));
-            }
+                return combineOnGpu(kern, g, &.{joined}, inv, scores, n, k, self.hidden, g.dtypeOf(x));
+            };
             var outs: std.ArrayList(T) = .empty;
             defer outs.deinit(a);
             const ts: u32 = @intCast(glm.combine_slice_tokens);
@@ -1135,10 +1162,8 @@ test "glm experts: the wide lane's GPU combine over its parts equals the op chai
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(a, s);
     defer g.deinit();
-    var slot: ?mlx.mlx_fast_metal_kernel = null;
-    defer if (slot) |kern| {
-        _ = mlx.mlx_fast_metal_kernel_free(kern);
-    };
+    const kern = try buildCombine();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
     const n: u32 = 300;
     const k: u32 = glm.routed_top_k;
     const hidden: c_int = 6144;
@@ -1169,7 +1194,7 @@ test "glm experts: the wide lane's GPU combine over its parts equals the op chai
         l.* = pi << 24 | (r - @as(u32, @intCast(cuts[pi])));
     }
     const loc = try g.hostArray(std.mem.sliceAsBytes(locv), &.{@intCast(n * k)}, .uint32);
-    const got = try combineOnGpu(&slot, &g, &parts, loc, scores, n, k, hidden, .bfloat16);
+    const got = try combineOnGpu(kern, &g, &parts, loc, scores, n, k, hidden, .bfloat16);
     const y = try g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), hidden });
     const want = try g.astype(try g.sum(try g.mul(y, try g.expandDims(scores, -1)), -2, false), .bfloat16);
     const same = try g.astype(try g.equal(got, want), .float32);

@@ -289,10 +289,10 @@ pub const Carry = struct {
 /// The indexer of full layer `l` over the forward's rows: per query block the top `index_topk` keys by the fp32
 /// score (relu'd per head, weighted by `weights_proj` at `n_heads^-0.5 * head_dim^-0.5`, summed over heads), masked
 /// causally in a block of several rows (a one-row block's keys all precede its row); argpartition's ids in its order
-/// (`glm_moe_dsa_topk` where it serves the shape: a block of several rows alone, the one-row blocks of a verify in one
-/// launch, `topk_mod.max_rows` at a time); null where the block's keys fit `index_topk` (every causal key is attended).
-/// Kept in `carry`.
-pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, rows: u32, carry: *Carry) !void {
+/// (on the top-k kernels when the construction's route took them, `tk`: a block of several rows alone, the one-row
+/// blocks of a verify in one launch, `topk_mod.max_rows` at a time; null: argpartition's own); null where the block's
+/// keys fit `index_topk` (every causal key is attended). Kept in `carry`.
+pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, rows: u32, carry: *Carry, tk: ?*const topk_mod.Kernels) !void {
     const keys = start + rows;
     const topk = c.index_topk;
     if (keys <= topk) {
@@ -327,34 +327,35 @@ pub fn select(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, 
             held[n_held] = .{ .i = i, .s = g.keep(s) };
             n_held += 1;
             if (n_held == held.len) {
-                try selectRows(g, topk, carry, held[0..n_held]);
+                try selectRows(g, topk, carry, held[0..n_held], tk);
                 for (held[0..n_held]) |h| g.release(h.s);
                 n_held = 0;
             }
             continue;
         }
         s = try g.where(try causalMask(g, start + b0, b1 - b0, nb), s, try g.scalar(-std.math.inf(f64), .float32));
-        const idx = if (try topk_mod.topk(g, try g.reshape(s, &.{ 1, r, @intCast(nb) }), topk)) |t| try g.reshape(t, &.{ 1, 1, r, @intCast(topk) }) else blk: {
+        const idx = if (tk) |ks| try g.reshape(try ks.topk(g, try g.reshape(s, &.{ 1, r, @intCast(nb) }), topk), &.{ 1, 1, r, @intCast(topk) }) else blk: {
             const kth: c_int = @intCast(nb - topk);
             break :blk try lastSlice(g, try g.argpartition(s, kth, -1), kth, @intCast(nb));
         };
         carry.set(g, i, idx);
     }
-    if (n_held > 0) try selectRows(g, topk, carry, held[0..n_held]);
+    if (n_held > 0) try selectRows(g, topk, carry, held[0..n_held], tk);
 }
 
 /// A one-row block's scores `[1, 1, 1, keys]` held for `selectRows`, and its block.
 const Held = struct { i: usize, s: T };
 
-/// The top `topk` ids of each held one-row block in one launch (`topk_mod.topkRows`), each block's `[1, 1, 1, topk]`
-/// int32 in `carry`; argpartition's per block where the kernel does not serve `topk`.
-fn selectRows(g: *G, topk: u32, carry: *Carry, held: []const Held) !void {
+/// The top `topk` ids of each held one-row block in one launch (`Kernels.topkRows`, the construction's route `tk`),
+/// each block's `[1, 1, 1, topk]` int32 in `carry`; argpartition's per block without the kernels (`tk` null).
+fn selectRows(g: *G, topk: u32, carry: *Carry, held: []const Held, tk: ?*const topk_mod.Kernels) !void {
     const m = g.mark();
     defer g.resetTo(m);
     var ss: [topk_mod.max_rows]T = undefined;
     for (held, 0..) |h, j| ss[j] = h.s;
     const k: c_int = @intCast(topk);
-    if (try topk_mod.topkRows(g, ss[0..held.len], topk)) |ids| {
+    if (tk) |ks| {
+        const ids = try ks.topkRows(g, ss[0..held.len], topk);
         for (held, 0..) |h, j| {
             const jr: c_int = @intCast(j);
             carry.set(g, h.i, try g.reshape(try g.slice(ids, &.{ jr, 0 }, &.{ jr + 1, k }, &.{ 1, 1 }), &.{ 1, 1, 1, k }));
@@ -404,7 +405,7 @@ pub const SpanWindow = struct {
 /// on the tensor units (f32, the products of the same bf16 values accumulated in f32), the top `index_topk` kept as
 /// i32 ids `[1, rows, index_topk]` (`glm_moe_dsa_topk`: argpartition's ids in its order); null where the span's keys
 /// fit `index_topk`.
-fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, carry: *Carry, win: *SpanWindow) !void {
+fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T, start: u32, carry: *Carry, win: *SpanWindow, tk: ?*const topk_mod.Kernels) !void {
     const topk = c.index_topk;
     const ih: c_int = @intCast(c.index_n_heads);
     const ihd: c_int = @intCast(c.index_head_dim);
@@ -429,8 +430,8 @@ fn selectSpans(g: *G, c: *const glm.Config, ix: Indexer, x: T, iq: T, ik_all: T,
         const wb = try g.reshape(try g.slice(wts, &.{ @intCast(b0), 0 }, &.{ @intCast(b1), ih }, &.{ 1, 1 }), &.{ 1, r, ih });
         const kb = try g.slice(ik, &.{ 0, 0, 0 }, &.{ 1, @intCast(nb), ihd }, &.{ 1, 1, 1 });
         const scores = try g.adopt((try dsa.indexerScores(g.s, qb, wb, kb, @intCast(start + b0), 1)) orelse return error.DsaKernelDeclined);
-        // argpartition's ids in its order, by the top-k kernel where it serves the shape.
-        const idx = (try topk_mod.topk(g, scores, topk)) orelse blk: {
+        // argpartition's ids in its order: on the top-k kernel where the construction's route took it.
+        const idx = if (tk) |ks| try ks.topk(g, scores, topk) else blk: {
             const kth: c_int = @intCast(nb - topk);
             break :blk try g.astype(try lastSlice(g, try g.argpartition(scores, kth, -1), kth, @intCast(nb)), .int32);
         };
@@ -549,7 +550,7 @@ pub const Form = enum { auto, per_row };
 /// appended, the indexer's selection made (full layers) or read from `carry` (shared), the output `[rows, hidden]`.
 /// `.per_row` takes a `Carry.perRow` (one block per row). A prompt (`.auto`) on the DSA kernels (`kernels`) runs
 /// `selectSpans` and `attendSpans`.
-pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, start: u32, rows: u32, cache: *Cache, carry: *Carry, form: Form, kernels: bool) !T {
+pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, start: u32, rows: u32, cache: *Cache, carry: *Carry, form: Form, kernels: bool, tk: ?*const topk_mod.Kernels) !T {
     const heads: c_int = @intCast(c.n_heads);
     const qhd: c_int = @intCast(c.qHeadDim());
     const n: c_int = @intCast(rows);
@@ -570,7 +571,7 @@ pub fn attention(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, x: T, st
     var win = SpanWindow.of(c.isFull(l), c.isSparse(l));
     if (lw.indexer) |ix| {
         const ik_all = try cache.indexView(g, l);
-        if (spans) try selectSpans(g, c, ix, x, q.iq.?, ik_all, start, carry, &win) else try select(g, c, ix, x, q.iq.?, ik_all, start, rows, carry);
+        if (spans) try selectSpans(g, c, ix, x, q.iq.?, ik_all, start, carry, &win, tk) else try select(g, c, ix, x, q.iq.?, ik_all, start, rows, carry, tk);
     }
     if (pt.enabled and prompt_form) {
         var sel: std.ArrayList(T) = .empty;
@@ -740,6 +741,9 @@ pub const Routes = struct {
     max_route_ids: u32 = 48,
     /// A prompt's attention on the DSA kernels (the module's probe passed on this device).
     dsa: bool = false,
+    /// The indexer's top-k on the GPU kernels (`glm_moe_dsa_topk.Kernels`, built and run once at construction where the
+    /// stream is the GPU's and the model's top-k is one the kernel serves); null: argpartition.
+    topk: ?*const topk_mod.Kernels = null,
     /// The wave probe, a diagnostic the module arms (`WaveProbe`); null: off.
     wave_probe: ?*WaveProbe = null,
 };
@@ -884,7 +888,7 @@ pub fn forwardRows(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const 
         errdefer ex.dropStaged();
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{}, .seed);
         const x = try rmsNorm(g, h, lw.input_norm, c.rms_norm_eps);
-        const h1 = try g.add(h, try attention(g, c, lw, l, x, start, rows, cache, &carry, if (want.verify) .per_row else .auto, rt.dsa));
+        const h1 = try g.add(h, try attention(g, c, lw, l, x, start, rows, cache, &carry, if (want.verify) .per_row else .auto, rt.dsa, rt.topk));
         if (pt.enabled and prompt) _ = try pt.phase(g, &.{h1}, .oproj);
         if (probe) |p| {
             try g.evalAll(&.{h1});
@@ -1031,6 +1035,9 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
     if (!try dsaKernelsRun(a, s, &c)) return error.SkipZigTest;
     var g = try G.init(a, s);
     defer g.deinit();
+    // The top-k kernels the served route builds on a GPU stream, in both arms (the selection's route).
+    var ks = try topk_mod.Kernels.build(&g, c.index_topk);
+    defer ks.deinit();
     var prng = std.Random.DefaultPrng.init(53);
     const tw: TestWeights = .{ .rand = prng.random() };
     const hid: c_int = @intCast(c.hidden_size);
@@ -1048,7 +1055,7 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
             var carry = try Carry.init(a, &c, cl[1], cl[0] + cl[1], kernels);
             defer carry.deinit(&g);
             for (&layers, 0..) |*lw, l| {
-                const y = try attention(&g, &c, lw, @intCast(l), x, cl[0], cl[1], &cache, &carry, .auto, kernels);
+                const y = try attention(&g, &c, lw, @intCast(l), x, cl[0], cl[1], &cache, &carry, .auto, kernels, &ks);
                 const yf = try g.astype(y, .float32);
                 outs[arm][ci * 2 + l] = try testing.allocator.alloc(f32, @intCast(g.shapeOf(yf).numel()));
                 _ = try g.hostF32(yf, outs[arm][ci * 2 + l]);
@@ -1100,6 +1107,8 @@ test "glm attention: the reference indexer's top-k is the top-k kernel's (int32 
     defer _ = mlx.mlx_stream_free(s);
     var g = try G.init(a, s);
     defer g.deinit();
+    var ks = try topk_mod.Kernels.build(&g, c.index_topk);
+    defer ks.deinit();
     var prng = std.Random.DefaultPrng.init(57);
     const tw: TestWeights = .{ .rand = prng.random() };
     const hid: c_int = @intCast(c.hidden_size);
@@ -1125,7 +1134,7 @@ test "glm attention: the reference indexer's top-k is the top-k kernel's (int32 
         const ik_all = try cache.indexView(&g, 0);
         var carry = if (cl.verify) try Carry.perRow(a, cl.rows) else try Carry.init(a, &c, cl.rows, cl.start + cl.rows, false);
         defer carry.deinit(&g);
-        try select(&g, &c, ix, x, q.iq.?, ik_all, cl.start, cl.rows, &carry);
+        try select(&g, &c, ix, x, q.iq.?, ik_all, cl.start, cl.rows, &carry, &ks);
         // The same scores through argpartition, each block masked causally (a call of several rows).
         const scale = std.math.pow(f64, @floatFromInt(c.index_n_heads), -0.5) * std.math.pow(f64, @floatFromInt(c.index_head_dim), -0.5);
         const wts = try g.mul(try g.astype(try linear(&g, x, ix.weights_proj), .float32), try g.scalar(scale, .float32));
@@ -1167,6 +1176,8 @@ test "glm attention: the verify's rows through embed_q and unembed_out at once e
     defer _ = mlx.mlx_stream_free(s);
     var g = try G.init(a, s);
     defer g.deinit();
+    var ks = try topk_mod.Kernels.build(&g, c.index_topk);
+    defer ks.deinit();
     var prng = std.Random.DefaultPrng.init(55);
     const tw: TestWeights = .{ .rand = prng.random() };
     const hid: c_int = @intCast(c.hidden_size);
@@ -1190,14 +1201,14 @@ test "glm attention: the verify's rows through embed_q and unembed_out at once e
             defer carry.deinit(&g);
             for (&layers, 0..) |*lw, li| {
                 const l: u32 = @intCast(li);
-                const y = if (arm == 0) try attention(&g, &c, lw, l, x, start, rows, &cache, &carry, .per_row, false) else blk: {
+                const y = if (arm == 0) try attention(&g, &c, lw, l, x, start, rows, &cache, &carry, .per_row, false, &ks) else blk: {
                     // The row-by-row form: each row's absorbedRow, joined, through o.
                     const q = try queryOf(&g, &c, lw, x, start, rows);
                     const k = try keysOf(&g, &c, lw, x, start, rows);
                     try cache.append(&g, l, k.latent, k.k_pe, k.index);
                     const kv_all = try cache.latentView(&g, l);
                     const pe_all = try cache.ropeView(&g, l);
-                    if (lw.indexer) |ix| try select(&g, &c, ix, x, q.iq.?, try cache.indexView(&g, l), start, rows, &carry);
+                    if (lw.indexer) |ix| try select(&g, &c, ix, x, q.iq.?, try cache.indexView(&g, l), start, rows, &carry, &ks);
                     var per: [rows]T = undefined;
                     for (&per, 0..) |*o, i| {
                         const r: c_int = @intCast(i);

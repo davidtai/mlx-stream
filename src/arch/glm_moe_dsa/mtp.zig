@@ -27,6 +27,7 @@ const cache_mod = @import("cache.zig");
 const settings = @import("settings.zig");
 const acceptance = @import("../../sdk_ext.zig").acceptance;
 const exl3 = @import("exl3_bank.zig");
+const topk_mod = @import("topk.zig");
 
 const G = graph.G;
 const T = G.T;
@@ -551,6 +552,8 @@ pub fn Lane(comptime kind: BankKind) type {
         top_p: [max_depth]f32 = @splat(0),
         /// Logged once per request that the lane stopped tracking.
         untracked_logged: bool = false,
+        /// The indexer's top-k route the module built at its construction (`graph.Routes.topk`; null: argpartition).
+        topk: ?*const topk_mod.Kernels = null,
         /// MLX's active bytes the open added (its residents, its experts' arrays and their slot table), measured once:
         /// the module holds them to the bill's term (`glm_moe_dsa_bill.Mtp`).
         measured_bytes: u64 = 0,
@@ -684,7 +687,7 @@ pub fn Lane(comptime kind: BankKind) type {
             const q = try graph.queryOf(g, c, lw, a_in, pos, 1);
             var carry = try graph.Carry.init(a, c, 1, pos + 1, false);
             defer carry.deinit(g);
-            try graph.select(g, c, lw.indexer.?, a_in, q.iq.?, try self.cache.indexView(g, 0), pos, 1, &carry);
+            try graph.select(g, c, lw.indexer.?, a_in, q.iq.?, try self.cache.indexView(g, 0), pos, 1, &carry, self.topk);
             return if (carry.topk[0]) |t| g.keep(t) else null;
         }
 

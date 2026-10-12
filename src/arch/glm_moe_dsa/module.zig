@@ -36,6 +36,7 @@ const settings = @import("settings.zig");
 const bill_mod = @import("bill.zig");
 const split_mod = @import("split.zig");
 const graph = @import("graph.zig");
+const topk_mod = @import("topk.zig");
 const bank_mod = @import("bank.zig");
 const experts_mod = @import("experts.zig");
 const mtp_mod = @import("mtp.zig");
@@ -184,6 +185,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         /// Decode's window rows (`bill.decodeWindowRows`): a decode call over more routed ids is refused.
         window_ids: u32,
         routes: graph.Routes,
+        /// The indexer's top-k kernels where the construction's route takes them (`graph.Routes.topk`); built once.
+        topk_kernels: ?topk_mod.Kernels = null,
         overrides: Overrides,
         event: ?expert_event.Event = null,
         prev_cache_limit: usize = 0,
@@ -242,9 +245,13 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const gpu_target = host.ceiling -| host.wired_margin;
             const ram = sdk.memory.totalMemBytes();
             const max_context = bill_mod.servedContext(cfg);
-            // The prompt's attention form this device runs (the bill charges its arrays).
+            // The prompt's attention form this device runs (the bill charges its arrays), and the indexer's top-k route: the
+            // kernel on a GPU stream where it serves the model's top-k, else argpartition (the bill charges its ids).
             const dsa = try graph.dsaKernelsRun(gpa, s, model);
-            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag), .dsa = dsa, .gemm = comptime bill_mod.promptGemmOf(Q), .select = bill_mod.selectOf(model), .prompt_cache = bill_mod.prefillCacheBytes(ram), .size_classes = bill_mod.prompt_size_classes };
+            // The draft lane's bill (its pack refused by name here, before the stream is read).
+            const mtp_inputs = try bill_mod.mtpOf(gpa, io, cfg, mtp_kind, &diag);
+            const select: bill_mod.Select = if (topk_mod.serves(model.index_topk) and mlx.streamIsGpu(s)) .kernel else .argpartition;
+            const inputs: bill_mod.Inputs = .{ .model = model, .bank = bank.geometryOf(), .resident_bytes = resident_bytes, .stream = bill_mod.streamShape(cfg), .prompt_tokens = max_context, .decode_positions = bill_mod.maxPositions(cfg), .mtp = mtp_inputs, .dsa = dsa, .gemm = comptime bill_mod.promptGemmOf(Q), .select = select, .prompt_cache = bill_mod.prefillCacheBytes(ram), .size_classes = bill_mod.prompt_size_classes };
             const billed = bill_mod.billOf(inputs);
             const mb = try bill_mod.memoryBill(gpa, billed, null);
             errdefer mb.free(gpa);
@@ -344,7 +351,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.w = try graph.Weights.bind(gpa, weights, model, &diag);
             errdefer self.w.deinit(gpa);
             try self.residentsNow(weights);
-            self.ex = try Experts.init(gpa, &self.g, self.stream, self.math, model.hidden_size, .{ .gated = gated, .event = self.event, .wide_depth = shape.wide_depth });
+            self.ex = try Experts.init(gpa, &self.g, self.stream, self.math, model.hidden_size, .{ .gated = gated, .event = self.event, .wide_depth = shape.wide_depth, .combine_gpu = gpu and model.hidden_size % 4 == 0 });
             errdefer self.ex.deinit(&self.g);
             // The slot arrays are the quant's signature (every routed layer's base bank).
             for (self.ex.banks) |b| if (b[@backingInt(experts_mod.BankKind.base)]) |arr| try self.math.checkBank(&self.g, arr, &diag);
@@ -372,7 +379,11 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             const preloaded = try self.stream.preload(&pre, Preload.order);
             const pre_ns: u64 = @intCast(t_pre.untilNow(io, .awake).nanoseconds);
             log.info("glm_moe_dsa: preloaded {d} experts ({d:.2} GB) into the prompt rows in {d:.2} s\n", .{ preloaded, gigabytes(Reads.of(pre0, self.stream.stats()).ssd_bytes), seconds(pre_ns) });
-            self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa };
+            // The top-k kernels built and run once here where the route takes them, never inside a prompt.
+            if (select == .kernel) self.topk_kernels = try topk_mod.Kernels.build(&self.g, model.index_topk);
+            errdefer if (self.topk_kernels) |*k| k.deinit();
+            self.routes = .{ .read_ahead = true, .lookahead = true, .max_route_ids = shape.max_route_ids, .dsa = dsa, .topk = if (self.topk_kernels) |*k| k else null };
+            if (self.mtp) |ln| ln.topk = self.routes.topk;
             self.file_backed_start = file_backed_start;
             if (std.c.getenv(wave_probe_env) != null) {
                 self.probe = try gpa.create(graph.WaveProbe);
@@ -528,6 +539,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             if (self.recorder) |rec| rec.deinit();
             self.math.deinit(&self.g);
             if (comptime has_kernels) self.kset.deinit();
+            if (self.topk_kernels) |*k| k.deinit();
             self.w.deinit(self.gpa);
             self.bank.deinit();
             self.history.deinit(self.gpa);

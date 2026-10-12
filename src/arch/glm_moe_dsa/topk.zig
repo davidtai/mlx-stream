@@ -140,10 +140,6 @@ const body =
     \\    for (uint j = tid; j < uint(K); j += 1024u) out[ulong(row) * uint(K) + j] = int(uint(sel[j] & 0xffffffffu));
 ;
 
-var kernel: ?mlx.mlx_fast_metal_kernel = null;
-/// `topkRows`' kernels, one per row count (its inputs `s0 ..`).
-var rows_kernels: [max_rows]?mlx.mlx_fast_metal_kernel = @splat(null);
-
 /// The most rows `topkRows` takes in one launch: its lengths ride in `params`' eight slots (a verify has at most
 /// `max_route_ids / n_experts_per_tok` = 6 rows).
 pub const max_rows = 8;
@@ -153,97 +149,109 @@ pub fn serves(k: u32) bool {
     return k > 0 and k <= 2048 and std.math.isPowerOfTwo(k);
 }
 
-/// The ids `[1, rows, k]` (int32) of each row's `k` largest scores (`scores` `[1, rows, n]` f32, row-contiguous,
-/// `k < n`), as `argpartition(scores, n - k)[..., n - k:]` orders them; null where the kernel does not serve the
-/// shape (`k` not a power of two up to 2048, or a row of 2^31 or more) or the stream is not the GPU's.
-pub fn topk(g: *G, scores: T, k: u32) !?T {
-    if (!mlx.streamIsGpu(g.s)) return null;
-    const sh = g.shapeOf(scores);
-    if (sh.n != 3 or sh.dim(0) != 1) return null;
-    const rows = sh.dim(1);
-    const n = sh.dim(2);
-    if (!serves(k) or n <= k or g.dtypeOf(scores) != .float32) return null;
-    const kern = kernel orelse blk: {
-        const ins = [_][*:0]const u8{ "scores", "params" };
-        const outs = [_][*:0]const u8{"out"};
-        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
-        defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
-        defer _ = mlx.mlx_vector_string_free(ov);
-        const kn = mlx.mlx_fast_metal_kernel_new("glm_moe_dsa_topk", iv, ov, source, "", true, false);
-        if (kn.ctx == null) return error.MetalKernelCompileFailed;
-        kernel = kn;
-        break :blk kn;
+/// The top-k kernels of one load, built at its construction (`build`: each compiled and run once at the model's top-k,
+/// the construction's acceptance), never inside a prompt. The module builds them only where the route takes them (a GPU
+/// stream, a top-k the kernel serves, `serves`); elsewhere the graph's route is argpartition.
+pub const Kernels = struct {
+    one: mlx.mlx_fast_metal_kernel,
+    rows: [max_rows]mlx.mlx_fast_metal_kernel,
+
+    pub fn build(g: *G, k: u32) !Kernels {
+        std.debug.assert(serves(k) and mlx.streamIsGpu(g.s));
+        var ks: Kernels = .{ .one = try newKernel("glm_moe_dsa_topk", &.{ "scores", "params" }, source), .rows = undefined };
+        var built: usize = 0;
+        errdefer {
+            _ = mlx.mlx_fast_metal_kernel_free(ks.one);
+            for (ks.rows[0..built]) |kn| _ = mlx.mlx_fast_metal_kernel_free(kn);
+        }
+        inline for (1..max_rows + 1) |nr| {
+            const ins = comptime names: {
+                var v: [nr + 1][]const u8 = undefined;
+                for (0..nr) |i| v[i] = std.fmt.comptimePrint("s{d}", .{i});
+                v[nr] = "params";
+                break :names v;
+            };
+            ks.rows[nr - 1] = try newKernel(std.fmt.comptimePrint("glm_moe_dsa_topk_rows{d}", .{nr}), &ins, comptime rowsSource(nr));
+            built += 1;
+        }
+        // The acceptance: one launch of each at the model's top-k over k + 1 zeros (ties throughout), evaluated.
+        const m = g.mark();
+        defer g.resetTo(m);
+        const n: c_int = @intCast(k + 1);
+        var outs: [max_rows + 1]T = undefined;
+        outs[0] = try ks.topk(g, try g.zeros(&.{ 1, 1, n }, .float32), k);
+        var rows: [max_rows]T = undefined;
+        for (&rows) |*r| r.* = try g.zeros(&.{ 1, 1, 1, n }, .float32);
+        for (1..max_rows + 1) |nr| outs[nr] = try ks.topkRows(g, rows[0..nr], k);
+        try g.evalAll(&outs);
+        return ks;
+    }
+
+    pub fn deinit(ks: *Kernels) void {
+        _ = mlx.mlx_fast_metal_kernel_free(ks.one);
+        for (ks.rows) |kn| _ = mlx.mlx_fast_metal_kernel_free(kn);
+        ks.* = undefined;
+    }
+
+    /// The ids `[1, rows, k]` (int32) of each row's `k` largest scores (`scores` `[1, rows, n]` f32, row-contiguous,
+    /// `k < n`), as `argpartition(scores, n - k)[..., n - k:]` orders them. The route's invariants (a GPU stream, `k`
+    /// served, f32 scores of one leading row, more keys than `k`) are the callers': asserted, never re-checked.
+    pub fn topk(ks: *const Kernels, g: *G, scores: T, k: u32) !T {
+        const sh = g.shapeOf(scores);
+        std.debug.assert(sh.n == 3 and sh.dim(0) == 1 and g.dtypeOf(scores) == .float32 and serves(k) and sh.dim(2) > k);
+        const rows = sh.dim(1);
+        // Eight slots: an input of fewer is bound in the constant address space.
+        const pv = [8]i32{ sh.dim(2), 0, 0, 0, 0, 0, 0, 0 };
+        const params = try g.hostArray(std.mem.sliceAsBytes(&pv), &.{8}, .int32);
+        return launch(g, ks.one, &.{ scores, params }, &[_]c_int{ 1, rows, @intCast(k) }, rows, k);
+    }
+
+    /// The ids `[rows.len, k]` (int32) of each row's `k` largest scores, `rows[r]` one row of `n_r > k` f32 scores
+    /// (`[..., n_r]`, every leading dim 1; the lengths may differ), as `topk` gives them, every row in one launch (a row's
+    /// threadgroup reads its own input). The invariants are the callers', asserted.
+    pub fn topkRows(ks: *const Kernels, g: *G, rows: []const T, k: u32) !T {
+        std.debug.assert(rows.len > 0 and rows.len <= max_rows and serves(k));
+        var pv: [8]i32 = @splat(0);
+        for (rows, 0..) |r, i| {
+            const sh = g.shapeOf(r);
+            const n = sh.dim(-1);
+            std.debug.assert(sh.numel() == n and n > k and g.dtypeOf(r) == .float32);
+            pv[i] = n;
+        }
+        const params = try g.hostArray(std.mem.sliceAsBytes(&pv), &.{8}, .int32);
+        var inputs: [max_rows + 1]T = undefined;
+        @memcpy(inputs[0..rows.len], rows);
+        inputs[rows.len] = params;
+        const nr: c_int = @intCast(rows.len);
+        return launch(g, ks.rows[rows.len - 1], inputs[0 .. rows.len + 1], &[_]c_int{ nr, @intCast(k) }, nr, k);
+    }
+};
+
+fn newKernel(comptime name: [:0]const u8, comptime ins: []const []const u8, src: [:0]const u8) !mlx.mlx_fast_metal_kernel {
+    const in_names = comptime blk: {
+        var v: [ins.len][*:0]const u8 = undefined;
+        for (ins, 0..) |n, i| v[i] = (n ++ "\x00")[0..n.len :0];
+        break :blk v;
     };
-    // Eight slots: an input of fewer is bound in the constant address space.
-    const pv = [8]i32{ n, 0, 0, 0, 0, 0, 0, 0 };
-    const params = try g.hostArray(std.mem.sliceAsBytes(&pv), &.{8}, .int32);
+    const outs = [_][*:0]const u8{"out"};
+    const iv = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const kn = mlx.mlx_fast_metal_kernel_new(name, iv, ov, src, "", true, false);
+    if (kn.ctx == null) return error.MetalKernelCompileFailed;
+    return kn;
+}
+
+/// One launch of `kern` over `inputs` with an int32 output of `out_shape` (1024 threads per row, `K` = `k`).
+fn launch(g: *G, kern: mlx.mlx_fast_metal_kernel, inputs: []const T, out_shape: []const c_int, rows: c_int, k: u32) !T {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, @intCast(k) }, 3, .int32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, out_shape.ptr, out_shape.len, .int32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1024, rows, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", @intCast(k)));
-    const inputs = [_]mlx.mlx_array{ scores, params };
-    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
-    defer _ = mlx.mlx_vector_array_free(iv);
-    var ov = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
-    var out = mlx.mlx_array_new();
-    mlx.check(mlx.mlx_vector_array_get(&out, ov, 0)) catch |e| {
-        _ = mlx.mlx_array_free(out);
-        return e;
-    };
-    return try g.adopt(out);
-}
-
-/// The ids `[rows.len, k]` (int32) of each row's `k` largest scores, `rows[r]` one row of `n_r > k` f32 scores
-/// (`[..., n_r]`, every leading dim 1; the lengths may differ), as `topk` gives them, every row in one launch (a row's
-/// threadgroup reads its own input); null where the kernel does not serve the shape or the stream is not the GPU's.
-pub fn topkRows(g: *G, rows: []const T, k: u32) !?T {
-    std.debug.assert(rows.len > 0 and rows.len <= max_rows);
-    if (!serves(k) or !mlx.streamIsGpu(g.s)) return null;
-    var pv: [8]i32 = @splat(0);
-    for (rows, 0..) |r, i| {
-        const sh = g.shapeOf(r);
-        const n = sh.dim(-1);
-        if (sh.numel() != n or n <= k or g.dtypeOf(r) != .float32) return null;
-        pv[i] = n;
-    }
-    inline for (1..max_rows + 1) |nr| if (rows.len == nr) return try launchRows(nr, g, rows, &pv, k);
-    unreachable;
-}
-
-fn launchRows(comptime nr: usize, g: *G, rows: []const T, pv: *const [8]i32, k: u32) !T {
-    const kern = rows_kernels[nr - 1] orelse blk: {
-        const ins = comptime names: {
-            var v: [nr + 1][*:0]const u8 = undefined;
-            for (0..nr) |i| v[i] = std.fmt.comptimePrint("s{d}", .{i});
-            v[nr] = "params";
-            break :names v;
-        };
-        const outs = [_][*:0]const u8{"out"};
-        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
-        defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
-        defer _ = mlx.mlx_vector_string_free(ov);
-        const kn = mlx.mlx_fast_metal_kernel_new(std.fmt.comptimePrint("glm_moe_dsa_topk_rows{d}", .{nr}), iv, ov, comptime rowsSource(nr), "", true, false);
-        if (kn.ctx == null) return error.MetalKernelCompileFailed;
-        rows_kernels[nr - 1] = kn;
-        break :blk kn;
-    };
-    const params = try g.hostArray(std.mem.sliceAsBytes(pv), &.{8}, .int32);
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ @intCast(nr), @intCast(k) }, 2, .int32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1024, @intCast(nr), 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", @intCast(k)));
-    var inputs: [nr + 1]mlx.mlx_array = undefined;
-    @memcpy(inputs[0..nr], rows);
-    inputs[nr] = params;
-    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
@@ -266,6 +274,8 @@ test "glm topk: each row's k largest scores in argpartition's ids and order, tie
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var g = try G.init(a, s);
     defer g.deinit();
+    var ks = try Kernels.build(&g, 2048);
+    defer ks.deinit();
     var prng = std.Random.DefaultPrng.init(17);
     const rand = prng.random();
     var checked: usize = 0;
@@ -299,7 +309,7 @@ test "glm topk: each row's k largest scores in argpartition's ids and order, tie
             };
         }
         const sc = try g.hostArray(std.mem.sliceAsBytes(v), &.{ 1, @intCast(cs.rows), @intCast(cs.n) }, .float32);
-        const got = (try topk(&g, sc, cs.k)).?;
+        const got = try ks.topk(&g, sc, cs.k);
         const kth: c_int = @intCast(cs.n - cs.k);
         const want = try g.astype(try lastSlice(&g, try g.argpartition(sc, kth, -1), kth, @intCast(cs.n)), .int32);
         const gv = try a.alloc(u32, cs.rows * cs.k);
@@ -322,6 +332,8 @@ test "glm topk: rows of their own lengths in one launch, each its k largest in a
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var g = try G.init(a, s);
     defer g.deinit();
+    var ks = try Kernels.build(&g, 2048);
+    defer ks.deinit();
     var prng = std.Random.DefaultPrng.init(19);
     const rand = prng.random();
     const k: u32 = 2048;
@@ -349,7 +361,7 @@ test "glm topk: rows of their own lengths in one launch, each its k largest in a
             const kth: c_int = @intCast(n - k);
             want[r] = try g.astype(try lastSlice(&g, try g.reshape(try g.argpartition(rows[r], kth, -1), &.{ 1, 1, @intCast(n) }), kth, @intCast(n)), .uint32);
         }
-        const got = (try topkRows(&g, rows[0..lens.len], k)).?;
+        const got = try ks.topkRows(&g, rows[0..lens.len], k);
         try testing.expect(g.dtypeOf(got) == .int32);
         const gv = try a.alloc(u32, lens.len * k);
         defer a.free(gv);
