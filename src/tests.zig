@@ -37,6 +37,8 @@ comptime {
     _ = @import("arch/mimo_v2/gpu_warm.zig");
     _ = @import("arch/mimo_v2/gpu_power.zig");
     _ = @import("arch/mimo_v2/gpu_warm_test.zig");
+    _ = @import("arch/glm5_next/bank.zig");
+    _ = @import("arch/glm5_next/bank_test.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");
