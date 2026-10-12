@@ -216,11 +216,11 @@ The prompt runs whole, in calls of up to 16,384 rows. Per routed layer:
 
 `python3 scripts/mimo_charts.py` draws these from the cells behind the README's measured lines (MiMo-V2.6-Flash).
 
-![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on 746e7da9, with b00df80e from 32K to 256K](img/mimo-ladder.png)
+![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on 746e7da9](img/mimo-ladder.png)
 
-The card ladder on `746e7da9` (this tree at `8e7d186`); `b00df80e` ran MLX's stock attention past 32,768 context. The
-binary of record, `4b018c54` (this tree at `05fc760`), differs from `746e7da9` only by the hot-path audit and the dead
-code sweep and reproduces its 16K cell token for token (stamp16k-g15-20261011: 998.8 / 32.30 tok/s, 688 tokens).
+The card ladder on `746e7da9` (this tree at `8e7d186`). The binary of record, `4b018c54` (this tree at `05fc760`),
+differs from `746e7da9` only by the hot-path audit and the dead code sweep and reproduces its 16K cell token for token
+(stamp16k-g15-20261011: 998.8 / 32.30 tok/s, 688 tokens).
 
 **Full 1K–1M sweep.** The card ladder on `746e7da9` in mlx-serve's benchmark format: one line chart per metric
 against requested context, with TTFT, both memory peaks and the answer lengths.

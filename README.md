@@ -270,12 +270,10 @@ complete and stopped on EOS.
 
 Prompt lengths are the fixtures', rendered for thinking off; thinking on drops their trailing `<think></think>`, so
 each request carries 2 tokens fewer. The 1K prefill figure is the cold first request: fixed startup dominates its
-11 s TTFT. The same ladder on `b00df80e`, which installed MLX's stock attention past 32,768 context, read
-753.5 / 24.4 at 32K, 661.8 / 21.1 at 64K, 488.0 / 15.8 at 128K and 311.3 / 9.6 at 256K (prefill / decode, tok/s);
-the attention kernels are now the defaults at every served context. The bf16res tier has not been measured on these
-builds.
+11 s TTFT. The attention kernels are the defaults at every served context, to the checkpoint's 1,048,576 keys. The
+bf16res tier has not been measured on these builds.
 
-![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on 746e7da9, with b00df80e from 32K to 256K](docs/img/mimo-ladder.png)
+![Card ladder prefill and decode tok/s from 1K to 1M prompt tokens on 746e7da9](docs/img/mimo-ladder.png)
 
 [![1K–1M sweep summary on 746e7da9: decode, prefill, TTFT, memory peaks and completion tokens](docs/benchmarks/mimo-v26-flash/summary.png)](docs/benchmarks/mimo-v26-flash/README.md)
 

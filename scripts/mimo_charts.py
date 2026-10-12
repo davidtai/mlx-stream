@@ -38,11 +38,6 @@ LADDER = {
     "512K": (296.1, 15.4), "1M": (179.6, 9.6),
 }
 
-# The previous binary b00df80e (this tree d3a8555), MLX's stock attention above 32,768 served context, on the rungs
-# past that context. Up to 16K prompts (32,768 context) it installs the binary 746e7da9's routes.
-# Source: cells/ladder2-20261011 (summary.txt LADDER_ROW lines; 256K: chain.log RUNG_END r09-256k).
-LADDER_PREVIOUS = {"32K": (753.5, 24.4), "64K": (661.8, 21.1), "128K": (488.0, 15.8), "256K": (311.3, 9.6)}
-
 # Served cells on the standard 16K prompt (served context 32,768): (sampling, answer, rows prompt/decode,
 # prefill tok/s, decode tok/s).
 # Sources: the card pair and the greedy pair: cells/card4-20261011 (c-def-1/2 and g-def-1/2, means of 2; binary
@@ -130,28 +125,20 @@ def note(fig, text, y=0.025):
 
 
 def ladder():
-    fig = figure("Attention kernels at every context remove the 32K cliff",
+    fig = figure("Decode holds about 30 tok/s to 64K and serves 1M at 9.6",
                  "Prefill and decode tok/s by prompt length, MiMo-V2.6-Flash, M5 Max 128 GB. "
                  "1K prefill = the cold first request.")
     panels = ((axes(fig, [0.09, 0.50, 0.88, 0.28], 1250, [0, 500, 1000], "prefill (tok/s)"), 0),
               (axes(fig, [0.09, 0.12, 0.88, 0.28], 40, [0, 10, 20, 30], "decode (tok/s)"), 1))
-    w, off = 0.42, 0.22
     for ax, k in panels:
         for i, rung in enumerate(RUNGS):
-            x = i
-            if rung in LADDER_PREVIOUS:
-                old = LADDER_PREVIOUS[rung][k]
-                ax.bar(i - off, old, w, color=ORANGE, zorder=3)
-                label(ax, i - off, old, num(old), size=14, weight="normal", color=INK2)
-                x = i + off
-            ax.bar(x, LADDER[rung][k], w, color=BLUE, zorder=3)
-            label(ax, x, LADDER[rung][k], num(LADDER[rung][k]), size=14)
+            ax.bar(i, LADDER[rung][k], 0.6, color=BLUE, zorder=3)
+            label(ax, i, LADDER[rung][k], num(LADDER[rung][k]), size=16)
         ax.set_xticks(range(len(RUNGS)))
         ax.set_xticklabels(RUNGS, fontsize=19)
         ax.set_xlim(-0.55, len(RUNGS) - 0.45)
     panels[1][0].set_xlabel("prompt tokens", fontsize=20, labelpad=10)
-    legend(fig, [(BLUE, "746e7da9 (plugin 8e7d186): kernels at every context"),
-                 (ORANGE, "b00df80e: stock MLX attention above 32,768 context")])
+    legend(fig, [(BLUE, "746e7da9 (plugin 8e7d186): kernels at every context")])
     return fig
 
 
