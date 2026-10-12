@@ -5,6 +5,7 @@
 //! so its test runs only on a GPU machine (on a GPU machine).
 
 const std = @import("std");
+const kset = @import("../../sdk_ext/kernel_set.zig");
 const mlx = @import("sdk").mlx;
 const model = @import("host.zig").model;
 /// Bank shards open past the page cache (F_NOCACHE): a test's reads leave no credited cache behind
@@ -831,9 +832,7 @@ pub const Runner = struct {
             if (@as(u64, @intCast(gd)) != td) same = false;
         };
         if (!same) return self.record(key, t, .{}, try std.fmt.allocPrint(a, "zig {s} {any} vs dump {s} {any}", .{ @tagName(got_dt), got_shape, d.dtype, d.shape }));
-        var h: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(try hostBytes(g, x), &h, .{});
-        const hex = std.fmt.bytesToHex(h, .lower);
+        const hex = kset.shaHex(try hostBytes(g, x));
         var numel: u64 = 1;
         for (t.shape[0..t.rank]) |v| numel *= v;
         const differs = !std.mem.eql(u8, &hex, d.sha256);

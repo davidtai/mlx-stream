@@ -24,7 +24,7 @@ const mimo = @import("config.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
 const Kernel = mlx.mlx_fast_metal_kernel;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const kset = @import("../../sdk_ext/kernel_set.zig");
 
 pub const Tier = enum { kernels, stock, invalid };
 
@@ -70,15 +70,9 @@ pub const text_pins = [_]struct { file: []const u8, text: []const u8, sha256: []
     .{ .file = "dec_attn_window.metal", .text = texts.window, .sha256 = "8b83077c17db8a2f0ead905fb547625538d83972e806ee88c570c0d762aa54ba" },
 };
 
-fn hexOf(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
-
 pub fn checkPins() !void {
-    if (!std.mem.eql(u8, &hexOf(texts.manifest), manifest_sha256)) return error.MimoDecodeAttentionManifestNotPinned;
-    for (text_pins) |p| if (!std.mem.eql(u8, &hexOf(p.text), p.sha256)) return error.MimoDecodeAttentionTextNotPinned;
+    if (!std.mem.eql(u8, &kset.shaHex(texts.manifest), manifest_sha256)) return error.MimoDecodeAttentionManifestNotPinned;
+    for (text_pins) |p| if (!std.mem.eql(u8, &kset.shaHex(p.text), p.sha256)) return error.MimoDecodeAttentionTextNotPinned;
 }
 
 /// The geometry the texts are written for; anything else is refused at construction.

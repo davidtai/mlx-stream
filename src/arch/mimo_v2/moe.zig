@@ -588,18 +588,10 @@ pub fn k1Members(ids: []const u32, e: usize, maxm: u32, mem: []u32) u32 {
 
 const testing = std.testing;
 
-fn hex(digest: [32]u8) [64]u8 {
-    return std.fmt.bytesToHex(digest, .lower);
-}
-
-fn sha(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
-    return hex(d);
-}
+const shaHex = @import("../../sdk_ext/kernel_set.zig").shaHex;
 
 test "mimo moe registry: the manifest pins every embedded text and the pin is the manifest's sha256" {
-    try testing.expectEqualStrings(manifest_sha256, &sha(texts.manifest));
+    try testing.expectEqualStrings(manifest_sha256, &shaHex(texts.manifest));
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, texts.manifest, .{});
     defer parsed.deinit();
     const m = parsed.value.object;
@@ -621,13 +613,13 @@ test "mimo moe registry: the manifest pins every embedded text and the pin is th
     for (pinned) |p| {
         var found = false;
         for (m.get("headers").?.array.items) |h| if (std.mem.eql(u8, h.object.get("file").?.string, p.file)) {
-            try testing.expectEqualStrings(h.object.get("sha256").?.string, &sha(p.text));
+            try testing.expectEqualStrings(h.object.get("sha256").?.string, &shaHex(p.text));
             found = true;
         };
         for (m.get("kernels").?.array.items) |k| {
             const s = k.object.get("source").?.object;
             if (std.mem.eql(u8, s.get("file").?.string, p.file)) {
-                try testing.expectEqualStrings(s.get("sha256").?.string, &sha(p.text));
+                try testing.expectEqualStrings(s.get("sha256").?.string, &shaHex(p.text));
                 try testing.expect(k.object.get("ensure_row_contiguous").?.bool);
                 found = true;
             }

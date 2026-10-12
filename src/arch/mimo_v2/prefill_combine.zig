@@ -404,21 +404,17 @@ fn expectWords(name: []const u8, want: []const u16, got: []const u16) !void {
 
 const testing = std.testing;
 
-fn sha(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
+const shaHex = @import("../../sdk_ext/kernel_set.zig").shaHex;
 
 test "mimo prefill combine registry: the manifest pins the header and the text, and the pin is the manifest's sha256" {
-    try testing.expectEqualStrings(manifest_sha256, &sha(texts.manifest));
+    try testing.expectEqualStrings(manifest_sha256, &shaHex(texts.manifest));
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, texts.manifest, .{});
     defer parsed.deinit();
     const m = parsed.value.object;
     const hs = m.get("headers").?.array.items;
     try testing.expectEqual(@as(usize, 1), hs.len);
     try testing.expectEqualStrings("header_mimo_prefill_combine.metal", hs[0].object.get("file").?.string);
-    try testing.expectEqualStrings(hs[0].object.get("sha256").?.string, &sha(texts.header));
+    try testing.expectEqualStrings(hs[0].object.get("sha256").?.string, &shaHex(texts.header));
     const ks = m.get("kernels").?.array.items;
     try testing.expectEqual(@as(usize, 2), ks.len);
     // Both kernels are the one text (P7 `inplace`: its table form): one source file, one sha.
@@ -426,7 +422,7 @@ test "mimo prefill combine registry: the manifest pins the header and the text, 
         const k = kv.object;
         try testing.expectEqualStrings(kname, k.get("name").?.string);
         try testing.expectEqualStrings("mimo_prefill_combine.metal", k.get("source").?.object.get("file").?.string);
-        try testing.expectEqualStrings(k.get("source").?.object.get("sha256").?.string, &sha(texts.combine));
+        try testing.expectEqualStrings(k.get("source").?.object.get("sha256").?.string, &shaHex(texts.combine));
         try testing.expect(k.get("ensure_row_contiguous").?.bool);
         // The manifest's inputs are the form's buffer names, in order.
         const ins = k.get("inputs").?.array.items;

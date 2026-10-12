@@ -16,7 +16,7 @@ const mimo = @import("config.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
 const Kernel = mlx.mlx_fast_metal_kernel;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const kset = @import("../../sdk_ext/kernel_set.zig");
 
 pub const Route = enum { ops, fused, invalid };
 
@@ -57,15 +57,9 @@ pub const text_pins = [_]struct { file: []const u8, text: []const u8, sha256: []
     .{ .file = "mimo_glue_top8.metal", .text = texts.top8, .sha256 = "ec3124418c8d07f85ff8d788549c8d5e035605ce6adf17084f15e4f3550e40bd" },
 };
 
-pub fn hexOf(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
-
 pub fn checkPins() !void {
-    if (!std.mem.eql(u8, &hexOf(texts.manifest), manifest_sha256)) return error.MimoGlueManifestNotPinned;
-    for (text_pins) |p| if (!std.mem.eql(u8, &hexOf(p.text), p.sha256)) return error.MimoGlueTextNotPinned;
+    if (!std.mem.eql(u8, &kset.shaHex(texts.manifest), manifest_sha256)) return error.MimoGlueManifestNotPinned;
+    for (text_pins) |p| if (!std.mem.eql(u8, &kset.shaHex(p.text), p.sha256)) return error.MimoGlueTextNotPinned;
 }
 
 /// The geometry the texts are written for (hidden 4096, 256 experts, top 8, eps 1e-6); anything else is refused at
@@ -631,7 +625,7 @@ test "mimo glue CPU: the manifest and every K2 text match their pins" {
     defer m.deinit();
     var seen: usize = 0;
     for (text_pins) |p| {
-        try testing.expectEqualStrings(&hexOf(p.text), p.sha256);
+        try testing.expectEqualStrings(&kset.shaHex(p.text), p.sha256);
         for (m.value.headers) |h| if (std.mem.eql(u8, h.file, p.file)) {
             try testing.expectEqualStrings(p.sha256, h.sha256);
             try testing.expectEqual(p.text.len, h.bytes);

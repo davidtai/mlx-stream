@@ -362,9 +362,7 @@ pub fn KernelTrace(comptime R: type) type {
             const nd = &t.nodes.items[n];
             switch (nd.origin) {
                 .host => {
-                    var d: [32]u8 = undefined;
-                    std.crypto.hash.sha2.Sha256.hash(nd.bytes, &d, .{});
-                    const hex = std.fmt.bytesToHex(d, .lower);
+                    const hex = @import("kernel_set.zig").shaHex(nd.bytes);
                     try out.print(a, "host:{t}:", .{nd.dtype});
                     try shapeStr(out, a, nd.shape.slice());
                     try out.print(a, ":{s}", .{hex[0..16]});

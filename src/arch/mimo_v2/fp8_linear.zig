@@ -36,7 +36,7 @@ const prefill_attention = @import("prefill_attention.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
 const Kernel = mlx.mlx_fast_metal_kernel;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const kset = @import("../../sdk_ext/kernel_set.zig");
 const log = std.log.scoped(.mimo);
 
 /// The widest call the GEMV takes: decode, the MTP verify window (M = 4), a head's rows; M > 8 is the prompt GEMM.
@@ -61,15 +61,9 @@ pub const text_pins = [_]struct { file: []const u8, text: []const u8, sha256: []
     .{ .file = "mimo_fp8_dequant_bf16.metal", .text = texts.dequant, .sha256 = "6530ac20bf944f5c4153e62e467a1c89de104e52855f3dbba3a6d007ac06ffdb" },
 };
 
-fn hexOf(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
-
 pub fn checkPins() !void {
-    if (!std.mem.eql(u8, &hexOf(texts.manifest), manifest_sha256)) return error.MimoFp8ManifestNotPinned;
-    for (text_pins) |p| if (!std.mem.eql(u8, &hexOf(p.text), p.sha256)) return error.MimoFp8TextNotPinned;
+    if (!std.mem.eql(u8, &kset.shaHex(texts.manifest), manifest_sha256)) return error.MimoFp8ManifestNotPinned;
+    for (text_pins) |p| if (!std.mem.eql(u8, &kset.shaHex(p.text), p.sha256)) return error.MimoFp8TextNotPinned;
 }
 
 // ---- geometry (host arithmetic; CPU-tested at the real shapes) ----

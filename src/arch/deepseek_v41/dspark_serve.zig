@@ -5,6 +5,7 @@
 //! same pieces over the shell's loaded residents.
 
 const std = @import("std");
+const kset = @import("../../sdk_ext/kernel_set.zig");
 const v41 = @import("deepseek_v41.zig");
 const routes = @import("routes.zig");
 const eng = @import("engram.zig");
@@ -648,9 +649,7 @@ test "dsv41 dspark serve: the arm pins the draft subset by sha, charges the admi
     try tm.tmp.dir.writeFile(testing.io, .{ .sub_path = "subset.json", .data = text });
     var pbuf: [700]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/subset.json", .{tm.root});
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
+    const hex = kset.shaHex(text);
     var g = TraceOps.init(a);
     defer g.deinit();
     var opt = tm.options();
@@ -677,8 +676,7 @@ test "dsv41 dspark serve: the arm pins the draft subset by sha, charges the admi
     const other = "{\"format\": \"mlx-serve-expert-subset-v1\", \"n_experts\": 128, \"selected\": [[5]]}";
     try tm.tmp.dir.writeFile(testing.io, .{ .sub_path = "other.json", .data = other });
     var pbuf2: [700]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(other, &digest, .{});
-    const hex2 = std.fmt.bytesToHex(digest, .lower);
+    const hex2 = kset.shaHex(other);
     opt.draft_subset = .{ .path = try std.fmt.bufPrint(&pbuf2, "{s}/other.json", .{tm.root}), .sha256 = &hex2 };
     try testing.expectError(error.SubsetGeometry, TraceArm.init(a, testing.io, &g, {}, opt, &diag));
 }

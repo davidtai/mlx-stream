@@ -249,13 +249,13 @@ pub const TokenMap = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return refuse(diag, error.EngramTokenMap, "{s}: {s}", .{ tok_path, @errorName(e) }),
         };
-        if (!std.mem.eql(u8, &sha256Hex(tok), meta.tokenizer_sha256)) return refuse(diag, error.EngramTokenMap, "token map built from tokenizer {s}, the bank's tokenizer.json is {s}", .{ meta.tokenizer_sha256, &sha256Hex(tok) });
+        if (!std.mem.eql(u8, &shaHex(tok), meta.tokenizer_sha256)) return refuse(diag, error.EngramTokenMap, "token map built from tokenizer {s}, the bank's tokenizer.json is {s}", .{ meta.tokenizer_sha256, &shaHex(tok) });
         const raw = io_util.readAllNoCache(a, map_path, 64 << 20) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return refuse(diag, error.EngramTokenMap, "{s}: {s}", .{ map_path, @errorName(e) }),
         };
         if (raw.len != meta.vocab * 4) return refuse(diag, error.EngramTokenMap, "{s}: {d} bytes, want {d} (u32 per id)", .{ map_path, raw.len, meta.vocab * 4 });
-        if (!std.mem.eql(u8, &sha256Hex(raw), meta.map_sha256)) return refuse(diag, error.EngramTokenMap, "{s}: sha256 differs from its sidecar", .{map_path});
+        if (!std.mem.eql(u8, &shaHex(raw), meta.map_sha256)) return refuse(diag, error.EngramTokenMap, "{s}: sha256 differs from its sidecar", .{map_path});
         const ids = try a.alloc(u32, raw.len / 4);
         var top: u32 = 0;
         for (ids, 0..) |*v, i| {
@@ -269,11 +269,7 @@ pub const TokenMap = struct {
     }
 };
 
-fn sha256Hex(bytes: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
+const shaHex = @import("../../sdk_ext/kernel_set.zig").shaHex;
 
 /// The Engram row source (Python `EngramV41`'s row fetch: `NgramHashState` ids,
 /// `NGramRowCache` records): the manifest, the token map and one record table
@@ -612,14 +608,14 @@ pub fn writeMiniBank(a: std.mem.Allocator, tmp: *std.testing.TmpDir, root: []con
     try tmp.dir.writeFile(io, .{ .sub_path = "engram/engram-L1.bin", .data = bank });
     const map = try a.alloc(u8, f.vocab * 4);
     for (0..f.vocab) |i| std.mem.writeInt(u32, map[i * 4 ..][0..4], @intCast(i % f.map_mod), .little);
-    const map_sha = sha256Hex(map);
+    const map_sha = shaHex(map);
     if (f.flip_map_byte) map[5] ^= 1;
     try tmp.dir.writeFile(io, .{ .sub_path = "map.u32", .data = map });
     if (!f.drop_sidecar) {
         const meta = try std.fmt.allocPrint(a,
             \\{{"format":"{s}","vocab":{d},"compressed_vocab_size":50,"pad_id":2,"pad_compressed":2,
             \\"map_sha256":"{s}","tokenizer_sha256":"{s}","manifest_sha256":"{s}"}}
-        , .{ TokenMap.format, f.sidecar_vocab orelse f.vocab, &map_sha, &sha256Hex("{\"model\":\"mini\"}"), f.sidecar_manifest_sha });
+        , .{ TokenMap.format, f.sidecar_vocab orelse f.vocab, &map_sha, &shaHex("{\"model\":\"mini\"}"), f.sidecar_manifest_sha });
         try tmp.dir.writeFile(io, .{ .sub_path = "map.u32.json", .data = meta });
     }
     return std.fmt.allocPrint(a, "{s}/map.u32", .{root});

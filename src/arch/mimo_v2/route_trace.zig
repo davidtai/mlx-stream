@@ -19,6 +19,7 @@
 //!                      call carried for layer L+1 (score descending, ties by id; 0xFF / NaN when the call had none;
 //!                      an M-row call: each expert's max over the rows).
 const std = @import("std");
+const kset = @import("../../sdk_ext/kernel_set.zig");
 const expert_policy = @import("../../sdk_ext.zig").expert.policy;
 
 pub const format = "mimo-route-trace-v2";
@@ -147,9 +148,7 @@ pub const Trace = struct {
         @memset(t.rows_end, 0);
         @memset(t.resident0, expert_policy.no_expert);
         @memset(t.resident_end, expert_policy.no_expert);
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(ids), &digest, .{});
-        t.prompt_sha256 = std.fmt.bytesToHex(digest, .lower);
+        t.prompt_sha256 = kset.shaHex(std.mem.sliceAsBytes(ids));
         t.wide_decode_calls = 0;
         t.overflow = false;
         t.extended_prompt = false;
@@ -271,9 +270,7 @@ pub const Trace = struct {
         defer a.free(res0);
         const res1 = try packRows(a, t.resident_end, t.experts, L, width);
         defer a.free(res1);
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(t.decode_ids.items), &digest, .{});
-        const decode_sha = std.fmt.bytesToHex(digest, .lower);
+        const decode_sha = kset.shaHex(std.mem.sliceAsBytes(t.decode_ids.items));
         const base = try t.basePath(a);
         defer a.free(base);
         const files = .{

@@ -5,6 +5,7 @@
 //! GPU only: DSV41_KERNELS_GPU=1 and DSV41_KERNEL_OPS_FIXTURE=<dir> in a lock-holding window.
 
 const std = @import("std");
+const kset = @import("../sdk_ext/kernel_set.zig");
 const mlx = @import("sdk").mlx;
 const xk = @import("kernels.zig");
 const sdk = @import("sdk");
@@ -277,10 +278,7 @@ fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
 }
 
 fn hexEql(want: []const u8, bytes: []const u8) bool {
-    var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
-    const got = std.fmt.bytesToHex(d, .lower);
-    return std.mem.eql(u8, want, &got);
+    return std.mem.eql(u8, want, &kset.shaHex(bytes));
 }
 
 pub const Line = struct {

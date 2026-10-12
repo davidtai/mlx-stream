@@ -10,6 +10,7 @@
 //! from exl3_kernel_ops.zig.
 
 const std = @import("std");
+const kset = @import("../sdk_ext/kernel_set.zig");
 const mlx = @import("sdk").mlx;
 const xk = @import("kernels.zig");
 const selfcheck = @import("selfcheck.zig");
@@ -1588,9 +1589,7 @@ const LaneMap = struct {
     n_w1: usize = 0,
 
     fn refOf(tb: *const [80]i32) [16]u8 {
-        var d: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(tb), &d, .{});
-        const hex = std.fmt.bytesToHex(d, .lower);
+        const hex = kset.shaHex(std.mem.sliceAsBytes(tb));
         return hex[0..16].*;
     }
 
@@ -2501,12 +2500,6 @@ fn renderLog(t: *const Trace, from: usize, out: *std.ArrayList(u8)) !void {
     }
 }
 
-fn digestOf(text: []const u8) [64]u8 {
-    var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(text, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
-
 /// The EXL3 slot bank as named caller arrays (their references render by name).
 fn namedBank(t: *Trace, cap: c_int) !BankArrays(Trace.T) {
     return testBank(t, cap);
@@ -2580,7 +2573,7 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
     const n = try movedLaneLog(a, &tb, &set.reg, acc, bb, &lane_log);
     try testing.expect(n[0] > 0 and n[1] == 2 * n[0] and n[2] == 0);
     try testing.expectEqual(@as(usize, moved_log_lines), std.mem.count(u8, lane_log.items, "\n"));
-    try testing.expectEqualStrings(moved_log_sha256, &digestOf(lane_log.items));
+    try testing.expectEqualStrings(moved_log_sha256, &kset.shaHex(lane_log.items));
     // The fused arm: its self-checks join the report, and its waves launch the fused down GEMM (the down GEMM's and
     // rot_widen1's words in one launch; later launch indices one fewer per fused launch): the same pinned log.
     {
@@ -2596,7 +2589,7 @@ test "dsv41 kernels c2: move invariance: gateUp / down / prefill / finishPrefill
         defer fused_log.deinit(a);
         const nf = try movedLaneLog(a, &tf, &set.reg, accf, try namedBank(&tf, 64), &fused_log);
         try testing.expect(nf[0] > 0 and nf[1] == nf[0] and nf[2] == nf[0]);
-        try testing.expectEqualStrings(moved_log_sha256, &digestOf(fused_log.items));
+        try testing.expectEqualStrings(moved_log_sha256, &kset.shaHex(fused_log.items));
     }
     // checkBank: the moved per-projection check's refusals, through the quant's entry
     for ([_]struct { cap: c_int, last: c_int, rin_dt: Dtype, what: []const u8 }{

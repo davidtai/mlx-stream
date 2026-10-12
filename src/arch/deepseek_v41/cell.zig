@@ -7,6 +7,7 @@
 //! lane is not ported: the prompt goes in decode-lane forwards of <= 8 rows.
 
 const std = @import("std");
+const kset = @import("../../sdk_ext/kernel_set.zig");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const v41 = @import("deepseek_v41.zig");
@@ -96,9 +97,7 @@ pub fn idsSha256(a: std.mem.Allocator, ids: []const u32) ![64]u8 {
     try text.append(a, '[');
     for (ids, 0..) |id, i| try text.print(a, "{s}{d}", .{ if (i == 0) "" else ", ", id });
     try text.append(a, ']');
-    var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(text.items, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
+    return kset.shaHex(text.items);
 }
 
 const StreamIo = struct {
