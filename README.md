@@ -143,6 +143,45 @@ operation, not changed-helper execution; the stricter changed-path promotion gat
 The stock budget-boundary regression fails before the compact-only metadata correction and passes
 afterward in ReleaseSafe. No thermal/fan equivalence is claimed.
 
+#### Current-main 3.0 replay — rejected, not neutral
+
+The current-main replay is based on `ca49e236f9a0677cd7b45ffd6279bd26d1d8cc88`.
+The synthetic-bank merge retains both projection-specific layer counts and the upstream hash
+helpers. Full `mlx-stream-test` and `mlx-stream-conformance` completed successfully with
+`-Doptimize=safe` on that repaired native source. Earlier measurements remain scoped to PR11/f22.
+
+The fresh source-associated engine run retained all four ABBA arms, 24 measured long requests
+and 16 long conditioning requests on the same host and original calibrated harness. All cells
+completed 192 tokens. The approximate 16K rungs have the matched native counts shown below.
+
+| ABBA arm | Cell | Native prompt tokens | Median prefill tok/s | Median decode tok/s |
+|---|---|---:|---:|---:|
+| 0 baseline | Code | 16172 | 592.266 | 14.563 |
+| 0 baseline | Count | 16132 | 610.988 | 17.074 |
+| 1 candidate | Code | 16172 | 551.339 | 13.915 |
+| 1 candidate | Count | 16132 | 557.414 | 15.997 |
+| 2 candidate | Code | 16172 | 533.298 | 14.708 |
+| 2 candidate | Count | 16132 | 532.892 | 16.211 |
+| 3 baseline | Code | 16172 | 545.478 | 14.932 |
+| 3 baseline | Count | 16132 | 544.333 | 16.238 |
+
+Delivered output, reasoning, usage and request hashes match; exact same-facts admission also
+passes. Acceptance is rejected: observed sampled shader-name sets differ, and unchanged
+performance guards fail. Worst matched long prefill/decode changes are -12.35%/-9.43%;
+worst short decode is -5.69%. Code/count baseline drift is 2.53%/4.90%.
+Owned stock captures contain 9,509/9,030 positive samples and clean up fully. The candidate-only
+sampled names are stock `dsv41_exl3_mul1h_k3_2304` and `q3_prefill_fused_exl3x3_mul1lut_k3`.
+A sampled-set difference is not an exhaustive launch-change proof; it remains an acceptance
+failure, not waived. No neutrality, thermal/fan equivalence or engine win is claimed.
+
+The six saved micro deltas also reapply exactly to source08, but their rebased actual hybrid
+engine comparison is rejected. Delivered output/usage match; nominal median decode change is
+-1.50%, worst matched sample -12.23%, and baseline drift 3.78%. Throughput fails independently
+of dispatch attribution. The clean warmed capture contains 6,260 enclosing compact/banked
+samples, zero verified changed-helper samples, and no changed kernel has proven linkage.
+All owned processes exit normally and the GPU lease is released. These deltas remain excluded:
+source applicability is confirmed, engine benefit is not.
+
 
 | Published source | Expert contract | Status |
 |---|---|---|

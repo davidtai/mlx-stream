@@ -53,6 +53,19 @@
   do not prove changed-helper execution. The saved deltas remain excluded.
 - Drop the obsolete `row_costs`/`decode_base_rows` SDK proposal; mixed EXL3 support uses the
   merged SDK contract and does not require a separate all-plugin API migration.
+- Rebase the published draft onto current main `ca49e236`, preserving projection-specific
+  synthetic-bank layer counts and upstream hash helpers. Full repaired-source test/conformance
+  commands complete successfully in ReleaseSafe; the draft is conflict-free.
+- Complete current-main/source08 stock 3.0 ABBA with all 24 measured long requests and 16 long
+  conditioning requests. Delivered output/usage/hashes and exact same-facts admission match,
+  but sampled shader-name sets differ and unchanged performance guards reject: worst matched
+  long prefill/decode -12.35%/-9.43%. Both owned profiler captures save and clean up normally.
+  README records the actual same-host/harness table; neutrality is not claimed or waived.
+- Reapply all six saved deltas exactly to current-main/source08 and benchmark the actual hybrid
+  engine. Output/usage parity passes, but nominal median decode change is -1.50%, worst matched
+  sample -12.23%, and baseline drift 3.78%. Throughput and changed-path attribution both fail.
+  The clean warmed capture contains 6,260 enclosing samples, not proof of changed-helper
+  execution. All six remain excluded; no optimizer is restarted or engine win promoted.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the
