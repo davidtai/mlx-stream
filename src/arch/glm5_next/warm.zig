@@ -12,9 +12,11 @@
 //! compile warm, not a self-check).
 //! What it leaves: the request cache restarted (every KDA state cleared, the DSA lanes' lengths 0: their buffers keep
 //! the warm's rows past any request's length, and a request reads only the positions it appended), the expert source
-//! untouched (no route, read or slot), MLX's cache cleared. Token-identical: no request state is changed. Its memory is
-//! the prompt pass's (two spans in flight, one dense tile), within the request's billed terms, which hold nothing at the
-//! load. A prompt longer than one call reaches key counts the warm does not: those compile on first use, as before.
+//! untouched (no route, read or slot), the FP8 residents route's prompt weights released (`fp8_block128`: what the warm
+//! dequantized, released at each warmed layer's end), MLX's cache cleared. Token-identical: no request state is
+//! changed. Its memory is the prompt pass's (two spans in flight, one dense tile), within the request's billed terms,
+//! which hold nothing at the load. A prompt longer than one call reaches key counts the warm does not: those compile on
+//! first use, as before.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -76,11 +78,17 @@ pub fn run(g: *G, io: std.Io, c: *const glm.Config, w: *const graph.Weights, cac
         const hidden: c_int = @intCast(c.hidden_size);
         const zero = try g.zeros(&.{ 1, @intCast(graph.span_rows), @intCast(c.hc_mult), hidden }, .bfloat16);
         try g.evalAll(&.{zero});
+        // `residents_format: fp8_block128`: each warmed layer's BF16 weights (the FP8 route's prompt cache) released at
+        // its end, as the prompt pass releases them (`fp8.Route.layerEnd`): the prompt phase never holds two layers'
+        // sets, and the warm leaves none.
         try spans(g, c, &w.layers[p.kda_layer], zero, p.kda_spans, cache, routes);
+        if (w.fp8) |r| r.layerEnd();
         try spans(g, c, &w.layers[p.dsa_layer], zero, p.dsa_spans, cache, routes);
+        if (w.fp8) |r| r.layerEnd();
         const d = w.layers[p.dense_layer].dense orelse return error.Glm5NextWarmLayout;
         const x = try g.zeros(&.{ @intCast(graph.dense_tile_rows), hidden }, .bfloat16);
         try g.evalAll(&.{try graph.mlp(g, c, d, x)});
+        if (w.fp8) |r| r.layerEnd();
         var ahead: graph.Ahead = .{};
         defer ahead.release(g);
         try graph.predictor(g, c, &w.layers[p.routed_layer], p.routed_layer, &.{zero}, &ahead);
