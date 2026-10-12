@@ -71,6 +71,25 @@ the MoE over every row at once (the shared expert committed first); the layer's 
 indexer scores and sparse latent attention run on the NAX kernels where the device has them (`dsa_nax=true` in the
 routes line); an installed NAX route never falls back.
 
+**KDA prompt pass.** A KDA span wider than the decode lane (more than 4 rows: only the prompt pass has one) runs the prompt
+route installed at construction (`kda_percore.zig`): oMLX's per-core recurrence as mlx-serve runs it
+(`kda_recurrence.zig`, `kernels/kda_percore.metal`, glm5next/kda-prefill-40c b07dc2f5; oMLX 0.7.0, Apache-2.0), one
+threadgroup per GPU core or two where the cores are too few for one, the bounded gate evaluated while staging (no f32
+gate in memory). The plan for this GPU's cores (the IORegistry's `gpu-core-count`) and one probe launch over zeros
+decide it once: on the 40-core M5 Max the load logs `[kda] per-core prefill recurrence engaged (80 threadgroups x 104
+rows, 2 per core)` and the routes line `kda=percore`. Where no plan carries the rows (a CPU stream, fewer than 32 cores
+for 64 heads) or the probe is refused (a threadgroup past this GPU's cap), the per-token route is installed as the prompt
+route: the load logs `[kda] per-core prefill recurrence declined (...)` and the routes line `kda=stock`; an installed
+route never falls back. Every decode-lane span (a serial step; a decode-phase extend of up to 4 rows; a prompt span of at
+most 4 rows) runs the per-token route, the stock gated-delta kernel over the materialized f32 gate, under either. The two
+round the delta rule alike but not bit for bit (a row's 128 channels summed as eight 16-channel lanes against 32 lanes of
+4), so greedy ids may part at near ties. The per-core route reads each KDA layer's A_log as an F32 table the bind
+converts once (the pack stores F32 on layers 0-2 and BF16 on the other 31; F16 is taken too, any other dtype refuses the
+load by name); `trunk_f32_tables` bills the 34 tables (256 B each) and the buffer census counts them. The bill keeps
+the per-token route's five f32 gate stages, which the per-core route never builds. The window's parity test:
+`GLM5NEXT_KDA_PERCORE_GPU=1 _GPU_WINDOW_LOCKED=1`,
+`-Dtest-filter="glm5_next kda percore GPU"`.
+
 ## The bill
 
 MiMo's form: the arch's terms (`residents`, `trunk_f32_tables`, `router_f32`, `kv_lanes` (the DSA lanes, allocated at
