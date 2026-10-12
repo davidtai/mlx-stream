@@ -10,10 +10,10 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const glm = @import("glm_moe_dsa.zig");
-const settings = @import("glm_moe_dsa_settings.zig");
-const bill = @import("glm_moe_dsa_bill.zig");
-const phase_mem = @import("phase_memory.zig");
-const split = @import("glm_moe_dsa_split.zig");
+const settings = @import("settings.zig");
+const bill = @import("bill.zig");
+const phase_mem = @import("../../phase_memory.zig");
+const split = @import("split.zig");
 
 const testing = std.testing;
 

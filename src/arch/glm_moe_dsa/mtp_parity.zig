@@ -9,15 +9,15 @@
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
-const sdk_ext = @import("sdk_ext.zig");
+const sdk_ext = @import("../../sdk_ext.zig");
 const quant = sdk_ext.quant;
 const glm = @import("glm_moe_dsa.zig");
-const settings = @import("glm_moe_dsa_settings.zig");
-const module = @import("glm_moe_dsa_module.zig");
-const bank_mod = @import("glm_moe_dsa_bank.zig");
-const graph = @import("glm_moe_dsa_graph.zig");
-const mtp = @import("glm_moe_dsa_mtp.zig");
-const plugin = @import("glm_moe_dsa_plugin.zig");
+const settings = @import("settings.zig");
+const module = @import("module.zig");
+const bank_mod = @import("bank.zig");
+const graph = @import("graph.zig");
+const mtp = @import("mtp.zig");
+const plugin = @import("plugin.zig");
 
 const testing = std.testing;
 const M = module.ModuleOf(bank_mod, quant.FromGatherMatmul(quant.GatherQmm), .dense);
@@ -335,12 +335,12 @@ test "glm mtp: a depth past the route limit, a pack without mtp/ and a config wi
     cfg.mtp_depth = 5;
     try testing.expectError(error.MtpPackMissing, plugin.loadBytes(a, testing.io, &cfg, &facts, 64 << 30));
     var diag: glm.Diag = .{};
-    try testing.expectError(error.MtpPackMissing, @import("glm_moe_dsa_bill.zig").sdkBillOf(arena.allocator(), testing.io, &cfg, 1024, &diag));
+    try testing.expectError(error.MtpPackMissing, @import("bill.zig").sdkBillOf(arena.allocator(), testing.io, &cfg, 1024, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "mtp/mtp-residents.safetensors") != null);
     try testing.expectError(error.MtpPackMissing, M.initWith(a, testing.io, &cfg, &weights, undefined, .{ .ceiling = 64 << 30, .wired_margin = 0 }, .{}));
     // Off, the same pack loads its bill with its MTP terms at nothing.
     cfg.mtp_depth = 0;
-    const mb = try @import("glm_moe_dsa_bill.zig").sdkBillOf(arena.allocator(), testing.io, &cfg, 1024, null);
+    const mb = try @import("bill.zig").sdkBillOf(arena.allocator(), testing.io, &cfg, 1024, null);
     for (mb.terms) |t| if (std.mem.indexOf(u8, t.name, "MTP") != null) try testing.expectEqual([2]u64{ 0, 0 }, t.bytes);
     // A config without index_share_for_mtp_iteration drafts one token at most.
     var tmp2 = testing.tmpDir(.{});
@@ -391,7 +391,7 @@ fn decideHost(g: *G, rows: []const f32, w: usize, drafts: []const u32, mode: sdk
 
 test "glm mtp: the decisions equal the host references: argmax, typical at temperature 1, the sampled point-mass rule, sampled typical" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const ds = @import("sdk_ext.zig").acceptance;
+    const ds = @import("../../sdk_ext.zig").acceptance;
     const acc = sdk.acceptance;
     const a = testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();

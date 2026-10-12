@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """glm53_exl3_manifest.py: write src/kernels/glm53_exl3/manifest.json from the texts beside it (each text's sha256 and
 size, every kernel's signature, template parameters, threadgroup, registered instantiations and checks) and print the
-manifest's sha256, the pin `src/glm53_exl3_kernels.zig` carries.
+manifest's sha256, the pin `src/arch/glm_moe_dsa/glm53_exl3/kernels.zig` carries.
 
   scripts/glm53_exl3_manifest.py [--check]
 --check writes nothing and exits 1 when the manifest on disk is not the one the texts give."""

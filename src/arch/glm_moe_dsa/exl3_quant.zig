@@ -9,9 +9,9 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
-const sdk_ext = @import("sdk_ext.zig");
+const sdk_ext = @import("../../sdk_ext.zig");
 const quant = sdk_ext.quant;
-const bank_mod = @import("glm_moe_dsa_exl3_bank.zig");
+const bank_mod = @import("exl3_bank.zig");
 const sushi = @import("mlx_host").sushi_exl3;
 
 const Allocator = std.mem.Allocator;
@@ -171,7 +171,7 @@ test "glm exl3 quant: claims the EXL3 bank's description and declines the affine
     try testing.expect(std.mem.indexOf(u8, why.message(), "affine") != null);
     const mul1 = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"mode\":\"exl3\",\"codebook\":\"mul1\",\"codebook_multiplier\":1,\"tp_ranks\":4}", .{});
     try testing.expectEqual(@as(?quant.Priority, null), claims(&.{ .quantization = mul1, .hidden = 6144, .inter = 2048, .n_experts = 256, .n_layers = 150, .layers = &.{} }, null));
-    const G = @import("glm_moe_dsa_graph.zig").G;
+    const G = @import("graph.zig").G;
     var diag: Diag = .{};
     const spec: quant.Spec = .{ .hidden = 6144, .inter = 2048, .top_k = 8, .n_layers = 150, .act = .swiglu, .input = .bfloat16 };
     const ok = try accept(G, testing.allocator, undefined, .{ .peek = &p }, spec, &diag);
@@ -189,9 +189,9 @@ test "glm exl3 quant: claims the EXL3 bank's description and declines the affine
 test "glm exl3 quant: a wide prompt call with its misses staged at the layer's start (both bank layers) equals sushi's host decode, reads what the unstaged call reads and leaves its residents" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
-    const graph = @import("glm_moe_dsa_graph.zig");
+    const graph = @import("graph.zig");
     const G = graph.G;
-    const experts_mod = @import("glm_moe_dsa_experts.zig");
+    const experts_mod = @import("experts.zig");
     const Ex = experts_mod.Experts(G, bank_mod, Accepted(G));
     var c = try bank_mod.tinyConfigInter(a, 512);
     defer c.deinit(a);
@@ -344,9 +344,9 @@ pub fn hostMoe(img: []const u8, b: *const bank_mod.Bank, layer: u32, xs: []const
 /// outputs up to `scale`. One body for every EXL3 quant over this bank.
 pub fn expectStreamedMoe(comptime Q: type, comptime label: []const u8, s: mlx.mlx_stream, ctx: quant.Context, widths: []const u32, comptime bound: fn (f32) f32) !void {
     const a = testing.allocator;
-    const graph = @import("glm_moe_dsa_graph.zig");
+    const graph = @import("graph.zig");
     const G = graph.G;
-    const experts_mod = @import("glm_moe_dsa_experts.zig");
+    const experts_mod = @import("experts.zig");
     const expert_event = sdk_ext.expert.event;
     const Ex = experts_mod.Experts(G, bank_mod, Q.Accepted(G));
     var c = try bank_mod.tinyConfigInter(a, 512);

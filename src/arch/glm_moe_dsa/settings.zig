@@ -7,7 +7,7 @@ const sdk = @import("sdk");
 const log = @import("sdk").log;
 const glm = @import("glm_moe_dsa.zig");
 const acceptance = sdk.acceptance;
-const expert_tally = @import("sdk_ext.zig").expert.tally;
+const expert_tally = @import("../../sdk_ext.zig").expert.tally;
 
 /// The arch's numerics: "stock" (the reference's op chain) is the only tier; any other name is unset.
 pub const NumericTier = enum { stock };
@@ -76,12 +76,12 @@ pub const Config = struct {
     /// The prompt routes one layer may hold live at once (`sdk_ext.expert.stream.max_wide_depth`).
     pub const max_wide_depth: i64 = 5;
     /// The lookahead's widest budget (`sdk_ext.expert.lookahead.max_budget`).
-    pub const max_lookahead_budget: i64 = @import("sdk_ext.zig").expert.lookahead.max_budget;
+    pub const max_lookahead_budget: i64 = @import("../../sdk_ext.zig").expert.lookahead.max_budget;
     /// The least units cap: the fill's floor (`phase_memory.min_fill_rows`), under which a load is refused.
-    pub const min_units_cap: i64 = @import("phase_memory.zig").min_fill_rows;
+    pub const min_units_cap: i64 = @import("../../phase_memory.zig").min_fill_rows;
     /// The deepest draft a round verifies: its depth + 1 rows of top-8 routes in the stream's decode lane
     /// (`sdk_ext.expert.policy.max_route_ids` = 48).
-    pub const max_mtp_depth: u32 = @import("sdk_ext.zig").expert.policy.max_route_ids / glm.routed_top_k - 1;
+    pub const max_mtp_depth: u32 = @import("../../sdk_ext.zig").expert.policy.max_route_ids / glm.routed_top_k - 1;
 
     pub const MtpAcceptance = enum { exact, typical, other };
 
@@ -208,7 +208,7 @@ pub const Config = struct {
     /// not implement.
     pub fn checkMtp(c: *const Config) error{ MtpDepthOverRouteLimit, MtpAcceptanceNotImplemented }!void {
         if (c.mtp_depth_over_limit) |v| {
-            log.warn("glm_moe_dsa: load refused: mtp_depth {d} is over the route limit: a round verifies depth + 1 rows of {d} routes in one {d}-route call, so the depth is at most {d} (MtpDepthOverRouteLimit)\n", .{ v, glm.routed_top_k, @import("sdk_ext.zig").expert.policy.max_route_ids, max_mtp_depth });
+            log.warn("glm_moe_dsa: load refused: mtp_depth {d} is over the route limit: a round verifies depth + 1 rows of {d} routes in one {d}-route call, so the depth is at most {d} (MtpDepthOverRouteLimit)\n", .{ v, glm.routed_top_k, @import("../../sdk_ext.zig").expert.policy.max_route_ids, max_mtp_depth });
             return error.MtpDepthOverRouteLimit;
         }
         if (c.mtp_acceptance == .other and c.mtpDepth() > 0) {

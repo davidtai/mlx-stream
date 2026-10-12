@@ -11,8 +11,8 @@ const std = @import("std");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const glm = @import("glm_moe_dsa.zig");
-const settings = @import("glm_moe_dsa_settings.zig");
-const module = @import("glm_moe_dsa_module.zig");
+const settings = @import("settings.zig");
+const module = @import("module.zig");
 
 const testing = std.testing;
 

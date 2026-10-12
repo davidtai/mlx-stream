@@ -4,10 +4,10 @@
 //! call one route whose ids carry their bank layer's flags.
 
 const std = @import("std");
-const sdk_ext = @import("sdk_ext.zig");
-const bank_mod = @import("glm_moe_dsa_bank.zig");
-const exl3 = @import("glm_moe_dsa_exl3_bank.zig");
-const glm = @import("glm_moe_dsa.zig");
+const sdk_ext = @import("../sdk_ext.zig");
+const bank_mod = @import("../arch/glm_moe_dsa/bank.zig");
+const exl3 = @import("../arch/glm_moe_dsa/exl3_bank.zig");
+const glm = @import("../arch/glm_moe_dsa/glm_moe_dsa.zig");
 const policy = sdk_ext.expert.policy;
 const routes = sdk_ext.expert.routes;
 const Flag = routes.Flag;
@@ -15,7 +15,7 @@ const Flag = routes.Flag;
 const testing = std.testing;
 
 comptime {
-    _ = @import("sdk_ext/expert/routes.zig");
+    _ = @import("../sdk_ext/expert/routes.zig");
 }
 
 /// `rows` rows of `k` distinct experts of `n_experts`, row-major.

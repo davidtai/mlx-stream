@@ -13,8 +13,8 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
-const xk = @import("glm53_exl3_kernels.zig");
-const exl3_quant = @import("exl3/quant.zig");
+const xk = @import("kernels.zig");
+const exl3_quant = @import("../../../exl3/quant.zig");
 
 const Kernel = xk.Kernel;
 

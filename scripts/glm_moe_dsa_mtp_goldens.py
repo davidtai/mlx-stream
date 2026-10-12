@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""glm_moe_dsa_mtp_goldens.py: the GLM-5.3 MTP draft lane's fixture (src/glm_moe_dsa_mtp.zig).
+"""glm_moe_dsa_mtp_goldens.py: the GLM-5.3 MTP draft lane's fixture (src/arch/glm_moe_dsa/mtp.zig).
 
 The tiny model of `glm_moe_dsa_goldens.py` (the same config, seed and quantization) with an MTP layer at index
 `num_hidden_layers`: random BF16 weights, the routed experts dense BF16 (the lane's test bank kind; the served lane binds

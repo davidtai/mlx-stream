@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""glm_moe_dsa_goldens.py: the GLM-5.3 arch's parity fixture (src/glm_moe_dsa_parity.zig).
+"""glm_moe_dsa_goldens.py: the GLM-5.3 arch's parity fixture (src/arch/glm_moe_dsa/parity.zig).
 
 A tiny model of the arch (the config of `glm_moe_dsa.tinyConfigJson`) with random weights, quantized as the release's
 MLX builds are (affine group 64, 4 bits, two modules at 8 bits, the indexer and the router as stored), saved as an MLX

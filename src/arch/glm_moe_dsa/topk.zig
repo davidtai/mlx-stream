@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
-const ops = @import("arch/deepseek_v41/ops.zig");
+const ops = @import("../deepseek_v41/ops.zig");
 
 const G = ops.MlxOps;
 const T = G.T;

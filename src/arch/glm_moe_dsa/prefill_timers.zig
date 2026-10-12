@@ -2,9 +2,9 @@
 //! forward's layer evaluated on its own and its wall time charged to it, accumulated over one prompt pass and printed
 //! at its end. In every other build `enabled` is false and each call below compiles to nothing.
 
-const bo = @import("build_flags.zig");
-const ops = @import("arch/deepseek_v41/ops.zig");
-const sdk_ext = @import("sdk_ext.zig");
+const bo = @import("../../build_flags.zig");
+const ops = @import("../deepseek_v41/ops.zig");
+const sdk_ext = @import("../../sdk_ext.zig");
 const log = @import("sdk").log;
 
 pub const enabled: bool = if (@hasDecl(bo, "glm_prefill_timers")) bo.glm_prefill_timers else false;

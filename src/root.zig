@@ -45,7 +45,7 @@ pub const testing = struct {
 pub const arch = @import("arch/deepseek_v41/plugin.zig");
 /// Every arch the glue dispatches by `claims(peek)`, in claim order: DeepSeek-V4.1 and GLM-5.3 (MiMo has its own
 /// entry, `mimo`, with its own context and headroom).
-pub const archs = .{ @import("arch/deepseek_v41/plugin.zig"), @import("glm_moe_dsa_plugin.zig") };
+pub const archs = .{ @import("arch/deepseek_v41/plugin.zig"), @import("arch/glm_moe_dsa/plugin.zig") };
 pub const sdk = @import("sdk");
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
 pub const default_context: u64 = @import("arch/deepseek_v41/bill.zig").fill_prompt_tokens;

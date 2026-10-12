@@ -17,12 +17,12 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
-const sdk_ext = @import("sdk_ext.zig");
+const sdk_ext = @import("../../../sdk_ext.zig");
 const quant = sdk_ext.quant;
-const bank_mod = @import("glm_moe_dsa_exl3_bank.zig");
-const xk = @import("glm53_exl3_kernels.zig");
-const routes = @import("glm53_exl3_routes.zig");
-const sushi_quant = @import("glm_moe_dsa_exl3_quant.zig");
+const bank_mod = @import("../exl3_bank.zig");
+const xk = @import("kernels.zig");
+const routes = @import("routes.zig");
+const sushi_quant = @import("../exl3_quant.zig");
 const selfcheck = xk.selfcheck;
 const ks = sdk_ext.kernels.KernelSet(xk);
 
@@ -477,7 +477,7 @@ test "glm53 exl3 quant: claims GLM-5.3's EXL3 bank only; accept refuses what the
         try testing.expectEqual(@as(?quant.Priority, null), claims(&try peekOf(ar, q), &why));
         try testing.expect(std.mem.indexOf(u8, why.message(), "quant " ++ name) != null);
     }
-    const G = @import("glm_moe_dsa_graph.zig").G;
+    const G = @import("../graph.zig").G;
     var diag: Diag = .{};
     const spec: quant.Spec = .{ .hidden = 6144, .inter = 2048, .top_k = 8, .n_layers = 150, .act = .swiglu, .input = .bfloat16 };
     const set = try ks.Set.init(testing.allocator, .{ .device = .{ .stub = .{} } }, &diag);
@@ -538,7 +538,7 @@ test "glm53 exl3 quant: the streamed EXL3 bank's MoE through the experts driver 
 test "glm53 exl3 quant: on the same slot banks the GLM-5.3 kernels and sushi's EXL3 chain agree within bf16 rounding, decode widths 1 to 6 and prompt widths" {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
-    const G = @import("glm_moe_dsa_graph.zig").G;
+    const G = @import("../graph.zig").G;
     var c = try bank_mod.tinyConfigInter(a, 512);
     defer c.deinit(a);
     var tmp = std.testing.tmpDir(.{});
@@ -888,8 +888,8 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
     const dir = std.mem.span(std.c.getenv("GLM53_EXL3_BENCH") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = testing.io;
-    const G = @import("glm_moe_dsa_graph.zig").G;
-    const glm = @import("glm_moe_dsa.zig");
+    const G = @import("../graph.zig").G;
+    const glm = @import("../glm_moe_dsa.zig");
     var cdiag: Diag = .{};
     var c = glm.Config.load(a, io, dir, null, &cdiag) catch |e| {
         std.debug.print("config refused: {s}\n", .{cdiag.message()});
@@ -1152,7 +1152,7 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
 test "glm53 exl3 bench: the tiny fixture's EXL3 pack (GLM53_EXL3_TINY_PACK)" {
     const out = std.mem.span(std.c.getenv("GLM53_EXL3_TINY_PACK") orelse return error.SkipZigTest);
     const a = testing.allocator;
-    const glm = @import("glm_moe_dsa.zig");
+    const glm = @import("../glm_moe_dsa.zig");
     var model = try bank_mod.tinyConfigInter(a, 512);
     defer model.deinit(a);
     std.Io.Dir.cwd().createDirPath(testing.io, out) catch {};
@@ -1170,7 +1170,7 @@ test "glm53 exl3 bench: the tiny fixture's EXL3 pack (GLM53_EXL3_TINY_PACK)" {
 /// The tiny fixture's residents at random (`writeResidents` writes zeros): the packed weights random bits, the affine
 /// scales small and the biases centring the codes (`bits` per tensor from the config's quantization), the norms near 1,
 /// every other float small.
-fn randomResidents(a: Allocator, io: std.Io, dir: std.Io.Dir, model: *const @import("glm_moe_dsa.zig").Config, seed: u64) !void {
+fn randomResidents(a: Allocator, io: std.Io, dir: std.Io.Dir, model: *const @import("../glm_moe_dsa.zig").Config, seed: u64) !void {
     const file = try dir.readFileAlloc(io, "model.safetensors", a, .unlimited);
     defer a.free(file);
     const hlen: usize = @intCast(std.mem.readInt(u64, file[0..8], .little));
@@ -1227,9 +1227,9 @@ fn sushiEndToEnd(uniform: bool) !void {
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
-    const glm = @import("glm_moe_dsa.zig");
-    const module = @import("glm_moe_dsa_module.zig");
-    const settings = @import("glm_moe_dsa_settings.zig");
+    const glm = @import("../glm_moe_dsa.zig");
+    const module = @import("../module.zig");
+    const settings = @import("../settings.zig");
     const sdk = @import("sdk");
     var model = try bank_mod.tinyConfigInter(a, 512);
     var tmp = testing.tmpDir(.{});

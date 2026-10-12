@@ -21,16 +21,16 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const glm = @import("glm_moe_dsa.zig");
-const settings = @import("glm_moe_dsa_settings.zig");
-const bank_mod = @import("glm_moe_dsa_bank.zig");
-const cache_mod = @import("glm_moe_dsa_cache.zig");
-const io_mod = @import("sdk_ext.zig").expert.io;
-const mtp_mod = @import("glm_moe_dsa_mtp.zig");
-const exl3_bank = @import("glm_moe_dsa_exl3_bank.zig");
-const phase_mem = @import("phase_memory.zig");
-const topk_mod = @import("glm_moe_dsa_topk.zig");
-const glm53_quant = @import("glm53_exl3_quant.zig");
-const sushi_quant = @import("glm_moe_dsa_exl3_quant.zig");
+const settings = @import("settings.zig");
+const bank_mod = @import("bank.zig");
+const cache_mod = @import("cache.zig");
+const io_mod = @import("../../sdk_ext.zig").expert.io;
+const mtp_mod = @import("mtp.zig");
+const exl3_bank = @import("exl3_bank.zig");
+const phase_mem = @import("../../phase_memory.zig");
+const topk_mod = @import("topk.zig");
+const glm53_quant = @import("glm53_exl3/quant.zig");
+const sushi_quant = @import("exl3_quant.zig");
 
 /// The request a construction bills when the model sets no context (`ctx_size`), and the fill's floor (shared with
 /// DeepSeek-V4.1's bill, `phase_memory`).

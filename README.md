@@ -377,7 +377,7 @@ rounded down (148 K3 and 108 K4 experts per routed layer over 128 units: 1.15625
 19.0 MB, 2.45 GB a unit). The KV costs 95,232 B per
 position (the 512 latent and 64 rope values on every layer, the 128-value indexer key on the 21 full layers, bf16).
 The KV lanes hold only the current phase's positions: the prompt's during its pass, and from the decode handover the
-request's own prompt and `max_tokens`. The bill (`src/glm_moe_dsa_bill.zig`) is built the way DeepSeek-V4.1's is, on
+request's own prompt and `max_tokens`. The bill (`src/arch/glm_moe_dsa/bill.zig`) is built the way DeepSeek-V4.1's is, on
 the machinery both bills share (`src/phase_memory.zig`): each phase's terms come from the shard headers, the bank's
 manifest, the arrays the module allocates and the limits it installs. The slot rows are billed exactly as the module
 gives them. The residents are billed as MLX allocates them, and not at construction: the host's loader keeps them lazy
@@ -390,7 +390,7 @@ staging, and the prompt's routed GEMM work and attention spans in flight. At con
 the decode handover and the request's end the module logs one `glm_moe_dsa: phase memory` record: the billed terms,
 MLX's active, cache and peak bytes, the footprint and its peak, the box's pages, and billed less measured. With
 `GLM53_WAVE_PROBE` set, the prompt pass also logs each layer's MLX peak by stage (`glm_moe_dsa: wave probe`). The
-receipts test (`src/glm_moe_dsa_bill_receipts_test.zig`) rebuilds the box's runs from their records.
+receipts test (`src/arch/glm_moe_dsa/bill_receipts_test.zig`) rebuilds the box's runs from their records.
 
 The construction admits both phases of the longest request (the billed context and `max_output` generated tokens)
 under the box's target and fills the prompt rows to it. The box's target is the RAM less a 16 GiB OS reserve (the
@@ -436,7 +436,7 @@ accepted, the rate, the accepted and emitted tokens per round, tok/s and the tim
 and the verify's SSD bytes (per emitted token, and the share only rejected rows read). A second line gives the
 acceptance by the head's top probability, per tenth.
 
-`src/glm_moe_dsa_mtp_parity.zig` checks the lane on a tiny model with an MTP layer (`scripts/glm_moe_dsa_mtp_goldens.py`,
+`src/arch/glm_moe_dsa/mtp_parity.zig` checks the lane on a tiny model with an MTP layer (`scripts/glm_moe_dsa_mtp_goldens.py`,
 `GLM53_MTP_PARITY=<its pack>`): every round's drafts and draft logits against the reference's modules at depth 1 to 5,
 the rounds' tokens against the serial decode, and both KV states after the rounds against a serial run's.
 
@@ -446,7 +446,7 @@ Not available for GLM-5.3:
   mlx-serve's DSA kernels, the routed combine on one kernel of its own);
 - a prompt over 18,431 tokens reads each routed layer's experts once per call of 16,384 rows, not once per prompt.
 
-`src/glm_moe_dsa_parity.zig` checks the arch against the reference `glm_moe_dsa.py` on a tiny model of the arch:
+`src/arch/glm_moe_dsa/parity.zig` checks the arch against the reference `glm_moe_dsa.py` on a tiny model of the arch:
 `scripts/glm_moe_dsa_goldens.py` builds it, converts it with the converter and writes the reference's logits beside
 the pack (`GLM53_PARITY=<pack>` with `DSV41_PHASE0B_MLX=1`).
 
@@ -488,8 +488,8 @@ src/exl3/                  the EXL3 quant, kernels, source and self-checks
 src/expert/                the expert stream: bank, stream, admission and lookahead, with their tests
 src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile,
                            the draft lanes' acceptance)
-src/glm_moe_dsa*.zig       the GLM-5.3 arch, its banks, bill, module, draft lane and parity tests
-src/glm53_exl3_*.zig       GLM-5.3's EXL3 kernels, routes, quant and self-check (texts in src/kernels/glm53_exl3/)
+src/arch/glm_moe_dsa/      the GLM-5.3 arch: its banks, bill, module, draft lane and parity tests
+src/arch/glm_moe_dsa/glm53_exl3/  GLM-5.3's EXL3 kernels, routes, quant and self-check (texts in src/kernels/glm53_exl3/)
 src/kernels/exl3/          the pinned Metal kernel texts and their manifest (embedded at compile time)
 src/fixtures/              test fixtures (bank peek, prefill wave samples, DSpark lookup and receipt stats, the MiMo
                            config)

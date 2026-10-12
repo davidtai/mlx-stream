@@ -16,15 +16,15 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
-const sdk_ext = @import("sdk_ext.zig");
+const sdk_ext = @import("../../sdk_ext.zig");
 const expert_policy = sdk_ext.expert.policy;
 const expert_event = sdk_ext.expert.event;
-const expert_stream = @import("expert/stream.zig");
-const ops = @import("arch/deepseek_v41/ops.zig");
+const expert_stream = @import("../../expert/stream.zig");
+const ops = @import("../deepseek_v41/ops.zig");
 const glm = @import("glm_moe_dsa.zig");
 /// PROFILE builds (`-Dplugin-profile=true`): each decode-lane call's host stamps on the verify's GPU timeline.
-const timeline = @import("arch/deepseek_v41/verify_timeline.zig");
-const pt = @import("glm_moe_dsa_prefill_timers.zig");
+const timeline = @import("../deepseek_v41/verify_timeline.zig");
+const pt = @import("prefill_timers.zig");
 
 /// Metal binds at most 31 buffers to a kernel; the combine's other three are `loc`, `w` and `out`.
 const metal_buffer_slots = 31;

@@ -4,12 +4,12 @@
 
 const std = @import("std");
 const sdk = @import("sdk");
-const sdk_ext = @import("sdk_ext.zig");
+const sdk_ext = @import("../../sdk_ext.zig");
 const glm = @import("glm_moe_dsa.zig");
-const settings = @import("glm_moe_dsa_settings.zig");
-const module = @import("glm_moe_dsa_module.zig");
-const bill_mod = @import("glm_moe_dsa_bill.zig");
-const bank_mod = @import("glm_moe_dsa_bank.zig");
+const settings = @import("settings.zig");
+const module = @import("module.zig");
+const bill_mod = @import("bill.zig");
+const bank_mod = @import("bank.zig");
 
 pub const name = "glm_moe_dsa";
 

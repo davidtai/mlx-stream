@@ -1,5 +1,5 @@
-//! The memory bills' shared machinery (DeepSeek-V4.1's `deepseek_v41_bill.zig` and GLM-5.3's `glm_moe_dsa_bill.zig`,
-//! and their modules): the standard request and the fill's floor, the page tables of a phase's wired bytes and their
+//! The memory bills' shared machinery (DeepSeek-V4.1's `arch/deepseek_v41/bill.zig` and GLM-5.3's
+//! `arch/glm_moe_dsa/bill.zig`, and their modules): the standard request and the fill's floor, the page tables of a phase's wired bytes and their
 //! row-following term, one phase boundary's record of the billed terms against what the kernel and MLX measured (its
 //! residuals), the construction check's arithmetic, a phase change's settle, the page-cache check the bills' assumption
 //! rests on, and the receipts tests' checks of a record and of the fill's edge. A bill keeps its own terms (a struct of

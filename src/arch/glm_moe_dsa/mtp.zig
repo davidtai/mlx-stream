@@ -22,11 +22,11 @@ const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const log = sdk.log;
 const glm = @import("glm_moe_dsa.zig");
-const graph = @import("glm_moe_dsa_graph.zig");
-const cache_mod = @import("glm_moe_dsa_cache.zig");
-const settings = @import("glm_moe_dsa_settings.zig");
-const acceptance = @import("sdk_ext.zig").acceptance;
-const exl3 = @import("glm_moe_dsa_exl3_bank.zig");
+const graph = @import("graph.zig");
+const cache_mod = @import("cache.zig");
+const settings = @import("settings.zig");
+const acceptance = @import("../../sdk_ext.zig").acceptance;
+const exl3 = @import("exl3_bank.zig");
 
 const G = graph.G;
 const T = G.T;
@@ -1030,7 +1030,7 @@ test "glm mtp: the EXL3 bank's MoE on the GPU equals sushi's host decode of the 
     var ids16: [n * k]u16 = undefined;
     for (&ids16, ids) |*d, e| d.* = @intCast(e);
     var want: [n * 128]f32 = undefined;
-    @import("glm_moe_dsa_exl3_quant.zig").hostMoe(img, &m, 0, &xin, &ids16, &sc, k, &want);
+    @import("exl3_quant.zig").hostMoe(img, &m, 0, &xin, &ids16, &sc, k, &want);
     var scale: f32 = 0;
     var worst: f32 = 0;
     for (want, got) |x, y_| {

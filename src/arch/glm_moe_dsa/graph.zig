@@ -17,13 +17,13 @@
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
-const ops = @import("arch/deepseek_v41/ops.zig");
+const ops = @import("../deepseek_v41/ops.zig");
 const glm = @import("glm_moe_dsa.zig");
-const cache_mod = @import("glm_moe_dsa_cache.zig");
-const pt = @import("glm_moe_dsa_prefill_timers.zig");
-const expert_policy = @import("sdk_ext.zig").expert.policy;
+const cache_mod = @import("cache.zig");
+const pt = @import("prefill_timers.zig");
+const expert_policy = @import("../../sdk_ext.zig").expert.policy;
 const dsa = sdk.dsa;
-const topk_mod = @import("glm_moe_dsa_topk.zig");
+const topk_mod = @import("topk.zig");
 
 pub const G = ops.MlxOps;
 pub const T = G.T;

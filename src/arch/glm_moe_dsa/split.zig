@@ -1,6 +1,6 @@
 //! GLM-5.3's decode rows per bank layer on the box's EXL3 packs: the 3.42 bpw pack (`bill.box_exl3`: per routed layer a
 //! K3 bank layer of 148 experts and a K4 one of 108) and the uniform 3.0 bpw pack (`bill.box_exl3_30`: per routed layer
-//! one K3 bank layer of 256, its second stream layer empty; its table and curves in `glm_moe_dsa_split_k3.zig`). The
+//! one K3 bank layer of 256, its second stream layer empty; its table and curves in `split_k3.zig`). The
 //! handover's grow gives the bank layers uneven rows at the even split's bytes: a row saves more misses on some layers
 //! than on others (on the first routed layers the most). GLM-only: the tables and the curves are these packs', from four
 //! recorded decodes pooled (coding at two seeds, prose, and a coding run of an earlier build; the 3.0 pack's replayed at
@@ -18,8 +18,8 @@
 
 const std = @import("std");
 const glm = @import("glm_moe_dsa.zig");
-const bill = @import("glm_moe_dsa_bill.zig");
-const k3 = @import("glm_moe_dsa_split_k3.zig");
+const bill = @import("bill.zig");
+const k3 = @import("split_k3.zig");
 
 /// The packs the tables cover (`packOf`): the 3.42 bpw pack's K3 and K4 bank layers, the 3.0 bpw pack's K3 one.
 pub const Pack = enum { k3_k4, k3 };

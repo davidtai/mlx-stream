@@ -2,10 +2,10 @@
 //! the per-tensor affine bits, and the resident tensor spec checked against the pack's shard headers. Host-side: a pack
 //! this build does not implement is refused by name before any MLX array (and so the Metal device) exists. Oracle: the
 //! checkpoint's bundled `glm_moe_dsa.py` (mlx-lm's `deepseek_v32` with GLM's indexer schedule, fp32 indexer scores and
-//! router logits); the routed experts stream from the affine bank (`glm_moe_dsa_bank.zig`), never from these shards.
+//! router logits); the routed experts stream from the affine bank (`bank.zig`), never from these shards.
 
 const std = @import("std");
-const v41 = @import("arch/deepseek_v41/deepseek_v41.zig");
+const v41 = @import("../deepseek_v41/deepseek_v41.zig");
 
 /// The shard headers of a pack (`deepseek_v41.Checkpoint`: 8-byte length + JSON, never tensor data).
 pub const Checkpoint = v41.Checkpoint;
@@ -706,14 +706,14 @@ pub fn residentBufferBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, 
     _ = try checkResidents(try residentSpec(arena.allocator(), c), &ck, diag);
     if (!classes) return bufferBytes(&ck, page);
     var n: u64 = 0;
-    for (ck.tensors.values()) |t| n += @import("glm_moe_dsa_cache.zig").sizeClassBytes(t.end - t.begin);
+    for (ck.tensors.values()) |t| n += @import("cache.zig").sizeClassBytes(t.end - t.begin);
     return n;
 }
 
 /// Every tensor of `ck` in its own MLX buffer: past one page, rounded up to whole pages (`glm_moe_dsa_cache.bufferBytes`).
 pub fn bufferBytes(ck: *const Checkpoint, page: u64) u64 {
     var n: u64 = 0;
-    for (ck.tensors.values()) |t| n += @import("glm_moe_dsa_cache.zig").bufferBytes(t.end - t.begin, page);
+    for (ck.tensors.values()) |t| n += @import("cache.zig").bufferBytes(t.end - t.begin, page);
     return n;
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""glm_split_k3_table.py <trace> ... [--out src/glm_moe_dsa_split_k3.zig] [--prompt-units 81] [--units 96]: the decode
+"""glm_split_k3_table.py <trace> ... [--out src/arch/glm_moe_dsa/split_k3.zig] [--prompt-units 81] [--units 96]: the decode
 row split of GLM-5.3's uniform 3.0 bpw EXL3 pack (one K3 bank layer of 256 experts per routed layer; its second stream
-layer empty) for src/glm_moe_dsa_split.zig, from route recorder traces (src/sdk_ext/expert/routes.zig, GLM53_ROUTES)
+layer empty) for src/arch/glm_moe_dsa/split.zig, from route recorder traces (src/sdk_ext/expert/routes.zig, GLM53_ROUTES)
 of decodes on any GLM-5.3 pack.
 
 Per routed layer and trace: the plugin's decode policy (policy.zig LayerPolicy.planWith(.decode), replicated below)
@@ -158,7 +158,7 @@ def misses(t, l, rows):
     return sum(len(u) - p.plan(u) for u in t.seq[l])
 
 
-# ── the split (glm_moe_dsa_split.zig) on the 3.0 pack's K3 stream layers ──
+# ── the split (src/arch/glm_moe_dsa/split.zig) on the 3.0 pack's K3 stream layers ──
 
 LO, STEP, N = 8, 4, 256
 PAGE = 16384
@@ -242,7 +242,7 @@ def decode_rows(curves, ref, prompt_units, units):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("traces", nargs="+")
-    ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "glm_moe_dsa_split_k3.zig"))
+    ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "arch", "glm_moe_dsa", "split_k3.zig"))
     ap.add_argument("--prompt-units", type=int, default=81)
     ap.add_argument("--units", type=int, default=96)
     a = ap.parse_args()

@@ -8,9 +8,9 @@
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const log = @import("sdk").log;
-const xk = @import("glm53_exl3_kernels.zig");
-const kset = @import("sdk_ext/kernel_set.zig");
-const routes = @import("glm53_exl3_routes.zig");
+const xk = @import("kernels.zig");
+const kset = @import("../../../sdk_ext/kernel_set.zig");
+const routes = @import("routes.zig");
 const sushi = @import("mlx_host").sushi_exl3;
 
 const Allocator = std.mem.Allocator;
@@ -471,7 +471,7 @@ fn promptChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
 // ── Tests (GPU: DSV41_PHASE0B_MLX) ──
 
 const testing = std.testing;
-const ks = @import("sdk_ext.zig").kernels.KernelSet(xk);
+const ks = @import("../../../sdk_ext.zig").kernels.KernelSet(xk);
 
 fn gpuSet(a: Allocator, s: mlx.mlx_stream) !*ks.Set {
     var diag: xk.Diag = .{};

@@ -14,13 +14,13 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
-const sdk_ext = @import("sdk_ext.zig");
+const sdk_ext = @import("../../sdk_ext.zig");
 const expert_io = sdk_ext.expert.io;
 const bank_file = sdk_ext.expert.bank_file;
 const quant = sdk_ext.quant;
 const glm = @import("glm_moe_dsa.zig");
-const affine = @import("glm_moe_dsa_bank.zig");
-const bill_units = @import("glm_moe_dsa_bill.zig");
+const affine = @import("bank.zig");
+const bill_units = @import("bill.zig");
 const sushi = @import("mlx_host").sushi_exl3;
 
 pub const format = "mlx-stream-expert-manifest-exl3-v1";
@@ -794,7 +794,7 @@ test "glm exl3 bank: a uniform pack (one K3 bank layer per layer, the converter'
 
 test "glm exl3 bank: a uniform pack of 256 K3 experts a routed layer: its routes, their gates, the reads ahead and the grow touch no empty layer" {
     const a = testing.allocator;
-    const split = @import("glm_moe_dsa_split.zig");
+    const split = @import("split.zig");
     const text = try glm.tinyConfigJson(a, glm.tiny_quant);
     defer a.free(text);
     const t256 = try std.mem.replaceOwned(u8, a, text, "\"n_routed_experts\":16,", "\"n_routed_experts\":256,");
@@ -878,7 +878,7 @@ test "glm exl3 bank: a uniform pack of 256 K3 experts a routed layer: its routes
 
 test "glm exl3 bank: at GLM-5.3's geometry the 3.42 bpw pack's and the uniform 3.0 bpw pack's manifests give the bill's slots, its units and the split's packs" {
     const a = testing.allocator;
-    const split = @import("glm_moe_dsa_split.zig");
+    const split = @import("split.zig");
     const text = try glm.testConfigJson(a, ",\"model.embed_tokens\":{\"group_size\":64,\"bits\":8},\"lm_head\":{\"group_size\":64,\"bits\":8}");
     defer a.free(text);
     var c = try glm.Config.parse(a, text, &glm.glm53, null);
