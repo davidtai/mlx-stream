@@ -66,6 +66,14 @@
   sample -12.23%, and baseline drift 3.78%. Throughput and changed-path attribution both fail.
   The clean warmed capture contains 6,260 enclosing samples, not proof of changed-helper
   execution. All six remain excluded; no optimizer is restarted or engine win promoted.
+- Diagnose the apparent K3/Jayleaton slowdown as a benchmark-mode mismatch: earlier fast
+  serving used native DSpark, while the rejection validators explicitly disabled MTP.
+  Controlled current-binary drafting toggles recover K3/Jayleaton throughput without a
+  reboot or cache purge. Inter-launch drift remains separate from stock-neutrality proof.
+- Retry all six saved deltas with native MTP/DSpark execution required in each measured arm
+  and profile. Output/usage parity passes; nominal +1.84% is rejected by unchanged throughput
+  and changed-path gates. Two matched samples regress, baseline drift is 3.38%, and enclosing
+  samples do not prove changed-helper execution. None is promoted.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the

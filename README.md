@@ -182,6 +182,39 @@ samples, zero verified changed-helper samples, and no changed kernel has proven 
 All owned processes exit normally and the GPU lease is released. These deltas remain excluded:
 source applicability is confirmed, engine benefit is not.
 
+#### Native drafting configuration and saved-delta retry
+
+The rejected stock and saved-delta validator tables above use forced serial decoding:
+their launch arguments include `--no-mtp`. They must not be compared as normal served
+throughput against the earlier DSpark-enabled K3/Jayleaton results. An installed native
+draft lane is not evidence of execution; the host gates DSpark off when MTP is disabled.
+
+A same-binary, same-historical-fixture diagnostic recovered normal throughput without
+rebooting, purging caches or changing power policy. Each entry is a median of three
+uncached 192-token completions; native execution markers and loaded runtime images were checked.
+
+| Diagnostic configuration | Median delivered tok/s |
+|---|---:|
+| Current-main K3, serial, two launches | 15.76 / 16.40 |
+| Current-main K3, DSpark, two launches | 28.75 / 25.36 |
+| Repaired K3, DSpark | 28.43 |
+| Repaired Jayleaton hybrid, DSpark | 24.08 |
+
+The same DSpark baseline still varies between launches despite matching cache rows and
+output. A separate single-server run cycles the original three fixtures four times,
+requires zero cached tokens and retains matching per-fixture output. Its median delivery
+rate is 28.17 tok/s; loaded GPU temperature peaks at 77.51 C, with no swapouts across the run.
+This diagnoses the headline configuration mismatch, not the cause of all inter-launch drift,
+nor full stock 16K neutrality. No ENOSPC-corruption or thermal-causality claim is made.
+
+All six saved deltas were then retried on source08's actual Jayleaton engine with native
+MTP/DSpark enabled. The harness requires `spec=dspark` execution markers for every arm and
+the owned profile target; throughput, output/usage and changed-path gates are unchanged.
+Output/usage parity passes. Nominal median gain is +1.84%, but the >=2% median / >=1% every
+matched sample rule fails, with two matched changes of -0.34%/-0.09% and 3.38% baseline drift.
+The clean trace has 2,425 enclosing samples and zero verified changed-path samples.
+The retry is rejected for promotion; all six remain excluded.
+
 
 | Published source | Expert contract | Status |
 |---|---|---|
