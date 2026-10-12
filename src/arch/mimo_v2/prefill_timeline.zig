@@ -40,6 +40,9 @@ const std = @import("std");
 const mlx = @import("sdk").mlx;
 const profile = @import("profile.zig");
 const gpu_power = @import("gpu_power.zig");
+/// The command-buffer rows, the signal log's entries, the host clock and the span arithmetic are the verify timeline's
+/// (the same shim and pool log).
+const verify_timeline = @import("../deepseek_v41/verify_timeline.zig");
 const log = std.log.scoped(.mimo);
 
 pub const enabled = profile.enabled;
@@ -48,8 +51,8 @@ pub const Stage = enum(u8) { edge, predict, attn, router, dense, moe, join, gath
 pub const n_stages = @typeInfo(Stage).@"enum".field_names.len;
 pub const TileKind = enum(u8) { moe, reduce };
 
-/// One committed command buffer (the shim's `Dsv41tlRow`, same layout as `dsv41_verify_timeline.Row`).
-pub const Row = extern struct { host_commit: u64 = 0, gpu_start: u64 = 0, gpu_end: u64 = 0, host_done: u64 = 0, tag: u64 = 0, status: u64 = 0, queue: u64 = 0 };
+/// One committed command buffer (the shim's `Dsv41tlRow`).
+pub const Row = verify_timeline.Row;
 /// A host mark: from `t` to the next mark's `t` the host is in `stage` (of `layer`; `no_layer` on the edge). `io_ns`:
 /// the drive's busy ns so far; `nb_calls` / `nb_bytes`: fresh Metal buffers so far; `tile`: the tile index + 1 (0: none).
 pub const Mark = struct { t: u64 = 0, io_ns: u64 = 0, nb_calls: u64 = 0, nb_bytes: u64 = 0, tile: u32 = 0, layer: u16 = no_layer, stage: Stage = .edge };
@@ -59,7 +62,7 @@ pub const Mark = struct { t: u64 = 0, io_ns: u64 = 0, nb_calls: u64 = 0, nb_byte
 /// the bank would pass) and the event value its waves wait for (0: none).
 pub const Tile = struct { layer: u16 = 0, kind: TileKind = .moe, idx: u16 = 0, rows: u32 = 0, bank_rows: u32 = 0, slots: u32 = 0, span: u32 = 0, gate: u64 = 0 };
 /// The read pool's signal log entry (`q3ld_test_ev_log`): value, signal call time, prefix-advance time, call ns.
-pub const Signal = [4]i64;
+pub const Signal = verify_timeline.Signal;
 pub const no_layer: u16 = 0xFFFF;
 
 pub const max_rows = 1 << 17;
@@ -109,11 +112,7 @@ const Storage = struct {
     var signals: [max_signals]Signal = undefined;
 };
 
-pub fn now() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.UPTIME_RAW, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+pub const now = verify_timeline.now;
 
 /// Construction: `MIMO_PREFILL_TIMELINE` read once (`"1"` arms it; unset or `"0"` leaves it off; anything else refuses).
 pub fn want(io: std.Io) !bool {
@@ -380,7 +379,9 @@ pub fn pathOf(rows: u32, bank_rows: u32) u2 {
     return if (rows / bank_rows < 64) 0 else 1;
 }
 
-const Span = [2]u64;
+const Span = verify_timeline.Span;
+const busyIn = verify_timeline.busyIn;
+const signalOf = verify_timeline.signalOf;
 
 /// A buffer's GPU start. Metal reports GPUStartTime 0 for some committed buffers (cells/p1-20261009: the first buffer of
 /// 293 of 546 prompt-pass dispatches, the one holding a group's event wait); such a buffer started no earlier than its
@@ -418,31 +419,10 @@ fn unionOf(a: std.mem.Allocator, rs: []const Row, lo: u64, hi: u64, filter: ?Sta
     return list.toOwnedSlice(a);
 }
 
-fn busyIn(u: []const Span, x: u64, y: u64) u64 {
-    var s: u64 = 0;
-    for (u) |sp| {
-        const p = @max(sp[0], x);
-        const q = @min(sp[1], y);
-        if (q > p) s += q - p;
-    }
-    return s;
-}
-
 fn totalOf(u: []const Span) u64 {
     var s: u64 = 0;
     for (u) |sp| s += sp[1] - sp[0];
     return s;
-}
-
-/// The first logged signal at or past `value` (values never decrease): its signal call time.
-fn signalOf(sig: []const Signal, value: u64) ?u64 {
-    var lo: usize = 0;
-    var hi: usize = sig.len;
-    while (lo < hi) {
-        const mid = (lo + hi) / 2;
-        if (@as(u64, @intCast(sig[mid][0])) < value) lo = mid + 1 else hi = mid;
-    }
-    return if (lo < sig.len) @intCast(sig[lo][1]) else null;
 }
 
 pub fn summarize(a: std.mem.Allocator, in: Input) !Sum {
