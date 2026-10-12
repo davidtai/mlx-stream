@@ -69,7 +69,7 @@
   (MiMo's, allocated per geometry) and the KV grow lane gains a `resize`.
 - GLM-5.3: the MTP draft lane over the release's MTP layer (`mtp_depth`, `mtp_acceptance`, `mtp_typical_delta`;
   off by default, exact acceptance unless typical is named), its experts resident from the EXL3 build's records
-  through sushi's EXL3 MoE; PR #5's `convert_glm_exl3_bank.py --mtp-only` writes the pack's `mtp/` directory.
+  through sushi's EXL3 MoE; `scripts/convert_glm_exl3_bank.py --mtp-only` writes the pack's `mtp/` directory.
 - GLM-5.3 prompt pass: the attention over each row's selected keys on mlx-serve's DSA kernels (the indexer's scores
   and the latent attention on the tensor units), in layer-major calls of 16,384 rows and spans under 2 GiB that the
   bill charges with the same functions; each routed expert read at most once per call, a layer's misses read at its

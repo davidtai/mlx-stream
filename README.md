@@ -308,7 +308,7 @@ failing problems.
 
 The `glm_moe_dsa` arch serves GLM-5.3 (744B, 78 layers: 3 dense, 75 MoE with 256 experts, top-8 and one shared expert;
 MLA; the lightning indexer on 21 layers) from a pack of resident shards and an expert bank (the pack converters,
-`scripts/convert_glm_bank.py` and `scripts/convert_glm_exl3_bank.py`, and the pack formats come with PR #5). The
+`scripts/convert_glm_bank.py` and `scripts/convert_glm_exl3_bank.py`, and the pack formats are in this repository). The
 experts stream from the pack's bank through the same stream, read pool, residency policy, lookahead and event gates as
 DeepSeek-V4.1; on the affine bank the expert math is MLX's own `gather_qmm`, on the EXL3 bank see below.
 
@@ -444,7 +444,7 @@ At each prompt the residency policy keeps the residents of the prompt rows and f
 The decode policy's transition counts and its window carry over from one request to the next.
 
 The MTP draft lane (`mtp_depth` > 0) runs the release's MTP layer (layer 78), which the MLX builds drop. The pack
-must have `mtp/` beside its shards, as PR #5's `scripts/convert_glm_exl3_bank.py --mtp-only --from-pack <EXL3 pack>
+must have `mtp/` beside its shards, as `scripts/convert_glm_exl3_bank.py --mtp-only --from-pack <EXL3 pack>
 --dst <pack>/mtp` writes it: `mtp-residents.safetensors` (the layer's BF16 tensors as published),
 `mtp-experts.bin` and `mtp-manifest-exl3-v1.json` (its 256 experts as the EXL3 build's mini-expert records). Without
 `mtp/`, the load is refused by name. The experts stay resident (4.17 GB) and run through sushi's EXL3 MoE on the

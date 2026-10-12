@@ -3,8 +3,8 @@
 The MXFP4 pack is a model directory for the `glm_moe_dsa` arch with MXFP4 weights. The routed experts live in one
 sidecar file, `experts.bin`, as packed per-expert records. The other tensors stay in safetensors shards and load once.
 The MTP layer is in `mtp/`. `scripts/convert_glm_mxfp4_bank.py` writes the pack from the compressed-tensors snapshot
-`RedHatAI/GLM-5.3-MXFP4`. The arch's MXFP4 bank module reads it. Both follow this document. A change to the format
-changes both.
+`RedHatAI/GLM-5.3-MXFP4`. Today the arch's GLM-5.3 bank refuses mode `mxfp4` by name; the converter targets a future
+MXFP4 bank module. Both follow this document. A change to the format changes both.
 
 ## Source
 
