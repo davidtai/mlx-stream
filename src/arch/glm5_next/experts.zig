@@ -16,6 +16,7 @@ const sdk = @import("sdk");
 const mlx = sdk.mlx;
 const sdk_ext = @import("../../sdk_ext.zig");
 const expert_event = sdk_ext.expert.event;
+const expert_tally = sdk_ext.expert.tally;
 const ops = @import("../deepseek_v41/ops.zig");
 const shared_experts = @import("../deepseek_v41/experts.zig");
 const mimo_stream = @import("../mimo_v2/stream.zig");
@@ -27,6 +28,7 @@ const nvfp4 = @import("nvfp4.zig");
 const settings = @import("settings.zig");
 const glue = @import("glue.zig");
 const profile = @import("../mimo_v2/profile.zig");
+const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
 const route_trace = @import("../mimo_v2/route_trace.zig");
 const log = sdk.log;
@@ -80,13 +82,15 @@ comptime {
 }
 
 /// The stream's construction options (pure: the CPU tests read them): MiMo's event gates and lookahead over `rows`, the
-/// phase rows' transient release, the read schedule's overlap route with prompt lever 1's relocation, decode's window 0.
-pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event) !B.Options {
+/// phase rows' transient release, the read schedule's overlap route with prompt lever 1's relocation, decode's window 0,
+/// and the rate tally (`tally`: every layer pins at most floor(ratio x 288) experts; none at ratio 0).
+pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !B.Options {
     var opts = B.eventOptions(rows, memory, event);
     opts.transient_release = true;
     try B.applyReadSchedule(&opts, read_schedule);
     opts.prompt_relocate = prompt_relocate;
     opts.decode_route_ids = mimo_stream.decodeRouteIds(decode_window);
+    opts.tally = if (tally.enabled()) .{ .ratio = tally.ratio, .window = tally.window } else null;
     return opts;
 }
 
@@ -157,6 +161,9 @@ pub const Source = struct {
     parts_combine: *const PartsCombineFn = partsCombineInplace,
     combine_kernel: prefill_combine.Kernel = .{},
     combine_route: prefill_combine.Route = .inplace,
+    /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine (its own queue, kernel, buffer and parked thread); the
+    /// stream source holds its arm (`warm_arm`: armed by `gate` and `awaitReadAhead`). Null on the control.
+    warm: ?*gpu_warm.Warm = null,
     /// P1's host scratch (reused): the call's predicted counts (read back from the GPU, prompt lever 5), the ranking.
     ahead_counts: [max_experts]u32 = undefined,
     ahead_ranked: [max_experts]u16 = undefined,
@@ -164,7 +171,7 @@ pub const Source = struct {
     /// Construction (the GPU stream, under the caller's lock): the bank opened, the stream at `rows`, the scheduler
     /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
     /// routed layer's.
-    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict) !*Source {
+    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings) !*Source {
         var bank = try bank_mod.Bank.open(a, io, model_dir);
         errdefer bank.deinit();
         const geo = bank.geometry;
@@ -196,10 +203,17 @@ pub const Source = struct {
         // refused here, once, if a bank's spans outgrow it.
         if (B.S.stagingBytes(&self.sdk_bank) > settings.reader_staging_bytes) return error.Glm5NextReaderStaging;
         const event = try expert_event.createMetal();
-        self.sdk_stream = try Stream.init(a, &self.sdk_bank, try streamOptions(self.rows, .{ .mlx = stream }, event));
+        self.sdk_stream = try Stream.init(a, &self.sdk_bank, try streamOptions(self.rows, .{ .mlx = stream }, event, tally));
         errdefer self.sdk_stream.deinit();
         self.stream_source = StreamSource.init(self.sdk_stream);
         try self.stream_source.installReadSchedule(read_schedule, mimo_stream.default_read_schedule_threshold);
+        // MiMo's X12 (`gpu_keep_warm`, the route the module resolved: `settings.Config.warmRoute`): `.waits` makes the warm
+        // queue, kernel and buffer on MLX's device (no kernel runs) and starts the parked warm thread, once, and binds its
+        // arm into the stream source (mimo_v2/source.zig's install); `.off` installs nothing; refused by name on a CPU
+        // stream or without the stream's Metal event.
+        self.warm = try gpu_warm.install(a, keep_warm, stream, event.object);
+        errdefer if (self.warm) |w| w.destroy();
+        if (self.warm) |w| self.stream_source.warm_arm = gpu_warm.Arm.of(gpu_warm.Warm, w);
         // The slot arrays are the format's, every routed layer's (base and transient banks), checked once.
         for (0..geo.num_moe_layers) |i| {
             const layer: u32 = geo.first_moe_layer + @as(u32, @intCast(i));
@@ -261,6 +275,8 @@ pub const Source = struct {
 
     pub fn deinit(self: *Source) void {
         _ = mlx.mlx_synchronize(self.g.s);
+        // X12: the warm thread joined (its chunks in flight retired) before anything else goes (MiMo's order).
+        if (self.warm) |w| w.destroy();
         self.ex.releaseParts(&self.g);
         self.ex.math.deinit(&self.g);
         self.combine_kernel.deinit();
@@ -422,12 +438,33 @@ pub const Source = struct {
     pub fn stats(self: *Source) sdk_ext.expert.Stats {
         return self.stream_source.stats();
     }
+
+    /// The rate tally's geometry: the stream's layers (the routed layers) and each one's experts.
+    pub fn tallyShape(self: *const Source) struct { layers: u32, experts: u32 } {
+        return .{ .layers = @intCast(self.sdk_stream.layers.len), .experts = self.bank.geometry.num_experts };
+    }
+
+    /// Every layer's tally seeded from a tally file's rates (`tallyShape`: layers x experts): the pins of the next request.
+    pub fn seedTally(self: *Source, rates: []const f32) void {
+        self.sdk_stream.seedTally(rates);
+    }
+
+    /// The request's end: each layer's decode rates folded in and written to `out` (layers x experts); the layers that
+    /// routed in the decode.
+    pub fn endTally(self: *Source, out: []f32) u32 {
+        return self.sdk_stream.endTally(out);
+    }
 };
 
 test "glm5_next experts: the stream's options install the overlap schedule early_whole_trim with prompt lever 1's relocation (exact), the phase rows' release and decode's window" {
     const testing = std.testing;
     const rows = [_]u32{ 124, 124 };
-    const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 });
+    const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 });
+    try testing.expect(opts.tally == null);
+    const tallied = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0.25, .window = 16 });
+    try testing.expectEqual(@as(f64, 0.25), tallied.tally.?.ratio);
+    try testing.expectEqual(@as(u32, 16), tallied.tally.?.window);
+    try testing.expect(tallied.tally.?.layer_experts == null);
     try testing.expectEqual(B.S.PromptReads.overlap, opts.prompt_reads);
     try testing.expectEqual(B.S.AheadPost.whole_trim, opts.prompt_ahead);
     try testing.expect(opts.prompt_relocate);
@@ -435,4 +472,64 @@ test "glm5_next experts: the stream's options install the overlap schedule early
     try testing.expectEqual(mimo_stream.decodeRouteIds(decode_window), opts.decode_route_ids);
     try testing.expectEqual(@as(u64, 123), opts.event.?.backend.metal);
     try testing.expectEqualSlices(u32, &rows, opts.rows);
+}
+
+test "glm5_next experts: the rate tally's pins on Flash's geometry: the top floor(ratio x 288) experts by rate, at most the layer's rows, ties by the lower id; none unseeded" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const policy_mod = sdk_ext.expert.policy;
+    // A synthetic rate table: expert e's rate falls with e, two ties (experts 10 and 11 share a rate) and four experts
+    // never routed (rate 0: never pinned).
+    var rates: [max_experts]f32 = undefined;
+    for (&rates, 0..) |*r, e| r.* = if (e >= max_experts - 4) 0 else 1.0 / @as(f32, @floatFromInt(e + 1));
+    rates[11] = rates[10];
+    for ([_]struct { ratio: f64, rows: u32, pins: u32 }{
+        .{ .ratio = 0.25, .rows = 143, .pins = 72 },
+        .{ .ratio = 0.5, .rows = 143, .pins = 143 }, // floor(0.5 x 288) = 144 > 143 rows: every row pinned
+        .{ .ratio = 0.5, .rows = 160, .pins = 144 },
+        .{ .ratio = 1.0, .rows = 288, .pins = 284 }, // only experts of positive rate
+    }) |case| {
+        var p = try policy_mod.LayerPolicy.init(a, max_experts, case.rows);
+        defer p.deinit(a);
+        p.setTally(expert_tally.pinLimit(case.ratio, max_experts), expert_tally.alphaOf(expert_tally.default_window));
+        for (0..max_experts) |e| try testing.expect(!p.isPinned(@intCast(e)));
+        p.seedTally(&rates);
+        var n: u32 = 0;
+        for (0..max_experts) |e| n += @intFromBool(p.isPinned(@intCast(e)));
+        try testing.expectEqual(case.pins, n);
+        // The hottest are pinned, in rate order (ties by the lower id: 10 before 11).
+        for (0..case.pins) |e| try testing.expect(p.isPinned(@intCast(e)));
+        if (case.pins < max_experts - 4) try testing.expect(!p.isPinned(@intCast(case.pins)));
+    }
+}
+
+test "glm5_next experts: the rate tally's file round-trips at Flash's geometry (42 layers x 288 experts); another geometry is ignored" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &dir_buf);
+    const root = dir_buf[0..root_len];
+    const key = try expert_tally.keyOf(a, "glm5_next", "/models/GLM-5.3-Flash-NVFP4-fp8res-mlx-stream/");
+    defer a.free(key);
+    try testing.expectEqualStrings("glm5_next-GLM-5.3-Flash-NVFP4-fp8res-mlx-stream", key);
+    const path = try std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ root, key, expert_tally.file_name });
+    defer a.free(path);
+    const n_layers: u32 = 42;
+    const rates = try a.alloc(f32, n_layers * max_experts);
+    defer a.free(rates);
+    for (rates, 0..) |*r, i| r.* = @as(f32, @floatFromInt(i % 97)) / 97.0;
+    try testing.expect((try expert_tally.read(a, io, path, n_layers, max_experts)) == .missing);
+    try expert_tally.write(a, io, path, rates, n_layers, max_experts, expert_tally.default_window);
+    switch (try expert_tally.read(a, io, path, n_layers, max_experts)) {
+        .rates => |back| {
+            defer a.free(back);
+            try testing.expectEqualSlices(f32, rates, back);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect((try expert_tally.read(a, io, path, 43, max_experts)) == .mismatched);
+    try testing.expect((try expert_tally.read(a, io, path, n_layers, 256)) == .mismatched);
 }

@@ -9,12 +9,18 @@
 //! `ops`, the op chain, the control); `decode_dsa` the decode lane's sparse latent attention (`fused`, the default: two
 //! texts, dsa_decode.zig; `ops`, the op chain, the control); `decode_predict` the lookahead predictor's router weight
 //! (`bf16`, the default: the stored BF16 weight; `f32`, the transposed F32 copy, the control); `decode_swiglu` the decode lane's MLP activation
-//! (`fused`, the default: one text, swiglu.zig; `ops`, the op chain, the control); `logits_dump_dir` (an absolute directory) installs the logits dump route for the KL gate
-//! (dump.zig): absent, nothing of it is built.
+//! (`fused`, the default: one text, swiglu.zig; `ops`, the op chain, the control); `gpu_keep_warm` MiMo's X12 route
+//! (`waits`, the default: a one-simdgroup spin on its own Metal queue while the stream's gated parts and read-ahead wait
+//! for their bytes, mimo_v2/gpu_warm.zig; `off`, the control); `logits_dump_dir` (an absolute directory) installs the
+//! logits dump route for the KL gate (dump.zig): absent, nothing of it is built. `expert_resident_ratio`,
+//! `expert_tally_window` and `expert_tally_file` set the expert stream's rate tally (sdk_ext/expert/tally.zig, every
+//! streamed arch's keys; glm5_next's default ratio `default_tally_ratio`).
 
 const std = @import("std");
 const sdk = @import("sdk");
 const glm = @import("config.zig");
+const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
+const expert_tally = @import("../../sdk_ext.zig").expert.tally;
 
 /// The context a load bills when the model sets none: the standard request (16,384 prompt tokens and 1,024 generated).
 pub const fill_reserve_tokens: u64 = 16_384 + 1_024;
@@ -22,13 +28,62 @@ pub const fill_reserve_tokens: u64 = 16_384 + 1_024;
 pub const host_bytes: u64 = 1_000_000_000;
 pub const host_construction_bytes: u64 = 400_000_000;
 pub const compilation_bytes: u64 = 512 << 20;
+
+/// MiMo's M1 (`host_runtime`) + M2 (`compiler_runtime`) for glm5_next, the DECODE phase only (bill.zig
+/// `decodeHostTerms`): one measured bound for the process's host side, its footprint less MLX's active and cache (the
+/// host's allocations, the compiled graphs and Metal pipelines: what neither MLX nor a geometric term counts), the
+/// reading `Module.requestEnd` prints in its `glm5_next decode memory:` line. The rule is MiMo's and DeepSeek's: the
+/// max-shape reading + 0.02 GB for a long decode, rounded up to the next 50 MB. Readings: all 112 of the served and
+/// profile cells of 2026-10-12 (reports/.../mimo/cells/glm5next-*/**/server.log, stub runs excluded): BF16 and FP8
+/// packs, serial and the MTP lane, 1, 1,024, 10,403 and 16,384 decode tokens, reserves 4,096 and 32,768; host side
+/// 494.8-833.3 MB, the largest 833,268,278 B (g21b-vs-g21c 03-B: FP8, lane on, 115/131, MLX's cache read 0 at the end);
+/// the 16K-token decodes read 494.8 and 550.2 MB (no growth with decode length). Hence 900 MB in decode for host_runtime
+/// and compiler_runtime TOGETHER (the reading cannot split them): compiler_runtime's decode bytes are 0 and
+/// host_runtime's are this. The prompt phase keeps both declared terms (no prompt-phase reading), and so does every
+/// reserve the readings do not cover (`decode_host_measured_reserve`: 32,768, the largest read). MLX's cache term stays
+/// declared (bounded by its limit and the overshoot term, not by a snapshot). Releases 636,870,912 B in decode.
+pub const decode_host_reading_bytes: u64 = 833_268_278;
+pub const decode_host_long_decode_bytes: u64 = 20_000_000;
+pub const decode_host_bytes: u64 = (std.math.divCeil(u64, decode_host_reading_bytes + decode_host_long_decode_bytes, 50_000_000) catch unreachable) * 50_000_000;
+/// The largest construction reserve (tokens) the readings cover; above it the decode phase bills the declared terms.
+pub const decode_host_measured_reserve: u64 = 32_768;
+/// The no-under-bill fixture (bill.zig test "M1-M3"): each reading's footprint, MLX active, MLX cache, its cell's process
+/// bound and reserve: the largest host side of each pack and lane, the largest cache, the own-fill cells, the long
+/// decodes and the smallest reserve.
+pub const decode_host_readings = [_][5]u64{
+    .{ 95_305_026_376, 94_471_758_098, 0, 98_472_578_980, 32_768 }, // g21b-vs-g21c 03-B (FP8, lane; the largest host side)
+    .{ 95_617_616_664, 94_528_430_319, 276_389_478, 98_467_622_820, 32_768 }, // g19m-vs-g21b 02-B (FP8, lane; the largest cache)
+    .{ 96_932_302_648, 95_861_683_071, 268_727_143, 99_189_569_332, 32_768 }, // g19m-serial-vs-lane 02-B (BF16, lane)
+    .{ 97_995_707_200, 97_264_520_570, 8_586_644, 100_176_321_724, 32_768 }, // g19f-vs-g19f-stack3 03-B (BF16, serial)
+    .{ 103_666_213_752, 103_047_808_854, 8_586_644, 105_510_501_940, 32_768 }, // g19q-vs-g19q3 02-B (FP8, serial, own fill)
+    .{ 102_456_024_728, 101_606_242_482, 268_732_608, 105_024_025_756, 32_768 }, // g19-vs-g21c-ownfill 02-B (FP8, lane, own fill)
+    .{ 103_207_182_840, 102_615_296_446, 8_586_644, 105_492_585_324, 32_768 }, // g19-vs-g21c-ownfill 01-A (BF16, serial, own fill)
+    .{ 103_223_075_320, 102_615_296_446, 57_622_863, 105_492_585_324, 32_768 }, // glm5next-16k r05-16k (10,403 tokens)
+    .{ 103_118_643_680, 102_615_296_446, 8_586_644, 105_492_589_484, 32_768 }, // profile16k p16k (16,384 tokens)
+    .{ 86_480_924_336, 85_916_160_054, 28_309_072, 88_319_536_788, 4_096 }, // KL on the FP8 pack (reserve 4,096)
+};
+comptime {
+    // The decode phase holds the constructed module's host side too.
+    if (decode_host_bytes < host_construction_bytes) @compileError("decode host side under its construction bound");
+    if (decode_host_bytes > host_bytes + compilation_bytes) @compileError("decode host side over the declared terms");
+}
 /// MLX's buffer cache limit through the request (the decode phase's and the prompt pass's).
 pub const allocator_cache_bytes: u64 = 256 << 20;
+/// The expert stream's rate tally on glm5_next (sdk_ext/expert/tally.zig, policy.zig: per layer and expert an EMA of the
+/// decode routes' request rate; the top `expert_resident_ratio` of each layer's experts by rate pinned in the persistent
+/// rows, never victims, first in; with a seeded tally a prompt miss that is not pinned evicts nothing; the file
+/// ~/.mlx-stream/glm5_next-<pack dir>/expert-tally.bin read at the load, written at each request's end). The default
+/// ratio: 0 (off). The policy's exact replay on the profile cell's route trace (4,096 serial decode tokens at 140 rows,
+/// 0 plan mismatches; pins from the first 2,048 tokens' route shares): at Flash's ~50 % residency, ratio 0.5 pins
+/// min(144, rows) = every decode row (a static resident set) and misses +7.2 % in-sample / +34.0 % on the next 2,048
+/// tokens; 0.25 -2.5 % / +1.1 %; 0.375 -4.0 % / +4.0 %; pins from the prompt's counts +13..+190 %. No ratio gains out of
+/// sample (and that trace is the benchmark prompt's own: a ceiling at best). A load names a ratio to turn it on.
+pub const default_tally_ratio: f64 = 0;
 /// The reader's staging per worker: Flash's gate/up span (9,437,192 B) plus its page alignment and a page (bank.zig).
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "logits_dump_dir" };
 
 /// The decode lane's routed-expert route, installed once at construction: `stock` MLX's gather_qmm nvfp4 (two gathers
 /// and the clamped SwiGLU, then a gather per down), `fused` the NVFP4 decode texts (decode_kernels.zig: MiMo's k1 family
@@ -90,6 +145,16 @@ pub const Config = struct {
     decode_predict: DecodePredict = .bf16,
     /// The decode lane's MLP activation (swiglu.zig): `fused` (the default) or `ops` (the control).
     decode_swiglu: DecodeSwiglu = .fused,
+    /// MiMo's X12 keep-warm (mimo_v2/gpu_warm.zig, adopted there as the default: round -4.7 ms, decode +2.4 %, ids
+    /// identical): `waits` (the default) warms the GPU while the stream's event-gated parts (decode miss parts, a prompt
+    /// group's reads) and the host's read-ahead wait for their bytes; `off` (the control) installs nothing. Exact by
+    /// construction (the engine touches no model array). On a CPU stream the default resolves to `off` (`warmRoute`).
+    gpu_keep_warm: gpu_warm.Route = .waits,
+    /// The settings named `gpu_keep_warm` (a named route refuses where the default resolves to the control).
+    gpu_keep_warm_requested: bool = false,
+    /// The expert stream's rate tally (`expert_resident_ratio`, `expert_tally_window`, `expert_tally_file`): every
+    /// streamed arch's keys (`expert_tally.Settings`), glm5_next's default ratio.
+    tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -101,7 +166,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, dump_dir: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -135,6 +200,12 @@ pub const Config = struct {
             const route: ?DecodeSwiglu = if (v == .string) std.meta.stringToEnum(DecodeSwiglu, v.string) else null;
             if (route) |r| c.decode_swiglu = r else c.malformed.decode_swiglu = true;
         }
+        if (raw.object.get("gpu_keep_warm")) |v| {
+            const route: gpu_warm.Route = if (v == .string) gpu_warm.parseRoute(v.string) else .invalid;
+            if (route == .invalid) c.malformed.gpu_keep_warm = true else c.gpu_keep_warm = route;
+            c.gpu_keep_warm_requested = true;
+        }
+        _ = c.tally.apply(raw.object);
         if (raw.object.get("logits_dump_dir")) |v| {
             const ok = v == .string and v.string.len > 1 and v.string.len <= max_dump_dir and v.string[0] == '/' and std.mem.indexOfScalar(u8, v.string, 0) == null;
             if (ok) {
@@ -142,6 +213,14 @@ pub const Config = struct {
                 c.dump_dir_len = @intCast(v.string.len);
             } else c.malformed.dump_dir = true;
         }
+    }
+
+    /// The keep-warm route the construction installs on a stream (`gpu`: the stream runs on the GPU): the setting's,
+    /// except that the DEFAULT on a CPU stream resolves to `off` (its waits are host waits; MiMo's rule); a named `waits`
+    /// stays and refuses by name at the install.
+    pub fn warmRoute(c: *const Config, gpu: bool) gpu_warm.Route {
+        if (c.gpu_keep_warm != .off and !c.gpu_keep_warm_requested and !gpu) return .off;
+        return c.gpu_keep_warm;
     }
 
     /// The logits dump route's directory (`logits_dump_dir`), null when the setting is absent.
@@ -185,6 +264,8 @@ pub const Config = struct {
         if (c.malformed.decode_dsa) return error.Glm5NextDecodeDsaSetting;
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
+        if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
+        try c.tally.check("glm5_next");
         if (c.kv_quant_bits) |b| if (b != 0 and b != 16) return error.Glm5NextKvQuantUnsupported;
         if (c.expert_rows) |d| if (d > c.model.n_routed_experts) return error.Glm5NextExpertRows;
         if (c.expert_prefill_rows) |p| if (p > c.model.n_routed_experts) return error.Glm5NextExpertRows;
@@ -267,6 +348,33 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try (try parseSettings("{\"decode_glue\":\"fused\"}")).validate();
     try testing.expectError(error.Glm5NextDecodeGlueSetting, (try parseSettings("{\"decode_glue\":\"stock\"}")).validate());
     try testing.expectError(error.Glm5NextDecodeGlueSetting, (try parseSettings("{\"decode_glue\":true}")).validate());
+    // The keep-warm route: waits unless named; off (the control) by name; anything else refused by name. The default on a
+    // CPU stream resolves to off; a named waits stays (the install refuses it there by name).
+    try testing.expectEqual(gpu_warm.Route.waits, pinned.gpu_keep_warm);
+    try testing.expect(!pinned.gpu_keep_warm_requested);
+    try testing.expectEqual(gpu_warm.Route.waits, pinned.warmRoute(true));
+    try testing.expectEqual(gpu_warm.Route.off, pinned.warmRoute(false));
+    const warm_off = try parseSettings("{\"gpu_keep_warm\":\"off\"}");
+    try warm_off.validate();
+    try testing.expectEqual(gpu_warm.Route.off, warm_off.warmRoute(true));
+    const warm_named = try parseSettings("{\"gpu_keep_warm\":\"waits\"}");
+    try warm_named.validate();
+    try testing.expectEqual(gpu_warm.Route.waits, warm_named.warmRoute(false));
+    try testing.expectError(error.Glm5NextGpuKeepWarmSetting, (try parseSettings("{\"gpu_keep_warm\":\"all\"}")).validate());
+    try testing.expectError(error.Glm5NextGpuKeepWarmSetting, (try parseSettings("{\"gpu_keep_warm\":true}")).validate());
+    // The rate tally: the default ratio unless named; the keys parsed; an impossible value refused by name.
+    try testing.expectEqual(default_tally_ratio, pinned.tally.ratio);
+    try testing.expectEqual(expert_tally.default_window, pinned.tally.window);
+    try testing.expectEqual(expert_tally.File.on, pinned.tally.file);
+    const tallied = try parseSettings("{\"expert_resident_ratio\":0.25,\"expert_tally_window\":16,\"expert_tally_file\":\"pinned\"}");
+    try tallied.validate();
+    try testing.expectEqual(@as(f64, 0.25), tallied.tally.ratio);
+    try testing.expectEqual(@as(u32, 16), tallied.tally.window);
+    try testing.expect(tallied.tally.readsFile() and !tallied.tally.writesFile());
+    try testing.expect(!(try parseSettings("{\"expert_resident_ratio\":0,\"expert_tally_file\":\"on\"}")).tally.readsFile());
+    try testing.expectError(error.ResidentRatioOutOfRange, (try parseSettings("{\"expert_resident_ratio\":1.5}")).validate());
+    try testing.expectError(error.TallyWindowOutOfRange, (try parseSettings("{\"expert_tally_window\":0}")).validate());
+    try testing.expectError(error.TallyFileUnknown, (try parseSettings("{\"expert_tally_file\":\"benchmark\"}")).validate());
     // The host's facts: its rows win; its context is the reserve.
     const facts: sdk.LoadFacts = .{ .memory_baseline_bytes = 10, .expert_rows = 90, .effective_context = 32_768, .wired_margin_bytes = 2 << 30 };
     const built = pinned.withFacts(&facts);
