@@ -158,7 +158,12 @@ its prompt pass (`draft_lane.arm`, blockSize 1 without a lane); the arch binds i
 request the prompt's last row and each serial step's row reach the host as the one-hot of the plugin's draw. A lane's
 verify draws the same token at the same position (sample-then-verify), so a seeded request yields the same ids serial or
 drafted, on every mlx-stream arch at equal rows. Unarmed requests (logprobs, grammar, penalties, `--no-mtp`) keep the
-host's sampler; greedy requests keep their logits (the host's argmax).
+host's sampler; greedy requests keep their logits (the host's argmax). A bound request logs `mlx-stream sampler: request
+bound (the plugin draws every token) lane="<lane>" ...` once, at its prompt pass. By construction a lane-less module
+reports blockSize 1 (`/props`: block_size 1, mtp_loaded true) and its requests default to `enable_mtp`: that is how
+the host arms them; the decode stays serial (`arm` answers off). The path-identical serial control is `mtp_lane` off
+served WITHOUT `--no-mtp` (`--no-mtp` keeps the host's sampler). Open: the host's masked special tokens are not passed
+to the plugin's draw (a follow-up: the mask in `ArmRequest`).
 
 ## The profile build
 

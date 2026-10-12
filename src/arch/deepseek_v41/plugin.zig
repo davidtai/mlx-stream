@@ -121,7 +121,7 @@ pub fn reservedTokens(_: sdk.RequestShape) u64 {
 /// The prompt pass: from position 0, or after the positions `restorePrefix` kept (`req.prompt_tokens` counts them).
 /// The prompt pass: the request's sampler bound (`draft_lane.arm`), its last row the plugin's first token when bound.
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
-    m.sampler.begin();
+    m.sampler.begin(m.decodeLane());
     return m.sampler.chosen(try m.prefillAt(req.prompt_tokens - ids.len, ids, reservedTokens(req)), m.position());
 }
 

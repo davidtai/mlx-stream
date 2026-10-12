@@ -138,9 +138,10 @@ pub fn deinit(m: *Module) void {
 /// The prompt pass: the request's sampler bound (`draft_lane.arm`), its last row the plugin's first token when bound.
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
     if (comptime !host_caps.glm) unreachable;
+    const lane = draft_lane.laneName(m);
     return switch (m.*) {
         inline else => |x| blk: {
-            x.sampler.begin();
+            x.sampler.begin(lane);
             break :blk x.sampler.chosen(try x.prefillAt(req.prompt_tokens - ids.len, ids), x.position());
         },
     };

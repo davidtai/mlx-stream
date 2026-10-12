@@ -39,10 +39,12 @@ pub fn SamplerOf(comptime G: type) type {
             self.pending = if (req.clean and !req.greedy) bindingOf(req.sampling) else null;
         }
 
-        /// The prompt pass's start: the request's binding (none when the host did not arm it).
-        pub fn begin(self: *Self) void {
+        /// The prompt pass's start: the request's binding (none when the host did not arm it). A bound request logs
+        /// once, with the decode lane it runs on (`lane`: the arch's lane name, "serial" without one).
+        pub fn begin(self: *Self, lane: []const u8) void {
             self.active = self.pending;
             self.pending = null;
+            if (self.active) |sm| sdk.log.info("mlx-stream sampler: request bound (the plugin draws every token) lane=\"{s}\" seed={d} temperature={d:.3} top_p={d:.3} top_k={d}\n", .{ lane, sm.seed, sm.temperature, sm.top_p, sm.top_k });
         }
 
         /// `logits` (owned by the caller; its last axis the vocabulary) predicts the token at absolute position
@@ -156,16 +158,16 @@ test "sdk_ext sampler: arm binds a clean sampled request for its prompt pass; gr
     const S = SamplerOf(NoOps);
     var s: S = .{ .g = .{} };
     s.arm(.{ .greedy = false, .clean = true, .sampling = .{ .temperature = 1.0, .top_p = 0.95, .seed = 1 } });
-    s.begin();
+    s.begin("serial");
     try testing.expectEqual(@as(u64, 1), s.active.?.seed);
     // The next request is not armed: unbound.
-    s.begin();
+    s.begin("serial");
     try testing.expect(s.active == null);
     s.arm(.{ .greedy = true, .clean = true, .sampling = .{ .temperature = 0.0, .seed = 1 } });
-    s.begin();
+    s.begin("serial");
     try testing.expect(s.active == null);
     s.arm(.{ .greedy = false, .clean = false, .sampling = .{ .temperature = 1.0, .seed = 1 } });
-    s.begin();
+    s.begin("serial");
     try testing.expect(s.active == null);
 }
 
