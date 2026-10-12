@@ -7,6 +7,7 @@
 //! (`truncateTo`) and appends after it. An append past the cap is refused by name (`BoundedLaneFull`).
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const sdk_ext = @import("../../sdk_ext.zig");
 const glm = @import("glm_moe_dsa.zig");
 
@@ -191,6 +192,7 @@ pub fn bytesAt(c: *const glm.Config, cap: u64, page: u64) u64 {
 const testing = std.testing;
 
 test "glm cache: the lanes' bytes at a cap are whole pages per buffer; at page multiples, the position's bytes times the cap" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const text = try glm.testConfigJson(testing.allocator, "");
     defer testing.allocator.free(text);
     var c = try glm.Config.parse(testing.allocator, text, &glm.glm53, null);

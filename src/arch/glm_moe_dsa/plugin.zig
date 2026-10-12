@@ -10,8 +10,16 @@ const settings = @import("settings.zig");
 const module = @import("module.zig");
 const bill_mod = @import("bill.zig");
 const bank_mod = @import("bank.zig");
+const host_caps = @import("../../host_caps.zig");
 
 pub const name = "glm_moe_dsa";
+
+/// GLM-5.3 on a host without its surface (`host_caps.glm`: sushi's EXL3 MoE and the DSA kernels, `mlx_host`'s pub
+/// `sushi_exl3` / `dsa_nax`): the parse and the construction refuse by name, so no config or module of this arch exists
+/// there and the entries that take one are unreachable (each compiles to its body on a host with the surface).
+const host_surface_missing = "glm_moe_dsa: this host exports no GLM-5.3 surface (mlx_host.sushi_exl3: " ++
+    (if (host_caps.sushi_exl3) "yes" else "no") ++ ", mlx_host.dsa_nax: " ++ (if (host_caps.dsa_nax) "yes" else "no") ++
+    "): GLM-5.3 needs a host built with both (GlmHostSurfaceMissing)";
 
 pub const caps: sdk.Caps = .{
     .owns_decode_state = true,
@@ -21,8 +29,9 @@ pub const caps: sdk.Caps = .{
 };
 
 pub const Config = settings.Config;
-/// The pack's bank picks the module at load (`module.Served`).
-pub const Module = module.Served;
+/// The pack's bank picks the module at load (`module.Served`). On a host without the GLM-5.3 surface no module exists
+/// (the construction refuses by name); the SDK's tables still name a type, one that reaches no host surface.
+pub const Module = if (host_caps.glm) module.Served else struct {};
 
 /// G6: the process's one expert reader, claimed at the load claim (a second load that needs it is refused by name,
 /// `error.ExpertReaderInUse`), released when the loaded model goes.
@@ -37,6 +46,10 @@ pub fn claims(p: *const sdk.ConfigPeek) ?sdk.Priority {
 /// The arch's own parse of config.json against the release this build serves (refusals by name), and the pack's
 /// directory beside it.
 pub fn parse(gpa: std.mem.Allocator, p: *const sdk.ConfigPeek, diag: *sdk.Diag) !*Config {
+    if (comptime !host_caps.glm) {
+        diag.set("{s}", .{host_surface_missing});
+        return error.GlmHostSurfaceMissing;
+    }
     var model = try glm.Config.parse(gpa, p.text, &glm.glm53, diag);
     const c = gpa.create(Config) catch |e| {
         model.deinit(gpa);
@@ -65,6 +78,7 @@ pub fn applySettings(c: *Config, raw: std.json.Value) void {
 
 /// The load preflight's requirement: the bill's process bound at the fill's floor rows.
 pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, c: *const Config, facts: *const sdk.LoadFacts, ceiling: u64) !u64 {
+    if (comptime !host_caps.glm) unreachable;
     _ = ceiling;
     try c.checkCtxSize();
     try c.checkMaxOutput();
@@ -82,6 +96,7 @@ pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, c: *const Config, facts: *c
 /// G4: the bill's terms for prompts up to the request's length (the fill's floor rows in the process bound). Pure
 /// host: the pack's shard headers and the bank's manifest through `io`.
 pub fn bill(gpa: std.mem.Allocator, io: std.Io, req: *const sdk.BillRequest) !sdk.MemoryBill {
+    if (comptime !host_caps.glm) unreachable;
     const c: *const Config = @ptrCast(@alignCast(req.cfg));
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -106,40 +121,50 @@ pub fn promptBytes(c: *const Config, seq: u64, max_tokens: u32) u64 {
 }
 
 pub fn init(load: *const sdk.LoadCtx, c: *const Config) !*Module {
+    if (comptime !host_caps.glm) {
+        sdk.log.err("{s}\n", .{host_surface_missing});
+        return error.GlmHostSurfaceMissing;
+    }
     const built = c.withFacts(&load.facts);
     return Module.init(load.gpa, load.io, &built, load.weights, load.stream, .{ .ceiling = load.ceiling, .wired_margin = load.facts.wired_margin_bytes });
 }
 
 pub fn deinit(m: *Module) void {
+    if (comptime !host_caps.glm) unreachable;
     m.deinit();
 }
 
 /// The prompt pass: from position 0, or after the positions `restorePrefix` kept (`req.prompt_tokens` counts them).
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
+    if (comptime !host_caps.glm) unreachable;
     return switch (m.*) {
         inline else => |x| x.prefillAt(req.prompt_tokens - ids.len, ids),
     };
 }
 
 pub fn restorePrefix(m: *Module, prefix: []const u32) u64 {
+    if (comptime !host_caps.glm) unreachable;
     return switch (m.*) {
         inline else => |x| x.restorePrefix(prefix),
     };
 }
 
 pub fn step(m: *Module, ids: []const u32) !sdk.mlx.mlx_array {
+    if (comptime !host_caps.glm) unreachable;
     return switch (m.*) {
         inline else => |x| x.extend(ids),
     };
 }
 
 pub fn position(m: *const Module) u64 {
+    if (comptime !host_caps.glm) unreachable;
     return switch (m.*) {
         inline else => |x| x.position(),
     };
 }
 
 pub fn handover(m: *Module, h: sdk.DecodeHandover) !void {
+    if (comptime !host_caps.glm) unreachable;
     return switch (m.*) {
         inline else => |x| x.decodeHandover(h),
     };
@@ -147,6 +172,7 @@ pub fn handover(m: *Module, h: sdk.DecodeHandover) !void {
 
 /// The request's end: the decode's stats line.
 pub fn requestEnd(m: *Module) void {
+    if (comptime !host_caps.glm) unreachable;
     switch (m.*) {
         inline else => |x| x.requestEnd(),
     }
@@ -157,6 +183,7 @@ pub fn requestEnd(m: *Module) void {
 /// names typical (with its delta). Logprobs, grammar and penalties consume logits the lane never shapes and stay serial.
 pub const draft_lane = struct {
     pub fn blockSize(m: *const Module) u32 {
+        if (comptime !host_caps.glm) unreachable;
         return switch (m.*) {
             inline else => |x| x.mtpDepth(),
         };
@@ -167,6 +194,7 @@ pub const draft_lane = struct {
     }
 
     pub fn arm(m: *const Module, req: sdk.ArmRequest) sdk.DraftArm {
+        if (comptime !host_caps.glm) unreachable;
         const mode = switch (m.*) {
             inline else => |x| (x.mtp orelse return .off).mode,
         };
@@ -178,12 +206,14 @@ pub const draft_lane = struct {
     }
 
     pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
+        if (comptime !host_caps.glm) unreachable;
         return switch (m.*) {
             inline else => |x| x.mtpRound(a, t1, accepted_cap, sampling),
         };
     }
 
     pub fn stats(m: *const Module) sdk.DraftStats {
+        if (comptime !host_caps.glm) unreachable;
         return switch (m.*) {
             inline else => |x| x.draftStats(),
         };
@@ -193,6 +223,7 @@ pub const draft_lane = struct {
 const testing = std.testing;
 
 test "glm plugin: claims its own model_type at native priority and declines the rest" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const real = try glm.testConfigJson(testing.allocator, "");
     defer testing.allocator.free(real);
     try sdk.testing.expectClaims(claims, &.{
@@ -204,6 +235,7 @@ test "glm plugin: claims its own model_type at native priority and declines the 
 }
 
 test "glm plugin: parse builds the arch's config and its pack dir, and refuses by the arch's own names" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const real = try glm.testConfigJson(testing.allocator, "");
     defer testing.allocator.free(real);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -221,6 +253,7 @@ test "glm plugin: parse builds the arch's config and its pack dir, and refuses b
 }
 
 test "glm plugin: the table the registry builds (owns its decode state, a handover, a request end, a prefix restore, its bills, its max output, a draft lane)" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const vt = comptime sdk.Arch.of(@This());
     try testing.expect(vt.caps.owns_decode_state and !vt.caps.batches_decode and vt.caps.prefill_whole_prompt and vt.caps.prefill_yields_last_logits);
     try testing.expect(vt.handover != null and vt.request_end != null and vt.restore_prefix != null and vt.bill != null and vt.prompt_bytes != null and vt.spec == .draft_lane);
@@ -234,6 +267,7 @@ test "glm plugin: the table the registry builds (owns its decode state, a handov
 }
 
 test "glm plugin: the term-wise bill bounds the process exactly as the load preflight bills it (a tiny pack)" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var rbuf: [512]u8 = undefined;

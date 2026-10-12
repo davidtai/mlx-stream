@@ -56,6 +56,8 @@ pub const arch = @import("arch/deepseek_v41/plugin.zig");
 /// (the conformance suite's list; the host's glue binds each arch by its own entry: the root's, `mimo` and `glm`).
 pub const archs = .{ @import("arch/deepseek_v41/plugin.zig"), @import("arch/glm_moe_dsa/plugin.zig") };
 pub const sdk = @import("sdk");
+/// The host surface beyond the SDK's this build sees (comptime, from the host's pub declarations): GLM-5.3's.
+pub const host_caps = @import("host_caps.zig");
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
 pub const default_context: u64 = @import("arch/deepseek_v41/bill.zig").fill_prompt_tokens;
 /// Positions a request may generate past its prompt (the KV lanes' bound) for an arch without its own `maxOutput`

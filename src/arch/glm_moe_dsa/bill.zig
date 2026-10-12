@@ -19,6 +19,7 @@
 //!   a routed group) frees its arrays once their consumers ran.
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const sdk = @import("sdk");
 const glm = @import("glm_moe_dsa.zig");
 const settings = @import("settings.zig");
@@ -1019,6 +1020,7 @@ fn boxInputs(c: *const glm.Config, cfg: *const settings.Config) Inputs {
 }
 
 test "glm bill: a fill unit is every stream layer's rows per expert slot at its share; the slot table holds the rows' exact bytes" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try testing.expectEqual(@as(u64, 75 * 21_233_664), unitBytes(glm53Geometry()));
     try testing.expectEqual(@as(u32, 256), maxUnits(glm53Geometry()));
     var out: [75]u32 = undefined;
@@ -1050,6 +1052,7 @@ test "glm bill: a fill unit is every stream layer's rows per expert slot at its 
 }
 
 test "glm bill: the prompt pass's cache limit is a sixteenth of the RAM, at most 16 GiB, and the bill's prompt cache term is that limit" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     // The 256 GiB M5 Ultra and a 24 GiB laptop.
@@ -1063,6 +1066,7 @@ test "glm bill: the prompt pass's cache limit is a sixteenth of the RAM, at most
 }
 
 test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on the box's EXL3 pack" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
@@ -1123,6 +1127,7 @@ test "glm bill: GLM-5.3's terms at the 16,448-token context, by construction on 
 }
 
 test "glm bill: the allocator's size classes: a page under 1 MiB, an eighth of the power of two above; the prompt's transients at them" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try testing.expectEqual(@as(u64, 100), sizeClassBytes(100));
     try testing.expectEqual(@as(u64, 32768), sizeClassBytes(16385));
     try testing.expectEqual(@as(u64, 1 << 20), sizeClassBytes(1 << 20));
@@ -1149,6 +1154,7 @@ test "glm bill: the allocator's size classes: a page under 1 MiB, an eighth of t
 }
 
 test "glm bill: the SDK's view fills the exact units, admits them, and refuses one more in either phase" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
@@ -1176,6 +1182,7 @@ test "glm bill: the SDK's view fills the exact units, admits them, and refuses o
 }
 
 test "glm bill: per machine size, the units the fill takes and the bytes the request's bill grows grow with the RAM" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
@@ -1209,6 +1216,7 @@ test "glm bill: per machine size, the units the fill takes and the bytes the req
 }
 
 test "glm bill: the bill at a request counts its slot rows exactly; a request's own KV fills more rows than the longest one's" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{ .max_context_tokens = 16448, .mtp_depth = 3 };
@@ -1245,6 +1253,7 @@ test "glm bill: the bill at a request counts its slot rows exactly; a request's 
 }
 
 test "glm bill: the live budget is the most grown bytes the reading leaves under the target, and refuses below the prompt rows" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var l: Live = .{ .target = 255_550_554_112, .baseline = 12_400_000_000, .mlx_bytes = 219_000_000_000, .device_after = 1_000_000_000, .host = 1_100_000_000 };
     const x = try l.budget();
     try testing.expect(l.total(x) <= l.target and l.total(x + 1) > l.target);
@@ -1255,6 +1264,7 @@ test "glm bill: the live budget is the most grown bytes the reading leaves under
 }
 
 test "glm bill: the target is the RAM less the OS reserve, and MLX's bytes stay within the GPU's" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const gib: u64 = 1 << 30;
     const ram: u64 = 274_877_906_944;
     const gpu = 240 * gib - 2 * gib;
@@ -1274,6 +1284,7 @@ test "glm bill: the target is the RAM less the OS reserve, and MLX's bytes stay 
 }
 
 test "glm bill: the grown budget is the most bytes under the target with their page tables, and a unit count's bytes" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try testing.expectEqual(@as(?u64, null), grownBudget(100, 0, 99));
     // 1 GiB under the target beside 200 GiB wired: the grown bytes and their page tables fill it to the byte.
     const wired: u64 = 200 << 30;
@@ -1291,6 +1302,7 @@ test "glm bill: the grown budget is the most bytes under the target with their p
 }
 
 test "glm bill: the MTP lane adds its residents, experts and slot table, its layer's KV, its pending hidden and its waves" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{ .mtp_depth = 3 };
@@ -1317,6 +1329,7 @@ test "glm bill: the MTP lane adds its residents, experts and slot table, its lay
 }
 
 test "glm bill: on the DSA kernels the prompt wave stops growing past one call; the reference's form grows with the keys" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const g = box_exl3.geometry;
@@ -1334,6 +1347,7 @@ test "glm bill: on the DSA kernels the prompt wave stops growing past one call; 
 }
 
 test "glm bill: the rest-of-box floor only raises the rest the bill sits beside, so it only lowers the rows" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try testing.expectEqual(@as(u64, 15_400_000_000), restOfBox(15_400_000_000, null));
     try testing.expectEqual(@as(u64, 21_000_000_000), restOfBox(15_400_000_000, 21_000_000_000));
     try testing.expectEqual(@as(u64, 22_000_000_000), restOfBox(22_000_000_000, 21_000_000_000));
@@ -1348,6 +1362,7 @@ test "glm bill: the rest-of-box floor only raises the rest the bill sits beside,
 }
 
 test "glm bill: the units cap only lowers the rows, in each phase" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const r: sdk.Rows = .{ .prompt = 72, .decode = 87 };
     try testing.expectEqual(r, capRows(r, null));
     try testing.expectEqual(sdk.Rows{ .prompt = 72, .decode = 85 }, capRows(r, 85));
@@ -1356,6 +1371,7 @@ test "glm bill: the units cap only lowers the rows, in each phase" {
 }
 
 test "glm bill: the bill line lists every term and each phase's total at the units chosen" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     const cfg: settings.Config = .{ .mtp_depth = 3 };
@@ -1370,6 +1386,7 @@ test "glm bill: the bill line lists every term and each phase's total at the uni
 }
 
 test "glm bill: every measured host side sits under its phase's bound" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const bounds = [4]u64{ host_side_construction_bytes, host_side_prompt_bytes, host_side_decode_bytes, host_side_decode_bytes };
     for (host_side_readings) |r| try testing.expect((r[0] -| r[1] -| r[2]) -| r[4] <= bounds[r[3]]);
     // Each bound: the largest reading past the staging (constructed 1.036 GB, the 3.0 pack's closing runs; the prompt

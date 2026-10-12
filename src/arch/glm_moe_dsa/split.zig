@@ -17,6 +17,7 @@
 //! pins it).
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const glm = @import("glm_moe_dsa.zig");
 const bill = @import("bill.zig");
 const k3 = @import("split_k3.zig");
@@ -347,6 +348,7 @@ fn slotBytesOf(g: glm.Geometry, prompt: u32, rows: []const u32) u64 {
 }
 
 test "glm split: at the reference units the table comes back as it is, within the bill's slot rows" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const g = bill.box_exl3.geometry;
     var out: [n_bank]u32 = undefined;
     const rows = decodeRows(g, ref_prompt_units, ref_units, bill.grownBytes(g, ref_prompt_units, ref_units), &out).?;
@@ -365,6 +367,7 @@ test "glm split: at the reference units the table comes back as it is, within th
 }
 
 test "glm split: the uniform 3.0 pack's table: at its reference units it comes back as it is, its empty stream layers keep no rows, within the bill's slot rows" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const g = bill.box_exl3_30.geometry;
     try testing.expectEqual(Pack.k3, packOf(g).?);
     try testing.expectEqual(Pack.k3_k4, packOf(bill.box_exl3.geometry).?);
@@ -388,6 +391,7 @@ test "glm split: the uniform 3.0 pack's table: at its reference units it comes b
 }
 
 test "glm split: at other budgets every layer keeps its prompt rows, the bill's slot rows bound the split's, and no row that fits is left" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     for ([_]glm.Geometry{ bill.box_exl3.geometry, bill.box_exl3_30.geometry }) |g| try otherBudgets(g);
 }
 
@@ -414,6 +418,7 @@ fn otherBudgets(g: glm.Geometry) !void {
 }
 
 test "glm split: a stream of another geometry keeps the even split" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const two = [2]glm.LayerSlots{ bill.box_exl3.k3, bill.box_exl3.k4 };
     var g = bill.box_exl3.geometry;
     g.layers = &two;
@@ -422,6 +427,7 @@ test "glm split: a stream of another geometry keeps the even split" {
 }
 
 test "glm split: a budget past the even split's bytes grows more rows within it, and no row that fits is left" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const g = bill.box_exl3.geometry;
     var floor: [n_bank]u32 = undefined;
     _ = bill.rowsAt(g, ref_prompt_units, &floor);

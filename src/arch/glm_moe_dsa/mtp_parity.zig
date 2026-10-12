@@ -7,6 +7,7 @@
 //! allowed (DSV41_PHASE0B_MLX=1); skipped otherwise. The refusals below need neither.
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const sdk_ext = @import("../../sdk_ext.zig");
@@ -122,6 +123,7 @@ fn runCase(a: std.mem.Allocator, r: *Rig, cs: *const Case, vocab: usize) !f32 {
 }
 
 test "glm mtp parity: every round's drafts, draft logits, accepted count and next token equal the reference's; the rounds emit the serial decode's tokens at every depth" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const dir = fixtureDir() orelse return error.SkipZigTest;
     const a = testing.allocator;
     const gold = try loadGoldens(a, dir);
@@ -190,6 +192,7 @@ const Snapshot = struct {
 };
 
 test "glm mtp parity: after the rounds the target's lanes and the MTP layer's equal a serial run's over the same tokens, bit for bit, and hold exactly the committed positions" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const dir = fixtureDir() orelse return error.SkipZigTest;
     const a = testing.allocator;
     const gold = try loadGoldens(a, dir);
@@ -225,6 +228,7 @@ test "glm mtp parity: after the rounds the target's lanes and the MTP layer's eq
 }
 
 test "glm mtp parity: a later prompt keeps the prefix the lane tracks and drafts the reference's tokens after it" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const dir = fixtureDir() orelse return error.SkipZigTest;
     const a = testing.allocator;
     const gold = try loadGoldens(a, dir);
@@ -251,6 +255,7 @@ test "glm mtp parity: a later prompt keeps the prefix the lane tracks and drafts
 }
 
 test "glm mtp parity: a round's verify reads, each expert's by the first row that routes it, sum to the stream's demand bytes; with its first draft rejected the kept row read exactly a serial step's bytes from the same state" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const dir = fixtureDir() orelse return error.SkipZigTest;
     const a = testing.allocator;
     const gold = try loadGoldens(a, dir);
@@ -310,6 +315,7 @@ fn synthPack(a: std.mem.Allocator, tmp: *std.testing.TmpDir, buf: []u8, index_sh
 }
 
 test "glm mtp: a depth past the route limit, a pack without mtp/ and a config without a shared selection are refused by name at load, before any device array" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -354,6 +360,7 @@ test "glm mtp: a depth past the route limit, a pack without mtp/ and a config wi
 }
 
 test "glm mtp: the lane arms clean requests only, exact as greedy or stochastic, typical only when the setting names it" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var lane: module.Module.Lane = undefined;
     lane.mode = .exact;
     var inner: module.Module = undefined;
@@ -390,6 +397,7 @@ fn decideHost(g: *G, rows: []const f32, w: usize, drafts: []const u32, mode: sdk
 }
 
 test "glm mtp: the decisions equal the host references: argmax, typical at temperature 1, the sampled point-mass rule, sampled typical" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const ds = @import("../../sdk_ext.zig").acceptance;
     const acc = sdk.acceptance;

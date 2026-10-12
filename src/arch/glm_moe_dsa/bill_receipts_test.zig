@@ -8,6 +8,7 @@
 //! units covers every peak it measured.
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const sdk = @import("sdk");
 const glm = @import("glm_moe_dsa.zig");
 const settings = @import("settings.zig");
@@ -54,6 +55,7 @@ fn ranGemmRowsInFlight(gemm: bill.PromptGemm) u64 {
 }
 
 test "glm bill receipts: the 9d157b5 screen's peaks, over its own bill, sit under this bill at its inputs and units" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     // The screen ran sushi's prompt GEMM and argpartition's selection, before the slice window (its encode ran as far
@@ -180,6 +182,7 @@ const receipts = [_]Receipt{
 const host_key_bytes: i64 = 8;
 
 test "glm bill receipts: each run's phase terms, page tables and residuals rebuild from its bill, to the byte" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     for (receipts) |r| {
@@ -217,6 +220,7 @@ test "glm bill receipts: each run's phase terms, page tables and residuals rebui
 }
 
 test "glm bill receipts: the fill at each run's baseline gives its units, one more in either phase is refused, and the bill at the request and the split give its grow" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try glm53Config();
     defer c.deinit(testing.allocator);
     for (receipts) |r| {

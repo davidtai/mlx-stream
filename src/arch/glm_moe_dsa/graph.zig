@@ -24,7 +24,8 @@ const pt = @import("prefill_timers.zig");
 const expert_policy = @import("../../sdk_ext.zig").expert.policy;
 /// The host's DeepSeek sparse attention kernels (the indexer's scores, the latent attention over selected rows): GLM-5.3's
 /// own need of the host surface, not the SDK's.
-const dsa = @import("mlx_host").dsa_nax;
+const host_caps = @import("../../host_caps.zig");
+const dsa = if (host_caps.dsa_nax) @import("mlx_host").dsa_nax else @compileError("glm_moe_dsa: this host exports no dsa_nax (host_caps): the reference must sit behind host_caps.glm");
 const topk_mod = @import("topk.zig");
 const trunk_kernels = @import("trunk_kernels.zig");
 
@@ -1008,6 +1009,7 @@ const TestWeights = struct {
 };
 
 test "glm wave probe: a layer's stages are its rises over the layer's start; the line carries every layer" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var p: WaveProbe = .{};
     p.call(16387, 16387);
     p.layers[0] = .{ .start = 197_000_000_000, .attn = 4_000_000_000, .moe = 9_000_000_000, .tail = 6_000_000_000, .cache = 17_000_000_000, .cache_start = 17_100_000_000, .footprint = 214_800_000_000, .fp = .{ 218_000_000_000, 221_000_000_000, 219_000_000_000 } };
@@ -1024,6 +1026,7 @@ test "glm wave probe: a layer's stages are its rises over the layer's start; the
 }
 
 test "glm attention: a prompt on the DSA kernels selects the reference's keys and matches its prompt form" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const text = try kernelDimsConfigJson(a, kernel_dims);
@@ -1099,6 +1102,7 @@ test "glm attention: a prompt on the DSA kernels selects the reference's keys an
 }
 
 test "glm attention: the reference indexer's top-k is the top-k kernel's (int32 ids) and argpartition's ids in its order, over a verify's rows and a prompt's blocks, at GLM-5.3's top-k" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const text = try kernelDimsConfigJson(a, glm53_dims);
@@ -1169,6 +1173,7 @@ test "glm attention: the reference indexer's top-k is the top-k kernel's (int32 
 }
 
 test "glm attention: the verify's rows through embed_q and unembed_out at once equal the row-by-row absorbed attention bit for bit at GLM-5.3's head dims" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const text = try kernelDimsConfigJson(a, glm53_dims);

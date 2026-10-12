@@ -4,6 +4,7 @@
 //! call one route whose ids carry their bank layer's flags.
 
 const std = @import("std");
+const host_caps = @import("../host_caps.zig");
 const sdk_ext = @import("../sdk_ext.zig");
 const bank_mod = @import("../arch/glm_moe_dsa/bank.zig");
 const exl3 = @import("../arch/glm_moe_dsa/exl3_bank.zig");
@@ -35,6 +36,7 @@ fn pickRows(rnd: std.Random, out: []u16, rows: usize, k: usize, n_experts: u16) 
 }
 
 test "glm routes: the recorder keeps every decode route as the stream served it, and its file reads back" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var sb = try bank_mod.SynthBank.open();
     defer sb.close();
@@ -181,6 +183,7 @@ test "glm routes: the recorder keeps every decode route as the stream served it,
 }
 
 test "glm routes: an EXL3 call routes its K3 and K4 bank layers, the recorder keeps one route of the call, each id flagged by its bank layer" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var c = try bank_mod.tinyConfig(a);
     defer c.deinit(a);

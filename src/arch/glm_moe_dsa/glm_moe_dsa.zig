@@ -5,6 +5,7 @@
 //! router logits); the routed experts stream from the affine bank (`bank.zig`), never from these shards.
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const v41 = @import("../deepseek_v41/deepseek_v41.zig");
 
 /// The shard headers of a pack (`deepseek_v41.Checkpoint`: 8-byte length + JSON, never tensor data).
@@ -802,6 +803,7 @@ pub fn tinyConfigJson(a: std.mem.Allocator, quant: []const u8) ![]u8 {
 pub const tiny_quant = "\"group_size\":64,\"bits\":4,\"model.embed_tokens\":{\"group_size\":64,\"bits\":8},\"model.layers.1.self_attn.o_proj\":{\"group_size\":64,\"bits\":8}";
 
 test "glm config: the tiny model parses with no release pinned and is refused as GLM-5.3" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const text = try tinyConfigJson(testing.allocator, tiny_quant);
     defer testing.allocator.free(text);
     var diag: Diag = .{};
@@ -818,6 +820,7 @@ test "glm config: the tiny model parses with no release pinned and is refused as
 }
 
 test "glm config: the release's config parses to GLM-5.3's dims, 21 full indexer layers and 75 routed layers" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const text = try testConfigJson(testing.allocator, "");
     defer testing.allocator.free(text);
     var diag: Diag = .{};
@@ -844,6 +847,7 @@ test "glm config: the release's config parses to GLM-5.3's dims, 21 full indexer
 }
 
 test "glm config: a mixed build's per-module bits override the default, every other module keeps it" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const text = try testConfigJson(testing.allocator, ",\"model.embed_tokens\":{\"bits\":8,\"group_size\":64},\"model.layers.3.self_attn.o_proj\":{\"group_size\":64,\"bits\":8}");
     defer testing.allocator.free(text);
     var c = try Config.parse(testing.allocator, text, &glm53, null);
@@ -855,6 +859,7 @@ test "glm config: a mixed build's per-module bits override the default, every ot
 }
 
 test "glm config: every refusal names its field" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const Case = struct { from: []const u8, to: []const u8, err: anyerror, why: []const u8 };
     const cases = [_]Case{
         .{ .from = "\"model_type\":\"glm_moe_dsa\"", .to = "\"model_type\":\"glm4_moe\"", .err = error.ModelType, .why = "model_type" },
@@ -892,6 +897,7 @@ test "glm config: every refusal names its field" {
 }
 
 test "glm config: without indexer_types the reference's schedule builds the same table" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const base = try testConfigJson(testing.allocator, "");
     defer testing.allocator.free(base);
     const start = std.mem.indexOf(u8, base, "\"indexer_types\":[").?;
@@ -906,6 +912,7 @@ test "glm config: without indexer_types the reference's schedule builds the same
 }
 
 test "glm residents: the spec names the release's tensors at their shapes, the latent projections per head, the indexer on full layers only" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const text = try testConfigJson(testing.allocator, ",\"model.layers.0.self_attn.embed_q\":{\"bits\":8,\"group_size\":64}");
     defer testing.allocator.free(text);
     var c = try Config.parse(testing.allocator, text, &glm53, null);
@@ -936,6 +943,7 @@ test "glm residents: the spec names the release's tensors at their shapes, the l
 }
 
 test "glm residents: a pack's shards pass the spec; a missing, mistyped or extra tensor is refused by name" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var c = try Config.parse(testing.allocator, try tinyText(), null, null);
     defer c.deinit(testing.allocator);
     var tmp = testing.tmpDir(.{});
@@ -979,6 +987,7 @@ fn tinyText() ![]const u8 {
 }
 
 test "glm prompt shape: calls of 16,384 rows with a short tail joined; spans under their target; the kernels fit GLM-5.3" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = std.testing.allocator;
     var calls: std.ArrayList(u64) = .empty;
     defer calls.deinit(a);

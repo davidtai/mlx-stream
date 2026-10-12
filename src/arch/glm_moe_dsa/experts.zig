@@ -15,6 +15,7 @@
 //! host builds the next) before the group's slots go back; then the combine (on the GPU one launch over the groups' outputs, else the join and the op chain in token slices).
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const builtin = @import("builtin");
 const mlx = @import("sdk").mlx;
 const sdk_ext = @import("../../sdk_ext.zig");
@@ -1076,6 +1077,7 @@ pub fn Experts(comptime G: type, comptime Bk: type, comptime M: type) type {
 }
 
 test "glm experts: the wide lane's GPU combine over its parts equals the op chain's bits at GLM-5.3's hidden size" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();

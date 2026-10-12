@@ -21,7 +21,8 @@ const quant = sdk_ext.quant;
 const glm = @import("glm_moe_dsa.zig");
 const affine = @import("bank.zig");
 const bill_units = @import("bill.zig");
-const sushi = @import("mlx_host").sushi_exl3;
+const host_caps = @import("../../host_caps.zig");
+const sushi = if (host_caps.sushi_exl3) @import("mlx_host").sushi_exl3 else @compileError("glm_moe_dsa: this host exports no sushi_exl3 (host_caps): the reference must sit behind host_caps.glm");
 
 pub const format = "mlx-stream-expert-manifest-exl3-v1";
 pub const manifest_file = "expert-manifest-exl3-v1.json";
@@ -633,6 +634,7 @@ pub fn tinyConfigInter(a: std.mem.Allocator, inter: u32) !glm.Config {
 pub const tmpRoot = affine.tmpRoot;
 
 test "glm exl3 bank: GLM-5.3's minis: K3 3,578,880 B in 3,579,904 B records, K4 4,758,528 in 4,759,552, the gate/up span first" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const k3 = miniSegments(6144, 512, 3);
     const k4 = miniSegments(6144, 512, 4);
     try testing.expectEqual(@as(u64, 3_578_880), k3.logical);
@@ -649,6 +651,7 @@ test "glm exl3 bank: GLM-5.3's minis: K3 3,578,880 B in 3,579,904 B records, K4 
 }
 
 test "glm exl3 bank: a clean synthetic bank opens: the stream layers, each expert's bank layer and its minis' offsets" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var c = try affine.tinyConfig(a);
     defer c.deinit(a);
@@ -715,6 +718,7 @@ test "glm exl3 bank: a clean synthetic bank opens: the stream layers, each exper
 }
 
 test "glm exl3 bank: a uniform pack (one K3 bank layer per layer, the converter's for k_values [3]) opens with two stream layers per routed layer, the second empty: no experts, no rows, the first's geometry" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var c = try affine.tinyConfig(a);
     defer c.deinit(a);
@@ -793,6 +797,7 @@ test "glm exl3 bank: a uniform pack (one K3 bank layer per layer, the converter'
 }
 
 test "glm exl3 bank: a uniform pack of 256 K3 experts a routed layer: its routes, their gates, the reads ahead and the grow touch no empty layer" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     const split = @import("split.zig");
     const text = try glm.tinyConfigJson(a, glm.tiny_quant);
@@ -877,6 +882,7 @@ test "glm exl3 bank: a uniform pack of 256 K3 experts a routed layer: its routes
 }
 
 test "glm exl3 bank: at GLM-5.3's geometry the 3.42 bpw pack's and the uniform 3.0 bpw pack's manifests give the bill's slots, its units and the split's packs" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     const split = @import("split.zig");
     const text = try glm.testConfigJson(a, ",\"model.embed_tokens\":{\"group_size\":64,\"bits\":8},\"lm_head\":{\"group_size\":64,\"bits\":8}");
@@ -910,6 +916,7 @@ test "glm exl3 bank: at GLM-5.3's geometry the 3.42 bpw pack's and the uniform 3
 }
 
 test "glm exl3 bank: every rule of the pack's contract refuses by name" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try affine.expectRefusals(@This(), &.{
         .{ .s = .{ .no_manifest = true }, .err = error.ManifestMissing, .why = "not found" },
         .{ .s = .{ .format = "mlx-stream-expert-manifest-exl3-v2" }, .err = error.ManifestFormat, .why = "format" },
@@ -934,6 +941,7 @@ test "glm exl3 bank: every rule of the pack's contract refuses by name" {
 }
 
 test "glm exl3 bank: the stream reads each routed expert's minis into adjacent rows of its bank layer's slots, persistent and transient, both geometries" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var c = try affine.tinyConfig(a);
     defer c.deinit(a);
@@ -975,6 +983,7 @@ test "glm exl3 bank: the stream reads each routed expert's minis into adjacent r
 }
 
 test "glm exl3 bank: the lookahead reads ahead the next routed layer's experts over both its bank layers, each its own span, claimable until the call's last route" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const a = testing.allocator;
     var c = try affine.tinyConfig(a);
     defer c.deinit(a);
@@ -1098,6 +1107,7 @@ fn gateWidest(tp: u32, records_per_part: u32) !void {
 }
 
 test "glm exl3 bank: the gates of the widest route register: 48 ids of 8 minis (768 tickets), and GLM-5.3's 48 ids of 4 minis" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try gateWidest(8, 1);
     try gateWidest(4, 2);
 }

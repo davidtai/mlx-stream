@@ -6,6 +6,7 @@
 //! the whole bank by name. The slot arrays bind to MLX's own `gather_qmm` (`sdk_ext.quant.GatherQmm`).
 
 const std = @import("std");
+const host_caps = @import("../../host_caps.zig");
 const mlx = @import("sdk").mlx;
 const sdk_ext = @import("../../sdk_ext.zig");
 const expert_io = sdk_ext.expert.io;
@@ -515,6 +516,7 @@ comptime {
 }
 
 test "glm bank: GLM-5.3's record: nine segments of 21,233,664 B, the gate/up span 14,155,776 B, 4096-aligned as is" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     const segs = layerSegments(4, 6144, 2048).?;
     try testing.expectEqual(@as(u64, 21_233_664), logicalBytes(&segs));
     try testing.expectEqual(@as(u64, 21_233_664), recordBytes(logicalBytes(&segs)));
@@ -534,6 +536,7 @@ test "glm bank: GLM-5.3's record: nine segments of 21,233,664 B, the gate/up spa
 }
 
 test "glm bank: a clean synthetic bank opens: offsets, spans and digests from its manifest" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var sb = try SynthBank.open();
     defer sb.close();
     const b = &sb.bank;
@@ -562,6 +565,7 @@ test "glm bank: a clean synthetic bank opens: offsets, spans and digests from it
 }
 
 test "glm bank: every rule of the pack's contract refuses by name" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     try expectRefusals(@This(), &.{
         .{ .s = .{ .no_manifest = true }, .err = error.ManifestMissing, .why = "not found" },
         .{ .s = .{ .format = "mlx-stream-expert-manifest-affine-v2" }, .err = error.ManifestFormat, .why = "format" },
@@ -585,6 +589,7 @@ test "glm bank: every rule of the pack's contract refuses by name" {
 }
 
 test "glm bank: the bank of a config with other dims is refused at its dims" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var c = try tinyConfig(testing.allocator);
@@ -603,6 +608,7 @@ test "glm bank: the bank of a config with other dims is refused at its dims" {
 pub const Stream = sdk_ext.expert.stream.StreamOf(@This(), false);
 
 test "glm bank: the stream serves every routed id from a slot holding its record, the pre-read staging sized from the bank" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var sb = try SynthBank.open();
     defer sb.close();
     const b = &sb.bank;
@@ -631,6 +637,7 @@ test "glm bank: the stream serves every routed id from a slot holding its record
 }
 
 test "glm bank: the preload fills the prompt rows; a later prompt finds the residents a decode left (shrink's keep)" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
     var sb = try SynthBank.open();
     defer sb.close();
     const b = &sb.bank;
