@@ -222,6 +222,12 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             try cfg.checkUnitsCap();
             try cfg.tally.check("glm_moe_dsa");
             try cfg.checkMtp();
+            // The handover bills the rest of the box from the kernel's page counts: a box that gives none is refused
+            // here, once, never billed as an empty box.
+            if (sdk.memory.boxUsedBytes() == null) {
+                log.err("glm_moe_dsa: load refused: the kernel gives no reading of the box's used memory (host_statistics64), and the decode rows are billed beside it (BoxReadingUnavailable)\n", .{});
+                return error.BoxReadingUnavailable;
+            }
             const file_backed_start = sdk.memory.vmBytes().external;
             const dir = cfg.model_dir orelse return error.GlmPackDir;
             const model: *const glm.Config = if (cfg.model) |*m| m else return error.GlmPackDir;
@@ -409,7 +415,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             _ = mlx.mlx_synchronize(self.g.s);
             self.g.clearCache();
             const m = Mem.now();
-            const box = Box.now(m);
+            const box = try Box.now(m);
             var cc = phase_mem.Construction.of(self.bill, prompt_rows, m.footprint, m.active, m.cache);
             cc.host_known = self.billed.phases[@intFromEnum(bill_mod.Phase.construction)].pool_staging;
             log.info("glm_moe_dsa: construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (tolerance {d} B); the box {d} B used, the rest of it {d} B (the load's baseline {d} B, billed at {d} B)\n", .{ m.footprint, m.active, m.cache, m.hostSide(), cc.billed, cc.residual(), construction_tolerance_bytes, box.used, box.others, self.cfg.memory_baseline_bytes orelse 0, self.baseline });
@@ -686,7 +692,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.g.clearCache();
             const kv1 = self.kvAllocated();
             const st = settle(LiveReader{ .io = self.io }, before.hostSide());
-            const box = Box.now(st.after);
+            const box = try Box.now(st.after);
             // The box's target beside the rest of the box as it stands now (not the load's baseline, an older reading of
             // it), at least its floor, for the live reading and the bill at the request alike.
             const rest = bill_mod.restOfBox(box.others, self.cfg.rest_of_box_floor_bytes);
@@ -775,7 +781,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
                 .rows_alt = if (Experts.bpl > 1) self.decode_rows[1] else null,
                 .spread = if (self.split_rows) split_mod.spread(self.decode_rows) else null,
                 .mem = .{ .start = d.mem0, .end = end },
-                .box = Box.now(end),
+                .box = Box.now(end) catch null,
             }});
             self.phaseRecord("decode", self.requestTerms(), null);
             log.info("{f}\n", .{HostLine{ .h = self.ex.host, .wall_ns = d.wall_ns }});
@@ -936,13 +942,15 @@ pub const Mem = phase_mem.Ledgers;
 const Peaks = graph.WaveProbe.Peaks;
 
 /// The box's used memory beside this process's (`sdk.memory.boxUsedBytes`, read right after `mem`): what the rest of
-/// the box holds is the used memory less this process's footprint and the page tables of its MLX bytes.
+/// the box holds is the used memory less this process's footprint and the page tables of its MLX bytes. The
+/// construction refused a box without the reading (`BoxReadingUnavailable`); a reading the kernel refuses later fails
+/// the boundary that needs it, never reads as an empty box.
 pub const Box = struct {
     used: u64,
     others: u64,
 
-    pub fn now(mem: Mem) Box {
-        const used = sdk.memory.boxUsedBytes();
+    pub fn now(mem: Mem) error{BoxReadingUnavailable}!Box {
+        const used = sdk.memory.boxUsedBytes() orelse return error.BoxReadingUnavailable;
         return .{ .used = used, .others = used -| mem.footprint -| bill_mod.wireTables(mem.active + mem.cache) };
     }
 };
@@ -1493,7 +1501,7 @@ test "glm box: the box's used memory holds this process's footprint, and the res
     defer std.heap.page_allocator.free(block);
     @memset(block, 0x5a);
     const m: Mem = .{ .footprint = sdk.memory.processMemory().footprint };
-    const box = Box.now(m);
+    const box = try Box.now(m);
     try testing.expect(box.used >= m.footprint and box.used <= sdk.memory.totalMemBytes());
     try testing.expectEqual(box.used - m.footprint - bill_mod.wireTables(0), box.others);
 }
