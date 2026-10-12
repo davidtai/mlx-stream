@@ -910,10 +910,13 @@ fn nbytesOf(x: mlx.mlx_array) u64 {
 
 /// GLM53_EXL3_DEC4's experiments on these texts' decode chain: one text each, one needle replaced.
 const DecExp = struct { name: []const u8, kernel: xk.Kernel, subs: []const [2][]const u8 = &.{}, members: u32 = routes.max_members, members_down: ?u32 = null, all: bool = false };
+const shuffled_gu = [_][2][]const u8{.{ "        for (uint o = 0u; o < TPG; ++o) g53_lane_weights<K>(tw + size_t(tk) * (OT * NW) + o * NW, pl, w8[o]);", "        for (uint o = 0u; o < TPG; ++o) { const device uint* ww = tw + size_t(tk) * (OT * NW) + o * NW; const uint wl = lane < NW ? ww[lane] : 0u; const uint lo = simd_shuffle(wl, ushort(pl.a)); const uint hi = simd_shuffle(wl, ushort(pl.b)); const uint v0 = (K == 4) ? lo : ((lo >> pl.s) | ((hi << 1u) << (31u - pl.s))); const uint vh = (K == 4) ? hi : (hi >> pl.s); uint cw[8]; for (uint m = 0u; m < 8u; ++m) { const uint sh = uint(K) * m; cw[m] = (sh <= 16u ? (v0 >> sh) : ((v0 >> sh) | (vh << (32u - sh)))) & 0xffffu; } for (uint p = 0u; p < 4u; ++p) { const half2 hh = g53_mcg2(uint2(cw[2u * p], cw[2u * p + 1u])); w8[o][2u * p] = hh.x; w8[o][2u * p + 1u] = hh.y; } }" }};
+const shuffled_down = [_][2][]const u8{.{ "            g53_lane_weights<K>(tw + size_t(tk) * (OT * NW), pl, w8);", "            { const device uint* ww = tw + size_t(tk) * (OT * NW); const uint wl = lane < NW ? ww[lane] : 0u; const uint lo = simd_shuffle(wl, ushort(pl.a)); const uint hi = simd_shuffle(wl, ushort(pl.b)); const uint v0 = (K == 4) ? lo : ((lo >> pl.s) | ((hi << 1u) << (31u - pl.s))); const uint vh = (K == 4) ? hi : (hi >> pl.s); uint cw[8]; for (uint m = 0u; m < 8u; ++m) { const uint sh = uint(K) * m; cw[m] = (sh <= 16u ? (v0 >> sh) : ((v0 >> sh) | (vh << (32u - sh)))) & 0xffffu; } for (uint p = 0u; p < 4u; ++p) { const half2 hh = g53_mcg2(uint2(cw[2u * p], cw[2u * p + 1u])); w8[2u * p] = hh.x; w8[2u * p + 1u] = hh.y; } }" }};
 const dec_exps = [_]DecExp{
+    .{ .name = "gu: a tile's words one coalesced load, shuffled to the lanes", .kernel = .glm53_dec_gu, .subs = &shuffled_gu, .all = true },
+    .{ .name = "down: a tile's words one coalesced load, shuffled to the lanes", .kernel = .glm53_dec_down, .subs = &shuffled_down, .all = true },
     .{ .name = "two members a slot", .kernel = .glm53_dec_gu, .members = 2, .all = true },
     .{ .name = "gu two members a slot, down one", .kernel = .glm53_dec_gu, .members = 2, .members_down = 1, .all = true },
-    .{ .name = "gu one member a slot, down two", .kernel = .glm53_dec_gu, .members = 1, .members_down = 2, .all = true },
     .{ .name = "gu: nothing (returns)", .kernel = .glm53_dec_gu, .subs = &.{.{ "    if (packed == 0xffffffffu) return;", "    if (true) return;" }} },
     .{ .name = "down: nothing (returns)", .kernel = .glm53_dec_down, .subs = &.{.{ "    if (n_live == 0u) return;", "    if (true) return;" }} },
 };
