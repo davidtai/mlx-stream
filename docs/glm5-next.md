@@ -34,7 +34,7 @@ The arch claims a `config.json` with `model_type` `glm5_next` and the block
 The block's optional `settings` object takes `expert_prefill_rows` and `expert_rows` (an operator pin: either alone
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
 is installed when true; off, the serial control, by default: below), `draft_depth` (the lane's drafts per round: an
-integer 1 .. 3, default 3; anything else refused by name), `decode_moe` (the decode lane's expert route:
+integer 1 .. 3, default 1 (measured +2.31 % decode over 3 on g21c); anything else refused by name), `decode_moe` (the decode lane's expert route:
 `hitpass`, the default, `fused` or `stock`; anything else refused by name), `decode_glue` (the decode lane's glue:
 `fused`, the default, or `ops`), `decode_kda`, `decode_dsa` and `decode_swiglu` (the decode lane's KDA layer, DSA
 attention and MLP activation: `fused`, the default, or `ops`), `decode_predict` (the lookahead predictor's router

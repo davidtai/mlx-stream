@@ -2,7 +2,7 @@
 //! construction; a key that is not a setting refuses the load by name) and the host's load facts. MiMo's contract: the
 //! operator pins the rows with `expert_prefill_rows` / `expert_rows` (either alone forces both); `mtp_lane` installs the
 //! MTP draft lane (mtp.zig; off, the serial control, by default) and `draft_depth` its drafts per round (1 .. 3, default
-//! 3); `decode_moe` the decode lane's expert route (`hitpass`,
+//! 1, `default_draft_depth`); `decode_moe` the decode lane's expert route (`hitpass`,
 //! the default: the NVFP4 decode texts with the device hit pass; `fused`, the texts with the host-routed hit wave, its
 //! control; `stock`, MLX's gathers, the texts' control); `decode_glue` the decode lane's glue (`fused`, the default: the
 //! mHC hcPre chain, the router and top-8 texts, the combine with the shared expert's add, glue.zig; `ops`, the stock op
@@ -90,6 +90,10 @@ pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "m
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
 /// `draft_depth`: the bill is the trained depth's).
 pub const trained_draft_depth: u32 = 3;
+/// The lane's default drafts per round: 1. Measured on g21c (FP8 residents, lane on, 115/131, sample-then-verify, ids
+/// identical across arms): depth 1 is +2.31 % decode over depth 3 (the g21c-depth1 pair, VALID); depth 2 +1.39 % (noisy).
+/// glm5_next only: MiMo (mimo_v2/settings.zig) keeps its trained depth 3 and DSV4.1 its DSpark schedule.
+pub const default_draft_depth: u32 = 1;
 
 /// The decode lane's routed-expert route, installed once at construction: `stock` MLX's gather_qmm nvfp4 (two gathers
 /// and the clamped SwiGLU, then a gather per down), `fused` the NVFP4 decode texts (decode_kernels.zig: MiMo's k1 family
@@ -140,10 +144,10 @@ pub const Config = struct {
     expert_rows: ?u32 = null,
     expert_prefill_rows: ?u32 = null,
     mtp_lane: bool = false,
-    /// Drafts per round (`"draft_depth"`: an integer 1 .. `trained_draft_depth`, default the trained depth): a round
+    /// Drafts per round (`"draft_depth"`: an integer 1 .. `trained_draft_depth`, default `default_draft_depth`): a round
     /// drafts at most this many and verifies 1 + them. Read once at construction (`mtp.Lane.open`); 0 marks a value
     /// outside 1 .. 3 or not an integer (refused by name in `validate`). Without the lane it is inert.
-    draft_depth: u32 = trained_draft_depth,
+    draft_depth: u32 = default_draft_depth,
     decode_moe: DecodeMoe = .hitpass,
     /// The decode lane's glue (glue.zig `Route`): `fused` (the default) or `ops` (the stock op chains, the control).
     decode_glue: DecodeGlue = .fused,
@@ -314,8 +318,8 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expect(on.mtp_lane);
     try testing.expectError(error.Glm5NextMtpLaneSetting, (try parseSettings("{\"mtp_lane\":1}")).validate());
     try (try parseSettings("{\"mtp_lane\":false}")).validate();
-    // The lane's depth: the trained 3 unless named; 1 .. 3 by name; anything else refused by name.
-    try testing.expectEqual(trained_draft_depth, on.draft_depth);
+    // The lane's depth: 1 unless named; 1 .. 3 by name; anything else refused by name.
+    try testing.expectEqual(@as(u32, 1), on.draft_depth);
     try testing.expectEqual(@as(u32, 3), trained_draft_depth);
     for ([_]struct { []const u8, u32 }{
         .{ "{\"mtp_lane\":true,\"draft_depth\":1}", 1 },
@@ -410,4 +414,18 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(@as(?u32, 120), built.expert_prefill_rows);
     try testing.expectEqual(@as(u64, 32_768), built.reserveTokens());
     try testing.expectEqual(fill_reserve_tokens, (Config{}).reserveTokens());
+}
+
+test "glm5_next settings: the resolved draft depth per arch (glm5_next 1; MiMo its trained 3; DSV4.1's DSpark schedule unchanged)" {
+    const mimo = @import("../mimo_v2/settings.zig");
+    const dsv41_graph = @import("../deepseek_v41/graph.zig");
+    const dspark = @import("../deepseek_v41/dspark.zig");
+    const base: Config = .{};
+    try testing.expectEqual(@as(u32, 1), base.draft_depth);
+    try testing.expectEqual(@as(u32, 1), (try parseSettings("{\"mtp_lane\":true}")).draft_depth);
+    const m: mimo.Config = .{};
+    try testing.expectEqual(@as(u32, 3), m.draft_depth);
+    try testing.expectEqual(mimo.trained_draft_depth, m.draft_depth);
+    try testing.expectEqual(@as(u32, 32), dsv41_graph.draft_compile_max_rows);
+    try testing.expectEqual(@as(u32, 16), dspark.max_block);
 }
