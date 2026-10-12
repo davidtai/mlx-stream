@@ -271,6 +271,24 @@ pub const LayerPolicy = struct {
         return n;
     }
 
+    /// `forgetAll` without the residents: before a continuation of the same conversation the residents stay in their
+    /// slots and only the prompt state goes (protection, the seed, the prompt counts). Each resident's recency becomes its
+    /// last decode use (never used: 0), so the prompt's first victims are the residents decode used least recently.
+    /// Called once, nothing live, after `shrink`; returns the residents kept.
+    pub fn forgetPrompt(p: *LayerPolicy) u32 {
+        p.protected.unsetAll();
+        p.seed.unsetAll();
+        p.seed_ranks = 0;
+        @memset(p.prefill_freq, 0);
+        @memset(p.recency, 0);
+        p.clock = 0;
+        for (p.slot_to_expert[0..p.capacity]) |e| if (e != no_expert and p.last_used[e] >= 0) {
+            p.recency[e] = @intCast(p.last_used[e] + 1);
+            p.clock = @max(p.clock, p.recency[e]);
+        };
+        return p.occupancy;
+    }
+
     /// The one phase change: `capacity` persistent slots from now on, the new
     /// ones empty.
     pub fn grow(p: *LayerPolicy, capacity: u32) !void {

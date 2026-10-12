@@ -292,6 +292,17 @@ pub fn reverseBoundKept(prompt: bill_mod.PhaseTerms, scratch_bytes: u64, call_wa
 /// `unknown` (a harness's own request end): the kept boundary stays and the bound charges a cold prompt's wave.
 pub const Coming = union(enum) { fresh, unknown, continuation: struct { rows: u64, positions: u64 } };
 
+/// What the reverse change leaves in the prompt rows for the coming request (`Stream.shrink`), routed on its kind: a
+/// continuation keeps the residents decode left there (its rows route over the same conversation, and a kept resident
+/// is a hit, not an SSD read: issue #9); a fresh prompt, or a harness's own request end, forgets them, as at
+/// construction (the cold prompt's schedule equals the first prompt's). The rows, and so the bill, are the same.
+pub fn reverseResidents(coming: Coming) expert_stream.Residents {
+    return switch (coming) {
+        .continuation => .keep,
+        .fresh, .unknown => .forget,
+    };
+}
+
 /// The continuation call's wave (`bill.turnCallWave`) at the served bill's prompt geometry.
 pub const TurnCall = struct {
     pb: v41.PrefillBill,
@@ -336,6 +347,10 @@ pub const ReverseRecord = struct {
     vm_prompt_ready: ?VmMark = null,
     freed_bytes: u64,
     regrown_bytes: u64 = 0,
+    /// The prompt rows' residents for the coming request (`reverseResidents`) and how many it finds over every layer (set
+    /// once the settle passed).
+    residents: expert_stream.Residents = .forget,
+    kept_residents: u64 = 0,
     settle_ms: u32,
     bound_bytes: u64,
     margin_bytes: i64,
@@ -1564,6 +1579,12 @@ pub const Module = struct {
             self.logReverse();
             if (!isSettleRefusal(e)) return self.refuseBoundary(e);
             self.dropState();
+            // The next request runs cold: the residents a continuation's free kept go, as the forget route's shrink leaves them.
+            if (x.shrunk and x.residents == .keep) {
+                _ = switch (self.arm) {
+                    inline else => |t| t.arm.stream.forgetResidents(),
+                } catch |fe| return self.refuseBoundary(fe);
+            }
             log.err("NATIVE reverse phase change refused: {s}; this request fails, the kept boundary is dropped, the next request runs the change again\n", .{@errorName(e)});
             return e;
         };
@@ -1584,9 +1605,13 @@ pub const Module = struct {
         before: BoundaryMemory,
         coming: Coming = .fresh,
         scratch_absent: bool = false,
+        residents: expert_stream.Residents = .forget,
+        /// The grown rows were freed (`Arm.shrink`, under `residents`).
+        shrunk: bool = false,
+        kept_residents: u64 = 0,
 
         /// The finished request's state (its KV lanes, the strategy's caches; a new prompt rebuilds both), then the
-        /// decode-only rows. Returns the rows' bytes.
+        /// decode-only rows (the prompt rows' residents forgotten or kept for the coming request). Returns the rows' bytes.
         pub fn free(x: *ReverseLive) !u64 {
             const m = x.m;
             m.dropDspark();
@@ -1596,11 +1621,16 @@ pub const Module = struct {
                 if (m.state) |*st| st.deinit(&m.g, m.gpa);
                 m.state = null;
             }
-            const freed = if (m.grown()) switch (m.arm) {
-                inline else => |t| try t.arm.shrink(),
+            x.residents = reverseResidents(x.coming);
+            x.shrunk = m.grown();
+            const freed = if (x.shrunk) switch (m.arm) {
+                inline else => |t| try t.arm.shrink(x.residents),
             } else 0;
             x.scratch_absent = switch (m.arm) {
                 inline else => |t| t.arm.stream.transient_released,
+            };
+            x.kept_residents = switch (m.arm) {
+                inline else => |t| t.arm.stream.residentCount(),
             };
             return freed;
         }
@@ -1630,9 +1660,12 @@ pub const Module = struct {
             try checkSettled(x.before, st.after, freed, bound);
         }
 
-        /// The prompt's scratch (when the decode freed it) and the prompt cache limit.
+        /// The prompt's scratch (when the decode freed it) and the prompt cache limit. The record takes the residents route
+        /// here, once the settle passed (a refused change's record keeps `forget`: its kept residents go with the boundary).
         pub fn allocate(x: *ReverseLive) !void {
             const m = x.m;
+            m.reverse_change.?.residents = x.residents;
+            m.reverse_change.?.kept_residents = x.kept_residents;
             m.reverse_change.?.regrown_bytes = switch (m.arm) {
                 inline else => |t| try t.arm.regrowTransient(&m.g, x.scratch_absent),
             };
@@ -3270,6 +3303,19 @@ test "dsv41 memory: the reverse phase change frees, settles, and only then alloc
     var rejected: Rec = .{ .settle_fails = true };
     try std.testing.expectError(error.PhaseChangeFootprintOverBill, reverseSteps(&rejected));
     try std.testing.expectEqualStrings("fcs", rejected.log[0..rejected.n]);
+}
+
+test "dsv41 memory: the reverse change keeps the prompt rows' residents for a continuation of any length and forgets them for a fresh prompt; its record names the route" {
+    try std.testing.expectEqual(expert_stream.Residents.forget, reverseResidents(.fresh));
+    try std.testing.expectEqual(expert_stream.Residents.forget, reverseResidents(.unknown));
+    for ([_]u64{ 1, 160, 953, 954, 1772, 16384 }) |rows|
+        try std.testing.expectEqual(expert_stream.Residents.keep, reverseResidents(.{ .continuation = .{ .rows = rows, .positions = 40_221 } }));
+    // `NATIVE DSV41_REVERSE_PHASE_CHANGE`: the route by name and the residents the coming prompt finds.
+    const m: BoundaryMemory = .{ .active = 0, .cache = 0, .footprint = 0 };
+    const r: ReverseRecord = .{ .before = m, .after = m, .freed_bytes = 0, .residents = .keep, .kept_residents = 11_200, .settle_ms = 0, .bound_bytes = 0, .margin_bytes = 0, .ms = 0 };
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, r, .{});
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"residents\":\"keep\",\"kept_residents\":11200,") != null);
 }
 
 test "dsv41 memory: the reverse bound is the prompt bill less the terms the next prompt allocates later; the settle holds the scratch until the frees landed" {

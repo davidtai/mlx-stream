@@ -497,8 +497,8 @@ pub const StreamSource = struct {
     }
     // ── end MIMO_DIAG ──
 
-    pub fn shrink(self: *StreamSource, rows: []const u32) !u64 {
-        return self.stream.shrink(rows);
+    pub fn shrink(self: *StreamSource, rows: []const u32, residents: S.Residents) !u64 {
+        return self.stream.shrink(rows, residents);
     }
 
     pub fn resumePrefill(self: *StreamSource, rows: []const u32) !void {
@@ -849,7 +849,7 @@ fn phaseRowsBoundary(prompt_rows: [2]u32, decode_rows: [2]u32) !void {
     // The reverse change frees the grown rows and window 0, then the prompt's scratch comes back.
     var grown: u64 = 0;
     for (decode_rows, prompt_rows) |d, p| grown += d - p;
-    try testing.expectEqual(@as(u64, (grown + 8) * geom.record_bytes), try stream.shrink(&prompt_rows));
+    try testing.expectEqual(@as(u64, (grown + 8) * geom.record_bytes), try stream.shrink(&prompt_rows, .forget));
     try testing.expectEqual(@as(u64, 16 * geom.record_bytes), try stream.regrowTransient());
     for (stream.layers, prompt_rows) |*ls, p| {
         try testing.expect(ls.ext == null);
@@ -938,7 +938,7 @@ test "mimo rows audit R3: decode's window 0 holds decode_route_ids rows and ever
     // A call admits at most its layer's 3 rows: at least one of its 4 misses rode the window every call.
     try testing.expect(transient_loads >= 6);
     // The reverse change frees the grown rows and exactly the narrow window 0.
-    try testing.expectEqual(@as(u64, (2 * 1 + window) * geom.record_bytes), try stream.shrink(&prompt_rows));
+    try testing.expectEqual(@as(u64, (2 * 1 + window) * geom.record_bytes), try stream.shrink(&prompt_rows, .forget));
     try testing.expectEqual(@as(u64, 16 * geom.record_bytes), try stream.regrowTransient());
     try testing.expectEqual(@as(u32, 16), stream.transient.rows);
     // R2's cancelled growth (`Source.resumePrefill` with the growth pending: a request that ended before its first decode

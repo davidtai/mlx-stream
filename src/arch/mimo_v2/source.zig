@@ -639,7 +639,7 @@ pub const Source = struct {
             // +phase-rows: the reverse change: the grown rows and window 0 freed (residents forgotten: `Stream.shrink`),
             // MLX's cache cleared, then the prompt's 96 transient rows re-created, so the prompt phase holds its bill.
             if (self.decode_rows != null) {
-                _ = try self.ex.shrink(self.rows);
+                _ = try self.ex.shrink(self.rows, .forget);
                 self.g.clearCache();
                 _ = try self.ex.regrowTransient(&self.g, true);
                 return;

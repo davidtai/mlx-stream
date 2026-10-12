@@ -237,6 +237,43 @@ test "dsv41 policy: shrink forgets every expert past the new capacity; plans sta
     try testing.expectEqual(@as(u32, 0), out.n_evictions);
 }
 
+test "dsv41 policy: forgetPrompt keeps the residents in their slots and clears the prompt state; the first victim is the resident decode used least recently" {
+    var p = try LayerPolicy.init(testing.allocator, 16, 4);
+    defer p.deinit(testing.allocator);
+    var out: Plan = .{};
+    // The prompt: 1, 2, 3, 4 in slots 0..3, protected by its seed.
+    p.prepareSeed(&.{ 1, 2, 3, 4 });
+    p.plan(&.{ 1, 2, 3, 4 }, .prefill, &out);
+    try testing.expectEqual(@as(usize, 4), p.protected.count());
+    // Decode at 6 rows: 5 into a grown slot; 1, 2 and 4 routed last (3 never).
+    try p.grow(6);
+    p.plan(&.{ 5, 1 }, .decode, &out);
+    p.plan(&.{ 2, 4, 1 }, .decode, &out);
+    try testing.expectEqual(@as(?u32, 4), p.slotOf(5));
+    // The reverse change to 4 rows: the grown slot's resident goes, the prompt slots' stay where they are.
+    try p.shrink(4);
+    try testing.expectEqual(@as(u32, 4), p.forgetPrompt());
+    for ([_]u16{ 1, 2, 3, 4 }, 0..) |e, s| try testing.expectEqual(@as(?u32, @intCast(s)), p.slotOf(e));
+    try testing.expectEqual(@as(?u32, null), p.slotOf(5));
+    // The prompt state is forgetAll's: no protection, no seed, no prompt counts.
+    try testing.expectEqual(@as(usize, 0), p.protected.count());
+    try testing.expectEqual(@as(usize, 0), p.seed.count());
+    try testing.expectEqual(@as(u32, 0), p.seed_ranks);
+    for (p.prefill_freq) |f| try testing.expectEqual(@as(u32, 0), f);
+    // Recency is decode's last use: 1, 2 and 4 at the second decode route (epoch 2), 3 never.
+    for ([_]u16{ 1, 2, 4 }) |e| try testing.expectEqual(@as(u64, 3), p.recency[e]);
+    try testing.expectEqual(@as(u64, 0), p.recency[3]);
+    try testing.expectEqual(@as(u64, 3), p.clock);
+    // A continuation's prompt over 2, 4 and 7: two hits, and 7 takes 3's slot (decode never used 3), not slot 0.
+    p.prepareSeed(&.{ 2, 4, 7 });
+    p.plan(&.{ 2, 4, 7 }, .prefill, &out);
+    try checkPlan(&p, &.{ 2, 4, 7 }, &out, max_route_ids);
+    try testing.expectEqualSlices(u16, &.{ 2, 4 }, out.hitsOf());
+    try testing.expectEqualSlices(u16, &.{7}, out.missesOf());
+    try testing.expectEqualSlices(Eviction, &.{.{ .slot = 2, .previous = 3, .next = 7 }}, out.evictionsOf());
+    try testing.expectEqual(@as(?u32, 0), p.slotOf(1));
+}
+
 test "dsv41 policy: bounded parts cut at the last physical gap" {
     var ends: [8]u32 = undefined;
     // 0-10-20 contiguous | 35-45 | 60-70.

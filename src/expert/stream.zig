@@ -41,6 +41,7 @@ pub const Options = S.Options;
 pub const read_ahead_probed = S.read_ahead_probed;
 pub const ReadAheadProbe = S.ReadAheadProbe;
 pub const GrowFill = S.GrowFill;
+pub const Residents = S.Residents;
 const ProbeSlot = S.ProbeSlot;
 const no_probe = S.no_probe;
 pub const Lookahead = S.Lookahead;
@@ -207,8 +208,8 @@ pub const StreamSource = struct {
     }
 
     /// The reverse phase change's free (`Stream.shrink`): the bytes freed.
-    pub fn shrink(self: *StreamSource, prompt_rows: []const u32) !u64 {
-        return self.stream.shrink(prompt_rows);
+    pub fn shrink(self: *StreamSource, prompt_rows: []const u32, residents: Residents) !u64 {
+        return self.stream.shrink(prompt_rows, residents);
     }
 
     /// The reverse phase change's allocation (`Stream.regrowTransient`): the bytes allocated.
@@ -1813,7 +1814,7 @@ test "dsv41 stream 0b: REVERSE: two requests through MLX slot rows: the reverse 
         // pages outside it do not rise (10 %); only then the scratch.
         _ = mlx.mlx_synchronize(stream);
         const b1 = try ProbeBox.mark(&buf);
-        const freed = try s.shrink(prompt_rows);
+        const freed = try s.shrink(prompt_rows, .forget);
         try testing.expectEqual(transientBytes(s, 24 + max_route_ids + decode_staging_rows), freed);
         _ = mlx.mlx_synchronize(stream);
         _ = mlx.mlx_clear_cache();
@@ -1922,7 +1923,7 @@ test "dsv41 stream: three requests: each prompt, phase change, decode and revers
         if (req == 1) _ = try serveGated(s, 1, &.{ 3, 4, 5, 6, 7, 8 }, &.{});
         // Freed: the grown rows (6 + 5) and decode's window 0.
         const record = prompt_bytes / (5 * max_route_ids);
-        try testing.expectEqual((6 + 5 + max_route_ids + decode_staging_rows) * record, try s.shrink(&.{ 4, 4 }));
+        try testing.expectEqual((6 + 5 + max_route_ids + decode_staging_rows) * record, try s.shrink(&.{ 4, 4 }, .forget));
         try testing.expectEqual(Phase.prefill, s.phase);
         try testing.expect(s.transient_released);
         for (s.layers) |*ls| {
@@ -1934,13 +1935,153 @@ test "dsv41 stream: three requests: each prompt, phase change, decode and revers
             for (ls.meta[0..4]) |m| try testing.expectEqual(@as(u16, 0), m.pins);
         }
         for (&s.routes) |*r| try testing.expect(r.state == .free);
-        try testing.expectError(error.NotGrown, s.shrink(&.{ 4, 4 }));
+        try testing.expectError(error.NotGrown, s.shrink(&.{ 4, 4 }, .forget));
         try testing.expectEqual(prompt_bytes, try s.regrowTransient());
         try testing.expectEqual(@as(u32, 5 * max_route_ids), s.transient.rows);
         for (s.transient_meta) |m| try testing.expect(std.meta.eql(m, SlotMeta{}));
         try testing.expectError(error.TransientNotReleased, s.regrowTransient());
     }
     try testing.expectEqual(@as(u64, 0), s.stats().gates_forced);
+}
+
+/// One request up to its reverse change, on a stream of 4 prompt rows per layer: each layer's prompt route over
+/// `prompt[l]` (the 4 persistent rows, then the scratch; its plan into `plans[l]`), the phase change to 6 rows per layer,
+/// then decode's routes over `decode` on both layers. Every served slot holds its record.
+fn promptAndDecode(s: *Stream, sb: *const SynthBank, prompt: [2][]const u16, decode: []const []const u16, plans: *[2]Plan) !void {
+    for (prompt, 0..) |ids, l| {
+        const r = try serve(s, @intCast(l), ids);
+        try expectServed(s, sb, r, ids);
+        plans[l] = r.plan;
+        s.release(r);
+    }
+    try s.flush();
+    _ = try s.releaseTransient();
+    try s.grow(&.{ 6, 6 });
+    for (decode) |ids| for (0..2) |l| {
+        const r = try serve(s, @intCast(l), ids);
+        try expectServed(s, sb, r, ids);
+        s.release(r);
+    };
+    try s.flush();
+}
+
+const turn_opt: Options = .{ .rows = &.{ 4, 4 }, .transient_rows = 5 * max_route_ids, .wide_depth = 5, .pool = test_pool, .transient_release = true };
+const turn_prompt = [2][]const u16{ &.{ 1, 2, 3, 4, 9, 10 }, &.{ 5, 6, 7, 8, 11 } };
+const turn_decode = [_][]const u16{ &.{ 1, 12 }, &.{ 2, 13, 3 }, &.{ 14, 1, 15, 2 }, &.{ 16, 4, 1 } };
+
+test "dsv41 stream: the forget route leaves the prompt rows as construction does: the next prompt plans as the first did, slot for slot" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, turn_opt);
+    defer s.deinit();
+    var first: [2]Plan = undefined;
+    var again: [2]Plan = undefined;
+    for (0..2) |req| {
+        try promptAndDecode(s, &sb, turn_prompt, &turn_decode, if (req == 0) &first else &again);
+        _ = try s.shrink(&.{ 4, 4 }, .forget);
+        // Every resident and the prompt state gone (decode's transition state persists, as before the route existed).
+        for (s.layers) |*ls| {
+            try testing.expectEqual(@as(u32, 0), ls.policy.occupancy);
+            for (ls.policy.slot_to_expert) |e| try testing.expectEqual(expert_policy.no_expert, e);
+            try testing.expectEqual(@as(usize, 0), ls.policy.protected.count());
+            try testing.expectEqual(@as(usize, 0), ls.policy.seed.count());
+            for (ls.policy.prefill_freq, ls.policy.recency) |f, rc| try testing.expect(f == 0 and rc == 0);
+            try testing.expectEqual(@as(u64, 0), ls.policy.clock);
+        }
+        try testing.expectEqual(@as(u64, 0), s.residentCount());
+        _ = try s.regrowTransient();
+    }
+    for (first, again) |x, y| {
+        try testing.expectEqualSlices(u32, x.slotsOf(), y.slotsOf());
+        try testing.expectEqualSlices(u16, x.missesOf(), y.missesOf());
+        try testing.expectEqualSlices(expert_policy.Load, x.loadsOf(), y.loadsOf());
+        try testing.expectEqual(@as(u32, 0), y.n_hits);
+    }
+}
+
+/// One route of the reverse change on the shared history (`promptAndDecode` on a fresh stream: the read pool is one per
+/// process), then a continuation's prompt on each layer over two of the residents decode left in its prompt rows and two
+/// experts never routed (20, 21). Checks the rows stay the bill's prompt rows throughout and every served slot's bytes.
+const TurnOutcome = struct { left: [2][4]u16, freed: u64, regrown: u64, kept: u64, hits: [2]u32, misses: [2]u32, reads: [2]u64, bytes: [2]u64 };
+
+fn continuationTurn(sb: *const SynthBank, residents: Residents) !TurnOutcome {
+    const s = try Stream.init(testing.allocator, &sb.bank, turn_opt);
+    defer s.deinit();
+    var plans: [2]Plan = undefined;
+    try promptAndDecode(s, sb, turn_prompt, &turn_decode, &plans);
+    var out: TurnOutcome = undefined;
+    // What decode left in each layer's prompt rows (slots 0..3, full).
+    for (&out.left, s.layers) |*row, *ls| for (row, ls.policy.slot_to_expert[0..4]) |*e, x| {
+        try testing.expect(x != expert_policy.no_expert);
+        e.* = x;
+    };
+    out.freed = try s.shrink(&.{ 4, 4 }, residents);
+    for (s.layers, 0..) |*ls, l| {
+        // The bill's prompt rows only, whatever the route.
+        try testing.expectEqual(@as(u32, 4), ls.policy.capacity);
+        try testing.expectEqual(@as(u32, 4), ls.base.rows);
+        try testing.expect(ls.ext == null);
+        for (ls.meta[4..]) |m| try testing.expect(std.meta.eql(m, SlotMeta{}));
+        try testing.expectEqual(@as(usize, 0), ls.policy.protected.count());
+        switch (residents) {
+            .forget => try testing.expectEqual(@as(u32, 0), ls.policy.occupancy),
+            // Every resident decode left there, in its slot; the slot's meta its landed record's, unpinned.
+            .keep => for (out.left[l], 0..) |e, slot| {
+                try testing.expectEqual(@as(?u32, @intCast(slot)), ls.policy.slotOf(e));
+                try testing.expect(std.meta.eql(ls.meta[slot], SlotMeta{ .state = .ready, .layer = @intCast(l), .expert = e }));
+            },
+        }
+    }
+    out.kept = s.residentCount();
+    out.regrown = try s.regrowTransient();
+    for (0..2) |l| {
+        const ids = [_]u16{ out.left[l][1], 20, out.left[l][3], 21 };
+        const b0 = s.stats().expert_bytes_read;
+        const r = try serve(s, @intCast(l), &ids);
+        try expectServed(s, sb, r, &ids);
+        if (residents == .keep) {
+            try testing.expectEqualSlices(u16, &.{ out.left[l][1], out.left[l][3] }, r.plan.hitsOf());
+            try testing.expectEqualSlices(u16, &.{ 20, 21 }, r.plan.missesOf());
+        }
+        // A persistent load takes a prompt row (keep: a resident decode used least recently), the rest the scratch.
+        for (r.plan.loadsOf()) |ld| try testing.expect(if (ld.persistent) ld.slot < 4 else ld.slot >= 4 and ld.slot < 4 + 5 * max_route_ids);
+        out.hits[l] = r.plan.n_hits;
+        out.misses[l] = r.plan.n_misses;
+        out.reads[l] = readsOf(r);
+        s.release(r);
+        try s.flush();
+        out.bytes[l] = s.stats().expert_bytes_read - b0;
+    }
+    for (s.layers) |*ls| try testing.expect(ls.base.rows == 4 and ls.ext == null and ls.policy.capacity == 4);
+    return out;
+}
+
+test "dsv41 stream: the keep route: a continuation's prompt finds the residents decode left in the prompt rows and reads only its misses; the rows and the bytes freed are the forget route's" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    var record: u64 = 0;
+    for (sb.bank.layers[0].segments) |seg| record += seg.length;
+    const cold = try continuationTurn(&sb, .forget);
+    const warm = try continuationTurn(&sb, .keep);
+    // One history: the same residents left in the prompt rows.
+    try testing.expectEqual(cold.left, warm.left);
+    // The same rows freed and re-created: each layer's 2 grown rows and decode's window 0, then the prompt's scratch.
+    try testing.expectEqual(cold.freed, warm.freed);
+    try testing.expectEqual((2 + 2 + max_route_ids + decode_staging_rows) * record, warm.freed);
+    try testing.expectEqual(cold.regrown, warm.regrown);
+    try testing.expectEqual(@as(u64, 0), cold.kept);
+    try testing.expectEqual(@as(u64, 8), warm.kept);
+    for (0..2) |l| {
+        // Forget: all four routed experts miss and are read. Keep: the two kept ones hit; only 20 and 21 are read.
+        try testing.expectEqual(@as(u32, 0), cold.hits[l]);
+        try testing.expectEqual(@as(u32, 4), cold.misses[l]);
+        try testing.expectEqual(@as(u64, 4), cold.reads[l]);
+        try testing.expectEqual(4 * record, cold.bytes[l]);
+        try testing.expectEqual(@as(u32, 2), warm.hits[l]);
+        try testing.expectEqual(@as(u32, 2), warm.misses[l]);
+        try testing.expectEqual(@as(u64, 2), warm.reads[l]);
+        try testing.expectEqual(2 * record, warm.bytes[l]);
+    }
 }
 
 test "dsv41 stream: a request cancelled in its prompt phase: its live and held routes are settled at its end, and the next prompt routes" {
