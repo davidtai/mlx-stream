@@ -98,6 +98,8 @@ pub const Kernels = struct {
     /// f32 [8]: routed_scaling, then zeros (eight words: MLX passes a smaller input in the constant address space).
     consts: T = .{ .ctx = null },
     experts: u32 = 0,
+    /// hcPre's and materialize's prepared launches (kernels, counter, eps, threadgroup size, configs per row count).
+    hc: ops.HcPlan = .{},
 
     pub fn deinit(k: *Kernels) void {
         for ([_]Kernel{ k.router, k.top8, k.combine }) |x| if (x.ctx != null) {
@@ -107,6 +109,7 @@ pub const Kernels = struct {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         };
         if (k.consts.ctx != null) _ = mlx.mlx_array_free(k.consts);
+        k.hc.deinit();
         k.* = .{};
     }
 };
@@ -164,6 +167,12 @@ pub const Geometry = struct {
 /// input norm, the first routed layer's router (BF16 weight, F32 correction bias).
 pub const CheckTables = struct { fn_rows: T, scale: T, base: T, norm_w: T, router_w: T, router_bias: T };
 
+/// The model's hc geometry as hcPre's plan launches it: D and the stream's dtype from the norm weight (every layer's norm
+/// is BF16 [hidden] by the bind's dtype rules), the Sinkhorn iterations and the eps values from the config.
+pub fn hcGeometry(c: *const glm.Config, norm_w: T) ops.HcPlan.Geometry {
+    return .{ .d = @intCast(c.hidden_size), .dt = mlx.mlx_array_dtype(norm_w), .iters = c.hc_iters, .hc_eps = c.hc_eps, .norm_eps = c.rms_norm_eps, .rms_eps = c.rms_norm_eps };
+}
+
 /// The route's construction on the module's GPU stream `s` (refused by name: `diag`): the geometry, the three texts'
 /// kernel objects, every decode-lane width's configs, then the compile check: one launch of each text and of both hcPre
 /// variants over zeros and the model's own tables, evaluated (Metal compiles a text at its first dispatch; hcPre's first
@@ -180,6 +189,12 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const glm.Config, ta
     const e: u32 = c.n_routed_experts;
     var k: Kernels = .{ .experts = e };
     errdefer k.deinit();
+    // hcPre's plan: its kernels, counter, eps and configs, the threadgroup probe over the tables' sublayer (2 launches).
+    k.hc = ops.HcPlan.install(s, hcGeometry(c, tables.norm_w), @intCast(max_rows), tables.fn_rows, tables.scale, tables.base, tables.norm_w) catch |err| {
+        var eb: [400]u8 = undefined;
+        diag.set("glm5_next decode_glue=fused: hcPre's plan refused ({s}): {s}", .{ @errorName(err), mlx.takeError(&eb) orelse "" });
+        return err;
+    };
     k.router = try makeKernel("glm5n_glue_router", &.{ "x", "gate" }, &.{"logits"}, texts.router, texts.header);
     k.top8 = try makeKernel("glm5n_glue_top8", &.{ "logits", "bias", "consts" }, &.{ "ids", "weights" }, texts.top8, texts.header);
     k.combine = try makeKernel("glm5n_moe_combine", &.{ "rows", "w", "shared" }, &.{"y"}, texts.combine, texts.header_combine);
@@ -218,11 +233,11 @@ fn compileCheck(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const glm.Config, k
     const hc: c_int = @intCast(c.hc_mult);
     // hcPre over a zero stream, then its deferred variant over a zero sublayer output.
     const stream = try g.zeros(&.{ 1, 1, hc, h }, .bfloat16);
-    var p0 = try ops.hcPre(s, stream, null, t.fn_rows, t.scale, t.base, t.norm_w, c.hc_iters, c.hc_eps, c.rms_norm_eps, c.rms_norm_eps);
+    var p0 = try ops.hcPre(s, &k.hc, stream, null, t.fn_rows, t.scale, t.base, t.norm_w);
     defer p0.deinit();
     const y = try g.zeros(&.{ 1, 1, h }, .bfloat16);
     const df: ops.Deferred = .{ .y = y, .post = p0.post, .comb = p0.comb, .h = stream };
-    var p1 = try ops.hcPre(s, null, &df, t.fn_rows, t.scale, t.base, t.norm_w, c.hc_iters, c.hc_eps, c.rms_norm_eps, c.rms_norm_eps);
+    var p1 = try ops.hcPre(s, &k.hc, null, &df, t.fn_rows, t.scale, t.base, t.norm_w);
     defer p1.deinit();
     // The router and its tail over p1's normed row, the combine over zero rows.
     const x = try g.reshape(p1.normed, &.{ 1, h });
@@ -282,8 +297,8 @@ pub fn combineShared(g: *G, k: *const Kernels, routed: T, weights: T, shared: T,
 /// (the forward's first sublayer) or from the previous sublayer's `Deferred` (then `h` is the stream it stood for).
 pub const Pre = struct { normed: T, post: T, comb: T, h: ?T };
 
-pub fn pre(g: *G, c: *const glm.Config, x: ?T, deferred: ?*const ops.Deferred, fn_rows: T, scale: T, base: T, norm_w: T) !Pre {
-    const p = try ops.hcPre(g.s, x, deferred, fn_rows, scale, base, norm_w, c.hc_iters, c.hc_eps, c.rms_norm_eps, c.rms_norm_eps);
+pub fn pre(g: *G, k: *const Kernels, x: ?T, deferred: ?*const ops.Deferred, fn_rows: T, scale: T, base: T, norm_w: T) !Pre {
+    const p = try ops.hcPre(g.s, &k.hc, x, deferred, fn_rows, scale, base, norm_w);
     const out: Pre = .{
         .normed = try g.adopt(p.normed),
         .post = try g.adopt(p.post),

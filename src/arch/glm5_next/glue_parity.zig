@@ -134,6 +134,8 @@ test "glm5next glue GPU: router + top-8 texts against the stock route; the combi
     const base = try f32Array(&g, a, &.{mix}, 0.5, 0.0, &state);
     const norm_w = try bf16Array(&g, a, &.{H}, 0.5, 1.0, &state);
     var diag: @import("sdk").Diag = .{};
+    // The op chains' kernels and launches (the stock side of the comparison), as the module installs them.
+    try ops.install(glue.hcGeometry(&c, norm_w));
     var k = glue.install(a, stream, &c, .{ .fn_rows = fn_rows, .scale = scale, .base = base, .norm_w = norm_w, .router_w = router_w, .router_bias = bias }, &diag) catch |e| {
         std.debug.print("glm5next glue install refused: {s}\n", .{diag.message()});
         return e;
@@ -258,9 +260,9 @@ test "glm5next glue GPU: router + top-8 texts against the stock route; the combi
         defer c2.deinit();
         const n2 = try graph.rmsNorm(&g, c2.x, norm_w, c.rms_norm_eps);
         // Fused: hcPre on the stream, its deferral with y0, hcPre on the deferral.
-        const p1 = try glue.pre(&g, &c, stream0, null, fn_rows, scale, base, norm_w);
+        const p1 = try glue.pre(&g, &k, stream0, null, fn_rows, scale, base, norm_w);
         const df: ops.Deferred = .{ .y = y0, .post = p1.post, .comb = p1.comb, .h = stream0 };
-        const p2 = try glue.pre(&g, &c, null, &df, fn_rows, scale, base, norm_w);
+        const p2 = try glue.pre(&g, &k, null, &df, fn_rows, scale, base, norm_w);
         for ([_][2]T{ .{ n1, p1.normed }, .{ c1.post, p1.post }, .{ c1.comb, p1.comb }, .{ s1, p2.h.? }, .{ n2, p2.normed }, .{ c2.post, p2.post }, .{ c2.comb, p2.comb } }, 0..) |pair, i| {
             const want = try hostF32(&g, a, pair[0]);
             defer a.free(want);

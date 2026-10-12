@@ -18,6 +18,8 @@ const experts = @import("experts.zig");
 const kda = @import("kda.zig");
 const kda_percore = @import("kda_percore.zig");
 const dsa = @import("dsa.zig");
+/// The DSA indexer's prepared decode launches (`SelectPlan`).
+const ops_dsa = @import("ops.zig");
 const dump = @import("dump.zig");
 const glue = @import("glue.zig");
 const kda_decode = @import("kda_decode.zig");
@@ -99,7 +101,10 @@ pub const Module = struct {
         const t_read = std.Io.Timestamp.now(io, .awake);
         try weights.materialize();
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
-        try kda.install();
+        try kda.install(&self.c.model);
+        // The op chains' hc and selection kernels and the decode lane's collapse / expand launches (the control route
+        // and the prompt pass), once for the model's hc geometry.
+        try ops_dsa.install(glue.hcGeometry(model, self.w.layers[0].input_norm));
         // The KDA prompt route, once: the per-core kernel where this GPU's plan and probe take it, else the per-token one.
         const kda_route = try kda_percore.install(&self.g, &self.c.model);
         // The decode glue (`decode_glue`): the fused texts installed here (their geometry, the launches per decode-lane
@@ -114,6 +119,14 @@ pub const Module = struct {
             log.info("glm5_next decode glue installed: hcPre chain (collapse, norm and the deferred expand in one dispatch a sublayer), router {d} threadgroups + top-8, combine + shared expert; compile check passed\n", .{model.n_routed_experts / 4});
         }
         errdefer self.glue_kernels.deinit();
+        // The DSA indexer's decode launches (every route: the stock op chain and the fused texts select alike): kernels,
+        // configs and their compile check at construction, before the MTP lane opens (its head's DSA layer reads them).
+        self.routes.dsa.select = ops_dsa.SelectPlan.install(s, dsa.indexer(model, self.routes.dsa), .bfloat16) catch |e| {
+            var eb: [400]u8 = undefined;
+            log.err("glm5_next: the DSA indexer's decode launches refused ({s}): {s}\n", .{ @errorName(e), mlx.takeError(&eb) orelse "" });
+            return e;
+        };
+        errdefer self.routes.dsa.select.?.destroy();
         // The decode lane's sparse latent attention (`decode_dsa`): the fused texts installed here (before the MTP lane
         // opens: its head's DSA layer takes the same route), refused by name; the op chain otherwise.
         if (self.c.decode_dsa == .fused) {
@@ -247,6 +260,7 @@ pub const Module = struct {
         self.glue_kernels.deinit();
         self.kda_kernels.deinit();
         self.dsa_kernels.deinit();
+        if (self.routes.dsa.select) |p| p.destroy();
         self.swiglu_kernels.deinit();
         self.w.deinit(self.gpa);
         self.gpa.free(self.gates);
