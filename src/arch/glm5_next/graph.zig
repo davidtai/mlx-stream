@@ -200,22 +200,22 @@ pub const Weights = struct {
                 const dim = hv * dk;
                 const a_log = try lg.get("self_attn.A_log", &.{hv});
                 const conv_raw = try lg.get("self_attn.conv1d.weight", &.{ 3 * dim, 1, @intCast(c.kda_conv) });
-                if (mlx.mlx_array_dtype(conv_raw) != .bfloat16) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} self_attn.conv1d.weight is not BF16", .{l});
+                try dtypeCheck("self_attn.conv1d.weight", mlx.mlx_array_dtype(conv_raw), l, diag);
                 lw.attn = .{ .kda = .{
                     .q = try lg.get("self_attn.q_proj.weight", &.{ dim, h }),
                     .k = try lg.get("self_attn.k_proj.weight", &.{ dim, h }),
                     .v = try lg.get("self_attn.v_proj.weight", &.{ dim, h }),
                     .f_a = try lg.get("self_attn.f_a_proj.weight", &.{ dk, h }),
-                    .f_b = try lg.get("self_attn.f_b_proj.weight", &.{ dim, dk }),
+                    .f_b = try checked(lg, "self_attn.f_b_proj.weight", &.{ dim, dk }, l, diag),
                     .g_a = try lg.get("self_attn.g_a_proj.weight", &.{ dk, h }),
-                    .g_b = try lg.get("self_attn.g_b_proj.weight", &.{ dim, dk }),
+                    .g_b = try checked(lg, "self_attn.g_b_proj.weight", &.{ dim, dk }, l, diag),
                     .b = try lg.get("self_attn.b_proj.weight", &.{ hv, h }),
                     .a_log = try w.own(a, try aLogTable(s, a_log, l, diag)),
                     .a_exp = try w.own(a, try aExp(s, a_log, hv, dk)),
-                    .dt_bias = try w.own(a, try f32Copy(s, try lg.get("self_attn.dt_bias", &.{dim}), false)),
+                    .dt_bias = try w.own(a, try f32Copy(s, try checked(lg, "self_attn.dt_bias", &.{dim}, l, diag), false)),
                     .conv_w = try w.own(a, try convLayout(s, conv_raw)),
                     .conv_raw = conv_raw,
-                    .o_norm = try lg.get("self_attn.o_norm.weight", &.{dk}),
+                    .o_norm = try checked(lg, "self_attn.o_norm.weight", &.{dk}, l, diag),
                     .o = try lg.get("self_attn.o_proj.weight", &.{ h, dim }),
                 } };
                 lw.slot = n_kda;
@@ -225,13 +225,12 @@ pub const Weights = struct {
                 const e: c_int = @intCast(c.n_routed_experts);
                 const si: c_int = @intCast(c.moe_intermediate_size * c.n_shared_experts);
                 const gate_w = try lg.get("mlp.gate.weight", &.{ e, h });
-                if (mlx.mlx_array_dtype(gate_w) != .bfloat16) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} mlp.gate.weight is not BF16", .{l});
+                try dtypeCheck("mlp.gate.weight", mlx.mlx_array_dtype(gate_w), l, diag);
                 lw.router = .{
                     .w = gate_w,
                     .w_t = try w.own(a, try f32Copy(s, gate_w, true)),
-                    .bias = try lg.get("mlp.gate.e_score_correction_bias", &.{e}),
+                    .bias = try checked(lg, "mlp.gate.e_score_correction_bias", &.{e}, l, diag),
                 };
-                if (mlx.mlx_array_dtype(lw.router.?.bias) != .float32) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} gate.e_score_correction_bias is not F32", .{l});
                 lw.shared = .{
                     .gate = try lg.get("mlp.shared_experts.gate_proj.weight", &.{ si, h }),
                     .up = try lg.get("mlp.shared_experts.up_proj.weight", &.{ si, h }),
@@ -341,7 +340,51 @@ pub fn aLogAccepted(dt: mlx.mlx_dtype) bool {
 
 /// `layer`'s A_log dtype as the bind takes it; any other refuses the load by name.
 fn aLogCheck(dt: mlx.mlx_dtype, layer: u32, diag: ?*sdk.Diag) !void {
-    if (!aLogAccepted(dt)) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} self_attn.A_log is {t}, not a float (F32, BF16 or F16)", .{ layer, dt });
+    return dtypeCheck("self_attn.A_log", dt, layer, diag);
+}
+
+/// Which layers hold a rule's tensor.
+pub const RuleLayers = enum { kda, moe };
+/// A per-layer tensor a route reads in its stored dtype (or converts once at the bind), the layers that hold it, and the
+/// dtypes the bind takes for it. One table: the bind's refusals (`dtypeCheck`) and the pack-header test (GLM5_BANK) read
+/// it, so a real pack's dtype is checked against every route before a load, never found by a refusal in a window.
+pub const DtypeRule = struct { suffix: []const u8, layers: RuleLayers, accepted: []const mlx.mlx_dtype, desc: []const u8 };
+const float_dtypes = [_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 };
+const float_desc = "a float (F32, BF16 or F16)";
+pub const dtype_rules = [_]DtypeRule{
+    // KDA: A_log (its own F32 table) and dt_bias (an F32 copy) converted once; the conv, f_b, g_b and o_norm read as
+    // stored by the fused decode text (kda_decode.zig: one compile-checked variant per dtype combination) and the op chain.
+    .{ .suffix = "self_attn.A_log", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    .{ .suffix = "self_attn.dt_bias", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    .{ .suffix = "self_attn.conv1d.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    .{ .suffix = "self_attn.f_b_proj.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    .{ .suffix = "self_attn.g_b_proj.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    .{ .suffix = "self_attn.o_norm.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    // The router: the glue's router text and the BF16 predictor read the weight as BF16; the correction bias is F32.
+    .{ .suffix = "mlp.gate.weight", .layers = .moe, .accepted = &.{.bfloat16}, .desc = "BF16" },
+    .{ .suffix = "mlp.gate.e_score_correction_bias", .layers = .moe, .accepted = &.{.float32}, .desc = "F32" },
+};
+
+fn ruleOf(comptime suffix: []const u8) DtypeRule {
+    for (dtype_rules) |r| if (std.mem.eql(u8, r.suffix, suffix)) return r;
+    @compileError("glm5_next: no dtype rule for " ++ suffix);
+}
+
+pub fn accepts(r: DtypeRule, dt: mlx.mlx_dtype) bool {
+    return std.mem.indexOfScalar(mlx.mlx_dtype, r.accepted, dt) != null;
+}
+
+/// A layer's tensor through the bind's getter, its dtype checked against its rule (`dtypeCheck`).
+fn checked(lg: anytype, comptime suffix: []const u8, shape: []const c_int, layer: u32, diag: ?*sdk.Diag) !T {
+    const x = try lg.get(suffix, shape);
+    try dtypeCheck(suffix, mlx.mlx_array_dtype(x), layer, diag);
+    return x;
+}
+
+/// `layer`'s `suffix` tensor dtype against its rule; any other refuses the load by name.
+pub fn dtypeCheck(comptime suffix: []const u8, dt: mlx.mlx_dtype, layer: u32, diag: ?*sdk.Diag) !void {
+    const r = comptime ruleOf(suffix);
+    if (!accepts(r, dt)) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} " ++ suffix ++ " is {t}, not " ++ r.desc, .{ layer, dt });
 }
 
 /// A_log [heads] of `layer` as its own F32 table, evaluated, once (the per-core prompt route reads it: kda_percore.zig).
@@ -1008,4 +1051,82 @@ test "glm5_next graph: every KDA layer's A_log dtype in the pack's headers is on
     std.debug.print("\nGLM5_NEXT A_LOG pack={s} kda_layers={d} dtypes:", .{ dir, n });
     for (hist.keys(), hist.values()) |k, v| std.debug.print(" {s}={d}", .{ k, v });
     std.debug.print("\n", .{});
+}
+
+test "glm5_next graph: the dtype rules take each of Flash's float dtypes where a route reads floats, and name the tensor otherwise" {
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 }) |dt| try dtypeCheck("self_attn.conv1d.weight", dt, 0, null);
+    var diag: sdk.Diag = .{};
+    try testing.expectError(error.Glm5NextResidentDtype, dtypeCheck("self_attn.conv1d.weight", .uint8, 2, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "layer 2 self_attn.conv1d.weight is uint8, not a float (F32, BF16 or F16)") != null);
+    try testing.expectError(error.Glm5NextResidentDtype, dtypeCheck("mlp.gate.weight", .float32, 3, &diag));
+    try testing.expectError(error.Glm5NextResidentDtype, dtypeCheck("mlp.gate.e_score_correction_bias", .bfloat16, 3, &diag));
+}
+
+// GLM5_BANK=<pack> (headers only, no payload): every per-layer tensor of `dtype_rules` (the tensors the fused routes and
+// the bind's conversions read as stored) on every layer that holds it, its dtype as the pack's shards declare it, against
+// its rule: the check the bind makes at the load, made on the real pack before any window. The histograms printed (the
+// pack of record: A_log, dt_bias and conv1d F32 on layers 0-2, BF16 on the other 31).
+test "glm5_next graph: every tensor the routes bind has a dtype its rule takes in the pack's headers (GLM5_BANK)" {
+    const dir = std.mem.span(std.c.getenv("GLM5_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    defer d.close(io);
+    const config_text = try d.readFileAlloc(io, "config.json", a, .limited(1 << 20));
+    defer a.free(config_text);
+    var cdiag: glm.Diag = .{};
+    const c = glm.Config.parse(a, config_text, &cdiag) catch |e| {
+        std.debug.print("config refused: {s}\n", .{cdiag.message()});
+        return e;
+    };
+    const raw = try d.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 << 20));
+    defer a.free(raw);
+    const index = try std.json.parseFromSlice(std.json.Value, a, raw, .{ .allocate = .alloc_always });
+    defer index.deinit();
+    const wm = index.value.object.get("weight_map").?.object;
+    var headers: std.StringArrayHashMapUnmanaged(std.json.Parsed(std.json.Value)) = .empty;
+    defer {
+        for (headers.values()) |*h| h.deinit();
+        headers.deinit(a);
+    }
+    var bad: u32 = 0;
+    std.debug.print("\nGLM5_NEXT DTYPE_RULES pack={s}\n", .{dir});
+    for (dtype_rules) |r| {
+        var counts: [3]u32 = @splat(0);
+        var other: u32 = 0;
+        var l: u32 = 0;
+        while (l < c.n_layers) : (l += 1) {
+            const holds = switch (r.layers) {
+                .kda => !c.isDsa(l),
+                .moe => c.isMoe(l),
+            };
+            if (!holds) continue;
+            var nb: [128]u8 = undefined;
+            const name = try std.fmt.bufPrint(&nb, "model.language_model.layers.{d}.{s}", .{ l, r.suffix });
+            const shard = (wm.get(name) orelse {
+                std.debug.print("  {s}: missing from the index\n", .{name});
+                return error.Glm5NextResidentMissing;
+            }).string;
+            if (headers.get(shard) == null) {
+                const header = try shardHeader(a, dir, shard);
+                errdefer header.deinit();
+                try headers.put(a, shard, header);
+            }
+            const desc = headers.get(shard).?.value.object.get(name) orelse return error.Glm5NextResidentMissing;
+            const dtype = desc.object.get("dtype").?.string;
+            const dt = safetensorsDtype(dtype) orelse .complex64;
+            if (!accepts(r, dt)) {
+                std.debug.print("  REFUSED layer {d} {s} is {s}, not {s}\n", .{ l, r.suffix, dtype, r.desc });
+                bad += 1;
+            }
+            switch (dt) {
+                .float32 => counts[0] += 1,
+                .bfloat16 => counts[1] += 1,
+                .float16 => counts[2] += 1,
+                else => other += 1,
+            }
+        }
+        std.debug.print("  {s}: F32={d} BF16={d} F16={d} other={d}\n", .{ r.suffix, counts[0], counts[1], counts[2], other });
+    }
+    try testing.expectEqual(@as(u32, 0), bad);
 }

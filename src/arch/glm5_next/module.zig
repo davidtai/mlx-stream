@@ -139,12 +139,18 @@ pub const Module = struct {
         }
         errdefer self.swiglu_kernels.deinit();
         // The decode lane's KDA layer (`decode_kda`): the fused text installed here (its geometry, the launches per width,
-        // one launch over the first KDA layer's tables), refused by name; the op chain otherwise.
+        // one launch over the first KDA layer of each weight-dtype variant), refused by name; the op chain otherwise.
         if (self.c.decode_kda == .fused) {
-            const first_kda = for (self.w.layers) |*lw| {
-                if (lw.attn == .kda) break &lw.attn.kda;
-            } else unreachable;
-            self.kda_kernels = kda_decode.install(gpa, s, model, first_kda, &diag) catch |e| {
+            const kda_layers = try gpa.alloc(*const kda.Weights, model.nKda());
+            defer gpa.free(kda_layers);
+            var n_kda: usize = 0;
+            for (self.w.layers) |*lw| if (lw.attn == .kda) {
+                kda_layers[n_kda] = &lw.attn.kda;
+                n_kda += 1;
+            };
+            var checks: [16]*const kda.Weights = undefined;
+            const n_checks = try kda_decode.variants(kda_layers[0..n_kda], &checks);
+            self.kda_kernels = kda_decode.install(gpa, s, model, checks[0..n_checks], &diag) catch |e| {
                 log.err("glm5_next: the fused KDA decode refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
                 return e;
             };

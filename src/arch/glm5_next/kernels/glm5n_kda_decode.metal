@@ -2,8 +2,10 @@
 // the short conv and SiLU, the low-rank gate projections' second stages, the q/k L2 norms, the gate and beta, the
 // vector-gated delta rule and the gated RMSNorm, in one dispatch (the host's oMLX kda_decode body). This variant (GLM-5.3-
 // Flash's BF16 pack): the projections arrive as separate rows (q, k, v [TOK, QKV]; f_a, g_a [TOK, DK]; b [TOK, H]: each
-// from its own GEMV, so a projection's weight format stays outside the text); the gate's second stages read the BF16
-// f_b / g_b rows [QKV, DK] (a quad of threads per row, 32 values each); the conv tail is the module's f32 state
+// from its own GEMV, so a projection's weight format stays outside the text); the gate's second stages read the f_b /
+// g_b rows [QKV, DK] (a quad of threads per row, 32 values each) and the conv its weights [3 QKV, 1, CK] in the pack's
+// float dtype as stored (the pack of record: BF16, the conv F32 on layers 0-2; each value widened to f32 in the
+// product, so a BF16 layer computes as before); the conv tail is the module's f32 state
 // [1, CK - 1, 3 * QKV] (its values bf16-exact); the gate's exp(A_log) is the module's f32 table a_exp [QKV].
 // consts: q_scale (1 / sqrt(DK)), the L2 eps, the norm eps, the gate's lower bound, 1 / DK.
 constexpr int CK = 4;
@@ -42,11 +44,11 @@ if (tid < uint(3 * DK)) {
   for (int t = 0; t < TOK; t++) {
     win[CK - 1 + t] = src[t * QKV + h * DK + i];
   }
-  const device T* w = conv_w + gc * CK;
+  const device auto* w = conv_w + gc * CK;
   for (int t = 0; t < TOK; t++) {
     float acc = 0.0;
     for (int j = 0; j < CK; ++j) {
-      acc += static_cast<float>(win[t + j]) * w[j];
+      acc += static_cast<float>(win[t + j]) * static_cast<float>(w[j]);
     }
     T co = static_cast<T>(acc);
     T sgm = glm_sigmoid<T>(co);
@@ -72,7 +74,7 @@ if (tid < uint(3 * DK)) {
   const int which = quad / DK;
   const int i = quad % DK;
   const int row = h * DK + i;
-  const device T* wl = (which == 0 ? fb_w : gb_w) + size_t(row) * DK + ql * VPT;
+  const device auto* wl = (which == 0 ? fb_w : gb_w) + size_t(row) * DK + ql * VPT;
   for (int t = 0; t < TOK; t++) {
     const device T* xin = (which == 0 ? fa : ga) + t * DK + ql * VPT;
     float result = 0;
