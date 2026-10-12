@@ -27,6 +27,7 @@ const nvfp4 = @import("nvfp4.zig");
 const settings = @import("settings.zig");
 const glue = @import("glue.zig");
 const profile = @import("../mimo_v2/profile.zig");
+const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
 const route_trace = @import("../mimo_v2/route_trace.zig");
 const log = sdk.log;
@@ -157,6 +158,9 @@ pub const Source = struct {
     parts_combine: *const PartsCombineFn = partsCombineInplace,
     combine_kernel: prefill_combine.Kernel = .{},
     combine_route: prefill_combine.Route = .inplace,
+    /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine (its own queue, kernel, buffer and parked thread); the
+    /// stream source holds its arm (`warm_arm`: armed by `gate` and `awaitReadAhead`). Null on the control.
+    warm: ?*gpu_warm.Warm = null,
     /// P1's host scratch (reused): the call's predicted counts (read back from the GPU, prompt lever 5), the ranking.
     ahead_counts: [max_experts]u32 = undefined,
     ahead_ranked: [max_experts]u16 = undefined,
@@ -164,7 +168,7 @@ pub const Source = struct {
     /// Construction (the GPU stream, under the caller's lock): the bank opened, the stream at `rows`, the scheduler
     /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
     /// routed layer's.
-    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict) !*Source {
+    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route) !*Source {
         var bank = try bank_mod.Bank.open(a, io, model_dir);
         errdefer bank.deinit();
         const geo = bank.geometry;
@@ -200,6 +204,13 @@ pub const Source = struct {
         errdefer self.sdk_stream.deinit();
         self.stream_source = StreamSource.init(self.sdk_stream);
         try self.stream_source.installReadSchedule(read_schedule, mimo_stream.default_read_schedule_threshold);
+        // MiMo's X12 (`gpu_keep_warm`, the route the module resolved: `settings.Config.warmRoute`): `.waits` makes the warm
+        // queue, kernel and buffer on MLX's device (no kernel runs) and starts the parked warm thread, once, and binds its
+        // arm into the stream source (mimo_v2/source.zig's install); `.off` installs nothing; refused by name on a CPU
+        // stream or without the stream's Metal event.
+        self.warm = try gpu_warm.install(a, keep_warm, stream, event.object);
+        errdefer if (self.warm) |w| w.destroy();
+        if (self.warm) |w| self.stream_source.warm_arm = gpu_warm.Arm.of(gpu_warm.Warm, w);
         // The slot arrays are the format's, every routed layer's (base and transient banks), checked once.
         for (0..geo.num_moe_layers) |i| {
             const layer: u32 = geo.first_moe_layer + @as(u32, @intCast(i));
@@ -261,6 +272,8 @@ pub const Source = struct {
 
     pub fn deinit(self: *Source) void {
         _ = mlx.mlx_synchronize(self.g.s);
+        // X12: the warm thread joined (its chunks in flight retired) before anything else goes (MiMo's order).
+        if (self.warm) |w| w.destroy();
         self.ex.releaseParts(&self.g);
         self.ex.math.deinit(&self.g);
         self.combine_kernel.deinit();

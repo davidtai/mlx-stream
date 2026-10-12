@@ -9,12 +9,15 @@
 //! `ops`, the op chain, the control); `decode_dsa` the decode lane's sparse latent attention (`fused`, the default: two
 //! texts, dsa_decode.zig; `ops`, the op chain, the control); `decode_predict` the lookahead predictor's router weight
 //! (`bf16`, the default: the stored BF16 weight; `f32`, the transposed F32 copy, the control); `decode_swiglu` the decode lane's MLP activation
-//! (`fused`, the default: one text, swiglu.zig; `ops`, the op chain, the control); `logits_dump_dir` (an absolute directory) installs the logits dump route for the KL gate
-//! (dump.zig): absent, nothing of it is built.
+//! (`fused`, the default: one text, swiglu.zig; `ops`, the op chain, the control); `gpu_keep_warm` MiMo's X12 route
+//! (`waits`, the default: a one-simdgroup spin on its own Metal queue while the stream's gated parts and read-ahead wait
+//! for their bytes, mimo_v2/gpu_warm.zig; `off`, the control); `logits_dump_dir` (an absolute directory) installs the
+//! logits dump route for the KL gate (dump.zig): absent, nothing of it is built.
 
 const std = @import("std");
 const sdk = @import("sdk");
 const glm = @import("config.zig");
+const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 
 /// The context a load bills when the model sets none: the standard request (16,384 prompt tokens and 1,024 generated).
 pub const fill_reserve_tokens: u64 = 16_384 + 1_024;
@@ -28,7 +31,7 @@ pub const allocator_cache_bytes: u64 = 256 << 20;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "logits_dump_dir" };
 
 /// The decode lane's routed-expert route, installed once at construction: `stock` MLX's gather_qmm nvfp4 (two gathers
 /// and the clamped SwiGLU, then a gather per down), `fused` the NVFP4 decode texts (decode_kernels.zig: MiMo's k1 family
@@ -90,6 +93,13 @@ pub const Config = struct {
     decode_predict: DecodePredict = .bf16,
     /// The decode lane's MLP activation (swiglu.zig): `fused` (the default) or `ops` (the control).
     decode_swiglu: DecodeSwiglu = .fused,
+    /// MiMo's X12 keep-warm (mimo_v2/gpu_warm.zig, adopted there as the default: round -4.7 ms, decode +2.4 %, ids
+    /// identical): `waits` (the default) warms the GPU while the stream's event-gated parts (decode miss parts, a prompt
+    /// group's reads) and the host's read-ahead wait for their bytes; `off` (the control) installs nothing. Exact by
+    /// construction (the engine touches no model array). On a CPU stream the default resolves to `off` (`warmRoute`).
+    gpu_keep_warm: gpu_warm.Route = .waits,
+    /// The settings named `gpu_keep_warm` (a named route refuses where the default resolves to the control).
+    gpu_keep_warm_requested: bool = false,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -101,7 +111,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, dump_dir: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -135,6 +145,11 @@ pub const Config = struct {
             const route: ?DecodeSwiglu = if (v == .string) std.meta.stringToEnum(DecodeSwiglu, v.string) else null;
             if (route) |r| c.decode_swiglu = r else c.malformed.decode_swiglu = true;
         }
+        if (raw.object.get("gpu_keep_warm")) |v| {
+            const route: gpu_warm.Route = if (v == .string) gpu_warm.parseRoute(v.string) else .invalid;
+            if (route == .invalid) c.malformed.gpu_keep_warm = true else c.gpu_keep_warm = route;
+            c.gpu_keep_warm_requested = true;
+        }
         if (raw.object.get("logits_dump_dir")) |v| {
             const ok = v == .string and v.string.len > 1 and v.string.len <= max_dump_dir and v.string[0] == '/' and std.mem.indexOfScalar(u8, v.string, 0) == null;
             if (ok) {
@@ -142,6 +157,14 @@ pub const Config = struct {
                 c.dump_dir_len = @intCast(v.string.len);
             } else c.malformed.dump_dir = true;
         }
+    }
+
+    /// The keep-warm route the construction installs on a stream (`gpu`: the stream runs on the GPU): the setting's,
+    /// except that the DEFAULT on a CPU stream resolves to `off` (its waits are host waits; MiMo's rule); a named `waits`
+    /// stays and refuses by name at the install.
+    pub fn warmRoute(c: *const Config, gpu: bool) gpu_warm.Route {
+        if (c.gpu_keep_warm != .off and !c.gpu_keep_warm_requested and !gpu) return .off;
+        return c.gpu_keep_warm;
     }
 
     /// The logits dump route's directory (`logits_dump_dir`), null when the setting is absent.
@@ -185,6 +208,7 @@ pub const Config = struct {
         if (c.malformed.decode_dsa) return error.Glm5NextDecodeDsaSetting;
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
+        if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
         if (c.kv_quant_bits) |b| if (b != 0 and b != 16) return error.Glm5NextKvQuantUnsupported;
         if (c.expert_rows) |d| if (d > c.model.n_routed_experts) return error.Glm5NextExpertRows;
         if (c.expert_prefill_rows) |p| if (p > c.model.n_routed_experts) return error.Glm5NextExpertRows;
@@ -267,6 +291,20 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try (try parseSettings("{\"decode_glue\":\"fused\"}")).validate();
     try testing.expectError(error.Glm5NextDecodeGlueSetting, (try parseSettings("{\"decode_glue\":\"stock\"}")).validate());
     try testing.expectError(error.Glm5NextDecodeGlueSetting, (try parseSettings("{\"decode_glue\":true}")).validate());
+    // The keep-warm route: waits unless named; off (the control) by name; anything else refused by name. The default on a
+    // CPU stream resolves to off; a named waits stays (the install refuses it there by name).
+    try testing.expectEqual(gpu_warm.Route.waits, pinned.gpu_keep_warm);
+    try testing.expect(!pinned.gpu_keep_warm_requested);
+    try testing.expectEqual(gpu_warm.Route.waits, pinned.warmRoute(true));
+    try testing.expectEqual(gpu_warm.Route.off, pinned.warmRoute(false));
+    const warm_off = try parseSettings("{\"gpu_keep_warm\":\"off\"}");
+    try warm_off.validate();
+    try testing.expectEqual(gpu_warm.Route.off, warm_off.warmRoute(true));
+    const warm_named = try parseSettings("{\"gpu_keep_warm\":\"waits\"}");
+    try warm_named.validate();
+    try testing.expectEqual(gpu_warm.Route.waits, warm_named.warmRoute(false));
+    try testing.expectError(error.Glm5NextGpuKeepWarmSetting, (try parseSettings("{\"gpu_keep_warm\":\"all\"}")).validate());
+    try testing.expectError(error.Glm5NextGpuKeepWarmSetting, (try parseSettings("{\"gpu_keep_warm\":true}")).validate());
     // The host's facts: its rows win; its context is the reserve.
     const facts: sdk.LoadFacts = .{ .memory_baseline_bytes = 10, .expert_rows = 90, .effective_context = 32_768, .wired_margin_bytes = 2 << 30 };
     const built = pinned.withFacts(&facts);

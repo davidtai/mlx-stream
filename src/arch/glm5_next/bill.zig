@@ -22,6 +22,7 @@ const mimo_math = @import("../mimo_v2/math.zig");
 const mimo_stream = @import("../mimo_v2/stream.zig");
 const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
 const dsv_bill = @import("../deepseek_v41/bill.zig");
+const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const io_util = sdk.io_util;
 
 const Term = sdk.MemoryBill.Term;
@@ -162,6 +163,9 @@ pub const Inputs = struct {
     decode_swiglu: settings.DecodeSwiglu = .ops,
     /// The MTP lane's construction facts (`mtp_lane` on; null: the serial control, none of the lane's terms).
     mtp: ?mtp.Facts = null,
+    /// MiMo's X12 keep-warm route (`settings.Config.gpu_keep_warm`; `.off` the control). The setting's route, not the
+    /// stream's resolution: a default `waits` on a CPU stream keeps its 1 MiB term (an over-bill there only, MiMo's rule).
+    gpu_keep_warm: gpu_warm.Route = .off,
     page: u64 = 16_384,
 };
 
@@ -380,6 +384,9 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         // The plugin's sampler on a row it hands the host (`sdk_ext.sampler.chosen`: the tempered row, its sort, keep
         // mask, softmax, cumulative sum, draw and one-hot): eight f32 vocab rows at most, the prompt's last row or a step's.
         .{ .name = "sampler", .bytes = @splat(8 * @as(u64, c.vocab_size) * f32b), .at_construction = false },
+        // `gpu_keep_warm: waits`: MiMo's warm engine (its 32 KiB buffer, library, pipeline, queue, chunks in flight and parked
+        // thread: `gpu_warm.bill_bytes`, declared), from construction; 0 on the control.
+        .{ .name = "gpu_warm", .bytes = @splat(if (in.gpu_keep_warm == .waits) gpu_warm.bill_bytes else 0), .at_construction = in.gpu_keep_warm == .waits },
     };
     const lt = lane orelse return a.dupe(Term, &terms);
     const la = lane_arch.?;
@@ -531,6 +538,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .decode_dsa = cfg.decode_dsa,
         .decode_swiglu = cfg.decode_swiglu,
         .mtp = lane,
+        .gpu_keep_warm = cfg.gpu_keep_warm,
         .page = page,
     };
 }
@@ -683,6 +691,23 @@ test "glm5_next bill: the terms sum to the bill, the slot wiring is the one row 
     if (rows.decode < 288) try testing.expect(b.total(.decode, 12_600_000_000, rows.decode + 1) > target);
     // The slot wiring follows the transient and the rows, MiMo's rule (the harness refills with it).
     try testing.expectEqual(wireTables(termOf(b, "slot_transient")[0] + rows.prompt * b.per_row), b.row_terms.?.at(&b.row_terms.?.data, .prompt, rows.prompt, rows.prompt * b.per_row));
+}
+
+test "glm5_next bill: the keep-warm route bills MiMo's declared engine in both phases from construction; the control, none" {
+    const a = testing.allocator;
+    var in = try fixtureInputs(32_768);
+    const off = try billOf(a, &in);
+    defer off.free(a);
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(off, "gpu_warm"));
+    in.gpu_keep_warm = .waits;
+    const on = try billOf(a, &in);
+    defer on.free(a);
+    try testing.expectEqual([2]u64{ gpu_warm.bill_bytes, gpu_warm.bill_bytes }, termOf(on, "gpu_warm"));
+    for (on.terms) |t| if (std.mem.eql(u8, t.name, "gpu_warm")) try testing.expect(t.at_construction);
+    try testing.expectEqual(off.fixed(.prompt) + gpu_warm.bill_bytes, on.fixed(.prompt));
+    try testing.expectEqual(off.fixed(.decode) + gpu_warm.bill_bytes, on.fixed(.decode));
+    // The settings' default is the route (inputsOf reads `cfg.gpu_keep_warm`): waits unless named off.
+    try testing.expectEqual(gpu_warm.Route.waits, (settings.Config{}).gpu_keep_warm);
 }
 
 test "glm5_next bill: the MTP lane adds its terms, the verify's rows on the decode wave and its KDA captures; off, none" {
