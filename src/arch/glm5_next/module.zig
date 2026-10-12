@@ -22,6 +22,8 @@ const dump = @import("dump.zig");
 const mtp = @import("mtp.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const acc = @import("../../sdk_ext.zig").acceptance;
+/// The plugin's draw for every row handed to the host (`sdk_ext.sampler`): bound per request by `draft_lane.arm`.
+pub const Sampler = @import("../../sdk_ext.zig").sampler.SamplerOf(graph.G);
 const pagecache = @import("../mimo_v2/pagecache.zig");
 /// Profile builds only (glm5_next/profile.zig): the route trace, the prompt timeline, the phase lines, the decode
 /// timers and the serial forwards' GPU timeline; every call compiles to nothing in a served build.
@@ -54,6 +56,8 @@ pub const Module = struct {
     mtp: ?*mtp.Lane = null,
     /// With the lane: the request's token ids by position (a pair's next token), allocated at the billed positions.
     history: []u32 = &.{},
+    /// The request's sampler (mlx-stream's one stream): the first token and every serial step's, a clean request's.
+    sampler: Sampler,
     /// The serial step the construction installed (`stepRoute`): the served one, or the lane's (each step's hidden
     /// pended while the lane follows the request).
     step_pass: *const fn (*Module, []const u32) anyerror!T,
@@ -71,8 +75,10 @@ pub const Module = struct {
 
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .io = io, .g = try graph.G.init(gpa, s), .c = cfg.*, .w = undefined, .gates = &.{}, .src = undefined, .cache = undefined, .routes = routes, .reserve = plan.reserve, .rows = plan.rows, .prompt_pass = promptServed, .step_pass = stepServed };
+        self.* = .{ .gpa = gpa, .io = io, .g = try graph.G.init(gpa, s), .c = cfg.*, .w = undefined, .gates = &.{}, .src = undefined, .cache = undefined, .routes = routes, .reserve = plan.reserve, .rows = plan.rows, .prompt_pass = promptServed, .step_pass = stepServed, .sampler = undefined };
         errdefer self.g.deinit();
+        self.sampler = try Sampler.init(gpa, s);
+        errdefer self.sampler.deinit();
         var diag: sdk.Diag = .{};
         errdefer if (diag.len > 0) log.err("{s}\n", .{diag.message()});
         // The residents: every tensor the trunk does not read dropped unread (the vision tower, the MTP layer, the FP8 KV
@@ -172,6 +178,7 @@ pub const Module = struct {
         self.cache.deinit(&self.g);
         self.w.deinit(self.gpa);
         self.gpa.free(self.gates);
+        self.sampler.deinit();
         self.g.deinit();
         self.gpa.destroy(self);
     }

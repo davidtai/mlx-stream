@@ -135,10 +135,14 @@ pub fn deinit(m: *Module) void {
 }
 
 /// The prompt pass: from position 0, or after the positions `restorePrefix` kept (`req.prompt_tokens` counts them).
+/// The prompt pass: the request's sampler bound (`draft_lane.arm`), its last row the plugin's first token when bound.
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
     if (comptime !host_caps.glm) unreachable;
     return switch (m.*) {
-        inline else => |x| x.prefillAt(req.prompt_tokens - ids.len, ids),
+        inline else => |x| blk: {
+            x.sampler.begin();
+            break :blk x.sampler.chosen(try x.prefillAt(req.prompt_tokens - ids.len, ids), x.position());
+        },
     };
 }
 
@@ -149,10 +153,11 @@ pub fn restorePrefix(m: *Module, prefix: []const u32) u64 {
     };
 }
 
+/// A serial step: its row the plugin's token at the next position when the request is bound.
 pub fn step(m: *Module, ids: []const u32) !sdk.mlx.mlx_array {
     if (comptime !host_caps.glm) unreachable;
     return switch (m.*) {
-        inline else => |x| x.extend(ids),
+        inline else => |x| x.sampler.chosen(try x.extend(ids), x.position()),
     };
 }
 
@@ -182,21 +187,30 @@ pub fn requestEnd(m: *Module) void {
 /// requests: the argmax; sampled ones: the drafts accepted with the tempered, filtered target's probability) unless it
 /// names typical (with its delta). Logprobs, grammar and penalties consume logits the lane never shapes and stay serial.
 pub const draft_lane = struct {
+    /// The MTP lane's depth, or 1 without one: the host still arms every clean request, so the plugin binds its
+    /// sampler and draws every serial token.
     pub fn blockSize(m: *const Module) u32 {
         if (comptime !host_caps.glm) unreachable;
+        return @max(depth(m), 1);
+    }
+
+    fn depth(m: *const Module) u32 {
         return switch (m.*) {
             inline else => |x| x.mtpDepth(),
         };
     }
 
     pub fn laneName(m: *const Module) []const u8 {
-        return if (blockSize(m) > 0) "glm-mtp" else "serial";
+        return if (depth(m) > 0) "glm-mtp" else "serial";
     }
 
-    pub fn arm(m: *const Module, req: sdk.ArmRequest) sdk.DraftArm {
+    pub fn arm(m: *Module, req: sdk.ArmRequest) sdk.DraftArm {
         if (comptime !host_caps.glm) unreachable;
         const mode = switch (m.*) {
-            inline else => |x| (x.mtp orelse return .off).mode,
+            inline else => |x| blk: {
+                x.sampler.arm(req);
+                break :blk (x.mtp orelse return .off).mode;
+            },
         };
         if (!req.clean) return .off;
         return switch (mode) {

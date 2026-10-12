@@ -119,8 +119,10 @@ pub fn reservedTokens(_: sdk.RequestShape) u64 {
 }
 
 /// The prompt pass: from position 0, or after the positions `restorePrefix` kept (`req.prompt_tokens` counts them).
+/// The prompt pass: the request's sampler bound (`draft_lane.arm`), its last row the plugin's first token when bound.
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
-    return m.prefillAt(req.prompt_tokens - ids.len, ids, reservedTokens(req));
+    m.sampler.begin();
+    return m.sampler.chosen(try m.prefillAt(req.prompt_tokens - ids.len, ids, reservedTokens(req)), m.position());
 }
 
 /// Multi-turn over the host's prefix cache: the positions of the host's match the Module's kept boundary honours.
@@ -128,8 +130,9 @@ pub fn restorePrefix(m: *Module, prefix: []const u32) u64 {
     return m.restorePrefix(prefix);
 }
 
+/// A serial step: its row the plugin's token at the next position when the request is bound.
 pub fn step(m: *Module, ids: []const u32) !sdk.mlx.mlx_array {
-    return m.extend(ids);
+    return m.sampler.chosen(try m.extend(ids), m.position());
 }
 
 pub fn position(m: *const Module) u64 {
@@ -142,8 +145,10 @@ pub fn handover(m: *Module, h: sdk.DecodeHandover) !void {
 
 /// The DSpark draft head's lane: typical acceptance at the tier's delta, inside the module.
 pub const draft_lane = struct {
+    /// The DSpark lane's block, or 1 without one: the host still arms every clean request, so the plugin binds its
+    /// sampler and draws every serial token.
     pub fn blockSize(m: *const Module) u32 {
-        return m.draftBlockSize();
+        return @max(m.draftBlockSize(), 1);
     }
 
     pub fn laneName(m: *const Module) []const u8 {
@@ -153,7 +158,9 @@ pub const draft_lane = struct {
     /// A clean request takes typical acceptance, greedy or sampled: the lane is the served decode rule (the tier's
     /// delta over the target's own distribution, argmax correction), so a sampled request's temperature / top_p do not
     /// shape it. Logprobs, grammar and penalties consume logits the lane never shapes and stay serial.
-    pub fn arm(_: *const Module, req: sdk.ArmRequest) sdk.DraftArm {
+    pub fn arm(m: *Module, req: sdk.ArmRequest) sdk.DraftArm {
+        m.sampler.arm(req);
+        if (m.draftBlockSize() == 0) return .off;
         return if (req.clean) .typical else .off;
     }
 
@@ -217,12 +224,19 @@ test "dsv41 plugin: the lane's sampling is the host's, field for field, and gree
     }
 }
 
-test "dsv41 plugin: the draft lane arms every clean request, greedy or sampled, and the served prompt reserves nothing" {
-    const m: *const Module = undefined;
-    try testing.expectEqual(sdk.DraftArm.typical, draft_lane.arm(m, .{ .greedy = true, .clean = true }));
-    try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(m, .{ .greedy = true, .clean = false }));
-    try testing.expectEqual(sdk.DraftArm.typical, draft_lane.arm(m, .{ .greedy = false, .clean = true }));
+test "dsv41 plugin: without a DSpark lane every request decodes serially (block 1, off) with the sampler bound for a clean sampled one; the served prompt reserves nothing" {
+    var mod: Module = undefined;
+    const m = &mod;
+    m.dspark_cfg = null;
+    m.sampler.pending = null;
+    m.sampler.active = null;
+    try testing.expectEqual(@as(u32, 1), draft_lane.blockSize(m));
+    try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(m, .{ .greedy = true, .clean = true }));
+    try testing.expect(m.sampler.pending == null);
+    try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(m, .{ .greedy = false, .clean = true, .sampling = .{ .temperature = 1.0, .top_p = 0.95, .seed = 1 } }));
+    try testing.expectEqual(@as(u64, 1), m.sampler.pending.?.seed);
     try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(m, .{ .greedy = false, .clean = false }));
+    try testing.expect(m.sampler.pending == null);
     for ([_]sdk.RequestShape{ .{ .prompt_tokens = 1, .max_tokens = 0, .host_context = 0 }, .{ .prompt_tokens = 16384, .max_tokens = 1024, .host_context = 1 << 20 } }) |req|
         try testing.expectEqual(@as(u64, 0), reservedTokens(req));
 }

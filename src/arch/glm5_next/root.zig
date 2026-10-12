@@ -147,14 +147,17 @@ pub fn deinit(m: *Module) void {
     m.deinit();
 }
 
+/// The prompt pass: the request's sampler bound (`draft_lane.arm`), its last row the plugin's first token when bound.
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
     if (comptime !host_caps.dsa_nax) unreachable;
-    return m.prefill(ids, req);
+    m.sampler.begin();
+    return m.sampler.chosen(try m.prefill(ids, req), m.position());
 }
 
+/// A serial step: its row the plugin's token at the next position when the request is bound.
 pub fn step(m: *Module, ids: []const u32) !sdk.mlx.mlx_array {
     if (comptime !host_caps.dsa_nax) unreachable;
-    return m.step(ids);
+    return m.sampler.chosen(try m.step(ids), m.position());
 }
 
 pub fn position(m: *const Module) u64 {
@@ -168,11 +171,12 @@ pub fn requestEnd(m: *Module) void {
 }
 
 /// The draft lane: the MTP lane (`mtp_lane`, mtp.zig, MiMo's draft-lane seam) when the construction installed it,
-/// else serial (blockSize 0: the host arms nothing and every request stays serial).
+/// else serial. Either way the host arms every clean request (blockSize 1 without a lane: the sampler's serial steps),
+/// so the plugin binds its sampler and draws every token (`sdk_ext.sampler`).
 pub const draft_lane = struct {
     pub fn blockSize(m: *const Module) u32 {
         if (comptime !host_caps.dsa_nax) unreachable;
-        return if (m.mtp != null) mtp.verify_rows else 0;
+        return if (m.mtp != null) mtp.verify_rows else 1;
     }
 
     pub fn laneName(m: *const Module) []const u8 {
@@ -182,8 +186,10 @@ pub const draft_lane = struct {
 
     /// The exact rule's arms (MiMo's): a clean greedy request `.greedy`, a clean sampled one `.stochastic`; logprobs,
     /// grammar and penalties stay serial.
-    pub fn arm(m: *const Module, req: sdk.ArmRequest) sdk.DraftArm {
+    /// Binds the request's sampler; without a lane the request decodes in serial steps (.off), the plugin's tokens.
+    pub fn arm(m: *Module, req: sdk.ArmRequest) sdk.DraftArm {
         if (comptime !host_caps.dsa_nax) unreachable;
+        m.sampler.arm(req);
         if (m.mtp == null) return .off;
         return mtp.armOf(req);
     }
@@ -270,8 +276,14 @@ test "glm5_next arch table: the registry builds it (the draft lane surface, no p
     if (comptime !host_caps.dsa_nax) return error.SkipZigTest;
     var m: Module = undefined;
     m.mtp = null;
-    try testing.expectEqual(@as(u32, 0), draft_lane.blockSize(&m));
+    m.sampler.pending = null;
+    m.sampler.active = null;
+    // No lane: blockSize 1 (the host arms every clean request), arm binds the sampler and answers serial.
+    try testing.expectEqual(@as(u32, 1), draft_lane.blockSize(&m));
+    try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(&m, .{ .greedy = false, .clean = true, .sampling = .{ .temperature = 1.0, .top_p = 0.95, .seed = 1 } }));
+    try testing.expectEqual(@as(u64, 1), m.sampler.pending.?.seed);
     try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(&m, .{ .greedy = true, .clean = true }));
+    try testing.expect(m.sampler.pending == null);
     try testing.expectEqualStrings("serial", draft_lane.laneName(&m));
     try testing.expectEqual(@as(u64, 0), draft_lane.stats(&m).rounds);
     var rbuf: [8]u8 = undefined;

@@ -20,8 +20,9 @@
 //! rows then leave the lanes (`draft`): the trunk's verified rows come back as pending pairs with the trunk's own hidden.
 //!
 //! Acceptance is exact (`rule`): a greedy request's emitted tokens are the verify rows' argmax (the target's greedy
-//! tokens bit for bit, whatever was drafted), a sampled request's are exact speculative sampling with point-mass drafts
-//! (distributed as its tempered, filtered target), MiMo's `decisionGraph` with `.exact`.
+//! tokens bit for bit, whatever was drafted), a sampled request's are its target's position-keyed draws, a draft kept
+//! when it is the draw (sample-then-verify: the serial step's tokens, distributed as its tempered, filtered target),
+//! MiMo's `decisionGraph` with `.exact`.
 //!
 //! The draft bank: `mtp-experts-nvfp4.bin` beside `mtp-expert-manifest-nvfp4.json`, the routed bank's `nvfp4-gud-9part`
 //! records read by the routed bank's code (`bank.Bank.openOf(.., bank.mtp_files)`, the SDK expert reader's

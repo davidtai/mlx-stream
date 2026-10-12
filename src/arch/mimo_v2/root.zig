@@ -123,23 +123,26 @@ pub fn deinit(m: *Module) void {
     m.deinit();
 }
 
+/// The prompt pass: the request's sampler bound (`draft_lane.arm`), its last row the plugin's first token when bound.
 pub fn prefill(m: *Module, ids: []const u32, req: sdk.RequestShape) !sdk.mlx.mlx_array {
-    return m.prefill(ids, m.c.reserveTokens(req.prompt_tokens, req.max_tokens, req.host_context));
+    m.sampler.begin();
+    return m.sampler.chosen(try m.prefill(ids, m.c.reserveTokens(req.prompt_tokens, req.max_tokens, req.host_context)), m.position());
 }
 
+/// A serial step: its row the plugin's token at the next position when the request is bound.
 pub fn step(m: *Module, ids: []const u32) !sdk.mlx.mlx_array {
-    return m.extend(ids);
+    return m.sampler.chosen(try m.extend(ids), m.position());
 }
 
 pub fn position(m: *const Module) u64 {
     return m.position();
 }
 
-/// The MTP draft lane (`draft.zig`), installed at construction when the setting `mtp_lane` sets `mtp_heads` (blockSize 0 otherwise: the host
-/// arms nothing and every request stays serial).
+/// The MTP draft lane (`draft.zig`), installed at construction when the setting `mtp_lane` sets `mtp_heads`; without it
+/// blockSize 1: the host still arms every clean request, so the plugin binds its sampler and draws every serial token.
 pub const draft_lane = struct {
     pub fn blockSize(m: *const Module) u32 {
-        return if (m.lane != null) draft.verify_rows else 0;
+        return if (m.lane != null) draft.verify_rows else 1;
     }
 
     pub fn laneName(m: *const Module) []const u8 {
@@ -149,7 +152,8 @@ pub const draft_lane = struct {
     /// A clean request drafts under the construction tier, greedy or sampled: `typical` labels every request `typical`;
     /// `exact` is argmax equality on a greedy request (`greedy`) and exact speculative sampling on a sampled one
     /// (`stochastic`). Logprobs, grammar and penalties consume logits the lane never shapes and stay serial.
-    pub fn arm(m: *const Module, req: sdk.ArmRequest) sdk.DraftArm {
+    pub fn arm(m: *Module, req: sdk.ArmRequest) sdk.DraftArm {
+        m.sampler.arm(req);
         const lane = m.lane orelse return .off;
         if (!req.clean) return .off;
         return switch (lane.rule) {
@@ -406,12 +410,14 @@ fn writeBillFixture(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
     try dir.writeFile(io, .{ .sub_path = "resident.safetensors", .data = &shard });
 }
 
-test "mimo draft lane: the table the registry builds; no lane = serial (block 0, off); a lane arms clean requests by tier" {
+test "mimo draft lane: the table the registry builds; no lane = serial (block 1, off, the sampler bound); a lane arms clean requests by tier" {
     const vt = comptime sdk.Arch.of(@This());
     try std.testing.expect(vt.spec == .draft_lane);
     var m: Module = undefined;
     m.lane = null;
-    try std.testing.expectEqual(@as(u32, 0), draft_lane.blockSize(&m));
+    m.sampler.pending = null;
+    m.sampler.active = null;
+    try std.testing.expectEqual(@as(u32, 1), draft_lane.blockSize(&m));
     try std.testing.expectEqualStrings("serial", draft_lane.laneName(&m));
     try std.testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(&m, .{ .greedy = true, .clean = true }));
     try std.testing.expectEqual(sdk.DraftStats{}, draft_lane.stats(&m));
