@@ -51,8 +51,9 @@ CELLS_16K = (
     ("greedy", "136-token answer", "134/152", 1003.0, 23.0),
 )
 
-# HumanEval on 746e7da9 (plugin 8e7d186; the binary of record 4b018c54 reproduces its 16K cell token for token): 164 problems, one sample each, pass@1, cap 16,384 tokens, thinking on,
-# rows 127/145. arm: (passed, wrong answer, truncated, loop, no code, server error, decode tok/s median).
+# HumanEval on 746e7da9 (plugin 8e7d186; the binary of record 4b018c54 reproduces its 16K cell token for token): 164 problems, one sample each, pass@1,
+# greedy: temperature 0, seed 0, thinking off, 8,192 cap; card: temperature 1.0, top_p 0.95, seed 1, thinking on, 16,384 cap; rows 127/145.
+# arm: (passed, wrong answer, truncated, loop, no code, server error, decode tok/s median).
 # Source: cells/humaneval3-20261011 (REPORT.md).
 HUMANEVAL = {"greedy": (155, 9, 0, 0, 0, 0, 31.2), "card": (157, 7, 0, 0, 0, 0, 30.1)}
 FAILURE_CLASSES = ("wrong answer", "truncated", "loop", "no code", "server error")
@@ -174,8 +175,8 @@ def cells_16k():
 
 def humaneval():
     fig = figure("Every failure is a wrong answer, none a truncation or loop",
-                 "HumanEval pass@1, 164 problems, one sample each, 16,384-token cap, thinking on, rows 127/145, "
-                 "MiMo-V2.6-Flash.")
+                 "HumanEval pass@1, 164 problems, one sample each, rows 127/145, MiMo-V2.6-Flash.")
+    fig.text(0.09, 0.815, "greedy: thinking off, 8,192 cap; card: thinking on, 16,384 cap.", fontsize=19, color=INK2)
     arms = (("greedy", ORANGE), ("card", BLUE))
     left = axes(fig, [0.09, 0.22, 0.36, 0.54], 1.15, [0, 0.5, 1.0], "pass@1", fmt=lambda v: f"{v:.1f}" if v else "0")
     for i, (arm, color) in enumerate(arms):
