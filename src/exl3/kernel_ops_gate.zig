@@ -13,6 +13,7 @@ const sdk_ext = @import("../sdk_ext.zig");
 const kr = sdk_ext.kernels.Routes(xk);
 const tr = @import("../arch/deepseek_v41/kernel_routes.zig");
 const xq = @import("quant.zig");
+const KernelSet = sdk_ext.kernels.KernelSet(xk);
 
 const Allocator = std.mem.Allocator;
 const Dtype = mlx.mlx_dtype;
@@ -494,7 +495,8 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         var r = try xq.Gemv(MlxG).initRates(g.a, g, reg, .{}, @as(u3, 1) << @intCast(layout.k - 2));
         defer r.deinit(g);
         const proj: xq.Proj = if (eq(u8, c.proj.?, "down")) .down else .gate;
-        outs[0] = try r.project(g, proj, in(ins, "xh"), in(ins, "ids"), in(ins, "code"), .{ .fixed = layout });
+        const binding = r.bindStorage(@splat(.{ .fixed = layout }));
+        outs[0] = try r.project(&binding, g, proj, in(ins, "xh"), in(ins, "ids"), in(ins, "code"), .{ .fixed = layout });
         return 1;
     }
     if (eq(u8, f, "prep")) {
@@ -517,7 +519,14 @@ fn runFamily(g: *MlxG, reg: *const xk.Registry, c: *const JCase, ins: *std.Strin
         return 3;
     }
     if (eq(u8, f, "digx")) {
-        const r = xq.DigX(MlxG).init(reg);
+        var r = xq.DigX(MlxG).init(reg);
+        const rates = [3]u32{ layouts.gate.k, layouts.up.k, layouts.down.k };
+        const unit = xq.tightLayout(2).code_row_words / 2;
+        r.bindStorage(.{ .fixed = rates }, .{
+            @intCast(layouts.gate.code_row_words / unit),
+            @intCast(layouts.up.code_row_words / unit),
+            @intCast(layouts.down.code_row_words / unit),
+        });
         const rhs = in(ins, "rhs");
         const tbl_gu = in(ins, "tbl_gu");
         const tbl_dn = in(ins, "tbl_dn");
@@ -931,6 +940,7 @@ fn publicProjection(g: *MlxG, block: *const PublicBlock, down: bool, bank: usize
         .rin = try g.hostArray(std.mem.sliceAsBytes(rin), &.{ @intCast(cap), @intCast(ni * 16) }, .float16),
         .rout = try g.hostArray(std.mem.sliceAsBytes(rout), &.{ @intCast(cap), @intCast(nj * 16) }, .float16),
         .layout = .{ .fixed = .{ .k = block.k, .code_row_words = row_words } },
+        .route_index = @intCast(width / 16 - 2),
     };
 }
 
@@ -1104,6 +1114,9 @@ test "dsv41 kernels ops gpu: independent public H128 blocks cover full rate proj
             .up = try publicProjection(&g, blocks[1], false, b, false),
             .down = try publicProjection(&g, blocks[2], true, b, false),
         };
+        const binding = gemv.bindStorage(.{ banks[2].gate.layout, banks[2].up.layout, banks[2].down.layout });
+        const triple = [3]u32{ blocks[0].k, blocks[1].k, blocks[2].k };
+        const banked_binding = banked.bindStorage(.{ .fixed = triple }, @splat(4));
         for (1..49) |rows| {
             const batch = g.mark();
             defer g.resetTo(batch);
@@ -1121,20 +1134,21 @@ test "dsv41 kernels ops gpu: independent public H128 blocks cover full rate proj
             const bank_ids = try g.hostArray(std.mem.sliceAsBytes(packed_ids[0..rows]), &.{@intCast(rows)}, .uint32);
             const bank = banks[2];
             const xs = try prep.inRin(&g, act, tok, bank.gate.rin, bank.up.rin, ids);
-            const zs = try gemv.projectGu(&g, xs[0], xs[1], ids, bank.gate.code, bank.up.code, bank.gate.layout, bank.up.layout);
+            const zs = try gemv.projectGu(&binding, &g, xs[0], xs[1], ids, bank.gate.code, bank.up.code, bank.gate.layout, bank.up.layout);
             const hidden = try prep.guEpi(&g, zs[0], zs[1], bank.gate.rout, bank.up.rout, ids);
             try expectPublicRows(&g, hidden, blocks, rows, false, 2, true, null);
             const hd = try prep.dinRin(&g, hidden, bank.down.rin, ids);
-            const zd = try gemv.project(&g, .down, hd, ids, bank.down.code, bank.down.layout);
+            const zd = try gemv.project(&binding, &g, .down, hd, ids, bank.down.code, bank.down.layout);
             const out = try prep.dpost(&g, zd, bank.down.rout, ids);
             try expectPublicRows(&g, out, blocks, rows, false, 2, false, null);
-            const bh = try banked.gateUp(&g, act, tok, bank_ids, &banks);
+            const bh = try banked.gateUpBound(&banked_binding, &g, act, tok, bank_ids, &banks);
             try expectPublicRows(&g, bh, blocks, rows, true, 0, true, null);
-            const bo = try banked.down(&g, bh, bank_ids, &banks);
+            const bo = try banked.downBound(&banked_binding, &g, bh, bank_ids, &banks);
             try expectPublicRows(&g, bo, blocks, rows, true, 0, false, null);
         }
         var prefill = try xq.DigXPrefill(MlxG).init(a, &reg, .{ .wave = 1, .inflight = 2, .row_budget = 128, .carry_rows = 128 }, &diag);
         defer prefill.deinit(&g);
+        prefill.dig.bindStorage(.{ .fixed = triple }, @splat(4));
         for ([_]usize{ 1, 127, 128, 129 }) |rows| {
             const batch = g.mark();
             defer g.resetTo(batch);
@@ -1303,6 +1317,7 @@ test "dsv41 kernels ops gpu: captured Pollard K4 down full H128 scaled projectio
         .rin = try g.hostArray(bank_rin, &.{ 3, 2304 }, .float16),
         .rout = try g.hostArray(bank_rout, &.{ 3, 5120 }, .float16),
         .layout = .{ .fixed = .{ .k = 4, .code_row_words = code.len } },
+        .route_index = 2,
     };
     const input = try g.hostArray(std.mem.sliceAsBytes(&x), &.{ 3, 2304 }, .float32);
     const ids = try g.hostArray(std.mem.sliceAsBytes(&[_]u32{ 2, 2, 2 }), &.{3}, .uint32);
@@ -1311,7 +1326,8 @@ test "dsv41 kernels ops gpu: captured Pollard K4 down full H128 scaled projectio
     var prep = try xq.RinPrep(MlxG).init(&g, &reg);
     defer prep.deinit(&g);
     const transformed = try prep.dinRin(&g, input, projection.rin, ids);
-    const inner = try gemv.project(&g, .down, transformed, ids, projection.code, projection.layout);
+    const binding = gemv.bindStorage(@splat(projection.layout));
+    const inner = try gemv.project(&binding, &g, .down, transformed, ids, projection.code, projection.layout);
     const output = try prep.dpost(&g, inner, projection.rout, ids);
     const got = try g.hostBytes(output);
     defer a.free(got);
@@ -1330,7 +1346,8 @@ test "dsv41 kernels ops gpu: captured Pollard K4 down full H128 scaled projectio
     }
 }
 
-fn publicAccepted(g: *MlxG, reg: *const xk.Registry, rates: [3]u32, diag: *xk.Diag) !*xq.Accepted(MlxG) {
+fn publicAccepted(g: *MlxG, set: *const KernelSet.Set, rates: [3]u32, physical_max: [3]u32, diag: *xk.Diag) !*xq.Accepted(MlxG) {
+    const reg = &set.reg;
     const a = g.a;
     var gemv = try xq.Gemv(MlxG).initRates(a, g, reg, .{}, 7);
     errdefer gemv.deinit(g);
@@ -1353,7 +1370,9 @@ fn publicAccepted(g: *MlxG, reg: *const xk.Registry, rates: [3]u32, diag: *xk.Di
     errdefer a.free(layer_rates);
     layer_rates[0] = .{ .fixed = rates };
     const acc = try a.create(xq.Accepted(MlxG));
-    acc.* = .{ .a = a, .reg = reg, .layer_rates = layer_rates, .gemv = gemv, .prep = prep, .tok = tok, .n_tok = n_tok, .waves = waves };
+    errdefer a.destroy(acc);
+    acc.* = .{ .a = a, .reg = reg, .set = set, .layer_rates = layer_rates, .physical_max = physical_max, .gemv = gemv, .prep = prep, .tok = tok, .n_tok = n_tok, .waves = waves };
+    try acc.bindRoutes();
     return acc;
 }
 
@@ -1367,13 +1386,11 @@ test "dsv41 kernels ops gpu: accepted routed forms and carried BF16 mixed expert
     const fixtures = [_]PublicBlock{ try loadPublicBlock(fa, 2), try loadPublicBlock(fa, 3), try loadPublicBlock(fa, 4) };
     mlx.installErrorHandler();
     var diag: xk.Diag = .{};
-    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
-    defer reg.deinit();
     const stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
-    var bound = try reg.bind(stream, &diag);
-    defer bound.deinit();
-    var g: MlxG = .{ .a = a, .s = stream, .bound = &bound };
+    const set = try KernelSet.Set.init(a, .{ .device = .{ .stream = stream } }, &diag);
+    defer set.deinit();
+    var g: MlxG = .{ .a = a, .s = stream, .bound = &set.bound };
     defer g.deinit();
     const forms_cases = [_]xq.Forms{
         .{ .gu_one = true },
@@ -1393,11 +1410,21 @@ test "dsv41 kernels ops gpu: accepted routed forms and carried BF16 mixed expert
         for (forms_cases) |forms| {
             const route_mark = g.mark();
             defer g.resetTo(route_mark);
-            const acc = try publicAccepted(&g, &reg, rates, &diag);
+            const acc = try publicAccepted(&g, set, rates, @splat(4), &diag);
             defer acc.deinit(&g);
             try acc.routeForms(&g, forms);
             try acc.routeBanked(&g);
             for (banks) |bank| try acc.checkLayerBank(&g, 0, bank, &diag);
+            const tight_acc = if (std.mem.eql(u32, &rates, &.{ 3, 3, 3 }))
+                try publicAccepted(&g, set, rates, @splat(3), &diag)
+            else
+                null;
+            defer if (tight_acc) |tight| tight.deinit(&g);
+            if (tight_acc) |tight| {
+                try tight.routeForms(&g, forms);
+                try tight.routeBanked(&g);
+                try tight.checkLayerBank(&g, 0, banks[0], &diag);
+            }
             for ([_]usize{ 1, 3, 7, 48 }) |rows| {
                 const batch = g.mark();
                 defer g.resetTo(batch);
@@ -1417,14 +1444,14 @@ test "dsv41 kernels ops gpu: accepted routed forms and carried BF16 mixed expert
                 try expectPublicRows(&g, hidden, blocks, rows, true, 0, true, null);
                 const out = try acc.downBanked(&g, hidden, ids, &banks);
                 try expectPublicRows(&g, out, blocks, rows, true, 0, false, null);
-                if (std.mem.eql(u32, &rates, &.{ 3, 3, 3 })) {
+                if (tight_acc) |tight| {
                     // All-tight aliases engage the banked form texts, not the stride-aware fallback.
                     const tight_banks = [_]xq.BankArrays(mlx.mlx_array){ banks[0], banks[0], banks[0] };
                     for (0..rows) |r| ids_host[r] = @intCast(((r % 3) << 24) | 1);
                     const tight_ids = try g.hostArray(std.mem.sliceAsBytes(ids_host[0..rows]), &.{@intCast(rows)}, .uint32);
-                    const th = try acc.gateUpBanked(&g, act, tight_ids, &tight_banks);
+                    const th = try tight.gateUpBanked(&g, act, tight_ids, &tight_banks);
                     try expectPublicRows(&g, th, blocks, rows, false, 0, true, null);
-                    const to = try acc.downBanked(&g, th, tight_ids, &tight_banks);
+                    const to = try tight.downBanked(&g, th, tight_ids, &tight_banks);
                     try expectPublicRows(&g, to, blocks, rows, false, 0, false, null);
                 }
             }
@@ -1499,6 +1526,7 @@ fn compactPublicProjection(g: *MlxG, fixtures: *const [4]PublicBlock, bank: usiz
         .rin = try g.hostArray(std.mem.sliceAsBytes(rin), &.{ 2, @intCast(ni * 16) }, .float16),
         .rout = try g.hostArray(std.mem.sliceAsBytes(rout), &.{ 2, @intCast(nj * 16) }, .float16),
         .layout = .{ .compact = try g.hostArray(std.mem.sliceAsBytes(&descriptors), &.{ 2, 2 }, .uint64) },
+        .route_index = 0,
     };
 }
 
@@ -1561,9 +1589,10 @@ fn expectMixedRows(g: *MlxG, value: mlx.mlx_array, fixtures: *const [4]PublicBlo
     }
 }
 
-fn compactAccepted(g: *MlxG, reg: *const xk.Registry, diag: *xk.Diag) !*xq.Accepted(MlxG) {
+fn compactAccepted(g: *MlxG, set: *const KernelSet.Set, diag: *xk.Diag) !*xq.Accepted(MlxG) {
+    const reg = &set.reg;
     // Numerical construction is deliberately separate from the public rate-admission gate.
-    const acc = try publicAccepted(g, reg, .{ 3, 3, 3 }, diag);
+    const acc = try publicAccepted(g, set, .{ 3, 3, 3 }, @splat(3), diag);
     errdefer acc.deinit(g);
     var gemv = try xq.Gemv(MlxG).initStorage(g.a, g, reg, .{}, 0, true);
     errdefer gemv.deinit(g);
@@ -1574,6 +1603,8 @@ fn compactAccepted(g: *MlxG, reg: *const xk.Registry, diag: *xk.Diag) !*xq.Accep
     acc.gemv = gemv;
     acc.compact = true;
     acc.layer_rates[0] = .{ .compact = classes };
+    acc.physical_max = .{ 5, 5, 4 };
+    try acc.bindRoutes();
     return acc;
 }
 
@@ -1586,13 +1617,11 @@ test "exl3 mixed gpu: heterogeneous descriptor triples decode verify and carried
     const fixtures = [4]PublicBlock{ try loadPublicBlock(arena.allocator(), 2), try loadPublicBlock(arena.allocator(), 3), try loadPublicBlock(arena.allocator(), 5), try loadPublicBlock(arena.allocator(), 4) };
     mlx.installErrorHandler();
     var diag: xk.Diag = .{};
-    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
-    defer reg.deinit();
     const stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
-    var bound = try reg.bind(stream, &diag);
-    defer bound.deinit();
-    var g: MlxG = .{ .a = a, .s = stream, .bound = &bound };
+    const set = try KernelSet.Set.init(a, .{ .device = .{ .stream = stream } }, &diag);
+    defer set.deinit();
+    var g: MlxG = .{ .a = a, .s = stream, .bound = &set.bound };
     defer g.deinit();
     var banks: [3]xq.BankArrays(mlx.mlx_array) = undefined;
     for (&banks, 0..) |*bank, b| bank.* = .{
@@ -1600,7 +1629,7 @@ test "exl3 mixed gpu: heterogeneous descriptor triples decode verify and carried
         .up = try compactPublicProjection(&g, &fixtures, b, 1),
         .down = try compactPublicProjection(&g, &fixtures, b, 2),
     };
-    const acc = try compactAccepted(&g, &reg, &diag);
+    const acc = try compactAccepted(&g, set, &diag);
     defer acc.deinit(&g);
     try acc.routeForms(&g, .{ .gu_one = true, .down_pair = true });
     try acc.routeBanked(&g);
@@ -1786,6 +1815,7 @@ fn sparkBankProjection(g: *MlxG, projection: SparkProjection, offset: u64) !xq.P
         .rin = try g.hostArray(projection.rin, &.{ 1, @intCast(projection.input) }, .float16),
         .rout = try g.hostArray(projection.rout, &.{ 1, @intCast(projection.output) }, .float16),
         .layout = .{ .compact = try g.hostArray(std.mem.sliceAsBytes(&descriptor), &.{ 1, 2 }, .uint64) },
+        .route_index = 0,
     };
 }
 
@@ -2119,7 +2149,20 @@ fn expectPublishedSource(header: std.json.Value, data: []const u8, comptime ks: 
     try testing.expectEqualStrings(expected_sha256, &actual);
 }
 
-fn expectPublishedExpert(comptime ks: [3]u8, comptime expert_prefix: []const u8, comptime sample_sha256: []const u8, comptime source_sha256: ?[]const u8, comptime reference_env: [:0]const u8) !void {
+// Authenticate the actual external oracle weights, independent of JSON metadata,
+// safetensors ordering and padding: w1/w3/w2, each inner then public, at fixed F16 geometry.
+fn expectPublishedReference(header: std.json.Value, data: []const u8, comptime expert_prefix: []const u8, expected_sha256: []const u8) !void {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    inline for (.{ "w1", "w3", "w2" }, .{ 5120, 5120, 2304 }, .{ 2304, 2304, 5120 }) |name, input, output| {
+        const prefix = expert_prefix ++ name ++ ".";
+        hash.update(try publicTensor(header, data, prefix ++ "inner", "F16", &.{ input, output }));
+        hash.update(try publicTensor(header, data, prefix ++ "public", "F16", &.{ input, output }));
+    }
+    const actual = std.fmt.bytesToHex(hash.finalResult(), .lower);
+    try testing.expectEqualStrings(expected_sha256, &actual);
+}
+
+fn expectPublishedExpert(comptime ks: [3]u8, comptime expert_prefix: []const u8, comptime sample_sha256: []const u8, comptime source_sha256: []const u8, comptime reference_sha256: []const u8, comptime reference_env: [:0]const u8) !void {
     errdefer std.debug.print("Published expert failed: K={any} expert={s}\n", .{ ks, expert_prefix });
     const fixture = std.c.getenv(reference_env) orelse return error.ExpertReferenceRequired;
     const a = testing.allocator;
@@ -2137,7 +2180,8 @@ fn expectPublishedExpert(comptime ks: [3]u8, comptime expert_prefix: []const u8,
     try testing.expectEqualStrings(sample_sha256, metadata.object.get("sample_sha256").?.string);
     try testing.expectEqualStrings("bc48d02cb1c14939dc47b90f870dd689d63e3b1ab69a157e65538db68677a6c8", metadata.object.get("codebook_sha256").?.string);
     const data = bytes[8 + n ..];
-    if (source_sha256) |digest| try expectPublishedSource(parsed.value, data, ks, expert_prefix, digest);
+    try expectPublishedSource(parsed.value, data, ks, expert_prefix, source_sha256);
+    try expectPublishedReference(parsed.value, data, expert_prefix, reference_sha256);
     var oracle_arena = std.heap.ArenaAllocator.init(a);
     defer oracle_arena.deinit();
     const oa = oracle_arena.allocator();
@@ -2150,25 +2194,23 @@ fn expectPublishedExpert(comptime ks: [3]u8, comptime expert_prefix: []const u8,
     const prefill_expected = try sparkPrefillExpected(oa, &projections);
     mlx.installErrorHandler();
     var diag: xk.Diag = .{};
-    var reg = try xk.Registry.init(a, &xk.embedded, xk.manifest_sha256, &diag);
-    defer reg.deinit();
     const stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
-    var bound = try reg.bind(stream, &diag);
-    defer bound.deinit();
-    var g: MlxG = .{ .a = a, .s = stream, .bound = &bound };
+    const set = try KernelSet.Set.init(a, .{ .device = .{ .stream = stream } }, &diag);
+    defer set.deinit();
+    var g: MlxG = .{ .a = a, .s = stream, .bound = &set.bound };
     defer g.deinit();
     const bank: xq.BankArrays(mlx.mlx_array) = .{
         .gate = try sparkBankProjection(&g, projections[0], 256),
         .up = try sparkBankProjection(&g, projections[1], 512),
         .down = try sparkBankProjection(&g, projections[2], 768),
     };
-    const acc = try compactAccepted(&g, &reg, &diag);
+    const acc = try compactAccepted(&g, set, &diag);
     defer acc.deinit(&g);
     acc.layer_rates[0].compact[0] = .{ ks[0], ks[1], ks[2] };
     try acc.routeBanked(&g);
     try acc.checkLayerBank(&g, 0, bank, &diag);
-    const bf16_acc = try compactAccepted(&g, &reg, &diag);
+    const bf16_acc = try compactAccepted(&g, set, &diag);
     defer bf16_acc.deinit(&g);
     bf16_acc.layer_rates[0].compact[0] = .{ ks[0], ks[1], ks[2] };
     try bf16_acc.checkLayerBank(&g, 0, bank, &diag);
@@ -2232,9 +2274,9 @@ fn expectPublishedExpert(comptime ks: [3]u8, comptime expert_prefix: []const u8,
 test "exl3 mixed gpu: full nonrepeated Spark K2 K3 K5 oracles and arena offsets beyond 4 GiB" {
     const enabled = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
     if (std.mem.eql(u8, std.mem.span(enabled), "0")) return error.SkipZigTest;
-    try expectPublishedExpert(.{ 2, 2, 2 }, "layers.0.ffn.experts.0.", "108fe9acee54485f014d32fc770ae5673cb92582ed25d3a990d8bc29d30ea526", null, "DSV41_SPARK_K2_REFERENCE");
-    try expectPublishedExpert(.{ 3, 3, 3 }, "layers.10.ffn.experts.1.", "aba3c9f13766c9bf7bbae904cde140ae760a2f569943e03b7ecbc23bb6ab2438", null, "DSV41_SPARK_K3_REFERENCE");
-    try expectPublishedExpert(.{ 5, 5, 5 }, "layers.0.ffn.experts.2.", "d7db53973044421de435e62901243205ba0e1868fb0056bd5da19673db0af014", null, "DSV41_SPARK_K5_REFERENCE");
+    try expectPublishedExpert(.{ 2, 2, 2 }, "layers.0.ffn.experts.0.", "108fe9acee54485f014d32fc770ae5673cb92582ed25d3a990d8bc29d30ea526", "42eff77cff994174b943b8b2e0cd9a27df4e7501f44aaf5e04c19b0609478e78", "2e83b584cdef199cb4951aa58d9a62aaf655ab6dd7e4c1e9daba9e1d5700e796", "DSV41_SPARK_K2_REFERENCE");
+    try expectPublishedExpert(.{ 3, 3, 3 }, "layers.10.ffn.experts.1.", "aba3c9f13766c9bf7bbae904cde140ae760a2f569943e03b7ecbc23bb6ab2438", "0311ba9ae2727c1e4917aff54ed7839816b39bea9de14b2ac549289d75cb4a24", "a81c2487052220a91d50e6b4a1ce5619f2c2da3a9a010938a2ef67d983fd872b", "DSV41_SPARK_K3_REFERENCE");
+    try expectPublishedExpert(.{ 5, 5, 5 }, "layers.0.ffn.experts.2.", "d7db53973044421de435e62901243205ba0e1868fb0056bd5da19673db0af014", "208490a1ac233a39ff8b65c82563bfa6636601929fb40403e6842b6a34f9677f", "c83954a0894db25e687276a3e29cd72db27affb10887d6a405c51e1539e532da", "DSV41_SPARK_K5_REFERENCE");
 }
 
 test "exl3 mixed gpu: published Jayleaton mixed K4 K5 production projections" {
@@ -2242,6 +2284,6 @@ test "exl3 mixed gpu: published Jayleaton mixed K4 K5 production projections" {
     if (std.mem.eql(u8, std.mem.span(enabled), "0")) return error.SkipZigTest;
     if (std.c.getenv("DSV41_JAY_K4_REFERENCE") == null and std.c.getenv("DSV41_JAY_K5_REFERENCE") == null)
         return error.SkipZigTest;
-    try expectPublishedExpert(.{ 3, 3, 4 }, "layers.0.ffn.experts.14.", "765772addd9019c4f16aa149a94083ed10583dffaa908c776b27e6c68f24b5e8", "990c577799282720ac2b8518884141cdf0f5a652a5c7ddbd25e2e46d8f68fe3d", "DSV41_JAY_K4_REFERENCE");
-    try expectPublishedExpert(.{ 4, 4, 5 }, "layers.3.ffn.experts.340.", "9d5fa81241773306693a0bce67c0026b3fdd3ccb67993b633cb9dc30315587de", "c2fe1cc143e01c2115c29dbb6559ac3ae6527ff6499c46a7723f1935fc25ee66", "DSV41_JAY_K5_REFERENCE");
+    try expectPublishedExpert(.{ 3, 3, 4 }, "layers.0.ffn.experts.14.", "765772addd9019c4f16aa149a94083ed10583dffaa908c776b27e6c68f24b5e8", "990c577799282720ac2b8518884141cdf0f5a652a5c7ddbd25e2e46d8f68fe3d", "594df611038f81641e28f314f2793c053eee1366e4dc6038f542b4b65e00481f", "DSV41_JAY_K4_REFERENCE");
+    try expectPublishedExpert(.{ 4, 4, 5 }, "layers.3.ffn.experts.340.", "9d5fa81241773306693a0bce67c0026b3fdd3ccb67993b633cb9dc30315587de", "c2fe1cc143e01c2115c29dbb6559ac3ae6527ff6499c46a7723f1935fc25ee66", "82b61f2e86439f65972703a88b56360de60fc2b71f6e2aea85f692a8d75468fe", "DSV41_JAY_K5_REFERENCE");
 }

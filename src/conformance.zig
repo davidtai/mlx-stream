@@ -38,6 +38,16 @@ test "mlx-stream conformance: the arch and the kinds it binds decline what is no
     try sdk.testing.expectGroupClaims(quant.claims, &group_near_misses);
 }
 
+test "mlx-stream conformance: the EXL3 quant's identity and kernel manifest are pinned" {
+    const exl3 = @import("exl3/quant.zig");
+    const kernels = @import("exl3/kernels.zig");
+    const q = comptime sdk_ext.Quant.of(exl3);
+    try std.testing.expectEqualStrings("exl3-mul1-k3", q.name);
+    try std.testing.expectEqualStrings("0730e68a7495224cf89b233860e6bd1f22a20534ea3478a21a6f2131bcbb123a", exl3.kernel_pin.manifest_sha256);
+    try std.testing.expectEqualStrings(kernels.manifest_sha256, exl3.kernel_pin.manifest_sha256);
+    try std.testing.expectEqual(@as(usize, 133), kernels.n_kernels);
+}
+
 test "mlx-stream conformance: the EXL3 source's capabilities, and the arch claims the one reader for the process" {
     const k = comptime sdk_ext.ExpertSource.of(@import("exl3/source.zig"));
     try std.testing.expectEqualStrings("exl3-stream", k.name);

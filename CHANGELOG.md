@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- EXL3 mixed-bank review repairs: retain uniform-bank stream/policy behavior, allocate and bill mixed
+  ticket ranges at construction, and install per-layer kernel routes from accepted physical geometry.
+  Installed fused-down routes no longer fall back to chains. Compact phase billing uses the existing
+  SDK `row_terms`/owned `slot_table` contract without changing the shared memory-bill API.
+- Restore EXL3 route-launch and row-plan regressions, the `exl3-mul1-k3` identity, conformance manifest
+  pin, 133-kernel/18-header/17-predecessor inventory and original real-bank shard/offset assertions.
+  `mul1h_rate` is a hash-pinned addendum to the unchanged stock header; two unpublished predecessor
+  pins are removed. Public expert gates pin actual reference payloads; the compact PHASE0B gate skips
+  noncompact banks before device setup. Standalone tests default to ReleaseSafe and never use ReleaseFast.
+- Keep six prior compact microbenchmark wins as separate rebased revalidation inputs, not installed
+  engine wins: the repair baseline contains reverted texts; the previous combined served comparison
+  gained only 0.16% and was rejected.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the

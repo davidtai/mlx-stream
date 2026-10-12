@@ -311,14 +311,32 @@ test "dsv41 integer rates: mixed bill owns exact persistent transient and prefix
         var bd: expert_bank.Diag = .{};
         var bank = try expert_bank.Bank.open(a, io, tm.root, mixed.bank_geometry.?, &bd);
         defer bank.deinit();
-        const st = try @import("expert_stream.zig").Stream.init(testing.allocator, &bank, .{
+        const pool_opt: arm_mod.Options = .{
+            .model_dir = tm.root,
+            .baseline_bytes = null,
+            .slot_memory = .host,
+            .pool = .{ .tickets = 16 },
+        };
+        const sized = arm_mod.poolOptions(&bank, pool_opt);
+        const minimum = @import("../../expert/stream.zig").minimumTickets(&bank, .{ .rows = &.{n_experts} });
+        try testing.expectEqual(minimum, @as(u64, sized.tickets));
+        const geo = try @import("../../expert/stream.zig").StorageGeometry.initBank(&bank);
+        const io_pool = @import("../../sdk_ext.zig").expert.io;
+        const ticket_delta = io_pool.poolBytes(sized, std.heap.pageSize()) - io_pool.poolBytes(pool_opt.pool, std.heap.pageSize());
+        try testing.expectEqual(ticket_delta, arm_mod.poolGrowthBytes(&bank, pool_opt, &geo, pool_opt.pool.workers * pool_opt.pool.staging_bytes));
+        var large = pool_opt;
+        large.pool.tickets = sized.tickets + 17;
+        try testing.expectEqual(large.pool.tickets, arm_mod.poolOptions(&bank, large).tickets);
+        const stream_opt: @import("../../expert/stream.zig").Options = .{
             .rows = &.{ 16, 16, 16, 16, 16 },
             .transient_rows = @intCast(b.transient_rows),
             .wide_depth = @intCast(config.dsv41WideDepth()),
             .transient_release = module.transientRelease(mixed),
-            .pool = .{ .workers = 2, .staging_bytes = 16384 },
-        });
+            .pool = arm_mod.poolOptions(&bank, .{ .model_dir = tm.root, .baseline_bytes = null, .slot_memory = .host, .pool = .{ .workers = 2, .staging_bytes = 16384 } }),
+        };
+        const st = try @import("../../expert/stream.zig").Stream.init(testing.allocator, &bank, stream_opt);
         defer st.deinit();
+        try testing.expectEqual(@as(usize, stream_opt.pool.tickets), st.pool.log.len);
         var allocated: u64 = 0;
         for (st.layers) |*l| for (l.base.row_bytes) |bytes| {
             allocated += bytes * l.base.rows;
@@ -384,10 +402,18 @@ test "dsv41 memory mini: real compact bill producer owns its SDK table after nat
     defer retained_sdk.free(testing.allocator);
     try testing.expectEqual(decode_total, retained_sdk.total(.decode, baseline, 27));
     try testing.expectEqual(prompt_total, mb.total(.prompt, baseline, 16));
+    try testing.expectEqual(@as(usize, 3 * (n_experts + 1)), mb.slot_table.len);
+    for (0..n_experts + 1) |row| try testing.expectEqual(
+        @min(
+            retained.compact_costs.?.slots(0, @intCast(row), 0),
+            retained.compact_costs.?.slots(@min(retained.prefill_rows, @as(u32, @intCast(row))), @intCast(row), 0),
+        ),
+        mb.slots(@intCast(row)),
+    );
     try testing.expectEqual(decode_total, mb.total(.decode, baseline, 27));
     try testing.expectEqual(construction, mb.constructionBytes(16));
-    try sdk.admit(mb, baseline, .{ .prompt = 16, .decode = 27 }, @max(prompt_total, decode_total));
-    try testing.expectError(error.DecodeBaseRowsMismatch, sdk.admit(mb, baseline, .{ .prompt = 17, .decode = 27 }, std.math.maxInt(u64)));
-    const filled = try sdk.fill(mb, baseline, std.math.maxInt(u64), n_experts, 16);
-    try testing.expectEqual(sdk.Rows{ .prompt = 16, .decode = n_experts }, filled);
+    try bill.admitMemoryBill(retained, mb, .{ .prompt = 16, .decode = 27 }, @max(prompt_total, decode_total));
+    try testing.expectError(error.DecodeBaseRowsMismatch, bill.admitMemoryBill(retained, mb, .{ .prompt = 17, .decode = 27 }, std.math.maxInt(u64)));
+    const filled = try bill.fillOf(bill.fillBillOf(retained), std.math.maxInt(u64), n_experts);
+    try testing.expectEqual(arm_mod.NativeRows{ .prefill = n_experts, .decode = n_experts }, filled);
 }

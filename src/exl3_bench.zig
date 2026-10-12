@@ -2,12 +2,12 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
-const bank_mod = @import("expert_bank.zig");
-const xq = @import("exl3_quant.zig");
-const xk = @import("exl3_kernels.zig");
+const bank_mod = @import("expert/bank.zig");
+const xq = @import("exl3/quant.zig");
+const xk = @import("exl3/kernels.zig");
 const ext = @import("sdk_ext.zig");
-const tr = @import("dsv41_kernel_routes.zig");
-const G = @import("exl3_kernel_ops_gate.zig").MlxG;
+const tr = @import("arch/deepseek_v41/kernel_routes.zig");
+const G = @import("exl3/kernel_ops_gate.zig").MlxG;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 const BankArrays = xq.BankArrays(mlx.mlx_array);
@@ -244,6 +244,8 @@ fn loadProjection(g: *G, bank: *const bank_mod.Bank, o: *const Options, records:
             .{ .compact = try g.hostArray(std.mem.sliceAsBytes(descriptors[0..o.n_experts]), &.{ @intCast(o.n_experts), 2 }, .uint64) }
         else
             .{ .fixed = xq.tightLayout(k) },
+        .layer = o.layer,
+        .route_index = if (bank.isCompact()) 0 else @intCast(k - 2),
     };
 }
 

@@ -36,9 +36,53 @@ const RowPlans = kr.RowPlans;
 const rowsVars = kr.rowsVars;
 const no_vars = kr.no_vars;
 
+/// Installed projection dispatch: its entry, prepared rows and argument writer are bound once.
+fn ProjectionRoute(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        e: *const Entry,
+        plan: *const RowPlans(G, 48),
+        statics: *const Statics(G),
+        call: *const fn (*const Self, *G, G.T, G.T, ProjArrays(G.T)) anyerror!G.T,
+
+        fn fixed(self: *const Self, g: *G, x: G.T, ids: G.T, p: ProjArrays(G.T)) anyerror!G.T {
+            var ins: [xk.max_inputs]G.T = undefined;
+            ins[0..3].* = .{ x, ids, p.code };
+            for (3..self.e.inputs.len) |i| ins[i] = self.statics.arrays[i];
+            var out: [1]G.T = undefined;
+            try self.plan.launch(g, rowsOf(G, g, x, 0), ins[0..self.e.inputs.len], &out);
+            return out[0];
+        }
+
+        fn compact(self: *const Self, g: *G, x: G.T, ids: G.T, p: ProjArrays(G.T)) anyerror!G.T {
+            var out: [1]G.T = undefined;
+            try self.plan.launch(g, rowsOf(G, g, x, 0), &.{ x, ids, p.code, p.layout.compact }, &out);
+            return out[0];
+        }
+    };
+}
+
+fn LayerRoute(comptime G: type) type {
+    return struct {
+        const Self = @This();
+        const GuCall = fn (*const Gemv(G), *const Self, *G, G.T, G.T, G.T, ProjArrays(G.T), ProjArrays(G.T)) anyerror![2]G.T;
+        projections: [3][3]ProjectionRoute(G),
+        gu_calls: [3][3]*const GuCall,
+        banked: ?Banked(G).Binding = null,
+        fn pair(_: *const Gemv(G), self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, gate: ProjArrays(G.T), up: ProjArrays(G.T)) anyerror![2]G.T {
+            const rg = &self.projections[0][gate.route_index];
+            const ru = &self.projections[1][up.route_index];
+            return .{ try rg.call(rg, g, xg, ids, gate), try ru.call(ru, g, xu, ids, up) };
+        }
+        fn one(gemv: *const Gemv(G), _: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, gate: ProjArrays(G.T), up: ProjArrays(G.T)) anyerror![2]G.T {
+            return gemv.guOne(g, xg, xu, ids, gate.code, up.code);
+        }
+    };
+}
+
 // ── C2: the quant ──
 
-pub const name = "exl3-mul1";
+pub const name = "exl3-mul1-k3";
 
 /// G5: the kernel set this quant self-checks at accept is pinned by the registry's manifest.
 pub const kernel_pin: sdk_ext.kernels.Pin = .{ .manifest_sha256 = xk.manifest_sha256 };
@@ -272,7 +316,10 @@ pub fn Accepted(comptime G: type) type {
         pub const max_decode_rows: u32 = decode_table_rows;
         a: Allocator,
         reg: *const xk.Registry,
+        set: *const ks.Set,
         layer_rates: []LayerRates = &.{},
+        layer_routes: []LayerRoute(G) = &.{},
+        physical_max: [3]u32 = .{ 3, 3, 3 },
         compact: bool = false,
         /// this subset's self-check results (its receipt: `report.writeJsonLines(a)`)
         report: selfcheck.Report = .{},
@@ -324,6 +371,15 @@ pub fn Accepted(comptime G: type) type {
                 },
             }
             try self.checkBank(g, bank, diag);
+            inline for (.{ bank.gate, bank.up, bank.down }, 0..) |p, i| {
+                const index: u2 = switch (p.layout) {
+                    .fixed => |l| @intCast(@divExact(l.code_row_words, tightLayout(2).code_row_words / 2) - 2),
+                    .compact => 0,
+                };
+                if (p.layer != layer or p.route_index != index or
+                    (p.layout == .fixed and @as(u32, index) + 2 > self.physical_max[i]))
+                    return refuse(diag, error.RouteInput, "exl3 quant: layer {d} projection {d} changes installed physical route", .{ layer, i });
+            }
         }
 
         /// x [rows, 5120] bf16 (the routed rows, taken), slot_ids u32 [rows], rows 1..48 ->
@@ -332,7 +388,8 @@ pub fn Accepted(comptime G: type) type {
             const rows = rowsOf(G, g, x, 0);
             std.debug.assert(!(rows < 1 or rows > max_decode_rows));
             const xs = try self.prep.inRin(g, x, self.tok[rows - 1], gate.rin, up.rin, slot_ids);
-            const z = try self.gemv.projectGu(g, xs[0], xs[1], slot_ids, gate.code, up.code, gate.layout, up.layout);
+            const route = &self.layer_routes[gate.layer];
+            const z = try route.gu_calls[gate.route_index][up.route_index](&self.gemv, route, g, xs[0], xs[1], slot_ids, gate, up);
             return self.prep.guEpi(g, z[0], z[1], gate.rout, up.rout, slot_ids);
         }
 
@@ -340,7 +397,8 @@ pub fn Accepted(comptime G: type) type {
         /// the down GEMV -> dpost.
         pub fn down(self: *const Self, g: *G, h: G.T, slot_ids: G.T, d: A) !G.T {
             const hd = try self.prep.dinRin(g, h, d.rin, slot_ids);
-            const zd = try self.gemv.project(g, .down, hd, slot_ids, d.code, d.layout);
+            const route = &self.layer_routes[d.layer].projections[2][d.route_index];
+            const zd = try route.call(route, g, hd, slot_ids, d);
             return self.prep.dpost(g, zd, d.rout, slot_ids);
         }
 
@@ -350,12 +408,14 @@ pub fn Accepted(comptime G: type) type {
         pub fn gateUpBanked(self: *const Self, g: *G, x: G.T, ids: G.T, banks: *const [3]quant.BankArrays(A)) !G.T {
             const rows = rowsOf(G, g, x, 0);
             std.debug.assert(!(rows < 1 or rows > max_decode_rows));
-            return self.banked.?.gateUp(g, x, self.tok[rows - 1], ids, banks);
+            const route = &self.layer_routes[banks[0].gate.layer].banked.?;
+            return self.banked.?.gateUpBound(route, g, x, self.tok[rows - 1], ids, banks);
         }
 
         /// The banked route's down: h [rows, 2304] f32 (gateUpBanked's), the same packed ids -> [rows, 5120] f32.
         pub fn downBanked(self: *const Self, g: *G, h: G.T, ids: G.T, banks: *const [3]quant.BankArrays(A)) !G.T {
-            return self.banked.?.down(g, h, ids, banks);
+            const route = &self.layer_routes[banks[0].down.layer].banked.?;
+            return self.banked.?.downBound(route, g, h, ids, banks);
         }
 
         /// Layer `layer`'s DIG-X waves over the call's routed rows (`DigXPrefill.call`): a KEPT
@@ -376,13 +436,18 @@ pub fn Accepted(comptime G: type) type {
         }
 
         /// The fused down GEMM arm, at construction (before any prefill): its self-checks (compile, composition,
-        /// fused) on `set`, the accepting set, join the report, then every layer's waves launch it in place of the
-        /// 128-row down text and rot_widen1. A failed check refuses it by name (SelfCheckFailed, `diag`) and the
-        /// waves stay stock.
+        /// fused) on `set`, the accepting set, join the report. Only layers whose down banks are physically tight
+        /// K3 install it; every other layer installs the chain before dispatch. A failed check refuses it by name
+        /// (SelfCheckFailed, `diag`) without changing any installed stage.
         pub fn routeFusedDown(self: *Self, set: *const ks.Set, diag: *Diag) !void {
             try set.selfCheck(self.a, &w1_texts, .compile, &self.report, diag);
-            for (self.waves) |*w| w.installDown(.fused);
-            self.fused_down = true;
+            var installed = false;
+            for (self.waves, self.layer_rates) |*w, rate| {
+                const fused = switch (rate) { .fixed => |r| r[2] == 3 and self.physical_max[2] == 3, .compact => false };
+                w.installDown(if (fused) .fused else .chain);
+                installed = installed or fused;
+            }
+            self.fused_down = installed;
         }
 
         /// The decode route texts (the forms', the banked route's) compiled at construction with the rest of the set
@@ -411,6 +476,7 @@ pub fn Accepted(comptime G: type) type {
             self.gemv.deinit(g);
             self.gemv = next;
             self.forms = forms;
+            self.bindLayers();
         }
 
         /// The banked route, at construction (before any decode; after `routeForms`, whose forms it takes): the decode
@@ -420,6 +486,72 @@ pub fn Accepted(comptime G: type) type {
         pub fn routeBanked(self: *Self, g: *G) !void {
             if (self.banked != null) return error.BankedRoutedTwice;
             self.banked = try Banked(G).init(g, self.reg, self.forms, &self.gemv);
+            self.bindLayers();
+        }
+
+        /// Explicit physical geometry for a diagnostic source, before installing any routed arm.
+        /// Production accept derives this bound from every source-capable layer, including the shared transient.
+        pub fn bindPhysicalGeometry(self: *Self, g: *G, physical_max: [3]u32, diag: *Diag) !void {
+            if (self.banked != null or self.fused_down or self.expert_bf16 or self.forms.gu_one or self.forms.down_pair)
+                return refuse(diag, error.RouteInput, "exl3 quant: physical geometry must precede routed-arm installation", .{});
+            if (self.compact)
+                return refuse(diag, error.RouteInput, "exl3 quant: fixed physical geometry on a descriptor-backed source", .{});
+            for (physical_max, self.physical_max, 0..) |next, current, p| {
+                if (next < current or next < 2 or next > 4)
+                    return refuse(diag, error.RouteInput, "exl3 quant: projection {d} physical K {d} outside accepted source bound {d}..4", .{ p, next, current });
+            }
+            for (self.layer_rates) |rate| {
+                const rates = rate.fixed;
+                for (rates, physical_max) |k, capacity| {
+                    if (k != 3 or capacity != 3) try self.prepareRate(g, k, diag);
+                }
+            }
+            self.physical_max = physical_max;
+            self.bindLayers();
+            for (self.waves, self.layer_rates) |*w, rate| w.dig.bindStorage(rate, physical_max);
+        }
+
+        /// Explicit construction boundary for diagnostic contexts with prebuilt GEMVs and owned rates.
+        pub fn bindRoutes(self: *Self) !void {
+            if (self.layer_routes.len == 0)
+                self.layer_routes = try self.a.alloc(LayerRoute(G), self.layer_rates.len);
+            self.bindLayers();
+            for (self.waves, self.layer_rates) |*w, rate| w.dig.bindStorage(rate, self.physical_max);
+        }
+
+        /// Rebind only during installation, after replacing forms or adding banked plans.
+        fn bindLayers(self: *Self) void {
+            for (self.layer_routes, self.layer_rates) |*route, rate| {
+                const rates = switch (rate) { .fixed => |r| r, .compact => [3]u32{ 3, 3, 3 } };
+                inline for (0..3) |p| {
+                    for (0..3) |physical| {
+                        if (!self.compact and (physical + 2 < rates[p] or physical + 2 > self.physical_max[p])) continue;
+                        const direct = !self.compact and (rates[p] != 3 or physical != 1);
+                        const down_proj = p == 2;
+                        route.projections[p][physical] = .{
+                            .e = if (direct) (if (down_proj) self.gemv.rate_dn_e[rates[p] - 2] else self.gemv.rate_gu_e[rates[p] - 2]) else (if (down_proj) self.gemv.dn else self.gemv.gu),
+                            .plan = if (direct) (if (down_proj) self.gemv.rate_dn[rates[p] - 2].? else self.gemv.rate_gu[rates[p] - 2].?) else (if (down_proj) &self.gemv.dn_p else &self.gemv.gu_p),
+                            .statics = if (down_proj) &self.gemv.dn_statics else &self.gemv.gu_statics,
+                            .call = if (self.compact) ProjectionRoute(G).compact else ProjectionRoute(G).fixed,
+                        };
+                    }
+                }
+                for (&route.gu_calls, 0..) |*row, gi| for (row, 0..) |*call, ui| {
+                    call.* = if (!self.compact and self.forms.gu_one and rates[0] == 3 and rates[1] == 3 and gi == 1 and ui == 1) LayerRoute(G).one else LayerRoute(G).pair;
+                };
+                route.banked = if (self.banked) |*b| b.bindStorage(rate, self.physical_max) else null;
+            }
+        }
+
+        fn prepareRate(self: *Self, g: *G, k: u32, diag: *Diag) !void {
+            const bit = @as(u3, 1) << @as(u2, @intCast(k - 2));
+            if (self.gemv.rate_mask & bit != 0) return;
+            for (xk.rate_kernels) |kernel| {
+                const pair = xk.ratesOf(kernel);
+                if (pair[0] == k and pair[1] == k)
+                    try self.set.selfCheck(self.a, &.{kernel}, .compile, &self.report, diag);
+            }
+            try self.gemv.prepareRate(g, self.reg, k);
         }
 
         /// Releases the routes (statics, prepared configs, the row maps, the wave states) and
@@ -433,6 +565,7 @@ pub fn Accepted(comptime G: type) type {
                 .fixed => {},
             };
             self.a.free(self.layer_rates);
+            self.a.free(self.layer_routes);
             for (self.tok[0..self.n_tok]) |x| g.release(x);
             self.prep.deinit(g);
             self.gemv.deinit(g);
@@ -491,6 +624,7 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
         .fixed => {},
     };
     var mask: u3 = 0;
+    var physical_max: [3]u32 = @splat(2);
     for (rates, peek.layers) |*rate, layer| {
         if (compact) {
             const classes = try a.alloc([3]u32, layer.record_layouts.len);
@@ -500,12 +634,13 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
             const triple = sourceRates(layer.segments).?;
             rate.* = .{ .fixed = triple };
             for (triple) |k| mask |= @as(u3, 1) << @as(u2, @intCast(k - 2));
+            for (triple, 0..) |k, p| physical_max[p] = @max(physical_max[p], k);
         }
         copied += 1;
     }
     if (mask == 2) mask = 0;
     const acc = try a.create(Accepted(G));
-    acc.* = .{ .a = a, .reg = &set.reg, .layer_rates = rates, .compact = compact, .gemv = undefined, .prep = undefined, .tok = undefined };
+    acc.* = .{ .a = a, .reg = &set.reg, .set = set, .layer_rates = rates, .compact = compact, .gemv = undefined, .prep = undefined, .tok = undefined };
     errdefer {
         acc.report.deinit(a);
         a.destroy(acc);
@@ -519,6 +654,10 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
     }
     acc.gemv = try Gemv(G).initStorage(a, g, &set.reg, .{}, mask, compact);
     errdefer acc.gemv.deinit(g);
+    acc.physical_max = physical_max;
+    acc.layer_routes = try a.alloc(LayerRoute(G), rates.len);
+    errdefer a.free(acc.layer_routes);
+    acc.bindLayers();
     acc.prep = try RinPrep(G).init(g, &set.reg);
     errdefer acc.prep.deinit(g);
     errdefer for (acc.tok[0..acc.n_tok]) |x| g.release(x);
@@ -539,6 +678,9 @@ pub fn accept(comptime G: type, a: Allocator, g: *G, ctx: quant.Context, spec: q
         built += 1;
     }
     acc.waves = waves;
+    for (acc.waves, rates) |*w, rate| {
+        w.dig.bindStorage(rate, physical_max);
+    }
     return acc;
 }
 
@@ -578,7 +720,15 @@ pub fn ProjectionStorage(comptime T: type) type {
 
 /// One projection's slot bank; the logical rate is independent of its physical capacity.
 pub fn ProjArrays(comptime T: type) type {
-    return struct { code: T, rout: T, rin: T, layout: ProjectionStorage(T) };
+    return struct {
+        code: T,
+        rout: T,
+        rin: T,
+        layout: ProjectionStorage(T),
+        /// Construction-time route key: logical layer and physical fixed capacity (K2..K4).
+        layer: u32 = 0,
+        route_index: u2 = 1,
+    };
 }
 
 /// A layer bank's projection arrays are what the kernels read (bind time, once per bank).
@@ -648,8 +798,6 @@ pub fn Gemv(comptime G: type) type {
         dn_p: RowPlans(G, 48),
         /// gu_one: gate and up in one launch (`dsv41_exl3_guone_k3_2304`), bound by `initForms`.
         gu1_p: ?RowPlans(G, 48) = null,
-        /// The gate / up call bound at construction: `guOne` (gu_one's one launch) or `guPair` (the two stock launches).
-        gu_call: *const GuCall = guPair,
         rate_mask: u3 = 0,
         rate_a: Allocator,
         compact: bool = false,
@@ -658,7 +806,6 @@ pub fn Gemv(comptime G: type) type {
         rate_gu_e: [3]*const Entry = undefined,
         rate_dn_e: [3]*const Entry = undefined,
 
-        const GuCall = fn (self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T;
 
         pub fn init(g: *G, reg: *const xk.Registry) !Self {
             return initForms(g, reg, .{});
@@ -685,7 +832,7 @@ pub fn Gemv(comptime G: type) type {
             errdefer if (gu1_p) |*x| x.deinit(g);
             var gs = try Statics(G).init(g, gu);
             errdefer gs.deinit(g);
-            var self: Self = .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p, .gu_call = if (!compact and forms.gu_one) guOne else guPair, .rate_mask = rate_mask, .rate_a = a, .compact = compact };
+            var self: Self = .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p, .rate_mask = rate_mask, .rate_a = a, .compact = compact };
             errdefer {
                 self.dn_statics.deinit(g);
                 freeRatePlans(G, a, g, &self.rate_gu);
@@ -702,6 +849,24 @@ pub fn Gemv(comptime G: type) type {
             return self;
         }
 
+        fn prepareRate(self: *Self, g: *G, reg: *const xk.Registry, k: u32) !void {
+            const i = k - 2;
+            if (self.rate_gu[i] != null) return;
+            const kg = [_]Kernel{ .dsv41_exl3_mul1h_rate_2304, .dsv41_exl3_mul1h_rate_2304__k3, .dsv41_exl3_mul1h_rate_2304__k4 };
+            const kd = [_]Kernel{ .dsv41_exl3_mul1h_rate_5120, .dsv41_exl3_mul1h_rate_5120__k3, .dsv41_exl3_mul1h_rate_5120__k4 };
+            const pg = try allocRatePlan(G, self.rate_a, g, reg.get(kg[i]));
+            errdefer {
+                pg.deinit(g);
+                self.rate_a.destroy(pg);
+            }
+            const pd = try allocRatePlan(G, self.rate_a, g, reg.get(kd[i]));
+            self.rate_gu_e[i] = reg.get(kg[i]);
+            self.rate_dn_e[i] = reg.get(kd[i]);
+            self.rate_gu[i] = pg;
+            self.rate_dn[i] = pd;
+            self.rate_mask |= @as(u3, 1) << @as(u2, @intCast(i));
+        }
+
         pub fn deinit(self: *Self, g: *G) void {
             self.gu_p.deinit(g);
             self.dn_p.deinit(g);
@@ -712,15 +877,39 @@ pub fn Gemv(comptime G: type) type {
             freeRatePlans(G, self.rate_a, g, &self.rate_dn);
         }
 
-        /// Tight K3 keeps its installed form; other layouts use their prepared direct-rate plans.
-        pub fn projectGu(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T, lg: ProjectionStorage(G.T), lu: ProjectionStorage(G.T)) ![2]G.T {
-            if (!lg.tightK3() or !lu.tightK3())
-                return .{ try self.project(g, .gate, xg, ids, code_g, lg), try self.project(g, .up, xu, ids, code_u, lu) };
-            return self.gu_call(self, g, xg, xu, ids, code_g, code_u);
+        pub const Binding = struct {
+            projections: [3]ProjectionRoute(G),
+            gu_call: *const fn (*const Self, *const Binding, *G, G.T, G.T, G.T, G.T, G.T, ProjectionStorage(G.T), ProjectionStorage(G.T)) anyerror![2]G.T,
+        };
+
+        /// Construction boundary for standalone diagnostics and route regressions.
+        pub fn bindStorage(self: *const Self, layouts: [3]ProjectionStorage(G.T)) Binding {
+            var binding: Binding = .{ .projections = undefined, .gu_call = guPair };
+            for (layouts, 0..) |layout, p| {
+                const direct = layout == .fixed and !layout.tightK3();
+                const index = if (layout == .fixed) layout.fixed.k - 2 else 0;
+                const dn = p == 2;
+                binding.projections[p] = .{
+                    .e = if (direct) (if (dn) self.rate_dn_e[index] else self.rate_gu_e[index]) else (if (dn) self.dn else self.gu),
+                    .plan = if (direct) (if (dn) self.rate_dn[index].? else self.rate_gu[index].?) else (if (dn) &self.dn_p else &self.gu_p),
+                    .statics = if (dn) &self.dn_statics else &self.gu_statics,
+                    .call = if (self.compact) ProjectionRoute(G).compact else ProjectionRoute(G).fixed,
+                };
+            }
+            if (layouts[0].tightK3() and layouts[1].tightK3() and self.gu1_p != null) binding.gu_call = guBoundOne;
+            return binding;
         }
 
-        fn guPair(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T {
-            return .{ try self.project(g, .gate, xg, ids, code_g, .{ .fixed = tightLayout(3) }), try self.project(g, .up, xu, ids, code_u, .{ .fixed = tightLayout(3) }) };
+        pub fn projectGu(self: *const Self, binding: *const Binding, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T, lg: ProjectionStorage(G.T), lu: ProjectionStorage(G.T)) ![2]G.T {
+            return binding.gu_call(self, binding, g, xg, xu, ids, code_g, code_u, lg, lu);
+        }
+
+        fn guPair(self: *const Self, binding: *const Binding, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T, lg: ProjectionStorage(G.T), lu: ProjectionStorage(G.T)) anyerror![2]G.T {
+            return .{ try self.project(binding, g, .gate, xg, ids, code_g, lg), try self.project(binding, g, .up, xu, ids, code_u, lu) };
+        }
+
+        fn guBoundOne(self: *const Self, _: *const Binding, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T, _: ProjectionStorage(G.T), _: ProjectionStorage(G.T)) anyerror![2]G.T {
+            return self.guOne(g, xg, xu, ids, code_g, code_u);
         }
 
         fn guOne(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T {
@@ -731,30 +920,9 @@ pub fn Gemv(comptime G: type) type {
 
         /// xh [rows, in] f32 (rotated), ids [rows] u32 (each row's slot), code = the projection's
         /// bank code -> z [rows, out] f32 (gate / up: out 2304, down: out 5120).
-        pub fn project(self: *const Self, g: *G, proj: Proj, xh: G.T, ids: G.T, code: G.T, layout: ProjectionStorage(G.T)) !G.T {
-            if ((layout == .compact) != self.compact) return error.StorageNotPrepared;
-            if (layout == .compact) {
-                const plan = if (proj == .down) &self.dn_p else &self.gu_p;
-                var out: [1]G.T = undefined;
-                try plan.launch(g, rowsOf(G, g, xh, 0), &.{ xh, ids, code, layout.compact }, &out);
-                return out[0];
-            }
-            const direct = !layout.tightK3();
-            const index = layout.fixed.k - 2;
-            const p: *const RowPlans(G, 48) = if (direct) blk: {
-                const plans = if (proj == .down) &self.rate_dn[index] else &self.rate_gu[index];
-                break :blk plans.* orelse return error.RateNotPrepared;
-            } else if (proj == .down) &self.dn_p else &self.gu_p;
-            const e = if (direct) (if (proj == .down) self.rate_dn_e[index] else self.rate_gu_e[index]) else (if (proj == .down) self.dn else self.gu);
-            const st = if (proj == .down) &self.dn_statics else &self.gu_statics;
-            var ins: [9]G.T = undefined;
-            ins[0] = xh;
-            ins[1] = ids;
-            ins[2] = code;
-            for (3..e.inputs.len) |i| ins[i] = st.arrays[i];
-            var out: [1]G.T = undefined;
-            try p.launch(g, rowsOf(G, g, xh, 0), ins[0..e.inputs.len], &out);
-            return out[0];
+        pub fn project(_: *const Self, binding: *const Binding, g: *G, proj: Proj, xh: G.T, ids: G.T, code: G.T, layout: ProjectionStorage(G.T)) !G.T {
+            const route = &binding.projections[@intFromEnum(proj)];
+            return route.call(route, g, xh, ids, .{ .code = code, .rin = undefined, .rout = undefined, .layout = layout });
         }
     };
 }
@@ -791,7 +959,48 @@ pub fn Banked(comptime G: type) type {
         rate_gu_st: [xk.max_inputs]G.T = undefined,
         rate_dn_st: [xk.max_inputs]G.T = undefined,
 
-        const GuCall = fn (self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T;
+        const GuCall = fn (self: *const Self, binding: *const Binding, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T;
+        pub const Binding = struct {
+            projections: [3]Projection,
+            gu_call: *const GuCall,
+        };
+        const Projection = struct {
+            e: *const Entry,
+            plan: *const RowPlans(G, 48),
+            statics: *const [xk.max_inputs]G.T,
+            call: *const fn (*const Projection, *G, G.T, G.T, *const [3]A) anyerror!G.T,
+            fn fixed(p: *const Projection, g: *G, x: G.T, ids: G.T, banks: *const [3]A) anyerror!G.T {
+                var ins = p.statics.*;
+                ins[0..5].* = .{ x, ids, banks[0].code, banks[1].code, banks[2].code };
+                var out: [1]G.T = undefined;
+                try p.plan.launch(g, rowsOf(G, g, x, 0), ins[0..p.e.inputs.len], &out);
+                return out[0];
+            }
+            fn compact(p: *const Projection, g: *G, x: G.T, ids: G.T, banks: *const [3]A) anyerror!G.T {
+                var out: [1]G.T = undefined;
+                try p.plan.launch(g, rowsOf(G, g, x, 0), &.{ x, ids, banks[0].code, banks[1].code, banks[2].code, banks[0].layout.compact, banks[1].layout.compact, banks[2].layout.compact }, &out);
+                return out[0];
+            }
+        };
+
+        /// Bind against every source-capable bank's maximum geometry, not just the resident bank.
+        pub fn bindStorage(self: *const Self, rate: LayerRates, physical_max: [3]u32) Binding {
+            const rates = switch (rate) { .fixed => |r| r, .compact => [3]u32{ 3, 3, 3 } };
+            var binding: Binding = .{ .projections = undefined, .gu_call = guPair };
+            inline for (0..3) |p| {
+                const direct = !self.compact and (if (p == 2) (rates[p] != 3 or physical_max[p] != 3) else (rates[0] != 3 or rates[1] != 3 or physical_max[0] != 3 or physical_max[1] != 3));
+                const dn = p == 2;
+                binding.projections[p] = .{
+                    .e = if (direct) (if (dn) self.rate_dn_e[rates[p] - 2] else self.rate_gu_e[rates[p] - 2]) else (if (dn) self.dn_e else self.gu_e),
+                    .plan = if (direct) (if (dn) self.rate_dn[rates[p] - 2].? else self.rate_gu[rates[p] - 2].?) else (if (dn) &self.dn_p else &self.gu_p),
+                    .statics = if (direct) (if (dn) &self.rate_dn_st else &self.rate_gu_st) else (if (dn) &self.dn_st else &self.gu_st),
+                    .call = if (self.compact) Projection.compact else Projection.fixed,
+                };
+            }
+            if (!self.compact and rates[0] == 3 and rates[1] == 3 and physical_max[0] == 3 and physical_max[1] == 3)
+                binding.gu_call = self.gu_call;
+            return binding;
+        }
 
         pub fn init(g: *G, reg: *const xk.Registry, forms: Forms, gemv: *const Gemv(G)) !Self {
             const compact = gemv.compact;
@@ -858,78 +1067,40 @@ pub fn Banked(comptime G: type) type {
             freeRatePlans(G, self.rate_a, g, &self.rate_dn);
         }
 
-        fn tightBanks(comptime proj: Proj, banks: *const [3]BA) bool {
-            for (banks) |b| {
-                const layout = @field(b, @tagName(proj)).layout;
-                if (!layout.tightK3()) return false;
-            }
-            return true;
-        }
 
         /// x [tokens, 5120] bf16 (taken rows), tok [rows] i32, ids packed -> the clamped SwiGLU [rows, 2304] f32.
-        pub fn gateUp(self: *const Self, g: *G, x: G.T, tok: G.T, ids: G.T, banks: *const [3]BA) !G.T {
+        pub fn gateUpBound(self: *const Self, binding: *const Binding, g: *G, x: G.T, tok: G.T, ids: G.T, banks: *const [3]BA) !G.T {
             const rows = rowsOf(G, g, tok, 0);
             var xs: [2]G.T = undefined;
             try self.in_rin_p.launch(g, rows, &.{ x, tok, banks[0].gate.rin, banks[1].gate.rin, banks[2].gate.rin, banks[0].up.rin, banks[1].up.rin, banks[2].up.rin, ids }, &xs);
-            const z = if (!self.compact and tightBanks(.gate, banks) and tightBanks(.up, banks))
-                try self.gu_call(self, g, xs[0], xs[1], ids, banks)
-            else
-                try self.guPair(g, xs[0], xs[1], ids, banks);
+            const z = try binding.gu_call(self, binding, g, xs[0], xs[1], ids, banks);
             var out: [1]G.T = undefined;
             try self.gu_epi_p.launch(g, rows, &.{ z[0], z[1], banks[0].gate.rout, banks[1].gate.rout, banks[2].gate.rout, banks[0].up.rout, banks[1].up.rout, banks[2].up.rout, ids }, &out);
             return out[0];
         }
 
         /// h [rows, 2304] f32, ids packed -> [rows, 5120] f32: din_rin -> the down GEMV -> dpost, banked.
-        pub fn down(self: *const Self, g: *G, h: G.T, ids: G.T, banks: *const [3]BA) !G.T {
+        pub fn downBound(self: *const Self, binding: *const Binding, g: *G, h: G.T, ids: G.T, banks: *const [3]BA) !G.T {
             const rows = rowsOf(G, g, h, 0);
             var hd: [1]G.T = undefined;
             try self.din_rin_p.launch(g, rows, &.{ h, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, ids }, &hd);
-            const direct = !self.compact and !tightBanks(.down, banks);
-            const index = if (self.compact) 0 else banks[0].down.layout.fixed.k - 2;
-            const plan: *const RowPlans(G, 48) = if (direct) (self.rate_dn[index] orelse return error.RateNotPrepared) else &self.dn_p;
-            const entry = if (direct) self.rate_dn_e[index] else self.dn_e;
-            var ins: [xk.max_inputs]G.T = if (self.compact) undefined else if (direct) self.rate_dn_st else self.dn_st;
-            ins[0] = hd[0];
-            ins[1] = ids;
-            ins[2] = banks[0].down.code;
-            ins[3] = banks[1].down.code;
-            ins[4] = banks[2].down.code;
-            if (self.compact) {
-                inline for (0..3) |b| ins[5 + b] = banks[b].down.layout.compact;
-            }
-            var zd: [1]G.T = undefined;
-            try plan.launch(g, rows, ins[0..entry.inputs.len], &zd);
+            const p = &binding.projections[2];
+            const zd = try p.call(p, g, hd[0], ids, &.{ banks[0].down, banks[1].down, banks[2].down });
             var out: [1]G.T = undefined;
-            try self.dpost_p.launch(g, rows, &.{ zd[0], banks[0].down.rout, banks[1].down.rout, banks[2].down.rout, ids }, &out);
+            try self.dpost_p.launch(g, rows, &.{ zd, banks[0].down.rout, banks[1].down.rout, banks[2].down.rout, ids }, &out);
             return out[0];
         }
 
-        fn guPair(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
-            const rows = rowsOf(G, g, xg, 0);
-            var out: [2]G.T = undefined;
-            const direct = !self.compact and (!tightBanks(.gate, banks) or !tightBanks(.up, banks));
-            inline for (.{ .gate, .up }, 0..) |proj, o| {
-                const index = if (self.compact) 0 else @field(banks[0], @tagName(proj)).layout.fixed.k - 2;
-                const plan: *const RowPlans(G, 48) = if (direct) (self.rate_gu[index] orelse return error.RateNotPrepared) else &self.gu_p;
-                const entry = if (direct) self.rate_gu_e[index] else self.gu_e;
-                var ins: [xk.max_inputs]G.T = if (self.compact) undefined else if (direct) self.rate_gu_st else self.gu_st;
-                ins[1] = ids;
-                ins[0] = if (o == 0) xg else xu;
-                ins[2] = @field(banks[0], @tagName(proj)).code;
-                ins[3] = @field(banks[1], @tagName(proj)).code;
-                ins[4] = @field(banks[2], @tagName(proj)).code;
-                if (self.compact) {
-                    inline for (0..3) |b| ins[5 + b] = @field(banks[b], @tagName(proj)).layout.compact;
-                }
-                var z: [1]G.T = undefined;
-                try plan.launch(g, rows, ins[0..entry.inputs.len], &z);
-                out[o] = z[0];
-            }
-            return out;
+        fn guPair(_: *const Self, binding: *const Binding, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
+            const pg = &binding.projections[0];
+            const pu = &binding.projections[1];
+            return .{
+                try pg.call(pg, g, xg, ids, &.{ banks[0].gate, banks[1].gate, banks[2].gate }),
+                try pu.call(pu, g, xu, ids, &.{ banks[0].up, banks[1].up, banks[2].up }),
+            };
         }
 
-        fn guOne(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
+        fn guOne(self: *const Self, _: *const Binding, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
             var out: [2]G.T = undefined;
             try self.gu_p.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &out);
             return out;
@@ -1098,6 +1269,24 @@ pub fn DigX(comptime G: type) type {
         rate_dn: [3]*const Entry,
         compact_gu: *const Entry,
         compact_dn: *const Entry,
+        gu_dispatch: *const fn (*const Self, *G, G.T, G.T, G.T, G.T, G.T, u32, ProjectionStorage(G.T), ProjectionStorage(G.T)) anyerror![2]G.T = guFixed,
+        dn_dispatch: *const fn (*const Self, *G, G.T, G.T, G.T, u32, ProjectionStorage(G.T)) anyerror!G.T = dnFixed,
+
+        pub fn bindStorage(self: *Self, rate: LayerRates, physical_max: [3]u32) void {
+            switch (rate) {
+                .compact => {
+                    self.gemm_gu128 = self.compact_gu;
+                    self.gemm_dn128 = self.compact_dn;
+                    self.gu_dispatch = guCompact;
+                    self.dn_dispatch = dnCompact;
+                },
+                .fixed => |r| {
+                    if (r[0] != 3 or r[1] != 3 or physical_max[0] != 3 or physical_max[1] != 3)
+                        self.gemm_gu128 = self.rate_gu[r[0] - 2][r[1] - 2];
+                    if (r[2] != 3 or physical_max[2] != 3) self.gemm_dn128 = self.rate_dn[r[2] - 2];
+                },
+            }
+        }
 
         pub fn init(reg: *const xk.Registry) Self {
             return .{
@@ -1136,15 +1325,22 @@ pub fn DigX(comptime G: type) type {
         /// x0 / x1 [rows, 1, 5120] f16 (take2), gate / up code, the gate|up table at `m_tile` rows -> (zg, zu)
         /// [rows, 2304] f32: the 128-row text, the 64-row text's words.
         pub fn gemmGateUp(self: *const Self, g: *G, x0: G.T, x1: G.T, code_g: G.T, code_u: G.T, tbl: G.T, tgs: u32, lg: ProjectionStorage(G.T), lu: ProjectionStorage(G.T)) ![2]G.T {
-            if ((lg == .compact) != (lu == .compact)) return error.StorageNotPrepared;
-            const entry = if (lg == .compact) self.compact_gu else if (lg.tightK3() and lu.tightK3()) self.gemm_gu128 else self.rate_gu[lg.fixed.k - 2][lu.fixed.k - 2];
+            return self.gu_dispatch(self, g, x0, x1, code_g, code_u, tbl, tgs, lg, lu);
+        }
+
+        fn guFixed(self: *const Self, g: *G, x0: G.T, x1: G.T, code_g: G.T, code_u: G.T, tbl: G.T, tgs: u32, _: ProjectionStorage(G.T), _: ProjectionStorage(G.T)) anyerror![2]G.T {
             var vars = rowsVars(rowsOf(G, g, x0, 0));
             vars.set(.tgs, tgs);
             var out: [2]G.T = undefined;
-            if (lg == .compact)
-                try launchRule(G, g, entry, &vars, &.{ x0, x1, code_g, code_u, tbl, lg.compact, lu.compact }, &out)
-            else
-                try launchRule(G, g, entry, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
+            try launchRule(G, g, self.gemm_gu128, &vars, &.{ x0, x1, code_g, code_u, tbl }, &out);
+            return out;
+        }
+
+        fn guCompact(self: *const Self, g: *G, x0: G.T, x1: G.T, code_g: G.T, code_u: G.T, tbl: G.T, tgs: u32, lg: ProjectionStorage(G.T), lu: ProjectionStorage(G.T)) anyerror![2]G.T {
+            var vars = rowsVars(rowsOf(G, g, x0, 0));
+            vars.set(.tgs, tgs);
+            var out: [2]G.T = undefined;
+            try launchRule(G, g, self.gemm_gu128, &vars, &.{ x0, x1, code_g, code_u, tbl, lg.compact, lu.compact }, &out);
             return out;
         }
 
@@ -1175,14 +1371,22 @@ pub fn DigX(comptime G: type) type {
         /// x [rows, 1, 2304] f16 (onepass), down code, the down table at `m_tile` rows -> z [rows, 5120] f32: the
         /// 128-row text, the 64-row text's words.
         pub fn gemmDown(self: *const Self, g: *G, x: G.T, code_d: G.T, tbl: G.T, tgs: u32, layout: ProjectionStorage(G.T)) !G.T {
-            const entry = if (layout == .compact) self.compact_dn else if (layout.tightK3()) self.gemm_dn128 else self.rate_dn[layout.fixed.k - 2];
+            return self.dn_dispatch(self, g, x, code_d, tbl, tgs, layout);
+        }
+
+        fn dnFixed(self: *const Self, g: *G, x: G.T, code_d: G.T, tbl: G.T, tgs: u32, _: ProjectionStorage(G.T)) anyerror!G.T {
             var vars = rowsVars(rowsOf(G, g, x, 0));
             vars.set(.tgs, tgs);
             var out: [1]G.T = undefined;
-            if (layout == .compact)
-                try launchRule(G, g, entry, &vars, &.{ x, code_d, tbl, layout.compact }, &out)
-            else
-                try launchRule(G, g, entry, &vars, &.{ x, code_d, tbl }, &out);
+            try launchRule(G, g, self.gemm_dn128, &vars, &.{ x, code_d, tbl }, &out);
+            return out[0];
+        }
+
+        fn dnCompact(self: *const Self, g: *G, x: G.T, code_d: G.T, tbl: G.T, tgs: u32, layout: ProjectionStorage(G.T)) anyerror!G.T {
+            var vars = rowsVars(rowsOf(G, g, x, 0));
+            vars.set(.tgs, tgs);
+            var out: [1]G.T = undefined;
+            try launchRule(G, g, self.gemm_dn128, &vars, &.{ x, code_d, tbl, layout.compact }, &out);
             return out[0];
         }
 
@@ -1405,7 +1609,7 @@ pub fn DigXPrefill(comptime G: type) type {
                 while (self.flight.items.len > keep) try self.drainOne(g);
                 prof.charge(.drain, tp);
                 tp = prof.now();
-                prof.count(1, if (self.wave_launches == 4 and !bank.down.layout.tightK3()) 5 else self.wave_launches);
+                prof.count(1, self.wave_launches);
                 var ex: [wave_max]WaveExpert = undefined;
                 for (order[first..i], 0..) |gi, j| {
                     ex[j] = .{ .slot = self.gslot.items[gi], .rows = cnt[gi] };
@@ -1514,8 +1718,7 @@ pub fn DigXPrefill(comptime G: type) type {
         }
 
         /// Fused: the fused down GEMM over its 40-tile table (rot_widen1 as its epilogue reads the table's slot column).
-        fn downFused(self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, rhs: G.T) anyerror!G.T {
-            if (!bank.down.layout.tightK3()) return self.downChain(g, hd, bank, ex, rhs);
+        fn downFused(self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, _: G.T) anyerror!G.T {
             const tw = digTableBm(ex, self.tiles_w, DigX(G).m_tile);
             const tdw = try g.hostArray(std.mem.sliceAsBytes(&tw.table), &.{80}, .int32);
             return self.dig.gemmDownWiden(g, hd, bank.down.code, bank.down.rout, tdw, tw.tgs);
@@ -1781,7 +1984,41 @@ test "dsv41 kernels rates: accepted layer identity outlives its peek and rejects
     var bank = try testBank(&g, 4);
     bank.down.code = try g.ext("padded", &.{ 4, 144, 320, 64 }, .int16);
     bank.down.layout.fixed.code_row_words = tightLayout(4).code_row_words;
+    inline for (.{ "gate", "up", "down" }) |field| @field(bank, field).layer = 39;
+    bank.down.route_index = 2;
+    const stock_prepared = g.prepared_live;
+    const stock_checks = acc.report.results.items.len;
+    try testing.expectError(error.RouteInput, acc.checkLayerBank(&g, 39, bank, &diag));
+    try testing.expectEqual(stock_prepared, g.prepared_live);
+    try testing.expectEqual(stock_checks, acc.report.results.items.len);
+    try testing.expectEqual([3]u32{ 3, 3, 3 }, acc.physical_max);
+    try acc.bindPhysicalGeometry(&g, .{ 3, 3, 4 }, &diag);
     try acc.checkLayerBank(&g, 39, bank, &diag);
+    try acc.routeForms(&g, .{ .gu_one = true, .down_pair = true });
+    try acc.routeBanked(&g);
+    try acc.routeFusedDown(set, &diag);
+    try testing.expectError(error.RouteInput, acc.bindPhysicalGeometry(&g, .{ 3, 3, 4 }, &diag));
+    try testing.expectEqual(@as(u32, 5), acc.waves[39].wave_launches);
+    const prepared = g.prepared_live;
+    const frozen: *const Accepted(Trace) = acc;
+    const installed_checks = acc.report.results.items.len;
+    try frozen.checkLayerBank(&g, 39, bank, &diag);
+    try testing.expectEqual(prepared, g.prepared_live);
+    try testing.expectEqual(installed_checks, acc.report.results.items.len);
+    try testing.expectEqual(@as(u32, 5), acc.waves[39].wave_launches);
+    const banks = [_]BankArrays(Trace.T){ bank, bank, bank };
+    for ([_]c_int{ 1, 7, 48 }) |m| {
+        const x = try g.ext("accepted x", &.{ m, 5120 }, .bfloat16);
+        const ids = try g.ext("accepted ids", &.{m}, .uint32);
+        const h = try acc.gateUp(&g, x, ids, bank.gate, bank.up);
+        try testing.expectEqual(Kernel.dsv41_exl3_guone_k3_2304, g.back(2).k);
+        _ = try acc.down(&g, h, ids, bank.down);
+        try testing.expectEqual(Kernel.dsv41_exl3_mul1h_rate_5120__k3, g.back(2).k);
+        const bh = try acc.gateUpBanked(&g, x, ids, &banks);
+        _ = try acc.downBanked(&g, bh, ids, &banks);
+        try testing.expectEqual(Kernel.dsv41_exl3_b3_mul1h_rate_5120__k3, g.back(2).k);
+        try testing.expectEqual(prepared, g.prepared_live);
+    }
     for ([_]u32{ 2, 4 }) |k| {
         bank.down.layout.fixed.k = k;
         try testing.expectError(error.RouteInput, acc.checkLayerBank(&g, 39, bank, &diag));
@@ -1843,6 +2080,8 @@ test "exl3 mixed storage: every selected class is admitted and owned after peek 
         const p = &@field(bank, field);
         p.code = try g.ext("compact arena", &.{ 30000, 256 }, .int16);
         p.layout = .{ .compact = try g.ext("descriptors", &.{ 2, 2 }, .uint64) };
+        p.layer = 39;
+        p.route_index = 0;
     }
     try acc.checkLayerBank(&g, 39, bank, &diag);
     bank.gate.layout = .{ .compact = try g.ext("wrong capacity", &.{ 3, 2 }, .uint64) };

@@ -713,7 +713,7 @@ pub const Module = struct {
             self.max_context = bill_mod.servedContext(&admitted);
             // Forced rows too: both phases' totals under the target (a baseline-free shell bills the process alone).
             const mb = try bill_mod.memoryBill(arena.allocator(), b);
-            sdk.admit(mb, b.baseline, .{ .prompt = b.prefill_rows, .decode = b.decode_rows }, self.fill_target) catch |e| {
+            bill_mod.admitMemoryBill(b, mb, .{ .prompt = b.prefill_rows, .decode = b.decode_rows }, self.fill_target) catch |e| {
                 log.err("admission refused before construction: {s} (prompt total {d} B, decode total {d} B, target {d} B)\n", .{ @errorName(e), b.prefillTotal(), b.decodeTotal(), self.fill_target });
                 return e;
             };

@@ -367,14 +367,14 @@ pub const StreamSource = struct {
 
     // ── HITPASS (DEVROUTE, design-decode-fusion 2d) ──
     /// Absolute layer `layer`'s resident map as the device reads it: `out[e]` = the packed (bank << 24 | row) of expert
-    /// e's persistent slot, else 0 (a miss: its device row reads base row 0 and is never joined). DSV's `lutOf` over the
-    /// relative layer's policy; the dense layers (below `first_moe_layer`) have no policy and map every expert to 0.
+    /// e's persistent slot, else the math's `missing_id` (stock zero: the device reads base row 0 and is never joined).
+    /// DSV's `lutOf` over the relative layer's policy; dense layers have no policy and map every expert to `missing_id`.
     /// The scheduler writes it only after a route (the policy changes only in `route`), never per dispatch.
-    pub fn residentLut(self: *const StreamSource, layer: u32, out: []u32) void {
-        if (layer < self.stream.bank.first_moe_layer) return @memset(out, 0);
-        if (comptime diag.compiled) if (self.missfree) |mf| if (self.decoding()) return self.missFreeLut(mf, layer, out);
+    pub fn residentLut(self: *const StreamSource, layer: u32, out: []u32, missing_id: u32) void {
+        if (layer < self.stream.bank.first_moe_layer) return @memset(out, missing_id);
+        if (comptime diag.compiled) if (self.missfree) |mf| if (self.decoding()) return self.missFreeLut(mf, layer, out, missing_id);
         const rel = self.relativeLayer(layer);
-        @import("../../expert/stream.zig").lutOf(&self.stream.layers[rel].policy, self.stream, rel, out);
+        @import("../../expert/stream.zig").lutOf(&self.stream.layers[rel].policy, self.stream, rel, out, missing_id);
     }
 
     // ── end HITPASS ──
@@ -485,11 +485,11 @@ pub const StreamSource = struct {
     }
 
     /// The device LUT under missfree: every expert's entry is its substitute's packed slot (a resident's own).
-    fn missFreeLut(self: *const StreamSource, mf: *const diag.MissFree, layer: u32, out: []u32) void {
+    fn missFreeLut(self: *const StreamSource, mf: *const diag.MissFree, layer: u32, out: []u32, missing_id: u32) void {
         const rel = self.relativeLayer(layer);
         const pol = &self.stream.layers[rel].policy;
         for (out, 0..) |*o, e| {
-            o.* = 0;
+            o.* = missing_id;
             if (e >= pol.n_experts) continue;
             const ref = self.stream.slotRef(rel, pol.slotOf(mf.sub(rel, @intCast(e))).?);
             o.* = (@as(u32, @backingInt(ref.bank)) << 24) | ref.row;
@@ -1713,7 +1713,7 @@ test "mimo hitpass: residentLut stays the policy's map under a scripted admit/ev
     try ss.grow(&rows);
     try testing.expect(ss.decoding());
     var lut: [3][64]u32 = undefined;
-    for (0..3) |l| ss.residentLut(@intCast(l), &lut[l]);
+    for (0..3) |l| ss.residentLut(@intCast(l), &lut[l], 0);
     // The dense layer has no policy: every expert reads base row 0 and is never joined.
     try testing.expectEqualSlices(u32, &@as([64]u32, @splat(0)), &lut[0]);
     // A scripted sequence over 4-row layers: repeats (hits), new experts (admits), and evictions of the oldest.
@@ -1732,14 +1732,14 @@ test "mimo hitpass: residentLut stays the policy's map under a scripted admit/ev
         const before = lut[layer];
         try expectLutIsPolicy(&ss, layer, &before);
         try hitRoute(&ss, layer, &ids);
-        ss.residentLut(layer, &lut[layer]);
+        ss.residentLut(layer, &lut[layer], 0);
         try expectLutIsPolicy(&ss, layer, &lut[layer]);
         changed += @intFromBool(!std.mem.eql(u32, &before, &lut[layer]));
     };
     // The policy moved (admits and evictions), and the LUT moved with it on every route that changed residency.
     try testing.expect(changed >= 8);
     // The dense layer is untouched by routed traffic.
-    ss.residentLut(0, &lut[0]);
+    ss.residentLut(0, &lut[0], 0);
     try testing.expectEqualSlices(u32, &@as([64]u32, @splat(0)), &lut[0]);
 }
 
@@ -1754,7 +1754,7 @@ test "mimo hitpass: the hit/miss split on synthetic ids: every hit's LUT entry (
     var ss = StreamSource.init(f.stream);
     try ss.grow(&rows);
     var lut: [3][64]u32 = undefined;
-    for (0..3) |l| ss.residentLut(@intCast(l), &lut[l]);
+    for (0..3) |l| ss.residentLut(@intCast(l), &lut[l], 0);
     var rng = std.Random.DefaultPrng.init(20261008);
     var n_hits: usize = 0;
     var n_misses: usize = 0;
@@ -1799,7 +1799,7 @@ test "mimo hitpass: the hit/miss split on synthetic ids: every hit's LUT entry (
         ss.release(call);
         try ss.flush();
         var after: [64]u32 = undefined;
-        ss.residentLut(layer, &after);
+        ss.residentLut(layer, &after, 0);
         if (n_ids == 16) wide_stale += @intFromBool(!std.mem.eql(u32, &after, &lut[layer]));
         lut[layer] = after;
     }
@@ -1811,6 +1811,9 @@ test "mimo hitpass: the hit/miss split on synthetic ids: every hit's LUT entry (
 /// The scheduler's math on the trace backend: MiMo's projection type, the banked waves' shapes only.
 const HitTraceMath = struct {
     pub const has_banked = true;
+    pub fn devrouteMissingId(_: *const HitTraceMath) u32 {
+        return @import("math.zig").Math.devroute_missing_id;
+    }
     pub const decode_forward_rows: u32 = 1;
     pub fn Projection(comptime A: type) type {
         return sdk_ext.quant.GatherQmm.Arrays(A);
@@ -1893,7 +1896,7 @@ fn hitInstallRun(a: std.mem.Allocator, hitpass: bool, pre: *[4]usize) !void {
                 try @import("source.zig").lutAfterRoute(&ex, &g, 1);
                 try testing.expect(ex.dev_parity[1] != p0);
                 var want: [64]u32 = undefined;
-                ss.residentLut(1, &want);
+                ss.residentLut(1, &want, ex.math.devrouteMissingId());
                 try testing.expectEqualSlices(u32, &want, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[1][ex.dev_parity[1]])))));
             }
         }
@@ -1911,7 +1914,7 @@ fn hitInstallRun(a: std.mem.Allocator, hitpass: bool, pre: *[4]usize) !void {
         if (hitpass) {
             try testing.expect(ex.dev_parity[1] != p0);
             var want: [64]u32 = undefined;
-            ss.residentLut(1, &want);
+            ss.residentLut(1, &want, ex.math.devrouteMissingId());
             try testing.expectEqualSlices(u32, &want, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[1][ex.dev_parity[1]])))));
         }
     }

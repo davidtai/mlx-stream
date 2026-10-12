@@ -979,3 +979,27 @@ test "dsv41 policy: compact decode replaces cold prefill residents and retains c
     try testing.expectEqual(@as(u32, 2), plan.n_hits);
     try testing.expectEqual(@as(u32, 0), plan.n_loads);
 }
+
+test "dsv41 policy: compact fitting preserves upstream tally pins and prefill eviction eligibility" {
+    const needs = [_][3]u32{ .{ 3, 3, 3 }, .{ 4, 4, 4 }, .{ 3, 3, 3 }, .{ 4, 4, 4 } };
+    var p = try LayerPolicy.init(testing.allocator, needs.len, 2);
+    defer p.deinit(testing.allocator);
+    p.needs = &needs;
+    p.capacities = needs[0..2];
+    p.setTally(1, tally.alphaOf(32));
+    p.seedTally(&.{ 1, 0, 0, 0 });
+    var plan: Plan = .{};
+    p.plan(&.{ 0, 1 }, .prefill, &plan);
+    p.plan(&.{3}, .prefill, &plan);
+    try testing.expectEqual(@as(u32, 0), plan.n_persistent);
+    try testing.expectEqual(@as(?u32, 0), p.slotOf(0));
+    try testing.expectEqual(@as(?u32, 1), p.slotOf(1));
+    p.plan(&.{ 0, 3 }, .decode, &plan);
+    try testing.expectEqual(@as(?u32, 0), p.slotOf(0));
+    try testing.expectEqual(@as(?u32, 1), p.slotOf(3));
+    try testing.expectEqual(@as(u32, 1), plan.n_evictions);
+    try testing.expectEqual(@as(u16, 1), plan.evictions[0].previous);
+    var shares: [4]f32 = undefined;
+    try testing.expect(p.endRequest(&shares));
+    try testing.expectEqualSlices(f32, &.{ 1, 0, 0, 1 }, &shares);
+}

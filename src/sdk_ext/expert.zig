@@ -264,6 +264,8 @@ pub fn assertSource(comptime S: type) void {
 ///   `logical_bytes` (a record's bytes); `mlxDtype(dtype) mlx_dtype` (a slot array's dtype);
 /// - `Bank`: fields `layers: []Layer` (the arch's routed layers), `n_experts`, `sidecar: UncachedFd`; methods
 ///   `recordOffset(*const Bank, layer, expert) u64` and `spans(*const Bank, layer, expert)` (`.gu_offset`, `.down_offset`);
+///   compact banks additionally supply `isCompact` and `recordGeometry(*const Bank, layer, expert)`; stock banks use
+///   `layers[layer]` for record geometry without implementing the compact capability;
 /// - `BankArrays` and `bankArraysOf([n_components]mlx_array) BankArrays`: the slot arrays as the bank's quant binds them;
 /// - `routed_top_k`: the arch's routed experts per token (the lookahead selector's per-row threshold rank).
 /// The stream allocates the slot rows, plans routes, reads, gates and releases; the arch keeps the MoE math.
@@ -280,8 +282,10 @@ pub fn assertBank(comptime B: type) void {
         for ([_][]const u8{ "layers", "n_experts", "sidecar" }) |f|
             if (!@hasField(B.Bank, f)) @compileError(where ++ "Bank has no " ++ f);
         if (@FieldType(B.Bank, "sidecar") != io.UncachedFd) @compileError(where ++ "Bank.sidecar is not an UncachedFd");
-        for ([_][]const u8{ "recordOffset", "recordGeometry", "spans" }) |m|
+        for ([_][]const u8{ "recordOffset", "spans" }) |m|
             if (!@hasDecl(B.Bank, m)) @compileError(where ++ "Bank has no " ++ m);
+        if (@hasDecl(B.Bank, "isCompact") and !@hasDecl(B.Bank, "recordGeometry"))
+            @compileError(where ++ "compact Bank has no recordGeometry");
     }
 }
 

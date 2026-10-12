@@ -48,6 +48,10 @@ by each component's maximum. Enlarged page-rounded preread buffers are charged s
 Tight K3 keeps its existing kernels; K2/K4 and padded/mixed banks use direct decode and tiled prefill, not full
 BF16 expert materialization.
 
+Routes are bound once per layer from accepted rates and physical storage geometry. Installed fused-down
+routes do not fall back to chained launches. Uniform banks retain the stock stream priority, window,
+held-set and policy rules; geometry grouping and construction-sized ticket ranges apply only to mixed banks.
+
 For per-expert mixtures, `expert-manifest-v3.json` is self-contained (`format: "mtplx-expert-manifest-v3"`):
 `classes` describes each nine-segment record layout and its gate/up/down `projection_K`; `records` selects
 exactly one class, sidecar range, padded SHA256 and logical SHA256 for every layer/expert pair. Segment shapes,
@@ -61,6 +65,11 @@ Only settled slots enter the device lookup table; the missing-slot sentinel is d
 Compact decode selects each expert's bit width once and shares packed-weight decoding across up to three rows
 that select the same expert. Direct and three-bank GEMVs use two-tile loop unrolling without changing F32
 accumulation or reduction order or adding kernel launches. Fixed-layout K3 and prefill kernels are unchanged.
+
+The six prior microbenchmark wins are kept as revalidation artifacts, not installed engine wins. The repair
+baseline contains their reverted texts. Their previous combined engine gain was 0.16%, below the promotion gate;
+only a rebased candidate passing actual served acceptance may be adopted.
+The `mul1h_rate` header composes the unchanged stock K3 header with a separately hash-pinned addendum.
 
 | Published source | Expert contract | Status |
 |---|---|---|
@@ -102,14 +111,17 @@ zig build serve -Dmlx-serve=../mlx-serve        # the host's ReleaseFast server 
 
 From the host checkout the suites are `zig build mlx-stream-test` (part of `zig build test`) and
 `zig build mlx-stream-conformance`.
-The standalone build defaults to ReleaseFast and forwards `-Doptimize` to the host. The SDK's owned, bounded
-row-cost table is tested separately because Zig does not collect tests through a foreign module import.
+The standalone build defaults to ReleaseSafe. Tests and conformance retain Debug or ReleaseSafe checks
+even when `-Doptimize=ReleaseFast` is requested for the native benchmark; `serve` builds ReleaseFast.
+The SDK memory-bill tests run separately because Zig does not collect tests through a foreign module import.
+Compact phase tables, owned callback backing, coupled fill and admission belong to the DeepSeek architecture;
+the shared SDK memory-bill API is unchanged.
 
 `scripts/test_dsv41.sh` runs every `dsv41 ` test of the plugin and the host on the CPU, and adds the bank tests when
 `DSV41_BANK` is set. MiMo-V2.6-Flash's tests run through a filter, and its bill tool reads a prepared pack's headers
 (no payload) and prints every bill term and the rows it admits per context:
-Bank header checks are independent of shard grouping. Optional `DSV41_M0_FIXTURE` checks compare tensor dtypes,
-shapes and payload hashes, not filenames or offsets; the fixture must match the checkpoint's tensor bytes.
+The original 3.0-bank regression pins 49 shards. Optional `DSV41_M0_FIXTURE` checks compare tensor dtypes,
+shapes, payload hashes, shard filenames and byte offsets against the matching checkpoint fixture.
 The real-bank EXL3 admission test checks the manifest against the runtime decoder contract without loading the model.
 
 ```sh
@@ -227,7 +239,7 @@ if GPU testing is requested but their required assets are missing.
 
 ### Quant correctness checks
 
-Run the host's `mlx-stream-test` and `mlx-stream-conformance` targets with `-Doptimize=ReleaseFast` and
+Run the host's `mlx-stream-test` and `mlx-stream-conformance` targets with `-Doptimize=safe` or `debug` and
 `-Dmlx-stream-dir=/path/to/checkout`. Inline regressions cover malformed manifests, logical/physical strides,
 nonzero cache slots across growth/shrink/reuse, compact class capacities, owned bills, source identity, and actual preread/scatter.
 
@@ -255,8 +267,9 @@ do not affect the result. The complete canonical fixture must match SHA256
 are refused. The GPU gate retains this exact identity check. The extraction tests skip without their fixture
 environment variable; an explicitly missing or mismatched fixture fails.
 
-The real-bank weight regression checks logical tensor schemas, counts and reference payload hashes, not shard
-count, shard names or byte offsets, so a lossless change of container layout does not invalidate its evidence.
+The original real-bank weight regression pins shard count, shard filenames and byte offsets in addition to
+logical tensor schemas and reference payload hashes. Public Spark/Jay expert gates authenticate the actual
+loaded source and inner/public reference payload bytes before oracle reconstruction or device setup.
 
 For the manifest's compile and numerical probes, build with `-Dtest-filter="dsv41 pre-ship gate:"` and run the
 standalone binary with `DSV41_SELFCHECK_DEVICE=1`. This includes integer-rate and compact kernels, not just K3 construction.

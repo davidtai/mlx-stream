@@ -105,7 +105,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .max_source_record_bytes = 0,
                 };
                 for (layers) |*l| {
-                    out.persistent_row_bytes += rowBytes(l);
+                    out.persistent_row_bytes += StorageGeometry.rowBytes(l);
                     out.max_source_record_bytes = @max(out.max_source_record_bytes, spanOf(l));
                     out.transient.minis = @max(out.transient.minis, minisOf(l));
                     for (l.segments, &out.transient.segments) |s, *cap| {
@@ -113,7 +113,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         if (s.length > cap.length) cap.* = s;
                     }
                 }
-                out.transient_row_bytes = rowBytes(&out.transient);
+                out.transient_row_bytes = StorageGeometry.rowBytes(&out.transient);
                 return out;
             }
 
@@ -148,7 +148,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     for (sizes) |size| total = try std.math.add(u64, total, metalBytes(size));
                     return total;
                 };
-                return std.math.mul(u64, rowBytes(geometry), rows);
+                return std.math.mul(u64, StorageGeometry.rowBytes(geometry), rows);
             }
 
             pub fn metalBytes(bytes: u64) u64 {
@@ -188,7 +188,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         fn mixedBank(bank: *const B.Bank) bool {
             if (comptime @hasField(Layer, "projection_k")) {
                 for (bank.layers) |l| {
-                    for (l.projection_k[1..]) |k| if (k != l.projection_k[0]) return true;
+                    for (l.projection_k) |k| if (k != bank.layers[0].projection_k[0]) return true;
                 }
             }
             if (comptime @hasDecl(B.Bank, "isCompact")) return bank.isCompact();
@@ -777,6 +777,16 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             return std.mem.alignForward(u64, widest, page) + page;
         }
 
+        /// Uniform banks retain the upstream ring. Mixed banks own disjoint demand-route intervals and a seed suffix:
+        /// completed but unsettled results cannot be overwritten by newer routes or read-ahead.
+        pub fn minimumTickets(bank: *const B.Bank, opt: Options) u64 {
+            if (!mixedBank(bank)) return 2 * expert_io.max_items;
+            var seed_rows: u64 = 0;
+            for (opt.rows) |rows| seed_rows = @max(seed_rows, rows);
+            if (opt.prompt_ahead == .whole_trim) seed_rows *= 2;
+            return @max(2 * expert_io.max_items, 2 * maxMinis(bank) * (route_capacity * @as(u64, opt.max_route_ids) + seed_rows));
+        }
+
         /// The contract's gates, counters and refusals (`sdk.expert`).
         pub const Gates = expert.Gates;
         pub const Stats = expert.Stats;
@@ -809,6 +819,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             reads: [max_route_ids]bool = undefined,
             n_parts: u32 = 0,
             parts: [max_route_ids]Part = undefined,
+            ticket_next: u32 = 0,
             state: enum { free, live, released } = .free,
             /// Its transient window (prefill routes beside a live one: `Options.wide_depth`).
             window: u8 = 0,
@@ -856,6 +867,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             allocator: std.mem.Allocator,
             bank: *const B.Bank,
             pool: *expert_io.Pool,
+            mixed: bool,
+            group_geometry: bool,
+            /// Zero on the stock ring; otherwise one fixed interval per route and a separate seed suffix.
+            ticket_stride: u32,
             layers: []LayerSlots,
             transient: Rows,
             transient_meta: []SlotMeta,
@@ -962,6 +977,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 /// Records [0, posted) have jobs; P7 overlap leaves [posted, n) to the call's plans (`p7Tail`); `whole_trim`
                 /// moves `posted` back over the jobs it withdraws at the plans (`p7Withdraw`).
                 posted: u32 = 0,
+                ticket_next: u32 = 0,
                 loads: []LayerPolicy.ReadAhead,
                 reads: []bool,
                 parts: []Part,
@@ -1024,6 +1040,16 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (opt.decode_route_ids > opt.max_route_ids) return error.InvalidOptions;
                 if (opt.max_route_ids == 0 or opt.max_route_ids > max_route_ids or opt.transient_rows < opt.max_route_ids or minis > max_minis or
                     opt.records_per_part == 0 or opt.records_per_part * minis > expert_io.max_items) return error.InvalidOptions;
+                const mixed = mixedBank(bank);
+                var group_geometry = mixed;
+                if (comptime @hasField(B.Bank, "expert_rates")) if (bank.expert_rates.len != 0) {
+                    group_geometry = false;
+                    const first = bank.expert_rates[0][0];
+                    for (bank.expert_rates) |rates| for (rates) |k| {
+                        if (k != first) group_geometry = true;
+                    };
+                };
+                if (opt.pool.tickets < minimumTickets(bank, opt)) return error.InvalidOptions;
                 // One transient row must hold any layer's record; per geometry, each of the two geometries has its scratch.
                 var widest: usize = 0;
                 for (bank.layers, 0..) |*l, i| if (spanOf(l) > spanOf(&bank.layers[widest])) {
@@ -1038,7 +1064,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         } else alt_layer = i;
                     } else {
                         if (minisOf(l) != minisOf(&bank.layers[widest])) return error.MixedGeometry;
-                        if (!mixedBank(bank)) for (l.segments, bank.layers[widest].segments) |sg, w| if (sg.length > w.length) return error.MixedGeometry;
+                        if (!mixed) for (l.segments, bank.layers[widest].segments) |sg, w| if (sg.length > w.length) return error.MixedGeometry;
                     }
                 }
                 var geometry = try StorageGeometry.initBank(bank);
@@ -1053,7 +1079,16 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const page = std.heap.pageSize();
                     const record = geometry.max_source_record_bytes;
                     pool_opt.spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
-                    if (la.preread) pool_opt.staging_bytes = @max(pool_opt.staging_bytes, try StorageGeometry.prereadStaging(bank, page));
+                    if (la.preread) {
+                        if (mixed) {
+                            pool_opt.staging_bytes = @max(pool_opt.staging_bytes, try StorageGeometry.prereadStaging(bank, page));
+                        } else for (bank.layers) |l| {
+                            var gu: u64 = 0;
+                            for (l.segments[0..gu_components]) |sg| gu += sg.length;
+                            if (l.segments[0].offset != 0 or l.segments[gu_components].offset != gu) return error.MixedGeometry;
+                            if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
+                        };
+                    }
                 }
                 var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
                 if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
@@ -1148,6 +1183,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .allocator = a,
                     .bank = bank,
                     .pool = pool,
+                    .mixed = mixed,
+                    .group_geometry = group_geometry,
+                    .ticket_stride = if (mixed) 2 * opt.max_route_ids * minis else 0,
                     .layers = layers,
                     .transient = transient,
                     .transient_meta = transient_meta,
@@ -1254,12 +1292,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// Tests: each routed id of `r` (`ids`, in plan order) is served from a slot whose rows hold its records'
             /// segments as `image` (the bank's experts.bin) holds them, each of the id's records at its stride.
             pub fn expectServed(self: *Stream, r: *const Route, ids: []const u16, image: []const u8) !void {
-                const l = &self.bank.layers[r.layer];
                 for (ids, r.plan.slotsOf()) |e, slot| {
+                    const l = recordGeometry(self.bank, r.layer, e);
                     const off = self.bank.recordOffset(r.layer, e);
                     for (l.segments, 0..) |seg, c| {
                         const row = self.slotRow(r.layer, slot, @enumFromInt(c));
-                        try std.testing.expectEqual(minisOf(l) * seg.length, row.len);
+                        if (self.mixed) {
+                            try std.testing.expect(minisOf(l) * seg.length <= row.len);
+                        } else try std.testing.expectEqual(minisOf(l) * seg.length, row.len);
                         for (0..minisOf(l)) |mi| try std.testing.expectEqualSlices(u8, image[off + mi * miniStride(l) + seg.offset ..][0..seg.length], row[mi * seg.length ..][0..seg.length]);
                     }
                 }
@@ -1314,12 +1354,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.held_layer = r.layer;
                 const cap = self.layers[r.layer].policy.capacity;
                 for (r.hit_slots[0..r.plan.n_hits]) |s| if (s < cap) {
-                    if (std.mem.indexOfScalar(u32, self.held_base.items, s) != null) continue;
+                    if (self.mixed and std.mem.indexOfScalar(u32, self.held_base.items, s) != null) continue;
                     try self.held_base.append(self.allocator, s);
                     self.locate(r.layer, s).meta.pins += 1;
                 };
                 for (r.plan.loadsOf()) |l| if (l.persistent) {
-                    if (std.mem.indexOfScalar(u32, self.held_base.items, l.slot) != null) continue;
+                    if (self.mixed and std.mem.indexOfScalar(u32, self.held_base.items, l.slot) != null) continue;
                     try self.held_base.append(self.allocator, l.slot);
                     self.locate(r.layer, l.slot).meta.pins += 1;
                 };
@@ -1353,18 +1393,24 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (items) |it| {
                     const src = self.locate(layer, it.from).meta;
                     if (it.from < p.capacity or src.state != .ready or src.layer != layer or src.expert != it.e) break;
-                    // A transient row of another geometry than the layer's rows (one scratch at the widest layer) is not
-                    // copied.
-                    const same = for (0..n_components) |c| {
-                        if (self.slotRow(layer, it.from, @enumFromInt(c)).len != ls.base.row_bytes[c]) break false;
-                    } else true;
-                    if (!same) break;
+                    const geom = recordGeometry(self.bank, layer, it.e);
+                    // Stock uniform banks keep their same-row promotion rule. Mixed banks copy only logical bytes;
+                    // admission checks destination capacity, leaving its unused compact tail untouched.
+                    if (!self.mixed) {
+                        const same = for (0..n_components) |c| {
+                            if (self.slotRow(layer, it.from, @enumFromInt(c)).len != ls.base.row_bytes[c]) break false;
+                        } else true;
+                        if (!same) break;
+                    }
                     copies.ensureUnusedCapacity(self.allocator, n_components) catch break;
                     const to = p.admitSeed(it.e, pinned.items) orelse break;
+                    const dst_loc = self.locate(layer, to);
+                    dst_loc.rows.publish(dst_loc.row, geom) catch unreachable;
                     for (0..n_components) |c| {
                         const dst = self.slotRow(layer, to, @enumFromInt(c));
-                        copies.appendAssumeCapacity(.{ .dst = dst, .src = self.slotRow(layer, it.from, @enumFromInt(c)) });
-                        bytes += dst.len;
+                        const len = if (self.mixed) geom.segments[c].length * minisOf(geom) else dst.len;
+                        copies.appendAssumeCapacity(.{ .dst = dst[0..len], .src = self.slotRow(layer, it.from, @enumFromInt(c))[0..len] });
+                        bytes += len;
                     }
                     // Not read before its copy lands: no later route of this call routes `it.e` again, and the call's end
                     // settles the copies.
@@ -1651,14 +1697,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.n_free == 0) return self.fail(error.RoutesExhausted);
                 self.n_free -= 1;
                 const r = &self.routes[self.free[self.n_free]];
-                // Only transient loads own a window. Persistent hit-only calls can
-                // remain live beside every window, but still hold their resident slots.
+                // Mixed persistent-only calls do not own a transient window. Stock
+                // streams retain their original wide-depth window and pin checks.
                 const held_set = &self.held_scratch;
                 held_set.clearRetainingCapacity();
                 var used_windows: u8 = 0;
-                for (&self.routes) |*o| {
+                if (self.mixed or self.wide_depth > 1) for (&self.routes) |*o| {
                     if (o.state == .free) continue;
-                    if (!mixedBank(self.bank) or o.plan.n_loads > o.plan.n_persistent)
+                    if (!self.mixed or o.plan.n_loads > o.plan.n_persistent)
                         used_windows |= @as(u8, 1) << @intCast(o.window);
                     if (o.layer != layer) continue;
                     for (o.hit_slots[0..o.plan.n_hits]) |hs| if (hs < self.layers[layer].policy.capacity) {
@@ -1667,15 +1713,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     for (o.plan.loadsOf()) |l| if (l.persistent) {
                         self.holdScratch(l.slot);
                     };
-                }
+                };
                 if (self.held_base.items.len > 0 and self.held_layer == layer)
                     for (self.held_base.items) |slot| self.holdScratch(slot);
                 const first_window: u8 = @intCast(@ctz(~used_windows));
-                if (!mixedBank(self.bank) and first_window >= self.wide_depth) return self.fail(error.RoutesExhausted);
+                if (!self.mixed and first_window >= self.wide_depth) return self.fail(error.RoutesExhausted);
                 const window = if (first_window < self.wide_depth) first_window else 0;
                 // The window's rows may still be a promotion's sources.
                 self.copier.waitFor(self.copier.window_seq[window]);
-                r.* = .{ .layer = layer, .window = window };
+                r.* = .{ .layer = layer, .window = window, .ticket_next = @as(u32, self.free[self.n_free]) * self.ticket_stride };
                 const ls = &self.layers[layer];
                 ls.policy.planWith(ids, self.phase, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held_set.items });
                 // A persistent load may take a row a promotion of this layer still writes.
@@ -1737,18 +1783,21 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             const RecordOrder = struct {
                 bank: *const B.Bank,
                 layer: u32,
+                mixed: bool = false,
 
                 fn same(order: RecordOrder, x: u16, y: u16) bool {
-                    for (order.bank.recordGeometry(order.layer, x).segments, order.bank.recordGeometry(order.layer, y).segments) |a, b| {
+                    for (recordGeometry(order.bank, order.layer, x).segments, recordGeometry(order.bank, order.layer, y).segments) |a, b| {
                         if (a.length != b.length or a.offset != b.offset) return false;
                     }
                     return true;
                 }
 
                 fn less(order: RecordOrder, x: u16, y: u16) bool {
-                    for (order.bank.recordGeometry(order.layer, x).segments, order.bank.recordGeometry(order.layer, y).segments) |a, b| {
-                        if (a.length != b.length) return a.length < b.length;
-                        if (a.offset != b.offset) return a.offset < b.offset;
+                    if (order.mixed) {
+                        for (recordGeometry(order.bank, order.layer, x).segments, recordGeometry(order.bank, order.layer, y).segments) |a, b| {
+                            if (a.length != b.length) return a.length < b.length;
+                            if (a.offset != b.offset) return a.offset < b.offset;
+                        }
                     }
                     return order.bank.recordOffset(order.layer, x) < order.bank.recordOffset(order.layer, y);
                 }
@@ -1758,8 +1807,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var experts: [expert_lookahead.max_candidates]u16 = undefined;
                 const misses = self.selector.?.certainMisses(ids, &self.layers[layer].policy, &experts);
                 if (misses.len == 0) return;
-                if (mixedBank(self.bank)) {
-                    const order: RecordOrder = .{ .bank = self.bank, .layer = layer };
+                if (self.group_geometry) {
+                    const order: RecordOrder = .{ .bank = self.bank, .layer = layer, .mixed = true };
                     std.sort.insertion(u16, experts[0..misses.len], order, RecordOrder.less);
                     var start: usize = 0;
                     while (start < misses.len) {
@@ -1837,8 +1886,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     _ = self.pool.specStep(self.bank.sidecar, r.tag, &.{}, 0) catch return self.fail(error.SpecRefused);
                     return;
                 }
-                const order: RecordOrder = .{ .bank = self.bank, .layer = next };
-                if (mixedBank(self.bank)) std.sort.insertion(u16, chosen[0..n], order, RecordOrder.less);
+                const order: RecordOrder = .{ .bank = self.bank, .layer = next, .mixed = self.group_geometry };
+                if (self.group_geometry) std.sort.insertion(u16, chosen[0..n], order, RecordOrder.less);
                 var start: usize = 0;
                 while (start < n) {
                     var end = start + 1;
@@ -1934,44 +1983,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return self.event_word;
             }
 
-            /// Tickets remain owned until reclamation; gates include C's queued
-            /// prefix and live calls that have not registered their gates yet.
-            fn reserveResources(self: *const Stream, needed: u32, needed_gates: u32) Error!u32 {
-                if (self.gated) {
-                    var gates = self.pool.liveGates() catch return error.GateRefused;
-                    for (&self.routes) |*route_| {
-                        if (route_.state != .free and route_.gates == null and route_.n_parts != 0)
-                            gates += 1 + route_.n_parts;
-                    }
-                    if (gates + needed_gates > expert_io.max_gates) return error.GatesFull;
-                }
-                if (needed == 0) return 0;
-                const Interval = struct { lo: u32, hi: u32 };
-                var ranges: [route_capacity]Interval = undefined;
-                var n_ranges: usize = 0;
-                for (&self.routes) |*route_| {
-                    if (route_.state == .free) continue;
-                    var range: Interval = .{ .lo = @intCast(self.pool.published.len), .hi = 0 };
-                    for (route_.partsOf()) |part| if (part.n_reads != 0) {
-                        range.lo = @min(range.lo, part.ticket);
-                        range.hi = @max(range.hi, part.ticket + 2 * part.n_reads);
-                    };
-                    if (range.hi == 0) continue;
-                    ranges[n_ranges] = range;
-                    n_ranges += 1;
-                }
-                var first: u32 = 0;
-                while (@as(u64, first) + needed <= self.pool.published.len) {
-                    var next = first;
-                    for (ranges[0..n_ranges]) |range| {
-                        if (first < range.hi and range.lo < first + needed)
-                            next = @max(next, range.hi);
-                    }
-                    if (next == first) return first;
-                    first = next;
-                }
-                return error.RoutesExhausted;
-            }
 
             /// Loads in file order, cut into parts (decode: the bounded parts of
             /// `records_per_part`; prefill: `max_items` chunks), one pool submit per part.
@@ -1988,7 +1999,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         return order.records.less(order.plan.loads[a].expert, order.plan.loads[b].expert);
                     }
                 };
-                const order: RecordOrder = .{ .bank = bank, .layer = r.layer };
+                const order: RecordOrder = .{ .bank = bank, .layer = r.layer, .mixed = self.group_geometry };
                 std.sort.insertion(u8, r.order[0..n], Order{ .records = order, .plan = plan }, Order.less);
                 var offsets: [max_route_ids]u64 = undefined;
                 var lengths: [max_route_ids]u64 = undefined;
@@ -2020,22 +2031,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     group_start = group_end;
                 }
                 const ends = ends_buf[0..n_ends];
-                var tickets: u32 = 0;
-                for (r.reads[0..n]) |read_| tickets += 2 * @as(u32, @intFromBool(read_));
-                const first_ticket = self.reserveResources(tickets, @intCast(n_ends + 1)) catch |err| {
-                    // No IO was posted: undo this call's pins and new admissions.
-                    for (r.hit_slots[0..plan.n_hits]) |slot| self.locate(r.layer, slot).meta.pins -= 1;
-                    for (plan.loadsOf(), r.reads[0..n]) |load, read_| {
-                        const meta = self.locate(r.layer, load.slot).meta;
-                        meta.pins -= 1;
-                        if (read_) meta.state = .empty;
-                        if (load.persistent) self.layers[r.layer].policy.invalidate(load.expert);
-                    }
-                    r.* = .{};
-                    self.n_free += 1;
-                    return self.fail(err);
-                };
-                self.pool.next_ticket = first_ticket;
                 var start: u32 = 0;
                 for (ends) |end| {
                     var part: Part = .{ .first = start, .n = end - start };
@@ -2050,14 +2045,20 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     }
                     if (nr > 0) {
                         const lens = lengthsOf(recordGeometry(bank, r.layer, plan.loads[r.order[start]].expert));
-                        part.ticket = B.Records.submit(self.pool, bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &lens) catch |e| return self.fail(e);
-                        std.debug.assert(self.pool.next_ticket <= first_ticket + tickets);
+                        part.ticket = try self.submitRoute(r, gu[0..nr], down[0..nr], rows[0..nr], &lens);
                         part.n_reads = nr;
                     } else part.settled = true;
                     r.parts[r.n_parts] = part;
                     r.n_parts += 1;
                     start = end;
                 }
+            }
+
+            fn submitRoute(self: *Stream, r: *Route, gu: []const u64, down: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64) Error!u32 {
+                if (!self.mixed) return B.Records.submit(self.pool, self.bank.sidecar, gu, down, rows, lens) catch |e| return self.fail(e);
+                const ri: u32 = @intCast((@intFromPtr(r) - @intFromPtr(&self.routes[0])) / @sizeOf(Route));
+                const lo = ri * self.ticket_stride;
+                return B.Records.submitRange(self.pool, lo, lo + self.ticket_stride, &r.ticket_next, self.bank.sidecar, gu, down, rows, lens) catch |e| return self.fail(e);
             }
 
             /// Load (`slot`, `e`)'s read entries from index `at`, one per record of the id (its records adjacent in the file
@@ -2147,17 +2148,17 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn readAheadSeed(self: *Stream, layer: u32, experts: []const u16) !void {
                 if (self.failed) return error.StreamFailed;
                 if (self.phase != .prefill) return error.NotPrefill;
-                // Empty-only admission cannot overwrite live hits or held base rows;
-                // an owned reader ticket still forbids resetting the seed cursor.
-                for (&self.routes) |*route_| {
+                // Uniform banks keep the stock cursor and scheduling contract. Settled live routes no longer own
+                // unread results; mixed banks' seed suffix is independent even while demand reads remain unsettled.
+                if (!self.mixed) for (&self.routes) |*route_| {
                     if (route_.state == .free) continue;
-                    for (route_.partsOf()) |part| if (part.n_reads != 0) return error.RoutesLive;
-                }
+                    for (route_.partsOf()) |part| if (part.n_reads != 0 and !part.settled) return error.RoutesLive;
+                };
                 if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
                 const ah = &self.ahead;
                 const mn = minisOf(&self.bank.layers[layer]);
                 // The ticket ring's room in records (each record's minis take a gate/up and a down ticket apiece).
-                const fit = @min(ah.loads.len, self.ahead_cap orelse (self.pool.published.len - 2 * expert_io.max_items) / (2 * mn));
+                const fit = @min(ah.loads.len, self.ahead_cap orelse if (self.mixed) self.layers[layer].policy.capacity else (self.pool.published.len - 2 * expert_io.max_items) / (2 * mn));
                 const admitted = self.layers[layer].policy.admitReadAhead(experts, ah.loads[0..fit]);
                 if (comptime read_ahead_probed) if (self.probe) |pr| {
                     // The predicted seed: the ranking's top as many as the layer's unprotected rows (the seed's rule); blocked:
@@ -2170,11 +2171,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     pr.admission(layer, top, @intCast(admitted.len), blocked);
                 };
                 const n: u32 = @intCast(admitted.len);
-                ah.* = .{ .layer = layer, .n = n, .loads = ah.loads, .reads = ah.reads, .parts = ah.parts, .landed = ah.landed };
+                ah.* = .{ .layer = layer, .n = n, .loads = ah.loads, .reads = ah.reads, .parts = ah.parts, .landed = ah.landed, .ticket_next = route_capacity * self.ticket_stride };
                 if (n == 0) return;
                 const now: u32 = switch (self.prompt_reads) {
                     .stock => blk: {
-                        const order: RecordOrder = .{ .bank = self.bank, .layer = layer };
+                        const order: RecordOrder = .{ .bank = self.bank, .layer = layer, .mixed = self.group_geometry };
                         std.sort.pdq(LayerPolicy.ReadAhead, admitted, order, struct {
                             fn less(o: RecordOrder, x: LayerPolicy.ReadAhead, y: LayerPolicy.ReadAhead) bool {
                                 return o.less(x.expert, y.expert);
@@ -2226,7 +2227,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         posted += 1;
                     }
                     if (nr > 0) {
-                        part.ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &lens) catch |e| return self.fail(e);
+                        part.ticket = if (self.mixed)
+                            B.Records.submitRange(self.pool, route_capacity * self.ticket_stride, self.pool.demand_tickets, &ah.ticket_next, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &lens) catch |e| return self.fail(e)
+                        else
+                            B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &lens) catch |e| return self.fail(e);
                         part.n_reads = nr;
                         self.counters.ahead_posted += posted;
                         if (comptime read_ahead_probed) if (self.probe) |pr| pr.posted(layer, posted);
@@ -2350,7 +2354,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     self.n_free -= 1;
                     const ri = self.free[self.n_free];
                     const r = &self.routes[ri];
-                    r.* = .{ .layer = layer, .window = window, .state = .live };
+                    r.* = .{ .layer = layer, .window = window, .state = .live, .ticket_next = @as(u32, ri) * self.ticket_stride };
                     p.route[g] = ri;
                     p.window[g] = window;
                     ls.policy.planWith(self.p7Group(g), .prefill, &r.plan, .{ .transient_base = @as(u32, window) * self.max_route_ids, .held = held.items });
@@ -2508,11 +2512,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (plan.loadsOf()) |l| self.p7_rows[self.p7Index(layer, l.slot)].reader = @intCast(g);
                 const n = plan.n_loads;
                 for (r.order[0..n], 0..) |*o, i| o.* = @intCast(i);
-                const Ctx = struct { plan: *const Plan, key: *const [max_route_ids]i8, ra: *const [max_route_ids]u64 };
-                std.sort.insertion(u8, r.order[0..n], Ctx{ .plan = plan, .key = &key, .ra = &ra }, struct {
+                const order: RecordOrder = .{ .bank = self.bank, .layer = layer, .mixed = self.group_geometry };
+                const Ctx = struct { plan: *const Plan, key: *const [max_route_ids]i8, ra: *const [max_route_ids]u64, records: RecordOrder };
+                std.sort.insertion(u8, r.order[0..n], Ctx{ .plan = plan, .key = &key, .ra = &ra, .records = order }, struct {
                     fn less(c: Ctx, a: u8, b: u8) bool {
                         if (c.key[a] != c.key[b]) return c.key[a] < c.key[b];
                         if ((c.ra[a] != 0) != (c.ra[b] != 0)) return c.ra[a] == 0;
+                        if (c.records.mixed) return c.records.less(c.plan.loads[a].expert, c.plan.loads[b].expert);
                         return c.plan.loads[a].expert < c.plan.loads[b].expert;
                     }
                 }.less);
@@ -2522,7 +2528,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const k0 = key[r.order[start]];
                     const b0 = ra[r.order[start]] != 0;
                     var end = start + 1;
-                    while (end < n and end - start < expert_io.max_items and key[r.order[end]] == k0 and (ra[r.order[end]] != 0) == b0) end += 1;
+                    while (end < n and end - start < expert_io.max_items / minisOf(&self.bank.layers[layer]) and key[r.order[end]] == k0 and
+                        (ra[r.order[end]] != 0) == b0 and order.same(plan.loads[r.order[start]].expert, plan.loads[r.order[end]].expert)) end += 1;
                     var m: u64 = 0;
                     for (r.order[start..end]) |li| m |= ra[li];
                     r.parts[r.n_parts] = .{ .first = start, .n = end - start };
@@ -2580,7 +2587,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             fn p7Submit(self: *Stream, r: *Route, pi: u32) Error!void {
                 const plan = &r.plan;
                 const part = &r.parts[pi];
-                const ls = &self.layers[r.layer];
                 var rows: [expert_io.max_items][n_components]u64 = undefined;
                 var gu: [expert_io.max_items]u64 = undefined;
                 var down: [expert_io.max_items]u64 = undefined;
@@ -2592,16 +2598,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (m.pins != 0 or m.state == .loading) return self.fail(error.SlotStillPinned);
                     if (r.reads[li]) {
                         m.* = .{ .state = .loading, .layer = @intCast(r.layer), .expert = l.expert };
-                        rows[nr] = loc.rows.rowDest(loc.row);
-                        const sp = self.bank.spans(r.layer, l.expert);
-                        gu[nr] = sp.gu_offset;
-                        down[nr] = sp.down_offset;
-                        nr += 1;
+                        loc.rows.publish(loc.row, recordGeometry(self.bank, r.layer, l.expert)) catch return self.fail(error.SlotStillPinned);
+                        nr = self.entries(r.layer, l.slot, l.expert, &rows, &gu, &down, nr);
                     }
                     m.pins = 1;
                 }
                 if (nr > 0) {
-                    part.ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &ls.lens) catch |e| return self.fail(e);
+                    const lens = lengthsOf(recordGeometry(self.bank, r.layer, plan.loads[r.order[part.first]].expert));
+                    part.ticket = try self.submitRoute(r, gu[0..nr], down[0..nr], rows[0..nr], &lens);
                     part.n_reads = nr;
                 } else part.settled = true;
             }
@@ -2837,7 +2841,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const n0 = self.decode_route_ids + decode_staging_rows;
                     const geoms = [2]?u32{ self.transient_layer, if (self.alt) |x| x.layer else null };
                     for (geoms, [2]*?Rows{ &window0, &alt0 }, [2]*[]SlotMeta{ &meta0, &alt_meta0 }) |gl, w, m| {
-                        const geom = if (gl.? == self.transient_layer) &self.geometry.transient else &RowGeometry{ .segments = self.bank.layers[gl.?].segments, .minis = minisOf(&self.bank.layers[gl.?]) };
+                        const layer = gl orelse continue;
+                        const geom = if (layer == self.transient_layer) &self.geometry.transient else &RowGeometry{ .segments = self.bank.layers[layer].segments, .minis = minisOf(&self.bank.layers[layer]) };
                         w.* = switch (self.grow_fill) {
                             .zeros => try Rows.init(geom, n0, self.memory),
                             .unfilled => try Rows.initUnfilled(geom, n0, self.memory),

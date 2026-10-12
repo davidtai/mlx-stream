@@ -412,7 +412,9 @@ pub const FakeSource = struct {
         if (@TypeOf(g.*) != ops.TraceOps) @compileError("FakeSource binds trace arrays only");
         const rows = self.bankRows(layer, kind);
         if (rows == 0) return null;
-        return try traceBank(g, &self.geom, rows);
+        var arrays = try traceBank(g, &self.geom, rows);
+        inline for (.{ "gate", "up", "down" }) |name| @field(arrays, name).layer = layer;
+        return arrays;
     }
 
     /// Calls that are neither free nor released (tests).
@@ -430,8 +432,8 @@ const t128_scale: f32 = @bitCast(@as(u32, 0x3db504f3));
 
 /// The stock tier's routed-expert math, `exl3_lane.Exl3PackedOps` op for op:
 /// per projection `t128(gemv(t128(x * rin[slot])) ) * rout[slot]` (f32), the
-/// clamped SwiGLU between gate/up and down. `Gemv.project(g, proj, xh, ids,
-/// code, layout)` is the EXL3 decode GEMV (`z = xh @ W_hat[slot]` in the trellis domain,
+/// clamped SwiGLU between gate/up and down. `Gemv.project(binding, g, proj, xh,
+/// ids, code, layout)` is the EXL3 decode GEMV (`z = xh @ W_hat[slot]` in the trellis domain,
 /// f32 [rows, out]): the accepted EXL3 quant's (`*const exl3_quant.Gemv(G)`).
 /// The parity harnesses' math (the stock path reads f32 routed rows).
 pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
@@ -461,7 +463,11 @@ pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
         fn project(self: *const Self, g: *G, x: T, ids: T, p: ProjOf(T), proj: xq.Proj) !T {
             const rin = try g.astype(try g.take(p.rin, ids, 0), .float32);
             const xh = try t128(g, try g.mul(try g.astype(x, .float32), rin));
-            const z = try self.gemv.project(g, proj, xh, ids, p.code, p.layout);
+            const Provider = if (@typeInfo(Gemv) == .pointer) @typeInfo(Gemv).pointer.child else Gemv;
+            const z = if (comptime @hasDecl(Provider, "bindStorage")) blk: {
+                const binding = self.gemv.bindStorage(@splat(p.layout));
+                break :blk try self.gemv.project(&binding, g, proj, xh, ids, p.code, p.layout);
+            } else try self.gemv.project(g, proj, xh, ids, p.code, p.layout);
             const rout = try g.astype(try g.take(p.rout, ids, 0), .float32);
             return g.mul(try t128(g, z), rout);
         }
@@ -811,8 +817,8 @@ fn Exl3EventProjection(comptime T: type) type {
         pub fn inputs(p: ProjOf(T)) [count]T {
             return .{ p.code, p.rout, p.rin };
         }
-        pub fn fromWaited(out: [count]T) ProjOf(T) {
-            return .{ .code = out[0], .rout = out[1], .rin = out[2] };
+        pub fn fromWaited(p: ProjOf(T), out: [count]T) ProjOf(T) {
+            return .{ .code = out[0], .rout = out[1], .rin = out[2], .layout = p.layout, .layer = p.layer, .route_index = p.route_index };
         }
     };
 }
@@ -1107,14 +1113,23 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 .compact => |descriptor| {
                     var out: [4]T = undefined;
                     try self.eventWait(g, &.{ p.code, p.rout, p.rin, descriptor }, value, deps, &out);
-                    return .{ .code = out[0], .rout = out[1], .rin = out[2], .layout = .{ .compact = out[3] } };
+                    return .{ .code = out[0], .rout = out[1], .rin = out[2], .layout = .{ .compact = out[3] }, .layer = p.layer, .route_index = p.route_index };
                 },
                 .fixed => {},
             };
             const xs = EventProjection.inputs(p);
             var outs: [EventProjection.count]T = undefined;
             try self.eventWait(g, &xs, value, deps, &outs);
-            return EventProjection.fromWaited(outs);
+            var waited = if (comptime @hasDecl(M, "EventProjection"))
+                EventProjection.fromWaited(outs)
+            else
+                EventProjection.fromWaited(p, outs);
+            if (comptime !@hasDecl(M, "Projection")) {
+                waited.layout = p.layout;
+                waited.layer = p.layer;
+                waited.route_index = p.route_index;
+            }
+            return waited;
         }
 
         pub fn deinit(self: *Self) void {
@@ -1128,8 +1143,18 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
         /// A bank with rows must have arrays the math can bind (MLX slot memory).
         fn bind(g: *G, source: *S, layer: u32, kind: BankKind) !?Arrays {
-            const arrays = try source.bankArrays(g, layer, kind);
+            var arrays = try source.bankArrays(g, layer, kind);
             if (arrays == null and source.bankRows(layer, kind) > 0) return error.SlotArraysUnbound;
+            if (comptime !@hasDecl(M, "Projection")) if (arrays) |*bank| {
+                inline for (.{ "gate", "up", "down" }) |name| {
+                    const p = &@field(bank, name);
+                    p.layer = layer;
+                    p.route_index = switch (p.layout) {
+                        .compact => 0,
+                        .fixed => @intCast(@divExact(g.shapeOf(p.code).d[3], 16) - 2),
+                    };
+                }
+            };
             return arrays;
         }
 
@@ -1236,8 +1261,6 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             /// P1: the layer's predicted seed, experts hottest first, read ahead of its routed call.
             pub fn readAheadSeed(h: Hook, experts: []const u16) !void {
                 if (comptime !@hasDecl(S, "readAheadSeed")) return error.ReadAheadNotStreamed;
-                // The predictor evaluated every carried chunk before this boundary.
-                try h.ex.flush();
                 return h.ex.source.readAheadSeed(h.layer, experts);
             }
         };
@@ -1996,6 +2019,28 @@ test "dsv41 experts: the fake and the stream adapter are expert sources" {
     try testing.expectEqual(@as(usize, expert_stream.max_wide_depth + 1), StreamSource.n_routes);
 }
 
+test "dsv41 experts: a layer seed leaves deferred stock routes owned until the normal flush" {
+    const a = testing.allocator;
+    const c = testConfig(256, 128, 2);
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Ex = Experts(TraceOps, FakeSource, Chain);
+    var ex = try Ex.init(a, &g, &src, Chain.init(.{}, &c), &c);
+    defer ex.deinit();
+    const previous = try src.route(0, &.{1}, &.{});
+    src.release(previous);
+    src.log.clearRetainingCapacity();
+    try ex.at(1).readAheadSeed(&.{ 3, 2 });
+    try testing.expect(previous.state == .released);
+    try testing.expectEqualSlices(u16, &.{ 3, 2 }, src.ahead_log.items);
+    for (src.log.items) |event| try testing.expect(event.kind != .flush);
+    try ex.flush();
+    try testing.expect(previous.state == .free);
+}
+
 test "dsv41 experts: a decode call runs the residents, then each part's gate/up after waitGu and its down after waitDown" {
     const a = testing.allocator;
     const c = testConfig(256, 128, 2); // widths an EXL3 bank has (t128 blocks of 128)
@@ -2197,7 +2242,7 @@ test "mimo sdk2 experts: event waits register the native MXFP4 pair and the EXL3
         const projection: ProjectionType(u32) = if (comptime WaitMath == NativeWaitMath)
             .{ .w = xs[0], .scales = xs[1], .biases = null }
         else
-            .{ .code = xs[0], .rout = xs[1], .rin = xs[2] };
+            .{ .code = xs[0], .rout = xs[1], .rin = xs[2], .layout = .{ .fixed = .{ .k = 4, .code_row_words = 512 } }, .layer = 7, .route_index = 2 };
         const deps = [_]u32{ try g.input(&.{1}, .float32), try g.input(&.{2}, .float32) };
         const mark = g.mark();
         const waited = try ex.waitProj(&g, projection, 17, &deps);
@@ -2206,6 +2251,11 @@ test "mimo sdk2 experts: event waits register the native MXFP4 pair and the EXL3
         else
             [_]u32{ waited.code, waited.rout, waited.rin };
         if (comptime WaitMath == NativeWaitMath) try testing.expect(waited.biases == null);
+        if (comptime WaitMath != NativeWaitMath) {
+            try testing.expectEqual(@as(u32, 7), waited.layer);
+            try testing.expectEqual(@as(u2, 2), waited.route_index);
+            try testing.expect(std.meta.eql(projection.layout, waited.layout));
+        }
         try testing.expectEqual(mark.n + xs.len, g.nodes.items.len);
         try testing.expectEqual(xs.len, g.waits.items.len);
         for (xs, aliases, 0..) |original, alias, i| {
@@ -2221,6 +2271,35 @@ test "mimo sdk2 experts: event waits register the native MXFP4 pair and the EXL3
         try testing.expectEqual(TraceOps.Freed{ .from = @intCast(mark.n), .to = @intCast(mark.n + xs.len) }, g.freed.items[0]);
         for (xs) |x| try testing.expect(x < mark.n);
     }
+}
+
+test "dsv41 experts: compact event aliases preserve construction routes and bind fake banks to their layer" {
+    const a = testing.allocator;
+    var source = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 1, 1 } });
+    defer source.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    const bank = (try source.bankArrays(&g, 1, .base)).?;
+    inline for (.{ "gate", "up", "down" }) |name| {
+        try testing.expectEqual(@as(u32, 1), @field(bank, name).layer);
+        try testing.expectEqual(@as(u2, 1), @field(bank, name).route_index);
+    }
+    const Ex = ExpertsWith(TraceOps, FakeSource, TraceMath, .{ .gated = true });
+    var ex: Ex = .{ .a = a, .source = &source, .math = .{ .hidden = 256, .inter = 128 }, .hidden = 256, .n_experts = 16, .banks = &.{}, .g = &g };
+    const p: ProjOf(u32) = .{
+        .code = try g.input(&.{ 2, 256 }, .int16),
+        .rout = try g.input(&.{ 2, 128 }, .float16),
+        .rin = try g.input(&.{ 2, 256 }, .float16),
+        .layout = .{ .compact = try g.input(&.{ 2, 2 }, .uint64) },
+        .layer = 7,
+        .route_index = 0,
+    };
+    const waited = try ex.waitProj(&g, p, 17, &.{});
+    try testing.expectEqual(@as(u32, 7), waited.layer);
+    try testing.expectEqual(@as(u2, 0), waited.route_index);
+    try testing.expect(waited.layout.compact != p.layout.compact);
+    try testing.expectEqual(@as(usize, 4), g.waits.items.len);
+    try testing.expectEqual(ops.Dtype.uint64, g.dtypeOf(waited.layout.compact));
 }
 
 /// A test-only profile hook proves the optional math hook receives the shared
@@ -2601,7 +2680,8 @@ test "dsv41 experts: the kernels' decode GEMV launches configs prepared on the m
         defer gemv.deinit(&g);
         try testing.expect(g.prepared_live > 0);
         // gate / up: xh f32 [rows, 5120] at slot rows ids, code i16 [cap, 320, 144, 48] -> [rows, 2304] f32
-        const z = try gemv.project(&g, .gate, try g.input(&.{ 6, 5120 }, .float32), try g.input(&.{6}, .uint32), try g.input(&.{ 64, 320, 144, 48 }, .int16), .{ .fixed = xq.tightLayout(3) });
+        const binding = gemv.bindStorage(@splat(.{ .fixed = xq.tightLayout(3) }));
+        const z = try gemv.project(&binding, &g, .gate, try g.input(&.{ 6, 5120 }, .float32), try g.input(&.{6}, .uint32), try g.input(&.{ 64, 320, 144, 48 }, .int16), .{ .fixed = xq.tightLayout(3) });
         try testing.expect(g.shapeOf(z).eql(ops.Shape.of(&.{ 6, 2304 })));
         try testing.expectEqual(@as(usize, 1), g.prepared_launches);
     }
@@ -3251,8 +3331,10 @@ test "dsv41 compact experts: descriptor-only evaluation waits for publication an
     const Ex = ExpertsWith(ops.MlxOps, StreamSource, QuantMath(ops.MlxOps, xq.Accepted(ops.MlxOps)), .{ .gated = true });
     var ex: Ex = undefined;
     ex.event = ev;
-    const waited = try ex.waitProj(&g, .{ .code = code, .rout = scale, .rin = scale, .layout = .{ .compact = descriptor } }, 7, &.{});
+    const waited = try ex.waitProj(&g, .{ .code = code, .rout = scale, .rin = scale, .layout = .{ .compact = descriptor }, .layer = 7, .route_index = 0 }, 7, &.{});
     try testing.expect(waited.layout.compact.ctx != descriptor.ctx);
+    try testing.expectEqual(@as(u32, 7), waited.layer);
+    try testing.expectEqual(@as(u2, 0), waited.route_index);
     const Publisher = struct {
         fn publish(bytes: []u8, event_word: *i64) void {
             std.Io.sleep(testing.io, .fromMilliseconds(30), .awake) catch {};
@@ -5096,6 +5178,9 @@ test "dsv41 compact experts: gated DEVROUTE second-call hit consumes the settled
     _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.CompactBankRequired);
     const a = testing.allocator;
+    var bank = try expert_bank.Bank.open(a, testing.io, dir, expert_bank.dsv41, null);
+    defer bank.deinit();
+    if (!bank.isCompact()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const G = ops.MlxOps;
     const ks = sdk_ext.kernels.KernelSet(xk);
@@ -5108,9 +5193,6 @@ test "dsv41 compact experts: gated DEVROUTE second-call hit consumes the settled
     defer set.deinit();
     set.install(G, &g);
     defer ks.Set.uninstall(G, &g);
-    var bank = try expert_bank.Bank.open(a, testing.io, dir, expert_bank.dsv41, null);
-    defer bank.deinit();
-    if (!bank.isCompact()) return error.CompactBankRequired;
     var peek = try expert_bank.peek(a, testing.io, dir, null);
     defer peek.deinit();
     var config = testConfig(@intCast(bank.hidden), @intCast(bank.inter), @intCast(bank.layers.len));

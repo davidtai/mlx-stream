@@ -269,7 +269,7 @@ pub const Bank = struct {
             if (try src.next() != .end_of_document) return error.ManifestSyntax;
             try bank.adoptV3(j, implemented, diag);
             bank.sidecar_path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, j.sidecar.?.file }, 0);
-            try bank.openSidecar(diag);
+            bank.sidecar = try bank_file.openSidecar(bank.sidecar_path, bank.sidecar_size, .at_least, diag);
             return bank;
         }
         var v2 = try parseV2(allocator, io, dir, diag);
@@ -327,7 +327,7 @@ pub const Bank = struct {
         if (j.classes.len == 0 or j.classes.len > 512) return error.LayerGeometry;
         if (j.records.len != d.n_layers * d.n_experts) return error.RecordCount;
         const sc = j.sidecar orelse return error.ManifestSyntax;
-        if (!plainName(sc.file) or sc.alignment != record_alignment or sc.size > std.math.maxInt(i64)) return error.SidecarGeometry;
+        if (!bank_file.plainName(sc.file) or sc.alignment != record_alignment or sc.size > std.math.maxInt(i64)) return error.SidecarGeometry;
         if (!j.parity.all_pass) return error.ParityNotPassed;
         const a = self.allocator;
         self.hidden = d.hidden;
@@ -1679,7 +1679,7 @@ test "dsv41 projection rates: crossed projection declarations open and peek thei
     try testing.expectEqual(@as(u64, 2624), bank.layers[0].logical_bytes);
     try testing.expectEqual(@as(u64, 3136), bank.layers[1].logical_bytes);
     try testing.expectEqual(@as(u64, 28672), bank.recordOffset(1, 3));
-    const stream = @import("expert_stream.zig");
+    const stream = @import("stream.zig");
     const geometry = try stream.StorageGeometry.init(bank.layers);
     try testing.expectEqual(@as(u64, 5760), geometry.persistent_row_bytes);
     try testing.expectEqual(@as(u64, 3648), geometry.transient_row_bytes);

@@ -16,7 +16,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "1ce3d7facb5de9bd97d4d9ea4c2efbf4a46a9e3ca4266f4a22853e632165e5b1";
+pub const manifest_sha256 = "0730e68a7495224cf89b233860e6bd1f22a20534ea3478a21a6f2131bcbb123a";
 
 /// G7: the decode-timers build's launch probe (`sdk_ext/kernel_set.zig`: its build flag, keys and observer).
 pub const launch_observed = kset.launch_observed;
@@ -270,7 +270,7 @@ pub const compact_kernels = [_]Kernel{
     .dsv41_prefill_dig_gemm_2304x5120_xmul1h_compact_m128,
 };
 
-/// Header texts shared by several kernels (file header_<tag>.metal).
+/// Logical shared headers; mul1h_rate reuses the stock dig_mul1h_k3 text plus its rate addendum.
 pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows, attnfuse_s2, attnhalf_idx, pf_hc, smallk, joinless, dig_mul1h_k3_lut, hcpost_tf32, mul1h_rate };
 
 pub const n_kernels = std.meta.fieldNames(Kernel).len;
@@ -285,20 +285,32 @@ pub const Texts = struct {
     addenda: [n_headers][:0]const u8,
 };
 
-/// The lane headers the port appends its own text to (file port_<tag>.metal): pf_hc's q3pf_ld
-/// twin for `const constant` inputs (MLX binds an input of fewer than 8 elements as constant).
-pub const ported = [_]Header{.pf_hc};
+/// Lane headers with authenticated port addenda. The rate header keeps the stock K3
+/// text untouched and adds only the mixed-rate functions in header_mul1h_rate.metal.
+pub const ported = [_]Header{ .pf_hc, .mul1h_rate };
 
 pub const embedded: Texts = .{
     .manifest = @embedFile(dir ++ "manifest.json"),
     .sources = embedAll(Kernel, ""),
-    .headers = embedAll(Header, "header_"),
+    .headers = embedHeaders(),
     .addenda = embedAddenda(),
 };
 
 fn embedAddenda() [n_headers][:0]const u8 {
     var out: [n_headers][:0]const u8 = @splat("");
-    for (ported) |h| out[@backingInt(h)] = @embedFile(dir ++ "port_" ++ @tagName(h) ++ ".metal");
+    for (ported) |h| out[@backingInt(h)] = if (h == .mul1h_rate)
+        @embedFile(dir ++ "header_mul1h_rate.metal")
+    else
+        @embedFile(dir ++ "port_" ++ @tagName(h) ++ ".metal");
+    return out;
+}
+
+fn embedHeaders() [n_headers][:0]const u8 {
+    var out: [n_headers][:0]const u8 = undefined;
+    inline for (std.meta.fieldNames(Header), 0..) |name, i| {
+        const base = if (comptime std.mem.eql(u8, name, "mul1h_rate")) "dig_mul1h_k3" else name;
+        out[i] = @embedFile(dir ++ "header_" ++ base ++ ".metal");
+    }
     return out;
 }
 
@@ -1182,6 +1194,11 @@ const shaHex = kset.shaHex;
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);
     defer reg.deinit();
+    try testing.expectEqual(@as(usize, 133), n_kernels);
+    try testing.expectEqual(@as(usize, 18), n_headers);
+    try testing.expectEqual(@as(usize, 17), reg.predecessors.len);
+    try testing.expect(!reg.acceptsManifest("1ecc3d1c3b0d475b6ee54e59a22100d2df8b5788e2363310f771e08632f84724"));
+    try testing.expect(!reg.acceptsManifest("1790f2036ac40b0d962edffe046b9011e364b95385a9269d632803a60bab8594"));
     for (reg.entries, 0..) |e, i| try testing.expectEqual(@as(Kernel, @fromBackingInt(@intCast(i))), e.kernel);
     try testing.expect(reg.get(.dsv41_exl3_mul1h_k3_2304).checks.contains(.decode_table));
     try testing.expect(reg.get(.mtplx_dsv4_sinkhorn_hc4_it20).launch.rule.threadgroup_rule != null);
@@ -1363,7 +1380,7 @@ test "dsv41 kernels: the pf_hc port addendum compiles with its lane header; the 
     // every other header compiles as the lane's text
     for (&reg.entries) |*e| {
         const id = e.header orelse continue;
-        if (id != .pf_hc) try testing.expectEqual(embedded.headers[@backingInt(id)].ptr, reg.header(e).ptr);
+        if (embedded.addenda[@backingInt(id)].len == 0) try testing.expectEqual(embedded.headers[@backingInt(id)].ptr, reg.header(e).ptr);
     }
     // 9fbf4ab8 (before the addendum) stays a predecessor for every kernel but the four pf_hc ones
     try testing.expect(reg.acceptsManifest("9fbf4ab873c953728555fc010a5a6b81726f42690f0db667bc3b51b336803091"));
@@ -1387,7 +1404,7 @@ test "dsv41 kernels: the pf_hc port addendum compiles with its lane header; the 
         try testing.expect(std.mem.indexOf(u8, diag.message(), "embeds none") != null);
     }
     {
-        const m = try replaceFirst(a, embedded.manifest, "\"port_addenda\": [", "\"port_addenda_off\": [");
+        const m = try replaceFirst(a, embedded.manifest, "\"port_addenda\":[", "\"port_addenda_off\":[");
         defer a.free(m);
         var texts = embedded;
         texts.manifest = m;
@@ -1396,6 +1413,33 @@ test "dsv41 kernels: the pf_hc port addendum compiles with its lane header; the 
         try testing.expectError(error.SchemaInvalid, Registry.init(a, &texts, &pin, &diag));
         try testing.expect(std.mem.indexOf(u8, diag.message(), "the manifest lists none") != null);
     }
+}
+
+test "dsv41 kernels: rate functions are an authenticated addendum to the untouched stock K3 header" {
+    var reg = try initOrPrint(&embedded, manifest_sha256);
+    defer reg.deinit();
+    const lane = embedded.headers[@backingInt(Header.mul1h_rate)];
+    const port = embedded.addenda[@backingInt(Header.mul1h_rate)];
+    try testing.expectEqualStrings(embedded.headers[@backingInt(Header.dig_mul1h_k3)], lane);
+    try testing.expectEqualStrings("5963b0464b94eaadba9e6f223d9963f388fa77fc1daa717cfce9af6d8c48291c", &shaHex(lane));
+    try testing.expectEqualStrings("273210eb02ab559c73f946920458f1ee8dfa5bc119c3fbbe0fe31eaeda0aee94", &shaHex(port));
+    try testing.expect(std.mem.indexOf(u8, port, "METAL_FUNC uint rate_window") != null);
+    try testing.expect(std.mem.indexOf(u8, port, "METAL_FUNC void dig_dec_job") == null);
+    for (&reg.entries) |*e| {
+        if (e.header != .mul1h_rate) continue;
+        const compiled = reg.header(e);
+        try testing.expect(std.mem.startsWith(u8, compiled, lane));
+        try testing.expectEqualStrings(port, compiled[lane.len..]);
+    }
+    const a = testing.allocator;
+    var texts = embedded;
+    const bad = try a.dupeSentinel(u8, port, 0);
+    defer a.free(bad);
+    bad[bad.len / 2] ^= 0x20;
+    texts.addenda[@backingInt(Header.mul1h_rate)] = bad;
+    var diag: Diag = .{};
+    try testing.expectError(error.TextSha256Mismatch, Registry.init(a, &texts, manifest_sha256, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "port addendum mul1h_rate") != null);
 }
 
 test "dsv41 kernels: an unknown kernel name is refused" {

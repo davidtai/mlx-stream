@@ -413,14 +413,6 @@ pub const Pool = struct {
         }
     }
 
-    /// Registered gates still held by C's satisfied-prefix queue, armed or not.
-    pub fn liveGates(self: *const Pool) !u32 {
-        _ = self;
-        var state: [10]i64 = undefined;
-        const count = c.q3ld_ev_state(&state);
-        if (count < 0) return error.GateRefused;
-        return @intCast(count);
-    }
 
     /// Forces every live gate <= `value` (error paths: nothing may wait for it).
     pub fn releaseGates(self: *Pool, value: u64) void {
@@ -519,6 +511,12 @@ pub fn Records(comptime components: usize, comptime gate_up: usize) type {
         /// its own status). Returns the first of its 2n tickets.
         pub fn submit(pool: *Pool, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
             return submitOn(pool, 0, pool.demand_tickets, &pool.next_ticket, fd, gu_offsets, down_offsets, rows, lens);
+        }
+
+        /// A construction-owned ticket interval with its own cursor. The owner settles all prior reads before reuse.
+        pub fn submitRange(pool: *Pool, lo: u32, hi: u32, next: *u32, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
+            std.debug.assert(lo <= next.* and next.* <= hi and hi <= pool.demand_tickets and 2 * rows.len <= hi - lo);
+            return submitOn(pool, lo, hi, next, fd, gu_offsets, down_offsets, rows, lens);
         }
 
         fn submitOn(pool: *Pool, lo: u32, hi: u32, next: *u32, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {

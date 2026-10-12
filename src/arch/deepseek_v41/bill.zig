@@ -498,6 +498,7 @@ pub fn billAt(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, 
         prefix[l + 1] = prefix[l] + expert_stream.StorageGeometry.rowBytes(layer);
     };
     const compact = if (p.bank.isCompact()) try CompactCosts.init(a, &p.bank) else null;
+    errdefer if (compact) |costs| costs.deinit(a);
     const per_row = if (compact) |costs| costs.per_row else geometry.persistent_row_bytes;
     var metadata = p.bank.metadataBytes();
     const old_parts = std.math.divCeil(u32, p.bank.n_experts, sdk_ext.expert.io.max_items) catch unreachable;
@@ -837,18 +838,78 @@ pub fn memoryBill(a: std.mem.Allocator, b: Bill) !sdk.MemoryBill {
         // Created at the prompt's end, never held from construction (0 in the prompt phase today).
         .{ .name = "retained prompt state", .bytes = .{ p.prompt_state, d.prompt_state }, .at_construction = false },
         .{ .name = "unbilled process overhead", .bytes = .{ p.unbilled_overhead, d.unbilled_overhead }, .at_construction = true },
-        .{ .name = "wire tables", .bytes = .{ p.wire_tables, d.wire_tables }, .at_construction = false, .with_rows = true },
+        .{
+            .name = if (b.compact_costs != null or b.decode_extra_records != 0) "wire tables and phase slot adjustments" else "wire tables",
+            .bytes = .{ p.wire_tables, d.wire_tables + (decode_slots - @min(decode_slots, fb.slotBytes(false, b.decode_rows, 0))) },
+            .at_construction = false,
+            .with_rows = true,
+        },
         .{ .name = "decode buffer allowance", .bytes = .{ p.decode_buffer_allowance, d.decode_buffer_allowance }, .at_construction = false },
         .{ .name = "prompt buffer allowance", .bytes = .{ p.prompt_buffer_allowance, d.prompt_buffer_allowance }, .at_construction = false },
     });
-    const w = fillBillOf(b).wiring.?;
-    return .{ .terms = terms, .per_row = per_row, .row_terms = .{ .data = .{ w.prefill_wired, w.decode_wired + b.decode_extra_records * per_row, per_row, 0 }, .at = wiringAt } };
+    errdefer a.free(terms);
+    const w = fb.wiring.?;
+    if (b.compact_costs) |costs| {
+        // Common slots are the smaller actual phase allocation at each row count.
+        // Split buffers can round UP or DOWN relative to one unsplit buffer: the
+        // callback adds each phase's nonnegative difference, never unsigned subtraction.
+        // At the pinned prompt base both phases share the same base allocation, so
+        // constructionBytes is exact at the bill's own built prompt rows.
+        // The owned suffix is callback backing, never a legal slot row. Decode queries
+        // pin the prompt base; extra records narrow decode's domain to 0..n_experts-1.
+        // Coupled fill and admission stay in the arch, not generic sdk.fill.
+        const count = @as(usize, b.n_experts) + 1;
+        const decode_count = count - @intFromBool(b.decode_extra_records != 0);
+        const table = try a.alloc(u64, 2 * count + decode_count);
+        errdefer a.free(table);
+        for (0..count) |row| {
+            const prompt = costs.slots(0, @intCast(row), 0);
+            table[row] = prompt;
+            table[count + row] = prompt;
+        }
+        for (0..decode_count) |row| {
+            const r: u32 = @intCast(row);
+            const decode = costs.slots(@min(b.prefill_rows, r), r, b.decode_extra_records);
+            table[row] = @min(table[row], decode);
+            table[2 * count + row] = decode;
+        }
+        return .{
+            .terms = terms,
+            .per_row = per_row,
+            .slot_table = table,
+            .row_terms = .{ .data = .{ w.prefill_wired, w.decode_wired, @intFromPtr(table[count..].ptr), (@as(u64, count) << 32) | decode_count }, .at = compactRowsAt },
+        };
+    }
+    return .{ .terms = terms, .per_row = per_row, .row_terms = .{ .data = .{ w.prefill_wired, w.decode_wired, b.slot_prefix[b.decode_extra_records], 0 }, .at = fixedRowsAt } };
 }
 
-/// The wiring terms at `rows` (`sdk.MemoryBill.RowTerms`): the page tables of each phase's wired bytes less its slot rows
-/// (`data`) and the rows' bytes, exactly as `FillBill.total` re-evaluates them (`phase_memory.wiringAt`, shared with
-/// GLM-5.3's bill).
-const wiringAt = phase_mem.wiringAt;
+// Decode's extra records are slots too, not merely wired bytes.
+fn fixedRowsAt(data: *const [4]u64, phase: sdk.MemoryBill.Phase, _: u32, slots: u64) u64 {
+    const extra = if (phase == .decode) data[2] else 0;
+    return extra + wireTables(data[@intFromEnum(phase)] + slots + extra);
+}
+
+fn compactRowsAt(data: *const [4]u64, phase: sdk.MemoryBill.Phase, rows: u32, slots: u64) u64 {
+    const count = data[3] >> 32;
+    const limit = if (phase == .prompt) count else data[3] & std.math.maxInt(u32);
+    std.debug.assert(rows < limit);
+    const phases: [*]const u64 = @ptrFromInt(data[2]);
+    const offset: usize = if (phase == .decode) @intCast(count) else 0;
+    const actual = phases[@as(usize, rows) + offset];
+    std.debug.assert(actual >= slots);
+    return actual - slots + wireTables(data[@intFromEnum(phase)] + actual);
+}
+
+/// The arch owns compact prompt-base coupling and the extra-record domain; the SDK
+/// still performs both named phase-target checks before construction.
+pub fn admitMemoryBill(b: Bill, mb: sdk.MemoryBill, rows: sdk.Rows, target: u64) !void {
+    if (b.compact_costs != null) {
+        if (rows.prompt != b.prefill_rows) return error.DecodeBaseRowsMismatch;
+        if (rows.prompt > rows.decode or rows.decode > b.n_experts or
+            (b.decode_extra_records != 0 and rows.decode == b.n_experts)) return error.RowCostDomain;
+    }
+    try sdk.admit(mb, b.baseline, rows, target);
+}
 
 /// A bill in the fill's shape: its phases' totals less their slot rows and their wiring terms, one row on every routed
 /// layer, and each phase's wired bytes less its slot rows (the wiring terms, re-evaluated at every row count).
@@ -957,7 +1018,7 @@ fn nativeFill(a: std.mem.Allocator, bill: Bill, target: u64) !arm_mod.NativeRows
     chosen.slot_decode = bill.slot_decode - fb.slotBytes(true, bill.decode_rows, bill.decode_extra_records) + bill.compact_costs.?.slots(rows.prefill, rows.decode, 0);
     const mb = try memoryBill(a, chosen);
     defer mb.free(a);
-    try sdk.admit(mb, chosen.baseline, .{ .prompt = rows.prefill, .decode = rows.decode }, target);
+    try admitMemoryBill(chosen, mb, .{ .prompt = rows.prefill, .decode = rows.decode }, target);
     return rows;
 }
 
@@ -1167,11 +1228,12 @@ pub fn fillOf(fb: FillBill, target: u64, n_experts: u32) error{ NoSlotRows, Nati
         return error.NativeBillDoesNotFit;
     }
     const terms = [_]sdk.MemoryBill.Term{.{ .name = "fixed", .bytes = .{ fb.prefill_fixed, fb.decode_fixed }, .at_construction = false }};
-    var costs: [385]sdk.MemoryBill.RowCost = undefined;
-    for (costs[0 .. n_experts + 1], 0..) |*cost, row| cost.* = .{
-        .bytes = .{ fb.total(false, row) - fb.prefill_fixed - row * fb.per_row, fb.total(true, row) - fb.decode_fixed - row * fb.per_row },
-    };
-    const r = try sdk.fill(.{ .terms = &terms, .per_row = fb.per_row, .row_costs = costs[0 .. n_experts + 1] }, 0, target, n_experts, min_fill_rows);
+    const w = fb.wiring orelse FillBill.Wiring{ .prefill_wired = 0, .decode_wired = 0 };
+    const r = try sdk.fill(.{
+        .terms = &terms,
+        .per_row = fb.per_row,
+        .row_terms = if (fb.wiring != null) .{ .data = .{ w.prefill_wired, w.decode_wired, 0, 0 }, .at = fixedRowsAt } else null,
+    }, 0, target, n_experts, min_fill_rows);
     return .{ .prefill = r.prompt, .decode = r.decode };
 }
 
@@ -1179,7 +1241,7 @@ pub fn fillOf(fb: FillBill, target: u64, n_experts: u32) error{ NoSlotRows, Nati
 pub fn admitOf(b: Bill, target: u64) !void {
     const mb = try memoryBill(testing.allocator, b);
     defer mb.free(testing.allocator);
-    return sdk.admit(mb, b.baseline, .{ .prompt = b.prefill_rows, .decode = b.decode_rows }, target);
+    return admitMemoryBill(b, mb, .{ .prompt = b.prefill_rows, .decode = b.decode_rows }, target);
 }
 
 test "dsv41 memory: the host side bills 1.00 GB in the prompt and decode phases, 0.90 GB at construction; every reading of the fixed host under it" {
@@ -2679,6 +2741,13 @@ test "dsv41 compact memory: every prefix split and extra record follows independ
     bank.deinit();
     source_arena.deinit();
     try testing.expectEqual(@as(u64, 2 * (6144 * 9 + 3072 + 48)), costs.per_row);
+    const page: u64 = std.heap.pageSize();
+    // Metal keeps sub-page allocations byte-sized: splitting across this boundary
+    // can remove rounding, while splitting two rounded buffers can add rounding.
+    try testing.expect(expert_stream.StorageGeometry.metalBytes(page + 512) >
+        expert_stream.StorageGeometry.metalBytes(page) + expert_stream.StorageGeometry.metalBytes(512));
+    try testing.expect(2 * expert_stream.StorageGeometry.metalBytes(page + 512) >
+        expert_stream.StorageGeometry.metalBytes(2 * (page + 512)));
     for (0..34) |base_| {
         const base: u32 = @intCast(base_);
         var previous: u64 = 0;
@@ -2713,16 +2782,25 @@ test "dsv41 compact memory: every prefix split and extra record follows independ
         const n = withExtra(native, extra);
         const mb = try memoryBill(testing.allocator, n);
         defer mb.free(testing.allocator);
-        for (0..mb.row_costs.len) |row| {
+        for (0..n.n_experts + 1 - extra) |row| {
             const r: u32 = @intCast(row);
             const p = independentCompactSlots(0, r, 0);
             const d = independentCompactSlots(@min(16, r), r, extra);
             try testing.expectEqual(fb.totalSlots(false, p), mb.total(.prompt, n.baseline, r));
             try testing.expectEqual(fb.totalSlots(true, d), mb.total(.decode, n.baseline, r));
-            try testing.expectEqual(n.constructionTerms().sum() - n.slot_prefill + p, mb.constructionBytes(r));
+            try testing.expectEqual(@min(p, d), mb.slots(r));
         }
-        try testing.expectError(error.DecodeBaseRowsMismatch, sdk.admit(mb, n.baseline, .{ .prompt = 17, .decode = 25 }, std.math.maxInt(u64)));
-        if (extra == 1) try testing.expectError(error.RowCostDomain, sdk.admit(mb, n.baseline, .{ .prompt = 16, .decode = 33 }, std.math.maxInt(u64)));
+        try testing.expectEqual(n.constructionTerms().sum(), mb.constructionBytes(n.prefill_rows));
+        try testing.expectError(error.DecodeBaseRowsMismatch, admitMemoryBill(n, mb, .{ .prompt = 17, .decode = 25 }, std.math.maxInt(u64)));
+        if (extra == 1) try testing.expectError(error.RowCostDomain, admitMemoryBill(n, mb, .{ .prompt = 16, .decode = 33 }, std.math.maxInt(u64)));
+        try admitMemoryBill(n, mb, .{ .prompt = 16, .decode = 25 }, @max(n.prefillTotal(), n.decodeTotal()));
+        try testing.expectError(error.PromptOverTarget, admitMemoryBill(n, mb, .{ .prompt = 16, .decode = 25 }, n.prefillTotal() - 1));
+        var decode_limited = n;
+        decode_limited.decode_wave = n.prefillTotal();
+        const decode_mb = try memoryBill(testing.allocator, decode_limited);
+        defer decode_mb.free(testing.allocator);
+        try admitMemoryBill(decode_limited, decode_mb, .{ .prompt = 16, .decode = 25 }, decode_limited.decodeTotal());
+        try testing.expectError(error.DecodeOverTarget, admitMemoryBill(decode_limited, decode_mb, .{ .prompt = 16, .decode = 25 }, decode_limited.decodeTotal() - 1));
     }
     const threshold = fb.totalSlots(true, independentCompactSlots(16, 25, 1));
     try testing.expectEqual(@as(u32, 0), fillExtraRecords(native, threshold - 1));

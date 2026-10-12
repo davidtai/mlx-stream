@@ -192,6 +192,20 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     if (opt.preallocate) prefill = decode;
     return .{ .config = c, .bank = bank, .geometry = geometry, .draft_subset = subset, .inputs = inputs, .plan = plan_, .prefill_rows = prefill, .decode_rows = decode };
 }
+/// Reserve the mixed ticket ring for every later admitted grow, not just the prompt's
+/// construction rows. The pure stream bound leaves uniform stock pools unchanged.
+pub fn poolOptions(bank: *const expert_bank.Bank, opt: Options) expert_io.Options {
+    var pool = opt.pool;
+    const minimum = expert_stream.minimumTickets(bank, .{
+        .rows = &.{bank.n_experts},
+        .slot_memory = opt.slot_memory,
+        .wide_depth = opt.wide_depth,
+        .transient_rows = @as(u32, opt.wide_depth) * expert_policy.max_route_ids,
+    });
+    if (minimum > 2 * expert_io.max_items) pool.tickets = @intCast(@max(pool.tickets, minimum));
+    return pool;
+}
+
 
 pub fn poolStagingBytes(bank: *const expert_bank.Bank, opt: Options) !u64 {
     const span = if (opt.lookahead) |la|
@@ -205,6 +219,9 @@ pub fn poolStagingBytes(bank: *const expert_bank.Bank, opt: Options) !u64 {
 pub fn poolGrowthBytes(bank: *const expert_bank.Bank, opt: Options, geometry: *const expert_stream.StorageGeometry, staging_bytes: u64) u64 {
     const defaults: expert_io.Options = .{};
     var bytes = staging_bytes -| defaults.workers * defaults.staging_bytes;
+    const pool = poolOptions(bank, opt);
+    const original = opt.pool;
+    bytes += expert_io.poolBytes(pool, std.heap.pageSize()) - expert_io.poolBytes(original, std.heap.pageSize());
     if (opt.lookahead) |la| {
         const page = std.heap.pageSize();
         const k3 = expert_bank.layerSegments(3, bank.hidden, bank.inter).?;
@@ -310,7 +327,7 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
                 .slot_memory = opt.slot_memory,
                 .lookahead = opt.lookahead,
                 .event = opt.event,
-                .pool = opt.pool,
+                .pool = poolOptions(&self.bank, opt),
                 .wide_depth = opt.wide_depth,
                 .transient_rows = @as(u32, opt.wide_depth) * expert_policy.max_route_ids,
                 .transient_release = opt.transient_release,
@@ -786,6 +803,10 @@ test "dsv41 arm: a synthetic model builds at its admitted rows with the routed-e
         return e;
     };
     defer arm.deinit();
+    try testing.expectEqual(tm.options().pool.tickets, poolOptions(&arm.bank, tm.options()).tickets);
+    try testing.expectEqual(@as(usize, tm.options().pool.tickets), arm.stream.pool.log.len);
+    const geometry = try expert_stream.StorageGeometry.initBank(&arm.bank);
+    try testing.expectEqual(@as(u64, 0), poolGrowthBytes(&arm.bank, tm.options(), &geometry, arm.inputs.io_staging_bytes.?));
     // The plan is Admission.plan's; a layer never holds more rows than its 4 experts.
     const want = try expert_admission.Admission.plan(.dsv41_pass2, arm.inputs);
     try testing.expectEqual(want.admission.decode_rows, arm.plan.?.admission.decode_rows);

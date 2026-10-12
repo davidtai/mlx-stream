@@ -62,6 +62,7 @@ pub const decode_staging_rows = S.decode_staging_rows;
 const wait_timeout_ns = S.wait_timeout_ns;
 pub const Stream = S.Stream;
 pub const StorageGeometry = S.StorageGeometry;
+pub const minimumTickets = S.minimumTickets;
 /// The EXL3 bank's slot arrays by projection.
 pub const ProjArrays = expert_bank.ProjArrays;
 pub const BankArrays = expert_bank.BankArrays;
@@ -92,10 +93,10 @@ pub fn wavesOf(plan: *const Plan, hit_slots: []const u32, part_loads: []const []
 
 /// Trace arrays in one record's geometry, `rows` rows (a trace backend's `input`).
 pub fn traceBank(g: anytype, geom: *const Layer, rows: u32) !BankArraysOf(@TypeOf(g.*).T) {
-    return traceBankGeometry(g, geom, 0, rows, geom.projection_k);
+    return traceBankGeometry(g, geom, 0, rows, geom.projection_k, 0);
 }
 
-fn traceBankGeometry(g: anytype, geom: anytype, first: u32, rows: u32, rates: [3]u32) !BankArraysOf(@TypeOf(g.*).T) {
+fn traceBankGeometry(g: anytype, geom: anytype, first: u32, rows: u32, rates: [3]u32, layer: u32) !BankArraysOf(@TypeOf(g.*).T) {
     const T = @TypeOf(g.*).T;
     var a: [n_components]T = undefined;
     const sizes: [n_components]u64 = if (geom.compact) try S.compactSizes(geom, first, rows) else @splat(0);
@@ -117,9 +118,9 @@ fn traceBankGeometry(g: anytype, geom: anytype, first: u32, rows: u32, rates: [3
         descriptor.* = try g.input(&.{ @intCast(rows), 2 }, .uint64);
     };
     return .{
-        .gate = .{ .code = a[0], .rout = a[1], .rin = a[2], .layout = if (geom.compact) .{ .compact = descriptors[0] } else .{ .fixed = .{ .k = rates[0], .code_row_words = geom.segments[0].length / 2 } } },
-        .up = .{ .code = a[3], .rout = a[4], .rin = a[5], .layout = if (geom.compact) .{ .compact = descriptors[1] } else .{ .fixed = .{ .k = rates[1], .code_row_words = geom.segments[3].length / 2 } } },
-        .down = .{ .code = a[6], .rout = a[7], .rin = a[8], .layout = if (geom.compact) .{ .compact = descriptors[2] } else .{ .fixed = .{ .k = rates[2], .code_row_words = geom.segments[6].length / 2 } } },
+        .gate = .{ .code = a[0], .rout = a[1], .rin = a[2], .layer = layer, .route_index = if (geom.compact) 0 else @intCast(geom.segments[0].shape[2] / 16 - 2), .layout = if (geom.compact) .{ .compact = descriptors[0] } else .{ .fixed = .{ .k = rates[0], .code_row_words = geom.segments[0].length / 2 } } },
+        .up = .{ .code = a[3], .rout = a[4], .rin = a[5], .layer = layer, .route_index = if (geom.compact) 0 else @intCast(geom.segments[3].shape[2] / 16 - 2), .layout = if (geom.compact) .{ .compact = descriptors[1] } else .{ .fixed = .{ .k = rates[1], .code_row_words = geom.segments[3].length / 2 } } },
+        .down = .{ .code = a[6], .rout = a[7], .rin = a[8], .layer = layer, .route_index = if (geom.compact) 0 else @intCast(geom.segments[6].shape[2] / 16 - 2), .layout = if (geom.compact) .{ .compact = descriptors[2] } else .{ .fixed = .{ .k = rates[2], .code_row_words = geom.segments[6].length / 2 } } },
     };
 }
 
@@ -317,17 +318,17 @@ pub const StreamSource = struct {
                 .transient => &self.stream.transient.row_bytes,
             };
             return .{
-                .gate = .{ .code = b.gate.code, .rout = b.gate.rout, .rin = b.gate.rin, .layout = if (b.descriptors) |d| .{ .compact = d[0] } else .{ .fixed = .{ .k = rates[0], .code_row_words = row_bytes[0] / 2 } } },
-                .up = .{ .code = b.up.code, .rout = b.up.rout, .rin = b.up.rin, .layout = if (b.descriptors) |d| .{ .compact = d[1] } else .{ .fixed = .{ .k = rates[1], .code_row_words = row_bytes[3] / 2 } } },
-                .down = .{ .code = b.down.code, .rout = b.down.rout, .rin = b.down.rin, .layout = if (b.descriptors) |d| .{ .compact = d[2] } else .{ .fixed = .{ .k = rates[2], .code_row_words = row_bytes[6] / 2 } } },
+                .gate = .{ .code = b.gate.code, .rout = b.gate.rout, .rin = b.gate.rin, .layer = layer, .route_index = if (b.descriptors != null) 0 else @intCast(row_bytes[0] / (self.stream.bank.layers[layer].segments[0].length / rates[0]) - 2), .layout = if (b.descriptors) |d| .{ .compact = d[0] } else .{ .fixed = .{ .k = rates[0], .code_row_words = row_bytes[0] / 2 } } },
+                .up = .{ .code = b.up.code, .rout = b.up.rout, .rin = b.up.rin, .layer = layer, .route_index = if (b.descriptors != null) 0 else @intCast(row_bytes[3] / (self.stream.bank.layers[layer].segments[3].length / rates[1]) - 2), .layout = if (b.descriptors) |d| .{ .compact = d[1] } else .{ .fixed = .{ .k = rates[1], .code_row_words = row_bytes[3] / 2 } } },
+                .down = .{ .code = b.down.code, .rout = b.down.rout, .rin = b.down.rin, .layer = layer, .route_index = if (b.descriptors != null) 0 else @intCast(row_bytes[6] / (self.stream.bank.layers[layer].segments[6].length / rates[2]) - 2), .layout = if (b.descriptors) |d| .{ .compact = d[2] } else .{ .fixed = .{ .k = rates[2], .code_row_words = row_bytes[6] / 2 } } },
             };
         } else {
             if (comptime !@hasDecl(G, "input")) @compileError("StreamSource binds MLX arrays or a trace backend's inputs; " ++ @typeName(G) ++ " has neither");
             const rows = self.bankRows(layer, kind);
             if (rows == 0) return null;
-            if (kind == .transient) return try traceBankGeometry(g, &self.stream.geometry.transient, 0, rows, rates);
+            if (kind == .transient) return try traceBankGeometry(g, &self.stream.geometry.transient, 0, rows, rates, layer);
             const first = if (kind == .ext) self.stream.layers[layer].base.rows else 0;
-            return try traceBankGeometry(g, &self.stream.bank.layers[layer], first, rows, rates);
+            return try traceBankGeometry(g, &self.stream.bank.layers[layer], first, rows, rates, layer);
         }
     }
 };
@@ -1475,6 +1476,60 @@ fn scoresFor(top: []const u16) [32]f32 {
     return s;
 }
 
+test "dsv41 stream: uniform speculative reads retain selector priority rather than file order" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{
+        .rows = &.{ 0, 0 },
+        .max_route_ids = 6,
+        .transient_rows = 6,
+        .pool = la_pool,
+        .lookahead = .{ .k = 6, .budget = 3, .chunks = 1, .preread = false },
+    });
+    defer s.deinit();
+    try s.grow(&.{ 0, 0 });
+    const priority = [_]u16{ 25, 9, 17 };
+    const scores = scoresFor(&priority);
+    const r = try s.route(0, &.{0}, &scores);
+    var raw: [expert_io.spec_state_w * expert_io.max_spec]i64 = undefined;
+    _ = expert_io.test_abi.abi.q3ld_spec_state(&raw);
+    for (priority, 0..) |expert, i| {
+        try testing.expect(raw[i * expert_io.spec_state_w] != 0);
+        try testing.expectEqual(@as(i64, @intCast(sb.bank.recordOffset(1, expert))), raw[i * expert_io.spec_state_w + 2]);
+    }
+    s.release(r);
+    try s.flush();
+}
+
+test "dsv41 stream: settled stock routes survive a layer seed and skipped loads do not advance tickets" {
+    var sb = try SynthBank.open(32);
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{
+        .rows = &.{ 2, 2 },
+        .max_route_ids = 6,
+        .transient_rows = 6,
+        .pool = la_pool,
+    });
+    defer s.deinit();
+    const first = try serve(s, 0, &.{ 4, 2 });
+    try s.readAheadSeed(1, &.{ 9, 7 });
+    try testing.expect(first.state == .live);
+    try expectServed(s, &sb, first, &.{ 4, 2 });
+    s.release(first);
+    try s.readAheadSeed(1, &.{9});
+    try testing.expect(first.state == .released);
+    try s.flush();
+    _ = s.layers[0].policy.forgetAll();
+    const cursor = s.pool.next_ticket;
+    const again = try serve(s, 0, &.{ 4, 2 });
+    try testing.expectEqual(@as(u32, 2), again.plan.n_loads);
+    try testing.expect(std.mem.allEqual(bool, again.reads[0..again.plan.n_loads], false));
+    try testing.expectEqual(cursor, s.pool.next_ticket);
+    try expectServed(s, &sb, again, &.{ 4, 2 });
+    s.release(again);
+    try s.flush();
+}
+
 fn waitCounter(s: *Stream, which: expert_io.Counter, at_least: i64) !void {
     var t: u32 = 0;
     while (s.pool.counter(which) < at_least) : (t += 1) {
@@ -2557,7 +2612,7 @@ fn mixedLifecycle(synth: expert_bank.Synth, rates: [3][3]u32, costs: [3]u64) !vo
     const s = try Stream.init(testing.allocator, &bank, .{ .rows = &.{ 2, 2, 2 }, .max_route_ids = 12, .transient_rows = 24, .wide_depth = 2, .pool = test_pool, .transient_release = true });
     defer s.deinit();
     var src = StreamSource.init(s);
-    var g = @import("deepseek_v41_ops.zig").TraceOps.init(testing.allocator);
+    var g = @import("../arch/deepseek_v41/ops.zig").TraceOps.init(testing.allocator);
     defer g.deinit();
     for (0..3) |l| {
         try expectMixedBindings(&src, &g, @intCast(l), rates[l]);
@@ -2573,7 +2628,7 @@ fn mixedLifecycle(synth: expert_bank.Synth, rates: [3][3]u32, costs: [3]u64) !vo
         try expectMixedRead(s, &bank, image, @intCast(l), &.{ 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19 }, 0b111);
     }
     const grown_bytes = row * (12 + decode_staging_rows) + 2 * costs[0] + 3 * costs[1] + 4 * costs[2];
-    try testing.expectEqual(grown_bytes, try s.shrink(&.{ 2, 2, 2 }));
+    try testing.expectEqual(grown_bytes, try s.shrink(&.{ 2, 2, 2 }, .forget));
     try testing.expectEqual(24 * row, try s.regrowTransient());
     try testing.expectEqual(24 * row, s.promptTransientBytes());
     try testing.expectEqual(@as(u32, 24), s.transient.rows);
@@ -2635,7 +2690,7 @@ test "dsv41 integer rates: K4 preread staging covers unaligned gate up and down 
     try testing.expect(s.pool.staging.len > workers * (expert_io.Options{}).staging_bytes);
     const baseline = workers * (expert_io.Options{}).staging_bytes + 2 * (std.mem.alignForward(u64, 13_315_584, page) + 2 * page);
     const actual = s.pool.staging.len + s.pool.spec_staging.?.len;
-    const arm = @import("deepseek_v41_arm.zig");
+    const arm = @import("../arch/deepseek_v41/arm.zig");
     const opts: arm.Options = .{ .model_dir = "", .baseline_bytes = null, .slot_memory = .host, .lookahead = .{ .budget = 1, .preread = true } };
     try testing.expectEqual(actual - baseline, arm.poolGrowthBytes(&sb.bank, opts, &s.geometry, s.pool.staging.len));
 }
@@ -2703,6 +2758,36 @@ fn expectCompactOffsets(rows: *const Rows, rates: []const [3]u32, unit_words: u6
     for (offsets, 0..) |words, projection| try testing.expectEqual(words * 2, compact.sizes[3 * projection]);
 }
 
+test "dsv41 compact stream: asynchronous seed promotion copies logical bytes and publishes the smaller descriptor" {
+    const rates = [_][3]u32{ .{ 4, 4, 4 }, .{ 2, 2, 2 } };
+    var fixture = try CompactFixture.init(.{ .hidden = 128, .inter = 128, .n_experts = 4, .n_layers = 1, .rates = &rates });
+    defer fixture.deinit();
+    const s = try Stream.init(testing.allocator, &fixture.bank, .{ .rows = &.{1}, .max_route_ids = 1, .transient_rows = 1, .pool = test_pool });
+    defer s.deinit();
+    const warm = try serve(s, 0, &.{0});
+    s.release(warm);
+    try s.flush();
+    s.layers[0].policy.protected.set(0);
+    const transient = try serve(s, 0, &.{1});
+    const from = transient.plan.slotsOf()[0];
+    try testing.expect(from >= s.layers[0].policy.capacity);
+    try expectCompactServed(s, &fixture, transient, &.{1});
+    s.release(transient);
+    try s.flush();
+    s.layers[0].policy.protected.unset(0);
+    try s.seedPrefill(0, &.{1});
+    var tail: [4096]u8 = undefined;
+    @memcpy(&tail, s.slotRow(0, 0, .gate_code)[4096..8192]);
+    try testing.expectEqual(@as(u32, 1), s.promote(0, &.{.{ .e = 1, .from = from }}));
+    s.settleCopies();
+    const promoted = try serve(s, 0, &.{1});
+    try testing.expectEqual(@as(u32, 1), promoted.plan.n_hits);
+    try expectCompactServed(s, &fixture, promoted, &.{1});
+    try testing.expectEqualSlices(u8, &tail, s.slotRow(0, 0, .gate_code)[4096..8192]);
+    s.release(promoted);
+    try s.flush();
+}
+
 test "dsv41 compact stream: logical descriptors and bytes survive eviction grow shrink and identical suffix regrow" {
     const rates = [_][3]u32{ .{ 2, 3, 5 }, .{ 5, 2, 2 }, .{ 2, 5, 2 }, .{ 2, 2, 2 } };
     var fixture = try CompactFixture.init(.{ .hidden = 128, .inter = 128, .n_experts = 32, .n_layers = 2, .rates = &rates });
@@ -2718,7 +2803,7 @@ test "dsv41 compact stream: logical descriptors and bytes survive eviction grow 
     });
     defer stream.deinit();
     var source = StreamSource.init(stream);
-    var trace = @import("deepseek_v41_ops.zig").TraceOps.init(testing.allocator);
+    var trace = @import("../arch/deepseek_v41/ops.zig").TraceOps.init(testing.allocator);
     defer trace.deinit();
     const base_address = @intFromPtr(stream.layers[0].base.backing.compact.banks[0].ptr);
     try expectCompactOffsets(&stream.layers[0].base, rates[0..3], 1024);
@@ -2757,7 +2842,7 @@ test "dsv41 compact stream: logical descriptors and bytes survive eviction grow 
     stream.release(grown);
     try stream.flush();
     const freed = stream.layers[0].ext.?.bytes() + stream.layers[1].ext.?.bytes() + stream.transient.bytes();
-    try testing.expectEqual(freed, try stream.shrink(&.{ 3, 3 }));
+    try testing.expectEqual(freed, try stream.shrink(&.{ 3, 3 }, .forget));
     try testing.expectEqual(base_address, @intFromPtr(stream.layers[0].base.backing.compact.banks[0].ptr));
     try expectCompactOffsets(&stream.layers[0].base, rates[0..3], 1024);
     try testing.expectEqual(prompt_bytes, try stream.regrowTransient());
@@ -2771,9 +2856,9 @@ test "dsv41 compact stream: logical descriptors and bytes survive eviction grow 
 }
 
 test "dsv41 compact stream: pending and completed-unsettled fills remain missing until the demand join" {
-    var fixture = try CompactFixture.init(.{ .hidden = 128, .inter = 128, .n_experts = 12, .n_layers = 1 });
+    var fixture = try CompactFixture.init(.{ .hidden = 128, .inter = 128, .n_experts = 12, .n_layers = 2 });
     defer fixture.deinit();
-    const stream = try Stream.init(testing.allocator, &fixture.bank, .{ .rows = &.{3}, .max_route_ids = 3, .transient_rows = 3, .pool = test_pool });
+    const stream = try Stream.init(testing.allocator, &fixture.bank, .{ .rows = &.{ 3, 3 }, .max_route_ids = 3, .transient_rows = 3, .pool = test_pool });
     defer stream.deinit();
     defer expert_io.clearFaults();
     const page = std.heap.pageSize();
@@ -2786,19 +2871,24 @@ test "dsv41 compact stream: pending and completed-unsettled fills remain missing
     for (route.partsOf()) |part| try stream.pool.wait(part.ticket, 2 * part.n_reads, std.time.ns_per_s);
     source.residentLut(0, &lut, 0xffffffff);
     try testing.expect(std.mem.allEqual(u32, &lut, 0xffffffff));
-    try testing.expectError(error.RoutesLive, stream.readAheadSeed(0, &.{3}));
+    // Independent seed tickets may land without joining the earlier demand route's completed results.
+    try stream.readAheadSeed(1, &.{ 0, 1, 2 });
+    try stream.awaitReadAhead(1);
+    source.residentLut(0, &lut, 0xffffffff);
+    try testing.expect(std.mem.allEqual(u32, &lut, 0xffffffff));
     for (0..route.n_parts) |part| try stream.waitDown(route, @intCast(part));
     source.residentLut(0, &lut, 0xffffffff);
     try testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, lut[0..3]);
     try testing.expect(std.mem.allEqual(u32, lut[3..], 0xffffffff));
     try expectCompactServed(stream, &fixture, route, &.{ 0, 1, 2 });
     stream.release(route);
-    try testing.expectError(error.RoutesLive, stream.readAheadSeed(0, &.{3}));
+    try stream.readAheadSeed(0, &.{3});
+    try testing.expect(route.state == .released);
     try stream.flush();
     try stream.readAheadSeed(0, &.{3});
 }
 
-test "dsv41 compact stream: five full windows reserve tickets until reclamation across gate and ticket wrap" {
+test "dsv41 compact stream: construction-owned ranges preserve five windows across gate wrap and route reuse" {
     var rates: [48][3]u32 = undefined;
     for (&rates, 0..) |*rate, i| rate.* = .{ @intCast(2 + i / 16), @intCast(2 + i / 4 % 4), @intCast(2 + i % 4) };
     var fixture = try CompactFixture.init(.{ .hidden = 128, .inter = 128, .n_experts = 288, .n_layers = 1, .rates = &rates });
@@ -2813,7 +2903,7 @@ test "dsv41 compact stream: five full windows reserve tickets until reclamation 
         .event = .{ .backend = .host, .watchdog_ms = 10000 },
     };
     try testing.expectError(error.InvalidOptions, Stream.init(testing.allocator, &fixture.bank, options));
-    options.pool.tickets = 480;
+    options.pool.tickets = @intCast(minimumTickets(&fixture.bank, options));
     const stream = try Stream.init(testing.allocator, &fixture.bank, options);
     defer stream.deinit();
     defer expert_io.clearFaults();
@@ -2833,7 +2923,7 @@ test "dsv41 compact stream: five full windows reserve tickets until reclamation 
         try stream.pool.wait(part.ticket, 2 * part.n_reads, std.time.ns_per_s);
     };
     try waitWord(stream, 245);
-    try testing.expectError(error.RoutesLive, stream.readAheadSeed(0, &.{240}));
+    try stream.readAheadSeed(0, &.{240});
     for (routes, &ids) |route, *window| try expectCompactServed(stream, &fixture, route, window);
     stream.release(routes[0]);
     var replacement_ids: [48]u16 = undefined;
@@ -2869,7 +2959,7 @@ test "dsv41 compact stream: full heterogeneous seed owns enough tickets and ever
         .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 191 },
     };
     try testing.expectError(error.InvalidOptions, Stream.init(testing.allocator, &fixture.bank, options));
-    options.pool.tickets = 192;
+    options.pool.tickets = @intCast(minimumTickets(&fixture.bank, options));
     const stream = try Stream.init(testing.allocator, &fixture.bank, options);
     defer stream.deinit();
     var ids: [96]u16 = undefined;
@@ -2878,6 +2968,7 @@ test "dsv41 compact stream: full heterogeneous seed owns enough tickets and ever
     const page = std.heap.pageSize();
     expert_io.injectFault(fixture.bank.spans(0, 0).gu_offset / page * page, 5, 20 * std.time.ns_per_ms);
     try stream.readAheadSeed(0, &ids);
+    try testing.expectEqual(@as(u32, 96), stream.ahead.n);
     try stream.awaitReadAhead(0);
     for (0..2) |half| {
         const selected = ids[half * 48 ..][0..48];
@@ -2944,7 +3035,7 @@ test "dsv41 compact stream: hit-only calls retain their rows without consuming t
         .rows = &.{3},
         .max_route_ids = 3,
         .transient_rows = 3,
-        .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 16 },
+        .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 42 },
     });
     defer stream.deinit();
     const warm = try serve(stream, 0, &.{ 0, 1, 2 });
@@ -2960,28 +3051,35 @@ test "dsv41 compact stream: hit-only calls retain their rows without consuming t
     try stream.flush();
 }
 
-test "dsv41 compact stream: completed owned tickets refuse overlap even when another transient window is free" {
+test "dsv41 compact stream: undersized pools refuse at construction and independent ranges preserve settled live calls" {
     for ([_]bool{ false, true }) |persistent| {
         var fixture = try CompactFixture.init(.{ .hidden = 128, .inter = 128, .n_experts = 12, .n_layers = 2 });
         defer fixture.deinit();
         const rows = [_]u32{ 0, @intFromBool(persistent) };
-        const stream = try Stream.init(testing.allocator, &fixture.bank, .{
+        var options: Options = .{
             .rows = &rows,
             .max_route_ids = 4,
             .transient_rows = 12,
             .wide_depth = 3,
             .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 16 },
-        });
+        };
+        try testing.expectError(error.InvalidOptions, Stream.init(testing.allocator, &fixture.bank, options));
+        options.pool.tickets = @intCast(minimumTickets(&fixture.bank, options));
+        const stream = try Stream.init(testing.allocator, &fixture.bank, options);
         defer stream.deinit();
         const first = try serve(stream, 0, &.{ 0, 1, 2, 3 });
         const second = try serve(stream, 0, &.{ 4, 5, 6, 7 });
-        try testing.expectError(error.RoutesExhausted, stream.route(1, &.{0}, &.{}));
+        const third = try serve(stream, 1, &.{0});
+        for (first.partsOf()) |a| for (second.partsOf()) |b| {
+            try testing.expect(a.ticket + 2 * a.n_reads <= b.ticket or b.ticket + 2 * b.n_reads <= a.ticket);
+        };
         try expectCompactServed(stream, &fixture, first, &.{ 0, 1, 2, 3 });
         try expectCompactServed(stream, &fixture, second, &.{ 4, 5, 6, 7 });
-        const unused = stream.locate(1, if (persistent) 0 else 8).meta;
-        try testing.expect(unused.pins == 0 and unused.state == .empty);
-        try testing.expect(stream.layers[1].policy.slotOf(0) == null);
-        try testing.expect(stream.n_free == route_capacity - 2);
+        try expectCompactServed(stream, &fixture, third, &.{0});
+        stream.release(first);
+        stream.release(second);
+        stream.release(third);
+        try stream.flush();
     }
 }
 
@@ -2992,7 +3090,7 @@ test "dsv41 compact stream: empty-slot seed overlaps live hits and held base row
         .rows = &.{3},
         .max_route_ids = 3,
         .transient_rows = 3,
-        .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 16 },
+        .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 42 },
     });
     defer stream.deinit();
     const warm = try serve(stream, 0, &.{0});
@@ -3012,61 +3110,45 @@ test "dsv41 compact stream: empty-slot seed overlaps live hits and held base row
     try stream.flush();
 }
 
-test "dsv41 compact stream: gate admission refuses a sixth heterogeneous route before posting IO" {
-    try gateAdmissionBound(true, false);
-    try gateAdmissionBound(false, false);
-    try gateAdmissionBound(true, true);
-}
-
-fn gateAdmissionBound(register_all: bool, retire_completed: bool) !void {
+test "dsv41 compact stream: construction bounds admit six heterogeneous gated routes with disjoint tickets" {
     var rates: [48][3]u32 = undefined;
     for (&rates, 0..) |*rate, i| rate.* = .{ @intCast(2 + i / 16), @intCast(2 + i / 4 % 4), @intCast(2 + i % 4) };
     var fixture = try CompactFixture.init(.{ .hidden = 128, .inter = 128, .n_experts = 288, .n_layers = 1, .rates = &rates });
     defer fixture.deinit();
-    const stream = try Stream.init(testing.allocator, &fixture.bank, .{
+    var options: Options = .{
         .rows = &.{48},
         .max_route_ids = 48,
         .transient_rows = 240,
         .wide_depth = 5,
-        .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 576 },
         .lookahead = .{ .k = 8, .budget = 2, .preread = false },
         .event = .{ .backend = .host, .watchdog_ms = 10000 },
-    });
-    defer stream.deinit();
-    defer expert_io.clearFaults();
-    const page = std.heap.pageSize();
-    expert_io.injectFault(fixture.bank.spans(0, 0).gu_offset / page * page, 5, std.time.ns_per_s);
-    var ids: [6][48]u16 = undefined;
-    for (&ids, 0..) |*group, g| for (group, 0..) |*expert, i| {
-        expert.* = @intCast(g * 48 + i);
     };
-    var owned: [5]*Route = undefined;
-    for (&owned, ids[0..5], 0..) |*route, selected, i| {
+    options.pool.tickets = @intCast(minimumTickets(&fixture.bank, options));
+    const stream = try Stream.init(testing.allocator, &fixture.bank, options);
+    defer stream.deinit();
+    var ids: [route_capacity][48]u16 = undefined;
+    for (&ids, 0..) |*group, g| for (group, 0..) |*expert, i| expert.* = @intCast(g * 48 + i);
+    var owned: [route_capacity]*Route = undefined;
+    var final_value: u64 = 0;
+    for (&owned, ids, 0..) |*route, selected, i| {
         route.* = try stream.route(0, &selected, &.{});
-        if (register_all or i == 0) _ = try stream.gate(route.*);
-    }
-    if (retire_completed) {
-        for (owned[1..], ids[1..5]) |route, selected| {
-            for (0..route.n_parts) |part| try stream.waitDown(route, @intCast(part));
-            try expectCompactServed(stream, &fixture, route, &selected);
-            stream.release(route);
+        const gates = (try stream.gate(route.*)).?;
+        try testing.expectEqual(@as(u32, 48), gates.n_parts);
+        final_value = gates.down_first + gates.n_parts - 1;
+        const lo = @as(u32, @intCast(i)) * stream.ticket_stride;
+        for (route.*.partsOf()) |part| {
+            try testing.expect(part.ticket >= lo);
+            try testing.expect(part.ticket + 2 * part.n_reads <= lo + stream.ticket_stride);
         }
-        try stream.flush();
     }
-    try testing.expect(@atomicLoad(i64, stream.eventWord().?, .acquire) < 49);
-    try testing.expectError(error.GatesFull, stream.route(0, &ids[5], &.{}));
-    try testing.expect(stream.n_free == (if (retire_completed) @as(u32, 5) else 1));
-    const first_unused: usize = if (retire_completed) 0 else 192;
-    for (first_unused..first_unused + 48) |row| {
-        const meta = stream.locate(0, @intCast(48 + row)).meta;
-        try testing.expect(meta.pins == 0 and meta.state == .empty);
-    }
-    for (owned, ids[0..5]) |route, selected| {
-        if (route.state == .free) continue;
+    try testing.expectEqual(@as(u8, 0), stream.n_free);
+    try testing.expectError(error.RoutesExhausted, stream.route(0, &ids[0], &.{}));
+    try testing.expectEqual(@as(u64, route_capacity), stream.stats().route_calls);
+    for (owned, ids) |route, selected| {
         for (0..route.n_parts) |part| try stream.waitDown(route, @intCast(part));
         try expectCompactServed(stream, &fixture, route, &selected);
         stream.release(route);
     }
-    try waitWord(stream, if (register_all) 245 else 49);
+    try waitWord(stream, final_value);
     try stream.flush();
 }

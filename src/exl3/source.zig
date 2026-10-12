@@ -38,7 +38,7 @@ test "dsv41 plugin: the EXL3 source claims a model directory that holds an exper
 test "dsv41 plugin: variable selected bank participates in source discovery" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const image = try @import("expert_bank.zig").writeVariableSynth(testing.allocator, &tmp);
+    const image = try @import("../expert/bank.zig").writeVariableSynth(testing.allocator, &tmp);
     defer testing.allocator.free(image);
     var rbuf: [1024]u8 = undefined;
     const root = rbuf[0..try tmp.dir.realPath(testing.io, &rbuf)];
