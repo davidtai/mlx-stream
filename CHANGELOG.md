@@ -74,6 +74,13 @@
   and profile. Output/usage parity passes; nominal +1.84% is rejected by unchanged throughput
   and changed-path gates. Two matched samples regress, baseline drift is 3.38%, and enclosing
   samples do not prove changed-helper execution. None is promoted.
+- Complete native MTP/DSpark stock K3 16K ABBA: all 24 measured and 16 conditioning
+  requests finish uncached. Output/usage/hashes, exact same-facts admission and sampled
+  stock shader-name equality pass. Recover both owned stock profiles without retiming;
+  initial empty capture and artifact-reconstruction failures remain preserved.
+- Keep K3 neutrality unproven: unchanged 3% guards reject with 7.21% code baseline drift,
+  -6.52%/-3.56% worst matched long decode/prefill changes and -8.35% worst short decode.
+  No causal PR regression or performance-neutrality claim; no gate is waived.
 - MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
   as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
   DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the

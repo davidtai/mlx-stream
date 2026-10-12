@@ -215,10 +215,40 @@ matched sample rule fails, with two matched changes of -0.34%/-0.09% and 3.38% b
 The clean trace has 2,425 enclosing samples and zero verified changed-path samples.
 The retry is rejected for promotion; all six remain excluded.
 
+#### Native DSpark 16K K3 comparison — completed, rejected
+
+The requested source08 comparison now completes on the actual stock 3.0 pack:
+current-main `ca49e236` versus repaired native source `c46a1c5a`, on the same host/harness,
+with native MTP/DSpark required in every arm and both profile targets. All 24 measured
+16K requests and 16 long conditioning requests complete; actual inputs are 16,172/16,132
+tokens, with 192 uncached completion tokens. Calibration uses 32 completion tokens because
+a one-token DSpark completion legitimately has no positive decode timing interval.
+
+| ABBA arm | Code median native tok/s | Count median native tok/s |
+|---|---:|---:|
+| Baseline A | 23.824 | 29.140 |
+| PR B | 25.918 | 30.067 |
+| PR C | 25.455 | 29.348 |
+| Baseline D | 25.542 | 29.599 |
+
+Full output/reasoning/usage/request-hash parity, exact same-facts admission and sampled
+stock shader-name equality pass. Live admission facts differ; identical-facts reports
+reproduce both formulas exactly, not a claim that live cache sizes were identical.
+Recovered owned captures contain 2,684 baseline / 2,796 PR positive stock samples.
+The initial empty capture is retained. Profile recovery repeats no timing requests;
+offline reconstruction restores JSON choice-key types without relaxing exact parity.
+All owned targets/tracers drain and GPU leases are released.
+
+The unchanged 3% performance/noise/drift gates reject: code baseline drift is 7.21%,
+worst matched long decode/prefill changes are -6.52%/-3.56%, worst short decode is -8.35%,
+and one code arm has 6.20% relative MAD. This run does not establish K3 neutrality or
+causally attribute these differences to the PR. No stock performance-neutrality claim
+or engine win is made; the draft remains gated.
+
 
 | Published source | Expert contract | Status |
 |---|---|---|
-| Stock 3.0 streaming repack | Uniform K3 gate/up/down; native non-expert tensors | Same-host served comparison above; neutrality acceptance pending. |
+| Stock 3.0 streaming repack | Uniform K3 gate/up/down; native non-expert tensors | Native DSpark 16K comparison completed; performance guards rejected, neutrality unproven. |
 | [Pollard 3.5](https://huggingface.co/bot-lab-21/DeepSeek-V4.1-Flash-EXL3-3.5bpw-Pollard/tree/f129e31a81e1337aa33e129e2d847fc7e37c8733) | K3/K4 per projection; native non-expert tensors | Complete-checkpoint serving validated with a checked streaming repack. |
 | [Spark 2.77](https://huggingface.co/0xSero/DeepSeek-V4.1-Flash-Spark/tree/9e3bbeabbb39fa2cf6e37e1cecfbd2fd0290329f) | K2/K3/K5 per expert; native trunk/draft | Complete-checkpoint serving validated with a checked streaming repack selecting `exl3/plan/J268-ho-v31-K5n.json`, not unused alternate tensors. |
 | [Jayleaton 2.8](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw/tree/915e1d0de8ee0a99944c5bc88ab802a639c63380) | K2–K5 per expert/projection | Expert-only hybrid validated with the original K3 pack's native trunk/draft; not a complete-checkpoint port. |
