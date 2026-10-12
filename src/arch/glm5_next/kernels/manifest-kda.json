@@ -1,0 +1,143 @@
+{
+ "format": "mlx-stream-glm5next-kda-kernels-v1",
+ "headers": [
+  {
+   "bytes": 1001,
+   "file": "header_glm5n_kda.metal",
+   "id": "glm5n_kda",
+   "sha256": "b28e8e1c60e71c9031b34cf2aaeb3e4e4afac0bc795d541c96bc7af61be2a069"
+  }
+ ],
+ "kernels": [
+  {
+   "class": "rounding-class against the op chain (the host's oMLX kda_decode body, BF16-gate variant)",
+   "family": "kda",
+   "grid": [
+    "1024*QKV/DK",
+    1,
+    1
+   ],
+   "header": {
+    "id": "glm5n_kda"
+   },
+   "inputs": [
+    {
+     "name": "q"
+    },
+    {
+     "name": "k"
+    },
+    {
+     "name": "v"
+    },
+    {
+     "name": "fa"
+    },
+    {
+     "name": "ga"
+    },
+    {
+     "name": "b"
+    },
+    {
+     "name": "conv_w"
+    },
+    {
+     "name": "a_exp"
+    },
+    {
+     "name": "dt_bias"
+    },
+    {
+     "name": "norm_w"
+    },
+    {
+     "name": "consts"
+    },
+    {
+     "name": "conv_state"
+    },
+    {
+     "name": "state_in"
+    },
+    {
+     "name": "fb_w"
+    },
+    {
+     "name": "gb_w"
+    }
+   ],
+   "instances": [
+    {
+     "DK": 128,
+     "QKV": 8192,
+     "TOK": 1
+    },
+    {
+     "DK": 128,
+     "QKV": 8192,
+     "TOK": 2
+    },
+    {
+     "DK": 128,
+     "QKV": 8192,
+     "TOK": 3
+    },
+    {
+     "DK": 128,
+     "QKV": 8192,
+     "TOK": 4
+    }
+   ],
+   "name": "glm5n_kda_decode",
+   "origin": "mlx-serve src/kernels/kda_decode.metal @ glm5next/host a8f6c6b8 (oMLX 0.7.0, Apache-2.0)",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y",
+     "shape": [
+      1,
+      "TOK",
+      "QKV"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "conv_state_out",
+     "shape": [
+      1,
+      3,
+      "3*QKV"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "state_out",
+     "shape": [
+      1,
+      "QKV/DK",
+      "DK",
+      "DK"
+     ]
+    }
+   ],
+   "source": {
+    "bytes": 6749,
+    "file": "glm5n_kda_decode.metal",
+    "sha256": "61bc7c74ae3ef10970e7d80f756231d601c04b5c91d53b90e5ec52c4b5b79bad"
+   },
+   "template": [
+    "T",
+    "TOK",
+    "DK",
+    "QKV"
+   ],
+   "threadgroup": [
+    1024,
+    1,
+    1
+   ]
+  }
+ ],
+ "lane": "glm5next/decode-stack (decode_kda: fused)"
+}

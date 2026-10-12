@@ -1,0 +1,135 @@
+{
+ "format": "mlx-stream-glm5next-dsa-kernels-v1",
+ "headers": [],
+ "kernels": [
+  {
+   "class": "rounding-class against the op chain (f32 scores and softmax)",
+   "family": "dsa",
+   "grid": [
+    "NS*32*HG",
+    "H/HG",
+    "S"
+   ],
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "q",
+     "shape": [
+      1,
+      "H",
+      "S",
+      "R"
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "lat",
+     "shape": [
+      "T",
+      "R"
+     ]
+    },
+    {
+     "dtype": "int32",
+     "name": "sel",
+     "shape": [
+      "S",
+      "W"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "consts",
+     "shape": [
+      8
+     ]
+    }
+   ],
+   "instances": [
+    {
+     "BK": 16,
+     "HG": 8,
+     "NS": 16,
+     "R": 512,
+     "S": 1
+    },
+    {
+     "BK": 16,
+     "HG": 8,
+     "NS": 16,
+     "R": 512,
+     "S": 2
+    },
+    {
+     "BK": 16,
+     "HG": 8,
+     "NS": 16,
+     "R": 512,
+     "S": 3
+    },
+    {
+     "BK": 16,
+     "HG": 8,
+     "NS": 16,
+     "R": 512,
+     "S": 4
+    }
+   ],
+   "name": "glm5n_dsa_sparse_split",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "pacc",
+     "shape": [
+      "H*S",
+      "NS",
+      "R"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "pm",
+     "shape": [
+      "H*S",
+      "NS"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "pl",
+     "shape": [
+      "H*S",
+      "NS"
+     ]
+    }
+   ],
+   "pattern": "mlx-serve msv_dec_attn split (MiMo's dec_attn_split.metal) for MLA over gathered latent rows",
+   "source": {
+    "bytes": 3452,
+    "file": "glm5n_dsa_sparse_split.metal",
+    "sha256": "b0978989050147499611e36b47d16ec077953521cb7ab4837adb36d19d694636"
+   },
+   "template": [
+    "T",
+    "R",
+    "HG",
+    "BK"
+   ],
+   "threadgroup": [
+    "32*HG",
+    1,
+    1
+   ]
+  }
+ ],
+ "lane": "glm5next/decode-stack (decode_dsa: fused)",
+ "merge": {
+  "bytes": 539,
+  "file": "../mimo_v2/kernels/dec_attn_merge.metal",
+  "pinned_by": "mimo_v2/decode_attention.zig text_pins",
+  "sha256": "1c43462d81fe43b9eb6988346685518d8f812880bcba61ee7f4b42be57aa8a2a",
+  "template": {
+   "BDV": 512
+  }
+ }
+}

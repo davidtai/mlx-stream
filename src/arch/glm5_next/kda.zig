@@ -49,6 +49,8 @@ pub const Weights = struct {
     dt_bias: T,
     /// f32 [conv dim, taps, 1]: the depthwise conv in MLX's layout.
     conv_w: T,
+    /// The pack's BF16 conv weight [conv dim, 1, taps] as stored (the fused decode text reads it: kda_decode.zig).
+    conv_raw: T,
     /// [dv]: the output RMSNorm's weight, per head.
     o_norm: T,
     o: fp8.Linear,
@@ -66,7 +68,7 @@ pub const State = struct {
         st.* = .{};
     }
 
-    fn set(st: *State, g: *G, conv: T, rec: T) void {
+    pub fn set(st: *State, g: *G, conv: T, rec: T) void {
         st.reset(g);
         st.conv = g.keep(conv);
         st.rec = g.keep(rec);
@@ -112,6 +114,17 @@ fn rmsNormOnes(g: *G, x: T, ones: T, eps: f32) !T {
 /// x [1, R, hidden] (R rows after `st`'s positions) -> [1, R, hidden]; `st` advanced past them.
 pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State) !T {
     return forwardWith(g, c, w, x, st, false, {});
+}
+
+/// The decode lane's KDA layer, bound at construction (`settings.decode_kda`): the op chain (`forward`, the control) or
+/// the fused text (kda_decode.zig `run` over its installed kernels, `ctx`). Same contract as `forward`.
+pub const Step = struct {
+    ctx: ?*const anyopaque = null,
+    run: *const fn (ctx: ?*const anyopaque, g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State) anyerror!T = forwardOps,
+};
+
+fn forwardOps(_: ?*const anyopaque, g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State) anyerror!T {
+    return forward(g, c, w, x, st);
 }
 
 /// `forward` with every row's state captured into `cap` (the MTP verify's rows: `restore` rolls back to any of them).

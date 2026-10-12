@@ -241,7 +241,7 @@ test "glm5_next parse: the settings block is applied at parse; a non-object bloc
     for ([_]Case{
         .{ .block = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-nvfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\",\"settings\":{\"expert_prefill_rows\":100,\"expert_rows\":120,\"logits_dump_dir\":\"/tmp/kl\"}},", .err = null },
         .{ .block = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-nvfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\",\"settings\":[1]},", .err = error.Glm5NextSettingsBlock },
-        .{ .block = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-nvfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\",\"settings\":{\"decode_glue\":\"ops\"}},", .err = error.Glm5NextSettingUnknown },
+        .{ .block = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-nvfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\",\"settings\":{\"decode_attention\":\"stock\"}},", .err = error.Glm5NextSettingUnknown },
         .{ .block = "", .err = error.Glm5NextPackRequired },
     }) |case| {
         const text = try std.mem.replaceOwned(u8, arena.allocator(), base, marker, try std.mem.concat(arena.allocator(), u8, &.{ marker, case.block }));

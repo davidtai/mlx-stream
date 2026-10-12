@@ -21,7 +21,6 @@ const sdk = @import("sdk");
 const mlx = sdk.mlx;
 const glm = @import("config.zig");
 const graph = @import("graph.zig");
-const dsa = @import("dsa.zig");
 const experts = @import("experts.zig");
 
 const G = graph.G;
@@ -67,7 +66,7 @@ pub fn plan(c: *const glm.Config, cap: u32) !Plan {
 pub const Report = struct { plan: Plan, ns: u64 };
 
 /// The warm (construction, after the source and the cache, before the construction check): see the file's doc.
-pub fn run(g: *G, io: std.Io, c: *const glm.Config, w: *const graph.Weights, cache: *graph.Cache, src: *experts.Source, routes: dsa.Routes) !Report {
+pub fn run(g: *G, io: std.Io, c: *const glm.Config, w: *const graph.Weights, cache: *graph.Cache, src: *experts.Source, routes: graph.Routes) !Report {
     const p = try plan(c, cache.cap);
     const t0 = std.Io.Timestamp.now(io, .awake);
     {
@@ -95,12 +94,13 @@ pub fn run(g: *G, io: std.Io, c: *const glm.Config, w: *const graph.Weights, cac
 
 /// Layer `lw`'s attention over `n` spans of zeros at positions 0, span_rows, ...: each span committed with the layer's
 /// lanes or state as a prompt call commits it, the span before it waited (two in flight).
-fn spans(g: *G, c: *const glm.Config, lw: *const graph.Layer, zero: T, n: u32, cache: *graph.Cache, routes: dsa.Routes) !void {
+fn spans(g: *G, c: *const glm.Config, lw: *const graph.Layer, zero: T, n: u32, cache: *graph.Cache, routes: graph.Routes) !void {
     var prev: ?T = null;
     defer if (prev) |x| g.release(x);
     for (0..n) |i| {
         const ms = g.mark();
-        const next = g.keep(try graph.attentionSpan(g, c, lw, zero, @intCast(i * graph.span_rows), cache, routes, .last));
+        // A prompt call's span (wider than the decode lane): the prompt routes, as `graph.forward` runs it.
+        const next = g.keep(try graph.attentionSpan(g, c, lw, zero, @intCast(i * graph.span_rows), cache, routes, false, .last));
         g.resetTo(ms);
         var bufs: [2]T = undefined;
         const b = cache.buffers(lw, &bufs);

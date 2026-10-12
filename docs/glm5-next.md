@@ -9,8 +9,10 @@ Terms as in [mimo.md](mimo.md): **pack**, **residents**, **rows** (prompt rows, 
 
 Code: `src/arch/glm5_next/` (`root.zig` the arch contract, `settings.zig` the settings, `config.zig` the model,
 `bill.zig` the bill, `module.zig` construction and requests, `graph.zig` the forward, `kda.zig` / `dsa.zig` / `ops.zig`
-the attention and the hyper-connections, `fp8.zig` the residents route, `experts.zig` the expert source, `nvfp4.zig` the
-projection format, `bank.zig` the bank, `dump.zig` the logits dump); the gather shim is `csrc/glm5_gather_qmm.inc`.
+the attention and the hyper-connections, `glue.zig` the decode lane's fused glue, `kda_decode.zig` / `dsa_decode.zig` /
+`swiglu.zig` the decode lane's KDA, DSA and MLP activation texts, `kda_percore.zig` the KDA prompt route, `fp8.zig` the
+residents route, `warm.zig` the prompt kernels' warm, `experts.zig` the expert source, `nvfp4.zig` the projection
+format, `bank.zig` the bank, `dump.zig` the logits dump); the gather shim is `csrc/glm5_gather_qmm.inc`.
 
 ## The model
 
@@ -32,8 +34,11 @@ The arch claims a `config.json` with `model_type` `glm5_next` and the block
 The block's optional `settings` object takes `expert_prefill_rows` and `expert_rows` (an operator pin: either alone
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
 is installed when true; off, the serial control, by default: below), `decode_moe` (the decode lane's expert route:
-`stock`, the default, or `fused`; anything else refused by name) and `logits_dump_dir` (below). Any other key refuses
-the load by name. The residents' format is the pack's own top-level `residents_format` (below), not a setting.
+`hitpass`, the default, `fused` or `stock`; anything else refused by name), `decode_glue` (the decode lane's glue:
+`fused`, the default, or `ops`), `decode_kda`, `decode_dsa` and `decode_swiglu` (the decode lane's KDA layer, DSA
+attention and MLP activation: `fused`, the default, or `ops`), `decode_predict` (the lookahead predictor's router
+weight: `bf16`, the default, or `f32`) and `logits_dump_dir` (below). Any other key refuses the load by name. The
+residents' format is the pack's own top-level `residents_format` (below), not a setting.
 
 Residents: the text trunk loads (`model.language_model.layers.{0..44}.*`, `embed_tokens`, `norm`, `lm_head`: 1,178
 tensors, 17,842,673,276 B as MLX allocates them); the vision tower, the MTP layer (45) and the DSA layers' FP8 KV scales
@@ -91,12 +96,64 @@ The gathers are MLX's `gather_qmm` in `nvfp4` mode (group 16) with each slot's f
 shim (`glm5_gather_qmm_nvfp4`: MLX's C++ op; mlx-c's `mlx_gather_qmm` has no global scale and is not changed): MLX folds
 g / 2688 into each group scale, so there is no output scaling and no extra rounding.
 
-The decode lane's experts take the route `decode_moe` names, installed once at construction: `stock` (the default) runs
-the gathers above per bank; `fused` installs the NVFP4 decode texts (`decode_kernels.zig`, MiMo's k1 family over the
-NVFP4 bank: the pinned set built on the module's stream, its compile check at every registered instantiation, the
-launches prepared per wave width up to 64 pairs) and binds the shared scheduler's banked waves, one launch of each text
-per wave over the three banks. A refused install refuses the load by name; the route never falls back. The routes line
-names the installed route (`decode_moe=`).
+The decode lane's experts take the route `decode_moe` names, installed once at construction: `stock` runs the gathers
+above per bank; `fused` installs the NVFP4 decode texts (`decode_kernels.zig`, MiMo's k1 family over the NVFP4 bank: the
+pinned set built on the module's stream, its compile check at every registered instantiation, the launches prepared per
+wave width up to 64 pairs) and binds the shared scheduler's banked waves, one launch of each text per wave over the
+three banks; `hitpass` (the default, MiMo's HITPASS on the scheduler's DEVROUTE) is `fused` with each decode-lane call's
+hit wave dispatched from the layer's device-resident slot LUT behind the routing barrier's arrays, before the host reads
+the ids: the host then routes and builds only the miss parts, whose rows replace their pairs in the join (exact against
+`fused`; `fused` is rounding-class against `stock`). A refused install refuses the load by name; the route never falls
+back. The routes line names the installed route (`decode_moe=`); `fused` and `hitpass` log
+`glm5_next decode experts installed: decode_moe=<route> (...)`.
+
+## The decode glue
+
+`decode_glue` (installed once at construction; `glue.zig`) fuses the decode lane's glue (one row, or the MTP verify's
+<= 4 in decode; a wide call keeps the stock glue): `fused` (the default) runs each sublayer's mHC collapse and its norm in
+one `hcPre` dispatch that also applies the previous sublayer's expand (the host's oMLX `hc_pre_fused` chain in `ops.zig`,
+unchanged; the last expand is materialized for the head), the router's product and its top-8 tail in two texts
+(`glm5n_glue_router`: MiMo's `mimo_glue_router_rows` over the router's BF16 weight at 288 experts; `glm5n_glue_top8`:
+MiMo's `mimo_glue_top8` with routed_scaling and i32 ids) and the routed combine with the shared expert's add in one
+(`glm5n_moe_combine`: MiMo's `mimo_moe_combine` plus the bf16 add). `ops` is the stock op chains (the control). The
+texts are pinned (`kernels/manifest-glue.json`); the install refuses another geometry by name and launches each text
+once over the model's own tables (the compile check; it also fixes hcPre's threadgroup width), logging
+`glm5_next decode glue installed: hcPre chain (...)`. Rounding-class against `ops`: hcPre sums the mixes and the norm's
+squares in its own order and the router's product runs MLX gemv's order on the BF16 weight where the stock runs gemv_t
+on the F32 copy; the top-8 tail and the combine are the stock expressions. The routes line names it (`decode_glue=`).
+
+## The decode KDA layer and DSA attention
+
+`decode_kda` (`kda_decode.zig`): `fused` (the default) runs each KDA layer of the decode lane (one row, or a served step
+of the MTP lane; the MTP verify's capture keeps the op chain) as one text, the host's oMLX KDA decode kernel
+(`src/kernels/kda_decode.metal` at glm5next/host a8f6c6b8; oMLX 0.7.0, Apache-2.0) in its BF16-gate variant: the short
+conv and SiLU, the gate's second stages over the BF16 f_b / g_b rows, the q/k L2 norms, the gate and beta, the
+vector-gated delta rule over the f32 state and the gated RMSNorm, one 1,024-thread threadgroup per head. The projections
+stay GEMVs outside the text (the weight format's seam), and the text keeps the module's state layout (the f32 conv tail,
+the f32 recurrent state), so the prompt pass's op chain and the decode text hand the state over unchanged. `ops` is the
+op chain (the control); rounding-class against it. Logs `glm5_next decode KDA installed: one text a layer (...)`.
+
+`decode_dsa` (`dsa_decode.zig`): `fused` (the default) runs the decode lane's sparse latent attention (the selected 2,048
+pooled tokens and the partial pool's tail) as two texts: a split text in MiMo's dec_attn pattern for MLA (each of 16
+slices of the selection keeps an online softmax in exp2 units over its gathered latent rows, a simdgroup per head, eight
+heads per threadgroup) and MiMo's `dec_attn_merge.metal` unchanged, where the op chain runs about fifteen dispatches.
+f32 throughout: rounding-class against the op chain (bf16 scores and probabilities there). The MTP lane's head takes the
+same route. Logs `glm5_next decode DSA installed: the sparse latent attention in two texts (...)`. Each install refuses
+another geometry by name and launches its texts once at construction (the compile check); the routes line names both
+(`decode_kda=`, `decode_dsa=`).
+
+## The decode MLP activation and the lookahead predictor
+
+`decode_swiglu` (`swiglu.zig`): `fused` (the default) runs the clamped SwiGLU of the decode lane's dense MLPs and shared
+experts (silu(min(gate, 10)) x clip(up, -10, 10)) as one text between the gate / up GEMVs and the down GEMV, where the
+op chain runs five dispatches; f32 arithmetic and one BF16 rounding (rounding-class against `ops`). The GEMVs stay MLX's
+BF16 gemv (at the box's bandwidth) or whichever weight format's GEMV is bound: the seam. Logs `glm5_next decode SwiGLU
+installed: ...`; the prompt pass keeps the op chain.
+
+`decode_predict`: `bf16` (the default) scores the lookahead's next-layer prediction on the router's stored BF16 weight
+(MiMo X19's `predict_router: bf16`): half the bytes of the transposed F32 copy and no input cast. The scores pick the
+lookahead's reads only, never an expert of a forward, so the route is token-exact. `f32` is the control. Logs
+`glm5_next decode predictor installed: ...`. The routes line names both (`decode_predict=`, `decode_swiglu=`).
 
 ## The prompt pass
 
@@ -203,12 +260,15 @@ MiMo's form: the arch's terms (`residents`, `trunk_f32_tables`, `router_f32`, `k
 the billed context at construction), `kda_state`, `mlx_cache`, `mlx_cache_overshoot`, `compiler_runtime`,
 `host_runtime`, the wiring terms, `request` (the prompt wave / the decode wave)) and the source's (`slot_transient`,
 `slot_rounding`, `reader_staging`, `source_metadata`, `expert_workspace`, the event and speculation runtimes, the
-predictor's, `decode_kernels` (the fused decode route's set and prepared launches, declared 16 MiB; 0 on `stock`),
-`slot_wiring`). Under `fp8_block128` the `residents` term reads the FP8 codes and scales from the shards' headers as
-stored, and `fp8_prompt_weights` bills the prompt route's BF16 weights in the prompt phase: the widest layer's FP8 set
-in BF16 (the full set: layers 0-2, KDA with the dense MLP, 573,046,784 B; the hybrid set: a dense MLP, 301,989,888 B)
-and its wiring, geometric over the layers' declared site shapes (a layer's end releases its set); the decode phase bills
-none. `per_row` is one slot row on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
+predictor's, `decode_kernels` (the fused decode route's set and prepared launches, declared 16 MiB under `fused` and
+`hitpass`; 0 on `stock`), `glue_kernels` (the fused glue's texts, declared 8 MiB; 0 under `ops`), `kda_kernels` (the KDA
+decode text, declared 4 MiB), `dsa_kernels` (the DSA decode texts, declared 4 MiB, and the split's partials at four rows,
+8,421,376 B), `swiglu_kernels` (the MLP activation text, declared 1 MiB), `slot_wiring`). Under `fp8_block128` the
+`residents` term reads the FP8 codes and scales from the shards' headers as stored, and `fp8_prompt_weights` bills the
+prompt route's BF16 weights in the prompt phase: the widest layer's FP8 set in BF16 (the full set: layers 0-2, KDA
+with the dense MLP, 573,046,784 B; the hybrid set: a dense MLP, 301,989,888 B) and its wiring, geometric over the
+layers' declared site shapes (a layer's end releases its set); the decode phase bills none. `per_row` is one slot row
+on every routed layer (42 x 14,159,872 B). The fill's floor is 8 rows. The bill tool:
 
     GLM5_BANK=<pack> GLM5_BILL_BASELINES_GB=10.6,12.0,12.6,13.0 MLX_DEFAULT_DEVICE=cpu \
       zig build mlx-stream-test -Dtest-filter="the bill tool prints every term" -j4
