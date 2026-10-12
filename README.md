@@ -109,6 +109,11 @@ rejected: short-decode baseline drift was 10.17%, count-decode baseline drift wa
 prefill comparisons also exceeded the 3% guard. The unchanged baseline's live memory reading changed
 from 19.66 GB to 25.62 GB, changing admission from 116/147 to 105/136 prefill/decode rows. These timing
 results establish neither neutrality nor a causal attribution to the restored stock submission work.
+A separate PR11-versus-PR11 control, with identical plugin/host source attestations and no repair delta,
+also failed the same guards: the unchanged baseline binary drifted 3.41% on short decode, 5.15% on code
+decode and 7.70% on count decode; a matched prefill sample changed -5.42%. Correctness, launch sets,
+profiling and exact same-facts admission passed. The measurement setup is therefore not stable enough
+to establish performance neutrality; this control does not establish that the repair is neutral.
 The stock budget-boundary regression fails before the compact-only metadata correction and passes
 afterward in ReleaseSafe. No thermal/fan equivalence is claimed.
 
