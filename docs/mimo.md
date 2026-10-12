@@ -222,6 +222,17 @@ The card ladder on `746e7da9` (this tree at `8e7d186`); `b00df80e` ran MLX's sto
 binary of record, `4b018c54` (this tree at `05fc760`), differs from `746e7da9` only by the hot-path audit and the dead
 code sweep and reproduces its 16K cell token for token (stamp16k-g15-20261011: 998.8 / 32.30 tok/s, 688 tokens).
 
+**Full 1K–1M sweep.** The same two ladders in mlx-serve's benchmark format: one line per build against requested
+context, with TTFT and both memory peaks. [benchmarks/mimo-v26-flash](benchmarks/mimo-v26-flash/README.md) has the
+tables, the matched configuration and the receipts; `python3 scripts/mimo_sweep_charts.py` redraws it from its
+`results.json`.
+
+![1K–1M sweep summary: decode, decode gain, prefill, TTFT, MLX allocator peak and process footprint peak, 746e7da9 against b00df80e](benchmarks/mimo-v26-flash/summary.png)
+
+![Decode tok/s against requested context from 1K to 1M, 746e7da9 against b00df80e](benchmarks/mimo-v26-flash/decode_tok_s.png)
+
+![Prefill tok/s against requested context from 1K to 1M, 746e7da9 against b00df80e](benchmarks/mimo-v26-flash/prefill_tok_s.png)
+
 ![Prefill and decode tok/s of the served 16K cells: three card cells and a greedy pair, by answer length and expert rows](img/mimo-16k-cells.png)
 
 The served 16K cells by answer length and rows; the greedy pair's 136-token answer makes its decode figure ramp-dominated.
