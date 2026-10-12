@@ -1621,7 +1621,7 @@ test "exl3 mixed gpu: heterogeneous descriptor triples decode verify and carried
         try expectMixedRows(&g, hidden, &fixtures, routed_ids[0..rows], true, .dense_public);
         const out = try acc.downBanked(&g, hidden, ids, &banks);
         try expectMixedRows(&g, out, &fixtures, routed_ids[0..rows], false, .dense_public);
-        if (rows == 1 or rows == 8 or rows == 48) {
+        if (rows == 1 or rows == 7 or rows == 8 or rows == 47 or rows == 48) {
             const local_ids = try g.hostArray(std.mem.sliceAsBytes(local[0..rows]), &.{@intCast(rows)}, .uint32);
             for (banks, 0..) |bank, b| {
                 var expected_ids: [48]u32 = undefined;
@@ -2095,9 +2095,33 @@ fn expectSparkPrefillRows(g: *MlxG, arithmetic: mlx.mlx_array, stored: mlx.mlx_a
     }
 }
 
-fn expectSparkExpert(comptime k: u8, comptime expert_prefix: []const u8, comptime sample_sha256: []const u8, comptime reference_env: [:0]const u8) !void {
-    errdefer std.debug.print("Spark expert failed: K{d} expert={s}\n", .{ k, expert_prefix });
-    const fixture = std.c.getenv(reference_env) orelse return error.SparkReferenceRequired;
+// Hash only original tensors, in w1/w3/w2 then trellis/suh/svh/mul1 order.
+// Fixed dtype/geometry checks bind the byte boundaries; CPU floating outputs remain tolerance-tested.
+fn expectPublishedSource(header: std.json.Value, data: []const u8, comptime ks: [3]u8, comptime expert_prefix: []const u8, expected_sha256: []const u8) !void {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    inline for (.{ "w1", "w3", "w2" }, ks, .{ 5120, 5120, 2304 }, .{ 2304, 2304, 5120 }) |name, k, input, output| {
+        const prefix = expert_prefix ++ name ++ ".";
+        hash.update(try publicTensor(header, data, prefix ++ "trellis", "I16", &.{ input / 16, output / 16, 16 * k }));
+        hash.update(try publicTensor(header, data, prefix ++ "suh", "F16", &.{input}));
+        hash.update(try publicTensor(header, data, prefix ++ "svh", "F16", &.{output}));
+        const mul1 = header.object.get(prefix ++ "mul1") orelse return error.FixtureTensorMissing;
+        try testing.expectEqualStrings("I32", mul1.object.get("dtype").?.string);
+        try testing.expectEqual(@as(usize, 0), mul1.object.get("shape").?.array.items.len);
+        const offsets = mul1.object.get("data_offsets").?.array.items;
+        try testing.expectEqual(@as(usize, 2), offsets.len);
+        const lo: usize = @intCast(offsets[0].integer);
+        const hi: usize = @intCast(offsets[1].integer);
+        try testing.expect(lo <= hi and hi <= data.len);
+        try testing.expectEqual(@as(usize, 4), hi - lo);
+        hash.update(data[lo..hi]);
+    }
+    const actual = std.fmt.bytesToHex(hash.finalResult(), .lower);
+    try testing.expectEqualStrings(expected_sha256, &actual);
+}
+
+fn expectPublishedExpert(comptime ks: [3]u8, comptime expert_prefix: []const u8, comptime sample_sha256: []const u8, comptime source_sha256: ?[]const u8, comptime reference_env: [:0]const u8) !void {
+    errdefer std.debug.print("Published expert failed: K={any} expert={s}\n", .{ ks, expert_prefix });
+    const fixture = std.c.getenv(reference_env) orelse return error.ExpertReferenceRequired;
     const a = testing.allocator;
     const bytes = try sdk.io_util.readAllNoCache(a, std.mem.span(fixture), 256 << 20);
     defer a.free(bytes);
@@ -2113,13 +2137,14 @@ fn expectSparkExpert(comptime k: u8, comptime expert_prefix: []const u8, comptim
     try testing.expectEqualStrings(sample_sha256, metadata.object.get("sample_sha256").?.string);
     try testing.expectEqualStrings("bc48d02cb1c14939dc47b90f870dd689d63e3b1ab69a157e65538db68677a6c8", metadata.object.get("codebook_sha256").?.string);
     const data = bytes[8 + n ..];
+    if (source_sha256) |digest| try expectPublishedSource(parsed.value, data, ks, expert_prefix, digest);
     var oracle_arena = std.heap.ArenaAllocator.init(a);
     defer oracle_arena.deinit();
     const oa = oracle_arena.allocator();
     const projections = [3]SparkProjection{
-        try sparkProjection(oa, parsed.value, data, expert_prefix, k, "w1", 5120, 2304),
-        try sparkProjection(oa, parsed.value, data, expert_prefix, k, "w3", 5120, 2304),
-        try sparkProjection(oa, parsed.value, data, expert_prefix, k, "w2", 2304, 5120),
+        try sparkProjection(oa, parsed.value, data, expert_prefix, ks[0], "w1", 5120, 2304),
+        try sparkProjection(oa, parsed.value, data, expert_prefix, ks[1], "w3", 5120, 2304),
+        try sparkProjection(oa, parsed.value, data, expert_prefix, ks[2], "w2", 2304, 5120),
     };
     const expected = try sparkExpected(oa, &projections);
     const prefill_expected = try sparkPrefillExpected(oa, &projections);
@@ -2140,16 +2165,16 @@ fn expectSparkExpert(comptime k: u8, comptime expert_prefix: []const u8, comptim
     };
     const acc = try compactAccepted(&g, &reg, &diag);
     defer acc.deinit(&g);
-    acc.layer_rates[0].compact[0] = .{ k, k, k };
+    acc.layer_rates[0].compact[0] = .{ ks[0], ks[1], ks[2] };
     try acc.routeBanked(&g);
     try acc.checkLayerBank(&g, 0, bank, &diag);
     const bf16_acc = try compactAccepted(&g, &reg, &diag);
     defer bf16_acc.deinit(&g);
-    bf16_acc.layer_rates[0].compact[0] = .{ k, k, k };
+    bf16_acc.layer_rates[0].compact[0] = .{ ks[0], ks[1], ks[2] };
     try bf16_acc.checkLayerBank(&g, 0, bank, &diag);
     try bf16_acc.routeExpertBf16();
     const zero_slots: [129]u32 = @splat(0);
-    for ([_]usize{ 1, 8, 48 }) |rows| {
+    for ([_]usize{ 1, 3, 8, 47, 48 }) |rows| {
         const mark = g.mark();
         defer g.resetTo(mark);
         const act = try publicActs(&g, rows);
@@ -2184,8 +2209,8 @@ fn expectSparkExpert(comptime k: u8, comptime expert_prefix: []const u8, comptim
     }
     // The payload begins beyond 4 GiB; truncating its byte offset reads zeros.
     const high = try sparkBankProjection(&g, projections[2], (@as(u64, 1) << 31) + 256);
-    const act = try publicActs(&g, 1);
-    const ids = try g.hostArray(std.mem.sliceAsBytes(zero_slots[0..1]), &.{1}, .uint32);
+    const act = try publicActs(&g, 3);
+    const ids = try g.hostArray(std.mem.sliceAsBytes(zero_slots[0..3]), &.{3}, .uint32);
     const hidden = try acc.gateUp(&g, act, ids, bank.gate, bank.up);
     const high_out = try acc.down(&g, hidden, ids, high);
     try expectSparkRows(&g, high_out, expected.out, expected.out, 5120, "high-offset direct down");
@@ -2207,7 +2232,16 @@ fn expectSparkExpert(comptime k: u8, comptime expert_prefix: []const u8, comptim
 test "exl3 mixed gpu: full nonrepeated Spark K2 K3 K5 oracles and arena offsets beyond 4 GiB" {
     const enabled = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
     if (std.mem.eql(u8, std.mem.span(enabled), "0")) return error.SkipZigTest;
-    try expectSparkExpert(2, "layers.0.ffn.experts.0.", "108fe9acee54485f014d32fc770ae5673cb92582ed25d3a990d8bc29d30ea526", "DSV41_SPARK_K2_REFERENCE");
-    try expectSparkExpert(3, "layers.10.ffn.experts.1.", "aba3c9f13766c9bf7bbae904cde140ae760a2f569943e03b7ecbc23bb6ab2438", "DSV41_SPARK_K3_REFERENCE");
-    try expectSparkExpert(5, "layers.0.ffn.experts.2.", "d7db53973044421de435e62901243205ba0e1868fb0056bd5da19673db0af014", "DSV41_SPARK_K5_REFERENCE");
+    try expectPublishedExpert(.{ 2, 2, 2 }, "layers.0.ffn.experts.0.", "108fe9acee54485f014d32fc770ae5673cb92582ed25d3a990d8bc29d30ea526", null, "DSV41_SPARK_K2_REFERENCE");
+    try expectPublishedExpert(.{ 3, 3, 3 }, "layers.10.ffn.experts.1.", "aba3c9f13766c9bf7bbae904cde140ae760a2f569943e03b7ecbc23bb6ab2438", null, "DSV41_SPARK_K3_REFERENCE");
+    try expectPublishedExpert(.{ 5, 5, 5 }, "layers.0.ffn.experts.2.", "d7db53973044421de435e62901243205ba0e1868fb0056bd5da19673db0af014", null, "DSV41_SPARK_K5_REFERENCE");
+}
+
+test "exl3 mixed gpu: published Jayleaton mixed K4 K5 production projections" {
+    const enabled = std.c.getenv("DSV41_KERNELS_GPU") orelse return error.SkipZigTest;
+    if (std.mem.eql(u8, std.mem.span(enabled), "0")) return error.SkipZigTest;
+    if (std.c.getenv("DSV41_JAY_K4_REFERENCE") == null and std.c.getenv("DSV41_JAY_K5_REFERENCE") == null)
+        return error.SkipZigTest;
+    try expectPublishedExpert(.{ 3, 3, 4 }, "layers.0.ffn.experts.14.", "765772addd9019c4f16aa149a94083ed10583dffaa908c776b27e6c68f24b5e8", "990c577799282720ac2b8518884141cdf0f5a652a5c7ddbd25e2e46d8f68fe3d", "DSV41_JAY_K4_REFERENCE");
+    try expectPublishedExpert(.{ 4, 4, 5 }, "layers.3.ffn.experts.340.", "9d5fa81241773306693a0bce67c0026b3fdd3ccb67993b633cb9dc30315587de", "c2fe1cc143e01c2115c29dbb6559ac3ae6527ff6499c46a7723f1935fc25ee66", "DSV41_JAY_K5_REFERENCE");
 }

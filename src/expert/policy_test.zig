@@ -880,7 +880,7 @@ test "expert policy: tally: the file round-trips its rates; a missing file, anot
     try testing.expectEqualStrings("glm_moe_dsa-pack-exl3-3.42bpw", key);
 }
 
-test "dsv41 policy: compact admission fits before eviction and preserves protected and routed residents" {
+test "dsv41 policy: compact admission fits before eviction and preserves routed residents" {
     const needs = [_][3]u32{ .{ 2, 3, 5 }, .{ 5, 2, 2 }, .{ 2, 5, 2 }, .{ 2, 2, 2 }, .{ 5, 5, 5 }, .{ 2, 3, 5 }, .{ 5, 2, 2 }, .{ 2, 2, 2 } };
     const capacities = [_][3]u32{ needs[1], needs[0], needs[2], needs[4], needs[1], needs[0], needs[2], needs[4] };
     for ([_]Phase{ .prefill, .decode }) |phase| {
@@ -904,8 +904,9 @@ test "dsv41 policy: compact admission fits before eviction and preserves protect
         try testing.expectEqual(@as(?u32, 2), p.slotOf(3));
         try p.grow(4);
         p.plan(&.{5}, phase, &plan);
-        try testing.expectEqual(@as(?u32, 3), p.slotOf(5));
-        try testing.expectEqual(@as(?u32, 1), p.slotOf(0));
+        try checkPlan(&p, &.{5}, &plan, max_route_ids);
+        try testing.expectEqual(@as(u32, 1), plan.n_persistent);
+        if (phase == .prefill) try testing.expectEqual(@as(?u32, 1), p.slotOf(0));
         for (p.slot_to_expert[0..p.capacity], 0..) |expert, slot| {
             if (expert == no_expert) continue;
             for (needs[expert], capacities[slot]) |need, capacity| try testing.expect(need <= capacity);
@@ -946,4 +947,35 @@ test "dsv41 policy: compact held capacity is never reassigned" {
     p.plan(&.{2}, .prefill, &plan);
     try testing.expectEqual(@as(?u32, null), p.slotOf(0));
     try testing.expectEqual(@as(?u32, 0), p.slotOf(2));
+}
+
+test "dsv41 policy: compact decode replaces cold prefill residents and retains current routes" {
+    const rates = [_][3]u32{ .{ 3, 3, 3 }, .{ 3, 3, 3 }, .{ 3, 3, 3 } };
+    var p = try LayerPolicy.init(testing.allocator, rates.len, 1);
+    defer p.deinit(testing.allocator);
+    p.needs = &rates;
+    p.capacities = &rates;
+    var plan: Plan = .{};
+    p.prepareSeed(&.{0});
+    p.plan(&.{0}, .prefill, &plan);
+    try testing.expect(p.protected.isSet(0));
+    p.plan(&.{1}, .prefill, &plan);
+    try checkPlan(&p, &.{1}, &plan, max_route_ids);
+    try testing.expectEqual(@as(?u32, 0), p.slotOf(0));
+    try testing.expectEqual(@as(?u32, null), p.slotOf(1));
+
+    try p.grow(2);
+    p.plan(&.{1}, .decode, &plan);
+    const routed_slot = p.slotOf(1).?;
+    p.plan(&.{ 1, 2 }, .decode, &plan);
+    try checkPlan(&p, &.{ 1, 2 }, &plan, max_route_ids);
+    try testing.expectEqual(@as(?u32, null), p.slotOf(0));
+    try testing.expectEqual(@as(?u32, routed_slot), p.slotOf(1));
+    try testing.expectEqual(@as(?u32, 0), p.slotOf(2));
+    try testing.expectEqual(@as(u32, 1), plan.n_persistent);
+
+    p.plan(&.{ 1, 2 }, .decode, &plan);
+    try checkPlan(&p, &.{ 1, 2 }, &plan, max_route_ids);
+    try testing.expectEqual(@as(u32, 2), plan.n_hits);
+    try testing.expectEqual(@as(u32, 0), plan.n_loads);
 }

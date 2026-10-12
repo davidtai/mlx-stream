@@ -1290,3 +1290,24 @@ METAL_FUNC void gemv_rate_loop(const device short* base, const device float* xp,
         }
     }
 }
+
+// Each member keeps its own accumulator order; ROWS is selected once outside this loop.
+template <int K, uint TILES, uint COLS, uint UNROLL, uint ROWS>
+METAL_FUNC void gemv_rate_group_loop(const device short* base, const device float* xh,
+                                    thread const uint* members, uint tn, uint lane,
+                                    thread const uint* dr, thread float* acc) {
+    const gemv_lane_plan pl = gemv_lane_plan_of<K>(lane);
+    #pragma clang loop unroll_count(UNROLL)
+    for (uint tk = 0; tk < TILES; ++tk) {
+        const device short* tile = base + (tk * COLS + tn) * (16u * K);
+        uint win[8];
+        gemv_lane_windows<K>(reinterpret_cast<const device uint*>(tile), pl, win);
+        for (uint m = 0; m < 8u; ++m) {
+            const float w = float(dig_cb(win[m]));
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < ROWS; ++r) {
+                acc[r * 8u + m] = metal::fma(xh[members[r] * (TILES * 16u) + tk * 16u + dr[m]], w, acc[r * 8u + m]);
+            }
+        }
+    }
+}

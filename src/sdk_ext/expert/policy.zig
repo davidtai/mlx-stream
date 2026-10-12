@@ -799,7 +799,7 @@ pub const LayerPolicy = struct {
         return admission;
     }
 
-    /// Rank misses before choosing destinations, without evicting any incompatible resident.
+    /// Decode ranks supersede prefill protection; destinations must still fit each projection.
     fn capacityAdmissions(p: *LayerPolicy, out: *const Plan) []u32 {
         const candidates = p.candidates[0..out.n_misses];
         @memcpy(candidates, out.missesOf());
@@ -815,7 +815,7 @@ pub const LayerPolicy = struct {
                 var best: ?u32 = null;
                 for (p.slot_to_expert[0..p.capacity], 0..) |resident, slot| {
                     if (used[slot] != 0 or p.held.isSet(slot) or !p.fits(expert, slot, larger)) continue;
-                    if (resident != no_expert and (p.in_route.isSet(resident) or p.protected.isSet(resident) or !p.rankLess(resident, expert))) continue;
+                    if (resident != no_expert and (p.in_route.isSet(resident) or !p.rankLess(resident, expert))) continue;
                     if (best == null or resident == no_expert or
                         (p.slot_to_expert[best.?] != no_expert and p.rankLess(resident, p.slot_to_expert[best.?]))) best = @intCast(slot);
                     if (resident == no_expert) break;

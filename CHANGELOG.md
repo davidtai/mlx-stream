@@ -99,6 +99,9 @@
     `expert_wide_depth` honors every depth the stream takes (1 to 5; 3 and 4 were ignored before); the gate ring holds
     512 gates of up to 768 tickets.
   - opt-in reads straight into the slot rows (`expert_io.Options.direct`, no staging, no copy) for page-aligned ranges.
+- Add a standalone real-expert EXL3 benchmark for direct and three-bank decode, with correctness-gated variant screening and isolated Metal profiling, without loading a model or server.
+- Speed up compact mixed-rate expert decoding by sharing weight decoding across repeated expert rows and tuning loop unrolling without changing numerical outputs.
+- Let mixed-rate expert caches replace cold prompt experts during decode while preserving slot-capacity and in-flight ownership checks.
 - Stream compact K2–K5 per-expert MUL1 mixtures without widest-rate cache padding, with capacity-aware admission and settled-only device routing.
 - Stream K2/K3/K4 MUL1 experts with mixed projection rates, exact cache/read-buffer accounting, and independent GPU regressions while retaining the tight K3 path.
 - Include separately billed expert metadata in the construction verifier's host-memory allowance.

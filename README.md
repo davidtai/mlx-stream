@@ -58,16 +58,18 @@ Compact caches concatenate each slot's actual code capacity instead of padding a
 U64 descriptors carry code-word offsets and logical rates; immutable slot capacities bound every refill.
 Persistent and transient arenas, descriptor arrays, growth and construction peaks are billed from those capacities.
 Only settled slots enter the device lookup table; the missing-slot sentinel is distinct from the valid slot zero.
-Compact decode selects each expert's bit width once and reuses loaded code words while decoding its weights.
-This avoids repeated packed-weight reads without changing accumulation order or adding kernel launches.
+Compact decode selects each expert's bit width once and shares packed-weight decoding across up to three rows
+that select the same expert. Direct and three-bank GEMVs use two-tile loop unrolling without changing F32
+accumulation or reduction order or adding kernel launches. Fixed-layout K3 and prefill kernels are unchanged.
 
 | Published source | Expert contract | Status |
 |---|---|---|
 | [Pollard 3.5](https://huggingface.co/bot-lab-21/DeepSeek-V4.1-Flash-EXL3-3.5bpw-Pollard/tree/f129e31a81e1337aa33e129e2d847fc7e37c8733) | K3/K4 per projection; native non-expert tensors | Complete-checkpoint serving validated with a checked streaming repack. |
 | [Spark 2.77](https://huggingface.co/0xSero/DeepSeek-V4.1-Flash-Spark/tree/9e3bbeabbb39fa2cf6e37e1cecfbd2fd0290329f) | K2/K3/K5 per expert; native trunk/draft | Complete-checkpoint serving validated with a checked streaming repack selecting `exl3/plan/J268-ho-v31-K5n.json`, not unused alternate tensors. |
+| [Jayleaton 2.8](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw/tree/915e1d0de8ee0a99944c5bc88ab802a639c63380) | K2–K5 per expert/projection | Expert-only hybrid validated with the original K3 pack's native trunk/draft; not a complete-checkpoint port. |
 | [Mia 2.9](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw/tree/64ba41b6c916a587db06eae2e19b7845f7be6e6b) | K2/K3 routed layers, plus EXL3 trunk/draft | Not a drop-in checkpoint; replacing its trunk/draft would create a different model. |
 
-Advertised bpw is an average, not a decoder rate or codec. Spark 2.77 is the near-2.8 candidate checked here.
+Advertised bpw is an average, not the bit width used by every projection.
 MCG, fractional decoder rates, K6–K8 and EXL3 trunk/draft tensors remain unsupported.
 
 ## How mlx-serve consumes it
@@ -269,8 +271,9 @@ The oracle is the unmodified [PonyExl3 CPU reference](https://github.com/beamiva
 not mlx-stream output or an ExLlamaV3 CUDA capture. It first checks all 65,536 MUL1 entries and calibrates against
 Sushi's K2/K3/K4 fixtures; the receipt records library, input, output and comparison-policy provenance.
 
-The compact GPU gate covers K2–K5 mixtures, all three banks, carried BF16 waves across 128-row boundaries,
-poisoned missing slots, full real K2/K3/K5 experts and code addresses beyond 4 GiB. Full-expert prefill checks bounded
+The compact GPU gate covers K2–K5 mixtures, all three banks, repeated experts and odd group tails, carried BF16
+waves across 128-row boundaries, poisoned missing slots, published Spark/Jay experts and down-code offsets
+beyond 4 GiB. Full-expert prefill checks bounded
 independent arithmetic plus exact terminal rounding: F32 outputs match Pony-inner CPU references with per-block
 FP16 activation stores and f32 projection/SwiGLU boundaries at the original dense-public f64 RMS/64 budget.
 Paired BF16 outputs must equal CPU nearest-even rounding of those verified F32 outputs, bit for bit, for each
@@ -281,6 +284,14 @@ its assets, and missing assets fail rather than count as numerical passes.
 Run the capture tool's tests with `python3 scripts/test_capture_exl3_cpu_reference.py`. Set
 `PONY_EXL3_REFERENCE`, `SUSHI_EXL3_FIXTURES` and all three `DSV41_SPARK_K{2,3,5}_SAMPLE` paths to exercise the real
 capture pipeline, including corrupted reference/trellis/scale rejection; missing enabled assets are not numerical passes.
+
+The optional `published Jayleaton mixed K4 K5` GPU test uses `DSV41_JAY_K4_REFERENCE` and
+`DSV41_JAY_K5_REFERENCE` for layer-0/expert-14 (K3/K3/K4) and layer-3/expert-340 (K4/K4/K5) from
+[`jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw/tree/915e1d0de8ee0a99944c5bc88ab802a639c63380).
+These mixed-projection Pony reference fixtures are separate from the uniform-rate Spark capture command above.
+Both are required when either is supplied; neither supplied skips this test. In addition to the numerical checks,
+it pins all twelve embedded source tensors' bytes after validating their names, dtypes and shapes, without
+pinning platform-dependent floating-point reference outputs.
 
 To reproduce a pinned sample, download its selected shard from the Spark revision linked above, then extract only
 the unchanged reference tensors below. This creates a test fixture, not a streaming pack; canonical container

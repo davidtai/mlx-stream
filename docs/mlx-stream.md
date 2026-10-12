@@ -306,6 +306,140 @@ What the SDK gained for it (each optional or a construction default, so DeepSeek
 The conformance suite checks that each arch claims only its own pack and that both share one reader claim
 (`ExpertReaderInUse`). MiMo, like DeepSeek-V4.1, owns its decode state, so `sdk.KVCache` is still not built.
 
+## Compact expert decode
+
+Direct and three-bank compact GEMVs group up to three routed rows selecting the same expert, decoding each
+weight once for the group. A leader owns consecutive occurrences of the full encoded ID, including its bank;
+followers do not write, partial groups use their actual size, and singletons retain the scalar loop. Missing
+banked rows write zeros before descriptor access. Each row keeps its original F32 FMA and reduction order.
+Grouping is within one routed call, not across HTTP requests; fixed-layout K3 and prefill paths are unchanged.
+
+Compact decode admission follows the same changing expert rankings as fixed-layout K3: prefill protection
+does not pin cold experts throughout generation. Replacements must fit every projection's slot capacity
+and cannot overwrite current-route or held rows; prefill protection and stream pin lifetimes are unchanged.
+
+## Freestanding EXL3 tuning
+
+`exl3-bench` runs the production expert quant path on selected real bank records without loading a model,
+attention, Engram or a server. `--workload decode` exercises gate/up → SwiGLU → down → six-route weighted
+reduction at 1–8 token rows; `--workload prefill` exercises the production prefill path at 1–256 rows. Select
+1–6 unique experts; fewer than six are reused across the six routed assignments. Use 128 and 129 prefill rows
+as separate workloads when screening the prefill dispatch boundary. Each workload must pass its native numerical
+check before timing; the batch runner additionally requires the candidate's output digest to match the baseline
+exactly. A tolerance-passing native check alone does not make a changed-output candidate eligible for a speed score.
+Decode installs the served stack4 `gu_one`/`down_pair` forms, subject to the production storage guards.
+`--route direct` (default) uses one bank. `--route banked` selects the production three-bank decode kernels:
+selected slots are assigned round-robin to bank bindings sharing one weight arena, without duplicating weights.
+Banked outputs are checked against direct single-row outputs. This does not simulate independent bank storage,
+SSD throughput, cache residency or concurrent requests. Banked prefill is rejected.
+
+With the host's pinned Zig on `PATH`, its MLX libraries staged, and `HOST_CHECKOUT` naming that checkout, build
+only the focused target from this plugin checkout:
+
+```sh
+zig build exl3-bench -Dmlx-serve="$HOST_CHECKOUT" -Doptimize=ReleaseFast
+./zig-out/bin/exl3-bench --help
+```
+
+This target installs `zig-out/bin/exl3-bench` without building the server. Help does not require weights or a GPU.
+Native JSON reports use `schema_version: 1`, identify `bank_sha256`, `workload_sha256`, `input_sha256` and
+`output_sha256`, and echo the common workload arguments. `bank_sha256` identifies validated bank metadata and
+record digests, not a fresh read of every unselected payload. `setup_us` is separate from resident
+`timing: {unit: "us", samples: [...], median: ...}`; check/profile timing is null.
+Output stability compares checked outputs before and after the loop; it does not hash every timed iteration.
+
+### Separate-binary batch screening
+
+Build the same harness in each real candidate tree, keeping that tree's pinned kernel registry consistent, and
+retain a distinct executable for each variant. The runner does not generate optimizations or silently select
+alternative kernels. Its manifest is a JSON list of exactly `name` and `binary` per entry, for example:
+
+```json
+[
+  {"name": "baseline", "binary": "binaries/baseline/exl3-bench"},
+  {"name": "candidate-a", "binary": "binaries/candidate-a/exl3-bench"}
+]
+```
+
+These are example labels and paths, not supplied implementations or measured results. Extend the list with all
+actual candidate builds: there is no ten-variant limit. Names must be unique ASCII labels beginning with a letter
+or digit and containing only letters, digits, `.`, `_` and `-` (at most 64 characters). Executable paths resolve
+relative to the manifest, must exist and be executable, and must be distinct after symlink resolution. Binary
+SHA-256, size and modification time are recorded; a changed binary aborts the run.
+
+From the plugin checkout, with `VARIANTS`, `BANK` and `SUSHI_CHECKOUT` set to the manifest, real expert-bank path
+and Sushi checkout respectively:
+
+```sh
+python3 scripts/bench_exl3_variants.py \
+  --variants "$VARIANTS" --baseline baseline \
+  --bank "$BANK" --layer 0 --experts 0,1,2,3,4,5 \
+  --workload decode --route banked --rows 1 --warmup 10 --iterations 100 --repeats 5 \
+  --rounds 12 --seed 42 --gpu-lock "$SUSHI_CHECKOUT/scripts/gpu-lock.sh" \
+  --output "$HOME/.sushi/runs/exl3-decode-screen"
+```
+
+Choose IDs and layer present in that bank. For prefill, use `--workload prefill --route direct --rows 128`, then run
+a separate output directory with `--rows 129`; do not compare unlike workloads or routes. Every output directory must be new.
+Build ReleaseFast before running and follow the quiet-box, power and thermal protocol; the lock cannot stop
+uncooperative CPU/I/O jobs, so wait for bank exports and other disruptive work to finish first.
+
+The runner checks the baseline and every candidate before starting any timed invocation. It requires matching
+bank, deterministic input, workload and output SHA-256 identities, layer, expert IDs, projection rates and row
+count; echoed timing knobs must match the requested values too. Invalid JSON, missing/nonfinite/inconsistent
+metrics, failed checks, binary changes, timeouts and nonzero exits fail the session without retries or scores.
+Raw stdout/stderr, lock logs and failed records remain in `raw/`; `report.json` is updated after each invocation.
+Already completed valid raw timings remain available after a failure, but an incomplete session publishes no
+aggregate score.
+
+Each round is `baseline, candidate, baseline, candidate, …, baseline`. A seeded shuffle chooses the initial
+candidate order, subsequent rounds rotate it, and successive full cycles reverse direction; every candidate
+occupies every position once per complete cycle. Each candidate's paired speedup is the mean of its two
+bracketing baseline medians divided by its own median, and the reported score is the median of those per-round
+ratios (`>1` means faster). Use at least as many rounds as candidates for a complete position-balanced cycle.
+These are **same-boot separate-process** comparisons, not same-process A/B evidence; startup, JIT and warmup
+are outside the native resident timing window. Preserve the raw samples and corroborate small differences rather
+than treating a ranking as a proven speedup.
+
+The runner invokes one process at a time under `taskpolicy -a`, acquires the shared GPU lock immediately before
+each native invocation (including correctness checks), and releases it immediately afterward. It owns and cleans
+up only its child process groups, never other servers or jobs. The default per-invocation timeout is 600 seconds;
+`--timeout` changes it without enabling retries. Lock queue waiting is not part of the native timeout or timing.
+SIGINT/SIGTERM during lock acquisition or release are deferred until ownership settles; cancelling while queued
+therefore waits for that acquisition to finish, then releases without starting the workload.
+
+### One-variant Metal profiling
+
+Use a separate run for capture, selecting exactly one real variant:
+
+```sh
+python3 scripts/bench_exl3_variants.py \
+  --variants "$VARIANTS" --baseline baseline --mode profile --variant candidate-a \
+  --bank "$BANK" --layer 0 --experts 0,1,2,3,4,5 \
+  --workload prefill --rows 129 --warmup 10 --iterations 10000 --repeats 1 \
+  --timeout 1800 --gpu-lock "$SUSHI_CHECKOUT/scripts/gpu-lock.sh" \
+  --output "$HOME/.sushi/runs/exl3-prefill-profile"
+```
+
+The baseline and selected variant still pass correctness preflight; only the selected variant then runs the
+repetitive profile workload. While its `profile` record is running in `report.json`, attach Instruments' Metal
+System Trace to that `exl3-bench` process. Inspect command-buffer scheduling, GPU idle gaps, dispatch durations
+and available per-kernel counters; use Xcode's Metal profiling tools for shader-level investigation where
+supported. Keep captures with this run's binary provenance and record the actual profiler settings. The runner
+does not initiate a capture itself. `profile` reports have `timing: null` and no benchmark score: capture overhead
+is never presented as performance evidence. Repeat resident screening without instrumentation for timing.
+For `xctrace --launch`, target `exl3-bench` directly rather than its QoS wrapper; apply `taskpolicy -a` to the
+tracer. Verify the trace names the native process and contains GPU events. The template alone does not enable
+GPU counters or shader timelines: check the recorded settings before making occupancy or bandwidth claims.
+
+CPU-only runner behavior tests (no bank or GPU required):
+
+```sh
+python3 -m unittest discover -s scripts -p test_bench_exl3_variants.py
+```
+Set `EXL3_GPU_LOCK_TEST_SCRIPT` to the shared lock script to include its real publication/cancellation regression;
+the test uses a private temporary lock directory and does not acquire the machine's GPU lock.
+
 ## Not built yet
 
 As the proposal plans, a kind's full interface lands with its first real consumer. Not built yet:
