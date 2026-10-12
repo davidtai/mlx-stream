@@ -1,0 +1,4129 @@
+{
+ "format": "mlx-stream-mimo-kernels-v1",
+ "headers": [
+  {
+   "bytes": 1410,
+   "file": "header_mimo_moe_mx.metal",
+   "id": "mimo_moe_mx",
+   "sha256": "f8990474002797961455a52c45627c55d88e728100e603c07283b7080b5e272e"
+  },
+  {
+   "bytes": 488,
+   "file": "header_mimo_moe_combine.metal",
+   "id": "mimo_moe_combine",
+   "sha256": "7775d246af98f9758c34de4a8a36595b5eb32b1bb5d9df23e45ced0fde5e8a36"
+  },
+  {
+   "bytes": 1984,
+   "file": "header_mimo_moe_union.metal",
+   "id": "mimo_moe_union",
+   "sha256": "451075e94d4ed4bff196204d1f7b2f07217ef0e6f9ec4d7299baea0679845784"
+  },
+  {
+   "bytes": 5092,
+   "file": "header_mimo_moe_k1.metal",
+   "id": "mimo_moe_k1",
+   "sha256": "e1110fa24909f63a44116db4ef19b769b092fc81101a08dac329a6f0a3282bde"
+  }
+ ],
+ "kernels": [
+  {
+   "atomic_outputs": false,
+   "class": "rounding-class",
+   "donor": "mlx-serve 7a9e392f src/moe_fp4.zig mlxserve_moe_fp4_gateup_mx: banked ids, x per pair, f32 SiLU",
+   "ensure_row_contiguous": true,
+   "family": "mimo_moe",
+   "header": {
+    "id": "mimo_moe_mx"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "x",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "g0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "gs0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "u0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "us0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "g1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "gs1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "u1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "us1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "g2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "gs2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "u2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "us2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "ids",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      32,
+      512,
+      1
+     ],
+     "note": "grid (32, N/ROWS, P)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 1
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      7
+     ],
+     "note": "grid (32, N/ROWS, P)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       7,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 7
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      8
+     ],
+     "note": "grid (32, N/ROWS, P)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 8
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      32
+     ],
+     "note": "grid (32, N/ROWS, P)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       32,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 32
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      48
+     ],
+     "note": "grid (32, N/ROWS, P)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       48,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 48
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    }
+   ],
+   "name": "mimo_moe_mx_gateup_banked",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y"
+    }
+   ],
+   "phase": "decode",
+   "source": {
+    "bytes": 1488,
+    "file": "mimo_moe_mx_gateup_banked.metal",
+    "sha256": "8be3fc00dcf9ef1cda1b79f8f3ccf431af2493a4cbfee9da849b8d5b2774b834"
+   },
+   "vars": [
+    {
+     "lo": 1,
+     "name": "S0"
+    },
+    {
+     "lo": 1,
+     "name": "S1"
+    },
+    {
+     "lo": 1,
+     "name": "S2"
+    },
+    {
+     "lo": 1,
+     "name": "P"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "rounding-class",
+   "donor": "mlx-serve 7a9e392f src/moe_fp4.zig mlxserve_moe_fp4_downred_mx: per-pair rows (no score fold), banked ids",
+   "ensure_row_contiguous": true,
+   "family": "mimo_moe",
+   "header": {
+    "id": "mimo_moe_mx"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "act",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      },
+      {
+       "m": 2048
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "d0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "ds0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 64
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "d1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "ds1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 64
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "d2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "ds2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 64
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "ids",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      32,
+      1024,
+      1
+     ],
+     "note": "grid (32, H/ROWS, P)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 1
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      7
+     ],
+     "note": "grid (32, H/ROWS, P)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       7,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 7
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      8
+     ],
+     "note": "grid (32, H/ROWS, P)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 8
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      32
+     ],
+     "note": "grid (32, H/ROWS, P)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       32,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 32
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      48
+     ],
+     "note": "grid (32, H/ROWS, P)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       48,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 48
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    }
+   ],
+   "name": "mimo_moe_mx_down_banked",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y"
+    }
+   ],
+   "phase": "decode",
+   "source": {
+    "bytes": 1024,
+    "file": "mimo_moe_mx_down_banked.metal",
+    "sha256": "d4254a226c1b9635931bcd3702ea49870708e86e2ab6bd4835ebc27b726f839c"
+   },
+   "vars": [
+    {
+     "lo": 1,
+     "name": "S0"
+    },
+    {
+     "lo": 1,
+     "name": "S1"
+    },
+    {
+     "lo": 1,
+     "name": "S2"
+    },
+    {
+     "lo": 1,
+     "name": "P"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact (the arch's Metal fold)",
+   "ensure_row_contiguous": true,
+   "family": "mimo_moe",
+   "header": {
+    "id": "mimo_moe_combine"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "rows",
+     "shape": [
+      {
+       "m": 8,
+       "v": "n"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "w",
+     "shape": [
+      {
+       "m": 1,
+       "v": "n"
+      },
+      {
+       "m": 8
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      4096,
+      1,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "TOPK"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "n",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      4096,
+      4,
+      1
+     ],
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       4,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "TOPK"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "n",
+       "value": 4
+      }
+     ]
+    }
+   ],
+   "name": "mimo_moe_combine",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y"
+    }
+   ],
+   "phase": "decode",
+   "source": {
+    "bytes": 368,
+    "file": "mimo_moe_combine.metal",
+    "sha256": "b4c230ea12d509d1fbebbd12a5193e9aa87749a2703a507a885ab61925e7e617"
+   },
+   "vars": [
+    {
+     "lo": 1,
+     "name": "n"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact vs mimo_moe_mx_gateup_banked per pair (same per-row products, partial sums and fold; device self-check bitwise)",
+   "donor": "mimo_moe_mx_gateup_banked with the union rule: the leader pair of each slot reads the slot once for up to MAXM member pairs",
+   "ensure_row_contiguous": true,
+   "family": "mimo_moe",
+   "header": {
+    "append": "mimo_moe_union",
+    "id": "mimo_moe_mx"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "x",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "g0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "gs0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "u0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "us0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "g1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "gs1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "u1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "us1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "g2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "gs2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "u2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "us2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "ids",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      32,
+      512,
+      1
+     ],
+     "note": "grid (32, N/ROWS, P); a threadgroup whose pair is not its slot union leader returns",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 1
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      7
+     ],
+     "note": "grid (32, N/ROWS, P); a threadgroup whose pair is not its slot union leader returns",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       7,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 7
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      8
+     ],
+     "note": "grid (32, N/ROWS, P); a threadgroup whose pair is not its slot union leader returns",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 8
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      32
+     ],
+     "note": "grid (32, N/ROWS, P); a threadgroup whose pair is not its slot union leader returns",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       32,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 32
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      48
+     ],
+     "note": "grid (32, N/ROWS, P); a threadgroup whose pair is not its slot union leader returns",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       48,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 48
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    }
+   ],
+   "name": "mimo_moe_mx_gateup_union",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y"
+    }
+   ],
+   "phase": "decode",
+   "source": {
+    "bytes": 2071,
+    "file": "mimo_moe_mx_gateup_union.metal",
+    "sha256": "f23cbd16a3eddc6defceb7e2b55211b2440ac071d0e5859a287eca16d48cef95"
+   },
+   "vars": [
+    {
+     "lo": 1,
+     "name": "S0"
+    },
+    {
+     "lo": 1,
+     "name": "S1"
+    },
+    {
+     "lo": 1,
+     "name": "S2"
+    },
+    {
+     "lo": 1,
+     "name": "P"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact vs mimo_moe_mx_down_banked per pair (same per-row products, partial sums and fold; device self-check bitwise)",
+   "donor": "mimo_moe_mx_down_banked with the union rule: the leader pair of each slot reads the slot once for up to MAXM member pairs",
+   "ensure_row_contiguous": true,
+   "family": "mimo_moe",
+   "header": {
+    "append": "mimo_moe_union",
+    "id": "mimo_moe_mx"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "act",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      },
+      {
+       "m": 2048
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "d0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "ds0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 64
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "d1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "ds1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 64
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "d2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "ds2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 64
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "ids",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      32,
+      1024,
+      1
+     ],
+     "note": "grid (32, H/ROWS, P); a threadgroup whose pair is not its slot union leader returns",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 1
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      7
+     ],
+     "note": "grid (32, H/ROWS, P); a threadgroup whose pair is not its slot union leader returns",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       7,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 7
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      8
+     ],
+     "note": "grid (32, H/ROWS, P); a threadgroup whose pair is not its slot union leader returns",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 8
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      32
+     ],
+     "note": "grid (32, H/ROWS, P); a threadgroup whose pair is not its slot union leader returns",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       32,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 32
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      48
+     ],
+     "note": "grid (32, H/ROWS, P); a threadgroup whose pair is not its slot union leader returns",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       48,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 48
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    }
+   ],
+   "name": "mimo_moe_mx_down_union",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y"
+    }
+   ],
+   "phase": "decode",
+   "source": {
+    "bytes": 1481,
+    "file": "mimo_moe_mx_down_union.metal",
+    "sha256": "7f7d0bcff647d59f1511e1fb95853da93ca03bbbbe0c39e771c5a67d4f5f4fa4"
+   },
+   "vars": [
+    {
+     "lo": 1,
+     "name": "S0"
+    },
+    {
+     "lo": 1,
+     "name": "S1"
+    },
+    {
+     "lo": 1,
+     "name": "S2"
+    },
+    {
+     "lo": 1,
+     "name": "P"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact vs mimo_moe_mx_gateup_banked per pair (the banked texts' per-lane products, partial sums, fold, simd_sum and epilogue; device self-check bitwise)",
+   "donor": "mimo_moe_mx_gateup_banked + the union rule (mimo/m4-attribution): two FP4 codes per integer op, the union by simdgroup vote, the next chunk's codes and scales loaded ahead",
+   "ensure_row_contiguous": true,
+   "family": "mimo_moe",
+   "header": {
+    "append": "mimo_moe_k1",
+    "id": "mimo_moe_mx"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "x",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "g0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "gs0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "u0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "us0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "g1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "gs1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "u1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "us1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "g2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "gs2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "u2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 512
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "us2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 2048
+      },
+      {
+       "m": 128
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "ids",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      32,
+      512,
+      1
+     ],
+     "note": "grid (32, N/ROWS, P); P <= 8: ROWS 4, MAXM 1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 1,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 1
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      7
+     ],
+     "note": "grid (32, N/ROWS, P); P <= 8: ROWS 4, MAXM 1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       7,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 1,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 7
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      8
+     ],
+     "note": "grid (32, N/ROWS, P); P <= 8: ROWS 4, MAXM 1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 1,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 8
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      9
+     ],
+     "note": "grid (32, N/ROWS, P); P >= 9: ROWS 2, MAXM 4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       9,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 2,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 9
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      16
+     ],
+     "note": "grid (32, N/ROWS, P); P >= 9: ROWS 2, MAXM 4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       16,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 2,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 16
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      24
+     ],
+     "note": "grid (32, N/ROWS, P); P >= 9: ROWS 2, MAXM 4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       24,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 2,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 24
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      32
+     ],
+     "note": "grid (32, N/ROWS, P); P >= 9: ROWS 2, MAXM 4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       32,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 2,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 32
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      48
+     ],
+     "note": "grid (32, N/ROWS, P); P >= 9: ROWS 2, MAXM 4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       48,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 2,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 48
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      512,
+      8
+     ],
+     "note": "grid (32, N/ROWS, P); P <= 8: ROWS 4, MAXM 1; FMA 1: the timed rounding-class alternative (never routed)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 1,
+       "name": "MAXM"
+      },
+      {
+       "int": 1,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 8
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      32
+     ],
+     "note": "grid (32, N/ROWS, P); P >= 9: ROWS 2, MAXM 4; FMA 1: the timed rounding-class alternative (never routed)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       32,
+       2048
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 2,
+       "name": "ROWS"
+      },
+      {
+       "int": 4096,
+       "name": "K"
+      },
+      {
+       "int": 2048,
+       "name": "N"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 1,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 32
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    }
+   ],
+   "name": "mimo_moe_k1_gateup",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y"
+    }
+   ],
+   "phase": "decode",
+   "source": {
+    "bytes": 3900,
+    "file": "mimo_moe_k1_gateup.metal",
+    "sha256": "e9371ffe0182c179ea717caba05daec9eab2eae03a35f7605615e3511d5b5942"
+   },
+   "vars": [
+    {
+     "lo": 1,
+     "name": "S0"
+    },
+    {
+     "lo": 1,
+     "name": "S1"
+    },
+    {
+     "lo": 1,
+     "name": "S2"
+    },
+    {
+     "lo": 1,
+     "name": "P"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact vs mimo_moe_mx_down_banked per pair (the banked texts' per-lane products, partial sums, fold, simd_sum and epilogue; device self-check bitwise)",
+   "donor": "mimo_moe_mx_down_banked + the union rule (mimo/m4-attribution): two FP4 codes per integer op, the union by simdgroup vote, the next chunk's codes and scales loaded ahead",
+   "ensure_row_contiguous": true,
+   "family": "mimo_moe",
+   "header": {
+    "append": "mimo_moe_k1",
+    "id": "mimo_moe_mx"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "act",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      },
+      {
+       "m": 2048
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "d0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "ds0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S0"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 64
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "d1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "ds1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S1"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 64
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "d2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "ds2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "S2"
+      },
+      {
+       "m": 4096
+      },
+      {
+       "m": 64
+      }
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "ids",
+     "shape": [
+      {
+       "m": 1,
+       "v": "P"
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      32,
+      1024,
+      1
+     ],
+     "note": "grid (32, H/ROWS, P); P <= 8: ROWS 4, MAXM 1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 1,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 1
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      7
+     ],
+     "note": "grid (32, H/ROWS, P); P <= 8: ROWS 4, MAXM 1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       7,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 1,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 7
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      8
+     ],
+     "note": "grid (32, H/ROWS, P); P <= 8: ROWS 4, MAXM 1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 1,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 8
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      9
+     ],
+     "note": "grid (32, H/ROWS, P); P >= 9: ROWS 4, MAXM 4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       9,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 9
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      16
+     ],
+     "note": "grid (32, H/ROWS, P); P >= 9: ROWS 4, MAXM 4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       16,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 16
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      24
+     ],
+     "note": "grid (32, H/ROWS, P); P >= 9: ROWS 4, MAXM 4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       24,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 24
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      32
+     ],
+     "note": "grid (32, H/ROWS, P); P >= 9: ROWS 4, MAXM 4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       32,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 32
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      48
+     ],
+     "note": "grid (32, H/ROWS, P); P >= 9: ROWS 4, MAXM 4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       48,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 0,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 48
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      8
+     ],
+     "note": "grid (32, H/ROWS, P); P <= 8: ROWS 4, MAXM 1; FMA 1: the timed rounding-class alternative (never routed)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 1,
+       "name": "MAXM"
+      },
+      {
+       "int": 1,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 8
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    },
+    {
+     "grid": [
+      32,
+      1024,
+      32
+     ],
+     "note": "grid (32, H/ROWS, P); P >= 9: ROWS 4, MAXM 4; FMA 1: the timed rounding-class alternative (never routed)",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       32,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "ROWS"
+      },
+      {
+       "int": 2048,
+       "name": "I"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      },
+      {
+       "int": 32,
+       "name": "GS"
+      },
+      {
+       "int": 4,
+       "name": "MAXM"
+      },
+      {
+       "int": 1,
+       "name": "FMA"
+      }
+     ],
+     "threadgroup": [
+      32,
+      2,
+      1
+     ],
+     "vars": [
+      {
+       "name": "P",
+       "value": 32
+      },
+      {
+       "name": "S0",
+       "value": 124
+      },
+      {
+       "name": "S1",
+       "value": 8
+      },
+      {
+       "name": "S2",
+       "value": 96
+      }
+     ]
+    }
+   ],
+   "name": "mimo_moe_k1_down",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y"
+    }
+   ],
+   "phase": "decode",
+   "source": {
+    "bytes": 2742,
+    "file": "mimo_moe_k1_down.metal",
+    "sha256": "d423da6100ee9af2fbd463019c042421b33c6d5147defe36dad057fedcd9b785"
+   },
+   "vars": [
+    {
+     "lo": 1,
+     "name": "S0"
+    },
+    {
+     "lo": 1,
+     "name": "S1"
+    },
+    {
+     "lo": 1,
+     "name": "S2"
+    },
+    {
+     "lo": 1,
+     "name": "P"
+    }
+   ]
+  }
+ ],
+ "note": "L5 fused MoE decode (design-decode-fusion-20261007 2c). Pairs P = routed (token, k) pairs of one wave; M <= 4 tokens -> P <= 32; 48 = max_route_ids. P < 8 passes ids as constant (MLX metal_kernel max_constant_array_size). M4 lever 1 (mimo/m4-attribution): a served wave wider than one token (P > 8: the verify rows) takes the union texts, one read per distinct slot; P <= 8 (every serial call) keeps the banked texts and their template arguments; the banked texts are also the union texts' bitwise reference in the device self-check. K1 (mimo/k1-moe-bw): `decode_moe_kernel: k1` binds the k1 texts at every wave width (MAXM 1 at P <= 8, the union rule at MAXM 4 from P >= 9); per member row the banked texts' arithmetic bit for bit (FMA 0). FMA 1 (one FMA per weight, block scale folded once per lane block) is a rounding-class alternative the m4attr family times; no route binds it.",
+ "port_addenda": []
+}

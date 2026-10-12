@@ -2,6 +2,103 @@
 
 ## Unreleased
 
+- MiMo-V2.6-Flash, the second arch (`mimo_v2_flash`, src/arch/mimo_v2/): its 12,032 routed experts stream from the SSD
+  as an MXFP4 expert bank (`experts.bin`, format `mlx-stream-mxfp4-expert-bank-v1`) through the same reader as
+  DeepSeek-V4.1's; the trunk is resident in the release's FP8 (the fp8res pack, of record) or in BF16 (bf16res); the
+  pack's three MTP heads drive a draft lane (depth 1-3, typical or exact acceptance). The arch claims only a prepared
+  pack (`model_type: mimo_v2_flash` plus the `expert_streaming` block), bills prompt rows and decode rows apart with
+  the host side at its measured readings, and ships its Metal kernels pinned by six manifests
+  (src/arch/mimo_v2/kernels/, `scripts/compile_mimo_kernels_offline.py`). See docs/mimo.md and docs/mimo-pack.md.
+- MiMo-V2.6-Flash's settings live in the pack: the `settings` object of `config.json`'s `expert_streaming` block, read
+  once at construction. An unknown key, a wrong type or an unknown value refuses the load by name. No environment
+  variable or CLI flag selects a route; the host's per-model `ctx_size`, `kv_quant` and `mtp` stay the host's load
+  facts. A lab A/B uses a copy of `config.json` with every other pack file hard-linked.
+- `sdk_ext.acceptance`: one acceptance module for every draft lane (the exact and typical rules, the sampled path,
+  seeded draws keyed by position). DeepSeek-V4.1's DSpark lane now uses it with the same decisions, pinned by a
+  characterization frozen on the previous tree; its four sampling tests moved into the `acceptance` suite. The
+  rule-on-every-request form (`acceptGeneral`) is MiMo's only.
+- Expert reader: `q3ld_withdraw` (`Pool.withdraw`) takes a queued job that no worker has started back out of the
+  queue, by its first ticket: nothing is read and no row written (status `withdrawn`); a job already taken, or whose
+  bytes a pre-range or a live event gate is waiting on, runs as submitted. `Pool.quiesce` expires unbound reads and
+  waits for the pool's activity to stop. The reader's ABI moves from 2026100201 to 2026101001. DeepSeek-V4.1 calls
+  neither.
+- Expert stream: the prompt pass's read schedule and a decode window narrower than the widest route are construction
+  options; DeepSeek-V4.1 passes neither and keeps the stock schedule. Slot arrays take their dtype from the bank.
+- SDK: `LoadFacts.effective_context` (the context the load serves), `LoadFacts.kv_quant_bits` and
+  `Shell.kv_quant_bits` (optional, null by default); `sdk.plugin_profile` follows the host's profile build option when
+  the host declares one. DeepSeek-V4.1 reads none of them.
+- MiMo-V2.6-Flash lines of record in the README (MiMo-V2.6-Flash): fp8res pack, KV bf16, draft lane on, rows pinned per
+  cell, card sampling (temperature 1.0, top_p 0.95, seed 1, thinking on, 16,384-token cap), on server sha256
+  `746e7da9` (host `2c041af6` + this tree at `8e7d186`) unless named. The binary of record, `4b018c54` (this tree at
+  `05fc760`), differs from `746e7da9` only by the hot-path audit and the dead code sweep and reproduces its 16K cell
+  token for token (stamp16k-g15-20261011: 998.8 / 32.30 tok/s prefill / decode, 688 tokens; `746e7da9`: 1,003.9 /
+  31.6). The 16K card pair at 134 / 152 rows (on `b00df80e`, which installs the same routes up to 32,768 context):
+  996.4 / 1,003.2 tok/s prefill (mean 999.8), 28.40 / 28.10 tok/s decode (mean 28.25), 16.44 / 16.33 s TTFT, 107.81 GB
+  peak. The card ladder from 1K to 1M-token prompts: 978.5 tok/s prefill and 30.7 tok/s decode at 16K (1,003.9 and
+  31.6 at 130 / 147 rows), 296.1 and 15.4 at 512K, 179.6 and 9.6 at 1M, peak 96.1-104.3 GB. HumanEval pass@1: greedy
+  0.9451, card 0.9573 on `746e7da9` (identical counts and failing ids on `bb3c7245`).
+- The MiMo bill charges the one-eval predictor's router tiles on the default `prefill_predict_evals: one` (up to
+  0.43 GB in the prompt phase at 16K; it was unbilled).
+- GLM-5.3 on main (#11 merged over #10 and #12; the review's fixes): the arch under src/arch/glm_moe_dsa/; the box's
+  used memory from host_statistics64 (`sdk.memory.boxUsedBytes` is null without a reading; a load refuses such a box,
+  `BoxReadingUnavailable`); the prompt's GEMM slices and attention spans in flight held by the schedule and billed at
+  those bounds; the indexer's top-k and the routed combine on construction-time routes, their kernels built and run
+  once at construction; the reader's direct reads off; the route recorder and the draft lane's acceptance histogram in
+  profile builds only; the tally folded in at each request's end; the construction check raised by the bytes other
+  models hold in the process (#8's reading); the draft lane's sampled decisions on `sdk_ext.acceptance`. The quality
+  tier of the headline and the ceilings it carries are named in README (GLM-5.3's measurements).
+- GLM-5.3's trunk kernels (the indexer's top-k in its one-buffer and 1-8 rows forms, the decode lane's routed combine)
+  are a pinned registry of their own over `sdk_ext.kernels.KernelSet` (`trunk_kernels`, texts and manifest in
+  src/kernels/glm_moe_dsa/, `scripts/glm_trunk_manifest.py`): every text checked against the manifest's pin, the
+  kernels built on the module's GPU stream and each route's kernels launched once at the model's instantiation at
+  construction (`trunk_selfcheck.runRoutes`); an instantiation the manifest does not register gets no kernel route
+  (argpartition, the op chain's combine). The texts are the ones the routes compiled before, byte for byte.
+- GLM-5.3 on the host's typed glue: the root exports `glm` (the arch, the standard request's context, the 128K
+  `max_output` default) beside `mimo`, and the module answers the context it billed (`Served.maxContext`). The
+  allocator's size-class switch (`mlx_set_alloc_size_classes`, mlx-serve's patched MLX) is looked up by name at
+  construction (`bill.sizeClassSwitch`): a stock MLX links and serves with no size classes, and the bill charges them
+  exactly when the module turns them on.
+- GLM-5.3's memory bill fills to the box: the KV lanes hold each phase's positions (a prompt's at its pass, the
+  request's own prompt and `max_tokens` from its handover); `max_output` (default 131,072) bills the longest request
+  at construction; the decode handover settles the prompt's frees, reads the footprint and the box, and grows the
+  decode rows to the fewer of the bill at the request and the live reading, under the box's RAM less a 16 GiB OS
+  reserve, MLX's bytes within the host's ceiling less its wired margin; decode's transient window holds the widest
+  decode call's ids (8 rows serial); the host side is one measured term (1.5 GB; the unbilled overhead term is gone);
+  the construction checks its footprint (`ConstructionOverBill`). The SDK's arch table gains the optional `maxOutput`
+  hook (SDK 2.1) and `sdk.memory.boxUsedBytes`; decode's window is the expert stream's `Options.decode_route_ids`
+  (MiMo's, allocated per geometry) and the KV grow lane gains a `resize`.
+- GLM-5.3: the MTP draft lane over the release's MTP layer (`mtp_depth`, `mtp_acceptance`, `mtp_typical_delta`;
+  off by default, exact acceptance unless typical is named), its experts resident from the EXL3 build's records
+  through sushi's EXL3 MoE; PR #5's `convert_glm_exl3_bank.py --mtp-only` writes the pack's `mtp/` directory.
+- GLM-5.3 prompt pass: the attention over each row's selected keys on mlx-serve's DSA kernels (the indexer's scores
+  and the latent attention on the tensor units), in layer-major calls of 16,384 rows and spans under 2 GiB that the
+  bill charges with the same functions; each routed expert read at most once per call, a layer's misses read at its
+  start and its hottest made resident from the transient rows (`Stream.promote`); the routed combine in one kernel
+  over the groups' outputs (the EXL3 bank's prompt GEMMs on GLM-5.3's own kernels since). The construction
+  fills the prompt rows before the first request, and a request keeps the residents of the one before (its reverse
+  change passes `keep` to `Stream.shrink`, the per-request route of #12).
+- GLM-5.3 (`glm_moe_dsa`): a second arch over the same expert stream, from a pack of resident shards and an affine
+  expert bank (`expert-manifest-affine-v1.json`). Serial decode, the `stock` tier, MLX's `gather_qmm` for the experts.
+  `src/root.zig` exports both archs as `archs`; `arch` stays DeepSeek-V4.1's. Each request logs a prompt line and a
+  decode line from the stream's counters; the SDK's arch table gains the optional `requestEnd` hook, and the stream
+  counts its host wait on reads (`Stats.read_wait_ns`) and each layer's hits and misses (`layerCounts`).
+- The expert stream takes its slot arrays' dtypes from the bank module and can size its read pool's staging from the
+  bank (`Stream.Options.staging_from_bank`); MlxOps gains affine matmuls with biases at a tensor's own bits and group.
+- What GLM-5.3's work changes for DeepSeek-V4.1 (and MiMo), which share the stream, the reader and the registry:
+  - the reader queues one job per demand range (gate/up ranges first), the only demand path: a submit's ranges read on
+    idle workers side by side, each with its own status; a failed range no longer skips the rest of its submit (the
+    stream fails either way). `q3ld_withdraw` takes a submit's range jobs together, all or none. Reader ABI 2026101201.
+    No DeepSeek-V4.1 or MiMo measurement yet (GLM-5.3: +29 % decode).
+  - the rate tally (`expert_resident_ratio`, `expert_tally_window`, `expert_tally_file`; `sdk_ext.expert.tally`): per
+    expert an EMA of its decode routes, the top share pinned against the transition window, the rates carried in
+    ~/.mlx-stream/<arch>-<model dir>/expert-tally.bin. Off for DeepSeek-V4.1 by default (ratio 0: no tally, no file,
+    the plans of before); on at 0.5 for GLM-5.3, where it was measured. `expert_tally_file: pinned` reads the file and
+    never writes it, `off` keeps none: a cell's arms start from the same state.
+  - DeepSeek-V4.1's EXL3 kernel registry runs on the shared `sdk_ext/kernel_set.zig` (its refusals through
+    `bank_file`, the same message and error); its bill and module read the shared `phase_memory.zig` (value-identical);
+    `expert_wide_depth` honors every depth the stream takes (1 to 5; 3 and 4 were ignored before); the gate ring holds
+    512 gates of up to 768 tickets.
+  - opt-in reads straight into the slot rows (`expert_io.Options.direct`, no staging, no copy) for page-aligned ranges.
 - The plugin carries its own `sdk` module (sdk/: the arch contract, the weight loader, the reads past the page cache)
   and reaches mlx-serve only through `mlx_host`; mlx-serve calls the arch from one glue file. `HOST_PIN`, the
   conformance suite's host-registry test and the host test bridge's dependence on host internals are gone.

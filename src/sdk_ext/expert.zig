@@ -26,8 +26,15 @@ pub const Event = event.Event;
 pub const policy = @import("expert/policy.zig");
 /// The expert stream over a bank module (`assertBank`): slot rows, routes, residency, reads, lookahead, gates, release.
 pub const stream = @import("expert/stream.zig");
+/// A bank's open around its own manifest rules: the manifest read, the sidecar opened for the reader, the peek.
+pub const bank_file = @import("expert/bank_file.zig");
 /// The lookahead selector: the next routed layer's predicted records, chosen by score over its router rows.
 pub const lookahead = @import("expert/lookahead.zig");
+/// The route recorder (a diagnostic): one request's decode routes, what served each id, and the handover's residents.
+pub const routes = @import("expert/routes.zig");
+/// The rate tally's settings and file (every model's residency: the top share of each layer's experts by request rate
+/// pinned, the rates carried from run to run under ~/.mlx-stream/<model key>/).
+pub const tally = @import("expert/tally.zig");
 
 /// The one reader per process: the host takes it at the load claim of an arch whose caps say `uses_expert_reader`
 /// (its source declares `uses_reader`), before the preflight and the weights, and gives it back when the loaded model
@@ -95,6 +102,8 @@ pub const Stats = struct {
     adopt_copy_seconds: f64 = 0,
     /// Wall time with a read in flight (the pool's gauge).
     read_wall_ns: u64 = 0,
+    /// Host time blocked in the read waits (a part's gate/up or its settle, a read-ahead's landing).
+    read_wait_ns: u64 = 0,
     /// The lookahead class: records claimed by a demand read, physical bytes
     /// of speculative reads, records issued / fully landed, demand ranges
     /// copied out of a speculative record (no preadv) and their bytes.
@@ -102,6 +111,17 @@ pub const Stats = struct {
     spec_bytes: u64 = 0,
     spec_issued: u64 = 0,
     spec_landed: u64 = 0,
+    /// The lookahead's records no demand read claimed: dropped while queued, abandoned while read, read and never
+    /// served (the waste's attribution); demand ranges read straight into their rows (`io.Options.direct`).
+    spec_expired: u64 = 0,
+    spec_abandoned: u64 = 0,
+    spec_discarded: u64 = 0,
+    spec_cancelled: u64 = 0,
+    /// Of the claimed, those still in flight at the claim (the prediction right, the read late); the physical bytes
+    /// the abandoned records had read.
+    spec_claimed_inflight: u64 = 0,
+    spec_abandoned_bytes: u64 = 0,
+    direct_ranges: u64 = 0,
     adopt_ranges: u64 = 0,
     adopt_bytes: u64 = 0,
     /// Pre-read ranges queued, served to a demand read, dropped unbound.
@@ -117,7 +137,31 @@ pub const Stats = struct {
     ahead_hits: u64 = 0,
     ahead_demand: u64 = 0,
     ahead_bytes: u64 = 0,
+    /// P7 overlap: read-ahead records never read because the call's plans evict them before any hit (`p7Tail`).
+    ahead_dropped: u64 = 0,
+    /// Prompt records copied from a transient row into a resident's row (`Stream.promote`) and their bytes.
+    promoted: u64 = 0,
+    promoted_bytes: u64 = 0,
+
+    /// The counters since `prev`, an earlier snapshot of the same stream: each field's difference, at least zero.
+    pub fn since(s: Stats, prev: Stats) Stats {
+        var d: Stats = .{};
+        inline for (@typeInfo(Stats).@"struct".field_names) |name| {
+            const now = @field(s, name);
+            const then = @field(prev, name);
+            @field(d, name) = switch (@TypeOf(now)) {
+                u64 => now -| then,
+                f64 => @max(now - then, 0),
+                else => @compileError("Stats." ++ name ++ ": a counter is u64 or f64"),
+            };
+        }
+        return d;
+    }
 };
+
+/// One layer's routes so far, every phase: the routes, the unique experts per route that were resident / had to be
+/// loaded.
+pub const LayerCounts = struct { routes: u64 = 0, hits: u64 = 0, misses: u64 = 0 };
 
 /// A source's refusals at run time. A failure is sticky: every later call refuses as `StreamFailed`.
 pub const Error = error{
@@ -139,6 +183,8 @@ pub const Error = error{
     /// The watchdog released a gate before its bytes landed: the GPU may have
     /// read them early, so the outputs since are invalid.
     GateForced,
+    /// A decode route over more ids than decode's transient window holds rows.
+    RouteWiderThanWindow,
 };
 
 /// What a source type supports (`S.caps`, comptime). An instance installs a subset at construction (a route chosen
@@ -256,6 +302,20 @@ fn expectMethod(comptime S: type, comptime name: []const u8, comptime params: []
 }
 
 const testing = std.testing;
+
+test "sdk expert: Stats.since is each counter's difference, at least zero" {
+    const s0: Stats = .{ .route_calls = 3, .expert_bytes_read = 100, .expert_read_seconds = 0.25, .spec_issued = 9 };
+    const s1: Stats = .{ .route_calls = 10, .expert_bytes_read = 4196, .expert_read_seconds = 1.0, .spec_issued = 2, .promoted = 5 };
+    const d = s1.since(s0);
+    try testing.expectEqual(@as(u64, 7), d.route_calls);
+    try testing.expectEqual(@as(u64, 4096), d.expert_bytes_read);
+    try testing.expectEqual(@as(f64, 0.75), d.expert_read_seconds);
+    try testing.expectEqual(@as(u64, 5), d.promoted);
+    // A counter below its earlier snapshot (a new stream's) gives zero, not a wrap.
+    try testing.expectEqual(@as(u64, 0), d.spec_issued);
+    try testing.expectEqual(@as(f64, 0), s0.since(s1).expert_read_seconds);
+    try testing.expectEqual(Stats{}, s1.since(s1));
+}
 
 test "sdk expert: one reader per process: a second taker is refused by name until the first gives it back" {
     try takeReader();

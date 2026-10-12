@@ -248,6 +248,26 @@ pub fn Lanes(comptime G: type) type {
                 self.len = @min(n, self.len);
             }
 
+            /// The bound becomes exactly `cap` rows (at least the rows it holds): an empty lane allocates `cap` at its
+            /// next append; a lane with rows gets a `cap`-row buffer holding them (the caller evaluates `buf`, after
+            /// which the old buffer is freed). No-op at the same capacity.
+            pub fn resize(self: *Grow, g: *G, cap: u32) !void {
+                if (cap < self.len) return error.BoundedLaneFull;
+                self.init_cap = cap;
+                self.bounded_cap = cap;
+                const old = self.buf orelse return;
+                if (cap == self.cap) return;
+                if (self.len == 0) {
+                    g.release(old);
+                    self.buf = null;
+                    self.cap = 0;
+                    return;
+                }
+                const head = try rowsSlice(g, old, 0, self.len);
+                replace(g, &self.buf, try write(g, try alloc(g, old, cap), head, 0));
+                self.cap = cap;
+            }
+
             pub fn deinit(self: *Grow, g: *G) void {
                 if (self.buf) |b| g.release(b);
                 self.buf = null;

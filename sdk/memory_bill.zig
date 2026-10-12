@@ -36,13 +36,18 @@ pub const MemoryBill = struct {
     per_row: u64 = 0,
     /// The terms flagged `with_rows`, at any row count; null for a bill linear in its rows.
     row_terms: ?RowTerms = null,
+    /// The slot rows' bytes at each row count `0 .. slot_table.len - 1` where they are not `rows * per_row`: a bank
+    /// whose stream layers each take their share of a fill unit, rounded down (GLM-5.3's EXL3 bank). Empty: linear.
+    /// The bill owns it (`free`); `per_row` stays the fill's first linear step.
+    slot_table: []const u64 = &.{},
 
-    /// Terms not linear in the slot rows (the kernel's page tables over the wired bytes): `at(&data, phase, rows)` is
-    /// their bytes at `rows` per layer. Subadditive in the rows, so the linear fill bounds the rows from above.
-    /// `data` is the plugin's own (the inputs its formula reads), so a bill stays a value.
+    /// Terms not linear in the slot rows (the kernel's page tables over the wired bytes): `at(&data, phase, rows, slots)` is
+    /// their bytes at `rows` per layer, `slots` the slot rows' bytes there (`slots(rows)`). Subadditive in the rows, so the
+    /// linear fill bounds the rows from above. `data` is the plugin's own (the inputs its formula reads), so a bill stays
+    /// a value.
     pub const RowTerms = struct {
         data: [4]u64,
-        at: *const fn (data: *const [4]u64, phase: Phase, rows: u32) u64,
+        at: *const fn (data: *const [4]u64, phase: Phase, rows: u32, slots: u64) u64,
     };
 
     /// The phase's terms, the baseline, the slot rows and the row-following terms apart.
@@ -54,11 +59,17 @@ pub const MemoryBill = struct {
         return n;
     }
 
+    /// The slot rows' bytes at `rows` per layer: the table's (`slot_table`), else `rows * per_row`.
+    pub fn slots(b: MemoryBill, rows: u32) u64 {
+        return if (b.slot_table.len == 0) rows * b.per_row else b.slot_table[rows];
+    }
+
     /// The phase's total over the box baseline at `rows` slot rows per layer.
     pub fn total(b: MemoryBill, phase: Phase, baseline: u64, rows: u32) u64 {
-        const linear = baseline + b.fixed(phase) + rows * b.per_row;
+        const slot_bytes = b.slots(rows);
+        const linear = baseline + b.fixed(phase) + slot_bytes;
         const r = b.row_terms orelse return linear;
-        return linear + r.at(&r.data, phase, rows);
+        return linear + r.at(&r.data, phase, rows, slot_bytes);
     }
 
     /// What the process may hold above the baseline: the larger phase (a phase change frees before it grows, so
@@ -70,7 +81,7 @@ pub const MemoryBill = struct {
     /// What the constructed module holds before any request: the construction terms at their prompt bytes and the
     /// prompt rows.
     pub fn constructionBytes(b: MemoryBill, prompt_rows: u32) u64 {
-        var n: u64 = prompt_rows * b.per_row;
+        var n: u64 = b.slots(prompt_rows);
         for (b.terms) |t| {
             if (t.at_construction) n += t.atConstruction();
         }
@@ -80,6 +91,7 @@ pub const MemoryBill = struct {
     /// Frees an allocated bill's terms.
     pub fn free(b: MemoryBill, gpa: std.mem.Allocator) void {
         gpa.free(b.terms);
+        if (b.slot_table.len > 0) gpa.free(b.slot_table);
     }
 };
 
@@ -113,17 +125,22 @@ pub const BillRequest = struct {
 /// within `target`. Refused by name below `min_rows`, and for a bill without slot rows (nothing to fill).
 pub fn fill(b: MemoryBill, baseline: u64, target: u64, n_experts: u32, min_rows: u32) error{ NoSlotRows, NativeBillDoesNotFit }!Rows {
     if (b.per_row == 0) return error.NoSlotRows;
+    if (b.slot_table.len > 0 and b.slot_table.len <= n_experts) return error.NativeBillDoesNotFit;
     const most = struct {
-        // The linear rows (the row-following terms left out) bound it from above; step down while the total is over.
-        fn f(mb: MemoryBill, phase: MemoryBill.Phase, base: u64, t: u64) u64 {
+        // The linear rows (the row-following terms left out) bound it from above; step down while the total is over. A
+        // slot table's rounded-down shares can fit past the linear rows: step up while the next row count fits.
+        fn f(mb: MemoryBill, phase: MemoryBill.Phase, base: u64, t: u64, cap: u32) u64 {
             const fixed = base + mb.fixed(phase);
-            var r = if (fixed >= t) 0 else (t - fixed) / mb.per_row;
+            var r: u64 = @min(if (fixed >= t) 0 else (t - fixed) / mb.per_row, cap);
             while (r > 0 and mb.total(phase, base, @intCast(r)) > t) r -= 1;
+            if (mb.slot_table.len > 0) while (r < cap and mb.total(phase, base, @intCast(r + 1)) <= t) {
+                r += 1;
+            };
             return r;
         }
     }.f;
-    const decode = @min(most(b, .decode, baseline, target), n_experts);
-    const prompt = @min(most(b, .prompt, baseline, target), decode);
+    const decode = @min(most(b, .decode, baseline, target, n_experts), n_experts);
+    const prompt = @min(most(b, .prompt, baseline, target, n_experts), decode);
     if (prompt < min_rows) return error.NativeBillDoesNotFit;
     return .{ .prompt = @intCast(prompt), .decode = @intCast(decode) };
 }
@@ -212,6 +229,24 @@ test "sdk bill: the ceiling and the stop are arguments; an upstream default marg
     try testing.expectError(error.PromptOverTarget, admit(b, 10 * gb, forced, upstream.target()));
 }
 
+test "sdk bill: a slot table bills each row count's own bytes; the fill steps up past the linear rows to the exact ones" {
+    // Rows of 10 then 11 bytes alternately (a share rounded down): the linear step 11 bounds them from above.
+    var table: [9]u64 = undefined;
+    for (&table, 0..) |*x, r| x.* = 10 * r + r / 2;
+    const terms = [_]MemoryBill.Term{.{ .name = "residents", .bytes = .{ 100, 90 }, .at_construction = true }};
+    const b: MemoryBill = .{ .terms = &terms, .per_row = 11, .slot_table = &table };
+    try testing.expectEqual(@as(u64, 100 + table[5]), b.total(.prompt, 0, 5));
+    try testing.expectEqual(@as(u64, 100 + table[3]), b.constructionBytes(3));
+    // 100 + 6 rows (63 B) fit 163; the linear estimate (63 / 11) says 5.
+    const r = try fill(b, 0, 163, 8, 1);
+    try testing.expectEqual(@as(u32, 6), r.prompt);
+    try testing.expect(b.total(.prompt, 0, r.prompt) <= 163 and b.total(.prompt, 0, r.prompt + 1) > 163);
+    try testing.expectEqual(@as(u32, 7), r.decode);
+    // Capped at the layer's units; a table shorter than them refuses.
+    try testing.expectEqual(@as(u32, 8), (try fill(b, 0, 10_000, 8, 1)).decode);
+    try testing.expectError(error.NativeBillDoesNotFit, fill(b, 0, 10_000, 9, 1));
+}
+
 test "sdk bill: a row-following term counts at the rows asked; the fill steps down to the exact rows" {
     const terms = [_]MemoryBill.Term{
         .{ .name = "residents", .bytes = .{ 10 * gb, 10 * gb }, .at_construction = true },
@@ -219,8 +254,8 @@ test "sdk bill: a row-following term counts at the rows asked; the fill steps do
     };
     const per_gb = struct {
         // 1 B per 1,000 B of wired bytes, rounded up: subadditive in the rows.
-        fn at(data: *const [4]u64, _: MemoryBill.Phase, rows: u32) u64 {
-            return std.math.divCeil(u64, data[0] + rows * data[1], 1000) catch unreachable;
+        fn at(data: *const [4]u64, _: MemoryBill.Phase, _: u32, slots: u64) u64 {
+            return std.math.divCeil(u64, data[0] + slots, 1000) catch unreachable;
         }
     }.at;
     const b: MemoryBill = .{ .terms = &terms, .per_row = gb / 4, .row_terms = .{ .data = .{ 10 * gb, gb / 4, 0, 0 }, .at = per_gb } };

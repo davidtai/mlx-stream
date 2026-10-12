@@ -8,7 +8,8 @@
  *   pre-read     a layer call's certain misses queued as ranges before its plan; the submit binds them;
  *   event gate   per-wave gates over tickets; the satisfied prefix is handed to an MTLSharedEvent (or a host
  *                word) by the publishing worker, and a watchdog forces a gate whose bytes never land.
- * The pool never calls MLX. State is static: one pool per process. macOS only (mach time). */
+ * A queued submit (its range jobs) can be withdrawn unread by its first ticket (q3ld_withdraw). The pool never calls
+ * MLX. State is static: one pool per process. macOS only (mach time). */
 #ifndef MLX_SERVE_Q3_LOOKAHEAD4_H
 #define MLX_SERVE_Q3_LOOKAHEAD4_H
 
@@ -35,6 +36,7 @@ extern "C" {
 #define Q3LD_ST_OSERR 2
 #define Q3LD_ST_DEADLINE 3
 #define Q3LD_ST_SKIPPED 4
+#define Q3LD_ST_WITHDRAWN 5
 #define Q3LD_EVK_OFF 0
 #define Q3LD_EVK_MTL 1
 #define Q3LD_EVK_HOST 2
@@ -53,6 +55,11 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
  * speculative records and binds the pre-ranges that hold its ranges. 0, -1, -2 ticket pending, -3 queue full. */
 int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int32_t ngu, int32_t ndown,
                 const int64_t *offsets, const uint64_t *const *rows, const int64_t *lens, int64_t first);
+/* The submit whose first ticket is `first`, while no worker has started it, leaves the queue unread: every range job of
+ * it, all or none; its tickets are published with ST_WITHDRAWN (no row written). 1 withdrawn, 0 not queued (a worker
+ * started it and it runs as submitted / it is done / no submit starts at `first`), -1 not running / bad ticket, -2
+ * refused (a ticket bound to a pre-range or waited on by a live event gate). */
+int q3ld_withdraw(int64_t first);
 /* A layer call's step: settle every unclaimed record with tag <= cur, then queue n records (bases) with tag
  * cur + 1 (len = their payload bytes). Queued count, -1 off / not running. */
 int32_t q3ld_spec_step(int32_t fd, int64_t file_size, int64_t cur, int32_t n, const int64_t *bases);
@@ -81,7 +88,7 @@ int q3ld_ev_config(int32_t kind, uint64_t obj, int64_t timeout_ns, uint64_t star
 int32_t q3ld_ev_gates(int32_t n, const uint64_t *values, const int32_t *counts, const int64_t *tickets);
 int32_t q3ld_ev_release(uint64_t value);    /* force every live gate <= value; forced count, -1 off */
 int32_t q3ld_ev_state(int64_t *out);        /* 10 words; returns the live gate count */
-int32_t q3ld_abi(void);                     /* 2026100201 */
+int32_t q3ld_abi(void);                     /* 2026101001 */
 int32_t q3ld_max_gates(void);
 int32_t q3ld_max_gate_tickets(void);
 int32_t q3ld_max_pre(void);
@@ -101,6 +108,11 @@ uint64_t q3ld_mtl_value(void *event);
 void q3ld_test_rules(int32_t n, const int64_t *off, const int64_t *code, const int64_t *arg);
 void q3ld_test_delay(uint64_t seed, int64_t max_ns);
 void q3ld_test_spec_delay(int64_t max_ns);
+/* The speculative hold: `starts` >= 0 turns it on with that many records still allowed to start (-1 turns it off);
+ * a started unclaimed record's chunk waits at its start while it is on (a claim or the hold's end lets it go).
+ * q3ld_test_spec_held waits until n records wait there: 0, or 1 at the timeout. */
+void q3ld_test_spec_hold(int32_t starts);
+int32_t q3ld_test_spec_held(int32_t n, int64_t timeout_ns);
 int64_t q3ld_test_events(int64_t *buf, int64_t cap);
 int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap);
 #endif

@@ -12,10 +12,13 @@ const std = @import("std");
 
 /// The SDK's version. A plugin built against another major is refused (`negotiate`); a newer minor on either
 /// side is compatible (newer hooks are optional). 2.0: a draft lane's `round` takes the request's `SamplingParams`.
-pub const api: Version = .{ .major = 2, .minor = 0 };
+/// 2.1: an arch's optional `maxOutput` (the generation a request may take past its prompt).
+pub const api: Version = .{ .major = 2, .minor = 1 };
 
-/// Compile the registered plugins' profile probes in (`-Dplugin-profile=true`); off in every served build.
-pub const plugin_profile = false;
+/// Compile the registered plugins' profile probes in: the host's `zig build -Dplugin-profile=true`, which also compiles
+/// the probes' C shims (csrc/dsv41_*: the command-buffer timeline the profile links) and publishes the switch as the
+/// host root's `pub const plugin_profile`. Off in every served build, and with a host that has no such switch.
+pub const plugin_profile: bool = if (@hasDecl(@import("mlx_host"), "plugin_profile")) @import("mlx_host").plugin_profile else false;
 
 pub const mlx = @import("mlx_host").mlx;
 pub const log = @import("mlx_host").log;

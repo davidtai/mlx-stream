@@ -32,7 +32,12 @@ pub const Caps = struct {
 };
 
 /// The parsed model's facts the host keeps on its own config.
-pub const Shell = struct { num_experts: u32 = 0, num_layers: u32 = 0 };
+pub const Shell = struct {
+    num_experts: u32 = 0,
+    num_layers: u32 = 0,
+    /// The installed KV precision (0 = bf16, 8 = affine 8-bit); null when the arch has no choice.
+    kv_quant_bits: ?u8 = null,
+};
 
 /// The host's generic streamed-expert facts at load (CLI flags and the preflight's sample).
 pub const LoadFacts = struct {
@@ -44,6 +49,10 @@ pub const LoadFacts = struct {
     expert_prefill_rows: ?u32 = null,
     /// The loader's page-cache setting for resident weights (`nocache_weights`; null = the arch's default).
     nocache_weights: ?bool = null,
+    /// The context the load serves (the model's `ctx_size`, else the arch's default context), stamped before billing.
+    effective_context: ?u64 = null,
+    /// A construction-time KV precision choice (0 = bf16, 8 = affine 8-bit); null = the arch's default.
+    kv_quant_bits: ?u8 = null,
     /// What a plan leaves unplanned under the GPU memory ceiling (`--wired-margin-gib` / `--wired-margin`), stamped
     /// once at load; the arch never reads the host's flag.
     wired_margin_bytes: u64,
@@ -101,10 +110,15 @@ pub const Arch = struct {
     restore_prefix: ?*const fn (m: *anyopaque, prefix: []const u32) u64,
     /// The phase change; null = the arch has none.
     handover: ?*const fn (m: *anyopaque, h: DecodeHandover) anyerror!void,
+    /// The request's end (the host's finish, on the inference thread, after its last step); null = none.
+    request_end: ?*const fn (m: *anyopaque) void,
     spec: spec.Spec,
     /// G4: the arch's terms of the composed bill (waves, KV by owner, prompt state, cache limits); null = none.
     /// Pure host: it may read the model's headers through `io`, never the device.
     bill: ?*const fn (gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill,
+    /// The most tokens a request may generate past its prompt, from the arch's config with the model's settings
+    /// applied (the host serves the billed prompts plus these); null = the plugin's `generation_headroom`.
+    max_output: ?*const fn (cfg: *const anyopaque) u64 = null,
     /// A resource the arch holds once per process (an expert reader): the host claims it at the load claim, before
     /// the preflight and the weights, and releases it when the loaded model goes (or the load fails). A second load
     /// that needs it is refused by the claim's error. Null = the arch claims nothing.
@@ -113,8 +127,9 @@ pub const Arch = struct {
 
     /// The table of `T`, a namespace declaring the arch (a missing or mistyped declaration is a compile error
     /// naming it): name, caps, claims, Config, parse, freeConfig, shell, applySettings, loadBytes, Module, init,
-    /// deinit, prefill, step, position; optional (absent when undeclared or `{}`) promptBytes, handover,
-    /// restorePrefix (only with `owns_decode_state`), draft_lane, bill, and the pair claimProcess / releaseProcess.
+    /// deinit, prefill, step, position; optional (absent when undeclared or `{}`) promptBytes, handover, requestEnd,
+    /// restorePrefix (only with `owns_decode_state`), draft_lane, bill, maxOutput, and the pair claimProcess /
+    /// releaseProcess.
     pub fn of(comptime T: type) Arch {
         comptime {
             const w = "arch " ++ @typeName(T);
@@ -136,11 +151,13 @@ pub const Arch = struct {
             check.fnDecl(w, T, "step", &.{ *T.Module, []const u32 }, mlx.mlx_array);
             check.fnDecl(w, T, "position", &.{*const T.Module}, u64);
             if (check.has(T, "handover")) check.fnDecl(w, T, "handover", &.{ *T.Module, DecodeHandover }, void);
+            if (check.has(T, "requestEnd")) check.fnDecl(w, T, "requestEnd", &.{*T.Module}, void);
             if (check.has(T, "restorePrefix")) {
                 if (!T.caps.owns_decode_state) @compileError(w ++ ": restorePrefix without owns_decode_state");
                 check.fnDecl(w, T, "restorePrefix", &.{ *T.Module, []const u32 }, u64);
             }
             if (check.has(T, "bill")) check.fnDecl(w, T, "bill", &.{ Allocator, std.Io, *const bill.BillRequest }, bill.MemoryBill);
+            if (check.has(T, "maxOutput")) check.fnDecl(w, T, "maxOutput", &.{*const T.Config}, u64);
             if (check.has(T, "claimProcess") != check.has(T, "releaseProcess")) @compileError(w ++ ": claimProcess and releaseProcess come as a pair");
             if (check.has(T, "claimProcess")) {
                 check.fnDecl(w, T, "claimProcess", &.{}, void);
@@ -193,11 +210,17 @@ pub const Arch = struct {
             fn handover(m: *anyopaque, h: DecodeHandover) anyerror!void {
                 return T.handover(mod(m), h);
             }
+            fn requestEnd(m: *anyopaque) void {
+                T.requestEnd(mod(m));
+            }
             fn restorePrefix(m: *anyopaque, prefix: []const u32) u64 {
                 return T.restorePrefix(mod(m), prefix);
             }
             fn billOf(gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill {
                 return T.bill(gpa, io, req);
+            }
+            fn maxOutput(cfg: *const anyopaque) u64 {
+                return T.maxOutput(constCfg(cfg));
             }
             fn claimProcess() anyerror!void {
                 return T.claimProcess();
@@ -222,9 +245,11 @@ pub const Arch = struct {
             .step = W.step,
             .position = W.position,
             .handover = if (check.has(T, "handover")) W.handover else null,
+            .request_end = if (check.has(T, "requestEnd")) W.requestEnd else null,
             .restore_prefix = if (check.has(T, "restorePrefix")) W.restorePrefix else null,
             .spec = if (check.has(T, "draft_lane")) .{ .draft_lane = spec.DraftLane.of(T.Module, T.draft_lane) } else .none,
             .bill = if (check.has(T, "bill")) W.billOf else null,
+            .max_output = if (check.has(T, "maxOutput")) W.maxOutput else null,
             .claim_process = if (check.has(T, "claimProcess")) W.claimProcess else null,
             .release_process = if (check.has(T, "claimProcess")) W.releaseProcess else null,
         };

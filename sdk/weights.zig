@@ -4,6 +4,7 @@
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const log = @import("mlx_host").log;
+const Diag = @import("peek.zig").Diag;
 
 /// Holds all loaded weights as mlx arrays, keyed by name.
 pub const Weights = struct {
@@ -30,6 +31,14 @@ pub const Weights = struct {
         return self.map.get(name);
     }
 
+    /// The tensor `name`, else `err` with `diag` (when given) set to "<name>: <why>": a load's refusal by name.
+    pub fn need(self: *const Weights, name: []const u8, diag: ?*Diag, err: anytype, comptime why: []const u8) @TypeOf(err)!mlx.mlx_array {
+        return self.map.get(name) orelse {
+            if (diag) |d| d.set("{s}: " ++ why, .{name});
+            return err;
+        };
+    }
+
     /// Hand the map a new array under `name`, freeing the one it held (load-time
     /// weight fusion parks its row views here so the originals go away).
     pub fn replace(self: *Weights, name: []const u8, arr: mlx.mlx_array) void {
@@ -37,6 +46,18 @@ pub const Weights = struct {
             _ = mlx.mlx_array_free(p.*);
             p.* = arr;
         }
+    }
+
+    /// Every array read into its own MLX buffer now, in one evaluation (the loader's arrays are lazy: each would be
+    /// read at its first use, inside the forward that uses it; one evaluation lets MLX's IO threads read them in
+    /// parallel). The buffers are the arrays' own (`Load` allocates each at its size): no copy, no transient past MLX's
+    /// read staging.
+    pub fn materialize(self: *const Weights) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var it = self.map.valueIterator();
+        while (it.next()) |v| try mlx.check(mlx.mlx_vector_array_append_value(vec, v.*));
+        try mlx.check(mlx.mlx_eval(vec));
     }
 
     pub fn count(self: *const Weights) u32 {

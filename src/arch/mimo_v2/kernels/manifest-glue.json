@@ -1,0 +1,1396 @@
+{
+ "format": "mlx-stream-mimo-kernels-v1",
+ "headers": [
+  {
+   "bytes": 2116,
+   "file": "header_mimo_glue.metal",
+   "id": "mimo_glue",
+   "sha256": "75784dde518a7b706e3276c32add41325d28e5bfaa1cff03a68dc40057bf9e51"
+  }
+ ],
+ "kernels": [
+  {
+   "atomic_outputs": false,
+   "class": "exact",
+   "ensure_row_contiguous": true,
+   "family": "glue",
+   "header": {
+    "id": "mimo_glue"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "x",
+     "shape": [
+      {
+       "m": 1,
+       "v": "M"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "w",
+     "shape": [
+      {
+       "m": 4096
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      256,
+      1,
+      1
+     ],
+     "note": "M=1",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      2,
+      1
+     ],
+     "note": "M=2",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       2,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 2
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      3,
+      1
+     ],
+     "note": "M=3",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       3,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 3
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      4,
+      1
+     ],
+     "note": "M=4",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       4,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 4
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      8,
+      1
+     ],
+     "note": "M=8",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 8
+      }
+     ]
+    }
+   ],
+   "name": "mimo_glue_norm",
+   "note": "layer 0's input norm: rms_norm (unit weight) then the learned weight's multiply",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "n"
+    }
+   ],
+   "phase": "decode lane (M <= 8)",
+   "source": {
+    "bytes": 634,
+    "file": "mimo_glue_norm.metal",
+    "sha256": "3008660a5d8e36446aa0e2b4057798655ebbaa3f01496c748e7733147ffe31a6"
+   },
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "M"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact",
+   "ensure_row_contiguous": true,
+   "family": "glue",
+   "header": {
+    "id": "mimo_glue"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "a",
+     "shape": [
+      {
+       "m": 1,
+       "v": "M"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "b",
+     "shape": [
+      {
+       "m": 1,
+       "v": "M"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "w",
+     "shape": [
+      {
+       "m": 4096
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      256,
+      1,
+      1
+     ],
+     "note": "M=1",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4096
+      ],
+      [
+       1,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      2,
+      1
+     ],
+     "note": "M=2",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       2,
+       4096
+      ],
+      [
+       2,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 2
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      3,
+      1
+     ],
+     "note": "M=3",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       3,
+       4096
+      ],
+      [
+       3,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 3
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      4,
+      1
+     ],
+     "note": "M=4",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       4,
+       4096
+      ],
+      [
+       4,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 4
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      8,
+      1
+     ],
+     "note": "M=8",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       8,
+       4096
+      ],
+      [
+       8,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 8
+      }
+     ]
+    }
+   ],
+   "name": "mimo_glue_addnorm",
+   "note": "residual add + rms_norm + weight multiply",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "h"
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "n"
+    }
+   ],
+   "phase": "decode lane (M <= 8)",
+   "source": {
+    "bytes": 797,
+    "file": "mimo_glue_addnorm.metal",
+    "sha256": "f547c88792eaca9cf98ca093c693245985516a44f88ce66e5011e3bd9944eb2c"
+   },
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "M"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact",
+   "ensure_row_contiguous": true,
+   "family": "glue",
+   "header": {
+    "id": "mimo_glue"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "a",
+     "shape": [
+      {
+       "m": 1,
+       "v": "M"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "b",
+     "shape": [
+      {
+       "m": 1,
+       "v": "M"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "w",
+     "shape": [
+      {
+       "m": 4096
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      256,
+      1,
+      1
+     ],
+     "note": "M=1",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4096
+      ],
+      [
+       1,
+       4096
+      ],
+      [
+       1,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      2,
+      1
+     ],
+     "note": "M=2",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       2,
+       4096
+      ],
+      [
+       2,
+       4096
+      ],
+      [
+       2,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 2
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      3,
+      1
+     ],
+     "note": "M=3",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       3,
+       4096
+      ],
+      [
+       3,
+       4096
+      ],
+      [
+       3,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 3
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      4,
+      1
+     ],
+     "note": "M=4",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       4,
+       4096
+      ],
+      [
+       4,
+       4096
+      ],
+      [
+       4,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 4
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      8,
+      1
+     ],
+     "note": "M=8",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       8,
+       4096
+      ],
+      [
+       8,
+       4096
+      ],
+      [
+       8,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 8
+      }
+     ]
+    }
+   ],
+   "name": "mimo_glue_addnorm32",
+   "note": "addnorm + the router's F32 cast (M > 1)",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "h"
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "n"
+    },
+    {
+     "dtype": "float32",
+     "name": "xf"
+    }
+   ],
+   "phase": "decode lane (M <= 8)",
+   "source": {
+    "bytes": 754,
+    "file": "mimo_glue_addnorm32.metal",
+    "sha256": "4f0b82b48f24b03f9481ccb0908744707b7c57be9fdba6ef683003d9e3388b29"
+   },
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "M"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact",
+   "ensure_row_contiguous": true,
+   "family": "glue",
+   "header": {
+    "id": "mimo_glue"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "a",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "b",
+     "shape": [
+      {
+       "m": 1
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "w",
+     "shape": [
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "gate",
+     "shape": [
+      {
+       "m": 256
+      },
+      {
+       "m": 4096
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      256,
+      64,
+      1
+     ],
+     "note": "M=1: 64 threadgroups = MLX gemv's",
+     "output_dtypes": [
+      "bfloat16",
+      "bfloat16",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       4096
+      ],
+      [
+       1,
+       4096
+      ],
+      [
+       1,
+       256
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": []
+    }
+   ],
+   "name": "mimo_glue_router1",
+   "note": "residual add + post-attention norm + the router's F32 GEMV in MLX gemv_float32_bm1_bn8_sm1_sn32_tm4_tn4's accumulation",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "h"
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "n"
+    },
+    {
+     "dtype": "float32",
+     "name": "logits"
+    }
+   ],
+   "phase": "decode lane M = 1",
+   "source": {
+    "bytes": 2223,
+    "file": "mimo_glue_router1.metal",
+    "sha256": "a0e10bef80dd1699d372501dd19a8006be4ada01c4362c985f57b4982d8dc988"
+   }
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact vs mimo_glue_router1 per row (router1's per-lane products, shuffles and fold: a row's logits are its M = 1 logits whatever M is); rounding-class vs MLX's M > 1 F32 GEMM (X19 verify_router bf16_gemv)",
+   "ensure_row_contiguous": true,
+   "family": "glue",
+   "header": {
+    "id": "mimo_glue"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "x",
+     "shape": [
+      {
+       "m": 1,
+       "v": "M"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "gate",
+     "shape": [
+      {
+       "m": 256
+      },
+      {
+       "m": 4096
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      256,
+      64,
+      1
+     ],
+     "note": "M=1: 64 threadgroups (router1's), every row in each",
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       256
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 1,
+       "name": "M"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      64,
+      1
+     ],
+     "note": "M=2: 64 threadgroups (router1's), every row in each",
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       2,
+       256
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 2,
+       "name": "M"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 2
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      64,
+      1
+     ],
+     "note": "M=3: 64 threadgroups (router1's), every row in each",
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       3,
+       256
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 3,
+       "name": "M"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 3
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      64,
+      1
+     ],
+     "note": "M=4: 64 threadgroups (router1's), every row in each",
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       4,
+       256
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 4,
+       "name": "M"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 4
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      64,
+      1
+     ],
+     "note": "M=8: 64 threadgroups (router1's), every row in each",
+     "output_dtypes": [
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       8,
+       256
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "M"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 8
+      }
+     ]
+    }
+   ],
+   "name": "mimo_glue_router_rows",
+   "note": "X19: the router's product for M rows from the BF16 weight, each row in MLX gemv_float32_bm1_bn8_sm1_sn32_tm4_tn4's accumulation (router1's): the verify router (verify_router bf16_gemv) and the lookahead predictor (predict_router bf16)",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "logits"
+    }
+   ],
+   "phase": "decode lane (M <= 8): the verify router and the lookahead predictor",
+   "source": {
+    "bytes": 2488,
+    "file": "mimo_glue_router_rows.metal",
+    "sha256": "1bc126dc3d040904582a991862ec23b1ee89210f08b59cec071a0b8024101afa"
+   }
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact",
+   "ensure_row_contiguous": true,
+   "family": "glue",
+   "header": {
+    "id": "mimo_glue"
+   },
+   "inputs": [
+    {
+     "dtype": "float32",
+     "name": "logits",
+     "shape": [
+      {
+       "m": 1,
+       "v": "M"
+      },
+      {
+       "m": 256
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "bias",
+     "shape": [
+      {
+       "m": 256
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      256,
+      1,
+      1
+     ],
+     "note": "M=1",
+     "output_dtypes": [
+      "uint32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       1,
+       8
+      ],
+      [
+       1,
+       8
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 1
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      2,
+      1
+     ],
+     "note": "M=2",
+     "output_dtypes": [
+      "uint32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       2,
+       8
+      ],
+      [
+       2,
+       8
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 2
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      3,
+      1
+     ],
+     "note": "M=3",
+     "output_dtypes": [
+      "uint32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       3,
+       8
+      ],
+      [
+       3,
+       8
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 3
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      4,
+      1
+     ],
+     "note": "M=4",
+     "output_dtypes": [
+      "uint32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       4,
+       8
+      ],
+      [
+       4,
+       8
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 4
+      }
+     ]
+    },
+    {
+     "grid": [
+      256,
+      8,
+      1
+     ],
+     "note": "M=8",
+     "output_dtypes": [
+      "uint32",
+      "float32"
+     ],
+     "output_shapes": [
+      [
+       8,
+       8
+      ],
+      [
+       8,
+       8
+      ]
+     ],
+     "template": [],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "M",
+       "value": 8
+      }
+     ]
+    }
+   ],
+   "name": "mimo_glue_top8",
+   "note": "sigmoid + correction + MLX's stable argsort's first 8 + take + row sum + 1e-20 + divide",
+   "outputs": [
+    {
+     "dtype": "uint32",
+     "name": "ids"
+    },
+    {
+     "dtype": "float32",
+     "name": "scores"
+    }
+   ],
+   "phase": "decode lane (M <= 8)",
+   "source": {
+    "bytes": 1637,
+    "file": "mimo_glue_top8.metal",
+    "sha256": "ec3124418c8d07f85ff8d788549c8d5e035605ce6adf17084f15e4f3550e40bd"
+   },
+   "vars": [
+    {
+     "hi": 8,
+     "lo": 1,
+     "name": "M"
+    }
+   ]
+  }
+ ],
+ "lane": "mimo/k2-glue (decode_glue) + router rows (mimo/router-bf16)"
+}

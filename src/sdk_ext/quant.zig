@@ -241,6 +241,7 @@ pub fn FromGatherMatmul(comptime Q: type) type {
                 spec: Spec,
                 // host scratch of prefill, reused across calls
                 order: std.ArrayList(u32) = .empty,
+                counts: std.ArrayList(u32) = .empty,
                 ids: std.ArrayList(u32) = .empty,
                 src: std.ArrayList(u32) = .empty,
                 inv: std.ArrayList(u32) = .empty,
@@ -272,13 +273,17 @@ pub fn FromGatherMatmul(comptime Q: type) type {
                     try self.ids.resize(self.a, n);
                     try self.src.resize(self.a, n);
                     try self.inv.resize(self.a, n);
-                    for (self.order.items, 0..) |*o, i| o.* = @intCast(i);
-                    // stable: equal slots keep their routed order (mlx-lm's argsort of the flat indices)
-                    std.sort.block(u32, self.order.items, rows.slot, struct {
-                        fn lt(slot: []const u32, x0: u32, x1: u32) bool {
-                            return slot[x0] < slot[x1];
-                        }
-                    }.lt);
+                    // Stable by slot: equal slots keep their routed order (mlx-lm's argsort of the flat indices), as a
+                    // counting sort over the slots' range.
+                    const max_slot = if (n == 0) 0 else std.mem.max(u32, rows.slot);
+                    try self.counts.resize(self.a, max_slot + 2);
+                    @memset(self.counts.items, 0);
+                    for (rows.slot) |sl| self.counts.items[sl + 1] += 1;
+                    for (1..self.counts.items.len) |i| self.counts.items[i] += self.counts.items[i - 1];
+                    for (rows.slot, 0..) |sl, i| {
+                        self.order.items[self.counts.items[sl]] = @intCast(i);
+                        self.counts.items[sl] += 1;
+                    }
                     for (self.order.items, 0..) |o, i| {
                         self.ids.items[i] = rows.slot[o];
                         self.src.items[i] = if (rows.act_row) |ar| ar[o] else o;
@@ -303,7 +308,7 @@ pub fn FromGatherMatmul(comptime Q: type) type {
 
                 pub fn deinit(self: *Self, g: *G) void {
                     _ = g;
-                    inline for (.{ &self.order, &self.ids, &self.src, &self.inv }) |l| l.deinit(self.a);
+                    inline for (.{ &self.order, &self.counts, &self.ids, &self.src, &self.inv }) |l| l.deinit(self.a);
                     self.a.destroy(self);
                 }
             };

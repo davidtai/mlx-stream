@@ -24,6 +24,11 @@ pub const max_candidates = 64;
 
 const Entry = struct { rank: u8, score: f32, expert: u16 };
 
+/// Expert `e` is resident under `p`: the residency `select` skips (one layer's policy).
+pub fn residentIn(p: *const LayerPolicy, e: u16) bool {
+    return p.slotOf(e) != null;
+}
+
 /// A selector for an arch routing `routed_top_k` experts per row: tau is measured from each row's routed-top-k-th score,
 /// and a selector keeps at least that many candidates per row (`k`, up to `max_k`).
 pub fn SelectorOf(comptime routed_top_k: u32) type {
@@ -54,6 +59,12 @@ pub fn SelectorOf(comptime routed_top_k: u32) type {
         /// n_experts (row-major f32), `next` that layer's residency. Returns the
         /// first `out.len` non-resident experts of the ordered union.
         pub fn select(self: *Selector, scores: []const f32, next: *const LayerPolicy, out: []u16) []u16 {
+            return self.selectWith(scores, next, residentIn, out, null);
+        }
+
+        /// `select` with the residency asked of `resident(ctx, expert)` (the next layer's experts over several
+        /// policies: one per bank layer).
+        pub fn selectWith(self: *Selector, scores: []const f32, ctx: anytype, comptime resident: fn (@TypeOf(ctx), u16) bool, out: []u16, ranks: ?[]u8) []u16 {
             std.debug.assert(scores.len % self.n_experts == 0 and scores.len / self.n_experts <= max_rows);
             var entries: [max_rows * max_k]Entry = undefined;
             const ordered = self.order(scores, &entries);
@@ -61,7 +72,8 @@ pub fn SelectorOf(comptime routed_top_k: u32) type {
             for (ordered) |en| {
                 if (self.seen.isSet(en.expert)) continue;
                 self.seen.set(en.expert);
-                if (next.slotOf(en.expert) != null) continue;
+                if (resident(ctx, en.expert)) continue;
+                if (ranks) |r| r[n] = en.rank;
                 out[n] = en.expert;
                 n += 1;
                 if (n == out.len) break;

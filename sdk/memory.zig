@@ -178,12 +178,18 @@ pub fn startFootprintInterval() void {
 pub const VmBytes = struct { free: u64 = 0, active: u64 = 0, inactive: u64 = 0, wired: u64 = 0, purgeable: u64 = 0, speculative: u64 = 0, compressor: u64 = 0, external: u64 = 0, internal: u64 = 0 };
 
 pub fn vmBytes() VmBytes {
-    if (comptime !builtin.os.tag.isDarwin()) return .{};
+    return vmBytesChecked() orelse .{};
+}
+
+/// `vmBytes`, or null where the kernel gives no reading (off Darwin, or host_statistics64 refused): a caller whose
+/// bound rests on the reading refuses rather than read zeros.
+pub fn vmBytesChecked() ?VmBytes {
+    if (comptime !builtin.os.tag.isDarwin()) return null;
     var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return .{};
+    if (host_page_size(mach_host_self(), &page) != 0) return null;
     var vm = std.mem.zeroes(VmStats64);
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return .{};
+    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return null;
     const pg: u64 = page;
     return .{
         .free = vm.free_count * pg,
@@ -202,6 +208,17 @@ pub fn vmBytes() VmBytes {
 /// memory monitor reads (file cache included; free and speculative pages excluded).
 pub fn physicalUsedBytes(v: VmBytes) u64 {
     return v.wired + v.active + v.inactive + v.compressor;
+}
+
+/// The box's used memory as the host's baseline counts it (wired, the compressor's pages, the anonymous pages less
+/// the purgeable ones; file-backed pages aside), from one host_statistics64 reading, whose counts every Darwin has (the
+/// `vm.page_wired_count` sysctl an earlier form read does not exist on macOS 26.6: it read 0 there, and a bill took the
+/// rest of the box as empty). host_statistics64 is rate-limited box-wide for non-platform binaries (past 2-10 calls a
+/// second it returns its last reading): a phase boundary reads it once. Null where the kernel gives no reading; a
+/// construction that bills the rest of the box refuses then.
+pub fn boxUsedBytes() ?u64 {
+    const v = vmBytesChecked() orelse return null;
+    return v.wired + (v.internal -| v.purgeable) + v.compressor;
 }
 
 /// Total physical RAM (hw.memsize). 0 on failure and off Darwin.
@@ -238,6 +255,9 @@ test "sdk memory: the process and box readings are the kernel's, self-consistent
     const v = vmBytes();
     try testing.expect(v.wired > 0 and v.active > 0);
     try testing.expect(physicalUsedBytes(v) <= total and physicalUsedBytes(v) >= v.wired);
+    // The box's used memory holds the wired pages and this process's anonymous ones, and fits the box.
+    const used = boxUsedBytes().?;
+    try testing.expect(used <= total and used >= v.wired / 2 and used >= 32 << 20);
 }
 
 test "sdk memory: physical used is wired + active + inactive + compressor, free and speculative and file counts aside" {

@@ -24,7 +24,7 @@ rewrite rules below still hold; the host-side rows of the tables are history.
 | `@import("../model.zig")` etc. in deepseek_v41_host.zig | the bridge's own config parse and loaders (no host import) |
 | inside src/sdk_ext: `@import("peek.zig")`, `@import("memory_bill.zig")`, `@import("quant_mode.zig")` | `@import("sdk")` |
 | `plugins.mlx_stream_testing` (host tests) | gone: the host has no registry |
-| `caps.uses_expert_reader` + `sdk.expert.takeReader/giveReader` in the host | `vt.claim_process` / `vt.release_process` (plugin: `claimProcess` / `releaseProcess` in deepseek_v41_plugin.zig) |
+| `caps.uses_expert_reader` + `sdk.expert.takeReader/giveReader` in the host | `vt.claim_process` / `vt.release_process` (plugin: `claimProcess` / `releaseProcess` in src/arch/deepseek_v41/plugin.zig) |
 
 ## Files
 
@@ -132,50 +132,50 @@ rewrite rules below still hold; the host-side rows of the tables are history.
 | src/kernels/exl3/q3rc_premix_part.metal | src/kernels/exl3/q3rc_premix_part.metal |  |
 | src/kernels/exl3/q3rc_router_tail.metal | src/kernels/exl3/q3rc_router_tail.metal |  |
 | src/kernels/exl3/q3sk_combine.metal | src/kernels/exl3/q3sk_combine.metal |  |
-| src/mlx_stream/deepseek_v41.zig | src/deepseek_v41.zig |  |
-| src/mlx_stream/deepseek_v41_ar.zig | src/deepseek_v41_ar.zig |  |
-| src/mlx_stream/deepseek_v41_arm.zig | src/deepseek_v41_arm.zig |  |
-| src/mlx_stream/deepseek_v41_bill.zig | src/deepseek_v41_bill.zig |  |
-| src/mlx_stream/deepseek_v41_cache.zig | src/deepseek_v41_cache.zig |  |
-| src/mlx_stream/deepseek_v41_cell.zig | src/deepseek_v41_cell.zig |  |
-| src/mlx_stream/deepseek_v41_dspark.zig | src/deepseek_v41_dspark.zig |  |
-| src/mlx_stream/deepseek_v41_dspark_head.zig | src/deepseek_v41_dspark_head.zig |  |
-| src/mlx_stream/deepseek_v41_dspark_loop.zig | src/deepseek_v41_dspark_loop.zig |  |
-| src/mlx_stream/deepseek_v41_dspark_serve.zig | src/deepseek_v41_dspark_serve.zig |  |
-| src/mlx_stream/deepseek_v41_engram.zig | src/deepseek_v41_engram.zig |  |
-| src/mlx_stream/deepseek_v41_experts.zig | src/deepseek_v41_experts.zig |  |
-| src/mlx_stream/deepseek_v41_graph.zig | src/deepseek_v41_graph.zig |  |
-| src/mlx_stream/deepseek_v41_host.zig | src/deepseek_v41_host.zig |  |
-| src/mlx_stream/deepseek_v41_model.zig | src/deepseek_v41_model.zig |  |
-| src/mlx_stream/deepseek_v41_module.zig | src/deepseek_v41_module.zig |  |
-| src/mlx_stream/deepseek_v41_ops.zig | src/deepseek_v41_ops.zig |  |
-| src/mlx_stream/deepseek_v41_parity.zig | src/deepseek_v41_parity.zig |  |
-| src/mlx_stream/deepseek_v41_plugin.zig | src/deepseek_v41_plugin.zig |  |
-| src/mlx_stream/deepseek_v41_routes.zig | src/deepseek_v41_routes.zig |  |
-| src/mlx_stream/deepseek_v41_settings.zig | src/deepseek_v41_settings.zig |  |
-| src/mlx_stream/dsv41_cache_sim.zig | src/dsv41_cache_sim.zig |  |
-| src/mlx_stream/dsv41_decode_first.zig | src/dsv41_decode_first.zig |  |
-| src/mlx_stream/dsv41_decode_timers.zig | src/dsv41_decode_timers.zig |  |
-| src/mlx_stream/dsv41_draft_routes.zig | src/dsv41_draft_routes.zig |  |
-| src/mlx_stream/dsv41_host_heap.zig | src/dsv41_host_heap.zig |  |
-| src/mlx_stream/dsv41_kernel_routes.zig | src/dsv41_kernel_routes.zig |  |
-| src/mlx_stream/dsv41_kernels_test.zig | src/dsv41_kernels_test.zig |  |
-| src/mlx_stream/dsv41_prefill_timers.zig | src/dsv41_prefill_timers.zig |  |
-| src/mlx_stream/dsv41_profile.zig | src/dsv41_profile.zig |  |
-| src/mlx_stream/dsv41_verify_timeline.zig | src/dsv41_verify_timeline.zig |  |
-| src/mlx_stream/exl3_kernel_ops_gate.zig | src/exl3_kernel_ops_gate.zig |  |
-| src/mlx_stream/exl3_kernels.zig | src/exl3_kernels.zig |  |
-| src/mlx_stream/exl3_quant.zig | src/exl3_quant.zig |  |
-| src/mlx_stream/exl3_selfcheck.zig | src/exl3_selfcheck.zig |  |
-| src/mlx_stream/exl3_source.zig | src/exl3_source.zig |  |
-| src/mlx_stream/expert_admission.zig | src/expert_admission.zig |  |
-| src/mlx_stream/expert_bank.zig | src/expert_bank.zig |  |
-| src/mlx_stream/expert_event_test.zig | src/expert_event_test.zig |  |
-| src/mlx_stream/expert_io_test.zig | src/expert_io_test.zig |  |
-| src/mlx_stream/expert_lookahead.zig | src/expert_lookahead.zig |  |
-| src/mlx_stream/expert_policy_test.zig | src/expert_policy_test.zig |  |
-| src/mlx_stream/expert_stream.zig | src/expert_stream.zig |  |
-| src/mlx_stream/expert_stream_of_test.zig | src/expert_stream_of_test.zig |  |
+| src/mlx_stream/deepseek_v41.zig | src/arch/deepseek_v41/deepseek_v41.zig |  |
+| src/mlx_stream/deepseek_v41_ar.zig | src/arch/deepseek_v41/ar.zig |  |
+| src/mlx_stream/deepseek_v41_arm.zig | src/arch/deepseek_v41/arm.zig |  |
+| src/mlx_stream/deepseek_v41_bill.zig | src/arch/deepseek_v41/bill.zig |  |
+| src/mlx_stream/deepseek_v41_cache.zig | src/arch/deepseek_v41/cache.zig |  |
+| src/mlx_stream/deepseek_v41_cell.zig | src/arch/deepseek_v41/cell.zig |  |
+| src/mlx_stream/deepseek_v41_dspark.zig | src/arch/deepseek_v41/dspark.zig |  |
+| src/mlx_stream/deepseek_v41_dspark_head.zig | src/arch/deepseek_v41/dspark_head.zig |  |
+| src/mlx_stream/deepseek_v41_dspark_loop.zig | src/arch/deepseek_v41/dspark_loop.zig |  |
+| src/mlx_stream/deepseek_v41_dspark_serve.zig | src/arch/deepseek_v41/dspark_serve.zig |  |
+| src/mlx_stream/deepseek_v41_engram.zig | src/arch/deepseek_v41/engram.zig |  |
+| src/mlx_stream/deepseek_v41_experts.zig | src/arch/deepseek_v41/experts.zig |  |
+| src/mlx_stream/deepseek_v41_graph.zig | src/arch/deepseek_v41/graph.zig |  |
+| src/mlx_stream/deepseek_v41_host.zig | src/arch/deepseek_v41/host.zig |  |
+| src/mlx_stream/deepseek_v41_model.zig | src/arch/deepseek_v41/model.zig |  |
+| src/mlx_stream/deepseek_v41_module.zig | src/arch/deepseek_v41/module.zig |  |
+| src/mlx_stream/deepseek_v41_ops.zig | src/arch/deepseek_v41/ops.zig |  |
+| src/mlx_stream/deepseek_v41_parity.zig | src/arch/deepseek_v41/parity.zig |  |
+| src/mlx_stream/deepseek_v41_plugin.zig | src/arch/deepseek_v41/plugin.zig |  |
+| src/mlx_stream/deepseek_v41_routes.zig | src/arch/deepseek_v41/routes.zig |  |
+| src/mlx_stream/deepseek_v41_settings.zig | src/arch/deepseek_v41/settings.zig |  |
+| src/mlx_stream/dsv41_cache_sim.zig | src/arch/deepseek_v41/cache_sim.zig |  |
+| src/mlx_stream/dsv41_decode_first.zig | src/arch/deepseek_v41/decode_first.zig |  |
+| src/mlx_stream/dsv41_decode_timers.zig | src/arch/deepseek_v41/decode_timers.zig |  |
+| src/mlx_stream/dsv41_draft_routes.zig | src/arch/deepseek_v41/draft_routes.zig |  |
+| src/mlx_stream/dsv41_host_heap.zig | src/arch/deepseek_v41/host_heap.zig |  |
+| src/mlx_stream/dsv41_kernel_routes.zig | src/arch/deepseek_v41/kernel_routes.zig |  |
+| src/mlx_stream/dsv41_kernels_test.zig | src/arch/deepseek_v41/kernels_test.zig |  |
+| src/mlx_stream/dsv41_prefill_timers.zig | src/arch/deepseek_v41/prefill_timers.zig |  |
+| src/mlx_stream/dsv41_profile.zig | src/arch/deepseek_v41/profile.zig |  |
+| src/mlx_stream/dsv41_verify_timeline.zig | src/arch/deepseek_v41/verify_timeline.zig |  |
+| src/mlx_stream/exl3_kernel_ops_gate.zig | src/exl3/kernel_ops_gate.zig |  |
+| src/mlx_stream/exl3_kernels.zig | src/exl3/kernels.zig |  |
+| src/mlx_stream/exl3_quant.zig | src/exl3/quant.zig |  |
+| src/mlx_stream/exl3_selfcheck.zig | src/exl3/selfcheck.zig |  |
+| src/mlx_stream/exl3_source.zig | src/exl3/source.zig |  |
+| src/mlx_stream/expert_admission.zig | src/expert/admission.zig |  |
+| src/mlx_stream/expert_bank.zig | src/expert/bank.zig |  |
+| src/mlx_stream/expert_event_test.zig | src/expert/event_test.zig |  |
+| src/mlx_stream/expert_io_test.zig | src/expert/io_test.zig |  |
+| src/mlx_stream/expert_lookahead.zig | src/expert/lookahead.zig |  |
+| src/mlx_stream/expert_policy_test.zig | src/expert/policy_test.zig |  |
+| src/mlx_stream/expert_stream.zig | src/expert/stream.zig |  |
+| src/mlx_stream/expert_stream_of_test.zig | src/expert/stream_of_test.zig |  |
 | src/mlx_stream/mlx_stream.zig | src/root.zig |  |
 | src/mlx_stream/mlx_stream_imports.zig | (deleted) | import probe / profile options: the boundary holds by construction; `-Dplugin-profile` replaces the options |
 | src/mlx_stream/mlx_stream_options.zig | (deleted) | replaced by src/build_flags.zig (`sdk.plugin_profile`) |
@@ -214,7 +214,7 @@ rewrite rules below still hold; the host-side rows of the tables are history.
 | src/plugins.zig (the mlx-stream conformance tests) | src/conformance.zig | renamed "mlx-stream conformance: ..." |
 | src/sdk.zig (`expert`, `kernels`, `quant`, `profile`, `ops`, `kv`, `Quant`, `ExpertSource`) | src/sdk_ext.zig (`sdk_ext.expert`, ...) |  |
 | (new) | src/build_flags.zig | profile switches from `sdk.plugin_profile` |
-| (new) | src/exl3_sushi_parity.zig | sushi K3 fixture through this plugin decode |
+| (new) | src/exl3/sushi_parity.zig | sushi K3 fixture through this plugin decode |
 
 ## Tests ported from the coverage branches
 
@@ -226,8 +226,8 @@ rewrite rules below still hold; the host-side rows of the tables are history.
 | coverage/sdk `src/plugins_refusals.zig` cases `expert_source_wrong_caps`, `quant_half_contract`, `quant_claims_mistyped`, `quant_check_direct`, `profile_hook_missing_probe` | `src/refusals.zig` + `refusal_cases` in build.zig (`zig build refusals`) |
 | coverage/sdk cases `arch_binds_unprovided`, `arch_binds_another`; registry tests of quant routing and binds | dropped: the small SDK has no binds and no quant / expert-source tables |
 | fork `src/qwen4_exp.zig` "dsv41 ngram table: a BF16 tensor inside a checkpoint shard ..." | `src/ngram_table.zig` |
-| coverage/expert-io 74c81fff..fbc12206 (src/mlx_stream/expert_*_test.zig, expert_stream.zig, lib/expert_io/*, src/sdk/expert/*) | the same names under src/, csrc/, src/sdk_ext/expert/ (one commit per original commit; the decode-plan fix sits beside the keepwarm lever's line) |
+| coverage/expert-io 74c81fff..fbc12206 (src/mlx_stream/expert_*_test.zig, expert_stream.zig, lib/expert_io/*, src/sdk/expert/*) | src/expert/ (the names without their `expert_` prefix), csrc/, src/sdk_ext/expert/ (one commit per original commit; the decode-plan fix sits beside the keepwarm lever's line) |
 | coverage/expert-io `src/io_util.zig` no-cache tests | host src/io_util.zig |
 | coverage/expert-io `src/gpu_ceiling.zig`, `src/nocache_reader.zig` tests | host only |
-| coverage/plugin-core ad3d0f93..f1da4b90 (src/mlx_stream/*, src/fixtures/dsv41_*, src/mlx_stream/deepseek_v41_bill_receipts_test.zig) | src/*, src/fixtures/*, src/deepseek_v41_bill_receipts_test.zig |
-| coverage/plugin-core 9cca0993 (deepseek_v41_bill_mini_test.zig + bill / engram / module / deepseek_v41 hunks) | src/deepseek_v41_bill_mini_test.zig and the same names under src/ |
+| coverage/plugin-core ad3d0f93..f1da4b90 (src/mlx_stream/*, src/fixtures/dsv41_*, src/mlx_stream/deepseek_v41_bill_receipts_test.zig) | the paths in the table above, src/fixtures/*, src/arch/deepseek_v41/bill_receipts_test.zig |
+| coverage/plugin-core 9cca0993 (deepseek_v41_bill_mini_test.zig + bill / engram / module / deepseek_v41 hunks) | src/arch/deepseek_v41/bill_mini_test.zig and bill.zig, engram.zig, module.zig, deepseek_v41.zig under src/arch/deepseek_v41/ |

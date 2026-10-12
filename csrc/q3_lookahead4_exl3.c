@@ -27,11 +27,9 @@
  *   continuation, the same syscalls and bytes) up to the first scatter copy, where it waits for the range's rows.
  *   q3ld_submit BINDS each job range (fd, offset, component lengths all equal; job without a deadline) to its pre-range:
  *   in flight / waiting -> the rows are attached and that worker scatters and finishes the loop; still QUEUED -> the
- *   pre-range is cancelled and the job reads the range itself (stock).  The job's own worker, reaching a bound range,
- *   waits until the pre-range is DONE and publishes ITS result words in ticket order (the completion-log contract of
- *   the native-issue pump is unchanged: a fill's tickets complete in index order, by one worker).  Unbound pre-ranges
- *   expire at the layer-call's settle (spec_step / spec_stepn), at the next pre_read and at quiesce; a pre-range whose
- *   job skips it (an earlier range failed) is cancelled at the bind point and never writes its rows.  A pre-running
+ *   pre-range is cancelled and the job reads the range itself (stock).  The range's own job, reaching a bound range,
+ *   waits until the pre-range is DONE and publishes ITS result words.  Unbound pre-ranges
+ *   expire at the layer-call's settle (spec_step / spec_stepn), at the next pre_read and at quiesce.  A pre-running
  *   worker counts as demand busy (the speculative queue rule sees it) and in the read gauge.  Keyed by FILE OFFSET only;
  *   plans / slots / policy never see a pre-range; exactness: a range's bytes and result words are those of the same
  *   stock read, started earlier.  Counters SC_PRE_*; inject event kinds 9 (pre start) / 10 (pre served).
@@ -56,9 +54,10 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  * transcribed unchanged) plus ONE addition: a low-priority, CHUNKED, SPECULATIVE op class, split into
  * per-HORIZON priority classes (prio 0 = the next layer, prio h-1 = h layers ahead).
  *
- * DEMAND (unchanged from q3_nativeissue.c): 4 workers, one per stock 9 MiB staging buffer, a FIFO job
- * queue, per range the stock aligned F_NOCACHE preadv loop + the scatter copy into the slot rows, the
- * result words + an ordered completion log published with a RELEASE store.  Two additions on the demand
+ * DEMAND: workers, one per stock 9 MiB staging buffer, a FIFO job queue of ONE RANGE per job (a submit
+ * queues each of its ranges, gate/up ranges first, so idle workers read them side by side; each range's
+ * status is its own), per range the stock aligned F_NOCACHE preadv loop + the scatter copy into the slot
+ * rows, the result words + an ordered completion log published with a RELEASE store.  Two additions on the demand
  * path, both keyed by FILE OFFSET only (never by layer / expert / slot):
  *   - q3ld_submit CLAIMS every speculative record that contains one of the job's ranges: an in-flight,
  *     parked or landed record is promoted (it now reads its remaining chunks back to back, ignoring the
@@ -102,6 +101,18 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  *   - the stock entry points (q3ld_spec_step / _spec_stepn / _pre_read) behave as before (len = rec_len, the armed
  *     lengths): a uniform-record bank reads exactly as with the original pool.  ABI 2026092704 (original 2026092504).
  * ABI 2026100201.
+ *
+ * WITHDRAW (mimo/ahead-trim, 2026-10-10; ABI 2026101001; over range jobs ABI 2026101201): q3ld_withdraw(first) takes
+ *   a submit that no worker has started back out of the queue, by its first ticket: every range job of it (a submit
+ *   queues one job per range, sub_len[first] of them, adjacent in the FIFO and in ticket order), all or none; the jobs
+ *   behind them keep their order.  Its tickets get ST_WITHDRAWN words (nothing read: no preadv, payload 0, no row
+ *   written) and are published in ticket order under the pool mutex, so they are terminal for waits and free for the
+ *   ring's next submit.  A submit a worker has started (its first range taken: the FIFO takes its ranges in ticket
+ *   order) runs as submitted, every range of it (0 = not queued).  Refused (-2) for a submit whose bytes are promised
+ *   elsewhere: a ticket bound to a pre-range or waited on by a live event gate.  Its owner calls it when the job's records are no longer
+ *   needed before the drive reached them (P7 early_whole_trim: the read-ahead jobs still queued when the prompt call's
+ *   plans exist).  It never touches the speculative class (no claim is released; the prompt pass issues none).
+ *   Inject event kind 11 (withdrawn).
  */
 #include <errno.h>
 #include <mach/mach_time.h>
@@ -124,6 +135,7 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
 #define ST_OSERR 2
 #define ST_DEADLINE 3
 #define ST_SKIPPED 4
+#define ST_WITHDRAWN 5       /* q3ld_withdraw: the job left the queue unstarted; nothing read, no row written */
 
 #define MAX_SPEC 16
 #define MAX_SPEC_THREADS 3
@@ -181,7 +193,6 @@ enum {
     SC_PRE_WAITS,         /* ... of which the job worker waited for the pre-range */
     SC_PRE_WAIT_NS,
     SC_PRE_BIND_WAIT_NS,  /* pre-range workers waiting for their rows */
-    SC_PRE_SKIP_CANCELS,  /* bound pre-ranges cancelled because their job skipped the range */
     SC_PRE_MAX_INFLIGHT,  /* max pre-ranges running at a start */
     /* the event-gate class (lookahead4) */
     SC_EV_CALLS,          /* q3ld_ev_gates calls */
@@ -196,6 +207,7 @@ enum {
     SC_EV_WD_LAST_VALUE,  /* the value of the last forced gate */
     SC_EV_HOST_RELEASED,  /* gates the host released (error paths) */
     SC_EV_STOP_RELEASED,  /* live gates released at stop */
+    SC_DIRECT_RANGES,     /* demand ranges read straight into their rows (q3ld_direct_config: no staging, no copy) */
     SC_N
 };
 
@@ -228,8 +240,7 @@ typedef struct {
     int fd;
     int64_t file_size;
     int64_t deadline;
-    int64_t first;      /* first ticket */
-    int32_t count;      /* ranges in the job */
+    int64_t ticket;     /* the job's one range */
 } job_t;
 
 typedef struct {
@@ -287,7 +298,7 @@ static int64_t *sc = 0;
 typedef struct {
     int state;
     int bound;            /* a demand submit attached its rows (rg.dst) */
-    int cancel;           /* expiry (unbound) / the job skipped it (bound): no scatter */
+    int cancel;           /* expired while unbound (a cancelled range is never bound): no scatter */
     int fd;
     int64_t file_size;
     int64_t tag;
@@ -303,10 +314,11 @@ static int64_t pre_lens[2 * MAX_COMP];
 static int64_t pre_gu_total = 0;
 static uint64_t pre_order = 0;
 static int32_t *pre_of = 0;   /* per ticket: 1 + the pre-range bound to that range at submit, 0 = none */
+static int32_t *sub_len = 0;  /* WITHDRAW: per ticket, the range jobs of the submit it starts (0: it starts none) */
 
 /* ---- the event-gate class (lookahead4) */
-#define MAX_GATES 256
-#define MAX_GATE_TICKETS 256
+#define MAX_GATES 512         /* the live gates of every route a stream holds: 6 routes x (48 parts + 1) <= 512 */
+#define MAX_GATE_TICKETS 768  /* tickets of one registration: a gate/up and a down ticket per record, 2 x 48 ids x 8 minis */
 #define EVK_OFF 0
 #define EVK_MTL 1         /* ev_obj = an MTLSharedEvent (q3ld_mtl_signal) */
 #define EVK_HOST 2        /* ev_obj = an int64 word (release store; the CPU backend and the checks) */
@@ -345,7 +357,8 @@ static int nrules = 0;
 static uint64_t rng = 0;
 static int64_t delay_max = 0, spec_delay_max = 0;
 /* event log: kind (1 demand submit, 2 demand start, 3 spec start by thread 0, 8 spec start by a thread >= 1, 7 claimed
- * chunk start, 4 spec end, 5 adopt, 9 pre-range start, 10 pre-range served), qlen, busy, t, arg */
+ * chunk start, 4 spec end, 5 adopt, 9 pre-range start, 10 pre-range served, 11 demand job withdrawn), qlen, busy, t,
+ * arg */
 static int64_t *evlog = 0, evcap = 0, evn = 0;
 
 void q3ld_test_rules(int32_t n, const int64_t *off, const int64_t *code, const int64_t *arg) {
@@ -365,6 +378,19 @@ void q3ld_test_delay(uint64_t seed, int64_t max_ns) {
 void q3ld_test_spec_delay(int64_t max_ns) {
     pthread_mutex_lock(&mu);
     spec_delay_max = max_ns;
+    pthread_mutex_unlock(&mu);
+}
+
+/* HOLD (spec_hold >= 0): only spec_hold more records may start (SPEC_MAY_START, SPEC_STARTED), and a started
+ * unclaimed record's chunk waits at its start (spec_hold_wait); spec_held counts the records waiting there, hold_cv
+ * tells q3ld_test_spec_held of a change.  A claim (spec_cv) or the hold's end (-1) lets a record go. */
+static int spec_hold = -1, spec_held = 0;
+static pthread_cond_t hold_cv = PTHREAD_COND_INITIALIZER;
+
+void q3ld_test_spec_hold(int32_t starts) {
+    pthread_mutex_lock(&mu);
+    spec_hold = starts < 0 ? -1 : starts;
+    pthread_cond_broadcast(&spec_cv);
     pthread_mutex_unlock(&mu);
 }
 
@@ -432,6 +458,9 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
 #define RANGE_DELAY() range_delay()
 #define SPEC_DELAY() spec_delay()
 #define EV(kind, arg) ev((kind), (arg))
+#define SPEC_HOLD(s) spec_hold_wait(s)
+#define SPEC_MAY_START(s) (spec_hold != 0 || (s)->state != SP_QUEUED)
+#define SPEC_STARTED() do { if (spec_hold > 0) spec_hold -= 1; } while (0)
 #else
 static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
     ssize_t r;
@@ -441,6 +470,9 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
 #define RANGE_DELAY() ((void)0)
 #define SPEC_DELAY() ((void)0)
 #define EV(kind, arg) ((void)0)
+#define SPEC_HOLD(s) ((void)0)
+#define SPEC_MAY_START(s) 1
+#define SPEC_STARTED() ((void)0)
 #endif
 
 #define LATE(deadline) ((deadline) >= 0 && q3ld_monotonic_ns() >= (deadline))
@@ -464,8 +496,68 @@ static void gauge_exit(void) {
     pthread_mutex_unlock(&mu);
 }
 
+/* DIRECT: a range whose file offset, destination rows and part lengths are all page multiples is read straight into
+ * its rows by preadv (one iovec per part), no staging buffer and no scatter copy.  Off unless q3ld_direct_config. */
+static int direct_reads = 0;
+
+int q3ld_direct_config(int32_t on) {
+    direct_reads = on != 0;
+    return 0;
+}
+
+static int direct_ok(const job_t *job, const range_t *rg) {
+    if (!direct_reads || rg->offset % page_size) return 0;
+    int64_t total = 0;
+    for (int32_t d = 0; d < rg->ndst; d++) {
+        if (rg->len[d] == 0) continue;
+        if (rg->dst[d] % (uint64_t)page_size || rg->len[d] % page_size) return 0;
+        total += rg->len[d];
+    }
+    return total > 0 && rg->offset + total <= job->file_size;
+}
+
+/* the DIRECT read: preadv into the rows until every part is full; the status words as run_range's */
+static int run_range_direct(const job_t *job, const range_t *rg, int64_t *out) {
+    struct iovec iov[MAX_COMP];
+    int n = 0;
+    int64_t want = 0;
+    for (int32_t d = 0; d < rg->ndst; d++) {
+        if (!rg->len[d]) continue;
+        iov[n].iov_base = (void *)(uintptr_t)rg->dst[d];
+        iov[n].iov_len = (size_t)rg->len[d];
+        want += rg->len[d];
+        n++;
+    }
+    int64_t calls = 0, returned = 0, total = 0, t_start = 0;
+    int status = ST_OK, first = 0;
+    out[4] = 0;
+    while (total < want) {
+        if (LATE(job->deadline)) { status = ST_DEADLINE; break; }
+        calls++;
+        if (!t_start) t_start = q3ld_monotonic_ns();
+        ssize_t r = do_preadv(job->fd, iov + first, n - first, (off_t)(rg->offset + total));
+        if (r < 0) { out[4] = errno; status = ST_OSERR; break; }
+        if (r == 0) { status = ST_SHORT; break; }
+        returned += r;
+        total += r;
+        int64_t left = r;
+        while (first < n && left >= (int64_t)iov[first].iov_len) { left -= (int64_t)iov[first].iov_len; first++; }
+        if (first < n && left > 0) { iov[first].iov_base = (char *)iov[first].iov_base + left; iov[first].iov_len -= (size_t)left; }
+    }
+    pthread_mutex_lock(&mu);
+    sc[SC_DIRECT_RANGES] += 1;
+    pthread_mutex_unlock(&mu);
+    out[1] = calls;
+    out[2] = returned;
+    out[3] = total;
+    out[5] = t_start ? t_start : q3ld_monotonic_ns();
+    out[6] = q3ld_monotonic_ns();
+    return status;
+}
+
 /* one range: stock _readv_range_into_impl loop + _read_some steps; returns the status (q3_nativeissue.c) */
 static int run_range(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
+    if (direct_ok(job, rg)) return run_range_direct(job, rg, out);
     int64_t calls = 0, returned = 0, read_total = 0, t_start = 0;
     int status = ST_OK;
     int32_t d = 0;
@@ -644,7 +736,7 @@ static void run_pre(int i, int w, char *stage) {
     for (int k = 0; k < MAX_PRE; k++) n += pre[k].state == PR_INFLIGHT;
     if (n > sc[SC_PRE_MAX_INFLIGHT]) sc[SC_PRE_MAX_INFLIGHT] = n;
     EV(9, p->rg.offset);
-    job_t job = { p->fd, p->file_size, -1, 0, 0 };
+    job_t job = { p->fd, p->file_size, -1, 0 };
     pthread_mutex_unlock(&mu);
     RANGE_DELAY();
     int64_t out[RES_W] = { 0 };
@@ -653,11 +745,10 @@ static void run_pre(int i, int w, char *stage) {
     gauge_exit();
     pthread_mutex_lock(&mu);
     busy -= 1;
-    if (status == PRE_DROPPED && !p->bound) {
+    if (status == PRE_DROPPED) {
         p->state = PR_FREE;                 /* expired unbound: nobody waits for it */
         p->cancel = 0;
     } else {
-        if (status == PRE_DROPPED) status = ST_SKIPPED;   /* bound but its job skipped it: the job frees it */
         for (int k = 1; k < RES_W; k++) p->words[k] = out[k];
         p->words[7] = w;
         p->words[0] = status;
@@ -878,72 +969,46 @@ static void *worker(void *arg) {
         job_t job = queue[qhead];
         qhead = (qhead + 1) % qcap;
         __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);
-        EV(2, job.first);
+        EV(2, job.ticket);
         busy += 1;
         pthread_mutex_unlock(&mu);
-        int failed = 0;
-        for (int32_t i = 0; i < job.count; i++) {
-            int64_t t = job.first + i;
-            int64_t *out = res + t * RES_W;
-            int pb = pre_of ? pre_of[t] : 0;
-            if (failed) {
-                if (pb) {                                  /* PRE: its pre-range must not write the rows */
-                    pre_t *p = &pre[pb - 1];
-                    pthread_mutex_lock(&mu);
-                    p->cancel = 1;
-                    sc[SC_PRE_SKIP_CANCELS] += 1;
-                    pthread_cond_broadcast(&pre_cv);
-                    while (p->state != PR_DONE) pthread_cond_wait(&pre_cv, &mu);
-                    p->state = PR_FREE; p->bound = 0; p->cancel = 0;
-                    pre_of[t] = 0;
-                    pthread_mutex_unlock(&mu);
-                }
-                out[1] = out[2] = out[3] = out[4] = 0;
-                out[5] = out[6] = q3ld_monotonic_ns();
-                out[7] = w;
-                pthread_mutex_lock(&mu);
-                out[0] = ST_SKIPPED;
-                publish(t);
-                pthread_mutex_unlock(&mu);
-                ev_flush();                                /* EVENT: a skipped range is terminal too */
-                continue;
-            }
-            int status;
-            int ww = w;
-            if (pb) {                                      /* PRE: the bound pre-range's result, in ticket order */
-                pre_t *p = &pre[pb - 1];
-                pthread_mutex_lock(&mu);
-                if (p->state != PR_DONE) {
-                    int64_t tw = q3ld_monotonic_ns();
-                    sc[SC_PRE_WAITS] += 1;
-                    while (p->state != PR_DONE) pthread_cond_wait(&pre_cv, &mu);
-                    sc[SC_PRE_WAIT_NS] += q3ld_monotonic_ns() - tw;
-                }
-                for (int k = 1; k < RES_W; k++) out[k] = p->words[k];
-                status = (int)p->words[0];
-                ww = (int)p->words[7];
-                p->state = PR_FREE; p->bound = 0; p->cancel = 0;
-                pre_of[t] = 0;
-                sc[SC_PRE_SERVED] += 1;
-                EV(10, ranges[t].offset);
-                pthread_mutex_unlock(&mu);
-            } else {
-                RANGE_DELAY();
-                status = try_adopt(&job, &ranges[t], out);
-                if (status < 0) {
-                    gauge_enter();
-                    status = run_range(&job, &ranges[t], stage, out);
-                    gauge_exit();
-                }
-            }
-            out[7] = ww;
+        const int64_t t = job.ticket;
+        int64_t *out = res + t * RES_W;
+        int pb = pre_of ? pre_of[t] : 0;
+        int status;
+        int ww = w;
+        if (pb) {                                      /* PRE: the bound pre-range's result */
+            pre_t *p = &pre[pb - 1];
             pthread_mutex_lock(&mu);
-            out[0] = status;
-            publish(t);
+            if (p->state != PR_DONE) {
+                int64_t tw = q3ld_monotonic_ns();
+                sc[SC_PRE_WAITS] += 1;
+                while (p->state != PR_DONE) pthread_cond_wait(&pre_cv, &mu);
+                sc[SC_PRE_WAIT_NS] += q3ld_monotonic_ns() - tw;
+            }
+            for (int k = 1; k < RES_W; k++) out[k] = p->words[k];
+            status = (int)p->words[0];
+            ww = (int)p->words[7];
+            p->state = PR_FREE; p->bound = 0; p->cancel = 0;
+            pre_of[t] = 0;
+            sc[SC_PRE_SERVED] += 1;
+            EV(10, ranges[t].offset);
             pthread_mutex_unlock(&mu);
-            ev_flush();                                    /* EVENT: the gate this range completed, if any */
-            if (status) failed = 1;
+        } else {
+            RANGE_DELAY();
+            status = try_adopt(&job, &ranges[t], out);
+            if (status < 0) {
+                gauge_enter();
+                status = run_range(&job, &ranges[t], stage, out);
+                gauge_exit();
+            }
         }
+        out[7] = ww;
+        pthread_mutex_lock(&mu);
+        out[0] = status;
+        publish(t);
+        pthread_mutex_unlock(&mu);
+        ev_flush();                                    /* EVENT: the gate this range completed, if any */
         pthread_mutex_lock(&mu);
         busy -= 1;
         pthread_cond_broadcast(&done_cv);
@@ -1005,15 +1070,39 @@ static void spec_drop_parked(spec_t *s) {   /* caller holds mu; s is INFLIGHT &&
     pthread_cond_broadcast(&land_cv);
 }
 
+#ifdef Q3LD_INJECT
+static void spec_hold_wait(const spec_t *s) {   /* caller holds mu */
+    if (spec_hold < 0 || s->claimed) return;
+    spec_held += 1;
+    pthread_cond_broadcast(&hold_cv);
+    while (spec_hold >= 0 && !s->claimed && !stopping) pthread_cond_wait(&spec_cv, &mu);
+    spec_held -= 1;
+    pthread_cond_broadcast(&hold_cv);
+}
+
+int32_t q3ld_test_spec_held(int32_t n, int64_t timeout_ns) {
+    struct timespec dl;
+    abs_realtime(&dl, timeout_ns);
+    pthread_mutex_lock(&mu);
+    int32_t rc = 0;
+    while (spec_held < n) {
+        if (pthread_cond_timedwait(&hold_cv, &mu, &dl) == ETIMEDOUT) { rc = 1; break; }
+    }
+    pthread_mutex_unlock(&mu);
+    return rc;
+}
+#endif
+
 static void *spec_worker(void *arg) {
     int ti = (int)(intptr_t)arg;
     pthread_mutex_lock(&mu);
     for (;;) {
         int i;
-        while (!stopping && !((i = spec_pick()) >= 0 && startable(&spec[i], ti))) pthread_cond_wait(&spec_cv, &mu);
+        while (!stopping && !((i = spec_pick()) >= 0 && startable(&spec[i], ti) && SPEC_MAY_START(&spec[i]))) pthread_cond_wait(&spec_cv, &mu);
         if (stopping) break;
         spec_t *s = &spec[i];
         if (s->state == SP_QUEUED) {
+            SPEC_STARTED();
             s->state = SP_INFLIGHT;
             sc[SC_STARTED] += 1;
             int64_t want_end = s->base + s->len;                  /* EXL3_LANE_PORT: this record's length */
@@ -1066,6 +1155,7 @@ static void *spec_worker(void *arg) {
                 }
             }
             EV(s->claimed ? 7 : (ti > 0 ? 8 : 3), s->claimed ? s->base : nq);
+            SPEC_HOLD(s);
             int64_t n = s->span - s->got;
             if (n > spec_chunk) n = spec_chunk;
             char *dst = s->buf + s->got;
@@ -1156,10 +1246,11 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     ranges = (range_t *)calloc((size_t)n_tickets, sizeof(range_t));
     queue = (job_t *)calloc((size_t)n_tickets, sizeof(job_t));
     pre_of = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
+    sub_len = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
     gate_of = (int64_t *)calloc((size_t)n_tickets, sizeof(int64_t));
-    if (!ranges || !queue || !pre_of || !gate_of) {
-        free(ranges); free(queue); free(pre_of); free(gate_of);
-        ranges = 0; queue = 0; pre_of = 0; gate_of = 0;
+    if (!ranges || !queue || !pre_of || !sub_len || !gate_of) {
+        free(ranges); free(queue); free(pre_of); free(sub_len); free(gate_of);
+        ranges = 0; queue = 0; pre_of = 0; sub_len = 0; gate_of = 0;
         pthread_mutex_unlock(&mu);
         return -ENOMEM;
     }
@@ -1201,7 +1292,7 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     for (int32_t i = 0; i < count; i++) {
         if (res[(first + i) * RES_W] == ST_PENDING) { pthread_mutex_unlock(&mu); return -2; }
     }
-    if (qlen >= qcap) { pthread_mutex_unlock(&mu); return -3; }
+    if (qlen + count > qcap) { pthread_mutex_unlock(&mu); return -3; }
     for (int32_t i = 0; i < count; i++) {
         int down = i >= n;
         int32_t item = down ? i - n : i;
@@ -1217,6 +1308,7 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
         for (int k = 1; k < RES_W; k++) out[k] = 0;
         out[0] = ST_PENDING;
         pre_of[first + i] = 0;
+        sub_len[first + i] = i == 0 ? count : 0;       /* WITHDRAW: the submit's range jobs, on its first ticket */
         gate_of[first + i] = 0;                        /* EVENT: a gate maps a ticket only after this submit */
     }
     if (pre_on && deadline < 0) {                  /* PRE: bind (in flight / waiting / done) or cancel (queued) */
@@ -1240,13 +1332,54 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
         if (woke) pthread_cond_broadcast(&pre_cv);
     }
     if (nspec) claim_ranges(fd, first, count);
-    job_t *job = &queue[(qhead + qlen) % qcap];
-    job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->first = first; job->count = count;
-    __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
+    for (int32_t i = 0; i < count; i++) {          /* a job per range, in ticket order: every gate/up, then every down */
+        job_t *job = &queue[(qhead + qlen) % qcap];
+        job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->ticket = first + i;
+        __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
+    }
     EV(1, first);
-    pthread_cond_signal(&work_cv);
+    pthread_cond_broadcast(&work_cv);
     pthread_mutex_unlock(&mu);
     return 0;
+}
+
+/* WITHDRAW: take the submit whose first ticket is `first` back out of the FIFO while no worker has started it: its
+ * sub_len[first] range jobs, adjacent in the queue in ticket order (one submit queues them under the pool mutex), leave
+ * it together, the jobs behind them keeping their order; its tickets get ST_WITHDRAWN words (no preadv, payload 0, no
+ * row written) and are published in ticket order.  The FIFO takes a submit's ranges in ticket order, so its first
+ * range still queued means none of it was taken.  Returns 1 withdrawn; 0 not queued (a worker started it and every
+ * range of it runs as submitted, it is done, or no submit starts at `first`); -1 not running / bad ticket; -2 refused
+ * (a ticket bound to a pre-range or waited on by a live event gate: its bytes are promised elsewhere). */
+int q3ld_withdraw(int64_t first) {
+    if (first < 0) return -1;
+    pthread_mutex_lock(&mu);
+    if (!running || first >= nt) { pthread_mutex_unlock(&mu); return -1; }
+    const int32_t count = sub_len[first];
+    if (count < 1) { pthread_mutex_unlock(&mu); return 0; }
+    int64_t k = 0;
+    while (k < qlen && queue[(qhead + k) % qcap].ticket != first) k++;
+    if (k == qlen) { pthread_mutex_unlock(&mu); return 0; }
+    for (int32_t i = 0; i < count; i++) {           /* the submit's ranges, adjacent and in ticket order */
+        if (k + i >= qlen || queue[(qhead + k + i) % qcap].ticket != first + i) { pthread_mutex_unlock(&mu); return 0; }
+        int64_t t = first + i;
+        if (pre_of[t] || (gate_of[t] && gate_live(gate_of[t] - 1))) { pthread_mutex_unlock(&mu); return -2; }
+    }
+    for (int64_t m = k; m + count < qlen; m++) queue[(qhead + m) % qcap] = queue[(qhead + m + count) % qcap];
+    __atomic_store_n(&qlen, qlen - count, __ATOMIC_RELAXED);
+    sub_len[first] = 0;
+    int64_t now = q3ld_monotonic_ns();
+    for (int32_t i = 0; i < count; i++) {
+        int64_t *out = res + (first + i) * RES_W;
+        out[1] = out[2] = out[3] = out[4] = 0;
+        out[5] = out[6] = now;
+        out[7] = -1;
+        out[0] = ST_WITHDRAWN;
+        publish(first + i);
+    }
+    EV(11, first);
+    pthread_cond_broadcast(&spec_cv);          /* the demand queue got shallower: the speculative queue rule may pass */
+    pthread_mutex_unlock(&mu);
+    return 1;
 }
 
 /* settle every unclaimed record with tag <= cur: QUEUED dropped, parked dropped, running abandoned at the next
@@ -1337,6 +1470,23 @@ int32_t q3ld_spec_step_len(int32_t fd, int64_t file_size, int64_t cur, int32_t n
     if (!running || stopping || !nspec || len <= 0 || len > spec_rec_len) { pthread_mutex_unlock(&mu); return -1; }
     int wake = settle(cur);
     int32_t queued = issue(fd, file_size, cur, cur + 1, 0, 1, n, bases, len);
+    if (queued || wake) pthread_cond_broadcast(&spec_cv);
+    pthread_mutex_unlock(&mu);
+    return queued;
+}
+
+/* q3ld_spec_step whose record k carries lens[k] payload bytes (0 < lens[k] <= the configured rec_len): one step over the
+ * records of several layers of different record lengths (GLM-5.3's EXL3 bank: an expert of the next routed layer's
+ * K3 or K4 bank layer).  Returns the number newly queued, -1 when off / not running / a bad length. */
+int32_t q3ld_spec_step_lens(int32_t fd, int64_t file_size, int64_t cur, int32_t n, const int64_t *bases, const int64_t *lens) {
+    pthread_mutex_lock(&mu);
+    if (!running || stopping || !nspec) { pthread_mutex_unlock(&mu); return -1; }
+    for (int32_t k = 0; k < n; k++) {
+        if (lens[k] <= 0 || lens[k] > spec_rec_len) { pthread_mutex_unlock(&mu); return -1; }
+    }
+    int wake = settle(cur);
+    int32_t queued = 0;
+    for (int32_t k = 0; k < n; k++) queued += issue(fd, file_size, cur, cur + 1, 0, 1, 1, &bases[k], lens[k]);
     if (queued || wake) pthread_cond_broadcast(&spec_cv);
     pthread_mutex_unlock(&mu);
     return queued;
@@ -1503,7 +1653,7 @@ int q3ld_stop(void) {
     }
     running = 0; nworkers = 0; nspec_started = 0; __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); nspec = 0; nspec_threads = 0; spec_configured = 0;
     spec_idle_busy = SPEC_MAX_DEMAND_BUSY;
-    free(ranges); free(queue); free(pre_of); ranges = 0; queue = 0; pre_of = 0;
+    free(ranges); free(queue); free(pre_of); free(sub_len); ranges = 0; queue = 0; pre_of = 0; sub_len = 0;
     for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
     pre_on = 0; pre_ngu = pre_ndown = 0; pre_gu_total = 0;
     res = 0; logbuf = 0; gauge = 0; sc = 0;
@@ -1736,9 +1886,12 @@ int32_t q3ld_ev_gates(int32_t n, const uint64_t *values, const int32_t *counts, 
     if (!running || stopping || ev_kind == EVK_OFF || !gate_of) { pthread_mutex_unlock(&mu); return -1; }
     if (g_tail - g_head + n > MAX_GATES) { pthread_mutex_unlock(&mu); return -3; }
     uint64_t prev = ev_hi;
+    int64_t total = 0;
+    for (int32_t i = 0; i < n; i++) total += counts[i] < 0 ? MAX_GATE_TICKETS + 1 : counts[i];
+    if (total > MAX_GATE_TICKETS) { pthread_mutex_unlock(&mu); return -2; }
     int64_t k = 0;
     for (int32_t i = 0; i < n; i++) {                   /* validate everything before any change */
-        if (values[i] <= prev || counts[i] < 0 || counts[i] > MAX_GATE_TICKETS) { pthread_mutex_unlock(&mu); return -2; }
+        if (values[i] <= prev) { pthread_mutex_unlock(&mu); return -2; }
         prev = values[i];
         for (int32_t j = 0; j < counts[i]; j++, k++) {
             int64_t t = tickets[k];
@@ -1826,7 +1979,7 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026100201; }              /* EXL3_LANE_PORT 2026092704, original 2026092504 */
+int32_t q3ld_abi(void) { return 2026101201; }              /* WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }

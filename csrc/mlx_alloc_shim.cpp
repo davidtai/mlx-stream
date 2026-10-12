@@ -52,3 +52,13 @@ int dsv41_alloc_uninit(mlx_array* out, const int* shape, size_t ndim, mlx_dtype 
 }
 
 }  // extern "C"
+
+// MiMo P7 (`prefill_combine: "inplace"`): the wide call's sources' GPU addresses (csrc/mimo_gpu_address.inc).
+#include "mimo_gpu_address.inc"
+
+// MiMo X12 (`gpu_keep_warm`): the warm queue, kernel and tiny buffer (csrc/mimo_gpu_warm.inc). Kept in this translation
+// unit because the host compiles a fixed list of the plugin's csrc files; DeepSeek never calls it.
+#include "mimo_gpu_warm.inc"
+
+// MiMo X12 measurement: the GPU's energy, DVFS-state and thermal-state residency (IOReport) and DVFS table (csrc/mimo_gpu_power.inc).
+#include "mimo_gpu_power.inc"

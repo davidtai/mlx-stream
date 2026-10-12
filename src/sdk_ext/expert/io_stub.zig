@@ -19,7 +19,13 @@ pub const q3ld = struct {
     pub fn q3ld_submit(_: i32, _: i64, _: i64, _: i32, _: i32, _: i32, _: [*]const i64, _: [*]const [*]const u64, _: [*]const i64, _: i64) c_int {
         return -1;
     }
+    pub fn q3ld_withdraw(_: i64) c_int {
+        return -1;
+    }
     pub fn q3ld_spec_step_len(_: i32, _: i64, _: i64, _: i32, _: ?[*]const i64, _: i64) i32 {
+        return -1;
+    }
+    pub fn q3ld_spec_step_lens(_: i32, _: i64, _: i64, _: i32, _: ?[*]const i64, _: ?[*]const i64) i32 {
         return -1;
     }
     pub fn q3ld_spec_state(_: *[io.spec_state_w * io.max_spec]i64) i32 {
@@ -61,6 +67,9 @@ pub const q3ld = struct {
     }
     pub fn q3ld_monotonic_ns() i64 {
         return 0;
+    }
+    pub fn q3ld_direct_config(_: i32) c_int {
+        return -1;
     }
     pub fn q3ld_abi() i32 {
         return 0;
