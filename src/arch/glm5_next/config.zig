@@ -19,7 +19,18 @@ pub const Diag = struct {
     }
 };
 
-pub const Error = error{ OutOfMemory, Glm5NextConfigSyntax, Glm5NextConfigField, Glm5NextConfigUnsupported };
+pub const Error = error{ OutOfMemory, Glm5NextConfigSyntax, Glm5NextConfigField, Glm5NextConfigUnsupported, Glm5NextResidentsFormat };
+
+/// The trunk's residents (the pack's top-level `residents_format`, fp8.zig): `bf16` (absent: every trunk projection BF16)
+/// or `fp8_block128` (each trunk projection the pack's `quantization` declares FP8 as e4m3fn codes U8 [out, in] with F32
+/// [out / 64, in / 128] scales; every other one BF16). The same two names say how one projection is stored.
+pub const ResidentsFormat = enum { bf16, fp8_block128 };
+/// One FP8 scale per 64 output rows x 128 input columns (the release-style grid MiMo's fp8res texts read).
+pub const fp8_scale_rows: u32 = 64;
+pub const fp8_scale_cols: u32 = 128;
+
+/// One trunk projection the FP8 route serves: its name after the layer's prefix (without `.weight`) and its [out, in].
+pub const Fp8Site = struct { suffix: []const u8, out: u32, in: u32 };
 
 fn refuse(diag: ?*Diag, err: Error, comptime fmt: []const u8, args: anytype) Error {
     if (diag) |d| d.len = if (std.fmt.bufPrint(&d.buf, "glm5_next config: " ++ fmt, args)) |m| m.len else |_| d.buf.len;
@@ -65,6 +76,12 @@ pub const Config = struct {
     n_eos: u8 = 3,
     /// Bit l set: layer l is a DSA layer (the rest KDA). Flash: 3, 7, ..., 43.
     dsa_mask: u64 = flash_dsa_mask,
+    /// The trunk's residents (`residents_format`).
+    residents_format: ResidentsFormat = .bf16,
+    /// Bit i of layer l: the layer's site i (`fp8Sites` then `fp8MlpSites`) is declared FP8 (only under `fp8_block128`).
+    fp8_mask: [max_layers]u16 = @splat(0),
+    /// The MTP layer declares FP8 projections (the draft lane binds BF16 residents: refused with `mtp_lane`).
+    mtp_fp8: bool = false,
 
     pub const flash_dsa_mask: u64 = blk: {
         var m: u64 = 0;
@@ -100,6 +117,89 @@ pub const Config = struct {
 
     pub fn kdaConvDim(c: *const Config) u32 {
         return 3 * c.kdaDim();
+    }
+
+    /// Layer `l`'s attention projections the FP8 route serves (KDA: q, k, v, o and the gate's and beta's input stages;
+    /// DSA: q_a, q_b, kv_a, o and the indexer's wk, wq_b). KDA's f_b / g_b (K = 128), kv_b (used per head), the indexer's
+    /// weights_proj (32 rows) and pool gate stay BF16.
+    pub fn fp8Sites(c: *const Config, l: u32, out: *[7]Fp8Site) []const Fp8Site {
+        const h = c.hidden_size;
+        if (c.isDsa(l)) {
+            out[0..6].* = .{
+                .{ .suffix = "self_attn.q_a_proj", .out = c.q_lora_rank, .in = h },
+                .{ .suffix = "self_attn.q_b_proj", .out = c.n_heads * c.head_dim, .in = c.q_lora_rank },
+                .{ .suffix = "self_attn.kv_a_proj_with_mqa", .out = c.kv_lora_rank, .in = h },
+                .{ .suffix = "self_attn.o_proj", .out = h, .in = c.n_heads * c.head_dim },
+                .{ .suffix = "self_attn.indexer.wk", .out = c.index_head_dim, .in = h },
+                .{ .suffix = "self_attn.indexer.wq_b", .out = c.index_n_heads * c.index_head_dim, .in = c.q_lora_rank },
+            };
+            return out[0..6];
+        }
+        const dim = c.kdaDim();
+        out.* = .{
+            .{ .suffix = "self_attn.q_proj", .out = dim, .in = h },
+            .{ .suffix = "self_attn.k_proj", .out = dim, .in = h },
+            .{ .suffix = "self_attn.v_proj", .out = dim, .in = h },
+            .{ .suffix = "self_attn.o_proj", .out = h, .in = dim },
+            .{ .suffix = "self_attn.f_a_proj", .out = c.kda_head_dim, .in = h },
+            .{ .suffix = "self_attn.g_a_proj", .out = c.kda_head_dim, .in = h },
+            .{ .suffix = "self_attn.b_proj", .out = c.kda_heads, .in = h },
+        };
+        return out[0..7];
+    }
+
+    /// Layer `l`'s MLP projections the FP8 route serves: the dense MLP's or the shared expert's gate, up and down.
+    pub fn fp8MlpSites(c: *const Config, l: u32) [3]Fp8Site {
+        const h = c.hidden_size;
+        if (c.isMoe(l)) {
+            const si = c.moe_intermediate_size * c.n_shared_experts;
+            return .{
+                .{ .suffix = "mlp.shared_experts.gate_proj", .out = si, .in = h },
+                .{ .suffix = "mlp.shared_experts.up_proj", .out = si, .in = h },
+                .{ .suffix = "mlp.shared_experts.down_proj", .out = h, .in = si },
+            };
+        }
+        return .{
+            .{ .suffix = "mlp.gate_proj", .out = c.intermediate_size, .in = h },
+            .{ .suffix = "mlp.up_proj", .out = c.intermediate_size, .in = h },
+            .{ .suffix = "mlp.down_proj", .out = h, .in = c.intermediate_size },
+        };
+    }
+
+    /// Layer `l`'s site index of `suffix` (its `fp8Sites`, then its `fp8MlpSites`), or null when `suffix` names none of
+    /// the projections the FP8 route can serve.
+    pub fn siteIndex(c: *const Config, l: u32, suffix: []const u8) ?u4 {
+        var buf: [7]Fp8Site = undefined;
+        const attn = c.fp8Sites(l, &buf);
+        for (attn, 0..) |s, i| if (std.mem.eql(u8, s.suffix, suffix)) return @intCast(i);
+        for (c.fp8MlpSites(l), 0..) |s, i| if (std.mem.eql(u8, s.suffix, suffix)) return @intCast(attn.len + i);
+        return null;
+    }
+
+    /// Whether `suffix` names one of layer `l`'s sites the FP8 route can serve.
+    pub fn isFp8Site(c: *const Config, l: u32, suffix: []const u8) bool {
+        return c.siteIndex(l, suffix) != null;
+    }
+
+    /// Whether the pack declares layer `l`'s site `suffix` FP8 (else it is BF16).
+    pub fn siteIsFp8(c: *const Config, l: u32, suffix: []const u8) bool {
+        const i = c.siteIndex(l, suffix) orelse return false;
+        return (c.fp8_mask[l] >> i) & 1 == 1;
+    }
+
+    /// The trunk's sites the FP8 route can serve, over every layer (439 on Flash).
+    pub fn fp8TrunkSites(c: *const Config) u32 {
+        var n: u32 = 0;
+        var buf: [7]Fp8Site = undefined;
+        for (0..c.n_layers) |l| n += @intCast(c.fp8Sites(@intCast(l), &buf).len + 3);
+        return n;
+    }
+
+    /// The trunk projections the pack declares FP8 (0 under `bf16`; the full set 439, the hybrid set 190).
+    pub fn fp8Declared(c: *const Config) u32 {
+        var n: u32 = 0;
+        for (c.fp8_mask[0..c.n_layers]) |m| n += @popCount(m);
+        return n;
     }
 
     /// The bytes one position adds to the DSA caches: each layer's latent and its indexer row (key | gate), BF16.
@@ -214,7 +314,68 @@ pub const Config = struct {
         // The routed experts' activation is installed at that limit (experts.zig `expertActivation`).
         if (c.swiglu_limit != 10.0) return refuse(diag, error.Glm5NextConfigUnsupported, "swiglu_limit {d} (10 served)", .{c.swiglu_limit});
         if (c.n_experts_per_tok != 8) return refuse(diag, error.Glm5NextConfigUnsupported, "num_experts_per_tok {d} (8 served)", .{c.n_experts_per_tok});
+        try c.parseResidents(root.object, diag);
         return c;
+    }
+
+    /// The residents' format and the pack's per-projection declarations (`quantization`, else `quantization_config`),
+    /// once: an FP8 declaration ({"mode": "fp8_e4m3", "bits": 8, "block": [64, 128]}) is accepted only under
+    /// `residents_format: fp8_block128` and only on a trunk site the route serves (`isFp8Site`: its bit in `fp8_mask`) or
+    /// the MTP layer (`mtp_fp8`); every trunk site not declared FP8 stays BF16 (the full set declares all 439, the hybrid
+    /// 190); the format with no FP8 declaration, or anything else, refuses by name (`Glm5NextResidentsFormat`).
+    fn parseResidents(c: *Config, root: std.json.ObjectMap, diag: ?*Diag) Error!void {
+        if (root.get("residents_format")) |v| {
+            if (v != .string) return refuse(diag, error.Glm5NextResidentsFormat, "residents_format is not a string", .{});
+            c.residents_format = std.meta.stringToEnum(ResidentsFormat, v.string) orelse return refuse(diag, error.Glm5NextResidentsFormat, "residents_format {s} (bf16 / fp8_block128 served)", .{v.string});
+        }
+        const q = root.get("quantization") orelse root.get("quantization_config");
+        var declared: u32 = 0;
+        if (q) |qv| if (qv == .object) {
+            var it = qv.object.iterator();
+            while (it.next()) |e| {
+                const v = e.value_ptr.*;
+                const key = e.key_ptr.*;
+                const fp8 = isFp8Decl(v);
+                if (!fp8) {
+                    if (isFp8Mode(v)) return refuse(diag, error.Glm5NextResidentsFormat, "{s}: an FP8 declaration other than {{fp8_e4m3, 8 bits, block [64, 128]}}", .{key});
+                    continue;
+                }
+                if (c.residents_format != .fp8_block128) return refuse(diag, error.Glm5NextResidentsFormat, "{s} is FP8 without residents_format fp8_block128", .{key});
+                const pre = "model.language_model.layers.";
+                const rest = if (std.mem.startsWith(u8, key, pre)) key[pre.len..] else return refuse(diag, error.Glm5NextResidentsFormat, "{s} is FP8, outside the trunk's layers", .{key});
+                const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return refuse(diag, error.Glm5NextResidentsFormat, "{s} is FP8, outside the trunk's layers", .{key});
+                const l = std.fmt.parseInt(u32, rest[0..dot], 10) catch return refuse(diag, error.Glm5NextResidentsFormat, "{s} is FP8, outside the trunk's layers", .{key});
+                if (l == c.n_layers) {
+                    c.mtp_fp8 = true;
+                    continue;
+                }
+                const site = if (l < c.n_layers) c.siteIndex(l, rest[dot + 1 ..]) else null;
+                const i = site orelse return refuse(diag, error.Glm5NextResidentsFormat, "{s} is FP8, not one of the trunk's FP8 projections", .{key});
+                c.fp8_mask[l] |= @as(u16, 1) << i;
+                declared += 1;
+            }
+        };
+        if (c.residents_format == .fp8_block128 and declared == 0)
+            return refuse(diag, error.Glm5NextResidentsFormat, "residents_format fp8_block128 declares none of the trunk's {d} FP8 projections", .{c.fp8TrunkSites()});
+    }
+
+    /// MiMo's FP8 declaration (its `Storage.fromJson` rule): exactly {"mode": "fp8_e4m3", "bits": 8, "block": [64, 128]}.
+    fn isFp8Decl(v: std.json.Value) bool {
+        if (v != .object or v.object.count() != 3) return false;
+        const mode = v.object.get("mode") orelse return false;
+        const bits = v.object.get("bits") orelse return false;
+        const block = v.object.get("block") orelse return false;
+        if (mode != .string or !std.mem.eql(u8, mode.string, "fp8_e4m3") or bits != .integer or bits.integer != 8) return false;
+        if (block != .array or block.array.items.len != 2) return false;
+        const r = block.array.items[0];
+        const col = block.array.items[1];
+        return r == .integer and r.integer == fp8_scale_rows and col == .integer and col.integer == fp8_scale_cols;
+    }
+
+    fn isFp8Mode(v: std.json.Value) bool {
+        if (v != .object) return false;
+        const mode = v.object.get("mode") orelse return false;
+        return mode == .string and std.mem.startsWith(u8, mode.string, "fp8");
     }
 
     fn str(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -281,6 +442,103 @@ test "glm5_next config: the pack's text_config parses to Flash's served form" {
     try testing.expectEqual(@as(u64, 34 * (64 * 128 * 128 * 4 + 3 * 24_576 * 4)), c.kdaStateBytes());
     try testing.expect(c.isEos(154827) and !c.isEos(1));
     try testing.expectEqual(@as(f32, -5.0), c.kda_lower_bound);
+}
+
+test "glm5_next config: residents_format fp8_block128 per the map (the full set 439, the hybrid set 190, the rest BF16); the MTP layer's FP8 noted; anything else refused by name" {
+    const a = testing.allocator;
+    const base = try flashConfigJson(a);
+    defer a.free(base);
+    const c0 = try Config.parse(a, base, null);
+    try testing.expectEqual(ResidentsFormat.bf16, c0.residents_format);
+    try testing.expectEqual(@as(u32, 238 + 44 + 22 + 126 + 9), c0.fp8TrunkSites());
+    // The pack's declaration: every trunk site FP8, the BF16-kept projections false, the MTP layer's FP8 (the prepared
+    // variant's), the experts' nvfp4.
+    var q: std.ArrayList(u8) = .empty;
+    defer q.deinit(a);
+    const fp8_decl = "{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[64,128]}";
+    try q.appendSlice(a, "\"quantization\":{\"group_size\":16,\"bits\":4,\"mode\":\"nvfp4\",\"lm_head\":false");
+    for (0..45) |l| {
+        var buf: [7]Fp8Site = undefined;
+        for (c0.fp8Sites(@intCast(l), &buf)) |st| try q.print(a, ",\"model.language_model.layers.{d}.{s}\":{s}", .{ l, st.suffix, fp8_decl });
+        for (c0.fp8MlpSites(@intCast(l))) |st| try q.print(a, ",\"model.language_model.layers.{d}.{s}\":{s}", .{ l, st.suffix, fp8_decl });
+        try q.print(a, ",\"model.language_model.layers.{d}.hc_attn_fn\":false", .{l});
+        if (l >= 3) try q.print(a, ",\"model.language_model.layers.{d}.mlp.switch_mlp.gate_proj\":{{\"group_size\":16,\"bits\":4,\"mode\":\"nvfp4\"}}", .{l});
+    }
+    try q.print(a, ",\"model.language_model.layers.45.self_attn.q_a_proj\":{s}}}", .{fp8_decl});
+    const with = struct {
+        fn f(al: std.mem.Allocator, b: []const u8, extra: []const u8) ![]u8 {
+            return std.fmt.allocPrint(al, "{{{s},{s}", .{ extra, b[1..] });
+        }
+    }.f;
+    {
+        const flag = try std.fmt.allocPrint(a, "\"residents_format\":\"fp8_block128\",{s}", .{q.items});
+        defer a.free(flag);
+        const text = try with(a, base, flag);
+        defer a.free(text);
+        var diag: Diag = .{};
+        const c = Config.parse(a, text, &diag) catch |e| {
+            std.debug.print("refused: {s}\n", .{diag.message()});
+            return e;
+        };
+        try testing.expectEqual(ResidentsFormat.fp8_block128, c.residents_format);
+        try testing.expect(c.mtp_fp8);
+        try testing.expectEqual(@as(u32, 439), c.fp8Declared());
+        try testing.expect(c.isFp8Site(4, "self_attn.q_proj") and c.isFp8Site(3, "self_attn.indexer.wq_b") and !c.isFp8Site(4, "self_attn.f_b_proj"));
+        try testing.expect(c.isFp8Site(0, "mlp.gate_proj") and !c.isFp8Site(3, "mlp.gate_proj") and c.isFp8Site(3, "mlp.shared_experts.down_proj"));
+        try testing.expect(c.siteIsFp8(4, "self_attn.q_proj") and c.siteIsFp8(3, "self_attn.indexer.wq_b") and !c.siteIsFp8(4, "self_attn.f_b_proj"));
+    }
+    {
+        // The pack lane's hybrid set (`--groups dsa,indexer_wk,shared,dense`: the projections GLM's own weights hold on an
+        // FP8 grid): the KDA layers' sites and the indexer's wq_b declared false, so BF16.
+        var hybrid: std.ArrayList(u8) = .empty;
+        defer hybrid.deinit(a);
+        try hybrid.appendSlice(a, "\"residents_format\":\"fp8_block128\",\"quantization\":{\"lm_head\":false");
+        for (0..45) |l| {
+            var buf: [7]Fp8Site = undefined;
+            const kda_layer = !c0.isDsa(@intCast(l));
+            for (c0.fp8Sites(@intCast(l), &buf)) |st| {
+                const fp8 = !kda_layer and !std.mem.eql(u8, st.suffix, "self_attn.indexer.wq_b");
+                try hybrid.print(a, ",\"model.language_model.layers.{d}.{s}\":{s}", .{ l, st.suffix, if (fp8) fp8_decl else "false" });
+            }
+            for (c0.fp8MlpSites(@intCast(l))) |st| try hybrid.print(a, ",\"model.language_model.layers.{d}.{s}\":{s}", .{ l, st.suffix, fp8_decl });
+        }
+        try hybrid.appendSlice(a, "}");
+        const text = try with(a, base, hybrid.items);
+        defer a.free(text);
+        var diag: Diag = .{};
+        const c = Config.parse(a, text, &diag) catch |e| {
+            std.debug.print("refused: {s}\n", .{diag.message()});
+            return e;
+        };
+        try testing.expectEqual(@as(u32, 11 * 4 + 11 + 42 * 3 + 3 * 3), c.fp8Declared());
+        try testing.expect(!c.mtp_fp8);
+        try testing.expect(!c.siteIsFp8(4, "self_attn.q_proj") and c.siteIsFp8(3, "self_attn.o_proj") and c.siteIsFp8(3, "self_attn.indexer.wk") and !c.siteIsFp8(3, "self_attn.indexer.wq_b"));
+        try testing.expect(c.siteIsFp8(0, "mlp.down_proj") and c.siteIsFp8(4, "mlp.shared_experts.up_proj"));
+    }
+    const Case = struct { extra: []const u8, why: []const u8 };
+    const no_flag = try std.fmt.allocPrint(a, "{s}", .{q.items});
+    defer a.free(no_flag);
+    const head_fp8 = try std.mem.replaceOwned(u8, a, q.items, "\"lm_head\":false", "\"lm_head\":{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[64,128]}");
+    defer a.free(head_fp8);
+    const off_site = try std.fmt.allocPrint(a, "\"residents_format\":\"fp8_block128\",{s}", .{head_fp8});
+    defer a.free(off_site);
+    for ([_]Case{
+        .{ .extra = no_flag, .why = "without residents_format fp8_block128" },
+        .{ .extra = "\"residents_format\":\"fp8_block128\",\"quantization\":{\"lm_head\":false}", .why = "declares none of the trunk's 439" },
+        .{ .extra = "\"residents_format\":\"fp8_block128\",\"quantization\":{\"model.language_model.layers.4.self_attn.f_b_proj\":{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[64,128]}}", .why = "f_b_proj is FP8, not one of the trunk's FP8 projections" },
+        .{ .extra = off_site, .why = "lm_head is FP8, outside the trunk's layers" },
+        .{ .extra = "\"residents_format\":\"fp8\"", .why = "residents_format fp8 (bf16 / fp8_block128 served)" },
+        .{ .extra = "\"residents_format\":\"fp8_block128\",\"quantization\":{\"lm_head\":{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[128,128]}}", .why = "an FP8 declaration other than" },
+    }) |cs| {
+        const text = try with(a, base, cs.extra);
+        defer a.free(text);
+        var diag: Diag = .{};
+        if (Config.parse(a, text, &diag)) |_| return error.TestUnexpectedResult else |e| try testing.expectEqual(error.Glm5NextResidentsFormat, e);
+        testing.expect(std.mem.indexOf(u8, diag.message(), cs.why) != null) catch |e| {
+            std.debug.print("want \"{s}\" in \"{s}\"\n", .{ cs.why, diag.message() });
+            return e;
+        };
+    }
 }
 
 test "glm5_next config: what leaves the served form is refused by name" {

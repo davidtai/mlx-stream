@@ -117,6 +117,8 @@ pub const Config = struct {
         if (c.malformed.mtp_lane) return error.Glm5NextMtpLaneSetting;
         if (c.malformed.dump_dir) return error.Glm5NextLogitsDumpDir;
         if (c.malformed.decode_moe) return error.Glm5NextDecodeMoeSetting;
+        // The draft lane binds the MTP layer's residents BF16 (its spec); a pack declaring them FP8 cannot serve the lane.
+        if (c.mtp_lane and c.model.mtp_fp8) return error.Glm5NextMtpResidentsFp8;
         if (c.kv_quant_bits) |b| if (b != 0 and b != 16) return error.Glm5NextKvQuantUnsupported;
         if (c.expert_rows) |d| if (d > c.model.n_routed_experts) return error.Glm5NextExpertRows;
         if (c.expert_prefill_rows) |p| if (p > c.model.n_routed_experts) return error.Glm5NextExpertRows;
@@ -166,6 +168,14 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try (try parseSettings("{\"decode_moe\":\"stock\"}")).validate();
     try testing.expectError(error.Glm5NextDecodeMoeSetting, (try parseSettings("{\"decode_moe\":\"k1\"}")).validate());
     try testing.expectError(error.Glm5NextDecodeMoeSetting, (try parseSettings("{\"decode_moe\":1}")).validate());
+    // An FP8-declared MTP layer (config.zig `mtp_fp8`) refuses the lane by name; the serial control loads.
+    {
+        var fp8_mtp = try parseSettings("{\"mtp_lane\":true}");
+        fp8_mtp.model.mtp_fp8 = true;
+        try testing.expectError(error.Glm5NextMtpResidentsFp8, fp8_mtp.validate());
+        fp8_mtp.mtp_lane = false;
+        try fp8_mtp.validate();
+    }
     // The host's facts: its rows win; its context is the reserve.
     const facts: sdk.LoadFacts = .{ .memory_baseline_bytes = 10, .expert_rows = 90, .effective_context = 32_768, .wired_margin_bytes = 2 << 30 };
     const built = pinned.withFacts(&facts);

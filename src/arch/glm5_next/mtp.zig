@@ -400,16 +400,16 @@ pub const Head = struct {
         head.post_norm = try lg.get("post_attention_layernorm.weight", &.{h});
         head.head_norm = try lg.get("shared_head.norm.weight", &.{h});
         head.attn = .{
-            .q_a = try lg.get("self_attn.q_a_proj.weight", &.{ ql, h }),
+            .q_a = .{ .bf16 = try lg.get("self_attn.q_a_proj.weight", &.{ ql, h }) },
             .q_a_norm = try lg.get("self_attn.q_a_layernorm.weight", &.{ql}),
-            .q_b = try lg.get("self_attn.q_b_proj.weight", &.{ heads * hd, ql }),
-            .kv_a = try lg.get("self_attn.kv_a_proj_with_mqa.weight", &.{ r, h }),
+            .q_b = .{ .bf16 = try lg.get("self_attn.q_b_proj.weight", &.{ heads * hd, ql }) },
+            .kv_a = .{ .bf16 = try lg.get("self_attn.kv_a_proj_with_mqa.weight", &.{ r, h }) },
             .kv_a_norm = try lg.get("self_attn.kv_a_layernorm.weight", &.{r}),
             .wk = try head.own(a, try graph.view(s, kv_b, &.{ heads, 2 * hd, r }, 0, hd)),
             .wv = try head.own(a, try graph.view(s, kv_b, &.{ heads, 2 * hd, r }, hd, 2 * hd)),
-            .o = try lg.get("self_attn.o_proj.weight", &.{ h, heads * hd }),
-            .idx_wq_b = try lg.get("self_attn.indexer.wq_b.weight", &.{ ih * ihd, ql }),
-            .idx_wk = try lg.get("self_attn.indexer.wk.weight", &.{ ihd, h }),
+            .o = .{ .bf16 = try lg.get("self_attn.o_proj.weight", &.{ h, heads * hd }) },
+            .idx_wq_b = .{ .bf16 = try lg.get("self_attn.indexer.wq_b.weight", &.{ ih * ihd, ql }) },
+            .idx_wk = .{ .bf16 = try lg.get("self_attn.indexer.wk.weight", &.{ ihd, h }) },
             .idx_k_norm_w = try lg.get("self_attn.indexer.k_norm.weight", &.{ihd}),
             .idx_k_norm_b = try lg.get("self_attn.indexer.k_norm.bias", &.{ihd}),
             .idx_wproj = try lg.get("self_attn.indexer.weights_proj.weight", &.{ ih, h }),
@@ -421,10 +421,12 @@ pub const Head = struct {
             .bias = try lg.get("mlp.gate.e_score_correction_bias", &.{e}),
         };
         if (mlx.mlx_array_dtype(head.router.bias) != .float32) return refuse(diag, error.Glm5NextMtpResidentDtype, "mlp.gate.e_score_correction_bias is not F32", .{});
+        // The MTP layer's residents are BF16 (the draft lane's spec; settings refuses an FP8-declared MTP layer with the
+        // lane on), whatever the trunk's residents format.
         head.shared = .{
-            .gate = try lg.get("mlp.shared_experts.gate_proj.weight", &.{ si, h }),
-            .up = try lg.get("mlp.shared_experts.up_proj.weight", &.{ si, h }),
-            .down = try lg.get("mlp.shared_experts.down_proj.weight", &.{ h, si }),
+            .gate = .{ .bf16 = try lg.get("mlp.shared_experts.gate_proj.weight", &.{ si, h }) },
+            .up = .{ .bf16 = try lg.get("mlp.shared_experts.up_proj.weight", &.{ si, h }) },
+            .down = .{ .bf16 = try lg.get("mlp.shared_experts.down_proj.weight", &.{ h, si }) },
         };
         return head;
     }
