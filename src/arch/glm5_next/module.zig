@@ -317,7 +317,10 @@ pub const Module = struct {
         defer self.g.release(hidden);
         // `stepWith` refused a step past the billed positions (the history's bound less the verify's rows).
         @memcpy(self.history[at..][0..ids.len], ids);
+        // The pend's wall is the step's (the request's decode line).
+        const t0 = self.nowNs();
         try lane.pend(&self.g, self.cache.len, hidden, @intCast(ids.len), true);
+        self.decode.wall_ns += self.nowNs() - t0;
         return logits;
     }
 
@@ -364,13 +367,14 @@ pub const Module = struct {
         const len = self.cache.len;
         if (len + 1 > self.cache.cap) return error.ContextOverBill;
         try self.checkTokens(&.{t1});
+        // The round's wall, its drafts included (the request's decode line rates the rounds as a serial step's tokens).
+        const t0 = self.nowNs();
         const k = mtp.draftsAt(lane.tracked(), lane.n_pending, len, accepted_cap, self.reserve);
         var ids: [mtp.verify_rows]u32 = undefined;
         ids[0] = t1;
         if (k > 0) try lane.draft(g, &self.w, self.history[lane.pairs() + 1 .. len], t1, k, ids[1 .. k + 1]);
         const rows: u32 = k + 1;
         const drafts = ids[1..rows];
-        const t0 = self.nowNs();
         const tp = gprof.stepBegin(t1);
         var taps: graph.Taps = .{};
         // A round without drafts is a serial step's forward (no capture: nothing to roll back).
