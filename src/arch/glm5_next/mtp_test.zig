@@ -12,6 +12,7 @@ const glm = @import("config.zig");
 const bank = @import("bank.zig");
 const graph = @import("graph.zig");
 const mtp = @import("mtp.zig");
+const settings = @import("settings.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const testing = std.testing;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -764,14 +765,18 @@ test "glm5_next mtp coupled drafts: a sampled draft drawn from the head's q at t
 }
 
 test "glm5_next mtp acceptance setting: exact is today's rule; typical (delta 0.5) keeps more of a noisy head's drafts than exact on a synthetic (p, q) pair, its emitted tokens still drawn from the target" {
-    try testing.expectEqual(acc.Rule.exact, mtp.ruleOf(.exact));
-    try testing.expectEqual(@as(f32, 0.5), mtp.ruleOf(.typical).typical.delta);
-    try testing.expectEqualStrings("glm5_next-mtp exact", mtp.nameOf(mtp.ruleOf(.exact)));
-    try testing.expectEqualStrings("glm5_next-mtp typical 0.5", mtp.nameOf(mtp.ruleOf(.typical)));
+    try testing.expectEqual(acc.Rule.exact, mtp.ruleOf(.exact, 0.3));
+    try testing.expectEqual(@as(f32, 0.5), mtp.ruleOf(.typical, settings.typical_delta).typical.delta);
+    var nb: [mtp.name_cap]u8 = undefined;
+    try testing.expectEqualStrings("glm5_next-mtp exact", mtp.nameOf(&nb, mtp.ruleOf(.exact, 0.7)));
+    for ([_]f32{ 0.3, 0.5, 0.7 }, [_][]const u8{ "glm5_next-mtp typical 0.3", "glm5_next-mtp typical 0.5", "glm5_next-mtp typical 0.7" }) |d, want| {
+        try testing.expectEqual(d, mtp.ruleOf(.typical, d).typical.delta);
+        try testing.expectEqualStrings(want, mtp.nameOf(&nb, mtp.ruleOf(.typical, d)));
+    }
     const V = 64;
     var row: [V]f32 = undefined;
     var kept: [2]u64 = @splat(0);
-    for ([_]acc.Rule{ mtp.ruleOf(.exact), mtp.ruleOf(.typical) }, 0..) |rule, ri| for (0..16) |seed| {
+    for ([_]acc.Rule{ mtp.ruleOf(.exact, settings.typical_delta), mtp.ruleOf(.typical, settings.typical_delta) }, 0..) |rule, ri| for (0..16) |seed| {
         const s: acc.Params = .{ .temperature = 1.0, .top_p = 0.95, .seed = 11 + seed };
         var len: u64 = 1;
         var t1: u32 = @intCast(seed % V);

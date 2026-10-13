@@ -84,7 +84,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "mtp_acceptance", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "logits_dump_dir" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -103,7 +103,8 @@ pub const default_draft_depth: u32 = 1;
 /// routes and builds only the miss parts, whose rows replace their pairs in the join): exact against `fused`.
 /// The MTP lane's acceptance rule (`mtp_acceptance`), installed at construction.
 pub const MtpAcceptance = enum { exact, typical };
-/// Typical acceptance's delta (DSV4.1's served delta for the lane's rule; MiMo's default is 0.3).
+/// Typical acceptance's default delta (DSV4.1's served delta for the lane's rule; MiMo's default is 0.3); a load sets
+/// its own with `mtp_typical_delta`, in (0, 1].
 pub const typical_delta: f32 = 0.5;
 
 pub const DecodeMoe = enum { stock, fused, hitpass };
@@ -159,6 +160,10 @@ pub const Config = struct {
     /// exp(-H(p))); the token at a rejection stays the target's own draw at that position). Lossy by design: ids diverge
     /// from serial. `tokenv3` is refused by name (not ported: no source in mlx-stream). Construction-time.
     mtp_acceptance: MtpAcceptance = .exact,
+    /// Typical acceptance's delta (`"mtp_typical_delta"`: a number in (0, 1], default `typical_delta`). Construction-time,
+    /// with `"mtp_acceptance":"typical"` only (named with the exact rule it is refused: an inert lossy knob is a lie).
+    mtp_typical_delta: f32 = typical_delta,
+    mtp_typical_delta_set: bool = false,
     decode_moe: DecodeMoe = .hitpass,
     /// The decode lane's glue (glue.zig `Route`): `fused` (the default) or `ops` (the stock op chains, the control).
     decode_glue: DecodeGlue = .fused,
@@ -191,7 +196,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -206,6 +211,17 @@ pub const Config = struct {
             if (m) |x| c.mtp_acceptance = x else if (v == .string and std.mem.eql(u8, v.string, "tokenv3")) {
                 c.malformed.tokenv3 = true;
             } else c.malformed.mtp_acceptance = true;
+        }
+        if (raw.object.get("mtp_typical_delta")) |v| {
+            const f: ?f64 = switch (v) {
+                .float => v.float,
+                .integer => @floatFromInt(v.integer),
+                else => null,
+            };
+            c.mtp_typical_delta_set = true;
+            if (f) |x| {
+                if (std.math.isFinite(x) and x > 0 and x <= 1) c.mtp_typical_delta = @floatCast(x) else c.malformed.mtp_typical_delta = true;
+            } else c.malformed.mtp_typical_delta = true;
         }
         if (raw.object.get("draft_depth")) |v| c.draft_depth = if (v == .integer and v.integer >= 1 and v.integer <= trained_draft_depth) @intCast(v.integer) else 0;
         if (raw.object.get("decode_moe")) |v| {
@@ -289,6 +305,8 @@ pub const Config = struct {
         if (c.malformed.mtp_lane) return error.Glm5NextMtpLaneSetting;
         if (c.malformed.tokenv3) return error.Glm5NextMtpAcceptanceNotPorted;
         if (c.malformed.mtp_acceptance) return error.Glm5NextMtpAcceptanceSetting;
+        if (c.malformed.mtp_typical_delta) return error.Glm5NextMtpTypicalDeltaSetting;
+        if (c.mtp_typical_delta_set and c.mtp_acceptance != .typical) return error.Glm5NextMtpTypicalDeltaWithoutTypical;
         if (c.draft_depth == 0 or c.draft_depth > trained_draft_depth) return error.Glm5NextDraftDepthRange;
         if (c.malformed.dump_dir) return error.Glm5NextLogitsDumpDir;
         if (c.malformed.decode_moe) return error.Glm5NextDecodeMoeSetting;
@@ -362,6 +380,18 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectError(error.Glm5NextMtpAcceptanceNotPorted, (try parseSettings("{\"mtp_acceptance\":\"tokenv3\"}")).validate());
     for ([_][]const u8{ "{\"mtp_acceptance\":\"greedy\"}", "{\"mtp_acceptance\":1}", "{\"mtp_acceptance\":null}" }) |text|
         try testing.expectError(error.Glm5NextMtpAcceptanceSetting, (try parseSettings(text)).validate());
+    try testing.expectEqual(typical_delta, typ.mtp_typical_delta);
+    for ([_]f32{ 0.3, 0.5, 0.7 }, [_][]const u8{ "0.3", "0.5", "0.7" }) |want, txt| {
+        var b: [128]u8 = undefined;
+        const d = try parseSettings(try std.fmt.bufPrint(&b, "{{\"mtp_lane\":true,\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":{s}}}", .{txt}));
+        try d.validate();
+        try testing.expectEqual(want, d.mtp_typical_delta);
+    }
+    try (try parseSettings("{\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":1}")).validate();
+    for ([_][]const u8{ "{\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":0}", "{\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":1.5}", "{\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":-0.3}", "{\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":\"0.3\"}" }) |text|
+        try testing.expectError(error.Glm5NextMtpTypicalDeltaSetting, (try parseSettings(text)).validate());
+    try testing.expectError(error.Glm5NextMtpTypicalDeltaWithoutTypical, (try parseSettings("{\"mtp_typical_delta\":0.3}")).validate());
+    try testing.expectError(error.Glm5NextMtpTypicalDeltaWithoutTypical, (try parseSettings("{\"mtp_acceptance\":\"exact\",\"mtp_typical_delta\":0.3}")).validate());
     // The dump route: an absolute directory, else refused by name; absent, none.
     const dumped = try parseSettings("{\"logits_dump_dir\":\"/tmp/kl/incoming\"}");
     try dumped.validate();

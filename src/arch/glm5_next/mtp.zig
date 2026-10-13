@@ -66,22 +66,20 @@ pub const verify_rows: u32 = max_depth + 1;
 pub const rule: acc.Rule = .exact;
 
 /// The lane's rule for `settings.mtp_acceptance` (construction).
-pub fn ruleOf(m: settings.MtpAcceptance) acc.Rule {
+pub fn ruleOf(m: settings.MtpAcceptance, delta: f32) acc.Rule {
     return switch (m) {
         .exact => .exact,
-        .typical => .{ .typical = .{ .delta = settings.typical_delta } },
+        .typical => .{ .typical = .{ .delta = delta } },
     };
 }
 pub const lane_name = "glm5_next-mtp exact";
-/// The typical rule's lane name (MiMo's form, "mtp typical <delta>"): the receipt and the install line name the rule in play.
-pub const lane_name_typical = "glm5_next-mtp typical 0.5";
-comptime {
-    if (settings.typical_delta != 0.5) @compileError("lane_name_typical names delta 0.5");
-}
-pub fn nameOf(r: acc.Rule) []const u8 {
+/// The lane's name for its rule (MiMo's form, "mtp typical <delta>"): the receipt and the install line name the rule in
+/// play, the typical rule with its delta ("glm5_next-mtp typical 0.3"). Written once at construction (`Lane.name`).
+pub const name_cap = 48;
+pub fn nameOf(buf: *[name_cap]u8, r: acc.Rule) []const u8 {
     return switch (r) {
         .exact => lane_name,
-        .typical => lane_name_typical,
+        .typical => |t| std.fmt.bufPrint(buf, "glm5_next-mtp typical {d}", .{t.delta}) catch unreachable,
     };
 }
 /// Pairs one catch-up call appends (the prompt's, in chunks): the trunk's attention span (its DSA call shapes).
@@ -536,6 +534,9 @@ pub const Lane = struct {
     depth: u32 = max_depth,
     /// The acceptance rule (`settings.mtp_acceptance`, `ruleOf`; construction).
     rule: acc.Rule = .exact,
+    /// The lane's name for `rule` (`nameOf`, construction).
+    name_buf: [name_cap]u8 = undefined,
+    name_len: usize = 0,
     /// The request's counters (MiMo's: rounds, drafted, accepted, generated, corrected; the stream's at the decode start).
     stats: mimo_draft.Stats = .{},
     /// The request's acceptance by draft position (the receipt's tail).
@@ -563,6 +564,11 @@ pub const Lane = struct {
         errdefer gpa.destroy(self);
         const lanes_cap = cap + max_depth;
         self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth, .rule = accept };
+        {
+            const nm = nameOf(&self.name_buf, accept);
+            if (@intFromPtr(nm.ptr) != @intFromPtr(&self.name_buf)) @memcpy(self.name_buf[0..nm.len], nm);
+            self.name_len = nm.len;
+        }
         self.head = try Head.bind(gpa, g.s, map, c, diag);
         errdefer self.head.deinit(gpa);
         const n: u32 = c.n_routed_experts;
@@ -593,7 +599,7 @@ pub const Lane = struct {
         for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         self.held_bytes = heldOf(&held, std.heap.pageSize());
-        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=coupled_sample bank={s} experts={d} lanes={d} positions measured_bytes={d} acceptance={s}\n", .{ nameOf(accept), depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, @tagName(accept) });
+        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=coupled_sample bank={s} experts={d} lanes={d} positions measured_bytes={d} acceptance={s}\n", .{ self.name(), depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, @tagName(accept) });
         return self;
     }
 
@@ -781,8 +787,13 @@ pub const Lane = struct {
 
     /// The request's line at its end (MiMo's receipt form; the expert stream's counters at the decode start and now),
     /// then the lane's depth and its acceptance by draft position (`Positions.write`).
+    /// The lane's name (`nameOf` its rule, written at construction).
+    pub fn name(self: *const Lane) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
     pub fn line(self: *const Lane, buf: []u8, now: sdk_ext.expert.Stats) []const u8 {
-        const head = self.stats.line(buf, nameOf(self.rule), now);
+        const head = self.stats.line(buf, self.name(), now);
         return buf[0 .. head.len + self.pos.write(buf[head.len..], self.depth).len];
     }
 };
