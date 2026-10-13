@@ -842,6 +842,59 @@ test "glm5_next bill: forced rows load as named with the overage reported; at or
     try testing.expectError(error.Glm5NextPhaseRows, choose(b, &cfg, box_ceiling, box_stop));
 }
 
+test "glm5_next bill: a per-layer rows split (expert_rows_by_layer) bills exactly as the uniform rows it redistributes" {
+    // MiMo's test (mimo_v2/bill.zig): the split moves decode rows between routed layers at the plan's total (offsets
+    // summing to 0; prompt rows min(plan's, the layer's decode)). The plan (fill, admission, process bound) never sees the
+    // split, and the one row term is linear in the rows (`per_row` = one record on each routed layer), so the split's
+    // decode slots are the uniform rows' bytes exactly and its prompt slots never more.
+    const a = testing.allocator;
+    const in = try fixtureInputs(32_768);
+    const b = try billOf(a, &in);
+    defer b.free(a);
+    const record = in.geometry.record_bytes;
+    var offsets: settings.LayerRows.Offsets = .{ .len = 42 };
+    for (offsets.d[0..42], 0..) |*o, l| o.* = if (l < 10) 40 else if (l == 15) -49 else if (l < 22) -13 else -11; // 400 - 49 - 6*13 - 20*11 = 53 ...
+    var sum: i32 = 0;
+    for (offsets.slice()) |o| sum += o;
+    offsets.d[41] -= @intCast(sum); // ... the last layer takes the remainder: the offsets sum to 0
+    for ([_]?sdk.Rows{ .{ .prompt = 115, .decode = 131 }, .{ .prompt = 126, .decode = 143 }, null }) |forced| {
+        var uniform: settings.Config = .{ .memory_baseline_bytes = 12_600_000_000 };
+        if (forced) |f| {
+            uniform.expert_rows = f.decode;
+            uniform.expert_prefill_rows = f.prompt;
+        }
+        var split = uniform;
+        split.expert_rows_by_layer = .{ .offsets = offsets };
+        try split.validate();
+        const pu = try choose(b, &uniform, box_ceiling, box_stop);
+        const ps = try choose(b, &split, box_ceiling, box_stop);
+        try testing.expectEqual(pu.rows, ps.rows);
+        try testing.expectEqual(pu.over_fill, ps.over_fill);
+        try testing.expectEqual(b.processBound(pu.rows), b.processBound(ps.rows));
+        var up: [42]u32 = undefined;
+        var ud: [42]u32 = undefined;
+        var sp: [42]u32 = undefined;
+        var sd: [42]u32 = undefined;
+        try settings.layerRows(.uniform, pu.rows, 288, &up, &ud);
+        try settings.layerRows(split.expert_rows_by_layer, ps.rows, 288, &sp, &sd);
+        var bytes: [4]u64 = @splat(0);
+        for (up, ud, sp, sd) |a0, a1, a2, a3| {
+            bytes[0] += a0 * record;
+            bytes[1] += a1 * record;
+            bytes[2] += a2 * record;
+            bytes[3] += a3 * record;
+        }
+        try testing.expectEqual(@as(u64, ps.rows.decode) * b.per_row, bytes[3]);
+        try testing.expectEqual(bytes[1], bytes[3]);
+        try testing.expectEqual(@as(u64, ps.rows.prompt) * b.per_row, bytes[0]);
+        try testing.expect(bytes[2] <= bytes[0]);
+        // Not uniform: the split really moves rows (routed layer 0 +40; routed layer 15, model layer 18, -49).
+        try testing.expectEqual(ps.rows.decode + 40, sd[0]);
+        try testing.expectEqual(ps.rows.decode - 49, sd[15]);
+        try testing.expectEqual(@min(ps.rows.prompt, sd[15]), sp[15]);
+    }
+}
+
 // GLM5_BANK=<pack> (headers only, no payload): the bill tool. Every term in bytes and the filled rows at the served
 // contexts (`tool_contexts`), at GLM5_BILL_BASELINES_GB (comma list; default 10.6,12.0,12.6,13.0) and GLM5_BILL_CEILING
 // (bytes; default 120,259,084,288) less the pinned 2 GiB margin, in MiMo's table form (bill_rows.py reads it).

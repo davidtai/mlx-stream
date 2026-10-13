@@ -15,7 +15,8 @@
 //! for their bytes, mimo_v2/gpu_warm.zig; `off`, the control); `logits_dump_dir` (an absolute directory) installs the
 //! logits dump route for the KL gate (dump.zig): absent, nothing of it is built. `expert_resident_ratio`,
 //! `expert_tally_window` and `expert_tally_file` set the expert stream's rate tally (sdk_ext/expert/tally.zig, every
-//! streamed arch's keys; glm5_next's default ratio `default_tally_ratio`).
+//! streamed arch's keys; glm5_next's default ratio `default_tally_ratio`). `expert_rows_by_layer` splits the decode rows
+//! between the routed layers (`LayerRows`; `uniform`, the default, is every layer at the plan's rows).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -84,7 +85,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -126,6 +127,59 @@ pub const DecodePredict = enum { f32, bf16 };
 /// construction (swiglu.zig): `fused` one text between the gate / up GEMVs and the down GEMV; `ops` the op chain (the
 /// control). Rounding-class against `ops`.
 pub const DecodeSwiglu = enum { ops, fused };
+/// `expert_rows_by_layer` (MiMo's mimo/layer-rows, mimo_v2/settings.zig `LayerRows`): the plan's decode rows split
+/// between the routed layers at the SAME total, once at construction. `uniform` (the default) is every layer at the plan's
+/// rows, today's construction exactly. `offsets` is one integer per routed layer (routed layer 0 first, model layer
+/// `first_k_dense`), summing to 0, added to the plan's DECODE rows; each layer's prompt rows are min(the plan's prompt rows,
+/// its decode rows), so prompt <= decode on every layer (the stream's grow adds rows, never moves them). The bill is
+/// unchanged: its one row term is linear in the rows (bill.zig `slotWiring`), the decode total is the plan's, and the
+/// prompt total can only fall. No table ships: a table comes from a calibration trace (the per-layer miss rates of
+/// non-benchmark prompts at uniform rows; the replay in reports/.../mimo/glm5next-per-layer-rows-20261012.md weights
+/// rows by sqrt(miss rate)), never from the benchmark prompt's own trace. Setting: `"uniform"` or an array of integers
+/// (each within i16) summing to 0, of length the model's routed layers; anything else refuses by name in `validate`;
+/// a split that puts a layer under one decode row or over its experts refuses at construction (`layerRows`).
+pub const LayerRows = union(enum) {
+    uniform,
+    offsets: Offsets,
+    /// Not `"uniform"` nor an array of integers within i16 (`Glm5NextExpertRowsByLayer`), an array longer than
+    /// `glm.max_layers` or of another length than the model's routed layers (`Glm5NextExpertRowsByLayerLength`), or one
+    /// whose entries do not sum to 0 (`Glm5NextExpertRowsByLayerSum`).
+    invalid: enum { setting, length, sum },
+
+    pub const Offsets = struct {
+        len: u8,
+        d: [glm.max_layers]i16 = @splat(0),
+
+        pub fn slice(o: *const Offsets) []const i16 {
+            return o.d[0..o.len];
+        }
+    };
+};
+
+/// The per-layer rows of both phases (routed-layer order) into `prompt` / `decode` (each of the model's routed layers'
+/// length), from the plan's uniform `rows`, once at construction. `uniform`: every layer at `rows` (today's construction).
+/// `offsets`: decode = rows.decode + offset, prompt = min(rows.prompt, decode); refused by name when a layer would hold
+/// fewer than one decode row or more than its `n_experts` experts.
+pub fn layerRows(split: LayerRows, rows: sdk.Rows, n_experts: u32, prompt: []u32, decode: []u32) !void {
+    if (prompt.len != decode.len) return error.Glm5NextExpertRowsByLayerLength;
+    switch (split) {
+        .uniform => {
+            @memset(prompt, rows.prompt);
+            @memset(decode, rows.decode);
+        },
+        .offsets => |*o| {
+            if (o.len != decode.len) return error.Glm5NextExpertRowsByLayerLength;
+            for (prompt, decode, o.slice()) |*p, *q, off| {
+                const dd = @as(i64, rows.decode) + off;
+                if (dd < 1 or dd > n_experts) return error.Glm5NextExpertRowsByLayerRange;
+                q.* = @intCast(dd);
+                p.* = @min(rows.prompt, q.*);
+            }
+        },
+        .invalid => return error.Glm5NextExpertRowsByLayer,
+    }
+}
+
 /// The longest dump directory a setting may name.
 pub const max_dump_dir: usize = 480;
 
@@ -176,6 +230,8 @@ pub const Config = struct {
     /// The expert stream's rate tally (`expert_resident_ratio`, `expert_tally_window`, `expert_tally_file`): every
     /// streamed arch's keys (`expert_tally.Settings`), glm5_next's default ratio.
     tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
+    /// The decode rows' split between the routed layers (`LayerRows`): `uniform` (the default) or `offsets`.
+    expert_rows_by_layer: LayerRows = .uniform,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -233,6 +289,7 @@ pub const Config = struct {
             c.gpu_keep_warm_requested = true;
         }
         _ = c.tally.apply(raw.object);
+        if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
         if (raw.object.get("logits_dump_dir")) |v| {
             const ok = v == .string and v.string.len > 1 and v.string.len <= max_dump_dir and v.string[0] == '/' and std.mem.indexOfScalar(u8, v.string, 0) == null;
             if (ok) {
@@ -253,6 +310,25 @@ pub const Config = struct {
     /// The logits dump route's directory (`logits_dump_dir`), null when the setting is absent.
     pub fn dumpDir(c: *const Config) ?[]const u8 {
         return if (c.dump_dir_len == 0) null else c.dump_dir_buf[0..c.dump_dir_len];
+    }
+
+    /// `"expert_rows_by_layer"`: "uniform", or integers (each within i16, at most `glm.max_layers`) summing to 0.
+    fn layerRowsSetting(v: std.json.Value) LayerRows {
+        switch (v) {
+            .string => |s| return if (std.mem.eql(u8, s, "uniform")) .uniform else .{ .invalid = .setting },
+            .array => |arr| {
+                for (arr.items) |item| if (item != .integer or item.integer < std.math.minInt(i16) or item.integer > std.math.maxInt(i16)) return .{ .invalid = .setting };
+                if (arr.items.len == 0 or arr.items.len > glm.max_layers) return .{ .invalid = .length };
+                var out: LayerRows.Offsets = .{ .len = @intCast(arr.items.len) };
+                var sum: i64 = 0;
+                for (arr.items, out.d[0..arr.items.len]) |item, *o| {
+                    o.* = @intCast(item.integer);
+                    sum += item.integer;
+                }
+                return if (sum == 0) .{ .offsets = out } else .{ .invalid = .sum };
+            },
+            else => return .{ .invalid = .setting },
+        }
     }
 
     fn rowsSetting(c: *Config, v: std.json.Value) ?u32 {
@@ -295,6 +371,15 @@ pub const Config = struct {
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
         if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
         try c.tally.check("glm5_next");
+        switch (c.expert_rows_by_layer) {
+            .uniform => {},
+            .offsets => |o| if (o.len != c.model.moeLayers()) return error.Glm5NextExpertRowsByLayerLength,
+            .invalid => |why| return switch (why) {
+                .setting => error.Glm5NextExpertRowsByLayer,
+                .length => error.Glm5NextExpertRowsByLayerLength,
+                .sum => error.Glm5NextExpertRowsByLayerSum,
+            },
+        }
         if (c.kv_quant_bits) |b| if (b != 0 and b != 16) return error.Glm5NextKvQuantUnsupported;
         if (c.expert_rows) |d| if (d > c.model.n_routed_experts) return error.Glm5NextExpertRows;
         if (c.expert_prefill_rows) |p| if (p > c.model.n_routed_experts) return error.Glm5NextExpertRows;
@@ -457,4 +542,57 @@ test "glm5_next settings: the resolved draft depth per arch (glm5_next depth 2, 
     try testing.expectEqual(mimo.trained_draft_depth, m.draft_depth);
     try testing.expectEqual(@as(u32, 32), dsv41_graph.draft_compile_max_rows);
     try testing.expectEqual(@as(u32, 16), dspark.max_block);
+}
+
+test "glm5_next settings: expert_rows_by_layer: uniform by default (today's rows), offsets on decode only with prompt = min(prompt, decode), refusals by name" {
+    const n_moe = (Config{}).model.moeLayers();
+    try testing.expectEqual(@as(u32, 42), n_moe);
+    var prompt: [42]u32 = undefined;
+    var decode: [42]u32 = undefined;
+    const rows: sdk.Rows = .{ .prompt = 126, .decode = 143 };
+    // The default: uniform, exactly the memset construction (every layer at the plan's rows).
+    const base = try parseSettings("{}");
+    try testing.expect(base.expert_rows_by_layer == .uniform);
+    try base.validate();
+    try layerRows(base.expert_rows_by_layer, rows, 288, &prompt, &decode);
+    for (prompt, decode) |p, d| {
+        try testing.expectEqual(@as(u32, 126), p);
+        try testing.expectEqual(@as(u32, 143), d);
+    }
+    try testing.expect((try parseSettings("{\"expert_rows_by_layer\":\"uniform\"}")).expert_rows_by_layer == .uniform);
+    // A fixture of the per-layer replay's shape (sqrt of the miss rate at 143 rows; NOT a shipped table): routed layer 15
+    // (model layer 18) at decode 94, under the plan's 126 prompt rows: its prompt rows are 94.
+    const fixture = [42]i16{ 67, 76, 74, 63, 39, 45, 44, 45, 29, 17, 8, 1, 8, 11, -9, -49, -47, -25, -19, -10, 2, -14, -33, -24, -35, -20, -13, -8, -13, -8, -29, -31, -29, -19, -22, -18, -18, -9, -12, -17, -4, 6 };
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try text.appendSlice(testing.allocator, "{\"expert_rows_by_layer\":[");
+    for (fixture, 0..) |w, l| try text.print(testing.allocator, "{s}{d}", .{ if (l == 0) "" else ",", w });
+    try text.appendSlice(testing.allocator, "]}");
+    const split = try parseSettings(text.items);
+    try split.validate();
+    try testing.expectEqualSlices(i16, &fixture, split.expert_rows_by_layer.offsets.slice());
+    try layerRows(split.expert_rows_by_layer, rows, 288, &prompt, &decode);
+    try testing.expectEqual(@as(u32, 94), decode[15]);
+    try testing.expectEqual(@as(u32, 94), prompt[15]);
+    try testing.expectEqual(@as(u32, 210), decode[0]);
+    try testing.expectEqual(@as(u32, 126), prompt[0]);
+    var sum_d: u64 = 0;
+    var sum_p: u64 = 0;
+    for (prompt, decode) |p, d| {
+        try testing.expect(p <= d and p >= 1);
+        sum_d += d;
+        sum_p += p;
+    }
+    // The decode total is the plan's; the prompt total can only fall.
+    try testing.expectEqual(@as(u64, 42 * 143), sum_d);
+    try testing.expect(sum_p <= 42 * 126);
+    // Refusals by name: the setting, the length, the sum, the range at construction.
+    for ([_][]const u8{ "{\"expert_rows_by_layer\":\"sqrt\"}", "{\"expert_rows_by_layer\":true}", "{\"expert_rows_by_layer\":[1.5]}", "{\"expert_rows_by_layer\":[40000]}", "{\"expert_rows_by_layer\":null}" }) |bad|
+        try testing.expectError(error.Glm5NextExpertRowsByLayer, (try parseSettings(bad)).validate());
+    try testing.expectError(error.Glm5NextExpertRowsByLayerLength, (try parseSettings("{\"expert_rows_by_layer\":[]}")).validate());
+    try testing.expectError(error.Glm5NextExpertRowsByLayerLength, (try parseSettings("{\"expert_rows_by_layer\":[1,-1]}")).validate());
+    try testing.expectError(error.Glm5NextExpertRowsByLayerSum, (try parseSettings("{\"expert_rows_by_layer\":[1,1]}")).validate());
+    try testing.expectError(error.Glm5NextExpertRowsByLayerRange, layerRows(split.expert_rows_by_layer, .{ .prompt = 40, .decode = 49 }, 288, &prompt, &decode));
+    try testing.expectError(error.Glm5NextExpertRowsByLayerRange, layerRows(split.expert_rows_by_layer, .{ .prompt = 200, .decode = 222 }, 288, &prompt, &decode));
+    try testing.expectError(error.Glm5NextExpertRowsByLayerLength, layerRows(split.expert_rows_by_layer, rows, 288, prompt[0..41], decode[0..41]));
 }
