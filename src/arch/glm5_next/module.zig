@@ -598,7 +598,7 @@ pub const Module = struct {
         const k = mtp.draftsAt(lane.depth, lane.tracked(), lane.n_pending, len, accepted_cap, self.reserve);
         var ids: [mtp.verify_rows]u32 = undefined;
         ids[0] = t1;
-        if (k > 0) try lane.draft(g, &self.w, self.history[lane.pairs() + 1 .. len], t1, k, ids[1 .. k + 1]);
+        if (k > 0) try lane.draft(g, &self.w, self.history[lane.pairs() + 1 .. len], t1, k, ids[1 .. k + 1], acc.Params.active(acc.Params.of(sampling)), len);
         const rows: u32 = k + 1;
         const drafts = ids[1..rows];
         const tp = gprof.stepBegin(t1);

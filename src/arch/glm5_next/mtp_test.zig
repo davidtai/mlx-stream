@@ -699,3 +699,66 @@ test "glm5_next mtp hold: what the open's arrays hold equals the bill's mtp_bank
     const t = mtp.terms(facts, &pc, 32_768, page);
     try testing.expectEqual(mtp.heldOf(&openArrayBytes(&db.owner.geometry, &pc, 32_768), page), t[0].bytes[0] + t[2].bytes[0] + t[3].bytes[0]);
 }
+
+/// A toy draft head near the toy target: `targetRow` with seeded noise (the head's q against the target's p).
+fn draftRow(prev: u32, pos: u64, out: []f32) void {
+    targetRow(prev, pos, out);
+    var rng = std.Random.DefaultPrng.init(0x77 ^ (@as(u64, prev) *% 0x9e37_79b9) ^ (pos *% 0x5851_f42d));
+    for (out) |*x| x.* += rng.random().floatNorm(f32) * 0.6;
+}
+
+test "glm5_next mtp coupled drafts: a sampled draft drawn from the head's q at the target's own uniform keeps the emitted ids the serial chain's (exact), and is accepted more often than the head's argmax" {
+    const V = 64;
+    const sm: acc.Params = .{ .temperature = 1.0, .top_p = 0.95, .seed = 7 };
+    var dp: [V]f64 = undefined;
+    var dq: [V]f64 = undefined;
+    var row: [V]f32 = undefined;
+    var drafted: [2]u64 = @splat(0);
+    var kept: [2]u64 = @splat(0);
+    for ([_]bool{ true, false }) |coupled| for (0..16) |seed| {
+        const s: acc.Params = .{ .temperature = sm.temperature, .top_p = sm.top_p, .seed = sm.seed + seed };
+        const n = 200;
+        // The serial chain: token j is p's draw at position j.
+        var serial: [n + 8]u32 = undefined;
+        serial[0] = @intCast(seed % V);
+        for (1..n + 8) |j| {
+            targetRow(serial[j - 1], j, &row);
+            acc.distribution(&row, s, &dp);
+            serial[j] = acc.sample(&dp, s.seed, j);
+        }
+        var len: u64 = 1;
+        var t1 = serial[1];
+        var emitted: [n + 8]u32 = undefined;
+        emitted[0] = serial[0];
+        while (len < n) {
+            var drafts: [3]u32 = undefined;
+            var logits: [4 * V]f32 = undefined;
+            var prev = t1;
+            targetRow(t1, len + 1, logits[0..V]);
+            for (0..3) |i| {
+                const pos = len + 1 + i;
+                draftRow(prev, pos, &row);
+                if (coupled) {
+                    acc.distribution(&row, s, &dq);
+                    drafts[i] = acc.sample(&dq, s.seed, pos);
+                } else drafts[i] = argmax(&row);
+                prev = drafts[i];
+                targetRow(prev, pos + 1, logits[(i + 1) * V ..][0..V]);
+            }
+            const r = acc.accept(mtp.rule, s, &logits, &drafts, null, len);
+            emitted[len] = t1;
+            for (drafts[0..r.n_accepted], 0..) |d, i| emitted[len + 1 + i] = d;
+            len += r.n_accepted + 1;
+            t1 = r.next_token;
+            drafted[@intFromBool(coupled)] += 3;
+            kept[@intFromBool(coupled)] += r.n_accepted;
+        }
+        // Exact: either drafter emits the serial chain's ids.
+        try testing.expectEqualSlices(u32, serial[0..len], emitted[0..len]);
+    };
+    const rate_argmax = @as(f64, @floatFromInt(kept[0])) / @as(f64, @floatFromInt(drafted[0]));
+    const rate_coupled = @as(f64, @floatFromInt(kept[1])) / @as(f64, @floatFromInt(drafted[1]));
+    std.debug.print("GLM5N_MTP_COUPLED acceptance argmax={d:.3} coupled={d:.3}\n", .{ rate_argmax, rate_coupled });
+    try testing.expect(rate_coupled > rate_argmax);
+    try noDevice();
+}
