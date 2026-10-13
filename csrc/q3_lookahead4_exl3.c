@@ -827,6 +827,13 @@ static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
     }
     spec_t *s = &spec[i];
     s->readers += 1;
+    /* An adopting copy reads s->buf until it drops `readers`. A landed record a demand range adopts without a claim
+     * (its bytes landed before any submit claimed it) could otherwise be abandoned (settle, re-validation, quiesce) and
+     * its slot reissued while the copy runs: spec_end frees it without looking at `readers`, issue() takes the free
+     * slot, and its preadv overwrites the buffer mid-copy (the range then publishes OK with torn bytes). Claiming it
+     * here, under `mu`, keeps it out of every abandon path until the copy is done. */
+    s->claimed = 1;
+    s->abandon = 0;
     if (waited) sc[SC_ADOPT_WAIT_NS] += q3ld_monotonic_ns() - t0;
     EV(5, rg->offset);
     const char *src = s->buf + (s->base - s->aligned) + (rg->offset - s->base);
