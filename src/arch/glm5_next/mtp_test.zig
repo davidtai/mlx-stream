@@ -650,6 +650,240 @@ test "glm5_next mtp positions: a round decides drafts 1 .. min(accepted + 1, dra
     try noDevice();
 }
 
+/// A host backend for the draft chain's ops (CPU): every array a host vector of f32 (an id array holds its ids as exact
+/// integers), every op computed when built; `evals` / `reads` count the host's waits and reads, and a read of an array
+/// no eval named is refused (on MLX it would be one more sync).
+const ChainOps = struct {
+    pub const T = u32;
+    a: std.mem.Allocator,
+    vals: std.ArrayList([]f32) = .empty,
+    evaluated: std.ArrayList(T) = .empty,
+    evals: u32 = 0,
+    reads: u32 = 0,
+
+    fn deinit(g: *ChainOps) void {
+        for (g.vals.items) |v| g.a.free(v);
+        g.vals.deinit(g.a);
+        g.evaluated.deinit(g.a);
+    }
+
+    fn readable(g: *const ChainOps, x: T) !void {
+        if (std.mem.indexOfScalar(T, g.evaluated.items, x) == null) return error.ImplicitSync;
+    }
+
+    pub fn max(g: *ChainOps, x: T, axis: c_int, keepdims: bool) !T {
+        std.debug.assert(axis == 0 and !keepdims);
+        return g.new(&.{std.mem.max(f32, g.vals.items[x])});
+    }
+
+    pub fn logsumexp(g: *ChainOps, x: T, axis: c_int, keepdims: bool) !T {
+        std.debug.assert(axis == 0 and !keepdims);
+        const v = g.vals.items[x];
+        const m = std.mem.max(f32, v);
+        var s: f32 = 0;
+        for (v) |f| s += @exp(f - m);
+        return g.new(&.{m + @log(s)});
+    }
+
+    pub fn sub(g: *ChainOps, x: T, y: T) !T {
+        return g.new(&.{g.vals.items[x][0] - g.vals.items[y][0]});
+    }
+
+    pub fn exp(g: *ChainOps, x: T) !T {
+        return g.new(&.{@exp(g.vals.items[x][0])});
+    }
+
+    pub fn hostF32(g: *ChainOps, x: T, out: []f32) ![]const f32 {
+        try g.readable(x);
+        g.reads += 1;
+        const v = g.vals.items[x];
+        if (v.len != out.len) return error.HostReadSize;
+        @memcpy(out, v);
+        return out;
+    }
+
+    fn new(g: *ChainOps, v: []const f32) !T {
+        try g.vals.append(g.a, try g.a.dupe(f32, v));
+        return @intCast(g.vals.items.len - 1);
+    }
+
+    pub fn reshape(g: *ChainOps, x: T, _: []const c_int) !T {
+        return g.new(g.vals.items[x]);
+    }
+
+    /// The first maximum (MLX's argmax), as an id.
+    pub fn argmax(g: *ChainOps, x: T, axis: c_int) !T {
+        std.debug.assert(axis == 0);
+        return g.new(&.{@floatFromInt(firstMax(g.vals.items[x]))});
+    }
+
+    pub fn concat(g: *ChainOps, xs: []const T, _: c_int) !T {
+        var all: std.ArrayList(f32) = .empty;
+        defer all.deinit(g.a);
+        for (xs) |x| try all.appendSlice(g.a, g.vals.items[x]);
+        return g.new(all.items);
+    }
+
+    pub fn evalAll(g: *ChainOps, xs: []const T) !void {
+        g.evals += 1;
+        try g.evaluated.appendSlice(g.a, xs);
+    }
+
+    pub fn hostU32(g: *ChainOps, x: T, out: []u32) ![]const u32 {
+        try g.readable(x);
+        g.reads += 1;
+        const v = g.vals.items[x];
+        if (v.len != out.len) return error.HostReadSize;
+        for (out, v) |*o, f| o.* = @intFromFloat(f);
+        return out;
+    }
+
+    pub fn hostArray(g: *ChainOps, bytes: []const u8, _: []const c_int, _: sdk.mlx.mlx_dtype) !T {
+        const ids = std.mem.bytesAsSlice(u32, bytes);
+        var v: [8]f32 = undefined;
+        for (v[0..ids.len], ids) |*f, i| f.* = @floatFromInt(i);
+        return g.new(v[0..ids.len]);
+    }
+};
+
+const firstMax = argmax;
+
+/// A toy draft head over `ChainOps`: a step's logits [V] are `targetRow` of (the pair's token, its position), its normed
+/// row carries the token and the position forward; a pair's input is (the token taken from the id array, the normed row).
+const ToyHead = struct {
+    V: u32,
+
+    pub fn step(h: ToyHead, g: *ChainOps, x: u32, pos: u32) !struct { normed: u32, logits: u32 } {
+        const tok: u32 = @intFromFloat(g.vals.items[x][0]);
+        var row: [64]f32 = undefined;
+        targetRow(tok, pos, row[0..h.V]);
+        return .{ .normed = try g.new(&.{ @floatFromInt(tok), @floatFromInt(pos) }), .logits = try g.new(row[0..h.V]) };
+    }
+
+    pub fn draw(_: ToyHead, g: *ChainOps, logits: u32, _: u32) !u32 {
+        return g.reshape(try g.argmax(logits, 0), &.{1});
+    }
+
+    pub fn input(_: ToyHead, g: *ChainOps, idx: u32, hidden: u32) !u32 {
+        return g.new(&.{ g.vals.items[idx][0], g.vals.items[hidden][1] });
+    }
+};
+
+/// The stepwise chain (the lane's draft before the device chain): each step evaluated and its draft read on its own,
+/// the next pair's input built from the host's id.
+fn stepwiseDrafts(g: *ChainOps, head: ToyHead, x0: u32, start: u32, depth: u32, out: []u32) !void {
+    var x = x0;
+    for (0..depth) |s| {
+        const r = try head.step(g, x, start + @as(u32, @intCast(s)));
+        const am = try g.argmax(r.logits, 0);
+        try g.evalAll(&.{am});
+        var tok: [1]u32 = undefined;
+        _ = try g.hostU32(am, &tok);
+        out[s] = tok[0];
+        if (s + 1 < depth) x = try head.input(g, try g.hostArray(std.mem.sliceAsBytes(out[s..][0..1]), &.{1}, .uint32), r.normed);
+    }
+}
+
+test "glm5_next mtp draft chain: the device chain (each draft's argmax feeding the next pair on the device, one eval) drafts the stepwise chain's ids at depth 1..3 and reads each draft's top-1 probability in the same sync; one sync a round instead of one a step" {
+    const head: ToyHead = .{ .V = 64 };
+    for ([_]u32{ 1, 2, 3 }) |depth| for (0..32) |seed| {
+        var g: ChainOps = .{ .a = testing.allocator };
+        defer g.deinit();
+        const t1: u32 = @intCast(seed % head.V);
+        const start: u32 = 100 + @as(u32, @intCast(seed)) * 7;
+        const x0 = try g.new(&.{ @floatFromInt(t1), 0 });
+        var want: [mtp.max_depth]u32 = undefined;
+        try stepwiseDrafts(&g, head, x0, start, depth, want[0..depth]);
+        try testing.expectEqual(depth, g.evals);
+        try testing.expectEqual(depth, g.reads);
+        g.evals = 0;
+        g.reads = 0;
+        var got: [mtp.max_depth]u32 = undefined;
+        var q: [mtp.max_depth]f32 = undefined;
+        try mtp.chainDrafts(ChainOps, &g, head, x0, start, depth, got[0..depth], q[0..depth]);
+        try testing.expectEqualSlices(u32, want[0..depth], got[0..depth]);
+        // One eval; the drafts and their probabilities are read from it (no read of an array no eval named).
+        try testing.expectEqual(@as(u32, 1), g.evals);
+        try testing.expectEqual(@as(u32, 2), g.reads);
+        // Each draft is the target's argmax after the previous one, its q the target row's softmax at it.
+        var prev = t1;
+        for (got[0..depth], q[0..depth], 0..) |d, p, s| {
+            var row: [64]f32 = undefined;
+            targetRow(prev, start + s, &row);
+            try testing.expectEqual(argmax(&row), d);
+            const m = std.mem.max(f32, &row);
+            var z: f64 = 0;
+            for (row) |f| z += @exp(@as(f64, f - m));
+            try testing.expectApproxEqRel(@as(f32, @floatCast(1.0 / z)), p, 1e-5);
+            prev = d;
+        }
+    };
+    try noDevice();
+}
+
+test "glm5_next mtp draft gate: of a round's drafts the leading ones whose cumulative top-1 probability stays at or above theta are verified; theta 0 (off) keeps every draft" {
+    const Row = struct { q: []const f32, theta: f32, k: u32 };
+    for ([_]Row{
+        .{ .q = &.{ 0.9, 0.8, 0.7 }, .theta = 0, .k = 3 }, // off
+        .{ .q = &.{ 0.2, 0.1, 0.05 }, .theta = 0, .k = 3 }, // off keeps even unlikely drafts
+        .{ .q = &.{ 0.9, 0.8, 0.7 }, .theta = 0.55, .k = 2 }, // 0.9, 0.72, 0.504
+        .{ .q = &.{ 0.5, 0.99, 0.99 }, .theta = 0.55, .k = 0 }, // the first draft under theta: a serial step
+        .{ .q = &.{ 0.99, 0.6, 0.99 }, .theta = 0.6, .k = 1 }, // 0.99, 0.594
+        .{ .q = &.{ 1.0, 1.0, 1.0 }, .theta = 0.99, .k = 3 },
+        .{ .q = &.{ 0.81, 0.74, 0.74 }, .theta = 0.55, .k = 2 }, // g21b's mean acceptance: 0.81, 0.599, 0.444
+        .{ .q = &.{0.95}, .theta = 0.55, .k = 1 }, // a depth-1 round
+        .{ .q = &.{}, .theta = 0.55, .k = 0 }, // no drafts
+    }) |r| try testing.expectEqual(r.k, mtp.gatedDrafts(r.q, r.theta));
+    try noDevice();
+}
+
+test "glm5_next mtp calibration: a synthetic acceptance table (each draft kept with its own q) bins every decided position by q, sums to the per-position counts, and a gate verifies only its prefix" {
+    // Rounds of three drafts with q drawn from a seeded table; the target keeps draft i with probability q_i (the exact
+    // rule keeps a prefix). Gate off: every position is counted in its q bin, the bins summing to `Positions`.
+    var prng = std.Random.DefaultPrng.init(0xca1b);
+    const rand = prng.random();
+    for ([_]f32{ 0, 0.55 }) |theta| {
+        var pos: mtp.Positions = .{};
+        var cal: mtp.Calib = .{};
+        var dropped: u64 = 0;
+        for (0..2000) |_| {
+            var q: [3]f32 = undefined;
+            for (&q) |*p| p.* = 0.3 + 0.7 * rand.float(f32);
+            const k = mtp.gatedDrafts(&q, theta);
+            dropped += 3 - k;
+            var kept: u32 = 0;
+            while (kept < k and rand.float(f32) < q[kept]) kept += 1;
+            pos.add(k, kept);
+            cal.add(k, kept, q[0..k]);
+        }
+        for (0..mtp.max_depth) |i| {
+            var t: u64 = 0;
+            var kk: u64 = 0;
+            for (cal.tested[i], cal.kept[i]) |tb, kb| {
+                t += tb;
+                kk += kb;
+                try testing.expect(kb <= tb);
+            }
+            try testing.expectEqual(pos.tested[i], t);
+            try testing.expectEqual(pos.kept[i], kk);
+        }
+        // Off: no draft dropped; on: some, and a bin's acceptance tracks its q (a kept draft is a q-coin's heads).
+        if (theta == 0) try testing.expectEqual(@as(u64, 0), dropped) else try testing.expect(dropped > 0);
+        if (theta == 0) {
+            const lo = @as(f64, @floatFromInt(cal.kept[0][3] + cal.kept[0][4])) / @as(f64, @floatFromInt(cal.tested[0][3] + cal.tested[0][4]));
+            const hi = @as(f64, @floatFromInt(cal.kept[0][9])) / @as(f64, @floatFromInt(cal.tested[0][9]));
+            try testing.expect(lo < hi);
+        }
+    }
+    var buf: [512]u8 = undefined;
+    var c: mtp.Calib = .{};
+    c.add(3, 1, &.{ 0.95, 0.42, 0.05 });
+    c.add(2, 2, &.{ 1.0, 0.0 });
+    try testing.expectEqualStrings("depth=3 q_bins=10 pos1=0/0,0/0,0/0,0/0,0/0,0/0,0/0,0/0,0/0,2/2 pos2=1/1,0/0,0/0,0/0,1/0,0/0,0/0,0/0,0/0,0/0 pos3=0/0,0/0,0/0,0/0,0/0,0/0,0/0,0/0,0/0,0/0", c.write(&buf, 3));
+    try testing.expectEqual(@as(usize, 0), c.write(buf[0..20], 3).len);
+    try noDevice();
+}
+
 test "glm5_next mtp: the lane's device code compiles against the arch's seams (declarations referenced, nothing run)" {
     std.testing.refAllDecls(mtp.Lane);
     std.testing.refAllDecls(mtp.Head);
