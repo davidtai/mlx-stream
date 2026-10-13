@@ -198,7 +198,7 @@ control) is read once at construction; the load logs `[kda] fused prompt prologu
 prompt prologue declined (...)` and `kda_prologue=ops`. The decode lane and the MTP verify's capture keep the op chain.
 No bill term (the text's live arrays are a subset of the op chain's). The window's parity test, bit for bit against the
 op chain (q, k, v, the tail, the layer's output and state over spans of 1,024, a carried 1,024 and 37 rows):
-`GLM5NEXT_KDA_PROLOGUE_GPU=1 _GPU_WINDOW_LOCKED=1`, `-Dtest-filter="glm5_next kda prologue GPU"`.
+`GLM5NEXT_KDA_PROLOGUE_GPU=1 _GPU_WINDOW_LOCKED=1`, `-Dtest-filter="glm5_next kda prologue GPU"`; one `GLM5NEXT_KDA_PARITY shape=... PASS|FAIL` line per span and an overall line.
 
 ## Prompt levers
 

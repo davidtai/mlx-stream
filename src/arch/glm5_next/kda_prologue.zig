@@ -166,9 +166,11 @@ test "glm5_next kda prologue CPU: Flash's geometry is the text's (dk 128, 4 taps
 // ── the window's parity test ──────────────────────────────────────────────
 
 /// Static bound (declared before any run): the synthetic layer's residents (q / k / v / o 4 x 64 MiB BF16, the gate
-/// stages and conv < 8 MiB, the f32 conv copy 0.4 MiB), one 1,024-row span's two prologues (the op chain's f32 window
-/// and conv stages 4 x 101 MB, its bf16 stages 4 x 50 MB; the text's outputs 50 MB), two forwards' arrays (< 0.4 GB),
-/// the host read-backs (4 x 33.6 MB f32 per compared pair): < 1.4 GB plus the texts' JIT; declared 1.6 GB.
+/// stages and conv < 8 MiB): 0.27 GB; then the larger of one 1,024-row span's two prologues in their own scope (the op
+/// chain's f32 window and conv stages 4 x 101 MB, its bf16 stages 4 x 50 MB, the projections 3 x 17 MB, the text's
+/// outputs 50 MB: 0.71 GB) and its two forwards (each the op chain's prologue plus the gate, recurrence and output
+/// arrays, < 0.5 GB: 1.0 GB); the host read-backs (two f32 copies of the widest compared array, 2 x 33.6 MB): < 1.4 GB
+/// plus the texts' JIT; declared 1.6 GB.
 const parity_bound_bytes: u64 = 1_600_000_000;
 
 fn bf16Bits(x: f32) u16 {
@@ -209,7 +211,7 @@ test "glm5_next kda prologue GPU: the fused text against the op chain at Flash's
     _ = std.c.getenv("GLM5NEXT_KDA_PROLOGUE_GPU") orelse return error.SkipZigTest;
     const guard = std.c.getenv("_GPU_WINDOW_LOCKED") orelse return error.GpuLockRequired;
     if (!std.mem.eql(u8, std.mem.span(guard), "1")) return error.GpuLockRequired;
-    std.debug.print("GLM5N_KDA_PROLOGUE_PARITY bound_bytes={d}\n", .{parity_bound_bytes});
+    std.debug.print("GLM5NEXT_KDA_PARITY bound_bytes={d}\n", .{parity_bound_bytes});
     mlx.installErrorHandler();
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
@@ -294,17 +296,26 @@ test "glm5_next kda prologue GPU: the fused text against the op chain at Flash's
         defer g.resetTo(m);
         const x = try randBf16(&g, a, r, &.{ 1, rows, h }, 1.0, 0.0);
         defer g.release(x);
-        // The prologues alone, from the same projections and the op chain's carried tail.
-        const qp = try g.matmul(x, try g.transpose(w.q.bf16));
-        const kp = try g.matmul(x, try g.transpose(w.k.bf16));
-        const vp = try g.matmul(x, try g.transpose(w.v.bf16));
-        const tail = s_ops.conv orelse try g.zeros(&.{ 1, @as(c_int, @intCast(c.kda_conv)) - 1, 3 * dim }, .float32);
-        const po = try kda.prologueOps(&g, &c, &w, qp, kp, vp, tail);
-        const pf = try prologueFused(&g, &c, &w, qp, kp, vp, tail);
-        const d_q = try bitDiffs(&g, a, pf.q, po.q);
-        const d_k = try bitDiffs(&g, a, pf.k, po.k);
-        const d_v = try bitDiffs(&g, a, pf.v, po.v);
-        const d_t = try bitDiffs(&g, a, pf.next_tail, po.next_tail);
+        // The prologues alone, from the same projections and the op chain's carried tail (their own scope: freed before
+        // the forwards).
+        var d_q: usize = 0;
+        var d_k: usize = 0;
+        var d_v: usize = 0;
+        var d_t: usize = 0;
+        {
+            const mp = g.mark();
+            defer g.resetTo(mp);
+            const qp = try g.matmul(x, try g.transpose(w.q.bf16));
+            const kp = try g.matmul(x, try g.transpose(w.k.bf16));
+            const vp = try g.matmul(x, try g.transpose(w.v.bf16));
+            const tail = s_ops.conv orelse try g.zeros(&.{ 1, @as(c_int, @intCast(c.kda_conv)) - 1, 3 * dim }, .float32);
+            const po = try kda.prologueOps(&g, &c, &w, qp, kp, vp, tail);
+            const pf = try prologueFused(&g, &c, &w, qp, kp, vp, tail);
+            d_q = try bitDiffs(&g, a, pf.q, po.q);
+            d_k = try bitDiffs(&g, a, pf.k, po.k);
+            d_v = try bitDiffs(&g, a, pf.v, po.v);
+            d_t = try bitDiffs(&g, a, pf.next_tail, po.next_tail);
+        }
         // The whole layer: kda.forward with the op chain installed, then with the text (each carrying its own state).
         prompt = &kda.prologueOps;
         const y_ops = try kda.forward(&g, &c, &w, x, &s_ops);
@@ -314,9 +325,10 @@ test "glm5_next kda prologue GPU: the fused text against the op chain at Flash's
         const d_y = try bitDiffs(&g, a, y_txt, y_ops);
         const d_s = try bitDiffs(&g, a, s_txt.rec.?, s_ops.rec.?);
         const d_c = try bitDiffs(&g, a, s_txt.conv.?, s_ops.conv.?);
-        std.debug.print("GLM5N_KDA_PROLOGUE_PARITY span={d} rows={d} bit_diffs q={d} k={d} v={d} tail={d} layer_y={d} state={d} conv_tail={d}\n", .{ span, rows, d_q, d_k, d_v, d_t, d_y, d_s, d_c });
-        total += d_q + d_k + d_v + d_t + d_y + d_s + d_c;
+        const shape_diffs = d_q + d_k + d_v + d_t + d_y + d_s + d_c;
+        std.debug.print("GLM5NEXT_KDA_PARITY shape=span{d}_rows{d} {s} bit_diffs q={d} k={d} v={d} tail={d} layer_y={d} state={d} conv_tail={d}\n", .{ span, rows, if (shape_diffs == 0) "PASS" else "FAIL", d_q, d_k, d_v, d_t, d_y, d_s, d_c });
+        total += shape_diffs;
     }
-    std.debug.print("GLM5N_KDA_PROLOGUE_PARITY {s} total_bit_diffs={d}\n", .{ if (total == 0) "PASS" else "FAIL", total });
+    std.debug.print("GLM5NEXT_KDA_PARITY overall {s} total_bit_diffs={d}\n", .{ if (total == 0) "PASS" else "FAIL", total });
     try testing.expectEqual(@as(usize, 0), total);
 }
