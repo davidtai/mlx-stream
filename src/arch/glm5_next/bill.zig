@@ -842,7 +842,7 @@ test "glm5_next bill: forced rows load as named with the overage reported; at or
     try testing.expectError(error.Glm5NextPhaseRows, choose(b, &cfg, box_ceiling, box_stop));
 }
 
-test "glm5_next bill: a per-layer rows split (expert_rows_by_layer) bills exactly as the uniform rows it redistributes" {
+test "glm5_next bill: a per-layer rows split (expert_rows_by_layer, lr2) bills exactly as the uniform rows it redistributes" {
     // MiMo's test (mimo_v2/bill.zig): the split moves decode rows between routed layers at the plan's total (offsets
     // summing to 0; prompt rows min(plan's, the layer's decode)). The plan (fill, admission, process bound) never sees the
     // split, and the one row term is linear in the rows (`per_row` = one record on each routed layer), so the split's
@@ -858,7 +858,7 @@ test "glm5_next bill: a per-layer rows split (expert_rows_by_layer) bills exactl
     for (offsets.slice()) |o| sum += o;
     offsets.d[41] -= @intCast(sum); // ... the last layer takes the remainder: the offsets sum to 0
     for ([_]?sdk.Rows{ .{ .prompt = 115, .decode = 131 }, .{ .prompt = 126, .decode = 143 }, null }) |forced| {
-        var uniform: settings.Config = .{ .memory_baseline_bytes = 12_600_000_000 };
+        var uniform: settings.Config = .{ .memory_baseline_bytes = 12_600_000_000, .expert_rows_by_layer = .uniform };
         if (forced) |f| {
             uniform.expert_rows = f.decode;
             uniform.expert_prefill_rows = f.prompt;
@@ -887,11 +887,15 @@ test "glm5_next bill: a per-layer rows split (expert_rows_by_layer) bills exactl
         try testing.expectEqual(@as(u64, ps.rows.decode) * b.per_row, bytes[3]);
         try testing.expectEqual(bytes[1], bytes[3]);
         try testing.expectEqual(@as(u64, ps.rows.prompt) * b.per_row, bytes[0]);
-        try testing.expect(bytes[2] <= bytes[0]);
-        // Not uniform: the split really moves rows (routed layer 0 +40; routed layer 15, model layer 18, -49).
-        try testing.expectEqual(ps.rows.decode + 40, sd[0]);
-        try testing.expectEqual(ps.rows.decode - 49, sd[15]);
-        try testing.expectEqual(@min(ps.rows.prompt, sd[15]), sp[15]);
+        // lr2: the prompt rows stay uniform (equal prompt bytes); every decode layer at least its prompt rows.
+        try testing.expectEqual(bytes[0], bytes[2]);
+        for (sp, sd) |p, d| {
+            try testing.expectEqual(ps.rows.prompt, p);
+            try testing.expect(d >= p);
+        }
+        // Not uniform: the split really moves rows (routed layer 0 up, routed layer 15 down to at most the uniform rows).
+        try testing.expect(sd[0] > ps.rows.decode);
+        try testing.expect(sd[15] <= ps.rows.decode);
     }
 }
 

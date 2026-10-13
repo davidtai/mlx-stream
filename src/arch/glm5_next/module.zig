@@ -218,8 +218,8 @@ pub const Module = struct {
         };
         self.gates = try self.w.gates(gpa, self.c.decode_predict);
         errdefer gpa.free(self.gates);
-        // The expert source at the plan's rows: every routed layer alike (`expert_rows_by_layer: uniform`, the default), or
-        // the setting's split of the decode rows at the same total (prompt rows min(plan's, the layer's decode)).
+        // The expert source at the plan's rows: every routed layer alike (`expert_rows_by_layer: uniform`), or (the default)
+        // the calibrated split of the decode rows at the same total (lr2: prompt rows uniform; decode floored at them).
         const n_moe = model.moeLayers();
         const prompt_rows = try arena.allocator().alloc(u32, n_moe);
         const decode_rows = try arena.allocator().alloc(u32, n_moe);

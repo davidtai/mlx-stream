@@ -156,10 +156,31 @@ pub const LayerRows = union(enum) {
     };
 };
 
+/// glm5_next's default decode split (`expert_rows_by_layer`): 42 integer offsets summing to 0, the calibration of the
+/// three NON-benchmark prompts (reports/.../mimo/cells/glm5next-calib-20261013/expert-rows-by-layer.json). The
+/// g21d-vs-g21d-lr pair (lane on, 115/131): decode +3.40 % (noisy), stacked.
+pub const default_layer_offsets = [_]i16{ 63, 61, 62, 58, 34, 40, 35, 42, 22, 6, 2, 2, 0, 0, -14, -30, -32, -26, -26, -29, -11, -12, -24, -21, -22, -13, -18, -18, -10, -5, -22, -18, -13, -11, -12, -9, -10, -7, -7, -9, -6, 8 };
+
+pub fn defaultLayerRows() LayerRows {
+    var o: LayerRows.Offsets = .{ .len = default_layer_offsets.len };
+    @memcpy(o.d[0..default_layer_offsets.len], &default_layer_offsets);
+    return .{ .offsets = o };
+}
+
+comptime {
+    var sum: i32 = 0;
+    for (default_layer_offsets) |x| sum += x;
+    if (sum != 0 or default_layer_offsets.len != 42) @compileError("glm5_next: the default per-layer offsets must be 42 summing to 0");
+}
+
 /// The per-layer rows of both phases (routed-layer order) into `prompt` / `decode` (each of the model's routed layers'
 /// length), from the plan's uniform `rows`, once at construction. `uniform`: every layer at `rows` (today's construction).
-/// `offsets`: decode = rows.decode + offset, prompt = min(rows.prompt, decode); refused by name when a layer would hold
-/// fewer than one decode row or more than its `n_experts` experts.
+/// `offsets` (lr2): the prompt rows stay uniform at `rows.prompt` in every layer (equal prompt bytes; the split applies at
+/// the phase change); decode = rows.decode + offset, held at rows.prompt at least (the stream grows a layer at the phase
+/// change, never shrinks it), and the rows that floor adds are taken back from the widest decode layers (the first widest
+/// first, one row at a time, never under rows.prompt) so the decode rows sum to the plan's: both phases bill exactly as
+/// the uniform rows. Refused by name when a layer would hold more than its `n_experts` experts or the floor cannot be
+/// paid back.
 pub fn layerRows(split: LayerRows, rows: sdk.Rows, n_experts: u32, prompt: []u32, decode: []u32) !void {
     if (prompt.len != decode.len) return error.Glm5NextExpertRowsByLayerLength;
     switch (split) {
@@ -169,11 +190,22 @@ pub fn layerRows(split: LayerRows, rows: sdk.Rows, n_experts: u32, prompt: []u32
         },
         .offsets => |*o| {
             if (o.len != decode.len) return error.Glm5NextExpertRowsByLayerLength;
+            var surplus: i64 = 0;
             for (prompt, decode, o.slice()) |*p, *q, off| {
                 const dd = @as(i64, rows.decode) + off;
-                if (dd < 1 or dd > n_experts) return error.Glm5NextExpertRowsByLayerRange;
-                q.* = @intCast(dd);
-                p.* = @min(rows.prompt, q.*);
+                if (dd > n_experts) return error.Glm5NextExpertRowsByLayerRange;
+                const floored = @max(dd, @as(i64, rows.prompt));
+                surplus += floored - dd;
+                q.* = @intCast(floored);
+                p.* = rows.prompt;
+            }
+            while (surplus > 0) : (surplus -= 1) {
+                var wi: usize = 0;
+                for (decode, 0..) |d, i| {
+                    if (d > decode[wi]) wi = i;
+                }
+                if (decode[wi] <= rows.prompt) return error.Glm5NextExpertRowsByLayerRange;
+                decode[wi] -= 1;
             }
         },
         .invalid => return error.Glm5NextExpertRowsByLayer,
@@ -231,7 +263,7 @@ pub const Config = struct {
     /// streamed arch's keys (`expert_tally.Settings`), glm5_next's default ratio.
     tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
     /// The decode rows' split between the routed layers (`LayerRows`): `uniform` (the default) or `offsets`.
-    expert_rows_by_layer: LayerRows = .uniform,
+    expert_rows_by_layer: LayerRows = defaultLayerRows(),
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -544,24 +576,38 @@ test "glm5_next settings: the resolved draft depth per arch (glm5_next depth 2, 
     try testing.expectEqual(@as(u32, 16), dspark.max_block);
 }
 
-test "glm5_next settings: expert_rows_by_layer: uniform by default (today's rows), offsets on decode only with prompt = min(prompt, decode), refusals by name" {
+test "glm5_next settings: expert_rows_by_layer: the calibrated offsets by default, uniform by name; lr2: prompt rows uniform, decode = rows + offset floored at the prompt rows and paid back from the widest layers; refusals by name" {
     const n_moe = (Config{}).model.moeLayers();
     try testing.expectEqual(@as(u32, 42), n_moe);
     var prompt: [42]u32 = undefined;
     var decode: [42]u32 = undefined;
-    const rows: sdk.Rows = .{ .prompt = 126, .decode = 143 };
-    // The default: uniform, exactly the memset construction (every layer at the plan's rows).
-    const base = try parseSettings("{}");
-    try testing.expect(base.expert_rows_by_layer == .uniform);
-    try base.validate();
-    try layerRows(base.expert_rows_by_layer, rows, 288, &prompt, &decode);
+    // Uniform by name: exactly the memset construction (every layer at the plan's rows).
+    const uni = try parseSettings("{\"expert_rows_by_layer\":\"uniform\"}");
+    try testing.expect(uni.expert_rows_by_layer == .uniform);
+    try layerRows(uni.expert_rows_by_layer, .{ .prompt = 126, .decode = 143 }, 288, &prompt, &decode);
     for (prompt, decode) |p, d| {
         try testing.expectEqual(@as(u32, 126), p);
         try testing.expectEqual(@as(u32, 143), d);
     }
-    try testing.expect((try parseSettings("{\"expert_rows_by_layer\":\"uniform\"}")).expert_rows_by_layer == .uniform);
-    // A fixture of the per-layer replay's shape (sqrt of the miss rate at 143 rows; NOT a shipped table): routed layer 15
-    // (model layer 18) at decode 94, under the plan's 126 prompt rows: its prompt rows are 94.
+    // The default: the calibration's 42 offsets.
+    const base = try parseSettings("{}");
+    try base.validate();
+    try testing.expectEqualSlices(i16, &default_layer_offsets, base.expert_rows_by_layer.offsets.slice());
+    for ([_]sdk.Rows{ .{ .prompt = 126, .decode = 145 }, .{ .prompt = 115, .decode = 131 }, .{ .prompt = 126, .decode = 143 }, .{ .prompt = 130, .decode = 130 } }) |rows| {
+        try layerRows(base.expert_rows_by_layer, rows, 288, &prompt, &decode);
+        var sum_d: u64 = 0;
+        for (prompt, decode) |p, d| {
+            try testing.expectEqual(rows.prompt, p); // prompt rows uniform: equal prompt bytes
+            try testing.expect(d >= p); // the stream grows a layer at the phase change, never shrinks it
+            sum_d += d;
+        }
+        try testing.expectEqual(@as(u64, 42) * rows.decode, sum_d); // the decode total is the plan's
+    }
+    // At 126/145 the cut layers floor at 126 (offsets down to -32 would give 113) and the widest layers pay it back.
+    try layerRows(base.expert_rows_by_layer, .{ .prompt = 126, .decode = 145 }, 288, &prompt, &decode);
+    try testing.expectEqual(@as(u32, 126), decode[16]);
+    try testing.expect(decode[0] < 145 + 63);
+    // A fixture through the setting: parsed as given.
     const fixture = [42]i16{ 67, 76, 74, 63, 39, 45, 44, 45, 29, 17, 8, 1, 8, 11, -9, -49, -47, -25, -19, -10, 2, -14, -33, -24, -35, -20, -13, -8, -13, -8, -29, -31, -29, -19, -22, -18, -18, -9, -12, -17, -4, 6 };
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(testing.allocator);
@@ -571,28 +617,12 @@ test "glm5_next settings: expert_rows_by_layer: uniform by default (today's rows
     const split = try parseSettings(text.items);
     try split.validate();
     try testing.expectEqualSlices(i16, &fixture, split.expert_rows_by_layer.offsets.slice());
-    try layerRows(split.expert_rows_by_layer, rows, 288, &prompt, &decode);
-    try testing.expectEqual(@as(u32, 94), decode[15]);
-    try testing.expectEqual(@as(u32, 94), prompt[15]);
-    try testing.expectEqual(@as(u32, 210), decode[0]);
-    try testing.expectEqual(@as(u32, 126), prompt[0]);
-    var sum_d: u64 = 0;
-    var sum_p: u64 = 0;
-    for (prompt, decode) |p, d| {
-        try testing.expect(p <= d and p >= 1);
-        sum_d += d;
-        sum_p += p;
-    }
-    // The decode total is the plan's; the prompt total can only fall.
-    try testing.expectEqual(@as(u64, 42 * 143), sum_d);
-    try testing.expect(sum_p <= 42 * 126);
     // Refusals by name: the setting, the length, the sum, the range at construction.
     for ([_][]const u8{ "{\"expert_rows_by_layer\":\"sqrt\"}", "{\"expert_rows_by_layer\":true}", "{\"expert_rows_by_layer\":[1.5]}", "{\"expert_rows_by_layer\":[40000]}", "{\"expert_rows_by_layer\":null}" }) |bad|
         try testing.expectError(error.Glm5NextExpertRowsByLayer, (try parseSettings(bad)).validate());
     try testing.expectError(error.Glm5NextExpertRowsByLayerLength, (try parseSettings("{\"expert_rows_by_layer\":[]}")).validate());
     try testing.expectError(error.Glm5NextExpertRowsByLayerLength, (try parseSettings("{\"expert_rows_by_layer\":[1,-1]}")).validate());
     try testing.expectError(error.Glm5NextExpertRowsByLayerSum, (try parseSettings("{\"expert_rows_by_layer\":[1,1]}")).validate());
-    try testing.expectError(error.Glm5NextExpertRowsByLayerRange, layerRows(split.expert_rows_by_layer, .{ .prompt = 40, .decode = 49 }, 288, &prompt, &decode));
     try testing.expectError(error.Glm5NextExpertRowsByLayerRange, layerRows(split.expert_rows_by_layer, .{ .prompt = 200, .decode = 222 }, 288, &prompt, &decode));
-    try testing.expectError(error.Glm5NextExpertRowsByLayerLength, layerRows(split.expert_rows_by_layer, rows, 288, prompt[0..41], decode[0..41]));
+    try testing.expectError(error.Glm5NextExpertRowsByLayerLength, layerRows(split.expert_rows_by_layer, .{ .prompt = 126, .decode = 143 }, 288, prompt[0..41], decode[0..41]));
 }
