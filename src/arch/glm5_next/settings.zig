@@ -84,7 +84,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "mtp_acceptance", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "logits_dump_dir" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -101,6 +101,11 @@ pub const default_draft_depth: u32 = 1;
 /// HITPASS, the shared scheduler's DEVROUTE) the fused texts with each decode-lane call's hit wave dispatched from the
 /// layer's device-resident slot LUT behind the routing barrier's arrays, before the host reads the ids (the host then
 /// routes and builds only the miss parts, whose rows replace their pairs in the join): exact against `fused`.
+/// The MTP lane's acceptance rule (`mtp_acceptance`), installed at construction.
+pub const MtpAcceptance = enum { exact, typical };
+/// Typical acceptance's delta (DSV4.1's served delta for the lane's rule; MiMo's default is 0.3).
+pub const typical_delta: f32 = 0.5;
+
 pub const DecodeMoe = enum { stock, fused, hitpass };
 /// The decode lane's glue, installed once at construction (glue.zig): `fused` the hcPre chain (each sublayer's collapse
 /// and norm with the previous expand in one dispatch), the router and top-8 texts and the combine with the shared expert's
@@ -148,6 +153,12 @@ pub const Config = struct {
     /// drafts at most this many and verifies 1 + them. Read once at construction (`mtp.Lane.open`); 0 marks a value
     /// outside 1 .. 3 or not an integer (refused by name in `validate`). Without the lane it is inert.
     draft_depth: u32 = default_draft_depth,
+    /// The MTP lane's acceptance (`"mtp_acceptance"`): `exact` (the default: sample-then-verify, a draft kept iff it is the
+    /// target's draw at its position; serial == lane ids) or `typical` (Medusa's typical acceptance over the request's own
+    /// target, delta `typical_delta`, the shared `acceptance.typicalRows`: a draft kept when p(x) > min(eps, delta x
+    /// exp(-H(p))); the token at a rejection stays the target's own draw at that position). Lossy by design: ids diverge
+    /// from serial. `tokenv3` is refused by name (not ported: no source in mlx-stream). Construction-time.
+    mtp_acceptance: MtpAcceptance = .exact,
     decode_moe: DecodeMoe = .hitpass,
     /// The decode lane's glue (glue.zig `Route`): `fused` (the default) or `ops` (the stock op chains, the control).
     decode_glue: DecodeGlue = .fused,
@@ -180,7 +191,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -189,6 +200,12 @@ pub const Config = struct {
         if (raw.object.get("expert_prefill_rows")) |v| c.expert_prefill_rows = c.rowsSetting(v);
         if (raw.object.get("mtp_lane")) |v| {
             if (v == .bool) c.mtp_lane = v.bool else c.malformed.mtp_lane = true;
+        }
+        if (raw.object.get("mtp_acceptance")) |v| {
+            const m: ?MtpAcceptance = if (v == .string) std.meta.stringToEnum(MtpAcceptance, v.string) else null;
+            if (m) |x| c.mtp_acceptance = x else if (v == .string and std.mem.eql(u8, v.string, "tokenv3")) {
+                c.malformed.tokenv3 = true;
+            } else c.malformed.mtp_acceptance = true;
         }
         if (raw.object.get("draft_depth")) |v| c.draft_depth = if (v == .integer and v.integer >= 1 and v.integer <= trained_draft_depth) @intCast(v.integer) else 0;
         if (raw.object.get("decode_moe")) |v| {
@@ -270,6 +287,8 @@ pub const Config = struct {
     pub fn validate(c: Config) !void {
         if (c.malformed.rows) return error.Glm5NextExpertRowsSetting;
         if (c.malformed.mtp_lane) return error.Glm5NextMtpLaneSetting;
+        if (c.malformed.tokenv3) return error.Glm5NextMtpAcceptanceNotPorted;
+        if (c.malformed.mtp_acceptance) return error.Glm5NextMtpAcceptanceSetting;
         if (c.draft_depth == 0 or c.draft_depth > trained_draft_depth) return error.Glm5NextDraftDepthRange;
         if (c.malformed.dump_dir) return error.Glm5NextLogitsDumpDir;
         if (c.malformed.decode_moe) return error.Glm5NextDecodeMoeSetting;
@@ -334,6 +353,15 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
         "{\"draft_depth\":0}",   "{\"draft_depth\":4}",     "{\"draft_depth\":-1}",   "{\"draft_depth\":2.0}",
         "{\"draft_depth\":2.5}", "{\"draft_depth\":\"2\"}", "{\"draft_depth\":true}", "{\"draft_depth\":null}",
     }) |text| try testing.expectError(error.Glm5NextDraftDepthRange, (try parseSettings(text)).validate());
+    // The lane's acceptance: exact unless named; typical by name; tokenv3 refused as not ported; anything else by name.
+    try testing.expectEqual(MtpAcceptance.exact, on.mtp_acceptance);
+    const typ = try parseSettings("{\"mtp_lane\":true,\"mtp_acceptance\":\"typical\"}");
+    try typ.validate();
+    try testing.expectEqual(MtpAcceptance.typical, typ.mtp_acceptance);
+    try (try parseSettings("{\"mtp_acceptance\":\"exact\"}")).validate();
+    try testing.expectError(error.Glm5NextMtpAcceptanceNotPorted, (try parseSettings("{\"mtp_acceptance\":\"tokenv3\"}")).validate());
+    for ([_][]const u8{ "{\"mtp_acceptance\":\"greedy\"}", "{\"mtp_acceptance\":1}", "{\"mtp_acceptance\":null}" }) |text|
+        try testing.expectError(error.Glm5NextMtpAcceptanceSetting, (try parseSettings(text)).validate());
     // The dump route: an absolute directory, else refused by name; absent, none.
     const dumped = try parseSettings("{\"logits_dump_dir\":\"/tmp/kl/incoming\"}");
     try dumped.validate();

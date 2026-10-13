@@ -64,6 +64,14 @@ pub const max_depth: u32 = settings.trained_draft_depth;
 pub const verify_rows: u32 = max_depth + 1;
 /// The lane's acceptance: exact only.
 pub const rule: acc.Rule = .exact;
+
+/// The lane's rule for `settings.mtp_acceptance` (construction).
+pub fn ruleOf(m: settings.MtpAcceptance) acc.Rule {
+    return switch (m) {
+        .exact => .exact,
+        .typical => .{ .typical = .{ .delta = settings.typical_delta } },
+    };
+}
 pub const lane_name = "glm5_next-mtp exact";
 /// Pairs one catch-up call appends (the prompt's, in chunks): the trunk's attention span (its DSA call shapes).
 pub const append_rows: u32 = graph.span_rows;
@@ -515,6 +523,8 @@ pub const Lane = struct {
     untracked_logged: bool = false,
     /// Drafts per round at most (`settings.draft_depth`, 1 .. `max_depth`; construction).
     depth: u32 = max_depth,
+    /// The acceptance rule (`settings.mtp_acceptance`, `ruleOf`; construction).
+    rule: acc.Rule = .exact,
     /// The request's counters (MiMo's: rounds, drafted, accepted, generated, corrected; the stream's at the decode start).
     stats: mimo_draft.Stats = .{},
     /// The request's acceptance by draft position (the receipt's tail).
@@ -531,7 +541,7 @@ pub const Lane = struct {
     /// arch's weight map with the MTP layer's residents kept and read), every record read into the bank's MLX arrays and
     /// checked, the lanes allocated at `cap` positions plus `max_depth`; `depth` drafts a round at most (`draft_depth`,
     /// 1 .. `max_depth`, validated with the settings). Device work: the module's construction, under the GPU lock.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, depth: u32, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, depth: u32, accept: acc.Rule, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
         std.debug.assert(depth >= 1 and depth <= max_depth);
         var db = try DraftBank.open(gpa, io, dir, c, diag);
         defer db.deinit();
@@ -541,7 +551,7 @@ pub const Lane = struct {
         const self = try gpa.create(Lane);
         errdefer gpa.destroy(self);
         const lanes_cap = cap + max_depth;
-        self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth };
+        self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth, .rule = accept };
         self.head = try Head.bind(gpa, g.s, map, c, diag);
         errdefer self.head.deinit(gpa);
         const n: u32 = c.n_routed_experts;
@@ -572,7 +582,7 @@ pub const Lane = struct {
         for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         self.held_bytes = heldOf(&held, std.heap.pageSize());
-        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=coupled_sample bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
+        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=coupled_sample bank={s} experts={d} lanes={d} positions measured_bytes={d} acceptance={s}\n", .{ lane_name, depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, @tagName(accept) });
         return self;
     }
 

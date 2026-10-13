@@ -762,3 +762,35 @@ test "glm5_next mtp coupled drafts: a sampled draft drawn from the head's q at t
     try testing.expect(rate_coupled > rate_argmax);
     try noDevice();
 }
+
+test "glm5_next mtp acceptance setting: exact is today's rule; typical (delta 0.5) keeps more of a noisy head's drafts than exact on a synthetic (p, q) pair, its emitted tokens still drawn from the target" {
+    try testing.expectEqual(acc.Rule.exact, mtp.ruleOf(.exact));
+    try testing.expectEqual(@as(f32, 0.5), mtp.ruleOf(.typical).typical.delta);
+    const V = 64;
+    var row: [V]f32 = undefined;
+    var kept: [2]u64 = @splat(0);
+    for ([_]acc.Rule{ mtp.ruleOf(.exact), mtp.ruleOf(.typical) }, 0..) |rule, ri| for (0..16) |seed| {
+        const s: acc.Params = .{ .temperature = 1.0, .top_p = 0.95, .seed = 11 + seed };
+        var len: u64 = 1;
+        var t1: u32 = @intCast(seed % V);
+        while (len < 200) {
+            var drafts: [3]u32 = undefined;
+            var logits: [4 * V]f32 = undefined;
+            var prev = t1;
+            targetRow(t1, len + 1, logits[0..V]);
+            for (0..3) |i| {
+                draftRow(prev, len + 1 + i, &row);
+                drafts[i] = argmax(&row);
+                prev = drafts[i];
+                targetRow(prev, len + 2 + i, logits[(i + 1) * V ..][0..V]);
+            }
+            const r = acc.accept(rule, s, &logits, &drafts, null, len);
+            kept[ri] += r.n_accepted;
+            len += r.n_accepted + 1;
+            t1 = r.next_token;
+        }
+    };
+    std.debug.print("GLM5N_MTP_ACCEPTANCE kept exact={d} typical={d}\n", .{ kept[0], kept[1] });
+    try testing.expect(kept[1] >= kept[0]);
+    try noDevice();
+}
