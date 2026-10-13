@@ -19,10 +19,12 @@ const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const fp8 = @import("fp8.zig");
 const kda_percore = @import("kda_percore.zig");
+const kda_prologue = @import("kda_prologue.zig");
 
 comptime {
-    // kda_percore.zig's tests run with this file's (src/tests.zig lists kda.zig).
+    // kda_percore.zig's and kda_prologue.zig's tests run with this file's (src/tests.zig lists kda.zig).
     _ = kda_percore;
+    _ = kda_prologue;
 }
 
 pub const G = ops_be.MlxOps;
@@ -159,24 +161,19 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
     const dim: c_int = hv * dk;
     const cdim: c_int = 3 * dim;
     const taps: c_int = @intCast(c.kda_conv);
-    // The short conv over [q | k | v], f32, its window the state's tail then the rows.
-    const qkv = try g.astype(try g.concat(&.{ try fp8.project(g, w.q, x), try fp8.project(g, w.k, x), try fp8.project(g, w.v, x) }, 2), .float32);
-    const tail = st.conv orelse try g.zeros(&.{ 1, taps - 1, cdim }, .float32);
-    const window = try g.concat(&.{ tail, qkv }, 1);
-    var conv_raw = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_conv1d(&conv_raw, window, w.conv_w, 1, 0, 1, cdim, g.s));
-    const conv = try g.astype(try g.silu(try g.adopt(conv_raw)), .bfloat16);
-    // Its own buffer (times one): a view would keep the whole window alive across tokens.
-    const next_tail = try g.mul(try g.slice(window, &.{ 0, rows, 0 }, &.{ 1, rows + taps - 1, cdim }, &.{ 1, 1, 1 }), try g.scalar(1.0, .float32));
     const head4 = [_]c_int{ 1, rows, hv, dk };
-    const q = try g.reshape(try g.slice(conv, &.{ 0, 0, 0 }, &.{ 1, rows, dim }, &.{ 1, 1, 1 }), &head4);
-    const k = try g.reshape(try g.slice(conv, &.{ 0, 0, dim }, &.{ 1, rows, 2 * dim }, &.{ 1, 1, 1 }), &head4);
-    const v = try g.reshape(try g.slice(conv, &.{ 0, 0, 2 * dim }, &.{ 1, rows, cdim }, &.{ 1, 1, 1 }), &head4);
-    // q = rms_norm(q) / dk and k = rms_norm(k) / sqrt(dk): the L2 norms with the reference's scales.
-    const ones = try g.ones(&.{dk}, .bfloat16);
-    const inv_dk = 1.0 / @as(f64, @floatFromInt(dk));
-    const qs = try g.mul(try rmsNormOnes(g, q, ones, 1e-6), try g.scalar(inv_dk, .bfloat16));
-    const ks = try g.mul(try rmsNormOnes(g, k, ones, 1e-6), try g.scalar(@sqrt(inv_dk), .bfloat16));
+    // The prologue (the short conv, SiLU, the q / k norms, the next tail) from the three projections and the state's
+    // tail: past the decode lane the prompt prologue installed at construction (kda_prologue.zig), else the op chain.
+    // The MTP verify's capture keeps the op chain (it captures the conv window).
+    const qp = try fp8.project(g, w.q, x);
+    const kp = try fp8.project(g, w.k, x);
+    const vp = try fp8.project(g, w.v, x);
+    const tail = st.conv orelse try g.zeros(&.{ 1, taps - 1, cdim }, .float32);
+    const pro = if (capture) try prologueOps(g, c, w, qp, kp, vp, tail) else try kda_prologue.spanPrologue(rows)(g, c, w, qp, kp, vp, tail);
+    const qs = pro.q;
+    const ks = pro.k;
+    const v = pro.v;
+    const next_tail = pro.next_tail;
     // The forget gate's pre-activation per key channel (each route makes the gate of it), beta, the state.
     const a = try linear(g, try fp8.project(g, w.f_a, x), w.f_b);
     const beta = try g.sigmoid(try fp8.project(g, w.b, x));
@@ -185,7 +182,7 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
         // The MTP verify's rows: the stock kernel's capture variant over the f32 gate.
         const rs = try recurSeq(g, qs, ks, v, try gateOf(g, c, w, a), beta, state, rows, hv, dk);
         cap.release(g);
-        cap.* = .{ .seq = g.keep(rs.seq), .window = g.keep(window), .rows = @intCast(rows) };
+        cap.* = .{ .seq = g.keep(rs.seq), .window = g.keep(pro.window.?), .rows = @intCast(rows) };
         break :blk Recur{ .y = rs.y, .state = rs.state };
     } else blk: {
         // The span's route: past the decode lane the prompt route installed at construction, else the per-token route.
@@ -199,6 +196,48 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
     const gated = try g.mul(try g.adopt(yn), try g.sigmoid(z));
     st.set(g, next_tail, r.state);
     return fp8.project(g, w.o, try g.reshape(gated, &.{ 1, rows, dim }));
+}
+
+/// One span's prologue: q and k [1, R, hv, dk] bf16 (normalized and scaled), v [1, R, hv, dk] bf16, the next conv tail
+/// f32 [1, taps - 1, conv dim], and (the op chain's only) the conv window the MTP capture keeps.
+pub const Prologue = struct { q: T, k: T, v: T, next_tail: T, window: ?T = null };
+
+/// A prologue route over one span: the q / k / v projections [1, R, hv * dk] (the trunk's dtype) and the state's conv
+/// tail f32 [1, taps - 1, conv dim] -> `Prologue`.
+pub const PrologueFn = fn (g: *G, c: *const glm.Config, w: *const Weights, qp: T, kp: T, vp: T, tail: T) anyerror!Prologue;
+
+/// The op chain (the decode lane's, the capture's, and the prompt pass's control): the short conv over [q | k | v] in
+/// f32, its window the state's tail then the rows; SiLU; bf16; q = rms_norm(q) / dk and k = rms_norm(k) / sqrt(dk) (the
+/// L2 norms with the reference's scales).
+pub fn prologueOps(g: *G, c: *const glm.Config, w: *const Weights, qp: T, kp: T, vp: T, tail: T) anyerror!Prologue {
+    const rows = g.shapeOf(qp).dim(1);
+    const hv: c_int = @intCast(c.kda_heads);
+    const dk: c_int = @intCast(c.kda_head_dim);
+    const dim: c_int = hv * dk;
+    const cdim: c_int = 3 * dim;
+    const taps: c_int = @intCast(c.kda_conv);
+    const qkv = try g.astype(try g.concat(&.{ qp, kp, vp }, 2), .float32);
+    const window = try g.concat(&.{ tail, qkv }, 1);
+    var conv_raw = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_conv1d(&conv_raw, window, w.conv_w, 1, 0, 1, cdim, g.s));
+    const conv = try g.astype(try g.silu(try g.adopt(conv_raw)), .bfloat16);
+    // Its own buffer (times one): a view would keep the whole window alive across tokens.
+    const next_tail = try g.mul(try g.slice(window, &.{ 0, rows, 0 }, &.{ 1, rows + taps - 1, cdim }, &.{ 1, 1, 1 }), try g.scalar(1.0, .float32));
+    const head4 = [_]c_int{ 1, rows, hv, dk };
+    const q = try g.reshape(try g.slice(conv, &.{ 0, 0, 0 }, &.{ 1, rows, dim }, &.{ 1, 1, 1 }), &head4);
+    const k = try g.reshape(try g.slice(conv, &.{ 0, 0, dim }, &.{ 1, rows, 2 * dim }, &.{ 1, 1, 1 }), &head4);
+    const v = try g.reshape(try g.slice(conv, &.{ 0, 0, 2 * dim }, &.{ 1, rows, cdim }, &.{ 1, 1, 1 }), &head4);
+    const ones = try g.ones(&.{dk}, .bfloat16);
+    const scales = qkScales(c);
+    const qs = try g.mul(try rmsNormOnes(g, q, ones, 1e-6), try g.scalar(scales.q, .bfloat16));
+    const ks = try g.mul(try rmsNormOnes(g, k, ones, 1e-6), try g.scalar(scales.k, .bfloat16));
+    return .{ .q = qs, .k = ks, .v = v, .next_tail = next_tail, .window = window };
+}
+
+/// The q / k scales (1 / dk and 1 / sqrt(dk)), as f64 for `G.scalar` (both prologue routes take the same bf16 scalars).
+pub fn qkScales(c: *const glm.Config) struct { q: f64, k: f64 } {
+    const inv_dk = 1.0 / @as(f64, @floatFromInt(c.kda_head_dim));
+    return .{ .q = inv_dk, .k = @sqrt(inv_dk) };
 }
 
 pub const Recur = struct { y: T, state: T };

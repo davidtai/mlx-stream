@@ -7,7 +7,8 @@
 //! control; `stock`, MLX's gathers, the texts' control); `decode_glue` the decode lane's glue (`fused`, the default: the
 //! mHC hcPre chain, the router and top-8 texts, the combine with the shared expert's add, glue.zig; `ops`, the stock op
 //! chains, the control); `decode_kda` the decode lane's KDA layer (`fused`, the default: one text a layer, kda_decode.zig;
-//! `ops`, the op chain, the control); `decode_dsa` the decode lane's sparse latent attention (`fused`, the default: two
+//! `ops`, the op chain, the control); `kda_prologue` the KDA prompt pass's prologue (`fused`, the default: one text a span,
+//! kda_prologue.zig, exact; `ops`, the op chain, the control); `decode_dsa` the decode lane's sparse latent attention (`fused`, the default: two
 //! texts, dsa_decode.zig; `ops`, the op chain, the control); `decode_predict` the lookahead predictor's router weight
 //! (`bf16`, the default: the stored BF16 weight; `f32`, the transposed F32 copy, the control); `decode_swiglu` the decode lane's MLP activation
 //! (`fused`, the default: one text, swiglu.zig; `ops`, the op chain, the control); `gpu_keep_warm` MiMo's X12 route
@@ -85,7 +86,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -114,6 +115,10 @@ pub const DecodeGlue = enum { ops, fused };
 /// in its BF16-gate variant (the conv, the gate stages, the norms, the gate, the delta rule and the gated norm in one
 /// dispatch; the projections stay GEMVs); `ops` the op chain (the control). Rounding-class against `ops`.
 pub const DecodeKda = enum { ops, fused };
+/// The KDA prompt pass's prologue, installed once at construction (kda_prologue.zig): `fused` the conv, SiLU, the q / k
+/// norms and the next tail in one text, each step MLX's kernel for the op it replaces (the op chain's bits); `ops` the op
+/// chain (the control). Exact against `ops`. On a CPU stream the default resolves to `ops`.
+pub const KdaPrologue = enum { ops, fused };
 /// The decode lane's DSA sparse latent attention, installed once at construction (dsa_decode.zig): `fused` a split text
 /// (MiMo's dec_attn split pattern for MLA over the selected latent rows) and MiMo's merge text; `ops` the op chain (the
 /// control). Rounding-class against `ops`.
@@ -246,6 +251,8 @@ pub const Config = struct {
     decode_glue: DecodeGlue = .fused,
     /// The decode lane's KDA layer (kda_decode.zig): `fused` (the default) or `ops` (the op chain, the control).
     decode_kda: DecodeKda = .fused,
+    /// The KDA prompt pass's prologue (kda_prologue.zig): `fused` (the default) or `ops` (the op chain, the control).
+    kda_prologue: KdaPrologue = .fused,
     /// The decode lane's DSA sparse latent attention (dsa_decode.zig): `fused` (the default) or `ops` (the control).
     decode_dsa: DecodeDsa = .fused,
     /// The lookahead predictor's router weight: `bf16` (the default) or `f32` (the control).
@@ -275,7 +282,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -302,6 +309,10 @@ pub const Config = struct {
         if (raw.object.get("decode_kda")) |v| {
             const route: ?DecodeKda = if (v == .string) std.meta.stringToEnum(DecodeKda, v.string) else null;
             if (route) |r| c.decode_kda = r else c.malformed.decode_kda = true;
+        }
+        if (raw.object.get("kda_prologue")) |v| {
+            const route: ?KdaPrologue = if (v == .string) std.meta.stringToEnum(KdaPrologue, v.string) else null;
+            if (route) |r| c.kda_prologue = r else c.malformed.kda_prologue = true;
         }
         if (raw.object.get("decode_dsa")) |v| {
             const route: ?DecodeDsa = if (v == .string) std.meta.stringToEnum(DecodeDsa, v.string) else null;
@@ -398,6 +409,7 @@ pub const Config = struct {
         if (c.mtp_lane and c.model.mtp_fp8) return error.Glm5NextMtpResidentsFp8;
         if (c.malformed.decode_glue) return error.Glm5NextDecodeGlueSetting;
         if (c.malformed.decode_kda) return error.Glm5NextDecodeKdaSetting;
+        if (c.malformed.kda_prologue) return error.Glm5NextKdaPrologueSetting;
         if (c.malformed.decode_dsa) return error.Glm5NextDecodeDsaSetting;
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
@@ -507,6 +519,11 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(DecodeKda.ops, (try parseSettings("{\"decode_kda\":\"ops\"}")).decode_kda);
     try testing.expectError(error.Glm5NextDecodeKdaSetting, (try parseSettings("{\"decode_kda\":\"percore\"}")).validate());
     try testing.expectError(error.Glm5NextDecodeKdaSetting, (try parseSettings("{\"decode_kda\":0}")).validate());
+    // The KDA prompt prologue: fused unless named; ops (the control) by name; anything else refused by name.
+    try testing.expectEqual(KdaPrologue.fused, pinned.kda_prologue);
+    try testing.expectEqual(KdaPrologue.ops, (try parseSettings("{\"kda_prologue\":\"ops\"}")).kda_prologue);
+    try testing.expectError(error.Glm5NextKdaPrologueSetting, (try parseSettings("{\"kda_prologue\":\"percore\"}")).validate());
+    try testing.expectError(error.Glm5NextKdaPrologueSetting, (try parseSettings("{\"kda_prologue\":1}")).validate());
     // The decode DSA attention: fused unless named; ops (the control) by name; anything else refused by name.
     try testing.expectEqual(DecodeDsa.fused, pinned.decode_dsa);
     try testing.expectEqual(DecodeDsa.ops, (try parseSettings("{\"decode_dsa\":\"ops\"}")).decode_dsa);

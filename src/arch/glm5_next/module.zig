@@ -17,6 +17,7 @@ const graph = @import("graph.zig");
 const experts = @import("experts.zig");
 const kda = @import("kda.zig");
 const kda_percore = @import("kda_percore.zig");
+const kda_prologue = @import("kda_prologue.zig");
 const dsa = @import("dsa.zig");
 /// The DSA indexer's prepared decode launches (`SelectPlan`).
 const ops_dsa = @import("ops.zig");
@@ -132,6 +133,8 @@ pub const Module = struct {
         try ops_dsa.install(glue.hcGeometry(model, self.w.layers[0].input_norm));
         // The KDA prompt route, once: the per-core kernel where this GPU's plan and probe take it, else the per-token one.
         const kda_route = try kda_percore.install(&self.g, &self.c.model);
+        // The KDA prompt prologue (`kda_prologue`), once: the fused text on a GPU stream unless the setting names the op chain.
+        const kda_prologue_route = try kda_prologue.install(&self.g, &self.c.model, self.c.kda_prologue);
         // The decode glue (`decode_glue`): the fused texts installed here (their geometry, the launches per decode-lane
         // width, one launch of each over the model's own tables), refused by name; the stock op chains otherwise.
         if (self.c.decode_glue == .fused) {
@@ -255,7 +258,7 @@ pub const Module = struct {
             log.info("glm5_next logits_dump: on dir={s} chunk_rows={d} chunk_bytes={d} (one safetensors file per prompt pass: logits F32 [prompt rows, {d}], token_ids I32, ids_int32_sha256; written before the request returns)\n", .{ d, graph.dump_chunk_rows, dump.chunkBytes(graph.dump_chunk_rows, model.vocab_size, model.hidden_size), model.vocab_size });
         }
         if (self.mtp == null) log.info("glm5_next MTP lane: off (serial; set {{\"mtp_lane\":true}})\n", .{});
-        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s} residents={s} decode_glue={s} decode_kda={s} decode_dsa={s} decode_predict={s} decode_swiglu={s} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ routes.dsa.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route), @tagName(self.c.model.residents_format), @tagName(self.c.decode_glue), @tagName(self.c.decode_kda), @tagName(self.c.decode_dsa), @tagName(self.c.decode_predict), @tagName(self.c.decode_swiglu), @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
+        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s} kda_prologue={s} residents={s} decode_glue={s} decode_kda={s} decode_dsa={s} decode_predict={s} decode_swiglu={s} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ routes.dsa.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route), @tagName(kda_prologue_route), @tagName(self.c.model.residents_format), @tagName(self.c.decode_glue), @tagName(self.c.decode_kda), @tagName(self.c.decode_dsa), @tagName(self.c.decode_predict), @tagName(self.c.decode_swiglu), @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
         // The prompt levers' engagement lines (glm5next/prefill-levers; docs/glm5-next.md "Prompt levers").
         if (experts.prompt_relocate) log.info("glm5_next prompt lever 1: read-ahead relocation engaged (a read-ahead record the plans evict before any hit is copied at the plans into its later transient row: read once; exact)\n", .{});
         log.info("glm5_next prompt lever 3: prompt kernels warmed at load in {d} ms (KDA layer {d}: {d} spans; dense layer {d}: one {d}-row tile; DSA layer {d}: {d} spans of {d} rows; the {s} combine; token-identical)\n", .{ warmed.ns / std.time.ns_per_ms, warmed.plan.kda_layer, warmed.plan.kda_spans, warmed.plan.dense_layer, graph.dense_tile_rows, warmed.plan.dsa_layer, warmed.plan.dsa_spans, graph.span_rows, @tagName(self.src.combine_route) });
