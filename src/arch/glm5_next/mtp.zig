@@ -73,6 +73,17 @@ pub fn ruleOf(m: settings.MtpAcceptance) acc.Rule {
     };
 }
 pub const lane_name = "glm5_next-mtp exact";
+/// The typical rule's lane name (MiMo's form, "mtp typical <delta>"): the receipt and the install line name the rule in play.
+pub const lane_name_typical = "glm5_next-mtp typical 0.5";
+comptime {
+    if (settings.typical_delta != 0.5) @compileError("lane_name_typical names delta 0.5");
+}
+pub fn nameOf(r: acc.Rule) []const u8 {
+    return switch (r) {
+        .exact => lane_name,
+        .typical => lane_name_typical,
+    };
+}
 /// Pairs one catch-up call appends (the prompt's, in chunks): the trunk's attention span (its DSA call shapes).
 pub const append_rows: u32 = graph.span_rows;
 /// Serial steps whose hidden the lane keeps for a later round; past them the lane stops tracking the request.
@@ -582,7 +593,7 @@ pub const Lane = struct {
         for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         self.held_bytes = heldOf(&held, std.heap.pageSize());
-        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=coupled_sample bank={s} experts={d} lanes={d} positions measured_bytes={d} acceptance={s}\n", .{ lane_name, depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, @tagName(accept) });
+        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=coupled_sample bank={s} experts={d} lanes={d} positions measured_bytes={d} acceptance={s}\n", .{ nameOf(accept), depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, @tagName(accept) });
         return self;
     }
 
@@ -771,7 +782,7 @@ pub const Lane = struct {
     /// The request's line at its end (MiMo's receipt form; the expert stream's counters at the decode start and now),
     /// then the lane's depth and its acceptance by draft position (`Positions.write`).
     pub fn line(self: *const Lane, buf: []u8, now: sdk_ext.expert.Stats) []const u8 {
-        const head = self.stats.line(buf, lane_name, now);
+        const head = self.stats.line(buf, nameOf(self.rule), now);
         return buf[0 .. head.len + self.pos.write(buf[head.len..], self.depth).len];
     }
 };

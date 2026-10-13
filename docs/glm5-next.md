@@ -300,7 +300,7 @@ MiMo's draft-lane seam; `MTP.md` lists its integration points). At construction:
 the weight map and read with the trunk, the draft bank (`mtp-experts-nvfp4.bin`, all 288 experts resident in NVFP4)
 read into MLX and checked record by record against its manifest, the head's lanes at the billed positions; what the
 open holds is held to its billed terms (`mtp_bank + mtp_tables + mtp_kv`, else `ConstructionOverBill`). Line:
-`glm5_next MTP lane installed: lane="glm5_next-mtp exact" depth=3 verify_rows=4 ...` (off: `glm5_next MTP lane: off
+`glm5_next MTP lane installed: lane="glm5_next-mtp exact" depth=3 verify_rows=4 ...` (`lane="glm5_next-mtp typical 0.5"` with `{"mtp_acceptance":"typical"}`; the `[spec-stats]` receipt names the same lane) (off: `glm5_next MTP lane: off
 (serial; set {"mtp_lane":true})`).
 
 A request: the prompt pass hands the lane every row's final-normed hidden (`graph.Head.hidden`), each pair whose next

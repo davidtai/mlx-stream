@@ -181,7 +181,7 @@ pub const draft_lane = struct {
 
     pub fn laneName(m: *const Module) []const u8 {
         if (comptime !host_caps.dsa_nax) unreachable;
-        return if (m.mtp != null) mtp.lane_name else "serial";
+        return if (m.mtp) |l| mtp.nameOf(l.rule) else "serial";
     }
 
     /// The exact rule's arms (MiMo's): a clean greedy request `.greedy`, a clean sampled one `.stochastic`; logprobs,

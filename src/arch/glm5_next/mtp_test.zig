@@ -766,6 +766,8 @@ test "glm5_next mtp coupled drafts: a sampled draft drawn from the head's q at t
 test "glm5_next mtp acceptance setting: exact is today's rule; typical (delta 0.5) keeps more of a noisy head's drafts than exact on a synthetic (p, q) pair, its emitted tokens still drawn from the target" {
     try testing.expectEqual(acc.Rule.exact, mtp.ruleOf(.exact));
     try testing.expectEqual(@as(f32, 0.5), mtp.ruleOf(.typical).typical.delta);
+    try testing.expectEqualStrings("glm5_next-mtp exact", mtp.nameOf(mtp.ruleOf(.exact)));
+    try testing.expectEqualStrings("glm5_next-mtp typical 0.5", mtp.nameOf(mtp.ruleOf(.typical)));
     const V = 64;
     var row: [V]f32 = undefined;
     var kept: [2]u64 = @splat(0);
