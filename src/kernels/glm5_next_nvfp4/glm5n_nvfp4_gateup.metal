@@ -11,9 +11,9 @@ const device uint32_t* wg = b == 0u ? gate_w0 : (b == 1u ? gate_w1 : gate_w2);
 const device uint8_t* sg_ = b == 0u ? gate_s0 : (b == 1u ? gate_s1 : gate_s2);
 const device uint32_t* wu = b == 0u ? up_w0 : (b == 1u ? up_w1 : up_w2);
 const device uint8_t* su_ = b == 0u ? up_s0 : (b == 1u ? up_s1 : up_s2);
-// fp_dequantize's `*global_scale / (F8E4M3_MAX * F4E2M1_MAX)`, read by value (a bank under 8 slots passes `constant`)
-const float ginv = (b == 0u ? float(gate_g0[slot]) : (b == 1u ? float(gate_g1[slot]) : float(gate_g2[slot]))) / 2688.0f;
-const float uinv = (b == 0u ? float(up_g0[slot]) : (b == 1u ? float(up_g1[slot]) : float(up_g2[slot]))) / 2688.0f;
+// fp_dequantize's `*global_scale / (F8E4M3_MAX * F4E2M1_MAX)`, read by value from the slot's own line (glm5n_g_at)
+const float ginv = (b == 0u ? float(gate_g0[glm5n_g_at(slot)]) : (b == 1u ? float(gate_g1[glm5n_g_at(slot)]) : float(gate_g2[glm5n_g_at(slot)]))) / 2688.0f;
+const float uinv = (b == 0u ? float(up_g0[glm5n_g_at(slot)]) : (b == 1u ? float(up_g1[glm5n_g_at(slot)]) : float(up_g2[glm5n_g_at(slot)]))) / 2688.0f;
 constexpr int KW2 = K / 16;
 constexpr int KG = K / GS;
 constexpr int NC = K / 512;

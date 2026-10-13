@@ -76,10 +76,64 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             return true;
         }
 
-        /// One slot row of component `c` in `layer`'s slots: the segment of each of a routed id's records, back to back.
-        /// Host rows and MLX rows alike.
+        /// Scale-line isolation (a bank's `slot_line_bytes`, glm5_next's NVFP4 bank): every slot row of every component
+        /// starts on its own line of this many bytes, so a row the read pool writes after a command buffer commits never
+        /// shares a GPU cache line with another slot's row. A component whose row is shorter than a line (a 4-byte global
+        /// scale) is padded to one line per slot: its array is [rows, line / itemsize] and the pool writes the row's first
+        /// `length` bytes; the kernels read word 0 of the slot's line. 0 (every other bank): rows back to back, as before.
+        pub const slot_line_bytes: u64 = if (@hasDecl(B, "slot_line_bytes")) B.slot_line_bytes else 0;
+        /// A padded component's array is never smaller than this many bytes (a bank's `slot_min_bytes`): its own Metal
+        /// buffer, never a sub-allocation of MLX's small-buffer heap (< 256 B) beside foreign buffers, and never an input
+        /// MLX passes in the `constant` address space (< 8 elements).
+        pub const slot_min_bytes: u64 = if (@hasDecl(B, "slot_min_bytes")) B.slot_min_bytes else 0;
+
+        comptime {
+            if (slot_line_bytes != 0 and (!std.math.isPowerOfTwo(slot_line_bytes) or slot_min_bytes < 256 or slot_min_bytes % slot_line_bytes != 0))
+                @compileError("expert stream: a bank's slot_line_bytes must be a power of two and its slot_min_bytes a multiple of it, at least MLX's small-buffer threshold");
+        }
+
+        /// One slot row of component `c` in `layer`'s slots: the segment of each of a routed id's records, back to back,
+        /// padded to `slot_line_bytes` when the bank isolates lines. Host rows and MLX rows alike.
         pub fn rowBytes(layer: *const Layer, c: usize) u64 {
-            return layer.segments[c].length * minisOf(layer);
+            const n = layer.segments[c].length * minisOf(layer);
+            return if (slot_line_bytes == 0) n else std.mem.alignForward(u64, n, slot_line_bytes);
+        }
+
+        /// Whether component `c`'s rows are padded past their segment (line isolation of a short row).
+        pub fn padded(layer: *const Layer, c: usize) bool {
+            return rowBytes(layer, c) != layer.segments[c].length * minisOf(layer);
+        }
+
+        /// The rows component `c`'s array holds for `rows` slot rows: `rows` x minis, and for a padded component at least
+        /// `slot_min_bytes` of rows (the rows past `rows` are never addressed).
+        pub fn allocRows(layer: *const Layer, c: usize, rows: u32) u32 {
+            const n = rows * minisOf(layer);
+            if (!padded(layer, c)) return n;
+            return @max(n, @as(u32, @intCast(std.math.divCeil(u64, slot_min_bytes, rowBytes(layer, c)) catch unreachable)));
+        }
+
+        /// The MLX shape of component `c`'s array for `rows` slot rows into `shape`; returns its rank. A padded component
+        /// (a scalar segment, one record per id: refused otherwise, `SlotLineGeometry`) is [allocRows, line / itemsize].
+        pub fn arrayShape(layer: *const Layer, c: usize, rows: u32, shape: *[4]c_int) !usize {
+            const seg = layer.segments[c];
+            if (padded(layer, c)) {
+                // A scalar segment's length is its element's size.
+                const item = seg.length;
+                if (seg.rank != 0 or minisOf(layer) != 1 or item == 0 or rowBytes(layer, c) % item != 0) return error.SlotLineGeometry;
+                shape[0] = @intCast(allocRows(layer, c, rows));
+                shape[1] = @intCast(rowBytes(layer, c) / item);
+                return 2;
+            }
+            shape[0] = @intCast(rows * minisOf(layer));
+            for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
+            return seg.rank + 1;
+        }
+
+        /// The bytes of component `c`'s array for `rows` slot rows (`arrayShape`'s): the stream's frees and the bill's
+        /// slot terms.
+        pub fn arrayBytes(layer: *const Layer, c: usize, rows: u32) u64 {
+            if (padded(layer, c)) return @as(u64, allocRows(layer, c, rows)) * rowBytes(layer, c);
+            return @as(u64, rows) * rowBytes(layer, c);
         }
 
         pub const HostSlotRows = struct {
@@ -145,11 +199,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer b.deinit();
                 for (layer.segments, 0..) |seg, c| {
                     var shape: [4]c_int = undefined;
-                    shape[0] = @intCast(rows * minisOf(layer));
-                    for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
+                    const ndim = try arrayShape(layer, c, rows, &shape);
                     const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_zeros(&b.arrays[c], &shape, seg.rank + 1, dtype, stream));
+                    try mlx.check(mlx.mlx_zeros(&b.arrays[c], &shape, ndim, dtype, stream));
                     b.row_bytes[c] = rowBytes(layer, c);
                 }
                 return b;
@@ -161,11 +214,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer b.deinit();
                 for (layer.segments, 0..) |seg, c| {
                     var shape: [4]c_int = undefined;
-                    shape[0] = @intCast(rows * minisOf(layer));
-                    for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
+                    const ndim = try arrayShape(layer, c, rows, &shape);
                     const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
-                    if (dsv41_alloc_uninit(&b.arrays[c], &shape, seg.rank + 1, dtype) != 0) return error.MlxUnfilledAlloc;
+                    if (dsv41_alloc_uninit(&b.arrays[c], &shape, ndim, dtype) != 0) return error.MlxUnfilledAlloc;
                     b.row_bytes[c] = rowBytes(layer, c);
                 }
                 try b.bind();
@@ -970,7 +1022,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const off = self.bank.recordOffset(r.layer, e);
                     for (l.segments, 0..) |seg, c| {
                         const row = self.slotRow(r.layer, slot, @enumFromInt(c));
-                        try std.testing.expectEqual(minisOf(l) * seg.length, row.len);
+                        try std.testing.expectEqual(rowBytes(l, c), row.len);
                         for (0..minisOf(l)) |mi| try std.testing.expectEqualSlices(u8, image[off + mi * miniStride(l) + seg.offset ..][0..seg.length], row[mi * seg.length ..][0..seg.length]);
                     }
                 }
@@ -2588,9 +2640,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// The prompt scratch's bytes (`regrowTransient` allocates them).
             pub fn promptTransientBytes(self: *const Stream) u64 {
                 var n: u64 = 0;
-                for (self.bank.layers[self.transient_layer].segments) |seg| n += seg.length * minisOf(&self.bank.layers[self.transient_layer]);
-                if (self.alt) |x| for (self.bank.layers[x.layer].segments) |seg| {
-                    n += seg.length * minisOf(&self.bank.layers[x.layer]);
+                for (0..n_components) |c| n += rowBytes(&self.bank.layers[self.transient_layer], c);
+                if (self.alt) |x| for (0..n_components) |c| {
+                    n += rowBytes(&self.bank.layers[x.layer], c);
                 };
                 return n * self.prompt_transient_rows;
             }

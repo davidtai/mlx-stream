@@ -412,10 +412,12 @@ pub const DraftBank = struct {
         return &b.view.layers[0];
     }
 
-    /// The draft bank's arrays as MLX allocates them: each component [experts, ...] in its own buffer.
+    /// The draft bank's arrays as MLX allocates them: each component [experts, ...] in its own buffer, the global
+    /// scales line-isolated ([experts, 32] f32: `Slots.arrayShape`, bank.zig `scale_line_bytes`).
     pub fn arrayBytes(g: *const bank.Geometry, page: u64) u64 {
+        const l: bank.Layer = .{ .logical_bytes = g.logical_bytes, .base_offset = 0, .segments = g.segments };
         var n: u64 = 0;
-        for (g.segments) |s| n += graph.bufferBytes(@as(u64, g.num_experts) * s.length, page);
+        for (0..bank.n_components) |c| n += graph.bufferBytes(Slots.arrayBytes(&l, c, g.num_experts), page);
         return n;
     }
 
@@ -454,7 +456,8 @@ pub const DraftBank = struct {
         }
         for (ids, rows_at) |e, r| {
             var h = std.crypto.hash.sha2.Sha256.init(.{});
-            for (0..bank.n_components) |ci| h.update(rows.row(@fromBackingInt(@intCast(ci)), r));
+            // Each component's record bytes at its row's start (a line-isolated global scale's row is a 128-byte line).
+            for (b.owner.geometry.segments, 0..) |seg, ci| h.update(rows.row(@fromBackingInt(@intCast(ci)), r)[0..@intCast(seg.length)]);
             if (!std.mem.eql(u8, &h.finalResult(), &b.owner.digests[e])) return refuse(diag, error.Glm5NextMtpBankDigest, "{s}: expert {d}: sha256 differs from the manifest's", .{ bank.mtp_files.data, e });
         }
     }

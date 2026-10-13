@@ -34,6 +34,9 @@ const T = mlx.mlx_array;
 
 const parity_bound_bytes: u64 = 1_200_000_000;
 const slots: u32 = 8;
+/// f32 per global-scale line (bank.zig `scale_line_floats`).
+const gl: c_int = @import("bank.zig").scale_line_floats;
+const gl_n: usize = @import("bank.zig").scale_line_floats;
 const H: u32 = xk.hidden;
 const I: u32 = xk.inter;
 const record_bytes: usize = 14_155_788;
@@ -94,15 +97,16 @@ fn projArrays(a: std.mem.Allocator, g: *ops.MlxOps, recs: []const []const u8, w:
     defer a.free(words);
     const scales = try a.alloc(u8, n * s.len);
     defer a.free(scales);
-    var gs: [slots]f32 = undefined;
+    // Line-isolated global scales (bank.zig `scale_line_bytes`): slot i's word at column 0 of row i, the rest zero.
+    var gs: [slots * gl_n]f32 = @splat(0);
     for (recs, 0..) |r, i| {
         @memcpy(words[i * w.len ..][0..w.len], r[w.off..][0..w.len]);
         @memcpy(scales[i * s.len ..][0..s.len], r[s.off..][0..s.len]);
-        gs[i] = gOf(r, gp);
+        gs[i * gl_n] = gOf(r, gp);
     }
     const wa = try g.hostArray(words, &.{ @intCast(n), @intCast(rows), @intCast(cols / 8) }, .uint32);
     const sa = try g.hostArray(scales, &.{ @intCast(n), @intCast(rows), @intCast(cols / 16) }, .uint8);
-    const ga = try g.hostArray(std.mem.sliceAsBytes(gs[0..n]), &.{@intCast(n)}, .float32);
+    const ga = try g.hostArray(std.mem.sliceAsBytes(gs[0 .. n * gl_n]), &.{ @intCast(n), gl }, .float32);
     try g.evalAll(&.{ wa, sa, ga });
     return .{ .w = g.keep(wa), .scales = g.keep(sa), .global_scale = g.keep(ga) };
 }
@@ -112,7 +116,7 @@ fn dequantF32(g: *ops.MlxOps, p: xk.ProjArrays, slot: u32, rows: u32, cols: u32)
     const sl: c_int = @intCast(slot);
     const w = try g.reshape(try g.slice(p.w, &.{ sl, 0, 0 }, &.{ sl + 1, @intCast(rows), @intCast(cols / 8) }, &.{ 1, 1, 1 }), &.{ @intCast(rows), @intCast(cols / 8) });
     const s = try g.reshape(try g.slice(p.scales, &.{ sl, 0, 0 }, &.{ sl + 1, @intCast(rows), @intCast(cols / 16) }, &.{ 1, 1, 1 }), &.{ @intCast(rows), @intCast(cols / 16) });
-    const gs = try g.slice(p.global_scale, &.{sl}, &.{sl + 1}, &.{1});
+    const gs = try g.reshape(try g.slice(p.global_scale, &.{ sl, 0 }, &.{ sl + 1, 1 }, &.{ 1, 1 }), &.{1});
     var r = mlx.mlx_array_new();
     mlx.check(mlx.mlx_dequantize(&r, w, s, .{}, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", gs, .{ .value = .float32, .has_value = true }, g.s)) catch |e| {
         _ = mlx.mlx_array_free(r);
@@ -125,7 +129,9 @@ fn dequantF32(g: *ops.MlxOps, p: xk.ProjArrays, slot: u32, rows: u32, cols: u32)
 /// f32 output), times g / 2688 of the slot (MLX's divide), rounded to bf16: [1, rows].
 fn stockProj(g: *ops.MlxOps, xf: T, p: xk.ProjArrays, slot: T, rows: u32) !T {
     const y = try g.gatherQmm(xf, p.w, p.scales, slot, .nvfp4);
-    const inv = try g.take(try g.div(p.global_scale, try g.scalar(2688.0, .float32)), slot, 0);
+    const n = g.shapeOf(p.global_scale).d[0];
+    const col0 = try g.reshape(try g.slice(p.global_scale, &.{ 0, 0 }, &.{ n, 1 }, &.{ 1, 1 }), &.{n});
+    const inv = try g.take(try g.div(col0, try g.scalar(2688.0, .float32)), slot, 0);
     return g.astype(try g.mul(try g.reshape(y, &.{ 1, @intCast(rows) }), try g.reshape(inv, &.{ 1, 1 })), .bfloat16);
 }
 

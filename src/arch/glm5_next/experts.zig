@@ -223,6 +223,9 @@ pub const Source = struct {
                 try nvfp4.checkArrays(&self.g, "down", arrays.down, geo.intermediate_size, geo.hidden_size);
             };
         }
+        // Scale-line isolation (bank.zig `scale_line_bytes`): every slot array the stream makes (base, transient, and the
+        // phase change's ext and window 0, by the same `StreamOf.arrayShape`) holds each slot's global scales on its own line.
+        log.info("glm5_next bank: scale lines isolated (each slot's gate/up/down global scale on its own {d}-byte line, f32 [rows, {d}], arrays >= {d} B in their own buffers, device-class; checked on {d} routed layers)\n", .{ bank_mod.scale_line_bytes, bank_mod.scale_line_floats, bank_mod.scale_array_min_bytes, geo.num_moe_layers });
         var math = try Math.init(a, geo, expertActivation);
         errdefer math.deinit(&self.g);
         math.drain = try Math.drainsOf(drain);

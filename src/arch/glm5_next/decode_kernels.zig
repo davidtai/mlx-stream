@@ -31,7 +31,7 @@ pub const selfcheck = @import("decode_kernels_selfcheck.zig");
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/glm5_next_nvfp4/manifest.json (scripts/glm5next_nvfp4_kernels_manifest.py prints it): pins every text.
-pub const manifest_sha256 = "38e703b97dc1d827d74c8104a39e337163d4d547c6d97668906e7c38d6969571";
+pub const manifest_sha256 = "45630c9bded159d97cce3d36d106e1f777bbbf365f4f4da19f29df3cbd07572e";
 pub const format = "mlx-stream-glm5next-nvfp4-kernels-v1";
 const dir = "../../kernels/glm5_next_nvfp4/";
 const prefix = "glm5next nvfp4 kernels";
@@ -381,8 +381,9 @@ pub fn openForTest(a: Allocator, s: mlx.mlx_stream) !*Set {
 // ── The module's install and dispatch ──
 
 /// One projection's slot arrays as the bank scatters them (the arch's `bank.Arrays`): the E2M1 words [slots, out, in / 8]
-/// U32, the E4M3 scales [slots, out, in / 16] U8 and the f32 global scales [slots], whole (the texts' row-contiguous
-/// inputs: a slice would be copied per call).
+/// U32, the E4M3 scales [slots, out, in / 16] U8 and the f32 global scales [>= slots, 32] (one 128-byte line per slot,
+/// its word at column 0: the texts read `g[slot * 32]`, header `glm5n_g_at`), whole (the texts' row-contiguous inputs: a
+/// slice would be copied per call).
 pub const ProjArrays = struct { w: mlx.mlx_array, scales: mlx.mlx_array, global_scale: mlx.mlx_array };
 /// One bank's three projections.
 pub const BankArrays = struct { gate: ProjArrays, up: ProjArrays, down: ProjArrays };
@@ -712,4 +713,22 @@ test "glm5next nvfp4 kernels: every wave width launches at the plan's instantiat
     try testing.expectEqual(@as(i32, 2048), ld.template[2].value.int);
     try testing.expectEqualStrings("H", ld.template[3].name);
     try testing.expectEqual(@as(i32, 4096), ld.template[3].value.int);
+}
+
+test "glm5next nvfp4 kernels: the texts read each slot's global scale at word 0 of its own line (bank.zig scale_line_floats), never a packed index" {
+    const bank = @import("bank.zig");
+    const header = @embedFile(dir ++ "header_glm5n_nvfp4.metal");
+    const gate_up = @embedFile(dir ++ "glm5n_nvfp4_gateup.metal");
+    const down = @embedFile(dir ++ "glm5n_nvfp4_down.metal");
+    // The helper's pitch is the bank's line in f32.
+    const want = std.fmt.comptimePrint("inline size_t glm5n_g_at(size_t slot) {{\n  return slot * size_t({d});\n}}", .{bank.scale_line_floats});
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, header, want));
+    // gate/up reads 6 global-scale inputs (gate, up x 3 banks), down 3, each through the helper; no `_gN[slot]` left.
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, gate_up, "[glm5n_g_at(slot)]"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, down, "[glm5n_g_at(slot)]"));
+    for ([_][]const u8{ gate_up, down }) |t| for ([_][]const u8{ "_g0[slot]", "_g1[slot]", "_g2[slot]" }) |packed_ix| {
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, t, packed_ix));
+    };
+    // The bound global-scale inputs are f32 (manifest), each a [>= slots, 32] array of a page at least: `device` class.
+    try std.testing.expect(bank.scale_array_min_bytes / 4 >= 8);
 }
