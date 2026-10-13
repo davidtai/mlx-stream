@@ -769,7 +769,7 @@ test "glm5_next mtp acceptance setting: exact is today's rule; typical (delta 0.
     try testing.expectEqual(@as(f32, 0.5), mtp.ruleOf(.typical, settings.typical_delta).typical.delta);
     var nb: [mtp.name_cap]u8 = undefined;
     try testing.expectEqualStrings("glm5_next-mtp exact", mtp.nameOf(&nb, mtp.ruleOf(.exact, 0.7)));
-    for ([_]f32{ 0.3, 0.5, 0.7 }, [_][]const u8{ "glm5_next-mtp typical 0.3", "glm5_next-mtp typical 0.5", "glm5_next-mtp typical 0.7" }) |d, want| {
+    for ([_]f32{ 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 }, [_][]const u8{ "glm5_next-mtp typical 0.2", "glm5_next-mtp typical 0.3", "glm5_next-mtp typical 0.4", "glm5_next-mtp typical 0.5", "glm5_next-mtp typical 0.6", "glm5_next-mtp typical 0.7", "glm5_next-mtp typical 0.8" }) |d, want| {
         try testing.expectEqual(d, mtp.ruleOf(.typical, d).typical.delta);
         try testing.expectEqualStrings(want, mtp.nameOf(&nb, mtp.ruleOf(.typical, d)));
     }

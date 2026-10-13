@@ -381,7 +381,7 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     for ([_][]const u8{ "{\"mtp_acceptance\":\"greedy\"}", "{\"mtp_acceptance\":1}", "{\"mtp_acceptance\":null}" }) |text|
         try testing.expectError(error.Glm5NextMtpAcceptanceSetting, (try parseSettings(text)).validate());
     try testing.expectEqual(typical_delta, typ.mtp_typical_delta);
-    for ([_]f32{ 0.3, 0.5, 0.7 }, [_][]const u8{ "0.3", "0.5", "0.7" }) |want, txt| {
+    for ([_]f32{ 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 }, [_][]const u8{ "0.2", "0.3", "0.4", "0.5", "0.6", "0.7", "0.8" }) |want, txt| {
         var b: [128]u8 = undefined;
         const d = try parseSettings(try std.fmt.bufPrint(&b, "{{\"mtp_lane\":true,\"mtp_acceptance\":\"typical\",\"mtp_typical_delta\":{s}}}", .{txt}));
         try d.validate();
