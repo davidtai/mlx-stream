@@ -564,11 +564,7 @@ pub const Lane = struct {
         errdefer gpa.destroy(self);
         const lanes_cap = cap + max_depth;
         self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth, .rule = accept };
-        {
-            const nm = nameOf(&self.name_buf, accept);
-            if (@intFromPtr(nm.ptr) != @intFromPtr(&self.name_buf)) @memcpy(self.name_buf[0..nm.len], nm);
-            self.name_len = nm.len;
-        }
+        self.setRule(accept);
         self.head = try Head.bind(gpa, g.s, map, c, diag);
         errdefer self.head.deinit(gpa);
         const n: u32 = c.n_routed_experts;
@@ -787,6 +783,14 @@ pub const Lane = struct {
 
     /// The request's line at its end (MiMo's receipt form; the expert stream's counters at the decode start and now),
     /// then the lane's depth and its acceptance by draft position (`Positions.write`).
+    /// The lane's rule and its name (`nameOf`), once at construction.
+    pub fn setRule(self: *Lane, r: acc.Rule) void {
+        self.rule = r;
+        const nm = nameOf(&self.name_buf, r);
+        if (@intFromPtr(nm.ptr) != @intFromPtr(&self.name_buf)) @memcpy(self.name_buf[0..nm.len], nm);
+        self.name_len = nm.len;
+    }
+
     /// The lane's name (`nameOf` its rule, written at construction).
     pub fn name(self: *const Lane) []const u8 {
         return self.name_buf[0..self.name_len];
