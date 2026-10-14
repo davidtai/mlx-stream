@@ -1079,6 +1079,7 @@ test {
     _ = @import("fusion.zig");
     _ = @import("fusion_test.zig");
     _ = @import("fusion_parity.zig");
+    _ = @import("prebuild.zig");
 }
 
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {

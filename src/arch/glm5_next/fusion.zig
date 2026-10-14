@@ -406,6 +406,39 @@ pub fn combineIndexed(g: *G, rows: T, order: T, weights: T, shared: T, nt: u32) 
     return out[0];
 }
 
+/// prebuild.zig: one launch of each installed fused text's instantiation at `rows` rows over zero rows and the first fused
+/// sites (the GEMV texts at every width; the epilogue and the combine, one library each, at one row), the outputs appended
+/// to `outs` for the caller's evaluation. Returns the launches.
+pub fn prebuild(g: *G, c: *const glm.Config, layers: []const graph.Layer, rows: u32, outs: *std.ArrayList(T), a: std.mem.Allocator) !u32 {
+    var n: u32 = 0;
+    const h: c_int = @intCast(c.hidden_size);
+    const m: c_int = @intCast(rows);
+    if (kda_in.kernel.ctx != null) for (layers) |*lw| if (lw.attn == .kda) {
+        const r = try kdaInputsFused(g, &lw.attn.kda, try g.zeros(&.{ 1, m, h }, .bfloat16));
+        try outs.appendSlice(a, &.{ r.q, r.k, r.v, r.f_a, r.g_a, r.b });
+        n += 1;
+        break;
+    };
+    if (pair.kernel.ctx != null) for ([_]swiglu.Width{ .dense, .shared }) |width| {
+        const mlp = for (layers) |*lw| {
+            if (if (width == .dense) lw.dense else lw.shared) |x| break x;
+        } else continue;
+        const r = try gateUpFused(g, mlp.gate, mlp.up, try g.zeros(&.{ m, h }, .bfloat16), width, rows);
+        try outs.appendSlice(a, &.{ r.gate, r.up });
+        n += 1;
+    };
+    if (rows == 1 and pred.kernel.ctx != null) {
+        try outs.append(a, try predEpilogue(g, try g.zeros(&.{ 1, pred.experts }, .bfloat16), try g.zeros(&.{pred.experts}, .float32), 1));
+        n += 1;
+    }
+    if (rows == 1 and join.kernel.ctx != null) {
+        const tk: c_int = @intCast(glue.top_k);
+        try outs.append(a, try combineIndexed(g, try g.zeros(&.{ tk, h }, .bfloat16), try g.zeros(&.{tk}, .uint32), try g.zeros(&.{ 1, tk }, .float32), try g.zeros(&.{ 1, h }, .bfloat16), 1));
+        n += 1;
+    }
+    return n;
+}
+
 /// The indexed combine installed (the module binds the join route only then).
 pub fn joinInstalled() bool {
     return join.kernel.ctx != null;

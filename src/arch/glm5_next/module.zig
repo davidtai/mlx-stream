@@ -28,6 +28,7 @@ const kda_decode = @import("kda_decode.zig");
 const dsa_decode = @import("dsa_decode.zig");
 const swiglu = @import("swiglu.zig");
 const fusion = @import("fusion.zig");
+const prebuild = @import("prebuild.zig");
 const mtp = @import("mtp.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const acc = @import("../../sdk_ext.zig").acceptance;
@@ -290,6 +291,10 @@ pub const Module = struct {
         const warmed = switch (self.src) {
             inline else => |x| try warm.run(&self.g, io, &self.c.model, &self.w, &self.cache, x, self.routes),
         };
+        // The decode lane's custom-kernel pipelines built here, not inside the first request (prebuild.zig): every width of
+        // the FP8 GEMV sites, the installed fusion texts, the fused glue and SwiGLU. Unconditional, exact (no output read).
+        const prebuilt = try prebuild.run(gpa, io, s, &self.c.model, &self.w, self.routes);
+        log.info("glm5_next pipelines pre-built: {d} launches at decode widths 1..{d} (fp8 gemv {d}, fusion {d}, glue {d}, swiglu {d}) in {d} ms\n", .{ prebuilt.gemv + prebuilt.fusion + prebuilt.glue + prebuilt.swiglu, prebuild.max_rows, prebuilt.gemv, prebuilt.fusion, prebuilt.glue, prebuilt.swiglu, prebuilt.ns / std.time.ns_per_ms });
         self.prompt_pass = promptPassOf(promptRoute(&self.c), self.c.expert_family);
         self.step_pass = stepPassOf(stepRoute(&self.c), self.c.decode_glue, self.c.expert_family);
         self.round_pass = roundPassOf(self.c.decode_glue, self.c.expert_family);
