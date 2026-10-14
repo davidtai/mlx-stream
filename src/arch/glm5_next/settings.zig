@@ -19,7 +19,7 @@
 //! streamed arch's keys; glm5_next's default ratio `default_tally_ratio`). `expert_rows_by_layer` splits the decode rows
 //! between the routed layers (`LayerRows`; `uniform`, the default, is every layer at the plan's rows). `exl3_gateup_form`,
 //! `exl3_down_form`, `exl3_forms_maxm` and `exl3_forms_min_p` pick the EXL3 family's decode forms (`Exl3Forms`, exl3_forms.zig;
-//! `seam`, the default: lane B's chain, the control).
+//! `guone` + `pair`, the default; `seam` by name: lane B's chain, the control).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -141,22 +141,28 @@ pub const DecodePredict = enum { f32, bf16 };
 /// construction (swiglu.zig): `fused` one text between the gate / up GEMVs and the down GEMV; `ops` the op chain (the
 /// control). Rounding-class against `ops`.
 pub const DecodeSwiglu = enum { ops, fused };
-/// The EXL3 family's decode forms (exl3_forms.zig), installed once at construction (exl3_math.zig `Math.init`): the gate /
-/// up form (`exl3_gateup_form`): `seam` (the default: lane B's in_rin, two GEMVs, gu_epi; g22-exl3's chain, the control),
-/// `fused16` / `fused8` (g5k3_gu_fused at 16 or 8 simdgroups), `guone` (DeepSeek's gu_one), `gemv_u8` (the GEMV at
-/// DeepSeek's unroll 8); the down form (`exl3_down_form`): `seam`, `pair` (DeepSeek's down_pair), `fused1` / `fused2`
-/// (din_rin + g5k3_dn_fused over 1 / 2 blocks), `pro1` / `pro2` (g5k3_dn_pro); `exl3_forms_maxm` the fused forms' union
-/// rule (1, the default, or 4); `exl3_forms_min_p` the narrowest wave the fused forms take (1 .. 64, default 1; narrower
-/// waves run the seam chain). The mcg GEMV is the bench's codebook price, not a form: on the mul1 pack it decodes other
-/// weights, so no setting names it. Every form computes the seam's words (the kbench's device parity); a name outside
-/// these, a combination `exl3_forms.Forms.check` refuses, or a non-seam form on an NVFP4 pack refuses the load by name.
+/// The EXL3 family's decode forms (exl3_forms.zig), installed once at construction (exl3_math.zig `Math.init`): the
+/// gate / up form (`exl3_gateup_form`): `seam` (lane B's in_rin, two GEMVs, gu_epi; g22-exl3's chain, the control, by
+/// name), `fused16` / `fused8` (g5k3_gu_fused at 16 or 8 simdgroups), `guone` (DeepSeek's gu_one, the default),
+/// `gemv_u8` (the GEMV at DeepSeek's unroll 8); the down form (`exl3_down_form`): `seam`, `pair` (DeepSeek's down_pair,
+/// the default), `fused1` / `fused2` (din_rin + g5k3_dn_fused over 1 / 2 blocks), `pro1` / `pro2` (g5k3_dn_pro);
+/// `exl3_forms_maxm` the fused forms' union rule (1, the default, or 4); `exl3_forms_min_p` the narrowest wave the
+/// fused forms take (1 .. 64, default 1; narrower waves run the seam chain). The mcg GEMV is the bench's codebook
+/// price, not a form: on the mul1 pack it decodes other weights, so no setting names it. Every form computes the seam's
+/// words (the kbench's device parity); a name outside these, a combination `exl3_forms.Forms.check` refuses, or a named
+/// form other than the seam on an NVFP4 pack refuses the load by name. The default is batch 27's measured pair
+/// (g22-exl3b at 190/217, lane on, draft_depth 3 + draft_gate 0.5: guone + pair +1.79 % decode over the seam beyond
+/// noise, ids identical); on an NVFP4 pack it is inert (that source installs no form).
 pub const Exl3GateUpForm = enum { seam, fused16, fused8, guone, gemv_u8 };
 pub const Exl3DownForm = enum { seam, pair, fused1, fused2, pro1, pro2 };
 pub const Exl3Forms = struct {
-    gateup: Exl3GateUpForm = .seam,
-    down: Exl3DownForm = .seam,
+    gateup: Exl3GateUpForm = .guone,
+    down: Exl3DownForm = .pair,
     maxm: u32 = 1,
     min_p: u32 = 1,
+
+    /// The seam chain, by name (`"exl3_gateup_form":"seam","exl3_down_form":"seam"`): the control.
+    pub const seam_chain: Exl3Forms = .{ .gateup = .seam, .down = .seam };
 
     /// The forms exl3_forms.zig installs for these settings (every name maps; `check` is the install's).
     pub fn forms(f: Exl3Forms) exl3_forms.Forms {
@@ -181,9 +187,9 @@ pub const Exl3Forms = struct {
         };
     }
 
-    /// The seam chain itself (the default): Math binds lane B's kernels, no forms install.
+    /// The seam chain itself (`seam_chain`): Math binds lane B's kernels, no forms install.
     pub fn isSeam(f: Exl3Forms) bool {
-        return std.meta.eql(f, Exl3Forms{});
+        return std.meta.eql(f, seam_chain);
     }
 };
 
@@ -343,8 +349,10 @@ pub const Config = struct {
     tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
     /// The decode rows' split between the routed layers (`LayerRows`): `uniform` (the default) or `offsets`.
     expert_rows_by_layer: LayerRows = defaultLayerRows(),
-    /// The EXL3 family's decode forms (`Exl3Forms`): the seam chain unless named.
+    /// The EXL3 family's decode forms (`Exl3Forms`): guone + pair unless named; the seam chain by name.
     exl3_forms: Exl3Forms = .{},
+    /// The settings named a forms key (on an NVFP4 pack the default is inert; a named form other than the seam refuses).
+    exl3_forms_requested: bool = false,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -425,16 +433,20 @@ pub const Config = struct {
         if (raw.object.get("exl3_gateup_form")) |v| {
             const form: ?Exl3GateUpForm = if (v == .string) std.meta.stringToEnum(Exl3GateUpForm, v.string) else null;
             if (form) |f| c.exl3_forms.gateup = f else c.malformed.exl3_gateup_form = true;
+            c.exl3_forms_requested = true;
         }
         if (raw.object.get("exl3_down_form")) |v| {
             const form: ?Exl3DownForm = if (v == .string) std.meta.stringToEnum(Exl3DownForm, v.string) else null;
             if (form) |f| c.exl3_forms.down = f else c.malformed.exl3_down_form = true;
+            c.exl3_forms_requested = true;
         }
         if (raw.object.get("exl3_forms_maxm")) |v| {
             if (v == .integer and (v.integer == 1 or v.integer == 4)) c.exl3_forms.maxm = @intCast(v.integer) else c.malformed.exl3_forms_maxm = true;
+            c.exl3_forms_requested = true;
         }
         if (raw.object.get("exl3_forms_min_p")) |v| {
             if (v == .integer and v.integer >= 1 and v.integer <= exl3_forms.max_pairs) c.exl3_forms.min_p = @intCast(v.integer) else c.malformed.exl3_forms_min_p = true;
+            c.exl3_forms_requested = true;
         }
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
@@ -527,7 +539,7 @@ pub const Config = struct {
         if (c.malformed.exl3_down_form) return error.Glm5NextExl3DownFormSetting;
         if (c.malformed.exl3_forms_maxm) return error.Glm5NextExl3FormsMaxmSetting;
         if (c.malformed.exl3_forms_min_p) return error.Glm5NextExl3FormsMinPSetting;
-        if (!c.exl3_forms.isSeam() and c.expert_family != .exl3) return error.Glm5NextExl3FormsOnNvfp4Pack;
+        if (c.exl3_forms_requested and !c.exl3_forms.isSeam() and c.expert_family != .exl3) return error.Glm5NextExl3FormsOnNvfp4Pack;
         c.exl3_forms.forms().check() catch return error.Glm5NextExl3FormsSetting;
         try c.tally.check("glm5_next");
         switch (c.expert_rows_by_layer) {
@@ -780,11 +792,28 @@ test "glm5_next settings: expert_rows_by_layer: the calibrated offsets by defaul
     try testing.expectError(error.Glm5NextExpertRowsByLayerLength, layerRows(split.expert_rows_by_layer, .{ .prompt = 126, .decode = 143 }, 288, prompt[0..41], decode[0..41]));
 }
 
-test "glm5_next settings: the exl3 decode forms: the seam unless named, every form by name on an exl3 pack, refusals by name" {
+test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the seam and every form by name on an exl3 pack, refusals by name" {
+    // the default: guone + pair (batch 27's measured forms) installed on an exl3 pack, inert (admitted) on an NVFP4 pack
     const none = try parseSettings("{}");
-    try testing.expect(none.exl3_forms.isSeam());
+    try testing.expectEqual(Exl3Forms{ .gateup = .guone, .down = .pair, .maxm = 1, .min_p = 1 }, none.exl3_forms);
+    try testing.expect(!none.exl3_forms.isSeam());
+    try testing.expect(!none.exl3_forms_requested);
     try none.validate();
-    try testing.expectEqual(exl3_forms.Forms{}, none.exl3_forms.forms());
+    try testing.expectEqual(exl3_forms.Forms{ .gu = .guone, .dn = .pair, .maxm = 1, .min_p = 1 }, none.exl3_forms.forms());
+    {
+        var c = none;
+        c.expert_family = .exl3;
+        try c.validate();
+    }
+    // the seam by name: the control (exl3_forms.Forms{}: Math binds lane B's kernels), on either family
+    {
+        var c = try parseSettings("{\"exl3_gateup_form\":\"seam\",\"exl3_down_form\":\"seam\"}");
+        try testing.expect(c.exl3_forms.isSeam());
+        try testing.expectEqual(exl3_forms.Forms{}, c.exl3_forms.forms());
+        try c.validate();
+        c.expert_family = .exl3;
+        try c.validate();
+    }
     for (std.enums.values(Exl3GateUpForm)) |gu| for (std.enums.values(Exl3DownForm)) |dn| {
         var buf: [160]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "{{\"exl3_gateup_form\":\"{t}\",\"exl3_down_form\":\"{t}\"}}", .{ gu, dn });
