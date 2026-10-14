@@ -9,9 +9,10 @@
 //!     SwiGLU epilogue, the down GEMM, rot_widen1 into bf16) over the call's rows sorted by slot, a wave at most
 //!     `wave_rows` rows of at most `xq.wave_max` experts, pipelined as MiMo's drain (one wave in flight behind the next).
 //! The decode lookahead's predictor is MiMo's (`mimo_math.Predictor`), bound at construction.
-//! The decode chain's launches are bound once at construction (`Decode`): lane B's seam texts (exl3_kernels.zig, the
-//! default `exl3_gateup_form` / `exl3_down_form` = seam: g22-exl3's chain, unchanged) or the installed forms
-//! (exl3_forms.zig `Installed`, the settings' `Exl3Forms`); the calls run the bound pair, no per-call choice.
+//! The decode chain's launches are bound once at construction (`Decode`): lane B's seam texts (exl3_kernels.zig,
+//! `exl3_gateup_form` / `exl3_down_form` = seam by name: g22-exl3's chain, unchanged) or the installed forms
+//! (exl3_forms.zig `Installed`, the settings' `Exl3Forms`, guone + pair by default); the calls run the bound pair, no
+//! per-call choice.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -89,7 +90,7 @@ pub const Math = struct {
 
     allocator: std.mem.Allocator,
     k: *kernels.Kernels,
-    /// The installed forms (null: the seam chain, `Exl3Forms` default).
+    /// The installed forms (null: the seam chain, `Exl3Forms.seam_chain` by name).
     forms: ?*xf.Installed,
     /// The decode chain the calls run (`Decode.seam(k)` or `Decode.forms(forms)`), bound at `init`.
     decode: Decode,
