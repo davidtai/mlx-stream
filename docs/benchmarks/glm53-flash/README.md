@@ -138,8 +138,8 @@ disagreed by more than the cap. Exact means token ids identical across all four 
 | g26 stack vs g25b binary | g25bin-vs-g26 | g25b / g26 | 32.80 → 34.60 | +5.49 % beyond (cc +3.99 %) | +0.03 % | diverge @872 | VALID | reproduced in a second window |
 | Rows 193/219, 195/221 on g25b | g25-rows-193-219, g25-rows-195-221 | g25b | 32.80 → 33.15; 32.75 → 33.35 | +1.07 %; +1.83 % beyond | within | rows differ | VALID | rows ladder |
 | Rows 193/219, 195/221 on g26 | g26-rows-193-219, g26-rows-195-221 | g26 | 34.55 → 34.85; 34.45 → 35.05 | +0.87 %; +1.74 % beyond | within | rows differ | VALID | rows ladder |
-| draft_gate 0.4 vs 0.5 on g26 | g26-vs-g04 | g26 | <!-- PENDING-VERDICT g26-vs-g04: decode A -> B --> PENDING | PENDING | PENDING | record-only | PENDING | PENDING |
-| Fused EXL3 glue (gu_epi + din_rin) | g26-vs-gf | g26-gf | <!-- PENDING-VERDICT g26-vs-gf: decode A -> B --> PENDING | PENDING | PENDING | gating | PENDING | PENDING |
+| draft_gate 0.4 vs 0.5 on g26 | g26-vs-g04 | g26 | 34.35 → 33.85 | −1.46 % beyond (cc −1.24 %) | 0.00 % | diverge @258 (record-only) | VALID | dead: the gate stays 0.5 |
+| Fused EXL3 glue (gu_epi + din_rin) | g26-vs-gf | g26-gf `6cba0f9` | 34.30 / 34.50 → 32.30 / 33.30 (per arm) | slower in both B arms | — | B arms differ from each other (@161) and from A | INVALID | dead: the glue stays separate (g26's only route; g26-gf is not a stack) |
 
 Stacks in the table: g22-exl3 is the EXL3 K=3 base (`99f3454`); each g22-* is that base plus one lane's switches,
 defaults off. g23 (`55e814f`) adds the forms default, the prompt bundle and the typical merge (off). g23n (`e493364`) is
@@ -247,8 +247,15 @@ baseline ≤ 12.01 GB. Decode rows above 225 are refused at load by the default 
   GB bar: foreign processes, a 1 GB disk read lifting the page cache, protected system daemons that cannot be stopped.
   The clean floor (7.9–8.3 GB right after the production server's bootout) admits it, hence the first-step single
   cells.
-- **draft_depth 4:** not loadable. The MTP layer's trained depth is 3; the lane, the decode kernels, the pre-build and
-  the bill are sized for 4 verify rows, and `draft_depth` 4 is refused at load by name.
+- **draft_depth 4:** refused by design. The MTP layer's trained depth is 3; the lane, the decode kernels, the pre-build
+  and the bill are sized for 4 verify rows, and `draft_depth` 4 is refused at load by name.
+- **draft_gate 0.4** (on g26, where the q8 head makes each draft cheaper): −1.46 % beyond (cc −1.24 %). A lower gate
+  verifies more low-confidence drafts, and the extra verify rows cost more than the extra acceptances return. The gate
+  stays 0.5.
+- **Fused EXL3 glue** (gu_epi + din_rin in one launch, g26-gf `6cba0f9`): INVALID. The CPU parity proof was
+  bit-identical, but on the device the two fused arms differed from each other (from token 161) and from the separate
+  arms. The likely cause is a missing threadgroup barrier between the kernel's threadgroup writes of `h` and the
+  din_rin reads of them. The fused arms were also slower (32.30 / 33.30 vs 34.30 / 34.50). The glue stays separate.
 
 ## Provenance
 
