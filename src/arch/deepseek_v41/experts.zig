@@ -81,6 +81,7 @@ const traceBank = expert_stream.traceBank;
 
 /// DEVROUTE's resident map of one layer from its policy (`expert_stream.lutOf`).
 const lutOf = expert_stream.lutOf;
+const lutOfMiss = expert_stream.lutOfMiss;
 
 // ── StreamSource: the streamer's Stream, the EXL3 source's side of the contract (`expert_stream.StreamSource`) ──
 
@@ -341,6 +342,11 @@ pub const FakeSource = struct {
     /// DEVROUTE: as `StreamSource.residentLut`.
     pub fn residentLut(self: *const FakeSource, layer: u32, out: []u32) void {
         lutOf(&self.policies[layer], self, layer, out);
+    }
+
+    /// DEVROUTE: as `StreamSource.residentLutMiss`.
+    pub fn residentLutMiss(self: *const FakeSource, layer: u32, out: []u32, miss: u32) void {
+        lutOfMiss(&self.policies[layer], self, layer, out, miss);
     }
 
     pub fn decoding(self: *const FakeSource) bool {
@@ -904,6 +910,8 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         devroute: bool = false,
         dev_lut: [][2]T = &.{},
         dev_parity: []u1 = &.{},
+        /// DEVROUTE's LUT value for a non-resident expert (`Options.dev_miss`), bound at construction.
+        dev_miss: u32 = 0,
 
         const GateUpWaveFn = fn (self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, w: u8, over: ?*const [n_banks]?Arrays) anyerror!Wave;
         const DownWaveFn = fn (self: *Self, g: *G, layer: u32, wave: *const Wave, acc: *Acc, over: ?*const [n_banks]?Arrays) anyerror![]const T;
@@ -917,7 +925,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// layer's resident LUT into the banked texts, every routed pair) committed behind the barrier's arrays, before the
         /// host's wait and route; the host then routes and builds only the miss parts; the join takes every hit pair from
         /// the device wave and every miss pair from its part. Needs the banked route.
-        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null, wide: Wide = .{}, banked: bool = false, hoist_first: bool = false, devroute: bool = false };
+        /// `dev_miss`: the LUT value of a non-resident expert in DEVROUTE's device wave: 0 (base row 0: the wave computes
+        /// every routed pair, the missed ones never joined) or a math's skip id (its banked texts return on it: the wave
+        /// computes only the resident pairs; glm5_next `hit_wave: resident_only`). Needs `devroute` and a source with
+        /// `residentLutMiss`; the caller names a skip id only for a math whose installed texts skip it.
+        pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null, wide: Wide = .{}, banked: bool = false, hoist_first: bool = false, devroute: bool = false, dev_miss: u32 = 0 };
 
         /// The wide lane's host scratch, reused across calls.
         const WideScratch = struct {
@@ -1004,6 +1016,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 if (comptime !(@hasDecl(S, "residentLut") and @hasDecl(S, "decoding"))) return error.DevrouteNotInSource;
                 self.devroute = true;
             }
+            if (opt.dev_miss != 0) {
+                if (!opt.devroute) return error.DevrouteMissNeedsDevroute;
+                if (comptime !@hasDecl(S, "residentLutMiss")) return error.DevrouteMissNotInSource;
+                self.dev_miss = opt.dev_miss;
+            }
             return self;
         }
 
@@ -1027,9 +1044,15 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 };
             }
             for (self.dev_lut, self.dev_parity, 0..) |pair, *par, l| {
-                for (pair) |x| self.source.residentLut(@intCast(l), std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(x)))));
+                for (pair) |x| self.lutInto(@intCast(l), std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(x)))));
                 par.* = 0;
             }
+        }
+
+        /// Layer `layer`'s resident map into `out` with the bound miss value (`dev_miss`; a source without
+        /// `residentLutMiss` has only 0, which `initWith` enforces).
+        fn lutInto(self: *const Self, layer: u32, out: []u32) void {
+            if (comptime @hasDecl(S, "residentLutMiss")) self.source.residentLutMiss(layer, out, self.dev_miss) else self.source.residentLut(layer, out);
         }
 
         /// DEVROUTE: layer `layer`'s LUT for its next call, from the policy after this call's route; that call reads it.
@@ -1041,13 +1064,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
 
         fn devLutAfterRouteIn(self: *Self, g: *G, layer: u32) !void {
             const next = self.dev_parity[layer] +% 1;
-            self.source.residentLut(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next])))));
+            self.lutInto(layer, std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(self.dev_lut[layer][next])))));
             self.dev_parity[layer] = next;
         }
 
         /// DEVROUTE: the call's every routed pair through the banked texts, the slots from the layer's LUT on the device
-        /// (hits: their resident (bank, row), the host's plan's same; misses: base row 0, never joined); `[n * k, hidden]`
-        /// in routed order.
+        /// (hits: their resident (bank, row), the host's plan's same; misses: `dev_miss`: base row 0 computed, or the
+        /// math's skip id, left unwritten; never joined either way); `[n * k, hidden]` in routed order.
         fn devWave(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32) !T {
             if (comptime !hasBanked()) {
                 return error.DevrouteNeedsBanked;
@@ -5220,4 +5243,149 @@ test "dsv41 experts: the banked waves (ROUTED_BANKED) hand every routed position
     // A math without the banked route refuses the option at construction.
     const Plain = ExpertsWith(TraceOps, FakeSource, TraceMath, .{});
     try testing.expectError(error.BankedNotInMath, Plain.initWith(a, &g, &src, .{ .hidden = 64, .inter = 32 }, &c, .{ .banked = true }));
+}
+
+test "dsv41 experts: DEVROUTE dev_miss (glm5_next hit_wave resident_only): the device wave's pairs are the plan's hits, the miss parts' its misses: disjoint, covering, each joined row written once; 0 .. 8 misses a call" {
+    const a = testing.allocator;
+    const Ex = Experts(TraceOps, FakeSource, TraceMath);
+    const skip: u32 = 0xFFFF_FFFF;
+    const n_layers = 2;
+    const n_experts = 40;
+    var src = try FakeSource.init(a, .{ .hidden = 64, .inter = 32, .n_experts = n_experts, .rows = &.{ 6, 6 } });
+    defer src.deinit();
+    try src.grow(&.{ 12, 12 });
+    // Fill each layer's 12 persistent rows (experts 0 .. 11) before the measured calls.
+    for (0..n_layers) |l| {
+        var warm: [12]u16 = undefined;
+        for (&warm, 0..) |*d, e| d.* = @intCast(e);
+        const call = try src.route(@intCast(l), &warm, &.{});
+        src.release(call);
+        try src.flush();
+    }
+    var lut: [n_layers][n_experts]u32 = undefined;
+    var lut0: [n_experts]u32 = undefined;
+    for (0..n_layers) |l| src.residentLutMiss(@intCast(l), &lut[l], skip);
+    var rng = std.Random.DefaultPrng.init(20261014);
+    const rand = rng.random();
+    var seen_misses: [9]usize = @splat(0);
+    for (0..9 * 40) |call_i| {
+        const l: u32 = @intCast(call_i % n_layers);
+        const want_m: u32 = @intCast((call_i / n_layers) % 9);
+        // The resident map with the skip id is the stock map but for the non-residents (0 there).
+        src.residentLut(l, &lut0);
+        for (lut[l], lut0) |x, y| try testing.expect(if (x == skip) y == 0 else x == y);
+        var res: [n_experts]u16 = undefined;
+        var non: [n_experts]u16 = undefined;
+        var n_res: usize = 0;
+        var n_non: usize = 0;
+        for (lut[l], 0..) |x, e| {
+            if (x == skip) {
+                non[n_non] = @intCast(e);
+                n_non += 1;
+            } else {
+                res[n_res] = @intCast(e);
+                n_res += 1;
+            }
+        }
+        try testing.expect(n_res >= 8 and n_non >= 8);
+        // A verify call: 4 rows x top-8 (32 pairs), each row 8 distinct experts, `want_m` of the pairs non-resident.
+        var ids: [32]u16 = undefined;
+        var miss_left = want_m;
+        for (0..4) |r| {
+            const mr: u32 = @min(miss_left, if (r == 3) 8 else rand.uintAtMost(u32, @min(miss_left, 8)));
+            miss_left -= mr;
+            rand.shuffle(u16, res[0..n_res]);
+            rand.shuffle(u16, non[0..n_non]);
+            for (0..8) |j| ids[r * 8 + j] = if (j < mr) non[j] else res[j - mr];
+            rand.shuffle(u16, ids[r * 8 ..][0..8]);
+        }
+        try testing.expectEqual(@as(u32, 0), miss_left);
+        const call = try src.route(l, &ids, &.{});
+        const sv = src.served(call);
+        // The device wave computes p iff its LUT id is not the skip id; a miss part computes p iff its wave is a part.
+        var pos: [64]u32 = undefined;
+        var n_pos: usize = 0;
+        var computed: [32]u8 = @splat(0);
+        var dev_rows: [32]bool = undefined;
+        for (ids, 0..) |e, p| {
+            dev_rows[p] = lut[l][e] != skip;
+            computed[p] += @intFromBool(dev_rows[p]);
+            pos[n_pos] = @intCast(p); // the device wave's row p carries position p (written or not)
+            n_pos += 1;
+        }
+        var misses: u32 = 0;
+        for (1..sv.n_parts + 1) |part| for (sv.waves, 0..) |w, p| if (w == part) {
+            computed[p] += 1;
+            misses += 1;
+            pos[n_pos] = @intCast(p);
+            n_pos += 1;
+        };
+        try testing.expectEqual(want_m, misses);
+        seen_misses[misses] += 1;
+        // Partition: the device wave's computed pairs are exactly the plan's hits (wave 0); each pair computed once.
+        for (sv.waves, dev_rows, computed) |w, d, c| {
+            try testing.expectEqual(w == 0, d);
+            try testing.expectEqual(@as(u8, 1), c);
+        }
+        // The join reads, for each position, a written row (a computed device row or a miss part's), each row once.
+        var order: [max_route_ids]u32 = undefined;
+        const n = Ex.joinOrder(pos[0..n_pos], 32, &order);
+        try testing.expectEqual(@as(u32, 32), n);
+        var used: [64]bool = @splat(false);
+        for (order[0..32], 0..) |row, p| {
+            try testing.expect(!used[row]);
+            used[row] = true;
+            if (row < 32) {
+                try testing.expectEqual(@as(u32, @intCast(p)), row);
+                try testing.expect(dev_rows[p]);
+            }
+        }
+        src.release(call);
+        try src.flush();
+        // The layer's next call reads the map after this route (`devLutAfterRoute`).
+        src.residentLutMiss(l, &lut[l], skip);
+    }
+    for (seen_misses) |c| try testing.expect(c >= 40);
+}
+
+test "dsv41 experts: DEVROUTE dev_miss: refused without the device route; bound, the LUTs carry it for every non-resident expert" {
+    const a = testing.allocator;
+    var c = testConfig(256, 128, 2);
+    c.n_routed_experts = 16;
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    g.record_host = true;
+    const Ex = ExpertsWith(TraceOps, FakeSource, TraceBankedMath, .{});
+    const math: TraceBankedMath = .{ .inner = .{ .hidden = 256, .inter = 128 } };
+    try testing.expectError(error.DevrouteMissNeedsDevroute, Ex.initWith(a, &g, &src, math, &c, .{ .banked = true, .dev_miss = 0xFFFF_FFFF }));
+    var ex = try Ex.initWith(a, &g, &src, math, &c, .{ .banked = true, .devroute = true, .dev_miss = 0xFFFF_FFFF });
+    defer ex.deinit();
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), ex.dev_miss);
+    try ex.grow(&g, &.{ 8, 8 });
+    var script: Script = .{ .calls = &.{&.{ 1, 2, 3, 4, 5, 6 }} };
+    g.host_values = script.values();
+    const xf = try g.input(&.{ 2, 256 }, .bfloat16);
+    const idx = try g.input(&.{ 2, 3 }, .int32);
+    _ = try ex.at(0).routedHoist(&g, xf, idx, &.{});
+    // Each layer's LUT the next call reads is the policy's map with the skip id (layer 0 after its route, layer 1 from the
+    // grow), and no LUT holds any other non-slot value.
+    var skips: usize = 0;
+    for (0..2) |l| {
+        var want: [16]u32 = undefined;
+        src.residentLutMiss(@intCast(l), &want, 0xFFFF_FFFF);
+        const cur = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(ex.dev_lut[l][ex.dev_parity[l]]))));
+        try testing.expectEqualSlices(u32, &want, cur);
+        for (ex.dev_lut[l]) |x| for (std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(try g.hostBytes(x))))) |v| {
+            try testing.expect(v == 0xFFFF_FFFF or v >> 24 <= 2);
+            skips += @intFromBool(v == 0xFFFF_FFFF);
+        };
+    }
+    try testing.expect(skips > 0);
+    // The stock binding keeps 0 for a non-resident expert.
+    var stock = try Ex.initWith(a, &g, &src, math, &c, .{ .banked = true, .devroute = true });
+    defer stock.deinit();
+    try testing.expectEqual(@as(u32, 0), stock.dev_miss);
+    try ex.flush();
 }
