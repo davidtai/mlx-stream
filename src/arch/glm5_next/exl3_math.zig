@@ -18,6 +18,7 @@ const quant = @import("../../sdk_ext.zig").quant;
 const xq = @import("../../exl3/quant.zig");
 const mimo_math = @import("../mimo_v2/math.zig");
 const profile = @import("../mimo_v2/profile.zig");
+const ptl = @import("../mimo_v2/prefill_timeline.zig");
 const kernels = @import("exl3_kernels.zig");
 const bank = @import("exl3_bank.zig");
 
@@ -170,6 +171,14 @@ pub const Math = struct {
         for (order, self.ridx[0..n]) |o, *r| r.* = @intCast(if (rows.act_row) |ar| ar[o] else o);
         var ex: [xq.wave_max]xq.WaveExpert = undefined;
         const experts = waveExperts(order, rows.slot, &ex, self.rhs[0..n]);
+        // Profile builds only (compiled out of a served build): the wave's prompt-timeline tile, marked before its graph
+        // as MiMo's `tileGraph` marks a projection tile: its rows, the bank's slot rows the texts read (the code arrays'
+        // first dim) and its experts' slots in packed order (ascending: the tile's distinct slots and their span).
+        if (comptime ptl.enabled) {
+            var slots: [xq.wave_max]u32 = undefined;
+            for (experts, slots[0..experts.len]) |e, *sl| sl.* = e.slot;
+            ptl.tile(.moe, @intCast(n), @intCast(g.shapeOf(b.gate.code).d[0]), slots[0..experts.len]);
+        }
         const t = xq.digTableBm(experts, kernels.gu_tiles, kernels.m_tile);
         const cn: c_int = @intCast(n);
         const ridx = try g.hostArray(std.mem.sliceAsBytes(self.ridx[0..n]), &.{cn}, .int32);
