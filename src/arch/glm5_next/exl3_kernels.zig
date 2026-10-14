@@ -75,6 +75,13 @@ pub fn projDims(which: Which) ProjDims {
 // ── The texts ──
 
 pub const Kernel = enum { in_rin, gemv, gu_epi, din_rin, dpost, take2v, gemm_gu, gemm_dn, onepass, widen1 };
+/// DEVROUTE `hit_wave: resident_only`: the id the device hit wave's LUT gives a non-resident expert. Each decode text
+/// (in_rin, gemv, gu_epi, din_rin, dpost; the forms' guone and pair) returns from a pair's threadgroup carrying it before
+/// any read or write (`scripts/glm5next_exl3_kernels_gen.py` / `_forms_gen.py`): a missed pair's row is left unwritten and
+/// is never joined (its miss part's row replaces it). The host's waves never carry it (a packed slot ref has bank <= 2).
+pub const skip_id: u32 = 0xFFFF_FFFF;
+/// The decode texts that skip `skip_id` (the prompt's DIG texts never see a device-LUT id).
+pub const skip_kernels = [_]Kernel{ .in_rin, .gemv, .gu_epi, .din_rin, .dpost };
 const n_kernels = std.meta.fieldNames(Kernel).len;
 
 const dir = "../../kernels/glm5_next_exl3/";
@@ -97,11 +104,11 @@ pub const header_onepass: [:0]const u8 = @embedFile("../../kernels/exl3/header_d
 
 /// sha256 of each text as `scripts/glm5next_exl3_kernels_gen.py` writes it (checked once at install and in the tests).
 pub const text_sha256 = [n_kernels]*const [64]u8{
-    "6b5d6987c06750e44ff16cd4d92142ede9b1693643cae6c1ec6391cfad8162d2",
-    "632af1fde45f91dd64b1c7c4ba05562d50bdcf4587fbe4e6ca5a91d64a5c6bbe",
-    "f9526c59b09561032dad3b048a78e50b4d2c77cef487fd924a65ab6e1dab3388",
-    "4cfa833c6427f68000eaac5b77d3964f5975875d95c1634720ae915fcbb4b735",
-    "ba6f173e5e190177314cbadd85c6b0c8398253ce76392f1aba93454e873a35d5",
+    "4a6c3181188adcc8c712ee0e38fc2a134a54572d899abdc721bd378c4a13b20d",
+    "cdc317ab432f5c00cb3a0618600d73699fe376f66796aa9ff615692b8d768649",
+    "bb77488986526f1ed58f98b3a5e2499376fa6d1f0ac903494087e12b32981f9b",
+    "a80a8680c0628f1b540cae7700d53911f14264d001bc3210b9d98d9e01faa26d",
+    "cbb59d76080db7af87aa1bbad58fa38c85c82b2817db4ee0ef2fd8fbb0e385e9",
     "27755f90ed5379a9254172c794dd0f8eaa4df85fc2cee4bd0587554a333edfc8",
     "c72444223bf1b65d86ec05f681fb24672180f538474a191a0359ea8a2e02d291",
     "537d8c33523b8d703cca2a5aa8729476fb805ee12fc50170ff572e9bff4a122e",
@@ -436,6 +443,24 @@ test "glm5_next exl3 kernels: the texts are the pinned ones, every DeepSeek shap
         }
     }
     try testing.expect(std.mem.indexOf(u8, header_onepass, "glm5n_dig2_swiglu_one") != null);
+    // hit_wave resident_only: each decode text returns on `skip_id` right after its ids read, before any barrier, read or
+    // write; no other text carries it.
+    for (texts, 0..) |t, i| {
+        const k: Kernel = @enumFromInt(i);
+        const skips = std.mem.indexOfScalar(Kernel, &skip_kernels, k) != null;
+        const at = std.mem.indexOf(u8, t, "== 0xFFFFFFFFu) return;");
+        try testing.expectEqual(skips, at != null);
+        if (at) |j| {
+            // The skip is the line right after the text's one ids read, and no barrier or store comes before it.
+            const ids_at = std.mem.indexOf(u8, t, "= ids[").?;
+            const eol = std.mem.indexOfScalarPos(u8, t, ids_at, '\n').?;
+            try testing.expectEqual(eol, std.mem.lastIndexOfScalar(u8, t[0..j], '\n').?);
+            for ([_][]const u8{ "threadgroup_barrier", "out[", "xg[" }) |use| if (std.mem.indexOf(u8, t, use)) |u| try testing.expect(u > j);
+        }
+    }
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), skip_id);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, @embedFile("../../kernels/glm5_next_exl3_forms/g5k3_guone.metal"), "if (sid == 0xFFFFFFFFu) return;"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, @embedFile("../../kernels/glm5_next_exl3_forms/g5k3_pair.metal"), "if (slot == 0xFFFFFFFFu) return;"));
     try testing.expectEqual(@as(u32, 64), gu_tiles);
     try testing.expectEqual(@as(u32, 64), dn_tiles);
     try testing.expectEqual([3]u32{ 256, 128, 48 }, projDims(.gate_up).code);
