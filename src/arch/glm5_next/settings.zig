@@ -136,9 +136,10 @@ pub const DecodeKda = enum { ops, fused };
 /// chain (the control). Exact against `ops`. On a CPU stream the default resolves to `ops`.
 pub const KdaPrologue = enum { ops, fused };
 /// The MTP verify's KDA layer, installed once at construction (kda_verify.zig): `chain` the op chain with the stock
-/// capture recurrence (the default and the control); `fused` the prologue, the gate, beta, the capture recurrence and the
-/// gated norm in one text a layer, each stage MLX's kernel (or the stock text) of the op it replaces (the op chain's
-/// bits; the projections and the low-rank second stages stay outside). Exact against `chain`. Needs the MTP lane.
+/// capture recurrence (the control, by name); `fused` (the default since g24: batch 30 +1.28 % decode, 0 bit diffs) the
+/// prologue, the gate, beta, the capture recurrence and the gated norm in one text a layer, each stage MLX's kernel (or the
+/// stock text) of the op it replaces (the op chain's bits; the projections and the low-rank second stages stay outside).
+/// Exact against `chain`. Needs the MTP lane: without it the default installs nothing (no verify); named, it refuses.
 pub const KdaVerify = enum { chain, fused };
 /// The decode lane's DSA sparse latent attention, installed once at construction (dsa_decode.zig): `fused` a split text
 /// (MiMo's dec_attn split pattern for MLA over the selected latent rows) and MiMo's merge text; `ops` the op chain (the
@@ -374,8 +375,11 @@ pub const Config = struct {
     decode_kda: DecodeKda = .fused,
     /// The KDA prompt pass's prologue (kda_prologue.zig): `fused` (the default) or `ops` (the op chain, the control).
     kda_prologue: KdaPrologue = .fused,
-    /// The MTP verify's KDA layer (kda_verify.zig): `chain` (the default, the control) or `fused` (with `mtp_lane` only).
-    kda_verify: KdaVerify = .chain,
+    /// The MTP verify's KDA layer (kda_verify.zig): `fused` (the default) or `chain` (the control, by name). `fused` named
+    /// without `mtp_lane` is refused; the default without the lane installs nothing (the module installs a verify route
+    /// with the lane only).
+    kda_verify: KdaVerify = .fused,
+    kda_verify_named: bool = false,
     /// The decode lane's DSA sparse latent attention (dsa_decode.zig): `fused` (the default) or `ops` (the control).
     decode_dsa: DecodeDsa = .fused,
     /// The lookahead predictor's router weight: `bf16` (the default) or `f32` (the control).
@@ -476,6 +480,7 @@ pub const Config = struct {
         if (raw.object.get("kda_verify")) |v| {
             const route: ?KdaVerify = if (v == .string) std.meta.stringToEnum(KdaVerify, v.string) else null;
             if (route) |r| c.kda_verify = r else c.malformed.kda_verify = true;
+            c.kda_verify_named = true;
         }
         if (raw.object.get("decode_dsa")) |v| {
             const route: ?DecodeDsa = if (v == .string) std.meta.stringToEnum(DecodeDsa, v.string) else null;
@@ -632,7 +637,7 @@ pub const Config = struct {
         if (c.malformed.kda_prologue) return error.Glm5NextKdaPrologueSetting;
         if (c.malformed.kda_verify) return error.Glm5NextKdaVerifySetting;
         // The fused verify replaces the MTP verify's KDA layer: without the lane there is no verify (an inert knob is a lie).
-        if (c.kda_verify == .fused and !c.mtp_lane) return error.Glm5NextKdaVerifyWithoutLane;
+        if (c.kda_verify_named and c.kda_verify == .fused and !c.mtp_lane) return error.Glm5NextKdaVerifyWithoutLane;
         if (c.malformed.decode_dsa) return error.Glm5NextDecodeDsaSetting;
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
@@ -785,10 +790,13 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(KdaPrologue.ops, (try parseSettings("{\"kda_prologue\":\"ops\"}")).kda_prologue);
     try testing.expectError(error.Glm5NextKdaPrologueSetting, (try parseSettings("{\"kda_prologue\":\"percore\"}")).validate());
     try testing.expectError(error.Glm5NextKdaPrologueSetting, (try parseSettings("{\"kda_prologue\":1}")).validate());
-    // The MTP verify's KDA layer: chain unless named; fused by name with the lane; refused by name without it; anything else
-    // refused by name.
-    try testing.expectEqual(KdaVerify.chain, pinned.kda_verify);
-    try testing.expectEqual(KdaVerify.chain, (try parseSettings("{\"mtp_lane\":true}")).kda_verify);
+    // The MTP verify's KDA layer: fused unless named (the default validates without the lane: nothing installed); chain (the
+    // control) by name; fused named without the lane refused by name; anything else refused by name.
+    try testing.expectEqual(KdaVerify.fused, pinned.kda_verify);
+    try testing.expectEqual(KdaVerify.fused, (try parseSettings("{\"mtp_lane\":true}")).kda_verify);
+    try (try parseSettings("{}")).validate();
+    try (try parseSettings("{\"mtp_lane\":false}")).validate();
+    try testing.expectEqual(KdaVerify.chain, (try parseSettings("{\"mtp_lane\":true,\"kda_verify\":\"chain\"}")).kda_verify);
     {
         const fused = try parseSettings("{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"kda_verify\":\"fused\"}");
         try testing.expectEqual(KdaVerify.fused, fused.kda_verify);

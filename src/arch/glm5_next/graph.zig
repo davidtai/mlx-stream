@@ -772,8 +772,8 @@ pub const Routes = struct {
     /// The decode lane's KDA layer (`decode_kda`, kda.zig `Step`): the op chain unless the module installed the fused
     /// text (kda_decode.zig). The prompt's wide calls run the op chain; the MTP verify's capture runs `kda_verify`.
     kda: kda.Step = .{},
-    /// The MTP verify's KDA layer (`kda_verify`, kda.zig `VerifyStep`): the op chain with the capture (the default and
-    /// the control) unless the module installed the fused verify text (kda_verify.zig).
+    /// The MTP verify's KDA layer (`kda_verify`, kda.zig `VerifyStep`): the op chain with the capture (the control,
+    /// `kda_verify: chain`) unless the module installed the fused verify text (kda_verify.zig; the default with the lane).
     kda_verify: kda.VerifyStep = .{},
     /// The decode lane's MLP activation (`decode_swiglu`): the op chain unless the module installed the fused text.
     swiglu: ?*const swiglu.Kernels = null,

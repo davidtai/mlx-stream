@@ -1,4 +1,4 @@
-//! GLM-5.3-Flash's KDA layer of the MTP verify in one text (`kda_verify: fused`; `chain`, the default, is the op chain:
+//! GLM-5.3-Flash's KDA layer of the MTP verify in one text (`kda_verify: fused`, the default; `chain`, by name, is the op chain:
 //! kda.zig `forwardCapture`, the control). The text (kernels/glm5n_kda_verify.metal, its element functions in
 //! kernels/header_glm5n_kda_verify.metal) runs, per KDA layer of every verify (R = 2 .. 4 rows), the prologue (the prompt
 //! prologue's exact text: conv, SiLU, bf16, the q / k norms and scales), the forget gate (`gateOf`), beta (bf16 sigmoid),
