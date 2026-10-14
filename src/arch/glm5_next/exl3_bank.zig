@@ -360,3 +360,40 @@ test "glm5_next exl3 bank: K other than 3, a codebook other than mul1, another m
         try testing.expectError(c.err, inspect(a, testing.io, s.root, 3, c.want, &d2));
     }
 }
+
+test "glm5_next exl3 bank: direct reads: the pack's record geometry passes the 4 KiB block check (and fails today's 16 KiB page rule); a 1 KiB-misaligned record is refused by name" {
+    const S = sdk_ext.expert.stream.StreamOf(SDK, false);
+    const io = sdk_ext.expert.io;
+    var layers: [42]Layer = undefined;
+    const ks: [42]u32 = @splat(3);
+    const total = expert_bank.layerTable(&ks, 4096, 2048, 288, &layers).?;
+    try testing.expectEqual(@as(u64, 114_598_084_608), total);
+    var bank: SDKBank = .{ .layers = &layers, .n_experts = 288, .first_moe_layer = 3, .record_bytes = 9_474_048, .sidecar = .{ .fd = -1, .size = total } };
+    // APFS's block (the micro-proof's fstatfs f_bsize on the pack's volume) on the 16 KiB page.
+    try io.checkDirectBlock(4096, 16384);
+    try S.checkDirectReads(&bank, 4096);
+    // Today's 16 KiB page rule refuses the pack: the rout / rin segments are 4 and 8 KiB, and records 1, 2, 3 of a layer
+    // sit 4, 8, 12 KiB past a 16 KiB boundary.
+    try testing.expectEqual(@as(u64, 4096), bank.recordOffset(5, 41) % 16384);
+    try testing.expectError(error.DirectReadsLength, S.checkDirectReads(&bank, 16384));
+    // A synthetic bank whose layer 7 starts 1 KiB off the block: refused by name.
+    layers[7].base_offset += 1024;
+    try testing.expectError(error.DirectReadsOffset, S.checkDirectReads(&bank, 4096));
+    layers[7].base_offset -= 1024;
+    // A segment of 1 KiB-misaligned length: refused by name.
+    layers[9].segments[1].length += 1024;
+    try testing.expectError(error.DirectReadsLength, S.checkDirectReads(&bank, 4096));
+    layers[9].segments[1].length -= 1024;
+    try S.checkDirectReads(&bank, 4096);
+    // Blocks the route refuses: not a power of two, under 512 B, over the page.
+    for ([_]u64{ 0, 256, 3072, 32768 }) |b| try testing.expectError(error.DirectReadsBlock, io.checkDirectBlock(b, 16384));
+    // The rows: host slot rows of Flash's segments (page-aligned banks, 4 / 8 KiB and 3 MiB rows) pass; a 1 KiB-skewed base
+    // is refused by name.
+    var hr = try S.HostSlotRows.init(&layers[0], 3);
+    defer hr.deinit();
+    var r: S.Rows = .{ .rows = 3, .row_bytes = hr.row_bytes };
+    for (&r.base, hr.banks) |*b, bk| b.* = @intFromPtr(bk.ptr);
+    try S.checkDirectRows(&r, 4096);
+    r.base[4] += 1024;
+    try testing.expectError(error.DirectReadsRow, S.checkDirectRows(&r, 4096));
+}

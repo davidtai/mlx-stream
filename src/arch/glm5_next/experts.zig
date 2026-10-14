@@ -124,18 +124,39 @@ comptime {
 /// phase rows' transient release, the read schedule's overlap route with prompt lever 1's relocation, decode's window 0,
 /// and the rate tally (`tally`: every layer pins at most floor(ratio x 288) experts; none at ratio 0).
 pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !B.Options {
-    return streamOptionsOf(B, rows, memory, event, tally);
+    return streamOptionsOf(B, rows, memory, event, tally, .staged);
 }
 
-/// `streamOptions` over a family's bridge `Bp` (the same options for every family).
-pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !Bp.Options {
+/// `streamOptions` over a family's bridge `Bp` (the same options for every family), with the demand reads' route
+/// (`settings.MissReads`): `direct` sets the pool's direct route and turns the decode pre-read off (a pre-range stages);
+/// the stream proves the geometry at its construction (`checkDirectReads`, `checkDirectRows`).
+pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings, miss_reads: settings.MissReads) !Bp.Options {
     var opts = Bp.eventOptions(rows, memory, event);
     opts.transient_release = true;
     try Bp.applyReadSchedule(&opts, read_schedule);
     opts.prompt_relocate = prompt_relocate;
     opts.decode_route_ids = mimo_stream.decodeRouteIds(decode_window);
     opts.tally = if (tally.enabled()) .{ .ratio = tally.ratio, .window = tally.window } else null;
+    switch (miss_reads) {
+        .staged => {},
+        .direct => {
+            opts.pool.direct = true;
+            opts.lookahead.?.preread = false;
+        },
+    }
     return opts;
+}
+
+/// The construction's engagement line of the demand reads' route (`miss_reads`): the installed block (0 = staged), whether
+/// the decode pre-read is installed, the geometry the stream checked, and the decode forms installed beside it (`forms`:
+/// null on the NVFP4 family), so one line names the experts' whole decode install.
+pub fn missReadsLine(buf: []u8, miss_reads: settings.MissReads, block: u64, preread: bool, layers: u32, experts: u32, record_bytes: u64, forms: ?settings.Exl3Forms) []const u8 {
+    var fb: [96]u8 = undefined;
+    const f = if (forms) |x| std.fmt.bufPrint(&fb, "gateup={s} down={s} maxm={d} min_p={d}", .{ @tagName(x.gateup), @tagName(x.down), x.maxm, x.min_p }) catch "" else "-";
+    return std.fmt.bufPrint(buf, "glm5_next experts: miss_reads={s} block={d} preread={s} records={d}x{d}x{d}B forms {s} ({s})", .{
+        @tagName(miss_reads), block, if (preread) "on" else "off", layers, experts, record_bytes, f,
+        if (miss_reads == .direct) "demand ranges preadv straight into the slot rows, no staging copy; ranges and rows checked on the block" else "demand ranges through the staging buffer and the copy",
+    }) catch buf[0..0];
 }
 
 /// The phase route of a routed call (MiMo's `decodeLane`): one row in either phase, up to `decode_lane_rows` in decode.
@@ -232,7 +253,7 @@ pub fn SourceOf(comptime fam: Family) type {
         /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
         /// routed layer's. `prompt`: the prompt levers' routes (prompt_levers.zig; the scheduler's route cut on either
         /// family, the DIG-X wave size and the rows' counting sort on exl3).
-        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, exl3_forms: settings.Exl3Forms, prompt: prompt_levers.Settings) !*Self {
+        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, exl3_forms: settings.Exl3Forms, prompt: prompt_levers.Settings, miss_reads: settings.MissReads) !*Self {
             const Bm = Fam.Bridge;
             const bm = Fam.bank;
             var open_diag: sdk.Diag = .{};
@@ -270,7 +291,7 @@ pub fn SourceOf(comptime fam: Family) type {
             // refused here, once, if a bank's spans outgrow it.
             if (Bm.S.stagingBytes(&self.sdk_bank) > settings.reader_staging_bytes) return error.Glm5NextReaderStaging;
             const event = try expert_event.createMetal();
-            self.sdk_stream = try Bm.Stream.init(a, &self.sdk_bank, try streamOptionsOf(Bm, self.rows, .{ .mlx = stream }, event, tally));
+            self.sdk_stream = try Bm.Stream.init(a, &self.sdk_bank, try streamOptionsOf(Bm, self.rows, .{ .mlx = stream }, event, tally, miss_reads));
             errdefer self.sdk_stream.deinit();
             self.stream_source = Bm.StreamSource.init(self.sdk_stream);
             try self.stream_source.installReadSchedule(read_schedule, mimo_stream.default_read_schedule_threshold);
@@ -370,10 +391,18 @@ pub fn SourceOf(comptime fam: Family) type {
                 log.info("glm5_next experts: exl3 k3 mul1 routes (decode_moe={s}: DeepSeek-V4.1's banked PREP=rin chain at hidden {d} / inter {d}, in_rin + gate/up mul1h GEMVs + gu_epi + din_rin + down mul1h GEMV + dpost(bf16), one launch each per wave over the three banks{s}; prompt: DIG-X waves of <= {d} rows / {d} experts, take2 + gate|up GEMM (m128) + onepass + down GEMM (m128) + rot_widen1(bf16); bank {d} x {d} records of {d} B, codebook mul1 0x{X}, no global-scale word: scale-line isolation not applicable; the NVFP4 draft bank unchanged)\n", .{ @tagName(decode_moe), exl3_kernels.hidden, exl3_kernels.inter, if (decode_moe == .hitpass) ", each call's hit wave from the layer's resident slot LUT" else if (decode_moe == .stock) ", unbanked: one group per bank" else "", prompt.wave_rows, @import("../../exl3/quant.zig").wave_max, geo.num_moe_layers, geo.num_experts, geo.record_bytes, exl3_kernels.codebook_multiplier });
                 // The decode forms bound at Math.init (`exl3_gateup_form` / `exl3_down_form`; seam = lane B's chain above).
                 log.info("glm5_next experts: exl3 k3 forms gateup={s} down={s} maxm={d} min_p={d}\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down), exl3_forms.maxm, exl3_forms.min_p });
-            } else switch (decode_moe) {
+            }
+            // The demand reads' route as the stream installed it (`miss_reads`): its block, read back from the stream.
+            {
+                var lb: [320]u8 = undefined;
+                log.info("{s}\n", .{missReadsLine(&lb, miss_reads, self.sdk_stream.direct_block, self.sdk_stream.preread, geo.num_moe_layers, geo.num_experts, geo.record_bytes, if (comptime fam == .exl3) exl3_forms else null)});
+            }
+            if (comptime fam != .exl3) {
+                switch (decode_moe) {
                 .stock => {},
                 .fused => log.info("glm5_next decode experts installed: decode_moe=fused (the NVFP4 k1 texts over the three banks, one launch of each per wave; the hit wave routed on the host)\n", .{}),
                 .hitpass => log.info("glm5_next decode experts installed: decode_moe=hitpass (the NVFP4 k1 texts over the three banks; each call's hit wave from the layer's resident slot LUT behind the routing barrier, the miss parts after the route)\n", .{}),
+                }
             }
             try self.beginPrefill();
             return self;
@@ -634,6 +663,28 @@ test "glm5_next experts: the stream's options install the overlap schedule early
     try testing.expectEqual(mimo_stream.decodeRouteIds(decode_window), opts.decode_route_ids);
     try testing.expectEqual(@as(u64, 123), opts.event.?.backend.metal);
     try testing.expectEqualSlices(u32, &rows, opts.rows);
+}
+
+test "glm5_next experts: miss_reads: staged keeps the pool's staging route and the decode pre-read; direct sets the direct route with the pre-read off; the engagement line names the installed route" {
+    const testing = std.testing;
+    const rows = [_]u32{ 190, 190 };
+    const Bx = Types(.exl3).Bridge;
+    const staged = try streamOptionsOf(Bx, &rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .staged);
+    try testing.expect(!staged.pool.direct);
+    try testing.expect(staged.lookahead.?.preread);
+    const direct = try streamOptionsOf(Bx, &rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .direct);
+    try testing.expect(direct.pool.direct);
+    try testing.expect(!direct.lookahead.?.preread);
+    // Everything else is the control's.
+    var same = direct;
+    same.pool.direct = false;
+    same.lookahead.?.preread = true;
+    try testing.expectEqualDeep(staged, same);
+    var buf: [320]u8 = undefined;
+    const forms: settings.Exl3Forms = .{ .gateup = .guone, .down = .pair };
+    try testing.expectEqualStrings("glm5_next experts: miss_reads=direct block=4096 preread=off records=42x288x9474048B forms gateup=guone down=pair maxm=1 min_p=1 (demand ranges preadv straight into the slot rows, no staging copy; ranges and rows checked on the block)", missReadsLine(&buf, .direct, 4096, false, 42, 288, 9_474_048, forms));
+    try testing.expectEqualStrings("glm5_next experts: miss_reads=staged block=0 preread=on records=42x288x9474048B forms gateup=guone down=pair maxm=1 min_p=1 (demand ranges through the staging buffer and the copy)", missReadsLine(&buf, .staged, 0, true, 42, 288, 9_474_048, forms));
+    try testing.expectEqualStrings("glm5_next experts: miss_reads=staged block=0 preread=on records=42x288x9474048B forms - (demand ranges through the staging buffer and the copy)", missReadsLine(&buf, .staged, 0, true, 42, 288, 9_474_048, null));
 }
 
 test "glm5_next experts: the rate tally's pins on Flash's geometry: the top floor(ratio x 288) experts by rate, at most the layer's rows, ties by the lower id; none unseeded" {

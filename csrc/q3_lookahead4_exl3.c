@@ -496,24 +496,24 @@ static void gauge_exit(void) {
     pthread_mutex_unlock(&mu);
 }
 
-/* DIRECT: a range whose file offset, destination rows and part lengths are all page multiples is read straight into
- * its rows by preadv (one iovec per part), no staging buffer and no scatter copy.  Off unless q3ld_direct_config. */
+/* DIRECT (miss_reads, 2026-10-14; ABI 2026101401): the demand ranges' read ROUTE, chosen once on a stopped pool by
+ * q3ld_direct_config.  On: every demand range is read straight into its rows by preadv (one iovec per part), no staging
+ * buffer and no scatter copy; off (the default): the staging loop + the copy.  No per-range eligibility test: the owner
+ * proves once, at construction, that every range it will submit is aligned to the file's block size (the record
+ * offsets, the part lengths, the slot rows; sdk_ext/expert/stream.zig checkDirectReads), so the F_NOCACHE preadv takes
+ * the uncached path.  Either route lands the file's bytes; the route never decides correctness, only the copy. */
 static int direct_reads = 0;
+static int run_range_staged(const job_t *job, const range_t *rg, char *stage, int64_t *out);
+static int run_range_direct_route(const job_t *job, const range_t *rg, char *stage, int64_t *out);
+static int (*run_range)(const job_t *, const range_t *, char *, int64_t *) = run_range_staged;
 
 int q3ld_direct_config(int32_t on) {
+    pthread_mutex_lock(&mu);
+    if (running) { pthread_mutex_unlock(&mu); return -1; }
     direct_reads = on != 0;
+    run_range = direct_reads ? run_range_direct_route : run_range_staged;
+    pthread_mutex_unlock(&mu);
     return 0;
-}
-
-static int direct_ok(const job_t *job, const range_t *rg) {
-    if (!direct_reads || rg->offset % page_size) return 0;
-    int64_t total = 0;
-    for (int32_t d = 0; d < rg->ndst; d++) {
-        if (rg->len[d] == 0) continue;
-        if (rg->dst[d] % (uint64_t)page_size || rg->len[d] % page_size) return 0;
-        total += rg->len[d];
-    }
-    return total > 0 && rg->offset + total <= job->file_size;
 }
 
 /* the DIRECT read: preadv into the rows until every part is full; the status words as run_range's */
@@ -555,9 +555,13 @@ static int run_range_direct(const job_t *job, const range_t *rg, int64_t *out) {
     return status;
 }
 
+static int run_range_direct_route(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
+    (void)stage;
+    return run_range_direct(job, rg, out);
+}
+
 /* one range: stock _readv_range_into_impl loop + _read_some steps; returns the status (q3_nativeissue.c) */
-static int run_range(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
-    if (direct_ok(job, rg)) return run_range_direct(job, rg, out);
+static int run_range_staged(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
     int64_t calls = 0, returned = 0, read_total = 0, t_start = 0;
     int status = ST_OK;
     int32_t d = 0;
@@ -1660,6 +1664,8 @@ int q3ld_stop(void) {
     }
     running = 0; nworkers = 0; nspec_started = 0; __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); nspec = 0; nspec_threads = 0; spec_configured = 0;
     spec_idle_busy = SPEC_MAX_DEMAND_BUSY;
+    direct_reads = 0;
+    run_range = run_range_staged;
     free(ranges); free(queue); free(pre_of); free(sub_len); ranges = 0; queue = 0; pre_of = 0; sub_len = 0;
     for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
     pre_on = 0; pre_ngu = pre_ndown = 0; pre_gu_total = 0;
@@ -1986,7 +1992,7 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026101201; }              /* WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
+int32_t q3ld_abi(void) { return 2026101401; }              /* DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }

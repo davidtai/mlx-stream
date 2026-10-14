@@ -64,8 +64,9 @@ pub const test_abi = if (builtin.is_test) struct {
     pub const status_words = res_w;
 } else struct {};
 
-/// The C pool's ABI (`q3ld_abi`): 2026101201, the submit-wide WITHDRAW over the range-job queue.
-pub const abi_version = 2026101201;
+/// The C pool's ABI (`q3ld_abi`): 2026101401, DIRECT reads as a construction-time route (2026101201: the submit-wide
+/// WITHDRAW over the range-job queue).
+pub const abi_version = 2026101401;
 pub const max_workers = 8;
 /// Records per job (one fill unit).
 pub const max_items = 8;
@@ -183,8 +184,10 @@ pub const Options = struct {
     /// wider spans sizes it from the bank (`stream.Options.staging_from_bank`).
     staging_bytes: u64 = 9 << 20,
     tickets: u32 = 256,
-    /// A demand range whose file offset, destination rows and part lengths are all page multiples reads straight into
-    /// its rows (one preadv iovec per part), with no staging and no copy; any other range takes the staging loop.
+    /// The demand ranges' read route, fixed at start: true reads every demand range straight into its rows (one preadv
+    /// iovec per part, no staging, no copy); false (the default) takes the staging loop and the copy. The pool tests no
+    /// range: the owner proves the alignment once at construction (`checkDirectBlock` + the stream's
+    /// `checkDirectReads`), so the uncached preadv takes the drive's direct path.
     direct: bool = false,
     spec: ?Spec = null,
 };
@@ -230,6 +233,31 @@ pub const UncachedFd = struct {
         _ = std.c.close(f.fd);
     }
 };
+
+/// Why a direct-read geometry is refused (`checkDirectBlock`, the stream's `checkDirectReads`), each by name.
+pub const DirectError = error{ DirectReadsBlock, DirectReadsOffset, DirectReadsLength, DirectReadsRow };
+
+/// The file system block of `fd` (fstatfs `f_bsize`: APFS 4,096 B): the alignment at which an F_NOCACHE preadv reads
+/// straight from the drive into the caller's pages. Read once, at construction.
+pub fn fileBlockSize(fd: UncachedFd) error{StatFailed}!u64 {
+    if (comptime builtin.os.tag != .macos) return error.StatFailed;
+    var st: Statfs = undefined;
+    if (fstatfs(fd.fd, &st) != 0 or st.f_bsize == 0) return error.StatFailed;
+    return st.f_bsize;
+}
+
+/// Darwin's `struct statfs` (64-bit inodes, arm64's only layout): only `f_bsize` is read.
+const Statfs = extern struct { f_bsize: u32, f_iosize: i32, rest: [2160]u8 };
+extern "c" fn fstatfs(fd: c_int, buf: *Statfs) c_int;
+
+comptime {
+    if (@sizeOf(Statfs) != 2168) @compileError("expert io: struct statfs is 2,168 bytes on Darwin");
+}
+
+/// A direct-read block: a power of two of at least 512 B and at most `page` (the pool's staging page).
+pub fn checkDirectBlock(block: u64, page: u64) DirectError!void {
+    if (block < 512 or !std.math.isPowerOfTwo(block) or block > page or page % block != 0) return error.DirectReadsBlock;
+}
 
 pub const OpenError = error{ NotFound, OpenFailed, StatFailed, NotRegularFile, NoCacheRefused };
 
@@ -324,7 +352,7 @@ pub const Pool = struct {
         if (c.q3ld_spec_config(threads, &bufs, nslots, @intCast(slot_bytes), rec_len, @intCast(if (opt.spec) |s| s.chunk_bytes else 0), &self.counters) != 0)
             return error.PoolUnavailable;
         if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
-        _ = c.q3ld_direct_config(@intFromBool(opt.direct));
+        if (c.q3ld_direct_config(@intFromBool(opt.direct)) != 0) return error.PoolUnavailable;
         var ptrs: [max_workers]u64 = undefined;
         for (0..opt.workers) |w| ptrs[w] = @intFromPtr(staging.ptr) + w * opt.staging_bytes;
         const rc = c.q3ld_start(@intCast(opt.workers), &ptrs, @intCast(opt.staging_bytes), @intCast(page), res.ptr, opt.tickets, log_arr.ptr, opt.tickets, &self.gauge);
