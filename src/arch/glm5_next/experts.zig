@@ -397,8 +397,9 @@ pub fn SourceOf(comptime fam: Family) type {
             if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
             if (comptime fam == .exl3) {
                 log.info("glm5_next experts: exl3 k3 mul1 routes (decode_moe={s}: DeepSeek-V4.1's banked PREP=rin chain at hidden {d} / inter {d}, in_rin + gate/up mul1h GEMVs + gu_epi + din_rin + down mul1h GEMV + dpost(bf16), one launch each per wave over the three banks{s}; prompt: DIG-X waves of <= {d} rows / {d} experts, take2 + gate|up GEMM (m128) + onepass + down GEMM (m128) + rot_widen1(bf16); bank {d} x {d} records of {d} B, codebook mul1 0x{X}, no global-scale word: scale-line isolation not applicable; the NVFP4 draft bank unchanged)\n", .{ @tagName(decode_moe), exl3_kernels.hidden, exl3_kernels.inter, if (decode_moe == .hitpass) ", each call's hit wave from the layer's resident slot LUT" else if (decode_moe == .stock) ", unbanked: one group per bank" else "", prompt.wave_rows, @import("../../exl3/quant.zig").wave_max, geo.num_moe_layers, geo.num_experts, geo.record_bytes, exl3_kernels.codebook_multiplier });
-                // The decode forms bound at Math.init (`exl3_gateup_form` / `exl3_down_form`; seam = lane B's chain above).
-                log.info("glm5_next experts: exl3 k3 forms gateup={s} down={s} maxm={d} min_p={d}\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down), exl3_forms.maxm, exl3_forms.min_p });
+                // The decode forms bound at Math.init (`exl3_gateup_form` / `exl3_down_form` / `exl3_glue`; seam = lane B's chain
+                // above; glue=fused: gu_epi + din_rin in one launch, g5k3_glue).
+                log.info("glm5_next experts: exl3 k3 forms gateup={s} down={s} maxm={d} min_p={d} glue={s}\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down), exl3_forms.maxm, exl3_forms.min_p, if (exl3_forms.isSeam()) "separate" else @tagName(exl3_forms.forms().glueRoute()) });
             }
             // The demand reads' route as the stream installed it (`miss_reads`): its block, read back from the stream.
             {

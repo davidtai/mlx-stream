@@ -64,6 +64,10 @@ KERNELS = [
      [vec("xh", "float32", HID, "P"), IDS] + banks("code", code), [("out", "float32")], [[("IT", GU[0]), ("OT", GU[1])]]),
     ("g5k3_gemv_mcg", FDIR, [],
      [vec("xh", "float32", HID, "P"), IDS] + banks("code", code), [("out", "float32")], [[("IT", GU[0]), ("OT", GU[1])], [("IT", DN[0]), ("OT", DN[1])]]),
+    ("g5k3_glue", FDIR, [],
+     [vec("zg", "float32", INTER, "P"), vec("zu", "float32", INTER, "P")] + banks("rg", lambda n: vec(n, "float16", INTER))
+     + banks("ru", lambda n: vec(n, "float16", INTER)) + banks("rn", lambda n: vec(n, "float16", INTER)) + [IDS],
+     [("out", "float32")], [[("INTER", INTER)]]),
     ("glm5n_exl3_gemv", SDIR, [],
      [vec("xh", "float32", HID, "P"), IDS] + banks("code", code), [("out", "float32")], [[("IT", GU[0]), ("OT", GU[1])], [("IT", DN[0]), ("OT", DN[1])]]),
     ("glm5n_exl3_dpost", SDIR, [],

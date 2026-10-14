@@ -604,3 +604,114 @@ test "glm5_next exl3 ref: a bf16-rounded truth passes the bf16 ratio, an error o
     b[100] = r[100] * (1.0 + 1.0 / 128.0) + 1.0;
     try testing.expect(bf16ErrRatio(&b, &r) > 1.0);
 }
+
+// ── The glue (exl3_glue): gu_epi + din_rin as two launches and as g5k3_glue, per (128-column block, row) ──
+
+/// gu_epi's per-block arithmetic as its text runs it: the two butterflies, then per column e the scaled gate / up words
+/// times their f16 output scales, the clamps, the sigmoid, h = (gate * sg) * up.
+fn glueEpi(zg: *const [128]f32, zu: *const [128]f32, rg: []const u16, ru: []const u16, h: *[128]f32) void {
+    var bg = zg.*;
+    var bu = zu.*;
+    emuButterfly(&bg);
+    emuButterfly(&bu);
+    for (0..128) |e| {
+        const g = bg[e] * SCALE;
+        const gm = g * @as(f32, @floatCast(h16(rg[e])));
+        const gate = if (std.math.isNan(gm)) gm else (if (gm < 10.0) gm else 10.0);
+        const u = bu[e] * SCALE;
+        const um = u * @as(f32, @floatCast(h16(ru[e])));
+        const up0 = if (std.math.isNan(um)) um else (if (um > -10.0) um else -10.0);
+        const up = if (std.math.isNan(up0)) up0 else (if (up0 < 10.0) up0 else 10.0);
+        const yv = 1 / (1 + @exp(@abs(gate)));
+        const sg = if (gate < 0) yv else 1 - yv;
+        const sl = gate * sg;
+        h[e] = sl * up;
+    }
+}
+
+/// din_rin's per-block arithmetic: B = h * f16 rin scale, the butterfly, times SCALE.
+fn glueDin(h: *const [128]f32, rn: []const u16, hd: *[128]f32) void {
+    var b: [128]f32 = undefined;
+    for (0..128) |c| b[c] = h[c] * @as(f32, @floatCast(h16(rn[c])));
+    emuButterfly(&b);
+    for (0..128) |c| hd[c] = b[c] * SCALE;
+}
+
+/// The two launches: gu_epi stores h to the device array (an f32 word), din_rin reads it back.
+pub fn emuGlueSeparate(zg: []const f32, zu: []const f32, rg: []const u16, ru: []const u16, rn: []const u16, h_dev: []f32, hd: []f32) void {
+    var blk: usize = 0;
+    while (blk * 128 < zg.len) : (blk += 1) {
+        const o = blk * 128;
+        var h: [128]f32 = undefined;
+        glueEpi(zg[o..][0..128], zu[o..][0..128], rg[o..][0..128], ru[o..][0..128], &h);
+        @memcpy(h_dev[o..][0..128], &h);
+    }
+    blk = 0;
+    while (blk * 128 < zg.len) : (blk += 1) {
+        const o = blk * 128;
+        glueDin(h_dev[o..][0..128], rn[o..][0..128], hd[o..][0..128]);
+    }
+}
+
+/// g5k3_glue as its text runs it: per block, gu_epi's arithmetic into the threadgroup array H (an f32 word), then
+/// din_rin's arithmetic from H into BD, the butterfly, times SCALE, in the same threadgroup.
+pub fn emuGlueFused(zg: []const f32, zu: []const f32, rg: []const u16, ru: []const u16, rn: []const u16, hd: []f32) void {
+    var blk: usize = 0;
+    while (blk * 128 < zg.len) : (blk += 1) {
+        const o = blk * 128;
+        var H: [128]f32 = undefined;
+        glueEpi(zg[o..][0..128], zu[o..][0..128], rg[o..][0..128], ru[o..][0..128], &H);
+        glueDin(&H, rn[o..][0..128], hd[o..][0..128]);
+    }
+}
+
+test "glm5_next exl3 ref: the fused glue (g5k3_glue) equals gu_epi + din_rin bit for bit over every word (random rows, the clamps, NaN, infinities, signed zeros, subnormals)" {
+    const a = testing.allocator;
+    const rows = 6;
+    const n = rows * inter;
+    const zg = try a.alloc(f32, n);
+    defer a.free(zg);
+    const zu = try a.alloc(f32, n);
+    defer a.free(zu);
+    const rg = try a.alloc(u16, inter);
+    defer a.free(rg);
+    const ru = try a.alloc(u16, inter);
+    defer a.free(ru);
+    const rn = try a.alloc(u16, inter);
+    defer a.free(rn);
+    fillScales(0x676c7565, 1.0, rg);
+    fillScales(0x676c7566, 1.0, ru);
+    fillScales(0x676c7567, 1.0, rn);
+    var s: u64 = 0x676c7565;
+    const specials = [_]f32{ 0.0, -0.0, std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32), 1.0e-40, -1.0e-40, 10.0, -10.0, 9.999999, 10.000001, std.math.floatMax(f32), -std.math.floatMax(f32) };
+    for (zg, zu, 0..) |*g, *u, i| {
+        const z0 = ek.splitmix64(&s);
+        const z1 = ek.splitmix64(&s);
+        // rows 0-3: magnitudes 2^-12 .. 2^19 with signs; rows 4-5: one special word in 8
+        const mg: f32 = @floatCast((unit(z0) - 0.5) * std.math.pow(f64, 2.0, @as(f64, @floatFromInt(@as(i32, @intCast(z0 >> 59)) - 12))));
+        const mu: f32 = @floatCast((unit(z1) - 0.5) * std.math.pow(f64, 2.0, @as(f64, @floatFromInt(@as(i32, @intCast(z1 >> 59)) - 12))));
+        g.* = mg;
+        u.* = mu;
+        if (i >= 4 * inter and (z0 & 7) == 0) g.* = specials[@intCast((z0 >> 8) % specials.len)];
+        if (i >= 4 * inter and (z1 & 7) == 0) u.* = specials[@intCast((z1 >> 8) % specials.len)];
+    }
+    const h_dev = try a.alloc(f32, inter);
+    defer a.free(h_dev);
+    const sep = try a.alloc(f32, inter);
+    defer a.free(sep);
+    const fus = try a.alloc(f32, inter);
+    defer a.free(fus);
+    var nan_words: usize = 0;
+    for (0..rows) |r| {
+        const z = zg[r * inter ..][0..inter];
+        const w = zu[r * inter ..][0..inter];
+        emuGlueSeparate(z, w, rg, ru, rn, h_dev, sep);
+        emuGlueFused(z, w, rg, ru, rn, fus);
+        for (sep, fus) |p, q| {
+            try testing.expectEqual(@as(u32, @bitCast(p)), @as(u32, @bitCast(q)));
+            if (std.math.isNan(p)) nan_words += 1;
+        }
+    }
+    // the special rows reach the NaN path (the clamps keep NaN; the butterflies spread it)
+    try testing.expect(nan_words > 0);
+}

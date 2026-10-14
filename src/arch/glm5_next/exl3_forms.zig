@@ -14,6 +14,11 @@
 //!     GEMV and dpost in one launch).
 //!   `maxm` (fused forms): 1, or 4 = the union rule of the NVFP4 k1 texts (a slot's pairs in one threadgroup, each
 //!     trellis word decoded once for all of them).
+//!   `glue` (`Glue`): `separate` (gu_epi, then din_rin at the head of `down`) or `fused` (`g5k3_glue`, generated from
+//!     the two texts: gu_epi's text up to its store, the h words in threadgroup memory, din_rin's text from its read on;
+//!     one launch). Under `fused`, `gateUp` returns din_rin's output (the rotated down input) and `down` starts at its
+//!     GEMV: the scheduler carries the [P, inter] f32 array between the two unchanged. It applies where both glue
+//!     launches exist (not the fused gate / up forms, not the prologue down forms: `Forms.glueRoute`).
 //! Every form keeps the seam's arithmetic and order per output word (fma chains per lane over the k-tiles, the column
 //! sums, the 128-point butterflies, the scales, the clamped SwiGLU, one rounding on dpost's store); only where values
 //! live and which thread computes them change. A form that fails the device parity is not installed.
@@ -43,6 +48,7 @@ comptime {
 
 pub const GuForm = enum { seam, u8, guone, mcg, fused16, fused8 };
 pub const DnForm = enum { seam, pair, mcg, fused1, fused2, pro1, pro2 };
+pub const Glue = enum { separate, fused };
 pub const Forms = struct {
     gu: GuForm = .seam,
     dn: DnForm = .seam,
@@ -51,6 +57,8 @@ pub const Forms = struct {
     /// varies per call, fixed per P at install (the fused forms' threadgroups cover a 128-column block each, so a
     /// one-pair wave fills 16 (gate / up) or 32 (down) of the GPU's cores; the bench measures the crossover).
     min_p: u32 = 1,
+    /// gu_epi + din_rin: two launches (`separate`) or one (`fused`, where `glueRoute` admits it).
+    glue: Glue = .separate,
 
     pub fn fusedGu(f: Forms) bool {
         return f.gu == .fused16 or f.gu == .fused8;
@@ -69,19 +77,27 @@ pub const Forms = struct {
         if (f.min_p != 1 and !(f.fusedGu() or f.fusedDn())) return error.Glm5NextExl3Forms;
     }
 
-    /// The forms a wave of P pairs runs: these, or the seam chain below `min_p`.
+    /// The glue these forms run: `fused` only where both glue launches exist (the fused gate / up forms carry gu_epi in
+    /// their text, the prologue down forms din_rin), else `separate`.
+    pub fn glueRoute(f: Forms) Glue {
+        return if (f.glue == .fused and !f.fusedGu() and f.dn != .pro1 and f.dn != .pro2) .fused else .separate;
+    }
+
+    /// The forms a wave of P pairs runs: these, or the seam chain below `min_p` (the glue kept); the glue resolved.
     pub fn at(f: Forms, p: u32) Forms {
-        return if (p < f.min_p) .{} else f;
+        var o: Forms = if (p < f.min_p) .{ .glue = f.glue } else f;
+        o.glue = o.glueRoute();
+        return o;
     }
 
     pub fn name(f: Forms, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "gu={t},dn={t},maxm={d},min_p={d}", .{ f.gu, f.dn, f.maxm, f.min_p }) catch "forms";
+        return std.fmt.bufPrint(buf, "gu={t},dn={t},maxm={d},min_p={d},glue={t}", .{ f.gu, f.dn, f.maxm, f.min_p, f.glueRoute() }) catch "forms";
     }
 };
 
 // ── The texts ──
 
-pub const Kernel = enum { g5k3_gu_fused, g5k3_dn_fused, g5k3_dn_pro, g5k3_guone, g5k3_pair, g5k3_gemv_u8, g5k3_gemv_mcg };
+pub const Kernel = enum { g5k3_gu_fused, g5k3_dn_fused, g5k3_dn_pro, g5k3_guone, g5k3_pair, g5k3_gemv_u8, g5k3_gemv_mcg, g5k3_glue };
 const n_kernels = std.meta.fieldNames(Kernel).len;
 const dir = "../../kernels/glm5_next_exl3_forms/";
 pub const texts: [n_kernels][:0]const u8 = blk: {
@@ -99,6 +115,7 @@ pub const text_sha256 = [n_kernels]*const [64]u8{
     "5214c036ac204e09a420dd36466c2831b1a3bec5539fdef6d4a75a8541eab1b2",
     "66d970fa467925ce0f5d9dec3bdba70d1e0955dbdaabbcf3e193ca2676021e5d",
     "68722bac9793357fe9046c5b5f6abfea4d78b55ed05f1c0b5a712b66a9d5d780",
+    "32d5d64f1bb5259da8c7f28c54b26347a95208b8fa91c8eb7add78ad1d52a428",
 };
 pub const header_sha256: *const [64]u8 = "4e4dbb86d58cccb83e961c96308ca43bb660f72223f0e795f53484fa956cc3f8";
 
@@ -107,7 +124,9 @@ pub fn checkPins() error{Glm5NextExl3FormsTextNotPinned}!void {
     if (!std.mem.eql(u8, &kset.shaHex(header), header_sha256)) return error.Glm5NextExl3FormsTextNotPinned;
 }
 
-const Sig = struct { ins: []const [*:0]const u8, outs: []const [*:0]const u8, hdr: bool };
+/// A text's MLX signature; `contiguous` false for the texts that read their inputs' strides (g5k3_glue: gu_epi's and
+/// din_rin's reads, as the seam registers them).
+const Sig = struct { ins: []const [*:0]const u8, outs: []const [*:0]const u8, hdr: bool, contiguous: bool = true };
 
 fn sigOf(k: Kernel) Sig {
     return switch (k) {
@@ -116,6 +135,7 @@ fn sigOf(k: Kernel) Sig {
         .g5k3_dn_pro => .{ .ins = &.{ "h", "ids", "cd0", "cd1", "cd2", "rn0", "rn1", "rn2", "rd0", "rd1", "rd2" }, .outs = &.{"out"}, .hdr = true },
         .g5k3_guone => .{ .ins = &.{ "xh_g", "xh_u", "ids", "code_g0", "code_g1", "code_g2", "code_u0", "code_u1", "code_u2" }, .outs = &.{ "out_g", "out_u" }, .hdr = false },
         .g5k3_pair, .g5k3_gemv_u8, .g5k3_gemv_mcg => .{ .ins = &.{ "xh", "ids", "code0", "code1", "code2" }, .outs = &.{"out"}, .hdr = false },
+        .g5k3_glue => .{ .ins = &.{ "zg", "zu", "rg0", "rg1", "rg2", "ru0", "ru1", "ru2", "rn0", "rn1", "rn2", "ids" }, .outs = &.{"out"}, .hdr = false, .contiguous = false },
     };
 }
 
@@ -281,7 +301,7 @@ pub fn install(a: std.mem.Allocator, seam: *const xk.Kernels, forms: Forms, out_
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(@ptrCast(sig.outs.ptr), sig.outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        self.k[i] = mtl.mlx_fast_metal_kernel_new(@tagName(k), iv, ov, texts[i], if (sig.hdr) header else "", true, false);
+        self.k[i] = mtl.mlx_fast_metal_kernel_new(@tagName(k), iv, ov, texts[i], if (sig.hdr) header else "", sig.contiguous, false);
         if (self.k[i].ctx == null) {
             diag.set("glm5_next exl3 forms: {s} was not created", .{@tagName(k)});
             return error.Glm5NextExl3FormsKernel;
@@ -300,8 +320,9 @@ pub fn install(a: std.mem.Allocator, seam: *const xk.Kernels, forms: Forms, out_
             .guone => try cfgOf(guoneLaunch(p)),
             .fused16, .fused8 => try cfgOf(guFusedLaunch(p, ef.gu, ef.maxm)),
         };
+        // gu_epi (or g5k3_glue: the same grid and output) and din_rin (not under the fused glue)
         if (!ef.fusedGu()) w.epi = try seamCfg(xk.rotLaunch(p, inter, "INTER"));
-        if (ef.dn != .pro1 and ef.dn != .pro2) w.din = try seamCfg(xk.rotLaunch(p, inter, "INTER"));
+        if (ef.dn != .pro1 and ef.dn != .pro2 and ef.glue == .separate) w.din = try seamCfg(xk.rotLaunch(p, inter, "INTER"));
         w.d1 = switch (ef.dn) {
             .seam => try seamCfg(xk.gemvLaunch(p, inter, hidden)),
             .pair, .mcg => try cfgOf(gemvLaunch(p, inter, hidden)),
@@ -331,7 +352,8 @@ fn widthOf(g: *G, x: T) !u32 {
 }
 
 /// The seam's `gateUp` in the installed form: x bf16 [P, hidden], ids u32 [P] packed `bank << 24 | slot row` -> the
-/// clamped SwiGLU f32 [P, inter].
+/// clamped SwiGLU f32 [P, inter] (glue `separate`), or under the fused glue din_rin's output of it (f32 [P, inter]):
+/// `down` takes whichever its width's forms return.
 pub fn gateUp(f: *const Installed, g: *G, x: T, ids: T, banks: *const [n_banks]BankArrays) !T {
     const p = try widthOf(g, x);
     const w = &f.w[p - 1];
@@ -356,7 +378,10 @@ pub fn gateUp(f: *const Installed, g: *G, x: T, ids: T, banks: *const [n_banks]B
         },
     }
     var out: [1]T = undefined;
-    try apply(g, f.seamK(.gu_epi), w.epi, &.{ z[0], z[1], banks[0].gate.rout, banks[1].gate.rout, banks[2].gate.rout, banks[0].up.rout, banks[1].up.rout, banks[2].up.rout, ids }, &out);
+    switch (w.f.glue) {
+        .separate => try apply(g, f.seamK(.gu_epi), w.epi, &.{ z[0], z[1], banks[0].gate.rout, banks[1].gate.rout, banks[2].gate.rout, banks[0].up.rout, banks[1].up.rout, banks[2].up.rout, ids }, &out),
+        .fused => try apply(g, f.kern(.g5k3_glue), w.epi, &.{ z[0], z[1], banks[0].gate.rout, banks[1].gate.rout, banks[2].gate.rout, banks[0].up.rout, banks[1].up.rout, banks[2].up.rout, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, ids }, &out),
+    }
     return out[0];
 }
 
@@ -373,8 +398,8 @@ pub fn down(f: *const Installed, g: *G, h: T, ids: T, banks: *const [n_banks]Ban
         },
         else => {},
     }
-    var hd: [1]T = undefined;
-    try apply(g, f.seamK(.din_rin), w.din, &.{ h, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, ids }, &hd);
+    var hd: [1]T = .{h};
+    if (w.f.glue == .separate) try apply(g, f.seamK(.din_rin), w.din, &.{ h, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, ids }, &hd);
     switch (w.f.dn) {
         .fused1, .fused2 => {
             try apply(g, f.kern(.g5k3_dn_fused), w.d1, &.{ hd[0], ids, banks[0].down.code, banks[1].down.code, banks[2].down.code, banks[0].down.rout, banks[1].down.rout, banks[2].down.rout }, &out);
@@ -454,4 +479,58 @@ test "glm5_next exl3 forms: threadgroup memory of every fused instance fits 32 K
         for ([_]u32{ 1, 2 }) |nb| try testing.expect(mm * nb * 128 * 4 <= 32 << 10);
     }
     for ([_]u32{ 1, 2 }) |nb| try testing.expect(1 * inter * 4 + nb * 128 * 4 <= 32 << 10);
+}
+
+test "glm5_next exl3 forms: the glue route: fused only where both glue launches exist, resolved per wave width" {
+    const fu: Forms = .{ .gu = .guone, .dn = .pair, .glue = .fused };
+    try testing.expectEqual(Glue.fused, fu.glueRoute());
+    try testing.expectEqual(Glue.fused, fu.at(1).glue);
+    try testing.expectEqual(Glue.fused, (Forms{ .gu = .seam, .dn = .fused1, .glue = .fused }).glueRoute());
+    try testing.expectEqual(Glue.separate, (Forms{ .gu = .fused16, .dn = .pair, .glue = .fused }).glueRoute());
+    try testing.expectEqual(Glue.separate, (Forms{ .gu = .guone, .dn = .pro1, .glue = .fused }).glueRoute());
+    try testing.expectEqual(Glue.separate, (Forms{ .gu = .guone, .dn = .pair }).at(7).glue);
+    // below min_p the seam chain keeps the setting's glue
+    const h: Forms = .{ .gu = .fused16, .dn = .fused1, .min_p = 4, .glue = .fused };
+    try testing.expectEqual(Forms{ .glue = .fused }, h.at(3));
+    try testing.expectEqual(Glue.separate, h.at(4).glue);
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("gu=guone,dn=pair,maxm=1,min_p=1,glue=fused", fu.name(&buf));
+}
+
+test "glm5_next exl3 forms: g5k3_glue is gu_epi's text then din_rin's, line for line (stores / loads of h through threadgroup memory, din_rin's array renamed)" {
+    const a = testing.allocator;
+    const glue = texts[@intFromEnum(Kernel.g5k3_glue)];
+    const epi = xk.texts[@intFromEnum(xk.Kernel.gu_epi)];
+    const din = xk.texts[@intFromEnum(xk.Kernel.din_rin)];
+    var n: usize = 0;
+    // every line of gu_epi below its two-line head is in the glue text, its two h stores as threadgroup stores
+    var it = std.mem.splitScalar(u8, epi, '\n');
+    _ = it.next();
+    _ = it.next();
+    while (it.next()) |line| {
+        if (std.mem.eql(u8, line, "        out[row * uint(INTER) + col] = sl * up;")) {
+            try testing.expect(std.mem.indexOf(u8, glue, "        H[e] = sl * up;\n") != null);
+            continue;
+        }
+        try testing.expect(std.mem.indexOf(u8, glue, line) != null);
+        n += 1;
+    }
+    // every line of din_rin below its head with B renamed BD, its two h loads from threadgroup memory
+    const din_bd = try std.mem.replaceOwned(u8, a, din, "B[", "BD[");
+    defer a.free(din_bd);
+    var jt = std.mem.splitScalar(u8, din_bd, '\n');
+    _ = jt.next();
+    _ = jt.next();
+    while (jt.next()) |line0| {
+        const l1 = try std.mem.replaceOwned(u8, a, line0, "hid[row * hid_strides[0] + c0 * hid_strides[1]]", "H[tid]");
+        defer a.free(l1);
+        const line = try std.mem.replaceOwned(u8, a, l1, "hid[row * hid_strides[0] + c1 * hid_strides[1]]", "H[tid + 64u]");
+        defer a.free(line);
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " "), "threadgroup float BD[128];")) continue;
+        try testing.expect(std.mem.indexOf(u8, glue, line) != null);
+        n += 1;
+    }
+    try testing.expect(n > 60);
+    try testing.expect(std.mem.indexOf(u8, glue, "hid[") == null);
+    try testing.expect(std.mem.indexOf(u8, glue, "out[row * uint(INTER) + col]") == null);
 }
