@@ -47,6 +47,10 @@ pub const Forms = struct {
     gu: GuForm = .seam,
     dn: DnForm = .seam,
     maxm: u32 = 1,
+    /// The narrowest wave the fused forms take (narrower waves run the seam chain): a route on the wave width P, which
+    /// varies per call, fixed per P at install (the fused forms' threadgroups cover a 128-column block each, so a
+    /// one-pair wave fills 16 (gate / up) or 32 (down) of the GPU's cores; the bench measures the crossover).
+    min_p: u32 = 1,
 
     pub fn fusedGu(f: Forms) bool {
         return f.gu == .fused16 or f.gu == .fused8;
@@ -61,10 +65,17 @@ pub const Forms = struct {
         if (f.maxm != 1 and f.maxm != 4) return error.Glm5NextExl3Forms;
         if (f.maxm != 1 and !(f.fusedGu() or f.fusedDn())) return error.Glm5NextExl3Forms;
         if (f.maxm != 1 and (f.dn == .pro1 or f.dn == .pro2)) return error.Glm5NextExl3Forms;
+        if (f.min_p < 1 or f.min_p > max_pairs) return error.Glm5NextExl3Forms;
+        if (f.min_p != 1 and !(f.fusedGu() or f.fusedDn())) return error.Glm5NextExl3Forms;
+    }
+
+    /// The forms a wave of P pairs runs: these, or the seam chain below `min_p`.
+    pub fn at(f: Forms, p: u32) Forms {
+        return if (p < f.min_p) .{} else f;
     }
 
     pub fn name(f: Forms, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "gu={t},dn={t},maxm={d}", .{ f.gu, f.dn, f.maxm }) catch "forms";
+        return std.fmt.bufPrint(buf, "gu={t},dn={t},maxm={d},min_p={d}", .{ f.gu, f.dn, f.maxm, f.min_p }) catch "forms";
     }
 };
 
@@ -206,6 +217,8 @@ const Cfg = mlx.mlx_fast_metal_kernel_config;
 const none: Cfg = .{ .ctx = null };
 /// One wave width's prepared launches (null ctx: not used by the installed forms).
 const WaveCfg = struct {
+    /// the forms this width runs (`Forms.at`)
+    f: Forms = .{},
     in_rin: Cfg = none,
     g1: Cfg = none,
     epi: Cfg = none,
@@ -274,26 +287,27 @@ pub fn install(a: std.mem.Allocator, seam: *const xk.Kernels, forms: Forms, out_
             return error.Glm5NextExl3FormsKernel;
         }
     }
-    const nb: u32 = if (forms.dn == .fused2 or forms.dn == .pro2) 2 else 1;
     for (0..max_pairs) |i| {
         const p: u32 = @intCast(i + 1);
-        var w: WaveCfg = .{};
+        const ef = forms.at(p);
+        const nb: u32 = if (ef.dn == .fused2 or ef.dn == .pro2) 2 else 1;
+        var w: WaveCfg = .{ .f = ef };
         errdefer w.free();
         w.in_rin = try seamCfg(xk.inRinLaunch(p));
-        w.g1 = switch (forms.gu) {
+        w.g1 = switch (ef.gu) {
             .seam => try seamCfg(xk.gemvLaunch(p, hidden, inter)),
             .u8, .mcg => try cfgOf(gemvLaunch(p, hidden, inter)),
             .guone => try cfgOf(guoneLaunch(p)),
-            .fused16, .fused8 => try cfgOf(guFusedLaunch(p, forms.gu, forms.maxm)),
+            .fused16, .fused8 => try cfgOf(guFusedLaunch(p, ef.gu, ef.maxm)),
         };
-        if (!forms.fusedGu()) w.epi = try seamCfg(xk.rotLaunch(p, inter, "INTER"));
-        if (forms.dn != .pro1 and forms.dn != .pro2) w.din = try seamCfg(xk.rotLaunch(p, inter, "INTER"));
-        w.d1 = switch (forms.dn) {
+        if (!ef.fusedGu()) w.epi = try seamCfg(xk.rotLaunch(p, inter, "INTER"));
+        if (ef.dn != .pro1 and ef.dn != .pro2) w.din = try seamCfg(xk.rotLaunch(p, inter, "INTER"));
+        w.d1 = switch (ef.dn) {
             .seam => try seamCfg(xk.gemvLaunch(p, inter, hidden)),
             .pair, .mcg => try cfgOf(gemvLaunch(p, inter, hidden)),
-            .fused1, .fused2, .pro1, .pro2 => try cfgOf(dnFusedLaunch(p, nb, forms.maxm, out_dtype)),
+            .fused1, .fused2, .pro1, .pro2 => try cfgOf(dnFusedLaunch(p, nb, ef.maxm, out_dtype)),
         };
-        if (!forms.fusedDn()) {
+        if (!ef.fusedDn()) {
             // dpost at hidden with its store in out_dtype (the seam's bf16; T is the text's store type)
             var dl = xk.rotLaunch(p, hidden, "HID");
             dl.t_dtype = out_dtype;
@@ -324,9 +338,9 @@ pub fn gateUp(f: *const Installed, g: *G, x: T, ids: T, banks: *const [n_banks]B
     var xs: [2]T = undefined;
     try apply(g, f.seamK(.in_rin), w.in_rin, &.{ x, f.tok[p - 1], banks[0].gate.rin, banks[1].gate.rin, banks[2].gate.rin, banks[0].up.rin, banks[1].up.rin, banks[2].up.rin, ids }, &xs);
     var z: [2]T = undefined;
-    switch (f.forms.gu) {
+    switch (w.f.gu) {
         .seam, .u8, .mcg => {
-            const k = switch (f.forms.gu) {
+            const k = switch (w.f.gu) {
                 .seam => f.seamK(.gemv),
                 .u8 => f.kern(.g5k3_gemv_u8),
                 else => f.kern(.g5k3_gemv_mcg),
@@ -352,7 +366,7 @@ pub fn down(f: *const Installed, g: *G, h: T, ids: T, banks: *const [n_banks]Ban
     const p = try widthOf(g, h);
     const w = &f.w[p - 1];
     var out: [1]T = undefined;
-    switch (f.forms.dn) {
+    switch (w.f.dn) {
         .pro1, .pro2 => {
             try apply(g, f.kern(.g5k3_dn_pro), w.d1, &.{ h, ids, banks[0].down.code, banks[1].down.code, banks[2].down.code, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, banks[0].down.rout, banks[1].down.rout, banks[2].down.rout }, &out);
             return out[0];
@@ -361,14 +375,14 @@ pub fn down(f: *const Installed, g: *G, h: T, ids: T, banks: *const [n_banks]Ban
     }
     var hd: [1]T = undefined;
     try apply(g, f.seamK(.din_rin), w.din, &.{ h, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, ids }, &hd);
-    switch (f.forms.dn) {
+    switch (w.f.dn) {
         .fused1, .fused2 => {
             try apply(g, f.kern(.g5k3_dn_fused), w.d1, &.{ hd[0], ids, banks[0].down.code, banks[1].down.code, banks[2].down.code, banks[0].down.rout, banks[1].down.rout, banks[2].down.rout }, &out);
             return out[0];
         },
         else => {},
     }
-    const k = switch (f.forms.dn) {
+    const k = switch (w.f.dn) {
         .seam => f.seamK(.gemv),
         .pair => f.kern(.g5k3_pair),
         else => f.kern(.g5k3_gemv_mcg),
@@ -399,6 +413,13 @@ test "glm5_next exl3 forms: the installable forms (maxm 4 only on a fused form, 
     try (Forms{ .gu = .fused16, .dn = .fused1, .maxm = 4 }).check();
     try (Forms{ .gu = .fused8, .dn = .seam, .maxm = 4 }).check();
     try (Forms{ .gu = .fused16, .dn = .pro1, .maxm = 1 }).check();
+    try (Forms{ .gu = .fused8, .dn = .fused1, .maxm = 4, .min_p = 4 }).check();
+    try testing.expectError(error.Glm5NextExl3Forms, (Forms{ .gu = .guone, .dn = .pair, .min_p = 4 }).check());
+    try testing.expectError(error.Glm5NextExl3Forms, (Forms{ .gu = .fused8, .min_p = 0 }).check());
+    const h: Forms = .{ .gu = .fused16, .dn = .fused2, .maxm = 4, .min_p = 4 };
+    try testing.expectEqual(Forms{}, h.at(3));
+    try testing.expectEqual(h, h.at(4));
+    try testing.expectEqual(h, h.at(64));
     try testing.expectError(error.Glm5NextExl3Forms, (Forms{ .gu = .seam, .dn = .pair, .maxm = 4 }).check());
     try testing.expectError(error.Glm5NextExl3Forms, (Forms{ .gu = .fused16, .dn = .pro2, .maxm = 4 }).check());
     try testing.expectError(error.Glm5NextExl3Forms, (Forms{ .gu = .fused16, .dn = .fused1, .maxm = 2 }).check());

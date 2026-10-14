@@ -182,7 +182,8 @@ const Arm = struct {
     times: [rounds]f64 = undefined,
 };
 
-fn launchCount(f: xf.Forms) u32 {
+fn launchCount(f0: xf.Forms) u32 {
+    const f = f0.at(f0.min_p);
     const gu: u32 = switch (f.gu) {
         .seam, .u8, .mcg => 4,
         .guone => 3,
@@ -196,8 +197,8 @@ fn launchCount(f: xf.Forms) u32 {
     return gu + dn;
 }
 
-fn armsList() [22]Arm {
-    var out: [22]Arm = undefined;
+fn armsList() [24]Arm {
+    var out: [24]Arm = undefined;
     var n: usize = 0;
     out[n] = .{ .name = "exl3_seam", .kind = .seam, .launches = 7 };
     n += 1;
@@ -220,6 +221,8 @@ fn armsList() [22]Arm {
         .{ "exl3_f16_p2", .{ .gu = .fused16, .dn = .pro2 } },
         .{ "exl3_f8_p1", .{ .gu = .fused8, .dn = .pro1 } },
         .{ "exl3_f8_p2", .{ .gu = .fused8, .dn = .pro2 } },
+        .{ "exl3_hyb_f16_f1_m1_p4", .{ .gu = .fused16, .dn = .fused1, .min_p = 4 } },
+        .{ "exl3_hyb_f8_f1_m4_p4", .{ .gu = .fused8, .dn = .fused1, .maxm = 4, .min_p = 4 } },
     };
     for (named) |x| {
         out[n] = .{ .name = x[0], .kind = .forms, .forms = x[1], .launches = launchCount(x[1]) };
