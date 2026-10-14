@@ -445,6 +445,8 @@ pub const Cache = struct {
     kda: []kda.State,
     /// The MTP verify's captures, one per KDA layer (`Head.verify`): released after each round (`rollback`).
     capture: []kda.Capture,
+    /// Each lane's buffer address after `preallocate` (latent then index, per DSA layer; 0 before it): `inPlace` compares.
+    addr0: []usize,
     len: u32 = 0,
     cap: u32,
 
@@ -456,13 +458,16 @@ pub const Cache = struct {
         const kda_states = try a.alloc(kda.State, c.nKda());
         errdefer a.free(kda_states);
         const captures = try a.alloc(kda.Capture, c.nKda());
+        errdefer a.free(captures);
+        const addr0 = try a.alloc(usize, 2 * c.nDsa());
+        @memset(addr0, 0);
         for (latent, index) |*lt, *ix| {
             lt.* = dsa.Lane.init(cap, cap);
             ix.* = dsa.Lane.init(cap, cap);
         }
         for (kda_states) |*st| st.* = .{};
         for (captures) |*cp| cp.* = .{};
-        return .{ .a = a, .latent = latent, .index = index, .kda = kda_states, .capture = captures, .cap = cap };
+        return .{ .a = a, .latent = latent, .index = index, .kda = kda_states, .capture = captures, .addr0 = addr0, .cap = cap };
     }
 
     pub fn deinit(self: *Cache, g: *G) void {
@@ -476,6 +481,7 @@ pub const Cache = struct {
         self.a.free(self.index);
         self.a.free(self.kda);
         self.a.free(self.capture);
+        self.a.free(self.addr0);
         self.* = undefined;
     }
 
@@ -494,6 +500,25 @@ pub const Cache = struct {
             }
         }
         if (news.items.len > 0) try g.evalAll(news.items);
+        for (self.latent, self.index, 0..) |*lt, *ix, i| {
+            self.addr0[2 * i] = dsa.dataAddr(lt.buf.?);
+            self.addr0[2 * i + 1] = dsa.dataAddr(ix.buf.?);
+        }
+    }
+
+    /// The lanes whose buffers are still the ones `preallocate` made ([0]: latent, [1]: index): every append since wrote
+    /// in place. Off the hot path (a request's end): the buffers evaluated first.
+    pub fn inPlace(self: *const Cache, g: *G) ![2]u32 {
+        var bufs: std.ArrayList(T) = .empty;
+        defer bufs.deinit(self.a);
+        for (self.latent, self.index) |*lt, *ix| for ([_]*dsa.Lane{ lt, ix }) |lane| if (lane.buf) |b| try bufs.append(self.a, b);
+        if (bufs.items.len > 0) try g.evalAll(bufs.items);
+        var n: [2]u32 = .{ 0, 0 };
+        for (self.latent, self.index, 0..) |*lt, *ix, i| {
+            if (lt.buf) |b| n[0] += @intFromBool(self.addr0[2 * i] != 0 and dsa.dataAddr(b) == self.addr0[2 * i]);
+            if (ix.buf) |b| n[1] += @intFromBool(self.addr0[2 * i + 1] != 0 and dsa.dataAddr(b) == self.addr0[2 * i + 1]);
+        }
+        return n;
     }
 
     /// A new request from position 0: the lanes empty (their buffers kept), every KDA state cleared.
@@ -1091,6 +1116,7 @@ test {
     _ = @import("kda_decode_parity.zig");
     _ = @import("dsa_decode.zig");
     _ = @import("dsa_decode_parity.zig");
+    _ = @import("dsa.zig");
     _ = @import("swiglu.zig");
     _ = @import("fp8.zig");
     _ = @import("fp8_parity.zig");

@@ -99,16 +99,12 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
     var ikn_raw = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_layer_norm(&ikn_raw, try fp8.project(g, w.idx_wk, x), w.idx_k_norm_w, w.idx_k_norm_b, 1e-6, g.s));
     const ikn = try g.adopt(ikn_raw);
-    const gate = try g.astype(try g.matmul(try g.astype(x, .float32), w.idx_gate_t), g.dtypeOf(ikn));
-    const idx_new = try g.concat(&.{ ikn, gate }, -1);
-    // A row that completes a pool stores the pool's key (`ops.withPooledKeys`): the cached rows of its open pool first.
-    const kpool: c_int = @intCast(c.index_kpool);
-    const n_prev: c_int = @min(@as(c_int, @intCast(start)), kpool - 1);
-    const prev = if (n_prev > 0) blk: {
-        const iv = (try lanes.index.view(g)) orelse return error.Glm5NextIndexLaneEmpty;
-        break :blk try g.slice(iv, &.{ 0, @as(c_int, @intCast(start)) - n_prev, 0 }, &.{ 1, @intCast(start), 2 * ihd }, &.{ 1, 1, 1 });
-    } else idx_new;
-    const idx_rows = try g.adopt(try ops.withPooledKeys(g.s, prev, idx_new, w.idx_ape, @intCast(start), ix));
+    // The pool gate's f32 projection; the pooled text stores it in the key's dtype beside the key (ops 10 and 11, folded).
+    const gate = try g.matmul(try g.astype(x, .float32), w.idx_gate_t);
+    // A row that completes a pool stores the pool's key (`ops.withPooledKeys`): the open pool's cached rows are read from
+    // the index lane's buffer by the text itself, so no view of the lane's old buffer outlives the graph and the append
+    // below writes in place (MLX donates a slice_update's input only when nothing else holds its data).
+    const idx_rows = try g.adopt(try ops.withPooledKeys(g.s, if (start > 0) lanes.index.buf orelse return error.Glm5NextIndexLaneEmpty else null, ikn, gate, w.idx_ape, @intCast(start), ix));
     try lanes.latent.append(g, lat);
     try lanes.index.append(g, idx_rows);
     const t: c_int = @intCast(start + @as(u32, @intCast(rows)));
@@ -190,7 +186,102 @@ fn sdpa(g: *G, q: T, k: T, v: T, scale: f32, mode: [:0]const u8) !T {
     return g.adopt(o);
 }
 
+/// The address of an evaluated array's data (0: none).
+pub fn dataAddr(x: T) usize {
+    const p = mlx.mlx_array_data_uint8(x) orelse return 0;
+    return @intFromPtr(p);
+}
+
+/// Whether each lane's appends wrote its buffer in place (its address unchanged).
+pub const AppendProbe = struct { index: bool, latent: bool };
+
+/// Once at construction (after the indexer's decode launches are installed): two forwards' lane appends as `forward`
+/// makes them (the pooled-keys text reading the index lane's buffer, the appends, the views after them, each forward's
+/// arrays freed at its end) on two 16-row lanes, the second forward reading the first's three cached rows. A lane whose
+/// buffer address moved was copied by its append.
+pub fn probeAppends(g: *G, c: *const glm.Config, ix: ops.Indexer) !AppendProbe {
+    const cap: u32 = 16;
+    var lat_lane = Lane.init(cap, cap);
+    var idx_lane = Lane.init(cap, cap);
+    defer lat_lane.deinit(g);
+    defer idx_lane.deinit(g);
+    const r: c_int = @intCast(c.kv_lora_rank);
+    const dh: c_int = @intCast(c.index_head_dim);
+    {
+        const m = g.mark();
+        defer g.resetTo(m);
+        lat_lane.buf = g.keep(try g.zeros(&.{ 1, @intCast(cap), r }, .bfloat16));
+        lat_lane.cap = cap;
+        idx_lane.buf = g.keep(try g.zeros(&.{ 1, @intCast(cap), 2 * dh }, .bfloat16));
+        idx_lane.cap = cap;
+        try g.evalAll(&.{ lat_lane.buf.?, idx_lane.buf.? });
+    }
+    const lat0 = dataAddr(lat_lane.buf.?);
+    const idx0 = dataAddr(idx_lane.buf.?);
+    for ([_][2]u32{ .{ 0, 3 }, .{ 3, 4 } }) |step| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const start = step[0];
+        const n: c_int = @intCast(step[1]);
+        const key = try g.zeros(&.{ 1, n, dh }, .bfloat16);
+        const gate = try g.zeros(&.{ 1, n, dh }, .float32);
+        const ape = try g.zeros(&.{ ix.kpool, dh }, .float32);
+        const lat = try g.zeros(&.{ 1, n, r }, .bfloat16);
+        const rows = try g.adopt(try ops.withPooledKeys(g.s, if (start > 0) idx_lane.buf.? else null, key, gate, ape, @intCast(start), ix));
+        try lat_lane.append(g, lat);
+        try idx_lane.append(g, rows);
+        const lv = (try lat_lane.view(g)).?;
+        const iv = (try idx_lane.view(g)).?;
+        try g.evalAll(&.{ lv, iv });
+    }
+    return .{ .index = dataAddr(idx_lane.buf.?) == idx0, .latent = dataAddr(lat_lane.buf.?) == lat0 };
+}
+
 /// The bytes one position adds to a DSA layer's lanes (bf16).
 pub fn rowBytes(c: *const glm.Config) [2]u64 {
     return .{ 2 * @as(u64, c.kv_lora_rank), 2 * 2 * @as(u64, c.index_head_dim) };
+}
+
+const testing = std.testing;
+
+test "glm5_next dsa: the lanes' appends write in place on the installed texts; a view of the old buffer before an append (the old pooled-keys input) makes MLX copy the lane (guarded window: Metal)" {
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const c: glm.Config = .{};
+    var ix = indexer(&c, .{});
+    const plan = try ops.SelectPlan.install(s, ix, .bfloat16, .batched);
+    defer plan.destroy();
+    ix.plan = plan;
+    // The decode route: both lanes keep their buffers across two forwards' appends (the second reads three cached rows).
+    const p = try probeAppends(&g, &c, ix);
+    try testing.expect(p.index);
+    try testing.expect(p.latent);
+    // The old input: a view of the lane's rows taken before its append, alive until the forward's end, holds the old
+    // buffer's data, so MLX cannot donate it to the append's slice_update and copies the whole lane.
+    var lane = Lane.init(16, 16);
+    defer lane.deinit(&g);
+    {
+        const m = g.mark();
+        defer g.resetTo(m);
+        lane.buf = g.keep(try g.zeros(&.{ 1, 16, 256 }, .bfloat16));
+        lane.cap = 16;
+        lane.len = 3;
+        try g.evalAll(&.{lane.buf.?});
+    }
+    const addr0 = dataAddr(lane.buf.?);
+    {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const old_view = (try lane.view(&g)).?;
+        const prev = try g.slice(old_view, &.{ 0, 0, 0 }, &.{ 1, 3, 256 }, &.{ 1, 1, 1 });
+        const rows = try g.add(try g.zeros(&.{ 1, 1, 256 }, .bfloat16), try g.slice(prev, &.{ 0, 2, 0 }, &.{ 1, 3, 256 }, &.{ 1, 1, 1 }));
+        try lane.append(&g, rows);
+        try g.evalAll(&.{(try lane.view(&g)).?});
+    }
+    try testing.expect(dataAddr(lane.buf.?) != addr0);
 }

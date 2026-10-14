@@ -196,15 +196,26 @@ pub const Module = struct {
             log.info("glm5_next dsa select: route=batched (a verify window's rows in one indexer scores launch and one top-k launch, the one-query body per row; compile check passed)\n", .{})
         else
             log.info("glm5_next dsa select: route=per_row (a verify window's rows each in its own indexer scores and top-k launch; the control)\n", .{});
+        // The DSA lanes' appends, probed once on the installed texts: the index lane's pooled-keys text reads the lane's
+        // buffer itself (no view of it before its append), so MLX donates the buffer to the append and it writes in place.
+        {
+            const probe = dsa.probeAppends(&self.g, model, dsa.indexer(model, self.routes.dsa)) catch |e| {
+                var eb: [400]u8 = undefined;
+                log.err("glm5_next: the DSA lanes' append probe failed ({s}): {s}\n", .{ @errorName(e), mlx.takeError(&eb) orelse "" });
+                return e;
+            };
+            log.info("glm5_next dsa index lane: append={s} (the pooled-keys text reads the open pool's cached rows from the lane's buffer; the gate's cast and the row's concatenation in the same text; probe: two forwards' appends, the buffer's address {s})\n", .{ if (probe.index) "in_place" else "copy", if (probe.index) "unchanged" else "moved" });
+            log.info("glm5_next dsa latent lane: append={s} (probe: two forwards' appends, the buffer's address {s})\n", .{ if (probe.latent) "in_place" else "copy", if (probe.latent) "unchanged" else "moved" });
+        }
         // The decode lane's sparse latent attention (`decode_dsa`): the fused texts installed here (before the MTP lane
         // opens: its head's DSA layer takes the same route), refused by name; the op chain otherwise.
         if (self.c.decode_dsa == .fused) {
-            self.dsa_kernels = dsa_decode.install(gpa, s, model, &diag) catch |e| {
+            self.dsa_kernels = dsa_decode.install(gpa, s, model, self.c.dsa_split_form, &diag) catch |e| {
                 log.err("glm5_next: the fused DSA decode refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
                 return e;
             };
             self.routes.dsa.sparse = &self.dsa_kernels;
-            log.info("glm5_next decode DSA installed: the sparse latent attention in two texts ({d} slices x {d} head groups of the split, MiMo's merge); compile check passed\n", .{ dsa_decode.slices, model.n_heads / dsa_decode.head_group });
+            log.info("glm5_next decode DSA installed: the sparse latent attention in two texts ({d} slices x {d} head groups of the split, MiMo's merge); dsa_split_form={s} ({d} heads a threadgroup{s}); compile check passed\n", .{ dsa_decode.slices, model.n_heads / dsa_decode.headGroup(self.c.dsa_split_form), @tagName(self.c.dsa_split_form), dsa_decode.headGroup(self.c.dsa_split_form), if (self.c.dsa_split_form == .lean) ", keys scored in groups of 4 and updated in key order, the factor-1 update without its multiply: bit for bit the current form's" else ", the control" });
         }
         errdefer self.dsa_kernels.deinit();
         // The decode lane's MLP activation (`decode_swiglu`): the fused text installed here at the bound MLPs' widths
@@ -623,6 +634,13 @@ pub const Module = struct {
         log.info("glm5_next decode memory: footprint={d} mlx_active={d} mlx_cache={d} mlx_peak={d} footprint_less_mlx={d} billed_host_runtime={d} billed_mlx_cache={d} billed_compiler_runtime={d}\n", .{
             footprint, active, cache, peak, footprint -| active -| cache, dh.host, experts.decode_cache_bytes, dh.compiler,
         });
+        // The DSA lanes over the request: each lane still on the buffer its preallocation made (every append in place).
+        if (self.cache.inPlace(&self.g)) |n| {
+            const nd = self.c.model.nDsa();
+            const head: ?[2]bool = if (self.mtp) |lane| (lane.inPlace(&self.g) catch [2]bool{ false, false }) else null;
+            const word = [2][]const u8{ "moved", "in_place" };
+            log.info("glm5_next dsa lanes over the request: latent in_place {d}/{d} index in_place {d}/{d} mtp_head_latent={s} mtp_head_index={s}\n", .{ n[0], nd, n[1], nd, if (head) |h| word[@intFromBool(h[0])] else "none", if (head) |h| word[@intFromBool(h[1])] else "none" });
+        } else |_| {}
         const s1 = self.srcStats();
         const tok_s: f64 = if (d.wall_ns > 0) @as(f64, @floatFromInt(d.tokens)) * 1e9 / @as(f64, @floatFromInt(d.wall_ns)) else 0;
         self.endTally();
