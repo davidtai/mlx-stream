@@ -188,7 +188,7 @@ fn launchCount(f0: xf.Forms) u32 {
     const f = f0.at(f0.min_p);
     const gu: u32 = switch (f.gu) {
         .seam, .u8, .mcg => 4,
-        .guone => 3,
+        .guone, .guone_pair => 3,
         .fused16, .fused8 => 2,
     };
     const dn: u32 = switch (f.dn) {
@@ -204,6 +204,7 @@ const named_arms = [_]NamedArm{
     .{ .name = "exl3_seam_forms", .forms = .{} },
     .{ .name = "exl3_u8", .forms = .{ .gu = .u8 } },
     .{ .name = "exl3_dsv41_forms", .forms = .{ .gu = .guone, .dn = .pair } },
+    .{ .name = "exl3_guone_pair", .forms = .{ .gu = .guone_pair, .dn = .pair } },
     .{ .name = "exl3_mcg", .forms = .{ .gu = .mcg, .dn = .mcg } },
     .{ .name = "exl3_f16_seam", .forms = .{ .gu = .fused16 } },
     .{ .name = "exl3_seam_f1", .forms = .{ .dn = .fused1 } },
@@ -764,9 +765,9 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
     try testing.expectEqual(@as(u32, 0), fails);
 }
 
-test "glm5_next exl3 kbench: the arm table is the list's length (23: seam, 20 forms, 2 NVFP4), every entry named and installable, one mcg arm" {
+test "glm5_next exl3 kbench: the arm table is the list's length (24: seam, 21 forms, 2 NVFP4), every entry named and installable, one mcg arm" {
     const arms = armsList();
-    try testing.expectEqual(@as(usize, 23), arms.len);
+    try testing.expectEqual(@as(usize, 24), arms.len);
     try testing.expectEqual(named_arms.len + 3, arms.len);
     try testing.expectEqual(ArmKind.seam, arms[0].kind);
     try testing.expectEqual(ArmKind.nv_fused, arms[arms.len - 2].kind);

@@ -3,7 +3,8 @@
 //! and mcg), the f64 expert forward of exl3_ref.py (y = t128(t128(x suh) W_hat) svh, t128 the natural-order Sylvester
 //! Hadamard over 128-blocks scaled 1/sqrt(128); the clamped SwiGLU at 10), an f32 emulation of the seam chain's
 //! arithmetic per output word (the order every form keeps), the union rule of the fused forms, and their column-sum
-//! identity. CPU only: nothing here creates an MLX array.
+//! identity, and the gate / up texts g5k3_guone and g5k3_guone_pair per lane as written (the two-row rule's parity). CPU
+//! only: nothing here creates an MLX array.
 //! The CPU tests pin this module to exl3_ref.py (testdata/exl3-ref, written by scripts/glm5next_exl3_ref_fixture.py).
 
 const std = @import("std");
@@ -442,6 +443,144 @@ pub fn colsumCase(s: *u64, it: usize, acc: *[32][8]f32) void {
 
 pub const colsum_cases: usize = 2000;
 
+// ── The gate / up texts g5k3_guone and g5k3_guone_pair, per lane as written (the two-row rule's host parity) ──
+
+/// g5k3_guone's decode words (g5k3_guone.metal:33-36): a 16-bit window -> the f16 weight bits.
+pub fn decodeGuoneWords(window: u32) u16 {
+    const rr = window *% 0x83DCD12D;
+    const bs = (rr & 0x00FF00FF) +% ((rr >> 8) & 0x00FF00FF);
+    return hfmaWeight(@truncate((bs *% 0x00010001 +% 0x64000000) >> 16));
+}
+
+/// g5k3_pair's decode words (g5k3_pair.metal:48-51, g5k3_guone_pair's): the high half of z.
+pub fn decodePairWords(window: u32) u16 {
+    const rr = window *% 0x83DCD12D;
+    const q = (rr >> 8) & 0x00FF00FF;
+    const z = (rr -% q *% 255) *% 0x00010001 +% 0x64000000;
+    return hfmaWeight(@truncate(z >> 16));
+}
+
+/// fma(hs, 0x1EEE, 0xC931) in half: the exact value (hs = 1024 + a byte sum, exact in f64) rounded once.
+fn hfmaWeight(hs: u16) u16 {
+    const v: f16 = @floatCast(h16(hs) * h16(0x1EEE) + h16(0xC931));
+    return @bitCast(v);
+}
+
+/// The 8 windows of lane `lane` in one 16 x 16 tile's 48 code words (the texts' wa / wb / lp funnel shifts).
+pub fn laneWindows(tile: []const i16, lane: u32) [8]u32 {
+    const wa: u32 = 2 * ((3 * lane + 2) >> 2);
+    const wb: u32 = (wa + 46) % 48;
+    const lp: u32 = 8 * ((lane + 1) & 3);
+    const w32 = struct {
+        fn at(t: []const i16, i: u32) u32 {
+            return @as(u32, @as(u16, @bitCast(t[2 * i]))) | (@as(u32, @as(u16, @bitCast(t[2 * i + 1]))) << 16);
+        }
+    };
+    const rd8 = w32.at(tile, wa >> 1);
+    const rd9 = w32.at(tile, wb >> 1);
+    const v0: u32 = if (lp == 0) rd8 else ((rd8 >> @intCast(lp)) | (rd9 << @intCast(32 - lp)));
+    const v1: u32 = if (lp < 16) ((rd8 >> @intCast(lp + 16)) | (rd9 << @intCast(16 - lp))) else (rd9 >> @intCast(lp - 16));
+    var out: [8]u32 = undefined;
+    for (0..6) |m| out[m] = (v0 >> @intCast(3 * m)) & 0xffff;
+    for (6..8) |m| out[m] = (v1 >> @intCast(3 * m - 16)) & 0xffff;
+    return out;
+}
+
+pub const GuText = enum { guone, guone_pair };
+
+/// A gate / up launch's code banks: per bank (0..2) and projection (0 gate, 1 up) the slots' codes [slots, IT, OT, 48].
+pub const GuBanks = struct {
+    code: [3][2][]const i16,
+
+    fn slotCode(b: *const GuBanks, id: u32, proj: u32) []const i16 {
+        const per = (hidden / 16) * (inter / 16) * 48;
+        return b.code[id >> 24][proj][(id & 0xFFFFFF) * per ..][0..per];
+    }
+};
+
+/// One launch of `text` over P = ids.len rows (grid (inter / 16 x 32, 2 P)), threadgroups at the output tiles `tiles`:
+/// xg / xu [P, hidden] f32, out_g / out_u [P, inter] f32 (only the threadgroups' words are written), `writes` counts the
+/// stores per (projection, row, tile index) and `decodes` the trellis decodes. Per threadgroup as the text runs it: the
+/// row (and for guone_pair the rank rule, the odd rank's exit, the leader's mate), each lane's fma chains over the k-tiles
+/// with one decode per weight per threadgroup, then the threadgroup column sums (red[c][l], in lane order) per row.
+pub fn emuGuLaunch(text: GuText, xg: []const f32, xu: []const f32, ids: []const u32, banks: *const GuBanks, tiles: []const u32, out_g: []f32, out_u: []f32, writes: []u8, decodes: *u64) void {
+    const nr: u32 = @intCast(ids.len);
+    const it = hidden / 16;
+    const ot = inter / 16;
+    for (0..2 * nr) |yi| for (tiles, 0..) |tn, ti| {
+        const y: u32 = @intCast(yi);
+        const half_up = y / nr;
+        const row = y - half_up * nr;
+        const slot = ids[row];
+        var rank: u32 = 0;
+        var cnt: u32 = 0;
+        var mate = row;
+        if (text == .guone_pair) {
+            for (0..nr) |ji| {
+                const j: u32 = @intCast(ji);
+                const same: u32 = @intFromBool(ids[j] == slot);
+                rank += if (j < row) same else 0;
+                cnt += same;
+                mate = if (mate == row and j > row and same == 1) j else mate;
+            }
+            if (rank & 1 != 0) continue;
+        }
+        const two = text == .guone_pair and rank + 1 < cnt;
+        const code = banks.slotCode(slot, half_up);
+        const xh = if (half_up != 0) xu else xg;
+        const out = if (half_up != 0) out_u else out_g;
+        var acc: [32][8]f32 = @splat(@splat(0));
+        var accb: [32][8]f32 = @splat(@splat(0));
+        for (0..32) |li| {
+            const lane: u32 = @intCast(li);
+            var dr: [8]u32 = undefined;
+            for (0..8) |mi| {
+                const m: u32 = @intCast(mi);
+                const q = m & 3;
+                dr[mi] = 2 * (lane & 3) + (if (q < 2) @as(u32, 9) else 3) - q;
+            }
+            for (0..it) |tki| {
+                const tk: u32 = @intCast(tki);
+                const win = laneWindows(code[(tk * ot + tn) * 48 ..][0..48], lane);
+                for (0..8) |m| {
+                    const wbits = switch (text) {
+                        .guone => decodeGuoneWords(win[m]),
+                        .guone_pair => decodePairWords(win[m]),
+                    };
+                    decodes.* += 1;
+                    const w: f32 = @floatCast(h16(wbits));
+                    acc[li][m] = @mulAdd(f32, xh[row * hidden + tk * 16 + dr[m]], w, acc[li][m]);
+                    if (two) accb[li][m] = @mulAdd(f32, xh[mate * hidden + tk * 16 + dr[m]], w, accb[li][m]);
+                }
+            }
+        }
+        var z: [16]f32 = undefined;
+        colsumStock(&acc, &z);
+        @memcpy(out[row * inter + tn * 16 ..][0..16], &z);
+        writes[(half_up * nr + row) * tiles.len + ti] += 1;
+        if (two) {
+            colsumStock(&accb, &z);
+            @memcpy(out[mate * inter + tn * 16 ..][0..16], &z);
+            writes[(half_up * nr + mate) * tiles.len + ti] += 1;
+        }
+    };
+}
+
+/// The pairs the two-row rule shares: the leaders (even ranks with a partner) of a wave's ids.
+pub fn pairLeaders(ids: []const u32) u32 {
+    var n: u32 = 0;
+    for (ids, 0..) |v, i| {
+        var rank: u32 = 0;
+        var cnt: u32 = 0;
+        for (ids, 0..) |u, j| if (u == v) {
+            cnt += 1;
+            if (j < i) rank += 1;
+        };
+        if (rank & 1 == 0 and rank + 1 < cnt) n += 1;
+    }
+    return n;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -603,4 +742,147 @@ test "glm5_next exl3 ref: a bf16-rounded truth passes the bf16 ratio, an error o
     try testing.expect(bf16ErrRatio(&b, &r) <= 1.0);
     b[100] = r[100] * (1.0 + 1.0 / 128.0) + 1.0;
     try testing.expect(bf16ErrRatio(&b, &r) > 1.0);
+}
+
+test "glm5_next exl3 ref: guone_pair's decode words (g5k3_pair's) equal g5k3_guone's and the mul1 table for every 16-bit window" {
+    const tbl = try testing.allocator.create([65536]u16);
+    defer testing.allocator.destroy(tbl);
+    table(.mul1, tbl);
+    for (0..65536) |wi| {
+        const w: u32 = @intCast(wi);
+        try testing.expectEqual(tbl[wi], decodeGuoneWords(w));
+        try testing.expectEqual(tbl[wi], decodePairWords(w));
+    }
+}
+
+/// The guone_pair parity's banks: bank 0 two slots, bank 1 one, bank 2 two; gate and up codes per slot from fillCode.
+const GpFixture = struct {
+    store: [3][2][]i16,
+    banks: GuBanks,
+
+    fn init(a: std.mem.Allocator) !GpFixture {
+        const per = (hidden / 16) * (inter / 16) * 48;
+        const slots = [3]u32{ 2, 1, 2 };
+        var f: GpFixture = undefined;
+        var made: usize = 0;
+        errdefer for (0..made) |k| a.free(f.store[k / 2][k % 2]);
+        for (0..3) |b| for (0..2) |p| {
+            f.store[b][p] = try a.alloc(i16, slots[b] * per);
+            made += 1;
+            for (0..slots[b]) |s| fillCode(0x67705f00 + 64 * b + 8 * p + s, f.store[b][p][s * per ..][0..per]);
+            f.banks.code[b][p] = f.store[b][p];
+        };
+        return f;
+    }
+    fn deinit(f: *GpFixture, a: std.mem.Allocator) void {
+        for (f.store) |bp| for (bp) |s| a.free(s);
+    }
+};
+
+/// Rows' rotated inputs [P, hidden]: f32 values over 2^-13 .. 2^20 with signs (in_rin's output is any f32).
+fn gpX(seed: u64, out: []f32) void {
+    var s = seed;
+    for (out) |*o| {
+        const z = ek.splitmix64(&s);
+        const mag: f64 = (0.5 + unit(z)) * std.math.pow(f64, 2.0, @as(f64, @floatFromInt(@as(i32, @intCast(z >> 59)) - 12)));
+        o.* = @floatCast(if (z & 1 != 0) -mag else mag);
+    }
+}
+
+/// guone_pair against guone on one wave: every word of both outputs bit for bit, each (projection, row, tile) written
+/// exactly once, and the trellis decodes = guone's x (P - leaders) / P.
+fn gpCase(a: std.mem.Allocator, fx: *const GpFixture, ids: []const u32, tiles: []const u32, seed: u64) !void {
+    const p = ids.len;
+    const xg = try a.alloc(f32, p * hidden);
+    defer a.free(xg);
+    const xu = try a.alloc(f32, p * hidden);
+    defer a.free(xu);
+    gpX(seed, xg);
+    gpX(seed ^ 0x7570, xu);
+    var outs: [2][2][]f32 = undefined; // [text][gate, up]
+    var writes: [2][]u8 = undefined;
+    var decodes: [2]u64 = .{ 0, 0 };
+    for (0..2) |t| {
+        for (0..2) |k| {
+            outs[t][k] = try a.alloc(f32, p * inter);
+            @memset(outs[t][k], @bitCast(@as(u32, 0x7FBADBAD)));
+        }
+        writes[t] = try a.alloc(u8, 2 * p * tiles.len);
+        @memset(writes[t], 0);
+    }
+    defer for (0..2) |t| {
+        for (0..2) |k| a.free(outs[t][k]);
+        a.free(writes[t]);
+    };
+    for ([_]GuText{ .guone, .guone_pair }, 0..) |text, t| emuGuLaunch(text, xg, xu, ids, &fx.banks, tiles, outs[t][0], outs[t][1], writes[t], &decodes[t]);
+    for (0..2) |t| for (writes[t]) |c| try testing.expectEqual(@as(u8, 1), c);
+    for (0..2) |k| for (0..p) |r| for (tiles) |tn| for (0..16) |c| {
+        const i = r * inter + tn * 16 + c;
+        try testing.expectEqual(@as(u32, @bitCast(outs[0][k][i])), @as(u32, @bitCast(outs[1][k][i])));
+        try testing.expect(@as(u32, @bitCast(outs[1][k][i])) != 0x7FBADBAD);
+    };
+    const leaders = pairLeaders(ids);
+    try testing.expectEqual(decodes[0] / p * (p - leaders), decodes[1]);
+}
+
+test "glm5_next exl3 ref: g5k3_guone as written equals the seam GEMV over the decoded W_hat (the windows' layout)" {
+    const a = testing.allocator;
+    var fx = try GpFixture.init(a);
+    defer fx.deinit(a);
+    const tbl = try a.create([65536]u16);
+    defer a.destroy(tbl);
+    table(.mul1, tbl);
+    const ids = [_]u32{ (2 << 24) | 1, 1 << 24 };
+    const tiles = [_]u32{ 0, 5, 64, 127 };
+    const xg = try a.alloc(f32, ids.len * hidden);
+    defer a.free(xg);
+    const xu = try a.alloc(f32, ids.len * hidden);
+    defer a.free(xu);
+    gpX(0x616e63, xg);
+    gpX(0x616e64, xu);
+    const og = try a.alloc(f32, ids.len * inter);
+    defer a.free(og);
+    const ou = try a.alloc(f32, ids.len * inter);
+    defer a.free(ou);
+    var writes: [2 * ids.len * tiles.len]u8 = @splat(0);
+    var decodes: u64 = 0;
+    emuGuLaunch(.guone, xg, xu, &ids, &fx.banks, &tiles, og, ou, &writes, &decodes);
+    const w = try a.alloc(u16, hidden * inter);
+    defer a.free(w);
+    for (ids, 0..) |id, r| for ([_][]const f32{ xg, xu }, [_][]const f32{ og, ou }, 0..) |x, o, proj| {
+        decodeW(fx.banks.slotCode(id, @intCast(proj)), hidden, inter, tbl, w);
+        for (tiles) |tn| {
+            var z: [16]f32 = undefined;
+            emuGemvTile(x[r * hidden ..][0..hidden], w, hidden, inter, tn, &z);
+            for (z, o[r * inter + tn * 16 ..][0..16]) |e, g| try testing.expectEqual(@as(u32, @bitCast(e)), @as(u32, @bitCast(g)));
+        }
+    };
+}
+
+test "glm5_next exl3 ref: g5k3_guone_pair equals g5k3_guone bit for bit at Flash's gate / up shape (P 1..4, with and without slot sharing, three banks), one decode per weight for two rows of a slot" {
+    const a = testing.allocator;
+    var fx = try GpFixture.init(a);
+    defer fx.deinit(a);
+    const A: u32 = 0;
+    const B: u32 = 1;
+    const C: u32 = 1 << 24;
+    const D: u32 = (2 << 24) | 1;
+    const E: u32 = 2 << 24;
+    const waves = [_][]const u32{
+        &.{A},
+        &.{ A, B },          &.{ D, D },
+        &.{ A, C, E },       &.{ C, C, C }, &.{ A, B, A },
+        &.{ A, C, D, E },    &.{ A, A, A, A }, &.{ D, B, D, B }, &.{ E, E, E, A }, &.{ B, A, C, A },
+    };
+    const tiles = [_]u32{ 0, 1, 7, 8, 63, 64, 120, 127 };
+    var shared: u32 = 0;
+    for (waves, 0..) |ids, i| {
+        try gpCase(a, &fx, ids, &tiles, 0x6770_0000 + i);
+        shared += pairLeaders(ids);
+    }
+    try testing.expectEqual(@as(u32, 9), shared);
+    // one wave over every output tile of both projections (the whole [P, inter] outputs)
+    var all: [inter / 16]u32 = undefined;
+    for (&all, 0..) |*t, i| t.* = @intCast(i);
+    try gpCase(a, &fx, &.{ B, E, B, C }, &all, 0x67706675);
 }

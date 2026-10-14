@@ -145,6 +145,7 @@ pub const DecodeSwiglu = enum { ops, fused };
 /// The EXL3 family's decode forms (exl3_forms.zig), installed once at construction (exl3_math.zig `Math.init`): the
 /// gate / up form (`exl3_gateup_form`): `seam` (lane B's in_rin, two GEMVs, gu_epi; g22-exl3's chain, the control, by
 /// name), `fused16` / `fused8` (g5k3_gu_fused at 16 or 8 simdgroups), `guone` (DeepSeek's gu_one, the default),
+/// `guone_pair` (g5k3_guone_pair: gu_one with down_pair's two-row rule, one trellis decode for two rows of a slot),
 /// `gemv_u8` (the GEMV at DeepSeek's unroll 8); the down form (`exl3_down_form`): `seam`, `pair` (DeepSeek's down_pair,
 /// the default), `fused1` / `fused2` (din_rin + g5k3_dn_fused over 1 / 2 blocks), `pro1` / `pro2` (g5k3_dn_pro);
 /// `exl3_forms_maxm` the fused forms' union rule (1, the default, or 4); `exl3_forms_min_p` the narrowest wave the
@@ -154,7 +155,7 @@ pub const DecodeSwiglu = enum { ops, fused };
 /// form other than the seam on an NVFP4 pack refuses the load by name. The default is batch 27's measured pair
 /// (g22-exl3b at 190/217, lane on, draft_depth 3 + draft_gate 0.5: guone + pair +1.79 % decode over the seam beyond
 /// noise, ids identical); on an NVFP4 pack it is inert (that source installs no form).
-pub const Exl3GateUpForm = enum { seam, fused16, fused8, guone, gemv_u8 };
+pub const Exl3GateUpForm = enum { seam, fused16, fused8, guone, guone_pair, gemv_u8 };
 pub const Exl3DownForm = enum { seam, pair, fused1, fused2, pro1, pro2 };
 pub const Exl3Forms = struct {
     gateup: Exl3GateUpForm = .guone,
@@ -173,6 +174,7 @@ pub const Exl3Forms = struct {
                 .fused16 => .fused16,
                 .fused8 => .fused8,
                 .guone => .guone,
+                .guone_pair => .guone_pair,
                 .gemv_u8 => .u8,
             },
             .dn = switch (f.down) {
@@ -837,6 +839,18 @@ test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the 
         c.expert_family = .nvfp4;
         if (gu == .seam and dn == .seam) try c.validate() else try testing.expectError(error.Glm5NextExl3FormsOnNvfp4Pack, c.validate());
     };
+    // guone_pair by name (the default stays guone): gu_one's launch with down_pair's two-row rule, beside the pair down
+    {
+        var c = try parseSettings("{\"exl3_gateup_form\":\"guone_pair\"}");
+        try testing.expect(c.exl3_forms_requested);
+        c.expert_family = .exl3;
+        try c.validate();
+        try testing.expectEqual(Exl3Forms{ .gateup = .guone_pair, .down = .pair, .maxm = 1, .min_p = 1 }, c.exl3_forms);
+        try testing.expectEqual(exl3_forms.Forms{ .gu = .guone_pair, .dn = .pair, .maxm = 1, .min_p = 1 }, c.exl3_forms.forms());
+        try testing.expect(!c.exl3_forms.isSeam());
+        c.expert_family = .nvfp4;
+        try testing.expectError(error.Glm5NextExl3FormsOnNvfp4Pack, c.validate());
+    }
     {
         var c = try parseSettings("{\"exl3_gateup_form\":\"fused8\",\"exl3_down_form\":\"fused1\",\"exl3_forms_maxm\":4,\"exl3_forms_min_p\":4}");
         c.expert_family = .exl3;
@@ -856,6 +870,8 @@ test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the 
         .{ "{\"exl3_forms_min_p\":65}", error.Glm5NextExl3FormsMinPSetting },
         // combinations the forms refuse: maxm 4 or min_p > 1 without a fused form, a prologue form at maxm 4
         .{ "{\"exl3_gateup_form\":\"guone\",\"exl3_forms_maxm\":4}", error.Glm5NextExl3FormsSetting },
+        .{ "{\"exl3_gateup_form\":\"guone_pair\",\"exl3_forms_maxm\":4}", error.Glm5NextExl3FormsSetting },
+        .{ "{\"exl3_gateup_form\":\"guone_pair\",\"exl3_forms_min_p\":4}", error.Glm5NextExl3FormsSetting },
         .{ "{\"exl3_down_form\":\"pair\",\"exl3_forms_min_p\":4}", error.Glm5NextExl3FormsSetting },
         .{ "{\"exl3_gateup_form\":\"fused16\",\"exl3_down_form\":\"pro2\",\"exl3_forms_maxm\":4}", error.Glm5NextExl3FormsSetting },
     }) |case| {

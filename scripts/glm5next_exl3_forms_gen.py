@@ -10,7 +10,8 @@ texts'. Run from the repository root; `--check` compares, writes nothing.
   g5k3_gemv_mcg glm5n_exl3_gemv with the mul1 decode replaced by exllamav3's mcg decode (codebook.cuh L67-75:
                 x *= 0xCBAC1FED; x = (x & 0x8FFF8FFF) ^ 0x3B603B60; the f16 sum of its two halves), the bench's
                 codebook price only (no mcg bank is served)
-The fused forms (g5k3_gu_fused, g5k3_dn_fused, header_g5k3) are written by hand.
+The fused forms (g5k3_gu_fused, g5k3_dn_fused, header_g5k3) and g5k3_guone_pair (g5k3_guone with g5k3_pair's two-row
+rule and decode words) are written by hand.
 """
 import os
 import sys
