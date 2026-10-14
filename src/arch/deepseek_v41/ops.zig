@@ -1184,6 +1184,8 @@ pub const TraceOps = struct {
     host_values: ?HostValues = null,
     /// Each event wait's timeline value and dependency count, in build order.
     waits: std.ArrayList(Wait) = .empty,
+    /// The event waits the scheduler built (one per `eventWait` call, however many arrays it aliases into `waits`).
+    wait_calls: usize = 0,
     freed: std.ArrayList(Freed) = .empty,
     /// The node count at each `evalAll` (where a host sync fell in the build).
     evals: std.ArrayList(usize) = .empty,
