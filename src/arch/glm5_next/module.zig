@@ -12,6 +12,7 @@ const mlx = sdk.mlx;
 const log = sdk.log;
 const glm = @import("config.zig");
 const settings = @import("settings.zig");
+const prompt_levers = @import("prompt_levers.zig");
 const bill = @import("bill.zig");
 const graph = @import("graph.zig");
 const experts = @import("experts.zig");
@@ -92,12 +93,25 @@ pub const Module = struct {
     step_pass: *const fn (*Module, []const u32) anyerror!T,
     /// The MTP round the construction installed: its verify over the installed decode glue.
     round_pass: *const fn (*Module, std.mem.Allocator, u32, u32, sdk.SamplingParams) anyerror!sdk.DraftRound,
+    /// The three passes the construction installed (`ttft_tail: deferred`: a prompt pass hands the request's next call
+    /// the tail's passes, `Passes.deferTail`, which run the tail and put these back before their own work).
+    installed: Installed = undefined,
+    /// The request's prompt tail: its prompt length and the parts timed in the prompt pass (the tail line).
+    tail: Tail = .{},
     /// The rate tally's file (`expert_tally.pathOf`; null: none, as in test builds or under `expert_tally_file: off`)
     /// and the rates each request's end folds in and writes (layers x experts; empty: no tally, ratio 0).
     tally_path: ?[]u8 = null,
     tally_rates: []f32 = &.{},
 
     const Decode = struct { steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0, s0: @import("../../sdk_ext.zig").expert.Stats = .{}, active: bool = false };
+    const Installed = struct {
+        prompt: *const fn (*Module, []const u32) anyerror!T,
+        step: *const fn (*Module, []const u32) anyerror!T,
+        round: *const fn (*Module, std.mem.Allocator, u32, u32, sdk.SamplingParams) anyerror!sdk.DraftRound,
+    };
+    /// The prompt pass's tail after its last call's forward: the lane's pend (the hidden rows evaluated), its catch-up
+    /// (the pairs appended), the logits' eval (and the source's flush), each in ns, for the tail line.
+    const Tail = struct { prompt_tokens: usize = 0, pend_ns: u64 = 0, catchup_ns: u64 = 0, logits_ns: u64 = 0 };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, ceiling: u64, stop: u64) !*Module {
         const model = &cfg.model;
@@ -107,7 +121,8 @@ pub const Module = struct {
         const plan = try bill.plan(arena.allocator(), io, cfg, ceiling, stop);
         // The routes, once: the NAX kernels where the device has the tensor units (Flash's dims are theirs); the fused
         // glue's texts below, after the residents.
-        const routes: graph.Routes = .{ .dsa = .{ .nax = prefill_attention.deviceHasNax(s) and dsa.fits(model) } };
+        // `prompt_static_order: sampled`: P1's predictor on a prompt call's sampled spans (graph.zig `predictSpans`).
+        const routes: graph.Routes = .{ .dsa = .{ .nax = prefill_attention.deviceHasNax(s) and dsa.fits(model) }, .predict_sampled = cfg.prompt.static_order == .sampled };
 
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
@@ -245,8 +260,8 @@ pub const Module = struct {
         const warm_route = self.c.warmRoute(gpu_warm.gpuStream(s));
         if (warm_route != self.c.gpu_keep_warm) log.info("glm5_next route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits)\n", .{@tagName(self.c.gpu_keep_warm)});
         self.src = switch (self.c.expert_family) {
-            .nvfp4 => .{ .nvfp4 = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms) },
-            .exl3 => .{ .exl3 = try experts.Exl3Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms) },
+            .nvfp4 => .{ .nvfp4 = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.prompt) },
+            .exl3 => .{ .exl3 = try experts.Exl3Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.prompt) },
         };
         errdefer switch (self.src) {
             inline else => |x| x.deinit(),
@@ -270,8 +285,11 @@ pub const Module = struct {
             inline else => |x| try warm.run(&self.g, io, &self.c.model, &self.w, &self.cache, x, self.routes),
         };
         self.prompt_pass = promptPassOf(promptRoute(&self.c), self.c.expert_family);
+        // `ttft_tail: deferred`: the served and the lane's prompt passes without their tail (the dump route keeps it).
+        if (self.c.prompt.ttft_tail == .deferred) self.prompt_pass = deferredPromptOf(promptRoute(&self.c), self.c.expert_family) orelse self.prompt_pass;
         self.step_pass = stepPassOf(stepRoute(&self.c), self.c.decode_glue, self.c.expert_family);
         self.round_pass = roundPassOf(self.c.decode_glue, self.c.expert_family);
+        self.installed = .{ .prompt = self.prompt_pass, .step = self.step_pass, .round = self.round_pass };
         if (self.c.dumpDir()) |d| {
             log.info("glm5_next logits_dump: on dir={s} chunk_rows={d} chunk_bytes={d} (one safetensors file per prompt pass: logits F32 [prompt rows, {d}], token_ids I32, ids_int32_sha256; written before the request returns)\n", .{ d, graph.dump_chunk_rows, dump.chunkBytes(graph.dump_chunk_rows, model.vocab_size, model.hidden_size), model.vocab_size });
         }
@@ -282,6 +300,13 @@ pub const Module = struct {
         log.info("glm5_next prompt lever 3: prompt kernels warmed at load in {d} ms (KDA layer {d}: {d} spans; dense layer {d}: one {d}-row tile; DSA layer {d}: {d} spans of {d} rows; the {s} combine; token-identical)\n", .{ warmed.ns / std.time.ns_per_ms, warmed.plan.kda_layer, warmed.plan.kda_spans, warmed.plan.dense_layer, graph.dense_tile_rows, warmed.plan.dsa_layer, warmed.plan.dsa_spans, graph.span_rows, @tagName(combine_route) });
         log.info("glm5_next prompt lever 4: routing barrier committed before the shared expert (the routed ids and weights, then the shared expert's GEMMs; exact)\n", .{});
         log.info("glm5_next prompt lever 5: predictor counts on the GPU, committed behind the previous layer's tail (one read back of the expert counts; token-identical)\n", .{});
+        // The prompt levers (prompt_levers.zig): every switch named, defaults included, then the installed MTP lane's drafts
+        // and gate as its own line prints them (the lane's catch-up is the prompt tail's; one substring proves both).
+        var lb: [160]u8 = undefined;
+        if (self.mtp) |lane|
+            log.info("glm5_next prompt: {s} mtp_lane=on depth={d} verify_rows={d} draft_gate={d:.3}\n", .{ self.c.prompt.line(&lb), lane.depth, lane.depth + 1, lane.gate })
+        else
+            log.info("glm5_next prompt: {s} mtp_lane=off\n", .{self.c.prompt.line(&lb)});
         // The residents' counts by route: `BF16 <n>` (the control's line), or `FP8 <projections> + BF16 <the rest>` (each FP8
         // projection two tensors: its codes and its scales).
         var rb: [64]u8 = undefined;
@@ -533,22 +558,106 @@ pub fn Passes(comptime fam: experts.Family) type {
         }
 
         pub fn promptServed(self: *Module, ids: []const u32) anyerror!T {
+            return promptServedWith(self, ids, .off);
+        }
+
+        /// `ttft_tail: deferred`: the served pass, its logits returned before the phase change (`deferTail`).
+        pub fn promptServedDeferred(self: *Module, ids: []const u32) anyerror!T {
+            return promptServedWith(self, ids, .deferred);
+        }
+
+        fn promptServedWith(self: *Module, ids: []const u32, comptime tail: prompt_levers.TtftTail) anyerror!T {
             try beginPrompt(self, ids);
             const logits = try promptCalls(self, ids, .last, {});
             errdefer self.g.release(logits);
-            try enterDecode(self, ids.len);
+            self.tail = .{ .prompt_tokens = ids.len };
+            switch (tail) {
+                .off => try enterDecodeLine(self, ids.len, .off),
+                .deferred => deferTail(self),
+            }
             return logits;
         }
 
         /// The prompt pass's end -> the decode phase (the source's phase change), the request's decode accounting.
         pub fn enterDecode(self: *Module, prompt_tokens: usize) !void {
+            _ = try enterDecodeTimed(self, prompt_tokens);
+        }
+
+        /// `enterDecode`, its source's phase change timed: (the whole, its grow) in ns.
+        fn enterDecodeTimed(self: *Module, prompt_tokens: usize) ![2]u64 {
             // The FP8 prompt route's BF16 weights released (MLX's cache is cleared by the source's phase change below).
             if (self.fp8_route) |r| r.close();
             if (comptime gprof.enabled) gprof.promptEnd(src(self));
-            try src(self).beginDecode();
+            const t0 = self.nowNs();
+            const grow_ns = try src(self).beginDecodeTimed();
+            const phase_ns = self.nowNs() - t0;
             self.decode = .{ .active = true, .s0 = src(self).stats() };
             if (self.mtp) |lane| lane.stats.stream_start = self.decode.s0;
             if (comptime gprof.enabled) gprof.decodeBegin(src(self), self.reserve -| prompt_tokens);
+            return .{ phase_ns, grow_ns };
+        }
+
+        /// The eager tail's end (`ttft_tail: off`): the phase change inside the prompt pass, then the tail line.
+        fn enterDecodeLine(self: *Module, prompt_tokens: usize, comptime tail: prompt_levers.TtftTail) !void {
+            const ph = try enterDecodeTimed(self, prompt_tokens);
+            tailLine(self, tail, ph, 0);
+        }
+
+        /// One line a request at its phase change: the prompt tail's parts (ms) and which run inside the TTFT (the prompt
+        /// pass returns after them) or after it (`ttft_tail: deferred`: at the request's first decode call). Timestamps at
+        /// the phase change only: nothing per token.
+        fn tailLine(self: *Module, comptime tail: prompt_levers.TtftTail, ph: [2]u64, after_catchup_ns: u64) void {
+            const t = self.tail;
+            const ms = struct {
+                fn f(ns: u64) f64 {
+                    return @as(f64, @floatFromInt(ns)) / 1e6;
+                }
+            }.f;
+            const catchup = t.catchup_ns + after_catchup_ns;
+            const in_ttft = t.pend_ns + t.catchup_ns + t.logits_ns + (if (tail == .off) ph[0] else 0);
+            const after = after_catchup_ns + (if (tail == .deferred) ph[0] else 0);
+            log.info("glm5_next prompt tail: ttft_tail={s} prompt_tokens={d} pend_ms={d:.1} catchup_ms={d:.1} logits_ms={d:.1} phase_ms={d:.1} grow_ms={d:.1} in_ttft_ms={d:.1} after_ttft_ms={d:.1}\n", .{ @tagName(tail), t.prompt_tokens, ms(t.pend_ns), ms(catchup), ms(t.logits_ns), ms(ph[0]), ms(ph[1]), ms(in_ttft), ms(after) });
+        }
+
+        /// `ttft_tail: deferred`: the request's next call (a decode round or step, or the next request's prompt pass) runs the
+        /// tail first (`finishTail`): the construction's passes put back, the tail's in their place (a phase route of the
+        /// pass pointers: no call checks a flag).
+        fn deferTail(self: *Module) void {
+            self.prompt_pass = tailPrompt;
+            self.step_pass = tailStep;
+            self.round_pass = tailRound;
+        }
+
+        /// The deferred tail, in the eager pass's order: the lane's catch-up (the prompt's pairs whose next token it gives),
+        /// then the phase change (`enterDecode`); its wall the decode's (the request's decode line). The installed passes
+        /// are put back first: a failure here fails this call, not every later one.
+        fn finishTail(self: *Module) !void {
+            self.prompt_pass = self.installed.prompt;
+            self.step_pass = self.installed.step;
+            self.round_pass = self.installed.round;
+            const t0 = self.nowNs();
+            if (self.mtp) |lane| if (lane.tracked() == self.cache.len) try lane.append(&self.g, &self.w, self.history[lane.pairs() + 1 .. self.cache.len]);
+            const catchup_ns = self.nowNs() - t0;
+            const ph = try enterDecodeTimed(self, self.tail.prompt_tokens);
+            self.decode.wall_ns += self.nowNs() - t0;
+            tailLine(self, .deferred, ph, catchup_ns);
+        }
+
+        fn tailPrompt(self: *Module, ids: []const u32) anyerror!T {
+            try finishTail(self);
+            // The request that ended without a decode call: its end now (the eager pass's next prefill reports it).
+            self.requestEnd();
+            return self.prompt_pass(self, ids);
+        }
+
+        fn tailStep(self: *Module, ids: []const u32) anyerror!T {
+            try finishTail(self);
+            return self.step_pass(self, ids);
+        }
+
+        fn tailRound(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) anyerror!sdk.DraftRound {
+            try finishTail(self);
+            return self.round_pass(self, a, t1, accepted_cap, sampling);
         }
 
         /// The logits dump route: the served prompt pass, every row's logits written to one file before it returns.
@@ -581,11 +690,22 @@ pub fn Passes(comptime fam: experts.Family) type {
         /// The lane's prompt pass: the served one, every call's final-normed hidden pended and each pair whose next token
         /// the prompt gives appended to the lane (its last row stays pending for the first round's t1).
         pub fn promptLane(self: *Module, ids: []const u32) anyerror!T {
+            return promptLaneWith(self, ids, .off);
+        }
+
+        /// `ttft_tail: deferred`: the lane's prompt pass, the last call's catch-up and the phase change after the logits
+        /// return (`deferTail`; earlier calls' catch-ups stay in the pass: the pending rows billed are one call's).
+        pub fn promptLaneDeferred(self: *Module, ids: []const u32) anyerror!T {
+            return promptLaneWith(self, ids, .deferred);
+        }
+
+        fn promptLaneWith(self: *Module, ids: []const u32, comptime tail: prompt_levers.TtftTail) anyerror!T {
             try beginPrompt(self, ids);
             const lane = self.mtp.?;
             @memcpy(self.history[0..ids.len], ids);
             var logits: ?T = null;
             errdefer if (logits) |x| self.g.release(x);
+            self.tail = .{ .prompt_tokens = ids.len };
             var at: usize = 0;
             while (at < ids.len) {
                 const end = @min(ids.len, at + graph.prompt_call_rows);
@@ -595,13 +715,22 @@ pub fn Passes(comptime fam: experts.Family) type {
                 logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids[at..end], self.cache.len, &self.cache, src(self), self.routes, .hidden, .ops, &taps);
                 const hidden = taps.hidden.?;
                 defer self.g.release(hidden);
+                const t0 = self.nowNs();
                 try lane.pend(&self.g, self.cache.len, hidden, @intCast(end - at), false);
-                if (lane.tracked() == self.cache.len) try lane.append(&self.g, &self.w, self.history[lane.pairs() + 1 .. self.cache.len]);
+                const t1 = self.nowNs();
+                if (tail == .off or end < ids.len) if (lane.tracked() == self.cache.len) try lane.append(&self.g, &self.w, self.history[lane.pairs() + 1 .. self.cache.len]);
+                self.tail.pend_ns = t1 - t0;
+                self.tail.catchup_ns = self.nowNs() - t1;
                 at = end;
             }
+            const t2 = self.nowNs();
             try self.g.evalAll(&.{logits.?});
             try src(self).flush();
-            try enterDecode(self, ids.len);
+            self.tail.logits_ns = self.nowNs() - t2;
+            switch (tail) {
+                .off => try enterDecodeLine(self, ids.len, .off),
+                .deferred => deferTail(self),
+            }
             return logits.?;
         }
 
@@ -774,6 +903,18 @@ fn promptPassOf(r: PromptRoute, fam: experts.Family) *const fn (*Module, []const
     };
 }
 
+/// `ttft_tail: deferred`'s prompt pass of a route: the served or the lane's without its tail; null for the dump route (the
+/// KL gate's pass keeps its tail).
+fn deferredPromptOf(r: PromptRoute, fam: experts.Family) ?*const fn (*Module, []const u32) anyerror!T {
+    return switch (fam) {
+        inline else => |f| switch (r) {
+            .served => &Passes(f).promptServedDeferred,
+            .lane => &Passes(f).promptLaneDeferred,
+            .dump => null,
+        },
+    };
+}
+
 /// The serial step a construction installs: the served step, or the MTP lane's (`mtp_lane`: the step's final-normed
 /// hidden pended for the lane's next round). Off, the served step is g19b's exactly.
 pub const StepRoute = enum { served, lane };
@@ -840,6 +981,32 @@ test "glm5_next prompt route: the served pass unless logits_dump_dir names a dir
     // The dump route wins over the lane (the KL gate's pass).
     lane_c.applySettings(raw.value);
     try testing.expectEqual(PromptRoute.dump, promptRoute(&lane_c));
+}
+
+test "glm5_next ttft_tail: deferred installs the served and the lane's prompt passes without their tail, the dump keeps its own; off installs today's passes (construction-time routes)" {
+    if (comptime !@import("../../host_caps.zig").dsa_nax) return error.SkipZigTest;
+    inline for (.{ experts.Family.nvfp4, experts.Family.exl3 }) |f| {
+        try testing.expect(deferredPromptOf(.served, f).? == &Passes(f).promptServedDeferred);
+        try testing.expect(deferredPromptOf(.lane, f).? == &Passes(f).promptLaneDeferred);
+        try testing.expect(deferredPromptOf(.dump, f) == null);
+        // Today's passes are their own callables (the default route installs them, unchanged).
+        try testing.expect(deferredPromptOf(.served, f).? != promptPassOf(.served, f));
+        try testing.expect(deferredPromptOf(.lane, f).? != promptPassOf(.lane, f));
+    }
+    // The setting as the pack's block gives it: off by default, deferred when named.
+    for ([_]struct { text: []const u8, want: prompt_levers.TtftTail }{
+        .{ .text = "{}", .want = .off },
+        .{ .text = "{\"ttft_tail\":\"off\"}", .want = .off },
+        .{ .text = "{\"mtp_lane\":true,\"ttft_tail\":\"deferred\"}", .want = .deferred },
+    }) |case| {
+        const raw = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.text, .{});
+        defer raw.deinit();
+        try testing.expect(settings.unknownSetting(raw.value.object) == null);
+        var c: settings.Config = .{};
+        c.applySettings(raw.value);
+        try c.validate();
+        try testing.expectEqual(case.want, c.prompt.ttft_tail);
+    }
 }
 
 test "glm5_next step route: the served step unless mtp_lane installs the lane's, each over the installed decode glue (construction-time routes)" {
