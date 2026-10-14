@@ -203,6 +203,19 @@ No bill term (the text's live arrays are a subset of the op chain's). The window
 op chain (q, k, v, the tail, the layer's output and state over spans of 1,024, a carried 1,024 and 37 rows):
 `GLM5NEXT_KDA_PROLOGUE_GPU=1 _GPU_WINDOW_LOCKED=1`, `-Dtest-filter="glm5_next kda prologue GPU"`; one `GLM5NEXT_KDA_PARITY shape=... PASS|FAIL` line per span and an overall line.
 
+The MTP verify's KDA layer (`kda_verify`, with `mtp_lane` only; `chain`, the default and the control: the op chain with
+the stock capture recurrence) can run one text a layer (`fused`: `kda_verify.zig`, `kernels/glm5n_kda_verify.metal`, its
+element functions in `kernels/header_glm5n_kda_verify.metal`): one 1,024-thread threadgroup per head runs the prompt
+prologue's text, the forget gate, beta, the conv window and next tail, the stock capture recurrence (the state after
+every row but the last) and the gated RMSNorm, where the op chain dispatches 21 to 29 a layer. Each stage is the MLX
+kernel (or the stock text) of the op it replaces, per element in the same types and order; the projections and the
+low-rank second stages f_b / g_b stay outside (fusing them changes their summation order: rounding-class, not taken).
+The load logs `glm5_next kda verify: route=fused ...` (or `route=chain ...`); a geometry, a CPU stream or a KDA table of
+another dtype refuses the load by name. No bill term. The window's parity test, bit for bit against the op chain at the
+verify's widths 2, 3 and 4 (output, state, conv tail, captured rows and window) plus the element functions alone:
+`GLM5NEXT_KDA_FUSED_GPU=1 _GPU_WINDOW_LOCKED=1`, `-Dtest-filter="glm5_next kda verify fused GPU"`; one
+`GLM5NEXT_KDA_FUSED_PARITY shape=verify_rows<R> PASS|FAIL` line per width, a `stage=elements` line and an overall line.
+
 ## Prompt levers
 
 The 16K prompt pass's levers from the prefill analysis (`reports/.../mimo/glm5next-prefill-gpu-levers-20261012.md`),

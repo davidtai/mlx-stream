@@ -21,11 +21,13 @@ const fp8 = @import("fp8.zig");
 const kda_percore = @import("kda_percore.zig");
 const kda_prologue = @import("kda_prologue.zig");
 const fusion = @import("fusion.zig");
+const kda_verify = @import("kda_verify.zig");
 
 comptime {
-    // kda_percore.zig's and kda_prologue.zig's tests run with this file's (src/tests.zig lists kda.zig).
+    // kda_percore.zig's, kda_prologue.zig's and kda_verify.zig's tests run with this file's (src/tests.zig lists kda.zig).
     _ = kda_percore;
     _ = kda_prologue;
+    _ = kda_verify;
 }
 
 pub const G = ops_be.MlxOps;
@@ -136,6 +138,18 @@ fn forwardOps(_: ?*const anyopaque, g: *G, c: *const glm.Config, w: *const Weigh
 /// Its own comptime instance: the serial forward's code carries no capture branch.
 pub fn forwardCapture(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State, cap: *Capture) !T {
     return forwardWith(g, c, w, x, st, true, cap);
+}
+
+/// The MTP verify's KDA layer, bound at construction (`settings.kda_verify`): the op chain (`forwardCapture`, the
+/// default and the control) or the fused verify text (kda_verify.zig `run` over its installed kernels, `ctx`). Same
+/// contract as `forwardCapture`.
+pub const VerifyStep = struct {
+    ctx: ?*const anyopaque = null,
+    run: *const fn (ctx: ?*const anyopaque, g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State, cap: *Capture) anyerror!T = forwardCaptureOps,
+};
+
+fn forwardCaptureOps(_: ?*const anyopaque, g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State, cap: *Capture) anyerror!T {
+    return forwardCapture(g, c, w, x, st, cap);
 }
 
 /// The state after verify row `row` (a partial accept: `row` < the capture's rows - 1), copied into `st` from `cap`
@@ -251,7 +265,7 @@ pub const Recur = struct { y: T, state: T };
 pub const RecurFn = fn (g: *G, c: *const glm.Config, w: *const Weights, q: T, k: T, v: T, a: T, beta: T, state: T) anyerror!Recur;
 
 /// The forget gate per key channel, f32, exp(lb * sigmoid(exp(A_log) * (a + dt_bias))): the stock kernels' input.
-fn gateOf(g: *G, c: *const glm.Config, w: *const Weights, a: T) !T {
+pub fn gateOf(g: *G, c: *const glm.Config, w: *const Weights, a: T) !T {
     const a32 = try g.astype(try g.add(a, w.dt_bias), .float32);
     return g.exp(try g.mul(try g.sigmoid(try g.mul(w.a_exp, a32)), try g.scalar(c.kda_lower_bound, .float32)));
 }
@@ -492,6 +506,9 @@ const recur_source: [:0]const u8 =
 
 /// mlx-serve `transformer.zig` `gdnKernelSource(vectorized = true, capture_seq = true)` at ddalcu main 6e15b046: the
 /// stock text plus `seq_base` and, after each row but the last, the state written to `state_seq` at `t * seq_stride`.
+/// The capture text (kda_verify.zig's tests read its statements against the fused verify text's).
+pub const recur_seq_source_text = recur_seq_source;
+
 const recur_seq_source: [:0]const u8 =
     \\auto n = thread_position_in_grid.z;
     \\auto b_idx = n / Hv;

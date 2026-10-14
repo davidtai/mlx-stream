@@ -688,7 +688,7 @@ pub fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, s
     const out = switch (lw.attn) {
         // The MTP verify captures every row's state (`Cache.rollback`); every other call advances the state alone.
         .kda => |*kw| if (head == .verify)
-            try kda.forwardCapture(g, c, kw, normed, &cache.kda[lw.slot], &cache.capture[lw.slot])
+            try routes.kda_verify.run(routes.kda_verify.ctx, g, c, kw, normed, &cache.kda[lw.slot], &cache.capture[lw.slot])
         else if (decode_lane)
             try routes.kda.run(routes.kda.ctx, g, c, kw, normed, &cache.kda[lw.slot])
         else
@@ -770,8 +770,11 @@ pub const Routes = struct {
     dsa: dsa.Routes = .{},
     glue: ?*const glue.Kernels = null,
     /// The decode lane's KDA layer (`decode_kda`, kda.zig `Step`): the op chain unless the module installed the fused
-    /// text (kda_decode.zig). The prompt's wide calls and the MTP verify's capture always run the op chain.
+    /// text (kda_decode.zig). The prompt's wide calls run the op chain; the MTP verify's capture runs `kda_verify`.
     kda: kda.Step = .{},
+    /// The MTP verify's KDA layer (`kda_verify`, kda.zig `VerifyStep`): the op chain with the capture (the default and
+    /// the control) unless the module installed the fused verify text (kda_verify.zig).
+    kda_verify: kda.VerifyStep = .{},
     /// The decode lane's MLP activation (`decode_swiglu`): the op chain unless the module installed the fused text.
     swiglu: ?*const swiglu.Kernels = null,
     /// P1's predictor on a prompt call's sampled spans (`prompt_static_order: sampled`; `predictSpans`); false (the
@@ -1007,7 +1010,7 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
         const out = switch (lw.attn) {
             // The MTP verify captures every row's state (`Cache.rollback`); every other call advances the state alone.
             .kda => |*kw| if (head == .verify)
-                try kda.forwardCapture(g, c, kw, pa.normed, &cache.kda[lw.slot], &cache.capture[lw.slot])
+                try routes.kda_verify.run(routes.kda_verify.ctx, g, c, kw, pa.normed, &cache.kda[lw.slot], &cache.capture[lw.slot])
             else
                 try routes.kda.run(routes.kda.ctx, g, c, kw, pa.normed, &cache.kda[lw.slot]),
             .dsa => |*dw| try dsa.forward(g, c, dw, pa.normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes.dsa),
