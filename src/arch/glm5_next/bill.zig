@@ -208,6 +208,8 @@ pub const Inputs = struct {
     /// MiMo's X12 keep-warm route (`settings.Config.gpu_keep_warm`; `.off` the control). The setting's route, not the
     /// stream's resolution: a default `waits` on a CPU stream keeps its 1 MiB term (an over-bill there only, MiMo's rule).
     gpu_keep_warm: gpu_warm.Route = .off,
+    /// The read pool's demand workers (`settings.Config.demand_workers`): each holds one `reader_staging_bytes` buffer.
+    demand_workers: u32 = settings.default_demand_workers,
     page: u64 = 16_384,
 };
 
@@ -516,7 +518,7 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
     const transient: [2]u64 = .{ @as(u64, mimo_stream.transient_rows) * record, @as(u64, mimo_stream.decodeTransientRows(experts.decode_window)) * record };
     const n: u64 = g.num_experts;
     const bitset = std.mem.alignForward(u64, n, 64) / 8;
-    const staging = @as(u64, mimo_stream.io_workers) * settings.reader_staging_bytes;
+    const staging = @as(u64, in.demand_workers) * settings.reader_staging_bytes;
     const spec = @as(u64, mimo_stream.spec_slots) * (std.mem.alignForward(u64, record, page) + 2 * page);
     const tickets = @as(u64, mimo_stream.io_tickets_early) * (8 * 8 + 8 + 1);
     // Per layer: the transition counts, the per-expert arrays, the route scratch, the bitsets, and the decode seed's
@@ -603,6 +605,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .decode_swiglu = cfg.decode_swiglu,
         .mtp = lane,
         .gpu_keep_warm = cfg.gpu_keep_warm,
+        .demand_workers = cfg.demand_workers,
         .page = page,
     };
 }
@@ -983,9 +986,11 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
         const block = if (v.value == .object) v.value.object.get("expert_streaming") orelse .null else .null;
         break :blk @import("root.zig").declared(block) orelse return error.Glm5NextPackRequired;
     };
-    var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane };
+    // `GLM5_BILL_DEMAND_WORKERS=<n>`: the bill with n demand workers (`demand_workers`; default 4).
+    const workers: u32 = if (std.c.getenv("GLM5_BILL_DEMAND_WORKERS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else settings.default_demand_workers;
+    var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane, .demand_workers = workers };
     const res = try residentBytes(a, io, dir, &model, std.heap.pageSize());
-    std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s} experts={s}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off", @tagName(fam) });
+    std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s} experts={s} demand_workers={d}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off", @tagName(fam), workers });
     for (tool_contexts) |ctx| {
         cfg.effective_context = ctx;
         const b = try completeBill(a, io, &cfg, cfg.reserveTokens());
@@ -1090,4 +1095,31 @@ test "glm5_next bill: the exl3 geometry of a synthetic two-layer, eight-expert b
     try testing.expectEqual(@as(u64, 2 * 9_474_048), b.per_row);
     // The Flash bank's dims are the load's: the synthetic bank is refused under them, by name.
     try testing.expectError(error.Glm5NextExl3Dims, exl3_bank.inspect(a, testing.io, root, 3, exl3_bank.flash, &diag));
+}
+
+test "glm5_next bill: demand_workers bills its staging buffers: 6 workers = the reader_staging term + 2 x 10 MiB in both phases, every other term and per_row unchanged" {
+    const a = testing.allocator;
+    const in4 = try fixtureInputs(32_768);
+    var in6 = in4;
+    in6.demand_workers = 6;
+    const b4 = try billOf(a, &in4);
+    defer b4.free(a);
+    const b6 = try billOf(a, &in6);
+    defer b6.free(a);
+    try testing.expectEqual(@as(u64, 4) * settings.reader_staging_bytes, termOf(b4, "reader_staging")[0]);
+    const delta: u64 = 2 * settings.reader_staging_bytes;
+    try testing.expectEqual(@as(u64, 20_971_520), delta);
+    try testing.expectEqual(b4.per_row, b6.per_row);
+    try testing.expectEqual(b4.terms.len, b6.terms.len);
+    for (b4.terms, b6.terms) |x, y| {
+        try testing.expectEqualStrings(x.name, y.name);
+        const d: u64 = if (std.mem.eql(u8, x.name, "reader_staging")) delta else 0;
+        try testing.expectEqual(x.bytes[0] + d, y.bytes[0]);
+        try testing.expectEqual(x.bytes[1] + d, y.bytes[1]);
+    }
+    try testing.expectEqual(b4.fixed(.prompt) + delta, b6.fixed(.prompt));
+    try testing.expectEqual(b4.fixed(.decode) + delta, b6.fixed(.decode));
+    // The pool these settings start maps exactly the billed staging: workers x staging buffer.
+    const io_mod = @import("../../sdk_ext.zig").expert.io;
+    try testing.expectEqual(delta, io_mod.poolBytes(.{ .workers = 6, .staging_bytes = settings.reader_staging_bytes }, in4.page) - io_mod.poolBytes(.{ .workers = 4, .staging_bytes = settings.reader_staging_bytes }, in4.page));
 }

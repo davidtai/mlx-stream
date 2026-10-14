@@ -2652,6 +2652,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return if (self.layers.len > 0) self.layers[0].policy.seed_tail_ids else 0;
             }
 
+            /// The read pool's demand workers as started.
+            pub fn demandWorkers(self: *const Stream) u32 {
+                return self.pool.workers();
+            }
+
             /// Residents over every layer's persistent rows (the reverse change's record: what the next prompt finds).
             pub fn residentCount(self: *const Stream) u64 {
                 var n: u64 = 0;

@@ -89,7 +89,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "decode_seed", "decode_seed_tokens" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "decode_seed", "decode_seed_tokens", "demand_workers" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -195,10 +195,17 @@ pub const DecodeSeed = enum { off, prompt_tail };
 pub const default_decode_seed_tokens: u32 = 64;
 /// The most tail tokens `decode_seed_tokens` takes.
 pub const max_decode_seed_tokens: u32 = 16_384;
+/// The read pool's demand workers (`demand_workers`, 1 .. `max_demand_workers`): 4 (the default, MiMo's `io_workers`,
+/// the control). Each worker holds one `reader_staging_bytes` staging buffer (billed: bill.zig `reader_staging`).
+pub const default_demand_workers: u32 = 4;
+/// The pool's limit (q3_lookahead4_exl3.c MAX_WORKERS).
+pub const max_demand_workers: u32 = 8;
 
-/// The read-wait routes the stream installs (`Config.readWait`): the decode seed's tail tokens (0 = off).
+/// The read-wait routes the stream installs (`Config.readWait`): the decode seed's tail tokens (0 = off) and the demand
+/// workers.
 pub const ReadWait = struct {
     decode_seed_tokens: u32 = 0,
+    demand_workers: u32 = default_demand_workers,
 };
 
 /// `expert_rows_by_layer` (MiMo's mimo/layer-rows, mimo_v2/settings.zig `LayerRows`): the plan's decode rows split
@@ -354,6 +361,8 @@ pub const Config = struct {
     decode_seed: DecodeSeed = .off,
     decode_seed_tokens: u32 = default_decode_seed_tokens,
     decode_seed_tokens_named: bool = false,
+    /// The read pool's demand workers (`demand_workers`; 0 marks a value outside 1 .. `max_demand_workers`).
+    demand_workers: u32 = default_demand_workers,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -436,6 +445,7 @@ pub const Config = struct {
             c.decode_seed_tokens = if (v == .integer and v.integer >= 1 and v.integer <= max_decode_seed_tokens) @intCast(v.integer) else 0;
             c.decode_seed_tokens_named = true;
         }
+        if (raw.object.get("demand_workers")) |v| c.demand_workers = if (v == .integer and v.integer >= 1 and v.integer <= max_demand_workers) @intCast(v.integer) else 0;
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
         if (raw.object.get("logits_dump_dir")) |v| {
@@ -457,7 +467,7 @@ pub const Config = struct {
 
     /// The read-wait routes the stream installs (after `validate`).
     pub fn readWait(c: *const Config) ReadWait {
-        return .{ .decode_seed_tokens = if (c.decode_seed == .prompt_tail) c.decode_seed_tokens else 0 };
+        return .{ .decode_seed_tokens = if (c.decode_seed == .prompt_tail) c.decode_seed_tokens else 0, .demand_workers = c.demand_workers };
     }
 
     /// The logits dump route's directory (`logits_dump_dir`), null when the setting is absent.
@@ -533,6 +543,7 @@ pub const Config = struct {
         if (c.malformed.decode_seed) return error.Glm5NextDecodeSeedSetting;
         if (c.decode_seed_tokens == 0) return error.Glm5NextDecodeSeedTokensRange;
         if (c.decode_seed_tokens_named and c.decode_seed != .prompt_tail) return error.Glm5NextDecodeSeedTokensWithoutSeed;
+        if (c.demand_workers == 0) return error.Glm5NextDemandWorkersRange;
         try c.tally.check("glm5_next");
         switch (c.expert_rows_by_layer) {
             .uniform => {},
@@ -812,20 +823,27 @@ test "glm5_next settings: the exl3 decode forms: the seam unless named, every fo
     }
 }
 
-test "glm5_next settings: the decode seed (decode_seed, decode_seed_tokens) parses once and refuses by name" {
+test "glm5_next settings: the read-wait routes (decode_seed, decode_seed_tokens, demand_workers) parse once and refuse by name" {
     const off = try parseSettings("{}");
     try off.validate();
     try testing.expectEqual(DecodeSeed.off, off.decode_seed);
-    try testing.expectEqual(ReadWait{ .decode_seed_tokens = 0 }, off.readWait());
+    try testing.expectEqual(ReadWait{ .decode_seed_tokens = 0, .demand_workers = 4 }, off.readWait());
+    try testing.expectEqual(default_demand_workers, off.demand_workers);
     const named_off = try parseSettings("{\"decode_seed\":\"off\"}");
     try named_off.validate();
     try testing.expectEqual(@as(u32, 0), named_off.readWait().decode_seed_tokens);
     const tail = try parseSettings("{\"decode_seed\":\"prompt_tail\"}");
     try tail.validate();
-    try testing.expectEqual(ReadWait{ .decode_seed_tokens = default_decode_seed_tokens }, tail.readWait());
-    const tail128 = try parseSettings("{\"decode_seed\":\"prompt_tail\",\"decode_seed_tokens\":128,\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5}");
+    try testing.expectEqual(ReadWait{ .decode_seed_tokens = default_decode_seed_tokens, .demand_workers = 4 }, tail.readWait());
+    const tail128 = try parseSettings("{\"decode_seed\":\"prompt_tail\",\"decode_seed_tokens\":128}");
     try tail128.validate();
     try testing.expectEqual(@as(u32, 128), tail128.readWait().decode_seed_tokens);
+    const w6 = try parseSettings("{\"demand_workers\":6}");
+    try w6.validate();
+    try testing.expectEqual(ReadWait{ .decode_seed_tokens = 0, .demand_workers = 6 }, w6.readWait());
+    const both = try parseSettings("{\"decode_seed\":\"prompt_tail\",\"decode_seed_tokens\":64,\"demand_workers\":6,\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5}");
+    try both.validate();
+    try testing.expectEqual(ReadWait{ .decode_seed_tokens = 64, .demand_workers = 6 }, both.readWait());
     for ([_][]const u8{ "{\"decode_seed\":\"tail\"}", "{\"decode_seed\":true}", "{\"decode_seed\":1}", "{\"decode_seed\":null}" }) |text|
         try testing.expectError(error.Glm5NextDecodeSeedSetting, (try parseSettings(text)).validate());
     for ([_][]const u8{
@@ -835,4 +853,6 @@ test "glm5_next settings: the decode seed (decode_seed, decode_seed_tokens) pars
     }) |text| try testing.expectError(error.Glm5NextDecodeSeedTokensRange, (try parseSettings(text)).validate());
     try testing.expectError(error.Glm5NextDecodeSeedTokensWithoutSeed, (try parseSettings("{\"decode_seed_tokens\":64}")).validate());
     try testing.expectError(error.Glm5NextDecodeSeedTokensWithoutSeed, (try parseSettings("{\"decode_seed\":\"off\",\"decode_seed_tokens\":64}")).validate());
+    for ([_][]const u8{ "{\"demand_workers\":0}", "{\"demand_workers\":9}", "{\"demand_workers\":6.0}", "{\"demand_workers\":\"6\"}", "{\"demand_workers\":-4}" }) |text|
+        try testing.expectError(error.Glm5NextDemandWorkersRange, (try parseSettings(text)).validate());
 }

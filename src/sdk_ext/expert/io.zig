@@ -279,6 +279,8 @@ pub const Pool = struct {
     /// Demand's tickets end here.
     demand_tickets: u32 = 0,
     record_bytes: u64 = 0,
+    /// The demand workers started (`Options.workers`).
+    n_workers: u32 = 0,
 
     /// Starts the process's pool (the speculative class, when given, is
     /// configured first). Staging, status words, counters and the log live
@@ -305,7 +307,7 @@ pub const Pool = struct {
         @memset(log_arr, 0);
         @memset(published, false);
         const demand: u32 = opt.tickets;
-        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand };
+        self.* = .{ .allocator = allocator, .staging = staging, .res = res, .log = log_arr, .published = published, .demand_tickets = demand, .n_workers = opt.workers };
         var bufs: [max_spec]u64 = undefined;
         var threads: i32 = 0;
         var slot_bytes: u64 = 0;
@@ -417,6 +419,11 @@ pub const Pool = struct {
     /// The pool's clock (a `Result`'s `t_start_ns` / `t_end_ns`).
     pub fn nowNs() i64 {
         return c.q3ld_monotonic_ns();
+    }
+
+    /// The demand workers this pool started.
+    pub fn workers(self: *const Pool) u32 {
+        return self.n_workers;
     }
 
     pub fn counter(self: *const Pool, which: Counter) i64 {

@@ -120,7 +120,9 @@ pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_even
 /// `streamOptions` over a family's bridge `Bp` (the same options for every family).
 pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings, read_wait: settings.ReadWait) !Bp.Options {
     var opts = Bp.eventOptions(rows, memory, event);
-    // The read-wait routes (settings.zig `ReadWait`): the decode seed's tail ids (tail tokens x top-k; 0 = off).
+    // The read-wait routes (settings.zig `ReadWait`): the pool's demand workers (each one staging buffer) and the decode
+    // seed's tail ids (tail tokens x top-k; 0 = off).
+    opts.pool.workers = read_wait.demand_workers;
     opts.decode_seed_ids = read_wait.decode_seed_tokens * top_k;
     opts.transient_release = true;
     try Bp.applyReadSchedule(&opts, read_schedule);
@@ -130,6 +132,10 @@ pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemo
     return opts;
 }
 
+comptime {
+    if (settings.default_demand_workers != mimo_stream.io_workers) @compileError("glm5_next: the default demand workers are not MiMo's io_workers (the control)");
+    if (settings.max_demand_workers != sdk_ext.expert.io.max_workers) @compileError("glm5_next: demand_workers' bound is not the pool's");
+}
 
 /// The phase route of a routed call (MiMo's `decodeLane`): one row in either phase, up to `decode_lane_rows` in decode.
 pub fn decodeLane(nt: u32, decoding: bool) bool {
@@ -351,10 +357,10 @@ pub fn SourceOf(comptime fam: Family) type {
                 log.info("glm5_next experts: exl3 k3 mul1 routes (decode_moe={s}: DeepSeek-V4.1's banked PREP=rin chain at hidden {d} / inter {d}, in_rin + gate/up mul1h GEMVs + gu_epi + din_rin + down mul1h GEMV + dpost(bf16), one launch each per wave over the three banks{s}; prompt: DIG-X waves of <= {d} rows / {d} experts, take2 + gate|up GEMM (m128) + onepass + down GEMM (m128) + rot_widen1(bf16); bank {d} x {d} records of {d} B, codebook mul1 0x{X}, no global-scale word: scale-line isolation not applicable; the NVFP4 draft bank unchanged)\n", .{ @tagName(decode_moe), exl3_kernels.hidden, exl3_kernels.inter, if (decode_moe == .hitpass) ", each call's hit wave from the layer's resident slot LUT" else if (decode_moe == .stock) ", unbanked: one group per bank" else "", exl3_math.wave_rows, @import("../../exl3/quant.zig").wave_max, geo.num_moe_layers, geo.num_experts, geo.record_bytes, exl3_kernels.codebook_multiplier });
                 // The decode forms bound at Math.init (`exl3_gateup_form` / `exl3_down_form`; seam = lane B's chain above).
                 log.info("glm5_next experts: exl3 k3 forms gateup={s} down={s} maxm={d} min_p={d}\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down), exl3_forms.maxm, exl3_forms.min_p });
-                // The read-wait routes as the stream installed them (the policies' tail ids),
+                // The read-wait routes as the stream installed them (the pool's started workers, the policies' tail ids),
                 // on the forms' line's settings: one line names every decode route a read-wait pair compares.
                 const seed_ids = self.sdk_stream.decodeSeedIds();
-                log.info("glm5_next read-wait: forms gateup={s} down={s}; decode_seed={s} decode_seed_tokens={d}\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down), if (seed_ids > 0) "prompt_tail" else "off", seed_ids / top_k });
+                log.info("glm5_next read-wait: forms gateup={s} down={s}; decode_seed={s} decode_seed_tokens={d}; demand_workers={d} (staging {d} B)\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down), if (seed_ids > 0) "prompt_tail" else "off", seed_ids / top_k, self.sdk_stream.demandWorkers(), @as(u64, self.sdk_stream.demandWorkers()) * settings.reader_staging_bytes });
             } else switch (decode_moe) {
                 .stock => {},
                 .fused => log.info("glm5_next decode experts installed: decode_moe=fused (the NVFP4 k1 texts over the three banks, one launch of each per wave; the hit wave routed on the host)\n", .{}),
@@ -571,9 +577,11 @@ test "glm5_next experts: the stream's options install the overlap schedule early
     const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .{});
     try testing.expect(opts.tally == null);
     const tallied = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0.25, .window = 16 }, .{});
-    // The decode seed: off by default, on as its tail ids.
+    // The read-wait routes' controls: four demand workers, the decode seed off.
+    try testing.expectEqual(@as(u32, 4), opts.pool.workers);
     try testing.expectEqual(@as(u32, 0), opts.decode_seed_ids);
-    const rw = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .{ .decode_seed_tokens = 64 });
+    const rw = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .{ .decode_seed_tokens = 64, .demand_workers = 6 });
+    try testing.expectEqual(@as(u32, 6), rw.pool.workers);
     try testing.expectEqual(@as(u32, 64 * top_k), rw.decode_seed_ids);
     try testing.expectEqual(@as(f64, 0.25), tallied.tally.?.ratio);
     try testing.expectEqual(@as(u32, 16), tallied.tally.?.window);
@@ -645,6 +653,26 @@ test "glm5_next experts: the rate tally's file round-trips at Flash's geometry (
     }
     try testing.expect((try expert_tally.read(a, io, path, 43, max_experts)) == .mismatched);
     try testing.expect((try expert_tally.read(a, io, path, n_layers, 256)) == .mismatched);
+}
+
+test "glm5_next experts: demand_workers 6 starts the read pool with six workers and six staging buffers (+20 MiB, the bill's reader_staging delta)" {
+    const testing = std.testing;
+    const io_mod = sdk_ext.expert.io;
+    const rows = [_]u32{ 124, 124 };
+    for ([_]u32{ 4, 6 }) |workers| {
+        const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .{ .demand_workers = workers });
+        // The stream's own pool options, the bridge's staging per worker (no speculative class: the stream adds it).
+        try testing.expectEqual(workers, opts.pool.workers);
+        try testing.expectEqual(settings.reader_staging_bytes, opts.pool.staging_bytes);
+        const pool = try io_mod.Pool.start(testing.allocator, opts.pool);
+        defer pool.stop();
+        try testing.expectEqual(workers, pool.workers());
+        try testing.expectEqual(@as(usize, workers) * settings.reader_staging_bytes, pool.staging.len);
+    }
+    const page = std.heap.pageSize();
+    const o4 = (try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .{})).pool;
+    const o6 = (try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .{ .demand_workers = 6 })).pool;
+    try testing.expectEqual(@as(u64, 20_971_520), io_mod.poolBytes(o6, page) - io_mod.poolBytes(o4, page));
 }
 
 /// The decode seed's CPU model of one prompt call of one layer, as the shared scheduler and the stream drive the policy
