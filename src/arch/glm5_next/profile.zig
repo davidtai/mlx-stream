@@ -6,14 +6,17 @@
 //!   `GLM5_NEXT_GPU_TIMELINE=1`        DSV's verify GPU timeline over the serial decode's forwards (one forward a cycle with
 //!                                     one verify; the first `verify_timeline.max_cycles` forwards of the first request).
 //! Every request also prints MiMo's per-phase lines (`GLM5_NEXT_PROFILE`, `_AHEAD`, `_AHEAD_LOOKAHEAD`, `_IO`) and, at the
-//! decode's end, DSV's `DECODE_TIMERS` (a serial cycle is a token). The state lives here (no Module field); in a served
-//! build every entry below compiles to nothing.
+//! decode's end, DSV's `DECODE_TIMERS` (a serial cycle is a token) and the decode round anatomy (`GLM5_NEXT_DECODE_ROUND`,
+//! round_timers.zig: per decode forward, the host's stamps of the MTP round around it, from its entry to its return, and the
+//! host's time between rounds; `<prefix>-r<k>.decode-rounds.tsv` beside the route trace). The state lives here (no Module
+//! field); in a served build every entry below compiles to nothing.
 //!
 //! Its own memory, outside the arch's bill (the cell reserves it on the baseline, `GLM_PROFILE_RESERVE_GB` 0.25): the
 //! prompt timeline's static rows, marks, tiles and signals (~12 MB) and the verify timeline's (~24 MB), the route trace's
 //! request buffers (u16 ids: ~11 MB of prompt ids at 16,384 tokens, ~11 MB of decode ids and ~16 MB of predictor records
-//! at its 4,096 decode calls), the TSV text and the GPU timeline's JSON (each at most ~15 MB, built once at an end): at
-//! most ~0.1 GB.
+//! at its 4,096 decode calls), the TSV text and the GPU timeline's JSON (each at most ~15 MB, built once at an end), the
+//! decode round rows (`rt.max_rounds` x 128 B + a median scratch of 8 B a row: ~2.2 MB, written as the decode reaches
+//! them) and their TSV (~0.3 KB a forward): at most ~0.1 GB.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -25,6 +28,7 @@ const ptl = @import("../mimo_v2/prefill_timeline.zig");
 const dt = @import("../deepseek_v41/decode_timers.zig");
 const timeline = @import("../deepseek_v41/verify_timeline.zig");
 const experts = @import("experts.zig");
+const rt = @import("round_timers.zig");
 
 pub const enabled = mimo_profile.enabled;
 
@@ -54,8 +58,17 @@ const State = struct {
     hidden: u32 = 0,
     inter: u32 = 0,
     layers: u32 = 0,
+    /// The decode round rows cleared so far in this request (`stamp`).
+    rows_used: u32 = 0,
 };
 var state: if (enabled) State else void = if (enabled) .{} else {};
+
+/// The decode round rows (round_timers.zig), static: each request's rows are cleared as its decode reaches them (`stamp`)
+/// and summarized at its end (`roundsEnd`).
+const Rounds = if (enabled) struct {
+    var rows: [rt.max_rounds]rt.Row = undefined;
+    var scratch: [rt.max_rounds]f64 = undefined;
+} else struct {};
 
 /// Construction (after the source): every switch read once, each armed one's line printed; an unreadable value refuses
 /// the load by name.
@@ -84,6 +97,7 @@ pub fn arm(a: std.mem.Allocator, io: std.Io, src: anytype, n_layers: u32, s: mlx
             return error.Glm5NextGpuTimelineSetting;
         }
     }
+    log.info(tag ++ "_DECODE_ROUND armed: every decode forward's round stamps, rounds_cap={d} points={d} tsv={}\n", .{ rt.max_rounds, rt.n_points, state.trace != null });
 }
 
 /// The module's end: the trace freed (the source still alive).
@@ -120,6 +134,7 @@ pub fn decodeBegin(src: anytype, budget: u64) void {
     if (comptime !enabled) return;
     startPhase(.decode, src);
     state.steps = 0;
+    state.rows_used = 0;
     if (state.trace) |t| traceResidents(src, t, false);
     if (!state.gpu_wanted) return;
     if (state.gpu_installed) {
@@ -157,6 +172,7 @@ pub fn stepBegin(id: u32) dt.Stamp {
         timeline.cycleBegin();
         timeline.verifyBegin();
     }
+    if (state.phase == .decode) stamp(state.steps, .verify_begin);
     return dt.now();
 }
 
@@ -164,8 +180,59 @@ pub fn stepBegin(id: u32) dt.Stamp {
 pub fn stepEnd(t0: dt.Stamp) void {
     if (comptime !enabled) return;
     _ = dt.charge(.verify, t0);
+    if (state.phase == .decode) stamp(state.steps, .verify_end);
     if (state.gpu_on) timeline.verifyEnd();
     if (state.phase == .decode) state.steps += 1;
+}
+
+/// A decode round's point (round_timers.zig `Point`): the row of the decode's current cycle, or of the cycle just ended for
+/// the points after its verify (`rt.afterVerify`). Nothing outside the decode phase (the prompt pass's catch-up appends).
+pub inline fn roundAt(p: rt.Point) void {
+    if (comptime !enabled) return;
+    if (state.phase != .decode) return;
+    stamp(if (rt.afterVerify(p)) state.steps -| 1 else state.steps, p);
+}
+
+/// The counts of the cycle just ended (after its `exit`): a serial step or a round, its drafts, the drafts verified, the
+/// drafts accepted, the tokens emitted.
+pub inline fn roundCounts(serial: bool, drafted: u32, verified: u32, kept: u32, emitted: u64) void {
+    if (comptime !enabled) return;
+    if (state.phase != .decode or state.steps == 0 or state.steps - 1 >= state.rows_used) return;
+    const r = &Rounds.rows[@intCast(state.steps - 1)];
+    r.serial = serial;
+    r.drafted = @intCast(@min(drafted, 255));
+    r.verified = @intCast(@min(verified, 255));
+    r.kept = @intCast(@min(kept, 255));
+    r.emitted = @intCast(@min(emitted, std.math.maxInt(u32)));
+}
+
+/// Point `p` of cycle `i`'s row now (`timeline.now`: the GPU timeline's clock); rows past `rt.max_rounds` are not kept.
+fn stamp(i: u64, p: rt.Point) void {
+    if (i >= rt.max_rounds) return;
+    const k: u32 = @intCast(i);
+    while (state.rows_used <= k) : (state.rows_used += 1) Rounds.rows[state.rows_used] = .{};
+    Rounds.rows[k].t[@intFromEnum(p)] = timeline.now();
+}
+
+/// The request's decode rounds (its end): `GLM5_NEXT_DECODE_ROUND {...}` over the kept rows (every counted forward up to
+/// `rt.max_rounds`) and, beside the route trace, `<base>.decode-rounds.tsv`.
+fn roundsEnd(base: ?[]const u8) void {
+    const kept: usize = @intCast(@min(state.steps, @as(u64, rt.max_rounds)));
+    const rows = Rounds.rows[0..@min(kept, @as(usize, state.rows_used))];
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    rt.writeLine(&w, rows, state.steps, Rounds.scratch[0..], base != null) catch {
+        log.info(rt.line_name ++ "_UNAVAILABLE {{\"reason\": \"the line is over {d} bytes\"}}\n", .{buf.len});
+        return;
+    };
+    log.info("{s}\n", .{w.buffered()});
+    const b = base orelse return;
+    var aw: std.Io.Writer.Allocating = .init(state.a);
+    defer aw.deinit();
+    rt.writeTsv(&aw.writer, rows) catch |e| return log.err(tag ++ "_DECODE_ROUND tsv: {s}\n", .{@errorName(e)});
+    const path = std.fmt.allocPrint(state.a, "{s}.decode-rounds.tsv", .{b}) catch return;
+    defer state.a.free(path);
+    std.Io.Dir.cwd().writeFile(state.io, .{ .sub_path = path, .data = aw.written() }) catch |e| log.err(tag ++ "_DECODE_ROUND write {s}: {s}\n", .{ path, @errorName(e) });
 }
 
 /// An MTP round's end (its verify was the step's forward, `stepBegin` traced t1): the round's accepted drafts and its
@@ -177,8 +244,8 @@ pub fn roundEnd(accepted: u32, tokens: []const u32) void {
     for (tokens[1..]) |id| t.decodeToken(id);
 }
 
-/// The request's end (the decode phase's): the phase lines, `DECODE_TIMERS`, the GPU timeline's line and file, the
-/// trace's files.
+/// The request's end (the decode phase's): the phase lines, `DECODE_TIMERS`, the decode round line and TSV, the GPU
+/// timeline's line and file, the trace's files.
 pub fn decodeEnd(src: anytype) void {
     if (comptime !enabled) return;
     if (state.phase != .decode) return;
@@ -189,6 +256,7 @@ pub fn decodeEnd(src: anytype) void {
     dt.reset();
     const base = requestBase();
     defer if (base) |b| state.a.free(b);
+    roundsEnd(base);
     if (state.gpu_on) {
         const pending = timeline.settle(state.stream.?, 2000);
         const rep = timeline.repairUnstarted();
@@ -273,4 +341,7 @@ test "glm5_next profile: a served build compiles every entry to nothing" {
     try std.testing.expect(@TypeOf(state) == void);
     try std.testing.expect(@TypeOf(stepBegin(7)) == void);
     stepEnd({});
+    // the decode round's stamps compile to nothing too
+    roundAt(.enter);
+    roundCounts(false, 3, 2, 1, 2);
 }

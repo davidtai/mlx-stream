@@ -659,6 +659,8 @@ pub fn Passes(comptime fam: experts.Family) type {
             const t0 = self.nowNs();
             try lane.pend(&self.g, self.cache.len, hidden, @intCast(ids.len), true);
             self.decode.wall_ns += self.nowNs() - t0;
+            gprof.roundAt(.pended);
+            gprof.roundAt(.exit);
             return logits;
         }
 
@@ -677,8 +679,10 @@ pub fn Passes(comptime fam: experts.Family) type {
                 return logits;
             }
             const t0 = self.nowNs();
+            gprof.roundAt(.enter);
             const tp = gprof.stepBegin(ids[0]);
             const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids, self.cache.len, &self.cache, src(self), self.routes, head, gl, sink);
+            gprof.roundAt(.fwd_built);
             errdefer self.g.release(logits);
             // The logits and every KDA state: a conv tail feeds no output of its own step (and the lane's hidden row).
             var evals: std.ArrayList(T) = .empty;
@@ -686,12 +690,17 @@ pub fn Passes(comptime fam: experts.Family) type {
             try evals.append(self.gpa, logits);
             if (head == .hidden) try evals.append(self.gpa, sink.hidden.?);
             try self.cache.stateArrays(&evals, self.gpa);
+            gprof.roundAt(.dec_built);
             try self.g.evalAll(evals.items);
+            gprof.roundAt(.evaluated);
             try src(self).flush();
+            gprof.roundAt(.flushed);
             gprof.stepEnd(tp);
             self.decode.steps += 1;
             self.decode.tokens += ids.len;
             self.decode.wall_ns += self.nowNs() - t0;
+            gprof.roundAt(.exit);
+            gprof.roundCounts(true, 0, 0, 0, ids.len);
             return logits;
         }
 
@@ -703,6 +712,7 @@ pub fn Passes(comptime fam: experts.Family) type {
             try self.checkTokens(&.{t1});
             // The round's wall, its drafts included (the request's decode line rates the rounds as a serial step's tokens).
             const t0 = self.nowNs();
+            gprof.roundAt(.enter);
             const drafted = mtp.draftsAt(lane.depth, lane.tracked(), lane.n_pending, len, accepted_cap, self.reserve);
             var ids: [mtp.verify_rows]u32 = undefined;
             var q: [mtp.max_depth]f32 = undefined;
@@ -720,6 +730,7 @@ pub fn Passes(comptime fam: experts.Family) type {
                 try graph.forward(g, self.gpa, &self.c.model, &self.w, ids[0..rows], len, &self.cache, src(self), self.routes, .verify, gl, &taps)
             else
                 try graph.forward(g, self.gpa, &self.c.model, &self.w, ids[0..1], len, &self.cache, src(self), self.routes, .hidden, gl, &taps);
+            gprof.roundAt(.fwd_built);
             defer g.release(logits);
             const hidden = taps.hidden.?;
             defer g.release(hidden);
@@ -731,15 +742,20 @@ pub fn Passes(comptime fam: experts.Family) type {
             try evals.appendSlice(self.gpa, &.{ d.targets, d.flags orelse d.targets, hidden });
             try self.cache.stateArrays(&evals, self.gpa);
             try self.cache.captureArrays(&evals, self.gpa);
+            gprof.roundAt(.dec_built);
             try g.evalAll(evals.items);
+            gprof.roundAt(.evaluated);
             try src(self).flush();
+            gprof.roundAt(.flushed);
             const pre = try mimo_draft.readDecision(g, d, drafts);
             const plan = mimo_draft.commitOf(k, pre);
+            gprof.roundAt(.decided);
             const kept = pre.accepted;
             try self.cache.rollback(g, &self.c.model, len, rows, kept + 1);
             gprof.stepEnd(tp);
             const committed = try g.slice(hidden, &.{ 0, 0 }, &.{ @intCast(kept + 1), @intCast(self.c.model.hidden_size) }, &.{ 1, 1 });
             try lane.pend(g, len + 1 + kept, committed, kept + 1, drafted == 0);
+            gprof.roundAt(.pended);
             @memcpy(self.history[len..][0 .. kept + 1], ids[0 .. kept + 1]);
             lane.record(k, kept, q[0..k]);
             const tokens = try a.dupe(u32, ids[0..plan.emitted]);
@@ -747,6 +763,8 @@ pub fn Passes(comptime fam: experts.Family) type {
             self.decode.steps += 1;
             self.decode.tokens += plan.emitted;
             self.decode.wall_ns += self.nowNs() - t0;
+            gprof.roundAt(.exit);
+            gprof.roundCounts(false, drafted, k, kept, plan.emitted);
             return .{ .tokens = tokens, .accepted = kept, .next_token = plan.next };
         }
     };

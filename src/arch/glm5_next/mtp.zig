@@ -49,6 +49,8 @@ const nvfp4 = @import("nvfp4.zig");
 const experts = @import("experts.zig");
 const bill = @import("bill.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
+/// Profile builds only: the decode round's stamps (profile.zig `roundAt`; nothing in a served build or a test).
+const gprof = @import("profile.zig");
 
 const G = graph.G;
 const T = graph.T;
@@ -135,9 +137,12 @@ pub fn chainDrafts(comptime Ops: type, g: *Ops, head: anytype, x0: Ops.T, start:
     }
     const all = if (depth == 1) ids[0] else try g.concat(ids[0..depth], 0);
     const q_all = if (depth == 1) qs[0] else try g.concat(qs[0..depth], 0);
+    gprof.roundAt(.chain_built);
     try g.evalAll(&.{ all, q_all });
+    gprof.roundAt(.chain_done);
     _ = try g.hostU32(all, out[0..depth]);
     _ = try g.hostF32(q_all, q_out[0..depth]);
+    gprof.roundAt(.chain_read);
 }
 
 /// The draft gate (`settings.draft_gate`, theta): of a round's `q.len` drafts, the leading ones whose cumulative top-1
@@ -797,6 +802,7 @@ pub const Lane = struct {
             try g.evalAll(&.{ self.latent.buf.?, self.index.buf.? });
             at = end;
         }
+        gprof.roundAt(.appended);
         const m = g.mark();
         defer g.resetTo(m);
         const old = self.pending.?;
@@ -805,6 +811,7 @@ pub const Lane = struct {
         if (self.pending) |p| try g.evalAll(&.{p});
         g.release(old);
         self.n_pending -= n;
+        gprof.roundAt(.copied);
     }
 
     /// One draft step of the chain (`chainDrafts`): the layer on the pair input `x` at position `pos`, its final-normed

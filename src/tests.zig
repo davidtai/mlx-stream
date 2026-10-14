@@ -49,6 +49,7 @@ comptime {
     _ = @import("arch/glm5_next/root.zig");
     _ = @import("arch/glm5_next/module.zig");
     _ = @import("arch/glm5_next/profile.zig");
+    _ = @import("arch/glm5_next/round_timers.zig");
     _ = @import("arch/glm5_next/mtp.zig");
     _ = @import("arch/glm5_next/mtp_test.zig");
     _ = @import("arch/glm5_next/exl3_kernels.zig");
