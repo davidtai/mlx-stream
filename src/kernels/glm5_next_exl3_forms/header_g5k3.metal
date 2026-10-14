@@ -130,3 +130,77 @@ inline int g5k3_members(I ids, uint np, uint e, uint lane, thread uint* mem) {
   }
   return nm;
 }
+
+// ── The w forms (g5k3_guw, g5k3_dnw, g5k3_guwp, g5k3_dnwp): the GEMV of gu_one / down_pair per row, with g5k3_pair's
+// decode words on every path, the lane's x as two float2 loads per k-tile, and g5k3_colsum (no threadgroup memory). ──
+
+// g5k3_pair's decode words (g5k3_pair.metal:47-50): a 16-bit window -> the weight. Equal to guone's words for every
+// window (256 q = rr & 0xFF00FF00, so rr - 255 q = (rr & 0x00FF00FF) + q): one integer op fewer than guone's.
+inline float g5k3_wpair(uint window) {
+  uint rr = window * 0x83DCD12Du;
+  uint q = (rr >> 8u) & 0x00FF00FFu;
+  uint z = (rr - q * 255u) * 0x00010001u + 0x64000000u;
+  return float(fma(as_type<half2>(z).y, as_type<half>(ushort(0x1EEEu)), as_type<half>(ushort(0xC931u))));
+}
+
+// The lane's two funnel-shifted words of one tile: bits 0..31 (x) and 16..47 (y) of (rd9:rd8) >> lp (the stock GEMV's
+// v0 / v1, line for line).
+inline uint2 g5k3w_v(const device short* tile, uint wa, uint wb, uint lp) {
+  const device uint* tile32 = reinterpret_cast<const device uint*>(tile);
+  uint rd8 = tile32[wa >> 1u];
+  uint rd9 = tile32[wb >> 1u];
+  uint v0 = (lp == 0u) ? rd8 : ((rd8 >> lp) | (rd9 << (32u - lp)));
+  uint v1 = (lp < 16u) ? ((rd8 >> (lp + 16u)) | (rd9 << (16u - lp))) : (rd9 >> (lp - 16u));
+  return uint2(v0, v1);
+}
+
+// Weight m's input x[dr[m]] (dr = 2k + (9, 8, 1, 0)[m & 3], k = lane & 3) from the lane's two float2 loads of the k-tile:
+// xa = (x[2k], x[2k + 1]), xb = (x[2k + 8], x[2k + 9]). m is a literal after the unroll: the select folds.
+inline float g5k3w_x(uint m, float2 xa, float2 xb) {
+  const uint q = m & 3u;
+  return q == 0u ? xb.y : (q == 1u ? xb.x : (q == 2u ? xa.y : xa.x));
+}
+
+// One tile's 8 weights of the lane into one row's fma chains (the stock GEMV's order: m = 0..7, fma(x, w, acc)).
+inline void g5k3w_tile1(uint2 v, float2 xa, float2 xb, thread float* acc) {
+  for (uint m = 0; m < 6u; ++m) {
+    float w = g5k3_wpair((v.x >> (3u * m)) & 0xffffu);
+    acc[m] = fma(g5k3w_x(m, xa, xb), w, acc[m]);
+  }
+  for (uint m = 6u; m < 8u; ++m) {
+    float w = g5k3_wpair((v.y >> (3u * m - 16u)) & 0xffffu);
+    acc[m] = fma(g5k3w_x(m, xa, xb), w, acc[m]);
+  }
+}
+
+// The pair rule's leader: one decode per weight for two rows' chains (row: xa / xb, mate: ya / yb).
+inline void g5k3w_tile2(uint2 v, float2 xa, float2 xb, float2 ya, float2 yb, thread float* acc, thread float* accb) {
+  for (uint m = 0; m < 6u; ++m) {
+    float w = g5k3_wpair((v.x >> (3u * m)) & 0xffffu);
+    acc[m] = fma(g5k3w_x(m, xa, xb), w, acc[m]);
+    accb[m] = fma(g5k3w_x(m, ya, yb), w, accb[m]);
+  }
+  for (uint m = 6u; m < 8u; ++m) {
+    float w = g5k3_wpair((v.y >> (3u * m - 16u)) & 0xffffu);
+    acc[m] = fma(g5k3w_x(m, xa, xb), w, acc[m]);
+    accb[m] = fma(g5k3w_x(m, ya, yb), w, accb[m]);
+  }
+}
+
+// The pair rule (g5k3_pair.metal:8-19): rows of one slot pair up in row order; returns the row's rank among the rows
+// naming its slot, the count, and the next such row (the mate; the row itself when none). Threadgroup-uniform. `ids`
+// is `constant` below 8 pairs (MLX's small inputs), `device` above.
+template <typename I>
+inline uint3 g5k3w_rank(I ids, uint nrows, uint row) {
+  uint slot = ids[row];
+  uint rank = 0u;
+  uint cnt = 0u;
+  uint mate = row;
+  for (uint j = 0; j < nrows; ++j) {
+    uint same = (ids[j] == slot) ? 1u : 0u;
+    rank += (j < row) ? same : 0u;
+    cnt += same;
+    mate = (mate == row && j > row && same == 1u) ? j : mate;
+  }
+  return uint3(rank, cnt, mate);
+}

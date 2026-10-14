@@ -566,6 +566,87 @@ pub fn emuGuLaunch(text: GuText, xg: []const f32, xu: []const f32, ids: []const 
     };
 }
 
+// ── The w forms (g5k3_guw / g5k3_dnw at TPT 1 or 2, g5k3_guwp / g5k3_dnwp) per lane as written ──
+
+/// A w text: `one` (g5k3_guw / g5k3_dnw: one row a simdgroup, `tpt` output tiles a simdgroup) or `pair` (g5k3_guwp /
+/// g5k3_dnwp: the two-row rule, one tile a simdgroup).
+pub const WText = enum { one, pair };
+
+/// The text's x of weight m from the lane's two float2 loads (header g5k3w_x): xa = (x[2k], x[2k + 1]),
+/// xb = (x[2k + 8], x[2k + 9]); q = m & 3 picks xb.y, xb.x, xa.y, xa.x (dr = 2k + 9, 8, 1, 0).
+pub fn wX(m: u32, xa: [2]f32, xb: [2]f32) f32 {
+    return switch (m & 3) {
+        0 => xb[1],
+        1 => xb[0],
+        2 => xa[1],
+        else => xa[0],
+    };
+}
+
+/// One projection of a w text's launch over P = ids.len rows as the text runs it: x [P, in] f32, `codes[r]` row r's slot
+/// codes [in / 16, out / 16, 48] (the caller resolves ids -> slot), out [P, o] f32 (only the launched groups' words), the
+/// simdgroups at x positions `groups` (output tiles gx tpt .. gx tpt + tpt - 1), `writes` per (row, group, t) stores,
+/// `decodes` the trellis decodes. Per simdgroup: the row (and for `pair` the rank rule: the odd rank exits, the leader
+/// takes its mate), each lane's float2 x loads, g5k3_pair's words, the fma chains over the k-tiles, then g5k3_colsum.
+pub fn emuWProj(text: WText, tpt: u32, in: u32, o: u32, x: []const f32, ids: []const u32, codes: []const []const i16, groups: []const u32, out: []f32, writes: []u8, decodes: *u64) void {
+    std.debug.assert(text == .one or tpt == 1);
+    const nr: u32 = @intCast(ids.len);
+    const it = in / 16;
+    const ot = o / 16;
+    for (0..nr) |ri| for (groups, 0..) |gx, gi| {
+        const row: u32 = @intCast(ri);
+        var rank: u32 = 0;
+        var cnt: u32 = 0;
+        var mate = row;
+        if (text == .pair) {
+            for (0..nr) |ji| {
+                const j: u32 = @intCast(ji);
+                const same: u32 = @intFromBool(ids[j] == ids[row]);
+                rank += if (j < row) same else 0;
+                cnt += same;
+                mate = if (mate == row and j > row and same == 1) j else mate;
+            }
+            if (rank & 1 != 0) continue;
+        }
+        const two = text == .pair and rank + 1 < cnt;
+        for (0..tpt) |ti| {
+            const tn = gx * tpt + @as(u32, @intCast(ti));
+            var acc: [32][8]f32 = @splat(@splat(0));
+            var accb: [32][8]f32 = @splat(@splat(0));
+            for (0..32) |li| {
+                const lane: u32 = @intCast(li);
+                const k = lane & 3;
+                for (0..it) |tki| {
+                    const tk: u32 = @intCast(tki);
+                    const xr = x[row * in + tk * 16 ..][0..16];
+                    const yr = x[mate * in + tk * 16 ..][0..16];
+                    const xa = [2]f32{ xr[2 * k], xr[2 * k + 1] };
+                    const xb = [2]f32{ xr[2 * k + 8], xr[2 * k + 9] };
+                    const ya = [2]f32{ yr[2 * k], yr[2 * k + 1] };
+                    const yb = [2]f32{ yr[2 * k + 8], yr[2 * k + 9] };
+                    const win = laneWindows(codes[row][(tk * ot + tn) * 48 ..][0..48], lane);
+                    for (0..8) |mi| {
+                        const m: u32 = @intCast(mi);
+                        const w: f32 = @floatCast(h16(decodePairWords(win[mi])));
+                        decodes.* += 1;
+                        acc[li][mi] = @mulAdd(f32, wX(m, xa, xb), w, acc[li][mi]);
+                        if (two) accb[li][mi] = @mulAdd(f32, wX(m, ya, yb), w, accb[li][mi]);
+                    }
+                }
+            }
+            var z: [16]f32 = undefined;
+            colsumRegisters(&acc, &z);
+            @memcpy(out[row * o + tn * 16 ..][0..16], &z);
+            writes[(row * groups.len + gi) * tpt + ti] += 1;
+            if (two) {
+                colsumRegisters(&accb, &z);
+                @memcpy(out[mate * o + tn * 16 ..][0..16], &z);
+                writes[(mate * groups.len + gi) * tpt + ti] += 1;
+            }
+        }
+    };
+}
+
 /// The pairs the two-row rule shares: the leaders (even ranks with a partner) of a wave's ids.
 pub fn pairLeaders(ids: []const u32) u32 {
     var n: u32 = 0;
@@ -885,4 +966,124 @@ test "glm5_next exl3 ref: g5k3_guone_pair equals g5k3_guone bit for bit at Flash
     var all: [inter / 16]u32 = undefined;
     for (&all, 0..) |*t, i| t.* = @intCast(i);
     try gpCase(a, &fx, &.{ B, E, B, C }, &all, 0x67706675);
+}
+
+/// A w text's launch over one projection against a reference over the same rows and tiles, bit for bit; every
+/// (row, group, t) written once; the decodes = one per weight per row less the leaders' mates.
+fn wCase(a: std.mem.Allocator, in: u32, o: u32, x: []const f32, ids: []const u32, codes: []const []const i16, groups_1: []const u32, groups_2: []const u32, want: []const f32) !void {
+    const p = ids.len;
+    const per_tile: u64 = 32 * (in / 16) * 8;
+    for ([_]struct { WText, u32, []const u32 }{ .{ .one, 1, groups_1 }, .{ .one, 2, groups_2 }, .{ .pair, 1, groups_1 } }) |c| {
+        const got = try a.alloc(f32, p * o);
+        defer a.free(got);
+        @memset(got, @bitCast(@as(u32, 0x7FBADBAD)));
+        const writes = try a.alloc(u8, p * c[2].len * @as(usize, c[1]));
+        defer a.free(writes);
+        @memset(writes, 0);
+        var decodes: u64 = 0;
+        emuWProj(c[0], c[1], in, o, x, ids, codes, c[2], got, writes, &decodes);
+        for (writes) |n| try testing.expectEqual(@as(u8, 1), n);
+        for (0..p) |r| for (c[2]) |gx| for (0..c[1]) |ti| {
+            const tn = gx * c[1] + @as(u32, @intCast(ti));
+            for (0..16) |col| {
+                const i = r * o + tn * 16 + col;
+                try testing.expectEqual(@as(u32, @bitCast(want[i])), @as(u32, @bitCast(got[i])));
+            }
+        };
+        const shared: u64 = if (c[0] == .pair) pairLeaders(ids) else 0;
+        try testing.expectEqual(per_tile * @as(u64, c[2].len) * @as(u64, c[1]) * (@as(u64, p) - shared), decodes);
+    }
+}
+
+/// The w texts' tile sets: one tile a simdgroup at `t1`, two at `t2` (t2 = t1 / 2 in pairs: the same tiles).
+const w_groups_1 = [_]u32{ 0, 1, 6, 7, 62, 63, 126, 127 };
+const w_groups_2 = [_]u32{ 0, 3, 31, 63 };
+const w_dn_groups_1 = [_]u32{ 0, 1, 128, 129, 254, 255 };
+const w_dn_groups_2 = [_]u32{ 0, 64, 127 };
+
+test "glm5_next exl3 ref: the w gate / up texts (g5k3_guw at TPT 1 and 2, g5k3_guwp) equal g5k3_guone bit for bit at Flash's gate / up shape (P 1..4, with and without slot sharing, three banks)" {
+    const a = testing.allocator;
+    var fx = try GpFixture.init(a);
+    defer fx.deinit(a);
+    const A: u32 = 0;
+    const B: u32 = 1;
+    const C: u32 = 1 << 24;
+    const D: u32 = (2 << 24) | 1;
+    const E: u32 = 2 << 24;
+    const waves = [_][]const u32{ &.{A}, &.{ A, B }, &.{ D, D }, &.{ C, C, C }, &.{ A, B, A }, &.{ A, A, A, A }, &.{ D, B, D, B }, &.{ E, E, E, A } };
+    var shared: u32 = 0;
+    for (waves, 0..) |ids, wi| {
+        const p = ids.len;
+        const xg = try a.alloc(f32, p * hidden);
+        defer a.free(xg);
+        const xu = try a.alloc(f32, p * hidden);
+        defer a.free(xu);
+        gpX(0x7700_0000 + wi, xg);
+        gpX(0x7700_0100 + wi, xu);
+        const og = try a.alloc(f32, p * inter);
+        defer a.free(og);
+        const ou = try a.alloc(f32, p * inter);
+        defer a.free(ou);
+        const writes = try a.alloc(u8, 2 * p * w_groups_1.len);
+        defer a.free(writes);
+        @memset(writes, 0);
+        var decodes: u64 = 0;
+        emuGuLaunch(.guone, xg, xu, ids, &fx.banks, &w_groups_1, og, ou, writes, &decodes);
+        for ([_][]const f32{ xg, xu }, [_][]const f32{ og, ou }, 0..) |x, want, proj| {
+            var codes: [4][]const i16 = undefined;
+            for (ids, 0..) |id, r| codes[r] = fx.banks.slotCode(id, @intCast(proj));
+            try wCase(a, hidden, inter, x, ids, codes[0..p], &w_groups_1, &w_groups_2, want);
+        }
+        shared += pairLeaders(ids);
+    }
+    try testing.expectEqual(@as(u32, 8), shared);
+}
+
+test "glm5_next exl3 ref: the w down texts (g5k3_dnw at TPT 1 and 2, g5k3_dnwp) equal the stock down GEMV over the decoded W_hat bit for bit at Flash's down shape (P 1..4, with and without slot sharing, three banks)" {
+    const a = testing.allocator;
+    const per = (inter / 16) * (hidden / 16) * 48;
+    // bank 0 two slots, bank 1 one, bank 2 two (the gate / up fixture's layout), down codes per slot from fillCode
+    const slots = [3]u32{ 2, 1, 2 };
+    var store: [3][]i16 = undefined;
+    var made: usize = 0;
+    defer for (store[0..made]) |s| a.free(s);
+    for (0..3) |b| {
+        store[b] = try a.alloc(i16, slots[b] * per);
+        made += 1;
+        for (0..slots[b]) |s| fillCode(0x646e_0000 + 64 * b + s, store[b][s * per ..][0..per]);
+    }
+    const tbl = try a.create([65536]u16);
+    defer a.destroy(tbl);
+    table(.mul1, tbl);
+    const wdec = try a.alloc(u16, inter * hidden);
+    defer a.free(wdec);
+    const A: u32 = 0;
+    const B: u32 = 1;
+    const C: u32 = 1 << 24;
+    const D: u32 = (2 << 24) | 1;
+    const E: u32 = 2 << 24;
+    const waves = [_][]const u32{ &.{A}, &.{ E, B }, &.{ D, D }, &.{ C, C, C }, &.{ A, D, A }, &.{ B, B, B, B }, &.{ D, B, D, B } };
+    var shared: u32 = 0;
+    for (waves, 0..) |ids, wi| {
+        const p = ids.len;
+        const x = try a.alloc(f32, p * inter);
+        defer a.free(x);
+        gpX(0x646e_7800 + wi, x);
+        var codes: [4][]const i16 = undefined;
+        for (ids, 0..) |id, r| codes[r] = store[id >> 24][(id & 0xFFFFFF) * per ..][0..per];
+        // the reference: the stock GEMV (glm5n_exl3_gemv, g5k3_pair's single path) over the decoded W_hat per row
+        const want = try a.alloc(f32, p * hidden);
+        defer a.free(want);
+        for (0..p) |r| {
+            decodeW(codes[r], inter, hidden, tbl, wdec);
+            for (w_dn_groups_1) |tn| {
+                var z: [16]f32 = undefined;
+                emuGemvTile(x[r * inter ..][0..inter], wdec, inter, hidden, tn, &z);
+                @memcpy(want[r * hidden + tn * 16 ..][0..16], &z);
+            }
+        }
+        try wCase(a, inter, hidden, x, ids, codes[0..p], &w_dn_groups_1, &w_dn_groups_2, want);
+        shared += pairLeaders(ids);
+    }
+    try testing.expectEqual(@as(u32, 7), shared);
 }

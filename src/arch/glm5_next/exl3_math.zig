@@ -474,10 +474,10 @@ test "glm5_next exl3 math: every exl3 form name computes the seam's words on the
     const ref = @import("exl3_forms_ref.zig");
     const sumOf = struct {
         fn gu(f: xf.Forms) ref.ColSum {
-            return if (f.fusedGu()) .registers else .stock;
+            return if (f.fusedGu() or f.wGu()) .registers else .stock;
         }
         fn dn(f: xf.Forms) ref.ColSum {
-            return if (f.fusedDn()) .registers else .stock;
+            return if (f.fusedDn() or f.wDn()) .registers else .stock;
         }
     };
     // the column sums: each name's (gate / up and down) against the seam's, bit for bit, over the identity's cases

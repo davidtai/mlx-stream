@@ -147,7 +147,10 @@ pub const DecodeSwiglu = enum { ops, fused };
 /// name), `fused16` / `fused8` (g5k3_gu_fused at 16 or 8 simdgroups), `guone` (DeepSeek's gu_one, the default),
 /// `guone_pair` (g5k3_guone_pair: gu_one with down_pair's two-row rule, one trellis decode for two rows of a slot),
 /// `gemv_u8` (the GEMV at DeepSeek's unroll 8); the down form (`exl3_down_form`): `seam`, `pair` (DeepSeek's down_pair,
-/// the default), `fused1` / `fused2` (din_rin + g5k3_dn_fused over 1 / 2 blocks), `pro1` / `pro2` (g5k3_dn_pro);
+/// the default), `fused1` / `fused2` (din_rin + g5k3_dn_fused over 1 / 2 blocks), `pro1` / `pro2` (g5k3_dn_pro); the w forms
+/// (exl3_forms.zig: g5k3_pair's decode words on every path, float2 x loads, register column sums): gate / up `guw` /
+/// `guw2` (one / two output tiles a simdgroup), `guwp` (the two-row rule), `guwh` / `guw2h` (one-row at P <= 8, two-row
+/// above); down `dnw` / `dnw2` / `dnwp` / `dnwh` / `dnw2h` likewise;
 /// `exl3_forms_maxm` the fused forms' union rule (1, the default, or 4); `exl3_forms_min_p` the narrowest wave the
 /// fused forms take (1 .. 64, default 1; narrower waves run the seam chain). The mcg GEMV is the bench's codebook
 /// price, not a form: on the mul1 pack it decodes other weights, so no setting names it. Every form computes the seam's
@@ -155,8 +158,8 @@ pub const DecodeSwiglu = enum { ops, fused };
 /// form other than the seam on an NVFP4 pack refuses the load by name. The default is batch 27's measured pair
 /// (g22-exl3b at 190/217, lane on, draft_depth 3 + draft_gate 0.5: guone + pair +1.79 % decode over the seam beyond
 /// noise, ids identical); on an NVFP4 pack it is inert (that source installs no form).
-pub const Exl3GateUpForm = enum { seam, fused16, fused8, guone, guone_pair, gemv_u8 };
-pub const Exl3DownForm = enum { seam, pair, fused1, fused2, pro1, pro2 };
+pub const Exl3GateUpForm = enum { seam, fused16, fused8, guone, guone_pair, gemv_u8, guw, guw2, guwp, guwh, guw2h };
+pub const Exl3DownForm = enum { seam, pair, fused1, fused2, pro1, pro2, dnw, dnw2, dnwp, dnwh, dnw2h };
 pub const Exl3Forms = struct {
     gateup: Exl3GateUpForm = .guone,
     down: Exl3DownForm = .pair,
@@ -176,6 +179,11 @@ pub const Exl3Forms = struct {
                 .guone => .guone,
                 .guone_pair => .guone_pair,
                 .gemv_u8 => .u8,
+                .guw => .guw,
+                .guw2 => .guw2,
+                .guwp => .guwp,
+                .guwh => .guwh,
+                .guw2h => .guw2h,
             },
             .dn = switch (f.down) {
                 .seam => .seam,
@@ -184,6 +192,11 @@ pub const Exl3Forms = struct {
                 .fused2 => .fused2,
                 .pro1 => .pro1,
                 .pro2 => .pro2,
+                .dnw => .dnw,
+                .dnw2 => .dnw2,
+                .dnwp => .dnwp,
+                .dnwh => .dnwh,
+                .dnw2h => .dnw2h,
             },
             .maxm = f.maxm,
             .min_p = f.min_p,
@@ -851,6 +864,16 @@ test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the 
         c.expert_family = .nvfp4;
         try testing.expectError(error.Glm5NextExl3FormsOnNvfp4Pack, c.validate());
     }
+    // the w forms by name (the default stays guone + pair): the width-routed pair, refused on an NVFP4 pack
+    {
+        var c = try parseSettings("{\"exl3_gateup_form\":\"guw2h\",\"exl3_down_form\":\"dnwh\"}");
+        try testing.expect(c.exl3_forms_requested);
+        c.expert_family = .exl3;
+        try c.validate();
+        try testing.expectEqual(exl3_forms.Forms{ .gu = .guw2h, .dn = .dnwh, .maxm = 1, .min_p = 1 }, c.exl3_forms.forms());
+        c.expert_family = .nvfp4;
+        try testing.expectError(error.Glm5NextExl3FormsOnNvfp4Pack, c.validate());
+    }
     {
         var c = try parseSettings("{\"exl3_gateup_form\":\"fused8\",\"exl3_down_form\":\"fused1\",\"exl3_forms_maxm\":4,\"exl3_forms_min_p\":4}");
         c.expert_family = .exl3;
@@ -873,6 +896,8 @@ test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the 
         .{ "{\"exl3_gateup_form\":\"guone_pair\",\"exl3_forms_maxm\":4}", error.Glm5NextExl3FormsSetting },
         .{ "{\"exl3_gateup_form\":\"guone_pair\",\"exl3_forms_min_p\":4}", error.Glm5NextExl3FormsSetting },
         .{ "{\"exl3_down_form\":\"pair\",\"exl3_forms_min_p\":4}", error.Glm5NextExl3FormsSetting },
+        .{ "{\"exl3_gateup_form\":\"guw\",\"exl3_forms_maxm\":4}", error.Glm5NextExl3FormsSetting },
+        .{ "{\"exl3_down_form\":\"dnwh\",\"exl3_forms_min_p\":4}", error.Glm5NextExl3FormsSetting },
         .{ "{\"exl3_gateup_form\":\"fused16\",\"exl3_down_form\":\"pro2\",\"exl3_forms_maxm\":4}", error.Glm5NextExl3FormsSetting },
     }) |case| {
         var c = try parseSettings(case[0]);

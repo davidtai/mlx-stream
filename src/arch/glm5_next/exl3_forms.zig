@@ -16,6 +16,15 @@
 //!     GEMV and dpost in one launch).
 //!   `maxm` (fused forms): 1, or 4 = the union rule of the NVFP4 k1 texts (a slot's pairs in one threadgroup, each
 //!     trellis word decoded once for all of them).
+//!   The w forms (hand-written; header_g5k3.metal `g5k3w_*`): gu_one's / the stock GEMV's launch per row with
+//!     g5k3_pair's decode words on every path (one integer op a weight fewer than guone's), the lane's x as two float2
+//!     loads a k-tile (four scalar loads before), and g5k3_colsum (no threadgroup memory, no barrier): gate / up `guw`
+//!     (g5k3_guw, one output tile a simdgroup) and `guw2` (two tiles a simdgroup: the lane's x loads shared, two
+//!     independent decode chains), `guwp` (g5k3_guwp: guone_pair's two-row rule on the w lane); down `dnw` / `dnw2`
+//!     (g5k3_dnw at one / two tiles) and `dnwp` (g5k3_dnwp: down_pair's rule on the w lane). `guwh` / `guw2h` and
+//!     `dnwh` / `dnw2h` route on the wave width at install (`Forms.at`): the one-row form at P <= top_k (one token's
+//!     wave: no two pairs name one slot), the two-row form above; every form computes every row's words, the route only
+//!     picks the faster launch for the width.
 //! Every form keeps the seam's arithmetic and order per output word (fma chains per lane over the k-tiles, the column
 //! sums, the 128-point butterflies, the scales, the clamped SwiGLU, one rounding on dpost's store); only where values
 //! live and which thread computes them change. A form that fails the device parity is not installed.
@@ -43,8 +52,53 @@ comptime {
     if (max_pairs > 64) @compileError("glm5_next exl3 forms: the union vote takes at most 64 pairs a wave");
 }
 
-pub const GuForm = enum { seam, u8, guone, guone_pair, mcg, fused16, fused8 };
-pub const DnForm = enum { seam, pair, mcg, fused1, fused2, pro1, pro2 };
+pub const GuForm = enum {
+    seam,
+    u8,
+    guone,
+    guone_pair,
+    mcg,
+    fused16,
+    fused8,
+    guw,
+    guw2,
+    guwp,
+    guwh,
+    guw2h,
+
+    /// The w forms' route on the wave width (`Forms.at`): the one-row form at P <= top_k, the two-row form above.
+    fn atP(f: GuForm, p: u32) GuForm {
+        return switch (f) {
+            .guwh => if (p <= top_k) .guw else .guwp,
+            .guw2h => if (p <= top_k) .guw2 else .guwp,
+            else => f,
+        };
+    }
+};
+pub const DnForm = enum {
+    seam,
+    pair,
+    mcg,
+    fused1,
+    fused2,
+    pro1,
+    pro2,
+    dnw,
+    dnw2,
+    dnwp,
+    dnwh,
+    dnw2h,
+
+    fn atP(f: DnForm, p: u32) DnForm {
+        return switch (f) {
+            .dnwh => if (p <= top_k) .dnw else .dnwp,
+            .dnw2h => if (p <= top_k) .dnw2 else .dnwp,
+            else => f,
+        };
+    }
+};
+/// One token's wave: top_k pairs naming distinct slots (the w forms' route between the one-row and two-row texts).
+pub const top_k: u32 = 8;
 pub const Forms = struct {
     gu: GuForm = .seam,
     dn: DnForm = .seam,
@@ -60,6 +114,19 @@ pub const Forms = struct {
     pub fn fusedDn(f: Forms) bool {
         return f.dn == .fused1 or f.dn == .fused2 or f.dn == .pro1 or f.dn == .pro2;
     }
+    /// The w forms (their column sums are g5k3_colsum's, the fused forms' register sums).
+    pub fn wGu(f: Forms) bool {
+        return switch (f.gu) {
+            .guw, .guw2, .guwp, .guwh, .guw2h => true,
+            else => false,
+        };
+    }
+    pub fn wDn(f: Forms) bool {
+        return switch (f.dn) {
+            .dnw, .dnw2, .dnwp, .dnwh, .dnw2h => true,
+            else => false,
+        };
+    }
 
     /// The forms a build installs, refused by name otherwise: maxm 1 or 4, 4 only on a fused form; the prologue forms at
     /// maxm 1 (each member's rotated input is 8 KiB of threadgroup memory).
@@ -71,9 +138,13 @@ pub const Forms = struct {
         if (f.min_p != 1 and !(f.fusedGu() or f.fusedDn())) return error.Glm5NextExl3Forms;
     }
 
-    /// The forms a wave of P pairs runs: these, or the seam chain below `min_p`.
+    /// The forms a wave of P pairs runs: these (the w forms' width routes resolved), or the seam chain below `min_p`.
     pub fn at(f: Forms, p: u32) Forms {
-        return if (p < f.min_p) .{} else f;
+        if (p < f.min_p) return .{};
+        var o = f;
+        o.gu = f.gu.atP(p);
+        o.dn = f.dn.atP(p);
+        return o;
     }
 
     pub fn name(f: Forms, buf: []u8) []const u8 {
@@ -83,7 +154,7 @@ pub const Forms = struct {
 
 // ── The texts ──
 
-pub const Kernel = enum { g5k3_gu_fused, g5k3_dn_fused, g5k3_dn_pro, g5k3_guone, g5k3_pair, g5k3_gemv_u8, g5k3_gemv_mcg, g5k3_guone_pair };
+pub const Kernel = enum { g5k3_gu_fused, g5k3_dn_fused, g5k3_dn_pro, g5k3_guone, g5k3_pair, g5k3_gemv_u8, g5k3_gemv_mcg, g5k3_guone_pair, g5k3_guw, g5k3_dnw, g5k3_guwp, g5k3_dnwp };
 const n_kernels = std.meta.fieldNames(Kernel).len;
 const dir = "../../kernels/glm5_next_exl3_forms/";
 pub const texts: [n_kernels][:0]const u8 = blk: {
@@ -103,8 +174,12 @@ pub const text_sha256 = [n_kernels]*const [64]u8{
     "66d970fa467925ce0f5d9dec3bdba70d1e0955dbdaabbcf3e193ca2676021e5d",
     "3dbbae2ece4fb6e77241d6f9bd829886e798346c3f9126a840e105ab99a22abc",
     "60b34ea70408fbb498368d06f3326ff49c0843216b03ca863549e0ed7010c66e",
+    "8b133738199d43fee1f358562506e89d9de73a73867c4ea7ce594e756695f4f6",
+    "315fe9436e0847daebf9bb645bc575e826e39cfab1f0bb9dcfa5a4504a2b4bc4",
+    "7d20d915f3c9a9dd266b11f19a4210b9658143eabd67f66bbe22f476e30f73fa",
+    "be6a38486c7441e0cfb950af3c590ee07d222406e8b595f4f1c8a4a842258e25",
 };
-pub const header_sha256: *const [64]u8 = "4e4dbb86d58cccb83e961c96308ca43bb660f72223f0e795f53484fa956cc3f8";
+pub const header_sha256: *const [64]u8 = "93dbe2a9acb4268e1384dbe4d23e09a3a72c8e6bdb51c656a71c9bd1563cdc52";
 
 pub fn checkPins() error{Glm5NextExl3FormsTextNotPinned}!void {
     for (texts, text_sha256) |t, want| if (!std.mem.eql(u8, &kset.shaHex(t), want)) return error.Glm5NextExl3FormsTextNotPinned;
@@ -120,6 +195,8 @@ fn sigOf(k: Kernel) Sig {
         .g5k3_dn_pro => .{ .ins = &.{ "h", "ids", "cd0", "cd1", "cd2", "rn0", "rn1", "rn2", "rd0", "rd1", "rd2" }, .outs = &.{"out"}, .hdr = true },
         .g5k3_guone, .g5k3_guone_pair => .{ .ins = &.{ "xh_g", "xh_u", "ids", "code_g0", "code_g1", "code_g2", "code_u0", "code_u1", "code_u2" }, .outs = &.{ "out_g", "out_u" }, .hdr = false },
         .g5k3_pair, .g5k3_gemv_u8, .g5k3_gemv_mcg => .{ .ins = &.{ "xh", "ids", "code0", "code1", "code2" }, .outs = &.{"out"}, .hdr = false },
+        .g5k3_guw, .g5k3_guwp => .{ .ins = &.{ "xh_g", "xh_u", "ids", "code_g0", "code_g1", "code_g2", "code_u0", "code_u1", "code_u2" }, .outs = &.{ "out_g", "out_u" }, .hdr = true },
+        .g5k3_dnw, .g5k3_dnwp => .{ .ins = &.{ "xh", "ids", "code0", "code1", "code2" }, .outs = &.{"out"}, .hdr = true },
     };
 }
 
@@ -169,6 +246,21 @@ pub fn dnFusedLaunch(p: u32, nb: u32, maxm: u32, dt: mlx.mlx_dtype) Launch {
 pub fn guoneLaunch(p: u32) Launch {
     const l: Launch = .{ .grid = .{ inter / 16 * 32, 2 * p, 1 }, .tg = .{ 32, 1, 1 } };
     return l.int("IT", hidden / 16).int("OT", inter / 16).out(p, inter, .float32).out(p, inter, .float32);
+}
+
+/// The w forms' one-row texts (g5k3_guw: gate and up, grid y 2 P; g5k3_dnw: grid y P): `tpt` output tiles a simdgroup,
+/// grid (out / 16 / tpt x 32, rows).
+pub fn wLaunch(p: u32, in: u32, o: u32, tpt: u32, gu: bool) Launch {
+    const l: Launch = .{ .grid = .{ o / 16 / tpt * 32, if (gu) 2 * p else p, 1 }, .tg = .{ 32, 1, 1 } };
+    const k = l.int("IT", in / 16).int("OT", o / 16).int("TPT", tpt);
+    return if (gu) k.out(p, o, .float32).out(p, o, .float32) else k.out(p, o, .float32);
+}
+
+/// The w forms' two-row texts (g5k3_guwp: gate and up, grid y 2 P; g5k3_dnwp: grid y P): one tile a simdgroup.
+pub fn wpLaunch(p: u32, in: u32, o: u32, gu: bool) Launch {
+    const l: Launch = .{ .grid = .{ o / 16 * 32, if (gu) 2 * p else p, 1 }, .tg = .{ 32, 1, 1 } };
+    const k = l.int("IT", in / 16).int("OT", o / 16);
+    return if (gu) k.out(p, o, .float32).out(p, o, .float32) else k.out(p, o, .float32);
 }
 
 /// One-simdgroup GEMV texts (pair, u8, mcg): grid (out / 16 x 32, P).
@@ -304,6 +396,10 @@ pub fn install(a: std.mem.Allocator, seam: *const xk.Kernels, forms: Forms, out_
             .u8, .mcg => try cfgOf(gemvLaunch(p, hidden, inter)),
             .guone, .guone_pair => try cfgOf(guoneLaunch(p)),
             .fused16, .fused8 => try cfgOf(guFusedLaunch(p, ef.gu, ef.maxm)),
+            .guw => try cfgOf(wLaunch(p, hidden, inter, 1, true)),
+            .guw2 => try cfgOf(wLaunch(p, hidden, inter, 2, true)),
+            .guwp => try cfgOf(wpLaunch(p, hidden, inter, true)),
+            .guwh, .guw2h => unreachable, // resolved by `Forms.at`
         };
         if (!ef.fusedGu()) w.epi = try seamCfg(xk.rotLaunch(p, inter, "INTER"));
         if (ef.dn != .pro1 and ef.dn != .pro2) w.din = try seamCfg(xk.rotLaunch(p, inter, "INTER"));
@@ -311,6 +407,10 @@ pub fn install(a: std.mem.Allocator, seam: *const xk.Kernels, forms: Forms, out_
             .seam => try seamCfg(xk.gemvLaunch(p, inter, hidden)),
             .pair, .mcg => try cfgOf(gemvLaunch(p, inter, hidden)),
             .fused1, .fused2, .pro1, .pro2 => try cfgOf(dnFusedLaunch(p, nb, ef.maxm, out_dtype)),
+            .dnw => try cfgOf(wLaunch(p, inter, hidden, 1, false)),
+            .dnw2 => try cfgOf(wLaunch(p, inter, hidden, 2, false)),
+            .dnwp => try cfgOf(wpLaunch(p, inter, hidden, false)),
+            .dnwh, .dnw2h => unreachable, // resolved by `Forms.at`
         };
         if (!ef.fusedDn()) {
             // dpost at hidden with its store in out_dtype (the seam's bf16; T is the text's store type)
@@ -355,6 +455,9 @@ pub fn gateUp(f: *const Installed, g: *G, x: T, ids: T, banks: *const [n_banks]B
         },
         .guone => try apply(g, f.kern(.g5k3_guone), w.g1, &.{ xs[0], xs[1], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &z),
         .guone_pair => try apply(g, f.kern(.g5k3_guone_pair), w.g1, &.{ xs[0], xs[1], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &z),
+        .guw, .guw2 => try apply(g, f.kern(.g5k3_guw), w.g1, &.{ xs[0], xs[1], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &z),
+        .guwp => try apply(g, f.kern(.g5k3_guwp), w.g1, &.{ xs[0], xs[1], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &z),
+        .guwh, .guw2h => unreachable, // resolved at install (`Forms.at`)
         .fused16, .fused8 => {
             var out: [1]T = undefined;
             try apply(g, f.kern(.g5k3_gu_fused), w.g1, &.{ xs[0], xs[1], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code, banks[0].gate.rout, banks[1].gate.rout, banks[2].gate.rout, banks[0].up.rout, banks[1].up.rout, banks[2].up.rout }, &out);
@@ -391,6 +494,8 @@ pub fn down(f: *const Installed, g: *G, h: T, ids: T, banks: *const [n_banks]Ban
     const k = switch (w.f.dn) {
         .seam => f.seamK(.gemv),
         .pair => f.kern(.g5k3_pair),
+        .dnw, .dnw2 => f.kern(.g5k3_dnw),
+        .dnwp => f.kern(.g5k3_dnwp),
         else => f.kern(.g5k3_gemv_mcg),
     };
     var zd: [1]T = undefined;
@@ -460,4 +565,37 @@ test "glm5_next exl3 forms: threadgroup memory of every fused instance fits 32 K
         for ([_]u32{ 1, 2 }) |nb| try testing.expect(mm * nb * 128 * 4 <= 32 << 10);
     }
     for ([_]u32{ 1, 2 }) |nb| try testing.expect(1 * inter * 4 + nb * 128 * 4 <= 32 << 10);
+}
+
+test "glm5_next exl3 forms: the w forms' launches cover every output word at every wave width; the width routes resolve at install" {
+    for (1..max_pairs + 1) |pi| {
+        const p: u32 = @intCast(pi);
+        for ([_]u32{ 1, 2 }) |tpt| {
+            const g = wLaunch(p, hidden, inter, tpt, true);
+            try testing.expectEqual(inter / 16, g.grid[0] / 32 * tpt);
+            try testing.expectEqual(2 * p, g.grid[1]);
+            try testing.expectEqual(@as(u8, 2), g.n_out);
+            const d = wLaunch(p, inter, hidden, tpt, false);
+            try testing.expectEqual(hidden / 16, d.grid[0] / 32 * tpt);
+            try testing.expectEqual(p, d.grid[1]);
+            try testing.expectEqual(@as(u8, 1), d.n_out);
+        }
+        const gp = wpLaunch(p, hidden, inter, true);
+        try testing.expectEqual(inter / 16, gp.grid[0] / 32);
+        try testing.expectEqual(2 * p, gp.grid[1]);
+        const dp = wpLaunch(p, inter, hidden, false);
+        try testing.expectEqual(hidden / 16, dp.grid[0] / 32);
+        // the width routes: one-row texts at P <= top_k, two-row above; the concrete forms unchanged
+        const h = (Forms{ .gu = .guwh, .dn = .dnw2h }).at(p);
+        try testing.expectEqual(if (p <= top_k) GuForm.guw else GuForm.guwp, h.gu);
+        try testing.expectEqual(if (p <= top_k) DnForm.dnw2 else DnForm.dnwp, h.dn);
+        try testing.expectEqual(GuForm.guw2, (Forms{ .gu = .guw2, .dn = .dnwp }).at(p).gu);
+        try testing.expectEqual(DnForm.dnwp, (Forms{ .gu = .guw2, .dn = .dnwp }).at(p).dn);
+        // no width resolves to a route value (the gate / up and down switches never meet one)
+        for (std.enums.values(GuForm)) |gu| try testing.expect(gu.atP(p) != .guwh and gu.atP(p) != .guw2h);
+        for (std.enums.values(DnForm)) |dn| try testing.expect(dn.atP(p) != .dnwh and dn.atP(p) != .dnw2h);
+    }
+    try (Forms{ .gu = .guw2h, .dn = .dnwh }).check();
+    try testing.expectError(error.Glm5NextExl3Forms, (Forms{ .gu = .guw, .dn = .dnw, .maxm = 4 }).check());
+    try testing.expectError(error.Glm5NextExl3Forms, (Forms{ .gu = .guwh, .dn = .dnwh, .min_p = 4 }).check());
 }

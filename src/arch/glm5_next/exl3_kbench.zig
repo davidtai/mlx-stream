@@ -188,13 +188,15 @@ fn launchCount(f0: xf.Forms) u32 {
     const f = f0.at(f0.min_p);
     const gu: u32 = switch (f.gu) {
         .seam, .u8, .mcg => 4,
-        .guone, .guone_pair => 3,
+        .guone, .guone_pair, .guw, .guw2, .guwp => 3,
         .fused16, .fused8 => 2,
+        .guwh, .guw2h => unreachable, // resolved by `Forms.at`
     };
     const dn: u32 = switch (f.dn) {
-        .seam, .pair, .mcg => 3,
+        .seam, .pair, .mcg, .dnw, .dnw2, .dnwp => 3,
         .fused1, .fused2 => 2,
         .pro1, .pro2 => 1,
+        .dnwh, .dnw2h => unreachable, // resolved by `Forms.at`
     };
     return gu + dn;
 }
@@ -222,6 +224,13 @@ const named_arms = [_]NamedArm{
     .{ .name = "exl3_f8_p2", .forms = .{ .gu = .fused8, .dn = .pro2 } },
     .{ .name = "exl3_hyb_f16_f1_m1_p4", .forms = .{ .gu = .fused16, .dn = .fused1, .min_p = 4 } },
     .{ .name = "exl3_hyb_f8_f1_m4_p4", .forms = .{ .gu = .fused8, .dn = .fused1, .maxm = 4, .min_p = 4 } },
+    // the w forms (exl3_forms.zig): g5k3_pair's decode words on every path, float2 x loads, register column sums
+    .{ .name = "exl3_guw_pair", .forms = .{ .gu = .guw, .dn = .pair } },
+    .{ .name = "exl3_guw_dnw", .forms = .{ .gu = .guw, .dn = .dnw } },
+    .{ .name = "exl3_guw2_dnw2", .forms = .{ .gu = .guw2, .dn = .dnw2 } },
+    .{ .name = "exl3_guwp_dnwp", .forms = .{ .gu = .guwp, .dn = .dnwp } },
+    .{ .name = "exl3_guwh_dnwh", .forms = .{ .gu = .guwh, .dn = .dnwh } },
+    .{ .name = "exl3_guw2h_dnw2h", .forms = .{ .gu = .guw2h, .dn = .dnw2h } },
 };
 /// The seam, the named form arms, the two NVFP4 controls. The table's length comes from the list: the 9105bbf binary
 /// sized it by hand (24 for 23 arms), its `assert(n == out.len)` was UB in ReleaseFast and the test compiled to a
@@ -230,6 +239,7 @@ pub const arm_count = 1 + named_arms.len + 2;
 /// The arm table, built and checked at compile time: names distinct, every form installable (`Forms.check`), exactly
 /// one mcg arm (the mcg codebook's reference chain).
 const arms_table: [arm_count]Arm = blk: {
+    @setEvalBranchQuota(20_000);
     var out: [arm_count]Arm = undefined;
     out[0] = .{ .name = "exl3_seam", .kind = .seam, .launches = 7 };
     for (named_arms, 1..) |x, i| {
@@ -765,9 +775,9 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
     try testing.expectEqual(@as(u32, 0), fails);
 }
 
-test "glm5_next exl3 kbench: the arm table is the list's length (24: seam, 21 forms, 2 NVFP4), every entry named and installable, one mcg arm" {
+test "glm5_next exl3 kbench: the arm table is the list's length (30: seam, 27 forms, 2 NVFP4), every entry named and installable, one mcg arm" {
     const arms = armsList();
-    try testing.expectEqual(@as(usize, 24), arms.len);
+    try testing.expectEqual(@as(usize, 30), arms.len);
     try testing.expectEqual(named_arms.len + 3, arms.len);
     try testing.expectEqual(ArmKind.seam, arms[0].kind);
     try testing.expectEqual(ArmKind.nv_fused, arms[arms.len - 2].kind);
