@@ -206,13 +206,14 @@ pub const Module = struct {
             log.info("glm5_next decode KDA installed: one text a layer ({d} threadgroups of {d}: conv, gate stages, L2 norms, gate, delta rule and gated norm; the projections GEMVs); compile check passed\n", .{ model.kda_heads, kda_decode.threads });
         }
         errdefer self.kda_kernels.deinit();
-        // The MTP lane (`mtp_lane`): its draft bank read into MLX and checked, its head bound from the kept residents,
-        // its lanes at the billed positions; what its open holds against its billed terms (ConstructionOverBill).
+        // The MTP lane (`mtp_lane`): its draft bank read into MLX and checked, its head bound from the kept residents (and
+        // under `draft_head: q4` lm_head's 4-bit copy built), its lanes at the billed positions; what its open holds against
+        // its billed terms (ConstructionOverBill).
         if (self.c.mtp_lane) {
-            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.c.draft_depth, self.c.draft_gate, self.routes.dsa, &diag);
+            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.c.draft_depth, self.c.draft_gate, self.c.draft_head, self.w.head, self.routes.dsa, &diag);
             errdefer lane.deinit(&self.g);
-            const term = termBytes(plan.bill, "mtp_bank") + termBytes(plan.bill, "mtp_tables") + termBytes(plan.bill, "mtp_kv");
-            log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv), residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
+            const term = termBytes(plan.bill, "mtp_bank") + termBytes(plan.bill, "mtp_tables") + termBytes(plan.bill, "mtp_kv") + termBytes(plan.bill, "mtp_head_q4");
+            log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv + mtp_head_q4), residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
             mtp.holdCheck(lane.held_bytes, term) catch |e| {
                 log.err("glm5_next: load refused: the MTP lane holds {d} B, over its billed {d} B (ConstructionOverBill)\n", .{ lane.held_bytes, term });
                 return e;
@@ -276,6 +277,12 @@ pub const Module = struct {
             log.info("glm5_next logits_dump: on dir={s} chunk_rows={d} chunk_bytes={d} (one safetensors file per prompt pass: logits F32 [prompt rows, {d}], token_ids I32, ids_int32_sha256; written before the request returns)\n", .{ d, graph.dump_chunk_rows, dump.chunkBytes(graph.dump_chunk_rows, model.vocab_size, model.hidden_size), model.vocab_size });
         }
         if (self.mtp == null) log.info("glm5_next MTP lane: off (serial; set {{\"mtp_lane\":true}})\n", .{});
+        // The draft head as installed (`draft_head`; read back from the lane: its form, its weights' bits and group, the
+        // sampled draw's filter, the q4 arrays' bytes) and the lane's depth and gate.
+        if (self.mtp) |lane| {
+            var hb: [160]u8 = undefined;
+            log.info("glm5_next MTP draft head: {s} lane=on depth={d} draft_gate={d:.3}\n", .{ lane.headLine(&hb), lane.depth, lane.gate });
+        } else log.info("glm5_next MTP draft head: none lane=off\n", .{});
         log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s} kda_prologue={s} residents={s} decode_glue={s} decode_kda={s} decode_dsa={s} decode_predict={s} decode_swiglu={s} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ routes.dsa.nax, @tagName(combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route), @tagName(kda_prologue_route), @tagName(self.c.model.residents_format), @tagName(self.c.decode_glue), @tagName(self.c.decode_kda), @tagName(self.c.decode_dsa), @tagName(self.c.decode_predict), @tagName(self.c.decode_swiglu), @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
         // The prompt levers' engagement lines (glm5next/prefill-levers; docs/glm5-next.md "Prompt levers").
         if (experts.prompt_relocate) log.info("glm5_next prompt lever 1: read-ahead relocation engaged (a read-ahead record the plans evict before any hit is copied at the plans into its later transient row: read once; exact)\n", .{});

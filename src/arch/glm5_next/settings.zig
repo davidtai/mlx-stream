@@ -17,7 +17,10 @@
 //! logits dump route for the KL gate (dump.zig): absent, nothing of it is built. `expert_resident_ratio`,
 //! `expert_tally_window` and `expert_tally_file` set the expert stream's rate tally (sdk_ext/expert/tally.zig, every
 //! streamed arch's keys; glm5_next's default ratio `default_tally_ratio`). `expert_rows_by_layer` splits the decode rows
-//! between the routed layers (`LayerRows`; `uniform`, the default, is every layer at the plan's rows).
+//! between the routed layers (`LayerRows`; `uniform`, the default, is every layer at the plan's rows). `draft_head` is the
+//! MTP lane's draft head (`DraftHead`: `bf16`, the default and the control, the trunk's lm_head and the full-vocab filter
+//! on every draft step; `q4`, a 4-bit copy of lm_head built once at the lane's open and a bounded draft filter; needs
+//! `mtp_lane`).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -86,7 +89,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "draft_head" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -132,6 +135,25 @@ pub const DecodePredict = enum { f32, bf16 };
 /// construction (swiglu.zig): `fused` one text between the gate / up GEMVs and the down GEMV; `ops` the op chain (the
 /// control). Rounding-class against `ops`.
 pub const DecodeSwiglu = enum { ops, fused };
+/// The MTP lane's draft head (reports/.../mimo/glm5next-audit-decode-20261014.md rank 3), installed once at the lane's open
+/// (mtp.zig `Lane.chain`): `bf16` (the default, the control) drafts on the trunk's BF16 lm_head and draws a sampled draft
+/// through the request's full-vocab filter (`acceptance.sampledRows`: a sort of every logit); `q4` drafts on a 4-bit copy of
+/// lm_head (`draft_head_bits`, `draft_head_group`: MLX's affine quantize at the open, 0.36 GB beside the BF16 head) and draws
+/// a sampled draft whose filter sorts (top_k, if set, at most `draft_filter_k`: `mtp.boundedServes`) through the bounded
+/// filter (`mtp.boundedDraw`: the request's filter over the row's `draft_filter_k` largest logits, the same position-keyed
+/// draw). Drafts only steer acceptance: the verify keeps the BF16
+/// head and draws every emitted token from its full row (mtp.zig's exact rule), so the ids are the control's under either
+/// form. Any other value refuses by name in `validate`; `q4` without `mtp_lane` refuses by name.
+pub const DraftHead = enum { bf16, q4 };
+/// The q4 draft head's quantization (MLX's affine mode): 4 bits, a scale and a bias (bf16) per group of 64 weights. Group 64
+/// is MLX's default 4-bit group: lm_head [154,880, 4,096] holds 317,194,240 B of packed words and 2 x 19,824,640 B of
+/// scales and biases (0.357 GB, read once a draft step in place of the BF16 head's 1.269 GB); group 32 reads 39.6 MB more
+/// a step, group 128 saves 19.8 MB at twice the group's span per scale. MLX's draft GEMV (`quantized_matmul`, one row,
+/// transposed weights) dispatches its `affine_qmv_fast` kernel at this shape (K = 4,096 a multiple of 512, N = 154,880 of 8).
+pub const draft_head_bits: u32 = 4;
+pub const draft_head_group: u32 = 64;
+/// The q4 draft head's bounded filter: the candidates a draft draw reads (MLX's argpartition of the tempered row).
+pub const draft_filter_k: u32 = 256;
 /// `expert_rows_by_layer` (MiMo's mimo/layer-rows, mimo_v2/settings.zig `LayerRows`): the plan's decode rows split
 /// between the routed layers at the SAME total, once at construction. `uniform` (the default) is every layer at the plan's
 /// rows, today's construction exactly. `offsets` is one integer per routed layer (routed layer 0 first, model layer
@@ -278,6 +300,8 @@ pub const Config = struct {
     tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
     /// The decode rows' split between the routed layers (`LayerRows`): `uniform` (the default) or `offsets`.
     expert_rows_by_layer: LayerRows = defaultLayerRows(),
+    /// The MTP lane's draft head (`DraftHead`): `bf16` (the default, the control) or `q4`.
+    draft_head: DraftHead = .bf16,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -289,7 +313,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, draft_head: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -337,6 +361,10 @@ pub const Config = struct {
             const route: gpu_warm.Route = if (v == .string) gpu_warm.parseRoute(v.string) else .invalid;
             if (route == .invalid) c.malformed.gpu_keep_warm = true else c.gpu_keep_warm = route;
             c.gpu_keep_warm_requested = true;
+        }
+        if (raw.object.get("draft_head")) |v| {
+            const form: ?DraftHead = if (v == .string) std.meta.stringToEnum(DraftHead, v.string) else null;
+            if (form) |f| c.draft_head = f else c.malformed.draft_head = true;
         }
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
@@ -421,6 +449,9 @@ pub const Config = struct {
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
         if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
+        if (c.malformed.draft_head) return error.Glm5NextDraftHeadSetting;
+        // The draft head is the MTP lane's: without the lane a q4 head would install nothing.
+        if (!c.mtp_lane and c.draft_head == .q4) return error.Glm5NextDraftHeadNeedsLane;
         try c.tally.check("glm5_next");
         switch (c.expert_rows_by_layer) {
             .uniform => {},
@@ -583,6 +614,42 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(@as(?u32, 120), built.expert_prefill_rows);
     try testing.expectEqual(@as(u64, 32_768), built.reserveTokens());
     try testing.expectEqual(fill_reserve_tokens, (Config{}).reserveTokens());
+}
+
+test "glm5_next settings: the draft head: bf16 unless named; bf16 / q4 by name; any other value refused by name; q4 refused without the lane" {
+    const base = try parseSettings("{}");
+    try base.validate();
+    try testing.expectEqual(DraftHead.bf16, base.draft_head);
+    try testing.expectEqual(DraftHead.bf16, (try parseSettings("{\"mtp_lane\":true}")).draft_head);
+    for ([_]struct { text: []const u8, want: DraftHead }{
+        .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"bf16\"}", .want = .bf16 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"q4\"}", .want = .q4 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q4\"}", .want = .q4 },
+        // The control's form needs no lane (nothing of it installs).
+        .{ .text = "{\"draft_head\":\"bf16\"}", .want = .bf16 },
+    }) |case| {
+        const c = try parseSettings(case.text);
+        try c.validate();
+        try testing.expectEqual(case.want, c.draft_head);
+    }
+    // Anything but "bf16" / "q4" refused by name.
+    for ([_][]const u8{ "\"Q4\"", "\"q8\"", "\"int4\"", "\"4\"", "\"BF16\"", "\"\"", "\"mxfp4\"", "4", "true", "null", "[\"q4\"]", "{}" }) |bad| {
+        var buf: [96]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{{\"mtp_lane\":true,\"draft_head\":{s}}}", .{bad});
+        try testing.expectError(error.Glm5NextDraftHeadSetting, (try parseSettings(text)).validate());
+    }
+    // q4 without the lane: refused by name.
+    try testing.expectError(error.Glm5NextDraftHeadNeedsLane, (try parseSettings("{\"draft_head\":\"q4\"}")).validate());
+    try testing.expectError(error.Glm5NextDraftHeadNeedsLane, (try parseSettings("{\"mtp_lane\":false,\"draft_head\":\"q4\"}")).validate());
+    // Near misses of the key are not settings.
+    for ([_][]const u8{ "{\"draft_heads\":\"q4\"}", "{\"drafthead\":\"q4\"}", "{\"head\":\"q4\"}" }) |text|
+        try testing.expectError(error.Unknown, parseSettings(text));
+    // The q4 geometry: MLX's affine 4-bit group 64 at Flash's lm_head (the qmv_fast alignments: K by 512, N by 8).
+    const c: Config = .{};
+    try testing.expectEqual(@as(u32, 0), c.model.hidden_size % 512);
+    try testing.expectEqual(@as(u32, 0), c.model.vocab_size % 8);
+    try testing.expectEqual(@as(u32, 0), c.model.hidden_size % draft_head_group);
+    try testing.expect(draft_filter_k <= c.model.vocab_size);
 }
 
 test "glm5_next settings: the resolved draft depth per arch (glm5_next depth 2, gate 0.75; MiMo its trained 3; DSV4.1's DSpark schedule unchanged)" {
