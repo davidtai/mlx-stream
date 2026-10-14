@@ -8,7 +8,9 @@
 //! mHC hcPre chain, the router and top-8 texts, the combine with the shared expert's add, glue.zig; `ops`, the stock op
 //! chains, the control); `decode_kda` the decode lane's KDA layer (`fused`, the default: one text a layer, kda_decode.zig;
 //! `ops`, the op chain, the control); `kda_prologue` the KDA prompt pass's prologue (`fused`, the default: one text a span,
-//! kda_prologue.zig, exact; `ops`, the op chain, the control); `decode_dsa` the decode lane's sparse latent attention (`fused`, the default: two
+//! kda_prologue.zig, exact; `ops`, the op chain, the control); `kda_verify` the MTP verify's KDA layer (`chain`, the
+//! default: the op chain with the stock capture recurrence, the control; `fused`, one exact text a layer, kda_verify.zig;
+//! with `mtp_lane` only); `decode_dsa` the decode lane's sparse latent attention (`fused`, the default: two
 //! texts, dsa_decode.zig; `ops`, the op chain, the control); `decode_predict` the lookahead predictor's router weight
 //! (`bf16`, the default: the stored BF16 weight; `f32`, the transposed F32 copy, the control); `decode_swiglu` the decode lane's MLP activation
 //! (`fused`, the default: one text, swiglu.zig; `ops`, the op chain, the control); `gpu_keep_warm` MiMo's X12 route
@@ -90,7 +92,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -129,6 +131,11 @@ pub const DecodeKda = enum { ops, fused };
 /// norms and the next tail in one text, each step MLX's kernel for the op it replaces (the op chain's bits); `ops` the op
 /// chain (the control). Exact against `ops`. On a CPU stream the default resolves to `ops`.
 pub const KdaPrologue = enum { ops, fused };
+/// The MTP verify's KDA layer, installed once at construction (kda_verify.zig): `chain` the op chain with the stock
+/// capture recurrence (the default and the control); `fused` the prologue, the gate, beta, the capture recurrence and the
+/// gated norm in one text a layer, each stage MLX's kernel (or the stock text) of the op it replaces (the op chain's
+/// bits; the projections and the low-rank second stages stay outside). Exact against `chain`. Needs the MTP lane.
+pub const KdaVerify = enum { chain, fused };
 /// The decode lane's DSA sparse latent attention, installed once at construction (dsa_decode.zig): `fused` a split text
 /// (MiMo's dec_attn split pattern for MLA over the selected latent rows) and MiMo's merge text; `ops` the op chain (the
 /// control). Rounding-class against `ops`.
@@ -333,6 +340,8 @@ pub const Config = struct {
     decode_kda: DecodeKda = .fused,
     /// The KDA prompt pass's prologue (kda_prologue.zig): `fused` (the default) or `ops` (the op chain, the control).
     kda_prologue: KdaPrologue = .fused,
+    /// The MTP verify's KDA layer (kda_verify.zig): `chain` (the default, the control) or `fused` (with `mtp_lane` only).
+    kda_verify: KdaVerify = .chain,
     /// The decode lane's DSA sparse latent attention (dsa_decode.zig): `fused` (the default) or `ops` (the control).
     decode_dsa: DecodeDsa = .fused,
     /// The lookahead predictor's router weight: `bf16` (the default) or `f32` (the control).
@@ -369,7 +378,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -417,6 +426,10 @@ pub const Config = struct {
         if (raw.object.get("kda_prologue")) |v| {
             const route: ?KdaPrologue = if (v == .string) std.meta.stringToEnum(KdaPrologue, v.string) else null;
             if (route) |r| c.kda_prologue = r else c.malformed.kda_prologue = true;
+        }
+        if (raw.object.get("kda_verify")) |v| {
+            const route: ?KdaVerify = if (v == .string) std.meta.stringToEnum(KdaVerify, v.string) else null;
+            if (route) |r| c.kda_verify = r else c.malformed.kda_verify = true;
         }
         if (raw.object.get("decode_dsa")) |v| {
             const route: ?DecodeDsa = if (v == .string) std.meta.stringToEnum(DecodeDsa, v.string) else null;
@@ -537,6 +550,9 @@ pub const Config = struct {
         if (c.malformed.decode_glue) return error.Glm5NextDecodeGlueSetting;
         if (c.malformed.decode_kda) return error.Glm5NextDecodeKdaSetting;
         if (c.malformed.kda_prologue) return error.Glm5NextKdaPrologueSetting;
+        if (c.malformed.kda_verify) return error.Glm5NextKdaVerifySetting;
+        // The fused verify replaces the MTP verify's KDA layer: without the lane there is no verify (an inert knob is a lie).
+        if (c.kda_verify == .fused and !c.mtp_lane) return error.Glm5NextKdaVerifyWithoutLane;
         if (c.malformed.decode_dsa) return error.Glm5NextDecodeDsaSetting;
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
@@ -679,6 +695,22 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(KdaPrologue.ops, (try parseSettings("{\"kda_prologue\":\"ops\"}")).kda_prologue);
     try testing.expectError(error.Glm5NextKdaPrologueSetting, (try parseSettings("{\"kda_prologue\":\"percore\"}")).validate());
     try testing.expectError(error.Glm5NextKdaPrologueSetting, (try parseSettings("{\"kda_prologue\":1}")).validate());
+    // The MTP verify's KDA layer: chain unless named; fused by name with the lane; refused by name without it; anything else
+    // refused by name.
+    try testing.expectEqual(KdaVerify.chain, pinned.kda_verify);
+    try testing.expectEqual(KdaVerify.chain, (try parseSettings("{\"mtp_lane\":true}")).kda_verify);
+    {
+        const fused = try parseSettings("{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"kda_verify\":\"fused\"}");
+        try testing.expectEqual(KdaVerify.fused, fused.kda_verify);
+        try fused.validate();
+        try (try parseSettings("{\"mtp_lane\":true,\"kda_verify\":\"chain\"}")).validate();
+        try (try parseSettings("{\"kda_verify\":\"chain\"}")).validate();
+    }
+    try testing.expectError(error.Glm5NextKdaVerifyWithoutLane, (try parseSettings("{\"kda_verify\":\"fused\"}")).validate());
+    try testing.expectError(error.Glm5NextKdaVerifyWithoutLane, (try parseSettings("{\"mtp_lane\":false,\"kda_verify\":\"fused\"}")).validate());
+    try testing.expectError(error.Glm5NextKdaVerifySetting, (try parseSettings("{\"mtp_lane\":true,\"kda_verify\":\"ops\"}")).validate());
+    try testing.expectError(error.Glm5NextKdaVerifySetting, (try parseSettings("{\"mtp_lane\":true,\"kda_verify\":\"on\"}")).validate());
+    try testing.expectError(error.Glm5NextKdaVerifySetting, (try parseSettings("{\"mtp_lane\":true,\"kda_verify\":true}")).validate());
     // The decode DSA attention: fused unless named; ops (the control) by name; anything else refused by name.
     try testing.expectEqual(DecodeDsa.fused, pinned.decode_dsa);
     try testing.expectEqual(DecodeDsa.ops, (try parseSettings("{\"decode_dsa\":\"ops\"}")).decode_dsa);

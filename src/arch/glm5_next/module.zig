@@ -26,6 +26,7 @@ const dump = @import("dump.zig");
 const fp8 = @import("fp8.zig");
 const glue = @import("glue.zig");
 const kda_decode = @import("kda_decode.zig");
+const kda_verify = @import("kda_verify.zig");
 const dsa_decode = @import("dsa_decode.zig");
 const swiglu = @import("swiglu.zig");
 const mtp = @import("mtp.zig");
@@ -66,6 +67,9 @@ pub const Module = struct {
     glue_kernels: glue.Kernels = .{},
     /// `decode_kda: fused`: the KDA decode text (kda_decode.zig), installed at construction; `routes.kda` runs it.
     kda_kernels: kda_decode.Kernels = .{},
+    /// `kda_verify: fused`: the MTP verify's KDA text (kda_verify.zig), installed at construction; `routes.kda_verify`
+    /// runs it.
+    kda_verify_kernels: kda_verify.Kernels = .{},
     /// `decode_dsa: fused`: the DSA decode texts (dsa_decode.zig), installed at construction; `routes.dsa.sparse` points here.
     dsa_kernels: dsa_decode.Kernels = .{},
     /// `decode_swiglu: fused`: the MLP activation text (swiglu.zig), installed at construction; `routes.swiglu` points here.
@@ -221,6 +225,27 @@ pub const Module = struct {
             log.info("glm5_next decode KDA installed: one text a layer ({d} threadgroups of {d}: conv, gate stages, L2 norms, gate, delta rule and gated norm; the projections GEMVs); compile check passed\n", .{ model.kda_heads, kda_decode.threads });
         }
         errdefer self.kda_kernels.deinit();
+        // The MTP verify's KDA layer (`kda_verify`, the lane only: settings.zig refuses `fused` without it): the fused text
+        // installed here (its geometry, every KDA layer's tables, the launches per verify width, one launch as the compile
+        // check), refused by name; the op chain with the capture otherwise. One line names the installed route.
+        if (self.c.mtp_lane) {
+            if (self.c.kda_verify == .fused) {
+                const kda_layers = try gpa.alloc(*const kda.Weights, model.nKda());
+                defer gpa.free(kda_layers);
+                var n_kda: usize = 0;
+                for (self.w.layers) |*lw| if (lw.attn == .kda) {
+                    kda_layers[n_kda] = &lw.attn.kda;
+                    n_kda += 1;
+                };
+                self.kda_verify_kernels = kda_verify.install(gpa, s, model, kda_layers[0..n_kda], &diag) catch |e| {
+                    log.err("glm5_next: the fused KDA verify refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                    return e;
+                };
+                self.routes.kda_verify = .{ .ctx = &self.kda_verify_kernels, .run = kda_verify.run };
+                log.info("glm5_next kda verify: route=fused kernel=glm5n_kda_verify layers={d} rows=1..{d} threadgroups={d}x{d} (prologue, gate, beta, capture recurrence and gated norm in one dispatch a layer; the projections, f_b / g_b and o outside); compile check passed\n", .{ n_kda, kda_verify.max_rows, model.kda_heads, kda_verify.threads });
+            } else log.info("glm5_next kda verify: route=chain (the op chain with the stock capture recurrence)\n", .{});
+        }
+        errdefer self.kda_verify_kernels.deinit();
         // The MTP lane (`mtp_lane`): its draft bank read into MLX and checked, its head bound from the kept residents,
         // its lanes at the billed positions; what its open holds against its billed terms (ConstructionOverBill).
         if (self.c.mtp_lane) {
@@ -431,6 +456,7 @@ pub const Module = struct {
         self.cache.deinit(&self.g);
         self.glue_kernels.deinit();
         self.kda_kernels.deinit();
+        self.kda_verify_kernels.deinit();
         self.dsa_kernels.deinit();
         if (self.routes.dsa.select) |p| p.destroy();
         self.swiglu_kernels.deinit();
