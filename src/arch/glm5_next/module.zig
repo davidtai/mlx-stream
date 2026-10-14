@@ -267,10 +267,15 @@ pub const Module = struct {
         // under `draft_head: q4 | q8` lm_head's quantized copy built), its lanes at the billed positions; what its open holds against
         // its billed terms (ConstructionOverBill).
         if (self.c.mtp_lane) {
-            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.c.draft_depth, self.c.draft_gate, mtp.ruleOf(self.c.mtp_acceptance, self.c.mtp_typical_delta), self.c.draft_head, self.w.head, self.routes.dsa, &diag);
+            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.c.draft_depth, self.c.draft_gate, mtp.ruleOf(self.c.mtp_acceptance, self.c.mtp_typical_delta), self.c.draftHeadRoute(), self.w.head, self.routes.dsa, &diag);
             errdefer lane.deinit(&self.g);
             const term = termBytes(plan.bill, "mtp_bank") + termBytes(plan.bill, "mtp_tables") + termBytes(plan.bill, "mtp_kv") + termBytes(plan.bill, "mtp_head_q4") + termBytes(plan.bill, "mtp_head_q8");
-            log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv + mtp_head_q4 / mtp_head_q8), residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
+            const head_term: []const u8 = switch (self.c.draftHeadRoute()) {
+                .bf16 => "",
+                .q4 => " + mtp_head_q4",
+                .q8 => " + mtp_head_q8",
+            };
+            log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv{s}), head={s}, residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, head_term, @tagName(self.c.draftHeadRoute()), @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
             mtp.holdCheck(lane.held_bytes, term) catch |e| {
                 log.err("glm5_next: load refused: the MTP lane holds {d} B, over its billed {d} B (ConstructionOverBill)\n", .{ lane.held_bytes, term });
                 return e;

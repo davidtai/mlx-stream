@@ -452,8 +452,10 @@ pub const Config = struct {
     tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
     /// The decode rows' split between the routed layers (`LayerRows`): `uniform` (the default) or `offsets`.
     expert_rows_by_layer: LayerRows = defaultLayerRows(),
-    /// The MTP lane's draft head (`DraftHead`): `bf16` (the default, the control), `q4` or `q8`.
-    draft_head: DraftHead = .bf16,
+    /// The MTP lane's draft head (`DraftHead`): `q8` (the default since g26: battery 3/3, +2.36 % decode clock-corrected,
+    /// rounding-class), `bf16` (the control) or `q4`, by name. Read through `draftHeadRoute`.
+    draft_head: DraftHead = .q8,
+    draft_head_named: bool = false,
     /// The EXL3 family's decode forms (`Exl3Forms`): guone + pair unless named; the seam chain by name.
     exl3_forms: Exl3Forms = .{},
     /// The settings named a forms key (on an NVFP4 pack the default is inert; a named form other than the seam refuses).
@@ -597,6 +599,7 @@ pub const Config = struct {
         if (raw.object.get("draft_head")) |v| {
             const form: ?DraftHead = if (v == .string) std.meta.stringToEnum(DraftHead, v.string) else null;
             if (form) |f| c.draft_head = f else c.malformed.draft_head = true;
+            c.draft_head_named = true;
         }
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
@@ -629,6 +632,12 @@ pub const Config = struct {
         const gu_skips = c.exl3_forms.gateup == .seam or c.exl3_forms.gateup == .guone;
         const dn_skips = c.exl3_forms.down == .seam or c.exl3_forms.down == .pair;
         return gu_skips and dn_skips;
+    }
+
+    /// The draft head the lane installs and the bill prices: the setting's with the lane; `bf16` (nothing installed, no
+    /// head term) without it.
+    pub fn draftHeadRoute(c: *const Config) DraftHead {
+        return if (c.mtp_lane) c.draft_head else .bf16;
     }
 
     /// The hit wave's route: the setting's, except that the DEFAULT `resident_only` resolves to `all_pairs` where its texts
@@ -733,8 +742,9 @@ pub const Config = struct {
         }
         if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
         if (c.malformed.draft_head) return error.Glm5NextDraftHeadSetting;
-        // The draft head is the MTP lane's: without the lane a quantized head would install nothing.
-        if (!c.mtp_lane and c.draft_head != .bf16) return error.Glm5NextDraftHeadNeedsLane;
+        // The draft head is the MTP lane's: a quantized head NAMED without the lane would install nothing (refused); the
+        // default without the lane installs nothing (`draftHeadRoute`: bf16, no head term).
+        if (c.draft_head_named and !c.mtp_lane and c.draft_head != .bf16) return error.Glm5NextDraftHeadNeedsLane;
         if (c.malformed.exl3_gateup_form) return error.Glm5NextExl3GateUpFormSetting;
         if (c.malformed.exl3_down_form) return error.Glm5NextExl3DownFormSetting;
         if (c.malformed.exl3_forms_maxm) return error.Glm5NextExl3FormsMaxmSetting;
@@ -1071,11 +1081,15 @@ test "glm5_next settings: the launch-fusion switches: off unless named, on / off
         try testing.expectError(error.Unknown, parseSettings(text));
 }
 
-test "glm5_next settings: the draft head: bf16 unless named; bf16 / q4 / q8 by name; any other value refused by name; q4 / q8 refused without the lane" {
+test "glm5_next settings: the draft head: q8 unless named (bf16 without the lane: nothing installed); bf16 / q4 / q8 by name; any other value refused by name; q4 / q8 named without the lane refused" {
     const base = try parseSettings("{}");
     try base.validate();
-    try testing.expectEqual(DraftHead.bf16, base.draft_head);
-    try testing.expectEqual(DraftHead.bf16, (try parseSettings("{\"mtp_lane\":true}")).draft_head);
+    try testing.expectEqual(DraftHead.q8, base.draft_head);
+    try testing.expectEqual(DraftHead.bf16, base.draftHeadRoute());
+    const laned = try parseSettings("{\"mtp_lane\":true}");
+    try laned.validate();
+    try testing.expectEqual(DraftHead.q8, laned.draftHeadRoute());
+    try testing.expectEqual(DraftHead.bf16, (try parseSettings("{\"mtp_lane\":true,\"draft_head\":\"bf16\"}")).draftHeadRoute());
     for ([_]struct { text: []const u8, want: DraftHead }{
         .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"bf16\"}", .want = .bf16 },
         .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"q4\"}", .want = .q4 },

@@ -1041,7 +1041,7 @@ test "glm5_next mtp acceptance setting: exact is today's rule; typical (delta 0.
 
 // ── the draft head (`draft_head`: bf16, the control; q4, the 4-bit head and the bounded draw) ──
 
-test "glm5_next mtp draft head: the lane's chain is the bf16 head's unless the setting names q4; the q4 chain (its 4-bit head, its bounded draw) is reachable from draft_head q4 only" {
+test "glm5_next mtp draft head: the lane's chain is the q8 head's by default (bf16 and q4 by name; none without the lane); the q4 chain (its 4-bit head, its bounded draw) is reachable from draft_head q4 only" {
     try testing.expect(mtp.chainOf(.bf16) != mtp.chainOf(.q4));
     try testing.expect(mtp.chainFor(.bf16) == mtp.chainOf(.bf16));
     try testing.expect(mtp.chainFor(.q4) == mtp.chainOf(.q4));
@@ -1049,8 +1049,8 @@ test "glm5_next mtp draft head: the lane's chain is the bf16 head's unless the s
     try testing.expect(mtp.chainOf(.q8) != mtp.chainOf(.q4) and mtp.chainOf(.q8) != mtp.chainOf(.bf16));
     for ([_]struct { text: []const u8, want: settings.DraftHead }{
         .{ .text = "{}", .want = .bf16 },
-        .{ .text = "{\"mtp_lane\":true}", .want = .bf16 },
-        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5}", .want = .bf16 },
+        .{ .text = "{\"mtp_lane\":true}", .want = .q8 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5}", .want = .q8 },
         .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"bf16\"}", .want = .bf16 },
         .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q4\"}", .want = .q4 },
         .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q8\"}", .want = .q8 },
@@ -1061,15 +1061,15 @@ test "glm5_next mtp draft head: the lane's chain is the bf16 head's unless the s
         var c: settings.Config = .{};
         c.applySettings(raw.value);
         try c.validate();
-        try testing.expectEqual(case.want, c.draft_head);
-        // The open binds `chainFor(draft_head)`: the q4 chain for "q4" alone.
+        try testing.expectEqual(case.want, c.draftHeadRoute());
+        // The open binds `chainFor(draftHeadRoute())`: the q4 chain for "q4" alone.
         const want_chain = switch (case.want) {
             .bf16 => mtp.chainOf(.bf16),
             .q4 => mtp.chainOf(.q4),
             .q8 => mtp.chainOf(.q8),
         };
-        try testing.expect(mtp.chainFor(c.draft_head) == want_chain);
-        try testing.expectEqual(case.want == .q4, mtp.chainFor(c.draft_head) == mtp.chainOf(.q4));
+        try testing.expect(mtp.chainFor(c.draftHeadRoute()) == want_chain);
+        try testing.expectEqual(case.want == .q4, mtp.chainFor(c.draftHeadRoute()) == mtp.chainOf(.q4));
     }
     // The q4 head's arrays start empty (built only by the q4 open).
     const empty: mtp.HeadQ = .{};

@@ -625,7 +625,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .decode_dsa = cfg.decode_dsa,
         .decode_swiglu = cfg.decode_swiglu,
         .mtp = lane,
-        .draft_head = cfg.draft_head,
+        .draft_head = cfg.draftHeadRoute(),
         .gpu_keep_warm = cfg.gpu_keep_warm,
         .exl3_wave_rows = cfg.prompt.wave_rows,
         .page = page,
@@ -1053,9 +1053,9 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
     const lane = if (std.c.getenv("GLM5_BILL_MTP")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
     // `GLM5_BILL_WAVE_ROWS=<rows>`: the exl3 family's DIG-X prompt waves at that setting (`exl3_wave_rows`, validated).
     const wave_rows: u32 = if (std.c.getenv("GLM5_BILL_WAVE_ROWS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else prompt_levers.default_wave_rows;
-    // `GLM5_BILL_DRAFT_HEAD=q4|q8` (with the lane): the lane's quantized draft head (`mtp_head_q4` / `mtp_head_q8`); absent,
-    // the control's head.
-    const head: settings.DraftHead = if (std.c.getenv("GLM5_BILL_DRAFT_HEAD")) |v| std.meta.stringToEnum(settings.DraftHead, std.mem.span(v)) orelse return error.Glm5NextDraftHeadSetting else .bf16;
+    // `GLM5_BILL_DRAFT_HEAD=bf16|q4|q8` (with the lane): the lane's draft head (`mtp_head_q4` / `mtp_head_q8`); absent, the
+    // settings' default (q8 since g26: `mtp_head_q8` with the lane).
+    const head: settings.DraftHead = if (std.c.getenv("GLM5_BILL_DRAFT_HEAD")) |v| std.meta.stringToEnum(settings.DraftHead, std.mem.span(v)) orelse return error.Glm5NextDraftHeadSetting else (settings.Config{}).draft_head;
     const fam = blk: {
         const v = try std.json.parseFromSlice(std.json.Value, a, config_text, .{});
         defer v.deinit();
