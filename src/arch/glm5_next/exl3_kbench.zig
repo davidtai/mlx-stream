@@ -16,7 +16,9 @@
 //!    over 145 or 215 resident slots; miss parts of 1 and 3 pairs over a transient bank of 10 or 30 records. The NVFP4
 //!    arms take the same pattern modulo their bank (145 base).
 //! Lines: GLM5NEXT_EXL3_KPARITY / KREF per (wave, arm), GLM5NEXT_EXL3_KBENCH per (case, arm), a `pick` line per case,
-//! `overall PASS|FAIL`. Static bound (declared, printed first): EXL3 slot arrays 253 x 9,474,048 B = 2.40 GB; NVFP4
+//! `overall PASS|FAIL`; GLM5NEXT_EXL3_KSTAGE before each stage (install, banks, parity_<codebook>_<wave>,
+//! timing_<case>), and a watchdog thread that ends the process (status 124, `TIMEOUT stage=<name>`, `overall FAIL`) when a
+//! stage outlives its budget. Static bound (declared, printed first): EXL3 slot arrays 253 x 9,474,048 B = 2.40 GB; NVFP4
 //! 183 x 14,155,788 B = 2.59 GB + line-isolated scales 0.01 GB; a round's chain <= 42 x 32 x 82 KiB = 0.11 GB live,
 //! MLX's cache cleared per case (limit 0.5 GB); host truth <= 8 decoded experts x 50 MB = 0.40 GB + the f64 work;
 //! JIT and the test binary ~0.4 GB. Bound 6.5 GB.
@@ -90,7 +92,7 @@ fn buildExl3(a: std.mem.Allocator, g: *G) !ExlBanks {
         // per component: the array shape (rows = cap) and its bytes
         var arrs: [9]struct { arr: T, bytes: []u8 } = undefined;
         for (0..9) |c| {
-            const comp: ref.Component = @enumFromInt(c);
+            const comp: ref.Component = @fromBackingInt(@intCast(c));
             const is_dn = c >= 6;
             const d = if (is_dn) dn else gu;
             arrs[c] = switch (c % 3) {
@@ -114,7 +116,7 @@ fn buildExl3(a: std.mem.Allocator, g: *G) !ExlBanks {
         for (0..cap) |s| {
             ref.synthRecord(recordSeed(@intCast(b), @intCast(s)), rec);
             for (0..9) |c| {
-                const sg = ref.segment(@enumFromInt(c));
+                const sg = ref.segment(@fromBackingInt(@intCast(c)));
                 @memcpy(arrs[c].bytes[s * sg.len ..][0..sg.len], rec[sg.off..][0..sg.len]);
             }
         }
@@ -197,43 +199,59 @@ fn launchCount(f0: xf.Forms) u32 {
     return gu + dn;
 }
 
-fn armsList() [24]Arm {
-    var out: [24]Arm = undefined;
-    var n: usize = 0;
-    out[n] = .{ .name = "exl3_seam", .kind = .seam, .launches = 7 };
-    n += 1;
-    const named = [_]struct { []const u8, xf.Forms }{
-        .{ "exl3_seam_forms", .{} },
-        .{ "exl3_u8", .{ .gu = .u8 } },
-        .{ "exl3_dsv41_forms", .{ .gu = .guone, .dn = .pair } },
-        .{ "exl3_mcg", .{ .gu = .mcg, .dn = .mcg } },
-        .{ "exl3_f16_seam", .{ .gu = .fused16 } },
-        .{ "exl3_seam_f1", .{ .dn = .fused1 } },
-        .{ "exl3_f16_f1_m1", .{ .gu = .fused16, .dn = .fused1 } },
-        .{ "exl3_f16_f2_m1", .{ .gu = .fused16, .dn = .fused2 } },
-        .{ "exl3_f8_f1_m1", .{ .gu = .fused8, .dn = .fused1 } },
-        .{ "exl3_f8_f2_m1", .{ .gu = .fused8, .dn = .fused2 } },
-        .{ "exl3_f16_f1_m4", .{ .gu = .fused16, .dn = .fused1, .maxm = 4 } },
-        .{ "exl3_f16_f2_m4", .{ .gu = .fused16, .dn = .fused2, .maxm = 4 } },
-        .{ "exl3_f8_f1_m4", .{ .gu = .fused8, .dn = .fused1, .maxm = 4 } },
-        .{ "exl3_f8_f2_m4", .{ .gu = .fused8, .dn = .fused2, .maxm = 4 } },
-        .{ "exl3_f16_p1", .{ .gu = .fused16, .dn = .pro1 } },
-        .{ "exl3_f16_p2", .{ .gu = .fused16, .dn = .pro2 } },
-        .{ "exl3_f8_p1", .{ .gu = .fused8, .dn = .pro1 } },
-        .{ "exl3_f8_p2", .{ .gu = .fused8, .dn = .pro2 } },
-        .{ "exl3_hyb_f16_f1_m1_p4", .{ .gu = .fused16, .dn = .fused1, .min_p = 4 } },
-        .{ "exl3_hyb_f8_f1_m4_p4", .{ .gu = .fused8, .dn = .fused1, .maxm = 4, .min_p = 4 } },
-    };
-    for (named) |x| {
-        out[n] = .{ .name = x[0], .kind = .forms, .forms = x[1], .launches = launchCount(x[1]) };
-        n += 1;
+const NamedArm = struct { name: []const u8, forms: xf.Forms };
+const named_arms = [_]NamedArm{
+    .{ .name = "exl3_seam_forms", .forms = .{} },
+    .{ .name = "exl3_u8", .forms = .{ .gu = .u8 } },
+    .{ .name = "exl3_dsv41_forms", .forms = .{ .gu = .guone, .dn = .pair } },
+    .{ .name = "exl3_mcg", .forms = .{ .gu = .mcg, .dn = .mcg } },
+    .{ .name = "exl3_f16_seam", .forms = .{ .gu = .fused16 } },
+    .{ .name = "exl3_seam_f1", .forms = .{ .dn = .fused1 } },
+    .{ .name = "exl3_f16_f1_m1", .forms = .{ .gu = .fused16, .dn = .fused1 } },
+    .{ .name = "exl3_f16_f2_m1", .forms = .{ .gu = .fused16, .dn = .fused2 } },
+    .{ .name = "exl3_f8_f1_m1", .forms = .{ .gu = .fused8, .dn = .fused1 } },
+    .{ .name = "exl3_f8_f2_m1", .forms = .{ .gu = .fused8, .dn = .fused2 } },
+    .{ .name = "exl3_f16_f1_m4", .forms = .{ .gu = .fused16, .dn = .fused1, .maxm = 4 } },
+    .{ .name = "exl3_f16_f2_m4", .forms = .{ .gu = .fused16, .dn = .fused2, .maxm = 4 } },
+    .{ .name = "exl3_f8_f1_m4", .forms = .{ .gu = .fused8, .dn = .fused1, .maxm = 4 } },
+    .{ .name = "exl3_f8_f2_m4", .forms = .{ .gu = .fused8, .dn = .fused2, .maxm = 4 } },
+    .{ .name = "exl3_f16_p1", .forms = .{ .gu = .fused16, .dn = .pro1 } },
+    .{ .name = "exl3_f16_p2", .forms = .{ .gu = .fused16, .dn = .pro2 } },
+    .{ .name = "exl3_f8_p1", .forms = .{ .gu = .fused8, .dn = .pro1 } },
+    .{ .name = "exl3_f8_p2", .forms = .{ .gu = .fused8, .dn = .pro2 } },
+    .{ .name = "exl3_hyb_f16_f1_m1_p4", .forms = .{ .gu = .fused16, .dn = .fused1, .min_p = 4 } },
+    .{ .name = "exl3_hyb_f8_f1_m4_p4", .forms = .{ .gu = .fused8, .dn = .fused1, .maxm = 4, .min_p = 4 } },
+};
+/// The seam, the named form arms, the two NVFP4 controls. The table's length comes from the list: the 9105bbf binary
+/// sized it by hand (24 for 23 arms), its `assert(n == out.len)` was UB in ReleaseFast and the test compiled to a
+/// one-instruction self-loop right after G.init (the window hang of 2026-10-14T04:48Z).
+pub const arm_count = 1 + named_arms.len + 2;
+/// The arm table, built and checked at compile time: names distinct, every form installable (`Forms.check`), exactly
+/// one mcg arm (the mcg codebook's reference chain).
+const arms_table: [arm_count]Arm = blk: {
+    var out: [arm_count]Arm = undefined;
+    out[0] = .{ .name = "exl3_seam", .kind = .seam, .launches = 7 };
+    for (named_arms, 1..) |x, i| {
+        x.forms.check() catch @compileError("glm5next exl3 kbench: arm " ++ x.name ++ " names forms no build installs");
+        out[i] = .{ .name = x.name, .kind = .forms, .forms = x.forms, .launches = launchCount(x.forms) };
     }
-    out[n] = .{ .name = "nvfp4_fused", .kind = .nv_fused, .launches = 2 };
-    n += 1;
-    out[n] = .{ .name = "nvfp4_stock_gather", .kind = .nv_stock, .launches = 4 };
-    n += 1;
-    std.debug.assert(n == out.len);
-    return out;
+    out[arm_count - 2] = .{ .name = "nvfp4_fused", .kind = .nv_fused, .launches = 2 };
+    out[arm_count - 1] = .{ .name = "nvfp4_stock_gather", .kind = .nv_stock, .launches = 4 };
+    for (out, 0..) |p, i| for (out[0..i]) |q| if (std.mem.eql(u8, p.name, q.name)) @compileError("glm5next exl3 kbench: arm " ++ p.name ++ " named twice");
+    break :blk out;
+};
+/// The mcg arm's index (the mcg codebook's reference chain), exactly one.
+const mcg_arm_index: usize = blk: {
+    var found: ?usize = null;
+    for (arms_table, 0..) |arm, i| if (arm.kind == .forms and arm.forms.gu == .mcg) {
+        if (found != null) @compileError("glm5next exl3 kbench: two mcg arms");
+        found = i;
+    };
+    break :blk found orelse @compileError("glm5next exl3 kbench: no mcg arm");
+};
+
+fn armsList() [arm_count]Arm {
+    return arms_table;
 }
 
 const Ctx = struct {
@@ -286,14 +304,21 @@ const Rng = struct {
     }
 };
 
+/// Draws per wave are bounded: a rejection loop that cannot fill (fewer distinct values than it needs) fails by name
+/// instead of spinning. The cases' geometry is checked at compile time below, so the bound is never reached.
+const max_draws: u32 = 1 << 16;
+
 /// A hit wave: M tokens of top-8 over `res` slots, rows after the first share 30 % of the first row's slots.
-fn hitWave(r: *Rng, m: u32, res: u32, out: []u32) u32 {
+fn hitWave(r: *Rng, m: u32, res: u32, out: []u32) error{Glm5nKbenchWaveDraw}!u32 {
+    if (res < 8 or out.len < @as(usize, m) * 8) return error.Glm5nKbenchWaveDraw;
     var first: [8]u32 = undefined;
     var p: u32 = 0;
     for (0..m) |t| {
         var row: [8]u32 = undefined;
         var n: usize = 0;
-        while (n < 8) {
+        var draws: u32 = 0;
+        while (n < 8) : (draws += 1) {
+            if (draws >= max_draws) return error.Glm5nKbenchWaveDraw;
             const v = if (t > 0 and r.below(10) < 3) first[r.below(8)] else r.below(res);
             if (std.mem.indexOfScalar(u32, row[0..n], v) != null) continue;
             row[n] = v;
@@ -306,6 +331,21 @@ fn hitWave(r: *Rng, m: u32, res: u32, out: []u32) u32 {
         }
     }
     return p;
+}
+
+/// A miss part: `p` distinct records of a transient bank of `res`.
+fn missPart(r: *Rng, p: u32, res: u32, out: []u32) error{Glm5nKbenchWaveDraw}!u32 {
+    if (p > res or out.len < p) return error.Glm5nKbenchWaveDraw;
+    var n: u32 = 0;
+    var draws: u32 = 0;
+    while (n < p) : (draws += 1) {
+        if (draws >= max_draws) return error.Glm5nKbenchWaveDraw;
+        const v = r.below(res);
+        if (std.mem.indexOfScalar(u32, out[0..n], v) != null) continue;
+        out[n] = v;
+        n += 1;
+    }
+    return n;
 }
 
 fn distinct(ids: []const u32) u32 {
@@ -327,6 +367,13 @@ const cases = [_]Case{
     .{ .name = "miss_p1_n30", .hit = false, .m = 1, .res = 30, .p = 1 },
     .{ .name = "miss_p3_n30", .hit = false, .m = 1, .res = 30, .p = 3 },
 };
+
+comptime {
+    for (cases) |cs| {
+        if (cs.hit and (cs.res < 8 or cs.m * 8 != cs.p or cs.p > 32 or cs.res > caps_x[0])) @compileError("glm5next exl3 kbench: hit case " ++ cs.name);
+        if (!cs.hit and (cs.p > cs.res or cs.res > caps_x[2] or cs.res > caps_n[2])) @compileError("glm5next exl3 kbench: miss case " ++ cs.name);
+    }
+}
 
 // ── Parity ──
 
@@ -378,11 +425,98 @@ const Truth = struct {
     }
 };
 
+// ── Stages and the watchdog ──
+
+const PWave = struct { name: []const u8, p: u32 };
+const pwaves = [_]PWave{ .{ .name = "p1", .p = 1 }, .{ .name = "p3_misses_only", .p = 3 }, .{ .name = "p16_hits_only", .p = 16 }, .{ .name = "p24_m3_banks_repeats", .p = 24 }, .{ .name = "p64_widest", .p = 64 } };
+const codebooks = [_]ref.Codebook{ .mul1, .mcg };
+
+/// A stage of the bench: a progress line names it before it starts, and the watchdog fails the process by its name
+/// when it outlives its budget (a hang is attributable from the guard log alone).
+pub const StageKind = enum(u8) { install, banks, parity, timing };
+/// Budgets, seconds: the whole bench is about 2-4 min; each budget is several times its stage's expected time (the first
+/// parity wave also JIT-compiles every arm's pipelines). A fully stalled run fails in at most 300 + 180 + 10 x 120 +
+/// 10 x 120 = 2,880 s, one stage's budget after the stall began.
+pub fn stageBudgetS(kind: StageKind) u64 {
+    return switch (kind) {
+        .install => 300,
+        .banks => 180,
+        .parity => 120,
+        .timing => 120,
+    };
+}
+
+/// The stage's name: install, banks, parity_<codebook>_<wave> (sub = codebook x waves + wave), timing_<case>.
+pub fn stageName(kind: StageKind, sub: u32, buf: []u8) []const u8 {
+    return switch (kind) {
+        .install, .banks => @tagName(kind),
+        .parity => if (sub < codebooks.len * pwaves.len)
+            std.fmt.bufPrint(buf, "parity_{t}_{s}", .{ codebooks[sub / pwaves.len], pwaves[sub % pwaves.len].name }) catch "parity"
+        else
+            "parity_out_of_range",
+        .timing => if (sub < cases.len) std.fmt.bufPrint(buf, "timing_{s}", .{cases[sub].name}) catch "timing" else "timing_out_of_range",
+    };
+}
+
+const Watchdog = struct {
+    /// kind << 32 | sub
+    stage: std.atomic.Value(u64) = .init(0),
+    /// ns (CLOCK_MONOTONIC); max while a stage is entered
+    deadline: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    quit: std.atomic.Value(bool) = .init(false),
+    t0: u64,
+    /// the poll period, ns (the tests shorten it)
+    poll_ns: u64 = 250 * std.time.ns_per_ms,
+    /// what a timeout does: the bench exits the process (status 124); the CPU test records it
+    on_timeout: *const fn (w: *Watchdog, name: []const u8) void = exitOnTimeout,
+    fired: std.atomic.Value(bool) = .init(false),
+
+    fn enter(w: *Watchdog, kind: StageKind, sub: u32) void {
+        w.enterBudget(kind, sub, stageBudgetS(kind) * std.time.ns_per_s);
+    }
+
+    fn enterBudget(w: *Watchdog, kind: StageKind, sub: u32, budget_ns: u64) void {
+        w.deadline.store(std.math.maxInt(u64), .seq_cst);
+        w.stage.store(@as(u64, @backingInt(kind)) << 32 | sub, .seq_cst);
+        var buf: [64]u8 = undefined;
+        std.debug.print("GLM5NEXT_EXL3_KSTAGE stage={s} budget_s={d} t_ms={d}\n", .{ stageName(kind, sub, &buf), budget_ns / std.time.ns_per_s, (nowNs() - w.t0) / std.time.ns_per_ms });
+        w.deadline.store(nowNs() + budget_ns, .seq_cst);
+    }
+
+    fn run(w: *Watchdog) void {
+        while (!w.quit.load(.seq_cst)) {
+            const req: std.c.timespec = .{ .sec = @intCast(w.poll_ns / std.time.ns_per_s), .nsec = @intCast(w.poll_ns % std.time.ns_per_s) };
+            _ = std.c.nanosleep(&req, null);
+            if (nowNs() <= w.deadline.load(.seq_cst)) continue;
+            const st = w.stage.load(.seq_cst);
+            var buf: [64]u8 = undefined;
+            const name = stageName(@fromBackingInt(@intCast(@as(u8, @truncate(st >> 32)))), @truncate(st), &buf);
+            w.fired.store(true, .seq_cst);
+            w.on_timeout(w, name);
+            return;
+        }
+    }
+
+    fn exitOnTimeout(w: *Watchdog, name: []const u8) void {
+        std.debug.print("GLM5NEXT_EXL3_KBENCH TIMEOUT stage={s} t_ms={d}\nGLM5NEXT_EXL3_KBENCH overall FAIL timeout stage={s}\n", .{ name, (nowNs() - w.t0) / std.time.ns_per_ms, name });
+        std.c._exit(124);
+    }
+
+    fn stop(w: *Watchdog, th: std.Thread) void {
+        w.quit.store(true, .seq_cst);
+        th.join();
+    }
+};
+
 test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: parity against the seam and the exl3_ref truth, then us per layer (hit waves M 1..3 over 145 / 215 slots, miss parts over 10 / 30 records) against the NVFP4 control" {
     _ = std.c.getenv("GLM5NEXT_EXL3_KBENCH") orelse return error.SkipZigTest;
     const guard = std.c.getenv("_GPU_WINDOW_LOCKED") orelse return error.GpuLockRequired;
     if (!std.mem.eql(u8, std.mem.span(guard), "1")) return error.GpuLockRequired;
-    std.debug.print("GLM5NEXT_EXL3_KBENCH bound_bytes={d} layers={d} rounds={d} warm={d}\n", .{ bound_bytes, layers, rounds, warm });
+    std.debug.print("GLM5NEXT_EXL3_KBENCH bound_bytes={d} layers={d} rounds={d} warm={d} arms={d}\n", .{ bound_bytes, layers, rounds, warm, arm_count });
+    var wd: Watchdog = .{ .t0 = nowNs() };
+    const wd_thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, Watchdog.run, .{&wd});
+    defer wd.stop(wd_thread);
+    wd.enter(.install, 0);
     const a = std.heap.c_allocator;
     const stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(stream);
@@ -437,6 +571,7 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
         a.destroy(seam16);
     }
 
+    wd.enter(.banks, 0);
     const t_build = nowNs();
     var xb = try buildExl3(a, &g);
     defer xb.deinit(&g);
@@ -451,13 +586,12 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
     defer a.destroy(tbl);
     var fails: u32 = 0;
     var rng: Rng = .{ .s = 0x70617269 };
-    const PWave = struct { name: []const u8, p: u32 };
-    const pwaves = [_]PWave{ .{ .name = "p1", .p = 1 }, .{ .name = "p3_misses_only", .p = 3 }, .{ .name = "p16_hits_only", .p = 16 }, .{ .name = "p24_m3_banks_repeats", .p = 24 }, .{ .name = "p64_widest", .p = 64 } };
-    for ([_]ref.Codebook{ .mul1, .mcg }) |cb| {
+    for (codebooks, 0..) |cb, cbi| {
         ref.table(cb, tbl);
         var truth: Truth = .{ .a = a, .tbl = tbl };
         defer truth.deinit();
-        for (pwaves) |pw| {
+        for (pwaves, 0..) |pw, pwi| {
+            wd.enter(.parity, @intCast(cbi * pwaves.len + pwi));
             var ids: [64]u32 = undefined;
             for (ids[0..pw.p], 0..) |*v, i| {
                 const bank: u32, const slot: u32 = if (std.mem.eql(u8, pw.name, "p1")) .{ 0, 5 } else if (std.mem.startsWith(u8, pw.name, "p3")) .{ 2, rng.below(30) } else if (std.mem.startsWith(u8, pw.name, "p16")) .{ 0, rng.below(215) } else if (std.mem.startsWith(u8, pw.name, "p24"))
@@ -472,9 +606,7 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
             const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xin), &.{ ci(pw.p), ci(H) }, .float32), .bfloat16);
             const ida = try g.hostArray(std.mem.sliceAsBytes(ids[0..pw.p]), &.{ci(pw.p)}, .uint32);
             // the reference chain of this codebook: the seam (mul1) or the mcg arm's
-            const mcg_arm = for (&arms) |*arm| {
-                if (arm.kind == .forms and arm.forms.gu == .mcg) break arm;
-            } else unreachable;
+            const mcg_arm = &arms[mcg_arm_index];
             const r32 = if (cb == .mul1) seam32 else mcg_arm.inst32.?;
             const r16 = if (cb == .mul1) seam16 else mcg_arm.inst.?;
             const h_ref = try xf.gateUp(r32, &g, x, ida, &xb.banks);
@@ -547,7 +679,8 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
     // ── 2. Timing ──
     var xinit: [32 * H]f32 = undefined;
     for (0..32) |r| ref.fillX(0x7900 + r, xinit[r * H ..][0..H]);
-    for (cases) |cs| {
+    for (cases, 0..) |cs, csi| {
+        wd.enter(.timing, @intCast(csi));
         _ = mlx.mlx_clear_cache();
         // the case's waves: one per layer (EXL3 packed ids, NVFP4 packed ids modulo its bank, NVFP4 stock rows)
         var ids_x: [layers]T = undefined;
@@ -559,16 +692,7 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
         const bank: u32 = if (cs.hit) 0 else 2;
         for (0..layers) |l| {
             var w: [32]u32 = undefined;
-            const p = if (cs.hit) hitWave(&r, cs.m, cs.res, &w) else blk: {
-                var n: u32 = 0;
-                while (n < cs.p) {
-                    const v = r.below(cs.res);
-                    if (std.mem.indexOfScalar(u32, w[0..n], v) != null) continue;
-                    w[n] = v;
-                    n += 1;
-                }
-                break :blk n;
-            };
+            const p = if (cs.hit) try hitWave(&r, cs.m, cs.res, &w) else try missPart(&r, cs.p, cs.res, &w);
             var px: [32]u32 = undefined;
             var pn: [32]u32 = undefined;
             var rn: [32]u32 = undefined;
@@ -638,4 +762,97 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
     }
     std.debug.print("GLM5NEXT_EXL3_KBENCH overall {s} parity_fails={d}\n", .{ if (fails == 0) "PASS" else "FAIL", fails });
     try testing.expectEqual(@as(u32, 0), fails);
+}
+
+test "glm5_next exl3 kbench: the arm table is the list's length (23: seam, 20 forms, 2 NVFP4), every entry named and installable, one mcg arm" {
+    const arms = armsList();
+    try testing.expectEqual(@as(usize, 23), arms.len);
+    try testing.expectEqual(named_arms.len + 3, arms.len);
+    try testing.expectEqual(ArmKind.seam, arms[0].kind);
+    try testing.expectEqual(ArmKind.nv_fused, arms[arms.len - 2].kind);
+    try testing.expectEqual(ArmKind.nv_stock, arms[arms.len - 1].kind);
+    for (arms, 0..) |arm, i| {
+        try testing.expect(arm.name.len > 0);
+        try testing.expect(arm.launches >= 1 and arm.launches <= 7);
+        try testing.expect(arm.ok and arm.inst == null and arm.inst32 == null);
+        if (arm.kind == .forms) {
+            try arm.forms.check();
+            try testing.expectEqualStrings(named_arms[i - 1].name, arm.name);
+        }
+        for (arms[0..i]) |q| try testing.expect(!std.mem.eql(u8, arm.name, q.name));
+    }
+    try testing.expectEqualStrings("exl3_mcg", arms[mcg_arm_index].name);
+}
+
+test "glm5_next exl3 kbench: every case's waves draw within the bound (distinct per row / part), an impossible draw fails by name" {
+    for (cases) |cs| {
+        var r: Rng = .{ .s = 0x77617665 ^ (@as(u64, cs.m) << 8) ^ cs.res ^ (@as(u64, cs.p) << 16) };
+        for (0..layers) |_| {
+            var w: [32]u32 = undefined;
+            const p = if (cs.hit) try hitWave(&r, cs.m, cs.res, &w) else try missPart(&r, cs.p, cs.res, &w);
+            try testing.expectEqual(cs.p, p);
+            var row: u32 = 0;
+            while (row * 8 < p) : (row += 1) {
+                const part = w[row * 8 .. @min(p, row * 8 + 8)];
+                try testing.expectEqual(@as(u32, @intCast(part.len)), distinct(part));
+                for (part) |v| try testing.expect(v < cs.res);
+            }
+        }
+    }
+    var r: Rng = .{ .s = 1 };
+    var w: [32]u32 = undefined;
+    try testing.expectError(error.Glm5nKbenchWaveDraw, hitWave(&r, 1, 7, &w));
+    try testing.expectError(error.Glm5nKbenchWaveDraw, hitWave(&r, 5, 145, &w));
+    try testing.expectError(error.Glm5nKbenchWaveDraw, missPart(&r, 11, 10, &w));
+}
+
+test "glm5_next exl3 kbench: every stage has a name; the watchdog fires on an overrun stage by its name and stays quiet on one that ends in budget" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("install", stageName(.install, 0, &buf));
+    try testing.expectEqualStrings("banks", stageName(.banks, 0, &buf));
+    try testing.expectEqualStrings("parity_mul1_p1", stageName(.parity, 0, &buf));
+    try testing.expectEqualStrings("parity_mcg_p64_widest", stageName(.parity, codebooks.len * pwaves.len - 1, &buf));
+    try testing.expectEqualStrings("timing_miss_p3_n30", stageName(.timing, cases.len - 1, &buf));
+    try testing.expectEqualStrings("timing_out_of_range", stageName(.timing, cases.len, &buf));
+    var total: u64 = 0;
+    for (std.enums.values(StageKind)) |k| total += stageBudgetS(k) * @as(u64, switch (k) {
+        .install, .banks => 1,
+        .parity => codebooks.len * pwaves.len,
+        .timing => cases.len,
+    });
+    // the budgets' sum: 2,880 s (under an hour)
+    try testing.expectEqual(@as(u64, 2880), total);
+
+    const Rec = struct {
+        var name: [64]u8 = undefined;
+        var len: usize = 0;
+        fn record(_: *Watchdog, n: []const u8) void {
+            @memcpy(name[0..n.len], n);
+            len = n.len;
+        }
+    };
+    // in budget: no fire
+    {
+        var wd: Watchdog = .{ .t0 = nowNs(), .poll_ns = 2 * std.time.ns_per_ms, .on_timeout = Rec.record };
+        const th = try std.Thread.spawn(.{}, Watchdog.run, .{&wd});
+        wd.enterBudget(.banks, 0, 10 * std.time.ns_per_s);
+        const req: std.c.timespec = .{ .sec = 0, .nsec = 30 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&req, null);
+        wd.stop(th);
+        try testing.expect(!wd.fired.load(.seq_cst));
+    }
+    // overrun: fires with the stage's name, bounded
+    {
+        var wd: Watchdog = .{ .t0 = nowNs(), .poll_ns = 2 * std.time.ns_per_ms, .on_timeout = Rec.record };
+        const th = try std.Thread.spawn(.{}, Watchdog.run, .{&wd});
+        wd.enterBudget(.timing, 3, 20 * std.time.ns_per_ms);
+        var waited: u32 = 0;
+        while (!wd.fired.load(.seq_cst) and waited < 500) : (waited += 1) {
+            const req: std.c.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&req, null);
+        }
+        wd.stop(th);
+        try testing.expect(wd.fired.load(.seq_cst));
+        try testing.expectEqualStrings("timing_hit_m1_r215", Rec.name[0..Rec.len]);
+    }
 }
