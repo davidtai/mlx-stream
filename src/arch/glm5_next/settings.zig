@@ -165,7 +165,7 @@ pub const DecodeSwiglu = enum { ops, fused };
 pub const DsaSelect = @import("ops.zig").SelectRoute;
 /// The hitpass device hit wave's pairs (`hit_wave`), installed once at construction (the shared scheduler's
 /// `Options.dev_miss`): `all_pairs` (the default, the control) computes every routed pair, a missed one from base row 0
-/// (never joined: its miss part's row replaces it); `resident_only` (the default since g25) gives a non-resident expert the EXL3 texts' skip id
+/// (never joined: its miss part's row replaces it); `resident_only` (by name; measured alone -0.64 % decode, so not the default) gives a non-resident expert the EXL3 texts' skip id
 /// (exl3_kernels.zig `skip_id`), so each decode text returns on a missed pair and the wave computes only the resident
 /// pairs. Exact: every joined row comes from the same text and words as before. Named, refused on an NVFP4 pack (its k1
 /// texts do not skip), off hitpass, and with a form whose text does not skip (u8, the fused and pro forms); the default
@@ -405,9 +405,9 @@ pub const Config = struct {
     decode_swiglu: DecodeSwiglu = .fused,
     /// A verify window's DSA indexer selection (ops.zig `SelectPlan`): `batched` (the default) or `per_row` (the control).
     dsa_select: DsaSelect = .batched,
-    /// The hitpass device hit wave's pairs: `resident_only` (the default; `hitWaveRoute` resolves it to `all_pairs` where
-    /// its texts cannot skip) or `all_pairs` (the control).
-    hit_wave: HitWave = .resident_only,
+    /// The hitpass device hit wave's pairs: `all_pairs` (the default) or `resident_only` (by name; `hitWaveRoute` would
+    /// resolve an unnamed `resident_only` to `all_pairs` where its texts cannot skip).
+    hit_wave: HitWave = .all_pairs,
     hit_wave_named: bool = false,
     /// MiMo's X12 keep-warm (mimo_v2/gpu_warm.zig, adopted there as the default: round -4.7 ms, decode +2.4 %, ids
     /// identical): `waits` (the default) warms the GPU while the stream's event-gated parts (decode miss parts, a prompt
@@ -879,16 +879,23 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(DsaSelect.per_row, (try parseSettings("{\"dsa_select\":\"per_row\"}")).dsa_select);
     try testing.expectError(error.Glm5NextDsaSelectSetting, (try parseSettings("{\"dsa_select\":\"rows\"}")).validate());
     try testing.expectError(error.Glm5NextDsaSelectSetting, (try parseSettings("{\"dsa_select\":1}")).validate());
-    // The hit wave: resident_only unless named, resolved to all_pairs where it cannot skip (NVFP4, off hitpass, a
-    // non-skipping form); all_pairs (the control) by name; a named resident_only refused there by name.
-    try testing.expectEqual(HitWave.resident_only, pinned.hit_wave);
+    // The hit wave: all_pairs unless named; resident_only by name on an EXL3 pack's hitpass with skipping forms, refused by
+    // name elsewhere; an unnamed resident_only resolves to all_pairs where it cannot skip.
+    try testing.expectEqual(HitWave.all_pairs, pinned.hit_wave);
     try pinned.validate();
     try testing.expectEqual(HitWave.all_pairs, pinned.hitWaveRoute());
     {
         var d = try parseSettings("{}");
         d.expert_family = .exl3;
         try d.validate();
-        try testing.expectEqual(HitWave.resident_only, d.hitWaveRoute());
+        try testing.expectEqual(HitWave.all_pairs, d.hitWaveRoute());
+        var named = try parseSettings("{\"hit_wave\":\"resident_only\"}");
+        named.expert_family = .exl3;
+        try named.validate();
+        try testing.expectEqual(HitWave.resident_only, named.hitWaveRoute());
+        var un = d;
+        un.hit_wave = .resident_only;
+        try testing.expectEqual(HitWave.resident_only, un.hitWaveRoute());
         var nf = try parseSettings("{\"exl3_gateup_form\":\"gemv_u8\"}");
         nf.expert_family = .exl3;
         try testing.expectEqual(HitWave.all_pairs, nf.hitWaveRoute());
