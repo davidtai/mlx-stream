@@ -227,7 +227,7 @@ test "glm5next determinism GPU (NEEDS A WINDOW): every fused decode text, run 64
 
     // decode_dsa at S = 1 and 4.
     {
-        var k = dsa_decode.install(a, s, &c, &diag) catch |err| {
+        var k = dsa_decode.install(a, s, &c, .lean, &diag) catch |err| {
             std.debug.print("dsa install refused: {s}\n", .{diag.message()});
             return err;
         };

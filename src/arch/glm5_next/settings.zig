@@ -33,7 +33,9 @@
 //! exact; an EXL3 pack's hitpass with the seam / guone gate-up and seam / pair down forms only). `draft_head` is the
 //! MTP lane's draft head (`DraftHead`: `bf16`, the default and the control, the trunk's lm_head and the full-vocab filter
 //! on every draft step; `q4` / `q8`, a 4- / 8-bit copy of lm_head built once at the lane's open and a bounded draft
-//! filter; needs `mtp_lane`).
+//! filter; needs `mtp_lane`). `dsa_split_form` the fused DSA decode's split text (`DsaSplitForm`: `lean`, the default:
+//! 16 heads a threadgroup, keys scored in groups of 4 and updated in key order, the factor-1 update without its multiply;
+//! `current`, the control; bit for bit the same outputs, dsa_decode.zig; needs `decode_dsa: fused`).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -104,7 +106,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads", "dsa_select", "hit_wave", "draft_head" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads", "dsa_select", "hit_wave", "draft_head", "dsa_split_form" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -194,6 +196,9 @@ pub const draft_filter_k: u32 = 256;
 /// (the default since g25: one scores launch and one top-k launch for the window's rows) or `per_row` (the control, by
 /// name). Exact.
 pub const DsaSelect = @import("ops.zig").SelectRoute;
+/// The fused DSA decode's split text (`dsa_split_form`), installed once at construction (dsa_decode.zig `SplitForm`):
+/// `lean` (the default) or `current` (the control, by name). Exact: the same operations in the same order per output.
+pub const DsaSplitForm = @import("dsa_decode.zig").SplitForm;
 /// The hitpass device hit wave's pairs (`hit_wave`), installed once at construction (the shared scheduler's
 /// `Options.dev_miss`): `all_pairs` (the default, the control) computes every routed pair, a missed one from base row 0
 /// (never joined: its miss part's row replaces it); `resident_only` (by name; measured alone -0.64 % decode, so not the default) gives a non-resident expert the EXL3 texts' skip id
@@ -436,6 +441,9 @@ pub const Config = struct {
     decode_swiglu: DecodeSwiglu = .fused,
     /// A verify window's DSA indexer selection (ops.zig `SelectPlan`): `batched` (the default) or `per_row` (the control).
     dsa_select: DsaSelect = .batched,
+    /// The fused DSA decode's split text (dsa_decode.zig): `lean` (the default) or `current` (the control).
+    dsa_split_form: DsaSplitForm = .lean,
+    dsa_split_form_named: bool = false,
     /// The hitpass device hit wave's pairs: `all_pairs` (the default) or `resident_only` (by name; `hitWaveRoute` would
     /// resolve an unnamed `resident_only` to `all_pairs` where its texts cannot skip).
     hit_wave: HitWave = .all_pairs,
@@ -486,7 +494,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false, miss_reads: bool = false, dsa_select: bool = false, hit_wave: bool = false, draft_head: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false, miss_reads: bool = false, dsa_select: bool = false, hit_wave: bool = false, draft_head: bool = false, dsa_split_form: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -551,6 +559,11 @@ pub const Config = struct {
         if (raw.object.get("decode_swiglu")) |v| {
             const route: ?DecodeSwiglu = if (v == .string) std.meta.stringToEnum(DecodeSwiglu, v.string) else null;
             if (route) |r| c.decode_swiglu = r else c.malformed.decode_swiglu = true;
+        }
+        if (raw.object.get("dsa_split_form")) |v| {
+            const form: ?DsaSplitForm = if (v == .string) std.meta.stringToEnum(DsaSplitForm, v.string) else null;
+            if (form) |f| c.dsa_split_form = f else c.malformed.dsa_split_form = true;
+            c.dsa_split_form_named = true;
         }
         if (raw.object.get("dsa_select")) |v| {
             const route: ?DsaSelect = if (v == .string) std.meta.stringToEnum(DsaSelect, v.string) else null;
@@ -734,6 +747,9 @@ pub const Config = struct {
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
         if (c.malformed.dsa_select) return error.Glm5NextDsaSelectSetting;
+        if (c.malformed.dsa_split_form) return error.Glm5NextDsaSplitFormSetting;
+        // The split's text is the fused DSA decode's: a form named on the op chain would install nothing (refused).
+        if (c.dsa_split_form_named and c.decode_dsa != .fused) return error.Glm5NextDsaSplitFormNeedsFused;
         if (c.malformed.hit_wave) return error.Glm5NextHitWaveSetting;
         if (c.hit_wave_named and c.hit_wave == .resident_only) {
             if (c.expert_family != .exl3) return error.Glm5NextHitWaveOnNvfp4Pack;
@@ -929,6 +945,16 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(DsaSelect.per_row, (try parseSettings("{\"dsa_select\":\"per_row\"}")).dsa_select);
     try testing.expectError(error.Glm5NextDsaSelectSetting, (try parseSettings("{\"dsa_select\":\"rows\"}")).validate());
     try testing.expectError(error.Glm5NextDsaSelectSetting, (try parseSettings("{\"dsa_select\":1}")).validate());
+    // The fused DSA decode's split text: lean unless named; current (the control) by name; malformed, or named on the op
+    // chain, refused by name.
+    try testing.expectEqual(DsaSplitForm.lean, (try parseSettings("{}")).dsa_split_form);
+    try testing.expectEqual(DsaSplitForm.current, (try parseSettings("{\"dsa_split_form\":\"current\"}")).dsa_split_form);
+    try testing.expectEqual(DsaSplitForm.lean, (try parseSettings("{\"dsa_split_form\":\"lean\"}")).dsa_split_form);
+    try (try parseSettings("{\"dsa_split_form\":\"current\"}")).validate();
+    try (try parseSettings("{\"decode_dsa\":\"ops\"}")).validate();
+    try testing.expectError(error.Glm5NextDsaSplitFormSetting, (try parseSettings("{\"dsa_split_form\":\"fast\"}")).validate());
+    try testing.expectError(error.Glm5NextDsaSplitFormSetting, (try parseSettings("{\"dsa_split_form\":1}")).validate());
+    try testing.expectError(error.Glm5NextDsaSplitFormNeedsFused, (try parseSettings("{\"decode_dsa\":\"ops\",\"dsa_split_form\":\"current\"}")).validate());
     // The hit wave: all_pairs unless named; resident_only by name on an EXL3 pack's hitpass with skipping forms, refused by
     // name elsewhere; an unnamed resident_only resolves to all_pairs where it cannot skip.
     try testing.expectEqual(HitWave.all_pairs, pinned.hit_wave);

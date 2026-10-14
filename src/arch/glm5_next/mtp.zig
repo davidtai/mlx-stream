@@ -797,6 +797,8 @@ pub const Lane = struct {
     /// MLX's active bytes the open added, measured once (reported: it also counts what MLX keeps beside the arrays, such
     /// as the scalars a fill reads, and buffers its cache hands back larger than asked).
     measured_bytes: u64 = 0,
+    /// The head's lanes' buffer addresses after the open (latent, index): `inPlace` compares.
+    addr0: [2]usize = .{ 0, 0 },
 
     /// The lane over the pack at `dir`: the draft bank (refused by name when absent), the head bound from `map` (the
     /// arch's weight map with the MTP layer's residents kept and read), every record read into the bank's MLX arrays and
@@ -850,6 +852,7 @@ pub const Lane = struct {
                 lane.cap = lanes_cap;
             }
             try g.evalAll(&.{ self.latent.buf.?, self.index.buf.? });
+            self.addr0 = .{ dsa.dataAddr(self.latent.buf.?), dsa.dataAddr(self.index.buf.?) };
         }
         var active1: usize = 0;
         _ = mlx.mlx_get_active_memory(&active1);
@@ -864,6 +867,15 @@ pub const Lane = struct {
         self.held_bytes = heldOf(&held, std.heap.pageSize());
         log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=device_chain_coupled bank={s} experts={d} lanes={d} positions measured_bytes={d} draft_gate={d:.3} acceptance={s}\n", .{ self.name(), depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, gate, @tagName(accept) });
         return self;
+    }
+
+    /// Whether the head's lanes ([0]: latent, [1]: index) still hold the buffers the open made: every append since wrote in
+    /// place. Off the hot path (a request's end): the buffers evaluated first.
+    pub fn inPlace(self: *const Lane, g: *G) ![2]bool {
+        const lb = self.latent.buf orelse return .{ false, false };
+        const ib = self.index.buf orelse return .{ false, false };
+        try g.evalAll(&.{ lb, ib });
+        return .{ self.addr0[0] != 0 and dsa.dataAddr(lb) == self.addr0[0], self.addr0[1] != 0 and dsa.dataAddr(ib) == self.addr0[1] };
     }
 
     pub fn deinit(self: *Lane, g: *G) void {
