@@ -30,6 +30,7 @@ const dsa_decode = @import("dsa_decode.zig");
 const swiglu = @import("swiglu.zig");
 const fusion = @import("fusion.zig");
 const prebuild = @import("prebuild.zig");
+const exl3_kernels = @import("exl3_kernels.zig");
 const mtp = @import("mtp.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const acc = @import("../../sdk_ext.zig").acceptance;
@@ -310,8 +311,15 @@ pub const Module = struct {
         };
         // The decode lane's custom-kernel pipelines built here, not inside the first request (prebuild.zig): every width of
         // the FP8 GEMV sites, the installed fusion texts, the fused glue and SwiGLU. Unconditional, exact (no output read).
-        const prebuilt = try prebuild.run(gpa, io, s, &self.c.model, &self.w, self.routes);
-        log.info("glm5_next pipelines pre-built: {d} launches at decode widths 1..{d} (fp8 gemv {d}, fusion {d}, glue {d}, swiglu {d}) in {d} ms\n", .{ prebuilt.gemv + prebuilt.fusion + prebuilt.glue + prebuilt.swiglu, prebuild.max_rows, prebuilt.gemv, prebuilt.fusion, prebuilt.glue, prebuilt.swiglu, prebuilt.ns / std.time.ns_per_ms });
+        // The expert texts' too (experts.zig `prebuildExperts`): the exl3 family's prompt waves (a full wave and a one-row
+        // tail) and its installed decode chain at every width.
+        const pb_t0 = std.Io.Timestamp.now(io, .awake);
+        var prebuilt = try prebuild.run(gpa, io, s, &self.c.model, &self.w, self.routes);
+        prebuilt.experts = switch (self.src) {
+            inline else => |x| try x.prebuildExperts(),
+        };
+        prebuilt.ns = @intCast(pb_t0.untilNow(io, .awake).nanoseconds);
+        log.info("glm5_next pipelines pre-built: {d} launches at decode widths 1..{d} (fp8 gemv {d}, fusion {d}, glue {d}, swiglu {d}) + {d} expert calls (prompt waves of {d} and 1 rows, decode chain at 1..{d} pairs) in {d} ms\n", .{ prebuilt.gemv + prebuilt.fusion + prebuilt.glue + prebuilt.swiglu, prebuild.max_rows, prebuilt.gemv, prebuilt.fusion, prebuilt.glue, prebuilt.swiglu, prebuilt.experts, self.c.prompt.wave_rows, exl3_kernels.max_pairs, prebuilt.ns / std.time.ns_per_ms });
         self.prompt_pass = promptPassOf(promptRoute(&self.c), self.c.expert_family);
         // `ttft_tail: deferred`: the served and the lane's prompt passes without their tail (the dump route keeps it).
         if (self.c.prompt.ttft_tail == .deferred) self.prompt_pass = deferredPromptOf(promptRoute(&self.c), self.c.expert_family) orelse self.prompt_pass;

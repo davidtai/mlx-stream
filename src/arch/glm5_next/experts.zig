@@ -556,6 +556,19 @@ pub fn SourceOf(comptime fam: Family) type {
             try g.evalAll(&.{out});
         }
 
+        /// The pipeline pre-build of the expert texts (prebuild.zig's caller, construction): the exl3 family's prompt waves
+        /// and decode chain over the first routed layer's base bank (exl3_math.zig `Math.prebuild`: zero rows, slot row 0 read
+        /// only; no route, read or slot of the stream). The NVFP4 family pre-builds nothing here. Returns the calls made.
+        pub fn prebuildExperts(self: *Self) !u32 {
+            if (comptime fam != .exl3) return 0;
+            const g = &self.g;
+            const arrays = (try self.stream_source.bankArrays(g, self.bank.geometry.first_moe_layer, .base)) orelse return error.Glm5NextPrebuildBank;
+            const n = try self.ex.math.prebuild(g, arrays);
+            try mlx.check(mlx.mlx_synchronize(g.s));
+            g.clearCache();
+            return n;
+        }
+
         /// The decode lane's routed call under the fused glue (`decode_glue: fused`, glue.zig; the module's fused trunk is
         /// its only caller, on the decode lane): `forward`'s decode lane, the glue's i32 ids as the scheduler reads them, the
         /// shared expert `shared` committed during the call's read wait (`forward`'s hoist), and the combine text adding the

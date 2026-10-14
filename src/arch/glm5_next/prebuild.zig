@@ -11,9 +11,11 @@
 //! touched; only MLX's library and pipeline caches gain entries (each instantiation's library is MLX's own, built by MLX's
 //! own apply and eval). Exact by construction: no value of any request changes. Transient memory: the zero rows and the
 //! outputs of one width at a time (< 4 MB), freed with MLX's cache before the next construction step.
+//! The module adds the expert texts (experts.zig `prebuildExperts`, exl3_math.zig `Math.prebuild`): the exl3 family's
+//! prompt waves at a full wave and a one-row tail, and its installed decode chain at every width (zero rows, slot row 0 of
+//! the first routed layer's base bank, read only). The prompt pass's other texts are warm.zig's (prompt lever 3).
 //! Not pre-built (their instantiations depend on runtime values or need request state): the hcPre chain (its deferred
-//! input), the DSA decode texts (the key count), the EXL3 expert texts (the wave widths), the KDA verify capture
-//! recurrence and the MTP draft chain's kernels.
+//! input), the DSA decode texts (the key count), the KDA verify capture recurrence and the MTP draft chain's kernels.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -32,7 +34,7 @@ const T = graph.T;
 /// The decode lane's widths (the MTP verify's rows at most).
 pub const max_rows: u32 = swiglu.max_rows;
 
-pub const Result = struct { gemv: u32 = 0, fusion: u32 = 0, glue: u32 = 0, swiglu: u32 = 0, ns: u64 = 0 };
+pub const Result = struct { gemv: u32 = 0, fusion: u32 = 0, glue: u32 = 0, swiglu: u32 = 0, experts: u32 = 0, ns: u64 = 0 };
 
 /// The FP8 trunk sites of every layer (attention, then MLP), each projection once.
 fn sitesOf(lw: *const graph.Layer, out: *[16]fp8.Linear) []const fp8.Linear {
