@@ -875,7 +875,7 @@ pub const SelectPlan = struct {
         var gate0 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate0);
         try mlx.check(mlx.mlx_zeros(&gate0, &[_]c_int{ 1, 1, ix.head_dim }, 3, .float32, s));
-        arrays[6] = try withPooledKeys(s, arrays[0], arrays[1], gate0, arrays[2], ix.kpool - 1, ix_p);
+        arrays[6] = try withPooledKeys(s, arrays[0], 0, arrays[1], gate0, arrays[2], ix.kpool - 1, ix_p);
         arrays[7] = try decodeSelect(s, arrays[4], arrays[5], arrays[3], ix_p, t - 1, pools, sel_k);
         try mlx.check(mlx.mlx_array_eval(arrays[6]));
         try mlx.check(mlx.mlx_array_eval(arrays[7]));
@@ -990,9 +990,11 @@ fn scalarI(v: i32) mlx.mlx_array {
 /// softmax-weighted keys (only pooled keys are read once a pool is whole). One thread per
 /// (row, channel). The forward's rows come as their LayerNorm'd keys `key` [B, S, Dh] and their
 /// f32 gate projections `gate` [B, S, Dh], stored as T here (MLX's astype and concatenate, folded:
-/// the same conversion). The up-to kpool - 1 cached rows of the open pool are read from the index
-/// lane's own buffer `prev` [B, dims[1], 2*Dh] at their positions (dims[1] > 0; 0: none cached), so no view
-/// of the lane outlives the forward's graph and the lane's append writes its buffer in place.
+/// the same conversion). The up-to kpool - 1 cached rows of the open pool are read from `prev`
+/// [B, dims[1], 2*Dh], the stored rows of positions dims[2] .. dims[2] + dims[1] (dsa.zig `Tail`: kept
+/// beside the index lane, so nothing in the forward reads the lane before its append and MLX can
+/// donate the lane's buffer to it: MLX holds every input of an encoded op until its command buffer
+/// completes, metal/eval.cpp, and donates only an input nothing else holds).
 const POOLED_ROWS_SOURCE =
     \\const uint d = thread_position_in_grid.x;
     \\const int r = int(thread_position_in_grid.y);
@@ -1000,6 +1002,7 @@ const POOLED_ROWS_SOURCE =
     \\const int S = int(threads_per_grid.y);
     \\const int pos0 = dims[0];
     \\const int prev_rows = dims[1];
+    \\const int prev_base = dims[2];
     \\const size_t crow = (size_t(b) * S + r) * DH;
     \\device T* orow = out + (size_t(b) * S + r) * (2 * DH);
     \\orow[d] = key[crow + d];
@@ -1018,7 +1021,7 @@ const POOLED_ROWS_SOURCE =
     \\        kv[j] = key[c];
     \\        lg[j] = float(T(gate[c])) + ape[j * DH + d];
     \\    } else {
-    \\        const device T* row = prev + (size_t(b) * prev_rows + q) * (2 * DH);
+    \\        const device T* row = prev + (size_t(b) * prev_rows + (q - prev_base)) * (2 * DH);
     \\        kv[j] = row[d];
     \\        lg[j] = float(row[DH + d]) + ape[j * DH + d];
     \\    }
@@ -1033,16 +1036,17 @@ const POOLED_ROWS_SOURCE =
 
 /// The forward's indexer rows at positions `pos0..` from their keys `key` [B, S, Dh] (the key's
 /// dtype) and f32 gate projections `gate` [B, S, Dh], each completed pool's key in its completing
-/// row's gate half. `lane` is the index lane's buffer [B, cap, 2*Dh] holding the rows before `pos0`
-/// (null only when no row before `pos0` is read: pos0 == 0); the text reads the open pool's cached
-/// rows from it at their positions (no view of the lane is made).
-pub fn withPooledKeys(s: mlx.mlx_stream, lane: ?mlx.mlx_array, key: mlx.mlx_array, gate: mlx.mlx_array, ape: mlx.mlx_array, pos0: c_int, ix: Indexer) !mlx.mlx_array {
+/// row's gate half. `prev` [B, n, 2*Dh] holds the stored rows of positions `prev_base` .. `prev_base`
+/// + n, covering the open pool's rows before `pos0` (null only when no row before `pos0` is read:
+/// pos0 == 0).
+pub fn withPooledKeys(s: mlx.mlx_stream, prev_rows_arr: ?mlx.mlx_array, prev_base: c_int, key: mlx.mlx_array, gate: mlx.mlx_array, ape: mlx.mlx_array, pos0: c_int, ix: Indexer) !mlx.mlx_array {
     const plan = ix.plan.?;
     const ksh = mlx.getShape(key);
-    const prev_rows: c_int = if (lane) |l| mlx.getShape(l)[1] else 0;
-    const dims = mlx.mlx_array_new_data(&[_]i32{ pos0, prev_rows }, &[_]c_int{2}, 1, .int32);
+    const prev_rows: c_int = if (prev_rows_arr) |l| mlx.getShape(l)[1] else 0;
+    // Eight words: MLX passes an input of fewer than eight elements as a `constant` pointer.
+    const dims = mlx.mlx_array_new_data(&[_]i32{ pos0, prev_rows, prev_base, 0, 0, 0, 0, 0 }, &[_]c_int{8}, 1, .int32);
     defer _ = mlx.mlx_array_free(dims);
-    const prev = lane orelse key;
+    const prev = prev_rows_arr orelse key;
     const csh = [_]c_int{ ksh[0], ksh[1], 2 * ix.head_dim };
     // The decode lane's rows on the prepared configs; a prompt span (wider) builds its own (a row-count route).
     if (csh[0] == 1 and csh[1] <= SelectPlan.max_rows)

@@ -442,11 +442,15 @@ pub const Cache = struct {
     a: std.mem.Allocator,
     latent: []dsa.Lane,
     index: []dsa.Lane,
+    /// Each DSA layer's index tail (dsa.zig `Tail`): the open pool's rows the pooled-keys text reads.
+    tails: []dsa.Tail,
     kda: []kda.State,
     /// The MTP verify's captures, one per KDA layer (`Head.verify`): released after each round (`rollback`).
     capture: []kda.Capture,
-    /// Each lane's buffer address after `preallocate` (latent then index, per DSA layer; 0 before it): `inPlace` compares.
+    /// Each lane's buffer address after `preallocate` (latent then index, per DSA layer; 0 before it) and at the decode's
+    /// start (`markDecode`): `inPlace` compares.
     addr0: []usize,
+    addr_dec: []usize,
     len: u32 = 0,
     cap: u32,
 
@@ -460,14 +464,20 @@ pub const Cache = struct {
         const captures = try a.alloc(kda.Capture, c.nKda());
         errdefer a.free(captures);
         const addr0 = try a.alloc(usize, 2 * c.nDsa());
+        errdefer a.free(addr0);
         @memset(addr0, 0);
+        const addr_dec = try a.alloc(usize, 2 * c.nDsa());
+        errdefer a.free(addr_dec);
+        @memset(addr_dec, 0);
+        const tails = try a.alloc(dsa.Tail, c.nDsa());
+        for (tails) |*t| t.* = .{};
         for (latent, index) |*lt, *ix| {
             lt.* = dsa.Lane.init(cap, cap);
             ix.* = dsa.Lane.init(cap, cap);
         }
         for (kda_states) |*st| st.* = .{};
         for (captures) |*cp| cp.* = .{};
-        return .{ .a = a, .latent = latent, .index = index, .kda = kda_states, .capture = captures, .addr0 = addr0, .cap = cap };
+        return .{ .a = a, .latent = latent, .index = index, .kda = kda_states, .capture = captures, .addr0 = addr0, .addr_dec = addr_dec, .tails = tails, .cap = cap };
     }
 
     pub fn deinit(self: *Cache, g: *G) void {
@@ -481,7 +491,10 @@ pub const Cache = struct {
         self.a.free(self.index);
         self.a.free(self.kda);
         self.a.free(self.capture);
+        for (self.tails) |*t| t.reset(g);
+        self.a.free(self.tails);
         self.a.free(self.addr0);
+        self.a.free(self.addr_dec);
         self.* = undefined;
     }
 
@@ -506,19 +519,35 @@ pub const Cache = struct {
         }
     }
 
-    /// The lanes whose buffers are still the ones `preallocate` made ([0]: latent, [1]: index): every append since wrote
-    /// in place. Off the hot path (a request's end): the buffers evaluated first.
-    pub fn inPlace(self: *const Cache, g: *G) ![2]u32 {
+    fn evalLanes(self: *const Cache, g: *G) !void {
         var bufs: std.ArrayList(T) = .empty;
         defer bufs.deinit(self.a);
         for (self.latent, self.index) |*lt, *ix| for ([_]*dsa.Lane{ lt, ix }) |lane| if (lane.buf) |b| try bufs.append(self.a, b);
         if (bufs.items.len > 0) try g.evalAll(bufs.items);
-        var n: [2]u32 = .{ 0, 0 };
+    }
+
+    /// The lanes' buffer addresses at the decode's start (the prompt pass evaluated). Once a request, off the hot path.
+    pub fn markDecode(self: *Cache, g: *G) !void {
+        try self.evalLanes(g);
         for (self.latent, self.index, 0..) |*lt, *ix, i| {
-            if (lt.buf) |b| n[0] += @intFromBool(self.addr0[2 * i] != 0 and dsa.dataAddr(b) == self.addr0[2 * i]);
-            if (ix.buf) |b| n[1] += @intFromBool(self.addr0[2 * i + 1] != 0 and dsa.dataAddr(b) == self.addr0[2 * i + 1]);
+            self.addr_dec[2 * i] = if (lt.buf) |b| dsa.dataAddr(b) else 0;
+            self.addr_dec[2 * i + 1] = if (ix.buf) |b| dsa.dataAddr(b) else 0;
         }
-        return n;
+    }
+
+    /// The lanes whose buffers are still the ones `preallocate` made (`whole`: every append of the request in place) and
+    /// still the ones the decode started on (`decode`: every decode append in place); [0] latent, [1] index. Off the hot
+    /// path (a request's end): the buffers evaluated first.
+    pub fn inPlace(self: *const Cache, g: *G) !struct { whole: [2]u32, decode: [2]u32 } {
+        try self.evalLanes(g);
+        var w: [2]u32 = .{ 0, 0 };
+        var d: [2]u32 = .{ 0, 0 };
+        for (self.latent, self.index, 0..) |*lt, *ix, i| for ([_]*dsa.Lane{ lt, ix }, 0..) |lane, j| if (lane.buf) |b| {
+            const a = dsa.dataAddr(b);
+            w[j] += @intFromBool(self.addr0[2 * i + j] != 0 and a == self.addr0[2 * i + j]);
+            d[j] += @intFromBool(self.addr_dec[2 * i + j] != 0 and a == self.addr_dec[2 * i + j]);
+        };
+        return .{ .whole = w, .decode = d };
     }
 
     /// A new request from position 0: the lanes empty (their buffers kept), every KDA state cleared.
@@ -527,6 +556,7 @@ pub const Cache = struct {
             lt.truncateTo(0);
             ix.truncateTo(0);
         }
+        for (self.tails) |*t| t.reset(g);
         for (self.kda) |*st| st.reset(g);
         for (self.capture) |*cp| cp.release(g);
         self.len = 0;
@@ -718,7 +748,7 @@ pub fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, s
             try routes.kda.run(routes.kda.ctx, g, c, kw, normed, &cache.kda[lw.slot])
         else
             try kda.forward(g, c, kw, normed, &cache.kda[lw.slot]),
-        .dsa => |*dw| try dsa.forward(g, c, dw, normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes.dsa),
+        .dsa => |*dw| try dsa.forward(g, c, dw, normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot], .tail = &cache.tails[lw.slot] }, routes.dsa),
     };
     return g.adopt(try ops.expand(g.s, out, stream, &col));
 }
@@ -1038,7 +1068,7 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
                 try routes.kda_verify.run(routes.kda_verify.ctx, g, c, kw, pa.normed, &cache.kda[lw.slot], &cache.capture[lw.slot])
             else
                 try routes.kda.run(routes.kda.ctx, g, c, kw, pa.normed, &cache.kda[lw.slot]),
-            .dsa => |*dw| try dsa.forward(g, c, dw, pa.normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes.dsa),
+            .dsa => |*dw| try dsa.forward(g, c, dw, pa.normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot], .tail = &cache.tails[lw.slot] }, routes.dsa),
         };
         // Decode host idle: the attention sublayer committed as built (the GPU runs it while the host builds the FFN's
         // glue and router up to the routing barrier).
