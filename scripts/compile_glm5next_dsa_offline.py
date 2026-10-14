@@ -51,7 +51,7 @@ def main():
     ops = open(OPS).read()
     pooled = "\n".join(l.strip()[2:] for l in re.search(r"const POOLED_ROWS_SOURCE =\n(.*?)\n;", ops, re.S)[1].splitlines())
     kp = {"name": "glm5_dsa_pooled_rows", "inputs": [inp("prev", "bfloat16", 32768 * 2 * DH), inp("key", "bfloat16", 4 * DH), inp("gate", "float32", 4 * DH),
-                                                     inp("ape", "float32", KPOOL * DH), inp("dims", "int32", 2)],
+                                                     inp("ape", "float32", KPOOL * DH), inp("dims", "int32", 8)],
           "outputs": [{"name": "out", "dtype": "bfloat16"}]}
     jobs.append(("pooled", cko.assemble(kp, {"source": pooled, "header": ""}, ([{"name": "T", "dtype": "bfloat16"}, {"name": "KPOOL", "int": KPOOL}, {"name": "DH", "int": DH}], None, {}))))
     tmp = tempfile.mkdtemp(prefix="glm5n-dsa-offline-")

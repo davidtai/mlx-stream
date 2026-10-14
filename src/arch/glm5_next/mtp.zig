@@ -628,8 +628,11 @@ pub const Lane = struct {
     /// MLX's active bytes the open added, measured once (reported: it also counts what MLX keeps beside the arrays, such
     /// as the scalars a fill reads, and buffers its cache hands back larger than asked).
     measured_bytes: u64 = 0,
-    /// The head's lanes' buffer addresses after the open (latent, index): `inPlace` compares.
+    /// The head's lanes' buffer addresses after the open and at the decode's start (latent, index): `inPlace` compares.
     addr0: [2]usize = .{ 0, 0 },
+    addr_dec: [2]usize = .{ 0, 0 },
+    /// The head's index tail (dsa.zig `Tail`).
+    tail: dsa.Tail = .{},
 
     /// The lane over the pack at `dir`: the draft bank (refused by name when absent), the head bound from `map` (the
     /// arch's weight map with the MTP layer's residents kept and read), every record read into the bank's MLX arrays and
@@ -684,17 +687,30 @@ pub const Lane = struct {
         return self;
     }
 
-    /// Whether the head's lanes ([0]: latent, [1]: index) still hold the buffers the open made: every append since wrote in
-    /// place. Off the hot path (a request's end): the buffers evaluated first.
-    pub fn inPlace(self: *const Lane, g: *G) ![2]bool {
-        const lb = self.latent.buf orelse return .{ false, false };
-        const ib = self.index.buf orelse return .{ false, false };
+    /// The head's lanes' buffer addresses at the decode's start. Once a request, off the hot path.
+    pub fn markDecode(self: *Lane, g: *G) !void {
+        const lb = self.latent.buf orelse return;
+        const ib = self.index.buf orelse return;
         try g.evalAll(&.{ lb, ib });
-        return .{ self.addr0[0] != 0 and dsa.dataAddr(lb) == self.addr0[0], self.addr0[1] != 0 and dsa.dataAddr(ib) == self.addr0[1] };
+        self.addr_dec = .{ dsa.dataAddr(lb), dsa.dataAddr(ib) };
+    }
+
+    /// Whether the head's lanes ([0]: latent, [1]: index) still hold the buffers the open made (`whole`) and the ones the
+    /// decode started on (`decode`). Off the hot path (a request's end): the buffers evaluated first.
+    pub fn inPlace(self: *const Lane, g: *G) !struct { whole: [2]bool, decode: [2]bool } {
+        const lb = self.latent.buf orelse return .{ .whole = .{ false, false }, .decode = .{ false, false } };
+        const ib = self.index.buf orelse return .{ .whole = .{ false, false }, .decode = .{ false, false } };
+        try g.evalAll(&.{ lb, ib });
+        const a = [2]usize{ dsa.dataAddr(lb), dsa.dataAddr(ib) };
+        return .{
+            .whole = .{ self.addr0[0] != 0 and a[0] == self.addr0[0], self.addr0[1] != 0 and a[1] == self.addr0[1] },
+            .decode = .{ self.addr_dec[0] != 0 and a[0] == self.addr_dec[0], self.addr_dec[1] != 0 and a[1] == self.addr_dec[1] },
+        };
     }
 
     pub fn deinit(self: *Lane, g: *G) void {
         if (self.pending) |p| g.release(p);
+        self.tail.reset(g);
         self.latent.deinit(g);
         self.index.deinit(g);
         self.slots.deinit();
@@ -706,6 +722,7 @@ pub const Lane = struct {
     pub fn reset(self: *Lane, g: *G) void {
         self.latent.truncateTo(0);
         self.index.truncateTo(0);
+        self.tail.reset(g);
         if (self.pending) |p| g.release(p);
         self.pending = null;
         self.n_pending = 0;
@@ -734,7 +751,7 @@ pub const Lane = struct {
     }
 
     fn lanes(self: *Lane) dsa.Lanes {
-        return .{ .latent = &self.latent, .index = &self.index };
+        return .{ .latent = &self.latent, .index = &self.index, .tail = &self.tail };
     }
 
     /// A serial step of `rows` after the trunk's `len` positions is one the lane keeps (`pend`): the lane follows the

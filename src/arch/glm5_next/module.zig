@@ -635,11 +635,16 @@ pub const Module = struct {
             footprint, active, cache, peak, footprint -| active -| cache, dh.host, experts.decode_cache_bytes, dh.compiler,
         });
         // The DSA lanes over the request: each lane still on the buffer its preallocation made (every append in place).
+        // `whole`: since the preallocation (the prompt pass's appends included); `decode`: since the decode's start.
         if (self.cache.inPlace(&self.g)) |n| {
             const nd = self.c.model.nDsa();
-            const head: ?[2]bool = if (self.mtp) |lane| (lane.inPlace(&self.g) catch [2]bool{ false, false }) else null;
             const word = [2][]const u8{ "moved", "in_place" };
-            log.info("glm5_next dsa lanes over the request: latent in_place {d}/{d} index in_place {d}/{d} mtp_head_latent={s} mtp_head_index={s}\n", .{ n[0], nd, n[1], nd, if (head) |h| word[@intFromBool(h[0])] else "none", if (head) |h| word[@intFromBool(h[1])] else "none" });
+            var hb: [160]u8 = undefined;
+            const head: []const u8 = if (self.mtp) |lane| blk: {
+                const h = lane.inPlace(&self.g) catch break :blk "mtp_head=unread";
+                break :blk std.fmt.bufPrint(&hb, "mtp_head_latent={s}/{s} mtp_head_index={s}/{s}", .{ word[@intFromBool(h.whole[0])], word[@intFromBool(h.decode[0])], word[@intFromBool(h.whole[1])], word[@intFromBool(h.decode[1])] }) catch "mtp_head=?";
+            } else "mtp_head=none";
+            log.info("glm5_next dsa lanes over the request: latent in_place {d}/{d} index in_place {d}/{d}; decode only: latent in_place {d}/{d} index in_place {d}/{d}; {s} (whole/decode)\n", .{ n.whole[0], nd, n.whole[1], nd, n.decode[0], nd, n.decode[1], nd, head });
         } else |_| {}
         const s1 = self.srcStats();
         const tok_s: f64 = if (d.wall_ns > 0) @as(f64, @floatFromInt(d.tokens)) * 1e9 / @as(f64, @floatFromInt(d.wall_ns)) else 0;
@@ -691,6 +696,10 @@ pub fn Passes(comptime fam: experts.Family) type {
             const grow_ns = try src(self).beginDecodeTimed();
             const phase_ns = self.nowNs() - t0;
             self.decode = .{ .active = true, .s0 = src(self).stats() };
+            // The DSA lanes' buffer addresses at the decode's start (once a request): the request's end line splits the
+            // prompt's appends from the decode's.
+            try self.cache.markDecode(&self.g);
+            if (self.mtp) |lane| try lane.markDecode(&self.g);
             if (self.mtp) |lane| lane.stats.stream_start = self.decode.s0;
             if (comptime gprof.enabled) gprof.decodeBegin(src(self), self.reserve -| prompt_tokens);
             return .{ phase_ns, grow_ns };
