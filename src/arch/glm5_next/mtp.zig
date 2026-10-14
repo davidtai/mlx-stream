@@ -35,8 +35,8 @@
 //!
 //! The draft head (`settings.draft_head`, installed once at the lane's open: `Lane.chain`): `bf16` (the control) runs
 //! every draft step's head on the trunk's BF16 lm_head and draws a sampled draft through the request's full-vocab filter
-//! (`acceptance.sampledRows`); `q4` runs it on a 4-bit copy of lm_head built at the open (`HeadQ4`, MLX's affine quantize,
-//! billed `mtp_head_q4`) and draws a sampled draft whose filter sorts (top_k, if set, within the candidates:
+//! (`acceptance.sampledRows`); `q4` / `q8` run it on a 4-bit / 8-bit copy of lm_head built at the open (`HeadQ`, MLX's
+//! affine quantize, billed `mtp_head_q4` / `mtp_head_q8`) and draws a sampled draft whose filter sorts (top_k, if set, within the candidates:
 //! `boundedServes`) through `boundedDraw` (the filter over the row's `settings.draft_filter_k` largest logits). The verify
 //! keeps the BF16 head: the emitted tokens are the control's.
 
@@ -579,11 +579,11 @@ pub const Head = struct {
 
 // ── the draft head ──
 
-/// The q4 draft head (`draft_head: q4`): lm_head [vocab, hidden] BF16 quantized once at the lane's open by MLX's affine
-/// mode at `settings.draft_head_bits` / `settings.draft_head_group`: packed words uint32 [vocab, hidden x bits / 32], scales
-/// and biases bf16 [vocab, hidden / group], each its own buffer (`headQ4Bytes`). The draft steps read it in place of the
-/// BF16 head (`ChainHead(.q4)`: MLX's `quantized_matmul`, one row on transposed weights: its `affine_qmv_fast` kernel).
-pub const HeadQ4 = struct {
+/// The quantized draft head (`draft_head: q4 | q8`): lm_head [vocab, hidden] BF16 quantized once at the lane's open by MLX's
+/// affine mode at `settings.headBits` / `settings.draft_head_group`: packed words uint32 [vocab, hidden x bits / 32], scales
+/// and biases bf16 [vocab, hidden / group], each its own buffer (`headQBytes`). The draft steps read it in place of the
+/// BF16 head (`ChainHead(.q4 / .q8)`: MLX's `quantized_matmul`, one row on transposed weights: its `affine_qmv_fast` kernel).
+pub const HeadQ = struct {
     w: T = none,
     scales: T = none,
     biases: T = none,
@@ -592,10 +592,10 @@ pub const HeadQ4 = struct {
 
     /// MLX's affine quantize of `head` (bf16 [vocab, hidden]) on stream `s`: one kernel writing the three arrays from the
     /// resident head (no intermediate array). Caller-owned, not yet evaluated.
-    pub fn quantize(s: mlx.mlx_stream, head: T) !HeadQ4 {
+    pub fn quantize(s: mlx.mlx_stream, head: T, bits: u32) !HeadQ {
         var vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
-        try mlx.check(mlx.mlx_quantize(&vec, head, .some(@intCast(settings.draft_head_group)), .some(@intCast(settings.draft_head_bits)), "affine", .{}, s));
+        try mlx.check(mlx.mlx_quantize(&vec, head, .some(@intCast(settings.draft_head_group)), .some(@intCast(bits)), "affine", .{}, s));
         if (mlx.mlx_vector_array_size(vec) != 3) return error.Glm5NextDraftHeadQuantize;
         var out: [3]T = undefined;
         var got: usize = 0;
@@ -613,37 +613,39 @@ pub const HeadQ4 = struct {
         return .{ .w = out[0], .scales = out[1], .biases = out[2] };
     }
 
-    pub fn arrays(q: HeadQ4) [head_q4_arrays]T {
+    pub fn arrays(q: HeadQ) [head_q_arrays]T {
         return .{ q.w, q.scales, q.biases };
     }
 };
 
-/// The q4 draft head's arrays (packed words, scales, biases).
-pub const head_q4_arrays = 3;
+/// The quantized draft head's arrays (packed words, scales, biases).
+pub const head_q_arrays = 3;
 
-/// The q4 draft head's bytes as MLX allocates its arrays (`HeadQ4`): the packed words and the two bf16 tables, each its own
-/// buffer. Flash: 317,194,240 + 2 x 19,824,640 = 356,843,520 B.
-pub fn headQ4Bytes(c: *const glm.Config, page: u64) u64 {
+/// The quantized draft head's bytes at `bits` as MLX allocates its arrays (`HeadQ`): the packed words and the two bf16
+/// tables, each its own buffer. Flash q4: 317,194,240 + 2 x 19,824,640 = 356,843,520 B; q8: 634,388,480 + 2 x 19,824,640 =
+/// 674,037,760 B.
+pub fn headQBytes(c: *const glm.Config, page: u64, bits: u32) u64 {
     const v: u64 = c.vocab_size;
     const h: u64 = c.hidden_size;
-    return graph.bufferBytes(v * h * settings.draft_head_bits / 8, page) + 2 * graph.bufferBytes(v * (h / settings.draft_head_group) * 2, page);
+    return graph.bufferBytes(v * h * bits / 8, page) + 2 * graph.bufferBytes(v * (h / settings.draft_head_group) * 2, page);
 }
 
 /// A draft step's head on its final-normed row `normed` [1, hidden] under draft head `form`, f32 [vocab]: `bf16` the
-/// trunk's lm_head `head` (`graph.linear`'s matmul on the transposed weight: the control's ops), `q4` its 4-bit copy `q4`
-/// (packed words, scales, biases: `HeadQ4.arrays`) through `quantized_matmul` at the copy's bits and group (affine,
+/// trunk's lm_head `head` (`graph.linear`'s matmul on the transposed weight: the control's ops), `q4` / `q8` its quantized copy `q`
+/// (packed words, scales, biases: `HeadQ.arrays`) through `quantized_matmul` at the copy's bits and group (affine,
 /// transposed weights). Each form reads only its own head.
-pub fn headLogits(comptime form: settings.DraftHead, g: anytype, normed: anytype, head: @TypeOf(normed), q4: [head_q4_arrays]@TypeOf(normed)) !@TypeOf(normed) {
+pub fn headLogits(comptime form: settings.DraftHead, g: anytype, normed: anytype, head: @TypeOf(normed), q: [head_q_arrays]@TypeOf(normed)) !@TypeOf(normed) {
     const raw = switch (form) {
         .bf16 => try g.matmul(normed, try g.transpose(head)),
-        .q4 => try g.quantizedMatmul(normed, q4[0], q4[1], q4[2], true, settings.draft_head_bits, settings.draft_head_group, .affine),
+        .q4, .q8 => try g.quantizedMatmul(normed, q[0], q[1], q[2], true, settings.headBits(form), settings.draft_head_group, .affine),
     };
     return g.reshape(try g.astype(raw, .float32), &.{-1});
 }
 
-/// The bill's `mtp_head_q4` (`draft_head: q4`): the q4 head's arrays, held from the lane's open in both phases.
-pub fn headQ4Term(c: *const glm.Config, page: u64) Term {
-    return .{ .name = "mtp_head_q4", .bytes = @splat(headQ4Bytes(c, page)), .at_construction = true };
+/// The bill's `mtp_head_q4` / `mtp_head_q8` (`draft_head: q4 | q8`): the quantized head's arrays, held from the lane's open in both phases.
+pub fn headQTerm(c: *const glm.Config, page: u64, form: settings.DraftHead) Term {
+    std.debug.assert(form != .bf16);
+    return .{ .name = if (form == .q8) "mtp_head_q8" else "mtp_head_q4", .bytes = @splat(headQBytes(c, page, settings.headBits(form))), .at_construction = true };
 }
 
 /// Whether the q4 head's bounded draw serves a sampled request's drafts (`chainOf`, once a round): its filter sorts (top_k or
@@ -712,12 +714,12 @@ pub fn boundedDraw(g: anytype, row2: anytype, sm: acc.Params, pos: u64) !@TypeOf
 pub const Chain = *const fn (lane: *Lane, g: *G, w: *const graph.Weights, x0: T, start: u32, depth: u32, out: []u32, q: []f32, sm: ?acc.Params, len: u64) anyerror!void;
 
 /// The draft chain of draft head `form`, bound once at the lane's open (`Lane.chain`): `bf16` the trunk's BF16 head and the
-/// request's full-vocab draw (the control's chain); `q4` the 4-bit copy (`HeadQ4`) and, on a request the bounded draw
+/// request's full-vocab draw (the control's chain); `q4` the 4-bit copy (`HeadQ`) and, on a request the bounded draw
 /// serves (`boundedServes`), the bounded draw (`boundedDraw`).
 pub fn chainOf(comptime form: settings.DraftHead) Chain {
     return struct {
         fn f(lane: *Lane, g: *G, w: *const graph.Weights, x0: T, start: u32, depth: u32, out: []u32, q: []f32, sm: ?acc.Params, len: u64) anyerror!void {
-            const head: Lane.ChainHead(form) = .{ .lane = lane, .w = w, .sm = sm, .len = len, .bounded = form == .q4 and sm != null and boundedServes(sm.?) };
+            const head: Lane.ChainHead(form) = .{ .lane = lane, .w = w, .sm = sm, .len = len, .bounded = form != .bf16 and sm != null and boundedServes(sm.?) };
             return chainDrafts(G, g, head, x0, start, depth, out, q);
         }
     }.f;
@@ -758,8 +760,8 @@ pub const Lane = struct {
     /// arrays (owned by `head`) and their bytes.
     head_form: settings.DraftHead = .bf16,
     chain: Chain = chainOf(.bf16),
-    q4: HeadQ4 = .{},
-    q4_bytes: u64 = 0,
+    qh: HeadQ = .{},
+    q_bytes: u64 = 0,
     /// The request's counters (MiMo's: rounds, drafted, accepted, generated, corrected; the stream's at the decode start).
     stats: mimo_draft.Stats = .{},
     /// The request's acceptance by draft position (the receipt's tail).
@@ -778,7 +780,7 @@ pub const Lane = struct {
     /// arch's weight map with the MTP layer's residents kept and read), every record read into the bank's MLX arrays and
     /// checked, the lanes allocated at `cap` positions plus `max_depth`; `depth` drafts a round at most (`draft_depth`,
     /// 1 .. `max_depth`) and `gate` the draft gate's theta (`draft_gate`, 0 off), both validated with the settings; `form`
-    /// the draft head (`draft_head`): its chain bound here, and under `q4` the trunk's `lm_head` quantized (`HeadQ4`) and
+    /// the draft head (`draft_head`): its chain bound here, and under `q4` the trunk's `lm_head` quantized (`HeadQ`) and
     /// evaluated here. Device work: the module's construction, under the GPU lock.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, depth: u32, gate: f32, form: settings.DraftHead, lm_head: T, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
         std.debug.assert(depth >= 1 and depth <= max_depth);
@@ -793,16 +795,16 @@ pub const Lane = struct {
         self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth, .gate = gate, .head_form = form, .chain = chainFor(form) };
         self.head = try Head.bind(gpa, g.s, map, c, diag);
         errdefer self.head.deinit(gpa);
-        // The q4 draft head: lm_head quantized once, its arrays the head's own (freed with it), evaluated now.
-        if (form == .q4) {
-            const q = try HeadQ4.quantize(g.s, lm_head);
+        // The quantized draft head (q4 / q8): lm_head quantized once, its arrays the head's own (freed with it), evaluated now.
+        if (form != .bf16) {
+            const q = try HeadQ.quantize(g.s, lm_head, settings.headBits(form));
             const qa = q.arrays();
             for (qa, 0..) |x, i| _ = self.head.own(gpa, x) catch |e| {
                 for (qa[i + 1 ..]) |y| _ = mlx.mlx_array_free(y);
                 return e;
             };
             try g.evalAll(&qa);
-            self.q4 = q;
+            self.qh = q;
         }
         const n: u32 = c.n_routed_experts;
         self.slots = try Slots.LayerSlotBank.init(db.layer(), n, g.s);
@@ -828,13 +830,13 @@ pub const Lane = struct {
         var active1: usize = 0;
         _ = mlx.mlx_get_active_memory(&active1);
         self.measured_bytes = active1 -| active0;
-        var held: [bank.n_components + 5 + head_q4_arrays]u64 = @splat(0);
+        var held: [bank.n_components + 5 + head_q_arrays]u64 = @splat(0);
         for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..][0..5]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
-        if (form == .q4) for (self.q4.arrays(), held[bank.n_components + 5 ..]) |x, *h| {
+        if (form != .bf16) for (self.qh.arrays(), held[bank.n_components + 5 ..]) |x, *h| {
             h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         };
-        self.q4_bytes = heldOf(held[bank.n_components + 5 ..], std.heap.pageSize());
+        self.q_bytes = heldOf(held[bank.n_components + 5 ..], std.heap.pageSize());
         self.held_bytes = heldOf(&held, std.heap.pageSize());
         log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=device_chain_coupled bank={s} experts={d} lanes={d} positions measured_bytes={d} draft_gate={d:.3}\n", .{ lane_name, depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, gate });
         return self;
@@ -992,7 +994,7 @@ pub const Lane = struct {
 
     /// One draft step of the chain (`chainDrafts`) under draft head `form` (`chainOf`): the layer on the pair input `x` at
     /// position `pos`, its final-normed row and its f32 logits [vocab] (`bf16`: the trunk's untied head; `q4`: its 4-bit
-    /// copy, `HeadQ4`).
+    /// copy, `HeadQ`).
     fn ChainHead(comptime form: settings.DraftHead) type {
         return struct {
             lane: *Lane,
@@ -1007,7 +1009,7 @@ pub const Lane = struct {
             pub fn step(h: Self, g: *G, x: T, pos: u32) !struct { normed: T, logits: T } {
                 const out_row = try h.lane.layer(g, x, pos);
                 const normed = try graph.rmsNorm(g, out_row, h.lane.head.head_norm, h.lane.c.rms_norm_eps);
-                return .{ .normed = normed, .logits = try headLogits(form, g, normed, h.w.head, h.lane.q4.arrays()) };
+                return .{ .normed = normed, .logits = try headLogits(form, g, normed, h.w.head, h.lane.qh.arrays()) };
             }
 
             pub fn input(h: Self, g: *G, idx: T, hidden: T) !T {
@@ -1020,7 +1022,7 @@ pub const Lane = struct {
             pub fn draw(h: Self, g: *G, logits: T, s: u32) !T {
                 if (h.sm) |p| {
                     const row2 = try g.reshape(logits, &.{ 1, @intCast(h.lane.c.vocab_size) });
-                    if (form == .q4 and h.bounded) return boundedDraw(g, row2, p, h.len + 1 + s);
+                    if (form != .bf16 and h.bounded) return boundedDraw(g, row2, p, h.len + 1 + s);
                     return (try acc.sampledRows(g, row2, p, h.len + s, &.{})).tok;
                 }
                 return g.reshape(try g.argmax(logits, 0), &.{1});
@@ -1059,12 +1061,12 @@ pub const Lane = struct {
     /// bits and group of the head's weights (the q4 arrays' shapes), the sampled draw's filter and the q4 arrays' bytes.
     pub fn headLine(self: *const Lane, buf: []u8) []const u8 {
         return switch (self.head_form) {
-            .bf16 => std.fmt.bufPrint(buf, "form=bf16 bits=16 group=none filter=full bytes={d}", .{self.q4_bytes}) catch buf[0..0],
-            .q4 => blk: {
+            .bf16 => std.fmt.bufPrint(buf, "form=bf16 bits=16 group=none filter=full bytes={d}", .{self.q_bytes}) catch buf[0..0],
+            .q4, .q8 => blk: {
                 const h: u64 = self.c.hidden_size;
-                const words: u64 = @intCast(mlx.getShape(self.q4.w)[1]);
-                const groups: u64 = @intCast(mlx.getShape(self.q4.scales)[1]);
-                break :blk std.fmt.bufPrint(buf, "form=q4 bits={d} group={d} filter=top{d} bytes={d}", .{ words * 32 / h, h / groups, settings.draft_filter_k, self.q4_bytes }) catch buf[0..0];
+                const words: u64 = @intCast(mlx.getShape(self.qh.w)[1]);
+                const groups: u64 = @intCast(mlx.getShape(self.qh.scales)[1]);
+                break :blk std.fmt.bufPrint(buf, "form={s} bits={d} group={d} filter=top{d} bytes={d}", .{ @tagName(self.head_form), words * 32 / h, h / groups, settings.draft_filter_k, self.q_bytes }) catch buf[0..0];
             },
         };
     }
@@ -1084,10 +1086,10 @@ pub fn heldOf(nbytes: []const u64, page: u64) u64 {
 }
 
 /// What the lane's open holds at `positions` billed positions under draft head `form`, from the draft bank's geometry and
-/// the model: the bill's `mtp_bank + mtp_tables + mtp_kv` (+ `mtp_head_q4` under `q4`). The open's `held_bytes` (its
+/// the model: the bill's `mtp_bank + mtp_tables + mtp_kv` (+ `mtp_head_q4` / `mtp_head_q8` under `q4` / `q8`). The open's `held_bytes` (its
 /// arrays) equals it by construction: the same shapes.
 pub fn heldBytes(g: *const bank.Geometry, c: *const glm.Config, positions: u64, page: u64, form: settings.DraftHead) u64 {
-    return DraftBank.arrayBytes(g, page) + Head.tableBytes(c, page) + kvBytes(c, positions, page) + if (form == .q4) headQ4Bytes(c, page) else 0;
+    return DraftBank.arrayBytes(g, page) + Head.tableBytes(c, page) + kvBytes(c, positions, page) + if (form != .bf16) headQBytes(c, page, settings.headBits(form)) else 0;
 }
 
 /// The module's construction check: what the open holds, at most what the bill holds for it.

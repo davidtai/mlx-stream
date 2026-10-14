@@ -205,7 +205,7 @@ pub const Inputs = struct {
     decode_swiglu: settings.DecodeSwiglu = .ops,
     /// The MTP lane's construction facts (`mtp_lane` on; null: the serial control, none of the lane's terms).
     mtp: ?mtp.Facts = null,
-    /// The MTP lane's draft head (`settings.DraftHead`): `q4` adds the lane's `mtp_head_q4` (its arrays, wired and
+    /// The MTP lane's draft head (`settings.DraftHead`): `q4` / `q8` adds the lane's `mtp_head_q4` / `mtp_head_q8` (its arrays, wired and
     /// counted with the lane's); `bf16` (the control) adds nothing.
     draft_head: settings.DraftHead = .bf16,
     /// MiMo's X12 keep-warm route (`settings.Config.gpu_keep_warm`; `.off` the control). The setting's route, not the
@@ -365,7 +365,7 @@ pub fn bufferCensus(in: *const Inputs) u64 {
     const g = in.geometry;
     const construction = in.residents.tensors + graph.Weights.ownedArrays(c) + (g.num_moe_layers + 1) * bank.n_components + 2 * c.nDsa() + 2 * c.nKda();
     const tiles = (@as(u64, graph.prompt_call_rows) * c.n_experts_per_tok + mimo_math.projection_rows - 1) / mimo_math.projection_rows + mimo_stream.max_route_ids;
-    const lane: u64 = if (in.mtp != null) laneBuffers(c) + @as(u64, if (in.draft_head == .q4) mtp.head_q4_arrays else 0) else 0;
+    const lane: u64 = if (in.mtp != null) laneBuffers(c) + @as(u64, if (in.draft_head != .bf16) mtp.head_q_arrays else 0) else 0;
     return construction + 2 * (tiles + 2 * (graph.prompt_call_rows / graph.span_rows) + 256) + lane;
 }
 
@@ -394,8 +394,8 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
     // request arrays (pending rows, waves, the KDA captures, the hidden taps) with the request's.
     const lane: ?[6]Term = if (in.mtp) |f| mtp.terms(f, c, in.reserve, page) else null;
     const lane_arch: ?[3]Term = if (in.mtp != null) laneTerms(in) else null;
-    // `draft_head: q4`: the lane's 4-bit lm_head copy, held from its open (wired with the lane's held arrays).
-    const head_q4: ?Term = if (in.mtp != null and in.draft_head == .q4) mtp.headQ4Term(c, page) else null;
+    // `draft_head: q4 | q8`: the lane's quantized lm_head copy, held from its open (wired with the lane's held arrays).
+    const head_q4: ?Term = if (in.mtp != null and in.draft_head != .bf16) mtp.headQTerm(c, page, in.draft_head) else null;
     var lane_held: u64 = 0;
     var lane_request: [2]u64 = .{ 0, 0 };
     if (in.mtp) |f| lane_held = f.bank_bytes + f.resident_bytes + f.table_bytes + mtp.kvBytes(c, in.reserve, page);
@@ -861,7 +861,7 @@ test "glm5_next bill: draft_head q4 adds the lane's mtp_head_q4 (356,843,520 B f
     in.draft_head = .q4;
     const q4 = try billOf(a, &in);
     defer q4.free(a);
-    const head = mtp.headQ4Bytes(&in.model, in.page);
+    const head = mtp.headQBytes(&in.model, in.page, 4);
     try testing.expectEqual(@as(u64, 356_843_520), head);
     try testing.expectEqual([2]u64{ head, head }, termOf(q4, "mtp_head_q4"));
     // Every other term is the control's but the wiring of the lane's held arrays and the buffer census (three arrays).
@@ -871,12 +871,23 @@ test "glm5_next bill: draft_head q4 adds the lane's mtp_head_q4 (356,843,520 B f
         if (std.mem.eql(u8, x.name, "resident_wiring")) {
             for (0..2) |ph| try testing.expect(y[ph] >= x.bytes[ph] + wireTables(head) - 64 and y[ph] <= x.bytes[ph] + wireTables(head) + 64);
         } else if (std.mem.eql(u8, x.name, "buffer_allowance")) {
-            for (0..2) |ph| try testing.expectEqual(x.bytes[ph] + wire_buffer_bytes * mtp.head_q4_arrays, y[ph]);
+            for (0..2) |ph| try testing.expectEqual(x.bytes[ph] + wire_buffer_bytes * mtp.head_q_arrays, y[ph]);
         } else try testing.expectEqual(x.bytes, y);
     }
     for ([_]sdk.MemoryBill.Phase{ .prompt, .decode }) |ph| try testing.expect(q4.fixed(ph) > ctl.fixed(ph) + head);
     // At the pin's rows the q4 bill admits a lower baseline by the term and its wiring.
     try testing.expect(q4.total(.decode, 12_600_000_000, 217) > ctl.total(.decode, 12_600_000_000, 217) + head);
+    // q8: the same shape of difference at its own bytes (634,388,480 B of words and the same two tables), named mtp_head_q8.
+    in.draft_head = .q8;
+    const q8 = try billOf(a, &in);
+    defer q8.free(a);
+    const head8 = mtp.headQBytes(&in.model, in.page, 8);
+    try testing.expectEqual(@as(u64, 674_037_760), head8);
+    try testing.expectEqual([2]u64{ head8, head8 }, termOf(q8, "mtp_head_q8"));
+    for (q8.terms) |x| try testing.expect(!std.mem.eql(u8, x.name, "mtp_head_q4"));
+    try testing.expectEqual(ctl.terms.len + 1, q8.terms.len);
+    for ([_]sdk.MemoryBill.Phase{ .prompt, .decode }) |ph| try testing.expect(q8.fixed(ph) > q4.fixed(ph) + (head8 - head));
+    in.draft_head = .q4;
     // Without the lane the setting bills nothing (validate refuses q4 there; the bill holds no lane terms at all).
     in.mtp = null;
     const off = try billOf(a, &in);
@@ -1022,7 +1033,8 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
     };
     // `GLM5_BILL_MTP=1`: the bill with the MTP lane installed (its terms, the verify's rows, the KDA captures).
     const lane = if (std.c.getenv("GLM5_BILL_MTP")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
-    // `GLM5_BILL_DRAFT_HEAD=q4` (with the lane): the lane's q4 draft head (`mtp_head_q4`); absent, the control's head.
+    // `GLM5_BILL_DRAFT_HEAD=q4|q8` (with the lane): the lane's quantized draft head (`mtp_head_q4` / `mtp_head_q8`); absent,
+    // the control's head.
     const head: settings.DraftHead = if (std.c.getenv("GLM5_BILL_DRAFT_HEAD")) |v| std.meta.stringToEnum(settings.DraftHead, std.mem.span(v)) orelse return error.Glm5NextDraftHeadSetting else .bf16;
     const fam = blk: {
         const v = try std.json.parseFromSlice(std.json.Value, a, config_text, .{});
@@ -1032,7 +1044,7 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
     };
     var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane, .draft_head = head };
     const res = try residentBytes(a, io, dir, &model, std.heap.pageSize());
-    std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s} experts={s}{s}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off", @tagName(fam), if (head == .q4) " draft_head=q4" else "" });
+    std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s} experts={s}{s}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off", @tagName(fam), if (head == .q4) " draft_head=q4" else if (head == .q8) " draft_head=q8" else "" });
     for (tool_contexts) |ctx| {
         cfg.effective_context = ctx;
         const b = try completeBill(a, io, &cfg, cfg.reserveTokens());

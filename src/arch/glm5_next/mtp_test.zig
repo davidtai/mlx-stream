@@ -1007,12 +1007,15 @@ test "glm5_next mtp draft head: the lane's chain is the bf16 head's unless the s
     try testing.expect(mtp.chainOf(.bf16) != mtp.chainOf(.q4));
     try testing.expect(mtp.chainFor(.bf16) == mtp.chainOf(.bf16));
     try testing.expect(mtp.chainFor(.q4) == mtp.chainOf(.q4));
+    try testing.expect(mtp.chainFor(.q8) == mtp.chainOf(.q8));
+    try testing.expect(mtp.chainOf(.q8) != mtp.chainOf(.q4) and mtp.chainOf(.q8) != mtp.chainOf(.bf16));
     for ([_]struct { text: []const u8, want: settings.DraftHead }{
         .{ .text = "{}", .want = .bf16 },
         .{ .text = "{\"mtp_lane\":true}", .want = .bf16 },
         .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5}", .want = .bf16 },
         .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"bf16\"}", .want = .bf16 },
         .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q4\"}", .want = .q4 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q8\"}", .want = .q8 },
     }) |case| {
         const raw = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.text, .{});
         defer raw.deinit();
@@ -1025,12 +1028,13 @@ test "glm5_next mtp draft head: the lane's chain is the bf16 head's unless the s
         const want_chain = switch (case.want) {
             .bf16 => mtp.chainOf(.bf16),
             .q4 => mtp.chainOf(.q4),
+            .q8 => mtp.chainOf(.q8),
         };
         try testing.expect(mtp.chainFor(c.draft_head) == want_chain);
         try testing.expectEqual(case.want == .q4, mtp.chainFor(c.draft_head) == mtp.chainOf(.q4));
     }
     // The q4 head's arrays start empty (built only by the q4 open).
-    const empty: mtp.HeadQ4 = .{};
+    const empty: mtp.HeadQ = .{};
     for (empty.arrays()) |x| try testing.expect(x.ctx == null);
     try noDevice();
 }
@@ -1073,7 +1077,7 @@ const HeadOps = struct {
 test "glm5_next mtp draft head: a draft step's head reads its own form's weights only: bf16 lm_head's matmul (the control's ops), or the q4 copy through quantized_matmul at 4 bits, group 64, affine, transposed" {
     const normed: u32 = 1;
     const lm_head: u32 = 2;
-    const q4 = [mtp.head_q4_arrays]u32{ 3, 4, 5 };
+    const q4 = [mtp.head_q_arrays]u32{ 3, 4, 5 };
     {
         var g: HeadOps = .{ .a = testing.allocator };
         defer g.calls.deinit(testing.allocator);
@@ -1101,6 +1105,15 @@ test "glm5_next mtp draft head: a draft step's head reads its own form's weights
         try testing.expectEqual(sdk.QuantMode.affine, qm.mode.?);
         try testing.expect(!g.reads(lm_head));
     }
+    {
+        var g: HeadOps = .{ .a = testing.allocator };
+        defer g.calls.deinit(testing.allocator);
+        _ = try mtp.headLogits(.q8, &g, normed, lm_head, q4);
+        try testing.expectEqual(HeadOps.Op.quantized_matmul, g.calls.items[0].op);
+        try testing.expectEqual(@as(u32, 8), g.calls.items[0].bits);
+        try testing.expectEqual(@as(u32, 64), g.calls.items[0].group);
+        try testing.expect(!g.reads(lm_head));
+    }
     try noDevice();
 }
 
@@ -1109,16 +1122,24 @@ test "glm5_next mtp draft head: the q4 head holds 356,843,520 B at Flash (packed
     const c: glm.Config = .{};
     // MLX's affine quantize's shapes (ops.cpp `affine_quantize`): words uint32 [vocab, hidden x bits / 32], scales and
     // biases bf16 [vocab, hidden / group].
-    const words: u64 = @as(u64, c.vocab_size) * (c.hidden_size * settings.draft_head_bits / 32) * 4;
+    const words: u64 = @as(u64, c.vocab_size) * (c.hidden_size * settings.headBits(.q4) / 32) * 4;
     const tables: u64 = @as(u64, c.vocab_size) * (c.hidden_size / settings.draft_head_group) * 2;
     try testing.expectEqual(@as(u64, 317_194_240), words);
     try testing.expectEqual(@as(u64, 19_824_640), tables);
-    try testing.expectEqual(@as(u64, 356_843_520), mtp.headQ4Bytes(&c, page));
-    try testing.expectEqual(mtp.headQ4Bytes(&c, page), mtp.heldOf(&.{ words, tables, tables }, page));
-    const t = mtp.headQ4Term(&c, page);
+    try testing.expectEqual(@as(u64, 356_843_520), mtp.headQBytes(&c, page, 4));
+    try testing.expectEqual(mtp.headQBytes(&c, page, 4), mtp.heldOf(&.{ words, tables, tables }, page));
+    const t = mtp.headQTerm(&c, page, .q4);
     try testing.expectEqualStrings("mtp_head_q4", t.name);
     try testing.expect(t.at_construction);
     try testing.expectEqual([2]u64{ 356_843_520, 356_843_520 }, t.bytes);
+    // q8: 634,388,480 B of words and the same tables (674,037,760 B), billed mtp_head_q8, held = billed.
+    const words8: u64 = @as(u64, c.vocab_size) * (c.hidden_size * 8 / 32) * 4;
+    try testing.expectEqual(@as(u64, 634_388_480), words8);
+    try testing.expectEqual(@as(u64, 674_037_760), mtp.headQBytes(&c, page, 8));
+    try testing.expectEqual(mtp.headQBytes(&c, page, 8), mtp.heldOf(&.{ words8, tables, tables }, page));
+    const t8 = mtp.headQTerm(&c, page, .q8);
+    try testing.expectEqualStrings("mtp_head_q8", t8.name);
+    try testing.expectEqual([2]u64{ 674_037_760, 674_037_760 }, t8.bytes);
     // A draft step reads 356,843,520 B in place of the BF16 head's 1,268,776,960 B.
     try testing.expectEqual(@as(u64, 1_268_776_960), @as(u64, c.vocab_size) * c.hidden_size * 2);
     // The open's held arrays (`Lane.open`: the bank's nine, the head's three f32 tables, the two lanes, and under q4 the
@@ -1126,12 +1147,13 @@ test "glm5_next mtp draft head: the q4 head holds 356,843,520 B at Flash (packed
     const g = try bank.Geometry.init(c.hidden_size, c.moe_intermediate_size, c.n_routed_experts, c.n_layers, 1);
     for ([_]u64{ 17_408, 32_768 }) |positions| {
         const base = openArrayBytes(&g, &c, positions);
-        var with_q4: [base.len + mtp.head_q4_arrays]u64 = undefined;
+        var with_q4: [base.len + mtp.head_q_arrays]u64 = undefined;
         @memcpy(with_q4[0..base.len], &base);
         with_q4[base.len..].* = .{ words, tables, tables };
         try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page, .bf16), mtp.heldOf(&base, page));
         try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page, .q4), mtp.heldOf(&with_q4, page));
         try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page, .bf16) + t.bytes[0], mtp.heldBytes(&g, &c, positions, page, .q4));
+        try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page, .bf16) + t8.bytes[0], mtp.heldBytes(&g, &c, positions, page, .q8));
         const f: mtp.Facts = .{ .bank_bytes = mtp.DraftBank.arrayBytes(&g, page), .resident_bytes = 0, .table_bytes = mtp.Head.tableBytes(&c, page) };
         const lt = mtp.terms(f, &c, positions, page);
         try testing.expectEqual(lt[0].bytes[0] + lt[2].bytes[0] + lt[3].bytes[0] + t.bytes[0], mtp.heldOf(&with_q4, page));
@@ -1560,5 +1582,159 @@ test "glm5_next mtp draft head: the bounded filter (the row's top 256) draws the
     std.debug.print("GLM5N_DRAFT_FILTER cases={d} k={d} inside={d} identical={d} near_threshold_skipped={d} outside={d} outside_same={d}\n", .{ n_cases, settings.draft_filter_k, inside, compared, unclear, outside, outside_same });
     // Both regimes exercised; a kept set inside the top 256 with a decision at its threshold is rare.
     try testing.expect(compared >= n_cases / 3 and outside >= n_cases / 10 and unclear <= inside / 10);
+    try noDevice();
+}
+
+/// A bf16 value (round to nearest even) as f32: the head's stored precision.
+fn bf16Round(x: f32) f32 {
+    const b: u32 = @bitCast(x);
+    const r = b +% (0x7fff + ((b >> 16) & 1));
+    return @bitCast(r & 0xffff_0000);
+}
+
+/// One row's affine quantize at `bits`, group `settings.draft_head_group`, then its dequantized values (MLX's Metal
+/// `affine_quantize` kernel, kernels/quantized.h: per group w_min from the values, w_max from 0 and the values,
+/// scale = max((max - min) / (2^bits - 1), 1e-7) signed toward the larger side, the edge snapped to a whole step, the
+/// codes min(round((w - bias) / scale), 2^bits - 1) at the f32 scale and bias; dequantized as code x bf16(scale) +
+/// bf16(bias), as quantized_matmul reads them).
+fn affineRoundTrip(row: []const f32, bits: u32, out: []f32) void {
+    const gs = settings.draft_head_group;
+    const n_bins: f32 = @floatFromInt((@as(u32, 1) << @intCast(bits)) - 1);
+    var at: usize = 0;
+    while (at < row.len) : (at += gs) {
+        const grp = row[at..][0..gs];
+        var w_min: f32 = std.math.floatMax(f32);
+        var w_max: f32 = 0;
+        for (grp) |v| {
+            w_min = @min(w_min, v);
+            w_max = @max(w_max, v);
+        }
+        var scale = @max((w_max - w_min) / n_bins, 1e-7);
+        const side = @abs(w_min) > @abs(w_max);
+        scale = if (side) scale else -scale;
+        const edge = if (side) w_min else w_max;
+        const q0 = @round(edge / scale);
+        const at_zero = q0 == 0;
+        scale = if (at_zero) scale else edge / q0;
+        const bias: f32 = if (at_zero) 0 else edge;
+        const s16 = bf16Round(scale);
+        const b16 = bf16Round(bias);
+        for (grp, out[at..][0..gs]) |v, *o| {
+            const code = std.math.clamp(@round((v - bias) / scale), 0, n_bins);
+            o.* = code * s16 + b16;
+        }
+    }
+}
+
+/// Up to `n` rows of the pack's lm_head (bf16 [vocab, hidden]) read past the page cache, `chunks` runs of rows spread
+/// over the vocab, as f32 into `out` ([n, hidden]); the rows' count, 0 when the pack has no such tensor.
+fn packHeadRows(a: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, out: []f32, n: usize, chunks: usize) !usize {
+    var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    defer d.close(io);
+    const raw = try d.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 << 20));
+    defer a.free(raw);
+    const index = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer index.deinit();
+    const shard = (index.value.object.get("weight_map") orelse return 0).object.get("lm_head.weight") orelse return 0;
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, shard.string }, 0);
+    defer a.free(path);
+    const fd = try sdk.io_util.openNoCache(path.ptr, .{});
+    defer _ = std.c.close(fd);
+    var prefix: [8]u8 = undefined;
+    try sdk.io_util.readAligned(fd, &prefix, 0);
+    const len = std.mem.readInt(u64, &prefix, .little);
+    const text = try a.alloc(u8, @intCast(len));
+    defer a.free(text);
+    try sdk.io_util.readAligned(fd, text, 8);
+    const header = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+    defer header.deinit();
+    const desc = header.value.object.get("lm_head.weight") orelse return 0;
+    if (!std.mem.eql(u8, desc.object.get("dtype").?.string, "BF16")) return 0;
+    const lo: u64 = @intCast(desc.object.get("data_offsets").?.array.items[0].integer);
+    const h: usize = c.hidden_size;
+    const per = n / chunks;
+    const buf = try a.alloc(u8, per * h * 2);
+    defer a.free(buf);
+    for (0..chunks) |k| {
+        const first: u64 = (@as(u64, c.vocab_size) - per) * k / (chunks - 1);
+        try sdk.io_util.readAligned(fd, buf, 8 + len + lo + first * h * 2);
+        for (out[k * per * h ..][0 .. per * h], 0..) |*o, i| o.* = @bitCast(@as(u32, std.mem.readInt(u16, buf[i * 2 ..][0..2], .little)) << 16);
+    }
+    return per * chunks;
+}
+
+test "glm5_next mtp draft head: the q8 and q4 heads' logit error against the bf16 head (MLX's affine round trip at group 64 on random rows; the pack's own lm_head rows with GLM5_HEAD_PACK)" {
+    const a = testing.allocator;
+    const c: glm.Config = .{};
+    const h: usize = c.hidden_size;
+    const n_rows = 256;
+    const n_in = 32;
+    const rows = try a.alloc(f32, n_rows * h);
+    defer a.free(rows);
+    const q4 = try a.alloc(f32, n_rows * h);
+    defer a.free(q4);
+    const q8 = try a.alloc(f32, n_rows * h);
+    defer a.free(q8);
+    const xs = try a.alloc(f32, n_in * h);
+    defer a.free(xs);
+    var prng = std.Random.DefaultPrng.init(0x10_9175);
+    const rand = prng.random();
+    // The head's input: a final-normed row (unit RMS), bf16.
+    for (xs) |*x| x.* = bf16Round(rand.floatNorm(f32));
+    const pack = std.c.getenv("GLM5_HEAD_PACK");
+    for ([_]bool{ false, true }) |real| {
+        if (real and pack == null) continue;
+        var nr: usize = n_rows;
+        if (real) {
+            nr = try packHeadRows(a, testing.io, std.mem.span(pack.?), &c, rows, n_rows, 4);
+            try testing.expect(nr == n_rows);
+        } else {
+            for (rows) |*w| {
+                // An lm_head-like row: N(0, 0.02) with a heavier tail (1 % of the weights at 4x).
+                const t: f32 = if (rand.float(f32) < 0.01) 4 else 1;
+                w.* = bf16Round(rand.floatNorm(f32) * 0.02 * t);
+            }
+        }
+        for (0..nr) |r| {
+            affineRoundTrip(rows[r * h ..][0..h], 4, q4[r * h ..][0..h]);
+            affineRoundTrip(rows[r * h ..][0..h], 8, q8[r * h ..][0..h]);
+        }
+        var max_err: [2]f64 = .{ 0, 0 };
+        var sum_err: [2]f64 = .{ 0, 0 };
+        var sum_sq: f64 = 0;
+        var top_same: [2]u32 = .{ 0, 0 };
+        for (0..n_in) |i| {
+            const x = xs[i * h ..][0..h];
+            var best: [3]usize = .{ 0, 0, 0 };
+            var best_v: [3]f64 = @splat(-std.math.inf(f64));
+            for (0..nr) |r| {
+                var lg: [3]f64 = .{ 0, 0, 0 };
+                for (x, rows[r * h ..][0..h], q4[r * h ..][0..h], q8[r * h ..][0..h]) |xv, w, w4, w8| {
+                    lg[0] += @as(f64, xv) * w;
+                    lg[1] += @as(f64, xv) * w4;
+                    lg[2] += @as(f64, xv) * w8;
+                }
+                sum_sq += lg[0] * lg[0];
+                for (0..2) |f| {
+                    const e = @abs(lg[f + 1] - lg[0]);
+                    max_err[f] = @max(max_err[f], e);
+                    sum_err[f] += e;
+                }
+                for (0..3) |f| if (lg[f] > best_v[f]) {
+                    best_v[f] = lg[f];
+                    best[f] = r;
+                };
+            }
+            for (0..2) |f| top_same[f] += @intFromBool(best[f + 1] == best[0]);
+        }
+        const n: f64 = @floatFromInt(nr * n_in);
+        const std_l = @sqrt(sum_sq / n);
+        std.debug.print("GLM5N_DRAFT_HEAD_LOGIT_ERR source={s} rows={d} inputs={d} logit_rms={d:.4} q4 max={d:.5} mean={d:.5} top1_same={d}/{d} q8 max={d:.5} mean={d:.5} top1_same={d}/{d} q8/q4 mean={d:.4}\n", .{
+            if (real) "pack" else "synthetic", nr, n_in, std_l, max_err[0], sum_err[0] / n, top_same[0], n_in, max_err[1], sum_err[1] / n, top_same[1], n_in, sum_err[1] / sum_err[0],
+        });
+        // 255 levels against 15 over the same span: q8's error is a small fraction of q4's.
+        try testing.expect(max_err[1] < max_err[0] / 4 and sum_err[1] < sum_err[0] / 8);
+        try testing.expect(top_same[1] >= top_same[0]);
+    }
     try noDevice();
 }

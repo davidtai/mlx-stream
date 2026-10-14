@@ -144,13 +144,22 @@ pub const DecodeSwiglu = enum { ops, fused };
 /// draw). Drafts only steer acceptance: the verify keeps the BF16
 /// head and draws every emitted token from its full row (mtp.zig's exact rule), so the ids are the control's under either
 /// form. Any other value refuses by name in `validate`; `q4` without `mtp_lane` refuses by name.
-pub const DraftHead = enum { bf16, q4 };
-/// The q4 draft head's quantization (MLX's affine mode): 4 bits, a scale and a bias (bf16) per group of 64 weights. Group 64
+pub const DraftHead = enum { bf16, q4, q8 };
+/// The bits of a draft head's weights (`q4` / `q8`: MLX's affine quantize at `draft_head_group`; `bf16`: the trunk's head).
+pub fn headBits(form: DraftHead) u32 {
+    return switch (form) {
+        .bf16 => 16,
+        .q4 => 4,
+        .q8 => 8,
+    };
+}
+/// The quantized draft heads' group (MLX's affine mode, `q4` 4 bits and `q8` 8 bits, a scale and a bias (bf16) per group of
+/// 64 weights). `q8` holds 634,388,480 B of words and the same tables (0.674 GB; first window, batch 28a: q4's drafts lost
+/// more acceptance than its reads saved, q8 halves the read saving at a far smaller logit error). q4: group 64
 /// is MLX's default 4-bit group: lm_head [154,880, 4,096] holds 317,194,240 B of packed words and 2 x 19,824,640 B of
 /// scales and biases (0.357 GB, read once a draft step in place of the BF16 head's 1.269 GB); group 32 reads 39.6 MB more
 /// a step, group 128 saves 19.8 MB at twice the group's span per scale. MLX's draft GEMV (`quantized_matmul`, one row,
-/// transposed weights) dispatches its `affine_qmv_fast` kernel at this shape (K = 4,096 a multiple of 512, N = 154,880 of 8).
-pub const draft_head_bits: u32 = 4;
+/// transposed weights) dispatches its `affine_qmv_fast` kernel at this shape (K = 4,096 a multiple of 512 (q4) / 256 (q8), N = 154,880 of 8).
 pub const draft_head_group: u32 = 64;
 /// The q4 draft head's bounded filter: the candidates a draft draw reads (MLX's argpartition of the tempered row).
 pub const draft_filter_k: u32 = 256;
@@ -300,7 +309,7 @@ pub const Config = struct {
     tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
     /// The decode rows' split between the routed layers (`LayerRows`): `uniform` (the default) or `offsets`.
     expert_rows_by_layer: LayerRows = defaultLayerRows(),
-    /// The MTP lane's draft head (`DraftHead`): `bf16` (the default, the control) or `q4`.
+    /// The MTP lane's draft head (`DraftHead`): `bf16` (the default, the control), `q4` or `q8`.
     draft_head: DraftHead = .bf16,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
@@ -450,8 +459,8 @@ pub const Config = struct {
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
         if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
         if (c.malformed.draft_head) return error.Glm5NextDraftHeadSetting;
-        // The draft head is the MTP lane's: without the lane a q4 head would install nothing.
-        if (!c.mtp_lane and c.draft_head == .q4) return error.Glm5NextDraftHeadNeedsLane;
+        // The draft head is the MTP lane's: without the lane a quantized head would install nothing.
+        if (!c.mtp_lane and c.draft_head != .bf16) return error.Glm5NextDraftHeadNeedsLane;
         try c.tally.check("glm5_next");
         switch (c.expert_rows_by_layer) {
             .uniform => {},
@@ -616,7 +625,7 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(fill_reserve_tokens, (Config{}).reserveTokens());
 }
 
-test "glm5_next settings: the draft head: bf16 unless named; bf16 / q4 by name; any other value refused by name; q4 refused without the lane" {
+test "glm5_next settings: the draft head: bf16 unless named; bf16 / q4 / q8 by name; any other value refused by name; q4 / q8 refused without the lane" {
     const base = try parseSettings("{}");
     try base.validate();
     try testing.expectEqual(DraftHead.bf16, base.draft_head);
@@ -625,6 +634,7 @@ test "glm5_next settings: the draft head: bf16 unless named; bf16 / q4 by name; 
         .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"bf16\"}", .want = .bf16 },
         .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"q4\"}", .want = .q4 },
         .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q4\"}", .want = .q4 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q8\"}", .want = .q8 },
         // The control's form needs no lane (nothing of it installs).
         .{ .text = "{\"draft_head\":\"bf16\"}", .want = .bf16 },
     }) |case| {
@@ -632,8 +642,8 @@ test "glm5_next settings: the draft head: bf16 unless named; bf16 / q4 by name; 
         try c.validate();
         try testing.expectEqual(case.want, c.draft_head);
     }
-    // Anything but "bf16" / "q4" refused by name.
-    for ([_][]const u8{ "\"Q4\"", "\"q8\"", "\"int4\"", "\"4\"", "\"BF16\"", "\"\"", "\"mxfp4\"", "4", "true", "null", "[\"q4\"]", "{}" }) |bad| {
+    // Anything but "bf16" / "q4" / "q8" refused by name.
+    for ([_][]const u8{ "\"Q4\"", "\"Q8\"", "\"q2\"", "\"q16\"", "\"int4\"", "\"4\"", "\"BF16\"", "\"\"", "\"mxfp4\"", "4", "true", "null", "[\"q4\"]", "{}" }) |bad| {
         var buf: [96]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "{{\"mtp_lane\":true,\"draft_head\":{s}}}", .{bad});
         try testing.expectError(error.Glm5NextDraftHeadSetting, (try parseSettings(text)).validate());
@@ -641,6 +651,10 @@ test "glm5_next settings: the draft head: bf16 unless named; bf16 / q4 by name; 
     // q4 without the lane: refused by name.
     try testing.expectError(error.Glm5NextDraftHeadNeedsLane, (try parseSettings("{\"draft_head\":\"q4\"}")).validate());
     try testing.expectError(error.Glm5NextDraftHeadNeedsLane, (try parseSettings("{\"mtp_lane\":false,\"draft_head\":\"q4\"}")).validate());
+    try testing.expectError(error.Glm5NextDraftHeadNeedsLane, (try parseSettings("{\"draft_head\":\"q8\"}")).validate());
+    try testing.expectEqual(@as(u32, 8), headBits(.q8));
+    try testing.expectEqual(@as(u32, 4), headBits(.q4));
+
     // Near misses of the key are not settings.
     for ([_][]const u8{ "{\"draft_heads\":\"q4\"}", "{\"drafthead\":\"q4\"}", "{\"head\":\"q4\"}" }) |text|
         try testing.expectError(error.Unknown, parseSettings(text));

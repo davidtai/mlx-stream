@@ -207,13 +207,13 @@ pub const Module = struct {
         }
         errdefer self.kda_kernels.deinit();
         // The MTP lane (`mtp_lane`): its draft bank read into MLX and checked, its head bound from the kept residents (and
-        // under `draft_head: q4` lm_head's 4-bit copy built), its lanes at the billed positions; what its open holds against
+        // under `draft_head: q4 | q8` lm_head's quantized copy built), its lanes at the billed positions; what its open holds against
         // its billed terms (ConstructionOverBill).
         if (self.c.mtp_lane) {
             const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.c.draft_depth, self.c.draft_gate, self.c.draft_head, self.w.head, self.routes.dsa, &diag);
             errdefer lane.deinit(&self.g);
-            const term = termBytes(plan.bill, "mtp_bank") + termBytes(plan.bill, "mtp_tables") + termBytes(plan.bill, "mtp_kv") + termBytes(plan.bill, "mtp_head_q4");
-            log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv + mtp_head_q4), residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
+            const term = termBytes(plan.bill, "mtp_bank") + termBytes(plan.bill, "mtp_tables") + termBytes(plan.bill, "mtp_kv") + termBytes(plan.bill, "mtp_head_q4") + termBytes(plan.bill, "mtp_head_q8");
+            log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv + mtp_head_q4 / mtp_head_q8), residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
             mtp.holdCheck(lane.held_bytes, term) catch |e| {
                 log.err("glm5_next: load refused: the MTP lane holds {d} B, over its billed {d} B (ConstructionOverBill)\n", .{ lane.held_bytes, term });
                 return e;
@@ -278,7 +278,7 @@ pub const Module = struct {
         }
         if (self.mtp == null) log.info("glm5_next MTP lane: off (serial; set {{\"mtp_lane\":true}})\n", .{});
         // The draft head as installed (`draft_head`; read back from the lane: its form, its weights' bits and group, the
-        // sampled draw's filter, the q4 arrays' bytes) and the lane's depth and gate.
+        // sampled draw's filter, the quantized arrays' bytes) and the lane's depth and gate.
         if (self.mtp) |lane| {
             var hb: [160]u8 = undefined;
             log.info("glm5_next MTP draft head: {s} lane=on depth={d} draft_gate={d:.3}\n", .{ lane.headLine(&hb), lane.depth, lane.gate });
