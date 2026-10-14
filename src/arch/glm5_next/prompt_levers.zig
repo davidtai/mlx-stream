@@ -1,7 +1,10 @@
 //! glm5_next's prompt levers (the 2026-10-14 prefill audit's exact levers 1-5): construction-time routes set by the
-//! pack's `expert_streaming.settings` block, read once, refused by name, each default today's route (g22-exl3):
-//!   - `exl3_wave_rows` (the EXL3 family's DIG-X prompt waves): a wave's rows at most, default 1,024 (MiMo's projection
-//!     tile), 128 .. 4,096 in steps of the GEMMs' 128-row M tile. Exact: each M tile's rows accumulate their own K in the
+//! pack's `expert_streaming.settings` block, read once, refused by name. The defaults are batch 27's measured bundle
+//! (g22-pw at 190/217, lane on, draft_depth 3 + draft_gate 0.5: prefill 1,010 -> 1,073, +6.18 %, exact, ids identical):
+//! `exl3_wave_rows` 2048, `prompt_route_cut` on, `prompt_static_order` sampled, `ttft_tail` deferred; g22-exl3's routes
+//! (1024, off, off, off: the control) stay selectable by name.
+//!   - `exl3_wave_rows` (the EXL3 family's DIG-X prompt waves): a wave's rows at most, default 2,048 (the control 1,024,
+//!     MiMo's projection tile), 128 .. 4,096 in steps of the GEMMs' 128-row M tile. Exact: each M tile's rows accumulate their own K in the
 //!     same order whatever wave holds them (a row's output does not depend on its wave). The bill's `expert_workspace`
 //!     prices two waves in flight at the setting (bill.zig `workspaceBytes`); a value off the grid refuses the load.
 //!   - `prompt_route_cut` (`off` | `on`): the wide call's rows bucketed by group once (the shared scheduler's
@@ -22,8 +25,11 @@ pub const RouteCut = enum { off, on };
 pub const StaticOrder = enum { off, sampled };
 pub const TtftTail = enum { off, deferred };
 
-/// The DIG-X prompt wave's rows: today's (MiMo's projection tile), the bounds and the grid (the GEMMs' M tile).
-pub const default_wave_rows: u32 = 1024;
+/// The DIG-X prompt wave's rows: the default (batch 27's measured bundle), the control's (g22-exl3's: MiMo's projection
+/// tile; by name), the bounds and the grid (the GEMMs' M tile). 2,048 rows bill as 1,024 (bill.zig `tileBytes`: both
+/// inside NVFP4's tile).
+pub const default_wave_rows: u32 = 2048;
+pub const control_wave_rows: u32 = 1024;
 pub const min_wave_rows: u32 = 128;
 pub const max_wave_rows: u32 = 4096;
 pub const wave_rows_step: u32 = 128;
@@ -40,15 +46,19 @@ pub const keys = [_][]const u8{ "exl3_wave_rows", "prompt_route_cut", "prompt_st
 
 pub const Settings = struct {
     wave_rows: u32 = default_wave_rows,
-    route_cut: RouteCut = .off,
-    static_order: StaticOrder = .off,
-    ttft_tail: TtftTail = .off,
+    route_cut: RouteCut = .on,
+    static_order: StaticOrder = .sampled,
+    ttft_tail: TtftTail = .deferred,
+    /// The settings named `exl3_wave_rows` (on the NVFP4 family the default is inert; a named size other than the
+    /// control's refuses).
+    wave_rows_named: bool = false,
     /// A key given a value it does not take (refused by name in `check`).
     malformed: struct { wave_rows: bool = false, route_cut: bool = false, static_order: bool = false, ttft_tail: bool = false } = .{},
 
     /// The settings object (after `unknownSetting`).
     pub fn apply(s: *Settings, o: std.json.ObjectMap) void {
         if (o.get("exl3_wave_rows")) |v| {
+            s.wave_rows_named = true;
             if (v == .integer and validWaveRows(v.integer))
                 s.wave_rows = @intCast(v.integer)
             else
@@ -69,10 +79,11 @@ pub const Settings = struct {
         return if (v == .string) std.meta.stringToEnum(E, v.string) else null;
     }
 
-    /// Once, with the settings' other refusals: a malformed value, or a wave size named on a family without DIG-X waves.
+    /// Once, with the settings' other refusals: a malformed value, or a wave size other than the control's named on a family
+    /// without DIG-X waves (there the default is inert).
     pub fn check(s: Settings, exl3: bool) !void {
         if (s.malformed.wave_rows) return error.Glm5NextExl3WaveRows;
-        if (s.wave_rows != default_wave_rows and !exl3) return error.Glm5NextExl3WaveRowsFamily;
+        if (s.wave_rows_named and s.wave_rows != control_wave_rows and !exl3) return error.Glm5NextExl3WaveRowsFamily;
         if (s.malformed.route_cut) return error.Glm5NextPromptRouteCut;
         if (s.malformed.static_order) return error.Glm5NextPromptStaticOrder;
         if (s.malformed.ttft_tail) return error.Glm5NextTtftTail;
@@ -106,12 +117,18 @@ fn parsed(text: []const u8) !Settings {
     return s;
 }
 
-test "glm5_next prompt levers: every default today's route; each key read, malformed values refused by name" {
+test "glm5_next prompt levers: the defaults are the measured bundle, the control by name; each key read, malformed values refused by name" {
     const d: Settings = .{};
     try d.check(false);
     try d.check(true);
     var buf: [128]u8 = undefined;
-    try testing.expectEqualStrings("wave_rows=1024 route_cut=off static_order=off ttft_tail=off", d.line(&buf));
+    try testing.expectEqualStrings("wave_rows=2048 route_cut=on static_order=sampled ttft_tail=deferred", d.line(&buf));
+    try testing.expectEqualStrings("wave_rows=2048 route_cut=on static_order=sampled ttft_tail=deferred", (try parsed("{}")).line(&buf));
+    // the control (g22-exl3's routes) by name, on either family
+    const ctl = try parsed("{\"exl3_wave_rows\":1024,\"prompt_route_cut\":\"off\",\"prompt_static_order\":\"off\",\"ttft_tail\":\"off\"}");
+    try ctl.check(true);
+    try ctl.check(false);
+    try testing.expectEqualStrings("wave_rows=1024 route_cut=off static_order=off ttft_tail=off", ctl.line(&buf));
     const all = try parsed("{\"exl3_wave_rows\":2048,\"prompt_route_cut\":\"on\",\"prompt_static_order\":\"sampled\",\"ttft_tail\":\"deferred\"}");
     try all.check(true);
     try testing.expectEqualStrings("wave_rows=2048 route_cut=on static_order=sampled ttft_tail=deferred", all.line(&buf));
@@ -120,7 +137,8 @@ test "glm5_next prompt levers: every default today's route; each key read, malfo
     // Off the grid, out of range, or not an integer: refused by name.
     for ([_][]const u8{ "{\"exl3_wave_rows\":2000}", "{\"exl3_wave_rows\":0}", "{\"exl3_wave_rows\":8192}", "{\"exl3_wave_rows\":\"2048\"}", "{\"exl3_wave_rows\":2048.0}" }) |t|
         try testing.expectError(error.Glm5NextExl3WaveRows, (try parsed(t)).check(true));
-    // A wave size on the NVFP4 family (no DIG-X waves) refuses; the default does not.
+    // A wave size other than the control's named on the NVFP4 family (no DIG-X waves) refuses; the default (unnamed) and
+    // the control's do not.
     try testing.expectError(error.Glm5NextExl3WaveRowsFamily, (try parsed("{\"exl3_wave_rows\":2048}")).check(false));
     try (try parsed("{\"exl3_wave_rows\":1024}")).check(false);
     try testing.expectError(error.Glm5NextPromptRouteCut, (try parsed("{\"prompt_route_cut\":true}")).check(true));
