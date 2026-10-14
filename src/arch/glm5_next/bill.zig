@@ -24,6 +24,8 @@ const mimo_stream = @import("../mimo_v2/stream.zig");
 const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
 const dsv_bill = @import("../deepseek_v41/bill.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
+const exl3_math = @import("exl3_math.zig");
+const prompt_levers = @import("prompt_levers.zig");
 const io_util = sdk.io_util;
 
 const Term = sdk.MemoryBill.Term;
@@ -208,6 +210,8 @@ pub const Inputs = struct {
     /// MiMo's X12 keep-warm route (`settings.Config.gpu_keep_warm`; `.off` the control). The setting's route, not the
     /// stream's resolution: a default `waits` on a CPU stream keeps its 1 MiB term (an over-bill there only, MiMo's rule).
     gpu_keep_warm: gpu_warm.Route = .off,
+    /// The EXL3 family's DIG-X prompt wave rows (`exl3_wave_rows`, prompt_levers.zig); NVFP4 bills its own tile.
+    exl3_wave_rows: u32 = prompt_levers.default_wave_rows,
     page: u64 = 16_384,
 };
 
@@ -469,10 +473,21 @@ pub fn laneTerms(in: *const Inputs) [3]Term {
 
 // ── The expert source's terms (MiMo's route: experts.zig) ──
 
+/// The routed math's tile in flight over `nr` routed rows: NVFP4's projection tile (MiMo's `projection_rows` at its per-row
+/// rate), or on the exl3 family that tile or a DIG-X prompt wave of `wave_rows` rows (`exl3_math.wave_bytes_per_row` a
+/// row: take2, z, hd, zd, y and the row maps), whichever is larger. At the default 1,024 rows (and up to 2,184) the wave
+/// is inside the NVFP4 tile: the bill is today's.
+pub fn tileBytes(g: SourceGeometry, nr: u64, wave_rows: u32) u64 {
+    const tile = @as(u64, @min(nr, mimo_math.projection_rows)) * (20 * @as(u64, g.hidden_size) + 24 * @as(u64, g.intermediate_size) + 32);
+    if (g.family != .exl3) return tile;
+    return @max(tile, @min(nr, @as(u64, wave_rows)) * exl3_math.wave_bytes_per_row);
+}
+
 /// The wide lane's workspace over a call of `tokens` tokens (mimo_v2/source.zig `workspaceBytes`'s rates at this
 /// geometry): the routed tile outputs and the merge, the call's input and output rows, one projection tile and one
-/// reduction tile, the host scratch; the pipelined drain's second tiles.
-pub fn workspaceBytes(g: SourceGeometry, tokens: u64) u64 {
+/// reduction tile, the host scratch; the pipelined drain's second tiles. The tile is `tileBytes`' (the exl3 family's
+/// DIG-X wave at `wave_rows` where it outgrows NVFP4's tile; two in flight: MiMo's drain).
+pub fn workspaceBytes(g: SourceGeometry, tokens: u64, wave_rows: u32) u64 {
     const k: u64 = experts.top_k;
     const nr = tokens * k;
     const max_nr = @as(u64, graph.prompt_call_rows) * k;
@@ -482,9 +497,11 @@ pub fn workspaceBytes(g: SourceGeometry, tokens: u64) u64 {
         ((max_nr + mimo_math.tile_rows - 1) / mimo_math.tile_rows + mimo_stream.max_route_ids) * 8 + (if (g.family == .exl3) @as(u64, @sizeOf(experts.Exl3Source)) else @as(u64, @sizeOf(experts.Source))) + (1 << 20);
     const routed = nr * (4 * H + 8) + 3 * @as(u64, @min(tokens, mimo_math.combine_tokens)) * k * 2 * H;
     const input_output = tokens * (6 * H + k * 8);
-    const matrix_tile = @as(u64, @min(nr, mimo_math.projection_rows)) * (20 * H + 24 * I + 32);
+    const nvfp4_tile = @as(u64, @min(nr, mimo_math.projection_rows)) * (20 * H + 24 * I + 32);
+    const matrix_tile = tileBytes(g, nr, wave_rows);
     const reduction_tile = @as(u64, @min(tokens, mimo_math.tile_rows)) * (k * H * 8 + H * 8 + k * 8);
-    const drain = mimo_math.pipelinedExtraBytes(H, I, @intCast(tokens));
+    // The drain's second tile and reduction tile (`pipelinedExtraBytes`: NVFP4's tile), its tile the same as the first.
+    const drain = mimo_math.pipelinedExtraBytes(H, I, @intCast(tokens)) - nvfp4_tile + matrix_tile;
     return host + routed + input_output + matrix_tile + reduction_tile + drain;
 }
 
@@ -533,7 +550,7 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
         .{ .name = "slot_rounding", .bytes = @splat(rounding), .at_construction = true },
         .{ .name = "reader_staging", .bytes = @splat(staging), .at_construction = true },
         .{ .name = "source_metadata", .bytes = @splat(policy + metadata + manifest), .at_construction = true },
-        .{ .name = "expert_workspace", .bytes = .{ workspaceBytes(g, t), workspaceBytes(g, experts.decode_lane_rows) }, .at_construction = false },
+        .{ .name = "expert_workspace", .bytes = .{ workspaceBytes(g, t, in.exl3_wave_rows), workspaceBytes(g, experts.decode_lane_rows, in.exl3_wave_rows) }, .at_construction = false },
         .{ .name = "event_runtime", .bytes = @splat(8 << 20), .at_construction = true },
         .{ .name = "event_graph", .bytes = @splat(16 << 20), .at_construction = false },
         .{ .name = "spec_staging", .bytes = @splat(spec), .at_construction = true },
@@ -601,6 +618,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .decode_swiglu = cfg.decode_swiglu,
         .mtp = lane,
         .gpu_keep_warm = cfg.gpu_keep_warm,
+        .exl3_wave_rows = cfg.prompt.wave_rows,
         .page = page,
     };
 }
@@ -975,13 +993,18 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
     };
     // `GLM5_BILL_MTP=1`: the bill with the MTP lane installed (its terms, the verify's rows, the KDA captures).
     const lane = if (std.c.getenv("GLM5_BILL_MTP")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    // `GLM5_BILL_WAVE_ROWS=<rows>`: the exl3 family's DIG-X prompt waves at that setting (`exl3_wave_rows`, validated).
+    const wave_rows: u32 = if (std.c.getenv("GLM5_BILL_WAVE_ROWS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else prompt_levers.default_wave_rows;
     const fam = blk: {
         const v = try std.json.parseFromSlice(std.json.Value, a, config_text, .{});
         defer v.deinit();
         const block = if (v.value == .object) v.value.object.get("expert_streaming") orelse .null else .null;
         break :blk @import("root.zig").declared(block) orelse return error.Glm5NextPackRequired;
     };
-    var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane };
+    var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane, .prompt = .{ .wave_rows = wave_rows } };
+    if (!prompt_levers.validWaveRows(wave_rows)) return error.Glm5NextExl3WaveRows;
+    try cfg.prompt.check(fam == .exl3);
+    if (wave_rows != prompt_levers.default_wave_rows) std.debug.print("\nGLM5_NEXT BILL exl3_wave_rows={d}\n", .{wave_rows});
     const res = try residentBytes(a, io, dir, &model, std.heap.pageSize());
     std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s} experts={s}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off", @tagName(fam) });
     for (tool_contexts) |ctx| {
@@ -1061,6 +1084,50 @@ test "glm5_next bill: the exl3 family bills its 9,474,048 B record as the row (p
     try testing.expect(be.total(.decode, 12_600_000_000, re.decode) <= target);
     if (re.decode < 288) try testing.expect(be.total(.decode, 12_600_000_000, re.decode + 1) > target);
     std.debug.print("\nGLM5_NEXT EXL3 BILL fixture (residents 17.85 GB, lane off, ctx 32,768, baseline 12.6 GB): nvfp4 {d}/{d} exl3 {d}/{d} per_row {d}\n", .{ rn.prompt, rn.decode, re.prompt, re.decode, be.per_row });
+}
+
+test "glm5_next bill: the exl3 wave setting prices two DIG-X waves in flight: 1,024 and 2,048 rows inside NVFP4's tile (today's bill), 4,096 rows two waves' excess; decode and NVFP4 unchanged" {
+    const a = testing.allocator;
+    const nv = try fixtureInputs(32_768);
+    var ex = nv;
+    ex.geometry = .ofExl3(try exl3_bank.Geometry.init(4096, 2048, 288, 3, 42));
+    const b0 = try billOf(a, &ex);
+    defer b0.free(a);
+    const tile = @as(u64, mimo_math.projection_rows) * (20 * 4096 + 24 * 2048 + 32);
+    try testing.expectEqual(@as(u64, 134_250_496), tile);
+    try testing.expectEqual(@as(u64, 61_448), exl3_math.wave_bytes_per_row);
+    for ([_]u32{ 128, 1024, 2048, 2176 }) |w| {
+        var in = ex;
+        in.exl3_wave_rows = w;
+        const b = try billOf(a, &in);
+        defer b.free(a);
+        try testing.expectEqual(termOf(b0, "expert_workspace"), termOf(b, "expert_workspace"));
+        try testing.expectEqual(b0.fixed(.prompt), b.fixed(.prompt));
+    }
+    var in4 = ex;
+    in4.exl3_wave_rows = 4096;
+    const b4 = try billOf(a, &in4);
+    defer b4.free(a);
+    const extra = 2 * (4096 * exl3_math.wave_bytes_per_row - tile);
+    try testing.expectEqual(@as(u64, 234_881_024), extra);
+    try testing.expectEqual(termOf(b0, "expert_workspace")[0] + extra, termOf(b4, "expert_workspace")[0]);
+    try testing.expectEqual(termOf(b0, "expert_workspace")[1], termOf(b4, "expert_workspace")[1]);
+    try testing.expectEqual(b0.fixed(.decode), b4.fixed(.decode));
+    // NVFP4 bills its own tile whatever the input says (the setting refuses on NVFP4 packs: prompt_levers.zig `check`).
+    var nv4 = nv;
+    nv4.exl3_wave_rows = 4096;
+    const bn = try billOf(a, &nv);
+    defer bn.free(a);
+    const bn4 = try billOf(a, &nv4);
+    defer bn4.free(a);
+    try testing.expectEqual(termOf(bn, "expert_workspace"), termOf(bn4, "expert_workspace"));
+    // At 12.6 GB on the fixture (lane off, ctx 32,768) the 4,096-row waves' prompt bill is 235 MB more, the decode bill
+    // the same: the decode fill is unchanged; the prompt fill at most one row less.
+    const target = box_ceiling - box_stop;
+    const r0 = try sdk.fill(b0, 12_600_000_000, target, 288, min_rows);
+    const r4 = try sdk.fill(b4, 12_600_000_000, target, 288, min_rows);
+    try testing.expect(r4.prompt + 1 >= r0.prompt and r4.prompt <= r0.prompt);
+    std.debug.print("\nGLM5_NEXT EXL3 WAVE BILL fixture (lane off, ctx 32,768, baseline 12.6 GB): 1,024/2,048 rows {d}/{d}, 4,096 rows {d}/{d} (+{d} B prompt)\n", .{ r0.prompt, r0.decode, r4.prompt, r4.decode, extra });
 }
 
 test "glm5_next bill: the exl3 geometry of a synthetic two-layer, eight-expert bank-v2 pack at GLM's shape, from its manifest" {

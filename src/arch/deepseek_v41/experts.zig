@@ -781,8 +781,36 @@ pub const Wide = struct {
     /// record) and the base call issued after the last seed group, so only the seed's own reads precede it. Exact:
     /// each expert's rows and kernel are its own whatever its group; the combine folds by routed position.
     seed_aligned: bool = false,
+    /// The route-plan cut (glm5next/route-plan, cd6f1ec): the call's rows bucketed by group once (a stable counting sort
+    /// into the join's scratch, `bucketRowsByGroup`), each group's bank passes over its own rows only, in the same order
+    /// (byte-identical plans), and the distinct experts with their counts in one pass. Off (the control): every bank
+    /// pass of every group walks the call's every row. Exact: host planning only.
+    route_cut: bool = false,
     pub const max_cold_rows = 8;
 };
+
+/// A wide call's rows bucketed by group, each group's rows in ascending row order (a stable counting sort): `ids` the
+/// call's routed ids (rows x top-k), `distinct` its experts, `grp_of[e]` expert e's group, `count[e]` (optional) its rows;
+/// `off` [n_groups + 1] gets the groups' offsets, `rows` [ids.len] the rows. A pass over `rows[off[g]..off[g + 1]]` meets
+/// exactly the rows of group g a pass over the whole call meets, in the same order (exact).
+pub fn bucketRowsByGroup(ids: []const u16, distinct: []const u16, grp_of: []const u16, count: ?[]const u32, off: []u32, rows: []u32) void {
+    @memset(off, 0);
+    if (count) |c| {
+        for (distinct) |e| off[grp_of[e] + 1] += c[e];
+    } else for (ids) |e| {
+        off[grp_of[e] + 1] += 1;
+    }
+    for (1..off.len) |gi| off[gi] += off[gi - 1];
+    // Each row at its group's cursor (`off[gi]` advances to the group's end), then the starts restored.
+    for (ids, 0..) |e, row| {
+        const gi = grp_of[e];
+        rows[off[gi]] = @intCast(row);
+        off[gi] += 1;
+    }
+    var gi = off.len - 1;
+    while (gi > 0) : (gi -= 1) off[gi] = off[gi - 1];
+    off[0] = 0;
+}
 
 /// The routed-expert hook of `Model(G)` over source `S` with math `M`
 /// (`gateUp(g, x, ids, gate, up)`, `down(g, h, ids, d)`). Bank arrays are
@@ -918,9 +946,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             def_slot: std.ArrayList(u32) = .empty,
             def_act: std.ArrayList(u32) = .empty,
             def_pos: std.ArrayList(u32) = .empty,
+            /// `Wide.route_cut`: the call's rows by group (`groupRows`; the rows themselves in `inv`, free until the join):
+            /// per expert its group, the groups' row offsets.
+            grp_of: std.ArrayList(u16) = .empty,
+            grp_off: std.ArrayList(u32) = .empty,
 
             fn deinit(w: *WideScratch, a: std.mem.Allocator) void {
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc, &w.def_slot, &w.def_act, &w.def_pos }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc, &w.def_slot, &w.def_act, &w.def_pos, &w.grp_of, &w.grp_off }) |l| l.deinit(a);
                 w.jl.deinit(a);
             }
         };
@@ -1651,6 +1683,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 const s0 = gs.start(gi);
                 return gs.d[s0..@min(s0 + max_route_ids, if (gi < gs.seed_groups) gs.sa else gs.d.len)];
             }
+
+            /// The group of the expert at `fi` in the call's order (`start`'s inverse).
+            fn index(gs: Groups, fi: usize) usize {
+                return if (fi < gs.sa) fi / max_route_ids else gs.seed_groups + (fi - gs.sa) / max_route_ids;
+            }
         };
 
         /// The deferred base-bank rows gathered so far as one call's waves, drained; their slots stay held. `at_seed`:
@@ -1682,7 +1719,25 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             w.def_pos.clearRetainingCapacity();
         }
 
+        /// `Wide.route_cut`: the call's rows bucketed by group (`bucketRowsByGroup`) into `inv` [n_ids] (the join's scratch,
+        /// unused until the call's groups are done: no new per-row memory), group `gi`'s at `grp_off[gi]..grp_off[gi + 1]`.
+        /// A group's bank passes then read its own rows only. `counted`: `count` holds each expert's rows.
+        fn groupRows(a: std.mem.Allocator, w: *WideScratch, groups: Groups, n_groups: usize, counted: bool) !void {
+            try w.grp_of.resize(a, w.first.items.len);
+            for (groups.d, 0..) |e, i| w.grp_of.items[e] = @intCast(groups.index(i));
+            try w.grp_off.resize(a, n_groups + 1);
+            try w.inv.resize(a, w.ids.items.len);
+            bucketRowsByGroup(w.ids.items, groups.d, w.grp_of.items, if (counted) w.count.items else null, w.grp_off.items, w.inv.items);
+        }
+
+        /// The construction's route (`Wide.route_cut`), once per call: the core at its comptime instance.
         fn runWideCore(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32, comptime parts: bool) !void {
+            return switch (self.wide_route.route_cut) {
+                inline else => |cut| self.runWideCoreAt(g, layer, xf, indices, n, k, parts, cut),
+            };
+        }
+
+        fn runWideCoreAt(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32, comptime parts: bool, comptime cut: bool) !void {
             const a = self.a;
             const w = &self.wide;
             wide_profile.countWideCall();
@@ -1704,14 +1759,34 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             try w.first.resize(a, self.n_experts);
             @memset(w.first.items, -1);
             w.distinct.clearRetainingCapacity();
-            for (w.ids.items) |e| if (w.first.items[e] < 0) {
-                w.first.items[e] = @intCast(w.distinct.items.len);
-                try w.distinct.append(a, e);
-            };
-            if (feed or hot_first or cold > 0) {
-                try w.count.resize(a, self.n_experts);
-                @memset(w.count.items, 0);
-                for (w.ids.items) |e| w.count.items[e] += 1;
+            const counted = feed or hot_first or cold > 0;
+            if (comptime cut) {
+                // The call's experts in first appearance and (the feed's order, the cold split) their rows: one pass.
+                try w.distinct.ensureTotalCapacity(a, self.n_experts);
+                if (counted) {
+                    try w.count.resize(a, self.n_experts);
+                    @memset(w.count.items, 0);
+                    for (w.ids.items) |e| {
+                        if (w.first.items[e] < 0) {
+                            w.first.items[e] = @intCast(w.distinct.items.len);
+                            w.distinct.appendAssumeCapacity(e);
+                        }
+                        w.count.items[e] += 1;
+                    }
+                } else for (w.ids.items) |e| if (w.first.items[e] < 0) {
+                    w.first.items[e] = @intCast(w.distinct.items.len);
+                    w.distinct.appendAssumeCapacity(e);
+                };
+            } else {
+                for (w.ids.items) |e| if (w.first.items[e] < 0) {
+                    w.first.items[e] = @intCast(w.distinct.items.len);
+                    try w.distinct.append(a, e);
+                };
+                if (counted) {
+                    try w.count.resize(a, self.n_experts);
+                    @memset(w.count.items, 0);
+                    for (w.ids.items) |e| w.count.items[e] += 1;
+                }
             }
             // The call's residency seed (the seed route), then its experts hottest first (the order route).
             if (feed) {
@@ -1741,6 +1816,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const sa: usize = if (comptime @hasDecl(S, "seedRanks")) (if (aligned) @min(self.source.seedRanks(layer), n_distinct) else 0) else 0;
             const groups: Groups = .{ .d = w.distinct.items, .sa = sa, .seed_groups = (sa + max_route_ids - 1) / max_route_ids };
             const n_groups = groups.seed_groups + (n_distinct - sa + max_route_ids - 1) / max_route_ids;
+            if (comptime cut) try groupRows(a, w, groups, n_groups, counted);
             // P1b: the seed's base call is due after its last group (aligned: the last seed group; else the first group
             // with a transient row).
             var base_due = self.wide_route.base_at_seed;
@@ -1786,9 +1862,15 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                     w.cold_slot.clearRetainingCapacity();
                     w.cold_act.clearRetainingCapacity();
                     w.cold_pos.clearRetainingCapacity();
-                    for (w.ids.items, 0..) |e, row| {
+                    // The cut: the group's own rows, in row order (`groupRows`), each bank's rows as a pass over the whole
+                    // call meets them; the control: every row of the call, the group's kept.
+                    const passed: []const u32 = if (comptime cut) w.inv.items[w.grp_off.items[gi]..w.grp_off.items[gi + 1]] else &.{};
+                    const n_pass = if (comptime cut) passed.len else w.ids.items.len;
+                    for (0..n_pass) |pi| {
+                        const row: usize = if (comptime cut) passed[pi] else pi;
+                        const e = w.ids.items[row];
                         const fi: usize = @intCast(w.first.items[e]);
-                        if (fi < start or fi >= start + group.len) continue;
+                        if (comptime !cut) if (fi < start or fi >= start + group.len) continue;
                         const ref = sv.refs[fi - start];
                         if (ref.bank != kind) continue;
                         const act_row: u32 = @intCast(row / @as(usize, k));
@@ -3524,7 +3606,7 @@ const StreamRec = struct {
     var base_code: u32 = 0;
     var transient_code: u32 = 0;
 
-    const Rec = struct { experts: []u16, act_row: []u32, base: bool, live: u32, evals: usize };
+    const Rec = struct { experts: []u16, act_row: []u32, base: bool, live: u32, evals: usize, slot: []u32 = &.{} };
 
     fn init(a: std.mem.Allocator) StreamRec {
         return .{ .a = a };
@@ -3534,6 +3616,7 @@ const StreamRec = struct {
         for (self.recs.items) |r| {
             self.a.free(r.experts);
             self.a.free(r.act_row);
+            self.a.free(r.slot);
         }
         self.recs.deinit(self.a);
     }
@@ -3560,7 +3643,11 @@ const StreamRec = struct {
         for (rows.slot, experts) |r, *e| e.* = try expertIn(s, bank.?, if (base) r else cap + r);
         var live: u32 = 0;
         for (&s.routes) |*r| live += @intFromBool(r.state == .live);
-        try self.recs.append(self.a, .{ .experts = experts, .act_row = try self.a.dupe(u32, rows.act_row.?), .base = base, .live = live, .evals = g.evals.items.len });
+        const act_rows = try self.a.dupe(u32, rows.act_row.?);
+        errdefer self.a.free(act_rows);
+        const slots = try self.a.dupe(u32, rows.slot);
+        errdefer self.a.free(slots);
+        try self.recs.append(self.a, .{ .experts = experts, .act_row = act_rows, .base = base, .live = live, .evals = g.evals.items.len, .slot = slots });
         return g.input(&.{ @intCast(rows.slot.len), g.shapeOf(act).d[1] }, .float32);
     }
 
@@ -3668,6 +3755,111 @@ test "dsv41 experts: the wide feed and read-ahead serve every routed row from it
             for (hot[0..16]) |e| in_top[e] = true;
             for (recs) |r| for (r.experts) |e| try testing.expectEqual(in_top[e], r.base);
         }
+    }
+}
+
+test "dsv41 experts: the route-plan cut (Wide.route_cut) hands the math the control's calls: every bank pass's slots, records, act rows and positions in the same order, the same reads and drains" {
+    const a = testing.allocator;
+    var sb = try SynthBank.open(128);
+    defer sb.close();
+    StreamRec.bank = &sb;
+    defer StreamRec.bank = null;
+    var c = testConfig(64, 32, 1);
+    c.n_routed_experts = 128;
+    // 120 tokens x top-6 over 3 groups of 48: a hot band (experts 0..9 in every 4th token), the rest spread, the
+    // first appearance order unlike the hot order.
+    const n = 120;
+    const k = 6;
+    var ids: [n * k]u16 = undefined;
+    for (&ids, 0..) |*e, i| {
+        const t = i / k;
+        const j = i % k;
+        e.* = if (t % 4 == 0 and j < 2) @intCast((t / 4 + 5 * j) % 10) else @intCast(10 + j * 19 + (t * (j + 7)) % 19);
+    }
+    const Math = WithPrefillRoutes(TraceOps, TraceMath, StreamRec);
+    const Ex = ExpertsWith(TraceOps, StreamSource, Math, .{ .prefill = true });
+    const Run = struct {
+        recs: std.ArrayList(StreamRec.Rec) = .empty,
+        pos: std.ArrayList(u32) = .empty,
+        bytes: u64 = 0,
+        drains: usize = 0,
+        finishes: u32 = 0,
+
+        fn deinit(r: *@This(), al: std.mem.Allocator) void {
+            for (r.recs.items) |x| {
+                al.free(x.experts);
+                al.free(x.act_row);
+                al.free(x.slot);
+            }
+            r.recs.deinit(al);
+            r.pos.deinit(al);
+        }
+    };
+    for ([_]Wide{ .{}, .{ .seed = true, .hot_first = true, .depth = 2 }, .{ .depth = 2 }, .{ .hot_first = true }, .{ .seed = true, .hot_first = true } }) |base_wide| {
+        var runs: [2]Run = .{ .{}, .{} };
+        defer for (&runs) |*r| r.deinit(a);
+        for ([_]bool{ false, true }, &runs) |cut, *run| {
+            var wide = base_wide;
+            wide.route_cut = cut;
+            const s = try expert_stream.Stream.init(a, &sb.bank, .{ .rows = &.{ 16, 16 }, .pool = .{ .workers = 2, .staging_bytes = 16384, .tickets = 256 }, .wide_depth = wide.depth, .transient_rows = @as(u32, wide.depth) * max_route_ids });
+            defer s.deinit();
+            StreamRec.stream = s;
+            defer StreamRec.stream = null;
+            var src = StreamSource.init(s);
+            var g = TraceOps.init(a);
+            defer g.deinit();
+            var rrs = [_]StreamRec{StreamRec.init(a)};
+            defer rrs[0].deinit(&g);
+            var ex = try Ex.initWith(a, &g, &src, .{ .d = .{ .hidden = 64, .inter = 32 }, .routes = &rrs }, &c, .{ .wide = wide });
+            defer ex.deinit();
+            StreamRec.base_code = ex.banks[0][@backingInt(BankKind.base)].?.gate.code;
+            StreamRec.transient_code = ex.banks[0][@backingInt(BankKind.transient)].?.gate.code;
+            var script: Script = .{ .calls = &.{&ids} };
+            g.host_values = script.values();
+            const evals0 = g.evals.items.len;
+            _ = try ex.at(0).routed(&g, try g.input(&.{ n, 64 }, .bfloat16), try g.input(&.{ n, k }, .int32));
+            try ex.flush();
+            run.drains = g.evals.items.len - evals0;
+            run.finishes = rrs[0].finishes;
+            run.bytes = s.stats().expert_bytes_read;
+            try run.pos.appendSlice(a, ex.wide.pos.items);
+            // The recorder's calls moved over (its deinit then frees nothing).
+            try run.recs.appendSlice(a, rrs[0].recs.items);
+            rrs[0].recs.clearRetainingCapacity();
+        }
+        const want = runs[0];
+        const got = runs[1];
+        try testing.expect(want.recs.items.len >= 2);
+        try testing.expectEqual(want.recs.items.len, got.recs.items.len);
+        for (want.recs.items, got.recs.items) |x, y| {
+            try testing.expectEqualSlices(u32, x.slot, y.slot);
+            try testing.expectEqualSlices(u16, x.experts, y.experts);
+            try testing.expectEqualSlices(u32, x.act_row, y.act_row);
+            try testing.expectEqual(x.base, y.base);
+            try testing.expectEqual(x.live, y.live);
+            try testing.expectEqual(x.evals, y.evals);
+        }
+        try testing.expectEqualSlices(u32, want.pos.items, got.pos.items);
+        try testing.expectEqual(want.bytes, got.bytes);
+        try testing.expectEqual(want.drains, got.drains);
+        try testing.expectEqual(want.finishes, got.finishes);
+    }
+}
+
+test "dsv41 experts: bucketRowsByGroup keeps every group's rows in row order, with or without the counts" {
+    // 3 groups over 5 experts; rows of 2 ids.
+    const ids = [_]u16{ 4, 0, 2, 4, 1, 3, 0, 2, 4, 1 };
+    const distinct = [_]u16{ 4, 0, 2, 1, 3 };
+    const grp_of = [_]u16{ 0, 1, 1, 2, 0 };
+    var count: [5]u32 = @splat(0);
+    for (ids) |e| count[e] += 1;
+    for ([_]?[]const u32{ &count, null }) |cn| {
+        var off: [4]u32 = undefined;
+        var out: [ids.len]u32 = undefined;
+        bucketRowsByGroup(&ids, &distinct, &grp_of, cn, &off, &out);
+        try testing.expectEqualSlices(u32, &.{ 0, 5, 9, 10 }, &off);
+        // Group 0 = experts 4, 0; group 1 = 2, 1; group 2 = 3: each group's id positions ascending.
+        try testing.expectEqualSlices(u32, &.{ 0, 1, 3, 6, 8, 2, 4, 7, 9, 5 }, &out);
     }
 }
 

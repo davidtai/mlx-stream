@@ -28,6 +28,7 @@ const fp8 = @import("fp8.zig");
 const glue = @import("glue.zig");
 const settings = @import("settings.zig");
 const swiglu = @import("swiglu.zig");
+const prompt_levers = @import("prompt_levers.zig");
 /// Profile builds: the prompt pass's stage marks (MiMo's timeline, armed by `GLM5_NEXT_PREFILL_TIMELINE`); every mark
 /// compiles to nothing in a served build.
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
@@ -741,6 +742,17 @@ pub fn expertCounts(comptime Ops: type, g: *Ops, ids: Ops.T, rows: c_int, k: c_i
     return g.sum(try g.equal(try g.reshape(ids, &.{ rows * k, 1 }), all_ids), 0, false);
 }
 
+/// The spans P1's predictor routes (`Routes.predict_sampled`, the construction's `prompt_static_order`): every span of the
+/// call (the control), or at most `prompt_levers.sampled_spans` evenly spaced ones (`prompt_levers.sampledSpanIndices`)
+/// copied into `buf`. The counts only rank the read-ahead seed: token-identical either way.
+fn predictSpans(routes: Routes, spans: []const T, buf: *[max_spans]T) []const T {
+    if (!routes.predict_sampled) return spans;
+    var idx: [max_spans]usize = undefined;
+    const n = prompt_levers.sampledSpanIndices(spans.len, &idx);
+    for (idx[0..n], buf[0..n]) |i, *b| b.* = spans[i];
+    return buf[0..n];
+}
+
 /// P1: routed layer `l`'s predicted counts (evaluated) ranked hottest first and posted to the stream, which reads the
 /// seed into the layer's free persistent rows while the attention runs. The prediction only picks reads.
 fn postReadAhead(g: *G, c: *const glm.Config, ahead: *const Ahead, src: anytype, l: u32) !void {
@@ -759,6 +771,9 @@ pub const Routes = struct {
     kda: kda.Step = .{},
     /// The decode lane's MLP activation (`decode_swiglu`): the op chain unless the module installed the fused text.
     swiglu: ?*const swiglu.Kernels = null,
+    /// P1's predictor on a prompt call's sampled spans (`prompt_static_order: sampled`; `predictSpans`); false (the
+    /// control): every span.
+    predict_sampled: bool = false,
 };
 
 /// What a forward hands back after its last layer (a comptime route per call site):
@@ -814,6 +829,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
     // Prompt lever 5: the next routed layer's predictor, built and evaluated with each layer's output.
     var ahead: Ahead = .{};
     defer ahead.release(g);
+    var predict_buf: [max_spans]T = undefined;
     // Prefill host idle: a prompt layer's cache purge runs after the next layer's first span is committed.
     var purge: DeferredPurge = .{};
     for (w.layers, 0..) |*lw, li| {
@@ -827,7 +843,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
         if (prompt and lw.router != null) {
             // Built at the previous layer's end; a call's first routed layer with no earlier layer in the call builds it here.
             if (ahead.layer == null) {
-                try predictor(g, c, lw, l, spans, &ahead);
+                try predictor(g, c, lw, l, predictSpans(routes, spans, &predict_buf), &ahead);
                 try g.evalAll(&.{ahead.counts.?});
             }
             try postReadAhead(g, c, &ahead, src, l);
@@ -906,7 +922,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             @memcpy(outs[0..n_spans], spans);
             var n_outs = n_spans;
             if (li + 1 < w.layers.len and w.layers[li + 1].router != null) {
-                try predictor(g, c, &w.layers[li + 1], l + 1, spans, &ahead);
+                try predictor(g, c, &w.layers[li + 1], l + 1, predictSpans(routes, spans, &predict_buf), &ahead);
                 outs[n_outs] = ahead.counts.?;
                 n_outs += 1;
             }
@@ -1073,6 +1089,8 @@ test {
     _ = @import("fp8.zig");
     _ = @import("fp8_parity.zig");
     _ = @import("determinism_gpu.zig");
+    _ = @import("route_plan_bench.zig");
+    _ = @import("prompt_levers.zig");
 }
 
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {
