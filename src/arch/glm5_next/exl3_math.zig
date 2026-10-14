@@ -9,6 +9,9 @@
 //!     SwiGLU epilogue, the down GEMM, rot_widen1 into bf16) over the call's rows sorted by slot, a wave at most
 //!     `wave_rows` rows of at most `xq.wave_max` experts, pipelined as MiMo's drain (one wave in flight behind the next).
 //! The decode lookahead's predictor is MiMo's (`mimo_math.Predictor`), bound at construction.
+//! The decode chain's launches are bound once at construction (`Decode`): lane B's seam texts (exl3_kernels.zig, the
+//! default `exl3_gateup_form` / `exl3_down_form` = seam: g22-exl3's chain, unchanged) or the installed forms
+//! (exl3_forms.zig `Installed`, the settings' `Exl3Forms`); the calls run the bound pair, no per-call choice.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -19,6 +22,7 @@ const xq = @import("../../exl3/quant.zig");
 const mimo_math = @import("../mimo_v2/math.zig");
 const profile = @import("../mimo_v2/profile.zig");
 const kernels = @import("exl3_kernels.zig");
+const xf = @import("exl3_forms.zig");
 const bank = @import("exl3_bank.zig");
 
 const T = mlx.mlx_array;
@@ -39,6 +43,33 @@ comptime {
     if (wave_bytes_per_row > 20 * kernels.hidden + 24 * kernels.inter + 32) @compileError("glm5_next exl3: a wave row outgrows the billed tile row");
 }
 
+/// The decode chain, bound once at construction: lane B's seam kernels, or an installed form.
+pub const Decode = struct {
+    ctx: *const anyopaque,
+    gate_up: *const fn (ctx: *const anyopaque, g: *G, x: T, ids: T, banks: *const [kernels.n_banks]Arrays) anyerror!T,
+    down: *const fn (ctx: *const anyopaque, g: *G, h: T, ids: T, banks: *const [kernels.n_banks]Arrays) anyerror!T,
+
+    pub fn seam(k: *const kernels.Kernels) Decode {
+        return .{ .ctx = k, .gate_up = seamGateUp, .down = seamDown };
+    }
+    pub fn forms(f: *const xf.Installed) Decode {
+        return .{ .ctx = f, .gate_up = formsGateUp, .down = formsDown };
+    }
+
+    fn seamGateUp(ctx: *const anyopaque, g: *G, x: T, ids: T, banks: *const [kernels.n_banks]Arrays) anyerror!T {
+        return kernels.gateUp(@ptrCast(@alignCast(ctx)), g, x, ids, banks);
+    }
+    fn seamDown(ctx: *const anyopaque, g: *G, h: T, ids: T, banks: *const [kernels.n_banks]Arrays) anyerror!T {
+        return kernels.down(@ptrCast(@alignCast(ctx)), g, h, ids, banks);
+    }
+    fn formsGateUp(ctx: *const anyopaque, g: *G, x: T, ids: T, banks: *const [kernels.n_banks]Arrays) anyerror!T {
+        return xf.gateUp(@ptrCast(@alignCast(ctx)), g, x, ids, banks);
+    }
+    fn formsDown(ctx: *const anyopaque, g: *G, h: T, ids: T, banks: *const [kernels.n_banks]Arrays) anyerror!T {
+        return xf.down(@ptrCast(@alignCast(ctx)), g, h, ids, banks);
+    }
+};
+
 pub const Math = struct {
     const Self = @This();
 
@@ -58,6 +89,10 @@ pub const Math = struct {
 
     allocator: std.mem.Allocator,
     k: *kernels.Kernels,
+    /// The installed forms (null: the seam chain, `Exl3Forms` default).
+    forms: ?*xf.Installed,
+    /// The decode chain the calls run (`Decode.seam(k)` or `Decode.forms(forms)`), bound at `init`.
+    decode: Decode,
     predictor: mimo_math.Predictor = .{},
     order: []u32,
     /// A wave's host tables: act rows, entries, the wave table.
@@ -65,22 +100,33 @@ pub const Math = struct {
     rhs: []u32,
 
     /// Construction (the module's GPU stream): the texts installed (`exl3_kernels.install`: pins, kernels, the decode
-    /// launches, the compile check), refused by name.
-    pub fn init(a: std.mem.Allocator, s: mlx.mlx_stream, call_rows: u32, diag: *sdk.Diag) !Self {
+    /// launches, the compile check), refused by name; the decode forms (`forms`, the settings' `Exl3Forms.forms()`): the
+    /// seam chain binds lane B's kernels and installs nothing more; any other form is installed here (exl3_forms.zig
+    /// `install`: the forms checked, the pins, its texts and every wave width's launches), refused by name.
+    pub fn init(a: std.mem.Allocator, s: mlx.mlx_stream, call_rows: u32, forms: xf.Forms, diag: *sdk.Diag) !Self {
         const k = try kernels.install(a, s, diag);
         errdefer {
             k.deinit();
             a.destroy(k);
         }
+        const inst: ?*xf.Installed = if (std.meta.eql(forms, xf.Forms{})) null else try xf.install(a, k, forms, .bfloat16, diag);
+        errdefer if (inst) |f| {
+            f.deinit();
+            a.destroy(f);
+        };
         const order = try a.alloc(u32, call_rows);
         errdefer a.free(order);
         const ridx = try a.alloc(i32, wave_rows);
         errdefer a.free(ridx);
-        return .{ .allocator = a, .k = k, .order = order, .ridx = ridx, .rhs = try a.alloc(u32, wave_rows) };
+        return .{ .allocator = a, .k = k, .forms = inst, .decode = if (inst) |f| Decode.forms(f) else Decode.seam(k), .order = order, .ridx = ridx, .rhs = try a.alloc(u32, wave_rows) };
     }
 
     pub fn deinit(self: *Self, _: *G) void {
         self.predictor.deinit();
+        if (self.forms) |f| {
+            f.deinit();
+            self.allocator.destroy(f);
+        }
         self.k.deinit();
         self.allocator.destroy(self.k);
         self.allocator.free(self.order);
@@ -98,23 +144,23 @@ pub const Math = struct {
     pub fn gateUp(self: *const Self, g: *G, x: T, ids: T, gate: Proj, up: Proj) !T {
         const one: Arrays = .{ .gate = gate, .up = up, .down = gate };
         const banks: [kernels.n_banks]Arrays = @splat(one);
-        return kernels.gateUp(self.k, g, x, ids, &banks);
+        return self.decode.gate_up(self.decode.ctx, g, x, ids, &banks);
     }
 
     pub fn down(self: *const Self, g: *G, h: T, ids: T, d: Proj) !T {
         const one: Arrays = .{ .gate = d, .up = d, .down = d };
         const banks: [kernels.n_banks]Arrays = @splat(one);
-        return kernels.down(self.k, g, h, ids, &banks);
+        return self.decode.down(self.decode.ctx, g, h, ids, &banks);
     }
 
     /// x bf16 [P, hidden] (each pair's token row), ids packed `bank << 24 | row` -> the clamped SwiGLU f32 [P, inter].
     pub fn gateUpBanked(self: *const Self, g: *G, x: T, ids: T, banks: *const [kernels.n_banks]Arrays) !T {
-        return kernels.gateUp(self.k, g, x, ids, banks);
+        return self.decode.gate_up(self.decode.ctx, g, x, ids, banks);
     }
 
     /// h f32 [P, inter] -> each pair's down row bf16 [P, hidden] (the scheduler's join and the arch's combine follow).
     pub fn downBanked(self: *const Self, g: *G, h: T, ids: T, banks: *const [kernels.n_banks]Arrays) !T {
-        return kernels.down(self.k, g, h, ids, banks);
+        return self.decode.down(self.decode.ctx, g, h, ids, banks);
     }
 
     // ── Prompt: DIG-X waves ──
@@ -281,4 +327,64 @@ test "glm5_next exl3 math: a call's waves hold at most 16 experts and wave_rows 
     for (big_order, 0..) |*o, i| o.* = @intCast(i);
     try testing.expectEqual(@as(usize, wave_rows), Math.waveEnd(big_order, big_slots, 0));
     try testing.expectEqual(@as(usize, big_n), Math.waveEnd(big_order, big_slots, wave_rows));
+}
+
+test "glm5_next exl3 math: every exl3 form name computes the seam's words on the host (column sums over the 2,000 cases; one expert's h and down words)" {
+    const settings = @import("settings.zig");
+    const ref = @import("exl3_forms_ref.zig");
+    const sumOf = struct {
+        fn gu(f: xf.Forms) ref.ColSum {
+            return if (f.fusedGu()) .registers else .stock;
+        }
+        fn dn(f: xf.Forms) ref.ColSum {
+            return if (f.fusedDn()) .registers else .stock;
+        }
+    };
+    // the column sums: each name's (gate / up and down) against the seam's, bit for bit, over the identity's cases
+    var s: u64 = 7;
+    var acc: [32][8]f32 = undefined;
+    var checked: usize = 0;
+    for (0..ref.colsum_cases) |it| {
+        ref.colsumCase(&s, it, &acc);
+        var seam: [16]f32 = undefined;
+        ref.colsumStock(&acc, &seam);
+        for (std.enums.values(settings.Exl3GateUpForm)) |name| {
+            var z: [16]f32 = undefined;
+            ref.colsumOf(sumOf.gu((settings.Exl3Forms{ .gateup = name }).forms()), &acc, &z);
+            for (seam, z) |p, q| try testing.expectEqual(@as(u32, @bitCast(p)), @as(u32, @bitCast(q)));
+            checked += 1;
+        }
+        for (std.enums.values(settings.Exl3DownForm)) |name| {
+            var z: [16]f32 = undefined;
+            ref.colsumOf(sumOf.dn((settings.Exl3Forms{ .down = name }).forms()), &acc, &z);
+            for (seam, z) |p, q| try testing.expectEqual(@as(u32, @bitCast(p)), @as(u32, @bitCast(q)));
+            checked += 1;
+        }
+    }
+    try testing.expectEqual(ref.colsum_cases * (std.enums.values(settings.Exl3GateUpForm).len + std.enums.values(settings.Exl3DownForm).len), checked);
+    // one expert's decoded output: h and the first two down blocks per (gate / up, down) name against the seam chain
+    const a = testing.allocator;
+    const tbl = try a.create([65536]u16);
+    defer a.destroy(tbl);
+    ref.table(.mul1, tbl);
+    const rec = try a.alignedAlloc(u8, .@"16", ref.record_bytes);
+    defer a.free(rec);
+    ref.synthRecord(0x6d617468, rec);
+    var e = try ref.Expert.init(a, rec, tbl);
+    defer e.deinit(a);
+    var x: [ref.hidden]f32 = undefined;
+    ref.fillX(0x6d61, &x);
+    var hs: [2][ref.inter]f32 = undefined;
+    var ys: [2][ref.hidden]f32 = undefined;
+    for (std.enums.values(ref.ColSum), 0..) |k, i| {
+        @memset(&ys[i], 0);
+        try ref.emuExpertSums(a, &e, &x, &hs[i], &ys[i], 0, 2, k, k);
+    }
+    for (std.enums.values(settings.Exl3GateUpForm)) |gn| for (std.enums.values(settings.Exl3DownForm)) |dnn| {
+        const f = (settings.Exl3Forms{ .gateup = gn, .down = dnn }).forms();
+        const h = &hs[@intFromEnum(sumOf.gu(f))];
+        const y = &ys[@intFromEnum(sumOf.dn(f))];
+        for (hs[0], h) |p, q| try testing.expectEqual(@as(u32, @bitCast(p)), @as(u32, @bitCast(q)));
+        for (ys[0][0..256], y[0..256]) |p, q| try testing.expectEqual(@as(u32, @bitCast(p)), @as(u32, @bitCast(q)));
+    };
 }

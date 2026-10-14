@@ -272,10 +272,26 @@ pub fn emuButterfly(B: *[128]f32) void {
     }
 }
 
+/// A GEMV tile's column sums: `stock` the threadgroup red array (the seam's, gu_one's, down_pair's and the u8 GEMV's),
+/// `registers` the fused forms' g5k3_colsum (g5k3_gu_fused, g5k3_dn_fused, g5k3_dn_pro).
+pub const ColSum = enum { stock, registers };
+
+pub fn colsumOf(kind: ColSum, acc: *const [32][8]f32, z: *[16]f32) void {
+    switch (kind) {
+        .stock => colsumStock(acc, z),
+        .registers => colsumRegisters(acc, z),
+    }
+}
+
 /// The stock GEMV (glm5n_exl3_gemv) of output tile tn: per lane l and weight m an fma chain over the k-tiles, then
 /// red[c][l] = 0 + acc[4..7] (c = l >> 2) / 0 + acc[0..3] (c = l / 4 + 8), column c = 0 + red[c][0..31] in lane order.
 pub fn emuGemvTile(xh: []const f32, w: []const u16, in: u32, out: u32, tn: u32, z: *[16]f32) void {
-    var red: [16][32]f32 = @splat(@splat(0));
+    emuGemvTileSum(xh, w, in, out, tn, .stock, z);
+}
+
+/// `emuGemvTile` with the column sums of `sum` (the per-lane fma chains are every form's).
+pub fn emuGemvTileSum(xh: []const f32, w: []const u16, in: u32, out: u32, tn: u32, sum: ColSum, z: *[16]f32) void {
+    var accs: [32][8]f32 = undefined;
     for (0..32) |li| {
         const l: u32 = @intCast(li);
         var acc: [8]f32 = @splat(0);
@@ -289,16 +305,9 @@ pub fn emuGemvTile(xh: []const f32, w: []const u16, in: u32, out: u32, tn: u32, 
                 acc[mi] = @mulAdd(f32, xh[tk * 16 + dr], wv, acc[mi]);
             }
         }
-        for (0..8) |mi| {
-            const c = (l >> 2) + (if (mi < 4) @as(u32, 8) else 0);
-            red[c][li] += acc[mi];
-        }
+        accs[li] = acc;
     }
-    for (0..16) |c| {
-        var s: f32 = 0;
-        for (0..32) |l| s += red[c][l];
-        z[c] = s;
-    }
+    colsumOf(sum, &accs, z);
 }
 
 /// The fused forms' column sums (header_g5k3.metal g5k3_colsum): column c = 0 + the four lanes' partials in lane order.
@@ -341,6 +350,11 @@ pub fn colsumStock(acc: *const [32][8]f32, z: *[16]f32) void {
 /// The seam chain of one pair in f32 (std exp for gu_epi's): x [hidden] (bf16 values) -> h [inter] f32, and the down
 /// output words of hidden blocks [blk_lo, blk_hi) (f32, before dpost's store rounding).
 pub fn emuExpert(a: std.mem.Allocator, e: *const Expert, x: []const f32, h: []f32, y: []f32, blk_lo: u32, blk_hi: u32) !void {
+    return emuExpertSums(a, e, x, h, y, blk_lo, blk_hi, .stock, .stock);
+}
+
+/// `emuExpert` with the gate / up GEMVs' column sums `gu` and the down GEMV's `dn`.
+pub fn emuExpertSums(a: std.mem.Allocator, e: *const Expert, x: []const f32, h: []f32, y: []f32, blk_lo: u32, blk_hi: u32, gu: ColSum, dn: ColSum) !void {
     const xg = try a.alloc(f32, hidden);
     defer a.free(xg);
     const xu = try a.alloc(f32, hidden);
@@ -354,8 +368,8 @@ pub fn emuExpert(a: std.mem.Allocator, e: *const Expert, x: []const f32, h: []f3
         var bg: [128]f32 = undefined;
         var bu: [128]f32 = undefined;
         for (0..8) |t| {
-            emuGemvTile(xg, e.wg, hidden, inter, blk * 8 + @as(u32, @intCast(t)), bg[t * 16 ..][0..16]);
-            emuGemvTile(xu, e.wu, hidden, inter, blk * 8 + @as(u32, @intCast(t)), bu[t * 16 ..][0..16]);
+            emuGemvTileSum(xg, e.wg, hidden, inter, blk * 8 + @as(u32, @intCast(t)), gu, bg[t * 16 ..][0..16]);
+            emuGemvTileSum(xu, e.wu, hidden, inter, blk * 8 + @as(u32, @intCast(t)), gu, bu[t * 16 ..][0..16]);
         }
         emuButterfly(&bg);
         emuButterfly(&bu);
@@ -380,7 +394,7 @@ pub fn emuExpert(a: std.mem.Allocator, e: *const Expert, x: []const f32, h: []f3
     var hb = blk_lo;
     while (hb < blk_hi) : (hb += 1) {
         var bd: [128]f32 = undefined;
-        for (0..8) |t| emuGemvTile(xd, e.wd, inter, hidden, hb * 8 + @as(u32, @intCast(t)), bd[t * 16 ..][0..16]);
+        for (0..8) |t| emuGemvTileSum(xd, e.wd, inter, hidden, hb * 8 + @as(u32, @intCast(t)), dn, bd[t * 16 ..][0..16]);
         emuButterfly(&bd);
         for (0..128) |c| y[hb * 128 + c] = (bd[c] * SCALE) * @as(f32, @floatCast(h16(od[hb * 128 + c])));
     }
@@ -408,6 +422,25 @@ pub fn members(ids: []const u32, e: usize, maxm: u32, mem: []u32) u32 {
     }
     return n;
 }
+
+/// Case `it` of the column-sum identity's 2,000 (the CPU test's generator, the forms' parity test reuses it): random
+/// accumulators with signed zeros, small integers (cancellation) and values over 2^-15 .. 2^16; every fifth case all -0.
+pub fn colsumCase(s: *u64, it: usize, acc: *[32][8]f32) void {
+    for (acc) |*row| for (row) |*v| {
+        const z = ek.splitmix64(s);
+        v.* = switch (z % 7) {
+            0 => -0.0,
+            1 => 0.0,
+            2 => @as(f32, @floatFromInt(@as(i32, @intCast(z >> 40 & 0xff)) - 128)),
+            else => @as(f32, @floatCast((unit(z) - 0.5) * std.math.pow(f64, 2.0, @as(f64, @floatFromInt(@as(i32, @intCast(z >> 56 & 31)) - 15))))),
+        };
+    };
+    if (it % 5 == 0) for (acc) |*row| for (row) |*v| {
+        v.* = -0.0;
+    };
+}
+
+pub const colsum_cases: usize = 2000;
 
 // ── Tests ──
 
@@ -472,19 +505,8 @@ test "glm5_next exl3 ref: decode and forward equal exl3_ref.py on the fixture ex
 test "glm5_next exl3 ref: the fused forms' register column sums equal the stock threadgroup sums bit for bit (signed zeros, cancellation, random)" {
     var s: u64 = 7;
     var acc: [32][8]f32 = undefined;
-    for (0..2000) |it| {
-        for (&acc) |*row| for (row) |*v| {
-            const z = ek.splitmix64(&s);
-            v.* = switch (z % 7) {
-                0 => -0.0,
-                1 => 0.0,
-                2 => @as(f32, @floatFromInt(@as(i32, @intCast(z >> 40 & 0xff)) - 128)),
-                else => @as(f32, @floatCast((unit(z) - 0.5) * std.math.pow(f64, 2.0, @as(f64, @floatFromInt(@as(i32, @intCast(z >> 56 & 31)) - 15))))),
-            };
-        };
-        if (it % 5 == 0) for (&acc) |*row| for (row) |*v| {
-            v.* = -0.0;
-        };
+    for (0..colsum_cases) |it| {
+        colsumCase(&s, it, &acc);
         var p: [16]f32 = undefined;
         var q: [16]f32 = undefined;
         colsumStock(&acc, &p);
