@@ -51,6 +51,41 @@ pub const Lanes = struct {
     latent: *Lane,
     index: *Lane,
     tail: *Tail,
+    /// The MTP head's draft rows of a round (`Side`; null: every call appends to the lanes).
+    side: ?*Side = null,
+};
+
+/// The MTP head's draft rows of a round, kept beside its lanes: a draft step past the round's first (`on`) stores its
+/// latent and index rows here, not in the lanes, and its attention reads the lanes' rows below `base` and these after them
+/// (the side texts: `ops.decodeSelectSide`, `dsa_decode.attendSide`; the same keys in the same order, exact). The round's
+/// draft rows left the lanes at its end anyway (mtp.zig `draft`), and the chain runs its steps in one device graph, where an
+/// append after the previous step's readers of the same lane could never be donated (MLX holds an encoded op's inputs
+/// until its command buffer completes): every draft step copied both lanes.
+pub const Side = struct {
+    lat: ?T = null,
+    idx: ?T = null,
+    /// The lanes' rows (positions below `base`) when the first side row came.
+    base: u32 = 0,
+    n: u32 = 0,
+    on: bool = false,
+
+    pub fn reset(self: *Side, g: *G) void {
+        if (self.lat) |x| g.release(x);
+        if (self.idx) |x| g.release(x);
+        self.* = .{};
+    }
+
+    fn push(self: *Side, g: *G, lat: T, idx: T) !void {
+        const nl = if (self.lat) |x| try g.concat(&.{ x, lat }, 1) else lat;
+        const ni = if (self.idx) |x| try g.concat(&.{ x, idx }, 1) else idx;
+        const kl = g.keep(nl);
+        const ki = g.keep(ni);
+        if (self.lat) |x| g.release(x);
+        if (self.idx) |x| g.release(x);
+        self.lat = kl;
+        self.idx = ki;
+        self.n += @intCast(g.shapeOf(lat).dim(1));
+    }
 };
 
 /// The stored index rows of the last `cap` positions (at most) before `end`, kept beside the index lane: the pooled-keys
@@ -178,11 +213,34 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
     // the tail kept beside the lane (`Tail`), so nothing reads the index lane before its append below and MLX donates its
     // buffer to the append (in place).
     const idx_rows = try indexRows(g, lanes.tail, ikn, gate, w.idx_ape, start, ix);
-    try lanes.latent.append(g, lat);
-    try lanes.index.append(g, idx_rows);
     const t: c_int = @intCast(start + @as(u32, @intCast(rows)));
-    const latent4 = try g.reshape(((try lanes.latent.view(g)) orelse unreachable), &.{ 1, 1, t, r });
-    const index_view = (try lanes.index.view(g)) orelse unreachable;
+    // The MTP head's draft step past the round's first (`Side`): its rows beside the lanes, the lanes untouched.
+    const side: ?*Side = if (lanes.side) |sd| (if (sd.on) sd else null) else null;
+    var latent4: T = undefined;
+    var index_view: T = undefined;
+    // Side, sparse: the lanes' views (rows below `base`) and the side rows, read by the side texts.
+    var side_sparse = false;
+    if (side) |sd| {
+        if (sd.n == 0) sd.base = start;
+        std.debug.assert(rows == 1 and start == sd.base + sd.n and lanes.latent.len == sd.base and lanes.index.len == sd.base);
+        try sd.push(g, lat, idx_rows);
+        const lv = (try lanes.latent.view(g)) orelse return error.Glm5NextHeadLaneEmpty;
+        const iv = (try lanes.index.view(g)) orelse return error.Glm5NextHeadLaneEmpty;
+        if (ops.selectsAll(t, ix)) {
+            // Every key read: the keys in order (the lanes' rows, then the side's), as the appended lane would hold them.
+            latent4 = try g.reshape(try g.concat(&.{ lv, sd.lat.? }, 1), &.{ 1, 1, t, r });
+            index_view = try g.concat(&.{ iv, sd.idx.? }, 1);
+        } else {
+            side_sparse = true;
+            latent4 = try g.reshape(lv, &.{ 1, 1, @intCast(sd.base), r });
+            index_view = iv;
+        }
+    } else {
+        try lanes.latent.append(g, lat);
+        try lanes.index.append(g, idx_rows);
+        latent4 = try g.reshape(((try lanes.latent.view(g)) orelse unreachable), &.{ 1, 1, t, r });
+        index_view = (try lanes.index.view(g)) orelse unreachable;
+    }
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
     // A row before `dense_end` reads every earlier token (all its pools fit the top-k): a prompt runs those rows causally
@@ -218,6 +276,12 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
             const q_idx = try g.reshape(try fp8.project(g, w.idx_wq_b, qr_s), &.{ 1, n, ih, ihd });
             const x_s = try g.slice(x, &.{ 0, sparse_from, 0 }, &.{ 1, rows, @intCast(c.hidden_size) }, &.{ 1, 1, 1 });
             const wts = try g.mul(try g.astype(try linear(g, x_s, w.idx_wproj), .float32), try g.scalar(1.0 / @sqrt(@as(f64, @floatFromInt(ih))), .float32));
+            if (side_sparse) {
+                // The MTP head's draft step over the lanes and the round's draft rows (`Side`): exact (the same keys).
+                const sd = side.?;
+                const sel = try g.adopt(try ops.decodeSelectSide(g.s, q_idx, wts, index_view, sd.idx.?, ix, t - 1, @divTrunc(t, ix.kpool), @intCast(sd.base)));
+                break :blk try dsa_decode.attendSide(g, routes.sparse orelse return error.Glm5NextHeadSideNeedsFused, q_abs, latent4, try g.reshape(sd.lat.?, &.{ 1, 1, @intCast(sd.n), r }), sel, sd.base);
+            }
             const idx_cache = try g.reshape(index_view, &.{ 1, t, 2 * ihd });
             // Profile builds, the prompt timeline recording: the indexer's inputs committed under `attn`, so each mark
             // of the split (`ops.selectRows`: indexer, topk; here: sparse) times only its own work.

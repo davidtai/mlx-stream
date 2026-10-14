@@ -639,12 +639,12 @@ pub const Module = struct {
         if (self.cache.inPlace(&self.g)) |n| {
             const nd = self.c.model.nDsa();
             const word = [2][]const u8{ "moved", "in_place" };
-            var hb: [160]u8 = undefined;
+            var hb: [200]u8 = undefined;
             const head: []const u8 = if (self.mtp) |lane| blk: {
-                const h = lane.inPlace(&self.g) catch break :blk "mtp_head=unread";
-                break :blk std.fmt.bufPrint(&hb, "mtp_head_latent={s}/{s} mtp_head_index={s}/{s}", .{ word[@intFromBool(h.whole[0])], word[@intFromBool(h.decode[0])], word[@intFromBool(h.whole[1])], word[@intFromBool(h.decode[1])] }) catch "mtp_head=?";
-            } else "mtp_head=none";
-            log.info("glm5_next dsa lanes over the request: latent in_place {d}/{d} index in_place {d}/{d}; decode only: latent in_place {d}/{d} index in_place {d}/{d}; {s} (whole/decode)\n", .{ n.whole[0], nd, n.whole[1], nd, n.decode[0], nd, n.decode[1], nd, head });
+                const h = lane.inPlace(&self.g) catch break :blk "mtp_head unread";
+                break :blk std.fmt.bufPrint(&hb, "mtp_head whole latent={s} index={s}; mtp_head decode latent={s} index={s}", .{ word[@intFromBool(h.whole[0])], word[@intFromBool(h.whole[1])], word[@intFromBool(h.decode[0])], word[@intFromBool(h.decode[1])] }) catch "mtp_head ?";
+            } else "mtp_head none";
+            log.info("glm5_next dsa lanes over the request (in place = the buffer kept): trunk whole latent={d}/{d} index={d}/{d}; trunk decode latent={d}/{d} index={d}/{d}; {s}\n", .{ n.whole[0], nd, n.whole[1], nd, n.decode[0], nd, n.decode[1], nd, head });
         } else |_| {}
         const s1 = self.srcStats();
         const tok_s: f64 = if (d.wall_ns > 0) @as(f64, @floatFromInt(d.tokens)) * 1e9 / @as(f64, @floatFromInt(d.wall_ns)) else 0;

@@ -239,6 +239,119 @@
     1,
     1
    ]
+  },
+  {
+   "class": "bit-identical to glm5n_dsa_sparse_split_lean (the gather's source by row: the MTP head's draft steps)",
+   "family": "dsa",
+   "grid": [
+    "NS*32*HG",
+    "H/HG",
+    "S"
+   ],
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "q",
+     "shape": [
+      1,
+      "H",
+      "S",
+      "R"
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "lat",
+     "shape": [
+      "T",
+      "R"
+     ]
+    },
+    {
+     "dtype": "int32",
+     "name": "sel",
+     "shape": [
+      "S",
+      "W"
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "side",
+     "shape": [
+      "N",
+      "R"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "consts",
+     "shape": [
+      8
+     ]
+    },
+    {
+     "dtype": "int32",
+     "name": "rows_in",
+     "shape": [
+      8
+     ]
+    }
+   ],
+   "instances": [
+    {
+     "BK": 16,
+     "HG": 16,
+     "NS": 16,
+     "R": 512,
+     "S": 1
+    }
+   ],
+   "name": "glm5n_dsa_sparse_split_lean_side",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "pacc",
+     "shape": [
+      "H*S",
+      "NS",
+      "R"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "pm",
+     "shape": [
+      "H*S",
+      "NS"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "pl",
+     "shape": [
+      "H*S",
+      "NS"
+     ]
+    }
+   ],
+   "pattern": "glm5n_dsa_sparse_split_lean over the lane's rows and the round's draft rows (one query row)",
+   "source": {
+    "bytes": 4402,
+    "file": "glm5n_dsa_sparse_split_lean_side.metal",
+    "sha256": "d348ea32b840a512302b4eed40dbbaa8c06f6c8569c41d31f7fcbbc0438b182e"
+   },
+   "template": [
+    "T",
+    "R",
+    "HG",
+    "BK"
+   ],
+   "threadgroup": [
+    "32*HG",
+    1,
+    1
+   ]
   }
  ],
  "lane": "glm5next/decode-stack (decode_dsa: fused; dsa_split_form: current | lean)",
