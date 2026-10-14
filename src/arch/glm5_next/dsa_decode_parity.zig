@@ -111,6 +111,15 @@ test "glm5next dsa decode GPU: the split / merge texts against the f64 reference
         defer a.free(got_lean);
         try testing.expectEqualSlices(u32, @as([*]const u32, @ptrCast(got.ptr))[0..got.len], @as([*]const u32, @ptrCast(got_lean.ptr))[0..got_lean.len]);
         std.debug.print("GLM5N_DSA_SPLIT_LEAN rows={d} identical=yes\n", .{rows});
+        if (rows == 1) {
+            // The side text (the MTP head's draft steps): the lane's first lanes - 3 rows and its last three as side rows.
+            const lane_view = try g.slice(lat, &.{ 0, 0, 0, 0 }, &.{ 1, 1, @intCast(lanes - 3), @intCast(R) }, &.{ 1, 1, 1, 1 });
+            const side = try g.hostArray(std.mem.sliceAsBytes(lat_h[(lanes - 3) * R ..]), &.{ 1, 1, 3, @intCast(R) }, .bfloat16);
+            const got_side = try hostF32(&g, a, try dsa_decode.attendSide(&g, &kl, q, lane_view, side, sel, @intCast(lanes - 3)));
+            defer a.free(got_side);
+            try testing.expectEqualSlices(u32, @as([*]const u32, @ptrCast(got.ptr))[0..got.len], @as([*]const u32, @ptrCast(got_side.ptr))[0..got_side.len]);
+            std.debug.print("GLM5N_DSA_SPLIT_SIDE rows=1 identical=yes\n", .{});
+        }
         const chain = try hostF32(&g, a, try g.adopt(try ops.sparseLatentAttention(s, q, lat, sel, @floatCast(scale), 64)));
         defer a.free(chain);
         // The f64 reference, [1, H, rows, R].

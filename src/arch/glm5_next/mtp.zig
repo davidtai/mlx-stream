@@ -802,6 +802,11 @@ pub const Lane = struct {
     addr_dec: [2]usize = .{ 0, 0 },
     /// The head's index tail (dsa.zig `Tail`).
     tail: dsa.Tail = .{},
+    /// The round's draft rows beside the lanes (dsa.zig `Side`): a draft step past the round's first stores its rows here
+    /// and reads the lanes + these (installed with the fused DSA decode texts: `routes.sparse`); `chain_start` the round's
+    /// first draft position while the chain runs (null otherwise).
+    side: dsa.Side = .{},
+    chain_start: ?u32 = null,
 
     /// The lane over the pack at `dir`: the draft bank (refused by name when absent), the head bound from `map` (the
     /// arch's weight map with the MTP layer's residents kept and read), every record read into the bank's MLX arrays and
@@ -896,6 +901,7 @@ pub const Lane = struct {
     pub fn deinit(self: *Lane, g: *G) void {
         if (self.pending) |p| g.release(p);
         self.tail.reset(g);
+        self.side.reset(g);
         self.latent.deinit(g);
         self.index.deinit(g);
         self.slots.deinit();
@@ -936,7 +942,7 @@ pub const Lane = struct {
     }
 
     fn lanes(self: *Lane) dsa.Lanes {
-        return .{ .latent = &self.latent, .index = &self.index, .tail = &self.tail };
+        return .{ .latent = &self.latent, .index = &self.index, .tail = &self.tail, .side = if (self.routes.sparse != null) &self.side else null };
     }
 
     /// A serial step of `rows` after the trunk's `len` positions is one the lane keeps (`pend`): the lane follows the
@@ -1005,6 +1011,8 @@ pub const Lane = struct {
     /// the output [n, hidden].
     fn layer(self: *Lane, g: *G, x: T, start: u32) !T {
         const c = self.c;
+        // A draft step past the round's first: its rows beside the lanes (`Side`).
+        self.side.on = if (self.chain_start) |cs| start > cs else false;
         const n = g.shapeOf(x).dim(0);
         const h: c_int = @intCast(c.hidden_size);
         const a_in = try graph.rmsNorm(g, x, self.head.input_norm, c.rms_norm_eps);
@@ -1095,6 +1103,12 @@ pub const Lane = struct {
         const m0 = g.mark();
         defer g.resetTo(m0);
         const start = self.pairs();
+        // The chain's steps past its first keep their rows beside the lanes (`Side`), released after the chain's eval.
+        self.chain_start = start;
+        defer {
+            self.chain_start = null;
+            self.side.reset(g);
+        }
         try self.chain(self, g, w, try self.input(g, w, &.{t1}, self.pending.?), start, depth, out, q, sm, len);
         self.latent.truncateTo(start + 1);
         self.index.truncateTo(start + 1);

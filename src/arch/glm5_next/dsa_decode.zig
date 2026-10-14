@@ -53,13 +53,15 @@ pub const texts = struct {
     pub const manifest = @embedFile("kernels/manifest-dsa.json");
     pub const split = @embedFile("kernels/glm5n_dsa_sparse_split.metal");
     pub const split_lean = @embedFile("kernels/glm5n_dsa_sparse_split_lean.metal");
+    pub const split_side = @embedFile("kernels/glm5n_dsa_sparse_split_lean_side.metal");
     /// MiMo's merge text, unchanged (its own pin: mimo_v2/decode_attention.zig `text_pins`).
     pub const merge = @embedFile("../mimo_v2/kernels/dec_attn_merge.metal");
 };
-pub const manifest_sha256 = "a67dd8ade913ce530a5a65d6eb308536a994d043f038a93678c77355e36b7130";
+pub const manifest_sha256 = "fa2af3154e43bee9101fd97bb8a304d1cd110a395c6f2588f90fa406d76a8594";
 pub const text_pins = [_]kset.TextPin{
     .{ .file = "glm5n_dsa_sparse_split.metal", .text = texts.split, .sha256 = "b0978989050147499611e36b47d16ec077953521cb7ab4837adb36d19d694636" },
     .{ .file = "glm5n_dsa_sparse_split_lean.metal", .text = texts.split_lean, .sha256 = "5949c0a2da9279efa35e9ce6eff7fe72315acb90b1e59881b722067e20c186bc" },
+    .{ .file = "glm5n_dsa_sparse_split_lean_side.metal", .text = texts.split_side, .sha256 = "d348ea32b840a512302b4eed40dbbaa8c06f6c8569c41d31f7fcbbc0438b182e" },
 };
 /// MiMo's pin of dec_attn_merge.metal (mimo_v2/decode_attention.zig): the merge is its text, byte for byte.
 pub const merge_sha256 = "1c43462d81fe43b9eb6988346685518d8f812880bcba61ee7f4b42be57aa8a2a";
@@ -83,6 +85,9 @@ pub const Kernels = struct {
     form: SplitForm = .current,
     split: Kernel = .{ .ctx = null },
     merge: Kernel = .{ .ctx = null },
+    /// The MTP head's draft steps (`attendSide`): the lean split over the lane's rows and the round's draft rows, one row.
+    split_side: Kernel = .{ .ctx = null },
+    side_cfg: Config = .{ .ctx = null },
     /// Index rows - 1.
     split_cfg: [max_rows]Config = @splat(.{ .ctx = null }),
     merge_cfg: [max_rows]Config = @splat(.{ .ctx = null }),
@@ -90,10 +95,10 @@ pub const Kernels = struct {
     consts: T = .{ .ctx = null },
 
     pub fn deinit(k: *Kernels) void {
-        for ([_]Kernel{ k.split, k.merge }) |x| if (x.ctx != null) {
+        for ([_]Kernel{ k.split, k.merge, k.split_side }) |x| if (x.ctx != null) {
             _ = mtl.mlx_fast_metal_kernel_free(x);
         };
-        for (k.split_cfg ++ k.merge_cfg) |c| if (c.ctx != null) {
+        for (k.split_cfg ++ k.merge_cfg ++ [_]Config{k.side_cfg}) |c| if (c.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(c);
         };
         if (k.consts.ctx != null) _ = mlx.mlx_array_free(k.consts);
@@ -133,6 +138,23 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const glm.Config, fo
         .lean => try makeKernel("glm5n_dsa_sparse_split_lean", &.{ "q", "lat", "sel", "consts" }, &.{ "pacc", "pm", "pl" }, texts.split_lean, "#include <metal_simdgroup>\n"),
     };
     k.merge = try makeKernel("glm5n_dsa_merge", &.{ "pacc", "pm", "pl" }, &.{"out"}, texts.merge, "");
+    k.split_side = try makeKernel("glm5n_dsa_sparse_split_lean_side", &.{ "q", "lat", "sel", "side", "consts", "rows_in" }, &.{ "pacc", "pm", "pl" }, texts.split_side, "#include <metal_simdgroup>\n");
+    {
+        // One query row at the lean form's head group (the side text is the lean split's arithmetic).
+        const sg = splitGrid(c.n_heads, 1, head_group_lean);
+        const cs = mlx.mlx_fast_metal_kernel_config_new();
+        k.side_cfg = cs;
+        const hh: c_int = @intCast(c.n_heads);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cs, &[_]c_int{ hh, @intCast(slices), @intCast(latent) }, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cs, &[_]c_int{ hh, @intCast(slices) }, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cs, &[_]c_int{ hh, @intCast(slices) }, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cs, sg[0], sg[1], sg[2]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cs, @intCast(32 * head_group_lean), 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cs, "T", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cs, "R", @intCast(latent)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cs, "HG", @intCast(head_group_lean)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cs, "BK", @intCast(tile_keys)));
+    }
     const heads: c_int = @intCast(c.n_heads);
     const r: c_int = @intCast(latent);
     const ns: c_int = @intCast(slices);
@@ -181,7 +203,9 @@ fn compileCheck(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const glm.Config, k
     for (&sel, 0..) |*x, i| x.* = if (i % 5 == 4) -1 else @intCast(i);
     const sa = try g.hostArray(std.mem.sliceAsBytes(&sel), &.{ 1, 1, 40 }, .int32);
     const o = try attend(&g, k, q, lat, sa, 1);
-    try g.evalAll(&.{o});
+    const side = try g.zeros(&.{ 1, 1, 4, @intCast(latent) }, .bfloat16);
+    const os = try attendSide(&g, k, q, lat, side, sa, 36);
+    try g.evalAll(&.{ o, os });
     if (!std.mem.eql(c_int, g.shapeOf(o).slice(), &[_]c_int{ 1, heads, 1, @intCast(latent) })) return error.Glm5NextDsaDecodeShape;
 }
 
@@ -221,11 +245,51 @@ pub fn attend(g: *G, k: *const Kernels, q_abs: T, lat: T, sel: T, rows: u32) !T 
     return g.adopt(out);
 }
 
+/// The MTP head's draft step (dsa.zig `Side`): one query row q_abs [1, H, 1, R] over the latent rows `sel` [1, 1, W] selects,
+/// rows below `lane_rows` from the lane's view `lat` [1, 1, >= lane_rows, R] and the rest from `side` [1, 1, n, R] (the
+/// round's draft rows) -> [1, H, 1, R] bf16. The lean split's arithmetic with the gather's source by row, MiMo's merge: bit
+/// for bit `attend` over the lane with the draft rows appended. Two dispatches.
+pub fn attendSide(g: *G, k: *const Kernels, q_abs: T, lat: T, side: T, sel: T, lane_rows: u32) !T {
+    const lsh = g.shapeOf(lat);
+    const ssh = g.shapeOf(side);
+    const lat2 = try g.reshape(lat, &.{ lsh.dim(-2), lsh.dim(-1) });
+    const side2 = try g.reshape(side, &.{ ssh.dim(-2), ssh.dim(-1) });
+    const sel2 = try g.reshape(sel, &.{ 1, g.shapeOf(sel).dim(-1) });
+    const rows_in = try g.hostArray(std.mem.sliceAsBytes(&[8]i32{ @intCast(lane_rows), 0, 0, 0, 0, 0, 0, 0 }), &.{8}, .int32);
+    var parts: [3]T = undefined;
+    {
+        const in = mlx.mlx_vector_array_new_data(&[_]T{ q_abs, lat2, sel2, side2, k.consts, rows_in }, 6);
+        defer _ = mlx.mlx_vector_array_free(in);
+        var ov = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ov);
+        try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, k.split_side, in, k.side_cfg, g.s));
+        for (&parts, 0..) |*p, i| {
+            var x = mlx.mlx_array_new();
+            mlx.check(mlx.mlx_vector_array_get(&x, ov, i)) catch |e| {
+                _ = mlx.mlx_array_free(x);
+                return e;
+            };
+            p.* = try g.adopt(x);
+        }
+    }
+    const in = mlx.mlx_vector_array_new_data(&parts, 3);
+    defer _ = mlx.mlx_vector_array_free(in);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, k.merge, in, k.merge_cfg[0], g.s));
+    var out = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_vector_array_get(&out, ov, 0)) catch |e| {
+        _ = mlx.mlx_array_free(out);
+        return e;
+    };
+    return g.adopt(out);
+}
+
 const testing = std.testing;
 
 test "glm5_next dsa_decode: the embedded manifest and the split text are the pinned ones; the merge is MiMo's text" {
     try checkPins();
-    try kset.expectManifestPins(texts.manifest, &text_pins, 2);
+    try kset.expectManifestPins(texts.manifest, &text_pins, 3);
     try testing.expect(std.mem.eql(u8, texts.merge, @embedFile("../mimo_v2/kernels/dec_attn_merge.metal")));
 }
 
@@ -272,6 +336,9 @@ const Emu = struct {
     lat: []const u16, // [lanes, latent]
     sel: []const i32, // [rows, width]
     scale: f32,
+    /// The side text (`attendSide`): rows at or past `lane_rows` gathered from `side` (row - lane_rows).
+    side: []const u16 = &.{},
+    lane_rows: usize = std.math.maxInt(usize),
     pacc: []f32, // [heads * rows, slices, latent]
     pm: []f32,
     pl: []f32,
@@ -310,7 +377,10 @@ fn emulate(e: Emu, lean: bool) void {
             const rows = @min(BK, k1 - c0);
             for (0..BK) |r| {
                 const src: i32 = if (r < rows) e.sel[qs * W + c0 + r] else -1;
-                for (0..R) |d| ks[r * R + d] = if (src >= 0) e.lat[@as(usize, @intCast(src)) * R + d] else 0;
+                for (0..R) |d| ks[r * R + d] = if (src < 0) 0 else blk: {
+                    const u: usize = @intCast(src);
+                    break :blk if (u < e.lane_rows) e.lat[u * R + d] else e.side[(u - e.lane_rows) * R + d];
+                };
                 kid[r] = src;
             }
             for (0..hg) |sg| {
@@ -437,4 +507,47 @@ test "glm5_next dsa_decode: dsa_split_form lean's partials (pacc, pm, pl) are th
         defer for (&outs) |*o| for (o) |x| a.free(x);
         for (0..3) |i| try testing.expectEqualSlices(u32, @as([*]const u32, @ptrCast(outs[0][i].ptr))[0..outs[0][i].len], @as([*]const u32, @ptrCast(outs[1][i].ptr))[0..outs[1][i].len]);
     };
+}
+
+test "glm5_next dsa_decode: the side text (the MTP head's draft steps) gives the lean split's partials over the lane with the draft rows appended, bit for bit (CPU emulator)" {
+    const a = testing.allocator;
+    const R = latent;
+    const lane_rows: usize = 3000;
+    const n_side: usize = 3;
+    var prng = std.Random.DefaultPrng.init(0x73696465);
+    const rng = prng.random();
+    const bf = struct {
+        fn of(x: f32) u16 {
+            const b: u32 = @bitCast(x);
+            return @truncate((b +% 0x7FFF +% ((b >> 16) & 1)) >> 16);
+        }
+    };
+    const full = try a.alloc(u16, (lane_rows + n_side) * R);
+    defer a.free(full);
+    for (full) |*x| x.* = bf.of(rng.floatNorm(f32));
+    const heads: usize = 16;
+    const width: usize = 2051;
+    const q = try a.alloc(u16, heads * R);
+    defer a.free(q);
+    for (q) |*x| x.* = bf.of(0.5 * rng.floatNorm(f32));
+    // 2,048 pooled rows in increasing order, then the open pool's rows: the last ones the side's (positions >= lane_rows).
+    const sel = try a.alloc(i32, width);
+    defer a.free(sel);
+    for (sel[0..2048], 0..) |*x, j| x.* = @intCast(j + (lane_rows + n_side - 2051));
+    for (sel[2048..], 0..) |*x, j| x.* = @intCast(lane_rows + j);
+    var outs: [2][3][]f32 = undefined;
+    for (&outs, 0..) |*o, f| {
+        o[0] = try a.alloc(f32, heads * slices * R);
+        o[1] = try a.alloc(f32, heads * slices);
+        o[2] = try a.alloc(f32, heads * slices);
+        var e: Emu = .{ .heads = heads, .rows = 1, .width = width, .q = q, .lat = full, .sel = sel, .scale = 1.0 / 16.0, .pacc = o[0], .pm = o[1], .pl = o[2] };
+        if (f == 1) {
+            e.lat = full[0 .. lane_rows * R];
+            e.side = full[lane_rows * R ..];
+            e.lane_rows = lane_rows;
+        }
+        emulate(e, true);
+    }
+    defer for (&outs) |*o| for (o) |x| a.free(x);
+    for (0..3) |i| try testing.expectEqualSlices(u32, @as([*]const u32, @ptrCast(outs[0][i].ptr))[0..outs[0][i].len], @as([*]const u32, @ptrCast(outs[1][i].ptr))[0..outs[1][i].len]);
 }

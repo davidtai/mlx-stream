@@ -6,7 +6,7 @@ and the indexer's pooled-rows text (ops.zig POOLED_ROWS_SOURCE: the lane buffer,
 with the Metal shader compiler in MLX's JIT math mode (safe). Nothing runs on the GPU.
 
   scripts/compile_glm5next_dsa_offline.py --mlx-include <stage>/include
-Prints KERNELS_OFFLINE_COMPILE PASS n=<instantiations> kernels=3 or ... FAIL failed=<f>/<n>; exit 0 / 1 (2: usage)."""
+Prints KERNELS_OFFLINE_COMPILE PASS n=<instantiations> kernels=5 or ... FAIL failed=<f>/<n>; exit 0 / 1 (2: usage)."""
 import argparse
 import os
 import re
@@ -48,11 +48,28 @@ def main():
                  "outputs": [{"name": "pacc", "dtype": "float32"}, {"name": "pm", "dtype": "float32"}, {"name": "pl", "dtype": "float32"}]}
             tmpl = [{"name": "T", "dtype": "bfloat16"}, {"name": "R", "int": R}, {"name": "HG", "int": hg}, {"name": "BK", "int": BK}]
             jobs.append(("%s_s%d" % (k["name"], s), cko.assemble(k, {"source": src, "header": "#include <metal_simdgroup>\n"}, (tmpl, None, {}))))
+    side = open(os.path.join(KDIR, "glm5n_dsa_sparse_split_lean_side.metal")).read()
+    ks = {"name": "glm5n_dsa_sparse_split_lean_side", "inputs": [inp("q", "bfloat16", H * R), inp("lat", "bfloat16", T * R),
+                                                                 {"name": "sel", "dtype": "int32", "shape": [{"m": 1}, {"m": W}]}, inp("side", "bfloat16", 3 * R),
+                                                                 inp("consts", "float32", 8), inp("rows_in", "int32", 8)],
+          "outputs": [{"name": "pacc", "dtype": "float32"}, {"name": "pm", "dtype": "float32"}, {"name": "pl", "dtype": "float32"}]}
+    jobs.append(("split_side_s1", cko.assemble(ks, {"source": side, "header": "#include <metal_simdgroup>\n"},
+                                               ([{"name": "T", "dtype": "bfloat16"}, {"name": "R", "int": R}, {"name": "HG", "int": 16}, {"name": "BK", "int": BK}], None, {}))))
     ops = open(OPS).read()
     pooled = "\n".join(l.strip()[2:] for l in re.search(r"const POOLED_ROWS_SOURCE =\n(.*?)\n;", ops, re.S)[1].splitlines())
     kp = {"name": "glm5_dsa_pooled_rows", "inputs": [inp("prev", "bfloat16", 32768 * 2 * DH), inp("key", "bfloat16", 4 * DH), inp("gate", "float32", 4 * DH),
                                                      inp("ape", "float32", KPOOL * DH), inp("dims", "int32", 8)],
           "outputs": [{"name": "out", "dtype": "bfloat16"}]}
+    # the side scores text (ops.zig DEC_SCORE_SIDE_SOURCE: the one-query binding + the lane / side pooled key), assembled from
+    # its pieces as Zig joins them
+    def lit(name):
+        return "\n".join(l.strip()[2:] for l in re.search(r"const %s =\n(.*?)\n;" % name, ops, re.S)[1].splitlines())
+    sside = lit("DEC_SCORE_ONE") + "\n" + "const int lane_rows = dims[2];\n" + lit("DEC_SCORE_BODY_A") + "\n" + lit("DEC_SCORE_POOLED_SIDE") + "\n" + lit("DEC_SCORE_BODY_B")
+    kss = {"name": "glm5_dsa_decode_scores_side", "inputs": [inp("cache", "bfloat16", 32768 * 2 * DH), inp("side", "bfloat16", 3 * 2 * DH),
+                                                             inp("q", "bfloat16", 32 * DH), inp("w", "float32", 32), inp("dims", "int32", 8)],
+           "outputs": [{"name": "out", "dtype": "float32"}]}
+    jobs.append(("scores_side", cko.assemble(kss, {"source": sside, "header": ""}, ([{"name": "T", "dtype": "bfloat16"}, {"name": "DH", "int": DH}, {"name": "KPOOL", "int": KPOOL},
+                                                                                   {"name": "SGS", "int": 8}, {"name": "PPS", "int": 4}], None, {}))))
     jobs.append(("pooled", cko.assemble(kp, {"source": pooled, "header": ""}, ([{"name": "T", "dtype": "bfloat16"}, {"name": "KPOOL", "int": KPOOL}, {"name": "DH", "int": DH}], None, {}))))
     tmp = tempfile.mkdtemp(prefix="glm5n-dsa-offline-")
     bad = 0
@@ -67,9 +84,9 @@ def main():
             print("KERNELS_OFFLINE_COMPILE_ERROR %s :: %s" % (name, " | ".join(err)[:1500]))
     shutil.rmtree(tmp, ignore_errors=True)
     if bad:
-        print("KERNELS_OFFLINE_COMPILE FAIL failed=%d/%d kernels=3" % (bad, len(jobs)))
+        print("KERNELS_OFFLINE_COMPILE FAIL failed=%d/%d kernels=5" % (bad, len(jobs)))
         return 1
-    print("KERNELS_OFFLINE_COMPILE PASS n=%d kernels=3" % len(jobs))
+    print("KERNELS_OFFLINE_COMPILE PASS n=%d kernels=5" % len(jobs))
     return 0
 
 
