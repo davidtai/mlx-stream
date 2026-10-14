@@ -193,7 +193,9 @@ pub const Module = struct {
         };
         errdefer self.routes.dsa.select.?.destroy();
         if (self.routes.dsa.select.?.route() == .batched)
-            log.info("glm5_next dsa select: route=batched (a verify window's rows in one indexer scores launch and one top-k launch, the one-query body per row; compile check passed)\n", .{});
+            log.info("glm5_next dsa select: route=batched (a verify window's rows in one indexer scores launch and one top-k launch, the one-query body per row; compile check passed)\n", .{})
+        else
+            log.info("glm5_next dsa select: route=per_row (a verify window's rows each in its own indexer scores and top-k launch; the control)\n", .{});
         // The decode lane's sparse latent attention (`decode_dsa`): the fused texts installed here (before the MTP lane
         // opens: its head's DSA layer takes the same route), refused by name; the op chain otherwise.
         if (self.c.decode_dsa == .fused) {
@@ -300,8 +302,8 @@ pub const Module = struct {
         const warm_route = self.c.warmRoute(gpu_warm.gpuStream(s));
         if (warm_route != self.c.gpu_keep_warm) log.info("glm5_next route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits)\n", .{@tagName(self.c.gpu_keep_warm)});
         self.src = switch (self.c.expert_family) {
-            .nvfp4 => .{ .nvfp4 = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.prompt, self.c.missReadsRoute(), self.c.hit_wave) },
-            .exl3 => .{ .exl3 = try experts.Exl3Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.prompt, self.c.missReadsRoute(), self.c.hit_wave) },
+            .nvfp4 => .{ .nvfp4 = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.prompt, self.c.missReadsRoute(), self.c.hitWaveRoute()) },
+            .exl3 => .{ .exl3 = try experts.Exl3Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.prompt, self.c.missReadsRoute(), self.c.hitWaveRoute()) },
         };
         errdefer switch (self.src) {
             inline else => |x| x.deinit(),
