@@ -983,19 +983,19 @@ test "glm5_next prompt route: the served pass unless logits_dump_dir names a dir
     try testing.expectEqual(PromptRoute.dump, promptRoute(&lane_c));
 }
 
-test "glm5_next ttft_tail: deferred installs the served and the lane's prompt passes without their tail, the dump keeps its own; off installs today's passes (construction-time routes)" {
+test "glm5_next ttft_tail: deferred installs the served and the lane's prompt passes without their tail, the dump keeps its own; off installs the control's passes (construction-time routes)" {
     if (comptime !@import("../../host_caps.zig").dsa_nax) return error.SkipZigTest;
     inline for (.{ experts.Family.nvfp4, experts.Family.exl3 }) |f| {
         try testing.expect(deferredPromptOf(.served, f).? == &Passes(f).promptServedDeferred);
         try testing.expect(deferredPromptOf(.lane, f).? == &Passes(f).promptLaneDeferred);
         try testing.expect(deferredPromptOf(.dump, f) == null);
-        // Today's passes are their own callables (the default route installs them, unchanged).
+        // The control's passes are their own callables (`ttft_tail: off` installs them, unchanged).
         try testing.expect(deferredPromptOf(.served, f).? != promptPassOf(.served, f));
         try testing.expect(deferredPromptOf(.lane, f).? != promptPassOf(.lane, f));
     }
-    // The setting as the pack's block gives it: off by default, deferred when named.
+    // The setting as the pack's block gives it: deferred by default (batch 27's measured bundle), off when named.
     for ([_]struct { text: []const u8, want: prompt_levers.TtftTail }{
-        .{ .text = "{}", .want = .off },
+        .{ .text = "{}", .want = .deferred },
         .{ .text = "{\"ttft_tail\":\"off\"}", .want = .off },
         .{ .text = "{\"mtp_lane\":true,\"ttft_tail\":\"deferred\"}", .want = .deferred },
     }) |case| {

@@ -7,7 +7,7 @@
 //!     the unbanked route (`decode_moe: stock`) runs the same texts with every bank the call's one bank;
 //!   - prompt: DeepSeek-V4.1's DIG-X waves (take2, the gate|up GEMM decoding the trellis in its B loader, the onepass
 //!     SwiGLU epilogue, the down GEMM, rot_widen1 into bf16) over the call's rows sorted by slot, a wave at most
-//!     `wave_rows` rows (the construction's `exl3_wave_rows`, prompt_levers.zig; default `default_wave_rows`) of at most
+//!     `wave_rows` rows (the construction's `exl3_wave_rows`, prompt_levers.zig; default `prompt_levers.default_wave_rows`, the control's `control_wave_rows`) of at most
 //!     `xq.wave_max` experts, pipelined as MiMo's drain (one wave in flight behind the next). The rows' slot order is a
 //!     stable block sort (the control) or, under `prompt_route_cut: on`, a stable counting sort (the same order).
 //! The decode lookahead's predictor is MiMo's (`mimo_math.Predictor`), bound at construction.
@@ -34,10 +34,10 @@ const G = ops.MlxOps;
 const Proj = bank.Arrays(T);
 const Arrays = bank.BankArraysOf(T);
 
-/// A prompt wave's rows at most by default: MiMo's projection tile (the bill's `expert_workspace` prices a tile of these
+/// A prompt wave's rows at most on the control (g22-exl3's, `exl3_wave_rows` 1024 by name): MiMo's projection tile (the bill's `expert_workspace` prices a tile of these
 /// rows at NVFP4's per-row bytes, above a DIG-X wave's: take2 16 KiB + z 16 KiB + hd 4 KiB + zd 16 KiB + y 8 KiB a row).
 /// The construction's `exl3_wave_rows` sets a load's (`Math.wave_rows`); the bill prices two waves of it in flight.
-pub const default_wave_rows: u32 = mimo_math.projection_rows;
+pub const control_wave_rows: u32 = mimo_math.projection_rows;
 /// A prompt call's routed rows at most (the module's calls: `graph.prompt_call_rows` tokens x top-8; MiMo's math's bound).
 pub const max_call_rows: u32 = @import("nvfp4.zig").Format.max_call_tokens * 8;
 pub const wave_bytes_per_row: u64 = 2 * kernels.hidden * 2 + 2 * kernels.inter * 4 + kernels.inter * 2 + kernels.hidden * 4 + kernels.hidden * 2 + 8;
@@ -47,7 +47,7 @@ comptime {
     if (kernels.gu_tiles != kernels.dn_tiles) @compileError("glm5_next exl3: the gate|up and down GEMMs need their own wave tables");
     if (wave_bytes_per_row > 20 * kernels.hidden + 24 * kernels.inter + 32) @compileError("glm5_next exl3: a wave row outgrows the billed tile row");
     // The setting's default is today's wave; every admitted size is whole M tiles of the GEMMs.
-    if (prompt_levers.default_wave_rows != default_wave_rows) @compileError("glm5_next exl3: the wave setting's default is not today's wave");
+    if (prompt_levers.control_wave_rows != control_wave_rows) @compileError("glm5_next exl3: the wave setting's control is not g22-exl3's wave");
     if (prompt_levers.wave_rows_step % kernels.m_tile != 0) @compileError("glm5_next exl3: a wave size off the GEMMs' M tile");
 }
 
@@ -348,7 +348,7 @@ test "glm5_next exl3 math: a call's waves hold at most 16 experts and wave_rows 
     var start: usize = 0;
     var waves_n: u32 = 0;
     while (start < order.len) {
-        const end = Math.waveEnd(&order, &slots, start, default_wave_rows);
+        const end = Math.waveEnd(&order, &slots, start, control_wave_rows);
         var ex: [xq.wave_max]xq.WaveExpert = undefined;
         var rhs: [40]u32 = undefined;
         const e = Math.waveExperts(order[start..end], &slots, &ex, rhs[0 .. end - start]);
@@ -365,7 +365,7 @@ test "glm5_next exl3 math: a call's waves hold at most 16 experts and wave_rows 
     }
     try testing.expectEqual(@as(u32, 2), waves_n);
     // One expert of more rows than a wave takes splits over waves of wave_rows.
-    const wave_rows = default_wave_rows;
+    const wave_rows = control_wave_rows;
     const big_n = wave_rows + 7;
     const big_slots = try testing.allocator.alloc(u32, big_n);
     defer testing.allocator.free(big_slots);
