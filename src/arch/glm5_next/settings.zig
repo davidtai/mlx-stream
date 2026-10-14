@@ -26,6 +26,9 @@
 //! launch-fusion switches (`Fusion`: `on`, the default, or `off`, the control), each an exact construction-time route.
 //! `miss_reads` routes the expert stream's demand reads (`MissReads`: `staged`, through the read pool's staging and a copy;
 //! `direct`, straight into the slot rows).
+//! `dsa_select` a verify window's DSA indexer
+//! selection (`per_row`, the default: one scores and one top-k launch per row; `batched`: one of each for all the rows;
+//! exact, ops.zig `SelectRoute`).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -96,7 +99,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads", "dsa_select" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -154,6 +157,9 @@ pub const DecodePredict = enum { f32, bf16 };
 /// construction (swiglu.zig): `fused` one text between the gate / up GEMVs and the down GEMV; `ops` the op chain (the
 /// control). Rounding-class against `ops`.
 pub const DecodeSwiglu = enum { ops, fused };
+/// A verify window's DSA indexer selection (`dsa_select`), installed once at construction (ops.zig `SelectPlan`): `per_row`
+/// (the default, the control) or `batched` (one scores launch and one top-k launch for the window's rows). Exact.
+pub const DsaSelect = @import("ops.zig").SelectRoute;
 /// The EXL3 family's decode forms (exl3_forms.zig), installed once at construction (exl3_math.zig `Math.init`): the
 /// gate / up form (`exl3_gateup_form`): `seam` (lane B's in_rin, two GEMVs, gu_epi; g22-exl3's chain, the control, by
 /// name), `fused16` / `fused8` (g5k3_gu_fused at 16 or 8 simdgroups), `guone` (DeepSeek's gu_one, the default),
@@ -386,6 +392,8 @@ pub const Config = struct {
     decode_predict: DecodePredict = .bf16,
     /// The decode lane's MLP activation (swiglu.zig): `fused` (the default) or `ops` (the control).
     decode_swiglu: DecodeSwiglu = .fused,
+    /// A verify window's DSA indexer selection (ops.zig `SelectPlan`): `per_row` (the default, the control) or `batched`.
+    dsa_select: DsaSelect = .per_row,
     /// MiMo's X12 keep-warm (mimo_v2/gpu_warm.zig, adopted there as the default: round -4.7 ms, decode +2.4 %, ids
     /// identical): `waits` (the default) warms the GPU while the stream's event-gated parts (decode miss parts, a prompt
     /// group's reads) and the host's read-ahead wait for their bytes; `off` (the control) installs nothing. Exact by
@@ -428,7 +436,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false, miss_reads: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false, miss_reads: bool = false, dsa_select: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -493,6 +501,10 @@ pub const Config = struct {
         if (raw.object.get("decode_swiglu")) |v| {
             const route: ?DecodeSwiglu = if (v == .string) std.meta.stringToEnum(DecodeSwiglu, v.string) else null;
             if (route) |r| c.decode_swiglu = r else c.malformed.decode_swiglu = true;
+        }
+        if (raw.object.get("dsa_select")) |v| {
+            const route: ?DsaSelect = if (v == .string) std.meta.stringToEnum(DsaSelect, v.string) else null;
+            if (route) |r| c.dsa_select = r else c.malformed.dsa_select = true;
         }
         if (raw.object.get("gpu_keep_warm")) |v| {
             const route: gpu_warm.Route = if (v == .string) gpu_warm.parseRoute(v.string) else .invalid;
@@ -641,6 +653,7 @@ pub const Config = struct {
         if (c.malformed.decode_dsa) return error.Glm5NextDecodeDsaSetting;
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
+        if (c.malformed.dsa_select) return error.Glm5NextDsaSelectSetting;
         if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
         if (c.malformed.exl3_gateup_form) return error.Glm5NextExl3GateUpFormSetting;
         if (c.malformed.exl3_down_form) return error.Glm5NextExl3DownFormSetting;
@@ -821,6 +834,11 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(DecodeSwiglu.fused, pinned.decode_swiglu);
     try testing.expectEqual(DecodeSwiglu.ops, (try parseSettings("{\"decode_swiglu\":\"ops\"}")).decode_swiglu);
     try testing.expectError(error.Glm5NextDecodeSwigluSetting, (try parseSettings("{\"decode_swiglu\":true}")).validate());
+    try testing.expectEqual(DsaSelect.per_row, pinned.dsa_select);
+    try testing.expectEqual(DsaSelect.batched, (try parseSettings("{\"dsa_select\":\"batched\"}")).dsa_select);
+    try testing.expectEqual(DsaSelect.per_row, (try parseSettings("{\"dsa_select\":\"per_row\"}")).dsa_select);
+    try testing.expectError(error.Glm5NextDsaSelectSetting, (try parseSettings("{\"dsa_select\":\"rows\"}")).validate());
+    try testing.expectError(error.Glm5NextDsaSelectSetting, (try parseSettings("{\"dsa_select\":1}")).validate());
     // The decode glue: fused unless named; ops (the control) by name; anything else refused by name.
     try testing.expectEqual(DecodeGlue.fused, pinned.decode_glue);
     try testing.expectEqual(DecodeGlue.ops, (try parseSettings("{\"decode_glue\":\"ops\"}")).decode_glue);

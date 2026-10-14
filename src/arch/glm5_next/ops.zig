@@ -784,6 +784,12 @@ pub const Indexer = struct {
     plan: ?*SelectPlan = null,
 };
 
+/// A verify window's selection (`dsa_select`), installed once at construction (`SelectPlan.install`): `per_row` (the
+/// default, the control) one scores launch and one top-k launch per row, joined by a concatenation; `batched` one scores
+/// launch with a threadgroup plane per row and one top-k launch with a threadgroup per row, writing the joined layout.
+/// The same body text runs every row in both (the rows text binds row z's arrays and position): exact.
+pub const SelectRoute = enum { per_row, batched };
+
 /// The DSA indexer's decode launches for one model, prepared at the module's construction (`install`): the pooled-row,
 /// decode-score and top-k-expand kernels made; the pooled rows' config per decode-lane row count (1 .. `max_rows`); the
 /// scores' config per pool count p and the top-k's per selection width (the runtime values their output shape, grid or
@@ -804,8 +810,16 @@ pub const SelectPlan = struct {
     cfg_scores: Config = .{ .ctx = null },
     topk_k: c_int = 0,
     cfg_topk: Config = .{ .ctx = null },
+    /// `dsa_select: batched`: the rows texts (null under `per_row`) and their configs per row count R (2 ..
+    /// `HC_PRE_MAX_ROWS`, index R - 1) at the pool count / selection width each was last built for.
+    rows: ?RowsKernels = null,
+    rows_scores_p: [HC_PRE_MAX_ROWS]c_int = @splat(0),
+    cfg_rows_scores: [HC_PRE_MAX_ROWS]Config = @splat(.{ .ctx = null }),
+    rows_topk_k: [HC_PRE_MAX_ROWS]c_int = @splat(0),
+    cfg_rows_topk: [HC_PRE_MAX_ROWS]Config = @splat(.{ .ctx = null }),
 
     pub const max_rows: usize = 8;
+    pub const RowsKernels = struct { scores: Kernel, topk: Kernel };
 
     fn lock(p: *SelectPlan) void {
         while (p.busy.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
@@ -815,7 +829,7 @@ pub const SelectPlan = struct {
         p.busy.store(false, .release);
     }
 
-    pub fn install(s: mlx.mlx_stream, ix: Indexer, dt: mlx.mlx_dtype) !*SelectPlan {
+    pub fn install(s: mlx.mlx_stream, ix: Indexer, dt: mlx.mlx_dtype, select: SelectRoute) !*SelectPlan {
         const p = try std.heap.c_allocator.create(SelectPlan);
         p.* = .{ .dt = dt, .ix = ix };
         p.ix.plan = null;
@@ -823,9 +837,18 @@ pub const SelectPlan = struct {
         p.pooled = try decodeKernelNew("glm5_dsa_pooled_rows", &.{ "prev", "chunk", "ape", "dims" }, POOLED_ROWS_SOURCE, "");
         p.scores = try decodeKernelNew("glm5_dsa_decode_scores", &.{ "cache", "q", "w", "dims" }, DEC_SCORE_SOURCE, "");
         p.topk = try decodeKernelNew("glm5_dsa_topk_expand", &.{ "scores", "dims" }, TOPK_EXPAND_SOURCE, TOPK_EXPAND_HEADER);
+        if (select == .batched) p.rows = .{
+            .scores = try decodeKernelNew("glm5_dsa_decode_scores_rows", &.{ "cache", "q", "w", "dims" }, DEC_SCORE_ROWS_SOURCE, ""),
+            .topk = try decodeKernelNew("glm5_dsa_topk_expand_rows", &.{ "scores", "dims" }, TOPK_EXPAND_ROWS_SOURCE, TOPK_EXPAND_HEADER),
+        };
         for (&p.cfg_pooled, 1..) |*c, m| c.* = try pooledConfig(ix, dt, &.{ 1, @intCast(m), 2 * ix.head_dim });
         try p.check(s);
         return p;
+    }
+
+    /// The route installed (`dsa_select`).
+    pub fn route(p: *const SelectPlan) SelectRoute {
+        return if (p.rows != null) .batched else .per_row;
     }
 
     /// One launch of each text over zeros at the steady widths (the pooled rows at one row; the scores over a pool count
@@ -852,6 +875,18 @@ pub const SelectPlan = struct {
         arrays[7] = try decodeSelect(s, arrays[4], arrays[5], arrays[3], ix_p, t - 1, pools, sel_k);
         try mlx.check(mlx.mlx_array_eval(arrays[6]));
         try mlx.check(mlx.mlx_array_eval(arrays[7]));
+        if (p.rows != null) {
+            // The rows texts at two rows (their queries at t - 2 and t - 1).
+            var rq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(rq);
+            try mlx.check(mlx.mlx_zeros(&rq, &[_]c_int{ 1, 2, ix.heads, ix.head_dim }, 4, p.dt, s));
+            var rw = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(rw);
+            try mlx.check(mlx.mlx_zeros(&rw, &[_]c_int{ 1, 2, ix.heads }, 3, .float32, s));
+            const sel = try decodeSelectRows(s, rq, rw, arrays[3], ix_p, t - 2, pools, sel_k);
+            defer _ = mlx.mlx_array_free(sel);
+            try mlx.check(mlx.mlx_array_eval(sel));
+        }
     }
 
     /// The scores' config at pool count `pools` (built when it changes; the caller holds the lock).
@@ -876,9 +911,34 @@ pub const SelectPlan = struct {
         return p.cfg_topk;
     }
 
+    /// The rows scores' config at R rows and `pools` (built when the pool count changes for R; the caller holds the lock).
+    fn rowsScoresConfig(p: *SelectPlan, rows: c_int, pools: c_int) !Config {
+        const i: usize = @intCast(rows - 1);
+        if (p.rows_scores_p[i] != pools or p.cfg_rows_scores[i].ctx == null) {
+            const c = try decodeScoresRowsConfig(p.ix, p.dt, rows, pools);
+            if (p.cfg_rows_scores[i].ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(p.cfg_rows_scores[i]);
+            p.cfg_rows_scores[i] = c;
+            p.rows_scores_p[i] = pools;
+        }
+        return p.cfg_rows_scores[i];
+    }
+
+    /// The rows top-k's config at R rows and width `sel_k` (built when the width changes for R; the caller holds the lock).
+    fn rowsTopkConfig(p: *SelectPlan, rows: c_int, sel_k: c_int) !Config {
+        const i: usize = @intCast(rows - 1);
+        if (p.rows_topk_k[i] != sel_k or p.cfg_rows_topk[i].ctx == null) {
+            const c = try topkExpandRowsConfig(p.ix, rows, sel_k);
+            if (p.cfg_rows_topk[i].ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(p.cfg_rows_topk[i]);
+            p.cfg_rows_topk[i] = c;
+            p.rows_topk_k[i] = sel_k;
+        }
+        return p.cfg_rows_topk[i];
+    }
+
     pub fn destroy(p: *SelectPlan) void {
         for ([_]Kernel{ p.pooled, p.scores, p.topk }) |k| if (k.ctx != null) mtl.mlx_fast_metal_kernel_free(k);
-        for (p.cfg_pooled ++ [_]Config{ p.cfg_scores, p.cfg_topk }) |c| if (c.ctx != null) {
+        if (p.rows) |r| for ([_]Kernel{ r.scores, r.topk }) |k| if (k.ctx != null) mtl.mlx_fast_metal_kernel_free(k);
+        for (p.cfg_pooled ++ [_]Config{ p.cfg_scores, p.cfg_topk } ++ p.cfg_rows_scores ++ p.cfg_rows_topk) |c| if (c.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(c);
         };
         std.heap.c_allocator.destroy(p);
@@ -1101,18 +1161,38 @@ pub fn selectTokens(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, i
 
 /// One query's indexer scores in one dispatch: each simdgroup loads PPS pool keys in turn
 /// (`withPooledKeys`' layout) and lane h scores head h against each; the head sum is the
-/// pool's score, -FLT_MAX for a pool the query cannot see.
+/// pool's score, -FLT_MAX for a pool the query cannot see. The body reads its query through
+/// `qr` / `wr`, writes through `outr` and sees the query at `q_pos`: the one-query text binds
+/// them to the launch's arrays and `dims[0]`; the rows text (`dsa_select: batched`) to row z's.
 const DEC_SCORE_SGS: c_int = 8;
 const DEC_SCORE_PPS: c_int = 4;
-const DEC_SCORE_SOURCE =
+const DEC_SCORE_ONE =
+    \\auto qr = q;
+    \\auto wr = w;
+    \\auto outr = out;
+    \\const int q_pos = dims[0];
+    \\
+;
+/// The rows text's binding: threadgroup z scores row z of q [1, R, 32, DH] / w [1, R, 32] at position dims[0] + z into
+/// out [R, P] row z.
+const DEC_SCORE_ROWS =
+    \\const uint brow = threadgroup_position_in_grid.z;
+    \\auto qr = q + size_t(brow) * (32 * DH);
+    \\auto wr = w + size_t(brow) * 32;
+    \\auto outr = out + size_t(brow) * size_t(dims[1]);
+    \\const int q_pos = dims[0] + int(brow);
+    \\
+;
+const DEC_SCORE_SOURCE = DEC_SCORE_ONE ++ DEC_SCORE_BODY;
+const DEC_SCORE_ROWS_SOURCE = DEC_SCORE_ROWS ++ DEC_SCORE_BODY;
+const DEC_SCORE_BODY =
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const uint tid = sg * 32 + lane;
-    \\const int q_pos = dims[0];
     \\const int P = dims[1];
     \\threadgroup float qT[DH * 32];
     \\threadgroup float kp[SGS][DH];
-    \\for (uint i = tid; i < uint(32 * DH); i += SGS * 32) qT[(i % DH) * 32 + i / DH] = float(q[i]);
+    \\for (uint i = tid; i < uint(32 * DH); i += SGS * 32) qT[(i % DH) * 32 + i / DH] = float(qr[i]);
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\for (int pp = 0; pp < PPS; ++pp) {
     \\const int p = (int(threadgroup_position_in_grid.y) * SGS + int(sg)) * PPS + pp;
@@ -1123,20 +1203,37 @@ const DEC_SCORE_SOURCE =
     \\simdgroup_barrier(mem_flags::mem_threadgroup);
     \\float dot = 0.0f;
     \\for (int d = 0; d < DH; ++d) dot = fma(qT[d * 32 + lane], kp[sg][d], dot);
-    \\const float sc = simd_sum(w[lane] * metal::max(dot, 0.0f));
-    \\if (lane == 0) out[p] = (p * KPOOL + KPOOL - 1 <= q_pos) ? sc : -FLT_MAX;
+    \\const float sc = simd_sum(wr[lane] * metal::max(dot, 0.0f));
+    \\if (lane == 0) outr[p] = (p * KPOOL + KPOOL - 1 <= q_pos) ? sc : -FLT_MAX;
     \\simdgroup_barrier(mem_flags::mem_threadgroup);
     \\}
 ;
 
 /// The top SEL_K of one query's pool scores as token indices in `expandSelection`'s layout,
 /// in one threadgroup: a 4-pass 8-bit radix select finds the SEL_K-th largest score, then an
-/// ordered compaction (ties to the lower index) writes the pools chronologically.
-const TOPK_EXPAND_SOURCE =
+/// ordered compaction (ties to the lower index) writes the pools chronologically. The body
+/// reads `scr`, writes `outr` and sees the query at `q_pos` (bound as the scores' text binds).
+const TOPK_EXPAND_ONE =
+    \\auto scr = scores;
+    \\auto outr = out;
+    \\const int q_pos = dims[0];
+    \\
+;
+/// The rows text's binding: threadgroup y selects row y of scores [R, P] at position dims[0] + y into out [1, R, OUT_W]
+/// row y.
+const TOPK_EXPAND_ROWS =
+    \\const uint brow = threadgroup_position_in_grid.y;
+    \\auto scr = scores + size_t(brow) * size_t(dims[1]);
+    \\auto outr = out + size_t(brow) * size_t(OUT_W);
+    \\const int q_pos = dims[0] + int(brow);
+    \\
+;
+const TOPK_EXPAND_SOURCE = TOPK_EXPAND_ONE ++ TOPK_EXPAND_BODY;
+const TOPK_EXPAND_ROWS_SOURCE = TOPK_EXPAND_ROWS ++ TOPK_EXPAND_BODY;
+const TOPK_EXPAND_BODY =
     \\const uint tid = thread_position_in_threadgroup.x;
     \\const uint lane = tid % 32;
     \\const uint sg = tid / 32;
-    \\const int q_pos = dims[0];
     \\const int P = dims[1];
     \\threadgroup atomic_uint hist[256];
     \\threadgroup uint st[3];
@@ -1150,7 +1247,7 @@ const TOPK_EXPAND_SOURCE =
     \\    const uint prefix = st[0];
     \\    const uint pmask = st[1];
     \\    for (int i = int(tid); i < P; i += 1024) {
-    \\        const uint k = msv_score_key(scores[i]);
+    \\        const uint k = msv_score_key(scr[i]);
     \\        if ((k & pmask) == prefix) atomic_fetch_add_explicit(&hist[(k >> shift) & 255u], 1u, memory_order_relaxed);
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1176,7 +1273,7 @@ const TOPK_EXPAND_SOURCE =
     \\const int s1 = metal::min(s0 + seg, P);
     \\uint g = 0u, e = 0u;
     \\for (int i = s0; i < s1; ++i) {
-    \\    const uint k = msv_score_key(scores[i]);
+    \\    const uint k = msv_score_key(scr[i]);
     \\    g += k > thr ? 1u : 0u;
     \\    e += k == thr ? 1u : 0u;
     \\}
@@ -1194,12 +1291,12 @@ const TOPK_EXPAND_SOURCE =
     \\uint er = part_e[sg] + pe;
     \\uint pos = part_g[sg] + pg + metal::min(er, need);
     \\for (int i = s0; i < s1; ++i) {
-    \\    const uint k = msv_score_key(scores[i]);
+    \\    const uint k = msv_score_key(scr[i]);
     \\    bool take = k > thr;
     \\    if (k == thr) { take = er < need; ++er; }
     \\    if (take) {
     \\        const bool valid = (i + 1) * KPOOL - 1 <= q_pos;
-    \\        for (int c = 0; c < KPOOL; ++c) out[int(pos) * KPOOL + c] = valid ? i * KPOOL + c : -1;
+    \\        for (int c = 0; c < KPOOL; ++c) outr[int(pos) * KPOOL + c] = valid ? i * KPOOL + c : -1;
     \\        ++pos;
     \\    }
     \\}
@@ -1210,7 +1307,7 @@ const TOPK_EXPAND_SOURCE =
     \\        const int tail_count = (q_pos + 1) % KPOOL;
     \\        if (t < tail_count) v = q_pos + 1 - tail_count + t;
     \\    }
-    \\    out[col] = v;
+    \\    outr[col] = v;
     \\}
 ;
 const TOPK_EXPAND_HEADER =
@@ -1302,6 +1399,51 @@ fn topkExpandConfig(ix: Indexer, select_k: c_int) !Config {
     return cfg;
 }
 
+/// `dsa_select: batched`: a verify window's R rows (2 .. `HC_PRE_MAX_ROWS`, queries at `q_start .. q_start + R`, `ws`
+/// carrying the Dh^-0.5) in one scores launch and one top-k launch: int32 [1, R, topk + kpool - 1], each row the
+/// one-query `decodeSelect`'s words (the same body text per row).
+fn decodeSelectRows(s: mlx.mlx_stream, q_idx: mlx.mlx_array, ws: mlx.mlx_array, idx_cache: mlx.mlx_array, ix: Indexer, q_start: c_int, p: c_int, select_k: c_int) !mlx.mlx_array {
+    const plan = ix.plan.?;
+    const rk = plan.rows.?;
+    const rows = mlx.getShape(q_idx)[1];
+    const dims = mlx.mlx_array_new_data(&[_]i32{ q_start, p }, &[_]c_int{2}, 1, .int32);
+    defer _ = mlx.mlx_array_free(dims);
+    plan.lock();
+    defer plan.unlock();
+    const scores = try applyOne(s, rk.scores, try plan.rowsScoresConfig(rows, p), &.{ idx_cache, q_idx, ws, dims });
+    defer _ = mlx.mlx_array_free(scores);
+    return applyOne(s, rk.topk, try plan.rowsTopkConfig(rows, select_k), &.{ scores, dims });
+}
+
+/// The rows scores' launch at R rows and `p` pools: the one-query grid with a z plane per row; out f32 [R, p].
+fn decodeScoresRowsConfig(ix: Indexer, dt: mlx.mlx_dtype, rows: c_int, p: c_int) !Config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, p }, 2, .float32));
+    const per_tg = DEC_SCORE_SGS * DEC_SCORE_PPS;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, DEC_SCORE_SGS * 32, @divTrunc(p + per_tg - 1, per_tg), rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, DEC_SCORE_SGS * 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    inline for (.{ .{ "DH", ix.head_dim }, .{ "KPOOL", ix.kpool }, .{ "SGS", DEC_SCORE_SGS }, .{ "PPS", DEC_SCORE_PPS } }) |kv| {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+    }
+    return cfg;
+}
+
+/// The rows top-k's launch at R rows and width `select_k`: one 1,024-thread group per row; out int32 [1, R, OUT_W].
+fn topkExpandRowsConfig(ix: Indexer, rows: c_int, select_k: c_int) !Config {
+    const out_w = ix.topk + ix.kpool - 1;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, out_w }, 3, .int32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1024, rows, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
+    inline for (.{ .{ "SEL_K", select_k }, .{ "KPOOL", ix.kpool }, .{ "TOPK_W", ix.topk }, .{ "TAIL_W", ix.kpool - 1 }, .{ "OUT_W", out_w } }) |kv| {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+    }
+    return cfg;
+}
+
 /// `selectTokens` for queries at positions `q_start .. q_start + S`.
 fn selectRows(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, idx_cache: mlx.mlx_array, ix: Indexer, q_start: c_int) !mlx.mlx_array {
     const csh = mlx.getShape(idx_cache);
@@ -1332,6 +1474,8 @@ fn selectRows(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, idx_cac
         var ws = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ws);
         try mlx.check(mlx.mlx_multiply(&ws, w, scale, s));
+        // `dsa_select: batched` (the plan's construction-time route): every row in one launch of each.
+        if (ix.plan.?.rows != null) return decodeSelectRows(s, q_idx, ws, idx_cache, ix, q_start, p, select_k);
         const qsh = mlx.getShape(q_idx);
         var rows_out: [HC_PRE_MAX_ROWS]mlx.mlx_array = undefined;
         var n: usize = 0;
@@ -1721,5 +1865,189 @@ test "glm5_next ops: the op chains' kernels and launches install once per proces
     var other = flash_geo;
     other.d = 2048;
     try testing.expectError(error.Glm5HcInstallGeometry, install(other));
+    try @import("sdk").testing.expectNoDevice();
+}
+
+// ---- `dsa_select: batched`: the rows texts against the one-query texts (CPU: a model of the launch, no device) ----
+
+test "glm5_next ops: dsa_select's texts are one body under two bindings; the rows launches are the one-query grids with a plane per row" {
+    // One body each: the one-query and the rows sources differ only in the binding in front of it.
+    try testing.expect(std.mem.endsWith(u8, DEC_SCORE_SOURCE, DEC_SCORE_BODY) and std.mem.endsWith(u8, DEC_SCORE_ROWS_SOURCE, DEC_SCORE_BODY));
+    try testing.expect(std.mem.endsWith(u8, TOPK_EXPAND_SOURCE, TOPK_EXPAND_BODY) and std.mem.endsWith(u8, TOPK_EXPAND_ROWS_SOURCE, TOPK_EXPAND_BODY));
+    // The body reads its arrays and position only through the binding's names (`SelBinding` models these lines).
+    for ([_][]const u8{ "q[", "w[", "out[", "dims[0]" }) |raw| try testing.expect(std.mem.indexOf(u8, DEC_SCORE_BODY, raw) == null);
+    for ([_][]const u8{ "scores[", " out[", "dims[0]" }) |raw| try testing.expect(std.mem.indexOf(u8, TOPK_EXPAND_BODY, raw) == null);
+    try testing.expectEqualStrings("auto qr = q;\nauto wr = w;\nauto outr = out;\nconst int q_pos = dims[0];\n", DEC_SCORE_ONE);
+    try testing.expectEqualStrings("const uint brow = threadgroup_position_in_grid.z;\nauto qr = q + size_t(brow) * (32 * DH);\nauto wr = w + size_t(brow) * 32;\nauto outr = out + size_t(brow) * size_t(dims[1]);\nconst int q_pos = dims[0] + int(brow);\n", DEC_SCORE_ROWS);
+    try testing.expectEqualStrings("auto scr = scores;\nauto outr = out;\nconst int q_pos = dims[0];\n", TOPK_EXPAND_ONE);
+    try testing.expectEqualStrings("const uint brow = threadgroup_position_in_grid.y;\nauto scr = scores + size_t(brow) * size_t(dims[1]);\nauto outr = out + size_t(brow) * size_t(OUT_W);\nconst int q_pos = dims[0] + int(brow);\n", TOPK_EXPAND_ROWS);
+    const ix: Indexer = .{ .topk = 2048, .kpool = 4, .heads = 32, .head_dim = 128 };
+    const per = DEC_SCORE_SGS * DEC_SCORE_PPS;
+    for (2..@as(usize, @intCast(HC_PRE_MAX_ROWS)) + 1) |m| for ([_]c_int{ 513, 4096 }) |p| {
+        const r: c_int = @intCast(m);
+        const sc = try decodeScoresRowsConfig(ix, .bfloat16, r, p);
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(sc);
+        try testing.expectEqual([9]c_int{ DEC_SCORE_SGS * 32, @divTrunc(p + per - 1, per), r, DEC_SCORE_SGS * 32, 1, 1, 1, 5, 0 }, readConfig(sc));
+        const tc = try topkExpandRowsConfig(ix, r, 512);
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(tc);
+        try testing.expectEqual([9]c_int{ 1024, r, 1, 1024, 1, 1, 1, 5, 0 }, readConfig(tc));
+    };
+    try @import("sdk").testing.expectNoDevice();
+}
+
+/// A host model of the select texts' launches at Flash's indexer (32 heads, Dh 128, kpool 4): the body (`selModelScores`,
+/// `selModelTopk`, the texts' arithmetic and order per row, the simd sum in lane order) under a binding (`SelBinding`: the
+/// ONE / ROWS lines the test above pins), run over each launch's threadgroups.
+const SelBinding = enum { one, rows };
+const sel_h: usize = 32;
+const sel_dh: usize = 128;
+const sel_kpool: usize = 4;
+
+fn bf16ToF32(b: u16) f32 {
+    return @bitCast(@as(u32, b) << 16);
+}
+
+/// The scores text over its grid: (x: the simdgroups, y: pool blocks, z: 1 or R); cache [T, 2 Dh] bf16 bits, q bf16 bits,
+/// w f32, dims {q_pos or q_start, P}; out f32.
+fn selModelScores(bind: SelBinding, planes: usize, cache: []const u16, q: []const u16, w: []const f32, dims: [2]i32, out: []f32) void {
+    const P: usize = @intCast(dims[1]);
+    const sgs: usize = @intCast(DEC_SCORE_SGS);
+    const pps: usize = @intCast(DEC_SCORE_PPS);
+    const blocks = (P + sgs * pps - 1) / (sgs * pps);
+    for (0..planes) |z| for (0..blocks) |y| {
+        // the binding
+        const brow: usize = if (bind == .rows) z else 0;
+        const qr = q[brow * sel_h * sel_dh ..];
+        const wr = w[brow * sel_h ..];
+        const outr = out[brow * P ..];
+        const q_pos: i64 = @as(i64, dims[0]) + @as(i64, @intCast(brow));
+        // the body
+        var qT: [sel_dh * 32]f32 = undefined;
+        for (0..32 * sel_dh) |i| qT[(i % sel_dh) * 32 + i / sel_dh] = bf16ToF32(qr[i]);
+        for (0..sgs) |sg| for (0..pps) |pp| {
+            const p = (y * sgs + sg) * pps + pp;
+            if (p >= P) continue;
+            var kp: [sel_dh]f32 = undefined;
+            for (0..sel_dh) |d| kp[d] = bf16ToF32(cache[(p * sel_kpool + sel_kpool - 1) * (2 * sel_dh) + sel_dh + d]);
+            var sum: f32 = 0;
+            for (0..32) |lane| {
+                var dot: f32 = 0;
+                for (0..sel_dh) |d| dot = @mulAdd(f32, qT[d * 32 + lane], kp[d], dot);
+                sum += wr[lane] * @max(dot, 0);
+            }
+            outr[p] = if (@as(i64, @intCast(p * sel_kpool + sel_kpool - 1)) <= q_pos) sum else -std.math.floatMax(f32);
+        };
+    };
+}
+
+fn selKey(x: f32) u32 {
+    const u: u32 = @bitCast(x);
+    return if (u & 0x80000000 != 0) ~u else u | 0x80000000;
+}
+
+/// The top-k text over its grid (one group per plane): the 4-pass radix select's threshold and count, then the ordered
+/// compaction (every key above the threshold and the first `need` equal ones, by pool index) and the tail columns.
+fn selModelTopk(bind: SelBinding, planes: usize, scores: []const f32, dims: [2]i32, sel_k: usize, out: []i32) void {
+    const P: usize = @intCast(dims[1]);
+    const out_w: usize = 2048 + sel_kpool - 1;
+    for (0..planes) |y| {
+        const brow: usize = if (bind == .rows) y else 0;
+        const scr = scores[brow * P ..][0..P];
+        const outr = out[brow * out_w ..][0..out_w];
+        const q_pos: i64 = @as(i64, dims[0]) + @as(i64, @intCast(brow));
+        var prefix: u32 = 0;
+        var pmask: u32 = 0;
+        var need: u32 = @intCast(sel_k);
+        for (0..4) |pass| {
+            const shift: u5 = @intCast(24 - 8 * pass);
+            var hist: [256]u32 = @splat(0);
+            for (scr) |v| {
+                const k = selKey(v);
+                if (k & pmask == prefix) hist[(k >> shift) & 255] += 1;
+            }
+            var cum: u32 = 0;
+            var bin: u32 = 255;
+            while (bin > 0) : (bin -= 1) {
+                if (cum + hist[bin] >= need) break;
+                cum += hist[bin];
+            }
+            need -= cum;
+            prefix |= bin << shift;
+            pmask |= @as(u32, 255) << shift;
+        }
+        var pos: usize = 0;
+        var eq: u32 = 0;
+        for (scr, 0..) |v, i| {
+            const k = selKey(v);
+            var take = k > prefix;
+            if (k == prefix) {
+                take = eq < need;
+                eq += 1;
+            }
+            if (!take) continue;
+            const valid = @as(i64, @intCast((i + 1) * sel_kpool)) - 1 <= q_pos;
+            for (0..sel_kpool) |c| outr[pos * sel_kpool + c] = if (valid) @intCast(i * sel_kpool + c) else -1;
+            pos += 1;
+        }
+        for (sel_k * sel_kpool..out_w) |col| {
+            var v: i32 = -1;
+            if (col >= 2048 and col < 2048 + sel_kpool - 1) {
+                const t: i64 = @intCast(col - 2048);
+                const tail_count = @mod(q_pos + 1, @as(i64, sel_kpool));
+                if (t < tail_count) v = @intCast(q_pos + 1 - tail_count + t);
+            }
+            outr[col] = v;
+        }
+    }
+}
+
+test "glm5_next ops: dsa_select batched: the rows launches' scores and top-k indices are the per-row launches' bit for bit at Flash's shapes, rows 1 .. 4, ties included" {
+    const a = testing.allocator;
+    const P: usize = 4096; // pools: 16,384 keys
+    const t = P * sel_kpool;
+    const sel_k: usize = 2048 / sel_kpool;
+    const out_w: usize = 2048 + sel_kpool - 1;
+    const cache = try a.alloc(u16, t * 2 * sel_dh);
+    defer a.free(cache);
+    const q = try a.alloc(u16, 4 * sel_h * sel_dh);
+    defer a.free(q);
+    var w: [4 * sel_h]f32 = undefined;
+    var rng = std.Random.DefaultPrng.init(20261014);
+    const rand = rng.random();
+    for ([_]bool{ false, true }) |ties| {
+        // Ties: keys and queries on a 3-level grid (many equal pool scores, the threshold bin full of them).
+        const levels = [_]f32{ -0.5, 0.0, 0.5 };
+        for (cache) |*c| c.* = @truncate(@as(u32, @bitCast(if (ties) levels[rand.uintLessThan(usize, 3)] else rand.floatNorm(f32))) >> 16);
+        for (q) |*c| c.* = @truncate(@as(u32, @bitCast(if (ties) levels[rand.uintLessThan(usize, 3)] else rand.floatNorm(f32))) >> 16);
+        for (&w) |*x| x.* = if (ties) 0.25 else rand.float(f32) * 0.2;
+        for (1..5) |rows| {
+            // The window's queries end at the last key; the last rows see pools the first cannot (the mask differs per row).
+            const q_start: i32 = @intCast(t - rows);
+            const want_sc = try a.alloc(f32, rows * P);
+            defer a.free(want_sc);
+            const got_sc = try a.alloc(f32, rows * P);
+            defer a.free(got_sc);
+            const want_ix = try a.alloc(i32, rows * out_w);
+            defer a.free(want_ix);
+            const got_ix = try a.alloc(i32, rows * out_w);
+            defer a.free(got_ix);
+            // per_row: row i's slices through the one-query launches at q_start + i, joined in row order.
+            for (0..rows) |i| {
+                const d: [2]i32 = .{ q_start + @as(i32, @intCast(i)), @intCast(P) };
+                selModelScores(.one, 1, cache, q[i * sel_h * sel_dh ..][0 .. sel_h * sel_dh], w[i * sel_h ..][0..sel_h], d, want_sc[i * P ..][0..P]);
+                selModelTopk(.one, 1, want_sc[i * P ..][0..P], d, sel_k, want_ix[i * out_w ..][0..out_w]);
+            }
+            // batched: the whole window through the rows launches at q_start.
+            const d: [2]i32 = .{ q_start, @intCast(P) };
+            selModelScores(.rows, rows, cache, q[0 .. rows * sel_h * sel_dh], w[0 .. rows * sel_h], d, got_sc);
+            selModelTopk(.rows, rows, got_sc, d, sel_k, got_ix);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want_sc), std.mem.sliceAsBytes(got_sc));
+            try testing.expectEqualSlices(i32, want_ix, got_ix);
+            // The selection is sel_k pools of 4 plus the tail: every row's chronological picks, -1 only past the query.
+            var picked: usize = 0;
+            for (got_ix[(rows - 1) * out_w ..][0 .. sel_k * sel_kpool]) |v| picked += @intFromBool(v >= 0);
+            try testing.expectEqual(sel_k * sel_kpool, picked);
+        }
+    }
     try @import("sdk").testing.expectNoDevice();
 }
