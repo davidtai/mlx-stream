@@ -19,7 +19,8 @@
 //! streamed arch's keys; glm5_next's default ratio `default_tally_ratio`). `expert_rows_by_layer` splits the decode rows
 //! between the routed layers (`LayerRows`; `uniform`, the default, is every layer at the plan's rows). `exl3_gateup_form`,
 //! `exl3_down_form`, `exl3_forms_maxm` and `exl3_forms_min_p` pick the EXL3 family's decode forms (`Exl3Forms`, exl3_forms.zig;
-//! `seam`, the default: lane B's chain, the control).
+//! `seam`, the default: lane B's chain, the control). `miss_reads` routes the expert stream's demand reads (`MissReads`:
+//! `staged`, the default, through the read pool's staging and a copy; `direct`, straight into the slot rows).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -89,7 +90,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "miss_reads" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -180,6 +181,16 @@ pub const Exl3Forms = struct {
         return std.meta.eql(f, Exl3Forms{});
     }
 };
+
+/// The expert stream's demand (miss) reads, installed once at construction (`miss_reads`): `staged` (the default, the
+/// control) preadv each record's gate/up and down ranges into a worker's staging buffer, then one thread copies them into
+/// the slot rows; `direct` preadv them straight into the slot rows (one iovec per segment, no staging, no copy; the
+/// read-wait audit's lever 3: the 0.19 ms copy tail of each demand layer) with the decode pre-read off (a pre-range starts
+/// before its plan names rows, so it stages). The same file bytes land in the same rows: exact. `direct` is admitted only
+/// when the stream proves at construction that every record range and slot row is aligned to the file's block
+/// (stream.zig `checkDirectReads` / `checkDirectRows`; EXL3 K=3: 4 KiB records and segments on APFS's 4 KiB block),
+/// refused by name otherwise (`DirectReads*`).
+pub const MissReads = enum { staged, direct };
 
 /// `expert_rows_by_layer` (MiMo's mimo/layer-rows, mimo_v2/settings.zig `LayerRows`): the plan's decode rows split
 /// between the routed layers at the SAME total, once at construction. `uniform` (the default) is every layer at the plan's
@@ -329,6 +340,8 @@ pub const Config = struct {
     expert_rows_by_layer: LayerRows = defaultLayerRows(),
     /// The EXL3 family's decode forms (`Exl3Forms`): the seam chain unless named.
     exl3_forms: Exl3Forms = .{},
+    /// The expert stream's demand reads (`MissReads`): staged unless named.
+    miss_reads: MissReads = .staged,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -340,7 +353,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, miss_reads: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -402,6 +415,10 @@ pub const Config = struct {
         }
         if (raw.object.get("exl3_forms_min_p")) |v| {
             if (v == .integer and v.integer >= 1 and v.integer <= exl3_forms.max_pairs) c.exl3_forms.min_p = @intCast(v.integer) else c.malformed.exl3_forms_min_p = true;
+        }
+        if (raw.object.get("miss_reads")) |v| {
+            const route: ?MissReads = if (v == .string) std.meta.stringToEnum(MissReads, v.string) else null;
+            if (route) |r| c.miss_reads = r else c.malformed.miss_reads = true;
         }
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
@@ -490,6 +507,7 @@ pub const Config = struct {
         if (c.malformed.exl3_down_form) return error.Glm5NextExl3DownFormSetting;
         if (c.malformed.exl3_forms_maxm) return error.Glm5NextExl3FormsMaxmSetting;
         if (c.malformed.exl3_forms_min_p) return error.Glm5NextExl3FormsMinPSetting;
+        if (c.malformed.miss_reads) return error.Glm5NextMissReadsSetting;
         if (!c.exl3_forms.isSeam() and c.expert_family != .exl3) return error.Glm5NextExl3FormsOnNvfp4Pack;
         c.exl3_forms.forms().check() catch return error.Glm5NextExl3FormsSetting;
         try c.tally.check("glm5_next");
@@ -769,4 +787,20 @@ test "glm5_next settings: the exl3 decode forms: the seam unless named, every fo
         c.expert_family = .exl3;
         try testing.expectError(case[1], c.validate());
     }
+}
+
+test "glm5_next settings: miss_reads: staged unless named, direct by name, anything else refused by name" {
+    const none = try parseSettings("{}");
+    try none.validate();
+    try testing.expectEqual(MissReads.staged, none.miss_reads);
+    const staged = try parseSettings("{\"miss_reads\":\"staged\"}");
+    try staged.validate();
+    try testing.expectEqual(MissReads.staged, staged.miss_reads);
+    const direct = try parseSettings("{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"exl3_gateup_form\":\"guone\",\"exl3_down_form\":\"pair\",\"miss_reads\":\"direct\"}");
+    var dx = direct;
+    dx.expert_family = .exl3;
+    try dx.validate();
+    try testing.expectEqual(MissReads.direct, dx.miss_reads);
+    for ([_][]const u8{ "{\"miss_reads\":\"uncached\"}", "{\"miss_reads\":\"Direct\"}", "{\"miss_reads\":true}", "{\"miss_reads\":1}", "{\"miss_reads\":null}" }) |bad|
+        try testing.expectError(error.Glm5NextMissReadsSetting, (try parseSettings(bad)).validate());
 }
