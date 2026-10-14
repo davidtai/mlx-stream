@@ -17,7 +17,9 @@
 //! logits dump route for the KL gate (dump.zig): absent, nothing of it is built. `expert_resident_ratio`,
 //! `expert_tally_window` and `expert_tally_file` set the expert stream's rate tally (sdk_ext/expert/tally.zig, every
 //! streamed arch's keys; glm5_next's default ratio `default_tally_ratio`). `expert_rows_by_layer` splits the decode rows
-//! between the routed layers (`LayerRows`; `uniform`, the default, is every layer at the plan's rows).
+//! between the routed layers (`LayerRows`; `uniform`, the default, is every layer at the plan's rows). `fuse_kda_inputs`,
+//! `fuse_gate_up` and `merge_gate_waits` are the decode trunk's launch-fusion switches (`Fusion`: `off`, the default and
+//! the control, or `on`), each an exact construction-time route.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -86,7 +88,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "fuse_kda_inputs", "fuse_gate_up", "merge_gate_waits" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -132,6 +134,16 @@ pub const DecodePredict = enum { f32, bf16 };
 /// construction (swiglu.zig): `fused` one text between the gate / up GEMVs and the down GEMV; `ops` the op chain (the
 /// control). Rounding-class against `ops`.
 pub const DecodeSwiglu = enum { ops, fused };
+/// A trunk launch-fusion switch (reports/.../mimo/glm5next-audit-decode-20261014.md rank 8), installed once at
+/// construction: `off` (the default) is the stack's route, the control; `on` the switch's route. Each changes how many
+/// launches or waits carry the same work, never what is computed (every output of a fused launch is its stock launch's,
+/// bit for bit):
+///   fuse_kda_inputs   a KDA layer's six FP8 input GEMVs (q, k, v, f_a, g_a, b) one launch at <= 8 rows (fusion.zig)
+///   fuse_gate_up      the decode lane's MLPs' FP8 gate and up GEMVs one launch (fusion.zig)
+///   merge_gate_waits  a decode call's gated miss parts wait once per gate value, not once per projection and bank (the
+///                     scheduler's MERGE_GATE_WAITS, deepseek_v41/experts.zig)
+/// Any other value refuses by name in `validate`; a fusion switch on a pack whose sites are not FP8 refuses at the install.
+pub const Fusion = enum { off, on };
 /// `expert_rows_by_layer` (MiMo's mimo/layer-rows, mimo_v2/settings.zig `LayerRows`): the plan's decode rows split
 /// between the routed layers at the SAME total, once at construction. `uniform` (the default) is every layer at the plan's
 /// rows, today's construction exactly. `offsets` is one integer per routed layer (routed layer 0 first, model layer
@@ -278,6 +290,10 @@ pub const Config = struct {
     tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
     /// The decode rows' split between the routed layers (`LayerRows`): `uniform` (the default) or `offsets`.
     expert_rows_by_layer: LayerRows = defaultLayerRows(),
+    /// The trunk launch-fusion switches (`Fusion`): each `off` (the default, the control) or `on`.
+    fuse_kda_inputs: Fusion = .off,
+    fuse_gate_up: Fusion = .off,
+    merge_gate_waits: Fusion = .off,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -289,7 +305,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, merge_gate_waits: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -337,6 +353,12 @@ pub const Config = struct {
             const route: gpu_warm.Route = if (v == .string) gpu_warm.parseRoute(v.string) else .invalid;
             if (route == .invalid) c.malformed.gpu_keep_warm = true else c.gpu_keep_warm = route;
             c.gpu_keep_warm_requested = true;
+        }
+        inline for (.{ "fuse_kda_inputs", "fuse_gate_up", "merge_gate_waits" }) |key| {
+            if (raw.object.get(key)) |v| {
+                const route: ?Fusion = if (v == .string) std.meta.stringToEnum(Fusion, v.string) else null;
+                if (route) |r| @field(c, key) = r else @field(c.malformed, key) = true;
+            }
         }
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
@@ -421,6 +443,9 @@ pub const Config = struct {
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
         if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
+        if (c.malformed.fuse_kda_inputs) return error.Glm5NextFuseKdaInputsSetting;
+        if (c.malformed.fuse_gate_up) return error.Glm5NextFuseGateUpSetting;
+        if (c.malformed.merge_gate_waits) return error.Glm5NextMergeGateWaitsSetting;
         try c.tally.check("glm5_next");
         switch (c.expert_rows_by_layer) {
             .uniform => {},
@@ -583,6 +608,40 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(@as(?u32, 120), built.expert_prefill_rows);
     try testing.expectEqual(@as(u64, 32_768), built.reserveTokens());
     try testing.expectEqual(fill_reserve_tokens, (Config{}).reserveTokens());
+}
+
+test "glm5_next settings: the launch-fusion switches: off unless named, on / off by name, any other value refused by name, none needs the lane" {
+    const keys = [_][]const u8{ "fuse_kda_inputs", "fuse_gate_up", "merge_gate_waits" };
+    const base = try parseSettings("{}");
+    try base.validate();
+    inline for (keys) |key| try testing.expectEqual(Fusion.off, @field(base, key));
+    const on: Fusion = .on;
+    const off: Fusion = .off;
+    for ([_]struct { text: []const u8, want: [3]Fusion }{
+        .{ .text = "{\"mtp_lane\":true,\"fuse_kda_inputs\":\"on\"}", .want = .{ on, off, off } },
+        .{ .text = "{\"mtp_lane\":true,\"fuse_gate_up\":\"on\"}", .want = .{ off, on, off } },
+        .{ .text = "{\"mtp_lane\":true,\"merge_gate_waits\":\"on\"}", .want = .{ off, off, on } },
+        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"fuse_kda_inputs\":\"on\",\"fuse_gate_up\":\"on\",\"merge_gate_waits\":\"on\"}", .want = .{ on, on, on } },
+        .{ .text = "{\"fuse_kda_inputs\":\"off\",\"fuse_gate_up\":\"off\",\"merge_gate_waits\":\"off\"}", .want = .{ off, off, off } },
+        // Every switch serves the serial decode lane too (no lane needed).
+        .{ .text = "{\"fuse_kda_inputs\":\"on\",\"fuse_gate_up\":\"on\",\"merge_gate_waits\":\"on\"}", .want = .{ on, on, on } },
+    }) |case| {
+        const c = try parseSettings(case.text);
+        try c.validate();
+        inline for (keys, 0..) |key, i| try testing.expectEqual(case.want[i], @field(c, key));
+    }
+    // Anything but "on" / "off" refused by name, per key.
+    const refusals = [_]anyerror{ error.Glm5NextFuseKdaInputsSetting, error.Glm5NextFuseGateUpSetting, error.Glm5NextMergeGateWaitsSetting };
+    inline for (keys, 0..) |key, i| {
+        for ([_][]const u8{ "\"ON\"", "\"On\"", "\"yes\"", "\"\"", "\"fused\"", "true", "false", "1", "0", "null", "[\"on\"]" }) |bad| {
+            var buf: [128]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, "{{\"mtp_lane\":true,\"{s}\":{s}}}", .{ key, bad });
+            try testing.expectError(refusals[i], (try parseSettings(text)).validate());
+        }
+    }
+    // Near misses of the names are not settings.
+    for ([_][]const u8{ "{\"fuse_kda_input\":\"on\"}", "{\"fuse_gateup\":\"on\"}", "{\"merge_waits\":\"on\"}", "{\"fusion\":\"on\"}" }) |text|
+        try testing.expectError(error.Unknown, parseSettings(text));
 }
 
 test "glm5_next settings: the resolved draft depth per arch (glm5_next depth 2, gate 0.75; MiMo its trained 3; DSV4.1's DSpark schedule unchanged)" {
