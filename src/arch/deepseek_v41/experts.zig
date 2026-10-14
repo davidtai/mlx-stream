@@ -904,8 +904,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         devroute: bool = false,
         dev_lut: [][2]T = &.{},
         dev_parity: []u1 = &.{},
+        /// A gated scheduler's decode call's miss parts, bound at construction (`bindMergeGateWaits`): each projection of
+        /// each bank waited on its own (the stock route), or every array of one gate value in one wait (MERGE_GATE_WAITS).
+        gated_parts: if (routes.gated) *const GatedPartsFn else void = if (routes.gated) gatedPartsStock else {},
 
         const GateUpWaveFn = fn (self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, w: u8, over: ?*const [n_banks]?Arrays) anyerror!Wave;
+        const GatedPartsFn = fn (self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, gates: expert_stream.Gates, acc: *Acc) anyerror!void;
         const DownWaveFn = fn (self: *Self, g: *G, layer: u32, wave: *const Wave, acc: *Acc, over: ?*const [n_banks]?Arrays) anyerror![]const T;
         const PreBarrierFn = fn (g: *G, barrier: []const T, hoist: []const T) anyerror!void;
         const PostHitFn = fn (g: *G, hoist: []const T) anyerror!void;
@@ -1113,11 +1117,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return g.add(try g.sqrt(try g.logaddexp(z, try g.scalar(0, .float32))), gate.bias);
         }
 
-        /// An event wait's aliases of `xs` (the GPU reads them after `value`), into `outs` (any contents).
+        /// An event wait's aliases of `xs` (the GPU reads them after `value`), into `outs` (any contents). One wait (one
+        /// pass-through primitive, one encoder split) whatever `xs.len`; the trace backend counts the waits (`wait_calls`).
         fn eventWait(self: *Self, g: *G, xs: []const T, value: u64, deps: []const T, outs: []T) !void {
             if (G == ops.MlxOps) {
                 try mlxEventWait(g, self.event, xs, value, deps, outs);
             } else {
+                if (comptime @hasField(G, "wait_calls")) g.wait_calls += 1;
                 for (xs, outs) |x, *o| o.* = try g.eventAlias(x, value, deps.len);
             }
         }
@@ -1214,6 +1220,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             /// started: they run during the read wait, not in the next routing barrier.
             pub fn routedHoist(h: Hook, g: *G, xf: T, indices: T, hoist: []const T) !T {
                 return h.ex.run(g, h.layer, xf, indices, hoist);
+            }
+
+            /// `routedHoist` ending before the join's take (JOIN_INDEXED, a decode-lane call): the concatenated outputs and
+            /// each routed position's row in them, for a combine that reads the rows in place.
+            pub fn routedHoistIndexed(h: Hook, g: *G, xf: T, indices: T, hoist: []const T) !Indexed {
+                return h.ex.runEnd(g, h.layer, xf, indices, hoist, .indexed);
             }
 
             /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs as the
@@ -1370,11 +1382,30 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return acc.outs[first..acc.n_outs];
         }
 
+        /// The gated waves on the route bound at construction (`gated_parts`).
+        fn gatedParts(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, gates: expert_stream.Gates, acc: *Acc) !void {
+            return self.gated_parts(self, g, layer, xf, k, sv, gates, acc);
+        }
+
+        /// MERGE_GATE_WAITS bound (a decode call's gated miss parts wait once per gate value), once at construction,
+        /// before any call. Needs the gated route.
+        pub fn bindMergeGateWaits(self: *Self) !void {
+            if (comptime routes.gated) {
+                self.gated_parts = gatedPartsMerged;
+            } else return error.MergeGateWaitsNeedsGated;
+        }
+
+        /// MERGE_GATE_WAITS as bound at construction.
+        pub fn mergeGateWaits(self: *const Self) bool {
+            return if (comptime routes.gated) self.gated_parts == &gatedPartsMerged else false;
+        }
+
         /// The gated waves (the lookahead4 lane's event gate): every part's
         /// gate/up over bank arrays waited at `gu`, then part p's down over
         /// arrays waited at `down_first + p`, ordered after every gate/up and
-        /// the previous part's down. Nothing waits on the host.
-        fn gatedParts(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, gates: expert_stream.Gates, acc: *Acc) !void {
+        /// the previous part's down. Nothing waits on the host. Each projection
+        /// of each bank waits on its own (the stock route).
+        fn gatedPartsStock(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, gates: expert_stream.Gates, acc: *Acc) anyerror!void {
             var gu: [n_banks]?Arrays = @splat(null);
             for (sv.waves, sv.refs) |w, ref| {
                 const b = @backingInt(ref.bank);
@@ -1405,6 +1436,72 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
         }
 
+        /// MERGE_GATE_WAITS: `gatedPartsStock`'s waves over the same arrays, gates and deps, with one event wait per gate
+        /// value: the gate and up arrays of every bank the call's misses read wait at `gu` together, then part p's down
+        /// arrays of every such bank at `down_first + p` together (behind the same deps). The stock route waits each
+        /// projection of each bank on its own at those same values. Exact: every array aliases the same buffer behind the
+        /// same value; only the waits (each one pass-through primitive and one encoder split) are fewer.
+        fn gatedPartsMerged(self: *Self, g: *G, layer: u32, xf: T, k: u32, sv: Served, gates: expert_stream.Gates, acc: *Acc) anyerror!void {
+            const pc = EventProjection.count;
+            var gu: [n_banks]?Arrays = @splat(null);
+            // The banks the misses read, in the stock route's order (first appearance), each one's gate then up arrays.
+            var order: [n_banks]usize = undefined;
+            var nb: usize = 0;
+            var seen: [n_banks]bool = @splat(false);
+            var xs: [2 * n_banks * pc]T = undefined;
+            for (sv.waves, sv.refs) |w, ref| {
+                const b = @backingInt(ref.bank);
+                if (w == 0 or seen[b]) continue;
+                seen[b] = true;
+                const arrays = self.banks[layer][b].?;
+                xs[2 * pc * nb ..][0..pc].* = EventProjection.inputs(arrays.gate);
+                xs[2 * pc * nb + pc ..][0..pc].* = EventProjection.inputs(arrays.up);
+                order[nb] = b;
+                nb += 1;
+            }
+            if (nb > 0) {
+                var outs: [2 * n_banks * pc]T = undefined;
+                try self.eventWait(g, xs[0 .. 2 * pc * nb], gates.gu, &.{}, outs[0 .. 2 * pc * nb]);
+                for (order[0..nb], 0..) |b, i| {
+                    const arrays = self.banks[layer][b].?;
+                    gu[b] = .{ .gate = EventProjection.fromWaited(outs[2 * pc * i ..][0..pc].*), .up = EventProjection.fromWaited(outs[2 * pc * i + pc ..][0..pc].*), .down = arrays.down };
+                }
+            }
+            var waves: [max_route_ids]Wave = undefined;
+            var hs: [max_route_ids]T = undefined;
+            var n_hs: usize = 0;
+            for (0..sv.n_parts) |p| {
+                waves[p] = try self.gate_up_wave(self, g, layer, xf, k, sv, @intCast(p + 1), &gu);
+                for (waves[p].h[0..waves[p].n]) |h| {
+                    hs[n_hs] = h;
+                    n_hs += 1;
+                }
+            }
+            var prev: []const T = &.{};
+            for (0..sv.n_parts) |p| {
+                var deps: [2 * max_route_ids]T = undefined;
+                @memcpy(deps[0..n_hs], hs[0..n_hs]);
+                @memcpy(deps[n_hs..][0..prev.len], prev);
+                var dn = gu;
+                var dx: [n_banks * pc]T = undefined;
+                var nd: usize = 0;
+                for (dn) |d| if (d) |arr| {
+                    dx[pc * nd ..][0..pc].* = EventProjection.inputs(arr.down);
+                    nd += 1;
+                };
+                if (nd > 0) {
+                    var dout: [n_banks * pc]T = undefined;
+                    try self.eventWait(g, dx[0 .. pc * nd], gates.down_first + p, deps[0 .. n_hs + prev.len], dout[0 .. pc * nd]);
+                    var i: usize = 0;
+                    for (&dn) |*d| if (d.*) |*arr| {
+                        arr.down = EventProjection.fromWaited(dout[pc * i ..][0..pc].*);
+                        i += 1;
+                    };
+                }
+                prev = try self.down_wave(self, g, layer, &waves[p], acc, &dn);
+            }
+        }
+
         /// `PackedDecode.run` (gate/up publish before down): the routing
         /// barrier, the residents' wave, then per miss part gate/up after
         /// `waitGu` and down after `waitDown`, each wave started on the GPU;
@@ -1424,6 +1521,18 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         pub fn run(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T) !T {
+            return self.runEnd(g, layer, xf, indices, hoist, .take);
+        }
+
+        /// A decode-lane call's outputs before the join's take (`Hook.routedHoistIndexed`, JOIN_INDEXED: the caller's
+        /// combine reads the rows in place): the concatenated outputs [rows, hidden] and each routed position's row in
+        /// them, u32 [n * k] (`joinOrder`; the stock join takes exactly these rows).
+        pub const Indexed = struct { rows: T, order: T };
+
+        /// How a call ends: the join's take (`run`, every caller's route) or the indexed rows (JOIN_INDEXED).
+        const Ending = enum { take, indexed };
+
+        fn runEnd(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T, comptime ending: Ending) !(if (ending == .take) T else Indexed) {
             const n: u32 = @intCast(g.shapeOf(xf).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
             const n_ids = n * k;
@@ -1432,7 +1541,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (if (comptime @hasDecl(M, "prefill_min_tokens")) n >= M.prefill_min_tokens else n_ids > max_route_ids) {
                 // Only a decode-width layer hoists (the trunk's small-rows segments).
                 std.debug.assert(hoist.len == 0);
-                if (comptime !routes.prefill) {
+                if (comptime ending == .indexed) {
+                    // The indexed join serves the decode lane only (a wide call joins in its combine already).
+                    return error.IndexedJoinWideCall;
+                } else if (comptime !routes.prefill) {
                     return error.PrefillLaneNotPorted;
                 } else {
                     return self.runWide(g, layer, xf, indices, n, k);
@@ -1523,7 +1635,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (dev != null) try self.devLutAfterRoute(g, layer);
             if (comptime timeline.enabled) timeline.point(layer, .end, self.readGauge(), sv.n_parts > 0);
             if (comptime first_cycle.enabled) first_cycle.call(layer, t_barrier - t_call, t_route - t_route0, dt.now() - t_route, ids, sv.waves, wall_b, tail_reads);
-            return self.join(g, &acc, n, k);
+            return if (comptime ending == .take) self.join(g, &acc, n, k) else joinIndexed(g, &acc, n, k);
         }
 
         /// Each routed position's row in the concatenated outputs: the LAST row carrying it (DEVROUTE's miss parts follow
@@ -1541,6 +1653,15 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const n_ids = joinOrder(acc.pos[0..acc.n_pos], n * k, &order);
             const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
             return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+        }
+
+        /// `join` without its take: the concatenated outputs and the order the take would read them in (JOIN_INDEXED).
+        fn joinIndexed(g: *G, acc: *const Acc, n: u32, k: u32) !Indexed {
+            const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
+            var order: [max_route_ids]u32 = undefined;
+            const n_ids = joinOrder(acc.pos[0..acc.n_pos], n * k, &order);
+            const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
+            return .{ .rows = joined, .order = ord };
         }
 
         /// The self-check's joined row as the host reads it: a math with its own projection (bf16 joins) casts to
@@ -3342,6 +3463,159 @@ test "dsv41 experts: the gated route builds every wave at once over event-wait a
         }
         if (p > 0) try testing.expect(part[0].n_deps > prev_deps);
         prev_deps = part[0].n_deps;
+    }
+}
+
+/// One routed call of the gated test scheduler (FakeSource, the eager chain), stock or MERGE_GATE_WAITS: its nodes, its
+/// waits' aliases, the waits it built, its parts and the banks its misses read.
+const MergeWaitsRun = struct {
+    nodes: []TraceOps.Node = &.{},
+    waits: []TraceOps.Wait = &.{},
+    calls: usize = 0,
+    parts: u32 = 0,
+    banks: usize = 0,
+
+    fn deinit(r: *MergeWaitsRun, a: std.mem.Allocator) void {
+        a.free(r.nodes);
+        a.free(r.waits);
+    }
+
+    fn run(a: std.mem.Allocator, merge: bool, ids: []const u16) !MergeWaitsRun {
+        const c = testConfig(256, 128, 2);
+        var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+        defer src.deinit();
+        var g = TraceOps.init(a);
+        defer g.deinit();
+        const Chain = EagerChain(TraceOps, TraceGemv);
+        var ex = try ExpertsWith(TraceOps, FakeSource, Chain, .{ .gated = true }).init(a, &g, &src, Chain.init(.{}, &c), &c);
+        defer ex.deinit();
+        // Off unless bound; bound once, at construction.
+        try testing.expect(!ex.mergeGateWaits());
+        if (merge) try ex.bindMergeGateWaits();
+        try testing.expectEqual(merge, ex.mergeGateWaits());
+        try ex.grow(&g, &.{ 8, 8 });
+        src.log.clearRetainingCapacity();
+        src.trace = &g;
+        var script: Script = .{ .calls = &.{ids} };
+        g.host_values = script.values();
+        const first = g.nodes.items.len;
+        const w0 = g.waits.items.len;
+        const c0 = g.wait_calls;
+        _ = try ex.at(0).routed(&g, try g.input(&.{ 2, 256 }, .bfloat16), try g.input(&.{ 2, 3 }, .int32));
+        const sv = src.served(&src.calls[0]);
+        var kinds: [n_banks]bool = @splat(false);
+        for (sv.waves, sv.refs) |w, r| {
+            if (w > 0) kinds[@backingInt(r.bank)] = true;
+        }
+        var out: MergeWaitsRun = .{ .calls = g.wait_calls - c0, .parts = sv.n_parts };
+        for (kinds) |k| out.banks += @intFromBool(k);
+        out.nodes = try a.dupe(TraceOps.Node, g.nodes.items[first..]);
+        errdefer a.free(out.nodes);
+        out.waits = try a.dupe(TraceOps.Wait, g.waits.items[w0..]);
+        return out;
+    }
+};
+
+test "dsv41 experts: MERGE_GATE_WAITS: one event wait per gate value (1 + parts a call, the stock route 2 per miss bank + one per bank a part), every node, alias, value and dep the stock route's; an ungated scheduler refuses it by name" {
+    const a = testing.allocator;
+    var waited: usize = 0;
+    for ([_][]const u16{ &.{ 1, 2, 3, 4, 5, 6 }, &.{ 7, 8, 9, 10, 11, 12 }, &.{ 1, 1, 2, 3, 3, 9 } }) |ids| {
+        var stock = try MergeWaitsRun.run(a, false, ids);
+        defer stock.deinit(a);
+        var merged = try MergeWaitsRun.run(a, true, ids);
+        defer merged.deinit(a);
+        // The same call: the same parts and miss banks.
+        try testing.expectEqual(stock.parts, merged.parts);
+        try testing.expectEqual(stock.banks, merged.banks);
+        try testing.expect(stock.parts > 0 and stock.banks > 0);
+        // Exact by construction: every node (each alias, wave and join) in the same order, op, dtype and shape, and every
+        // alias at the same value behind the same deps.
+        try testing.expectEqual(stock.nodes.len, merged.nodes.len);
+        for (stock.nodes, merged.nodes) |x, y| {
+            try testing.expectEqual(x.op, y.op);
+            try testing.expectEqual(x.dtype, y.dtype);
+            try testing.expect(x.shape.eql(y.shape));
+        }
+        try testing.expectEqualSlices(TraceOps.Wait, stock.waits, merged.waits);
+        // The waits built: the stock route's gate and up of each miss bank and each part's down per bank; one per value.
+        try testing.expectEqual(2 * stock.banks + stock.banks * stock.parts, stock.calls);
+        try testing.expectEqual(1 + merged.parts, merged.calls);
+        waited += stock.calls - merged.calls;
+    }
+    try testing.expect(waited > 0);
+    // An ungated scheduler (its parts wait on the host) refuses the route by name.
+    const c = testConfig(256, 128, 2);
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+    defer src.deinit();
+    var g = TraceOps.init(a);
+    defer g.deinit();
+    var ex = try Experts(TraceOps, FakeSource, Chain).init(a, &g, &src, Chain.init(.{}, &c), &c);
+    defer ex.deinit();
+    try testing.expectError(error.MergeGateWaitsNeedsGated, ex.bindMergeGateWaits());
+    try testing.expect(!ex.mergeGateWaits());
+}
+
+test "dsv41 experts: JOIN_INDEXED: a decode call ending before the join's take: every node the stock call's but the take and its reshape, the order the take's index byte for byte, the rows the take's source" {
+    const a = testing.allocator;
+    const c = testConfig(256, 128, 2);
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Chain, .{ .gated = true });
+    for ([_][]const u16{ &.{ 1, 2, 3, 4, 5, 6 }, &.{ 1, 1, 2, 3, 3, 9 }, &.{ 7, 8, 9, 10, 11, 12 } }) |ids| {
+        var stock_ops: std.ArrayList(ops.Op) = .empty;
+        defer stock_ops.deinit(a);
+        var idx_ops: std.ArrayList(ops.Op) = .empty;
+        defer idx_ops.deinit(a);
+        var stock_order: []u8 = &.{};
+        defer a.free(stock_order);
+        var idx_order: []u8 = &.{};
+        defer a.free(idx_order);
+        var stock_rows: ops.Shape = .{};
+        var idx_rows: ops.Shape = .{};
+        var out_shape: ops.Shape = .{};
+        for ([_]bool{ false, true }) |indexed| {
+            var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+            defer src.deinit();
+            var g = TraceOps.init(a);
+            defer g.deinit();
+            g.record_host = true;
+            var ex = try Ex.init(a, &g, &src, Chain.init(.{}, &c), &c);
+            defer ex.deinit();
+            try ex.grow(&g, &.{ 8, 8 });
+            src.log.clearRetainingCapacity();
+            src.trace = &g;
+            var script: Script = .{ .calls = &.{ids} };
+            g.host_values = script.values();
+            const xf = try g.input(&.{ 2, 256 }, .bfloat16);
+            const idx = try g.input(&.{ 2, 3 }, .int32);
+            const first = g.nodes.items.len;
+            if (indexed) {
+                const j = try ex.at(0).routedHoistIndexed(&g, xf, idx, &.{});
+                for (g.nodes.items[first..]) |nd| try idx_ops.append(a, nd.op);
+                idx_order = try a.dupe(u8, g.hostBytesOf(j.order).?);
+                idx_rows = g.shapeOf(j.rows);
+                try testing.expectEqual(ops.Dtype.uint32, g.dtypeOf(j.order));
+            } else {
+                const out = try ex.at(0).routedHoist(&g, xf, idx, &.{});
+                for (g.nodes.items[first..]) |nd| try stock_ops.append(a, nd.op);
+                out_shape = g.shapeOf(out);
+                // The take's index: the call's last host array; its source: the node before it (the concat, or the one output).
+                var last_host: usize = g.nodes.items.len;
+                while (last_host > first) : (last_host -= 1) if (g.nodes.items[last_host - 1].op == .host) break;
+                stock_order = try a.dupe(u8, g.hostBytesOf(@intCast(last_host - 1)).?);
+                stock_rows = g.nodes.items[last_host - 2].shape;
+            }
+        }
+        // The stock call is the indexed call then the take and its reshape to [n, k, hidden].
+        try testing.expectEqual(idx_ops.items.len + 2, stock_ops.items.len);
+        try testing.expectEqualSlices(ops.Op, idx_ops.items, stock_ops.items[0..idx_ops.items.len]);
+        try testing.expectEqual(ops.Op.take, stock_ops.items[idx_ops.items.len]);
+        try testing.expectEqual(ops.Op.reshape, stock_ops.items[idx_ops.items.len + 1]);
+        try testing.expect(out_shape.eql(ops.Shape.of(&.{ 2, 3, 256 })));
+        // The same order (each routed position's row) and the same rows the take reads.
+        try testing.expectEqualSlices(u8, stock_order, idx_order);
+        try testing.expectEqual(@as(usize, 2 * 3 * 4), idx_order.len);
+        try testing.expect(stock_rows.eql(idx_rows));
     }
 }
 
