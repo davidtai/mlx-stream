@@ -24,6 +24,9 @@ const bridge = @import("../mimo_v2/stream_source.zig");
 const mimo_math = @import("../mimo_v2/math.zig");
 const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
 const bank_mod = @import("bank.zig");
+const exl3_bank = @import("exl3_bank.zig");
+const exl3_math = @import("exl3_math.zig");
+const exl3_kernels = @import("exl3_kernels.zig");
 const nvfp4 = @import("nvfp4.zig");
 const settings = @import("settings.zig");
 const glue = @import("glue.zig");
@@ -34,6 +37,7 @@ const route_trace = @import("../mimo_v2/route_trace.zig");
 const log = sdk.log;
 
 const T = mlx.mlx_array;
+const Module = @This();
 
 pub const top_k: u32 = 8;
 /// Profile builds: the route trace over the bank's 288 experts (u16 ids, `GLM5_NEXT_ROUTE_TRACE`).
@@ -45,6 +49,29 @@ pub const StreamSource = B.StreamSource;
 pub const Math = mimo_math.MathOf(nvfp4.Format);
 pub const Experts = shared_experts.ExpertsWith(ops.MlxOps, StreamSource, Math, .{ .prefill = true, .gated = true, .lookahead = true });
 pub const Gate = Experts.Gate;
+
+/// The routed experts' quant family, chosen once at construction by the pack's `expert_streaming` block
+/// (`settings.Config.expert_family`): `nvfp4` (the stack of record's NVFP4 bank) or `exl3` (an EXL3 K=3 mul1 bank-v2
+/// pack: exl3_bank.zig, exl3_math.zig). Each family is its own `SourceOf` type: no per-call branch on the family.
+pub const Family = settings.ExpertFamily;
+
+/// A family's bank module, stream bridge, math and scheduler.
+pub fn Types(comptime fam: Family) type {
+    return switch (fam) {
+        .nvfp4 => struct {
+            pub const bank = bank_mod;
+            pub const Bridge = Module.B;
+            pub const Math = Module.Math;
+            pub const Experts = Module.Experts;
+        },
+        .exl3 => struct {
+            pub const bank = exl3_bank;
+            pub const Bridge = bridge.For(exl3_bank, .{ .Arrays = exl3_bank.Arrays, .staging_bytes = settings.reader_staging_bytes, .Trace = Trace });
+            pub const Math = exl3_math.Math;
+            pub const Experts = shared_experts.ExpertsWith(ops.MlxOps, Bridge.StreamSource, exl3_math.Math, .{ .prefill = true, .gated = true, .lookahead = true });
+        },
+    };
+}
 
 /// `decode_predict: bf16`: the next routed layer's scores from its router's BF16 weight as stored ([experts, hidden], MLX's
 /// gemv over x [n, hidden]), then the sigmoid and the correction as MiMo's F32 route: f32 [n, experts]. Half the F32
@@ -85,9 +112,14 @@ comptime {
 /// phase rows' transient release, the read schedule's overlap route with prompt lever 1's relocation, decode's window 0,
 /// and the rate tally (`tally`: every layer pins at most floor(ratio x 288) experts; none at ratio 0).
 pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !B.Options {
-    var opts = B.eventOptions(rows, memory, event);
+    return streamOptionsOf(B, rows, memory, event, tally);
+}
+
+/// `streamOptions` over a family's bridge `Bp` (the same options for every family).
+pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !Bp.Options {
+    var opts = Bp.eventOptions(rows, memory, event);
     opts.transient_release = true;
-    try B.applyReadSchedule(&opts, read_schedule);
+    try Bp.applyReadSchedule(&opts, read_schedule);
     opts.prompt_relocate = prompt_relocate;
     opts.decode_route_ids = mimo_stream.decodeRouteIds(decode_window);
     opts.tally = if (tally.enabled()) .{ .ratio = tally.ratio, .window = tally.window } else null;
@@ -99,39 +131,12 @@ pub fn decodeLane(nt: u32, decoding: bool) bool {
     return nt == 1 or (decoding and nt <= decode_lane_rows);
 }
 
-const PartsCombineFn = fn (self: *const Source, g: *ops.MlxOps, outs: []const T, loc: T, route_weights: T, nt: u32) anyerror!T;
-
 /// The decode lane's combine (MiMo's stock): `routed` [n, 8, H] bf16 in router order, f32 weights [n, 8]; f32 products,
 /// the sum over the 8 routes, bf16 once.
 fn combineStock(g: *ops.MlxOps, routed: T, route_weights: T) !T {
     const n = g.shapeOf(routed).d[0];
     const expanded = try g.reshape(route_weights, &.{ n, top_k, 1 });
     return g.astype(try g.sum(try g.mul(try g.astype(routed, .float32), expanded), 1, false), .bfloat16);
-}
-
-/// The prompt combine over the wide call's sources read in place (P7 `inplace`, the host's wired policy `max`).
-fn partsCombineInplace(self: *const Source, g: *ops.MlxOps, outs: []const T, loc: T, route_weights: T, nt: u32) !T {
-    if (comptime ptl.enabled) ptl.tile(.reduce, nt, 0, &.{});
-    const encode_start = profile.now();
-    const output = try self.combine_kernel.callInplace(g, outs, loc, route_weights, nt);
-    profile.charge(.encode, encode_start);
-    const drain_start = profile.now();
-    try g.evalAll(&.{output});
-    profile.charge(.drain, drain_start);
-    return g.keep(output);
-}
-
-/// The same text over at most `prefill_combine.sources` bound sources (the scheduler merges the rest): under any other
-/// wired policy (the in-place form needs every source in MLX's residency sets).
-fn partsCombineFused(self: *const Source, g: *ops.MlxOps, outs: []const T, loc: T, route_weights: T, nt: u32) !T {
-    if (comptime ptl.enabled) ptl.tile(.reduce, nt, 0, &.{});
-    const encode_start = profile.now();
-    const output = try self.combine_kernel.call(g, outs, loc, route_weights, nt);
-    profile.charge(.encode, encode_start);
-    const drain_start = profile.now();
-    try g.evalAll(&.{output});
-    profile.charge(.drain, drain_start);
-    return g.keep(output);
 }
 
 /// The prompt combine the host's wired policy allows (`MLX_SERVE_WIRED`, read once at construction): `inplace` under
@@ -147,317 +152,396 @@ fn expertActivation(g: *ops.MlxOps, gate: T, up: T) !T {
     return sdk_ext.quant.activation(ops.MlxOps, g, .{ .swiglu_clamped = 10.0 }, gate, up);
 }
 
-pub const Source = struct {
-    allocator: std.mem.Allocator,
-    bank: bank_mod.Bank,
-    sdk_bank: bank_mod.SDKBank,
-    sdk_stream: *Stream,
-    stream_source: StreamSource,
-    g: ops.MlxOps,
-    /// The prompt phase's rows per routed layer and the decode phase's (each at least the prompt's).
-    rows: []const u32,
-    decode_rows: []const u32,
-    ex: Experts,
-    parts_combine: *const PartsCombineFn = partsCombineInplace,
-    combine_kernel: prefill_combine.Kernel = .{},
-    combine_route: prefill_combine.Route = .inplace,
-    /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine (its own queue, kernel, buffer and parked thread); the
-    /// stream source holds its arm (`warm_arm`: armed by `gate` and `awaitReadAhead`). Null on the control.
-    warm: ?*gpu_warm.Warm = null,
-    /// P1's host scratch (reused): the call's predicted counts (read back from the GPU, prompt lever 5), the ranking.
-    ahead_counts: [max_experts]u32 = undefined,
-    ahead_ranked: [max_experts]u16 = undefined,
+pub fn SourceOf(comptime fam: Family) type {
+    return struct {
+        const Self = @This();
+        const Fam = Types(fam);
+        const PartsCombineFn = fn (self: *const Self, g: *ops.MlxOps, outs: []const T, loc: T, route_weights: T, nt: u32) anyerror!T;
 
-    /// Construction (the GPU stream, under the caller's lock): the bank opened, the stream at `rows`, the scheduler
-    /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
-    /// routed layer's.
-    pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings) !*Source {
-        var bank = try bank_mod.Bank.open(a, io, model_dir);
-        errdefer bank.deinit();
-        const geo = bank.geometry;
-        try geo.requireFlash();
-        if (rows.len != geo.num_moe_layers or decode_rows.len != rows.len) return error.Glm5NextExpertRows;
-        var widest: u32 = mimo_stream.transient_rows;
-        for (rows, decode_rows) |p, d| {
-            if (p == 0 or p > d or d > geo.num_experts) return error.Glm5NextExpertRows;
-            widest = @max(widest, d);
+        /// The prompt combine over the wide call's sources read in place (P7 `inplace`, the host's wired policy `max`).
+        fn partsCombineInplace(self: *const Self, g: *ops.MlxOps, outs: []const T, loc: T, route_weights: T, nt: u32) !T {
+            if (comptime ptl.enabled) ptl.tile(.reduce, nt, 0, &.{});
+            const encode_start = profile.now();
+            const output = try self.combine_kernel.callInplace(g, outs, loc, route_weights, nt);
+            profile.charge(.encode, encode_start);
+            const drain_start = profile.now();
+            try g.evalAll(&.{output});
+            profile.charge(.drain, drain_start);
+            return g.keep(output);
         }
-        // Every slot array within the device's largest buffer (once, before any allocation).
-        const buffer_limit = mlx.maxBufferLength();
-        if (buffer_limit == 0) return error.Glm5NextBufferLimitUnknown;
-        for (geo.segments) |seg| if (@as(u64, widest) * seg.length > buffer_limit) return error.Glm5NextBufferLimit;
-        if (gates.len != geo.first_moe_layer + geo.num_moe_layers) return error.Glm5NextGateTable;
 
-        const self = try a.create(Source);
-        errdefer a.destroy(self);
-        self.* = .{ .allocator = a, .bank = bank, .sdk_bank = undefined, .sdk_stream = undefined, .stream_source = undefined, .g = undefined, .rows = undefined, .decode_rows = undefined, .ex = undefined };
-        self.rows = try a.dupe(u32, rows);
-        errdefer a.free(self.rows);
-        self.decode_rows = try a.dupe(u32, decode_rows);
-        errdefer a.free(self.decode_rows);
-        self.g = try ops.MlxOps.init(a, stream);
-        errdefer self.g.deinit();
-        self.sdk_bank = try bank_mod.SDKBank.init(a, &self.bank);
-        errdefer self.sdk_bank.deinit();
-        // The reader's staging holds the bank's widest span (Flash's gate/up span plus its page alignment and a page):
-        // refused here, once, if a bank's spans outgrow it.
-        if (B.S.stagingBytes(&self.sdk_bank) > settings.reader_staging_bytes) return error.Glm5NextReaderStaging;
-        const event = try expert_event.createMetal();
-        self.sdk_stream = try Stream.init(a, &self.sdk_bank, try streamOptions(self.rows, .{ .mlx = stream }, event, tally));
-        errdefer self.sdk_stream.deinit();
-        self.stream_source = StreamSource.init(self.sdk_stream);
-        try self.stream_source.installReadSchedule(read_schedule, mimo_stream.default_read_schedule_threshold);
-        // MiMo's X12 (`gpu_keep_warm`, the route the module resolved: `settings.Config.warmRoute`): `.waits` makes the warm
-        // queue, kernel and buffer on MLX's device (no kernel runs) and starts the parked warm thread, once, and binds its
-        // arm into the stream source (mimo_v2/source.zig's install); `.off` installs nothing; refused by name on a CPU
-        // stream or without the stream's Metal event.
-        self.warm = try gpu_warm.install(a, keep_warm, stream, event.object);
-        errdefer if (self.warm) |w| w.destroy();
-        if (self.warm) |w| self.stream_source.warm_arm = gpu_warm.Arm.of(gpu_warm.Warm, w);
-        // The slot arrays are the format's, every routed layer's (base and transient banks), checked once.
-        for (0..geo.num_moe_layers) |i| {
-            const layer: u32 = geo.first_moe_layer + @as(u32, @intCast(i));
-            for ([_]B.BankKind{ .base, .transient }) |kind| if (try self.stream_source.bankArrays(&self.g, layer, kind)) |arrays| {
-                try nvfp4.checkArrays(&self.g, "gate", arrays.gate, geo.hidden_size, geo.intermediate_size);
-                try nvfp4.checkArrays(&self.g, "up", arrays.up, geo.hidden_size, geo.intermediate_size);
-                try nvfp4.checkArrays(&self.g, "down", arrays.down, geo.intermediate_size, geo.hidden_size);
-            };
+        /// The same text over at most `prefill_combine.sources` bound sources (the scheduler merges the rest): under any other
+        /// wired policy (the in-place form needs every source in MLX's residency sets).
+        fn partsCombineFused(self: *const Self, g: *ops.MlxOps, outs: []const T, loc: T, route_weights: T, nt: u32) !T {
+            if (comptime ptl.enabled) ptl.tile(.reduce, nt, 0, &.{});
+            const encode_start = profile.now();
+            const output = try self.combine_kernel.call(g, outs, loc, route_weights, nt);
+            profile.charge(.encode, encode_start);
+            const drain_start = profile.now();
+            try g.evalAll(&.{output});
+            profile.charge(.drain, drain_start);
+            return g.keep(output);
         }
-        // Scale-line isolation (bank.zig `scale_line_bytes`): every slot array the stream makes (base, transient, and the
-        // phase change's ext and window 0, by the same `StreamOf.arrayShape`) holds each slot's global scales on its own line.
-        log.info("glm5_next bank: scale lines isolated (each slot's gate/up/down global scale on its own {d}-byte line, f32 [rows, {d}], arrays >= {d} B in their own buffers, device-class; checked on {d} routed layers)\n", .{ bank_mod.scale_line_bytes, bank_mod.scale_line_floats, bank_mod.scale_array_min_bytes, geo.num_moe_layers });
-        var math = try Math.init(a, geo, expertActivation);
-        errdefer math.deinit(&self.g);
-        math.drain = try Math.drainsOf(drain);
-        math.bank_view = try Math.bankViewsOf(bank_view);
-        // The lookahead predictor (`decode_predict`): the scores on the router's BF16 weight (`scoresBf16`), or MiMo's F32
-        // route (the control); the gate table holds the matching weight (graph.zig `gates`).
-        math.predictor = switch (predict) {
-            .f32 => try mimo_math.Predictor.install(.f32, geo),
-            .bf16 => .{ .scores = scoresBf16 },
-        };
-        // The decode lane's route: the fused NVFP4 texts installed here (their compile self-check, the launches prepared
-        // per wave width), refused by name, under `fused` and `hitpass`; the stock gathers otherwise.
-        if (decode_moe != .stock) {
-            var diag: sdk.Diag = .{};
-            math.fused = nvfp4.FusedDecode.install(a, stream, geo.hidden_size, geo.intermediate_size, top_k, 10.0, &diag) catch |e| {
-                log.err("glm5_next: the fused decode route refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+
+        allocator: std.mem.Allocator,
+        bank: Fam.bank.Bank,
+        sdk_bank: Fam.bank.SDKBank,
+        sdk_stream: *Fam.Bridge.Stream,
+        stream_source: Fam.Bridge.StreamSource,
+        g: ops.MlxOps,
+        /// The prompt phase's rows per routed layer and the decode phase's (each at least the prompt's).
+        rows: []const u32,
+        decode_rows: []const u32,
+        ex: Fam.Experts,
+        /// exl3: the routers' gates as the family's scheduler types them (the module's table, copied once at construction).
+        own_gates: if (fam == .exl3) []Fam.Experts.Gate else void = if (fam == .exl3) &.{} else {},
+        parts_combine: *const PartsCombineFn = partsCombineInplace,
+        combine_kernel: prefill_combine.Kernel = .{},
+        combine_route: prefill_combine.Route = .inplace,
+        /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine (its own queue, kernel, buffer and parked thread); the
+        /// stream source holds its arm (`warm_arm`: armed by `gate` and `awaitReadAhead`). Null on the control.
+        warm: ?*gpu_warm.Warm = null,
+        /// P1's host scratch (reused): the call's predicted counts (read back from the GPU, prompt lever 5), the ranking.
+        ahead_counts: [max_experts]u32 = undefined,
+        ahead_ranked: [max_experts]u16 = undefined,
+
+        /// Construction (the GPU stream, under the caller's lock): the bank opened, the stream at `rows`, the scheduler
+        /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
+        /// routed layer's.
+        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings) !*Self {
+            const Bm = Fam.Bridge;
+            const bm = Fam.bank;
+            var open_diag: sdk.Diag = .{};
+            var bank = (if (comptime fam == .exl3) bm.Bank.open(a, io, model_dir, bm.flash_first_moe_layer, bm.flash, &open_diag) else bm.Bank.open(a, io, model_dir)) catch |e| {
+                if (open_diag.len > 0) log.err("{s}\n", .{open_diag.message()});
                 return e;
             };
+            errdefer bank.deinit();
+            const geo = bank.geometry;
+            try geo.requireFlash();
+            if (rows.len != geo.num_moe_layers or decode_rows.len != rows.len) return error.Glm5NextExpertRows;
+            var widest: u32 = mimo_stream.transient_rows;
+            for (rows, decode_rows) |p, d| {
+                if (p == 0 or p > d or d > geo.num_experts) return error.Glm5NextExpertRows;
+                widest = @max(widest, d);
+            }
+            // Every slot array within the device's largest buffer (once, before any allocation).
+            const buffer_limit = mlx.maxBufferLength();
+            if (buffer_limit == 0) return error.Glm5NextBufferLimitUnknown;
+            for (geo.segments) |seg| if (@as(u64, widest) * seg.length > buffer_limit) return error.Glm5NextBufferLimit;
+            if (gates.len != geo.first_moe_layer + geo.num_moe_layers) return error.Glm5NextGateTable;
+
+            const self = try a.create(Self);
+            errdefer a.destroy(self);
+            self.* = .{ .allocator = a, .bank = bank, .sdk_bank = undefined, .sdk_stream = undefined, .stream_source = undefined, .g = undefined, .rows = undefined, .decode_rows = undefined, .ex = undefined };
+            self.rows = try a.dupe(u32, rows);
+            errdefer a.free(self.rows);
+            self.decode_rows = try a.dupe(u32, decode_rows);
+            errdefer a.free(self.decode_rows);
+            self.g = try ops.MlxOps.init(a, stream);
+            errdefer self.g.deinit();
+            self.sdk_bank = try bm.SDKBank.init(a, &self.bank);
+            errdefer self.sdk_bank.deinit();
+            // The reader's staging holds the bank's widest span (Flash's gate/up span plus its page alignment and a page):
+            // refused here, once, if a bank's spans outgrow it.
+            if (Bm.S.stagingBytes(&self.sdk_bank) > settings.reader_staging_bytes) return error.Glm5NextReaderStaging;
+            const event = try expert_event.createMetal();
+            self.sdk_stream = try Bm.Stream.init(a, &self.sdk_bank, try streamOptionsOf(Bm, self.rows, .{ .mlx = stream }, event, tally));
+            errdefer self.sdk_stream.deinit();
+            self.stream_source = Bm.StreamSource.init(self.sdk_stream);
+            try self.stream_source.installReadSchedule(read_schedule, mimo_stream.default_read_schedule_threshold);
+            // MiMo's X12 (`gpu_keep_warm`, the route the module resolved: `settings.Config.warmRoute`): `.waits` makes the warm
+            // queue, kernel and buffer on MLX's device (no kernel runs) and starts the parked warm thread, once, and binds its
+            // arm into the stream source (mimo_v2/source.zig's install); `.off` installs nothing; refused by name on a CPU
+            // stream or without the stream's Metal event.
+            self.warm = try gpu_warm.install(a, keep_warm, stream, event.object);
+            errdefer if (self.warm) |w| w.destroy();
+            if (self.warm) |w| self.stream_source.warm_arm = gpu_warm.Arm.of(gpu_warm.Warm, w);
+            // The slot arrays are the format's, every routed layer's (base and transient banks), checked once.
+            for (0..geo.num_moe_layers) |i| {
+                const layer: u32 = geo.first_moe_layer + @as(u32, @intCast(i));
+                for ([_]Bm.BankKind{ .base, .transient }) |kind| if (try self.stream_source.bankArrays(&self.g, layer, kind)) |arrays| {
+                    if (comptime fam == .exl3) {
+                        try bm.checkArrays(&self.g, "gate", arrays.gate, false);
+                        try bm.checkArrays(&self.g, "up", arrays.up, false);
+                        try bm.checkArrays(&self.g, "down", arrays.down, true);
+                    } else {
+                        try nvfp4.checkArrays(&self.g, "gate", arrays.gate, geo.hidden_size, geo.intermediate_size);
+                        try nvfp4.checkArrays(&self.g, "up", arrays.up, geo.hidden_size, geo.intermediate_size);
+                        try nvfp4.checkArrays(&self.g, "down", arrays.down, geo.intermediate_size, geo.hidden_size);
+                    }
+                };
+            }
+            if (comptime fam == .nvfp4) {
+                // Scale-line isolation (bank.zig `scale_line_bytes`): every slot array the stream makes (base, transient, and the
+                // phase change's ext and window 0, by the same `StreamOf.arrayShape`) holds each slot's global scales on its own line.
+                log.info("glm5_next bank: scale lines isolated (each slot's gate/up/down global scale on its own {d}-byte line, f32 [rows, {d}], arrays >= {d} B in their own buffers, device-class; checked on {d} routed layers)\n", .{ bm.scale_line_bytes, bm.scale_line_floats, bm.scale_array_min_bytes, geo.num_moe_layers });
+            }
+            var math = if (comptime fam == .exl3) blk: {
+                // The exl3 family's math: the GLM-shape EXL3 texts installed (their pins, kernels, decode launches per wave
+                // width and compile check), refused by name; MiMo's predictor as the NVFP4 family binds it.
+                var diag: sdk.Diag = .{};
+                var m = Fam.Math.init(a, stream, exl3_math.max_call_rows, &diag) catch |e| {
+                    log.err("glm5_next: the exl3 expert texts refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                    return e;
+                };
+                errdefer m.deinit(&self.g);
+                m.predictor = switch (predict) {
+                    .f32 => try mimo_math.Predictor.install(.f32, geo),
+                    .bf16 => .{ .scores = scoresBf16 },
+                };
+                break :blk m;
+            } else blk: {
+                var math_n = try Fam.Math.init(a, geo, expertActivation);
+                errdefer math_n.deinit(&self.g);
+                math_n.drain = try Fam.Math.drainsOf(drain);
+                math_n.bank_view = try Fam.Math.bankViewsOf(bank_view);
+                // The lookahead predictor (`decode_predict`): the scores on the router's BF16 weight (`scoresBf16`), or MiMo's F32
+                // route (the control); the gate table holds the matching weight (graph.zig `gates`).
+                math_n.predictor = switch (predict) {
+                    .f32 => try mimo_math.Predictor.install(.f32, geo),
+                    .bf16 => .{ .scores = scoresBf16 },
+                };
+                // The decode lane's route: the fused NVFP4 texts installed here (their compile self-check, the launches prepared
+                // per wave width), refused by name, under `fused` and `hitpass`; the stock gathers otherwise.
+                if (decode_moe != .stock) {
+                    var diag: sdk.Diag = .{};
+                    math_n.fused = nvfp4.FusedDecode.install(a, stream, geo.hidden_size, geo.intermediate_size, top_k, 10.0, &diag) catch |e| {
+                            log.err("glm5_next: the fused decode route refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                            return e;
+                    };
+                }
+                break :blk math_n;
+            };
+            errdefer math.deinit(&self.g);
+            self.combine_route = combineRoute();
+            switch (self.combine_route) {
+                .inplace => {
+                    self.combine_kernel = try prefill_combine.Kernel.initInplace(geo);
+                    self.parts_combine = partsCombineInplace;
+                },
+                else => {
+                    self.combine_kernel = try prefill_combine.Kernel.init(geo);
+                    self.parts_combine = partsCombineFused;
+                },
+            }
+            errdefer self.combine_kernel.deinit();
+            const config: struct { hidden_size: u32, moe_intermediate_size: u32, n_layers: u32, n_routed_experts: u32, n_experts_per_tok: u32 } = .{
+                .hidden_size = geo.hidden_size,
+                .moe_intermediate_size = geo.intermediate_size,
+                .n_layers = geo.first_moe_layer + geo.num_moe_layers,
+                .n_routed_experts = geo.num_experts,
+                .n_experts_per_tok = top_k,
+            };
+            if (comptime fam == .exl3) {
+                self.own_gates = try a.alloc(Fam.Experts.Gate, gates.len);
+                for (gates, self.own_gates) |gt, *o| o.* = .{ .w = gt.w, .bias = gt.bias };
+            }
+            errdefer if (comptime fam == .exl3) a.free(self.own_gates);
+            const fam_gates = if (comptime fam == .exl3) self.own_gates else gates;
+            self.ex = try Fam.Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = fam_gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true }, .banked = decode_moe != .stock, .devroute = decode_moe == .hitpass });
+            errdefer self.ex.deinit();
+            if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
+            if (comptime fam == .exl3) {
+                log.info("glm5_next experts: exl3 k3 mul1 routes (decode_moe={s}: DeepSeek-V4.1's banked PREP=rin chain at hidden {d} / inter {d}, in_rin + gate/up mul1h GEMVs + gu_epi + din_rin + down mul1h GEMV + dpost(bf16), one launch each per wave over the three banks{s}; prompt: DIG-X waves of <= {d} rows / {d} experts, take2 + gate|up GEMM (m128) + onepass + down GEMM (m128) + rot_widen1(bf16); bank {d} x {d} records of {d} B, codebook mul1 0x{X}, no global-scale word: scale-line isolation not applicable; the NVFP4 draft bank unchanged)\n", .{ @tagName(decode_moe), exl3_kernels.hidden, exl3_kernels.inter, if (decode_moe == .hitpass) ", each call's hit wave from the layer's resident slot LUT" else if (decode_moe == .stock) ", unbanked: one group per bank" else "", exl3_math.wave_rows, @import("../../exl3/quant.zig").wave_max, geo.num_moe_layers, geo.num_experts, geo.record_bytes, exl3_kernels.codebook_multiplier });
+            } else switch (decode_moe) {
+                .stock => {},
+                .fused => log.info("glm5_next decode experts installed: decode_moe=fused (the NVFP4 k1 texts over the three banks, one launch of each per wave; the hit wave routed on the host)\n", .{}),
+                .hitpass => log.info("glm5_next decode experts installed: decode_moe=hitpass (the NVFP4 k1 texts over the three banks; each call's hit wave from the layer's resident slot LUT behind the routing barrier, the miss parts after the route)\n", .{}),
+            }
+            try self.beginPrefill();
+            return self;
         }
-        self.combine_route = combineRoute();
-        switch (self.combine_route) {
-            .inplace => {
-                self.combine_kernel = try prefill_combine.Kernel.initInplace(geo);
-                self.parts_combine = partsCombineInplace;
-            },
-            else => {
-                self.combine_kernel = try prefill_combine.Kernel.init(geo);
-                self.parts_combine = partsCombineFused;
-            },
+
+        pub fn deinit(self: *Self) void {
+            _ = mlx.mlx_synchronize(self.g.s);
+            // X12: the warm thread joined (its chunks in flight retired) before anything else goes (MiMo's order).
+            if (self.warm) |w| w.destroy();
+            self.ex.releaseParts(&self.g);
+            self.ex.math.deinit(&self.g);
+            self.combine_kernel.deinit();
+            self.ex.deinit();
+            if (comptime fam == .exl3) self.allocator.free(self.own_gates);
+            self.g.deinit();
+            // Stops and joins every read before the slot arrays go.
+            self.sdk_stream.deinit();
+            self.sdk_bank.deinit();
+            self.bank.deinit();
+            self.allocator.free(self.rows);
+            self.allocator.free(self.decode_rows);
+            self.allocator.destroy(self);
         }
-        errdefer self.combine_kernel.deinit();
-        const config: struct { hidden_size: u32, moe_intermediate_size: u32, n_layers: u32, n_routed_experts: u32, n_experts_per_tok: u32 } = .{
-            .hidden_size = geo.hidden_size,
-            .moe_intermediate_size = geo.intermediate_size,
-            .n_layers = geo.first_moe_layer + geo.num_moe_layers,
-            .n_routed_experts = geo.num_experts,
-            .n_experts_per_tok = top_k,
-        };
-        self.ex = try Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true }, .banked = decode_moe != .stock, .devroute = decode_moe == .hitpass });
-        errdefer self.ex.deinit();
-        if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
-        switch (decode_moe) {
-            .stock => {},
-            .fused => log.info("glm5_next decode experts installed: decode_moe=fused (the NVFP4 k1 texts over the three banks, one launch of each per wave; the hit wave routed on the host)\n", .{}),
-            .hitpass => log.info("glm5_next decode experts installed: decode_moe=hitpass (the NVFP4 k1 texts over the three banks; each call's hit wave from the layer's resident slot LUT behind the routing barrier, the miss parts after the route)\n", .{}),
+
+        fn settle(self: *Self) !void {
+            try mlx.check(mlx.mlx_synchronize(self.g.s));
+            self.ex.releaseParts(&self.g);
+            try self.sdk_stream.settleRoutes();
         }
-        try self.beginPrefill();
-        return self;
-    }
 
-    pub fn deinit(self: *Source) void {
-        _ = mlx.mlx_synchronize(self.g.s);
-        // X12: the warm thread joined (its chunks in flight retired) before anything else goes (MiMo's order).
-        if (self.warm) |w| w.destroy();
-        self.ex.releaseParts(&self.g);
-        self.ex.math.deinit(&self.g);
-        self.combine_kernel.deinit();
-        self.ex.deinit();
-        self.g.deinit();
-        // Stops and joins every read before the slot arrays go.
-        self.sdk_stream.deinit();
-        self.sdk_bank.deinit();
-        self.bank.deinit();
-        self.allocator.free(self.rows);
-        self.allocator.free(self.decode_rows);
-        self.allocator.destroy(self);
-    }
+        fn setCacheLimit(bytes: usize) void {
+            var previous: usize = 0;
+            _ = mlx.mlx_set_cache_limit(&previous, bytes);
+        }
 
-    fn settle(self: *Source) !void {
-        try mlx.check(mlx.mlx_synchronize(self.g.s));
-        self.ex.releaseParts(&self.g);
-        try self.sdk_stream.settleRoutes();
-    }
+        /// A prompt layer's end (its output evaluated): MLX's cache purged once half full (P7 `pooled`).
+        pub fn promptLayerEnd(_: *const Self) void {
+            var cached: usize = 0;
+            _ = mlx.mlx_get_cache_memory(&cached);
+            if (cached >= prompt_cache_bytes / 2) _ = mlx.mlx_clear_cache();
+        }
 
-    fn setCacheLimit(bytes: usize) void {
-        var previous: usize = 0;
-        _ = mlx.mlx_set_cache_limit(&previous, bytes);
-    }
+        /// A new request: the prompt phase, the previous request's residents, seed and prompt counts forgotten (MiMo's).
+        pub fn beginPrefill(self: *Self) !void {
+            try self.resumePrefill();
+            _ = try self.stream_source.forgetResidents();
+            self.stream_source.resetPromptCounts();
+        }
 
-    /// A prompt layer's end (its output evaluated): MLX's cache purged once half full (P7 `pooled`).
-    pub fn promptLayerEnd(_: *const Source) void {
-        var cached: usize = 0;
-        _ = mlx.mlx_get_cache_memory(&cached);
-        if (cached >= prompt_cache_bytes / 2) _ = mlx.mlx_clear_cache();
-    }
+        /// The request's read schedule from its prompt length, once, after `beginPrefill`.
+        pub fn chooseReadSchedule(self: *Self, prompt_tokens: u64) !mimo_stream.ReadSchedule {
+            return self.stream_source.chooseReadSchedule(prompt_tokens);
+        }
 
-    /// A new request: the prompt phase, the previous request's residents, seed and prompt counts forgotten (MiMo's).
-    pub fn beginPrefill(self: *Source) !void {
-        try self.resumePrefill();
-        _ = try self.stream_source.forgetResidents();
-        self.stream_source.resetPromptCounts();
-    }
+        /// The prompt phase: after a decode, the grown rows and window 0 freed (residents forgotten), MLX's cache cleared,
+        /// the prompt's scratch re-created; the prompt pass's cache limit.
+        pub fn resumePrefill(self: *Self) !void {
+            try self.settle();
+            defer setCacheLimit(prompt_cache_bytes);
+            if (self.sdk_stream.phase == .decode) {
+                _ = try self.ex.shrink(self.rows, .forget);
+                self.g.clearCache();
+                _ = try self.ex.regrowTransient(&self.g, true);
+            }
+        }
 
-    /// The request's read schedule from its prompt length, once, after `beginPrefill`.
-    pub fn chooseReadSchedule(self: *Source, prompt_tokens: u64) !mimo_stream.ReadSchedule {
-        return self.stream_source.chooseReadSchedule(prompt_tokens);
-    }
-
-    /// The prompt phase: after a decode, the grown rows and window 0 freed (residents forgotten), MLX's cache cleared,
-    /// the prompt's scratch re-created; the prompt pass's cache limit.
-    pub fn resumePrefill(self: *Source) !void {
-        try self.settle();
-        defer setCacheLimit(prompt_cache_bytes);
-        if (self.sdk_stream.phase == .decode) {
-            _ = try self.ex.shrink(self.rows, .forget);
+        /// The phase change after the prompt pass: decode's cache limit, the prompt's scratch freed, MLX's cache cleared,
+        /// every layer grown to its decode rows (the added rows empty) and decode's window 0 allocated.
+        pub fn beginDecode(self: *Self) !void {
+            try self.settle();
+            if (self.sdk_stream.phase != .prefill) return;
+            setCacheLimit(decode_cache_bytes);
             self.g.clearCache();
-            _ = try self.ex.regrowTransient(&self.g, true);
+            _ = try self.ex.releaseTransient();
+            self.g.clearCache();
+            try self.ex.grow(&self.g, self.decode_rows);
         }
-    }
 
-    /// The phase change after the prompt pass: decode's cache limit, the prompt's scratch freed, MLX's cache cleared,
-    /// every layer grown to its decode rows (the added rows empty) and decode's window 0 allocated.
-    pub fn beginDecode(self: *Source) !void {
-        try self.settle();
-        if (self.sdk_stream.phase != .prefill) return;
-        setCacheLimit(decode_cache_bytes);
-        self.g.clearCache();
-        _ = try self.ex.releaseTransient();
-        self.g.clearCache();
-        try self.ex.grow(&self.g, self.decode_rows);
-    }
+        /// After the forward's last eval (the logits): the released routes settled and unpinned.
+        pub fn flush(self: *Self) !void {
+            try self.ex.flush();
+        }
 
-    /// After the forward's last eval (the logits): the released routes settled and unpinned.
-    pub fn flush(self: *Source) !void {
-        try self.ex.flush();
-    }
+        pub fn decoding(self: *const Self) bool {
+            return self.sdk_stream.phase == .decode;
+        }
 
-    pub fn decoding(self: *const Source) bool {
-        return self.sdk_stream.phase == .decode;
-    }
+        pub fn decodeLaneAt(self: *const Self, nt: u32) bool {
+            return decodeLane(nt, self.decoding());
+        }
 
-    pub fn decodeLaneAt(self: *const Source, nt: u32) bool {
-        return decodeLane(nt, self.decoding());
-    }
+        /// One routed call of absolute layer `layer`: x [nt, H] bf16, ids [nt, 8], f32 weights [nt, 8] -> the weighted sum
+        /// [nt, H] bf16, a KEPT handle the caller adopts. The decode lane's output is lazy (the next routing barrier or the
+        /// logits evaluate it), with `hoist` (the shared expert) committed during its read wait; a wide call's is evaluated.
+        pub fn forward(self: *Self, layer: u32, x: T, expert_ids: T, route_weights: T, hoist: []const T) !T {
+            const g = &self.g;
+            defer g.reset();
+            const nt: u32 = @intCast(g.shapeOf(x).d[0]);
+            profile.call();
+            if (self.decodeLaneAt(nt)) {
+                const routed = try self.ex.at(layer).routedHoist(g, x, try g.astype(expert_ids, .int32), hoist);
+                const encode_start = profile.now();
+                const output = try combineStock(g, routed, route_weights);
+                profile.charge(.encode, encode_start);
+                return g.keep(output);
+            }
+            // Decode's window 0 holds one decode-lane route: no decode-phase call is wide (the module resumes the prompt
+            // phase for any wider forward). An invariant of the callers.
+            std.debug.assert(!self.decoding());
+            const hook = self.ex.at(layer);
+            const parts = try hook.routedParts(g, x, try g.astype(expert_ids, .int32));
+            defer hook.releaseParts(g);
+            if (comptime ptl.enabled) ptl.stage(.join);
+            const join_start = profile.now();
+            // The tiles are evaluated; this evaluates the merged source, if any.
+            try g.evalAll(parts.outs);
+            try mlx.check(mlx.mlx_synchronize(g.s));
+            try self.ex.flush();
+            profile.charge(.join, join_start);
+            return self.parts_combine(self, g, parts.outs, parts.loc, route_weights, nt);
+        }
 
-    /// One routed call of absolute layer `layer`: x [nt, H] bf16, ids [nt, 8], f32 weights [nt, 8] -> the weighted sum
-    /// [nt, H] bf16, a KEPT handle the caller adopts. The decode lane's output is lazy (the next routing barrier or the
-    /// logits evaluate it), with `hoist` (the shared expert) committed during its read wait; a wide call's is evaluated.
-    pub fn forward(self: *Source, layer: u32, x: T, expert_ids: T, route_weights: T, hoist: []const T) !T {
-        const g = &self.g;
-        defer g.reset();
-        const nt: u32 = @intCast(g.shapeOf(x).d[0]);
-        profile.call();
-        if (self.decodeLaneAt(nt)) {
-            const routed = try self.ex.at(layer).routedHoist(g, x, try g.astype(expert_ids, .int32), hoist);
+        /// Prompt lever 3 (warm.zig): the installed prompt combine's text built by its first dispatch (MLX compiles a custom
+        /// kernel's library then) over one token of zero rows, evaluated and dropped. No route, read or slot is touched.
+        pub fn warmCombine(self: *Self) !void {
+            const g = &self.g;
+            const m = g.mark();
+            defer g.resetTo(m);
+            const h: c_int = @intCast(self.bank.geometry.hidden_size);
+            const rows = try g.zeros(&.{ @intCast(top_k), h }, .bfloat16);
+            try g.evalAll(&.{rows});
+            // Token 0's routed position k reads row k of the one source.
+            var pairs: [2 * top_k]i32 = undefined;
+            for (0..top_k) |k| {
+                pairs[2 * k] = 0;
+                pairs[2 * k + 1] = @intCast(k);
+            }
+            const loc = try g.hostArray(std.mem.sliceAsBytes(&pairs), &.{ 1, @intCast(top_k), 2 }, .int32);
+            const weights = try g.zeros(&.{ 1, @intCast(top_k) }, .float32);
+            const out = switch (self.combine_route) {
+                .inplace => try self.combine_kernel.callInplace(g, &.{rows}, loc, weights, 1),
+                else => try self.combine_kernel.call(g, &.{rows}, loc, weights, 1),
+            };
+            try g.evalAll(&.{out});
+        }
+
+        /// The decode lane's routed call under the fused glue (`decode_glue: fused`, glue.zig; the module's fused trunk is
+        /// its only caller, on the decode lane): `forward`'s decode lane, the glue's i32 ids as the scheduler reads them, the
+        /// shared expert `shared` committed during the call's read wait (`forward`'s hoist), and the combine text adding the
+        /// shared expert's rows: the routed sum plus the shared expert, bf16 [nt, H], a KEPT handle the caller adopts (lazy,
+        /// as `forward`'s decode lane).
+        pub fn forwardShared(self: *Self, layer: u32, x: T, ids: T, route_weights: T, shared: T, k: *const glue.Kernels) !T {
+            const g = &self.g;
+            defer g.reset();
+            const nt: u32 = @intCast(g.shapeOf(x).d[0]);
+            profile.call();
+            const routed = try self.ex.at(layer).routedHoist(g, x, ids, &.{shared});
             const encode_start = profile.now();
-            const output = try combineStock(g, routed, route_weights);
+            const output = try glue.combineShared(g, k, routed, route_weights, shared, nt);
             profile.charge(.encode, encode_start);
             return g.keep(output);
         }
-        // Decode's window 0 holds one decode-lane route: no decode-phase call is wide (the module resumes the prompt
-        // phase for any wider forward). An invariant of the callers.
-        std.debug.assert(!self.decoding());
-        const hook = self.ex.at(layer);
-        const parts = try hook.routedParts(g, x, try g.astype(expert_ids, .int32));
-        defer hook.releaseParts(g);
-        if (comptime ptl.enabled) ptl.stage(.join);
-        const join_start = profile.now();
-        // The tiles are evaluated; this evaluates the merged source, if any.
-        try g.evalAll(parts.outs);
-        try mlx.check(mlx.mlx_synchronize(g.s));
-        try self.ex.flush();
-        profile.charge(.join, join_start);
-        return self.parts_combine(self, g, parts.outs, parts.loc, route_weights, nt);
-    }
 
-    /// Prompt lever 3 (warm.zig): the installed prompt combine's text built by its first dispatch (MLX compiles a custom
-    /// kernel's library then) over one token of zero rows, evaluated and dropped. No route, read or slot is touched.
-    pub fn warmCombine(self: *Source) !void {
-        const g = &self.g;
-        const m = g.mark();
-        defer g.resetTo(m);
-        const h: c_int = @intCast(self.bank.geometry.hidden_size);
-        const rows = try g.zeros(&.{ @intCast(top_k), h }, .bfloat16);
-        try g.evalAll(&.{rows});
-        // Token 0's routed position k reads row k of the one source.
-        var pairs: [2 * top_k]i32 = undefined;
-        for (0..top_k) |k| {
-            pairs[2 * k] = 0;
-            pairs[2 * k + 1] = @intCast(k);
+        /// P1: layer `layer`'s predicted experts, hottest first, read into its free persistent rows ahead of its call.
+        pub fn readAheadSeed(self: *Self, layer: u32, ranked: []const u16) !void {
+            try self.ex.at(layer).readAheadSeed(ranked);
         }
-        const loc = try g.hostArray(std.mem.sliceAsBytes(&pairs), &.{ 1, @intCast(top_k), 2 }, .int32);
-        const weights = try g.zeros(&.{ 1, @intCast(top_k) }, .float32);
-        const out = switch (self.combine_route) {
-            .inplace => try self.combine_kernel.callInplace(g, &.{rows}, loc, weights, 1),
-            else => try self.combine_kernel.call(g, &.{rows}, loc, weights, 1),
-        };
-        try g.evalAll(&.{out});
-    }
 
-    /// The decode lane's routed call under the fused glue (`decode_glue: fused`, glue.zig; the module's fused trunk is
-    /// its only caller, on the decode lane): `forward`'s decode lane, the glue's i32 ids as the scheduler reads them, the
-    /// shared expert `shared` committed during the call's read wait (`forward`'s hoist), and the combine text adding the
-    /// shared expert's rows: the routed sum plus the shared expert, bf16 [nt, H], a KEPT handle the caller adopts (lazy,
-    /// as `forward`'s decode lane).
-    pub fn forwardShared(self: *Source, layer: u32, x: T, ids: T, route_weights: T, shared: T, k: *const glue.Kernels) !T {
-        const g = &self.g;
-        defer g.reset();
-        const nt: u32 = @intCast(g.shapeOf(x).d[0]);
-        profile.call();
-        const routed = try self.ex.at(layer).routedHoist(g, x, ids, &.{shared});
-        const encode_start = profile.now();
-        const output = try glue.combineShared(g, k, routed, route_weights, shared, nt);
-        profile.charge(.encode, encode_start);
-        return g.keep(output);
-    }
+        pub fn stats(self: *Self) sdk_ext.expert.Stats {
+            return self.stream_source.stats();
+        }
 
-    /// P1: layer `layer`'s predicted experts, hottest first, read into its free persistent rows ahead of its call.
-    pub fn readAheadSeed(self: *Source, layer: u32, ranked: []const u16) !void {
-        try self.ex.at(layer).readAheadSeed(ranked);
-    }
+        /// The rate tally's geometry: the stream's layers (the routed layers) and each one's experts.
+        pub fn tallyShape(self: *const Self) struct { layers: u32, experts: u32 } {
+            return .{ .layers = @intCast(self.sdk_stream.layers.len), .experts = self.bank.geometry.num_experts };
+        }
 
-    pub fn stats(self: *Source) sdk_ext.expert.Stats {
-        return self.stream_source.stats();
-    }
+        /// Every layer's tally seeded from a tally file's rates (`tallyShape`: layers x experts): the pins of the next request.
+        pub fn seedTally(self: *Self, rates: []const f32) void {
+            self.sdk_stream.seedTally(rates);
+        }
 
-    /// The rate tally's geometry: the stream's layers (the routed layers) and each one's experts.
-    pub fn tallyShape(self: *const Source) struct { layers: u32, experts: u32 } {
-        return .{ .layers = @intCast(self.sdk_stream.layers.len), .experts = self.bank.geometry.num_experts };
-    }
+        /// The request's end: each layer's decode rates folded in and written to `out` (layers x experts); the layers that
+        /// routed in the decode.
+        pub fn endTally(self: *Self, out: []f32) u32 {
+            return self.sdk_stream.endTally(out);
+        }
+    };
+}
 
-    /// Every layer's tally seeded from a tally file's rates (`tallyShape`: layers x experts): the pins of the next request.
-    pub fn seedTally(self: *Source, rates: []const f32) void {
-        self.sdk_stream.seedTally(rates);
-    }
-
-    /// The request's end: each layer's decode rates folded in and written to `out` (layers x experts); the layers that
-    /// routed in the decode.
-    pub fn endTally(self: *Source, out: []f32) u32 {
-        return self.sdk_stream.endTally(out);
-    }
-};
+/// The NVFP4 family's source (the stack of record; its code is this file's as before the exl3 family).
+pub const Source = SourceOf(.nvfp4);
+/// The exl3 family's source (an EXL3 K=3 mul1 bank-v2 pack).
+pub const Exl3Source = SourceOf(.exl3);
 
 test "glm5_next experts: the stream's options install the overlap schedule early_whole_trim with prompt lever 1's relocation (exact), the phase rows' release and decode's window" {
     const testing = std.testing;

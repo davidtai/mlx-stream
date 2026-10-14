@@ -11,6 +11,7 @@ const host_caps = @import("../../host_caps.zig");
 const glm = @import("config.zig");
 const settings = @import("settings.zig");
 const bank = @import("bank.zig");
+const exl3_bank = @import("exl3_bank.zig");
 const bills = @import("bill.zig");
 const module = @import("module.zig");
 const mtp = @import("mtp.zig");
@@ -35,10 +36,18 @@ pub const Module = if (host_caps.dsa_nax) module.Module else struct {};
 pub const claimProcess = sdk_ext.expert.takeReader;
 pub const releaseProcess = sdk_ext.expert.giveReader;
 
-/// The pack's `expert_streaming` block: mlx-stream's NVFP4 bank and its manifest.
-pub fn declared(v: std.json.Value) bool {
-    if (v != .object) return false;
-    inline for (.{ .{ "family", family }, .{ "format", bank.format }, .{ "manifest", manifest_file } }) |pair| {
+/// The pack's `expert_streaming` block: mlx-stream's NVFP4 bank and its manifest (`nvfp4`), or the EXL3 K=3 mul1
+/// bank-v2 pack (`exl3`: its format, both manifests and the quant, R/mimo/glm5next-exl3-pack-contract.md sec. 5); null
+/// for any other block. The family is the construction's route (`settings.Config.expert_family`).
+pub fn declared(v: std.json.Value) ?settings.ExpertFamily {
+    if (v != .object) return null;
+    if (fieldsAre(v, .{ .{ "family", family }, .{ "format", bank.format }, .{ "manifest", manifest_file } })) return .nvfp4;
+    if (fieldsAre(v, .{ .{ "family", family }, .{ "format", exl3_bank.format }, .{ "manifest", exl3_bank.manifest_file }, .{ "runtime_manifest", exl3_bank.runtime_manifest_file }, .{ "quant", exl3_bank.quant_name } })) return .exl3;
+    return null;
+}
+
+fn fieldsAre(v: std.json.Value, comptime pairs: anytype) bool {
+    inline for (pairs) |pair| {
         const field = v.object.get(pair[0]) orelse return false;
         if (field != .string or !std.mem.eql(u8, field.string, pair[1])) return false;
     }
@@ -48,7 +57,7 @@ pub fn declared(v: std.json.Value) bool {
 pub fn claims(p: *const sdk.ConfigPeek) ?sdk.Priority {
     const t = p.modelType() orelse return null;
     if (!std.mem.eql(u8, t, "glm5_next")) return null;
-    return if (declared(p.root.get("expert_streaming") orelse .null)) .native else null;
+    return if (declared(p.root.get("expert_streaming") orelse .null) != null) .native else null;
 }
 
 /// The arch's own parse of config.json (refusals by name), the pack's directory, and the pack's construction settings
@@ -59,10 +68,10 @@ pub fn parse(a: std.mem.Allocator, p: *const sdk.ConfigPeek, diag: *sdk.Diag) !*
         return error.Glm5NextHostSurfaceMissing;
     }
     const block = p.root.get("expert_streaming") orelse .null;
-    if (!declared(block)) {
-        diag.set("glm5_next: the pack declares no mlx-stream NVFP4 bank (expert_streaming {{family, format, manifest}})", .{});
+    const fam = declared(block) orelse {
+        diag.set("glm5_next: the pack declares no mlx-stream NVFP4 bank or EXL3 K=3 mul1 bank (expert_streaming {{family, format, manifest[, runtime_manifest, quant]}})", .{});
         return error.Glm5NextPackRequired;
-    }
+    };
     var md: glm.Diag = .{};
     const model = glm.Config.parse(a, p.text, &md) catch |e| {
         diag.set("{s}", .{md.message()});
@@ -70,7 +79,7 @@ pub fn parse(a: std.mem.Allocator, p: *const sdk.ConfigPeek, diag: *sdk.Diag) !*
     };
     const c = try a.create(Config);
     errdefer a.destroy(c);
-    c.* = .{ .model = model, .model_dir = if (p.model_dir.len > 0) try a.dupe(u8, p.model_dir) else null };
+    c.* = .{ .model = model, .expert_family = fam, .model_dir = if (p.model_dir.len > 0) try a.dupe(u8, p.model_dir) else null };
     errdefer if (c.model_dir) |d| a.free(d);
     if (block.object.get("settings")) |raw| {
         if (raw != .object) {
@@ -233,6 +242,13 @@ test "glm5_next claims: the pack's NVFP4 declaration claims it; other packs and 
         .{ .config =
         \\{"model_type":"glm5_next","expert_streaming":{"family":"mlx-stream","format":"mlx-stream-nvfp4-expert-bank-v1","manifest":"other.json"}}
         , .want = null },
+        // The EXL3 K=3 mul1 pack (its block as the converter writes it), and the same block with another quant.
+        .{ .config =
+        \\{"model_type":"glm5_next","expert_streaming":{"family":"mlx-stream","format":"mtplx-expert-manifest-v2","manifest":"expert-manifest-v2.json","runtime_manifest":"expert-manifest.json","quant":"exl3-k3-mul1"}}
+        , .want = .native },
+        .{ .config =
+        \\{"model_type":"glm5_next","expert_streaming":{"family":"mlx-stream","format":"mtplx-expert-manifest-v2","manifest":"expert-manifest-v2.json","runtime_manifest":"expert-manifest.json","quant":"exl3-k3-mcg"}}
+        , .want = null },
     });
 }
 
@@ -304,4 +320,24 @@ test "glm5_next arch table: the registry builds it (the draft lane surface, no p
     try testing.expectEqual(sdk.DraftArm.off, tbl.arm(&m, .{ .greedy = false, .clean = false }));
     lane.stats.add(3, 2);
     try testing.expectEqual(sdk.DraftStats{ .rounds = 1, .drafted = 3, .accepted = 2, .generated = 3 }, tbl.stats(&m));
+}
+
+test "glm5_next parse: the EXL3 K=3 mul1 pack's block selects the exl3 family; the NVFP4 block the nvfp4 one" {
+    if (comptime !host_caps.dsa_nax) return error.SkipZigTest;
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const base = try glm.flashConfigJson(arena.allocator());
+    const marker = "\"model_type\":\"glm5_next\",";
+    for ([_]struct { block: []const u8, fam: settings.ExpertFamily }{
+        .{ .block = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mtplx-expert-manifest-v2\",\"manifest\":\"expert-manifest-v2.json\",\"runtime_manifest\":\"expert-manifest.json\",\"quant\":\"exl3-k3-mul1\"},", .fam = .exl3 },
+        .{ .block = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-nvfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"},", .fam = .nvfp4 },
+    }) |case| {
+        const text = try std.mem.replaceOwned(u8, arena.allocator(), base, marker, try std.mem.concat(arena.allocator(), u8, &.{ marker, case.block }));
+        const peek = try sdk.ConfigPeek.parse(arena.allocator(), "/fixture", text);
+        var diag: sdk.Diag = .{};
+        const c = try parse(a, &peek, &diag);
+        defer freeConfig(a, c);
+        try testing.expectEqual(case.fam, c.expert_family);
+    }
 }

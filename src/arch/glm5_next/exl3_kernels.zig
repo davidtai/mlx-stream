@@ -12,7 +12,8 @@
 //!     the bank manifest's, fixed in the texts): no scale-line isolation applies.
 //!   - Decode (`gateUp`, `down`): P routed pairs, 1 <= P <= `max_pairs` (one route: the MTP verify's rows 1..4 x top-8
 //!     at most); `ids` u32 [P] packed `bank << 24 | slot row`; x bf16 [P, hidden] (each pair's token row, taken);
-//!     `gateUp` -> the clamped SwiGLU f32 [P, inter]; `down` (h f32 [P, inter]) -> f32 [P, hidden] (no route weight).
+//!     `gateUp` -> the clamped SwiGLU f32 [P, inter]; `down` (h f32 [P, inter]) -> bf16 [P, hidden] (no route weight; the
+//!     f32 word rounded once on store, the expert output type the combines read).
 //!     Six launches: in_rin, the gate GEMV, the up GEMV, gu_epi, din_rin, the down GEMV, dpost.
 //!   - Prompt (DIG-X, one wave of <= 16 experts of one bank, rows grouped by expert): `take2` -> `gemmGateUp` ->
 //!     `onePass` -> `gemmDown` -> `widen1`; the wave table is `exl3/quant.zig digTableBm` at `m_tile` rows with
@@ -65,7 +66,8 @@ pub const BankArrays = quant.BankArrays(Proj);
 
 /// The dims of a projection's slot arrays (without the leading rows): code, rout, rin.
 pub const ProjDims = struct { code: [3]u32, rout: u32, rin: u32 };
-pub fn projDims(comptime which: enum { gate_up, down }) ProjDims {
+pub const Which = enum { gate_up, down };
+pub fn projDims(which: Which) ProjDims {
     const in: u32, const out: u32 = if (which == .down) .{ inter, hidden } else .{ hidden, inter };
     return .{ .code = .{ in / 16, out / 16, tile_words }, .rout = out, .rin = in };
 }
@@ -99,7 +101,7 @@ pub const text_sha256 = [n_kernels]*const [64]u8{
     "632af1fde45f91dd64b1c7c4ba05562d50bdcf4587fbe4e6ca5a91d64a5c6bbe",
     "f9526c59b09561032dad3b048a78e50b4d2c77cef487fd924a65ab6e1dab3388",
     "4cfa833c6427f68000eaac5b77d3964f5975875d95c1634720ae915fcbb4b735",
-    "45015c22215381429a91610296688f19d91bd6cbd78be65823d32f0045260fdb",
+    "ba6f173e5e190177314cbadd85c6b0c8398253ce76392f1aba93454e873a35d5",
     "27755f90ed5379a9254172c794dd0f8eaa4df85fc2cee4bd0587554a333edfc8",
     "c72444223bf1b65d86ec05f681fb24672180f538474a191a0359ea8a2e02d291",
     "537d8c33523b8d703cca2a5aa8729476fb805ee12fc50170ff572e9bff4a122e",
@@ -239,6 +241,12 @@ pub fn widen1Launch(rows: u32, dtype: mlx.mlx_dtype) Launch {
     return l;
 }
 
+/// dpost: rotLaunch at hidden, its output in bf16 (the expert output type: the glm5_next combines read bf16 rows).
+pub fn dpostLaunch(p: u32) Launch {
+    const l: Launch = .{ .grid = .{ ci(hidden / 128 * 64), ci(p), 1 }, .tg = .{ 64, 1, 1 }, .t_dtype = .bfloat16 };
+    return l.int("HID", hidden).out(&.{ p, hidden }, .bfloat16);
+}
+
 /// The decode configs of one wave width (prepared at install).
 const DecodeCfg = struct { in_rin: Config, gemv_gu: Config, gu_epi: Config, din_rin: Config, gemv_dn: Config, dpost: Config };
 
@@ -251,8 +259,8 @@ pub const Kernels = struct {
 
     pub fn deinit(self: *Kernels) void {
         for (self.k) |k| if (k.ctx != null) mtl.mlx_fast_metal_kernel_free(k);
-        for (self.dec) |d| if (d) |c| inline for (std.meta.fields(DecodeCfg)) |f| {
-            _ = mlx.mlx_fast_metal_kernel_config_free(@field(c, f.name));
+        for (self.dec) |d| if (d) |c| for ([_]Config{ c.in_rin, c.gemv_gu, c.gu_epi, c.din_rin, c.gemv_dn, c.dpost }) |x| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(x);
         };
         for (self.tok) |t| if (t.ctx != null) {
             _ = mlx.mlx_array_free(t);
@@ -302,7 +310,7 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, diag: *sdk.Diag) !*Kerne
             .gu_epi = try configOf(rotLaunch(p, inter, "INTER")),
             .din_rin = try configOf(rotLaunch(p, inter, "INTER")),
             .gemv_dn = try configOf(gemvLaunch(p, inter, hidden)),
-            .dpost = try configOf(rotLaunch(p, hidden, "HID")),
+            .dpost = try configOf(dpostLaunch(p)),
         };
         var idx: [max_pairs]i32 = undefined;
         for (idx[0..p], 0..) |*v, j| v.* = @intCast(j);
@@ -350,7 +358,8 @@ pub fn gateUp(k: *const Kernels, g: *G, x: T, ids: T, banks: *const [n_banks]Ban
     return out[0];
 }
 
-/// h f32 [P, inter] (gateUp's), the same packed ids -> f32 [P, hidden]: din_rin, the down GEMV, dpost.
+/// h f32 [P, inter] (gateUp's), the same packed ids -> bf16 [P, hidden]: din_rin, the down GEMV, dpost (its f32 word
+/// rounded once on store).
 pub fn down(k: *const Kernels, g: *G, h: T, ids: T, banks: *const [n_banks]BankArrays) !T {
     const p: u32 = @intCast(g.shapeOf(h).d[0]);
     const c = k.dec[p - 1].?;
@@ -418,8 +427,13 @@ const testing = std.testing;
 
 test "glm5_next exl3 kernels: the texts are the pinned ones, every DeepSeek shape literal replaced, GLM's geometry" {
     try checkPins();
+    // Outside comments (the generated head names the DeepSeek base text), no DeepSeek shape literal is left.
     for (texts) |t| {
-        for ([_][]const u8{ "5120", "2304", "2211840", "320u", "144u" }) |lit| try testing.expect(std.mem.indexOf(u8, t, lit) == null);
+        var lines = std.mem.splitScalar(u8, t, '\n');
+        while (lines.next()) |line| {
+            const code = if (std.mem.indexOf(u8, line, "//")) |c| line[0..c] else line;
+            for ([_][]const u8{ "5120", "2304", "2211840", "320u", "144u" }) |lit| try testing.expect(std.mem.indexOf(u8, code, lit) == null);
+        }
     }
     try testing.expect(std.mem.indexOf(u8, header_onepass, "glm5n_dig2_swiglu_one") != null);
     try testing.expectEqual(@as(u32, 64), gu_tiles);

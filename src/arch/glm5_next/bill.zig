@@ -13,6 +13,7 @@ const sdk = @import("sdk");
 const glm = @import("config.zig");
 const settings = @import("settings.zig");
 const bank = @import("bank.zig");
+const exl3_bank = @import("exl3_bank.zig");
 const graph = @import("graph.zig");
 const experts = @import("experts.zig");
 const kda = @import("kda.zig");
@@ -143,9 +144,50 @@ fn readAt(fd: std.c.fd_t, bytes: []u8, offset: u64) !void {
 
 // ── The arch's terms ──
 
+/// The expert bank's geometry as the source's terms read it, from either family's manifest: the dims, the record stride
+/// and one slot row's bytes over the slot arrays (the NVFP4 bank's line-isolated row; the EXL3 bank's segments, no line
+/// padding: its row is its 9,474,048 B record at Flash's dims).
+pub const SourceGeometry = struct {
+    family: settings.ExpertFamily = .nvfp4,
+    hidden_size: u32,
+    intermediate_size: u32,
+    num_experts: u32,
+    first_moe_layer: u32,
+    num_moe_layers: u32,
+    record_bytes: u64,
+    slot_row_bytes: u64,
+
+    pub fn slotRowBytes(g: *const SourceGeometry) u64 {
+        return g.slot_row_bytes;
+    }
+
+    pub fn ofNvfp4(g: bank.Geometry) SourceGeometry {
+        return .{ .family = .nvfp4, .hidden_size = g.hidden_size, .intermediate_size = g.intermediate_size, .num_experts = g.num_experts, .first_moe_layer = g.first_moe_layer, .num_moe_layers = g.num_moe_layers, .record_bytes = g.record_bytes, .slot_row_bytes = g.slotRowBytes() };
+    }
+
+    pub fn ofExl3(g: exl3_bank.Geometry) SourceGeometry {
+        return .{ .family = .exl3, .hidden_size = g.hidden_size, .intermediate_size = g.intermediate_size, .num_experts = g.num_experts, .first_moe_layer = g.first_moe_layer, .num_moe_layers = g.num_moe_layers, .record_bytes = g.record_bytes, .slot_row_bytes = g.slotRowBytes() };
+    }
+};
+
+/// The pack's bank geometry by its family (pure host: the manifest; the EXL3 quantization checked by name first).
+pub fn sourceGeometry(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, dir: []const u8) !SourceGeometry {
+    return switch (cfg.expert_family) {
+        .nvfp4 => .ofNvfp4(try bank.inspect(a, io, dir)),
+        .exl3 => blk: {
+            var diag: sdk.Diag = .{};
+            const g = exl3_bank.inspect(a, io, dir, @intCast(cfg.model.first_k_dense), exl3_bank.flash, &diag) catch |e| {
+                if (diag.len > 0) sdk.log.err("{s}\n", .{diag.message()});
+                return e;
+            };
+            break :blk .ofExl3(g);
+        },
+    };
+}
+
 pub const Inputs = struct {
     model: glm.Config,
-    geometry: bank.Geometry,
+    geometry: SourceGeometry,
     residents: Residents,
     /// The positions the load bills (the served context: prompt and generation).
     reserve: u64,
@@ -430,14 +472,14 @@ pub fn laneTerms(in: *const Inputs) [3]Term {
 /// The wide lane's workspace over a call of `tokens` tokens (mimo_v2/source.zig `workspaceBytes`'s rates at this
 /// geometry): the routed tile outputs and the merge, the call's input and output rows, one projection tile and one
 /// reduction tile, the host scratch; the pipelined drain's second tiles.
-pub fn workspaceBytes(g: bank.Geometry, tokens: u64) u64 {
+pub fn workspaceBytes(g: SourceGeometry, tokens: u64) u64 {
     const k: u64 = experts.top_k;
     const nr = tokens * k;
     const max_nr = @as(u64, graph.prompt_call_rows) * k;
     const H: u64 = g.hidden_size;
     const I: u64 = g.intermediate_size;
     const host = 44 * max_nr + 28 * @as(u64, g.num_experts) + (@as(u64, g.first_moe_layer) + g.num_moe_layers) * 3 * 64 +
-        ((max_nr + mimo_math.tile_rows - 1) / mimo_math.tile_rows + mimo_stream.max_route_ids) * 8 + @sizeOf(experts.Source) + (1 << 20);
+        ((max_nr + mimo_math.tile_rows - 1) / mimo_math.tile_rows + mimo_stream.max_route_ids) * 8 + (if (g.family == .exl3) @as(u64, @sizeOf(experts.Exl3Source)) else @as(u64, @sizeOf(experts.Source))) + (1 << 20);
     const routed = nr * (4 * H + 8) + 3 * @as(u64, @min(tokens, mimo_math.combine_tokens)) * k * 2 * H;
     const input_output = tokens * (6 * H + k * 8);
     const matrix_tile = @as(u64, @min(nr, mimo_math.projection_rows)) * (20 * H + 24 * I + 32);
@@ -447,7 +489,7 @@ pub fn workspaceBytes(g: bank.Geometry, tokens: u64) u64 {
 }
 
 /// P1's predictor (one eval over a call's router tiles) and the decode lookahead's scores, at this geometry.
-pub fn predictorBytes(g: bank.Geometry, tokens: u64) u64 {
+pub fn predictorBytes(g: SourceGeometry, tokens: u64) u64 {
     const n: u64 = g.num_experts;
     const tile: u64 = @min(tokens, graph.prompt_call_rows);
     return @max(4 * (@as(u64, g.hidden_size) + 5 * n), tile * (6 * @as(u64, g.hidden_size) + 20 * n + 16 * experts.top_k + 8));
@@ -478,8 +520,11 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
     const spec = @as(u64, mimo_stream.spec_slots) * (std.mem.alignForward(u64, record, page) + 2 * page);
     const tickets = @as(u64, mimo_stream.io_tickets_early) * (8 * 8 + 8 + 1);
     const policy = @as(u64, g.num_moe_layers) * (n * n * 4 + n * 56 + mimo_stream.max_route_ids * 2 + 5 * bitset);
-    const metadata = tickets + @sizeOf(experts.Stream) + @as(u64, g.num_moe_layers) * (n * 64 + 64) + (n + mimo_stream.transient_rows) * 96 + (1 << 20);
-    const manifest = @as(u64, g.num_moe_layers) * (n * 32 + @sizeOf(bank.Layer));
+    const stream_bytes: u64 = if (g.family == .exl3) @as(u64, @sizeOf(experts.Types(.exl3).Bridge.Stream)) else @as(u64, @sizeOf(experts.Stream));
+    const metadata = tickets + stream_bytes + @as(u64, g.num_moe_layers) * (n * 64 + 64) + (n + mimo_stream.transient_rows) * 96 + (1 << 20);
+    // The open bank's tables: the NVFP4 bank's digest (32 B) per record and its layer; the EXL3 reader's padded and
+    // logical digests (64 B) per record and its layer.
+    const manifest = if (g.family == .exl3) @as(u64, g.num_moe_layers) * (n * 64 + @sizeOf(exl3_bank.Layer)) else @as(u64, g.num_moe_layers) * (n * 32 + @sizeOf(bank.Layer));
     // The slot arrays' page rounding (each component's array per layer and the transient's), beside the record stride.
     const rounding = (@as(u64, g.num_moe_layers) + 2) * bank.n_components * page;
     const t: u64 = @min(in.reserve, graph.prompt_call_rows);
@@ -498,7 +543,9 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
         // `decode_moe: fused` and `hitpass`: the NVFP4 decode texts' set (its library, two pipelines per registered
         // instantiation) and the launches prepared per wave width (decode_kernels.zig `Fused`), declared; its waves' rows
         // are the decode wave's (`request`). 0 on the stock route.
-        .{ .name = "decode_kernels", .bytes = @splat(if (in.decode_moe != .stock) fused_kernels_bytes else 0), .at_construction = true },
+        // exl3: the GLM-shape EXL3 texts (exl3_kernels.zig: ten kernels, the decode launches per wave width, the row maps)
+        // on every route (they serve the prompt waves too), declared at the same bound.
+        .{ .name = "decode_kernels", .bytes = @splat(if (in.decode_moe != .stock or g.family == .exl3) fused_kernels_bytes else 0), .at_construction = true },
         // `decode_glue: fused`: the glue's texts, pipelines and configs (glue.zig), declared; 0 under `ops`.
         .{ .name = "glue_kernels", .bytes = @splat(if (in.decode_glue == .fused) glue_kernels_bytes else 0), .at_construction = true },
         // `decode_kda: fused`: the KDA decode text, declared; 0 under `ops`.
@@ -543,7 +590,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
     }
     return .{
         .model = cfg.model,
-        .geometry = try bank.inspect(a, io, dir),
+        .geometry = try sourceGeometry(a, io, cfg, dir),
         .residents = try residentBytes(a, io, dir, &cfg.model, page),
         .reserve = reserve,
         .combine = experts.combineRoute(),
@@ -620,7 +667,7 @@ pub const tool_contexts = [_]u64{ 17_408, 18_432, 20_480, 24_576, 32_766, 32_768
 fn fixtureInputs(reserve: u64) !Inputs {
     return .{
         .model = .{},
-        .geometry = try bank.Geometry.init(4096, 2048, 288, 3, 42),
+        .geometry = .ofNvfp4(try bank.Geometry.init(4096, 2048, 288, 3, 42)),
         .residents = .{ .bytes = 17_850_000_000, .tensors = 1215 },
         .reserve = reserve,
     };
@@ -928,14 +975,20 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
     };
     // `GLM5_BILL_MTP=1`: the bill with the MTP lane installed (its terms, the verify's rows, the KDA captures).
     const lane = if (std.c.getenv("GLM5_BILL_MTP")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
-    var cfg: settings.Config = .{ .model = model, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane };
+    const fam = blk: {
+        const v = try std.json.parseFromSlice(std.json.Value, a, config_text, .{});
+        defer v.deinit();
+        const block = if (v.value == .object) v.value.object.get("expert_streaming") orelse .null else .null;
+        break :blk @import("root.zig").declared(block) orelse return error.Glm5NextPackRequired;
+    };
+    var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane };
     const res = try residentBytes(a, io, dir, &model, std.heap.pageSize());
-    std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off" });
+    std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s} experts={s}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off", @tagName(fam) });
     for (tool_contexts) |ctx| {
         cfg.effective_context = ctx;
         const b = try completeBill(a, io, &cfg, cfg.reserveTokens());
         defer b.free(a);
-        std.debug.print("\nkv=bf16 ctx={d} attention=kda+dsa experts=nvfp4 reserve={d} per_row={d}\n  {s:<22} {s:>15} {s:>15} {s}\n", .{ ctx, cfg.reserveTokens(), b.per_row, "term", "prompt B", "decode B", "construction" });
+        std.debug.print("\nkv=bf16 ctx={d} attention=kda+dsa experts={s} reserve={d} per_row={d}\n  {s:<22} {s:>15} {s:>15} {s}\n", .{ ctx, @tagName(fam), cfg.reserveTokens(), b.per_row, "term", "prompt B", "decode B", "construction" });
         for (b.terms) |t| std.debug.print("  {s:<22} {d:>15} {d:>15} {s}\n", .{ t.name, t.bytes[0], t.bytes[1], if (t.at_construction) "yes" else "" });
         std.debug.print("  {s:<22} {d:>15} {d:>15}\n", .{ "fixed", b.fixed(.prompt), b.fixed(.decode) });
         for (baselines[0..n_base]) |base| {
@@ -956,8 +1009,9 @@ test "glm5_next bill: the line-isolated slot arrays fit the slot terms (per_row 
     const in = try fixtureInputs(32_768);
     const b = try billOf(a, &in);
     defer b.free(a);
-    const g = in.geometry;
-    try testing.expectEqual(@as(u64, 14_156_160), g.slotRowBytes());
+    const g = try bank.Geometry.init(4096, 2048, 288, 3, 42);
+    try testing.expectEqual(@as(u64, 14_156_160), in.geometry.slotRowBytes());
+    try testing.expectEqual(g.record_bytes, in.geometry.record_bytes);
     try testing.expect(g.slotRowBytes() <= g.record_bytes);
     try testing.expectEqual(@as(u64, 42) * g.record_bytes, b.per_row);
     // Every slot array the decode phase holds at 115/131 under the default per-layer split (base, ext, decode's window 0;
@@ -980,4 +1034,58 @@ test "glm5_next bill: the line-isolated slot arrays fit the slot terms (per_row 
     }
     const billed = 131 * b.per_row + termOf(b, "slot_transient")[1] + termOf(b, "slot_rounding")[1];
     try testing.expect(held <= billed);
+}
+
+test "glm5_next bill: the exl3 family bills its 9,474,048 B record as the row (per_row, slot_transient, spec_staging), its texts on every route, and fills more rows than NVFP4 at the same baseline" {
+    const a = testing.allocator;
+    const nv = try fixtureInputs(32_768);
+    var ex = nv;
+    ex.geometry = .ofExl3(try exl3_bank.Geometry.init(4096, 2048, 288, 3, 42));
+    try testing.expectEqual(settings.ExpertFamily.exl3, ex.geometry.family);
+    const bn = try billOf(a, &nv);
+    defer bn.free(a);
+    const be = try billOf(a, &ex);
+    defer be.free(a);
+    const record: u64 = 9_474_048;
+    try testing.expectEqual(record, ex.geometry.record_bytes);
+    try testing.expectEqual(record, ex.geometry.slotRowBytes());
+    try testing.expectEqual(@as(u64, 42) * record, be.per_row);
+    try testing.expectEqual([2]u64{ @as(u64, mimo_stream.transient_rows) * record, @as(u64, mimo_stream.decodeTransientRows(experts.decode_window)) * record }, termOf(be, "slot_transient"));
+    try testing.expectEqual(@as(u64, mimo_stream.spec_slots) * (std.mem.alignForward(u64, record, ex.page) + 2 * ex.page), termOf(be, "spec_staging")[0]);
+    // The texts serve the prompt waves too: billed on the stock decode route as well.
+    try testing.expectEqual([2]u64{ fused_kernels_bytes, fused_kernels_bytes }, termOf(be, "decode_kernels"));
+    const target = box_ceiling - box_stop;
+    const rn = try sdk.fill(bn, 12_600_000_000, target, 288, min_rows);
+    const re = try sdk.fill(be, 12_600_000_000, target, 288, min_rows);
+    try testing.expect(re.prompt > rn.prompt and re.decode > rn.decode);
+    try testing.expect(be.total(.decode, 12_600_000_000, re.decode) <= target);
+    if (re.decode < 288) try testing.expect(be.total(.decode, 12_600_000_000, re.decode + 1) > target);
+    std.debug.print("\nGLM5_NEXT EXL3 BILL fixture (residents 17.85 GB, lane off, ctx 32,768, baseline 12.6 GB): nvfp4 {d}/{d} exl3 {d}/{d} per_row {d}\n", .{ rn.prompt, rn.decode, re.prompt, re.decode, be.per_row });
+}
+
+test "glm5_next bill: the exl3 geometry of a synthetic two-layer, eight-expert bank-v2 pack at GLM's shape, from its manifest" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bin = try @import("../../expert/bank.zig").writeSynth(a, &tmp, .{ .hidden = 4096, .inter = 2048, .n_experts = 8 });
+    a.free(bin);
+    const v2 = try tmp.dir.readFileAlloc(testing.io, exl3_bank.manifest_file, a, .limited(64 << 20));
+    defer a.free(v2);
+    const full = try std.mem.replaceOwned(u8, a, v2, "\"tile\":{\"size\":16}", "\"tile\":{\"size\":16,\"layout\":\"exl3-tensor-core\",\"bitstream\":\"msb-first-swap16\"},\"hadamard\":{\"size\":128,\"order\":\"sylvester-natural\",\"scale\":\"1/sqrt(128)\"},\"scales\":{\"rin\":\"exl3.suh\",\"rout\":\"exl3.svh\"}");
+    defer a.free(full);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = exl3_bank.manifest_file, .data = full });
+    var rbuf: [512]u8 = undefined;
+    const root = try sdk.testing.tmpRoot(&tmp, &rbuf);
+    var diag: sdk.Diag = .{};
+    const want: @import("../../expert/bank.zig").Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 4096, .inter = 2048, .n_experts = 8, .n_layers = 2 };
+    const g = SourceGeometry.ofExl3(try exl3_bank.inspect(a, testing.io, root, 3, want, &diag));
+    try testing.expectEqual(@as(u32, 2), g.num_moe_layers);
+    try testing.expectEqual(@as(u32, 8), g.num_experts);
+    var in = try fixtureInputs(32_768);
+    in.geometry = g;
+    const b = try billOf(a, &in);
+    defer b.free(a);
+    try testing.expectEqual(@as(u64, 2 * 9_474_048), b.per_row);
+    // The Flash bank's dims are the load's: the synthetic bank is refused under them, by name.
+    try testing.expectError(error.Glm5NextExl3Dims, exl3_bank.inspect(a, testing.io, root, 3, exl3_bank.flash, &diag));
 }

@@ -68,7 +68,7 @@ pub fn plan(c: *const glm.Config, cap: u32) !Plan {
 pub const Report = struct { plan: Plan, ns: u64 };
 
 /// The warm (construction, after the source and the cache, before the construction check): see the file's doc.
-pub fn run(g: *G, io: std.Io, c: *const glm.Config, w: *const graph.Weights, cache: *graph.Cache, src: *experts.Source, routes: graph.Routes) !Report {
+pub fn run(g: *G, io: std.Io, c: *const glm.Config, w: *const graph.Weights, cache: *graph.Cache, src: anytype, routes: graph.Routes) !Report {
     const p = try plan(c, cache.cap);
     const t0 = std.Io.Timestamp.now(io, .awake);
     {
