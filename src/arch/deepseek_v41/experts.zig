@@ -1190,6 +1190,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 return h.ex.run(g, h.layer, xf, indices, hoist);
             }
 
+            /// `routedHoist` ending before the join's take (JOIN_INDEXED, a decode-lane call): the concatenated outputs and
+            /// each routed position's row in them, for a combine that reads the rows in place.
+            pub fn routedHoistIndexed(h: Hook, g: *G, xf: T, indices: T, hoist: []const T) !Indexed {
+                return h.ex.runEnd(g, h.layer, xf, indices, hoist, .indexed);
+            }
+
             /// JOINLESS (a wide call only: more than max_route_ids ids): the unjoined outputs as the
             /// combine's sources and each assignment's (source, row); `releaseParts` after the combines are evaluated.
             pub fn routedParts(h: Hook, g: *G, xf: T, indices: T) !Parts {
@@ -1483,6 +1489,18 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         }
 
         pub fn run(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T) !T {
+            return self.runEnd(g, layer, xf, indices, hoist, .take);
+        }
+
+        /// A decode-lane call's outputs before the join's take (`Hook.routedHoistIndexed`, JOIN_INDEXED: the caller's
+        /// combine reads the rows in place): the concatenated outputs [rows, hidden] and each routed position's row in
+        /// them, u32 [n * k] (`joinOrder`; the stock join takes exactly these rows).
+        pub const Indexed = struct { rows: T, order: T };
+
+        /// How a call ends: the join's take (`run`, every caller's route) or the indexed rows (JOIN_INDEXED).
+        const Ending = enum { take, indexed };
+
+        fn runEnd(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T, comptime ending: Ending) !(if (ending == .take) T else Indexed) {
             const n: u32 = @intCast(g.shapeOf(xf).dim(0));
             const k: u32 = @intCast(g.shapeOf(indices).dim(1));
             const n_ids = n * k;
@@ -1491,7 +1509,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (if (comptime @hasDecl(M, "prefill_min_tokens")) n >= M.prefill_min_tokens else n_ids > max_route_ids) {
                 // Only a decode-width layer hoists (the trunk's small-rows segments).
                 std.debug.assert(hoist.len == 0);
-                if (comptime !routes.prefill) {
+                if (comptime ending == .indexed) {
+                    // The indexed join serves the decode lane only (a wide call joins in its combine already).
+                    return error.IndexedJoinWideCall;
+                } else if (comptime !routes.prefill) {
                     return error.PrefillLaneNotPorted;
                 } else {
                     return self.runWide(g, layer, xf, indices, n, k);
@@ -1582,7 +1603,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             if (dev != null) try self.devLutAfterRoute(g, layer);
             if (comptime timeline.enabled) timeline.point(layer, .end, self.readGauge(), sv.n_parts > 0);
             if (comptime first_cycle.enabled) first_cycle.call(layer, t_barrier - t_call, t_route - t_route0, dt.now() - t_route, ids, sv.waves, wall_b, tail_reads);
-            return self.join(g, &acc, n, k);
+            return if (comptime ending == .take) self.join(g, &acc, n, k) else joinIndexed(g, &acc, n, k);
         }
 
         /// Each routed position's row in the concatenated outputs: the LAST row carrying it (DEVROUTE's miss parts follow
@@ -1600,6 +1621,15 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             const n_ids = joinOrder(acc.pos[0..acc.n_pos], n * k, &order);
             const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
             return g.reshape(try g.take(joined, ord, 0), &.{ @intCast(n), @intCast(k), self.hidden });
+        }
+
+        /// `join` without its take: the concatenated outputs and the order the take would read them in (JOIN_INDEXED).
+        fn joinIndexed(g: *G, acc: *const Acc, n: u32, k: u32) !Indexed {
+            const joined = try g.concat(acc.outs[0..acc.n_outs], 0);
+            var order: [max_route_ids]u32 = undefined;
+            const n_ids = joinOrder(acc.pos[0..acc.n_pos], n * k, &order);
+            const ord = try g.hostArray(std.mem.sliceAsBytes(order[0..n_ids]), &.{@intCast(n_ids)}, .uint32);
+            return .{ .rows = joined, .order = ord };
         }
 
         /// The self-check's joined row as the host reads it: a math with its own projection (bf16 joins) casts to
@@ -3442,6 +3472,69 @@ test "dsv41 experts: MERGE_GATE_WAITS: one event wait per gate value (1 + parts 
     defer ex.deinit();
     try testing.expectError(error.MergeGateWaitsNeedsGated, ex.bindMergeGateWaits());
     try testing.expect(!ex.mergeGateWaits());
+}
+
+test "dsv41 experts: JOIN_INDEXED: a decode call ending before the join's take: every node the stock call's but the take and its reshape, the order the take's index byte for byte, the rows the take's source" {
+    const a = testing.allocator;
+    const c = testConfig(256, 128, 2);
+    const Chain = EagerChain(TraceOps, TraceGemv);
+    const Ex = ExpertsWith(TraceOps, FakeSource, Chain, .{ .gated = true });
+    for ([_][]const u16{ &.{ 1, 2, 3, 4, 5, 6 }, &.{ 1, 1, 2, 3, 3, 9 }, &.{ 7, 8, 9, 10, 11, 12 } }) |ids| {
+        var stock_ops: std.ArrayList(ops.Op) = .empty;
+        defer stock_ops.deinit(a);
+        var idx_ops: std.ArrayList(ops.Op) = .empty;
+        defer idx_ops.deinit(a);
+        var stock_order: []u8 = &.{};
+        defer a.free(stock_order);
+        var idx_order: []u8 = &.{};
+        defer a.free(idx_order);
+        var stock_rows: ops.Shape = .{};
+        var idx_rows: ops.Shape = .{};
+        var out_shape: ops.Shape = .{};
+        for ([_]bool{ false, true }) |indexed| {
+            var src = try FakeSource.init(a, .{ .hidden = 256, .inter = 128, .n_experts = 16, .rows = &.{ 4, 4 } });
+            defer src.deinit();
+            var g = TraceOps.init(a);
+            defer g.deinit();
+            g.record_host = true;
+            var ex = try Ex.init(a, &g, &src, Chain.init(.{}, &c), &c);
+            defer ex.deinit();
+            try ex.grow(&g, &.{ 8, 8 });
+            src.log.clearRetainingCapacity();
+            src.trace = &g;
+            var script: Script = .{ .calls = &.{ids} };
+            g.host_values = script.values();
+            const xf = try g.input(&.{ 2, 256 }, .bfloat16);
+            const idx = try g.input(&.{ 2, 3 }, .int32);
+            const first = g.nodes.items.len;
+            if (indexed) {
+                const j = try ex.at(0).routedHoistIndexed(&g, xf, idx, &.{});
+                for (g.nodes.items[first..]) |nd| try idx_ops.append(a, nd.op);
+                idx_order = try a.dupe(u8, g.hostBytesOf(j.order).?);
+                idx_rows = g.shapeOf(j.rows);
+                try testing.expectEqual(ops.Dtype.uint32, g.dtypeOf(j.order));
+            } else {
+                const out = try ex.at(0).routedHoist(&g, xf, idx, &.{});
+                for (g.nodes.items[first..]) |nd| try stock_ops.append(a, nd.op);
+                out_shape = g.shapeOf(out);
+                // The take's index: the call's last host array; its source: the node before it (the concat, or the one output).
+                var last_host: usize = g.nodes.items.len;
+                while (last_host > first) : (last_host -= 1) if (g.nodes.items[last_host - 1].op == .host) break;
+                stock_order = try a.dupe(u8, g.hostBytesOf(@intCast(last_host - 1)).?);
+                stock_rows = g.nodes.items[last_host - 2].shape;
+            }
+        }
+        // The stock call is the indexed call then the take and its reshape to [n, k, hidden].
+        try testing.expectEqual(idx_ops.items.len + 2, stock_ops.items.len);
+        try testing.expectEqualSlices(ops.Op, idx_ops.items, stock_ops.items[0..idx_ops.items.len]);
+        try testing.expectEqual(ops.Op.take, stock_ops.items[idx_ops.items.len]);
+        try testing.expectEqual(ops.Op.reshape, stock_ops.items[idx_ops.items.len + 1]);
+        try testing.expect(out_shape.eql(ops.Shape.of(&.{ 2, 3, 256 })));
+        // The same order (each routed position's row) and the same rows the take reads.
+        try testing.expectEqualSlices(u8, stock_order, idx_order);
+        try testing.expectEqual(@as(usize, 2 * 3 * 4), idx_order.len);
+        try testing.expect(stock_rows.eql(idx_rows));
+    }
 }
 
 /// A host-only architecture fixture whose router is already transposed and F32.
