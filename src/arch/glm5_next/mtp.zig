@@ -32,6 +32,13 @@
 //! (`terms`) come from the manifest and the shards' headers: the bank's arrays, the layer's residents and the head's f32
 //! tables, the head's lanes (bf16) at the billed positions plus a round's draft rows, the pending hidden rows (bf16), the
 //! prompt's hidden rows and catch-up, a round's draft steps and its decision.
+//!
+//! The draft head (`settings.draft_head`, installed once at the lane's open: `Lane.chain`): `bf16` (the control) runs
+//! every draft step's head on the trunk's BF16 lm_head and draws a sampled draft through the request's full-vocab filter
+//! (`acceptance.sampledRows`); `q4` / `q8` run it on a 4-bit / 8-bit copy of lm_head built at the open (`HeadQ`, MLX's
+//! affine quantize, billed `mtp_head_q4` / `mtp_head_q8`) and draws a sampled draft whose filter sorts (top_k, if set, within the candidates:
+//! `boundedServes`) through `boundedDraw` (the filter over the row's `settings.draft_filter_k` largest logits). The verify
+//! keeps the BF16 head: the emitted tokens are the control's.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -107,6 +114,7 @@ pub const Refusal = error{
     Glm5NextMtpResidentMissing,
     Glm5NextMtpResidentDtype,
     Glm5NextMtpResidentShape,
+    Glm5NextDraftHeadQuantize,
 };
 
 fn refuse(diag: ?*sdk.Diag, err: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
@@ -586,6 +594,161 @@ pub const Head = struct {
     }
 };
 
+// ── the draft head ──
+
+/// The quantized draft head (`draft_head: q4 | q8`): lm_head [vocab, hidden] BF16 quantized once at the lane's open by MLX's
+/// affine mode at `settings.headBits` / `settings.draft_head_group`: packed words uint32 [vocab, hidden x bits / 32], scales
+/// and biases bf16 [vocab, hidden / group], each its own buffer (`headQBytes`). The draft steps read it in place of the
+/// BF16 head (`ChainHead(.q4 / .q8)`: MLX's `quantized_matmul`, one row on transposed weights: its `affine_qmv_fast` kernel).
+pub const HeadQ = struct {
+    w: T = none,
+    scales: T = none,
+    biases: T = none,
+
+    const none: T = .{ .ctx = null };
+
+    /// MLX's affine quantize of `head` (bf16 [vocab, hidden]) on stream `s`: one kernel writing the three arrays from the
+    /// resident head (no intermediate array). Caller-owned, not yet evaluated.
+    pub fn quantize(s: mlx.mlx_stream, head: T, bits: u32) !HeadQ {
+        var vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_quantize(&vec, head, .some(@intCast(settings.draft_head_group)), .some(@intCast(bits)), "affine", .{}, s));
+        if (mlx.mlx_vector_array_size(vec) != 3) return error.Glm5NextDraftHeadQuantize;
+        var out: [3]T = undefined;
+        var got: usize = 0;
+        errdefer for (out[0..got]) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        for (&out, 0..) |*x, i| {
+            x.* = mlx.mlx_array_new();
+            mlx.check(mlx.mlx_vector_array_get(x, vec, i)) catch |e| {
+                _ = mlx.mlx_array_free(x.*);
+                return e;
+            };
+            got += 1;
+        }
+        return .{ .w = out[0], .scales = out[1], .biases = out[2] };
+    }
+
+    pub fn arrays(q: HeadQ) [head_q_arrays]T {
+        return .{ q.w, q.scales, q.biases };
+    }
+};
+
+/// The quantized draft head's arrays (packed words, scales, biases).
+pub const head_q_arrays = 3;
+
+/// The quantized draft head's bytes at `bits` as MLX allocates its arrays (`HeadQ`): the packed words and the two bf16
+/// tables, each its own buffer. Flash q4: 317,194,240 + 2 x 19,824,640 = 356,843,520 B; q8: 634,388,480 + 2 x 19,824,640 =
+/// 674,037,760 B.
+pub fn headQBytes(c: *const glm.Config, page: u64, bits: u32) u64 {
+    const v: u64 = c.vocab_size;
+    const h: u64 = c.hidden_size;
+    return graph.bufferBytes(v * h * bits / 8, page) + 2 * graph.bufferBytes(v * (h / settings.draft_head_group) * 2, page);
+}
+
+/// A draft step's head on its final-normed row `normed` [1, hidden] under draft head `form`, f32 [vocab]: `bf16` the
+/// trunk's lm_head `head` (`graph.linear`'s matmul on the transposed weight: the control's ops), `q4` / `q8` its quantized copy `q`
+/// (packed words, scales, biases: `HeadQ.arrays`) through `quantized_matmul` at the copy's bits and group (affine,
+/// transposed weights). Each form reads only its own head.
+pub fn headLogits(comptime form: settings.DraftHead, g: anytype, normed: anytype, head: @TypeOf(normed), q: [head_q_arrays]@TypeOf(normed)) !@TypeOf(normed) {
+    const raw = switch (form) {
+        .bf16 => try g.matmul(normed, try g.transpose(head)),
+        .q4, .q8 => try g.quantizedMatmul(normed, q[0], q[1], q[2], true, settings.headBits(form), settings.draft_head_group, .affine),
+    };
+    return g.reshape(try g.astype(raw, .float32), &.{-1});
+}
+
+/// The bill's `mtp_head_q4` / `mtp_head_q8` (`draft_head: q4 | q8`): the quantized head's arrays, held from the lane's open in both phases.
+pub fn headQTerm(c: *const glm.Config, page: u64, form: settings.DraftHead) Term {
+    std.debug.assert(form != .bf16);
+    return .{ .name = if (form == .q8) "mtp_head_q8" else "mtp_head_q4", .bytes = @splat(headQBytes(c, page, settings.headBits(form))), .at_construction = true };
+}
+
+/// Whether the q4 head's bounded draw serves a sampled request's drafts (`chainOf`, once a round): its filter sorts (top_k or
+/// top_p set: the full draw's sort is what the bounded filter replaces; without one the full draw sorts nothing) and its
+/// top_k, when set, lies within the candidates (a wider top_k renormalises top_p over tokens past them). Otherwise the draft
+/// is the full draw's (`acc.sampledRows`).
+pub fn boundedServes(sm: acc.Params) bool {
+    return sm.sorts() and sm.top_k <= settings.draft_filter_k;
+}
+
+/// The q4 head's bounded draw (`draft_head: q4`) on a sampled request it serves (`boundedServes`): the token at
+/// absolute position `pos` from the head's row `row2` [1, vocab] (any float dtype), uint32 [1]. The request's filter (the
+/// steps of `acc.filteredRows`: the row tempered, top_k, then top_p over the top_k-renormalised set, then min_p) runs on
+/// the row's `settings.draft_filter_k` largest tempered logits only (MLX's argpartition: its first k, in any order), each
+/// candidate's probability taken on the whole row's normaliser (its logsumexp). Whenever the full filter's kept set (ties
+/// at its threshold included) lies within those candidates, the kept set, its probabilities and the inverse CDF in
+/// token-id order (`acc.drawRows`) are the full filter's, so the draw at the same uniform (`acc.drawV(seed, pos)`) is
+/// `acc.sampledRows`' token; a wider kept set is cut to the candidates and renormalised. A draft only steers acceptance:
+/// the verify draws every emitted token from the BF16 head's full row.
+pub fn boundedDraw(g: anytype, row2: anytype, sm: acc.Params, pos: u64) !@TypeOf(row2) {
+    std.debug.assert(boundedServes(sm));
+    const k: c_int = @intCast(settings.draft_filter_k);
+    const lt = try g.mul(try g.astype(row2, .float32), try g.scalar(1.0 / sm.temperature, .float32));
+    const ninf = try g.scalar(-std.math.inf(f64), .float32);
+    const zero = try g.scalar(0, .float32);
+    // The k largest tempered logits, sorted descending: the full filter's first k.
+    const cand = try g.slice(try g.argpartition(try g.neg(lt), k - 1, -1), &.{ 0, 0 }, &.{ 1, k }, &.{ 1, 1 });
+    const srt = try g.neg(try g.sort(try g.neg(try g.takeAlongAxis(lt, cand, -1)), -1));
+    // Their probabilities under the whole row (the full filter's softmax over every sorted logit, its first k).
+    const ps = try g.exp(try g.sub(srt, try g.logsumexp(lt, -1, true)));
+    const rank = try g.reshape(try g.arange(0, @floatFromInt(k), 1, .int32), &.{ 1, k });
+    var kk: ?@TypeOf(row2) = if (sm.top_k > 0) try g.less(rank, try g.scalar(@floatFromInt(sm.top_k), .int32)) else null;
+    if (sm.top_p < 1.0) {
+        var pk = ps;
+        if (kk) |m| {
+            pk = try g.where(m, ps, zero);
+            pk = try g.div(pk, try g.sum(pk, -1, true));
+        }
+        const before = try g.sub(try g.cumsum(pk, -1), pk);
+        const kp = try g.less(before, try g.scalar(sm.top_p, .float32));
+        kk = if (kk) |m| try g.logicalAnd(m, kp) else kp;
+    }
+    const count = try g.sum(try g.astype(kk.?, .int32), -1, true);
+    const thr = try g.takeAlongAxis(srt, try g.sub(count, try g.scalar(1, .int32)), -1);
+    // The candidates in token-id order (the full draw's CDF order) and the kept ones among them.
+    const ids = try g.sort(cand, -1);
+    const vid = try g.takeAlongAxis(lt, ids, -1);
+    var keep = try g.greaterEqual(vid, thr);
+    if (sm.min_p) |mp| {
+        const pm = try g.softmax(try g.where(keep, vid, ninf), -1);
+        const km = try g.greaterEqual(pm, try g.mul(try g.max(pm, -1, true), try g.scalar(mp, .float32)));
+        keep = try g.logicalAnd(keep, km);
+    }
+    const p = try g.softmax(try g.where(keep, vid, ninf), -1);
+    // The draw: the first kept candidate whose cumulative mass reaches v x the total.
+    const cum = try g.cumsum(p, -1);
+    const total = try g.slice(cum, &.{ 0, k - 1 }, &.{ 1, k }, &.{ 1, 1 });
+    const v = [1]f32{acc.drawV(sm.seed, pos)};
+    const vv = try g.hostArray(std.mem.sliceAsBytes(&v), &.{ 1, 1 }, .float32);
+    const at = try g.sum(try g.astype(try g.less(cum, try g.mul(vv, total)), .int32), -1, true);
+    return g.reshape(try g.takeAlongAxis(ids, at, -1), &.{1});
+}
+
+/// The draft chain a lane's draft head installs (`chainOf`): the round's `depth` drafts from the pair input `x0` at
+/// `start` (`chainDrafts` over the form's head), read into `out` with each draft's top-1 probability into `q`.
+pub const Chain = *const fn (lane: *Lane, g: *G, w: *const graph.Weights, x0: T, start: u32, depth: u32, out: []u32, q: []f32, sm: ?acc.Params, len: u64) anyerror!void;
+
+/// The draft chain of draft head `form`, bound once at the lane's open (`Lane.chain`): `bf16` the trunk's BF16 head and the
+/// request's full-vocab draw (the control's chain); `q4` the 4-bit copy (`HeadQ`) and, on a request the bounded draw
+/// serves (`boundedServes`), the bounded draw (`boundedDraw`).
+pub fn chainOf(comptime form: settings.DraftHead) Chain {
+    return struct {
+        fn f(lane: *Lane, g: *G, w: *const graph.Weights, x0: T, start: u32, depth: u32, out: []u32, q: []f32, sm: ?acc.Params, len: u64) anyerror!void {
+            const head: Lane.ChainHead(form) = .{ .lane = lane, .w = w, .sm = sm, .len = len, .bounded = form != .bf16 and sm != null and boundedServes(sm.?) };
+            return chainDrafts(G, g, head, x0, start, depth, out, q);
+        }
+    }.f;
+}
+
+/// The chain the setting installs (the lane's open binds it once).
+pub fn chainFor(form: settings.DraftHead) Chain {
+    return switch (form) {
+        inline else => |f| chainOf(f),
+    };
+}
+
 // ── the lane ──
 
 /// The lane over its head, its resident bank and its DSA lanes. `pending` holds the trunk's final-normed hidden of the
@@ -615,6 +778,12 @@ pub const Lane = struct {
     /// The lane's name for `rule` (`nameOf`, construction).
     name_buf: [name_cap]u8 = undefined,
     name_len: usize = 0,
+    /// The draft head (`settings.draft_head`; construction): the chain it installed (`chainFor`) and, under `q4`, its
+    /// arrays (owned by `head`) and their bytes.
+    head_form: settings.DraftHead = .bf16,
+    chain: Chain = chainOf(.bf16),
+    qh: HeadQ = .{},
+    q_bytes: u64 = 0,
     /// The request's counters (MiMo's: rounds, drafted, accepted, generated, corrected; the stream's at the decode start).
     stats: mimo_draft.Stats = .{},
     /// The request's acceptance by draft position (the receipt's tail).
@@ -632,10 +801,11 @@ pub const Lane = struct {
     /// The lane over the pack at `dir`: the draft bank (refused by name when absent), the head bound from `map` (the
     /// arch's weight map with the MTP layer's residents kept and read), every record read into the bank's MLX arrays and
     /// checked, the lanes allocated at `cap` positions plus `max_depth`; `depth` drafts a round at most (`draft_depth`,
-    /// 1 .. `max_depth`), `gate` the draft gate's theta (`draft_gate`, 0 off), both validated with the settings, and `accept`
-    /// the acceptance rule (`ruleOf`; the lane's name follows it).
+    /// 1 .. `max_depth`) and `gate` the draft gate's theta (`draft_gate`, 0 off), both validated with the settings, `accept`
+    /// the acceptance rule (`ruleOf`; the lane's name follows it); `form` the draft head (`draft_head`): its chain bound here,
+    /// and under `q4` / `q8` the trunk's `lm_head` quantized (`HeadQ`) and evaluated here.
     /// Device work: the module's construction, under the GPU lock.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, depth: u32, gate: f32, accept: acc.Rule, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, depth: u32, gate: f32, accept: acc.Rule, form: settings.DraftHead, lm_head: T, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
         std.debug.assert(depth >= 1 and depth <= max_depth);
         var db = try DraftBank.open(gpa, io, dir, c, diag);
         defer db.deinit();
@@ -645,10 +815,21 @@ pub const Lane = struct {
         const self = try gpa.create(Lane);
         errdefer gpa.destroy(self);
         const lanes_cap = cap + max_depth;
-        self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth, .gate = gate, .rule = accept };
+        self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth, .gate = gate, .rule = accept, .head_form = form, .chain = chainFor(form) };
         self.setRule(accept);
         self.head = try Head.bind(gpa, g.s, map, c, diag);
         errdefer self.head.deinit(gpa);
+        // The quantized draft head (q4 / q8): lm_head quantized once, its arrays the head's own (freed with it), evaluated now.
+        if (form != .bf16) {
+            const q = try HeadQ.quantize(g.s, lm_head, settings.headBits(form));
+            const qa = q.arrays();
+            for (qa, 0..) |x, i| _ = self.head.own(gpa, x) catch |e| {
+                for (qa[i + 1 ..]) |y| _ = mlx.mlx_array_free(y);
+                return e;
+            };
+            try g.evalAll(&qa);
+            self.qh = q;
+        }
         const n: u32 = c.n_routed_experts;
         self.slots = try Slots.LayerSlotBank.init(db.layer(), n, g.s);
         errdefer self.slots.deinit();
@@ -673,9 +854,13 @@ pub const Lane = struct {
         var active1: usize = 0;
         _ = mlx.mlx_get_active_memory(&active1);
         self.measured_bytes = active1 -| active0;
-        var held: [bank.n_components + 5]u64 = undefined;
+        var held: [bank.n_components + 5 + head_q_arrays]u64 = @splat(0);
         for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
-        for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..][0..5]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        if (form != .bf16) for (self.qh.arrays(), held[bank.n_components + 5 ..]) |x, *h| {
+            h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        };
+        self.q_bytes = heldOf(held[bank.n_components + 5 ..], std.heap.pageSize());
         self.held_bytes = heldOf(&held, std.heap.pageSize());
         log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=device_chain_coupled bank={s} experts={d} lanes={d} positions measured_bytes={d} draft_gate={d:.3} acceptance={s}\n", .{ self.name(), depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, gate, @tagName(accept) });
         return self;
@@ -831,31 +1016,43 @@ pub const Lane = struct {
         self.n_pending -= n;
     }
 
-    /// One draft step of the chain (`chainDrafts`): the layer on the pair input `x` at position `pos`, its final-normed
-    /// row and its f32 logits [vocab] (the trunk's untied head).
-    const ChainHead = struct {
-        lane: *Lane,
-        w: *const graph.Weights,
-        sm: ?acc.Params = null,
-        len: u64 = 0,
+    /// One draft step of the chain (`chainDrafts`) under draft head `form` (`chainOf`): the layer on the pair input `x` at
+    /// position `pos`, its final-normed row and its f32 logits [vocab] (`bf16`: the trunk's untied head; `q4`: its 4-bit
+    /// copy, `HeadQ`).
+    fn ChainHead(comptime form: settings.DraftHead) type {
+        return struct {
+            lane: *Lane,
+            w: *const graph.Weights,
+            sm: ?acc.Params = null,
+            len: u64 = 0,
+            /// `q4` on a sampled request the bounded draw serves: the draw is `boundedDraw` (set once a round, `chainOf`).
+            bounded: bool = false,
 
-        pub fn step(h: ChainHead, g: *G, x: T, pos: u32) !struct { normed: T, logits: T } {
-            const out_row = try h.lane.layer(g, x, pos);
-            const normed = try graph.rmsNorm(g, out_row, h.lane.head.head_norm, h.lane.c.rms_norm_eps);
-            return .{ .normed = normed, .logits = try g.reshape(try g.astype(try graph.linear(g, normed, h.w.head), .float32), &.{-1}) };
-        }
+            const Self = @This();
 
-        pub fn input(h: ChainHead, g: *G, idx: T, hidden: T) !T {
-            return h.lane.inputAt(g, h.w, idx, hidden);
-        }
+            pub fn step(h: Self, g: *G, x: T, pos: u32) !struct { normed: T, logits: T } {
+                const out_row = try h.lane.layer(g, x, pos);
+                const normed = try graph.rmsNorm(g, out_row, h.lane.head.head_norm, h.lane.c.rms_norm_eps);
+                return .{ .normed = normed, .logits = try headLogits(form, g, normed, h.w.head, h.lane.qh.arrays()) };
+            }
 
-        /// Draft `s` (the token at position len + 1 + s, t1 at len), uint32 [1] on the device: a sampled request's coupled
-        /// draw (`acceptance.sampledRows` on the head's row at the target's uniform there), a greedy one's argmax.
-        pub fn draw(h: ChainHead, g: *G, logits: T, s: u32) !T {
-            if (h.sm) |p| return (try acc.sampledRows(g, try g.reshape(logits, &.{ 1, @intCast(h.lane.c.vocab_size) }), p, h.len + s, &.{})).tok;
-            return g.reshape(try g.argmax(logits, 0), &.{1});
-        }
-    };
+            pub fn input(h: Self, g: *G, idx: T, hidden: T) !T {
+                return h.lane.inputAt(g, h.w, idx, hidden);
+            }
+
+            /// Draft `s` (the token at position len + 1 + s, t1 at len), uint32 [1] on the device: a sampled request's
+            /// coupled draw (`acceptance.sampledRows` on the head's row at the target's uniform there; `q4` on a request it
+            /// serves: `boundedDraw` at the same uniform), a greedy one's argmax.
+            pub fn draw(h: Self, g: *G, logits: T, s: u32) !T {
+                if (h.sm) |p| {
+                    const row2 = try g.reshape(logits, &.{ 1, @intCast(h.lane.c.vocab_size) });
+                    if (form != .bf16 and h.bounded) return boundedDraw(g, row2, p, h.len + 1 + s);
+                    return (try acc.sampledRows(g, row2, p, h.len + s, &.{})).tok;
+                }
+                return g.reshape(try g.argmax(logits, 0), &.{1});
+            }
+        };
+    }
 
     /// A round's `depth` drafts into `out` after `t1` (the token at the trunk's length): the pending pairs appended
     /// (their tokens `after`, then `t1`; the last one through the layer), the first draft from the last pair's row, each
@@ -869,7 +1066,7 @@ pub const Lane = struct {
         const m0 = g.mark();
         defer g.resetTo(m0);
         const start = self.pairs();
-        try chainDrafts(G, g, ChainHead{ .lane = self, .w = w, .sm = sm, .len = len }, try self.input(g, w, &.{t1}, self.pending.?), start, depth, out, q);
+        try self.chain(self, g, w, try self.input(g, w, &.{t1}, self.pending.?), start, depth, out, q, sm, len);
         self.latent.truncateTo(start + 1);
         self.index.truncateTo(start + 1);
         g.release(self.pending.?);
@@ -897,6 +1094,20 @@ pub const Lane = struct {
         return buf[0 .. head.len + self.pos.write(buf[head.len..], self.depth).len];
     }
 
+    /// The installed draft head as the construction's engagement line prints it, read back from the lane: its form, the
+    /// bits and group of the head's weights (the q4 arrays' shapes), the sampled draw's filter and the q4 arrays' bytes.
+    pub fn headLine(self: *const Lane, buf: []u8) []const u8 {
+        return switch (self.head_form) {
+            .bf16 => std.fmt.bufPrint(buf, "form=bf16 bits=16 group=none filter=full bytes={d}", .{self.q_bytes}) catch buf[0..0],
+            .q4, .q8 => blk: {
+                const h: u64 = self.c.hidden_size;
+                const words: u64 = @intCast(mlx.getShape(self.qh.w)[1]);
+                const groups: u64 = @intCast(mlx.getShape(self.qh.scales)[1]);
+                break :blk std.fmt.bufPrint(buf, "form={s} bits={d} group={d} filter=top{d} bytes={d}", .{ @tagName(self.head_form), words * 32 / h, h / groups, settings.draft_filter_k, self.q_bytes }) catch buf[0..0];
+            },
+        };
+    }
+
     /// The request's calibration (`Calib.write`), for its own line at the request's end (the host's receipt buffer holds
     /// MiMo's line and the per-position tail only).
     pub fn calibLine(self: *const Lane, buf: []u8) []const u8 {
@@ -911,10 +1122,11 @@ pub fn heldOf(nbytes: []const u64, page: u64) u64 {
     return n;
 }
 
-/// What the lane's open holds at `positions` billed positions, from the draft bank's geometry and the model: the bill's
-/// `mtp_bank + mtp_tables + mtp_kv`. The open's `held_bytes` (its arrays) equals it by construction: the same shapes.
-pub fn heldBytes(g: *const bank.Geometry, c: *const glm.Config, positions: u64, page: u64) u64 {
-    return DraftBank.arrayBytes(g, page) + Head.tableBytes(c, page) + kvBytes(c, positions, page);
+/// What the lane's open holds at `positions` billed positions under draft head `form`, from the draft bank's geometry and
+/// the model: the bill's `mtp_bank + mtp_tables + mtp_kv` (+ `mtp_head_q4` / `mtp_head_q8` under `q4` / `q8`). The open's `held_bytes` (its
+/// arrays) equals it by construction: the same shapes.
+pub fn heldBytes(g: *const bank.Geometry, c: *const glm.Config, positions: u64, page: u64, form: settings.DraftHead) u64 {
+    return DraftBank.arrayBytes(g, page) + Head.tableBytes(c, page) + kvBytes(c, positions, page) + if (form != .bf16) headQBytes(c, page, settings.headBits(form)) else 0;
 }
 
 /// The module's construction check: what the open holds, at most what the bill holds for it.

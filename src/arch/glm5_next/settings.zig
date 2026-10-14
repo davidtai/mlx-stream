@@ -30,7 +30,10 @@
 //! selection (`per_row`, the default: one scores and one top-k launch per row; `batched`: one of each for all the rows;
 //! exact, ops.zig `SelectRoute`). `hit_wave` the hitpass device hit wave's pairs (`all_pairs`, the default: every routed
 //! pair, the missed ones on base row 0 and never joined; `resident_only`: the missed pairs skipped in every decode text;
-//! exact; an EXL3 pack's hitpass with the seam / guone gate-up and seam / pair down forms only).
+//! exact; an EXL3 pack's hitpass with the seam / guone gate-up and seam / pair down forms only). `draft_head` is the
+//! MTP lane's draft head (`DraftHead`: `bf16`, the default and the control, the trunk's lm_head and the full-vocab filter
+//! on every draft step; `q4` / `q8`, a 4- / 8-bit copy of lm_head built once at the lane's open and a bounded draft
+//! filter; needs `mtp_lane`).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -101,7 +104,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads", "dsa_select", "hit_wave" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads", "dsa_select", "hit_wave", "draft_head" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -159,6 +162,34 @@ pub const DecodePredict = enum { f32, bf16 };
 /// construction (swiglu.zig): `fused` one text between the gate / up GEMVs and the down GEMV; `ops` the op chain (the
 /// control). Rounding-class against `ops`.
 pub const DecodeSwiglu = enum { ops, fused };
+/// The MTP lane's draft head (reports/.../mimo/glm5next-audit-decode-20261014.md rank 3), installed once at the lane's open
+/// (mtp.zig `Lane.chain`): `bf16` (the default, the control) drafts on the trunk's BF16 lm_head and draws a sampled draft
+/// through the request's full-vocab filter (`acceptance.sampledRows`: a sort of every logit); `q4` drafts on a 4-bit copy of
+/// lm_head (`draft_head_bits`, `draft_head_group`: MLX's affine quantize at the open, 0.36 GB beside the BF16 head) and draws
+/// a sampled draft whose filter sorts (top_k, if set, at most `draft_filter_k`: `mtp.boundedServes`) through the bounded
+/// filter (`mtp.boundedDraw`: the request's filter over the row's `draft_filter_k` largest logits, the same position-keyed
+/// draw). Drafts only steer acceptance: the verify keeps the BF16
+/// head and draws every emitted token from its full row (mtp.zig's exact rule), so the ids are the control's under either
+/// form. Any other value refuses by name in `validate`; `q4` without `mtp_lane` refuses by name.
+pub const DraftHead = enum { bf16, q4, q8 };
+/// The bits of a draft head's weights (`q4` / `q8`: MLX's affine quantize at `draft_head_group`; `bf16`: the trunk's head).
+pub fn headBits(form: DraftHead) u32 {
+    return switch (form) {
+        .bf16 => 16,
+        .q4 => 4,
+        .q8 => 8,
+    };
+}
+/// The quantized draft heads' group (MLX's affine mode, `q4` 4 bits and `q8` 8 bits, a scale and a bias (bf16) per group of
+/// 64 weights). `q8` holds 634,388,480 B of words and the same tables (0.674 GB; first window, batch 28a: q4's drafts lost
+/// more acceptance than its reads saved, q8 halves the read saving at a far smaller logit error). q4: group 64
+/// is MLX's default 4-bit group: lm_head [154,880, 4,096] holds 317,194,240 B of packed words and 2 x 19,824,640 B of
+/// scales and biases (0.357 GB, read once a draft step in place of the BF16 head's 1.269 GB); group 32 reads 39.6 MB more
+/// a step, group 128 saves 19.8 MB at twice the group's span per scale. MLX's draft GEMV (`quantized_matmul`, one row,
+/// transposed weights) dispatches its `affine_qmv_fast` kernel at this shape (K = 4,096 a multiple of 512 (q4) / 256 (q8), N = 154,880 of 8).
+pub const draft_head_group: u32 = 64;
+/// The q4 draft head's bounded filter: the candidates a draft draw reads (MLX's argpartition of the tempered row).
+pub const draft_filter_k: u32 = 256;
 /// A verify window's DSA indexer selection (`dsa_select`), installed once at construction (ops.zig `SelectPlan`): `batched`
 /// (the default since g25: one scores launch and one top-k launch for the window's rows) or `per_row` (the control, by
 /// name). Exact.
@@ -421,6 +452,8 @@ pub const Config = struct {
     tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
     /// The decode rows' split between the routed layers (`LayerRows`): `uniform` (the default) or `offsets`.
     expert_rows_by_layer: LayerRows = defaultLayerRows(),
+    /// The MTP lane's draft head (`DraftHead`): `bf16` (the default, the control), `q4` or `q8`.
+    draft_head: DraftHead = .bf16,
     /// The EXL3 family's decode forms (`Exl3Forms`): guone + pair unless named; the seam chain by name.
     exl3_forms: Exl3Forms = .{},
     /// The settings named a forms key (on an NVFP4 pack the default is inert; a named form other than the seam refuses).
@@ -451,7 +484,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false, miss_reads: bool = false, dsa_select: bool = false, hit_wave: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false, miss_reads: bool = false, dsa_select: bool = false, hit_wave: bool = false, draft_head: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -560,6 +593,10 @@ pub const Config = struct {
             const route: ?MissReads = if (v == .string) std.meta.stringToEnum(MissReads, v.string) else null;
             if (route) |r| c.miss_reads = r else c.malformed.miss_reads = true;
             c.miss_reads_requested = true;
+        }
+        if (raw.object.get("draft_head")) |v| {
+            const form: ?DraftHead = if (v == .string) std.meta.stringToEnum(DraftHead, v.string) else null;
+            if (form) |f| c.draft_head = f else c.malformed.draft_head = true;
         }
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
@@ -695,6 +732,9 @@ pub const Config = struct {
             if (!c.formsSkip()) return error.Glm5NextHitWaveForms;
         }
         if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
+        if (c.malformed.draft_head) return error.Glm5NextDraftHeadSetting;
+        // The draft head is the MTP lane's: without the lane a quantized head would install nothing.
+        if (!c.mtp_lane and c.draft_head != .bf16) return error.Glm5NextDraftHeadNeedsLane;
         if (c.malformed.exl3_gateup_form) return error.Glm5NextExl3GateUpFormSetting;
         if (c.malformed.exl3_down_form) return error.Glm5NextExl3DownFormSetting;
         if (c.malformed.exl3_forms_maxm) return error.Glm5NextExl3FormsMaxmSetting;
@@ -1029,6 +1069,47 @@ test "glm5_next settings: the launch-fusion switches: off unless named, on / off
     // Near misses of the names are not settings.
     for ([_][]const u8{ "{\"fuse_kda_input\":\"on\"}", "{\"fuse_gateup\":\"on\"}", "{\"fuse_predict\":\"on\"}", "{\"fuse_joins\":\"on\"}", "{\"merge_waits\":\"on\"}", "{\"fusion\":\"on\"}" }) |text|
         try testing.expectError(error.Unknown, parseSettings(text));
+}
+
+test "glm5_next settings: the draft head: bf16 unless named; bf16 / q4 / q8 by name; any other value refused by name; q4 / q8 refused without the lane" {
+    const base = try parseSettings("{}");
+    try base.validate();
+    try testing.expectEqual(DraftHead.bf16, base.draft_head);
+    try testing.expectEqual(DraftHead.bf16, (try parseSettings("{\"mtp_lane\":true}")).draft_head);
+    for ([_]struct { text: []const u8, want: DraftHead }{
+        .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"bf16\"}", .want = .bf16 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"q4\"}", .want = .q4 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q4\"}", .want = .q4 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q8\"}", .want = .q8 },
+        // The control's form needs no lane (nothing of it installs).
+        .{ .text = "{\"draft_head\":\"bf16\"}", .want = .bf16 },
+    }) |case| {
+        const c = try parseSettings(case.text);
+        try c.validate();
+        try testing.expectEqual(case.want, c.draft_head);
+    }
+    // Anything but "bf16" / "q4" / "q8" refused by name.
+    for ([_][]const u8{ "\"Q4\"", "\"Q8\"", "\"q2\"", "\"q16\"", "\"int4\"", "\"4\"", "\"BF16\"", "\"\"", "\"mxfp4\"", "4", "true", "null", "[\"q4\"]", "{}" }) |bad| {
+        var buf: [96]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{{\"mtp_lane\":true,\"draft_head\":{s}}}", .{bad});
+        try testing.expectError(error.Glm5NextDraftHeadSetting, (try parseSettings(text)).validate());
+    }
+    // q4 without the lane: refused by name.
+    try testing.expectError(error.Glm5NextDraftHeadNeedsLane, (try parseSettings("{\"draft_head\":\"q4\"}")).validate());
+    try testing.expectError(error.Glm5NextDraftHeadNeedsLane, (try parseSettings("{\"mtp_lane\":false,\"draft_head\":\"q4\"}")).validate());
+    try testing.expectError(error.Glm5NextDraftHeadNeedsLane, (try parseSettings("{\"draft_head\":\"q8\"}")).validate());
+    try testing.expectEqual(@as(u32, 8), headBits(.q8));
+    try testing.expectEqual(@as(u32, 4), headBits(.q4));
+
+    // Near misses of the key are not settings.
+    for ([_][]const u8{ "{\"draft_heads\":\"q4\"}", "{\"drafthead\":\"q4\"}", "{\"head\":\"q4\"}" }) |text|
+        try testing.expectError(error.Unknown, parseSettings(text));
+    // The q4 geometry: MLX's affine 4-bit group 64 at Flash's lm_head (the qmv_fast alignments: K by 512, N by 8).
+    const c: Config = .{};
+    try testing.expectEqual(@as(u32, 0), c.model.hidden_size % 512);
+    try testing.expectEqual(@as(u32, 0), c.model.vocab_size % 8);
+    try testing.expectEqual(@as(u32, 0), c.model.hidden_size % draft_head_group);
+    try testing.expect(draft_filter_k <= c.model.vocab_size);
 }
 
 test "glm5_next settings: the resolved draft depth per arch (glm5_next depth 2, gate 0.75; MiMo its trained 3; DSV4.1's DSpark schedule unchanged)" {
