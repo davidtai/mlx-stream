@@ -205,6 +205,9 @@ pub const Inputs = struct {
     decode_swiglu: settings.DecodeSwiglu = .ops,
     /// The MTP lane's construction facts (`mtp_lane` on; null: the serial control, none of the lane's terms).
     mtp: ?mtp.Facts = null,
+    /// A draft-chain sync route (`settings.Config.draftFold`: `draft_chain_eval: once` or `draft_append: deferred`): the
+    /// lane's decode `mtp_wave` adds `mtp.foldBytes`. False: the control's terms exactly.
+    draft_fold: bool = false,
     /// MiMo's X12 keep-warm route (`settings.Config.gpu_keep_warm`; `.off` the control). The setting's route, not the
     /// stream's resolution: a default `waits` on a CPU stream keeps its 1 MiB term (an over-bill there only, MiMo's rule).
     gpu_keep_warm: gpu_warm.Route = .off,
@@ -389,7 +392,7 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
     // The MTP lane (`mtp_lane` on): its own terms and the arch's for it (`laneTerms`); what it holds on the GPU from the
     // open (the bank, the layer's residents, the head's tables and lanes) is wired with the trunk's residents, its
     // request arrays (pending rows, waves, the KDA captures, the hidden taps) with the request's.
-    const lane: ?[6]Term = if (in.mtp) |f| mtp.terms(f, c, in.reserve, page) else null;
+    const lane: ?[6]Term = if (in.mtp) |f| mtp.terms(f, c, in.reserve, page, in.draft_fold) else null;
     const lane_arch: ?[3]Term = if (in.mtp != null) laneTerms(in) else null;
     var lane_held: u64 = 0;
     var lane_request: [2]u64 = .{ 0, 0 };
@@ -600,6 +603,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .decode_dsa = cfg.decode_dsa,
         .decode_swiglu = cfg.decode_swiglu,
         .mtp = lane,
+        .draft_fold = cfg.mtp_lane and cfg.draftFold(),
         .gpu_keep_warm = cfg.gpu_keep_warm,
         .page = page,
     };
@@ -982,6 +986,14 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
         break :blk @import("root.zig").declared(block) orelse return error.Glm5NextPackRequired;
     };
     var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane };
+    // `GLM5_BILL_DRAFT_FOLD=1` (with the lane): the bill under a draft-chain sync route (`draft_chain_eval: once` and
+    // `draft_append: deferred`; either alone bills the same `mtp.foldBytes`).
+    if (std.c.getenv("GLM5_BILL_DRAFT_FOLD")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
+        if (!lane) return error.Glm5NextDraftChainEvalNeedsLane;
+        cfg.draft_chain_eval = .once;
+        cfg.draft_append = .deferred;
+        std.debug.print("\nGLM5_NEXT BILL draft_fold=on (draft_chain_eval=once draft_append=deferred: mtp_wave decode + mtp.foldBytes)\n", .{});
+    };
     const res = try residentBytes(a, io, dir, &model, std.heap.pageSize());
     std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s} experts={s}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off", @tagName(fam) });
     for (tool_contexts) |ctx| {

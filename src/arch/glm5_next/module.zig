@@ -111,7 +111,7 @@ pub const Module = struct {
 
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .io = io, .g = try graph.G.init(gpa, s), .c = cfg.*, .w = undefined, .gates = &.{}, .src = undefined, .cache = undefined, .routes = routes, .reserve = plan.reserve, .rows = plan.rows, .prompt_pass = Passes(.nvfp4).promptServed, .step_pass = stepPassOf(.served, .ops, .nvfp4), .round_pass = roundPassOf(.ops, .nvfp4), .sampler = undefined };
+        self.* = .{ .gpa = gpa, .io = io, .g = try graph.G.init(gpa, s), .c = cfg.*, .w = undefined, .gates = &.{}, .src = undefined, .cache = undefined, .routes = routes, .reserve = plan.reserve, .rows = plan.rows, .prompt_pass = Passes(.nvfp4).promptServed, .step_pass = stepPassOf(.served, .ops, .nvfp4), .round_pass = roundPassOf(.ops, .nvfp4, .{}), .sampler = undefined };
         errdefer self.g.deinit();
         self.sampler = try Sampler.init(gpa, s);
         errdefer self.sampler.deinit();
@@ -271,7 +271,16 @@ pub const Module = struct {
         };
         self.prompt_pass = promptPassOf(promptRoute(&self.c), self.c.expert_family);
         self.step_pass = stepPassOf(stepRoute(&self.c), self.c.decode_glue, self.c.expert_family);
-        self.round_pass = roundPassOf(self.c.decode_glue, self.c.expert_family);
+        self.round_pass = roundPassOf(self.c.decode_glue, self.c.expert_family, draftRouteOf(&self.c));
+        // The draft chain's syncs as installed (read back from the bound round), the installed lane's depth and gate and
+        // the EXL3 decode forms the source installed: one line names what a draft-chain pair's arm runs (its one
+        // engagement substring).
+        {
+            const dr = self.installedDraftRoute();
+            var lane_buf: [64]u8 = undefined;
+            const lane_state: []const u8 = if (self.mtp) |lane| std.fmt.bufPrint(&lane_buf, "lane=on depth={d} draft_gate={d:.3}", .{ lane.depth, lane.gate }) catch unreachable else "lane=off";
+            log.info("glm5_next draft chain: draft_chain_eval={s} draft_append={s} {s} forms gateup={s} down={s}\n", .{ @tagName(dr.chain), @tagName(dr.app), lane_state, @tagName(self.c.exl3_forms.gateup), @tagName(self.c.exl3_forms.down) });
+        }
         if (self.c.dumpDir()) |d| {
             log.info("glm5_next logits_dump: on dir={s} chunk_rows={d} chunk_bytes={d} (one safetensors file per prompt pass: logits F32 [prompt rows, {d}], token_ids I32, ids_int32_sha256; written before the request returns)\n", .{ d, graph.dump_chunk_rows, dump.chunkBytes(graph.dump_chunk_rows, model.vocab_size, model.hidden_size), model.vocab_size });
         }
@@ -310,6 +319,13 @@ pub const Module = struct {
         while (it.next()) |k| if (!graph.keptResident(c, k.*) and !(lane and mtp.isResident(c, k.*))) try names.append(gpa, try gpa.dupe(u8, k.*));
         for (names.items) |n| weights.drop(n);
         if (names.items.len > 0) log.info("glm5_next: {d} tensors of the pack the trunk does not read dropped unread (the vision tower, {s}the FP8 KV scales)\n", .{ names.items.len, if (lane) "the MTP layer's unread tensors, " else "the MTP layer, " });
+    }
+
+    /// The draft-chain syncs of the bound round (`round_pass`), read back against each route's instance at the
+    /// construction's glue and family (the engagement line's; once, at construction).
+    fn installedDraftRoute(self: *const Module) DraftRoute {
+        for (draft_routes) |dr| if (self.round_pass == roundPassOf(self.c.decode_glue, self.c.expert_family, dr)) return dr;
+        unreachable;
     }
 
     /// Once, at construction (every command retired, MLX's cache cleared): the footprint beside the bill's construction
@@ -695,7 +711,9 @@ pub fn Passes(comptime fam: experts.Family) type {
             return logits;
         }
 
-        pub fn roundWith(self: *Module, comptime gl: glue.Route, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) anyerror!sdk.DraftRound {
+        /// `dr` (comptime, the construction's `DraftRoute`): the draft's catch-up waited or folded into the chain
+        /// (`draft_chain_eval`), the round's end waited or committed with the kept rows' catch-up (`draft_append`).
+        pub fn roundWith(self: *Module, comptime gl: glue.Route, comptime dr: DraftRoute, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) anyerror!sdk.DraftRound {
             const lane = self.mtp.?;
             const g = &self.g;
             const len = self.cache.len;
@@ -707,7 +725,7 @@ pub fn Passes(comptime fam: experts.Family) type {
             var ids: [mtp.verify_rows]u32 = undefined;
             var q: [mtp.max_depth]f32 = undefined;
             ids[0] = t1;
-            if (drafted > 0) try lane.draft(g, &self.w, self.history[lane.pairs() + 1 .. len], t1, drafted, ids[1 .. drafted + 1], q[0..drafted], acc.Params.active(acc.Params.of(sampling)), len);
+            if (drafted > 0) try lane.draft(g, &self.w, self.history[lane.pairs() + 1 .. len], t1, drafted, ids[1 .. drafted + 1], q[0..drafted], acc.Params.active(acc.Params.of(sampling)), len, dr.chain);
             // The draft gate (`draft_gate`): the leading drafts whose cumulative top-1 probability stays at or above theta are
             // verified (theta 0, the default: every draft).
             const k = mtp.gatedDrafts(q[0..drafted], lane.gate);
@@ -739,7 +757,11 @@ pub fn Passes(comptime fam: experts.Family) type {
             try self.cache.rollback(g, &self.c.model, len, rows, kept + 1);
             gprof.stepEnd(tp);
             const committed = try g.slice(hidden, &.{ 0, 0 }, &.{ @intCast(kept + 1), @intCast(self.c.model.hidden_size) }, &.{ 1, 1 });
-            try lane.pend(g, len + 1 + kept, committed, kept + 1, drafted == 0);
+            switch (dr.app) {
+                .eval => try lane.pend(g, len + 1 + kept, committed, kept + 1, drafted == 0),
+                // A drafted round's kept drafts are its kept rows' next tokens (the last row's is the next round's t1).
+                .deferred => try lane.pendDeferred(g, &self.w, len + 1 + kept, committed, kept + 1, drafted == 0, if (drafted > 0) ids[1 .. kept + 1] else &.{}),
+            }
             @memcpy(self.history[len..][0 .. kept + 1], ids[0 .. kept + 1]);
             lane.record(k, kept, q[0..k]);
             const tokens = try a.dupe(u32, ids[0..plan.emitted]);
@@ -793,15 +815,41 @@ fn stepPassOf(r: StepRoute, gl: glue.Route, fam: experts.Family) *const fn (*Mod
     };
 }
 
-/// The MTP round a construction installs: its verify (and a draftless round's step) over the installed decode glue.
-fn roundPassOf(gl: glue.Route, fam: experts.Family) *const fn (*Module, std.mem.Allocator, u32, u32, sdk.SamplingParams) anyerror!sdk.DraftRound {
+/// The MTP round's draft-chain syncs a construction installs (settings.zig `DraftChainEval`, `DraftAppend`; the defaults
+/// are the controls).
+pub const DraftRoute = struct {
+    chain: settings.DraftChainEval = .per_step,
+    app: settings.DraftAppend = .eval,
+};
+
+pub fn draftRouteOf(c: *const settings.Config) DraftRoute {
+    return .{ .chain = c.draft_chain_eval, .app = c.draft_append };
+}
+
+const draft_routes = blk: {
+    var all: [4]DraftRoute = undefined;
+    var i: usize = 0;
+    for ([_]settings.DraftChainEval{ .per_step, .once }) |ch| for ([_]settings.DraftAppend{ .eval, .deferred }) |ap| {
+        all[i] = .{ .chain = ch, .app = ap };
+        i += 1;
+    };
+    break :blk all;
+};
+
+/// The MTP round a construction installs: its verify (and a draftless round's step) over the installed decode glue, at
+/// the draft-chain syncs `dr` (one instance per route: no per-round choice).
+fn roundPassOf(gl: glue.Route, fam: experts.Family, dr: DraftRoute) *const fn (*Module, std.mem.Allocator, u32, u32, sdk.SamplingParams) anyerror!sdk.DraftRound {
     return switch (fam) {
         inline else => |fm| switch (gl) {
-            inline else => |g| struct {
-                fn f(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) anyerror!sdk.DraftRound {
-                    return Passes(fm).roundWith(self, g, a, t1, accepted_cap, sampling);
-                }
-            }.f,
+            inline else => |g| switch (dr.chain) {
+                inline else => |ch| switch (dr.app) {
+                    inline else => |ap| struct {
+                        fn f(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) anyerror!sdk.DraftRound {
+                            return Passes(fm).roundWith(self, g, .{ .chain = ch, .app = ap }, a, t1, accepted_cap, sampling);
+                        }
+                    }.f,
+                },
+            },
         },
     };
 }
@@ -849,7 +897,7 @@ test "glm5_next step route: the served step unless mtp_lane installs the lane's,
     // The default glue is the fused one.
     try testing.expectEqual(glue.Route.fused, off.decode_glue);
     try testing.expect(stepPassOf(stepRoute(&off), off.decode_glue, .nvfp4) == &Passes(.nvfp4).stepServed(.fused));
-    try testing.expect(roundPassOf(off.decode_glue, .nvfp4) == roundPassOf(.fused, .nvfp4));
+    try testing.expect(roundPassOf(off.decode_glue, .nvfp4, draftRouteOf(&off)) == roundPassOf(.fused, .nvfp4, .{}));
     // The setting as the pack's block gives it: on installs the lane's step, false keeps the served one; the glue route
     // picks the instance (ops: the stock op chains, the control).
     for ([_]struct { text: []const u8, want: StepRoute, glue: glue.Route }{
@@ -874,7 +922,36 @@ test "glm5_next step route: the served step unless mtp_lane installs the lane's,
     }
     // The two glue instances are distinct callables.
     try testing.expect(stepPassOf(.served, .ops, .nvfp4) != stepPassOf(.served, .fused, .nvfp4));
-    try testing.expect(roundPassOf(.ops, .nvfp4) != roundPassOf(.fused, .nvfp4));
+    try testing.expect(roundPassOf(.ops, .nvfp4, .{}) != roundPassOf(.fused, .nvfp4, .{}));
+}
+
+test "glm5_next draft route: the controls unless named; each of the four draft-chain sync routes its own round instance (construction-time routes), read back from the bound round" {
+    if (comptime !@import("../../host_caps.zig").dsa_nax) return error.SkipZigTest;
+    const off: settings.Config = .{};
+    try testing.expectEqual(DraftRoute{}, draftRouteOf(&off));
+    for (draft_routes, 0..) |a, i| for (draft_routes, 0..) |b, j| inline for (.{ glue.Route.ops, glue.Route.fused }) |gl| {
+        const pa = roundPassOf(gl, .exl3, a);
+        try testing.expect((pa == roundPassOf(gl, .exl3, b)) == (i == j));
+        try testing.expect(pa != roundPassOf(gl, .nvfp4, a));
+    };
+    for ([_]struct { text: []const u8, want: DraftRoute }{
+        .{ .text = "{\"mtp_lane\":true}", .want = .{} },
+        .{ .text = "{\"mtp_lane\":true,\"draft_chain_eval\":\"once\"}", .want = .{ .chain = .once } },
+        .{ .text = "{\"mtp_lane\":true,\"draft_append\":\"deferred\"}", .want = .{ .app = .deferred } },
+        .{ .text = "{\"mtp_lane\":true,\"draft_chain_eval\":\"once\",\"draft_append\":\"deferred\"}", .want = .{ .chain = .once, .app = .deferred } },
+    }) |case| {
+        const raw = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.text, .{});
+        defer raw.deinit();
+        var c: settings.Config = .{};
+        c.applySettings(raw.value);
+        try c.validate();
+        try testing.expectEqual(case.want, draftRouteOf(&c));
+        // The engagement line's read back: the bound round names its own route.
+        var m: Module = undefined;
+        m.c = c;
+        m.round_pass = roundPassOf(c.decode_glue, c.expert_family, draftRouteOf(&c));
+        try testing.expectEqual(case.want, m.installedDraftRoute());
+    }
 }
 
 test "glm5_next expert family: each family installs its own passes (construction-time routes, no per-forward branch)" {
@@ -885,6 +962,6 @@ test "glm5_next expert family: each family installs its own passes (construction
         try testing.expect(stepPassOf(.served, gl, .exl3) == &Passes(.exl3).stepServed(gl));
         try testing.expect(stepPassOf(.lane, gl, .exl3) == &Passes(.exl3).stepLane(gl));
         try testing.expect(stepPassOf(.served, gl, .exl3) != stepPassOf(.served, gl, .nvfp4));
-        try testing.expect(roundPassOf(gl, .exl3) != roundPassOf(gl, .nvfp4));
+        try testing.expect(roundPassOf(gl, .exl3, .{}) != roundPassOf(gl, .nvfp4, .{}));
     }
 }

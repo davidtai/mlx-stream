@@ -601,7 +601,7 @@ test "glm5_next mtp bill: the lane's terms by construction (the bank's nine arra
     try testing.expect(f.resident_bytes >= res_bytes);
     try testing.expectEqual(mtp.Head.tableBytes(&c, page), f.table_bytes);
     const positions: u64 = 17_408;
-    const t = mtp.terms(f, &c, positions, page);
+    const t = mtp.terms(f, &c, positions, page, false);
     const names = [_][]const u8{ "mtp_bank", "mtp_residents", "mtp_tables", "mtp_kv", "mtp_pending", "mtp_wave" };
     for (t, names) |term, name| try testing.expectEqualStrings(name, term.name);
     try testing.expectEqual([2]u64{ f.bank_bytes, f.bank_bytes }, t[0].bytes);
@@ -618,7 +618,7 @@ test "glm5_next mtp bill: the lane's terms by construction (the bank's nine arra
         const pf = try mtp.facts(a, io, std.mem.span(p), &pc, page, &diag);
         // 3 x (288 x 4,194,304 words + 288 x 524,288 scales + 288 x 4 global scales).
         try testing.expectEqual(@as(u64, 4_076_866_944), pf.bank_bytes);
-        const pt = mtp.terms(pf, &pc, positions, page);
+        const pt = mtp.terms(pf, &pc, positions, page, false);
         var total: [2]u64 = .{ 0, 0 };
         for (pt) |term| {
             total[0] += term.bytes[0];
@@ -822,6 +822,300 @@ test "glm5_next mtp draft chain: the device chain (each draft's argmax feeding t
     try noDevice();
 }
 
+/// A host op backend that tracks what the device would have run: every array lazy until an eval reaches it (its inputs'
+/// closure), committed by `asyncEval`, done once an eval names it or reaches it, or once any later eval runs (the stream's
+/// order runs a committed array before it). A host read of an array not done is an implicit sync (refused). Values are
+/// computed when built (the toy's), so a route's arrays compare bit for bit with another's.
+const FoldOps = struct {
+    pub const T = u32;
+    const State = enum { lazy, committed, done };
+    a: std.mem.Allocator,
+    vals: std.ArrayList([]f32) = .empty,
+    deps: std.ArrayList([]u32) = .empty,
+    state: std.ArrayList(State) = .empty,
+    evals: u32 = 0,
+    commits: u32 = 0,
+    reads: u32 = 0,
+
+    fn deinit(g: *FoldOps) void {
+        for (g.vals.items) |v| g.a.free(v);
+        for (g.deps.items) |d| g.a.free(d);
+        g.vals.deinit(g.a);
+        g.deps.deinit(g.a);
+        g.state.deinit(g.a);
+    }
+
+    fn new(g: *FoldOps, v: []const f32, deps: []const u32) !T {
+        try g.vals.append(g.a, try g.a.dupe(f32, v));
+        try g.deps.append(g.a, try g.a.dupe(u32, deps));
+        try g.state.append(g.a, .lazy);
+        return @intCast(g.vals.items.len - 1);
+    }
+
+    /// An array given as already on the device (evaluated before the round).
+    fn ready(g: *FoldOps, v: []const f32) !T {
+        const x = try g.new(v, &.{});
+        g.state.items[x] = .done;
+        return x;
+    }
+
+    fn reach(g: *FoldOps, x: T, to: State) void {
+        if (@intFromEnum(g.state.items[x]) >= @intFromEnum(to)) return;
+        g.state.items[x] = to;
+        for (g.deps.items[x]) |d| g.reach(d, to);
+    }
+
+    pub fn evalAll(g: *FoldOps, xs: []const T) !void {
+        g.evals += 1;
+        for (g.state.items) |*s| if (s.* == .committed) {
+            s.* = .done;
+        };
+        for (xs) |x| g.reach(x, .done);
+    }
+
+    pub fn asyncEval(g: *FoldOps, xs: []const T) !void {
+        g.commits += 1;
+        for (xs) |x| g.reach(x, .committed);
+    }
+
+    fn readable(g: *const FoldOps, x: T) !void {
+        if (g.state.items[x] != .done) return error.ImplicitSync;
+    }
+
+    fn done(g: *const FoldOps, x: T) bool {
+        return g.state.items[x] == .done;
+    }
+
+    pub fn hostU32(g: *FoldOps, x: T, out: []u32) ![]const u32 {
+        try g.readable(x);
+        g.reads += 1;
+        for (out, g.vals.items[x]) |*o, f| o.* = @intFromFloat(f);
+        return out;
+    }
+
+    pub fn hostF32(g: *FoldOps, x: T, out: []f32) ![]const f32 {
+        try g.readable(x);
+        g.reads += 1;
+        @memcpy(out, g.vals.items[x]);
+        return out;
+    }
+
+    pub fn reshape(g: *FoldOps, x: T, _: []const c_int) !T {
+        return g.new(g.vals.items[x], &.{x});
+    }
+
+    pub fn argmax(g: *FoldOps, x: T, axis: c_int) !T {
+        std.debug.assert(axis == 0);
+        return g.new(&.{@floatFromInt(firstMax(g.vals.items[x]))}, &.{x});
+    }
+
+    pub fn concat(g: *FoldOps, xs: []const T, _: c_int) !T {
+        var all: std.ArrayList(f32) = .empty;
+        defer all.deinit(g.a);
+        for (xs) |x| try all.appendSlice(g.a, g.vals.items[x]);
+        return g.new(all.items, xs);
+    }
+
+    pub fn max(g: *FoldOps, x: T, axis: c_int, keepdims: bool) !T {
+        std.debug.assert(axis == 0 and !keepdims);
+        return g.new(&.{std.mem.max(f32, g.vals.items[x])}, &.{x});
+    }
+
+    pub fn logsumexp(g: *FoldOps, x: T, axis: c_int, keepdims: bool) !T {
+        std.debug.assert(axis == 0 and !keepdims);
+        const v = g.vals.items[x];
+        const m = std.mem.max(f32, v);
+        var s: f32 = 0;
+        for (v) |f| s += @exp(f - m);
+        return g.new(&.{m + @log(s)}, &.{x});
+    }
+
+    pub fn sub(g: *FoldOps, x: T, y: T) !T {
+        return g.new(&.{g.vals.items[x][0] - g.vals.items[y][0]}, &.{ x, y });
+    }
+
+    pub fn exp(g: *FoldOps, x: T) !T {
+        return g.new(&.{@exp(g.vals.items[x][0])}, &.{x});
+    }
+};
+
+/// The toy lane: one key per position (each key's value a function of its pair and position, built on the lane's last
+/// key, as a lane write builds on the lane's buffer), the pending rows (one value a row) and their count.
+const FoldLane = struct {
+    keys: std.ArrayList(u32) = .empty,
+    pending: ?u32 = null,
+    n_pending: u32 = 0,
+
+    fn keyOf(row: f32, tok: u32, pos: u64) f32 {
+        return @floatFromInt((@as(u64, @intFromFloat(row)) *% 31 +% @as(u64, tok) *% 7 +% pos *% 13) % 1009);
+    }
+
+    fn appendKey(l: *FoldLane, g: *FoldOps, a: std.mem.Allocator, row: f32, tok: u32, dep: u32) !u32 {
+        const pos: u64 = l.keys.items.len;
+        const last = l.keys.items[l.keys.items.len - 1];
+        const k = try g.new(&.{keyOf(row, tok, pos)}, &.{ dep, last });
+        try l.keys.append(a, k);
+        return k;
+    }
+
+    fn keySum(l: *const FoldLane, g: *const FoldOps) u32 {
+        var s: u64 = 0;
+        for (l.keys.items) |k| s += @intFromFloat(g.vals.items[k][0]);
+        return @intCast(s % 64);
+    }
+};
+
+/// The lane's keys for `mtp.catchUp` over the toy (as `Lane.Keys` over MLX).
+const FoldKeys = struct {
+    lane: *FoldLane,
+    a: std.mem.Allocator,
+    tokens: []const u32,
+
+    pub fn chunk(k: FoldKeys, g: *FoldOps, at: u32, end: u32) !void {
+        const p = k.lane.pending.?;
+        for (at..end) |i| _ = try k.lane.appendKey(g, k.a, g.vals.items[p][i], k.tokens[i], p);
+    }
+
+    pub fn lanes(k: FoldKeys) [2]u32 {
+        const last = k.lane.keys.items[k.lane.keys.items.len - 1];
+        return .{ last, last };
+    }
+
+    pub fn keepTail(k: FoldKeys, g: *FoldOps, n: u32) !?u32 {
+        const old = k.lane.pending.?;
+        k.lane.pending = if (n == k.lane.n_pending) null else try g.new(g.vals.items[old][n..], &.{old});
+        k.lane.n_pending -= n;
+        return k.lane.pending;
+    }
+};
+
+/// The toy draft head on the lane: a step appends its pair's key (the layer's lane write) and its logits read every key
+/// of the lane (the attention), so a draft depends on the caught-up keys.
+const FoldHead = struct {
+    lane: *FoldLane,
+    a: std.mem.Allocator,
+    V: u32,
+
+    pub fn step(h: FoldHead, g: *FoldOps, x: u32, pos: u32) !struct { normed: u32, logits: u32 } {
+        std.debug.assert(pos == h.lane.keys.items.len);
+        const tok: u32 = @intFromFloat(g.vals.items[x][0]);
+        const key = try h.lane.appendKey(g, h.a, g.vals.items[x][1], tok, x);
+        var row: [64]f32 = undefined;
+        targetRow((tok + h.lane.keySum(g)) % h.V, pos, row[0..h.V]);
+        return .{ .normed = try g.new(&.{ @floatFromInt(tok), @floatFromInt(pos) }, &.{key}), .logits = try g.new(row[0..h.V], &.{key}) };
+    }
+
+    pub fn draw(_: FoldHead, g: *FoldOps, logits: u32, _: u32) !u32 {
+        return g.reshape(try g.argmax(logits, 0), &.{1});
+    }
+
+    pub fn input(_: FoldHead, g: *FoldOps, idx: u32, hidden: u32) !u32 {
+        return g.new(&.{ g.vals.items[idx][0], g.vals.items[hidden][1] }, &.{ idx, hidden });
+    }
+};
+
+const FoldRoute = struct { chain: mtp.CatchUpSync, app: enum { eval, deferred } };
+
+const FoldRound = struct {
+    ids: [mtp.max_depth]u32 = undefined,
+    q: [mtp.max_depth]f32 = undefined,
+    keys: [64]f32 = undefined,
+    n_keys: usize = 0,
+    evals: u32 = 0,
+    commits: u32 = 0,
+    reads: u32 = 0,
+};
+
+/// One round end and the next round's draft on the toy, at route `r`, as module.zig `roundWith` and mtp.zig `Lane.draft`
+/// / `pendDeferred` sequence them: the previous round's verify kept `kept` drafts (`drafts`), its kept rows' hidden
+/// `hidden` pended (waited, or, deferred, folded with the kept rows' catch-up committed); then the draft at `t1`: the
+/// catch-up of the pending rows but the last (`r.chain`: waited per chunk or folded into the chain), the chain of `depth`
+/// drafts read once, the draft rows truncated.
+fn foldRound(a: std.mem.Allocator, r: FoldRoute, prior: u32, kept: u32, drafts: []const u32, t1: u32, depth: u32, chunk_rows: u32, seed: u64) !FoldRound {
+    var g: FoldOps = .{ .a = a };
+    defer g.deinit();
+    var lane: FoldLane = .{};
+    defer lane.keys.deinit(a);
+    var prng = std.Random.DefaultPrng.init(seed);
+    // The lane's pairs before the round (evaluated) and the verify's hidden rows (evaluated by the verify's eval).
+    for (0..prior) |i| try lane.keys.append(a, try g.ready(&.{@floatFromInt((i * 37 + seed) % 1009)}));
+    var rows: [mtp.verify_rows]f32 = undefined;
+    for (&rows) |*x| x.* = @floatFromInt(prng.random().uintLessThan(u32, 4096));
+    const hidden = try g.ready(rows[0 .. kept + 1]);
+    const after = drafts[0..kept];
+    var out: FoldRound = .{};
+    // The round's end: the pend (a view of the verify's hidden), then the deferred catch-up.
+    lane.pending = try g.new(g.vals.items[hidden], &.{hidden});
+    lane.n_pending = kept + 1;
+    switch (r.app) {
+        .eval => try g.evalAll(&.{lane.pending.?}),
+        .deferred => if (kept == 0) try g.asyncEval(&.{lane.pending.?}) else try mtp.catchUp(FoldOps, &g, FoldKeys{ .lane = &lane, .a = a, .tokens = after }, kept, chunk_rows, .commit),
+    }
+    // The next round's draft: the catch-up of what is still pending but the last row, then the chain.
+    const tokens_left: []const u32 = if (r.app == .deferred) &.{} else after;
+    const n: u32 = @intCast(@min(tokens_left.len, lane.n_pending));
+    switch (r.chain) {
+        .wait => try mtp.catchUp(FoldOps, &g, FoldKeys{ .lane = &lane, .a = a, .tokens = tokens_left }, n, chunk_rows, .wait),
+        .fold => try mtp.catchUp(FoldOps, &g, FoldKeys{ .lane = &lane, .a = a, .tokens = tokens_left }, n, chunk_rows, .fold),
+        .commit => unreachable,
+    }
+    try testing.expectEqual(@as(u32, 1), lane.n_pending);
+    const start: u32 = @intCast(lane.keys.items.len);
+    const x0 = try g.new(&.{ @floatFromInt(t1), g.vals.items[lane.pending.?][0] }, &.{lane.pending.?});
+    try mtp.chainDrafts(FoldOps, &g, FoldHead{ .lane = &lane, .a = a, .V = 64 }, x0, start, depth, out.ids[0..depth], out.q[0..depth]);
+    lane.keys.shrinkRetainingCapacity(start + 1);
+    // Every key the lanes keep ran on the device by the chain's eval (no catch-up left unrun), read here by value.
+    for (lane.keys.items, 0..) |k, i| {
+        try testing.expect(g.done(k));
+        out.keys[i] = g.vals.items[k][0];
+    }
+    out.n_keys = lane.keys.items.len;
+    out.evals = g.evals;
+    out.commits = g.commits;
+    out.reads = g.reads;
+    return out;
+}
+
+test "glm5_next mtp draft chain syncs: draft_chain_eval once and draft_append deferred draft the control's ids and q and append its keys bit for bit; once is one eval a round, deferred commits the round's end with no wait" {
+    const a = testing.allocator;
+    const control: FoldRoute = .{ .chain = .wait, .app = .eval };
+    const routes = [_]FoldRoute{ .{ .chain = .fold, .app = .eval }, .{ .chain = .wait, .app = .deferred }, .{ .chain = .fold, .app = .deferred } };
+    for ([_]u32{ 1, 2, 3 }) |depth| for (0..mtp.max_depth + 1) |kept_u| for ([_]u32{ 1, 2, mtp.append_rows }) |chunk_rows| for (0..6) |seed| {
+        const kept: u32 = @intCast(kept_u);
+        const drafts = [_]u32{ @intCast((seed * 5 + 1) % 64), @intCast((seed * 11 + 3) % 64), @intCast((seed * 17 + 9) % 64) };
+        const t1: u32 = @intCast((seed * 3 + kept) % 64);
+        const prior: u32 = 5 + @as(u32, @intCast(seed));
+        const want = try foldRound(a, control, prior, kept, &drafts, t1, depth, chunk_rows, seed);
+        // The control: the round's pend waited, the catch-up's chunks and copy each waited, the chain's one eval.
+        const chunks: u32 = (kept + chunk_rows - 1) / chunk_rows;
+        const copy: u32 = if (kept > 0) 1 else 0;
+        try testing.expectEqual(1 + chunks + copy + 1, want.evals);
+        try testing.expectEqual(@as(u32, 0), want.commits);
+        try testing.expectEqual(@as(u32, 2), want.reads);
+        try testing.expectEqual(@as(usize, prior + kept + 1), want.n_keys);
+        for (routes) |r| {
+            const got = try foldRound(a, r, prior, kept, &drafts, t1, depth, chunk_rows, seed);
+            try testing.expectEqualSlices(u32, want.ids[0..depth], got.ids[0..depth]);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.q[0..depth]), std.mem.sliceAsBytes(got.q[0..depth]));
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.keys[0..want.n_keys]), std.mem.sliceAsBytes(got.keys[0..got.n_keys]));
+            try testing.expectEqual(@as(u32, 2), got.reads);
+            switch (r.app) {
+                // once: the round's pend waited, the chain's eval runs the catch-up (one eval a draft).
+                .eval => {
+                    try testing.expectEqual(@as(u32, 2), got.evals);
+                    try testing.expectEqual(@as(u32, 0), got.commits);
+                },
+                // deferred: the round's end one commit, no wait; the draft finds nothing to catch up, the chain's one eval.
+                .deferred => {
+                    try testing.expectEqual(@as(u32, 1), got.evals);
+                    try testing.expectEqual(@as(u32, 1), got.commits);
+                },
+            }
+        }
+    };
+    try noDevice();
+}
+
 test "glm5_next mtp draft gate: of a round's drafts the leading ones whose cumulative top-1 probability stays at or above theta are verified; theta 0 (off) keeps every draft" {
     const Row = struct { q: []const f32, theta: f32, k: u32 };
     for ([_]Row{
@@ -916,7 +1210,7 @@ test "glm5_next mtp hold: what the open's arrays hold equals the bill's mtp_bank
         const held = mtp.heldOf(&arrays, page);
         try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page), held);
         const f: mtp.Facts = .{ .bank_bytes = mtp.DraftBank.arrayBytes(&g, page), .resident_bytes = 0, .table_bytes = mtp.Head.tableBytes(&c, page) };
-        const t = mtp.terms(f, &c, positions, page);
+        const t = mtp.terms(f, &c, positions, page, false);
         try testing.expectEqual(t[0].bytes[0] + t[2].bytes[0] + t[3].bytes[0], held);
         try mtp.holdCheck(held, held);
         try testing.expectError(error.ConstructionOverBill, mtp.holdCheck(held + 4, held));
@@ -933,7 +1227,7 @@ test "glm5_next mtp hold: what the open's arrays hold equals the bill's mtp_bank
     var db = try mtp.DraftBank.open(a, io, dir, &pc, &diag);
     defer db.deinit();
     const facts = try mtp.facts(a, io, dir, &pc, page, &diag);
-    const t = mtp.terms(facts, &pc, 32_768, page);
+    const t = mtp.terms(facts, &pc, 32_768, page, false);
     try testing.expectEqual(mtp.heldOf(&openArrayBytes(&db.owner.geometry, &pc, 32_768), page), t[0].bytes[0] + t[2].bytes[0] + t[3].bytes[0]);
 }
 

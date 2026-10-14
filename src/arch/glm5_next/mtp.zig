@@ -140,6 +140,42 @@ pub fn chainDrafts(comptime Ops: type, g: *Ops, head: anytype, x0: Ops.T, start:
     _ = try g.hostF32(q_all, q_out[0..depth]);
 }
 
+/// Where a catch-up's arrays reach the device (a construction-time route: comptime at each call site; settings.zig
+/// `DraftChainEval`, `DraftAppend`):
+///   wait    each chunk's keys and the pending copy evaluated, the host waiting (the prompt pass's; the decode control)
+///   fold    nothing evaluated: the next eval whose graph reaches them runs them (`draft_chain_eval: once`: the round's
+///           chain, whose first step reads the appended lanes and the copied row)
+///   commit  one commit of the lanes and the copy at the end, no host wait (`draft_append: deferred`: the round's end;
+///           nothing on the host reads them before the next round's chain eval)
+pub const CatchUpSync = enum { wait, fold, commit };
+
+/// The catch-up of the first `n` pending pairs over op backend `Ops` (`evalAll`, `asyncEval`) and the lane's keys
+/// `keys` (`chunk(g, at, end)`: pairs at .. end appended to the lanes; `lanes()`: the lanes' two arrays; `keepTail(g,
+/// n)`: the pending rows after the first n kept as a copy, null when none stay), in chunks of `chunk_rows` pairs. Only
+/// where the host waits depends on `sync`: the chunks, their order and every array built are the same.
+pub fn catchUp(comptime Ops: type, g: *Ops, keys: anytype, n: u32, chunk_rows: u32, comptime sync: CatchUpSync) !void {
+    if (n == 0) return;
+    var at: u32 = 0;
+    while (at < n) {
+        const end = @min(at + chunk_rows, n);
+        try keys.chunk(g, at, end);
+        if (comptime sync == .wait) {
+            const l = keys.lanes();
+            try g.evalAll(&.{ l[0], l[1] });
+        }
+        at = end;
+    }
+    const tail = try keys.keepTail(g, n);
+    switch (sync) {
+        .wait => if (tail) |p| try g.evalAll(&.{p}),
+        .fold => {},
+        .commit => {
+            const l = keys.lanes();
+            if (tail) |p| try g.asyncEval(&.{ l[0], l[1], p }) else try g.asyncEval(&.{ l[0], l[1] });
+        },
+    }
+}
+
 /// The draft gate (`settings.draft_gate`, theta): of a round's `q.len` drafts, the leading ones whose cumulative top-1
 /// probability q_1 x .. x q_s stays at or above theta are verified, the rest dropped (the verify's rows saved). theta 0
 /// (the default, off) keeps every draft. The products only fall, so the first one under theta ends the prefix.
@@ -716,6 +752,22 @@ pub const Lane = struct {
     /// `max_pending` serial positions (a request the lane does not draft) the lane stops tracking: the rows are dropped
     /// and `tracked` stays behind the trunk (no round drafts until the next request).
     pub fn pend(self: *Lane, g: *G, target_len: u64, hidden: T, rows: u32, serial: bool) !void {
+        return self.pendWith(g, target_len, hidden, rows, serial, .wait);
+    }
+
+    /// The round's end under `draft_append: deferred` (settings.zig `DraftAppend`): the kept rows pended and, after a
+    /// drafted round (`after`: its kept drafts, the next tokens of every kept row but the last), those rows caught up
+    /// (`catchUp`), all of it committed with no host wait. The next round's draft then finds one pending row, nothing to
+    /// catch up: the same chunk (the kept rows, at the same position) the control's next draft appends, its keys bit for
+    /// bit. A draftless round's rows (`after` empty) are only pended, committed.
+    pub fn pendDeferred(self: *Lane, g: *G, w: *const graph.Weights, target_len: u64, hidden: T, rows: u32, serial: bool, after: []const u32) !void {
+        if (after.len == 0) return self.pendWith(g, target_len, hidden, rows, serial, .commit);
+        try self.pendWith(g, target_len, hidden, rows, serial, .fold);
+        std.debug.assert(after.len + 1 == self.n_pending);
+        try catchUp(G, g, Keys{ .lane = self, .w = w, .tokens = after }, @intCast(after.len), append_rows, .commit);
+    }
+
+    fn pendWith(self: *Lane, g: *G, target_len: u64, hidden: T, rows: u32, serial: bool, comptime sync: CatchUpSync) !void {
         if (self.tracked() + rows != target_len) return;
         if (serial and self.n_pending + rows > max_pending) {
             if (!self.untracked_logged) log.info("glm5_next MTP lane: {d} serial steps past its last round, the lane stops tracking this request\n", .{self.n_pending});
@@ -726,7 +778,11 @@ pub const Lane = struct {
         defer g.resetTo(m);
         const all = if (self.pending) |p| try g.concat(&.{ p, hidden }, 0) else hidden;
         const kept = g.keep(all);
-        try g.evalAll(&.{kept});
+        switch (sync) {
+            .wait => try g.evalAll(&.{kept}),
+            .fold => {},
+            .commit => try g.asyncEval(&.{kept}),
+        }
         if (self.pending) |p| g.release(p);
         self.pending = kept;
         self.n_pending += rows;
@@ -779,33 +835,53 @@ pub const Lane = struct {
 
     /// The pending pairs whose next token `tokens` gives (`tokens[i]` follows pending row i), at most `tokens.len`:
     /// their keys appended in chunks of `append_rows` (`dsa.forward` appends a call's latent and indexer rows; only the
-    /// lanes are evaluated, so its attention is built and never run); the rest stay pending.
+    /// lanes are evaluated, so its attention is built and never run); the rest stay pending. Each chunk and the copy
+    /// waited (`catchUp` `.wait`: the prompt pass's, and the decode control's).
     pub fn append(self: *Lane, g: *G, w: *const graph.Weights, tokens: []const u32) !void {
+        return self.appendWith(g, w, tokens, .wait);
+    }
+
+    fn appendWith(self: *Lane, g: *G, w: *const graph.Weights, tokens: []const u32, comptime sync: CatchUpSync) !void {
         const n: u32 = @intCast(@min(tokens.len, self.n_pending));
-        if (n == 0) return;
-        const c = self.c;
-        const h: c_int = @intCast(c.hidden_size);
-        var at: u32 = 0;
-        while (at < n) {
-            const end = @min(at + append_rows, n);
+        return catchUp(G, g, Keys{ .lane = self, .w = w, .tokens = tokens }, n, append_rows, sync);
+    }
+
+    /// The lane's keys for `catchUp`: the pending rows' pairs with their next tokens `tokens`.
+    const Keys = struct {
+        lane: *Lane,
+        w: *const graph.Weights,
+        tokens: []const u32,
+
+        /// Pending pairs at .. end appended at the lanes' end (`dsa.forward` appends the call's latent and indexer rows).
+        pub fn chunk(k: Keys, g: *G, at: u32, end: u32) !void {
+            const self = k.lane;
+            const c = self.c;
+            const h: c_int = @intCast(c.hidden_size);
             const m = g.mark();
             defer g.resetTo(m);
             const rows = try g.slice(self.pending.?, &.{ @intCast(at), 0 }, &.{ @intCast(end), h }, &.{ 1, 1 });
-            const x = try self.input(g, w, tokens[at..end], rows);
+            const x = try self.input(g, k.w, k.tokens[at..end], rows);
             const a_in = try graph.rmsNorm(g, x, self.head.input_norm, c.rms_norm_eps);
             _ = try dsa.forward(g, c, &self.head.attn, try g.reshape(a_in, &.{ 1, @intCast(end - at), h }), self.pairs(), self.lanes(), self.routes);
-            try g.evalAll(&.{ self.latent.buf.?, self.index.buf.? });
-            at = end;
         }
-        const m = g.mark();
-        defer g.resetTo(m);
-        const old = self.pending.?;
-        // The rows kept as a copy: a slice's view keeps the whole prompt call's hidden alive.
-        self.pending = if (n == self.n_pending) null else g.keep(try g.take(old, try g.arange(@floatFromInt(n), @floatFromInt(self.n_pending), 1, .uint32), 0));
-        if (self.pending) |p| try g.evalAll(&.{p});
-        g.release(old);
-        self.n_pending -= n;
-    }
+
+        pub fn lanes(k: Keys) [2]T {
+            return .{ k.lane.latent.buf.?, k.lane.index.buf.? };
+        }
+
+        /// The pending rows after the first `n` kept as a copy (a slice's view keeps the whole prompt call's hidden
+        /// alive), null when none stay.
+        pub fn keepTail(k: Keys, g: *G, n: u32) !?T {
+            const self = k.lane;
+            const m = g.mark();
+            defer g.resetTo(m);
+            const old = self.pending.?;
+            self.pending = if (n == self.n_pending) null else g.keep(try g.take(old, try g.arange(@floatFromInt(n), @floatFromInt(self.n_pending), 1, .uint32), 0));
+            g.release(old);
+            self.n_pending -= n;
+            return self.pending;
+        }
+    };
 
     /// One draft step of the chain (`chainDrafts`): the layer on the pair input `x` at position `pos`, its final-normed
     /// row and its f32 logits [vocab] (the trunk's untied head).
@@ -839,9 +915,11 @@ pub const Lane = struct {
     /// once with each draft's top-1 probability into `q` (`chainDrafts`); a sampled request's draft is coupled (the head's
     /// draw at the target's own uniform, `ChainHead.draw`), a greedy one's the argmax. The draft rows leave the lanes at the end: the
     /// lanes hold the trunk's pairs only.
-    pub fn draft(self: *Lane, g: *G, w: *const graph.Weights, after: []const u32, t1: u32, depth: u32, out: []u32, q: []f32, sm: ?acc.Params, len: u64) !void {
+    /// `chain` (`draft_chain_eval`, comptime: the construction's round): `per_step` waits for the catch-up's keys and
+    /// copy before the chain; `once` folds them into the chain's graph, its one eval running them.
+    pub fn draft(self: *Lane, g: *G, w: *const graph.Weights, after: []const u32, t1: u32, depth: u32, out: []u32, q: []f32, sm: ?acc.Params, len: u64, comptime chain: settings.DraftChainEval) !void {
         std.debug.assert(after.len + 1 == self.n_pending and depth >= 1 and depth <= max_depth and out.len >= depth);
-        try self.append(g, w, after);
+        try self.appendWith(g, w, after, if (chain == .once) .fold else .wait);
         const m0 = g.mark();
         defer g.resetTo(m0);
         const start = self.pairs();
@@ -938,6 +1016,16 @@ pub fn draftStepBytes(c: *const glm.Config, keys: u64) u64 {
     return 6 * h * 2 + bill.dsaRowBytes(c, keys) + bill.moeRowBytes(c) + gathers + 2 * h * 2 + @as(u64, c.vocab_size) * (2 + 4);
 }
 
+/// `draft_chain_eval: once` or `draft_append: deferred` (settings.zig `Config.draftFold`): what a folded or committed
+/// catch-up can hold past the control's waits, at most: its chunk's arrays (the pending rows but the last, `max_pending -
+/// 1`, at `appendWaveBytes`' per-row bytes) and the lanes' previous buffers (both lanes at the billed positions plus a
+/// round's drafts, `kvBytes`: a lane write the device runs later keeps the buffer it copies from until then). The
+/// pending copy's source is `pendingBytes`' second generation. At most one such catch-up is in flight: a round folds or
+/// commits one, and under both routes the round's draft finds nothing to catch up.
+pub fn foldBytes(c: *const glm.Config, positions: u64, page: u64) u64 {
+    return (max_pending - 1) * (appendWaveBytes(c) / append_rows) + kvBytes(c, positions, page);
+}
+
 /// The round's decision on the verify rows (MiMo's `decisionGraph` on [verify_rows, vocab] f32): the sampled path's
 /// tempered rows, their sort, keep mask, probabilities, cumulative sums and draws, eight f32 rows' worth at most.
 pub fn decisionBytes(c: *const glm.Config) u64 {
@@ -946,15 +1034,15 @@ pub fn decisionBytes(c: *const glm.Config) u64 {
 
 /// The lane's terms of the bill at `positions` (the billed context), each phase apart: `mtp_bank`, `mtp_residents`,
 /// `mtp_tables` and `mtp_kv` held from the open (construction terms), `mtp_pending` and `mtp_wave` (a phase's: the
-/// prompt's catch-up, the decode's draft steps and decision). The reader's staging during the open is the routed
-/// bank's (`reader_staging`, the same pool size).
-pub fn terms(f: Facts, c: *const glm.Config, positions: u64, page: u64) [6]Term {
+/// prompt's catch-up, the decode's draft steps and decision, plus `foldBytes` when `fold`: a draft-chain sync route).
+/// The reader's staging during the open is the routed bank's (`reader_staging`, the same pool size).
+pub fn terms(f: Facts, c: *const glm.Config, positions: u64, page: u64, fold: bool) [6]Term {
     return .{
         .{ .name = "mtp_bank", .bytes = @splat(f.bank_bytes), .at_construction = true },
         .{ .name = "mtp_residents", .bytes = @splat(f.resident_bytes), .at_construction = true },
         .{ .name = "mtp_tables", .bytes = @splat(f.table_bytes), .at_construction = true },
         .{ .name = "mtp_kv", .bytes = @splat(kvBytes(c, positions, page)), .at_construction = true },
         .{ .name = "mtp_pending", .bytes = .{ pendingBytes(c, .prompt, page), pendingBytes(c, .decode, page) }, .at_construction = false },
-        .{ .name = "mtp_wave", .bytes = .{ appendWaveBytes(c), draftStepBytes(c, positions) + decisionBytes(c) }, .at_construction = false },
+        .{ .name = "mtp_wave", .bytes = .{ appendWaveBytes(c), draftStepBytes(c, positions) + decisionBytes(c) + if (fold) foldBytes(c, positions, page) else 0 }, .at_construction = false },
     };
 }

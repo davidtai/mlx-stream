@@ -19,7 +19,9 @@
 //! streamed arch's keys; glm5_next's default ratio `default_tally_ratio`). `expert_rows_by_layer` splits the decode rows
 //! between the routed layers (`LayerRows`; `uniform`, the default, is every layer at the plan's rows). `exl3_gateup_form`,
 //! `exl3_down_form`, `exl3_forms_maxm` and `exl3_forms_min_p` pick the EXL3 family's decode forms (`Exl3Forms`, exl3_forms.zig;
-//! `seam`, the default: lane B's chain, the control).
+//! `seam`, the default: lane B's chain, the control). `draft_chain_eval` and `draft_append` move the MTP lane's decode
+//! syncs (`DraftChainEval`, `DraftAppend`; the defaults are today's waits, the control), each an exact construction-time
+//! route that needs `mtp_lane`.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -89,7 +91,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "draft_chain_eval", "draft_append" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -144,6 +146,16 @@ pub const DecodeSwiglu = enum { ops, fused };
 /// waves run the seam chain). The mcg GEMV is the bench's codebook price, not a form: on the mul1 pack it decodes other
 /// weights, so no setting names it. Every form computes the seam's words (the kbench's device parity); a name outside
 /// these, a combination `exl3_forms.Forms.check` refuses, or a non-seam form on an NVFP4 pack refuses the load by name.
+/// The MTP lane's draft chain syncs (`draft_chain_eval`), installed once at construction (module.zig `roundPassOf`):
+/// `per_step` (the default, the control: a round's catch-up waits for each chunk's keys and for the pending copy, then
+/// the chain's one eval) or `once` (the catch-up's keys and copy built into the chain's graph, no wait of their own: the
+/// chain's one eval runs them; mtp.zig `CatchUpSync.fold`). Only the host waits move; every array's value is the same.
+pub const DraftChainEval = enum { per_step, once };
+/// The MTP lane's round-end catch-up (`draft_append`), installed once at construction: `eval` (the default, the
+/// control: the round's pend waits for the kept rows' hidden; their keys are appended by the next round's draft) or
+/// `deferred` (the round's pend and, after a drafted round, its kept rows' keys and the pending copy committed at the
+/// round's end with no host wait: the next round's chain finds nothing to catch up; mtp.zig `CatchUpSync.commit`).
+pub const DraftAppend = enum { eval, deferred };
 pub const Exl3GateUpForm = enum { seam, fused16, fused8, guone, gemv_u8 };
 pub const Exl3DownForm = enum { seam, pair, fused1, fused2, pro1, pro2 };
 pub const Exl3Forms = struct {
@@ -329,6 +341,9 @@ pub const Config = struct {
     expert_rows_by_layer: LayerRows = defaultLayerRows(),
     /// The EXL3 family's decode forms (`Exl3Forms`): the seam chain unless named.
     exl3_forms: Exl3Forms = .{},
+    /// The MTP lane's decode syncs (`DraftChainEval`, `DraftAppend`): today's waits unless named.
+    draft_chain_eval: DraftChainEval = .per_step,
+    draft_append: DraftAppend = .eval,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -340,7 +355,12 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, draft_chain_eval: bool = false, draft_append: bool = false };
+
+    /// Either draft-lane sync route other than the control (the bill's `mtp_wave` decode term adds `mtp.foldBytes`).
+    pub fn draftFold(c: *const Config) bool {
+        return c.draft_chain_eval == .once or c.draft_append == .deferred;
+    }
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -402,6 +422,14 @@ pub const Config = struct {
         }
         if (raw.object.get("exl3_forms_min_p")) |v| {
             if (v == .integer and v.integer >= 1 and v.integer <= exl3_forms.max_pairs) c.exl3_forms.min_p = @intCast(v.integer) else c.malformed.exl3_forms_min_p = true;
+        }
+        if (raw.object.get("draft_chain_eval")) |v| {
+            const route: ?DraftChainEval = if (v == .string) std.meta.stringToEnum(DraftChainEval, v.string) else null;
+            if (route) |r| c.draft_chain_eval = r else c.malformed.draft_chain_eval = true;
+        }
+        if (raw.object.get("draft_append")) |v| {
+            const route: ?DraftAppend = if (v == .string) std.meta.stringToEnum(DraftAppend, v.string) else null;
+            if (route) |r| c.draft_append = r else c.malformed.draft_append = true;
         }
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
@@ -492,6 +520,11 @@ pub const Config = struct {
         if (c.malformed.exl3_forms_min_p) return error.Glm5NextExl3FormsMinPSetting;
         if (!c.exl3_forms.isSeam() and c.expert_family != .exl3) return error.Glm5NextExl3FormsOnNvfp4Pack;
         c.exl3_forms.forms().check() catch return error.Glm5NextExl3FormsSetting;
+        if (c.malformed.draft_chain_eval) return error.Glm5NextDraftChainEvalSetting;
+        if (c.malformed.draft_append) return error.Glm5NextDraftAppendSetting;
+        // Both move the MTP lane's own syncs: without the lane they would install nothing.
+        if (!c.mtp_lane and c.draft_chain_eval != .per_step) return error.Glm5NextDraftChainEvalNeedsLane;
+        if (!c.mtp_lane and c.draft_append != .eval) return error.Glm5NextDraftAppendNeedsLane;
         try c.tally.check("glm5_next");
         switch (c.expert_rows_by_layer) {
             .uniform => {},
@@ -769,4 +802,40 @@ test "glm5_next settings: the exl3 decode forms: the seam unless named, every fo
         c.expert_family = .exl3;
         try testing.expectError(case[1], c.validate());
     }
+}
+
+test "glm5_next settings: the draft chain syncs: draft_chain_eval per_step / once, draft_append eval / deferred, the controls unless named; any other value refused by name; either refused without the lane" {
+    const base = try parseSettings("{}");
+    try base.validate();
+    try testing.expectEqual(DraftChainEval.per_step, base.draft_chain_eval);
+    try testing.expectEqual(DraftAppend.eval, base.draft_append);
+    try testing.expect(!base.draftFold());
+    for ([_]struct { text: []const u8, chain: DraftChainEval, app: DraftAppend }{
+        .{ .text = "{\"mtp_lane\":true,\"draft_chain_eval\":\"once\"}", .chain = .once, .app = .eval },
+        .{ .text = "{\"mtp_lane\":true,\"draft_append\":\"deferred\"}", .chain = .per_step, .app = .deferred },
+        .{ .text = "{\"mtp_lane\":true,\"draft_chain_eval\":\"once\",\"draft_append\":\"deferred\"}", .chain = .once, .app = .deferred },
+        .{ .text = "{\"mtp_lane\":true,\"draft_chain_eval\":\"per_step\",\"draft_append\":\"eval\"}", .chain = .per_step, .app = .eval },
+        // The controls by name need no lane (nothing installs).
+        .{ .text = "{\"draft_chain_eval\":\"per_step\",\"draft_append\":\"eval\"}", .chain = .per_step, .app = .eval },
+    }) |case| {
+        const c = try parseSettings(case.text);
+        try c.validate();
+        try testing.expectEqual(case.chain, c.draft_chain_eval);
+        try testing.expectEqual(case.app, c.draft_append);
+        try testing.expectEqual(case.chain == .once or case.app == .deferred, c.draftFold());
+    }
+    for ([_][]const u8{ "\"ONCE\"", "\"Once\"", "\"on\"", "\"\"", "\"per-step\"", "\"deferred\"", "true", "1", "null", "[\"once\"]" }) |bad| {
+        var buf: [128]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{{\"mtp_lane\":true,\"draft_chain_eval\":{s}}}", .{bad});
+        try testing.expectError(error.Glm5NextDraftChainEvalSetting, (try parseSettings(text)).validate());
+    }
+    for ([_][]const u8{ "\"DEFERRED\"", "\"defer\"", "\"on\"", "\"\"", "\"once\"", "\"wait\"", "false", "0", "null", "[\"deferred\"]" }) |bad| {
+        var buf: [128]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{{\"mtp_lane\":true,\"draft_append\":{s}}}", .{bad});
+        try testing.expectError(error.Glm5NextDraftAppendSetting, (try parseSettings(text)).validate());
+    }
+    try testing.expectError(error.Glm5NextDraftChainEvalNeedsLane, (try parseSettings("{\"draft_chain_eval\":\"once\"}")).validate());
+    try testing.expectError(error.Glm5NextDraftAppendNeedsLane, (try parseSettings("{\"mtp_lane\":false,\"draft_append\":\"deferred\"}")).validate());
+    for ([_][]const u8{ "{\"draft_chain\":\"once\"}", "{\"draft_chain_evals\":\"once\"}", "{\"draft_appends\":\"deferred\"}", "{\"append\":\"deferred\"}" }) |text|
+        try testing.expectError(error.Unknown, parseSettings(text));
 }
