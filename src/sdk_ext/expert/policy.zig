@@ -120,6 +120,18 @@ pub const LayerPolicy = struct {
     pin_limit: u32 = 0,
     seeded: bool = false,
     pin_scratch: []u16,
+    // The decode seed (`setDecodeSeed`, a construction-time route; 0 = off, every plan as without it): each prompt
+    // call's `prepareSeed` ranks the call's experts by their rows among the call's last `seed_tail_ids` routed ids
+    // (the prompt's tail tokens x top-k), ties by the prompt's count, then by id, and keeps the top `capacity` of them
+    // (`keep`): the decode's start set. Within the call a kept expert is never a prefill victim, and a kept miss that
+    // finds no row the stock rule gives takes the row of a resident that is not kept and that an earlier plan of this
+    // call already used (`keepVictim`: never a record still to be read by the call), so the prompt pass reads the same
+    // records and the decode starts from the tail's experts. Residency only: no route, record or weight changes.
+    seed_tail_ids: u32 = 0,
+    keep: std.DynamicBitSetUnmanaged,
+    tail_counts: []u32,
+    /// The pool clock after the call's `prepareSeed`: a resident whose recency is past it was used by this call.
+    call_clock: u64 = 0,
 
     /// A plan beside other live routes of the layer: their slots (`held`) are
     /// never victims, and its transient loads take rows from `transient_base`.
@@ -157,6 +169,8 @@ pub const LayerPolicy = struct {
             .pinned = undefined,
             .request_counts = undefined,
             .pin_scratch = undefined,
+            .keep = undefined,
+            .tail_counts = undefined,
         };
         errdefer a.free(p.slot_to_expert);
         p.expert_to_slot = try a.alloc(u32, n);
@@ -202,6 +216,11 @@ pub const LayerPolicy = struct {
         p.request_counts = try a.alloc(u32, n);
         errdefer a.free(p.request_counts);
         p.pin_scratch = try a.alloc(u16, n);
+        errdefer a.free(p.pin_scratch);
+        p.keep = try std.DynamicBitSetUnmanaged.initEmpty(a, n);
+        errdefer p.keep.deinit(a);
+        p.tail_counts = try a.alloc(u32, n);
+        @memset(p.tail_counts, 0);
         @memset(p.rate, 0);
         @memset(p.request_counts, 0);
         @memset(p.slot_to_expert, no_expert);
@@ -241,6 +260,8 @@ pub const LayerPolicy = struct {
         p.pinned.deinit(a);
         a.free(p.request_counts);
         a.free(p.pin_scratch);
+        p.keep.deinit(a);
+        a.free(p.tail_counts);
         p.* = undefined;
     }
 
@@ -254,6 +275,24 @@ pub const LayerPolicy = struct {
     pub fn setTally(p: *LayerPolicy, pin_limit: u32, alpha: f32) void {
         p.pin_limit = @min(pin_limit, p.n_experts);
         p.alpha = alpha;
+    }
+
+    /// The decode seed on (`tail_ids` > 0: the prompt's last tokens x top-k routed ids each prompt call ranks) or off (0).
+    /// Once, at construction.
+    pub fn setDecodeSeed(p: *LayerPolicy, tail_ids: u32) void {
+        p.seed_tail_ids = tail_ids;
+    }
+
+    /// Residents that are in the last prompt call's decode set (`keep`): the decode seed's rows.
+    pub fn keptResidents(p: *const LayerPolicy) u32 {
+        var n: u32 = 0;
+        for (p.slot_to_expert[0..p.capacity]) |e| n += @intFromBool(e != no_expert and p.keep.isSet(e));
+        return n;
+    }
+
+    /// The decode set's size (the last prompt call's `keep`).
+    pub fn keepCount(p: *const LayerPolicy) u32 {
+        return @intCast(p.keep.count());
     }
 
     /// The rates a tally file (or another layer's state) holds, one per expert: the tally seeded, the pins chosen.
@@ -330,6 +369,35 @@ pub const LayerPolicy = struct {
     /// the resident part of its top-(capacity - protected) and marks the rest to
     /// be admitted first, protected, by the prefill routes.
     pub fn prepareSeed(p: *LayerPolicy, ids: []const u16) void {
+        p.prepareWholeSeed(ids);
+        if (p.seed_tail_ids > 0) p.prepareDecodeSet(ids);
+        p.call_clock = p.clock;
+    }
+
+    /// The decode seed's set of this prompt call (`seed_tail_ids` on): the top `capacity` of the call's experts by
+    /// (rows among its last `seed_tail_ids` ids, the prompt's count, -id), every one routed by the prompt.
+    fn prepareDecodeSet(p: *LayerPolicy, ids: []const u16) void {
+        const tail = ids[ids.len - @min(ids.len, p.seed_tail_ids) ..];
+        @memset(p.tail_counts, 0);
+        for (tail) |e| p.tail_counts[e] += 1;
+        p.keep.unsetAll();
+        var n: usize = 0;
+        for (p.prefill_freq, 0..) |c, e| if (c > 0) {
+            p.candidates[n] = @intCast(e);
+            n += 1;
+        };
+        const ranked = p.candidates[0..n];
+        std.sort.pdq(u16, ranked, @as(*const LayerPolicy, p), struct {
+            fn hotter(pp: *const LayerPolicy, x: u16, y: u16) bool {
+                if (pp.tail_counts[x] != pp.tail_counts[y]) return pp.tail_counts[x] > pp.tail_counts[y];
+                if (pp.prefill_freq[x] != pp.prefill_freq[y]) return pp.prefill_freq[x] > pp.prefill_freq[y];
+                return x < y;
+            }
+        }.hotter);
+        for (ranked[0..@min(n, p.capacity)]) |e| p.keep.set(e);
+    }
+
+    fn prepareWholeSeed(p: *LayerPolicy, ids: []const u16) void {
         const counts = p.call_counts;
         @memset(counts, 0);
         for (ids) |e| {
@@ -383,6 +451,8 @@ pub const LayerPolicy = struct {
     /// Called once, nothing live, after `shrink`; returns the residents kept.
     pub fn forgetPrompt(p: *LayerPolicy) u32 {
         p.protected.unsetAll();
+        p.keep.unsetAll();
+        p.call_clock = 0;
         p.seed.unsetAll();
         p.seed_ranks = 0;
         @memset(p.prefill_freq, 0);
@@ -521,7 +591,7 @@ pub const LayerPolicy = struct {
                 // once admitted are never victims.
                 for (out.missesOf()) |e| {
                     const is_seed = p.seed.isSet(e);
-                    const slot = p.emptySlot() orelse (if (p.mayEvictInPrefill(e)) p.probationVictim() else null) orelse no_slot;
+                    const slot = p.emptySlot() orelse (if (p.mayEvictInPrefill(e)) p.probationVictim() else null) orelse p.keepVictim(e) orelse no_slot;
                     if (is_seed) p.seed.unset(e);
                     if (slot == no_slot) {
                         transient_buf[n_transient] = e;
@@ -603,10 +673,28 @@ pub const LayerPolicy = struct {
         var best: ?u32 = null;
         var best_recency: u64 = 0;
         for (p.slot_to_expert[0..p.capacity], 0..) |e, s| {
-            if (e == no_expert or p.in_route.isSet(e) or p.protected.isSet(e) or p.held.isSet(s) or p.pinned.isSet(e)) continue;
+            if (e == no_expert or p.in_route.isSet(e) or p.protected.isSet(e) or p.held.isSet(s) or p.pinned.isSet(e) or p.keep.isSet(e)) continue;
             if (best == null or p.recency[e] < best_recency) {
                 best = @intCast(s);
                 best_recency = p.recency[e];
+            }
+        }
+        return best;
+    }
+
+    /// The decode seed's row for kept miss `e` that the stock rule left without one: the earliest-used resident of this
+    /// call (lowest recency past `call_clock`, then the lowest slot) that is not kept, not in this route, not held and
+    /// not pinned. A resident no plan of this call has used yet is never taken (no record the call still reads is
+    /// evicted). Null when off (`keep` empty), for a miss not kept, or when no such resident exists.
+    fn keepVictim(p: *const LayerPolicy, e: u16) ?u32 {
+        if (!p.keep.isSet(e)) return null;
+        var best: ?u32 = null;
+        var best_recency: u64 = 0;
+        for (p.slot_to_expert[0..p.capacity], 0..) |r, s| {
+            if (r == no_expert or p.keep.isSet(r) or p.in_route.isSet(r) or p.held.isSet(s) or p.pinned.isSet(r) or p.recency[r] <= p.call_clock) continue;
+            if (best == null or p.recency[r] < best_recency) {
+                best = @intCast(s);
+                best_recency = p.recency[r];
             }
         }
         return best;

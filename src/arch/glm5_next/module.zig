@@ -245,8 +245,8 @@ pub const Module = struct {
         const warm_route = self.c.warmRoute(gpu_warm.gpuStream(s));
         if (warm_route != self.c.gpu_keep_warm) log.info("glm5_next route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits)\n", .{@tagName(self.c.gpu_keep_warm)});
         self.src = switch (self.c.expert_family) {
-            .nvfp4 => .{ .nvfp4 = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms) },
-            .exl3 => .{ .exl3 = try experts.Exl3Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms) },
+            .nvfp4 => .{ .nvfp4 = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.readWait()) },
+            .exl3 => .{ .exl3 = try experts.Exl3Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.readWait()) },
         };
         errdefer switch (self.src) {
             inline else => |x| x.deinit(),

@@ -464,6 +464,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             prompt_relocate: bool = false,
             /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
             tally: ?Tally = null,
+            /// The decode seed (`LayerPolicy.setDecodeSeed`) on every layer: each prompt call keeps resident the top rows
+            /// of its experts by their rows among its last `decode_seed_ids` routed ids (tail tokens x top-k). 0: off.
+            decode_seed_ids: u32 = 0,
         };
 
         /// The rate tally's settings (`expert.tally.Settings`) and the stream's geometry: each stream layer pins at most
@@ -851,6 +854,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         const experts = if (t.layer_experts) |le| le[li] else bank.n_experts;
                         policy.setTally(expert.tally.pinLimit(t.ratio, experts), expert.tally.alphaOf(t.window));
                     }
+                    policy.setDecodeSeed(opt.decode_seed_ids);
                     var base = try Rows.init(geom, rows, opt.slot_memory);
                     errdefer base.deinit();
                     const meta = try a.alloc(SlotMeta, bank.n_experts);
@@ -2628,6 +2632,24 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.releaseHeld();
                 try self.flush();
                 for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
+            }
+
+            /// The decode seed's rows (`Options.decode_seed_ids`): per layer, its residents in the last prompt call's decode
+            /// set (`out`, one per layer) and that set's size (`of`); returns the residents over every layer.
+            pub fn decodeSeedRows(self: *const Stream, out: []u32, of: []u32) u64 {
+                std.debug.assert(out.len == self.layers.len and of.len == self.layers.len);
+                var n: u64 = 0;
+                for (self.layers, out, of) |*ls, *o, *f| {
+                    o.* = ls.policy.keptResidents();
+                    f.* = ls.policy.keepCount();
+                    n += o.*;
+                }
+                return n;
+            }
+
+            /// The decode seed's tail ids as installed (0: off), read back from the first layer's policy.
+            pub fn decodeSeedIds(self: *const Stream) u32 {
+                return if (self.layers.len > 0) self.layers[0].policy.seed_tail_ids else 0;
             }
 
             /// Residents over every layer's persistent rows (the reverse change's record: what the next prompt finds).

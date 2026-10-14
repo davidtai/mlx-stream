@@ -519,7 +519,9 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
     const staging = @as(u64, mimo_stream.io_workers) * settings.reader_staging_bytes;
     const spec = @as(u64, mimo_stream.spec_slots) * (std.mem.alignForward(u64, record, page) + 2 * page);
     const tickets = @as(u64, mimo_stream.io_tickets_early) * (8 * 8 + 8 + 1);
-    const policy = @as(u64, g.num_moe_layers) * (n * n * 4 + n * 56 + mimo_stream.max_route_ids * 2 + 5 * bitset);
+    // Per layer: the transition counts, the per-expert arrays, the route scratch, the bitsets, and the decode seed's
+    // tail counts and set (`LayerPolicy.tail_counts`, `keep`: allocated on every route, the seed on or off).
+    const policy = @as(u64, g.num_moe_layers) * (n * n * 4 + n * 56 + mimo_stream.max_route_ids * 2 + 5 * bitset + (n * 4 + bitset));
     const stream_bytes: u64 = if (g.family == .exl3) @as(u64, @sizeOf(experts.Types(.exl3).Bridge.Stream)) else @as(u64, @sizeOf(experts.Stream));
     const metadata = tickets + stream_bytes + @as(u64, g.num_moe_layers) * (n * 64 + 64) + (n + mimo_stream.transient_rows) * 96 + (1 << 20);
     // The open bank's tables: the NVFP4 bank's digest (32 B) per record and its layer; the EXL3 reader's padded and

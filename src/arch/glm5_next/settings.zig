@@ -89,7 +89,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "decode_seed", "decode_seed_tokens" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -179,6 +179,26 @@ pub const Exl3Forms = struct {
     pub fn isSeam(f: Exl3Forms) bool {
         return std.meta.eql(f, Exl3Forms{});
     }
+};
+
+/// The decode seed (`decode_seed`, sdk_ext/expert/policy.zig `LayerPolicy.setDecodeSeed`), installed once at construction:
+/// `off` (the default, the control: the prompt rows end holding the prompt's hottest experts by whole-prompt count) or
+/// `prompt_tail`: each prompt call keeps resident, in its prompt rows, its experts ranked by their rows among the call's
+/// last `decode_seed_tokens` tokens (ties: the prompt's count, then id), so the decode starts from the tail's working set.
+/// Zero extra reads: the prompt pass reads the same records (a kept miss the stock rule leaves transient takes the row
+/// of a resident the call already used and does not keep). Exact: residency only (routes, records and arithmetic
+/// unchanged). Audit: reports/.../mimo/glm5next-audit-readwait-20261014.md lever 1.
+pub const DecodeSeed = enum { off, prompt_tail };
+/// `decode_seed_tokens`' default: 64, picked on the three non-benchmark calibration traces (cells/glm5next-calib-20261013,
+/// the exact decode-policy replay at 190/217: misses -706 per 256 tokens mean, against -674 at 96, -551 at 128 and -359 at
+/// 256), never on the benchmark prompt.
+pub const default_decode_seed_tokens: u32 = 64;
+/// The most tail tokens `decode_seed_tokens` takes.
+pub const max_decode_seed_tokens: u32 = 16_384;
+
+/// The read-wait routes the stream installs (`Config.readWait`): the decode seed's tail tokens (0 = off).
+pub const ReadWait = struct {
+    decode_seed_tokens: u32 = 0,
 };
 
 /// `expert_rows_by_layer` (MiMo's mimo/layer-rows, mimo_v2/settings.zig `LayerRows`): the plan's decode rows split
@@ -329,6 +349,11 @@ pub const Config = struct {
     expert_rows_by_layer: LayerRows = defaultLayerRows(),
     /// The EXL3 family's decode forms (`Exl3Forms`): the seam chain unless named.
     exl3_forms: Exl3Forms = .{},
+    /// The decode seed (`DecodeSeed`) and its tail tokens (`decode_seed_tokens`; 0 marks a value outside
+    /// 1 .. `max_decode_seed_tokens` or not an integer, refused by name; named without `prompt_tail`, refused by name).
+    decode_seed: DecodeSeed = .off,
+    decode_seed_tokens: u32 = default_decode_seed_tokens,
+    decode_seed_tokens_named: bool = false,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -340,7 +365,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, decode_seed: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -403,6 +428,14 @@ pub const Config = struct {
         if (raw.object.get("exl3_forms_min_p")) |v| {
             if (v == .integer and v.integer >= 1 and v.integer <= exl3_forms.max_pairs) c.exl3_forms.min_p = @intCast(v.integer) else c.malformed.exl3_forms_min_p = true;
         }
+        if (raw.object.get("decode_seed")) |v| {
+            const route: ?DecodeSeed = if (v == .string) std.meta.stringToEnum(DecodeSeed, v.string) else null;
+            if (route) |r| c.decode_seed = r else c.malformed.decode_seed = true;
+        }
+        if (raw.object.get("decode_seed_tokens")) |v| {
+            c.decode_seed_tokens = if (v == .integer and v.integer >= 1 and v.integer <= max_decode_seed_tokens) @intCast(v.integer) else 0;
+            c.decode_seed_tokens_named = true;
+        }
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
         if (raw.object.get("logits_dump_dir")) |v| {
@@ -420,6 +453,11 @@ pub const Config = struct {
     pub fn warmRoute(c: *const Config, gpu: bool) gpu_warm.Route {
         if (c.gpu_keep_warm != .off and !c.gpu_keep_warm_requested and !gpu) return .off;
         return c.gpu_keep_warm;
+    }
+
+    /// The read-wait routes the stream installs (after `validate`).
+    pub fn readWait(c: *const Config) ReadWait {
+        return .{ .decode_seed_tokens = if (c.decode_seed == .prompt_tail) c.decode_seed_tokens else 0 };
     }
 
     /// The logits dump route's directory (`logits_dump_dir`), null when the setting is absent.
@@ -492,6 +530,9 @@ pub const Config = struct {
         if (c.malformed.exl3_forms_min_p) return error.Glm5NextExl3FormsMinPSetting;
         if (!c.exl3_forms.isSeam() and c.expert_family != .exl3) return error.Glm5NextExl3FormsOnNvfp4Pack;
         c.exl3_forms.forms().check() catch return error.Glm5NextExl3FormsSetting;
+        if (c.malformed.decode_seed) return error.Glm5NextDecodeSeedSetting;
+        if (c.decode_seed_tokens == 0) return error.Glm5NextDecodeSeedTokensRange;
+        if (c.decode_seed_tokens_named and c.decode_seed != .prompt_tail) return error.Glm5NextDecodeSeedTokensWithoutSeed;
         try c.tally.check("glm5_next");
         switch (c.expert_rows_by_layer) {
             .uniform => {},
@@ -769,4 +810,29 @@ test "glm5_next settings: the exl3 decode forms: the seam unless named, every fo
         c.expert_family = .exl3;
         try testing.expectError(case[1], c.validate());
     }
+}
+
+test "glm5_next settings: the decode seed (decode_seed, decode_seed_tokens) parses once and refuses by name" {
+    const off = try parseSettings("{}");
+    try off.validate();
+    try testing.expectEqual(DecodeSeed.off, off.decode_seed);
+    try testing.expectEqual(ReadWait{ .decode_seed_tokens = 0 }, off.readWait());
+    const named_off = try parseSettings("{\"decode_seed\":\"off\"}");
+    try named_off.validate();
+    try testing.expectEqual(@as(u32, 0), named_off.readWait().decode_seed_tokens);
+    const tail = try parseSettings("{\"decode_seed\":\"prompt_tail\"}");
+    try tail.validate();
+    try testing.expectEqual(ReadWait{ .decode_seed_tokens = default_decode_seed_tokens }, tail.readWait());
+    const tail128 = try parseSettings("{\"decode_seed\":\"prompt_tail\",\"decode_seed_tokens\":128,\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5}");
+    try tail128.validate();
+    try testing.expectEqual(@as(u32, 128), tail128.readWait().decode_seed_tokens);
+    for ([_][]const u8{ "{\"decode_seed\":\"tail\"}", "{\"decode_seed\":true}", "{\"decode_seed\":1}", "{\"decode_seed\":null}" }) |text|
+        try testing.expectError(error.Glm5NextDecodeSeedSetting, (try parseSettings(text)).validate());
+    for ([_][]const u8{
+        "{\"decode_seed\":\"prompt_tail\",\"decode_seed_tokens\":0}",     "{\"decode_seed\":\"prompt_tail\",\"decode_seed_tokens\":16385}",
+        "{\"decode_seed\":\"prompt_tail\",\"decode_seed_tokens\":64.0}",  "{\"decode_seed\":\"prompt_tail\",\"decode_seed_tokens\":\"64\"}",
+        "{\"decode_seed\":\"prompt_tail\",\"decode_seed_tokens\":-1}",
+    }) |text| try testing.expectError(error.Glm5NextDecodeSeedTokensRange, (try parseSettings(text)).validate());
+    try testing.expectError(error.Glm5NextDecodeSeedTokensWithoutSeed, (try parseSettings("{\"decode_seed_tokens\":64}")).validate());
+    try testing.expectError(error.Glm5NextDecodeSeedTokensWithoutSeed, (try parseSettings("{\"decode_seed\":\"off\",\"decode_seed_tokens\":64}")).validate());
 }

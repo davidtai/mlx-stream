@@ -102,6 +102,8 @@ pub const decode_cache_bytes: usize = 256 << 20;
 /// `decode_lane_rows` rows (a serial token; the MTP verify's 4 rows in phase 4).
 pub const decode_lane_rows: u32 = Math.decode_forward_rows;
 pub const max_experts: u32 = 288;
+/// The most routed layers a source holds (the decode seed's per-layer line).
+const max_moe_layers = 64;
 
 comptime {
     if (Math.prefill_min_tokens != decode_lane_rows + 1) @compileError("glm5_next: the scheduler's wide threshold is not the decode lane's bound");
@@ -111,13 +113,15 @@ comptime {
 /// The stream's construction options (pure: the CPU tests read them): MiMo's event gates and lookahead over `rows`, the
 /// phase rows' transient release, the read schedule's overlap route with prompt lever 1's relocation, decode's window 0,
 /// and the rate tally (`tally`: every layer pins at most floor(ratio x 288) experts; none at ratio 0).
-pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !B.Options {
-    return streamOptionsOf(B, rows, memory, event, tally);
+pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings, read_wait: settings.ReadWait) !B.Options {
+    return streamOptionsOf(B, rows, memory, event, tally, read_wait);
 }
 
 /// `streamOptions` over a family's bridge `Bp` (the same options for every family).
-pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !Bp.Options {
+pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings, read_wait: settings.ReadWait) !Bp.Options {
     var opts = Bp.eventOptions(rows, memory, event);
+    // The read-wait routes (settings.zig `ReadWait`): the decode seed's tail ids (tail tokens x top-k; 0 = off).
+    opts.decode_seed_ids = read_wait.decode_seed_tokens * top_k;
     opts.transient_release = true;
     try Bp.applyReadSchedule(&opts, read_schedule);
     opts.prompt_relocate = prompt_relocate;
@@ -125,6 +129,7 @@ pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemo
     opts.tally = if (tally.enabled()) .{ .ratio = tally.ratio, .window = tally.window } else null;
     return opts;
 }
+
 
 /// The phase route of a routed call (MiMo's `decodeLane`): one row in either phase, up to `decode_lane_rows` in decode.
 pub fn decodeLane(nt: u32, decoding: bool) bool {
@@ -208,7 +213,7 @@ pub fn SourceOf(comptime fam: Family) type {
         /// Construction (the GPU stream, under the caller's lock): the bank opened, the stream at `rows`, the scheduler
         /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
         /// routed layer's.
-        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, exl3_forms: settings.Exl3Forms) !*Self {
+        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, exl3_forms: settings.Exl3Forms, read_wait: settings.ReadWait) !*Self {
             const Bm = Fam.Bridge;
             const bm = Fam.bank;
             var open_diag: sdk.Diag = .{};
@@ -246,7 +251,7 @@ pub fn SourceOf(comptime fam: Family) type {
             // refused here, once, if a bank's spans outgrow it.
             if (Bm.S.stagingBytes(&self.sdk_bank) > settings.reader_staging_bytes) return error.Glm5NextReaderStaging;
             const event = try expert_event.createMetal();
-            self.sdk_stream = try Bm.Stream.init(a, &self.sdk_bank, try streamOptionsOf(Bm, self.rows, .{ .mlx = stream }, event, tally));
+            self.sdk_stream = try Bm.Stream.init(a, &self.sdk_bank, try streamOptionsOf(Bm, self.rows, .{ .mlx = stream }, event, tally, read_wait));
             errdefer self.sdk_stream.deinit();
             self.stream_source = Bm.StreamSource.init(self.sdk_stream);
             try self.stream_source.installReadSchedule(read_schedule, mimo_stream.default_read_schedule_threshold);
@@ -346,6 +351,10 @@ pub fn SourceOf(comptime fam: Family) type {
                 log.info("glm5_next experts: exl3 k3 mul1 routes (decode_moe={s}: DeepSeek-V4.1's banked PREP=rin chain at hidden {d} / inter {d}, in_rin + gate/up mul1h GEMVs + gu_epi + din_rin + down mul1h GEMV + dpost(bf16), one launch each per wave over the three banks{s}; prompt: DIG-X waves of <= {d} rows / {d} experts, take2 + gate|up GEMM (m128) + onepass + down GEMM (m128) + rot_widen1(bf16); bank {d} x {d} records of {d} B, codebook mul1 0x{X}, no global-scale word: scale-line isolation not applicable; the NVFP4 draft bank unchanged)\n", .{ @tagName(decode_moe), exl3_kernels.hidden, exl3_kernels.inter, if (decode_moe == .hitpass) ", each call's hit wave from the layer's resident slot LUT" else if (decode_moe == .stock) ", unbanked: one group per bank" else "", exl3_math.wave_rows, @import("../../exl3/quant.zig").wave_max, geo.num_moe_layers, geo.num_experts, geo.record_bytes, exl3_kernels.codebook_multiplier });
                 // The decode forms bound at Math.init (`exl3_gateup_form` / `exl3_down_form`; seam = lane B's chain above).
                 log.info("glm5_next experts: exl3 k3 forms gateup={s} down={s} maxm={d} min_p={d}\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down), exl3_forms.maxm, exl3_forms.min_p });
+                // The read-wait routes as the stream installed them (the policies' tail ids),
+                // on the forms' line's settings: one line names every decode route a read-wait pair compares.
+                const seed_ids = self.sdk_stream.decodeSeedIds();
+                log.info("glm5_next read-wait: forms gateup={s} down={s}; decode_seed={s} decode_seed_tokens={d}\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down), if (seed_ids > 0) "prompt_tail" else "off", seed_ids / top_k });
             } else switch (decode_moe) {
                 .stock => {},
                 .fused => log.info("glm5_next decode experts installed: decode_moe=fused (the NVFP4 k1 texts over the three banks, one launch of each per wave; the hit wave routed on the host)\n", .{}),
@@ -426,6 +435,17 @@ pub fn SourceOf(comptime fam: Family) type {
             _ = try self.ex.releaseTransient();
             self.g.clearCache();
             try self.ex.grow(&self.g, self.decode_rows);
+            // The decode seed's rows, once per request at the phase change (the prompt pass has ended): per routed layer
+            // its prompt rows holding the tail's set, of that set's size.
+            if (self.sdk_stream.decodeSeedIds() > 0) {
+                var held: [max_moe_layers]u32 = undefined;
+                var of: [max_moe_layers]u32 = undefined;
+                const n = self.rows.len;
+                const total = self.sdk_stream.decodeSeedRows(held[0..n], of[0..n]);
+                var sum_of: u64 = 0;
+                for (of[0..n]) |x| sum_of += x;
+                log.info("glm5_next decode seed: prompt_tail tokens={d} seeded rows {d} of {d} over {d} layers per layer {any}\n", .{ self.sdk_stream.decodeSeedIds() / top_k, total, sum_of, n, held[0..n] });
+            }
         }
 
         /// After the forward's last eval (the logits): the released routes settled and unpinned.
@@ -548,9 +568,13 @@ pub const Exl3Source = SourceOf(.exl3);
 test "glm5_next experts: the stream's options install the overlap schedule early_whole_trim with prompt lever 1's relocation (exact), the phase rows' release and decode's window" {
     const testing = std.testing;
     const rows = [_]u32{ 124, 124 };
-    const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 });
+    const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .{});
     try testing.expect(opts.tally == null);
-    const tallied = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0.25, .window = 16 });
+    const tallied = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0.25, .window = 16 }, .{});
+    // The decode seed: off by default, on as its tail ids.
+    try testing.expectEqual(@as(u32, 0), opts.decode_seed_ids);
+    const rw = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .{ .decode_seed_tokens = 64 });
+    try testing.expectEqual(@as(u32, 64 * top_k), rw.decode_seed_ids);
     try testing.expectEqual(@as(f64, 0.25), tallied.tally.?.ratio);
     try testing.expectEqual(@as(u32, 16), tallied.tally.?.window);
     try testing.expect(tallied.tally.?.layer_experts == null);
@@ -621,4 +645,217 @@ test "glm5_next experts: the rate tally's file round-trips at Flash's geometry (
     }
     try testing.expect((try expert_tally.read(a, io, path, 43, max_experts)) == .mismatched);
     try testing.expect((try expert_tally.read(a, io, path, n_layers, 256)) == .mismatched);
+}
+
+/// The decode seed's CPU model of one prompt call of one layer, as the shared scheduler and the stream drive the policy
+/// (deepseek_v41/experts.zig `runWideCore` under glm5_next's wide route, stream.zig `planCall`): P1's read-ahead admits the
+/// call's hottest experts into the empty prompt rows (here the call's own counts: a perfect predictor), the seed, the
+/// call's distinct experts hottest first (count desc, id asc), groups of `max_route_ids` planned in order with the
+/// previous `wide_depth - 1` groups' persistent slots held. Returns the records the call reads (its loads) and the
+/// evictions of a resident no group of the call had used yet (a record the call then reads again).
+const SeedModel = struct {
+    loads: u64 = 0,
+    unused_evictions: u64 = 0,
+
+    fn run(a: std.mem.Allocator, p: *sdk_ext.expert.policy.LayerPolicy, ids: []const u16) !SeedModel {
+        const policy_mod = sdk_ext.expert.policy;
+        const n = p.n_experts;
+        const counts = try a.alloc(u32, n);
+        defer a.free(counts);
+        @memset(counts, 0);
+        for (ids) |e| counts[e] += 1;
+        const ranked = try a.alloc(u16, n);
+        defer a.free(ranked);
+        const order = policy_mod.rankHottest(counts, ranked);
+        var ra: [max_experts]policy_mod.LayerPolicy.ReadAhead = undefined;
+        _ = p.admitReadAhead(order, ra[0..@min(n, max_experts)]);
+        p.prepareSeed(ids);
+        const used = try a.alloc(bool, n);
+        defer a.free(used);
+        @memset(used, false);
+        var out: SeedModel = .{};
+        const width = policy_mod.max_route_ids;
+        const depth = mimo_stream.wide_depth;
+        const n_groups = (order.len + width - 1) / width;
+        var plans: [16]policy_mod.Plan = undefined;
+        var held: [2 * policy_mod.max_route_ids]u32 = undefined;
+        for (0..n_groups) |g| {
+            const group = order[g * width .. @min((g + 1) * width, order.len)];
+            var nh: usize = 0;
+            var q = g -| (depth - 1);
+            while (q < g) : (q += 1) {
+                const o = &plans[q % plans.len];
+                for (o.hitsOf()) |e| if (p.slotOf(e)) |s| if (s < p.capacity) {
+                    held[nh] = s;
+                    nh += 1;
+                };
+                for (o.loadsOf()) |l| if (l.persistent) {
+                    held[nh] = l.slot;
+                    nh += 1;
+                };
+            }
+            const plan = &plans[g % plans.len];
+            p.planWith(group, .prefill, plan, .{ .transient_base = @intCast((g % depth) * width), .held = held[0..nh] });
+            out.loads += plan.n_loads;
+            for (plan.evictionsOf()) |ev| out.unused_evictions += @intFromBool(!used[ev.previous] and counts[ev.previous] > 0);
+            for (group) |e| used[e] = true;
+        }
+        return out;
+    }
+};
+
+test "glm5_next experts: the decode seed (prompt_tail) ends a prompt call with the tail's experts in the prompt rows, reading the same records and evicting no record the call still reads" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const policy_mod = sdk_ext.expert.policy;
+    // 160 experts, 12 prompt rows, 400 tokens x top-8: tokens 0..367 route a hot block (experts 0..95, about 31 rows
+    // each), the last 32 tokens a tail block (experts 120..143, about 8 rows each) with two of the hot block's (0, 1);
+    // the seed reads the last 64 tokens. The tail's experts come after two groups of 48 in the hot order, as a 16K
+    // prompt's tail experts do: a kept miss takes the row of a resident used two or more groups earlier (the previous
+    // group's rows are held).
+    const n_experts = 160;
+    const top = 8;
+    const tokens = 400;
+    var ids: [tokens * top]u16 = undefined;
+    var x: u32 = 12345;
+    for (0..tokens) |t| for (0..top) |j| {
+        x = x *% 1103515245 +% 12345;
+        const r = (x >> 16) % 1000;
+        ids[t * top + j] = if (t < tokens - 32) @intCast(r % 96) else if (j < 2) @intCast(j) else @intCast(120 + (r % 24));
+    };
+    // Unique ids per token (a router's top-8 is distinct): repeat collisions are fine for the counts, the plan dedups.
+    const rows = 12;
+    var off = try policy_mod.LayerPolicy.init(a, n_experts, rows);
+    defer off.deinit(a);
+    const m_off = try SeedModel.run(a, &off, &ids);
+    var on = try policy_mod.LayerPolicy.init(a, n_experts, rows);
+    defer on.deinit(a);
+    on.setDecodeSeed(64 * top);
+    const m_on = try SeedModel.run(a, &on, &ids);
+    // The same records read, no record evicted before its use by the seed's rule.
+    try testing.expectEqual(m_off.loads, m_on.loads);
+    try testing.expectEqual(m_off.unused_evictions, m_on.unused_evictions);
+    // The expected set: top 12 by (tail count, prompt count, -id).
+    var tail: [n_experts]u32 = @splat(0);
+    var whole: [n_experts]u32 = @splat(0);
+    for (ids) |e| whole[e] += 1;
+    for (ids[(tokens - 64) * top ..]) |e| tail[e] += 1;
+    var all: [n_experts]u16 = undefined;
+    var na: usize = 0;
+    for (0..n_experts) |e| if (whole[e] > 0) {
+        all[na] = @intCast(e);
+        na += 1;
+    };
+    const Ctx = struct { t: *const [n_experts]u32, w: *const [n_experts]u32 };
+    std.sort.pdq(u16, all[0..na], Ctx{ .t = &tail, .w = &whole }, struct {
+        fn lt(c: Ctx, p: u16, q: u16) bool {
+            if (c.t[p] != c.t[q]) return c.t[p] > c.t[q];
+            if (c.w[p] != c.w[q]) return c.w[p] > c.w[q];
+            return p < q;
+        }
+    }.lt);
+    for (all[0..rows]) |e| {
+        try testing.expect(on.keep.isSet(e));
+        try testing.expect(on.slotOf(e) != null);
+    }
+    try testing.expectEqual(@as(u32, rows), on.keptResidents());
+    try testing.expect(on.occupancy <= rows);
+    // Off: the control's prompt rows (the whole prompt's hottest), a different set.
+    try testing.expectEqual(@as(u32, 0), off.keepCount());
+    var differ: u32 = 0;
+    for (all[0..rows]) |e| differ += @intFromBool(off.slotOf(e) == null);
+    try testing.expect(differ > 0);
+    // forgetPrompt clears the set (the next request's prompt chooses again).
+    _ = on.forgetPrompt();
+    try testing.expectEqual(@as(u32, 0), on.keepCount());
+}
+
+// GLM5_SEED_TRACE=<route trace dir> GLM5_SEED_EXPECT=<dir of expect-n<N>.u16> (build/g22-ws/tools/seed_expect.py, the
+// audit's replay rule) [GLM5_SEED_OUT=<dir>]: the decode seed on the profile cell's prompt (42 layers x 16,381 tokens),
+// each layer's call through `SeedModel` at the pair's 190 prompt rows, for N = 64, 128, 256: the chosen set equals the
+// replay's on every layer, the realized prompt rows hold it, the rows never pass 190, the call reads what the control
+// reads, no record is evicted before its use; the realized residents written to <out>/realized-n<N>.u16 for the replay.
+test "glm5_next experts: the decode seed on the profile trace: the chosen rows equal the replay's, realized within the 190 prompt rows, zero extra reads" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const io = testing.io;
+    const policy_mod = sdk_ext.expert.policy;
+    const trace = std.mem.span(std.c.getenv("GLM5_SEED_TRACE") orelse return error.SkipZigTest);
+    const expect_dir = std.mem.span(std.c.getenv("GLM5_SEED_EXPECT") orelse return error.SkipZigTest);
+    const out_dir: ?[]const u8 = if (std.c.getenv("GLM5_SEED_OUT")) |v| std.mem.span(v) else null;
+    var td = try std.Io.Dir.openDirAbsolute(io, trace, .{});
+    defer td.close(io);
+    const hdr_text = try td.readFileAlloc(io, "route-r0.json", a, .limited(1 << 20));
+    defer a.free(hdr_text);
+    const hdr = try std.json.parseFromSlice(std.json.Value, a, hdr_text, .{ .ignore_unknown_fields = true });
+    defer hdr.deinit();
+    const L: usize = @intCast(hdr.value.object.get("layers").?.integer);
+    const E: u32 = @intCast(hdr.value.object.get("experts").?.integer);
+    const P: usize = @intCast(hdr.value.object.get("prompt_tokens").?.integer);
+    const prompt = try td.readFileAlloc(io, "route-r0.prompt.u16", a, .limited(64 << 20));
+    defer a.free(prompt);
+    try testing.expectEqual(L * P * top_k * 2, prompt.len);
+    const all_ids = try a.alloc(u16, L * P * top_k);
+    defer a.free(all_ids);
+    for (all_ids, 0..) |*v, i| v.* = std.mem.readInt(u16, prompt[2 * i ..][0..2], .little);
+    const prompt_rows = 190;
+    var ed = try std.Io.Dir.openDirAbsolute(io, expect_dir, .{});
+    defer ed.close(io);
+    var off_loads: u64 = 0;
+    var off_unused: u64 = 0;
+    for (0..L) |l| {
+        var p = try policy_mod.LayerPolicy.init(a, E, prompt_rows);
+        defer p.deinit(a);
+        const m = try SeedModel.run(a, &p, all_ids[l * P * top_k ..][0 .. P * top_k]);
+        off_loads += m.loads;
+        off_unused += m.unused_evictions;
+    }
+    for ([_]u32{ 64, 128, 256 }) |n_tok| {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "expect-n{d}.u16", .{n_tok});
+        const expect = try ed.readFileAlloc(io, name, a, .limited(1 << 20));
+        defer a.free(expect);
+        try testing.expectEqual(L * prompt_rows * 2, expect.len);
+        const realized = try a.alloc(u8, L * prompt_rows * 2);
+        defer a.free(realized);
+        var selection_equal: u32 = 0;
+        var held_total: u64 = 0;
+        var set_total: u64 = 0;
+        var loads: u64 = 0;
+        var unused: u64 = 0;
+        var max_occupancy: u32 = 0;
+        for (0..L) |l| {
+            var p = try policy_mod.LayerPolicy.init(a, E, prompt_rows);
+            defer p.deinit(a);
+            p.setDecodeSeed(n_tok * top_k);
+            const m = try SeedModel.run(a, &p, all_ids[l * P * top_k ..][0 .. P * top_k]);
+            loads += m.loads;
+            unused += m.unused_evictions;
+            max_occupancy = @max(max_occupancy, p.occupancy);
+            try testing.expect(p.occupancy <= prompt_rows);
+            var same = p.keepCount() <= prompt_rows;
+            var k: u32 = 0;
+            for (0..prompt_rows) |i| {
+                const e = std.mem.readInt(u16, expect[(l * prompt_rows + i) * 2 ..][0..2], .little);
+                if (e == policy_mod.no_expert) continue;
+                k += 1;
+                if (!p.keep.isSet(e)) same = false;
+            }
+            if (k != p.keepCount()) same = false;
+            selection_equal += @intFromBool(same);
+            held_total += p.keptResidents();
+            set_total += p.keepCount();
+            for (0..prompt_rows) |s| std.mem.writeInt(u16, realized[(l * prompt_rows + s) * 2 ..][0..2], p.slot_to_expert[s], .little);
+        }
+        std.debug.print("GLM5NEXT_SEED_TRACE n={d} layers={d} selection_equal={d}/{d} realized_rows={d}/{d} max_occupancy={d}/{d} loads_on={d} loads_off={d} unused_evictions_on={d} off={d}\n", .{ n_tok, L, selection_equal, L, held_total, set_total, max_occupancy, prompt_rows, loads, off_loads, unused, off_unused });
+        try testing.expectEqual(@as(u32, @intCast(L)), selection_equal);
+        try testing.expectEqual(off_loads, loads);
+        try testing.expectEqual(off_unused, unused);
+        if (out_dir) |od| {
+            var o = try std.Io.Dir.openDirAbsolute(io, od, .{});
+            defer o.close(io);
+            const rn = try std.fmt.bufPrint(&name_buf, "realized-n{d}.u16", .{n_tok});
+            try o.writeFile(io, .{ .sub_path = rn, .data = realized });
+        }
+    }
 }
