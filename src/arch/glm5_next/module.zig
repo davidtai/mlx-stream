@@ -209,7 +209,7 @@ pub const Module = struct {
         // The MTP lane (`mtp_lane`): its draft bank read into MLX and checked, its head bound from the kept residents,
         // its lanes at the billed positions; what its open holds against its billed terms (ConstructionOverBill).
         if (self.c.mtp_lane) {
-            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.c.draft_depth, self.c.draft_gate, self.routes.dsa, &diag);
+            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.c.draft_depth, self.c.draft_gate, mtp.ruleOf(self.c.mtp_acceptance, self.c.mtp_typical_delta), self.routes.dsa, &diag);
             errdefer lane.deinit(&self.g);
             const term = termBytes(plan.bill, "mtp_bank") + termBytes(plan.bill, "mtp_tables") + termBytes(plan.bill, "mtp_kv");
             log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv), residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
@@ -725,7 +725,7 @@ pub fn Passes(comptime fam: experts.Family) type {
             defer g.release(hidden);
             const m = g.mark();
             defer g.resetTo(m);
-            const d = try mimo_draft.decisionGraph(g, logits, drafts, mtp.rule, acc.Params.of(sampling), len);
+            const d = try mimo_draft.decisionGraph(g, logits, drafts, lane.rule, acc.Params.of(sampling), len);
             var evals: std.ArrayList(T) = .empty;
             defer evals.deinit(self.gpa);
             try evals.appendSlice(self.gpa, &.{ d.targets, d.flags orelse d.targets, hidden });
