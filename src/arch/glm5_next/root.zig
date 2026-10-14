@@ -190,7 +190,7 @@ pub const draft_lane = struct {
 
     pub fn laneName(m: *const Module) []const u8 {
         if (comptime !host_caps.dsa_nax) unreachable;
-        return if (m.mtp != null) mtp.lane_name else "serial";
+        return if (m.mtp) |l| l.name() else "serial";
     }
 
     /// The exact rule's arms (MiMo's): a clean greedy request `.greedy`, a clean sampled one `.stochastic`; logprobs,
@@ -311,6 +311,7 @@ test "glm5_next arch table: the registry builds it (the draft lane surface, no p
     // The installed lane through the host's table: its verify rows, its name, its arms and its counters.
     var lane: mtp.Lane = undefined;
     lane.stats = .{};
+    lane.setRule(.exact);
     m.mtp = &lane;
     const tbl = vt.spec.draft_lane;
     try testing.expectEqual(@as(u32, 4), tbl.block_size(&m));

@@ -64,7 +64,24 @@ pub const max_depth: u32 = settings.trained_draft_depth;
 pub const verify_rows: u32 = max_depth + 1;
 /// The lane's acceptance: exact only.
 pub const rule: acc.Rule = .exact;
+
+/// The lane's rule for `settings.mtp_acceptance` (construction).
+pub fn ruleOf(m: settings.MtpAcceptance, delta: f32) acc.Rule {
+    return switch (m) {
+        .exact => .exact,
+        .typical => .{ .typical = .{ .delta = delta } },
+    };
+}
 pub const lane_name = "glm5_next-mtp exact";
+/// The lane's name for its rule (MiMo's form, "mtp typical <delta>"): the receipt and the install line name the rule in
+/// play, the typical rule with its delta ("glm5_next-mtp typical 0.3"). Written once at construction (`Lane.name`).
+pub const name_cap = 48;
+pub fn nameOf(buf: *[name_cap]u8, r: acc.Rule) []const u8 {
+    return switch (r) {
+        .exact => lane_name,
+        .typical => |t| std.fmt.bufPrint(buf, "glm5_next-mtp typical {d}", .{t.delta}) catch unreachable,
+    };
+}
 /// Pairs one catch-up call appends (the prompt's, in chunks): the trunk's attention span (its DSA call shapes).
 pub const append_rows: u32 = graph.span_rows;
 /// Serial steps whose hidden the lane keeps for a later round; past them the lane stops tracking the request.
@@ -593,6 +610,11 @@ pub const Lane = struct {
     depth: u32 = max_depth,
     /// The draft gate's theta (`settings.draft_gate`; 0: off, every draft verified; `gatedDrafts`; construction).
     gate: f32 = 0,
+    /// The acceptance rule (`settings.mtp_acceptance`, `ruleOf`; construction).
+    rule: acc.Rule = .exact,
+    /// The lane's name for `rule` (`nameOf`, construction).
+    name_buf: [name_cap]u8 = undefined,
+    name_len: usize = 0,
     /// The request's counters (MiMo's: rounds, drafted, accepted, generated, corrected; the stream's at the decode start).
     stats: mimo_draft.Stats = .{},
     /// The request's acceptance by draft position (the receipt's tail).
@@ -610,9 +632,10 @@ pub const Lane = struct {
     /// The lane over the pack at `dir`: the draft bank (refused by name when absent), the head bound from `map` (the
     /// arch's weight map with the MTP layer's residents kept and read), every record read into the bank's MLX arrays and
     /// checked, the lanes allocated at `cap` positions plus `max_depth`; `depth` drafts a round at most (`draft_depth`,
-    /// 1 .. `max_depth`) and `gate` the draft gate's theta (`draft_gate`, 0 off), both validated with the settings.
+    /// 1 .. `max_depth`), `gate` the draft gate's theta (`draft_gate`, 0 off), both validated with the settings, and `accept`
+    /// the acceptance rule (`ruleOf`; the lane's name follows it).
     /// Device work: the module's construction, under the GPU lock.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, depth: u32, gate: f32, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, g: *G, dir: []const u8, map: *const sdk.Weights, c: *const glm.Config, cap: u32, depth: u32, gate: f32, accept: acc.Rule, routes: dsa.Routes, diag: ?*sdk.Diag) !*Lane {
         std.debug.assert(depth >= 1 and depth <= max_depth);
         var db = try DraftBank.open(gpa, io, dir, c, diag);
         defer db.deinit();
@@ -622,7 +645,8 @@ pub const Lane = struct {
         const self = try gpa.create(Lane);
         errdefer gpa.destroy(self);
         const lanes_cap = cap + max_depth;
-        self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth, .gate = gate };
+        self.* = .{ .gpa = gpa, .c = c, .head = undefined, .slots = undefined, .experts = undefined, .latent = dsa.Lane.init(lanes_cap, lanes_cap), .index = dsa.Lane.init(lanes_cap, lanes_cap), .routes = routes, .depth = depth, .gate = gate, .rule = accept };
+        self.setRule(accept);
         self.head = try Head.bind(gpa, g.s, map, c, diag);
         errdefer self.head.deinit(gpa);
         const n: u32 = c.n_routed_experts;
@@ -653,7 +677,7 @@ pub const Lane = struct {
         for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
         self.held_bytes = heldOf(&held, std.heap.pageSize());
-        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=device_chain_coupled bank={s} experts={d} lanes={d} positions measured_bytes={d} draft_gate={d:.3}\n", .{ lane_name, depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, gate });
+        log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} drafts=device_chain_coupled bank={s} experts={d} lanes={d} positions measured_bytes={d} draft_gate={d:.3} acceptance={s}\n", .{ self.name(), depth, depth + 1, bank.mtp_files.data, n, lanes_cap, self.measured_bytes, gate, @tagName(accept) });
         return self;
     }
 
@@ -855,8 +879,21 @@ pub const Lane = struct {
 
     /// The request's line at its end (MiMo's receipt form; the expert stream's counters at the decode start and now),
     /// then the lane's depth and its acceptance by draft position (`Positions.write`).
+    /// The lane's rule and its name (`nameOf`), once at construction.
+    pub fn setRule(self: *Lane, r: acc.Rule) void {
+        self.rule = r;
+        const nm = nameOf(&self.name_buf, r);
+        if (@intFromPtr(nm.ptr) != @intFromPtr(&self.name_buf)) @memcpy(self.name_buf[0..nm.len], nm);
+        self.name_len = nm.len;
+    }
+
+    /// The lane's name (`nameOf` its rule, written at construction).
+    pub fn name(self: *const Lane) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
     pub fn line(self: *const Lane, buf: []u8, now: sdk_ext.expert.Stats) []const u8 {
-        const head = self.stats.line(buf, lane_name, now);
+        const head = self.stats.line(buf, self.name(), now);
         return buf[0 .. head.len + self.pos.write(buf[head.len..], self.depth).len];
     }
 

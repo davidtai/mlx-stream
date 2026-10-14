@@ -35,7 +35,10 @@ The block's optional `settings` object takes `expert_prefill_rows` and `expert_r
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
 is installed when true; off, the serial control, by default: below), `draft_depth` (the lane's drafts per round: an
 integer 1 .. 3, default 1 (measured +2.31 % decode over 3 on g21c); anything else refused by name), `draft_gate` (the lane's confidence gate: theta in [0, 1),
-default 0 = off; below), `decode_moe` (the decode lane's expert route:
+default 0 = off; below), `mtp_acceptance` (the lane's acceptance: `exact`, the default,
+sample-then-verify; `typical`, Medusa's typical acceptance at delta `mtp_typical_delta` over the request's target, lossy, the token at a
+rejection still the target's own draw; `tokenv3` refused by name, not ported), `mtp_typical_delta` (typical's delta, a number in
+(0, 1], default 0.5; with `"mtp_acceptance":"typical"` only, else refused by name), `decode_moe` (the decode lane's expert route:
 `hitpass`, the default, `fused` or `stock`; anything else refused by name), `decode_glue` (the decode lane's glue:
 `fused`, the default, or `ops`), `decode_kda`, `decode_dsa` and `decode_swiglu` (the decode lane's KDA layer, DSA
 attention and MLP activation: `fused`, the default, or `ops`), `decode_predict` (the lookahead predictor's router
@@ -311,7 +314,7 @@ MiMo's draft-lane seam; `MTP.md` lists its integration points). At construction:
 the weight map and read with the trunk, the draft bank (`mtp-experts-nvfp4.bin`, all 288 experts resident in NVFP4)
 read into MLX and checked record by record against its manifest, the head's lanes at the billed positions; what the
 open holds is held to its billed terms (`mtp_bank + mtp_tables + mtp_kv`, else `ConstructionOverBill`). Line:
-`glm5_next MTP lane installed: lane="glm5_next-mtp exact" depth=3 verify_rows=4 ...` (off: `glm5_next MTP lane: off
+`glm5_next MTP lane installed: lane="glm5_next-mtp exact" depth=3 verify_rows=4 ...` (`lane="glm5_next-mtp typical 0.5"` with `{"mtp_acceptance":"typical"}`, `typical 0.3` with `"mtp_typical_delta":0.3`; the `[spec-stats]` receipt names the same lane) (off: `glm5_next MTP lane: off
 (serial; set {"mtp_lane":true})`).
 
 A request: the prompt pass hands the lane every row's final-normed hidden (`graph.Head.hidden`), each pair whose next
