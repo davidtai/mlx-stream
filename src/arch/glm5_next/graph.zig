@@ -28,6 +28,7 @@ const fp8 = @import("fp8.zig");
 const glue = @import("glue.zig");
 const settings = @import("settings.zig");
 const swiglu = @import("swiglu.zig");
+const fusion = @import("fusion.zig");
 /// Profile builds: the prompt pass's stage marks (MiMo's timeline, armed by `GLM5_NEXT_PREFILL_TIMELINE`); every mark
 /// compiles to nothing in a served build.
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
@@ -583,11 +584,13 @@ pub fn mlp(g: *G, c: *const glm.Config, m: Mlp, x: T) !T {
 }
 
 /// A decode-lane MLP (x [rows, hidden], rows <= 4): the activation on the fused text where the module installed it
-/// (`decode_swiglu: fused`, swiglu.zig), the op chain otherwise (`mlp`). The projections are the residents route's either
-/// way (fp8.zig `project`: BF16 on the stock matmul, or under `fp8_block128` MiMo's FP8 GEMV at the decode lane's rows).
+/// (`decode_swiglu: fused`, swiglu.zig), the op chain otherwise (`mlp`'s). The projections are the residents route's either
+/// way (fp8.zig `project`: BF16 on the stock matmul, or under `fp8_block128` MiMo's FP8 GEMV at the decode lane's rows),
+/// gate and up on the route installed at construction (fusion.zig `fuse_gate_up`: each its own launch, or one launch).
 fn mlpDecode(g: *G, c: *const glm.Config, m: Mlp, x: T, sw: ?*const swiglu.Kernels, width: swiglu.Width, rows: u32) !T {
-    const k = sw orelse return mlp(g, c, m, x);
-    return fp8.project(g, m.down, try swiglu.activate(g, k, width, try fp8.project(g, m.gate, x), try fp8.project(g, m.up, x), rows));
+    const gu = try fusion.gateUp(g, m.gate, m.up, x, width, rows);
+    const k = sw orelse return fp8.project(g, m.down, try sdk_ext.quant.activation(G, g, .{ .swiglu_clamped = c.swiglu_limit }, gu.gate, gu.up));
+    return fp8.project(g, m.down, try swiglu.activate(g, k, width, gu.gate, gu.up, rows));
 }
 
 /// A prompt call's dense MLP over `x` [rows, hidden] in tiles of `dense_tile_rows` rows: each tile committed as built
@@ -1073,6 +1076,9 @@ test {
     _ = @import("fp8.zig");
     _ = @import("fp8_parity.zig");
     _ = @import("determinism_gpu.zig");
+    _ = @import("fusion.zig");
+    _ = @import("fusion_test.zig");
+    _ = @import("fusion_parity.zig");
 }
 
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {

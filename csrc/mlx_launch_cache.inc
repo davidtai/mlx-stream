@@ -29,6 +29,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "mlx/backend/metal/device.h"
@@ -378,6 +379,45 @@ int mlxlc_test_bench(mlx_fast_metal_kernel k, mlx_fast_metal_kernel_config confi
 // MLX applies and pipeline resolutions since the process started (tests; cached launches are not counted).
 void mlxlc_counts(int64_t out[2]) {
   for (int i = 0; i < 2; i++) out[i] = mlxlc::g_counts[i].load();
+}
+
+// Tests (CPU, no device): an explicit GPU stream object for graphs that are built and never evaluated (index 0, never
+// registered with MLX's scheduler: nothing is encoded on it).
+mlx_stream mlxlc_test_gpu_stream(void) {
+  return mlx_stream_new_(mx::Stream(0, mx::Device::gpu));
+}
+
+// Tests (CPU, no device): a graph input of `shape` and `dtype` with no data and no producer that runs (a Placeholder
+// node, mlxlc_test_bench's inputs: nothing is allocated). 0, or -1 (g_error).
+int mlxlc_test_placeholder(const int* shape, int ndim, mlx_dtype dtype, mlx_stream s, mlx_array* out) {
+  try {
+    const auto& st = mlx_stream_get_(s);
+    mlx_array_set_(*out, mx::array(mx::Shape(shape, shape + ndim), mlx_dtype_to_cpp(dtype),
+                                    std::make_shared<mlxlc::Placeholder>(st), {}));
+    return 0;
+  } catch (const std::exception& e) {
+    g_error = e.what();
+    return -1;
+  }
+}
+
+// Tests (CPU, no device: a walk of the unevaluated graph): the custom-kernel launches reachable from `outputs` through
+// their inputs (MLX's CustomKernel nodes and the cache's CustomKernelCached ones), each launch once (a launch's several
+// outputs share its primitive).
+int mlxlc_test_count_launches(const mlx_vector_array outputs) {
+  const auto& outs = mlx_vector_array_get_(outputs);
+  std::vector<mx::array> stack(outs.begin(), outs.end());
+  std::unordered_set<std::uintptr_t> visited;
+  std::unordered_set<const void*> launches;
+  while (!stack.empty()) {
+    mx::array a = stack.back();
+    stack.pop_back();
+    if (!visited.insert(a.id()).second || !a.has_primitive()) continue;
+    const std::string name = a.primitive().name();
+    if (name == "CustomKernel" || name == "CustomKernelCached") launches.insert(&a.primitive());
+    for (const auto& in : a.inputs()) stack.push_back(in);
+  }
+  return static_cast<int>(launches.size());
 }
 
 }  // extern "C"

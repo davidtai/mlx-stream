@@ -1,0 +1,543 @@
+{
+ "ensure_row_contiguous": true,
+ "format": "mlx-stream-glm5next-fusion-kernels-v1",
+ "headers": [
+  {
+   "after": "src/arch/mimo_v2/kernels/header_fp8res.metal (MiMo's pinned decoders)",
+   "bytes": 4534,
+   "file": "header_glm5n_fp8_multi.metal",
+   "id": "glm5n_fp8_multi",
+   "sha256": "44cac691ddd7a605823eff01acaec1f6b20a5d2a202af386241e104b3e96a914"
+  }
+ ],
+ "kernels": [
+  {
+   "contract": "every output glm5n_fp8_gemv_rows's (mimo_fp8_gemv.metal's code) at its site's KS: the stock launch's sum bit for bit; R and RG pick rows only",
+   "header": [
+    "header_fp8res.metal",
+    "header_glm5n_fp8_multi.metal"
+   ],
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "x",
+     "shape": [
+      "M",
+      "K"
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "w_q",
+     "shape": [
+      "NB",
+      "K"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "s_q",
+     "shape": [
+      "NB/64",
+      "K/128"
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "w_k",
+     "shape": [
+      "NB",
+      "K"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "s_k",
+     "shape": [
+      "NB/64",
+      "K/128"
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "w_v",
+     "shape": [
+      "NB",
+      "K"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "s_v",
+     "shape": [
+      "NB/64",
+      "K/128"
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "w_fa",
+     "shape": [
+      "NA",
+      "K"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "s_fa",
+     "shape": [
+      "NA/64",
+      "K/128"
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "w_ga",
+     "shape": [
+      "NA",
+      "K"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "s_ga",
+     "shape": [
+      "NA/64",
+      "K/128"
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "w_b",
+     "shape": [
+      "NC",
+      "K"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "s_b",
+     "shape": [
+      "NC/64",
+      "K/128"
+     ]
+    }
+   ],
+   "instances": [
+    {
+     "K": 4096,
+     "KSB": 1,
+     "KSS": 8,
+     "M": 1,
+     "NA": 128,
+     "NB": 8192,
+     "NC": 64,
+     "RB": 4,
+     "RGB": 8,
+     "RGS": 1,
+     "RS": 4
+    },
+    {
+     "K": 4096,
+     "KSB": 1,
+     "KSS": 8,
+     "M": 2,
+     "NA": 128,
+     "NB": 8192,
+     "NC": 64,
+     "RB": 4,
+     "RGB": 8,
+     "RGS": 1,
+     "RS": 4
+    },
+    {
+     "K": 4096,
+     "KSB": 1,
+     "KSS": 8,
+     "M": 3,
+     "NA": 128,
+     "NB": 8192,
+     "NC": 64,
+     "RB": 4,
+     "RGB": 8,
+     "RGS": 1,
+     "RS": 4
+    },
+    {
+     "K": 4096,
+     "KSB": 1,
+     "KSS": 8,
+     "M": 4,
+     "NA": 128,
+     "NB": 8192,
+     "NC": 64,
+     "RB": 2,
+     "RGB": 8,
+     "RGS": 1,
+     "RS": 2
+    },
+    {
+     "K": 4096,
+     "KSB": 1,
+     "KSS": 8,
+     "M": 5,
+     "NA": 128,
+     "NB": 8192,
+     "NC": 64,
+     "RB": 1,
+     "RGB": 8,
+     "RGS": 1,
+     "RS": 4
+    },
+    {
+     "K": 4096,
+     "KSB": 1,
+     "KSS": 8,
+     "M": 6,
+     "NA": 128,
+     "NB": 8192,
+     "NC": 64,
+     "RB": 1,
+     "RGB": 8,
+     "RGS": 1,
+     "RS": 4
+    },
+    {
+     "K": 4096,
+     "KSB": 1,
+     "KSS": 8,
+     "M": 7,
+     "NA": 128,
+     "NB": 8192,
+     "NC": 64,
+     "RB": 4,
+     "RGB": 8,
+     "RGS": 1,
+     "RS": 4
+    },
+    {
+     "K": 4096,
+     "KSB": 1,
+     "KSS": 8,
+     "M": 8,
+     "NA": 128,
+     "NB": 8192,
+     "NC": 64,
+     "RB": 4,
+     "RGB": 8,
+     "RGS": 1,
+     "RS": 4
+    }
+   ],
+   "launch": {
+    "grid": [
+     "32",
+     "(3 NB / (RB RGB) + 2 NA / (RS RGS) + NC / (RS RGS)) * TG",
+     "1"
+    ],
+    "threadgroup": [
+     "32",
+     "TG = RGB * KSB = RGS * KSS",
+     "1"
+    ]
+   },
+   "meaning": "segments q, k, v, f_a, g_a, b: an FP8 projection's codes uint8 [N, K] and tile scales float32 [N / 64, K / 128] each",
+   "name": "glm5n_fp8_gemv_kda_in",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y_q",
+     "shape": [
+      "M",
+      "NB"
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "y_k",
+     "shape": [
+      "M",
+      "NB"
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "y_v",
+     "shape": [
+      "M",
+      "NB"
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "y_fa",
+     "shape": [
+      "M",
+      "NA"
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "y_ga",
+     "shape": [
+      "M",
+      "NA"
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "y_b",
+     "shape": [
+      "M",
+      "NC"
+     ]
+    }
+   ],
+   "source": {
+    "bytes": 1890,
+    "file": "glm5n_fp8_gemv_kda_in.metal",
+    "sha256": "8dab99d935e66e9c5deaa8f48a108e719a28e4105a9cf06b9ede6455e785e506"
+   },
+   "switch": "fuse_kda_inputs",
+   "template": [
+    "M",
+    "K",
+    "NB",
+    "RB",
+    "KSB",
+    "RGB",
+    "NA",
+    "NC",
+    "RS",
+    "KSS",
+    "RGS"
+   ]
+  },
+  {
+   "contract": "every output glm5n_fp8_gemv_rows's (mimo_fp8_gemv.metal's code) at the site's plan: the stock launch's sum bit for bit",
+   "header": [
+    "header_fp8res.metal",
+    "header_glm5n_fp8_multi.metal"
+   ],
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "x",
+     "shape": [
+      "M",
+      "K"
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "w_gate",
+     "shape": [
+      "N",
+      "K"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "s_gate",
+     "shape": [
+      "N/64",
+      "K/128"
+     ]
+    },
+    {
+     "dtype": "uint8",
+     "name": "w_up",
+     "shape": [
+      "N",
+      "K"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "s_up",
+     "shape": [
+      "N/64",
+      "K/128"
+     ]
+    }
+   ],
+   "instances": [
+    {
+     "K": 4096,
+     "KS": 1,
+     "M": 1,
+     "N": 12288,
+     "R": 4,
+     "RG": 4
+    },
+    {
+     "K": 4096,
+     "KS": 1,
+     "M": 2,
+     "N": 12288,
+     "R": 4,
+     "RG": 4
+    },
+    {
+     "K": 4096,
+     "KS": 1,
+     "M": 3,
+     "N": 12288,
+     "R": 4,
+     "RG": 4
+    },
+    {
+     "K": 4096,
+     "KS": 1,
+     "M": 4,
+     "N": 12288,
+     "R": 2,
+     "RG": 4
+    },
+    {
+     "K": 4096,
+     "KS": 1,
+     "M": 5,
+     "N": 12288,
+     "R": 1,
+     "RG": 4
+    },
+    {
+     "K": 4096,
+     "KS": 1,
+     "M": 6,
+     "N": 12288,
+     "R": 1,
+     "RG": 4
+    },
+    {
+     "K": 4096,
+     "KS": 1,
+     "M": 7,
+     "N": 12288,
+     "R": 4,
+     "RG": 4
+    },
+    {
+     "K": 4096,
+     "KS": 1,
+     "M": 8,
+     "N": 12288,
+     "R": 4,
+     "RG": 4
+    },
+    {
+     "K": 4096,
+     "KS": 2,
+     "M": 1,
+     "N": 2048,
+     "R": 4,
+     "RG": 2
+    },
+    {
+     "K": 4096,
+     "KS": 2,
+     "M": 2,
+     "N": 2048,
+     "R": 4,
+     "RG": 2
+    },
+    {
+     "K": 4096,
+     "KS": 2,
+     "M": 3,
+     "N": 2048,
+     "R": 4,
+     "RG": 2
+    },
+    {
+     "K": 4096,
+     "KS": 2,
+     "M": 4,
+     "N": 2048,
+     "R": 2,
+     "RG": 2
+    },
+    {
+     "K": 4096,
+     "KS": 2,
+     "M": 5,
+     "N": 2048,
+     "R": 4,
+     "RG": 2
+    },
+    {
+     "K": 4096,
+     "KS": 2,
+     "M": 6,
+     "N": 2048,
+     "R": 4,
+     "RG": 2
+    },
+    {
+     "K": 4096,
+     "KS": 2,
+     "M": 7,
+     "N": 2048,
+     "R": 4,
+     "RG": 2
+    },
+    {
+     "K": 4096,
+     "KS": 2,
+     "M": 8,
+     "N": 2048,
+     "R": 4,
+     "RG": 2
+    }
+   ],
+   "launch": {
+    "grid": [
+     "32",
+     "2 * N / (R * RG) * RG * KS",
+     "1"
+    ],
+    "threadgroup": [
+     "32",
+     "RG * KS",
+     "1"
+    ]
+   },
+   "meaning": "segments gate, up: an FP8 projection's codes uint8 [N, K] and tile scales float32 [N / 64, K / 128] each, one plan",
+   "name": "glm5n_fp8_gemv_pair",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y_gate",
+     "shape": [
+      "M",
+      "N"
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "y_up",
+     "shape": [
+      "M",
+      "N"
+     ]
+    }
+   ],
+   "source": {
+    "bytes": 818,
+    "file": "glm5n_fp8_gemv_pair.metal",
+    "sha256": "fe58d2cd4645d4a80ffc2ce6b54f50e3a3114e743d3433ca3a08f68c9f6ef756"
+   },
+   "switch": "fuse_gate_up",
+   "template": [
+    "M",
+    "N",
+    "K",
+    "R",
+    "KS",
+    "RG"
+   ]
+  }
+ ],
+ "math_mode": "safe"
+}
