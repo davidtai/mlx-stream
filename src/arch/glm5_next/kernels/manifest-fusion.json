@@ -537,6 +537,234 @@
     "KS",
     "RG"
    ]
+  },
+  {
+   "contract": "element for element MLX's astype (bf16 -> f32), Sigmoid (unary_ops.h, precise::exp) and f32 Add of the stock route: bit for bit",
+   "header": [],
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "logits",
+     "shape": [
+      "M",
+      "E"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "correction",
+     "shape": [
+      "E"
+     ]
+    }
+   ],
+   "instances": [
+    {
+     "E": 288,
+     "M": 1
+    },
+    {
+     "E": 288,
+     "M": 2
+    },
+    {
+     "E": 288,
+     "M": 3
+    },
+    {
+     "E": 288,
+     "M": 4
+    },
+    {
+     "E": 288,
+     "M": 5
+    },
+    {
+     "E": 288,
+     "M": 6
+    },
+    {
+     "E": 288,
+     "M": 7
+    },
+    {
+     "E": 288,
+     "M": 8
+    }
+   ],
+   "launch": {
+    "grid": [
+     "M * E",
+     "1",
+     "1"
+    ],
+    "threadgroup": [
+     "E",
+     "1",
+     "1"
+    ]
+   },
+   "meaning": "the lookahead predictor's epilogue over the next routed layer's BF16 router product",
+   "name": "glm5n_pred_epilogue",
+   "outputs": [
+    {
+     "dtype": "float32",
+     "name": "scores",
+     "shape": [
+      "M",
+      "E"
+     ]
+    }
+   ],
+   "source": {
+    "bytes": 810,
+    "file": "glm5n_pred_epilogue.metal",
+    "sha256": "82556142ed171e6c2e0c7c64934e07fd09a544f65d075068b329ff0ef0f7d4be"
+   },
+   "switch": "fuse_predictor",
+   "template": [
+    "E"
+   ]
+  },
+  {
+   "contract": "glm5n_moe_combine's arithmetic line for line on the rows the join's take would copy: bit for bit",
+   "header": [
+    "header_glm5n_combine.metal"
+   ],
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "rows",
+     "shape": [
+      "R",
+      "H"
+     ]
+    },
+    {
+     "dtype": "uint32",
+     "name": "order",
+     "shape": [
+      "N8"
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "w",
+     "shape": [
+      "M",
+      "TOPK"
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "shared",
+     "shape": [
+      "M",
+      "H"
+     ]
+    }
+   ],
+   "instances": [
+    {
+     "H": 4096,
+     "M": 1,
+     "N8": 8,
+     "R": 16,
+     "T": "bfloat16",
+     "TOPK": 8
+    },
+    {
+     "H": 4096,
+     "M": 2,
+     "N8": 16,
+     "R": 32,
+     "T": "bfloat16",
+     "TOPK": 8
+    },
+    {
+     "H": 4096,
+     "M": 3,
+     "N8": 24,
+     "R": 48,
+     "T": "bfloat16",
+     "TOPK": 8
+    },
+    {
+     "H": 4096,
+     "M": 4,
+     "N8": 32,
+     "R": 64,
+     "T": "bfloat16",
+     "TOPK": 8
+    },
+    {
+     "H": 4096,
+     "M": 5,
+     "N8": 40,
+     "R": 80,
+     "T": "bfloat16",
+     "TOPK": 8
+    },
+    {
+     "H": 4096,
+     "M": 6,
+     "N8": 48,
+     "R": 96,
+     "T": "bfloat16",
+     "TOPK": 8
+    },
+    {
+     "H": 4096,
+     "M": 7,
+     "N8": 56,
+     "R": 112,
+     "T": "bfloat16",
+     "TOPK": 8
+    },
+    {
+     "H": 4096,
+     "M": 8,
+     "N8": 64,
+     "R": 128,
+     "T": "bfloat16",
+     "TOPK": 8
+    }
+   ],
+   "launch": {
+    "grid": [
+     "H",
+     "M",
+     "1"
+    ],
+    "threadgroup": [
+     "256",
+     "1",
+     "1"
+    ]
+   },
+   "meaning": "the decode combine (glm5n_moe_combine, glue.zig) reading the call's joined rows in place through the join's order",
+   "name": "glm5n_moe_combine_idx",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y",
+     "shape": [
+      "M",
+      "H"
+     ]
+    }
+   ],
+   "source": {
+    "bytes": 1250,
+    "file": "glm5n_moe_combine_idx.metal",
+    "sha256": "3fbae8287b70da19da3ccc4dbb2039353e83ec5b7747962f41ed768b232cc4ce"
+   },
+   "switch": "fuse_join",
+   "template": [
+    "T",
+    "TOPK",
+    "H"
+   ]
   }
  ],
  "math_mode": "safe"

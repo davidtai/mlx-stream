@@ -30,6 +30,7 @@ const exl3_kernels = @import("exl3_kernels.zig");
 const nvfp4 = @import("nvfp4.zig");
 const settings = @import("settings.zig");
 const glue = @import("glue.zig");
+const fusion = @import("fusion.zig");
 const profile = @import("../mimo_v2/profile.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
@@ -76,9 +77,19 @@ pub fn Types(comptime fam: Family) type {
 /// `decode_predict: bf16`: the next routed layer's scores from its router's BF16 weight as stored ([experts, hidden], MLX's
 /// gemv over x [n, hidden]), then the sigmoid and the correction as MiMo's F32 route: f32 [n, experts]. Half the F32
 /// copy's bytes and no input cast; the scores pick the lookahead's reads only.
-fn scoresBf16(_: *const mimo_math.Predictor, g: *ops.MlxOps, x: T, router: T, correction: T) anyerror!T {
+pub fn scoresBf16(_: *const mimo_math.Predictor, g: *ops.MlxOps, x: T, router: T, correction: T) anyerror!T {
     const logits = try g.matmul(x, try g.transpose(router));
     return g.add(try g.sigmoid(try g.astype(logits, .float32)), correction);
+}
+
+/// `fuse_predictor: on` (fusion.zig): `scoresBf16`'s product, then its epilogue (the f32 widening, the sigmoid and the
+/// correction) in one dispatch, element for element the three stock dispatches' arithmetic; a call wider than the
+/// epilogue's prepared rows (none on the decode lane, the predictor's only phase) keeps the stock epilogue.
+pub fn scoresBf16Fused(p: *const mimo_math.Predictor, g: *ops.MlxOps, x: T, router: T, correction: T) anyerror!T {
+    const n: u32 = @intCast(g.shapeOf(x).dim(0));
+    if (n > fusion.max_rows) return scoresBf16(p, g, x, router, correction);
+    const logits = try g.matmul(x, try g.transpose(router));
+    return fusion.predEpilogue(g, logits, correction, n);
 }
 pub const Residents = B.S.Residents;
 
@@ -157,6 +168,7 @@ pub fn SourceOf(comptime fam: Family) type {
         const Self = @This();
         const Fam = Types(fam);
         const PartsCombineFn = fn (self: *const Self, g: *ops.MlxOps, outs: []const T, loc: T, route_weights: T, nt: u32) anyerror!T;
+        const ForwardSharedFn = fn (self: *Self, layer: u32, x: T, ids: T, route_weights: T, shared: T, k: *const glue.Kernels) anyerror!T;
 
         /// The prompt combine over the wide call's sources read in place (P7 `inplace`, the host's wired policy `max`).
         fn partsCombineInplace(self: *const Self, g: *ops.MlxOps, outs: []const T, loc: T, route_weights: T, nt: u32) !T {
@@ -196,6 +208,9 @@ pub fn SourceOf(comptime fam: Family) type {
         /// exl3: the routers' gates as the family's scheduler types them (the module's table, copied once at construction).
         own_gates: if (fam == .exl3) []Fam.Experts.Gate else void = if (fam == .exl3) &.{} else {},
         parts_combine: *const PartsCombineFn = partsCombineInplace,
+        /// The fused glue's routed call (`forwardShared`), bound at construction: the join's take then the combine text
+        /// (the stock route), or the combine reading the joined rows in place (`fuse_join`, fusion.zig).
+        forward_shared: *const ForwardSharedFn = forwardSharedStock,
         combine_kernel: prefill_combine.Kernel = .{},
         combine_route: prefill_combine.Route = .inplace,
         /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine (its own queue, kernel, buffer and parked thread); the
@@ -500,6 +515,10 @@ pub fn SourceOf(comptime fam: Family) type {
         /// shared expert's rows: the routed sum plus the shared expert, bf16 [nt, H], a KEPT handle the caller adopts (lazy,
         /// as `forward`'s decode lane).
         pub fn forwardShared(self: *Self, layer: u32, x: T, ids: T, route_weights: T, shared: T, k: *const glue.Kernels) !T {
+            return self.forward_shared(self, layer, x, ids, route_weights, shared, k);
+        }
+
+        fn forwardSharedStock(self: *Self, layer: u32, x: T, ids: T, route_weights: T, shared: T, k: *const glue.Kernels) anyerror!T {
             const g = &self.g;
             defer g.reset();
             const nt: u32 = @intCast(g.shapeOf(x).d[0]);
@@ -509,6 +528,44 @@ pub fn SourceOf(comptime fam: Family) type {
             const output = try glue.combineShared(g, k, routed, route_weights, shared, nt);
             profile.charge(.encode, encode_start);
             return g.keep(output);
+        }
+
+        /// `fuse_join: on` (fusion.zig): `forwardSharedStock` with the scheduler's join folded into the combine: the call
+        /// ends before the join's take (`routedHoistIndexed`) and `glm5n_moe_combine_idx` reads each routed row in place
+        /// through the join's order, the combine text's arithmetic line for line.
+        fn forwardSharedIndexed(self: *Self, layer: u32, x: T, ids: T, route_weights: T, shared: T, _: *const glue.Kernels) anyerror!T {
+            const g = &self.g;
+            defer g.reset();
+            const nt: u32 = @intCast(g.shapeOf(x).d[0]);
+            profile.call();
+            const j = try self.ex.at(layer).routedHoistIndexed(g, x, ids, &.{shared});
+            const encode_start = profile.now();
+            const output = try fusion.combineIndexed(g, j.rows, j.order, route_weights, shared, nt);
+            profile.charge(.encode, encode_start);
+            return g.keep(output);
+        }
+
+        /// `fuse_join` (fusion.zig), bound once at construction after the combine text's install.
+        pub fn fuseJoin(self: *Self) !void {
+            if (!fusion.joinInstalled()) return error.Glm5NextFuseJoinNotInstalled;
+            self.forward_shared = &forwardSharedIndexed;
+        }
+
+        /// `fuse_join` as bound (the module's launch-fusion line).
+        pub fn joinFused(self: *const Self) bool {
+            return self.forward_shared == &forwardSharedIndexed;
+        }
+
+        /// `fuse_predictor` (fusion.zig), bound once at construction after the epilogue's install: the BF16 predictor's
+        /// epilogue as one dispatch. The F32 predictor (`decode_predict: f32`) refuses it by name.
+        pub fn fusePredictor(self: *Self) !void {
+            if (self.ex.math.predictor.scores != &scoresBf16 or !fusion.predInstalled()) return error.Glm5NextFusePredictorNeedsBf16;
+            self.ex.math.predictor.scores = &scoresBf16Fused;
+        }
+
+        /// `fuse_predictor` as bound (the module's launch-fusion line).
+        pub fn predictorFused(self: *const Self) bool {
+            return self.ex.math.predictor.scores == &scoresBf16Fused;
         }
 
         /// P1: layer `layer`'s predicted experts, hottest first, read into its free persistent rows ahead of its call.

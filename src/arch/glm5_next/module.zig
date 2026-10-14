@@ -134,11 +134,11 @@ pub const Module = struct {
         try weights.materialize();
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
         try kda.install(&self.c.model);
-        // The trunk's launch fusion (`fuse_kda_inputs`, `fuse_gate_up`), once, over the read residents: each switch on its
-        // text, its launches at 1 .. 8 rows and its route (one launch over the first fused site set as the compile check),
-        // every fused site FP8 at its launch's shapes and plans or the load refused by name; off (the default) keeps the
-        // stock projections.
-        fusion.install(gpa, s, &self.c.model, self.w.layers, .{ .kda_inputs = self.c.fuse_kda_inputs == .on, .gate_up = self.c.fuse_gate_up == .on }, &diag) catch |e| {
+        // The trunk's launch fusion (`fuse_kda_inputs`, `fuse_gate_up`, `fuse_predictor`, `fuse_join`), once, over the read
+        // residents: each switch on its text, its launches at 1 .. 8 rows and (the GEMVs') its route (one launch as the
+        // compile check), every fused site FP8 at its launch's shapes and plans or the load refused by name; off (the
+        // default) keeps the stock route. The predictor's and the join's routes are bound into the expert source below.
+        fusion.install(gpa, s, &self.c.model, self.w.layers, .{ .kda_inputs = self.c.fuse_kda_inputs == .on, .gate_up = self.c.fuse_gate_up == .on, .predictor = self.c.fuse_predictor == .on, .join = self.c.fuse_join == .on }, &diag) catch |e| {
             log.err("glm5_next: the launch fusion refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
             return e;
         };
@@ -261,9 +261,16 @@ pub const Module = struct {
             inline else => |x| x.deinit(),
         };
         // MERGE_GATE_WAITS (`merge_gate_waits`), bound into the scheduler once, before any call: a decode call's gated miss
-        // parts wait once per gate value.
+        // parts wait once per gate value. `fuse_predictor`: the BF16 predictor's epilogue as one dispatch; `fuse_join`: the
+        // fused glue's routed call ending before the join's take, its combine reading the rows in place; each bound likewise.
         if (self.c.merge_gate_waits == .on) switch (self.src) {
             inline else => |x| try x.ex.bindMergeGateWaits(),
+        };
+        if (self.c.fuse_predictor == .on) switch (self.src) {
+            inline else => |x| try x.fusePredictor(),
+        };
+        if (self.c.fuse_join == .on) switch (self.src) {
+            inline else => |x| try x.fuseJoin(),
         };
         // The rate tally (`expert_resident_ratio` > 0): its file read once (the first request's pins), its line.
         try self.openTally(dir, std.mem.min(u32, decode_rows));
@@ -297,9 +304,15 @@ pub const Module = struct {
         const merged = switch (self.src) {
             inline else => |x| x.ex.mergeGateWaits(),
         };
+        const pred_fused = switch (self.src) {
+            inline else => |x| x.predictorFused(),
+        };
+        const join_fused = switch (self.src) {
+            inline else => |x| x.joinFused(),
+        };
         var fusion_lane: [64]u8 = undefined;
         const fusion_lane_state: []const u8 = if (self.mtp) |lane| std.fmt.bufPrint(&fusion_lane, "lane=on depth={d} draft_gate={d:.3}", .{ lane.depth, lane.gate }) catch unreachable else "lane=off";
-        log.info("glm5_next launch fusion: fuse_kda_inputs={s} fuse_gate_up={s} merge_gate_waits={s} {s}\n", .{ switchState(fusion.kdaInputsEngaged()), switchState(fusion.gateUpEngaged()), switchState(merged), fusion_lane_state });
+        log.info("glm5_next launch fusion: fuse_kda_inputs={s} fuse_gate_up={s} fuse_predictor={s} fuse_join={s} merge_gate_waits={s} {s}\n", .{ switchState(fusion.kdaInputsEngaged()), switchState(fusion.gateUpEngaged()), switchState(pred_fused), switchState(join_fused), switchState(merged), fusion_lane_state });
         // The prompt levers' engagement lines (glm5next/prefill-levers; docs/glm5-next.md "Prompt levers").
         if (experts.prompt_relocate) log.info("glm5_next prompt lever 1: read-ahead relocation engaged (a read-ahead record the plans evict before any hit is copied at the plans into its later transient row: read once; exact)\n", .{});
         log.info("glm5_next prompt lever 3: prompt kernels warmed at load in {d} ms (KDA layer {d}: {d} spans; dense layer {d}: one {d}-row tile; DSA layer {d}: {d} spans of {d} rows; the {s} combine; token-identical)\n", .{ warmed.ns / std.time.ns_per_ms, warmed.plan.kda_layer, warmed.plan.kda_spans, warmed.plan.dense_layer, graph.dense_tile_rows, warmed.plan.dsa_layer, warmed.plan.dsa_spans, graph.span_rows, @tagName(combine_route) });

@@ -20,6 +20,7 @@ HIDDEN = 4096
 # [12288, hidden], the shared experts' [2048, hidden].
 KDA_BIG, KDA_A, KDA_C = 8192, 128, 64
 DENSE, SHARED = 12288, 2048
+EXPERTS = 288
 
 
 def gemv_plan(n, k):
@@ -74,6 +75,10 @@ def pair_instances():
     return out
 
 
+def pred_instances():
+    return [{"M": m, "E": EXPERTS} for m in range(1, MAX_ROWS + 1)]
+
+
 def manifest():
     seg = "an FP8 projection's codes uint8 [N, K] and tile scales float32 [N / 64, K / 128]"
     kda_in = [{"name": "x", "dtype": "bfloat16", "shape": ["M", "K"]}]
@@ -119,6 +124,37 @@ def manifest():
                 "contract": "every output glm5n_fp8_gemv_rows's (mimo_fp8_gemv.metal's code) at the site's plan: the "
                             "stock launch's sum bit for bit",
                 "instances": pair_instances(),
+            },
+            {
+                "name": "glm5n_pred_epilogue",
+                "source": text("glm5n_pred_epilogue.metal"),
+                "header": [],
+                "switch": "fuse_predictor",
+                "inputs": [{"name": "logits", "dtype": "bfloat16", "shape": ["M", "E"]},
+                           {"name": "correction", "dtype": "float32", "shape": ["E"]}],
+                "outputs": [{"name": "scores", "dtype": "float32", "shape": ["M", "E"]}],
+                "meaning": "the lookahead predictor's epilogue over the next routed layer's BF16 router product",
+                "template": ["E"],
+                "launch": {"grid": ["M * E", "1", "1"], "threadgroup": ["E", "1", "1"]},
+                "contract": "element for element MLX's astype (bf16 -> f32), Sigmoid (unary_ops.h, precise::exp) and f32 Add of "
+                            "the stock route: bit for bit",
+                "instances": pred_instances(),
+            },
+            {
+                "name": "glm5n_moe_combine_idx",
+                "source": text("glm5n_moe_combine_idx.metal"),
+                "header": ["header_glm5n_combine.metal"],
+                "switch": "fuse_join",
+                "inputs": [{"name": "rows", "dtype": "bfloat16", "shape": ["R", "H"]},
+                           {"name": "order", "dtype": "uint32", "shape": ["N8"]},
+                           {"name": "w", "dtype": "float32", "shape": ["M", "TOPK"]},
+                           {"name": "shared", "dtype": "bfloat16", "shape": ["M", "H"]}],
+                "outputs": [{"name": "y", "dtype": "bfloat16", "shape": ["M", "H"]}],
+                "meaning": "the decode combine (glm5n_moe_combine, glue.zig) reading the call's joined rows in place through the join's order",
+                "template": ["T", "TOPK", "H"],
+                "launch": {"grid": ["H", "M", "1"], "threadgroup": ["256", "1", "1"]},
+                "contract": "glm5n_moe_combine's arithmetic line for line on the rows the join's take would copy: bit for bit",
+                "instances": [{"M": m, "R": 2 * 8 * m, "N8": 8 * m, "T": "bfloat16", "TOPK": 8, "H": HIDDEN} for m in range(1, MAX_ROWS + 1)],
             },
         ],
     }

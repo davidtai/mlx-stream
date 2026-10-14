@@ -6,7 +6,8 @@
 //!     the stock launch's sum (MiMo's KS-order emulation `hostGemvDotW` at the site's plan), on random codes, scales and
 //!     rows at every R a width takes;
 //!   - the launches the routes build (the graph's custom-kernel nodes over placeholder inputs): a KDA layer's input
-//!     projections 6 stock, 1 fused; an MLP's gate / up 2 and 1; the same outputs (shapes, dtype) either way;
+//!     projections 6 stock, 1 fused; an MLP's gate / up 2 and 1; the predictor's product and epilogue 4 and 2 (every
+//!     node that dispatches); a routed call's join and combine 2 and 1; the same outputs (shapes, dtype) either way;
 //!   - the install's plan refuses a BF16 site, an off-shape site and a plan one launch cannot hold, by name.
 
 const std = @import("std");
@@ -18,6 +19,9 @@ const kda = @import("kda.zig");
 const graph = @import("graph.zig");
 const swiglu = @import("swiglu.zig");
 const fusion = @import("fusion.zig");
+const experts = @import("experts.zig");
+const glue = @import("glue.zig");
+const mimo_math = @import("../mimo_v2/math.zig");
 const mimo_fp8 = @import("../mimo_v2/fp8_linear.zig");
 const kset = @import("../../sdk_ext/kernel_set.zig");
 
@@ -30,10 +34,11 @@ extern "c" fn mlxlc_test_config(config: mlx.mlx_fast_metal_kernel_config, out: *
 extern "c" fn mlxlc_test_gpu_stream() mlx.mlx_stream;
 extern "c" fn mlxlc_test_placeholder(shape: [*]const c_int, ndim: c_int, dtype: mlx.mlx_dtype, s: mlx.mlx_stream, out: *mlx.mlx_array) c_int;
 extern "c" fn mlxlc_test_count_launches(outputs: mlx.mlx_vector_array) c_int;
+extern "c" fn mlxlc_test_graph_ops(outputs: mlx.mlx_vector_array, out: [*]u8, cap: c_int) c_int;
 
 test "glm5_next fusion: the embedded manifest and texts are the pinned ones; the segment function is mimo_fp8_gemv.metal's code line for line but its four kernel-scope lines" {
     try fusion.checkPins();
-    try kset.expectManifestPins(fusion.texts.manifest, &fusion.text_pins, 2);
+    try kset.expectManifestPins(fusion.texts.manifest, &fusion.text_pins, 4);
     // MiMo's text, its code lines (no comments), in order, against the function's body.
     const swapped = [_][]const u8{
         "    const int sgi = int(simdgroup_index_in_threadgroup);",
@@ -74,6 +79,44 @@ test "glm5_next fusion: the embedded manifest and texts are the pinned ones; the
     }
     try testing.expectEqual(@as(usize, 6), std.mem.count(u8, fusion.texts.kda_in, "glm5n_fp8_gemv_rows<"));
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, fusion.texts.pair, "glm5n_fp8_gemv_rows<"));
+    // The predictor's epilogue: MLX's Sigmoid line for line (mlx/backend/metal/kernels/unary_ops.h at the pinned MLX:
+    // `auto y = 1 / (1 + metal::precise::exp(metal::abs(x))); return (x < 0) ? y : 1 - y;`, T = float) between the exact
+    // widening and the f32 add of the bias.
+    for ([_][]const u8{
+        "const float x = static_cast<float>(logits[i]);",
+        "const float y = 1 / (1 + metal::precise::exp(metal::abs(x)));",
+        "const float s = (x < 0) ? y : 1 - y;",
+        "scores[i] = s + correction[i % E];",
+    }) |line| try testing.expect(std.mem.indexOf(u8, fusion.texts.pred, line) != null);
+    // The indexed combine: glue.zig's combine text (glm5n_moe_combine.metal) code line for line but its row reads, which
+    // take the join's order (the rows the take would copy, read in place).
+    {
+        const swaps = [_][2][]const u8{
+            .{ "const device auto* r = rows + size_t(t) * TOPK * H + h;", "const device auto* o = order + size_t(t) * TOPK;" },
+            .{ "float acc = float(r[0]) * wt[0] + 0.0f;", "float acc = float(rows[size_t(o[0]) * H + h]) * wt[0] + 0.0f;" },
+            .{ "  const float p = float(r[size_t(k) * H]) * wt[k] + 0.0f;", "  const float p = float(rows[size_t(o[k]) * H + h]) * wt[k] + 0.0f;" },
+        };
+        var stock_lines = std.mem.splitScalar(u8, glue.texts.combine, '\n');
+        var idx_lines = std.mem.splitScalar(u8, fusion.texts.combine_idx, '\n');
+        var code_lines: usize = 0;
+        var n_swapped: usize = 0;
+        while (stock_lines.next()) |line| {
+            if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
+            const want = for (swaps) |sw| {
+                if (std.mem.eql(u8, line, sw[0])) {
+                    n_swapped += 1;
+                    break sw[1];
+                }
+            } else line;
+            const got = while (idx_lines.next()) |l| {
+                if (l.len != 0 and !std.mem.startsWith(u8, l, "//")) break l;
+            } else return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(want, got);
+            code_lines += 1;
+        }
+        try testing.expectEqual(@as(usize, 3), n_swapped);
+        try testing.expect(code_lines >= 11);
+    }
     try sdk.testing.expectNoDevice();
 }
 
@@ -103,6 +146,8 @@ test "glm5_next fusion: the fused launches' geometry at Flash's sites (the bound
     const ks = parsed.value.kernels;
     try testing.expectEqualStrings("glm5n_fp8_gemv_kda_in", ks[0].name);
     try testing.expectEqualStrings("glm5n_fp8_gemv_pair", ks[1].name);
+    try testing.expectEqualStrings("glm5n_pred_epilogue", ks[2].name);
+    try testing.expectEqual(fusion.max_rows, ks[2].instances.len);
     try testing.expectEqual(fusion.max_rows, ks[0].instances.len);
     try testing.expectEqual(2 * fusion.max_rows, ks[1].instances.len);
     const I = struct {
@@ -143,6 +188,23 @@ test "glm5_next fusion: the fused launches' geometry at Flash's sites (the bound
             const l = mimo_fp8.gemvLaunch(e[0], pg.n);
             try testing.expectEqual([9]c_int{ 32, 2 * l.grid[1], 1, l.tg[0], l.tg[1], 1, 2, 6, 0 }, got);
         }
+    }
+    // The predictor's epilogue: one threadgroup of E threads a row, one output f32 [M, E].
+    for (1..fusion.max_rows + 1) |m| {
+        const e: c_int = @intCast(c.n_routed_experts);
+        try testing.expectEqual(e, I.of(ks[2].instances[m - 1], "E"));
+        try testing.expectEqual(@as(c_int, @intCast(m)), I.of(ks[2].instances[m - 1], "M"));
+        const pc = try fusion.predConfig(@intCast(m), e);
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(pc);
+        var got: [9]c_int = undefined;
+        mlxlc_test_config(pc, &got);
+        try testing.expectEqual([9]c_int{ @as(c_int, @intCast(m)) * e, 1, 1, e, 1, 1, 1, 1, 0 }, got);
+        // The indexed combine: glue.zig's combine launch at the same rows (its three template arguments).
+        const ci = try fusion.combineIdxConfig(@intCast(m));
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(ci);
+        mlxlc_test_config(ci, &got);
+        const cg = glue.Geometry.combine(@intCast(m));
+        try testing.expectEqual([9]c_int{ cg.grid[0], cg.grid[1], cg.grid[2], cg.group[0], cg.group[1], cg.group[2], 1, 3, 0 }, got);
     }
     // The verify's width (4 rows): q / k / v 2 rows a simdgroup x 8 row groups, f_a / g_a / b 2 rows x 8 partitions.
     const g4 = try fusion.kdaInGeometry(q.plans[4], fa.plans[4], c.kdaDim(), c.kda_head_dim, c.kda_heads, c.hidden_size, 4);
@@ -354,7 +416,26 @@ fn launchesOf(outs: []const T) c_int {
     return mlxlc_test_count_launches(v);
 }
 
-test "glm5_next fusion: the launches the routes build (the graph's custom-kernel nodes over placeholder inputs): a KDA layer's input projections 6 stock, 1 fused; an MLP's gate / up 2 and 1; the outputs' shapes and dtype the stock route's" {
+/// The graph's nodes that dispatch (every primitive but the views MLX evaluates as no-copy reshapes of their input, and the
+/// placeholders), and their names.
+fn dispatchesOf(outs: []const T, names: *[512]u8) !struct { n: usize, names: []const u8 } {
+    const v = mlx.mlx_vector_array_new_data(outs.ptr, outs.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    const all = mlxlc_test_graph_ops(v, names, names.len);
+    if (all < 0) return error.TestUnexpectedResult;
+    const list = std.mem.sliceTo(names, 0);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |op| {
+        const view = for ([_][]const u8{ "MlxlcPlaceholder", "Transpose", "Reshape", "Broadcast", "Squeeze", "ExpandDims" }) |vw| {
+            if (std.mem.eql(u8, op, vw)) break true;
+        } else false;
+        n += @intFromBool(!view);
+    }
+    return .{ .n = n, .names = list };
+}
+
+test "glm5_next fusion: the launches the routes build (the graph's nodes over placeholder inputs): a KDA layer's input projections 6 stock, 1 fused; an MLP's gate / up 2 and 1; the predictor's product and epilogue 4 dispatches and 2; a routed call's take and combine 2 and 1; the outputs' shapes and dtype the stock route's" {
     const a = testing.allocator;
     const c: glm.Config = .{};
     const s = mlxlc_test_gpu_stream();
@@ -402,7 +483,7 @@ test "glm5_next fusion: the launches the routes build (the graph's custom-kernel
     const dense_layer: graph.Layer = .{ .input_norm = .{ .ctx = null }, .post_norm = .{ .ctx = null }, .hc_attn = undefined, .hc_ffn = undefined, .attn = .{ .kda = w }, .dense = .{ .gate = try P.lin(a, &arrays, s, &route, c.intermediate_size, h), .up = try P.lin(a, &arrays, s, &route, c.intermediate_size, h), .down = .{ .bf16 = .{ .ctx = null } } }, .slot = 1 };
     const shared_layer: graph.Layer = .{ .input_norm = .{ .ctx = null }, .post_norm = .{ .ctx = null }, .hc_attn = undefined, .hc_ffn = undefined, .attn = .{ .kda = w }, .shared = mlp, .slot = 2 };
     const p = try fusion.plan(&c, &.{ layer, dense_layer, shared_layer }, .{ .kda_inputs = true, .gate_up = true }, null);
-    var restore = try fusion.testInstall(p);
+    var restore = try fusion.testInstall(p, @intCast(c.n_routed_experts));
     defer restore.done();
     for (1..5) |rows| {
         const m0 = g.mark();
@@ -435,13 +516,87 @@ test "glm5_next fusion: the launches the routes build (the graph's custom-kernel
         // Stock: each projection its own launch; fused: one launch for the six, one for the pair.
         try testing.expectEqual([2]c_int{ 6, 2 }, got[0]);
         try testing.expectEqual([2]c_int{ 1, 1 }, got[1]);
+        // The predictor (experts.zig `scoresBf16` / `scoresBf16Fused`): the product and its epilogue over the next routed
+        // layer's BF16 router [E, hidden] and correction f32 [E]: Matmul, AsType, Sigmoid, Add stock; Matmul and the
+        // epilogue's one launch fused; the same f32 [rows, E] out.
+        {
+            const e: c_int = @intCast(c.n_routed_experts);
+            const router = try placeholder(s, &.{ e, @intCast(h) }, .bfloat16);
+            try arrays.append(a, router);
+            const corr = try placeholder(s, &.{e}, .float32);
+            try arrays.append(a, corr);
+            const pr: mimo_math.Predictor = .{};
+            var nb: [512]u8 = undefined;
+            const st = try experts.scoresBf16(&pr, &g, x2, router, corr);
+            const sd = try dispatchesOf(&.{st}, &nb);
+            try testing.expectEqual(@as(usize, 4), sd.n);
+            for ([_][]const u8{ "Matmul", "AsType", "Sigmoid", "Add" }) |op| try testing.expect(std.mem.indexOf(u8, sd.names, op) != null);
+            const fu = try experts.scoresBf16Fused(&pr, &g, x2, router, corr);
+            const fd = try dispatchesOf(&.{fu}, &nb);
+            try testing.expectEqual(@as(usize, 2), fd.n);
+            try testing.expect(std.mem.indexOf(u8, fd.names, "Matmul") != null and std.mem.indexOf(u8, fd.names, "CustomKernel") != null);
+            try testing.expect(std.mem.indexOf(u8, fd.names, "Sigmoid") == null);
+            try testing.expect(g.shapeOf(st).eql(g.shapeOf(fu)));
+            try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(fu));
+        }
+        // A routed call's end (deepseek_v41/experts.zig `join` then glue.zig `combineShared`; `fuse_join`: the indexed
+        // combine): the joined rows [R, hidden] (the device wave's then a miss part's), the join's order, the weights and
+        // the shared expert's rows: the take and the combine stock, the combine alone fused; the same bf16 [rows, hidden].
+        {
+            const tk: c_int = @intCast(glue.top_k);
+            const n_ids: c_int = tk * @as(c_int, @intCast(rows));
+            const joined = try placeholder(s, &.{ n_ids + 3, @intCast(h) }, .bfloat16);
+            try arrays.append(a, joined);
+            const order = try placeholder(s, &.{n_ids}, .uint32);
+            try arrays.append(a, order);
+            const wts = try placeholder(s, &.{ @intCast(rows), tk }, .float32);
+            try arrays.append(a, wts);
+            const shared = try placeholder(s, &.{ @intCast(rows), @intCast(h) }, .bfloat16);
+            try arrays.append(a, shared);
+            var nb: [512]u8 = undefined;
+            // The stock end: the join's take into router order, then the combine text (glue.zig's kernel and launch).
+            const taken = try g.reshape(try g.take(joined, order, 0), &.{ @intCast(rows), tk, @intCast(h) });
+            const flat = try g.reshape(taken, &.{ n_ids, @intCast(h) });
+            const ck = blk: {
+                const ins = [_][*:0]const u8{ "rows", "w", "shared" };
+                const outs = [_][*:0]const u8{"y"};
+                const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+                defer _ = mlx.mlx_vector_string_free(iv);
+                const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+                defer _ = mlx.mlx_vector_string_free(ov);
+                break :blk mlx.mlx_fast_metal_kernel_new("glm5n_moe_combine", iv, ov, glue.texts.combine, glue.texts.header_combine, true, false);
+            };
+            defer _ = mlx.mlx_fast_metal_kernel_free(ck);
+            const cfg = try fusion.combineIdxConfig(@intCast(rows));
+            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            var so = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(so);
+            const sin = mlx.mlx_vector_array_new_data(&[_]T{ flat, wts, shared }, 3);
+            defer _ = mlx.mlx_vector_array_free(sin);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&so, ck, sin, cfg, s));
+            var stock_y = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&stock_y, so, 0));
+            const sy = try g.adopt(stock_y);
+            const sd = try dispatchesOf(&.{sy}, &nb);
+            try testing.expectEqual(@as(usize, 2), sd.n);
+            try testing.expect(std.mem.indexOf(u8, sd.names, "Gather") != null and std.mem.indexOf(u8, sd.names, "CustomKernel") != null);
+            const fy = try fusion.combineIndexed(&g, joined, order, wts, shared, @intCast(rows));
+            const fd = try dispatchesOf(&.{fy}, &nb);
+            try testing.expectEqual(@as(usize, 1), fd.n);
+            try testing.expect(std.mem.indexOf(u8, fd.names, "Gather") == null);
+            try testing.expect(g.shapeOf(sy).eql(g.shapeOf(fy)));
+            try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(fy));
+        }
         // The same outputs either way: [1, rows, N] for the six, [rows, N] for the pair.
         for (0..8) |i| try testing.expectEqual(shapes[0][i], shapes[1][i]);
         try testing.expectEqual([3]c_int{ 1, @intCast(rows), @intCast(c.kda_heads) }, shapes[1][5]);
     }
-    // A forward of Flash's layers (the verify, a serial step): 5 fewer launches a KDA layer, 1 fewer an MLP.
+    // A forward of Flash's layers (the verify, a serial step): 5 fewer launches a KDA layer, 1 fewer an MLP, 2 fewer a routed
+    // layer's predictor.
     try testing.expectEqual(@as(u32, 170), 5 * c.nKda());
     try testing.expectEqual(@as(u32, 45), c.n_layers);
+    try testing.expectEqual(@as(u32, 84), 2 * c.moeLayers());
+    try testing.expectEqual(@as(u32, 42), c.moeLayers());
     try sdk.testing.expectNoDevice();
 }
 

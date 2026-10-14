@@ -19,7 +19,13 @@ sys.path.insert(0, HERE)
 import compile_kernels_offline as cko  # noqa: E402
 
 KDIR = os.path.join(HERE, "..", "src", "arch", "glm5_next", "kernels")
-MIMO_HEADER = os.path.join(HERE, "..", "src", "arch", "mimo_v2", "kernels", "header_fp8res.metal")
+MIMO_KDIR = os.path.join(HERE, "..", "src", "arch", "mimo_v2", "kernels")
+
+
+def header_text(names):
+    """The header MLX gets for a kernel: its listed header files in order (MiMo's FP8 decoders from mimo_v2's kernels, the
+    rest from glm5_next's)."""
+    return "".join(open(os.path.join(MIMO_KDIR if n == "header_fp8res.metal" else KDIR, n)).read() for n in names)
 
 
 def dims(shape, inst):
@@ -50,20 +56,19 @@ def main():
         print("KERNELS_OFFLINE_COMPILE BAD_INCLUDE %s" % a.mlx_include)
         return 2
     m = json.load(open(os.path.join(KDIR, "manifest-fusion.json")))
-    header = open(MIMO_HEADER).read() + open(os.path.join(KDIR, m["headers"][0]["file"])).read()
     tmp = tempfile.mkdtemp(prefix="glm5n-fusion-offline-")
     if a.ir:
         os.makedirs(a.ir, exist_ok=True)
     n = bad = 0
     for k in m["kernels"]:
-        texts = {"source": open(os.path.join(KDIR, k["source"]["file"])).read(), "header": header}
+        texts = {"source": open(os.path.join(KDIR, k["source"]["file"])).read(), "header": header_text(k["header"])}
         for inst in k["instances"]:
             kk = {"name": k["name"], "outputs": k["outputs"],
                   "inputs": [{"name": i["name"], "dtype": i["dtype"], "shape": dims(i["shape"], inst)} for i in k["inputs"]]}
-            tmpl = [{"name": t, "int": inst[t]} for t in k["template"]]
+            tmpl = [{"name": t, "dtype": inst[t]} if isinstance(inst[t], str) else {"name": t, "int": inst[t]} for t in k["template"]]
             src = cko.assemble(kk, texts, (tmpl, None, {}))
             n += 1
-            tag = "_".join("%s%d" % (t, inst[t]) for t in k["template"])
+            tag = "_".join("%s%s" % (t, inst[t]) for t in k["template"]) + "_m%d" % inst.get("M", 0)
             f = os.path.join(tmp, "%s_%s.metal" % (k["name"], tag))
             open(f, "w").write(src)
             cmd = ["xcrun", "-sdk", "macosx", "metal", "-std=" + a.std, "-fmetal-math-mode=safe", "-I", a.mlx_include]

@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -418,6 +419,32 @@ int mlxlc_test_count_launches(const mlx_vector_array outputs) {
     for (const auto& in : a.inputs()) stack.push_back(in);
   }
   return static_cast<int>(launches.size());
+}
+
+// Tests (CPU, no device: a walk of the unevaluated graph): the primitive of every node reachable from `outputs` (each node
+// once: a multi-output primitive once), names joined by ',' into `out` (at most `cap` bytes with its terminator); returns
+// the nodes, or -1 when the names do not fit.
+int mlxlc_test_graph_ops(const mlx_vector_array outputs, char* out, int cap) {
+  const auto& outs = mlx_vector_array_get_(outputs);
+  std::vector<mx::array> stack(outs.begin(), outs.end());
+  std::unordered_set<std::uintptr_t> visited;
+  std::unordered_set<const void*> prims;
+  std::string names;
+  int n = 0;
+  while (!stack.empty()) {
+    mx::array a = stack.back();
+    stack.pop_back();
+    if (!visited.insert(a.id()).second || !a.has_primitive()) continue;
+    if (prims.insert(&a.primitive()).second) {
+      if (n > 0) names += ",";
+      names += a.primitive().name();
+      n++;
+    }
+    for (const auto& in : a.inputs()) stack.push_back(in);
+  }
+  if (static_cast<int>(names.size()) + 1 > cap) return -1;
+  std::memcpy(out, names.c_str(), names.size() + 1);
+  return n;
 }
 
 }  // extern "C"
