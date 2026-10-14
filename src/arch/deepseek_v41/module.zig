@@ -314,6 +314,12 @@ pub const TurnCall = struct {
     }
 };
 
+/// A footprint bound raised by the bytes the host's other models hold in this process: the bills are this
+/// module's own, and the footprint reading is the whole process's.
+pub fn raisedBound(bound: ?u64, foreign: u64) ?u64 {
+    return if (bound) |b| b +| foreign else null;
+}
+
 /// A boundary's settle check (`checkSettled`): the readings, not a broken invariant. It fails its request only.
 pub fn isSettleRefusal(e: anyerror) bool {
     return e == error.PhaseChangeCacheNotEmpty or e == error.PhaseChangeActiveNotFreed or e == error.PhaseChangeFootprintNotFreed or e == error.PhaseChangeFootprintOverBill;
@@ -1661,7 +1667,7 @@ pub const Module = struct {
             } else reverseBound(terms, scratch);
             const st = settleReadings(LiveReader{ .io = m.io }, x.before, freed, m.installed.phase_change_poll_ms, bound);
             m.reverse_change = .{ .vm_after = if (m.overrides.verify) VmMark.now() else null, .before = x.before, .after = st.after, .freed_bytes = x.before.cache + freed, .settle_ms = st.waited_ms, .bound_bytes = bound, .margin_bytes = @as(i64, @intCast(bound)) - @as(i64, @intCast(st.after.footprint)), .ms = 0 };
-            try checkSettled(x.before, st.after, freed, bound);
+            try checkSettled(x.before, st.after, freed, raisedBound(bound, sdk.memory.foreignBytes()));
         }
 
         /// The prompt's scratch (when the decode freed it) and the prompt cache limit. The record takes the residents route
@@ -1752,7 +1758,7 @@ pub const Module = struct {
         const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms, bound);
         if (v) marks[3] = VmMark.now();
         self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = released_here, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
-        checkSettled(before, st.after, freed_device, bound) catch |e| {
+        checkSettled(before, st.after, freed_device, raisedBound(bound, sdk.memory.foreignBytes())) catch |e| {
             // The readings over the bound: this request fails (nothing grew); the next request's reverse change returns
             // the Module to its prompt configuration on fresh readings. Not latched.
             self.phase_change.?.refused = @errorName(e);
@@ -3182,6 +3188,18 @@ test "dsv41 memory: the phase change's settle poll as a route (poll5): the same 
         try std.testing.expectEqual(@as(usize, phase_change_settle_ms / 5 + 1), i);
         try std.testing.expectError(error.PhaseChangeFootprintNotFreed, checkFreed(before, st.after, 0));
     }
+}
+
+test "dsv41 memory: another model in the process raises the bound by its bytes, never past them" {
+    // A media model loaded into the same process (Krea, 14.73 GB) lifts the footprint over the plugin's own bill.
+    const gb: u64 = 1_000_000_000;
+    const before: BoundaryMemory = .{ .active = 190 * gb, .cache = 0, .footprint = 200 * gb };
+    const after: BoundaryMemory = .{ .active = 180 * gb, .cache = 0, .footprint = 190 * gb };
+    const own_bound: u64 = 176 * gb;
+    try std.testing.expectError(error.PhaseChangeFootprintOverBill, checkSettled(before, after, 10 * gb, own_bound));
+    try checkSettled(before, after, 10 * gb, raisedBound(own_bound, 14_730_000_000));
+    try std.testing.expectError(error.PhaseChangeFootprintOverBill, checkSettled(before, after, 10 * gb, raisedBound(own_bound, 13 * gb)));
+    try std.testing.expectEqual(@as(?u64, null), raisedBound(null, 14_730_000_000));
 }
 
 test "dsv41 memory: until_freed settles on the admission's bound (run 3bj): a reading above it keeps polling, the settled arms pass at once" {
