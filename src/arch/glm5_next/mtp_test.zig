@@ -1688,6 +1688,10 @@ test "glm5_next mtp draft head: the q8 and q4 heads' logit error against the bf1
         if (real) {
             nr = try packHeadRows(a, testing.io, std.mem.span(pack.?), &c, rows, n_rows, 4);
             try testing.expect(nr == n_rows);
+            // A pack whose shard holds no payload (a headers-only stub) is not a reading.
+            var nonzero: usize = 0;
+            for (rows) |w| nonzero += @intFromBool(w != 0);
+            try testing.expect(nonzero > rows.len / 2);
         } else {
             for (rows) |*w| {
                 // An lm_head-like row: N(0, 0.02) with a heavier tail (1 % of the weights at 4x).
