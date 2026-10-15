@@ -1040,9 +1040,6 @@ pub const Module = struct {
         log.info("NATIVE decode host side: end of decode {d} B (after the grow {d} B; footprint {d} B, MLX active {d} B, cache {d} B)\n", .{ self.decode_host.end.?, after, m.footprint, m.active, m.cache });
     }
 
-    /// The rate tally's file read (`expert.tally`; the stream's tally seeded from it: the pins) and the rates its writes
-    /// start from. Nothing without a tally (the default: ratio 0); no file under `expert_tally_file: off` or in test
-    /// builds (their HOME is the box user's).
     /// `resident_seed` at construction (sdk_ext/expert/usage.zig `decide`): `usage` when the pack has
     /// `expert-usage-v1.json` (or by name), each stream layer's empty prompt rows filled from it (`Stream.seedResidents`);
     /// `none` otherwise. A malformed file, or one of another model or geometry, refuses the load by name. One line.
@@ -1067,6 +1064,9 @@ pub const Module = struct {
         }
     }
 
+    /// The rate tally's file read (`expert.tally`; the stream's tally seeded from it: the pins) and the rates its writes
+    /// start from. Nothing without a tally (the default: ratio 0); no file under `expert_tally_file: off` or in test
+    /// builds (their HOME is the box user's).
     fn openTally(self: *Module, config: *const settings.Config) !void {
         if (!config.tally.enabled()) return;
         const st = switch (self.arm) {
