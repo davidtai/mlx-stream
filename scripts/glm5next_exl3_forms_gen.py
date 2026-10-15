@@ -6,7 +6,6 @@ texts'. Run from the repository root; `--check` compares, writes nothing.
 
   g5k3_guone    dsv41_exl3_b3_guone_k3_2304 (gate and up in one launch; unroll 8 kept)        IT, OT
   g5k3_pair     dsv41_exl3_b3_pair_k3_5120  (the down form: a slot's rows paired, one decode)  IT, OT
-  g5k3_gemv_u8  dsv41_exl3_b3_mul1h_k3_2304 (the gate / up GEMV as DeepSeek runs it, unroll 8) IT, OT
   g5k3_gemv_mcg glm5n_exl3_gemv with the mul1 decode replaced by exllamav3's mcg decode (codebook.cuh L67-75:
                 x *= 0xCBAC1FED; x = (x & 0x8FFF8FFF) ^ 0x3B603B60; the f16 sum of its two halves), the bench's
                 codebook price only (no mcg bank is served)
@@ -56,13 +55,6 @@ OUT['g5k3_pair'] = head('g5k3_pair', 'exl3/dsv41_exl3_b3_pair_k3_5120', 'IT, OT'
     ('[row * 5120u', '[row * (uint(OT) * 16u)', 2),
     ('[mate * 5120u', '[mate * (uint(OT) * 16u)', 1),
 ], 'pair')
-OUT['g5k3_gemv_u8'] = head('g5k3_gemv_u8', 'exl3/dsv41_exl3_b3_mul1h_k3_2304', 'IT, OT') + sub(read(SRC, 'dsv41_exl3_b3_mul1h_k3_2304'), [
-    ('* 2211840ul', '* (ulong(IT) * ulong(OT) * 48ul)', 1),
-    ('xh + row * 5120u', 'xh + row * (uint(IT) * 16u)', 1),
-    ('tk < 320u', 'tk < uint(IT)', 1),
-    ('(tk * 144u + tn)', '(tk * uint(OT) + tn)', 1),
-    ('out[row * 2304u', 'out[row * (uint(OT) * 16u)', 1),
-], 'gemv_u8')
 MUL1 = ('                uint rr = window * 0x83DCD12Du;\n'
         '                uint bs = (rr & 0x00FF00FFu) + ((rr >> 8u) & 0x00FF00FFu);\n'
         '                half hs = as_type<half>(ushort((bs * 0x00010001u + 0x64000000u) >> 16u));\n'

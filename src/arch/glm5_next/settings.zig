@@ -199,8 +199,8 @@ pub const DsaSelect = @import("ops.zig").SelectRoute;
 pub const DsaSplitForm = @import("dsa_decode.zig").SplitForm;
 /// The EXL3 family's decode forms (exl3_forms.zig), installed once at construction (exl3_math.zig `Math.init`): the
 /// gate / up form (`exl3_gateup_form`): `seam` (lane B's in_rin, two GEMVs, gu_epi; g22-exl3's chain, the control, by
-/// name), `fused16` / `fused8` (g5k3_gu_fused at 16 or 8 simdgroups), `guone` (DeepSeek's gu_one, the default),
-/// `gemv_u8` (the GEMV at DeepSeek's unroll 8); the down form (`exl3_down_form`): `seam`, `pair` (DeepSeek's down_pair,
+/// name), `fused16` / `fused8` (g5k3_gu_fused at 16 or 8 simdgroups), `guone` (DeepSeek's gu_one, the default); the
+/// down form (`exl3_down_form`): `seam`, `pair` (DeepSeek's down_pair,
 /// the default), `fused1` / `fused2` (din_rin + g5k3_dn_fused over 1 / 2 blocks), `pro1` / `pro2` (g5k3_dn_pro);
 /// `exl3_forms_maxm` the fused forms' union rule (1, the default, or 4); `exl3_forms_min_p` the narrowest wave the
 /// fused forms take (1 .. 64, default 1; narrower waves run the seam chain). The mcg GEMV is the bench's codebook
@@ -209,7 +209,7 @@ pub const DsaSplitForm = @import("dsa_decode.zig").SplitForm;
 /// form other than the seam on an NVFP4 pack refuses the load by name. The default is batch 27's measured pair
 /// (g22-exl3b at 190/217, lane on, draft_depth 3 + draft_gate 0.5: guone + pair +1.79 % decode over the seam beyond
 /// noise, ids identical); on an NVFP4 pack it is inert (that source installs no form).
-pub const Exl3GateUpForm = enum { seam, fused16, fused8, guone, gemv_u8 };
+pub const Exl3GateUpForm = enum { seam, fused16, fused8, guone };
 pub const Exl3DownForm = enum { seam, pair, fused1, fused2, pro1, pro2 };
 pub const Exl3Forms = struct {
     gateup: Exl3GateUpForm = .guone,
@@ -228,7 +228,6 @@ pub const Exl3Forms = struct {
                 .fused16 => .fused16,
                 .fused8 => .fused8,
                 .guone => .guone,
-                .gemv_u8 => .u8,
             },
             .dn = switch (f.down) {
                 .seam => .seam,
@@ -1167,9 +1166,9 @@ test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the 
         try c.validate();
         try testing.expectEqual(gu, c.exl3_forms.gateup);
         try testing.expectEqual(dn, c.exl3_forms.down);
-        // the forms' names are the settings' (gemv_u8 = u8)
+        // the forms' names are the settings'
         const f = c.exl3_forms.forms();
-        try testing.expectEqualStrings(if (gu == .gemv_u8) "u8" else @tagName(gu), @tagName(f.gu));
+        try testing.expectEqualStrings(@tagName(gu), @tagName(f.gu));
         try testing.expectEqualStrings(@tagName(dn), @tagName(f.dn));
         // a non-seam form on the NVFP4 pack refuses by name
         c.expert_family = .nvfp4;
@@ -1185,6 +1184,8 @@ test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the 
         .{ "{\"exl3_gateup_form\":\"gemv_mcg\"}", error.Glm5NextExl3GateUpFormSetting },
         .{ "{\"exl3_gateup_form\":\"mcg\"}", error.Glm5NextExl3GateUpFormSetting },
         .{ "{\"exl3_gateup_form\":\"pair\"}", error.Glm5NextExl3GateUpFormSetting },
+        // the retired u8 form (superseded by guone)
+        .{ "{\"exl3_gateup_form\":\"gemv_u8\"}", error.Glm5NextExl3GateUpFormSetting },
         .{ "{\"exl3_gateup_form\":1}", error.Glm5NextExl3GateUpFormSetting },
         .{ "{\"exl3_down_form\":\"mcg\"}", error.Glm5NextExl3DownFormSetting },
         .{ "{\"exl3_down_form\":\"fused3\"}", error.Glm5NextExl3DownFormSetting },
