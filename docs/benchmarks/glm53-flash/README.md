@@ -22,7 +22,7 @@ g25-dsa3 is g25-dsa plus the MTP head's side rows. That lever measured +2.79 % o
 (g26bin-vs-dsa3) against g26-dsa2's +1.61 % for the tail fix alone (g26bin-vs-dsa2, a different window): about +0.4 % for the side rows; it is exact and was stacked without its own exact
 pair (small exact positives stack, judged by the stack's next pair).
 
-Which stack is the headline is a policy choice:
+The headline is the q8 draft head (decision of 2026-10-15): **36.30 tok/s decode / 1,086.0 tok/s prefill at 199/225** (g26-dsa3 class; on this branch `"draft_head": "q8"`), with 34.95 / 1,093.0 at the standard 190/217 pin. The exact stack (34.50 / 1,077.1 at 199/225) stays the default and the exact reference. The two classes:
 
 - **g25-dsa3** (exact): every token id equals the serial path's at equal rows. Choose it when the headline must be exact.
 - **g26-dsa3** (rounding-class): the q8 head changes which drafts the lane offers, so ids diverge from the exact stack
