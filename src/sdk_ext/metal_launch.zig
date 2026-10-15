@@ -12,7 +12,6 @@ const mlx = @import("sdk").mlx;
 extern "c" fn mlxlc_kernel_new(name: [*c]const u8, input_names: mlx.mlx_vector_string, output_names: mlx.mlx_vector_string, source: [*c]const u8, header: [*c]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx.mlx_fast_metal_kernel;
 extern "c" fn mlxlc_kernel_free(k: mlx.mlx_fast_metal_kernel) void;
 extern "c" fn mlxlc_apply(outputs: *mlx.mlx_vector_array, k: mlx.mlx_fast_metal_kernel, inputs: mlx.mlx_vector_array, config: mlx.mlx_fast_metal_kernel_config, stream: mlx.mlx_stream) c_int;
-extern "c" fn mlxlc_counts(out: *[2]i64) void;
 
 pub fn mlx_fast_metal_kernel_new(name: [*c]const u8, input_names: mlx.mlx_vector_string, output_names: mlx.mlx_vector_string, source: [*c]const u8, header: [*c]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx.mlx_fast_metal_kernel {
     return mlxlc_kernel_new(name, input_names, output_names, source, header, ensure_row_contiguous, atomic_outputs);
@@ -25,14 +24,6 @@ pub fn mlx_fast_metal_kernel_free(k: mlx.mlx_fast_metal_kernel) void {
 
 pub fn mlx_fast_metal_kernel_apply(outputs: *mlx.mlx_vector_array, k: mlx.mlx_fast_metal_kernel, inputs: mlx.mlx_vector_array, config: mlx.mlx_fast_metal_kernel_config, stream: mlx.mlx_stream) c_int {
     return mlxlc_apply(outputs, k, inputs, config, stream);
-}
-
-/// MLX applies and pipeline resolutions since the process started (cold paths; tests).
-pub const Counts = struct { mlx_applies: i64, resolved: i64 };
-pub fn counts() Counts {
-    var c: [2]i64 = undefined;
-    mlxlc_counts(&c);
-    return .{ .mlx_applies = c[0], .resolved = c[1] };
 }
 
 // ---- CPU tests (no device: graphs are built on an explicit GPU stream and never evaluated) ----

@@ -30,11 +30,12 @@ namespace mx = mlx::core;
 
 namespace {
 
-enum Kind : int { KIND_NULL = 0, KIND_METAL = 1, KIND_HOST = 2 };
+enum Kind : int { KIND_METAL = 1, KIND_HOST = 2 };
 
 // Kept for the process life: primitives and the pool hold raw pointers.
 struct EventRec {
-  int kind = KIND_NULL;
+  explicit EventRec(int k) : kind(k) {}
+  int kind;
   MTL::SharedEvent* mtl = nullptr;
   int64_t* word = nullptr;
   int64_t timeout_ns = 0;
@@ -175,8 +176,7 @@ int32_t dsv41ev_create_metal(uint64_t start, uint64_t* object) {
       return 0;
     }
     e->setSignaledValue(start);
-    auto* rec = new EventRec();
-    rec->kind = KIND_METAL;
+    auto* rec = new EventRec(KIND_METAL);
     rec->mtl = e;
     *object = reinterpret_cast<uint64_t>(e);
     return add(rec);
@@ -191,15 +191,10 @@ int32_t dsv41ev_create_host(int64_t* word, int64_t timeout_ns) {
     g_error = "a host event needs an aligned int64 word and a positive timeout";
     return 0;
   }
-  auto* rec = new EventRec();
-  rec->kind = KIND_HOST;
+  auto* rec = new EventRec(KIND_HOST);
   rec->word = word;
   rec->timeout_ns = timeout_ns;
   return add(rec);
-}
-
-int32_t dsv41ev_create_null(void) {
-  return add(new EventRec());
 }
 
 int dsv41ev_wait(const mlx_array* xs, size_t n, int32_t event, uint64_t value, const mlx_array* deps, size_t n_deps,

@@ -20,7 +20,6 @@
 // Same pipeline, same arguments: bit-identical results. Built against MLX 0.32.x (64ea011c) headers: CustomKernel's
 // state() layout, Device's cache lookups and the mlx-c config struct below are re-verified on every MLX bump (the CPU
 // test `metal_launch` checks the config layout through mlx-c's setters).
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -83,7 +82,6 @@ struct Cache {
 
 std::mutex g_mu;
 std::unordered_map<void*, std::shared_ptr<Cache>> g_caches;  // keyed by the mlx-c kernel object
-std::atomic<int64_t> g_counts[2];                            // MLX applies, resolutions (cold paths only; tests)
 
 std::shared_ptr<Cache> cache_of(void* ctx) {
   std::lock_guard<std::mutex> lk(g_mu);
@@ -190,7 +188,6 @@ int mlx_apply(mlx_vector_array* outputs, mlx_fast_metal_kernel cls, mlx_vector_a
                const std::vector<mx::array>& ins) {
   const int rc = mlx_fast_metal_kernel_apply(outputs, cls, inputs, config, stream);
   if (rc != 0) return rc;
-  g_counts[0]++;
   const auto& outs = mlx_vector_array_get_(*outputs);
   if (outs.empty() || !outs[0].has_primitive()) return 0;
   auto& prim = outs[0].primitive();
@@ -261,10 +258,7 @@ int mlxlc_apply(mlx_vector_array* outputs, mlx_fast_metal_kernel cls, const mlx_
         lib = d.get_library(v->lib_name, mx::CompileOptions{}, []() -> std::string { throw mlxlc::NotBuilt{}; });
       } catch (const mlxlc::NotBuilt&) {
       }
-      if (lib != nullptr) {
-        v->pipeline = d.get_kernel(v->kernel_name, lib);
-        mlxlc::g_counts[1]++;
-      }
+      if (lib != nullptr) v->pipeline = d.get_kernel(v->kernel_name, lib);
     }
     if (v == nullptr || v->pipeline == nullptr) {
       return mlxlc::mlx_apply(outputs, cls, inputs, config, stream, *cache, v, cfg, ins);
@@ -375,11 +369,6 @@ int mlxlc_test_bench(mlx_fast_metal_kernel k, mlx_fast_metal_kernel_config confi
     g_error = e.what();
     return -1;
   }
-}
-
-// MLX applies and pipeline resolutions since the process started (tests; cached launches are not counted).
-void mlxlc_counts(int64_t out[2]) {
-  for (int i = 0; i < 2; i++) out[i] = mlxlc::g_counts[i].load();
 }
 
 // Tests (CPU, no device): an explicit GPU stream object for graphs that are built and never evaluated (index 0, never
