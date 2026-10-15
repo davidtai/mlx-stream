@@ -208,7 +208,7 @@ pub fn SourceOf(comptime fam: Family) type {
         /// Construction (the GPU stream, under the caller's lock): the bank opened, the stream at `rows`, the scheduler
         /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
         /// routed layer's.
-        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings) !*Self {
+        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, exl3_forms: settings.Exl3Forms) !*Self {
             const Bm = Fam.Bridge;
             const bm = Fam.bank;
             var open_diag: sdk.Diag = .{};
@@ -281,7 +281,7 @@ pub fn SourceOf(comptime fam: Family) type {
                 // The exl3 family's math: the GLM-shape EXL3 texts installed (their pins, kernels, decode launches per wave
                 // width and compile check), refused by name; MiMo's predictor as the NVFP4 family binds it.
                 var diag: sdk.Diag = .{};
-                var m = Fam.Math.init(a, stream, exl3_math.max_call_rows, &diag) catch |e| {
+                var m = Fam.Math.init(a, stream, exl3_math.max_call_rows, exl3_forms.forms(), &diag) catch |e| {
                     log.err("glm5_next: the exl3 expert texts refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
                     return e;
                 };
@@ -344,6 +344,8 @@ pub fn SourceOf(comptime fam: Family) type {
             if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
             if (comptime fam == .exl3) {
                 log.info("glm5_next experts: exl3 k3 mul1 routes (decode_moe={s}: DeepSeek-V4.1's banked PREP=rin chain at hidden {d} / inter {d}, in_rin + gate/up mul1h GEMVs + gu_epi + din_rin + down mul1h GEMV + dpost(bf16), one launch each per wave over the three banks{s}; prompt: DIG-X waves of <= {d} rows / {d} experts, take2 + gate|up GEMM (m128) + onepass + down GEMM (m128) + rot_widen1(bf16); bank {d} x {d} records of {d} B, codebook mul1 0x{X}, no global-scale word: scale-line isolation not applicable; the NVFP4 draft bank unchanged)\n", .{ @tagName(decode_moe), exl3_kernels.hidden, exl3_kernels.inter, if (decode_moe == .hitpass) ", each call's hit wave from the layer's resident slot LUT" else if (decode_moe == .stock) ", unbanked: one group per bank" else "", exl3_math.wave_rows, @import("../../exl3/quant.zig").wave_max, geo.num_moe_layers, geo.num_experts, geo.record_bytes, exl3_kernels.codebook_multiplier });
+                // The decode forms bound at Math.init (`exl3_gateup_form` / `exl3_down_form`; seam = lane B's chain above).
+                log.info("glm5_next experts: exl3 k3 forms gateup={s} down={s} maxm={d} min_p={d}\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down), exl3_forms.maxm, exl3_forms.min_p });
             } else switch (decode_moe) {
                 .stock => {},
                 .fused => log.info("glm5_next decode experts installed: decode_moe=fused (the NVFP4 k1 texts over the three banks, one launch of each per wave; the hit wave routed on the host)\n", .{}),
