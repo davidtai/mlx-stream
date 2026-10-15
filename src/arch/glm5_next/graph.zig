@@ -183,8 +183,8 @@ pub const Weights = struct {
             };
             const lg: L = .{ .pre = pre, .map = map, .diag = diag, .c = c, .l = l, .route = fp8_route };
             lw.* = .{
-                .input_norm = try lg.get("input_layernorm.weight", &.{h}),
-                .post_norm = try lg.get("post_attention_layernorm.weight", &.{h}),
+                .input_norm = try checked(lg, "input_layernorm.weight", &.{h}, l, diag),
+                .post_norm = try checked(lg, "post_attention_layernorm.weight", &.{h}, l, diag),
                 .hc_attn = .{
                     .fn_rows = try w.own(a, try f32Copy(s, try lg.get("hc_attn_fn", &.{ hc_mix, hch }), false)),
                     .base = try w.own(a, try f32Copy(s, try lg.get("hc_attn_base", &.{hc_mix}), false)),
@@ -375,7 +375,7 @@ fn aLogCheck(dt: mlx.mlx_dtype, layer: u32, diag: ?*sdk.Diag) !void {
 }
 
 /// Which layers hold a rule's tensor.
-pub const RuleLayers = enum { kda, moe };
+pub const RuleLayers = enum { all, kda, moe };
 /// A per-layer tensor a route reads in its stored dtype (or converts once at the bind), the layers that hold it, and the
 /// dtypes the bind takes for it. One table: the bind's refusals (`dtypeCheck`) and the pack-header test (GLM5_BANK) read
 /// it, so a real pack's dtype is checked against every route before a load, never found by a refusal in a window.
@@ -391,6 +391,9 @@ pub const dtype_rules = [_]DtypeRule{
     .{ .suffix = "self_attn.f_b_proj.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
     .{ .suffix = "self_attn.g_b_proj.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
     .{ .suffix = "self_attn.o_norm.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    // The mHC norms: hcPre's plan (ops.HcPlan) launches every sublayer's norm in the stream's dtype (BF16).
+    .{ .suffix = "input_layernorm.weight", .layers = .all, .accepted = &.{.bfloat16}, .desc = "BF16 (the stream's dtype)" },
+    .{ .suffix = "post_attention_layernorm.weight", .layers = .all, .accepted = &.{.bfloat16}, .desc = "BF16 (the stream's dtype)" },
     // The router: the glue's router text and the BF16 predictor read the weight as BF16; the correction bias is F32.
     .{ .suffix = "mlp.gate.weight", .layers = .moe, .accepted = &.{.bfloat16}, .desc = "BF16" },
     .{ .suffix = "mlp.gate.e_score_correction_bias", .layers = .moe, .accepted = &.{.float32}, .desc = "F32" },
@@ -619,6 +622,39 @@ pub const Routing = struct { indices: T, weights: T };
 /// (~15 ms a layer in the profile), so the call's plans and reads start that much sooner in a drive-bound MoE stage; the
 /// GPU runs the shared expert behind the router, ahead of the first group's tiles. The same graphs and values, only the
 /// commit order moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+/// Prefill host idle (g21c profile: the tail -> next layer's attention gap, 5.2 ms a layer, GPU idle while the host purged
+/// MLX's cache after the tail's evaluation): a prompt layer's purge (`Source.promptLayerEnd`: MLX's cache cleared once
+/// half full) runs after the next layer's first attention span is committed, so the GPU starts that span first. The
+/// cache stays under its limit (MLX frees on allocation past it), so no bill term moves; no value changes: exact.
+pub const DeferredPurge = struct {
+    pending: bool = false,
+
+    pub fn layerEnd(p: *DeferredPurge) void {
+        p.pending = true;
+    }
+
+    pub fn afterFirstCommit(p: *DeferredPurge, src: anytype) void {
+        if (!p.pending) return;
+        p.pending = false;
+        src.promptLayerEnd();
+    }
+};
+
+/// Prefill host idle (g21c profile: the dense stage's GPU idle, ~5-7 ms a routed layer while the host built the 16 spans'
+/// collapse and norm graphs with nothing committed): a prompt call's span collapse and norm committed as built. The same
+/// graph and values, only the commit point moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+/// Decode host idle (g21c profile, 684 of 1,024 serial forwards: 5.7 ms a forward of GPU idle inside call -> barrier,
+/// while the host built each routed layer's attention, glue and router with nothing committed after the previous layer's
+/// miss parts): a decode-lane layer's attention output committed as built. The same graph and values, only the commit
+/// point moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+pub fn commitAttention(comptime Ops: type, g: *Ops, out: Ops.T) !void {
+    try g.asyncEval(&.{out});
+}
+
+pub fn commitSpanNorm(comptime Ops: type, g: *Ops, normed: Ops.T) !void {
+    try g.asyncEval(&.{normed});
+}
+
 pub fn commitRoutingFirst(comptime Ops: type, g: *Ops, indices: Ops.T, weights: Ops.T, shared: Ops.T) !void {
     try g.asyncEval(&.{ indices, weights });
     try g.asyncEval(&.{shared});
@@ -778,6 +814,8 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
     // Prompt lever 5: the next routed layer's predictor, built and evaluated with each layer's output.
     var ahead: Ahead = .{};
     defer ahead.release(g);
+    // Prefill host idle: a prompt layer's cache purge runs after the next layer's first span is committed.
+    var purge: DeferredPurge = .{};
     for (w.layers, 0..) |*lw, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
@@ -812,6 +850,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             commit[0] = next;
             @memcpy(commit[1 .. 1 + b.len], b);
             try g.asyncEval(commit[0 .. 1 + b.len]);
+            if (i == 0) purge.afterFirstCommit(src);
             if (prev) |p| try g.evalAll(&.{p});
             prev = next;
         }
@@ -826,6 +865,9 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             cl.* = try ops.collapse(g.s, sp, lw.hc_ffn.fn_rows, lw.hc_ffn.scale, lw.hc_ffn.base, c.hc_iters, c.hc_eps, c.rms_norm_eps);
             n_cols += 1;
             nx.* = try rmsNorm(g, cl.x, lw.post_norm, c.rms_norm_eps);
+            // Prefill host idle: a prompt call commits each span's collapse and norm as built (the GPU runs them while
+            // the host builds the next span's), as the attention loop commits its spans; decode stays lazy.
+            if (prompt) try commitSpanNorm(G, g, nx.*);
         }
         const x = try g.reshape(if (n_spans == 1) normed[0] else try g.concat(normed, 1), &.{ @intCast(rows), hidden });
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, x, rows) else try mlpDecode(g, c, d, x, routes.swiglu, .dense, rows)) else blk: {
@@ -869,11 +911,12 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
                 n_outs += 1;
             }
             try g.evalAll(outs[0..n_outs]);
-            src.promptLayerEnd();
+            purge.layerEnd();
             // `fp8_block128`: the layer's BF16 weights released (no later layer reads them; fp8.zig `promptBytes`).
             if (w.fp8) |r| r.layerEnd();
         }
     }
+    purge.afterFirstCommit(src);
     if (comptime ptl.enabled) ptl.leaveLayers();
     cache.len = start + rows;
     if (head == .dump) try dumpRows(g, c, w, spans, sink);
@@ -933,9 +976,9 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
         defer g.resetTo(m);
         // The attention sublayer: its collapse and norm, with the previous sublayer's expand (none before layer 0).
         const pa = if (pend) |*p|
-            try glue.pre(g, c, null, &p.deferred, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, lw.input_norm)
+            try glue.pre(g, k, null, &p.deferred, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, lw.input_norm)
         else
-            try glue.pre(g, c, stream, null, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, lw.input_norm);
+            try glue.pre(g, k, stream, null, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, lw.input_norm);
         if (pend) |*p| {
             p.release(g);
             pend = null;
@@ -950,9 +993,12 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
                 try routes.kda.run(routes.kda.ctx, g, c, kw, pa.normed, &cache.kda[lw.slot]),
             .dsa => |*dw| try dsa.forward(g, c, dw, pa.normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes.dsa),
         };
+        // Decode host idle: the attention sublayer committed as built (the GPU runs it while the host builds the FFN's
+        // glue and router up to the routing barrier).
+        try commitAttention(G, g, out);
         pend = Pending.of(g, out, pa.post, pa.comb, stream);
         // The FFN sublayer: the attention's expand folded into its collapse and norm.
-        const pf = try glue.pre(g, c, null, &pend.?.deferred, lw.hc_ffn.fn_rows, lw.hc_ffn.scale, lw.hc_ffn.base, lw.post_norm);
+        const pf = try glue.pre(g, k, null, &pend.?.deferred, lw.hc_ffn.fn_rows, lw.hc_ffn.scale, lw.hc_ffn.base, lw.post_norm);
         pend.?.release(g);
         pend = null;
         g.release(stream);
@@ -969,7 +1015,7 @@ fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32
     }
     cache.len = start + rows;
     // The last sublayer's expand, materialized: the stream the head reads.
-    const final = try g.adopt(try pend.?.deferred.materialize(g.s));
+    const final = try g.adopt(try ops.materialize(g.s, &k.hc, &pend.?.deferred));
     const spans = [_]T{final};
     if (head == .hidden or head == .verify) {
         const final_rows = try normedRows(g, c, w, &spans, rows);
@@ -1026,6 +1072,7 @@ test {
     _ = @import("swiglu.zig");
     _ = @import("fp8.zig");
     _ = @import("fp8_parity.zig");
+    _ = @import("determinism_gpu.zig");
 }
 
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {
@@ -1056,6 +1103,54 @@ test "glm5_next graph: prompt lever 4 commits the routing barrier's ids and weig
     try testing.expectEqualSlices(Trace.T, &.{shared}, g.committed.items[g.commit_spans.items[1][0]..g.commit_spans.items[1][1]]);
     // Only the two commit markers: no node of a graph is built or evaluated here.
     try testing.expectEqual(nodes + 2, g.nodes.items.len);
+    try testing.expectEqual(@as(usize, 0), g.evals.items.len);
+}
+
+test "glm5_next graph: decode host idle commits a layer's attention output alone, as built (one commit; nothing evaluated)" {
+    const Trace = ops_be.TraceOps;
+    var g = Trace.init(testing.allocator);
+    defer g.deinit();
+    const out = try g.input(&.{ 1, 1, 4096 }, .bfloat16);
+    const nodes = g.nodes.items.len;
+    try commitAttention(Trace, &g, out);
+    try testing.expectEqual(@as(usize, 1), g.commit_spans.items.len);
+    try testing.expectEqualSlices(Trace.T, &.{out}, g.committed.items[g.commit_spans.items[0][0]..g.commit_spans.items[0][1]]);
+    try testing.expectEqual(nodes + 1, g.nodes.items.len);
+    try testing.expectEqual(@as(usize, 0), g.evals.items.len);
+}
+
+test "glm5_next graph: prefill host idle's deferred purge runs once, after the next layer's first commit, and at the pass's end" {
+    const Fake = struct {
+        purges: u32 = 0,
+        pub fn promptLayerEnd(f: *@This()) void {
+            f.purges += 1;
+        }
+    };
+    var src: Fake = .{};
+    var p: DeferredPurge = .{};
+    p.afterFirstCommit(&src); // layer 0's first span: nothing pending
+    try testing.expectEqual(@as(u32, 0), src.purges);
+    p.layerEnd(); // layer 0's end: deferred
+    try testing.expectEqual(@as(u32, 0), src.purges);
+    p.afterFirstCommit(&src); // layer 1's first span committed: layer 0's purge
+    try testing.expectEqual(@as(u32, 1), src.purges);
+    p.afterFirstCommit(&src); // no second purge
+    try testing.expectEqual(@as(u32, 1), src.purges);
+    p.layerEnd();
+    p.afterFirstCommit(&src); // the pass's end
+    try testing.expectEqual(@as(u32, 2), src.purges);
+}
+
+test "glm5_next graph: prefill host idle commits a span's collapse and norm alone, as built (one commit; nothing evaluated)" {
+    const Trace = ops_be.TraceOps;
+    var g = Trace.init(testing.allocator);
+    defer g.deinit();
+    const normed = try g.input(&.{ 1, 1024, 4096 }, .bfloat16);
+    const nodes = g.nodes.items.len;
+    try commitSpanNorm(Trace, &g, normed);
+    try testing.expectEqual(@as(usize, 1), g.commit_spans.items.len);
+    try testing.expectEqualSlices(Trace.T, &.{normed}, g.committed.items[g.commit_spans.items[0][0]..g.commit_spans.items[0][1]]);
+    try testing.expectEqual(nodes + 1, g.nodes.items.len);
     try testing.expectEqual(@as(usize, 0), g.evals.items.len);
 }
 
@@ -1274,6 +1369,7 @@ test "glm5_next graph: every tensor the routes bind has a dtype its rule takes i
         var l: u32 = 0;
         while (l < c.n_layers) : (l += 1) {
             const holds = switch (r.layers) {
+                .all => true,
                 .kda => !c.isDsa(l),
                 .moe => c.isMoe(l),
             };

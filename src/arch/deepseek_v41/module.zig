@@ -46,6 +46,8 @@ const ds = @import("dspark.zig");
 const log = @import("sdk").log;
 
 const G = ops.MlxOps;
+/// The plugin's draw for every row handed to the host (`sdk_ext.sampler`): bound per request by `draft_lane.arm`.
+pub const Sampler = @import("../../sdk_ext.zig").sampler.SamplerOf(G);
 const expert_stream = @import("../../expert/stream.zig");
 const expert_event = sdk_ext.expert.event;
 const expert_io = sdk_ext.expert.io;
@@ -517,6 +519,8 @@ const envelope = expert_admission.Envelope.dsv41_pass2;
 pub const Module = struct {
     gpa: std.mem.Allocator,
     g: G,
+    /// The request's sampler (mlx-stream's one stream): the first token and every serial step's, a clean request's.
+    sampler: Sampler,
     /// The load context's kernel set, its launcher installed on `g`.
     set: *kernel_set.Set,
     /// The EXL3 quant accepted on the set: the served routed-expert math (C2).
@@ -627,8 +631,10 @@ pub const Module = struct {
         };
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .set = undefined, .exl3 = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
+        self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .set = undefined, .exl3 = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined, .sampler = undefined };
         errdefer self.g.deinit();
+        self.sampler = try Sampler.init(gpa, s);
+        errdefer self.sampler.deinit();
         self.owner = std.Thread.getCurrentId();
         self.io = io;
         self.overrides = ov;
@@ -1136,6 +1142,7 @@ pub const Module = struct {
         self.dropArm();
         self.gpa.free(self.warm_peaks);
         self.dropKernels();
+        self.sampler.deinit();
         self.g.deinit();
         setCacheLimit(self.prev_cache_limit);
         gpa.destroy(self);

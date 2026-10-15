@@ -37,7 +37,10 @@ follows the host's `glm_mtp.zig`; its oracle is mlx-vlm's `glm5_next_mtp`.
 
 1. **Settings key (`settings.zig`).** `mtp_lane` keeps its parse and its malformed refusal
    (`Glm5NextMtpLaneSetting`). Drop the `Glm5NextMtpLaneNotServed` refusal in `validate`. The default stays `false`
-   (the serial control) until a window measures the lane.
+   (the serial control) until a window measures the lane. `draft_depth` (1 .. 3, default 3, else
+   `Glm5NextDraftDepthRange`) sets the drafts per round; the lanes, the bill and the host's block stay sized at 3.
+   `draft_gate` (theta in [0, 1), default 0 = off, else `Glm5NextDraftGateRange`) verifies the leading drafts whose
+   cumulative top-1 probability stays at or above theta.
 
 2. **Residents (`graph.keptResident` / `module.dropUnread`).** With the lane on, also keep every name for which
    `mtp.isResident(c, name)` is true: 25 tensors, 369,670,784 B. Then `weights.materialize()` reads them with the

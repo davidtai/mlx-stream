@@ -19,6 +19,8 @@ const bank_mod = @import("bank.zig");
 const kv_storage = @import("kv.zig");
 const profile = @import("profile.zig");
 const draft = @import("draft.zig");
+/// The plugin's draw for every row handed to the host (`sdk_ext.sampler`): bound per request by `draft_lane.arm`.
+pub const Sampler = @import("../../sdk_ext.zig").sampler.SamplerOf(@import("../deepseek_v41/ops.zig").MlxOps);
 const dt = @import("../deepseek_v41/decode_timers.zig");
 const expert_policy = @import("../../sdk_ext.zig").expert.policy;
 const route_trace = @import("route_trace.zig");
@@ -162,6 +164,8 @@ pub const Module = struct {
     trace: if (profile.enabled) ?*route_trace.Trace else void = if (profile.enabled) null else {},
     /// X20: the P7 install line's parts and its per-request form (`P7Line`), installed once at construction.
     p7_line: P7Line = .{},
+    /// The request's sampler (mlx-stream's one stream): the first token and every serial step's, a clean request's.
+    sampler: Sampler = undefined,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *host.Weights, s: Stream, ceiling: u64, stop: u64) !*Module {
         // The box's file-backed pages before any resident byte is read (the nocache reader fills the arrays lazily,
@@ -252,6 +256,8 @@ pub const Module = struct {
         errdefer a.destroy(self);
         const decode_host = bills.decodeHostTerms(config.*, plan.reserve);
         self.* = .{ .a = a, .s = s, .c = c, .source = source, .predictor_gates = gates, .embed = embed, .head = head, .norm = norm, .layers = layers, .value_scale = scale, .norm_ones = ones, .full_rope_freq = full_freq, .sliding_rope_freq = sliding_freq, .context_bound = plan.reserve, .decode_host_billed = decode_host.host, .decode_compiler_billed = decode_host.compiler, .previous_cache_limit = previous, .fp8 = fp8, .closes_prompt_route = config.decodeClosesPromptRoute() };
+        self.sampler = try Sampler.init(a, s);
+        errdefer self.sampler.deinit();
         // The MTP lane: its heads load (every tensor's sha256 verified) only when the lane is set, before the
         // construction check that their bill term covers.
         if (config.mtp_heads) {
@@ -423,6 +429,7 @@ pub const Module = struct {
         };
         for (&self.caches) |*cache| cache.deinit();
         if (self.lane) |l| l.deinit();
+        self.sampler.deinit();
         self.nax.deinit();
         self.source.deinit();
         self.a.free(self.predictor_gates);

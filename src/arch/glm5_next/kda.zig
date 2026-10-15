@@ -224,11 +224,83 @@ var kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 var seq_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
-/// The recurrence's kernel objects (the stock one and the verify's capture variant), built once at construction (no
-/// device work: a library compiles at its first dispatch); a forward only reads them.
-pub fn install() !void {
+/// The recurrence's prepared launches at 1 .. `plan_rows` rows (the decode lane, the MTP verify): each text's config and
+/// the row-count scalar `T` (and the capture's stride), built once by `install` for the model's heads and head dim; a
+/// launch at those rows indexes them, a wider one (a prompt span on the per-token route) builds its own.
+pub const plan_rows: usize = 8;
+const Plan = struct {
+    hv: c_int = 0,
+    dk: c_int = 0,
+    cfg: [plan_rows]mlx.mlx_fast_metal_kernel_config = @splat(.{ .ctx = null }),
+    cfg_seq: [plan_rows]mlx.mlx_fast_metal_kernel_config = @splat(.{ .ctx = null }),
+    t: [plan_rows]mlx.mlx_array = @splat(.{ .ctx = null }),
+    stride: mlx.mlx_array = .{ .ctx = null },
+};
+var plan: Plan = .{};
+
+/// The recurrence's kernel objects (the stock one and the verify's capture variant) and their launches at the decode
+/// lane's row counts, built once at construction for `c`'s geometry (no device work: a library compiles at its first
+/// dispatch); a forward only reads them. A second model of another geometry is refused by name (the launches are the
+/// process's).
+pub fn install(c: *const glm.Config) !void {
     _ = try recurKernel();
     _ = try recurSeqKernel();
+    const hv: c_int = @intCast(c.kda_heads);
+    const dk: c_int = @intCast(c.kda_head_dim);
+    if (plan.hv != 0) {
+        if (plan.hv != hv or plan.dk != dk) return error.Glm5NextKdaPlanGeometry;
+        return;
+    }
+    var p: Plan = .{ .hv = hv, .dk = dk };
+    errdefer freePlan(&p);
+    for (0..plan_rows) |i| {
+        const rows: c_int = @intCast(i + 1);
+        p.cfg[i] = try recurConfig(rows, hv, dk);
+        p.cfg_seq[i] = try recurSeqConfig(rows, hv, dk);
+        p.t[i] = mlx.mlx_array_new_int(rows);
+    }
+    p.stride = mlx.mlx_array_new_int(hv * dk * dk);
+    plan = p;
+}
+
+fn freePlan(p: *Plan) void {
+    for (p.cfg ++ p.cfg_seq) |x| if (x.ctx != null) {
+        _ = mlx.mlx_fast_metal_kernel_config_free(x);
+    };
+    for (p.t ++ [_]mlx.mlx_array{p.stride}) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+    p.* = .{};
+}
+
+fn recurConfig(rows: c_int, hv: c_int, dk: c_int) !mlx.mlx_fast_metal_kernel_config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, hv, dk }, 4, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, hv, dk, dk }, 4, .float32));
+    try recurCommon(cfg, hv, dk);
+    return cfg;
+}
+
+fn recurSeqConfig(rows: c_int, hv: c_int, dk: c_int) !mlx.mlx_fast_metal_kernel_config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, hv, dk }, 4, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, 1, hv, dk, dk }, 5, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, hv, dk, dk }, 4, .float32));
+    try recurCommon(cfg, hv, dk);
+    return cfg;
+}
+
+fn recurCommon(cfg: mlx.mlx_fast_metal_kernel_config, hv: c_int, dk: c_int) !void {
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, dk, hv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 4, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OutT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Dk", dk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Dv", dk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Hk", hv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Hv", hv));
 }
 
 fn recurSeqKernel() !mlx.mlx_fast_metal_kernel {
@@ -249,24 +321,13 @@ const RecurSeq = struct { y: T, state: T, seq: T };
 
 /// `recur` with every row's state but the last written to `seq` f32 [rows, 1, hv, dv, dk] (the host's `capture_seq`).
 fn recurSeq(g: *G, q: T, k: T, v: T, gate: T, beta: T, state: T, rows: c_int, hv: c_int, dk: c_int) !RecurSeq {
-    const kern = try recurSeqKernel();
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, hv, dk }, 4, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, 1, hv, dk, dk }, 5, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, hv, dk, dk }, 4, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, dk, hv));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 4, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OutT", .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Dk", dk));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Dv", dk));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Hk", hv));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Hv", hv));
-    const t_arr = try g.adopt(mlx.mlx_array_new_int(rows));
-    // The per-row stride into `state_seq`: B * Hv * Dv * Dk (B = 1).
-    const stride = try g.adopt(mlx.mlx_array_new_int(hv * dk * dk));
-    const ins = [_]T{ q, k, v, gate, beta, state, t_arr, stride };
+    const kern = seq_kernel.?;
+    // The verify's rows (<= `plan_rows`) on the installed plan (its config, its row-count scalar, the per-row stride into
+    // `state_seq`: B * Hv * Dv * Dk, B = 1).
+    std.debug.assert(rows >= 1 and rows <= plan_rows and hv == plan.hv and dk == plan.dk);
+    const ri: usize = @intCast(rows - 1);
+    const cfg = plan.cfg_seq[ri];
+    const ins = [_]T{ q, k, v, gate, beta, state, plan.t[ri], plan.stride };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -298,20 +359,16 @@ fn recurKernel() !mlx.mlx_fast_metal_kernel {
 /// The delta rule over `rows` tokens: q, k, v [1, R, hv, dk] bf16, the gate f32 [1, R, hv * dk], beta [1, R, hv], the
 /// state f32 [1, hv, dv, dk] -> y [1, R, hv, dv] bf16 and the state after the last row.
 fn recur(g: *G, q: T, k: T, v: T, gate: T, beta: T, state: T, rows: c_int, hv: c_int, dk: c_int) !Recur {
-    const kern = try recurKernel();
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, rows, hv, dk }, 4, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, hv, dk, dk }, 4, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, dk, hv));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 4, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OutT", .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Dk", dk));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Dv", dk));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Hk", hv));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Hv", hv));
-    const t_arr = try g.adopt(mlx.mlx_array_new_int(rows));
+    const kern = kernel.?;
+    // The decode lane's rows on the installed plan; a wider span (a prompt span on the per-token route) its own launch.
+    const planned = rows <= plan_rows;
+    std.debug.assert(!planned or (hv == plan.hv and dk == plan.dk));
+    const own = if (planned) null else try recurConfig(rows, hv, dk);
+    defer if (own) |c| {
+        _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    };
+    const cfg = own orelse plan.cfg[@intCast(rows - 1)];
+    const t_arr = if (planned) plan.t[@intCast(rows - 1)] else try g.adopt(mlx.mlx_array_new_int(rows));
     const ins = [_]T{ q, k, v, gate, beta, state, t_arr };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -488,4 +545,36 @@ test "glm5_next kda: the recurrence text is the host's stock vector-gated kernel
     try testing.expect(std.mem.indexOf(u8, recur_source, "state[i] = state[i] * g_[s_idx];") != null);
     try testing.expect(std.mem.indexOf(u8, recur_source, "  g_ += Hv * Dk;") != null);
     try testing.expectEqual(@as(u64, 3 * 24_576 * 4 + 64 * 128 * 128 * 4), State.bytes(&.{}));
+}
+
+test "glm5_next kda: the recurrence's launches at M = 1 .. 8 are the per-call launches; another model's geometry is refused by name" {
+    const c: glm.Config = .{};
+    const hv: c_int = @intCast(c.kda_heads);
+    const dk: c_int = @intCast(c.kda_head_dim);
+    for (1..plan_rows + 1) |m| {
+        const cf = try recurConfig(@intCast(m), hv, dk);
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cf);
+        try testing.expectEqual([9]c_int{ 32, dk, hv, 32, 4, 1, 2, 6, 0 }, readConfig(cf));
+        const cs = try recurSeqConfig(@intCast(m), hv, dk);
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cs);
+        try testing.expectEqual([9]c_int{ 32, dk, hv, 32, 4, 1, 3, 6, 0 }, readConfig(cs));
+    }
+    // A plan already installed for these heads: the same model again is a no-op, another one refused (no arrays made:
+    // the CPU lane creates no device).
+    const saved = plan;
+    defer plan = saved;
+    plan = .{ .hv = hv, .dk = dk };
+    try install(&c);
+    var other = c;
+    other.kda_heads = 32;
+    try testing.expectError(error.Glm5NextKdaPlanGeometry, install(&other));
+    try @import("sdk").testing.expectNoDevice();
+}
+
+extern "c" fn mlxlc_test_config(config: mlx.mlx_fast_metal_kernel_config, out: *[9]c_int) void;
+
+fn readConfig(cf: mlx.mlx_fast_metal_kernel_config) [9]c_int {
+    var got: [9]c_int = undefined;
+    mlxlc_test_config(cf, &got);
+    return got;
 }

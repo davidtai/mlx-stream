@@ -18,6 +18,8 @@ const experts = @import("experts.zig");
 const kda = @import("kda.zig");
 const kda_percore = @import("kda_percore.zig");
 const dsa = @import("dsa.zig");
+/// The DSA indexer's prepared decode launches (`SelectPlan`).
+const ops_dsa = @import("ops.zig");
 const dump = @import("dump.zig");
 const fp8 = @import("fp8.zig");
 const glue = @import("glue.zig");
@@ -27,12 +29,17 @@ const swiglu = @import("swiglu.zig");
 const mtp = @import("mtp.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const acc = @import("../../sdk_ext.zig").acceptance;
+/// The plugin's draw for every row handed to the host (`sdk_ext.sampler`): bound per request by `draft_lane.arm`.
+pub const Sampler = @import("../../sdk_ext.zig").sampler.SamplerOf(graph.G);
 const pagecache = @import("../mimo_v2/pagecache.zig");
 /// Profile builds only (glm5_next/profile.zig): the route trace, the prompt timeline, the phase lines, the decode
 /// timers and the serial forwards' GPU timeline; every call compiles to nothing in a served build.
 const gprof = @import("profile.zig");
 const prefill_attention = @import("../mimo_v2/prefill_attention.zig");
 const warm = @import("warm.zig");
+const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
+const expert_tally = @import("../../sdk_ext.zig").expert.tally;
+const builtin = @import("builtin");
 
 const T = mlx.mlx_array;
 
@@ -72,11 +79,17 @@ pub const Module = struct {
     mtp: ?*mtp.Lane = null,
     /// With the lane: the request's token ids by position (a pair's next token), allocated at the billed positions.
     history: []u32 = &.{},
+    /// The request's sampler (mlx-stream's one stream): the first token and every serial step's, a clean request's.
+    sampler: Sampler,
     /// The serial step the construction installed (`stepRoute` and the glue route): the served one, or the lane's (each
     /// step's hidden pended while the lane follows the request), each over the installed decode glue.
     step_pass: *const fn (*Module, []const u32) anyerror!T,
     /// The MTP round the construction installed: its verify over the installed decode glue.
     round_pass: *const fn (*Module, std.mem.Allocator, u32, u32, sdk.SamplingParams) anyerror!sdk.DraftRound,
+    /// The rate tally's file (`expert_tally.pathOf`; null: none, as in test builds or under `expert_tally_file: off`)
+    /// and the rates each request's end folds in and writes (layers x experts; empty: no tally, ratio 0).
+    tally_path: ?[]u8 = null,
+    tally_rates: []f32 = &.{},
 
     const Decode = struct { steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0, s0: @import("../../sdk_ext.zig").expert.Stats = .{}, active: bool = false };
 
@@ -92,8 +105,10 @@ pub const Module = struct {
 
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .io = io, .g = try graph.G.init(gpa, s), .c = cfg.*, .w = undefined, .gates = &.{}, .src = undefined, .cache = undefined, .routes = routes, .reserve = plan.reserve, .rows = plan.rows, .prompt_pass = promptServed, .step_pass = stepPassOf(.served, .ops), .round_pass = roundPassOf(.ops) };
+        self.* = .{ .gpa = gpa, .io = io, .g = try graph.G.init(gpa, s), .c = cfg.*, .w = undefined, .gates = &.{}, .src = undefined, .cache = undefined, .routes = routes, .reserve = plan.reserve, .rows = plan.rows, .prompt_pass = promptServed, .step_pass = stepPassOf(.served, .ops), .round_pass = roundPassOf(.ops), .sampler = undefined };
         errdefer self.g.deinit();
+        self.sampler = try Sampler.init(gpa, s);
+        errdefer self.sampler.deinit();
         var diag: sdk.Diag = .{};
         errdefer if (diag.len > 0) log.err("{s}\n", .{diag.message()});
         // The residents: every tensor the trunk does not read dropped unread (the vision tower, the MTP layer, the FP8 KV
@@ -111,7 +126,10 @@ pub const Module = struct {
         const t_read = std.Io.Timestamp.now(io, .awake);
         try weights.materialize();
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
-        try kda.install();
+        try kda.install(&self.c.model);
+        // The op chains' hc and selection kernels and the decode lane's collapse / expand launches (the control route
+        // and the prompt pass), once for the model's hc geometry.
+        try ops_dsa.install(glue.hcGeometry(model, self.w.layers[0].input_norm));
         // The KDA prompt route, once: the per-core kernel where this GPU's plan and probe take it, else the per-token one.
         const kda_route = try kda_percore.install(&self.g, &self.c.model);
         // The decode glue (`decode_glue`): the fused texts installed here (their geometry, the launches per decode-lane
@@ -126,6 +144,14 @@ pub const Module = struct {
             log.info("glm5_next decode glue installed: hcPre chain (collapse, norm and the deferred expand in one dispatch a sublayer), router {d} threadgroups + top-8, combine + shared expert; compile check passed\n", .{model.n_routed_experts / 4});
         }
         errdefer self.glue_kernels.deinit();
+        // The DSA indexer's decode launches (every route: the stock op chain and the fused texts select alike): kernels,
+        // configs and their compile check at construction, before the MTP lane opens (its head's DSA layer reads them).
+        self.routes.dsa.select = ops_dsa.SelectPlan.install(s, dsa.indexer(model, self.routes.dsa), .bfloat16) catch |e| {
+            var eb: [400]u8 = undefined;
+            log.err("glm5_next: the DSA indexer's decode launches refused ({s}): {s}\n", .{ @errorName(e), mlx.takeError(&eb) orelse "" });
+            return e;
+        };
+        errdefer self.routes.dsa.select.?.destroy();
         // The decode lane's sparse latent attention (`decode_dsa`): the fused texts installed here (before the MTP lane
         // opens: its head's DSA layer takes the same route), refused by name; the op chain otherwise.
         if (self.c.decode_dsa == .fused) {
@@ -175,7 +201,7 @@ pub const Module = struct {
         // The MTP lane (`mtp_lane`): its draft bank read into MLX and checked, its head bound from the kept residents,
         // its lanes at the billed positions; what its open holds against its billed terms (ConstructionOverBill).
         if (self.c.mtp_lane) {
-            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.routes.dsa, &diag);
+            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.c.draft_depth, self.c.draft_gate, self.routes.dsa, &diag);
             errdefer lane.deinit(&self.g);
             const term = termBytes(plan.bill, "mtp_bank") + termBytes(plan.bill, "mtp_tables") + termBytes(plan.bill, "mtp_kv");
             log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv), residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
@@ -192,14 +218,30 @@ pub const Module = struct {
         };
         self.gates = try self.w.gates(gpa, self.c.decode_predict);
         errdefer gpa.free(self.gates);
-        // The expert source at the plan's rows, every routed layer alike.
+        // The expert source at the plan's rows: every routed layer alike (`expert_rows_by_layer: uniform`), or (the default)
+        // the calibrated split of the decode rows at the same total (lr2: prompt rows uniform; decode floored at them).
         const n_moe = model.moeLayers();
         const prompt_rows = try arena.allocator().alloc(u32, n_moe);
         const decode_rows = try arena.allocator().alloc(u32, n_moe);
-        @memset(prompt_rows, plan.rows.prompt);
-        @memset(decode_rows, plan.rows.decode);
-        self.src = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict);
+        settings.layerRows(self.c.expert_rows_by_layer, plan.rows, model.n_routed_experts, prompt_rows, decode_rows) catch |e| {
+            log.err("glm5_next: load refused: expert_rows_by_layer does not fit the plan's rows {d}/{d} ({s})\n", .{ plan.rows.prompt, plan.rows.decode, @errorName(e) });
+            return e;
+        };
+        if (self.c.expert_rows_by_layer == .offsets) {
+            var sum_p: u64 = 0;
+            for (prompt_rows) |r| sum_p += r;
+            log.info("glm5_next expert rows by layer installed: decode {any} (sum {d} = {d} x {d}), prompt {any} (sum {d}); bill unchanged\n", .{ decode_rows, @as(u64, plan.rows.decode) * n_moe, n_moe, plan.rows.decode, prompt_rows, sum_p });
+        }
+        // `gpu_keep_warm` (MiMo's X12): the DEFAULT on a CPU stream resolves to the control here, once, with one line; a
+        // named route still refuses by name there (the install).
+        const warm_route = self.c.warmRoute(gpu_warm.gpuStream(s));
+        if (warm_route != self.c.gpu_keep_warm) log.info("glm5_next route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits)\n", .{@tagName(self.c.gpu_keep_warm)});
+        self.src = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally);
         errdefer self.src.deinit();
+        // The rate tally (`expert_resident_ratio` > 0): its file read once (the first request's pins), its line.
+        try self.openTally(dir, std.mem.min(u32, decode_rows));
+        errdefer self.closeTally();
+        if (self.src.warm != null) log.info("glm5_next gpu keep-warm installed: gpu_keep_warm=waits source={s} (MiMo X12: a {d}-thread spin on its own Metal queue in chunks of ~{d} us while the stream's gated parts and the read-ahead wait for their bytes; no model array touched; bill {d} B)\n", .{ if (self.c.gpu_keep_warm_requested) "setting" else "default", gpu_warm.threads, gpu_warm.chunk_target_ns / std.time.ns_per_us, gpu_warm.bill_bytes });
         if (self.c.decode_predict == .bf16) log.info("glm5_next decode predictor installed: the lookahead's scores on the routers' BF16 weights ([experts, hidden], MLX gemv; the F32 copies stay the prompt routing's)\n", .{});
         self.cache = try graph.Cache.init(gpa, &self.c.model, @intCast(plan.reserve));
         errdefer self.cache.deinit(&self.g);
@@ -213,7 +255,7 @@ pub const Module = struct {
             log.info("glm5_next logits_dump: on dir={s} chunk_rows={d} chunk_bytes={d} (one safetensors file per prompt pass: logits F32 [prompt rows, {d}], token_ids I32, ids_int32_sha256; written before the request returns)\n", .{ d, graph.dump_chunk_rows, dump.chunkBytes(graph.dump_chunk_rows, model.vocab_size, model.hidden_size), model.vocab_size });
         }
         if (self.mtp == null) log.info("glm5_next MTP lane: off (serial; set {{\"mtp_lane\":true}})\n", .{});
-        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s} residents={s} decode_glue={s} decode_kda={s} decode_dsa={s} decode_predict={s} decode_swiglu={s}\n", .{ routes.dsa.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route), @tagName(self.c.model.residents_format), @tagName(self.c.decode_glue), @tagName(self.c.decode_kda), @tagName(self.c.decode_dsa), @tagName(self.c.decode_predict), @tagName(self.c.decode_swiglu) });
+        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s} residents={s} decode_glue={s} decode_kda={s} decode_dsa={s} decode_predict={s} decode_swiglu={s} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ routes.dsa.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route), @tagName(self.c.model.residents_format), @tagName(self.c.decode_glue), @tagName(self.c.decode_kda), @tagName(self.c.decode_dsa), @tagName(self.c.decode_predict), @tagName(self.c.decode_swiglu), @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
         // The prompt levers' engagement lines (glm5next/prefill-levers; docs/glm5-next.md "Prompt levers").
         if (experts.prompt_relocate) log.info("glm5_next prompt lever 1: read-ahead relocation engaged (a read-ahead record the plans evict before any hit is copied at the plans into its later transient row: read once; exact)\n", .{});
         log.info("glm5_next prompt lever 3: prompt kernels warmed at load in {d} ms (KDA layer {d}: {d} spans; dense layer {d}: one {d}-row tile; DSA layer {d}: {d} spans of {d} rows; the {s} combine; token-identical)\n", .{ warmed.ns / std.time.ns_per_ms, warmed.plan.kda_layer, warmed.plan.kda_spans, warmed.plan.dense_layer, graph.dense_tile_rows, warmed.plan.dsa_layer, warmed.plan.dsa_spans, graph.span_rows, @tagName(self.src.combine_route) });
@@ -263,9 +305,68 @@ pub const Module = struct {
             log.warn("glm5_next construction check: the footprint {d} B exceeds the billed construction terms {d} B by more than {d} B (an under-bill: proceeding)\n", .{ footprint, billed, bill.construction_tolerance_bytes });
     }
 
+    /// The rate tally at construction (glm_moe_dsa's `openTally`): nothing at ratio 0 (no tally: the stream got none);
+    /// else the rates its requests' ends fold in, and the file read (`expert_tally_file` on / pinned) to seed the first
+    /// request's pins; never in test builds (their HOME is the box user's). One line either way.
+    fn openTally(self: *Module, dir: []const u8, decode_rows: u32) !void {
+        const t = self.c.tally;
+        if (!t.enabled()) {
+            log.info("glm5_next expert tally: off (expert_resident_ratio 0: no rate tally, no pins, no file)\n", .{});
+            return;
+        }
+        const shape = self.src.tallyShape();
+        self.tally_rates = try self.gpa.alloc(f32, @as(usize, shape.layers) * shape.experts);
+        @memset(self.tally_rates, 0);
+        errdefer self.closeTally();
+        const pins = @min(expert_tally.pinLimit(t.ratio, shape.experts), decode_rows);
+        var status: []const u8 = "no file (expert_tally_file off): every request after the first pins from the last one's rates";
+        if (!builtin.is_test and t.readsFile()) {
+            const key = try expert_tally.keyOf(self.gpa, "glm5_next", dir);
+            defer self.gpa.free(key);
+            self.tally_path = try expert_tally.pathOf(self.gpa, key);
+            if (self.tally_path) |path| switch (try expert_tally.read(self.gpa, self.io, path, shape.layers, shape.experts)) {
+                .rates => |r| {
+                    defer self.gpa.free(r);
+                    @memcpy(self.tally_rates, r);
+                    self.src.seedTally(r);
+                    status = "file read: the first request pins from it";
+                },
+                .missing => status = "no file yet: the first request plans as without a tally",
+                .mismatched => {
+                    log.warn("glm5_next expert tally: {s} is not this stream's ({d} layers of {d} experts, version {d}): ignored\n", .{ path, shape.layers, shape.experts, expert_tally.version });
+                    status = "file of another geometry ignored: the first request plans as without a tally";
+                },
+            } else status = "no HOME, no file: every request after the first pins from the last one's rates";
+        }
+        log.info("glm5_next expert tally installed: expert_resident_ratio={d} pins={d} of {d} decode rows a layer, window {d} routes, expert_tally_file={s} path={s}; {s}\n", .{ t.ratio, pins, decode_rows, t.window, @tagName(t.file), if (self.tally_path) |p| p else "none", status });
+    }
+
+    fn closeTally(self: *Module) void {
+        if (self.tally_path) |p| self.gpa.free(p);
+        self.tally_path = null;
+        if (self.tally_rates.len > 0) self.gpa.free(self.tally_rates);
+        self.tally_rates = &.{};
+    }
+
+    /// The request's end for the tally (glm_moe_dsa's `endTally`): each layer's decode rates folded in (the next request
+    /// pins from them), the file written under `expert_tally_file: on`. A failure is logged; the request is not failed.
+    fn endTally(self: *Module) void {
+        if (self.tally_rates.len == 0) return;
+        const routed = self.src.endTally(self.tally_rates);
+        const path = self.tally_path orelse return;
+        if (routed == 0 or !self.c.tally.writesFile()) return;
+        const shape = self.src.tallyShape();
+        expert_tally.write(self.gpa, self.io, path, self.tally_rates, shape.layers, shape.experts, self.c.tally.window) catch |e| {
+            log.warn("glm5_next expert tally: not written to {s}: {s}\n", .{ path, @errorName(e) });
+            return;
+        };
+        log.info("glm5_next expert tally: written to {s} ({d} of {d} layers routed in the decode)\n", .{ path, routed, shape.layers });
+    }
+
     pub fn deinit(self: *Module) void {
         _ = mlx.mlx_synchronize(self.g.s);
         if (comptime gprof.enabled) gprof.disarm(self.src);
+        self.closeTally();
         if (self.mtp) |lane| {
             lane.deinit(&self.g);
             self.gpa.free(self.history);
@@ -275,10 +376,12 @@ pub const Module = struct {
         self.glue_kernels.deinit();
         self.kda_kernels.deinit();
         self.dsa_kernels.deinit();
+        if (self.routes.dsa.select) |p| p.destroy();
         self.swiglu_kernels.deinit();
         self.w.deinit(self.gpa);
         if (self.fp8_route) |r| r.destroy(self.gpa);
         self.gpa.free(self.gates);
+        self.sampler.deinit();
         self.g.deinit();
         self.gpa.destroy(self);
     }
@@ -500,10 +603,14 @@ pub const Module = struct {
         try self.checkTokens(&.{t1});
         // The round's wall, its drafts included (the request's decode line rates the rounds as a serial step's tokens).
         const t0 = self.nowNs();
-        const k = mtp.draftsAt(lane.tracked(), lane.n_pending, len, accepted_cap, self.reserve);
+        const drafted = mtp.draftsAt(lane.depth, lane.tracked(), lane.n_pending, len, accepted_cap, self.reserve);
         var ids: [mtp.verify_rows]u32 = undefined;
+        var q: [mtp.max_depth]f32 = undefined;
         ids[0] = t1;
-        if (k > 0) try lane.draft(g, &self.w, self.history[lane.pairs() + 1 .. len], t1, k, ids[1 .. k + 1]);
+        if (drafted > 0) try lane.draft(g, &self.w, self.history[lane.pairs() + 1 .. len], t1, drafted, ids[1 .. drafted + 1], q[0..drafted], acc.Params.active(acc.Params.of(sampling)), len);
+        // The draft gate (`draft_gate`): the leading drafts whose cumulative top-1 probability stays at or above theta are
+        // verified (theta 0, the default: every draft).
+        const k = mtp.gatedDrafts(q[0..drafted], lane.gate);
         const rows: u32 = k + 1;
         const drafts = ids[1..rows];
         const tp = gprof.stepBegin(t1);
@@ -532,9 +639,9 @@ pub const Module = struct {
         try self.cache.rollback(g, &self.c.model, len, rows, kept + 1);
         gprof.stepEnd(tp);
         const committed = try g.slice(hidden, &.{ 0, 0 }, &.{ @intCast(kept + 1), @intCast(self.c.model.hidden_size) }, &.{ 1, 1 });
-        try lane.pend(g, len + 1 + kept, committed, kept + 1, k == 0);
+        try lane.pend(g, len + 1 + kept, committed, kept + 1, drafted == 0);
         @memcpy(self.history[len..][0 .. kept + 1], ids[0 .. kept + 1]);
-        lane.stats.add(k, kept);
+        lane.record(k, kept, q[0..k]);
         const tokens = try a.dupe(u32, ids[0..plan.emitted]);
         if (comptime gprof.enabled) gprof.roundEnd(kept, tokens);
         self.decode.steps += 1;
@@ -561,6 +668,11 @@ pub const Module = struct {
         if (!self.decode.active) return;
         const d = self.decode;
         self.decode = .{};
+        // The lane's calibration: each draft position's tested / kept counts by the head's top-1 probability q.
+        if (self.mtp) |lane| if (lane.stats.rounds > 0) {
+            var cb: [1024]u8 = undefined;
+            log.info("glm5_next MTP lane calibration: {s}\n", .{lane.calibLine(&cb)});
+        };
         if (comptime gprof.enabled) gprof.decodeEnd(self.src);
         const footprint = sdk.memory.footprint().now;
         var active: usize = 0;
@@ -569,11 +681,14 @@ pub const Module = struct {
         _ = mlx.mlx_get_active_memory(&active);
         _ = mlx.mlx_get_cache_memory(&cache);
         _ = mlx.mlx_get_peak_memory(&peak);
+        // The decode phase's billed host side (MiMo's M1+M2: the measured bound where the readings cover the reserve).
+        const dh = bill.decodeHostTerms(self.reserve);
         log.info("glm5_next decode memory: footprint={d} mlx_active={d} mlx_cache={d} mlx_peak={d} footprint_less_mlx={d} billed_host_runtime={d} billed_mlx_cache={d} billed_compiler_runtime={d}\n", .{
-            footprint, active, cache, peak, footprint -| active -| cache, settings.host_bytes, experts.decode_cache_bytes, settings.compilation_bytes,
+            footprint, active, cache, peak, footprint -| active -| cache, dh.host, experts.decode_cache_bytes, dh.compiler,
         });
         const s1 = self.src.stats();
         const tok_s: f64 = if (d.wall_ns > 0) @as(f64, @floatFromInt(d.tokens)) * 1e9 / @as(f64, @floatFromInt(d.wall_ns)) else 0;
+        self.endTally();
         log.info("glm5_next decode: steps={d} tokens={d} wall_s={d:.3} tok_s={d:.2} ssd_bytes={d} ssd_bytes_per_token={d}\n", .{ d.steps, d.tokens, @as(f64, @floatFromInt(d.wall_ns)) / 1e9, tok_s, s1.expert_bytes_read -| d.s0.expert_bytes_read, if (d.tokens > 0) (s1.expert_bytes_read -| d.s0.expert_bytes_read) / d.tokens else 0 });
     }
 };

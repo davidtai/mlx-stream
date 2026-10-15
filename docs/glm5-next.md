@@ -33,7 +33,9 @@ The arch claims a `config.json` with `model_type` `glm5_next` and the block
 
 The block's optional `settings` object takes `expert_prefill_rows` and `expert_rows` (an operator pin: either alone
 forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
-is installed when true; off, the serial control, by default: below), `decode_moe` (the decode lane's expert route:
+is installed when true; off, the serial control, by default: below), `draft_depth` (the lane's drafts per round: an
+integer 1 .. 3, default 1 (measured +2.31 % decode over 3 on g21c); anything else refused by name), `draft_gate` (the lane's confidence gate: theta in [0, 1),
+default 0 = off; below), `decode_moe` (the decode lane's expert route:
 `hitpass`, the default, `fused` or `stock`; anything else refused by name), `decode_glue` (the decode lane's glue:
 `fused`, the default, or `ops`), `decode_kda`, `decode_dsa` and `decode_swiglu` (the decode lane's KDA layer, DSA
 attention and MLP activation: `fused`, the default, or `ops`), `decode_predict` (the lookahead predictor's router
@@ -291,7 +293,8 @@ prints a table per served context (17,408; 18,432; 20,480; 24,576; 32,766; 32,76
 
 ## The MTP draft lane
 
-`mtp_lane: true` installs the release's MTP layer as a draft head at depth 3 with exact acceptance (`mtp.zig`, on
+`mtp_lane: true` installs the release's MTP layer as a draft head at depth 3 (`draft_depth` 1 .. 3 sets it; the
+lanes, the bill and the host's block stay sized at 3, MiMo's rule) with exact acceptance (`mtp.zig`, on
 MiMo's draft-lane seam; `MTP.md` lists its integration points). At construction: the MTP layer's 25 residents kept in
 the weight map and read with the trunk, the draft bank (`mtp-experts-nvfp4.bin`, all 288 experts resident in NVFP4)
 read into MLX and checked record by record against its manifest, the head's lanes at the billed positions; what the
@@ -301,12 +304,21 @@ open holds is held to its billed terms (`mtp_bank + mtp_tables + mtp_kv`, else `
 
 A request: the prompt pass hands the lane every row's final-normed hidden (`graph.Head.hidden`), each pair whose next
 token the prompt gives appended to the head's lanes; a round (the host's `draft_lane.round`) drafts up to 3 tokens
-after t1, verifies [t1, drafts] in one decode-lane forward (`Head.verify`: every row's logits and hidden; each KDA
+after t1 as one device graph (`mtp.chainDrafts`: each draft's argmax feeds the next pair's embedding on the device; one
+eval and one read of the drafts, before the verify; the install line names it, `drafts=device_chain`), verifies [t1, drafts] in one decode-lane forward (`Head.verify`: every row's logits and hidden; each KDA
 layer's per-row states captured by the host's `capture_seq` recurrence), decides by the exact rule inside the verify's
-eval (greedy: the verify rows' argmax; sampled: exact speculative sampling), then rolls back to the kept rows (the DSA
+eval (greedy: the verify rows' argmax; sampled: sample-then-verify, every row's token the target's position-keyed draw, the serial step's), then rolls back to the kept rows (the DSA
 lanes truncated; on a partial accept every KDA state restored from the capture by a copy, no re-forward) and pends the
 kept rows' hidden. A round without drafts (the lane not tracking, the cap, the context) is a serial step. The request's
-receipt is MiMo's `[spec-stats]` line (rounds, accepted per round, misses and bytes per round).
+receipt is MiMo's `[spec-stats]` line (rounds, accepted per round, misses and bytes per round) and the lane's tail
+` depth=<d> pos_tested=a,b,c pos_kept=x,y,z` (per draft position: the rounds that decided it, the rounds that kept it;
+position i's acceptance is kept / tested). Each draft's top-1 probability under the head (q = exp(max - logsumexp) of
+its logits) is read in the round's one sync with the drafts; the request's end logs the calibration, those counts by q
+(`glm5_next MTP lane calibration: depth=<d> q_bins=10 pos1=t/k,... pos2=... pos3=...`, bin floor(10 q)).
+`draft_gate` (theta, default 0 = off) verifies a round's leading drafts whose cumulative q stays at or above theta
+(`mtp.gatedDrafts`; the rest are dropped before the verify, their rows saved); the install line ends `draft_gate=`.
+Design: build/g21c-dc/DESIGN-CONFIDENCE-GATE.md in the reports tree (theta = the lane's tokens per ms x the marginal
+verify row's ms, about 0.52 .. 0.60 at 115/131).
 
 Bill (with the lane): the lane's own terms (`mtp_bank`, `mtp_residents`, `mtp_tables`, `mtp_kv`, `mtp_pending`,
 `mtp_wave`), the decode wave at the verify's 4 rows (`request`), `mtp_kda_capture` (5 rows of every KDA layer's state
@@ -322,6 +334,21 @@ Routes (construction time, `module.promptRoute` / `module.stepRoute`): off, the 
 (`.hidden`: the step's hidden pended while the lane follows the request, `Lane.keepsStep`, else the served forward) and
 the round (`Module.mtpRound`). The KDA capture is its own comptime instance (`kda.forwardCapture`), reached only from a
 verify.
+
+## One sampler
+
+Every token the plugin hands the host comes from one stream (`sdk_ext.sampler`, `sdk_ext.acceptance.drawAt`: splitmix64
+over the request's seed, the token's absolute position and the draw index). The host arms every clean request before
+its prompt pass (`draft_lane.arm`, blockSize 1 without a lane); the arch binds its sampler there, and for a sampled
+request the prompt's last row and each serial step's row reach the host as the one-hot of the plugin's draw. A lane's
+verify draws the same token at the same position (sample-then-verify), so a seeded request yields the same ids serial or
+drafted, on every mlx-stream arch at equal rows. Unarmed requests (logprobs, grammar, penalties, `--no-mtp`) keep the
+host's sampler; greedy requests keep their logits (the host's argmax). A bound request logs `mlx-stream sampler: request
+bound (the plugin draws every token) lane="<lane>" ...` once, at its prompt pass. By construction a lane-less module
+reports blockSize 1 (`/props`: block_size 1, mtp_loaded true) and its requests default to `enable_mtp`: that is how
+the host arms them; the decode stays serial (`arm` answers off). The path-identical serial control is `mtp_lane` off
+served WITHOUT `--no-mtp` (`--no-mtp` keeps the host's sampler). Open: the host's masked special tokens are not passed
+to the plugin's draw (a follow-up: the mask in `ArmRequest`).
 
 ## The profile build
 

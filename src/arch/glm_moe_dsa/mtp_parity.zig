@@ -365,7 +365,9 @@ test "glm mtp: the lane arms clean requests only, exact as greedy or stochastic,
     lane.mode = .exact;
     var inner: module.Module = undefined;
     inner.mtp = null;
-    const m: module.Served = .{ .affine = &inner };
+    inner.sampler.pending = null;
+    inner.sampler.active = null;
+    var m: module.Served = .{ .affine = &inner };
     try testing.expectEqual(sdk.DraftArm.off, plugin.draft_lane.arm(&m, .{ .greedy = true, .clean = true }));
     inner.mtp = &lane;
     try testing.expectEqual(sdk.DraftArm.greedy, plugin.draft_lane.arm(&m, .{ .greedy = true, .clean = true }));
