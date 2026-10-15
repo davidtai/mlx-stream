@@ -98,12 +98,23 @@ pub const Refusal = error{
 
 pub const format_v2 = "mtplx-expert-manifest-v2";
 pub const format_v1 = "mtplx-expert-manifest-v1";
-/// The v1 runtime manifest's mode for an EXL3 bank (never a tcq3 / mcg bank).
+/// The v1 runtime manifest's mode for an EXL3 mul1 bank. A bank's v1 mode is `runtime_mode_prefix` ++ its v2 codebook
+/// ("exl3-mul1", "exl3-mcg"; never a tcq3 bank).
 pub const runtime_mode = "exl3-mul1";
+pub const runtime_mode_prefix = "exl3-";
 /// Record alignment in experts.bin; the manifest must declare the same.
 pub const record_alignment: u64 = 4096;
 /// The mul1 codebook multiplier the EXL3 kernels are built for.
 pub const mul1_multiplier: u64 = 0x83DCD12D;
+/// The mcg codebook multiplier (exllamav3 codebook.cuh: x *= 0xCBAC1FED).
+pub const mcg_multiplier: u64 = 0xCBAC1FED;
+
+/// The multiplier a known codebook decodes at (null: a codebook this table does not name; its build checks it).
+pub fn codebookMultiplier(codebook: []const u8) ?u64 {
+    if (std.mem.eql(u8, codebook, "mul1")) return mul1_multiplier;
+    if (std.mem.eql(u8, codebook, "mcg")) return mcg_multiplier;
+    return null;
+}
 /// Bounds the parse of a hostile manifest (the real bank has 40 x 384).
 const max_layers = 4096;
 const max_experts = 1 << 16;
@@ -210,6 +221,9 @@ pub const Bank = struct {
     /// [layer * n_experts + expert]
     digests: []Digests = &.{},
     sidecar_path: [:0]const u8 = "",
+    /// The v2 codebook (an entry of the build's `Implemented.codebooks`: static), set by `adoptV2`; the v1 mode is
+    /// `runtime_mode_prefix` ++ it.
+    codebook: []const u8 = "",
     /// experts.bin, opened once for the reader (`openUncached`: read-only, O_NOFOLLOW, F_NOCACHE, no read-ahead);
     /// `sidecar.size` is the file's.
     sidecar: expert_io.UncachedFd = .{ .fd = -1, .size = 0 },
@@ -266,8 +280,11 @@ pub const Bank = struct {
         const a = self.allocator;
         const q = v2.quant orelse return refuse(diag, error.ManifestSyntax, "v2: no quantization", .{});
         if (!containsStr(implemented.codebooks, q.codebook)) return refuse(diag, error.CodebookNotImplemented, "v2: codebook \"{s}\" not implemented by this build", .{q.codebook});
-        if (std.mem.eql(u8, q.codebook, "mul1") and q.codebook_multiplier != mul1_multiplier)
-            return refuse(diag, error.CodebookMultiplier, "v2: mul1 multiplier {d} != {d}", .{ q.codebook_multiplier, mul1_multiplier });
+        if (codebookMultiplier(q.codebook)) |m| if (q.codebook_multiplier != m)
+            return refuse(diag, error.CodebookMultiplier, "v2: {s} multiplier {d} != {d}", .{ q.codebook, q.codebook_multiplier, m });
+        for (implemented.codebooks) |c| if (std.mem.eql(u8, c, q.codebook)) {
+            self.codebook = c;
+        };
         const d = v2.dims orelse return refuse(diag, error.ManifestSyntax, "v2: no dims", .{});
         if (d.n_layers == 0 or d.n_layers > max_layers or d.n_experts == 0 or d.n_experts > max_experts or layerSegments(1, d.hidden, d.inter) == null)
             return refuse(diag, error.DimsInvalid, "v2: dims hidden={d} inter={d} n_experts={d} n_layers={d}", .{ d.hidden, d.inter, d.n_experts, d.n_layers });
@@ -351,7 +368,8 @@ pub const Bank = struct {
                 },
                 .quantization => {
                     const qm = try src.parse(struct { mode: []const u8 }, meta.allocator());
-                    if (!std.mem.eql(u8, qm.mode, runtime_mode)) return refuse(diag, error.RuntimeModeNotExl3, "{s}: quantization.mode \"{s}\" is not {s}", .{ src.name, qm.mode, runtime_mode });
+                    if (!std.mem.startsWith(u8, qm.mode, runtime_mode_prefix) or !std.mem.eql(u8, qm.mode[runtime_mode_prefix.len..], self.codebook))
+                        return refuse(diag, error.RuntimeModeNotExl3, "{s}: quantization.mode \"{s}\" is not {s}{s} (the v2 codebook)", .{ src.name, qm.mode, runtime_mode_prefix, self.codebook });
                 },
                 .sidecar => sidecar = try src.parse(SidecarJson, meta.allocator()),
                 .records => {
@@ -955,6 +973,8 @@ pub fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u
 }
 
 const implemented_synth: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = 4, .n_layers = 2 };
+/// A build implementing both codebooks (glm5_next's EXL3 route: the codebook is the pack's, chosen at construction).
+const implemented_synth_mcg: Implemented = .{ .codebooks = &.{ "mul1", "mcg" }, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = 4, .n_layers = 2 };
 
 pub const tmpRoot = @import("sdk").testing.tmpRoot;
 
@@ -1013,6 +1033,33 @@ test "dsv41 bank: a clean synthetic bank opens with offsets, spans and digests f
     };
 }
 
+test "dsv41 bank: the codebook is the v2 manifest's: a build of both opens mul1 and mcg banks (v1 mode exl3-<codebook>), a mul1-only build refuses mcg" {
+    const Case = struct { s: Synth, impl: Implemented, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .s = .{}, .impl = implemented_synth, .want = "mul1" },
+        .{ .s = .{}, .impl = implemented_synth_mcg, .want = "mul1" },
+        .{ .s = .{ .codebook = "mcg", .multiplier = 0xCBAC1FED, .v1_mode = "exl3-mcg" }, .impl = implemented_synth_mcg, .want = "mcg" },
+        .{ .s = .{ .codebook = "mcg", .multiplier = 0xCBAC1FED, .v1_mode = "exl3-mcg" }, .impl = implemented_synth, .want = null },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        testing.allocator.free(try writeSynth(testing.allocator, &tmp, c.s));
+        var rbuf: [512]u8 = undefined;
+        var diag: Diag = .{};
+        if (c.want) |cb| {
+            var bank = try Bank.open(testing.allocator, std.testing.io, try tmpRoot(&tmp, &rbuf), c.impl, &diag);
+            defer bank.deinit();
+            try testing.expectEqualStrings(cb, bank.codebook);
+        } else {
+            try testing.expectError(error.CodebookNotImplemented, Bank.open(testing.allocator, std.testing.io, try tmpRoot(&tmp, &rbuf), c.impl, &diag));
+        }
+    }
+    try testing.expectEqual(@as(?u64, 0xCBAC1FED), codebookMultiplier("mcg"));
+    try testing.expectEqual(@as(?u64, 0x83DCD12D), codebookMultiplier("mul1"));
+    try testing.expectEqual(@as(?u64, null), codebookMultiplier("3inst"));
+}
+
 test "dsv41 bank: a K=2 layer opens only when K=2 is implemented" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1045,6 +1092,9 @@ test "dsv41 bank: every bankv2 refusal refuses, by name" {
         .{ .s = .{ .v2_format = "mtplx-expert-manifest-v3" }, .err = error.ManifestFormat },
         .{ .s = .{ .codebook = "mcg" }, .err = error.CodebookNotImplemented },
         .{ .s = .{ .multiplier = 0x83DCD12E }, .err = error.CodebookMultiplier },
+        .{ .s = .{ .codebook = "mcg", .multiplier = 0x83DCD12D, .v1_mode = "exl3-mcg" }, .err = error.CodebookMultiplier, .impl = implemented_synth_mcg },
+        .{ .s = .{ .codebook = "mcg", .multiplier = 0xCBAC1FED }, .err = error.RuntimeModeNotExl3, .impl = implemented_synth_mcg },
+        .{ .s = .{ .v1_mode = "exl3-mcg" }, .err = error.RuntimeModeNotExl3, .impl = implemented_synth_mcg },
         .{ .s = .{ .hidden = 72 }, .err = error.DimsInvalid },
         .{ .s = .{}, .err = error.DimsNotImplemented, .impl = dsv41 },
         .{ .s = .{ .drop_layer_entry = true }, .err = error.LayerGeometry },

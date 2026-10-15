@@ -24,6 +24,18 @@ pub const format = expert_bank.format_v2;
 pub const manifest_file = "expert-manifest-v2.json";
 pub const runtime_manifest_file = "expert-manifest.json";
 pub const quant_name = "exl3-k3-mul1";
+/// The config's `expert_streaming.quant` of a pack whose v2 manifest names codebook `cb`: "exl3-k3-mul1", "exl3-k3-mcg".
+pub fn quantName(cb: kernels.Codebook) []const u8 {
+    return switch (cb) {
+        inline else => |c| "exl3-k3-" ++ @tagName(c),
+    };
+}
+/// The codebook a config's `expert_streaming.quant` declares (null: not an EXL3 K=3 quant this build serves).
+pub fn codebookOfQuant(quant_value: []const u8) ?kernels.Codebook {
+    const prefix = "exl3-k3-";
+    if (!std.mem.startsWith(u8, quant_value, prefix)) return null;
+    return kernels.Codebook.ofName(quant_value[prefix.len..]);
+}
 
 pub const n_components = expert_bank.n_components;
 pub const gu_components = expert_bank.gu_components;
@@ -34,8 +46,9 @@ pub const Segment = expert_bank.Segment;
 pub const routed_top_k = 8;
 pub const page = expert_bank.record_alignment;
 
-/// GLM-5.3-Flash's bank the texts decode: mul1 at K = 3 on every layer, hidden 4096, inter 2048, 288 experts, 42 layers.
-pub const flash: expert_bank.Implemented = .{ .codebooks = &.{kernels.codebook}, .k = &.{kernels.k_bits}, .hidden = kernels.hidden, .inter = kernels.inter, .n_experts = 288, .n_layers = 42 };
+/// GLM-5.3-Flash's bank the texts decode: mul1 or mcg (`kernels.Codebook`, the pack's, a construction-time route) at K = 3
+/// on every layer, hidden 4096, inter 2048, 288 experts, 42 layers.
+pub const flash: expert_bank.Implemented = .{ .codebooks = kernels.codebook_names, .k = &.{kernels.k_bits}, .hidden = kernels.hidden, .inter = kernels.inter, .n_experts = 288, .n_layers = 42 };
 pub const flash_first_moe_layer: u32 = 3;
 
 /// One projection's slot arrays (DeepSeek's `ProjArrays`: code, rout, rin).
@@ -103,14 +116,19 @@ pub const Geometry = struct {
 };
 
 /// The bank's quantization as the texts decode it, field by field (the v2 manifest's `quantization`, DeepSeek's quant
-/// `claims` at GLM's dims): mode exl3, the mul1 codebook at its multiplier, the tile, the Hadamard, the scales, K = 3 on
-/// every layer and the dims `want`. Refused once, by name, before any read.
-pub fn checkPeek(v: *const quant.BankPeek, want: expert_bank.Implemented, diag: *sdk.Diag) !void {
+/// `claims` at GLM's dims): mode exl3, a codebook of `want.codebooks` this build has texts for (`kernels.Codebook`) at
+/// its multiplier, the tile, the Hadamard, the scales, K = 3 on every layer and the dims `want`. Refused once, by name,
+/// before any read; returns the pack's codebook (the construction's route).
+pub fn checkPeek(v: *const quant.BankPeek, want: expert_bank.Implemented, diag: *sdk.Diag) !kernels.Codebook {
     const q = v.quantization;
     const f = xq.format;
     if (!strIs(q, "mode", f.mode)) return refuse(diag, error.Glm5NextExl3Mode, "quantization.mode \"{s}\" (the texts decode {s})", .{ quant.str(q, "mode") orelse "", f.mode });
-    if (!strIs(q, "codebook", f.codebook)) return refuse(diag, error.Glm5NextExl3Codebook, "quantization.codebook \"{s}\" (the texts decode {s} only)", .{ quant.str(q, "codebook") orelse "", f.codebook });
-    if ((quant.int(q, "codebook_multiplier") orelse -1) != f.multiplier) return refuse(diag, error.Glm5NextExl3Codebook, "quantization.codebook_multiplier {?d} (mul1 is {d})", .{ quant.int(q, "codebook_multiplier"), f.multiplier });
+    const name = quant.str(q, "codebook") orelse "";
+    const cb = kernels.Codebook.ofName(name) orelse return refuse(diag, error.Glm5NextExl3Codebook, "quantization.codebook \"{s}\" (this build decodes {s})", .{ name, "mul1 | mcg" });
+    var listed = false;
+    for (want.codebooks) |c| listed = listed or std.mem.eql(u8, c, name);
+    if (!listed) return refuse(diag, error.Glm5NextExl3Codebook, "quantization.codebook \"{s}\" (the texts decode {s} only)", .{ name, want.codebooks[0] });
+    if ((quant.int(q, "codebook_multiplier") orelse -1) != cb.multiplier()) return refuse(diag, error.Glm5NextExl3Codebook, "quantization.codebook_multiplier {?d} ({s} is {d})", .{ quant.int(q, "codebook_multiplier"), name, cb.multiplier() });
     const tile = quant.obj(q, "tile");
     if ((quant.int(tile, "size") orelse -1) != f.tile_size or !strIs(tile, "layout", f.tile_layout) or !strIs(tile, "bitstream", f.tile_bitstream))
         return refuse(diag, error.Glm5NextExl3Tile, "quantization.tile {?d} / {s} / {s} (the texts read {d} / {s} / {s})", .{ quant.int(tile, "size"), quant.str(tile, "layout") orelse "", quant.str(tile, "bitstream") orelse "", f.tile_size, f.tile_layout, f.tile_bitstream });
@@ -124,6 +142,7 @@ pub fn checkPeek(v: *const quant.BankPeek, want: expert_bank.Implemented, diag: 
         return refuse(diag, error.Glm5NextExl3Dims, "dims hidden {d} / inter {d} / {d} experts / {d} layers ({d} entries) (the texts are instantiated at {d} / {d}, the bank is {d} x {d})", .{ v.hidden, v.inter, v.n_experts, v.n_layers, v.layers.len, want.hidden, want.inter, want.n_experts, want.n_layers });
     for (v.layers, 0..) |l, li| if (l.bits != kernels.k_bits)
         return refuse(diag, error.Glm5NextExl3K, "layer {d} K {d} (the texts decode K = {d} only)", .{ li, l.bits, kernels.k_bits });
+    return cb;
 }
 
 fn strIs(v: std.json.Value, field: []const u8, want: []const u8) bool {
@@ -138,10 +157,16 @@ fn refuse(diag: *sdk.Diag, err: anyerror, comptime fmt: []const u8, args: anytyp
 /// The bank's geometry for the bill and the admission (pure host): the v2 manifest peeked (records skipped, no sidecar),
 /// its quantization checked (`checkPeek`), the geometry its dims give.
 pub fn inspect(a: std.mem.Allocator, io: std.Io, dir: []const u8, first_moe_layer: u32, want: expert_bank.Implemented, diag: *sdk.Diag) !Geometry {
+    return (try inspectCodebook(a, io, dir, first_moe_layer, want, diag)).geometry;
+}
+
+/// `inspect` and the pack's codebook (`checkPeek`'s).
+pub const Inspected = struct { geometry: Geometry, codebook: kernels.Codebook };
+pub fn inspectCodebook(a: std.mem.Allocator, io: std.Io, dir: []const u8, first_moe_layer: u32, want: expert_bank.Implemented, diag: *sdk.Diag) !Inspected {
     var p = try expert_bank.peek(a, io, dir, diag);
     defer p.deinit();
-    try checkPeek(&p.view, want, diag);
-    return Geometry.init(p.view.hidden, p.view.inter, p.view.n_experts, first_moe_layer, p.view.n_layers);
+    const cb = try checkPeek(&p.view, want, diag);
+    return .{ .geometry = try Geometry.init(p.view.hidden, p.view.inter, p.view.n_experts, first_moe_layer, p.view.n_layers), .codebook = cb };
 }
 
 /// The open bank: DeepSeek's reader over both manifests and `experts.bin` (every record's place and digest, the
@@ -149,16 +174,23 @@ pub fn inspect(a: std.mem.Allocator, io: std.Io, dir: []const u8, first_moe_laye
 pub const Bank = struct {
     owner: expert_bank.Bank,
     geometry: Geometry,
+    /// The pack's codebook (the v2 manifest's, equal to the config's `expert_streaming.quant`): the texts' route.
+    codebook: kernels.Codebook,
 
-    pub fn open(a: std.mem.Allocator, io: std.Io, dir: []const u8, first_moe_layer: u32, want: expert_bank.Implemented, diag: *sdk.Diag) !Bank {
-        const geometry = try inspect(a, io, dir, first_moe_layer, want, diag);
+    /// `declared`: the codebook the config's `expert_streaming.quant` names (root.zig `parse`); a manifest naming another
+    /// is refused by name.
+    pub fn open(a: std.mem.Allocator, io: std.Io, dir: []const u8, first_moe_layer: u32, want: expert_bank.Implemented, declared: kernels.Codebook, diag: *sdk.Diag) !Bank {
+        const ins = try inspectCodebook(a, io, dir, first_moe_layer, want, diag);
+        const geometry = ins.geometry;
+        if (ins.codebook != declared) return refuse(diag, error.Glm5NextExl3Codebook, "the manifest's codebook {t} differs from the config's quant {s}", .{ ins.codebook, quantName(declared) });
         var owner = try expert_bank.Bank.open(a, io, dir, want, diag);
         errdefer owner.deinit();
+        if (!std.mem.eql(u8, owner.codebook, @tagName(ins.codebook))) return refuse(diag, error.Glm5NextExl3Codebook, "the reader's codebook {s} differs from the peek's {t}", .{ owner.codebook, ins.codebook });
         for (owner.layers) |l| for (l.segments, geometry.segments) |x, y| {
             if (x.offset != y.offset or x.length != y.length) return refuse(diag, error.Glm5NextExl3Dims, "a layer's segments differ from the geometry", .{});
         };
         if (owner.sidecar_size != geometry.total_bytes) return refuse(diag, error.Glm5NextExl3Dims, "sidecar {d} B, the geometry's {d} B", .{ owner.sidecar_size, geometry.total_bytes });
-        return .{ .owner = owner, .geometry = geometry };
+        return .{ .owner = owner, .geometry = geometry, .codebook = ins.codebook };
     }
 
     pub fn deinit(b: *Bank) void {
@@ -253,10 +285,10 @@ test "glm5_next exl3 bank: Flash's record is nine segments back to back, 9,474,0
 }
 
 /// The synthetic bank's quantization object as the converter writes it (DeepSeek's synth writes only the tile size).
-fn fullQuantization(a: std.mem.Allocator, text: []const u8, codebook: []const u8) ![]u8 {
-    const from = try std.fmt.allocPrint(a, "\"codebook\":\"{s}\",\"codebook_multiplier\":{d},\"tile\":{{\"size\":16}}", .{ codebook, @as(u64, 0x83DCD12D) });
+fn fullQuantization(a: std.mem.Allocator, text: []const u8, codebook: []const u8, multiplier: u64) ![]u8 {
+    const from = try std.fmt.allocPrint(a, "\"codebook\":\"{s}\",\"codebook_multiplier\":{d},\"tile\":{{\"size\":16}}", .{ codebook, multiplier });
     defer a.free(from);
-    const to = try std.fmt.allocPrint(a, "\"codebook\":\"{s}\",\"codebook_multiplier\":{d},\"tile\":{{\"size\":16,\"layout\":\"exl3-tensor-core\",\"bitstream\":\"msb-first-swap16\"}},\"hadamard\":{{\"size\":128,\"order\":\"sylvester-natural\",\"scale\":\"1/sqrt(128)\"}},\"scales\":{{\"rin\":\"exl3.suh\",\"rout\":\"exl3.svh\"}}", .{ codebook, @as(u64, 0x83DCD12D) });
+    const to = try std.fmt.allocPrint(a, "\"codebook\":\"{s}\",\"codebook_multiplier\":{d},\"tile\":{{\"size\":16,\"layout\":\"exl3-tensor-core\",\"bitstream\":\"msb-first-swap16\"}},\"hadamard\":{{\"size\":128,\"order\":\"sylvester-natural\",\"scale\":\"1/sqrt(128)\"}},\"scales\":{{\"rin\":\"exl3.suh\",\"rout\":\"exl3.svh\"}}", .{ codebook, multiplier });
     defer a.free(to);
     if (std.mem.count(u8, text, from) != 1) return error.TestFixture;
     return std.mem.replaceOwned(u8, a, text, from, to);
@@ -280,7 +312,7 @@ const Synth = struct {
         const io = testing.io;
         const v2 = try self.tmp.dir.readFileAlloc(io, manifest_file, a, .limited(64 << 20));
         defer a.free(v2);
-        const full = try fullQuantization(a, v2, codebook);
+        const full = try fullQuantization(a, v2, codebook, s.multiplier);
         defer a.free(full);
         try self.tmp.dir.writeFile(io, .{ .sub_path = manifest_file, .data = full });
         self.root = try expert_bank.tmpRoot(&self.tmp, &self.rbuf);
@@ -299,7 +331,7 @@ test "glm5_next exl3 bank: a synthetic two-layer, eight-expert bank at GLM's sha
     const s = try Synth.write(.{ .hidden = 4096, .inter = 2048, .n_experts = 8 }, "mul1");
     defer s.close();
     var diag: sdk.Diag = .{};
-    var bank = Bank.open(testing.allocator, testing.io, s.root, 3, synth_implemented, &diag) catch |e| {
+    var bank = Bank.open(testing.allocator, testing.io, s.root, 3, synth_implemented, .mul1, &diag) catch |e| {
         std.debug.print("refused: {s}\n", .{diag.message()});
         return e;
     };
@@ -352,12 +384,62 @@ test "glm5_next exl3 bank: K other than 3, a codebook other than mul1, another m
         };
         defer s.close();
         var diag: sdk.Diag = .{};
-        try testing.expectError(c.err, Bank.open(a, testing.io, s.root, 3, c.want, &diag));
+        try testing.expectError(c.err, Bank.open(a, testing.io, s.root, 3, c.want, .mul1, &diag));
         try testing.expect(std.mem.startsWith(u8, diag.message(), "glm5_next exl3 bank: "));
         try testing.expect(std.mem.indexOf(u8, diag.message(), c.says) != null);
         // The bill's inspect refuses the same way (before any row is billed).
         var d2: sdk.Diag = .{};
         try testing.expectError(c.err, inspect(a, testing.io, s.root, 3, c.want, &d2));
+    }
+}
+
+test "glm5_next exl3 bank: the codebook is the pack's route: a build of both opens an mcg pack (config quant exl3-k3-mcg, v1 mode exl3-mcg); a wrong multiplier, a config naming the other codebook, a v1 mode of the other codebook or a codebook without texts refuse by name" {
+    const a = testing.allocator;
+    const both: expert_bank.Implemented = .{ .codebooks = flash.codebooks, .k = &.{3}, .hidden = 64, .inter = 32, .n_experts = 4, .n_layers = 2 };
+    try testing.expectEqualSlices(u8, "mul1", flash.codebooks[0]);
+    try testing.expectEqualSlices(u8, "mcg", flash.codebooks[1]);
+    try testing.expectEqualStrings("exl3-k3-mcg", quantName(.mcg));
+    try testing.expectEqualStrings("exl3-k3-mul1", quantName(.mul1));
+    try testing.expectEqualStrings(quant_name, quantName(.mul1));
+    try testing.expectEqual(kernels.Codebook.mcg, codebookOfQuant("exl3-k3-mcg").?);
+    try testing.expectEqual(kernels.Codebook.mul1, codebookOfQuant("exl3-k3-mul1").?);
+    try testing.expect(codebookOfQuant("exl3-k3-3inst") == null and codebookOfQuant("exl3-k4-mcg") == null);
+    const mcg: expert_bank.Synth = .{ .codebook = "mcg", .multiplier = 0xCBAC1FED, .v1_mode = "exl3-mcg" };
+    // Opens: the mcg pack on a build of both, its codebook the route.
+    {
+        const s = try Synth.write(mcg, "mcg");
+        defer s.close();
+        var diag: sdk.Diag = .{};
+        var bank = Bank.open(a, testing.io, s.root, 3, both, .mcg, &diag) catch |e| {
+            std.debug.print("refused: {s}\n", .{diag.message()});
+            return e;
+        };
+        defer bank.deinit();
+        try testing.expectEqual(kernels.Codebook.mcg, bank.codebook);
+        try testing.expectEqual(kernels.Codebook.mcg, (try inspectCodebook(a, testing.io, s.root, 3, both, &diag)).codebook);
+        // The bill's geometry is the codebook's neither: the same bytes as a mul1 pack's.
+        const m = try Synth.write(.{}, "mul1");
+        defer m.close();
+        const gm = try inspect(a, testing.io, m.root, 3, both, &diag);
+        try testing.expectEqual(gm.total_bytes, bank.geometry.total_bytes);
+        try testing.expectEqual(gm.record_bytes, bank.geometry.record_bytes);
+    }
+    const Case = struct { synth: expert_bank.Synth, codebook: []const u8, declared: kernels.Codebook, err: anyerror, says: []const u8 };
+    for ([_]Case{
+        .{ .synth = .{ .codebook = "mcg", .multiplier = 0x83DCD12D, .v1_mode = "exl3-mcg" }, .codebook = "mcg", .declared = .mcg, .err = error.Glm5NextExl3Codebook, .says = "codebook_multiplier" },
+        .{ .synth = mcg, .codebook = "mcg", .declared = .mul1, .err = error.Glm5NextExl3Codebook, .says = "differs from the config's quant exl3-k3-mul1" },
+        .{ .synth = .{}, .codebook = "mul1", .declared = .mcg, .err = error.Glm5NextExl3Codebook, .says = "differs from the config's quant exl3-k3-mcg" },
+        .{ .synth = .{ .codebook = "mcg", .multiplier = 0xCBAC1FED }, .codebook = "mcg", .declared = .mcg, .err = error.RuntimeModeNotExl3, .says = "exl3-mcg" },
+        .{ .synth = .{ .codebook = "3inst", .multiplier = 0xCBAC1FED, .v1_mode = "exl3-3inst" }, .codebook = "3inst", .declared = .mcg, .err = error.Glm5NextExl3Codebook, .says = "codebook \"3inst\"" },
+    }) |c| {
+        const s = try Synth.write(c.synth, c.codebook);
+        defer s.close();
+        var diag: sdk.Diag = .{};
+        try testing.expectError(c.err, Bank.open(a, testing.io, s.root, 3, both, c.declared, &diag));
+        testing.expect(std.mem.indexOf(u8, diag.message(), c.says) != null) catch |e| {
+            std.debug.print("diag: {s}\n", .{diag.message()});
+            return e;
+        };
     }
 }
 

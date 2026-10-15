@@ -397,6 +397,9 @@ pub const Config = struct {
     model: glm.Config = .{},
     /// The pack's expert family (parse: the `expert_streaming` block), never a setting.
     expert_family: ExpertFamily = .nvfp4,
+    /// An EXL3 pack's codebook (parse: `expert_streaming.quant`, exl3-k3-mul1 / exl3-k3-mcg), never a setting: the texts'
+    /// construction-time route; the bank's open refuses a manifest naming another.
+    exl3_codebook: @import("exl3_kernels.zig").Codebook = .mul1,
     /// The pack's directory: config.json, the resident shards, the bank (experts.bin and its manifest).
     model_dir: ?[]const u8 = null,
     /// The operator's rows (`expert_rows` the decode rows, `expert_prefill_rows` the prompt rows); null = the bill's fill.

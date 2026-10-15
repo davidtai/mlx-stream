@@ -524,7 +524,7 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
     var old_limit: usize = 0;
     _ = mlx.mlx_set_cache_limit(&old_limit, 512 << 20);
     var diag: sdk.Diag = .{};
-    const seam = xk.install(a, stream, &diag) catch |e| {
+    const seam = xk.install(a, stream, .mul1, &diag) catch |e| {
         std.debug.print("GLM5NEXT_EXL3_KBENCH seam install refused: {s}\n", .{diag.message()});
         return e;
     };

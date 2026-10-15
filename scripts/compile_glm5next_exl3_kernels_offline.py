@@ -49,11 +49,17 @@ K = {
                            [("out", "float32")], [("INTER", I)], [])],
     "glm5n_exl3_din_rin": [([inp("hid", "float32", rows([I]))] + banked3("rn", "float16", [I]) + [inp("ids", "uint32", rows([]))], [("out", "float32")], [("INTER", I)], [])],
     "glm5n_exl3_dpost": [([inp("zd", "float32", rows([H]))] + banked3("rd", "float16", [H]) + [inp("ids", "uint32", rows([]))], [("out", "bfloat16")], [("HID", H), ("T", "bfloat16")], [])],
+    # the mcg codebook's texts (exl3_kernels.zig `Codebook.mcg`): the GEMV's mcg words, the DIG-X GEMMs under the mcg header
+    "glm5n_exl3_gemv_mcg": [([inp("xh", "float32", rows([it * 16])), inp("ids", "uint32", rows([]))] + banked3("code", "int16", [it, ot, 48]),
+                             [("out", "float32")], [("IT", it), ("OT", ot)], []) for it, ot in ((H // 16, I // 16), (I // 16, H // 16))],
     "glm5n_exl3_take2v": [([inp("act", "bfloat16", [{"m": 300}, {"m": H}]), inp("ridx", "int32", rows([])), inp("rhs", "uint32", rows([])), inp("slots", "int32", [{"m": 80}]),
                             inp("rin_g", "float16", bank([H])), inp("rin_u", "float16", bank([H]))], [("out_g", "float16"), ("out_u", "float16")], [("HID", H)], [])],
     "glm5n_exl3_gemm_gu": [([inp("x0", "float16", rows([1, H])), inp("x1", "float16", rows([1, H])), inp("code0", "int16", bank(GU_CODE)), inp("code1", "int16", bank(GU_CODE)), inp("tbl", "int32", [{"m": 80}])],
                             [("z0", "float32"), ("z1", "float32")], [("KD", H), ("ND", I)], ["gemm"])],
     "glm5n_exl3_gemm_dn": [([inp("x", "float16", rows([1, I])), inp("code0", "int16", bank(DN_CODE)), inp("tbl", "int32", [{"m": 80}])], [("z0", "float32")], [("KD", I), ("ND", H)], ["gemm"])],
+    "glm5n_exl3_gemm_gu@mcg": [([inp("x0", "float16", rows([1, H])), inp("x1", "float16", rows([1, H])), inp("code0", "int16", bank(GU_CODE)), inp("code1", "int16", bank(GU_CODE)), inp("tbl", "int32", [{"m": 80}])],
+                                [("z0", "float32"), ("z1", "float32")], [("KD", H), ("ND", I)], ["gemm_mcg"])],
+    "glm5n_exl3_gemm_dn@mcg": [([inp("x", "float16", rows([1, I])), inp("code0", "int16", bank(DN_CODE)), inp("tbl", "int32", [{"m": 80}])], [("z0", "float32")], [("KD", I), ("ND", H)], ["gemm_mcg"])],
     "glm5n_exl3_onepass": [([inp("z0", "float32", rows([I])), inp("z1", "float32", rows([I])), inp("rhs", "uint32", rows([])), inp("tbl", "int32", [{"m": 80}]),
                              inp("rout0", "float16", bank([I])), inp("rout1", "float16", bank([I])), inp("rin2", "float16", bank([I]))], [("hd", "float16")], [("INTER", I), ("SGS", 8)], ["onepass"])],
     "glm5n_exl3_widen1": [([inp("act", "float32", rows([H])), inp("rhs", "uint32", rows([])), inp("slots", "int32", [{"m": 80}]), inp("rout", "float16", bank([H]))],
@@ -73,10 +79,12 @@ def main():
         print("KERNELS_OFFLINE_COMPILE BAD_INCLUDE %s" % a.mlx_include)
         return 2
     headers = {"gemm": open(os.path.join(XDIR, "header_dig_mul1h_k3.metal")).read(),
+               "gemm_mcg": open(os.path.join(KDIR, "header_glm5n_exl3_dig_mcg.metal")).read(),
                "onepass": open(os.path.join(XDIR, "header_dig2_x.metal")).read() + open(os.path.join(KDIR, "header_glm5n_exl3_dig2.metal")).read()}
     tmp = tempfile.mkdtemp(prefix="glm5n-exl3-offline-")
     n = bad = 0
-    for name, insts in K.items():
+    for key, insts in K.items():
+        name = key.split("@")[0]  # "<text>@<codebook>": the text under that codebook's header
         src = open(os.path.join(KDIR, name + ".metal")).read()
         texts = {"source": src, "header": "".join(headers[h] for h in insts[0][3])}
         for ins, outs, tmpl_, _ in insts:
@@ -85,7 +93,7 @@ def main():
             for r in (1, 9):
                 text = cko.assemble(kk, texts, (tmpl, [d for _, d in outs], {"R": r, "S": 4}))
                 n += 1
-                f = os.path.join(tmp, "%s_%s_r%d.metal" % (name, "_".join(str(v) for _, v in tmpl_), r))
+                f = os.path.join(tmp, "%s_%s_r%d.metal" % (key.replace("@", "_"), "_".join(str(v) for _, v in tmpl_), r))
                 open(f, "w").write(text)
                 cmd = ["xcrun", "-sdk", "macosx", "metal", "-std=" + a.std, "-fmetal-math-mode=safe", "-I", a.mlx_include]
                 res = subprocess.run(cmd + ["-c", f, "-o", f + ".air"], capture_output=True, text=True)

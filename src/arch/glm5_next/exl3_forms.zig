@@ -17,6 +17,10 @@
 //! Every form keeps the seam's arithmetic and order per output word (fma chains per lane over the k-tiles, the column
 //! sums, the 128-point butterflies, the scales, the clamped SwiGLU, one rounding on dpost's store); only where values
 //! live and which thread computes them change. A form that fails the device parity is not installed.
+//! Codebook (the pack's, a construction-time route: `install` reads it from the seam's `Kernels.codebook`): under mul1
+//! every form above; under mcg the served forms `seam`, `guone` (`g5k3_guone_mcg`) and `pair` (`g5k3_pair_mcg`): the mul1
+//! texts with the kernel bench's mcg decode words (scripts/glm5next_exl3_forms_gen.py), bound once at install. A form
+//! with no mcg text (u8, the bench's mcg price, the fused and prologue forms) is refused at install on an mcg pack.
 //! Wave widths: P = 1 .. `max_pairs` (64 = 8 tokens x top-8, the NVFP4 texts' widest wave; the decode lane forms at most
 //! 4 rows x 8 = 32 pairs, and the scheduler's route at most `policy.max_route_ids` = 48).
 
@@ -81,7 +85,7 @@ pub const Forms = struct {
 
 // ── The texts ──
 
-pub const Kernel = enum { g5k3_gu_fused, g5k3_dn_fused, g5k3_dn_pro, g5k3_guone, g5k3_pair, g5k3_gemv_u8, g5k3_gemv_mcg };
+pub const Kernel = enum { g5k3_gu_fused, g5k3_dn_fused, g5k3_dn_pro, g5k3_guone, g5k3_pair, g5k3_gemv_u8, g5k3_gemv_mcg, g5k3_guone_mcg, g5k3_pair_mcg };
 const n_kernels = std.meta.fieldNames(Kernel).len;
 const dir = "../../kernels/glm5_next_exl3_forms/";
 pub const texts: [n_kernels][:0]const u8 = blk: {
@@ -90,6 +94,9 @@ pub const texts: [n_kernels][:0]const u8 = blk: {
     break :blk out;
 };
 pub const header: [:0]const u8 = @embedFile(dir ++ "header_g5k3.metal");
+pub fn textOf(k: Kernel) [:0]const u8 {
+    return texts[@intFromEnum(k)];
+}
 /// sha256 of each text (the generated ones as `scripts/glm5next_exl3_forms_gen.py` writes them) and of the header.
 pub const text_sha256 = [n_kernels]*const [64]u8{
     "06518c1a2675dca204da46410c37570d015b8dd94ad9fcb89d13e842f5783721",
@@ -99,6 +106,8 @@ pub const text_sha256 = [n_kernels]*const [64]u8{
     "5214c036ac204e09a420dd36466c2831b1a3bec5539fdef6d4a75a8541eab1b2",
     "66d970fa467925ce0f5d9dec3bdba70d1e0955dbdaabbcf3e193ca2676021e5d",
     "68722bac9793357fe9046c5b5f6abfea4d78b55ed05f1c0b5a712b66a9d5d780",
+    "721cb29af3e9951c73211cbbe42474ba7cd2547b37b329930318182550f731fb",
+    "062d6ce33132ed7c154468e1df6703a362af9788e93f7915323a711576a000d8",
 };
 pub const header_sha256: *const [64]u8 = "4e4dbb86d58cccb83e961c96308ca43bb660f72223f0e795f53484fa956cc3f8";
 
@@ -114,8 +123,8 @@ fn sigOf(k: Kernel) Sig {
         .g5k3_gu_fused => .{ .ins = &.{ "xg", "xu", "ids", "code_g0", "code_g1", "code_g2", "code_u0", "code_u1", "code_u2", "og0", "og1", "og2", "ou0", "ou1", "ou2" }, .outs = &.{"out"}, .hdr = true },
         .g5k3_dn_fused => .{ .ins = &.{ "xd", "ids", "cd0", "cd1", "cd2", "rd0", "rd1", "rd2" }, .outs = &.{"out"}, .hdr = true },
         .g5k3_dn_pro => .{ .ins = &.{ "h", "ids", "cd0", "cd1", "cd2", "rn0", "rn1", "rn2", "rd0", "rd1", "rd2" }, .outs = &.{"out"}, .hdr = true },
-        .g5k3_guone => .{ .ins = &.{ "xh_g", "xh_u", "ids", "code_g0", "code_g1", "code_g2", "code_u0", "code_u1", "code_u2" }, .outs = &.{ "out_g", "out_u" }, .hdr = false },
-        .g5k3_pair, .g5k3_gemv_u8, .g5k3_gemv_mcg => .{ .ins = &.{ "xh", "ids", "code0", "code1", "code2" }, .outs = &.{"out"}, .hdr = false },
+        .g5k3_guone, .g5k3_guone_mcg => .{ .ins = &.{ "xh_g", "xh_u", "ids", "code_g0", "code_g1", "code_g2", "code_u0", "code_u1", "code_u2" }, .outs = &.{ "out_g", "out_u" }, .hdr = false },
+        .g5k3_pair, .g5k3_pair_mcg, .g5k3_gemv_u8, .g5k3_gemv_mcg => .{ .ins = &.{ "xh", "ids", "code0", "code1", "code2" }, .outs = &.{"out"}, .hdr = false },
     };
 }
 
@@ -237,6 +246,9 @@ pub const Installed = struct {
     forms: Forms,
     out_dtype: mlx.mlx_dtype,
     seam: *const xk.Kernels,
+    /// The guone / pair texts of the seam's codebook (`textsFor`), bound at install.
+    guone_k: Kernel = .g5k3_guone,
+    pair_k: Kernel = .g5k3_pair,
     k: [n_kernels]mlx.mlx_fast_metal_kernel = @splat(.{ .ctx = null }),
     w: [max_pairs]WaveCfg = @splat(.{}),
     tok: [max_pairs]T = @splat(.{ .ctx = null }),
@@ -257,6 +269,16 @@ pub const Installed = struct {
     }
 };
 
+/// The codebook's guone / pair texts; null when `forms` has a form without a text in that codebook (mcg: seam, guone and
+/// pair only; the gate/up and down forms checked separately).
+pub const CodebookTexts = struct { guone: Kernel, pair: Kernel };
+pub fn textsFor(cb: xk.Codebook, forms: Forms) ?CodebookTexts {
+    return switch (cb) {
+        .mul1 => .{ .guone = .g5k3_guone, .pair = .g5k3_pair },
+        .mcg => if ((forms.gu == .seam or forms.gu == .guone) and (forms.dn == .seam or forms.dn == .pair)) .{ .guone = .g5k3_guone_mcg, .pair = .g5k3_pair_mcg } else null,
+    };
+}
+
 /// Construction, once: the forms checked, the pins, the texts built, every wave width's launches of the chosen forms
 /// prepared (`out_dtype`: down's output, the seam's bf16; the bench also installs f32 for its reference check). The
 /// seam's kernels (`seam`, from `exl3_kernels.install`) run in_rin, gu_epi, din_rin, dpost and the seam GEMV.
@@ -265,12 +287,16 @@ pub fn install(a: std.mem.Allocator, seam: *const xk.Kernels, forms: Forms, out_
         diag.set("glm5_next exl3 forms: {t} / {t} at maxm {d} is not an installable form", .{ forms.gu, forms.dn, forms.maxm });
         return e;
     };
+    const ct = textsFor(seam.codebook, forms) orelse {
+        diag.set("glm5_next exl3 forms: {t} / {t} has no {t} codebook text (an {t} pack serves the seam, guone and pair forms)", .{ forms.gu, forms.dn, seam.codebook, seam.codebook });
+        return error.Glm5NextExl3FormsCodebook;
+    };
     checkPins() catch |e| {
         diag.set("glm5_next exl3 forms: a text is not the pinned one", .{});
         return e;
     };
     const self = try a.create(Installed);
-    self.* = .{ .forms = forms, .out_dtype = out_dtype, .seam = seam };
+    self.* = .{ .forms = forms, .out_dtype = out_dtype, .seam = seam, .guone_k = ct.guone, .pair_k = ct.pair };
     errdefer {
         self.deinit();
         a.destroy(self);
@@ -348,7 +374,7 @@ pub fn gateUp(f: *const Installed, g: *G, x: T, ids: T, banks: *const [n_banks]B
             try apply(g, k, w.g1, &.{ xs[0], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code }, z[0..1]);
             try apply(g, k, w.g1, &.{ xs[1], ids, banks[0].up.code, banks[1].up.code, banks[2].up.code }, z[1..2]);
         },
-        .guone => try apply(g, f.kern(.g5k3_guone), w.g1, &.{ xs[0], xs[1], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &z),
+        .guone => try apply(g, f.kern(f.guone_k), w.g1, &.{ xs[0], xs[1], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &z),
         .fused16, .fused8 => {
             var out: [1]T = undefined;
             try apply(g, f.kern(.g5k3_gu_fused), w.g1, &.{ xs[0], xs[1], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code, banks[0].gate.rout, banks[1].gate.rout, banks[2].gate.rout, banks[0].up.rout, banks[1].up.rout, banks[2].up.rout }, &out);
@@ -384,7 +410,7 @@ pub fn down(f: *const Installed, g: *G, h: T, ids: T, banks: *const [n_banks]Ban
     }
     const k = switch (w.f.dn) {
         .seam => f.seamK(.gemv),
-        .pair => f.kern(.g5k3_pair),
+        .pair => f.kern(f.pair_k),
         else => f.kern(.g5k3_gemv_mcg),
     };
     var zd: [1]T = undefined;

@@ -115,15 +115,16 @@ pub const Math = struct {
     pack: *const fn (self: *Self, rows: quant.PrefillRows) error{OutOfMemory}![]u32,
     slot_cursor: std.ArrayList(u32) = .empty,
 
-    /// Construction (the module's GPU stream): the texts installed (`exl3_kernels.install`: pins, kernels, the decode
+    /// Construction (the module's GPU stream): `codebook` the pack's (exl3_bank.zig `Bank.codebook`: the decode GEMV,
+    /// the forms' guone / pair and the DIG-X header of that codebook, one route bound here); the texts installed (`exl3_kernels.install`: pins, kernels, the decode
     /// launches, the compile check), refused by name; the decode forms (`forms`, the settings' `Exl3Forms.forms()`): the
     /// seam chain binds lane B's kernels and installs nothing more; any other form is installed here (exl3_forms.zig
     /// `install`: the forms checked, the pins, its texts and every wave width's launches), refused by name; the prompt
     /// waves at `wave_rows` rows (validated with the settings: whole M tiles, at most `prompt_levers.max_wave_rows`), the
     /// rows' order by `pack`.
-    pub fn init(a: std.mem.Allocator, s: mlx.mlx_stream, call_rows: u32, forms: xf.Forms, wave_rows: u32, pack: Pack, diag: *sdk.Diag) !Self {
+    pub fn init(a: std.mem.Allocator, s: mlx.mlx_stream, codebook: kernels.Codebook, call_rows: u32, forms: xf.Forms, wave_rows: u32, pack: Pack, diag: *sdk.Diag) !Self {
         std.debug.assert(wave_rows >= prompt_levers.min_wave_rows and wave_rows <= prompt_levers.max_wave_rows);
-        const k = try kernels.install(a, s, diag);
+        const k = try kernels.install(a, s, codebook, diag);
         errdefer {
             k.deinit();
             a.destroy(k);

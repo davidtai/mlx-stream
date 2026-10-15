@@ -41,6 +41,34 @@ pub const tile_words: u32 = 16 * k_bits;
 /// The codebook the texts decode (exl3 mul1, the multiplier in the texts).
 pub const codebook = xq.format.codebook;
 pub const codebook_multiplier: u64 = xq.format.multiplier;
+
+/// The codebooks this build decodes, a construction-time route chosen from the pack (the v2 manifest's
+/// `quantization.codebook`, exl3_bank.zig `checkPeek`): the texts that carry decode words (the decode GEMV, the forms'
+/// guone / pair, the DIG-X GEMMs' header) are instantiated once per codebook; every other text, the launches, the
+/// bank reads and the bytes are shared. `mcg` decodes with the kernel bench's mcg words (g5k3_gemv_mcg: exllamav3
+/// codebook.cuh L67-75).
+pub const Codebook = enum {
+    mul1,
+    mcg,
+
+    pub fn multiplier(c: Codebook) u64 {
+        return switch (c) {
+            .mul1 => 0x83DCD12D,
+            .mcg => 0xCBAC1FED,
+        };
+    }
+
+    /// The pack's codebook by its manifest name (null: a codebook this build has no texts for).
+    pub fn ofName(name: []const u8) ?Codebook {
+        return std.meta.stringToEnum(Codebook, name);
+    }
+};
+/// Every codebook's manifest name (the bank's `Implemented.codebooks`).
+pub const codebook_names: []const []const u8 = std.meta.fieldNames(Codebook);
+comptime {
+    if (!std.mem.eql(u8, codebook, @tagName(Codebook.mul1)) or codebook_multiplier != Codebook.mul1.multiplier())
+        @compileError("glm5_next exl3: the mul1 texts' codebook is not DeepSeek's format");
+}
 /// The swiglu clamp the texts fuse (gu_epi, onepass): GLM-5.3-Flash's `swiglu_limit` is DeepSeek's.
 pub const swiglu_limit: f64 = xq.fused_act.swiglu_clamped;
 /// The widest decode wave: one route (the scheduler's `max_route_ids`).
@@ -100,6 +128,24 @@ pub const texts: [n_kernels][:0]const u8 = .{
 /// The DIG-X GEMMs' header (DeepSeek's, reused as it is) and the onepass header (DeepSeek's dig2 helpers + GLM's width
 /// parameter).
 pub const header_gemm: [:0]const u8 = @embedFile("../../kernels/exl3/header_dig_mul1h_k3.metal");
+/// The mcg codebook's texts (scripts/glm5next_exl3_kernels_gen.py): the decode GEMV with the kernel bench's mcg words,
+/// and the DIG-X GEMMs' header with dig_cb decoding mcg. The other kernels' texts are the mul1 build's.
+pub const gemv_mcg: [:0]const u8 = @embedFile(dir ++ "glm5n_exl3_gemv_mcg.metal");
+pub const header_gemm_mcg: [:0]const u8 = @embedFile(dir ++ "header_glm5n_exl3_dig_mcg.metal");
+pub const gemv_mcg_sha256: *const [64]u8 = "bae6de38f74036fa6286eaaddd4ec33eab19394266c28d14f04d404e93562363";
+pub const header_gemm_mcg_sha256: *const [64]u8 = "2a6962c0216011540eb5643e7855af4ff18826179009c5ff5daedf1428fbb7aa";
+
+/// A kernel's text and header under a codebook.
+pub fn textOf(cb: Codebook, k: Kernel) [:0]const u8 {
+    return if (cb == .mcg and k == .gemv) gemv_mcg else texts[@intFromEnum(k)];
+}
+pub fn headerOf(cb: Codebook, k: Kernel) [:0]const u8 {
+    return if (cb == .mcg and decodesInHeader(k)) header_gemm_mcg else sigOf(k).header;
+}
+/// The texts whose decode words live in `header_gemm` (the DIG-X GEMMs' B loader).
+pub fn decodesInHeader(k: Kernel) bool {
+    return k == .gemm_gu or k == .gemm_dn;
+}
 pub const header_onepass: [:0]const u8 = @embedFile("../../kernels/exl3/header_dig2_x.metal") ++ @embedFile(dir ++ "header_glm5n_exl3_dig2.metal");
 
 /// sha256 of each text as `scripts/glm5next_exl3_kernels_gen.py` writes it (checked once at install and in the tests).
@@ -118,6 +164,8 @@ pub const text_sha256 = [n_kernels]*const [64]u8{
 
 pub fn checkPins() error{Glm5NextExl3TextNotPinned}!void {
     for (texts, text_sha256) |t, want| if (!std.mem.eql(u8, &kset.shaHex(t), want)) return error.Glm5NextExl3TextNotPinned;
+    if (!std.mem.eql(u8, &kset.shaHex(gemv_mcg), gemv_mcg_sha256)) return error.Glm5NextExl3TextNotPinned;
+    if (!std.mem.eql(u8, &kset.shaHex(header_gemm_mcg), header_gemm_mcg_sha256)) return error.Glm5NextExl3TextNotPinned;
 }
 
 /// A text's MLX signature: inputs, outputs, whether MLX makes the inputs row-contiguous (the texts that read strides
@@ -258,6 +306,8 @@ pub fn dpostLaunch(p: u32) Launch {
 const DecodeCfg = struct { in_rin: Config, gemv_gu: Config, gu_epi: Config, din_rin: Config, gemv_dn: Config, dpost: Config };
 
 pub const Kernels = struct {
+    /// The codebook the decode texts were built for (the pack's, at install).
+    codebook: Codebook = .mul1,
     k: [n_kernels]MKernel = @splat(.{ .ctx = null }),
     /// [P - 1]: the decode launches of a P-pair wave.
     dec: [max_pairs]?DecodeCfg = @splat(null),
@@ -280,9 +330,10 @@ pub const Kernels = struct {
     }
 };
 
-/// Construction, once (the module's GPU stream): the pins, every text built, the decode launches prepared for every wave
-/// width, one launch of each decode text over zeros as the compile check. Refused by name.
-pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, diag: *sdk.Diag) !*Kernels {
+/// Construction, once (the module's GPU stream): the pins, every text built for the pack's codebook `cb` (the decode
+/// GEMV and the DIG-X header are the codebook's; an mcg kernel carries the suffix `_mcg` in its name), the decode launches
+/// prepared for every wave width, one launch of each decode text over zeros as the compile check. Refused by name.
+pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, cb: Codebook, diag: *sdk.Diag) !*Kernels {
     checkPins() catch |e| {
         diag.set("glm5_next exl3 kernels: a text is not the pinned one (scripts/glm5next_exl3_kernels_gen.py --check)", .{});
         return e;
@@ -292,7 +343,7 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, diag: *sdk.Diag) !*Kerne
         return error.Glm5NextExl3NotGpu;
     }
     const self = try a.create(Kernels);
-    self.* = .{};
+    self.* = .{ .codebook = cb };
     errdefer {
         self.deinit();
         a.destroy(self);
@@ -303,7 +354,10 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, diag: *sdk.Diag) !*Kerne
         defer _ = mlx.mlx_vector_string_free(in_vec);
         const out_vec = mlx.mlx_vector_string_new_data(@ptrCast(sig.outs.ptr), sig.outs.len);
         defer _ = mlx.mlx_vector_string_free(out_vec);
-        self.k[i] = mtl.mlx_fast_metal_kernel_new("glm5n_exl3_" ++ @tagName(k), in_vec, out_vec, texts[i], sig.header, sig.contiguous, false);
+        const name: [:0]const u8 = switch (cb) {
+            inline else => |c| comptime kernelName(c, k),
+        };
+        self.k[i] = mtl.mlx_fast_metal_kernel_new(name, in_vec, out_vec, textOf(cb, k), headerOf(cb, k), sig.contiguous, false);
         if (self.k[i].ctx == null) {
             diag.set("glm5_next exl3 kernels: glm5n_exl3_{s} was not created", .{@tagName(k)});
             return error.Glm5NextExl3Kernel;
@@ -330,6 +384,13 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, diag: *sdk.Diag) !*Kerne
         return e;
     };
     return self;
+}
+
+/// A kernel's MLX name under a codebook: the mul1 names unchanged, an mcg instance whose text or header differs carries
+/// `_mcg` (the library cache never mixes the two codebooks' texts under one name).
+pub fn kernelName(comptime cb: Codebook, comptime k: Kernel) [:0]const u8 {
+    const differs = cb == .mcg and (k == .gemv or decodesInHeader(k));
+    return "glm5n_exl3_" ++ @tagName(k) ++ (if (differs) "_mcg" else "");
 }
 
 /// One decode wave of one pair over zero banks of one slot row, evaluated.

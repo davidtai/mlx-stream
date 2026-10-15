@@ -178,14 +178,22 @@ pub fn sourceGeometry(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Con
         .nvfp4 => .ofNvfp4(try bank.inspect(a, io, dir)),
         .exl3 => blk: {
             var diag: sdk.Diag = .{};
-            const g = exl3_bank.inspect(a, io, dir, @intCast(cfg.model.first_k_dense), exl3_bank.flash, &diag) catch |e| {
+            const ins = exl3_bank.inspectCodebook(a, io, dir, @intCast(cfg.model.first_k_dense), exl3_bank.flash, &diag) catch |e| {
                 if (diag.len > 0) sdk.log.err("{s}\n", .{diag.message()});
                 return e;
             };
-            break :blk .ofExl3(g);
+            // The codebook moves no byte (the same record, slot rows and texts' workspace); the config's quant must name
+            // the manifest's (the bank's open refuses the same pack).
+            if (ins.codebook != cfg.exl3_codebook) {
+                sdk.log.err("glm5_next exl3 bank: the manifest's codebook {t} differs from the config's quant {s}\n", .{ ins.codebook, exl3_bank.quantName(cfg.exl3_codebook) });
+                return error.Glm5NextExl3Codebook;
+            }
+            break :blk .ofExl3(ins.geometry);
         },
     };
 }
+
+const exl3_kernels_cb = @import("exl3_kernels.zig").Codebook;
 
 pub const Inputs = struct {
     model: glm.Config,
@@ -1056,13 +1064,14 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
     // `GLM5_BILL_DRAFT_HEAD=bf16|q4|q8` (with the lane): the lane's draft head (`mtp_head_q4` / `mtp_head_q8`); absent, the
     // settings' default (q8 since g26: `mtp_head_q8` with the lane).
     const head: settings.DraftHead = if (std.c.getenv("GLM5_BILL_DRAFT_HEAD")) |v| std.meta.stringToEnum(settings.DraftHead, std.mem.span(v)) orelse return error.Glm5NextDraftHeadSetting else (settings.Config{}).draft_head;
-    const fam = blk: {
+    const fam, const codebook = blk: {
         const v = try std.json.parseFromSlice(std.json.Value, a, config_text, .{});
         defer v.deinit();
         const block = if (v.value == .object) v.value.object.get("expert_streaming") orelse .null else .null;
-        break :blk @import("root.zig").declared(block) orelse return error.Glm5NextPackRequired;
+        const f = @import("root.zig").declared(block) orelse return error.Glm5NextPackRequired;
+        break :blk .{ f, if (f == .exl3) @import("root.zig").declaredCodebook(block).? else exl3_kernels_cb.mul1 };
     };
-    var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane, .prompt = .{ .wave_rows = wave_rows }, .draft_head = head };
+    var cfg: settings.Config = .{ .model = model, .expert_family = fam, .exl3_codebook = codebook, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane, .prompt = .{ .wave_rows = wave_rows }, .draft_head = head };
     if (!prompt_levers.validWaveRows(wave_rows)) return error.Glm5NextExl3WaveRows;
     try cfg.prompt.check(fam == .exl3);
     if (wave_rows != prompt_levers.default_wave_rows) std.debug.print("\nGLM5_NEXT BILL exl3_wave_rows={d}\n", .{wave_rows});

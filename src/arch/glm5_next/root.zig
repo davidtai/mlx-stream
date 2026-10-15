@@ -42,8 +42,17 @@ pub const releaseProcess = sdk_ext.expert.giveReader;
 pub fn declared(v: std.json.Value) ?settings.ExpertFamily {
     if (v != .object) return null;
     if (fieldsAre(v, .{ .{ "family", family }, .{ "format", bank.format }, .{ "manifest", manifest_file } })) return .nvfp4;
-    if (fieldsAre(v, .{ .{ "family", family }, .{ "format", exl3_bank.format }, .{ "manifest", exl3_bank.manifest_file }, .{ "runtime_manifest", exl3_bank.runtime_manifest_file }, .{ "quant", exl3_bank.quant_name } })) return .exl3;
+    if (fieldsAre(v, .{ .{ "family", family }, .{ "format", exl3_bank.format }, .{ "manifest", exl3_bank.manifest_file }, .{ "runtime_manifest", exl3_bank.runtime_manifest_file } }) and declaredCodebook(v) != null) return .exl3;
     return null;
+}
+
+/// The codebook an EXL3 block's `quant` names (`exl3-k3-mul1` / `exl3-k3-mcg`, exl3_bank.zig `codebookOfQuant`); null
+/// for any other quant. The bank's open refuses a manifest naming another codebook.
+pub fn declaredCodebook(v: std.json.Value) ?@import("exl3_kernels.zig").Codebook {
+    if (v != .object) return null;
+    const q = v.object.get("quant") orelse return null;
+    if (q != .string) return null;
+    return exl3_bank.codebookOfQuant(q.string);
 }
 
 fn fieldsAre(v: std.json.Value, comptime pairs: anytype) bool {
@@ -69,7 +78,7 @@ pub fn parse(a: std.mem.Allocator, p: *const sdk.ConfigPeek, diag: *sdk.Diag) !*
     }
     const block = p.root.get("expert_streaming") orelse .null;
     const fam = declared(block) orelse {
-        diag.set("glm5_next: the pack declares no mlx-stream NVFP4 bank or EXL3 K=3 mul1 bank (expert_streaming {{family, format, manifest[, runtime_manifest, quant]}})", .{});
+        diag.set("glm5_next: the pack declares no mlx-stream NVFP4 bank or EXL3 K=3 mul1 / mcg bank (expert_streaming {{family, format, manifest[, runtime_manifest, quant]}})", .{});
         return error.Glm5NextPackRequired;
     };
     var md: glm.Diag = .{};
@@ -79,7 +88,7 @@ pub fn parse(a: std.mem.Allocator, p: *const sdk.ConfigPeek, diag: *sdk.Diag) !*
     };
     const c = try a.create(Config);
     errdefer a.destroy(c);
-    c.* = .{ .model = model, .expert_family = fam, .model_dir = if (p.model_dir.len > 0) try a.dupe(u8, p.model_dir) else null };
+    c.* = .{ .model = model, .expert_family = fam, .exl3_codebook = if (fam == .exl3) declaredCodebook(block).? else .mul1, .model_dir = if (p.model_dir.len > 0) try a.dupe(u8, p.model_dir) else null };
     errdefer if (c.model_dir) |d| a.free(d);
     if (block.object.get("settings")) |raw| {
         if (raw != .object) {
@@ -330,8 +339,9 @@ test "glm5_next parse: the EXL3 K=3 mul1 pack's block selects the exl3 family; t
     defer arena.deinit();
     const base = try glm.flashConfigJson(arena.allocator());
     const marker = "\"model_type\":\"glm5_next\",";
-    for ([_]struct { block: []const u8, fam: settings.ExpertFamily }{
+    for ([_]struct { block: []const u8, fam: settings.ExpertFamily, cb: @import("exl3_kernels.zig").Codebook = .mul1 }{
         .{ .block = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mtplx-expert-manifest-v2\",\"manifest\":\"expert-manifest-v2.json\",\"runtime_manifest\":\"expert-manifest.json\",\"quant\":\"exl3-k3-mul1\"},", .fam = .exl3 },
+        .{ .block = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mtplx-expert-manifest-v2\",\"manifest\":\"expert-manifest-v2.json\",\"runtime_manifest\":\"expert-manifest.json\",\"quant\":\"exl3-k3-mcg\"},", .fam = .exl3, .cb = .mcg },
         .{ .block = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-nvfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"},", .fam = .nvfp4 },
     }) |case| {
         const text = try std.mem.replaceOwned(u8, arena.allocator(), base, marker, try std.mem.concat(arena.allocator(), u8, &.{ marker, case.block }));
@@ -340,5 +350,8 @@ test "glm5_next parse: the EXL3 K=3 mul1 pack's block selects the exl3 family; t
         const c = try parse(a, &peek, &diag);
         defer freeConfig(a, c);
         try testing.expectEqual(case.fam, c.expert_family);
+        try testing.expectEqual(case.cb, c.exl3_codebook);
     }
+    // A quant naming a codebook without texts declares no family.
+    try testing.expect(declared((try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"family\":\"mlx-stream\",\"format\":\"mtplx-expert-manifest-v2\",\"manifest\":\"expert-manifest-v2.json\",\"runtime_manifest\":\"expert-manifest.json\",\"quant\":\"exl3-k3-3inst\"}", .{}))) == null);
 }
