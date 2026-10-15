@@ -81,7 +81,7 @@ test "dsv41 memory mini: billAt bills every term from the bank's own files and t
     var ck = try v41.Checkpoint.openIndexed(a, io, tm.root, &vd);
     defer ck.deinit();
     const m = try v41.WeightMap.build(a, try v41.residentSpec(a, &c), &ck, &vd);
-    try testing.expectEqual(m.totalBytes() + bill.builtResidentBytes(&c, .bf16, false), b.residents);
+    try testing.expectEqual(m.totalBytes() + bill.builtResidentBytes(&c, .bf16), b.residents);
     try testing.expectEqual(m.bytes_by_module[@backingInt(v41.Module.embed)], b.embedding);
     try testing.expect(b.engram > 0);
     // The prompt and decode transients, from the arch's bills at the request's positions.
@@ -189,11 +189,7 @@ test "dsv41 memory mini: each route the bill reads moves its own term by geometr
     // HEAD_MODE mxfp8: its codes and scales built, the dense head dropped.
     o.head_mode = .mxfp8;
     const bh = try bill.billAtFloor(a, io, config, prompt, max_tokens, null, ceiling, o);
-    try testing.expectEqual(@as(i64, @intCast(bill.builtResidentBytes(&c, .mxfp8, false) - bill.builtResidentBytes(&c, .bf16, false))) - @as(i64, @intCast(bill.droppedResidentBytes(&m, &c, .mxfp8, false))), @as(i64, @intCast(bh.residents)) - @as(i64, @intCast(b0.residents)));
-    // DENSE_RC: the stacked shared gate | up built, the halves dropped (bytes equal).
-    o = ov;
-    o.dense_rc = true;
-    try testing.expectEqual(b0.residents, (try bill.billAtFloor(a, io, config, prompt, max_tokens, null, ceiling, o)).residents);
+    try testing.expectEqual(@as(i64, @intCast(bill.builtResidentBytes(&c, .mxfp8) - bill.builtResidentBytes(&c, .bf16))) - @as(i64, @intCast(bill.droppedResidentBytes(&m, .mxfp8))), @as(i64, @intCast(bh.residents)) - @as(i64, @intCast(b0.residents)));
     // The decode cache limit and the transient release, each its own term.
     o = ov;
     o.decode_cache_bytes = 1 << 20;

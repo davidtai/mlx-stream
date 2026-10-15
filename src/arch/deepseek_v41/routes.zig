@@ -47,7 +47,6 @@ pub const Tier = struct {
         // The trunk's verify-row sites (C23, C27-C29): the draft block keeps its own C16 routes.
         r.rc_smallm = false;
         r.rc_mxfp8_rows = false;
-        r.dense_rc = false;
         r.rc_index_topk = false;
         r.rc_attn_softmax = false;
         r.head = switch (self.routes.head) {

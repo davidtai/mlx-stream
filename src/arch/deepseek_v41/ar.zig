@@ -689,7 +689,7 @@ fn envStr(name: [*:0]const u8) ?[]const u8 {
 
 /// The cell levers this build no longer takes (each one dead in the ledger): a window that still sets one is refused by
 /// name before any work, never ignored.
-const retired_cell_levers = [_][:0]const u8{"DSV41_CELL_PREDICT_BF16"};
+const retired_cell_levers = [_][:0]const u8{ "DSV41_CELL_PREDICT_BF16", "DSV41_CELL_DENSE_RC" };
 
 /// The first retired cell lever that `getenv` finds set, or null.
 fn retiredCellLever(getenv: anytype) ?[]const u8 {
@@ -1206,8 +1206,6 @@ const CellReceipt = struct {
     head_mxfp8_rc: ?bool = null,
     /// ROUTED_FORMS as installed: "stock", "down_pair", "gu_one" or "down_pair,gu_one".
     routed_forms: []const u8 = "stock",
-    /// DENSE_RC as installed.
-    dense_rc: ?bool = null,
     /// ROUTED_BANKED as installed: the routed decode stages one launch over every bank (true) or per bank.
     routed_banked: bool = false,
     /// HOIST_FIRST as installed: each decode call's hoist committed before its routing barrier's wait (true) or behind
@@ -1682,7 +1680,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .head_mode = @tagName(md.installed.head_mode),
         .head_mxfp8_rc = if (md.installed.head_mode == .mxfp8) md.installed.head_mxfp8_rc else null,
         .routed_forms = formsName(md.installed.routed_forms),
-        .dense_rc = md.installed.dense_rc,
         .routed_banked = md.installed.routed_banked,
         .hoist_first = md.installed.hoist_first,
         .draft_staged = md.installed.draft_staged,
@@ -1817,7 +1814,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_ROUTED_FORMS")) |v| ov.routed_forms = try parseForms(v);
-    if (envStr("DSV41_CELL_DENSE_RC")) |v| ov.dense_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellDenseRc;
     if (envStr("DSV41_CELL_ROUTED_BANKED")) |v| ov.routed_banked = try cellBool("DSV41_CELL_ROUTED_BANKED", v);
     if (envStr("DSV41_CELL_HOIST_FIRST")) |v| ov.hoist_first = try cellBool("DSV41_CELL_HOIST_FIRST", v);
     if (envStr("DSV41_CELL_DRAFT_STAGED")) |v| ov.draft_staged = try cellBool("DSV41_CELL_DRAFT_STAGED", v);

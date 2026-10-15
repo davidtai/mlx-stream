@@ -179,7 +179,6 @@ pub fn Model(comptime G: type) type {
             for (self.layers, 0..) |*lw, l| {
                 lw.* = try bindLayer(lookup, cp.layers[l], @intCast(l));
                 if (tier.routes.wo_a_f32) lw.wo_a_dense = try self.own(g, try Tr.woaDenseF32(g, cp, lw.wo_a));
-                if (tier.routes.dense_rc) try self.stackSharedGateUp(g, lookup, lw, @intCast(l));
             }
             // The prefill core's sink views, once per layer (`W.sink4`).
             if (tier.routes.prefill_attn) for (self.layers) |*lw| {
@@ -244,41 +243,6 @@ pub fn Model(comptime G: type) type {
             for (&self.engram_m1) |*x| if (x.*) |*r| r.deinit(g);
             self.gpa.free(self.layers);
             self.gpa.destroy(self);
-        }
-
-        /// DENSE_RC: the layer's shared gate and up stacked `[2 I, H / 4]` (and their scales), evaluated, with
-        /// `sh_w1` / `sh_w3` rebound as its halves (views); a mutable lookup that can forget arrays drops the two
-        /// originals here, one layer at a time (else the owner drops them after construction: `droppedSharedGateUp`).
-        fn stackSharedGateUp(self: *Self, g: *G, lookup: anytype, lw: *graph.LayerW(T), l: u32) !void {
-            const w1 = lw.sh_w1;
-            const w3 = lw.sh_w3;
-            if (w1.mode != .mxfp8 or w3.mode != .mxfp8) return error.DenseRcMode;
-            const w = try self.own(g, try g.concat(&.{ w1.w, w3.w }, 0));
-            const sc = try self.own(g, try g.concat(&.{ w1.s, w3.s }, 0));
-            try g.evalAll(&.{ w, sc });
-            const n = g.shapeOf(w1.w).dim(0);
-            const half = struct {
-                fn of(g_: *G, x: T, lo: c_int, hi: c_int) !T {
-                    const sh = g_.shapeOf(x);
-                    return g_.slice(x, &.{ lo, 0 }, &.{ hi, sh.dim(1) }, &.{ 1, 1 });
-                }
-            }.of;
-            lw.sh_w13 = .{ .w = w, .s = sc, .mode = .mxfp8 };
-            lw.sh_w1 = .{ .w = try self.own(g, try half(g, w, 0, n)), .s = try self.own(g, try half(g, sc, 0, n)), .mode = .mxfp8 };
-            lw.sh_w3 = .{ .w = try self.own(g, try half(g, w, n, 2 * n)), .s = try self.own(g, try half(g, sc, n, 2 * n)), .mode = .mxfp8 };
-            if (comptime canDrop(@TypeOf(lookup))) {
-                var b: [96]u8 = undefined;
-                inline for (.{ "w1", "w3" }) |nm| inline for (.{ "weight", "scales" }) |part| {
-                    lookup.drop(try std.fmt.bufPrint(&b, "layers.{d}.ffn.shared_experts." ++ nm ++ "." ++ part, .{l}));
-                };
-            }
-        }
-
-        fn canDrop(comptime L: type) bool {
-            return switch (@typeInfo(L)) {
-                .pointer => |p| !p.attrs.@"const" and @hasDecl(p.child, "drop"),
-                else => false,
-            };
         }
 
         fn own(self: *Self, g: *G, x: T) !T {
@@ -479,16 +443,13 @@ pub fn Model(comptime G: type) type {
             var n: u64 = 0;
             if (self.tier.routes.wo_a_f32) n += @as(u64, c.n_layers) * graph.woaDenseBytes(c);
             if (self.tier.routes.head == .mxfp8) n += @as(u64, c.vocab_size) * c.hidden_size * 33 / 32;
-            if (self.tier.routes.dense_rc) n += graph.sharedGateUpBytes(c);
             return n;
         }
 
         /// Checkpoint residents the Module drops once the model is built: the dense bf16 head under HEAD_MODE
         /// mxfp8 (its quantized codes and scales are in `builtBytes`). The bill's resident term less these.
         pub fn droppedBytes(self: *const Self) u64 {
-            var n: u64 = if (self.tier.routes.head == .mxfp8) @as(u64, self.c.vocab_size) * self.c.hidden_size * 2 else 0;
-            if (self.tier.routes.dense_rc) n += graph.sharedGateUpBytes(&self.c);
-            return n;
+            return if (self.tier.routes.head == .mxfp8) @as(u64, self.c.vocab_size) * self.c.hidden_size * 2 else 0;
         }
 
         /// The input table's bytes (bf16 `[vocab, dim]`): what retiring it frees,

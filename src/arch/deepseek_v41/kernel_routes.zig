@@ -798,52 +798,6 @@ pub const M1Site = enum { indexer_wq_b, shared_w1_w3, shared_w2, engram_wkv };
 
 /// DSV41_MXFP8_ROWS=m1order at one site (`M1Rows.run`): x [M, K] bf16 -> y [M, N] bf16, each
 /// row in MLX's M = 1 mxfp8_qmv_fast order, at the lane's pinned (R, V) per M (M = 1: R 4, V 1).
-/// DENSE_RC (`Routes.dense_rc`): RCPROJ's FMA text at an M1 site's geometry instead of the m1rows text (kbench v7,
-/// rounding-class): shared_w1_w3 over the gate and up weights STACKED (one launch, N 4,608), shared_w2 at 8-wide lane
-/// steps, the indexer wq_b and the Engram wkv at 4-wide. R 1 at M >= 7 (else 2); K split in two at the stacked site,
-/// else two row groups per threadgroup.
-pub const RcRowsGeom = struct { n: u32, k: u32, ks: u32, rg: u32, kv: u32 };
-
-pub fn rcRowsGeom(site: M1Site) RcRowsGeom {
-    return switch (site) {
-        .shared_w1_w3 => .{ .n = 4608, .k = 5120, .ks = 2, .rg = 1, .kv = 4 },
-        .shared_w2 => .{ .n = 5120, .k = 2304, .ks = 1, .rg = 2, .kv = 8 },
-        .indexer_wq_b => .{ .n = 4096, .k = 1280, .ks = 1, .rg = 2, .kv = 4 },
-        .engram_wkv => .{ .n = 25600, .k = 6144, .ks = 1, .rg = 2, .kv = 4 },
-    };
-}
-
-const rc_template_names = [_][:0]const u8{ "N", "K", "M", "R", "KS", "RG", "KV", "G", "XS", "XG", "YS", "YG" };
-
-fn rcRowsTemplates(comptime site: M1Site) [8][12]TemplateArg {
-    @setEvalBranchQuota(10_000);
-    const gm = rcRowsGeom(site);
-    var t: [8][12]TemplateArg = undefined;
-    for (&t, 1..) |*row, m| {
-        const r: u32 = if (m >= 7) 1 else 2;
-        const vals = [12]u32{ gm.n, gm.k, m, r, gm.ks, gm.rg, gm.kv, 1, gm.k, 0, gm.n, 0 };
-        for (row, rc_template_names, vals) |*x, nm, v| x.* = .{ .name = nm, .value = .{ .int = @intCast(v) } };
-    }
-    return t;
-}
-
-const rc_rows_templates = blk: {
-    var all: [4][8][12]TemplateArg = undefined;
-    for (std.enums.values(M1Site), 0..) |s, i| all[i] = rcRowsTemplates(s);
-    break :blk all;
-};
-
-/// The RCPROJ launch of `site` at M = m (static template storage).
-pub fn rcRowsCfg(site: M1Site, m: u32) LaunchConfig {
-    const gm = rcRowsGeom(site);
-    const r: u32 = if (m >= 7) 1 else 2;
-    var cfg: LaunchConfig = .{ .grid = .{ 32, gm.n / (r * gm.rg) * gm.ks * gm.rg, 1 }, .threadgroup = .{ 32, gm.ks * gm.rg, 1 }, .template = &rc_rows_templates[@intFromEnum(site)][m - 1], .n_out = 1 };
-    cfg.out_ranks[0] = 2;
-    cfg.out_shapes[0] = .{ @intCast(m), @intCast(gm.n), 0, 0 };
-    cfg.out_dtypes[0] = .bfloat16;
-    return cfg;
-}
-
 pub fn Mxfp8Rows(comptime G: type) type {
     return struct {
         const Self = @This();
@@ -853,22 +807,6 @@ pub fn Mxfp8Rows(comptime G: type) type {
         plans: RowPlans(G, max_rows),
         w: G.T,
         scales: G.T,
-
-        /// DENSE_RC: the site on RCPROJ (`rcRowsGeom`); `w` u32 [N, K / 4], `scales` u8 [N, K / 32] at the site's N
-        /// (the stacked gate | up at shared_w1_w3), checked here once.
-        pub fn initRc(g: *G, reg: *const xk.Registry, site: M1Site, w: G.T, scales: G.T, diag: ?*xk.Diag) !Self {
-            const e = reg.get(.q3rc_mxfp8_fma);
-            const gm = rcRowsGeom(site);
-            const want = [2][2]c_int{ .{ @intCast(gm.n), @intCast(gm.k / 4) }, .{ @intCast(gm.n), @intCast(gm.k / 32) } };
-            for ([_]G.T{ w, scales }, want, [_]Dtype{ .uint32, .uint8 }) |x, sh, dt| {
-                const d = dims(G, g, x);
-                if (g.dtypeOf(x) != dt or d.n != 2 or d.d[0] != sh[0] or d.d[1] != sh[1])
-                    return refuse(diag, error.RouteInput, "exl3 kernel ops: dense rc {t}: an input is {t} {any}, the site takes {t} {any}", .{ site, g.dtypeOf(x), d.slice(), dt, sh });
-            }
-            var cfgs: [max_rows]LaunchConfig = undefined;
-            for (&cfgs, 1..) |*c, m| c.* = rcRowsCfg(site, @intCast(m));
-            return .{ .e = e, .site = site, .plans = try .initCfgs(g, e, &cfgs), .w = g.keep(w), .scales = g.keep(scales) };
-        }
 
         /// `w` the packed mxfp8 weight (u32 [N, K / 4]), `scales` its e8m0 scales (u8 [N, K / 32]).
         pub fn init(g: *G, reg: *const xk.Registry, site: M1Site, w: G.T, scales: G.T, diag: ?*xk.Diag) !Self {
