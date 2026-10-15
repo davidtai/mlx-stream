@@ -45,11 +45,119 @@ pub const Weights = struct {
     idx_ape: T,
 };
 
-/// One DSA layer's cache rows: the normalized latent [1, n, kv_lora_rank] and the indexer row [1, n, 2 * index_head_dim].
+/// One DSA layer's cache rows: the normalized latent [1, n, kv_lora_rank] and the indexer row [1, n, 2 * index_head_dim];
+/// `tail` the index rows of the last positions, kept beside the index lane (`Tail`).
 pub const Lanes = struct {
     latent: *Lane,
     index: *Lane,
+    tail: *Tail,
+    /// The MTP head's draft rows of a round (`Side`; null: every call appends to the lanes).
+    side: ?*Side = null,
 };
+
+/// The MTP head's draft rows of a round, kept beside its lanes: a draft step past the round's first (`on`) stores its
+/// latent and index rows here, not in the lanes, and its attention reads the lanes' rows below `base` and these after them
+/// (the side texts: `ops.decodeSelectSide`, `dsa_decode.attendSide`; the same keys in the same order, exact). The round's
+/// draft rows left the lanes at its end anyway (mtp.zig `draft`), and the chain runs its steps in one device graph, where an
+/// append after the previous step's readers of the same lane could never be donated (MLX holds an encoded op's inputs
+/// until its command buffer completes): every draft step copied both lanes.
+pub const Side = struct {
+    lat: ?T = null,
+    idx: ?T = null,
+    /// The lanes' rows (positions below `base`) when the first side row came.
+    base: u32 = 0,
+    n: u32 = 0,
+    on: bool = false,
+
+    pub fn reset(self: *Side, g: *G) void {
+        if (self.lat) |x| g.release(x);
+        if (self.idx) |x| g.release(x);
+        self.* = .{};
+    }
+
+    fn push(self: *Side, g: *G, lat: T, idx: T) !void {
+        const nl = if (self.lat) |x| try g.concat(&.{ x, lat }, 1) else lat;
+        const ni = if (self.idx) |x| try g.concat(&.{ x, idx }, 1) else idx;
+        const kl = g.keep(nl);
+        const ki = g.keep(ni);
+        if (self.lat) |x| g.release(x);
+        if (self.idx) |x| g.release(x);
+        self.lat = kl;
+        self.idx = ki;
+        self.n += @intCast(g.shapeOf(lat).dim(1));
+    }
+};
+
+/// The stored index rows of the last `cap` positions (at most) before `end`, kept beside the index lane: the pooled-keys
+/// text reads the open pool's cached rows here, never the lane. MLX holds every input of an encoded op until its command
+/// buffer completes (mlx metal/eval.cpp `eval`: the inputs' data in the completion handler) and donates a slice_update's
+/// input only when nothing else holds its data (backend/common/utils.h `is_donatable`); a read of the lane in the same
+/// forward before its append made every append copy the whole lane. `cap` covers the open pool (kpool - 1 rows) behind a
+/// rollback of a verify window's rejected rows (`ops.SelectPlan.max_rows`).
+pub const Tail = struct {
+    rows: ?T = null,
+    end: u32 = 0,
+
+    pub const cap: u32 = 16;
+
+    pub fn reset(self: *Tail, g: *G) void {
+        if (self.rows) |r| g.release(r);
+        self.* = .{};
+    }
+
+    /// The tail after a forward that stored `new` [1, n, 2 * Dh] at positions `start` .. `start + n`: its kept rows below
+    /// `start` (a rollback drops the rest) then `new`, the last `cap` of them. A span wider than `cap` keeps a copy of its
+    /// last `cap` rows (no hold on the span's rows).
+    fn update(self: *Tail, g: *G, start: u32, new: T) !void {
+        const n: u32 = @intCast(g.shapeOf(new).dim(1));
+        const w = g.shapeOf(new).dim(2);
+        var next: T = undefined;
+        if (n >= cap) {
+            var c = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_copy(&c, try g.slice(new, &.{ 0, @intCast(n - cap), 0 }, &.{ 1, @intCast(n), w }, &.{ 1, 1, 1 }), g.s));
+            next = try g.adopt(c);
+        } else {
+            var parts: [2]T = undefined;
+            var np: usize = 0;
+            var kept: u32 = 0;
+            if (start > 0) if (self.rows) |r| {
+                const held: u32 = @intCast(g.shapeOf(r).dim(1));
+                const base = self.end - held;
+                if (start > base) {
+                    kept = @min(start, self.end) - base;
+                    parts[np] = try g.slice(r, &.{ 0, 0, 0 }, &.{ 1, @intCast(kept), w }, &.{ 1, 1, 1 });
+                    np += 1;
+                }
+            };
+            parts[np] = new;
+            np += 1;
+            const all = if (np == 1) new else try g.concat(parts[0..np], 1);
+            const total = kept + n;
+            next = if (total > cap) try g.slice(all, &.{ 0, @intCast(total - cap), 0 }, &.{ 1, @intCast(total), w }, &.{ 1, 1, 1 }) else all;
+        }
+        const k = g.keep(next);
+        if (self.rows) |r| g.release(r);
+        self.rows = k;
+        self.end = start + n;
+    }
+};
+
+/// The forward's index rows at positions `start` .. (`ops.withPooledKeys` over the tail's rows) and the tail after them.
+fn indexRows(g: *G, tail: *Tail, key: T, gate: T, ape: T, start: u32, ix: ops.Indexer) !T {
+    var prev: ?T = null;
+    var base: u32 = 0;
+    if (start > 0) {
+        const r = tail.rows orelse return error.Glm5NextIndexTailEmpty;
+        const held: u32 = @intCast(g.shapeOf(r).dim(1));
+        // The tail covers the open pool's rows before `start` (by construction: `Tail.cap` against a verify's rollback).
+        std.debug.assert(tail.end >= start and tail.end - held <= start - @min(start, @as(u32, @intCast(ix.kpool - 1))));
+        prev = r;
+        base = tail.end - held;
+    }
+    const rows = try g.adopt(try ops.withPooledKeys(g.s, prev, @intCast(base), key, gate, ape, @intCast(start), ix));
+    try tail.update(g, start, rows);
+    return rows;
+}
 pub const Lane = @import("../../sdk_ext.zig").kv.Lanes(G).Grow;
 
 fn linear(g: *G, x: T, w: T) !T {
@@ -99,21 +207,40 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
     var ikn_raw = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_layer_norm(&ikn_raw, try fp8.project(g, w.idx_wk, x), w.idx_k_norm_w, w.idx_k_norm_b, 1e-6, g.s));
     const ikn = try g.adopt(ikn_raw);
-    const gate = try g.astype(try g.matmul(try g.astype(x, .float32), w.idx_gate_t), g.dtypeOf(ikn));
-    const idx_new = try g.concat(&.{ ikn, gate }, -1);
-    // A row that completes a pool stores the pool's key (`ops.withPooledKeys`): the cached rows of its open pool first.
-    const kpool: c_int = @intCast(c.index_kpool);
-    const n_prev: c_int = @min(@as(c_int, @intCast(start)), kpool - 1);
-    const prev = if (n_prev > 0) blk: {
-        const iv = (try lanes.index.view(g)) orelse return error.Glm5NextIndexLaneEmpty;
-        break :blk try g.slice(iv, &.{ 0, @as(c_int, @intCast(start)) - n_prev, 0 }, &.{ 1, @intCast(start), 2 * ihd }, &.{ 1, 1, 1 });
-    } else idx_new;
-    const idx_rows = try g.adopt(try ops.withPooledKeys(g.s, prev, idx_new, w.idx_ape, @intCast(start), ix));
-    try lanes.latent.append(g, lat);
-    try lanes.index.append(g, idx_rows);
+    // The pool gate's f32 projection; the pooled text stores it in the key's dtype beside the key (ops 10 and 11, folded).
+    const gate = try g.matmul(try g.astype(x, .float32), w.idx_gate_t);
+    // A row that completes a pool stores the pool's key (`ops.withPooledKeys`): the open pool's cached rows are read from
+    // the tail kept beside the lane (`Tail`), so nothing reads the index lane before its append below and MLX donates its
+    // buffer to the append (in place).
+    const idx_rows = try indexRows(g, lanes.tail, ikn, gate, w.idx_ape, start, ix);
     const t: c_int = @intCast(start + @as(u32, @intCast(rows)));
-    const latent4 = try g.reshape(((try lanes.latent.view(g)) orelse unreachable), &.{ 1, 1, t, r });
-    const index_view = (try lanes.index.view(g)) orelse unreachable;
+    // The MTP head's draft step past the round's first (`Side`): its rows beside the lanes, the lanes untouched.
+    const side: ?*Side = if (lanes.side) |sd| (if (sd.on) sd else null) else null;
+    var latent4: T = undefined;
+    var index_view: T = undefined;
+    // Side, sparse: the lanes' views (rows below `base`) and the side rows, read by the side texts.
+    var side_sparse = false;
+    if (side) |sd| {
+        if (sd.n == 0) sd.base = start;
+        std.debug.assert(rows == 1 and start == sd.base + sd.n and lanes.latent.len == sd.base and lanes.index.len == sd.base);
+        try sd.push(g, lat, idx_rows);
+        const lv = (try lanes.latent.view(g)) orelse return error.Glm5NextHeadLaneEmpty;
+        const iv = (try lanes.index.view(g)) orelse return error.Glm5NextHeadLaneEmpty;
+        if (ops.selectsAll(t, ix)) {
+            // Every key read: the keys in order (the lanes' rows, then the side's), as the appended lane would hold them.
+            latent4 = try g.reshape(try g.concat(&.{ lv, sd.lat.? }, 1), &.{ 1, 1, t, r });
+            index_view = try g.concat(&.{ iv, sd.idx.? }, 1);
+        } else {
+            side_sparse = true;
+            latent4 = try g.reshape(lv, &.{ 1, 1, @intCast(sd.base), r });
+            index_view = iv;
+        }
+    } else {
+        try lanes.latent.append(g, lat);
+        try lanes.index.append(g, idx_rows);
+        latent4 = try g.reshape(((try lanes.latent.view(g)) orelse unreachable), &.{ 1, 1, t, r });
+        index_view = (try lanes.index.view(g)) orelse unreachable;
+    }
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
     // A row before `dense_end` reads every earlier token (all its pools fit the top-k): a prompt runs those rows causally
@@ -149,6 +276,12 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
             const q_idx = try g.reshape(try fp8.project(g, w.idx_wq_b, qr_s), &.{ 1, n, ih, ihd });
             const x_s = try g.slice(x, &.{ 0, sparse_from, 0 }, &.{ 1, rows, @intCast(c.hidden_size) }, &.{ 1, 1, 1 });
             const wts = try g.mul(try g.astype(try linear(g, x_s, w.idx_wproj), .float32), try g.scalar(1.0 / @sqrt(@as(f64, @floatFromInt(ih))), .float32));
+            if (side_sparse) {
+                // The MTP head's draft step over the lanes and the round's draft rows (`Side`): exact (the same keys).
+                const sd = side.?;
+                const sel = try g.adopt(try ops.decodeSelectSide(g.s, q_idx, wts, index_view, sd.idx.?, ix, t - 1, @divTrunc(t, ix.kpool), @intCast(sd.base)));
+                break :blk try dsa_decode.attendSide(g, routes.sparse orelse return error.Glm5NextHeadSideNeedsFused, q_abs, latent4, try g.reshape(sd.lat.?, &.{ 1, 1, @intCast(sd.n), r }), sel, sd.base);
+            }
             const idx_cache = try g.reshape(index_view, &.{ 1, t, 2 * ihd });
             // Profile builds, the prompt timeline recording: the indexer's inputs committed under `attn`, so each mark
             // of the split (`ops.selectRows`: indexer, topk; here: sparse) times only its own work.
@@ -190,7 +323,105 @@ fn sdpa(g: *G, q: T, k: T, v: T, scale: f32, mode: [:0]const u8) !T {
     return g.adopt(o);
 }
 
+/// The address of an evaluated array's data (0: none).
+pub fn dataAddr(x: T) usize {
+    const p = mlx.mlx_array_data_uint8(x) orelse return 0;
+    return @intFromPtr(p);
+}
+
+/// Whether each lane's appends wrote its buffer in place (its address unchanged).
+pub const AppendProbe = struct { index: bool, latent: bool };
+
+/// Once at construction (after the indexer's decode launches are installed): two forwards' lane appends as `forward`
+/// makes them (the pooled-keys text reading the tail, the appends, the views after them, each forward's arrays freed at
+/// its end, evaluated between: a decode round's host sync) on two 16-row lanes, the second forward reading the first's
+/// three cached rows. A lane whose buffer address moved was copied by its append. Refuses a kpool the tail cannot cover.
+pub fn probeAppends(g: *G, c: *const glm.Config, ix: ops.Indexer) !AppendProbe {
+    const cap: u32 = 16;
+    if (@as(u32, @intCast(ix.kpool - 1)) + ops.SelectPlan.max_rows > Tail.cap) return error.Glm5NextIndexTailCap;
+    var lat_lane = Lane.init(cap, cap);
+    var idx_lane = Lane.init(cap, cap);
+    var tail: Tail = .{};
+    defer lat_lane.deinit(g);
+    defer idx_lane.deinit(g);
+    defer tail.reset(g);
+    const r: c_int = @intCast(c.kv_lora_rank);
+    const dh: c_int = @intCast(c.index_head_dim);
+    {
+        const m = g.mark();
+        defer g.resetTo(m);
+        lat_lane.buf = g.keep(try g.zeros(&.{ 1, @intCast(cap), r }, .bfloat16));
+        lat_lane.cap = cap;
+        idx_lane.buf = g.keep(try g.zeros(&.{ 1, @intCast(cap), 2 * dh }, .bfloat16));
+        idx_lane.cap = cap;
+        try g.evalAll(&.{ lat_lane.buf.?, idx_lane.buf.? });
+    }
+    const lat0 = dataAddr(lat_lane.buf.?);
+    const idx0 = dataAddr(idx_lane.buf.?);
+    for ([_][2]u32{ .{ 0, 3 }, .{ 3, 4 } }) |step| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const start = step[0];
+        const n: c_int = @intCast(step[1]);
+        const key = try g.zeros(&.{ 1, n, dh }, .bfloat16);
+        const gate = try g.zeros(&.{ 1, n, dh }, .float32);
+        const ape = try g.zeros(&.{ ix.kpool, dh }, .float32);
+        const lat = try g.zeros(&.{ 1, n, r }, .bfloat16);
+        const rows = try indexRows(g, &tail, key, gate, ape, start, ix);
+        try lat_lane.append(g, lat);
+        try idx_lane.append(g, rows);
+        const lv = (try lat_lane.view(g)).?;
+        const iv = (try idx_lane.view(g)).?;
+        try g.evalAll(&.{ lv, iv });
+    }
+    return .{ .index = dataAddr(idx_lane.buf.?) == idx0, .latent = dataAddr(lat_lane.buf.?) == lat0 };
+}
+
 /// The bytes one position adds to a DSA layer's lanes (bf16).
 pub fn rowBytes(c: *const glm.Config) [2]u64 {
     return .{ 2 * @as(u64, c.kv_lora_rank), 2 * 2 * @as(u64, c.index_head_dim) };
+}
+
+const testing = std.testing;
+
+test "glm5_next dsa: the lanes' appends write in place on the installed texts; a view of the old buffer before an append (the old pooled-keys input) makes MLX copy the lane (guarded window: Metal)" {
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const c: glm.Config = .{};
+    var ix = indexer(&c, .{});
+    const plan = try ops.SelectPlan.install(s, ix, .bfloat16, .batched);
+    defer plan.destroy();
+    ix.plan = plan;
+    // The decode route: both lanes keep their buffers across two forwards' appends (the second reads three cached rows).
+    const p = try probeAppends(&g, &c, ix);
+    try testing.expect(p.index);
+    try testing.expect(p.latent);
+    // The old input: a view of the lane's rows taken before its append, alive until the forward's end, holds the old
+    // buffer's data, so MLX cannot donate it to the append's slice_update and copies the whole lane.
+    var lane = Lane.init(16, 16);
+    defer lane.deinit(&g);
+    {
+        const m = g.mark();
+        defer g.resetTo(m);
+        lane.buf = g.keep(try g.zeros(&.{ 1, 16, 256 }, .bfloat16));
+        lane.cap = 16;
+        lane.len = 3;
+        try g.evalAll(&.{lane.buf.?});
+    }
+    const addr0 = dataAddr(lane.buf.?);
+    {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const old_view = (try lane.view(&g)).?;
+        const prev = try g.slice(old_view, &.{ 0, 0, 0 }, &.{ 1, 3, 256 }, &.{ 1, 1, 1 });
+        const rows = try g.add(try g.zeros(&.{ 1, 1, 256 }, .bfloat16), try g.slice(prev, &.{ 0, 2, 0 }, &.{ 1, 3, 256 }, &.{ 1, 1, 1 }));
+        try lane.append(&g, rows);
+        try g.evalAll(&.{(try lane.view(&g)).?});
+    }
+    try testing.expect(dataAddr(lane.buf.?) != addr0);
 }

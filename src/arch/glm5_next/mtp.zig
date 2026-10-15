@@ -628,6 +628,16 @@ pub const Lane = struct {
     /// MLX's active bytes the open added, measured once (reported: it also counts what MLX keeps beside the arrays, such
     /// as the scalars a fill reads, and buffers its cache hands back larger than asked).
     measured_bytes: u64 = 0,
+    /// The head's lanes' buffer addresses after the open and at the decode's start (latent, index): `inPlace` compares.
+    addr0: [2]usize = .{ 0, 0 },
+    addr_dec: [2]usize = .{ 0, 0 },
+    /// The head's index tail (dsa.zig `Tail`).
+    tail: dsa.Tail = .{},
+    /// The round's draft rows beside the lanes (dsa.zig `Side`): a draft step past the round's first stores its rows here
+    /// and reads the lanes + these (installed with the fused DSA decode texts: `routes.sparse`); `chain_start` the round's
+    /// first draft position while the chain runs (null otherwise).
+    side: dsa.Side = .{},
+    chain_start: ?u32 = null,
 
     /// The lane over the pack at `dir`: the draft bank (refused by name when absent), the head bound from `map` (the
     /// arch's weight map with the MTP layer's residents kept and read), every record read into the bank's MLX arrays and
@@ -669,6 +679,7 @@ pub const Lane = struct {
                 lane.cap = lanes_cap;
             }
             try g.evalAll(&.{ self.latent.buf.?, self.index.buf.? });
+            self.addr0 = .{ dsa.dataAddr(self.latent.buf.?), dsa.dataAddr(self.index.buf.?) };
         }
         var active1: usize = 0;
         _ = mlx.mlx_get_active_memory(&active1);
@@ -681,8 +692,31 @@ pub const Lane = struct {
         return self;
     }
 
+    /// The head's lanes' buffer addresses at the decode's start. Once a request, off the hot path.
+    pub fn markDecode(self: *Lane, g: *G) !void {
+        const lb = self.latent.buf orelse return;
+        const ib = self.index.buf orelse return;
+        try g.evalAll(&.{ lb, ib });
+        self.addr_dec = .{ dsa.dataAddr(lb), dsa.dataAddr(ib) };
+    }
+
+    /// Whether the head's lanes ([0]: latent, [1]: index) still hold the buffers the open made (`whole`) and the ones the
+    /// decode started on (`decode`). Off the hot path (a request's end): the buffers evaluated first.
+    pub fn inPlace(self: *const Lane, g: *G) !struct { whole: [2]bool, decode: [2]bool } {
+        const lb = self.latent.buf orelse return .{ .whole = .{ false, false }, .decode = .{ false, false } };
+        const ib = self.index.buf orelse return .{ .whole = .{ false, false }, .decode = .{ false, false } };
+        try g.evalAll(&.{ lb, ib });
+        const a = [2]usize{ dsa.dataAddr(lb), dsa.dataAddr(ib) };
+        return .{
+            .whole = .{ self.addr0[0] != 0 and a[0] == self.addr0[0], self.addr0[1] != 0 and a[1] == self.addr0[1] },
+            .decode = .{ self.addr_dec[0] != 0 and a[0] == self.addr_dec[0], self.addr_dec[1] != 0 and a[1] == self.addr_dec[1] },
+        };
+    }
+
     pub fn deinit(self: *Lane, g: *G) void {
         if (self.pending) |p| g.release(p);
+        self.tail.reset(g);
+        self.side.reset(g);
         self.latent.deinit(g);
         self.index.deinit(g);
         self.slots.deinit();
@@ -694,6 +728,7 @@ pub const Lane = struct {
     pub fn reset(self: *Lane, g: *G) void {
         self.latent.truncateTo(0);
         self.index.truncateTo(0);
+        self.tail.reset(g);
         if (self.pending) |p| g.release(p);
         self.pending = null;
         self.n_pending = 0;
@@ -722,7 +757,7 @@ pub const Lane = struct {
     }
 
     fn lanes(self: *Lane) dsa.Lanes {
-        return .{ .latent = &self.latent, .index = &self.index };
+        return .{ .latent = &self.latent, .index = &self.index, .tail = &self.tail, .side = if (self.routes.sparse != null) &self.side else null };
     }
 
     /// A serial step of `rows` after the trunk's `len` positions is one the lane keeps (`pend`): the lane follows the
@@ -791,6 +826,8 @@ pub const Lane = struct {
     /// the output [n, hidden].
     fn layer(self: *Lane, g: *G, x: T, start: u32) !T {
         const c = self.c;
+        // A draft step past the round's first: its rows beside the lanes (`Side`).
+        self.side.on = if (self.chain_start) |cs| start > cs else false;
         const n = g.shapeOf(x).dim(0);
         const h: c_int = @intCast(c.hidden_size);
         const a_in = try graph.rmsNorm(g, x, self.head.input_norm, c.rms_norm_eps);
@@ -869,6 +906,12 @@ pub const Lane = struct {
         const m0 = g.mark();
         defer g.resetTo(m0);
         const start = self.pairs();
+        // The chain's steps past its first keep their rows beside the lanes (`Side`), released after the chain's eval.
+        self.chain_start = start;
+        defer {
+            self.chain_start = null;
+            self.side.reset(g);
+        }
         try chainDrafts(G, g, ChainHead{ .lane = self, .w = w, .sm = sm, .len = len }, try self.input(g, w, &.{t1}, self.pending.?), start, depth, out, q);
         self.latent.truncateTo(start + 1);
         self.index.truncateTo(start + 1);
