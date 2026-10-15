@@ -241,6 +241,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         }
 
         pub fn initWith(gpa: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, ov: Overrides) !*Self {
+            try cfg.checkRetired();
             try cfg.checkCtxSize();
             try cfg.checkMaxOutput();
             try cfg.checkUnitsCap();

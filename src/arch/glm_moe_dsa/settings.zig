@@ -10,9 +10,6 @@ const glm = @import("glm_moe_dsa.zig");
 const acceptance = sdk.acceptance;
 const expert_tally = @import("../../sdk_ext.zig").expert.tally;
 
-/// The arch's numerics: "stock" (the reference's op chain) is the only tier; any other name is unset.
-pub const NumericTier = enum { stock };
-
 pub const Config = struct {
     /// The pack's directory (config.json, the resident shards, the expert bank); owned by the host's config.
     model_dir: ?[]const u8 = null,
@@ -35,7 +32,8 @@ pub const Config = struct {
     max_output_tokens: ?u32 = null,
     /// A `max_output` above the model's limit: refused by name at load (`error.MaxOutputOverModelLimit`).
     max_output_over_limit: ?i64 = null,
-    numeric_tier: ?NumericTier = null,
+    /// A retired key the settings name: refused by name at load (`error.RetiredSettingsKey`).
+    retired_key: ?RetiredKey = null,
     /// The routed waves wait on the reads' events instead of the host (null = on).
     expert_event_gates: ?bool = null,
     /// The prompt pass layer by layer over the whole prompt (null = on); off, chunk by chunk.
@@ -86,6 +84,9 @@ pub const Config = struct {
 
     pub const MtpAcceptance = enum { exact, typical, other };
 
+    /// Keys this arch no longer takes. A pack that still sets one is refused by name at load, never ignored.
+    pub const RetiredKey = enum { numeric_tier };
+
     pub fn deinit(c: *Config, gpa: std.mem.Allocator) void {
         if (c.model) |*m| m.deinit(gpa);
         c.model = null;
@@ -115,12 +116,9 @@ pub const Config = struct {
                 any = true;
             };
         }
-        if (obj.get("numeric_tier")) |v| if (v == .string) {
-            if (std.meta.stringToEnum(NumericTier, v.string)) |t| {
-                c.numeric_tier = t;
-                any = true;
-            }
-        };
+        inline for (comptime std.meta.fieldNames(RetiredKey)) |key| {
+            if (obj.get(key) != null) c.retired_key = @field(RetiredKey, key);
+        }
         if (obj.get("expert_wide_depth")) |v| if (v == .integer and v.integer >= 1 and v.integer <= max_wide_depth) {
             c.expert_wide_depth = @intCast(v.integer);
             any = true;
@@ -170,8 +168,8 @@ pub const Config = struct {
                 any = true;
             };
         }
-        if (any) log.info("[model-settings] glm_moe_dsa: numeric_tier={s} event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} units_cap={d} rest_of_box_floor={d} resident_ratio={d} tally_window={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
-            if (c.numeric_tier) |t| @tagName(t) else "default", onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.expert_units_cap orelse 0, c.rest_of_box_floor_bytes orelse 0, c.tally.ratio, c.tally.window, c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta,
+        if (any) log.info("[model-settings] glm_moe_dsa: event_gates={s} layer_major_prefill={s} wide_depth={d} lookahead_budget={d} units_cap={d} rest_of_box_floor={d} resident_ratio={d} tally_window={d} billed_context={d} max_output={d} mtp_depth={d} mtp_acceptance={s} mtp_typical_delta={d}\n", .{
+            onOff(c.expert_event_gates), onOff(c.layer_major_prefill), c.expert_wide_depth orelse 0, c.lookaheadBudget(), c.expert_units_cap orelse 0, c.rest_of_box_floor_bytes orelse 0, c.tally.ratio, c.tally.window, c.max_context_tokens orelse 0, c.maxOutput(), c.mtpDepth(), c.acceptanceName(), c.typical().delta,
         });
     }
 
@@ -245,6 +243,13 @@ pub const Config = struct {
         return error.CtxSizeOverModelLimit;
     }
 
+    /// A retired key, refused by name (never a silent ignore).
+    pub fn checkRetired(c: *const Config) error{RetiredSettingsKey}!void {
+        const k = c.retired_key orelse return;
+        log.warn("glm_moe_dsa: load refused: model-settings.json sets {s}, a key this arch no longer takes; remove it (RetiredSettingsKey)\n", .{@tagName(k)});
+        return error.RetiredSettingsKey;
+    }
+
     /// A units cap under the fill's floor, refused by name (a capped fill would take fewer rows than a load may).
     pub fn checkUnitsCap(c: *const Config) error{UnitsCapUnderFillFloor}!void {
         const v = c.expert_units_cap_under_floor orelse return;
@@ -263,10 +268,8 @@ fn settingsOf(json: []const u8) !Config {
     return c;
 }
 
-test "glm settings: numeric_tier names stock only; the gates and the prompt order are bools; anything else is unset" {
+test "glm settings: the gates and the prompt order are bools; anything else is unset" {
     if (comptime !host_caps.glm) return error.SkipZigTest;
-    try testing.expectEqual(@as(?NumericTier, .stock), (try settingsOf("{\"numeric_tier\": \"stock\"}")).numeric_tier);
-    try testing.expectEqual(@as(?NumericTier, null), (try settingsOf("{\"numeric_tier\": \"served\"}")).numeric_tier);
     try testing.expectEqual(@as(?bool, false), (try settingsOf("{\"expert_event_gates\": false}")).expert_event_gates);
     try testing.expectEqual(@as(?bool, null), (try settingsOf("{\"expert_event_gates\": 0}")).expert_event_gates);
     try testing.expectEqual(@as(?bool, false), (try settingsOf("{\"layer_major_prefill\": false}")).layer_major_prefill);
@@ -303,6 +306,12 @@ test "glm settings: expert_wide_depth is 1 to 5; ctx_size bills every prompt up 
     try testing.expectEqual(@as(?u32, null), over.max_context_tokens);
     try testing.expectError(error.CtxSizeOverModelLimit, over.checkCtxSize());
     try (Config{}).checkCtxSize();
+}
+
+test "glm settings: the retired numeric_tier is refused by name at load" {
+    if (comptime !host_caps.glm) return error.SkipZigTest;
+    try testing.expectError(error.RetiredSettingsKey, (try settingsOf("{\"numeric_tier\": \"stock\"}")).checkRetired());
+    try (Config{}).checkRetired();
 }
 
 test "glm settings: max_output defaults to 128K, takes 1 to 1,048,576, and over the limit is kept for the refusal" {

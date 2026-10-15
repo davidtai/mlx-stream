@@ -371,7 +371,6 @@ Settings (`model-settings.json`):
 |---|---|---|
 | `ctx_size` | the longest prompt the load bills, 1 to 1,048,576 | 16,384 |
 | `max_output` | the most tokens a request may generate past its prompt, 1 to 1,048,576 | 131,072 |
-| `numeric_tier` | `stock` (the reference's op chain) | `stock` |
 | `expert_event_gates` | the GPU waits on the reads' events (`true`) or the host waits (`false`) | `true` |
 | `layer_major_prefill` | the prompt layer by layer (`true`) or chunk by chunk (`false`) | `true` |
 | `expert_wide_depth` | prompt expert groups read ahead per layer, 1 to 5 | 5 |
@@ -384,6 +383,8 @@ Settings (`model-settings.json`):
 | `expert_tally_file` | `on` (read at load, written at each request's end), `pinned` (read only), `off` | `on` |
 | `expert_units_cap` | at most this many units in either phase (a measurement's arms at the same rows) | off |
 | `rest_of_box_floor_bytes` | the rest of the box billed at least this (a measurement's arms at the same target) | off |
+
+The retired key `numeric_tier` is refused by name at load (`RetiredSettingsKey`).
 
 The rate tally (`sdk_ext.expert.tally`): per stream layer and expert, an EMA of the rate at which decode routes request
 it, folded in at each request's end; the top `expert_resident_ratio` of each layer's experts by rate are pinned
