@@ -9,8 +9,8 @@ const uint b = glm5n_slot_bank(id);
 const size_t slot = glm5n_slot_row(id);
 const device uint32_t* wd = b == 0u ? down_w0 : (b == 1u ? down_w1 : down_w2);
 const device uint8_t* sd = b == 0u ? down_s0 : (b == 1u ? down_s1 : down_s2);
-// fp_dequantize's `*global_scale / (F8E4M3_MAX * F4E2M1_MAX)`, read by value (a bank under 8 slots passes `constant`)
-const float dinv = (b == 0u ? float(down_g0[slot]) : (b == 1u ? float(down_g1[slot]) : float(down_g2[slot]))) / 2688.0f;
+// fp_dequantize's `*global_scale / (F8E4M3_MAX * F4E2M1_MAX)`, read by value from the slot's own line (glm5n_g_at)
+const float dinv = (b == 0u ? float(down_g0[glm5n_g_at(slot)]) : (b == 1u ? float(down_g1[glm5n_g_at(slot)]) : float(down_g2[glm5n_g_at(slot)]))) / 2688.0f;
 constexpr int KW2 = I / 16;
 constexpr int KG = I / GS;
 constexpr int NC = I / 512;

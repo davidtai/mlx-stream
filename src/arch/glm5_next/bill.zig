@@ -465,7 +465,12 @@ fn slotWiring(data: *const [4]u64, phase: sdk.MemoryBill.Phase, rows: u32, slots
 fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
     const g = in.geometry;
     const page = in.page;
-    const record = g.record_bytes;
+    // A slot row is billed at the record stride or the stream's line-isolated slot row (bank.zig `slotRowBytes`: each
+    // global scale on its own 128-byte line), whichever is larger: Flash's 14,156,160 B row fits its 14,159,872 B stride,
+    // so the rows' terms are the stride's. The global-scale arrays' page floor (`scale_array_min_bytes`, at most a page
+    // past their rows per array) is inside `slot_rounding`'s page per component of the base and transient banks and the
+    // stride's 3,712 B per row over the slot row for the ext banks (test "the line-isolated slot arrays fit").
+    const record = @max(g.record_bytes, g.slotRowBytes());
     const transient: [2]u64 = .{ @as(u64, mimo_stream.transient_rows) * record, @as(u64, mimo_stream.decodeTransientRows(experts.decode_window)) * record };
     const n: u64 = g.num_experts;
     const bitset = std.mem.alignForward(u64, n, 64) / 8;
@@ -943,4 +948,36 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
             } else |e| std.debug.print("  ROWS kv=bf16 ctx={d} baseline={d} refused={s}\n", .{ ctx, base, @errorName(e) });
         }
     }
+}
+
+test "glm5_next bill: the line-isolated slot arrays fit the slot terms (per_row the record stride, unchanged)" {
+    const S = @import("../../sdk_ext.zig").expert.stream.StreamOf(bank.SDK, false);
+    const a = testing.allocator;
+    const in = try fixtureInputs(32_768);
+    const b = try billOf(a, &in);
+    defer b.free(a);
+    const g = in.geometry;
+    try testing.expectEqual(@as(u64, 14_156_160), g.slotRowBytes());
+    try testing.expect(g.slotRowBytes() <= g.record_bytes);
+    try testing.expectEqual(@as(u64, 42) * g.record_bytes, b.per_row);
+    // Every slot array the decode phase holds at 115/131 under the default per-layer split (base, ext, decode's window 0;
+    // each array rounded to a page as Metal allocates it) against the bill's slot bytes for those rows.
+    const l: bank.Layer = .{ .logical_bytes = g.logical_bytes, .base_offset = 0, .segments = g.segments };
+    const Obj = struct {
+        fn bytes(layer: *const bank.Layer, rows: u32) u64 {
+            var n: u64 = 0;
+            for (0..bank.n_components) |c| n += std.mem.alignForward(u64, S.arrayBytes(layer, c, rows), bank.page);
+            return n;
+        }
+    };
+    var prompt: [42]u32 = undefined;
+    var decode: [42]u32 = undefined;
+    try settings.layerRows(settings.defaultLayerRows(), .{ .prompt = 115, .decode = 131 }, 288, &prompt, &decode);
+    var held: u64 = Obj.bytes(&l, mimo_stream.decodeTransientRows(experts.decode_window));
+    for (prompt, decode) |p, d| {
+        held += Obj.bytes(&l, p);
+        if (d > p) held += Obj.bytes(&l, d - p);
+    }
+    const billed = 131 * b.per_row + termOf(b, "slot_transient")[1] + termOf(b, "slot_rounding")[1];
+    try testing.expect(held <= billed);
 }

@@ -2,8 +2,8 @@
 """compile_glm5next_nvfp4_kernels_offline.py: compile_kernels_offline.py's assembly (MLX fast.metal_kernel's source layout
 at the pinned MLX 64ea011cb) over the GLM-5.3-Flash NVFP4 decode kernels (src/kernels/glm5_next_nvfp4/manifest.json),
 on the CPU, with the Metal shader compiler in MLX's JIT math mode (safe). Nothing runs on the GPU. Each registered
-instantiation compiles with `ids` below 8 pairs (`constant`) and at 8 and 9 pairs (`device`), and with a bank's global
-scales under 8 slots (`constant`) and at 8 (`device`).
+instantiation compiles with `ids` below 8 pairs (`constant`) and at 8 and 9 pairs (`device`), and with a bank's
+line-isolated global scales [S, 32] at 4 and 8 slots (`device` either way).
 
   scripts/compile_glm5next_nvfp4_kernels_offline.py --mlx-include <stage>/include [--ir <dir>]
 Prints KERNELS_OFFLINE_COMPILE PASS n=<instantiations> kernels=<k> or ... FAIL failed=<f>/<n>; exit 0 / 1 (2: usage)."""
@@ -33,7 +33,8 @@ def shape_of(name, k, inst):
         return [{"v": "S", "m": 1}, {"m": rows}, {"m": cols // 8}]
     if name.endswith(tuple("_s%d" % b for b in range(3))):
         return [{"v": "S", "m": 1}, {"m": rows}, {"m": cols // inst["GS"]}]
-    return [{"v": "S", "m": 1}]
+    # A global-scale input: line-isolated [S, 32] f32 (bank.zig scale_line_bytes), `device` at any S.
+    return [{"v": "S", "m": 1}, {"m": 32}]
 
 
 def main():

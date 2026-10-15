@@ -188,6 +188,18 @@ the per-token route's five f32 gate stages, which the per-core route never build
 `GLM5NEXT_KDA_PERCORE_GPU=1 _GPU_WINDOW_LOCKED=1`,
 `-Dtest-filter="glm5_next kda percore GPU"`.
 
+The prompt pass's KDA prologue (the short conv over [q | k | v], SiLU, the bf16 cast, the q / k L2 norms and scales,
+the next conv tail) runs one text per span past the decode lane (`kda_prologue.zig`, `kernels/glm5n_kda_prologue.metal`)
+in place of the op chain's dozen ops and their f32 window copies. Each step is MLX's kernel for the op it replaces
+(`depthwise_conv_1d`, the compiled SiLU, `rms_single_row` at axis 128, the bf16 `Multiply`), in the same operand order
+and types, so the outputs are the op chain's bits (exact). The setting `kda_prologue` (`fused`, the default; `ops`, the
+control) is read once at construction; the load logs `[kda] fused prompt prologue engaged (conv + silu + q/k rms,
+32-thread groups per row x head)` and the routes line `kda_prologue=fused`; a CPU stream or `ops` logs `[kda] fused
+prompt prologue declined (...)` and `kda_prologue=ops`. The decode lane and the MTP verify's capture keep the op chain.
+No bill term (the text's live arrays are a subset of the op chain's). The window's parity test, bit for bit against the
+op chain (q, k, v, the tail, the layer's output and state over spans of 1,024, a carried 1,024 and 37 rows):
+`GLM5NEXT_KDA_PROLOGUE_GPU=1 _GPU_WINDOW_LOCKED=1`, `-Dtest-filter="glm5_next kda prologue GPU"`; one `GLM5NEXT_KDA_PARITY shape=... PASS|FAIL` line per span and an overall line.
+
 ## Prompt levers
 
 The 16K prompt pass's levers from the prefill analysis (`reports/.../mimo/glm5next-prefill-gpu-levers-20261012.md`),
@@ -285,7 +297,7 @@ prints a table per served context (17,408; 18,432; 20,480; 24,576; 32,766; 32,76
   punctuation; g19 printed `45 layers (34 KDA, 11 DSA); ...`); under `fp8_block128`: `... residents FP8 439 + BF16 739
   tensors read in ...`
 - `glm5_next MTP lane: off ...`, `glm5_next routes: dsa_nax= prompt_combine= read_schedule= drain= bank_view=
-  decode_moe= span_rows=1024 call_rows=16384 kda=percore|stock residents=bf16|fp8_block128 decode_glue= decode_kda=
+  decode_moe= span_rows=1024 call_rows=16384 kda=percore|stock kda_prologue=fused|ops residents=bf16|fp8_block128 decode_glue= decode_kda=
   decode_dsa= decode_predict= decode_swiglu=`, the four `glm5_next prompt lever N: ...` lines,
   `glm5_next admission baseline: ...`, `glm5_next construction check: ...`
 - `forced rows P/D exceed the fill by N bytes at baseline B; proceeding (operator pin)` when a pin sits over the fill

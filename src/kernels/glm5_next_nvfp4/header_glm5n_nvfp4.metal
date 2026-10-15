@@ -6,6 +6,11 @@
 // f32): inv = g / 2688, s = e4m3 * inv, w = s * e2m1. The code is decoded as e2m1 x 2^-14 (the half bits mimo_e2m1
 // builds) and the lane's scale carries the 2^14 back (glm5n_nv_scale): s x 2^14 and the code's half are both exact, so
 // their product rounds as s * e2m1 does: the weight bit for bit.
+// Scale-line isolation (bank.zig `scale_line_bytes`): a slot's f32 global scale is word 0 of its own 128-byte line of
+// the projection's global-scale array [>= slots, 32]; the rest of the line is never read.
+inline size_t glm5n_g_at(size_t slot) {
+  return slot * size_t(32);
+}
 inline uint glm5n_slot_bank(uint id) {
   return id >> 24;
 }

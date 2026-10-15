@@ -14,8 +14,8 @@
 //! scale lands with the bytes its wave waits for (the stream's event gates cover a span, not a record). Records start
 //! every `record_bytes` here (the manifest's `record_stride`: the parts' bytes, here `logical_bytes` and the manifest's
 //! `record_bytes`, rounded up to a page); the padding is never read. The stream
-//! scatters each component into its own slot array: a global scale's is f32 [rows], the array MLX's gather_qmm takes
-//! as its per-expert global scale.
+//! scatters each component into its own slot array: a global scale's is f32 [rows, 32], one 128-byte line per slot
+//! (`scale_line_bytes`), whose column 0 MLX's gather_qmm takes as its per-expert global scale.
 //!
 //! A value of row r: e2m1(code) * (e4m3(scale) * (g / 2688)), in f32 in that order (MLX's fp_dequantize and its
 //! Metal loaders: the group scale times g / 2688 first, then the code; `dequantRow`).
@@ -35,6 +35,17 @@ pub const group_size = 16;
 pub const bits = 4;
 /// The records' alignment in `experts.bin`.
 pub const page = 4096;
+/// Scale-line isolation: the slot arrays give every slot's row its own 128-byte line (the GPU's cache line on Apple
+/// silicon). The read pool's CPU threads write a slot's three 4-byte global scales after the command buffers that read
+/// other slots' scales were committed; packed [rows] f32 put 32 slots' words in one line, so a miss part could read its
+/// scale from a line the GPU fetched before the pool wrote it (the previous occupant's scale: one expert wrong, only
+/// the rows routed to it). Padded, a global-scale array is f32 [rows, `scale_line_floats`], the slot's word at column
+/// 0, the rest never written or read; the words and E4M3 rows are whole lines already (2 MiB / 256 KiB per projection).
+pub const scale_line_bytes = 128;
+pub const scale_line_floats = scale_line_bytes / 4;
+/// A global-scale array is at least one page: its own Metal buffer (never MLX's < 256 B heap beside foreign buffers),
+/// and never under 8 elements (MLX's `constant` passing of small custom-kernel inputs).
+pub const scale_array_min_bytes = page;
 pub const Records = sdk_ext.expert.Records(n_components, gu_components);
 pub const Dtype = enum { U32, U8, F32 };
 /// The record's layout name in the manifest (`layout`).
@@ -74,7 +85,8 @@ pub fn mlxDtype(dtype: Dtype) mlx.mlx_dtype {
 }
 
 /// One projection's slot arrays: the E2M1 words [slots, out, in / 8], the E4M3 scales [slots, out, in / 16] and the
-/// f32 global scales [slots], as MLX's gather_qmm takes them in nvfp4 mode.
+/// f32 global scales [>= slots, `scale_line_floats`] (one line per slot, its word at column 0: `scale_line_bytes`);
+/// MLX's gather_qmm takes column 0 of the first `slots` rows (nvfp4.zig `perExpertScale`).
 pub fn Arrays(comptime T: type) type {
     return struct { w: T, scales: T, global_scale: T };
 }
@@ -163,6 +175,9 @@ pub const SDK = struct {
     pub const BankArrays = Module.BankArrays;
     pub const bankArraysOf = Module.bankArraysOf;
     pub const routed_top_k = Module.routed_top_k;
+    /// The stream's scale-line isolation (`StreamOf.slot_line_bytes` / `slot_min_bytes`).
+    pub const slot_line_bytes = Module.scale_line_bytes;
+    pub const slot_min_bytes = Module.scale_array_min_bytes;
 };
 
 /// The record geometry of (hidden, inter) projections: no MLX, no file.
@@ -220,6 +235,14 @@ pub const Geometry = struct {
         g.total_bytes = std.math.mul(u64, g.record_bytes, experts * layers) catch return error.InvalidGeometry;
         if (g.total_bytes > std.math.maxInt(i64)) return error.InvalidGeometry;
         return g;
+    }
+
+    /// One slot row's bytes over the nine slot arrays as the stream lays them out (`StreamOf.rowBytes`): every
+    /// component's row on whole `scale_line_bytes` lines, so the three 4-byte global scales take a line each.
+    pub fn slotRowBytes(g: *const Geometry) u64 {
+        var n: u64 = 0;
+        for (g.segments) |seg| n += std.mem.alignForward(u64, seg.length, scale_line_bytes);
+        return n;
     }
 
     /// Model layer `layer` (its range was fixed at installation).

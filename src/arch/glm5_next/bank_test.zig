@@ -207,7 +207,11 @@ test "glm5_next nvfp4 bank: records through the reader into host slot rows, byte
     for (refs, 0..) |r, i| {
         const rec = synth.record(synth.geom.first_moe_layer + r[0], r[1]);
         for (synth.geom.segments, 0..) |s, c| {
-            try testing.expectEqualSlices(u8, rec[@intCast(s.offset)..][0..@intCast(s.length)], rows.row(@fromBackingInt(@intCast(c)), @intCast(i)));
+            // The record's bytes at the row's start (a global scale's row is its own 128-byte line; the rest is never
+            // written or read).
+            const row = rows.row(@fromBackingInt(@intCast(c)), @intCast(i));
+            try testing.expectEqual(S.rowBytes(&b.layers[0], c), row.len);
+            try testing.expectEqualSlices(u8, rec[@intCast(s.offset)..][0..@intCast(s.length)], row[0..@intCast(s.length)]);
         }
         for (projections) |p| {
             const want = try refProjection(a, rec, &synth.geom, p);
@@ -319,7 +323,10 @@ test "glm5_next nvfp4 bank (window): the stream's MLX slot arrays dequantize in 
     try readRecords(&b, &refs, &slots);
     const arrays = bank.bankArraysOf(slots.arrays);
     try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(arrays.gate.global_scale));
-    try testing.expectEqual(@as(usize, 1), mlx.mlx_array_ndim(arrays.gate.global_scale));
+    // Line-isolated: [32, 32] f32 (3 slots floored at one page), each slot's word at column 0 of its row.
+    try testing.expectEqual(@as(usize, 2), mlx.mlx_array_ndim(arrays.gate.global_scale));
+    try testing.expectEqual(@as(c_int, bank.scale_line_floats), mlx.mlx_array_shape(arrays.gate.global_scale)[1]);
+    try testing.expectEqual(@as(c_int, bank.scale_array_min_bytes / bank.scale_line_bytes), mlx.mlx_array_shape(arrays.gate.global_scale)[0]);
     for ([_]mlx.mlx_stream{ cpu, gpu }) |s| for (refs, 0..) |r, i| {
         const rec = synth.record(synth.geom.first_moe_layer + r[0], r[1]);
         for (projections, [_]bank.Arrays(mlx.mlx_array){ arrays.gate, arrays.up, arrays.down }) |p, pa| {
@@ -344,7 +351,7 @@ fn mlxDequant(a: std.mem.Allocator, pa: bank.Arrays(mlx.mlx_array), i: i32, s: m
     try mlx.check(mlx.mlx_reshape(&arrs[1], arrs[0], &[_]c_int{ sw[1], sw[2] }, 2, s));
     try mlx.check(mlx.mlx_slice(&arrs[2], pa.scales, &[_]c_int{ i, 0, 0 }, 3, &[_]c_int{ i + 1, ss[1], ss[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
     try mlx.check(mlx.mlx_reshape(&arrs[3], arrs[2], &[_]c_int{ ss[1], ss[2] }, 2, s));
-    try mlx.check(mlx.mlx_slice(&arrs[4], pa.global_scale, &[_]c_int{i}, 1, &[_]c_int{i + 1}, 1, &[_]c_int{1}, 1, s));
+    try mlx.check(mlx.mlx_slice(&arrs[4], pa.global_scale, &[_]c_int{ i, 0 }, 2, &[_]c_int{ i + 1, 1 }, 2, &[_]c_int{ 1, 1 }, 2, s));
     var gs = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gs);
     try mlx.check(mlx.mlx_reshape(&gs, arrs[4], &[_]c_int{}, 0, s));
@@ -353,4 +360,80 @@ fn mlxDequant(a: std.mem.Allocator, pa: bank.Arrays(mlx.mlx_array), i: i32, s: m
     const n: usize = @intCast(sw[1] * sw[2] * 8);
     const data = mlx.mlx_array_data_float32(arrs[5]) orelse return error.MlxNoData;
     return a.dupe(f32, data[0..n]);
+}
+
+// ── Scale-line isolation (bank.zig `scale_line_bytes`): construction geometry, CPU only ──
+
+/// Flash's SDK layer (one routed layer's segments).
+fn flashLayer() !bank.Layer {
+    const g = try bank.Geometry.init(4096, 2048, 288, 3, 42);
+    return .{ .logical_bytes = g.logical_bytes, .base_offset = 0, .segments = g.segments };
+}
+
+test "glm5_next nvfp4 bank: scale lines isolated: each slot's global scale owns a 128-byte line, every other row is whole lines" {
+    const l = try flashLayer();
+    try testing.expectEqual(@as(u64, 128), S.slot_line_bytes);
+    try testing.expectEqual(@as(u64, bank.page), S.slot_min_bytes);
+    for (l.segments, 0..) |seg, c| {
+        const comp: Component = @fromBackingInt(@intCast(c));
+        const scalar = comp == .gate_global_scale or comp == .up_global_scale or comp == .down_global_scale;
+        try testing.expectEqual(scalar, S.padded(&l, c));
+        try testing.expectEqual(@as(u64, 0), S.rowBytes(&l, c) % bank.scale_line_bytes);
+        try testing.expectEqual(if (scalar) @as(u64, bank.scale_line_bytes) else seg.length, S.rowBytes(&l, c));
+    }
+    // The slot row (every component's row) is the bank's `slotRowBytes`, within the record stride (the bill's per_row).
+    var row: u64 = 0;
+    for (0..n_components) |c| row += S.rowBytes(&l, c);
+    const fg = try bank.Geometry.init(4096, 2048, 288, 3, 42);
+    try testing.expectEqual(fg.slotRowBytes(), row);
+    try testing.expectEqual(@as(u64, 14_155_776 + 3 * 128), row);
+    try testing.expect(row <= 14_159_872);
+}
+
+test "glm5_next nvfp4 bank: scale lines isolated: the arrays' shapes, a page at least, no line shared by two slots" {
+    const l = try flashLayer();
+    const g_comps = [_]usize{ @backingInt(Component.gate_global_scale), @backingInt(Component.up_global_scale), @backingInt(Component.down_global_scale) };
+    // ext banks of 1..7 rows (lr2), window 0, the base rows at 115/131, the MTP bank's 288.
+    for ([_]u32{ 1, 2, 3, 7, 8, 31, 32, 33, 64, 115, 131, 288 }) |rows| {
+        for (g_comps) |c| {
+            var shape: [4]c_int = undefined;
+            try testing.expectEqual(@as(usize, 2), try S.arrayShape(&l, c, rows, &shape));
+            try testing.expectEqual(@as(c_int, @intCast(@max(rows, 32))), shape[0]);
+            try testing.expectEqual(@as(c_int, bank.scale_line_floats), shape[1]);
+            const bytes = S.arrayBytes(&l, c, rows);
+            try testing.expectEqual(@as(u64, @intCast(shape[0])) * bank.scale_line_bytes, bytes);
+            // Never MLX's small-buffer heap (< 256 B) and never `constant`-class (< 8 elements): a page at least.
+            try testing.expect(bytes >= bank.scale_array_min_bytes and bytes >= 256 and @as(u64, @intCast(shape[0] * shape[1])) >= 8);
+        }
+        var shape: [4]c_int = undefined;
+        try testing.expectEqual(@as(usize, 3), try S.arrayShape(&l, @backingInt(Component.gate_weight), rows, &shape));
+        try testing.expectEqualSlices(c_int, &.{ @intCast(rows), 2048, 512 }, shape[0..3]);
+        try testing.expectEqual(@as(u64, rows) * 4_194_304, S.arrayBytes(&l, @backingInt(Component.gate_weight), rows));
+    }
+    // Host rows: every slot's global-scale row starts on its own 128-byte line, and the pool's destinations (rowDest)
+    // of two slots never fall in one line.
+    var rows = try S.HostSlotRows.init(&l, 40);
+    defer rows.deinit();
+    for (g_comps) |c| {
+        var lines = std.AutoHashMap(u64, u32).init(testing.allocator);
+        defer lines.deinit();
+        for (0..40) |r| {
+            const d = rows.rowDest(@intCast(r))[c];
+            try testing.expectEqual(@as(u64, 0), d % bank.scale_line_bytes);
+            const gop = try lines.getOrPut(d / bank.scale_line_bytes);
+            try testing.expect(!gop.found_existing);
+            gop.value_ptr.* = @intCast(r);
+            // The word's 4 bytes stay inside the line.
+            try testing.expectEqual(d / bank.scale_line_bytes, (d + 3) / bank.scale_line_bytes);
+        }
+    }
+}
+
+test "glm5_next nvfp4 bank: scale lines isolated: a padded component that is not one scalar per id is refused at construction" {
+    var l = try flashLayer();
+    // A block-scale row of 100 bytes would need padding inside a rank-2 row: no layout keeps it whole, refused by name.
+    l.segments[@backingInt(Component.gate_scales)].length = 100;
+    var shape: [4]c_int = undefined;
+    try testing.expect(S.padded(&l, @backingInt(Component.gate_scales)));
+    try testing.expectError(error.SlotLineGeometry, S.arrayShape(&l, @backingInt(Component.gate_scales), 4, &shape));
 }

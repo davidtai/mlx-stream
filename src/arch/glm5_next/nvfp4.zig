@@ -1,6 +1,6 @@
 //! glm5_next's routed-expert projection format for MiMo's expert math (`mimo_v2/math.zig` `MathOf`): the NVFP4 bank's
 //! slot arrays (bank.zig: E2M1 words [slots, out, in / 8] u32, E4M3 group scales [slots, out, in / 16] u8, one f32
-//! global scale per slot [slots]) and MLX's gather_qmm over them in nvfp4 mode (group 16, bits 4) with each slot's global
+//! global scale per slot on its own 128-byte line [>= slots, 32]) and MLX's gather_qmm over them in nvfp4 mode (group 16, bits 4) with each slot's global
 //! scale. mlx-c's `mlx_gather_qmm` has no argument for the global scale (and its signature stays as it is), so the gathers
 //! go through the plugin's shim `glm5_gather_qmm_nvfp4` (csrc/glm5_gather_qmm.inc, compiled into the plugin's C++ shim
 //! with the rest of csrc): MLX's own C++ `mx::gather_qmm(..., "nvfp4", global_scale, sorted)`, so the scale applies
@@ -35,8 +35,9 @@ pub const Format = struct {
 
     /// MLX's gather_qmm in nvfp4 mode with the slots' global scales: x [.., M, in] against the slots `rhs` names.
     fn gatherQmm(g: *ops.MlxOps, x: T, p: Projection(T), rhs: T, sorted: bool) !T {
+        const gs = try perExpertScale(g, p);
         var res = mlx.mlx_array_new();
-        if (glm5_gather_qmm_nvfp4(&res, x, p.w, p.scales, p.global_scale, rhs, sorted, g.s) != 0) {
+        if (glm5_gather_qmm_nvfp4(&res, x, p.w, p.scales, gs, rhs, sorted, g.s) != 0) {
             _ = mlx.mlx_array_free(res);
             sdk.log.err("glm5_next: gather_qmm nvfp4: {s}\n", .{std.mem.span(dsv41_alloc_last_error())});
             return error.MlxError;
@@ -59,7 +60,17 @@ pub const Format = struct {
         return gatherQmm(g, x, p, ids, false);
     }
 
-    /// Bank rows [lo, hi) of one projection: leading-axis slices of the row-contiguous slot arrays (shared-buffer views).
+    /// MLX's per-expert global scale of `p`: column 0 (each slot's word) of the first `slots` rows of the line-isolated
+    /// array [>= slots, 32] (bank.zig `scale_line_bytes`), f32 [slots], `slots` the words' leading dimension as MLX's
+    /// gather_qmm requires. A strided view: MLX's GatherQMM copies it row-contiguous on the GPU inside the op (after any
+    /// event wait the arrays came through), the same words, so the arithmetic is the packed array's.
+    pub fn perExpertScale(g: *ops.MlxOps, p: Projection(T)) !T {
+        const n = g.shapeOf(p.w).d[0];
+        return g.reshape(try g.slice(p.global_scale, &.{ 0, 0 }, &.{ n, 1 }, &.{ 1, 1 }), &.{n});
+    }
+
+    /// Bank rows [lo, hi) of one projection: leading-axis slices of the row-contiguous slot arrays (shared-buffer views;
+    /// the global scales' lines whole).
     pub fn window(g: *ops.MlxOps, p: Projection(T), lo: u32, hi: u32) !Projection(T) {
         const ws = g.shapeOf(p.w);
         const ss = g.shapeOf(p.scales);
@@ -68,7 +79,7 @@ pub const Format = struct {
         return .{
             .w = try g.slice(p.w, &.{ l, 0, 0 }, &.{ h, ws.d[1], ws.d[2] }, &.{ 1, 1, 1 }),
             .scales = try g.slice(p.scales, &.{ l, 0, 0 }, &.{ h, ss.d[1], ss.d[2] }, &.{ 1, 1, 1 }),
-            .global_scale = try g.slice(p.global_scale, &.{l}, &.{h}, &.{1}),
+            .global_scale = try g.slice(p.global_scale, &.{ l, 0 }, &.{ h, bank.scale_line_floats }, &.{ 1, 1 }),
         };
     }
 
@@ -130,8 +141,9 @@ comptime {
     if (decode_kernels.max_pairs < @import("../../sdk_ext.zig").expert.policy.max_route_ids) @compileError("glm5_next: the fused decode texts' widest wave is narrower than the scheduler's route");
 }
 
-/// A projection's slot arrays as the gathers take them: [slots, out, in / 8] u32, [slots, out, in / 16] u8, [slots] f32.
-/// Construction only (each routed layer's banks, once).
+/// A projection's slot arrays as the gathers take them: [slots, out, in / 8] u32, [slots, out, in / 16] u8, and the
+/// line-isolated global scales [>= slots, 32] f32 of at least a page (bank.zig `scale_line_bytes`). Construction only
+/// (each routed layer's banks, once).
 pub fn checkArrays(g: *ops.MlxOps, which: []const u8, w: bank.Arrays(T), in: u32, out: u32) !void {
     const sw = g.shapeOf(w.w);
     const ss = g.shapeOf(w.scales);
@@ -139,11 +151,17 @@ pub fn checkArrays(g: *ops.MlxOps, which: []const u8, w: bank.Arrays(T), in: u32
     const outc: c_int = @intCast(out);
     if (sw.n != 3 or sw.d[1] != outc or sw.d[2] != @as(c_int, @intCast(in / 8)) or g.dtypeOf(w.w) != .uint32 or
         ss.n != 3 or ss.d[0] != sw.d[0] or ss.d[1] != outc or ss.d[2] != @as(c_int, @intCast(in / bank.group_size)) or g.dtypeOf(w.scales) != .uint8 or
-        sg.n != 1 or sg.d[0] != sw.d[0] or g.dtypeOf(w.global_scale) != .float32)
+        !scaleShapeOk(sg.slice(), sw.d[0]) or g.dtypeOf(w.global_scale) != .float32)
     {
-        sdk.log.err("glm5_next: {s} slot arrays are {any} {any} {any}, not the nvfp4 bank's [slots, {d}, {d}] u32, [slots, {d}, {d}] u8, [slots] f32\n", .{ which, sw.slice(), ss.slice(), sg.slice(), out, in / 8, out, in / bank.group_size });
+        sdk.log.err("glm5_next: {s} slot arrays are {any} {any} {any}, not the nvfp4 bank's [slots, {d}, {d}] u32, [slots, {d}, {d}] u8, [>= slots, {d}] f32 (>= {d} B)\n", .{ which, sw.slice(), ss.slice(), sg.slice(), out, in / 8, out, in / bank.group_size, bank.scale_line_floats, bank.scale_array_min_bytes });
         return error.Glm5NextSlotArrays;
     }
+}
+
+/// A global-scale array's shape for `slots` slots: [rows, 32] f32, rows >= slots, at least `scale_array_min_bytes`.
+pub fn scaleShapeOk(shape: []const c_int, slots: c_int) bool {
+    if (shape.len != 2 or shape[1] != bank.scale_line_floats or shape[0] < slots) return false;
+    return @as(u64, @intCast(shape[0])) * bank.scale_line_bytes >= bank.scale_array_min_bytes;
 }
 
 const testing = std.testing;
@@ -167,4 +185,15 @@ test "glm5_next nvfp4 format: the event aliases are the projection's three array
     try testing.expectEqual(@as(u32, 17), back.w);
     try testing.expectEqual(@as(u32, 19), back.scales);
     try testing.expectEqual(@as(u32, 23), back.global_scale);
+}
+
+test "glm5_next nvfp4 format: a global-scale array is line-isolated: [>= slots, 32] f32 of a page at least, never packed [slots]" {
+    try testing.expect(scaleShapeOk(&.{ 32, 32 }, 3));
+    try testing.expect(scaleShapeOk(&.{ 131, 32 }, 131));
+    try testing.expect(scaleShapeOk(&.{ 288, 32 }, 288));
+    // Packed (the old layout), fewer rows than slots, another line, under a page.
+    try testing.expect(!scaleShapeOk(&.{131}, 131));
+    try testing.expect(!scaleShapeOk(&.{ 130, 32 }, 131));
+    try testing.expect(!scaleShapeOk(&.{ 131, 1 }, 131));
+    try testing.expect(!scaleShapeOk(&.{ 3, 32 }, 3));
 }

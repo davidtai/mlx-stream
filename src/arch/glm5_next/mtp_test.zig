@@ -213,7 +213,7 @@ test "glm5_next mtp bank: a synthetic draft bank opens through the routed bank's
         try db.read(a, &rows, &.{ 2, 0, 1 }, &.{ 0, 1, 2 }, &diag);
         for ([_]u32{ 2, 0, 1 }, 0..) |e, r| {
             const rec = synth.record(e);
-            for (synth.geom.segments, 0..) |s, ci| try testing.expectEqualSlices(u8, rec[@intCast(s.offset)..][0..@intCast(s.length)], rows.row(@fromBackingInt(@intCast(ci)), @intCast(r)));
+            for (synth.geom.segments, 0..) |s, ci| try testing.expectEqualSlices(u8, rec[@intCast(s.offset)..][0..@intCast(s.length)], rows.row(@fromBackingInt(@intCast(ci)), @intCast(r))[0..@intCast(s.length)]);
         }
         try testing.expectEqual(synth.geom.total_bytes, db.view.sidecar.size);
     }
@@ -273,7 +273,7 @@ test "glm5_next mtp bank: a read of more records than one submit takes (17: subm
     try db.read(a, &rows, &ids, &at, &diag);
     for (ids, at) |e, r| {
         const rec = synth.record(e);
-        for (synth.geom.segments, 0..) |s, ci| try testing.expectEqualSlices(u8, rec[@intCast(s.offset)..][0..@intCast(s.length)], rows.row(@fromBackingInt(@intCast(ci)), r));
+        for (synth.geom.segments, 0..) |s, ci| try testing.expectEqualSlices(u8, rec[@intCast(s.offset)..][0..@intCast(s.length)], rows.row(@fromBackingInt(@intCast(ci)), r)[0..@intCast(s.length)]);
     }
     try noDevice();
 }
@@ -317,7 +317,7 @@ test "glm5_next mtp bank: one read spanning past 2 GiB and 4 GiB of the data fil
     };
     for (written, recs) |e, rec| {
         const r = std.mem.indexOfScalar(u32, &ids, e).?;
-        for (g.segments, 0..) |s, ci| try testing.expectEqualSlices(u8, rec[@intCast(s.offset)..][0..@intCast(s.length)], rows.row(@fromBackingInt(@intCast(ci)), @intCast(r)));
+        for (g.segments, 0..) |s, ci| try testing.expectEqualSlices(u8, rec[@intCast(s.offset)..][0..@intCast(s.length)], rows.row(@fromBackingInt(@intCast(ci)), @intCast(r))[0..@intCast(s.length)]);
     }
     try noDevice();
 }
@@ -595,7 +595,8 @@ test "glm5_next mtp bill: the lane's terms by construction (the bank's nine arra
     const res_bytes = try writeResidents(a, io, tmp.dir, &c, null, null);
     const f = try mtp.facts(a, io, dir, &c, page, &diag);
     var arrays: u64 = 0;
-    for (synth.geom.segments) |s| arrays += graph.bufferBytes(3 * s.length, page);
+    // Line-isolated global scales: each [32, 32] f32 (3 experts floored at a page of 128-byte lines), the rest [3, ...].
+    for (synth.geom.segments) |s| arrays += graph.bufferBytes(if (s.rank == 0) bank.scale_array_min_bytes else 3 * s.length, page);
     try testing.expectEqual(arrays, f.bank_bytes);
     try testing.expect(f.resident_bytes >= res_bytes);
     try testing.expectEqual(mtp.Head.tableBytes(&c, page), f.table_bytes);
@@ -896,7 +897,8 @@ test "glm5_next mtp: the lane's device code compiles against the arch's seams (d
 /// positions plus a round's drafts), from their shapes and dtypes.
 fn openArrayBytes(g: *const bank.Geometry, c: *const glm.Config, positions: u64) [bank.n_components + 5]u64 {
     var out: [bank.n_components + 5]u64 = undefined;
-    for (g.segments, out[0..bank.n_components]) |s, *o| o.* = @as(u64, g.num_experts) * s.length;
+    const l: bank.Layer = .{ .logical_bytes = g.logical_bytes, .base_offset = 0, .segments = g.segments };
+    for (out[0..bank.n_components], 0..) |*o, ci| o.* = mtp.Slots.arrayBytes(&l, ci, g.num_experts);
     const h: u64 = c.hidden_size;
     const ihd: u64 = c.index_head_dim;
     const lanes = positions + mtp.max_depth;
@@ -919,8 +921,9 @@ test "glm5_next mtp hold: what the open's arrays hold equals the bill's mtp_bank
         try mtp.holdCheck(held, held);
         try testing.expectError(error.ConstructionOverBill, mtp.holdCheck(held + 4, held));
     }
-    // The window's 32,768-position load billed 4,134,049,152 B for the pack: the hold is exactly that.
-    try testing.expectEqual(@as(u64, 4_134_049_152), mtp.heldOf(&openArrayBytes(&g, &c, 32_768), page));
+    // The window's 32,768-position load billed 4,134,049,152 B for the pack with packed global scales; line-isolated
+    // ([288, 32] f32, 36,864 B -> 49,152 B at 16 KiB pages, were 1,152 B) the three arrays add 144,000 B.
+    try testing.expectEqual(@as(u64, 4_134_049_152 + 144_000), mtp.heldOf(&openArrayBytes(&g, &c, 32_768), page));
     // The pack's own manifest, when given: its geometry is the served model's.
     const dir = std.mem.span(std.c.getenv("GLM5_BANK") orelse return);
     const a = testing.allocator;

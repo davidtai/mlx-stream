@@ -63,8 +63,10 @@ fn checkOne(a: Allocator, bound: *const xk.Bound, k: Kernel, inst: xk.Instance, 
     try report.results.append(a, .{ .kernel = k, .check = .compile, .words = pairs, .ok = true });
 }
 
-/// Slots of a check bank's global scales: 8, MLX's `device` passing (the module's banks hold more).
+/// Slots of a check bank's global scales: 8 lines of 32 f32 (bank.zig `scale_line_floats`; MLX's `device` passing, as
+/// the module's line-isolated banks).
 const check_scale_slots = 8;
+const check_scale_floats = check_scale_slots * @import("bank.zig").scale_line_floats;
 
 /// One launch of `k` at `inst` over `pairs` pairs of zeros, evaluated: each bank one slot of zero words and scales (the
 /// same arrays in all three banks), its global scales `check_scale_slots` zeros, every id slot 0 of bank 0.
@@ -82,14 +84,14 @@ fn launchZeros(a: Allocator, bound: *const xk.Bound, k: Kernel, inst: xk.Instanc
     const sz = try a.alloc(u8, rows * cols / inst.gs);
     defer a.free(sz);
     @memset(sz, 0);
-    const gz: [check_scale_slots]f32 = @splat(0);
+    const gz: [check_scale_floats]f32 = @splat(0);
     const idz = try a.alloc(u32, pairs);
     defer a.free(idz);
     @memset(idz, 0);
     const x = try sc.host(std.mem.sliceAsBytes(xz), &.{ @intCast(pairs), @intCast(cols) }, .bfloat16);
     const w = try sc.host(std.mem.sliceAsBytes(wz), &.{ 1, @intCast(rows), @intCast(cols / 8) }, .uint32);
     const s = try sc.host(sz, &.{ 1, @intCast(rows), @intCast(cols / inst.gs) }, .uint8);
-    const g = try sc.host(std.mem.sliceAsBytes(&gz), &.{check_scale_slots}, .float32);
+    const g = try sc.host(std.mem.sliceAsBytes(&gz), &.{ check_scale_slots, @import("bank.zig").scale_line_floats }, .float32);
     const ids = try sc.host(std.mem.sliceAsBytes(idz), &.{@intCast(pairs)}, .uint32);
     var inputs: [xk.max_inputs]mlx.mlx_array = undefined;
     var n: usize = 0;
