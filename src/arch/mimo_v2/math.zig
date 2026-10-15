@@ -177,7 +177,7 @@ pub const Predictor = struct {
         return Math.predictorScores(g, x, router, correction);
     }
 
-    /// `router`: the next layer's BF16 [256, 4096] weight (the gate table `Source.validateGates` checked for this route).
+    /// `router`: the next layer's BF16 [256, 4096] weight (the gate table `Source.validateGatesFor` checked for this route).
     fn scoresBf16(p: *const Predictor, g: *ops.MlxOps, x: T, router: T, correction: T) anyerror!T {
         const logits = try g.adopt(try p.rows.apply(x, router, g.s));
         return g.add(try g.sigmoid(logits), correction);

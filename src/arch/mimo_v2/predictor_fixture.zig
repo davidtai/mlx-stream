@@ -30,19 +30,19 @@ test "mimo lookahead: F32 promotion precedes borrowed transposed sigmoid correct
 }
 
 test "mimo lookahead: installation validates explicit borrowed absolute gates once" {
-    if (comptime @hasDecl(source_mod, "Gate") and @hasDecl(source_mod, "validateGates")) {
+    if (comptime @hasDecl(source_mod, "Gate") and @hasDecl(source_mod, "validateGatesFor")) {
         const geometry = try bank_mod.Geometry.init(64, 64, 64, 1, 2);
         const borrowed: source_mod.Gate = .{ .w = .{ .ctx = @ptrFromInt(1) }, .bias = .{ .ctx = @ptrFromInt(2) } };
         const gates = [_]source_mod.Gate{ .{ .w = .{}, .bias = .{} }, borrowed, borrowed };
         var g: GateOps = .{};
-        try source_mod.validateGates(&g, geometry, &gates);
+        try source_mod.validateGatesFor(&g, geometry, &gates, .f32);
         try std.testing.expectEqual(@as(usize, 4), g.shapes);
-        try std.testing.expectError(error.MimoPredictorGateTable, source_mod.validateGates(&g, geometry, gates[0..2]));
+        try std.testing.expectError(error.MimoPredictorGateTable, source_mod.validateGatesFor(&g, geometry, gates[0..2], .f32));
         g.bad_shape = true;
-        try std.testing.expectError(error.MimoPredictorGateShape, source_mod.validateGates(&g, geometry, &gates));
+        try std.testing.expectError(error.MimoPredictorGateShape, source_mod.validateGatesFor(&g, geometry, &gates, .f32));
         g.bad_shape = false;
         g.bad_dtype = true;
-        try std.testing.expectError(error.MimoPredictorGateDtype, source_mod.validateGates(&g, geometry, &gates));
+        try std.testing.expectError(error.MimoPredictorGateDtype, source_mod.validateGatesFor(&g, geometry, &gates, .f32));
     } else return error.MimoLookaheadGateValidationMissing;
 }
 
@@ -140,7 +140,6 @@ test "mimo lookahead X19: the gate table is checked for the installed predictor 
     const flipped: source_mod.Gate = .{ .w = .{ .ctx = @ptrFromInt(4) }, .bias = .{ .ctx = @ptrFromInt(3) } };
     try source_mod.validateGatesFor(&g, geometry, &.{ empty, copy, copy }, .f32);
     try source_mod.validateGatesFor(&g, geometry, &.{ empty, stored, stored }, .bf16);
-    try source_mod.validateGates(&g, geometry, &.{ empty, copy, copy });
     try std.testing.expectError(error.MimoPredictorGateDtype, source_mod.validateGatesFor(&g, geometry, &.{ empty, stored, stored }, .f32));
     try std.testing.expectError(error.MimoPredictorGateDtype, source_mod.validateGatesFor(&g, geometry, &.{ empty, copy, copy }, .bf16));
     try std.testing.expectError(error.MimoPredictorGateShape, source_mod.validateGatesFor(&g, geometry, &.{ empty, flipped, flipped }, .bf16));
