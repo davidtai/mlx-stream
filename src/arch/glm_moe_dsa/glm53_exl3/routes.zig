@@ -226,32 +226,6 @@ pub const Prompt = struct {
         hm: [1]mlx.mlx_array = .{.{}},
         y: [1]mlx.mlx_array = .{.{}},
 
-        /// The array the last stage wrote (the bench evaluates it).
-        pub fn last(st: *const Stages, at: Stage) mlx.mlx_array {
-            return switch (at) {
-                .gate_up => st.z[1],
-                .mid => st.hm[0],
-                .down => st.y[0],
-            };
-        }
-
-        /// A new handle to the same array (the caller frees it).
-        pub fn retain(x: mlx.mlx_array) !mlx.mlx_array {
-            var r = mlx.mlx_array_new();
-            if (x.ctx != null) try mlx.check(mlx.mlx_array_set(&r, x));
-            return r;
-        }
-
-        /// The same arrays under new handles (tests: one stage's inputs launched again and again).
-        pub fn dupe(st: *const Stages) !Stages {
-            var d: Stages = .{};
-            errdefer d.deinit();
-            for (&d.z, st.z) |*o, i| o.* = try retain(i);
-            d.hm[0] = try retain(st.hm[0]);
-            d.y[0] = try retain(st.y[0]);
-            return d;
-        }
-
         pub fn take(st: *Stages) mlx.mlx_array {
             const y = st.y[0];
             st.y[0] = .{};
