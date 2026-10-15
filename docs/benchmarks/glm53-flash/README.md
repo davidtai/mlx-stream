@@ -191,6 +191,22 @@ after the pulse, gate ADMIT at 8.19, OVERFILL 1.17 GB at load) has its own one-p
 ladder, because the side rows add a lever: 34.50 against g25-dsa's 34.10 at the same pin, a single cell each in
 different windows.
 
+## HumanEval (2026-10-15)
+
+One served run per draft head on g29-clean (SHA-256 `89297e60`, plugin `1f3a3c0`, host `a8f6c6b8`), pin 190/217, MTP lane on
+(`draft_depth` 3, `draft_gate` 0.5), temperature 1.0, top-p 0.95, seed 1, thinking on, `max_tokens` 16,384, 164 problems
+through `/v1/chat/completions`, scored with evalplus on the last code block. The bf16 head is the exact default; the q8 head
+is the headline class (`"draft_head": "q8"`).
+
+| Draft head | pass@1 | completed-only pass@1 | truncated | errors | lane engaged | mean completion tokens | decode median (tok/s) | wall (s) | peak (GB) | failed |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| bf16 (exact) | 0.9817 (161/164) | 0.9938 (161/162) | 2 | 0 | 164/164 | 1,426.6 | 38.35 | 7,585 | 103.99 | 47, 116, 132 |
+| q8 | 0.9817 (161/164) | 0.9938 (161/162) | 2 | 0 | 164/164 | 1,316.1 | 39.9 | 6,844 | 104.66 | 116, 132, 139 |
+
+Both heads pass 161 of 164. Two problems fail on both (116, 132); each head loses one more problem the other passes, at
+temperature 1.0 with one sample. The two truncated completions per run hit the 16,384-token cap. For comparison, MiMo-V2.6-Flash
+scored 0.9451 / 0.9573 on the same harness.
+
 ## Context sweep 1K-1M
 
 One request per context rung, from 1K to 1M prompt tokens, on the exact stack of this branch (the g25-dsa3 kernels and
