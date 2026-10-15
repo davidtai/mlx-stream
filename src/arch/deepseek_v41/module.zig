@@ -1684,9 +1684,11 @@ pub const Module = struct {
                 .unknown => reverseBoundKept(terms, scratch, terms.waves),
                 .fresh => unreachable,
             } else reverseBound(terms, scratch);
-            const st = settleReadings(LiveReader{ .io = m.io }, x.before, freed, m.installed.phase_change_poll_ms, bound);
-            m.reverse_change = .{ .vm_after = if (m.overrides.verify) VmMark.now() else null, .before = x.before, .after = st.after, .freed_bytes = x.before.cache + freed, .settle_ms = st.waited_ms, .bound_bytes = bound, .margin_bytes = @as(i64, @intCast(bound)) - @as(i64, @intCast(st.after.footprint)), .ms = 0 };
-            try checkSettled(x.before, st.after, freed, raisedBound(bound, sdk.memory.foreignBytes()));
+            // The host's other models' bytes, read once per change: the poll, the record and the check judge one bound.
+            const raised = raisedBound(bound, sdk.memory.foreignBytes()).?;
+            const st = settleReadings(LiveReader{ .io = m.io }, x.before, freed, m.installed.phase_change_poll_ms, raised);
+            m.reverse_change = .{ .vm_after = if (m.overrides.verify) VmMark.now() else null, .before = x.before, .after = st.after, .freed_bytes = x.before.cache + freed, .settle_ms = st.waited_ms, .bound_bytes = raised, .margin_bytes = @as(i64, @intCast(raised)) - @as(i64, @intCast(st.after.footprint)), .ms = 0 };
+            try checkSettled(x.before, st.after, freed, raised);
         }
 
         /// The prompt's scratch (when the decode freed it) and the prompt cache limit. The record takes the residents route
@@ -1770,11 +1772,12 @@ pub const Module = struct {
         const freed_at = std.Io.Timestamp.now(self.io, .boot);
         // until_freed: the admission's bound on the footprint before the grow (from the bill and the release's bytes).
         const uf = untilFreedBound(self.bill.decodeTotal() - self.bill.baseline, self.bill.slot_prefill, self.bill.slot_decode, transient_freed, @intCast(self.model.c.n_layers));
-        const bound: ?u64 = uf.bound;
+        // Raised by the host's other models' bytes, read once per change: the poll, the record and the check judge one bound.
+        const bound: ?u64 = raisedBound(uf.bound, sdk.memory.foreignBytes());
         const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms, bound);
         if (v) marks[3] = VmMark.now();
         self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = released_here, .settle_ms = st.waited_ms, .settle = .until_freed, .grow_bound_bytes = bound, .grow_bytes = uf.grow, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
-        checkSettled(before, st.after, freed_device, raisedBound(bound, sdk.memory.foreignBytes())) catch |e| {
+        checkSettled(before, st.after, freed_device, bound) catch |e| {
             // The readings over the bound: this request fails (nothing grew); the next request's reverse change returns
             // the Module to its prompt configuration on fresh readings. Not latched.
             self.phase_change.?.refused = @errorName(e);
@@ -3165,6 +3168,22 @@ test "dsv41 memory: another model in the process raises the bound by its bytes, 
     try checkSettled(before, after, 10 * gb, raisedBound(own_bound, 14_730_000_000));
     try std.testing.expectError(error.PhaseChangeFootprintOverBill, checkSettled(before, after, 10 * gb, raisedBound(own_bound, 13 * gb)));
     try std.testing.expectEqual(@as(?u64, null), raisedBound(null, 14_730_000_000));
+    // The settle poll judges the raised bound too: a footprint between the own bound and the raised one settles at the
+    // first reading (with the own bound it polled to `phase_change_settle_ms` on every request).
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{after}, .i = &i, .slept_ms = &slept }, before, 10 * gb, 5, raisedBound(own_bound, 14_730_000_000));
+        try std.testing.expectEqual(@as(u32, 0), st.waited_ms);
+        try std.testing.expectEqual(@as(usize, 1), i);
+        try checkSettled(before, st.after, 10 * gb, raisedBound(own_bound, 14_730_000_000));
+    }
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{after}, .i = &i, .slept_ms = &slept }, before, 10 * gb, 5, own_bound);
+        try std.testing.expectEqual(phase_change_settle_ms, st.waited_ms);
+    }
 }
 
 test "dsv41 memory: until_freed settles on the admission's bound (run 3bj): a reading above it keeps polling, the settled arms pass at once" {
