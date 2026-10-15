@@ -496,7 +496,7 @@ pub fn joinlessRoute(ov: module.RouteOverrides) bool {
 pub fn prefillBillAt(config: *const settings.Config, ov: module.RouteOverrides, c: *const v41.Config, group_streams: u64) !v41.PrefillBill {
     const shape: v41.PrefillBill.JoinlessShape = .{ .wave_experts = exl3.PrefillShape.tier.wave, .wave_rows = exl3.PrefillShape.tier.row_budget, .group_experts = xp.max_route_ids, .base_calls = v41.PrefillBill.wide_base_calls, .inflight = exl3.PrefillShape.tier.inflight };
     const expert_bf16 = config.dsv41ExpertBf16();
-    return v41.PrefillBill.of(c, try module.ringGeometry(config, ov)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinlessRoute(ov)) shape else null).withGroupStreams(group_streams).withInputRelease(module.prefillInputRelease(ov)).withPrefillSub(module.prefillSub(ov, config.dsv41LayerMajor())).withDerivedGroup(derivedGroupRoute(config, ov), if (expert_bf16) 2 else 4);
+    return v41.PrefillBill.of(c, try module.ringGeometry(config, ov)).withIndexLaunch(try module.prefillIndexRoute(config, ov)).withJoinless(if (joinlessRoute(ov)) shape else null).withGroupStreams(group_streams).withPrefillSub(module.prefillSub(ov, config.dsv41LayerMajor())).withDerivedGroup(derivedGroupRoute(config, ov), if (expert_bf16) 2 else 4);
 }
 
 /// The routes `PrefillBill.groupTerms` is derived from, as the Module installs them (`Module.init`: the tier's route, an
@@ -2301,7 +2301,7 @@ test "dsv41 bill: the layer-major wave per sub-chunk call (read-out)" {
         for (calls, 0..) |cl, k| {
             const rows: u64 = cl[1] - cl[0];
             const t = pb.layerMajorWaveTerms(rows, span, cl[1], .served);
-            std.debug.print("WAVE_CALL seq {d} k {d} rows {d} positions {d} total {d} kept {d} halves {d} selection {d} attn {d} group {d} final {d} released {d}\n", .{ seq, k, rows, cl[1], t.total(), t.kept, t.halves, t.selection, t.attn, t.group, t.final_eval, t.released });
+            std.debug.print("WAVE_CALL seq {d} k {d} rows {d} positions {d} total {d} kept {d} halves {d} selection {d} attn {d} group {d} final {d}\n", .{ seq, k, rows, cl[1], t.total(), t.kept, t.halves, t.selection, t.attn, t.group, t.final_eval });
         }
     }
 }

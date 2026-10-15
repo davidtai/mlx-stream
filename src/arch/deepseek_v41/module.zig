@@ -126,8 +126,6 @@ pub const RouteOverrides = struct {
     decode_mxfp8_rows: ?bool = null,
     /// K16: each chunk's layer input stream released at its chunk fence (`inputStreamEarlyRelease`).
     input_stream_early_release: ?bool = null,
-    /// K16: each routed group's MoE inputs freed after its wide call (`prefillInputRelease`).
-    prefill_input_release: ?bool = null,
     /// The prompt's sub-chunk (`prefillSub`): the rows a layer-major call takes before the prompt continues in another
     /// call. null: `kvc.prefill_sub`; maxInt: the whole prompt in one call (the proof cell's control).
     prefill_sub: ?u64 = null,
@@ -369,11 +367,6 @@ pub fn transientRelease(ov: RouteOverrides) bool {
 /// served tier's route): the routed groups hold one hc-width stream when it is on.
 pub fn inputStreamEarlyRelease(ov: RouteOverrides) bool {
     return ov.input_stream_early_release orelse numericTier(.served).routes.input_stream_early_release;
-}
-
-/// K16's MoE-input release as the Module installs it and the bill charges it (one resolver; off by default).
-pub fn prefillInputRelease(ov: RouteOverrides) bool {
-    return ov.prefill_input_release orelse numericTier(.served).routes.prefill_input_release;
 }
 
 /// The prompt's sub-chunk the Module installs and the bill reads (upstream deepseek_v4's `prefillSub()`, read by both
@@ -759,12 +752,8 @@ pub const Module = struct {
         if (ov.decode_smallm) |v| tier.routes.rc_smallm = v;
         if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
         tier.routes.input_stream_early_release = inputStreamEarlyRelease(ov);
-        tier.routes.prefill_input_release = prefillInputRelease(ov);
         if (ov.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
         if (ov.prefill_hcpost) |v| tier.routes.prefill_hcpost = v;
-        // The release frees the inputs the combine would read without the host shared experts and JOINLESS.
-        if (tier.routes.prefill_input_release and (!tier.routes.prefill_host_shared or !tier.routes.prefill_joinless))
-            return refused(refuse(&diag, error.InputReleaseRoute, "prefill input release needs the host shared experts and JOINLESS", .{}), &diag);
         if (ov.head_mode) |h| {
             tier.routes.head = h;
             if (h != .bf16) tier.routes.rc_head = false;
@@ -824,7 +813,6 @@ pub const Module = struct {
         self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
         self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
-        self.installed.prefill_input_release = self.model.tier.routes.prefill_input_release;
         self.prefill_sub = prefillSub(ov, self.model.tier.layer_major);
         self.multiturn = multiturnRoute(ov);
         self.installed.prefill_sub = self.prefill_sub;
@@ -841,7 +829,6 @@ pub const Module = struct {
         log.info("NATIVE prefill input streams: {s}\n", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
         if (self.installed.prefill_hcpost) log.info("NATIVE prefill HC post: fused (both HC combines above 8 rows in one pass on the region's numerics; checked against the region at construction; word-exact on every normal-range and mixed-edge input tested, an input whose products are all below 2^-126 is not covered)\n", .{});
         if (self.installed.prefill_shared_mid) log.info("NATIVE prefill shared middle: compiled (the shared expert's clamps, silu and product as one region above 8 rows)\n", .{});
-        if (self.installed.prefill_input_release) log.info("NATIVE prefill input release: installed (each routed group's MoE inputs freed after its wide call)\n", .{});
         log.info("NATIVE transient release: {s}\n", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
         log.info("NATIVE grow fill: {t} ({s})\n", .{ self.installed.grow_fill, switch (self.installed.grow_fill) {
             .zeros => "the grown rows zero-filled on the GPU",
@@ -1954,8 +1941,6 @@ pub const Installed = struct {
     decode_mxfp8_rows: bool = false,
     /// K16's input streams released at each chunk fence, as installed.
     input_stream_early_release: bool = false,
-    /// K16's routed groups' MoE inputs freed after the wide call, as installed.
-    prefill_input_release: bool = false,
     /// The prompt's sub-chunk (`prefillSub`; maxInt: one call).
     prefill_sub: u64 = std.math.maxInt(u64),
     /// The shared expert's middle compiled at prompt widths, as installed.

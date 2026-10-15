@@ -689,7 +689,7 @@ fn envStr(name: [*:0]const u8) ?[]const u8 {
 
 /// The cell levers this build no longer takes (each one dead in the ledger): a window that still sets one is refused by
 /// name before any work, never ignored.
-const retired_cell_levers = [_][:0]const u8{ "DSV41_CELL_PREDICT_BF16", "DSV41_CELL_DENSE_RC" };
+const retired_cell_levers = [_][:0]const u8{ "DSV41_CELL_PREDICT_BF16", "DSV41_CELL_DENSE_RC", "DSV41_CELL_PREFILL_INPUT_RELEASE" };
 
 /// The first retired cell lever that `getenv` finds set, or null.
 fn retiredCellLever(getenv: anytype) ?[]const u8 {
@@ -1192,8 +1192,6 @@ const CellReceipt = struct {
     decode_mxfp8_rows: ?bool = null,
     /// K16's input streams released at each chunk fence (installed).
     input_stream_early_release: ?bool = null,
-    /// K16's routed groups' MoE inputs freed after the wide call (installed).
-    prefill_input_release: ?bool = null,
     /// The prompt's sub-chunk rows as installed (null: the prompt in one call).
     prefill_sub: ?u64 = null,
     /// The shared expert's middle at prompt widths as installed: "compiled" or "eager".
@@ -1673,7 +1671,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_smallm = md.installed.decode_smallm,
         .decode_mxfp8_rows = md.installed.decode_mxfp8_rows,
         .input_stream_early_release = md.installed.input_stream_early_release,
-        .prefill_input_release = md.installed.prefill_input_release,
         .prefill_sub = if (md.installed.prefill_sub == std.math.maxInt(u64)) null else md.installed.prefill_sub,
         .prefill_shared_mid = if (md.installed.prefill_shared_mid) "compiled" else "eager",
         .prefill_hcpost = if (md.installed.prefill_hcpost) "fused" else "region",
@@ -1792,7 +1789,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_WINDOW_RING_SLACK")) |v| ov.window_ring_slack = std.fmt.parseInt(u32, v, 10) catch return error.CellWindowRing;
     if (envStr("DSV41_CELL_WINDOW_RING_HEADROOM")) |v| ov.window_ring_headroom = std.fmt.parseInt(u32, v, 10) catch return error.CellWindowRing;
     if (envStr("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE")) |v| ov.input_stream_early_release = try cellBool("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE", v);
-    if (envStr("DSV41_CELL_PREFILL_INPUT_RELEASE")) |v| ov.prefill_input_release = try cellBool("DSV41_CELL_PREFILL_INPUT_RELEASE", v);
     // The prompt's sub-chunk rows ("whole": the prompt in one call, the proof cell's control).
     if (envStr("DSV41_CELL_PREFILL_SUB")) |v| ov.prefill_sub = if (std.mem.eql(u8, v, "whole")) std.math.maxInt(u64) else std.fmt.parseInt(u64, v, 10) catch return error.CellPrefillSub;
     if (envStr("DSV41_CELL_PREFILL_HCPOST")) |v| ov.prefill_hcpost = if (std.mem.eql(u8, v, "fused")) true else if (std.mem.eql(u8, v, "region")) false else return error.CellHcPostValue;
@@ -3126,8 +3122,8 @@ test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselin
             const w = pb.layerMajorWaveTerms(rows, pb.chunkRows(n), n, .served);
             // The derived group's terms (`PrefillBill.groupTerms`; `group_derived` false: the streams bound bills the group).
             const gt = pb.groupTerms(rows, pb.chunkRows(n));
-            std.debug.print("DSV41_WAVE_TERMS {{\"positions\": {d}, \"rows\": {d}, \"span\": {d}, \"kept_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"selection_gb\": {d:.3}, \"attn_gb\": {d:.3}, \"group_gb\": {d:.3}, \"final_eval_gb\": {d:.3}, \"released_gb\": {d:.3}, \"total_gb\": {d:.3}, \"overshoot_gb\": {d:.3}, \"group_derived\": {}, \"group_terms_gb\": {{\"router\": {d:.3}, \"cat_xf\": {d:.3}, \"cat_idx\": {d:.4}, \"shared\": {d:.3}, \"routed\": {d:.3}, \"waves\": {d:.3}, \"merge\": {d:.3}, \"loc\": {d:.4}, \"combine\": {d:.3}, \"cast\": {d:.3}}}}}\n", .{
-                n, rows, pb.chunkRows(n), gbOf(w.kept), gbOf(w.halves), gbOf(w.selection), gbOf(w.attn), gbOf(w.group), gbOf(w.final_eval), gbOf(w.released), gbOf(w.total()), gbOf(pb.joinedBytes(rows)),
+            std.debug.print("DSV41_WAVE_TERMS {{\"positions\": {d}, \"rows\": {d}, \"span\": {d}, \"kept_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"selection_gb\": {d:.3}, \"attn_gb\": {d:.3}, \"group_gb\": {d:.3}, \"final_eval_gb\": {d:.3}, \"total_gb\": {d:.3}, \"overshoot_gb\": {d:.3}, \"group_derived\": {}, \"group_terms_gb\": {{\"router\": {d:.3}, \"cat_xf\": {d:.3}, \"cat_idx\": {d:.4}, \"shared\": {d:.3}, \"routed\": {d:.3}, \"waves\": {d:.3}, \"merge\": {d:.3}, \"loc\": {d:.4}, \"combine\": {d:.3}, \"cast\": {d:.3}}}}}\n", .{
+                n, rows, pb.chunkRows(n), gbOf(w.kept), gbOf(w.halves), gbOf(w.selection), gbOf(w.attn), gbOf(w.group), gbOf(w.final_eval), gbOf(w.total()), gbOf(pb.joinedBytes(rows)),
                 pb.derived_group, gbOf(gt.router), gbOf(gt.cat_xf), gbOf(gt.cat_idx), gbOf(gt.shared), gbOf(gt.routed), gbOf(gt.waves), gbOf(gt.merge), gbOf(gt.loc), gbOf(gt.combine), gbOf(gt.cast),
             });
         };

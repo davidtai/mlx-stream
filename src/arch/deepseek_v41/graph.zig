@@ -175,10 +175,6 @@ pub const Routes = struct {
     /// residual, the tap is settled), not at its routed group's HC post; the routed groups then hold one hc-width
     /// stream. Lifetime only: the same ops.
     input_stream_early_release: bool = false,
-    /// K16: each routed group's MoE inputs (the chunks' moe_in, their row views and concat) freed once the wide call's
-    /// waves drained and the host-shared experts were issued from them, before the group's final evaluation. Lifetime
-    /// only: the same ops. Needs JOINLESS and the host shared experts (the combine then reads neither input).
-    prefill_input_release: bool = false,
     /// The shared expert's middle (clamps, silu, product) as C22's compiled SharedMid region at prompt widths (rows
     /// above rc_max_rows); decode widths keep the op chain. The device probe found the region equal
     /// to the op chain word for word at 953 and 183 f32 rows (kbench hcpostx1ff57a9e, SHAREDMIDX).
