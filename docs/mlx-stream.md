@@ -83,8 +83,6 @@ mlx-stream's files are the `.zig` files of `src/mlx_stream/`. Each may import:
 - host files only through `src/arch/deepseek_v41/host.zig`, the bridge its harnesses (the AR cell, parity) and bank
   tests use (the config parse, the loaders, the memory knobs). Served code never imports it.
 
-One narrow exception: `src/arch/deepseek_v41/profile.zig` reads `root` in profile builds.
-
 What the served path needs from the host comes through the SDK: the loaded weights and the host's loaders
 (`sdk.Weights`, `sdk.LoadCtx.loader`), the GPU ceiling and wired margin (`LoadCtx.ceiling`,
 `LoadFacts.wired_margin_bytes`), the memory ledgers (`sdk.memory`), and the reads past the page cache (`io_util`).

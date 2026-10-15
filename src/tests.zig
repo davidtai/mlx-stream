@@ -101,7 +101,6 @@ comptime {
     _ = @import("exl3/quant.zig");
     _ = @import("arch/deepseek_v41/kernel_routes.zig");
     _ = @import("arch/deepseek_v41/kernels_test.zig");
-    _ = @import("arch/deepseek_v41/profile.zig");
     _ = @import("sdk_ext.zig");
     _ = @import("ngram_table.zig");
     _ = @import("exl3/sushi_parity.zig");

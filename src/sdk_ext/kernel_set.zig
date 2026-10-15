@@ -59,7 +59,7 @@ pub fn KernelSet(comptime R: type) type {
 
         /// Where `Set.install` puts the launcher: the backend's `launcher: ?*const xk.Bound`
         /// field, or its base backend's under a wrapper that declares `Inner` and `base()`
-        /// (`dsv41_profile.Profiled`); null when neither has one.
+        /// (a profiling wrapper); null when neither has one.
         fn launcherSlot(comptime G: type, g: *G) ?*?*const xk.Bound {
             if (@hasField(G, "launcher")) return &g.launcher;
             if (@hasDecl(G, "Inner")) return launcherSlot(G.Inner, g.base());
