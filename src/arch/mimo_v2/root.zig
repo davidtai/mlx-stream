@@ -207,122 +207,116 @@ test "mimo SDK2 prepared parse and load facts expose the same installed shell" {
 }
 
 test "mimo SDK2 KV choice defaults to BF16 and retains an explicit Q8 construction selection" {
-    if (comptime @hasField(settings.Config, "kv_mode") and @hasDecl(settings.Config, "validate")) {
-        var c: settings.Config = .{};
-        try c.validate();
-        try std.testing.expectEqual(settings.KVMode.bf16, c.kv_mode);
-        const off = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"kv_quant\":\"off\"}", .{});
-        defer off.deinit();
-        c.applySettings(off.value);
-        try c.validate();
-        try std.testing.expectEqual(settings.KVMode.bf16, c.kv_mode);
-        const q8 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"kv_quant\":8}", .{});
-        defer q8.deinit();
-        c.applySettings(q8.value);
-        try c.validate();
-        try std.testing.expectEqual(settings.KVMode.q8, c.kv_mode);
-        const unsupported = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"kv_quant\":4}", .{});
-        defer unsupported.deinit();
-        c.applySettings(unsupported.value);
-        try std.testing.expectError(error.MimoKVModeUnsupported, c.validate());
-    } else return error.MimoSDK2KVChoiceMissing;
+    var c: settings.Config = .{};
+    try c.validate();
+    try std.testing.expectEqual(settings.KVMode.bf16, c.kv_mode);
+    const off = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"kv_quant\":\"off\"}", .{});
+    defer off.deinit();
+    c.applySettings(off.value);
+    try c.validate();
+    try std.testing.expectEqual(settings.KVMode.bf16, c.kv_mode);
+    const q8 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"kv_quant\":8}", .{});
+    defer q8.deinit();
+    c.applySettings(q8.value);
+    try c.validate();
+    try std.testing.expectEqual(settings.KVMode.q8, c.kv_mode);
+    const unsupported = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"kv_quant\":4}", .{});
+    defer unsupported.deinit();
+    c.applySettings(unsupported.value);
+    try std.testing.expectError(error.MimoKVModeUnsupported, c.validate());
 }
 
 test "mimo SDK2 claim accepts the prepared MXFP4 format and declines adjacent models" {
-    if (comptime @hasDecl(@This(), "claims")) {
-        try sdk.testing.expectClaims(@field(@This(), "claims"), &.{
-            .{ .config =
-            \\{"model_type":"mimo_v2_flash","expert_streaming":{"family":"mlx-stream","format":"mlx-stream-mxfp4-expert-bank-v1","manifest":"expert-manifest.json"}}
-            , .want = .native },
-            .{ .config = "{\"model_type\":\"mimo_v2_flash\"}", .want = null },
-            .{ .config =
-            \\{"model_type":"mimo_v2_flash","quantization_config":{"quant_method":"fp8"}}
-            , .want = null },
-            .{ .config =
-            \\{"model_type":"deepseek_v41","expert_streaming":{"family":"mlx-stream","format":"mlx-stream-mxfp4-expert-bank-v1","manifest":"expert-manifest.json"}}
-            , .want = null },
-            .{ .config =
-            \\{"model_type":"mimo_v2_flash","expert_streaming":{"family":"mlx-stream","format":"exl3","manifest":"expert-manifest.json"}}
-            , .want = null },
-            .{ .config =
-            \\{"model_type":"mimo_v2_flash","expert_streaming":{"family":"mlx-stream","format":"mlx-stream-mxfp4-expert-bank-v1","manifest":"other.json"}}
-            , .want = null },
-            .{ .config =
-            \\{"model_type":"mimo_v2_flash","expert_streaming":{"family":"other","format":"mlx-stream-mxfp4-expert-bank-v1","manifest":"expert-manifest.json"}}
-            , .want = null },
-            .{ .config = "{\"model_type\":\"mimo_v2_flash\",\"expert_streaming\":null}", .want = null },
-            .{ .config = "{\"model_type\":\"mimo_v2_flash\",\"expert_streaming\":true}", .want = null },
-            .{ .config = "{\"model_type\":\"mimo_v2_flash\",\"expert_streaming\":{\"family\":7}}", .want = null },
-        });
-    } else return error.MimoSDK2ClaimsMissing;
+    try sdk.testing.expectClaims(claims, &.{
+        .{ .config =
+        \\{"model_type":"mimo_v2_flash","expert_streaming":{"family":"mlx-stream","format":"mlx-stream-mxfp4-expert-bank-v1","manifest":"expert-manifest.json"}}
+        , .want = .native },
+        .{ .config = "{\"model_type\":\"mimo_v2_flash\"}", .want = null },
+        .{ .config =
+        \\{"model_type":"mimo_v2_flash","quantization_config":{"quant_method":"fp8"}}
+        , .want = null },
+        .{ .config =
+        \\{"model_type":"deepseek_v41","expert_streaming":{"family":"mlx-stream","format":"mlx-stream-mxfp4-expert-bank-v1","manifest":"expert-manifest.json"}}
+        , .want = null },
+        .{ .config =
+        \\{"model_type":"mimo_v2_flash","expert_streaming":{"family":"mlx-stream","format":"exl3","manifest":"expert-manifest.json"}}
+        , .want = null },
+        .{ .config =
+        \\{"model_type":"mimo_v2_flash","expert_streaming":{"family":"mlx-stream","format":"mlx-stream-mxfp4-expert-bank-v1","manifest":"other.json"}}
+        , .want = null },
+        .{ .config =
+        \\{"model_type":"mimo_v2_flash","expert_streaming":{"family":"other","format":"mlx-stream-mxfp4-expert-bank-v1","manifest":"expert-manifest.json"}}
+        , .want = null },
+        .{ .config = "{\"model_type\":\"mimo_v2_flash\",\"expert_streaming\":null}", .want = null },
+        .{ .config = "{\"model_type\":\"mimo_v2_flash\",\"expert_streaming\":true}", .want = null },
+        .{ .config = "{\"model_type\":\"mimo_v2_flash\",\"expert_streaming\":{\"family\":7}}", .want = null },
+    });
 }
 
 test "mimo SDK2 complete bill retains architecture source and row-following wiring terms" {
-    if (comptime @hasDecl(@This(), "bill")) {
-        const a = std.testing.allocator;
-        const io = std.testing.io;
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        try writeBillFixture(a, io, tmp.dir);
-        const path = try tmp.dir.realPathFileAlloc(io, ".", a);
-        defer a.free(path);
-        // The serial control (the fixture pack carries no MTP sidecar; the lane's terms: bill.zig "mimo mtp bill").
-        const c: @This().Config = .{ .expert_bank_dir = path, .mtp_heads = false };
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const peek = try sdk.ConfigPeek.parse(arena.allocator(), path, "{}");
-        const req: sdk.BillRequest = .{
-            .peek = &peek,
-            .cfg = &c,
-            .routes = undefined,
-            .prompt_tokens = 16_384,
-            .max_tokens = 1_024,
-            .ceiling = 120_000_000_000,
-            .stop = 2_000_000_000,
-        };
-        const b = try @field(@This(), "bill")(a, io, &req);
-        defer b.free(a);
-        const fixture = try @import("bill.zig").fixtureBill(a);
-        defer fixture.free(a);
-        const names = [_][]const u8{
-            "residents",           "mtp_heads",        "router_f32",         "mlx_cache",
-            "mlx_cache_overshoot", "compiler_runtime", "host_runtime",       "resident_wiring",
-            "buffer_allowance",    "request",          "kv_packed",          "kv_scales",
-            "kv_biases",           "kv_dense",         "kv_dequant",         "kv_update",
-            "kv_incoming",         "request_wiring",   "slot_transient",     "reader_staging",
-            "source_metadata",     "expert_workspace", "event_runtime",      "event_graph",
-            "spec_staging",        "spec_runtime",     "predictor_metadata", "predictor_workspace",
-            "predictor_runtime",   "slot_wiring",
-            "kv_sliding_ring",     "mtp_workspace",      "fp8_prompt_weights", "gpu_warm",
-        };
-        try std.testing.expectEqual(names.len, b.terms.len);
-        for (names) |term_name| {
-            var count: usize = 0;
-            for (b.terms) |term| count += @intFromBool(std.mem.eql(u8, term_name, term.name));
-            try std.testing.expectEqual(@as(usize, 1), count);
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeBillFixture(a, io, tmp.dir);
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    // The serial control (the fixture pack carries no MTP sidecar; the lane's terms: bill.zig "mimo mtp bill").
+    const c: Config = .{ .expert_bank_dir = path, .mtp_heads = false };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const peek = try sdk.ConfigPeek.parse(arena.allocator(), path, "{}");
+    const req: sdk.BillRequest = .{
+        .peek = &peek,
+        .cfg = &c,
+        .routes = undefined,
+        .prompt_tokens = 16_384,
+        .max_tokens = 1_024,
+        .ceiling = 120_000_000_000,
+        .stop = 2_000_000_000,
+    };
+    const b = try bill(a, io, &req);
+    defer b.free(a);
+    const fixture = try @import("bill.zig").fixtureBill(a);
+    defer fixture.free(a);
+    const names = [_][]const u8{
+        "residents",           "mtp_heads",        "router_f32",         "mlx_cache",
+        "mlx_cache_overshoot", "compiler_runtime", "host_runtime",       "resident_wiring",
+        "buffer_allowance",    "request",          "kv_packed",          "kv_scales",
+        "kv_biases",           "kv_dense",         "kv_dequant",         "kv_update",
+        "kv_incoming",         "request_wiring",   "slot_transient",     "reader_staging",
+        "source_metadata",     "expert_workspace", "event_runtime",      "event_graph",
+        "spec_staging",        "spec_runtime",     "predictor_metadata", "predictor_workspace",
+        "predictor_runtime",   "slot_wiring",
+        "kv_sliding_ring",     "mtp_workspace",      "fp8_prompt_weights", "gpu_warm",
+    };
+    try std.testing.expectEqual(names.len, b.terms.len);
+    for (names) |term_name| {
+        var count: usize = 0;
+        for (b.terms) |term| count += @intFromBool(std.mem.eql(u8, term_name, term.name));
+        try std.testing.expectEqual(@as(usize, 1), count);
+    }
+    try std.testing.expectEqual(@as(u64, 47 * 13_369_344), b.per_row);
+    try std.testing.expect(b.row_terms != null);
+    try std.testing.expectEqualSlices(u64, &fixture.row_terms.?.data, &b.row_terms.?.data);
+    // The source's twelve terms, after the architecture's.
+    for (b.terms[b.terms.len - 12 ..], fixture.terms[fixture.terms.len - 12 ..]) |actual, expected| {
+        try std.testing.expectEqual(expected, actual);
+    }
+    var row_terms: usize = 0;
+    for (b.terms) |term| row_terms += @intFromBool(term.with_rows);
+    try std.testing.expectEqual(@as(usize, 1), row_terms);
+    for ([_]sdk.MemoryBill.Phase{ .prompt, .decode }) |phase| {
+        try std.testing.expect(b.fixed(phase) > 4);
+        for ([_]u32{ 1, 8, 128 }) |rows| {
+            try std.testing.expect(b.total(phase, 0, rows) > b.fixed(phase) + rows * b.per_row);
         }
-        try std.testing.expectEqual(@as(u64, 47 * 13_369_344), b.per_row);
-        try std.testing.expect(b.row_terms != null);
-        try std.testing.expectEqualSlices(u64, &fixture.row_terms.?.data, &b.row_terms.?.data);
-        // The source's twelve terms, after the architecture's.
-        for (b.terms[b.terms.len - 12 ..], fixture.terms[fixture.terms.len - 12 ..]) |actual, expected| {
-            try std.testing.expectEqual(expected, actual);
-        }
-        var row_terms: usize = 0;
-        for (b.terms) |term| row_terms += @intFromBool(term.with_rows);
-        try std.testing.expectEqual(@as(usize, 1), row_terms);
-        for ([_]sdk.MemoryBill.Phase{ .prompt, .decode }) |phase| {
-            try std.testing.expect(b.fixed(phase) > 4);
-            for ([_]u32{ 1, 8, 128 }) |rows| {
-                try std.testing.expect(b.total(phase, 0, rows) > b.fixed(phase) + rows * b.per_row);
-            }
-        }
-        // The host's box: the 112 GiB ceiling less the pinned 2 GiB wired margin.
-        const target: u64 = 120_259_084_288 - (2 << 30);
-        const filled = try sdk.fill(b, 10_000_000_000, target, 256, 8);
-        try std.testing.expect(b.total(.prompt, 10_000_000_000, filled.prompt) <= target);
-        try std.testing.expect(b.total(.prompt, 10_000_000_000, filled.prompt + 1) > target);
-    } else return error.MimoSDK2CompleteBillMissing;
+    }
+    // The host's box: the 112 GiB ceiling less the pinned 2 GiB wired margin.
+    const target: u64 = 120_259_084_288 - (2 << 30);
+    const filled = try sdk.fill(b, 10_000_000_000, target, 256, 8);
+    try std.testing.expect(b.total(.prompt, 10_000_000_000, filled.prompt) <= target);
+    try std.testing.expect(b.total(.prompt, 10_000_000_000, filled.prompt + 1) > target);
 }
 
 /// G4 (`sdk.testing.expectBillBoundsLoad`): the load preflight (`loadBytes`) and the itemized bill (`bill`) read one bill
