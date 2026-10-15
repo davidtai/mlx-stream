@@ -105,12 +105,22 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             return rowBytes(layer, c) != layer.segments[c].length * minisOf(layer);
         }
 
-        /// The rows component `c`'s array holds for `rows` slot rows: `rows` x minis, and for a padded component at least
-        /// `slot_min_bytes` of rows (the rows past `rows` are never addressed).
+        /// Every slot array holds at least this many bytes: one VM page (and a padded component's `slot_min_bytes`). Metal
+        /// gives no file-block-aligned `contents()` to a buffer under the page (MLX allocates it unrounded), and the direct
+        /// reads need every slot row on the 4 KiB block (`checkDirectRows`): a one-row ext of a 4 KiB component was refused.
+        pub const array_min_bytes: u64 = @max(slot_min_bytes, std.heap.page_size_max);
+
+        /// The slot rows component `c`'s array holds for `rows` slot rows: `rows`, and at least `array_min_bytes` of rows
+        /// (the rows past `rows` are never addressed).
+        pub fn allocSlots(layer: *const Layer, c: usize, rows: u32) u32 {
+            const n = rowBytes(layer, c);
+            if (n == 0) return rows;
+            return @max(rows, @as(u32, @intCast(std.math.divCeil(u64, array_min_bytes, n) catch unreachable)));
+        }
+
+        /// The rows of component `c`'s array (its shape's first dimension) for `rows` slot rows: `allocSlots` x minis.
         pub fn allocRows(layer: *const Layer, c: usize, rows: u32) u32 {
-            const n = rows * minisOf(layer);
-            if (!padded(layer, c)) return n;
-            return @max(n, @as(u32, @intCast(std.math.divCeil(u64, slot_min_bytes, rowBytes(layer, c)) catch unreachable)));
+            return allocSlots(layer, c, rows) * minisOf(layer);
         }
 
         /// The MLX shape of component `c`'s array for `rows` slot rows into `shape`; returns its rank. A padded component
@@ -125,7 +135,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 shape[1] = @intCast(rowBytes(layer, c) / item);
                 return 2;
             }
-            shape[0] = @intCast(rows * minisOf(layer));
+            shape[0] = @intCast(allocRows(layer, c, rows));
             for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
             return seg.rank + 1;
         }
@@ -133,8 +143,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         /// The bytes of component `c`'s array for `rows` slot rows (`arrayShape`'s): the stream's frees and the bill's
         /// slot terms.
         pub fn arrayBytes(layer: *const Layer, c: usize, rows: u32) u64 {
-            if (padded(layer, c)) return @as(u64, allocRows(layer, c, rows)) * rowBytes(layer, c);
-            return @as(u64, rows) * rowBytes(layer, c);
+            return @as(u64, allocSlots(layer, c, rows)) * rowBytes(layer, c);
         }
 
         pub const HostSlotRows = struct {
@@ -142,15 +151,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             row_bytes: [n_components]u64,
             banks: [n_components][]u8,
 
-            /// Rows sized for `layer`'s segments; one page-aligned bank per component.
+            /// Rows sized for `layer`'s segments; one page-aligned bank per component (`arrayBytes`: a page at least).
             pub fn init(layer: *const Layer, rows: u32) !HostSlotRows {
                 var s: HostSlotRows = .{ .rows = rows, .row_bytes = undefined, .banks = undefined };
                 var n: usize = 0;
                 errdefer for (s.banks[0..n]) |b| std.heap.page_allocator.free(b);
                 for (layer.segments, 0..) |_, c| {
                     s.row_bytes[c] = rowBytes(layer, c);
-                    const bytes = std.math.mul(u64, s.row_bytes[c], rows) catch return error.OutOfMemory;
-                    s.banks[c] = try std.heap.page_allocator.alloc(u8, @intCast(bytes));
+                    s.banks[c] = try std.heap.page_allocator.alloc(u8, std.math.cast(usize, arrayBytes(layer, c, rows)) orelse return error.OutOfMemory);
                     n += 1;
                 }
                 return s;

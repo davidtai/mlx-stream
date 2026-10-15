@@ -596,8 +596,12 @@ test "glm5_next mtp bill: the lane's terms by construction (the bank's nine arra
     const res_bytes = try writeResidents(a, io, tmp.dir, &c, null, null);
     const f = try mtp.facts(a, io, dir, &c, page, &diag);
     var arrays: u64 = 0;
-    // Line-isolated global scales: each [32, 32] f32 (3 experts floored at a page of 128-byte lines), the rest [3, ...].
-    for (synth.geom.segments) |s| arrays += graph.bufferBytes(if (s.rank == 0) bank.scale_array_min_bytes else 3 * s.length, page);
+    // Every array holds 3 experts' rows, floored at a VM page of whole rows: the line-isolated global scales [128, 32] f32
+    // (128-byte lines), the rest [max(3, ceil(page / row)), ...].
+    for (synth.geom.segments) |s| {
+        const row = if (s.rank == 0) bank.scale_line_bytes else s.length;
+        arrays += graph.bufferBytes(@max(3, std.math.divCeil(u64, std.heap.page_size_max, row) catch unreachable) * row, page);
+    }
     try testing.expectEqual(arrays, f.bank_bytes);
     try testing.expect(f.resident_bytes >= res_bytes);
     try testing.expectEqual(mtp.Head.tableBytes(&c, page), f.table_bytes);

@@ -398,6 +398,24 @@ test "glm5_next exl3 bank: direct reads: the pack's record geometry passes the 4
     try testing.expectError(error.DirectReadsRow, S.checkDirectRows(&r, 4096));
 }
 
+test "glm5_next exl3 bank: direct rows: every slot array of a one-row ext holds a VM page at least, whole 4 KiB blocks (the rin / rout rows are 4 and 8 KiB)" {
+    const S = sdk_ext.expert.stream.StreamOf(SDK, false);
+    var layers: [42]Layer = undefined;
+    const ks: [42]u32 = @splat(3);
+    _ = expert_bank.layerTable(&ks, 4096, 2048, 288, &layers).?;
+    for (0..n_components) |c| {
+        const bytes = S.arrayBytes(&layers[17], c, 1);
+        try testing.expect(bytes >= std.heap.page_size_max);
+        try testing.expectEqual(@as(u64, 0), bytes % 4096);
+        // The MLX shape holds the same bytes (rows past the first are never addressed).
+        var shape: [4]c_int = undefined;
+        const ndim = try S.arrayShape(&layers[17], c, 1, &shape);
+        var n: u64 = 1;
+        for (shape[1..ndim]) |d| n *= @intCast(d);
+        try testing.expectEqual(bytes, @as(u64, @intCast(shape[0])) * n * 2);
+    }
+}
+
 test "glm5_next exl3 bank: direct rows: the served phase cycle (prompt, release, grow, shrink, regrow, release, grow) keeps every row on the block; a refused grow fails the stream closed" {
     const Bx = @import("experts.zig").Types(.exl3).Bridge;
     const a = testing.allocator;

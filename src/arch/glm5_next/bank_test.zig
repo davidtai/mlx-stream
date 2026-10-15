@@ -398,12 +398,12 @@ test "glm5_next nvfp4 bank: scale lines isolated: the arrays' shapes, a page at 
         for (g_comps) |c| {
             var shape: [4]c_int = undefined;
             try testing.expectEqual(@as(usize, 2), try S.arrayShape(&l, c, rows, &shape));
-            try testing.expectEqual(@as(c_int, @intCast(@max(rows, 32))), shape[0]);
+            try testing.expectEqual(@as(c_int, @intCast(@max(rows, std.heap.page_size_max / bank.scale_line_bytes))), shape[0]);
             try testing.expectEqual(@as(c_int, bank.scale_line_floats), shape[1]);
             const bytes = S.arrayBytes(&l, c, rows);
             try testing.expectEqual(@as(u64, @intCast(shape[0])) * bank.scale_line_bytes, bytes);
-            // Never MLX's small-buffer heap (< 256 B) and never `constant`-class (< 8 elements): a page at least.
-            try testing.expect(bytes >= bank.scale_array_min_bytes and bytes >= 256 and @as(u64, @intCast(shape[0] * shape[1])) >= 8);
+            // Never MLX's small-buffer heap (< 256 B) and never `constant`-class (< 8 elements): a VM page at least.
+            try testing.expect(bytes >= bank.scale_array_min_bytes and bytes >= std.heap.page_size_max and @as(u64, @intCast(shape[0] * shape[1])) >= 8);
         }
         var shape: [4]c_int = undefined;
         try testing.expectEqual(@as(usize, 3), try S.arrayShape(&l, @backingInt(Component.gate_weight), rows, &shape));
