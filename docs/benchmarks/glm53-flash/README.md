@@ -8,15 +8,15 @@ ladders, every lever pair with its verdict, how the numbers were measured, the s
 
 | Stack | Plugin | Server SHA-256 | Class | 190/217 decode / prefill | Headline (rows) decode / prefill |
 | --- | --- | --- | --- | ---: | ---: |
-| **g25-dsa3** | `glm5next/exl3-k3-stack3-dsalane` `0457394` | `6481fa1b` | exact | not measured alone (see g25-dsa) | <!-- PENDING-HEADLINE g25-dsa3 @199/225 (batch 53) --> PENDING (199/225) |
+| **g25-dsa3** | `glm5next/exl3-k3-stack3-dsalane` `0457394` | `6481fa1b` | exact | not measured alone (see g25-dsa) | 34.50 / 1,077.1 (199/225) |
 | g25-dsa | `glm5next/exl3-k3-stack3-dsalane` `88d2aad` | `5bbd8512` | exact | 33.15 / 1,093.5 | 34.10 / 1,084.3 (199/225) |
 | **g26-dsa3** | `glm5next/exl3-k3-dsalane` `cf30601` | `de1ab1f6` | rounding-class | 34.95 / 1,093.0 | 35.70 / 1,085.4 (197/223); <!-- PENDING-HEADLINE g26-dsa3 @199/225 (batch 54b) --> 199/225 PENDING |
 | g25b | `glm5next/exl3-k3-stack3` `f8465ad` | `3514568e` | exact | 32.80 / 1,093.3 | 33.80 / 1,083.7 (199/225) |
 | g26 | `glm5next/exl3-k3-stack4` `9bf67a7` | `087434fe` | rounding-class | 34.55 / 1,092.8 | 35.60 / 1,085.9 (199/225) |
 
 All servers are host `glm5next/host` `a8f6c6b8` with the plugin above, built ReleaseFast. Against the 40 tok/s decode /
-1,000 tok/s prefill goal, prefill is met on every stack. Decode reaches 34.10 on the exact stacks (85 % of the goal,
-g25-dsa at 199/225) and 35.70 on the q8 stacks (89 %, g26-dsa3 at 197/223).
+1,000 tok/s prefill goal, prefill is met on every stack. Decode reaches 34.50 on the exact stacks (86 % of the goal,
+g25-dsa3 at 199/225) and 35.70 on the q8 stacks (89 %, g26-dsa3 at 197/223).
 
 g25-dsa3 is g25-dsa plus the MTP head's side rows. That lever measured +2.79 % on the q8 stack with the tail fix included
 (g26bin-vs-dsa3) against g26-dsa2's +1.61 % for the tail fix alone (g26bin-vs-dsa2, a different window): about +0.4 % for the side rows; it is exact and was stacked without its own exact
@@ -161,11 +161,15 @@ physical footprint, in decimal GB (10^9 B).
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 190/217 | 33.15 | 1,093.5 | 104.21 | 2 | 12.69 |
 | 199/225 | 34.10 | 1,084.3 | 107.40 | 1 | 9.30 |
-| g25-dsa3 199/225 | <!-- PENDING-HEADLINE g25-dsa3 @199/225 (batch 53): decode / prefill / peak --> PENDING | PENDING | PENDING | 1 | 9.30 |
+| g25-dsa3 199/225 | 34.50 | 1,077.1 | 107.40 | 1 | 9.30 |
 
 ![g25-dsa decode vs decode rows](decode_rows_g25-dsa.svg)
 
 ![g25-dsa peak footprint vs decode rows](peak_rows_g25-dsa.svg)
+
+![g25-dsa3 decode vs decode rows](decode_rows_g25-dsa3.svg)
+
+![g25-dsa3 peak footprint vs decode rows](peak_rows_g25-dsa3.svg)
 
 ### g26-dsa3 (q8 draft head + DSA lane fixes, rounding-class)
 
@@ -181,8 +185,10 @@ physical footprint, in decimal GB (10^9 B).
 
 The two new ladders have two measured rungs each so far. The 190/217 rung is the B arms of the stack's head-to-head pair
 (g25bin-vs-g25dsa, g26bin-vs-dsa3). The upper rung is a first-step headline cell, flagged OVERFILL like the 225 cells
-above: 1.23 GB over the fill at load for g25-dsa, 0.9 GB for g26-dsa3. The g25-dsa3 rung at 199/225 is pending. When it
-lands it belongs to the g25-dsa3 ladder, not g25-dsa's: the side rows add a lever.
+above: 1.23 GB over the fill at load for g25-dsa, 0.9 GB for g26-dsa3. g25-dsa3 at 199/225 (batch 53, the clean-wait headline: 7.75 GB
+after the pulse, gate ADMIT at 8.19, OVERFILL 1.17 GB at load) has its own one-point chart. It is not a rung of g25-dsa's
+ladder, because the side rows add a lever: 34.50 against g25-dsa's 34.10 at the same pin, a single cell each in
+different windows.
 
 ## Lever pairs, 2026-10-14
 

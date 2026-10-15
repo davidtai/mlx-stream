@@ -35,6 +35,15 @@
       "binary_sha256": "de1ab1f6bdd65ce60e84e4ca3aee84fb6e5ffe9a9641e1a32dce2096cc7ca3ff",
       "class": "rounding-class",
       "draft_head": "q8"
+    },
+    "g25-dsa3": {
+      "label": "g25-dsa3 (exact stack of record)",
+      "plugin_branch": "glm5next/exl3-k3-stack3-dsalane",
+      "plugin_commit": "0457394",
+      "host_commit": "a8f6c6b8",
+      "binary_sha256": "6481fa1b07932a2aa215895b2431f611908975e22d612c4e903181fe41067ba5",
+      "class": "exact",
+      "draft_head": "bf16"
     }
   },
   "ladders": {
@@ -168,6 +177,19 @@
         "arms": 1,
         "ttft_s": 15.09,
         "source": "cells/glm5next-headline-g26dsa3-199-225-20261015 run dir g26dsa3-197-223 (batch 52, clean-wait first-step single cell, OVERFILL flagged)"
+      }
+    ],
+    "g25-dsa3": [
+      {
+        "prompt_rows": 199,
+        "decode_rows": 225,
+        "decode_tok_s": 34.5,
+        "prefill_tok_s": 1077.1,
+        "peak_gb": 107.4,
+        "admit_to_gb": 9.3,
+        "arms": 1,
+        "ttft_s": 15.21,
+        "source": "cells/glm5next-headline-g25dsa3-199-225-20261015 (batch 53, clean-wait first-step single cell: 7.75 GB after the pulse, gate ADMIT at 8.19; OVERFILL 1.17 GB at load)"
       }
     ]
   },
