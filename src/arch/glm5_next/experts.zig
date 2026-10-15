@@ -166,7 +166,9 @@ pub fn promptResidentsLine(residents: settings.PromptResidents) []const u8 {
 /// A request's start on the stream (or its source), after `Source.resumePrefill` (nothing live). `forget` (the control):
 /// every resident and the prompt state forgotten (`forgetResidents`). `keep` after a reverse change (`reversed`): the
 /// residents `shrink(.keep)` left in the prompt rows stay (that shrink already cleared their prompt state). A start with no
-/// decode before it (the construction's warm-up, a request that ended at its prompt) forgets as `forget` does. Then the
+/// phase change before it (the stream still in its prompt phase: the construction's warm-up) forgets as `forget` does.
+/// A request that stops at its prompt still enters decode (`ttft_tail: deferred` runs the phase change in its tail,
+/// `finishTail` -> `enterDecode`), so the next request finds that prompt's residents kept, as after any decode. Then the
 /// prompt counts are zeroed and the pins refreshed (`resetPromptCounts`).
 pub fn requestStart(stream: anytype, residents: settings.PromptResidents, reversed: bool) !void {
     if (residents == .forget or !reversed) _ = try stream.forgetResidents();
