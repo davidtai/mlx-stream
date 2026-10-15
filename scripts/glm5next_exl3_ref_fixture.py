@@ -5,8 +5,8 @@ and forward of one synthetic GLM-5.3-Flash expert (hidden 4096, inter 2048, K = 
   code (per projection, seed s): the little-endian int16 view of splitmix64(s) words (exl3 kernels.zig synthPlane);
   suh / svh (seed s): f16(sign * (0.5 + u) * scale), u = top 53 bits / 2^53, sign = bit 0 of the word;
   x (seed s): bf16 (round to nearest even) of f32(2 u - 1).
-Outputs: meta.json (seeds, scales, sha256 of each projection's W_hat f16 bytes [in, out] per codebook), h_mul1.f32
-(the clamped SwiGLU, f32 of the f64 value), y_mul1.f32 and y_mcg.f32 (the expert's down output, f32 of f64).
+Outputs: meta.json (seeds, scales, sha256 of each projection's W_hat f16 bytes [in, out]), h_mul1.f32
+(the clamped SwiGLU, f32 of the f64 value), y_mul1.f32 (the expert's down output, f32 of f64).
   scripts/glm5next_exl3_ref_fixture.py --ref <R>/exl3/exl3_ref.py [--check]"""
 import argparse
 import hashlib
@@ -80,7 +80,7 @@ def main():
     meta = {'format': 'glm5next-exl3-ref-v1', 'seed': SEED, 'x_seed': X_SEED, 'hidden': H, 'inter': I, 'K': 3,
             'proj': [], 'ref_sha256': hashlib.sha256(open(a.ref, 'rb').read()).hexdigest()}
     outs = {}
-    for cb in ('mul1', 'mcg'):
+    for cb in ('mul1',):
         p = {}
         for name, n_in, n_out, cs, ss, vs, sc_in, sc_out in PROJ:
             c = code(cs, n_in, n_out)

@@ -6,10 +6,10 @@
 //!
 //! Forms (texts in src/kernels/glm5_next_exl3_forms/; `scripts/glm5next_exl3_forms_gen.py` writes the generated ones):
 //!   gate / up (`GuForm`): `seam` (two GEMV launches + gu_epi), `guone`
-//!     (DeepSeek's gu_one: both GEMVs in one launch), `mcg` (the bench's codebook price, not a served form), `fused16` /
+//!     (DeepSeek's gu_one: both GEMVs in one launch), `fused16` /
 //!     `fused8` (`g5k3_gu_fused`: both GEMVs and gu_epi in one launch over a 128-column block, 16 simdgroups (one tile of
 //!     one projection each) or 8 (one tile of both)).
-//!   down (`DnForm`): `seam`, `pair` (DeepSeek's down_pair), `mcg`, `fused1` / `fused2` (din_rin, then `g5k3_dn_fused`:
+//!   down (`DnForm`): `seam`, `pair` (DeepSeek's down_pair), `fused1` / `fused2` (din_rin, then `g5k3_dn_fused`:
 //!     the GEMV and dpost in one launch over 1 or 2 128-column blocks), `pro1` / `pro2` (`g5k3_dn_pro`: din_rin, the
 //!     GEMV and dpost in one launch).
 //!   `maxm` (fused forms): 1, or 4 = the union rule of the NVFP4 k1 texts (a slot's pairs in one threadgroup, each
@@ -41,8 +41,8 @@ comptime {
     if (max_pairs > 64) @compileError("glm5_next exl3 forms: the union vote takes at most 64 pairs a wave");
 }
 
-pub const GuForm = enum { seam, guone, mcg, fused16, fused8 };
-pub const DnForm = enum { seam, pair, mcg, fused1, fused2, pro1, pro2 };
+pub const GuForm = enum { seam, guone, fused16, fused8 };
+pub const DnForm = enum { seam, pair, fused1, fused2, pro1, pro2 };
 pub const Forms = struct {
     gu: GuForm = .seam,
     dn: DnForm = .seam,
@@ -81,7 +81,7 @@ pub const Forms = struct {
 
 // ── The texts ──
 
-pub const Kernel = enum { g5k3_gu_fused, g5k3_dn_fused, g5k3_dn_pro, g5k3_guone, g5k3_pair, g5k3_gemv_mcg };
+pub const Kernel = enum { g5k3_gu_fused, g5k3_dn_fused, g5k3_dn_pro, g5k3_guone, g5k3_pair };
 const n_kernels = std.meta.fieldNames(Kernel).len;
 const dir = "../../kernels/glm5_next_exl3_forms/";
 pub const texts: [n_kernels][:0]const u8 = blk: {
@@ -97,7 +97,6 @@ pub const text_sha256 = [n_kernels]*const [64]u8{
     "318a568f9ee22fbc2bd75127bc010b440f312ba388dc74839ba7f785c5364e57",
     "85dcbd286beb00d7ec1f80b298967859090c0f8aedf29824380a5c5027df3374",
     "0732d4840889255ad9499b30e1431fc2ff78ec19d72ebc89f5a1d9df31440110",
-    "3dbbae2ece4fb6e77241d6f9bd829886e798346c3f9126a840e105ab99a22abc",
 };
 pub const header_sha256: *const [64]u8 = "4e4dbb86d58cccb83e961c96308ca43bb660f72223f0e795f53484fa956cc3f8";
 
@@ -114,7 +113,7 @@ fn sigOf(k: Kernel) Sig {
         .g5k3_dn_fused => .{ .ins = &.{ "xd", "ids", "cd0", "cd1", "cd2", "rd0", "rd1", "rd2" }, .outs = &.{"out"}, .hdr = true },
         .g5k3_dn_pro => .{ .ins = &.{ "h", "ids", "cd0", "cd1", "cd2", "rn0", "rn1", "rn2", "rd0", "rd1", "rd2" }, .outs = &.{"out"}, .hdr = true },
         .g5k3_guone => .{ .ins = &.{ "xh_g", "xh_u", "ids", "code_g0", "code_g1", "code_g2", "code_u0", "code_u1", "code_u2" }, .outs = &.{ "out_g", "out_u" }, .hdr = false },
-        .g5k3_pair, .g5k3_gemv_mcg => .{ .ins = &.{ "xh", "ids", "code0", "code1", "code2" }, .outs = &.{"out"}, .hdr = false },
+        .g5k3_pair => .{ .ins = &.{ "xh", "ids", "code0", "code1", "code2" }, .outs = &.{"out"}, .hdr = false },
     };
 }
 
@@ -165,7 +164,7 @@ pub fn guoneLaunch(p: u32) Launch {
     return l.int("IT", hidden / 16).int("OT", inter / 16).out(p, inter, .float32).out(p, inter, .float32);
 }
 
-/// One-simdgroup GEMV texts (pair, mcg): grid (out / 16 x 32, P).
+/// The one-simdgroup GEMV text (pair): grid (out / 16 x 32, P).
 pub fn gemvLaunch(p: u32, in: u32, o: u32) Launch {
     const l: Launch = .{ .grid = .{ o / 16 * 32, p, 1 }, .tg = .{ 32, 1, 1 } };
     return l.int("IT", in / 16).int("OT", o / 16).out(p, o, .float32);
@@ -295,7 +294,6 @@ pub fn install(a: std.mem.Allocator, seam: *const xk.Kernels, forms: Forms, out_
         w.in_rin = try seamCfg(xk.inRinLaunch(p));
         w.g1 = switch (ef.gu) {
             .seam => try seamCfg(xk.gemvLaunch(p, hidden, inter)),
-            .mcg => try cfgOf(gemvLaunch(p, hidden, inter)),
             .guone => try cfgOf(guoneLaunch(p)),
             .fused16, .fused8 => try cfgOf(guFusedLaunch(p, ef.gu, ef.maxm)),
         };
@@ -303,7 +301,7 @@ pub fn install(a: std.mem.Allocator, seam: *const xk.Kernels, forms: Forms, out_
         if (ef.dn != .pro1 and ef.dn != .pro2) w.din = try seamCfg(xk.rotLaunch(p, inter, "INTER"));
         w.d1 = switch (ef.dn) {
             .seam => try seamCfg(xk.gemvLaunch(p, inter, hidden)),
-            .pair, .mcg => try cfgOf(gemvLaunch(p, inter, hidden)),
+            .pair => try cfgOf(gemvLaunch(p, inter, hidden)),
             .fused1, .fused2, .pro1, .pro2 => try cfgOf(dnFusedLaunch(p, nb, ef.maxm, out_dtype)),
         };
         if (!ef.fusedDn()) {
@@ -338,8 +336,8 @@ pub fn gateUp(f: *const Installed, g: *G, x: T, ids: T, banks: *const [n_banks]B
     try apply(g, f.seamK(.in_rin), w.in_rin, &.{ x, f.tok[p - 1], banks[0].gate.rin, banks[1].gate.rin, banks[2].gate.rin, banks[0].up.rin, banks[1].up.rin, banks[2].up.rin, ids }, &xs);
     var z: [2]T = undefined;
     switch (w.f.gu) {
-        .seam, .mcg => {
-            const k = if (w.f.gu == .seam) f.seamK(.gemv) else f.kern(.g5k3_gemv_mcg);
+        .seam => {
+            const k = f.seamK(.gemv);
             try apply(g, k, w.g1, &.{ xs[0], ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code }, z[0..1]);
             try apply(g, k, w.g1, &.{ xs[1], ids, banks[0].up.code, banks[1].up.code, banks[2].up.code }, z[1..2]);
         },
@@ -377,11 +375,7 @@ pub fn down(f: *const Installed, g: *G, h: T, ids: T, banks: *const [n_banks]Ban
         },
         else => {},
     }
-    const k = switch (w.f.dn) {
-        .seam => f.seamK(.gemv),
-        .pair => f.kern(.g5k3_pair),
-        else => f.kern(.g5k3_gemv_mcg),
-    };
+    const k = if (w.f.dn == .seam) f.seamK(.gemv) else f.kern(.g5k3_pair);
     var zd: [1]T = undefined;
     try apply(g, k, w.d1, &.{ hd[0], ids, banks[0].down.code, banks[1].down.code, banks[2].down.code }, &zd);
     try apply(g, f.seamK(.dpost), w.post, &.{ zd[0], banks[0].down.rout, banks[1].down.rout, banks[2].down.rout, ids }, &out);

@@ -8,7 +8,7 @@
 //!    output (bf16 [P, hidden]; the fused down forms also f32) bit for bit against the seam (exl3_kernels.zig gateUp /
 //!    down; the forms' seam instance at P > 48), and the seam against the f64 truth (exl3_forms_ref: exl3_ref.py's
 //!    forward, pinned by the CPU test) per pair: h and the f32 down output max |err| / rms <= 1e-4 (DeepSeek-V4.1's
-//!    tolerance), each bf16 output word within 2^-8 |ref| + 1e-4 rms (its rounding on top of that tolerance). The mcg arm against the mcg truth. An arm failing parity is not timed.
+//!    tolerance), each bf16 output word within 2^-8 |ref| + 1e-4 rms (its rounding on top of that tolerance). An arm failing parity is not timed.
 //! 2. Timing: per case, 42 chained layers (layer l + 1's x = layer l's output; each layer its own wave of fresh slots),
 //!    one eval per round, rounds interleaved over the arms (start rotated), 2 warm rounds, `rounds` timed; per arm the
 //!    median / p10 / p90 us per layer and the effective GB/s (the wave's distinct records' bytes over the time).
@@ -187,12 +187,12 @@ const Arm = struct {
 fn launchCount(f0: xf.Forms) u32 {
     const f = f0.at(f0.min_p);
     const gu: u32 = switch (f.gu) {
-        .seam, .mcg => 4,
+        .seam => 4,
         .guone => 3,
         .fused16, .fused8 => 2,
     };
     const dn: u32 = switch (f.dn) {
-        .seam, .pair, .mcg => 3,
+        .seam, .pair => 3,
         .fused1, .fused2 => 2,
         .pro1, .pro2 => 1,
     };
@@ -203,7 +203,6 @@ const NamedArm = struct { name: []const u8, forms: xf.Forms };
 const named_arms = [_]NamedArm{
     .{ .name = "exl3_seam_forms", .forms = .{} },
     .{ .name = "exl3_dsv41_forms", .forms = .{ .gu = .guone, .dn = .pair } },
-    .{ .name = "exl3_mcg", .forms = .{ .gu = .mcg, .dn = .mcg } },
     .{ .name = "exl3_f16_seam", .forms = .{ .gu = .fused16 } },
     .{ .name = "exl3_seam_f1", .forms = .{ .dn = .fused1 } },
     .{ .name = "exl3_f16_f1_m1", .forms = .{ .gu = .fused16, .dn = .fused1 } },
@@ -225,8 +224,7 @@ const named_arms = [_]NamedArm{
 /// sized it by hand (24 for 23 arms), its `assert(n == out.len)` was UB in ReleaseFast and the test compiled to a
 /// one-instruction self-loop right after G.init (the window hang of 2026-10-14T04:48Z).
 pub const arm_count = 1 + named_arms.len + 2;
-/// The arm table, built and checked at compile time: names distinct, every form installable (`Forms.check`), exactly
-/// one mcg arm (the mcg codebook's reference chain).
+/// The arm table, built and checked at compile time: names distinct, every form installable (`Forms.check`).
 const arms_table: [arm_count]Arm = blk: {
     var out: [arm_count]Arm = undefined;
     out[0] = .{ .name = "exl3_seam", .kind = .seam, .launches = 7 };
@@ -238,15 +236,6 @@ const arms_table: [arm_count]Arm = blk: {
     out[arm_count - 1] = .{ .name = "nvfp4_stock_gather", .kind = .nv_stock, .launches = 4 };
     for (out, 0..) |p, i| for (out[0..i]) |q| if (std.mem.eql(u8, p.name, q.name)) @compileError("glm5next exl3 kbench: arm " ++ p.name ++ " named twice");
     break :blk out;
-};
-/// The mcg arm's index (the mcg codebook's reference chain), exactly one.
-const mcg_arm_index: usize = blk: {
-    var found: ?usize = null;
-    for (arms_table, 0..) |arm, i| if (arm.kind == .forms and arm.forms.gu == .mcg) {
-        if (found != null) @compileError("glm5next exl3 kbench: two mcg arms");
-        found = i;
-    };
-    break :blk found orelse @compileError("glm5next exl3 kbench: no mcg arm");
 };
 
 fn armsList() [arm_count]Arm {
@@ -428,14 +417,14 @@ const Truth = struct {
 
 const PWave = struct { name: []const u8, p: u32 };
 const pwaves = [_]PWave{ .{ .name = "p1", .p = 1 }, .{ .name = "p3_misses_only", .p = 3 }, .{ .name = "p16_hits_only", .p = 16 }, .{ .name = "p24_m3_banks_repeats", .p = 24 }, .{ .name = "p64_widest", .p = 64 } };
-const codebooks = [_]ref.Codebook{ .mul1, .mcg };
+const codebooks = [_]ref.Codebook{.mul1};
 
 /// A stage of the bench: a progress line names it before it starts, and the watchdog fails the process by its name
 /// when it outlives its budget (a hang is attributable from the guard log alone).
 pub const StageKind = enum(u8) { install, banks, parity, timing };
 /// Budgets, seconds: the whole bench is about 2-4 min; each budget is several times its stage's expected time (the first
-/// parity wave also JIT-compiles every arm's pipelines). A fully stalled run fails in at most 300 + 180 + 10 x 120 +
-/// 10 x 120 = 2,880 s, one stage's budget after the stall began.
+/// parity wave also JIT-compiles every arm's pipelines). A fully stalled run fails in at most 300 + 180 + 5 x 120 +
+/// 10 x 120 = 2,280 s, one stage's budget after the stall began.
 pub fn stageBudgetS(kind: StageKind) u64 {
     return switch (kind) {
         .install => 300,
@@ -546,7 +535,7 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
             std.debug.print("GLM5NEXT_EXL3_KBENCH arm={s} install refused: {s}\n", .{ arm.name, diag.message() });
             return e;
         };
-        if (arm.forms.fusedDn() or arm.forms.gu == .mcg) arm.inst32 = try xf.install(a, seam, arm.forms, .float32, &diag);
+        if (arm.forms.fusedDn()) arm.inst32 = try xf.install(a, seam, arm.forms, .float32, &diag);
     };
     defer for (&arms) |*arm| {
         if (arm.inst) |p| {
@@ -604,10 +593,9 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
             for (0..pw.p) |r| ref.fillX(0x7800 + r, xin[r * H ..][0..H]);
             const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xin), &.{ ci(pw.p), ci(H) }, .float32), .bfloat16);
             const ida = try g.hostArray(std.mem.sliceAsBytes(ids[0..pw.p]), &.{ci(pw.p)}, .uint32);
-            // the reference chain of this codebook: the seam (mul1) or the mcg arm's
-            const mcg_arm = &arms[mcg_arm_index];
-            const r32 = if (cb == .mul1) seam32 else mcg_arm.inst32.?;
-            const r16 = if (cb == .mul1) seam16 else mcg_arm.inst.?;
+            // the reference chain: the seam
+            const r32 = seam32;
+            const r16 = seam16;
             const h_ref = try xf.gateUp(r32, &g, x, ida, &xb.banks);
             const y32 = try xf.down(r32, &g, h_ref, ida, &xb.banks);
             const y16 = try xf.down(r16, &g, h_ref, ida, &xb.banks);
@@ -645,9 +633,7 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
             std.debug.print("GLM5NEXT_EXL3_KREF wave={s} codebook={t} pairs={d} h_err={e:.3} y32_err={e:.3} ybf16_ratio={d:.3} {s}\n", .{ pw.name, cb, pw.p, w_h, w_y32, w_y16, if (ref_ok) "PASS" else "FAIL" });
             // every arm of this codebook against the reference chain, bit for bit
             for (&arms) |*arm| {
-                const is_mcg = arm.kind == .forms and (arm.forms.gu == .mcg);
                 if (arm.kind == .nv_fused or arm.kind == .nv_stock) continue;
-                if (is_mcg != (cb == .mcg)) continue;
                 if (arm.kind == .seam and pw.p > xk.max_pairs) continue;
                 const mark = g.mark();
                 const h = if (arm.kind == .seam) try xk.gateUp(seam, &g, x, ida, &xb.banks) else try xf.gateUp(arm.inst.?, &g, x, ida, &xb.banks);
@@ -751,7 +737,7 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
             std.debug.print("GLM5NEXT_EXL3_KBENCH case={s} pairs={d} arm={s} launches={d} us_per_layer={d:.1} p10={d:.1} p90={d:.1} gbps={d:.1}\n", .{ cs.name, P, arm.name, arm.launches, med, t[1], t[rounds - 2], bytes / (med * 1000.0) });
             if (arm.kind == .seam) seam_t = med;
             if (arm.kind == .nv_fused) nv_t = med;
-            if (!is_nv and !(arm.kind == .forms and arm.forms.gu == .mcg) and (best == null or med < best_t)) {
+            if (!is_nv and (best == null or med < best_t)) {
                 best = arm;
                 best_t = med;
             }
@@ -763,9 +749,9 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
     try testing.expectEqual(@as(u32, 0), fails);
 }
 
-test "glm5_next exl3 kbench: the arm table is the list's length (22: seam, 19 forms, 2 NVFP4), every entry named and installable, one mcg arm" {
+test "glm5_next exl3 kbench: the arm table is the list's length (21: seam, 18 forms, 2 NVFP4), every entry named and installable" {
     const arms = armsList();
-    try testing.expectEqual(@as(usize, 22), arms.len);
+    try testing.expectEqual(@as(usize, 21), arms.len);
     try testing.expectEqual(named_arms.len + 3, arms.len);
     try testing.expectEqual(ArmKind.seam, arms[0].kind);
     try testing.expectEqual(ArmKind.nv_fused, arms[arms.len - 2].kind);
@@ -780,7 +766,6 @@ test "glm5_next exl3 kbench: the arm table is the list's length (22: seam, 19 fo
         }
         for (arms[0..i]) |q| try testing.expect(!std.mem.eql(u8, arm.name, q.name));
     }
-    try testing.expectEqualStrings("exl3_mcg", arms[mcg_arm_index].name);
 }
 
 test "glm5_next exl3 kbench: every case's waves draw within the bound (distinct per row / part), an impossible draw fails by name" {
@@ -810,7 +795,7 @@ test "glm5_next exl3 kbench: every stage has a name; the watchdog fires on an ov
     try testing.expectEqualStrings("install", stageName(.install, 0, &buf));
     try testing.expectEqualStrings("banks", stageName(.banks, 0, &buf));
     try testing.expectEqualStrings("parity_mul1_p1", stageName(.parity, 0, &buf));
-    try testing.expectEqualStrings("parity_mcg_p64_widest", stageName(.parity, codebooks.len * pwaves.len - 1, &buf));
+    try testing.expectEqualStrings("parity_mul1_p64_widest", stageName(.parity, codebooks.len * pwaves.len - 1, &buf));
     try testing.expectEqualStrings("timing_miss_p3_n30", stageName(.timing, cases.len - 1, &buf));
     try testing.expectEqualStrings("timing_out_of_range", stageName(.timing, cases.len, &buf));
     var total: u64 = 0;
@@ -819,8 +804,8 @@ test "glm5_next exl3 kbench: every stage has a name; the watchdog fires on an ov
         .parity => codebooks.len * pwaves.len,
         .timing => cases.len,
     });
-    // the budgets' sum: 2,880 s (under an hour)
-    try testing.expectEqual(@as(u64, 2880), total);
+    // the budgets' sum: 2,280 s (under an hour)
+    try testing.expectEqual(@as(u64, 2280), total);
 
     const Rec = struct {
         var name: [64]u8 = undefined;

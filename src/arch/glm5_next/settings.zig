@@ -203,8 +203,7 @@ pub const DsaSplitForm = @import("dsa_decode.zig").SplitForm;
 /// down form (`exl3_down_form`): `seam`, `pair` (DeepSeek's down_pair,
 /// the default), `fused1` / `fused2` (din_rin + g5k3_dn_fused over 1 / 2 blocks), `pro1` / `pro2` (g5k3_dn_pro);
 /// `exl3_forms_maxm` the fused forms' union rule (1, the default, or 4); `exl3_forms_min_p` the narrowest wave the
-/// fused forms take (1 .. 64, default 1; narrower waves run the seam chain). The mcg GEMV is the bench's codebook
-/// price, not a form: on the mul1 pack it decodes other weights, so no setting names it. Every form computes the seam's
+/// fused forms take (1 .. 64, default 1; narrower waves run the seam chain). Every form computes the seam's
 /// words (the kbench's device parity); a name outside these, a combination `exl3_forms.Forms.check` refuses, or a named
 /// form other than the seam on an NVFP4 pack refuses the load by name. The default is batch 27's measured pair
 /// (g22-exl3b at 190/217, lane on, draft_depth 3 + draft_gate 0.5: guone + pair +1.79 % decode over the seam beyond

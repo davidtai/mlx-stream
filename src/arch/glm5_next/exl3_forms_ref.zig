@@ -1,6 +1,6 @@
 //! The host truth of the GLM-5.3-Flash EXL3 K=3 decode forms (`exl3_forms.zig`) and the kernel bench
-//! (`exl3_kbench.zig`): synthetic records in the pack's layout, the EXL3 decode (exl3/kernels.zig `reconstruct`, mul1
-//! and mcg), the f64 expert forward of exl3_ref.py (y = t128(t128(x suh) W_hat) svh, t128 the natural-order Sylvester
+//! (`exl3_kbench.zig`): synthetic records in the pack's layout, the EXL3 decode (exl3/kernels.zig `reconstruct`,
+//! mul1), the f64 expert forward of exl3_ref.py (y = t128(t128(x suh) W_hat) svh, t128 the natural-order Sylvester
 //! Hadamard over 128-blocks scaled 1/sqrt(128); the clamped SwiGLU at 10), an f32 emulation of the seam chain's
 //! arithmetic per output word (the order every form keeps), the union rule of the fused forms, and their column-sum
 //! identity. CPU only: nothing here creates an MLX array.
@@ -95,24 +95,11 @@ pub fn synthRecord(seed: u64, rec: []u8) void {
 
 // ── Decode ──
 
-pub const Codebook = enum { mul1, mcg };
-
-/// exllamav3 codebook mcg (codebook.cuh L67-75): x *= 0xCBAC1FED; x = (x & 0x8FFF8FFF) ^ 0x3B603B60; the f16 sum of its
-/// two halves (__hadd: exact in f64, one rounding).
-pub fn mcgDecode(state: u32) u16 {
-    const x = ((state *% 0xCBAC1FED) & 0x8FFF8FFF) ^ 0x3B603B60;
-    const lo: f64 = @as(f16, @bitCast(@as(u16, @truncate(x))));
-    const hi: f64 = @as(f16, @bitCast(@as(u16, @truncate(x >> 16))));
-    const v: f16 = @floatCast(lo + hi);
-    return @bitCast(v);
-}
+pub const Codebook = enum { mul1 };
 
 pub fn table(cb: Codebook, out: *[65536]u16) void {
     switch (cb) {
         .mul1 => ek.mul1Table(out),
-        .mcg => for (out, 0..) |*o, s| {
-            o.* = mcgDecode(@intCast(s));
-        },
     }
 }
 
@@ -462,7 +449,7 @@ fn f32File(bytes: []const u8, out: []f64) void {
     for (out, 0..) |*o, i| o.* = @as(f32, @bitCast(std.mem.readInt(u32, bytes[4 * i ..][0..4], .little)));
 }
 
-test "glm5_next exl3 ref: decode and forward equal exl3_ref.py on the fixture expert (W_hat sha256 per projection and codebook, h and y)" {
+test "glm5_next exl3 ref: decode and forward equal exl3_ref.py on the fixture expert (W_hat sha256 per projection, h and y)" {
     const a = testing.allocator;
     const dir = "testdata/exl3-ref/";
     const meta = @embedFile(dir ++ "meta.json");
@@ -476,8 +463,8 @@ test "glm5_next exl3 ref: decode and forward equal exl3_ref.py on the fixture ex
     for (&x, x32) |*o, v| o.* = v;
     const tbl = try a.create([65536]u16);
     defer a.destroy(tbl);
-    for ([_]Codebook{ .mul1, .mcg }) |cb| {
-        table(cb, tbl);
+    {
+        table(.mul1, tbl);
         var e = try Expert.init(a, rec, tbl);
         defer e.deinit(a);
         for ([_][]const u16{ e.wg, e.wu, e.wd }) |w| {
@@ -492,13 +479,11 @@ test "glm5_next exl3 ref: decode and forward equal exl3_ref.py on the fixture ex
         defer a.free(y);
         try e.run(a, &x, h, y);
         var ry: [hidden]f64 = undefined;
-        f32File(if (cb == .mul1) @embedFile(dir ++ "y_mul1.f32") else @embedFile(dir ++ "y_mcg.f32"), &ry);
+        f32File(@embedFile(dir ++ "y_mul1.f32"), &ry);
         try testing.expect(maxErrOverRms(y, &ry) < 1e-6);
-        if (cb == .mul1) {
-            var rh: [inter]f64 = undefined;
-            f32File(@embedFile(dir ++ "h_mul1.f32"), &rh);
-            try testing.expect(maxErrOverRms(h, &rh) < 1e-6);
-        }
+        var rh: [inter]f64 = undefined;
+        f32File(@embedFile(dir ++ "h_mul1.f32"), &rh);
+        try testing.expect(maxErrOverRms(h, &rh) < 1e-6);
     }
 }
 

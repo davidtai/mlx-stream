@@ -13,7 +13,6 @@
    "suh_seed": 1735159095,
    "svh_scale": 0.01,
    "svh_seed": 1735159096,
-   "w_hat_sha256_mcg": "894aaf9e6cd337ec5bf1e013042dbc82c03735ef95258a4a6f0056e76ec6e658",
    "w_hat_sha256_mul1": "4d75fedc741ebeb91a2beea573ff1c9d7992c4aec45d7321ea2d1fe6fce7bd4c"
   },
   {
@@ -25,7 +24,6 @@
    "suh_seed": 1735159098,
    "svh_scale": 0.01,
    "svh_seed": 1735159099,
-   "w_hat_sha256_mcg": "a031f7ac88d5f0792dd5833408d63119e2d4bb8fdbe74d7bbe620aff0d4bb0cc",
    "w_hat_sha256_mul1": "0132c41f6580ec4592ca03e707a6adf1db12f8e94ca111bc9d32b565a9366f7f"
   },
   {
@@ -37,7 +35,6 @@
    "suh_seed": 1735159101,
    "svh_scale": 0.01,
    "svh_seed": 1735159102,
-   "w_hat_sha256_mcg": "4b93677bcb6f0caf285e82441122dafa5067715013c43a3566f422daed28a88f",
    "w_hat_sha256_mul1": "ffdb0637a935c7abeb04c1163a02281f8e8778f91061672f86d303db936b220a"
   }
  ],
