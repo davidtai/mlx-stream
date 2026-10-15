@@ -687,6 +687,30 @@ fn envStr(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
 }
 
+/// The cell levers this build no longer takes (each one dead in the ledger): a window that still sets one is refused by
+/// name before any work, never ignored.
+const retired_cell_levers = [_][:0]const u8{"DSV41_CELL_PREDICT_BF16"};
+
+/// The first retired cell lever that `getenv` finds set, or null.
+fn retiredCellLever(getenv: anytype) ?[]const u8 {
+    for (retired_cell_levers) |n| if (getenv(n.ptr) != null) return n;
+    return null;
+}
+
+test "dsv41 served cell: a retired cell lever is refused by name" {
+    const Env = struct {
+        fn none(_: [*:0]const u8) ?[*:0]const u8 {
+            return null;
+        }
+        fn all(_: [*:0]const u8) ?[*:0]const u8 {
+            return "1";
+        }
+    };
+    try std.testing.expectEqual(@as(?[]const u8, null), retiredCellLever(Env.none));
+    for (retired_cell_levers) |n| try std.testing.expect(std.mem.indexOf(u8, std.mem.span(n.ptr), "DSV41_CELL_") == 0);
+    try std.testing.expectEqualStrings(retired_cell_levers[0], retiredCellLever(Env.all).?);
+}
+
 /// A profile build's read-outs, armed by a decode-profile run (DSV41_CELL_DECODE_PROFILE), each off with its env set
 /// to 0: the draft's routed ids, the verify's GPU timeline, the host heap at three marks, and MLX_NEWBUFFER:
 /// -[MTLDevice newBufferWithLength:options:] calls and bytes (MLX's buffer-cache miss allocations; MLX keeps no
@@ -1176,8 +1200,6 @@ const CellReceipt = struct {
     prefill_shared_mid: ?[]const u8 = null,
     /// The prompt-width HC combines as installed: "fused" (one pass) or "region" (the compiled HcPost).
     prefill_hcpost: ?[]const u8 = null,
-    /// P1's predictor GEMM in bf16 (installed): the gate as stored, not its f32 copy.
-    predict_bf16: ?bool = null,
     /// HEAD_MODE (installed): the output head's codec, "bf16" or "mxfp8" (target and draft).
     head_mode: ?[]const u8 = null,
     /// The mxfp8 head's apply route (installed): RCPROJ (true) or MLX's quantized matmul; null on a bf16 head.
@@ -1657,7 +1679,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .prefill_sub = if (md.installed.prefill_sub == std.math.maxInt(u64)) null else md.installed.prefill_sub,
         .prefill_shared_mid = if (md.installed.prefill_shared_mid) "compiled" else "eager",
         .prefill_hcpost = if (md.installed.prefill_hcpost) "fused" else "region",
-        .predict_bf16 = md.installed.predict_bf16,
         .head_mode = @tagName(md.installed.head_mode),
         .head_mxfp8_rc = if (md.installed.head_mode == .mxfp8) md.installed.head_mxfp8_rc else null,
         .routed_forms = formsName(md.installed.routed_forms),
@@ -1715,6 +1736,10 @@ const CellArgs = struct {
 /// DSV41_CELL_FILL_LADDER, DSV41_CELL_WIRED_GB, and the routes (the shell's settings onto `config`, the
 /// Module's overrides into the returned args).
 fn cellConfig(config: *settings.Config) !CellArgs {
+    if (retiredCellLever(std.c.getenv)) |n| {
+        std.debug.print("dsv41 cell: refused: {s} is a retired lever this build no longer takes; unset it (CellRetiredLever)\n", .{n});
+        return error.CellRetiredLever;
+    }
     const gb = struct {
         fn of(name: [*:0]const u8) !?u64 {
             const v = std.c.getenv(name) orelse return null;
@@ -1775,7 +1800,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_PREFILL_SUB")) |v| ov.prefill_sub = if (std.mem.eql(u8, v, "whole")) std.math.maxInt(u64) else std.fmt.parseInt(u64, v, 10) catch return error.CellPrefillSub;
     if (envStr("DSV41_CELL_PREFILL_HCPOST")) |v| ov.prefill_hcpost = if (std.mem.eql(u8, v, "fused")) true else if (std.mem.eql(u8, v, "region")) false else return error.CellHcPostValue;
     if (envStr("DSV41_CELL_PREFILL_SHAREDMID")) |v| ov.prefill_shared_mid = if (std.mem.eql(u8, v, "compiled")) true else if (std.mem.eql(u8, v, "eager")) false else return error.CellSharedMidValue;
-    if (envStr("DSV41_CELL_PREDICT_BF16")) |v| ov.predict_bf16 = try cellBool("DSV41_CELL_PREDICT_BF16", v);
     if (envStr("DSV41_CELL_TRANSIENT_RELEASE")) |v| ov.transient_release = try cellBool("DSV41_CELL_TRANSIENT_RELEASE", v);
     // The phase change's settle poll (ms; the Module refuses a value outside 1..phase_change_settle_ms at construction).
     if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;

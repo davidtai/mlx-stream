@@ -134,8 +134,6 @@ pub const served: Tier = blk: {
     // K16's input streams released at each chunk fence: a one-factor arm (DSV41_CELL_INPUT_STREAM_EARLY_RELEASE=1); the
     // measurement's tight bill counts one routed-group stream when it is installed (`module.inputStreamEarlyRelease`).
     t.routes.input_stream_early_release = false;
-    // P1's predictor in bf16: a one-factor arm (DSV41_CELL_PREDICT_BF16=1), judged on the read-ahead counters.
-    t.routes.predict_bf16 = false;
     break :blk t;
 };
 

@@ -726,7 +726,7 @@ pub fn Model(comptime G: type) type {
             defer gpa.free(ids);
             const wave = g.mark();
             defer g.resetTo(wave);
-            const wf = if (self.tier.routes.predict_bf16) lw.gate_w else try g.astype(lw.gate_w, .float32);
+            const wf = try g.astype(lw.gate_w, .float32);
             // `predict_batch` chunks' predictions evaluated together, one GPU round trip for all of them; their ids are
             // then read in place (an evaluated array's host read makes no round trip).
             var start: usize = 0;
@@ -2093,7 +2093,7 @@ test "dsv41 model: P1's predictor reads its chunks' ids in batches: one eval a b
     try testing.expectEqualSlices(u16, expert_policy.rankHottest(want[0..n], buf[0..n]), hook.ranked.items);
 }
 
-test "dsv41 model: P1's predictor in bf16 (Routes.predict_bf16): the GEMM on the gate as stored, no f32 copy of the gate; the evals, reads and seed are the f32 route's" {
+test "dsv41 model: P1's predictor: one f32 copy of the gate per pass, each chunk's GEMM in f32, one eval and one read per chunk" {
     const m = try Mini.init();
     defer m.deinit();
     const n: c_int = @intCast(m.c.n_routed_experts);
@@ -2117,15 +2117,12 @@ test "dsv41 model: P1's predictor in bf16 (Routes.predict_bf16): the GEMM on the
     // Three chunks (one batch); no row count equals the expert count, so the shapes below name the gate alone.
     const rows = [_]c_int{ 8, 8, 3 };
     const Seen = struct { gemm_f32: usize = 0, gemm_bf16: usize = 0, gate_to_f32: usize = 0, evals: usize = 0, reads: usize = 0 };
-    var seen: [2]Seen = .{ .{}, .{} };
-    var seeds: [2]std.ArrayList(u16) = .{ .empty, .empty };
-    defer for (&seeds) |*x| x.deinit(testing.allocator);
-    for ([_]bool{ false, true }, &seen, &seeds) |bf16, *sn, *seed| {
+    var sn: Seen = .{};
+    {
         var g = TraceOps.init(testing.allocator);
         defer g.deinit();
         const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
-        var tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
-        tier.routes.predict_bf16 = bf16;
+        const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
         const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
         defer model_.deinit(&g);
         var host: Host = .{ .n = @intCast(n) };
@@ -2154,13 +2151,9 @@ test "dsv41 model: P1's predictor in bf16 (Routes.predict_bf16): the GEMM on the
             .host_read => sn.reads += 1,
             else => {},
         };
-        try seed.appendSlice(testing.allocator, hook.ranked.items);
+        try testing.expect(hook.ranked.items.len > 0);
     }
-    // f32 (the served default): one f32 copy of the gate for the pass, each chunk's GEMM in f32.
-    try testing.expectEqual(Seen{ .gemm_f32 = rows.len, .gate_to_f32 = 1, .evals = 1, .reads = rows.len }, seen[0]);
-    // bf16: no copy, each chunk's GEMM in bf16; the same evals and reads, and from the same ids the same seed.
-    try testing.expectEqual(Seen{ .gemm_bf16 = rows.len, .evals = 1, .reads = rows.len }, seen[1]);
-    try testing.expectEqualSlices(u16, seeds[0].items, seeds[1].items);
+    try testing.expectEqual(Seen{ .gemm_f32 = rows.len, .gate_to_f32 = 1, .evals = 1, .reads = rows.len }, sn);
 }
 
 test "dsv41 model: the routed row cap follows _derive_moe_row_cap" {

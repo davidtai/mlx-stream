@@ -190,9 +190,6 @@ pub const Routes = struct {
     /// of the compiled HcPost region, its words by construction on the region's numerics (needs prefill_hc_post: the
     /// region is the reference, checked at construction); decode widths keep their routes.
     prefill_hcpost: bool = false,
-    /// P1's predictor GEMM in the gate's stored bf16 (MLX accumulates in f32) instead of an f32 copy of the gate: the
-    /// seed it reads ahead may differ near ties. Exact outputs: the router decides the routes, the predictor only reads.
-    predict_bf16: bool = false,
     /// ENGRAM=prefetch (K16): the prompt pass's Engram gathers posted ahead of their layers on the row
     /// source's poster threads (the blocking read's bytes, in its order). Exact.
     engram_posted: bool = false,
@@ -2134,8 +2131,8 @@ pub fn Trunk(comptime G: type) type {
         }
 
         /// The predictor's selection over `x` [rows, dim]: `gatePrefix`'s biased scores and each row's top-k ids by
-        /// `gateSelect`'s partition, unordered, int32 [rows, k]. The GEMM runs in `wf`'s dtype: the gate in f32 (the
-        /// router's numerics) or as stored in bf16 (`Routes.predict_bf16`); the scores are f32 either way.
+        /// `gateSelect`'s partition, unordered, int32 [rows, k]. The GEMM runs in `wf`'s dtype (the gate's f32 copy:
+        /// the router's numerics); the scores are f32.
         pub fn predictTopk(g: *G, c: *const v41.Config, x: T, wf: T, bias: T) !T {
             const logits = try g.astype(try linear(g, try g.astype(x, g.dtypeOf(wf)), wf), .float32);
             const biased = try g.add(try g.sqrt(try g.softplus(logits)), bias);
@@ -2847,92 +2844,6 @@ test "dsv41 smoke 0b: P1's predictor top-k is the router's selection on the same
     }
     try testing.expectEqualSlices(u16, want_ids[0 .. rows * k], got_ids[0 .. rows * k]);
     std.debug.print("\nP1 predictor smoke: {d} rows x {d} experts: the predictor's top-{d} sets == the router's\n", .{ rows, n, k });
-}
-
-test "dsv41 smoke 0b: P1's predictor on the gate as stored (bf16) takes its own scores' top-k, the router's wherever the rounding cannot reorder (MLX, GPU stream)" {
-    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const mlx = @import("sdk").mlx;
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    var g = try ops.MlxOps.init(testing.allocator, s);
-    defer g.deinit();
-    const c = try realConfig();
-    const TrM = Trunk(ops.MlxOps);
-    // Enough rows that some sit within the bf16 rounding of the router's 6th / 7th scores: the data separates the routes.
-    const rows = 1024;
-    const dim: usize = c.hidden_size;
-    const n: usize = c.n_routed_experts;
-    const k: usize = c.n_experts_per_tok;
-    try testing.expect(n <= 512 and k <= 8);
-    const a = testing.allocator;
-    var rng = std.Random.DefaultPrng.init(0x5eed_91a2);
-    const r = rng.random();
-    const xs = try a.alloc(f32, rows * dim);
-    defer a.free(xs);
-    for (xs) |*v| v.* = r.floatNorm(f32);
-    const ws = try a.alloc(f32, n * dim);
-    defer a.free(ws);
-    for (ws) |*v| v.* = r.floatNorm(f32) * 0.02;
-    var bs: [512]f32 = undefined;
-    for (bs[0..n]) |*v| v.* = r.floatNorm(f32) * 0.1;
-    const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs), &.{ rows, @intCast(dim) }, .float32), .bfloat16);
-    // The gate as stored (bf16): what `Routes.predict_bf16` hands the predictor (no f32 copy).
-    const w = try g.astype(try g.hostArray(std.mem.sliceAsBytes(ws), &.{ @intCast(n), @intCast(dim) }, .float32), .bfloat16);
-    const bias = try g.hostArray(std.mem.sliceAsBytes(bs[0..n]), &.{@intCast(n)}, .float32);
-    const pre = try TrM.gatePrefix(&g, x, w, bias);
-    const route = try TrM.gateSelect(&g, &c, pre[0], pre[1]);
-    const got = try TrM.predictTopk(&g, &c, x, w, bias);
-    // The bf16 route's own scores and their top-k, by predictTopk's ops with the GEMM in the gate's dtype.
-    const sb = try g.add(try g.sqrt(try g.softplus(try g.astype(try TrM.linear(&g, try g.astype(x, .bfloat16), w), .float32))), bias);
-    const own = try g.astype(try TrM.sliceLast(&g, try g.argpartition(try g.neg(sb), @as(c_int, @intCast(k)) - 1, -1), 0, @intCast(k)), .int32);
-    try g.evalAll(&.{ route.indices, got, own, pre[1], sb });
-    const want_ids = try a.alloc(u16, rows * k);
-    defer a.free(want_ids);
-    const got_ids = try a.alloc(u16, rows * k);
-    defer a.free(got_ids);
-    const own_ids = try a.alloc(u16, rows * k);
-    defer a.free(own_ids);
-    const sf = try a.alloc(f32, rows * n);
-    defer a.free(sf);
-    const sbf = try a.alloc(f32, rows * n);
-    defer a.free(sbf);
-    const sorted = try a.alloc(f32, n);
-    defer a.free(sorted);
-    _ = try g.hostIds(route.indices, want_ids);
-    _ = try g.hostIds(got, got_ids);
-    _ = try g.hostIds(own, own_ids);
-    _ = try g.hostF32(pre[1], sf);
-    _ = try g.hostF32(sb, sbf);
-    var within: usize = 0;
-    var differ: usize = 0;
-    var differ_beyond: usize = 0;
-    for (0..rows) |i| {
-        const wi = want_ids[i * k ..][0..k];
-        const gi = got_ids[i * k ..][0..k];
-        const oi = own_ids[i * k ..][0..k];
-        std.mem.sort(u16, wi, {}, std.sort.asc(u16));
-        std.mem.sort(u16, gi, {}, std.sort.asc(u16));
-        std.mem.sort(u16, oi, {}, std.sort.asc(u16));
-        // (a) Its own scores' selection: the GEMM ran on the gate as stored.
-        try testing.expectEqualSlices(u16, oi, gi);
-        // (b) The router's wherever the bf16 perturbation (eps, the row's largest |bf16 - f32| score) cannot reorder the
-        // router's 6th and 7th scores (a margin over 2 eps keeps every top-k score above every other).
-        const row_f = sf[i * n ..][0..n];
-        const row_b = sbf[i * n ..][0..n];
-        var eps: f32 = 0;
-        for (row_f, row_b) |f, b| eps = @max(eps, @abs(b - f));
-        @memcpy(sorted, row_f);
-        std.mem.sort(f32, sorted, {}, std.sort.desc(f32));
-        const same = std.mem.eql(u16, wi, gi);
-        if (!same) differ += 1;
-        if (sorted[k - 1] - sorted[k] > 2 * eps) {
-            if (!same) differ_beyond += 1;
-        } else within += 1;
-    }
-    try testing.expectEqual(@as(usize, 0), differ_beyond);
-    // (c) The data separates the routes (some row's sets differ), so (a) tells the GEMM's dtype apart.
-    try testing.expect(differ > 0);
-    std.debug.print("\nP1 predictor bf16 smoke: {d} rows x {d} experts: the predictor's top-{d} sets == its own bf16 scores' on every row, == the router's on all {d} rows beyond twice the bf16 perturbation ({d} rows within it, {d} differ)\n", .{ rows, n, k, rows - within, within, differ });
 }
 
 fn miniConfig() !v41.Config {
