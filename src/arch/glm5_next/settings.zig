@@ -26,6 +26,11 @@
 //! launch-fusion switches (`Fusion`: `on`, the default, or `off`, the control), each an exact construction-time route.
 //! `miss_reads` routes the expert stream's demand reads (`MissReads`: `staged`, through the read pool's staging and a copy;
 //! `direct`, straight into the slot rows).
+//! `dsa_select` a verify window's DSA indexer
+//! selection (`per_row`, the default: one scores and one top-k launch per row; `batched`: one of each for all the rows;
+//! exact, ops.zig `SelectRoute`). `hit_wave` the hitpass device hit wave's pairs (`all_pairs`, the default: every routed
+//! pair, the missed ones on base row 0 and never joined; `resident_only`: the missed pairs skipped in every decode text;
+//! exact; an EXL3 pack's hitpass with the seam / guone gate-up and seam / pair down forms only).
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -96,7 +101,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads", "dsa_select", "hit_wave" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -154,6 +159,18 @@ pub const DecodePredict = enum { f32, bf16 };
 /// construction (swiglu.zig): `fused` one text between the gate / up GEMVs and the down GEMV; `ops` the op chain (the
 /// control). Rounding-class against `ops`.
 pub const DecodeSwiglu = enum { ops, fused };
+/// A verify window's DSA indexer selection (`dsa_select`), installed once at construction (ops.zig `SelectPlan`): `batched`
+/// (the default since g25: one scores launch and one top-k launch for the window's rows) or `per_row` (the control, by
+/// name). Exact.
+pub const DsaSelect = @import("ops.zig").SelectRoute;
+/// The hitpass device hit wave's pairs (`hit_wave`), installed once at construction (the shared scheduler's
+/// `Options.dev_miss`): `all_pairs` (the default, the control) computes every routed pair, a missed one from base row 0
+/// (never joined: its miss part's row replaces it); `resident_only` (by name; measured alone -0.64 % decode, so not the default) gives a non-resident expert the EXL3 texts' skip id
+/// (exl3_kernels.zig `skip_id`), so each decode text returns on a missed pair and the wave computes only the resident
+/// pairs. Exact: every joined row comes from the same text and words as before. Named, refused on an NVFP4 pack (its k1
+/// texts do not skip), off hitpass, and with a form whose text does not skip (u8, the fused and pro forms); the default
+/// resolves to `all_pairs` there (`Config.hitWaveRoute`).
+pub const HitWave = enum { all_pairs, resident_only };
 /// The EXL3 family's decode forms (exl3_forms.zig), installed once at construction (exl3_math.zig `Math.init`): the
 /// gate / up form (`exl3_gateup_form`): `seam` (lane B's in_rin, two GEMVs, gu_epi; g22-exl3's chain, the control, by
 /// name), `fused16` / `fused8` (g5k3_gu_fused at 16 or 8 simdgroups), `guone` (DeepSeek's gu_one, the default),
@@ -386,6 +403,12 @@ pub const Config = struct {
     decode_predict: DecodePredict = .bf16,
     /// The decode lane's MLP activation (swiglu.zig): `fused` (the default) or `ops` (the control).
     decode_swiglu: DecodeSwiglu = .fused,
+    /// A verify window's DSA indexer selection (ops.zig `SelectPlan`): `batched` (the default) or `per_row` (the control).
+    dsa_select: DsaSelect = .batched,
+    /// The hitpass device hit wave's pairs: `all_pairs` (the default) or `resident_only` (by name; `hitWaveRoute` would
+    /// resolve an unnamed `resident_only` to `all_pairs` where its texts cannot skip).
+    hit_wave: HitWave = .all_pairs,
+    hit_wave_named: bool = false,
     /// MiMo's X12 keep-warm (mimo_v2/gpu_warm.zig, adopted there as the default: round -4.7 ms, decode +2.4 %, ids
     /// identical): `waits` (the default) warms the GPU while the stream's event-gated parts (decode miss parts, a prompt
     /// group's reads) and the host's read-ahead wait for their bytes; `off` (the control) installs nothing. Exact by
@@ -428,7 +451,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false, miss_reads: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false, miss_reads: bool = false, dsa_select: bool = false, hit_wave: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -494,6 +517,15 @@ pub const Config = struct {
             const route: ?DecodeSwiglu = if (v == .string) std.meta.stringToEnum(DecodeSwiglu, v.string) else null;
             if (route) |r| c.decode_swiglu = r else c.malformed.decode_swiglu = true;
         }
+        if (raw.object.get("dsa_select")) |v| {
+            const route: ?DsaSelect = if (v == .string) std.meta.stringToEnum(DsaSelect, v.string) else null;
+            if (route) |r| c.dsa_select = r else c.malformed.dsa_select = true;
+        }
+        if (raw.object.get("hit_wave")) |v| {
+            const route: ?HitWave = if (v == .string) std.meta.stringToEnum(HitWave, v.string) else null;
+            if (route) |r| c.hit_wave = r else c.malformed.hit_wave = true;
+            c.hit_wave_named = true;
+        }
         if (raw.object.get("gpu_keep_warm")) |v| {
             const route: gpu_warm.Route = if (v == .string) gpu_warm.parseRoute(v.string) else .invalid;
             if (route == .invalid) c.malformed.gpu_keep_warm = true else c.gpu_keep_warm = route;
@@ -553,6 +585,20 @@ pub const Config = struct {
             .join = c.fuse_join == .on and (c.decode_glue == .fused or c.fusion_named.fuse_join),
             .merge_waits = c.merge_gate_waits == .on,
         };
+    }
+
+    /// Whether the installed EXL3 decode forms' texts return on the skip id (seam / guone gate|up, seam / pair down).
+    pub fn formsSkip(c: *const Config) bool {
+        const gu_skips = c.exl3_forms.gateup == .seam or c.exl3_forms.gateup == .guone;
+        const dn_skips = c.exl3_forms.down == .seam or c.exl3_forms.down == .pair;
+        return gu_skips and dn_skips;
+    }
+
+    /// The hit wave's route: the setting's, except that the DEFAULT `resident_only` resolves to `all_pairs` where its texts
+    /// cannot skip (an NVFP4 pack, off hitpass, a non-skipping form); a named `resident_only` stays (refused there by name).
+    pub fn hitWaveRoute(c: *const Config) HitWave {
+        if (c.hit_wave == .resident_only and !c.hit_wave_named and (c.expert_family != .exl3 or c.decode_moe != .hitpass or !c.formsSkip())) return .all_pairs;
+        return c.hit_wave;
     }
 
     /// The demand reads' route: the setting's, except that the DEFAULT `direct` resolves to `staged` on the NVFP4 family
@@ -641,6 +687,13 @@ pub const Config = struct {
         if (c.malformed.decode_dsa) return error.Glm5NextDecodeDsaSetting;
         if (c.malformed.decode_predict) return error.Glm5NextDecodePredictSetting;
         if (c.malformed.decode_swiglu) return error.Glm5NextDecodeSwigluSetting;
+        if (c.malformed.dsa_select) return error.Glm5NextDsaSelectSetting;
+        if (c.malformed.hit_wave) return error.Glm5NextHitWaveSetting;
+        if (c.hit_wave_named and c.hit_wave == .resident_only) {
+            if (c.expert_family != .exl3) return error.Glm5NextHitWaveOnNvfp4Pack;
+            if (c.decode_moe != .hitpass) return error.Glm5NextHitWaveNeedsHitpass;
+            if (!c.formsSkip()) return error.Glm5NextHitWaveForms;
+        }
         if (c.malformed.gpu_keep_warm) return error.Glm5NextGpuKeepWarmSetting;
         if (c.malformed.exl3_gateup_form) return error.Glm5NextExl3GateUpFormSetting;
         if (c.malformed.exl3_down_form) return error.Glm5NextExl3DownFormSetting;
@@ -821,6 +874,60 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try testing.expectEqual(DecodeSwiglu.fused, pinned.decode_swiglu);
     try testing.expectEqual(DecodeSwiglu.ops, (try parseSettings("{\"decode_swiglu\":\"ops\"}")).decode_swiglu);
     try testing.expectError(error.Glm5NextDecodeSwigluSetting, (try parseSettings("{\"decode_swiglu\":true}")).validate());
+    try testing.expectEqual(DsaSelect.batched, pinned.dsa_select);
+    try testing.expectEqual(DsaSelect.batched, (try parseSettings("{\"dsa_select\":\"batched\"}")).dsa_select);
+    try testing.expectEqual(DsaSelect.per_row, (try parseSettings("{\"dsa_select\":\"per_row\"}")).dsa_select);
+    try testing.expectError(error.Glm5NextDsaSelectSetting, (try parseSettings("{\"dsa_select\":\"rows\"}")).validate());
+    try testing.expectError(error.Glm5NextDsaSelectSetting, (try parseSettings("{\"dsa_select\":1}")).validate());
+    // The hit wave: all_pairs unless named; resident_only by name on an EXL3 pack's hitpass with skipping forms, refused by
+    // name elsewhere; an unnamed resident_only resolves to all_pairs where it cannot skip.
+    try testing.expectEqual(HitWave.all_pairs, pinned.hit_wave);
+    try pinned.validate();
+    try testing.expectEqual(HitWave.all_pairs, pinned.hitWaveRoute());
+    {
+        var d = try parseSettings("{}");
+        d.expert_family = .exl3;
+        try d.validate();
+        try testing.expectEqual(HitWave.all_pairs, d.hitWaveRoute());
+        var named = try parseSettings("{\"hit_wave\":\"resident_only\"}");
+        named.expert_family = .exl3;
+        try named.validate();
+        try testing.expectEqual(HitWave.resident_only, named.hitWaveRoute());
+        var un = d;
+        un.hit_wave = .resident_only;
+        try testing.expectEqual(HitWave.resident_only, un.hitWaveRoute());
+        var nf = try parseSettings("{\"exl3_gateup_form\":\"gemv_u8\"}");
+        nf.expert_family = .exl3;
+        try testing.expectEqual(HitWave.all_pairs, nf.hitWaveRoute());
+        var nh = try parseSettings("{\"decode_moe\":\"fused\"}");
+        nh.expert_family = .exl3;
+        try nh.validate();
+        try testing.expectEqual(HitWave.all_pairs, nh.hitWaveRoute());
+        var ctl = try parseSettings("{\"hit_wave\":\"all_pairs\"}");
+        ctl.expert_family = .exl3;
+        try testing.expectEqual(HitWave.all_pairs, ctl.hitWaveRoute());
+    }
+    try testing.expectError(error.Glm5NextHitWaveSetting, (try parseSettings("{\"hit_wave\":\"hits\"}")).validate());
+    try testing.expectError(error.Glm5NextHitWaveOnNvfp4Pack, (try parseSettings("{\"hit_wave\":\"resident_only\"}")).validate());
+    {
+        var c = try parseSettings("{\"hit_wave\":\"resident_only\"}");
+        c.expert_family = .exl3;
+        try c.validate();
+        try testing.expectEqual(HitWave.resident_only, c.hit_wave);
+        for ([_][]const u8{ "{\"hit_wave\":\"resident_only\",\"exl3_gateup_form\":\"seam\",\"exl3_down_form\":\"seam\"}", "{\"hit_wave\":\"resident_only\",\"exl3_down_form\":\"seam\"}" }) |txt| {
+            var ok = try parseSettings(txt);
+            ok.expert_family = .exl3;
+            try ok.validate();
+        }
+        for ([_][]const u8{ "{\"hit_wave\":\"resident_only\",\"exl3_gateup_form\":\"fused16\"}", "{\"hit_wave\":\"resident_only\",\"exl3_gateup_form\":\"gemv_u8\"}", "{\"hit_wave\":\"resident_only\",\"exl3_down_form\":\"pro1\"}" }) |txt| {
+            var bad = try parseSettings(txt);
+            bad.expert_family = .exl3;
+            try testing.expectError(error.Glm5NextHitWaveForms, bad.validate());
+        }
+        var off = try parseSettings("{\"hit_wave\":\"resident_only\",\"decode_moe\":\"fused\"}");
+        off.expert_family = .exl3;
+        try testing.expectError(error.Glm5NextHitWaveNeedsHitpass, off.validate());
+    }
     // The decode glue: fused unless named; ops (the control) by name; anything else refused by name.
     try testing.expectEqual(DecodeGlue.fused, pinned.decode_glue);
     try testing.expectEqual(DecodeGlue.ops, (try parseSettings("{\"decode_glue\":\"ops\"}")).decode_glue);
