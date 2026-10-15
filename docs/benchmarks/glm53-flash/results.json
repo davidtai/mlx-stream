@@ -177,6 +177,17 @@
         "arms": 1,
         "ttft_s": 15.09,
         "source": "cells/glm5next-headline-g26dsa3-199-225-20261015 run dir g26dsa3-197-223 (batch 52, clean-wait first-step single cell, OVERFILL flagged)"
+      },
+      {
+        "prompt_rows": 199,
+        "decode_rows": 225,
+        "decode_tok_s": 36.3,
+        "prefill_tok_s": 1086.0,
+        "peak_gb": 108.07,
+        "admit_to_gb": 8.62,
+        "arms": 1,
+        "ttft_s": 15.08,
+        "source": "cells/glm5next-headline-g26dsa3-199-225-20261015 run dir g26dsa3-199-225 (batch 54b, clean-wait first-step single cell: 7.52 GB after the pulse, gate ADMIT at 7.86; OVERFILL 1.65 GB at load)"
       }
     ],
     "g25-dsa3": [

@@ -10,13 +10,13 @@ ladders, every lever pair with its verdict, how the numbers were measured, the s
 | --- | --- | --- | --- | ---: | ---: |
 | **g25-dsa3** | `glm5next/exl3-k3-stack3-dsalane` `0457394` | `6481fa1b` | exact | not measured alone (see g25-dsa) | 34.50 / 1,077.1 (199/225) |
 | g25-dsa | `glm5next/exl3-k3-stack3-dsalane` `88d2aad` | `5bbd8512` | exact | 33.15 / 1,093.5 | 34.10 / 1,084.3 (199/225) |
-| **g26-dsa3** | `glm5next/exl3-k3-dsalane` `cf30601` | `de1ab1f6` | rounding-class | 34.95 / 1,093.0 | 35.70 / 1,085.4 (197/223); <!-- PENDING-HEADLINE g26-dsa3 @199/225 (batch 54b) --> 199/225 PENDING |
+| **g26-dsa3** | `glm5next/exl3-k3-dsalane` `cf30601` | `de1ab1f6` | rounding-class | 34.95 / 1,093.0 | 36.30 / 1,086.0 (199/225); 35.70 / 1,085.4 (197/223) |
 | g25b | `glm5next/exl3-k3-stack3` `f8465ad` | `3514568e` | exact | 32.80 / 1,093.3 | 33.80 / 1,083.7 (199/225) |
 | g26 | `glm5next/exl3-k3-stack4` `9bf67a7` | `087434fe` | rounding-class | 34.55 / 1,092.8 | 35.60 / 1,085.9 (199/225) |
 
 All servers are host `glm5next/host` `a8f6c6b8` with the plugin above, built ReleaseFast. Against the 40 tok/s decode /
 1,000 tok/s prefill goal, prefill is met on every stack. Decode reaches 34.50 on the exact stacks (86 % of the goal,
-g25-dsa3 at 199/225) and 35.70 on the q8 stacks (89 %, g26-dsa3 at 197/223).
+g25-dsa3 at 199/225) and 36.30 on the q8 stacks (91 %, g26-dsa3 at 199/225).
 
 g25-dsa3 is g25-dsa plus the MTP head's side rows. That lever measured +2.79 % on the q8 stack with the tail fix included
 (g26bin-vs-dsa3) against g26-dsa2's +1.61 % for the tail fix alone (g26bin-vs-dsa2, a different window): about +0.4 % for the side rows; it is exact and was stacked without its own exact
@@ -177,15 +177,16 @@ physical footprint, in decimal GB (10^9 B).
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 190/217 | 34.95 | 1,093.0 | 104.88 | 2 | 12.01 |
 | 197/223 | 35.70 | 1,085.4 | 107.28 | 1 | 9.42 |
-| 199/225 | <!-- PENDING-HEADLINE g26-dsa3 @199/225 (batch 54b): decode / prefill / peak --> PENDING | PENDING | PENDING | 1 | 8.62 |
+| 199/225 | 36.30 | 1,086.0 | 108.07 | 1 | 8.62 |
 
 ![g26-dsa3 decode vs decode rows](decode_rows_g26-dsa3.svg)
 
 ![g26-dsa3 peak footprint vs decode rows](peak_rows_g26-dsa3.svg)
 
-The two new ladders have two measured rungs each so far. The 190/217 rung is the B arms of the stack's head-to-head pair
-(g25bin-vs-g25dsa, g26bin-vs-dsa3). The upper rung is a first-step headline cell, flagged OVERFILL like the 225 cells
-above: 1.23 GB over the fill at load for g25-dsa, 0.9 GB for g26-dsa3. g25-dsa3 at 199/225 (batch 53, the clean-wait headline: 7.75 GB
+The 190/217 rung of each new ladder is the B arms of the stack's head-to-head pair (g25bin-vs-g25dsa, g26bin-vs-dsa3).
+The upper rungs are first-step headline cells, flagged OVERFILL like the 225 cells above: 1.23 GB over the fill at load
+for g25-dsa at 199/225, 0.9 GB for g26-dsa3 at 197/223, and 1.65 GB for g26-dsa3 at 199/225 (batch 54b, the clean-wait
+headline: 7.52 GB after the pulse, gate ADMIT at 7.86). g25-dsa3 at 199/225 (batch 53, the clean-wait headline: 7.75 GB
 after the pulse, gate ADMIT at 8.19, OVERFILL 1.17 GB at load) has its own one-point chart. It is not a rung of g25-dsa's
 ladder, because the side rows add a lever: 34.50 against g25-dsa's 34.10 at the same pin, a single cell each in
 different windows.
@@ -371,7 +372,7 @@ baseline ≤ 12.01 GB. Decode rows above 225 are refused at load by the default 
   the real DSA cost (see the finding above).
 - **199/225 on the q8 stack without the pulse:** batches 47 and 51 (g26-dsa2) were refused at the gate: 9.73–10.09 GB,
   then 9.38 GB against the 8.47 GB bar, after the previous step's work and the armer's gate runs. The in-runner pulse
-  plus the clean wait reached 8.25 GB; 197/223 ran first, and 199/225 is batch 54b.
+  plus the clean wait reached 8.25 GB for 197/223 (batch 52) and 7.86 GB for 199/225 (batch 54b, 36.30 tok/s).
 - **draft_depth 4:** refused by design. The MTP layer's trained depth is 3; the lane, the decode kernels, the pre-build
   and the bill are sized for 4 verify rows, and `draft_depth` 4 is refused at load by name.
 - **draft_gate 0.4** (on g26, where the q8 head makes each draft cheaper): −1.46 % beyond (cc −1.24 %). A lower gate
