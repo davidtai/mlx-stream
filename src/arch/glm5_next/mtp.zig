@@ -409,31 +409,35 @@ pub const Head = struct {
         head.post_norm = try lg.get("post_attention_layernorm.weight", &.{h});
         head.head_norm = try lg.get("shared_head.norm.weight", &.{h});
         head.attn = .{
-            .q_a = try lg.get("self_attn.q_a_proj.weight", &.{ ql, h }),
+            .q_a = .{ .bf16 = try lg.get("self_attn.q_a_proj.weight", &.{ ql, h }) },
             .q_a_norm = try lg.get("self_attn.q_a_layernorm.weight", &.{ql}),
-            .q_b = try lg.get("self_attn.q_b_proj.weight", &.{ heads * hd, ql }),
-            .kv_a = try lg.get("self_attn.kv_a_proj_with_mqa.weight", &.{ r, h }),
+            .q_b = .{ .bf16 = try lg.get("self_attn.q_b_proj.weight", &.{ heads * hd, ql }) },
+            .kv_a = .{ .bf16 = try lg.get("self_attn.kv_a_proj_with_mqa.weight", &.{ r, h }) },
             .kv_a_norm = try lg.get("self_attn.kv_a_layernorm.weight", &.{r}),
             .wk = try head.own(a, try graph.view(s, kv_b, &.{ heads, 2 * hd, r }, 0, hd)),
             .wv = try head.own(a, try graph.view(s, kv_b, &.{ heads, 2 * hd, r }, hd, 2 * hd)),
-            .o = try lg.get("self_attn.o_proj.weight", &.{ h, heads * hd }),
-            .idx_wq_b = try lg.get("self_attn.indexer.wq_b.weight", &.{ ih * ihd, ql }),
-            .idx_wk = try lg.get("self_attn.indexer.wk.weight", &.{ ihd, h }),
+            .o = .{ .bf16 = try lg.get("self_attn.o_proj.weight", &.{ h, heads * hd }) },
+            .idx_wq_b = .{ .bf16 = try lg.get("self_attn.indexer.wq_b.weight", &.{ ih * ihd, ql }) },
+            .idx_wk = .{ .bf16 = try lg.get("self_attn.indexer.wk.weight", &.{ ihd, h }) },
             .idx_k_norm_w = try lg.get("self_attn.indexer.k_norm.weight", &.{ihd}),
             .idx_k_norm_b = try lg.get("self_attn.indexer.k_norm.bias", &.{ihd}),
             .idx_wproj = try lg.get("self_attn.indexer.weights_proj.weight", &.{ ih, h }),
             .idx_gate_t = try head.own(a, try graph.f32Copy(s, try lg.get("self_attn.indexer.index_kpool_compress_gate", &.{ ihd, h }), true)),
             .idx_ape = try head.own(a, try graph.f32Copy(s, try lg.get("self_attn.indexer.index_kpool_compress_ape", &.{ @intCast(c.index_kpool), ihd }), false)),
         };
+        const gate_w = try lg.get("mlp.gate.weight", &.{ e, h });
         head.router = .{
-            .w_t = try head.own(a, try graph.f32Copy(s, try lg.get("mlp.gate.weight", &.{ e, h }), true)),
+            .w = gate_w,
+            .w_t = try head.own(a, try graph.f32Copy(s, gate_w, true)),
             .bias = try lg.get("mlp.gate.e_score_correction_bias", &.{e}),
         };
         if (mlx.mlx_array_dtype(head.router.bias) != .float32) return refuse(diag, error.Glm5NextMtpResidentDtype, "mlp.gate.e_score_correction_bias is not F32", .{});
+        // The MTP layer's residents are BF16 (the draft lane's spec; settings refuses an FP8-declared MTP layer with the
+        // lane on), whatever the trunk's residents format.
         head.shared = .{
-            .gate = try lg.get("mlp.shared_experts.gate_proj.weight", &.{ si, h }),
-            .up = try lg.get("mlp.shared_experts.up_proj.weight", &.{ si, h }),
-            .down = try lg.get("mlp.shared_experts.down_proj.weight", &.{ h, si }),
+            .gate = .{ .bf16 = try lg.get("mlp.shared_experts.gate_proj.weight", &.{ si, h }) },
+            .up = .{ .bf16 = try lg.get("mlp.shared_experts.up_proj.weight", &.{ si, h }) },
+            .down = .{ .bf16 = try lg.get("mlp.shared_experts.down_proj.weight", &.{ h, si }) },
         };
         return head;
     }
@@ -481,8 +485,12 @@ pub const Lane = struct {
     untracked_logged: bool = false,
     /// The request's counters (MiMo's: rounds, drafted, accepted, generated, corrected; the stream's at the decode start).
     stats: mimo_draft.Stats = .{},
-    /// MLX's active bytes the open added (the head's tables and views, the bank, the lanes), measured once: the module
-    /// holds them to the bill's terms.
+    /// What the open holds, from its own arrays (`heldOf`: the bank's nine, the head's three f32 tables, the two lanes,
+    /// each at MLX's allocation size): the module holds it to the bill's terms, which `heldBytes` derives from the same
+    /// shapes (`holdCheck`).
+    held_bytes: u64 = 0,
+    /// MLX's active bytes the open added, measured once (reported: it also counts what MLX keeps beside the arrays, such
+    /// as the scalars a fill reads, and buffers its cache hands back larger than asked).
     measured_bytes: u64 = 0,
 
     /// The lane over the pack at `dir`: the draft bank (refused by name when absent), the head bound from `map` (the
@@ -525,6 +533,10 @@ pub const Lane = struct {
         var active1: usize = 0;
         _ = mlx.mlx_get_active_memory(&active1);
         self.measured_bytes = active1 -| active0;
+        var held: [bank.n_components + 5]u64 = undefined;
+        for (self.slots.arrays, held[0..bank.n_components]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        for ([_]T{ self.head.router.w_t, self.head.attn.idx_gate_t, self.head.attn.idx_ape, self.latent.buf.?, self.index.buf.? }, held[bank.n_components..]) |x, *h| h.* = mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
+        self.held_bytes = heldOf(&held, std.heap.pageSize());
         log.info("glm5_next MTP lane installed: lane=\"{s}\" depth={d} verify_rows={d} bank={s} experts={d} lanes={d} positions measured_bytes={d}\n", .{ lane_name, max_depth, verify_rows, bank.mtp_files.data, n, lanes_cap, self.measured_bytes });
         return self;
     }
@@ -699,6 +711,24 @@ pub const Lane = struct {
         return self.stats.line(buf, lane_name, now);
     }
 };
+
+/// Bytes held by arrays of `nbytes` each, at MLX's allocation size (`graph.bufferBytes`: page-rounded past a page).
+pub fn heldOf(nbytes: []const u64, page: u64) u64 {
+    var n: u64 = 0;
+    for (nbytes) |b| n += graph.bufferBytes(b, page);
+    return n;
+}
+
+/// What the lane's open holds at `positions` billed positions, from the draft bank's geometry and the model: the bill's
+/// `mtp_bank + mtp_tables + mtp_kv`. The open's `held_bytes` (its arrays) equals it by construction: the same shapes.
+pub fn heldBytes(g: *const bank.Geometry, c: *const glm.Config, positions: u64, page: u64) u64 {
+    return DraftBank.arrayBytes(g, page) + Head.tableBytes(c, page) + kvBytes(c, positions, page);
+}
+
+/// The module's construction check: what the open holds, at most what the bill holds for it.
+pub fn holdCheck(held: u64, billed: u64) error{ConstructionOverBill}!void {
+    if (held > billed) return error.ConstructionOverBill;
+}
 
 // ── the bill's terms ──
 

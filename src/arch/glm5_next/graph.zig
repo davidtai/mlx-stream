@@ -24,6 +24,10 @@ const kda = @import("kda.zig");
 const dsa = @import("dsa.zig");
 const experts = @import("experts.zig");
 const nvfp4 = @import("nvfp4.zig");
+const fp8 = @import("fp8.zig");
+const glue = @import("glue.zig");
+const settings = @import("settings.zig");
+const swiglu = @import("swiglu.zig");
 /// Profile builds: the prompt pass's stage marks (MiMo's timeline, armed by `GLM5_NEXT_PREFILL_TIMELINE`); every mark
 /// compiles to nothing in a served build.
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
@@ -42,10 +46,12 @@ pub const dump_chunk_rows: u32 = 256;
 /// A prompt call's dense MLP (layers 0-2: 12,288 wide) in tiles of this many rows, at most `spans_in_flight` committed.
 pub const dense_tile_rows: u32 = 2048;
 
-pub const Mlp = struct { gate: T, up: T, down: T };
-/// The router: BF16 [experts, hidden] as stored, its transposed F32 copy [hidden, experts] (the routing product and the
-/// lookahead's predictor read it) and the F32 correction bias [experts].
-pub const Router = struct { w_t: T, bias: T };
+/// A SwiGLU MLP's projections (the dense layers' and the shared experts'): BF16, or the FP8 route's (fp8.zig).
+pub const Mlp = struct { gate: fp8.Linear, up: fp8.Linear, down: fp8.Linear };
+/// The router: BF16 [experts, hidden] as stored (`w`: the fused glue's router text reads it), its transposed F32 copy
+/// [hidden, experts] (the stock routing product and the lookahead's predictor read it) and the F32 correction bias
+/// [experts].
+pub const Router = struct { w: T, w_t: T, bias: T };
 /// A sublayer's hyper-connection: f32 [(2 + hc) * hc, hc * hidden], f32 [(2 + hc) * hc] and f32 [3].
 pub const Mhc = struct { fn_rows: T, base: T, scale: T };
 
@@ -88,6 +94,9 @@ pub const Weights = struct {
     head: T,
     layers: []Layer,
     owned: std.ArrayList(T) = .empty,
+    /// `residents_format: fp8_block128`: the FP8 route every FP8 projection is bound to (module-owned; a prompt layer's end
+    /// releases its BF16 weights, `forward`); null under `bf16`.
+    fp8: ?*fp8.Route = null,
 
     pub fn deinit(w: *Weights, a: std.mem.Allocator) void {
         for (w.owned.items) |x| _ = mlx.mlx_array_free(x);
@@ -114,7 +123,13 @@ pub const Weights = struct {
         return c.n_layers * 6 + c.nKda() * 4 + c.nDsa() * 4 + c.moeLayers();
     }
 
-    pub fn bind(a: std.mem.Allocator, s: mlx.mlx_stream, map: *const sdk.Weights, c: *const glm.Config, diag: ?*sdk.Diag) !Weights {
+    /// The residents route per site, by the pack's declarations (`glm.Config.siteIsFp8`; fp8.zig `siteTensors`, one table
+    /// with the CPU tests): a trunk site (`glm.Config.fp8Sites` / `fp8MlpSites`) declared FP8 binds as codes U8 [out, in]
+    /// with F32 scales [out / 64, in / 128] on `fp8_route` (installed by the module when the pack declares any); every other
+    /// one BF16 [out, in] on the stock matmul (all of them under `bf16`). A missing scale, another dtype or an off-grid shape
+    /// refuses the load by name.
+    pub fn bind(a: std.mem.Allocator, s: mlx.mlx_stream, map: *const sdk.Weights, c: *const glm.Config, fp8_route: ?*fp8.Route, diag: ?*sdk.Diag) !Weights {
+        if ((c.fp8Declared() > 0) != (fp8_route != null)) return error.Glm5NextResidentsRoute;
         const layers = try a.alloc(Layer, c.n_layers);
         errdefer a.free(layers);
         const h: c_int = @intCast(c.hidden_size);
@@ -124,6 +139,7 @@ pub const Weights = struct {
             .norm = try need(map, "model.language_model.norm.weight", &.{h}, diag),
             .head = try need(map, "lm_head.weight", &.{ vocab, h }, diag),
             .layers = layers,
+            .fp8 = fp8_route,
         };
         errdefer {
             for (w.owned.items) |x| _ = mlx.mlx_array_free(x);
@@ -141,12 +157,31 @@ pub const Weights = struct {
                 pre: []const u8,
                 map: *const sdk.Weights,
                 diag: ?*sdk.Diag,
+                c: *const glm.Config,
+                l: u32,
+                route: ?*fp8.Route,
                 fn get(self: @This(), comptime suffix: []const u8, shape: []const c_int) !T {
                     var nb: [160]u8 = undefined;
                     return need(self.map, std.fmt.bufPrint(&nb, "{s}" ++ suffix, .{self.pre}) catch unreachable, shape, self.diag);
                 }
+                /// A trunk site [out, in] as the pack declares it (fp8.zig `siteTensors`).
+                fn proj(self: @This(), comptime suffix: []const u8, out: c_int, in: c_int) !fp8.Linear {
+                    const format: glm.ResidentsFormat = if (self.c.siteIsFp8(self.l, suffix)) .fp8_block128 else .bf16;
+                    const want = fp8.siteTensors(format, @intCast(out), @intCast(in));
+                    const wt = try self.get(suffix ++ ".weight", &want.weight_shape);
+                    const dt: mlx.mlx_dtype = switch (want.weight) {
+                        .u8 => .uint8,
+                        .bf16 => .bfloat16,
+                        .f32 => .float32,
+                    };
+                    if (mlx.mlx_array_dtype(wt) != dt) return refuse(self.diag, error.Glm5NextResidentDtype, "{s}" ++ suffix ++ ".weight is {s}; declared {s}, it binds {s}", .{ self.pre, @tagName(mlx.mlx_array_dtype(wt)), @tagName(format), @tagName(dt) });
+                    const ss = want.scales orelse return .{ .bf16 = wt };
+                    const sc = try self.get(suffix ++ ".weight_scale_inv", &ss);
+                    if (mlx.mlx_array_dtype(sc) != .float32) return refuse(self.diag, error.Glm5NextResidentDtype, "{s}" ++ suffix ++ ".weight_scale_inv is {s}; declared fp8_block128, it binds float32", .{ self.pre, @tagName(mlx.mlx_array_dtype(sc)) });
+                    return .{ .fp8 = fp8.bind(self.route.?, wt, sc, @intCast(out), @intCast(in)) catch |e| return refuse(self.diag, e, "{s}" ++ suffix ++ " [{d}, {d}] has no FP8 GEMV plan", .{ self.pre, out, in }) };
+                }
             };
-            const lg: L = .{ .pre = pre, .map = map, .diag = diag };
+            const lg: L = .{ .pre = pre, .map = map, .diag = diag, .c = c, .l = l, .route = fp8_route };
             lw.* = .{
                 .input_norm = try lg.get("input_layernorm.weight", &.{h}),
                 .post_norm = try lg.get("post_attention_layernorm.weight", &.{h}),
@@ -172,16 +207,16 @@ pub const Weights = struct {
                 const ihd: c_int = @intCast(c.index_head_dim);
                 const kv_b = try lg.get("self_attn.kv_b_proj.weight", &.{ heads * 2 * hd, r });
                 lw.attn = .{ .dsa = .{
-                    .q_a = try lg.get("self_attn.q_a_proj.weight", &.{ ql, h }),
+                    .q_a = try lg.proj("self_attn.q_a_proj", ql, h),
                     .q_a_norm = try lg.get("self_attn.q_a_layernorm.weight", &.{ql}),
-                    .q_b = try lg.get("self_attn.q_b_proj.weight", &.{ heads * hd, ql }),
-                    .kv_a = try lg.get("self_attn.kv_a_proj_with_mqa.weight", &.{ r, h }),
+                    .q_b = try lg.proj("self_attn.q_b_proj", heads * hd, ql),
+                    .kv_a = try lg.proj("self_attn.kv_a_proj_with_mqa", r, h),
                     .kv_a_norm = try lg.get("self_attn.kv_a_layernorm.weight", &.{r}),
                     .wk = try w.own(a, try view(s, kv_b, &.{ heads, 2 * hd, r }, 0, hd)),
                     .wv = try w.own(a, try view(s, kv_b, &.{ heads, 2 * hd, r }, hd, 2 * hd)),
-                    .o = try lg.get("self_attn.o_proj.weight", &.{ h, heads * hd }),
-                    .idx_wq_b = try lg.get("self_attn.indexer.wq_b.weight", &.{ ih * ihd, ql }),
-                    .idx_wk = try lg.get("self_attn.indexer.wk.weight", &.{ ihd, h }),
+                    .o = try lg.proj("self_attn.o_proj", h, heads * hd),
+                    .idx_wq_b = try lg.proj("self_attn.indexer.wq_b", ih * ihd, ql),
+                    .idx_wk = try lg.proj("self_attn.indexer.wk", ihd, h),
                     .idx_k_norm_w = try lg.get("self_attn.indexer.k_norm.weight", &.{ihd}),
                     .idx_k_norm_b = try lg.get("self_attn.indexer.k_norm.bias", &.{ihd}),
                     .idx_wproj = try lg.get("self_attn.indexer.weights_proj.weight", &.{ ih, h }),
@@ -195,21 +230,24 @@ pub const Weights = struct {
                 const dk: c_int = @intCast(c.kda_head_dim);
                 const dim = hv * dk;
                 const a_log = try lg.get("self_attn.A_log", &.{hv});
+                const conv_raw = try lg.get("self_attn.conv1d.weight", &.{ 3 * dim, 1, @intCast(c.kda_conv) });
+                try dtypeCheck("self_attn.conv1d.weight", mlx.mlx_array_dtype(conv_raw), l, diag);
                 lw.attn = .{ .kda = .{
-                    .q = try lg.get("self_attn.q_proj.weight", &.{ dim, h }),
-                    .k = try lg.get("self_attn.k_proj.weight", &.{ dim, h }),
-                    .v = try lg.get("self_attn.v_proj.weight", &.{ dim, h }),
-                    .f_a = try lg.get("self_attn.f_a_proj.weight", &.{ dk, h }),
-                    .f_b = try lg.get("self_attn.f_b_proj.weight", &.{ dim, dk }),
-                    .g_a = try lg.get("self_attn.g_a_proj.weight", &.{ dk, h }),
-                    .g_b = try lg.get("self_attn.g_b_proj.weight", &.{ dim, dk }),
-                    .b = try lg.get("self_attn.b_proj.weight", &.{ hv, h }),
+                    .q = try lg.proj("self_attn.q_proj", dim, h),
+                    .k = try lg.proj("self_attn.k_proj", dim, h),
+                    .v = try lg.proj("self_attn.v_proj", dim, h),
+                    .f_a = try lg.proj("self_attn.f_a_proj", dk, h),
+                    .f_b = try checked(lg, "self_attn.f_b_proj.weight", &.{ dim, dk }, l, diag),
+                    .g_a = try lg.proj("self_attn.g_a_proj", dk, h),
+                    .g_b = try checked(lg, "self_attn.g_b_proj.weight", &.{ dim, dk }, l, diag),
+                    .b = try lg.proj("self_attn.b_proj", hv, h),
                     .a_log = try w.own(a, try aLogTable(s, a_log, l, diag)),
                     .a_exp = try w.own(a, try aExp(s, a_log, hv, dk)),
-                    .dt_bias = try w.own(a, try f32Copy(s, try lg.get("self_attn.dt_bias", &.{dim}), false)),
-                    .conv_w = try w.own(a, try convLayout(s, try lg.get("self_attn.conv1d.weight", &.{ 3 * dim, 1, @intCast(c.kda_conv) }))),
-                    .o_norm = try lg.get("self_attn.o_norm.weight", &.{dk}),
-                    .o = try lg.get("self_attn.o_proj.weight", &.{ h, dim }),
+                    .dt_bias = try w.own(a, try f32Copy(s, try checked(lg, "self_attn.dt_bias", &.{dim}, l, diag), false)),
+                    .conv_w = try w.own(a, try convLayout(s, conv_raw)),
+                    .conv_raw = conv_raw,
+                    .o_norm = try checked(lg, "self_attn.o_norm.weight", &.{dk}, l, diag),
+                    .o = try lg.proj("self_attn.o_proj", h, dim),
                 } };
                 lw.slot = n_kda;
                 n_kda += 1;
@@ -217,22 +255,24 @@ pub const Weights = struct {
             if (c.isMoe(l)) {
                 const e: c_int = @intCast(c.n_routed_experts);
                 const si: c_int = @intCast(c.moe_intermediate_size * c.n_shared_experts);
+                const gate_w = try lg.get("mlp.gate.weight", &.{ e, h });
+                try dtypeCheck("mlp.gate.weight", mlx.mlx_array_dtype(gate_w), l, diag);
                 lw.router = .{
-                    .w_t = try w.own(a, try f32Copy(s, try lg.get("mlp.gate.weight", &.{ e, h }), true)),
-                    .bias = try lg.get("mlp.gate.e_score_correction_bias", &.{e}),
+                    .w = gate_w,
+                    .w_t = try w.own(a, try f32Copy(s, gate_w, true)),
+                    .bias = try checked(lg, "mlp.gate.e_score_correction_bias", &.{e}, l, diag),
                 };
-                if (mlx.mlx_array_dtype(lw.router.?.bias) != .float32) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} gate.e_score_correction_bias is not F32", .{l});
                 lw.shared = .{
-                    .gate = try lg.get("mlp.shared_experts.gate_proj.weight", &.{ si, h }),
-                    .up = try lg.get("mlp.shared_experts.up_proj.weight", &.{ si, h }),
-                    .down = try lg.get("mlp.shared_experts.down_proj.weight", &.{ h, si }),
+                    .gate = try lg.proj("mlp.shared_experts.gate_proj", si, h),
+                    .up = try lg.proj("mlp.shared_experts.up_proj", si, h),
+                    .down = try lg.proj("mlp.shared_experts.down_proj", h, si),
                 };
             } else {
                 const inter: c_int = @intCast(c.intermediate_size);
                 lw.dense = .{
-                    .gate = try lg.get("mlp.gate_proj.weight", &.{ inter, h }),
-                    .up = try lg.get("mlp.up_proj.weight", &.{ inter, h }),
-                    .down = try lg.get("mlp.down_proj.weight", &.{ h, inter }),
+                    .gate = try lg.proj("mlp.gate_proj", inter, h),
+                    .up = try lg.proj("mlp.up_proj", inter, h),
+                    .down = try lg.proj("mlp.down_proj", h, inter),
                 };
             }
         }
@@ -247,11 +287,12 @@ pub const Weights = struct {
         return x;
     }
 
-    /// The gates the expert scheduler's lookahead reads, one per model layer (a dense layer's empty): the router's
-    /// transposed F32 copy and its correction bias.
-    pub fn gates(w: *const Weights, a: std.mem.Allocator) ![]experts.Gate {
+    /// The gates the expert scheduler's lookahead reads, one per model layer (a dense layer's empty): the router's weight
+    /// the installed predictor reads (`decode_predict`: `bf16` the stored BF16 [experts, hidden], `f32` the transposed
+    /// F32 copy) and its correction bias.
+    pub fn gates(w: *const Weights, a: std.mem.Allocator, predict: settings.DecodePredict) ![]experts.Gate {
         const out = try a.alloc(experts.Gate, w.layers.len);
-        for (out, w.layers) |*gt, lw| gt.* = if (lw.router) |r| .{ .w = r.w_t, .bias = r.bias } else .{ .w = .{ .ctx = null }, .bias = .{ .ctx = null } };
+        for (out, w.layers) |*gt, lw| gt.* = if (lw.router) |r| .{ .w = if (predict == .bf16) r.w else r.w_t, .bias = r.bias } else .{ .w = .{ .ctx = null }, .bias = .{ .ctx = null } };
         return out;
     }
 };
@@ -330,7 +371,51 @@ pub fn aLogAccepted(dt: mlx.mlx_dtype) bool {
 
 /// `layer`'s A_log dtype as the bind takes it; any other refuses the load by name.
 fn aLogCheck(dt: mlx.mlx_dtype, layer: u32, diag: ?*sdk.Diag) !void {
-    if (!aLogAccepted(dt)) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} self_attn.A_log is {t}, not a float (F32, BF16 or F16)", .{ layer, dt });
+    return dtypeCheck("self_attn.A_log", dt, layer, diag);
+}
+
+/// Which layers hold a rule's tensor.
+pub const RuleLayers = enum { kda, moe };
+/// A per-layer tensor a route reads in its stored dtype (or converts once at the bind), the layers that hold it, and the
+/// dtypes the bind takes for it. One table: the bind's refusals (`dtypeCheck`) and the pack-header test (GLM5_BANK) read
+/// it, so a real pack's dtype is checked against every route before a load, never found by a refusal in a window.
+pub const DtypeRule = struct { suffix: []const u8, layers: RuleLayers, accepted: []const mlx.mlx_dtype, desc: []const u8 };
+const float_dtypes = [_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 };
+const float_desc = "a float (F32, BF16 or F16)";
+pub const dtype_rules = [_]DtypeRule{
+    // KDA: A_log (its own F32 table) and dt_bias (an F32 copy) converted once; the conv, f_b, g_b and o_norm read as
+    // stored by the fused decode text (kda_decode.zig: one compile-checked variant per dtype combination) and the op chain.
+    .{ .suffix = "self_attn.A_log", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    .{ .suffix = "self_attn.dt_bias", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    .{ .suffix = "self_attn.conv1d.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    .{ .suffix = "self_attn.f_b_proj.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    .{ .suffix = "self_attn.g_b_proj.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    .{ .suffix = "self_attn.o_norm.weight", .layers = .kda, .accepted = &float_dtypes, .desc = float_desc },
+    // The router: the glue's router text and the BF16 predictor read the weight as BF16; the correction bias is F32.
+    .{ .suffix = "mlp.gate.weight", .layers = .moe, .accepted = &.{.bfloat16}, .desc = "BF16" },
+    .{ .suffix = "mlp.gate.e_score_correction_bias", .layers = .moe, .accepted = &.{.float32}, .desc = "F32" },
+};
+
+fn ruleOf(comptime suffix: []const u8) DtypeRule {
+    for (dtype_rules) |r| if (std.mem.eql(u8, r.suffix, suffix)) return r;
+    @compileError("glm5_next: no dtype rule for " ++ suffix);
+}
+
+pub fn accepts(r: DtypeRule, dt: mlx.mlx_dtype) bool {
+    return std.mem.indexOfScalar(mlx.mlx_dtype, r.accepted, dt) != null;
+}
+
+/// A layer's tensor through the bind's getter, its dtype checked against its rule (`dtypeCheck`).
+fn checked(lg: anytype, comptime suffix: []const u8, shape: []const c_int, layer: u32, diag: ?*sdk.Diag) !T {
+    const x = try lg.get(suffix, shape);
+    try dtypeCheck(suffix, mlx.mlx_array_dtype(x), layer, diag);
+    return x;
+}
+
+/// `layer`'s `suffix` tensor dtype against its rule; any other refuses the load by name.
+pub fn dtypeCheck(comptime suffix: []const u8, dt: mlx.mlx_dtype, layer: u32, diag: ?*sdk.Diag) !void {
+    const r = comptime ruleOf(suffix);
+    if (!accepts(r, dt)) return refuse(diag, error.Glm5NextResidentDtype, "layer {d} " ++ suffix ++ " is {t}, not " ++ r.desc, .{ layer, dt });
 }
 
 /// A_log [heads] of `layer` as its own F32 table, evaluated, once (the per-core prompt route reads it: kda_percore.zig).
@@ -453,7 +538,7 @@ pub const Cache = struct {
     }
 
     /// The layer's arrays an evaluation of its forward covers (lanes and states).
-    fn buffers(self: *const Cache, lw: *const Layer, out: *[2]T) []const T {
+    pub fn buffers(self: *const Cache, lw: *const Layer, out: *[2]T) []const T {
         var n: usize = 0;
         switch (lw.attn) {
             .dsa => for ([_]?T{ self.latent[lw.slot].buf, self.index[lw.slot].buf }) |b| if (b) |x| {
@@ -490,8 +575,16 @@ pub fn rmsNorm(g: *G, x: T, w: T, eps: f32) !T {
 
 /// silu(min(gate, limit)) * clip(up, -limit, limit) (the SDK's clamped SwiGLU: mlx-serve's `clampedSwiGLU`), then down.
 pub fn mlp(g: *G, c: *const glm.Config, m: Mlp, x: T) !T {
-    const act = try sdk_ext.quant.activation(G, g, .{ .swiglu_clamped = c.swiglu_limit }, try linear(g, x, m.gate), try linear(g, x, m.up));
-    return linear(g, act, m.down);
+    const act = try sdk_ext.quant.activation(G, g, .{ .swiglu_clamped = c.swiglu_limit }, try fp8.project(g, m.gate, x), try fp8.project(g, m.up, x));
+    return fp8.project(g, m.down, act);
+}
+
+/// A decode-lane MLP (x [rows, hidden], rows <= 4): the activation on the fused text where the module installed it
+/// (`decode_swiglu: fused`, swiglu.zig), the op chain otherwise (`mlp`). The projections are the residents route's either
+/// way (fp8.zig `project`: BF16 on the stock matmul, or under `fp8_block128` MiMo's FP8 GEMV at the decode lane's rows).
+fn mlpDecode(g: *G, c: *const glm.Config, m: Mlp, x: T, sw: ?*const swiglu.Kernels, width: swiglu.Width, rows: u32) !T {
+    const k = sw orelse return mlp(g, c, m, x);
+    return fp8.project(g, m.down, try swiglu.activate(g, k, width, try fp8.project(g, m.gate, x), try fp8.project(g, m.up, x), rows));
 }
 
 /// A prompt call's dense MLP over `x` [rows, hidden] in tiles of `dense_tile_rows` rows: each tile committed as built
@@ -520,6 +613,17 @@ fn mlpTiles(g: *G, a: std.mem.Allocator, c: *const glm.Config, m: Mlp, x: T, row
 
 pub const Routing = struct { indices: T, weights: T };
 
+/// Prompt lever 4 (glm5next/prefill-levers): a prompt call's MoE commits, the routing barrier's arrays first (the routed
+/// ids and weights: the router's graph over the FFN's collapse and norm), then the shared expert. The routed call's
+/// barrier (its host read of the ids) then waits for the router alone, not behind the shared expert's 16K-row GEMMs
+/// (~15 ms a layer in the profile), so the call's plans and reads start that much sooner in a drive-bound MoE stage; the
+/// GPU runs the shared expert behind the router, ahead of the first group's tiles. The same graphs and values, only the
+/// commit order moved: exact. `Ops`: the module's MLX backend (the CPU tests trace it).
+pub fn commitRoutingFirst(comptime Ops: type, g: *Ops, indices: Ops.T, weights: Ops.T, shared: Ops.T) !void {
+    try g.asyncEval(&.{ indices, weights });
+    try g.asyncEval(&.{shared});
+}
+
 /// noaux_tc at one group: f32 logits on the transposed F32 router, sigmoid, the correction bias for the choice, the
 /// top-k, the chosen sigmoid scores normalized (`norm_topk_prob`, + 1e-20) and scaled. x [n, hidden] -> ids u32 [n, k],
 /// weights f32 [n, k].
@@ -537,7 +641,7 @@ pub fn route(g: *G, c: *const glm.Config, r: Router, x: T) !Routing {
 
 /// The sublayer attention of layer `lw` on `stream` [1, R, hc, hidden] (rows at `start`): the collapse, the norm, KDA or
 /// DSA, the expand -> the new stream.
-fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start: u32, cache: *Cache, routes: dsa.Routes, comptime head: Head) !T {
+pub fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start: u32, cache: *Cache, routes: Routes, decode_lane: bool, comptime head: Head) !T {
     var col = try ops.collapse(g.s, stream, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, c.hc_iters, c.hc_eps, c.rms_norm_eps);
     defer col.deinit();
     const normed = try rmsNorm(g, col.x, lw.input_norm, c.rms_norm_eps);
@@ -545,37 +649,81 @@ fn attentionSpan(g: *G, c: *const glm.Config, lw: *const Layer, stream: T, start
         // The MTP verify captures every row's state (`Cache.rollback`); every other call advances the state alone.
         .kda => |*kw| if (head == .verify)
             try kda.forwardCapture(g, c, kw, normed, &cache.kda[lw.slot], &cache.capture[lw.slot])
+        else if (decode_lane)
+            try routes.kda.run(routes.kda.ctx, g, c, kw, normed, &cache.kda[lw.slot])
         else
             try kda.forward(g, c, kw, normed, &cache.kda[lw.slot]),
-        .dsa => |*dw| try dsa.forward(g, c, dw, normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes),
+        .dsa => |*dw| try dsa.forward(g, c, dw, normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes.dsa),
     };
     return g.adopt(try ops.expand(g.s, out, stream, &col));
 }
 
-/// P1 (a prompt call of a routed layer): the router on the layer's collapsed attention input (its post-attention norm),
-/// the call's predicted top-k counted over every row (one eval), ranked hottest first and posted to the stream, which
-/// reads them into the layer's free persistent rows while the attention runs. The prediction only picks reads.
-fn readAhead(g: *G, c: *const glm.Config, lw: *const Layer, spans: []const T, src: *experts.Source, layer: u32) !void {
-    const m = g.mark();
-    defer g.resetTo(m);
+/// A prompt call's spans at most.
+const max_spans = prompt_call_rows / span_rows + 1;
+
+/// P1's predictor of one routed layer for a prompt call (prompt lever 5): the call's predicted top-k counted per expert
+/// on the GPU (u32 [experts]: one small read back in place of every row's ids and the host's tally). Built on the layer's
+/// input spans at the previous layer's end, committed behind that layer's tail and evaluated with it (`forward`: no host
+/// gap at the boundary), or at the layer's own start for a call's first routed layer that no layer of the call precedes.
+pub const Ahead = struct {
+    layer: ?u32 = null,
+    counts: ?T = null,
+
+    pub fn release(a: *Ahead, g: *G) void {
+        if (a.counts) |x| g.release(x);
+        a.* = .{};
+    }
+};
+
+/// Routed layer `l`'s predictor over the call's input `spans` (`Ahead`), unevaluated: the router on each span's collapsed
+/// attention input (its post-attention norm), every row's top-k compared with each expert id and summed (exact integer
+/// counts: the host's tally of the same ids, so the same ranking and the same read-ahead), the spans' counts added. The
+/// counts are kept; the graph's intermediates belong to the caller's scope.
+pub fn predictor(g: *G, c: *const glm.Config, lw: *const Layer, l: u32, spans: []const T, ahead: *Ahead) !void {
+    std.debug.assert(ahead.layer == null and spans.len <= max_spans);
     const r = lw.router.?;
-    var ids: [prompt_call_rows / span_rows + 1]T = undefined;
-    for (spans, ids[0..spans.len]) |sp, *out| {
+    const n: c_int = @intCast(c.n_routed_experts);
+    const k: c_int = @intCast(c.n_experts_per_tok);
+    const ids_row = try g.reshape(try g.arange(0, @floatFromInt(n), 1, .uint32), &.{ 1, n });
+    var total: ?T = null;
+    for (spans) |sp| {
         var col = try ops.collapse(g.s, sp, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, c.hc_iters, c.hc_eps, c.rms_norm_eps);
         defer col.deinit();
         const sh = g.shapeOf(col.x);
         const x = try g.reshape(try rmsNorm(g, col.x, lw.post_norm, c.rms_norm_eps), &.{ sh.dim(1), sh.dim(2) });
-        out.* = (try route(g, c, r, x)).indices;
+        const span_counts = try expertCounts(G, g, (try route(g, c, r, x)).indices, sh.dim(1), k, ids_row);
+        total = if (total) |t| try g.add(t, span_counts) else span_counts;
     }
-    try g.evalAll(ids[0..spans.len]);
-    const counts = src.ahead_counts[0..c.n_routed_experts];
-    @memset(counts, 0);
-    for (ids[0..spans.len]) |x| {
-        const n: usize = @intCast(g.shapeOf(x).dim(0) * g.shapeOf(x).dim(1));
-        for (try g.readU32(x, src.ahead_ids[0..n])) |e| counts[e] += 1;
-    }
-    try src.readAheadSeed(layer, expert_policy.rankHottest(counts, &src.ahead_ranked));
+    ahead.counts = g.keep(try g.astype(total.?, .uint32));
+    ahead.layer = l;
 }
+
+/// Each expert's routed rows in `ids` (u32 [rows, k]): the ids compared with every expert id (`all_ids`, u32 [1, n]) and
+/// summed per expert, int32 [n] (integer sums: exactly the host's tally of the same ids). `Ops`: the module's MLX backend
+/// (the CPU tests trace it).
+pub fn expertCounts(comptime Ops: type, g: *Ops, ids: Ops.T, rows: c_int, k: c_int, all_ids: Ops.T) !Ops.T {
+    return g.sum(try g.equal(try g.reshape(ids, &.{ rows * k, 1 }), all_ids), 0, false);
+}
+
+/// P1: routed layer `l`'s predicted counts (evaluated) ranked hottest first and posted to the stream, which reads the
+/// seed into the layer's free persistent rows while the attention runs. The prediction only picks reads.
+fn postReadAhead(g: *G, c: *const glm.Config, ahead: *const Ahead, src: *experts.Source, l: u32) !void {
+    std.debug.assert(ahead.layer.? == l);
+    const counts = try g.readU32(ahead.counts.?, src.ahead_counts[0..c.n_routed_experts]);
+    try src.readAheadSeed(l, expert_policy.rankHottest(counts, &src.ahead_ranked));
+}
+
+/// The forward's construction-time routes (Module.init): the DSA kernels' and, under the fused glue, its installed texts
+/// (glue.zig; null under `decode_glue: ops`, whose instance never reads it).
+pub const Routes = struct {
+    dsa: dsa.Routes = .{},
+    glue: ?*const glue.Kernels = null,
+    /// The decode lane's KDA layer (`decode_kda`, kda.zig `Step`): the op chain unless the module installed the fused
+    /// text (kda_decode.zig). The prompt's wide calls and the MTP verify's capture always run the op chain.
+    kda: kda.Step = .{},
+    /// The decode lane's MLP activation (`decode_swiglu`): the op chain unless the module installed the fused text.
+    swiglu: ?*const swiglu.Kernels = null,
+};
 
 /// What a forward hands back after its last layer (a comptime route per call site):
 ///   last    the last row's logits f32 [1, vocab] (the served prompt pass and serial steps without the MTP lane)
@@ -593,12 +741,15 @@ pub const Taps = struct { hidden: ?T = null };
 /// `cache`), the routed experts through `src`: the last row's logits f32 [1, vocab], a kept handle the caller frees.
 /// `head` `.dump` (the logits-dump route, chosen at construction) also hands every row's logits, f32 in chunks of
 /// `dump_chunk_rows` rows, to `sink.append(g, chunk)` before returning.
-pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: *experts.Source, routes: dsa.Routes, comptime head: Head, sink: anytype) !T {
+pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: *experts.Source, routes: Routes, comptime head: Head, comptime gl: glue.Route, sink: anytype) !T {
     const rows: u32 = @intCast(ids.len);
     if (rows == 0 or rows > prompt_call_rows) return error.Glm5NextCallRows;
     if (start + rows > cache.cap) return error.ContextOverBill;
     // A wide call (the prompt's) or the decode lane's (the source's phase route: one row, or the MTP verify's in decode).
     const prompt = !src.decodeLaneAt(rows);
+    // The fused glue (`decode_glue: fused`, the instance the module installed) serves the decode lane; a wide call keeps
+    // the stock glue (the phase route).
+    if (comptime gl == .fused) if (!prompt) return forwardFused(g, c, w, ids, start, cache, src, routes, head, sink);
     const m0 = g.mark();
     defer g.resetTo(m0);
     const hidden: c_int = @intCast(c.hidden_size);
@@ -624,6 +775,9 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
     defer a.free(cols);
     const normed = try a.alloc(T, n_spans);
     defer a.free(normed);
+    // Prompt lever 5: the next routed layer's predictor, built and evaluated with each layer's output.
+    var ahead: Ahead = .{};
+    defer ahead.release(g);
     for (w.layers, 0..) |*lw, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
@@ -632,14 +786,22 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             ptl.layer(l);
             ptl.stage(.predict);
         }
-        if (prompt and lw.router != null) try readAhead(g, c, lw, spans, src, l);
+        if (prompt and lw.router != null) {
+            // Built at the previous layer's end; a call's first routed layer with no earlier layer in the call builds it here.
+            if (ahead.layer == null) {
+                try predictor(g, c, lw, l, spans, &ahead);
+                try g.evalAll(&.{ahead.counts.?});
+            }
+            try postReadAhead(g, c, &ahead, src, l);
+            ahead.release(g);
+        }
         if (comptime ptl.enabled) ptl.stage(.attn);
         // The attention, span by span (the KDA state and the DSA lanes carry from one span to the next); in a prompt
         // call each span is committed as built and the span before it waited, so at most `spans_in_flight` run at once.
         var prev: ?T = null;
         for (spans, 0..) |*sp, i| {
             const ms = g.mark();
-            const next = g.keep(try attentionSpan(g, c, lw, sp.*, start + @as(u32, @intCast(i * span_rows)), cache, routes, head));
+            const next = g.keep(try attentionSpan(g, c, lw, sp.*, start + @as(u32, @intCast(i * span_rows)), cache, routes, !prompt, head));
             g.resetTo(ms);
             g.release(sp.*);
             sp.* = next;
@@ -666,13 +828,13 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             nx.* = try rmsNorm(g, cl.x, lw.post_norm, c.rms_norm_eps);
         }
         const x = try g.reshape(if (n_spans == 1) normed[0] else try g.concat(normed, 1), &.{ @intCast(rows), hidden });
-        const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, x, rows) else try mlp(g, c, d, x)) else blk: {
+        const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, x, rows) else try mlpDecode(g, c, d, x, routes.swiglu, .dense, rows)) else blk: {
             const r = try route(g, c, lw.router.?, x);
-            const shared = try mlp(g, c, lw.shared.?, x);
-            // A prompt call commits the shared expert before its routed call (the GPU runs it while the host routes and
-            // the first group's reads land); a decode-lane call hands it over as the call's hoist (run during its read
-            // wait). The sum is the same either way.
-            if (prompt) try g.asyncEval(&.{shared});
+            const shared = if (prompt) try mlp(g, c, lw.shared.?, x) else try mlpDecode(g, c, lw.shared.?, x, routes.swiglu, .shared, rows);
+            // Prompt lever 4: a prompt call commits the routing barrier's arrays, then the shared expert (the GPU runs it
+            // behind the router while the host routes and the first group's reads land); a decode-lane call hands it over
+            // as the call's hoist (run during its read wait). The sum is the same either way.
+            if (prompt) try commitRoutingFirst(G, g, r.indices, r.weights, shared);
             if (comptime ptl.enabled) ptl.stage(.router);
             const routed = try g.adopt(try src.forward(l, x, r.indices, r.weights, if (prompt) &.{} else &.{shared}));
             break :blk try g.add(routed, shared);
@@ -686,11 +848,30 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
             g.release(sp.*);
             sp.* = next;
         }
+        // The expands hold the collapses they read.
+        for (cols[0..n_cols]) |*cl| cl.deinit();
+        n_cols = 0;
         // MiMo's tail: a prompt layer's output evaluated before the next layer starts (bounding its graph), then the
-        // pooled scratch's purge. A decode step's stays lazy: the next routing barrier evaluates it.
+        // pooled scratch's purge. A decode step's stays lazy: the next routing barrier evaluates it. Prompt lever 5: the
+        // tail is committed, the next routed layer's predictor built on its output while the GPU runs it, then committed
+        // behind it and evaluated with it (no host gap at the boundary). The layer's own arrays are released first (the
+        // tail's graph holds what it reads): the boundary holds the stream, the tail's inputs and the predictor's arrays,
+        // not the MoE stage's (bill.zig `promptWaveBytes`: `boundary`).
         if (prompt) {
-            try g.evalAll(spans);
+            g.resetTo(m);
+            try g.asyncEval(spans);
+            var outs: [max_spans + 1]T = undefined;
+            @memcpy(outs[0..n_spans], spans);
+            var n_outs = n_spans;
+            if (li + 1 < w.layers.len and w.layers[li + 1].router != null) {
+                try predictor(g, c, &w.layers[li + 1], l + 1, spans, &ahead);
+                outs[n_outs] = ahead.counts.?;
+                n_outs += 1;
+            }
+            try g.evalAll(outs[0..n_outs]);
             src.promptLayerEnd();
+            // `fp8_block128`: the layer's BF16 weights released (no later layer reads them; fp8.zig `promptBytes`).
+            if (w.fp8) |r| r.layerEnd();
         }
     }
     if (comptime ptl.enabled) ptl.leaveLayers();
@@ -706,6 +887,96 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weig
     const last = spans[n_spans - 1];
     const lr = g.shapeOf(last).dim(1);
     const row = try g.slice(last, &.{ 0, lr - 1, 0, 0 }, &.{ 1, lr, hc, hidden }, &.{ 1, 1, 1, 1 });
+    const mean = try g.reshape(try g.mean(row, 2, false), &.{ 1, hidden });
+    return g.keep(try g.astype(try linear(g, try rmsNorm(g, mean, w.norm, c.rms_norm_eps), w.head), .float32));
+}
+
+/// A sublayer's expand not applied yet (the fused glue): its output over its input stream with its gates, kept across the
+/// layer scope's resets until the next sublayer's hcPre folds it in.
+const Pending = struct {
+    deferred: ops.Deferred,
+
+    fn of(g: *G, y: T, post: T, comb: T, h: T) Pending {
+        return .{ .deferred = .{ .y = g.keep(y), .post = g.keep(post), .comb = g.keep(comb), .h = g.keep(h) } };
+    }
+
+    fn release(p: *Pending, g: *G) void {
+        for ([_]T{ p.deferred.y, p.deferred.post, p.deferred.comb, p.deferred.h }) |x| g.release(x);
+    }
+};
+
+/// The decode lane under the fused glue (`decode_glue: fused`, glue.zig): `forward`'s layers with each sublayer's collapse
+/// and norm in one hcPre dispatch that also applies the previous sublayer's expand (deferred until the next sublayer reads
+/// it; the last one is materialized for the head), the router's product and top-8 in two texts, the routed combine with
+/// the shared expert's add in one. The decode lane's rows are one span (at most `glue.max_rows`, hcPre's).
+fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: *experts.Source, routes: Routes, comptime head: Head, sink: anytype) !T {
+    if (comptime head == .dump) @compileError("glm5_next: the logits dump is a prompt pass (the stock glue)");
+    const k = routes.glue.?;
+    const rows: u32 = @intCast(ids.len);
+    const m0 = g.mark();
+    defer g.resetTo(m0);
+    const hidden: c_int = @intCast(c.hidden_size);
+    const hc: c_int = @intCast(c.hc_mult);
+    const r: c_int = @intCast(rows);
+    // The stream entering the first sublayer, [1, R, hc, hidden]; each deferral's rebuild (hcPre's `h`) replaces it.
+    var stream: T = blk: {
+        const idx = try g.hostArray(std.mem.sliceAsBytes(ids), &.{r}, .uint32);
+        const e = try g.reshape(try g.take(w.embed, idx, 0), &.{ 1, r, 1, hidden });
+        break :blk g.keep(try g.broadcastTo(e, &.{ 1, r, hc, hidden }));
+    };
+    defer g.release(stream);
+    var pend: ?Pending = null;
+    defer if (pend) |*p| p.release(g);
+    for (w.layers, 0..) |*lw, li| {
+        const l: u32 = @intCast(li);
+        const m = g.mark();
+        defer g.resetTo(m);
+        // The attention sublayer: its collapse and norm, with the previous sublayer's expand (none before layer 0).
+        const pa = if (pend) |*p|
+            try glue.pre(g, c, null, &p.deferred, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, lw.input_norm)
+        else
+            try glue.pre(g, c, stream, null, lw.hc_attn.fn_rows, lw.hc_attn.scale, lw.hc_attn.base, lw.input_norm);
+        if (pend) |*p| {
+            p.release(g);
+            pend = null;
+            g.release(stream);
+            stream = g.keep(pa.h.?);
+        }
+        const out = switch (lw.attn) {
+            // The MTP verify captures every row's state (`Cache.rollback`); every other call advances the state alone.
+            .kda => |*kw| if (head == .verify)
+                try kda.forwardCapture(g, c, kw, pa.normed, &cache.kda[lw.slot], &cache.capture[lw.slot])
+            else
+                try routes.kda.run(routes.kda.ctx, g, c, kw, pa.normed, &cache.kda[lw.slot]),
+            .dsa => |*dw| try dsa.forward(g, c, dw, pa.normed, start, .{ .latent = &cache.latent[lw.slot], .index = &cache.index[lw.slot] }, routes.dsa),
+        };
+        pend = Pending.of(g, out, pa.post, pa.comb, stream);
+        // The FFN sublayer: the attention's expand folded into its collapse and norm.
+        const pf = try glue.pre(g, c, null, &pend.?.deferred, lw.hc_ffn.fn_rows, lw.hc_ffn.scale, lw.hc_ffn.base, lw.post_norm);
+        pend.?.release(g);
+        pend = null;
+        g.release(stream);
+        stream = g.keep(pf.h.?);
+        const x = try g.reshape(pf.normed, &.{ r, hidden });
+        const f = if (lw.dense) |d| try mlpDecode(g, c, d, x, routes.swiglu, .dense, rows) else blk: {
+            const rt = lw.router.?;
+            const routing = try glue.route(g, k, rt.w, rt.bias, x, rows);
+            // The shared expert is the call's hoist (committed during its read wait); the combine text adds it.
+            const shared = try mlpDecode(g, c, lw.shared.?, x, routes.swiglu, .shared, rows);
+            break :blk try g.adopt(try src.forwardShared(l, x, routing.ids, routing.weights, shared, k));
+        };
+        pend = Pending.of(g, try g.reshape(f, &.{ 1, r, hidden }), pf.post, pf.comb, stream);
+    }
+    cache.len = start + rows;
+    // The last sublayer's expand, materialized: the stream the head reads.
+    const final = try g.adopt(try pend.?.deferred.materialize(g.s));
+    const spans = [_]T{final};
+    if (head == .hidden or head == .verify) {
+        const final_rows = try normedRows(g, c, w, &spans, rows);
+        sink.hidden = g.keep(final_rows);
+        if (head == .verify) return g.keep(try g.astype(try linear(g, final_rows, w.head), .float32));
+    }
+    const row = try g.slice(final, &.{ 0, r - 1, 0, 0 }, &.{ 1, r, hc, hidden }, &.{ 1, 1, 1, 1 });
     const mean = try g.reshape(try g.mean(row, 2, false), &.{ 1, hidden });
     return g.keep(try g.astype(try linear(g, try rmsNorm(g, mean, w.norm, c.rms_norm_eps), w.head), .float32));
 }
@@ -743,6 +1014,20 @@ fn dumpRows(g: *G, c: *const glm.Config, w: *const Weights, spans: []const T, si
 
 const testing = std.testing;
 
+test {
+    // The fused decode texts' CPU tests and their window parity tests (skipped without their switches); the FP8 residents
+    // route's likewise.
+    _ = @import("glue.zig");
+    _ = @import("glue_parity.zig");
+    _ = @import("kda_decode.zig");
+    _ = @import("kda_decode_parity.zig");
+    _ = @import("dsa_decode.zig");
+    _ = @import("dsa_decode_parity.zig");
+    _ = @import("swiglu.zig");
+    _ = @import("fp8.zig");
+    _ = @import("fp8_parity.zig");
+}
+
 test "glm5_next graph: the kept residents are the trunk's (no vision tower, no MTP layer, no FP8 KV scales)" {
     const c: glm.Config = .{};
     for ([_][]const u8{
@@ -755,6 +1040,77 @@ test "glm5_next graph: the kept residents are the trunk's (no vision tower, no M
         "model.language_model.layers.3.self_attn.k_proj.k_scale", "model.language_model.layers.3.self_attn.v_proj.v_scale",
         "model.language_model.layers.x.input_layernorm.weight",
     }) |n| try testing.expect(!keptResident(&c, n));
+}
+
+test "glm5_next graph: prompt lever 4 commits the routing barrier's ids and weights, then the shared expert (two commits, in that order; nothing else)" {
+    const Trace = ops_be.TraceOps;
+    var g = Trace.init(testing.allocator);
+    defer g.deinit();
+    const ids = try g.input(&.{ 16, 8 }, .uint32);
+    const weights = try g.input(&.{ 16, 8 }, .float32);
+    const shared = try g.input(&.{ 16, 4096 }, .bfloat16);
+    const nodes = g.nodes.items.len;
+    try commitRoutingFirst(Trace, &g, ids, weights, shared);
+    try testing.expectEqual(@as(usize, 2), g.commit_spans.items.len);
+    try testing.expectEqualSlices(Trace.T, &.{ ids, weights }, g.committed.items[g.commit_spans.items[0][0]..g.commit_spans.items[0][1]]);
+    try testing.expectEqualSlices(Trace.T, &.{shared}, g.committed.items[g.commit_spans.items[1][0]..g.commit_spans.items[1][1]]);
+    // Only the two commit markers: no node of a graph is built or evaluated here.
+    try testing.expectEqual(nodes + 2, g.nodes.items.len);
+    try testing.expectEqual(@as(usize, 0), g.evals.items.len);
+}
+
+test "glm5_next graph: prompt lever 5's expert counts compare every row's top-k with each expert id and sum per expert: int32 [experts] (the trace backend: no device)" {
+    const Trace = ops_be.TraceOps;
+    var g = Trace.init(testing.allocator);
+    defer g.deinit();
+    const ids = try g.input(&.{ 1024, 8 }, .uint32);
+    const all_ids = try g.input(&.{ 1, 288 }, .uint32);
+    const counts = try expertCounts(Trace, &g, ids, 1024, 8, all_ids);
+    try testing.expectEqualSlices(c_int, &.{288}, g.shapeOf(counts).slice());
+    try testing.expectEqual(mlx.mlx_dtype.int32, g.dtypeOf(counts));
+    try testing.expectEqual(@as(usize, 0), g.evals.items.len);
+}
+
+test "glm5_next graph: prompt lever 5's expert counts in MLX (two spans added, u32) are the host's tally of the same ids, so the read-ahead's ranking is the control's (guarded window: MLX's CPU stream creates the Metal device)" {
+    if (std.c.getenv("_GPU_WINDOW_LOCKED") == null) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = try G.init(a, s);
+    defer g.deinit();
+    const n: u32 = 288;
+    const k: u32 = 8;
+    const rows: u32 = 96;
+    var prng = std.Random.DefaultPrng.init(0x51ed);
+    const rng = prng.random();
+    var want: [n]u32 = @splat(0);
+    const all_ids = try g.reshape(try g.arange(0, @floatFromInt(n), 1, .uint32), &.{ 1, n });
+    var total: ?T = null;
+    for (0..2) |_| {
+        // Every row's top-k distinct, skewed toward low ids (hot experts) so the ranking has ties and gaps.
+        var ids: [rows * k]u32 = undefined;
+        for (0..rows) |r| {
+            var j: usize = 0;
+            while (j < k) {
+                const u = rng.float(f32);
+                const e: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(n - 1)), u * u * @as(f32, @floatFromInt(n))));
+                if (std.mem.indexOfScalar(u32, ids[r * k ..][0..j], e) != null) continue;
+                ids[r * k + j] = e;
+                want[e] += 1;
+                j += 1;
+            }
+        }
+        const x = try g.hostArray(std.mem.sliceAsBytes(&ids), &.{ rows, k }, .uint32);
+        const span_counts = try expertCounts(G, &g, x, rows, k, all_ids);
+        total = if (total) |t| try g.add(t, span_counts) else span_counts;
+    }
+    const counts = try g.astype(total.?, .uint32);
+    try g.evalAll(&.{counts});
+    var got: [n]u32 = undefined;
+    try testing.expectEqualSlices(u32, &want, try g.readU32(counts, &got));
+    var rank_want: [n]u16 = undefined;
+    var rank_got: [n]u16 = undefined;
+    try testing.expectEqualSlices(u16, expert_policy.rankHottest(&want, &rank_want), expert_policy.rankHottest(&got, &rank_got));
 }
 
 test "glm5_next graph: the owned f32 tables' bytes and the call geometry" {
@@ -872,4 +1228,82 @@ test "glm5_next graph: every KDA layer's A_log dtype in the pack's headers is on
     std.debug.print("\nGLM5_NEXT A_LOG pack={s} kda_layers={d} dtypes:", .{ dir, n });
     for (hist.keys(), hist.values()) |k, v| std.debug.print(" {s}={d}", .{ k, v });
     std.debug.print("\n", .{});
+}
+
+test "glm5_next graph: the dtype rules take each of Flash's float dtypes where a route reads floats, and name the tensor otherwise" {
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 }) |dt| try dtypeCheck("self_attn.conv1d.weight", dt, 0, null);
+    var diag: sdk.Diag = .{};
+    try testing.expectError(error.Glm5NextResidentDtype, dtypeCheck("self_attn.conv1d.weight", .uint8, 2, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "layer 2 self_attn.conv1d.weight is uint8, not a float (F32, BF16 or F16)") != null);
+    try testing.expectError(error.Glm5NextResidentDtype, dtypeCheck("mlp.gate.weight", .float32, 3, &diag));
+    try testing.expectError(error.Glm5NextResidentDtype, dtypeCheck("mlp.gate.e_score_correction_bias", .bfloat16, 3, &diag));
+}
+
+// GLM5_BANK=<pack> (headers only, no payload): every per-layer tensor of `dtype_rules` (the tensors the fused routes and
+// the bind's conversions read as stored) on every layer that holds it, its dtype as the pack's shards declare it, against
+// its rule: the check the bind makes at the load, made on the real pack before any window. The histograms printed (the
+// pack of record: A_log, dt_bias and conv1d F32 on layers 0-2, BF16 on the other 31).
+test "glm5_next graph: every tensor the routes bind has a dtype its rule takes in the pack's headers (GLM5_BANK)" {
+    const dir = std.mem.span(std.c.getenv("GLM5_BANK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    defer d.close(io);
+    const config_text = try d.readFileAlloc(io, "config.json", a, .limited(1 << 20));
+    defer a.free(config_text);
+    var cdiag: glm.Diag = .{};
+    const c = glm.Config.parse(a, config_text, &cdiag) catch |e| {
+        std.debug.print("config refused: {s}\n", .{cdiag.message()});
+        return e;
+    };
+    const raw = try d.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 << 20));
+    defer a.free(raw);
+    const index = try std.json.parseFromSlice(std.json.Value, a, raw, .{ .allocate = .alloc_always });
+    defer index.deinit();
+    const wm = index.value.object.get("weight_map").?.object;
+    var headers: std.StringArrayHashMapUnmanaged(std.json.Parsed(std.json.Value)) = .empty;
+    defer {
+        for (headers.values()) |*h| h.deinit();
+        headers.deinit(a);
+    }
+    var bad: u32 = 0;
+    std.debug.print("\nGLM5_NEXT DTYPE_RULES pack={s}\n", .{dir});
+    for (dtype_rules) |r| {
+        var counts: [3]u32 = @splat(0);
+        var other: u32 = 0;
+        var l: u32 = 0;
+        while (l < c.n_layers) : (l += 1) {
+            const holds = switch (r.layers) {
+                .kda => !c.isDsa(l),
+                .moe => c.isMoe(l),
+            };
+            if (!holds) continue;
+            var nb: [128]u8 = undefined;
+            const name = try std.fmt.bufPrint(&nb, "model.language_model.layers.{d}.{s}", .{ l, r.suffix });
+            const shard = (wm.get(name) orelse {
+                std.debug.print("  {s}: missing from the index\n", .{name});
+                return error.Glm5NextResidentMissing;
+            }).string;
+            if (headers.get(shard) == null) {
+                const header = try shardHeader(a, dir, shard);
+                errdefer header.deinit();
+                try headers.put(a, shard, header);
+            }
+            const desc = headers.get(shard).?.value.object.get(name) orelse return error.Glm5NextResidentMissing;
+            const dtype = desc.object.get("dtype").?.string;
+            const dt = safetensorsDtype(dtype) orelse .complex64;
+            if (!accepts(r, dt)) {
+                std.debug.print("  REFUSED layer {d} {s} is {s}, not {s}\n", .{ l, r.suffix, dtype, r.desc });
+                bad += 1;
+            }
+            switch (dt) {
+                .float32 => counts[0] += 1,
+                .bfloat16 => counts[1] += 1,
+                .float16 => counts[2] += 1,
+                else => other += 1,
+            }
+        }
+        std.debug.print("  {s}: F32={d} BF16={d} F16={d} other={d}\n", .{ r.suffix, counts[0], counts[1], counts[2], other });
+    }
+    try testing.expectEqual(@as(u32, 0), bad);
 }

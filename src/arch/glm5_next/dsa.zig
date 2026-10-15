@@ -12,6 +12,8 @@ const mlx = sdk.mlx;
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
 const ops = @import("ops.zig");
+const fp8 = @import("fp8.zig");
+const dsa_decode = @import("dsa_decode.zig");
 /// Profile builds: the DSA split's marks (`indexer`, `topk`, `sparse`) and their evals, only while the prompt timeline
 /// records; compiled out of a served build.
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
@@ -19,20 +21,22 @@ const ptl = @import("../mimo_v2/prefill_timeline.zig");
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
 
+/// One DSA layer's residents: its projections BF16, or under `residents_format: fp8_block128` the FP8 route's (fp8.zig:
+/// q_a, q_b, kv_a, o and the indexer's wk, wq_b; kv_b's halves, the indexer's weights_proj and its f32 tables stay BF16).
 pub const Weights = struct {
-    q_a: T,
+    q_a: fp8.Linear,
     q_a_norm: T,
-    q_b: T,
-    kv_a: T,
+    q_b: fp8.Linear,
+    kv_a: fp8.Linear,
     kv_a_norm: T,
     /// kv_b_proj's halves per head, views of the pack's [heads * (nope + v), latent]: `wk` [H, nope, latent] folds a
     /// query into the latent (`q @ wk`) and lifts the latent to keys (`latent @ wk^T`); `wv` [H, v, latent] lifts it to
     /// values (`latent @ wv^T`).
     wk: T,
     wv: T,
-    o: T,
-    idx_wq_b: T,
-    idx_wk: T,
+    o: fp8.Linear,
+    idx_wq_b: fp8.Linear,
+    idx_wk: fp8.Linear,
     idx_k_norm_w: T,
     idx_k_norm_b: T,
     idx_wproj: T,
@@ -59,8 +63,9 @@ fn rmsNorm(g: *G, x: T, w: T, eps: f32) !T {
 }
 
 /// The module's construction-time routes: the indexer's prompt scores and the sparse latent attention on the NAX
-/// kernels (`dsa_nax`) where the device runs them (`fits`: Flash's dims are the kernels').
-pub const Routes = struct { nax: bool = false };
+/// kernels (`dsa_nax`) where the device runs them (`fits`: Flash's dims are the kernels'); the decode lane's sparse
+/// latent attention on the fused texts (`decode_dsa: fused`, dsa_decode.zig) when the module installed them.
+pub const Routes = struct { nax: bool = false, sparse: ?*const dsa_decode.Kernels = null };
 
 /// The NAX kernels' shapes (`mlx_host.dsa_nax`): the 512-wide latent, heads in 32s, the indexer's 128-wide keys.
 pub fn fits(c: *const glm.Config) bool {
@@ -81,13 +86,13 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
     const ih: c_int = @intCast(c.index_n_heads);
     const ix = indexer(c, routes);
 
-    const q_resid = try rmsNorm(g, try linear(g, x, w.q_a), w.q_a_norm, c.rms_norm_eps);
-    const qh = try g.transposeAxes(try g.reshape(try linear(g, q_resid, w.q_b), &.{ 1, rows, heads, hd }), &.{ 0, 2, 1, 3 });
-    const lat = try rmsNorm(g, try linear(g, x, w.kv_a), w.kv_a_norm, c.rms_norm_eps);
+    const q_resid = try rmsNorm(g, try fp8.project(g, w.q_a, x), w.q_a_norm, c.rms_norm_eps);
+    const qh = try g.transposeAxes(try g.reshape(try fp8.project(g, w.q_b, q_resid), &.{ 1, rows, heads, hd }), &.{ 0, 2, 1, 3 });
+    const lat = try rmsNorm(g, try fp8.project(g, w.kv_a, x), w.kv_a_norm, c.rms_norm_eps);
 
     // The indexer row: the LayerNorm'd key and the pool gate (f32 projection, stored in the key's dtype).
     var ikn_raw = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_fast_layer_norm(&ikn_raw, try linear(g, x, w.idx_wk), w.idx_k_norm_w, w.idx_k_norm_b, 1e-6, g.s));
+    try mlx.check(mlx.mlx_fast_layer_norm(&ikn_raw, try fp8.project(g, w.idx_wk, x), w.idx_k_norm_w, w.idx_k_norm_b, 1e-6, g.s));
     const ikn = try g.adopt(ikn_raw);
     const gate = try g.astype(try g.matmul(try g.astype(x, .float32), w.idx_gate_t), g.dtypeOf(ikn));
     const idx_new = try g.concat(&.{ ikn, gate }, -1);
@@ -136,7 +141,7 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
             try sdpa(g, q_abs, latent4, latent4, scale, if (n > 1) "causal" else "")
         else blk: {
             const qr_s = try g.slice(q_resid, &.{ 0, sparse_from, 0 }, &.{ 1, rows, @intCast(c.q_lora_rank) }, &.{ 1, 1, 1 });
-            const q_idx = try g.reshape(try linear(g, qr_s, w.idx_wq_b), &.{ 1, n, ih, ihd });
+            const q_idx = try g.reshape(try fp8.project(g, w.idx_wq_b, qr_s), &.{ 1, n, ih, ihd });
             const x_s = try g.slice(x, &.{ 0, sparse_from, 0 }, &.{ 1, rows, @intCast(c.hidden_size) }, &.{ 1, 1, 1 });
             const wts = try g.mul(try g.astype(try linear(g, x_s, w.idx_wproj), .float32), try g.scalar(1.0 / @sqrt(@as(f64, @floatFromInt(ih))), .float32));
             const idx_cache = try g.reshape(index_view, &.{ 1, t, 2 * ihd });
@@ -150,8 +155,11 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
             };
             // The NAX route (installed at construction where the device has the tensor units and Flash's dims fit the
             // kernels) on a multi-row call; the op chain's otherwise. An installed route never falls back.
+            // The decode lane's rows (n <= 4) on the fused texts where installed (a row-count route).
             const o_sparse = if (routes.nax and n > 8)
                 try g.adopt((try ops.sparseLatentNax(g.s, q_abs, latent4, sel, scale)) orelse return error.Glm5NextNaxShape)
+            else if (routes.sparse != null and n <= dsa_decode.max_rows)
+                try dsa_decode.attend(g, routes.sparse.?, q_abs, latent4, sel, @intCast(n))
             else
                 try g.adopt(try ops.sparseLatentAttention(g.s, q_abs, latent4, sel, scale, 64));
             if (comptime ptl.enabled) if (ptl.recording()) {
@@ -167,7 +175,7 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, start: u32,
     const flat = try g.reshape(try g.transposeAxes(o, &.{ 0, 2, 1, 3 }), &.{ 1, rows, heads * hd });
     // The output waits for the indexer rows' write (the next call reads them).
     const of = try g.adopt(try ops.withDependency(flat, index_view));
-    return linear(g, of, w.o);
+    return fp8.project(g, w.o, of);
 }
 
 fn sdpa(g: *G, q: T, k: T, v: T, scale: f32, mode: [:0]const u8) !T {

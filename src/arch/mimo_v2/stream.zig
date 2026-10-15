@@ -581,8 +581,9 @@ fn p7Ids(rng: std.Random, rows: usize, span: u16, out: []u16) []u16 {
 }
 
 /// The reader a P7 script runs on: its workers, and (X21) what keeps it behind the call's plans: a sleep injected on each
-/// call's first read-ahead read (`hold_ns`) or a random delay before every range read (`delay_ns`, at most).
-const P7Pool = struct { workers: u32 = io_workers, hold_ns: i64 = 0, delay_ns: i64 = 0 };
+/// call's first read-ahead read (`hold_ns`) or a random delay before every range read (`delay_ns`, at most); `relocate`:
+/// the stream built with the overlap schedule's relocation (`Options.prompt_relocate`, glm5_next's route; MiMo's off).
+const P7Pool = struct { workers: u32 = io_workers, hold_ns: i64 = 0, delay_ns: i64 = 0, relocate: bool = false };
 
 fn p7Fixture(f: *HitFixture, a: std.mem.Allocator, rows: []const u32, schedule: ReadSchedule) !StreamSource {
     return p7FixtureOn(f, a, rows, schedule, .{});
@@ -594,6 +595,7 @@ fn p7FixtureOn(f: *HitFixture, a: std.mem.Allocator, rows: []const u32, schedule
     opts.transient_rows = wide_depth * P7Width;
     opts.pool.workers = pool.workers;
     try applyReadSchedule(&opts, schedule);
+    opts.prompt_relocate = pool.relocate;
     try f.initOpts(a, opts);
     errdefer f.deinit(a);
     var ss = StreamSource.init(f.stream);
@@ -945,6 +947,163 @@ test "mimo p7 read schedule CPU X21: early_whole_trim under any reader timing pl
         // A reader kept behind the plans withdraws early's whole tail (ranks 22+ in jobs 2-3) at least.
         if (pool.workers == 1) try testing.expect(trim.stats.ahead_dropped >= early.stats.ahead_dropped);
         std.debug.print("MIMO_P7_TRIM script calls={d} workers={d} delay_ns={d} hold_ns={d} bytes early_whole={d} early_whole_trim={d} early={d} dropped trim={d} early={d}\n", .{ n_calls, pool.workers, pool.delay_ns, pool.hold_ns, whole.stats.expert_bytes_read, trim.stats.expert_bytes_read, early.stats.expert_bytes_read, trim.stats.ahead_dropped, early.stats.ahead_dropped });
+    }
+}
+
+/// One record's bytes in the P7 fixture's bank.
+fn p7RecordBytes() !u64 {
+    const geom = try @call(.auto, bank_mod.Geometry.init, HitFixture.geom_args);
+    return geom.record_bytes;
+}
+
+/// The relocation proofs' second crafted call: 50 experts on 50 rows (equal counts: the hot order is the id order; five
+/// groups of 11), and a read-ahead ranking whose ranks 22-27 are group 4's six experts (true ranks 44-49). Group 2's seed
+/// misses evict them; group 4 (window 0) loads them into transient rows 0-5, of which group 2 (window 0) loaded rows 0-4
+/// first: only true rank 49's row (5) has no earlier reader.
+fn p7CraftedCall50(ids_buf: *[64 * 8]u16, pred_buf: *[64]u16) struct { ids: []const u16, pred: []const u16 } {
+    var n: usize = 0;
+    for (0..50) |row| {
+        for (0..8) |k| {
+            ids_buf[n] = @intCast((row + k * 5) % 50);
+            n += 1;
+        }
+    }
+    var count: [64]u32 = @splat(0);
+    for (ids_buf[0..n]) |e| count[e] += 1;
+    var ranked: [64]u16 = undefined;
+    const hot = expert_policy.rankHottest(&count, &ranked);
+    @memcpy(pred_buf[0..22], hot[0..22]);
+    @memcpy(pred_buf[22..28], hot[44..50]);
+    @memcpy(pred_buf[28..50], hot[22..44]);
+    return .{ .ids = ids_buf[0..n], .pred = pred_buf[0..50] };
+}
+
+test "mimo p7 read schedule CPU relocate: the read-ahead records the plans evict before any hit are copied into their later transient rows at the plans and read once: current's plans, hits, misses and rows; every routed row holds its record" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const rows = [_]u32{ 28, 28 };
+    const record = try p7RecordBytes();
+    var ids_buf: [64 * 8]u16 = undefined;
+    var pred_buf: [64]u16 = undefined;
+    const call = p7CraftedCall(&ids_buf, &pred_buf);
+    var ids = [_][]const u16{call.ids};
+    var pred = [_][]const u16{call.pred};
+    const script: P7Script = .{ .ids = &ids, .pred = &pred, .per_prompt = 1 };
+    var calls_c: [1]P7Call = undefined;
+    var calls_w: [1]P7Call = undefined;
+    var calls_r: [1]P7Call = undefined;
+    var cur: P7Run = .{ .calls = &calls_c, .stats = .{}, .residents = undefined };
+    var whole: P7Run = .{ .calls = &calls_w, .stats = .{}, .residents = undefined };
+    var moved: P7Run = .{ .calls = &calls_r, .stats = .{}, .residents = undefined };
+    try p7RunScript(a, .current, &rows, script, &cur);
+    try p7RunScript(a, .early_whole, &rows, script, &whole);
+    // early_whole reads the whole read-ahead (nothing withdrawn): the six cold records (true ranks 34-39, group 3, window
+    // 1, whose rows group 1 never loads) are read ahead, evicted by group 2's seed misses, and copied at the plans into
+    // group 3's transient rows: group 3's loads of them hold, and read nothing.
+    try p7RunScriptOn(a, .early_whole, &rows, script, &moved, .{ .relocate = true });
+    try p7ExpectSamePlans(&calls_c[0], &calls_r[0]);
+    for (cur.residents, moved.residents) |rc, rm| try testing.expectEqualSlices(u16, &rc, &rm);
+    try testing.expectEqual(cur.stats.expert_cache_hits, moved.stats.expert_cache_hits);
+    try testing.expectEqual(cur.stats.expert_cache_misses, moved.stats.expert_cache_misses);
+    try testing.expectEqual(whole.stats.loads_skipped + 6, moved.stats.loads_skipped);
+    try testing.expectEqual(whole.stats.expert_bytes_read - 6 * record, moved.stats.expert_bytes_read);
+    try testing.expectEqual(whole.stats.ahead_posted, moved.stats.ahead_posted);
+    try testing.expectEqual(@as(u64, 0), moved.stats.ahead_dropped);
+    // early_whole_trim with the reader held on the read-ahead's first read: the trim withdraws the six (never read), so
+    // nothing is relocated and the bytes are the trim's.
+    var calls_t: [1]P7Call = undefined;
+    var trim: P7Run = .{ .calls = &calls_t, .stats = .{}, .residents = undefined };
+    try p7RunScriptOn(a, .early_whole_trim, &rows, script, &trim, .{ .workers = 1, .hold_ns = 300 * std.time.ns_per_ms, .relocate = true });
+    try p7ExpectSamePlans(&calls_c[0], &calls_t[0]);
+    try testing.expectEqual(@as(u64, 6), trim.stats.ahead_dropped);
+    try testing.expectEqual(whole.stats.loads_skipped, trim.stats.loads_skipped);
+    try testing.expectEqual(moved.stats.expert_bytes_read, trim.stats.expert_bytes_read);
+    std.debug.print("MIMO_P7_RELOCATE crafted bytes current={d} early_whole={d} relocate={d} trim_relocate={d} skipped whole={d} relocate={d}\n", .{ cur.stats.expert_bytes_read, whole.stats.expert_bytes_read, moved.stats.expert_bytes_read, trim.stats.expert_bytes_read, whole.stats.loads_skipped, moved.stats.loads_skipped });
+}
+
+test "mimo p7 read schedule CPU relocate: a record whose later transient row an earlier group of the call loads is not relocated (read again, as the control)" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const rows = [_]u32{ 28, 28 };
+    const record = try p7RecordBytes();
+    var ids_buf: [64 * 8]u16 = undefined;
+    var pred_buf: [64]u16 = undefined;
+    const call = p7CraftedCall50(&ids_buf, &pred_buf);
+    var ids = [_][]const u16{call.ids};
+    var pred = [_][]const u16{call.pred};
+    const script: P7Script = .{ .ids = &ids, .pred = &pred, .per_prompt = 1 };
+    var calls_c: [1]P7Call = undefined;
+    var calls_w: [1]P7Call = undefined;
+    var calls_r: [1]P7Call = undefined;
+    var cur: P7Run = .{ .calls = &calls_c, .stats = .{}, .residents = undefined };
+    var whole: P7Run = .{ .calls = &calls_w, .stats = .{}, .residents = undefined };
+    var moved: P7Run = .{ .calls = &calls_r, .stats = .{}, .residents = undefined };
+    try p7RunScript(a, .current, &rows, script, &cur);
+    try p7RunScript(a, .early_whole, &rows, script, &whole);
+    try p7RunScriptOn(a, .early_whole, &rows, script, &moved, .{ .relocate = true });
+    try testing.expectEqual(@as(u32, 5), calls_c[0].n_groups);
+    try p7ExpectSamePlans(&calls_c[0], &calls_r[0]);
+    for (cur.residents, moved.residents) |rc, rm| try testing.expectEqualSlices(u16, &rc, &rm);
+    // Group 4's six loads: transient rows 0-5 of window 0; group 2 loaded rows 0-4 first. One relocation (row 5).
+    const g4 = &calls_c[0].plans[4];
+    try testing.expectEqual(@as(u32, 6), g4.n_loads);
+    try testing.expectEqual(@as(u8, 0), calls_c[0].windows[4]);
+    try testing.expectEqual(@as(u64, 1), moved.stats.loads_skipped - whole.stats.loads_skipped);
+    try testing.expectEqual(whole.stats.expert_bytes_read - record, moved.stats.expert_bytes_read);
+}
+
+test "mimo p7 read schedule CPU relocate: under any reader timing every call plans as current does, every routed row holds its record, and each record withdrawn or relocated is one record's bytes less than early_whole" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const rows = [_]u32{ 28, 28 };
+    const record = try p7RecordBytes();
+    const n_calls = P7Calls40.n_calls;
+    var c40: P7Calls40 = .{};
+    c40.fill(rows[0]);
+    const script: P7Script = .{ .ids = &c40.ids, .pred = &c40.pred, .per_prompt = 4 };
+    var calls_c: [n_calls]P7Call = undefined;
+    var calls_w: [n_calls]P7Call = undefined;
+    var cur: P7Run = .{ .calls = &calls_c, .stats = .{}, .residents = undefined };
+    var whole: P7Run = .{ .calls = &calls_w, .stats = .{}, .residents = undefined };
+    try p7RunScript(a, .current, &rows, script, &cur);
+    try p7RunScript(a, .early_whole, &rows, script, &whole);
+    const Arm = struct { schedule: ReadSchedule, pool: P7Pool };
+    const arms = [_]Arm{
+        .{ .schedule = .early_whole, .pool = .{ .relocate = true } },
+        .{ .schedule = .early_whole_trim, .pool = .{ .relocate = true } },
+        .{ .schedule = .early_whole_trim, .pool = .{ .workers = 1, .delay_ns = 2 * std.time.ns_per_ms, .relocate = true } },
+        .{ .schedule = .early_whole_trim, .pool = .{ .workers = 1, .hold_ns = 50 * std.time.ns_per_ms, .relocate = true } },
+    };
+    for (arms) |arm| {
+        var calls_r: [n_calls]P7Call = undefined;
+        var run: P7Run = .{ .calls = &calls_r, .stats = .{}, .residents = undefined };
+        try p7RunScriptOn(a, arm.schedule, &rows, script, &run, arm.pool);
+        for (&calls_c, &calls_r) |*want, *got| try p7ExpectSamePlans(want, got);
+        for (cur.residents, run.residents) |rc, rr| try testing.expectEqualSlices(u16, &rc, &rr);
+        try testing.expectEqual(cur.stats.expert_cache_hits, run.stats.expert_cache_hits);
+        try testing.expectEqual(cur.stats.expert_cache_misses, run.stats.expert_cache_misses);
+        try testing.expect(run.stats.loads_skipped >= whole.stats.loads_skipped);
+        const relocated = run.stats.loads_skipped - whole.stats.loads_skipped;
+        try testing.expectEqual(whole.stats.expert_bytes_read - (run.stats.ahead_dropped + relocated) * record, run.stats.expert_bytes_read);
+        // early_whole withdraws nothing: every evicted-first record is read ahead, and the script's mispredicted calls
+        // have ones whose later rows are fresh.
+        if (arm.schedule == .early_whole) try testing.expect(relocated > 0 and run.stats.ahead_dropped == 0);
+        std.debug.print("MIMO_P7_RELOCATE script calls={d} schedule={s} workers={d} delay_ns={d} hold_ns={d} bytes early_whole={d} run={d} relocated={d} dropped={d}\n", .{ n_calls, @tagName(arm.schedule), arm.pool.workers, arm.pool.delay_ns, arm.pool.hold_ns, whole.stats.expert_bytes_read, run.stats.expert_bytes_read, relocated, run.stats.ahead_dropped });
+    }
+}
+
+test "mimo p7 read schedule relocate: a stream refuses relocation without the overlap schedule; MiMo's schedules leave it off" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const rows = [_]u32{ 28, 28 };
+    var stock = options(&rows, .host);
+    stock.prompt_relocate = true;
+    var f: HitFixture = undefined;
+    try testing.expectError(error.InvalidOptions, f.initOpts(a, stock));
+    for ([_]ReadSchedule{ .current, .early, .early_whole, .early_whole_trim, .auto }) |schedule| {
+        var opts = options(&rows, .host);
+        try applyReadSchedule(&opts, schedule);
+        try testing.expect(!opts.prompt_relocate);
     }
 }
 

@@ -19,6 +19,11 @@ const kda = @import("kda.zig");
 const kda_percore = @import("kda_percore.zig");
 const dsa = @import("dsa.zig");
 const dump = @import("dump.zig");
+const fp8 = @import("fp8.zig");
+const glue = @import("glue.zig");
+const kda_decode = @import("kda_decode.zig");
+const dsa_decode = @import("dsa_decode.zig");
+const swiglu = @import("swiglu.zig");
 const mtp = @import("mtp.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const acc = @import("../../sdk_ext.zig").acceptance;
@@ -27,6 +32,7 @@ const pagecache = @import("../mimo_v2/pagecache.zig");
 /// timers and the serial forwards' GPU timeline; every call compiles to nothing in a served build.
 const gprof = @import("profile.zig");
 const prefill_attention = @import("../mimo_v2/prefill_attention.zig");
+const warm = @import("warm.zig");
 
 const T = mlx.mlx_array;
 
@@ -40,7 +46,19 @@ pub const Module = struct {
     gates: []experts.Gate,
     src: *experts.Source,
     cache: graph.Cache,
-    routes: dsa.Routes,
+    /// The forward's construction-time routes (the DSA kernels; the fused glue's texts under `decode_glue: fused`).
+    routes: graph.Routes,
+    /// `decode_glue: fused`: the glue texts (glue.zig), installed at construction; `routes.glue` points here.
+    glue_kernels: glue.Kernels = .{},
+    /// `decode_kda: fused`: the KDA decode text (kda_decode.zig), installed at construction; `routes.kda` runs it.
+    kda_kernels: kda_decode.Kernels = .{},
+    /// `decode_dsa: fused`: the DSA decode texts (dsa_decode.zig), installed at construction; `routes.dsa.sparse` points here.
+    dsa_kernels: dsa_decode.Kernels = .{},
+    /// `decode_swiglu: fused`: the MLP activation text (swiglu.zig), installed at construction; `routes.swiglu` points here.
+    swiglu_kernels: swiglu.Kernels = .{},
+    /// `residents_format: fp8_block128`: the FP8 residents route (fp8.zig), installed before the residents bind (every
+    /// FP8 projection points here); null under `bf16`.
+    fp8_route: ?*fp8.Route = null,
     /// The positions the load billed (the lanes' bound).
     reserve: u64,
     rows: sdk.Rows,
@@ -54,9 +72,11 @@ pub const Module = struct {
     mtp: ?*mtp.Lane = null,
     /// With the lane: the request's token ids by position (a pair's next token), allocated at the billed positions.
     history: []u32 = &.{},
-    /// The serial step the construction installed (`stepRoute`): the served one, or the lane's (each step's hidden
-    /// pended while the lane follows the request).
+    /// The serial step the construction installed (`stepRoute` and the glue route): the served one, or the lane's (each
+    /// step's hidden pended while the lane follows the request), each over the installed decode glue.
     step_pass: *const fn (*Module, []const u32) anyerror!T,
+    /// The MTP round the construction installed: its verify over the installed decode glue.
+    round_pass: *const fn (*Module, std.mem.Allocator, u32, u32, sdk.SamplingParams) anyerror!sdk.DraftRound,
 
     const Decode = struct { steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0, s0: @import("../../sdk_ext.zig").expert.Stats = .{}, active: bool = false };
 
@@ -66,37 +86,103 @@ pub const Module = struct {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const plan = try bill.plan(arena.allocator(), io, cfg, ceiling, stop);
-        // The routes, once: the NAX kernels where the device has the tensor units (Flash's dims are theirs).
-        const routes: dsa.Routes = .{ .nax = prefill_attention.deviceHasNax(s) and dsa.fits(model) };
+        // The routes, once: the NAX kernels where the device has the tensor units (Flash's dims are theirs); the fused
+        // glue's texts below, after the residents.
+        const routes: graph.Routes = .{ .dsa = .{ .nax = prefill_attention.deviceHasNax(s) and dsa.fits(model) } };
 
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .io = io, .g = try graph.G.init(gpa, s), .c = cfg.*, .w = undefined, .gates = &.{}, .src = undefined, .cache = undefined, .routes = routes, .reserve = plan.reserve, .rows = plan.rows, .prompt_pass = promptServed, .step_pass = stepServed };
+        self.* = .{ .gpa = gpa, .io = io, .g = try graph.G.init(gpa, s), .c = cfg.*, .w = undefined, .gates = &.{}, .src = undefined, .cache = undefined, .routes = routes, .reserve = plan.reserve, .rows = plan.rows, .prompt_pass = promptServed, .step_pass = stepPassOf(.served, .ops), .round_pass = roundPassOf(.ops) };
         errdefer self.g.deinit();
         var diag: sdk.Diag = .{};
         errdefer if (diag.len > 0) log.err("{s}\n", .{diag.message()});
         // The residents: every tensor the trunk does not read dropped unread (the vision tower, the MTP layer, the FP8 KV
         // scales: never billed), the rest bound by name and shape, then read into their buffers at once.
         try dropUnread(gpa, weights, &self.c.model, self.c.mtp_lane);
-        self.w = try graph.Weights.bind(gpa, s, weights, &self.c.model, &diag);
+        // The residents' route by the pack's `residents_format`, once: `fp8_block128` installs the FP8 route before the bind
+        // (MiMo's texts: no device work until a call) and binds every trunk site the pack declares FP8 to it; every other
+        // site (all of them under `bf16`, the control) binds BF16 on the stock matmul.
+        if (self.c.model.fp8Declared() > 0) self.fp8_route = try fp8.Route.install(gpa);
+        errdefer if (self.fp8_route) |r| r.destroy(gpa);
+        self.w = try graph.Weights.bind(gpa, s, weights, &self.c.model, self.fp8_route, &diag);
         errdefer self.w.deinit(gpa);
+        if (self.fp8_route != null)
+            log.info("glm5_next residents installed: residents=fp8_block128 ({d} of the trunk's {d} sites FP8 on MiMo's fp8res route: GEMV at M<={d}, prompt M>{d} = bf16(code x scale) in an LRU of {d} slots released at every prompt layer's end + the stock GEMM, bound {d} B; the other sites, lm_head, embeddings, mHC, f_b/g_b, routers, kv_b, the indexer's weights_proj and the MTP layer BF16)\n", .{ model.fp8Declared(), model.fp8TrunkSites(), fp8.gemv_max_rows, fp8.gemv_max_rows, fp8.prompt_slots, fp8.promptBytes(model, std.heap.pageSize()) });
         const t_read = std.Io.Timestamp.now(io, .awake);
         try weights.materialize();
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
         try kda.install();
         // The KDA prompt route, once: the per-core kernel where this GPU's plan and probe take it, else the per-token one.
         const kda_route = try kda_percore.install(&self.g, &self.c.model);
+        // The decode glue (`decode_glue`): the fused texts installed here (their geometry, the launches per decode-lane
+        // width, one launch of each over the model's own tables), refused by name; the stock op chains otherwise.
+        if (self.c.decode_glue == .fused) {
+            const first_moe = &self.w.layers[model.first_k_dense];
+            self.glue_kernels = glue.install(gpa, s, model, .{ .fn_rows = self.w.layers[0].hc_attn.fn_rows, .scale = self.w.layers[0].hc_attn.scale, .base = self.w.layers[0].hc_attn.base, .norm_w = self.w.layers[0].input_norm, .router_w = first_moe.router.?.w, .router_bias = first_moe.router.?.bias }, &diag) catch |e| {
+                log.err("glm5_next: the fused decode glue refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                return e;
+            };
+            self.routes.glue = &self.glue_kernels;
+            log.info("glm5_next decode glue installed: hcPre chain (collapse, norm and the deferred expand in one dispatch a sublayer), router {d} threadgroups + top-8, combine + shared expert; compile check passed\n", .{model.n_routed_experts / 4});
+        }
+        errdefer self.glue_kernels.deinit();
+        // The decode lane's sparse latent attention (`decode_dsa`): the fused texts installed here (before the MTP lane
+        // opens: its head's DSA layer takes the same route), refused by name; the op chain otherwise.
+        if (self.c.decode_dsa == .fused) {
+            self.dsa_kernels = dsa_decode.install(gpa, s, model, &diag) catch |e| {
+                log.err("glm5_next: the fused DSA decode refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                return e;
+            };
+            self.routes.dsa.sparse = &self.dsa_kernels;
+            log.info("glm5_next decode DSA installed: the sparse latent attention in two texts ({d} slices x {d} head groups of the split, MiMo's merge); compile check passed\n", .{ dsa_decode.slices, model.n_heads / dsa_decode.head_group });
+        }
+        errdefer self.dsa_kernels.deinit();
+        // The decode lane's MLP activation (`decode_swiglu`): the fused text installed here at the bound MLPs' widths
+        // (layer 0's dense MLP, the first routed layer's shared expert), refused by name; the op chain otherwise.
+        if (self.c.decode_swiglu == .fused) {
+            // The bound MLPs' widths (the bind refused any other shape, in either residents format): the dense MLPs' and
+            // the shared experts' intermediate sizes.
+            const dense_w: u32 = @intCast(model.intermediate_size);
+            const shared_w: u32 = @intCast(model.moe_intermediate_size * model.n_shared_experts);
+            self.swiglu_kernels = swiglu.install(gpa, s, model, dense_w, shared_w, &diag) catch |e| {
+                log.err("glm5_next: the fused decode SwiGLU refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                return e;
+            };
+            self.routes.swiglu = &self.swiglu_kernels;
+            log.info("glm5_next decode SwiGLU installed: the MLP activation in one text (dense width {d}, shared width {d}; the GEMVs stay the bound format's); compile check passed\n", .{ dense_w, shared_w });
+        }
+        errdefer self.swiglu_kernels.deinit();
+        // The decode lane's KDA layer (`decode_kda`): the fused text installed here (its geometry, the launches per width,
+        // one launch over the first KDA layer of each weight-dtype variant), refused by name; the op chain otherwise.
+        if (self.c.decode_kda == .fused) {
+            const kda_layers = try gpa.alloc(*const kda.Weights, model.nKda());
+            defer gpa.free(kda_layers);
+            var n_kda: usize = 0;
+            for (self.w.layers) |*lw| if (lw.attn == .kda) {
+                kda_layers[n_kda] = &lw.attn.kda;
+                n_kda += 1;
+            };
+            var checks: [16]*const kda.Weights = undefined;
+            const n_checks = try kda_decode.variants(kda_layers[0..n_kda], &checks);
+            self.kda_kernels = kda_decode.install(gpa, s, model, checks[0..n_checks], &diag) catch |e| {
+                log.err("glm5_next: the fused KDA decode refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+                return e;
+            };
+            self.routes.kda = .{ .ctx = &self.kda_kernels, .run = kda_decode.run };
+            log.info("glm5_next decode KDA installed: one text a layer ({d} threadgroups of {d}: conv, gate stages, L2 norms, gate, delta rule and gated norm; the projections GEMVs); compile check passed\n", .{ model.kda_heads, kda_decode.threads });
+        }
+        errdefer self.kda_kernels.deinit();
         // The MTP lane (`mtp_lane`): its draft bank read into MLX and checked, its head bound from the kept residents,
         // its lanes at the billed positions; what its open holds against its billed terms (ConstructionOverBill).
         if (self.c.mtp_lane) {
-            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), routes, &diag);
+            const lane = try mtp.Lane.open(gpa, io, &self.g, dir, weights, &self.c.model, @intCast(plan.reserve), self.routes.dsa, &diag);
             errdefer lane.deinit(&self.g);
             const term = termBytes(plan.bill, "mtp_bank") + termBytes(plan.bill, "mtp_tables") + termBytes(plan.bill, "mtp_kv");
-            log.info("glm5_next MTP lane: {d} B measured at its open, {d} B billed (mtp_bank + mtp_tables + mtp_kv), residual {d} B\n", .{ lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.measured_bytes)) });
-            if (lane.measured_bytes > term) {
-                log.err("glm5_next: load refused: the MTP lane holds {d} B, over its billed {d} B (ConstructionOverBill)\n", .{ lane.measured_bytes, term });
-                return error.ConstructionOverBill;
-            }
+            log.info("glm5_next MTP lane: {d} B held by its arrays ({d} B MLX active at its open), {d} B billed (mtp_bank + mtp_tables + mtp_kv), residual {d} B\n", .{ lane.held_bytes, lane.measured_bytes, term, @as(i64, @intCast(term)) - @as(i64, @intCast(lane.held_bytes)) });
+            mtp.holdCheck(lane.held_bytes, term) catch |e| {
+                log.err("glm5_next: load refused: the MTP lane holds {d} B, over its billed {d} B (ConstructionOverBill)\n", .{ lane.held_bytes, term });
+                return e;
+            };
             self.history = try gpa.alloc(u32, plan.reserve + mtp.verify_rows);
             self.mtp = lane;
         }
@@ -104,7 +190,7 @@ pub const Module = struct {
             lane.deinit(&self.g);
             gpa.free(self.history);
         };
-        self.gates = try self.w.gates(gpa);
+        self.gates = try self.w.gates(gpa, self.c.decode_predict);
         errdefer gpa.free(self.gates);
         // The expert source at the plan's rows, every routed layer alike.
         const n_moe = model.moeLayers();
@@ -112,19 +198,35 @@ pub const Module = struct {
         const decode_rows = try arena.allocator().alloc(u32, n_moe);
         @memset(prompt_rows, plan.rows.prompt);
         @memset(decode_rows, plan.rows.decode);
-        self.src = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe);
+        self.src = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict);
         errdefer self.src.deinit();
+        if (self.c.decode_predict == .bf16) log.info("glm5_next decode predictor installed: the lookahead's scores on the routers' BF16 weights ([experts, hidden], MLX gemv; the F32 copies stay the prompt routing's)\n", .{});
         self.cache = try graph.Cache.init(gpa, &self.c.model, @intCast(plan.reserve));
         errdefer self.cache.deinit(&self.g);
         try self.cache.preallocate(&self.g, &self.c.model);
+        // Prompt lever 3: the prompt pass's first-use kernel builds run here, not inside the first request (warm.zig).
+        const warmed = try warm.run(&self.g, io, &self.c.model, &self.w, &self.cache, self.src, self.routes);
         self.prompt_pass = promptPassOf(promptRoute(&self.c));
-        self.step_pass = stepPassOf(stepRoute(&self.c));
+        self.step_pass = stepPassOf(stepRoute(&self.c), self.c.decode_glue);
+        self.round_pass = roundPassOf(self.c.decode_glue);
         if (self.c.dumpDir()) |d| {
             log.info("glm5_next logits_dump: on dir={s} chunk_rows={d} chunk_bytes={d} (one safetensors file per prompt pass: logits F32 [prompt rows, {d}], token_ids I32, ids_int32_sha256; written before the request returns)\n", .{ d, graph.dump_chunk_rows, dump.chunkBytes(graph.dump_chunk_rows, model.vocab_size, model.hidden_size), model.vocab_size });
         }
         if (self.mtp == null) log.info("glm5_next MTP lane: off (serial; set {{\"mtp_lane\":true}})\n", .{});
-        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s}\n", .{ routes.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route) });
-        log.info("mlx-stream glm5_next installed: {d} layers; {d} KDA, {d} DSA; residents BF16 {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed ({d} sources), {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nKda(), model.nDsa(), weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, n_moe, plan.rows.prompt, graph.prompt_call_rows });
+        log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s} residents={s} decode_glue={s} decode_kda={s} decode_dsa={s} decode_predict={s} decode_swiglu={s}\n", .{ routes.dsa.nax, @tagName(self.src.combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route), @tagName(self.c.model.residents_format), @tagName(self.c.decode_glue), @tagName(self.c.decode_kda), @tagName(self.c.decode_dsa), @tagName(self.c.decode_predict), @tagName(self.c.decode_swiglu) });
+        // The prompt levers' engagement lines (glm5next/prefill-levers; docs/glm5-next.md "Prompt levers").
+        if (experts.prompt_relocate) log.info("glm5_next prompt lever 1: read-ahead relocation engaged (a read-ahead record the plans evict before any hit is copied at the plans into its later transient row: read once; exact)\n", .{});
+        log.info("glm5_next prompt lever 3: prompt kernels warmed at load in {d} ms (KDA layer {d}: {d} spans; dense layer {d}: one {d}-row tile; DSA layer {d}: {d} spans of {d} rows; the {s} combine; token-identical)\n", .{ warmed.ns / std.time.ns_per_ms, warmed.plan.kda_layer, warmed.plan.kda_spans, warmed.plan.dense_layer, graph.dense_tile_rows, warmed.plan.dsa_layer, warmed.plan.dsa_spans, graph.span_rows, @tagName(self.src.combine_route) });
+        log.info("glm5_next prompt lever 4: routing barrier committed before the shared expert (the routed ids and weights, then the shared expert's GEMMs; exact)\n", .{});
+        log.info("glm5_next prompt lever 5: predictor counts on the GPU, committed behind the previous layer's tail (one read back of the expert counts; token-identical)\n", .{});
+        // The residents' counts by route: `BF16 <n>` (the control's line), or `FP8 <projections> + BF16 <the rest>` (each FP8
+        // projection two tensors: its codes and its scales).
+        var rb: [64]u8 = undefined;
+        const residents = if (self.fp8_route != null)
+            std.fmt.bufPrint(&rb, "FP8 {d} + BF16 {d}", .{ model.fp8Declared(), weights.count() - 2 * model.fp8Declared() }) catch unreachable
+        else
+            std.fmt.bufPrint(&rb, "BF16 {d}", .{weights.count()}) catch unreachable;
+        log.info("mlx-stream glm5_next installed: {d} layers; {d} KDA, {d} DSA; residents {s} tensors read in {d:.2} s; experts NVFP4 g16 streamed ({d} sources), {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nKda(), model.nDsa(), residents, @as(f64, @floatFromInt(read_ns)) / 1e9, n_moe, plan.rows.prompt, graph.prompt_call_rows });
         log.info("glm5_next memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv=bf16 phase_rows=on growth_rows={d} forced={s}\n", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, plan.rows.decode - plan.rows.prompt, if (bill.isForced(cfg)) "yes" else "no" });
         if (comptime gprof.enabled) try gprof.arm(gpa, io, self.src, model.n_layers, s);
         self.checkConstruction(plan.bill, plan.rows.prompt);
@@ -170,7 +272,12 @@ pub const Module = struct {
         }
         self.src.deinit();
         self.cache.deinit(&self.g);
+        self.glue_kernels.deinit();
+        self.kda_kernels.deinit();
+        self.dsa_kernels.deinit();
+        self.swiglu_kernels.deinit();
         self.w.deinit(self.gpa);
+        if (self.fp8_route) |r| r.destroy(self.gpa);
         self.gpa.free(self.gates);
         self.g.deinit();
         self.gpa.destroy(self);
@@ -217,6 +324,8 @@ pub const Module = struct {
 
     /// The prompt pass's end -> the decode phase (the source's phase change), the request's decode accounting.
     fn enterDecode(self: *Module, prompt_tokens: usize) !void {
+        // The FP8 prompt route's BF16 weights released (MLX's cache is cleared by the source's phase change below).
+        if (self.fp8_route) |r| r.close();
         if (comptime gprof.enabled) gprof.promptEnd(self.src);
         try self.src.beginDecode();
         self.decode = .{ .active = true, .s0 = self.src.stats() };
@@ -243,6 +352,7 @@ pub const Module = struct {
     }
 
     fn beginPrompt(self: *Module, ids: []const u32) !void {
+        if (self.fp8_route) |r| r.open();
         try self.src.beginPrefill();
         _ = try self.src.chooseReadSchedule(ids.len);
         self.cache.restart(&self.g);
@@ -264,7 +374,7 @@ pub const Module = struct {
             if (logits) |x| self.g.release(x);
             logits = null;
             var taps: graph.Taps = .{};
-            logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids[at..end], self.cache.len, &self.cache, self.src, self.routes, .hidden, &taps);
+            logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids[at..end], self.cache.len, &self.cache, self.src, self.routes, .hidden, .ops, &taps);
             const hidden = taps.hidden.?;
             defer self.g.release(hidden);
             try lane.pend(&self.g, self.cache.len, hidden, @intCast(end - at), false);
@@ -287,7 +397,7 @@ pub const Module = struct {
             const end = @min(ids.len, at + graph.prompt_call_rows);
             if (logits) |x| self.g.release(x);
             logits = null;
-            logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids[at..end], self.cache.len, &self.cache, self.src, self.routes, head, sink);
+            logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids[at..end], self.cache.len, &self.cache, self.src, self.routes, head, .ops, sink);
             at = end;
         }
         try self.g.evalAll(&.{logits.?});
@@ -300,21 +410,33 @@ pub const Module = struct {
         return self.step_pass(self, ids);
     }
 
-    fn stepServed(self: *Module, ids: []const u32) anyerror!T {
-        return self.stepWith(ids, .last, {});
+    fn stepServed(comptime gl: glue.Route) fn (*Module, []const u32) anyerror!T {
+        return struct {
+            fn f(self: *Module, ids: []const u32) anyerror!T {
+                return self.stepWith(gl, ids, .last, {});
+            }
+        }.f;
     }
 
     /// The lane's serial step (a request the lane does not draft, or before its first round): the step's hidden pended
     /// (`mtp.max_pending` steps at most, then the lane stops tracking the request). A wider extend takes the prompt
     /// phase and leaves the lane behind (no round drafts until the next request).
-    fn stepLane(self: *Module, ids: []const u32) anyerror!T {
+    fn stepLane(comptime gl: glue.Route) fn (*Module, []const u32) anyerror!T {
+        return struct {
+            fn f(self: *Module, ids: []const u32) anyerror!T {
+                return self.stepLaneWith(gl, ids);
+            }
+        }.f;
+    }
+
+    fn stepLaneWith(self: *Module, comptime gl: glue.Route, ids: []const u32) anyerror!T {
         const lane = self.mtp.?;
         // A step the lane does not keep (a wide extend; the lane not following the request, or past `max_pending`):
         // the served step's forward.
-        if (!self.src.decodeLaneAt(@intCast(ids.len)) or !lane.keepsStep(self.cache.len, @intCast(ids.len))) return self.stepWith(ids, .last, {});
+        if (!self.src.decodeLaneAt(@intCast(ids.len)) or !lane.keepsStep(self.cache.len, @intCast(ids.len))) return self.stepWith(gl, ids, .last, {});
         const at = self.cache.len;
         var taps: graph.Taps = .{};
-        const logits = try self.stepWith(ids, .hidden, &taps);
+        const logits = try self.stepWith(gl, ids, .hidden, &taps);
         errdefer self.g.release(logits);
         const hidden = taps.hidden.?;
         defer self.g.release(hidden);
@@ -327,21 +449,23 @@ pub const Module = struct {
         return logits;
     }
 
-    fn stepWith(self: *Module, ids: []const u32, comptime head: graph.Head, sink: anytype) !T {
+    fn stepWith(self: *Module, comptime gl: glue.Route, ids: []const u32, comptime head: graph.Head, sink: anytype) !T {
         if (ids.len == 0) return error.Glm5NextEmptyStep;
         if (self.cache.len + ids.len > self.cache.cap) return error.ContextOverBill;
         try self.checkTokens(ids);
         if (!self.src.decodeLaneAt(@intCast(ids.len))) {
             // Wider than the decode lane: the prompt phase for it, then decode again.
             try self.src.resumePrefill();
+            if (self.fp8_route) |r| r.open();
             const logits = try self.promptCalls(ids, .last, {});
             errdefer self.g.release(logits);
+            if (self.fp8_route) |r| r.close();
             try self.src.beginDecode();
             return logits;
         }
         const t0 = self.nowNs();
         const tp = gprof.stepBegin(ids[0]);
-        const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids, self.cache.len, &self.cache, self.src, self.routes, head, sink);
+        const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids, self.cache.len, &self.cache, self.src, self.routes, head, gl, sink);
         errdefer self.g.release(logits);
         // The logits and every KDA state: a conv tail feeds no output of its own step (and the lane's hidden row).
         var evals: std.ArrayList(T) = .empty;
@@ -365,6 +489,10 @@ pub const Module = struct {
     /// accept), the kept rows' hidden pended and their tokens recorded. Returns [t1, the accepted drafts] (owned by `a`)
     /// and the next token.
     pub fn mtpRound(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
+        return self.round_pass(self, a, t1, accepted_cap, sampling);
+    }
+
+    fn roundWith(self: *Module, comptime gl: glue.Route, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) anyerror!sdk.DraftRound {
         const lane = self.mtp.?;
         const g = &self.g;
         const len = self.cache.len;
@@ -382,9 +510,9 @@ pub const Module = struct {
         var taps: graph.Taps = .{};
         // A round without drafts is a serial step's forward (no capture: nothing to roll back).
         const logits = if (k > 0)
-            try graph.forward(g, self.gpa, &self.c.model, &self.w, ids[0..rows], len, &self.cache, self.src, self.routes, .verify, &taps)
+            try graph.forward(g, self.gpa, &self.c.model, &self.w, ids[0..rows], len, &self.cache, self.src, self.routes, .verify, gl, &taps)
         else
-            try graph.forward(g, self.gpa, &self.c.model, &self.w, ids[0..1], len, &self.cache, self.src, self.routes, .hidden, &taps);
+            try graph.forward(g, self.gpa, &self.c.model, &self.w, ids[0..1], len, &self.cache, self.src, self.routes, .hidden, gl, &taps);
         defer g.release(logits);
         const hidden = taps.hidden.?;
         defer g.release(hidden);
@@ -478,10 +606,23 @@ pub fn stepRoute(c: *const settings.Config) StepRoute {
     return if (c.mtp_lane) .lane else .served;
 }
 
-fn stepPassOf(r: StepRoute) *const fn (*Module, []const u32) anyerror!T {
-    return switch (r) {
-        .served => Module.stepServed,
-        .lane => Module.stepLane,
+fn stepPassOf(r: StepRoute, gl: glue.Route) *const fn (*Module, []const u32) anyerror!T {
+    return switch (gl) {
+        inline else => |g| switch (r) {
+            .served => Module.stepServed(g),
+            .lane => Module.stepLane(g),
+        },
+    };
+}
+
+/// The MTP round a construction installs: its verify (and a draftless round's step) over the installed decode glue.
+fn roundPassOf(gl: glue.Route) *const fn (*Module, std.mem.Allocator, u32, u32, sdk.SamplingParams) anyerror!sdk.DraftRound {
+    return switch (gl) {
+        inline else => |g| struct {
+            fn f(self: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) anyerror!sdk.DraftRound {
+                return self.roundWith(g, a, t1, accepted_cap, sampling);
+            }
+        }.f,
     };
 }
 
@@ -521,16 +662,22 @@ test "glm5_next prompt route: the served pass unless logits_dump_dir names a dir
     try testing.expectEqual(PromptRoute.dump, promptRoute(&lane_c));
 }
 
-test "glm5_next step route: the served step unless mtp_lane installs the lane's (a construction-time route)" {
+test "glm5_next step route: the served step unless mtp_lane installs the lane's, each over the installed decode glue (construction-time routes)" {
     if (comptime !@import("../../host_caps.zig").dsa_nax) return error.SkipZigTest;
     const off: settings.Config = .{};
     try testing.expectEqual(StepRoute.served, stepRoute(&off));
-    try testing.expect(stepPassOf(stepRoute(&off)) == &Module.stepServed);
-    // The setting as the pack's block gives it: on installs the lane's step, false keeps the served one.
-    for ([_]struct { text: []const u8, want: StepRoute }{
-        .{ .text = "{\"mtp_lane\":true}", .want = .lane },
-        .{ .text = "{\"mtp_lane\":false}", .want = .served },
-        .{ .text = "{}", .want = .served },
+    // The default glue is the fused one.
+    try testing.expectEqual(glue.Route.fused, off.decode_glue);
+    try testing.expect(stepPassOf(stepRoute(&off), off.decode_glue) == &Module.stepServed(.fused));
+    try testing.expect(roundPassOf(off.decode_glue) == roundPassOf(.fused));
+    // The setting as the pack's block gives it: on installs the lane's step, false keeps the served one; the glue route
+    // picks the instance (ops: the stock op chains, the control).
+    for ([_]struct { text: []const u8, want: StepRoute, glue: glue.Route }{
+        .{ .text = "{\"mtp_lane\":true}", .want = .lane, .glue = .fused },
+        .{ .text = "{\"mtp_lane\":false}", .want = .served, .glue = .fused },
+        .{ .text = "{}", .want = .served, .glue = .fused },
+        .{ .text = "{\"decode_glue\":\"ops\"}", .want = .served, .glue = .ops },
+        .{ .text = "{\"mtp_lane\":true,\"decode_glue\":\"ops\"}", .want = .lane, .glue = .ops },
     }) |case| {
         const raw = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.text, .{});
         defer raw.deinit();
@@ -538,8 +685,14 @@ test "glm5_next step route: the served step unless mtp_lane installs the lane's 
         c.applySettings(raw.value);
         try c.validate();
         try testing.expectEqual(case.want, stepRoute(&c));
-        const want_step: *const fn (*Module, []const u32) anyerror!T = if (case.want == .lane) &Module.stepLane else &Module.stepServed;
-        try testing.expect(stepPassOf(stepRoute(&c)) == want_step);
+        try testing.expectEqual(case.glue, c.decode_glue);
+        const want_step: *const fn (*Module, []const u32) anyerror!T = switch (case.glue) {
+            inline else => |gl| if (case.want == .lane) &Module.stepLane(gl) else &Module.stepServed(gl),
+        };
+        try testing.expect(stepPassOf(stepRoute(&c), c.decode_glue) == want_step);
         try testing.expectEqual(if (case.want == .lane) PromptRoute.lane else PromptRoute.served, promptRoute(&c));
     }
+    // The two glue instances are distinct callables.
+    try testing.expect(stepPassOf(.served, .ops) != stepPassOf(.served, .fused));
+    try testing.expect(roundPassOf(.ops) != roundPassOf(.fused));
 }

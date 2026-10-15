@@ -17,6 +17,7 @@ const graph = @import("graph.zig");
 const experts = @import("experts.zig");
 const kda = @import("kda.zig");
 const mtp = @import("mtp.zig");
+const fp8 = @import("fp8.zig");
 const mimo_math = @import("../mimo_v2/math.zig");
 const mimo_stream = @import("../mimo_v2/stream.zig");
 const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
@@ -36,6 +37,19 @@ const bf16: u64 = 2;
 const f32b: u64 = 4;
 /// The fused decode route's kernel set and prepared launches, declared (`decode_kernels` term).
 pub const fused_kernels_bytes: u64 = 16 << 20;
+/// The fused decode glue's texts (glue.zig: three texts, the router's four widths, hcPre's two variants), their
+/// pipelines and launch configurations, declared (`glue_kernels` term).
+pub const glue_kernels_bytes: u64 = 8 << 20;
+/// The fused KDA decode text (kda_decode.zig: four widths), its pipelines and configs, declared (`kda_kernels` term).
+pub const kda_kernels_bytes: u64 = 4 << 20;
+/// The decode MLP activation text (swiglu.zig: eight launch configs), declared (`swiglu_kernels` term).
+pub const swiglu_kernels_bytes: u64 = 1 << 20;
+/// The fused DSA decode texts (dsa_decode.zig: the split's four widths and MiMo's merge), declared, plus the split's
+/// partials at the decode lane's widest call (pacc f32 [H x 4, 16, 512] and pm / pl), geometric (`dsa_kernels` term).
+pub fn dsaKernelsBytes(c: *const glm.Config) u64 {
+    const rows: u64 = @as(u64, c.n_heads) * @import("dsa_decode.zig").max_rows;
+    return (4 << 20) + rows * @import("dsa_decode.zig").slices * (@import("dsa_decode.zig").latent + 2) * 4;
+}
 
 pub const Plan = struct {
     bill: sdk.MemoryBill,
@@ -106,6 +120,12 @@ pub fn residentBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, c: *cons
     return out;
 }
 
+/// The FP8 prompt route's cache and its wiring (fp8.zig `promptBytes`); 0 under bf16.
+pub fn fp8PromptBytes(c: *const glm.Config, page: u64) u64 {
+    const b = fp8.promptBytes(c, page);
+    return b + wireTables(b);
+}
+
 fn glm_kept(c: *const glm.Config, name: []const u8) bool {
     return graph.keptResident(c, name);
 }
@@ -132,6 +152,14 @@ pub const Inputs = struct {
     combine: prefill_combine.Route = .inplace,
     /// The decode lane's expert route (`settings.DecodeMoe`).
     decode_moe: settings.DecodeMoe = .stock,
+    /// The decode lane's glue (`settings.DecodeGlue`).
+    decode_glue: settings.DecodeGlue = .ops,
+    /// The decode lane's KDA layer (`settings.DecodeKda`).
+    decode_kda: settings.DecodeKda = .ops,
+    /// The decode lane's DSA sparse latent attention (`settings.DecodeDsa`).
+    decode_dsa: settings.DecodeDsa = .ops,
+    /// The decode lane's MLP activation (`settings.DecodeSwiglu`).
+    decode_swiglu: settings.DecodeSwiglu = .ops,
     /// The MTP lane's construction facts (`mtp_lane` on; null: the serial control, none of the lane's terms).
     mtp: ?mtp.Facts = null,
     page: u64 = 16_384,
@@ -219,15 +247,33 @@ pub fn denseRowBytes(c: *const glm.Config) u64 {
 
 /// The prompt pass's wave at its widest call (`t` rows over `keys` keys): the call's stream twice (a layer's input and
 /// its output until the layer's eval), plus the widest stage: P1's predictor over every row, the attention's spans in
-/// flight (KDA's or DSA's, the widest) with the DSA dense prefix, the dense MLP's tiles in flight, or the MoE stage.
+/// flight (KDA's or DSA's, the widest) with the DSA dense prefix, the dense MLP's tiles in flight, the MoE stage, or a
+/// layer's end (prompt lever 5: the tail's inputs, the FFN's output and its two summands with the FFN's collapses, beside
+/// the next routed layer's predictor over every row, committed behind the tail).
 pub fn promptWaveBytes(c: *const glm.Config, t: u64, keys: u64) u64 {
     const s: u64 = @min(t, graph.span_rows);
-    const stream = 2 * t * c.hc_mult * c.hidden_size * bf16;
-    const predictor = t * (moeRowBytes(c) - 2 * @as(u64, c.hidden_size) * bf16);
+    const h: u64 = c.hidden_size;
+    const stream = 2 * t * c.hc_mult * h * bf16;
+    const predictor = t * (moeRowBytes(c) - 2 * h * bf16);
     const attention = @as(u64, graph.spans_in_flight) * s * @max(kdaRowBytes(c), dsaRowBytes(c, keys)) + dsaDenseBytes(c);
-    const dense = @as(u64, graph.spans_in_flight) * @as(u64, @min(t, graph.dense_tile_rows)) * denseRowBytes(c) + t * @as(u64, c.hidden_size) * bf16 * 2;
+    const dense = @as(u64, graph.spans_in_flight) * @as(u64, @min(t, graph.dense_tile_rows)) * denseRowBytes(c) + t * h * bf16 * 2;
     const moe = t * moeRowBytes(c);
-    return stream + @max(@max(predictor, attention), @max(dense, moe));
+    const boundary = t * (3 * h * bf16 + collapseRowBytes(c) + predictorRowBytes(c));
+    return stream + @max(@max(predictor, attention), @max(@max(dense, moe), boundary));
+}
+
+/// One row of a sublayer's collapse (`ops.collapse`): its mixes, the collapsed row, the post and comb gates, the norm.
+pub fn collapseRowBytes(c: *const glm.Config) u64 {
+    const hc: u64 = c.hc_mult;
+    return (2 + hc) * hc * f32b + @as(u64, c.hidden_size) * bf16 + hc * f32b + hc * hc * f32b + @as(u64, c.hidden_size) * bf16;
+}
+
+/// One row of P1's predictor (`graph.predictor`): the collapse, the router's f32 input, logits, sigmoid, biased, negated
+/// and partitioned scores, the top-k and its weights, the top-k compared with every expert id (bool).
+pub fn predictorRowBytes(c: *const glm.Config) u64 {
+    const e: u64 = c.n_routed_experts;
+    const k: u64 = c.n_experts_per_tok;
+    return collapseRowBytes(c) + @as(u64, c.hidden_size) * f32b + 5 * e * f32b + 4 * k * 4 + k * e;
 }
 
 /// The decode wave: a step's graph between two routing barriers (two layers' arrays at one row, the widest layer kind at
@@ -317,6 +363,11 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         .{ .name = "trunk_f32_tables", .bytes = @splat(owned.tables), .at_construction = true },
         .{ .name = "router_f32", .bytes = @splat(owned.routers), .at_construction = true },
         .{ .name = "kv_lanes", .bytes = @splat(kv), .at_construction = true },
+        // `residents_format: fp8_block128`: the prompt route's BF16 weights (fp8.zig `promptBytes`: the widest layer's FP8
+        // set in BF16, geometric over the layers' site shapes; a prompt layer's end releases its set) and their wiring; the
+        // decode phase holds none (the route is closed there). 0 under bf16 (the residents term carries the FP8 codes and
+        // scales by the shards' headers either way).
+        .{ .name = "fp8_prompt_weights", .bytes = .{ fp8PromptBytes(&in.model, in.page), 0 }, .at_construction = false },
         .{ .name = "kda_state", .bytes = @splat(states), .at_construction = false },
         .{ .name = "mlx_cache", .bytes = cache, .at_construction = false },
         .{ .name = "mlx_cache_overshoot", .bytes = overshoot, .at_construction = false },
@@ -419,10 +470,18 @@ fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
         .{ .name = "spec_runtime", .bytes = @splat(@as(u64, mimo_stream.spec_threads) * (2 << 20)), .at_construction = true },
         .{ .name = "predictor_workspace", .bytes = .{ predictorBytes(g, t), predictorBytes(g, experts.decode_lane_rows) }, .at_construction = false },
         .{ .name = "predictor_runtime", .bytes = @splat(16 << 20), .at_construction = false },
-        // `decode_moe: fused`: the NVFP4 decode texts' set (its library, two pipelines per registered instantiation) and
-        // the launches prepared per wave width (decode_kernels.zig `Fused`), declared; its waves' rows are the decode
-        // wave's (`request`). 0 on the stock route.
-        .{ .name = "decode_kernels", .bytes = @splat(if (in.decode_moe == .fused) fused_kernels_bytes else 0), .at_construction = true },
+        // `decode_moe: fused` and `hitpass`: the NVFP4 decode texts' set (its library, two pipelines per registered
+        // instantiation) and the launches prepared per wave width (decode_kernels.zig `Fused`), declared; its waves' rows
+        // are the decode wave's (`request`). 0 on the stock route.
+        .{ .name = "decode_kernels", .bytes = @splat(if (in.decode_moe != .stock) fused_kernels_bytes else 0), .at_construction = true },
+        // `decode_glue: fused`: the glue's texts, pipelines and configs (glue.zig), declared; 0 under `ops`.
+        .{ .name = "glue_kernels", .bytes = @splat(if (in.decode_glue == .fused) glue_kernels_bytes else 0), .at_construction = true },
+        // `decode_kda: fused`: the KDA decode text, declared; 0 under `ops`.
+        .{ .name = "kda_kernels", .bytes = @splat(if (in.decode_kda == .fused) kda_kernels_bytes else 0), .at_construction = true },
+        // `decode_dsa: fused`: the DSA decode texts and the split's partials, declared; 0 under `ops`.
+        .{ .name = "dsa_kernels", .bytes = @splat(if (in.decode_dsa == .fused) dsaKernelsBytes(&in.model) else 0), .at_construction = true },
+        // `decode_swiglu: fused`: the MLP activation text, declared; 0 under `ops`.
+        .{ .name = "swiglu_kernels", .bytes = @splat(if (in.decode_swiglu == .fused) swiglu_kernels_bytes else 0), .at_construction = true },
         .{ .name = "slot_wiring", .bytes = @splat(0), .at_construction = false, .with_rows = true },
     };
     return .{
@@ -464,6 +523,10 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .reserve = reserve,
         .combine = experts.combineRoute(),
         .decode_moe = cfg.decode_moe,
+        .decode_glue = cfg.decode_glue,
+        .decode_kda = cfg.decode_kda,
+        .decode_dsa = cfg.decode_dsa,
+        .decode_swiglu = cfg.decode_swiglu,
         .mtp = lane,
         .page = page,
     };
@@ -569,6 +632,46 @@ test "glm5_next bill: the terms sum to the bill, the slot wiring is the one row 
     defer bf.free(a);
     try testing.expectEqual(b.fixed(.prompt) + fused_kernels_bytes, bf.fixed(.prompt));
     try testing.expectEqual(b.fixed(.decode) + fused_kernels_bytes, bf.fixed(.decode));
+    // The FP8 residents' prompt route: its BF16 weights in the prompt phase only (0 under bf16).
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(b, "fp8_prompt_weights"));
+    var fp8_in = in;
+    fp8_in.model = fp8.fullSet(in.model);
+    const b8 = try billOf(a, &fp8_in);
+    defer b8.free(a);
+    const want8 = fp8PromptBytes(&fp8_in.model, fp8_in.page);
+    // The widest layer's FP8 set in BF16 (fp8.zig `promptBytes`: layers 0-2, 573,046,784 B) and its wiring.
+    try testing.expectEqual(@as(u64, 573_046_784) + wireTables(573_046_784), want8);
+    try testing.expectEqual([2]u64{ want8, 0 }, termOf(b8, "fp8_prompt_weights"));
+    try testing.expectEqual(b.fixed(.prompt) + want8, b8.fixed(.prompt));
+    try testing.expectEqual(b.fixed(.decode), b8.fixed(.decode));
+    // hitpass binds the same texts: the same term.
+    fused_in.decode_moe = .hitpass;
+    const bh = try billOf(a, &fused_in);
+    defer bh.free(a);
+    try testing.expectEqual(bf.fixed(.prompt), bh.fixed(.prompt));
+    try testing.expectEqual(bf.fixed(.decode), bh.fixed(.decode));
+    // The fused glue adds its declared texts (a construction term, both phases); 0 under ops.
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(b, "glue_kernels"));
+    var glue_in = in;
+    glue_in.decode_glue = .fused;
+    const bg = try billOf(a, &glue_in);
+    defer bg.free(a);
+    try testing.expectEqual(b.fixed(.prompt) + glue_kernels_bytes, bg.fixed(.prompt));
+    try testing.expectEqual(b.fixed(.decode) + glue_kernels_bytes, bg.fixed(.decode));
+    // The fused KDA text likewise; 0 under ops.
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(b, "kda_kernels"));
+    var kda_in = in;
+    kda_in.decode_kda = .fused;
+    const bk = try billOf(a, &kda_in);
+    defer bk.free(a);
+    try testing.expectEqual(b.fixed(.prompt) + kda_kernels_bytes, bk.fixed(.prompt));
+    // The fused DSA texts and their partials likewise; 0 under ops.
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(b, "dsa_kernels"));
+    var dsa_in = in;
+    dsa_in.decode_dsa = .fused;
+    const bd = try billOf(a, &dsa_in);
+    defer bd.free(a);
+    try testing.expectEqual(b.fixed(.decode) + (4 << 20) + 64 * 4 * 16 * 514 * 4, bd.fixed(.decode));
     const target = box_ceiling - box_stop;
     const rows = try sdk.fill(b, 12_600_000_000, target, 288, min_rows);
     try testing.expect(rows.prompt >= min_rows and rows.prompt <= rows.decode and rows.decode <= 288);
@@ -607,6 +710,18 @@ test "glm5_next bill: the MTP lane adds its terms, the verify's rows on the deco
         try testing.expect(termOf(on, "request_wiring")[ph] > termOf(off, "request_wiring")[ph]);
         try testing.expectEqual(termOf(off, "buffer_allowance")[ph] + wire_buffer_bytes * laneBuffers(&in.model), termOf(on, "buffer_allowance")[ph]);
     }
+}
+
+test "glm5_next bill: prompt lever 5's layer end (the tail's inputs beside the next routed layer's predictor) stays under the attention stage at every call width: the prompt wave is unchanged" {
+    const c: glm.Config = .{};
+    for ([_]u64{ 1, 5, 512, 1024, 2048, 4096, 8192, 16_384 }) |t| for ([_]u64{ 16_384, 32_768, 1 << 20 }) |keys| {
+        const s: u64 = @min(t, graph.span_rows);
+        const attention = @as(u64, graph.spans_in_flight) * s * @max(kdaRowBytes(&c), dsaRowBytes(&c, keys)) + dsaDenseBytes(&c);
+        const boundary = t * (3 * @as(u64, c.hidden_size) * bf16 + collapseRowBytes(&c) + predictorRowBytes(&c));
+        try testing.expect(boundary < attention);
+        // The predictor's own row (the stage before lever 5 billed it as the MoE row less its output) still covers it.
+        try testing.expect(predictorRowBytes(&c) <= moeRowBytes(&c) - 2 * @as(u64, c.hidden_size) * bf16);
+    };
 }
 
 test "glm5_next bill: every term is non-decreasing in the billed context (the ladder bounds a rung by the next printed table)" {

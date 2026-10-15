@@ -632,3 +632,46 @@ test "glm5_next mtp: the lane's device code compiles against the arch's seams (d
     std.testing.refAllDecls(mtp.DraftBank);
     try noDevice();
 }
+
+/// The bytes of the arrays the lane's open allocates (`Lane.open`: the bank's nine [experts, ...], the head's f32 router
+/// [hidden, experts], pool gate [hidden, index_head_dim] and ape [kpool, index_head_dim], the two bf16 lanes at the
+/// positions plus a round's drafts), from their shapes and dtypes.
+fn openArrayBytes(g: *const bank.Geometry, c: *const glm.Config, positions: u64) [bank.n_components + 5]u64 {
+    var out: [bank.n_components + 5]u64 = undefined;
+    for (g.segments, out[0..bank.n_components]) |s, *o| o.* = @as(u64, g.num_experts) * s.length;
+    const h: u64 = c.hidden_size;
+    const ihd: u64 = c.index_head_dim;
+    const lanes = positions + mtp.max_depth;
+    out[bank.n_components..].* = .{ h * c.n_routed_experts * 4, h * ihd * 4, @as(u64, c.index_kpool) * ihd * 4, lanes * c.kv_lora_rank * 2, lanes * 2 * ihd * 2 };
+    return out;
+}
+
+test "glm5_next mtp hold: what the open's arrays hold equals the bill's mtp_bank + mtp_tables + mtp_kv by construction (the pack's geometry with GLM5_BANK); a hold over the bill is refused by name" {
+    const page: u64 = 16_384;
+    // The served model's MTP layer over a bank of its geometry (288 experts at Flash's projections).
+    const c: glm.Config = .{};
+    const g = try bank.Geometry.init(c.hidden_size, c.moe_intermediate_size, c.n_routed_experts, c.n_layers, 1);
+    for ([_]u64{ 17_408, 32_768, 1_048_576 }) |positions| {
+        const arrays = openArrayBytes(&g, &c, positions);
+        const held = mtp.heldOf(&arrays, page);
+        try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page), held);
+        const f: mtp.Facts = .{ .bank_bytes = mtp.DraftBank.arrayBytes(&g, page), .resident_bytes = 0, .table_bytes = mtp.Head.tableBytes(&c, page) };
+        const t = mtp.terms(f, &c, positions, page);
+        try testing.expectEqual(t[0].bytes[0] + t[2].bytes[0] + t[3].bytes[0], held);
+        try mtp.holdCheck(held, held);
+        try testing.expectError(error.ConstructionOverBill, mtp.holdCheck(held + 4, held));
+    }
+    // The window's 32,768-position load billed 4,134,049,152 B for the pack: the hold is exactly that.
+    try testing.expectEqual(@as(u64, 4_134_049_152), mtp.heldOf(&openArrayBytes(&g, &c, 32_768), page));
+    // The pack's own manifest, when given: its geometry is the served model's.
+    const dir = std.mem.span(std.c.getenv("GLM5_BANK") orelse return);
+    const a = testing.allocator;
+    const io = testing.io;
+    const pc = try packConfig(a, io, dir);
+    var diag: sdk.Diag = .{};
+    var db = try mtp.DraftBank.open(a, io, dir, &pc, &diag);
+    defer db.deinit();
+    const facts = try mtp.facts(a, io, dir, &pc, page, &diag);
+    const t = mtp.terms(facts, &pc, 32_768, page);
+    try testing.expectEqual(mtp.heldOf(&openArrayBytes(&db.owner.geometry, &pc, 32_768), page), t[0].bytes[0] + t[2].bytes[0] + t[3].bytes[0]);
+}

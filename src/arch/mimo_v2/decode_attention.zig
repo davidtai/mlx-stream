@@ -20,6 +20,8 @@
 //! construction.
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const mimo = @import("config.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
@@ -142,7 +144,7 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         for ([_]Kernel{ k.split, k.merge, k.window }) |x| if (x.ctx != null) {
-            _ = mlx.mlx_fast_metal_kernel_free(x);
+            _ = mtl.mlx_fast_metal_kernel_free(x);
         };
         drop(k.scl);
         k.* = .{};
@@ -155,7 +157,7 @@ fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:
     const out_vec = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     // K/V are cache views: read through their strides, never copied (ensure_row_contiguous = false).
-    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, false, false);
+    const k = mtl.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, false, false);
     if (k.ctx == null) return error.MimoDecodeAttentionKernel;
     return k;
 }
@@ -223,7 +225,7 @@ pub fn split(r: *const Route, q: Array, k: Array, v: Array, s: Stream) !Array {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, vd, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", .bfloat16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "BDV", vd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, ks.merge, parts, c, s));
+        try mlx.check(mtl.mlx_fast_metal_kernel_apply(&outs, ks.merge, parts, c, s));
     }
     var out: Array = .{};
     errdefer drop(out);
@@ -257,7 +259,7 @@ pub fn splitPartials(r: *const Route, q: Array, k: Array, v: Array, s: Stream) !
         const ins = [_]Array{ q, k, v, ks.scl };
         const in_vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&parts, ks.split, in_vec, c, s));
+        try mlx.check(mtl.mlx_fast_metal_kernel_apply(&parts, ks.split, in_vec, c, s));
     }
     return parts;
 }
@@ -288,7 +290,7 @@ pub fn windowed(r: *const Route, q: Array, k: Array, v: Array, sinks: Array, s: 
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, ks.window, in_vec, c, s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&outs, ks.window, in_vec, c, s));
     var out: Array = .{};
     errdefer drop(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outs, 0));

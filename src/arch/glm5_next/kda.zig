@@ -13,8 +13,11 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const ops_be = @import("../deepseek_v41/ops.zig");
 const glm = @import("config.zig");
+const fp8 = @import("fp8.zig");
 const kda_percore = @import("kda_percore.zig");
 
 comptime {
@@ -25,18 +28,20 @@ comptime {
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
 
-/// One KDA layer's residents (the pack's BF16 projections, `x @ w^T`), with the f32 tables its gate reads.
+/// One KDA layer's residents (the pack's projections, `x @ w^T`: BF16, or under `residents_format: fp8_block128` the
+/// FP8 route's, fp8.zig), with the f32 tables its gate reads.
 pub const Weights = struct {
-    q: T,
-    k: T,
-    v: T,
-    /// The forget gate's low-rank stages [rank, hidden] and [hv * dk, rank]; the output gate's alike.
-    f_a: T,
+    q: fp8.Linear,
+    k: fp8.Linear,
+    v: fp8.Linear,
+    /// The forget gate's low-rank stages [rank, hidden] and [hv * dk, rank]; the output gate's alike (the second stages
+    /// BF16 in either format: K = 128).
+    f_a: fp8.Linear,
     f_b: T,
-    g_a: T,
+    g_a: fp8.Linear,
     g_b: T,
     /// beta's projection [heads, hidden].
-    b: T,
+    b: fp8.Linear,
     /// f32 [hv]: A_log as its own F32 table, converted once at bind (the pack stores F32 or BF16 by layer); the per-core
     /// kernel takes exp(A_log) of it itself.
     a_log: T,
@@ -46,9 +51,11 @@ pub const Weights = struct {
     dt_bias: T,
     /// f32 [conv dim, taps, 1]: the depthwise conv in MLX's layout.
     conv_w: T,
+    /// The pack's BF16 conv weight [conv dim, 1, taps] as stored (the fused decode text reads it: kda_decode.zig).
+    conv_raw: T,
     /// [dv]: the output RMSNorm's weight, per head.
     o_norm: T,
-    o: T,
+    o: fp8.Linear,
 };
 
 /// One request's state of a KDA layer: the conv's last `taps - 1` inputs [1, taps - 1, conv dim] (f32, as the conv
@@ -63,7 +70,7 @@ pub const State = struct {
         st.* = .{};
     }
 
-    fn set(st: *State, g: *G, conv: T, rec: T) void {
+    pub fn set(st: *State, g: *G, conv: T, rec: T) void {
         st.reset(g);
         st.conv = g.keep(conv);
         st.rec = g.keep(rec);
@@ -111,6 +118,17 @@ pub fn forward(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State)
     return forwardWith(g, c, w, x, st, false, {});
 }
 
+/// The decode lane's KDA layer, bound at construction (`settings.decode_kda`): the op chain (`forward`, the control) or
+/// the fused text (kda_decode.zig `run` over its installed kernels, `ctx`). Same contract as `forward`.
+pub const Step = struct {
+    ctx: ?*const anyopaque = null,
+    run: *const fn (ctx: ?*const anyopaque, g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State) anyerror!T = forwardOps,
+};
+
+fn forwardOps(_: ?*const anyopaque, g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State) anyerror!T {
+    return forward(g, c, w, x, st);
+}
+
 /// `forward` with every row's state captured into `cap` (the MTP verify's rows: `restore` rolls back to any of them).
 /// Its own comptime instance: the serial forward's code carries no capture branch.
 pub fn forwardCapture(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State, cap: *Capture) !T {
@@ -142,7 +160,7 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
     const cdim: c_int = 3 * dim;
     const taps: c_int = @intCast(c.kda_conv);
     // The short conv over [q | k | v], f32, its window the state's tail then the rows.
-    const qkv = try g.astype(try g.concat(&.{ try linear(g, x, w.q), try linear(g, x, w.k), try linear(g, x, w.v) }, 2), .float32);
+    const qkv = try g.astype(try g.concat(&.{ try fp8.project(g, w.q, x), try fp8.project(g, w.k, x), try fp8.project(g, w.v, x) }, 2), .float32);
     const tail = st.conv orelse try g.zeros(&.{ 1, taps - 1, cdim }, .float32);
     const window = try g.concat(&.{ tail, qkv }, 1);
     var conv_raw = mlx.mlx_array_new();
@@ -160,8 +178,8 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
     const qs = try g.mul(try rmsNormOnes(g, q, ones, 1e-6), try g.scalar(inv_dk, .bfloat16));
     const ks = try g.mul(try rmsNormOnes(g, k, ones, 1e-6), try g.scalar(@sqrt(inv_dk), .bfloat16));
     // The forget gate's pre-activation per key channel (each route makes the gate of it), beta, the state.
-    const a = try linear(g, try linear(g, x, w.f_a), w.f_b);
-    const beta = try g.sigmoid(try linear(g, x, w.b));
+    const a = try linear(g, try fp8.project(g, w.f_a, x), w.f_b);
+    const beta = try g.sigmoid(try fp8.project(g, w.b, x));
     const state = st.rec orelse try g.zeros(&.{ 1, hv, dk, dk }, .float32);
     const r = if (capture) blk: {
         // The MTP verify's rows: the stock kernel's capture variant over the f32 gate.
@@ -175,12 +193,12 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
         break :blk try route(g, c, w, qs, ks, v, a, beta, state);
     };
     // The gated RMSNorm: rms_norm(y) per head (o_norm) times sigmoid(g_b(g_a(x))).
-    const z = try g.reshape(try linear(g, try linear(g, x, w.g_a), w.g_b), &head4);
+    const z = try g.reshape(try linear(g, try fp8.project(g, w.g_a, x), w.g_b), &head4);
     var yn = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_rms_norm(&yn, r.y, w.o_norm, c.rms_norm_eps, g.s));
     const gated = try g.mul(try g.adopt(yn), try g.sigmoid(z));
     st.set(g, next_tail, r.state);
-    return linear(g, try g.reshape(gated, &.{ 1, rows, dim }), w.o);
+    return fp8.project(g, w.o, try g.reshape(gated, &.{ 1, rows, dim }));
 }
 
 pub const Recur = struct { y: T, state: T };
@@ -221,7 +239,7 @@ fn recurSeqKernel() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("glm5_next_gated_delta_vec_seq", iv, ov, recur_seq_source, "", true, false);
+    const k = mtl.mlx_fast_metal_kernel_new("glm5_next_gated_delta_vec_seq", iv, ov, recur_seq_source, "", true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     seq_kernel = k;
     return k;
@@ -253,7 +271,7 @@ fn recurSeq(g: *G, q: T, k: T, v: T, gate: T, beta: T, state: T, rows: c_int, hv
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
     var outs: [3]T = undefined;
     for (&outs, 0..) |*o, i| {
         var x = mlx.mlx_array_new();
@@ -271,7 +289,7 @@ fn recurKernel() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("glm5_next_gated_delta_vec", iv, ov, recur_source, "", true, false);
+    const k = mtl.mlx_fast_metal_kernel_new("glm5_next_gated_delta_vec", iv, ov, recur_source, "", true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     kernel = k;
     return k;
@@ -299,7 +317,7 @@ fn recur(g: *G, q: T, k: T, v: T, gate: T, beta: T, state: T, rows: c_int, hv: c
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, g.s));
     var y = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
     const yt = try g.adopt(y);

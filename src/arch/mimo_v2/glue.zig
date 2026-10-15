@@ -12,6 +12,8 @@
 //! control and the default) and runs the decode lane (`Source.decodeLaneAt`: M = 1, or M <= 4 in the decode phase).
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const mimo = @import("config.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
@@ -91,7 +93,7 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         for ([_]Kernel{ k.norm, k.addnorm, k.addnorm32, k.router1, k.top8 }) |x| if (x.ctx != null) {
-            _ = mlx.mlx_fast_metal_kernel_free(x);
+            _ = mtl.mlx_fast_metal_kernel_free(x);
         };
         k.* = .{};
     }
@@ -103,7 +105,7 @@ fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:
     const out_vec = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     // Inputs are the trunk's fresh row-major arrays; a view would be copied first (ensure_row_contiguous).
-    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, texts.header, true, false);
+    const k = mtl.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, texts.header, true, false);
     if (k.ctx == null) return error.MimoGlueKernel;
     return k;
 }
@@ -140,7 +142,7 @@ pub const RouterRows = struct {
         for (r.configs) |cfg| if (cfg.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         };
-        if (r.kernel.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(r.kernel);
+        if (r.kernel.ctx != null) _ = mtl.mlx_fast_metal_kernel_free(r.kernel);
         r.* = .{};
     }
 
@@ -152,7 +154,7 @@ pub const RouterRows = struct {
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var res = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(res);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, r.kernel, in_vec, r.configs[m - 1], s));
+        try mlx.check(mtl.mlx_fast_metal_kernel_apply(&res, r.kernel, in_vec, r.configs[m - 1], s));
         var out: Array = .{};
         try mlx.check(mlx.mlx_vector_array_get(&out, res, 0));
         return out;
@@ -173,7 +175,7 @@ fn apply(k: Kernel, ins: []const Array, outs_spec: []const Out, groups: c_int, t
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var res = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(res);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, k, in_vec, c, s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&res, k, in_vec, c, s));
     var got: usize = 0;
     errdefer for (outs[0..got]) |o| drop(o);
     for (outs) |*o| {
