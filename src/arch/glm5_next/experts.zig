@@ -152,7 +152,7 @@ pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemo
 /// null on the NVFP4 family), so one line names the experts' whole decode install.
 pub fn missReadsLine(buf: []u8, miss_reads: settings.MissReads, block: u64, preread: bool, layers: u32, experts: u32, record_bytes: u64, forms: ?settings.Exl3Forms) []const u8 {
     var fb: [96]u8 = undefined;
-    const f = if (forms) |x| std.fmt.bufPrint(&fb, "gateup={s} down={s} maxm={d} min_p={d}", .{ @tagName(x.gateup), @tagName(x.down), x.maxm, x.min_p }) catch "" else "-";
+    const f = if (forms) |x| std.fmt.bufPrint(&fb, "gateup={s} down={s}", .{ @tagName(x.gateup), @tagName(x.down) }) catch "" else "-";
     return std.fmt.bufPrint(buf, "glm5_next experts: miss_reads={s} block={d} preread={s} records={d}x{d}x{d}B forms {s} ({s})", .{
         @tagName(miss_reads), block, if (preread) "on" else "off", layers, experts, record_bytes, f,
         if (miss_reads == .direct) "demand ranges preadv straight into the slot rows, no staging copy; ranges and rows checked on the block" else "demand ranges through the staging buffer and the copy",
@@ -390,7 +390,7 @@ pub fn SourceOf(comptime fam: Family) type {
             if (comptime fam == .exl3) {
                 log.info("glm5_next experts: exl3 k3 mul1 routes (decode_moe={s}: DeepSeek-V4.1's banked PREP=rin chain at hidden {d} / inter {d}, in_rin + gate/up mul1h GEMVs + gu_epi + din_rin + down mul1h GEMV + dpost(bf16), one launch each per wave over the three banks{s}; prompt: DIG-X waves of <= {d} rows / {d} experts, take2 + gate|up GEMM (m128) + onepass + down GEMM (m128) + rot_widen1(bf16); bank {d} x {d} records of {d} B, codebook mul1 0x{X}, no global-scale word: scale-line isolation not applicable; the NVFP4 draft bank unchanged)\n", .{ @tagName(decode_moe), exl3_kernels.hidden, exl3_kernels.inter, if (decode_moe == .hitpass) ", each call's hit wave from the layer's resident slot LUT" else if (decode_moe == .stock) ", unbanked: one group per bank" else "", prompt.wave_rows, @import("../../exl3/quant.zig").wave_max, geo.num_moe_layers, geo.num_experts, geo.record_bytes, exl3_kernels.codebook_multiplier });
                 // The decode forms bound at Math.init (`exl3_gateup_form` / `exl3_down_form`; seam = lane B's chain above).
-                log.info("glm5_next experts: exl3 k3 forms gateup={s} down={s} maxm={d} min_p={d}\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down), exl3_forms.maxm, exl3_forms.min_p });
+                log.info("glm5_next experts: exl3 k3 forms gateup={s} down={s}\n", .{ @tagName(exl3_forms.gateup), @tagName(exl3_forms.down) });
             }
             // The demand reads' route as the stream installed it (`miss_reads`): its block, read back from the stream.
             {
@@ -695,8 +695,8 @@ test "glm5_next experts: miss_reads: staged keeps the pool's staging route and t
     try testing.expectEqualDeep(staged, same);
     var buf: [320]u8 = undefined;
     const forms: settings.Exl3Forms = .{ .gateup = .guone, .down = .pair };
-    try testing.expectEqualStrings("glm5_next experts: miss_reads=direct block=4096 preread=off records=42x288x9474048B forms gateup=guone down=pair maxm=1 min_p=1 (demand ranges preadv straight into the slot rows, no staging copy; ranges and rows checked on the block)", missReadsLine(&buf, .direct, 4096, false, 42, 288, 9_474_048, forms));
-    try testing.expectEqualStrings("glm5_next experts: miss_reads=staged block=0 preread=on records=42x288x9474048B forms gateup=guone down=pair maxm=1 min_p=1 (demand ranges through the staging buffer and the copy)", missReadsLine(&buf, .staged, 0, true, 42, 288, 9_474_048, forms));
+    try testing.expectEqualStrings("glm5_next experts: miss_reads=direct block=4096 preread=off records=42x288x9474048B forms gateup=guone down=pair (demand ranges preadv straight into the slot rows, no staging copy; ranges and rows checked on the block)", missReadsLine(&buf, .direct, 4096, false, 42, 288, 9_474_048, forms));
+    try testing.expectEqualStrings("glm5_next experts: miss_reads=staged block=0 preread=on records=42x288x9474048B forms gateup=guone down=pair (demand ranges through the staging buffer and the copy)", missReadsLine(&buf, .staged, 0, true, 42, 288, 9_474_048, forms));
     try testing.expectEqualStrings("glm5_next experts: miss_reads=staged block=0 preread=on records=42x288x9474048B forms - (demand ranges through the staging buffer and the copy)", missReadsLine(&buf, .staged, 0, true, 42, 288, 9_474_048, null));
 }
 

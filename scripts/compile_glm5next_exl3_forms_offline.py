@@ -42,19 +42,6 @@ def banks(prefix, mk):
 
 # (name, file, header files, inputs, outputs, template instances [[(name, int|dtype)]])
 KERNELS = [
-    ("g5k3_gu_fused", FDIR, ["header_g5k3.metal"],
-     [vec("xg", "float32", HID, "P"), vec("xu", "float32", HID, "P"), IDS] + banks("code_g", code) + banks("code_u", code)
-     + banks("og", lambda n: vec(n, "float16", INTER)) + banks("ou", lambda n: vec(n, "float16", INTER)),
-     [("out", "float32")],
-     [[("IT", GU[0]), ("OT", GU[1]), ("GUL", gul), ("MAXM", mm)] for gul in (0, 1) for mm in (1, 4)]),
-    ("g5k3_dn_fused", FDIR, ["header_g5k3.metal"],
-     [vec("xd", "float32", INTER, "P"), IDS] + banks("cd", code) + banks("rd", lambda n: vec(n, "float16", HID)),
-     [("out", None)],
-     [[("IT", DN[0]), ("OT", DN[1]), ("NB", nb), ("MAXM", mm), ("T", t)] for nb in (1, 2) for mm in (1, 4) for t in ("bfloat16", "float32")]),
-    ("g5k3_dn_pro", FDIR, ["header_g5k3.metal"],
-     [vec("h", "float32", INTER, "P"), IDS] + banks("cd", code) + banks("rn", lambda n: vec(n, "float16", INTER)) + banks("rd", lambda n: vec(n, "float16", HID)),
-     [("out", None)],
-     [[("IT", DN[0]), ("OT", DN[1]), ("NB", nb), ("MAXM", 1), ("T", t)] for nb in (1, 2) for t in ("bfloat16", "float32")]),
     ("g5k3_guone", FDIR, [],
      [vec("xh_g", "float32", HID, "P"), vec("xh_u", "float32", HID, "P"), IDS] + banks("code_g", code) + banks("code_u", code),
      [("out_g", "float32"), ("out_u", "float32")], [[("IT", GU[0]), ("OT", GU[1])]]),

@@ -2,8 +2,7 @@
 //! (`exl3_kbench.zig`): synthetic records in the pack's layout, the EXL3 decode (exl3/kernels.zig `reconstruct`,
 //! mul1), the f64 expert forward of exl3_ref.py (y = t128(t128(x suh) W_hat) svh, t128 the natural-order Sylvester
 //! Hadamard over 128-blocks scaled 1/sqrt(128); the clamped SwiGLU at 10), an f32 emulation of the seam chain's
-//! arithmetic per output word (the order every form keeps), the union rule of the fused forms, and their column-sum
-//! identity. CPU only: nothing here creates an MLX array.
+//! arithmetic per output word (the order every form keeps). CPU only: nothing here creates an MLX array.
 //! The CPU tests pin this module to exl3_ref.py (testdata/exl3-ref, written by scripts/glm5next_exl3_ref_fixture.py).
 
 const std = @import("std");
@@ -259,25 +258,9 @@ pub fn emuButterfly(B: *[128]f32) void {
     }
 }
 
-/// A GEMV tile's column sums: `stock` the threadgroup red array (the seam's, gu_one's, down_pair's and the u8 GEMV's),
-/// `registers` the fused forms' g5k3_colsum (g5k3_gu_fused, g5k3_dn_fused, g5k3_dn_pro).
-pub const ColSum = enum { stock, registers };
-
-pub fn colsumOf(kind: ColSum, acc: *const [32][8]f32, z: *[16]f32) void {
-    switch (kind) {
-        .stock => colsumStock(acc, z),
-        .registers => colsumRegisters(acc, z),
-    }
-}
-
 /// The stock GEMV (glm5n_exl3_gemv) of output tile tn: per lane l and weight m an fma chain over the k-tiles, then
 /// red[c][l] = 0 + acc[4..7] (c = l >> 2) / 0 + acc[0..3] (c = l / 4 + 8), column c = 0 + red[c][0..31] in lane order.
 pub fn emuGemvTile(xh: []const f32, w: []const u16, in: u32, out: u32, tn: u32, z: *[16]f32) void {
-    emuGemvTileSum(xh, w, in, out, tn, .stock, z);
-}
-
-/// `emuGemvTile` with the column sums of `sum` (the per-lane fma chains are every form's).
-pub fn emuGemvTileSum(xh: []const f32, w: []const u16, in: u32, out: u32, tn: u32, sum: ColSum, z: *[16]f32) void {
     var accs: [32][8]f32 = undefined;
     for (0..32) |li| {
         const l: u32 = @intCast(li);
@@ -294,33 +277,10 @@ pub fn emuGemvTileSum(xh: []const f32, w: []const u16, in: u32, out: u32, tn: u3
         }
         accs[li] = acc;
     }
-    colsumOf(sum, &accs, z);
+    colsumStock(&accs, z);
 }
 
-/// The fused forms' column sums (header_g5k3.metal g5k3_colsum): column c = 0 + the four lanes' partials in lane order.
-pub fn colsumRegisters(acc: *const [32][8]f32, z: *[16]f32) void {
-    for (0..16) |c| {
-        const b = (c & 7) * 4;
-        var s: f32 = 0;
-        for (0..4) |k| {
-            const l = b + k;
-            var hi: f32 = 0;
-            hi += acc[l][4];
-            hi += acc[l][5];
-            hi += acc[l][6];
-            hi += acc[l][7];
-            var lo: f32 = 0;
-            lo += acc[l][0];
-            lo += acc[l][1];
-            lo += acc[l][2];
-            lo += acc[l][3];
-            s += if (c < 8) hi else lo;
-        }
-        z[c] = s;
-    }
-}
-
-/// The stock column sums from per-lane accumulators (the threadgroup red array), for the identity test.
+/// The stock column sums from per-lane accumulators (the threadgroup red array).
 pub fn colsumStock(acc: *const [32][8]f32, z: *[16]f32) void {
     var red: [16][32]f32 = @splat(@splat(0));
     for (0..32) |l| for (0..8) |m| {
@@ -337,11 +297,6 @@ pub fn colsumStock(acc: *const [32][8]f32, z: *[16]f32) void {
 /// The seam chain of one pair in f32 (std exp for gu_epi's): x [hidden] (bf16 values) -> h [inter] f32, and the down
 /// output words of hidden blocks [blk_lo, blk_hi) (f32, before dpost's store rounding).
 pub fn emuExpert(a: std.mem.Allocator, e: *const Expert, x: []const f32, h: []f32, y: []f32, blk_lo: u32, blk_hi: u32) !void {
-    return emuExpertSums(a, e, x, h, y, blk_lo, blk_hi, .stock, .stock);
-}
-
-/// `emuExpert` with the gate / up GEMVs' column sums `gu` and the down GEMV's `dn`.
-pub fn emuExpertSums(a: std.mem.Allocator, e: *const Expert, x: []const f32, h: []f32, y: []f32, blk_lo: u32, blk_hi: u32, gu: ColSum, dn: ColSum) !void {
     const xg = try a.alloc(f32, hidden);
     defer a.free(xg);
     const xu = try a.alloc(f32, hidden);
@@ -355,8 +310,8 @@ pub fn emuExpertSums(a: std.mem.Allocator, e: *const Expert, x: []const f32, h: 
         var bg: [128]f32 = undefined;
         var bu: [128]f32 = undefined;
         for (0..8) |t| {
-            emuGemvTileSum(xg, e.wg, hidden, inter, blk * 8 + @as(u32, @intCast(t)), gu, bg[t * 16 ..][0..16]);
-            emuGemvTileSum(xu, e.wu, hidden, inter, blk * 8 + @as(u32, @intCast(t)), gu, bu[t * 16 ..][0..16]);
+            emuGemvTile(xg, e.wg, hidden, inter, blk * 8 + @as(u32, @intCast(t)), bg[t * 16 ..][0..16]);
+            emuGemvTile(xu, e.wu, hidden, inter, blk * 8 + @as(u32, @intCast(t)), bu[t * 16 ..][0..16]);
         }
         emuButterfly(&bg);
         emuButterfly(&bu);
@@ -381,53 +336,11 @@ pub fn emuExpertSums(a: std.mem.Allocator, e: *const Expert, x: []const f32, h: 
     var hb = blk_lo;
     while (hb < blk_hi) : (hb += 1) {
         var bd: [128]f32 = undefined;
-        for (0..8) |t| emuGemvTileSum(xd, e.wd, inter, hidden, hb * 8 + @as(u32, @intCast(t)), dn, bd[t * 16 ..][0..16]);
+        for (0..8) |t| emuGemvTile(xd, e.wd, inter, hidden, hb * 8 + @as(u32, @intCast(t)), bd[t * 16 ..][0..16]);
         emuButterfly(&bd);
         for (0..128) |c| y[hb * 128 + c] = (bd[c] * SCALE) * @as(f32, @floatCast(h16(od[hb * 128 + c])));
     }
 }
-
-// ── The union rule of the fused forms (header_g5k3.metal g5k3_members) ──
-
-/// Pair e's members (itself and the next maxm - 1 pairs naming its slot, in pair order) when its rank among them is a
-/// multiple of maxm; 0 otherwise.
-pub fn members(ids: []const u32, e: usize, maxm: u32, mem: []u32) u32 {
-    if (maxm == 1) {
-        mem[0] = @intCast(e);
-        return 1;
-    }
-    var rank: u32 = 0;
-    for (ids[0..e]) |v| rank += @intFromBool(v == ids[e]);
-    if (rank % maxm != 0) return 0;
-    var n: u32 = 0;
-    for (ids[e..], e..) |v, j| {
-        if (n == maxm) break;
-        if (v == ids[e]) {
-            mem[n] = @intCast(j);
-            n += 1;
-        }
-    }
-    return n;
-}
-
-/// Case `it` of the column-sum identity's 2,000 (the CPU test's generator, the forms' parity test reuses it): random
-/// accumulators with signed zeros, small integers (cancellation) and values over 2^-15 .. 2^16; every fifth case all -0.
-pub fn colsumCase(s: *u64, it: usize, acc: *[32][8]f32) void {
-    for (acc) |*row| for (row) |*v| {
-        const z = ek.splitmix64(s);
-        v.* = switch (z % 7) {
-            0 => -0.0,
-            1 => 0.0,
-            2 => @as(f32, @floatFromInt(@as(i32, @intCast(z >> 40 & 0xff)) - 128)),
-            else => @as(f32, @floatCast((unit(z) - 0.5) * std.math.pow(f64, 2.0, @as(f64, @floatFromInt(@as(i32, @intCast(z >> 56 & 31)) - 15))))),
-        };
-    };
-    if (it % 5 == 0) for (acc) |*row| for (row) |*v| {
-        v.* = -0.0;
-    };
-}
-
-pub const colsum_cases: usize = 2000;
 
 // ── Tests ──
 
@@ -485,47 +398,6 @@ test "glm5_next exl3 ref: decode and forward equal exl3_ref.py on the fixture ex
         f32File(@embedFile(dir ++ "h_mul1.f32"), &rh);
         try testing.expect(maxErrOverRms(h, &rh) < 1e-6);
     }
-}
-
-test "glm5_next exl3 ref: the fused forms' register column sums equal the stock threadgroup sums bit for bit (signed zeros, cancellation, random)" {
-    var s: u64 = 7;
-    var acc: [32][8]f32 = undefined;
-    for (0..colsum_cases) |it| {
-        colsumCase(&s, it, &acc);
-        var p: [16]f32 = undefined;
-        var q: [16]f32 = undefined;
-        colsumStock(&acc, &p);
-        colsumRegisters(&acc, &q);
-        for (p, q) |x, y| try testing.expectEqual(@as(u32, @bitCast(x)), @as(u32, @bitCast(y)));
-    }
-}
-
-test "glm5_next exl3 ref: the union rule covers every pair of a wave exactly once (P 1..64, slot repeats up to 9, hits and misses mixed, all one bank)" {
-    var s: u64 = 11;
-    var ids: [64]u32 = undefined;
-    var mem: [4]u32 = undefined;
-    for (1..65) |p| for (0..20) |pat| {
-        for (ids[0..p], 0..) |*v, i| {
-            const z = ek.splitmix64(&s);
-            v.* = switch (pat % 4) {
-                0 => @intCast(i), // all distinct
-                1 => @as(u32, @intCast(z % 3)), // heavy repeats
-                2 => (@as(u32, @intCast(z % 3)) << 24) | @as(u32, @intCast(z % 7)), // three banks
-                else => (2 << 24) | @as(u32, @intCast(z % 10)), // a transient part only (0 hits)
-            };
-        }
-        for ([_]u32{ 1, 4 }) |maxm| {
-            var seen: [64]u8 = @splat(0);
-            for (0..p) |e| {
-                const n = members(ids[0..p], e, maxm, &mem);
-                for (mem[0..n]) |m| {
-                    try testing.expectEqual(ids[e], ids[m]);
-                    seen[m] += 1;
-                }
-            }
-            for (seen[0..p]) |c| try testing.expectEqual(@as(u8, 1), c);
-        }
-    };
 }
 
 test "glm5_next exl3 ref: the seam chain's f32 arithmetic meets DeepSeek-V4.1's 1e-4 against the f64 truth at GLM's shape (waves of M = 1..3 tokens: hits only, misses only, mixed)" {

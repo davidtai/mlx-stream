@@ -19,9 +19,9 @@
 //! logits dump route for the KL gate (dump.zig): absent, nothing of it is built. `expert_resident_ratio`,
 //! `expert_tally_window` and `expert_tally_file` set the expert stream's rate tally (sdk_ext/expert/tally.zig, every
 //! streamed arch's keys; glm5_next's default ratio `default_tally_ratio`). `expert_rows_by_layer` splits the decode rows
-//! between the routed layers (`LayerRows`; `uniform`, the default, is every layer at the plan's rows). `exl3_gateup_form`,
-//! `exl3_down_form`, `exl3_forms_maxm` and `exl3_forms_min_p` pick the EXL3 family's decode forms (`Exl3Forms`, exl3_forms.zig;
-//! `guone` + `pair`, the default; `seam` by name: lane B's chain, the control).
+//! between the routed layers (`LayerRows`; `uniform`, the default, is every layer at the plan's rows). `exl3_gateup_form` and
+//! `exl3_down_form` pick the EXL3 family's decode forms (`Exl3Forms`, exl3_forms.zig; `guone` + `pair`, the default;
+//! `seam` by name: lane B's chain, the control).
 //! `fuse_kda_inputs`, `fuse_gate_up`, `fuse_predictor`, `fuse_join` and `merge_gate_waits` are the decode trunk's
 //! launch-fusion switches (`Fusion`: `on`, the default, or `off`, the control), each an exact construction-time route.
 //! `miss_reads` routes the expert stream's demand reads (`MissReads`: `staged`, through the read pool's staging and a copy;
@@ -104,7 +104,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "exl3_forms_maxm", "exl3_forms_min_p", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads", "dsa_select", "draft_head", "dsa_split_form" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads", "dsa_select", "draft_head", "dsa_split_form" };
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -199,45 +199,31 @@ pub const DsaSelect = @import("ops.zig").SelectRoute;
 pub const DsaSplitForm = @import("dsa_decode.zig").SplitForm;
 /// The EXL3 family's decode forms (exl3_forms.zig), installed once at construction (exl3_math.zig `Math.init`): the
 /// gate / up form (`exl3_gateup_form`): `seam` (lane B's in_rin, two GEMVs, gu_epi; g22-exl3's chain, the control, by
-/// name), `fused16` / `fused8` (g5k3_gu_fused at 16 or 8 simdgroups), `guone` (DeepSeek's gu_one, the default); the
-/// down form (`exl3_down_form`): `seam`, `pair` (DeepSeek's down_pair,
-/// the default), `fused1` / `fused2` (din_rin + g5k3_dn_fused over 1 / 2 blocks), `pro1` / `pro2` (g5k3_dn_pro);
-/// `exl3_forms_maxm` the fused forms' union rule (1, the default, or 4); `exl3_forms_min_p` the narrowest wave the
-/// fused forms take (1 .. 64, default 1; narrower waves run the seam chain). Every form computes the seam's
-/// words (the kbench's device parity); a name outside these, a combination `exl3_forms.Forms.check` refuses, or a named
-/// form other than the seam on an NVFP4 pack refuses the load by name. The default is batch 27's measured pair
+/// name) or `guone` (DeepSeek's gu_one, the default); the down form (`exl3_down_form`): `seam` or `pair` (DeepSeek's
+/// down_pair, the default). Every form computes the seam's words (the kbench's device parity); a name outside these, or
+/// a named form other than the seam on an NVFP4 pack, refuses the load by name. The default is batch 27's measured pair
 /// (g22-exl3b at 190/217, lane on, draft_depth 3 + draft_gate 0.5: guone + pair +1.79 % decode over the seam beyond
 /// noise, ids identical); on an NVFP4 pack it is inert (that source installs no form).
-pub const Exl3GateUpForm = enum { seam, fused16, fused8, guone };
-pub const Exl3DownForm = enum { seam, pair, fused1, fused2, pro1, pro2 };
+pub const Exl3GateUpForm = enum { seam, guone };
+pub const Exl3DownForm = enum { seam, pair };
 pub const Exl3Forms = struct {
     gateup: Exl3GateUpForm = .guone,
     down: Exl3DownForm = .pair,
-    maxm: u32 = 1,
-    min_p: u32 = 1,
 
     /// The seam chain, by name (`"exl3_gateup_form":"seam","exl3_down_form":"seam"`): the control.
     pub const seam_chain: Exl3Forms = .{ .gateup = .seam, .down = .seam };
 
-    /// The forms exl3_forms.zig installs for these settings (every name maps; `check` is the install's).
+    /// The forms exl3_forms.zig installs for these settings (every name maps).
     pub fn forms(f: Exl3Forms) exl3_forms.Forms {
         return .{
             .gu = switch (f.gateup) {
                 .seam => .seam,
-                .fused16 => .fused16,
-                .fused8 => .fused8,
                 .guone => .guone,
             },
             .dn = switch (f.down) {
                 .seam => .seam,
                 .pair => .pair,
-                .fused1 => .fused1,
-                .fused2 => .fused2,
-                .pro1 => .pro1,
-                .pro2 => .pro2,
             },
-            .maxm = f.maxm,
-            .min_p = f.min_p,
         };
     }
 
@@ -478,7 +464,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, exl3_forms_maxm: bool = false, exl3_forms_min_p: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false, miss_reads: bool = false, dsa_select: bool = false, draft_head: bool = false, dsa_split_form: bool = false };
+    pub const Malformed = struct { rows: bool = false, mtp_lane: bool = false, mtp_acceptance: bool = false, tokenv3: bool = false, mtp_typical_delta: bool = false, decode_moe: bool = false, decode_glue: bool = false, decode_kda: bool = false, kda_prologue: bool = false, kda_verify: bool = false, decode_dsa: bool = false, decode_predict: bool = false, decode_swiglu: bool = false, gpu_keep_warm: bool = false, dump_dir: bool = false, exl3_gateup_form: bool = false, exl3_down_form: bool = false, fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false, miss_reads: bool = false, dsa_select: bool = false, draft_head: bool = false, dsa_split_form: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -566,14 +552,6 @@ pub const Config = struct {
         if (raw.object.get("exl3_down_form")) |v| {
             const form: ?Exl3DownForm = if (v == .string) std.meta.stringToEnum(Exl3DownForm, v.string) else null;
             if (form) |f| c.exl3_forms.down = f else c.malformed.exl3_down_form = true;
-            c.exl3_forms_requested = true;
-        }
-        if (raw.object.get("exl3_forms_maxm")) |v| {
-            if (v == .integer and (v.integer == 1 or v.integer == 4)) c.exl3_forms.maxm = @intCast(v.integer) else c.malformed.exl3_forms_maxm = true;
-            c.exl3_forms_requested = true;
-        }
-        if (raw.object.get("exl3_forms_min_p")) |v| {
-            if (v == .integer and v.integer >= 1 and v.integer <= exl3_forms.max_pairs) c.exl3_forms.min_p = @intCast(v.integer) else c.malformed.exl3_forms_min_p = true;
             c.exl3_forms_requested = true;
         }
         inline for (.{ "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits" }) |key| {
@@ -722,11 +700,8 @@ pub const Config = struct {
         if (c.draft_head_named and !c.mtp_lane and c.draft_head != .bf16) return error.Glm5NextDraftHeadNeedsLane;
         if (c.malformed.exl3_gateup_form) return error.Glm5NextExl3GateUpFormSetting;
         if (c.malformed.exl3_down_form) return error.Glm5NextExl3DownFormSetting;
-        if (c.malformed.exl3_forms_maxm) return error.Glm5NextExl3FormsMaxmSetting;
-        if (c.malformed.exl3_forms_min_p) return error.Glm5NextExl3FormsMinPSetting;
         if (c.exl3_forms_requested and !c.exl3_forms.isSeam() and c.expert_family != .exl3) return error.Glm5NextExl3FormsOnNvfp4Pack;
         if (c.malformed.miss_reads) return error.Glm5NextMissReadsSetting;
-        c.exl3_forms.forms().check() catch return error.Glm5NextExl3FormsSetting;
         if (c.malformed.fuse_kda_inputs) return error.Glm5NextFuseKdaInputsSetting;
         if (c.malformed.fuse_gate_up) return error.Glm5NextFuseGateUpSetting;
         if (c.malformed.fuse_predictor) return error.Glm5NextFusePredictorSetting;
@@ -1138,11 +1113,11 @@ test "glm5_next settings: expert_rows_by_layer: the calibrated offsets by defaul
 test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the seam and every form by name on an exl3 pack, refusals by name" {
     // the default: guone + pair (batch 27's measured forms) installed on an exl3 pack, inert (admitted) on an NVFP4 pack
     const none = try parseSettings("{}");
-    try testing.expectEqual(Exl3Forms{ .gateup = .guone, .down = .pair, .maxm = 1, .min_p = 1 }, none.exl3_forms);
+    try testing.expectEqual(Exl3Forms{ .gateup = .guone, .down = .pair }, none.exl3_forms);
     try testing.expect(!none.exl3_forms.isSeam());
     try testing.expect(!none.exl3_forms_requested);
     try none.validate();
-    try testing.expectEqual(exl3_forms.Forms{ .gu = .guone, .dn = .pair, .maxm = 1, .min_p = 1 }, none.exl3_forms.forms());
+    try testing.expectEqual(exl3_forms.Forms{ .gu = .guone, .dn = .pair }, none.exl3_forms.forms());
     {
         var c = none;
         c.expert_family = .exl3;
@@ -1173,11 +1148,14 @@ test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the 
         c.expert_family = .nvfp4;
         if (gu == .seam and dn == .seam) try c.validate() else try testing.expectError(error.Glm5NextExl3FormsOnNvfp4Pack, c.validate());
     };
-    {
-        var c = try parseSettings("{\"exl3_gateup_form\":\"fused8\",\"exl3_down_form\":\"fused1\",\"exl3_forms_maxm\":4,\"exl3_forms_min_p\":4}");
-        c.expert_family = .exl3;
-        try c.validate();
-        try testing.expectEqual(exl3_forms.Forms{ .gu = .fused8, .dn = .fused1, .maxm = 4, .min_p = 4 }, c.exl3_forms.forms());
+    // the retired forms' keys (exl3_forms_maxm, exl3_forms_min_p) refused by name
+    for ([_][]const u8{ "exl3_forms_maxm", "exl3_forms_min_p" }) |key| {
+        var buf: [64]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{{\"{s}\":1}}", .{key});
+        try testing.expectError(error.Unknown, parseSettings(text));
+        const raw = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+        defer raw.deinit();
+        try testing.expectEqualStrings(key, unknownSetting(raw.value.object).?);
     }
     for ([_]struct { []const u8, anyerror }{
         .{ "{\"exl3_gateup_form\":\"gemv_mcg\"}", error.Glm5NextExl3GateUpFormSetting },
@@ -1188,14 +1166,13 @@ test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the 
         .{ "{\"exl3_gateup_form\":1}", error.Glm5NextExl3GateUpFormSetting },
         .{ "{\"exl3_down_form\":\"mcg\"}", error.Glm5NextExl3DownFormSetting },
         .{ "{\"exl3_down_form\":\"fused3\"}", error.Glm5NextExl3DownFormSetting },
-        .{ "{\"exl3_forms_maxm\":2}", error.Glm5NextExl3FormsMaxmSetting },
-        .{ "{\"exl3_forms_maxm\":\"4\"}", error.Glm5NextExl3FormsMaxmSetting },
-        .{ "{\"exl3_forms_min_p\":0}", error.Glm5NextExl3FormsMinPSetting },
-        .{ "{\"exl3_forms_min_p\":65}", error.Glm5NextExl3FormsMinPSetting },
-        // combinations the forms refuse: maxm 4 or min_p > 1 without a fused form, a prologue form at maxm 4
-        .{ "{\"exl3_gateup_form\":\"guone\",\"exl3_forms_maxm\":4}", error.Glm5NextExl3FormsSetting },
-        .{ "{\"exl3_down_form\":\"pair\",\"exl3_forms_min_p\":4}", error.Glm5NextExl3FormsSetting },
-        .{ "{\"exl3_gateup_form\":\"fused16\",\"exl3_down_form\":\"pro2\",\"exl3_forms_maxm\":4}", error.Glm5NextExl3FormsSetting },
+        // the retired fused and pro forms
+        .{ "{\"exl3_gateup_form\":\"fused16\"}", error.Glm5NextExl3GateUpFormSetting },
+        .{ "{\"exl3_gateup_form\":\"fused8\"}", error.Glm5NextExl3GateUpFormSetting },
+        .{ "{\"exl3_down_form\":\"fused1\"}", error.Glm5NextExl3DownFormSetting },
+        .{ "{\"exl3_down_form\":\"fused2\"}", error.Glm5NextExl3DownFormSetting },
+        .{ "{\"exl3_down_form\":\"pro1\"}", error.Glm5NextExl3DownFormSetting },
+        .{ "{\"exl3_down_form\":\"pro2\"}", error.Glm5NextExl3DownFormSetting },
     }) |case| {
         var c = try parseSettings(case[0]);
         c.expert_family = .exl3;

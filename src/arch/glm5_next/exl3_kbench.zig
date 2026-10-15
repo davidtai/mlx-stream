@@ -5,7 +5,7 @@
 //!
 //! 1. Parity (before any timing): waves P = 1, 3 (0 hits: transient only), 16 (0 misses: base only), 24 (M = 3, three
 //!    banks, a slot named 3 and 5 times), 64 (8 tokens: the widest wave). Every arm's h (f32 [P, inter]) and down
-//!    output (bf16 [P, hidden]; the fused down forms also f32) bit for bit against the seam (exl3_kernels.zig gateUp /
+//!    output (bf16 [P, hidden]) bit for bit against the seam (exl3_kernels.zig gateUp /
 //!    down; the forms' seam instance at P > 48), and the seam against the f64 truth (exl3_forms_ref: exl3_ref.py's
 //!    forward, pinned by the CPU test) per pair: h and the f32 down output max |err| / rms <= 1e-4 (DeepSeek-V4.1's
 //!    tolerance), each bf16 output word within 2^-8 |ref| + 1e-4 rms (its rounding on top of that tolerance). An arm failing parity is not timed.
@@ -178,23 +178,18 @@ const Arm = struct {
     kind: ArmKind,
     forms: xf.Forms = .{},
     inst: ?*xf.Installed = null,
-    inst32: ?*xf.Installed = null,
     launches: u32,
     ok: bool = true,
     times: [rounds]f64 = undefined,
 };
 
-fn launchCount(f0: xf.Forms) u32 {
-    const f = f0.at(f0.min_p);
+fn launchCount(f: xf.Forms) u32 {
     const gu: u32 = switch (f.gu) {
         .seam => 4,
         .guone => 3,
-        .fused16, .fused8 => 2,
     };
     const dn: u32 = switch (f.dn) {
         .seam, .pair => 3,
-        .fused1, .fused2 => 2,
-        .pro1, .pro2 => 1,
     };
     return gu + dn;
 }
@@ -203,33 +198,16 @@ const NamedArm = struct { name: []const u8, forms: xf.Forms };
 const named_arms = [_]NamedArm{
     .{ .name = "exl3_seam_forms", .forms = .{} },
     .{ .name = "exl3_dsv41_forms", .forms = .{ .gu = .guone, .dn = .pair } },
-    .{ .name = "exl3_f16_seam", .forms = .{ .gu = .fused16 } },
-    .{ .name = "exl3_seam_f1", .forms = .{ .dn = .fused1 } },
-    .{ .name = "exl3_f16_f1_m1", .forms = .{ .gu = .fused16, .dn = .fused1 } },
-    .{ .name = "exl3_f16_f2_m1", .forms = .{ .gu = .fused16, .dn = .fused2 } },
-    .{ .name = "exl3_f8_f1_m1", .forms = .{ .gu = .fused8, .dn = .fused1 } },
-    .{ .name = "exl3_f8_f2_m1", .forms = .{ .gu = .fused8, .dn = .fused2 } },
-    .{ .name = "exl3_f16_f1_m4", .forms = .{ .gu = .fused16, .dn = .fused1, .maxm = 4 } },
-    .{ .name = "exl3_f16_f2_m4", .forms = .{ .gu = .fused16, .dn = .fused2, .maxm = 4 } },
-    .{ .name = "exl3_f8_f1_m4", .forms = .{ .gu = .fused8, .dn = .fused1, .maxm = 4 } },
-    .{ .name = "exl3_f8_f2_m4", .forms = .{ .gu = .fused8, .dn = .fused2, .maxm = 4 } },
-    .{ .name = "exl3_f16_p1", .forms = .{ .gu = .fused16, .dn = .pro1 } },
-    .{ .name = "exl3_f16_p2", .forms = .{ .gu = .fused16, .dn = .pro2 } },
-    .{ .name = "exl3_f8_p1", .forms = .{ .gu = .fused8, .dn = .pro1 } },
-    .{ .name = "exl3_f8_p2", .forms = .{ .gu = .fused8, .dn = .pro2 } },
-    .{ .name = "exl3_hyb_f16_f1_m1_p4", .forms = .{ .gu = .fused16, .dn = .fused1, .min_p = 4 } },
-    .{ .name = "exl3_hyb_f8_f1_m4_p4", .forms = .{ .gu = .fused8, .dn = .fused1, .maxm = 4, .min_p = 4 } },
 };
 /// The seam, the named form arms, the two NVFP4 controls. The table's length comes from the list: the 9105bbf binary
 /// sized it by hand (24 for 23 arms), its `assert(n == out.len)` was UB in ReleaseFast and the test compiled to a
 /// one-instruction self-loop right after G.init (the window hang of 2026-10-14T04:48Z).
 pub const arm_count = 1 + named_arms.len + 2;
-/// The arm table, built and checked at compile time: names distinct, every form installable (`Forms.check`).
+/// The arm table, built and checked at compile time: names distinct.
 const arms_table: [arm_count]Arm = blk: {
     var out: [arm_count]Arm = undefined;
     out[0] = .{ .name = "exl3_seam", .kind = .seam, .launches = 7 };
     for (named_arms, 1..) |x, i| {
-        x.forms.check() catch @compileError("glm5next exl3 kbench: arm " ++ x.name ++ " names forms no build installs");
         out[i] = .{ .name = x.name, .kind = .forms, .forms = x.forms, .launches = launchCount(x.forms) };
     }
     out[arm_count - 2] = .{ .name = "nvfp4_fused", .kind = .nv_fused, .launches = 2 };
@@ -535,14 +513,9 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
             std.debug.print("GLM5NEXT_EXL3_KBENCH arm={s} install refused: {s}\n", .{ arm.name, diag.message() });
             return e;
         };
-        if (arm.forms.fusedDn()) arm.inst32 = try xf.install(a, seam, arm.forms, .float32, &diag);
     };
     defer for (&arms) |*arm| {
         if (arm.inst) |p| {
-            p.deinit();
-            a.destroy(p);
-        }
-        if (arm.inst32) |p| {
             p.deinit();
             a.destroy(p);
         }
@@ -638,23 +611,19 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
                 const mark = g.mark();
                 const h = if (arm.kind == .seam) try xk.gateUp(seam, &g, x, ida, &xb.banks) else try xf.gateUp(arm.inst.?, &g, x, ida, &xb.banks);
                 const y = if (arm.kind == .seam) try xk.down(seam, &g, h, ida, &xb.banks) else try xf.down(arm.inst.?, &g, h, ida, &xb.banks);
-                const y3 = if (arm.inst32) |p32| try xf.down(p32, &g, h, ida, &xb.banks) else y;
-                try g.evalAll(&.{ h, y, y3 });
+                try g.evalAll(&.{ h, y });
                 const ah = try hostF32(a, &g, h);
                 defer a.free(ah);
                 const ay = try hostF32(a, &g, y);
                 defer a.free(ay);
-                const ay3 = try hostF32(a, &g, y3);
-                defer a.free(ay3);
                 const eh = bitEq(ah, hh);
                 const ey = bitEq(ay, yy16);
-                const ey3 = if (arm.inst32 != null) bitEq(ay3, yy32) else ay3.len;
-                const ok = eh == hh.len and ey == yy16.len and ey3 == yy32.len;
+                const ok = eh == hh.len and ey == yy16.len;
                 if (!ok) {
                     arm.ok = false;
                     fails += 1;
                 }
-                std.debug.print("GLM5NEXT_EXL3_KPARITY wave={s} arm={s} h_bitwise={d}/{d} y_bitwise={d}/{d} y32_bitwise={d}/{d} {s}\n", .{ pw.name, arm.name, eh, hh.len, ey, yy16.len, ey3, yy32.len, if (ok) "PASS" else "FAIL" });
+                std.debug.print("GLM5NEXT_EXL3_KPARITY wave={s} arm={s} h_bitwise={d}/{d} y_bitwise={d}/{d} {s}\n", .{ pw.name, arm.name, eh, hh.len, ey, yy16.len, if (ok) "PASS" else "FAIL" });
                 g.resetTo(mark);
             }
             g.reset();
@@ -749,9 +718,9 @@ test "glm5next exl3 kbench GPU: the K=3 decode forms at GLM's expert shape: pari
     try testing.expectEqual(@as(u32, 0), fails);
 }
 
-test "glm5_next exl3 kbench: the arm table is the list's length (21: seam, 18 forms, 2 NVFP4), every entry named and installable" {
+test "glm5_next exl3 kbench: the arm table is the list's length (5: seam, 2 forms, 2 NVFP4), every entry named" {
     const arms = armsList();
-    try testing.expectEqual(@as(usize, 21), arms.len);
+    try testing.expectEqual(@as(usize, 5), arms.len);
     try testing.expectEqual(named_arms.len + 3, arms.len);
     try testing.expectEqual(ArmKind.seam, arms[0].kind);
     try testing.expectEqual(ArmKind.nv_fused, arms[arms.len - 2].kind);
@@ -759,9 +728,8 @@ test "glm5_next exl3 kbench: the arm table is the list's length (21: seam, 18 fo
     for (arms, 0..) |arm, i| {
         try testing.expect(arm.name.len > 0);
         try testing.expect(arm.launches >= 1 and arm.launches <= 7);
-        try testing.expect(arm.ok and arm.inst == null and arm.inst32 == null);
+        try testing.expect(arm.ok and arm.inst == null);
         if (arm.kind == .forms) {
-            try arm.forms.check();
             try testing.expectEqualStrings(named_arms[i - 1].name, arm.name);
         }
         for (arms[0..i]) |q| try testing.expect(!std.mem.eql(u8, arm.name, q.name));

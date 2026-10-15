@@ -6,7 +6,6 @@ texts'. Run from the repository root; `--check` compares, writes nothing.
 
   g5k3_guone    dsv41_exl3_b3_guone_k3_2304 (gate and up in one launch; unroll 8 kept)        IT, OT
   g5k3_pair     dsv41_exl3_b3_pair_k3_5120  (the down form: a slot's rows paired, one decode)  IT, OT
-The fused forms (g5k3_gu_fused, g5k3_dn_fused, header_g5k3) are written by hand.
 """
 import os
 import sys
