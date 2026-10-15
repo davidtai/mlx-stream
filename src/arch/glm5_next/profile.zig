@@ -59,7 +59,7 @@ var state: if (enabled) State else void = if (enabled) .{} else {};
 
 /// Construction (after the source): every switch read once, each armed one's line printed; an unreadable value refuses
 /// the load by name.
-pub fn arm(a: std.mem.Allocator, io: std.Io, src: *experts.Source, n_layers: u32, s: mlx.mlx_stream) !void {
+pub fn arm(a: std.mem.Allocator, io: std.Io, src: anytype, n_layers: u32, s: mlx.mlx_stream) !void {
     if (comptime !enabled) return;
     const geo = src.bank.geometry;
     state = .{ .a = a, .io = io, .stream = s, .record_bytes = geo.record_bytes, .hidden = geo.hidden_size, .inter = geo.intermediate_size, .layers = n_layers };
@@ -87,7 +87,7 @@ pub fn arm(a: std.mem.Allocator, io: std.Io, src: *experts.Source, n_layers: u32
 }
 
 /// The module's end: the trace freed (the source still alive).
-pub fn disarm(src: *experts.Source) void {
+pub fn disarm(src: anytype) void {
     if (comptime !enabled) return;
     if (state.trace) |t| {
         src.stream_source.trace = null;
@@ -98,7 +98,7 @@ pub fn disarm(src: *experts.Source) void {
 }
 
 /// A request's prompt pass begins (the source in its prompt phase): its trace, the phase's counters, the timeline.
-pub fn promptBegin(src: *experts.Source, ids: []const u32, reserve: u64) void {
+pub fn promptBegin(src: anytype, ids: []const u32, reserve: u64) void {
     if (comptime !enabled) return;
     if (state.trace) |t| t.begin(ids, reserve -| ids.len) catch |e| log.err(tag ++ "_ROUTE_TRACE begin: {s}\n", .{@errorName(e)});
     startPhase(.prefill, src);
@@ -106,7 +106,7 @@ pub fn promptBegin(src: *experts.Source, ids: []const u32, reserve: u64) void {
 }
 
 /// The prompt pass's end (its logits evaluated, before the phase change): the timeline's line and files, the phase lines.
-pub fn promptEnd(src: *experts.Source) void {
+pub fn promptEnd(src: anytype) void {
     if (comptime !enabled) return;
     const base = requestBase();
     defer if (base) |b| state.a.free(b);
@@ -116,7 +116,7 @@ pub fn promptEnd(src: *experts.Source) void {
 
 /// The decode phase begins (after the phase change): its counters, the residents' snapshot, the GPU timeline (the first
 /// request's, at most `budget` forwards and `gpu_cycles_cap`).
-pub fn decodeBegin(src: *experts.Source, budget: u64) void {
+pub fn decodeBegin(src: anytype, budget: u64) void {
     if (comptime !enabled) return;
     startPhase(.decode, src);
     state.steps = 0;
@@ -179,7 +179,7 @@ pub fn roundEnd(accepted: u32, tokens: []const u32) void {
 
 /// The request's end (the decode phase's): the phase lines, `DECODE_TIMERS`, the GPU timeline's line and file, the
 /// trace's files.
-pub fn decodeEnd(src: *experts.Source) void {
+pub fn decodeEnd(src: anytype) void {
     if (comptime !enabled) return;
     if (state.phase != .decode) return;
     endPhase(src);
@@ -213,7 +213,7 @@ fn requestBase() ?[]u8 {
     return t.basePath(state.a) catch null;
 }
 
-fn startPhase(phase: Phase, src: *experts.Source) void {
+fn startPhase(phase: Phase, src: anytype) void {
     state.phase = phase;
     state.s0 = src.stats();
     mimo_profile.reset();
@@ -221,7 +221,7 @@ fn startPhase(phase: Phase, src: *experts.Source) void {
 }
 
 /// MiMo's phase lines (module.zig `endDiagnosticPhase`) under glm5_next's tag, over the phase's settled counters.
-fn endPhase(src: *experts.Source) void {
+fn endPhase(src: anytype) void {
     const name = @tagName(state.phase);
     const before = state.s0;
     const after = src.stats();
@@ -251,7 +251,7 @@ fn endPhase(src: *experts.Source) void {
 }
 
 /// Every routed layer's persistent slots into the trace: at the decode's start (`end` false) or its end.
-fn traceResidents(src: *experts.Source, t: *experts.Trace, end: bool) void {
+fn traceResidents(src: anytype, t: *experts.Trace, end: bool) void {
     const geo = src.bank.geometry;
     for (0..geo.num_moe_layers) |rel| {
         const policy = src.stream_source.policy(geo.first_moe_layer + @as(u32, @intCast(rel)));

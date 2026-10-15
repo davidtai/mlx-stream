@@ -743,7 +743,7 @@ pub fn expertCounts(comptime Ops: type, g: *Ops, ids: Ops.T, rows: c_int, k: c_i
 
 /// P1: routed layer `l`'s predicted counts (evaluated) ranked hottest first and posted to the stream, which reads the
 /// seed into the layer's free persistent rows while the attention runs. The prediction only picks reads.
-fn postReadAhead(g: *G, c: *const glm.Config, ahead: *const Ahead, src: *experts.Source, l: u32) !void {
+fn postReadAhead(g: *G, c: *const glm.Config, ahead: *const Ahead, src: anytype, l: u32) !void {
     std.debug.assert(ahead.layer.? == l);
     const counts = try g.readU32(ahead.counts.?, src.ahead_counts[0..c.n_routed_experts]);
     try src.readAheadSeed(l, expert_policy.rankHottest(counts, &src.ahead_ranked));
@@ -777,7 +777,7 @@ pub const Taps = struct { hidden: ?T = null };
 /// `cache`), the routed experts through `src`: the last row's logits f32 [1, vocab], a kept handle the caller frees.
 /// `head` `.dump` (the logits-dump route, chosen at construction) also hands every row's logits, f32 in chunks of
 /// `dump_chunk_rows` rows, to `sink.append(g, chunk)` before returning.
-pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: *experts.Source, routes: Routes, comptime head: Head, comptime gl: glue.Route, sink: anytype) !T {
+pub fn forward(g: *G, a: std.mem.Allocator, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: anytype, routes: Routes, comptime head: Head, comptime gl: glue.Route, sink: anytype) !T {
     const rows: u32 = @intCast(ids.len);
     if (rows == 0 or rows > prompt_call_rows) return error.Glm5NextCallRows;
     if (start + rows > cache.cap) return error.ContextOverBill;
@@ -952,7 +952,7 @@ const Pending = struct {
 /// and norm in one hcPre dispatch that also applies the previous sublayer's expand (deferred until the next sublayer reads
 /// it; the last one is materialized for the head), the router's product and top-8 in two texts, the routed combine with
 /// the shared expert's add in one. The decode lane's rows are one span (at most `glue.max_rows`, hcPre's).
-fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: *experts.Source, routes: Routes, comptime head: Head, sink: anytype) !T {
+fn forwardFused(g: *G, c: *const glm.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: anytype, routes: Routes, comptime head: Head, sink: anytype) !T {
     if (comptime head == .dump) @compileError("glm5_next: the logits dump is a prompt pass (the stock glue)");
     const k = routes.glue.?;
     const rows: u32 = @intCast(ids.len);

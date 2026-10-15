@@ -230,8 +230,15 @@ pub fn unknownSetting(o: std.json.ObjectMap) ?[]const u8 {
     return null;
 }
 
+/// The routed experts' quant family, from the pack's `expert_streaming` block (root.zig `declared`): `nvfp4` (the
+/// NVFP4 bank, `expert-manifest.json`) or `exl3` (the EXL3 K=3 mul1 bank-v2 pack, `expert-manifest-v2.json`). The
+/// construction's route: the module installs the family's source and passes once.
+pub const ExpertFamily = enum { nvfp4, exl3 };
+
 pub const Config = struct {
     model: glm.Config = .{},
+    /// The pack's expert family (parse: the `expert_streaming` block), never a setting.
+    expert_family: ExpertFamily = .nvfp4,
     /// The pack's directory: config.json, the resident shards, the bank (experts.bin and its manifest).
     model_dir: ?[]const u8 = null,
     /// The operator's rows (`expert_rows` the decode rows, `expert_prefill_rows` the prompt rows); null = the bill's fill.
