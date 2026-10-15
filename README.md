@@ -161,6 +161,16 @@ and memory bill come
 from the tier defaults and the model settings (`model-settings.json`: `numeric_tier`, `ctx_size`, `expert_event_gates`,
 `layer_major_prefill`, `expert_wide_*`, `embedding_host_rows`), never from the environment.
 
+DeepSeek-V4.1's residency settings (`model-settings.json`; a bad value is refused by name at the load):
+
+| key | values | default |
+|---|---|---|
+| `prompt_residents` | `keep` (a fresh prompt finds the residents decode left in the prompt rows) or `forget` (empty rows); a continuation keeps them either way; `Dsv41PromptResidentsSetting` | `keep` |
+| `resident_seed` | `usage` (the prompt rows filled at the load from the pack's `expert-usage-v1.json`) or `none`; `ResidentSeedSetting`, `ExpertUsageMissing`, `ExpertUsageMalformed`, `ExpertUsageMismatch` | `usage` when the pack has the file, else `none` |
+
+The usage record (`expert_usage_record`, `expert_usage_label`) is glm5_next's; DeepSeek-V4.1 refuses either key by name
+(`ExpertUsageRecordNotInstalled`).
+
 The levers still under evaluation are construction-time routes of the timed cell harness (the `dsv41 served cell`
 test, `zig build cell`); a served build never compiles their switches. Unset is the default below, which is the
 served behavior.
