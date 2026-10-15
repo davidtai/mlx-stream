@@ -87,8 +87,6 @@ pub fn Accepted(comptime G: type) type {
         hidden: u32,
         mini: u32,
         report: selfcheck.Report = .{},
-        /// The prompt's prefill GEMM calls (each call's waves over host-known slots).
-        prefill_gemm_calls: u64 = 0,
         /// per K (3, 4): the decode and prompt chains
         dec: [2]routes.Decode,
         pf: [2]routes.Prompt,
@@ -249,7 +247,6 @@ pub fn Accepted(comptime G: type) type {
             try self.sortRows(rows, bank);
             for (self.waves.items) |w| _ = mlx.mlx_array_free(w);
             self.waves.clearRetainingCapacity();
-            self.prefill_gemm_calls += 1;
             const bk: routes.Bank = .{ .gate = proj(bank.gate), .up = proj(bank.up), .down = proj(bank.down) };
             var i: usize = 0;
             while (i < n) {
@@ -385,10 +382,6 @@ pub fn Accepted(comptime G: type) type {
             return out;
         }
 
-        /// The prompt's prefill GEMM calls and its waits on the GPU (none: the waves' tables are the host's).
-        pub fn prefillStats(self: *const Self) [2]u64 {
-            return .{ self.prefill_gemm_calls, 0 };
-        }
 
         /// Nothing is left in flight (every call's graph is the caller's).
         pub fn finishPrefill(self: *Self, g: *G) !void {
@@ -708,11 +701,6 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-/// The sushi binding's prefill GEMM calls and drains, where it counts them.
-fn theirStats(theirs: anytype) [2]u64 {
-    const T = @typeInfo(@TypeOf(theirs)).pointer.child;
-    return if (comptime @hasDecl(T, "prefillStats")) theirs.prefillStats() else .{ 0, 0 };
-}
 
 /// GLM53_EXL3_CEIL (with GLM53_EXL3_BENCH): the GEMM ceiling at GLM-5.3's routed shapes, 32 experts of 512 rows each
 /// (16,384 rows, a layer's 131,072 rows / 8): MLX's affine gather_qmm chain at the affine pack's quantization (4 bits,
@@ -1094,7 +1082,6 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
         }
     }
     var best: [2]u64 = @splat(std.math.maxInt(u64));
-    const q0 = .{ ours.prefillStats(), theirStats(theirs) };
     for (0..5) |rep| for (0..2) |arm| {
         const m = g.mark();
         defer g.resetTo(m);
@@ -1118,7 +1105,6 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
         if (rep > 0) best[arm] = @min(best[arm], dt);
     };
     const flop = @as(f64, @floatFromInt(n_tok * 8)) * 4.0 * 3.0 * 2.0 * @as(f64, @floatFromInt(h)) * 512.0;
-    const q1 = .{ ours.prefillStats(), theirStats(theirs) };
     for (0..2) |side| {
         const pr: quant.PrefillRows = .{ .slot = side_slot[side].items[0..@min(16384, side_slot[side].items.len)], .act_row = side_act[side].items[0..@min(16384, side_act[side].items.len)] };
         const sts = try ours.stageTimes(&g, xp, pr, banks[side], 16, null);
@@ -1148,7 +1134,7 @@ test "glm53 exl3 bench: one routed layer's decode (1 / 4 / 6 rows) and prompt (1
         };
     }
     if (std.c.getenv("GLM53_EXL3_CEIL") != null) try benchCeiling(a, &g, ours, &banks, slot_of, &b, h);
-    std.debug.print("GLM53_UBENCH prompt 16384 tokens ({d} K3 + {d} K4 rows): ours {d:.1} ms ({d:.1} TFLOP/s), sushi {d:.1} ms ({d:.1} TFLOP/s) per layer ({d:.2}x); prefill GEMM calls / GPU drains ours {d} / {d}, sushi {d} / {d}\n", .{ side_slot[0].items.len, side_slot[1].items.len, @as(f64, @floatFromInt(best[0])) / 1e6, flop / @as(f64, @floatFromInt(best[0])) / 1e3, @as(f64, @floatFromInt(best[1])) / 1e6, flop / @as(f64, @floatFromInt(best[1])) / 1e3, @as(f64, @floatFromInt(best[1])) / @as(f64, @floatFromInt(best[0])), q1[0][0] - q0[0][0], q1[0][1] - q0[0][1], q1[1][0] - q0[1][0], q1[1][1] - q0[1][1] });
+    std.debug.print("GLM53_UBENCH prompt 16384 tokens ({d} K3 + {d} K4 rows): ours {d:.1} ms ({d:.1} TFLOP/s), sushi {d:.1} ms ({d:.1} TFLOP/s) per layer ({d:.2}x)\n", .{ side_slot[0].items.len, side_slot[1].items.len, @as(f64, @floatFromInt(best[0])) / 1e6, flop / @as(f64, @floatFromInt(best[0])) / 1e3, @as(f64, @floatFromInt(best[1])) / 1e6, flop / @as(f64, @floatFromInt(best[1])) / 1e3, @as(f64, @floatFromInt(best[1])) / @as(f64, @floatFromInt(best[0])) });
 }
 
 // GLM53_EXL3_TINY_PACK=<dir>: the tiny fixture's EXL3 pack written there (the bench's smoke off the box).
