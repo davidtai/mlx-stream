@@ -45,6 +45,7 @@ const prefill_attention = @import("../mimo_v2/prefill_attention.zig");
 const warm = @import("warm.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const expert_tally = @import("../../sdk_ext.zig").expert.tally;
+const expert_usage = @import("../../sdk_ext.zig").expert.usage;
 const builtin = @import("builtin");
 
 const T = mlx.mlx_array;
@@ -109,8 +110,11 @@ pub const Module = struct {
     /// and the rates each request's end folds in and writes (layers x experts; empty: no tally, ratio 0).
     tally_path: ?[]u8 = null,
     tally_rates: []f32 = &.{},
+    /// The usage profile's record (`expert_usage_record`; null: off, the default): each request's end adds its counts
+    /// and writes the file.
+    usage_rec: ?*expert_usage.Recorder = null,
 
-    const Decode = struct { steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0, s0: @import("../../sdk_ext.zig").expert.Stats = .{}, active: bool = false };
+    const Decode = struct { steps: u64 = 0, tokens: u64 = 0, wall_ns: u64 = 0, s0: @import("../../sdk_ext.zig").expert.Stats = .{}, active: bool = false, prompt_tokens: u64 = 0 };
     const Installed = struct {
         prompt: *const fn (*Module, []const u32) anyerror!T,
         step: *const fn (*Module, []const u32) anyerror!T,
@@ -340,6 +344,9 @@ pub const Module = struct {
         // The rate tally (`expert_resident_ratio` > 0): its file read once (the first request's pins), its line.
         try self.openTally(dir, std.mem.min(u32, decode_rows));
         errdefer self.closeTally();
+        // The usage profile's record (`expert_usage_record`, off by default): its counts table and the decode routes counted.
+        try self.openUsage();
+        errdefer self.closeUsage();
         const src_warm = switch (self.src) {
             inline else => |x| x.warm != null,
         };
@@ -366,6 +373,8 @@ pub const Module = struct {
         };
         prebuilt.ns = @intCast(pb_t0.untilNow(io, .awake).nanoseconds);
         log.info("glm5_next pipelines pre-built: {d} launches at decode widths 1..{d} (fp8 gemv {d}, fusion {d}, glue {d}, swiglu {d}) + {d} expert calls (prompt waves of {d} and 1 rows, decode chain at 1..{d} pairs) in {d} ms\n", .{ prebuilt.gemv + prebuilt.fusion + prebuilt.glue + prebuilt.swiglu, prebuild.max_rows, prebuilt.gemv, prebuilt.fusion, prebuilt.glue, prebuilt.swiglu, prebuilt.experts, self.c.prompt.wave_rows, exl3_kernels.max_pairs, prebuilt.ns / std.time.ns_per_ms });
+        // The usage seed (`resident_seed`): after the warm-up and the pre-builds, before the first request; one line.
+        try self.seedResidents(dir);
         self.prompt_pass = promptPassOf(promptRoute(&self.c), self.c.expert_family);
         // `ttft_tail: deferred`: the served and the lane's prompt passes without their tail (the dump route keeps it).
         if (self.c.prompt.ttft_tail == .deferred) self.prompt_pass = deferredPromptOf(promptRoute(&self.c), self.c.expert_family) orelse self.prompt_pass;
@@ -494,6 +503,58 @@ pub const Module = struct {
         log.info("glm5_next expert tally installed: expert_resident_ratio={d} pins={d} of {d} decode rows a layer, window {d} routes, expert_tally_file={s} path={s}; {s}\n", .{ t.ratio, pins, decode_rows, t.window, @tagName(t.file), if (self.tally_path) |p| p else "none", status });
     }
 
+    /// `expert_usage_record` at construction: off (no recorder, no route counted), or the recorder over the stream's
+    /// layers and experts and the decode routes counted (`countRoutes`). One line.
+    fn openUsage(self: *Module) !void {
+        const path = self.c.residency.recordPath() orelse return;
+        const shape = self.srcTallyShape();
+        self.usage_rec = try expert_usage.Recorder.init(self.gpa, self.io, path, "glm5_next", self.c.residency.label(), shape.layers, shape.experts);
+        switch (self.src) {
+            inline else => |x| x.countRoutes(),
+        }
+        log.info("glm5_next expert usage record: on path={s} label={s} ({d} layers x {d} experts; each request's prompt routed ids and decode routes, written at its end; binary {s})\n", .{ path, self.c.residency.label(), shape.layers, shape.experts, self.usage_rec.?.binary_sha256[0..8] });
+    }
+
+    fn closeUsage(self: *Module) void {
+        if (self.usage_rec) |r| r.deinit();
+        self.usage_rec = null;
+    }
+
+    /// The request's usage (`expert_usage_record` on): its counts added before the tally's end (which zeroes the decode
+    /// counts), then the file written. A failed write is logged; the request is not failed.
+    fn endUsage(self: *Module, d: Decode) void {
+        const r = self.usage_rec orelse return;
+        switch (self.src) {
+            inline else => |x| x.addUsage(r.counts),
+        }
+        r.endRequest(self.io, d.prompt_tokens, d.tokens) catch |e| {
+            log.warn("glm5_next expert usage: not written to {s}: {s}\n", .{ r.path, @errorName(e) });
+            return;
+        };
+        log.info("glm5_next expert usage: written to {s} ({d} requests, {d} prompt + {d} decode tokens)\n", .{ r.path, r.requests, r.prompt_tokens, r.decode_tokens });
+    }
+
+    /// `resident_seed` at construction (sdk_ext/expert/usage.zig `decide`): `usage` when the pack has
+    /// `expert-usage-v1.json` (or by name), the prompt rows filled from it (`Source.seedResidents`); `none` otherwise.
+    /// A malformed file, or one of another model or geometry, refuses the load by name. One line, with the load's cost.
+    fn seedResidents(self: *Module, dir: []const u8) !void {
+        const shape = self.srcTallyShape();
+        var d = try expert_usage.decide(self.gpa, self.io, &self.c.residency, dir, "glm5_next", shape.layers, shape.experts);
+        defer if (d.profile) |*p| p.deinit();
+        var lb: [768]u8 = undefined;
+        const p = if (d.profile) |*x| x else {
+            log.info("{s}\n", .{expert_usage.seedLine(&lb, "glm5_next", &d, .{ .min = 0, .max = 0, .rows_min = 0, .rows_max = 0, .records = 0 }, 0, 0)});
+            return;
+        };
+        const s0 = self.srcStats();
+        const t0 = self.nowNs();
+        const r = switch (self.src) {
+            inline else => |x| try x.seedResidents(p),
+        };
+        const ms = (self.nowNs() - t0) / std.time.ns_per_ms;
+        log.info("{s}\n", .{expert_usage.seedLine(&lb, "glm5_next", &d, r, self.srcStats().expert_bytes_read -| s0.expert_bytes_read, ms)});
+    }
+
     fn closeTally(self: *Module) void {
         if (self.tally_path) |p| self.gpa.free(p);
         self.tally_path = null;
@@ -524,6 +585,7 @@ pub const Module = struct {
             inline else => |x| gprof.disarm(x),
         };
         self.closeTally();
+        self.closeUsage();
         if (self.mtp) |lane| {
             lane.deinit(&self.g);
             self.gpa.free(self.history);
@@ -660,6 +722,7 @@ pub const Module = struct {
         } else |_| {}
         const s1 = self.srcStats();
         const tok_s: f64 = if (d.wall_ns > 0) @as(f64, @floatFromInt(d.tokens)) * 1e9 / @as(f64, @floatFromInt(d.wall_ns)) else 0;
+        self.endUsage(d);
         self.endTally();
         log.info("glm5_next decode: steps={d} tokens={d} wall_s={d:.3} tok_s={d:.2} ssd_bytes={d} ssd_bytes_per_token={d} direct_ranges={d}\n", .{ d.steps, d.tokens, @as(f64, @floatFromInt(d.wall_ns)) / 1e9, tok_s, s1.expert_bytes_read -| d.s0.expert_bytes_read, if (d.tokens > 0) (s1.expert_bytes_read -| d.s0.expert_bytes_read) / d.tokens else 0, s1.direct_ranges -| d.s0.direct_ranges });
     }
@@ -707,7 +770,7 @@ pub fn Passes(comptime fam: experts.Family) type {
             const t0 = self.nowNs();
             const grow_ns = try src(self).beginDecodeTimed();
             const phase_ns = self.nowNs() - t0;
-            self.decode = .{ .active = true, .s0 = src(self).stats() };
+            self.decode = .{ .active = true, .s0 = src(self).stats(), .prompt_tokens = prompt_tokens };
             // The DSA lanes' buffer addresses at the decode's start (once a request): the request's end line splits the
             // prompt's appends from the decode's.
             try self.cache.markDecode(&self.g);

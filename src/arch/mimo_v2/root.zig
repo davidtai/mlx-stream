@@ -482,3 +482,28 @@ test "mimo pack settings: expert_streaming.settings is applied at parse; a non-o
         try std.testing.expectEqual(@import("stream.zig").ReadSchedule.current, c.prefill_read_schedule);
     }
 }
+
+test "mimo applySettings: the host's model-settings entry (null: no change) takes the pack block's keys; a bad value is refused by name at the load facts; a key outside setting_keys is named for the pack block's refusal (MimoSettingUnknown)" {
+    const usage = @import("../../sdk_ext.zig").expert.usage;
+    var c: Config = .{};
+    applySettings(&c, .null);
+    try std.testing.expectEqual(usage.PromptResidents.keep, c.prompt_residents);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    applySettings(&c, try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"prompt_residents\":\"forget\",\"resident_seed\":\"none\"}", .{}));
+    try std.testing.expectEqual(usage.PromptResidents.forget, c.prompt_residents);
+    try std.testing.expectEqual(usage.Seed.none, c.residency.seed.?);
+    try c.validate();
+    for ([_]struct { text: []const u8, err: anyerror }{
+        .{ .text = "{\"prompt_residents\":1}", .err = error.MimoPromptResidentsSetting },
+        .{ .text = "{\"resident_seed\":\"all\"}", .err = error.ResidentSeedSetting },
+        .{ .text = "{\"expert_usage_record\":\"/tmp/u.json\"}", .err = error.ExpertUsageRecordNotInstalled },
+        .{ .text = "{\"expert_usage_label\":\"\"}", .err = error.ExpertUsageRecordNotInstalled },
+    }) |w| {
+        var x: Config = .{};
+        applySettings(&x, try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), w.text, .{}));
+        try std.testing.expectError(w.err, x.validate());
+    }
+    const unknown = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"prompt_residents\":\"keep\",\"seed_rows\":3}", .{});
+    try std.testing.expectEqualStrings("seed_rows", settings.unknownSetting(unknown.object).?);
+}

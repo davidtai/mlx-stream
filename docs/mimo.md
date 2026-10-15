@@ -414,7 +414,13 @@ ids can change at near-ties. **lossy** = emits tokens the target would not have 
 | `phase_rows` | `true`, `false` | `true` | `false` | exact arithmetic; rows move ids |
 | `expert_rows`, `expert_prefill_rows` | positive integers | unset (AUTO) | | rows move ids |
 | `expert_rows_by_layer` | `derived`, `uniform`, or 47 integers summing to 0 | `derived` | `uniform` | rows move ids |
+| `prompt_residents` | `keep`, `forget` | `keep` | `forget` | exact; a bad value: `MimoPromptResidentsSetting` |
+| `resident_seed` | `usage`, `none` | `usage` when the pack has `expert-usage-v1.json`, else `none` | `none` | exact; `ResidentSeedSetting`, `ExpertUsageMissing`, `ExpertUsageMalformed`, `ExpertUsageMismatch` |
 
+`prompt_residents: keep` leaves the residents of decode in the prompt rows for the next prompt (one line at load:
+`mimo_v2 prompt residents: keep (...)`). `resident_seed` fills the empty prompt rows at the load from the pack's
+`expert-usage-v1.json` (one line: `mimo_v2 expert residents seeded: ...`). The usage record is glm5_next's: a named
+`expert_usage_record` or `expert_usage_label` is refused by name (`ExpertUsageRecordNotInstalled`).
 `prefill_read_schedule_threshold` beside any schedule but `auto` is refused (it would choose nothing). `kv_quant: 8`
 has no valid measured cell yet.
 

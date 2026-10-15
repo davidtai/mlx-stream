@@ -42,6 +42,7 @@ const sdk = @import("sdk");
 const glm = @import("config.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const expert_tally = @import("../../sdk_ext.zig").expert.tally;
+const expert_usage = @import("../../sdk_ext.zig").expert.usage;
 const exl3_forms = @import("exl3_forms.zig");
 const prompt_levers = @import("prompt_levers.zig");
 
@@ -106,7 +107,7 @@ pub const default_tally_ratio: f64 = 0;
 pub const reader_staging_bytes: u64 = 10 << 20;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads", "dsa_select", "draft_head", "dsa_split_form", "prompt_residents" };
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "mtp_lane", "draft_depth", "draft_gate", "mtp_acceptance", "mtp_typical_delta", "decode_moe", "decode_glue", "decode_kda", "kda_prologue", "kda_verify", "decode_dsa", "decode_predict", "decode_swiglu", "gpu_keep_warm", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "expert_rows_by_layer", "logits_dump_dir", "exl3_gateup_form", "exl3_down_form", "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits", "miss_reads", "dsa_select", "draft_head", "dsa_split_form", "prompt_residents" } ++ expert_usage.keys;
 
 /// The MTP lane's trained depth (the host's default chain of the release's one MTP layer): the most `draft_depth`
 /// admits. The lane's arrays, its bill and the host's block are sized at it whatever the setting (MiMo's
@@ -203,7 +204,7 @@ pub const DsaSplitForm = @import("dsa_decode.zig").SplitForm;
 /// `Source.init`): `keep` (the default) or `forget` (the control, by name). Exact by construction: a kept resident's slot
 /// bytes are its record's bytes (nothing writes a slot after its read lands; the expert stream's `shrink` settles every
 /// route first), so a prompt plan that counts it as a hit computes on the same bytes a read would bring.
-pub const PromptResidents = enum { keep, forget };
+pub const PromptResidents = expert_usage.PromptResidents;
 /// The EXL3 family's decode forms (exl3_forms.zig), installed once at construction (exl3_math.zig `Math.init`): the
 /// gate / up form (`exl3_gateup_form`): `seam` (lane B's in_rin, two GEMVs, gu_epi; g22-exl3's chain, the control, by
 /// name) or `guone` (DeepSeek's gu_one, the default); the down form (`exl3_down_form`): `seam` or `pair` (DeepSeek's
@@ -429,6 +430,10 @@ pub const Config = struct {
     /// The residents a prompt after a decode finds (experts.zig `Source.resumePrefill`): `keep` (the default) or
     /// `forget` (the control).
     prompt_residents: PromptResidents = .keep,
+    /// `resident_seed`, `expert_usage_record`, `expert_usage_label` (sdk_ext/expert/usage.zig): the prompt rows seeded at
+    /// the load from the pack's `expert-usage-v1.json` (default: when the pack has it), and the usage profile's record
+    /// (default off).
+    residency: expert_usage.Settings = .{},
     /// MiMo's X12 keep-warm (mimo_v2/gpu_warm.zig, adopted there as the default: round -4.7 ms, decode +2.4 %, ids
     /// identical): `waits` (the default) warms the GPU while the stream's event-gated parts (decode miss parts, a prompt
     /// group's reads) and the host's read-ahead wait for their bytes; `off` (the control) installs nothing. Exact by
@@ -587,6 +592,7 @@ pub const Config = struct {
             c.draft_head_named = true;
         }
         _ = c.tally.apply(raw.object);
+        _ = c.residency.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
         c.prompt.apply(raw.object);
         if (raw.object.get("logits_dump_dir")) |v| {
@@ -728,6 +734,7 @@ pub const Config = struct {
         if (c.fusion_named.fuse_join and c.fuse_join == .on and c.decode_glue != .fused) return error.Glm5NextFuseJoinNeedsFusedGlue;
         if (c.malformed.merge_gate_waits) return error.Glm5NextMergeGateWaitsSetting;
         try c.tally.check("glm5_next");
+        try c.residency.check("glm5_next");
         try c.prompt.check(c.expert_family == .exl3);
         switch (c.expert_rows_by_layer) {
             .uniform => {},
@@ -912,6 +919,12 @@ test "glm5_next settings: the rows pin, the lane, unknown keys and malformed val
     try (try parseSettings("{\"prompt_residents\":\"forget\"}")).validate();
     try testing.expectError(error.Glm5NextPromptResidentsSetting, (try parseSettings("{\"prompt_residents\":\"hold\"}")).validate());
     try testing.expectError(error.Glm5NextPromptResidentsSetting, (try parseSettings("{\"prompt_residents\":true}")).validate());
+    // The usage seed and record (sdk_ext/expert/usage.zig): by the pack unless named; a bad value refused by name.
+    try testing.expect((try parseSettings("{}")).residency.seed == null);
+    try testing.expectEqual(expert_usage.Seed.none, (try parseSettings("{\"resident_seed\":\"none\"}")).residency.seed.?);
+    try (try parseSettings("{\"resident_seed\":\"usage\",\"expert_usage_record\":\"/tmp/expert-usage-v1.json\",\"expert_usage_label\":\"he64\"}")).validate();
+    try testing.expectError(error.ResidentSeedSetting, (try parseSettings("{\"resident_seed\":\"hot\"}")).validate());
+    try testing.expectError(error.ExpertUsageRecordSetting, (try parseSettings("{\"expert_usage_record\":\"usage.json\"}")).validate());
     // The retired hit wave (resident_only measured -0.64 % decode): its key refused by name.
     try testing.expectError(error.Unknown, parseSettings("{\"hit_wave\":\"all_pairs\"}"));
     {

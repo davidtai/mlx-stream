@@ -17,6 +17,7 @@ const mlx = sdk.mlx;
 const sdk_ext = @import("../../sdk_ext.zig");
 const expert_event = sdk_ext.expert.event;
 const expert_tally = sdk_ext.expert.tally;
+const expert_usage = sdk_ext.expert.usage;
 const ops = @import("../deepseek_v41/ops.zig");
 const shared_experts = @import("../deepseek_v41/experts.zig");
 const mimo_stream = @import("../mimo_v2/stream.zig");
@@ -163,17 +164,28 @@ pub fn promptResidentsLine(residents: settings.PromptResidents) []const u8 {
     };
 }
 
-/// A request's start on the stream (or its source), after `Source.resumePrefill` (nothing live). `forget` (the control):
-/// every resident and the prompt state forgotten (`forgetResidents`). `keep` after a reverse change (`reversed`): the
-/// residents `shrink(.keep)` left in the prompt rows stay (that shrink already cleared their prompt state). A start with no
-/// phase change before it (the stream still in its prompt phase: the construction's warm-up) forgets as `forget` does.
-/// A request that stops at its prompt still enters decode (`ttft_tail: deferred` runs the phase change in its tail,
-/// `finishTail` -> `enterDecode`), so the next request finds that prompt's residents kept, as after any decode. Then the
-/// prompt counts are zeroed and the pins refreshed (`resetPromptCounts`).
-pub fn requestStart(stream: anytype, residents: settings.PromptResidents, reversed: bool) !void {
-    if (residents == .forget or !reversed) _ = try stream.forgetResidents();
+/// What came before a request's start (`requestStart`): the construction (the stream still in its prompt phase, its
+/// warm-up's residents), the usage seed (`Source.seedResidents`: the residents the load read), or a reverse change.
+pub const Start = enum { construction, seeded, reversed };
+
+/// A request's start on the stream (or its source), after `Source.resumePrefill` (nothing live). After the construction:
+/// every resident and the prompt state forgotten (`forgetResidents`: the warm-up's residents belong to no prompt). After
+/// the usage seed: the seeded residents stay (the seed left them as `shrink(.keep)` leaves a kept one), whatever
+/// `prompt_residents` says. After a reverse change: `forget` (the control) forgets every resident; `keep` leaves the
+/// residents `shrink(.keep)` left in the prompt rows (that shrink already cleared their prompt state). A request that
+/// stops at its prompt still enters decode (`ttft_tail: deferred` runs the phase change in its tail, `finishTail` ->
+/// `enterDecode`), so the next request starts after a reverse change and finds that prompt's residents kept, as after
+/// any decode. Then the prompt counts are zeroed and the pins refreshed (`resetPromptCounts`).
+pub fn requestStart(stream: anytype, residents: settings.PromptResidents, start: Start) !void {
+    const forget = switch (start) {
+        .construction => true,
+        .seeded => false,
+        .reversed => residents == .forget,
+    };
+    if (forget) _ = try stream.forgetResidents();
     stream.resetPromptCounts();
 }
+
 
 /// The phase route of a routed call (MiMo's `decodeLane`): one row in either phase, up to `decode_lane_rows` in decode.
 pub fn decodeLane(nt: u32, decoding: bool) bool {
@@ -260,6 +272,8 @@ pub fn SourceOf(comptime fam: Family) type {
         combine_route: prefill_combine.Route = .inplace,
         /// `prompt_residents` (settings.zig), installed at construction: the residents the reverse change keeps.
         prompt_residents: settings.PromptResidents = .keep,
+        /// The usage seed ran and no request started since (`beginPrefill` keeps the seeded residents once).
+        seeded_start: bool = false,
         /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine (its own queue, kernel, buffer and parked thread); the
         /// stream source holds its arm (`warm_arm`: armed by `gate` and `awaitReadAhead`). Null on the control.
         warm: ?*gpu_warm.Warm = null,
@@ -468,9 +482,32 @@ pub fn SourceOf(comptime fam: Family) type {
         /// A new request: the prompt phase, the previous request's seed and prompt counts forgotten; its residents
         /// forgotten (`forget`, MiMo's) or kept after a decode (`keep`; `requestStart`).
         pub fn beginPrefill(self: *Self) !void {
-            const reversed = self.sdk_stream.phase == .decode;
+            const start: Start = if (self.sdk_stream.phase == .decode) .reversed else if (self.seeded_start) .seeded else .construction;
+            self.seeded_start = false;
             try self.resumePrefill();
-            try requestStart(&self.stream_source, self.prompt_residents, reversed);
+            try requestStart(&self.stream_source, self.prompt_residents, start);
+        }
+
+        /// The usage seed at the load's end (after the warm-up and the pre-builds, before the first request): the prompt
+        /// phase, the warm-up's residents forgotten, then each layer's empty prompt rows filled with its most used experts
+        /// of `profile` (`Stream.seedResidents`: the read-ahead's reads, landed before this returns). The first request
+        /// keeps them (`Start.seeded`).
+        pub fn seedResidents(self: *Self, usage_profile: *expert_usage.Profile) !expert_usage.Seeded {
+            try self.resumePrefill();
+            _ = try self.sdk_stream.forgetResidents();
+            const records = try self.sdk_stream.seedResidents(expert_usage.Order{ .p = usage_profile, .rows = self.rows }, expert_usage.Order.of);
+            self.seeded_start = true;
+            return expert_usage.Seeded.of(self.sdk_stream.layers, self.rows, records);
+        }
+
+        /// The usage profile's record on (`expert_usage_record`), once at construction: decode routes counted.
+        pub fn countRoutes(self: *Self) void {
+            self.sdk_stream.countRoutes();
+        }
+
+        /// The request's usage into `counts` (`tallyShape`: layers x experts), at its end, before `endTally`.
+        pub fn addUsage(self: *Self, counts: []u64) void {
+            self.sdk_stream.addUsage(counts);
         }
 
         /// The request's read schedule from its prompt length, once, after `beginPrefill`.

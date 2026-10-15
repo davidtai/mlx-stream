@@ -282,12 +282,17 @@ pub const Coming = union(enum) { fresh, unknown, continuation: struct { rows: u6
 
 /// What the reverse change leaves in the prompt rows for the coming request (`Stream.shrink`), routed on its kind: a
 /// continuation keeps the residents decode left there (its rows route over the same conversation, and a kept resident
-/// is a hit, not an SSD read: issue #9); a fresh prompt, or a harness's own request end, forgets them, as at
-/// construction (the cold prompt's schedule equals the first prompt's). The rows, and so the bill, are the same.
-pub fn reverseResidents(coming: Coming) expert_stream.Residents {
+/// is a hit, not an SSD read: issue #9); a fresh prompt follows `prompt_residents` (`keep`, the default: the residents
+/// stay, a later prompt's plans count them as hits; `forget`, the control: as at construction); a harness's own request
+/// end forgets them (the cold prompt's schedule equals the first prompt's). The rows, and so the bill, are the same.
+pub fn reverseResidents(coming: Coming, fresh: sdk_ext.expert.usage.PromptResidents) expert_stream.Residents {
     return switch (coming) {
         .continuation => .keep,
-        .fresh, .unknown => .forget,
+        .fresh => switch (fresh) {
+            .keep => .keep,
+            .forget => .forget,
+        },
+        .unknown => .forget,
     };
 }
 
@@ -575,6 +580,8 @@ pub const Module = struct {
     tally_rates: []f32 = &.{},
     tally_window: u32 = 0,
     tally_write: bool = false,
+    /// `prompt_residents` (settings.zig), installed at construction: what a fresh request's reverse change keeps.
+    prompt_residents: sdk_ext.expert.usage.PromptResidents = .keep,
     /// The harness's route overrides the Module was built with (the bill reads the same ones).
     overrides: RouteOverrides = .{},
     /// The prefill routes as built: the trunk's pass and the hook's wide route (with the stream's
@@ -596,6 +603,7 @@ pub const Module = struct {
     pub fn initWith(gpa: std.mem.Allocator, io: std.Io, config: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, ov: RouteOverrides) !*Module {
         try checkCtxSize(config);
         try config.tally.check("deepseek_v41");
+        try config.checkResidency();
         const dir = config.expert_bank_dir orelse return error.Dsv41BankDir;
         const map = config.engram_token_map_path orelse return error.Dsv41BankDir;
         const layer_major = layerMajor(config) catch |e| {
@@ -905,6 +913,11 @@ pub const Module = struct {
             inline else => |t| try t.arm.stream.forgetResidents(),
         };
         log.info("NATIVE construction residents forgotten: {d} rows (the warm-up's); every layer's protection, seed and prompt counts cleared\n", .{forgotten});
+        self.prompt_residents = config.prompt_residents;
+        log.info("{s}\n", .{sdk_ext.expert.usage.promptResidentsLine("deepseek_v41", config.prompt_residents)});
+        // The usage seed (`resident_seed`): the prompt rows the warm-up's forget emptied, filled before the first request
+        // (whose request end returns at once: nothing of a request ran, `prompt_ready`).
+        try self.seedResidents(config, dir);
         try self.openTally(config);
         // The bill at the admitted rows (the boundaries' bounds read it); the verification harness checks the constructed
         // footprint against it (`checkConstruction`).
@@ -1025,6 +1038,30 @@ pub const Module = struct {
         const m = BoundaryMemory.now();
         self.decode_host.end = hostSideOf(m);
         log.info("NATIVE decode host side: end of decode {d} B (after the grow {d} B; footprint {d} B, MLX active {d} B, cache {d} B)\n", .{ self.decode_host.end.?, after, m.footprint, m.active, m.cache });
+    }
+
+    /// `resident_seed` at construction (sdk_ext/expert/usage.zig `decide`): `usage` when the pack has
+    /// `expert-usage-v1.json` (or by name), each stream layer's empty prompt rows filled from it (`Stream.seedResidents`);
+    /// `none` otherwise. A malformed file, or one of another model or geometry, refuses the load by name. One line.
+    fn seedResidents(self: *Module, config: *const settings.Config, dir: []const u8) !void {
+        const usage = sdk_ext.expert.usage;
+        switch (self.arm) {
+            inline else => |t| {
+                const st = t.arm.stream;
+                var d = try usage.decide(self.gpa, self.io, &config.residency, dir, "deepseek_v41", @intCast(st.layers.len), st.bank.n_experts);
+                defer if (d.profile) |*p| p.deinit();
+                var lb: [768]u8 = undefined;
+                const p = if (d.profile) |*x| x else {
+                    log.info("{s}\n", .{usage.seedLine(&lb, "deepseek_v41", &d, .{ .min = 0, .max = 0, .rows_min = 0, .rows_max = 0, .records = 0 }, 0, 0)});
+                    return;
+                };
+                const b0 = st.stats().expert_bytes_read;
+                const t0 = std.Io.Timestamp.now(self.io, .awake);
+                const records = try st.seedResidents(usage.Order{ .p = p, .rows = t.arm.prefill_rows }, usage.Order.of);
+                const ms: u64 = @intCast(@divTrunc(t0.untilNow(self.io, .awake).nanoseconds, std.time.ns_per_ms));
+                log.info("{s}\n", .{usage.seedLine(&lb, "deepseek_v41", &d, usage.Seeded.of(st.layers, t.arm.prefill_rows, records), st.stats().expert_bytes_read -| b0, ms)});
+            },
+        }
     }
 
     /// The rate tally's file read (`expert.tally`; the stream's tally seeded from it: the pins) and the rates its writes
@@ -1651,7 +1688,7 @@ pub const Module = struct {
             // The route only when this change frees the grown rows: without them (the phase change was refused before its
             // grow) no shrink runs and the residents stay as they are, so the record names `keep`.
             x.shrunk = m.grown();
-            x.residents = if (x.shrunk) reverseResidents(x.coming) else .keep;
+            x.residents = if (x.shrunk) reverseResidents(x.coming, m.prompt_residents) else .keep;
             const freed = if (x.shrunk) switch (m.arm) {
                 inline else => |t| try t.arm.shrink(x.residents),
             } else 0;
@@ -3307,11 +3344,15 @@ test "dsv41 memory: the reverse phase change frees, settles, and only then alloc
     try std.testing.expectEqualStrings("fcs", rejected.log[0..rejected.n]);
 }
 
-test "dsv41 memory: the reverse change keeps the prompt rows' residents for a continuation of any length and forgets them for a fresh prompt; its record names the route" {
-    try std.testing.expectEqual(expert_stream.Residents.forget, reverseResidents(.fresh));
-    try std.testing.expectEqual(expert_stream.Residents.forget, reverseResidents(.unknown));
-    for ([_]u64{ 1, 160, 953, 954, 1772, 16384 }) |rows|
-        try std.testing.expectEqual(expert_stream.Residents.keep, reverseResidents(.{ .continuation = .{ .rows = rows, .positions = 40_221 } }));
+test "dsv41 memory: the reverse change keeps the prompt rows' residents for a continuation of any length, keeps or forgets them for a fresh prompt by prompt_residents (keep by default), forgets them at a harness's own end; its record names the route" {
+    // A fresh prompt: `prompt_residents` (keep, the default; forget, the control); a harness's own end: forget.
+    try std.testing.expectEqual(expert_stream.Residents.keep, reverseResidents(.fresh, .keep));
+    try std.testing.expectEqual(expert_stream.Residents.forget, reverseResidents(.fresh, .forget));
+    for ([_]sdk_ext.expert.usage.PromptResidents{ .keep, .forget }) |pr| {
+        try std.testing.expectEqual(expert_stream.Residents.forget, reverseResidents(.unknown, pr));
+        for ([_]u64{ 1, 160, 953, 954, 1772, 16384 }) |rows|
+            try std.testing.expectEqual(expert_stream.Residents.keep, reverseResidents(.{ .continuation = .{ .rows = rows, .positions = 40_221 } }, pr));
+    }
     // `NATIVE DSV41_REVERSE_PHASE_CHANGE`: the route by name and the residents the coming prompt finds.
     const m: BoundaryMemory = .{ .active = 0, .cache = 0, .footprint = 0 };
     const r: ReverseRecord = .{ .before = m, .after = m, .freed_bytes = 0, .residents = .keep, .kept_residents = 11_200, .settle_ms = 0, .bound_bytes = 0, .margin_bytes = 0, .ms = 0 };

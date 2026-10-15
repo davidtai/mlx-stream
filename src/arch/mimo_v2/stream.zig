@@ -1355,6 +1355,43 @@ test "mimo p7 read schedule auto: a request's schedule never changes after its s
     try testing.expectEqual(ReadSchedule.current, try cs.chooseReadSchedule(16_384));
 }
 
+test "mimo p7 read schedule auto with kept residents: request 2 chooses its schedule over request 1's residents (prompt_residents: keep), and a seeded stream's request 1 chooses over the seed; a choice after the prompt started still refuses" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const rows = [_]u32{ 28, 28 };
+    var c40: P7Calls40 = .{};
+    c40.fill(rows[0]);
+    var f: HitFixture = undefined;
+    var ss = try p7Fixture(&f, a, &rows, .auto);
+    defer f.deinit(a);
+    var out: P7Call = .{};
+    for ([_]u64{ 1023, 16_384, 8191 }, 0..) |prompt, req| {
+        // Request 1 starts after the construction's forget; each later one keeps the last one's residents
+        // (`Source.beginPrefill` under keep: `Stream.forgetPrompt`, then the counts zeroed).
+        if (req > 0) try testing.expect(f.stream.residentCount() > 0);
+        const chose = try ss.chooseReadSchedule(prompt);
+        try testing.expectEqual((AutoSchedule{}).of(prompt), chose);
+        try testing.expectEqual(aheadPost(chose), f.stream.prompt_ahead);
+        for (0..2) |k| try p7RunCallProbed(&f, &ss, @intCast(1 + k), c40.ids[req * 2 + k], c40.pred[req * 2 + k], &out, p7NoChoice);
+        try ss.stream.settleRoutes();
+        try testing.expectError(error.PromptStarted, ss.chooseReadSchedule(prompt));
+        try f.stream.forgetPrompt();
+        ss.resetPromptCounts();
+    }
+    // A seeded stream (residents read at the load, no prompt yet): request 1 chooses.
+    _ = try ss.forgetResidents();
+    const Order = struct {
+        ids: []const u16,
+        fn of(o: @This(), _: u32) []const u16 {
+            return o.ids;
+        }
+    };
+    _ = try f.stream.seedResidents(Order{ .ids = &.{ 0, 1, 2, 3 } }, Order.of);
+    ss.resetPromptCounts();
+    try testing.expect(f.stream.residentCount() > 0);
+    try testing.expectEqual((AutoSchedule{}).of(16_384), try ss.chooseReadSchedule(16_384));
+}
+
 fn packedRef(ref: SlotRef) u32 {
     return (@as(u32, @backingInt(ref.bank)) << 24) | ref.row;
 }

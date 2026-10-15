@@ -43,7 +43,8 @@ The block's optional `settings` object takes the keys below. The arch reads them
 (`src/arch/glm5_next/settings.zig`, the prompt levers' keys in `prompt_levers.zig`). A key that is not in this table
 refuses the load by name (`Glm5NextSettingUnknown`); a `settings` value that is not an object refuses it as
 `Glm5NextSettingsBlock`. A wrong value refuses the load by the name in the "Refusal" column. Every refusal name has the
-prefix `Glm5Next` except the three tally names. The residents' format is the pack's own top-level `residents_format`
+prefix `Glm5Next` except the three tally names and the names of the usage seed and record (`ResidentSeedSetting`,
+`ExpertUsage*`), which the three arches share (`src/sdk_ext/expert/usage.zig`). The residents' format is the pack's own top-level `residents_format`
 (below), not a setting.
 
 | Key | Values | Default | Refusal | Meaning |
@@ -75,6 +76,9 @@ prefix `Glm5Next` except the three tally names. The residents' format is the pac
 | `gpu_keep_warm` | `waits`, `off` | `waits` (`off` on a CPU stream) | `GpuKeepWarmSetting` | MiMo's X12 keep-warm while the stream waits for its bytes. |
 | `miss_reads` | `direct`, `staged` | `direct` on an EXL3 pack; `staged` on an NVFP4 pack | `MissReadsSetting`; the stream refuses `direct` by name (`DirectReads*`) when a record or a slot row is off the file's block | The demand reads: straight into the slot rows, or through a staging buffer and a copy. Exact. |
 | `prompt_residents` | `keep`, `forget` | `keep` | `PromptResidentsSetting` | The residents a prompt after a decode finds: `keep` leaves the residents of the prompt rows for the next prompt, whose plans count them as hits; `forget` (the control) starts every request from empty rows. Exact. |
+| `resident_seed` | `usage`, `none` | `usage` when the pack directory has `expert-usage-v1.json`, else `none` | `ResidentSeedSetting`; `usage` without the file: `ExpertUsageMissing`; a bad file: `ExpertUsageMalformed`, `ExpertUsageMismatch` | At the end of the load, the empty prompt rows of each layer get the layer's most used experts of the file (one read-ahead pass per layer). The first request keeps them. The policy does not change. Exact. One line: `glm5_next expert residents seeded: ...`. |
+| `expert_usage_record` | an absolute file path, at most 1,024 bytes | absent (off) | `ExpertUsageRecordSetting`; an unwritable path: `ExpertUsageRecordNotWritable`; a file of another model or geometry at the path: `ExpertUsageMismatch`, `ExpertUsageMalformed` | Records the usage profile. A file already at the path is the start (this load is a new session). Each request's end adds its counts per layer (the prompt pass: one per routed id; decode: one per decode route that requested the expert) and writes the file. The recorder prints its line only when on. |
+| `expert_usage_label` | a string of 1 to 256 bytes | `unlabeled` | `ExpertUsageLabelSetting`; without `expert_usage_record`: `ExpertUsageLabelWithoutRecord` | The prompt set of this load's session in the file's `source`. |
 | `exl3_gateup_form` | `guone`, `seam` | `guone` | `Exl3GateUpFormSetting`; `Exl3FormsOnNvfp4Pack` (a form other than `seam` named on an NVFP4 pack) | The EXL3 family's decode gate / up form. Inert on an NVFP4 pack. |
 | `exl3_down_form` | `pair`, `seam` | `pair` | `Exl3DownFormSetting`; `Exl3FormsOnNvfp4Pack` | The EXL3 family's decode down form. |
 | `exl3_wave_rows` | integer 128 .. 4,096 in steps of 128 | 2,048 | `Exl3WaveRows`; `Exl3WaveRowsFamily` (a size other than 1,024 named on an NVFP4 pack) | The EXL3 family's prompt wave rows at most. Exact. |

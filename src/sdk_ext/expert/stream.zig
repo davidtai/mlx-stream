@@ -751,6 +751,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// The route recorder, a diagnostic its arch arms (`expert.routes`): every decode route, the handover's
             /// residents and prompt counts. Null: off.
             recorder: ?*expert_routes.Recorder = null,
+            /// The request's prompt pass started: a prompt route, seed, call plan or read-ahead ran since the request's start
+            /// (`resetPromptCounts` clears it). `setPromptAhead` refuses once it is set. Residents do not set it: a kept or
+            /// seeded resident is not a started prompt.
+            prompt_started: bool = false,
             /// P7 (`Options.prompt_reads`, `prompt_ahead`, `ahead_cap`).
             prompt_reads: PromptReads = .stock,
             prompt_ahead: AheadPost = .head,
@@ -1344,9 +1348,20 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return n;
             }
 
+            /// A kept request start without a shrink (MiMo's uniform rows or deferred growth): every layer's prompt state
+            /// forgotten (`LayerPolicy.forgetPrompt`), its residents kept, as `shrink(.keep)` leaves them. Nothing live.
+            pub fn forgetPrompt(self: *Stream) !void {
+                if (self.phase != .prefill) return error.NotPrefill;
+                try self.flush();
+                for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
+                if (self.ahead.live or self.held_base.items.len > 0) return error.RoutesLive;
+                for (self.layers) |*ls| _ = ls.policy.forgetPrompt();
+            }
+
             /// A request's start: every layer's prompt counts zeroed (they would otherwise add up across requests). The
             /// policy's rank tie-break reads them too, so request 1 (zeroed by the construction's forget) is unchanged.
             pub fn resetPromptCounts(self: *Stream) void {
+                self.prompt_started = false;
                 for (self.layers) |*ls| {
                     @memset(ls.policy.prefill_freq, 0);
                     // The prompt's pins at the rows it has (the tally's rates as the last request left them).
@@ -1374,9 +1389,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// P7 `overlap`: a request's read-ahead post (`AheadPost`), set once at the request's start by an arch that
             /// chooses it per request (MiMo's `prefill_read_schedule: auto`, by the prompt's length). Only at a request's
             /// start: refused on a `stock` stream, outside the prompt phase, on a failed stream, while anything of a prompt
-            /// pass is live (a read-ahead, a route, a planned call, a held slot) and once any layer holds a resident (the
-            /// request's first read-ahead or route admitted one; `forgetResidents` starts the next request empty), so a
-            /// request's prompt pass never changes it. `readAheadSeed` reads it at each layer's post as it reads the
+            /// pass is live (a read-ahead, a route, a planned call, a held slot) and once the request's prompt pass started
+            /// (`prompt_started`: its first route, seed, call plan or read-ahead; `resetPromptCounts` starts the next request),
+            /// so a request's prompt pass never changes it. Residents kept from the last request (`prompt_residents: keep`)
+            /// or seeded at the load (`resident_seed`) do not refuse it. `readAheadSeed` reads it at each layer's post as it reads the
             /// construction value, and the call's plans read it for `whole_trim`'s withdraw (X21; `auto` never sets
             /// `whole_trim`); nothing else does.
             pub fn setPromptAhead(self: *Stream, post: AheadPost) !void {
@@ -1385,7 +1401,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.failed) return error.StreamFailed;
                 if (self.ahead.live or self.p7.live or self.held_base.items.len > 0) return error.RoutesLive;
                 for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
-                for (self.layers) |*ls| if (ls.policy.occupancy != 0) return error.PromptStarted;
+                if (self.prompt_started) return error.PromptStarted;
                 self.prompt_ahead = post;
             }
 
@@ -1398,6 +1414,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// prefill routes.
             pub fn seedPrefill(self: *Stream, layer: u32, ids: []const u16) !void {
                 if (self.phase != .prefill) return error.NotPrefill;
+                self.prompt_started = true;
                 const ah = &self.ahead;
                 // P7 overlap: the seed reads residency only; the read-ahead lands where a plan needs it (`planCall`).
                 if (self.prompt_reads == .stock and ah.live and ah.layer == layer) try self.awaitReadAhead(layer);
@@ -1441,6 +1458,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
 
             fn routeWith(self: *Stream, layer: u32, ids: []const u16, scores: []const f32, step: bool) Error!*Route {
                 if (self.failed) return error.StreamFailed;
+                self.prompt_started = self.prompt_started or self.phase == .prefill;
                 self.notePrecision(layer, ids, step);
                 std.debug.assert(ids.len > 0 and ids.len <= self.max_route_ids);
                 // Decode's window 0 holds `decode_route_ids` rows: a decode route is never wider (the caller's contract).
@@ -1827,6 +1845,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.failed) return error.StreamFailed;
                 if (self.phase != .prefill) return error.NotPrefill;
                 if (self.ahead.live) try self.awaitReadAhead(self.ahead.layer);
+                self.prompt_started = true;
                 const ah = &self.ahead;
                 const mn = minisOf(&self.bank.layers[layer]);
                 // The ticket ring's room in records (each record's minis take a gate/up and a down ticket apiece).
@@ -1982,6 +2001,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn planCall(self: *Stream, layer: u32, distinct: []const u16, width: u32) Error!void {
                 if (self.failed) return error.StreamFailed;
                 std.debug.assert(self.prompt_reads == .overlap and self.phase == .prefill);
+                self.prompt_started = true;
                 if (self.p7.live) return self.fail(error.RoutesLive);
                 try self.flush();
                 if (self.n_free != route_capacity or self.held_base.items.len > 0) return self.fail(error.RoutesLive);
@@ -2394,6 +2414,65 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 // No prompt routed what the preload read.
                 self.ahead.tallied = true;
                 return n;
+            }
+
+            /// The usage seed (`expert.usage`, at construction: the prompt phase, nothing live, every layer's rows empty):
+            /// each layer's empty prompt rows filled with `order(ctx, layer)` (hottest first, at most the layer's rows) by
+            /// the read-ahead's load path (`readAheadSeed`: the reads a prompt's read-ahead issues, batched per layer, then
+            /// landed), as many batches as the ticket ring needs. Then every layer's prompt state goes (`forgetPrompt`), so
+            /// each seeded expert is a resident as `shrink(.keep)` leaves one: unprotected, recency 0, never pinned by the
+            /// seed; the dynamic policy evicts it as any other. Exact by construction: a seeded row holds its record's bytes
+            /// as a read-ahead's does. Returns the records read.
+            pub fn seedResidents(self: *Stream, ctx: anytype, comptime order: fn (@TypeOf(ctx), u32) []const u16) !u64 {
+                if (self.phase != .prefill) return error.NotPrefill;
+                if (self.failed) return error.StreamFailed;
+                try self.flush();
+                for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
+                if (self.ahead.live or self.held_base.items.len > 0) return error.RoutesLive;
+                for (self.layers) |*ls| if (ls.policy.occupancy != 0) return error.SeedRowsNotEmpty;
+                var n: u64 = 0;
+                for (0..self.layers.len) |l| {
+                    const layer: u32 = @intCast(l);
+                    const ids = order(ctx, layer);
+                    var done: usize = 0;
+                    while (done < ids.len) {
+                        try self.readAheadSeed(layer, ids[done..]);
+                        const admitted = self.ahead.n;
+                        for (self.ahead.reads[0..admitted]) |rd| n += @intFromBool(rd);
+                        try self.awaitReadAhead(layer);
+                        if (admitted == 0) break;
+                        // The admission takes the ids in order and skips none it can place (none is resident: the rows
+                        // started empty); it stops at the ring's room or the layer's rows.
+                        done += admitted;
+                    }
+                }
+                // No prompt routed what the seed read.
+                self.ahead.tallied = true;
+                for (self.layers) |*ls| _ = ls.policy.forgetPrompt();
+                return n;
+            }
+
+            /// The usage profile's route counting on (`LayerPolicy.count_routes`), once at construction: each decode route
+            /// counts its experts into the request's counts even without the rate tally (`addUsage` reads them).
+            pub fn countRoutes(self: *Stream) void {
+                for (self.layers) |*ls| ls.policy.count_routes = true;
+            }
+
+            /// The request's usage (`expert.usage.Recorder`), at its end and before the tally's `endTally` (which zeroes the
+            /// decode counts): each layer's prompt counts (`prefill_freq`: every routed id of the prompt pass) and decode
+            /// counts (`request_counts`: the decode routes that requested each expert) added into `counts` (`n_experts`
+            /// per stream layer, layer order). Without the tally the decode counts are zeroed here.
+            pub fn addUsage(self: *Stream, counts: []u64) void {
+                const n = self.bank.n_experts;
+                std.debug.assert(counts.len == self.layers.len * n);
+                for (self.layers, 0..) |*ls, l| {
+                    const p = &ls.policy;
+                    for (counts[l * n ..][0..n], p.prefill_freq, p.request_counts) |*c, f, r| c.* += @as(u64, f) + r;
+                    if (p.alpha == 0) {
+                        @memset(p.request_counts, 0);
+                        p.request_routes = 0;
+                    }
+                }
             }
 
             /// P1's construction self-check: `experts` of `layer` (none resident, one route wide) read ahead, hashed, zeroed and

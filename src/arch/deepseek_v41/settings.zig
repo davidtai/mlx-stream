@@ -21,6 +21,15 @@ pub const Config = struct {
     /// The expert stream's rate tally (`expert_resident_ratio`, `expert_tally_window`, `expert_tally_file`): off by
     /// default (ratio 0) until a DeepSeek-V4.1 measurement shows it; its window and ratio were chosen on GLM-5.3's routes.
     tally: sdk_ext.expert.tally.Settings = .{ .ratio = 0 },
+    /// The residents a fresh prompt after a decode finds (`prompt_residents`, glm5_next's setting; module.zig
+    /// `reverseResidents`): `keep` (the default: the residents decode left in the prompt rows stay, the prompt's plans
+    /// count them as hits) or `forget` (the control: a fresh request starts from empty rows). A continuation keeps them
+    /// either way. A value of another type or name is refused at construction by name (`Dsv41PromptResidentsSetting`).
+    prompt_residents: sdk_ext.expert.usage.PromptResidents = .keep,
+    prompt_residents_bad: bool = false,
+    /// `resident_seed` (sdk_ext/expert/usage.zig): the prompt rows seeded at the load from the pack's
+    /// `expert-usage-v1.json` (default: when the pack has it). The usage record is glm5_next's only (refused by name).
+    residency: sdk_ext.expert.usage.Settings = .{},
     /// The prompt pass's bill for the prefill admission.
     dsv41_prefill: ?v41.PrefillBill = null,
     /// The shell's facts: routed experts and layers.
@@ -80,6 +89,15 @@ pub const Config = struct {
     /// combines read them in f32). Rounding-class against the f32 outputs. null = the tier's: on for served; false: f32.
     kv16_expert_bf16: ?bool = null,
 
+    /// The load's refusal of a bad `prompt_residents` or residency value, by name.
+    pub fn checkResidency(c: *const Config) !void {
+        if (c.prompt_residents_bad) {
+            log.warn("deepseek_v41: load refused: prompt_residents names none of keep, forget (Dsv41PromptResidentsSetting)\n", .{});
+            return error.Dsv41PromptResidentsSetting;
+        }
+        try c.residency.checkSeedOnly("deepseek_v41");
+    }
+
     /// The host's load facts onto this config (the module and the bill read them under these names).
     pub fn withFacts(c: Config, facts: *const sdk.LoadFacts) Config {
         var out = c;
@@ -111,6 +129,12 @@ pub const Config = struct {
             }
         };
         if (c.tally.apply(obj)) any = true;
+        if (c.residency.apply(obj)) any = true;
+        if (obj.get("prompt_residents")) |v| {
+            const r: ?sdk_ext.expert.usage.PromptResidents = if (v == .string) std.meta.stringToEnum(sdk_ext.expert.usage.PromptResidents, v.string) else null;
+            if (r) |x| c.prompt_residents = x else c.prompt_residents_bad = true;
+            any = true;
+        }
         if (obj.get("expert_wide_cold_rows")) |v| if (v == .integer and v.integer >= 1 and v.integer <= 8) {
             c.expert_wide_cold_rows = @intCast(v.integer);
             any = true;
@@ -272,4 +296,27 @@ test "dsv41 settings: the load facts replace the fill's inputs" {
     try testing.expectEqual(@as(?u32, 130), c.expert_prefill_rows);
     try testing.expectEqual(@as(?bool, true), c.nocache_weights);
     try testing.expectEqual(@as(?NumericTier, .stock), c.numeric_tier);
+}
+
+test "dsv41 settings: prompt_residents: keep unless named; forget (the control) by name; anything else refused by name; resident_seed parses; the usage record is refused by name" {
+    const parse = struct {
+        fn f(text: []const u8) !Config {
+            const v = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+            defer v.deinit();
+            var c: Config = .{};
+            c.applySettings(v.value);
+            return c;
+        }
+    }.f;
+    const usage = sdk_ext.expert.usage;
+    try std.testing.expectEqual(usage.PromptResidents.keep, (try parse("{}")).prompt_residents);
+    const fg = try parse("{\"prompt_residents\":\"forget\"}");
+    try fg.checkResidency();
+    try std.testing.expectEqual(usage.PromptResidents.forget, fg.prompt_residents);
+    try std.testing.expectError(error.Dsv41PromptResidentsSetting, (try parse("{\"prompt_residents\":\"hold\"}")).checkResidency());
+    try std.testing.expectError(error.Dsv41PromptResidentsSetting, (try parse("{\"prompt_residents\":1}")).checkResidency());
+    try std.testing.expectEqual(usage.Seed.usage, (try parse("{\"resident_seed\":\"usage\"}")).residency.seed.?);
+    try std.testing.expectError(error.ResidentSeedSetting, (try parse("{\"resident_seed\":\"all\"}")).checkResidency());
+    try std.testing.expectError(error.ExpertUsageRecordNotInstalled, (try parse("{\"expert_usage_record\":\"/tmp/u.json\"}")).checkResidency());
+    try std.testing.expectEqualStrings("deepseek_v41 prompt residents: keep (decode's residents stay for the next prompt)", usage.promptResidentsLine("deepseek_v41", .keep));
 }
