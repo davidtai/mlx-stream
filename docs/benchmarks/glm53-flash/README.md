@@ -1,28 +1,89 @@
 # GLM-5.3-Flash on mlx-stream: benchmark record
 
-This directory records the GLM-5.3-Flash (`glm5_next`) serving stacks measured on 2026-10-14: the exact stack of record
-**g25b** and **g26**, which is g25b plus a q8 draft head (rounding-class). It gives the stacks' rows ladders, every lever
-pair of the day with its verdict, how the numbers were measured, the serve recipe and what did not work.
+This directory records the GLM-5.3-Flash (`glm5_next`) serving stacks measured on 2026-10-14 and the night of 10-14/15.
+The stacks of record are now **g25-dsa3** (exact) and **g26-dsa3** (rounding-class: g25-dsa3's twin with a q8 draft head).
+Both carry the DSA lane-copy fixes (see [The DSA lane-copy finding](#the-dsa-lane-copy-finding)) on top of the day's
+stacks **g25b** and **g26**, which this record keeps as the controls they were measured against. It gives the stacks' rows
+ladders, every lever pair with its verdict, how the numbers were measured, the serve recipe and what did not work.
 
-| Stack | Plugin | Server SHA-256 | Class | 190/217 decode / prefill | 199/225 decode / prefill |
+| Stack | Plugin | Server SHA-256 | Class | 190/217 decode / prefill | Headline (rows) decode / prefill |
 | --- | --- | --- | --- | ---: | ---: |
-| g25b | `glm5next/exl3-k3-stack3` `f8465ad` | `3514568e` | exact | 32.80 / 1,093.3 | 33.80 / 1,083.7 |
-| g26 | `glm5next/exl3-k3-stack4` `9bf67a7` | `087434fe` | rounding-class | 34.55 / 1,092.8 | 35.60 / 1,085.9 |
+| **g25-dsa3** | `glm5next/exl3-k3-stack3-dsalane` `0457394` | `6481fa1b` | exact | not measured alone (see g25-dsa) | <!-- PENDING-HEADLINE g25-dsa3 @199/225 (batch 53) --> PENDING (199/225) |
+| g25-dsa | `glm5next/exl3-k3-stack3-dsalane` `88d2aad` | `5bbd8512` | exact | 33.15 / 1,093.5 | 34.10 / 1,084.3 (199/225) |
+| **g26-dsa3** | `glm5next/exl3-k3-dsalane` `cf30601` | `de1ab1f6` | rounding-class | 34.95 / 1,093.0 | 35.70 / 1,085.4 (197/223); <!-- PENDING-HEADLINE g26-dsa3 @199/225 (batch 54b) --> 199/225 PENDING |
+| g25b | `glm5next/exl3-k3-stack3` `f8465ad` | `3514568e` | exact | 32.80 / 1,093.3 | 33.80 / 1,083.7 (199/225) |
+| g26 | `glm5next/exl3-k3-stack4` `9bf67a7` | `087434fe` | rounding-class | 34.55 / 1,092.8 | 35.60 / 1,085.9 (199/225) |
 
-Both servers are host `glm5next/host` `a8f6c6b8` with the plugin above, built ReleaseFast. Against the 40 tok/s decode /
-1,000 tok/s prefill goal, prefill is met on both stacks; decode is at 85 % (g25b) and 89 % (g26) of the goal at 199/225.
+All servers are host `glm5next/host` `a8f6c6b8` with the plugin above, built ReleaseFast. Against the 40 tok/s decode /
+1,000 tok/s prefill goal, prefill is met on every stack. Decode reaches 34.10 on the exact stacks (85 % of the goal,
+g25-dsa at 199/225) and 35.70 on the q8 stacks (89 %, g26-dsa3 at 197/223).
+
+g25-dsa3 is g25-dsa plus the MTP head's side rows. That lever measured +2.79 % on the q8 stack with the tail fix included
+(g26bin-vs-dsa3) against g26-dsa2's +1.61 % for the tail fix alone (g26bin-vs-dsa2, a different window): about +0.4 % for the side rows; it is exact and was stacked without its own exact
+pair (small exact positives stack, judged by the stack's next pair).
 
 Which stack is the headline is a policy choice:
 
-- **g25b** (exact): every token id equals the serial path's at equal rows. Choose it when the headline must be exact.
-- **g26** (rounding-class): the q8 head changes which drafts the lane offers, so ids diverge from g25b (first at token
-  872 of the 1,024-token cell). It passed the three-fixture grader battery 3/3, where the exact control failed the code
-  fixture on the same single sample.
+- **g25-dsa3** (exact): every token id equals the serial path's at equal rows. Choose it when the headline must be exact.
+- **g26-dsa3** (rounding-class): the q8 head changes which drafts the lane offers, so ids diverge from the exact stack
+  (first at token 872 of the 1,024-token cell on g26). It passed the three-fixture grader battery 3/3, where the exact
+  control failed the code fixture on the same single sample.
 
 This document is on branch `glm5next/docs-glm53-flash`, cut from the stack4 commit `9bf67a7`. If the exact stack is
 chosen, the same files apply on stack3 (`f8465ad`): this directory and the chart script are the only changes.
 
-## The stacks
+## The stacks of record (2026-10-15)
+
+**g25-dsa3** (exact), `glm5next/exl3-k3-stack3-dsalane` at `0457394`, server
+`6481fa1b07932a2aa215895b2431f611908975e22d612c4e903181fe41067ba5`. Commits over g25b (`f8465ad`), each cherry-picked
+from the q8 branch `glm5next/exl3-k3-dsalane` without the q8 head's hunks:
+
+- `4fcfc92` (from `c063864`): the index lane's append in place (the pooled-keys text reads the lane buffer; the gate cast
+  and the row concatenation folded into that text) and `dsa_split_form` with `lean` the default (bit for bit the current
+  split; it measured a wash, see the lever table);
+- `88d2aad` (from `2cee232`): the 16-row stored tail beside each DSA lane, which the pooled-keys text reads, so the trunk's
+  lane appends are donated (in place) in decode;
+- `0457394` (from `cf30601`): the MTP head's side rows. A round's draft steps past the first keep their latent and index
+  rows in a per-round side buffer (`dsa.Side`) instead of appending to the head's lanes. The side-aware scores and split
+  texts read the lane rows, then the side rows: the same keys in the same order.
+
+Bill identical to g25b (0 B); rows 190/217 at 12.6 GB.
+
+**g26-dsa3** (rounding-class), `glm5next/exl3-k3-dsalane` at `cf30601`, server
+`de1ab1f6bdd65ce60e84e4ca3aee84fb6e5ffe9a9641e1a32dce2096cc7ca3ff`: g26 (`9bf67a7`) + `c063864` + `2cee232` + `cf30601`
+(the same three changes, on the q8 stack). Bill identical to g26: the q8 head's `mtp_head_q8` term, so its pins admit
+0.68 GB less baseline than the exact stack's.
+
+## The DSA lane-copy finding
+
+The DSA layers append each step's latent and index rows to preallocated lanes, a slice update that MLX performs in
+place only when nothing else holds the lane buffer (`lib/mlx-src/mlx/backend/metal/utils.h:218-223`,
+`primitives.cpp:128-133`). MLX keeps a reference to every input of an encoded GPU op until its command buffer completes
+(`metal/eval.cpp:47-67`). The pooled-keys text reads the index lane in the same forward, still in flight at the append,
+so the append copied the whole lane: 32,768 × 512 B = 16.8 MB read and written per DSA layer per forward. The latent lane
+copied too (in place on 3 of 11 layers), and the MTP head's lanes copied at every draft step, because the draft chain
+runs a round's steps in one graph.
+
+The first fix (`c063864`: the text reads the lane by offset) did not engage on the device: its probe printed
+`append=copy` (batch 45, INVALID on engagement; see the lever table). The holder is the in-flight read itself, which a
+view's lifetime does not cover. The fixes that engaged:
+
+- **Stored tails** (`2cee232`): a 16-row tail beside each lane holds the pool's newest rows, and the pooled-keys text
+  reads the tail instead of the lane. Same stored values: exact.
+- **Side rows for the MTP head** (`cf30601`): see the stack list above. Exact (CPU emulator bit-identical; the trunk
+  scores text unchanged by sha).
+
+Engagement is visible in two places:
+- a construction probe line, `glm5_next dsa index lane: append=in_place|copy`;
+- the request-end tally line, per lane group and phase: `glm5_next dsa lanes over the request (in place = the buffer
+  kept): trunk whole latent=a/11 index=b/11; trunk decode latent=c/11 index=d/11; mtp_head whole latent=... index=...;
+  mtp_head decode latent=... index=...`.
+
+The window probe (batch 46, g26-dsa2) read decode latent and index in place 11/11. The prompt pass still copies: the
+whole-request tally reads 2/11 latent and 0/11 index, because span N+1's append meets span N's reads in flight in the
+layer-major prompt pass. That costs about 30 ms per 16K prompt; not fixed.
+
+## The stacks of 2026-10-14
 
 **g25b**, `glm5next/exl3-k3-stack3` at `f8465ad`, server `3514568e20cb4d3bc4cf9b0e2fae88c4df988d2201baf09cdf0c53a11df1e2a5`.
 Each item below is an exact construction-time route, on by default (the old value stays settable by key):
@@ -94,6 +155,35 @@ Prefill at 190/217 is from the stack's own head-to-head pair (g24bin-vs-g25 and 
 The rows pairs' A arms give the 190/217 decode. The 225 cells and the peak footprint are the process's lifetime peak
 physical footprint, in decimal GB (10^9 B).
 
+### g25-dsa (exact, DSA lane fix) and g25-dsa3
+
+| Rows P/D | Decode (tok/s) | Prefill (tok/s) | Peak footprint (GB) | Arms | Pin admits up to (GB) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 190/217 | 33.15 | 1,093.5 | 104.21 | 2 | 12.69 |
+| 199/225 | 34.10 | 1,084.3 | 107.40 | 1 | 9.30 |
+| g25-dsa3 199/225 | <!-- PENDING-HEADLINE g25-dsa3 @199/225 (batch 53): decode / prefill / peak --> PENDING | PENDING | PENDING | 1 | 9.30 |
+
+![g25-dsa decode vs decode rows](decode_rows_g25-dsa.svg)
+
+![g25-dsa peak footprint vs decode rows](peak_rows_g25-dsa.svg)
+
+### g26-dsa3 (q8 draft head + DSA lane fixes, rounding-class)
+
+| Rows P/D | Decode (tok/s) | Prefill (tok/s) | Peak footprint (GB) | Arms | Pin admits up to (GB) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 190/217 | 34.95 | 1,093.0 | 104.88 | 2 | 12.01 |
+| 197/223 | 35.70 | 1,085.4 | 107.28 | 1 | 9.42 |
+| 199/225 | <!-- PENDING-HEADLINE g26-dsa3 @199/225 (batch 54b): decode / prefill / peak --> PENDING | PENDING | PENDING | 1 | 8.62 |
+
+![g26-dsa3 decode vs decode rows](decode_rows_g26-dsa3.svg)
+
+![g26-dsa3 peak footprint vs decode rows](peak_rows_g26-dsa3.svg)
+
+The two new ladders have two measured rungs each so far. The 190/217 rung is the B arms of the stack's head-to-head pair
+(g25bin-vs-g25dsa, g26bin-vs-dsa3). The upper rung is a first-step headline cell, flagged OVERFILL like the 225 cells
+above: 1.23 GB over the fill at load for g25-dsa, 0.9 GB for g26-dsa3. The g25-dsa3 rung at 199/225 is pending. When it
+lands it belongs to the g25-dsa3 ladder, not g25-dsa's: the side rows add a lever.
+
 ## Lever pairs, 2026-10-14
 
 Each pair is one ABBA window (control, lever, lever, control), lane on, both arms at 190/217 with the standard MTP block,
@@ -140,6 +230,11 @@ disagreed by more than the cap. Exact means token ids identical across all four 
 | Rows 193/219, 195/221 on g26 | g26-rows-193-219, g26-rows-195-221 | g26 | 34.55 → 34.85; 34.45 → 35.05 | +0.87 %; +1.74 % beyond | within | rows differ | VALID | rows ladder |
 | draft_gate 0.4 vs 0.5 on g26 | g26-vs-g04 | g26 | 34.35 → 33.85 | −1.46 % beyond (cc −1.24 %) | 0.00 % | diverge @258 (record-only) | VALID | dead: the gate stays 0.5 |
 | Fused EXL3 glue (gu_epi + din_rin) | g26-vs-gf | g26-gf `6cba0f9` | 34.30 / 34.50 → 32.30 / 33.30 (per arm) | slower in both B arms | — | B arms differ from each other (@161) and from A | INVALID | dead: the glue stays separate (g26's only route; g26-gf is not a stack) |
+| DSA index lane in place + two folds + lean split | g26bin-vs-dsa | g26 / g26-dsa `36927e68` | A 34.30 / 34.20 → B 34.40 / 34.30 (per arm) | wash | — | exact | INVALID (engagement) | the probe printed `append=copy`: the fix did not engage (the in-flight read holds the lane); replaced by the tail fix |
+| Lean DSA split alone | g26-vs-dsa | g26-dsa | 34.50 → 34.50 | 0.0 % | — | exact | INVALID (engagement) | the split engaged (lean vs current lines present), but both arms printed the absent string `append=copy`; the numbers are a wash: dead (kept as the default, bit for bit the current split) |
+| DSA tail fix + two folds + lean split | g26bin-vs-dsa2 | g26 / g26-dsa2 `b88c79dd` | 34.25 → 34.80 | +1.61 % beyond (cc +1.67 %) | −0.08 % | exact | VALID | stacked (q8 stack of record at 23:44Z) |
+| DSA tail fix on the exact stack | g25bin-vs-g25dsa | g25b / g25-dsa `5bbd8512` | 32.85 → 33.15 | +0.91 % beyond (cc +0.94 %) | +0.04 % | exact | VALID | stacked (exact stack of record at 00:17Z) |
+| Tail fix + MTP head side rows | g26bin-vs-dsa3 | g26 / g26-dsa3 `de1ab1f6` | 34.00 → 34.95 | +2.79 % beyond (cc +2.77 %) | −0.12 % | exact | VALID | **g26-dsa3 = q8 stack of record**; the side rows stacked onto the exact stack as g25-dsa3 |
 
 Stacks in the table: g22-exl3 is the EXL3 K=3 base (`99f3454`); each g22-* is that base plus one lane's switches,
 defaults off. g23 (`55e814f`) adds the forms default, the prompt bundle and the typical merge (off). g23n (`e493364`) is
@@ -182,6 +277,14 @@ pre-build. g25b (`f8465ad`) adds the batched DSA selection, and g26 (`9bf67a7`) 
     116.29 GB against 120.26.
   - They are n=1 with no same-window control. The 190/217 controls of batches 36–39 read 32.7–32.8 (g25b) and
     34.45–34.80 (g26).
+- **Clean-floor headline cells (from batch 52):** the first-step rule was not enough for the q8 stack's 225 pin. Its bar
+  is 0.68 GB tighter (8.62 GB admit-to, physical use ≤ 8.47 GB at the gate) and was refused twice, with gates at
+  9.38–10.09 GB after the previous step's work. Headline cells now run behind a clean wait:
+  - the runner waits for 120 s with no build or test running;
+  - it pulses the memory pressure in-runner (file and speculative pages evicted);
+  - it reads physical use the way the chain's gate computes it (a 10-sample vm_stat read), then hands over to the gate.
+
+  g26-dsa3 at 197/223 was admitted that way: 7.88 GB after the pulse, 8.25 at the gate.
 
 ## Serve recipe
 
@@ -213,6 +316,10 @@ Every lever above is the stack's default: no other key is needed. On g26, add `"
 | 193/219 | 11.69 | 11.01 |
 | 195/221 | 10.89 | 10.22 |
 | 199/225 | 9.30 | 8.62 |
+
+The q8 column is 0.68 GB tighter at every pin: the `mtp_head_q8` term. 197/223 on the q8 stack admits up to 9.42 GB.
+The DSA lane fixes add no bill term; g25-dsa3 and g26-dsa3 use their parents' bars. For the stacks of record, choose
+g25-dsa3 (`6481fa1b`) or g26-dsa3 (`de1ab1f6`); their defaults carry every lever, so the settings block below is unchanged.
 
 The fill at a 12.6 GB baseline is 190/217 on g25b. On g26 it is 189/215: the q8 head's 0.67 GB means 190/217 needs a
 baseline ≤ 12.01 GB. Decode rows above 225 are refused at load by the default per-layer offsets (largest +63, cap 288).
@@ -247,6 +354,18 @@ baseline ≤ 12.01 GB. Decode rows above 225 are refused at load by the default 
   GB bar: foreign processes, a 1 GB disk read lifting the page cache, protected system daemons that cannot be stopped.
   The clean floor (7.9–8.3 GB right after the production server's bootout) admits it, hence the first-step single
   cells.
+- **KDA tiling audit:** the 12.4 ms per forward attributed to KDA is the whole layer. About 8 ms of it is the FP8
+  projection GEMVs, bandwidth-bound at 235 us per layer. The fused verify kernel sits at about 50–60 us against a
+  44 us floor, and tiling modelled −0.3..−0.7 ms per forward, below the 3 ms bar. Not built; KDA is closed. The one
+  larger term, the 0.8 ms of state-capture writes, needs a lane-contract change.
+- **DSA kernel exact levers:** the four DSA decode dispatches model to 170–265 us per layer (1.9–2.9 ms per forward).
+  Their exact levers sum to 0.8–1.3 ms (factor-1 skip, batched scores, head group 16, top-k scan, merge fold), below the
+  2 ms bar. The lean split form that packaged three of them measured 0.0 %. A tiled MMA/NAX split (−1.3..−1.8 ms) would
+  change the summation order (rounding-class): David's call, not built. The lane copies found by the same audit were
+  the real DSA cost (see the finding above).
+- **199/225 on the q8 stack without the pulse:** batches 47 and 51 (g26-dsa2) were refused at the gate: 9.73–10.09 GB,
+  then 9.38 GB against the 8.47 GB bar, after the previous step's work and the armer's gate runs. The in-runner pulse
+  plus the clean wait reached 8.25 GB; 197/223 ran first, and 199/225 is batch 54b.
 - **draft_depth 4:** refused by design. The MTP layer's trained depth is 3; the lane, the decode kernels, the pre-build
   and the bill are sized for 4 verify rows, and `draft_depth` 4 is refused at load by name.
 - **draft_gate 0.4** (on g26, where the q8 head makes each draft cheaper): −1.46 % beyond (cc −1.24 %). A lower gate
@@ -259,11 +378,13 @@ baseline ≤ 12.01 GB. Decode rows above 225 are refused at load by the default 
 
 ## Provenance
 
-- The ledger: the lab's `state.md`, 2026-10-14 entries from batch 27 (09:46Z) to batch 41 (21:26Z).
+- The ledger: the lab's `state.md`, 2026-10-14 entries from batch 27 (09:46Z) to batch 52 (10-15 01:02Z) and the g25-dsa3 build (01:05Z).
 - The pairs: the ABBA chain's `glm5next-abba-20261012/chain.log` (one `chain exit=0 verdict=...` line per pair) and
   each pair's `verdict.json` and four arm receipts under `glm5next-abba-20261012/<pair>/`.
-- The 225 cells: `glm5next-headline-g25b-199-225-20261014` and `glm5next-headline-g26-199-225-20261014`, each with
+- The headline cells: `glm5next-headline-g25b-199-225-20261014`, `glm5next-headline-g26-199-225-20261014`,
+  `glm5next-headline-g25dsa-199-225-20261014` and `glm5next-headline-g26dsa3-199-225-20261015` (run dir
+  `g26dsa3-197-223`), each with
   `summary.txt`, the cell's `receipt.json`, `server.log`, `settings-block.json` and the `OVERFILL` marker. All are in the
   lab's `reports/dsv41-f39-tcq3-runtime/mimo/cells`, outside this repository.
-- `results.json` holds the two ladders with each rung's source. `python3 scripts/glm53_flash_charts.py` redraws the
+- `results.json` holds the four ladders (g25b, g26, g25-dsa, g26-dsa3) with each rung's source. `python3 scripts/glm53_flash_charts.py` redraws the
   SVGs from it (no plotting library needed), and `--tables` prints the ladder tables.
