@@ -161,7 +161,7 @@ pub const PromptGemm = enum { affine, sushi, glm53 };
 
 /// The prompt GEMM of the module's quant `Q`.
 pub fn promptGemmOf(comptime Q: type) PromptGemm {
-    if (Q == glm53_quant) return if (glm53_quant.prompt_kernels == .glm53) .glm53 else .sushi;
+    if (Q == glm53_quant) return .glm53;
     return if (Q == sushi_quant) .sushi else .affine;
 }
 

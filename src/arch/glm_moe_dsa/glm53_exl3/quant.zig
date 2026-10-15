@@ -39,10 +39,9 @@ pub const Arrays = bank_mod.Proj;
 /// Rows per prompt wave.
 pub const wave_rows: u32 = 4096;
 
-/// Whose kernels a phase runs: GLM-5.3's own texts or sushi's chain (the sushi binding, composed).
+/// Whose kernels the decode waves run: GLM-5.3's own texts or sushi's chain (the sushi binding, composed). The prompt
+/// runs GLM-5.3's GEMMs (+23% prefill against sushi's prefill GEMM on the 16K coding ABBA).
 pub const Kernels = enum { glm53, sushi };
-/// The prompt's: GLM-5.3's GEMMs, +23% prefill against sushi's prefill GEMM on the 16K coding ABBA.
-pub const prompt_kernels: Kernels = .glm53;
 /// The decode waves': sushi's chain, faster at every decode width than these texts' GEMVs (`decodeWave`). A decode
 /// kernel that beats it switches this alone.
 pub const decode_kernels: Kernels = .sushi;
@@ -231,19 +230,18 @@ pub fn Accepted(comptime G: type) type {
         /// The wide call's x as the prompt GEMMs read it, the array the experts driver hands every `prefill` of the
         /// call (it calls this once per call, after the routing barrier, and drops it with the call's waves): x [rows,
         /// hidden] bf16 as f16 (MLX's astype, committed now: the GPU runs it while the host plans the call's groups),
-        /// the bill's routed-call wave transient. Null on sushi's prompt, which reads x itself.
+        /// the bill's routed-call wave transient.
         pub fn beginWide(self: *Self, g: *G, x: G.T) !?G.T {
             _ = self;
-            if (comptime prompt_kernels == .sushi) return null;
             const xf = try g.astype(x, .float16);
             try g.asyncEval(&.{xf});
             return xf;
         }
 
         /// x [tokens, hidden], the call's routed rows (one bank kind) -> [rows, hidden] bf16 in routed-row order, on
-        /// `prompt_kernels`': x the wide call's f16 copy (`beginWide`), else the caller's own (bf16: made f16 here).
+        /// GLM-5.3's GEMMs: x the wide call's f16 copy (`beginWide`), else the caller's own (bf16: made f16 here).
         pub fn prefill(self: *Self, g: *G, layer: u32, x: G.T, rows: quant.PrefillRows, bank: Bank) !G.T {
-            if (comptime prompt_kernels == .sushi) return self.sushi_math.prefill(g, layer, x, rows, bank);
+            _ = layer;
             const a = self.a;
             const n = rows.slot.len;
             const k = kOf(bank.gate.trellis) orelse return error.BankArrays;
