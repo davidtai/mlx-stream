@@ -576,6 +576,8 @@ scripts/                   test_dsv41.sh, compile_kernels_offline.py, compile_mi
                            prepare_mimo_pack.py   the pack builder (docs/mimo-pack.md)
                            glm_moe_dsa_goldens.py, glm_moe_dsa_mtp_goldens.py, glm_split_k3_table.py,
                            glm53_exl3_manifest.py, glm_trunk_manifest.py
+                           compile_glm5next_*_offline.py, glm5next_fusion_kernels_manifest.py   GLM-5.3-Flash's gate
+                           tools: CPU-only offline compiles of its kernel texts and the fusion manifest's writer (--check)
                            convert_glm_bank.py, convert_glm_exl3_bank.py, convert_glm_mxfp4_bank.py   the GLM-5.3
                            pack converters (docs/glm53-*pack-format.md), with their tests
 ```

@@ -78,16 +78,12 @@ only.
 mlx-stream's files are the `.zig` files of `src/mlx_stream/`. Each may import:
 
 - its own files (by name, from its directory);
-- the named modules `sdk`, `mlx`, `log`, `io_util` and `ngram` (the n-gram tables it shares with `qwen4_exp`), plus
-  `std`, `builtin` and `build_options` (the plugin's profile flags ride it);
-- host files only through `deepseek_v41_host.zig`, the bridge its harnesses (the AR cell, parity) and bank tests use:
-  `../model.zig` (the config parse through the registry, the loaders), `../gpu_ceiling.zig` and `../transformer.zig`. The bridge
-  refuses to compile outside a test build, so no served path can import it.
+- the named modules `sdk` and `mlx_host` (the host surface beyond the SDK's, read through `src/host_caps.zig`), plus
+  `std` and `builtin`; the profile flags are `src/build_flags.zig`, which follows the host's `sdk.plugin_profile`;
+- host files only through `src/arch/deepseek_v41/host.zig`, the bridge its harnesses (the AR cell, parity) and bank
+  tests use (the config parse, the loaders, the memory knobs). Served code never imports it.
 
-Two narrow exceptions: `dsv41_profile.zig` reads `root` in profile builds, and `mlx_stream_options.zig` (read by
-`build.zig`) imports `../sdk/build_option.zig`. `src/mlx_stream/mlx_stream_imports.zig` holds this list; every `zig build`
-step that compiles (install, `check`, `test`, `test-build`, `conformance`, `sdk-test-build`) first runs it over
-`src/mlx_stream/` and fails naming each import outside the list (a sibling import must name a file of the directory).
+One narrow exception: `src/arch/deepseek_v41/profile.zig` reads `root` in profile builds.
 
 What the served path needs from the host comes through the SDK: the loaded weights and the host's loaders
 (`sdk.Weights`, `sdk.LoadCtx.loader`), the GPU ceiling and wired margin (`LoadCtx.ceiling`,
@@ -203,8 +199,8 @@ reaches a plugin only through the registry.
 1. A directory under `src/` with a root file that declares `pub const plugin = sdk.Plugin{ ... }`; the plugin's files
    import `sdk` and each other.
 2. One line in `src/plugins.zig`, optionally behind a build flag such as `-Dmlx-stream`.
-3. If its profile code needs build options, one line in `build.zig`'s plugin options (as `src/mlx_stream/mlx_stream_options.zig`
-   does for mlx-stream).
+3. If its profile code needs a compile-time switch, one line in `src/build_flags.zig` (each follows the host's
+   `sdk.plugin_profile`).
 4. `zig build conformance` and `zig build check -Dslim=true`.
 
 ## A second arch, step by step
