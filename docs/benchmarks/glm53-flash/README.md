@@ -232,7 +232,7 @@ fall with context as the bill gives memory to the KV.
 
 The two commits after `6ac6dbf` on this branch (`1fbe7d1`, `1f3a3c0`) change only the expert stream's slot-array
 allocation floor and its refusal path, not the kernels or the numbers.
-identity pair: pending
+Identity pair (2026-10-15, 16K/1K standard cell, 190/217, control / candidate / candidate / control): g28-clean (6ac6dbf) 1,093.5 prefill / 32.90 decode vs g29-clean (1f3a3c0) 1,094.8 / 33.25; prefill +0.11 % and decode +1.06 %, both within noise; the 1,024 output ids are identical in all four arms. The two commits do not change the kernels or the numbers.
 
 Every point is one request (n=1), with no uncertainty interval. `sweep_results.json` holds the 11 rows.
 
