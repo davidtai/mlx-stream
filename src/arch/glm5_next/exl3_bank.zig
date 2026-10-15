@@ -271,6 +271,8 @@ const Synth = struct {
     tmp: testing.TmpDir,
     root: []const u8,
     rbuf: [512]u8,
+    /// The bank's experts.bin as written (`Stream.expectServed`'s image).
+    image: []u8,
 
     fn write(s: expert_bank.Synth, codebook: []const u8) !*Synth {
         const a = testing.allocator;
@@ -278,8 +280,8 @@ const Synth = struct {
         errdefer a.destroy(self);
         self.tmp = testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
-        const bin = try expert_bank.writeSynth(a, &self.tmp, s);
-        a.free(bin);
+        self.image = try expert_bank.writeSynth(a, &self.tmp, s);
+        errdefer a.free(self.image);
         const io = testing.io;
         const v2 = try self.tmp.dir.readFileAlloc(io, manifest_file, a, .limited(64 << 20));
         defer a.free(v2);
@@ -291,6 +293,7 @@ const Synth = struct {
     }
 
     fn close(self: *Synth) void {
+        testing.allocator.free(self.image);
         self.tmp.cleanup();
         testing.allocator.destroy(self);
     }
@@ -338,7 +341,7 @@ test "glm5_next exl3 bank: K other than 3, a codebook other than mul1, another m
                 var tmp = testing.tmpDir(.{});
                 errdefer tmp.cleanup();
                 const bin = try expert_bank.writeSynth(a, &tmp, c.synth);
-                a.free(bin);
+                errdefer a.free(bin);
                 const v2 = try tmp.dir.readFileAlloc(testing.io, manifest_file, a, .limited(64 << 20));
                 defer a.free(v2);
                 const from = "\"tile\":{\"size\":16}";
@@ -348,6 +351,7 @@ test "glm5_next exl3 bank: K other than 3, a codebook other than mul1, another m
                 try tmp.dir.writeFile(testing.io, .{ .sub_path = manifest_file, .data = full });
                 const self = try a.create(Synth);
                 self.tmp = tmp;
+                self.image = bin;
                 self.root = try expert_bank.tmpRoot(&self.tmp, &self.rbuf);
                 break :blk self;
             }
@@ -521,7 +525,7 @@ test "glm5_next exl3 bank: prompt_residents: keep leaves decode's residents in t
         const st = try Bx.Stream.init(a, &sb, opts);
         defer st.deinit();
         // Request 1 (`Source.beginPrefill` after construction: no decode before it): a prompt of every expert.
-        try X.requestStart(st, residents, false);
+        try X.requestStart(st, residents, .construction);
         for (0..2) |l| st.release(try st.serve(@intCast(l), &wave));
         try st.flush();
         // Its decode routes two of each layer's prompt residents and two experts the prompt rows do not hold.
@@ -557,7 +561,7 @@ test "glm5_next exl3 bank: prompt_residents: keep leaves decode's residents in t
             .forget => .forget,
         });
         _ = try st.regrowTransient();
-        try X.requestStart(st, residents, true);
+        try X.requestStart(st, residents, .reversed);
         // keep: the prompt rows hold the residents decode found there; forget: none.
         for (0..2) |l| for (dec[l][0..2]) |e| try testing.expectEqual(residents == .keep, st.layers[l].policy.slotOf(e) != null);
         if (residents == .forget) try testing.expectEqual(@as(u64, 0), st.residentCount());
@@ -584,4 +588,158 @@ test "glm5_next exl3 bank: prompt_residents: keep leaves decode's residents in t
     try testing.expectEqual(@as(u32, 0), hits[1]);
     try testing.expectEqual(@as(u64, 0), bytes[0]);
     try testing.expect(bytes[1] > 0);
+}
+
+/// The served options of the phase-cycle tests above (direct reads, phase rows, decode's window 0) on `prompt_rows`.
+fn cycleOptions(comptime Bx: type, prompt_rows: []const u32) !Bx.Options {
+    const X = @import("experts.zig");
+    var opts = try X.streamOptionsOf(Bx, prompt_rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .direct);
+    opts.event = null;
+    opts.lookahead = null;
+    opts.prompt_reads = .stock;
+    opts.prompt_ahead = .head;
+    opts.prompt_relocate = false;
+    opts.ahead_cap = null;
+    return opts;
+}
+
+test "glm5_next exl3 bank: expert usage: the counts add up across two requests (every prompt routed id, every decode route of an expert) on the host-memory stream; the file round-trips" {
+    const X = @import("experts.zig");
+    const Bx = X.Types(.exl3).Bridge;
+    const usage = sdk_ext.expert.usage;
+    const a = testing.allocator;
+    const s = try Synth.write(.{ .hidden = 4096, .inter = 2048, .n_experts = 8 }, "mul1");
+    defer s.close();
+    var diag: sdk.Diag = .{};
+    var bank = try Bank.open(a, testing.io, s.root, 3, synth_implemented, &diag);
+    defer bank.deinit();
+    var sb = try SDKBank.init(a, &bank);
+    defer sb.deinit();
+    const prompt_rows = [_]u32{ 4, 4 };
+    const decode_rows = [_]u32{ 6, 7 };
+    const st = try Bx.Stream.init(a, &sb, try cycleOptions(Bx, &prompt_rows));
+    defer st.deinit();
+    st.countRoutes();
+    const wave = [_]u16{ 0, 1, 2, 3, 4, 5, 6, 7, 1, 1 };
+    const dec = [_]u16{ 6, 1, 7, 3 };
+    const counts = try a.alloc(u64, 2 * 8);
+    defer a.free(counts);
+    @memset(counts, 0);
+    var want: [16]u64 = @splat(0);
+    for (0..2) |request| {
+        if (request == 0) try X.requestStart(st, .keep, .construction) else {
+            _ = try st.shrink(&prompt_rows, .keep);
+            _ = try st.regrowTransient();
+            try X.requestStart(st, .keep, .reversed);
+        }
+        for (0..2) |l| {
+            try st.seedPrefill(@intCast(l), &wave);
+            st.release(try st.serve(@intCast(l), &wave));
+        }
+        try st.flush();
+        _ = try st.releaseTransient();
+        try st.grow(&decode_rows);
+        // Request r decodes r + 1 routes of `dec` per layer.
+        for (0..request + 1) |_| for (0..2) |l| st.release(try st.serve(@intCast(l), &dec));
+        try st.flush();
+        st.addUsage(counts);
+        for (0..2) |l| {
+            for (wave) |e| want[l * 8 + e] += 1;
+            for (dec) |e| want[l * 8 + e] += request + 1;
+            // No tally: the decode counts are zeroed by the harvest (the next request's start from 0).
+            for (st.layers[l].policy.request_counts) |c| try testing.expectEqual(@as(u32, 0), c);
+        }
+        try testing.expectEqualSlices(u64, &want, counts);
+    }
+    // Expert 1 of layer 0: 3 prompt ids a request + 1 + 2 decode routes.
+    try testing.expectEqual(@as(u64, 3 + 3 + 1 + 2), counts[1]);
+    // The file: written by the recorder, read back as the profile the seed uses.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const path = try std.fs.path.join(a, &.{ dir, usage.file_name });
+    defer a.free(path);
+    const r = try usage.Recorder.init(a, testing.io, path, "glm5_next", "unit", 2, 8);
+    defer r.deinit();
+    @memcpy(r.counts, counts);
+    try r.endRequest(testing.io, 52, 24);
+    var settings: usage.Settings = .{};
+    var d = try usage.decide(a, testing.io, &settings, dir, "glm5_next", 2, 8);
+    defer d.profile.?.deinit();
+    try testing.expectEqualSlices(u64, counts, d.profile.?.counts);
+}
+
+test "glm5_next exl3 bank: resident seed: a stream seeded from a usage profile serves its first prompt's seeded experts as hits from their records' bytes (fewer records read than unseeded); the dynamic policy is unchanged; a mismatched profile is refused by name" {
+    const X = @import("experts.zig");
+    const Bx = X.Types(.exl3).Bridge;
+    const usage = sdk_ext.expert.usage;
+    const a = testing.allocator;
+    const s = try Synth.write(.{ .hidden = 4096, .inter = 2048, .n_experts = 8 }, "mul1");
+    defer s.close();
+    var diag: sdk.Diag = .{};
+    var bank = try Bank.open(a, testing.io, s.root, 3, synth_implemented, &diag);
+    defer bank.deinit();
+    var sb = try SDKBank.init(a, &bank);
+    defer sb.deinit();
+    const prompt_rows = [_]u32{ 4, 4 };
+    const text =
+        \\{"model_type":"glm5_next","layers":2,"experts":8,"counts":[[0,9,0,7,0,5,0,3],[8,0,6,0,4,0,2,1]],
+        \\"source":{"prompt_set":"unit","requests":2,"prompt_tokens":52,"decode_tokens":24,"binary_sha256":"89297e60"}}
+    ;
+    try testing.expectError(error.ExpertUsageMismatch, usage.parse(a, text, "glm5_next", 3, 8));
+    try testing.expectError(error.ExpertUsageMismatch, usage.parse(a, text, "glm5_next", 2, 16));
+    var profile = try usage.parse(a, text, "glm5_next", 2, 8);
+    defer profile.deinit();
+    const seeded = [2][4]u16{ .{ 1, 3, 5, 7 }, .{ 0, 2, 4, 6 } };
+    // The first prompt: every expert of both layers.
+    const wave = [_]u16{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    var hits: [2]u32 = .{ 0, 0 };
+    var bytes: [2]u64 = .{ 0, 0 };
+    for ([_]bool{ true, false }, 0..) |seed, i| {
+        const st = try Bx.Stream.init(a, &sb, try cycleOptions(Bx, &prompt_rows));
+        defer st.deinit();
+        if (seed) {
+            const Order = struct {
+                p: *usage.Profile,
+                fn of(o: @This(), layer: u32) []const u16 {
+                    return o.p.order(layer, 4);
+                }
+            };
+            const b0 = st.stats().expert_bytes_read;
+            try testing.expectEqual(@as(u64, 8), try st.seedResidents(Order{ .p = &profile }, Order.of));
+            try testing.expect(st.stats().expert_bytes_read > b0);
+            // Each seeded expert a resident as `shrink(.keep)` leaves one: unprotected, recency 0, not pinned.
+            for (0..2) |l| {
+                const p = &st.layers[l].policy;
+                try testing.expectEqual(@as(u32, 4), p.occupancy);
+                try testing.expectEqual(@as(usize, 0), p.protected.count());
+                for (seeded[l]) |e| {
+                    try testing.expect(p.slotOf(e) != null);
+                    try testing.expectEqual(@as(u64, 0), p.recency[e]);
+                    try testing.expect(!p.isPinned(e));
+                }
+            }
+            // The seed fills empty rows only: a second seed is refused by name.
+            try testing.expectError(error.SeedRowsNotEmpty, st.seedResidents(Order{ .p = &profile }, Order.of));
+            try X.requestStart(st, .keep, .seeded);
+            for (0..2) |l| for (seeded[l]) |e| try testing.expect(st.layers[l].policy.slotOf(e) != null);
+        } else try X.requestStart(st, .keep, .construction);
+        const before = st.stats().expert_bytes_read;
+        for (0..2) |l| {
+            try st.seedPrefill(@intCast(l), &wave);
+            const r = try st.serve(@intCast(l), &wave);
+            hits[i] += r.plan.n_hits;
+            // Exact: every id (hit or load) served from its record's bytes.
+            try st.expectServed(r, &wave, s.image);
+            st.release(r);
+        }
+        try st.flush();
+        bytes[i] = st.stats().expert_bytes_read - before;
+        try testing.expect(!st.failed);
+    }
+    // Seeded: the four seeded experts of each layer are hits; unseeded: none, every record read.
+    try testing.expectEqual(@as(u32, 8), hits[0]);
+    try testing.expectEqual(@as(u32, 0), hits[1]);
+    try testing.expect(bytes[0] < bytes[1]);
 }

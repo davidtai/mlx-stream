@@ -35,6 +35,9 @@ pub const routes = @import("expert/routes.zig");
 /// The rate tally's settings and file (every model's residency: the top share of each layer's experts by request rate
 /// pinned, the rates carried from run to run under ~/.mlx-stream/<model key>/).
 pub const tally = @import("expert/tally.zig");
+/// The expert usage profile (`expert_usage_record`) and the resident seed (`resident_seed`) from the pack's
+/// `expert-usage-v1.json`; `prompt_residents`, the reverse change's route.
+pub const usage = @import("expert/usage.zig");
 
 /// The one reader per process: the host takes it at the load claim of an arch whose caps say `uses_expert_reader`
 /// (its source declares `uses_reader`), before the preflight and the weights, and gives it back when the loaded model

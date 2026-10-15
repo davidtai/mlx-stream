@@ -1,4 +1,5 @@
 //! MiMo's construction-bound MXFP4 source, using the DSV reader and policy.
+const expert_usage = @import("../../sdk_ext.zig").expert.usage;
 const std = @import("std");
 const bank_mod = @import("bank.zig");
 const stream_mod = @import("stream.zig");
@@ -62,6 +63,9 @@ pub const Options = struct {
     /// X19 (mimo/router-bf16): the decode lookahead predictor's router (`prefill_math.PredictRoute`; `.f32` is the
     /// control: the gate table holds the transposed F32 copies; `.bf16`: the routers' BF16 weights).
     predict_router: prefill_math.PredictRoute = .f32,
+    /// The residents a prompt after a decode finds (`settings.Config.prompt_residents`; `.keep` is the default, `.forget`
+    /// the control).
+    prompt_residents: expert_usage.PromptResidents = .keep,
 };
 const Q = quant.GatherQmm;
 const Proj = Q.Arrays(mlx.mlx_array);
@@ -359,6 +363,10 @@ pub const Source = struct {
     defer_grow: bool = false,
     /// R2: the boundary ran and the growth has not (a prompt pass's end until the decode phase's first forward).
     grow_pending: bool = false,
+    /// `Options.prompt_residents`, installed at construction: the residents a prompt after a decode finds.
+    prompt_residents: expert_usage.PromptResidents = .keep,
+    /// The usage seed ran and no request started since (`beginPrefill` keeps the seeded residents once).
+    seeded_start: bool = false,
     /// R3: decode's window 0 is narrower than an SDK route (`Options.decode_window` = `.verify` with decode rows): a
     /// decode-phase wide call (its groups up to `max_route_ids` ids) is refused by name.
     narrow_window: bool = false,
@@ -457,6 +465,7 @@ pub const Source = struct {
         // starts the parked warm thread, once; refused by name on a CPU stream (its waits are host waits).
         self.warm = try gpu_warm.install(a, opts.gpu_keep_warm, stream, event.object);
         self.warm_route = opts.gpu_keep_warm;
+        self.prompt_residents = opts.prompt_residents;
         errdefer if (self.warm) |w| w.destroy();
         if (self.warm) |w| if (opts.gpu_keep_warm.waitsOn()) {
             self.stream_source.warm_arm = gpu_warm.Arm.of(gpu_warm.Warm, w);
@@ -605,12 +614,33 @@ pub const Source = struct {
         _ = mlx.mlx_set_cache_limit(&previous, bytes);
     }
 
-    /// New request: return to prompt routing, then forget the previous
-    /// request's residents, protected seed and prompt counts.
+    /// New request: return to prompt routing (`resumePrefill`: the reverse change, its shrink under `prompt_residents`),
+    /// then the previous request's protected seed and prompt counts forgotten, and its residents: after the construction
+    /// (no prompt ran: the warm-up's residents belong to no prompt) always; after a prompt, under `forget` (the control);
+    /// under `keep` (the default) they stay (`Stream.forgetPrompt`: as `shrink(.keep)` leaves them). After the usage seed
+    /// (`seedResidents`) the seeded residents stay once.
     pub fn beginPrefill(self: *Source) !void {
+        const prompted = self.sdk_stream.phase == .decode or self.grow_pending;
+        const seeded = self.seeded_start;
+        self.seeded_start = false;
+        try self.resumePrefill();
+        if (!seeded) {
+            if (!prompted or self.prompt_residents == .forget) {
+                _ = try self.stream_source.forgetResidents();
+            } else try self.sdk_stream.forgetPrompt();
+        }
+        self.stream_source.resetPromptCounts();
+    }
+
+    /// The usage seed at the load's end (before the first request): the prompt phase, the warm-up's residents forgotten,
+    /// then each layer's empty prompt rows filled with its most used experts of `profile` (`Stream.seedResidents`, landed
+    /// before this returns). The first request keeps them.
+    pub fn seedResidents(self: *Source, usage_profile: *expert_usage.Profile) !expert_usage.Seeded {
         try self.resumePrefill();
         _ = try self.stream_source.forgetResidents();
-        self.stream_source.resetPromptCounts();
+        const records = try self.sdk_stream.seedResidents(expert_usage.Order{ .p = usage_profile, .rows = self.rows }, expert_usage.Order.of);
+        self.seeded_start = true;
+        return expert_usage.Seeded.of(self.sdk_stream.layers, self.rows, records);
     }
 
     /// X20: the new request's read schedule from its prompt length, once, after `beginPrefill` (Module.prefill): `auto`
@@ -635,7 +665,10 @@ pub const Source = struct {
             // +phase-rows: the reverse change: the grown rows and window 0 freed (residents forgotten: `Stream.shrink`),
             // MLX's cache cleared, then the prompt's 96 transient rows re-created, so the prompt phase holds its bill.
             if (self.decode_rows != null) {
-                _ = try self.ex.shrink(self.rows, .forget);
+                _ = try self.ex.shrink(self.rows, switch (self.prompt_residents) {
+                    .keep => .keep,
+                    .forget => .forget,
+                });
                 self.g.clearCache();
                 _ = try self.ex.regrowTransient(&self.g, true);
                 return;

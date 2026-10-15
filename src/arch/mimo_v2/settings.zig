@@ -7,6 +7,7 @@ const decode_attention = @import("decode_attention.zig");
 const gpu_warm = @import("gpu_warm.zig");
 const fp8_linear = @import("fp8_linear.zig");
 const PredictRoute = @import("math.zig").PredictRoute;
+const expert_usage = @import("../../sdk_ext.zig").expert.usage;
 
 // An older host that supplies no construction context keeps the qualified
 // 16K prompt + 1K generation reservation. New hosts supply effective_context.
@@ -85,7 +86,7 @@ pub const PredictEvals = enum { tiled, one, invalid };
 pub const P7Requested = packed struct { read_schedule: bool = false, scratch: bool = false, combine: bool = false, predict_evals: bool = false, read_schedule_threshold: bool = false };
 /// The settings a request named with a value its key does not take (`applySettings`), each refused by name in
 /// `validate`: a bool key given a non-bool, a route key given an unknown name.
-pub const Malformed = packed struct { mtp_lane: bool = false, prefill_read_ahead: bool = false, phase_rows: bool = false, decode_moe: bool = false, prefill_attention: bool = false };
+pub const Malformed = packed struct { mtp_lane: bool = false, prefill_read_ahead: bool = false, phase_rows: bool = false, decode_moe: bool = false, prefill_attention: bool = false, prompt_residents: bool = false };
 
 /// R2 (mimo/decode-rows-audit): when the prompt->decode boundary grows the slot banks under the MTP lane
 /// (`Config.decode_grow`).
@@ -205,6 +206,8 @@ pub const setting_keys = [_][]const u8{
         "fp8_prompt_slots",
         "fp8_gemv_plan",
         "predict_router",
+        "prompt_residents",
+        "resident_seed",
 };
 
 /// The first key of a settings object that is not one of `setting_keys` (null: every key is a setting).
@@ -312,6 +315,14 @@ pub const Config = struct {
     /// the transient scratch and grows every slot bank by the difference (bill.zig `phaseTerms`, source.zig
     /// `beginDecode`). `"phase_rows": false` installs the control: one row count for both phases, as before.
     phase_rows: bool = true,
+    /// The residents a prompt after a decode finds (`prompt_residents`, glm5_next's setting; source.zig
+    /// `Source.beginPrefill`): `keep` (the default: the residents decode left in the prompt rows stay for the next
+    /// prompt, whose plans count them as hits) or `forget` (the control, by name: every request starts from empty rows).
+    /// Anything else refuses by name. The rows, and so the bill, are the same either way.
+    prompt_residents: expert_usage.PromptResidents = .keep,
+    /// `resident_seed` (sdk_ext/expert/usage.zig): the prompt rows seeded at the load from the pack's
+    /// `expert-usage-v1.json` (default: when the pack has it). The usage record is glm5_next's only (refused by name).
+    residency: expert_usage.Settings = .{},
     /// The prompt pass's tile drains (math.zig `Drain`), read once at construction: `"pipelined"` (the default: the
     /// measured best, cells/prefill1-bf16-20261008: 544.9/549.1 vs sync 491.5/495.7 prefill tok/s, TTFT -3.3 s, ids
     /// identical across all five cells) commits each expert projection / reduction tile and waits the one before it
@@ -505,6 +516,8 @@ pub const Config = struct {
         if (c.fp8_prompt_slots < 3 or c.fp8_prompt_slots > fp8_linear.PromptCache.max_slots) return error.MimoFp8PromptSlots;
         if (c.fp8_gemv_plan == .invalid) return error.MimoFp8GemvPlan;
         if (c.predict_router == .invalid) return error.MimoPredictRouter;
+        if (c.malformed.prompt_residents) return error.MimoPromptResidentsSetting;
+        try c.residency.checkSeedOnly("mimo_v2");
     }
 
     /// X18: the FP8 route's install options (fp8_linear.install), from the two settings.
@@ -535,6 +548,11 @@ pub const Config = struct {
     /// `applySettings`). Read once per load; `validate` refuses a bad value by name.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
         if (raw != .object) return;
+        if (raw.object.get("prompt_residents")) |v| {
+            const r: ?expert_usage.PromptResidents = if (v == .string) std.meta.stringToEnum(expert_usage.PromptResidents, v.string) else null;
+            if (r) |x| c.prompt_residents = x else c.malformed.prompt_residents = true;
+        }
+        _ = c.residency.apply(raw.object);
         if (raw.object.get("kv_quant")) |v| {
             c.setMode(switch (v) {
                 .integer => |i| if (i == 8) .q8 else if (i == 0) .bf16 else .invalid,
@@ -1374,4 +1392,26 @@ test "mimo settings: a NAMED value that cannot install refuses by name; the DEFA
     try std.testing.expectEqual(C.inplace, installedPrefillCombine(.inplace, false, null));
     try std.testing.expectEqual(C.stock, installedPrefillCombine(.stock, false, "fit"));
     try std.testing.expectEqualStrings("route prefill_combine=fused reason=host wired policy fit (inplace needs max) pin=prefill_combine", prefillCombineFusedLine(&buf, "fit"));
+}
+
+test "mimo settings: prompt_residents: keep unless named; forget (the control) by name; anything else refused by name; resident_seed parses; the usage record is refused by name" {
+    const parse = struct {
+        fn f(text: []const u8) !Config {
+            const v = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+            defer v.deinit();
+            var c: Config = .{};
+            c.applySettings(v.value);
+            return c;
+        }
+    }.f;
+    try std.testing.expectEqual(expert_usage.PromptResidents.keep, (try parse("{}")).prompt_residents);
+    const fg = try parse("{\"prompt_residents\":\"forget\"}");
+    try fg.validate();
+    try std.testing.expectEqual(expert_usage.PromptResidents.forget, fg.prompt_residents);
+    try std.testing.expectError(error.MimoPromptResidentsSetting, (try parse("{\"prompt_residents\":\"hold\"}")).validate());
+    try std.testing.expectError(error.MimoPromptResidentsSetting, (try parse("{\"prompt_residents\":false}")).validate());
+    try std.testing.expectEqual(expert_usage.Seed.none, (try parse("{\"resident_seed\":\"none\"}")).residency.seed.?);
+    try std.testing.expectError(error.ResidentSeedSetting, (try parse("{\"resident_seed\":\"all\"}")).validate());
+    try std.testing.expectError(error.ExpertUsageRecordNotInstalled, (try parse("{\"expert_usage_record\":\"/tmp/u.json\"}")).validate());
+    try std.testing.expectEqualStrings("mimo_v2 prompt residents: keep (decode's residents stay for the next prompt)", expert_usage.promptResidentsLine("mimo_v2", .keep));
 }

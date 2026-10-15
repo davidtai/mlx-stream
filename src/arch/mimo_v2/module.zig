@@ -4,6 +4,7 @@
 //! Dense projections remain affine Q4; only router weights acquire a FP32 copy.
 //! Request state is single-flight. Prefill uses bounded chunks and the source fences
 //! each bounded routed group before reusing expert slots.
+const expert_usage = @import("../../sdk_ext.zig").expert.usage;
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const host = @import("sdk");
@@ -250,7 +251,7 @@ pub const Module = struct {
             var line: [256]u8 = undefined;
             log.info("{s}", .{settings.prefillCombineFusedLine(&line, wired.?)});
         }
-        const source = try source_mod.Source.initWith(a, io, dir, &rows, gates, s, .{ .read_ahead = config.prefill_read_ahead, .decode_moe = config.decode_moe, .decode_moe_kernel = config.decode_moe_kernel, .decode_rows = if (config.phase_rows) &decode_rows else null, .prefill_drain = config.prefill_drain, .prefill_combine = combine_route, .prefill_bank_view = config.prefill_bank_view, .prefill_read_schedule = config.prefill_read_schedule, .prefill_read_schedule_threshold = config.prefill_read_schedule_threshold, .prefill_scratch = config.prefill_scratch, .defer_grow = config.defersGrowth(), .decode_window = config.decode_window, .gpu_keep_warm = warm_route, .predict_router = config.predict_router });
+        const source = try source_mod.Source.initWith(a, io, dir, &rows, gates, s, .{ .read_ahead = config.prefill_read_ahead, .decode_moe = config.decode_moe, .decode_moe_kernel = config.decode_moe_kernel, .decode_rows = if (config.phase_rows) &decode_rows else null, .prefill_drain = config.prefill_drain, .prefill_combine = combine_route, .prefill_bank_view = config.prefill_bank_view, .prefill_read_schedule = config.prefill_read_schedule, .prefill_read_schedule_threshold = config.prefill_read_schedule_threshold, .prefill_scratch = config.prefill_scratch, .defer_grow = config.defersGrowth(), .decode_window = config.decode_window, .gpu_keep_warm = warm_route, .predict_router = config.predict_router, .prompt_residents = config.prompt_residents });
         errdefer source.deinit();
         const self = try a.create(Module);
         errdefer a.destroy(self);
@@ -344,6 +345,9 @@ pub const Module = struct {
             else => log.info("MiMo layer rows: split={s} prompt_rows={any} decode_rows={any} prompt_total={d} decode_total={d} (uniform {d} x {d} / {d} x {d})", .{ if (config.expert_rows_by_layer == .derived or config.expert_rows_by_layer == .derived_named) "derived" else "offsets", rows, decode_rows, sumRows(&rows), sumRows(&decode_rows), mimo.moe_layers, plan.rows.prompt, mimo.moe_layers, plan.rows.decode }),
         }
         log.info("MiMo memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv={s} phase_rows={s} growth_rows={d} forced={s}", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, @tagName(config.kv_mode), if (config.phase_rows) "on" else "off (control)", plan.rows.decode - plan.rows.prompt, if (bills.isForced(config.*)) "yes" else "no" });
+        log.info("{s}", .{expert_usage.promptResidentsLine("mimo_v2", config.prompt_residents)});
+        // The usage seed (`resident_seed`): the last step before the construction check, before the first request.
+        try seedResidents(a, io, source, &config.residency, dir);
         try self.checkConstruction(plan.bill, plan.rows.prompt, weights, file_start);
         return self;
     }
@@ -418,6 +422,24 @@ pub const Module = struct {
         self.trace = t;
         self.source.stream_source.trace = t;
         log.info("MIMO_ROUTE_TRACE armed: prefix={s} format={s}", .{ std.mem.span(prefix), route_trace.format });
+    }
+
+    /// `resident_seed` at construction (sdk_ext/expert/usage.zig `decide`): `usage` when the pack has
+    /// `expert-usage-v1.json` (or by name), the prompt rows filled from it (`Source.seedResidents`); `none` otherwise. A
+    /// malformed file, or one of another model or geometry, refuses the load by name. One line, with the load's cost.
+    fn seedResidents(a: std.mem.Allocator, io: std.Io, source: *source_mod.Source, residency: *const expert_usage.Settings, dir: []const u8) !void {
+        var d = try expert_usage.decide(a, io, residency, dir, "mimo_v2", @intCast(source.sdk_stream.layers.len), source.sdk_stream.bank.n_experts);
+        defer if (d.profile) |*p| p.deinit();
+        var lb: [768]u8 = undefined;
+        const p = if (d.profile) |*x| x else {
+            log.info("{s}", .{expert_usage.seedLine(&lb, "mimo_v2", &d, .{ .min = 0, .max = 0, .rows_min = 0, .rows_max = 0, .records = 0 }, 0, 0)});
+            return;
+        };
+        const b0 = source.sdk_stream.stats().expert_bytes_read;
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        const r = try source.seedResidents(p);
+        const ms: u64 = @intCast(@divTrunc(t0.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
+        log.info("{s}", .{expert_usage.seedLine(&lb, "mimo_v2", &d, r, source.sdk_stream.stats().expert_bytes_read -| b0, ms)});
     }
 
     pub fn deinit(self: *Module) void {

@@ -117,6 +117,9 @@ pub const LayerPolicy = struct {
     request_counts: []u32,
     request_routes: u32 = 0,
     alpha: f32 = 0,
+    /// Whether decode routes count into `request_counts`: the tally's (`setTally`) and the usage profile's
+    /// (`expert.usage`, `Stream.countRoutes`); set once at construction.
+    count_routes: bool = false,
     pin_limit: u32 = 0,
     seeded: bool = false,
     pin_scratch: []u16,
@@ -254,6 +257,7 @@ pub const LayerPolicy = struct {
     pub fn setTally(p: *LayerPolicy, pin_limit: u32, alpha: f32) void {
         p.pin_limit = @min(pin_limit, p.n_experts);
         p.alpha = alpha;
+        p.count_routes = true;
     }
 
     /// The rates a tally file (or another layer's state) holds, one per expert: the tally seeded, the pins chosen.
@@ -315,7 +319,7 @@ pub const LayerPolicy = struct {
     /// One decode route of the layer (its unique experts) into the request's counts: the rate takes them at the
     /// request's end (`endRequest`), not per route.
     fn tallyRoute(p: *LayerPolicy, unique: []const u16) void {
-        if (p.alpha == 0) return;
+        if (!p.count_routes) return;
         for (unique) |e| p.request_counts[e] += 1;
         p.request_routes += 1;
     }
