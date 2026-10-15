@@ -322,6 +322,80 @@ The 64K rung hit the 16,384-token output cap (`finish_reason: length`). Every ot
   (`--suffix=-clean --binary e20b4548`) beside the cells, not in this repository. It writes the results file and the
   line charts.
 
+### q8 draft head (headline class)
+
+The same 11 rungs, run again with the q8 MTP draft head, the head of the 225-row headline. The q8 head is
+rounding-class, not exact.
+
+Method delta from the sweep above (all other items of the matched serving configuration are the same):
+
+- server build g29-clean, SHA-256 `89297e609a950eb2589cfa46bf6ce5d798a47a9b70bca03c6394fad872cfe146`: host
+  `a8f6c6b8` with this branch's plugin at `1f3a3c0`, ReleaseFast;
+- settings block `{"draft_depth": 3, "draft_gate": 0.5, "draft_head": "q8"}`;
+- expert rows pinned one to two rows under the rows of the BF16-head rung, because the q8 head adds a fixed term to
+  the memory bill. Every pin passed the layer-rows check and held at load.
+
+![q8 draft head: full 1K-1M sweep summary](sweep_q8_summary.png)
+
+| Requested context | Actual input | Served context | Rows P/D | Prefill (tok/s) | Decode (tok/s) | TTFT (s) | Completion tokens | Finish | MLX peak (GiB) | Footprint peak (GiB) | Box peak (GB) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: |
+| 1K | 1,023 | 17,408 | 189/216 | 122.0 | 34.4 | 8.39 | 12,369 | stop | 96.32 | 97.05 | 115.5 |
+| 2K | 2,047 | 18,432 | 189/216 | 238.2 | 36.6 | 8.59 | 5,164 | stop | 96.34 | 97.06 | 113.6 |
+| 4K | 4,095 | 20,480 | 189/216 | 462.2 | 33.6 | 8.86 | 7,788 | stop | 96.37 | 97.10 | 113.7 |
+| 8K | 8,191 | 24,576 | 189/215 | 888.6 | 32.1 | 9.22 | 12,796 | stop | 96.08 | 96.80 | 113.6 |
+| 16K | 16,381 | 32,766 | 189/215 | 1,088.7 | 34.4 | 15.05 | 5,548 | stop | 96.21 | 96.94 | 114.4 |
+| 32K | 32,766 | 49,151 | 188/213 | 1,045.8 | 31.9 | 31.33 | 6,297 | stop | 95.76 | 96.48 | 113.1 |
+| 64K | 65,534 | 81,919 | 186/211 | 992.2 | 29.5 | 66.05 | 16,384 | length | 95.64 | 96.31 | 112.7 |
+| 128K | 131,071 | 147,456 | 183/208 | 925.7 | 27.1 | 141.59 | 9,611 | stop | 95.74 | 96.33 | 112.6 |
+| 256K | 262,143 | 278,528 | 176/201 | 835.7 | 14.6 | 313.68 | 10,075 | stop | 95.58 | 96.31 | 114.2 |
+| 512K | 524,287 | 540,672 | 159/189 | 698.5 | 9.9 | 750.59 | 2,978 | stop | 96.00 | 96.76 | 114.3 |
+| 1M | 1,032,191 | 1,048,576 | 126/164 | 494.4 | 5.1 | 2,087.76 | 7,054 | stop | 96.19 | 96.74 | 115.9 |
+
+![q8 draft head: decode throughput](sweep_q8_decode_tok_s.png)
+
+![q8 draft head: prefill throughput](sweep_q8_prefill_tok_s.png)
+
+![q8 draft head: time to first token](sweep_q8_ttft_s.png)
+
+![q8 draft head: MLX allocator peak](sweep_q8_peak_memory_gb.png)
+
+![q8 draft head: process footprint peak](sweep_q8_peak_footprint_gb.png)
+
+![q8 draft head: completion-token counts](sweep_q8_completion_tokens.png)
+
+BF16 head (g28-clean) against q8 head (g29-clean), per rung. TTFT is prompt tokens / the server's prefill rate.
+
+| Requested context | Rows P/D BF16 | Rows P/D q8 | Prefill BF16 (tok/s) | Prefill q8 (tok/s) | Decode BF16 (tok/s) | Decode q8 (tok/s) | Decode delta (tok/s) | TTFT BF16 (s) | TTFT q8 (s) | TTFT delta | Finish BF16 / q8 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| 1K | 191/217 | 189/216 | 122.0 | 122.0 | 33.0 | 34.4 | +1.4 | 8.39 | 8.39 | +0.00 % | stop / stop |
+| 2K | 191/217 | 189/216 | 238.4 | 238.2 | 33.8 | 36.6 | +2.8 | 8.59 | 8.59 | +0.08 % | stop / stop |
+| 4K | 191/217 | 189/216 | 462.2 | 462.2 | 33.3 | 33.6 | +0.3 | 8.86 | 8.86 | +0.00 % | stop / stop |
+| 8K | 191/217 | 189/215 | 889.4 | 888.6 | 32.1 | 32.1 | +0.0 | 9.21 | 9.22 | +0.09 % | stop / stop |
+| 16K | 190/217 | 189/215 | 1,091.5 | 1,088.7 | 32.8 | 34.4 | +1.6 | 15.01 | 15.05 | +0.26 % | stop / stop |
+| 32K | 189/214 | 188/213 | 1,047.8 | 1,045.8 | 31.4 | 31.9 | +0.5 | 31.27 | 31.33 | +0.19 % | stop / stop |
+| 64K | 188/213 | 186/211 | 996.2 | 992.2 | 28.0 | 29.5 | +1.5 | 65.78 | 66.05 | +0.40 % | length / length |
+| 128K | 185/210 | 183/208 | 930.6 | 925.7 | 27.0 | 27.1 | +0.1 | 140.85 | 141.59 | +0.53 % | stop / stop |
+| 256K | 178/203 | 176/201 | 839.5 | 835.7 | 15.2 | 14.6 | -0.6 | 312.26 | 313.68 | +0.45 % | stop / stop |
+| 512K | 161/190 | 159/189 | 704.7 | 698.5 | 9.8 | 9.9 | +0.1 | 743.99 | 750.59 | +0.89 % | stop / stop |
+| 1M | 128/165 | 126/164 | 500.4 | 494.4 | 5.4 | 5.1 | -0.3 | 2,062.73 | 2,087.76 | +1.21 % | stop / stop |
+
+Observations (every point is one request, n=1):
+
+- From 1K to 64K, the q8 head decodes 0.0 to 2.8 tok/s faster than the BF16 head (+0.3 to +2.8 tok/s on six of the
+  seven rungs, equal at 8K), with one to two fewer expert rows.
+- From 128K up, decode is equal within noise (-0.6 to +0.1 tok/s).
+- TTFT is equal within 0.5 % up to 256K (128K: +0.53 %). At 512K and 1M the q8 rungs are 0.9 % and 1.2 % slower,
+  with two fewer prompt rows.
+- Both heads hit the 16,384-token output cap at 64K only (`finish_reason: length`). Every other q8 rung stopped on EOS
+  after 2,978-12,796 tokens.
+- The MLX allocator peak stayed at 95.6-96.4 GiB and the process footprint peak at 96.3-97.1 GiB on every rung,
+  the same band as the BF16 head. The whole machine peaked at 112.6-115.9 GB, from a box baseline of 10.4-11.8 GB.
+
+Provenance: cells `glm5next-ladder-q8-<rung>-20261015` (run dirs `rNN-<rung>-q8`) in the same lab directory, outside
+this repository. `sweep_q8_results.json` holds the 11 rows with each row's cell and the SHA-256 of its receipt, prompt
+and output. The chart script is the same `ladder_results.py` with `--suffix=-q8`, which writes into its own output
+directory.
+
 ## Lever pairs, 2026-10-14
 
 Each pair is one ABBA window (control, lever, lever, control), lane on, both arms at 190/217 with the standard MTP block,
