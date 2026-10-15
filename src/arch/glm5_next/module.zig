@@ -28,6 +28,8 @@ const glue = @import("glue.zig");
 const kda_decode = @import("kda_decode.zig");
 const dsa_decode = @import("dsa_decode.zig");
 const swiglu = @import("swiglu.zig");
+const fusion = @import("fusion.zig");
+const prebuild = @import("prebuild.zig");
 const mtp = @import("mtp.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const acc = @import("../../sdk_ext.zig").acceptance;
@@ -148,6 +150,14 @@ pub const Module = struct {
         try weights.materialize();
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
         try kda.install(&self.c.model);
+        // The trunk's launch fusion (`fuse_kda_inputs`, `fuse_gate_up`, `fuse_predictor`, `fuse_join`), once, over the read
+        // residents: each switch on its text, its launches at 1 .. 8 rows and (the GEMVs') its route (one launch as the
+        // compile check), every fused site FP8 at its launch's shapes and plans or the load refused by name; off (the
+        // default) keeps the stock route. The predictor's and the join's routes are bound into the expert source below.
+        fusion.install(gpa, s, &self.c.model, self.w.layers, .{ .kda_inputs = self.c.fuse_kda_inputs == .on, .gate_up = self.c.fuse_gate_up == .on, .predictor = self.c.fuse_predictor == .on, .join = self.c.fuse_join == .on }, &diag) catch |e| {
+            log.err("glm5_next: the launch fusion refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
+            return e;
+        };
         // The op chains' hc and selection kernels and the decode lane's collapse / expand launches (the control route
         // and the prompt pass), once for the model's hc geometry.
         try ops_dsa.install(glue.hcGeometry(model, self.w.layers[0].input_norm));
@@ -266,6 +276,18 @@ pub const Module = struct {
         errdefer switch (self.src) {
             inline else => |x| x.deinit(),
         };
+        // MERGE_GATE_WAITS (`merge_gate_waits`), bound into the scheduler once, before any call: a decode call's gated miss
+        // parts wait once per gate value. `fuse_predictor`: the BF16 predictor's epilogue as one dispatch; `fuse_join`: the
+        // fused glue's routed call ending before the join's take, its combine reading the rows in place; each bound likewise.
+        if (self.c.merge_gate_waits == .on) switch (self.src) {
+            inline else => |x| try x.ex.bindMergeGateWaits(),
+        };
+        if (self.c.fuse_predictor == .on) switch (self.src) {
+            inline else => |x| try x.fusePredictor(),
+        };
+        if (self.c.fuse_join == .on) switch (self.src) {
+            inline else => |x| try x.fuseJoin(),
+        };
         // The rate tally (`expert_resident_ratio` > 0): its file read once (the first request's pins), its line.
         try self.openTally(dir, std.mem.min(u32, decode_rows));
         errdefer self.closeTally();
@@ -284,6 +306,10 @@ pub const Module = struct {
         const warmed = switch (self.src) {
             inline else => |x| try warm.run(&self.g, io, &self.c.model, &self.w, &self.cache, x, self.routes),
         };
+        // The decode lane's custom-kernel pipelines built here, not inside the first request (prebuild.zig): every width of
+        // the FP8 GEMV sites, the installed fusion texts, the fused glue and SwiGLU. Unconditional, exact (no output read).
+        const prebuilt = try prebuild.run(gpa, io, s, &self.c.model, &self.w, self.routes);
+        log.info("glm5_next pipelines pre-built: {d} launches at decode widths 1..{d} (fp8 gemv {d}, fusion {d}, glue {d}, swiglu {d}) in {d} ms\n", .{ prebuilt.gemv + prebuilt.fusion + prebuilt.glue + prebuilt.swiglu, prebuild.max_rows, prebuilt.gemv, prebuilt.fusion, prebuilt.glue, prebuilt.swiglu, prebuilt.ns / std.time.ns_per_ms });
         self.prompt_pass = promptPassOf(promptRoute(&self.c), self.c.expert_family);
         // `ttft_tail: deferred`: the served and the lane's prompt passes without their tail (the dump route keeps it).
         if (self.c.prompt.ttft_tail == .deferred) self.prompt_pass = deferredPromptOf(promptRoute(&self.c), self.c.expert_family) orelse self.prompt_pass;
@@ -295,6 +321,21 @@ pub const Module = struct {
         }
         if (self.mtp == null) log.info("glm5_next MTP lane: off (serial; set {{\"mtp_lane\":true}})\n", .{});
         log.info("glm5_next routes: dsa_nax={} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} span_rows={d} call_rows={d} kda={s} kda_prologue={s} residents={s} decode_glue={s} decode_kda={s} decode_dsa={s} decode_predict={s} decode_swiglu={s} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ routes.dsa.nax, @tagName(combine_route), @tagName(experts.read_schedule), @tagName(experts.drain), @tagName(experts.bank_view), @tagName(self.c.decode_moe), graph.span_rows, graph.prompt_call_rows, @tagName(kda_route), @tagName(kda_prologue_route), @tagName(self.c.model.residents_format), @tagName(self.c.decode_glue), @tagName(self.c.decode_kda), @tagName(self.c.decode_dsa), @tagName(self.c.decode_predict), @tagName(self.c.decode_swiglu), @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
+        // The launch-fusion switches as installed (each read back from its bound route: the KDA inputs' and the MLPs' routes,
+        // the scheduler's gated parts), then the installed lane's depth and gate: one line names every route a lever pair's
+        // arm runs (its one engagement substring).
+        const merged = switch (self.src) {
+            inline else => |x| x.ex.mergeGateWaits(),
+        };
+        const pred_fused = switch (self.src) {
+            inline else => |x| x.predictorFused(),
+        };
+        const join_fused = switch (self.src) {
+            inline else => |x| x.joinFused(),
+        };
+        var fusion_lane: [64]u8 = undefined;
+        const fusion_lane_state: []const u8 = if (self.mtp) |lane| std.fmt.bufPrint(&fusion_lane, "lane=on depth={d} draft_gate={d:.3}", .{ lane.depth, lane.gate }) catch unreachable else "lane=off";
+        log.info("glm5_next launch fusion: fuse_kda_inputs={s} fuse_gate_up={s} fuse_predictor={s} fuse_join={s} merge_gate_waits={s} {s}\n", .{ switchState(fusion.kdaInputsEngaged()), switchState(fusion.gateUpEngaged()), switchState(pred_fused), switchState(join_fused), switchState(merged), fusion_lane_state });
         // The prompt levers' engagement lines (glm5next/prefill-levers; docs/glm5-next.md "Prompt levers").
         if (experts.prompt_relocate) log.info("glm5_next prompt lever 1: read-ahead relocation engaged (a read-ahead record the plans evict before any hit is copied at the plans into its later transient row: read once; exact)\n", .{});
         log.info("glm5_next prompt lever 3: prompt kernels warmed at load in {d} ms (KDA layer {d}: {d} spans; dense layer {d}: one {d}-row tile; DSA layer {d}: {d} spans of {d} rows; the {s} combine; token-identical)\n", .{ warmed.ns / std.time.ns_per_ms, warmed.plan.kda_layer, warmed.plan.kda_spans, warmed.plan.dense_layer, graph.dense_tile_rows, warmed.plan.dsa_layer, warmed.plan.dsa_spans, graph.span_rows, @tagName(combine_route) });
@@ -879,6 +920,10 @@ pub fn Passes(comptime fam: experts.Family) type {
             return .{ .tokens = tokens, .accepted = kept, .next_token = plan.next };
         }
     };
+}
+
+fn switchState(on: bool) []const u8 {
+    return if (on) "on" else "off";
 }
 
 /// The prompt pass a construction installs: the served pass, or the logits dump's when `logits_dump_dir` is set. The

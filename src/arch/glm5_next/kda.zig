@@ -20,6 +20,7 @@ const glm = @import("config.zig");
 const fp8 = @import("fp8.zig");
 const kda_percore = @import("kda_percore.zig");
 const kda_prologue = @import("kda_prologue.zig");
+const fusion = @import("fusion.zig");
 
 comptime {
     // kda_percore.zig's and kda_prologue.zig's tests run with this file's (src/tests.zig lists kda.zig).
@@ -164,10 +165,12 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
     const head4 = [_]c_int{ 1, rows, hv, dk };
     // The prologue (the short conv, SiLU, the q / k norms, the next tail) from the three projections and the state's
     // tail: past the decode lane the prompt prologue installed at construction (kda_prologue.zig), else the op chain.
-    // The MTP verify's capture keeps the op chain (it captures the conv window).
-    const qp = try fp8.project(g, w.q, x);
-    const kp = try fp8.project(g, w.k, x);
-    const vp = try fp8.project(g, w.v, x);
+    // The MTP verify's capture keeps the op chain (it captures the conv window). The six input projections on the route
+    // installed at construction (fusion.zig `fuse_kda_inputs`: each its own launch, or one launch at <= 8 rows).
+    const in = try fusion.kdaInputs(g, w, x);
+    const qp = in.q;
+    const kp = in.k;
+    const vp = in.v;
     const tail = st.conv orelse try g.zeros(&.{ 1, taps - 1, cdim }, .float32);
     const pro = if (capture) try prologueOps(g, c, w, qp, kp, vp, tail) else try kda_prologue.spanPrologue(rows)(g, c, w, qp, kp, vp, tail);
     const qs = pro.q;
@@ -175,8 +178,8 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
     const v = pro.v;
     const next_tail = pro.next_tail;
     // The forget gate's pre-activation per key channel (each route makes the gate of it), beta, the state.
-    const a = try linear(g, try fp8.project(g, w.f_a, x), w.f_b);
-    const beta = try g.sigmoid(try fp8.project(g, w.b, x));
+    const a = try linear(g, in.f_a, w.f_b);
+    const beta = try g.sigmoid(in.b);
     const state = st.rec orelse try g.zeros(&.{ 1, hv, dk, dk }, .float32);
     const r = if (capture) blk: {
         // The MTP verify's rows: the stock kernel's capture variant over the f32 gate.
@@ -190,7 +193,7 @@ fn forwardWith(g: *G, c: *const glm.Config, w: *const Weights, x: T, st: *State,
         break :blk try route(g, c, w, qs, ks, v, a, beta, state);
     };
     // The gated RMSNorm: rms_norm(y) per head (o_norm) times sigmoid(g_b(g_a(x))).
-    const z = try g.reshape(try linear(g, try fp8.project(g, w.g_a, x), w.g_b), &head4);
+    const z = try g.reshape(try linear(g, in.g_a, w.g_b), &head4);
     var yn = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_rms_norm(&yn, r.y, w.o_norm, c.rms_norm_eps, g.s));
     const gated = try g.mul(try g.adopt(yn), try g.sigmoid(z));

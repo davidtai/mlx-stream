@@ -21,6 +21,7 @@ const glm = @import("config.zig");
 const kda = @import("kda.zig");
 const fp8 = @import("fp8.zig");
 const kset = @import("../../sdk_ext/kernel_set.zig");
+const fusion = @import("fusion.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -189,10 +190,13 @@ pub fn step(g: *G, k: *const Kernels, c: *const glm.Config, w: *const kda.Weight
     const dk: c_int = @intCast(c.kda_head_dim);
     const conv_state = st.conv orelse try g.zeros(&.{ 1, @intCast(conv_taps - 1), @intCast(c.kdaConvDim()) }, .float32);
     const state = st.rec orelse try g.zeros(&.{ 1, hv, dk, dk }, .float32);
+    // The six input projections on the route installed at construction (fusion.zig `fuse_kda_inputs`: each its own
+    // launch, or one launch).
+    const p = try fusion.kdaInputs(g, w, x);
     const ins = [_]T{
-        try proj(g, x, w.q), try proj(g, x, w.k), try proj(g, x, w.v), try proj(g, x, w.f_a), try proj(g, x, w.g_a), try proj(g, x, w.b),
-        w.conv_raw,          w.a_exp,             w.dt_bias,           w.o_norm,              k.consts,              conv_state,
-        state,               w.f_b,               w.g_b,
+        p.q,        p.k,     p.v,       p.f_a,    p.g_a,    p.b,
+        w.conv_raw, w.a_exp, w.dt_bias, w.o_norm, k.consts, conv_state,
+        state,      w.f_b,   w.g_b,
     };
     const in = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(in);
