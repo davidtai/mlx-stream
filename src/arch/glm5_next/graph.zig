@@ -1151,7 +1151,6 @@ test {
     _ = @import("fp8.zig");
     _ = @import("fp8_parity.zig");
     _ = @import("determinism_gpu.zig");
-    _ = @import("route_plan_bench.zig");
     _ = @import("prompt_levers.zig");
     _ = @import("fusion.zig");
     _ = @import("fusion_test.zig");
