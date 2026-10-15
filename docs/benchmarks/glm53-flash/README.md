@@ -300,8 +300,8 @@ The 64K rung hit the 16,384-token output cap (`finish_reason: length`). Every ot
   (`glm5next-ladder-<rung>-20261015`, run dirs `rNN-<rung>-clean`), outside this repository. Each cell holds the
   receipt (server command, environment, request body, numbers), the request, the response, the server log and the
   output. `sweep_results.json` names each row's cell and the SHA-256 of its receipt, prompt and output.
-- In `sweep_results.json`, the `plugin_commit` field is the chart script's fixed label (`0457394`, the g25-dsa3 lab
-  branch). The binary of the sweep is the one that `binary_sha256` names: g28-clean, plugin `6ac6dbf`.
+- The binary of the sweep is g28-clean, SHA-256 `e20b4548` (`binary_sha256`), built from host `a8f6c6b8` and plugin
+  `6ac6dbf` (`plugin_commit`).
 - Prefill and decode are the server's own per-request line. The chart script is `ladder_results.py`
   (`--suffix=-clean --binary e20b4548`) beside the cells, not in this repository. It writes the results file and the
   line charts.
