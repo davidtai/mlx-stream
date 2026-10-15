@@ -207,6 +207,9 @@ pub const Inputs = struct {
     decode_swiglu: settings.DecodeSwiglu = .ops,
     /// The MTP lane's construction facts (`mtp_lane` on; null: the serial control, none of the lane's terms).
     mtp: ?mtp.Facts = null,
+    /// The MTP lane's draft head (`settings.DraftHead`): `q4` / `q8` adds the lane's `mtp_head_q4` / `mtp_head_q8` (its arrays, wired and
+    /// counted with the lane's); `bf16` (the control) adds nothing.
+    draft_head: settings.DraftHead = .bf16,
     /// MiMo's X12 keep-warm route (`settings.Config.gpu_keep_warm`; `.off` the control). The setting's route, not the
     /// stream's resolution: a default `waits` on a CPU stream keeps its 1 MiB term (an over-bill there only, MiMo's rule).
     gpu_keep_warm: gpu_warm.Route = .off,
@@ -366,7 +369,7 @@ pub fn bufferCensus(in: *const Inputs) u64 {
     const g = in.geometry;
     const construction = in.residents.tensors + graph.Weights.ownedArrays(c) + (g.num_moe_layers + 1) * bank.n_components + 2 * c.nDsa() + 2 * c.nKda();
     const tiles = (@as(u64, graph.prompt_call_rows) * c.n_experts_per_tok + mimo_math.projection_rows - 1) / mimo_math.projection_rows + mimo_stream.max_route_ids;
-    const lane: u64 = if (in.mtp != null) laneBuffers(c) else 0;
+    const lane: u64 = if (in.mtp != null) laneBuffers(c) + @as(u64, if (in.draft_head != .bf16) mtp.head_q_arrays else 0) else 0;
     return construction + 2 * (tiles + 2 * (graph.prompt_call_rows / graph.span_rows) + 256) + lane;
 }
 
@@ -395,9 +398,12 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
     // request arrays (pending rows, waves, the KDA captures, the hidden taps) with the request's.
     const lane: ?[6]Term = if (in.mtp) |f| mtp.terms(f, c, in.reserve, page) else null;
     const lane_arch: ?[3]Term = if (in.mtp != null) laneTerms(in) else null;
+    // `draft_head: q4 | q8`: the lane's quantized lm_head copy, held from its open (wired with the lane's held arrays).
+    const head_q4: ?Term = if (in.mtp != null and in.draft_head != .bf16) mtp.headQTerm(c, page, in.draft_head) else null;
     var lane_held: u64 = 0;
     var lane_request: [2]u64 = .{ 0, 0 };
     if (in.mtp) |f| lane_held = f.bank_bytes + f.resident_bytes + f.table_bytes + mtp.kvBytes(c, in.reserve, page);
+    if (head_q4) |x| lane_held += x.bytes[0];
     if (lane) |lt| for (lt) |x| if (!x.at_construction) {
         lane_request[0] += x.bytes[0];
         lane_request[1] += x.bytes[1];
@@ -438,10 +444,12 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
     };
     const lt = lane orelse return a.dupe(Term, &terms);
     const la = lane_arch.?;
-    const out = try a.alloc(Term, terms.len + lt.len + la.len);
+    const hq: []const Term = if (head_q4) |*x| @as(*const [1]Term, x) else &.{};
+    const out = try a.alloc(Term, terms.len + lt.len + hq.len + la.len);
     @memcpy(out[0..terms.len], &terms);
     @memcpy(out[terms.len..][0..lt.len], &lt);
-    @memcpy(out[terms.len + lt.len ..], &la);
+    @memcpy(out[terms.len + lt.len ..][0..hq.len], hq);
+    @memcpy(out[terms.len + lt.len + hq.len ..], &la);
     return out;
 }
 
@@ -617,6 +625,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .decode_dsa = cfg.decode_dsa,
         .decode_swiglu = cfg.decode_swiglu,
         .mtp = lane,
+        .draft_head = cfg.draftHeadRoute(),
         .gpu_keep_warm = cfg.gpu_keep_warm,
         .exl3_wave_rows = cfg.prompt.wave_rows,
         .page = page,
@@ -859,6 +868,55 @@ test "glm5_next bill: the MTP lane adds its terms, the verify's rows on the deco
     }
 }
 
+test "glm5_next bill: draft_head q4 adds the lane's mtp_head_q4 (356,843,520 B from construction, wired and counted with the lane's held arrays); the bf16 head (the control) is the lane's bill term for term; without the lane, nothing" {
+    const a = testing.allocator;
+    var in = try fixtureInputs(32_768);
+    in.mtp = .{ .bank_bytes = 4_076_866_944, .resident_bytes = 369_670_784, .table_bytes = 6_817_792 };
+    const ctl = try billOf(a, &in);
+    defer ctl.free(a);
+    try testing.expectEqual(settings.DraftHead.bf16, in.draft_head);
+    for (ctl.terms) |x| try testing.expect(!std.mem.eql(u8, x.name, "mtp_head_q4"));
+    in.draft_head = .q4;
+    const q4 = try billOf(a, &in);
+    defer q4.free(a);
+    const head = mtp.headQBytes(&in.model, in.page, 4);
+    try testing.expectEqual(@as(u64, 356_843_520), head);
+    try testing.expectEqual([2]u64{ head, head }, termOf(q4, "mtp_head_q4"));
+    // Every other term is the control's but the wiring of the lane's held arrays and the buffer census (three arrays).
+    try testing.expectEqual(ctl.terms.len + 1, q4.terms.len);
+    for (ctl.terms) |x| {
+        const y = termOf(q4, x.name);
+        if (std.mem.eql(u8, x.name, "resident_wiring")) {
+            for (0..2) |ph| try testing.expect(y[ph] >= x.bytes[ph] + wireTables(head) - 64 and y[ph] <= x.bytes[ph] + wireTables(head) + 64);
+        } else if (std.mem.eql(u8, x.name, "buffer_allowance")) {
+            for (0..2) |ph| try testing.expectEqual(x.bytes[ph] + wire_buffer_bytes * mtp.head_q_arrays, y[ph]);
+        } else try testing.expectEqual(x.bytes, y);
+    }
+    for ([_]sdk.MemoryBill.Phase{ .prompt, .decode }) |ph| try testing.expect(q4.fixed(ph) > ctl.fixed(ph) + head);
+    // At the pin's rows the q4 bill admits a lower baseline by the term and its wiring.
+    try testing.expect(q4.total(.decode, 12_600_000_000, 217) > ctl.total(.decode, 12_600_000_000, 217) + head);
+    // q8: the same shape of difference at its own bytes (634,388,480 B of words and the same two tables), named mtp_head_q8.
+    in.draft_head = .q8;
+    const q8 = try billOf(a, &in);
+    defer q8.free(a);
+    const head8 = mtp.headQBytes(&in.model, in.page, 8);
+    try testing.expectEqual(@as(u64, 674_037_760), head8);
+    try testing.expectEqual([2]u64{ head8, head8 }, termOf(q8, "mtp_head_q8"));
+    for (q8.terms) |x| try testing.expect(!std.mem.eql(u8, x.name, "mtp_head_q4"));
+    try testing.expectEqual(ctl.terms.len + 1, q8.terms.len);
+    for ([_]sdk.MemoryBill.Phase{ .prompt, .decode }) |ph| try testing.expect(q8.fixed(ph) > q4.fixed(ph) + (head8 - head));
+    in.draft_head = .q4;
+    // Without the lane the setting bills nothing (validate refuses q4 there; the bill holds no lane terms at all).
+    in.mtp = null;
+    const off = try billOf(a, &in);
+    defer off.free(a);
+    for (off.terms) |x| try testing.expect(!std.mem.eql(u8, x.name, "mtp_head_q4"));
+    in.draft_head = .bf16;
+    const off_ctl = try billOf(a, &in);
+    defer off_ctl.free(a);
+    try testing.expectEqual(off_ctl.fixed(.decode), off.fixed(.decode));
+}
+
 test "glm5_next bill: prompt lever 5's layer end (the tail's inputs beside the next routed layer's predictor) stays under the attention stage at every call width: the prompt wave is unchanged" {
     const c: glm.Config = .{};
     for ([_]u64{ 1, 5, 512, 1024, 2048, 4096, 8192, 16_384 }) |t| for ([_]u64{ 16_384, 32_768, 1 << 20 }) |keys| {
@@ -995,18 +1053,21 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
     const lane = if (std.c.getenv("GLM5_BILL_MTP")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
     // `GLM5_BILL_WAVE_ROWS=<rows>`: the exl3 family's DIG-X prompt waves at that setting (`exl3_wave_rows`, validated).
     const wave_rows: u32 = if (std.c.getenv("GLM5_BILL_WAVE_ROWS")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else prompt_levers.default_wave_rows;
+    // `GLM5_BILL_DRAFT_HEAD=bf16|q4|q8` (with the lane): the lane's draft head (`mtp_head_q4` / `mtp_head_q8`); absent, the
+    // settings' default (bf16: no head term).
+    const head: settings.DraftHead = if (std.c.getenv("GLM5_BILL_DRAFT_HEAD")) |v| std.meta.stringToEnum(settings.DraftHead, std.mem.span(v)) orelse return error.Glm5NextDraftHeadSetting else (settings.Config{}).draft_head;
     const fam = blk: {
         const v = try std.json.parseFromSlice(std.json.Value, a, config_text, .{});
         defer v.deinit();
         const block = if (v.value == .object) v.value.object.get("expert_streaming") orelse .null else .null;
         break :blk @import("root.zig").declared(block) orelse return error.Glm5NextPackRequired;
     };
-    var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane, .prompt = .{ .wave_rows = wave_rows } };
+    var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane, .prompt = .{ .wave_rows = wave_rows }, .draft_head = head };
     if (!prompt_levers.validWaveRows(wave_rows)) return error.Glm5NextExl3WaveRows;
     try cfg.prompt.check(fam == .exl3);
     if (wave_rows != prompt_levers.default_wave_rows) std.debug.print("\nGLM5_NEXT BILL exl3_wave_rows={d}\n", .{wave_rows});
     const res = try residentBytes(a, io, dir, &model, std.heap.pageSize());
-    std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s} experts={s}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off", @tagName(fam) });
+    std.debug.print("\nGLM5_NEXT BILL pack={s} ceiling={d} stop={d} target={d} residents={d} resident_tensors={d} combine={s} min_rows={d} mtp_lane={s} experts={s}{s}\n", .{ dir, ceiling, box_stop, target, res.bytes, res.tensors, @tagName(experts.combineRoute()), min_rows, if (lane) "on" else "off", @tagName(fam), if (head == .q4) " draft_head=q4" else if (head == .q8) " draft_head=q8" else "" });
     for (tool_contexts) |ctx| {
         cfg.effective_context = ctx;
         const b = try completeBill(a, io, &cfg, cfg.reserveTokens());

@@ -9,10 +9,10 @@ const sdk = @import("sdk");
 const sdk_ext = @import("../../sdk_ext.zig");
 const acc = sdk_ext.acceptance;
 const glm = @import("config.zig");
+const settings = @import("settings.zig");
 const bank = @import("bank.zig");
 const graph = @import("graph.zig");
 const mtp = @import("mtp.zig");
-const settings = @import("settings.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const testing = std.testing;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -915,7 +915,7 @@ test "glm5_next mtp hold: what the open's arrays hold equals the bill's mtp_bank
     for ([_]u64{ 17_408, 32_768, 1_048_576 }) |positions| {
         const arrays = openArrayBytes(&g, &c, positions);
         const held = mtp.heldOf(&arrays, page);
-        try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page), held);
+        try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page, .bf16), held);
         const f: mtp.Facts = .{ .bank_bytes = mtp.DraftBank.arrayBytes(&g, page), .resident_bytes = 0, .table_bytes = mtp.Head.tableBytes(&c, page) };
         const t = mtp.terms(f, &c, positions, page);
         try testing.expectEqual(t[0].bytes[0] + t[2].bytes[0] + t[3].bytes[0], held);
@@ -1036,5 +1036,747 @@ test "glm5_next mtp acceptance setting: exact is today's rule; typical (delta 0.
     };
     std.debug.print("GLM5N_MTP_ACCEPTANCE kept exact={d} typical={d}\n", .{ kept[0], kept[1] });
     try testing.expect(kept[1] >= kept[0]);
+    try noDevice();
+}
+
+// ── the draft head (`draft_head`: bf16, the control; q4, the 4-bit head and the bounded draw) ──
+
+test "glm5_next mtp draft head: the lane's chain is the bf16 head's by default (bf16 and q4 by name; none without the lane); the q4 chain (its 4-bit head, its bounded draw) is reachable from draft_head q4 only" {
+    try testing.expect(mtp.chainOf(.bf16) != mtp.chainOf(.q4));
+    try testing.expect(mtp.chainFor(.bf16) == mtp.chainOf(.bf16));
+    try testing.expect(mtp.chainFor(.q4) == mtp.chainOf(.q4));
+    try testing.expect(mtp.chainFor(.q8) == mtp.chainOf(.q8));
+    try testing.expect(mtp.chainOf(.q8) != mtp.chainOf(.q4) and mtp.chainOf(.q8) != mtp.chainOf(.bf16));
+    for ([_]struct { text: []const u8, want: settings.DraftHead }{
+        .{ .text = "{}", .want = .bf16 },
+        .{ .text = "{\"mtp_lane\":true}", .want = .bf16 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5}", .want = .bf16 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_head\":\"bf16\"}", .want = .bf16 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q4\"}", .want = .q4 },
+        .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"draft_head\":\"q8\"}", .want = .q8 },
+    }) |case| {
+        const raw = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.text, .{});
+        defer raw.deinit();
+        try testing.expect(settings.unknownSetting(raw.value.object) == null);
+        var c: settings.Config = .{};
+        c.applySettings(raw.value);
+        try c.validate();
+        try testing.expectEqual(case.want, c.draftHeadRoute());
+        // The open binds `chainFor(draftHeadRoute())`: the q4 chain for "q4" alone.
+        const want_chain = switch (case.want) {
+            .bf16 => mtp.chainOf(.bf16),
+            .q4 => mtp.chainOf(.q4),
+            .q8 => mtp.chainOf(.q8),
+        };
+        try testing.expect(mtp.chainFor(c.draftHeadRoute()) == want_chain);
+        try testing.expectEqual(case.want == .q4, mtp.chainFor(c.draftHeadRoute()) == mtp.chainOf(.q4));
+    }
+    // The q4 head's arrays start empty (built only by the q4 open).
+    const empty: mtp.HeadQ = .{};
+    for (empty.arrays()) |x| try testing.expect(x.ctx == null);
+    try noDevice();
+}
+
+/// A recording backend for a draft step's head (`mtp.headLogits`): each op appends its name and operands; arrays are ids.
+const HeadOps = struct {
+    pub const T = u32;
+    const Op = enum { transpose, matmul, quantized_matmul, astype, reshape };
+    const Call = struct { op: Op, args: [4]u32 = @splat(0), transpose_w: bool = false, bits: u32 = 0, group: u32 = 0, mode: ?sdk.QuantMode = null };
+    a: std.mem.Allocator,
+    calls: std.ArrayList(Call) = .empty,
+    next: u32 = 100,
+
+    fn add(g: *HeadOps, c: Call) !T {
+        try g.calls.append(g.a, c);
+        g.next += 1;
+        return g.next;
+    }
+    pub fn transpose(g: *HeadOps, x: T) !T {
+        return g.add(.{ .op = .transpose, .args = .{ x, 0, 0, 0 } });
+    }
+    pub fn matmul(g: *HeadOps, x: T, w: T) !T {
+        return g.add(.{ .op = .matmul, .args = .{ x, w, 0, 0 } });
+    }
+    pub fn quantizedMatmul(g: *HeadOps, x: T, w: T, sc: T, biases: ?T, transpose_w: bool, bits: u32, group: u32, mode: sdk.QuantMode) !T {
+        return g.add(.{ .op = .quantized_matmul, .args = .{ x, w, sc, biases orelse 0 }, .transpose_w = transpose_w, .bits = bits, .group = group, .mode = mode });
+    }
+    pub fn astype(g: *HeadOps, x: T, _: sdk.mlx.mlx_dtype) !T {
+        return g.add(.{ .op = .astype, .args = .{ x, 0, 0, 0 } });
+    }
+    pub fn reshape(g: *HeadOps, x: T, _: []const c_int) !T {
+        return g.add(.{ .op = .reshape, .args = .{ x, 0, 0, 0 } });
+    }
+    fn reads(g: *const HeadOps, x: T) bool {
+        for (g.calls.items) |c| for (c.args) |y| if (y == x) return true;
+        return false;
+    }
+};
+
+test "glm5_next mtp draft head: a draft step's head reads its own form's weights only: bf16 lm_head's matmul (the control's ops), or the q4 copy through quantized_matmul at 4 bits, group 64, affine, transposed" {
+    const normed: u32 = 1;
+    const lm_head: u32 = 2;
+    const q4 = [mtp.head_q_arrays]u32{ 3, 4, 5 };
+    {
+        var g: HeadOps = .{ .a = testing.allocator };
+        defer g.calls.deinit(testing.allocator);
+        _ = try mtp.headLogits(.bf16, &g, normed, lm_head, q4);
+        // graph.linear's ops (matmul on the transposed weight), then the f32 row: the control's step.
+        const want = [_]HeadOps.Op{ .transpose, .matmul, .astype, .reshape };
+        try testing.expectEqual(want.len, g.calls.items.len);
+        for (want, g.calls.items) |w, c| try testing.expectEqual(w, c.op);
+        try testing.expectEqual(lm_head, g.calls.items[0].args[0]);
+        try testing.expectEqual(normed, g.calls.items[1].args[0]);
+        for (q4) |x| try testing.expect(!g.reads(x));
+    }
+    {
+        var g: HeadOps = .{ .a = testing.allocator };
+        defer g.calls.deinit(testing.allocator);
+        _ = try mtp.headLogits(.q4, &g, normed, lm_head, q4);
+        const want = [_]HeadOps.Op{ .quantized_matmul, .astype, .reshape };
+        try testing.expectEqual(want.len, g.calls.items.len);
+        for (want, g.calls.items) |w, c| try testing.expectEqual(w, c.op);
+        const qm = g.calls.items[0];
+        try testing.expectEqualSlices(u32, &.{ normed, 3, 4, 5 }, &qm.args);
+        try testing.expect(qm.transpose_w);
+        try testing.expectEqual(@as(u32, 4), qm.bits);
+        try testing.expectEqual(@as(u32, 64), qm.group);
+        try testing.expectEqual(sdk.QuantMode.affine, qm.mode.?);
+        try testing.expect(!g.reads(lm_head));
+    }
+    {
+        var g: HeadOps = .{ .a = testing.allocator };
+        defer g.calls.deinit(testing.allocator);
+        _ = try mtp.headLogits(.q8, &g, normed, lm_head, q4);
+        try testing.expectEqual(HeadOps.Op.quantized_matmul, g.calls.items[0].op);
+        try testing.expectEqual(@as(u32, 8), g.calls.items[0].bits);
+        try testing.expectEqual(@as(u32, 64), g.calls.items[0].group);
+        try testing.expect(!g.reads(lm_head));
+    }
+    try noDevice();
+}
+
+test "glm5_next mtp draft head: the q4 head holds 356,843,520 B at Flash (packed words and bf16 scales and biases, group 64), billed mtp_head_q4; the open's arrays equal the bill's terms by construction under either form" {
+    const page: u64 = 16_384;
+    const c: glm.Config = .{};
+    // MLX's affine quantize's shapes (ops.cpp `affine_quantize`): words uint32 [vocab, hidden x bits / 32], scales and
+    // biases bf16 [vocab, hidden / group].
+    const words: u64 = @as(u64, c.vocab_size) * (c.hidden_size * settings.headBits(.q4) / 32) * 4;
+    const tables: u64 = @as(u64, c.vocab_size) * (c.hidden_size / settings.draft_head_group) * 2;
+    try testing.expectEqual(@as(u64, 317_194_240), words);
+    try testing.expectEqual(@as(u64, 19_824_640), tables);
+    try testing.expectEqual(@as(u64, 356_843_520), mtp.headQBytes(&c, page, 4));
+    try testing.expectEqual(mtp.headQBytes(&c, page, 4), mtp.heldOf(&.{ words, tables, tables }, page));
+    const t = mtp.headQTerm(&c, page, .q4);
+    try testing.expectEqualStrings("mtp_head_q4", t.name);
+    try testing.expect(t.at_construction);
+    try testing.expectEqual([2]u64{ 356_843_520, 356_843_520 }, t.bytes);
+    // q8: 634,388,480 B of words and the same tables (674,037,760 B), billed mtp_head_q8, held = billed.
+    const words8: u64 = @as(u64, c.vocab_size) * (c.hidden_size * 8 / 32) * 4;
+    try testing.expectEqual(@as(u64, 634_388_480), words8);
+    try testing.expectEqual(@as(u64, 674_037_760), mtp.headQBytes(&c, page, 8));
+    try testing.expectEqual(mtp.headQBytes(&c, page, 8), mtp.heldOf(&.{ words8, tables, tables }, page));
+    const t8 = mtp.headQTerm(&c, page, .q8);
+    try testing.expectEqualStrings("mtp_head_q8", t8.name);
+    try testing.expectEqual([2]u64{ 674_037_760, 674_037_760 }, t8.bytes);
+    // A draft step reads 356,843,520 B in place of the BF16 head's 1,268,776,960 B.
+    try testing.expectEqual(@as(u64, 1_268_776_960), @as(u64, c.vocab_size) * c.hidden_size * 2);
+    // The open's held arrays (`Lane.open`: the bank's nine, the head's three f32 tables, the two lanes, and under q4 the
+    // head's three) against the bill's mtp_bank + mtp_tables + mtp_kv (+ mtp_head_q4).
+    const g = try bank.Geometry.init(c.hidden_size, c.moe_intermediate_size, c.n_routed_experts, c.n_layers, 1);
+    for ([_]u64{ 17_408, 32_768 }) |positions| {
+        const base = openArrayBytes(&g, &c, positions);
+        var with_q4: [base.len + mtp.head_q_arrays]u64 = undefined;
+        @memcpy(with_q4[0..base.len], &base);
+        with_q4[base.len..].* = .{ words, tables, tables };
+        try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page, .bf16), mtp.heldOf(&base, page));
+        try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page, .q4), mtp.heldOf(&with_q4, page));
+        try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page, .bf16) + t.bytes[0], mtp.heldBytes(&g, &c, positions, page, .q4));
+        try testing.expectEqual(mtp.heldBytes(&g, &c, positions, page, .bf16) + t8.bytes[0], mtp.heldBytes(&g, &c, positions, page, .q8));
+        const f: mtp.Facts = .{ .bank_bytes = mtp.DraftBank.arrayBytes(&g, page), .resident_bytes = 0, .table_bytes = mtp.Head.tableBytes(&c, page) };
+        const lt = mtp.terms(f, &c, positions, page);
+        try testing.expectEqual(lt[0].bytes[0] + lt[2].bytes[0] + lt[3].bytes[0] + t.bytes[0], mtp.heldOf(&with_q4, page));
+    }
+    try noDevice();
+}
+
+/// A host backend for the sampled draws' graphs (`acc.sampledRows`, `mtp.boundedDraw`): every array a row-major f32 matrix
+/// (a 1-D array is one row, a scalar 1 x 1; ids, int32 and bool values held exactly), every op computed in f32 when
+/// built with MLX's semantics (2-D broadcasting; sorts, scans, reductions and softmax along the last axis, sequential).
+/// `argpartition` keeps its kth element in place and shuffles each side (seeded by `scramble`): MLX's CPU partition leaves
+/// both sides unordered, its Metal one is a sorted argsort; the bounded draw must not depend on that order.
+const DrawOps = struct {
+    pub const T = u32;
+    const Arr = struct { r: usize, c: usize, nd: u8, v: []f32 };
+    pub const Shape = struct {
+        d: [2]c_int,
+        n: usize,
+        pub fn dim(s: Shape, i: c_int) c_int {
+            const j: usize = @intCast(if (i < 0) @as(c_int, @intCast(s.n)) + i else i);
+            return s.d[j];
+        }
+    };
+    a: std.mem.Allocator,
+    arrs: std.ArrayList(Arr) = .empty,
+    scramble: u64 = 0,
+
+    fn deinit(g: *DrawOps) void {
+        for (g.arrs.items) |x| g.a.free(x.v);
+        g.arrs.deinit(g.a);
+    }
+    fn new(g: *DrawOps, r: usize, c: usize, nd: u8) !T {
+        const v = try g.a.alloc(f32, r * c);
+        @memset(v, 0);
+        try g.arrs.append(g.a, .{ .r = r, .c = c, .nd = nd, .v = v });
+        return @intCast(g.arrs.items.len - 1);
+    }
+    fn at(g: *DrawOps, x: T) Arr {
+        return g.arrs.items[x];
+    }
+    fn value(g: *DrawOps, x: T) []f32 {
+        return g.arrs.items[x].v;
+    }
+    pub fn shapeOf(g: *DrawOps, x: T) Shape {
+        const s = g.at(x);
+        return switch (s.nd) {
+            0 => .{ .d = .{ 1, 1 }, .n = 0 },
+            1 => .{ .d = .{ @intCast(s.c), 0 }, .n = 1 },
+            else => .{ .d = .{ @intCast(s.r), @intCast(s.c) }, .n = 2 },
+        };
+    }
+    pub fn hostArray(g: *DrawOps, bytes: []const u8, shape: []const c_int, dt: sdk.mlx.mlx_dtype) !T {
+        const n = bytes.len / 4;
+        const r: usize = if (shape.len == 2) @intCast(shape[0]) else 1;
+        const y = try g.new(r, n / r, @intCast(shape.len));
+        const out = g.value(y);
+        for (out, 0..) |*o, i| {
+            const w = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+            o.* = switch (dt) {
+                .float32 => @bitCast(w),
+                .int32 => @floatFromInt(@as(i32, @bitCast(w))),
+                else => @floatFromInt(w),
+            };
+        }
+        return y;
+    }
+    pub fn scalar(g: *DrawOps, v: f64, _: sdk.mlx.mlx_dtype) !T {
+        const y = try g.new(1, 1, 0);
+        g.value(y)[0] = @floatCast(v);
+        return y;
+    }
+    pub fn arange(g: *DrawOps, start: f64, stop: f64, step: f64, _: sdk.mlx.mlx_dtype) !T {
+        const n: usize = @intFromFloat(@ceil((stop - start) / step));
+        const y = try g.new(1, n, 1);
+        for (g.value(y), 0..) |*o, i| o.* = @floatCast(start + step * @as(f64, @floatFromInt(i)));
+        return y;
+    }
+    pub fn reshape(g: *DrawOps, x: T, shape: []const c_int) !T {
+        const s = g.at(x);
+        const n = s.r * s.c;
+        const r: usize = if (shape.len == 2) (if (shape[0] < 0) n / @as(usize, @intCast(shape[1])) else @intCast(shape[0])) else 1;
+        const y = try g.new(r, n / r, @intCast(shape.len));
+        @memcpy(g.value(y), g.value(x));
+        return y;
+    }
+    pub fn astype(g: *DrawOps, x: T, dt: sdk.mlx.mlx_dtype) !T {
+        const s = g.at(x);
+        const y = try g.new(s.r, s.c, s.nd);
+        for (g.value(y), g.value(x)) |*o, v| o.* = switch (dt) {
+            .int32, .uint32 => @trunc(v),
+            else => v,
+        };
+        return y;
+    }
+    fn map1(g: *DrawOps, x: T, comptime f: fn (f32) f32) !T {
+        const s = g.at(x);
+        const y = try g.new(s.r, s.c, s.nd);
+        for (g.value(y), g.value(x)) |*o, v| o.* = f(v);
+        return y;
+    }
+    fn negF(v: f32) f32 {
+        return -v;
+    }
+    fn expF(v: f32) f32 {
+        return @exp(v);
+    }
+    pub fn neg(g: *DrawOps, x: T) !T {
+        return g.map1(x, negF);
+    }
+    pub fn exp(g: *DrawOps, x: T) !T {
+        return g.map1(x, expF);
+    }
+    const Bin = enum { mul, sub, div, less, ge, land, eq };
+    fn bin(g: *DrawOps, x: T, y: T, comptime op: Bin) !T {
+        const p = g.at(x);
+        const q = g.at(y);
+        const r = @max(p.r, q.r);
+        const c = @max(p.c, q.c);
+        std.debug.assert((p.r == r or p.r == 1) and (q.r == r or q.r == 1) and (p.c == c or p.c == 1) and (q.c == c or q.c == 1));
+        const z = try g.new(r, c, @max(p.nd, q.nd));
+        const pv = g.value(x);
+        const qv = g.value(y);
+        const out = g.value(z);
+        for (0..r) |i| for (0..c) |j| {
+            const u = pv[(if (p.r == 1) 0 else i) * p.c + (if (p.c == 1) 0 else j)];
+            const w = qv[(if (q.r == 1) 0 else i) * q.c + (if (q.c == 1) 0 else j)];
+            out[i * c + j] = switch (op) {
+                .mul => u * w,
+                .sub => u - w,
+                .div => u / w,
+                .less => @floatFromInt(@intFromBool(u < w)),
+                .ge => @floatFromInt(@intFromBool(u >= w)),
+                .land => @floatFromInt(@intFromBool(u != 0 and w != 0)),
+                .eq => @floatFromInt(@intFromBool(u == w)),
+            };
+        };
+        return z;
+    }
+    pub fn mul(g: *DrawOps, x: T, y: T) !T {
+        return g.bin(x, y, .mul);
+    }
+    pub fn sub(g: *DrawOps, x: T, y: T) !T {
+        return g.bin(x, y, .sub);
+    }
+    pub fn div(g: *DrawOps, x: T, y: T) !T {
+        return g.bin(x, y, .div);
+    }
+    pub fn less(g: *DrawOps, x: T, y: T) !T {
+        return g.bin(x, y, .less);
+    }
+    pub fn greaterEqual(g: *DrawOps, x: T, y: T) !T {
+        return g.bin(x, y, .ge);
+    }
+    pub fn logicalAnd(g: *DrawOps, x: T, y: T) !T {
+        return g.bin(x, y, .land);
+    }
+    pub fn equal(g: *DrawOps, x: T, y: T) !T {
+        return g.bin(x, y, .eq);
+    }
+    pub fn where(g: *DrawOps, m: T, x: T, y: T) !T {
+        const sm = g.at(m);
+        const sx = g.at(x);
+        const sy = g.at(y);
+        const r = @max(sm.r, @max(sx.r, sy.r));
+        const c = @max(sm.c, @max(sx.c, sy.c));
+        const z = try g.new(r, c, @max(sm.nd, @max(sx.nd, sy.nd)));
+        const out = g.value(z);
+        for (0..r) |i| for (0..c) |j| {
+            const pick = g.value(m)[(if (sm.r == 1) 0 else i) * sm.c + (if (sm.c == 1) 0 else j)] != 0;
+            const src = if (pick) sx else sy;
+            const vals = if (pick) g.value(x) else g.value(y);
+            out[i * c + j] = vals[(if (src.r == 1) 0 else i) * src.c + (if (src.c == 1) 0 else j)];
+        };
+        return z;
+    }
+    const Red = enum { sum, max, lse };
+    fn reduce(g: *DrawOps, x: T, keepdims: bool, comptime op: Red) !T {
+        const s = g.at(x);
+        const y = try g.new(if (keepdims) s.r else 1, if (keepdims) 1 else s.r, if (keepdims) s.nd else s.nd -| 1);
+        for (0..s.r) |i| {
+            const row = g.value(x)[i * s.c ..][0..s.c];
+            g.value(y)[i] = switch (op) {
+                .sum => blk: {
+                    var t: f32 = 0;
+                    for (row) |v| t += v;
+                    break :blk t;
+                },
+                .max => std.mem.max(f32, row),
+                .lse => blk: {
+                    const m = std.mem.max(f32, row);
+                    if (m == -std.math.inf(f32)) break :blk m;
+                    var t: f32 = 0;
+                    for (row) |v| t += @exp(v - m);
+                    break :blk m + @log(t);
+                },
+            };
+        }
+        return y;
+    }
+    pub fn sum(g: *DrawOps, x: T, axis: c_int, keepdims: bool) !T {
+        std.debug.assert(axis == -1);
+        return g.reduce(x, keepdims, .sum);
+    }
+    pub fn max(g: *DrawOps, x: T, axis: c_int, keepdims: bool) !T {
+        std.debug.assert(axis == -1);
+        return g.reduce(x, keepdims, .max);
+    }
+    pub fn logsumexp(g: *DrawOps, x: T, axis: c_int, keepdims: bool) !T {
+        std.debug.assert(axis == -1);
+        return g.reduce(x, keepdims, .lse);
+    }
+    pub fn softmax(g: *DrawOps, x: T, axis: c_int) !T {
+        std.debug.assert(axis == -1);
+        const s = g.at(x);
+        const y = try g.new(s.r, s.c, s.nd);
+        for (0..s.r) |i| {
+            const row = g.value(x)[i * s.c ..][0..s.c];
+            const out = g.value(y)[i * s.c ..][0..s.c];
+            const m = std.mem.max(f32, row);
+            var t: f32 = 0;
+            for (out, row) |*o, v| {
+                o.* = @exp(v - m);
+                t += o.*;
+            }
+            for (out) |*o| o.* /= t;
+        }
+        return y;
+    }
+    pub fn cumsum(g: *DrawOps, x: T, axis: c_int) !T {
+        std.debug.assert(axis == -1);
+        const s = g.at(x);
+        const y = try g.new(s.r, s.c, s.nd);
+        for (0..s.r) |i| {
+            var t: f32 = 0;
+            for (g.value(x)[i * s.c ..][0..s.c], g.value(y)[i * s.c ..][0..s.c]) |v, *o| {
+                t += v;
+                o.* = t;
+            }
+        }
+        return y;
+    }
+    pub fn sort(g: *DrawOps, x: T, axis: c_int) !T {
+        std.debug.assert(axis == -1);
+        const s = g.at(x);
+        const y = try g.new(s.r, s.c, s.nd);
+        @memcpy(g.value(y), g.value(x));
+        for (0..s.r) |i| std.mem.sort(f32, g.value(y)[i * s.c ..][0..s.c], {}, std.sort.asc(f32));
+        return y;
+    }
+    const ByVal = struct {
+        v: []const f32,
+        fn lt(ctx: ByVal, p: u32, q: u32) bool {
+            return ctx.v[p] < ctx.v[q] or (ctx.v[p] == ctx.v[q] and p < q);
+        }
+    };
+    pub fn argpartition(g: *DrawOps, x: T, kth: c_int, axis: c_int) !T {
+        std.debug.assert(axis == -1);
+        const s = g.at(x);
+        const y = try g.new(s.r, s.c, s.nd);
+        const idx = try g.a.alloc(u32, s.c);
+        defer g.a.free(idx);
+        var prng = std.Random.DefaultPrng.init(g.scramble);
+        const k: usize = @intCast(kth);
+        for (0..s.r) |i| {
+            for (idx, 0..) |*o, j| o.* = @intCast(j);
+            std.mem.sort(u32, idx, ByVal{ .v = g.value(x)[i * s.c ..][0..s.c] }, ByVal.lt);
+            prng.random().shuffle(u32, idx[0..k]);
+            prng.random().shuffle(u32, idx[k + 1 ..]);
+            for (g.value(y)[i * s.c ..][0..s.c], idx) |*o, j| o.* = @floatFromInt(j);
+        }
+        return y;
+    }
+    pub fn slice(g: *DrawOps, x: T, start: []const c_int, stop: []const c_int, strides: []const c_int) !T {
+        const s = g.at(x);
+        std.debug.assert(start.len == 2 and strides[0] == 1 and strides[1] == 1);
+        const r0: usize = @intCast(start[0]);
+        const c0: usize = @intCast(start[1]);
+        const r: usize = @as(usize, @intCast(stop[0])) - r0;
+        const c: usize = @as(usize, @intCast(stop[1])) - c0;
+        const y = try g.new(r, c, 2);
+        for (0..r) |i| @memcpy(g.value(y)[i * c ..][0..c], g.value(x)[(r0 + i) * s.c + c0 ..][0..c]);
+        return y;
+    }
+    pub fn takeAlongAxis(g: *DrawOps, x: T, idx: T, axis: c_int) !T {
+        std.debug.assert(axis == -1);
+        const s = g.at(x);
+        const si = g.at(idx);
+        const r = @max(s.r, si.r);
+        const y = try g.new(r, si.c, 2);
+        for (0..r) |i| for (0..si.c) |j| {
+            const k: i64 = @intFromFloat(g.value(idx)[(if (si.r == 1) 0 else i) * si.c + j]);
+            const kk: usize = @intCast(if (k < 0) k + @as(i64, @intCast(s.c)) else k);
+            g.value(y)[i * si.c + j] = g.value(x)[(if (s.r == 1) 0 else i) * s.c + kk];
+        };
+        return y;
+    }
+};
+
+/// The full filter's facts for a row (the host reference, f64 over the f32 tempered logits): its kept set before
+/// min_p (`kept_pre`), and how far each of its decisions sits from its threshold: the top_p cut (each sorted
+/// position's cumulative mass before it, against top_p), min_p (each kept probability against min_p x the top one) and
+/// the draw (every kept token's CDF in token-id order, against the uniform). A decision within `margin` of its threshold
+/// can round either way in f32: such a row is not compared.
+fn filterFacts(row: []const f32, sm: acc.Params, v: f32, margin: f64) struct { kept_pre: usize, clear: bool } {
+    const V = 4096;
+    var lt: [V]f32 = undefined;
+    for (lt[0..row.len], row) |*o, x| o.* = x * (1.0 / sm.temperature);
+    var srt: [V]f32 = undefined;
+    @memcpy(srt[0..row.len], lt[0..row.len]);
+    std.mem.sort(f32, srt[0..row.len], {}, std.sort.desc(f32));
+    var z: f64 = 0;
+    const top: f64 = srt[0];
+    for (srt[0..row.len]) |x| z += @exp(@as(f64, x) - top);
+    var clear = true;
+    if (sm.top_p < 1.0) {
+        const kk: usize = if (sm.top_k > 0) @min(sm.top_k, row.len) else row.len;
+        var zk: f64 = 0;
+        for (srt[0..kk]) |x| zk += @exp(@as(f64, x) - top) / z;
+        var before: f64 = 0;
+        for (srt[0..kk]) |x| {
+            if (@abs(before - sm.top_p) < margin) clear = false;
+            if (before >= sm.top_p + margin) break;
+            before += @exp(@as(f64, x) - top) / z / zk;
+        }
+    }
+    var pre = sm;
+    pre.min_p = null;
+    var d: [V]f64 = undefined;
+    acc.distribution(row, pre, d[0..row.len]);
+    var kept_pre: usize = 0;
+    var pmax: f64 = 0;
+    for (d[0..row.len]) |p| {
+        if (p > 0) kept_pre += 1;
+        pmax = @max(pmax, p);
+    }
+    if (sm.min_p) |mp| for (d[0..row.len]) |p| {
+        if (p > 0 and @abs(p - mp * pmax) < margin * pmax) clear = false;
+    };
+    acc.distribution(row, sm, d[0..row.len]);
+    var cum: f64 = 0;
+    for (d[0..row.len]) |p| if (p > 0) {
+        cum += p;
+        if (@abs(cum - v) < margin) clear = false;
+    };
+    return .{ .kept_pre = kept_pre, .clear = clear };
+}
+
+test "glm5_next mtp draft head: the bounded filter (the row's top 256) draws the full filter's token whenever the full filter's kept set lies within the top 256 (random rows, every filter it serves, the position-keyed draw); a wider kept set draws a top-256 token; the candidates' order does not matter" {
+    const V = 4096;
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xd4af_7e5d_0256);
+    const rand = prng.random();
+    const params = [_]acc.Params{
+        .{ .temperature = 1.0, .top_p = 0.95 }, // the lever pair's request (card sampling)
+        .{ .temperature = 0.7, .top_p = 0.9 },
+        .{ .temperature = 1.3, .top_p = 0.95, .top_k = 40 },
+        .{ .temperature = 1.0, .top_p = 0.95, .top_k = 256 },
+        .{ .temperature = 0.8, .top_p = 0.9, .min_p = 0.05 },
+        .{ .temperature = 1.0, .top_k = 20 },
+        .{ .temperature = 0.6, .top_k = 256, .min_p = 0.1 },
+    };
+    // The requests the bounded draw serves: a sorting filter, top_k (if set) within the candidates; the rest keep the full
+    // draw (no sort to replace; a wider top_k renormalises top_p over tokens past the candidates).
+    for (params) |sm| try testing.expect(mtp.boundedServes(sm));
+    for ([_]acc.Params{ .{ .temperature = 1.0 }, .{ .temperature = 0.8, .min_p = 0.05 }, .{ .temperature = 1.0, .top_k = 257 }, .{ .temperature = 1.0, .top_p = 0.95, .top_k = 300 } }) |sm|
+        try testing.expect(!mtp.boundedServes(sm));
+    const n_cases = 630;
+    var row: [V]f32 = undefined;
+    var ranks: [V]u32 = undefined;
+    var inside: u32 = 0;
+    var compared: u32 = 0;
+    var outside: u32 = 0;
+    var outside_same: u32 = 0;
+    var unclear: u32 = 0;
+    for (0..n_cases) |case| {
+        var sm = params[case % params.len];
+        sm.seed = 0x5eed_0000 + case;
+        const pos: u64 = 16_381 + 13 * @as(u64, case);
+        // Three kinds of row over a random token order: peaked and medium (a language model's power law, p ~ rank^-alpha,
+        // alpha 2..3 and 1..1.8, with a little noise), flat (noise alone).
+        const kind = (case / params.len) % 3;
+        for (&ranks, 0..) |*x, i| x.* = @intCast(i + 1);
+        rand.shuffle(u32, &ranks);
+        const alpha: f32 = switch (kind) {
+            0 => 2.0 + rand.float(f32),
+            1 => 1.0 + 0.8 * rand.float(f32),
+            else => 0,
+        };
+        for (&row, ranks) |*x, rk| x.* = -alpha * @log(@as(f32, @floatFromInt(rk))) + rand.floatNorm(f32) * @as(f32, if (kind == 2) 0.25 else 0.05);
+        const v = acc.drawV(sm.seed, pos);
+        const facts = filterFacts(&row, sm, v, 1e-4);
+        var dref: [V]f64 = undefined;
+        acc.distribution(&row, sm, &dref);
+        const tok_ref = acc.draw(&dref, v);
+
+        var g: DrawOps = .{ .a = a, .scramble = case };
+        defer g.deinit();
+        const row2 = try g.hostArray(std.mem.sliceAsBytes(&row), &.{ 1, V }, .float32);
+        // The full filter (the control's draw: `ChainHead(.bf16).draw` at base pos - 1, its row's uniform at pos).
+        const full: u32 = @intFromFloat(g.value((try acc.sampledRows(&g, row2, sm, pos - 1, &.{})).tok)[0]);
+        const bounded: u32 = @intFromFloat(g.value(try mtp.boundedDraw(&g, row2, sm, pos))[0]);
+        // Another order of argpartition's candidates: the same token (the draw re-sorts them by value and by id).
+        g.scramble = case + 0x7777;
+        try testing.expectEqual(bounded, @as(u32, @intFromFloat(g.value(try mtp.boundedDraw(&g, row2, sm, pos))[0])));
+        // The backend's full graph is the host reference's draw (wherever no decision sits at its threshold).
+        if (facts.clear) try testing.expectEqual(tok_ref, full);
+        if (facts.kept_pre <= settings.draft_filter_k) {
+            inside += 1;
+            if (!facts.clear) {
+                unclear += 1;
+                continue;
+            }
+            compared += 1;
+            try testing.expectEqual(full, bounded);
+        } else {
+            outside += 1;
+            if (full == bounded) outside_same += 1;
+            // A wider kept set: the bounded draw is one of the row's top 256 tempered logits.
+            var above: usize = 0;
+            for (row) |x| {
+                if (x > row[bounded]) above += 1;
+            }
+            try testing.expect(above < settings.draft_filter_k);
+        }
+    }
+    std.debug.print("GLM5N_DRAFT_FILTER cases={d} k={d} inside={d} identical={d} near_threshold_skipped={d} outside={d} outside_same={d}\n", .{ n_cases, settings.draft_filter_k, inside, compared, unclear, outside, outside_same });
+    // Both regimes exercised; a kept set inside the top 256 with a decision at its threshold is rare.
+    try testing.expect(compared >= n_cases / 3 and outside >= n_cases / 10 and unclear <= inside / 10);
+    try noDevice();
+}
+
+/// A bf16 value (round to nearest even) as f32: the head's stored precision.
+fn bf16Round(x: f32) f32 {
+    const b: u32 = @bitCast(x);
+    const r = b +% (0x7fff + ((b >> 16) & 1));
+    return @bitCast(r & 0xffff_0000);
+}
+
+/// One row's affine quantize at `bits`, group `settings.draft_head_group`, then its dequantized values (MLX's Metal
+/// `affine_quantize` kernel, kernels/quantized.h: per group w_min from the values, w_max from 0 and the values,
+/// scale = max((max - min) / (2^bits - 1), 1e-7) signed toward the larger side, the edge snapped to a whole step, the
+/// codes min(round((w - bias) / scale), 2^bits - 1) at the f32 scale and bias; dequantized as code x bf16(scale) +
+/// bf16(bias), as quantized_matmul reads them).
+fn affineRoundTrip(row: []const f32, bits: u32, out: []f32) void {
+    const gs = settings.draft_head_group;
+    const n_bins: f32 = @floatFromInt((@as(u32, 1) << @intCast(bits)) - 1);
+    var at: usize = 0;
+    while (at < row.len) : (at += gs) {
+        const grp = row[at..][0..gs];
+        var w_min: f32 = std.math.floatMax(f32);
+        var w_max: f32 = 0;
+        for (grp) |v| {
+            w_min = @min(w_min, v);
+            w_max = @max(w_max, v);
+        }
+        var scale = @max((w_max - w_min) / n_bins, 1e-7);
+        const side = @abs(w_min) > @abs(w_max);
+        scale = if (side) scale else -scale;
+        const edge = if (side) w_min else w_max;
+        const q0 = @round(edge / scale);
+        const at_zero = q0 == 0;
+        scale = if (at_zero) scale else edge / q0;
+        const bias: f32 = if (at_zero) 0 else edge;
+        const s16 = bf16Round(scale);
+        const b16 = bf16Round(bias);
+        for (grp, out[at..][0..gs]) |v, *o| {
+            const code = std.math.clamp(@round((v - bias) / scale), 0, n_bins);
+            o.* = code * s16 + b16;
+        }
+    }
+}
+
+/// Up to `n` rows of the pack's lm_head (bf16 [vocab, hidden]) read past the page cache, `chunks` runs of rows spread
+/// over the vocab, as f32 into `out` ([n, hidden]); the rows' count, 0 when the pack has no such tensor.
+fn packHeadRows(a: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, out: []f32, n: usize, chunks: usize) !usize {
+    var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    defer d.close(io);
+    const raw = try d.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 << 20));
+    defer a.free(raw);
+    const index = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer index.deinit();
+    const shard = (index.value.object.get("weight_map") orelse return 0).object.get("lm_head.weight") orelse return 0;
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, shard.string }, 0);
+    defer a.free(path);
+    const fd = try sdk.io_util.openNoCache(path.ptr, .{});
+    defer _ = std.c.close(fd);
+    var prefix: [8]u8 = undefined;
+    try sdk.io_util.readAligned(fd, &prefix, 0);
+    const len = std.mem.readInt(u64, &prefix, .little);
+    const text = try a.alloc(u8, @intCast(len));
+    defer a.free(text);
+    try sdk.io_util.readAligned(fd, text, 8);
+    const header = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+    defer header.deinit();
+    const desc = header.value.object.get("lm_head.weight") orelse return 0;
+    if (!std.mem.eql(u8, desc.object.get("dtype").?.string, "BF16")) return 0;
+    const lo: u64 = @intCast(desc.object.get("data_offsets").?.array.items[0].integer);
+    const h: usize = c.hidden_size;
+    const per = n / chunks;
+    const buf = try a.alloc(u8, per * h * 2);
+    defer a.free(buf);
+    for (0..chunks) |k| {
+        const first: u64 = (@as(u64, c.vocab_size) - per) * k / (chunks - 1);
+        try sdk.io_util.readAligned(fd, buf, 8 + len + lo + first * h * 2);
+        for (out[k * per * h ..][0 .. per * h], 0..) |*o, i| o.* = @bitCast(@as(u32, std.mem.readInt(u16, buf[i * 2 ..][0..2], .little)) << 16);
+    }
+    return per * chunks;
+}
+
+test "glm5_next mtp draft head: the q8 and q4 heads' logit error against the bf16 head (MLX's affine round trip at group 64 on random rows; the pack's own lm_head rows with GLM5_HEAD_PACK)" {
+    const a = testing.allocator;
+    const c: glm.Config = .{};
+    const h: usize = c.hidden_size;
+    const n_rows = 256;
+    const n_in = 32;
+    const rows = try a.alloc(f32, n_rows * h);
+    defer a.free(rows);
+    const q4 = try a.alloc(f32, n_rows * h);
+    defer a.free(q4);
+    const q8 = try a.alloc(f32, n_rows * h);
+    defer a.free(q8);
+    const xs = try a.alloc(f32, n_in * h);
+    defer a.free(xs);
+    var prng = std.Random.DefaultPrng.init(0x10_9175);
+    const rand = prng.random();
+    // The head's input: a final-normed row (unit RMS), bf16.
+    for (xs) |*x| x.* = bf16Round(rand.floatNorm(f32));
+    const pack = std.c.getenv("GLM5_HEAD_PACK");
+    for ([_]bool{ false, true }) |real| {
+        if (real and pack == null) continue;
+        var nr: usize = n_rows;
+        if (real) {
+            nr = try packHeadRows(a, testing.io, std.mem.span(pack.?), &c, rows, n_rows, 4);
+            try testing.expect(nr == n_rows);
+            // A pack whose shard holds no payload (a headers-only stub) is not a reading.
+            var nonzero: usize = 0;
+            for (rows) |w| nonzero += @intFromBool(w != 0);
+            try testing.expect(nonzero > rows.len / 2);
+        } else {
+            for (rows) |*w| {
+                // An lm_head-like row: N(0, 0.02) with a heavier tail (1 % of the weights at 4x).
+                const t: f32 = if (rand.float(f32) < 0.01) 4 else 1;
+                w.* = bf16Round(rand.floatNorm(f32) * 0.02 * t);
+            }
+        }
+        for (0..nr) |r| {
+            affineRoundTrip(rows[r * h ..][0..h], 4, q4[r * h ..][0..h]);
+            affineRoundTrip(rows[r * h ..][0..h], 8, q8[r * h ..][0..h]);
+        }
+        var max_err: [2]f64 = .{ 0, 0 };
+        var sum_err: [2]f64 = .{ 0, 0 };
+        var sum_sq: f64 = 0;
+        var top_same: [2]u32 = .{ 0, 0 };
+        for (0..n_in) |i| {
+            const x = xs[i * h ..][0..h];
+            var best: [3]usize = .{ 0, 0, 0 };
+            var best_v: [3]f64 = @splat(-std.math.inf(f64));
+            for (0..nr) |r| {
+                var lg: [3]f64 = .{ 0, 0, 0 };
+                for (x, rows[r * h ..][0..h], q4[r * h ..][0..h], q8[r * h ..][0..h]) |xv, w, w4, w8| {
+                    lg[0] += @as(f64, xv) * w;
+                    lg[1] += @as(f64, xv) * w4;
+                    lg[2] += @as(f64, xv) * w8;
+                }
+                sum_sq += lg[0] * lg[0];
+                for (0..2) |f| {
+                    const e = @abs(lg[f + 1] - lg[0]);
+                    max_err[f] = @max(max_err[f], e);
+                    sum_err[f] += e;
+                }
+                for (0..3) |f| if (lg[f] > best_v[f]) {
+                    best_v[f] = lg[f];
+                    best[f] = r;
+                };
+            }
+            for (0..2) |f| top_same[f] += @intFromBool(best[f + 1] == best[0]);
+        }
+        const n: f64 = @floatFromInt(nr * n_in);
+        const std_l = @sqrt(sum_sq / n);
+        std.debug.print("GLM5N_DRAFT_HEAD_LOGIT_ERR source={s} rows={d} inputs={d} logit_rms={d:.4} q4 max={d:.5} mean={d:.5} top1_same={d}/{d} q8 max={d:.5} mean={d:.5} top1_same={d}/{d} q8/q4 mean={d:.4}\n", .{
+            if (real) "pack" else "synthetic", nr, n_in, std_l, max_err[0], sum_err[0] / n, top_same[0], n_in, max_err[1], sum_err[1] / n, top_same[1], n_in, sum_err[1] / sum_err[0],
+        });
+        // 255 levels against 15 over the same span: q8's error is a small fraction of q4's.
+        try testing.expect(max_err[1] < max_err[0] / 4 and sum_err[1] < sum_err[0] / 8);
+        try testing.expect(top_same[1] >= top_same[0]);
+    }
     try noDevice();
 }
