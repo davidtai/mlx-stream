@@ -214,6 +214,9 @@ rewrite rules below still hold; the host-side rows of the tables are history.
 | src/sdk.zig (`expert`, `kernels`, `quant`, `profile`, `ops`, `kv`, `Quant`, `ExpertSource`) | src/sdk_ext.zig (`sdk_ext.expert`, ...) |  |
 | (new) | src/build_flags.zig | profile switches from `sdk.plugin_profile` |
 | (new) | src/exl3/sushi_parity.zig | sushi K3 fixture through this plugin decode |
+| (new) | src/arch/glm5_next/ | the GLM-5.3-Flash arch (docs/glm5-next.md) |
+| (new) | src/arch/glm5_next/exl3_bank.zig | the GLM-5.3-Flash EXL3 K=3 (mul1) bank-v2 pack (`expert-manifest-v2.json`) |
+| (new) | docs/benchmarks/glm53-flash/ | the GLM-5.3-Flash benchmark record |
 
 ## Tests ported from the coverage branches
 

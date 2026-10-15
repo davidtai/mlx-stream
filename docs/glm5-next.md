@@ -31,19 +31,67 @@ The arch claims a `config.json` with `model_type` `glm5_next` and the block
 "expert_streaming": {"family": "mlx-stream", "format": "mlx-stream-nvfp4-expert-bank-v1", "manifest": "expert-manifest.json"}
 ```
 
-The block's optional `settings` object takes `expert_prefill_rows` and `expert_rows` (an operator pin: either alone
-forces both; loaded as named, the overage over the fill reported), `mtp_lane` (the MTP draft lane
-is installed when true; off, the serial control, by default: below), `draft_depth` (the lane's drafts per round: an
-integer 1 .. 3, default 1 (measured +2.31 % decode over 3 on g21c); anything else refused by name), `draft_gate` (the lane's confidence gate: theta in [0, 1),
-default 0 = off; below), `mtp_acceptance` (the lane's acceptance: `exact`, the default,
-sample-then-verify; `typical`, Medusa's typical acceptance at delta `mtp_typical_delta` over the request's target, lossy, the token at a
-rejection still the target's own draw; `tokenv3` refused by name, not ported), `mtp_typical_delta` (typical's delta, a number in
-(0, 1], default 0.5; with `"mtp_acceptance":"typical"` only, else refused by name), `decode_moe` (the decode lane's expert route:
-`hitpass`, the default, `fused` or `stock`; anything else refused by name), `decode_glue` (the decode lane's glue:
-`fused`, the default, or `ops`), `decode_kda`, `decode_dsa` and `decode_swiglu` (the decode lane's KDA layer, DSA
-attention and MLP activation: `fused`, the default, or `ops`), `decode_predict` (the lookahead predictor's router
-weight: `bf16`, the default, or `f32`) and `logits_dump_dir` (below). Any other key refuses the load by name. The
-residents' format is the pack's own top-level `residents_format` (below), not a setting.
+An EXL3 K=3 pack declares the block with the EXL3 bank's format, its two manifests and its quant:
+
+```json
+"expert_streaming": {"family": "mlx-stream", "format": "mtplx-expert-manifest-v2", "manifest": "expert-manifest-v2.json", "runtime_manifest": "expert-manifest.json", "quant": "exl3-k3-mul1"}
+```
+
+### Settings
+
+The block's optional `settings` object takes the keys below. The arch reads them once at construction
+(`src/arch/glm5_next/settings.zig`, the prompt levers' keys in `prompt_levers.zig`). A key that is not in this table
+refuses the load by name (`Glm5NextSettingUnknown`); a `settings` value that is not an object refuses it as
+`Glm5NextSettingsBlock`. A wrong value refuses the load by the name in the "Refusal" column. Every refusal name has the
+prefix `Glm5Next` except the three tally names. The residents' format is the pack's own top-level `residents_format`
+(below), not a setting.
+
+| Key | Values | Default | Refusal | Meaning |
+| --- | --- | --- | --- | --- |
+| `expert_prefill_rows` | integer 1 .. 288 | the bill's fill | `ExpertRowsSetting`; `ExpertRows` (over 288); `PhaseRows` (over `expert_rows`) | The prompt rows per routed layer. An operator pin: either rows key alone forces both; the load reports the overage over the fill. |
+| `expert_rows` | integer 1 .. 288 | the bill's fill | `ExpertRowsSetting`; `ExpertRows` (over 288) | The decode rows per routed layer (the same pin). |
+| `expert_rows_by_layer` | `"uniform"`, or one integer per routed layer (42), summing to 0 | the 42 calibrated offsets (`default_layer_offsets`, largest +63) | `ExpertRowsByLayer`; `ExpertRowsByLayerLength`; `ExpertRowsByLayerSum`; `ExpertRowsByLayerRange` (at construction) | Splits the decode rows between the routed layers at the same total. |
+| `mtp_lane` | `true`, `false` | `false` (the serial control) | `MtpLaneSetting`; `MtpResidentsFp8` (the pack's MTP layer is FP8) | Installs the MTP draft lane (below). |
+| `draft_depth` | integer 1 .. 3 | 2 | `DraftDepthRange` | The lane's drafts per round. The lane, the bill and the host's block stay sized at 3. |
+| `draft_gate` | number in [0, 1); 0 = off | 0.75 | `DraftGateRange` | The lane's confidence gate theta (below). |
+| `mtp_acceptance` | `exact`, `typical` | `exact` | `MtpAcceptanceSetting`; `MtpAcceptanceNotPorted` (`tokenv3`) | The lane's acceptance: `exact` is sample-then-verify; `typical` is Medusa's typical acceptance, lossy (the token at a rejection is still the target's own draw). |
+| `mtp_typical_delta` | number in (0, 1] | 0.5 | `MtpTypicalDeltaSetting`; `MtpTypicalDeltaWithoutTypical` | Typical acceptance's delta. Only with `"mtp_acceptance":"typical"`. |
+| `draft_head` | `bf16`, `q8`, `q4` | `bf16` | `DraftHeadSetting`; `DraftHeadNeedsLane` (`q4` / `q8` without `mtp_lane`) | The lane's draft head: the BF16 `lm_head` (exact), or an 8- / 4-bit copy of it (rounding-class). |
+| `kda_verify` | `fused`, `chain` | `fused` | `KdaVerifySetting`; `KdaVerifyWithoutLane` (`fused` named without `mtp_lane`) | The MTP verify's KDA layer: one text a layer, or the op chain (the control). |
+| `decode_moe` | `hitpass`, `fused`, `stock` | `hitpass` | `DecodeMoeSetting` | The decode lane's expert route (below). |
+| `decode_glue` | `fused`, `ops` | `fused` | `DecodeGlueSetting` | The decode lane's glue (below). |
+| `decode_kda` | `fused`, `ops` | `fused` | `DecodeKdaSetting` | The decode lane's KDA layer. |
+| `kda_prologue` | `fused`, `ops` | `fused` (`ops` on a CPU stream) | `KdaPrologueSetting` | The KDA prompt pass's prologue. |
+| `decode_dsa` | `fused`, `ops` | `fused` | `DecodeDsaSetting` | The decode lane's DSA sparse latent attention. |
+| `dsa_split_form` | `lean`, `current` | `lean` | `DsaSplitFormSetting`; `DsaSplitFormNeedsFused` (named with `decode_dsa: ops`) | The fused DSA decode's split text. Exact against `current`. |
+| `dsa_select` | `batched`, `per_row` | `batched` | `DsaSelectSetting` | A verify window's DSA indexer selection: one scores and one top-k launch for all the rows, or one of each per row. Exact. |
+| `decode_predict` | `bf16`, `f32` | `bf16` | `DecodePredictSetting` | The lookahead predictor's router weight. |
+| `decode_swiglu` | `fused`, `ops` | `fused` | `DecodeSwigluSetting` | The decode lane's MLP activation. |
+| `fuse_kda_inputs` | `on`, `off` | `on` (`off` when the trunk is not FP8) | `FuseKdaInputsSetting` | A KDA layer's six FP8 input GEMVs in one launch. |
+| `fuse_gate_up` | `on`, `off` | `on` (`off` when the trunk is not FP8) | `FuseGateUpSetting` | The decode MLPs' FP8 gate and up GEMVs in one launch. |
+| `fuse_predictor` | `on`, `off` | `on` (`off` with `decode_predict: f32`) | `FusePredictorSetting`; `FusePredictorNeedsBf16` | The lookahead predictor's epilogue in one launch. |
+| `fuse_join` | `on`, `off` | `on` (`off` with `decode_glue: ops`) | `FuseJoinSetting`; `FuseJoinNeedsFusedGlue` | A routed decode call's join take folded into the combine text. |
+| `merge_gate_waits` | `on`, `off` | `on` | `MergeGateWaitsSetting` | A decode call's gated miss parts wait once per gate value. |
+| `gpu_keep_warm` | `waits`, `off` | `waits` (`off` on a CPU stream) | `GpuKeepWarmSetting` | MiMo's X12 keep-warm while the stream waits for its bytes. |
+| `miss_reads` | `direct`, `staged` | `direct` on an EXL3 pack; `staged` on an NVFP4 pack | `MissReadsSetting`; the stream refuses `direct` by name (`DirectReads*`) when a record or a slot row is off the file's block | The demand reads: straight into the slot rows, or through a staging buffer and a copy. Exact. |
+| `prompt_residents` | `keep`, `forget` | `keep` | `PromptResidentsSetting` | The residents a prompt after a decode finds: `keep` leaves the residents of the prompt rows for the next prompt, whose plans count them as hits; `forget` (the control) starts every request from empty rows. Exact. |
+| `exl3_gateup_form` | `guone`, `seam` | `guone` | `Exl3GateUpFormSetting`; `Exl3FormsOnNvfp4Pack` (a form other than `seam` named on an NVFP4 pack) | The EXL3 family's decode gate / up form. Inert on an NVFP4 pack. |
+| `exl3_down_form` | `pair`, `seam` | `pair` | `Exl3DownFormSetting`; `Exl3FormsOnNvfp4Pack` | The EXL3 family's decode down form. |
+| `exl3_wave_rows` | integer 128 .. 4,096 in steps of 128 | 2,048 | `Exl3WaveRows`; `Exl3WaveRowsFamily` (a size other than 1,024 named on an NVFP4 pack) | The EXL3 family's prompt wave rows at most. Exact. |
+| `prompt_route_cut` | `on`, `off` | `on` | `PromptRouteCut` | The wide call's rows bucketed by group once. Host planning only. |
+| `prompt_static_order` | `sampled`, `off` | `sampled` | `PromptStaticOrder` | P1's predictor routes at most 4 evenly spaced spans of a prompt call. Token-identical. |
+| `ttft_tail` | `deferred`, `off` | `deferred` | `TtftTail` | The prompt pass returns its logits before the lane's catch-up and the phase change. Exact. |
+| `expert_resident_ratio` | number in [0, 1] | 0 (off) | `ResidentRatioOutOfRange` | The rate tally's pinned share of each layer's experts. A value of another type is ignored. |
+| `expert_tally_window` | integer >= 1 | 32 | `TallyWindowOutOfRange` | The rate tally's window in routes. A value of another type is ignored. |
+| `expert_tally_file` | `on`, `pinned`, `off` | `on` | `TallyFileUnknown` | The rate tally's file. A value of another type is ignored. |
+| `logits_dump_dir` | an absolute directory, at most 480 bytes | absent (no dump route) | `LogitsDumpDir` | Installs the logits dump route for the KL gate (below). |
+
+Retired keys, refused by name as `Glm5NextSettingUnknown`: `hit_wave` (the hit-wave route is removed),
+`exl3_forms_maxm`, `exl3_forms_min_p`, `numeric_tier`.
+
+The served recipe of record sets `"mtp_lane": true, "draft_depth": 3, "draft_gate": 0.5` with the pinned rows
+(`docs/benchmarks/glm53-flash/README.md`, "Serve recipe"). The code defaults (depth 2, gate 0.75) are the lane's
+measured defaults (the g21d-dq-gate pair on the NVFP4 pack).
 
 Residents: the text trunk loads (`model.language_model.layers.{0..44}.*`, `embed_tokens`, `norm`, `lm_head`: 1,178
 tensors, 17,842,673,276 B as MLX allocates them); the vision tower, the MTP layer (45) and the DSA layers' FP8 KV scales
@@ -94,7 +142,7 @@ expert math over the NVFP4 format (`mimo_v2/math.MathOf(nvfp4.Format)`: sorted N
 view, pipelined drains) and MiMo's in-place prompt combine. Routes installed once: read schedule `early_whole_trim`
 (with the read-ahead relocation: "Prompt levers" below), pooled prompt scratch (2 GiB cache, purged at a layer's end
 once half full), decode window 32 rows, phase rows (the prompt's scratch freed at the phase change, each layer grown to
-its decode rows, shrunk back at the next prompt, residents forgotten per request as MiMo's are). The in-place combine
+its decode rows, shrunk back at the next prompt, the residents of the prompt rows kept for the next prompt by default: `prompt_residents`). The in-place combine
 needs the host's wired policy `max`; under another policy the fused combine is installed (one log line).
 
 The gathers are MLX's `gather_qmm` in `nvfp4` mode (group 16) with each slot's f32 global scale, through the plugin's
@@ -321,8 +369,8 @@ prints a table per served context (17,408; 18,432; 20,480; 24,576; 32,766; 32,76
 
 ## The MTP draft lane
 
-`mtp_lane: true` installs the release's MTP layer as a draft head at depth 3 (`draft_depth` 1 .. 3 sets it; the
-lanes, the bill and the host's block stay sized at 3, MiMo's rule) with exact acceptance (`mtp.zig`, on
+`mtp_lane: true` installs the release's MTP layer as a draft head at depth 2 (`draft_depth` 1 .. 3 sets it; the served recipe of
+record uses 3; the lanes, the bill and the host's block stay sized at 3, MiMo's rule) with exact acceptance (`mtp.zig`, on
 MiMo's draft-lane seam; `docs/glm5-next-mtp.md` lists its integration points). At construction: the MTP layer's 25 residents kept in
 the weight map and read with the trunk, the draft bank (`mtp-experts-nvfp4.bin`, all 288 experts resident in NVFP4)
 read into MLX and checked record by record against its manifest, the head's lanes at the billed positions; what the
@@ -343,7 +391,7 @@ receipt is MiMo's `[spec-stats]` line (rounds, accepted per round, misses and by
 position i's acceptance is kept / tested). Each draft's top-1 probability under the head (q = exp(max - logsumexp) of
 its logits) is read in the round's one sync with the drafts; the request's end logs the calibration, those counts by q
 (`glm5_next MTP lane calibration: depth=<d> q_bins=10 pos1=t/k,... pos2=... pos3=...`, bin floor(10 q)).
-`draft_gate` (theta, default 0 = off) verifies a round's leading drafts whose cumulative q stays at or above theta
+`draft_gate` (theta, default 0.75; 0 = off; the served recipe of record uses 0.5) verifies a round's leading drafts whose cumulative q stays at or above theta
 (`mtp.gatedDrafts`; the rest are dropped before the verify, their rows saved); the install line ends `draft_gate=`.
 Design: build/g21c-dc/DESIGN-CONFIDENCE-GATE.md in the reports tree (theta = the lane's tokens per ms x the marginal
 verify row's ms, about 0.52 .. 0.60 at 115/131).

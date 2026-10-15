@@ -30,6 +30,9 @@ The supported models:
 - a MiMo-V2.6-Flash pack (a model directory whose `config.json` has `"model_type": "mimo_v2_flash"` and an
   `expert_streaming` block; [docs/mimo-pack.md](docs/mimo-pack.md) says how to prepare one);
 - a GLM-5.3 pack (`"model_type": "glm_moe_dsa"`; see GLM-5.3).
+- a GLM-5.3-Flash pack (`"model_type": "glm5_next"`), with an NVFP4 expert bank or an EXL3 K=3 (mul1) expert bank
+  (`expert-manifest-v2.json`); [docs/glm5-next.md](docs/glm5-next.md) gives the arch and its settings,
+  [docs/benchmarks/glm53-flash/](docs/benchmarks/glm53-flash/README.md) its benchmark record.
 
 No weights are included in this repository.
 
@@ -567,6 +570,7 @@ src/exl3/                  the EXL3 quant, kernels, source and self-checks
 src/expert/                the expert stream: bank, stream, admission and lookahead, with their tests
 src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile,
                            the draft lanes' acceptance)
+src/arch/glm5_next/        the GLM-5.3-Flash arch: settings, bill, forward, NVFP4 and EXL3 K=3 expert banks, draft lane
 src/arch/glm_moe_dsa/      the GLM-5.3 arch: its banks, bill, module, draft lane and parity tests
 src/arch/glm_moe_dsa/glm53_exl3/  GLM-5.3's EXL3 kernels, routes, quant and self-check (texts in src/kernels/glm53_exl3/)
 src/arch/glm_moe_dsa/trunk_kernels.zig  GLM-5.3's trunk kernels (top-k, routed combine) and their self-check (texts in
@@ -578,6 +582,7 @@ csrc/                      the C read pool, the MLX event / alloc shims (with Mi
                            and the profile-only timeline and power sources
 src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
 docs/                      design notes and the path map from the in-tree layout
+docs/benchmarks/           the benchmark records (glm53-flash/, mimo-v26-flash/)
 scripts/                   test_dsv41.sh, compile_kernels_offline.py, compile_mimo_kernels_offline.py,
                            prepare_mimo_pack.py   the pack builder (docs/mimo-pack.md)
                            glm_moe_dsa_goldens.py, glm_moe_dsa_mtp_goldens.py, glm_split_k3_table.py,

@@ -29,8 +29,10 @@ The headline is the q8 draft head (decision of 2026-10-15): **36.30 tok/s decode
   (first at token 872 of the 1,024-token cell on g26). It passed the three-fixture grader battery 3/3, where the exact
   control failed the code fixture on the same single sample.
 
-On branch `feat/glm53-flash-exl3`, the defaults are the exact stack g25-dsa3. Add `"draft_head": "q8"` to get the
-g26-dsa3 head. The stack names in this record are the lab builds that gave the numbers.
+On branch `feat/glm53-flash-exl3`, the defaults are the exact stack g25-dsa3 plus two later changes: `prompt_residents`
+`keep` (measured in [Warm TTFT](#warm-ttft-residents-kept-across-requests-2026-10-15); g25-dsa3 was measured with
+`forget`) and the one-page slot-array floor (no numeric effect; see the identity pair in
+[Context sweep 1K-1M](#context-sweep-1k-1m)). Add `"draft_head": "q8"` to get the g26-dsa3 head. The stack names in this record are the lab builds that gave the numbers.
 
 ## The stacks of record (2026-10-15)
 
@@ -100,7 +102,8 @@ Each item below is an exact construction-time route, on by default (the old valu
   prompt waves at 2,048 and 1 rows, and the decode chain at every width (`660577d`, `2e144d1`);
 - the batched DSA selection `dsa_select` `batched`: a verify window's indexer scores and top-k in one launch each
   (`380bfc7`, default `3dc224b`);
-- `hit_wave` `all_pairs` (`resident_only` is settable; it measured negative, see the lever table).
+- `hit_wave` `all_pairs` (`resident_only` measured negative, see the lever table). The code now has no hit-wave
+  route: the key `hit_wave` refuses the load by name (`Glm5NextSettingUnknown`).
 
 **g26**, `glm5next/exl3-k3-stack4` at `9bf67a7`, server `087434fea796de167a3aec630aeead7eb1b40d5b771eee9e922ff68d183896a9`:
 g25b plus the drafthead lane's q4 / q8 draft heads (`a1efb11`, from `601f230`, `f5fb02c`, `4f98d6a`), with
@@ -539,6 +542,7 @@ MLX_SERVE_GPU_CEILING_MB=114688 nice -n 19 mlx-serve serve --model <pack> \
 ```
 
 Every lever above is the default: the exact stack needs no other key. For the q8 head (g26-dsa3), add `"draft_head": "q8"`.
+The recipe sets `draft_depth` 3 and `draft_gate` 0.5 by name: the code defaults are depth 2 and gate 0.75.
 
 - **Rows pin by box baseline:** choose the highest rung whose admit-to bar is above the box's physical use at load,
   with margin for the drift seen in a window (up to ~2.5 GB after the first request):
@@ -552,7 +556,8 @@ Every lever above is the default: the exact stack needs no other key. For the q8
 
 The q8 column is 0.68 GB tighter at every pin: the `mtp_head_q8` term. 197/223 on the q8 stack admits up to 9.42 GB.
 The DSA lane fixes add no bill term; g25-dsa3 and g26-dsa3 use their parents' bars. For the stacks of record, choose
-g25-dsa3 (`6481fa1b`) or g26-dsa3 (`de1ab1f6`). On this branch, the defaults are g25-dsa3; `"draft_head": "q8"` gives g26-dsa3.
+g25-dsa3 (`6481fa1b`) or g26-dsa3 (`de1ab1f6`). On this branch, the defaults are g25-dsa3 plus `prompt_residents` `keep`
+and the one-page slot-array floor (see the top of this record); `"draft_head": "q8"` gives g26-dsa3.
 
 The fill at a 12.6 GB baseline is 190/217 on g25b. On g26 it is 189/215: the q8 head's 0.67 GB means 190/217 needs a
 baseline ≤ 12.01 GB. Decode rows above 225 are refused at load by the default per-layer offsets (largest +63, cap 288).
