@@ -462,8 +462,22 @@ test "glm5_next exl3 bank: direct rows: the served phase cycle (prompt, release,
         }
         try st.flush();
         if (request == 0) {
-            _ = try st.shrink(&prompt_rows, .forget);
-            _ = try st.regrowTransient();
+            // The frees and the regrow return the bytes the arrays hold (`arrayBytes`, the page floor included), not
+            // rows x row bytes: the one-to-three-row exts' 4 / 8 KiB components hold a page each.
+            const S = sdk_ext.expert.stream.StreamOf(SDK, false);
+            var want: u64 = 0;
+            var unfloored: u64 = 0;
+            for (0..2) |l| for (0..n_components) |c| {
+                want += S.arrayBytes(&st.bank.layers[l], c, decode_rows[l] - prompt_rows[l]);
+                unfloored += S.rowBytes(&st.bank.layers[l], c) * (decode_rows[l] - prompt_rows[l]);
+            };
+            for (0..n_components) |c| {
+                want += S.arrayBytes(&st.bank.layers[st.transient_layer], c, st.transient.rows);
+                unfloored += S.rowBytes(&st.bank.layers[st.transient_layer], c) * st.transient.rows;
+            }
+            try testing.expect(st.alt == null and want > unfloored);
+            try testing.expectEqual(want, try st.shrink(&prompt_rows, .forget));
+            try testing.expectEqual(st.promptTransientBytes(), try st.regrowTransient());
             try testing.expect(!st.failed);
         }
     }

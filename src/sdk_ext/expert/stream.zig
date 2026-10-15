@@ -306,6 +306,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             row_bytes: [n_components]u64 = @splat(0),
             backing: union(enum) { none, host: HostSlotRows, mlx: LayerSlotBank } = .none,
 
+            /// The bytes these rows allocated on `layer`'s geometry (`arrayBytes` per component, the bank's floor
+            /// included): what their free returns.
+            fn allocBytes(self: *const Rows, layer: *const Layer) u64 {
+                if (self.rows == 0) return 0;
+                var n: u64 = 0;
+                for (0..n_components) |c| n += arrayBytes(layer, c, self.rows);
+                return n;
+            }
+
             fn init(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
                 if (rows == 0) return .{};
                 switch (memory) {
@@ -2491,11 +2500,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 try self.flush();
                 for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
                 if (self.held_base.items.len > 0) return error.RoutesLive;
-                var bytes: u64 = 0;
-                for (self.transient.row_bytes) |n| bytes += n * self.transient.rows;
-                if (self.alt) |*x| for (x.rows.row_bytes) |n| {
-                    bytes += n * x.rows.rows;
-                };
+                var bytes: u64 = self.transient.allocBytes(&self.bank.layers[self.transient_layer]);
+                if (self.alt) |*x| bytes += x.rows.allocBytes(&self.bank.layers[x.layer]);
                 const before = if (self.memory == .mlx) mlxActive() else 0;
                 self.transient.deinit();
                 self.allocator.free(self.transient_meta);
@@ -2623,14 +2629,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (self.layers, prompt_rows) |*ls, rows| if (rows != ls.base.rows) return error.InvalidRows;
                 try self.settleRoutes();
                 var bytes: u64 = 0;
-                for (self.layers) |*ls| if (ls.ext) |e| {
-                    for (e.row_bytes) |n| bytes += n * e.rows;
+                for (self.layers, self.bank.layers) |*ls, *geom| if (ls.ext) |*e| {
+                    bytes += e.allocBytes(geom);
                 };
-                if (self.release_installed) for (self.transient.row_bytes) |n| {
-                    bytes += n * self.transient.rows;
-                };
-                if (self.release_installed) if (self.alt) |*x| for (x.rows.row_bytes) |n| {
-                    bytes += n * x.rows.rows;
+                if (self.release_installed) bytes += self.transient.allocBytes(&self.bank.layers[self.transient_layer]);
+                if (self.release_installed) if (self.alt) |*x| {
+                    bytes += x.rows.allocBytes(&self.bank.layers[x.layer]);
                 };
                 const before = if (self.memory == .mlx) mlxActive() else 0;
                 for (self.layers, prompt_rows) |*ls, rows| {
@@ -2691,14 +2695,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return n;
             }
 
-            /// The prompt scratch's bytes (`regrowTransient` allocates them).
+            /// The prompt scratch's bytes (`regrowTransient` allocates them: `arrayBytes`, the bank's floor included).
             pub fn promptTransientBytes(self: *const Stream) u64 {
                 var n: u64 = 0;
-                for (0..n_components) |c| n += rowBytes(&self.bank.layers[self.transient_layer], c);
+                for (0..n_components) |c| n += arrayBytes(&self.bank.layers[self.transient_layer], c, self.prompt_transient_rows);
                 if (self.alt) |x| for (0..n_components) |c| {
-                    n += rowBytes(&self.bank.layers[x.layer], c);
+                    n += arrayBytes(&self.bank.layers[x.layer], c, self.prompt_transient_rows);
                 };
-                return n * self.prompt_transient_rows;
+                return n;
             }
 
             /// The reverse phase change's allocation, after its frees landed: the prompt's scratch (`Options.transient_rows`
@@ -2722,7 +2726,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     errdefer t2.deinit();
                     const meta2 = try self.allocator.alloc(SlotMeta, t2.rows);
                     @memset(meta2, .{});
-                    for (t2.row_bytes) |n| bytes += n * t2.rows;
+                    bytes += t2.allocBytes(&self.bank.layers[x.layer]);
                     x.rows = t2;
                     x.meta = meta2;
                 }
@@ -2731,7 +2735,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 installed = true;
                 self.transient_released = false;
                 self.wide_depth = self.prompt_wide_depth;
-                for (t.row_bytes) |n| bytes += n * t.rows;
+                bytes += t.allocBytes(&self.bank.layers[self.transient_layer]);
                 if (self.direct_block != 0) self.checkRowsDirect(.regrow_transient) catch |e| return self.failDirect(e);
                 return bytes;
             }
