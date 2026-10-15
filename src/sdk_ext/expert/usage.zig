@@ -46,6 +46,10 @@ pub const Settings = struct {
     label_buf: [max_label]u8 = undefined,
     label_len: usize = 0,
     label_bad: bool = false,
+    /// The keys were named (whatever their values): an arch without the record refuses either, and a label refuses
+    /// without a record.
+    record_named: bool = false,
+    label_named: bool = false,
 
     /// The keys of one settings object; returns whether any was present.
     pub fn apply(s: *Settings, obj: std.json.ObjectMap) bool {
@@ -57,6 +61,7 @@ pub const Settings = struct {
         }
         if (obj.get("expert_usage_record")) |v| {
             any = true;
+            s.record_named = true;
             if (v == .string and v.string.len > 0 and v.string.len <= max_path and std.fs.path.isAbsolute(v.string)) {
                 @memcpy(s.record_buf[0..v.string.len], v.string);
                 s.record_len = v.string.len;
@@ -64,7 +69,8 @@ pub const Settings = struct {
         }
         if (obj.get("expert_usage_label")) |v| {
             any = true;
-            if (v == .string and v.string.len <= max_label) {
+            s.label_named = true;
+            if (v == .string and v.string.len > 0 and v.string.len <= max_label) {
                 @memcpy(s.label_buf[0..v.string.len], v.string);
                 s.label_len = v.string.len;
             } else s.label_bad = true;
@@ -73,7 +79,7 @@ pub const Settings = struct {
     }
 
     /// The load's refusal of a bad value, by name (`arch` prefixes the line).
-    pub fn check(s: *const Settings, comptime arch: []const u8) error{ ResidentSeedSetting, ExpertUsageRecordSetting, ExpertUsageLabelSetting }!void {
+    pub fn check(s: *const Settings, comptime arch: []const u8) error{ ResidentSeedSetting, ExpertUsageRecordSetting, ExpertUsageLabelSetting, ExpertUsageLabelWithoutRecord }!void {
         if (s.seed_bad) {
             log.warn(arch ++ ": load refused: resident_seed names none of usage, none (ResidentSeedSetting)\n", .{});
             return error.ResidentSeedSetting;
@@ -83,16 +89,23 @@ pub const Settings = struct {
             return error.ExpertUsageRecordSetting;
         }
         if (s.label_bad) {
-            log.warn(arch ++ ": load refused: expert_usage_label is not a string of at most {d} bytes (ExpertUsageLabelSetting)\n", .{max_label});
+            log.warn(arch ++ ": load refused: expert_usage_label is not a string of 1 to {d} bytes (ExpertUsageLabelSetting)\n", .{max_label});
             return error.ExpertUsageLabelSetting;
+        }
+        if (s.label_named and !s.record_named) {
+            log.warn(arch ++ ": load refused: expert_usage_label names the prompt set of a record, and expert_usage_record is not set (ExpertUsageLabelWithoutRecord)\n", .{});
+            return error.ExpertUsageLabelWithoutRecord;
         }
     }
 
     /// `check` for an arch that installs the seed but not the record (MiMo-V2.6, DeepSeek-V4.1): a named
     /// `expert_usage_record` or `expert_usage_label` is refused by name, never ignored.
-    pub fn checkSeedOnly(s: *const Settings, comptime arch: []const u8) error{ ResidentSeedSetting, ExpertUsageRecordSetting, ExpertUsageLabelSetting, ExpertUsageRecordNotInstalled }!void {
-        try s.check(arch);
-        if (s.record_len > 0 or s.label_len > 0) {
+    pub fn checkSeedOnly(s: *const Settings, comptime arch: []const u8) error{ ResidentSeedSetting, ExpertUsageRecordNotInstalled }!void {
+        if (s.seed_bad) {
+            log.warn(arch ++ ": load refused: resident_seed names none of usage, none (ResidentSeedSetting)\n", .{});
+            return error.ResidentSeedSetting;
+        }
+        if (s.record_named or s.label_named) {
             log.warn(arch ++ ": load refused: expert_usage_record / expert_usage_label are installed on glm5_next only (ExpertUsageRecordNotInstalled)\n", .{});
             return error.ExpertUsageRecordNotInstalled;
         }
@@ -115,23 +128,42 @@ pub const Doc = struct {
     counts: []const []const u64,
     source: Source,
 
+    /// The totals over every session, and each session (one server load that recorded into the file), oldest first.
     pub const Source = struct {
-        prompt_set: []const u8,
         requests: u64,
         prompt_tokens: u64,
         decode_tokens: u64,
-        binary_sha256: []const u8,
+        sessions: []const Session,
     };
+
+    pub const Session = struct {
+        prompt_set: []const u8,
+        binary_sha256: []const u8,
+        requests: u64 = 0,
+        prompt_tokens: u64 = 0,
+        decode_tokens: u64 = 0,
+    };
+
+    /// The checks every reader runs: the v1 form (`ExpertUsageMalformed`), then the model and geometry
+    /// (`ExpertUsageMismatch`).
+    pub fn check(d: *const Doc, model_type: []const u8, layers: u32, experts: u32) error{ ExpertUsageMalformed, ExpertUsageMismatch }!void {
+        if (d.counts.len != d.layers or d.experts == 0 or d.experts > std.math.maxInt(u16) or d.source.sessions.len == 0) return error.ExpertUsageMalformed;
+        for (d.counts) |row| if (row.len != d.experts) return error.ExpertUsageMalformed;
+        if (!std.mem.eql(u8, d.model_type, model_type) or d.layers != layers or d.experts != experts) return error.ExpertUsageMismatch;
+    }
 };
 
-/// The record side (`expert_usage_record`): the counts over every request since the load, written at each request's
-/// end (a temporary file beside `path`, renamed over it). The arch adds a request's counts (`Stream.addUsage`) into
-/// `counts`, then calls `endRequest`.
+/// The record side (`expert_usage_record`): the counts over every request of every session recorded into `path`. At the
+/// load the file at `path`, when there is one, is read and checked (`Doc.check`: refused by name, never overwritten) and
+/// its counts and sessions are the start; this load is a new session. The file is written once at the load (the
+/// directory proven writable, else `ExpertUsageRecordNotWritable`) and at each request's end (a temporary file beside
+/// `path`, renamed over it). The arch adds a request's counts (`Stream.addUsage`) into `counts`, then calls `endRequest`.
 pub const Recorder = struct {
     a: std.mem.Allocator,
+    /// The earlier sessions' strings (the file's).
+    arena: std.heap.ArenaAllocator,
     path: []u8,
     model_type: []const u8,
-    label: []u8,
     binary_sha256: [64]u8,
     layers: u32,
     experts: u32,
@@ -140,26 +172,62 @@ pub const Recorder = struct {
     requests: u64 = 0,
     prompt_tokens: u64 = 0,
     decode_tokens: u64 = 0,
+    /// Every session, this load's last.
+    sessions: []Doc.Session,
 
     /// `model_type` is static (the arch's name). The running binary's sha256 is read once here.
     pub fn init(a: std.mem.Allocator, io: std.Io, path: []const u8, model_type: []const u8, label: []const u8, layers: u32, experts: u32) !*Recorder {
         const r = try a.create(Recorder);
         errdefer a.destroy(r);
-        const p = try a.dupe(u8, path);
-        errdefer a.free(p);
-        const l = try a.dupe(u8, label);
-        errdefer a.free(l);
-        const counts = try a.alloc(u64, @as(usize, layers) * experts);
-        @memset(counts, 0);
-        r.* = .{ .a = a, .path = p, .model_type = model_type, .label = l, .binary_sha256 = selfSha256(a, io), .layers = layers, .experts = experts, .counts = counts };
+        r.* = .{ .a = a, .arena = .init(a), .path = undefined, .model_type = model_type, .binary_sha256 = selfSha256(a, io), .layers = layers, .experts = experts, .counts = undefined, .sessions = undefined };
+        errdefer r.arena.deinit();
+        const ar = r.arena.allocator();
+        r.path = try ar.dupe(u8, path);
+        r.counts = try ar.alloc(u64, @as(usize, layers) * experts);
+        @memset(r.counts, 0);
+        var earlier: []const Doc.Session = &.{};
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_file_bytes)) catch |e| switch (e) {
+            error.FileNotFound => null,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.warn("expert usage record: load refused: {s} is not readable: {s} (ExpertUsageMalformed)\n", .{ path, @errorName(e) });
+                return error.ExpertUsageMalformed;
+            },
+        };
+        if (text) |t| {
+            defer a.free(t);
+            const parsed = std.json.parseFromSliceLeaky(Doc, ar, t, .{ .ignore_unknown_fields = true }) catch {
+                log.warn("expert usage record: load refused: {s} is not the v1 form (ExpertUsageMalformed); move it away to start a new record\n", .{path});
+                return error.ExpertUsageMalformed;
+            };
+            parsed.check(model_type, layers, experts) catch |e| {
+                log.warn("expert usage record: load refused: {s}: {s} (the file must be the v1 form of {s} with {d} layers x {d} experts)\n", .{ path, @errorName(e), model_type, layers, experts });
+                return e;
+            };
+            for (parsed.counts, 0..) |row, l| @memcpy(r.counts[l * experts ..][0..experts], row);
+            r.requests = parsed.source.requests;
+            r.prompt_tokens = parsed.source.prompt_tokens;
+            r.decode_tokens = parsed.source.decode_tokens;
+            earlier = parsed.source.sessions;
+        }
+        r.sessions = try ar.alloc(Doc.Session, earlier.len + 1);
+        @memcpy(r.sessions[0..earlier.len], earlier);
+        r.sessions[earlier.len] = .{ .prompt_set = try ar.dupe(u8, label), .binary_sha256 = &r.binary_sha256 };
+        r.write(io) catch |e| {
+            log.warn("expert usage record: load refused: {s} is not writable: {s} (ExpertUsageRecordNotWritable)\n", .{ path, @errorName(e) });
+            return error.ExpertUsageRecordNotWritable;
+        };
         return r;
     }
 
     pub fn deinit(r: *Recorder) void {
-        r.a.free(r.counts);
-        r.a.free(r.label);
-        r.a.free(r.path);
+        r.arena.deinit();
         r.a.destroy(r);
+    }
+
+    /// This load's session.
+    pub fn session(r: *const Recorder) *Doc.Session {
+        return &r.sessions[r.sessions.len - 1];
     }
 
     /// One request's end (its counts already added): the totals, then the file written.
@@ -167,6 +235,10 @@ pub const Recorder = struct {
         r.requests += 1;
         r.prompt_tokens += prompt_tokens;
         r.decode_tokens += decode_tokens;
+        const ss = r.session();
+        ss.requests += 1;
+        ss.prompt_tokens += prompt_tokens;
+        ss.decode_tokens += decode_tokens;
         try r.write(io);
     }
 
@@ -174,13 +246,14 @@ pub const Recorder = struct {
         const rows = try r.a.alloc([]const u64, r.layers);
         defer r.a.free(rows);
         for (rows, 0..) |*row, l| row.* = r.counts[l * r.experts ..][0..r.experts];
-        const doc: Doc = .{ .model_type = r.model_type, .layers = r.layers, .experts = r.experts, .counts = rows, .source = .{ .prompt_set = r.label, .requests = r.requests, .prompt_tokens = r.prompt_tokens, .decode_tokens = r.decode_tokens, .binary_sha256 = &r.binary_sha256 } };
+        const doc: Doc = .{ .model_type = r.model_type, .layers = r.layers, .experts = r.experts, .counts = rows, .source = .{ .requests = r.requests, .prompt_tokens = r.prompt_tokens, .decode_tokens = r.decode_tokens, .sessions = r.sessions } };
         const json = try std.json.Stringify.valueAlloc(r.a, doc, .{});
         defer r.a.free(json);
         const tmp = try std.fmt.allocPrint(r.a, "{s}.tmp-{d}", .{ r.path, std.c.getpid() });
         defer r.a.free(tmp);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = json });
+        // Before the write: a write that fails part way leaves no temporary file.
         errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = json });
         try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp, std.Io.Dir.cwd(), r.path, io);
     }
 };
@@ -213,8 +286,8 @@ pub const Profile = struct {
     layers: u32,
     experts: u32,
     counts: []u64,
-    /// "<prompt set>, <requests> requests, <tokens> tokens, binary <sha 8>".
-    source_buf: [max_label + 128]u8 = undefined,
+    /// "<last session's prompt set>[ + <k> earlier sessions], <requests> requests, <tokens> tokens, binary <sha 8>".
+    source_buf: [max_label + 160]u8 = undefined,
     source_len: usize = 0,
     /// `order`'s scratch (one layer's ids).
     order_buf: []u16,
@@ -284,17 +357,18 @@ pub fn parse(a: std.mem.Allocator, text: []const u8, model_type: []const u8, lay
     const parsed = std.json.parseFromSlice(Doc, a, text, .{ .ignore_unknown_fields = true }) catch return error.ExpertUsageMalformed;
     defer parsed.deinit();
     const d = parsed.value;
-    if (d.counts.len != d.layers or d.experts == 0 or d.experts > std.math.maxInt(u16)) return error.ExpertUsageMalformed;
-    for (d.counts) |row| if (row.len != d.experts) return error.ExpertUsageMalformed;
-    if (!std.mem.eql(u8, d.model_type, model_type) or d.layers != layers or d.experts != experts) return error.ExpertUsageMismatch;
+    try d.check(model_type, layers, experts);
     const counts = try a.alloc(u64, @as(usize, layers) * experts);
     errdefer a.free(counts);
     for (d.counts, 0..) |row, l| @memcpy(counts[l * experts ..][0..experts], row);
     const order_buf = try a.alloc(u16, experts);
     var p: Profile = .{ .a = a, .layers = layers, .experts = experts, .counts = counts, .order_buf = order_buf };
     const s = d.source;
-    const sha = s.binary_sha256[0..@min(8, s.binary_sha256.len)];
-    const src = std.fmt.bufPrint(&p.source_buf, "{s}, {d} requests, {d} prompt + {d} decode tokens, binary {s}", .{ s.prompt_set[0..@min(s.prompt_set.len, max_label)], s.requests, s.prompt_tokens, s.decode_tokens, sha }) catch "";
+    const last = s.sessions[s.sessions.len - 1];
+    const sha = last.binary_sha256[0..@min(8, last.binary_sha256.len)];
+    var more_buf: [40]u8 = undefined;
+    const more = if (s.sessions.len > 1) std.fmt.bufPrint(&more_buf, " + {d} earlier sessions", .{s.sessions.len - 1}) catch "" else "";
+    const src = std.fmt.bufPrint(&p.source_buf, "{s}{s}, {d} requests, {d} prompt + {d} decode tokens, binary {s}", .{ last.prompt_set[0..@min(last.prompt_set.len, max_label)], more, s.requests, s.prompt_tokens, s.decode_tokens, sha }) catch "";
     p.source_len = src.len;
     return p;
 }
@@ -379,11 +453,32 @@ test "expert usage: settings parse, defaults, and bad values refused by name" {
         _ = x.apply(p.value.object);
         try testing.expectError(error.ExpertUsageRecordSetting, x.check("t"));
     }
+    // A label: 1 to `max_label` bytes, and only beside a record.
+    const Want = struct { text: []const u8, err: anyerror };
+    for ([_]Want{
+        .{ .text = "{\"expert_usage_record\":\"/tmp/u.json\",\"expert_usage_label\":\"\"}", .err = error.ExpertUsageLabelSetting },
+        .{ .text = "{\"expert_usage_record\":\"/tmp/u.json\",\"expert_usage_label\":3}", .err = error.ExpertUsageLabelSetting },
+        .{ .text = "{\"expert_usage_label\":\"he64\"}", .err = error.ExpertUsageLabelWithoutRecord },
+    }) |w| {
+        const p = try std.json.parseFromSlice(std.json.Value, testing.allocator, w.text, .{});
+        defer p.deinit();
+        var x: Settings = .{};
+        _ = x.apply(p.value.object);
+        try testing.expectError(w.err, x.check("t"));
+    }
+    // An arch without the record (MiMo, DeepSeek-V4.1): either key named, any value (the empty label too), is refused.
+    for ([_][]const u8{ "{\"expert_usage_label\":\"\"}", "{\"expert_usage_label\":\"x\"}", "{\"expert_usage_record\":\"/tmp/u.json\"}", "{\"expert_usage_record\":1}" }) |t| {
+        const p = try std.json.parseFromSlice(std.json.Value, testing.allocator, t, .{});
+        defer p.deinit();
+        var x: Settings = .{};
+        _ = x.apply(p.value.object);
+        try testing.expectError(error.ExpertUsageRecordNotInstalled, x.checkSeedOnly("t"));
+    }
     try testing.expectEqualStrings("mimo_v2 prompt residents: keep (decode's residents stay for the next prompt)", promptResidentsLine("mimo_v2", .keep));
     try testing.expectEqualStrings("deepseek_v41 prompt residents: forget (every request starts from empty rows)", promptResidentsLine("deepseek_v41", .forget));
 }
 
-test "expert usage: the file round-trips (record, write, parse); a malformed or mismatched file is refused by name" {
+test "expert usage: the file round-trips (record, write, parse); a later load's record adds to the file as a new session; a malformed or mismatched file, or a path that cannot be written, is refused by name" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -422,6 +517,30 @@ test "expert usage: the file round-trips (record, write, parse); a malformed or 
     try testing.expectError(error.ExpertUsageMalformed, parse(a, "{\"model_type\":\"glm5_next\",\"layers\":2}", "glm5_next", 2, 4));
     try testing.expectError(error.ExpertUsageMalformed, parse(a, "{\"model_type\":\"glm5_next\",\"layers\":2,\"experts\":4,\"counts\":[[1,2,3,4],[1,2]],\"source\":{\"prompt_set\":\"x\",\"requests\":1,\"prompt_tokens\":1,\"decode_tokens\":1,\"binary_sha256\":\"0\"}}", "glm5_next", 2, 4));
     try testing.expectError(error.ExpertUsageMalformed, parse(a, "not json", "glm5_next", 2, 4));
+    // A second load recording to the same path: the file's counts and sessions are its start.
+    {
+        const r2 = try Recorder.init(a, testing.io, path, "glm5_next", "unit2", 2, 4);
+        defer r2.deinit();
+        try testing.expectEqualSlices(u64, r.counts, r2.counts);
+        for (r2.counts, r.counts) |*c, x| c.* += x;
+        try r2.endRequest(testing.io, 4, 2);
+        const t2 = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(max_file_bytes));
+        defer a.free(t2);
+        var p2 = try parse(a, t2, "glm5_next", 2, 4);
+        defer p2.deinit();
+        try testing.expectEqualSlices(u64, &.{ 10, 0, 18, 2, 0, 0, 6, 6 }, p2.counts);
+        try testing.expect(std.mem.startsWith(u8, p2.source(), "unit2 + 1 earlier sessions, 2 requests, 30 prompt + 12 decode tokens, binary "));
+        // Another model or geometry at the path: refused by name, the file left as it is.
+        try testing.expectError(error.ExpertUsageMismatch, Recorder.init(a, testing.io, path, "glm5_next", "x", 3, 4));
+        try testing.expectError(error.ExpertUsageMismatch, Recorder.init(a, testing.io, path, "mimo_v2", "x", 2, 4));
+        const t3 = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(max_file_bytes));
+        defer a.free(t3);
+        try testing.expectEqualStrings(t2, t3);
+    }
+    // A path whose directory is absent: refused at the load by name, no file left.
+    const bad = try std.fs.path.join(a, &.{ empty_dir, "absent", file_name });
+    defer a.free(bad);
+    try testing.expectError(error.ExpertUsageRecordNotWritable, Recorder.init(a, testing.io, bad, "glm5_next", "x", 2, 4));
     // None: by the setting, or no file in the directory (and `usage` named without the file refused by name).
     s.seed = .none;
     try testing.expect((try decide(a, testing.io, &s, dir, "glm5_next", 2, 4)).reason == .setting_none);

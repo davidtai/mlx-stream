@@ -208,6 +208,9 @@ pub const setting_keys = [_][]const u8{
         "predict_router",
         "prompt_residents",
         "resident_seed",
+        // Read only to refuse by name (`ExpertUsageRecordNotInstalled`): the usage record is glm5_next's.
+        "expert_usage_record",
+        "expert_usage_label",
 };
 
 /// The first key of a settings object that is not one of `setting_keys` (null: every key is a setting).

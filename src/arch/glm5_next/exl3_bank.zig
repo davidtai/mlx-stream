@@ -685,7 +685,7 @@ test "glm5_next exl3 bank: resident seed: a stream seeded from a usage profile s
     const prompt_rows = [_]u32{ 4, 4 };
     const text =
         \\{"model_type":"glm5_next","layers":2,"experts":8,"counts":[[0,9,0,7,0,5,0,3],[8,0,6,0,4,0,2,1]],
-        \\"source":{"prompt_set":"unit","requests":2,"prompt_tokens":52,"decode_tokens":24,"binary_sha256":"89297e60"}}
+        \\"source":{"requests":2,"prompt_tokens":52,"decode_tokens":24,"sessions":[{"prompt_set":"unit","binary_sha256":"89297e60","requests":2,"prompt_tokens":52,"decode_tokens":24}]}}
     ;
     try testing.expectError(error.ExpertUsageMismatch, usage.parse(a, text, "glm5_next", 3, 8));
     try testing.expectError(error.ExpertUsageMismatch, usage.parse(a, text, "glm5_next", 2, 16));
