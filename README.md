@@ -172,10 +172,12 @@ served behavior.
 | `DSV41_CELL_DEVROUTE` | cell | `0` | `1`: decode's hit wave runs as a device graph before the host's routing wait (exact; needs `ROUTED_BANKED`). |
 | `DSV41_CELL_HOIST_FIRST` | cell | `0` | `1`: each decode call commits its hoist right behind the routing barrier's arrays (exact). |
 | `DSV41_CELL_DRAFT_STAGED` | cell | `0` | `1`: each draft stage is committed as soon as it is built (exact). |
-| `DSV41_CELL_PHASE_SETTLE` | cell | `until_freed` | `interval`: the phase change's settle waits for the freed bytes only, not the grow's bound. |
 | `DSV41_CELL_PHASE_POLL_MS` | cell | the settle's own | the phase change's footprint poll in ms (1 .. the settle bound; outside is refused). |
 | `DSV41_CELL_PREFILL_SUB` | cell | the cache's sub-chunk | the prompt rows per layer-major call; `whole` runs the prompt in one call. |
 | `DSV41_CELL_MAX_CONTEXT` | cell (bill tool) | 16,384 | the longest prompt the construction bills; the server takes it from `ctx_size`. |
+
+The cell refuses, by name, the retired levers `DSV41_CELL_PREDICT_BF16`, `DSV41_CELL_DENSE_RC`,
+`DSV41_CELL_PREFILL_INPUT_RELEASE` and `DSV41_CELL_PHASE_SETTLE` (`CellRetiredLever`).
 
 The test suites also read their own inputs (`DSV41_BANK`, device-only smoke switches, fixture paths, the cell
 harness's rows, baseline and output paths); each such test skips without its input.

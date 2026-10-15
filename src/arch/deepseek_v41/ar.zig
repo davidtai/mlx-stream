@@ -689,7 +689,7 @@ fn envStr(name: [*:0]const u8) ?[]const u8 {
 
 /// The cell levers this build no longer takes (each one dead in the ledger): a window that still sets one is refused by
 /// name before any work, never ignored.
-const retired_cell_levers = [_][:0]const u8{ "DSV41_CELL_PREDICT_BF16", "DSV41_CELL_DENSE_RC", "DSV41_CELL_PREFILL_INPUT_RELEASE" };
+const retired_cell_levers = [_][:0]const u8{ "DSV41_CELL_PREDICT_BF16", "DSV41_CELL_DENSE_RC", "DSV41_CELL_PREFILL_INPUT_RELEASE", "DSV41_CELL_PHASE_SETTLE" };
 
 /// The first retired cell lever that `getenv` finds set, or null.
 fn retiredCellLever(getenv: anytype) ?[]const u8 {
@@ -1168,9 +1168,6 @@ const CellReceipt = struct {
     phase_change: ?module.PhaseChangeRecord = null,
     /// The phase change's settle poll (ms) as the Module installed it (`module.phaseChangePollMs`; the default 250).
     phase_change_poll_ms: ?u32 = null,
-    /// The phase change's settle condition as the Module installed it (`module.phaseChangeSettle`; the default until_freed).
-    /// until_freed's bound, grow and margin ride in `phase_change`.
-    phase_change_settle: ?module.PhaseChangeSettle = null,
     /// The grow's new rows' allocation as installed (`module.growFill`; zeros by default).
     grow_fill: ?[]const u8 = null,
     /// The request's index through this Module (1 = the first; request k > 1 follows a reverse phase change).
@@ -1652,7 +1649,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .phase_memory = &phases,
         .phase_change = md.phase_change,
         .phase_change_poll_ms = md.installed.phase_change_poll_ms,
-        .phase_change_settle = md.installed.phase_change_settle,
         .grow_fill = @tagName(md.installed.grow_fill),
         .request = cx.request,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
@@ -1807,7 +1803,6 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     }
     // The fill's decode granule (row | record: the leftover below one row as single records, billed).
     if (envStr("DSV41_CELL_DECODE_FILL_GRANULE")) |v| ov.decode_fill_granule = std.meta.stringToEnum(@import("arm.zig").DecodeFillGranule, v) orelse return error.CellDecodeFillGranule;
-    if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_ROUTED_FORMS")) |v| ov.routed_forms = try parseForms(v);
     if (envStr("DSV41_CELL_ROUTED_BANKED")) |v| ov.routed_banked = try cellBool("DSV41_CELL_ROUTED_BANKED", v);
