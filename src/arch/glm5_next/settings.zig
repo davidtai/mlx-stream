@@ -27,6 +27,7 @@ const glm = @import("config.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const expert_tally = @import("../../sdk_ext.zig").expert.tally;
 const exl3_forms = @import("exl3_forms.zig");
+const prompt_levers = @import("prompt_levers.zig");
 
 /// The context a load bills when the model sets none: the standard request (16,384 prompt tokens and 1,024 generated).
 pub const fill_reserve_tokens: u64 = 16_384 + 1_024;
@@ -284,7 +285,8 @@ pub const max_dump_dir: usize = 480;
 pub fn unknownSetting(o: std.json.ObjectMap) ?[]const u8 {
     var it = o.iterator();
     while (it.next()) |kv| {
-        for (setting_keys) |k| {
+        // The prompt levers' keys (prompt_levers.zig) beside `setting_keys`.
+        for (setting_keys ++ prompt_levers.keys) |k| {
             if (std.mem.eql(u8, k, kv.key_ptr.*)) break;
         } else return kv.key_ptr.*;
     }
@@ -353,6 +355,9 @@ pub const Config = struct {
     exl3_forms: Exl3Forms = .{},
     /// The settings named a forms key (on an NVFP4 pack the default is inert; a named form other than the seam refuses).
     exl3_forms_requested: bool = false,
+    /// The prompt levers (prompt_levers.zig: `exl3_wave_rows`, `prompt_route_cut`, `prompt_static_order`, `ttft_tail`),
+    /// each default today's route.
+    prompt: prompt_levers.Settings = .{},
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -450,6 +455,7 @@ pub const Config = struct {
         }
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
+        c.prompt.apply(raw.object);
         if (raw.object.get("logits_dump_dir")) |v| {
             const ok = v == .string and v.string.len > 1 and v.string.len <= max_dump_dir and v.string[0] == '/' and std.mem.indexOfScalar(u8, v.string, 0) == null;
             if (ok) {
@@ -542,6 +548,7 @@ pub const Config = struct {
         if (c.exl3_forms_requested and !c.exl3_forms.isSeam() and c.expert_family != .exl3) return error.Glm5NextExl3FormsOnNvfp4Pack;
         c.exl3_forms.forms().check() catch return error.Glm5NextExl3FormsSetting;
         try c.tally.check("glm5_next");
+        try c.prompt.check(c.expert_family == .exl3);
         switch (c.expert_rows_by_layer) {
             .uniform => {},
             .offsets => |o| if (o.len != c.model.moeLayers()) return error.Glm5NextExpertRowsByLayerLength,
