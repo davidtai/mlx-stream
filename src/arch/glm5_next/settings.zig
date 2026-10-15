@@ -199,7 +199,7 @@ pub const Exl3Forms = struct {
 };
 
 /// A trunk launch-fusion switch (reports/.../mimo/glm5next-audit-decode-20261014.md rank 8), installed once at
-/// construction: `off` (the default) is the stack's route, the control; `on` the switch's route. Each changes how many
+/// construction: `on` (the default since g24) the switch's route; `off` the control. Each changes how many
 /// launches or waits carry the same work, never what is computed (every output of a fused launch is its stock launch's,
 /// bit for bit):
 ///   fuse_kda_inputs   a KDA layer's six FP8 input GEMVs (q, k, v, f_a, g_a, b) one launch at <= 8 rows (fusion.zig)
@@ -210,8 +210,14 @@ pub const Exl3Forms = struct {
 ///                     fused`, the default)
 ///   merge_gate_waits  a decode call's gated miss parts wait once per gate value, not once per projection and bank (the
 ///                     scheduler's MERGE_GATE_WAITS, deepseek_v41/experts.zig)
-/// Any other value refuses by name in `validate`; a GEMV fusion on a pack whose sites are not FP8 refuses at the install.
+/// Any other value refuses by name in `validate`. A switch NAMED `on` whose prerequisite is absent refuses by name (a GEMV
+/// fusion on a pack whose sites are not FP8 at the install, the predictor's under `decode_predict: f32`, the join's under
+/// `decode_glue: ops`); the DEFAULT resolves to `off` there (`fusionRoutes`), with one line.
 pub const Fusion = enum { off, on };
+/// The launch-fusion keys the settings named.
+pub const FusionNamed = struct { fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false };
+/// The launch-fusion routes a construction installs (`Config.fusionRoutes`).
+pub const FusionRoutes = struct { kda_inputs: bool, gate_up: bool, predictor: bool, join: bool, merge_waits: bool };
 /// The expert stream's demand (miss) reads, installed once at construction (`miss_reads`): `staged` (the default, the
 /// control) preadv each record's gate/up and down ranges into a worker's staging buffer, then one thread copies them into
 /// the slot rows; `direct` preadv them straight into the slot rows (one iovec per segment, no staging, no copy; the
@@ -386,14 +392,18 @@ pub const Config = struct {
     /// The prompt levers (prompt_levers.zig: `exl3_wave_rows`, `prompt_route_cut`, `prompt_static_order`, `ttft_tail`),
     /// each default today's route.
     prompt: prompt_levers.Settings = .{},
-    /// The trunk launch-fusion switches (`Fusion`): each `off` (the default, the control) or `on`.
-    fuse_kda_inputs: Fusion = .off,
-    fuse_gate_up: Fusion = .off,
-    fuse_predictor: Fusion = .off,
-    fuse_join: Fusion = .off,
-    merge_gate_waits: Fusion = .off,
-    /// The expert stream's demand reads (`MissReads`): staged unless named.
-    miss_reads: MissReads = .staged,
+    /// The trunk launch-fusion switches (`Fusion`): each `on` (the default) or `off` (the control); the keys the settings
+    /// named (`fusionRoutes`: a named `on` refuses where its prerequisite is absent, the default resolves to `off`).
+    fuse_kda_inputs: Fusion = .on,
+    fuse_gate_up: Fusion = .on,
+    fuse_predictor: Fusion = .on,
+    fuse_join: Fusion = .on,
+    merge_gate_waits: Fusion = .on,
+    fusion_named: FusionNamed = .{},
+    /// The expert stream's demand reads (`MissReads`): direct unless named (on an EXL3 pack; the default resolves to
+    /// staged on the NVFP4 family, whose records the direct route is not proven for: `missReadsRoute`).
+    miss_reads: MissReads = .direct,
+    miss_reads_requested: bool = false,
     /// `logits_dump_dir`: the dump route's directory (`dumpDir`), held in the config itself (no allocation).
     dump_dir_buf: [max_dump_dir]u8 = undefined,
     dump_dir_len: u16 = 0,
@@ -493,11 +503,13 @@ pub const Config = struct {
             if (raw.object.get(key)) |v| {
                 const route: ?Fusion = if (v == .string) std.meta.stringToEnum(Fusion, v.string) else null;
                 if (route) |r| @field(c, key) = r else @field(c.malformed, key) = true;
+                @field(c.fusion_named, key) = true;
             }
         }
         if (raw.object.get("miss_reads")) |v| {
             const route: ?MissReads = if (v == .string) std.meta.stringToEnum(MissReads, v.string) else null;
             if (route) |r| c.miss_reads = r else c.malformed.miss_reads = true;
+            c.miss_reads_requested = true;
         }
         _ = c.tally.apply(raw.object);
         if (raw.object.get("expert_rows_by_layer")) |v| c.expert_rows_by_layer = layerRowsSetting(v);
@@ -509,6 +521,28 @@ pub const Config = struct {
                 c.dump_dir_len = @intCast(v.string.len);
             } else c.malformed.dump_dir = true;
         }
+    }
+
+    /// The launch-fusion routes the construction installs: each switch's value, except that a DEFAULT `on` whose
+    /// prerequisite is absent resolves to `off` (the GEMV fusions need the FP8 residents, the predictor's the BF16
+    /// predictor, the join's the fused glue); a NAMED `on` stays and refuses by name (`validate`, the install).
+    pub fn fusionRoutes(c: *const Config) FusionRoutes {
+        const fp8_trunk = c.model.residents_format == .fp8_block128;
+        return .{
+            .kda_inputs = c.fuse_kda_inputs == .on and (fp8_trunk or c.fusion_named.fuse_kda_inputs),
+            .gate_up = c.fuse_gate_up == .on and (fp8_trunk or c.fusion_named.fuse_gate_up),
+            .predictor = c.fuse_predictor == .on and (c.decode_predict == .bf16 or c.fusion_named.fuse_predictor),
+            .join = c.fuse_join == .on and (c.decode_glue == .fused or c.fusion_named.fuse_join),
+            .merge_waits = c.merge_gate_waits == .on,
+        };
+    }
+
+    /// The demand reads' route: the setting's, except that the DEFAULT `direct` resolves to `staged` on the NVFP4 family
+    /// (the direct route's geometry is proven for the EXL3 bank); a named `direct` stays (the stream refuses it by name
+    /// where the geometry fails).
+    pub fn missReadsRoute(c: *const Config) MissReads {
+        if (c.miss_reads == .direct and !c.miss_reads_requested and c.expert_family != .exl3) return .staged;
+        return c.miss_reads;
     }
 
     /// The keep-warm route the construction installs on a stream (`gpu`: the stream runs on the GPU): the setting's,
@@ -598,10 +632,10 @@ pub const Config = struct {
         if (c.malformed.fuse_gate_up) return error.Glm5NextFuseGateUpSetting;
         if (c.malformed.fuse_predictor) return error.Glm5NextFusePredictorSetting;
         // The epilogue fusion is the BF16 predictor's (`scoresBf16`); the F32 route has its own graph.
-        if (c.fuse_predictor == .on and c.decode_predict != .bf16) return error.Glm5NextFusePredictorNeedsBf16;
+        if (c.fusion_named.fuse_predictor and c.fuse_predictor == .on and c.decode_predict != .bf16) return error.Glm5NextFusePredictorNeedsBf16;
         if (c.malformed.fuse_join) return error.Glm5NextFuseJoinSetting;
         // The indexed combine replaces the fused glue's combine; the stock glue has none.
-        if (c.fuse_join == .on and c.decode_glue != .fused) return error.Glm5NextFuseJoinNeedsFusedGlue;
+        if (c.fusion_named.fuse_join and c.fuse_join == .on and c.decode_glue != .fused) return error.Glm5NextFuseJoinNeedsFusedGlue;
         if (c.malformed.merge_gate_waits) return error.Glm5NextMergeGateWaitsSetting;
         try c.tally.check("glm5_next");
         try c.prompt.check(c.expert_family == .exl3);
@@ -793,15 +827,34 @@ test "glm5_next settings: the launch-fusion switches: off unless named, on / off
     const keys = [_][]const u8{ "fuse_kda_inputs", "fuse_gate_up", "fuse_predictor", "fuse_join", "merge_gate_waits" };
     const base = try parseSettings("{}");
     try base.validate();
-    inline for (keys) |key| try testing.expectEqual(Fusion.off, @field(base, key));
+    inline for (keys) |key| try testing.expectEqual(Fusion.on, @field(base, key));
+    // The defaults on (g24); each resolves to off where its prerequisite is absent (the BF16 residents, the F32 predictor,
+    // the stock glue), and a named on stays.
+    {
+        const r = base.fusionRoutes();
+        try testing.expect(!r.kda_inputs and !r.gate_up and r.predictor and r.join and r.merge_waits);
+        var fp8_cfg = base;
+        fp8_cfg.model.residents_format = .fp8_block128;
+        const rf = fp8_cfg.fusionRoutes();
+        try testing.expect(rf.kda_inputs and rf.gate_up and rf.predictor and rf.join and rf.merge_waits);
+        const other = try parseSettings("{\"decode_predict\":\"f32\",\"decode_glue\":\"ops\"}");
+        try other.validate();
+        const ro = other.fusionRoutes();
+        try testing.expect(!ro.predictor and !ro.join);
+        const named = try parseSettings("{\"fuse_kda_inputs\":\"on\"}");
+        try testing.expect(named.fusionRoutes().kda_inputs);
+        const off = try parseSettings("{\"fuse_kda_inputs\":\"off\",\"fuse_gate_up\":\"off\",\"fuse_predictor\":\"off\",\"fuse_join\":\"off\",\"merge_gate_waits\":\"off\"}");
+        const rr = off.fusionRoutes();
+        try testing.expect(!rr.kda_inputs and !rr.gate_up and !rr.predictor and !rr.join and !rr.merge_waits);
+    }
     const on: Fusion = .on;
     const off: Fusion = .off;
     for ([_]struct { text: []const u8, want: [5]Fusion }{
-        .{ .text = "{\"mtp_lane\":true,\"fuse_kda_inputs\":\"on\"}", .want = .{ on, off, off, off, off } },
-        .{ .text = "{\"mtp_lane\":true,\"fuse_gate_up\":\"on\"}", .want = .{ off, on, off, off, off } },
-        .{ .text = "{\"mtp_lane\":true,\"fuse_predictor\":\"on\"}", .want = .{ off, off, on, off, off } },
-        .{ .text = "{\"mtp_lane\":true,\"fuse_join\":\"on\"}", .want = .{ off, off, off, on, off } },
-        .{ .text = "{\"mtp_lane\":true,\"merge_gate_waits\":\"on\"}", .want = .{ off, off, off, off, on } },
+        .{ .text = "{\"mtp_lane\":true,\"fuse_kda_inputs\":\"off\"}", .want = .{ off, on, on, on, on } },
+        .{ .text = "{\"mtp_lane\":true,\"fuse_gate_up\":\"off\"}", .want = .{ on, off, on, on, on } },
+        .{ .text = "{\"mtp_lane\":true,\"fuse_predictor\":\"off\"}", .want = .{ on, on, off, on, on } },
+        .{ .text = "{\"mtp_lane\":true,\"fuse_join\":\"off\"}", .want = .{ on, on, on, off, on } },
+        .{ .text = "{\"mtp_lane\":true,\"merge_gate_waits\":\"off\"}", .want = .{ on, on, on, on, off } },
         .{ .text = "{\"mtp_lane\":true,\"draft_depth\":3,\"draft_gate\":0.5,\"fuse_kda_inputs\":\"on\",\"fuse_gate_up\":\"on\",\"fuse_predictor\":\"on\",\"fuse_join\":\"on\",\"merge_gate_waits\":\"on\"}", .want = .{ on, on, on, on, on } },
         .{ .text = "{\"fuse_kda_inputs\":\"off\",\"fuse_gate_up\":\"off\",\"fuse_predictor\":\"off\",\"fuse_join\":\"off\",\"merge_gate_waits\":\"off\"}", .want = .{ off, off, off, off, off } },
         // Every switch serves the serial decode lane too (no lane needed).
@@ -963,10 +1016,14 @@ test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the 
     }
 }
 
-test "glm5_next settings: miss_reads: staged unless named, direct by name, anything else refused by name" {
+test "glm5_next settings: miss_reads: direct unless named (the default staged on the NVFP4 family), staged by name, anything else refused by name" {
     const none = try parseSettings("{}");
     try none.validate();
-    try testing.expectEqual(MissReads.staged, none.miss_reads);
+    try testing.expectEqual(MissReads.direct, none.miss_reads);
+    try testing.expectEqual(MissReads.staged, none.missReadsRoute());
+    var none_exl3 = none;
+    none_exl3.expert_family = .exl3;
+    try testing.expectEqual(MissReads.direct, none_exl3.missReadsRoute());
     const staged = try parseSettings("{\"miss_reads\":\"staged\"}");
     try staged.validate();
     try testing.expectEqual(MissReads.staged, staged.miss_reads);

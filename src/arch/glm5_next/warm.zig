@@ -160,4 +160,6 @@ test "glm5_next warm: the warm's device code compiles against the arch's seams (
     testing.refAllDecls(@This());
     _ = &run;
     _ = &experts.Source.warmCombine;
+    _ = &experts.Source.prebuildExperts;
+    _ = &experts.SourceOf(.exl3).prebuildExperts;
 }

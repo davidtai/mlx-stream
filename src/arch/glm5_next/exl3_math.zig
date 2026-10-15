@@ -335,6 +335,41 @@ pub const Math = struct {
 
     /// Every wave was evaluated and synchronized before its call returned.
     pub fn finishPrefill(_: *Self, _: *G) !void {}
+
+    /// The pipeline pre-build of the EXL3 texts (construction, prebuild.zig's caller; no request state): MLX builds a custom
+    /// kernel's library and pipeline at the first evaluation of each instantiation (its template arguments, its inputs'
+    /// dtypes and classes: an input under 8 elements binds `constant`), so the prompt pass's first waves and the decode
+    /// lane's first rounds built them inside the first request. Here, over zero rows and slot row 0 of `b` (one routed
+    /// layer's base bank, read only; no route, read or slot of the stream): `prefill` at one full wave (`wave_rows` rows:
+    /// take2, the gate|up GEMM, onepass, the down GEMM, widen1, the join's concat and take) and at one row (a tail wave:
+    /// its row tables bind `constant`); the installed decode chain (`decode`: the seam texts or the forms) at every width
+    /// 1 .. `kernels.max_pairs`. Each result evaluated and dropped. Returns the calls made.
+    pub fn prebuild(self: *Self, g: *G, b: Arrays) !u32 {
+        var n: u32 = 0;
+        const zslots = try self.allocator.alloc(u32, self.wave_rows);
+        defer self.allocator.free(zslots);
+        @memset(zslots, 0);
+        for ([_]u32{ self.wave_rows, 1 }) |rows| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            const x = try g.zeros(&.{ @intCast(rows), @intCast(kernels.hidden) }, .bfloat16);
+            const y = try self.prefill(g, 0, x, .{ .slot = zslots[0..rows] }, b);
+            g.release(y);
+            n += 1;
+        }
+        const banks: [kernels.n_banks]Arrays = @splat(b);
+        var p: u32 = 1;
+        while (p <= kernels.max_pairs) : (p += 1) {
+            const m = g.mark();
+            defer g.resetTo(m);
+            const pi: c_int = @intCast(p);
+            const ids = try g.zeros(&.{pi}, .uint32);
+            const h = try self.decode.gate_up(self.decode.ctx, g, try g.zeros(&.{ pi, @intCast(kernels.hidden) }, .bfloat16), ids, &banks);
+            try g.evalAll(&.{try self.decode.down(self.decode.ctx, g, h, ids, &banks)});
+            n += 2;
+        }
+        return n;
+    }
 };
 
 const testing = std.testing;

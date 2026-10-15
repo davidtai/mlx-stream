@@ -30,6 +30,7 @@ const dsa_decode = @import("dsa_decode.zig");
 const swiglu = @import("swiglu.zig");
 const fusion = @import("fusion.zig");
 const prebuild = @import("prebuild.zig");
+const exl3_kernels = @import("exl3_kernels.zig");
 const mtp = @import("mtp.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const acc = @import("../../sdk_ext.zig").acceptance;
@@ -150,11 +151,13 @@ pub const Module = struct {
         try weights.materialize();
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
         try kda.install(&self.c.model);
+        // The launch-fusion routes as resolved (`fusionRoutes`: a default `on` whose prerequisite is absent installs `off`).
+        const fusion_routes = self.c.fusionRoutes();
         // The trunk's launch fusion (`fuse_kda_inputs`, `fuse_gate_up`, `fuse_predictor`, `fuse_join`), once, over the read
         // residents: each switch on its text, its launches at 1 .. 8 rows and (the GEMVs') its route (one launch as the
         // compile check), every fused site FP8 at its launch's shapes and plans or the load refused by name; off (the
         // default) keeps the stock route. The predictor's and the join's routes are bound into the expert source below.
-        fusion.install(gpa, s, &self.c.model, self.w.layers, .{ .kda_inputs = self.c.fuse_kda_inputs == .on, .gate_up = self.c.fuse_gate_up == .on, .predictor = self.c.fuse_predictor == .on, .join = self.c.fuse_join == .on }, &diag) catch |e| {
+        fusion.install(gpa, s, &self.c.model, self.w.layers, .{ .kda_inputs = fusion_routes.kda_inputs, .gate_up = fusion_routes.gate_up, .predictor = fusion_routes.predictor, .join = fusion_routes.join }, &diag) catch |e| {
             log.err("glm5_next: the launch fusion refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
             return e;
         };
@@ -270,8 +273,8 @@ pub const Module = struct {
         const warm_route = self.c.warmRoute(gpu_warm.gpuStream(s));
         if (warm_route != self.c.gpu_keep_warm) log.info("glm5_next route gpu_keep_warm=off reason=default {s} on a CPU stream (its waits are host waits)\n", .{@tagName(self.c.gpu_keep_warm)});
         self.src = switch (self.c.expert_family) {
-            .nvfp4 => .{ .nvfp4 = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.prompt, self.c.miss_reads) },
-            .exl3 => .{ .exl3 = try experts.Exl3Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.prompt, self.c.miss_reads) },
+            .nvfp4 => .{ .nvfp4 = try experts.Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.prompt, self.c.missReadsRoute()) },
+            .exl3 => .{ .exl3 = try experts.Exl3Source.init(gpa, io, dir, prompt_rows, decode_rows, self.gates, s, self.c.decode_moe, self.c.decode_predict, warm_route, self.c.tally, self.c.exl3_forms, self.c.prompt, self.c.missReadsRoute()) },
         };
         errdefer switch (self.src) {
             inline else => |x| x.deinit(),
@@ -279,13 +282,13 @@ pub const Module = struct {
         // MERGE_GATE_WAITS (`merge_gate_waits`), bound into the scheduler once, before any call: a decode call's gated miss
         // parts wait once per gate value. `fuse_predictor`: the BF16 predictor's epilogue as one dispatch; `fuse_join`: the
         // fused glue's routed call ending before the join's take, its combine reading the rows in place; each bound likewise.
-        if (self.c.merge_gate_waits == .on) switch (self.src) {
+        if (fusion_routes.merge_waits) switch (self.src) {
             inline else => |x| try x.ex.bindMergeGateWaits(),
         };
-        if (self.c.fuse_predictor == .on) switch (self.src) {
+        if (fusion_routes.predictor) switch (self.src) {
             inline else => |x| try x.fusePredictor(),
         };
-        if (self.c.fuse_join == .on) switch (self.src) {
+        if (fusion_routes.join) switch (self.src) {
             inline else => |x| try x.fuseJoin(),
         };
         // The rate tally (`expert_resident_ratio` > 0): its file read once (the first request's pins), its line.
@@ -308,8 +311,15 @@ pub const Module = struct {
         };
         // The decode lane's custom-kernel pipelines built here, not inside the first request (prebuild.zig): every width of
         // the FP8 GEMV sites, the installed fusion texts, the fused glue and SwiGLU. Unconditional, exact (no output read).
-        const prebuilt = try prebuild.run(gpa, io, s, &self.c.model, &self.w, self.routes);
-        log.info("glm5_next pipelines pre-built: {d} launches at decode widths 1..{d} (fp8 gemv {d}, fusion {d}, glue {d}, swiglu {d}) in {d} ms\n", .{ prebuilt.gemv + prebuilt.fusion + prebuilt.glue + prebuilt.swiglu, prebuild.max_rows, prebuilt.gemv, prebuilt.fusion, prebuilt.glue, prebuilt.swiglu, prebuilt.ns / std.time.ns_per_ms });
+        // The expert texts' too (experts.zig `prebuildExperts`): the exl3 family's prompt waves (a full wave and a one-row
+        // tail) and its installed decode chain at every width.
+        const pb_t0 = std.Io.Timestamp.now(io, .awake);
+        var prebuilt = try prebuild.run(gpa, io, s, &self.c.model, &self.w, self.routes);
+        prebuilt.experts = switch (self.src) {
+            inline else => |x| try x.prebuildExperts(),
+        };
+        prebuilt.ns = @intCast(pb_t0.untilNow(io, .awake).nanoseconds);
+        log.info("glm5_next pipelines pre-built: {d} launches at decode widths 1..{d} (fp8 gemv {d}, fusion {d}, glue {d}, swiglu {d}) + {d} expert calls (prompt waves of {d} and 1 rows, decode chain at 1..{d} pairs) in {d} ms\n", .{ prebuilt.gemv + prebuilt.fusion + prebuilt.glue + prebuilt.swiglu, prebuild.max_rows, prebuilt.gemv, prebuilt.fusion, prebuilt.glue, prebuilt.swiglu, prebuilt.experts, self.c.prompt.wave_rows, exl3_kernels.max_pairs, prebuilt.ns / std.time.ns_per_ms });
         self.prompt_pass = promptPassOf(promptRoute(&self.c), self.c.expert_family);
         // `ttft_tail: deferred`: the served and the lane's prompt passes without their tail (the dump route keeps it).
         if (self.c.prompt.ttft_tail == .deferred) self.prompt_pass = deferredPromptOf(promptRoute(&self.c), self.c.expert_family) orelse self.prompt_pass;
