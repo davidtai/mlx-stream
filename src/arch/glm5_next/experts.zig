@@ -155,6 +155,24 @@ pub fn missReadsLine(buf: []u8, miss_reads: settings.MissReads, block: u64, prer
     }) catch buf[0..0];
 }
 
+/// `prompt_residents`'s install line (settings.zig `PromptResidents`), printed once at construction.
+pub fn promptResidentsLine(residents: settings.PromptResidents) []const u8 {
+    return switch (residents) {
+        .keep => "glm5_next prompt residents: keep (decode's residents stay for the next prompt)",
+        .forget => "glm5_next prompt residents: forget (every request starts from empty rows)",
+    };
+}
+
+/// A request's start on the stream (or its source), after `Source.resumePrefill` (nothing live). `forget` (the control):
+/// every resident and the prompt state forgotten (`forgetResidents`). `keep` after a reverse change (`reversed`): the
+/// residents `shrink(.keep)` left in the prompt rows stay (that shrink already cleared their prompt state). A start with no
+/// decode before it (the construction's warm-up, a request that ended at its prompt) forgets as `forget` does. Then the
+/// prompt counts are zeroed and the pins refreshed (`resetPromptCounts`).
+pub fn requestStart(stream: anytype, residents: settings.PromptResidents, reversed: bool) !void {
+    if (residents == .forget or !reversed) _ = try stream.forgetResidents();
+    stream.resetPromptCounts();
+}
+
 /// The phase route of a routed call (MiMo's `decodeLane`): one row in either phase, up to `decode_lane_rows` in decode.
 pub fn decodeLane(nt: u32, decoding: bool) bool {
     return nt == 1 or (decoding and nt <= decode_lane_rows);
@@ -238,6 +256,8 @@ pub fn SourceOf(comptime fam: Family) type {
         forward_shared: *const ForwardSharedFn = forwardSharedStock,
         combine_kernel: prefill_combine.Kernel = .{},
         combine_route: prefill_combine.Route = .inplace,
+        /// `prompt_residents` (settings.zig), installed at construction: the residents the reverse change keeps.
+        prompt_residents: settings.PromptResidents = .keep,
         /// MiMo's X12 (`gpu_keep_warm: waits`): the warm engine (its own queue, kernel, buffer and parked thread); the
         /// stream source holds its arm (`warm_arm`: armed by `gate` and `awaitReadAhead`). Null on the control.
         warm: ?*gpu_warm.Warm = null,
@@ -249,7 +269,7 @@ pub fn SourceOf(comptime fam: Family) type {
         /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
         /// routed layer's. `prompt`: the prompt levers' routes (prompt_levers.zig; the scheduler's route cut on either
         /// family, the DIG-X wave size and the rows' counting sort on exl3).
-        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, exl3_forms: settings.Exl3Forms, prompt: prompt_levers.Settings, miss_reads: settings.MissReads) !*Self {
+        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, exl3_forms: settings.Exl3Forms, prompt: prompt_levers.Settings, miss_reads: settings.MissReads, prompt_residents: settings.PromptResidents) !*Self {
             const Bm = Fam.Bridge;
             const bm = Fam.bank;
             var open_diag: sdk.Diag = .{};
@@ -275,6 +295,7 @@ pub fn SourceOf(comptime fam: Family) type {
             const self = try a.create(Self);
             errdefer a.destroy(self);
             self.* = .{ .allocator = a, .bank = bank, .sdk_bank = undefined, .sdk_stream = undefined, .stream_source = undefined, .g = undefined, .rows = undefined, .decode_rows = undefined, .ex = undefined };
+            self.prompt_residents = prompt_residents;
             self.rows = try a.dupe(u32, rows);
             errdefer a.free(self.rows);
             self.decode_rows = try a.dupe(u32, decode_rows);
@@ -393,6 +414,7 @@ pub fn SourceOf(comptime fam: Family) type {
                 var lb: [320]u8 = undefined;
                 log.info("{s}\n", .{missReadsLine(&lb, miss_reads, self.sdk_stream.direct_block, self.sdk_stream.preread, geo.num_moe_layers, geo.num_experts, geo.record_bytes, if (comptime fam == .exl3) exl3_forms else null)});
             }
+            log.info("{s}\n", .{promptResidentsLine(prompt_residents)});
             if (comptime fam != .exl3) {
                 switch (decode_moe) {
                 .stock => {},
@@ -441,11 +463,12 @@ pub fn SourceOf(comptime fam: Family) type {
             if (cached >= prompt_cache_bytes / 2) _ = mlx.mlx_clear_cache();
         }
 
-        /// A new request: the prompt phase, the previous request's residents, seed and prompt counts forgotten (MiMo's).
+        /// A new request: the prompt phase, the previous request's seed and prompt counts forgotten; its residents
+        /// forgotten (`forget`, MiMo's) or kept after a decode (`keep`; `requestStart`).
         pub fn beginPrefill(self: *Self) !void {
+            const reversed = self.sdk_stream.phase == .decode;
             try self.resumePrefill();
-            _ = try self.stream_source.forgetResidents();
-            self.stream_source.resetPromptCounts();
+            try requestStart(&self.stream_source, self.prompt_residents, reversed);
         }
 
         /// The request's read schedule from its prompt length, once, after `beginPrefill`.
@@ -453,13 +476,17 @@ pub fn SourceOf(comptime fam: Family) type {
             return self.stream_source.chooseReadSchedule(prompt_tokens);
         }
 
-        /// The prompt phase: after a decode, the grown rows and window 0 freed (residents forgotten), MLX's cache cleared,
-        /// the prompt's scratch re-created; the prompt pass's cache limit.
+        /// The prompt phase: after a decode (every route settled: `settle`), the grown rows and window 0 freed, the
+        /// prompt rows' residents kept or forgotten (`prompt_residents`, the stream's `shrink`), MLX's cache cleared, the
+        /// prompt's scratch re-created; the prompt pass's cache limit.
         pub fn resumePrefill(self: *Self) !void {
             try self.settle();
             defer setCacheLimit(prompt_cache_bytes);
             if (self.sdk_stream.phase == .decode) {
-                _ = try self.ex.shrink(self.rows, .forget);
+                _ = try self.ex.shrink(self.rows, switch (self.prompt_residents) {
+                    .keep => .keep,
+                    .forget => .forget,
+                });
                 self.g.clearCache();
                 _ = try self.ex.regrowTransient(&self.g, true);
             }
@@ -694,6 +721,12 @@ test "glm5_next experts: miss_reads: staged keeps the pool's staging route and t
     try testing.expectEqualStrings("glm5_next experts: miss_reads=direct block=4096 preread=off records=42x288x9474048B forms gateup=guone down=pair (demand ranges preadv straight into the slot rows, no staging copy; ranges and rows checked on the block)", missReadsLine(&buf, .direct, 4096, false, 42, 288, 9_474_048, forms));
     try testing.expectEqualStrings("glm5_next experts: miss_reads=staged block=0 preread=on records=42x288x9474048B forms gateup=guone down=pair (demand ranges through the staging buffer and the copy)", missReadsLine(&buf, .staged, 0, true, 42, 288, 9_474_048, forms));
     try testing.expectEqualStrings("glm5_next experts: miss_reads=staged block=0 preread=on records=42x288x9474048B forms - (demand ranges through the staging buffer and the copy)", missReadsLine(&buf, .staged, 0, true, 42, 288, 9_474_048, null));
+}
+
+test "glm5_next experts: prompt_residents: the install line names the installed route" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("glm5_next prompt residents: keep (decode's residents stay for the next prompt)", promptResidentsLine(.keep));
+    try testing.expectEqualStrings("glm5_next prompt residents: forget (every request starts from empty rows)", promptResidentsLine(.forget));
 }
 
 test "glm5_next experts: the rate tally's pins on Flash's geometry: the top floor(ratio x 288) experts by rate, at most the layer's rows, ties by the lower id; none unseeded" {

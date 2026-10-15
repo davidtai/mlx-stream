@@ -475,3 +475,96 @@ test "glm5_next exl3 bank: direct rows: the served phase cycle (prompt, release,
     try testing.expect(st.failed);
     try testing.expectError(error.StreamFailed, st.shrink(&prompt_rows, .forget));
 }
+
+test "glm5_next exl3 bank: prompt_residents: keep leaves decode's residents in the prompt rows and the next prompt plans them as hits (no record read); forget plans and reads them again" {
+    const X = @import("experts.zig");
+    const Bx = X.Types(.exl3).Bridge;
+    const a = testing.allocator;
+    const s = try Synth.write(.{ .hidden = 4096, .inter = 2048, .n_experts = 8 }, "mul1");
+    defer s.close();
+    var diag: sdk.Diag = .{};
+    var bank = try Bank.open(a, testing.io, s.root, 3, synth_implemented, &diag);
+    defer bank.deinit();
+    var sb = try SDKBank.init(a, &bank);
+    defer sb.deinit();
+    // The served options of the phase cycle test above (direct reads, phase rows, decode's window 0).
+    const prompt_rows = [_]u32{ 4, 4 };
+    const decode_rows = [_]u32{ 6, 7 };
+    var opts = try X.streamOptionsOf(Bx, &prompt_rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .direct);
+    opts.event = null;
+    opts.lookahead = null;
+    opts.prompt_reads = .stock;
+    opts.prompt_ahead = .head;
+    opts.prompt_relocate = false;
+    opts.ahead_cap = null;
+    const wave = [_]u16{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    var hits: [2]u32 = .{ 0, 0 };
+    var bytes: [2]u64 = .{ 0, 0 };
+    for ([_]@import("settings.zig").PromptResidents{ .keep, .forget }, 0..) |residents, i| {
+        const st = try Bx.Stream.init(a, &sb, opts);
+        defer st.deinit();
+        // Request 1 (`Source.beginPrefill` after construction: no decode before it): a prompt of every expert.
+        try X.requestStart(st, residents, false);
+        for (0..2) |l| st.release(try st.serve(@intCast(l), &wave));
+        try st.flush();
+        // Its decode routes two of each layer's prompt residents and two experts the prompt rows do not hold.
+        var dec: [2][4]u16 = undefined;
+        for (0..2) |l| {
+            var nr: usize = 0;
+            var nm: usize = 2;
+            for (wave) |e| {
+                const resident = st.layers[l].policy.slotOf(e) != null;
+                if (resident and nr < 2) {
+                    dec[l][nr] = e;
+                    nr += 1;
+                } else if (!resident and nm < 4) {
+                    dec[l][nm] = e;
+                    nm += 1;
+                }
+            }
+            try testing.expect(nr == 2 and nm == 4);
+        }
+        _ = try st.releaseTransient();
+        try st.grow(&decode_rows);
+        for (0..2) |l| st.release(try st.serve(@intCast(l), &dec[l]));
+        try st.flush();
+        // The prompt-row slots of the two residents decode used.
+        var old: [2][2]u32 = undefined;
+        for (0..2) |l| for (0..2) |k| {
+            old[l][k] = st.layers[l].policy.slotOf(dec[l][k]).?;
+            try testing.expect(old[l][k] < prompt_rows[l]);
+        };
+        // Request 2: the reverse change (`Source.resumePrefill`) and the request's start (`Source.beginPrefill`).
+        _ = try st.shrink(&prompt_rows, switch (residents) {
+            .keep => .keep,
+            .forget => .forget,
+        });
+        _ = try st.regrowTransient();
+        try X.requestStart(st, residents, true);
+        // keep: the prompt rows hold the residents decode found there; forget: none.
+        for (0..2) |l| for (dec[l][0..2]) |e| try testing.expectEqual(residents == .keep, st.layers[l].policy.slotOf(e) != null);
+        if (residents == .forget) try testing.expectEqual(@as(u64, 0), st.residentCount());
+        // Its prompt routes the two kept experts of each layer again, one route each, in the order that puts neither in
+        // the slot it held (`forget`'s empty rows take slot 0 then 1): so no load can skip its read on a slot that
+        // still holds its record, and every byte forget reads is a record read again.
+        const before = st.stats().expert_bytes_read;
+        for (0..2) |l| {
+            const x = dec[l][0];
+            const y = dec[l][1];
+            const order: [2]u16 = if (old[l][0] != 0 and old[l][1] != 1) .{ x, y } else .{ y, x };
+            for (order) |e| {
+                const r = try st.serve(@intCast(l), &.{e});
+                hits[i] += r.plan.n_hits;
+                st.release(r);
+            }
+        }
+        try st.flush();
+        bytes[i] = st.stats().expert_bytes_read - before;
+        try testing.expect(!st.failed);
+    }
+    // keep: the two kept residents of each layer are hits and read nothing; forget: no hit, the four records read again.
+    try testing.expectEqual(@as(u32, 4), hits[0]);
+    try testing.expectEqual(@as(u32, 0), hits[1]);
+    try testing.expectEqual(@as(u64, 0), bytes[0]);
+    try testing.expect(bytes[1] > 0);
+}
