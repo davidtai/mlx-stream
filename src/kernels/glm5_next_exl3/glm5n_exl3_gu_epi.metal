@@ -13,7 +13,6 @@
     threadgroup float BG[128];
     threadgroup float BU[128];
     uint slot_ = ids[row * ids_strides[0]]; uint bk = slot_ >> 24u; uint slot = slot_ & 0xFFFFFFu;
-    if (slot_ == 0xFFFFFFFFu) return; // a missed pair of the device hit wave (hit_wave: resident_only)
     BG[tid] = zg[row * zg_strides[0] + c0 * zg_strides[1]];
     BG[tid + 64u] = zg[row * zg_strides[0] + c1 * zg_strides[1]];
     BU[tid] = zu[row * zu_strides[0] + c0 * zu_strides[1]];

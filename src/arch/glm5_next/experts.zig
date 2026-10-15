@@ -78,12 +78,6 @@ pub fn Types(comptime fam: Family) type {
 /// `decode_predict: bf16`: the next routed layer's scores from its router's BF16 weight as stored ([experts, hidden], MLX's
 /// gemv over x [n, hidden]), then the sigmoid and the correction as MiMo's F32 route: f32 [n, experts]. Half the F32
 /// copy's bytes and no input cast; the scores pick the lookahead's reads only.
-/// DEVROUTE's LUT value for a non-resident expert (`hit_wave`): the EXL3 decode texts' skip id under `resident_only`
-/// (settings `validate` admits it only on an EXL3 pack's hitpass with the forms whose texts skip it), else 0.
-fn devMiss(comptime fam: Family, hit_wave: settings.HitWave) u32 {
-    return if (fam == .exl3 and hit_wave == .resident_only) exl3_kernels.skip_id else 0;
-}
-
 pub fn scoresBf16(_: *const mimo_math.Predictor, g: *ops.MlxOps, x: T, router: T, correction: T) anyerror!T {
     const logits = try g.matmul(x, try g.transpose(router));
     return g.add(try g.sigmoid(try g.astype(logits, .float32)), correction);
@@ -259,7 +253,7 @@ pub fn SourceOf(comptime fam: Family) type {
         /// bound. `gates` holds every model layer's router (the dense layers' empty): the lookahead's predictor reads the next
         /// routed layer's. `prompt`: the prompt levers' routes (prompt_levers.zig; the scheduler's route cut on either
         /// family, the DIG-X wave size and the rows' counting sort on exl3).
-        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, exl3_forms: settings.Exl3Forms, prompt: prompt_levers.Settings, miss_reads: settings.MissReads, hit_wave: settings.HitWave) !*Self {
+        pub fn init(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, rows: []const u32, decode_rows: []const u32, gates: []const Gate, stream: mlx.mlx_stream, decode_moe: settings.DecodeMoe, predict: settings.DecodePredict, keep_warm: gpu_warm.Route, tally: expert_tally.Settings, exl3_forms: settings.Exl3Forms, prompt: prompt_levers.Settings, miss_reads: settings.MissReads) !*Self {
             const Bm = Fam.Bridge;
             const bm = Fam.bank;
             var open_diag: sdk.Diag = .{};
@@ -390,10 +384,8 @@ pub fn SourceOf(comptime fam: Family) type {
             }
             errdefer if (comptime fam == .exl3) a.free(self.own_gates);
             const fam_gates = if (comptime fam == .exl3) self.own_gates else gates;
-            self.ex = try Fam.Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = fam_gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true, .route_cut = prompt.route_cut == .on }, .banked = decode_moe != .stock, .devroute = decode_moe == .hitpass, .dev_miss = devMiss(fam, hit_wave) });
+            self.ex = try Fam.Experts.initWith(a, &self.g, &self.stream_source, math, &config, .{ .gates = fam_gates, .event = event, .wide = .{ .seed = true, .hot_first = true, .depth = mimo_stream.wide_depth, .read_ahead = true, .route_cut = prompt.route_cut == .on }, .banked = decode_moe != .stock, .devroute = decode_moe == .hitpass });
             errdefer self.ex.deinit();
-            if (self.ex.dev_miss != 0) log.info("glm5_next hit wave: route=resident_only (the device hit wave's LUT maps a non-resident expert to 0x{X}: its pairs return in every decode text, only the resident pairs computed; the miss parts unchanged)\n", .{self.ex.dev_miss})
-            else if (decode_moe == .hitpass) log.info("glm5_next hit wave: route=all_pairs (the device hit wave computes every routed pair, a missed one from base row 0, never joined; the control)\n", .{});
             if (self.combine_route == .inplace) self.ex.setJoinlessBound(prefill_combine.inplace_sources);
             if (comptime fam == .exl3) {
                 log.info("glm5_next experts: exl3 k3 mul1 routes (decode_moe={s}: DeepSeek-V4.1's banked PREP=rin chain at hidden {d} / inter {d}, in_rin + gate/up mul1h GEMVs + gu_epi + din_rin + down mul1h GEMV + dpost(bf16), one launch each per wave over the three banks{s}; prompt: DIG-X waves of <= {d} rows / {d} experts, take2 + gate|up GEMM (m128) + onepass + down GEMM (m128) + rot_widen1(bf16); bank {d} x {d} records of {d} B, codebook mul1 0x{X}, no global-scale word: scale-line isolation not applicable; the NVFP4 draft bank unchanged)\n", .{ @tagName(decode_moe), exl3_kernels.hidden, exl3_kernels.inter, if (decode_moe == .hitpass) ", each call's hit wave from the layer's resident slot LUT" else if (decode_moe == .stock) ", unbanked: one group per bank" else "", prompt.wave_rows, @import("../../exl3/quant.zig").wave_max, geo.num_moe_layers, geo.num_experts, geo.record_bytes, exl3_kernels.codebook_multiplier });

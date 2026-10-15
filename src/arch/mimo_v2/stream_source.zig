@@ -309,16 +309,10 @@ pub fn For(comptime bank_mod: type, comptime params: Params) type {
             /// relative layer's policy; the dense layers (below `first_moe_layer`) have no policy and map every expert to 0.
             /// The scheduler writes it only after a route (the policy changes only in `route`), never per dispatch.
             pub fn residentLut(self: *const StreamSource, layer: u32, out: []u32) void {
-                self.residentLutMiss(layer, out, 0);
-            }
-
-            /// `residentLut` with non-resident experts (and a dense layer's) mapped to `miss` (DEVROUTE's skipping route,
-            /// `Options.dev_miss`; 0 is `residentLut`).
-            pub fn residentLutMiss(self: *const StreamSource, layer: u32, out: []u32, miss: u32) void {
-                if (layer < self.stream.bank.first_moe_layer) return @memset(out, miss);
+                if (layer < self.stream.bank.first_moe_layer) return @memset(out, 0);
                 if (comptime diag.compiled) if (self.missfree) |mf| if (self.decoding()) return self.missFreeLut(mf, layer, out);
                 const rel = self.relativeLayer(layer);
-                @import("../../expert/stream.zig").lutOfMiss(&self.stream.layers[rel].policy, self.stream, rel, out, miss);
+                @import("../../expert/stream.zig").lutOf(&self.stream.layers[rel].policy, self.stream, rel, out);
             }
 
             // ── end HITPASS ──

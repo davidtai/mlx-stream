@@ -10,7 +10,6 @@
         // Every value below is threadgroup-uniform; the tile loops carry no predicate.
         uint nrows = threadgroups_per_grid.y;
         uint slot = ids[row];
-        if (slot == 0xFFFFFFFFu) return; // a missed pair of the device hit wave (hit_wave: resident_only)
         uint rank = 0u; uint cnt = 0u; uint mate = row;
         for (uint j = 0; j < nrows; ++j) {
             uint same = (ids[j] == slot) ? 1u : 0u;

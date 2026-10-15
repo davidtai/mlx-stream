@@ -40,18 +40,12 @@ def read(d, base):
 
 
 OUT = {}
-# DEVROUTE `hit_wave: resident_only` (glm5next_exl3_kernels_gen.py): a pair whose id is 0xFFFFFFFF returns first.
-IDS_ONE = 'uint sid = ids[row]; uint bk = sid >> 24u;'
-SKIP_ONE = (IDS_ONE, IDS_ONE + '\n        if (sid == 0xFFFFFFFFu) return; // a missed pair of the device hit wave (hit_wave: resident_only)', 1)
-IDS_PAIR = 'uint slot = ids[row];\n'
-SKIP_PAIR = (IDS_PAIR, IDS_PAIR + '        if (slot == 0xFFFFFFFFu) return; // a missed pair of the device hit wave (hit_wave: resident_only)\n', 1)
 OUT['g5k3_guone'] = head('g5k3_guone', 'exl3/dsv41_exl3_b3_guone_k3_2304', 'IT, OT') + sub(read(SRC, 'dsv41_exl3_b3_guone_k3_2304'), [
     ('* 2211840ul', '* (ulong(IT) * ulong(OT) * 48ul)', 1),
     ('row * 5120u', 'row * (uint(IT) * 16u)', 1),
     ('tk < 320u', 'tk < uint(IT)', 1),
     ('(tk * 144u + tn)', '(tk * uint(OT) + tn)', 1),
     ('[row * 2304u', '[row * (uint(OT) * 16u)', 1),
-    SKIP_ONE,
 ], 'guone')
 OUT['g5k3_pair'] = head('g5k3_pair', 'exl3/dsv41_exl3_b3_pair_k3_5120', 'IT, OT') + sub(read(SRC, 'dsv41_exl3_b3_pair_k3_5120'), [
     ('* 2211840ul', '* (ulong(IT) * ulong(OT) * 48ul)', 1),
@@ -61,7 +55,6 @@ OUT['g5k3_pair'] = head('g5k3_pair', 'exl3/dsv41_exl3_b3_pair_k3_5120', 'IT, OT'
     ('(tk * 320u + tn)', '(tk * uint(OT) + tn)', 2),
     ('[row * 5120u', '[row * (uint(OT) * 16u)', 2),
     ('[mate * 5120u', '[mate * (uint(OT) * 16u)', 1),
-    SKIP_PAIR,
 ], 'pair')
 OUT['g5k3_gemv_u8'] = head('g5k3_gemv_u8', 'exl3/dsv41_exl3_b3_mul1h_k3_2304', 'IT, OT') + sub(read(SRC, 'dsv41_exl3_b3_mul1h_k3_2304'), [
     ('* 2211840ul', '* (ulong(IT) * ulong(OT) * 48ul)', 1),

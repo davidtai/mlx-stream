@@ -111,13 +111,8 @@ pub fn traceBank(g: anytype, geom: *const Layer, rows: u32) !BankArraysOf(@TypeO
 /// DEVROUTE's resident map of one layer from its policy: each resident expert's persistent slot as its packed
 /// (bank << 24 | row) through `src.slotRef`; non-resident experts 0.
 pub fn lutOf(pol: *const expert_policy.LayerPolicy, src: anytype, layer: u32, out: []u32) void {
-    lutOfMiss(pol, src, layer, out, 0);
-}
-
-/// `lutOf` with non-resident experts mapped to `miss` (a skipping route's id; 0 is `lutOf`).
-pub fn lutOfMiss(pol: *const expert_policy.LayerPolicy, src: anytype, layer: u32, out: []u32, miss: u32) void {
     for (out, 0..) |*o, e| {
-        o.* = miss;
+        o.* = 0;
         if (e >= pol.n_experts) continue;
         const s = pol.slotOf(@intCast(e)) orelse continue;
         if (s >= pol.capacity) continue;
@@ -181,11 +176,6 @@ pub const StreamSource = struct {
     /// expert e's persistent slot, else 0 (a miss: the device row is computed from base row 0 and never joined).
     pub fn residentLut(self: *const StreamSource, layer: u32, out: []u32) void {
         lutOf(&self.stream.layers[layer].policy, self.stream, layer, out);
-    }
-
-    /// `residentLut` with non-resident experts mapped to `miss`.
-    pub fn residentLutMiss(self: *const StreamSource, layer: u32, out: []u32, miss: u32) void {
-        lutOfMiss(&self.stream.layers[layer].policy, self.stream, layer, out, miss);
     }
 
     /// The decode phase (the grown banks; DEVROUTE's LUTs exist).

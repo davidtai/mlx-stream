@@ -40,18 +40,10 @@ def read(base):
 
 OUT = {}
 
-# DEVROUTE `hit_wave: resident_only` (src/arch/glm5_next/exl3_kernels.zig `skip_id`): the device hit wave's LUT maps a
-# non-resident expert to 0xFFFFFFFF; each decode text's threadgroup of such a pair returns before any read or write (the
-# row is never joined: its miss part's row replaces it). Host-built waves never carry the id, so they run as before.
-IDS_RIN = 'uint slot_ = ids[row * ids_strides[0]]; uint bk = slot_ >> 24u; uint slot = slot_ & 0xFFFFFFu;'
-SKIP_RIN = (IDS_RIN, IDS_RIN + '\n    if (slot_ == 0xFFFFFFFFu) return; // a missed pair of the device hit wave (hit_wave: resident_only)', 1)
-IDS_GEMV = 'uint sid = ids[row]; uint bk = sid >> 24u;'
-SKIP_GEMV = (IDS_GEMV, IDS_GEMV + '\n        if (sid == 0xFFFFFFFFu) return; // a missed pair of the device hit wave (hit_wave: resident_only)', 1)
-
 # ── Decode: the banked PREP=rin chain (ids packed bank << 24 | slot row over the base, ext and transient banks) ──
 
 OUT['glm5n_exl3_in_rin'] = head('glm5n_exl3_in_rin', 'dsv41_exl3_b3_prep_in_rin', 'HID') + sub(
-    read('dsv41_exl3_b3_prep_in_rin'), [('row * 5120u', 'row * uint(HID)', 4), SKIP_RIN], 'in_rin')
+    read('dsv41_exl3_b3_prep_in_rin'), [('row * 5120u', 'row * uint(HID)', 4)], 'in_rin')
 
 # The GEMV of one projection: code [rows, IT, OT, 48] i16, xh f32 [P, IT * 16] -> z f32 [P, OT * 16].
 OUT['glm5n_exl3_gemv'] = head('glm5n_exl3_gemv', 'dsv41_exl3_b3_mul1h_k3_2304', 'IT, OT') + sub(
@@ -62,22 +54,20 @@ OUT['glm5n_exl3_gemv'] = head('glm5n_exl3_gemv', 'dsv41_exl3_b3_mul1h_k3_2304', 
         ('tk < 320u', 'tk < uint(IT)', 1),
         ('(tk * 144u + tn)', '(tk * uint(OT) + tn)', 1),
         ('out[row * 2304u', 'out[row * (uint(OT) * 16u)', 1),
-        SKIP_GEMV,
     ], 'gemv')
 
 OUT['glm5n_exl3_gu_epi'] = head('glm5n_exl3_gu_epi', 'dsv41_exl3_b3_prep_gu_epi', 'INTER') + sub(
-    read('dsv41_exl3_b3_prep_gu_epi'), [('out[row * 2304u', 'out[row * uint(INTER)', 2), SKIP_RIN], 'gu_epi')
+    read('dsv41_exl3_b3_prep_gu_epi'), [('out[row * 2304u', 'out[row * uint(INTER)', 2)], 'gu_epi')
 
 OUT['glm5n_exl3_din_rin'] = head('glm5n_exl3_din_rin', 'dsv41_exl3_b3_prep_din_rin', 'INTER') + sub(
-    read('dsv41_exl3_b3_prep_din_rin'), [('out[row * 2304u', 'out[row * uint(INTER)', 2), SKIP_RIN], 'din_rin')
+    read('dsv41_exl3_b3_prep_din_rin'), [('out[row * 2304u', 'out[row * uint(INTER)', 2)], 'din_rin')
 
 # dpost stores its f32 word in the template dtype T (bf16: the expert output type the glm5_next combines read; one
 # rounding on store, the DIG-X rot_widen1_obf16 idiom).
 OUT['glm5n_exl3_dpost'] = head('glm5n_exl3_dpost', 'dsv41_exl3_b3_moeprep_dpost', 'HID, T') + sub(
     read('dsv41_exl3_b3_moeprep_dpost'), [
         ('out[row * 5120u + c0] = (B[tid] * SCALE) * float(BANKED_rd(c0));', 'out[row * uint(HID) + c0] = static_cast<T>((B[tid] * SCALE) * float(BANKED_rd(c0)));', 1),
-        ('out[row * 5120u + c1] = (B[tid + 64u] * SCALE) * float(BANKED_rd(c1));', 'out[row * uint(HID) + c1] = static_cast<T>((B[tid + 64u] * SCALE) * float(BANKED_rd(c1)));', 1),
-        SKIP_RIN], 'dpost')
+        ('out[row * 5120u + c1] = (B[tid + 64u] * SCALE) * float(BANKED_rd(c1));', 'out[row * uint(HID) + c1] = static_cast<T>((B[tid + 64u] * SCALE) * float(BANKED_rd(c1)));', 1)], 'dpost')
 
 # ── Prompt: DIG-X (the trellis decoded in the NAX GEMMs' B loader), DIG2 onepass ──
 

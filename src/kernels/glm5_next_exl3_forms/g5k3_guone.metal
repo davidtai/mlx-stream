@@ -8,7 +8,6 @@
         uint lane = thread_index_in_simdgroup;
         threadgroup float red[16][32];
         uint sid = ids[row]; uint bk = sid >> 24u;
-        if (sid == 0xFFFFFFFFu) return; // a missed pair of the device hit wave (hit_wave: resident_only)
         const device short* base = (half_up != 0u ? (bk == 0u ? code_u0 : (bk == 1u ? code_u1 : code_u2)) : (bk == 0u ? code_g0 : (bk == 1u ? code_g1 : code_g2))) + ulong(sid & 0xFFFFFFu) * (ulong(IT) * ulong(OT) * 48ul);
         const device float* xp = (half_up != 0u ? xh_u : xh_g) + row * (uint(IT) * 16u);
         uint wa = 2u * ((3u * lane + 2u) >> 2); uint wb = (wa + 46u) % 48u; uint lp = 8u * ((lane + 1u) & 3u);

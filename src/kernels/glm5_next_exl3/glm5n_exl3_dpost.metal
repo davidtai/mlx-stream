@@ -11,7 +11,6 @@
 
     threadgroup float B[128];
     uint slot_ = ids[row * ids_strides[0]]; uint bk = slot_ >> 24u; uint slot = slot_ & 0xFFFFFFu;
-    if (slot_ == 0xFFFFFFFFu) return; // a missed pair of the device hit wave (hit_wave: resident_only)
     B[tid] = zd[row * zd_strides[0] + c0 * zd_strides[1]];
     B[tid + 64u] = zd[row * zd_strides[0] + c1 * zd_strides[1]];
     threadgroup_barrier(mem_flags::mem_threadgroup);
