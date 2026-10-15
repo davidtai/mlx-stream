@@ -197,6 +197,7 @@ pub const draft_lane = struct {
     }
 
     fn depth(m: *const Module) u32 {
+        if (comptime !host_caps.glm) unreachable;
         return switch (m.*) {
             inline else => |x| x.mtpDepth(),
         };
