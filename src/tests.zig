@@ -2,10 +2,6 @@
 //! (`-Dmlx-stream-dir=<this checkout>`); `zig build test` here does the same from this repo. A comptime block, not a
 //! test block: the root adds no test of its own.
 
-pub const plugin = @import("root.zig").plugin;
-pub const plugin_mimo = @import("root.zig").plugin_mimo;
-pub const testing = @import("root.zig").testing;
-
 comptime {
     _ = @import("arch/mimo_v2/root.zig");
     _ = @import("arch/mimo_v2/config.zig");

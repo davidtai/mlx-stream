@@ -10,5 +10,5 @@ pub const PhaseObserver = struct {
     ctx: *anyopaque,
     mark: *const fn (ctx: *anyopaque, stage: Stage) anyerror!void,
 
-    pub const Stage = enum { start, released, grown, tail };
+    pub const Stage = enum { start, released, grown };
 };

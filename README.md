@@ -550,7 +550,7 @@ compressed-tensors does (needs the network, torch and compressed-tensors).
 ```
 build.zig, build.zig.zon   standalone build (drives the host's build)
 sdk/                       the arch contract's types (`sdk` module), the weight loader, reads past the page cache
-src/root.zig               the archs the host calls (`arch`, `archs`, `sdk`, `default_context`) and the tests' surface
+src/root.zig               the archs the host calls (`arch`, `archs`, `sdk`, `default_context`)
 src/tests.zig              the test root (`zig build mlx-stream-test` in the host)
 src/conformance.zig        the conformance suite's root
 src/arch/deepseek_v41/     the DeepSeek-V4.1 arch, with its tests

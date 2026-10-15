@@ -1,5 +1,5 @@
-//! The host surface this plugin reads beyond the SDK's, as one comptime capability table, exported by the plugin root
-//! (`root.host_caps`). Each entry is a PUBLIC declaration of the host's `mlx_host` root: `@hasDecl` sees only pub
+//! The host surface this plugin reads beyond the SDK's, as one comptime capability table, read by the archs that need
+//! it. Each entry is a PUBLIC declaration of the host's `mlx_host` root: `@hasDecl` sees only pub
 //! declarations, and an absent entry is never a silent route: GLM-5.3 refuses by name at construction
 //! (`error.GlmHostSurfaceMissing`, plugin.zig) and its tests skip. A host older than the GLM-5.3 stack (ddalcu main,
 //! pr/mimo-host) exports neither entry; DeepSeek-V4.1 and MiMo need neither.

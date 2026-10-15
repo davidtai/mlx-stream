@@ -1346,11 +1346,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return routed;
             }
 
-            /// Whether the tally pins (seeded on its first layer: every layer is seeded together).
-            pub fn tallySeeded(self: *const Stream) bool {
-                return self.layers.len > 0 and self.layers[0].policy.seeded and self.layers[0].policy.pin_limit > 0;
-            }
-
             /// P7 `overlap`: a request's read-ahead post (`AheadPost`), set once at the request's start by an arch that
             /// chooses it per request (MiMo's `prefill_read_schedule: auto`, by the prompt's length). Only at a request's
             /// start: refused on a `stock` stream, outside the prompt phase, on a failed stream, while anything of a prompt

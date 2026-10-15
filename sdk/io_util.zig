@@ -130,11 +130,6 @@ pub const RowGather = struct {
     failed: std.atomic.Value(u32) = .init(0),
     unaligned: std.atomic.Value(u32) = .init(0),
 
-    /// Host bytes a gather keeps for the table's life (the bill's term): the stages and the scratch.
-    pub fn persistentBytes(helpers: usize, max_ids: usize) u64 {
-        return @as(u64, helpers + 1) * stage_len + @as(u64, max_ids) * (@sizeOf(Item) + @sizeOf(Run));
-    }
-
     pub fn init(fd: std.c.fd_t, base: u64, row_bytes: usize, rows: u64, helpers: usize, max_ids: usize, parallel_min: usize) !*RowGather {
         const page = std.heap.pageSize();
         if (row_bytes == 0 or max_ids == 0 or row_bytes + 2 * page > stage_len or stage_len % page != 0) return error.GatherGeometry;
@@ -446,10 +441,6 @@ pub const HeaderRegion = struct {
     cols: u64,
     start: u64,
     end: u64,
-
-    pub fn overlaps(a: HeaderRegion, b: HeaderRegion) bool {
-        return a.start < b.end and b.start < a.end;
-    }
 };
 
 /// One header entry, every access checked and the region proven to hold exactly

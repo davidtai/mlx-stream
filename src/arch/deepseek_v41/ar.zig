@@ -2131,7 +2131,7 @@ pub const PhaseMarks = struct {
     /// The transient release as the Module installed it (`Module.installed.transient_release`): the release proof is
     /// judged only when the phase change releases the scratch; off, it is NA.
     release_route: bool,
-    /// Indexed by `module.PhaseObserver.Stage`: start, released, grown (the SDK's `tail` stage is never observed here).
+    /// Indexed by `module.PhaseObserver.Stage`: start, released, grown.
     marks: [4]?BoxMark = @splat(null),
     failed: [4]?anyerror = @splat(null),
     spent_ns: u64 = 0,
