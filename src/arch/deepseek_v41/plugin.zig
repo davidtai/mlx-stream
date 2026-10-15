@@ -63,6 +63,11 @@ pub fn shell(c: *const Config) sdk.Shell {
     return .{ .num_experts = c.num_experts, .num_layers = c.num_hidden_layers };
 }
 
+/// The SDK's per-model settings seam (the host's model-settings.json entry; glm5_next's contract): the keys
+/// `Config.applySettings` reads (`ctx_size`, `prompt_residents`, `resident_seed`, the tally's, the wide schedule's, ...);
+/// `.null` or a non-object changes nothing; a key it does not read is left to the host. A bad value is refused by name at
+/// the load (`loadBytes`: `checkCtxSize`, `checkResidency`) and again at construction. The rows come from the load's facts
+/// (`withFacts`: `--expert-rows` / `--expert-prefill-rows`), not from this object.
 pub fn applySettings(c: *Config, raw: std.json.Value) void {
     c.applySettings(raw);
 }
@@ -70,6 +75,7 @@ pub fn applySettings(c: *Config, raw: std.json.Value) void {
 /// The load preflight's requirement: the native bill's process bound at the fill's floor rows.
 pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, c: *const Config, facts: *const sdk.LoadFacts, ceiling: u64) !u64 {
     try module.checkCtxSize(c);
+    try c.checkResidency();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     return bill_mod.loadRequirementBytes(arena.allocator(), io, c.withFacts(facts), ceiling);
@@ -265,4 +271,29 @@ test "dsv41 plugin: the term-wise bill bounds the process exactly as the load pr
     const req: sdk.BillRequest = .{ .peek = &p, .cfg = cfg, .routes = &ov, .prompt_tokens = bill_mod.fill_prompt_tokens, .max_tokens = bill_mod.fill_max_tokens, .ceiling = ceiling, .stop = module.ceiling_stop_bytes };
     const floor: sdk.Rows = .{ .prompt = bill_mod.min_fill_rows, .decode = bill_mod.min_fill_rows };
     try sdk.testing.expectBillBoundsLoad(@This(), testing.allocator, testing.io, cfg, &host.loadFacts(), &req, floor);
+}
+
+test "dsv41 plugin: applySettings takes the host's model-settings entry (null: no change), its residency keys parse, and a bad value is refused by name" {
+    var c: Config = .{};
+    applySettings(&c, .null);
+    try testing.expectEqual(sdk_ext.expert.usage.PromptResidents.keep, c.prompt_residents);
+    try testing.expect(c.residency.seed == null and c.max_context_tokens == null);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"ctx_size\":32768,\"prompt_residents\":\"forget\",\"resident_seed\":\"none\",\"max_output\":4096}", .{});
+    applySettings(&c, v);
+    try testing.expectEqual(@as(?u32, 32768), c.max_context_tokens);
+    try testing.expectEqual(sdk_ext.expert.usage.PromptResidents.forget, c.prompt_residents);
+    try testing.expectEqual(sdk_ext.expert.usage.Seed.none, c.residency.seed.?);
+    try c.checkResidency();
+    for ([_]struct { text: []const u8, err: anyerror }{
+        .{ .text = "{\"prompt_residents\":\"hold\"}", .err = error.Dsv41PromptResidentsSetting },
+        .{ .text = "{\"resident_seed\":\"hot\"}", .err = error.ResidentSeedSetting },
+        .{ .text = "{\"expert_usage_record\":\"/tmp/u.json\"}", .err = error.ExpertUsageRecordNotInstalled },
+        .{ .text = "{\"expert_usage_label\":\"\"}", .err = error.ExpertUsageRecordNotInstalled },
+    }) |w| {
+        var x: Config = .{};
+        applySettings(&x, try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), w.text, .{}));
+        try testing.expectError(w.err, x.checkResidency());
+    }
 }
