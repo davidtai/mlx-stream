@@ -236,7 +236,7 @@ pub const draft_lane = struct {
 
 const testing = std.testing;
 
-test "glm5_next claims: the pack's NVFP4 declaration claims it; other packs and models decline" {
+test "glm5_next claims: the pack's NVFP4 or EXL3 K=3 (mul1 | mcg) declaration claims it; other packs and models decline" {
     try sdk.testing.expectClaims(claims, &.{
         .{ .config =
         \\{"model_type":"glm5_next","expert_streaming":{"family":"mlx-stream","format":"mlx-stream-nvfp4-expert-bank-v1","manifest":"expert-manifest.json"}}
@@ -251,12 +251,19 @@ test "glm5_next claims: the pack's NVFP4 declaration claims it; other packs and 
         .{ .config =
         \\{"model_type":"glm5_next","expert_streaming":{"family":"mlx-stream","format":"mlx-stream-nvfp4-expert-bank-v1","manifest":"other.json"}}
         , .want = null },
-        // The EXL3 K=3 mul1 pack (its block as the converter writes it), and the same block with another quant.
+        // The EXL3 K=3 mul1 and mcg packs (their blocks as the converters write them), and the same block with a quant
+        // whose codebook this build has no texts for.
         .{ .config =
         \\{"model_type":"glm5_next","expert_streaming":{"family":"mlx-stream","format":"mtplx-expert-manifest-v2","manifest":"expert-manifest-v2.json","runtime_manifest":"expert-manifest.json","quant":"exl3-k3-mul1"}}
         , .want = .native },
         .{ .config =
         \\{"model_type":"glm5_next","expert_streaming":{"family":"mlx-stream","format":"mtplx-expert-manifest-v2","manifest":"expert-manifest-v2.json","runtime_manifest":"expert-manifest.json","quant":"exl3-k3-mcg"}}
+        , .want = .native },
+        .{ .config =
+        \\{"model_type":"glm5_next","expert_streaming":{"family":"mlx-stream","format":"mtplx-expert-manifest-v2","manifest":"expert-manifest-v2.json","runtime_manifest":"expert-manifest.json","quant":"exl3-k3-3inst"}}
+        , .want = null },
+        .{ .config =
+        \\{"model_type":"glm5_next","expert_streaming":{"family":"mlx-stream","format":"mtplx-expert-manifest-v2","manifest":"expert-manifest-v2.json","runtime_manifest":"expert-manifest.json","quant":"exl3-k4-mcg"}}
         , .want = null },
     });
 }
