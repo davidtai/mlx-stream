@@ -87,7 +87,6 @@ comptime {
     _ = @import("arch/deepseek_v41/bill_mini_test.zig");
     _ = @import("arch/deepseek_v41/decode_timers.zig");
     _ = @import("arch/deepseek_v41/decode_first.zig");
-    _ = @import("arch/deepseek_v41/cache_sim.zig");
     _ = @import("arch/deepseek_v41/draft_routes.zig");
     _ = @import("arch/deepseek_v41/verify_timeline.zig");
     _ = @import("arch/deepseek_v41/host_heap.zig");
