@@ -207,6 +207,27 @@ Both heads pass 161 of 164. Two problems fail on both (116, 132); each head lose
 temperature 1.0 with one sample. The two truncated completions per run hit the 16,384-token cap. For comparison, MiMo-V2.6-Flash
 scored 0.9451 / 0.9573 on the same harness.
 
+## Warm TTFT: residents kept across requests (2026-10-15)
+
+A warm request's TTFT on GLM-5.3-Flash is expert reads, not compute. With `prompt_residents: forget` (the old route) the
+prompt phase re-read about 98 of 288 experts per layer for every request. With `prompt_residents: keep` (the default from
+commit 2e032cb) the residents decode left in the prompt rows stay for the next prompt; a kept slot holds its record's own
+bytes, so the result is exact by construction.
+
+Measured on build g30-keep (SHA-256 `9cc5e8b2`, plugin `2e032cb`, host `a8f6c6b8`), pin 190/217, q8 draft head, one server
+load per arm, 12 sequential `/v1/chat/completions` requests of 143-206 prompt tokens (HumanEval problems 0-11, thinking
+off, temperature 1.0, top-p 0.95, seed 1, `max_tokens` 256, streamed), order A B B A:
+
+| Arm | Cold TTFT (request 1, ms) | Median TTFT (requests 2-12, ms) | Mean TTFT (requests 2-12, ms) | Decode median (tok/s) |
+| :--- | ---: | ---: | ---: | ---: |
+| A forget | 6,925.6 | 6,583.5 | 6,586.9 | 38.0 |
+| B keep | 7,098.9 | 2,432.8 | 2,446.9 | 38.5 |
+| B keep | 7,108.4 | 2,444.2 | 2,447.4 | 38.5 |
+| A forget | 7,109.2 | 6,589.1 | 6,588.1 | 38.0 |
+
+Keep cuts the warm TTFT by 63 % (6.59 s to 2.44 s). The cold request and decode do not change. Every request produced the
+same completion token count in all four arms. The cold floor of about 7 s is the bank's bytes over the drive's rate.
+
 ## Context sweep 1K-1M
 
 One request per context rung, from 1K to 1M prompt tokens, on the exact stack of this branch (the g25-dsa3 kernels and
