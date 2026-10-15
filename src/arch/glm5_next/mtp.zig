@@ -2,7 +2,7 @@
 //! `num_nextn_predict_layers` = 1) drafting `max_depth` tokens a round over its own one-layer DSA lanes, its 288 routed
 //! experts resident in NVFP4 (the pack's draft bank, docs/glm5-next-pack.md), on MiMo's draft-lane seam
 //! (`mimo_v2/draft.zig`: the round's draft count, the exact rule's decision graph over the shared acceptance module, the
-//! commit plan, the lane's counters). The arch's module wires it (MTP.md: the settings key, the bill terms, the
+//! commit plan, the lane's counters). The arch's module wires it (docs/glm5-next-mtp.md: the settings key, the bill terms, the
 //! construction, the prompt pass, the round and the request's end).
 //!
 //! The head (mlx-serve `glm_mtp.zig` at ddalcu main 6e15b046; its oracle mlx-vlm's `glm5_next_mtp` drafter). Pair p is

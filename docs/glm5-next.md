@@ -323,7 +323,7 @@ prints a table per served context (17,408; 18,432; 20,480; 24,576; 32,766; 32,76
 
 `mtp_lane: true` installs the release's MTP layer as a draft head at depth 3 (`draft_depth` 1 .. 3 sets it; the
 lanes, the bill and the host's block stay sized at 3, MiMo's rule) with exact acceptance (`mtp.zig`, on
-MiMo's draft-lane seam; `MTP.md` lists its integration points). At construction: the MTP layer's 25 residents kept in
+MiMo's draft-lane seam; `docs/glm5-next-mtp.md` lists its integration points). At construction: the MTP layer's 25 residents kept in
 the weight map and read with the trunk, the draft bank (`mtp-experts-nvfp4.bin`, all 288 experts resident in NVFP4)
 read into MLX and checked record by record against its manifest, the head's lanes at the billed positions; what the
 open holds is held to its billed terms (`mtp_bank + mtp_tables + mtp_kv`, else `ConstructionOverBill`). Line:

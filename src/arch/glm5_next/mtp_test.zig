@@ -2,7 +2,7 @@
 //! the draft bank through the routed bank's loader and reader (a synthetic bank always; the pack's when `GLM5_BANK`
 //! names it, record 0 against the reference reader's check-mtp vector, `testdata/mtp-vector-e000.json`), the MTP
 //! layer's residents from the shards' headers, the exact rule's rounds on synthetic targets, and the bill's terms. The
-//! lane's device code is compiled here (its declarations referenced); it runs in the arch's window cells (MTP.md).
+//! lane's device code is compiled here (its declarations referenced); it runs in the arch's window cells (docs/glm5-next-mtp.md).
 
 const std = @import("std");
 const sdk = @import("sdk");
