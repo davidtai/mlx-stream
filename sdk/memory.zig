@@ -103,6 +103,18 @@ fn taskVmInfo() ?TaskVmInfo {
     return info;
 }
 
+/// Bytes the host's other models hold in this process (its own bill's footprint reads count them too). The host
+/// keeps it current; a plugin's absolute footprint bounds rise by it.
+var foreign_bytes = std.atomic.Value(u64).init(0);
+
+pub fn setForeignBytes(n: u64) void {
+    foreign_bytes.store(n, .monotonic);
+}
+
+pub fn foreignBytes() u64 {
+    return foreign_bytes.load(.monotonic);
+}
+
 /// This process's phys_footprint (MLX's Metal / IOKit memory included) and its lifetime peak, in bytes.
 pub const Footprint = struct { now: u64, peak: u64 };
 
