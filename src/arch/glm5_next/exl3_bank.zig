@@ -397,3 +397,63 @@ test "glm5_next exl3 bank: direct reads: the pack's record geometry passes the 4
     r.base[4] += 1024;
     try testing.expectError(error.DirectReadsRow, S.checkDirectRows(&r, 4096));
 }
+
+test "glm5_next exl3 bank: direct rows: the served phase cycle (prompt, release, grow, shrink, regrow, release, grow) keeps every row on the block; a refused grow fails the stream closed" {
+    const Bx = @import("experts.zig").Types(.exl3).Bridge;
+    const a = testing.allocator;
+    const s = try Synth.write(.{ .hidden = 4096, .inter = 2048, .n_experts = 8 }, "mul1");
+    defer s.close();
+    var diag: sdk.Diag = .{};
+    var bank = try Bank.open(a, testing.io, s.root, 3, synth_implemented, &diag);
+    defer bank.deinit();
+    var sb = try SDKBank.init(a, &bank);
+    defer sb.deinit();
+    // The served options (direct demand reads, phase rows, decode's window 0), without the GPU event, the lookahead and
+    // the overlap schedule: none of them allocates a row.
+    const prompt_rows = [_]u32{ 4, 4 };
+    const decode_rows = [_]u32{ 6, 7 };
+    var opts = try @import("experts.zig").streamOptionsOf(Bx, &prompt_rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .direct);
+    opts.event = null;
+    opts.lookahead = null;
+    opts.prompt_reads = .stock;
+    opts.prompt_ahead = .head;
+    opts.prompt_relocate = false;
+    opts.ahead_cap = null;
+    try testing.expect(opts.pool.direct and opts.transient_release);
+    const st = try Bx.Stream.init(a, &sb, opts);
+    defer st.deinit();
+    try testing.expectEqual(@as(u64, 4096), st.direct_block);
+    // A 26-token prompt: 208 routed ids, one wave per layer (8 experts: every id of the wave distinct here).
+    const wave = [_]u16{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    const dec = [_]u16{ 6, 1, 7, 3 };
+    for (0..2) |request| {
+        for (0..2) |l| {
+            const r = try st.serve(@intCast(l), &wave);
+            st.release(r);
+        }
+        try st.flush();
+        _ = try st.releaseTransient();
+        try st.grow(&decode_rows);
+        try testing.expect(!st.failed);
+        for (0..2) |l| {
+            const r = try st.serve(@intCast(l), &dec);
+            st.release(r);
+        }
+        try st.flush();
+        if (request == 0) {
+            _ = try st.shrink(&prompt_rows, .forget);
+            _ = try st.regrowTransient();
+            try testing.expect(!st.failed);
+        }
+    }
+    _ = try st.shrink(&prompt_rows, .forget);
+    _ = try st.regrowTransient();
+    // A grow whose rows land off the block (a prompt row skewed 1 KiB): refused by name, the stream failed closed, every
+    // later phase call refused by `StreamFailed`; the rows it installed stay owned (one free at deinit).
+    _ = try st.releaseTransient();
+    st.layers[1].base.base[2] += 1024;
+    try testing.expectError(error.DirectReadsRow, st.grow(&decode_rows));
+    st.layers[1].base.base[2] -= 1024;
+    try testing.expect(st.failed);
+    try testing.expectError(error.StreamFailed, st.shrink(&prompt_rows, .forget));
+}

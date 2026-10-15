@@ -10,6 +10,7 @@ const expert_io = @import("io.zig");
 const expert_policy = @import("policy.zig");
 const expert_lookahead = @import("lookahead.zig");
 const expert_routes = @import("routes.zig");
+const log = @import("sdk").log;
 /// The route recorder (`expert.routes`) is a diagnostic: its hooks compile into profile builds (`sdk.plugin_profile`) and
 /// the tests only; a served build has no recorder branch on any route.
 pub const recording: bool = @import("sdk").plugin_profile or builtin.is_test;
@@ -979,7 +980,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 // Relocation's copies (`p7Relocate`): at most every persistent row's components per call, reserved once.
                 if (opt.prompt_relocate) try self.promote_copies.ensureTotalCapacity(a, @as(usize, n_components) * bank.n_experts);
                 self.direct_block = direct_block;
-                if (direct_block != 0) try self.checkRowsDirect();
+                if (direct_block != 0) try self.checkRowsDirect(.construction);
                 return self;
             }
 
@@ -2562,17 +2563,21 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 // arrays are already evaluated.
                 if (self.grow_fill == .zeros) try evalRows(a, exts);
                 for (exts) |*e| if (e.*) |*r| try r.bind();
+                // From here the stream owns the new rows (the errdefers above free none of them).
                 if (window0) |w| {
                     self.transient = w;
                     self.transient_meta = meta0;
                     self.transient_released = false;
+                    window0 = null;
                 }
                 if (alt0) |w| {
                     self.alt.?.rows = w;
                     self.alt.?.meta = alt_meta0;
+                    alt0 = null;
                 }
-                for (self.layers, decode_rows, exts) |*ls, rows, e| {
-                    ls.ext = e;
+                for (self.layers, decode_rows, exts) |*ls, rows, *e| {
+                    ls.ext = e.*;
+                    e.* = null;
                     ls.policy.grow(rows) catch unreachable;
                     // The tally's pins at decode's capacity, once per request (a route never re-ranks them).
                     ls.policy.refreshPins();
@@ -2583,7 +2588,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.wide_depth = 1;
                 self.route_lookahead = self.selector != null;
                 self.route_preread = self.route_lookahead and self.preread;
-                if (self.direct_block != 0) try self.checkRowsDirect();
+                if (self.direct_block != 0) self.checkRowsDirect(.grow) catch |e| return self.failDirect(e);
                 if (comptime recording) if (self.recorder) |rec| for (self.layers, 0..) |*ls, l| {
                     rec.handover(@intCast(l), ls.policy.prefill_freq, ls.policy.slot_to_expert[0..ls.policy.capacity], ls.base.rows);
                 };
@@ -2690,9 +2695,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.failed) return error.StreamFailed;
                 if (!self.transient_released) return error.TransientNotReleased;
                 var t = try Rows.init(&self.bank.layers[self.transient_layer], self.prompt_transient_rows, self.memory);
-                errdefer t.deinit();
+                // Until the install below; then the stream owns `t` and `meta`.
+                var installed = false;
+                errdefer if (!installed) t.deinit();
                 const meta = try self.allocator.alloc(SlotMeta, t.rows);
-                errdefer self.allocator.free(meta);
+                errdefer if (!installed) self.allocator.free(meta);
                 @memset(meta, .{});
                 var bytes: u64 = 0;
                 if (self.alt) |*x| {
@@ -2706,22 +2713,45 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 self.transient = t;
                 self.transient_meta = meta;
+                installed = true;
                 self.transient_released = false;
                 self.wide_depth = self.prompt_wide_depth;
                 for (t.row_bytes) |n| bytes += n * t.rows;
-                if (self.direct_block != 0) try self.checkRowsDirect();
+                if (self.direct_block != 0) self.checkRowsDirect(.regrow_transient) catch |e| return self.failDirect(e);
                 return bytes;
             }
 
             /// Every live slot row against the direct reads' block (`checkDirectRows`): at construction and after each phase
             /// change's allocation (`grow`, `regrowTransient`), never per read.
-            fn checkRowsDirect(self: *const Stream) expert_io.DirectError!void {
-                for (self.layers) |*ls| {
-                    try checkDirectRows(&ls.base, self.direct_block);
-                    if (ls.ext) |*e| try checkDirectRows(e, self.direct_block);
+            fn checkRowsDirect(self: *const Stream, site: DirectSite) expert_io.DirectError!void {
+                for (self.layers, 0..) |*ls, l| {
+                    try self.directRowsAt(site, &ls.base, "base", l);
+                    if (ls.ext) |*e| try self.directRowsAt(site, e, "ext", l);
                 }
-                if (!self.transient_released) try checkDirectRows(&self.transient, self.direct_block);
-                if (self.alt) |*x| try checkDirectRows(&x.rows, self.direct_block);
+                if (!self.transient_released) try self.directRowsAt(site, &self.transient, "transient", self.transient_layer);
+                if (self.alt) |*x| try self.directRowsAt(site, &x.rows, "alt", x.layer);
+            }
+
+            /// Where `checkRowsDirect` runs: the refusal line names it.
+            const DirectSite = enum { construction, grow, regrow_transient };
+
+            /// `checkDirectRows` on one bank of rows; a refusal logs one line (the refusal path only, never per read).
+            fn directRowsAt(self: *const Stream, site: DirectSite, r: *const Rows, which: []const u8, layer: usize) expert_io.DirectError!void {
+                checkDirectRows(r, self.direct_block) catch |e| {
+                    const blk = self.direct_block;
+                    for (r.base, r.row_bytes, 0..) |b, n, c| if (b % blk != 0 or n % blk != 0) {
+                        log.err("expert stream: direct rows refused at {t}: rows={s} layer={d} component={d} n_rows={d} base=0x{x} row_bytes={d} block={d} backing={t} phase={t} transient_released={}\n", .{ site, which, layer, c, r.rows, b, n, blk, r.backing, self.phase, self.transient_released });
+                        break;
+                    };
+                    return e;
+                };
+            }
+
+            /// A phase change's direct-rows refusal after its rows were installed: the stream fails closed (every later call
+            /// refused by `StreamFailed`).
+            fn failDirect(self: *Stream, err: expert_io.DirectError) expert_io.DirectError {
+                self.failed = true;
+                return err;
             }
 
             /// A settled result's read time; a result with payload and no preadv was copied out of a speculative record.
