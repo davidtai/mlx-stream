@@ -167,14 +167,17 @@ served behavior.
 | `DSV41_BILL_VARIANT` | server | `conservative` | `tight` bills one live K16 routed-group stream instead of four (only with the model's chunk-fenced taps). Any other value is refused by name at construction. |
 | `DSV41_SELFCHECK_REPORT` | server | off | `1` logs every kernel self-check result at construction (a failure is always logged and refuses the load). |
 | `GLM53_ROUTES` | server (profile builds) | off | Any value other than `0` arms GLM-5.3's route recorder: at each request's end, `glm53-routes-<pid>-<n>.bin` gets every decode route (layer, step, rows, routed ids, what served each id, the lookahead's records), each step's rows, drafts, accepted drafts and emitted tokens, and per layer the prompt's counts per expert and the residents at the handover. A value that starts with `/` is the directory; any other value writes to `/tmp`. The file layout is in `src/sdk_ext/expert/routes.zig`. |
-| `DSV41_CELL_ROUTED_FORMS` | cell | `stock` | `down_pair`, `gu_one` or both (comma list): the routed decode GEMVs rebuilt on those exact texts. |
-| `DSV41_CELL_ROUTED_BANKED` | cell | `0` | `1`: each routed decode stage runs as one launch over every bank's rows (exact). |
-| `DSV41_CELL_DEVROUTE` | cell | `0` | `1`: decode's hit wave runs as a device graph before the host's routing wait (exact; needs `ROUTED_BANKED`). |
-| `DSV41_CELL_HOIST_FIRST` | cell | `0` | `1`: each decode call commits its hoist right behind the routing barrier's arrays (exact). |
-| `DSV41_CELL_DRAFT_STAGED` | cell | `0` | `1`: each draft stage is committed as soon as it is built (exact). |
+| `DSV41_CELL_ROUTED_FORMS` | cell | `down_pair,gu_one` (stack4) | `stock`, `down_pair`, `gu_one` or both (comma list): the routed decode GEMVs rebuilt on those exact texts. |
+| `DSV41_CELL_ROUTED_BANKED` | cell | `1` (stack4) | `1`: each routed decode stage runs as one launch over every bank's rows (exact); `0`: one launch per bank. |
+| `DSV41_CELL_DEVROUTE` | cell | `1` (stack4) | `1`: decode's hit wave runs as a device graph before the host's routing wait (exact; needs `ROUTED_BANKED`); `0`: the host builds it. |
+| `DSV41_CELL_HOIST_FIRST` | cell | `1` (stack4) | `1`: each decode call commits its hoist right behind the routing barrier's arrays (exact). |
+| `DSV41_CELL_DRAFT_STAGED` | cell | `1` (stack4) | `1`: each draft stage is committed as soon as it is built (exact); `0`: one commit per draft block. |
 | `DSV41_CELL_PHASE_POLL_MS` | cell | the settle's own | the phase change's footprint poll in ms (1 .. the settle bound; outside is refused). |
 | `DSV41_CELL_PREFILL_SUB` | cell | the cache's sub-chunk | the prompt rows per layer-major call; `whole` runs the prompt in one call. |
 | `DSV41_CELL_MAX_CONTEXT` | cell (bill tool) | 16,384 | the longest prompt the construction bills; the server takes it from `ctx_size`. |
+
+The five stack4 defaults above are the served tier's (`decode_stack4`, on unless `model-settings.json` sets it
+`false`, which turns all five off); a cell variable overrides its own route only.
 
 The cell refuses, by name, the retired levers `DSV41_CELL_PREDICT_BF16`, `DSV41_CELL_DENSE_RC`,
 `DSV41_CELL_PREFILL_INPUT_RELEASE` and `DSV41_CELL_PHASE_SETTLE` (`CellRetiredLever`).
