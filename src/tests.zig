@@ -37,6 +37,21 @@ comptime {
     _ = @import("arch/mimo_v2/gpu_warm.zig");
     _ = @import("arch/mimo_v2/gpu_power.zig");
     _ = @import("arch/mimo_v2/gpu_warm_test.zig");
+    _ = @import("arch/glm5_next/bank.zig");
+    _ = @import("arch/glm5_next/bank_test.zig");
+    _ = @import("arch/glm5_next/config.zig");
+    _ = @import("arch/glm5_next/settings.zig");
+    _ = @import("arch/glm5_next/nvfp4.zig");
+    _ = @import("arch/glm5_next/kda.zig");
+    _ = @import("arch/glm5_next/graph.zig");
+    _ = @import("arch/glm5_next/bill.zig");
+    _ = @import("arch/glm5_next/dump.zig");
+    _ = @import("arch/glm5_next/root.zig");
+    _ = @import("arch/glm5_next/module.zig");
+    _ = @import("arch/glm5_next/profile.zig");
+    _ = @import("arch/glm5_next/mtp.zig");
+    _ = @import("arch/glm5_next/mtp_test.zig");
+    _ = @import("arch/mimo_v2/stream_source.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");
@@ -113,4 +128,8 @@ comptime {
     // GLM-5.3's refusal on a host without its surface: its own file, compiled only on such a host (the GLM tests above
     // skip there).
     if (!@import("host_caps.zig").glm) _ = @import("arch/glm_moe_dsa/host_surface_test.zig");
+    _ = @import("arch/glm5_next/decode_kernels.zig");
+    _ = @import("arch/glm5_next/decode_kernels_selfcheck.zig");
+    _ = @import("arch/glm5_next/decode_kernels_ref.zig");
+    _ = @import("arch/glm5_next/decode_kernels_parity.zig");
 }

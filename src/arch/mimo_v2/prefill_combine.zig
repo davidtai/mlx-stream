@@ -122,15 +122,15 @@ pub const Kernel = struct {
     /// P7 `inplace`: the table form of the same text (`initInplace`).
     k_inplace: mlx.mlx_fast_metal_kernel = .{},
 
-    /// Construction boundary: the routed geometry the text is instantiated for.
-    pub fn init(geometry: bank_mod.Geometry) !Kernel {
+    /// Construction boundary: the routed geometry the text is instantiated for (any bank's geometry: its `hidden_size`).
+    pub fn init(geometry: anytype) !Kernel {
         if (geometry.hidden_size != hidden) return error.MimoPrefillCombineGeometry;
         return .{ .k = try newKernel("mimo_prefill_combine", &input_names, texts.combine) };
     }
 
     /// P7 `inplace`: the text's table form, built once at construction (no device work: it compiles at its first
     /// dispatch; the byte-equality self-check is the pre-ship family `prefill_combine`).
-    pub fn initInplace(geometry: bank_mod.Geometry) !Kernel {
+    pub fn initInplace(geometry: anytype) !Kernel {
         if (geometry.hidden_size != hidden) return error.MimoPrefillCombineGeometry;
         return .{ .k_inplace = try newKernel("mimo_prefill_combine_inplace", &inplace_input_names, texts.combine_inplace) };
     }

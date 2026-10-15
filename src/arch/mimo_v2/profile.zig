@@ -26,9 +26,14 @@ pub fn reset() void {
 }
 /// SDK counters are cumulative; the caller supplies a settled phase delta.
 pub fn reportReadBytes(phase: []const u8, record_bytes: u64, read_bytes: u64) void {
+    reportReadBytesAs("MIMO", phase, record_bytes, read_bytes);
+}
+
+/// `reportReadBytes` under an arch's tag (`<tag>_PROFILE phase=...`: glm5_next's `GLM5_NEXT`).
+pub fn reportReadBytesAs(comptime tag: []const u8, phase: []const u8, record_bytes: u64, read_bytes: u64) void {
     if (comptime !enabled) return;
     if (calls == 0) return;
-    std.log.info("MIMO_PROFILE phase={s} calls={d} records={d} bytes={d} barrier_s={d:.6} route_s={d:.6} read_wait_s={d:.6} encode_s={d:.6} drain_s={d:.6} join_s={d:.6}", .{
+    std.log.info(tag ++ "_PROFILE phase={s} calls={d} records={d} bytes={d} barrier_s={d:.6} route_s={d:.6} read_wait_s={d:.6} encode_s={d:.6} drain_s={d:.6} join_s={d:.6}", .{
         phase,             calls,           read_bytes / record_bytes, read_bytes,
         seconds(.barrier), seconds(.route), seconds(.read_wait),       seconds(.encode),
         seconds(.drain),   seconds(.join),
