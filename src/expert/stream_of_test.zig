@@ -222,14 +222,9 @@ test "dsv41 bank contract: host slot rows of a bank of 4 records per routed id: 
     // Layer 0 has 3 persistent rows; layer 1 has none, so its misses take the transient rows.
     const s = try MinisOf.Stream.init(a, &bank, .{ .rows = &.{ 3, 0 }, .max_route_ids = 4, .transient_rows = 4, .records_per_part = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 } });
     defer s.deinit();
-    // A row is a segment of each of the 4 records, back to back: each component's bank is its rows times that, and a
-    // page at least (`arrayBytes`: whole rows past the page floor are never addressed).
+    // A row is a segment of each of the 4 records, back to back: each component's bank is its rows times that.
     for ([_]*const MinisOf.Rows{ &s.layers[0].base, &s.transient }) |rows| {
-        for (rows.backing.host.banks, geom.segments, 0..) |b, seg, c| {
-            const want = @max(rows.rows, std.math.divCeil(u64, std.heap.page_size_max, minis * seg.length) catch unreachable) * minis * seg.length;
-            try testing.expectEqual(want, b.len);
-            try testing.expectEqual(want, MinisOf.arrayBytes(&geom, c, rows.rows));
-        }
+        for (rows.backing.host.banks, geom.segments) |b, seg| try testing.expectEqual(rows.rows * minis * seg.length, b.len);
     }
     // Layer 0's three misses fill its rows 0, 1 and 2; layer 1's four take transient rows 0 to 3.
     const Case = struct { layer: u32, ids: []const u16, last: u32 };

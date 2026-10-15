@@ -208,6 +208,9 @@ pub const SDK = struct {
     pub const BankArrays = Module.BankArrays;
     pub const bankArraysOf = Module.bankArraysOf;
     pub const routed_top_k = Module.routed_top_k;
+    /// Every slot array one VM page at least (`StreamOf.slot_array_min_bytes`): the direct reads' 4 KiB block alignment
+    /// (a one-row ext of a 4 KiB rin / rout array was refused with DirectReadsRow).
+    pub const slot_array_min_bytes: u64 = std.heap.page_size_max;
 };
 
 /// The slot arrays the stream binds, checked once per bank at construction: the texts' shapes and dtypes.

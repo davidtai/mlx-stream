@@ -105,17 +105,24 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             return rowBytes(layer, c) != layer.segments[c].length * minisOf(layer);
         }
 
-        /// Every slot array holds at least this many bytes: one VM page (and a padded component's `slot_min_bytes`). Metal
-        /// gives no file-block-aligned `contents()` to a buffer under the page (MLX allocates it unrounded), and the direct
-        /// reads need every slot row on the 4 KiB block (`checkDirectRows`): a one-row ext of a 4 KiB component was refused.
-        pub const array_min_bytes: u64 = @max(slot_min_bytes, std.heap.page_size_max);
+        /// A bank's slot-array floor (a bank's `slot_array_min_bytes`, glm5_next's NVFP4 and EXL3 banks: one VM page):
+        /// every slot array of the bank holds at least this many bytes. Metal gives no file-block-aligned `contents()` to a
+        /// buffer under the page (MLX allocates it unrounded), and glm5_next's direct reads need every slot row on the 4 KiB
+        /// block (`checkDirectRows`): a one-row ext of a 4 KiB component was refused. 0 (every other bank: DeepSeek-V4.1,
+        /// MiMo, glm_moe_dsa): no floor, the arrays hold their rows exactly (a padded component's `slot_min_bytes` only).
+        pub const slot_array_min_bytes: u64 = if (@hasDecl(B, "slot_array_min_bytes")) B.slot_array_min_bytes else 0;
 
-        /// The slot rows component `c`'s array holds for `rows` slot rows: `rows`, and at least `array_min_bytes` of rows
+        /// The floor of component `c`'s array: the bank's `slot_array_min_bytes`, and a padded component's `slot_min_bytes`.
+        pub fn arrayMinBytes(layer: *const Layer, c: usize) u64 {
+            return if (padded(layer, c)) @max(slot_min_bytes, slot_array_min_bytes) else slot_array_min_bytes;
+        }
+
+        /// The slot rows component `c`'s array holds for `rows` slot rows: `rows`, and at least `arrayMinBytes` of rows
         /// (the rows past `rows` are never addressed).
         pub fn allocSlots(layer: *const Layer, c: usize, rows: u32) u32 {
             const n = rowBytes(layer, c);
             if (n == 0) return rows;
-            return @max(rows, @as(u32, @intCast(std.math.divCeil(u64, array_min_bytes, n) catch unreachable)));
+            return @max(rows, @as(u32, @intCast(std.math.divCeil(u64, arrayMinBytes(layer, c), n) catch unreachable)));
         }
 
         /// The rows of component `c`'s array (its shape's first dimension) for `rows` slot rows: `allocSlots` x minis.
@@ -151,7 +158,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             row_bytes: [n_components]u64,
             banks: [n_components][]u8,
 
-            /// Rows sized for `layer`'s segments; one page-aligned bank per component (`arrayBytes`: a page at least).
+            /// Rows sized for `layer`'s segments; one page-aligned bank per component (`arrayBytes`: the bank's floor at least).
             pub fn init(layer: *const Layer, rows: u32) !HostSlotRows {
                 var s: HostSlotRows = .{ .rows = rows, .row_bytes = undefined, .banks = undefined };
                 var n: usize = 0;

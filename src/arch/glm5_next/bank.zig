@@ -178,6 +178,8 @@ pub const SDK = struct {
     /// The stream's scale-line isolation (`StreamOf.slot_line_bytes` / `slot_min_bytes`).
     pub const slot_line_bytes = Module.scale_line_bytes;
     pub const slot_min_bytes = Module.scale_array_min_bytes;
+    /// Every slot array one VM page at least (`StreamOf.slot_array_min_bytes`): the direct reads' 4 KiB block alignment.
+    pub const slot_array_min_bytes: u64 = std.heap.page_size_max;
 };
 
 /// The record geometry of (hidden, inter) projections: no MLX, no file.
