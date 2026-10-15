@@ -12,6 +12,7 @@ const glm = @import("config.zig");
 const bank = @import("bank.zig");
 const graph = @import("graph.zig");
 const mtp = @import("mtp.zig");
+const settings = @import("settings.zig");
 const mimo_draft = @import("../mimo_v2/draft.zig");
 const testing = std.testing;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -997,5 +998,43 @@ test "glm5_next mtp coupled drafts: a sampled draft drawn from the head's q at t
     const rate_coupled = @as(f64, @floatFromInt(kept[1])) / @as(f64, @floatFromInt(drafted[1]));
     std.debug.print("GLM5N_MTP_COUPLED acceptance argmax={d:.3} coupled={d:.3}\n", .{ rate_argmax, rate_coupled });
     try testing.expect(rate_coupled > rate_argmax);
+    try noDevice();
+}
+
+test "glm5_next mtp acceptance setting: exact is today's rule; typical (delta 0.5) keeps more of a noisy head's drafts than exact on a synthetic (p, q) pair, its emitted tokens still drawn from the target" {
+    try testing.expectEqual(acc.Rule.exact, mtp.ruleOf(.exact, 0.3));
+    try testing.expectEqual(@as(f32, 0.5), mtp.ruleOf(.typical, settings.typical_delta).typical.delta);
+    var nb: [mtp.name_cap]u8 = undefined;
+    try testing.expectEqualStrings("glm5_next-mtp exact", mtp.nameOf(&nb, mtp.ruleOf(.exact, 0.7)));
+    for ([_]f32{ 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 }, [_][]const u8{ "glm5_next-mtp typical 0.2", "glm5_next-mtp typical 0.3", "glm5_next-mtp typical 0.4", "glm5_next-mtp typical 0.5", "glm5_next-mtp typical 0.6", "glm5_next-mtp typical 0.7", "glm5_next-mtp typical 0.8" }) |d, want| {
+        try testing.expectEqual(d, mtp.ruleOf(.typical, d).typical.delta);
+        try testing.expectEqualStrings(want, mtp.nameOf(&nb, mtp.ruleOf(.typical, d)));
+    }
+    const V = 64;
+    var row: [V]f32 = undefined;
+    var kept: [2]u64 = @splat(0);
+    for ([_]acc.Rule{ mtp.ruleOf(.exact, settings.typical_delta), mtp.ruleOf(.typical, settings.typical_delta) }, 0..) |rule, ri| for (0..16) |seed| {
+        const s: acc.Params = .{ .temperature = 1.0, .top_p = 0.95, .seed = 11 + seed };
+        var len: u64 = 1;
+        var t1: u32 = @intCast(seed % V);
+        while (len < 200) {
+            var drafts: [3]u32 = undefined;
+            var logits: [4 * V]f32 = undefined;
+            var prev = t1;
+            targetRow(t1, len + 1, logits[0..V]);
+            for (0..3) |i| {
+                draftRow(prev, len + 1 + i, &row);
+                drafts[i] = argmax(&row);
+                prev = drafts[i];
+                targetRow(prev, len + 2 + i, logits[(i + 1) * V ..][0..V]);
+            }
+            const r = acc.accept(rule, s, &logits, &drafts, null, len);
+            kept[ri] += r.n_accepted;
+            len += r.n_accepted + 1;
+            t1 = r.next_token;
+        }
+    };
+    std.debug.print("GLM5N_MTP_ACCEPTANCE kept exact={d} typical={d}\n", .{ kept[0], kept[1] });
+    try testing.expect(kept[1] >= kept[0]);
     try noDevice();
 }
