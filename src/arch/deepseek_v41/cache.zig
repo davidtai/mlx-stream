@@ -19,7 +19,6 @@ comptime {
 pub const Route = sdk_kv.Route;
 pub const Geometry = sdk_kv.Geometry;
 pub const boundedCompCap = sdk_kv.boundedCompCap;
-pub const boundedLatentCap = sdk_kv.boundedLatentCap;
 pub const Error = sdk_kv.Error;
 pub const Lanes = sdk_kv.Lanes;
 

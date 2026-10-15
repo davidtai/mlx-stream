@@ -33,10 +33,8 @@ const module = @import("module.zig");
 const gpu_ceiling = host_bridge.gpu_ceiling;
 const cell = @import("cell.zig");
 const arm_mod = @import("arm.zig");
-const expert_admission = @import("../../expert/admission.zig");
 const bill_mod = @import("bill.zig");
 const CellBill = bill_mod.Bill;
-const PhaseTerms = bill_mod.PhaseTerms;
 const PhaseMemory = bill_mod.PhaseMemory;
 const phaseMemory = bill_mod.phaseMemory;
 const printPhaseMemory = bill_mod.printPhaseMemory;
@@ -1971,7 +1969,6 @@ fn cellBool(comptime name: []const u8, v: []const u8) !bool {
 /// cache the step created by the end of construction (`phase_memory.checkPageCache`, shared with GLM-5.3's records),
 /// and the box's pages at the phase change. A guarded window's guard counts the whole box (other processes included),
 /// so these hold the harness's run to it.
-pub const page_cache_tolerance_bytes = @import("../../phase_memory.zig").page_cache_tolerance_bytes;
 pub const box_tolerance_bytes: u64 = 500_000_000;
 
 /// The load left no page cache to be aged into the guard's count later (v6c2: 15 GB of speculative pages from

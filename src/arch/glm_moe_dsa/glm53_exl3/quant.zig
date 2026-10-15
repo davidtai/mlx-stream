@@ -76,8 +76,6 @@ pub fn Accepted(comptime G: type) type {
         pub const max_decode_rows: u32 = routes.max_pairs;
         /// The decode lane hands each wave over once its segments landed (`fused`: sushi's decode chain).
         pub const fused_waves = true;
-        /// A decode slot's member pairs per GEMV (`decodeWave`'s gt).
-        pub const slot_members = routes.max_members;
         pub const top_k = routes.top_k;
         pub const combine_sources = routes.combine_sources;
         a: Allocator,

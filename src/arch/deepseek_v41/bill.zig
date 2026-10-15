@@ -6,7 +6,6 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const sdk_ext = @import("../../sdk_ext.zig");
-const mlx = @import("sdk").mlx;
 const settings = @import("settings.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("ops.zig");
@@ -206,7 +205,6 @@ pub fn wiredOf(t: PhaseTerms) u64 {
 }
 
 /// The page granule and the page tables of a phase's wired bytes (`phase_memory.wireTables`, shared with GLM-5.3's bill).
-pub const wire_page_bytes = phase_mem.wire_page_bytes;
 pub const wireTables = phase_mem.wireTables;
 
 /// The wiring overhead per live buffer if all of it were per buffer (measured): the largest

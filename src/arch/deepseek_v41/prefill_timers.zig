@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const bo = @import("../../build_flags.zig");
-const sdk = @import("sdk");
 const sdk_ext = @import("../../sdk_ext.zig");
 
 pub const enabled: bool = if (@hasDecl(bo, "dsv41_prefill_timers")) bo.dsv41_prefill_timers else false;

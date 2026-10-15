@@ -8,7 +8,6 @@
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const xk = @import("../../exl3/kernels.zig");
-const sdk = @import("sdk");
 const sdk_ext = @import("../../sdk_ext.zig");
 const selfcheck = @import("../../exl3/selfcheck.zig");
 const kr = sdk_ext.kernels.Routes(xk);
@@ -19,7 +18,6 @@ const Kernel = xk.Kernel;
 const Entry = xk.Entry;
 const Vars = xk.Vars;
 const LaunchConfig = xk.LaunchConfig;
-const TemplateArg = xk.TemplateArg;
 const Dtype = mlx.mlx_dtype;
 const Refusal = kr.Refusal;
 const refuse = kr.refuse;
@@ -1247,7 +1245,6 @@ pub fn JoinlessCombine(comptime G: type) type {
 const testing = std.testing;
 const kt = sdk_ext.kernels.Trace(xk);
 const Trace = kt.Trace;
-const TracePerCall = kt.TracePerCall;
 const testRegistry = kt.testRegistry;
 const expectLaunch = kt.expectLaunch;
 const expectPreparedDecode = kt.expectPreparedDecode;

@@ -51,7 +51,7 @@ pub const PrefillBill = struct {
     /// calibration) and the served tier's (`served_prefill_cache_bytes`, the limit the module sets); `cacheBytes`.
     cache_bytes: u64,
     served_cache_bytes: u64 = 0,
-    /// K16's kept state (`layerMajorBytes`): the hidden width, hc copies, routed top-k, the DSpark
+    /// K16's kept state (`layerMajorWaveBytes`): the hidden width, hc copies, routed top-k, the DSpark
     /// target taps, the indexer's top-k.
     hidden: u64 = 0,
     hc: u64 = 0,
@@ -618,17 +618,6 @@ pub const PrefillBill = struct {
         return sdk_ext.kv.planBytes(b.kvPlan(positions, &buf), .decode, b.chunkRows(seq), seq, b.ring_geo);
     }
 
-    /// `bytes` for a K16 request: the layer-major wave and the wide lane's transient in place of the
-    /// chunk-major wave.
-    pub fn layerMajorBytes(b: PrefillBill, seq: u64, max_tokens: u64, tier: Tier) u64 {
-        const positions = seq + max_tokens + 8;
-        const kv = switch (tier) {
-            .stock => positions * b.kv_pos_bytes,
-            .served => b.kvPromptBytes(seq, positions),
-        };
-        const head = if (tier == .stock) b.head_promotion_bytes else 0;
-        return b.layerMajorBilledBytes(seq, tier) + kv + head + b.cacheBytes(tier);
-    }
 
     /// A request of `seq` prompt tokens and up to `max_tokens` more: its KV, its widest chunk's wave (bounded by
     /// a full chunk reading every prompt position), the stock head's promotion at the logits, the allocator cache.
@@ -688,8 +677,6 @@ test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-
     try std.testing.expect(billed >= measured and billed - measured < 400_000_000 + 2 * 16384 * 16384 + 16384 * 256);
     // What it replaces: the x 5/4 pad, 1.59 GB more at 16K.
     try std.testing.expectEqual(@as(u64, 1_588_543_488 + (2 * 16384 * 16384 + 16384 * 256) / 4), wave / 4 * 5 - billed);
-    // The per-request bill (the server's admission) carries the same transient.
-    try std.testing.expectEqual(billed, b.layerMajorBytes(16384, 1024, .served));
     // JOINLESS's minimal-copy merge (58d9fb1): the joined input is at most 28 / 51 of the routed rows, 1.11 GB of
     // the 2.01 GB join, so the routed group's outputs and joined input fall from 4.03 to 3.12 GB. Served run 14 measured
     // the prompt's transient at 12.40 GB with the merge (13.46 GB before it).
@@ -1582,7 +1569,7 @@ pub const WeightMap = struct {
     }
 };
 
-/// After mlx-serve's loader (`model.loadWeights`: lazy arrays, nothing read):
+/// After mlx-serve's loader (`model.loadWeightsOpt`: lazy arrays, nothing read):
 /// every spec parameter is a handle with the dtype and shape the headers
 /// declared. Reads array metadata only, but the arrays exist, so this runs
 /// where MLX may run.

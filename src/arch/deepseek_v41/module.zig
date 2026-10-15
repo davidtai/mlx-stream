@@ -50,7 +50,6 @@ const G = ops.MlxOps;
 pub const Sampler = @import("../../sdk_ext.zig").sampler.SamplerOf(G);
 const expert_stream = @import("../../expert/stream.zig");
 const expert_event = sdk_ext.expert.event;
-const expert_io = sdk_ext.expert.io;
 const expert_bank = @import("../../expert/bank.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
 // The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
@@ -375,7 +374,6 @@ pub fn multiturnRoute(ov: RouteOverrides) bool {
     return ov.bill_pinned_prompt == null;
 }
 
-/// A0 (a)'s route the Module installs: the capture and the warm class together (off by default).
 /// DEVROUTE as the hook binds it (`devroute`): the override, else stack4's default.
 pub fn devRoute(ov: RouteOverrides, stack4: bool) bool {
     return ov.devroute orelse stack4;
@@ -1844,18 +1842,13 @@ pub const Module = struct {
     }
 };
 
-/// Whether `v41.PrefillBill` bills the layer-major pass (`layerMajorBytes`: one chunk's attention
-/// side and the routed group's sub-wave per layer, the server's per-request admission reads it).
-pub const layer_major_billed = true;
-
 /// The `layer_major_prefill` setting, checked before anything is built. K16 batches each layer's
 /// routed call across chunks (the wide lane): the stock tier's prompt forwards are decode-width.
-pub fn layerMajor(config: *const settings.Config) error{ LayerMajorOnStockTier, LayerMajorNotBilled, ReadAheadNeedsLayerMajor }!bool {
+pub fn layerMajor(config: *const settings.Config) error{ LayerMajorOnStockTier, ReadAheadNeedsLayerMajor }!bool {
     // P1's predictor pass is the layer-major prompt pass's (a chunk-major one has no layer top to read ahead from).
     if (config.dsv41WideReadAhead() and (!config.dsv41LayerMajor() or !config.dsv41WideSeed())) return error.ReadAheadNeedsLayerMajor;
     if (!config.dsv41LayerMajor()) return false;
     if ((config.numeric_tier orelse .served) == .stock) return error.LayerMajorOnStockTier;
-    if (!layer_major_billed) return error.LayerMajorNotBilled;
     return true;
 }
 
@@ -2221,10 +2214,6 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
     };
 }
 
-/// The fill's shape and target (the bill module's), re-exported for the module's callers.
-pub const FillBill = bill_mod.FillBill;
-pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
-
 /// A request's prompt against the billed context (`Module.max_context`): longer is refused by name, once, before its pass.
 /// A `ctx_size` above the model's own limit (1,048,576: `max_position_embeddings`), refused by name before anything
 /// loads (`ctx_size_over_limit`): never silently the standard 16,384.
@@ -2281,8 +2270,6 @@ test "dsv41 module: a prompt over the billed context is refused before its pass,
     try checkContext(16384, 16384, 16384);
     try std.testing.expectError(error.ContextNotPinned, checkContext(3953, 16384, 16384));
 }
-pub const fill_max_tokens = bill_mod.fill_max_tokens;
-pub const min_fill_rows = bill_mod.min_fill_rows;
 
 /// What a Module's builder states once from the host's load: the GPU memory ceiling and the wired margin the fill's
 /// target stays under, and the host's loaders (the Engram sidecar). The served load passes `sdk.LoadCtx.ceiling`,

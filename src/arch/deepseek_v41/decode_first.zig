@@ -171,14 +171,6 @@ pub fn call(layer: u32, barrier_ns: u64, route_ns: u64, moe_ns: u64, ids: []cons
     if (w == 0) tails[layer] = .{ .size = tail[layer].count(), .reads = tail_reads, .hits = m.intersectWith(tail[layer]).count() };
 }
 
-/// The distinct routed experts a call missed: `waves[i]` > 0 when routed id i reads from a miss part.
-pub fn missedOf(ids: []const u16, waves: []const u8) u64 {
-    var m: std.StaticBitSet(max_experts) = .empty;
-    for (ids, waves) |e, w| {
-        if (w > 0 and e < max_experts) m.set(e);
-    }
-    return m.count();
-}
 
 /// A registry kernel dispatched (`Bound.applyPrepared`, through the observer the kernel set installs from the
 /// backend's profile hook): its variant counted in the phase that first dispatches it.
@@ -313,7 +305,6 @@ test "dsv41 decode first: a variant or signature counts once, in the phase that 
     try std.testing.expectEqual([4]u32{ 1, 1, 2, 1 }, new_per_phase);
     try std.testing.expectEqual(@as(usize, 2), n_cycle1_new);
     try std.testing.expectEqualStrings("c", cycle1_new[0].what);
-    try std.testing.expectEqual(@as(u64, 2), missedOf(&.{ 3, 3, 7, 9 }, &.{ 1, 1, 0, 2 }));
     // past the first cycle a call counts with the warm ones
     call(2, 5_000_000, 1_000_000, 2_000_000, &.{ 3, 3, 7, 9 }, &.{ 1, 1, 0, 2 }, 0, 0);
     try std.testing.expectEqual(@as(u64, 0), layers[0][2].calls);
