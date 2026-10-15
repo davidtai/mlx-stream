@@ -8,8 +8,8 @@
 //! mHC hcPre chain, the router and top-8 texts, the combine with the shared expert's add, glue.zig; `ops`, the stock op
 //! chains, the control); `decode_kda` the decode lane's KDA layer (`fused`, the default: one text a layer, kda_decode.zig;
 //! `ops`, the op chain, the control); `kda_prologue` the KDA prompt pass's prologue (`fused`, the default: one text a span,
-//! kda_prologue.zig, exact; `ops`, the op chain, the control); `kda_verify` the MTP verify's KDA layer (`chain`, the
-//! default: the op chain with the stock capture recurrence, the control; `fused`, one exact text a layer, kda_verify.zig;
+//! kda_prologue.zig, exact; `ops`, the op chain, the control); `kda_verify` the MTP verify's KDA layer (`fused`, the
+//! default: one exact text a layer, kda_verify.zig; `chain`, the op chain with the stock capture recurrence, the control;
 //! with `mtp_lane` only); `decode_dsa` the decode lane's sparse latent attention (`fused`, the default: two
 //! texts, dsa_decode.zig; `ops`, the op chain, the control); `decode_predict` the lookahead predictor's router weight
 //! (`bf16`, the default: the stored BF16 weight; `f32`, the transposed F32 copy, the control); `decode_swiglu` the decode lane's MLP activation
@@ -24,11 +24,10 @@
 //! `seam` by name: lane B's chain, the control).
 //! `fuse_kda_inputs`, `fuse_gate_up`, `fuse_predictor`, `fuse_join` and `merge_gate_waits` are the decode trunk's
 //! launch-fusion switches (`Fusion`: `on`, the default, or `off`, the control), each an exact construction-time route.
-//! `miss_reads` routes the expert stream's demand reads (`MissReads`: `staged`, through the read pool's staging and a copy;
-//! `direct`, straight into the slot rows).
-//! `dsa_select` a verify window's DSA indexer
-//! selection (`per_row`, the default: one scores and one top-k launch per row; `batched`: one of each for all the rows;
-//! exact, ops.zig `SelectRoute`). `draft_head` is the
+//! `miss_reads` routes the expert stream's demand reads (`MissReads`: `direct`, the default, straight into the slot rows;
+//! `staged`, the control, through the read pool's staging and a copy; the default resolves to `staged` on the NVFP4
+//! family). `dsa_select` a verify window's DSA indexer selection (`batched`, the default: one scores and one top-k launch
+//! for all the rows; `per_row`, the control: one of each per row; exact, ops.zig `SelectRoute`). `draft_head` is the
 //! MTP lane's draft head (`DraftHead`: `bf16`, the default and the control, the trunk's lm_head and the full-vocab filter
 //! on every draft step; `q4` / `q8`, a 4- / 8-bit copy of lm_head built once at the lane's open and a bounded draft
 //! filter; needs `mtp_lane`). `dsa_split_form` the fused DSA decode's split text (`DsaSplitForm`: `lean`, the default:
@@ -253,10 +252,11 @@ pub const Fusion = enum { off, on };
 pub const FusionNamed = struct { fuse_kda_inputs: bool = false, fuse_gate_up: bool = false, fuse_predictor: bool = false, fuse_join: bool = false, merge_gate_waits: bool = false };
 /// The launch-fusion routes a construction installs (`Config.fusionRoutes`).
 pub const FusionRoutes = struct { kda_inputs: bool, gate_up: bool, predictor: bool, join: bool, merge_waits: bool };
-/// The expert stream's demand (miss) reads, installed once at construction (`miss_reads`): `staged` (the default, the
-/// control) preadv each record's gate/up and down ranges into a worker's staging buffer, then one thread copies them into
-/// the slot rows; `direct` preadv them straight into the slot rows (one iovec per segment, no staging, no copy; the
-/// read-wait audit's lever 3: the 0.19 ms copy tail of each demand layer) with the decode pre-read off (a pre-range starts
+/// The expert stream's demand (miss) reads, installed once at construction (`miss_reads`): `staged` (the control, and
+/// the default on the NVFP4 family, `Config.missReadsRoute`) preadv each record's gate/up and down ranges into a
+/// worker's staging buffer, then one thread copies them into the slot rows; `direct` (the default) preadv them straight
+/// into the slot rows (one iovec per segment, no staging, no copy; the read-wait audit's lever 3: the 0.19 ms copy tail
+/// of each demand layer) with the decode pre-read off (a pre-range starts
 /// before its plan names rows, so it stages). The same file bytes land in the same rows: exact. `direct` is admitted only
 /// when the stream proves at construction that every record range and slot row is aligned to the file's block
 /// (stream.zig `checkDirectReads` / `checkDirectRows`; EXL3 K=3: 4 KiB records and segments on APFS's 4 KiB block),
