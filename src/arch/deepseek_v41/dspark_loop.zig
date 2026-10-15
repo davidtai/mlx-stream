@@ -402,9 +402,9 @@ pub fn Loop(comptime G: type) type {
             return .{ .tt = tt, .typical = typical, .width = width, .drafted = drafted };
         }
 
-        /// A sampled request's decision (`acc.sampledRows`, the host's `acc.specStep`): the drafted
-        /// rows' acceptance flags (u < p(draft)) and every row's token: a drafted row's residual draw (its correction
-        /// when it rejects), the first undrafted row's draw from p (the bonus). The verify's eval realises it; the
+        /// A sampled request's decision (`acc.sampledRows`, the host's `acc.specStep`, sample-then-verify): every row's
+        /// token is p's position-keyed draw (the serial step's token there), a drafted row accepted when its draft is
+        /// that token. The verify's eval realises it; the
         /// flags take the typical flags' place in `acceptChunk`, the tokens the argmax rows'.
         fn decideSampled(self: *Self, row2: T, drafts: []const u32, rows: [2]u32, k_eff: u32, base: u64, sm: acc.Params) !Decision {
             const g = self.g;
@@ -3053,12 +3053,14 @@ test "dsv41 acceptance characterization: the host reference's decisions (exact, 
     }
     var hd = std.hash.Wyhash.init(0);
     hd.update(std.mem.sliceAsBytes(&got));
-    // Frozen on 2504f2b5 (the pre-refactor lane): the decisions of all 288 rounds and the sampled rows' bits.
-    try testing.expectEqual(@as(u64, 0x46f527b6c0a2deb2), hd.final());
+    // Frozen on 2504f2b5 (the pre-refactor lane): the sampled rows' bits (unchanged). The decisions re-frozen at the one
+    // sampler (sampling/unified-stream: sample-then-verify on sampled requests; greedy rounds as on 2504f2b5).
+    try testing.expectEqual(@as(u64, 0x4fbe5f2958d6b895), hd.final());
     try testing.expectEqual(@as(u64, 0x90456622b2108d8e), h.final());
     // Accepted drafts over the 24 sets, by rule (exact, typical 0.5, typical 0.3) and request (greedy, T 0.005, T 0.8,
-    // T 0.7 with the filters): typical accepts more as delta falls; a sampled request ignores the tier's rule.
-    const want_acc = [char_rules.len][char_requests.len]u32{ .{ 9, 9, 5, 9 }, .{ 11, 11, 5, 9 }, .{ 14, 14, 5, 9 } };
+    // T 0.7 with the filters): typical accepts more as delta falls; a sampled request ignores the tier's rule (a draft
+    // kept when it is the row's draw: 7 at T 0.8, 9 at T 0.7; 5 and 9 under the residual rule on 2504f2b5).
+    const want_acc = [char_rules.len][char_requests.len]u32{ .{ 9, 9, 7, 9 }, .{ 11, 11, 7, 9 }, .{ 14, 14, 7, 9 } };
     for (char_rules, 0..) |_, ri| for (char_requests, 0..) |_, qi| {
         var n_acc: u32 = 0;
         for (got[ri][qi]) |x| n_acc += x[0];
@@ -3107,12 +3109,13 @@ fn charTrace(a: std.mem.Allocator, rule: acc.Rule, sampling: ?acc.Params, use_ro
 
 test "dsv41 acceptance characterization: the lane's traced rounds (exact, typical 0.5 / 0.3; greedy and seeded sampled requests)" {
     const a = testing.allocator;
-    // Frozen on 2504f2b5. The trace keeps no scalar values (delta enters the graph as one): typical 0.5 and 0.3 trace
-    // alike; the host reference above separates them.
+    // Frozen on 2504f2b5; the sampled columns re-frozen at the one sampler (sample-then-verify's graph). The trace keeps
+    // no scalar values (delta enters the graph as one): typical 0.5 and 0.3 trace alike; the host reference above
+    // separates them.
     const want = [char_rules.len][char_requests.len]u64{
-        .{ 0xa96a55094f88cb75, 0xa96a55094f88cb75, 0xcf768b59fdf11ca2, 0x836171339f9f4d76 },
-        .{ 0x5a68c655006d7b69, 0x5a68c655006d7b69, 0xcf768b59fdf11ca2, 0x836171339f9f4d76 },
-        .{ 0x5a68c655006d7b69, 0x5a68c655006d7b69, 0xcf768b59fdf11ca2, 0x836171339f9f4d76 },
+        .{ 0xa96a55094f88cb75, 0xa96a55094f88cb75, 0xf4af8063a9a404dc, 0x714a46a61b0c3cac },
+        .{ 0x5a68c655006d7b69, 0x5a68c655006d7b69, 0xf4af8063a9a404dc, 0x714a46a61b0c3cac },
+        .{ 0x5a68c655006d7b69, 0x5a68c655006d7b69, 0xf4af8063a9a404dc, 0x714a46a61b0c3cac },
     };
     for (char_rules, 0..) |rule, ri| for (char_requests, 0..) |req, qi| {
         try testing.expectEqual(want[ri][qi], try charTrace(a, rule, req, req == null));

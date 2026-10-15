@@ -36,7 +36,7 @@ pub const NgramTable = struct {
     row_gather: ?*io_util.RowGather = null,
 
     /// `gatherRaw`'s readers: 15 helpers and the caller; pieces of 1,024 ids; the caller alone below 32 ids (a decode
-    /// or verify block). Built once per table (`RowGather.persistentBytes`: the bill's named term).
+    /// or verify block). Built once per table.
     pub const raw_gather_helpers: usize = 15;
     pub const raw_gather_max_ids: usize = 1024;
     pub const raw_gather_parallel_min: usize = 32;

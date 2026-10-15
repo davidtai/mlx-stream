@@ -18,6 +18,8 @@
 //! rounding-class alternative the m4attr family times; no route binds it (the routed plan is FMA 0 by comptime check).
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const ops = @import("../deepseek_v41/ops.zig");
 const quant = @import("../../sdk_ext.zig").quant;
 const bank_mod = @import("bank.zig");
@@ -39,7 +41,7 @@ pub const Route = enum { fused, stock, hitpass };
 /// name in `validate`).
 pub const KernelFamily = enum { banked, k1, invalid };
 
-/// MiMo's routed geometry the texts are instantiated for (validated once, `Fused.init`).
+/// MiMo's routed geometry the texts are instantiated for (validated once, `Fused.initTexts`).
 pub const hidden: u32 = 4096;
 pub const inter: u32 = 2048;
 pub const top_k: u32 = 8;
@@ -177,11 +179,7 @@ pub const Fused = struct {
 
     /// Construction boundary: the slot geometry the texts are instantiated for, and every bank's rows addressable by
     /// a packed id. No device work (the texts compile at their first dispatch; the self-check is the pre-ship gate).
-    pub fn init(geometry: bank_mod.Geometry, widest_bank_rows: u32) !Fused {
-        return initTexts(geometry, widest_bank_rows, .@"union");
-    }
-
-    /// K1: the fused route's texts of a kernel family (`settings.Config.decode_moe_kernel`): `.banked` is `init`'s,
+    /// K1: the fused route's texts of a kernel family (`settings.Config.decode_moe_kernel`): `.banked` the union texts,
     /// `.k1` the k1 texts at every width; `.invalid` is refused by name.
     pub fn initFamily(geometry: bank_mod.Geometry, widest_bank_rows: u32, family: KernelFamily) !Fused {
         return switch (family) {
@@ -249,7 +247,7 @@ pub const Fused = struct {
 
     pub fn deinit(self: *Fused) void {
         for ([_]mlx.mlx_fast_metal_kernel{ self.k_gate_up_pair, self.k_down_pair, self.k_gate_up_union, self.k_down_union, self.k_gate_up_k1, self.k_down_k1, self.k_combine }) |k| if (k.ctx != null) {
-            _ = mlx.mlx_fast_metal_kernel_free(k);
+            _ = mtl.mlx_fast_metal_kernel_free(k);
         };
         for (self.gate_up_cfg, self.down_cfg) |c, d| for ([_]mlx.mlx_fast_metal_kernel_config{ c, d }) |x| if (x.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(x);
@@ -303,7 +301,7 @@ fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, source: [*:0]cons
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
+    const k = mtl.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
     if (k.ctx == null) return error.MimoFusedMoeKernel;
     return k;
 }
@@ -327,7 +325,7 @@ fn apply(g: *ops.MlxOps, kernel: mlx.mlx_fast_metal_kernel, inputs: []const T, c
     defer _ = mlx.mlx_vector_array_free(in);
     var outputs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel, in, cfg, g.s));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&outputs, kernel, in, cfg, g.s));
     var out = mlx.mlx_array_new();
     mlx.check(mlx.mlx_vector_array_get(&out, outputs, 0)) catch |e| {
         _ = mlx.mlx_array_free(out);
@@ -649,9 +647,9 @@ test "mimo moe slot ids: the texts resolve the scheduler's packed ids to (bank, 
     try testing.expect(std.mem.indexOf(u8, texts.down, "b == 0u ? d0 : (b == 1u ? d1 : d2)") != null);
     // Construction refuses geometry the texts are not instantiated for, and banks a packed id cannot address.
     const mimo = try bank_mod.Geometry.init(4096, 2048, 256, 1, 47);
-    try testing.expectError(error.MimoFusedMoeGeometry, Fused.init(try bank_mod.Geometry.init(64, 64, 64, 1, 1), 8));
-    try testing.expectError(error.MimoFusedMoeSlotRows, Fused.init(mimo, 1 << 24));
-    try testing.expectError(error.MimoFusedMoeSlotRows, Fused.init(mimo, 0));
+    try testing.expectError(error.MimoFusedMoeGeometry, Fused.initFamily(try bank_mod.Geometry.init(64, 64, 64, 1, 1), 8, .banked));
+    try testing.expectError(error.MimoFusedMoeSlotRows, Fused.initFamily(mimo, 1 << 24, .banked));
+    try testing.expectError(error.MimoFusedMoeSlotRows, Fused.initFamily(mimo, 0, .banked));
 }
 
 /// The union texts' leader rule (`mimo_union_members`, header_mimo_moe_union.metal) on the host: pair `e` of a wave
@@ -1212,7 +1210,7 @@ test "mimo moe GPU: fused banked gate/up + down + combine vs the stock gather_qm
     var g = try ops.MlxOps.init(a, stream);
     defer g.deinit();
     const geometry = try bank_mod.Geometry.init(hidden, inter, 256, 1, 47);
-    var fused = try Fused.init(geometry, selfcheck_slots);
+    var fused = try Fused.initFamily(geometry, selfcheck_slots, .banked);
     defer fused.deinit();
     // M4 lever 1: the banked (per-pair) texts, the union texts' bitwise reference.
     var pair = try Fused.initTexts(geometry, selfcheck_slots, .pair);

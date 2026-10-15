@@ -1,0 +1,226 @@
+{
+  "stacks": {
+    "g25b": {
+      "label": "g25b (exact)",
+      "plugin_branch": "glm5next/exl3-k3-stack3",
+      "plugin_commit": "f8465ad",
+      "host_commit": "a8f6c6b8",
+      "binary_sha256": "3514568e20cb4d3bc4cf9b0e2fae88c4df988d2201baf09cdf0c53a11df1e2a5",
+      "class": "exact",
+      "draft_head": "bf16"
+    },
+    "g26": {
+      "label": "g26 (q8 draft head, rounding-class)",
+      "plugin_branch": "glm5next/exl3-k3-stack4",
+      "plugin_commit": "9bf67a7",
+      "host_commit": "a8f6c6b8",
+      "binary_sha256": "087434fea796de167a3aec630aeead7eb1b40d5b771eee9e922ff68d183896a9",
+      "class": "rounding-class",
+      "draft_head": "q8"
+    },
+    "g25-dsa": {
+      "label": "g25-dsa (exact, DSA lane fix)",
+      "plugin_branch": "glm5next/exl3-k3-stack3-dsalane",
+      "plugin_commit": "88d2aad",
+      "host_commit": "a8f6c6b8",
+      "binary_sha256": "5bbd85123c7b83fdb0d9a93aed4c49a3c6bcd2ea9c2724c7117f669564e0d9a9",
+      "class": "exact",
+      "draft_head": "bf16"
+    },
+    "g26-dsa3": {
+      "label": "g26-dsa3 (q8 draft head + DSA lane fixes, rounding-class)",
+      "plugin_branch": "glm5next/exl3-k3-dsalane",
+      "plugin_commit": "cf30601",
+      "host_commit": "a8f6c6b8",
+      "binary_sha256": "de1ab1f6bdd65ce60e84e4ca3aee84fb6e5ffe9a9641e1a32dce2096cc7ca3ff",
+      "class": "rounding-class",
+      "draft_head": "q8"
+    },
+    "g25-dsa3": {
+      "label": "g25-dsa3 (exact stack of record)",
+      "plugin_branch": "glm5next/exl3-k3-stack3-dsalane",
+      "plugin_commit": "0457394",
+      "host_commit": "a8f6c6b8",
+      "binary_sha256": "6481fa1b07932a2aa215895b2431f611908975e22d612c4e903181fe41067ba5",
+      "class": "exact",
+      "draft_head": "bf16"
+    }
+  },
+  "ladders": {
+    "g25b": [
+      {
+        "prompt_rows": 190,
+        "decode_rows": 217,
+        "decode_tok_s": 32.8,
+        "prefill_tok_s": 1093.3,
+        "peak_gb": 104.2,
+        "admit_to_gb": 12.69,
+        "arms": 2,
+        "source": "pairs/g25-rows-193-219 arms 01-A/04-A (batch 38, 20:18-20:31Z); prefill from pairs/g24bin-vs-g25 B arms (batch 36, 19:29-19:42Z)"
+      },
+      {
+        "prompt_rows": 193,
+        "decode_rows": 219,
+        "decode_tok_s": 33.15,
+        "prefill_tok_s": 1089.0,
+        "peak_gb": 104.99,
+        "admit_to_gb": 11.69,
+        "arms": 2,
+        "source": "pairs/g25-rows-193-219 arms 02-B/03-B (batch 38, VALID beyond +1.07 %)"
+      },
+      {
+        "prompt_rows": 195,
+        "decode_rows": 221,
+        "decode_tok_s": 33.35,
+        "prefill_tok_s": 1091.0,
+        "peak_gb": 105.79,
+        "admit_to_gb": 10.89,
+        "arms": 2,
+        "source": "pairs/g25-rows-195-221 arms 02-B/03-B (batch 38, VALID beyond +1.83 %)"
+      },
+      {
+        "prompt_rows": 199,
+        "decode_rows": 225,
+        "decode_tok_s": 33.8,
+        "prefill_tok_s": 1083.7,
+        "peak_gb": 107.38,
+        "admit_to_gb": 9.3,
+        "arms": 1,
+        "ttft_s": 15.12,
+        "source": "cells/glm5next-headline-g25b-199-225-20261014 (batch 40, first-step single cell, OVERFILL flagged)"
+      }
+    ],
+    "g26": [
+      {
+        "prompt_rows": 190,
+        "decode_rows": 217,
+        "decode_tok_s": 34.55,
+        "prefill_tok_s": 1092.8,
+        "peak_gb": 104.87,
+        "admit_to_gb": 12.01,
+        "arms": 2,
+        "source": "pairs/g26-rows-193-219 arms 01-A/04-A (batch 39, 20:46-20:59Z); prefill from pairs/g25bin-vs-g26 B arms (batch 37, 20:03-20:16Z)"
+      },
+      {
+        "prompt_rows": 193,
+        "decode_rows": 219,
+        "decode_tok_s": 34.85,
+        "prefill_tok_s": 1092.0,
+        "peak_gb": 105.67,
+        "admit_to_gb": 11.01,
+        "arms": 2,
+        "source": "pairs/g26-rows-193-219 arms 02-B/03-B (batch 39, VALID beyond +0.87 %)"
+      },
+      {
+        "prompt_rows": 195,
+        "decode_rows": 221,
+        "decode_tok_s": 35.05,
+        "prefill_tok_s": 1092.0,
+        "peak_gb": 106.54,
+        "admit_to_gb": 10.22,
+        "arms": 2,
+        "source": "pairs/g26-rows-195-221 arms 02-B/03-B (batch 39, VALID beyond +1.74 %)"
+      },
+      {
+        "prompt_rows": 199,
+        "decode_rows": 225,
+        "decode_tok_s": 35.6,
+        "prefill_tok_s": 1085.9,
+        "peak_gb": 108.05,
+        "admit_to_gb": 8.62,
+        "arms": 1,
+        "ttft_s": 15.09,
+        "source": "cells/glm5next-headline-g26-199-225-20261014 (batch 41, first-step single cell, OVERFILL flagged)"
+      }
+    ],
+    "g25-dsa": [
+      {
+        "prompt_rows": 190,
+        "decode_rows": 217,
+        "decode_tok_s": 33.15,
+        "prefill_tok_s": 1093.5,
+        "peak_gb": 104.21,
+        "admit_to_gb": 12.69,
+        "arms": 2,
+        "source": "pairs/g25bin-vs-g25dsa arms 02-B/03-B (batch 48, 00:04-00:17Z 10-15, VALID beyond +0.91 %)"
+      },
+      {
+        "prompt_rows": 199,
+        "decode_rows": 225,
+        "decode_tok_s": 34.1,
+        "prefill_tok_s": 1084.3,
+        "peak_gb": 107.4,
+        "admit_to_gb": 9.3,
+        "arms": 1,
+        "ttft_s": 15.11,
+        "source": "cells/glm5next-headline-g25dsa-199-225-20261014 (batch 49, first-step single cell, OVERFILL flagged)"
+      }
+    ],
+    "g26-dsa3": [
+      {
+        "prompt_rows": 190,
+        "decode_rows": 217,
+        "decode_tok_s": 34.95,
+        "prefill_tok_s": 1093.0,
+        "peak_gb": 104.88,
+        "admit_to_gb": 12.01,
+        "arms": 2,
+        "source": "pairs/g26bin-vs-dsa3 arms 02-B/03-B (batch 50, 00:22-00:35Z 10-15, VALID beyond +2.79 %)"
+      },
+      {
+        "prompt_rows": 197,
+        "decode_rows": 223,
+        "decode_tok_s": 35.7,
+        "prefill_tok_s": 1085.4,
+        "peak_gb": 107.28,
+        "admit_to_gb": 9.42,
+        "arms": 1,
+        "ttft_s": 15.09,
+        "source": "cells/glm5next-headline-g26dsa3-199-225-20261015 run dir g26dsa3-197-223 (batch 52, clean-wait first-step single cell, OVERFILL flagged)"
+      },
+      {
+        "prompt_rows": 199,
+        "decode_rows": 225,
+        "decode_tok_s": 36.3,
+        "prefill_tok_s": 1086.0,
+        "peak_gb": 108.07,
+        "admit_to_gb": 8.62,
+        "arms": 1,
+        "ttft_s": 15.08,
+        "source": "cells/glm5next-headline-g26dsa3-199-225-20261015 run dir g26dsa3-199-225 (batch 54b, clean-wait first-step single cell: 7.52 GB after the pulse, gate ADMIT at 7.86; OVERFILL 1.65 GB at load)"
+      }
+    ],
+    "g25-dsa3": [
+      {
+        "prompt_rows": 199,
+        "decode_rows": 225,
+        "decode_tok_s": 34.5,
+        "prefill_tok_s": 1077.1,
+        "peak_gb": 107.4,
+        "admit_to_gb": 9.3,
+        "arms": 1,
+        "ttft_s": 15.21,
+        "source": "cells/glm5next-headline-g25dsa3-199-225-20261015 (batch 53, clean-wait first-step single cell: 7.75 GB after the pulse, gate ADMIT at 8.19; OVERFILL 1.17 GB at load)"
+      }
+    ]
+  },
+  "request": {
+    "prompt_tokens": 16381,
+    "max_tokens": 1024,
+    "ctx_size": 32768,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "seed": 1,
+    "thinking": "on",
+    "kv": "bf16",
+    "mtp": {
+      "mtp_lane": true,
+      "draft_depth": 3,
+      "draft_gate": 0.5
+    },
+    "server_env": {
+      "MLX_SERVE_GPU_CEILING_MB": "114688"
+    },
+    "server_flags": "serve --model <pack> --host 127.0.0.1 --port 8081 --ctx-size 32768 --timeout 0 --no-vision --no-warmup-eager --prefix-cache-entries 0 --metrics --log-file off --kv-quant off --wired-margin-gib 2"
+  }
+}

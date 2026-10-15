@@ -107,9 +107,6 @@ pub const ev = struct {
     pub fn dsv41ev_create_host(_: *i64, _: i64) i32 {
         return -1;
     }
-    pub fn dsv41ev_create_null() i32 {
-        return -1;
-    }
     pub fn dsv41ev_wait(_: [*]const mlx.mlx_array, _: usize, _: i32, _: u64, _: ?[*]const mlx.mlx_array, _: usize, _: bool, _: mlx.mlx_stream, _: [*]mlx.mlx_array) c_int {
         return -1;
     }

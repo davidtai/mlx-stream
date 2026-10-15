@@ -22,10 +22,7 @@
 //! calling it from another thread.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
-const sdk_ext = @import("../../sdk_ext.zig");
 const v41 = @import("deepseek_v41.zig");
 const ops = @import("ops.zig");
 const xp = @import("experts.zig");

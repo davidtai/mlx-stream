@@ -11,6 +11,8 @@
 //! path checks eligibility or falls back. The span rule (`attentionSpanRows`, design §4) is read by module and bill.
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const mimo = @import("config.zig");
 const Array = mlx.mlx_array;
 const Stream = mlx.mlx_stream;
@@ -191,7 +193,7 @@ pub const Kernel = struct {
         const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(out_vec);
         // Q/K/V are read through their strides (cache views, transposed projections): ensure_row_contiguous = false.
-        var self: Kernel = .{ .k = mlx.mlx_fast_metal_kernel_new("msv_nax_attn_192_128", in_vec, out_vec, source_text, header_text, false, false) };
+        var self: Kernel = .{ .k = mtl.mlx_fast_metal_kernel_new("msv_nax_attn_192_128", in_vec, out_vec, source_text, header_text, false, false) };
         if (self.k.ctx == null) return error.MimoNaxAttentionKernel;
         errdefer self.deinit();
         const zero = [_]f32{0};
@@ -205,7 +207,7 @@ pub const Kernel = struct {
     }
 
     pub fn deinit(self: *Kernel) void {
-        if (self.k.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(self.k);
+        if (self.k.ctx != null) _ = mtl.mlx_fast_metal_kernel_free(self.k);
         drop(self.no_sinks);
         drop(self.no_state);
         self.* = .{};
@@ -277,7 +279,7 @@ pub const Kernel = struct {
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var outs = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(outs);
-            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, self.k, in_vec, c, s));
+            try mlx.check(mtl.mlx_fast_metal_kernel_apply(&outs, self.k, in_vec, c, s));
             if (last) {
                 try mlx.check(mlx.mlx_vector_array_get(&out, outs, 0));
             } else {

@@ -10,10 +10,8 @@ const std = @import("std");
 const kset = @import("../../sdk_ext/kernel_set.zig");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
-const v41 = @import("deepseek_v41.zig");
 const ops = @import("ops.zig");
 const arm_mod = @import("arm.zig");
-const expert_bank = @import("../../expert/bank.zig");
 const expert_stream = @import("../../expert/stream.zig");
 
 pub const receipt_kind = "dsv41-seeded-mtp-comparison-v1";

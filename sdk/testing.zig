@@ -244,7 +244,7 @@ pub fn FakeArch(comptime opts: FakeOptions) type {
             pub fn laneName(_: *const Module) []const u8 {
                 return "fake lane";
             }
-            pub fn arm(_: *const Module, req: spec.ArmRequest) spec.DraftArm {
+            pub fn arm(_: *Module, req: spec.ArmRequest) spec.DraftArm {
                 last_arm = req;
                 return if (req.clean and (req.greedy or opts.lane_samples)) .typical else .off;
             }

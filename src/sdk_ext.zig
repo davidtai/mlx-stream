@@ -10,6 +10,8 @@ const std = @import("std");
 pub const expert = @import("sdk_ext/expert.zig");
 /// G5: the kernel registry (routes, sets, the trace backend).
 pub const kernels = @import("sdk_ext/kernels.zig");
+/// Every MLX custom kernel's launch through the plugin's launch cache (no per-call source rebuild and hash).
+pub const metal_launch = @import("sdk_ext/metal_launch.zig");
 /// C2: the routed-expert quant contract and the generic gather quant (`GatherQmm` through `FromGatherMatmul`).
 pub const quant = @import("sdk_ext/quant.zig");
 /// G7: profile probes, injected by the arch's backend type (`of(Backend)`); off everywhere else.
@@ -18,6 +20,8 @@ pub const profile = @import("sdk_ext/profile.zig");
 pub const ops = @import("sdk_ext/ops.zig");
 /// The draft lanes' acceptance: the exact and typical rules, the sampled path, the seeded draws (every arch's lane).
 pub const acceptance = @import("sdk_ext/acceptance.zig");
+/// The serial sampler: the plugin's position-keyed token for every row it hands the host (one stream with the lanes').
+pub const sampler = @import("sdk_ext/sampler.zig");
 /// The KV seam: lane storage, routes and bounded caps for a module-owned decode state.
 pub const kv = @import("sdk_ext/kv.zig");
 /// `kv`'s conformance helpers (CPU lane).

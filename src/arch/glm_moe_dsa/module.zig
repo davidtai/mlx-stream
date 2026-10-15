@@ -54,6 +54,8 @@ const prefill_timers = @import("prefill_timers.zig");
 const phase_mem = @import("../../phase_memory.zig");
 
 const G = graph.G;
+/// The plugin's draw for every row handed to the host (`sdk_ext.sampler`): bound per request by `draft_lane.arm`.
+pub const Sampler = @import("../../sdk_ext.zig").sampler.SamplerOf(G);
 const Stats = sdk_ext.expert.Stats;
 const LayerCounts = sdk_ext.expert.LayerCounts;
 
@@ -154,6 +156,8 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         gpa: std.mem.Allocator,
         io: std.Io,
         g: G,
+        /// The request's sampler (mlx-stream's one stream): the first token and every serial step's, a clean request's.
+        sampler: Sampler,
         model: *const glm.Config,
         cfg: settings.Config,
         w: graph.Weights,
@@ -237,6 +241,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
         }
 
         pub fn initWith(gpa: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, host: Host, ov: Overrides) !*Self {
+            try cfg.checkRetired();
             try cfg.checkCtxSize();
             try cfg.checkMaxOutput();
             try cfg.checkUnitsCap();
@@ -292,8 +297,10 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
 
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .kset = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .size_classes = size_classes orelse &noSizeClasses, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .billed = billed, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{} };
+            self.* = .{ .gpa = gpa, .io = io, .g = try G.init(gpa, s), .model = model, .cfg = cfg.*, .w = undefined, .bank = bank, .stream = undefined, .math = undefined, .kset = undefined, .ex = undefined, .cache = undefined, .max_context = max_context, .max_positions = inputs.decode_positions, .prompt_rows = &.{}, .decode_rows = &.{}, .prompt_units = rows.prompt, .decode_units = rows.decode, .forced_rows = cfg.expert_rows != null, .size_classes = size_classes orelse &noSizeClasses, .inputs = inputs, .baseline = baseline, .gpu_target = gpu_target, .ram = ram, .window_ids = bill_mod.decodeWindowRows(cfg), .routes = .{}, .overrides = ov, .bill = mb, .billed = billed, .layer_counts0 = &.{}, .layer_counts1 = &.{}, .layer_rates = &.{}, .sampler = undefined };
             errdefer self.g.deinit();
+            self.sampler = try Sampler.init(gpa, s);
+            errdefer self.sampler.deinit();
             // The module owns its config's copy (the host's config keeps the parsed model's storage).
             self.model = if (self.cfg.model) |*m| m else unreachable;
             self.inputs.model = self.model;
@@ -594,6 +601,7 @@ pub fn ModuleOf(comptime Bk: type, comptime Q: type, comptime mtp_kind: mtp_mod.
             self.gpa.free(self.layer_rates);
             self.bill.free(self.gpa);
             if (self.probe) |p| self.gpa.destroy(p);
+            self.sampler.deinit();
             self.g.deinit();
             var prev: usize = 0;
             _ = mlx.mlx_set_cache_limit(&prev, self.prev_cache_limit);

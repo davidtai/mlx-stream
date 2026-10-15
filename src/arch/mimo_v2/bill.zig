@@ -40,12 +40,6 @@ pub fn requestBytes(c: mimo.Config, reserve: u64) u64 {
     return bytes + wireTables(bytes);
 }
 
-pub fn requestBytesBF16(c: mimo.Config, reserve: u64) u64 {
-    if (reserve == 0) return 0;
-    const bytes = kv.bf16Bound(c, reserve).total();
-    return bytes + wireTables(bytes);
-}
-
 pub fn requestForConfig(c: settings.Config, reserve: u64) u64 {
     if (reserve == 0) return 0;
     const bytes = c.request_bound(c.mimo, reserve).total();

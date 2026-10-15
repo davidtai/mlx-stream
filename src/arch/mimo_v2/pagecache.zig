@@ -13,11 +13,6 @@ const MS_INVALIDATE: c_int = 0x2;
 extern "c" fn mincore(addr: *const anyopaque, len: usize, vec: [*]u8) c_int;
 extern "c" fn msync(addr: *anyopaque, len: usize, flags: c_int) c_int;
 
-/// The box's file-backed pages (vm_stat "File-backed pages"), bytes.
-pub fn fileBackedBytes() u64 {
-    return sdk.memory.vmBytes().external;
-}
-
 /// `path`'s bytes resident in the page cache (mincore over a read-only shared mapping); `evict` first invalidates them
 /// (msync MS_INVALIDATE), so the count is what the eviction left.
 pub fn fileCachedBytes(path: [:0]const u8, evict: bool) !u64 {

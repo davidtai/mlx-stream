@@ -12,7 +12,6 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn dsv41ev_abi() i32;
     pub extern fn dsv41ev_create_metal(start: u64, object: *u64) i32;
     pub extern fn dsv41ev_create_host(word: *i64, timeout_ns: i64) i32;
-    pub extern fn dsv41ev_create_null() i32;
     pub extern fn dsv41ev_wait(xs: [*]const mlx.mlx_array, n: usize, event: i32, value: u64, deps: ?[*]const mlx.mlx_array, n_deps: usize, track_inputs: bool, s: mlx.mlx_stream, outs: [*]mlx.mlx_array) c_int;
     pub extern fn dsv41ev_signal(xs: [*]const mlx.mlx_array, n: usize, event: i32, value: u64, s: mlx.mlx_stream, outs: [*]mlx.mlx_array) c_int;
     pub extern fn dsv41ev_value(event: i32) u64;

@@ -265,7 +265,7 @@ fn generate(a: Allocator, gen: JGen, dt: Dtype, n: usize) ![]u8 {
         .wave_table => {
             var ex: [xq.wave_max]xq.WaveExpert = undefined;
             for (gen.slots, gen.rows, 0..) |s, r, j| ex[j] = .{ .slot = s, .rows = r };
-            const t = xq.digTable(ex[0..gen.slots.len], gen.tiles);
+            const t = xq.digTableBm(ex[0..gen.slots.len], gen.tiles, 64);
             @memcpy(b, std.mem.sliceAsBytes(&t.table));
         },
         .slots16 => {

@@ -18,6 +18,8 @@
 //! expert (config.zig refuses `n_shared_experts`), so there is no shared term.
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("../../sdk_ext/metal_launch.zig");
 const ops = @import("../deepseek_v41/ops.zig");
 const bank_mod = @import("bank.zig");
 const moe = @import("moe.zig");
@@ -122,15 +124,15 @@ pub const Kernel = struct {
     /// P7 `inplace`: the table form of the same text (`initInplace`).
     k_inplace: mlx.mlx_fast_metal_kernel = .{},
 
-    /// Construction boundary: the routed geometry the text is instantiated for.
-    pub fn init(geometry: bank_mod.Geometry) !Kernel {
+    /// Construction boundary: the routed geometry the text is instantiated for (any bank's geometry: its `hidden_size`).
+    pub fn init(geometry: anytype) !Kernel {
         if (geometry.hidden_size != hidden) return error.MimoPrefillCombineGeometry;
         return .{ .k = try newKernel("mimo_prefill_combine", &input_names, texts.combine) };
     }
 
     /// P7 `inplace`: the text's table form, built once at construction (no device work: it compiles at its first
     /// dispatch; the byte-equality self-check is the pre-ship family `prefill_combine`).
-    pub fn initInplace(geometry: bank_mod.Geometry) !Kernel {
+    pub fn initInplace(geometry: anytype) !Kernel {
         if (geometry.hidden_size != hidden) return error.MimoPrefillCombineGeometry;
         return .{ .k_inplace = try newKernel("mimo_prefill_combine_inplace", &inplace_input_names, texts.combine_inplace) };
     }
@@ -141,14 +143,14 @@ pub const Kernel = struct {
         defer _ = mlx.mlx_vector_string_free(in_vec);
         const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(out_vec);
-        const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, text, texts.header, true, false);
+        const k = mtl.mlx_fast_metal_kernel_new(name, in_vec, out_vec, text, texts.header, true, false);
         if (k.ctx == null) return error.MimoPrefillCombineKernel;
         return k;
     }
 
     pub fn deinit(self: *Kernel) void {
-        if (self.k.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(self.k);
-        if (self.k_inplace.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(self.k_inplace);
+        if (self.k.ctx != null) _ = mtl.mlx_fast_metal_kernel_free(self.k);
+        if (self.k_inplace.ctx != null) _ = mtl.mlx_fast_metal_kernel_free(self.k_inplace);
         self.* = .{};
     }
 
@@ -183,7 +185,7 @@ pub const Kernel = struct {
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var outputs = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(outputs);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, k, in_vec, cfg, g.s));
+        try mlx.check(mtl.mlx_fast_metal_kernel_apply(&outputs, k, in_vec, cfg, g.s));
         var out = mlx.mlx_array_new();
         mlx.check(mlx.mlx_vector_array_get(&out, outputs, 0)) catch |e| {
             _ = mlx.mlx_array_free(out);

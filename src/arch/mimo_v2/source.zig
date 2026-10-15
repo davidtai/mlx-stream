@@ -199,10 +199,6 @@ pub fn memoryBillForTokens(g: bank_mod.Geometry, rows: []const u32, tokens: u32)
 
 /// Construction boundary only. The owner keeps this absolute table and its
 /// promoted router/correction payloads alive until Source has been destroyed.
-pub fn validateGates(g: anytype, geometry: bank_mod.Geometry, gates: []const Gate) !void {
-    return validateGatesFor(g, geometry, gates, .f32);
-}
-
 /// X19: the gate table the installed predictor route reads: `.f32` the transposed F32 copies [hidden, experts]; `.bf16`
 /// the routers' BF16 weights as stored [experts, hidden]. The corrections are F32 [experts] on both.
 pub fn validateGatesFor(g: anytype, geometry: bank_mod.Geometry, gates: []const Gate, route: prefill_math.PredictRoute) !void {

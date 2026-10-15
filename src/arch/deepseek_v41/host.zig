@@ -23,9 +23,6 @@ pub const model = struct {
         return sdk.loader.dir(io, gpa, dir, opts);
     }
 
-    pub fn loadWeights(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) !Weights {
-        return loadWeightsOpt(io, gpa, dir, .{});
-    }
 
     pub fn loadSafetensorsFile(gpa: std.mem.Allocator, w: *Weights, path: [*:0]const u8, s: sdk.mlx.mlx_stream, opts: LoadOpts) !void {
         return sdk.loader.file(gpa, w, path, s, opts);

@@ -179,7 +179,6 @@ pub fn Model(comptime G: type) type {
             for (self.layers, 0..) |*lw, l| {
                 lw.* = try bindLayer(lookup, cp.layers[l], @intCast(l));
                 if (tier.routes.wo_a_f32) lw.wo_a_dense = try self.own(g, try Tr.woaDenseF32(g, cp, lw.wo_a));
-                if (tier.routes.dense_rc) try self.stackSharedGateUp(g, lookup, lw, @intCast(l));
             }
             // The prefill core's sink views, once per layer (`W.sink4`).
             if (tier.routes.prefill_attn) for (self.layers) |*lw| {
@@ -244,41 +243,6 @@ pub fn Model(comptime G: type) type {
             for (&self.engram_m1) |*x| if (x.*) |*r| r.deinit(g);
             self.gpa.free(self.layers);
             self.gpa.destroy(self);
-        }
-
-        /// DENSE_RC: the layer's shared gate and up stacked `[2 I, H / 4]` (and their scales), evaluated, with
-        /// `sh_w1` / `sh_w3` rebound as its halves (views); a mutable lookup that can forget arrays drops the two
-        /// originals here, one layer at a time (else the owner drops them after construction: `droppedSharedGateUp`).
-        fn stackSharedGateUp(self: *Self, g: *G, lookup: anytype, lw: *graph.LayerW(T), l: u32) !void {
-            const w1 = lw.sh_w1;
-            const w3 = lw.sh_w3;
-            if (w1.mode != .mxfp8 or w3.mode != .mxfp8) return error.DenseRcMode;
-            const w = try self.own(g, try g.concat(&.{ w1.w, w3.w }, 0));
-            const sc = try self.own(g, try g.concat(&.{ w1.s, w3.s }, 0));
-            try g.evalAll(&.{ w, sc });
-            const n = g.shapeOf(w1.w).dim(0);
-            const half = struct {
-                fn of(g_: *G, x: T, lo: c_int, hi: c_int) !T {
-                    const sh = g_.shapeOf(x);
-                    return g_.slice(x, &.{ lo, 0 }, &.{ hi, sh.dim(1) }, &.{ 1, 1 });
-                }
-            }.of;
-            lw.sh_w13 = .{ .w = w, .s = sc, .mode = .mxfp8 };
-            lw.sh_w1 = .{ .w = try self.own(g, try half(g, w, 0, n)), .s = try self.own(g, try half(g, sc, 0, n)), .mode = .mxfp8 };
-            lw.sh_w3 = .{ .w = try self.own(g, try half(g, w, n, 2 * n)), .s = try self.own(g, try half(g, sc, n, 2 * n)), .mode = .mxfp8 };
-            if (comptime canDrop(@TypeOf(lookup))) {
-                var b: [96]u8 = undefined;
-                inline for (.{ "w1", "w3" }) |nm| inline for (.{ "weight", "scales" }) |part| {
-                    lookup.drop(try std.fmt.bufPrint(&b, "layers.{d}.ffn.shared_experts." ++ nm ++ "." ++ part, .{l}));
-                };
-            }
-        }
-
-        fn canDrop(comptime L: type) bool {
-            return switch (@typeInfo(L)) {
-                .pointer => |p| !p.attrs.@"const" and @hasDecl(p.child, "drop"),
-                else => false,
-            };
         }
 
         fn own(self: *Self, g: *G, x: T) !T {
@@ -479,16 +443,13 @@ pub fn Model(comptime G: type) type {
             var n: u64 = 0;
             if (self.tier.routes.wo_a_f32) n += @as(u64, c.n_layers) * graph.woaDenseBytes(c);
             if (self.tier.routes.head == .mxfp8) n += @as(u64, c.vocab_size) * c.hidden_size * 33 / 32;
-            if (self.tier.routes.dense_rc) n += graph.sharedGateUpBytes(c);
             return n;
         }
 
         /// Checkpoint residents the Module drops once the model is built: the dense bf16 head under HEAD_MODE
         /// mxfp8 (its quantized codes and scales are in `builtBytes`). The bill's resident term less these.
         pub fn droppedBytes(self: *const Self) u64 {
-            var n: u64 = if (self.tier.routes.head == .mxfp8) @as(u64, self.c.vocab_size) * self.c.hidden_size * 2 else 0;
-            if (self.tier.routes.dense_rc) n += graph.sharedGateUpBytes(&self.c);
-            return n;
+            return if (self.tier.routes.head == .mxfp8) @as(u64, self.c.vocab_size) * self.c.hidden_size * 2 else 0;
         }
 
         /// The input table's bytes (bf16 `[vocab, dim]`): what retiring it frees,
@@ -726,7 +687,7 @@ pub fn Model(comptime G: type) type {
             defer gpa.free(ids);
             const wave = g.mark();
             defer g.resetTo(wave);
-            const wf = if (self.tier.routes.predict_bf16) lw.gate_w else try g.astype(lw.gate_w, .float32);
+            const wf = try g.astype(lw.gate_w, .float32);
             // `predict_batch` chunks' predictions evaluated together, one GPU round trip for all of them; their ids are
             // then read in place (an evaluated array's host read makes no round trip).
             var start: usize = 0;
@@ -956,7 +917,7 @@ pub fn Model(comptime G: type) type {
                     // below, h1 / post / comb with each post's evaluation).
                     probeGroupHalves(probe, halves[i..j], i);
                     if (parts != null) probeGroupMerge(probe, hook);
-                    // Each chunk's rows and MoE output shape and dtype, read before the inputs may be released.
+                    // Each chunk's rows and MoE output shape and dtype.
                     const nks = try a.alloc(c_int, j - i);
                     const mo_shape = try a.alloc(ops.Shape, j - i);
                     const mo_dt = try a.alloc(ops.Dtype, j - i);
@@ -965,17 +926,7 @@ pub fn Model(comptime G: type) type {
                         ms.* = g.shapeOf(halves[k].moe_in);
                         md.* = g.dtypeOf(halves[k].moe_in);
                     }
-                    // PREFILL_INPUT_RELEASE: the group's MoE inputs (each chunk's moe_in, its row view and their concat)
-                    // are dead once the wide call's waves drained and the shared experts were issued from them: freed
-                    // here, before the group's final evaluation.
-                    const released = rt.prefill_input_release and parts != null;
-                    if (released) {
-                        if (j - i > 1) g.drop(cat_xf);
-                        for (i..j) |k| {
-                            g.drop(xfs[k]);
-                            halves[k].moe_in = g.dropKept(halves[k].moe_in);
-                        }
-                    }
+
                     var pos: c_int = 0;
                     for (i..j) |k| {
                         probeChunk(probe, k);
@@ -1002,7 +953,7 @@ pub fn Model(comptime G: type) type {
                     }
                     // The profile's mark before the group's final evaluation (the merge, the combines, the HC posts and the new
                     // streams at once, as the timed pass runs it), then that evaluation's own stage.
-                    probeGroupEval(probe, if (parts) |pt| pt.outs else &.{}, if (parts) |pt| pt.loc else null, pre_shared, hs[i..j], if (released) null else cat_xf);
+                    probeGroupEval(probe, if (parts) |pt| pt.outs else &.{}, if (parts) |pt| pt.loc else null, pre_shared, hs[i..j], cat_xf);
                     try g.evalAll(hs[i..j]);
                     probeChunk(probe, i);
                     try probe.put("group.eval", hs[i]);
@@ -1483,63 +1434,6 @@ test "dsv41 model: K16's input-stream release (route): each chunk's layer input 
                 try testing.expectEqual(early, std.mem.indexOfScalar(u32, g.released.items[0..at], x) != null);
                 try testing.expectEqual(@as(usize, 1), std.mem.count(u32, g.released.items, &.{x}));
             }
-        }
-    }
-    // Lifetime only: the same op sequence with the route on and off.
-    try testing.expectEqualSlices(ops.Op, seqs[0].?, seqs[1].?);
-}
-
-test "dsv41 model: PREFILL_INPUT_RELEASE (route): each routed group's MoE inputs are dropped after the wide call and never read again; the ops are the same either way" {
-    var kd: xk.Diag = .{};
-    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
-    defer reg.deinit();
-    const json = try v41.testConfigJson(testing.allocator, .real);
-    defer testing.allocator.free(json);
-    var c = try v41.Config.parse(testing.allocator, json, null);
-    // Two real-geometry layers (JOINLESS's combine is derived for them), no Engram.
-    c.n_layers = 2;
-    c.engram.n_layers = 0;
-    for (c.layers[0..2]) |*li| li.engram_slot = null;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const spec = try v41.residentSpec(arena.allocator(), &c);
-    const k: c_int = @intCast(c.n_experts_per_tok);
-    // A wide routed source that hands out its outputs unjoined (one output, every assignment's row in it).
-    const Parts = struct {
-        outs: [1]u32 = undefined,
-        k: c_int,
-        pub fn at(self: *@This(), _: u32) PartsHook {
-            return .{ .outs = &self.outs, .k = self.k };
-        }
-    };
-    var seqs: [2]?[]ops.Op = .{ null, null };
-    defer for (seqs) |sq| if (sq) |x| testing.allocator.free(x);
-    for ([_]bool{ false, true }, &seqs) |rel, *seq| {
-        var g = TraceOps.init(testing.allocator);
-        defer g.deinit();
-        const lookup: SpecLookup = .{ .g = &g, .spec = spec };
-        var tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
-        tier.routes.prefill_joinless = true;
-        tier.routes.prefill_host_shared = true;
-        tier.routes.prefill_input_release = rel;
-        const model_ = try TM.initWith(testing.allocator, &g, c, tier, &lookup, null, .{ .registry = &reg });
-        defer model_.deinit(&g);
-        var st = try model_.newState();
-        defer st.deinit(&g, testing.allocator);
-        var src: Parts = .{ .k = k };
-        var ids: [20]u32 = undefined;
-        for (&ids, 0..) |*d, i| d.* = @intCast((i * 5 + 1) % 1000);
-        const mark = g.nodes.items.len;
-        _ = try model_.forward(&g, &st, &ids, .{ .logits = .last }, &src, graph.NoProbe{});
-        seq.* = try g.opsSince(testing.allocator, mark);
-        // Off: nothing dropped. On: per layer, three chunks' moe_in and row views and the group's concat, none of them
-        // read (shape, dtype or evaluation) after the drop.
-        try testing.expectEqual(@as(usize, if (rel) 2 * (3 + 3 + 1) else 0), g.dropped.items.len);
-        try testing.expectEqual(@as(u32, 0), g.use_after_drop);
-        if (rel) {
-            // The detector itself: a read of a dropped array counts.
-            _ = g.shapeOf(g.dropped.items[0]);
-            try testing.expectEqual(@as(u32, 1), g.use_after_drop);
         }
     }
     // Lifetime only: the same op sequence with the route on and off.
@@ -2093,7 +1987,7 @@ test "dsv41 model: P1's predictor reads its chunks' ids in batches: one eval a b
     try testing.expectEqualSlices(u16, expert_policy.rankHottest(want[0..n], buf[0..n]), hook.ranked.items);
 }
 
-test "dsv41 model: P1's predictor in bf16 (Routes.predict_bf16): the GEMM on the gate as stored, no f32 copy of the gate; the evals, reads and seed are the f32 route's" {
+test "dsv41 model: P1's predictor: one f32 copy of the gate per pass, each chunk's GEMM in f32, one eval and one read per chunk" {
     const m = try Mini.init();
     defer m.deinit();
     const n: c_int = @intCast(m.c.n_routed_experts);
@@ -2117,15 +2011,12 @@ test "dsv41 model: P1's predictor in bf16 (Routes.predict_bf16): the GEMM on the
     // Three chunks (one batch); no row count equals the expert count, so the shapes below name the gate alone.
     const rows = [_]c_int{ 8, 8, 3 };
     const Seen = struct { gemm_f32: usize = 0, gemm_bf16: usize = 0, gate_to_f32: usize = 0, evals: usize = 0, reads: usize = 0 };
-    var seen: [2]Seen = .{ .{}, .{} };
-    var seeds: [2]std.ArrayList(u16) = .{ .empty, .empty };
-    defer for (&seeds) |*x| x.deinit(testing.allocator);
-    for ([_]bool{ false, true }, &seen, &seeds) |bf16, *sn, *seed| {
+    var sn: Seen = .{};
+    {
         var g = TraceOps.init(testing.allocator);
         defer g.deinit();
         const lookup: SpecLookup = .{ .g = &g, .spec = m.spec };
-        var tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
-        tier.routes.predict_bf16 = bf16;
+        const tier = try routes.parse(&.{ .{ "MTPLX_DSV41_PREFILL_LAYER_MAJOR", "1" }, .{ "MTPLX_DSV41_PREFILL_CHUNK", "8" } }, null);
         const model_ = try TM.init(testing.allocator, &g, m.c, tier, &lookup, &m.src);
         defer model_.deinit(&g);
         var host: Host = .{ .n = @intCast(n) };
@@ -2154,13 +2045,9 @@ test "dsv41 model: P1's predictor in bf16 (Routes.predict_bf16): the GEMM on the
             .host_read => sn.reads += 1,
             else => {},
         };
-        try seed.appendSlice(testing.allocator, hook.ranked.items);
+        try testing.expect(hook.ranked.items.len > 0);
     }
-    // f32 (the served default): one f32 copy of the gate for the pass, each chunk's GEMM in f32.
-    try testing.expectEqual(Seen{ .gemm_f32 = rows.len, .gate_to_f32 = 1, .evals = 1, .reads = rows.len }, seen[0]);
-    // bf16: no copy, each chunk's GEMM in bf16; the same evals and reads, and from the same ids the same seed.
-    try testing.expectEqual(Seen{ .gemm_bf16 = rows.len, .evals = 1, .reads = rows.len }, seen[1]);
-    try testing.expectEqualSlices(u16, seeds[0].items, seeds[1].items);
+    try testing.expectEqual(Seen{ .gemm_f32 = rows.len, .gate_to_f32 = 1, .evals = 1, .reads = rows.len }, sn);
 }
 
 test "dsv41 model: the routed row cap follows _derive_moe_row_cap" {

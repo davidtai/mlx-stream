@@ -1590,7 +1590,7 @@ test "dsv41 io cov: a file shorter than its job's size, ending inside a range's 
     try testing.expectEqual(@as(i64, 200), pool.result(0).payload);
 }
 
-test "glm io: with direct reads a page-aligned range lands straight in its rows; an unaligned one, or the pool without them, takes the staging loop; every range lands the file's bytes" {
+test "glm io: with direct reads every range lands straight in its rows (aligned or not: the route tests no range, the owner proves alignment at construction); without them the staging loop; every range lands the file's bytes" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(96 * page);
     defer f.deinit();
@@ -1604,7 +1604,7 @@ test "glm io: with direct reads a page-aligned range lands straight in its rows;
         down[i] = (60 + 5 * i) * page;
     }
     const Case = struct { direct: bool, skew: usize, want: i64 };
-    for ([_]Case{ .{ .direct = true, .skew = 0, .want = 2 * n }, .{ .direct = true, .skew = 64, .want = 0 }, .{ .direct = false, .skew = 0, .want = 0 } }) |cs| {
+    for ([_]Case{ .{ .direct = true, .skew = 0, .want = 2 * n }, .{ .direct = true, .skew = 64, .want = 2 * n }, .{ .direct = false, .skew = 0, .want = 0 } }) |cs| {
         var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 64, .direct = cs.direct });
         defer pool.stop();
         var d = try Dests.initPages(n, &lens, cs.skew);

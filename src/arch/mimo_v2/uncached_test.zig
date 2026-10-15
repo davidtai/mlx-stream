@@ -10,7 +10,10 @@ const root = @import("root.zig");
 const testing = std.testing;
 
 const pagecache = @import("pagecache.zig");
-const fileBackedBytes = pagecache.fileBackedBytes;
+/// The box's file-backed pages (vm_stat "File-backed pages"), bytes.
+fn fileBackedBytes() u64 {
+    return sdk.memory.vmBytes().external;
+}
 const fileCachedBytes = pagecache.fileCachedBytes;
 
 /// A safetensors image with resident-like tensors (BF16 norms, U32 packed weights) at unaligned offsets.

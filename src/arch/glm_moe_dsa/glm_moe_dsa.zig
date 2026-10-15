@@ -512,11 +512,6 @@ pub const Config = struct {
         return c.qk_nope_head_dim + c.qk_rope_head_dim;
     }
 
-    /// One position's KV bytes over every layer: the bf16 latent and rope key (`kv_lora_rank + qk_rope_head_dim`) on
-    /// each layer, and the indexer's bf16 key on each full layer (GLM-5.3: 95,232 B).
-    pub fn kvPositionBytes(c: *const Config) u64 {
-        return 2 * (@as(u64, c.n_layers) * (c.kv_lora_rank + c.qk_rope_head_dim) + @as(u64, c.nFull()) * c.index_head_dim);
-    }
 };
 
 /// A config.json object's fields, refused by name when missing or mistyped.
@@ -839,8 +834,6 @@ test "glm config: the release's config parses to GLM-5.3's dims, 21 full indexer
     try testing.expectEqual(@as(f32, 8_000_000), c.rope_theta);
     try testing.expectEqual(@as(f32, 2.5), c.routed_scaling_factor);
     try testing.expectEqualSlices(u32, &.{ 154820, 154827, 154829 }, c.eos_ids[0..c.n_eos]);
-    // 95.2 KB per position: (512 + 64) x 2 B x 78 layers + 128 x 2 B x 21 full layers.
-    try testing.expectEqual(@as(u64, 95_232), c.kvPositionBytes());
     try testing.expectEqual(@as(u32, 4), c.quant.bitsOf("model.layers.0.self_attn.q_a_proj"));
     try testing.expectEqual(@as(u32, 1), c.n_nextn);
     try testing.expect(c.index_share_mtp);

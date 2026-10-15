@@ -10,6 +10,8 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
+/// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
+const mtl = @import("metal_launch.zig");
 const profile = @import("profile.zig");
 
 /// A load's kernel set as a quant's accept receives it (`sdk.quant.Context.kernels`): the set, erased, and the pin
@@ -57,7 +59,7 @@ pub fn KernelSet(comptime R: type) type {
 
         /// Where `Set.install` puts the launcher: the backend's `launcher: ?*const xk.Bound`
         /// field, or its base backend's under a wrapper that declares `Inner` and `base()`
-        /// (`dsv41_profile.Profiled`); null when neither has one.
+        /// (a profiling wrapper); null when neither has one.
         fn launcherSlot(comptime G: type, g: *G) ?*?*const xk.Bound {
             if (@hasField(G, "launcher")) return &g.launcher;
             if (@hasDecl(G, "Inner")) return launcherSlot(G.Inner, g.base());
@@ -252,7 +254,7 @@ pub fn newKernel(name: [*:0]const u8, inputs: []const [*:0]const u8, outputs: []
     defer _ = mlx.mlx_vector_string_free(vin);
     const vout = mlx.mlx_vector_string_new_data(@constCast(outputs.ptr), outputs.len);
     defer _ = mlx.mlx_vector_string_free(vout);
-    const k = mlx.mlx_fast_metal_kernel_new(name, vin, vout, source, header, ensure_row_contiguous, false);
+    const k = mtl.mlx_fast_metal_kernel_new(name, vin, vout, source, header, ensure_row_contiguous, false);
     return if (k.ctx == null) null else k;
 }
 
@@ -286,7 +288,7 @@ pub fn applyConfig(kernel: mlx.mlx_fast_metal_kernel, config: mlx.mlx_fast_metal
     defer _ = mlx.mlx_vector_array_free(vin);
     var vout = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(vout);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&vout, kernel, vin, config, stream));
+    try mlx.check(mtl.mlx_fast_metal_kernel_apply(&vout, kernel, vin, config, stream));
     for (outs, 0..) |*o, i| {
         o.* = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_vector_array_get(o, vout, i));
@@ -461,7 +463,7 @@ pub fn BoundOf(comptime R: type) type {
 
         pub fn deinit(self: *Self) void {
             for (self.kernels) |k| {
-                if (k.ctx != null) _ = mlx.mlx_fast_metal_kernel_free(k);
+                if (k.ctx != null) _ = mtl.mlx_fast_metal_kernel_free(k);
             }
             self.* = undefined;
         }

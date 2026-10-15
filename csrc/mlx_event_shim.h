@@ -27,17 +27,15 @@ int32_t dsv41ev_abi(void);
 int32_t dsv41ev_create_metal(uint64_t start, uint64_t *object);
 /* A host event over an 8-aligned int64 word; a CPU-stream wait gives up (counted) after timeout_ns. 0 on failure. */
 int32_t dsv41ev_create_host(int64_t *word, int64_t timeout_ns);
-/* A pass-through event (never waits). */
-int32_t dsv41ev_create_null(void);
 /* outs[i] (mlx_array_new() handles) alias xs[i], n >= 1, value >= 1; deps are ordering-only inputs; track_inputs
  * orders the post-wait GPU pass after the producers of xs (only for xs produced by in-flight GPU work). A host
  * event on a GPU stream is refused. 0, or -1 (dsv41ev_last_error). */
 int dsv41ev_wait(const mlx_array *xs, size_t n, int32_t event, uint64_t value, const mlx_array *deps, size_t n_deps,
                  bool track_inputs, mlx_stream s, mlx_array *outs);
-/* outs alias xs; the GPU hands `value` to a metal event after every pass encoded before it (probes). Metal or null
- * events only. 0 or -1. */
+/* outs alias xs; the GPU hands `value` to a metal event after every pass encoded before it (probes). Metal events
+ * only. 0 or -1. */
 int dsv41ev_signal(const mlx_array *xs, size_t n, int32_t event, uint64_t value, mlx_stream s, mlx_array *outs);
-/* The event's current value (0 for a null event or an unknown id). */
+/* The event's current value (0 for an unknown id). */
 uint64_t dsv41ev_value(int32_t event);
 /* gpu waits encoded, gpu signals encoded, host waits already satisfied, host waits that blocked, host wait
  * timeouts, host wait ns, cpu pass-throughs, events created. */

@@ -10,6 +10,7 @@ const expert_io = @import("io.zig");
 const expert_policy = @import("policy.zig");
 const expert_lookahead = @import("lookahead.zig");
 const expert_routes = @import("routes.zig");
+const log = @import("sdk").log;
 /// The route recorder (`expert.routes`) is a diagnostic: its hooks compile into profile builds (`sdk.plugin_profile`) and
 /// the tests only; a served build has no recorder branch on any route.
 pub const recording: bool = @import("sdk").plugin_profile or builtin.is_test;
@@ -76,10 +77,80 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             return true;
         }
 
-        /// One slot row of component `c` in `layer`'s slots: the segment of each of a routed id's records, back to back.
-        /// Host rows and MLX rows alike.
+        /// Scale-line isolation (a bank's `slot_line_bytes`, glm5_next's NVFP4 bank): every slot row of every component
+        /// starts on its own line of this many bytes, so a row the read pool writes after a command buffer commits never
+        /// shares a GPU cache line with another slot's row. A component whose row is shorter than a line (a 4-byte global
+        /// scale) is padded to one line per slot: its array is [rows, line / itemsize] and the pool writes the row's first
+        /// `length` bytes; the kernels read word 0 of the slot's line. 0 (every other bank): rows back to back, as before.
+        pub const slot_line_bytes: u64 = if (@hasDecl(B, "slot_line_bytes")) B.slot_line_bytes else 0;
+        /// A padded component's array is never smaller than this many bytes (a bank's `slot_min_bytes`): its own Metal
+        /// buffer, never a sub-allocation of MLX's small-buffer heap (< 256 B) beside foreign buffers, and never an input
+        /// MLX passes in the `constant` address space (< 8 elements).
+        pub const slot_min_bytes: u64 = if (@hasDecl(B, "slot_min_bytes")) B.slot_min_bytes else 0;
+
+        comptime {
+            if (slot_line_bytes != 0 and (!std.math.isPowerOfTwo(slot_line_bytes) or slot_min_bytes < 256 or slot_min_bytes % slot_line_bytes != 0))
+                @compileError("expert stream: a bank's slot_line_bytes must be a power of two and its slot_min_bytes a multiple of it, at least MLX's small-buffer threshold");
+        }
+
+        /// One slot row of component `c` in `layer`'s slots: the segment of each of a routed id's records, back to back,
+        /// padded to `slot_line_bytes` when the bank isolates lines. Host rows and MLX rows alike.
         pub fn rowBytes(layer: *const Layer, c: usize) u64 {
-            return layer.segments[c].length * minisOf(layer);
+            const n = layer.segments[c].length * minisOf(layer);
+            return if (slot_line_bytes == 0) n else std.mem.alignForward(u64, n, slot_line_bytes);
+        }
+
+        /// Whether component `c`'s rows are padded past their segment (line isolation of a short row).
+        pub fn padded(layer: *const Layer, c: usize) bool {
+            return rowBytes(layer, c) != layer.segments[c].length * minisOf(layer);
+        }
+
+        /// A bank's slot-array floor (a bank's `slot_array_min_bytes`, glm5_next's NVFP4 and EXL3 banks: one VM page):
+        /// every slot array of the bank holds at least this many bytes. Metal gives no file-block-aligned `contents()` to a
+        /// buffer under the page (MLX allocates it unrounded), and glm5_next's direct reads need every slot row on the 4 KiB
+        /// block (`checkDirectRows`): a one-row ext of a 4 KiB component was refused. 0 (every other bank: DeepSeek-V4.1,
+        /// MiMo, glm_moe_dsa): no floor, the arrays hold their rows exactly (a padded component's `slot_min_bytes` only).
+        pub const slot_array_min_bytes: u64 = if (@hasDecl(B, "slot_array_min_bytes")) B.slot_array_min_bytes else 0;
+
+        /// The floor of component `c`'s array: the bank's `slot_array_min_bytes`, and a padded component's `slot_min_bytes`.
+        pub fn arrayMinBytes(layer: *const Layer, c: usize) u64 {
+            return if (padded(layer, c)) @max(slot_min_bytes, slot_array_min_bytes) else slot_array_min_bytes;
+        }
+
+        /// The slot rows component `c`'s array holds for `rows` slot rows: `rows`, and at least `arrayMinBytes` of rows
+        /// (the rows past `rows` are never addressed).
+        pub fn allocSlots(layer: *const Layer, c: usize, rows: u32) u32 {
+            const n = rowBytes(layer, c);
+            if (n == 0) return rows;
+            return @max(rows, @as(u32, @intCast(std.math.divCeil(u64, arrayMinBytes(layer, c), n) catch unreachable)));
+        }
+
+        /// The rows of component `c`'s array (its shape's first dimension) for `rows` slot rows: `allocSlots` x minis.
+        pub fn allocRows(layer: *const Layer, c: usize, rows: u32) u32 {
+            return allocSlots(layer, c, rows) * minisOf(layer);
+        }
+
+        /// The MLX shape of component `c`'s array for `rows` slot rows into `shape`; returns its rank. A padded component
+        /// (a scalar segment, one record per id: refused otherwise, `SlotLineGeometry`) is [allocRows, line / itemsize].
+        pub fn arrayShape(layer: *const Layer, c: usize, rows: u32, shape: *[4]c_int) !usize {
+            const seg = layer.segments[c];
+            if (padded(layer, c)) {
+                // A scalar segment's length is its element's size.
+                const item = seg.length;
+                if (seg.rank != 0 or minisOf(layer) != 1 or item == 0 or rowBytes(layer, c) % item != 0) return error.SlotLineGeometry;
+                shape[0] = @intCast(allocRows(layer, c, rows));
+                shape[1] = @intCast(rowBytes(layer, c) / item);
+                return 2;
+            }
+            shape[0] = @intCast(allocRows(layer, c, rows));
+            for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
+            return seg.rank + 1;
+        }
+
+        /// The bytes of component `c`'s array for `rows` slot rows (`arrayShape`'s): the stream's frees and the bill's
+        /// slot terms.
+        pub fn arrayBytes(layer: *const Layer, c: usize, rows: u32) u64 {
+            return @as(u64, allocSlots(layer, c, rows)) * rowBytes(layer, c);
         }
 
         pub const HostSlotRows = struct {
@@ -87,15 +158,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             row_bytes: [n_components]u64,
             banks: [n_components][]u8,
 
-            /// Rows sized for `layer`'s segments; one page-aligned bank per component.
+            /// Rows sized for `layer`'s segments; one page-aligned bank per component (`arrayBytes`: the bank's floor at least).
             pub fn init(layer: *const Layer, rows: u32) !HostSlotRows {
                 var s: HostSlotRows = .{ .rows = rows, .row_bytes = undefined, .banks = undefined };
                 var n: usize = 0;
                 errdefer for (s.banks[0..n]) |b| std.heap.page_allocator.free(b);
                 for (layer.segments, 0..) |_, c| {
                     s.row_bytes[c] = rowBytes(layer, c);
-                    const bytes = std.math.mul(u64, s.row_bytes[c], rows) catch return error.OutOfMemory;
-                    s.banks[c] = try std.heap.page_allocator.alloc(u8, @intCast(bytes));
+                    s.banks[c] = try std.heap.page_allocator.alloc(u8, std.math.cast(usize, arrayBytes(layer, c, rows)) orelse return error.OutOfMemory);
                     n += 1;
                 }
                 return s;
@@ -145,11 +215,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer b.deinit();
                 for (layer.segments, 0..) |seg, c| {
                     var shape: [4]c_int = undefined;
-                    shape[0] = @intCast(rows * minisOf(layer));
-                    for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
+                    const ndim = try arrayShape(layer, c, rows, &shape);
                     const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_zeros(&b.arrays[c], &shape, seg.rank + 1, dtype, stream));
+                    try mlx.check(mlx.mlx_zeros(&b.arrays[c], &shape, ndim, dtype, stream));
                     b.row_bytes[c] = rowBytes(layer, c);
                 }
                 return b;
@@ -161,11 +230,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer b.deinit();
                 for (layer.segments, 0..) |seg, c| {
                     var shape: [4]c_int = undefined;
-                    shape[0] = @intCast(rows * minisOf(layer));
-                    for (seg.shape[0..seg.rank], 1..) |d, k| shape[k] = @intCast(d);
+                    const ndim = try arrayShape(layer, c, rows, &shape);
                     const dtype: mlx.mlx_dtype = B.mlxDtype(seg.dtype);
                     b.arrays[c] = mlx.mlx_array_new();
-                    if (dsv41_alloc_uninit(&b.arrays[c], &shape, seg.rank + 1, dtype) != 0) return error.MlxUnfilledAlloc;
+                    if (dsv41_alloc_uninit(&b.arrays[c], &shape, ndim, dtype) != 0) return error.MlxUnfilledAlloc;
                     b.row_bytes[c] = rowBytes(layer, c);
                 }
                 try b.bind();
@@ -237,6 +305,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             base: [n_components]u64 = @splat(0),
             row_bytes: [n_components]u64 = @splat(0),
             backing: union(enum) { none, host: HostSlotRows, mlx: LayerSlotBank } = .none,
+
+            /// The bytes these rows allocated on `layer`'s geometry (`arrayBytes` per component, the bank's floor
+            /// included): what their free returns.
+            fn allocBytes(self: *const Rows, layer: *const Layer) u64 {
+                if (self.rows == 0) return 0;
+                var n: u64 = 0;
+                for (0..n_components) |c| n += arrayBytes(layer, c, self.rows);
+                return n;
+            }
 
             fn init(layer: *const Layer, rows: u32, memory: SlotMemory) !Rows {
                 if (rows == 0) return .{};
@@ -404,6 +481,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// The read-ahead's admission bound in records; null: the stock rule, from the pool's tickets. A route that
             /// widens the ticket ring pins it to the narrower ring's bound so the admissions stay the control's.
             ahead_cap: ?u32 = null,
+            /// P7 `overlap` relocation (glm5next/prefill-levers lever 1): at a call's plans, every read-ahead record the plans
+            /// evict before any group hits it and load again later in the call into a transient row no earlier group of the
+            /// call reads is copied from its read-ahead row into that transient row (`p7Relocate`), so that load holds its
+            /// record and reads nothing: the record is read once, not twice. Needs `overlap` and one slot geometry (every
+            /// layer's rows interchangeable with the transient rows); off (the control): every such record is read again.
+            prompt_relocate: bool = false,
             /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
             tally: ?Tally = null,
         };
@@ -478,6 +561,30 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             }
             const page = std.heap.pageSize();
             return std.mem.alignForward(u64, widest, page) + page;
+        }
+
+        /// Direct reads (`expert_io.Options.direct`, a construction-time route): every range a submit of `bank` reads is
+        /// aligned to `block` (the file's block size, `expert_io.fileBlockSize`), so an F_NOCACHE preadv straight into the
+        /// slot rows takes the drive's uncached path. Checked once, at construction, over every record of every layer:
+        /// its gate/up and down offsets (`DirectReadsOffset`), every segment's offset and length and the minis' stride
+        /// (`DirectReadsLength`). The rows' side is `checkDirectRows`. Refused by name; nothing per read.
+        pub fn checkDirectReads(bank: *const B.Bank, block: u64) expert_io.DirectError!void {
+            if (block == 0) return error.DirectReadsBlock;
+            for (bank.layers, 0..) |*l, li| {
+                for (l.segments) |sg| if (sg.offset % block != 0 or sg.length % block != 0) return error.DirectReadsLength;
+                if (miniStride(l) % block != 0) return error.DirectReadsLength;
+                for (0..bank.n_experts) |e| {
+                    const sp = bank.spans(@intCast(li), @intCast(e));
+                    if (sp.gu_offset % block != 0 or sp.down_offset % block != 0) return error.DirectReadsOffset;
+                }
+            }
+        }
+
+        /// The rows' side of `checkDirectReads`: every component's base address and row stride a multiple of `block`
+        /// (`DirectReadsRow`), so every part a direct read lands (row + mini x segment length) starts on a block.
+        pub fn checkDirectRows(r: *const Rows, block: u64) expert_io.DirectError!void {
+            if (r.rows == 0) return;
+            for (r.base, r.row_bytes) |b, n| if (b % block != 0 or n % block != 0) return error.DirectReadsRow;
         }
 
         /// The contract's gates, counters and refusals (`sdk.expert`).
@@ -625,6 +732,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             ahead_pending_layer: u32 = 0,
             by_rank: ByRank = @splat(@splat(.{ 0, 0 })),
             preread: bool = false,
+            /// Direct reads (`Options.pool.direct`): the file's block every range and slot row was checked against at
+            /// construction (and every row the phase changes allocate); 0 = the staging route.
+            direct_block: u64 = 0,
             /// Decode layer calls so far; a call's pre-reads and speculative records
             /// carry its tag, settled by its own step.
             clock: i64 = 0,
@@ -645,6 +755,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             prompt_reads: PromptReads = .stock,
             prompt_ahead: AheadPost = .head,
             ahead_cap: ?u32 = null,
+            /// P7 overlap relocation (`Options.prompt_relocate`), fixed at construction.
+            prompt_relocate: bool = false,
             /// P7 overlap: the prompt call being scheduled; per row (a layer's persistent slots [0, n_experts), then the
             /// transient rows) the record its plans leave and its last reader; per persistent slot the read-ahead job
             /// writing it (`no_job`: none). Empty under `stock`.
@@ -762,6 +874,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
                     };
                 }
+                // Direct reads: the file's block, every record's ranges and (below) every slot row aligned to it, once. A
+                // pre-range starts before its plan names rows, so it stages: the route needs the pre-read off.
+                var direct_block: u64 = 0;
+                if (pool_opt.direct) {
+                    if (opt.lookahead) |la| if (la.preread) return error.InvalidOptions;
+                    direct_block = expert_io.fileBlockSize(bank.sidecar) catch return error.DirectReadsBlock;
+                    try expert_io.checkDirectBlock(direct_block, std.heap.pageSize());
+                    try checkDirectReads(bank, direct_block);
+                }
                 var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
                 if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
                 errdefer if (selector) |*sel| sel.deinit(a);
@@ -827,6 +948,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 // P7 overlap: a job is a bit of a part's blockers (u64), groups index the route ring.
                 if (opt.prompt_reads == .overlap and ahead_parts.len > 64) return error.InvalidOptions;
                 if (opt.prompt_ahead != .head and opt.prompt_reads != .overlap) return error.InvalidOptions;
+                // Relocation copies a layer's persistent row into a transient row: one geometry, rows interchangeable.
+                if (opt.prompt_relocate) {
+                    if (opt.prompt_reads != .overlap or alt_layer != null) return error.InvalidOptions;
+                    for (bank.layers) |*l| if (!sameGeometry(l, &bank.layers[widest])) return error.InvalidOptions;
+                }
                 const p7_rows: []P7Row = if (opt.prompt_reads == .overlap) try a.alloc(P7Row, bank.n_experts + opt.transient_rows) else &.{};
                 errdefer if (p7_rows.len > 0) a.free(p7_rows);
                 const ahead_job: []u8 = if (opt.prompt_reads == .overlap) try a.alloc(u8, bank.n_experts) else &.{};
@@ -871,9 +997,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .prompt_reads = opt.prompt_reads,
                     .prompt_ahead = opt.prompt_ahead,
                     .ahead_cap = opt.ahead_cap,
+                    .prompt_relocate = opt.prompt_relocate,
                     .p7_rows = p7_rows,
                     .ahead_job = ahead_job,
                 };
+                // Relocation's copies (`p7Relocate`): at most every persistent row's components per call, reserved once.
+                if (opt.prompt_relocate) try self.promote_copies.ensureTotalCapacity(a, @as(usize, n_components) * bank.n_experts);
+                self.direct_block = direct_block;
+                if (direct_block != 0) try self.checkRowsDirect(.construction);
                 return self;
             }
 
@@ -954,7 +1085,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     const off = self.bank.recordOffset(r.layer, e);
                     for (l.segments, 0..) |seg, c| {
                         const row = self.slotRow(r.layer, slot, @enumFromInt(c));
-                        try std.testing.expectEqual(minisOf(l) * seg.length, row.len);
+                        try std.testing.expectEqual(rowBytes(l, c), row.len);
                         for (0..minisOf(l)) |mi| try std.testing.expectEqualSlices(u8, image[off + mi * miniStride(l) + seg.offset ..][0..seg.length], row[mi * seg.length ..][0..seg.length]);
                     }
                 }
@@ -1238,11 +1369,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var routed: u32 = 0;
                 for (self.layers, 0..) |*ls, l| routed += @intFromBool(ls.policy.endRequest(out[l * n ..][0..n]));
                 return routed;
-            }
-
-            /// Whether the tally pins (seeded on its first layer: every layer is seeded together).
-            pub fn tallySeeded(self: *const Stream) bool {
-                return self.layers.len > 0 and self.layers[0].policy.seeded and self.layers[0].policy.pin_limit > 0;
             }
 
             /// P7 `overlap`: a request's read-ahead post (`AheadPost`), set once at the request's start by an arch that
@@ -1898,6 +2024,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 if (self.prompt_ahead == .whole_trim) try self.p7Withdraw(layer);
                 try self.p7Tail(layer);
+                if (self.prompt_relocate) try self.p7Relocate(layer);
                 try self.p7Rows(layer);
                 for (0..n_groups) |g| try self.p7Parts(@intCast(g));
                 try self.p7Post(0);
@@ -1997,6 +2124,60 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 ah.n = ah.posted + kept;
                 try self.postAheadJobs(layer, ah.n);
+            }
+
+            /// P7 overlap relocation (`Options.prompt_relocate`): each read-ahead record whose first event in the call's plans
+            /// is its row's eviction (an earlier group's seed or miss load takes the row before any group hits the record)
+            /// and that a later group loads again into a transient row no earlier group of the call reads (loads only: a
+            /// transient row is never a hit) is copied, now, from its read-ahead row into that transient row, every
+            /// component's row whole, and the row's meta made the record's: `p7Rows` then counts the row as holding it and
+            /// `p7Parts` makes that load a held one (no read). The record's read-ahead job is landed first (its rows hold
+            /// their records); the copies run before the call posts any read (`p7Post`), so no read writes a source row
+            /// before it is copied and no group reads a target row before the copy (every earlier group of the call reads
+            /// other rows; the previous call's routes are flushed). Plans, slots and kernels are the stock schedule's, and a
+            /// target row holds the bytes a read of the record would write (a row-for-row copy of the record's read):
+            /// exact by construction.
+            fn p7Relocate(self: *Stream, layer: u32) Error!void {
+                const ah = &self.ahead;
+                if (!ah.live or ah.layer != layer) return;
+                const p = &self.p7;
+                const cap = self.layers[layer].policy.capacity;
+                const copies = &self.promote_copies;
+                copies.clearRetainingCapacity();
+                var bytes: u64 = 0;
+                records: for (ah.loads[0..ah.n]) |l| {
+                    // The record's first event, in group order: a hit keeps it in place; its row's eviction marks it.
+                    const evicted: usize = first: for (0..p.n_groups) |gi| {
+                        const r = &self.routes[p.route[gi]];
+                        for (r.hit_slots[0..r.plan.n_hits]) |s| if (s == l.slot) continue :records;
+                        for (r.plan.evictionsOf()) |ev| if (ev.slot == l.slot and ev.previous == l.expert) break :first gi;
+                    } else continue :records;
+                    // Its load in a later group: a transient row that no group before that one loads.
+                    const to: u32 = later: for (evicted + 1..p.n_groups) |gi| {
+                        const r = &self.routes[p.route[gi]];
+                        for (r.plan.loadsOf()) |ld| if (ld.expert == l.expert) {
+                            if (ld.slot < cap) continue :records;
+                            for (0..gi) |gj| for (self.routes[p.route[gj]].plan.loadsOf()) |x| if (x.slot == ld.slot) continue :records;
+                            break :later ld.slot;
+                        };
+                    } else continue :records;
+                    // The source row holds the record once its job has landed (a record its row already held has a job too).
+                    const j = self.ahead_job[l.slot];
+                    if (j != no_job) try self.landAheadJob(j);
+                    const src = self.locate(layer, l.slot).meta;
+                    std.debug.assert(src.state == .ready and src.layer == layer and src.expert == l.expert);
+                    // Capacity reserved at construction: every persistent row's components.
+                    for (0..n_components) |c| {
+                        const dst = self.slotRow(layer, to, @enumFromInt(c));
+                        copies.appendAssumeCapacity(.{ .dst = dst, .src = self.slotRow(layer, l.slot, @enumFromInt(c)) });
+                        bytes += dst.len;
+                    }
+                    self.locate(layer, to).meta.* = .{ .state = .ready, .layer = @intCast(layer), .expert = l.expert };
+                }
+                if (bytes == 0) return;
+                // No promotion still reads a transient row (none on an overlap stream; settled here regardless).
+                self.settleCopies();
+                copyParallel(copies.items, bytes);
             }
 
             /// P7 overlap: every row's record and reader as the call starts (the slot meta, a read-ahead record counted as
@@ -2319,11 +2500,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 try self.flush();
                 for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
                 if (self.held_base.items.len > 0) return error.RoutesLive;
-                var bytes: u64 = 0;
-                for (self.transient.row_bytes) |n| bytes += n * self.transient.rows;
-                if (self.alt) |*x| for (x.rows.row_bytes) |n| {
-                    bytes += n * x.rows.rows;
-                };
+                var bytes: u64 = self.transient.allocBytes(&self.bank.layers[self.transient_layer]);
+                if (self.alt) |*x| bytes += x.rows.allocBytes(&self.bank.layers[x.layer]);
                 const before = if (self.memory == .mlx) mlxActive() else 0;
                 self.transient.deinit();
                 self.allocator.free(self.transient_meta);
@@ -2406,17 +2584,21 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 // arrays are already evaluated.
                 if (self.grow_fill == .zeros) try evalRows(a, exts);
                 for (exts) |*e| if (e.*) |*r| try r.bind();
+                // From here the stream owns the new rows (the errdefers above free none of them).
                 if (window0) |w| {
                     self.transient = w;
                     self.transient_meta = meta0;
                     self.transient_released = false;
+                    window0 = null;
                 }
                 if (alt0) |w| {
                     self.alt.?.rows = w;
                     self.alt.?.meta = alt_meta0;
+                    alt0 = null;
                 }
-                for (self.layers, decode_rows, exts) |*ls, rows, e| {
-                    ls.ext = e;
+                for (self.layers, decode_rows, exts) |*ls, rows, *e| {
+                    ls.ext = e.*;
+                    e.* = null;
                     ls.policy.grow(rows) catch unreachable;
                     // The tally's pins at decode's capacity, once per request (a route never re-ranks them).
                     ls.policy.refreshPins();
@@ -2427,6 +2609,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.wide_depth = 1;
                 self.route_lookahead = self.selector != null;
                 self.route_preread = self.route_lookahead and self.preread;
+                if (self.direct_block != 0) self.checkRowsDirect(.grow) catch |e| return self.failDirect(e);
                 if (comptime recording) if (self.recorder) |rec| for (self.layers, 0..) |*ls, l| {
                     rec.handover(@intCast(l), ls.policy.prefill_freq, ls.policy.slot_to_expert[0..ls.policy.capacity], ls.base.rows);
                 };
@@ -2446,14 +2629,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (self.layers, prompt_rows) |*ls, rows| if (rows != ls.base.rows) return error.InvalidRows;
                 try self.settleRoutes();
                 var bytes: u64 = 0;
-                for (self.layers) |*ls| if (ls.ext) |e| {
-                    for (e.row_bytes) |n| bytes += n * e.rows;
+                for (self.layers, self.bank.layers) |*ls, *geom| if (ls.ext) |*e| {
+                    bytes += e.allocBytes(geom);
                 };
-                if (self.release_installed) for (self.transient.row_bytes) |n| {
-                    bytes += n * self.transient.rows;
-                };
-                if (self.release_installed) if (self.alt) |*x| for (x.rows.row_bytes) |n| {
-                    bytes += n * x.rows.rows;
+                if (self.release_installed) bytes += self.transient.allocBytes(&self.bank.layers[self.transient_layer]);
+                if (self.release_installed) if (self.alt) |*x| {
+                    bytes += x.rows.allocBytes(&self.bank.layers[x.layer]);
                 };
                 const before = if (self.memory == .mlx) mlxActive() else 0;
                 for (self.layers, prompt_rows) |*ls, rows| {
@@ -2514,14 +2695,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return n;
             }
 
-            /// The prompt scratch's bytes (`regrowTransient` allocates them).
+            /// The prompt scratch's bytes (`regrowTransient` allocates them: `arrayBytes`, the bank's floor included).
             pub fn promptTransientBytes(self: *const Stream) u64 {
                 var n: u64 = 0;
-                for (self.bank.layers[self.transient_layer].segments) |seg| n += seg.length * minisOf(&self.bank.layers[self.transient_layer]);
-                if (self.alt) |x| for (self.bank.layers[x.layer].segments) |seg| {
-                    n += seg.length * minisOf(&self.bank.layers[x.layer]);
+                for (0..n_components) |c| n += arrayBytes(&self.bank.layers[self.transient_layer], c, self.prompt_transient_rows);
+                if (self.alt) |x| for (0..n_components) |c| {
+                    n += arrayBytes(&self.bank.layers[x.layer], c, self.prompt_transient_rows);
                 };
-                return n * self.prompt_transient_rows;
+                return n;
             }
 
             /// The reverse phase change's allocation, after its frees landed: the prompt's scratch (`Options.transient_rows`
@@ -2533,9 +2714,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (self.failed) return error.StreamFailed;
                 if (!self.transient_released) return error.TransientNotReleased;
                 var t = try Rows.init(&self.bank.layers[self.transient_layer], self.prompt_transient_rows, self.memory);
-                errdefer t.deinit();
+                // Until the install below; then the stream owns `t` and `meta`.
+                var installed = false;
+                errdefer if (!installed) t.deinit();
                 const meta = try self.allocator.alloc(SlotMeta, t.rows);
-                errdefer self.allocator.free(meta);
+                errdefer if (!installed) self.allocator.free(meta);
                 @memset(meta, .{});
                 var bytes: u64 = 0;
                 if (self.alt) |*x| {
@@ -2543,16 +2726,51 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     errdefer t2.deinit();
                     const meta2 = try self.allocator.alloc(SlotMeta, t2.rows);
                     @memset(meta2, .{});
-                    for (t2.row_bytes) |n| bytes += n * t2.rows;
+                    bytes += t2.allocBytes(&self.bank.layers[x.layer]);
                     x.rows = t2;
                     x.meta = meta2;
                 }
                 self.transient = t;
                 self.transient_meta = meta;
+                installed = true;
                 self.transient_released = false;
                 self.wide_depth = self.prompt_wide_depth;
-                for (t.row_bytes) |n| bytes += n * t.rows;
+                bytes += t.allocBytes(&self.bank.layers[self.transient_layer]);
+                if (self.direct_block != 0) self.checkRowsDirect(.regrow_transient) catch |e| return self.failDirect(e);
                 return bytes;
+            }
+
+            /// Every live slot row against the direct reads' block (`checkDirectRows`): at construction and after each phase
+            /// change's allocation (`grow`, `regrowTransient`), never per read.
+            fn checkRowsDirect(self: *const Stream, site: DirectSite) expert_io.DirectError!void {
+                for (self.layers, 0..) |*ls, l| {
+                    try self.directRowsAt(site, &ls.base, "base", l);
+                    if (ls.ext) |*e| try self.directRowsAt(site, e, "ext", l);
+                }
+                if (!self.transient_released) try self.directRowsAt(site, &self.transient, "transient", self.transient_layer);
+                if (self.alt) |*x| try self.directRowsAt(site, &x.rows, "alt", x.layer);
+            }
+
+            /// Where `checkRowsDirect` runs: the refusal line names it.
+            const DirectSite = enum { construction, grow, regrow_transient };
+
+            /// `checkDirectRows` on one bank of rows; a refusal logs one line (the refusal path only, never per read).
+            fn directRowsAt(self: *const Stream, site: DirectSite, r: *const Rows, which: []const u8, layer: usize) expert_io.DirectError!void {
+                checkDirectRows(r, self.direct_block) catch |e| {
+                    const blk = self.direct_block;
+                    for (r.base, r.row_bytes, 0..) |b, n, c| if (b % blk != 0 or n % blk != 0) {
+                        log.err("expert stream: direct rows refused at {t}: rows={s} layer={d} component={d} n_rows={d} base=0x{x} row_bytes={d} block={d} backing={t} phase={t} transient_released={}\n", .{ site, which, layer, c, r.rows, b, n, blk, r.backing, self.phase, self.transient_released });
+                        break;
+                    };
+                    return e;
+                };
+            }
+
+            /// A phase change's direct-rows refusal after its rows were installed: the stream fails closed (every later call
+            /// refused by `StreamFailed`).
+            fn failDirect(self: *Stream, err: expert_io.DirectError) expert_io.DirectError {
+                self.failed = true;
+                return err;
             }
 
             /// A settled result's read time; a result with payload and no preadv was copied out of a speculative record.

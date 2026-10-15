@@ -30,6 +30,9 @@ The supported models:
 - a MiMo-V2.6-Flash pack (a model directory whose `config.json` has `"model_type": "mimo_v2_flash"` and an
   `expert_streaming` block; [docs/mimo-pack.md](docs/mimo-pack.md) says how to prepare one);
 - a GLM-5.3 pack (`"model_type": "glm_moe_dsa"`; see GLM-5.3).
+- a GLM-5.3-Flash pack (`"model_type": "glm5_next"`), with an NVFP4 expert bank or an EXL3 K=3 (mul1) expert bank
+  (`expert-manifest-v2.json`); [docs/glm5-next.md](docs/glm5-next.md) gives the arch and its settings,
+  [docs/benchmarks/glm53-flash/](docs/benchmarks/glm53-flash/README.md) its benchmark record.
 
 No weights are included in this repository.
 
@@ -167,15 +170,20 @@ served behavior.
 | `DSV41_BILL_VARIANT` | server | `conservative` | `tight` bills one live K16 routed-group stream instead of four (only with the model's chunk-fenced taps). Any other value is refused by name at construction. |
 | `DSV41_SELFCHECK_REPORT` | server | off | `1` logs every kernel self-check result at construction (a failure is always logged and refuses the load). |
 | `GLM53_ROUTES` | server (profile builds) | off | Any value other than `0` arms GLM-5.3's route recorder: at each request's end, `glm53-routes-<pid>-<n>.bin` gets every decode route (layer, step, rows, routed ids, what served each id, the lookahead's records), each step's rows, drafts, accepted drafts and emitted tokens, and per layer the prompt's counts per expert and the residents at the handover. A value that starts with `/` is the directory; any other value writes to `/tmp`. The file layout is in `src/sdk_ext/expert/routes.zig`. |
-| `DSV41_CELL_ROUTED_FORMS` | cell | `stock` | `down_pair`, `gu_one` or both (comma list): the routed decode GEMVs rebuilt on those exact texts. |
-| `DSV41_CELL_ROUTED_BANKED` | cell | `0` | `1`: each routed decode stage runs as one launch over every bank's rows (exact). |
-| `DSV41_CELL_DEVROUTE` | cell | `0` | `1`: decode's hit wave runs as a device graph before the host's routing wait (exact; needs `ROUTED_BANKED`). |
-| `DSV41_CELL_HOIST_FIRST` | cell | `0` | `1`: each decode call commits its hoist right behind the routing barrier's arrays (exact). |
-| `DSV41_CELL_DRAFT_STAGED` | cell | `0` | `1`: each draft stage is committed as soon as it is built (exact). |
-| `DSV41_CELL_PHASE_SETTLE` | cell | `until_freed` | `interval`: the phase change's settle waits for the freed bytes only, not the grow's bound. |
+| `DSV41_CELL_ROUTED_FORMS` | cell | `down_pair,gu_one` (stack4) | `stock`, `down_pair`, `gu_one` or both (comma list): the routed decode GEMVs rebuilt on those exact texts. |
+| `DSV41_CELL_ROUTED_BANKED` | cell | `1` (stack4) | `1`: each routed decode stage runs as one launch over every bank's rows (exact); `0`: one launch per bank. |
+| `DSV41_CELL_DEVROUTE` | cell | `1` (stack4) | `1`: decode's hit wave runs as a device graph before the host's routing wait (exact; needs `ROUTED_BANKED`); `0`: the host builds it. |
+| `DSV41_CELL_HOIST_FIRST` | cell | `1` (stack4) | `1`: each decode call commits its hoist right behind the routing barrier's arrays (exact). |
+| `DSV41_CELL_DRAFT_STAGED` | cell | `1` (stack4) | `1`: each draft stage is committed as soon as it is built (exact); `0`: one commit per draft block. |
 | `DSV41_CELL_PHASE_POLL_MS` | cell | the settle's own | the phase change's footprint poll in ms (1 .. the settle bound; outside is refused). |
 | `DSV41_CELL_PREFILL_SUB` | cell | the cache's sub-chunk | the prompt rows per layer-major call; `whole` runs the prompt in one call. |
 | `DSV41_CELL_MAX_CONTEXT` | cell (bill tool) | 16,384 | the longest prompt the construction bills; the server takes it from `ctx_size`. |
+
+The five stack4 defaults above are the served tier's (`decode_stack4`, on unless `model-settings.json` sets it
+`false`, which turns all five off); a cell variable overrides its own route only.
+
+The cell refuses, by name, the retired levers `DSV41_CELL_PREDICT_BF16`, `DSV41_CELL_DENSE_RC`,
+`DSV41_CELL_PREFILL_INPUT_RELEASE` and `DSV41_CELL_PHASE_SETTLE` (`CellRetiredLever`).
 
 The test suites also read their own inputs (`DSV41_BANK`, device-only smoke switches, fixture paths, the cell
 harness's rows, baseline and output paths); each such test skips without its input.
@@ -371,7 +379,6 @@ Settings (`model-settings.json`):
 |---|---|---|
 | `ctx_size` | the longest prompt the load bills, 1 to 1,048,576 | 16,384 |
 | `max_output` | the most tokens a request may generate past its prompt, 1 to 1,048,576 | 131,072 |
-| `numeric_tier` | `stock` (the reference's op chain) | `stock` |
 | `expert_event_gates` | the GPU waits on the reads' events (`true`) or the host waits (`false`) | `true` |
 | `layer_major_prefill` | the prompt layer by layer (`true`) or chunk by chunk (`false`) | `true` |
 | `expert_wide_depth` | prompt expert groups read ahead per layer, 1 to 5 | 5 |
@@ -384,6 +391,8 @@ Settings (`model-settings.json`):
 | `expert_tally_file` | `on` (read at load, written at each request's end), `pinned` (read only), `off` | `on` |
 | `expert_units_cap` | at most this many units in either phase (a measurement's arms at the same rows) | off |
 | `rest_of_box_floor_bytes` | the rest of the box billed at least this (a measurement's arms at the same target) | off |
+
+The retired key `numeric_tier` is refused by name at load (`RetiredSettingsKey`).
 
 The rate tally (`sdk_ext.expert.tally`): per stream layer and expert, an EMA of the rate at which decode routes request
 it, folded in at each request's end; the top `expert_resident_ratio` of each layer's experts by rate are pinned
@@ -550,7 +559,7 @@ compressed-tensors does (needs the network, torch and compressed-tensors).
 ```
 build.zig, build.zig.zon   standalone build (drives the host's build)
 sdk/                       the arch contract's types (`sdk` module), the weight loader, reads past the page cache
-src/root.zig               the archs the host calls (`arch`, `archs`, `sdk`, `default_context`) and the tests' surface
+src/root.zig               the archs the host calls (`arch`, `archs`, `sdk`, `default_context`)
 src/tests.zig              the test root (`zig build mlx-stream-test` in the host)
 src/conformance.zig        the conformance suite's root
 src/arch/deepseek_v41/     the DeepSeek-V4.1 arch, with its tests
@@ -561,6 +570,7 @@ src/exl3/                  the EXL3 quant, kernels, source and self-checks
 src/expert/                the expert stream: bank, stream, admission and lookahead, with their tests
 src/sdk_ext.zig, sdk_ext/  the seams only this plugin consumes (expert source, kernel registry, quant, KV lanes, profile,
                            the draft lanes' acceptance)
+src/arch/glm5_next/        the GLM-5.3-Flash arch: settings, bill, forward, NVFP4 and EXL3 K=3 expert banks, draft lane
 src/arch/glm_moe_dsa/      the GLM-5.3 arch: its banks, bill, module, draft lane and parity tests
 src/arch/glm_moe_dsa/glm53_exl3/  GLM-5.3's EXL3 kernels, routes, quant and self-check (texts in src/kernels/glm53_exl3/)
 src/arch/glm_moe_dsa/trunk_kernels.zig  GLM-5.3's trunk kernels (top-k, routed combine) and their self-check (texts in
@@ -572,10 +582,13 @@ csrc/                      the C read pool, the MLX event / alloc shims (with Mi
                            and the profile-only timeline and power sources
 src/refusals.zig           the compile-fail cases of the sdk_ext contracts (`zig build refusals`)
 docs/                      design notes and the path map from the in-tree layout
+docs/benchmarks/           the benchmark records (glm53-flash/, mimo-v26-flash/)
 scripts/                   test_dsv41.sh, compile_kernels_offline.py, compile_mimo_kernels_offline.py,
                            prepare_mimo_pack.py   the pack builder (docs/mimo-pack.md)
                            glm_moe_dsa_goldens.py, glm_moe_dsa_mtp_goldens.py, glm_split_k3_table.py,
                            glm53_exl3_manifest.py, glm_trunk_manifest.py
+                           compile_glm5next_*_offline.py, glm5next_fusion_kernels_manifest.py   GLM-5.3-Flash's gate
+                           tools: CPU-only offline compiles of its kernel texts and the fusion manifest's writer (--check)
                            convert_glm_bank.py, convert_glm_exl3_bank.py, convert_glm_mxfp4_bank.py   the GLM-5.3
                            pack converters (docs/glm53-*pack-format.md), with their tests
 ```

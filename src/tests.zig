@@ -2,10 +2,6 @@
 //! (`-Dmlx-stream-dir=<this checkout>`); `zig build test` here does the same from this repo. A comptime block, not a
 //! test block: the root adds no test of its own.
 
-pub const plugin = @import("root.zig").plugin;
-pub const plugin_mimo = @import("root.zig").plugin_mimo;
-pub const testing = @import("root.zig").testing;
-
 comptime {
     _ = @import("arch/mimo_v2/root.zig");
     _ = @import("arch/mimo_v2/config.zig");
@@ -37,6 +33,28 @@ comptime {
     _ = @import("arch/mimo_v2/gpu_warm.zig");
     _ = @import("arch/mimo_v2/gpu_power.zig");
     _ = @import("arch/mimo_v2/gpu_warm_test.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/bank.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/bank_test.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/config.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/settings.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/nvfp4.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/kda.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/graph.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/bill.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/dump.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/root.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/module.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/profile.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/mtp.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/mtp_test.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/exl3_kernels.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/exl3_bank.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/exl3_math.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/exl3_parity.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/exl3_forms.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/exl3_forms_ref.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/exl3_kbench.zig");
+    _ = @import("arch/mimo_v2/stream_source.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");
@@ -69,7 +87,6 @@ comptime {
     _ = @import("arch/deepseek_v41/bill_mini_test.zig");
     _ = @import("arch/deepseek_v41/decode_timers.zig");
     _ = @import("arch/deepseek_v41/decode_first.zig");
-    _ = @import("arch/deepseek_v41/cache_sim.zig");
     _ = @import("arch/deepseek_v41/draft_routes.zig");
     _ = @import("arch/deepseek_v41/verify_timeline.zig");
     _ = @import("arch/deepseek_v41/host_heap.zig");
@@ -83,7 +100,6 @@ comptime {
     _ = @import("exl3/quant.zig");
     _ = @import("arch/deepseek_v41/kernel_routes.zig");
     _ = @import("arch/deepseek_v41/kernels_test.zig");
-    _ = @import("arch/deepseek_v41/profile.zig");
     _ = @import("sdk_ext.zig");
     _ = @import("ngram_table.zig");
     _ = @import("exl3/sushi_parity.zig");
@@ -110,7 +126,12 @@ comptime {
     _ = @import("arch/glm_moe_dsa/glm53_exl3/selfcheck.zig");
     _ = @import("arch/glm_moe_dsa/glm53_exl3/routes.zig");
     _ = @import("arch/glm_moe_dsa/glm53_exl3/quant.zig");
+    // GLM-5.3-Flash (glm5_next) needs the host's DSA kernels: its files build only on a host that exports them.
     // GLM-5.3's refusal on a host without its surface: its own file, compiled only on such a host (the GLM tests above
     // skip there).
     if (!@import("host_caps.zig").glm) _ = @import("arch/glm_moe_dsa/host_surface_test.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/decode_kernels.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/decode_kernels_selfcheck.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/decode_kernels_ref.zig");
+    if (@import("host_caps.zig").dsa_nax) _ = @import("arch/glm5_next/decode_kernels_parity.zig");
 }

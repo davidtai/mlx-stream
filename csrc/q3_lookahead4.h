@@ -97,9 +97,8 @@ int32_t q3ld_counters_n(void);
 int32_t q3ld_max_spec(void);
 int32_t q3ld_max_h(void);
 
-/* q3_event_shim.mm: [MTLSharedEvent setSignaledValue:] / signaledValue from any thread. */
+/* q3_event_shim.mm: [MTLSharedEvent setSignaledValue:] from any thread. */
 void q3ld_mtl_signal(void *event, uint64_t value);
-uint64_t q3ld_mtl_value(void *event);
 
 #ifdef Q3LD_INJECT
 /* Test builds: scripted preadv rules keyed by the syscall's aligned offset, each used once (code 1 EINTR,

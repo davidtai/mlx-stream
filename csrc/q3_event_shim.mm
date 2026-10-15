@@ -11,9 +11,3 @@ extern "C" void q3ld_mtl_signal(void *event, uint64_t value) {
         [(id<MTLSharedEvent>)event setSignaledValue:value];
     }
 }
-
-extern "C" uint64_t q3ld_mtl_value(void *event) {
-    @autoreleasepool {
-        return [(id<MTLSharedEvent>)event signaledValue];
-    }
-}

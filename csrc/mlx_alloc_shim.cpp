@@ -62,3 +62,8 @@ int dsv41_alloc_uninit(mlx_array* out, const int* shape, size_t ndim, mlx_dtype 
 
 // MiMo X12 measurement: the GPU's energy, DVFS-state and thermal-state residency (IOReport) and DVFS table (csrc/mimo_gpu_power.inc).
 #include "mimo_gpu_power.inc"
+// glm5_next: MLX's gather_qmm in nvfp4 mode with the per-expert global scale (mlx-c has no argument for it).
+#include "glm5_gather_qmm.inc"
+// Every arch's MLX custom kernels: the launch cache (sdk_ext/metal_launch.zig; the pinned MLX rebuilds and rehashes a
+// kernel's source on every apply).
+#include "mlx_launch_cache.inc"

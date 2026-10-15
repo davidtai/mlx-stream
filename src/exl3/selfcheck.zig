@@ -232,14 +232,9 @@ pub fn plan(reg: *const xk.Registry, want: std.EnumSet(Kernel), depth: Depth) st
     return out;
 }
 
-/// Runs every check of every kernel's plan; a failing check is recorded (with the latched MLX
-/// message) and the run continues, so one window reports the whole registry.
-pub fn runAll(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, report: *Report) !void {
-    return runOver(a, reg, bound, .full, .full, report);
-}
-
-/// As `runAll`, over the entries of `subset` (one consumer's kernels: `kernel_set.Set.selfCheck`) at `depth`,
-/// in registry order.
+/// Runs every check of `subset`'s plan (one consumer's kernels: `kernel_set.Set.selfCheck`) at `depth`, in registry
+/// order; a failing check is recorded (with the latched MLX message) and the run continues, so one window reports
+/// every kernel.
 pub fn runSubset(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, subset: []const Kernel, depth: Depth, report: *Report) !void {
     var want: std.EnumSet(Kernel) = .empty;
     for (subset) |k| want.insert(k);
@@ -269,12 +264,6 @@ fn runOver(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, want: 
     }
 }
 
-/// The acceptance gate: the whole plan on `bound`, refused (error.SelfCheckFailed, `diag`
-/// naming the first failure) unless every check passes. Nothing may launch the kernels before.
-pub fn accept(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, report: *Report, diag: ?*xk.Diag) !void {
-    try runAll(a, reg, bound, report);
-    try judge(report, diag);
-}
 
 /// The acceptance verdict over a finished plan: refused (error.SelfCheckFailed, `diag` naming
 /// the first failing kernel / check / site) unless every result passed and the plan ran.
@@ -2061,7 +2050,8 @@ test "dsv41 kernels gpu: every kernel of record passes its self-check" {
     defer bound.deinit();
     var report: Report = .{};
     defer report.deinit(a);
-    const verdict = accept(a, &reg, &bound, &report, &diag);
+    // The whole plan, then the acceptance verdict over it.
+    const verdict: anyerror!void = if (runOver(a, &reg, &bound, .full, .full, &report)) |_| judge(&report, &diag) else |e| e;
     try mlx.check(mlx.mlx_synchronize(stream));
     const lines = try report.writeJsonLines(a);
     defer a.free(lines);

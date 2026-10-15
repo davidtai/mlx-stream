@@ -16,7 +16,6 @@ const mdl = @import("model.zig");
 const xk = @import("../../exl3/kernels.zig");
 const kr = @import("kernel_routes.zig");
 const draft_routes = @import("draft_routes.zig");
-const sdk = @import("sdk");
 
 /// Bytes of one DSpark head expert (gate, up and down, mxfp4 with one e8m0
 /// scale per 32 weights): 18,800,640 on the bank of record, the stack of

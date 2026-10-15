@@ -743,13 +743,8 @@ pub const DigTable = struct { table: [80]i32, tgs: u32 };
 
 /// q3_prefill_dig_candidate.wave_table: per expert (<= 16, rows grouped by expert in order)
 /// slot, first row, rows, first threadgroup (unused: INT32_MAX); [64] experts, [65] threadgroups.
-/// `tiles` = the GEMM's threadgroups per 64-row tile (`digTiles`).
-pub fn digTable(experts: []const WaveExpert, tiles: u32) DigTable {
-    return digTableBm(experts, tiles, 64);
-}
-
-/// `digTable` at `bm`-row M tiles (64, or 128 for the 128-row GEMM texts): the first-threadgroup column counts
-/// ceil(rows / bm) tiles per expert; the slot, first-row and row columns are the same.
+/// `tiles` = the GEMM's threadgroups per `bm`-row M tile (`digTiles`; `bm` 64, or 128 for the 128-row GEMM texts):
+/// the first-threadgroup column counts ceil(rows / bm) tiles per expert.
 pub fn digTableBm(experts: []const WaveExpert, tiles: u32, bm: u32) DigTable {
     var t: [80]i32 = @splat(0);
     var row0: i64 = 0;
@@ -923,7 +918,7 @@ pub fn DigX(comptime G: type) type {
     };
 }
 
-/// A wave table on the device and its threadgroup count (`digTable`).
+/// A wave table on the device and its threadgroup count (`digTableBm`).
 pub fn DigTableArray(comptime G: type) type {
     return struct { tbl: G.T, tgs: u32 };
 }
@@ -1490,7 +1485,7 @@ test "dsv41 kernels ops: wave tables are the lanes' (DIG wave_table, rebuild slo
     const dx = DigX(Trace).init(&reg);
     try testing.expectEqual(@as(u32, 72), dx.digTiles(.gate_up));
     try testing.expectEqual(@as(u32, 80), dx.digTiles(.down));
-    const w = digTable(&.{ .{ .slot = 3, .rows = 70 }, .{ .slot = 0, .rows = 37 }, .{ .slot = 2, .rows = 20 } }, 72);
+    const w = digTableBm(&.{ .{ .slot = 3, .rows = 70 }, .{ .slot = 0, .rows = 37 }, .{ .slot = 2, .rows = 20 } }, 72, 64);
     try testing.expectEqualSlices(i32, &.{ 3, 0, 2, 0 }, w.table[0..4]);
     try testing.expectEqualSlices(i32, &.{ 0, 70, 107, 0 }, w.table[16..20]);
     try testing.expectEqualSlices(i32, &.{ 70, 37, 20, 0 }, w.table[32..36]);
@@ -2714,8 +2709,8 @@ test "dsv41 smoke 0b: take2 retune: the lane's take2 words on real records, bit 
                 const u_2: f32 = @as(f32, @floatFromInt(@as(u32, @truncate(h >> 16)) & 0xffffff)) / 16777216.0;
                 v.* = (u_1 + u_2 - 1.0) * 2.0;
             }
-            const tg = digTable(ex[0..per.len], d.digTiles(.gate_up));
-            const td = digTable(ex[0..per.len], d.digTiles(.down));
+            const tg = digTableBm(ex[0..per.len], d.digTiles(.gate_up), 64);
+            const td = digTableBm(ex[0..per.len], d.digTiles(.down), 64);
             const ni: c_int = @intCast(n);
             return .{
                 .rows = n,

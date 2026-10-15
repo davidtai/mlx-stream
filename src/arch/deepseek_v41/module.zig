@@ -46,9 +46,10 @@ const ds = @import("dspark.zig");
 const log = @import("sdk").log;
 
 const G = ops.MlxOps;
+/// The plugin's draw for every row handed to the host (`sdk_ext.sampler`): bound per request by `draft_lane.arm`.
+pub const Sampler = @import("../../sdk_ext.zig").sampler.SamplerOf(G);
 const expert_stream = @import("../../expert/stream.zig");
 const expert_event = sdk_ext.expert.event;
-const expert_io = sdk_ext.expert.io;
 const expert_bank = @import("../../expert/bank.zig");
 const Math = xp.QuantMath(G, xq.Accepted(G));
 // The RC routes' rows are the decode-width forwards the experts prove fit one route (never the wide lane).
@@ -124,8 +125,6 @@ pub const RouteOverrides = struct {
     decode_mxfp8_rows: ?bool = null,
     /// K16: each chunk's layer input stream released at its chunk fence (`inputStreamEarlyRelease`).
     input_stream_early_release: ?bool = null,
-    /// K16: each routed group's MoE inputs freed after its wide call (`prefillInputRelease`).
-    prefill_input_release: ?bool = null,
     /// The prompt's sub-chunk (`prefillSub`): the rows a layer-major call takes before the prompt continues in another
     /// call. null: `kvc.prefill_sub`; maxInt: the whole prompt in one call (the proof cell's control).
     prefill_sub: ?u64 = null,
@@ -136,8 +135,6 @@ pub const RouteOverrides = struct {
     prefill_shared_mid: ?bool = null,
     /// PREFILL_HCPOST: both HC combines at prompt widths in one pass on the region's numerics. null: the default, off.
     prefill_hcpost: ?bool = null,
-    /// P1's predictor GEMM on the gate as stored (bf16) instead of an f32 copy; exact outputs (it only chooses reads).
-    predict_bf16: ?bool = null,
     /// HEAD_MODE: the output head's codec (target and draft). mxfp8 quantizes the head once at construction and the
     /// Module drops the dense bf16 head; the verify head's m1rows kernel (C11) reads bf16 only, so it goes with it.
     /// Rounding-class: the ids change by design (the grader battery gates it).
@@ -148,9 +145,6 @@ pub const RouteOverrides = struct {
     /// ROUTED_FORMS (kbench v9, exact): the routed decode GEMVs' forms, each independently: down_pair (the down
     /// projection's pair text) and gu_one (gate and up in one launch). null: stock.
     routed_forms: ?xq.Forms = null,
-    /// DENSE_RC (kbench v7 / v7b): the shared gate | up stacked on RCPROJ, one launch (C29's other sites stay on
-    /// m1rows). Rounding-class (the head keeps C11's m1rows). null: off.
-    dense_rc: ?bool = null,
     /// ROUTED_BANKED (kbench v6d / v9b, exact): the routed decode stages on the banked texts, one launch per stage
     /// over a wave's rows of every bank (packed slot ids), the forms above taken. null: the default, off (per bank).
     routed_banked: ?bool = null,
@@ -174,8 +168,6 @@ pub const RouteOverrides = struct {
     /// null: the settle's own default (`phaseChangePollMs`). Exact: it moves only when the settle sees the frees, not
     /// what it reads or the one check that judges the last reading.
     phase_change_poll_ms: ?u32 = null,
-    /// The phase change's settle condition (`PhaseChangeSettle`). null: the default, `until_freed`.
-    phase_change_settle: ?PhaseChangeSettle = null,
     /// MLX's buffer cache limit through decode (set at the phase change; the bill's decode cache term). null: the
     /// default, the envelope's 268,435,456 B; at most that (a larger limit would bill past the admission's term).
     decode_cache_bytes: ?u64 = null,
@@ -245,23 +237,17 @@ pub const DecodeHost = struct {
     end: ?u64 = null,
 };
 
-/// What the phase change's settle waits for before its one check and the grow (polled every `phase_change_poll_ms`,
-/// at most `phase_change_settle_ms`, then refused by name).
-/// - `interval`: this process's footprint down since the pre-release reading by the bytes the frees report (the
+/// What a boundary's settle waited for before its one check (polled every `phase_change_poll_ms`, at most
+/// `phase_change_settle_ms`, then refused by name), as its record names it.
+/// - `interval` (the shrink's): this process's footprint down since the pre-release reading by the bytes the frees report (the
 ///   cache clear, the transient release), within `phase_change_tolerance_bytes`. Relative: the prompt's earlier
 ///   releases still trailing in the ledger count toward it (run 3bj: 1.414 GB of them between the boundary's
 ///   first reading and its frees, so one 5 ms poll satisfied it with 0.76 GB of the clear still landing).
-/// - `until_freed`: that, and the footprint at most the grow's bound, the decode phase's billed process bytes less the
+/// - `until_freed` (the phase change's): that, and the footprint at most the grow's bound, the decode phase's billed process bytes less the
 ///   grow's bytes (`untilFreedBound`): absolute, from the admission, so the grow lands within the decode bill whatever
 ///   trails; the time it takes is the reclaim's own lag. It bounds the grow, not decode: the decode bill's verify /
 ///   draft wave and decode cache arrive after the grow, and the decode phase's residual stays their check.
 pub const PhaseChangeSettle = enum { interval, until_freed };
-
-/// The settle condition the Module installs: the setting over the default (`until_freed`: its bound is absolute, so
-/// a fast poll cannot return on a reading the trailing releases satisfied).
-pub fn phaseChangeSettle(ov: RouteOverrides) PhaseChangeSettle {
-    return ov.phase_change_settle orelse .until_freed;
-}
 
 /// `until_freed`'s grow bound (the footprint before the grow): the decode phase's billed process bytes (`Bill.decodeTerms`,
 /// the admission) less the bytes the grow allocates: the decode slot banks over the prompt's (`slot_decode` -
@@ -380,11 +366,6 @@ pub fn inputStreamEarlyRelease(ov: RouteOverrides) bool {
     return ov.input_stream_early_release orelse numericTier(.served).routes.input_stream_early_release;
 }
 
-/// K16's MoE-input release as the Module installs it and the bill charges it (one resolver; off by default).
-pub fn prefillInputRelease(ov: RouteOverrides) bool {
-    return ov.prefill_input_release orelse numericTier(.served).routes.prefill_input_release;
-}
-
 /// The prompt's sub-chunk the Module installs and the bill reads (upstream deepseek_v4's `prefillSub()`, read by both
 /// its `extendState` and server.zig's prefill memory guard, deepseek_v4.zig:8063-8077): the override's, else
 /// `kvc.prefill_sub`. Only the layer-major pass takes sub-chunk calls (the chunk-major pass settles each span already).
@@ -399,7 +380,6 @@ pub fn multiturnRoute(ov: RouteOverrides) bool {
     return ov.bill_pinned_prompt == null;
 }
 
-/// A0 (a)'s route the Module installs: the capture and the warm class together (off by default).
 /// DEVROUTE as the hook binds it (`devroute`): the override, else stack4's default.
 pub fn devRoute(ov: RouteOverrides, stack4: bool) bool {
     return ov.devroute orelse stack4;
@@ -425,14 +405,11 @@ pub fn routedBanked(ov: RouteOverrides, stack4: bool) bool {
     return ov.routed_banked orelse stack4;
 }
 
-/// The phase change's settle poll the Module installs: the setting over its condition's default (`until_freed`:
-/// `phase_change_until_freed_poll_ms`; `interval`: `phase_change_poll_ms`, whose relative test a fast poll satisfies
-/// early); a value outside 1..`phase_change_settle_ms` refuses at construction.
+/// The phase change's settle poll the Module installs: the setting over `until_freed`'s default
+/// (`phase_change_until_freed_poll_ms`: its bound is absolute, so a fast poll cannot return on a reading the trailing
+/// releases satisfied); a value outside 1..`phase_change_settle_ms` refuses at construction.
 pub fn phaseChangePollMs(ov: RouteOverrides) error{PhaseChangePollMs}!u32 {
-    const ms = ov.phase_change_poll_ms orelse return switch (phaseChangeSettle(ov)) {
-        .interval => phase_change_poll_ms,
-        .until_freed => phase_change_until_freed_poll_ms,
-    };
+    const ms = ov.phase_change_poll_ms orelse return phase_change_until_freed_poll_ms;
     if (ms == 0 or ms > phase_change_settle_ms) return error.PhaseChangePollMs;
     return ms;
 }
@@ -523,6 +500,8 @@ const envelope = expert_admission.Envelope.dsv41_pass2;
 pub const Module = struct {
     gpa: std.mem.Allocator,
     g: G,
+    /// The request's sampler (mlx-stream's one stream): the first token and every serial step's, a clean request's.
+    sampler: Sampler,
     /// The load context's kernel set, its launcher installed on `g`.
     set: *kernel_set.Set,
     /// The EXL3 quant accepted on the set: the served routed-expert math (C2).
@@ -633,8 +612,10 @@ pub const Module = struct {
         };
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .set = undefined, .exl3 = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
+        self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .set = undefined, .exl3 = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined, .sampler = undefined };
         errdefer self.g.deinit();
+        self.sampler = try Sampler.init(gpa, s);
+        errdefer self.sampler.deinit();
         self.owner = std.Thread.getCurrentId();
         self.io = io;
         self.overrides = ov;
@@ -764,21 +745,12 @@ pub const Module = struct {
         if (ov.decode_smallm) |v| tier.routes.rc_smallm = v;
         if (ov.decode_mxfp8_rows) |v| tier.routes.rc_mxfp8_rows = v;
         tier.routes.input_stream_early_release = inputStreamEarlyRelease(ov);
-        tier.routes.prefill_input_release = prefillInputRelease(ov);
         if (ov.prefill_shared_mid) |v| tier.routes.prefill_shared_mid = v;
         if (ov.prefill_hcpost) |v| tier.routes.prefill_hcpost = v;
-        // The release frees the inputs the combine would read without the host shared experts and JOINLESS.
-        if (tier.routes.prefill_input_release and (!tier.routes.prefill_host_shared or !tier.routes.prefill_joinless))
-            return refused(refuse(&diag, error.InputReleaseRoute, "prefill input release needs the host shared experts and JOINLESS", .{}), &diag);
-        if (ov.predict_bf16) |v| tier.routes.predict_bf16 = v;
         if (ov.head_mode) |h| {
             tier.routes.head = h;
             if (h != .bf16) tier.routes.rc_head = false;
         }
-        if (ov.dense_rc) |v| if (v) {
-            if (!tier.routes.rc_mxfp8_rows) return error.DenseRcNeedsRows;
-            tier.routes.dense_rc = true;
-        };
         if (ov.head_mxfp8_rc) |v| {
             if (v and tier.routes.head != .mxfp8) return error.HeadMxfp8RcNeedsMxfp8;
             tier.routes.rc_head_mxfp8 = v;
@@ -797,13 +769,6 @@ pub const Module = struct {
         errdefer self.model.deinit(&self.g);
         // HEAD_MODE mxfp8: the model evaluated its quantized head at construction and reads nothing else of the
         // dense one (the draft head takes the model's), so the checkpoint's bf16 head leaves the device here.
-        if (tier.routes.dense_rc) {
-            // DENSE_RC: the model rebound the shared gate and up as views of its stack; the originals leave here.
-            var b: [96]u8 = undefined;
-            for (0..c.n_layers) |l| inline for (.{ "w1", "w3" }) |nm| inline for (.{ "weight", "scales" }) |part| {
-                weights.drop(try std.fmt.bufPrint(&b, "layers.{d}.ffn.shared_experts." ++ nm ++ "." ++ part, .{l}));
-            };
-        }
         if (tier.routes.head == .mxfp8) {
             weights.drop("head.weight");
             log.info("NATIVE head: mxfp8 (quantized once at construction), the dense bf16 head dropped: {d} B\n", .{self.model.droppedBytes()});
@@ -841,42 +806,32 @@ pub const Module = struct {
         self.installed.decode_smallm = self.model.tier.routes.rc_smallm;
         self.installed.decode_mxfp8_rows = self.model.tier.routes.rc_mxfp8_rows;
         self.installed.input_stream_early_release = self.model.tier.routes.input_stream_early_release;
-        self.installed.prefill_input_release = self.model.tier.routes.prefill_input_release;
         self.prefill_sub = prefillSub(ov, self.model.tier.layer_major);
         self.multiturn = multiturnRoute(ov);
         self.installed.prefill_sub = self.prefill_sub;
         self.installed.prefill_shared_mid = self.model.tier.routes.prefill_shared_mid;
         self.installed.prefill_hcpost = self.model.tier.routes.prefill_hcpost;
-        self.installed.predict_bf16 = self.model.tier.routes.predict_bf16;
         self.installed.head_mode = self.model.tier.routes.head;
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
         self.installed.routed_forms = self.exl3.forms;
         self.installed.routed_banked = self.exl3.banked != null;
         log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, banked {}\n", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_banked });
-        self.installed.dense_rc = self.model.tier.routes.dense_rc;
-        if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped\n", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}\n", .{self.installed.decodeSites(&line_buf)});
         log.info("NATIVE head installed: {t}, verify rows on m1rows {}\n", .{ self.installed.head_mode, self.model.head_rows != null });
         if (self.installed.head_mode == .mxfp8) log.info("NATIVE head mxfp8 apply: {s}\n", .{if (self.installed.head_mxfp8_rc) "rcproj (the verify rows and the draft block at <= 8 rows)" else "mlx quantized_matmul"});
         log.info("NATIVE prefill input streams: {s}\n", .{if (self.installed.input_stream_early_release) "released at each chunk fence" else "held to each chunk's HC post"});
         if (self.installed.prefill_hcpost) log.info("NATIVE prefill HC post: fused (both HC combines above 8 rows in one pass on the region's numerics; checked against the region at construction; word-exact on every normal-range and mixed-edge input tested, an input whose products are all below 2^-126 is not covered)\n", .{});
         if (self.installed.prefill_shared_mid) log.info("NATIVE prefill shared middle: compiled (the shared expert's clamps, silu and product as one region above 8 rows)\n", .{});
-        if (self.installed.prefill_input_release) log.info("NATIVE prefill input release: installed (each routed group's MoE inputs freed after its wide call)\n", .{});
-        log.info("NATIVE prefill predictor installed: {s}\n", .{if (self.installed.predict_bf16) "bf16 (the gate as stored)" else "f32 (the gate's f32 copy)"});
         log.info("NATIVE transient release: {s}\n", .{if (self.installed.transient_release) "installed (the phase change frees the scratch; decode keeps window 0)" else "off (the scratch's windows stay through decode)"});
         log.info("NATIVE grow fill: {t} ({s})\n", .{ self.installed.grow_fill, switch (self.installed.grow_fill) {
             .zeros => "the grown rows zero-filled on the GPU",
             .unfilled => "the grown rows MLX-owned without a fill; each is written by its read before any kernel reads it",
         } });
         self.installed.phase_change_poll_ms = poll_ms;
-        self.installed.phase_change_settle = phaseChangeSettle(ov);
         self.installed.decode_cache_bytes = decodeCacheLimit(ov) catch unreachable;
         log.info("NATIVE decode cache limit: {d} B ({s})\n", .{ self.installed.decode_cache_bytes, if (self.installed.decode_cache_bytes == envelope.decode_cache_bytes) "the envelope's" else "the route's" });
         log.info("NATIVE phase change poll: {d} ms (the settle's footprint reads, at most {d} ms)\n", .{ self.installed.phase_change_poll_ms, phase_change_settle_ms });
-        log.info("NATIVE phase change settle: {t} ({s})\n", .{ self.installed.phase_change_settle, switch (self.installed.phase_change_settle) {
-            .interval => "until the footprint is down by the freed bytes",
-            .until_freed => "until the footprint is down by the freed bytes and at most the grow's bound, the decode bill less the grow",
-        } });
+        log.info("NATIVE phase change settle: until_freed (until the footprint is down by the freed bytes and at most the grow's bound, the decode bill less the grow)\n", .{});
         const subset = switch (self.arm) {
             inline else => |t| if (t.arm.draft_subset) |*x| x else null,
         };
@@ -1142,6 +1097,7 @@ pub const Module = struct {
         self.dropArm();
         self.gpa.free(self.warm_peaks);
         self.dropKernels();
+        self.sampler.deinit();
         self.g.deinit();
         setCacheLimit(self.prev_cache_limit);
         gpa.destroy(self);
@@ -1728,9 +1684,11 @@ pub const Module = struct {
                 .unknown => reverseBoundKept(terms, scratch, terms.waves),
                 .fresh => unreachable,
             } else reverseBound(terms, scratch);
-            const st = settleReadings(LiveReader{ .io = m.io }, x.before, freed, m.installed.phase_change_poll_ms, bound);
-            m.reverse_change = .{ .vm_after = if (m.overrides.verify) VmMark.now() else null, .before = x.before, .after = st.after, .freed_bytes = x.before.cache + freed, .settle_ms = st.waited_ms, .bound_bytes = bound, .margin_bytes = @as(i64, @intCast(bound)) - @as(i64, @intCast(st.after.footprint)), .ms = 0 };
-            try checkSettled(x.before, st.after, freed, raisedBound(bound, sdk.memory.foreignBytes()));
+            // The host's other models' bytes, read once per change: the poll, the record and the check judge one bound.
+            const raised = raisedBound(bound, sdk.memory.foreignBytes()).?;
+            const st = settleReadings(LiveReader{ .io = m.io }, x.before, freed, m.installed.phase_change_poll_ms, raised);
+            m.reverse_change = .{ .vm_after = if (m.overrides.verify) VmMark.now() else null, .before = x.before, .after = st.after, .freed_bytes = x.before.cache + freed, .settle_ms = st.waited_ms, .bound_bytes = raised, .margin_bytes = @as(i64, @intCast(raised)) - @as(i64, @intCast(st.after.footprint)), .ms = 0 };
+            try checkSettled(x.before, st.after, freed, raised);
         }
 
         /// The prompt's scratch (when the decode freed it) and the prompt cache limit. The record takes the residents route
@@ -1813,15 +1771,13 @@ pub const Module = struct {
         // The frees' end (free_to_grow_ms starts here).
         const freed_at = std.Io.Timestamp.now(self.io, .boot);
         // until_freed: the admission's bound on the footprint before the grow (from the bill and the release's bytes).
-        const uf: ?@TypeOf(untilFreedBound(0, 0, 0, 0, 0)) = switch (self.installed.phase_change_settle) {
-            .interval => null,
-            .until_freed => untilFreedBound(self.bill.decodeTotal() - self.bill.baseline, self.bill.slot_prefill, self.bill.slot_decode, transient_freed, @intCast(self.model.c.n_layers)),
-        };
-        const bound: ?u64 = if (uf) |x| x.bound else null;
+        const uf = untilFreedBound(self.bill.decodeTotal() - self.bill.baseline, self.bill.slot_prefill, self.bill.slot_decode, transient_freed, @intCast(self.model.c.n_layers));
+        // Raised by the host's other models' bytes, read once per change: the poll, the record and the check judge one bound.
+        const bound: ?u64 = raisedBound(uf.bound, sdk.memory.foreignBytes());
         const st = settle(LiveReader{ .io = self.io }, before, freed_device, self.installed.phase_change_poll_ms, bound);
         if (v) marks[3] = VmMark.now();
-        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = released_here, .settle_ms = st.waited_ms, .settle = self.installed.phase_change_settle, .grow_bound_bytes = bound, .grow_bytes = if (uf) |x| x.grow else null, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
-        checkSettled(before, st.after, freed_device, raisedBound(bound, sdk.memory.foreignBytes())) catch |e| {
+        self.phase_change = .{ .before = before, .after = st.after, .freed_bytes = before.cache + freed_device, .transient_freed_bytes = released_here, .settle_ms = st.waited_ms, .settle = .until_freed, .grow_bound_bytes = bound, .grow_bytes = uf.grow, .margin_bytes = if (bound) |b| @as(i64, @intCast(b)) - @as(i64, @intCast(st.after.footprint)) else null };
+        checkSettled(before, st.after, freed_device, bound) catch |e| {
             // The readings over the bound: this request fails (nothing grew); the next request's reverse change returns
             // the Module to its prompt configuration on fresh readings. Not latched.
             self.phase_change.?.refused = @errorName(e);
@@ -1895,18 +1851,13 @@ pub const Module = struct {
     }
 };
 
-/// Whether `v41.PrefillBill` bills the layer-major pass (`layerMajorBytes`: one chunk's attention
-/// side and the routed group's sub-wave per layer, the server's per-request admission reads it).
-pub const layer_major_billed = true;
-
 /// The `layer_major_prefill` setting, checked before anything is built. K16 batches each layer's
 /// routed call across chunks (the wide lane): the stock tier's prompt forwards are decode-width.
-pub fn layerMajor(config: *const settings.Config) error{ LayerMajorOnStockTier, LayerMajorNotBilled, ReadAheadNeedsLayerMajor }!bool {
+pub fn layerMajor(config: *const settings.Config) error{ LayerMajorOnStockTier, ReadAheadNeedsLayerMajor }!bool {
     // P1's predictor pass is the layer-major prompt pass's (a chunk-major one has no layer top to read ahead from).
     if (config.dsv41WideReadAhead() and (!config.dsv41LayerMajor() or !config.dsv41WideSeed())) return error.ReadAheadNeedsLayerMajor;
     if (!config.dsv41LayerMajor()) return false;
     if ((config.numeric_tier orelse .served) == .stock) return error.LayerMajorOnStockTier;
-    if (!layer_major_billed) return error.LayerMajorNotBilled;
     return true;
 }
 
@@ -1942,8 +1893,6 @@ pub const Installed = struct {
     lookahead_budget: u32 = 0,
     /// The phase change's settle poll (ms), as installed (`phaseChangePollMs`).
     phase_change_poll_ms: u32 = phase_change_poll_ms,
-    /// The phase change's settle condition, as installed (`phaseChangeSettle`).
-    phase_change_settle: PhaseChangeSettle = .until_freed,
     /// The ring geometry the states are built with, as installed (`ringGeometry`; the bill reads the same).
     ring_geo: kvc.Geometry = .{},
     /// The grow's new rows' allocation, as installed in the stream.
@@ -1974,24 +1923,18 @@ pub const Installed = struct {
     decode_mxfp8_rows: bool = false,
     /// K16's input streams released at each chunk fence, as installed.
     input_stream_early_release: bool = false,
-    /// K16's routed groups' MoE inputs freed after the wide call, as installed.
-    prefill_input_release: bool = false,
     /// The prompt's sub-chunk (`prefillSub`; maxInt: one call).
     prefill_sub: u64 = std.math.maxInt(u64),
     /// The shared expert's middle compiled at prompt widths, as installed.
     prefill_shared_mid: bool = false,
     /// PREFILL_HCPOST's one-pass combine, as installed (past its construction check).
     prefill_hcpost: bool = false,
-    /// P1's predictor GEMM in bf16, as installed.
-    predict_bf16: bool = false,
     /// HEAD_MODE: the output head's codec as installed (target and draft).
     head_mode: graph.Routes.Head = .f32,
     /// The mxfp8 head's apply route as installed: RCPROJ (true) or MLX's quantized matmul.
     head_mxfp8_rc: bool = false,
     /// ROUTED_FORMS as installed.
     routed_forms: xq.Forms = .{},
-    /// DENSE_RC as installed.
-    dense_rc: bool = false,
     /// ROUTED_BANKED as installed (the quant's banked route and the hook's banked waves).
     routed_banked: bool = false,
     /// HOIST_FIRST as installed (the hook's barrier commits).
@@ -2280,10 +2223,6 @@ pub fn armOptions(config: *const settings.Config, ceiling: expert_admission.Ceil
     };
 }
 
-/// The fill's shape and target (the bill module's), re-exported for the module's callers.
-pub const FillBill = bill_mod.FillBill;
-pub const fill_prompt_tokens = bill_mod.fill_prompt_tokens;
-
 /// A request's prompt against the billed context (`Module.max_context`): longer is refused by name, once, before its pass.
 /// A `ctx_size` above the model's own limit (1,048,576: `max_position_embeddings`), refused by name before anything
 /// loads (`ctx_size_over_limit`): never silently the standard 16,384.
@@ -2340,8 +2279,6 @@ test "dsv41 module: a prompt over the billed context is refused before its pass,
     try checkContext(16384, 16384, 16384);
     try std.testing.expectError(error.ContextNotPinned, checkContext(3953, 16384, 16384));
 }
-pub const fill_max_tokens = bill_mod.fill_max_tokens;
-pub const min_fill_rows = bill_mod.min_fill_rows;
 
 /// What a Module's builder states once from the host's load: the GPU memory ceiling and the wired margin the fill's
 /// target stays under, and the host's loaders (the Engram sidecar). The served load passes `sdk.LoadCtx.ceiling`,
@@ -3188,11 +3125,9 @@ test "dsv41 module: the decode cache limit is a construction-time route; the env
 }
 
 test "dsv41 memory: the phase change's settle poll as a route (poll5): the same reads and check, its own wait steps" {
-    // The resolver: the settle's default (5 under until_freed, 250 under interval); an override in
-    // 1..phase_change_settle_ms; else refused at construction.
+    // The resolver: until_freed's default (5); an override in 1..phase_change_settle_ms; else refused at construction.
     try std.testing.expectEqual(@as(u32, 5), try phaseChangePollMs(.{}));
-    try std.testing.expectEqual(@as(u32, 250), try phaseChangePollMs(.{ .phase_change_settle = .interval }));
-    try std.testing.expectEqual(@as(u32, 250), try phaseChangePollMs(.{ .phase_change_settle = .until_freed, .phase_change_poll_ms = 250 }));
+    try std.testing.expectEqual(@as(u32, 250), try phaseChangePollMs(.{ .phase_change_poll_ms = 250 }));
     try std.testing.expectEqual(@as(u32, 5), try phaseChangePollMs(.{ .phase_change_poll_ms = 5 }));
     try std.testing.expectEqual(phase_change_settle_ms, try phaseChangePollMs(.{ .phase_change_poll_ms = phase_change_settle_ms }));
     try std.testing.expectError(error.PhaseChangePollMs, phaseChangePollMs(.{ .phase_change_poll_ms = 0 }));
@@ -3233,13 +3168,25 @@ test "dsv41 memory: another model in the process raises the bound by its bytes, 
     try checkSettled(before, after, 10 * gb, raisedBound(own_bound, 14_730_000_000));
     try std.testing.expectError(error.PhaseChangeFootprintOverBill, checkSettled(before, after, 10 * gb, raisedBound(own_bound, 13 * gb)));
     try std.testing.expectEqual(@as(?u64, null), raisedBound(null, 14_730_000_000));
+    // The settle poll judges the raised bound too: a footprint between the own bound and the raised one settles at the
+    // first reading (with the own bound it polled to `phase_change_settle_ms` on every request).
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{after}, .i = &i, .slept_ms = &slept }, before, 10 * gb, 5, raisedBound(own_bound, 14_730_000_000));
+        try std.testing.expectEqual(@as(u32, 0), st.waited_ms);
+        try std.testing.expectEqual(@as(usize, 1), i);
+        try checkSettled(before, st.after, 10 * gb, raisedBound(own_bound, 14_730_000_000));
+    }
+    {
+        var i: usize = 0;
+        var slept: u32 = 0;
+        const st = settle(FakeReader{ .readings = &.{after}, .i = &i, .slept_ms = &slept }, before, 10 * gb, 5, own_bound);
+        try std.testing.expectEqual(phase_change_settle_ms, st.waited_ms);
+    }
 }
 
 test "dsv41 memory: until_freed settles on the admission's bound (run 3bj): a reading above it keeps polling, the settled arms pass at once" {
-    // The resolver: until_freed by default (served and cell), interval on the setting (the control arm).
-    try std.testing.expectEqual(PhaseChangeSettle.until_freed, phaseChangeSettle(.{}));
-    try std.testing.expectEqual(PhaseChangeSettle.until_freed, (Installed{}).phase_change_settle);
-    try std.testing.expectEqual(PhaseChangeSettle.interval, phaseChangeSettle(.{ .phase_change_settle = .interval }));
     // The grow's bound from the bill (run 3bj's 134 / 164 rows): decode billed process 108,963,257,928 B, slot banks
     // 74,567,270,400 -> 90,545,971,200 B, + 40 layers x 9 arrays x 16 KiB rounding: the grow 15,984,599,040 B (measured
     // MLX active rise 15,980,298,240).
@@ -3266,7 +3213,7 @@ test "dsv41 memory: until_freed settles on the admission's bound (run 3bj): a re
     const early: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = 94_563_251_808 };
     const landed: BoundaryMemory = .{ .active = before.active, .cache = 0, .footprint = 92_437_427_712 };
     {
-        // interval (today's condition): returns on the early reading.
+        // interval (the relative condition alone, the shrink's): returns on the early reading.
         var i: usize = 0;
         var slept: u32 = 0;
         const st = settle(FakeReader{ .readings = &.{ early, landed }, .i = &i, .slept_ms = &slept }, before, 0, 5, null);

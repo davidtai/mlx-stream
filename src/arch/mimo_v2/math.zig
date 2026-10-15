@@ -1,5 +1,7 @@
 //! MiMo MXFP4 math for the shared DeepSeek expert prefill scheduler.
 //! The scheduler owns expert admission, reads, groups, and routed positions.
+//! `MathOf(F)` is the same math over another projection format `F` (its slot arrays and MLX's gathers over them:
+//! GLM-5.3-Flash's NVFP4 bank, glm5_next/nvfp4.zig). MiMo's math is `MathOf(Mxfp4)`: the same graphs, the same kernels.
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const ops = @import("../deepseek_v41/ops.zig");
@@ -13,38 +15,88 @@ const glue = @import("glue.zig");
 pub const tile_rows: u32 = 256;
 pub const projection_rows: u32 = 1024;
 const route_group_rows: u32 = @import("../../sdk_ext.zig").expert.policy.max_route_ids;
-const max_rows: u32 = @import("config.zig").prefill_max_tokens * 8;
 const T = mlx.mlx_array;
-const Proj = quant.GatherQmm.Arrays(T);
-const Arrays = quant.BankArrays(Proj);
 const Activation = *const fn (*ops.MlxOps, T, T) anyerror!T;
-const projection_params: quant.GatherQmm.Params = .{ .mode = .mxfp4, .bits = 4, .group_size = 32 };
 
-/// SDK projection backend over the existing native operation. MlxOps' own
-/// gatherQmm fixes sorted=false; this adapter exposes the SDK's sorted flag.
-const ProjectionOps = struct {
-    pub const T = mlx.mlx_array;
-    g: *ops.MlxOps,
-    pub fn shapeOf(p: *ProjectionOps, x: mlx.mlx_array) ops.Shape {
-        return p.g.shapeOf(x);
+/// MiMo's projection format (`MathOf`'s `F`): MLX's MXFP4 (E8M0 scales, group 32) through mlx-c's `mlx_gather_qmm`, {w, scales}
+/// per projection. Another format declares the same: `Projection`, `sortedGather`, `gather`, `window`, `EventProjection`,
+/// `max_call_tokens`, and `has_fused` (with `Fused`, its decode texts' type, when true).
+pub const Mxfp4 = struct {
+    /// The decode lane's fused texts over this format's banks (moe.zig: MiMo's banked / k1 families).
+    pub const has_fused = true;
+    pub const Fused = moe.Fused;
+    /// A call's tokens at most: `Math`'s row scratch holds their routed rows (top-8 each).
+    pub const max_call_tokens: u32 = @import("config.zig").prefill_max_tokens;
+    pub const params: quant.GatherQmm.Params = .{ .mode = .mxfp4, .bits = 4, .group_size = 32 };
+
+    pub fn Projection(comptime A: type) type {
+        return quant.GatherQmm.Arrays(A);
     }
-    pub fn reshape(p: *ProjectionOps, x: mlx.mlx_array, shape: []const c_int) !mlx.mlx_array {
-        return p.g.reshape(x, shape);
+
+    /// SDK projection backend over the existing native operation. MlxOps' own
+    /// gatherQmm fixes sorted=false; this adapter exposes the SDK's sorted flag.
+    const ProjectionOps = struct {
+        pub const T = mlx.mlx_array;
+        g: *ops.MlxOps,
+        pub fn shapeOf(p: *ProjectionOps, x: mlx.mlx_array) ops.Shape {
+            return p.g.shapeOf(x);
+        }
+        pub fn reshape(p: *ProjectionOps, x: mlx.mlx_array, shape: []const c_int) !mlx.mlx_array {
+            return p.g.reshape(x, shape);
+        }
+        pub fn gatherMatmul(p: *ProjectionOps, x: mlx.mlx_array, w: mlx.mlx_array, scales: ?mlx.mlx_array, biases: ?mlx.mlx_array, rhs: mlx.mlx_array, bits: u32, group: u32, mode: ?@import("sdk").QuantMode, sorted: bool) !mlx.mlx_array {
+            var result = mlx.mlx_array_new();
+            mlx.check(mlx.mlx_gather_qmm(&result, x, w, scales.?, biases orelse .{}, .{}, rhs, true, .some(@intCast(group)), .some(@intCast(bits)), mode.?.cstr(), sorted, p.g.s)) catch |err| {
+                _ = mlx.mlx_array_free(result);
+                return err;
+            };
+            return p.g.adopt(result);
+        }
+    };
+
+    /// A prompt tile's sorted gather: x [rows, in], rhs u32 [rows] (sorted) -> [rows, out].
+    pub fn sortedGather(g: *ops.MlxOps, x: T, p: Projection(T), rhs: T) !T {
+        var projection: ProjectionOps = .{ .g = g };
+        return quant.GatherQmm.gatherMatmul(ProjectionOps, &projection, &params, x, p, rhs, true);
     }
-    pub fn gatherMatmul(p: *ProjectionOps, x: mlx.mlx_array, w: mlx.mlx_array, scales: ?mlx.mlx_array, biases: ?mlx.mlx_array, rhs: mlx.mlx_array, bits: u32, group: u32, mode: ?@import("sdk").QuantMode, sorted: bool) !mlx.mlx_array {
-        var result = mlx.mlx_array_new();
-        mlx.check(mlx.mlx_gather_qmm(&result, x, w, scales.?, biases orelse .{}, .{}, rhs, true, .some(@intCast(group)), .some(@intCast(bits)), mode.?.cstr(), sorted, p.g.s)) catch |err| {
-            _ = mlx.mlx_array_free(result);
-            return err;
+
+    /// The decode lane's gather (and `matrix`'s one bank row): MlxOps' gather_qmm, unsorted.
+    pub fn gather(g: *ops.MlxOps, x: T, p: Projection(T), ids: T) !T {
+        return g.gatherQmm(x, p.w, p.scales.?, ids, .mxfp4);
+    }
+
+    /// Bank rows [lo, hi) of one projection: a leading-axis slice of a row-contiguous array (MLX `slice`: a shared-buffer
+    /// view at an offset, still row-contiguous, so `ensure_row_contiguous` passes it through uncopied).
+    pub fn window(g: *ops.MlxOps, p: Projection(T), lo: u32, hi: u32) !Projection(T) {
+        const ws = g.shapeOf(p.w);
+        const ss = g.shapeOf(p.scales.?);
+        const l: c_int = @intCast(lo);
+        const h: c_int = @intCast(hi);
+        return .{
+            .w = try g.slice(p.w, &.{ l, 0, 0 }, &.{ h, ws.d[1], ws.d[2] }, &.{ 1, 1, 1 }),
+            .scales = try g.slice(p.scales.?, &.{ l, 0, 0 }, &.{ h, ss.d[1], ss.d[2] }, &.{ 1, 1, 1 }),
         };
-        return p.g.adopt(result);
+    }
+
+    /// Native MXFP4 bindings are validated once by Source. The event aliases
+    /// retain exactly the packed weights and proven-present U8 exponents.
+    pub fn EventProjection(comptime A: type) type {
+        return struct {
+            pub const count: usize = 2;
+            pub fn inputs(p: Projection(A)) [count]A {
+                return .{ p.w, p.scales.? };
+            }
+            pub fn fromWaited(out: [count]A) Projection(A) {
+                return .{ .w = out[0], .scales = out[1], .biases = null };
+            }
+        };
     }
 };
-
-fn sortedProjection(g: *ops.MlxOps, x: T, p: Proj, rhs: T) !T {
-    var projection: ProjectionOps = .{ .g = g };
-    return quant.GatherQmm.gatherMatmul(ProjectionOps, &projection, &projection_params, x, p, rhs, true);
-}
+const Proj = Mxfp4.Projection(T);
+const Arrays = quant.BankArrays(Proj);
+const projection_params = Mxfp4.params;
+const sortedProjection = Mxfp4.sortedGather;
+const windowRows = Mxfp4.window;
 
 /// The shared scheduler's profiling surface, using MiMo's existing buckets.
 /// Deferred-base modes and its wide-call counter are unused by this route.
@@ -66,19 +118,7 @@ pub const Profile = struct {
 /// slots may be refilled after it). The same graphs over the same inputs in the same order: EXACT by construction.
 pub const Drain = enum { sync, pipelined, invalid };
 
-const TilesFn = fn (self: *Math, g: *ops.MlxOps, x: T, rows: quant.PrefillRows, bank: Arrays, kept: *std.ArrayList(T)) anyerror!void;
 const ReduceFn = fn (g: *ops.MlxOps, rows: T, rows_token: u32, route_weights: T, token: u32, stop: u32, hidden: c_int, out: *CombineOutputs) anyerror!void;
-/// The installed drain route: the projection tiles' and the reduction tiles' drivers.
-pub const Drains = struct { tiles: *const TilesFn, reduce: *const ReduceFn };
-
-pub fn drains(d: Drain) !Drains {
-    return switch (d) {
-        .sync => .{ .tiles = Math.projectTilesSync, .reduce = reduceTilesSync },
-        .pipelined => .{ .tiles = Math.projectTilesPipelined, .reduce = reduceTilesPipelined },
-        .invalid => error.MimoPrefillDrain,
-    };
-}
-
 /// The expert tile's bank view (`settings.prefill_bank_view`, bound once at construction: `bankViews`). MLX picks a
 /// sorted gather_qmm's kernel from the tile's rows B against the bank rows E it is handed (`GatherQMM::eval_gpu`,
 /// `gather_qmm_rhs_nax`): the sorted NAX GEMM when B >= 16 and B / E >= 4, its row tile bm = 64 when B / E >= 64 (else
@@ -96,45 +136,9 @@ pub fn drains(d: Drain) !Drains {
 /// the CPU (`mimo prefill bank view CPU`); the device proof is the pre-ship family `bankview` (`mimo bankview GPU`).
 pub const BankView = enum { full, window, invalid };
 
-/// One tile's bank as the GEMM sees it: the arrays handed to MLX and the slots rebased in place (`slots` sorted).
-const ViewFn = fn (g: *ops.MlxOps, bank: Arrays, slots: []u32) anyerror!Arrays;
-
-pub fn bankViews(v: BankView) !*const ViewFn {
-    return switch (v) {
-        .full => fullView,
-        .window => windowView,
-        .invalid => error.MimoPrefillBankView,
-    };
-}
-
 /// MLX's rule (`GatherQMM::eval_gpu`): a sorted M = 1 gather_qmm of B rows over E bank rows takes the sorted GEMM.
 pub fn sortedGemm(rows: usize, bank_rows: usize) bool {
     return rows >= 16 and rows / bank_rows >= 4;
-}
-
-fn fullView(_: *ops.MlxOps, bank: Arrays, _: []u32) anyerror!Arrays {
-    return bank;
-}
-
-fn windowView(g: *ops.MlxOps, bank: Arrays, slots: []u32) anyerror!Arrays {
-    if (!sortedGemm(slots.len, @intCast(g.shapeOf(bank.gate.w).d[0]))) return bank;
-    const lo = slots[0];
-    const hi = slots[slots.len - 1] + 1;
-    for (slots) |*s| s.* -= lo;
-    return .{ .gate = try windowRows(g, bank.gate, lo, hi), .up = try windowRows(g, bank.up, lo, hi), .down = try windowRows(g, bank.down, lo, hi) };
-}
-
-/// Bank rows [lo, hi) of one projection: a leading-axis slice of a row-contiguous array (MLX `slice`: a shared-buffer
-/// view at an offset, still row-contiguous, so `ensure_row_contiguous` passes it through uncopied).
-fn windowRows(g: *ops.MlxOps, p: Proj, lo: u32, hi: u32) !Proj {
-    const ws = g.shapeOf(p.w);
-    const ss = g.shapeOf(p.scales.?);
-    const l: c_int = @intCast(lo);
-    const h: c_int = @intCast(hi);
-    return .{
-        .w = try g.slice(p.w, &.{ l, 0, 0 }, &.{ h, ws.d[1], ws.d[2] }, &.{ 1, 1, 1 }),
-        .scales = try g.slice(p.scales.?, &.{ l, 0, 0 }, &.{ h, ss.d[1], ss.d[2] }, &.{ 1, 1, 1 }),
-    };
 }
 
 /// The pipelined route's second tile in flight: one more projection tile and one more reduction tile, at
@@ -157,7 +161,7 @@ pub const Predictor = struct {
     scores: *const fn (*const Predictor, *ops.MlxOps, T, T, T) anyerror!T = scoresF32,
 
     /// Construction: `.bf16` builds the kernel object and its per-M configs (hidden 4096, 256 experts only).
-    pub fn install(route: PredictRoute, geometry: bank_mod.Geometry) !Predictor {
+    pub fn install(route: PredictRoute, geometry: anytype) !Predictor {
         return switch (route) {
             .f32 => .{},
             .bf16 => .{ .rows = try glue.RouterRows.init(geometry.hidden_size, geometry.num_experts), .scores = scoresBf16 },
@@ -173,302 +177,343 @@ pub const Predictor = struct {
         return Math.predictorScores(g, x, router, correction);
     }
 
-    /// `router`: the next layer's BF16 [256, 4096] weight (the gate table `Source.validateGates` checked for this route).
+    /// `router`: the next layer's BF16 [256, 4096] weight (the gate table `Source.validateGatesFor` checked for this route).
     fn scoresBf16(p: *const Predictor, g: *ops.MlxOps, x: T, router: T, correction: T) anyerror!T {
         const logits = try g.adopt(try p.rows.apply(x, router, g.s));
         return g.add(try g.sigmoid(logits), correction);
     }
 };
 
-pub const Math = struct {
-    /// The decode lane's widest call: the MTP lane's verify (t1 + 3 drafts, `draft.verify_rows`), 4 x 8 = 32 routed
-    /// ids, one route (`max_route_ids` 48; construction refuses a wider bound). `Source.decodeLane` sends a decode-phase
-    /// call of at most these rows here: the fused texts (P <= 48 pairs, combine n <= 4), the hit pass, the decode
-    /// policy's admissions, the lookahead and its pre-read, each miss read once for the rows' union.
-    pub const decode_forward_rows: u32 = 4;
-    /// The scheduler's `routed` takes the wide lane from here (M >= 5). The prompt's M = 2..4 chunks take the wide
-    /// lane through `routedParts` (`Source.forward`'s phase route), so prompt calls are unchanged.
-    pub const prefill_min_tokens: u32 = decode_forward_rows + 1;
-    pub const wide_event_gates = true;
-    pub const predictor_decode_only = true;
-    pub const Profile = @import("math.zig").Profile;
-    /// Speculative hints only. Source installs borrowed F32 transposed routers
-    /// and correction vectors once; authoritative routing stays in Module.
-    /// BARRIER (mimo/barrier-residual): on MLX, a call of M > 1 rows (the MTP verify's) takes `predictorRows`, MLX's
-    /// gathered GEMV, in place of the [M, 4096] x [4096, 256] F32 GEMM; M = 1 (the serial token) keeps this graph op
-    /// for op. The scores only choose the lookahead's pre-reads (never an expert, a weight or a slot of the decode), so
-    /// the tokens are unchanged by construction; a verify row's hint may differ from the GEMM's in its last bits.
-    pub fn predictorScores(g: anytype, x: @TypeOf(g.*).T, router: @TypeOf(g.*).T, correction: @TypeOf(g.*).T) !@TypeOf(g.*).T {
-        if (comptime @TypeOf(g.*) == ops.MlxOps) {
-            const m = g.shapeOf(x).dim(0);
-            if (m > 1) return g.add(try g.sigmoid(try predictorRows(g, try g.astype(x, .float32), router, m)), correction);
+/// The prompt and decode expert math over projection format `F` (`Mxfp4` above: MiMo's): its slot arrays, its sorted and
+/// unsorted gathers and its bank window; every tile, drain, view and combine below is the format's own graph of the same
+/// schedule.
+pub fn MathOf(comptime F: type) type {
+    return struct {
+        const Self = @This();
+        const FProj = F.Projection(T);
+        const FArrays = quant.BankArrays(FProj);
+        const max_rows: u32 = F.max_call_tokens * 8;
+        const TilesFn = fn (self: *Self, g: *ops.MlxOps, x: T, rows: quant.PrefillRows, bank: FArrays, kept: *std.ArrayList(T)) anyerror!void;
+
+        /// The installed drain route: the projection tiles' and the reduction tiles' drivers.
+        pub const DrainSet = struct { tiles: *const TilesFn, reduce: *const ReduceFn };
+
+        pub fn drainsOf(d: Drain) !DrainSet {
+            return switch (d) {
+                .sync => .{ .tiles = Self.projectTilesSync, .reduce = reduceTilesSync },
+                .pipelined => .{ .tiles = Self.projectTilesPipelined, .reduce = reduceTilesPipelined },
+                .invalid => error.MimoPrefillDrain,
+            };
         }
-        return g.add(try g.sigmoid(try g.matmul(try g.astype(x, .float32), router)), correction);
-    }
 
-    /// `xf [M, K] @ router [K, N]` as M one-row products in one dispatch: `gather_mm` with a batch of M single rows
-    /// against the one router (index 0) routes to MLX's `gather_mv` (`gemv_t_gather`, the M = 1 product's `gemv_t`
-    /// blocking per row: 32 threadgroups at N = 256) where the M x 256 GEMM runs 8 output tiles down K = 4,096. The
-    /// m4lever1 cells measured that GEMM's predictor at ~62 us of each routed layer's barrier set at M = 4 (layer 47,
-    /// which has no next router, ends its barrier set 62 us sooner than every other full layer).
-    pub fn predictorRows(g: *ops.MlxOps, xf: T, router: T, m: c_int) !T {
-        const k = g.shapeOf(xf).dim(1);
-        const n = g.shapeOf(router).dim(1);
-        const rows = try g.reshape(xf, &.{ m, 1, k });
-        const one = try g.reshape(router, &.{ 1, k, n });
-        const zero: [1]u32 = .{0};
-        const rhs = try g.hostArray(std.mem.sliceAsBytes(&zero), &.{1}, .uint32);
-        var out = mlx.mlx_array_new();
-        mlx.check(mlx.mlx_gather_mm(&out, rows, one, .{}, rhs, false, g.s)) catch |err| {
-            _ = mlx.mlx_array_free(out);
-            return err;
-        };
-        return g.reshape(try g.adopt(out), &.{ m, n });
-    }
-    /// X19: the scheduler's decode predictor (`ExpertsWith.scoresOf`) through the installed route.
-    pub fn predictorScoresBound(self: *const Math, g: *ops.MlxOps, x: T, router: T, correction: T) !T {
-        return self.predictor.scores(&self.predictor, g, x, router, correction);
-    }
+        /// One tile's bank as the GEMM sees it: the arrays handed to MLX and the slots rebased in place (`slots` sorted).
+        const ViewFn = fn (g: *ops.MlxOps, bank: FArrays, slots: []u32) anyerror!FArrays;
 
-    pub fn Projection(comptime A: type) type {
-        return quant.GatherQmm.Arrays(A);
-    }
+        pub fn bankViewsOf(v: BankView) !*const ViewFn {
+            return switch (v) {
+                .full => viewFull,
+                .window => viewWindow,
+                .invalid => error.MimoPrefillBankView,
+            };
+        }
 
-    /// Native MXFP4 bindings are validated once by Source. The event aliases
-    /// retain exactly the packed weights and proven-present U8 exponents.
-    pub fn EventProjection(comptime A: type) type {
-        return struct {
-            pub const count: usize = 2;
-            pub fn inputs(p: Projection(A)) [count]A {
-                return .{ p.w, p.scales.? };
+        pub fn viewFull(_: *ops.MlxOps, bank: FArrays, _: []u32) anyerror!FArrays {
+            return bank;
+        }
+
+        pub fn viewWindow(g: *ops.MlxOps, bank: FArrays, slots: []u32) anyerror!FArrays {
+            if (!sortedGemm(slots.len, @intCast(g.shapeOf(bank.gate.w).d[0]))) return bank;
+            const lo = slots[0];
+            const hi = slots[slots.len - 1] + 1;
+            for (slots) |*s| s.* -= lo;
+            return .{ .gate = try F.window(g, bank.gate, lo, hi), .up = try F.window(g, bank.up, lo, hi), .down = try F.window(g, bank.down, lo, hi) };
+        }
+
+        /// The decode lane's widest call: the MTP lane's verify (t1 + 3 drafts, `draft.verify_rows`), 4 x 8 = 32 routed
+        /// ids, one route (`max_route_ids` 48; construction refuses a wider bound). `Source.decodeLane` sends a decode-phase
+        /// call of at most these rows here: the fused texts (P <= 48 pairs, combine n <= 4), the hit pass, the decode
+        /// policy's admissions, the lookahead and its pre-read, each miss read once for the rows' union.
+        pub const decode_forward_rows: u32 = 4;
+        /// The scheduler's `routed` takes the wide lane from here (M >= 5). The prompt's M = 2..4 chunks take the wide
+        /// lane through `routedParts` (`Source.forward`'s phase route), so prompt calls are unchanged.
+        pub const prefill_min_tokens: u32 = decode_forward_rows + 1;
+        pub const wide_event_gates = true;
+        pub const predictor_decode_only = true;
+        pub const Profile = @import("math.zig").Profile;
+        /// Speculative hints only. Source installs borrowed F32 transposed routers
+        /// and correction vectors once; authoritative routing stays in Module.
+        /// BARRIER (mimo/barrier-residual): on MLX, a call of M > 1 rows (the MTP verify's) takes `predictorRows`, MLX's
+        /// gathered GEMV, in place of the [M, 4096] x [4096, 256] F32 GEMM; M = 1 (the serial token) keeps this graph op
+        /// for op. The scores only choose the lookahead's pre-reads (never an expert, a weight or a slot of the decode), so
+        /// the tokens are unchanged by construction; a verify row's hint may differ from the GEMM's in its last bits.
+        pub fn predictorScores(g: anytype, x: @TypeOf(g.*).T, router: @TypeOf(g.*).T, correction: @TypeOf(g.*).T) !@TypeOf(g.*).T {
+            if (comptime @TypeOf(g.*) == ops.MlxOps) {
+                const m = g.shapeOf(x).dim(0);
+                if (m > 1) return g.add(try g.sigmoid(try predictorRows(g, try g.astype(x, .float32), router, m)), correction);
             }
-            pub fn fromWaited(out: [count]A) Projection(A) {
-                return .{ .w = out[0], .scales = out[1], .biases = null };
+            return g.add(try g.sigmoid(try g.matmul(try g.astype(x, .float32), router)), correction);
+        }
+
+        /// `xf [M, K] @ router [K, N]` as M one-row products in one dispatch: `gather_mm` with a batch of M single rows
+        /// against the one router (index 0) routes to MLX's `gather_mv` (`gemv_t_gather`, the M = 1 product's `gemv_t`
+        /// blocking per row: 32 threadgroups at N = 256) where the M x 256 GEMM runs 8 output tiles down K = 4,096. The
+        /// m4lever1 cells measured that GEMM's predictor at ~62 us of each routed layer's barrier set at M = 4 (layer 47,
+        /// which has no next router, ends its barrier set 62 us sooner than every other full layer).
+        pub fn predictorRows(g: *ops.MlxOps, xf: T, router: T, m: c_int) !T {
+            const k = g.shapeOf(xf).dim(1);
+            const n = g.shapeOf(router).dim(1);
+            const rows = try g.reshape(xf, &.{ m, 1, k });
+            const one = try g.reshape(router, &.{ 1, k, n });
+            const zero: [1]u32 = .{0};
+            const rhs = try g.hostArray(std.mem.sliceAsBytes(&zero), &.{1}, .uint32);
+            var out = mlx.mlx_array_new();
+            mlx.check(mlx.mlx_gather_mm(&out, rows, one, .{}, rhs, false, g.s)) catch |err| {
+                _ = mlx.mlx_array_free(out);
+                return err;
+            };
+            return g.reshape(try g.adopt(out), &.{ m, n });
+        }
+        /// X19: the scheduler's decode predictor (`ExpertsWith.scoresOf`) through the installed route.
+        pub fn predictorScoresBound(self: *const Self, g: *ops.MlxOps, x: T, router: T, correction: T) !T {
+            return self.predictor.scores(&self.predictor, g, x, router, correction);
+        }
+
+        pub fn Projection(comptime A: type) type {
+            return F.Projection(A);
+        }
+
+        pub fn EventProjection(comptime A: type) type {
+            return F.EventProjection(A);
+        }
+
+        allocator: std.mem.Allocator,
+        hidden: c_int,
+        inter: c_int,
+        activation: Activation,
+        /// Only the projection's row packing lives here. The shared scheduler
+        /// supplies the expert group and restores the full call's routed order.
+        order: []u32,
+        inverse: []u32,
+        kept: std.ArrayList(T),
+        zero_rhs: T,
+        /// L5: the fused decode texts (the format's `Fused`), installed at construction with `Options.banked`
+        /// (moe.Route.fused); null on the
+        /// stock route, whose scheduler never binds the banked waves.
+        fused: if (F.has_fused) ?F.Fused else void = if (F.has_fused) null else {},
+        /// The prompt pass's tile drains (`Drain`), bound at construction (`Source.Options.prefill_drain`); sync = the control.
+        drain: DrainSet = .{ .tiles = projectTilesSync, .reduce = reduceTilesSync },
+        /// The expert tiles' bank view (`BankView`), bound at construction (`Source.Options.prefill_bank_view`); full = the control.
+        bank_view: *const ViewFn = viewFull,
+        /// X19 (`predict_router`): the decode lookahead predictor's route, bound at construction (`Source.Options.predict_router`);
+        /// the control (`.f32`) is `predictorScores` on the transposed F32 router copy.
+        predictor: Predictor = .{},
+
+        pub fn init(a: std.mem.Allocator, geometry: anytype, activation: Activation) !Self {
+            const order = try a.alloc(u32, max_rows);
+            errdefer a.free(order);
+            const inverse = try a.alloc(u32, max_rows);
+            errdefer a.free(inverse);
+            var kept = try std.ArrayList(T).initCapacity(a, (max_rows + tile_rows - 1) / tile_rows + route_group_rows);
+            errdefer kept.deinit(a);
+            const zero = [_]u32{0};
+            const shape = [_]c_int{1};
+            const zero_rhs = mlx.mlx_array_new_data(std.mem.sliceAsBytes(&zero).ptr, &shape, shape.len, .uint32);
+            if (zero_rhs.ctx == null) return error.MlxError;
+            return .{ .allocator = a, .hidden = @intCast(geometry.hidden_size), .inter = @intCast(geometry.intermediate_size), .activation = activation, .order = order, .inverse = inverse, .kept = kept, .zero_rhs = zero_rhs };
+        }
+
+        pub fn deinit(self: *Self, g: *ops.MlxOps) void {
+            if (comptime F.has_fused) if (self.fused) |*f| f.deinit();
+            self.predictor.deinit();
+            for (self.kept.items) |x| g.release(x);
+            g.release(self.zero_rhs);
+            self.kept.deinit(self.allocator);
+            self.allocator.free(self.order);
+            self.allocator.free(self.inverse);
+        }
+
+        /// Required decode surface of the shared wrapper. Source.forward keeps
+        /// its existing one-token route; the installed prefill has no cold lane.
+        pub fn gateUp(self: *const Self, g: *ops.MlxOps, x: T, ids: T, gate: FProj, up: FProj) !T {
+            const n = g.shapeOf(x).d[0];
+            const repeated = try g.reshape(x, &.{ n, 1, self.hidden });
+            const gg = try g.reshape(try F.gather(g, repeated, gate, ids), &.{ n, self.inter });
+            const uu = try g.reshape(try F.gather(g, repeated, up, ids), &.{ n, self.inter });
+            return self.activation(g, gg, uu);
+        }
+
+        pub fn down(self: *const Self, g: *ops.MlxOps, h: T, ids: T, d: FProj) !T {
+            const n = g.shapeOf(h).d[0];
+            return g.reshape(try F.gather(g, try g.reshape(h, &.{ n, 1, self.inter }), d, ids), &.{ n, self.hidden });
+        }
+
+        /// L5: the shared scheduler's banked waves (bound by `Options.banked`, only with `fused` installed): every pair of
+        /// a wave in one text over the three banks, ids packed `bank << 24 | row`, x [P, H] one row per pair.
+        pub const has_banked = F.has_fused;
+
+        pub fn gateUpBanked(self: *const Self, g: *ops.MlxOps, x: T, ids: T, banks: *const [moe.n_banks]FArrays) !T {
+            return self.fused.?.gateUp(g, x, ids, banks);
+        }
+
+        /// The per-pair down rows [P, H] bf16 (the scheduler's join and the arch's combine follow).
+        pub fn downBanked(self: *const Self, g: *ops.MlxOps, h: T, ids: T, banks: *const [moe.n_banks]FArrays) !T {
+            return self.fused.?.down(g, h, ids, banks);
+        }
+
+        /// x is [1,count,K], so the existing gather operation sees the actual
+        /// token count as matrix M and a single RHS expert bank row.
+        fn matrix(self: *const Self, g: *ops.MlxOps, x: T, p: FProj, count: c_int, _: c_int, out: c_int) !T {
+            return g.reshape(try F.gather(g, x, p, self.zero_rhs), &.{ count, out });
+        }
+
+        /// Returns evaluated BF16 rows in the supplied group order, kept across
+        /// backend resets. Sorted projection graphs span experts and are bounded
+        /// by projection_rows, separately from the source's weighted reductions.
+        pub fn prefill(self: *Self, g: *ops.MlxOps, _: u32, x: T, rows: quant.PrefillRows, bank: FArrays) !T {
+            const n = rows.slot.len;
+            defer {
+                for (self.kept.items) |y| g.release(y);
+                self.kept.clearRetainingCapacity();
             }
-        };
-    }
-
-    allocator: std.mem.Allocator,
-    hidden: c_int,
-    inter: c_int,
-    activation: Activation,
-    /// Only the projection's row packing lives here. The shared scheduler
-    /// supplies the expert group and restores the full call's routed order.
-    order: []u32,
-    inverse: []u32,
-    kept: std.ArrayList(T),
-    zero_rhs: T,
-    /// L5: the fused decode texts, installed at construction with `Options.banked` (moe.Route.fused); null on the
-    /// stock route, whose scheduler never binds the banked waves.
-    fused: ?moe.Fused = null,
-    /// The prompt pass's tile drains (`Drain`), bound at construction (`Source.Options.prefill_drain`); sync = the control.
-    drain: Drains = .{ .tiles = projectTilesSync, .reduce = reduceTilesSync },
-    /// The expert tiles' bank view (`BankView`), bound at construction (`Source.Options.prefill_bank_view`); full = the control.
-    bank_view: *const ViewFn = fullView,
-    /// X19 (`predict_router`): the decode lookahead predictor's route, bound at construction (`Source.Options.predict_router`);
-    /// the control (`.f32`) is `predictorScores` on the transposed F32 router copy.
-    predictor: Predictor = .{},
-
-    pub fn init(a: std.mem.Allocator, geometry: bank_mod.Geometry, activation: Activation) !Math {
-        const order = try a.alloc(u32, max_rows);
-        errdefer a.free(order);
-        const inverse = try a.alloc(u32, max_rows);
-        errdefer a.free(inverse);
-        var kept = try std.ArrayList(T).initCapacity(a, (max_rows + tile_rows - 1) / tile_rows + route_group_rows);
-        errdefer kept.deinit(a);
-        const zero = [_]u32{0};
-        const shape = [_]c_int{1};
-        const zero_rhs = mlx.mlx_array_new_data(std.mem.sliceAsBytes(&zero).ptr, &shape, shape.len, .uint32);
-        if (zero_rhs.ctx == null) return error.MlxError;
-        return .{ .allocator = a, .hidden = @intCast(geometry.hidden_size), .inter = @intCast(geometry.intermediate_size), .activation = activation, .order = order, .inverse = inverse, .kept = kept, .zero_rhs = zero_rhs };
-    }
-
-    pub fn deinit(self: *Math, g: *ops.MlxOps) void {
-        if (self.fused) |*f| f.deinit();
-        self.predictor.deinit();
-        for (self.kept.items) |x| g.release(x);
-        g.release(self.zero_rhs);
-        self.kept.deinit(self.allocator);
-        self.allocator.free(self.order);
-        self.allocator.free(self.inverse);
-    }
-
-    /// Required decode surface of the shared wrapper. Source.forward keeps
-    /// its existing one-token route; the installed prefill has no cold lane.
-    pub fn gateUp(self: *const Math, g: *ops.MlxOps, x: T, ids: T, gate: Proj, up: Proj) !T {
-        const n = g.shapeOf(x).d[0];
-        const repeated = try g.reshape(x, &.{ n, 1, self.hidden });
-        const gg = try g.reshape(try g.gatherQmm(repeated, gate.w, gate.scales.?, ids, .mxfp4), &.{ n, self.inter });
-        const uu = try g.reshape(try g.gatherQmm(repeated, up.w, up.scales.?, ids, .mxfp4), &.{ n, self.inter });
-        return self.activation(g, gg, uu);
-    }
-
-    pub fn down(self: *const Math, g: *ops.MlxOps, h: T, ids: T, d: Proj) !T {
-        const n = g.shapeOf(h).d[0];
-        return g.reshape(try g.gatherQmm(try g.reshape(h, &.{ n, 1, self.inter }), d.w, d.scales.?, ids, .mxfp4), &.{ n, self.hidden });
-    }
-
-    /// L5: the shared scheduler's banked waves (bound by `Options.banked`, only with `fused` installed): every pair of
-    /// a wave in one text over the three banks, ids packed `bank << 24 | row`, x [P, H] one row per pair.
-    pub const has_banked = true;
-
-    pub fn gateUpBanked(self: *const Math, g: *ops.MlxOps, x: T, ids: T, banks: *const [moe.n_banks]Arrays) !T {
-        return self.fused.?.gateUp(g, x, ids, banks);
-    }
-
-    /// The per-pair down rows [P, H] bf16 (the scheduler's join and the arch's combine follow).
-    pub fn downBanked(self: *const Math, g: *ops.MlxOps, h: T, ids: T, banks: *const [moe.n_banks]Arrays) !T {
-        return self.fused.?.down(g, h, ids, banks);
-    }
-
-    /// x is [1,count,K], so the existing gather operation sees the actual
-    /// token count as matrix M and a single RHS expert bank row.
-    fn matrix(self: *const Math, g: *ops.MlxOps, x: T, p: Proj, count: c_int, _: c_int, out: c_int) !T {
-        return g.reshape(try g.gatherQmm(x, p.w, p.scales.?, self.zero_rhs, .mxfp4), &.{ count, out });
-    }
-
-    /// Returns evaluated BF16 rows in the supplied group order, kept across
-    /// backend resets. Sorted projection graphs span experts and are bounded
-    /// by projection_rows, separately from the source's weighted reductions.
-    pub fn prefill(self: *Math, g: *ops.MlxOps, _: u32, x: T, rows: quant.PrefillRows, bank: Arrays) !T {
-        const n = rows.slot.len;
-        defer {
+            try self.drain.tiles(self, g, x, rows, bank, &self.kept);
+            for (self.order[0..n], 0..) |o, i| self.inverse[o] = @intCast(i);
+            const join_start = profile.now();
+            const mark = g.mark();
+            const joined = try g.concat(self.kept.items, 0);
+            try g.evalAll(&.{joined});
+            const held_joined = g.keep(joined);
+            defer g.release(held_joined);
             for (self.kept.items) |y| g.release(y);
             self.kept.clearRetainingCapacity();
+            g.resetTo(mark);
+            const inverse = try g.hostArray(std.mem.sliceAsBytes(self.inverse[0..n]), &.{@intCast(n)}, .uint32);
+            const result = try g.take(held_joined, inverse, 0);
+            try g.evalAll(&.{result});
+            const held = g.keep(result);
+            g.resetTo(mark);
+            profile.charge(.join, join_start);
+            return held;
         }
-        try self.drain.tiles(self, g, x, rows, bank, &self.kept);
-        for (self.order[0..n], 0..) |o, i| self.inverse[o] = @intCast(i);
-        const join_start = profile.now();
-        const mark = g.mark();
-        const joined = try g.concat(self.kept.items, 0);
-        try g.evalAll(&.{joined});
-        const held_joined = g.keep(joined);
-        defer g.release(held_joined);
-        for (self.kept.items) |y| g.release(y);
-        self.kept.clearRetainingCapacity();
-        g.resetTo(mark);
-        const inverse = try g.hostArray(std.mem.sliceAsBytes(self.inverse[0..n]), &.{@intCast(n)}, .uint32);
-        const result = try g.take(held_joined, inverse, 0);
-        try g.evalAll(&.{result});
-        const held = g.keep(result);
-        g.resetTo(mark);
-        profile.charge(.join, join_start);
-        return held;
-    }
 
-    /// +join: the shared scheduler's unjoined route (`routedParts`) takes this.
-    pub const has_parts = true;
+        /// +join: the shared scheduler's unjoined route (`routedParts`) takes this.
+        pub const has_parts = true;
 
-    /// +join: `prefill`'s tiles as they are (no concatenate, no inverse take),
-    /// each tile's rows' indices into `rows` appended to `pos` in tile order.
-    /// The tiles are the same graphs over the same rows as `prefill`'s.
-    pub fn prefillParts(self: *Math, g: *ops.MlxOps, _: u32, x: T, rows: quant.PrefillRows, bank: Arrays, alloc: std.mem.Allocator, outs: *std.ArrayList(T), pos: *std.ArrayList(u32)) !void {
-        const n = rows.slot.len;
-        try outs.ensureUnusedCapacity(alloc, (n + projection_rows - 1) / projection_rows);
-        try pos.ensureUnusedCapacity(alloc, n);
-        try self.drain.tiles(self, g, x, rows, bank, outs);
-        pos.appendSliceAssumeCapacity(self.order[0..n]);
-    }
+        /// +join: `prefill`'s tiles as they are (no concatenate, no inverse take),
+        /// each tile's rows' indices into `rows` appended to `pos` in tile order.
+        /// The tiles are the same graphs over the same rows as `prefill`'s.
+        pub fn prefillParts(self: *Self, g: *ops.MlxOps, _: u32, x: T, rows: quant.PrefillRows, bank: FArrays, alloc: std.mem.Allocator, outs: *std.ArrayList(T), pos: *std.ArrayList(u32)) !void {
+            const n = rows.slot.len;
+            try outs.ensureUnusedCapacity(alloc, (n + projection_rows - 1) / projection_rows);
+            try pos.ensureUnusedCapacity(alloc, n);
+            try self.drain.tiles(self, g, x, rows, bank, outs);
+            pos.appendSliceAssumeCapacity(self.order[0..n]);
+        }
 
-    /// The stable slot packing (`self.order`): the call's rows sorted by slot (the same packing as the SDK's
-    /// gather-matmul prefill), the bounded sorted gathers then span the group's physical slots.
-    fn packRows(self: *Math, rows: quant.PrefillRows) []u32 {
-        const n = rows.slot.len;
-        const order = self.order[0..n];
-        for (order, 0..) |*o, i| o.* = @intCast(i);
-        std.sort.block(u32, order, rows.slot, struct {
-            fn lt(slots: []const u32, a: u32, b: u32) bool {
-                return slots[a] < slots[b];
+        /// The stable slot packing (`self.order`): the call's rows sorted by slot (the same packing as the SDK's
+        /// gather-matmul prefill), the bounded sorted gathers then span the group's physical slots.
+        fn packRows(self: *Self, rows: quant.PrefillRows) []u32 {
+            const n = rows.slot.len;
+            const order = self.order[0..n];
+            for (order, 0..) |*o, i| o.* = @intCast(i);
+            std.sort.block(u32, order, rows.slot, struct {
+                fn lt(slots: []const u32, a: u32, b: u32) bool {
+                    return slots[a] < slots[b];
+                }
+            }.lt);
+            return order;
+        }
+
+        /// One projection tile's graph over packed rows [start, stop): take, gate, up, activation, down (unevaluated).
+        fn tileGraph(self: *Self, g: *ops.MlxOps, x: T, rows: quant.PrefillRows, bank: FArrays, order: []const u32, start: usize, stop: usize) !T {
+            const encode_start = profile.now();
+            var source_rows: [projection_rows]u32 = undefined;
+            var slot_rows: [projection_rows]u32 = undefined;
+            for (order[start..stop], source_rows[0 .. stop - start], slot_rows[0 .. stop - start]) |o, *src, *slot| {
+                src.* = rows.act_row.?[o];
+                slot.* = rows.slot[o];
             }
-        }.lt);
-        return order;
-    }
-
-    /// One projection tile's graph over packed rows [start, stop): take, gate, up, activation, down (unevaluated).
-    fn tileGraph(self: *Math, g: *ops.MlxOps, x: T, rows: quant.PrefillRows, bank: Arrays, order: []const u32, start: usize, stop: usize) !T {
-        const encode_start = profile.now();
-        var source_rows: [projection_rows]u32 = undefined;
-        var slot_rows: [projection_rows]u32 = undefined;
-        for (order[start..stop], source_rows[0 .. stop - start], slot_rows[0 .. stop - start]) |o, *src, *slot| {
-            src.* = rows.act_row.?[o];
-            slot.* = rows.slot[o];
+            const view = try self.bank_view(g, bank, slot_rows[0 .. stop - start]);
+            if (comptime timeline.enabled) timeline.tile(.moe, @intCast(stop - start), @intCast(g.shapeOf(view.gate.w).d[0]), slot_rows[0 .. stop - start]);
+            const count: c_int = @intCast(stop - start);
+            const src = try g.hostArray(std.mem.sliceAsBytes(source_rows[0 .. stop - start]), &.{count}, .uint32);
+            const rhs = try g.hostArray(std.mem.sliceAsBytes(slot_rows[0 .. stop - start]), &.{count}, .uint32);
+            const act = try g.take(x, src, 0);
+            const gg = try F.sortedGather(g, act, view.gate, rhs);
+            const uu = try F.sortedGather(g, act, view.up, rhs);
+            const h = try self.activation(g, gg, uu);
+            const y = try F.sortedGather(g, h, view.down, rhs);
+            profile.charge(.encode, encode_start);
+            return y;
         }
-        const view = try self.bank_view(g, bank, slot_rows[0 .. stop - start]);
-        if (comptime timeline.enabled) timeline.tile(.moe, @intCast(stop - start), @intCast(g.shapeOf(view.gate.w).d[0]), slot_rows[0 .. stop - start]);
-        const count: c_int = @intCast(stop - start);
-        const src = try g.hostArray(std.mem.sliceAsBytes(source_rows[0 .. stop - start]), &.{count}, .uint32);
-        const rhs = try g.hostArray(std.mem.sliceAsBytes(slot_rows[0 .. stop - start]), &.{count}, .uint32);
-        const act = try g.take(x, src, 0);
-        const gg = try sortedProjection(g, act, view.gate, rhs);
-        const uu = try sortedProjection(g, act, view.up, rhs);
-        const h = try self.activation(g, gg, uu);
-        const y = try sortedProjection(g, h, view.down, rhs);
-        profile.charge(.encode, encode_start);
-        return y;
-    }
 
-    /// `Drain.sync` (the control): each bounded sorted projection tile evaluated, synchronized and appended KEPT to
-    /// `kept` (capacity reserved by the caller) before the next tile's graph is built.
-    fn projectTilesSync(self: *Math, g: *ops.MlxOps, x: T, rows: quant.PrefillRows, bank: Arrays, kept: *std.ArrayList(T)) !void {
-        const n = rows.slot.len;
-        const order = self.packRows(rows);
-        var start: usize = 0;
-        while (start < n) {
-            const stop = @min(start + projection_rows, n);
-            const mark = g.mark();
-            const y = try self.tileGraph(g, x, rows, bank, order, start, stop);
-            const drain_start = profile.now();
-            try g.evalAll(&.{y});
-            try mlx.check(mlx.mlx_synchronize(g.s));
-            profile.charge(.drain, drain_start);
-            kept.appendAssumeCapacity(g.keep(y));
-            g.resetTo(mark);
-            start = stop;
+        /// `Drain.sync` (the control): each bounded sorted projection tile evaluated, synchronized and appended KEPT to
+        /// `kept` (capacity reserved by the caller) before the next tile's graph is built.
+        fn projectTilesSync(self: *Self, g: *ops.MlxOps, x: T, rows: quant.PrefillRows, bank: FArrays, kept: *std.ArrayList(T)) !void {
+            const n = rows.slot.len;
+            const order = self.packRows(rows);
+            var start: usize = 0;
+            while (start < n) {
+                const stop = @min(start + projection_rows, n);
+                const mark = g.mark();
+                const y = try self.tileGraph(g, x, rows, bank, order, start, stop);
+                const drain_start = profile.now();
+                try g.evalAll(&.{y});
+                try mlx.check(mlx.mlx_synchronize(g.s));
+                profile.charge(.drain, drain_start);
+                kept.appendAssumeCapacity(g.keep(y));
+                g.resetTo(mark);
+                start = stop;
+            }
         }
-    }
 
-    /// `Drain.pipelined`: the same tiles, each committed (async eval) and appended KEPT, then the tile before it waited:
-    /// the GPU holds tile i while the host builds tile i + 1 (at most two in flight). The last tile is waited and the
-    /// stream synchronized before the call returns, as the control leaves it.
-    fn projectTilesPipelined(self: *Math, g: *ops.MlxOps, x: T, rows: quant.PrefillRows, bank: Arrays, kept: *std.ArrayList(T)) !void {
-        const n = rows.slot.len;
-        const order = self.packRows(rows);
-        var start: usize = 0;
-        var prev: ?T = null;
-        while (start < n) {
-            const stop = @min(start + projection_rows, n);
-            const mark = g.mark();
-            const y = try self.tileGraph(g, x, rows, bank, order, start, stop);
-            try g.asyncEval(&.{y});
-            const held = g.keep(y);
-            kept.appendAssumeCapacity(held);
-            g.resetTo(mark);
+        /// `Drain.pipelined`: the same tiles, each committed (async eval) and appended KEPT, then the tile before it waited:
+        /// the GPU holds tile i while the host builds tile i + 1 (at most two in flight). The last tile is waited and the
+        /// stream synchronized before the call returns, as the control leaves it.
+        fn projectTilesPipelined(self: *Self, g: *ops.MlxOps, x: T, rows: quant.PrefillRows, bank: FArrays, kept: *std.ArrayList(T)) !void {
+            const n = rows.slot.len;
+            const order = self.packRows(rows);
+            var start: usize = 0;
+            var prev: ?T = null;
+            while (start < n) {
+                const stop = @min(start + projection_rows, n);
+                const mark = g.mark();
+                const y = try self.tileGraph(g, x, rows, bank, order, start, stop);
+                try g.asyncEval(&.{y});
+                const held = g.keep(y);
+                kept.appendAssumeCapacity(held);
+                g.resetTo(mark);
+                if (prev) |p| {
+                    const drain_start = profile.now();
+                    try g.evalAll(&.{p});
+                    profile.charge(.drain, drain_start);
+                }
+                prev = held;
+                start = stop;
+            }
             if (prev) |p| {
                 const drain_start = profile.now();
                 try g.evalAll(&.{p});
+                try mlx.check(mlx.mlx_synchronize(g.s));
                 profile.charge(.drain, drain_start);
             }
-            prev = held;
-            start = stop;
         }
-        if (prev) |p| {
-            const drain_start = profile.now();
-            try g.evalAll(&.{p});
-            try mlx.check(mlx.mlx_synchronize(g.s));
-            profile.charge(.drain, drain_start);
-        }
-    }
 
-    /// Every matrix tile was evaluated and synchronized before its graph
-    /// was released. The scheduler still performs its existing group drain.
-    pub fn finishPrefill(_: *Math, _: *ops.MlxOps) !void {}
-};
+        /// Every matrix tile was evaluated and synchronized before its graph
+        /// was released. The scheduler still performs its existing group drain.
+        pub fn finishPrefill(_: *Self, _: *ops.MlxOps) !void {}
+    };
+}
+
+pub const Math = MathOf(Mxfp4);
+pub const drains = Math.drainsOf;
+pub const bankViews = Math.bankViewsOf;
+const fullView = Math.viewFull;
+const windowView = Math.viewWindow;
 
 /// The prompt pass's per-token routed combine (Source.forward, logical M >= 2): the unjoined tile outputs
 /// (`routedParts`); per gather tile of `combine_tokens` tokens, each source's rows taken in place, concatenated and
 /// permuted into [count, 8, H] (no [n, 8, H] array is built), then per tile of `tile_rows` tokens f32(row), times its f32
 /// route weight (a separate multiply), MLX's sum over the 8 routes (axis 1, fold order k = 0..7), BF16 once.
-
 pub const top_k: u32 = 8;
 /// Tokens per joinless gather tile (a multiple of `tile_rows`).
 pub const combine_tokens: u32 = 4 * tile_rows;

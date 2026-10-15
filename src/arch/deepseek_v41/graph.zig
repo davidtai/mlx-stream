@@ -60,9 +60,6 @@ pub fn LayerW(comptime T: type) type {
         sh_w1: Q(T),
         sh_w2: Q(T),
         sh_w3: Q(T),
-        /// DENSE_RC: the shared expert's gate and up stacked `[2 I, H / 4]` (gate rows first), built once by the model;
-        /// `sh_w1` / `sh_w3` are then its two halves (views).
-        sh_w13: ?Q(T) = null,
     };
 }
 
@@ -178,10 +175,6 @@ pub const Routes = struct {
     /// residual, the tap is settled), not at its routed group's HC post; the routed groups then hold one hc-width
     /// stream. Lifetime only: the same ops.
     input_stream_early_release: bool = false,
-    /// K16: each routed group's MoE inputs (the chunks' moe_in, their row views and concat) freed once the wide call's
-    /// waves drained and the host-shared experts were issued from them, before the group's final evaluation. Lifetime
-    /// only: the same ops. Needs JOINLESS and the host shared experts (the combine then reads neither input).
-    prefill_input_release: bool = false,
     /// The shared expert's middle (clamps, silu, product) as C22's compiled SharedMid region at prompt widths (rows
     /// above rc_max_rows); decode widths keep the op chain. The device probe found the region equal
     /// to the op chain word for word at 953 and 183 f32 rows (kbench hcpostx1ff57a9e, SHAREDMIDX).
@@ -190,9 +183,6 @@ pub const Routes = struct {
     /// of the compiled HcPost region, its words by construction on the region's numerics (needs prefill_hc_post: the
     /// region is the reference, checked at construction); decode widths keep their routes.
     prefill_hcpost: bool = false,
-    /// P1's predictor GEMM in the gate's stored bf16 (MLX accumulates in f32) instead of an f32 copy of the gate: the
-    /// seed it reads ahead may differ near ties. Exact outputs: the router decides the routes, the predictor only reads.
-    predict_bf16: bool = false,
     /// ENGRAM=prefetch (K16): the prompt pass's Engram gathers posted ahead of their layers on the row
     /// source's poster threads (the blocking read's bytes, in its order). Exact.
     engram_posted: bool = false,
@@ -204,9 +194,6 @@ pub const Routes = struct {
     /// (w1 / w3 / w2) and the Engram wkv in the M = 1 mxfp8 qmv order per row (RCPROJ keeps wq_a /
     /// wkv / wq_b / wo_b); bound per layer (the Engram's by the model).
     rc_mxfp8_rows: bool = false,
-    /// DENSE_RC (kbench v7 / v7b, rounding-class; needs rc_mxfp8_rows): the shared expert's gate and up as ONE RCPROJ
-    /// launch over their stacked weights (`LayerW.sh_w13`); C29's other sites stay on m1rows. Bound at construction.
-    dense_rc: bool = false,
     /// C27 INDEX_TOPK=metal at rows <= 8: an index source's select as one dispatch (the prefill
     /// route's kernel at the verify rows).
     rc_index_topk: bool = false,
@@ -309,20 +296,12 @@ pub fn MinvSites(comptime G: type) type {
         sh_w1: ?kr.Mxfp8Rows(G) = null,
         sh_w3: ?kr.Mxfp8Rows(G) = null,
         sh_w2: ?kr.Mxfp8Rows(G) = null,
-        /// DENSE_RC: gate and up in one RCPROJ launch over `LayerW.sh_w13` (sh_w1 / sh_w3 then unbound).
-        sh_w13: ?kr.Mxfp8Rows(G) = null,
 
         pub fn deinit(self: *Self, g: *G) void {
             inline for (.{ &self.cmp_wkv, &self.cmp_wgate, &self.wk, &self.wproj }) |x| if (x.*) |*r| r.deinit(g);
-            inline for (.{ &self.idx_wq_b, &self.sh_w1, &self.sh_w3, &self.sh_w2, &self.sh_w13 }) |x| if (x.*) |*r| r.deinit(g);
+            inline for (.{ &self.idx_wq_b, &self.sh_w1, &self.sh_w3, &self.sh_w2 }) |x| if (x.*) |*r| r.deinit(g);
         }
     };
-}
-
-/// DENSE_RC's stacked shared gate | up over every layer: the two mxfp8 weights' codes and e8m0 scales (I x H x 33 / 32
-/// each), what the model builds and the checkpoint's originals it drops.
-pub fn sharedGateUpBytes(c: *const v41.Config) u64 {
-    return @as(u64, c.n_layers) * 2 * @as(u64, c.moe_intermediate_size) * c.hidden_size * 33 / 32;
 }
 
 /// C14: one layer's RCPROJ sites (`kr.RcSite` minus the head), over its packed mxfp8 pairs.
@@ -565,7 +544,6 @@ pub fn Trunk(comptime G: type) type {
                     const geo = prefillGeometry(c);
                     k.hcpost = try kr.HcPostTf32(G).init(reg, &geo, null);
                 }
-                if (rt.dense_rc and !rt.rc_mxfp8_rows) return error.DenseRcNeedsRows;
                 if (rt.rc_smallm or rt.rc_mxfp8_rows) {
                     // The sites' x is the bf16 stream at these rows (C14 keeps it bf16).
                     if (!rt.rc_proj) return error.MinvNeedsProj;
@@ -584,12 +562,7 @@ pub fn Trunk(comptime G: type) type {
                             if (w.idx_k) |ik| ms.wk = try kr.SmallM(G).init(g, reg, if (li.ratio == 1) .wk_bf16 else .wk_f32, ik.wk, null);
                             if (w.idx_q) |iq| ms.wproj = try kr.SmallM(G).init(g, reg, .wproj, iq.weights_proj, null);
                         }
-                        if (rt.dense_rc) {
-                            const w13 = w.sh_w13 orelse return error.DenseRcNeedsStack;
-                            if (w.idx_q) |iq| ms.idx_wq_b = try m1Site(g, reg, .indexer_wq_b, iq.wq_b);
-                            ms.sh_w13 = try rcSite(g, reg, .shared_w1_w3, w13);
-                            ms.sh_w2 = try m1Site(g, reg, .shared_w2, w.sh_w2);
-                        } else if (rt.rc_mxfp8_rows) {
+                        if (rt.rc_mxfp8_rows) {
                             if (w.idx_q) |iq| ms.idx_wq_b = try m1Site(g, reg, .indexer_wq_b, iq.wq_b);
                             ms.sh_w1 = try m1Site(g, reg, .shared_w1_w3, w.sh_w1);
                             ms.sh_w3 = try m1Site(g, reg, .shared_w1_w3, w.sh_w3);
@@ -1744,16 +1717,6 @@ pub fn Trunk(comptime G: type) type {
                     out[n] = .{ .name = "shared_w2", .ok = try checkClose(g, try ms.sh_w2.?.call(g, h), try qlinear(g, h, w.sh_w2), 2e-2) };
                     n += 1;
                 };
-                if (l == 0) if (ms.sh_w13) |*s13| {
-                    // DENSE_RC: the stacked launch against the two stock projections side by side.
-                    const x = try checkFill(g, r, scratch, &.{ M, @intCast(c.hidden_size) }, 1.0, .bfloat16);
-                    const want = try g.concat(&.{ try qlinear(g, x, w.sh_w1), try qlinear(g, x, w.sh_w3) }, -1);
-                    out[n] = .{ .name = "shared_w13 rc", .ok = try checkClose(g, try s13.call(g, x), want, 2e-2) };
-                    n += 1;
-                    const h = try checkFill(g, r, scratch, &.{ M, @intCast(c.moe_intermediate_size) }, 1.0, .bfloat16);
-                    out[n] = .{ .name = "shared_w2", .ok = try checkClose(g, try ms.sh_w2.?.call(g, h), try qlinear(g, h, w.sh_w2), 2e-2) };
-                    n += 1;
-                };
             }
             if (kx.decode_topk) |*tk| {
                 const N: c_int = 1056;
@@ -1850,12 +1813,6 @@ pub fn Trunk(comptime G: type) type {
         pub fn m1Site(g: *G, reg: *const xk.Registry, site: kr.M1Site, q: Q(T)) !kr.Mxfp8Rows(G) {
             if (q.mode != .mxfp8) return error.Mxfp8RowsMode;
             return kr.Mxfp8Rows(G).init(g, reg, site, q.w, q.s, null);
-        }
-
-        /// DENSE_RC: one mxfp8 site on RCPROJ (`kr.rcRowsGeom`) over its packed pair.
-        pub fn rcSite(g: *G, reg: *const xk.Registry, site: kr.M1Site, q: Q(T)) !kr.Mxfp8Rows(G) {
-            if (q.mode != .mxfp8) return error.Mxfp8RowsMode;
-            return kr.Mxfp8Rows(G).initRc(g, reg, site, q.w, q.s, null) catch |e| return if (e == error.RouteInput) error.DenseRcGeometry else e;
         }
 
         /// `linear(x, w)`, at rows <= 8 on the C28 site when bound (x's leading dims flattened to M).
@@ -2134,8 +2091,8 @@ pub fn Trunk(comptime G: type) type {
         }
 
         /// The predictor's selection over `x` [rows, dim]: `gatePrefix`'s biased scores and each row's top-k ids by
-        /// `gateSelect`'s partition, unordered, int32 [rows, k]. The GEMM runs in `wf`'s dtype: the gate in f32 (the
-        /// router's numerics) or as stored in bf16 (`Routes.predict_bf16`); the scores are f32 either way.
+        /// `gateSelect`'s partition, unordered, int32 [rows, k]. The GEMM runs in `wf`'s dtype (the gate's f32 copy:
+        /// the router's numerics); the scores are f32.
         pub fn predictTopk(g: *G, c: *const v41.Config, x: T, wf: T, bias: T) !T {
             const logits = try g.astype(try linear(g, try g.astype(x, g.dtypeOf(wf)), wf), .float32);
             const biased = try g.add(try g.sqrt(try g.softplus(logits)), bias);
@@ -2187,30 +2144,9 @@ pub fn Trunk(comptime G: type) type {
             return s.w2.linear(g, try sharedMid(g, c, gl, ul, g.dtypeOf(x)));
         }
 
-        /// `sharedExpertMinv` (tests).
-        pub fn sharedExpertMinvFor(g: *G, c: *const v41.Config, rt: *const Routes, w: *const W, ms: ?*const MinvSites(G), x: T) !T {
-            return sharedExpertMinv(g, c, rt, w, ms, x);
-        }
-
         /// The shared expert with C29's rows at rows <= 8 when bound (else `sharedExpert`).
         fn sharedExpertMinv(g: *G, c: *const v41.Config, rt: *const Routes, w: *const W, ms: ?*const MinvSites(G), x: T) !T {
             const m = ms orelse return sharedExpertPrompt(g, c, rt, w, x);
-            if (m.sh_w13) |*s13| {
-                if (rowsOf(g, x, 1) > rc_max_rows) return sharedExpertPrompt(g, c, rt, w, x);
-                // DENSE_RC: gate | up in one launch, then their halves.
-                const gu = try m1Linear(g, s13, x, w.sh_w13.?);
-                const sh = g.shapeOf(gu);
-                const n: c_int = @divExact(sh.dim(-1), 2);
-                var lo: [ops.max_dims]c_int = @splat(0);
-                var hi = sh.d;
-                const st: [ops.max_dims]c_int = @splat(1);
-                hi[sh.n - 1] = n;
-                const gl = try g.slice(gu, lo[0..sh.n], hi[0..sh.n], st[0..sh.n]);
-                lo[sh.n - 1] = n;
-                hi[sh.n - 1] = 2 * n;
-                const ul = try g.slice(gu, lo[0..sh.n], hi[0..sh.n], st[0..sh.n]);
-                return m1Linear(g, &m.sh_w2.?, try sharedMid(g, c, gl, ul, g.dtypeOf(x)), w.sh_w2);
-            }
             if (m.sh_w1 == null or rowsOf(g, x, 1) > rc_max_rows) return sharedExpertPrompt(g, c, rt, w, x);
             const gl = try m1Linear(g, &m.sh_w1.?, x, w.sh_w1);
             const ul = try m1Linear(g, &m.sh_w3.?, x, w.sh_w3);
@@ -2849,92 +2785,6 @@ test "dsv41 smoke 0b: P1's predictor top-k is the router's selection on the same
     std.debug.print("\nP1 predictor smoke: {d} rows x {d} experts: the predictor's top-{d} sets == the router's\n", .{ rows, n, k });
 }
 
-test "dsv41 smoke 0b: P1's predictor on the gate as stored (bf16) takes its own scores' top-k, the router's wherever the rounding cannot reorder (MLX, GPU stream)" {
-    _ = std.c.getenv("DSV41_PHASE0B_MLX") orelse return error.SkipZigTest;
-    const mlx = @import("sdk").mlx;
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    var g = try ops.MlxOps.init(testing.allocator, s);
-    defer g.deinit();
-    const c = try realConfig();
-    const TrM = Trunk(ops.MlxOps);
-    // Enough rows that some sit within the bf16 rounding of the router's 6th / 7th scores: the data separates the routes.
-    const rows = 1024;
-    const dim: usize = c.hidden_size;
-    const n: usize = c.n_routed_experts;
-    const k: usize = c.n_experts_per_tok;
-    try testing.expect(n <= 512 and k <= 8);
-    const a = testing.allocator;
-    var rng = std.Random.DefaultPrng.init(0x5eed_91a2);
-    const r = rng.random();
-    const xs = try a.alloc(f32, rows * dim);
-    defer a.free(xs);
-    for (xs) |*v| v.* = r.floatNorm(f32);
-    const ws = try a.alloc(f32, n * dim);
-    defer a.free(ws);
-    for (ws) |*v| v.* = r.floatNorm(f32) * 0.02;
-    var bs: [512]f32 = undefined;
-    for (bs[0..n]) |*v| v.* = r.floatNorm(f32) * 0.1;
-    const x = try g.astype(try g.hostArray(std.mem.sliceAsBytes(xs), &.{ rows, @intCast(dim) }, .float32), .bfloat16);
-    // The gate as stored (bf16): what `Routes.predict_bf16` hands the predictor (no f32 copy).
-    const w = try g.astype(try g.hostArray(std.mem.sliceAsBytes(ws), &.{ @intCast(n), @intCast(dim) }, .float32), .bfloat16);
-    const bias = try g.hostArray(std.mem.sliceAsBytes(bs[0..n]), &.{@intCast(n)}, .float32);
-    const pre = try TrM.gatePrefix(&g, x, w, bias);
-    const route = try TrM.gateSelect(&g, &c, pre[0], pre[1]);
-    const got = try TrM.predictTopk(&g, &c, x, w, bias);
-    // The bf16 route's own scores and their top-k, by predictTopk's ops with the GEMM in the gate's dtype.
-    const sb = try g.add(try g.sqrt(try g.softplus(try g.astype(try TrM.linear(&g, try g.astype(x, .bfloat16), w), .float32))), bias);
-    const own = try g.astype(try TrM.sliceLast(&g, try g.argpartition(try g.neg(sb), @as(c_int, @intCast(k)) - 1, -1), 0, @intCast(k)), .int32);
-    try g.evalAll(&.{ route.indices, got, own, pre[1], sb });
-    const want_ids = try a.alloc(u16, rows * k);
-    defer a.free(want_ids);
-    const got_ids = try a.alloc(u16, rows * k);
-    defer a.free(got_ids);
-    const own_ids = try a.alloc(u16, rows * k);
-    defer a.free(own_ids);
-    const sf = try a.alloc(f32, rows * n);
-    defer a.free(sf);
-    const sbf = try a.alloc(f32, rows * n);
-    defer a.free(sbf);
-    const sorted = try a.alloc(f32, n);
-    defer a.free(sorted);
-    _ = try g.hostIds(route.indices, want_ids);
-    _ = try g.hostIds(got, got_ids);
-    _ = try g.hostIds(own, own_ids);
-    _ = try g.hostF32(pre[1], sf);
-    _ = try g.hostF32(sb, sbf);
-    var within: usize = 0;
-    var differ: usize = 0;
-    var differ_beyond: usize = 0;
-    for (0..rows) |i| {
-        const wi = want_ids[i * k ..][0..k];
-        const gi = got_ids[i * k ..][0..k];
-        const oi = own_ids[i * k ..][0..k];
-        std.mem.sort(u16, wi, {}, std.sort.asc(u16));
-        std.mem.sort(u16, gi, {}, std.sort.asc(u16));
-        std.mem.sort(u16, oi, {}, std.sort.asc(u16));
-        // (a) Its own scores' selection: the GEMM ran on the gate as stored.
-        try testing.expectEqualSlices(u16, oi, gi);
-        // (b) The router's wherever the bf16 perturbation (eps, the row's largest |bf16 - f32| score) cannot reorder the
-        // router's 6th and 7th scores (a margin over 2 eps keeps every top-k score above every other).
-        const row_f = sf[i * n ..][0..n];
-        const row_b = sbf[i * n ..][0..n];
-        var eps: f32 = 0;
-        for (row_f, row_b) |f, b| eps = @max(eps, @abs(b - f));
-        @memcpy(sorted, row_f);
-        std.mem.sort(f32, sorted, {}, std.sort.desc(f32));
-        const same = std.mem.eql(u16, wi, gi);
-        if (!same) differ += 1;
-        if (sorted[k - 1] - sorted[k] > 2 * eps) {
-            if (!same) differ_beyond += 1;
-        } else within += 1;
-    }
-    try testing.expectEqual(@as(usize, 0), differ_beyond);
-    // (c) The data separates the routes (some row's sets differ), so (a) tells the GEMM's dtype apart.
-    try testing.expect(differ > 0);
-    std.debug.print("\nP1 predictor bf16 smoke: {d} rows x {d} experts: the predictor's top-{d} sets == its own bf16 scores' on every row, == the router's on all {d} rows beyond twice the bf16 perturbation ({d} rows within it, {d} differ)\n", .{ rows, n, k, rows - within, within, differ });
-}
-
 fn miniConfig() !v41.Config {
     const json = try v41.testConfigJson(testing.allocator, .mini);
     defer testing.allocator.free(json);
@@ -3461,40 +3311,6 @@ test "dsv41 graph: the verify-row routes (C23, C27-C29) bind per layer, take row
     try expectShape(&g, out, &.{ 1, 5, 5120 }, .bfloat16);
     try testing.expect(!noneOf(&g, n0, .kernel));
     try testing.expect(noneOf(&g, n0, .sort) and noneOf(&g, n0, .argsort));
-}
-
-test "dsv41 graph: DENSE_RC binds the mxfp8 rows sites on RCPROJ over the stacked shared gate | up, one launch each" {
-    var kd: xk.Diag = .{};
-    var reg = try xk.Registry.init(testing.allocator, &xk.embedded, xk.manifest_sha256, &kd);
-    defer reg.deinit();
-    var g = TraceOps.init(testing.allocator);
-    defer g.deinit();
-    const c = try realConfig();
-    var ws: [v41.max_layers]LayerW(u32) = undefined;
-    for (0..c.n_layers) |l| ws[l] = try traceLayerW(&g, &c, c.layers[l]);
-    const rt: Routes = .{ .rc_proj = true, .rc_smallm = true, .rc_mxfp8_rows = true, .dense_rc = true, .selected_keys = true };
-    try testing.expectError(error.DenseRcNeedsStack, Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, ws[0..c.n_layers]));
-    const I: c_int = @intCast(c.moe_intermediate_size);
-    for (ws[0..c.n_layers]) |*w| w.sh_w13 = .{ .w = try g.input(&.{ 2 * I, @intCast(c.hidden_size / 4) }, .uint32), .s = try g.input(&.{ 2 * I, @intCast(c.hidden_size / 32) }, .uint8), .mode = .mxfp8 };
-    var bad = rt;
-    bad.rc_mxfp8_rows = false;
-    try testing.expectError(error.DenseRcNeedsRows, Tr.Kernels.init(testing.allocator, &g, &reg, &c, &bad, ws[0..c.n_layers]));
-    var k = try Tr.Kernels.init(testing.allocator, &g, &reg, &c, &rt, ws[0..c.n_layers]);
-    defer k.deinit(&g);
-    var l: usize = 0;
-    while (!c.layers[l].index_source) l += 1;
-    const ms = &k.minv.items[l];
-    try testing.expect(ms.sh_w13 != null and ms.sh_w1 == null and ms.sh_w3 == null and ms.sh_w2 != null and ms.idx_wq_b != null);
-    try testing.expectEqual(xk.Kernel.q3rc_mxfp8_fma, ms.sh_w13.?.e.kernel);
-    // The shared expert at 5 rows: one RCPROJ launch (gate | up stacked), w2 on m1rows, no qmm.
-    const l0 = g.launched.items.len;
-    const n0 = g.nodes.items.len;
-    const y = try Tr.sharedExpertMinvFor(&g, &c, &rt, &ws[l], ms, try g.input(&.{ 5, 5120 }, .bfloat16));
-    try expectShape(&g, y, &.{ 5, 5120 }, .bfloat16);
-    try testing.expectEqual(@as(usize, 1), g.launchesOf(l0, .q3rc_mxfp8_fma));
-    try testing.expectEqual(@as(usize, 1), g.launchesOf(l0, .dsv41_mxfp8_m1rows));
-    try testing.expectEqual(xk.Kernel.dsv41_mxfp8_m1rows, ms.idx_wq_b.?.e.kernel);
-    for (g.nodes.items[n0..]) |nd| try testing.expect(nd.op != .qmm);
 }
 
 test "dsv41 graph: HC mixes split pre / post / a Sinkhorn comb with 1 + 1 + 2 x 19 normalisations" {

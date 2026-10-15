@@ -33,10 +33,8 @@ const module = @import("module.zig");
 const gpu_ceiling = host_bridge.gpu_ceiling;
 const cell = @import("cell.zig");
 const arm_mod = @import("arm.zig");
-const expert_admission = @import("../../expert/admission.zig");
 const bill_mod = @import("bill.zig");
 const CellBill = bill_mod.Bill;
-const PhaseTerms = bill_mod.PhaseTerms;
 const PhaseMemory = bill_mod.PhaseMemory;
 const phaseMemory = bill_mod.phaseMemory;
 const printPhaseMemory = bill_mod.printPhaseMemory;
@@ -687,6 +685,30 @@ fn envStr(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
 }
 
+/// The cell levers this build no longer takes (each one dead in the ledger): a window that still sets one is refused by
+/// name before any work, never ignored.
+const retired_cell_levers = [_][:0]const u8{ "DSV41_CELL_PREDICT_BF16", "DSV41_CELL_DENSE_RC", "DSV41_CELL_PREFILL_INPUT_RELEASE", "DSV41_CELL_PHASE_SETTLE" };
+
+/// The first retired cell lever that `getenv` finds set, or null.
+fn retiredCellLever(getenv: anytype) ?[]const u8 {
+    for (retired_cell_levers) |n| if (getenv(n.ptr) != null) return n;
+    return null;
+}
+
+test "dsv41 served cell: a retired cell lever is refused by name" {
+    const Env = struct {
+        fn none(_: [*:0]const u8) ?[*:0]const u8 {
+            return null;
+        }
+        fn all(_: [*:0]const u8) ?[*:0]const u8 {
+            return "1";
+        }
+    };
+    try std.testing.expectEqual(@as(?[]const u8, null), retiredCellLever(Env.none));
+    for (retired_cell_levers) |n| try std.testing.expect(std.mem.indexOf(u8, std.mem.span(n.ptr), "DSV41_CELL_") == 0);
+    try std.testing.expectEqualStrings(retired_cell_levers[0], retiredCellLever(Env.all).?);
+}
+
 /// A profile build's read-outs, armed by a decode-profile run (DSV41_CELL_DECODE_PROFILE), each off with its env set
 /// to 0: the draft's routed ids, the verify's GPU timeline, the host heap at three marks, and MLX_NEWBUFFER:
 /// -[MTLDevice newBufferWithLength:options:] calls and bytes (MLX's buffer-cache miss allocations; MLX keeps no
@@ -1144,9 +1166,6 @@ const CellReceipt = struct {
     phase_change: ?module.PhaseChangeRecord = null,
     /// The phase change's settle poll (ms) as the Module installed it (`module.phaseChangePollMs`; the default 250).
     phase_change_poll_ms: ?u32 = null,
-    /// The phase change's settle condition as the Module installed it (`module.phaseChangeSettle`; the default until_freed).
-    /// until_freed's bound, grow and margin ride in `phase_change`.
-    phase_change_settle: ?module.PhaseChangeSettle = null,
     /// The grow's new rows' allocation as installed (`module.growFill`; zeros by default).
     grow_fill: ?[]const u8 = null,
     /// The request's index through this Module (1 = the first; request k > 1 follows a reverse phase change).
@@ -1168,24 +1187,18 @@ const CellReceipt = struct {
     decode_mxfp8_rows: ?bool = null,
     /// K16's input streams released at each chunk fence (installed).
     input_stream_early_release: ?bool = null,
-    /// K16's routed groups' MoE inputs freed after the wide call (installed).
-    prefill_input_release: ?bool = null,
     /// The prompt's sub-chunk rows as installed (null: the prompt in one call).
     prefill_sub: ?u64 = null,
     /// The shared expert's middle at prompt widths as installed: "compiled" or "eager".
     prefill_shared_mid: ?[]const u8 = null,
     /// The prompt-width HC combines as installed: "fused" (one pass) or "region" (the compiled HcPost).
     prefill_hcpost: ?[]const u8 = null,
-    /// P1's predictor GEMM in bf16 (installed): the gate as stored, not its f32 copy.
-    predict_bf16: ?bool = null,
     /// HEAD_MODE (installed): the output head's codec, "bf16" or "mxfp8" (target and draft).
     head_mode: ?[]const u8 = null,
     /// The mxfp8 head's apply route (installed): RCPROJ (true) or MLX's quantized matmul; null on a bf16 head.
     head_mxfp8_rc: ?bool = null,
     /// ROUTED_FORMS as installed: "stock", "down_pair", "gu_one" or "down_pair,gu_one".
     routed_forms: []const u8 = "stock",
-    /// DENSE_RC as installed.
-    dense_rc: ?bool = null,
     /// ROUTED_BANKED as installed: the routed decode stages one launch over every bank (true) or per bank.
     routed_banked: bool = false,
     /// HOIST_FIRST as installed: each decode call's hoist committed before its routing barrier's wait (true) or behind
@@ -1634,7 +1647,6 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .phase_memory = &phases,
         .phase_change = md.phase_change,
         .phase_change_poll_ms = md.installed.phase_change_poll_ms,
-        .phase_change_settle = md.installed.phase_change_settle,
         .grow_fill = @tagName(md.installed.grow_fill),
         .request = cx.request,
         .decode_cache_bytes = md.installed.decode_cache_bytes,
@@ -1653,15 +1665,12 @@ fn cellRun(arm: anytype, cx: CellCtx) !void {
         .decode_smallm = md.installed.decode_smallm,
         .decode_mxfp8_rows = md.installed.decode_mxfp8_rows,
         .input_stream_early_release = md.installed.input_stream_early_release,
-        .prefill_input_release = md.installed.prefill_input_release,
         .prefill_sub = if (md.installed.prefill_sub == std.math.maxInt(u64)) null else md.installed.prefill_sub,
         .prefill_shared_mid = if (md.installed.prefill_shared_mid) "compiled" else "eager",
         .prefill_hcpost = if (md.installed.prefill_hcpost) "fused" else "region",
-        .predict_bf16 = md.installed.predict_bf16,
         .head_mode = @tagName(md.installed.head_mode),
         .head_mxfp8_rc = if (md.installed.head_mode == .mxfp8) md.installed.head_mxfp8_rc else null,
         .routed_forms = formsName(md.installed.routed_forms),
-        .dense_rc = md.installed.dense_rc,
         .routed_banked = md.installed.routed_banked,
         .hoist_first = md.installed.hoist_first,
         .draft_staged = md.installed.draft_staged,
@@ -1715,6 +1724,10 @@ const CellArgs = struct {
 /// DSV41_CELL_FILL_LADDER, DSV41_CELL_WIRED_GB, and the routes (the shell's settings onto `config`, the
 /// Module's overrides into the returned args).
 fn cellConfig(config: *settings.Config) !CellArgs {
+    if (retiredCellLever(std.c.getenv)) |n| {
+        std.debug.print("dsv41 cell: refused: {s} is a retired lever this build no longer takes; unset it (CellRetiredLever)\n", .{n});
+        return error.CellRetiredLever;
+    }
     const gb = struct {
         fn of(name: [*:0]const u8) !?u64 {
             const v = std.c.getenv(name) orelse return null;
@@ -1770,12 +1783,10 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     if (envStr("DSV41_CELL_WINDOW_RING_SLACK")) |v| ov.window_ring_slack = std.fmt.parseInt(u32, v, 10) catch return error.CellWindowRing;
     if (envStr("DSV41_CELL_WINDOW_RING_HEADROOM")) |v| ov.window_ring_headroom = std.fmt.parseInt(u32, v, 10) catch return error.CellWindowRing;
     if (envStr("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE")) |v| ov.input_stream_early_release = try cellBool("DSV41_CELL_INPUT_STREAM_EARLY_RELEASE", v);
-    if (envStr("DSV41_CELL_PREFILL_INPUT_RELEASE")) |v| ov.prefill_input_release = try cellBool("DSV41_CELL_PREFILL_INPUT_RELEASE", v);
     // The prompt's sub-chunk rows ("whole": the prompt in one call, the proof cell's control).
     if (envStr("DSV41_CELL_PREFILL_SUB")) |v| ov.prefill_sub = if (std.mem.eql(u8, v, "whole")) std.math.maxInt(u64) else std.fmt.parseInt(u64, v, 10) catch return error.CellPrefillSub;
     if (envStr("DSV41_CELL_PREFILL_HCPOST")) |v| ov.prefill_hcpost = if (std.mem.eql(u8, v, "fused")) true else if (std.mem.eql(u8, v, "region")) false else return error.CellHcPostValue;
     if (envStr("DSV41_CELL_PREFILL_SHAREDMID")) |v| ov.prefill_shared_mid = if (std.mem.eql(u8, v, "compiled")) true else if (std.mem.eql(u8, v, "eager")) false else return error.CellSharedMidValue;
-    if (envStr("DSV41_CELL_PREDICT_BF16")) |v| ov.predict_bf16 = try cellBool("DSV41_CELL_PREDICT_BF16", v);
     if (envStr("DSV41_CELL_TRANSIENT_RELEASE")) |v| ov.transient_release = try cellBool("DSV41_CELL_TRANSIENT_RELEASE", v);
     // The phase change's settle poll (ms; the Module refuses a value outside 1..phase_change_settle_ms at construction).
     if (envStr("DSV41_CELL_PHASE_POLL_MS")) |v| ov.phase_change_poll_ms = std.fmt.parseInt(u32, v, 10) catch return error.CellPhasePollMs;
@@ -1790,10 +1801,8 @@ fn cellConfig(config: *settings.Config) !CellArgs {
     }
     // The fill's decode granule (row | record: the leftover below one row as single records, billed).
     if (envStr("DSV41_CELL_DECODE_FILL_GRANULE")) |v| ov.decode_fill_granule = std.meta.stringToEnum(@import("arm.zig").DecodeFillGranule, v) orelse return error.CellDecodeFillGranule;
-    if (envStr("DSV41_CELL_PHASE_SETTLE")) |v| ov.phase_change_settle = std.meta.stringToEnum(module.PhaseChangeSettle, v) orelse return error.CellPhaseSettle;
     if (envStr("DSV41_CELL_HEAD_MODE")) |v| ov.head_mode = if (std.mem.eql(u8, v, "bf16")) .bf16 else if (std.mem.eql(u8, v, "mxfp8")) .mxfp8 else return error.CellHeadMode;
     if (envStr("DSV41_CELL_ROUTED_FORMS")) |v| ov.routed_forms = try parseForms(v);
-    if (envStr("DSV41_CELL_DENSE_RC")) |v| ov.dense_rc = if (std.mem.eql(u8, v, "1")) true else if (std.mem.eql(u8, v, "0")) false else return error.CellDenseRc;
     if (envStr("DSV41_CELL_ROUTED_BANKED")) |v| ov.routed_banked = try cellBool("DSV41_CELL_ROUTED_BANKED", v);
     if (envStr("DSV41_CELL_HOIST_FIRST")) |v| ov.hoist_first = try cellBool("DSV41_CELL_HOIST_FIRST", v);
     if (envStr("DSV41_CELL_DRAFT_STAGED")) |v| ov.draft_staged = try cellBool("DSV41_CELL_DRAFT_STAGED", v);
@@ -1960,7 +1969,6 @@ fn cellBool(comptime name: []const u8, v: []const u8) !bool {
 /// cache the step created by the end of construction (`phase_memory.checkPageCache`, shared with GLM-5.3's records),
 /// and the box's pages at the phase change. A guarded window's guard counts the whole box (other processes included),
 /// so these hold the harness's run to it.
-pub const page_cache_tolerance_bytes = @import("../../phase_memory.zig").page_cache_tolerance_bytes;
 pub const box_tolerance_bytes: u64 = 500_000_000;
 
 /// The load left no page cache to be aged into the guard's count later (v6c2: 15 GB of speculative pages from
@@ -2131,7 +2139,7 @@ pub const PhaseMarks = struct {
     /// The transient release as the Module installed it (`Module.installed.transient_release`): the release proof is
     /// judged only when the phase change releases the scratch; off, it is NA.
     release_route: bool,
-    /// Indexed by `module.PhaseObserver.Stage`: start, released, grown (the SDK's `tail` stage is never observed here).
+    /// Indexed by `module.PhaseObserver.Stage`: start, released, grown.
     marks: [4]?BoxMark = @splat(null),
     failed: [4]?anyerror = @splat(null),
     spent_ns: u64 = 0,
@@ -3106,8 +3114,8 @@ test "dsv41 bill: the context table, 1k .. 128k prompt tokens at two box baselin
             const w = pb.layerMajorWaveTerms(rows, pb.chunkRows(n), n, .served);
             // The derived group's terms (`PrefillBill.groupTerms`; `group_derived` false: the streams bound bills the group).
             const gt = pb.groupTerms(rows, pb.chunkRows(n));
-            std.debug.print("DSV41_WAVE_TERMS {{\"positions\": {d}, \"rows\": {d}, \"span\": {d}, \"kept_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"selection_gb\": {d:.3}, \"attn_gb\": {d:.3}, \"group_gb\": {d:.3}, \"final_eval_gb\": {d:.3}, \"released_gb\": {d:.3}, \"total_gb\": {d:.3}, \"overshoot_gb\": {d:.3}, \"group_derived\": {}, \"group_terms_gb\": {{\"router\": {d:.3}, \"cat_xf\": {d:.3}, \"cat_idx\": {d:.4}, \"shared\": {d:.3}, \"routed\": {d:.3}, \"waves\": {d:.3}, \"merge\": {d:.3}, \"loc\": {d:.4}, \"combine\": {d:.3}, \"cast\": {d:.3}}}}}\n", .{
-                n, rows, pb.chunkRows(n), gbOf(w.kept), gbOf(w.halves), gbOf(w.selection), gbOf(w.attn), gbOf(w.group), gbOf(w.final_eval), gbOf(w.released), gbOf(w.total()), gbOf(pb.joinedBytes(rows)),
+            std.debug.print("DSV41_WAVE_TERMS {{\"positions\": {d}, \"rows\": {d}, \"span\": {d}, \"kept_gb\": {d:.3}, \"halves_gb\": {d:.3}, \"selection_gb\": {d:.3}, \"attn_gb\": {d:.3}, \"group_gb\": {d:.3}, \"final_eval_gb\": {d:.3}, \"total_gb\": {d:.3}, \"overshoot_gb\": {d:.3}, \"group_derived\": {}, \"group_terms_gb\": {{\"router\": {d:.3}, \"cat_xf\": {d:.3}, \"cat_idx\": {d:.4}, \"shared\": {d:.3}, \"routed\": {d:.3}, \"waves\": {d:.3}, \"merge\": {d:.3}, \"loc\": {d:.4}, \"combine\": {d:.3}, \"cast\": {d:.3}}}}}\n", .{
+                n, rows, pb.chunkRows(n), gbOf(w.kept), gbOf(w.halves), gbOf(w.selection), gbOf(w.attn), gbOf(w.group), gbOf(w.final_eval), gbOf(w.total()), gbOf(pb.joinedBytes(rows)),
                 pb.derived_group, gbOf(gt.router), gbOf(gt.cat_xf), gbOf(gt.cat_idx), gbOf(gt.shared), gbOf(gt.routed), gbOf(gt.waves), gbOf(gt.merge), gbOf(gt.loc), gbOf(gt.combine), gbOf(gt.cast),
             });
         };

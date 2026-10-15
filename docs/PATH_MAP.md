@@ -161,7 +161,6 @@ rewrite rules below still hold; the host-side rows of the tables are history.
 | src/mlx_stream/dsv41_kernel_routes.zig | src/arch/deepseek_v41/kernel_routes.zig |  |
 | src/mlx_stream/dsv41_kernels_test.zig | src/arch/deepseek_v41/kernels_test.zig |  |
 | src/mlx_stream/dsv41_prefill_timers.zig | src/arch/deepseek_v41/prefill_timers.zig |  |
-| src/mlx_stream/dsv41_profile.zig | src/arch/deepseek_v41/profile.zig |  |
 | src/mlx_stream/dsv41_verify_timeline.zig | src/arch/deepseek_v41/verify_timeline.zig |  |
 | src/mlx_stream/exl3_kernel_ops_gate.zig | src/exl3/kernel_ops_gate.zig |  |
 | src/mlx_stream/exl3_kernels.zig | src/exl3/kernels.zig |  |
@@ -215,6 +214,9 @@ rewrite rules below still hold; the host-side rows of the tables are history.
 | src/sdk.zig (`expert`, `kernels`, `quant`, `profile`, `ops`, `kv`, `Quant`, `ExpertSource`) | src/sdk_ext.zig (`sdk_ext.expert`, ...) |  |
 | (new) | src/build_flags.zig | profile switches from `sdk.plugin_profile` |
 | (new) | src/exl3/sushi_parity.zig | sushi K3 fixture through this plugin decode |
+| (new) | src/arch/glm5_next/ | the GLM-5.3-Flash arch (docs/glm5-next.md) |
+| (new) | src/arch/glm5_next/exl3_bank.zig | the GLM-5.3-Flash EXL3 K=3 (mul1) bank-v2 pack (`expert-manifest-v2.json`) |
+| (new) | docs/benchmarks/glm53-flash/ | the GLM-5.3-Flash benchmark record |
 
 ## Tests ported from the coverage branches
 

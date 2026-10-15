@@ -51,7 +51,7 @@ pub const PrefillBill = struct {
     /// calibration) and the served tier's (`served_prefill_cache_bytes`, the limit the module sets); `cacheBytes`.
     cache_bytes: u64,
     served_cache_bytes: u64 = 0,
-    /// K16's kept state (`layerMajorBytes`): the hidden width, hc copies, routed top-k, the DSpark
+    /// K16's kept state (`layerMajorWaveBytes`): the hidden width, hc copies, routed top-k, the DSpark
     /// target taps, the indexer's top-k.
     hidden: u64 = 0,
     hc: u64 = 0,
@@ -73,9 +73,6 @@ pub const PrefillBill = struct {
     /// two with it (ee80e40; served run 16 measured the fence's drop at 2.787 GB: two streams freed, 2.684 GB, so one more than
     /// the mixed stream stays live), one once the model declares that holder released.
     group_streams: u64 = 4,
-    /// K16's MoE-input release (`Routes.prefill_input_release`): the group's final evaluation no longer holds the
-    /// chunks' moe_in (seq x hidden f32, in `halves`) nor their concat (g_rows x hidden f32, in the final evaluation).
-    input_release: bool = false,
     /// The prompt's sub-chunk (`kvc.prefill_sub`, the module's `prefillSub`): a longer prompt's calls (`promptCallRows`).
     prefill_sub: u64 = kvc.prefill_sub,
     /// kv16: the bytes of one residual-stream element. The layer-major pass's kept streams (each chunk's hs, the halves'
@@ -126,12 +123,6 @@ pub const PrefillBill = struct {
     pub fn withIndexLaunch(b: PrefillBill, on: bool) PrefillBill {
         var x = b;
         x.index_launch = on;
-        return x;
-    }
-
-    pub fn withInputRelease(b: PrefillBill, on: bool) PrefillBill {
-        var x = b;
-        x.input_release = on;
         return x;
     }
 
@@ -458,7 +449,7 @@ pub const PrefillBill = struct {
 
     /// The layer-major wave's terms (`layerMajorWaveBytesAt`), for the read-outs: the kept streams (the hc streams and
     /// the DSpark taps), the halves, the index selection (its rows' masks over every compressed position), the attention
-    /// side, the routed group, its final evaluation and what the input release frees from it.
+    /// side, the routed group and its final evaluation.
     pub const WaveTerms = struct {
         kept: u64,
         halves: u64,
@@ -466,10 +457,9 @@ pub const PrefillBill = struct {
         attn: u64,
         group: u64,
         final_eval: u64,
-        released: u64,
 
         pub fn total(t: WaveTerms) u64 {
-            return t.kept + t.selection + @max(t.halves + @max(t.attn, t.group), t.halves + t.final_eval - t.released);
+            return t.kept + t.selection + @max(t.halves + @max(t.attn, t.group), t.halves + t.final_eval);
         }
     };
 
@@ -496,17 +486,11 @@ pub const PrefillBill = struct {
         // the taps and the selection are the kept terms above. It binds where the group's streams no longer do (the
         // tight bill with the early release).
         const final_eval = routed + b.joinedBytes(g_rows) + g_rows * (2 * d * 4 + b.hc * d * 4 + d * sb + b.top_k * 20);
-        // With the input release the final evaluation runs without the moe_in rows and their concat (the attention
-        // side and the routed call still hold both). Only a group that takes JOINLESS's parts releases: the bill's group
-        // (g_rows, the widest) does above joinless_min_ids routed ids; a narrower last group of a longer prompt keeps
-        // its own <= 8 rows, while the earlier groups' rows are already gone, so the widest group still bounds it.
-        const releases = b.input_release and g_rows * b.top_k > joinless_min_ids;
-        const released: u64 = if (releases) seq * d * sb + g_rows * d * sb else 0;
         if (b.derived_group) {
             const gt = b.groupTerms(seq, span);
-            return .{ .kept = kept_stream, .halves = halves, .selection = selection, .attn = attn, .group = gt.routedCall(), .final_eval = gt.finalEval(), .released = released };
+            return .{ .kept = kept_stream, .halves = halves, .selection = selection, .attn = attn, .group = gt.routedCall(), .final_eval = gt.finalEval() };
         }
-        return .{ .kept = kept_stream, .halves = halves, .selection = selection, .attn = attn, .group = group, .final_eval = final_eval, .released = released };
+        return .{ .kept = kept_stream, .halves = halves, .selection = selection, .attn = attn, .group = group, .final_eval = final_eval };
     }
 
     /// The K16 wide lane's own transient beside the layer-major wave: one more copy of the routed
@@ -634,17 +618,6 @@ pub const PrefillBill = struct {
         return sdk_ext.kv.planBytes(b.kvPlan(positions, &buf), .decode, b.chunkRows(seq), seq, b.ring_geo);
     }
 
-    /// `bytes` for a K16 request: the layer-major wave and the wide lane's transient in place of the
-    /// chunk-major wave.
-    pub fn layerMajorBytes(b: PrefillBill, seq: u64, max_tokens: u64, tier: Tier) u64 {
-        const positions = seq + max_tokens + 8;
-        const kv = switch (tier) {
-            .stock => positions * b.kv_pos_bytes,
-            .served => b.kvPromptBytes(seq, positions),
-        };
-        const head = if (tier == .stock) b.head_promotion_bytes else 0;
-        return b.layerMajorBilledBytes(seq, tier) + kv + head + b.cacheBytes(tier);
-    }
 
     /// A request of `seq` prompt tokens and up to `max_tokens` more: its KV, its widest chunk's wave (bounded by
     /// a full chunk reading every prompt position), the stock head's promotion at the logits, the allocator cache.
@@ -704,8 +677,6 @@ test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-
     try std.testing.expect(billed >= measured and billed - measured < 400_000_000 + 2 * 16384 * 16384 + 16384 * 256);
     // What it replaces: the x 5/4 pad, 1.59 GB more at 16K.
     try std.testing.expectEqual(@as(u64, 1_588_543_488 + (2 * 16384 * 16384 + 16384 * 256) / 4), wave / 4 * 5 - billed);
-    // The per-request bill (the server's admission) carries the same transient.
-    try std.testing.expectEqual(billed, b.layerMajorBytes(16384, 1024, .served));
     // JOINLESS's minimal-copy merge (58d9fb1): the joined input is at most 28 / 51 of the routed rows, 1.11 GB of
     // the 2.01 GB join, so the routed group's outputs and joined input fall from 4.03 to 3.12 GB. Served run 14 measured
     // the prompt's transient at 12.40 GB with the merge (13.46 GB before it).
@@ -733,13 +704,6 @@ test "dsv41 memory: the K16 prompt bill is the layer-major wave plus one routed-
     const group4: u64 = 2_013_265_920 + 1_474_834_337 + 16384 * (2 * 5120 * 4 + 4 * 4 * 5120 * 4);
     const final_eval: u64 = 2_013_265_920 + 1_474_834_337 + 16384 * (2 * 5120 * 4 + 4 * 5120 * 4 + 5120 * 4 + 6 * 20);
     try std.testing.expectEqual(final_eval, j.withGroupStreams(1).layerMajorWaveBytes(16384, .served) - (j.layerMajorWaveBytes(16384, .served) - group4));
-    // The input release lowers only the final evaluation's branch: where the group term binds (conservative, two
-    // streams) nothing; with one stream the final evaluation (5.84 GB) gives way to the attention side (5.58 GB).
-    try std.testing.expectEqual(j.layerMajorWaveBytes(16384, .served), j.withInputRelease(true).layerMajorWaveBytes(16384, .served));
-    try std.testing.expectEqual(j.withGroupStreams(2).layerMajorWaveBytes(16384, .served), j.withGroupStreams(2).withInputRelease(true).layerMajorWaveBytes(16384, .served));
-    const one = j.withGroupStreams(1);
-    const saved = one.layerMajorWaveBytes(16384, .served) - one.withInputRelease(true).layerMajorWaveBytes(16384, .served);
-    try std.testing.expect(saved > 0 and saved < 2 * 16384 * 5120 * 4);
     // Longer prompts make more row-closed waves: at a 65,104-row group (the chunk target's cap) the bound is 167.
     try std.testing.expectEqual(@as(u64, 48 + 108 + 9 + 2), j.joinlessOutputsMax(shape, 65_104 * 6));
     // P1d's resident-first base call: one more call's last wave, 87 outputs; the copy bound rises by routed x 23 / (86 x 87).
@@ -1605,7 +1569,7 @@ pub const WeightMap = struct {
     }
 };
 
-/// After mlx-serve's loader (`model.loadWeights`: lazy arrays, nothing read):
+/// After mlx-serve's loader (`model.loadWeightsOpt`: lazy arrays, nothing read):
 /// every spec parameter is a handle with the dtype and shape the headers
 /// declared. Reads array metadata only, but the arrays exist, so this runs
 /// where MLX may run.
