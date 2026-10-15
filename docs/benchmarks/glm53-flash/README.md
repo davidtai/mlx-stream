@@ -191,6 +191,121 @@ after the pulse, gate ADMIT at 8.19, OVERFILL 1.17 GB at load) has its own one-p
 ladder, because the side rows add a lever: 34.50 against g25-dsa's 34.10 at the same pin, a single cell each in
 different windows.
 
+## Context sweep 1K-1M
+
+One request per context rung, from 1K to 1M prompt tokens, on the exact stack of this branch (the g25-dsa3 kernels and
+defaults). The server is the real mlx-serve binary through its `/v1/completions` endpoint, not an in-process cell.
+
+![Full 1K-1M sweep summary](sweep_summary.png)
+
+### Matched serving configuration
+
+Every rung used the same pack, server flags and request shape:
+
+- Apple M5 Max with 128 GB of unified memory, GPU fans at full, no other model server loaded, each server run
+  serialized by the machine's exclusive GPU lock and watched by the memory guard;
+- server build g28-clean, SHA-256 `e20b4548ef9212b4db278432b2d213ff7305d4c90ee7a3af80a83498d75fe7cd`: host
+  `glm5next/host` `a8f6c6b8` with this branch's plugin at `6ac6dbf`, ReleaseFast;
+- pack `GLM-5.3-Flash-EXL3-K3-fp8res-mlx-stream`: EXL3 K=3 experts streamed from the internal SSD, FP8 residents,
+  NVFP4 MTP bank;
+- GPU memory ceiling 112 GiB (`MLX_SERVE_GPU_CEILING_MB=114688`) with `--wired-margin-gib 2`;
+- 16-bit KV cache (BF16, `--kv-quant off`), prefix cache off;
+- the MTP draft lane on (`"enable_mtp": true`) with `draft_depth` 3 and `draft_gate` 0.5;
+- card sampling: temperature 1.0, top-p 0.95, seed 1, no top-k; thinking on; `max_tokens` 16,384;
+- a fresh server per rung, serving one request: `POST /v1/completions` with the prompt rendered by the pack's chat
+  template.
+
+```sh
+MLX_SERVE_GPU_CEILING_MB=114688 nice -n 19 mlx-serve serve --model <pack> \
+  --host 127.0.0.1 --port 8081 --ctx-size <served context> --timeout 0 \
+  --no-vision --no-warmup-eager --prefix-cache-entries 0 --metrics \
+  --log-file off --kv-quant off --wired-margin-gib 2
+```
+
+The served context (`--ctx-size`) is the prompt plus the 16,384-token cap. The 1M fixture is 1,032,192 tokens, so that
+its served context is the model's 1,048,576-token limit. Actual input is the server's prompt count: with thinking on
+the request drops the fixture's trailing `</think>`, one token.
+
+Expert rows (slot rows per routed layer, prompt phase / decode phase) were pinned per rung in the pack's `config.json`
+at the memory bill's fill for a 12.6 GB box baseline. Every pin passed the layer-rows check and held at load. The rows
+fall with context as the bill gives memory to the KV.
+
+The two commits after `6ac6dbf` on this branch (`1fbe7d1`, `1f3a3c0`) change only the expert stream's slot-array
+allocation floor and its refusal path, not the kernels or the numbers.
+identity pair: pending
+
+Every point is one request (n=1), with no uncertainty interval. `sweep_results.json` holds the 11 rows.
+
+### Results
+
+| Requested context | Actual input | Served context | Rows P/D | Prefill (tok/s) | Decode (tok/s) | TTFT (s) | Completion tokens | Finish | MLX peak (GiB) | Footprint peak (GiB) | Box peak (GB) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: |
+| 1K | 1,023 | 17,408 | 191/217 | 122.0 | 33.0 | 8.39 | 11,410 | stop | 96.06 | 96.79 | 112.6 |
+| 2K | 2,047 | 18,432 | 191/217 | 238.4 | 33.8 | 8.59 | 3,324 | stop | 96.08 | 96.80 | 113.1 |
+| 4K | 4,095 | 20,480 | 191/217 | 462.2 | 33.3 | 8.86 | 10,278 | stop | 96.12 | 96.84 | 112.8 |
+| 8K | 8,191 | 24,576 | 191/217 | 889.4 | 32.1 | 9.21 | 12,446 | stop | 96.19 | 96.91 | 114.1 |
+| 16K | 16,381 | 32,766 | 190/217 | 1,091.5 | 32.8 | 15.01 | 6,263 | stop | 96.33 | 97.06 | 113.6 |
+| 32K | 32,766 | 49,151 | 189/214 | 1,047.8 | 31.4 | 31.27 | 10,099 | stop | 95.51 | 96.23 | 112.9 |
+| 64K | 65,534 | 81,919 | 188/213 | 996.2 | 28.0 | 65.78 | 16,384 | length | 95.76 | 96.43 | 112.9 |
+| 128K | 131,071 | 147,456 | 185/210 | 930.6 | 27.0 | 140.85 | 11,373 | stop | 95.86 | 96.43 | 113.1 |
+| 256K | 262,143 | 278,528 | 178/203 | 839.5 | 15.2 | 312.26 | 8,314 | stop | 95.69 | 96.43 | 113.3 |
+| 512K | 524,287 | 540,672 | 161/190 | 704.7 | 9.8 | 743.99 | 2,397 | stop | 95.74 | 96.51 | 113.1 |
+| 1M | 1,032,191 | 1,048,576 | 128/165 | 500.4 | 5.4 | 2,062.73 | 5,732 | stop | 95.93 | 96.48 | 113.9 |
+
+### Decode
+
+![Decode throughput](sweep_decode_tok_s.png)
+
+Decode holds 31.4-33.8 tok/s from 1K to 32K and reads 27-28 tok/s at 64K-128K. It then drops to 15.2 tok/s at 256K,
+9.8 at 512K and 5.4 at 1M. Over that range the pinned expert rows shrink (217 decode rows at 1K, 165 at 1M), and the
+attention and indexer work per token grows with the keys.
+
+### Prefill
+
+![Prefill throughput](sweep_prefill_tok_s.png)
+
+Prefill peaks at 16K (1,091.5 tok/s) and falls to 500.4 tok/s at 1M. Below 16K a fixed cost of about 8 s per first
+request dominates the TTFT, so the rate rises with the prompt.
+
+The standard 16K/1K headline cells of the same stack (the stack table above) use `max_tokens` 1,024 and other pins; the
+16K rung here is a separate request and does not replace them.
+
+### Time to first token
+
+![Time to first token](sweep_ttft_s.png)
+
+TTFT is prompt tokens / the server's prefill rate, from the server's per-request line. The 1M rung's 1,032,191-token
+prompt takes 2,062.7 s (34 min).
+
+### Memory
+
+![MLX allocator peak](sweep_peak_memory_gb.png)
+
+![Process footprint peak](sweep_peak_footprint_gb.png)
+
+The MLX allocator peak stayed at 95.5-96.3 GiB and the process footprint peak at 96.2-97.1 GiB on every rung: the bill
+gives the KV's growth back from the expert rows. The two peaks have different scopes and must not be added. The whole
+machine peaked at 112.6-114.1 GB. The box baseline at load was 10.4-11.0 GB, under the 12.6 GB that the pins assume.
+
+### Completion tokens
+
+![Completion-token counts](sweep_completion_tokens.png)
+
+The 64K rung hit the 16,384-token output cap (`finish_reason: length`). Every other rung stopped on EOS
+(`finish_reason: stop`) after 2,397-12,446 tokens.
+
+### Provenance
+
+- Cells: the 11 ladder cells of 2026-10-15 in the lab's `reports/dsv41-f39-tcq3-runtime/mimo/cells`
+  (`glm5next-ladder-<rung>-20261015`, run dirs `rNN-<rung>-clean`), outside this repository. Each cell holds the
+  receipt (server command, environment, request body, numbers), the request, the response, the server log and the
+  output. `sweep_results.json` names each row's cell and the SHA-256 of its receipt, prompt and output.
+- In `sweep_results.json`, the `plugin_commit` field is the chart script's fixed label (`0457394`, the g25-dsa3 lab
+  branch). The binary of the sweep is the one that `binary_sha256` names: g28-clean, plugin `6ac6dbf`.
+- Prefill and decode are the server's own per-request line. The chart script is `ladder_results.py`
+  (`--suffix=-clean --binary e20b4548`) beside the cells, not in this repository. It writes the results file and the
+  line charts.
+
 ## Lever pairs, 2026-10-14
 
 Each pair is one ABBA window (control, lever, lever, control), lane on, both arms at 190/217 with the standard MTP block,
