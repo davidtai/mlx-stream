@@ -538,6 +538,30 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             return std.mem.alignForward(u64, widest, page) + page;
         }
 
+        /// Direct reads (`expert_io.Options.direct`, a construction-time route): every range a submit of `bank` reads is
+        /// aligned to `block` (the file's block size, `expert_io.fileBlockSize`), so an F_NOCACHE preadv straight into the
+        /// slot rows takes the drive's uncached path. Checked once, at construction, over every record of every layer:
+        /// its gate/up and down offsets (`DirectReadsOffset`), every segment's offset and length and the minis' stride
+        /// (`DirectReadsLength`). The rows' side is `checkDirectRows`. Refused by name; nothing per read.
+        pub fn checkDirectReads(bank: *const B.Bank, block: u64) expert_io.DirectError!void {
+            if (block == 0) return error.DirectReadsBlock;
+            for (bank.layers, 0..) |*l, li| {
+                for (l.segments) |sg| if (sg.offset % block != 0 or sg.length % block != 0) return error.DirectReadsLength;
+                if (miniStride(l) % block != 0) return error.DirectReadsLength;
+                for (0..bank.n_experts) |e| {
+                    const sp = bank.spans(@intCast(li), @intCast(e));
+                    if (sp.gu_offset % block != 0 or sp.down_offset % block != 0) return error.DirectReadsOffset;
+                }
+            }
+        }
+
+        /// The rows' side of `checkDirectReads`: every component's base address and row stride a multiple of `block`
+        /// (`DirectReadsRow`), so every part a direct read lands (row + mini x segment length) starts on a block.
+        pub fn checkDirectRows(r: *const Rows, block: u64) expert_io.DirectError!void {
+            if (r.rows == 0) return;
+            for (r.base, r.row_bytes) |b, n| if (b % block != 0 or n % block != 0) return error.DirectReadsRow;
+        }
+
         /// The contract's gates, counters and refusals (`sdk.expert`).
         pub const Gates = expert.Gates;
         pub const Stats = expert.Stats;
@@ -683,6 +707,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             ahead_pending_layer: u32 = 0,
             by_rank: ByRank = @splat(@splat(.{ 0, 0 })),
             preread: bool = false,
+            /// Direct reads (`Options.pool.direct`): the file's block every range and slot row was checked against at
+            /// construction (and every row the phase changes allocate); 0 = the staging route.
+            direct_block: u64 = 0,
             /// Decode layer calls so far; a call's pre-reads and speculative records
             /// carry its tag, settled by its own step.
             clock: i64 = 0,
@@ -822,6 +849,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         if (gu > pool_opt.staging_bytes or l.logical_bytes - gu > pool_opt.staging_bytes) return error.InvalidOptions;
                     };
                 }
+                // Direct reads: the file's block, every record's ranges and (below) every slot row aligned to it, once. A
+                // pre-range starts before its plan names rows, so it stages: the route needs the pre-read off.
+                var direct_block: u64 = 0;
+                if (pool_opt.direct) {
+                    if (opt.lookahead) |la| if (la.preread) return error.InvalidOptions;
+                    direct_block = expert_io.fileBlockSize(bank.sidecar) catch return error.DirectReadsBlock;
+                    try expert_io.checkDirectBlock(direct_block, std.heap.pageSize());
+                    try checkDirectReads(bank, direct_block);
+                }
                 var selector: ?expert_lookahead.SelectorOf(B.routed_top_k) = null;
                 if (opt.lookahead) |la| selector = try expert_lookahead.SelectorOf(B.routed_top_k).init(a, bank.n_experts, la.k, la.tau, la.budget);
                 errdefer if (selector) |*sel| sel.deinit(a);
@@ -942,6 +978,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 };
                 // Relocation's copies (`p7Relocate`): at most every persistent row's components per call, reserved once.
                 if (opt.prompt_relocate) try self.promote_copies.ensureTotalCapacity(a, @as(usize, n_components) * bank.n_experts);
+                self.direct_block = direct_block;
+                if (direct_block != 0) try self.checkRowsDirect();
                 return self;
             }
 
@@ -2550,6 +2588,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.wide_depth = 1;
                 self.route_lookahead = self.selector != null;
                 self.route_preread = self.route_lookahead and self.preread;
+                if (self.direct_block != 0) try self.checkRowsDirect();
                 if (comptime recording) if (self.recorder) |rec| for (self.layers, 0..) |*ls, l| {
                     rec.handover(@intCast(l), ls.policy.prefill_freq, ls.policy.slot_to_expert[0..ls.policy.capacity], ls.base.rows);
                 };
@@ -2675,7 +2714,19 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.transient_released = false;
                 self.wide_depth = self.prompt_wide_depth;
                 for (t.row_bytes) |n| bytes += n * t.rows;
+                if (self.direct_block != 0) try self.checkRowsDirect();
                 return bytes;
+            }
+
+            /// Every live slot row against the direct reads' block (`checkDirectRows`): at construction and after each phase
+            /// change's allocation (`grow`, `regrowTransient`), never per read.
+            fn checkRowsDirect(self: *const Stream) expert_io.DirectError!void {
+                for (self.layers) |*ls| {
+                    try checkDirectRows(&ls.base, self.direct_block);
+                    if (ls.ext) |*e| try checkDirectRows(e, self.direct_block);
+                }
+                if (!self.transient_released) try checkDirectRows(&self.transient, self.direct_block);
+                if (self.alt) |*x| try checkDirectRows(&x.rows, self.direct_block);
             }
 
             /// A settled result's read time; a result with payload and no preadv was copied out of a speculative record.
