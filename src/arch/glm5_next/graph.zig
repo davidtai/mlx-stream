@@ -365,12 +365,6 @@ fn aExp(s: mlx.mlx_stream, a_log: T, hv: c_int, dk: c_int) !T {
     return out;
 }
 
-/// The A_log dtypes the bind takes (the pack of record stores F32 on layers 0-2 and BF16 on the rest): the floats the
-/// device converts to f32 exactly.
-pub fn aLogAccepted(dt: mlx.mlx_dtype) bool {
-    return dt == .float32 or dt == .bfloat16 or dt == .float16;
-}
-
 /// `layer`'s A_log dtype as the bind takes it; any other refuses the load by name.
 fn aLogCheck(dt: mlx.mlx_dtype, layer: u32, diag: ?*sdk.Diag) !void {
     return dtypeCheck("self_attn.A_log", dt, layer, diag);

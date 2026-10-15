@@ -120,14 +120,10 @@ comptime {
     if (mimo_stream.decode_lane_route_ids != decode_lane_rows * top_k) @compileError("glm5_next: decode's window 0 is not the decode lane's route");
 }
 
-/// The stream's construction options (pure: the CPU tests read them): MiMo's event gates and lookahead over `rows`, the
-/// phase rows' transient release, the read schedule's overlap route with prompt lever 1's relocation, decode's window 0,
-/// and the rate tally (`tally`: every layer pins at most floor(ratio x 288) experts; none at ratio 0).
-pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !B.Options {
-    return streamOptionsOf(B, rows, memory, event, tally, .staged);
-}
-
-/// `streamOptions` over a family's bridge `Bp` (the same options for every family), with the demand reads' route
+/// The stream's construction options over a family's bridge `Bp` (pure: the CPU tests read them; the same options for
+/// every family): MiMo's event gates and lookahead over `rows`, the phase rows' transient release, the read schedule's
+/// overlap route with prompt lever 1's relocation, decode's window 0, and the rate tally (`tally`: every layer pins at
+/// most floor(ratio x 288) experts; none at ratio 0), with the demand reads' route
 /// (`settings.MissReads`): `direct` sets the pool's direct route and turns the decode pre-read off (a pre-range stages);
 /// the stream proves the geometry at its construction (`checkDirectReads`, `checkDirectRows`).
 pub fn streamOptionsOf(comptime Bp: type, rows: []const u32, memory: Bp.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings, miss_reads: settings.MissReads) !Bp.Options {
@@ -663,9 +659,9 @@ pub const Exl3Source = SourceOf(.exl3);
 test "glm5_next experts: the stream's options install the overlap schedule early_whole_trim with prompt lever 1's relocation (exact), the phase rows' release and decode's window" {
     const testing = std.testing;
     const rows = [_]u32{ 124, 124 };
-    const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 });
+    const opts = try streamOptionsOf(B, &rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, .staged);
     try testing.expect(opts.tally == null);
-    const tallied = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0.25, .window = 16 });
+    const tallied = try streamOptionsOf(B, &rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0.25, .window = 16 }, .staged);
     try testing.expectEqual(@as(f64, 0.25), tallied.tally.?.ratio);
     try testing.expectEqual(@as(u32, 16), tallied.tally.?.window);
     try testing.expect(tallied.tally.?.layer_experts == null);

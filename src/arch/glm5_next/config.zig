@@ -202,21 +202,12 @@ pub const Config = struct {
         return n;
     }
 
-    /// The bytes one position adds to the DSA caches: each layer's latent and its indexer row (key | gate), BF16.
-    pub fn kvBytesPerToken(c: *const Config) u64 {
-        return @as(u64, c.nDsa()) * (c.kv_lora_rank + 2 * c.index_head_dim) * 2;
-    }
-
     /// The KDA states, fixed per request: each layer's f32 recurrent state [heads, dv, dk] (the reference's dtype) and
     /// its f32 conv tail [taps - 1, conv dim] (the conv's input dtype).
     pub fn kdaStateBytes(c: *const Config) u64 {
         const state: u64 = @as(u64, c.kda_heads) * c.kda_head_dim * c.kda_head_dim * 4;
         const conv: u64 = @as(u64, c.kda_conv - 1) * c.kdaConvDim() * 4;
         return @as(u64, c.nKda()) * (state + conv);
-    }
-
-    pub fn isEos(c: *const Config, id: u32) bool {
-        return std.mem.indexOfScalar(u32, c.eos[0..c.n_eos], id) != null;
     }
 
     /// `text`: the pack's config.json (the text model's fields at the top or in `text_config`).
@@ -437,10 +428,8 @@ test "glm5_next config: the pack's text_config parses to Flash's served form" {
     try testing.expectEqual(Config.flash_dsa_mask, c.dsa_mask);
     try testing.expect(c.isDsa(3) and c.isDsa(43) and !c.isDsa(0) and !c.isDsa(44));
     try testing.expect(!c.isMoe(2) and c.isMoe(3));
-    try testing.expectEqual(@as(u64, 16_896), c.kvBytesPerToken());
     try testing.expectEqual(@as(u32, 24_576), c.kdaConvDim());
     try testing.expectEqual(@as(u64, 34 * (64 * 128 * 128 * 4 + 3 * 24_576 * 4)), c.kdaStateBytes());
-    try testing.expect(c.isEos(154827) and !c.isEos(1));
     try testing.expectEqual(@as(f32, -5.0), c.kda_lower_bound);
 }
 

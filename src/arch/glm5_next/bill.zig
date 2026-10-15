@@ -677,11 +677,6 @@ pub fn isForced(cfg: *const settings.Config) bool {
     return cfg.expert_rows != null or cfg.expert_prefill_rows != null;
 }
 
-/// The most rows the fill admits at `baseline` under `target` (null when not even one row fits).
-pub fn admittedMaximum(b: sdk.MemoryBill, cfg: *const settings.Config, baseline: u64, target: u64) ?sdk.Rows {
-    return sdk.fill(b, baseline, target, cfg.model.n_routed_experts, 1) catch null;
-}
-
 // ── tests (host only: no MLX array) ──
 
 const testing = std.testing;

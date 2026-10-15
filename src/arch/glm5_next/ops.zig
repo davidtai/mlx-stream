@@ -674,28 +674,11 @@ pub const Pre = struct {
     pub fn deinit(self: *Pre) void {
         inline for (.{ self.normed, self.post, self.comb, self.h }) |a| _ = mlx.mlx_array_free(a);
     }
-
-    /// The `Deferred` this sublayer leaves: its output `y` over its input stream `h`.
-    pub fn defer_(self: *const Pre, y: mlx.mlx_array, h: mlx.mlx_array) Deferred {
-        var out: Deferred = .{ .y = mlx.mlx_array_new(), .post = mlx.mlx_array_new(), .comb = mlx.mlx_array_new(), .h = mlx.mlx_array_new() };
-        _ = mlx.mlx_array_set(&out.y, y);
-        _ = mlx.mlx_array_set(&out.post, self.post);
-        _ = mlx.mlx_array_set(&out.comb, self.comb);
-        _ = mlx.mlx_array_set(&out.h, h);
-        return out;
-    }
 };
-
-/// Whether `hcPre` serves a [1, R, HC, d] stream, R up to `HC_PRE_MAX_ROWS`.
-pub fn hcRowsServes(s: mlx.mlx_stream, sh: []const c_int, dt: mlx.mlx_dtype, fn_rows: mlx.mlx_array, norm_w: mlx.mlx_array) bool {
-    return mlx.streamIsGpu(s) and sh.len == 4 and sh[0] == 1 and sh[1] >= 1 and sh[1] <= HC_PRE_MAX_ROWS and sh[2] == HC and @rem(sh[3], 4) == 0 and
-        @divTrunc(sh[3], 4) <= HC_PRE_TPG and @rem(HC * sh[3], HC_PRE_NT) == 0 and (dt == .bfloat16 or dt == .float16) and
-        mlx.mlx_array_dtype(norm_w) == dt and mlx.mlx_array_dtype(fn_rows) == .float32;
-}
 
 /// The normed sublayer input and gates of R rows (1 .. the plan's rows), from their stream `x` [1, R, HC, D] or from the
 /// previous sublayer's `Deferred` (then `Pre.h` is the stream): the plan's prepared launch at R rows (its kernels, counter,
-/// eps and configs fixed at install). Callers check `hcRowsServes` once at their install.
+/// eps and configs fixed at install).
 pub fn hcPre(s: mlx.mlx_stream, plan: *const HcPlan, x: ?mlx.mlx_array, deferred: ?*const Deferred, fn_rows: mlx.mlx_array, scale: mlx.mlx_array, base: mlx.mlx_array, norm_w: mlx.mlx_array) !Pre {
     // Rows ride the grid's y: each has its own K-slices, counter word and gates.
     const rows: c_int = if (x) |xa| mlx.getShape(xa)[1] else mlx.getShape(deferred.?.y)[1];
