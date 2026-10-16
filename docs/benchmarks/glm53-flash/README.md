@@ -526,9 +526,35 @@ pre-build. g25b (`f8465ad`) adds the batched DSA selection, and g26 (`9bf67a7`) 
 
 ## Serve recipe
 
-- **Pack:** `GLM-5.3-Flash-EXL3-K3-fp8res-mlx-stream`. EXL3 K=3 (mul1, 3.05 bpw) routed experts are streamed from the
-  internal SSD with the `expert-manifest-v2.json` manifest. Residents are FP8 (block-128); the MTP draft bank is NVFP4.
-- **Server:** host `a8f6c6b8` + the plugin commit of the chosen stack:
+- **Pack:** the published pack
+  [OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw](https://huggingface.co/OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw)
+  (MIT, 130.8 GB). It is the measured pack `GLM-5.3-Flash-EXL3-K3-fp8res-mlx-stream`: EXL3 K=3 (mul1, 3.05 bpw) routed
+  experts, a record-by-record repack of turboderp's `3.05bpw` bank, streamed from the internal SSD with the
+  `expert-manifest-v2.json` manifest. Residents are FP8 (block-128, round to nearest from vcruz305's BF16 tensors); the
+  MTP draft bank is NVFP4. Files:
+
+| File | Bytes | What |
+| --- | ---: | --- |
+| `experts.bin` | 114,598,084,608 | the expert bank: 42 MoE layers x 288 routed experts, 9,474,048-byte records |
+| `expert-manifest-v2.json`, `expert-manifest.json` | 4,628,687 / 22,556,421 | the bank manifest and the runtime manifest |
+| `model-0000{1..5}-of-00005.safetensors`, `model.safetensors.index.json` | 12,043,235,276 | the residents (FP8 projections, BF16 tensors) |
+| `residents-fp8-manifest.json` | 520,635 | the FP8 residents' recipe and per-group error |
+| `mtp-experts-nvfp4.bin`, `mtp-expert-manifest-nvfp4.json` | 4,078,043,136 / 118,615 | the MTP draft bank (NVFP4) |
+| `expert-usage-v1.json` | 53,207 | the usage profile that seeds the prompt rows at load |
+| `config.json` | 211,018 | the release config with the `expert_streaming` block (`quant: exl3-k3-mul1`) and `residents_format: fp8_block128` |
+| `hf_quant_config.json`, tokenizer, chat template, generation and processor configs, `LICENSE`, `manifest.sha256` | | from the release and the source pack |
+
+  Download it to the internal SSD. `experts.bin` must be a real file or a hard link (the stream reads it with
+  uncached I/O):
+
+```sh
+hf download OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw \
+  --local-dir ~/models/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw
+sudo sysctl iogpu.wired_limit_mb=114688
+```
+
+- **Server:** mlx-serve with the GLM host changes (ddalcu/mlx-serve#823) and this plugin's `main`. The measured
+  numbers used host `a8f6c6b8` + the plugin commit of the chosen stack. The recommended serve block:
 
 ```sh
 MLX_SERVE_GPU_CEILING_MB=114688 nice -n 19 mlx-serve serve --model <pack> \
@@ -537,7 +563,8 @@ MLX_SERVE_GPU_CEILING_MB=114688 nice -n 19 mlx-serve serve --model <pack> \
   --log-file off --kv-quant off --wired-margin-gib 2
 ```
 
-- **Settings block** in the pack's `config.json` (`expert_streaming.settings`), with the request's `"enable_mtp": true`:
+- **Settings block** in the pack's `config.json` (`expert_streaming.settings`), with the request's `"enable_mtp": true`.
+  The published pack ships without a settings block; add this one:
 
 ```json
 {"expert_prefill_rows": 190, "expert_rows": 217, "mtp_lane": true, "draft_depth": 3, "draft_gate": 0.5}
