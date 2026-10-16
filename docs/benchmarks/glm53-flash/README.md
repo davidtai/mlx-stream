@@ -231,6 +231,8 @@ off, temperature 1.0, top-p 0.95, seed 1, `max_tokens` 256, streamed), order A B
 Keep cuts the warm TTFT by 63 % (6.59 s to 2.44 s). The cold request and decode do not change. Every request produced the
 same completion token count in all four arms. The cold floor of about 7 s is the bank's bytes over the drive's rate.
 
+Charts and the same measurement on MiMo-V2.6-Flash and DeepSeek-V4.1, with the resident seed: [warm-layers](../warm-layers/README.md).
+
 ## Context sweep 1K-1M
 
 One request per context rung, from 1K to 1M prompt tokens, on the exact stack of this branch (the g25-dsa3 kernels and
