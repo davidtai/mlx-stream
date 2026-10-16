@@ -37,6 +37,26 @@ An EXL3 K=3 pack declares the block with the EXL3 bank's format, its two manifes
 "expert_streaming": {"family": "mlx-stream", "format": "mtplx-expert-manifest-v2", "manifest": "expert-manifest-v2.json", "runtime_manifest": "expert-manifest.json", "quant": "exl3-k3-mul1"}
 ```
 
+The published EXL3 K=3 pack is
+[OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw](https://huggingface.co/OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw)
+(MIT, 130.8 GB): `experts.bin` (114.6 GB, 42 x 288 records), its two manifests, the FP8 residents in five safetensors
+shards with `residents-fp8-manifest.json`, the NVFP4 MTP draft bank (`mtp-experts-nvfp4.bin` and its manifest), the
+usage profile `expert-usage-v1.json`, and the release's config, tokenizer and chat template. It declares the EXL3 block
+above and ships without a settings block.
+
+```sh
+hf download OpensourceWTF/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw \
+  --local-dir ~/models/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw
+MLX_SERVE_GPU_CEILING_MB=114688 mlx-serve serve --model ~/models/GLM-5.3-Flash-streaming-repack-exl3-3.05bpw \
+  --ctx-size 32768 --no-vision --no-warmup-eager --prefix-cache-entries 0 --metrics --log-file off \
+  --kv-quant off --wired-margin-gib 2
+```
+
+The recommended settings block (`expert_streaming.settings` in the pack's `config.json`):
+`{"expert_prefill_rows": 190, "expert_rows": 217, "mtp_lane": true, "draft_depth": 3, "draft_gate": 0.5}`; add
+`"draft_head": "q8"` for the q8 head. The serve recipe and the rows pin by box baseline are in
+[benchmarks/glm53-flash](benchmarks/glm53-flash/README.md#serve-recipe).
+
 ### Settings
 
 The block's optional `settings` object takes the keys below. The arch reads them once at construction
