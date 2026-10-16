@@ -1058,6 +1058,13 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
         break :blk @import("root.zig").declared(block) orelse return error.Glm5NextPackRequired;
     };
     var cfg: settings.Config = .{ .model = model, .expert_family = fam, .model_dir = dir, .wired_margin_bytes = box_stop, .mtp_lane = lane, .prompt = .{ .wave_rows = wave_rows }, .draft_head = head };
+    // `GLM5_BILL_ROWS=<prompt>/<decode>`: a pin (the load's `expert_prefill_rows` / `expert_rows`): one FILL line per
+    // baseline (its totals, its over-fill, its headroom under the ceiling, the default per-layer split's widest layer).
+    if (std.c.getenv("GLM5_BILL_ROWS")) |v| {
+        var f = std.mem.splitScalar(u8, std.mem.span(v), '/');
+        cfg.expert_prefill_rows = try std.fmt.parseInt(u32, f.next() orelse return error.Glm5NextExpertRows, 10);
+        cfg.expert_rows = try std.fmt.parseInt(u32, f.next() orelse return error.Glm5NextExpertRows, 10);
+    }
     if (!prompt_levers.validWaveRows(wave_rows)) return error.Glm5NextExl3WaveRows;
     try cfg.prompt.check(fam == .exl3);
     if (wave_rows != prompt_levers.default_wave_rows) std.debug.print("\nGLM5_NEXT BILL exl3_wave_rows={d}\n", .{wave_rows});
@@ -1077,6 +1084,17 @@ test "glm5_next bill: the bill tool prints every term and the rows per context (
                     ctx,                    base,                                  p.rows.prompt,                         p.rows.prompt, p.rows.decode, p.rows.decode - p.rows.prompt, (p.rows.decode - p.rows.prompt) * b.per_row,
                     b.processBound(p.rows), b.total(.prompt, base, p.rows.prompt), b.total(.decode, base, p.rows.decode),
                 });
+                if (isForced(&cfg)) {
+                    var lp: [42]u32 = undefined;
+                    var ld: [42]u32 = undefined;
+                    var widest: u32 = 0;
+                    const split: []const u8 = if (settings.layerRows(settings.defaultLayerRows(), p.rows, model.n_routed_experts, &lp, &ld)) |_| blk: {
+                        for (ld) |d| widest = @max(widest, d);
+                        break :blk "ok";
+                    } else |e| @errorName(e);
+                    const peak = @max(b.total(.prompt, base, p.rows.prompt), b.total(.decode, base, p.rows.decode));
+                    std.debug.print("  FILL kv=bf16 ctx={d} baseline={d} rows={d}/{d} prompt_total={d} decode_total={d} target={d} over_fill={d} ceiling_headroom={d} layer_rows={s} widest_layer={d}\n", .{ ctx, base, p.rows.prompt, p.rows.decode, b.total(.prompt, base, p.rows.prompt), b.total(.decode, base, p.rows.decode), target, p.over_fill, @as(i64, @intCast(ceiling)) - @as(i64, @intCast(peak)), split, widest });
+                }
             } else |e| std.debug.print("  ROWS kv=bf16 ctx={d} baseline={d} refused={s}\n", .{ ctx, base, @errorName(e) });
         }
     }

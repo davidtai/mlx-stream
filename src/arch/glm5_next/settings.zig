@@ -282,7 +282,8 @@ pub const MissReads = enum { staged, direct };
 /// non-benchmark prompts at uniform rows; the replay in reports/.../mimo/glm5next-per-layer-rows-20261012.md weights
 /// rows by sqrt(miss rate)), never from the benchmark prompt's own trace. Setting: `"uniform"` or an array of integers
 /// (each within i16) summing to 0, of length the model's routed layers; anything else refuses by name in `validate`;
-/// a split that puts a layer under one decode row or over its experts refuses at construction (`layerRows`).
+/// a layer over its experts is held at them, the excess moved to the narrowest layers; plan rows over the experts refuse
+/// at construction (`layerRows`).
 pub const LayerRows = union(enum) {
     uniform,
     offsets: Offsets,
@@ -324,8 +325,10 @@ comptime {
 /// the phase change); decode = rows.decode + offset, held at rows.prompt at least (the stream grows a layer at the phase
 /// change, never shrinks it), and the rows that floor adds are taken back from the widest decode layers (the first widest
 /// first, one row at a time, never under rows.prompt) so the decode rows sum to the plan's: both phases bill exactly as
-/// the uniform rows. Refused by name when a layer would hold more than its `n_experts` experts or the floor cannot be
-/// paid back.
+/// the uniform rows. A layer is also held at `n_experts` at most (all its experts resident), and the rows that ceiling
+/// removes go to the narrowest decode layers (the first narrowest first, one row at a time, never over `n_experts`), so
+/// the plan's decode rows can go up to `n_experts` under any offsets (before: n_experts - the largest offset, 225 for the
+/// default table). Refused by name when the plan's rows are over `n_experts` or the floor cannot be paid back.
 pub fn layerRows(split: LayerRows, rows: sdk.Rows, n_experts: u32, prompt: []u32, decode: []u32) !void {
     if (prompt.len != decode.len) return error.Glm5NextExpertRowsByLayerLength;
     switch (split) {
@@ -335,14 +338,22 @@ pub fn layerRows(split: LayerRows, rows: sdk.Rows, n_experts: u32, prompt: []u32
         },
         .offsets => |*o| {
             if (o.len != decode.len) return error.Glm5NextExpertRowsByLayerLength;
+            if (rows.decode > n_experts or rows.prompt > rows.decode) return error.Glm5NextExpertRowsByLayerRange;
             var surplus: i64 = 0;
             for (prompt, decode, o.slice()) |*p, *q, off| {
                 const dd = @as(i64, rows.decode) + off;
-                if (dd > n_experts) return error.Glm5NextExpertRowsByLayerRange;
-                const floored = @max(dd, @as(i64, rows.prompt));
-                surplus += floored - dd;
-                q.* = @intCast(floored);
+                const held = std.math.clamp(dd, @as(i64, rows.prompt), @as(i64, n_experts));
+                surplus += held - dd;
+                q.* = @intCast(held);
                 p.* = rows.prompt;
+            }
+            while (surplus < 0) : (surplus += 1) {
+                var ni: usize = 0;
+                for (decode, 0..) |d, i| {
+                    if (d < decode[ni]) ni = i;
+                }
+                if (decode[ni] >= n_experts) return error.Glm5NextExpertRowsByLayerRange;
+                decode[ni] += 1;
             }
             while (surplus > 0) : (surplus -= 1) {
                 var wi: usize = 0;
@@ -1142,8 +1153,46 @@ test "glm5_next settings: expert_rows_by_layer: the calibrated offsets by defaul
     try testing.expectError(error.Glm5NextExpertRowsByLayerLength, (try parseSettings("{\"expert_rows_by_layer\":[]}")).validate());
     try testing.expectError(error.Glm5NextExpertRowsByLayerLength, (try parseSettings("{\"expert_rows_by_layer\":[1,-1]}")).validate());
     try testing.expectError(error.Glm5NextExpertRowsByLayerSum, (try parseSettings("{\"expert_rows_by_layer\":[1,1]}")).validate());
-    try testing.expectError(error.Glm5NextExpertRowsByLayerRange, layerRows(split.expert_rows_by_layer, .{ .prompt = 200, .decode = 222 }, 288, &prompt, &decode));
+    try testing.expectError(error.Glm5NextExpertRowsByLayerRange, layerRows(split.expert_rows_by_layer, .{ .prompt = 200, .decode = 289 }, 288, &prompt, &decode));
+    try testing.expectError(error.Glm5NextExpertRowsByLayerRange, layerRows(base.expert_rows_by_layer, .{ .prompt = 199, .decode = 289 }, 288, &prompt, &decode));
     try testing.expectError(error.Glm5NextExpertRowsByLayerLength, layerRows(split.expert_rows_by_layer, .{ .prompt = 126, .decode = 143 }, 288, prompt[0..41], decode[0..41]));
+}
+
+test "glm5_next settings: expert_rows_by_layer: the decode rows go up to n_experts under the default offsets (layers held at n_experts, the excess to the narrowest layers); refused above" {
+    var prompt: [42]u32 = undefined;
+    var decode: [42]u32 = undefined;
+    const base = try parseSettings("{}");
+    // 225 = 288 - 63: the last plan no layer is held at; 226..288 were refused before (layer 0 over its experts).
+    for ([_]sdk.Rows{ .{ .prompt = 199, .decode = 225 }, .{ .prompt = 199, .decode = 226 }, .{ .prompt = 199, .decode = 229 }, .{ .prompt = 199, .decode = 233 }, .{ .prompt = 220, .decode = 260 }, .{ .prompt = 288, .decode = 288 } }) |rows| {
+        try layerRows(base.expert_rows_by_layer, rows, 288, &prompt, &decode);
+        var sum_d: u64 = 0;
+        for (prompt, decode) |p, d| {
+            try testing.expectEqual(rows.prompt, p);
+            try testing.expect(d >= p and d <= 288);
+            sum_d += d;
+        }
+        try testing.expectEqual(@as(u64, 42) * rows.decode, sum_d); // the bill's total is unchanged
+    }
+    // 199/225 (today's stack of record): no layer over its experts, so the split is the floor's alone (layer 16 floored at
+    // 199 from 193, layers 15 and 19 at 199 from 195 and 196: 6 + 4 + 3 = 13 rows paid back from the widest, layer 0 288 -> 282).
+    try layerRows(base.expert_rows_by_layer, .{ .prompt = 199, .decode = 225 }, 288, &prompt, &decode);
+    try testing.expectEqual(@as(u32, 199), decode[16]);
+    try testing.expectEqual(@as(u32, 282), decode[0]);
+    // 199/233: layers 0..3 held at 288 (8 + 7 + 6 + 3 = 24 rows), the 24 rows to the narrowest layers.
+    try layerRows(base.expert_rows_by_layer, .{ .prompt = 199, .decode = 233 }, 288, &prompt, &decode);
+    for (decode[0..4]) |d| try testing.expectEqual(@as(u32, 288), d);
+    var raised: u32 = 0;
+    for (decode[4..], default_layer_offsets[4..]) |d, off| {
+        const want: i64 = @as(i64, 233) + off;
+        try testing.expect(@as(i64, d) >= want);
+        raised += @intCast(@as(i64, d) - want);
+        if (@as(i64, d) > want) try testing.expect(off < 0); // only cut layers take the excess
+    }
+    try testing.expectEqual(@as(u32, 24), raised);
+    // Uniform at the max: every layer at its experts.
+    try layerRows(.uniform, .{ .prompt = 199, .decode = 288 }, 288, &prompt, &decode);
+    // Above the experts: refused by name.
+    try testing.expectError(error.Glm5NextExpertRowsByLayerRange, layerRows(base.expert_rows_by_layer, .{ .prompt = 199, .decode = 289 }, 288, &prompt, &decode));
 }
 
 test "glm5_next settings: the exl3 decode forms: guone + pair unless named, the seam and every form by name on an exl3 pack, refusals by name" {
