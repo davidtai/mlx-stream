@@ -120,7 +120,7 @@ pub const Settings = struct {
     }
 };
 
-/// The file's JSON form.
+/// The file's JSON form (the form the recorder writes).
 pub const Doc = struct {
     model_type: []const u8,
     layers: u32,
@@ -152,6 +152,52 @@ pub const Doc = struct {
         if (!std.mem.eql(u8, d.model_type, model_type) or d.layers != layers or d.experts != experts) return error.ExpertUsageMismatch;
     }
 };
+
+/// The file as the readers parse it: `source` in either v1 form. The first form (recorders before the sessions list)
+/// is one session's object: `prompt_set`, `binary_sha256` and the totals. The second form is the totals and
+/// `sessions`. `doc` gives the second form; a first-form source is its one session. `source` is provenance only: the
+/// counts, `layers`, `experts` and `model_type` are what the checks and the seed read.
+const ReadDoc = struct {
+    model_type: []const u8,
+    layers: u32,
+    experts: u32,
+    counts: []const []const u64,
+    source: struct {
+        requests: u64,
+        prompt_tokens: u64,
+        decode_tokens: u64,
+        sessions: ?[]const Doc.Session = null,
+        prompt_set: ?[]const u8 = null,
+        binary_sha256: ?[]const u8 = null,
+    },
+
+    /// The second form; a source that is neither form (no sessions and no first-form provenance, or both) is
+    /// `ExpertUsageMalformed`. `ar` holds the one session of a first-form source.
+    fn doc(r: ReadDoc, ar: std.mem.Allocator) error{ ExpertUsageMalformed, OutOfMemory }!Doc {
+        const s = r.source;
+        const sessions: []const Doc.Session = if (s.sessions) |ss| blk: {
+            if (s.prompt_set != null or s.binary_sha256 != null) return error.ExpertUsageMalformed;
+            break :blk ss;
+        } else blk: {
+            const ps = s.prompt_set orelse return error.ExpertUsageMalformed;
+            const sha = s.binary_sha256 orelse return error.ExpertUsageMalformed;
+            const one = try ar.alloc(Doc.Session, 1);
+            one[0] = .{ .prompt_set = ps, .binary_sha256 = sha, .requests = s.requests, .prompt_tokens = s.prompt_tokens, .decode_tokens = s.decode_tokens };
+            break :blk one;
+        };
+        return .{ .model_type = r.model_type, .layers = r.layers, .experts = r.experts, .counts = r.counts, .source = .{ .requests = s.requests, .prompt_tokens = s.prompt_tokens, .decode_tokens = s.decode_tokens, .sessions = sessions } };
+    }
+};
+
+/// `text` as the second form, in `ar` (an arena): `ExpertUsageMalformed` when it is not JSON of either v1 form. Every
+/// string is a copy in `ar` (the recorder frees `text` and keeps the earlier sessions' strings).
+fn readDoc(ar: std.mem.Allocator, text: []const u8) error{ ExpertUsageMalformed, OutOfMemory }!Doc {
+    const r = std.json.parseFromSliceLeaky(ReadDoc, ar, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ExpertUsageMalformed,
+    };
+    return r.doc(ar);
+}
 
 /// The record side (`expert_usage_record`): the counts over every request of every session recorded into `path`. At the
 /// load the file at `path`, when there is one, is read and checked (`Doc.check`: refused by name, never overwritten) and
@@ -196,7 +242,9 @@ pub const Recorder = struct {
         };
         if (text) |t| {
             defer a.free(t);
-            const parsed = std.json.parseFromSliceLeaky(Doc, ar, t, .{ .ignore_unknown_fields = true }) catch {
+            // A first-form file is written back in the second form, its session kept as session 1.
+            const parsed = readDoc(ar, t) catch |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
                 log.warn("expert usage record: load refused: {s} is not the v1 form (ExpertUsageMalformed); move it away to start a new record\n", .{path});
                 return error.ExpertUsageMalformed;
             };
@@ -354,9 +402,9 @@ pub const Seeded = struct {
 /// `text` (the file's bytes) as a profile for a stream of `layers` x `experts` of `model_type`: refused by name when it
 /// does not parse as the v1 form (`ExpertUsageMalformed`) or names another model or geometry (`ExpertUsageMismatch`).
 pub fn parse(a: std.mem.Allocator, text: []const u8, model_type: []const u8, layers: u32, experts: u32) !Profile {
-    const parsed = std.json.parseFromSlice(Doc, a, text, .{ .ignore_unknown_fields = true }) catch return error.ExpertUsageMalformed;
-    defer parsed.deinit();
-    const d = parsed.value;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const d = try readDoc(arena.allocator(), text);
     try d.check(model_type, layers, experts);
     const counts = try a.alloc(u64, @as(usize, layers) * experts);
     errdefer a.free(counts);
@@ -549,4 +597,79 @@ test "expert usage: the file round-trips (record, write, parse); a later load's 
     e.seed = .usage;
     try testing.expectError(error.ExpertUsageMissing, decide(a, testing.io, &e, empty_dir, "glm5_next", 2, 4));
     try testing.expectEqualStrings("glm5_next expert residents seeded: none (no expert-usage-v1.json)", seedLine(&lb, "glm5_next", &.{ .profile = null, .reason = .no_file }, .{ .min = 0, .max = 0, .rows_min = 0, .rows_max = 0, .records = 0 }, 0, 0));
+}
+
+test "expert usage: the first-form file (one session's source) and the second form (totals + sessions) both parse; a first-form record is written back in the second form, its session kept as session 1" {
+    const a = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    // The header of the GLM-5.3-Flash pack's file (de03530's recorder) and synthesized 42 x 288 counts.
+    const layers = 42;
+    const experts = 288;
+    const rows = try ar.alloc([]const u64, layers);
+    for (rows, 0..) |*row, l| {
+        const r = try ar.alloc(u64, experts);
+        for (r, 0..) |*c, e| c.* = (l * 7 + e * 13) % 997;
+        row.* = r;
+    }
+    const sha = "59d24e84597db2b155e7aaf66f3d78b37cc4c2ef2743f7418108d3b312ff06a0";
+    const First = struct {
+        model_type: []const u8,
+        layers: u32,
+        experts: u32,
+        counts: []const []const u64,
+        source: struct { prompt_set: []const u8, requests: u64, prompt_tokens: u64, decode_tokens: u64, binary_sha256: []const u8 },
+    };
+    const first = try std.json.Stringify.valueAlloc(ar, First{ .model_type = "glm5_next", .layers = layers, .experts = experts, .counts = rows, .source = .{ .prompt_set = "humaneval0-63+std16k", .requests = 65, .prompt_tokens = 27266, .decode_tokens = 9887, .binary_sha256 = sha } }, .{});
+    const one = [_]Doc.Session{.{ .prompt_set = "humaneval0-63+std16k", .binary_sha256 = sha, .requests = 65, .prompt_tokens = 27266, .decode_tokens = 9887 }};
+    const second = try std.json.Stringify.valueAlloc(ar, Doc{ .model_type = "glm5_next", .layers = layers, .experts = experts, .counts = rows, .source = .{ .requests = 65, .prompt_tokens = 27266, .decode_tokens = 9887, .sessions = &one } }, .{});
+    for ([_][]const u8{ first, second }) |text| {
+        var p = try parse(a, text, "glm5_next", layers, experts);
+        defer p.deinit();
+        for (rows, 0..) |row, l| try testing.expectEqualSlices(u64, row, p.counts[l * experts ..][0..experts]);
+        try testing.expectEqualStrings("humaneval0-63+std16k, 65 requests, 27266 prompt + 9887 decode tokens, binary 59d24e84", p.source());
+        try testing.expectError(error.ExpertUsageMismatch, parse(a, text, "glm5_next", 41, experts));
+        try testing.expectError(error.ExpertUsageMismatch, parse(a, text, "mimo_v2", layers, experts));
+    }
+    // A source of neither form, of both forms, or with no session: malformed.
+    const c = "{\"model_type\":\"glm5_next\",\"layers\":1,\"experts\":2,\"counts\":[[1,2]],\"source\":";
+    const ok = c ++ "{\"requests\":1,\"prompt_tokens\":1,\"decode_tokens\":1,\"prompt_set\":\"x\",\"binary_sha256\":\"0\"}}";
+    var p_ok = try parse(a, ok, "glm5_next", 1, 2);
+    p_ok.deinit();
+    for ([_][]const u8{
+        c ++ "{\"requests\":1,\"prompt_tokens\":1,\"decode_tokens\":1}}",
+        c ++ "{\"requests\":1,\"prompt_tokens\":1,\"decode_tokens\":1,\"prompt_set\":\"x\"}}",
+        c ++ "{\"requests\":1,\"prompt_tokens\":1,\"decode_tokens\":1,\"prompt_set\":\"x\",\"binary_sha256\":\"0\",\"sessions\":[{\"prompt_set\":\"x\",\"binary_sha256\":\"0\"}]}}",
+        c ++ "{\"requests\":1,\"prompt_tokens\":1,\"decode_tokens\":1,\"sessions\":[]}}",
+        c ++ "{\"prompt_set\":\"x\",\"binary_sha256\":\"0\"}}",
+    }) |t| try testing.expectError(error.ExpertUsageMalformed, parse(a, t, "glm5_next", 1, 2));
+    // A record into a first-form file: the counts and totals are the start, the file becomes the second form, and its
+    // one session is session 1.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const path = try std.fs.path.join(a, &.{ dir, file_name });
+    defer a.free(path);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = first });
+    const r = try Recorder.init(a, testing.io, path, "glm5_next", "unit2", layers, experts);
+    defer r.deinit();
+    for (rows, 0..) |row, l| try testing.expectEqualSlices(u64, row, r.counts[l * experts ..][0..experts]);
+    r.counts[0] += 1;
+    try r.endRequest(testing.io, 4, 2);
+    const t2 = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(max_file_bytes));
+    defer a.free(t2);
+    // The second form exactly (no first-form fields left in `source`).
+    const strict = try std.json.parseFromSlice(Doc, a, t2, .{});
+    defer strict.deinit();
+    const s = strict.value.source;
+    try testing.expectEqual(@as(usize, 2), s.sessions.len);
+    try testing.expectEqualStrings("humaneval0-63+std16k", s.sessions[0].prompt_set);
+    try testing.expectEqualStrings(sha, s.sessions[0].binary_sha256);
+    try testing.expect(s.sessions[0].requests == 65 and s.sessions[0].prompt_tokens == 27266 and s.sessions[0].decode_tokens == 9887);
+    try testing.expectEqualStrings("unit2", s.sessions[1].prompt_set);
+    try testing.expect(s.sessions[1].requests == 1 and s.sessions[1].prompt_tokens == 4 and s.sessions[1].decode_tokens == 2);
+    try testing.expect(s.requests == 66 and s.prompt_tokens == 27270 and s.decode_tokens == 9889);
+    try testing.expectEqual(rows[0][0] + 1, strict.value.counts[0][0]);
 }
