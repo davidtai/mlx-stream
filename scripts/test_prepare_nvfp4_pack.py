@@ -1,0 +1,399 @@
+"""Tests of prepare_nvfp4_pack.py and scripts/packlib on the synthetic Beam checkpoint of beam_fixture.py: every step
+end to end, each record against a straight numpy repack of the fixture's tensors, the manifest against bank.zig (its
+Manifest fields, its fixture manifest and its refusals), resume, and the refusals by name. Numpy only, no network, no
+GPU, a few MB of disk.
+
+  python3 -I scripts/test_prepare_nvfp4_pack.py        (or: python3 -I -m pytest scripts/test_prepare_nvfp4_pack.py)
+"""
+import contextlib
+import hashlib
+import io
+import json
+import re
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.dont_write_bytecode = True
+
+import beam_fixture as fx  # noqa: E402
+import prepare_nvfp4_pack as conv  # noqa: E402
+from packlib import PrepError, manifest  # noqa: E402
+from packlib.st import E2M1, E4M3, StFile  # noqa: E402
+
+BANK_ZIG = HERE.parent / "src" / "arch" / "glm5_next" / "bank.zig"
+SEED = 7
+
+
+def run(*argv):
+    """(exit status, stdout + stderr) of the converter's main."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        rc = conv.main(list(argv))
+    return rc, buf.getvalue()
+
+
+def build_args(fix, pack, *extra):
+    return ["--family", "beam", "--src", str(fix), "--out", str(pack), "--pins", str(fix / fx.PINS),
+            "--disk-margin-gb", "0", *extra]
+
+
+def zig_fixture_manifest():
+    """bank.zig's `const fixture` manifest text (its `\\\\` lines joined)."""
+    text = BANK_ZIG.read_text()
+    body = text[text.index("const fixture =") :]
+    lines = [ln.strip()[2:] for ln in body.splitlines()[1:] if ln.strip().startswith("\\\\")]
+    return "".join(lines)
+
+
+def zig_manifest_fields():
+    """The top-level fields of bank.zig's `Manifest` struct (what Bank.parseFor requires)."""
+    text = BANK_ZIG.read_text()
+    body = text[text.index("const Manifest = struct {") :]
+    body = body[: body.index("\n};")]
+    return re.findall(r"^    (\w+):", body, re.M)
+
+
+class Fixture(unittest.TestCase):
+    """One fixture and one pack built by `all` (with --delete-verified), shared by the read-only tests."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="nvfp4-pack-test-"))
+        cls.fix, cls.pack = cls.tmp / "fix", cls.tmp / "pack"
+        fx.build(cls.fix, SEED)
+        cls.shards = fx.tensors(SEED)
+        cls.rc, cls.log = run("all", *build_args(cls.fix, cls.pack, "--delete-verified"))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def test_all_succeeds_and_deletes_the_shards(self):
+        self.assertEqual(self.rc, 0, self.log)
+        self.assertEqual(sorted(p.name for p in self.fix.glob("*.safetensors")), [])
+        self.assertEqual(sorted(p.name for p in self.pack.iterdir() if p.name != ".prepare"),
+                         sorted(conv.PACK_FILES + ["pack-sha256.txt"]))
+
+    def test_records_are_a_straight_numpy_repack(self):
+        m = json.loads((self.pack / "expert-manifest.json").read_text())
+        g = manifest.check(m)
+        self.assertEqual((g.hidden, g.inter, g.experts, g.first, g.layers), (fx.H, fx.MI, fx.E, fx.DENSE, fx.L - fx.DENSE))
+        data = (self.pack / "experts.bin").read_bytes()
+        self.assertEqual(len(data), g.total)
+        self.assertEqual(hashlib.sha256(data).hexdigest(), m["output_files"]["experts.bin"]["sha256"])
+        for i in range(g.records):
+            layer, e = g.at(i)
+            t = self.shards[f"model-layer-{layer:05d}.safetensors"]
+            want = b""
+            for p in fx.PROJ:
+                q = f"model.layers.{layer}.mlp.experts.{e}.{p}."
+                words = t[q + "weight"][2].view("<u4")  # U8 pairs as little-endian U32 words
+                g32 = np.float32(t[q + "weight_scale_2"][2]) * np.float32(2688.0)
+                want += words.tobytes() + t[q + "weight_scale"][2].tobytes() + np.array(g32, "<f4").tobytes()
+            rec = data[i * g.stride : (i + 1) * g.stride]
+            self.assertEqual(rec[: g.logical], want, f"record {layer}:{e}")
+            self.assertEqual(rec[g.logical :], bytes(g.stride - g.logical))
+            self.assertEqual(hashlib.sha256(want).hexdigest(), m["records"][i]["sha256"])
+
+    def test_words_decode_as_bank_zig_dequant_row(self):
+        """bank.zig dequantRow over the record's U32 words (element j at bits 4 * (j % 8)) equals the checkpoint's
+        e2m1 x e4m3 x weight_scale_2 within 2 ulps, and g / 2688 is weight_scale_2 exactly."""
+        m = json.loads((self.pack / "expert-manifest.json").read_text())
+        g = manifest.check(m)
+        rec = (self.pack / "experts.bin").read_bytes()[g.offset(4, 5) :][: g.logical]
+        t = self.shards["model-layer-00004.safetensors"]
+        for pi, p in enumerate(fx.PROJ):
+            w, s, gs = g.parts[3 * pi : 3 * pi + 3]
+            out, inn = w["shape"][0], w["shape"][1] * 8
+            words = np.frombuffer(rec[w["offset"] :][: w["length"]], "<u4").reshape(out, inn // 8)
+            codes = (words[:, :, None] >> (4 * np.arange(8, dtype=np.uint32))) & 0xF
+            codes = codes.reshape(out, inn)
+            scales = np.frombuffer(rec[s["offset"] :][: s["length"]], np.uint8).reshape(out, inn // 16)
+            gv = np.frombuffer(rec[gs["offset"] :][:4], "<f4")[0]
+            got = E2M1[codes] * np.repeat((E4M3[scales] * np.float32(gv / np.float32(2688))).astype(np.float32), 16, 1)
+            q = f"model.layers.4.mlp.experts.5.{p}."
+            ws2 = np.float32(t[q + "weight_scale_2"][2])
+            self.assertEqual(np.float32(gv / np.float32(2688)), ws2)
+            b = t[q + "weight"][2]
+            src_codes = np.stack([b & 0xF, b >> 4], -1).reshape(out, inn)
+            ref = (E2M1[src_codes] * np.repeat(E4M3[t[q + "weight_scale"][2]], 16, 1)).astype(np.float32) * ws2
+            self.assertTrue(np.all(np.abs(ref - got) <= 2 * np.spacing(np.abs(ref))), p)
+            self.assertGreater(np.abs(ref).max(), 0)
+
+    def test_manifest_has_every_field_bank_zig_parses(self):
+        m = json.loads((self.pack / "expert-manifest.json").read_text())
+        fields = zig_manifest_fields()
+        self.assertIn("record_stride", fields)
+        self.assertEqual([f for f in fields if f not in m], [])
+        self.assertEqual(m["layout"], "nvfp4-gud-9part")
+        self.assertEqual(m["format"], "mlx-stream-nvfp4-expert-bank-v1")
+        self.assertEqual(m["alignment"], 4096)
+        self.assertEqual([p["name"] for p in m["parts"]], [f"{p}.{k}" for p in fx.PROJ
+                                                             for k in ("weight", "scales", "global_scale")])
+        pins = json.loads((self.fix / fx.PINS).read_text())
+        self.assertEqual(m["source"], {"repository": pins["repository"], "revision": pins["revision"]})
+        self.assertEqual(m["source_files"], pins["files"])
+
+    def test_residents_are_the_release_tensors(self):
+        sf = StFile(self.pack / "model.safetensors")
+        try:
+            want = {n: v for t in self.shards.values() for n, v in t.items() if ".mlp.experts." not in n}
+            self.assertEqual(set(sf.header), set(want))
+            for n, (dtype, shape, arr) in want.items():
+                self.assertEqual((sf.header[n]["dtype"], sf.header[n]["shape"]), (dtype, shape), n)
+                self.assertEqual(bytes(sf.raw_bytes(n)), np.ascontiguousarray(arr).tobytes(), n)
+            self.assertEqual(sf.header["model.layers.3.mlp.gate.weight"]["dtype"], "F32")
+        finally:
+            sf.close()
+        idx = json.loads((self.pack / "model.safetensors.index.json").read_text())
+        self.assertEqual(set(idx["weight_map"].values()), {"model.safetensors"})
+
+    def test_config_by_rule(self):
+        cfg = json.loads((self.pack / "config.json").read_text())
+        rel = json.loads((self.fix / "config.json").read_text())
+        self.assertEqual(cfg["model_type"], "beam")
+        self.assertNotIn("quantization_config", cfg)
+        self.assertEqual(cfg["expert_streaming"], conv.STREAMING)
+        self.assertEqual(cfg["eos_token_id"], [510, 511])  # null in the release config, from generation_config.json
+        self.assertEqual(cfg["pad_token_id"], 509)
+        self.assertIsNone(cfg["bos_token_id"])
+        for k, v in rel.items():
+            if k not in ("quantization_config", "eos_token_id", "pad_token_id"):
+                self.assertEqual(cfg[k], v, k)
+        for n in conv.COPIES:
+            self.assertEqual((self.pack / n).read_bytes(), (self.fix / n).read_bytes(), n)
+        sums = dict(reversed(ln.split("  ")) for ln in (self.pack / "pack-sha256.txt").read_text().splitlines())
+        self.assertEqual(sorted(sums), sorted(conv.PACK_FILES))
+        self.assertEqual(sums["config.json"], hashlib.sha256((self.pack / "config.json").read_bytes()).hexdigest())
+
+    def test_rerun_skips_and_verify_needs_a_source_shard(self):
+        rc, log = run("all", *build_args(self.fix, self.pack))
+        # the keep set was deleted by verify --delete-verified: the rebuilt steps skip, verify has nothing to sample
+        self.assertEqual(rc, 1, log)
+        self.assertIn("[residents] skip", log)
+        self.assertIn("[bank] skip", log)
+        self.assertIn("no routed shard", log)
+
+
+class Spec(unittest.TestCase):
+    """The Python port of bank.zig against bank.zig's own numbers and fixture."""
+
+    def test_flash_geometry_is_bank_zig_test_numbers(self):
+        g = manifest.Geometry(4096, 2048, 288, 3, 42)
+        self.assertEqual((g.gate_up, g.logical, g.stride, g.total), (9_437_192, 14_155_788, 14_159_872,
+                                                                      42 * 288 * 14_159_872))
+        self.assertEqual((g.parts[2]["offset"], g.parts[3]["offset"]), (4_718_592, 4_718_596))
+        self.assertEqual(g.offset(4, 5), 288 * 14_159_872 + 5 * 14_159_872)
+
+    def test_beam_geometry(self):
+        g = manifest.Geometry(5120, 2560, 256, 3, 49)
+        self.assertEqual((g.gate_up, g.logical, g.stride, g.records, g.total),
+                         (14_745_608, 22_118_412, 22_122_496, 12_544, 277_504_589_824))
+
+    def test_invalid_geometry_refused_as_bank_zig(self):
+        for args in ((40, 32, 2, 1, 1), (32, 32, 0, 1, 1), (32, 32, 2, 1, 0), (1 << 31, 1 << 31, 288, 3, 42)):
+            with self.assertRaisesRegex(PrepError, "InvalidGeometry"):
+                manifest.Geometry(*args)
+
+    def test_bank_zig_fixture_manifest_parses_and_its_cases_refuse(self):
+        text = zig_fixture_manifest()
+        g = manifest.check(json.loads(text))
+        self.assertEqual((g.total, g.logical, g.gate_up), (2 * 4096, 3468, 2312))
+        cases = [('"nvfp4"', '"mxfp4"', "InvalidQuantization"),
+                 ('"group_size":16', '"group_size":32', "InvalidQuantization"),
+                 ('"record_stride":4096', '"record_stride":3468', "InvalidGeometry"),
+                 ('"layout":"nvfp4-gud-9part"', '"layout":"nvfp4-9part"', "InvalidFormat"),
+                 ('"name":"up_proj.global_scale"', '"name":"down_proj.global_scale"', "InvalidSegment"),
+                 ('"dtype":"F32","shape":[],"offset":1152', '"dtype":"F16","shape":[],"offset":1152', "InvalidSegment"),
+                 ('"offset":4096,"length":3468', '"offset":3468,"length":3468', "InvalidRecord"),
+                 ('"format":"mlx-stream-nvfp4-expert-bank-v1"', '"format":"mlx-stream-mxfp4-expert-bank-v1"',
+                  "InvalidFormat")]
+        for old, new, err in cases:
+            self.assertEqual(text.count(old), 1, old)
+            with self.assertRaisesRegex(PrepError, err):
+                manifest.check(json.loads(text.replace(old, new)))
+
+    def test_global_scale_round_trip(self):
+        self.assertEqual(conv.global_scale(np.float32(0.15625 / 2688), "x"), np.float32(0.15625))
+        with self.assertRaisesRegex(PrepError, "not weight_scale_2"):
+            conv.global_scale(np.uint32(980861098).view(np.float32), "x")
+        with self.assertRaisesRegex(PrepError, "positive finite"):
+            conv.global_scale(np.float32(0.0), "x")
+
+    def test_beam_pins(self):
+        repo, rev, files = conv.fetch.load_pins(HERE / conv.Beam.pins, conv.Beam.repo, conv.Beam.revision,
+                                                conv.META_FILES)
+        shards = {n: v for n, v in files.items() if n.endswith(".safetensors")}
+        self.assertEqual(len(shards), 53)
+        self.assertEqual(sum(v["size"] for v in shards.values()), 293_634_877_368)
+        self.assertEqual(files["model.safetensors.index.json"]["sha256"],
+                         "5e190cb19c177b2fa1febe607548f900172b9040f9f4af65f582cc8af6be1b26")
+
+    def test_glm5_next_is_a_refusing_stub(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            rc, log = run("all", "--family", "glm5_next", "--src", str(tmp / "s"), "--out", str(tmp / "o"))
+            self.assertEqual(rc, 1)
+            self.assertIn("csf32", log)
+            self.assertFalse((tmp / "o").exists())
+        finally:
+            shutil.rmtree(tmp)
+
+
+class Resume(unittest.TestCase):
+    def test_steps_one_by_one_equal_all(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "a", SEED)
+            fx.build(tmp / "b", SEED)
+            self.assertEqual(run("all", *build_args(tmp / "a", tmp / "pa"))[0], 0)
+            for step in ("fetch", "residents", "bank", "config", "verify"):
+                rc, log = run(step, *build_args(tmp / "b", tmp / "pb"))
+                self.assertEqual(rc, 0, f"{step}: {log}")
+            self.assertEqual((tmp / "pa" / "pack-sha256.txt").read_text(), (tmp / "pb" / "pack-sha256.txt").read_text())
+            rc, log = run("all", *build_args(tmp / "b", tmp / "pb"))
+            self.assertEqual(rc, 0, log)
+            self.assertIn("[bank] skip", log)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_a_pass_cut_mid_way_resumes_to_the_same_pack(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "a", SEED)
+            fx.build(tmp / "b", SEED)
+            self.assertEqual(run("all", *build_args(tmp / "a", tmp / "pa"))[0], 0)
+            shard = "model-layer-00005.safetensors"
+            (tmp / "b" / shard).rename(tmp / shard)
+            rc, log = run("all", *build_args(tmp / "b", tmp / "pb", "--delete-verified"))
+            self.assertEqual(rc, 1, log)
+            self.assertIn("[shard] deleted {\"shard\": \"model-layer-00004.safetensors\"}", log)
+            (tmp / shard).rename(tmp / "b" / shard)
+            rc, log = run("all", *build_args(tmp / "b", tmp / "pb", "--delete-verified"))
+            self.assertEqual(rc, 0, log)
+            self.assertNotIn("model-layer-00004.safetensors\", \"parts\"", log)  # not taken twice
+            self.assertEqual((tmp / "pa" / "pack-sha256.txt").read_text(), (tmp / "pb" / "pack-sha256.txt").read_text())
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_a_record_changed_on_disk_fails_verify(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "f", SEED)
+            self.assertEqual(run("all", *build_args(tmp / "f", tmp / "p"))[0], 0)
+            path = tmp / "p" / "experts.bin"
+            data = bytearray(path.read_bytes())
+            data[100] ^= 1
+            path.write_bytes(bytes(data))
+            rc, log = run("verify", *build_args(tmp / "f", tmp / "p"))
+            self.assertEqual(rc, 1)
+            self.assertIn("sha256 mismatch: experts.bin", log)
+        finally:
+            shutil.rmtree(tmp)
+
+
+def _ws2_bad(cfg, hfq, shards):
+    t = shards["model-layer-00003.safetensors"]
+    t["model.layers.3.mlp.experts.1.up_proj.weight_scale_2"] = ("F32", [], np.uint32(980861098).view(np.float32))
+
+
+def _nan_scale(cfg, hfq, shards):
+    t = shards["model-layer-00006.safetensors"]
+    d, s, arr = t["model.layers.6.mlp.experts.7.down_proj.weight_scale"]
+    arr = arr.copy()
+    arr[3, 2] = 0x7F
+    t["model.layers.6.mlp.experts.7.down_proj.weight_scale"] = (d, s, arr)
+
+
+def _dtype(cfg, hfq, shards):
+    t = shards["model-layer-00004.safetensors"]
+    d, s, arr = t["model.layers.4.mlp.experts.0.gate_proj.weight_scale"]
+    t["model.layers.4.mlp.experts.0.gate_proj.weight_scale"] = ("U8", s, arr)
+
+
+def _shape(cfg, hfq, shards):
+    t = shards["model-layer-00001.safetensors"]
+    t["model.layers.1.self_attn.gate_bias"] = ("BF16", [fx.NH + 1], np.zeros(fx.NH + 1, np.uint16))
+
+
+def _missing(cfg, hfq, shards):
+    del shards["model-layer-00005.safetensors"]["model.layers.5.mlp.experts.2.gate_proj.input_scale"]
+
+
+def _extra(cfg, hfq, shards):
+    shards["model-tail.safetensors"]["model.extra.weight"] = ("BF16", [2], np.zeros(2, np.uint16))
+
+
+def _not_excluded(cfg, hfq, shards):
+    hfq["quantization"]["exclude_modules"].remove("model.layers.3.self_attn*")
+
+
+def _not_nvfp4(cfg, hfq, shards):
+    hfq["quantization"]["quant_algo"] = "FP8"
+
+
+def _sparse_first(cfg, hfq, shards):
+    cfg["mlp_layer_types"] = ["sparse"] + cfg["mlp_layer_types"][1:]
+
+
+class Refusals(unittest.TestCase):
+    CASES = [
+        (_ws2_bad, "f32(weight_scale_2 x 2688) / 2688"),
+        (_nan_scale, "E4M3 NaN block scales"),
+        (_dtype, "weight_scale: U8 [128, 16]"),
+        (_shape, "gate_bias: BF16 [5]"),
+        (_missing, "missing (first ['model.layers.5.mlp.experts.2.gate_proj.input_scale']"),
+        (_extra, "extra (first ['model.extra.weight']"),
+        (_not_excluded, "resident model.layers.3.self_attn.q_proj is not excluded"),
+        (_not_nvfp4, "quant_algo FP8"),
+        (_sparse_first, "not a dense prefix"),
+    ]
+
+    def test_each_mismatch_refuses_by_name(self):
+        for tweak, want in self.CASES:
+            with self.subTest(tweak.__name__):
+                tmp = Path(tempfile.mkdtemp())
+                try:
+                    fx.build(tmp / "f", SEED, tweak)
+                    rc, log = run("all", *build_args(tmp / "f", tmp / "p"))
+                    self.assertEqual(rc, 1, log)
+                    self.assertIn(want, log)
+                    self.assertFalse((tmp / "p" / "expert-manifest.json").exists())
+                finally:
+                    shutil.rmtree(tmp)
+
+    def test_a_source_changed_after_pinning_refuses(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "f", SEED)
+            p = tmp / "f" / "model-layer-00002.safetensors"
+            data = bytearray(p.read_bytes())
+            data[-1] ^= 1
+            p.write_bytes(bytes(data))
+            rc, log = run("all", *build_args(tmp / "f", tmp / "p"))
+            self.assertEqual(rc, 1)
+            self.assertIn("sha256 mismatch: model-layer-00002.safetensors", log)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_a_pins_table_never_downloads(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "f", SEED)
+            (tmp / "f" / "model-layer-00003.safetensors").unlink()
+            rc, log = run("all", *build_args(tmp / "f", tmp / "p"))
+            self.assertEqual(rc, 1)
+            self.assertIn("a --pins table's files are not downloaded", log)
+        finally:
+            shutil.rmtree(tmp)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
