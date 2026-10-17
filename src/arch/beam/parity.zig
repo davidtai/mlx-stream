@@ -34,6 +34,11 @@
 //!
 //! Then each case runs again on the served routes, and the test prints the share of rows within `abs_tol` (a report:
 //! the near ties decide it).
+//!
+//! A q8 pack (`residents_format: affine8_g64`) runs two ways. Against its own reference (the script dequantizes the q8
+//! residents) it holds the bounds above: the served route computes what the q8 weights define. Against the BF16 pack's
+//! reference it holds the tier's bound: the twin is then the q8 reference on the BF16 reference's routes (the script's
+//! `--ids-from` and `--routes-from`), so a row's bound is `twin_factor` times the tier's own difference on that row.
 
 const std = @import("std");
 const sdk = @import("sdk");

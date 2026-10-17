@@ -1,12 +1,12 @@
 //! beam's memory bill on the shared bill core (mimo_v2/route_bill.zig), in glm5_next's form: the arch's terms (the
-//! trunk's residents and owned tables, the routers' F32 copies, the KV lanes preallocated at the billed context, MLX's
-//! cache and its one buffer of overshoot, the compiler and host runtimes, the wiring, the request's waves, the sampler,
-//! the keep-warm engine) and the expert source's (MiMo's route over the NVFP4 bank: route_bill.zig `sourceTerms`), each
-//! phase billed apart. Every byte term is geometric (the arrays graph.zig and experts.zig build, by their shapes at the
-//! billed context and the prompt call's rows, in the buffers MLX allocates for them) or a declared bound; each term is an
-//! upper bound. The fill (sdk.fill) gives the most decode rows and the most prompt rows (prompt <= decode <= experts)
-//! within the host's ceiling less its wired margin, floor 8; forced rows are an operator pin, loaded as named with the
-//! overage reported.
+//! trunk's residents and owned tables, the routers' F32 copies, the KV lanes preallocated at the billed context, the q8
+//! tier's prompt view, MLX's cache and its one buffer of overshoot, the compiler and host runtimes, the wiring, the
+//! request's waves, the sampler, the keep-warm engine) and the expert source's (MiMo's route over the NVFP4 bank:
+//! route_bill.zig `sourceTerms`), each phase billed apart. Every byte term is geometric (the arrays graph.zig and
+//! experts.zig build, by their shapes at the billed context and the prompt call's rows, in the buffers MLX allocates
+//! for them) or a declared bound; each term is an upper bound. The fill (sdk.fill) gives the most decode rows and the
+//! most prompt rows (prompt <= decode <= experts) within the host's ceiling less its wired margin, floor 8; forced rows
+//! are an operator pin, loaded as named with the overage reported.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -95,6 +95,27 @@ pub fn attnTileBytes(c: *const beam.Config, n: u64, keys: u64) u64 {
     return q + kvp + mask + out + gate + proj + lane;
 }
 
+/// The q8 tier's prompt view (graph.zig `promptView`): a prompt layer's projections as BF16 weights, each in its own
+/// buffer, held from the layer's start to its end; the widest layer's (a dense layer: its attention's five and its
+/// MLP's three). 0 under bf16.
+pub fn promptViewBytes(c: *const beam.Config, page: u64) u64 {
+    if (c.residents_format != .affine8_g64) return 0;
+    const h: u64 = c.hidden_size;
+    const qd: u64 = @as(u64, c.n_heads) * c.head_dim;
+    const kd: u64 = @as(u64, c.n_kv_heads) * c.head_dim;
+    const attn = 3 * bufferBytes(qd * h * bf16, page) + 2 * bufferBytes(kd * h * bf16, page);
+    const dense = if (c.first_k_dense > 0) 3 * bufferBytes(@as(u64, c.intermediate_size) * h * bf16, page) else 0;
+    return attn + dense;
+}
+
+/// The prompt view's largest buffer (a dense projection's BF16 weight, else q / gate / o's): 0 under bf16.
+pub fn promptViewBuffer(c: *const beam.Config) u64 {
+    if (c.residents_format != .affine8_g64) return 0;
+    const h: u64 = c.hidden_size;
+    const wide = @max(@as(u64, c.n_heads) * c.head_dim, if (c.first_k_dense > 0) @as(u64, c.intermediate_size) else 0);
+    return wide * h * bf16;
+}
+
 /// One dense MLP row (graph.zig `mlp`, `swiglu_f32`): gate and up (bf16), the activation (bf16: one compiled kernel, its
 /// f32 values in registers), down.
 pub fn denseRowBytes(c: *const beam.Config) u64 {
@@ -142,7 +163,7 @@ pub fn decodeWaveBytes(c: *const beam.Config, keys: u64) u64 {
 
 /// The phase's largest single buffer (MLX's cache can end one freed buffer over its limit). Prompt: the router's f32
 /// input over the call, its logits, a dense tile's activation, a slab, the merged routed rows under a combine that
-/// merges. Decode: a slab, the logits.
+/// merges, the q8 prompt view's widest weight. Decode: a slab, the logits.
 pub fn overshootBytes(in: *const Inputs, phase: sdk.MemoryBill.Phase) u64 {
     const c = &in.model;
     const h: u64 = c.hidden_size;
@@ -156,18 +177,20 @@ pub fn overshootBytes(in: *const Inputs, phase: sdk.MemoryBill.Phase) u64 {
     b = @max(b, @as(u64, @min(t, graph.dense_tile_rows)) * @as(u64, c.intermediate_size) * bf16);
     b = @max(b, @as(u64, graph.tile_rows) * (@as(u64, c.sliding_window) + graph.tile_rows));
     if (in.combine != .inplace) b = @max(b, t * c.n_experts_per_tok * h * bf16);
+    b = @max(b, promptViewBuffer(c));
     return b;
 }
 
 /// The live MLX buffers at once (each billed `wire_buffer_bytes`): the kept residents, the owned tables, the slot banks
 /// (every routed layer's components and the transient's), the lanes, construction's once; a forward's arrays twice
-/// (live and cached): the wide call's kept tiles, the attention tiles, a layer's graph.
+/// (live and cached): the wide call's kept tiles, the attention tiles, a layer's graph, the q8 prompt view's weights.
 pub fn bufferCensus(in: *const Inputs) u64 {
     const c = &in.model;
     const g = in.geometry;
     const construction = in.residents.tensors + graph.Weights.ownedArrays(c) + (g.num_moe_layers + 1) * bank.n_components + 2 * c.nFull() + 4 * c.nSliding();
     const tiles = (@as(u64, experts.call_rows) * c.n_experts_per_tok + mimo_math.projection_rows - 1) / mimo_math.projection_rows + mimo_stream.max_route_ids;
-    return construction + 2 * (tiles + 2 * (experts.call_rows / graph.tile_rows) + 256);
+    const view: u64 = if (c.residents_format == .affine8_g64) 8 else 0;
+    return construction + 2 * (tiles + 2 * (experts.call_rows / graph.tile_rows) + 256 + view);
 }
 
 fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
@@ -180,6 +203,7 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
     const cache: [2]u64 = .{ route.prompt_cache_bytes, route.decode_cache_bytes };
     const overshoot: [2]u64 = .{ overshootBytes(in, .prompt), overshootBytes(in, .decode) };
     const resident = in.residents.bytes;
+    const view = promptViewBytes(c, page);
     var wired: [2]u64 = undefined;
     for (&wired, cache, overshoot) |*w, ch, o| w.* = resident + owned.tables + owned.routers + kvb + ch + settings.compilation_bytes + o;
     const terms = [_]Term{
@@ -189,6 +213,9 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         // billed always (an upper bound).
         .{ .name = "router_f32", .bytes = @splat(owned.routers), .at_construction = true },
         .{ .name = "kv_lanes", .bytes = @splat(kvb), .at_construction = true },
+        // `residents_format: affine8_g64`: a prompt layer's projections dequantized to BF16 (graph.zig `promptView`) and
+        // their wiring; the decode phase reads the q8 residents as stored.
+        .{ .name = "prompt_view", .bytes = .{ view + wireTables(view), 0 }, .at_construction = false },
         .{ .name = "mlx_cache", .bytes = cache, .at_construction = false },
         .{ .name = "mlx_cache_overshoot", .bytes = overshoot, .at_construction = false },
         // No Beam reading yet: both phases bill the declared pair (MiMo's declared host runtime and compiled kernels).
@@ -291,6 +318,15 @@ fn fixtureInputs(reserve: u64) !Inputs {
     };
 }
 
+/// Beam 1.0's q8 pack (the converter's receipts: 1,274 resident tensors, 9,437,710,520 B on disk, each page-rounded
+/// in its MLX buffer at most a page more), the bank as the bf16 pack's.
+fn q8Inputs(reserve: u64) !Inputs {
+    var in = try fixtureInputs(reserve);
+    in.model.residents_format = .affine8_g64;
+    in.residents = .{ .bytes = 9_437_710_520 + 1274 * 16_384, .tensors = 1274 };
+    return in;
+}
+
 fn termOf(b: sdk.MemoryBill, name: []const u8) [2]u64 {
     for (b.terms) |t| if (std.mem.eql(u8, t.name, name)) return t.bytes;
     unreachable;
@@ -379,6 +415,36 @@ test "beam bill: every term is non-decreasing in the billed context (the ladder 
         }
         prev = b;
     }
+}
+
+test "beam bill: the q8 tier bills its residents and a dense layer's prompt view in the prompt phase only; the fill takes more rows" {
+    const a = testing.allocator;
+    const c8: beam.Config = .{ .residents_format = .affine8_g64 };
+    // A dense layer's view: q / gate [6,144, 5,120], o [5,120, 6,144], k / v [1,024, 5,120], gate / up / down
+    // [20,480, 5,120] in BF16, each its own buffer.
+    try testing.expectEqual(@as(u64, 2 * (3 * 6144 * 5120 + 2 * 1024 * 5120 + 3 * 20480 * 5120)), promptViewBytes(&c8, 16_384));
+    try testing.expectEqual(@as(u64, 838_860_800), promptViewBytes(&c8, 16_384));
+    try testing.expectEqual(@as(u64, 0), promptViewBytes(&beam.Config{}, 16_384));
+    try testing.expectEqual(@as(u64, 20480 * 5120 * 2), promptViewBuffer(&c8));
+    const in16 = try fixtureInputs(32_768);
+    const in8 = try q8Inputs(32_768);
+    const b16 = try billOf(a, &in16);
+    defer b16.free(a);
+    const b8 = try billOf(a, &in8);
+    defer b8.free(a);
+    const view = termOf(b8, "prompt_view");
+    try testing.expectEqual(@as(u64, 0), view[1]);
+    try testing.expect(view[0] >= 838_860_800);
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(b16, "prompt_view"));
+    // The residents drop by 6.72 GB; the decode phase's fixed terms by about that (the census adds 556 buffers).
+    try testing.expect(termOf(b16, "residents")[1] - termOf(b8, "residents")[1] > 6_700_000_000);
+    try testing.expect(b8.fixed(.decode) + 6_600_000_000 < b16.fixed(.decode));
+    const target = box_ceiling - box_stop;
+    const baseline: u64 = 35_063_922_688;
+    const r16 = try sdk.fill(b16, baseline, target, 256, min_rows);
+    const r8 = try sdk.fill(b8, baseline, target, 256, min_rows);
+    try testing.expect(r8.decode >= r16.decode + 5 and r8.prompt >= r16.prompt + 5);
+    std.debug.print("\nBEAM BILL q8 (baseline 35.06 GB, ctx 32,768): rows {d}/{d} against bf16's {d}/{d}; prompt_view {d} B\n", .{ r8.prompt, r8.decode, r16.prompt, r16.decode, view[0] });
 }
 
 test "beam bill: the keep-warm route bills MiMo's declared engine from construction; the control, none" {

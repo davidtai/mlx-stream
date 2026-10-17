@@ -1,6 +1,7 @@
-//! Reflection Beam 1.0 (`beam`) behind the `arch` kind (sdk.Arch.of): the pack mlx-stream serves (config.json, the BF16
-//! residents, the NVFP4 expert bank `experts.bin` beside `expert-manifest.json`, declared by the config's
-//! `expert_streaming` block; scripts/prepare_nvfp4_pack.py --family beam writes it). Every entry wraps the module's own;
+//! Reflection Beam 1.0 (`beam`) behind the `arch` kind (sdk.Arch.of): the pack mlx-stream serves (config.json, the
+//! residents in BF16 or the q8 tier (`residents_format`), the NVFP4 expert bank `experts.bin` beside
+//! `expert-manifest.json`, declared by the config's `expert_streaming` block; scripts/prepare_nvfp4_pack.py --family beam
+//! writes it). Every entry wraps the module's own;
 //! the host reaches the module once per prompt, serial step or request end, never per layer. No draft lane: every
 //! request decodes in serial steps, the plugin's sampler drawing each token.
 
