@@ -2,7 +2,8 @@
 
 An NVFP4 arch of mlx-stream serves a prepared directory, the **pack**. It does not serve the Hugging Face
 checkpoint. `scripts/prepare_nvfp4_pack.py` makes a pack from a ModelOpt NVFP4 checkpoint. This page tells what a
-pack holds, the layout of one expert record, how to make a pack, and which checkpoints the script reads.
+pack holds, the layout of one expert record, how to make a pack, which checkpoints the script reads, and how the
+script adds a drafter to a pack.
 
 Definitions: **pack** = the directory that `--model` points at. **Residents** = every tensor that is not a routed
 expert. The arch loads them one time (`model.safetensors`). **Expert bank** = `experts.bin` and
@@ -18,7 +19,8 @@ past the page cache. GB are decimal.
 | `experts.bin` | The expert records (next section). |
 | `expert-manifest.json` | Format `mlx-stream-nvfp4-expert-bank-v1`, layout `nvfp4-gud-9part`: the geometry, the nine parts, each record's offset, length and sha256, the source repository, revision and per-file sha256, and the size and sha256 of `experts.bin`. |
 | `tokenizer.json`, `tokenizer_config.json`, `generation_config.json`, `chat_template.jinja` | Copies of the checkpoint's files. |
-| `pack-sha256.txt` | The sha256 of the other nine files. |
+| `drafter.safetensors`, `drafter-manifest.json` | Optional: the drafter sidecar (see "The drafter sidecar"). A pack has both files or neither. |
+| `pack-sha256.txt` | The sha256 of the other files: nine, or eleven with the drafter sidecar. |
 
 The `expert_streaming` block in `config.json`:
 
@@ -143,3 +145,147 @@ python3 -I scripts/test_prepare_nvfp4_pack.py
 ```
 
 With `--pins` the script uses the table's repository and revision and never downloads.
+
+## The drafter sidecar
+
+The drafter step adds a DFlash2 drafter to a pack, for the draft lane of the arch. The step is not part of `all`. Run
+it on a pack that the steps above made.
+
+```sh
+python3 -I scripts/prepare_nvfp4_pack.py drafter --family beam --drafter-src SRC --out PACK \
+    [--drafter-pins PINS] [--work DIR]
+```
+
+`SRC` holds the drafter release's `config.json` and `model.safetensors`. `README.md` is optional. The script does
+not download files into `SRC`. For `beam`, the release is `reflection/Beam-1.0-501B-A23B-DFlash2` at
+`163b276be744c8ce2b8385ea85de54edb3088211`. Its pins are in `scripts/beam_dflash2_163b276b.sha256.json`.
+`--drafter-pins` gives a different pin table, for example the fixture drafter's.
+
+The step writes two files into the pack:
+
+| file | contents |
+|---|---|
+| `drafter.safetensors` | The release's `model.safetensors`, byte for byte. When `SRC` and `PACK` are on one filesystem, the file is a hard link. If not, the script copies the file with `F_NOCACHE` and checks the sha256 of the copy before the rename. |
+| `drafter-manifest.json` | Format `mlx-stream-dflash2-drafter-v1`. The next table gives its keys. |
+
+The step writes to the journal of the pack (`--work`, default `PACK/.prepare`). It records the drafter files that it
+hashed in `drafter-sources-verified.json` in that directory.
+
+### The manifest
+
+| key | value |
+|---|---|
+| `family` | `mlx-stream` |
+| `format` | `mlx-stream-dflash2-drafter-v1` |
+| `data_file` | `drafter.safetensors` |
+| `data_size`, `data_sha256` | The size in bytes and the sha256 of `drafter.safetensors`. |
+| `header_bytes` | 8 plus the length of the safetensors header. The payload starts at this offset. |
+| `payload_bytes` | The sum of the tensor lengths: `data_size` minus `header_bytes`. |
+| `source` | `repo`, `revision`, `file` (`model.safetensors`), `size`, `sha256`: the pin of the release file. `size` and `sha256` are equal to `data_size` and `data_sha256`. |
+| `config` | The geometry of the drafter and its `dflash_config`: 23 keys (below). |
+| `tensors` | For each tensor: `dtype` (`BF16`), `shape`, `offset`, `length`, `sha256`. `offset` is from the start of the payload, as `data_offsets[0]` in the header. |
+
+The script reads `config` from the release's `config.json` as z-lab dflash (07ebd93d, `dflash/model_mlx.py`
+`load_draft`) reads it:
+
+- From the top level: `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `head_dim`,
+  `intermediate_size`, `vocab_size`, `rms_norm_eps`, `sliding_window`, `layer_types`, `is_causal`,
+  `num_target_layers`.
+- From `dflash_config`: `block_size`, `mask_token_id`, `target_layer_ids`, `conv_kernel_size`, `conv_group_size`,
+  `selector_rank`, `selector_top_k`.
+- From `dflash_config`, else from the top level: `final_logit_softcapping`, `input_embedding_scale`,
+  `output_multiplier`. When the release does not set a scale, its value is 1.0.
+- `rope_theta`: from the top level, else from `rope_parameters`.
+
+The integers are JSON integers. `rms_norm_eps`, `rope_theta`, `final_logit_softcapping`, `input_embedding_scale` and
+`output_multiplier` are JSON numbers. `is_causal` is a bool. `layer_types` is a list of strings. When no layer is
+`sliding_attention` and the release sets no `sliding_window`, `sliding_window` is 0.
+
+### The tensors
+
+All tensors are BF16. H = `hidden_size`, L = `num_hidden_layers`, T = the number of target layers, K =
+`conv_kernel_size`, G = `conv_group_size`, R = `selector_rank`, V = `vocab_size`, NH and NKV = the number of query
+heads and KV heads, D = `head_dim`, I = `intermediate_size`.
+
+| tensor | shape |
+|---|---|
+| `fc.weight` | [H, T x H] |
+| `hidden_norm.weight`, `norm.weight` | [H] |
+| `candidate_selector.hidden_projection.weight` | [R, H] |
+| `candidate_selector.predecessor_codebook`, `candidate_selector.successor_codebook` (no `.weight` suffix) | [V, R] |
+| `layers.i.attention_conv.base_kernel`, `layers.i.mlp_conv.base_kernel` | [2, K, H] |
+| `layers.i.attention_conv.kernel_projection.weight`, `layers.i.mlp_conv.kernel_projection.weight` | [2 x K x H / G, H] |
+| `layers.i.input_layernorm.weight`, `layers.i.post_attention_layernorm.weight` | [H] |
+| `layers.i.self_attn.q_proj.weight` | [NH x D, H] |
+| `layers.i.self_attn.k_proj.weight`, `layers.i.self_attn.v_proj.weight` | [NKV x D, H] |
+| `layers.i.self_attn.o_proj.weight` | [H, NH x D] |
+| `layers.i.self_attn.q_norm.weight`, `layers.i.self_attn.k_norm.weight` | [D] |
+| `layers.i.mlp.gate_proj.weight`, `layers.i.mlp.up_proj.weight` | [I, H] |
+| `layers.i.mlp.down_proj.weight` | [H, I] |
+
+The `layers.i.` tensors are there for each layer i, from 0 to L - 1: 6 + 15 x L tensors in total. The release puts
+them in name order, one after the other.
+
+### The checks
+
+The step does these checks in this order. It does not change the pack's files before they pass:
+
+1. The pack has a `config.json` of the family.
+2. Each file of the pin table that is in `SRC`: its size and its sha256. `config.json` and `model.safetensors` must be
+   in `SRC`.
+3. The drafter's config. Each count is a positive integer. `block_size` is 2 or more. `mask_token_id` is less than
+   `vocab_size`. `conv_group_size` divides `hidden_size`. `selector_top_k` is not more than `vocab_size`.
+   `target_layer_ids` is a list of layer ids in increasing order. Each entry of `layer_types` is `sliding_attention`
+   or `full_attention`, and `sliding_window` is set when a layer is `sliding_attention`. `is_causal` is true or false.
+   The RoPE is the default RoPE: `rope_scaling` is null, `rope_parameters.rope_type` is `default`, and the config has
+   one `rope_theta` value. `input_embedding_scale` and `output_multiplier` are absent or 1.0.
+4. The drafter against the pack's `config.json`. `hidden_size` and `vocab_size` are equal. Each target layer id is
+   less than the pack's `num_hidden_layers`. `num_target_layers` is equal to the pack's `num_hidden_layers`.
+5. The safetensors header. It holds exactly the tensors above, each BF16 with its shape. The `data_offsets` follow
+   each other with no gap and no overlap, from 0 to the end of the file.
+
+Then the step puts `drafter.safetensors` into the pack. It reads the file one time past the page cache, for the sha256
+of each tensor and of the file. The sha256 of the file must be the pin's. Then the step writes the manifest. Then it
+reads the two files again: it compares the manifest with the file (the sizes, the header, the sha256 of each tensor
+and of the file).
+
+Each failure is a refusal by name with exit status 1, as in the other steps. Examples: a changed byte (the sha256 of
+`model.safetensors` is not the pin's), a tensor with a different name (the missing and the extra name), a tensor with
+a different shape, a `hidden_size` that is not the pack's, a target layer that is not a layer of the pack.
+
+### Verify and the drafter
+
+`verify` accepts a pack with both drafter files or with neither. It refuses one of the files without the other. When
+the pack holds the two files, `verify` does the read-back check of the step again, with the config check against the
+pack's `config.json`. Then `pack-sha256.txt` lists the two files. A pack without the drafter verifies as before.
+
+After the drafter step, run `verify` again to add the two files to `pack-sha256.txt`. `verify` needs a routed shard in
+`SRC` for its parity sample.
+
+### Sizes and the fixture drafter
+
+| drafter | `drafter.safetensors` | header (with the 8-byte length) | payload | tensors |
+|---|---|---|---|---|
+| `beam` (the release) | 3,854,978,296 B | 8,952 B | 3,854,969,344 B | 81 |
+| the fixture drafter, `--seed 0` | 2,587,744 B | 3,680 B | 2,584,064 B | 36 |
+
+The step reads `drafter.safetensors` three times past the page cache: for the pin (one time, then the journal's state
+records it), for the manifest and for the read-back. A copy adds one read and one write.
+
+`scripts/beam_fixture.py --drafter DRAFT` writes a tiny drafter for the fixture's trunk (hidden 256, vocabulary 512,
+7 layers). It has the release's config keys, header layout and name order. Its geometry: 2 layers (both
+`sliding_attention`, window 16, `is_causal` false), 4 query heads and 2 KV heads of 64, intermediate 384, target layers
+[1, 3, 5], block 16, mask id 508, conv kernel 2 in groups of 16, selector rank 32, top 8, soft cap 30. Its weights are
+seeded random values, rounded to BF16. With `--seed 0`, its `model.safetensors` has 2,587,744 B and the sha256
+`8452b030b568245314b3bed9931934b4cf46ecc473174bd05687b95e28643995`.
+
+```sh
+python3 -I scripts/beam_fixture.py --out FIX
+python3 -I scripts/prepare_nvfp4_pack.py all --family beam --src FIX --out PACK --pins FIX/fixture.sha256.json
+python3 -I scripts/beam_fixture.py --drafter DRAFT
+python3 -I scripts/prepare_nvfp4_pack.py drafter --family beam --drafter-src DRAFT --out PACK \
+    --drafter-pins DRAFT/fixture.sha256.json
+python3 -I scripts/prepare_nvfp4_pack.py verify --family beam --src FIX --out PACK --pins FIX/fixture.sha256.json
+```
+
+Time of the drafter step for the fixture drafter: 0.08 s on the laptop.
