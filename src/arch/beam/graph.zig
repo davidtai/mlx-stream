@@ -32,6 +32,11 @@
 //! for the layer (`promptView`: MiMo's and glm5_next's prompt route, the stock GEMM over the dequantized weight): the
 //! prompt pass keeps BF16's GEMMs (the 16K prompt's projections 2,376 ms against BF16's 2,395 ms; MLX's quantized GEMM
 //! on every tile 2,474 ms).
+//!
+//! The draft lane (lane.zig) reads the forward through its `capture` sink: the residual stream at the end of the
+//! drafter's target layers (drafter.zig `Captures`), a reference to the lazy rows in a verify chunk, the call's tail in a
+//! prompt call. A verify chunk is a decode-lane forward of at most `experts.decode_lane_rows` rows with every row's
+//! logits (`head == .all`); `Cache.trim` rolls its rejected rows back.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -526,6 +531,16 @@ pub const Cache = struct {
         for (self.rings) |*r| r.rewind();
         self.len = 0;
     }
+
+    /// The draft lane's rollback: the newest `n` positions dropped (the rejected verify rows). Each ring drops them under
+    /// its window rule (`SlidingRing.trimBy`: the next row's whole window stays resident; the ring keeps 17 rows past
+    /// it); a slab's rows past the length are unread and the next write replaces them.
+    pub fn trim(self: *Cache, n: u32) !void {
+        if (n == 0) return;
+        if (n > self.len) return error.BeamTrimRange;
+        for (self.rings) |*r| try r.trimBy(n);
+        self.len -= n;
+    }
 };
 
 // ── The forward ──
@@ -570,19 +585,20 @@ pub fn rmsNorm(g: *G, x: T, w: T, eps: f32) !T {
     return g.adopt(o);
 }
 
-fn rope(g: *G, x: T, dims: u32, base: f32, offset: u32) !T {
+/// RoPE (rotate-half, scale 1) over `x` [1, heads, n, d]'s first `dims` columns at positions offset .. offset + n - 1.
+pub fn rope(g: *G, x: T, dims: u32, base: f32, offset: u32) !T {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_rope(&o, x, @intCast(dims), false, mlx.mlx_optional_float.some(base), 1.0, @intCast(offset), .{}, g.s));
     return g.adopt(o);
 }
 
-fn tanh(g: *G, x: T) !T {
+pub fn tanh(g: *G, x: T) !T {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_tanh(&o, x, g.s));
     return g.adopt(o);
 }
 
-fn sdpa(g: *G, q: T, k: T, v: T, scale: f32, mode: [*:0]const u8, mask: T) !T {
+pub fn sdpa(g: *G, q: T, k: T, v: T, scale: f32, mode: [*:0]const u8, mask: T) !T {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, mode, mask, .{}, false, g.s));
     return g.adopt(o);
@@ -957,8 +973,9 @@ pub const Head = enum { last, all };
 /// `cache`), the routed experts through `src`, the construction's `routes`: the last row's logits f32 [1, vocab]
 /// (soft-capped), a kept handle the caller frees; under `head == .all` every row's, f32 [rows, vocab]. `force` is `{}`
 /// when served, or the parity test's `*const ForcedRoutes` (its own comptime instance: the served forward has no branch
-/// on it).
-pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Weights, routes: Routes, ids: []const u32, start: u32, cache: *Cache, src: anytype, comptime head: Head, force: anytype) !T {
+/// on it). `capture` is `{}`, or the draft lane's sink (`take(g, layer, x, rows)` after every layer, x its output
+/// [rows, hidden]; drafter.zig `Captures`).
+pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Weights, routes: Routes, ids: []const u32, start: u32, cache: *Cache, src: anytype, comptime head: Head, force: anytype, capture: anytype) !T {
     const rows: u32 = @intCast(ids.len);
     if (rows == 0 or rows > experts.call_rows) return error.BeamCallRows;
     if (start + rows > cache.cap) return error.ContextOverBill;
@@ -1035,6 +1052,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             try g.evalAll(&.{x});
             src.promptLayerEnd();
         }
+        if (comptime @TypeOf(capture) != void) try capture.take(g, l, x, rows);
     }
     cache.len = start + rows;
     // The decode glue's last boundary normed the one row by the final norm already: the head's lm_head and soft cap.

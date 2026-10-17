@@ -5,7 +5,9 @@
 //! expert source on MiMo's route at the plan's rows, the KV lanes allocated at the billed context, the rate tally, the
 //! usage record and seed, the receipt's lines.
 //! A request: the prompt pass in calls of at most `experts.call_rows` rows, the phase change to decode rows, serial
-//! steps; the request's end logs its decode memory. Single-flight: one request's state at a time.
+//! steps or the draft lane's rounds (lane.zig, `mtp_lane`: the DFlash2 drafter from the pack's sidecar; an armed
+//! request's prompt calls and steps feed the drafter's context); the request's end logs its decode memory.
+//! Single-flight: one request's state at a time.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -22,6 +24,8 @@ const route_bill = @import("../mimo_v2/route_bill.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const sdk_ext = @import("../../sdk_ext.zig");
 const residency = @import("../../sdk_ext/expert/residency.zig");
+const lane_mod = @import("lane.zig");
+const drafter = @import("drafter.zig");
 
 const T = mlx.mlx_array;
 
@@ -55,6 +59,8 @@ pub const Module = struct {
     /// committed length only at its end): the request's state is lost and every step refuses by name
     /// (`BeamDecodeStateLost`) until the next prompt pass restarts the lanes.
     state_lost: bool = false,
+    /// The draft lane (`mtp_lane`), installed at construction or absent (the serial control).
+    lane: ?*lane_mod.Lane = null,
 
     /// `open_ns`: the start of the last serial step, whose wall ends at the next step's start or at the request's end
     /// (`closeStep`).
@@ -140,6 +146,13 @@ pub const Module = struct {
         if (self.src.warm != null) log.info("beam gpu keep-warm installed: gpu_keep_warm=waits source={s} (MiMo X12: the gated waits and every decode routing barrier; bill {d} B)\n", .{ if (self.c.gpu_keep_warm_requested) "setting" else "default", gpu_warm.bill_bytes });
         self.cache = try graph.Cache.init(gpa, &self.g, &self.c.model, @intCast(plan.reserve));
         errdefer self.cache.deinit(&self.g);
+        // The draft lane: the drafter's sidecar verified tensor by tensor and its context rings, only with `mtp_lane`.
+        if (self.c.mtp_lane) {
+            self.lane = try lane_mod.Lane.init(gpa, io, dir, &self.c, s);
+            const l = self.lane.?;
+            log.info("beam draft lane installed: lane=\"{s}\" drafter={s} payload_bytes={d} sha256_verified={d}+file read_s={d:.2} block={d} targets={any} window={d} verify_chunk_rows={d}\n", .{ l.name(), drafter.format, l.dr.payload_bytes, l.dr.c.layers * 15 + 6, @as(f64, @floatFromInt(l.dr.read_ns)) / 1e9, l.dr.c.block, l.dr.c.targetSlice(), l.dr.c.window, lane_mod.chunk_rows });
+        } else log.info("beam draft lane: off (serial; set {{\"mtp_lane\":true}} with the drafter's sidecar in the pack)\n", .{});
+        errdefer if (self.lane) |l| l.deinit();
         // The usage seed (`resident_seed`): before the first request; one line.
         try residency.seedResidents(gpa, io, "beam", &self.c.residency, dir, self.src);
         log.info("beam routes: residents={s} prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe={s} decode_glue={s} expert_rows_by_layer={s} call_rows={d} tile_rows={d} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ @tagName(model.residents_format), @tagName(self.src.combine_route), @tagName(route.read_schedule), @tagName(route.drain), @tagName(route.bank_view), @tagName(decode_moe), @tagName(glue_route), @tagName(split), experts.call_rows, graph.tile_rows, @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
@@ -165,6 +178,7 @@ pub const Module = struct {
 
     pub fn deinit(self: *Module) void {
         _ = mlx.mlx_synchronize(self.g.s);
+        if (self.lane) |l| l.deinit();
         self.res.closeTally(self.gpa);
         self.res.closeUsage();
         self.src.deinit();
@@ -187,8 +201,14 @@ pub const Module = struct {
         return self.reserve;
     }
 
-    fn nowNs(self: *const Module) u64 {
+    pub fn nowNs(self: *const Module) u64 {
         return @intCast(std.Io.Timestamp.now(self.io, .awake).nanoseconds);
+    }
+
+    /// The lane when it is installed and the running request is armed (its forwards feed the drafter's context).
+    fn armedLane(self: *const Module) ?*lane_mod.Lane {
+        const l = self.lane orelse return null;
+        return if (l.active) l else null;
     }
 
     fn checkTokens(self: *const Module, ids: []const u32) !void {
@@ -200,6 +220,7 @@ pub const Module = struct {
     pub fn prefill(self: *Module, ids: []const u32, req: sdk.RequestShape) !T {
         self.requestEnd();
         if (req.prompt_tokens != ids.len) return error.BeamPrefixNotKept;
+        if (self.lane) |l| l.begin();
         try self.beginPrompt(ids);
         errdefer self.state_lost = true;
         const logits = try self.promptCalls(ids, .last, {});
@@ -224,7 +245,7 @@ pub const Module = struct {
 
     /// The prompt's calls (at most `experts.call_rows` rows each, layer by layer): the last call's logits (every row's
     /// under `head == .all`: the parity test's), evaluated, the source flushed. `force`: `{}`, or the parity test's routes
-    /// (graph.zig `ForcedRoutes`).
+    /// (graph.zig `ForcedRoutes`). An armed lane's request captures each call's tail into the drafter's context.
     pub fn promptCalls(self: *Module, ids: []const u32, comptime head: graph.Head, force: anytype) !T {
         var logits: ?T = null;
         errdefer if (logits) |x| self.g.release(x);
@@ -233,7 +254,13 @@ pub const Module = struct {
             const end = @min(ids.len, at + experts.call_rows);
             if (logits) |x| self.g.release(x);
             logits = null;
-            logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids[at..end], self.cache.len, &self.cache, self.src, head, force);
+            const start = self.cache.len;
+            if (self.armedLane()) |l| {
+                var caps = l.promptCaptures();
+                errdefer caps.release();
+                logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids[at..end], start, &self.cache, self.src, head, force, &caps);
+                try l.appendCaptures(&self.g, &caps, start + (end - at), true);
+            } else logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids[at..end], start, &self.cache, self.src, head, force, {});
             at = end;
         }
         try self.g.evalAll(&.{logits.?});
@@ -245,6 +272,8 @@ pub const Module = struct {
     pub fn enterDecode(self: *Module, prompt_tokens: usize) !void {
         try self.src.beginDecode();
         self.decode = .{ .active = true, .s0 = self.src.stats(), .prompt_tokens = prompt_tokens };
+        // The lane's receipt reads the stream's misses and bytes over the decode.
+        if (self.lane) |l| l.stats.base.stream_start = self.decode.s0;
     }
 
     /// A serial step (or a short extend) after the committed positions: the last row's logits f32 [1, vocab]. A step
@@ -270,7 +299,14 @@ pub const Module = struct {
             try self.src.beginDecode();
             return logits;
         }
-        const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids, self.cache.len, &self.cache, self.src, .last, force);
+        const start = self.cache.len;
+        // An armed lane's serial step feeds the drafter's context as a verify row does (no gap at the next round).
+        var caps: ?drafter.Captures = if (self.armedLane()) |l| l.rowCaptures() else null;
+        defer if (caps) |*cp| cp.release();
+        const logits = if (caps) |*cp|
+            try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids, start, &self.cache, self.src, .last, force, cp)
+        else
+            try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids, start, &self.cache, self.src, .last, force, {});
         errdefer self.g.release(logits);
         // Committed, not waited on: the host's read of the step's token (its eval of the sampler's row over these
         // logits) is the step's one wait after its routing barriers, with the sampler queued behind the head.
@@ -278,6 +314,7 @@ pub const Module = struct {
         // The last routed layer's released route: its reads settled, its rows unpinned. The next route that can refill
         // those rows runs after the host has read this step's token, so after the GPU has read them.
         try self.src.flush();
+        if (caps) |*cp| try self.lane.?.appendCaptures(&self.g, cp, start + ids.len, false);
         self.decode.steps += 1;
         self.decode.tokens += ids.len;
         self.decode.open_ns = t0;
@@ -290,6 +327,44 @@ pub const Module = struct {
         const t0 = self.decode.open_ns orelse return;
         self.decode.wall_ns += now - t0;
         self.decode.open_ns = null;
+    }
+
+    /// The draft lane's verify chunk: `ids` (at most `lane.chunk_rows` rows) at the committed length through the decode
+    /// lane, every row's logits f32 [rows, vocab] (a kept handle, lazy: the lane folds its decision into their eval, then
+    /// `flushVerify`) and the target layers' rows into `caps`. The position advances by every row; `trim` rolls the
+    /// rejected ones back.
+    pub fn verifyChunk(self: *Module, ids: []const u32, caps: *drafter.Captures) !T {
+        if (self.state_lost) return error.BeamDecodeStateLost;
+        std.debug.assert(ids.len > 0 and ids.len <= lane_mod.chunk_rows and self.src.decodeLaneAt(@intCast(ids.len)));
+        if (self.cache.len + ids.len > self.cache.cap) return error.ContextOverBill;
+        errdefer self.state_lost = true;
+        return graph.forward(&self.g, self.gpa, &self.c.model, &self.w, self.routes, ids, self.cache.len, &self.cache, self.src, .all, {}, caps);
+    }
+
+    /// After a verify chunk's eval: the routes it consumed are released (the serial step's flush).
+    pub fn flushVerify(self: *Module) !void {
+        try self.src.flush();
+    }
+
+    /// The draft lane's rollback: the newest `n` positions (the rejected verify rows) leave every KV lane.
+    pub fn trim(self: *Module, n: u32) !void {
+        self.cache.trim(n) catch |e| {
+            self.state_lost = true;
+            return e;
+        };
+    }
+
+    /// A draft round's start (lane.zig `roundWith`): the last step's or round's wall ends here (`closeStep`).
+    pub fn openRound(self: *Module, now: u64) void {
+        self.closeStep(now);
+    }
+
+    /// A round's tokens in the request's decode accounting (the `beam decode` line). Its wall is a serial step's: from
+    /// its start `t0` to the next step's or round's start, or the request's end.
+    pub fn noteRound(self: *Module, tokens: u32, t0: u64) void {
+        self.decode.steps += 1;
+        self.decode.tokens += tokens;
+        self.decode.open_ns = t0;
     }
 
     /// The request's end (the host's finish): its decode memory (MiMo's line) and its decode's rate and reads, once.
