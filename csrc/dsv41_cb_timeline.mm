@@ -63,6 +63,8 @@ static CommitImp original_for(id self, int depth) {
   return NULL;
 }
 
+static void kl_close(uint32_t row);
+
 static void tl_commit(id self, SEL sel) {
   int depth = self == t_self ? t_depth : 0;
   CommitImp orig = original_for(self, depth);
@@ -75,6 +77,7 @@ static void tl_commit(id self, SEL sel) {
       int same = [(id<MTLCommandBuffer>)self commandQueue] == g_queue;
       if (!same) g_other_queue.fetch_add(1, std::memory_order_relaxed);
       uint32_t i = g_committed.fetch_add(1);
+      kl_close(i < g_cap ? i : 0xFFFFFFFEu);
       if (i < g_cap) {
         Dsv41tlRow *r = &g_rows[i];
         r->tag = tag;
@@ -90,6 +93,8 @@ static void tl_commit(id self, SEL sel) {
       } else {
         g_dropped.fetch_add(1);
       }
+    } else {
+      kl_close(0xFFFFFFFFu);
     }
   }
   id saved_self = t_self;
@@ -193,6 +198,201 @@ size_t dsv41tl_hooked_names(char *out, size_t cap) {
   }
   if (cap > 0) out[n < cap ? n : cap - 1] = 0;
   return n;
+}
+
+// ── the kernel log (PROFILE builds; dsv41kl_hook once, dsv41kl_arm per phase) ──
+// Every compute dispatch the arming thread encodes (MLX's inference thread): its kernel's function name, its grid and
+// threadgroup, and the row of the command buffer that carried it (the outermost -commit above closes the thread's
+// pending dispatches with its row). The names come from the pipelines' creation on the device's class
+// (-newComputePipelineStateWithFunction:error: and -newComputePipelineStateWithDescriptor:options:reflection:error:),
+// the kernel from -setComputePipelineState: and the dispatches from -dispatchThreadgroups:threadsPerThreadgroup: and
+// -dispatchThreads:threadsPerThreadgroup: on the compute encoder's class; each override calls the original it replaced.
+// A pipeline made before dsv41kl_hook is named "?". Storage is static: past the cap a dispatch is counted, not logged.
+typedef id (*KlNewFnImp)(id, SEL, id, NSError **);
+typedef id (*KlNewDescImp)(id, SEL, id, MTLPipelineOption, MTLAutoreleasedComputePipelineReflection *, NSError **);
+typedef void (*KlSetImp)(id, SEL, id);
+typedef void (*KlDispatchImp)(id, SEL, MTLSize, MTLSize);
+
+#define KL_CAP (1u << 21)
+#define KL_NAMES (1u << 18)
+#define KL_SLOTS (1u << 13)
+static Dsv41klDispatch g_kl[KL_CAP];
+static char g_kl_names[KL_NAMES];   /* "?" at 0 (set by the hook) */
+static uint32_t g_kl_names_len = 2;
+static uintptr_t g_kl_slot_key[KL_SLOTS];
+static uint32_t g_kl_slot_name[KL_SLOTS];
+static uint32_t g_kl_pipes = 0;
+static pthread_mutex_t g_kl_mu = PTHREAD_MUTEX_INITIALIZER;
+static KlNewFnImp g_kl_new_fn = NULL;
+static KlNewDescImp g_kl_new_desc = NULL;
+static KlSetImp g_kl_set = NULL;
+static KlDispatchImp g_kl_tg = NULL;
+static KlDispatchImp g_kl_th = NULL;
+static std::atomic<int> g_kl_on{0};
+static pthread_t g_kl_owner;
+static std::atomic<uint32_t> g_kl_n{0};
+static std::atomic<uint32_t> g_kl_dropped{0};
+static uint32_t g_kl_pending = 0;   /* the owner's first dispatch not yet closed by a commit */
+static thread_local uint32_t t_kl_name = 0;
+
+static uint32_t kl_slot(uintptr_t key) {   /* caller holds g_kl_mu */
+  uint32_t h = (uint32_t)((key >> 4) * 2654435761u) & (KL_SLOTS - 1);
+  while (g_kl_slot_key[h] != 0 && g_kl_slot_key[h] != key) h = (h + 1) & (KL_SLOTS - 1);
+  return h;
+}
+
+static void kl_name_pipeline(id pipe, NSString *name) {
+  if (pipe == nil) return;
+  const char *utf = name ? [name UTF8String] : NULL;
+  pthread_mutex_lock(&g_kl_mu);
+  uint32_t h = kl_slot((uintptr_t)pipe);
+  if (g_kl_slot_key[h] == 0 && g_kl_pipes < KL_SLOTS / 2) {
+    uint32_t off = 0;
+    size_t len = utf ? strlen(utf) : 0;
+    if (len > 0 && g_kl_names_len + len + 1 <= KL_NAMES) {
+      off = g_kl_names_len;
+      memcpy(g_kl_names + off, utf, len + 1);
+      g_kl_names_len += (uint32_t)len + 1;
+    }
+    g_kl_slot_key[h] = (uintptr_t)pipe;
+    g_kl_slot_name[h] = off;
+    g_kl_pipes++;
+  } else if (g_kl_slot_key[h] == (uintptr_t)pipe && utf) {
+    /* a pipeline object reused at the same address after a release: its new name */
+    size_t len = strlen(utf);
+    if (g_kl_names_len + len + 1 <= KL_NAMES) {
+      g_kl_slot_name[h] = g_kl_names_len;
+      memcpy(g_kl_names + g_kl_names_len, utf, len + 1);
+      g_kl_names_len += (uint32_t)len + 1;
+    }
+  }
+  pthread_mutex_unlock(&g_kl_mu);
+}
+
+static id kl_new_fn(id self, SEL sel, id fn, NSError **err) {
+  id p = g_kl_new_fn(self, sel, fn, err);
+  kl_name_pipeline(p, fn ? [(id<MTLFunction>)fn name] : nil);
+  return p;
+}
+
+static id kl_new_desc(id self, SEL sel, id desc, MTLPipelineOption opt, MTLAutoreleasedComputePipelineReflection *refl, NSError **err) {
+  id p = g_kl_new_desc(self, sel, desc, opt, refl, err);
+  id<MTLFunction> fn = desc ? [(MTLComputePipelineDescriptor *)desc computeFunction] : nil;
+  kl_name_pipeline(p, fn ? [fn name] : nil);
+  return p;
+}
+
+/* The name lookup runs only while the log is armed (outside it the override costs one load): a pipeline set just before
+ * the arm and dispatched after it is named by the previous set's name. */
+static void kl_set(id self, SEL sel, id pipe) {
+  if (g_kl_on.load(std::memory_order_relaxed)) {
+    pthread_mutex_lock(&g_kl_mu);
+    uint32_t h = kl_slot((uintptr_t)pipe);
+    t_kl_name = g_kl_slot_key[h] == (uintptr_t)pipe ? g_kl_slot_name[h] : 0;
+    pthread_mutex_unlock(&g_kl_mu);
+  }
+  g_kl_set(self, sel, pipe);
+}
+
+static void kl_record(MTLSize grid, MTLSize group) {
+  if (!g_kl_on.load(std::memory_order_relaxed) || !pthread_equal(g_kl_owner, pthread_self())) return;
+  uint32_t i = g_kl_n.fetch_add(1, std::memory_order_relaxed);
+  if (i >= KL_CAP) {
+    g_kl_dropped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  Dsv41klDispatch *d = &g_kl[i];
+  d->row = 0xFFFFFFFDu;   /* pending: no commit closed it (yet) */
+  d->name = t_kl_name;
+  d->grid[0] = (uint32_t)grid.width; d->grid[1] = (uint32_t)grid.height; d->grid[2] = (uint32_t)grid.depth;
+  d->group[0] = (uint32_t)group.width; d->group[1] = (uint32_t)group.height; d->group[2] = (uint32_t)group.depth;
+}
+
+static void kl_tg(id self, SEL sel, MTLSize grid, MTLSize group) {
+  kl_record(grid, group);
+  g_kl_tg(self, sel, grid, group);
+}
+
+static void kl_th(id self, SEL sel, MTLSize grid, MTLSize group) {
+  /* dispatchThreads: the grid in threads; logged as threadgroups (rounded up) so both kinds read alike */
+  MTLSize tg = MTLSizeMake(group.width ? (grid.width + group.width - 1) / group.width : 0,
+                           group.height ? (grid.height + group.height - 1) / group.height : 0,
+                           group.depth ? (grid.depth + group.depth - 1) / group.depth : 0);
+  kl_record(tg, group);
+  g_kl_th(self, sel, grid, group);
+}
+
+/* The outermost -commit on the owner thread: its pending dispatches carried by `row` (0xFFFFFFFF untagged, 0xFFFFFFFE
+ * past the rows' cap). */
+static void kl_close(uint32_t row) {
+  if (!g_kl_on.load(std::memory_order_relaxed) || !pthread_equal(g_kl_owner, pthread_self())) return;
+  uint32_t n = g_kl_n.load(std::memory_order_relaxed);
+  if (n > KL_CAP) n = KL_CAP;
+  for (uint32_t k = g_kl_pending; k < n; k++) g_kl[k].row = row;
+  g_kl_pending = n;
+}
+
+/* The original is stored before the override is installed, so a concurrent call never sees a null original. */
+static int kl_swap(Class cls, SEL sel, IMP imp, void **orig) {
+  Method m = class_getInstanceMethod(cls, sel);
+  if (m == NULL) return -1;
+  *orig = (void *)method_getImplementation(m);
+  method_setImplementation(m, imp);
+  return 0;
+}
+
+int dsv41kl_hook(void) {
+  static int done = 1;
+  if (done <= 0) return done;
+  g_kl_names[0] = '?';
+  g_kl_names[1] = 0;
+  int rc = 0;
+  @autoreleasepool {
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    if (dev == nil) return done = -1;
+    Class dc = object_getClass(dev);
+    if (kl_swap(dc, @selector(newComputePipelineStateWithFunction:error:), (IMP)kl_new_fn, (void **)&g_kl_new_fn) != 0) rc = -2;
+    if (rc == 0 && kl_swap(dc, @selector(newComputePipelineStateWithDescriptor:options:reflection:error:), (IMP)kl_new_desc, (void **)&g_kl_new_desc) != 0) rc = -3;
+    /* the compute encoder's class, from a throwaway encoder of the kind MLX makes (concurrent dispatch; never committed) */
+    id<MTLCommandQueue> q = rc == 0 ? [dev newCommandQueue] : nil;
+    id<MTLCommandBuffer> cb = q ? [q commandBuffer] : nil;
+    id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : nil;
+    if (rc == 0 && enc == nil) rc = -4;
+    if (rc == 0) {
+      Class ec = object_getClass(enc);
+      [enc endEncoding];
+      if (kl_swap(ec, @selector(setComputePipelineState:), (IMP)kl_set, (void **)&g_kl_set) != 0) rc = -5;
+      if (rc == 0 && kl_swap(ec, @selector(dispatchThreadgroups:threadsPerThreadgroup:), (IMP)kl_tg, (void **)&g_kl_tg) != 0) rc = -6;
+      if (rc == 0 && kl_swap(ec, @selector(dispatchThreads:threadsPerThreadgroup:), (IMP)kl_th, (void **)&g_kl_th) != 0) rc = -7;
+    }
+    [q release];
+    [dev release];
+  }
+  return done = rc;
+}
+
+void dsv41kl_arm(int on) {
+  g_kl_on.store(0, std::memory_order_relaxed);
+  if (!on) return;
+  g_kl_owner = pthread_self();
+  g_kl_n.store(0);
+  g_kl_dropped.store(0);
+  g_kl_pending = 0;
+  t_kl_name = 0;
+  g_kl_on.store(1, std::memory_order_release);
+}
+
+const Dsv41klDispatch *dsv41kl_rows(uint32_t out[4]) {
+  uint32_t n = g_kl_n.load();
+  out[0] = n < KL_CAP ? n : KL_CAP;
+  out[1] = g_kl_dropped.load();
+  out[2] = g_kl_names_len;
+  out[3] = g_kl_pipes;
+  return g_kl;
+}
+
+const char *dsv41kl_names(void) {
+  return g_kl_names;
 }
 
 // ── the host self-test: a fake buffer hierarchy (no Metal object) ──
