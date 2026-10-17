@@ -1525,6 +1525,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             return if (comptime @hasDecl(S, "readWallNs")) self.source.readWallNs() else 0;
         }
 
+        /// A decode call's routing barrier begins (`on`) or its host-built hit wave is committed: the source's hold, where
+        /// it declares one (`holdBarrier`: MiMo's X12 warm engine keeps the GPU busy meanwhile, so the commit starts
+        /// beside running work, not on an idle GPU). No-op for every other source.
+        fn barrierHold(self: *Self, on: bool) void {
+            if (comptime @hasDecl(S, "holdBarrier")) self.source.holdBarrier(on);
+        }
+
         pub fn run(self: *Self, g: *G, layer: u32, xf: T, indices: T, hoist: []const T) !T {
             return self.runEnd(g, layer, xf, indices, hoist, .take);
         }
@@ -1578,6 +1585,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                 try g.asyncEval(bar[0..n_bar]);
                 try g.asyncEval(&.{d});
             }
+            // A host-built hit wave: once the router ends, the GPU has nothing queued until the host has read the ids,
+            // routed, and built and committed the hit wave. The source's barrier hold (`barrierHold`) spans that time,
+            // from here to the hit wave's commit.
+            var holding = dev == null;
+            if (holding) self.barrierHold(true);
+            defer if (holding) self.barrierHold(false);
             // HOIST_FIRST commits them and the hoist here (the evals below then only wait); the stock route nothing.
             try self.pre_barrier(g, bar[0..n_bar], hoist);
             if (n_bar > 1) try g.evalAll(bar[0..n_bar]);
@@ -1616,6 +1629,10 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             }
             // VERIFY_ENCODE hoist: behind the hit wave, ahead of every miss wave (HOIST_FIRST: committed before the barrier's wait).
             try self.post_hit(g, hoist);
+            if (holding) {
+                self.barrierHold(false);
+                holding = false;
+            }
             if (comptime timeline.enabled) timeline.point(layer, .hit, 0, false);
             if (routes.gated) {
                 if (try self.source.gate(call)) |gates| {
