@@ -69,6 +69,8 @@ comptime {
     _ = @import("arch/deepseek_v41/dspark_head.zig");
     _ = @import("arch/deepseek_v41/dspark_loop.zig");
     _ = @import("expert/bank.zig");
+    _ = @import("expert/nvfp4_bank.zig");
+    _ = @import("expert/nvfp4_format.zig");
     _ = @import("expert/io_test.zig");
     _ = @import("expert/lookahead.zig");
     _ = @import("expert/event_test.zig");

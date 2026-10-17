@@ -295,7 +295,7 @@ pub fn SourceOf(comptime fam: Family) type {
             };
             errdefer bank.deinit();
             const geo = bank.geometry;
-            try geo.requireFlash();
+            if (comptime fam == .exl3) try geo.requireFlash() else try bm.requireFlash(&geo);
             if (rows.len != geo.num_moe_layers or decode_rows.len != rows.len) return error.Glm5NextExpertRows;
             var widest: u32 = mimo_stream.transient_rows;
             for (rows, decode_rows) |p, d| {
