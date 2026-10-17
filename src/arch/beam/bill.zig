@@ -1,12 +1,12 @@
 //! beam's memory bill on the shared bill core (mimo_v2/route_bill.zig), in glm5_next's form: the arch's terms (the
 //! trunk's residents and owned tables, the routers' F32 copies, the KV lanes preallocated at the billed context, the q8
 //! tier's prompt view, MLX's cache and its one buffer of overshoot, the compiler and host runtimes, the wiring, the
-//! request's waves, the sampler, the keep-warm engine) and the expert source's (MiMo's route over the NVFP4 bank:
-//! route_bill.zig `sourceTerms`), each phase billed apart. Every byte term is geometric (the arrays graph.zig and
-//! experts.zig build, by their shapes at the billed context and the prompt call's rows, in the buffers MLX allocates
-//! for them) or a declared bound; each term is an upper bound. The fill (sdk.fill) gives the most decode rows and the
-//! most prompt rows (prompt <= decode <= experts) within the host's ceiling less its wired margin, floor 8; forced rows
-//! are an operator pin, loaded as named with the overage reported.
+//! request's waves, the sampler, the keep-warm engine, the hit pass's LUTs) and the expert source's (MiMo's route over
+//! the NVFP4 bank: route_bill.zig `sourceTerms`), each phase billed apart. Every byte term is geometric (the arrays
+//! graph.zig and experts.zig build, by their shapes at the billed context and the prompt call's rows, in the buffers
+//! MLX allocates for them) or a declared bound; each term is an upper bound. The fill (sdk.fill) gives the most decode
+//! rows and the most prompt rows (prompt <= decode <= experts) within the host's ceiling less its wired margin,
+//! floor 8; forced rows are an operator pin, loaded as named with the overage reported.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -21,6 +21,7 @@ const prefill_combine = @import("../mimo_v2/prefill_combine.zig");
 const route = @import("../mimo_v2/route.zig");
 const route_bill = @import("../mimo_v2/route_bill.zig");
 const dsv_bill = @import("../deepseek_v41/bill.zig");
+const shared_experts = @import("../deepseek_v41/experts.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const bank = experts.bank;
 
@@ -195,15 +196,18 @@ pub fn overshootBytes(in: *const Inputs, phase: sdk.MemoryBill.Phase) u64 {
 }
 
 /// The live MLX buffers at once (each billed `wire_buffer_bytes`): the kept residents, the owned tables, the slot banks
-/// (every routed layer's components and the transient's), the lanes, construction's once; a forward's arrays twice
-/// (live and cached): the wide call's kept tiles, the attention tiles, a layer's graph, the q8 prompt view's weights.
+/// (every routed layer's components and the transient's), the lanes, construction's once; the hit pass's LUT pairs; a
+/// forward's arrays twice (live and cached): the wide call's kept tiles, the attention tiles, a layer's graph, the q8
+/// prompt view's weights.
 pub fn bufferCensus(in: *const Inputs) u64 {
     const c = &in.model;
     const g = in.geometry;
     const construction = in.residents.tensors + graph.Weights.ownedArrays(c) + (g.num_moe_layers + 1) * bank.n_components + 2 * c.nFull() + 4 * c.nSliding();
     const tiles = (@as(u64, experts.call_rows) * c.n_experts_per_tok + mimo_math.projection_rows - 1) / mimo_math.projection_rows + mimo_stream.max_route_ids;
     const view: u64 = if (c.residents_format == .affine8_g64) 8 else 0;
-    return construction + 2 * (tiles + 2 * (experts.call_rows / graph.tile_rows) + 256 + view);
+    // The hit pass's LUT pairs (`decode_moe: hitpass`): one buffer each, held from the first decode on.
+    const luts: u64 = if (in.decode_moe == .hitpass) 2 * (@as(u64, g.first_moe_layer) + g.num_moe_layers) else 0;
+    return construction + luts + 2 * (tiles + 2 * (experts.call_rows / graph.tile_rows) + 256 + view);
 }
 
 fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
@@ -241,12 +245,20 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         // The plugin's sampler on a row it hands the host (`sdk_ext.sampler.chosen`): eight f32 vocab rows at most.
         .{ .name = "sampler", .bytes = @splat(8 * @as(u64, c.vocab_size) * f32b), .at_construction = false },
         .{ .name = "gpu_warm", .bytes = @splat(if (in.gpu_keep_warm == .waits) gpu_warm.bill_bytes else 0), .at_construction = in.gpu_keep_warm == .waits },
+        // `decode_moe: hitpass`: every model layer's LUT pair (the shared scheduler's DEVROUTE), from the first decode on.
+        .{ .name = "hitpass_luts", .bytes = @splat(if (in.decode_moe == .hitpass) hitpassLutBytes(in) else 0), .at_construction = false },
     };
     return a.dupe(Term, &terms);
 }
 
+/// The hit pass's LUTs (`decode_moe: hitpass`) at this bill's geometry: one pair per model layer.
+pub fn hitpassLutBytes(in: *const Inputs) u64 {
+    const g = in.geometry;
+    return shared_experts.devLutBytes(@as(u64, g.first_moe_layer) + g.num_moe_layers, g.num_experts, in.page);
+}
+
 /// The shared route's inputs at this bill's geometry: the NVFP4 tile, the source's own sizes, the decode texts under
-/// `decode_moe: fused`.
+/// `decode_moe: hitpass` and `fused`.
 fn routeInputs(in: *const Inputs) route_bill.Inputs {
     return .{
         .geometry = in.geometry,
@@ -262,7 +274,7 @@ fn routeInputs(in: *const Inputs) route_bill.Inputs {
         // The open bank's digest (32 B) per record and its layer.
         .record_table_bytes = 32,
         .layer_table_bytes = @sizeOf(bank.Layer),
-        .decode_kernels = if (in.decode_moe == .fused) fused_kernels_bytes else 0,
+        .decode_kernels = if (in.decode_moe != .stock) fused_kernels_bytes else 0,
     };
 }
 
@@ -378,6 +390,17 @@ test "beam bill: the terms sum to the bill, the slot wiring is the one row term,
     defer bf.free(a);
     try testing.expectEqual([2]u64{ fused_kernels_bytes, fused_kernels_bytes }, termOf(bf, "decode_kernels"));
     try testing.expectEqual(b.fixed(.decode) + fused_kernels_bytes, bf.fixed(.decode));
+    // The hit pass: the same texts, and every model layer's LUT pair (52 layers x 2 x a 16 KiB buffer of 256 u32).
+    var hp_in = in;
+    hp_in.decode_moe = .hitpass;
+    const bh = try billOf(a, &hp_in);
+    defer bh.free(a);
+    try testing.expectEqual([2]u64{ fused_kernels_bytes, fused_kernels_bytes }, termOf(bh, "decode_kernels"));
+    try testing.expectEqual([2]u64{ 52 * 2 * 16_384, 52 * 2 * 16_384 }, termOf(bh, "hitpass_luts"));
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(bf, "hitpass_luts"));
+    // Their 104 buffers join the buffer census.
+    try testing.expectEqual(bufferCensus(&fused_in) + 104, bufferCensus(&hp_in));
+    try testing.expectEqual(bf.fixed(.decode) + 52 * 2 * 16_384 + 104 * wire_buffer_bytes, bh.fixed(.decode));
     // The KV lanes: 9 full layers' slabs (8 x 128 x 2 B a position, K and V) and 43 sliding layers' rings of two slots
     // at the base 1,040 (512 + 8 + 8 + 512), K and V.
     try testing.expectEqual(@as(u64, 1040), kv.ringBase(512));

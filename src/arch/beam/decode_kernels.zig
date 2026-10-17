@@ -8,7 +8,8 @@
 //! The rows are the stock decode route's (MLX's gather_qmm nvfp4 per bank, then `swiglu_f32`) bit for bit:
 //! `decode_kernels_parity.zig` holds that gate on real records. The manifest (src/kernels/nvfp4/manifest_beam.json;
 //! `scripts/nvfp4_kernels_manifest.py beam` writes it and prints its pin) is its own, so GLM-5.3-Flash's pin does not
-//! move. The module installs the set under `decode_moe: fused` (settings.zig), the default where it is registered.
+//! move. The module installs the set under `decode_moe: hitpass` (the default where it is registered) and `fused`
+//! (settings.zig).
 
 const std = @import("std");
 const shared = @import("../../expert/nvfp4_decode_kernels.zig");

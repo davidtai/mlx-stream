@@ -158,13 +158,17 @@ the bank view, the decode window, the prompt cache (2 GiB) and the decode cache 
 and its NVFP4 projection format are shared with glm5_next (`src/expert/nvfp4_bank.zig`,
 `src/expert/nvfp4_format.zig`).
 
-- Decode experts take the route `decode_moe` names, installed once at construction. `fused` (the default) installs
-  the qmv texts (`decode_kernels.zig`; docs/nvfp4-decode-kernels.md) and binds the shared scheduler's banked waves: one
-  launch of gate, up and the f32 SwiGLU, and one launch of down, per wave over the three slot banks. `stock` runs
-  MLX's `gather_qmm` in nvfp4 mode per bank, then the f32 SwiGLU as MLX ops. The texts compute each row in the order
-  of MLX's gather_qmv_fast, so the two routes give the same bits. The default resolves to `stock` where the texts are
-  not registered (a routed geometry other than 5,120 / 2,560 / top-8: the fixture) and on a CPU stream, with one log
-  line.
+- Decode experts take the route `decode_moe` names, installed once at construction. `fused` installs the qmv texts
+  (`decode_kernels.zig`; docs/nvfp4-decode-kernels.md) and binds the shared scheduler's banked waves: one launch of
+  gate, up and the f32 SwiGLU, and one launch of down, per wave over the three slot banks. `hitpass` (the default, as
+  on glm5_next) is `fused` with the shared scheduler's device hit pass (DEVROUTE). Every routed pair runs in one wave
+  from the layer's resident slot LUT on the GPU, committed behind the router before the host reads the ids. A miss
+  reads base row 0 in that wave; the host then routes and builds only the miss parts, and the join takes each miss
+  row from its part. After each route the host writes the layer's other LUT (a pair per layer: the host never writes
+  a LUT that a committed wave reads). The phase change writes both. `stock` runs MLX's `gather_qmm` in nvfp4 mode per
+  bank, then the f32 SwiGLU as MLX ops. The texts compute each row in the order of MLX's gather_qmv_fast, so the three
+  routes give the same bits. The default resolves to `stock` where the texts are not registered (a routed geometry
+  other than 5,120 / 2,560 / top-8: the fixture) and on a CPU stream, with one log line.
 - The prompt combine uses MiMo's in-place text when the hidden size is a multiple of 1,024 and the model routes 8
   experts a token. Otherwise it uses MiMo's stock reduction (a test pack).
 
@@ -212,11 +216,12 @@ key that is not a beam setting refuses the load by name (`BeamSettingUnknown`).
 | `resident_seed`, `expert_usage_record`, `expert_usage_label` | the usage seed and record (sdk_ext/expert/usage.zig) | off |
 | `prompt_residents` | `keep`, `forget` | `keep` |
 | `gpu_keep_warm` | `waits`, `off` | `waits` on a GPU stream |
-| `decode_moe` | `fused`, `stock` | `fused` where registered, on a GPU stream |
+| `decode_moe` | `hitpass`, `fused`, `stock` | `hitpass` where registered, on a GPU stream |
 
 One of `expert_rows` or `expert_prefill_rows` alone sets both. The host's KV quantization must be off
-(`BeamKvQuantUnsupported`). `decode_moe: fused` named for a model where the texts are not registered refuses the load
-(`BeamDecodeMoeUnregistered`); named on a CPU stream it refuses at construction (`BeamDecodeMoeNeedsGpu`).
+(`BeamKvQuantUnsupported`). `decode_moe: hitpass` or `fused` named for a model where the texts are not registered
+refuses the load (`BeamDecodeMoeUnregistered`); named on a CPU stream it refuses at construction
+(`BeamDecodeMoeNeedsGpu`).
 
 `expert_rows_by_layer` moves decode rows between the routed layers. The prompt rows and the decode total stay the
 plan's, so the bill does not change. Each offset adds to the plan's decode rows of one routed layer (model layer 3
@@ -254,7 +259,8 @@ at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed g
 | `request`, `request_wiring` | The prompt wave at the widest call, the decode wave, and their wiring. |
 | `prompt_view` | The q8 tier only, prompt phase: the BF16 weights of the widest layer's projections (a dense layer: 838,860,800 B) and their wiring. |
 | `sampler`, `gpu_warm` | The plugin's sampler. MiMo's keep-warm engine when it is on. |
-| `decode_kernels` | The fused texts' set, its pipelines and prepared launches under `decode_moe: fused`: 20 MiB declared. At the pack's load the fused route's construction footprint is 18.6 MB more than the stock route's (host side 416.1 MB against 397.5 MB; MLX active the same). |
+| `decode_kernels` | The fused texts' set, its pipelines and prepared launches under `decode_moe: hitpass` and `fused`: 20 MiB declared. At the pack's load the fused route's construction footprint is 18.6 MB more than the stock route's (host side 416.1 MB against 397.5 MB; MLX active the same). |
+| `hitpass_luts` | Under `decode_moe: hitpass`: a LUT pair for each model layer, each LUT a page (52 x 2 x 16 KiB). |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
 rows. The fill bills the rows beside the host's non-file baseline (wired + anonymous - purgeable + compressor, the
