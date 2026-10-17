@@ -16,7 +16,7 @@
 //! times `routed_scaling_factor`. Every SwiGLU in f32 (`swiglu_f32`). The head: the final norm, the untied lm_head, the
 //! soft cap 30 tanh(x / 30) in f32.
 //!
-//! A prompt call (at most `experts.call_rows` rows) runs layer by layer: P1's predicted seed posted before a routed
+//! A prompt call (at most `experts.call_rows` rows: 17,408) runs layer by layer: P1's predicted seed posted before a routed
 //! layer's attention (its router on the layer's input under its pre-feedforward norm), the attention in tiles of
 //! `tile_rows` rows with at most `tiles_in_flight` committed (each sliding ring's append is at most one tile: the ring's
 //! headroom), the dense MLP in tiles, the MoE over every row at once (the wide lane), the layer's output evaluated at
@@ -773,6 +773,9 @@ test "beam graph: the kept residents are the trunk's (no routed expert, no quant
 test "beam graph: the call geometry and the full layers' query scale" {
     try testing.expectEqual(@as(u32, 512), tile_rows);
     try testing.expect(experts.call_rows % tile_rows == 0);
+    // P5: the 16,445-token coding prompt is one call (34 tiles of 512 rows).
+    try testing.expectEqual(@as(u32, 17_408), experts.call_rows);
+    try testing.expect(16_445 <= experts.call_rows);
     // (1 + (p + 1) / 2048) ^ 0.1 at p = 0 and p = 2047: 1.0000488 and 2^0.1.
     const p0 = @exp(beam.ssmax_power * std.math.log1p(@as(f32, 1) / beam.ssmax_base));
     try testing.expectApproxEqRel(@as(f32, 1.0000488), p0, 1e-6);
