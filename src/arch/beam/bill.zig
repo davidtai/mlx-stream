@@ -6,7 +6,9 @@
 //! experts.zig build, by their shapes at the billed context and the prompt call's rows, in the buffers MLX allocates
 //! for them) or a declared bound; each term is an upper bound. The fill (sdk.fill) gives the most decode rows and the
 //! most prompt rows (prompt <= decode <= experts) within the host's ceiling less its wired margin, floor 8; forced rows
-//! are an operator pin, loaded as named with the overage reported.
+//! are an operator pin, loaded as named with the overage reported. With the draft lane (`mtp_lane`) the bill adds the
+//! drafter's terms (`laneTerms`: its residents and context rings from construction, a round's draft and verify in the
+//! decode phase, the prompt's captures) and bills the decode wave at the verify chunk's rows.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -22,6 +24,8 @@ const route = @import("../mimo_v2/route.zig");
 const route_bill = @import("../mimo_v2/route_bill.zig");
 const dsv_bill = @import("../deepseek_v41/bill.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
+const drafter = @import("drafter.zig");
+const draft_lane = @import("lane.zig");
 const bank = experts.bank;
 
 const Term = sdk.MemoryBill.Term;
@@ -56,6 +60,16 @@ pub const Inputs = struct {
     /// The decode lane's expert route as billed (`Config.decodeMoeBilled`: the GPU stream's resolution).
     decode_moe: settings.DecodeMoe = .stock,
     page: u64 = 16_384,
+    /// The draft lane's inputs (`mtp_lane`), from the pack's drafter manifest; null: serial.
+    lane: ?Lane = null,
+};
+
+/// The draft lane's bill inputs: the drafter's geometry, its residents as MLX allocates them, the installed depth.
+pub const Lane = struct {
+    drafter: drafter.Config,
+    resident_bytes: u64,
+    resident_arrays: u64,
+    depth: u32,
 };
 
 /// The fused decode route's kernel set, its pipelines and prepared launches, declared (`decode_kernels` term): measured on
@@ -168,10 +182,35 @@ pub fn promptWaveBytes(c: *const beam.Config, t: u64, keys: u64) u64 {
 /// one compiled kernel). The first barrier comes after the dense layers and the first routed layer's attention: the
 /// wave holds max(2, first_k_dense + 1) layers.
 pub fn decodeWaveBytes(c: *const beam.Config, keys: u64) u64 {
+    return decodeWaveRows(c, keys, 1);
+}
+
+/// `decodeWaveBytes` at `rows` rows a forward (the draft lane's verify chunk: every row's arrays and logits).
+pub fn decodeWaveRows(c: *const beam.Config, keys: u64, rows: u64) u64 {
     const h: u64 = c.hidden_size;
     const mlp = @max(denseRowBytes(c), moeRowBytes(c) + @as(u64, c.n_experts_per_tok) * (2 * h + 6 * @as(u64, c.moe_intermediate_size)) * bf16);
-    const layer = attnTileBytes(c, 1, keys) + mlp + 9 * h * bf16;
-    return @max(2, @as(u64, c.first_k_dense) + 1) * layer + @as(u64, c.vocab_size) * (bf16 + f32b);
+    const layer = attnTileBytes(c, rows, keys) + rows * (mlp + 9 * h * bf16);
+    return @max(2, @as(u64, c.first_k_dense) + 1) * layer + rows * @as(u64, c.vocab_size) * (bf16 + f32b);
+}
+
+/// The draft lane's terms (`in.lane`): the drafter's residents and context rings (construction), the prompt pass's
+/// captures and one append tile (prompt), and a round's arrays (decode): the drafter's block at depth + 1 rows over the
+/// window, the committed rows' append, the verify's decision graph over a chunk (MiMo's nine f32 rows of the vocabulary a
+/// row), the chunk's kept logits and every chunk's captures. Zero without the lane.
+pub fn laneTerms(in: *const Inputs) struct { residents: u64, context: u64, prompt: u64, round: u64 } {
+    const l = in.lane orelse return .{ .residents = 0, .context = 0, .prompt = 0, .round = 0 };
+    const c = &in.model;
+    const d = &l.drafter;
+    const block: u64 = l.depth + 1;
+    const t: u64 = @min(in.reserve, experts.call_rows);
+    const decision = 9 * @as(u64, draft_lane.chunk_rows) * c.vocab_size * f32b + @as(u64, draft_lane.chunk_rows) * c.vocab_size * f32b;
+    const captures = @as(u64, d.n_targets) * draft_lane.max_chunks * draft_lane.chunk_rows * c.hidden_size * bf16;
+    return .{
+        .residents = l.resident_bytes,
+        .context = drafter.contextBytes(d, in.page),
+        .prompt = drafter.promptCaptureBytes(d, t, in.page) + drafter.appendBytes(d, drafter.append_rows),
+        .round = drafter.roundBytes(d, block, d.window - 1) + drafter.appendBytes(d, block) + decision + captures,
+    };
 }
 
 /// The phase's largest single buffer (MLX's cache can end one freed buffer over its limit). Prompt: the router's f32
@@ -203,7 +242,10 @@ pub fn bufferCensus(in: *const Inputs) u64 {
     const construction = in.residents.tensors + graph.Weights.ownedArrays(c) + (g.num_moe_layers + 1) * bank.n_components + 2 * c.nFull() + 4 * c.nSliding();
     const tiles = (@as(u64, experts.call_rows) * c.n_experts_per_tok + mimo_math.projection_rows - 1) / mimo_math.projection_rows + mimo_stream.max_route_ids;
     const view: u64 = if (c.residents_format == .affine8_g64) 8 else 0;
-    return construction + 2 * (tiles + 2 * (experts.call_rows / graph.tile_rows) + 256 + view);
+    // The draft lane: the drafter's arrays and its rings' slots (construction); a round's graph (every layer's arrays at
+    // the block, the selector's, the verify's decision and captures).
+    const drafted: u64 = if (in.lane) |l| l.resident_arrays + 4 * @as(u64, l.drafter.layers) + 2 * (48 * @as(u64, l.drafter.layers) + 64) else 0;
+    return construction + drafted + 2 * (tiles + 2 * (experts.call_rows / graph.tile_rows) + 256 + view);
 }
 
 fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
@@ -212,13 +254,16 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
     const owned = graph.Weights.ownedBytes(c, page);
     const kvb = kvBytes(c, in.reserve, page);
     const t: u64 = @min(in.reserve, experts.call_rows);
-    const waves: [2]u64 = .{ promptWaveBytes(c, t, in.reserve), decodeWaveBytes(c, in.reserve) };
+    // The decode wave at the verify chunk's rows when the lane is installed (a chunk is the decode phase's widest forward).
+    const decode_rows: u64 = if (in.lane != null) draft_lane.chunk_rows else 1;
+    const waves: [2]u64 = .{ promptWaveBytes(c, t, in.reserve), decodeWaveRows(c, in.reserve, decode_rows) };
     const cache: [2]u64 = .{ route.prompt_cache_bytes, route.decode_cache_bytes };
     const overshoot: [2]u64 = .{ overshootBytes(in, .prompt), overshootBytes(in, .decode) };
     const resident = in.residents.bytes;
     const view = promptViewBytes(c, page);
+    const ln = laneTerms(in);
     var wired: [2]u64 = undefined;
-    for (&wired, cache, overshoot) |*w, ch, o| w.* = resident + owned.tables + owned.routers + kvb + ch + settings.compilation_bytes + o;
+    for (&wired, cache, overshoot) |*w, ch, o| w.* = resident + owned.tables + owned.routers + kvb + ln.residents + ln.context + ch + settings.compilation_bytes + o;
     const terms = [_]Term{
         .{ .name = "residents", .bytes = @splat(resident), .at_construction = true },
         .{ .name = "trunk_f32_tables", .bytes = @splat(owned.tables), .at_construction = true },
@@ -241,6 +286,10 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         // The plugin's sampler on a row it hands the host (`sdk_ext.sampler.chosen`): eight f32 vocab rows at most.
         .{ .name = "sampler", .bytes = @splat(8 * @as(u64, c.vocab_size) * f32b), .at_construction = false },
         .{ .name = "gpu_warm", .bytes = @splat(if (in.gpu_keep_warm == .waits) gpu_warm.bill_bytes else 0), .at_construction = in.gpu_keep_warm == .waits },
+        // The draft lane (zero without it): the drafter's residents and rings from construction, its phases' arrays.
+        .{ .name = "drafter_residents", .bytes = @splat(ln.residents), .at_construction = ln.residents > 0 },
+        .{ .name = "drafter_context", .bytes = @splat(ln.context), .at_construction = ln.context > 0 },
+        .{ .name = "draft_round", .bytes = .{ ln.prompt, ln.round }, .at_construction = false },
     };
     return a.dupe(Term, &terms);
 }
@@ -289,7 +338,16 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .gpu_keep_warm = cfg.gpu_keep_warm,
         .decode_moe = cfg.decodeMoeBilled(),
         .page = page,
+        .lane = if (cfg.mtp_lane) try laneOf(a, io, dir, cfg, page) else null,
     };
+}
+
+/// The draft lane's bill inputs from the pack's drafter manifest (pure host: no tensor read).
+fn laneOf(a: std.mem.Allocator, io: std.Io, dir: []const u8, cfg: *const settings.Config, page: u64) !Lane {
+    var m = try drafter.readManifest(a, io, dir, &cfg.model);
+    defer m.deinit();
+    const r = drafter.residentBytes(&m, page);
+    return .{ .drafter = m.config, .resident_bytes = r.bytes, .resident_arrays = r.arrays, .depth = cfg.draft_depth };
 }
 
 pub fn completeBill(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, reserve: u64) !sdk.MemoryBill {
@@ -485,6 +543,29 @@ test "beam bill: the q8 tier bills its residents and a dense layer's prompt view
     const r8 = try sdk.fill(b8, baseline, target, 256, min_rows);
     try testing.expect(r8.decode >= r16.decode + 5 and r8.prompt >= r16.prompt + 5);
     std.debug.print("\nBEAM BILL q8 (baseline 35.06 GB, ctx 32,768): rows {d}/{d} against bf16's {d}/{d}; prompt_view {d} B\n", .{ r8.prompt, r8.decode, r16.prompt, r16.decode, view[0] });
+}
+
+test "beam bill: the draft lane adds the drafter's residents and rings from construction, a round's arrays and the verify chunk's wave; the fill gives fewer rows" {
+    const a = testing.allocator;
+    var in = try fixtureInputs(32_768);
+    const off = try billOf(a, &in);
+    defer off.free(a);
+    in.lane = .{ .drafter = drafter.beam_drafter, .resident_bytes = 3_855_000_000, .resident_arrays = 101, .depth = 7 };
+    const on = try billOf(a, &in);
+    defer on.free(a);
+    for ([_][]const u8{ "drafter_residents", "drafter_context", "draft_round" }) |n| try testing.expectEqual([2]u64{ 0, 0 }, termOf(off, n));
+    try testing.expectEqual([2]u64{ 3_855_000_000, 3_855_000_000 }, termOf(on, "drafter_residents"));
+    try testing.expectEqual(drafter.contextBytes(&drafter.beam_drafter, 16_384), termOf(on, "drafter_context")[1]);
+    try testing.expect(termOf(on, "draft_round")[0] > 0 and termOf(on, "draft_round")[1] > 0);
+    try testing.expect(termOf(on, "request")[1] > termOf(off, "request")[1]);
+    try testing.expectEqual(decodeWaveRows(&in.model, 32_768, 4), termOf(on, "request")[1]);
+    const baseline: u64 = 12_600_000_000;
+    const target = box_ceiling - box_stop;
+    const rows_off = try sdk.fill(off, baseline, target, 256, min_rows);
+    const rows_on = try sdk.fill(on, baseline, target, 256, min_rows);
+    try testing.expect(rows_on.decode < rows_off.decode and rows_on.prompt <= rows_off.prompt);
+    try testing.expect(on.total(.decode, baseline, rows_on.decode) <= target);
+    std.debug.print("\nBEAM BILL lane depth 7: decode +{d} B, prompt +{d} B (context {d}, round {d}, prompt captures {d}); rows {d}/{d} -> {d}/{d}\n", .{ on.fixed(.decode) - off.fixed(.decode), on.fixed(.prompt) - off.fixed(.prompt), termOf(on, "drafter_context")[1], termOf(on, "draft_round")[1], termOf(on, "draft_round")[0], rows_off.prompt, rows_off.decode, rows_on.prompt, rows_on.decode });
 }
 
 test "beam bill: the keep-warm route bills MiMo's declared engine from construction; the control, none" {
