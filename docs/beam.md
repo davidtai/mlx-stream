@@ -81,6 +81,20 @@ synchronization before the logits. There is no draft lane: `draft_lane.arm` bind
 
 The module keeps no prefix. A prompt longer than the billed context refuses with `ContextOverBill`.
 
+### The f32 steps in one kernel each
+
+The reference computes some steps in f32 and rounds the result to bf16: each SwiGLU (its activation and product), the
+depth-scaled residual add (each product rounded, then the sum), the routed scaling, the full layers' query scale and
+the soft cap. MLX runs each cast, product and rounding of such a chain as its own kernel and writes each f32 value to
+memory. Beam runs each chain as one compiled kernel (MLX `compile`, shapeless): the same casts and products, in the
+same order, in registers. The results are bit-equal to the op chains (the device tests `beam graph GPU`, on the
+parity environment). The SwiGLU's kernel is MlxOps' `swigluF32` (sdk_ext.quant's `swiglu_f32` on MLX). The trunk's
+kernels are compiled regions (graph.zig `prepareFused`): the module prepares them at construction and runs each one
+time on one row, so that MLX builds them at the load.
+
+The router's group top-k sums the kept groups' hits as bools (MLX sums them as int32: no cast) and masks the grouped
+scores (no [rows, 256] mask copy). The scheduler reads the router's u32 ids as they are (no cast to int32).
+
 ## The expert route
 
 Beam uses MiMo's expert route as glm5_next installs it (`src/arch/mimo_v2/route.zig`): the read schedule, the drain,
@@ -172,6 +186,11 @@ rounding: the script's twin (`--twin`: the same rows on the same routes, nothing
 row (median), 1.78 at most. Thus each row's bound there is 2 x the twin's difference on that row, at least 0.05. At least
 90 % of the rows must hold their bounds, and the argmax must be the reference's on each row whose top-2 margin clears
 its bound.
+
+The test sets MLX's wired limit to the device's recommended working set for the construction's life, as the host's
+default wired policy (`max`) does. At Beam's hidden size the prompt combine is the in-place text: it reads its sources
+through MLX's residency set, not as bound buffers. Without a wired limit, a source is resident only by chance, and the
+combine can read wrong values.
 
 | Case | Rows | Max difference | Rows in bound | Argmax (checked rows) | Router's own choice |
 |---|---|---|---|---|---|
