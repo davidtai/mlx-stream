@@ -639,19 +639,47 @@ const DepthAdd = struct {
     }
 };
 
+/// The attention's output gate: `o` times sigmoid(`gate` + `bias`), each in bf16 (the reference's bf16 add, sigmoid and
+/// product: `gateOutChain`), one compiled kernel (`GateOut`, shapeless: the add's and the sigmoid's rows are not
+/// written). o and gate [1, n, heads, d], bias [1, 1, heads, 1].
+pub fn gateOut(g: *G, c: *const beam.Config, o: T, gate: T, bias: T) !T {
+    var r: [1]T = undefined;
+    try g.tape(GateOut, c, &.{ o, gate, bias }, &r);
+    return r[0];
+}
+
+/// `gateOut`'s op chain (the region's body, the device test's control).
+pub fn gateOutChain(g: *G, o: T, gate: T, bias: T) !T {
+    return g.mul(o, try g.sigmoid(try g.add(gate, bias)));
+}
+
+const GateOut = struct {
+    pub const region: ops_be.Region = .beam_gate;
+    pub const Ctx = beam.Config;
+    pub const n_out = 1;
+    pub const shapeless = true;
+    pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
+        out[0] = try gateOutChain(g, in[0], in[1], in[2]);
+    }
+};
+
 /// The trunk's compiled regions on `g` (once, at construction; `c` outlives `g`), each run once on one row so that MLX
 /// builds its kernels at the load and not in the first request.
 pub fn prepareFused(g: *G, c: *const beam.Config) !void {
     try g.prepareTape(DepthAdd, c);
     try g.prepareTape(ScaleBy, c);
     try g.prepareTape(Softcap, c);
+    try g.prepareTape(GateOut, c);
     const m = g.mark();
     defer g.resetTo(m);
     const row = try g.zeros(&.{ 1, @intCast(c.hidden_size) }, .bfloat16);
     // The full layers' query: [1, heads, rows, head_dim] against [1, 1, rows, 1] (its own signature).
     const q = try g.zeros(&.{ 1, @intCast(c.n_heads), 1, @intCast(c.head_dim) }, .bfloat16);
     const logits = try g.zeros(&.{ 1, @intCast(c.vocab_size) }, .bfloat16);
-    try g.evalAll(&.{ try depthAdd(g, c, row, row, 2), try scaled(g, c, row, try g.scalar(c.routed_scaling, .float32)), try scaled(g, c, q, try ssmaxScale(g, 0, 1)), try softcap(g, c, logits) });
+    // The output gate: the attention's [1, 1, heads, head_dim] rows and the [1, 1, heads, 1] bias.
+    const o = try g.zeros(&.{ 1, 1, @intCast(c.n_heads), @intCast(c.head_dim) }, .bfloat16);
+    const bias = try g.zeros(&.{ 1, 1, @intCast(c.n_heads), 1 }, .bfloat16);
+    try g.evalAll(&.{ try depthAdd(g, c, row, row, 2), try scaled(g, c, row, try g.scalar(c.routed_scaling, .float32)), try scaled(g, c, q, try ssmaxScale(g, 0, 1)), try softcap(g, c, logits), try gateOut(g, c, o, o, bias) });
 }
 
 /// The full layers' query scale at position `pos`: (1 + (pos + 1) / 2048) ^ 0.1 in f32.
@@ -759,10 +787,9 @@ pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const 
             out = try sdpa(g, q, vk, vv, scale, "array", try windowMask(g, a, pos, nu, @intCast(span.first_key), span.key_count, c.sliding_window));
         } else out = try sdpa(g, q, vk, vv, scale, "", .{});
     }
-    // [1, n, heads, d], gated per head: attn * sigmoid(gate_proj(x) + gate_bias).
+    // [1, n, heads, d], gated per head: attn * sigmoid(gate_proj(x) + gate_bias), one compiled kernel.
     const o = try g.transposeAxes(out, &.{ 0, 2, 1, 3 });
-    const gate = try g.sigmoid(try g.add(try g.reshape(p.gate, &.{ 1, n, heads, hd }), at.gate_bias));
-    const gated = try g.mul(o, gate);
+    const gated = try gateOut(g, c, o, try g.reshape(p.gate, &.{ 1, n, heads, hd }), at.gate_bias);
     return project(g, at.o, try g.reshape(gated, &.{ n, heads * hd }));
 }
 
@@ -1339,5 +1366,29 @@ test "beam graph GPU: the fused projections' one GEMV (q8: one qmv) is the four 
             const got = try attnProjections(&g, &c, at, x);
             inline for (.{ "q", "k", "v", "gate" }) |f| try expectBits(@tagName(fmt) ++ " projection " ++ f, &g, @field(want, f), @field(got, f));
         }
+    }
+}
+
+test "beam graph GPU: the output gate is one kernel, the op chain bit for bit (a step's row, a tile; the attention's transposed rows)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    try prepareFused(&g, &c);
+    const heads: c_int = @intCast(c.n_heads);
+    const hd: c_int = @intCast(c.head_dim);
+    for ([_]c_int{ 1, 512 }, 0..) |n, i| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        // The attention's output as SDPA gives it, [1, heads, n, d], seen as [1, n, heads, d]; the gate's rows and bias.
+        const out = try testBf16(a, &g, &.{ 1, heads, n, hd }, 1.0, 1500 + i);
+        const o = try g.transposeAxes(out, &.{ 0, 2, 1, 3 });
+        const gate = try g.reshape(try testBf16(a, &g, &.{ n, heads * hd }, 4.0, 1600 + i), &.{ 1, n, heads, hd });
+        const bias = try g.reshape(try testBf16(a, &g, &.{heads}, 2.0, 1700 + i), &.{ 1, 1, heads, 1 });
+        try expectBits("gate_out", &g, try gateOutChain(&g, o, gate, bias), try gateOut(&g, &c, o, gate, bias));
     }
 }
