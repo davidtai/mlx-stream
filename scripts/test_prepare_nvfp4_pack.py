@@ -526,6 +526,25 @@ class Q8Residents(unittest.TestCase):
         finally:
             shutil.rmtree(sl, ignore_errors=True)
 
+    def test_a_q8_pass_cut_mid_way_resumes_to_the_same_pack_and_the_other_tier_refuses_its_state(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "b", SEED)
+            shard = "model-layer-00005.safetensors"
+            (tmp / "b" / shard).rename(tmp / shard)
+            rc, log = run("all", *build_args(tmp / "b", tmp / "pb", "--residents", "q8"))
+            self.assertEqual(rc, 1, log)
+            (tmp / shard).rename(tmp / "b" / shard)
+            # The state holds the q8 layout's residents: a bf16 run over it refuses by name.
+            rc, log = run("all", *build_args(tmp / "b", tmp / "pb"))
+            self.assertEqual(rc, 1, log)
+            self.assertIn("was written for another residents layout", log)
+            rc, log = run("all", *build_args(tmp / "b", tmp / "pb", "--residents", "q8"))
+            self.assertEqual(rc, 0, log)
+            self.assertEqual((tmp / "pb" / "pack-sha256.txt").read_text(), (self.q8 / "pack-sha256.txt").read_text())
+        finally:
+            shutil.rmtree(tmp)
+
     def test_a_shape_without_whole_groups_refuses(self):
         with self.assertRaisesRegex(PrepError, "in a multiple of 64"):
             affine.check_shape("x.weight", [128, 96])
