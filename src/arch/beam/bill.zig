@@ -139,15 +139,21 @@ pub fn moeRowBytes(c: *const beam.Config) u64 {
 /// The prompt pass's wave at its widest call (`t` rows over `keys` keys): the call's stream (the layer's input, its
 /// normed rows, the attention's joined output, the residual's two products and sum, the pre-feedforward rows, the MLP's
 /// output and its norm: 9 rows of hidden), plus the widest stage: P1's predictor over every row, the attention's tiles
-/// in flight, the dense MLP's tiles in flight, or the MoE stage.
+/// in flight, the dense MLP's tiles in flight, or the MoE stage (with the staging rows, P1's early predictor of the
+/// next layer beside it: `graph.nextAhead`).
 pub fn promptWaveBytes(c: *const beam.Config, t: u64, keys: u64) u64 {
     const h: u64 = c.hidden_size;
     const stream = 9 * t * h * bf16;
-    const predictor = t * (h * bf16 + routerRowBytes(c) + @as(u64, c.n_routed_experts) * @as(u64, c.n_experts_per_tok));
+    const predictor = predictorBytes(c, t);
     const attention = @as(u64, graph.tiles_in_flight) * attnTileBytes(c, @min(t, graph.tile_rows), keys);
     const dense = @as(u64, graph.tiles_in_flight) * @as(u64, @min(t, graph.dense_tile_rows)) * denseRowBytes(c);
-    const moe = t * moeRowBytes(c);
+    const moe = t * moeRowBytes(c) + if (experts.prompt_stage_rows > 0) predictor else 0;
     return stream + @max(@max(predictor, attention), @max(dense, moe));
+}
+
+/// P1's predictor over `t` rows (graph.zig `predictedCounts`): the normed rows, the router's row, the counts' mask.
+pub fn predictorBytes(c: *const beam.Config, t: u64) u64 {
+    return t * (@as(u64, c.hidden_size) * bf16 + routerRowBytes(c) + @as(u64, c.n_routed_experts) * @as(u64, c.n_experts_per_tok));
 }
 
 /// The decode wave: a step's graph between two routing barriers (the layers' arrays at one row, the widest attention
@@ -484,6 +490,8 @@ test "beam bill: the attention tile bills the fused attention's working set and 
         const w = promptWaveBytes(&c, t, keys);
         try testing.expect(w >= 9 * t * c.hidden_size * bf16 + @as(u64, graph.tiles_in_flight) * attnTileBytes(&c, @min(t, graph.tile_rows), keys));
         try testing.expect(w >= t * moeRowBytes(&c));
+        // P1: the next layer's early predictor beside the MoE stage (the staging rows on).
+        try testing.expect(w >= 9 * t * c.hidden_size * bf16 + t * moeRowBytes(&c) + predictorBytes(&c, t));
         try testing.expect(attnTileBytes(&c, 1, keys) >= 2 * keys * c.n_kv_heads * c.head_dim * bf16);
     };
 }

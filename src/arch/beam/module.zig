@@ -211,7 +211,7 @@ pub const Module = struct {
     /// the prompt pass's wall (the plugin's, from its checks to its logits), its reads and P1's and P6's counts.
     pub fn enterDecode(self: *Module, prompt_tokens: usize) !void {
         const p = self.src.stats().since(self.prompt.s0);
-        log.info("beam prompt: tokens={d} wall_s={d:.3} ssd_bytes={d} ahead_posted={d} ahead_dropped={d} staged={d} stage_copies={d} stage_unused={d} loads={d} skipped={d}\n", .{ prompt_tokens, @as(f64, @floatFromInt(self.nowNs() -| self.prompt.t0)) / 1e9, p.expert_bytes_read, p.ahead_posted, p.ahead_dropped, p.staged, p.stage_copies, p.stage_unused, p.persistent_loads + p.transient_loads, p.loads_skipped });
+        log.info("beam prompt: tokens={d} wall_s={d:.3} ssd_bytes={d} ahead_posted={d} ahead_dropped={d} staged={d} staged_ahead={d} stage_copies={d} stage_admits={d} stage_unused={d} loads={d} skipped={d}\n", .{ prompt_tokens, @as(f64, @floatFromInt(self.nowNs() -| self.prompt.t0)) / 1e9, p.expert_bytes_read, p.ahead_posted, p.ahead_dropped, p.staged, p.staged_ahead, p.stage_copies, p.stage_admits, p.stage_unused, p.persistent_loads + p.transient_loads, p.loads_skipped });
         try self.src.beginDecode();
         self.decode = .{ .active = true, .s0 = self.src.stats(), .prompt_tokens = prompt_tokens };
     }
