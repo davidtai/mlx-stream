@@ -116,7 +116,7 @@ fn layer(g: *G, math: *const experts.Math, banks: *const Banks, arm: Arm, x: T, 
 /// the two texts. The join (one take, plus a concatenate over more than one output) and the combine (widening,
 /// product, sum, narrowing) follow either.
 fn dispatches(arm: Arm, groups: u32) u32 {
-    const tail: u32 = 1 + @intFromBool(groups > 1 and arm == .stock) + 4;
+    const tail: u32 = 1 + @as(u32, @intFromBool(groups > 1 and arm == .stock)) + 4;
     return switch (arm) {
         .stock => groups * (1 + 3 * 2 + 5) + tail,
         .fused => 3 + tail,
