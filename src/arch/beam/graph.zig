@@ -33,6 +33,8 @@ const mimo = @import("../mimo_v2/config.zig");
 const kv = @import("../mimo_v2/kv.zig");
 const beam = @import("config.zig");
 const experts = @import("experts.zig");
+/// The route recorder (a diagnostic, `BEAM_ROUTES`): the predictions it records at each decode layer.
+const routes_diag = @import("routes_diag.zig");
 /// Profile builds only: MiMo's prompt-pass timeline's stage marks (a no-op outside a recorded prompt pass).
 const ptl = @import("../mimo_v2/prefill_timeline.zig");
 
@@ -649,6 +651,42 @@ fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, s
     try src.readAheadSeed(l, expert_policy.rankHottest(host, &src.ahead_ranked));
 }
 
+/// The route recorder's predictions at layer `l` of a decode step (routes_diag.zig names the slots): `x` the layer's
+/// input, `x1` its residual after the attention, `h` its MLP input. Lazy; the recorder evaluates them after the logits.
+fn recordPredictions(g: *G, c: *const beam.Config, w: *const Weights, l: u32, x: T, x1: T, h: T) !void {
+    const m = g.mark();
+    defer g.resetTo(m);
+    const first = c.first_k_dense;
+    const n: u32 = @intCast(w.layers.len);
+    if (l < first) {
+        if (l == 0) {
+            for (0..3) |j| {
+                const t = first + @as(u32, @intCast(j));
+                if (t < n) try routes_diag.keep(-4, @intCast(j), try predictorScores(g, c, w, t, x, true));
+            }
+        }
+        const pl: i16 = -@as(i16, @intCast(first - l));
+        for (0..3) |j| {
+            const t = first + @as(u32, @intCast(j));
+            if (t < n) try routes_diag.keep(pl, @intCast(j), try predictorScores(g, c, w, t, x1, true));
+        }
+        if (first < n) try routes_diag.keep(pl, 3, try predictorScores(g, c, w, first, h, false));
+        return;
+    }
+    const routed: i16 = @intCast(l - first);
+    if (l + 2 < n) try routes_diag.keep(routed, 1, try predictorScores(g, c, w, l + 2, h, false));
+    if (l + 3 < n) try routes_diag.keep(routed, 2, try predictorScores(g, c, w, l + 3, h, false));
+    if (l + 1 < n) try routes_diag.keep(routed, 3, try predictorScores(g, c, w, l + 1, x1, true));
+}
+
+/// Routed layer `t`'s router on `x` (under `t`'s pre-feedforward norm when `renorm`): sigmoid(f32 x @ W^T) + bias, f32
+/// [rows, experts] (the lookahead's scores, `routerScores`' choice).
+fn predictorScores(g: *G, c: *const beam.Config, w: *const Weights, t: u32, x: T, renorm: bool) !T {
+    const lw = &w.layers[t];
+    const xin = if (renorm) try rmsNorm(g, x, lw.pre_ff_norm, c.rms_norm_eps) else x;
+    return (try routerScores(g, lw.router.?, xin)).choice;
+}
+
 /// The head's rows: the last row's logits (served), or every row's (the parity test's).
 pub const Head = enum { last, all };
 
@@ -703,6 +741,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         if (comptime ptl.enabled) ptl.stage(if (lw.dense != null) .dense else .router);
         const x1 = try depthAdd(g, c, try rmsNorm(g, attn, lw.post_attn_norm, c.rms_norm_eps), x, beam.Config.residualIndex(l, false));
         const h = try rmsNorm(g, x1, lw.pre_ff_norm, c.rms_norm_eps);
+        if (comptime routes_diag.enabled) if (!prompt and routes_diag.on() and src.decoding()) try recordPredictions(g, c, w, l, x, x1, h);
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h)) else blk: {
             const r = if (comptime @TypeOf(force) == void) try route(g, c, lw.router.?, h) else try forcedRoute(g, c, lw.router.?, h, force, l, start);
             if (prompt) try g.asyncEval(&.{ r.indices, r.weights });

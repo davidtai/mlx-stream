@@ -21,6 +21,8 @@ const sdk_ext = @import("../../sdk_ext.zig");
 const residency = @import("../../sdk_ext/expert/residency.zig");
 /// Profile builds only (profile.zig): the prompt timeline, the GPU timeline, the kernel and read logs, the phase lines.
 const prof = @import("profile.zig");
+/// The route recorder (a diagnostic, `BEAM_ROUTES`; routes_diag.zig).
+const routes_diag = @import("routes_diag.zig");
 
 const T = mlx.mlx_array;
 
@@ -114,6 +116,7 @@ pub const Module = struct {
         // Once (every command retired, MLX's cache cleared): the footprint beside the bill's construction terms. A report.
         route.constructionCheck("beam", s, plan.bill, plan.rows.prompt, bill.construction_tolerance_bytes);
         if (comptime prof.enabled) try prof.arm(gpa, io, self.src, model.n_layers, s);
+        if (comptime routes_diag.enabled) try routes_diag.arm(gpa, self.src.sdk_stream, n_moe, model.n_routed_experts, model.n_experts_per_tok);
         return self;
     }
 
@@ -133,6 +136,7 @@ pub const Module = struct {
     pub fn deinit(self: *Module) void {
         _ = mlx.mlx_synchronize(self.g.s);
         if (comptime prof.enabled) prof.disarm();
+        if (comptime routes_diag.enabled) routes_diag.disarm(self.src.sdk_stream);
         self.res.closeTally(self.gpa);
         self.res.closeUsage();
         self.src.deinit();
@@ -187,6 +191,7 @@ pub const Module = struct {
         self.cache.restart();
         self.state_lost = false;
         if (comptime prof.enabled) prof.promptBegin(self.src);
+        if (comptime routes_diag.enabled) routes_diag.begin(ids.len);
     }
 
     /// The prompt's calls (at most `experts.call_rows` rows each, layer by layer): the last call's logits (every row's
@@ -238,6 +243,7 @@ pub const Module = struct {
             return logits;
         }
         const t0 = self.nowNs();
+        if (comptime routes_diag.enabled) routes_diag.stepBegin();
         const tp = prof.stepBegin();
         const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids, self.cache.len, &self.cache, self.src, .last, force);
         errdefer self.g.release(logits);
@@ -246,7 +252,10 @@ pub const Module = struct {
         prof.stepEnd(tp);
         self.decode.steps += 1;
         self.decode.tokens += ids.len;
-        self.decode.wall_ns += self.nowNs() - t0;
+        const wall = self.nowNs() - t0;
+        self.decode.wall_ns += wall;
+        // The recorder's predictions evaluated after the step's own wall (its one extra wait is not the step's).
+        if (comptime routes_diag.enabled) if (self.src.decoding()) routes_diag.stepEnd(&self.g, ids[0], wall);
         return logits;
     }
 
@@ -271,6 +280,7 @@ pub const Module = struct {
         self.res.endUsage(self.io, "beam", self.src, d.prompt_tokens, d.tokens);
         self.res.endTally(self.gpa, self.io, "beam", self.c.tally, self.src);
         log.info("beam decode: steps={d} tokens={d} wall_s={d:.3} tok_s={d:.2} ssd_bytes={d} ssd_bytes_per_token={d} direct_ranges={d}\n", .{ d.steps, d.tokens, @as(f64, @floatFromInt(d.wall_ns)) / 1e9, tok_s, s1.expert_bytes_read -| d.s0.expert_bytes_read, if (d.tokens > 0) (s1.expert_bytes_read -| d.s0.expert_bytes_read) / d.tokens else 0, s1.direct_ranges -| d.s0.direct_ranges });
+        if (comptime routes_diag.enabled) routes_diag.write(self.io);
     }
 };
 

@@ -5,11 +5,14 @@
 //!
 //! What it keeps:
 //! - per decode call of a routed layer: its layer, its step, the forward's rows, the routed ids in the router's flat
-//!   order (row r's top-k at `[r * k, (r + 1) * k)`), per id what served it (`Flag`), and the lookahead's records for
-//!   the next routed layer. A bank of several bank layers per routed layer (`banks_per_layer`, GLM-5.3's EXL3: K3 and
+//!   order (row r's top-k at `[r * k, (r + 1) * k)`), per id what served it (`Flag`), the lookahead's records for
+//!   the next routed layer, the time of its plan (`stamp`, just after its routing barrier) and, in `pred_slots` slots,
+//!   each row's top `pred_k` experts of a router's scores the arch hands over (`predict`: slot 0 is the lookahead's own
+//!   scores, the stream's; the arch names the others). An arch may add a route with no ids for a layer that does not
+//!   route (`pseudo`: its layer an i16 below 0, its predictions only). A bank of several bank layers per routed layer (`banks_per_layer`, GLM-5.3's EXL3: K3 and
 //!   K4) routes a call once per bank layer: the arch opens the call (`call`) and each of its routes fills its ids'
 //!   flags in it;
-//! - per step: its rows, drafts, accepted drafts, emitted tokens and wall time;
+//! - per step: its rows, drafts, accepted drafts, emitted tokens, wall time and its input token (`token`);
 //! - per bank layer (the stream's layers: `banks_per_layer` per routed layer), at the decode handover: the prompt's
 //!   routed rows per expert (the policy's prompt counts) and the residents in slot order, with the prompt and decode
 //!   rows.
@@ -23,12 +26,20 @@ const std = @import("std");
 const policy = @import("policy.zig");
 
 pub const magic = "GLMROUTE".*;
-pub const version: u32 = 2;
+/// Version 4: version 2 with the plan's stamp and the predictions (`Header.pred_dims` gives their shape) per route and
+/// the input token per step.
+pub const version: u32 = 4;
 pub const max_ids = policy.max_route_ids;
 /// The lookahead's records per call (`lookahead.max_budget`).
 pub const max_spec = 4;
 /// A route index for a route the recorder did not keep.
 pub const none: u32 = std.math.maxInt(u32);
+/// The predictions per route: `pred_slots` slots, each `pred_rows` rows of a router's top `pred_k` experts.
+pub const pred_slots = 4;
+pub const pred_rows = 1;
+pub const pred_k = 16;
+/// `Header.pred_dims`: slots | rows << 8 | k << 16.
+pub const pred_dims_word: u32 = pred_slots | pred_rows << 8 | pred_k << 16;
 
 /// What served one routed id (bits; the same for each repeat of an expert in a route).
 pub const Flag = struct {
@@ -67,7 +78,8 @@ pub const Header = extern struct {
     dropped: u32,
     /// Bank layers per routed layer.
     banks_per_layer: u32,
-    reserved: u32 = 0,
+    /// The predictions' shape (`pred_dims_word`).
+    pred_dims: u32 = pred_dims_word,
 };
 
 pub const Step = extern struct {
@@ -78,7 +90,8 @@ pub const Step = extern struct {
     accepted: u16,
     emitted: u16,
     wall_us: u32,
-    reserved: u32 = 0,
+    /// The step's first input token (`token`; 0 unless the arch names it).
+    token: u32 = 0,
 };
 
 pub const Route = extern struct {
@@ -90,10 +103,22 @@ pub const Route = extern struct {
     flags: [max_ids]u8,
     /// The records read ahead for the next layer (`policy.no_expert`: none).
     spec: [max_spec]u16,
+    /// The route's plan (`stamp`): us after the request's start (`begin`).
+    t_us: u32 = 0,
+    /// Per slot and row, a router's top `pred_k` experts by score (`policy.no_expert`: none) and their scores.
+    pred: [pred_slots][pred_rows][pred_k]u16 = @splat(@splat(@splat(policy.no_expert))),
+    pred_score: [pred_slots][pred_rows][pred_k]f32 = @splat(@splat(@splat(0))),
 };
 
 comptime {
-    std.debug.assert(@sizeOf(Header) == 64 and @sizeOf(Step) == 24 and @sizeOf(Route) == 160);
+    std.debug.assert(@sizeOf(Header) == 64 and @sizeOf(Step) == 24 and @sizeOf(Route) == 160 + 4 + pred_slots * pred_rows * pred_k * 6);
+}
+
+/// The recorder's clock (ns): the stamps' and the request's start.
+pub fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 /// Files named so far in this process (`nextFile`): a model loaded again never reuses a name.
@@ -136,6 +161,8 @@ pub const Recorder = struct {
     /// The open call (`call`): the route its bank layers' routes fill.
     open: u32 = none,
     dropped: u32 = 0,
+    /// The request's start (`begin`, `nowNs`).
+    t0_ns: u64 = 0,
 
     /// `n_layers` bank layers, `bpl` of them per routed layer.
     pub fn init(a: std.mem.Allocator, n_layers: u32, n_experts: u32, top_k: u32, bpl: u32) !*Recorder {
@@ -173,6 +200,7 @@ pub const Recorder = struct {
 
     /// A request's start: what the recorder kept is dropped.
     pub fn begin(self: *Recorder, prompt_tokens: u32, mtp_depth: u32) void {
+        self.t0_ns = nowNs();
         self.routes.clearRetainingCapacity();
         self.steps.clearRetainingCapacity();
         self.step = 0;
@@ -222,6 +250,72 @@ pub const Recorder = struct {
         r.* = .{ .layer = @intCast(layer), .n_ids = @intCast(ids.len), .rows = @intCast(ids.len / self.top_k), .step = self.step, .ids = @splat(policy.no_expert), .flags = @splat(0), .spec = @splat(policy.no_expert) };
         @memcpy(r.ids[0..ids.len], ids);
         return index;
+    }
+
+    /// A route with no ids for layer `layer` (an i16 below 0: a layer before the first routed one, -1 the last of them),
+    /// stamped at `t_ns` (`nowNs`), for its predictions only (`predict`). Returns its index (`none` when not kept).
+    pub fn pseudo(self: *Recorder, layer: i16, t_ns: u64) u32 {
+        std.debug.assert(layer < 0);
+        const index: u32 = @intCast(self.routes.items.len);
+        const r = self.routes.addOne(self.a) catch {
+            self.dropped += 1;
+            return none;
+        };
+        r.* = .{ .layer = @bitCast(layer), .n_ids = 0, .rows = 1, .step = self.step, .ids = @splat(policy.no_expert), .flags = @splat(0), .spec = @splat(policy.no_expert) };
+        self.stampAt(index, t_ns);
+        return index;
+    }
+
+    /// Route `index`'s plan, now.
+    pub fn stamp(self: *Recorder, index: u32) void {
+        self.stampAt(index, nowNs());
+    }
+
+    fn stampAt(self: *Recorder, index: u32, t_ns: u64) void {
+        if (index == none) return;
+        self.routes.items[index].t_us = @intCast(@min((t_ns -| self.t0_ns) / std.time.ns_per_us, std.math.maxInt(u32)));
+    }
+
+    /// Route `index`'s prediction in `slot` (below `pred_slots`): `scores` its rows' scores (rows x `n_experts`,
+    /// row-major), each row's top `pred_k` kept by score (ties: the lower id first).
+    pub fn predict(self: *Recorder, index: u32, slot: u32, scores: []const f32) void {
+        if (index == none or slot >= pred_slots) return;
+        const r = &self.routes.items[index];
+        const ne = self.n_experts;
+        const rows = @min(scores.len / ne, pred_rows);
+        for (0..rows) |row| {
+            const sc = scores[row * ne ..][0..ne];
+            const ids = &r.pred[slot][row];
+            const vals = &r.pred_score[slot][row];
+            var n: usize = 0;
+            for (sc, 0..) |v, e| {
+                if (n == pred_k and !(v > vals[n - 1] or (v == vals[n - 1] and e < ids[n - 1]))) continue;
+                var at = if (n < pred_k) n else pred_k - 1;
+                if (n < pred_k) n += 1;
+                while (at > 0 and (v > vals[at - 1] or (v == vals[at - 1] and e < ids[at - 1]))) : (at -= 1) {
+                    ids[at] = ids[at - 1];
+                    vals[at] = vals[at - 1];
+                }
+                ids[at] = @intCast(e);
+                vals[at] = v;
+            }
+        }
+    }
+
+    /// The open step's route of routed layer `layer` (the last one), or `none`.
+    pub fn routeOf(self: *const Recorder, layer: u32) u32 {
+        var i = self.routes.items.len;
+        while (i > self.first) {
+            i -= 1;
+            const r = &self.routes.items[i];
+            if (r.n_ids > 0 and r.layer == layer) return @intCast(i);
+        }
+        return none;
+    }
+
+    /// The last ended step's input token.
+    pub fn tokenOfLast(self: *Recorder, token: u32) void {
+        if (self.steps.items.len > 0) self.steps.items[self.steps.items.len - 1].token = token;
     }
 
     /// One decode route of bank layer `layer`: `ids` as routed, its plan, and per load (plan order) whether it reads.
@@ -399,7 +493,7 @@ test "expert routes: a plan's hits, loads, evictions and reads become each id's 
 
     const img = try rec.image(a);
     defer a.free(img);
-    try testing.expectEqual(@as(usize, 64 + 2 * 2 * 4 + 2 * 16 * 4 + 2 * 16 * 2 + 2 * 24 + 2 * 160), img.len);
+    try testing.expectEqual(@as(usize, 64 + 2 * 2 * 4 + 2 * 16 * 4 + 2 * 16 * 2 + 2 * 24 + 2 * @sizeOf(Route)), img.len);
     const im = try Parts.of(img);
     const h = im.header;
     try testing.expectEqualSlices(u8, "GLMROUTE", &h.magic);
@@ -458,4 +552,31 @@ test "expert routes: a call over two bank layers is one route, each id flagged b
     const img = try rec.image(a);
     defer a.free(img);
     try testing.expectEqual(@as(u32, 2), (try Parts.of(img)).header.banks_per_layer);
+}
+
+test "expert routes: a route's predictions keep each row's top experts by score in their slot; a pseudo route has no ids" {
+    const a = testing.allocator;
+    const rec = try Recorder.init(a, 2, 20, 2, 1);
+    defer rec.deinit();
+    rec.begin(4, 0);
+    // Scores e at e, with a tie at 0.5 between 7 and 2 (the lower id first).
+    var sc: [20]f32 = undefined;
+    for (&sc, 0..) |*v, e| v.* = -@as(f32, @floatFromInt(e));
+    sc[7] = 0.5;
+    sc[2] = 0.5;
+    const p = rec.pseudo(-1, rec.t0_ns + 3 * std.time.ns_per_ms);
+    rec.predict(p, 2, &sc);
+    const r = rec.routes.items[p];
+    try testing.expectEqual(@as(u16, 0xFFFF), r.layer);
+    try testing.expectEqual(@as(u8, 0), r.n_ids);
+    try testing.expectEqual(@as(u32, 3000), r.t_us);
+    try testing.expectEqualSlices(u16, &.{ 2, 7, 0, 1, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15 }, &r.pred[2][0]);
+    try testing.expectEqual(@as(f32, 0.5), r.pred_score[2][0][0]);
+    try testing.expectEqual(policy.no_expert, r.pred[0][0][0]);
+    // A slot past `pred_slots` is ignored; a pseudo route is no layer's route.
+    rec.predict(p, pred_slots, &sc);
+    try testing.expectEqual(none, rec.routeOf(0xFFFF));
+    rec.endStep(1, 0, 0, 1, 1_000);
+    rec.tokenOfLast(42);
+    try testing.expectEqual(@as(u32, 42), rec.steps.items[0].token);
 }

@@ -1518,6 +1518,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
                 if (comptime recording) if (self.recorder) |rec| if (self.phase == .decode) {
                     r.rec = rec.route(layer, ids, plan, r.reads[0..plan.n_loads]);
+                    // The plan's time and the lookahead's own scores of the next layer (slot 0).
+                    rec.stamp(r.rec);
+                    if (scores.len > 0) rec.predict(r.rec, 0, scores);
                 };
                 try self.submitParts(r);
                 if (lookahead) {
