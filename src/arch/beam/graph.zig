@@ -934,17 +934,23 @@ fn expertCounts(g: *G, ids: T, rows: c_int, k: c_int, all_ids: T) !T {
     return g.sum(try g.equal(try g.reshape(ids, &.{ rows * k, 1 }), all_ids), 0, false);
 }
 
-/// P1: routed layer `l`'s predicted experts (its router on the layer's input under its pre-feedforward norm, counted
-/// per expert on the GPU, one small read back), ranked hottest first and posted to the stream, which reads the seed
-/// into the layer's free persistent rows while the attention runs. The prediction only picks reads: token-exact.
-fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, src: anytype) !void {
-    const m = g.mark();
-    defer g.resetTo(m);
+/// P1's predictor of routed layer `lw` over `x` (the layer's input rows): its router on `x` under the layer's
+/// pre-feedforward norm, the chosen experts counted per expert on the GPU, u32 [experts], unevaluated.
+pub fn predictedCounts(g: *G, c: *const beam.Config, lw: *const Layer, x: T) !T {
     const n = g.shapeOf(x).dim(0);
     const ne: c_int = @intCast(c.n_routed_experts);
     const r = try route(g, c, lw.router.?, try rmsNorm(g, x, lw.pre_ff_norm, c.rms_norm_eps));
     const all_ids = try g.reshape(try g.arange(0, @floatFromInt(c.n_routed_experts), 1, .uint32), &.{ 1, ne });
-    const counts = try g.astype(try expertCounts(g, r.indices, n, @intCast(c.n_experts_per_tok), all_ids), .uint32);
+    return g.astype(try expertCounts(g, r.indices, n, @intCast(c.n_experts_per_tok), all_ids), .uint32);
+}
+
+/// P1: routed layer `l`'s predicted experts (`predictedCounts`, one small read back), ranked hottest first and posted
+/// to the stream, which reads the seed into the layer's free persistent rows while the attention runs. The prediction
+/// only picks reads: token-exact.
+fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, src: anytype) !void {
+    const m = g.mark();
+    defer g.resetTo(m);
+    const counts = try predictedCounts(g, c, lw, x);
     try g.evalAll(&.{counts});
     const host = try g.readU32(counts, src.ahead_counts[0..c.n_routed_experts]);
     try src.readAheadSeed(l, expert_policy.rankHottest(host, &src.ahead_ranked));
