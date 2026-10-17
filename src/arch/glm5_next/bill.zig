@@ -36,7 +36,7 @@ pub const wire_buffer_bytes = dsv_bill.wire_buffer_bytes;
 /// The fill's floor: fewer prompt rows refuse the load by name (the harness's `MIN_ROWS`).
 pub const min_rows: u32 = glm.default_expert_rows;
 /// How far the constructed footprint may sit above the construction terms before the construction check reports it.
-pub const construction_tolerance_bytes: u64 = 250_000_000;
+pub const construction_tolerance_bytes = route_bill.construction_tolerance_bytes;
 
 const bf16: u64 = 2;
 const f32b: u64 = 4;
@@ -56,15 +56,7 @@ pub fn dsaKernelsBytes(c: *const glm.Config) u64 {
     return (4 << 20) + rows * @import("dsa_decode.zig").slices * (@import("dsa_decode.zig").latent + 2) * 4;
 }
 
-pub const Plan = struct {
-    bill: sdk.MemoryBill,
-    rows: sdk.Rows,
-    target: u64,
-    baseline: u64,
-    reserve: u64,
-    /// Forced rows only: how far the bill at the forced rows sits over the target (0 = within). A report.
-    over_fill: u64 = 0,
-};
+pub const Plan = route_bill.Plan;
 
 // ── The residents (the shards' headers: no payload is read) ──
 
@@ -545,20 +537,7 @@ pub fn plan(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, ceili
 }
 
 pub fn choose(b: sdk.MemoryBill, cfg: *const settings.Config, ceiling: u64, stop: u64) !Plan {
-    const baseline = cfg.memory_baseline_bytes orelse return error.Glm5NextMemoryBaselineMissing;
-    const target = ceiling -| stop;
-    const forced_decode = cfg.expert_rows orelse cfg.expert_prefill_rows;
-    const forced_prompt = cfg.expert_prefill_rows orelse cfg.expert_rows;
-    const n_experts = cfg.model.n_routed_experts;
-    const rows: sdk.Rows = if (forced_decode) |d| .{ .prompt = forced_prompt.?, .decode = d } else try sdk.fill(b, baseline, target, n_experts, min_rows);
-    if (rows.prompt == 0 or rows.decode > n_experts) return error.Glm5NextExpertRows;
-    if (rows.prompt > rows.decode) return error.Glm5NextPhaseRows;
-    const over = overFillBytes(b, baseline, rows, target);
-    if (over > 0) {
-        var line: [192]u8 = undefined;
-        sdk.log.warn("glm5_next: {s}\n", .{forcedRowsLine(&line, rows, over, baseline)});
-    }
-    return .{ .bill = b, .rows = rows, .target = target, .baseline = baseline, .reserve = cfg.reserveTokens(), .over_fill = over };
+    return route_bill.choose("glm5_next", b, .{ .expert_rows = cfg.expert_rows, .expert_prefill_rows = cfg.expert_prefill_rows, .baseline = cfg.memory_baseline_bytes, .reserve = cfg.reserveTokens(), .n_experts = cfg.model.n_routed_experts, .min_rows = min_rows }, ceiling, stop, .{ .baseline = error.Glm5NextMemoryBaselineMissing, .rows = error.Glm5NextExpertRows, .phase = error.Glm5NextPhaseRows });
 }
 
 pub const forcedRowsLine = route_bill.forcedRowsLine;

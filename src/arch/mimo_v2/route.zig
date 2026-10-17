@@ -97,6 +97,23 @@ pub fn scoresStored(_: *const mimo_math.Predictor, g: *ops.MlxOps, x: T, router:
     return g.add(try g.sigmoid(try g.astype(logits, .float32)), correction);
 }
 
+/// Once, at construction (every command retired, MLX's cache cleared): the footprint beside the bill's construction
+/// terms at the prompt rows, one line. A report, as MiMo's: an over-footprint past `tolerance` is the bill's bug for its
+/// tests and the window guard, logged as an under-bill; the load proceeds.
+pub fn constructionCheck(comptime arch: []const u8, s: mlx.mlx_stream, b: sdk.MemoryBill, rows: u32, tolerance: u64) void {
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    const footprint = sdk.memory.footprint().now;
+    var active: usize = 0;
+    var cache: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&cache);
+    const billed = b.constructionBytes(rows);
+    sdk.log.info(arch ++ " construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (billed less footprint)\n", .{ footprint, active, cache, footprint -| active -| cache, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(footprint)) });
+    if (footprint > billed + tolerance)
+        sdk.log.warn(arch ++ " construction check: the footprint {d} B exceeds the billed construction terms {d} B by more than {d} B (an under-bill: proceeding)\n", .{ footprint, billed, tolerance });
+}
+
 /// The host's monotonic clock (ns): a phase change's one timing, never per call.
 pub fn monotonicNs() u64 {
     var ts: std.c.timespec = undefined;

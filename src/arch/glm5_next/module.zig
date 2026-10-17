@@ -449,17 +449,7 @@ pub const Module = struct {
     /// Once, at construction (every command retired, MLX's cache cleared): the footprint beside the bill's construction
     /// terms at the prompt rows. A report, as MiMo's: an under-bill is the bill's bug for its tests and the window guard.
     fn checkConstruction(self: *Module, b: sdk.MemoryBill, rows: u32) void {
-        _ = mlx.mlx_synchronize(self.g.s);
-        _ = mlx.mlx_clear_cache();
-        const footprint = sdk.memory.footprint().now;
-        var active: usize = 0;
-        var cache: usize = 0;
-        _ = mlx.mlx_get_active_memory(&active);
-        _ = mlx.mlx_get_cache_memory(&cache);
-        const billed = b.constructionBytes(rows);
-        log.info("glm5_next construction check: footprint {d} B (MLX active {d} B, cache {d} B, host side {d} B), billed construction terms {d} B, residual {d} B (billed less footprint)\n", .{ footprint, active, cache, footprint -| active -| cache, billed, @as(i64, @intCast(billed)) - @as(i64, @intCast(footprint)) });
-        if (footprint > billed + bill.construction_tolerance_bytes)
-            log.warn("glm5_next construction check: the footprint {d} B exceeds the billed construction terms {d} B by more than {d} B (an under-bill: proceeding)\n", .{ footprint, billed, bill.construction_tolerance_bytes });
+        @import("../mimo_v2/route.zig").constructionCheck("glm5_next", self.g.s, b, rows, bill.construction_tolerance_bytes);
     }
 
     /// The rate tally at construction (residency.zig `openTally`): one line either way.

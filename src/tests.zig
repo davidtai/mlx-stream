@@ -59,6 +59,7 @@ comptime {
     _ = @import("arch/mimo_v2/route_bill.zig");
     _ = @import("sdk_ext/expert/layer_rows.zig");
     _ = @import("sdk_ext/expert/residency.zig");
+    _ = @import("sdk_ext/safetensors.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");

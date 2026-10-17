@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const sdk = @import("sdk");
-const io_util = sdk.io_util;
+const safetensors = @import("../../sdk_ext/safetensors.zig");
 const mimo_math = @import("math.zig");
 const mimo_stream = @import("stream.zig");
 const route = @import("route.zig");
@@ -20,80 +20,12 @@ const dsv_bill = @import("../deepseek_v41/bill.zig");
 const Term = sdk.MemoryBill.Term;
 const wireTables = dsv_bill.wireTables;
 
-/// An MLX buffer of `n` bytes as the Metal allocator takes it: past one page, rounded up to whole pages.
-pub fn bufferBytes(n: u64, page: u64) u64 {
-    return if (n > page) std.mem.alignForward(u64, n, page) else n;
-}
+pub const bufferBytes = safetensors.bufferBytes;
 
-// ── The residents (the shards' headers: no payload is read) ──
+// ── The residents (the shards' headers: no payload is read; sdk_ext/safetensors.zig) ──
 
-pub const Residents = struct { bytes: u64, tensors: u64 };
-
-/// The residents `kept(ctx, name)` keeps of the pack's indexed shards, each in its own MLX buffer (page-rounded past one
-/// page). Every shard header is bounded and checked against its file; a tensor outside its file refuses
-/// (`ResidentShard`); an index that is not a weight map of `.safetensors` files refuses (`ResidentIndex`).
-pub fn residentBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, ctx: anytype, comptime kept: fn (@TypeOf(ctx), []const u8) bool, page: u64) !Residents {
-    var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
-    defer d.close(io);
-    const raw = d.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 << 20)) catch return error.ResidentIndex;
-    defer a.free(raw);
-    const index = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch return error.ResidentIndex;
-    defer index.deinit();
-    const wm = if (index.value == .object) index.value.object.get("weight_map") orelse return error.ResidentIndex else return error.ResidentIndex;
-    if (wm != .object or wm.object.count() == 0) return error.ResidentIndex;
-    var shards: std.StringArrayHashMapUnmanaged(void) = .empty;
-    defer shards.deinit(a);
-    var it = wm.object.iterator();
-    while (it.next()) |e| {
-        const v = e.value_ptr.*;
-        if (v != .string or !std.mem.endsWith(u8, v.string, ".safetensors") or std.mem.indexOfAny(u8, v.string, "/\\") != null) return error.ResidentIndex;
-        try shards.put(a, v.string, {});
-    }
-    var out: Residents = .{ .bytes = 0, .tensors = 0 };
-    for (shards.keys()) |shard| {
-        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, shard }, 0);
-        defer a.free(path);
-        const fd = try io_util.openNoCache(path.ptr, .{});
-        defer _ = std.c.close(fd);
-        const size_i = std.c.lseek(fd, 0, std.c.SEEK.END);
-        if (size_i < 8) return error.ResidentShard;
-        const size: u64 = @intCast(size_i);
-        var prefix: [8]u8 = undefined;
-        try readAt(fd, &prefix, 0);
-        const len = std.mem.readInt(u64, &prefix, .little);
-        if (len < 2 or len > 64 << 20 or len > size - 8) return error.ResidentShard;
-        const header = try a.alloc(u8, @intCast(len));
-        defer a.free(header);
-        try readAt(fd, header, 8);
-        const parsed = std.json.parseFromSlice(std.json.Value, a, header, .{}) catch return error.ResidentShard;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.ResidentShard;
-        var tensors = parsed.value.object.iterator();
-        while (tensors.next()) |t| {
-            const name = t.key_ptr.*;
-            if (std.mem.eql(u8, name, "__metadata__") or !kept(ctx, name)) continue;
-            const desc = t.value_ptr.*;
-            const offsets = if (desc == .object) desc.object.get("data_offsets") orelse return error.ResidentShard else return error.ResidentShard;
-            if (offsets != .array or offsets.array.items.len != 2 or offsets.array.items[0] != .integer or offsets.array.items[1] != .integer) return error.ResidentShard;
-            const lo = offsets.array.items[0].integer;
-            const hi = offsets.array.items[1].integer;
-            if (lo < 0 or hi < lo or @as(u64, @intCast(hi)) > size - 8 - len) return error.ResidentShard;
-            out.bytes += bufferBytes(@intCast(hi - lo), page);
-            out.tensors += 1;
-        }
-    }
-    return out;
-}
-
-fn readAt(fd: std.c.fd_t, bytes: []u8, offset: u64) !void {
-    var done: usize = 0;
-    while (done < bytes.len) {
-        const n = std.c.pread(fd, bytes[done..].ptr, bytes.len - done, @intCast(offset + done));
-        if (n < 0 and std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
-        if (n <= 0) return error.ResidentShard;
-        done += @intCast(n);
-    }
-}
+pub const Residents = safetensors.Residents;
+pub const residentBytes = safetensors.residentBytes;
 
 // ── The expert source's terms ──
 
@@ -231,6 +163,45 @@ pub fn compose(a: std.mem.Allocator, arch: []const Term, src: sdk.MemoryBill) !s
     @memcpy(terms[0..arch.len], arch);
     @memcpy(terms[arch.len..], src.terms);
     return .{ .terms = terms, .per_row = src.per_row, .row_terms = src.row_terms };
+}
+
+/// How far the constructed footprint may sit above the construction terms before the construction check reports it.
+pub const construction_tolerance_bytes: u64 = 250_000_000;
+
+/// The bill at the load's reserve and the rows (forced or the fill's).
+pub const Plan = struct {
+    bill: sdk.MemoryBill,
+    rows: sdk.Rows,
+    target: u64,
+    baseline: u64,
+    reserve: u64,
+    /// Forced rows only: how far the bill at the forced rows sits over the target (0 = within). A report.
+    over_fill: u64 = 0,
+};
+
+/// What the plan reads of an arch's construction config: the operator's rows (either alone forces both), the memory
+/// baseline the host sampled, the positions billed, the experts per routed layer and the fill's floor.
+pub const Pin = struct { expert_rows: ?u32, expert_prefill_rows: ?u32, baseline: ?u64, reserve: u64, n_experts: u32, min_rows: u32 };
+
+/// The arch's refusal names for the plan: no baseline, rows outside 1 .. experts, prompt rows over decode rows.
+pub const PlanErrors = struct { baseline: anyerror, rows: anyerror, phase: anyerror };
+
+/// The rows of `b` under `pin`: forced rows load as named with the overage reported (an operator pin, never a refusal);
+/// else the fill (`sdk.fill`) within the ceiling less the stop. Impossible counts refuse by the arch's names.
+pub fn choose(comptime arch: []const u8, b: sdk.MemoryBill, pin: Pin, ceiling: u64, stop: u64, comptime errs: PlanErrors) !Plan {
+    const baseline = pin.baseline orelse return errs.baseline;
+    const target = ceiling -| stop;
+    const forced_decode = pin.expert_rows orelse pin.expert_prefill_rows;
+    const forced_prompt = pin.expert_prefill_rows orelse pin.expert_rows;
+    const rows: sdk.Rows = if (forced_decode) |d| .{ .prompt = forced_prompt.?, .decode = d } else try sdk.fill(b, baseline, target, pin.n_experts, pin.min_rows);
+    if (rows.prompt == 0 or rows.decode > pin.n_experts) return errs.rows;
+    if (rows.prompt > rows.decode) return errs.phase;
+    const over = overFillBytes(b, baseline, rows, target);
+    if (over > 0) {
+        var line: [192]u8 = undefined;
+        sdk.log.warn(arch ++ ": {s}\n", .{forcedRowsLine(&line, rows, over, baseline)});
+    }
+    return .{ .bill = b, .rows = rows, .target = target, .baseline = baseline, .reserve = pin.reserve, .over_fill = over };
 }
 
 /// How far the bill at `rows` sits over `target` in its larger phase (0: both within). A report.
