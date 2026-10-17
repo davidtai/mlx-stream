@@ -112,6 +112,20 @@ call loads a staged record, the copier copies it (as in P6). The change is exact
 runs beside the MoE stage of layer l: the bill's prompt wave adds it. A layer with no empty prompt row (the usage
 seed's residents, a later call) stages at its read-ahead (P6).
 
+### The host work off the critical path (P7)
+
+Three host steps of each prompt layer ran while the GPU had no work. The shared route (`mimo_v2/route.zig`) now holds
+glm5_next's levers for them, and Beam uses them:
+
+- The predictor of the next routed layer is built on the layer's output and evaluated with the layer's tail
+  (`PromptAhead`). The next layer reads the counts back; it does not run the predictor in its own round trip.
+- The tail's purge of MLX's cache runs after the next layer's first attention tile is committed (`DeferredPurge`). The
+  GPU runs the tile while the host purges. The cache stays under its limit.
+- The wide call's rows are put into buckets by group once (the shared scheduler's `route_cut`). Each group's bank passes
+  read only the rows of the group, not every row of the call. The plans and the waves do not change.
+
+The values and the reads do not change: the change is exact.
+
 The prompt pass's end writes one line: `beam prompt: tokens= wall_s= ssd_bytes= ahead_posted= ahead_dropped= staged=
 staged_ahead= stage_copies= stage_admits= stage_unused= loads= skipped=`. The staged records are the copies, the
 admissions and the unused records.
