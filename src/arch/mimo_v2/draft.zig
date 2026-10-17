@@ -126,11 +126,32 @@ pub fn decisionGraph(g: anytype, row2: anytype, drafts: []const u32, rule: acc.R
 
 /// The evaluated decision on the host: the accepted count and the next token (`acceptance.prefix`).
 pub fn readDecision(g: anytype, d: anytype, drafts: []const u32) !acc.Prefix {
+    return readDecisionRows(g, d, drafts, @intCast(drafts.len + 1));
+}
+
+/// `readDecision` over a verify chunk of `n` rows (`decisionGraph` over them, `drafts` the chunk's: one a row, or one
+/// fewer when the chunk ends at the bonus row): `next` is null when every draft in it is accepted and it holds no further
+/// row (`acceptance.prefix`).
+pub fn readDecisionRows(g: anytype, d: anytype, drafts: []const u32, n: u32) !acc.Prefix {
+    std.debug.assert(n <= acc.max_rows and (drafts.len == n or drafts.len + 1 == n));
     var tb: [acc.max_rows]u32 = undefined;
     var fb: [acc.max_rows]bool = undefined;
-    const targets = try g.hostU32(d.targets, tb[0 .. drafts.len + 1]);
+    const targets = try g.hostU32(d.targets, tb[0..n]);
     const flags: ?[]const bool = if (d.flags) |f| try g.hostBool(f, fb[0..drafts.len]) else null;
     return acc.prefix(drafts, targets, flags);
+}
+
+/// The draft gate (a lane's `draft_gate`, theta): of a round's `q.len` drafts, the leading ones whose cumulative draft
+/// probability q_1 x .. x q_s stays at or above theta are verified, the rest dropped (the verify's rows saved). theta 0
+/// (off) keeps every draft. The products only fall, so the first one under theta ends the prefix. glm5_next's MTP lane
+/// and Beam's DFlash2 lane.
+pub fn gatedDrafts(q: []const f32, theta: f32) u32 {
+    var cum: f32 = 1;
+    for (q, 0..) |p, s| {
+        cum *= p;
+        if (cum < theta) return @intCast(s);
+    }
+    return @intCast(q.len);
 }
 
 /// A round's drafts at position `p` (t1 = x_p): the installed depth (`depthOf`), the host's accepted cap, the reserved
