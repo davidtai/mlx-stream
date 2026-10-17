@@ -11,14 +11,16 @@ step, the prepared launches and their tests.
 
 | file | what |
 |---|---|
-| `src/kernels/glm5_next_nvfp4/header_glm5n_nvfp4.metal` | the helpers: slot ids, the E4M3 and E2M1 decodes, the lane's scale, the dot, the activation load, the f32 sigmoid, the union vote |
-| `src/kernels/glm5_next_nvfp4/glm5n_nvfp4_gateup.metal` | gate and up of every routed pair, then the clamped SwiGLU: bf16 `[P, 2048]` |
-| `src/kernels/glm5_next_nvfp4/glm5n_nvfp4_down.metal` | each pair's down row: bf16 `[P, 4096]` (no score fold) |
-| `src/kernels/glm5_next_nvfp4/manifest.json` | each text's sha256 and size, the signatures, template parameters, threadgroup, registered instantiations and checks |
-| `scripts/glm5next_nvfp4_kernels_manifest.py` | writes the manifest and prints its pin (`--check`: is the manifest current) |
-| `scripts/compile_glm5next_nvfp4_kernels_offline.py` | compiles every instantiation with the Metal compiler on the CPU, in MLX's JIT math mode (safe) |
-| `src/arch/glm5_next/decode_kernels.zig` | the registry, the launches, `Fused` (prepared launches per wave width), `install` |
-| `src/arch/glm5_next/decode_kernels_selfcheck.zig` | the construction's compile check |
+| `src/kernels/nvfp4/header_glm5n_nvfp4.metal` | the helpers: slot ids, the E4M3 and E2M1 decodes, the lane's scale, the dot, the activation load, the f32 sigmoid, the union vote |
+| `src/kernels/nvfp4/glm5n_nvfp4_gateup.metal` | gate and up of every routed pair, then the clamped SwiGLU: bf16 `[P, 2048]` |
+| `src/kernels/nvfp4/glm5n_nvfp4_down.metal` | each pair's down row: bf16 `[P, 4096]` (no score fold) |
+| `src/kernels/nvfp4/manifest_glm5_next.json` | each text's sha256 and size, the signatures, template parameters, threadgroup, registered instantiations and checks |
+| `scripts/nvfp4_kernels_manifest.py` | writes each case's manifest and prints its pin (`--check`: is each manifest current) |
+| `scripts/compile_nvfp4_kernels_offline.py` | compiles every instantiation with the Metal compiler on the CPU, in MLX's JIT math mode (safe) |
+| `src/expert/nvfp4_decode_kernels.zig` | the shared set (`KernelsOf(case)`): the registry, the launches, `Fused` (prepared launches per wave width), `install`, the self-check (`SelfcheckOf`) |
+| `src/expert/nvfp4_format.zig` | `FusedDecodeOf(set)`: the set as MiMo's math binds a format's fused route |
+| `src/arch/glm5_next/decode_kernels.zig` | GLM-5.3-Flash's case: its texts, manifest, pin, geometry and activation; the registry tests |
+| `src/arch/glm5_next/decode_kernels_selfcheck.zig` | the self-check's tests |
 | `src/arch/glm5_next/decode_kernels_ref.zig` | the host reference of the texts' weight arithmetic and the CPU exactness tests |
 | `src/arch/glm5_next/decode_kernels_parity.zig` | the window's parity test |
 
@@ -161,7 +163,7 @@ for bit.
   (the pack's `scripts/glm5next_nvfp4_reader.py vectors`). It checks each record's sha256, its g and the fp16 sha256s
   against `vectors.json`, and all 75,497,472 values bit for bit.
 
-`scripts/compile_glm5next_nvfp4_kernels_offline.py --mlx-include <the MLX stage>/include` compiles the 16 instantiations
+`scripts/compile_nvfp4_kernels_offline.py --mlx-include <the MLX stage>/include glm5_next` compiles the 16 instantiations
 on the CPU: 2 texts x 2 geometries x 2 ids passings x 2 global-scale passings.
 
 **Window**: a child of the window orchestrator, with the lock held. Run it with `_GPU_WINDOW_LOCKED=1`,

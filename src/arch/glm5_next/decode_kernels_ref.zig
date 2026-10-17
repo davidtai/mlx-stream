@@ -1,4 +1,4 @@
-//! The host reference of the NVFP4 decode texts' weight arithmetic (kernels/glm5_next_nvfp4/header_glm5n_nvfp4.metal), line
+//! The host reference of the NVFP4 decode texts' weight arithmetic (kernels/nvfp4/header_glm5n_nvfp4.metal), line
 //! for line: `e4m3` is glm5n_e4m3, `decode8` glm5n_decode8, `nvScale` glm5n_nv_scale (with `invOf`, the texts' g / 2688),
 //! and `decodeProjection` walks a projection as a lane does (per row, per block of 16 codes: the uint2 of words 2q and
 //! 2q + 1 and scale byte q, decoded, each code's half times the lane's scale). The tests pin it to MLX's dequant order
