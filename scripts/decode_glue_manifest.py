@@ -44,18 +44,32 @@ def qk_norm(instances):
             "grid": ["32*HPG*ceil((HQ+HK)/HPG)", 1, 1], "threadgroup": ["32*HPG", 1, 1], "instances": instances}
 
 
+def add_norm(instances):
+    return {"name": "glue_add_norm", "headers": ["decode_glue"], "template": ["D", "TPG"],
+            "inputs": [arg("y", "bfloat16", [1, "D"]), arg("r", "bfloat16", [1, "D"]), arg("w1", "bfloat16", ["D"]),
+                       arg("w2", "bfloat16", ["D"]), arg("consts", "float32", [8])],
+            "outputs": [arg("res", "bfloat16", [1, "D"]), arg("out", "bfloat16", [1, "D"])], "grid": ["TPG", 1, 1],
+            "threadgroup": ["TPG", 1, 1], "instances": instances}
+
+
 # The q / k norm text's heads a threadgroup (beam glue.zig `heads_per_group`).
 HEADS_PER_GROUP = 8
+
+
+def norm_threads(d):
+    """MLX's rms threadgroup at hidden d (normalization.cpp): 1,024 past RMS_LOOPED_LIMIT 4,096, else 32 x ceil(d / 128)."""
+    return 1024 if d > 4096 else 32 * ((d + 127) // 128)
 
 
 def routed(d, e, g, tg, k, rows_per_group, hq, hk, hd):
     """One model's instantiations: the router's product and the predictor's at M = 1 (each `rows_per_group` rows of the
     weight a threadgroup), the select text at every decode-lane width, the q / k norm text on a sliding layer (MODE 0)
-    and a full one (MODE 1)."""
+    and a full one (MODE 1), the boundary text at MLX's rms threadgroup."""
     gv = [{"D": d, "E": e, "M": 1, "R": r, "EPI": epi} for r in rows_per_group for epi in (0, 1)]
     sv = [{"E": e, "G": g, "TG": tg, "K": k, "M": m} for m in range(1, LANE_ROWS + 1)]
     qv = [{"HQ": hq, "HK": hk, "HD": hd, "HPG": HEADS_PER_GROUP, "MODE": mode} for mode in (0, 1)]
-    return gv, sv, qv
+    av = [{"D": d, "TPG": norm_threads(d)}]
+    return gv, sv, qv, av
 
 
 # Beam 1.0 (hidden 5,120; 256 experts in 8 groups, 4 kept, top-8; 48 / 8 heads of 128) and the converter's fixture
@@ -70,12 +84,13 @@ def text(file):
 
 
 def build(case):
-    gv = [i for g, _, _ in CASES[case] for i in g]
-    sv = [i for _, s, _ in CASES[case] for i in s]
-    qv = [i for _, _, q in CASES[case] for i in q]
+    gv = [i for g, _, _, _ in CASES[case] for i in g]
+    sv = [i for _, s, _, _ in CASES[case] for i in s]
+    qv = [i for _, _, q, _ in CASES[case] for i in q]
+    av = [i for _, _, _, x in CASES[case] for i in x]
     m = {"format": "mlx-stream-decode-glue-kernels-v1", "case": case, "headers": [dict(id=i, **text(f)) for i, f in HEADERS],
          "kernels": []}
-    for k in (gemv(gv), select(sv), qk_norm(qv)):
+    for k in (gemv(gv), select(sv), qk_norm(qv), add_norm(av)):
         m["kernels"].append(dict(k, source=text(k["name"] + ".metal")))
     return (json.dumps(m, separators=(",", ":"), sort_keys=True) + "\n").encode()
 

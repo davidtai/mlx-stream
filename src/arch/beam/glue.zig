@@ -7,7 +7,9 @@
 //!     `rows_per_group` rows of the weight a threadgroup;
 //!   - `glue_router_select`: the tail (sigmoid, correction, the group top-k, the top-k, the normalized weights);
 //!   - `glue_qk_norm`: a decode row's query and key heads normed (q_norm, k_norm), then RoPE on a sliding layer, or the
-//!     query's scale on a full layer (graph.zig `qkStock`: two norms and two ropes, or two norms and a scale).
+//!     query's scale on a full layer (graph.zig `qkStock`: two norms and two ropes, or two norms and a scale);
+//!   - `glue_add_norm`: a decode row's sublayer boundary (graph.zig `boundaryStock`: the sublayer's norm, the
+//!     depth-scaled add, the next sublayer's norm).
 //! Stock: the router is the input cast, the GEMV and 17 ops (sigmoid, add, the groups' topk and sum, negation,
 //! argpartition, the group ids, equal, sum, greater, where, negation, argpartition, take_along_axis, sum, add, divide);
 //! the predictor is the cast, the GEMV, sigmoid and add. Exact: the ids, the weights, the predictor's scores and the
@@ -51,15 +53,17 @@ pub const texts = struct {
     pub const gemv = @embedFile(dir ++ "glue_router_gemv.metal");
     pub const select = @embedFile(dir ++ "glue_router_select.metal");
     pub const qk = @embedFile(dir ++ "glue_qk_norm.metal");
+    pub const add_norm = @embedFile(dir ++ "glue_add_norm.metal");
 };
 /// sha256 of manifest_beam.json (scripts/decode_glue_manifest.py prints it), which records every text's sha256 (checked
 /// against the pins by a CPU test).
-pub const manifest_sha256 = "5cb39505ae53b4b13d77b84b9bb91a6199288f24d82e2312d7e9f7752e72e0d0";
+pub const manifest_sha256 = "668af11732c2705238a6057f79f69e38454d481127e3b15f61fc00249faa28e3";
 pub const text_pins = [_]kset.TextPin{
     .{ .file = "header_decode_glue.metal", .text = texts.header, .sha256 = "6bec0858b4e0754c74a4eee95560bd78f0942ecc092cc50d50bcc7840977e484" },
     .{ .file = "glue_router_gemv.metal", .text = texts.gemv, .sha256 = "1c82d26867b1c277adb2ca003200f6c05c3ecc396126b74ac571854b202bdcb7" },
     .{ .file = "glue_router_select.metal", .text = texts.select, .sha256 = "5a7369ad5c53e6eb5b08013219ad7731cfa797863599d9be8f2c2e4715bf47f6" },
     .{ .file = "glue_qk_norm.metal", .text = texts.qk, .sha256 = "4118ee77c24b91bf6386e0bb28e84df8aeec27a87064387d29609339891c1067" },
+    .{ .file = "glue_add_norm.metal", .text = texts.add_norm, .sha256 = "7802402dbccaa535d22b60265c0476f20cd55788572c45c7b5429d7bd836042d" },
 };
 
 pub fn checkPins() !void {
@@ -100,6 +104,8 @@ pub const Kernels = struct {
     qk: Kernel = .{ .ctx = null },
     /// The q / k norm text on a sliding layer (MODE 0) and a full one (MODE 1).
     qk_cfg: [2]Config = @splat(.{ .ctx = null }),
+    add_norm: Kernel = .{ .ctx = null },
+    add_norm_cfg: Config = .{ .ctx = null },
     /// The GEMV at M = 1: the router's logits (EPI 0) and the predictor's scores (EPI 1).
     route_cfg: Config = .{ .ctx = null },
     pred_cfg: Config = .{ .ctx = null },
@@ -116,10 +122,10 @@ pub const Kernels = struct {
     eps: f32 = 0,
 
     pub fn deinit(k: *Kernels) void {
-        for ([_]Kernel{ k.gemv, k.select, k.qk }) |x| if (x.ctx != null) {
+        for ([_]Kernel{ k.gemv, k.select, k.qk, k.add_norm }) |x| if (x.ctx != null) {
             mtl.mlx_fast_metal_kernel_free(x);
         };
-        for ([_]Config{ k.route_cfg, k.pred_cfg } ++ k.select_cfg ++ k.qk_cfg) |cfg| if (cfg.ctx != null) {
+        for ([_]Config{ k.route_cfg, k.pred_cfg, k.add_norm_cfg } ++ k.select_cfg ++ k.qk_cfg) |cfg| if (cfg.ctx != null) {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         };
         if (k.consts.ctx != null) _ = mlx.mlx_array_free(k.consts);
@@ -155,7 +161,19 @@ pub const Launch = struct {
         const groups = (heads + heads_per_group - 1) / heads_per_group;
         return .{ .grid = .{ 32 * heads_per_group * groups, 1, 1 }, .group = .{ 32 * heads_per_group, 1, 1 } };
     }
+
+    /// The boundary text: one threadgroup of MLX's rms threadgroup at the hidden size (`normThreads`).
+    pub fn addNorm(hidden: u32) Launch {
+        const t = normThreads(hidden);
+        return .{ .grid = .{ t, 1, 1 }, .group = .{ t, 1, 1 } };
+    }
 };
+
+/// MLX's rms threadgroup at width `d` (normalization.cpp RMSNorm::eval_gpu): rms_looped's 1,024 threads past
+/// RMS_LOOPED_LIMIT (4,096), else rms_single_row's 32 x ceil(d / 128).
+pub fn normThreads(d: u32) u32 {
+    return if (d > 4096) 1024 else 32 * ((d + 127) / 128);
+}
 
 fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8) !Kernel {
     // The inputs are the forward's fresh row-major rows and the residents (a view would be copied: ensure_row_contiguous).
@@ -183,6 +201,13 @@ fn qkConfig(geo: Geometry, mode: i32) !Config {
     return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{ &qs, &ks }, .out_dtypes = &.{ .bfloat16, .bfloat16 }, .template = &t });
 }
 
+fn addNormConfig(geo: Geometry) !Config {
+    const l = Launch.addNorm(geo.hidden);
+    const shape = [_]c_int{ 1, @intCast(geo.hidden) };
+    const t = templateOf(&.{ "D", "TPG" }, .{ @intCast(geo.hidden), @intCast(normThreads(geo.hidden)) });
+    return kset.buildConfig(.{ .grid = l.grid, .threadgroup = l.group, .out_shapes = &.{ &shape, &shape }, .out_dtypes = &.{ .bfloat16, .bfloat16 }, .template = &t });
+}
+
 fn selectConfig(geo: Geometry, rows: u32) !Config {
     const l = Launch.select(geo.experts, rows);
     const shape = [_]c_int{ @intCast(rows), @intCast(geo.top_k) };
@@ -191,8 +216,9 @@ fn selectConfig(geo: Geometry, rows: u32) !Config {
 }
 
 /// The model's tables the self-check runs over (construction only): the first routed layer's router (its F32 weight
-/// and correction bias), the next routed layer's (the predictor's), and the first layer's q_norm and k_norm.
-pub const CheckTables = struct { w: T, bias: T, next_w: T, next_bias: T, q_norm: T, k_norm: T };
+/// and correction bias), the next routed layer's (the predictor's), the first layer's q_norm and k_norm, and its
+/// post-attention and pre-feedforward norms.
+pub const CheckTables = struct { w: T, bias: T, next_w: T, next_bias: T, q_norm: T, k_norm: T, post_attn_norm: T, pre_ff_norm: T };
 
 /// The route's construction on the module's GPU stream `s` (refused by name: `diag`): the geometry, the two texts'
 /// kernel objects, the configs, then the self-check (`selfCheck`: Metal compiles each text at its first dispatch).
@@ -215,6 +241,8 @@ pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config, t
     k.gemv = try newKernel("beam_glue_router_gemv", &.{ "x", "w", "bias" }, &.{"out"}, texts.gemv);
     k.select = try newKernel("beam_glue_router_select", &.{ "logits", "bias", "consts" }, &.{ "ids", "weights" }, texts.select);
     k.qk = try newKernel("beam_glue_qk_norm", &.{ "q", "k", "qw", "kw", "consts" }, &.{ "qo", "ko" }, texts.qk);
+    k.add_norm = try newKernel("beam_glue_add_norm", &.{ "y", "r", "w1", "w2", "consts" }, &.{ "res", "out" }, texts.add_norm);
+    k.add_norm_cfg = try addNormConfig(geo);
     k.route_cfg = try gemvConfig(geo, 0);
     k.pred_cfg = try gemvConfig(geo, 1);
     for (&k.select_cfg, 1..) |*cfg, m| cfg.* = try selectConfig(geo, @intCast(m));
@@ -287,6 +315,30 @@ pub fn qkNorm(g: *G, k: *const Kernels, q: T, kk: T, q_norm: T, k_norm: T, pos: 
     var out: [2]T = undefined;
     try apply(g, k.qk, k.qk_cfg[@intFromBool(full)], &.{ q, kk, q_norm, k_norm, consts }, &out);
     return .{ .q = out[0], .k = out[1] };
+}
+
+pub const Boundary = struct { res: T, out: T };
+
+/// The depth-scaled add's two scales of sublayer index `i` (graph.zig `depthAdd`: 1 / sqrt(i), sqrt((i - 1) / i), each
+/// rounded from f64 to f32 as `G.scalar` rounds it).
+pub fn depthScales(i: u32) [2]f32 {
+    const fi: f64 = @floatFromInt(i);
+    return .{ @floatCast(1.0 / @sqrt(fi)), @floatCast(@sqrt((fi - 1.0) / fi)) };
+}
+
+/// A decode row's sublayer boundary: the sublayer's output `y` [1, hidden] normed by `w1`, the depth-scaled add of
+/// sublayer index `i` with the residual `r` -> `res` [1, hidden] (the next residual), then `res` normed by `w2` -> `out`
+/// [1, hidden] (the next sublayer's input). One dispatch (graph.zig `boundaryStock`'s three).
+pub fn addNorm(g: *G, k: *const Kernels, y: T, r: T, w1: T, w2: T, i: u32) !Boundary {
+    const sc = depthScales(i);
+    var cv: [8]f32 = @splat(0);
+    cv[0] = sc[0];
+    cv[1] = sc[1];
+    cv[2] = k.eps;
+    const consts = try g.hostArray(std.mem.sliceAsBytes(&cv), &.{8}, .float32);
+    var out: [2]T = undefined;
+    try apply(g, k.add_norm, k.add_norm_cfg, &.{ y, r, w1, w2, consts }, &out);
+    return .{ .res = out[0], .out = out[1] };
 }
 
 // ── the self-check (construction, once) ──
@@ -371,13 +423,22 @@ pub fn selfCheck(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const beam.Config,
         try sameBytes(&g, if (full) "the full layer's query heads" else "the sliding layer's query heads", want.q, got.q, diag);
         try sameBytes(&g, if (full) "the full layer's key heads" else "the sliding layer's key heads", want.k, got.k, diag);
     };
+    // The first layer's attention boundary (sublayer 2) and a deep one (sublayer 105) on the first layer's norms.
+    const y = try checkRow(&g, a, c.hidden_size);
+    const r = try g.neg(try checkRow(&g, a, c.hidden_size));
+    for ([_]u32{ 2, 105 }) |i| {
+        const want = try graph.boundaryStock(&g, c, y, r, t.post_attn_norm, t.pre_ff_norm, i);
+        const got = try addNorm(&g, k, y, r, t.post_attn_norm, t.pre_ff_norm, i);
+        try sameBytes(&g, "the boundary's residual", want.res, got.res, diag);
+        try sameBytes(&g, "the boundary's normed row", want.out, got.out, diag);
+    }
 }
 
 const testing = std.testing;
 
 test "beam glue: the embedded manifest and texts are the pinned ones" {
     try checkPins();
-    try kset.expectManifestPins(texts.manifest, &text_pins, 3);
+    try kset.expectManifestPins(texts.manifest, &text_pins, 4);
 }
 
 test "beam glue: Beam 1.0's and the fixture's routers are the texts'; another is refused by name" {
@@ -416,6 +477,13 @@ test "beam glue: the launch geometry (the GEMV's experts / R threadgroups of 256
     // 48 + 8 heads: 7 threadgroups of 8 simdgroups; the fixture's 4 + 2: one.
     try testing.expectEqual([3]u32{ 7 * 256, 1, 1 }, Launch.qk(56).grid);
     try testing.expectEqual([3]u32{ 256, 1, 1 }, Launch.qk(6).grid);
+    // The boundary: rms_looped's 1,024 threads at 5,120; rms_single_row's 64 at the fixture's 256, 1,024 at 4,096.
+    try testing.expectEqual([3]u32{ 1024, 1, 1 }, Launch.addNorm(5120).grid);
+    try testing.expectEqual(@as(u32, 64), normThreads(256));
+    try testing.expectEqual(@as(u32, 1024), normThreads(4096));
+    // The depth scales of sublayer 2: 1 / sqrt(2) and sqrt(1 / 2), the same f32.
+    const sc = depthScales(2);
+    try testing.expectEqual(sc[0], sc[1]);
 }
 
 test "beam glue: the manifest registers the instantiations the install builds (each geometry at M = 1 and the lane's widths)" {
@@ -428,6 +496,7 @@ test "beam glue: the manifest registers the instantiations the install builds (e
         var gemv_found: [2]bool = @splat(false);
         var select_found: [max_rows]bool = @splat(false);
         var qk_found: [2]bool = @splat(false);
+        var add_found = false;
         for (m.value.kernels) |kk| for (kk.instances) |inst| {
             const o = inst.object;
             const int = struct {
@@ -444,11 +513,14 @@ test "beam glue: the manifest registers the instantiations the install builds (e
             } else if (std.mem.eql(u8, kk.name, "glue_qk_norm")) {
                 if (int(o, "HQ") == geo.heads and int(o, "HK") == geo.kv_heads and int(o, "HD") == geo.head_dim and int(o, "HPG") == heads_per_group)
                     qk_found[@intCast(int(o, "MODE"))] = true;
+            } else if (std.mem.eql(u8, kk.name, "glue_add_norm")) {
+                if (int(o, "D") == geo.hidden and int(o, "TPG") == normThreads(geo.hidden)) add_found = true;
             } else return error.BeamGlueManifestKernel;
         };
         for (gemv_found) |f| try testing.expect(f);
         for (select_found) |f| try testing.expect(f);
         for (qk_found) |f| try testing.expect(f);
+        try testing.expect(add_found);
     }
 }
 
@@ -525,9 +597,11 @@ test "beam glue GPU: the router's and the predictor's texts are the stock ops bi
         const hd: c_int = @intCast(geo.head_dim);
         const qn = try testBf16(a, &g, &.{hd}, 0.5, 15);
         const kn = try testBf16(a, &g, &.{hd}, 0.5, 16);
-        try g.evalAll(&.{ w, bias, w2, bias2, bias_ties, qn, kn });
+        const pn = try testBf16(a, &g, &.{d}, 0.5, 17);
+        const fnw = try testBf16(a, &g, &.{d}, 0.5, 18);
+        try g.evalAll(&.{ w, bias, w2, bias2, bias_ties, qn, kn, pn, fnw });
         var diag: sdk.Diag = .{};
-        var k = install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w2, .next_bias = bias2, .q_norm = qn, .k_norm = kn }, &diag) catch |err| {
+        var k = install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w2, .next_bias = bias2, .q_norm = qn, .k_norm = kn, .post_attn_norm = pn, .pre_ff_norm = fnw }, &diag) catch |err| {
             std.debug.print("beam glue install refused: {s}\n", .{diag.message()});
             return err;
         };
@@ -581,9 +655,11 @@ test "beam glue GPU: the q / k norm text is the stock norms and RoPE, or the nor
         const bias = try testF32(a, &g, &.{e}, 0.01, 12);
         const qn = try testBf16(a, &g, &.{hd}, 0.5, 15);
         const kn = try testBf16(a, &g, &.{hd}, 0.5, 16);
-        try g.evalAll(&.{ w, bias, qn, kn });
+        const pn = try testBf16(a, &g, &.{d}, 0.5, 17);
+        const fnw = try testBf16(a, &g, &.{d}, 0.5, 18);
+        try g.evalAll(&.{ w, bias, qn, kn, pn, fnw });
         var diag: sdk.Diag = .{};
-        var k = install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w, .next_bias = bias, .q_norm = qn, .k_norm = kn }, &diag) catch |err| {
+        var k = install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w, .next_bias = bias, .q_norm = qn, .k_norm = kn, .post_attn_norm = pn, .pre_ff_norm = fnw }, &diag) catch |err| {
             std.debug.print("beam glue install refused: {s}\n", .{diag.message()});
             return err;
         };
@@ -603,6 +679,52 @@ test "beam glue GPU: the q / k norm text is the stock norms and RoPE, or the nor
             calls += 1;
         };
         std.debug.print("BEAM GLUE qk_norm {d} / {d} heads of {d}: {d} rows (9 positions to 2^20, sliding and full) bit-equal\n", .{ geo.heads, geo.kv_heads, geo.head_dim, calls });
+    }
+}
+
+test "beam glue GPU: the boundary text is the stock norm, depth-scaled add and norm bit for bit (both hidden sizes, every sublayer index)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const graph = @import("graph.zig");
+    for (registered_geometries) |geo| {
+        const c = configOf(geo);
+        var g = try G.init(a, s);
+        defer g.deinit();
+        try graph.prepareFused(&g, &c);
+        const d: c_int = @intCast(geo.hidden);
+        const e: c_int = @intCast(geo.experts);
+        const hd: c_int = @intCast(geo.head_dim);
+        const w = try testF32(a, &g, &.{ e, d }, 1.0 / @sqrt(@as(f32, @floatFromInt(geo.hidden))), 11);
+        const bias = try testF32(a, &g, &.{e}, 0.01, 12);
+        const qn = try testBf16(a, &g, &.{hd}, 0.5, 15);
+        const kn = try testBf16(a, &g, &.{hd}, 0.5, 16);
+        const pn = try testBf16(a, &g, &.{d}, 0.5, 17);
+        const fnw = try testBf16(a, &g, &.{d}, 0.5, 18);
+        try g.evalAll(&.{ w, bias, qn, kn, pn, fnw });
+        var diag: sdk.Diag = .{};
+        var k = install(a, s, &c, .{ .w = w, .bias = bias, .next_w = w, .next_bias = bias, .q_norm = qn, .k_norm = kn, .post_attn_norm = pn, .pre_ff_norm = fnw }, &diag) catch |err| {
+            std.debug.print("beam glue install refused: {s}\n", .{diag.message()});
+            return err;
+        };
+        defer k.deinit();
+        var calls: usize = 0;
+        var i: u32 = 2;
+        while (i <= 2 * c.n_layers + 1) : (i += 1) {
+            const m = g.mark();
+            defer g.resetTo(m);
+            // A sublayer's output of a few magnitudes (an attention's, an MLP's) and a residual stream of order ten.
+            const y = try testBf16(a, &g, &.{ 1, d }, if (i % 2 == 0) 1.0 else 8.0, 1800 + i);
+            const r = try testBf16(a, &g, &.{ 1, d }, 4.0, 1900 + i);
+            const want = try graph.boundaryStock(&g, &c, y, r, pn, fnw, i);
+            const got = try addNorm(&g, &k, y, r, pn, fnw, i);
+            try sameBytes(&g, "residual", want.res, got.res, null);
+            try sameBytes(&g, "normed row", want.out, got.out, null);
+            calls += 1;
+        }
+        std.debug.print("BEAM GLUE add_norm hidden {d} ({d} threads): {d} sublayer boundaries bit-equal\n", .{ geo.hidden, normThreads(geo.hidden), calls });
     }
 }
 
@@ -634,8 +756,10 @@ test "beam glue GPU bench: a step's routers, the stock ops against the texts at 
     try g.evalAll(&bs);
     const qn = try testBf16(a, &g, &.{@intCast(geo.head_dim)}, 0.5, 15);
     const kn = try testBf16(a, &g, &.{@intCast(geo.head_dim)}, 0.5, 16);
+    const pn = try testBf16(a, &g, &.{d}, 0.5, 17);
+    const fnw = try testBf16(a, &g, &.{d}, 0.5, 18);
     var diag: sdk.Diag = .{};
-    var k = try install(a, s, &c, .{ .w = ws[0], .bias = bs[0], .next_w = ws[1], .next_bias = bs[1], .q_norm = qn, .k_norm = kn }, &diag);
+    var k = try install(a, s, &c, .{ .w = ws[0], .bias = bs[0], .next_w = ws[1], .next_bias = bs[1], .q_norm = qn, .k_norm = kn, .post_attn_norm = pn, .pre_ff_norm = fnw }, &diag);
     defer k.deinit();
     const x = g.keep(try testBf16(a, &g, &.{ 1, d }, 1, 400));
     defer g.release(x);

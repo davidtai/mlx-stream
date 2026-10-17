@@ -35,11 +35,13 @@ pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "e
 
 /// The decode lane's glue, installed once at construction: `fused` (the default) the router's and the predictor's texts
 /// (glue.zig: the router's product and its tail in two launches, the predictor's in one), each layer's q, k, v and gate
-/// projections in one buffer and one GEMV (graph.zig `fuseProjections`) and its q / k norms with RoPE or the query scale
-/// in one launch (glue.zig `qkNorm`), each bit for bit the stock ops; `ops` the stock op chain (the router's input cast,
-/// GEMV and 17 ops; the predictor's four; four projection GEMVs; two norms and two ropes, or two norms and a scale). The default
-/// resolves to `ops` where the texts do not register the model's router (another routed geometry) or on a CPU stream
-/// (`decodeGlueRoute`); `fused` named there refuses the load by name.
+/// projections in one buffer and one GEMV (graph.zig `fuseProjections`), its q / k norms with RoPE or the query scale
+/// in one launch (glue.zig `qkNorm`) and each sublayer boundary (the sublayer's norm, the depth-scaled add, the next
+/// sublayer's norm) in one launch (glue.zig `addNorm`), each bit for bit the stock ops; `ops` the stock op chain (the
+/// router's input cast, GEMV and 17 ops; the predictor's four; four projection GEMVs; two norms and two ropes, or two
+/// norms and a scale; a boundary's two norms and its add). The default resolves to `ops` where the texts do not
+/// register the model's router (another routed geometry) or on a CPU stream (`decodeGlueRoute`); `fused` named there
+/// refuses the load by name.
 pub const DecodeGlue = enum { fused, ops };
 
 pub const PromptResidents = expert_usage.PromptResidents;
