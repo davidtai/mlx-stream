@@ -3,10 +3,12 @@
 //! (P <= 64: up to 8 tokens of top-8), ids packed `bank << 24 | slot row`:
 //!   - gate/up: gate + up of every routed pair, then the arch's SwiGLU, bf16 [P, inter];
 //!   - down: each pair's down row, bf16 [P, hidden] (no score fold: the arch's combine follows).
-//! The texts live under src/kernels/nvfp4/ on one helper header (header_glm5n_nvfp4.metal: the slot ids, the global
-//! scale's line, the E4M3 decode, the k1 decode and dot, the activation load, the f32 sigmoid, the union vote): the k1
-//! texts (glm5n_nvfp4_*: GLM-5.3-Flash's), MiMo's k1 dot over MLX's dequantized weights, rounding-class against MLX's
-//! gather_qmm nvfp4, with the clamped SwiGLU (template LIMIT).
+//! The texts live under src/kernels/nvfp4/ in two families on one helper header (header_glm5n_nvfp4.metal: the slot
+//! ids, the global scale's line, the E4M3 decode, the activation load, the f32 sigmoid, the union vote):
+//!   - k1 (glm5n_nvfp4_*: GLM-5.3-Flash's): MiMo's k1 dot over MLX's dequantized weights, rounding-class against MLX's
+//!     gather_qmm nvfp4; the clamped SwiGLU (template LIMIT);
+//!   - qmv (nvfp4_qmv_*, header_nvfp4_qmv.metal: beam's): MLX's gather_qmv_fast arithmetic in its order, so each pair's
+//!     row is the stock route's bit for bit; the f32 SwiGLU.
 //! `KernelsOf(C)` is one arch's set. The case `C` names its kernels and headers (enums whose tags are the texts' names),
 //! its manifest file and pin, the manifest's format, its routed geometry and its activation; the registry, the plan,
 //! the launches, `Fused` and `install` are the same for every case. Each case has its own manifest
@@ -27,7 +29,7 @@
 //!   Kernel: enum                    two tags: the gate/up text's name, then the down text's (each `<tag>.metal`)
 //!   Header: enum                    the headers' names (each `header_<tag>.metal`), in the order the texts include them
 //!   hidden, inter, top_k: u32       the routed experts the texts are registered at
-//!   activation: quant.Activation    `.swiglu_clamped` (the LIMIT template parameter) or `.swiglu_f32` (no LIMIT)
+//!   activation: quant.Activation    `.swiglu_clamped` (the LIMIT template parameter) or `.swiglu_f32`
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;

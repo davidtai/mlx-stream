@@ -47,8 +47,14 @@ pub const Inputs = struct {
     combine: prefill_combine.Route = .inplace,
     /// MiMo's X12 keep-warm route (the setting's, not the stream's resolution: MiMo's rule).
     gpu_keep_warm: gpu_warm.Route = .off,
+    /// The decode lane's expert route as billed (`Config.decodeMoeBilled`: the GPU stream's resolution).
+    decode_moe: settings.DecodeMoe = .stock,
     page: u64 = 16_384,
 };
+
+/// The fused decode route's kernel set and prepared launches, declared (`decode_kernels` term): glm5_next's declaration
+/// for the same set's shape (two texts, four instantiations, 128 prepared launches).
+pub const fused_kernels_bytes: u64 = 16 << 20;
 
 /// The pack's residents (graph.zig `keptResident`), refused by beam's names.
 pub fn residentBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const beam.Config, page: u64) !route_bill.Residents {
@@ -204,7 +210,8 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
     return a.dupe(Term, &terms);
 }
 
-/// The shared route's inputs at this bill's geometry: the NVFP4 tile, the source's own sizes, no decode texts.
+/// The shared route's inputs at this bill's geometry: the NVFP4 tile, the source's own sizes, the decode texts under
+/// `decode_moe: fused`.
 fn routeInputs(in: *const Inputs) route_bill.Inputs {
     return .{
         .geometry = in.geometry,
@@ -223,6 +230,7 @@ fn routeInputs(in: *const Inputs) route_bill.Inputs {
         // `swiglu_f32` (experts.zig `expertActivation`): gate and up widened to f32 (8 B a column) and the f32 product
         // (4 B), past MiMo's activation's own rate; 4 more bytes a column than its 24 at most.
         .activation_extra_bytes = 4,
+        .decode_kernels = if (in.decode_moe == .fused) fused_kernels_bytes else 0,
     };
 }
 
@@ -247,6 +255,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .reserve = reserve,
         .combine = experts.combineRouteOf(cfg.model.hidden_size, cfg.model.n_experts_per_tok),
         .gpu_keep_warm = cfg.gpu_keep_warm,
+        .decode_moe = cfg.decodeMoeBilled(),
         .page = page,
     };
 }
@@ -320,8 +329,14 @@ test "beam bill: the terms sum to the bill, the slot wiring is the one row term,
     try testing.expectEqual(@as(u64, 22_122_496), in.geometry.record_bytes);
     try testing.expect(in.geometry.slot_row_bytes <= in.geometry.record_bytes);
     try testing.expectEqual(@as(u64, 49 * 22_122_496), b.per_row);
-    // No fused decode texts: the shared route's term is 0.
+    // The stock decode route: no decode texts (the shared route's term is 0); the fused route declares its set.
     try testing.expectEqual([2]u64{ 0, 0 }, termOf(b, "decode_kernels"));
+    var fused_in = in;
+    fused_in.decode_moe = .fused;
+    const bf = try billOf(a, &fused_in);
+    defer bf.free(a);
+    try testing.expectEqual([2]u64{ fused_kernels_bytes, fused_kernels_bytes }, termOf(bf, "decode_kernels"));
+    try testing.expectEqual(b.fixed(.decode) + fused_kernels_bytes, bf.fixed(.decode));
     // The KV lanes: 9 full layers' slabs (8 x 128 x 2 B a position, K and V) and 43 sliding layers' rings of two slots
     // at the base 1,040 (512 + 8 + 8 + 512), K and V.
     try testing.expectEqual(@as(u64, 1040), kv.ringBase(512));

@@ -334,6 +334,63 @@ test "beam parity: the served pack's logits match the numpy reference (BEAM_PARI
 /// `slice_rows` rows a layer: the stream misses and evicts, a long prompt crosses the 512-row tiles and the window.
 pub const slice_rows: u32 = 64;
 
+/// Every row's logits of one reference's ids served at `rows` under `decode_moe` (the reference's routes forced, so the
+/// two routes see the same experts): the prompt pass's rows, then each decode step's. Caller frees.
+fn servedLogits(a: std.mem.Allocator, dir: []const u8, prefix: []const u8, rows: u32, decode_moe: settings.DecodeMoe) ![]f32 {
+    const io = testing.io;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var pack_dir = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    const text = try pack_dir.readFileAlloc(io, "config.json", a, .limited(1 << 20));
+    pack_dir.close(io);
+    defer a.free(text);
+    var diag: beam.Diag = .{};
+    const model = try beam.Config.parse(a, text, &diag);
+    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .expert_rows = rows, .expert_prefill_rows = rows, .decode_moe = decode_moe, .decode_moe_requested = true };
+    try cfg.validate();
+    var weights = try sdk.loader.dir(io, a, dir, .{});
+    defer weights.deinit();
+    const m = try module.Module.init(a, io, &cfg, &weights, s, 64 << 30, 2 << 30);
+    defer m.deinit();
+    var ref = try readRef(a, io, prefix, model.moeLayers());
+    defer ref.deinit(a);
+    const out = try a.alloc(f32, ref.ids.len * ref.vocab);
+    errdefer a.free(out);
+    const chosen = try a.alloc(u32, ref.routes.len);
+    defer a.free(chosen);
+    const fr: graph.ForcedRoutes = .{ .ids = ref.routes, .chosen = chosen, .positions = ref.ids.len, .k = ref.k };
+    const prompt = ref.ids[0..ref.prompt];
+    try m.beginPrompt(prompt);
+    const all = try m.promptCalls(prompt, .all, &fr);
+    defer m.g.release(all);
+    @memcpy(out[0 .. prompt.len * ref.vocab], try hostRows(m, all, prompt.len, ref.vocab));
+    try m.enterDecode(prompt.len);
+    for (ref.prompt..ref.ids.len) |i| {
+        const x = try m.stepWith(ref.ids[i .. i + 1], &fr);
+        defer m.g.release(x);
+        @memcpy(out[i * ref.vocab ..][0..ref.vocab], try hostRows(m, x, 1, ref.vocab));
+    }
+    m.requestEnd();
+    return out;
+}
+
+test "beam parity: on the real-weight slice the fused decode experts give the stock route's logits, bit for bit (BEAM_PARITY_SLICE, BEAM_PARITY_SLICE_REF)" {
+    const dir = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE") orelse return error.SkipZigTest);
+    const refs = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE_REF") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var it = std.mem.splitScalar(u8, refs, ',');
+    while (it.next()) |prefix| {
+        const stock = try servedLogits(a, dir, prefix, slice_rows, .stock);
+        defer a.free(stock);
+        const fused = try servedLogits(a, dir, prefix, slice_rows, .fused);
+        defer a.free(fused);
+        var differ: usize = 0;
+        for (stock, fused) |x, y| differ += @intFromBool(@as(u32, @bitCast(x)) != @as(u32, @bitCast(y)));
+        std.debug.print("BEAM PARITY {s} fused vs stock decode experts: {d} logits, {d} differ\n", .{ std.fs.path.basename(prefix), stock.len, differ });
+        try testing.expectEqual(@as(usize, 0), differ);
+    }
+}
+
 test "beam parity: the real-weight slice at 64 of 256 rows (BEAM_PARITY_SLICE, BEAM_PARITY_SLICE_REF)" {
     const dir = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE") orelse return error.SkipZigTest);
     const refs = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE_REF") orelse return error.SkipZigTest);

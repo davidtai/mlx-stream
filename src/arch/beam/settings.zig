@@ -4,8 +4,9 @@
 //! splits the decode rows between the routed layers (`uniform`, the default, or offsets summing to 0); the rate tally's
 //! keys (`expert_resident_ratio`, `expert_tally_window`, `expert_tally_file`: sdk_ext/expert/tally.zig, every streamed
 //! arch's), the usage seed and record (`resident_seed`, `expert_usage_record`, `expert_usage_label`: usage.zig),
-//! `prompt_residents` (keep, the default, or forget) and MiMo's X12 keep-warm (`gpu_keep_warm`: waits, the default, or
-//! off). Beam has no draft lane and no fused decode texts: there is no lane or route key.
+//! `prompt_residents` (keep, the default, or forget), MiMo's X12 keep-warm (`gpu_keep_warm`: waits, the default, or
+//! off) and the decode lane's expert route (`decode_moe`: fused, the default, or stock). Beam has no draft lane: there
+//! is no lane key.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -14,6 +15,7 @@ const sdk_settings = @import("../../sdk_ext/settings.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const expert_tally = @import("../../sdk_ext.zig").expert.tally;
 const expert_usage = @import("../../sdk_ext.zig").expert.usage;
+const decode_kernels = @import("decode_kernels.zig");
 
 /// The context a load bills when the model sets none: the standard request (16,384 prompt tokens and 1,024 generated).
 pub const fill_reserve_tokens: u64 = 16_384 + 1_024;
@@ -29,7 +31,14 @@ pub const reader_staging_bytes: u64 = 16 << 20;
 pub const default_tally_ratio: f64 = 0;
 
 /// Every key `applySettings` reads; `expert_streaming.settings` may name these and nothing else (`unknownSetting`).
-pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "expert_rows_by_layer", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "prompt_residents", "gpu_keep_warm" } ++ expert_usage.keys;
+pub const setting_keys = [_][]const u8{ "expert_rows", "expert_prefill_rows", "expert_rows_by_layer", "expert_resident_ratio", "expert_tally_window", "expert_tally_file", "prompt_residents", "gpu_keep_warm", "decode_moe" } ++ expert_usage.keys;
+
+/// The decode lane's routed-expert route, installed once at construction: `fused` (the default) the qmv texts
+/// (decode_kernels.zig: gate + up + the f32 SwiGLU, then down, one launch of each per wave over the three banks; bit for
+/// bit the stock route's rows), `stock` MLX's gather_qmm nvfp4 per bank (two gathers and the f32 SwiGLU, then a gather
+/// per down). The default resolves to `stock` where the set is not registered (another routed geometry: a test
+/// fixture's) or on a CPU stream (`decodeMoeRoute`); `fused` named there refuses the load by name.
+pub const DecodeMoe = enum { fused, stock };
 
 pub const PromptResidents = expert_usage.PromptResidents;
 pub const LayerRows = sdk_settings.LayerRows;
@@ -60,6 +69,8 @@ pub const Config = struct {
     tally: expert_tally.Settings = .{ .ratio = default_tally_ratio },
     gpu_keep_warm: gpu_warm.Route = .waits,
     gpu_keep_warm_requested: bool = false,
+    decode_moe: DecodeMoe = .fused,
+    decode_moe_requested: bool = false,
     malformed: Malformed = .{},
     /// The load's facts.
     memory_baseline_bytes: ?u64 = null,
@@ -67,7 +78,7 @@ pub const Config = struct {
     effective_context: ?u64 = null,
     kv_quant_bits: ?u8 = null,
 
-    pub const Malformed = struct { rows: bool = false, prompt_residents: bool = false, gpu_keep_warm: bool = false };
+    pub const Malformed = struct { rows: bool = false, prompt_residents: bool = false, gpu_keep_warm: bool = false, decode_moe: bool = false };
 
     /// The pack's `expert_streaming.settings` object (after `unknownSetting`), or a host's per-model settings object.
     pub fn applySettings(c: *Config, raw: std.json.Value) void {
@@ -82,8 +93,29 @@ pub const Config = struct {
             if (r == .invalid) c.malformed.gpu_keep_warm = true else c.gpu_keep_warm = r;
             c.gpu_keep_warm_requested = true;
         }
+        if (sdk_settings.route(DecodeMoe, o, "decode_moe", &c.decode_moe, &c.malformed.decode_moe)) c.decode_moe_requested = true;
         _ = c.tally.apply(o);
         _ = c.residency.apply(o);
+    }
+
+    /// The model's routed experts are the fused set's (decode_kernels.zig `registeredAt`).
+    pub fn fusedRegistered(c: *const Config) bool {
+        return decode_kernels.registeredAt(c.model.hidden_size, c.model.moe_intermediate_size, c.model.n_experts_per_tok);
+    }
+
+    /// The decode route the construction installs on a stream (`gpu`: the stream runs on the GPU): the setting's, except
+    /// that the DEFAULT resolves to `stock` where the fused set is not registered or on a CPU stream (the texts need a
+    /// GPU stream); `fused` named on a CPU stream refuses by name (`validate` refuses it on another geometry).
+    pub fn decodeMoeRoute(c: *const Config, gpu: bool) !DecodeMoe {
+        if (c.decode_moe == .stock) return .stock;
+        if (!c.fusedRegistered()) return .stock;
+        if (!gpu) return if (c.decode_moe_requested) error.BeamDecodeMoeNeedsGpu else .stock;
+        return .fused;
+    }
+
+    /// The decode route the bill charges (`decodeMoeRoute` on a GPU stream: an upper bound on a CPU stream).
+    pub fn decodeMoeBilled(c: *const Config) DecodeMoe {
+        return if (c.decode_moe == .fused and c.fusedRegistered()) .fused else .stock;
     }
 
     /// The keep-warm route the construction installs on a stream (`gpu`: the stream runs on the GPU): the setting's,
@@ -115,6 +147,8 @@ pub const Config = struct {
         if (c.malformed.rows) return error.BeamExpertRowsSetting;
         if (c.malformed.prompt_residents) return error.BeamPromptResidentsSetting;
         if (c.malformed.gpu_keep_warm) return error.BeamGpuKeepWarmSetting;
+        if (c.malformed.decode_moe) return error.BeamDecodeMoeSetting;
+        if (c.decode_moe_requested and c.decode_moe == .fused and !c.fusedRegistered()) return error.BeamDecodeMoeUnregistered;
         try c.tally.check("beam");
         try c.residency.check("beam");
         c.expert_rows_by_layer.check(c.model.moeLayers()) catch |e| return switch (e) {
@@ -172,10 +206,39 @@ test "beam settings: every bad value refuses by name; an unknown key (a lane, a 
         .{ .text = "{\"expert_rows_by_layer\":[1,-1]}", .err = error.BeamExpertRowsByLayerLength },
         .{ .text = "{\"expert_resident_ratio\":2}", .err = error.ResidentRatioOutOfRange },
         .{ .text = "{\"resident_seed\":\"some\"}", .err = error.ResidentSeedSetting },
+        .{ .text = "{\"decode_moe\":\"hitpass\"}", .err = error.BeamDecodeMoeSetting },
+        .{ .text = "{\"decode_moe\":1}", .err = error.BeamDecodeMoeSetting },
     }) |case| try testing.expectError(case.err, (try parseSettings(case.text)).validate());
-    for ([_][]const u8{ "{\"mtp_lane\":true}", "{\"decode_moe\":\"fused\"}", "{\"draft_depth\":2}" }) |text|
+    for ([_][]const u8{ "{\"mtp_lane\":true}", "{\"decode_glue\":\"fused\"}", "{\"draft_depth\":2}" }) |text|
         try testing.expectError(error.BeamSettingUnknown, parseSettings(text));
     var c: Config = .{};
     c.kv_quant_bits = 8;
     try testing.expectError(error.BeamKvQuantUnsupported, c.validate());
+}
+
+test "beam settings: decode_moe: fused by default where the set is registered, stock elsewhere or on a CPU stream; named fused refuses there" {
+    const d: Config = .{};
+    try d.validate();
+    try testing.expectEqual(DecodeMoe.fused, try d.decodeMoeRoute(true));
+    try testing.expectEqual(DecodeMoe.stock, try d.decodeMoeRoute(false));
+    try testing.expectEqual(DecodeMoe.fused, d.decodeMoeBilled());
+    const st = try parseSettings("{\"decode_moe\":\"stock\"}");
+    try st.validate();
+    try testing.expectEqual(DecodeMoe.stock, try st.decodeMoeRoute(true));
+    try testing.expectEqual(DecodeMoe.stock, st.decodeMoeBilled());
+    const named = try parseSettings("{\"decode_moe\":\"fused\"}");
+    try named.validate();
+    try testing.expectEqual(DecodeMoe.fused, try named.decodeMoeRoute(true));
+    try testing.expectError(error.BeamDecodeMoeNeedsGpu, named.decodeMoeRoute(false));
+    // A fixture's narrow trunk: the default resolves to stock; fused named is refused.
+    var fixture: Config = .{};
+    fixture.model.hidden_size = 256;
+    fixture.model.moe_intermediate_size = 128;
+    fixture.model.n_experts_per_tok = 2;
+    try fixture.validate();
+    try testing.expectEqual(DecodeMoe.stock, try fixture.decodeMoeRoute(true));
+    try testing.expectEqual(DecodeMoe.stock, fixture.decodeMoeBilled());
+    var fixture_named = named;
+    fixture_named.model = fixture.model;
+    try testing.expectError(error.BeamDecodeMoeUnregistered, fixture_named.validate());
 }

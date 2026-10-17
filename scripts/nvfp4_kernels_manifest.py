@@ -4,6 +4,7 @@ the texts beside it (each text's sha256 and size, both kernels' signatures, temp
 instantiations and checks) and print its sha256, the pin of the case's Zig file:
 
   glm5_next  manifest_glm5_next.json  the k1 texts at GLM-5.3-Flash's experts    src/arch/glm5_next/decode_kernels.zig
+  beam       manifest_beam.json       the qmv texts at Beam 1.0's experts        src/arch/beam/decode_kernels.zig
 
   scripts/nvfp4_kernels_manifest.py [--check] [case ...]     (no case: every case)
 --check writes nothing and exits 1 when a manifest on disk is not the one the texts give."""
@@ -34,6 +35,9 @@ CASES = {
     "glm5_next": {"manifest": "manifest_glm5_next.json", "format": "mlx-stream-glm5next-nvfp4-kernels-v1",
                   "gate_up": "glm5n_nvfp4_gateup", "down": "glm5n_nvfp4_down", "headers": ["glm5n_nvfp4"],
                   "hidden": 4096, "inter": 2048, "limit": 10},
+    "beam": {"manifest": "manifest_beam.json", "format": "mlx-stream-nvfp4-decode-kernels-v1",
+             "gate_up": "nvfp4_qmv_gateup", "down": "nvfp4_qmv_down", "headers": ["glm5n_nvfp4", "nvfp4_qmv"],
+             "hidden": 5120, "inter": 2560, "limit": 0},
 }
 
 
