@@ -165,6 +165,22 @@ The bound is 0.05 because the reference rounds each BF16 tensor where modeling_b
 reduce in a different order. The result is a few BF16 ulps of the residual stream through the layers. On the fixture
 the largest difference is 0.046 (a 700-row prompt) with logits up to 1.5.
 
+The second case is the real-weight slice (`BEAM_PARITY_SLICE`, `BEAM_PARITY_SLICE_REF`): layers 0-5 of Beam 1.0 at
+its geometry (hidden 5,120, 3 routed layers of 256 experts, top 8, 48/8 heads, window 512), at 64 rows a routed layer,
+with a 700-row prompt and 4 decode steps. Its logits are large (up to 30, a row's deviation 7) and very sensitive to
+rounding: the script's twin (`--twin`: the same rows on the same routes, nothing rounded to BF16) moves them by 0.40 a
+row (median), 1.78 at most. Thus each row's bound there is 2 x the twin's difference on that row, at least 0.05. At least
+90 % of the rows must hold their bounds, and the argmax must be the reference's on each row whose top-2 margin clears
+its bound.
+
+| Case | Rows | Max difference | Rows in bound | Argmax (checked rows) | Router's own choice |
+|---|---|---|---|---|---|
+| Fixture, 40 + 8 | 48 | 0.042 | 48 of 48 | 17 of 17 | 190 of 192 (129 of 129 decisive) |
+| Fixture, 700 + 4 | 704 | 0.046 | 704 of 704 | 252 of 252 | 2,755 of 2,816 (1,873 of 1,873 decisive) |
+| Real slice, 700 + 4, 64 of 256 rows | 704 | 1.49 (2.4 x its twin) | 656 of 704 | 240 of 240 | 2,005 of 2,112 (no choice clears 0.05) |
+
+On the slice the stream missed 1,312 times, hit 409 times, evicted 209 times and read 32.0 GB.
+
 The fixture serves at the fill's rows only (8 of 8 experts). With fewer rows, the stream floors each slot array at
 one page. Then the E4M3 scales of a projection (2 KiB a slot on the fixture) hold more slots than its words, and
 MLX's `gather_qmm` refuses that. The construction refuses it first (`BeamSlotArrays`). Beam's own scales are 800 KiB a
@@ -220,5 +236,4 @@ arguments, on `/v1/chat/completions` and `/v1/messages`, streamed and not stream
   needs its own kernel manifest.
 - A Beam reading of the host runtime and the compiled kernels. The bill uses MiMo's declared values.
 - The lookahead selector's top-k is the bank's fixed 8 (`routed_top_k`). It only selects reads.
-- Expert evictions in the parity test: the fixture's geometry serves only at 8 of 8 rows (see Parity).
 - A profile build and the benchmark record.

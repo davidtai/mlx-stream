@@ -2,7 +2,11 @@
 //! on the GPU stream (the module's construction, its prompt pass, its serial decode steps) beside the reference's
 //! logits for the same token ids.
 //!
-//!   BEAM_PARITY=<pack dir> BEAM_PARITY_REF=<prefix>[,<prefix>...]
+//!   BEAM_PARITY=<pack dir> BEAM_PARITY_REF=<prefix>[,<prefix>...]               (the fill's rows)
+//!   BEAM_PARITY_SLICE=<pack dir> BEAM_PARITY_SLICE_REF=<prefix>[,<prefix>...]   (64 rows a routed layer)
+//!
+//! The second is the real-weight slice (layers 0-5 of Beam 1.0 at its geometry: 3 routed layers of 256 experts), at
+//! fewer rows than experts so that the stream misses and evicts.
 //!
 //! Each prefix names the script's PREFIX.json (the ids, the prompt's length, every routed layer's choice and its
 //! margin by row) and PREFIX.f32 (every row's logits, f32 [rows, vocab]). The prompt pass returns every prompt row's
@@ -22,6 +26,12 @@
 //! - every routed choice whose reference margin is at least `route_tol`: the router's own choice (recorded beside the
 //!   forced one) is the reference's set of experts.
 //!
+//! Where the reference has a twin (the script's `--twin`: the same rows on the same routes with nothing rounded to
+//! BF16), a row's bound is `twin_factor` times the twin's difference from the reference on that row, at least
+//! `abs_tol`: the real-weight slice moves by up to 1.8 between the two, so its bound is the model's own sensitivity. With a
+//! twin, at least `twin_within` of the rows hold their bounds and the argmax is the reference's on every row whose top-2
+//! margin clears its bound.
+//!
 //! Then each case runs again on the served routes, and the test prints the share of rows within `abs_tol` (a report:
 //! the near ties decide it).
 
@@ -35,8 +45,16 @@ const module = @import("module.zig");
 
 const testing = std.testing;
 
-/// The parity bound on the soft-capped logits (absolute).
+/// The parity bound on the soft-capped logits (absolute), and its floor where the reference has a twin.
 pub const abs_tol: f32 = 0.05;
+/// With the reference's twin (PREFIX.twin.f32: the same forward on the same routes, nothing rounded to BF16), a row's
+/// bound is `twin_factor` times the twin's own difference from the reference on that row (the model's sensitivity to
+/// BF16 rounding), at least `abs_tol`. The real-weight slice moves its logits by up to 1.8 between the two (logits up
+/// to 30, row deviation 7): a fixed bound cannot tell its rounding from an error there. The served path rounds at
+/// other points than either, so a row can sit past its twin's bound: with a twin the verdict is the share of rows
+/// within their bounds (`twin_within`) and the argmax on every row whose top-2 margin clears its bound.
+pub const twin_factor: f32 = 2;
+pub const twin_within: f32 = 0.9;
 /// A routed choice that clears the next candidate by this much (the reference's gap: a group score over the next group's,
 /// the k-th choice score over the next expert's) is decisive. A group score sums two sigmoid scores, so its served
 /// deviation is up to twice a score's: at 0.02 one group choice of 2,401 decisive ones flipped on the 700-row case
@@ -52,12 +70,16 @@ const Ref = struct {
     margins: []f32,
     routes: []u32,
     k: usize,
+    /// Each row's bound (`abs_tol`, or `twin_factor` x the twin's difference).
+    bounds: []f32,
+    twin: bool = false,
 
     fn deinit(r: *Ref, a: std.mem.Allocator) void {
         a.free(r.ids);
         a.free(r.logits);
         a.free(r.margins);
         a.free(r.routes);
+        a.free(r.bounds);
     }
 
     fn row(r: *const Ref, i: usize) []const f32 {
@@ -89,7 +111,25 @@ fn readRef(a: std.mem.Allocator, io: std.Io, prefix: []const u8, moe_layers: usi
     errdefer a.free(ids);
     const margins = try a.dupe(f32, v.route_margins);
     errdefer a.free(margins);
-    return .{ .ids = ids, .prompt = v.prompt_tokens, .vocab = v.vocab, .logits = logits, .margins = margins, .routes = try a.dupe(u32, v.routes), .k = v.route_k };
+    const bounds = try a.alloc(f32, v.rows);
+    errdefer a.free(bounds);
+    @memset(bounds, abs_tol);
+    var has_twin = false;
+    const twin_path = try std.fmt.allocPrint(a, "{s}.twin.f32", .{prefix});
+    defer a.free(twin_path);
+    if (cwd.readFileAlloc(io, twin_path, a, .limited(1 << 30))) |twin| {
+        defer a.free(twin);
+        if (twin.len != raw.len) return error.BeamParityRef;
+        const t = std.mem.bytesAsSlice(f32, twin);
+        for (bounds, 0..) |*b, i| {
+            var d: f32 = 0;
+            for (logits[i * v.vocab ..][0..v.vocab], t[i * v.vocab ..][0..v.vocab]) |x, y| d = @max(d, @abs(x - y));
+            b.* = @max(abs_tol, twin_factor * d);
+        }
+        has_twin = true;
+    } else |e| if (e != error.FileNotFound) return e;
+    const routes = try a.dupe(u32, v.routes);
+    return .{ .ids = ids, .prompt = v.prompt_tokens, .vocab = v.vocab, .logits = logits, .margins = margins, .routes = routes, .k = v.route_k, .bounds = bounds, .twin = has_twin };
 }
 
 fn argmax(x: []const f32) usize {
@@ -118,6 +158,9 @@ const Tally = struct {
     within: usize = 0,
     max_diff: f32 = 0,
     max_row: usize = 0,
+    /// The worst row's difference over its bound, and the largest bound.
+    max_ratio: f32 = 0,
+    max_bound: f32 = 0,
     argmax_checked: usize = 0,
     failed: bool = false,
     printed: usize = 0,
@@ -127,19 +170,23 @@ const Tally = struct {
         const want = ref.row(i);
         var d: f32 = 0;
         for (want, got) |x, y| d = @max(d, @abs(x - y));
+        const bound = ref.bounds[i];
         t.rows += 1;
         if (d > t.max_diff) {
             t.max_diff = d;
             t.max_row = i;
         }
-        if (d <= abs_tol) t.within += 1;
+        t.max_ratio = @max(t.max_ratio, d / bound);
+        t.max_bound = @max(t.max_bound, bound);
+        if (d <= bound) t.within += 1;
         if (!strict) return;
-        if (d > abs_tol) {
-            t.failed = true;
-            if (t.printed < 24) std.debug.print("beam parity:   row {d}: max |logit diff| {d:.5} over the bound {d}\n", .{ i, d, abs_tol });
+        if (d > bound) {
+            // Without a twin every row holds its bound; with one, the share of rows does (`check`).
+            if (!ref.twin) t.failed = true;
+            if (t.printed < 24) std.debug.print("beam parity:   row {d}: max |logit diff| {d:.5} over the bound {d:.5}\n", .{ i, d, bound });
             t.printed += 1;
         }
-        if (margin(want) > 2 * abs_tol) {
+        if (margin(want) > (if (ref.twin) bound else 2 * bound)) {
             t.argmax_checked += 1;
             if (argmax(want) != argmax(got)) {
                 t.failed = true;
@@ -149,7 +196,7 @@ const Tally = struct {
     }
 
     fn line(t: *const Tally, label: []const u8, phase: []const u8) void {
-        std.debug.print("BEAM PARITY {s} {s}: {d} rows max_diff {d:.5} (row {d}), {d} within {d}, argmax checked {d}\n", .{ label, phase, t.rows, t.max_diff, t.max_row, t.within, abs_tol, t.argmax_checked });
+        std.debug.print("BEAM PARITY {s} {s}: {d} rows max_diff {d:.5} (row {d}), worst diff / bound {d:.3}, bounds up to {d:.4}, {d} within, argmax checked {d}\n", .{ label, phase, t.rows, t.max_diff, t.max_row, t.max_ratio, t.max_bound, t.within, t.argmax_checked });
     }
 };
 
@@ -182,7 +229,17 @@ fn checkChoices(ref: *const Ref, chosen: []const u32, label: []const u8) !void {
             if (differ <= 8) std.debug.print("beam parity:   routed layer {d} row {d}: the router chose {any}, the reference {any} (margin {d:.5})\n", .{ l, r, got[0..ref.k], want[0..ref.k], ref.margins[l * rows + r] });
         }
     };
-    std.debug.print("BEAM PARITY {s} routes: {d} decisive choices of {d}, {d} differ\n", .{ label, decisive, layers * rows, differ });
+    var same: usize = 0;
+    for (0..layers * rows) |i| {
+        var want: [8]u32 = undefined;
+        var got: [8]u32 = undefined;
+        @memcpy(want[0..ref.k], ref.routes[i * ref.k ..][0..ref.k]);
+        @memcpy(got[0..ref.k], chosen[i * ref.k ..][0..ref.k]);
+        std.mem.sort(u32, want[0..ref.k], {}, std.sort.asc(u32));
+        std.mem.sort(u32, got[0..ref.k], {}, std.sort.asc(u32));
+        same += @intFromBool(std.mem.eql(u32, want[0..ref.k], got[0..ref.k]));
+    }
+    std.debug.print("BEAM PARITY {s} routes: {d} decisive choices of {d}, {d} differ; every choice: {d} of {d} the reference's set\n", .{ label, decisive, layers * rows, differ, same, layers * rows });
     if (differ > 0) return error.BeamParityRoutes;
 }
 
@@ -211,13 +268,18 @@ fn runCase(a: std.mem.Allocator, m: *module.Module, ref: *const Ref, label: []co
     tp.line(label, if (forced) "forced routes, prompt" else "served routes, prompt");
     td.line(label, if (forced) "forced routes, decode" else "served routes, decode");
     if (!forced) return;
+    // The router's choices are reported (and decisive ones held) before the logits' verdict.
+    const routes_ok = checkChoices(ref, chosen, label);
     if (tp.failed or td.failed) return error.BeamParityBound;
-    try checkChoices(ref, chosen, label);
+    if (ref.twin and @as(f32, @floatFromInt(tp.within + td.within)) < twin_within * @as(f32, @floatFromInt(tp.rows + td.rows))) {
+        std.debug.print("beam parity: {s}: {d} of {d} rows within their twin bounds, under {d}\n", .{ label, tp.within + td.within, tp.rows + td.rows, twin_within });
+        return error.BeamParityWithin;
+    }
+    try routes_ok;
 }
 
-test "beam parity: the served pack's logits match the numpy reference (BEAM_PARITY, BEAM_PARITY_REF)" {
-    const dir = std.mem.span(std.c.getenv("BEAM_PARITY") orelse return error.SkipZigTest);
-    const refs = std.mem.span(std.c.getenv("BEAM_PARITY_REF") orelse return error.SkipZigTest);
+/// One pack's references through one construction at `rows` (null: the fill's).
+fn parityRun(dir: []const u8, refs: []const u8, rows: ?u32) !void {
     const a = testing.allocator;
     const io = testing.io;
     const s = mlx.mlx_default_gpu_stream_new();
@@ -234,7 +296,7 @@ test "beam parity: the served pack's logits match the numpy reference (BEAM_PARI
     };
     // Every reference runs; the first failure is the test's.
     var first_err: ?anyerror = null;
-    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off };
+    const cfg: settings.Config = .{ .model = model, .model_dir = dir, .memory_baseline_bytes = 1 << 30, .effective_context = 2048, .gpu_keep_warm = .off, .expert_rows = rows, .expert_prefill_rows = rows };
     try cfg.validate();
     var weights = try sdk.loader.dir(io, a, dir, .{});
     defer weights.deinit();
@@ -254,8 +316,26 @@ test "beam parity: the served pack's logits match the numpy reference (BEAM_PARI
         };
     }
     const st = m.src.stats();
-    std.debug.print("BEAM PARITY stream: rows {d}/{d}, {d} misses, {d} hits, {d} B read\n", .{ m.rows.prompt, m.rows.decode, st.expert_cache_misses, st.expert_cache_hits, st.expert_bytes_read });
+    std.debug.print("BEAM PARITY stream: rows {d}/{d} of {d} experts, {d} misses, {d} hits, {d} evictions, {d} B read\n", .{ m.rows.prompt, m.rows.decode, model.n_routed_experts, st.expert_cache_misses, st.expert_cache_hits, st.expert_cache_evictions, st.expert_bytes_read });
     if (first_err) |e| return e;
     // Every record the routes name was read from the bank (P1's read-ahead reads them ahead of their routes: hits).
     try testing.expect(st.expert_bytes_read > 0 and st.expert_cache_hits > 0);
+    // Rows under the experts: the stream misses and evicts.
+    if (rows != null and rows.? < model.n_routed_experts) try testing.expect(st.expert_cache_misses > 0 and st.expert_cache_evictions > 0);
+}
+
+test "beam parity: the served pack's logits match the numpy reference (BEAM_PARITY, BEAM_PARITY_REF)" {
+    const dir = std.mem.span(std.c.getenv("BEAM_PARITY") orelse return error.SkipZigTest);
+    const refs = std.mem.span(std.c.getenv("BEAM_PARITY_REF") orelse return error.SkipZigTest);
+    try parityRun(dir, refs, null);
+}
+
+/// The real-weight slice (layers 0-5 of Beam 1.0: 3 dense, 3 routed layers of 256 experts at Beam's geometry) at
+/// `slice_rows` rows a layer: the stream misses and evicts, a long prompt crosses the 512-row tiles and the window.
+pub const slice_rows: u32 = 64;
+
+test "beam parity: the real-weight slice at 64 of 256 rows (BEAM_PARITY_SLICE, BEAM_PARITY_SLICE_REF)" {
+    const dir = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE") orelse return error.SkipZigTest);
+    const refs = std.mem.span(std.c.getenv("BEAM_PARITY_SLICE_REF") orelse return error.SkipZigTest);
+    try parityRun(dir, refs, slice_rows);
 }

@@ -2,10 +2,12 @@
 """The reference logits of a Beam pack for the beam arch's parity test (src/arch/beam/parity.zig).
 
     python3 -B -I scripts/beam_reference_logits.py --pack PACK --out PREFIX [--prompt 40] [--decode 8] [--seed 7]
+        [--decode-ids greedy|seeded] [--cache-gb 4]
 
 Reads the pack as mlx-stream serves it (config.json, the BF16 residents in model.safetensors, the NVFP4 expert bank
 experts.bin with expert-manifest.json: docs/nvfp4-pack.md) and runs modeling_beam.py's forward in numpy on the CPU:
-the prompt (PROMPT token ids from SEED), then DECODE greedy tokens, each the argmax of the previous row. Every row's
+the prompt (PROMPT token ids from SEED), then DECODE tokens: greedy (each the argmax of the previous row, a forward a
+token) or seeded (drawn from SEED, one forward: the parity test forces the tokens, so any sequence serves). Every row's
 logits are those of one causal forward over the whole sequence (a decode step's row is the sequence's row at its
 position).
 
@@ -15,13 +17,16 @@ dequantized in f32 by the bank's formula (MLX's nvfp4 dequantize: inv = g / 2688
 w = s x e2m1(code)). The attention's softmax runs in f32 and its output rounds to BF16.
 
 Writes PREFIX.json (the ids, the rows, the vocab, the per-row argmax and top-2 margin, the per-row routing margin: the
-least gap of a group or expert choice over the routed layers, every routed layer's chosen experts by row) and PREFIX.f32 (the logits, little-endian f32
-[rows, vocab], row-major). Stdlib and numpy only.
+least gap of a group or expert choice over the routed layers, every routed layer's chosen experts by row), PREFIX.f32 (the logits, little-endian f32
+[rows, vocab], row-major) and with `--twin` PREFIX.twin.f32 (the same rows with no BF16 rounding, on the same routes). The residents and the bank are mapped, never read whole (the full pack's experts.bin is
+277 GB): a tensor's bytes are read when the forward asks for them (the embedding's rows only), and the dequantized
+experts (157 MB each at Beam's geometry) sit in an LRU of `--cache-gb`. Stdlib and numpy only.
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import math
 import struct
@@ -59,38 +64,56 @@ E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5,
 
 
 class Safetensors:
+    """A safetensors file mapped, not read: each tensor's bytes come from the page cache when asked for."""
+
     def __init__(self, path: Path):
-        self.data = path.read_bytes()
-        n = struct.unpack("<Q", self.data[:8])[0]
-        self.header = json.loads(self.data[8 : 8 + n])
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            self.header = json.loads(f.read(n))
+        self.data = np.memmap(path, np.uint8, mode="r")
         self.base = 8 + n
 
-    def get(self, name: str) -> np.ndarray:
+    def raw(self, name: str) -> tuple[dict, np.ndarray]:
         h = self.header[name]
         lo, hi = h["data_offsets"]
-        raw = self.data[self.base + lo : self.base + hi]
-        if h["dtype"] == "BF16":
-            a = (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32)
-        elif h["dtype"] == "F32":
-            a = np.frombuffer(raw, np.float32)
-        else:
+        if h["dtype"] not in ("BF16", "F32"):
             raise SystemExit(f"{name}: dtype {h['dtype']} (BF16 / F32 read)")
-        return a.reshape(h["shape"]).astype(np.float32)
+        return h, self.data[self.base + lo : self.base + hi]
+
+    @staticmethod
+    def widen(h: dict, raw: np.ndarray) -> np.ndarray:
+        if h["dtype"] == "BF16":
+            return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+        return raw.view(np.float32).astype(np.float32)
+
+    def get(self, name: str) -> np.ndarray:
+        h, raw = self.raw(name)
+        return self.widen(h, raw).reshape(h["shape"])
+
+    def rows(self, name: str, ids) -> np.ndarray:
+        """Rows `ids` of a 2-D tensor (the embedding's): only their bytes are read."""
+        h, raw = self.raw(name)
+        width = h["shape"][1] * (2 if h["dtype"] == "BF16" else 4)
+        m = raw.reshape(h["shape"][0], width)
+        return self.widen(h, np.ascontiguousarray(m[np.asarray(ids)]).ravel()).reshape(len(ids), h["shape"][1])
 
 
 class Bank:
-    """The pack's NVFP4 records, dequantized in f32 on first use."""
+    """The pack's NVFP4 records, mapped (never read whole), each dequantized in f32 when routed; the dequantized
+    experts kept in an LRU of at most `cache_bytes`."""
 
-    def __init__(self, pack: Path):
+    def __init__(self, pack: Path, cache_bytes: int):
         self.m = json.loads((pack / "expert-manifest.json").read_text())
-        self.data = np.fromfile(pack / self.m["data_file"], np.uint8)
+        self.data = np.memmap(pack / self.m["data_file"], np.uint8, mode="r")
         self.parts = {p["name"]: p for p in self.m["parts"]}
         self.records = {(r["layer"], r["expert"]): r["offset"] for r in self.m["records"]}
-        self.cache: dict = {}
+        self.cache: collections.OrderedDict = collections.OrderedDict()
+        self.cache_bytes = cache_bytes
+        self.held = 0
 
     def part(self, off: int, name: str) -> np.ndarray:
         p = self.parts[name]
-        return self.data[off + p["offset"] : off + p["offset"] + p["length"]]
+        return np.asarray(self.data[off + p["offset"] : off + p["offset"] + p["length"]])
 
     def proj(self, off: int, proj: str) -> np.ndarray:
         codes = self.part(off, f"{proj}.weight")
@@ -107,10 +130,18 @@ class Bank:
 
     def expert(self, layer: int, e: int):
         key = (layer, e)
-        if key not in self.cache:
-            off = self.records[key]
-            self.cache[key] = tuple(self.proj(off, p) for p in ("gate_proj", "up_proj", "down_proj"))
-        return self.cache[key]
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        off = self.records[key]
+        w = tuple(self.proj(off, p) for p in ("gate_proj", "up_proj", "down_proj"))
+        size = sum(x.nbytes for x in w)
+        while self.cache and self.held + size > self.cache_bytes:
+            _, old = self.cache.popitem(last=False)
+            self.held -= sum(x.nbytes for x in old)
+        self.cache[key] = w
+        self.held += size
+        return w
 
 
 def rms_norm(x, w, eps):
@@ -133,11 +164,11 @@ def sigmoid(x):
 
 
 class Beam:
-    def __init__(self, pack: Path):
+    def __init__(self, pack: Path, cache_bytes: int = 4 << 30):
         self.cfg = json.loads((pack / "config.json").read_text())
         c = self.cfg
         self.st = Safetensors(pack / "model.safetensors")
-        self.bank = Bank(pack)
+        self.bank = Bank(pack, cache_bytes)
         self.L = c["num_hidden_layers"]
         self.H = c["hidden_size"]
         self.nh = c["num_attention_heads"]
@@ -156,6 +187,8 @@ class Beam:
         self.mlp_types = c["mlp_layer_types"]
         self.margins: dict = {}
         self.routes: dict = {}
+        # The twin's routes (`--twin`): every routed layer's ids by row, taken in place of the choice.
+        self.forced: dict | None = None
 
     def w(self, name):
         return self.st.get(name)
@@ -226,6 +259,8 @@ class Beam:
         msort = np.sort(masked, axis=-1)
         gap_e = msort[:, -self.k] - msort[:, -self.k - 1]
         self.margins[l] = np.minimum(gap_g, np.where(np.isfinite(gap_e), gap_e, np.inf))
+        if self.forced is not None:
+            ids = self.forced[l][:n]
         self.routes[l] = ids
         w = np.take_along_axis(scores, ids, axis=-1)
         w = w / (w.sum(axis=-1, keepdims=True) + np.float32(1e-20))
@@ -250,7 +285,7 @@ class Beam:
 
     def forward(self, ids):
         pos = np.arange(len(ids))
-        x = self.w("model.embed_tokens.weight")[np.asarray(ids)]
+        x = self.st.rows("model.embed_tokens.weight", ids)
         for l in range(self.L):
             p = f"model.layers.{l}."
             a = self.attention(l, rms_norm(x, self.w(p + "input_layernorm.weight"), self.eps), pos)
@@ -269,13 +304,23 @@ def main() -> None:
     ap.add_argument("--prompt", type=int, default=40)
     ap.add_argument("--decode", type=int, default=8)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--decode-ids", choices=("greedy", "seeded"), default="greedy",
+                    help="the decode tokens: each the argmax of the previous row (a forward per token), or drawn from "
+                         "SEED (one forward; the parity test forces the tokens either way)")
+    ap.add_argument("--cache-gb", type=float, default=4.0, help="the dequantized experts' LRU (default 4 GB)")
+    ap.add_argument("--twin", action="store_true",
+                    help="also write PREFIX.twin.f32: the same forward on the same routes with no BF16 rounding (every "
+                         "tensor f32), the model's own rounding sensitivity, which the parity test's bound reads")
     args = ap.parse_args()
-    m = Beam(args.pack)
+    m = Beam(args.pack, int(args.cache_gb * 1e9))
     vocab = m.cfg["vocab_size"]
     rng = np.random.default_rng(args.seed)
     ids = rng.integers(0, vocab, size=args.prompt).tolist()
-    for _ in range(args.decode):
-        ids.append(int(np.argmax(m.forward(ids)[-1])))
+    if args.decode_ids == "seeded":
+        ids += rng.integers(0, vocab, size=args.decode).tolist()
+    else:
+        for _ in range(args.decode):
+            ids.append(int(np.argmax(m.forward(ids)[-1])))
     m.margins, m.routes = {}, {}
     logits = m.forward(ids)
     srt = np.sort(logits, axis=-1)
@@ -283,6 +328,7 @@ def main() -> None:
     margins = np.stack([m.margins[l] for l in routed]) if routed else np.full((1, len(ids)), np.inf)
     meta = {
         "pack": str(args.pack), "prompt_tokens": args.prompt, "decode_tokens": args.decode, "seed": args.seed,
+        "decode_ids": args.decode_ids,
         "ids": ids, "rows": len(ids), "vocab": vocab,
         "argmax": np.argmax(logits, axis=-1).tolist(), "margin": (srt[:, -1] - srt[:, -2]).astype(float).tolist(),
         # Each row's routing margin: the least, over the routed layers, of its group and expert choice margins; and the
@@ -296,6 +342,16 @@ def main() -> None:
         "routes": np.stack([m.routes[l] for l in routed]).astype(int).ravel().tolist() if routed else [],
     }
     args.out.with_suffix(".f32").write_bytes(logits.astype("<f4").tobytes())
+    if args.twin:
+        global bf16
+        rounded = bf16
+        bf16 = lambda x: np.asarray(x, dtype=np.float32)  # noqa: E731
+        m.forced = {l: m.routes[l] for l in routed}
+        twin = m.forward(ids)
+        bf16 = rounded
+        args.out.with_suffix(".twin.f32").write_bytes(twin.astype("<f4").tobytes())
+        d = np.abs(twin - logits).max(axis=-1)
+        print(f"beam reference twin: f32 vs BF16 rounding, max |logit diff| per row: median {np.median(d):.4f}, max {d.max():.4f}")
     args.out.with_suffix(".json").write_text(json.dumps(meta, indent=1) + "\n")
     print(f"beam reference: {len(ids)} rows x {vocab} -> {args.out}.f32; argmax of the last row {meta['argmax'][-1]}")
 
