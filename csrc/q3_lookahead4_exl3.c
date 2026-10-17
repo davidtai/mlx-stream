@@ -83,7 +83,8 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  *   - a demand range holds `readers` on the slot while copying: a slot is never reclaimed under a copy.
  *
  * Counters (Python-owned int64[SC_N], written under the pool mutex, read at teardown): see SC_*.
- * Profile builds (-DQ3LD_EVSIG, -Ddsv41-decode-timers=true) keep only the event's signal log (q3ld_test_ev_log).
+ * Profile builds (-DQ3LD_EVSIG, -Ddsv41-decode-timers=true) keep only the event's signal log (q3ld_test_ev_log) and the
+ * read log of every preadv call's [start, end) (q3ld_test_read_log).
  * Test build (-DQ3LD_INJECT): the q3ni injection rules/delays, a speculative per-chunk delay and an event
  * log of demand submit / demand start / speculative chunk start with (qlen, busy, nearer-queued) at that
  * instant.
@@ -377,6 +378,24 @@ static int wd_running = 0, wd_stop = 0;
 
 void q3ld_mtl_signal(void *event, uint64_t value);          /* q3_event_shim.mm */
 
+#if defined(Q3LD_INJECT) || defined(Q3LD_EVSIG)
+/* The read log (profile and test builds): every preadv call's [start, end) on the pool's clock, its bytes and its
+ * thread's class (1 demand worker, 2 speculative thread, 3 a demand worker's pre-range), as int64[4] entries in a
+ * caller-owned buffer (q3ld_test_read_log); past the cap a call is counted (rdlog_dropped), not logged. */
+static int64_t *rdlog = 0, rdlog_cap = 0, rdlog_n = 0, rdlog_dropped = 0;
+static _Thread_local int64_t t_rdrole = 0;
+static void rdlog_put(int64_t t0, int64_t t1, ssize_t r) {
+    if (!__atomic_load_n(&rdlog, __ATOMIC_ACQUIRE)) return;
+    int64_t i = __atomic_fetch_add(&rdlog_n, 1, __ATOMIC_RELAXED);
+    if (i >= rdlog_cap) { __atomic_fetch_add(&rdlog_dropped, 1, __ATOMIC_RELAXED); return; }
+    int64_t *e = rdlog + 4 * i;
+    e[0] = t0; e[1] = t1; e[2] = (int64_t)r; e[3] = t_rdrole;
+}
+#define RDROLE(r) (t_rdrole = (r))
+#else
+#define RDROLE(r) ((void)0)
+#endif
+
 #ifdef Q3LD_INJECT
 #define MAX_RULES 16
 static int64_t rule_off[MAX_RULES], rule_code[MAX_RULES], rule_arg[MAX_RULES], rule_used[MAX_RULES];
@@ -479,7 +498,9 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
     }
     if (code == 5) sleep_ns(arg);
     ssize_t r;
+    int64_t t0 = q3ld_monotonic_ns();
     do { r = preadv(fd, iov, n, off); } while (r < 0 && errno == EINTR);   /* code 1: EINTR retried inside */
+    rdlog_put(t0, q3ld_monotonic_ns(), r);
     return r;
 }
 #define RANGE_DELAY() range_delay()
@@ -491,7 +512,13 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
 #else
 static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
     ssize_t r;
+#ifdef Q3LD_EVSIG
+    int64_t t0 = q3ld_monotonic_ns();
+#endif
     do { r = preadv(fd, iov, n, off); } while (r < 0 && errno == EINTR);
+#ifdef Q3LD_EVSIG
+    rdlog_put(t0, q3ld_monotonic_ns(), r);
+#endif
     return r;
 }
 #define RANGE_DELAY() ((void)0)
@@ -899,7 +926,9 @@ static void run_pre(int i, int w, char *stage) {
     RANGE_DELAY();
     int64_t out[RES_W] = { 0 };
     gauge_enter();
+    RDROLE(3);
     int status = run_range_pre(&job, p, stage, out);
+    RDROLE(1);
     gauge_exit();
     pthread_mutex_lock(&mu);
     busy -= 1;
@@ -1142,6 +1171,7 @@ static void publish(int64_t t) {
 static void *worker(void *arg) {
     int w = (int)(intptr_t)arg;
     char *stage = staging[w];
+    RDROLE(1);
     for (;;) {
         pthread_mutex_lock(&mu);
         int pi = -1;
@@ -1317,6 +1347,7 @@ int32_t q3ld_test_spec_held(int32_t n, int64_t timeout_ns) {
 
 static void *spec_worker(void *arg) {
     int ti = (int)(intptr_t)arg;
+    RDROLE(2);
     pthread_mutex_lock(&mu);
     for (;;) {
         int i;
@@ -2214,6 +2245,21 @@ int32_t q3ld_ev_state(int64_t *out) {
 }
 
 #if defined(Q3LD_INJECT) || defined(Q3LD_EVSIG)
+/* The read log: buf = int64[4 * cap] (n reset to 0) installs it; buf = 0, cap >= 0 reads the count; buf = 0, cap < 0
+ * removes it. Returns the entries logged so far (at most cap); out_dropped (when not null) gets the calls past cap. */
+int64_t q3ld_test_read_log(int64_t *buf, int64_t cap, int64_t *out_dropped) {
+    if (buf) {
+        __atomic_store_n(&rdlog, (int64_t *)0, __ATOMIC_RELEASE);
+        rdlog_cap = cap; rdlog_n = 0; rdlog_dropped = 0;
+        __atomic_store_n(&rdlog, buf, __ATOMIC_RELEASE);
+    } else if (cap < 0) {
+        __atomic_store_n(&rdlog, (int64_t *)0, __ATOMIC_RELEASE);
+    }
+    int64_t n = __atomic_load_n(&rdlog_n, __ATOMIC_ACQUIRE);
+    if (out_dropped) *out_dropped = __atomic_load_n(&rdlog_dropped, __ATOMIC_ACQUIRE);
+    return n < rdlog_cap ? n : rdlog_cap;
+}
+
 /* Python-owned int64[4 * cap] signal log (value, backend call start, prefix-advance time, backend ns); buf = 0 keeps
  * the current log, cap < 0 detaches it (the owner frees the buffer).  Returns the entries written so far. */
 int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {

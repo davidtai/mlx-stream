@@ -49,6 +49,8 @@ const kv = @import("../mimo_v2/kv.zig");
 const beam = @import("config.zig");
 const experts = @import("experts.zig");
 const glue = @import("glue.zig");
+/// Profile builds only: MiMo's prompt-pass timeline's stage marks (a no-op outside a recorded prompt pass).
+const ptl = @import("../mimo_v2/prefill_timeline.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -1005,7 +1007,12 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         // reads them as stored.
         const view = if (prompt) try promptView(g, stored) else stored.*;
         const lw = &view;
+        if (comptime ptl.enabled) {
+            ptl.layer(l);
+            ptl.stage(.predict);
+        }
         if (prompt and lw.router != null) try postReadAhead(g, c, lw, l, x, src);
+        if (comptime ptl.enabled) ptl.stage(.attn);
         // The attention, tile by tile (the rings and slabs carry from one tile to the next); in a prompt call each tile
         // is committed as built and the tile before it waited, so at most `tiles_in_flight` run at once.
         const xn = if (xn_next) |v| v else try rmsNorm(g, x, lw.input_norm, c.rms_norm_eps);
@@ -1024,6 +1031,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             if (i > 0) try g.evalAll(&.{outs[i - 1]});
         }
         const attn = if (n_tiles == 1) outs[0] else try g.concat(outs[0..n_tiles], 0);
+        if (comptime ptl.enabled) ptl.stage(if (lw.dense != null) .dense else .router);
         const b1 = if (boundary_glue) |k| try glue.addNorm(g, k, attn, x, lw.post_attn_norm, lw.pre_ff_norm, beam.Config.residualIndex(l, false)) else try boundaryStock(g, c, attn, x, lw.post_attn_norm, lw.pre_ff_norm, beam.Config.residualIndex(l, false));
         const x1 = b1.res;
         const h = b1.out;
@@ -1046,6 +1054,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         // MiMo's tail: a prompt layer's output evaluated before the next layer starts (bounding its graph), then the
         // pooled scratch's purge. A decode step's stays lazy: the next routing barrier evaluates it.
         if (prompt) {
+            if (comptime ptl.enabled) ptl.stage(.tail);
             g.resetTo(m);
             for (outs[0..n_kept]) |o| g.release(o);
             n_kept = 0;
@@ -1054,6 +1063,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         }
         if (comptime @TypeOf(capture) != void) try capture.take(g, l, x, rows);
     }
+    if (comptime ptl.enabled) ptl.leaveLayers();
     cache.len = start + rows;
     // The decode glue's last boundary normed the one row by the final norm already: the head's lm_head and soft cap.
     if (xn_next) |xn| return g.keep(try softcap(g, c, try project(g, w.head, xn)));
