@@ -128,14 +128,15 @@ pub fn promptWaveBytes(c: *const beam.Config, t: u64, keys: u64) u64 {
     return stream + @max(@max(predictor, attention), @max(dense, moe));
 }
 
-/// The decode wave: a step's graph between two routing barriers (two layers' arrays at one row, the widest attention
+/// The decode wave: a step's graph between two routing barriers (the layers' arrays at one row, the widest attention
 /// at `keys` keys and the widest MLP), the routed rows, the stream, and the head's logits (bf16, f32, the cap's three
-/// f32 stages).
+/// f32 stages). The first barrier comes after the dense layers and the first routed layer's attention: the wave holds
+/// max(2, first_k_dense + 1) layers.
 pub fn decodeWaveBytes(c: *const beam.Config, keys: u64) u64 {
     const h: u64 = c.hidden_size;
     const mlp = @max(denseRowBytes(c), moeRowBytes(c) + @as(u64, c.n_experts_per_tok) * (2 * h + 6 * @as(u64, c.moe_intermediate_size)) * bf16);
     const layer = attnTileBytes(c, 1, keys) + mlp + 9 * h * bf16;
-    return 2 * layer + @as(u64, c.vocab_size) * (bf16 + 4 * f32b);
+    return @max(2, @as(u64, c.first_k_dense) + 1) * layer + @as(u64, c.vocab_size) * (bf16 + 4 * f32b);
 }
 
 /// The phase's largest single buffer (MLX's cache can end one freed buffer over its limit). Prompt: the router's f32
@@ -219,6 +220,9 @@ fn routeInputs(in: *const Inputs) route_bill.Inputs {
         // The open bank's digest (32 B) per record and its layer.
         .record_table_bytes = 32,
         .layer_table_bytes = @sizeOf(bank.Layer),
+        // `swiglu_f32` (experts.zig `expertActivation`): gate and up widened to f32 (8 B a column) and the f32 product
+        // (4 B), past MiMo's activation's own rate; 4 more bytes a column than its 24 at most.
+        .activation_extra_bytes = 4,
     };
 }
 
@@ -348,6 +352,18 @@ test "beam bill: the fill on the 256 GB box sits within the target, the next row
     cfg = .{};
     try testing.expectError(error.BeamMemoryBaselineMissing, choose(b, &cfg, box_ceiling, box_stop));
     std.debug.print("\nBEAM BILL fixture (residents 16.16 GB, ctx 32,768, baseline 12.6 GB, ceiling 240 GiB): rows {d}/{d} per_row {d} process_bound {d}\n", .{ rows.prompt, rows.decode, b.per_row, b.processBound(rows) });
+}
+
+test "beam bill: the decode wave holds the dense layers and the first routed attention; the routed tile bills the f32 SwiGLU" {
+    const c: beam.Config = .{};
+    const keys: u64 = 32_768;
+    try testing.expect(decodeWaveBytes(&c, keys) >= 4 * attnTileBytes(&c, 1, keys));
+    const in = try fixtureInputs(keys);
+    const ri = routeInputs(&in);
+    var stock = ri;
+    stock.activation_extra_bytes = 0;
+    const nr: u64 = 1024;
+    try testing.expectEqual(route_bill.tileBytes(&stock, nr) + nr * 4 * c.moe_intermediate_size, route_bill.tileBytes(&ri, nr));
 }
 
 test "beam bill: every term is non-decreasing in the billed context (the ladder bounds a rung by the next table)" {
