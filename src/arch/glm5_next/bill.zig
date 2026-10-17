@@ -26,6 +26,7 @@ const dsv_bill = @import("../deepseek_v41/bill.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const exl3_math = @import("exl3_math.zig");
 const prompt_levers = @import("prompt_levers.zig");
+const route_bill = @import("../mimo_v2/route_bill.zig");
 const io_util = sdk.io_util;
 
 const Term = sdk.MemoryBill.Term;
@@ -67,61 +68,16 @@ pub const Plan = struct {
 
 // ── The residents (the shards' headers: no payload is read) ──
 
-pub const Residents = struct { bytes: u64, tensors: u64 };
+pub const Residents = route_bill.Residents;
 
 /// The kept residents (`graph.keptResident`) of the pack's indexed shards, each in its own MLX buffer (page-rounded past
-/// one page). Every shard header is bounded and checked against its file; a tensor outside its file refuses.
+/// one page): the shared header scan (route_bill.zig), refused by glm5_next's names.
 pub fn residentBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.Config, page: u64) !Residents {
-    var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
-    defer d.close(io);
-    const raw = d.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 << 20)) catch return error.Glm5NextResidentIndex;
-    defer a.free(raw);
-    const index = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch return error.Glm5NextResidentIndex;
-    defer index.deinit();
-    const wm = if (index.value == .object) index.value.object.get("weight_map") orelse return error.Glm5NextResidentIndex else return error.Glm5NextResidentIndex;
-    if (wm != .object or wm.object.count() == 0) return error.Glm5NextResidentIndex;
-    var shards: std.StringArrayHashMapUnmanaged(void) = .empty;
-    defer shards.deinit(a);
-    var it = wm.object.iterator();
-    while (it.next()) |e| {
-        const v = e.value_ptr.*;
-        if (v != .string or !std.mem.endsWith(u8, v.string, ".safetensors") or std.mem.indexOfAny(u8, v.string, "/\\") != null) return error.Glm5NextResidentIndex;
-        try shards.put(a, v.string, {});
-    }
-    var out: Residents = .{ .bytes = 0, .tensors = 0 };
-    for (shards.keys()) |shard| {
-        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, shard }, 0);
-        defer a.free(path);
-        const fd = try io_util.openNoCache(path.ptr, .{});
-        defer _ = std.c.close(fd);
-        const size_i = std.c.lseek(fd, 0, std.c.SEEK.END);
-        if (size_i < 8) return error.Glm5NextResidentShard;
-        const size: u64 = @intCast(size_i);
-        var prefix: [8]u8 = undefined;
-        try readAt(fd, &prefix, 0);
-        const len = std.mem.readInt(u64, &prefix, .little);
-        if (len < 2 or len > 64 << 20 or len > size - 8) return error.Glm5NextResidentShard;
-        const header = try a.alloc(u8, @intCast(len));
-        defer a.free(header);
-        try readAt(fd, header, 8);
-        const parsed = std.json.parseFromSlice(std.json.Value, a, header, .{}) catch return error.Glm5NextResidentShard;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.Glm5NextResidentShard;
-        var tensors = parsed.value.object.iterator();
-        while (tensors.next()) |t| {
-            const name = t.key_ptr.*;
-            if (std.mem.eql(u8, name, "__metadata__") or !glm_kept(c, name)) continue;
-            const desc = t.value_ptr.*;
-            const offsets = if (desc == .object) desc.object.get("data_offsets") orelse return error.Glm5NextResidentShard else return error.Glm5NextResidentShard;
-            if (offsets != .array or offsets.array.items.len != 2 or offsets.array.items[0] != .integer or offsets.array.items[1] != .integer) return error.Glm5NextResidentShard;
-            const lo = offsets.array.items[0].integer;
-            const hi = offsets.array.items[1].integer;
-            if (lo < 0 or hi < lo or @as(u64, @intCast(hi)) > size - 8 - len) return error.Glm5NextResidentShard;
-            out.bytes += graph.bufferBytes(@intCast(hi - lo), page);
-            out.tensors += 1;
-        }
-    }
-    return out;
+    return route_bill.residentBytes(a, io, dir, c, glm_kept, page) catch |e| switch (e) {
+        error.ResidentIndex => error.Glm5NextResidentIndex,
+        error.ResidentShard => error.Glm5NextResidentShard,
+        else => e,
+    };
 }
 
 /// The FP8 prompt route's cache and its wiring (fp8.zig `promptBytes`); 0 under bf16.
@@ -132,16 +88,6 @@ pub fn fp8PromptBytes(c: *const glm.Config, page: u64) u64 {
 
 fn glm_kept(c: *const glm.Config, name: []const u8) bool {
     return graph.keptResident(c, name);
-}
-
-fn readAt(fd: std.c.fd_t, bytes: []u8, offset: u64) !void {
-    var done: usize = 0;
-    while (done < bytes.len) {
-        const n = std.c.pread(fd, bytes[done..].ptr, bytes.len - done, @intCast(offset + done));
-        if (n < 0 and std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
-        if (n <= 0) return error.Glm5NextResidentShard;
-        done += @intCast(n);
-    }
 }
 
 // ── The arch's terms ──
@@ -481,111 +427,66 @@ pub fn laneTerms(in: *const Inputs) [3]Term {
 
 // ── The expert source's terms (MiMo's route: experts.zig) ──
 
-/// The routed math's tile in flight over `nr` routed rows: NVFP4's projection tile (MiMo's `projection_rows` at its per-row
-/// rate), or on the exl3 family that tile or a DIG-X prompt wave of `wave_rows` rows (`exl3_math.wave_bytes_per_row` a
-/// row: take2, z, hd, zd, y and the row maps), whichever is larger. At the default 1,024 rows (and up to 2,184) the wave
-/// is inside the NVFP4 tile: the bill is today's.
-pub fn tileBytes(g: SourceGeometry, nr: u64, wave_rows: u32) u64 {
-    const tile = @as(u64, @min(nr, mimo_math.projection_rows)) * (20 * @as(u64, g.hidden_size) + 24 * @as(u64, g.intermediate_size) + 32);
-    if (g.family != .exl3) return tile;
-    return @max(tile, @min(nr, @as(u64, wave_rows)) * exl3_math.wave_bytes_per_row);
-}
-
-/// The wide lane's workspace over a call of `tokens` tokens (mimo_v2/source.zig `workspaceBytes`'s rates at this
-/// geometry): the routed tile outputs and the merge, the call's input and output rows, one projection tile and one
-/// reduction tile, the host scratch; the pipelined drain's second tiles. The tile is `tileBytes`' (the exl3 family's
-/// DIG-X wave at `wave_rows` where it outgrows NVFP4's tile; two in flight: MiMo's drain).
-pub fn workspaceBytes(g: SourceGeometry, tokens: u64, wave_rows: u32) u64 {
-    const k: u64 = experts.top_k;
-    const nr = tokens * k;
-    const max_nr = @as(u64, graph.prompt_call_rows) * k;
-    const H: u64 = g.hidden_size;
-    const I: u64 = g.intermediate_size;
-    const host = 44 * max_nr + 28 * @as(u64, g.num_experts) + (@as(u64, g.first_moe_layer) + g.num_moe_layers) * 3 * 64 +
-        ((max_nr + mimo_math.tile_rows - 1) / mimo_math.tile_rows + mimo_stream.max_route_ids) * 8 + (if (g.family == .exl3) @as(u64, @sizeOf(experts.Exl3Source)) else @as(u64, @sizeOf(experts.Source))) + (1 << 20);
-    const routed = nr * (4 * H + 8) + 3 * @as(u64, @min(tokens, mimo_math.combine_tokens)) * k * 2 * H;
-    const input_output = tokens * (6 * H + k * 8);
-    const nvfp4_tile = @as(u64, @min(nr, mimo_math.projection_rows)) * (20 * H + 24 * I + 32);
-    const matrix_tile = tileBytes(g, nr, wave_rows);
-    const reduction_tile = @as(u64, @min(tokens, mimo_math.tile_rows)) * (k * H * 8 + H * 8 + k * 8);
-    // The drain's second tile and reduction tile (`pipelinedExtraBytes`: NVFP4's tile), its tile the same as the first.
-    const drain = mimo_math.pipelinedExtraBytes(H, I, @intCast(tokens)) - nvfp4_tile + matrix_tile;
-    return host + routed + input_output + matrix_tile + reduction_tile + drain;
-}
-
-/// P1's predictor (one eval over a call's router tiles) and the decode lookahead's scores, at this geometry.
-pub fn predictorBytes(g: SourceGeometry, tokens: u64) u64 {
-    const n: u64 = g.num_experts;
-    const tile: u64 = @min(tokens, graph.prompt_call_rows);
-    return @max(4 * (@as(u64, g.hidden_size) + 5 * n), tile * (6 * @as(u64, g.hidden_size) + 20 * n + 16 * experts.top_k + 8));
-}
-
-fn slotWiring(data: *const [4]u64, phase: sdk.MemoryBill.Phase, rows: u32, slots: u64) u64 {
-    // Linear in its rows (no slot table): `slots` is `rows * per_row`, the same bytes as `rows * data[1]`.
-    _ = slots;
-    return wireTables(data[if (phase == .prompt) 0 else 2] + rows * data[1]);
-}
-
-/// The source's terms and its rows: `per_row` one slot row on every routed layer (its record stride, at least the
-/// slot arrays' bytes), the transient scratch (the prompt's two wide windows, decode's window 0 at the decode lane's
-/// widest route), the read pool (its workers' staging, the speculative slots and the tickets), the metadata.
-fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
+/// The shared route's inputs at this bill's geometry and routes (route_bill.zig): the NVFP4 family's tile, or the exl3
+/// family's DIG-X waves at `exl3_wave_rows`; the source's own sizes; the decode texts on `fused` / `hitpass` (and on
+/// every exl3 route: they serve the prompt waves too), declared.
+fn routeInputs(in: *const Inputs) route_bill.Inputs {
     const g = in.geometry;
-    const page = in.page;
-    // A slot row is billed at the record stride or the stream's line-isolated slot row (bank.zig `slotRowBytes`: each
-    // global scale on its own 128-byte line), whichever is larger: Flash's 14,156,160 B row fits its 14,159,872 B stride,
-    // so the rows' terms are the stride's. The global-scale arrays' page floor (`scale_array_min_bytes`, at most a page
-    // past their rows per array) is inside `slot_rounding`'s page per component of the base and transient banks and the
-    // stride's 3,712 B per row over the slot row for the ext banks (test "the line-isolated slot arrays fit").
-    const record = @max(g.record_bytes, g.slotRowBytes());
-    const transient: [2]u64 = .{ @as(u64, mimo_stream.transient_rows) * record, @as(u64, mimo_stream.decodeTransientRows(experts.decode_window)) * record };
-    const n: u64 = g.num_experts;
-    const bitset = std.mem.alignForward(u64, n, 64) / 8;
-    const staging = @as(u64, mimo_stream.io_workers) * settings.reader_staging_bytes;
-    const spec = @as(u64, mimo_stream.spec_slots) * (std.mem.alignForward(u64, record, page) + 2 * page);
-    const tickets = @as(u64, mimo_stream.io_tickets_early) * (8 * 8 + 8 + 1);
-    const policy = @as(u64, g.num_moe_layers) * (n * n * 4 + n * 56 + mimo_stream.max_route_ids * 2 + 5 * bitset);
-    const stream_bytes: u64 = if (g.family == .exl3) @as(u64, @sizeOf(experts.Types(.exl3).Bridge.Stream)) else @as(u64, @sizeOf(experts.Stream));
-    const metadata = tickets + stream_bytes + @as(u64, g.num_moe_layers) * (n * 64 + 64) + (n + mimo_stream.transient_rows) * 96 + (1 << 20);
-    // The open bank's tables: the NVFP4 bank's digest (32 B) per record and its layer; the EXL3 reader's padded and
-    // logical digests (64 B) per record and its layer.
-    const manifest = if (g.family == .exl3) @as(u64, g.num_moe_layers) * (n * 64 + @sizeOf(exl3_bank.Layer)) else @as(u64, g.num_moe_layers) * (n * 32 + @sizeOf(bank.Layer));
-    // The slot arrays' page rounding (each component's array per layer and the transient's), beside the record stride.
-    const rounding = (@as(u64, g.num_moe_layers) + 2) * bank.n_components * page;
-    const t: u64 = @min(in.reserve, graph.prompt_call_rows);
-    const terms = [_]Term{
-        .{ .name = "slot_transient", .bytes = transient, .at_construction = true },
-        .{ .name = "slot_rounding", .bytes = @splat(rounding), .at_construction = true },
-        .{ .name = "reader_staging", .bytes = @splat(staging), .at_construction = true },
-        .{ .name = "source_metadata", .bytes = @splat(policy + metadata + manifest), .at_construction = true },
-        .{ .name = "expert_workspace", .bytes = .{ workspaceBytes(g, t, in.exl3_wave_rows), workspaceBytes(g, experts.decode_lane_rows, in.exl3_wave_rows) }, .at_construction = false },
-        .{ .name = "event_runtime", .bytes = @splat(8 << 20), .at_construction = true },
-        .{ .name = "event_graph", .bytes = @splat(16 << 20), .at_construction = false },
-        .{ .name = "spec_staging", .bytes = @splat(spec), .at_construction = true },
-        .{ .name = "spec_runtime", .bytes = @splat(@as(u64, mimo_stream.spec_threads) * (2 << 20)), .at_construction = true },
-        .{ .name = "predictor_workspace", .bytes = .{ predictorBytes(g, t), predictorBytes(g, experts.decode_lane_rows) }, .at_construction = false },
-        .{ .name = "predictor_runtime", .bytes = @splat(16 << 20), .at_construction = false },
-        // `decode_moe: fused` and `hitpass`: the NVFP4 decode texts' set (its library, two pipelines per registered
-        // instantiation) and the launches prepared per wave width (decode_kernels.zig `Fused`), declared; its waves' rows
-        // are the decode wave's (`request`). 0 on the stock route.
-        // exl3: the GLM-shape EXL3 texts (exl3_kernels.zig: ten kernels, the decode launches per wave width, the row maps)
-        // on every route (they serve the prompt waves too), declared at the same bound.
-        .{ .name = "decode_kernels", .bytes = @splat(if (in.decode_moe != .stock or g.family == .exl3) fused_kernels_bytes else 0), .at_construction = true },
-        // `decode_glue: fused`: the glue's texts, pipelines and configs (glue.zig), declared; 0 under `ops`.
-        .{ .name = "glue_kernels", .bytes = @splat(if (in.decode_glue == .fused) glue_kernels_bytes else 0), .at_construction = true },
-        // `decode_kda: fused`: the KDA decode text, declared; 0 under `ops`.
-        .{ .name = "kda_kernels", .bytes = @splat(if (in.decode_kda == .fused) kda_kernels_bytes else 0), .at_construction = true },
-        // `decode_dsa: fused`: the DSA decode texts and the split's partials, declared; 0 under `ops`.
-        .{ .name = "dsa_kernels", .bytes = @splat(if (in.decode_dsa == .fused) dsaKernelsBytes(&in.model) else 0), .at_construction = true },
-        // `decode_swiglu: fused`: the MLP activation text, declared; 0 under `ops`.
-        .{ .name = "swiglu_kernels", .bytes = @splat(if (in.decode_swiglu == .fused) swiglu_kernels_bytes else 0), .at_construction = true },
-        .{ .name = "slot_wiring", .bytes = @splat(0), .at_construction = false, .with_rows = true },
-    };
+    const exl3 = g.family == .exl3;
     return .{
-        .terms = try a.dupe(Term, &terms),
-        .per_row = @as(u64, g.num_moe_layers) * record,
-        .row_terms = .{ .data = .{ transient[0], @as(u64, g.num_moe_layers) * record, transient[1], 0 }, .at = slotWiring },
+        .geometry = .{ .hidden_size = g.hidden_size, .intermediate_size = g.intermediate_size, .num_experts = g.num_experts, .first_moe_layer = g.first_moe_layer, .num_moe_layers = g.num_moe_layers, .record_bytes = g.record_bytes, .slot_row_bytes = g.slotRowBytes() },
+        .reserve = in.reserve,
+        .page = in.page,
+        .call_rows = graph.prompt_call_rows,
+        .top_k = experts.top_k,
+        .decode_lane_rows = experts.decode_lane_rows,
+        .staging_bytes = settings.reader_staging_bytes,
+        .components = bank.n_components,
+        .stream_bytes = if (exl3) @sizeOf(experts.Types(.exl3).Bridge.Stream) else @sizeOf(experts.Stream),
+        .source_bytes = if (exl3) @sizeOf(experts.Exl3Source) else @sizeOf(experts.Source),
+        // The open bank's tables: the NVFP4 bank's digest (32 B) per record and its layer; the EXL3 reader's padded and
+        // logical digests (64 B) per record and its layer.
+        .record_table_bytes = if (exl3) 64 else 32,
+        .layer_table_bytes = if (exl3) @sizeOf(exl3_bank.Layer) else @sizeOf(bank.Layer),
+        .wave_rows = in.exl3_wave_rows,
+        .wave_bytes_per_row = if (exl3) exl3_math.wave_bytes_per_row else 0,
+        .decode_kernels = if (in.decode_moe != .stock or exl3) fused_kernels_bytes else 0,
     };
+}
+
+/// The routed math's tile in flight over `nr` routed rows (the shared route's `tileBytes`).
+pub fn tileBytes(g: SourceGeometry, nr: u64, wave_rows: u32) u64 {
+    var in = fixtureRoute(g);
+    in.wave_rows = wave_rows;
+    return route_bill.tileBytes(&in, nr);
+}
+
+/// The wide lane's workspace over a call of `tokens` tokens (the shared route's `workspaceBytes`).
+pub fn workspaceBytes(g: SourceGeometry, tokens: u64, wave_rows: u32) u64 {
+    var in = fixtureRoute(g);
+    in.wave_rows = wave_rows;
+    return route_bill.workspaceBytes(&in, tokens);
+}
+
+fn fixtureRoute(g: SourceGeometry) route_bill.Inputs {
+    const in: Inputs = .{ .model = .{}, .geometry = g, .residents = .{ .bytes = 0, .tensors = 0 }, .reserve = 0 };
+    return routeInputs(&in);
+}
+
+/// The source's terms (the shared route's), glm5_next's decode texts between the runtimes and the slot wiring:
+///   glue_kernels    `decode_glue: fused`: the glue's texts, pipelines and configs (glue.zig), declared; 0 under `ops`
+///   kda_kernels     `decode_kda: fused`: the KDA decode text, declared; 0 under `ops`
+///   dsa_kernels     `decode_dsa: fused`: the DSA decode texts and the split's partials, declared; 0 under `ops`
+///   swiglu_kernels  `decode_swiglu: fused`: the MLP activation text, declared; 0 under `ops`
+fn sourceTerms(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
+    const ri = routeInputs(in);
+    const extra = [_]Term{
+        .{ .name = "glue_kernels", .bytes = @splat(if (in.decode_glue == .fused) glue_kernels_bytes else 0), .at_construction = true },
+        .{ .name = "kda_kernels", .bytes = @splat(if (in.decode_kda == .fused) kda_kernels_bytes else 0), .at_construction = true },
+        .{ .name = "dsa_kernels", .bytes = @splat(if (in.decode_dsa == .fused) dsaKernelsBytes(&in.model) else 0), .at_construction = true },
+        .{ .name = "swiglu_kernels", .bytes = @splat(if (in.decode_swiglu == .fused) swiglu_kernels_bytes else 0), .at_construction = true },
+    };
+    return route_bill.sourceTerms(a, &ri, &extra);
 }
 
 /// The complete bill of `in`: the arch's terms, then the source's (which supply the rows and their wiring).
@@ -594,10 +495,7 @@ pub fn billOf(a: std.mem.Allocator, in: *const Inputs) !sdk.MemoryBill {
     defer a.free(arch);
     const src = try sourceTerms(a, in);
     defer a.free(src.terms);
-    const terms = try a.alloc(Term, arch.len + src.terms.len);
-    @memcpy(terms[0..arch.len], arch);
-    @memcpy(terms[arch.len..], src.terms);
-    return .{ .terms = terms, .per_row = src.per_row, .row_terms = src.row_terms };
+    return route_bill.compose(a, arch, src);
 }
 
 /// The bill inputs of `cfg`'s pack at `reserve` positions: its residents' headers and its bank's manifest (pure host).
@@ -663,15 +561,8 @@ pub fn choose(b: sdk.MemoryBill, cfg: *const settings.Config, ceiling: u64, stop
     return .{ .bill = b, .rows = rows, .target = target, .baseline = baseline, .reserve = cfg.reserveTokens(), .over_fill = over };
 }
 
-/// The forced rows' report line (MiMo's words).
-pub fn forcedRowsLine(buf: []u8, rows: sdk.Rows, over: u64, baseline: u64) []const u8 {
-    return std.fmt.bufPrint(buf, "forced rows {d}/{d} exceed the fill by {d} bytes at baseline {d}; proceeding (operator pin)", .{ rows.prompt, rows.decode, over, baseline }) catch buf[0..0];
-}
-
-/// How far the bill at `rows` sits over `target` in its larger phase (0: both within). A report.
-pub fn overFillBytes(b: sdk.MemoryBill, baseline: u64, rows: sdk.Rows, target: u64) u64 {
-    return @max(b.total(.prompt, baseline, rows.prompt) -| target, b.total(.decode, baseline, rows.decode) -| target);
-}
+pub const forcedRowsLine = route_bill.forcedRowsLine;
+pub const overFillBytes = route_bill.overFillBytes;
 
 pub fn isForced(cfg: *const settings.Config) bool {
     return cfg.expert_rows != null or cfg.expert_prefill_rows != null;
