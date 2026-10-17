@@ -110,9 +110,10 @@ def check(m, data_file="experts.bin"):
     return g
 
 
-def build(g, sums, bank_sha256, repository, revision, extra):
+def build(g, sums, bank_sha256, source, extra):
     """The manifest of a bank of geometry `g`: `sums` {"layer:expert": record sha256}, the bank's sha256, the source
-    pin, and the converter's `extra` keys (bank.zig ignores keys it does not read)."""
+    pin ({repository, revision} and any keys of the converter's: bank.zig reads those two), and the converter's
+    `extra` keys (bank.zig ignores keys it does not read)."""
     records = []
     for i in range(g.records):
         layer, e = g.at(i)
@@ -125,7 +126,7 @@ def build(g, sums, bank_sha256, repository, revision, extra):
         "layout": LAYOUT, "num_experts": g.experts, "num_moe_layers": g.layers,
         "output_files": {"experts.bin": {"sha256": bank_sha256, "size": g.total}}, "parts": g.parts,
         "quantization": {"bits": BITS, "group_size": GROUP, "mode": "nvfp4"}, "record_bytes": g.logical,
-        "record_stride": g.stride, "records": records, "source": {"repository": repository, "revision": revision},
+        "record_stride": g.stride, "records": records, "source": dict(source),
     })
     check(m)
     return m

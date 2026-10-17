@@ -335,6 +335,62 @@ class Resume(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class Slice(unittest.TestCase):
+    """--layers 0-5 of the 7-layer fixture: 3 dense and 3 routed layers, layer 5 full_attention."""
+
+    def test_slice_is_the_full_pack_cut_to_its_layers(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "f", SEED)
+            fx.build(tmp / "s", SEED)
+            self.assertEqual(run("all", *build_args(tmp / "f", tmp / "full"))[0], 0)
+            (tmp / "s" / "model-layer-00006.safetensors").unlink()  # past the slice: never read
+            rc, log = run("all", *build_args(tmp / "s", tmp / "slice", "--layers", "0-5"))
+            self.assertEqual(rc, 0, log)
+            cfg = json.loads((tmp / "slice" / "config.json").read_text())
+            full_cfg = json.loads((tmp / "full" / "config.json").read_text())
+            self.assertEqual((cfg["num_hidden_layers"], cfg["layer_types"], cfg["mlp_layer_types"]),
+                             (6, fx.LAYER_TYPES[:6], ["dense"] * 3 + ["sparse"] * 3))
+            self.assertEqual({k: v for k, v in cfg.items() if k not in ("num_hidden_layers", "layer_types",
+                                                                         "mlp_layer_types")},
+                             {k: v for k, v in full_cfg.items() if k not in ("num_hidden_layers", "layer_types",
+                                                                              "mlp_layer_types")})
+            m = json.loads((tmp / "slice" / "expert-manifest.json").read_text())
+            g = manifest.check(m)
+            self.assertEqual((g.first, g.layers, g.records), (3, 3, 24))
+            pins = json.loads((tmp / "s" / fx.PINS).read_text())
+            self.assertEqual(m["source"], {"repository": pins["repository"], "revision": pins["revision"],
+                                           "layers": [0, 5]})
+            full_bank = (tmp / "full" / "experts.bin").read_bytes()
+            self.assertEqual((tmp / "slice" / "experts.bin").read_bytes(), full_bank[:24 * g.stride])
+            fm = json.loads((tmp / "full" / "expert-manifest.json").read_text())
+            self.assertEqual([r["sha256"] for r in m["records"]], [r["sha256"] for r in fm["records"][:24]])
+            sl, fu = StFile(tmp / "slice" / "model.safetensors"), StFile(tmp / "full" / "model.safetensors")
+            try:
+                want = {n for n in fu.header if not n.startswith("model.layers.6.")}
+                self.assertEqual(set(sl.header), want)
+                for n in ("model.embed_tokens.weight", "lm_head.weight", "model.norm.weight",
+                          "model.layers.5.self_attn.q_proj.weight", "model.layers.4.mlp.gate.weight"):
+                    self.assertEqual(bytes(sl.raw_bytes(n)), bytes(fu.raw_bytes(n)), n)
+            finally:
+                sl.close()
+                fu.close()
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_a_slice_without_a_full_layer_or_from_above_0_refuses(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "f", SEED)
+            for layers, want in (("0-4", "no full_attention layer in the slice (the first is layer 5)"),
+                                 ("1-5", "a slice starts at layer 0"), ("0-7", "the model has layers 0-6")):
+                rc, log = run("all", *build_args(tmp / "f", tmp / f"p{layers}", "--layers", layers))
+                self.assertEqual(rc, 1, log)
+                self.assertIn(want, log)
+        finally:
+            shutil.rmtree(tmp)
+
+
 def _ws2_inexact(cfg, hfq, shards):
     t = shards["model-layer-00003.safetensors"]
     t["model.layers.3.mlp.experts.1.down_proj.weight_scale_2"] = ("F32", [], np.float32(0.0004534040344879031))

@@ -101,6 +101,16 @@ The script also refuses: a missing or an extra tensor in the index or a shard; a
 quantization that is not NVFP4 with group size 16; a resident linear that `hf_quant_config.json` does not exclude
 from the quantization; an expert projection that it excludes; a geometry that bank.zig refuses.
 
+### A layer slice
+
+`--layers 0-N` makes a pack of the first N + 1 layers only, with the release's weights, for parity and eviction tests.
+The slice starts at layer 0 and holds at least one `full_attention` layer; the script refuses any other slice.
+`config.json` has `num_hidden_layers`, `layer_types` and `mlp_layer_types` cut to the slice. Every other key is the
+release's. The residents are the slice's layers, the embedding, the final norm and `lm_head`. The bank holds the
+routed layers of the slice, and the manifest's `source` adds `"layers": [0, N]`. The script reads only the shards
+that hold the slice's tensors. For `beam`, `--layers 0-5` gives layers 0-2 dense and 3-5 routed (layer 5 is full
+attention): 768 records, `experts.bin` 16,990,076,928 B, `model.safetensors` 6,273,379,016 B.
+
 ### Disk and time
 
 - `beam` with `--delete-verified`: 305.4 GB at the peak (the bank, 16.16 GB of residents, one 5.878 GB shard in

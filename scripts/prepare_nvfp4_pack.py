@@ -43,6 +43,9 @@ build.
              against the source shards (bytes and manifest sha256), a dequant spot check of a few rows per projection,
              every resident tensor's sha256, then pack-sha256.txt
 
+--layers 0-N builds a slice: the first N + 1 layers (from 0, with a full_attention layer), config.json cut to them,
+the embedding, final norm and head kept, the manifest's source pin with "layers": [0, N] (docs/nvfp4-pack.md).
+
 The residents and the bank take each shard in one pass: with --delete-verified a shard is deleted once both have taken
 it and read it back, so the shards never sit on disk at once. The parity keep set (--keep-for-parity routed shards,
 seeded) stays until `verify --delete-verified`.
@@ -187,6 +190,26 @@ class Beam:
         out += [("model.norm.weight", "BF16", [H]), ("lm_head.weight", "BF16", [V, H])]
         return out
 
+    def slice(self, cfg, layers):
+        """config.json of the first layers only (`layers` = (0, last)): num_hidden_layers, layer_types and
+        mlp_layer_types cut to the slice, every other key as released (the embedding, the final norm and the head stay).
+        Refused unless the slice starts at layer 0, ends inside the model and holds a full_attention layer."""
+        lo, hi = layers
+        n = _count(cfg, "num_hidden_layers")
+        lt, mlp = cfg.get("layer_types"), cfg.get("mlp_layer_types")
+        if not isinstance(lt, list) or len(lt) != n or not isinstance(mlp, list) or len(mlp) != n:
+            raise PrepError("config.json: layer_types / mlp_layer_types do not name every layer")
+        if lo != 0:
+            raise PrepError(f"--layers {lo}-{hi}: a slice starts at layer 0 (the embedding feeds layer 0)")
+        if hi >= n:
+            raise PrepError(f"--layers {lo}-{hi}: the model has layers 0-{n - 1}")
+        if "full_attention" not in lt[:hi + 1]:
+            first = lt.index("full_attention") if "full_attention" in lt else None
+            raise PrepError(f"--layers {lo}-{hi}: no full_attention layer in the slice (the first is layer {first})")
+        out = dict(cfg)
+        out.update(num_hidden_layers=hi + 1, layer_types=lt[:hi + 1], mlp_layer_types=mlp[:hi + 1])
+        return out
+
     def expert_name(self, layer, expert, proj, kind):
         return f"{self.layer_prefix}{layer}.mlp.experts.{expert}.{proj}.{kind}"
 
@@ -240,7 +263,11 @@ class Plan:
     """Computed once from the verified config.json, hf_quant_config.json and index, before any shard is read: the
     tensor spec, the residents' header and offsets, and each shard's residents and records."""
 
-    def __init__(self, fam, cfg, hfq, index):
+    def __init__(self, fam, cfg, hfq, index, layers=None):
+        full_layers = _count(fam.text(cfg), "num_hidden_layers")
+        self.layers = layers
+        if layers is not None:
+            cfg = fam.slice(cfg, layers)
         self.fam, self.cfg = fam, cfg
         self.geom = g = fam.geometry(cfg)
         self.residents = fam.residents(cfg)
@@ -259,17 +286,23 @@ class Plan:
         wm = index.get("weight_map")
         if not isinstance(wm, dict):
             raise PrepError("model.safetensors.index.json has no weight_map")
-        missing, extra = sorted(set(self.spec) - set(wm)), sorted(set(wm) - set(self.spec))
+        missing, extra = sorted(set(self.spec) - set(wm)), set(wm) - set(self.spec)
+        if layers is not None:  # the layers past the slice are the release's, not read
+            past = tuple(f"{fam.layer_prefix}{li}." for li in range(layers[1] + 1, full_layers))
+            extra = {n for n in extra if not n.startswith(past)}
+        extra = sorted(extra)
         if missing or extra:
             raise PrepError(f"the index's tensor set is not the {fam.name} family's: {len(missing)} missing (first "
                             f"{missing[:3]}), {len(extra)} extra (first {extra[:3]})")
-        self.where = wm
-        self.shards = sorted(set(wm.values()))
+        self.index_shards = set(wm.values())
+        self.shards = sorted({wm[n] for n in self.spec})  # the shards the pack reads
         self.shard_residents = {s: [] for s in self.shards}
         self.shard_records = {s: [] for s in self.shards}
-        self.shard_tensors = {s: set() for s in self.shards}
+        self.shard_tensors = {s: set() for s in self.shards}  # all of a read shard's tensors, in the slice or not
         for n, s in wm.items():
-            self.shard_tensors[s].add(n)
+            if s in self.shard_tensors:
+                self.shard_tensors[s].add(n)
+        self.where = wm
         for name, _, _ in self.residents:
             self.shard_residents[wm[name]].append(name)
         for i in range(g.records):
@@ -329,7 +362,15 @@ class Ctx(fetch.Fetcher, journal.Journal):
         self.init_fetch(repo=repo, revision=rev, hub_endpoint=a.hub_endpoint, retries=a.retries,
                         fetch_with=a.fetch_with)
         self.own_release = a.pins is None
+        self.layers = a.layers
         self._plan = None
+
+    def source(self):
+        """The manifest's source pin: the release, and the layer slice when the pack is one."""
+        src = {"repository": self.repo, "revision": self.revision}
+        if self.layers is not None:
+            src["layers"] = list(self.layers)
+        return src
 
     def download(self, name):
         if not self.own_release:
@@ -342,11 +383,11 @@ class Ctx(fetch.Fetcher, journal.Journal):
                 self.ensure_source(n)
             cfg, hfq, index = (json.loads((self.src / n).read_text()) for n in
                                ("config.json", "hf_quant_config.json", "model.safetensors.index.json"))
-            self._plan = Plan(self.fam, cfg, hfq, index)
+            self._plan = Plan(self.fam, cfg, hfq, index, self.layers)
             shards = {n for n in self.table if n.endswith(".safetensors")}
-            if shards != set(self._plan.shards):
+            if shards != self._plan.index_shards:
                 raise PrepError(f"the pin table's shards differ from the index's: "
-                                f"{sorted(shards ^ set(self._plan.shards))[:5]}")
+                                f"{sorted(shards ^ self._plan.index_shards)[:5]}")
         return self._plan
 
 
@@ -385,7 +426,7 @@ def check_shard(sf, plan, name):
     if have != want:
         raise PrepError(f"{name}: tensor set differs from the index: missing {sorted(want - have)[:3]}, extra "
                         f"{sorted(have - want)[:3]}")
-    for t in sorted(have):
+    for t in sorted(have & set(plan.spec)):
         h = sf.header[t]
         dtype, shape = plan.spec[t]
         a, b = h["data_offsets"]
@@ -584,7 +625,7 @@ def step_bank(a, ctx, pass_parts=("bank",)):
     scales = [x for s in plan.shards for x in state["shards"].get(s, {}).get("global_scales", [])]
     inexact = [x for x in scales if x["how"] == "inexact"]
     idx = json.loads((ctx.src / "model.safetensors.index.json").read_text())
-    m = manifest.build(plan.geom, sums, bank_sha, ctx.repo, ctx.revision, {
+    m = manifest.build(plan.geom, sums, bank_sha, ctx.source(), {
         "family": "mlx-stream", "model_type": plan.fam.model_type,
         "global_scale_adjusted": len(scales) - len(inexact), "global_scale_inexact": len(inexact),
         "global_scale_inexact_tensors": inexact,
@@ -629,7 +670,7 @@ def verify_bank(a, ctx, plan):
     if (g.hidden, g.inter, g.experts, g.first, g.layers) != (want.hidden, want.inter, want.experts, want.first,
                                                             want.layers):
         raise PrepError("expert-manifest.json: geometry is not the config's")
-    if man.get("source") != {"repository": ctx.repo, "revision": ctx.revision} or man.get("source_files") != ctx.table:
+    if man.get("source") != ctx.source() or man.get("source_files") != ctx.table:
         raise PrepError("expert-manifest.json: source is not this release's pin table")
     path = ctx.out / "experts.bin"
     if os.path.getsize(path) != g.total:
@@ -790,6 +831,8 @@ def parse_args(argv):
     g.add_argument("--work", help="journal, state and staging directory, on --out's filesystem (default OUT/.prepare)")
     g.add_argument("--pins", metavar="JSON", help="a pin table other than the family's (a synthetic checkpoint: its "
                                                   "files are never downloaded)")
+    g.add_argument("--layers", metavar="0-N", help="a slice: the first N + 1 layers only (from 0, with a "
+                                                   "full_attention layer), for small real-weight packs")
     g.add_argument("--delete-verified", action="store_true",
                    help="shard pass: delete each shard once its residents and records are read back (the keep set "
                         "stays); verify: then delete the keep set after the parity sample passes")
@@ -818,6 +861,11 @@ def parse_args(argv):
         ap.error("--keep-for-parity must be 0 or more")
     if a.samples < 1:
         ap.error("--samples must be at least 1")
+    if a.layers is not None:
+        m = re.fullmatch(r"(\d+)-(\d+)", a.layers)
+        if not m or int(m.group(1)) > int(m.group(2)):
+            ap.error("--layers is FIRST-LAST, e.g. 0-5")
+        a.layers = (int(m.group(1)), int(m.group(2)))
     a.settings_obj = None
     if a.settings is not None:
         try:
