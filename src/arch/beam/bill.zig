@@ -85,9 +85,9 @@ pub fn kvBytes(c: *const beam.Config, cap: u64, page: u64) u64 {
 
 /// One attention tile's arrays over `keys` keys (graph.zig `attention`, every array the tile builds, live until its
 /// eval) for `n` rows: the q / k / v projections, their head views and norms, RoPE's outputs or the full layers' scaled
-/// query (bf16: one compiled kernel), the sliding mask, the attention's output and its transpose, the gate (projection,
-/// bias add, sigmoid), the gated rows, the output projection; and the one lane copy an append in flight beside its
-/// predecessor costs (a slab's K and V at `keys`, else a ring slot pair).
+/// query (bf16: one compiled kernel), the sliding mask, the attention's output and its transpose, the gate's projection,
+/// the gated rows (the bias add, the sigmoid and the product: one compiled kernel), the output projection; and the one
+/// lane copy an append in flight beside its predecessor costs (a slab's K and V at `keys`, else a ring slot pair).
 pub fn attnTileBytes(c: *const beam.Config, n: u64, keys: u64) u64 {
     const qd: u64 = @as(u64, c.n_heads) * c.head_dim;
     const kd: u64 = @as(u64, c.n_kv_heads) * c.head_dim;
@@ -96,7 +96,7 @@ pub fn attnTileBytes(c: *const beam.Config, n: u64, keys: u64) u64 {
     const kvp = n * kd * 6 * bf16;
     const mask = n * (@as(u64, c.sliding_window) + n);
     const out = n * qd * 2 * bf16;
-    const gate = n * qd * 4 * bf16;
+    const gate = n * qd * 2 * bf16;
     const proj = n * h * bf16;
     const lane = @max(2 * keys * kd * bf16, 2 * kv.ringBase(c.sliding_window) * kd * bf16);
     return q + kvp + mask + out + gate + proj + lane;
