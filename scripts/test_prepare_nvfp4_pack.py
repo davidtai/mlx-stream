@@ -220,12 +220,48 @@ class Spec(unittest.TestCase):
             with self.assertRaisesRegex(PrepError, err):
                 manifest.check(json.loads(text.replace(old, new)))
 
-    def test_global_scale_round_trip(self):
-        self.assertEqual(conv.global_scale(np.float32(0.15625 / 2688), "x"), np.float32(0.15625))
-        with self.assertRaisesRegex(PrepError, "not weight_scale_2"):
-            conv.global_scale(np.uint32(980861098).view(np.float32), "x")
+    def test_global_scale_policy(self):
+        k = np.float32(2688.0)
+        g, how, rel = conv.global_scale(np.float32(0.15625) / k, "x")
+        self.assertEqual((g, how, rel), (np.float32(0.15625), "exact", 0.0))
+        # The box's model.layers.3.mlp.experts.1.down_proj.weight_scale_2: no f32 g gives it back exactly; the nearest
+        # is f32(ws2 x 2688) = 1.21875, one rounding off (6.4e-8 relative), counted and kept.
+        w = np.float32(0.0004534040344879031)
+        g, how, rel = conv.global_scale(w, "x")
+        self.assertEqual((float(g), how), (1.21875, "inexact"))
+        self.assertNotEqual(np.float32(g / k), w)
+        self.assertLessEqual(abs(np.float32(g / k) - w), np.spacing(w))
+        self.assertLess(rel, 2.0 ** -23)
+        # Seeded random f32 scales: an exact g in the common case, the rest inexact within 1 ulp; ModelOpt's
+        # f32(amax / 2688) is always exact.
+        rng = np.random.default_rng(20261017)
+        counts = {"exact": 0, "adjusted": 0, "inexact": 0}
+        for x in (rng.random(4000) * 0.01 + 1e-6).astype(np.float32):
+            g, how, rel = conv.global_scale(x, "x")
+            counts[how] += 1
+            if how == "inexact":
+                self.assertLessEqual(abs(np.float32(g / k) - x), np.spacing(x))
+            else:
+                self.assertEqual(np.float32(g / k), x)
+        self.assertGreater(counts["exact"], counts["inexact"])
+        self.assertGreater(counts["inexact"], 0)
+        for amax in (rng.random(1000) * 30 + 1e-3).astype(np.float32):
+            self.assertEqual(conv.global_scale(np.float32(amax / k), "x")[1], "exact")
         with self.assertRaisesRegex(PrepError, "positive finite"):
             conv.global_scale(np.float32(0.0), "x")
+
+    def test_dequant_rows_accept_an_inexact_global_scale(self):
+        rng = np.random.default_rng(3)
+        codes = rng.integers(0, 256, (4, 32), dtype=np.uint8)
+        scales = rng.integers(0x30, 0x60, (4, 4), dtype=np.uint8)
+        w = np.float32(0.0004534040344879031)
+        g, how, _ = conv.global_scale(w, "x")
+        n, exact = conv.verify.nvfp4_rows(codes.tobytes(), scales.tobytes(), w, codes.tobytes(), scales.tobytes(), g,
+                                          4, 64, range(4))
+        self.assertEqual((how, n), ("inexact", 256))
+        with self.assertRaisesRegex(PrepError, "within 1 ulp"):
+            conv.verify.nvfp4_rows(codes.tobytes(), scales.tobytes(), w, codes.tobytes(), scales.tobytes(),
+                                   np.float32(1.25), 4, 64, range(4))
 
     def test_beam_pins(self):
         repo, rev, files = conv.fetch.load_pins(HERE / conv.Beam.pins, conv.Beam.repo, conv.Beam.revision,
@@ -299,9 +335,9 @@ class Resume(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
-def _ws2_bad(cfg, hfq, shards):
+def _ws2_inexact(cfg, hfq, shards):
     t = shards["model-layer-00003.safetensors"]
-    t["model.layers.3.mlp.experts.1.up_proj.weight_scale_2"] = ("F32", [], np.uint32(980861098).view(np.float32))
+    t["model.layers.3.mlp.experts.1.down_proj.weight_scale_2"] = ("F32", [], np.float32(0.0004534040344879031))
 
 
 def _nan_scale(cfg, hfq, shards):
@@ -345,7 +381,6 @@ def _sparse_first(cfg, hfq, shards):
 
 class Refusals(unittest.TestCase):
     CASES = [
-        (_ws2_bad, "f32(weight_scale_2 x 2688) / 2688"),
         (_nan_scale, "E4M3 NaN block scales"),
         (_dtype, "weight_scale: U8 [128, 16]"),
         (_shape, "gate_bias: BF16 [5]"),
@@ -368,6 +403,24 @@ class Refusals(unittest.TestCase):
                     self.assertFalse((tmp / "p" / "expert-manifest.json").exists())
                 finally:
                     shutil.rmtree(tmp)
+
+    def test_an_inexact_global_scale_is_counted_not_refused(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            fx.build(tmp / "f", SEED, _ws2_inexact)
+            rc, log = run("all", *build_args(tmp / "f", tmp / "p"))
+            self.assertEqual(rc, 0, log)
+            self.assertIn('[shard] global_scale_inexact {"tensor": "model.layers.3.mlp.experts.1.down_proj.weight_scale_2"',
+                          log)
+            m = json.loads((tmp / "p" / "expert-manifest.json").read_text())
+            self.assertEqual((m["global_scale_inexact"], m["global_scale_adjusted"]), (1, 0))
+            x = m["global_scale_inexact_tensors"][0]
+            self.assertEqual((x["layer"], x["expert"], x["proj"], x["global_scale"]), (3, 1, "down_proj", 1.21875))
+            g = manifest.check(m)
+            off = g.offset(3, 1) + g.parts[8]["offset"]
+            self.assertEqual(np.frombuffer((tmp / "p" / "experts.bin").read_bytes()[off:off + 4], "<f4")[0], 1.21875)
+        finally:
+            shutil.rmtree(tmp)
 
     def test_a_source_changed_after_pinning_refuses(self):
         tmp = Path(tempfile.mkdtemp())

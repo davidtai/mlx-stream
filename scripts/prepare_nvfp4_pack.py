@@ -33,7 +33,8 @@ build.
              into one model.safetensors whose header is computed from config.json before any shard is read; then
              model.safetensors.index.json
   bank       every routed expert's gate/up/down weight (U8 E2M1 pairs, read as U32 words), weight_scale (F8_E4M3
-             block scales, verbatim) and weight_scale_2 (f32 g = weight_scale_2 x 2688) into one record of
+             block scales, verbatim) and weight_scale_2 (the f32 g with f32(g / 2688) == weight_scale_2, else the nearest:
+             `global_scale`) into one record of
              experts.bin; each record read back and compared; input_scale dropped; then expert-manifest.json
   config     config.json by rule from the release's (model_type kept, quantization_config removed, the
              expert_streaming block added, a null eos/pad/bos id filled from generation_config.json), and the
@@ -47,9 +48,10 @@ it and read it back, so the shards never sit on disk at once. The parity keep se
 seeded) stays until `verify --delete-verified`.
 
 Refusals: every mismatch refuses by name with exit status 1: a source file's size or sha256 (the pin), the index's
-tensor set (a missing or an extra tensor), a tensor's dtype or shape, a NaN E4M3 block scale, a global scale whose
-f32(weight_scale_2 x 2688) / 2688 is not weight_scale_2, the quantization config (NVFP4, group 16, every resident
-excluded, every expert quantized), a geometry bank.zig refuses.
+tensor set (a missing or an extra tensor), a tensor's dtype or shape, a NaN E4M3 block scale, the quantization config (NVFP4, group 16, every resident
+excluded, every expert quantized), a geometry bank.zig refuses. A global scale
+with no exact f32 g (one f32 rounding, about 9 % of ModelOpt's amax / 6 / 448) is not refused: the nearest g is
+taken, counted in the manifest (`global_scale_inexact`, with its tensors) and checked by verify within 1 ulp.
 
 Requirements: Python 3.8+ and numpy (no torch, no mlx). Nothing runs on the GPU. Large files are read and written with
 F_NOCACHE on macOS. Set HF_TOKEN to send a Hugging Face token (to huggingface.co only).
@@ -94,8 +96,8 @@ TOOL = "prepare_nvfp4_pack.py"
 GLOBAL_K = verify.GLOBAL_K
 STREAMING = {"family": "mlx-stream", "format": manifest.BANK_FORMAT, "manifest": "expert-manifest.json"}
 REPACK_METHOD = ("bit-exact byte repack of the ModelOpt NVFP4 expert tensors: U8 E2M1 pairs read as U32 words, "
-                 "F8_E4M3 block scales verbatim, global scale f32(weight_scale_2 x 2688) with f32(g / 2688) == "
-                 "weight_scale_2 checked; input_scale dropped; no requantization")
+                 "F8_E4M3 block scales verbatim, global scale g with f32(g / 2688) == weight_scale_2 (MLX's "
+                 "order), else the nearest f32 g (counted in global_scale_inexact); input_scale dropped; no requantization")
 PACK_FILES = ["config.json", "model.safetensors", "model.safetensors.index.json", "experts.bin",
               "expert-manifest.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json",
               "chat_template.jinja"]
@@ -392,20 +394,38 @@ def check_shard(sf, plan, name):
 
 
 def global_scale(ws2, what):
-    """MLX's nvfp4 global scale of a ModelOpt weight_scale_2: f32(ws2 x 2688), refused unless f32(g / 2688) == ws2
-    (MLX folds g / 2688 into every block scale, so the dequant is the checkpoint's)."""
+    """MLX's nvfp4 global scale g for a ModelOpt weight_scale_2, and how it was found: (g, how, relative error).
+
+    MLX at the pinned mlx-src 64ea011cb (mlx-serve lib/mlx-src) folds g into each block scale in f32:
+    `inv_scale_enc = *global_scale / (F8E4M3_MAX * F4E2M1_MAX)` (2688.0f, mlx/backend/metal/kernels/fp4.h:3-4) at
+    fp_quantized.h:2259-2261 (fp_dequantize), :215-216 (the qmm loader) and :392-393 / :449-450 (qmv); the dequantize
+    and the qmm loader then take `scale = float(e4m3) * inv_scale_enc` in f32 (:2264-2267, :225-226) and
+    `scale * e2m1(code)` in f32 before the cast to the output dtype (:2277, :139-146); the qmv kernels multiply the
+    accumulated row by inv_scale_enc instead (:399-404). So the dequant is the checkpoint's when f32(g / 2688) is
+    weight_scale_2.
+
+    g starts at f32(ws2 x 2688); if f32(g / 2688) != ws2 (a 1-ulp rounding of the product), the f32 neighbours up to
+    4 ulps each side are tried, nearest first, and the nearest one that gives ws2 exactly is taken (`adjusted`). If
+    none does, the candidate whose f32(g / 2688) is nearest to ws2 is taken (`inexact`, its relative error returned):
+    counted in the manifest, logged, and checked by verify within 1 ulp of ws2. Neither refuses."""
     w = np.float32(ws2)
     if not np.isfinite(w) or w <= 0:
         raise PrepError(f"{what}: weight_scale_2 {float(w)!r} is not a positive finite f32")
-    g = np.float32(w * GLOBAL_K)
-    if np.float32(g / GLOBAL_K) != w:
-        raise PrepError(f"{what}: f32(weight_scale_2 x 2688) / 2688 is {float(np.float32(g / GLOBAL_K))!r}, not "
-                        f"weight_scale_2 {float(w)!r}")
-    return g
+    g0 = np.float32(w * GLOBAL_K)
+    cands, up, down = [g0], g0, g0
+    for _ in range(4):
+        up, down = np.nextafter(up, np.float32(np.inf)), np.nextafter(down, np.float32(-np.inf))
+        cands += [up, down]
+    for c in cands:
+        if np.float32(c / GLOBAL_K) == w:
+            return c, ("exact" if c == g0 else "adjusted"), 0.0
+    best = min(cands, key=lambda c: abs(float(np.float32(c / GLOBAL_K)) - float(w)))  # first (nearest g0) on ties
+    return best, "inexact", abs(float(np.float32(best / GLOBAL_K)) - float(w)) / float(w)
 
 
-def assemble_record(sf, plan, layer, expert):
-    """One record (`logical` bytes): per projection its U8 codes (as U32 words), its E4M3 scales, its global scale."""
+def assemble_record(sf, plan, layer, expert, scales=None):
+    """One record (`logical` bytes): per projection its U8 codes (as U32 words), its E4M3 scales, its global scale.
+    `scales` (a list) gets one entry per global scale that is not f32(ws2 x 2688) exactly (adjusted or inexact)."""
     parts = []
     for p in PROJ:
         def n(kind):
@@ -415,7 +435,11 @@ def assemble_record(sf, plan, layer, expert):
         if nan:
             raise PrepError(f"{n('weight_scale')}: {nan} E4M3 NaN block scales")
         ws2 = np.frombuffer(sf.raw_bytes(n("weight_scale_2")), "<f4")[0]
-        parts += [w, sc, np.array(global_scale(ws2, n("weight_scale_2")), "<f4").tobytes()]
+        g, how, rel = global_scale(ws2, n("weight_scale_2"))
+        if how != "exact" and scales is not None:
+            scales.append({"name": n("weight_scale_2"), "layer": layer, "expert": expert, "proj": p, "how": how,
+                           "weight_scale_2": float(ws2), "global_scale": float(g), "rel_error": rel})
+        parts += [w, sc, np.array(g, "<f4").tobytes()]
     rec = b"".join(bytes(x) for x in parts)
     if len(rec) != plan.geom.logical:
         raise PrepError(f"expert {layer}:{expert}: record of {len(rec)} B, want {plan.geom.logical}")
@@ -483,9 +507,15 @@ def shard_pass(a, ctx, plan, parts):
                             f"{s} residents")
                         ctx.save_state(STATE, state)
                     if "bank" in parts and not done(s, "bank"):
-                        entry["records"] = bank.write_verified(
-                            bfd, [(f"{layer}:{e}", g.offset(layer, e), assemble_record(sf, plan, layer, e),
-                                   g.stride - g.logical) for layer, e in plan.shard_records[s]], f"{s} records")
+                        scales = []
+                        recs = [(f"{layer}:{e}", g.offset(layer, e), assemble_record(sf, plan, layer, e, scales),
+                                 g.stride - g.logical) for layer, e in plan.shard_records[s]]
+                        for x in scales:
+                            if x["how"] == "inexact":
+                                ctx.log("shard", "global_scale_inexact", tensor=x["name"], rel_error=x["rel_error"],
+                                        weight_scale_2=x["weight_scale_2"], global_scale=x["global_scale"])
+                        entry["global_scales"] = scales
+                        entry["records"] = bank.write_verified(bfd, recs, f"{s} records")
                         ctx.save_state(STATE, state)
                 finally:
                     sf.close()
@@ -551,13 +581,18 @@ def step_bank(a, ctx, pass_parts=("bank",)):
     bank_sha = sha256_file(path)
     ctx.log("bank", "sha256", sha256=bank_sha, wall_s=round(time.time() - t0, 1))
     sums = {k: h for s in plan.shards for k, h in state["shards"].get(s, {}).get("records", {}).items()}
+    scales = [x for s in plan.shards for x in state["shards"].get(s, {}).get("global_scales", [])]
+    inexact = [x for x in scales if x["how"] == "inexact"]
     idx = json.loads((ctx.src / "model.safetensors.index.json").read_text())
     m = manifest.build(plan.geom, sums, bank_sha, ctx.repo, ctx.revision, {
         "family": "mlx-stream", "model_type": plan.fam.model_type,
+        "global_scale_adjusted": len(scales) - len(inexact), "global_scale_inexact": len(inexact),
+        "global_scale_inexact_tensors": inexact,
         "repack": {"family": plan.fam.name, "method": REPACK_METHOD, "tool": f"scripts/{TOOL}"},
         "source_files": ctx.table, "source_index_metadata": idx.get("metadata", {})})
     manifest.write(ctx.out / "expert-manifest.json", m)
-    ctx.log("bank", "done", records=plan.geom.records, bank_sha256=bank_sha,
+    ctx.log("bank", "done", records=plan.geom.records, bank_sha256=bank_sha, global_scale_adjusted=len(scales) - len(inexact),
+            global_scale_inexact=len(inexact),
             outputs=ctx.outputs("out/experts.bin", "out/expert-manifest.json"),
             hashes={"out/experts.bin": {"stamp": stamp(path), "sha256": bank_sha}})
 
@@ -602,6 +637,28 @@ def verify_bank(a, ctx, plan):
     sha = ctx.cached_sha("out/experts.bin") or sha256_file(path)
     if sha != man["output_files"]["experts.bin"]["sha256"]:
         raise ShaMismatch("experts.bin", man["output_files"]["experts.bin"]["sha256"], sha)
+    inexact = man.get("global_scale_inexact_tensors", [])
+    if man.get("global_scale_inexact") != len(inexact):
+        raise PrepError("expert-manifest.json: global_scale_inexact is not the length of its tensor list")
+    gfd = open_nocache(path)
+    try:
+        for x in inexact:
+            gs = g.parts[3 * PROJ.index(x["proj"]) + 2]
+            gv = np.frombuffer(bytes(read_exact(gfd, 4, g.offset(x["layer"], x["expert"]) + gs["offset"])), "<f4")[0]
+            w = np.float32(x["weight_scale_2"])
+            if gv != np.float32(x["global_scale"]) or abs(np.float32(gv / GLOBAL_K) - w) > np.spacing(w):
+                raise PrepError(f"{x['name']}: the bank's global scale {float(gv)!r} is not within 1 ulp of "
+                                f"weight_scale_2 x 2688 ({float(w)!r})")
+            shard = plan.where[x["name"]]
+            if (ctx.src / shard).exists():
+                sf = StFile(ctx.src / shard)
+                try:
+                    if np.frombuffer(sf.raw_bytes(x["name"]), "<f4")[0] != w:
+                        raise PrepError(f"{x['name']}: the manifest's weight_scale_2 is not {shard}'s")
+                finally:
+                    sf.close()
+    finally:
+        os.close(gfd)
     avail = [(layer, e, s) for s in plan.routed_shards if (ctx.src / s).exists() for layer, e in plan.shard_records[s]]
     if not avail:
         raise PrepError(f"no routed shard in {ctx.src} to sample the bank against (fetch one, or keep one with "

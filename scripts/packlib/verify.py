@@ -54,18 +54,19 @@ def codes_of(u8, out, inn):
 
 def nvfp4_rows(codes_u8, scales_u8, ws2, rec_codes, rec_scales, g, out, inn, rows):
     """Rows of one projection: the checkpoint's e2m1(code) x e4m3(scale) x weight_scale_2 (f32, left to right) against
-    the bank's e2m1(code) x (e4m3(scale) x (g / 2688)) (bank.zig dequantRow) from the record's bytes: within 2 f32
-    ulps, and g / 2688 == weight_scale_2 exactly. Returns (values, exactly equal)."""
-    if np.float32(g / GLOBAL_K) != np.float32(ws2):
-        raise PrepError(f"dequant check: g / 2688 = {float(np.float32(g / GLOBAL_K))!r} != weight_scale_2 {float(ws2)!r}")
+    the bank's e2m1(code) x (e4m3(scale) x (g / 2688)) (bank.zig dequantRow, MLX's order) from the record's bytes:
+    g / 2688 within 1 f32 ulp of weight_scale_2, the values within 2 f32 ulps (3 when g / 2688 is not weight_scale_2
+    exactly). Returns (values, exactly equal)."""
+    w, inv = np.float32(ws2), np.float32(g / GLOBAL_K)
+    if abs(inv - w) > np.spacing(w):
+        raise PrepError(f"dequant check: g / 2688 = {float(inv)!r} is not within 1 ulp of weight_scale_2 {float(w)!r}")
     r = np.array(sorted(rows))
     sc = np.frombuffer(bytes(scales_u8), np.uint8).reshape(out, inn // 16)[r]
     rsc = np.frombuffer(bytes(rec_scales), np.uint8).reshape(out, inn // 16)[r]
-    ref = (E2M1[codes_of(codes_u8, out, inn)[r]] * np.repeat(E4M3[sc], 16, axis=1)).astype(np.float32) * np.float32(ws2)
-    inv = np.float32(g / GLOBAL_K)
+    ref = (E2M1[codes_of(codes_u8, out, inn)[r]] * np.repeat(E4M3[sc], 16, axis=1)).astype(np.float32) * w
     got = E2M1[codes_of(rec_codes, out, inn)[r]] * np.repeat((E4M3[rsc] * inv).astype(np.float32), 16, axis=1)
     ref, got = ref.astype(np.float32), got.astype(np.float32)
-    off = np.abs(ref - got) > 2 * np.spacing(np.abs(ref))
+    off = np.abs(ref - got) > (2 if inv == w else 3) * np.spacing(np.abs(ref))
     if off.any():
-        raise PrepError(f"dequant check: {int(off.sum())} values off the checkpoint's by more than 2 f32 ulps")
+        raise PrepError(f"dequant check: {int(off.sum())} values off the checkpoint's by more than the f32 rounding")
     return ref.size, int(np.count_nonzero(ref == got))

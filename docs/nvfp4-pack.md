@@ -39,16 +39,22 @@ down) has three parts:
 |---|---|---|---|
 | `<proj>.weight` | U32 | [out, in / 8] | The ModelOpt `weight` (U8 [out, in / 2], two E2M1 codes per byte, element 2k in the low nibble), read as little-endian words. Element j of a word is in bits 4 x (j % 8). |
 | `<proj>.scales` | U8 | [out, in / 16] | The ModelOpt `weight_scale` (F8_E4M3, one block scale per 16 inputs), as is. |
-| `<proj>.global_scale` | F32 | [] | g = f32(`weight_scale_2` x 2688). |
+| `<proj>.global_scale` | F32 | [] | g, from `weight_scale_2` (below). |
 
 The gate/up span is the first six parts. The down span is the last three. The arch reads each span in one read. Each
 projection's global scale is in the span of its weights. Records start at every `record_stride` bytes: the record's
 bytes rounded up to 4,096 B. The padding is zero. Records are in order of routed layer, then expert. The script drops
 the `input_scale` tensors: the activations stay BF16.
 
-A value is e2m1(code) x (e4m3(scale) x (g / 2688)) in f32, in that order (MLX's nvfp4 dequantize). The script refuses
-a tensor where f32(g / 2688) is not `weight_scale_2`, so this value is the checkpoint's e2m1 x e4m3 x
-`weight_scale_2` within f32 rounding.
+MLX computes a value as e2m1(code) x (e4m3(scale) x (g / 2688)), all in f32 (mlx-src 64ea011cb,
+`mlx/backend/metal/kernels/fp_quantized.h`: `fp_dequantize` at lines 2259-2277, the qmm loader at lines 215-226). The
+qmv kernels multiply the row's sum by g / 2688. The value is the checkpoint's e2m1 x e4m3 x `weight_scale_2` when
+f32(g / 2688) is `weight_scale_2`. The script starts at g = f32(`weight_scale_2` x 2688) and tries the f32 values up
+to 4 ulps on each side. It takes the nearest g that gives `weight_scale_2` exactly. Some scales have no such g (about
+9 % when ModelOpt computes amax / 6 / 448 with two roundings). For those, the script takes the g whose g / 2688 is
+nearest, logs the tensor and its relative error (1 f32 ulp, at most 1.2e-7), and counts it in the manifest
+(`global_scale_inexact` and `global_scale_inexact_tensors`). The verify step checks that g / 2688 is within 1 ulp of
+`weight_scale_2` for each of them. The script does not refuse a global scale.
 
 | family | hidden | moe_intermediate | experts | routed layers | record | stride | `experts.bin` |
 |---|---|---|---|---|---|---|---|
