@@ -1666,7 +1666,7 @@ const HoldLog = struct {
     }
 };
 
-test "mimo stream source: a host-built hit wave holds the barrier's warm arm from before the ids' host read to the wave's commit; a device hit wave holds nothing" {
+test "mimo stream source: the routing barrier's hold (beam's host-built hit wave) spans the ids' host read to the hit wave's commit; a device hit wave holds nothing" {
     const testing = std.testing;
     const a = testing.allocator;
     const Tr = HitTraceMath.Tr;
