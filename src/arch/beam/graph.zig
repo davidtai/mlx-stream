@@ -578,12 +578,14 @@ fn select(g: *G, c: *const beam.Config, choice: T) !T {
     const group_scores = try g.sum(try g.adopt(top2), -1, false);
     const gpart = try g.argpartition(try g.neg(group_scores), tg - 1, -1);
     const keep_groups = try g.slice(gpart, &.{ 0, 0 }, &.{ n, tg }, &.{ 1, 1 });
-    // [n, tg, 1] against every group id [1, 1, ng]: a group is kept when any kept index names it.
+    // [n, tg, 1] against every group id [1, 1, ng]: a group is kept when any kept index names it (MLX sums bools as
+    // int32).
     const ids_row = try g.reshape(try g.arange(0, @floatFromInt(c.n_group), 1, .uint32), &.{ 1, 1, ng });
     const hit = try g.equal(try g.reshape(try g.astype(keep_groups, .uint32), &.{ n, tg, 1 }), ids_row);
-    const kept = try g.greater(try g.sum(try g.astype(hit, .int32), 1, false), try g.scalar(0, .int32));
-    const mask = try g.reshape(try g.broadcastTo(try g.reshape(kept, &.{ n, ng, 1 }), &.{ n, ng, eg }), &.{ n, e });
-    const masked = try g.where(mask, choice, try g.scalar(-std.math.inf(f64), .float32));
+    const kept = try g.greater(try g.sum(hit, 1, false), try g.scalar(0, .int32));
+    // The other groups' choice scores -inf, on the grouped view (the where broadcasts the [n, ng, 1] mask itself: no
+    // [n, experts] mask is built), then back to [n, experts] (a view of the where's output).
+    const masked = try g.reshape(try g.where(try g.reshape(kept, &.{ n, ng, 1 }), grouped, try g.scalar(-std.math.inf(f64), .float32)), &.{ n, e });
     const part = try g.argpartition(try g.neg(masked), k - 1, -1);
     return g.astype(try g.slice(part, &.{ 0, 0 }, &.{ n, k }, &.{ 1, 1 }), .uint32);
 }
@@ -921,6 +923,42 @@ test "beam graph GPU: the soft cap is one kernel, the op chain bit for bit (a st
         const cap: f64 = c.final_logit_softcapping;
         const want = try softcapChain(&g, l, try g.scalar(1.0 / cap, .float32), try g.scalar(cap, .float32));
         try expectBits("softcap", &g, want, try softcap(&g, &c, l));
+    }
+}
+
+test "beam graph GPU: the group top-k picks the experts its earlier form (the cast hits, the broadcast mask) picked" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    const e: c_int = @intCast(c.n_routed_experts);
+    const ng: c_int = @intCast(c.n_group);
+    const eg: c_int = @intCast(c.groupExperts());
+    const k: c_int = @intCast(c.n_experts_per_tok);
+    const tg: c_int = @intCast(c.topk_group);
+    for ([_]c_int{ 1, 16_384 }, 0..) |n, i| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        // Choice scores as the router makes them: sigmoid scores plus a small correction, f32 [n, experts].
+        const z = try g.astype(try testBf16(a, &g, &.{ n, e }, 2.0, 800 + i), .float32);
+        const choice = try g.add(try g.sigmoid(z), try g.astype(try testBf16(a, &g, &.{e}, 0.01, 900 + i), .float32));
+        // The earlier form: the hits cast to int32 before the sum, the group mask broadcast to [n, experts] (a copy).
+        const grouped = try g.reshape(choice, &.{ n, ng, eg });
+        var top2 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_topk_axis(&top2, grouped, 2, -1, g.s));
+        const gpart = try g.argpartition(try g.neg(try g.sum(try g.adopt(top2), -1, false)), tg - 1, -1);
+        const keep = try g.slice(gpart, &.{ 0, 0 }, &.{ n, tg }, &.{ 1, 1 });
+        const ids_row = try g.reshape(try g.arange(0, @floatFromInt(c.n_group), 1, .uint32), &.{ 1, 1, ng });
+        const hit = try g.equal(try g.reshape(keep, &.{ n, tg, 1 }), ids_row);
+        const kept = try g.greater(try g.sum(try g.astype(hit, .int32), 1, false), try g.scalar(0, .int32));
+        const mask = try g.reshape(try g.broadcastTo(try g.reshape(kept, &.{ n, ng, 1 }), &.{ n, ng, eg }), &.{ n, e });
+        const masked = try g.where(mask, choice, try g.scalar(-std.math.inf(f64), .float32));
+        const want = try g.slice(try g.argpartition(try g.neg(masked), k - 1, -1), &.{ 0, 0 }, &.{ n, k }, &.{ 1, 1 });
+        try expectBits("group_topk", &g, want, try select(&g, &c, choice));
     }
 }
 
