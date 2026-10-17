@@ -285,6 +285,17 @@ fn parityRun(dir: []const u8, refs: []const u8, rows: ?u32) !void {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    // The served condition: the host's wired policy `max` (every MLX buffer in MLX's residency set). The prompt
+    // combine's in-place text (Beam's hidden size) reads its sources unbound, through that set; a test binary has no
+    // wired limit, so an unbound source is resident only by chance. Set for the construction's life, then put back.
+    const max_rec = mlx.maxRecommendedWorkingSet();
+    if (max_rec == 0) return error.BeamParityResidency;
+    var old_wired: usize = 0;
+    try mlx.check(mlx.mlx_set_wired_limit(&old_wired, max_rec));
+    defer {
+        var ignored: usize = 0;
+        _ = mlx.mlx_set_wired_limit(&ignored, old_wired);
+    }
     var pack_dir = try std.Io.Dir.openDirAbsolute(io, dir, .{});
     const text = try pack_dir.readFileAlloc(io, "config.json", a, .limited(1 << 20));
     pack_dir.close(io);
