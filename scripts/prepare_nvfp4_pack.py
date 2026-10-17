@@ -3,7 +3,10 @@
 
 The routed experts become one NVFP4 expert bank (experts.bin + expert-manifest.json, format
 mlx-stream-nvfp4-expert-bank-v1, layout nvfp4-gud-9part: src/arch/glm5_next/bank.zig is the spec); every other tensor
-becomes the residents (model.safetensors + index), the release's bytes and dtypes; nothing is quantized or rounded.
+becomes the residents (model.safetensors + index, each tensor's sha256 in the index). The residents tier (`--residents`):
+bf16 (the default) writes the release's bytes and dtypes, nothing quantized or rounded; q8 writes every linear of the
+trunk and the head as MLX affine 8-bit group 64 (packlib/affine.py: U32 codes, BF16 scales and biases; config.json
+`residents_format: affine8_g64`) and every other resident as released.
 
 Families (`--family`):
   beam       reflection/Beam-1.0-501B-A23B-NVFP4 at 3bd1dccf13c8f7aa3d6732c5aaa48ba107a2c086 (model_type beam). The
@@ -29,9 +32,9 @@ build.
   fetch      the Hub tree at the revision (sizes, LFS oids), then resumable HTTP range downloads into SRC (or `hf
              download` with --fetch-with hf), each file's sha256 checked against the pin (`--files meta` fetches only
              the metadata files; `--files all`, the default, every shard too)
-  residents  every non-expert tensor, as released (BF16; the routers' weight and e_score_correction_bias F32), copied
-             into one model.safetensors whose header is computed from config.json before any shard is read; then
-             model.safetensors.index.json
+  residents  every non-expert tensor, as released (BF16; the routers' weight and e_score_correction_bias F32) or the
+             q8 tier's, into one model.safetensors whose header is computed from config.json before any shard is read;
+             then model.safetensors.index.json with each tensor's sha256
   bank       every routed expert's gate/up/down weight (U8 E2M1 pairs, read as U32 words), weight_scale (F8_E4M3
              block scales, verbatim) and weight_scale_2 (the f32 g with f32(g / 2688) == weight_scale_2, else the nearest:
              `global_scale`) into one record of
@@ -41,10 +44,14 @@ build.
              tokenizer files, generation_config.json and chat_template.jinja copied
   verify     the pack's file set, the config and the manifest against the spec, a seeded random sample of records
              against the source shards (bytes and manifest sha256), a dequant spot check of a few rows per projection,
-             every resident tensor's sha256, then pack-sha256.txt
+             every resident tensor's sha256 (and each q8 site quantized again from its source to the same bytes, within
+             1.5 scales of the release's values), then pack-sha256.txt
 
 --layers 0-N builds a slice: the first N + 1 layers (from 0, with a full_attention layer), config.json cut to them,
 the embedding, final norm and head kept, the manifest's source pin with "layers": [0, N] (docs/nvfp4-pack.md).
+
+--bank-from PACK hard-links experts.bin and expert-manifest.json from PACK (the same release, slice and geometry, on one
+filesystem) instead of building them: a q8 pack beside its bf16 pack writes only its residents.
 
 The residents and the bank take each shard in one pass: with --delete-verified a shard is deleted once both have taken
 it and read it back, so the shards never sit on disk at once. The parity keep set (--keep-for-parity routed shards,
@@ -89,7 +96,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # packlib, beside this script (python3 -I keeps the script's directory off sys.path)
 
 from packlib import PrepError, ShaMismatch  # noqa: E402
-from packlib import bank, fetch, journal, manifest, verify  # noqa: E402
+from packlib import affine, bank, fetch, journal, manifest, verify  # noqa: E402
 from packlib.manifest import GROUP, PROJ, Geometry  # noqa: E402
 from packlib.nocache import (copy_verified, open_nocache, pwrite_all, read_exact, sha256_file, stamp,  # noqa: E402
                              write_text_atomic)
@@ -213,11 +220,20 @@ class Beam:
     def expert_name(self, layer, expert, proj, kind):
         return f"{self.layer_prefix}{layer}.mlp.experts.{expert}.{proj}.{kind}"
 
-    def pack_config(self, cfg, gen, settings):
-        """config.json by rule: the release's keys, `quantization_config` removed (the residents are as released and
-        the bank's quantization is the manifest's; mlx-serve routes a `quant_method: modelopt` config to its resident
-        ModelOpt loader), a null eos/pad/bos id filled from generation_config.json, the expert_streaming block."""
+    def q8_site(self, name):
+        """A resident that the q8 tier quantizes: the weight of every linear of the trunk (the attention's q / k / v /
+        gate / o, the dense MLP's gate / up / down) and the head. The embedding (a lookup), the norms, the gate biases
+        and the routers (F32, as the reference keeps them) stay as released."""
+        return name == "lm_head.weight" or (name.startswith(self.layer_prefix) and name.endswith("_proj.weight"))
+
+    def pack_config(self, cfg, gen, settings, residents_format=None):
+        """config.json by rule: the release's keys, `quantization_config` removed (the residents are as released or the
+        tier's, and the bank's quantization is the manifest's; mlx-serve routes a `quant_method: modelopt` config to its
+        resident ModelOpt loader), a null eos/pad/bos id filled from generation_config.json, the expert_streaming block,
+        and `residents_format` when the residents are not the release's BF16 (the q8 tier: affine.FORMAT)."""
         out = {k: v for k, v in cfg.items() if k != "quantization_config"}
+        if residents_format is not None:
+            out["residents_format"] = residents_format
         for key in ("eos_token_id", "pad_token_id", "bos_token_id"):
             if out.get(key) is None and gen.get(key) is not None:
                 out[key] = gen[key]
@@ -263,15 +279,30 @@ class Plan:
     """Computed once from the verified config.json, hf_quant_config.json and index, before any shard is read: the
     tensor spec, the residents' header and offsets, and each shard's residents and records."""
 
-    def __init__(self, fam, cfg, hfq, index, layers=None):
+    def __init__(self, fam, cfg, hfq, index, layers=None, tier="bf16"):
         full_layers = _count(fam.text(cfg), "num_hidden_layers")
         self.layers = layers
         if layers is not None:
             cfg = fam.slice(cfg, layers)
         self.fam, self.cfg = fam, cfg
         self.geom = g = fam.geometry(cfg)
-        self.residents = fam.residents(cfg)
+        self.residents = fam.residents(cfg)  # the release's residents, as the source shards hold them
         self.spec = {name: (dtype, shape) for name, dtype, shape in self.residents}  # name -> (dtype, shape)
+        # The residents tier (`--residents`): bf16 writes the release's tensors; q8 writes each `q8_site` as its three
+        # affine tensors (packlib/affine.py) and every other resident as released. `layout`: the pack's tensors.
+        self.tier = tier
+        self.quantized = {n for n, dt, sh in self.residents if tier == "q8" and fam.q8_site(n)}
+        self.layout = []
+        for n, dt, sh in self.residents:
+            if n not in self.quantized:
+                self.layout.append((n, dt, sh))
+                continue
+            affine.check_shape(n, sh)
+            if dt != "BF16":
+                raise PrepError(f"{n}: {dt}: the q8 residents tier quantizes BF16 projections")
+            p, (out, inn) = n[:-len(".weight")], sh
+            self.layout += [(p + ".weight", "U32", [out, inn // 4]), (p + ".scales", "BF16", [out, inn // affine.GROUP]),
+                            (p + ".biases", "BF16", [out, inn // affine.GROUP])]
         self.expert_of = {}  # name -> (layer, expert, proj, kind)
         for layer in range(g.first, g.first + g.layers):
             for e in range(g.experts):
@@ -313,12 +344,12 @@ class Plan:
                 raise PrepError(f"expert {layer}:{e}: its tensors span shards {sorted(shards)} (one shard per record)")
             self.shard_records[shards.pop()].append((layer, e))
         self.routed_shards = [s for s in self.shards if self.shard_records[s]]
-        pre, self.res_payload = header_bytes({n: (dt, sh, nbytes(dt, sh)) for n, dt, sh in self.residents},
+        pre, self.res_payload = header_bytes({n: (dt, sh, nbytes(dt, sh)) for n, dt, sh in self.layout},
                                              RESIDENTS_META)
         self.res_header = bytes(pre)
         self.res_size = len(pre) + self.res_payload
         self.res_offset, off = {}, len(pre)
-        for n, dt, sh in self.residents:
+        for n, dt, sh in self.layout:
             self.res_offset[n] = off
             off += nbytes(dt, sh)
         check_quant(cfg, hfq, self)
@@ -363,6 +394,7 @@ class Ctx(fetch.Fetcher, journal.Journal):
                         fetch_with=a.fetch_with)
         self.own_release = a.pins is None
         self.layers = a.layers
+        self.tier = a.residents
         self._plan = None
 
     def source(self):
@@ -383,7 +415,7 @@ class Ctx(fetch.Fetcher, journal.Journal):
                 self.ensure_source(n)
             cfg, hfq, index = (json.loads((self.src / n).read_text()) for n in
                                ("config.json", "hf_quant_config.json", "model.safetensors.index.json"))
-            self._plan = Plan(self.fam, cfg, hfq, index, self.layers)
+            self._plan = Plan(self.fam, cfg, hfq, index, self.layers, self.tier)
             shards = {n for n in self.table if n.endswith(".safetensors")}
             if shards != self._plan.index_shards:
                 raise PrepError(f"the pin table's shards differ from the index's: "
@@ -509,16 +541,31 @@ def open_residents_stage(ctx, plan, state):
     return fd
 
 
+def resident_items(sf, plan, shard):
+    """The pack's tensors of one shard's residents as `bank.write_verified` takes them, (name, offset, bytes, 0): a
+    release tensor as is, or (the q8 tier) a quantized site's words, scales and biases (packlib/affine.py)."""
+    items = []
+    for t in plan.shard_residents[shard]:
+        if t not in plan.quantized:
+            items.append((t, plan.res_offset[t], sf.raw_bytes(t), 0))
+            continue
+        p = t[:-len(".weight")]
+        for kind, arr in zip((".weight", ".scales", ".biases"), affine.quantize(sf.array(t))):
+            items.append((p + kind, plan.res_offset[p + kind], arr.tobytes(), 0))
+    return items
+
+
 def shard_pass(a, ctx, plan, parts):
     """Each shard in index order: its residents (`residents` in parts) and its records (`bank`), each written, synced,
     read back and kept in the state; with --delete-verified a shard is deleted once both are taken (keep set
-    excepted)."""
+    excepted). With --bank-from the records are the other pack's (step_bank links them)."""
     state = ctx.load_state(STATE, {"shards": {}})
     ss, g = state["shards"], plan.geom
 
     def done(s, part):
-        return ("residents" in ss.get(s, {}) or not plan.shard_residents[s]) if part == "residents" else \
-               ("records" in ss.get(s, {}) or not plan.shard_records[s])
+        if part == "residents":
+            return "residents" in ss.get(s, {}) or not plan.shard_residents[s]
+        return a.bank_from is not None or "records" in ss.get(s, {}) or not plan.shard_records[s]
 
     todo = [s for s in plan.shards if not all(done(s, p) for p in parts)]
     keep = keep_set(a, plan)
@@ -543,9 +590,7 @@ def shard_pass(a, ctx, plan, parts):
                     check_shard(sf, plan, s)
                     entry = ss.setdefault(s, {})
                     if "residents" in parts and not done(s, "residents"):
-                        entry["residents"] = bank.write_verified(
-                            rfd, [(t, plan.res_offset[t], sf.raw_bytes(t), 0) for t in plan.shard_residents[s]],
-                            f"{s} residents")
+                        entry["residents"] = bank.write_verified(rfd, resident_items(sf, plan, s), f"{s} residents")
                         ctx.save_state(STATE, state)
                     if "bank" in parts and not done(s, "bank"):
                         scales = []
@@ -595,17 +640,53 @@ def step_residents(a, ctx, pass_parts=("residents",)):
         os.replace(stage, ctx.out / "model.safetensors")
     elif not (ctx.out / "model.safetensors").exists():
         raise PrepError("model.safetensors is neither staged nor in the pack: delete the state file to rebuild")
-    index = {"metadata": {"total_size": plan.res_payload},
-             "weight_map": {n: "model.safetensors" for n in sorted(n for n, _, _ in plan.residents)}}
-    write_text_atomic(ctx.out / "model.safetensors.index.json", json.dumps(index, indent=2) + "\n")
     sums = {t: h for s in plan.shards for t, h in state["shards"].get(s, {}).get("residents", {}).items()}
+    names = sorted(n for n, _, _ in plan.layout)
+    if set(sums) != set(names):
+        raise PrepError(f"the state's residents are not the plan's layout: {sorted(set(names) ^ set(sums))[:3]}")
+    index = {"metadata": {"total_size": plan.res_payload}, "weight_map": {n: "model.safetensors" for n in names},
+             "sha256": {n: sums[n] for n in names}}
+    write_text_atomic(ctx.out / "model.safetensors.index.json", json.dumps(index, indent=2) + "\n")
     write_text_atomic(ctx.work / "residents-sha256.json", json.dumps(sums, indent=0, sort_keys=True))
-    ctx.log("residents", "done", tensors=len(plan.residents), payload=plan.res_payload, size=plan.res_size,
+    ctx.log("residents", "done", tier=plan.tier, tensors=len(plan.layout), quantized=len(plan.quantized),
+            payload=plan.res_payload, size=plan.res_size,
             outputs=ctx.outputs("out/model.safetensors", "out/model.safetensors.index.json",
                                 "work/residents-sha256.json"))
 
 
 # ---- bank ----------------------------------------------------------------------------------------------------------
+
+def link_bank(a, ctx, plan):
+    """--bank-from PACK: experts.bin and expert-manifest.json hard-linked from PACK (a pack of the same release, slice
+    and geometry: a q8 pack beside its bf16 pack has the same bank, byte for byte). verify checks the bank as built."""
+    src = Path(a.bank_from).expanduser().resolve()
+    try:
+        man = json.loads((src / "expert-manifest.json").read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise PrepError(f"--bank-from {src}: expert-manifest.json: {e}") from None
+    g, want = manifest.check(man), plan.geom
+    if (g.hidden, g.inter, g.experts, g.first, g.layers) != (want.hidden, want.inter, want.experts, want.first,
+                                                            want.layers):
+        raise PrepError(f"--bank-from {src}: its bank's geometry is not this config's")
+    if man.get("source") != ctx.source() or man.get("source_files") != ctx.table:
+        raise PrepError(f"--bank-from {src}: its manifest's source is not this release's pin table (or slice)")
+    for n in ("experts.bin", "expert-manifest.json"):
+        have, dst = src / n, ctx.out / n
+        if have.is_symlink() or not have.is_file():
+            raise PrepError(f"--bank-from {src}: {n} is not a regular file")
+        if dst.exists():
+            if os.stat(dst).st_ino == os.stat(have).st_ino and os.stat(dst).st_dev == os.stat(have).st_dev:
+                continue
+            raise PrepError(f"{dst} exists and is not a link of {have}: delete it to link the bank")
+        try:
+            os.link(have, dst)
+        except OSError as e:
+            raise PrepError(f"--bank-from: {have} -> {dst}: {e} (a hard link needs one filesystem)") from None
+    if os.path.getsize(ctx.out / "experts.bin") != g.total:
+        raise PrepError(f"--bank-from {src}: experts.bin is not {g.total} B")
+    ctx.log("bank", "done", linked_from=str(src), records=g.records,
+            outputs=ctx.outputs("out/experts.bin", "out/expert-manifest.json"))
+
 
 def step_bank(a, ctx, pass_parts=("bank",)):
     plan = ctx.plan()
@@ -613,6 +694,8 @@ def step_bank(a, ctx, pass_parts=("bank",)):
     if done and ctx.unchanged(done):
         ctx.log("bank", "skip", reason="done and unchanged")
         return
+    if a.bank_from is not None:
+        return link_bank(a, ctx, plan)
     state = shard_pass(a, ctx, plan, set(pass_parts))
     missing = [s for s in plan.routed_shards if "records" not in state["shards"].get(s, {})]
     if missing:
@@ -643,7 +726,7 @@ def step_bank(a, ctx, pass_parts=("bank",)):
 def step_config(a, ctx):
     plan = ctx.plan()
     gen = json.loads((ctx.src / "generation_config.json").read_text())
-    cfg = plan.fam.pack_config(plan.cfg, gen, a.settings_obj)
+    cfg = plan.fam.pack_config(plan.cfg, gen, a.settings_obj, affine.FORMAT if plan.tier == "q8" else None)
     write_text_atomic(ctx.out / "config.json", json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
     for n in COPIES:
         copy_verified(ctx.src / n, ctx.out / n, ctx.table[n]["sha256"])
@@ -658,6 +741,10 @@ def verify_config(ctx, plan):
     if cfg.get("model_type") != plan.fam.model_type or "quantization_config" in cfg:
         raise PrepError(f"config.json: model_type {cfg.get('model_type')}, quantization_config "
                         f"{'present' if 'quantization_config' in cfg else 'absent'}: rerun the config step")
+    want = affine.FORMAT if plan.tier == "q8" else None
+    if cfg.get("residents_format") != want:
+        raise PrepError(f"config.json: residents_format {cfg.get('residents_format')!r}, the {plan.tier} tier's is "
+                        f"{want!r}: rerun the config step")
     block = {k: v for k, v in (cfg.get("expert_streaming") or {}).items() if k != "settings"}
     if block != STREAMING:
         raise PrepError(f"config.json: expert_streaming {cfg.get('expert_streaming')}, want {STREAMING}")
@@ -750,32 +837,55 @@ def verify_bank(a, ctx, plan):
 
 
 def verify_residents(ctx, plan):
+    """Every tensor of model.safetensors against its read-back sha256 and the index's; each resident whose source shard
+    is in SRC against it: a release tensor byte for byte, a q8 site quantized again from the source to the same bytes,
+    its codes within 1.5 scales of the release's values (packlib/affine.py `error`)."""
     sums = json.loads((ctx.work / "residents-sha256.json").read_text())
+    idx = json.loads((ctx.out / "model.safetensors.index.json").read_text())
+    names = {n for n, _, _ in plan.layout}
+    if set(idx.get("weight_map", {})) != names or idx.get("metadata", {}).get("total_size") != plan.res_payload:
+        raise PrepError("model.safetensors.index.json does not list exactly the residents")
+    if idx.get("sha256") != {n: sums.get(n) for n in names}:
+        raise PrepError("model.safetensors.index.json: its sha256 map is not the residents' read-back sha256")
     fd = open_nocache(ctx.out / "model.safetensors")
-    src = {}
+    src, errors = {}, []
     try:
         if os.fstat(fd).st_size != plan.res_size or bytes(read_exact(fd, len(plan.res_header), 0)) != plan.res_header:
             raise PrepError("model.safetensors: size or header is not the config's residents layout")
-        for name, dt, sh in plan.residents:
+        for name, dt, sh in plan.layout:
             got = hashlib.sha256(read_exact(fd, nbytes(dt, sh), plan.res_offset[name])).hexdigest()
             if got != sums.get(name):
                 raise ShaMismatch(f"model.safetensors {name}", sums.get(name), got)
-            shard = plan.where[name]
-            if (ctx.src / shard).exists():
-                if shard not in src:
-                    ctx.ensure_source(shard, fetch=False)
-                    src[shard] = StFile(ctx.src / shard)
-                if hashlib.sha256(src[shard].raw_bytes(name)).hexdigest() != got:
-                    raise PrepError(f"model.safetensors {name} differs from {shard}")
     finally:
         os.close(fd)
+    try:
+        for name, _, _ in plan.residents:
+            shard = plan.where[name]
+            if not (ctx.src / shard).exists():
+                continue
+            if shard not in src:
+                ctx.ensure_source(shard, fetch=False)
+                src[shard] = StFile(ctx.src / shard)
+            if name not in plan.quantized:
+                if hashlib.sha256(src[shard].raw_bytes(name)).hexdigest() != sums[name]:
+                    raise PrepError(f"model.safetensors {name} differs from {shard}")
+                continue
+            w = src[shard].array(name)
+            q = affine.quantize(w)
+            p = name[:-len(".weight")]
+            for kind, arr in zip((".weight", ".scales", ".biases"), q):
+                if hashlib.sha256(arr.tobytes()).hexdigest() != sums[p + kind]:
+                    raise PrepError(f"model.safetensors {p + kind} is not the q8 tier's quantization of {shard}'s {name}")
+            rel, worst = affine.error(w, *q)
+            if worst > 1.5:
+                raise PrepError(f"{name}: a q8 value is {worst:.3f} scales off the release's (the bound is 1.5)")
+            errors.append((rel, worst))
+    finally:
         for f in src.values():
             f.close()
-    idx = json.loads((ctx.out / "model.safetensors.index.json").read_text())
-    if set(idx.get("weight_map", {})) != {n for n, _, _ in plan.residents} or \
-            idx.get("metadata", {}).get("total_size") != plan.res_payload:
-        raise PrepError("model.safetensors.index.json does not list exactly the residents")
-    ctx.log("verify", "residents", tensors=len(plan.residents), against_source=len(src))
+    ctx.log("verify", "residents", tier=plan.tier, tensors=len(plan.layout), against_source=len(src),
+            quantized_checked=len(errors), q8_rel_rms_max=max((e[0] for e in errors), default=0.0),
+            q8_scales_off_max=max((e[1] for e in errors), default=0.0))
 
 
 def step_verify(a, ctx):
@@ -804,7 +914,7 @@ def step_verify(a, ctx):
 
 def step_all(a, ctx):
     step_fetch(a, ctx, META_FILES)
-    both = ("residents", "bank")
+    both = ("residents",) if a.bank_from is not None else ("residents", "bank")
     shard_pass(a, ctx, ctx.plan(), set(both))
     step_residents(a, ctx, both)
     step_bank(a, ctx, both)
@@ -842,6 +952,12 @@ def parse_args(argv):
     g.add_argument("--seed", type=int, default=20261017,
                    help="seed of the keep set (seed), the parity sample (seed + 1) and the dequant rows (seed + 2)")
     g.add_argument("--settings", metavar="JSON", help="a JSON object written verbatim as expert_streaming.settings")
+    g.add_argument("--residents", choices=("bf16", "q8"), default="bf16",
+                   help="the residents tier: bf16 (default) the release's tensors; q8 every linear of the trunk and the "
+                        "head as MLX affine 8-bit group 64 (config.json residents_format affine8_g64)")
+    g.add_argument("--bank-from", metavar="PACK",
+                   help="bank: hard-link experts.bin and expert-manifest.json from PACK (same release, slice and "
+                        "geometry; one filesystem) instead of building them; the shard pass takes the residents only")
     g.add_argument("--files", choices=("all", "meta"), default="all",
                    help="fetch: every release file (default), or the 7 metadata files")
     g.add_argument("--fetch-with", choices=("http", "hf"), default="http",

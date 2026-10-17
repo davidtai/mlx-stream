@@ -1,7 +1,7 @@
 """Tests of prepare_nvfp4_pack.py and scripts/packlib on the synthetic Beam checkpoint of beam_fixture.py: every step
 end to end, each record against a straight numpy repack of the fixture's tensors, the manifest against bank.zig (its
-Manifest fields, its fixture manifest and its refusals), resume, and the refusals by name. Numpy only, no network, no
-GPU, a few MB of disk.
+Manifest fields, its fixture manifest and its refusals), resume, the q8 residents tier against a scalar re-derivation
+of its rule, --bank-from, and the refusals by name. Numpy only, no network, no GPU, a few MB of disk.
 
   python3 -I scripts/test_prepare_nvfp4_pack.py        (or: python3 -I -m pytest scripts/test_prepare_nvfp4_pack.py)
 """
@@ -24,8 +24,8 @@ sys.dont_write_bytecode = True
 
 import beam_fixture as fx  # noqa: E402
 import prepare_nvfp4_pack as conv  # noqa: E402
-from packlib import PrepError, manifest  # noqa: E402
-from packlib.st import E2M1, E4M3, StFile  # noqa: E402
+from packlib import PrepError, affine, manifest  # noqa: E402
+from packlib.st import E2M1, E4M3, StFile, bf16_rne  # noqa: E402
 
 BANK_ZIG = HERE.parent / "src" / "arch" / "glm5_next" / "bank.zig"
 SEED = 7
@@ -154,6 +154,12 @@ class Fixture(unittest.TestCase):
             sf.close()
         idx = json.loads((self.pack / "model.safetensors.index.json").read_text())
         self.assertEqual(set(idx["weight_map"].values()), {"model.safetensors"})
+        sf = StFile(self.pack / "model.safetensors")
+        try:
+            self.assertEqual(idx["sha256"], {n: hashlib.sha256(bytes(sf.raw_bytes(n))).hexdigest() for n in sf.header})
+        finally:
+            sf.close()
+        self.assertNotIn("residents_format", json.loads((self.pack / "config.json").read_text()))
 
     def test_config_by_rule(self):
         cfg = json.loads((self.pack / "config.json").read_text())
@@ -389,6 +395,143 @@ class Slice(unittest.TestCase):
                 self.assertIn(want, log)
         finally:
             shutil.rmtree(tmp)
+
+
+def q8_group(vals):
+    """The q8 tier's rule for one group of 64 release values (exact f32), scalar: MLX's scale and bias in f32 (the
+    maximum from 0, the minimum, the scale signed to the larger edge, 0 a code), both rounded to BF16, each code the
+    nearest (half to even) under the rounded pair, clipped to 0 .. 255. Returns (codes, scale bits, bias bits)."""
+    f = np.float32
+    hi, lo = max(f(0), max(vals)), min(vals)
+    scale = max(f(f(hi - lo) / f(255)), f(1e-7))
+    side = abs(lo) > abs(hi)
+    scale = scale if side else f(-scale)
+    edge = lo if side else hi
+    q0 = np.round(f(edge / scale))
+    scale, bias = (f(edge / q0), edge) if q0 != 0 else (scale, f(0))
+    sb, bb = int(bf16_rne(np.array([scale], f))[0]), int(bf16_rne(np.array([bias], f))[0])
+    s = float(np.array([sb << 16], np.uint32).view(f)[0])
+    b = float(np.array([bb << 16], np.uint32).view(f)[0])
+    return [min(255, max(0, round((float(v) - b) / s))) for v in vals], sb, bb
+
+
+Q8_SITES = [f"model.layers.{li}.self_attn.{p}_proj.weight" for li in range(fx.L) for p in ("q", "k", "v", "gate", "o")]
+Q8_SITES += [f"model.layers.{li}.mlp.{p}_proj.weight" for li in range(fx.DENSE) for p in ("gate", "up", "down")]
+Q8_SITES += ["lm_head.weight"]
+
+
+class Q8Residents(unittest.TestCase):
+    """`--residents q8` on the fixture: a bf16 pack and a q8 pack built by `all` from the same seed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="nvfp4-pack-q8-test-"))
+        cls.fix = cls.tmp / "fix"
+        fx.build(cls.fix, SEED)
+        cls.shards = fx.tensors(SEED)
+        cls.release = {n: v for t in cls.shards.values() for n, v in t.items() if ".mlp.experts." not in n}
+        cls.rc16, cls.log16 = run("all", *build_args(cls.fix, cls.tmp / "bf16"))
+        cls.rc8, cls.log8 = run("all", *build_args(cls.fix, cls.tmp / "q8", "--residents", "q8"))
+        cls.q8 = cls.tmp / "q8"
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def test_builds_and_verifies(self):
+        self.assertEqual(self.rc16, 0, self.log16)
+        self.assertEqual(self.rc8, 0, self.log8)
+        self.assertIn('"tier": "q8"', self.log8)
+        self.assertIn(f'"quantized_checked": {len(Q8_SITES)}', self.log8)
+
+    def test_each_site_is_the_tiers_quantization(self):
+        sf = StFile(self.q8 / "model.safetensors")
+        rng = np.random.default_rng(5)
+        try:
+            for name in Q8_SITES:
+                p = name[: -len(".weight")]
+                _, (out, inn), arr = self.release[name]
+                self.assertEqual((sf.header[name]["dtype"], sf.header[name]["shape"]), ("U32", [out, inn // 4]), name)
+                for k in (".scales", ".biases"):
+                    self.assertEqual((sf.header[p + k]["dtype"], sf.header[p + k]["shape"]), ("BF16", [out, inn // 64]))
+                words, scales, biases = sf.array(name), sf.array(p + ".scales"), sf.array(p + ".biases")
+                codes = affine.codes(words)
+                vals = (np.asarray(arr, np.uint16).astype(np.uint32) << 16).view(np.float32)
+                for r in rng.choice(out, size=min(out, 6), replace=False):
+                    for gi in range(inn // 64):
+                        want, sb, bb = q8_group(list(vals[r, gi * 64:(gi + 1) * 64]))
+                        self.assertEqual(codes[r, gi * 64:(gi + 1) * 64].tolist(), want, f"{name} row {r} group {gi}")
+                        self.assertEqual((int(scales[r, gi]), int(biases[r, gi])), (sb, bb), f"{name} row {r} group {gi}")
+                rel, worst = affine.error(np.asarray(arr, np.uint16), words, scales, biases)
+                self.assertLess(rel, 0.008, name)
+                self.assertLessEqual(worst, 1.5, name)
+        finally:
+            sf.close()
+
+    def test_other_residents_are_the_release_tensors(self):
+        sf = StFile(self.q8 / "model.safetensors")
+        try:
+            kept = {n: v for n, v in self.release.items() if n not in Q8_SITES}
+            self.assertEqual(set(sf.header), set(kept) | set(Q8_SITES)
+                             | {n[: -len(".weight")] + k for n in Q8_SITES for k in (".scales", ".biases")})
+            for n, (dtype, shape, arr) in kept.items():
+                self.assertEqual((sf.header[n]["dtype"], sf.header[n]["shape"]), (dtype, shape), n)
+                self.assertEqual(bytes(sf.raw_bytes(n)), np.ascontiguousarray(arr).tobytes(), n)
+            for n in ("model.embed_tokens.weight", "model.layers.4.mlp.gate.weight", "model.layers.4.self_attn.gate_bias"):
+                self.assertIn(n, kept)
+            idx = json.loads((self.q8 / "model.safetensors.index.json").read_text())
+            self.assertEqual(set(idx["weight_map"]), set(sf.header))
+            self.assertEqual(idx["sha256"], {n: hashlib.sha256(bytes(sf.raw_bytes(n))).hexdigest() for n in sf.header})
+        finally:
+            sf.close()
+
+    def test_config_and_bank_are_the_bf16_packs(self):
+        c8 = json.loads((self.q8 / "config.json").read_text())
+        c16 = json.loads((self.tmp / "bf16" / "config.json").read_text())
+        self.assertEqual(c8.pop("residents_format"), "affine8_g64")
+        self.assertEqual(c8, c16)
+        for n in ("experts.bin", "expert-manifest.json", "tokenizer.json", "chat_template.jinja"):
+            self.assertEqual((self.q8 / n).read_bytes(), (self.tmp / "bf16" / n).read_bytes(), n)
+        size16 = (self.tmp / "bf16" / "model.safetensors").stat().st_size
+        size8 = (self.q8 / "model.safetensors").stat().st_size
+        self.assertLess(size8, size16)
+
+    def test_bank_from_links_the_bf16_bank(self):
+        out = self.tmp / "q8-linked"
+        try:
+            rc, log = run("all", *build_args(self.fix, out, "--residents", "q8", "--bank-from", str(self.tmp / "bf16")))
+            self.assertEqual(rc, 0, log)
+            self.assertIn('"linked_from"', log)
+            for n in ("experts.bin", "expert-manifest.json"):
+                self.assertEqual((out / n).stat().st_ino, (self.tmp / "bf16" / n).stat().st_ino, n)
+            self.assertEqual((out / "model.safetensors").read_bytes(), (self.q8 / "model.safetensors").read_bytes())
+            self.assertEqual((out / "pack-sha256.txt").read_text(), (self.q8 / "pack-sha256.txt").read_text())
+            rc, log = run("all", *build_args(self.fix, out, "--residents", "q8", "--bank-from", str(self.tmp / "bf16")))
+            self.assertEqual(rc, 0, log)
+            self.assertIn("[bank] skip", log)
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+    def test_bank_from_refuses_another_geometry_or_a_missing_pack(self):
+        sl = self.tmp / "slice"
+        try:
+            rc, log = run("all", *build_args(self.fix, sl, "--layers", "0-5"))
+            self.assertEqual(rc, 0, log)
+            for src, want in ((sl, "its bank's geometry is not this config's"),
+                              (self.tmp / "none", "--bank-from")):
+                out = self.tmp / "q8-refused"
+                rc, log = run("all", *build_args(self.fix, out, "--residents", "q8", "--bank-from", str(src)))
+                self.assertEqual(rc, 1, log)
+                self.assertIn(want, log)
+                self.assertFalse((out / "experts.bin").exists())
+                shutil.rmtree(out, ignore_errors=True)
+        finally:
+            shutil.rmtree(sl, ignore_errors=True)
+
+    def test_a_shape_without_whole_groups_refuses(self):
+        with self.assertRaisesRegex(PrepError, "in a multiple of 64"):
+            affine.check_shape("x.weight", [128, 96])
+        affine.check_shape("x.weight", [128, 192])
 
 
 def _ws2_inexact(cfg, hfq, shards):

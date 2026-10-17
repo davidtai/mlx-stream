@@ -13,8 +13,8 @@ past the page cache. GB are decimal.
 
 | file | contents |
 |---|---|
-| `config.json` | The checkpoint's `config.json` with three changes: `quantization_config` is removed, the `expert_streaming` block is added, and a null `eos_token_id`, `pad_token_id` or `bos_token_id` gets the value of `generation_config.json`. |
-| `model.safetensors`, `model.safetensors.index.json` | The residents. Each tensor has the bytes and the dtype of the checkpoint. Nothing is quantized. The routers' `weight` and `e_score_correction_bias` stay F32. |
+| `config.json` | The checkpoint's `config.json` with three changes: `quantization_config` is removed, the `expert_streaming` block is added, and a null `eos_token_id`, `pad_token_id` or `bos_token_id` gets the value of `generation_config.json`. A q8 pack also has `"residents_format": "affine8_g64"`. |
+| `model.safetensors`, `model.safetensors.index.json` | The residents, in the tier's form (next section). The index has the `weight_map` and a `sha256` map: the sha256 of each tensor's bytes. The routers' `weight` and `e_score_correction_bias` stay F32. |
 | `experts.bin` | The expert records (next section). |
 | `expert-manifest.json` | Format `mlx-stream-nvfp4-expert-bank-v1`, layout `nvfp4-gud-9part`: the geometry, the nine parts, each record's offset, length and sha256, the source repository, revision and per-file sha256, and the size and sha256 of `experts.bin`. |
 | `tokenizer.json`, `tokenizer_config.json`, `generation_config.json`, `chat_template.jinja` | Copies of the checkpoint's files. |
@@ -29,6 +29,44 @@ The `expert_streaming` block in `config.json`:
 `--settings JSON` adds a `settings` object to the block. The script removes `quantization_config` because the
 residents are not quantized and the manifest holds the bank's quantization. mlx-serve sends a config with
 `quant_method: modelopt` to its resident ModelOpt loader, so the pack must not keep it.
+
+### The residents tiers
+
+`--residents` selects the tier. The bank is the same in the two tiers.
+
+| tier | residents | class against the release |
+|---|---|---|
+| `bf16` (the default) | Each tensor has the bytes and the dtype of the checkpoint. Nothing is quantized. | The release's weights. |
+| `q8` | The weight of each linear of the trunk and the head is MLX's affine 8-bit, group 64. The other residents are as released: the embedding (a lookup), the norms, the gate biases, the routers (F32). | Rounding-class: a value is at most 1.5 scales from the release's value. |
+
+A q8 projection `W` [out, in] becomes three tensors. MLX's `quantized_matmul` and `dequantize` (mode `affine`, bits 8,
+group size 64) read them as they are.
+
+| tensor | dtype | shape | contents |
+|---|---|---|---|
+| `<prefix>.weight` | U32 | [out, in / 4] | The codes q (0 .. 255), four in a little-endian word. Code j of a word is in bits 8 j. |
+| `<prefix>.scales` | BF16 | [out, in / 64] | One scale s for each group of 64 inputs. |
+| `<prefix>.biases` | BF16 | [out, in / 64] | One bias b for each group. |
+
+The value of a code is s x q + b. `scripts/packlib/affine.py` makes the tensors on the CPU. For each group it takes
+the scale and the bias of MLX's `affine_quantize` (mlx-src 64ea011cb, `mlx/backend/metal/kernels/quantized.h`, lines
+2604-2627): the group's maximum from 0, its minimum, the scale (maximum - minimum) / 255 with the sign of the edge of
+larger magnitude, the bias at that edge, and 0 at a code. It rounds the scale and the bias to BF16 (nearest even). Then
+it takes each code nearest to the release's value under the rounded scale and bias (half to even), in 0 .. 255. MLX
+takes the codes from the scale and the bias before they are rounded. The rounded pair gives less error. On Beam's
+weights the relative RMS error is 0.54-0.63 % with the rounded pair and 0.69-0.84 % with MLX's codes. The script is
+deterministic: the same release gives the same bytes. On the M5 Ultra, MLX's `dequantize` of these tensors equals
+bf16(s x q + b) of the script's values for each value.
+
+| `--family beam` | tensors | `model.safetensors` |
+|---|---|---|
+| `bf16` | 734 | 16,163,485,456 B |
+| `q8` | 1,274 (270 projections of three tensors, 464 as released) | 9,437,710,520 B |
+| `q8`, `--layers 0-5` | 170 | 4,069,535,312 B (the bf16 slice: 6,273,379,016 B) |
+
+`--bank-from PACK` makes a hard link of `experts.bin` and `expert-manifest.json` from PACK. The script does not write
+the bank. PACK must have the same release, slice and geometry, on the same filesystem. Thus a q8 pack beside a bf16 pack
+adds only its residents. The shard pass then reads only the residents of each shard.
 
 ### The expert record
 
@@ -95,7 +133,9 @@ The steps of `all`, in order. Each step is also a subcommand.
 6. **verify**: the file set; `config.json`; the manifest; a seeded sample of records (`--samples`, default 16)
    against the records made again from the source shards, byte for byte; for three of them, four rows of each
    projection dequantized both ways (the checkpoint's and the bank's, within 2 f32 ulps); every resident tensor's
-   sha256; then `pack-sha256.txt`. With `--delete-verified` it then deletes the keep set.
+   sha256 (the read-back and the index's); each resident against its source shard when the shard is in `SRC` (a
+   release tensor byte for byte, a q8 projection quantized again to the same bytes and within 1.5 scales of the
+   release); then `pack-sha256.txt`. With `--delete-verified` it then deletes the keep set.
 
 The script also refuses: a missing or an extra tensor in the index or a shard; an E4M3 block scale that is NaN; a
 quantization that is not NVFP4 with group size 16; a resident linear that `hf_quant_config.json` does not exclude
