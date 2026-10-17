@@ -20,6 +20,8 @@ const pagecache = @import("../mimo_v2/pagecache.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
 const sdk_ext = @import("../../sdk_ext.zig");
 const residency = @import("../../sdk_ext/expert/residency.zig");
+/// Profile builds only (profile.zig): the prompt timeline, the GPU timeline, the kernel and read logs, the phase lines.
+const prof = @import("profile.zig");
 
 const T = mlx.mlx_array;
 
@@ -58,6 +60,7 @@ pub const Module = struct {
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, weights: *sdk.Weights, s: mlx.mlx_stream, ceiling: u64, stop: u64) !*Module {
         const model = &cfg.model;
         const dir = cfg.model_dir orelse return error.BeamPackDir;
+        if (comptime prof.enabled) try prof.armEarly();
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const plan = try bill.plan(arena.allocator(), io, cfg, ceiling, stop);
@@ -117,6 +120,7 @@ pub const Module = struct {
         log.info("beam memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv=bf16 phase_rows=on growth_rows={d} forced={s}\n", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, plan.rows.decode - plan.rows.prompt, if (bill.isForced(cfg)) "yes" else "no" });
         // Once (every command retired, MLX's cache cleared): the footprint beside the bill's construction terms. A report.
         route.constructionCheck("beam", s, plan.bill, plan.rows.prompt, bill.construction_tolerance_bytes);
+        if (comptime prof.enabled) try prof.arm(gpa, io, self.src, model.n_layers, s);
         return self;
     }
 
@@ -135,6 +139,7 @@ pub const Module = struct {
 
     pub fn deinit(self: *Module) void {
         _ = mlx.mlx_synchronize(self.g.s);
+        if (comptime prof.enabled) prof.disarm();
         self.res.closeTally(self.gpa);
         self.res.closeUsage();
         self.src.deinit();
@@ -189,6 +194,7 @@ pub const Module = struct {
         self.cache.restart();
         self.state_lost = false;
         self.prompt = .{ .t0 = self.nowNs(), .s0 = self.src.stats() };
+        if (comptime prof.enabled) prof.promptBegin(self.src);
     }
 
     /// The prompt's calls (at most `experts.call_rows` rows each, layer by layer): the last call's logits (every row's
@@ -215,8 +221,10 @@ pub const Module = struct {
     pub fn enterDecode(self: *Module, prompt_tokens: usize) !void {
         const p = self.src.stats().since(self.prompt.s0);
         log.info("beam prompt: tokens={d} wall_s={d:.3} ssd_bytes={d} ahead_posted={d} ahead_dropped={d} staged={d} staged_ahead={d} stage_copies={d} stage_admits={d} stage_unused={d} loads={d} skipped={d}\n", .{ prompt_tokens, @as(f64, @floatFromInt(self.nowNs() -| self.prompt.t0)) / 1e9, p.expert_bytes_read, p.ahead_posted, p.ahead_dropped, p.staged, p.staged_ahead, p.stage_copies, p.stage_admits, p.stage_unused, p.persistent_loads + p.transient_loads, p.loads_skipped });
+        if (comptime prof.enabled) prof.promptEnd(self.src);
         try self.src.beginDecode();
         self.decode = .{ .active = true, .s0 = self.src.stats(), .prompt_tokens = prompt_tokens };
+        if (comptime prof.enabled) prof.decodeBegin(self.src, self.reserve -| prompt_tokens);
     }
 
     /// A serial step (or a short extend) after the committed positions: the last row's logits f32 [1, vocab]. A step
@@ -241,10 +249,12 @@ pub const Module = struct {
             return logits;
         }
         const t0 = self.nowNs();
+        const tp = prof.stepBegin();
         const logits = try graph.forward(&self.g, self.gpa, &self.c.model, &self.w, ids, self.cache.len, &self.cache, self.src, .last, force);
         errdefer self.g.release(logits);
         try self.g.evalAll(&.{logits});
         try self.src.flush();
+        prof.stepEnd(tp);
         self.decode.steps += 1;
         self.decode.tokens += ids.len;
         self.decode.wall_ns += self.nowNs() - t0;
@@ -256,6 +266,7 @@ pub const Module = struct {
         if (!self.decode.active) return;
         const d = self.decode;
         self.decode = .{};
+        if (comptime prof.enabled) prof.decodeEnd(self.src);
         const footprint = sdk.memory.footprint().now;
         var active: usize = 0;
         var cache: usize = 0;
