@@ -621,6 +621,14 @@ pub fn depthAdd(g: *G, c: *const beam.Config, h: T, r: T, i: u32) !T {
     return o[0];
 }
 
+/// A sublayer boundary on the stock ops: the sublayer's output `y` normed by `w1`, the depth-scaled add of sublayer
+/// index `i` with the residual `r` (`res`, the next residual), then `res` normed by `w2` (`out`, the next sublayer's
+/// input). glue.zig `addNorm` gives the same bits on a decode row in one dispatch.
+pub fn boundaryStock(g: *G, c: *const beam.Config, y: T, r: T, w1: T, w2: T, i: u32) !glue.Boundary {
+    const res = try depthAdd(g, c, try rmsNorm(g, y, w1, c.rms_norm_eps), r, i);
+    return .{ .res = res, .out = try rmsNorm(g, res, w2, c.rms_norm_eps) };
+}
+
 /// `depthAdd`'s op chain (the compiled region's body, and the device test's control): bf16(f32(h) * a) + bf16(f32(r) *
 /// b), `a` and `b` f32 scalars.
 pub fn depthAddChain(g: *G, h: T, r: T, a: T, b: T) !T {
@@ -966,6 +974,12 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
     const n_tiles: usize = (rows + tile_rows - 1) / tile_rows;
     const outs = try a.alloc(T, n_tiles);
     defer a.free(outs);
+    // A one-row call under the decode glue: each sublayer boundary (its norm, the depth-scaled add, the next sublayer's
+    // norm) in one text (glue.zig `addNorm`); the next layer's normed input carries from the previous layer's boundary,
+    // the last layer's boundary normed by the final norm.
+    const boundary_glue: ?*const glue.Kernels = if (rows == 1) routes.glue else null;
+    var xn_next: ?T = null;
+    defer if (xn_next) |v| g.release(v);
     for (w.layers, 0..) |*stored, li| {
         const l: u32 = @intCast(li);
         const m = g.mark();
@@ -977,7 +991,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         if (prompt and lw.router != null) try postReadAhead(g, c, lw, l, x, src);
         // The attention, tile by tile (the rings and slabs carry from one tile to the next); in a prompt call each tile
         // is committed as built and the tile before it waited, so at most `tiles_in_flight` run at once.
-        const xn = try rmsNorm(g, x, lw.input_norm, c.rms_norm_eps);
+        const xn = if (xn_next) |v| v else try rmsNorm(g, x, lw.input_norm, c.rms_norm_eps);
         var n_kept: usize = 0;
         defer for (outs[0..n_kept]) |o| g.release(o);
         for (0..n_tiles) |i| {
@@ -993,15 +1007,22 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             if (i > 0) try g.evalAll(&.{outs[i - 1]});
         }
         const attn = if (n_tiles == 1) outs[0] else try g.concat(outs[0..n_tiles], 0);
-        const x1 = try depthAdd(g, c, try rmsNorm(g, attn, lw.post_attn_norm, c.rms_norm_eps), x, beam.Config.residualIndex(l, false));
-        const h = try rmsNorm(g, x1, lw.pre_ff_norm, c.rms_norm_eps);
+        const b1 = if (boundary_glue) |k| try glue.addNorm(g, k, attn, x, lw.post_attn_norm, lw.pre_ff_norm, beam.Config.residualIndex(l, false)) else try boundaryStock(g, c, attn, x, lw.post_attn_norm, lw.pre_ff_norm, beam.Config.residualIndex(l, false));
+        const x1 = b1.res;
+        const h = b1.out;
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h)) else blk: {
             const r = if (comptime @TypeOf(force) == void) try routeOf(g, c, routes, lw.router.?, h, !prompt) else try forcedRoute(g, c, routes, lw.router.?, h, force, l, start, !prompt);
             if (prompt) try g.asyncEval(&.{ r.indices, r.weights });
             const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights));
             break :blk try scaled(g, c, routed, try g.scalar(c.routed_scaling, .float32));
         };
-        const x2 = try depthAdd(g, c, try rmsNorm(g, f, lw.post_ff_norm, c.rms_norm_eps), x1, beam.Config.residualIndex(l, true));
+        const x2 = if (boundary_glue) |k| blk: {
+            const next_norm = if (l + 1 < w.layers.len) w.layers[l + 1].input_norm else w.norm;
+            const b2 = try glue.addNorm(g, k, f, x1, lw.post_ff_norm, next_norm, beam.Config.residualIndex(l, true));
+            if (xn_next) |v| g.release(v);
+            xn_next = g.keep(b2.out);
+            break :blk b2.res;
+        } else try depthAdd(g, c, try rmsNorm(g, f, lw.post_ff_norm, c.rms_norm_eps), x1, beam.Config.residualIndex(l, true));
         const next = g.keep(x2);
         g.release(x);
         x = next;
@@ -1016,6 +1037,8 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         }
     }
     cache.len = start + rows;
+    // The decode glue's last boundary normed the one row by the final norm already: the head's lm_head and soft cap.
+    if (xn_next) |xn| return g.keep(try softcap(g, c, try project(g, w.head, xn)));
     if (head == .all) return g.keep(try logitsOf(g, c, w, x));
     const last = try g.slice(x, &.{ @intCast(rows - 1), 0 }, &.{ @intCast(rows), hidden }, &.{ 1, 1 });
     return g.keep(try logitsOf(g, c, w, last));

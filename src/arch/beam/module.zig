@@ -86,9 +86,9 @@ pub const Module = struct {
         self.gates = try self.w.gates(gpa);
         errdefer gpa.free(self.gates);
         // The decode glue (`decode_glue`): each layer's attention projections in one buffer (graph.zig
-        // `fuseProjections`, checked on the first layer), then the router's texts installed on the first routed layers'
-        // tables (their geometry, the launches per decode-lane width, the self-check against the stock ops); the stock
-        // ops otherwise.
+        // `fuseProjections`, checked on the first layer), then the texts installed on the first layers' tables (the
+        // router's on the first routed layers', the q / k norms' and the boundaries' on layer 0's: their geometry, the
+        // launches per decode-lane width, the self-check against the stock ops); the stock ops otherwise.
         const glue_route = try self.c.decodeGlueRoute(mlx.streamIsGpu(s));
         if (glue_route == .fused) {
             self.w.fuseProjections(gpa, &self.g, weights, model) catch |e| {
@@ -97,14 +97,14 @@ pub const Module = struct {
             };
             const first = &self.w.layers[model.first_k_dense];
             const next = if (model.moeLayers() > 1) &self.w.layers[model.first_k_dense + 1] else first;
-            const attn0 = &self.w.layers[0].attn;
-            self.glue_kernels = glue.install(gpa, s, model, .{ .w = first.router.?.w, .bias = first.router.?.bias, .next_w = next.router.?.w, .next_bias = next.router.?.bias, .q_norm = attn0.q_norm, .k_norm = attn0.k_norm }, &diag) catch |e| {
+            const l0 = &self.w.layers[0];
+            self.glue_kernels = glue.install(gpa, s, model, .{ .w = first.router.?.w, .bias = first.router.?.bias, .next_w = next.router.?.w, .next_bias = next.router.?.bias, .q_norm = l0.attn.q_norm, .k_norm = l0.attn.k_norm, .post_attn_norm = l0.post_attn_norm, .pre_ff_norm = l0.pre_ff_norm }, &diag) catch |e| {
                 log.err("beam: the decode glue refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
                 diag = .{};
                 return e;
             };
             self.routes.glue = &self.glue_kernels;
-            log.info("beam decode glue installed: q/k/v/gate one GEMV, q/k norms and RoPE (or the query scale) one launch, router {d} threadgroups + select, predictor {d} threadgroups (decode_glue=fused); self-check passed\n", .{ model.n_routed_experts / glue.rows_per_group, model.n_routed_experts / glue.rows_per_group });
+            log.info("beam decode glue installed: q/k/v/gate one GEMV, q/k norms and RoPE (or the query scale) one launch, each sublayer boundary one launch, router {d} threadgroups + select, predictor {d} threadgroups (decode_glue=fused); self-check passed\n", .{ model.n_routed_experts / glue.rows_per_group, model.n_routed_experts / glue.rows_per_group });
         }
         errdefer self.glue_kernels.deinit();
         // The expert source at the plan's rows: every routed layer alike (`expert_rows_by_layer: uniform`, the default),
