@@ -161,6 +161,9 @@ attention): 768 records, `experts.bin` 16,990,076,928 B, `model.safetensors` 6,2
 - `beam` with `--delete-verified`: 305.4 GB at the peak (the bank, 16.16 GB of residents, one 5.878 GB shard in
   flight, the 5.878 GB keep set), plus `--disk-margin-gb` (default 10). Without it, the 293.6 GB of shards stay in
   `SRC`.
+- `beam --residents q8 --bank-from <bf16 pack>` on the M5 Ultra, with the 53 shards in `SRC`: 293 s for `all` (the
+  shards' sha256, the residents of each shard, the bank's sha256 and the verify; 9.44 GB written). The slice
+  (`--layers 0-5`): 49 s.
 - The fixture below: 0.30 s for `all` on the laptop.
 
 ## The families
