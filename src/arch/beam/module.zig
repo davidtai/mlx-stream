@@ -62,6 +62,8 @@ pub const Module = struct {
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .io = io, .g = try graph.G.init(gpa, s), .c = cfg.*, .w = undefined, .gates = &.{}, .src = undefined, .cache = undefined, .reserve = plan.reserve, .rows = plan.rows, .sampler = undefined };
         errdefer self.g.deinit();
+        // The trunk's compiled regions (graph.zig `prepareFused`), on its backend, once.
+        try graph.prepareFused(&self.g, &self.c.model);
         self.sampler = try Sampler.init(gpa, s);
         errdefer self.sampler.deinit();
         var diag: sdk.Diag = .{};

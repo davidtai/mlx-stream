@@ -133,7 +133,7 @@ fn freeFrom(comptime E: type, list: *std.ArrayList(E), from: usize, comptime fre
 
 /// The compiled regions a model builds at construction (`prepareTape`), one
 /// closure per region and context (the trunk's config, the draft head's).
-pub const Region = enum { attn_core, qkv_prep, out_prep, gate_prefix, moe_combine, hc_attn_prep, hc_ffn_prep, hc_post, seg2, seg3, draft_kv, markov_step, confidence, shared_mid };
+pub const Region = enum { attn_core, qkv_prep, out_prep, gate_prefix, moe_combine, hc_attn_prep, hc_ffn_prep, hc_post, seg2, seg3, draft_kv, markov_step, confidence, shared_mid, beam_depth_add };
 const n_regions = std.meta.fieldNames(Region).len;
 const contexts_per_region = 2;
 
@@ -246,8 +246,8 @@ pub const MlxOps = struct {
         free.* = .{ .ctx = ctx, .compiled = try g.buildTape(Body, ctx, @intFromPtr(@typeName(Body).ptr)) };
     }
 
-    /// `mx.compile(fn)` (fixed shape) of one trunk region `Body.run`, prepared
-    /// at construction: traced once per input signature, replayed after.
+    /// `mx.compile(fn)` of one trunk region `Body.run`, prepared at construction: traced once per input signature
+    /// (shapes and dtypes; under `Body.shapeless` dtypes and ranks only), replayed after.
     pub fn tape(g: *MlxOps, comptime Body: type, ctx: *const Body.Ctx, inputs: []const T, out: []T) !void {
         // Construction prepared every region a call can reach (the trace twin refuses the rest by name,
         // which the host tests prove); here the lookup only picks the context's closure (<= 2 slots).
@@ -304,7 +304,7 @@ pub const MlxOps = struct {
         const raw = mlx.mlx_closure_new_func_payload(&Cb.call, payload, null);
         defer _ = mlx.mlx_closure_free(raw);
         var compiled = mlx.mlx_closure{ .ctx = null };
-        try mlx.check(mlx.mlx_compile(&compiled, raw, false));
+        try mlx.check(mlx.mlx_compile(&compiled, raw, comptime @hasDecl(Body, "shapeless") and Body.shapeless));
         errdefer _ = mlx.mlx_closure_free(compiled);
         try g.tapes.append(g.gpa, .{ .key = key, .ctx = ctx, .compiled = compiled, .payload = payload, .free = &Cb.free });
         return compiled;
