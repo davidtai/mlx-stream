@@ -82,7 +82,10 @@ Decode is serial: one row a step. The routed call takes MiMo's decode lane. Its 
 synchronization before the logits: the host reads the layer's expert ids, plans the hits and the misses, then builds
 and commits the hit wave. From the router's end to that commit the GPU has no model work. MiMo's keep-warm engine
 (`gpu_keep_warm: waits`) runs from the barrier's wait to the commit. Thus the hit wave starts beside a running warm
-chunk, not on an idle GPU. There is no draft lane: `draft_lane.arm` binds the plugin's sampler and answers `off`.
+chunk, not on an idle GPU. The step commits its logits and does not wait for them. The host's read of the drawn token
+is the step's last synchronization, and the sampler runs on the GPU right behind the head. The `beam decode` line
+times each step from its start to the next step's start (the last step to the request's end). There is no draft
+lane: `draft_lane.arm` binds the plugin's sampler and answers `off`.
 
 The module keeps no prefix. A prompt longer than the billed context refuses with `ContextOverBill`.
 
