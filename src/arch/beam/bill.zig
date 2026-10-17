@@ -256,6 +256,9 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         .{ .name = "hitpass_luts", .bytes = @splat(if (in.decode_moe == .hitpass) hitpassLutBytes(in) else 0), .at_construction = false },
         // `decode_glue: fused`: the glue's texts, pipelines and configs (glue.zig), declared; 0 under ops.
         .{ .name = "glue_kernels", .bytes = @splat(if (in.decode_glue == .fused) glue_kernels_bytes else 0), .at_construction = true },
+        // P6's staging rows (experts.zig `prompt_stage_rows`): host pages in the prompt phase only (the phase change
+        // frees them with the transient scratch), each component's bank page-rounded.
+        .{ .name = "slot_stage", .bytes = .{ stageBytes(in), 0 }, .at_construction = true },
     };
     return a.dupe(Term, &terms);
 }
@@ -264,6 +267,13 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
 pub fn hitpassLutBytes(in: *const Inputs) u64 {
     const g = in.geometry;
     return shared_experts.devLutBytes(@as(u64, g.first_moe_layer) + g.num_moe_layers, g.num_experts, in.page);
+}
+
+/// P6's staging rows (`experts.prompt_stage_rows`): a slot row each, at the record stride or the line-isolated slot row,
+/// whichever is larger (the transient scratch's rule), and each component's bank rounded to a page.
+pub fn stageBytes(in: *const Inputs) u64 {
+    const g = in.geometry;
+    return @as(u64, experts.prompt_stage_rows) * @max(g.record_bytes, g.slot_row_bytes) + bank.n_components * in.page;
 }
 
 /// The shared route's inputs at this bill's geometry: the NVFP4 tile, the source's own sizes, the decode texts under
@@ -518,6 +528,15 @@ test "beam bill: the q8 tier bills its residents and a dense layer's prompt view
     const r8 = try sdk.fill(b8, baseline, target, 256, min_rows);
     try testing.expect(r8.decode >= r16.decode + 5 and r8.prompt >= r16.prompt + 5);
     std.debug.print("\nBEAM BILL q8 (baseline 35.06 GB, ctx 32,768): rows {d}/{d} against bf16's {d}/{d}; prompt_view {d} B\n", .{ r8.prompt, r8.decode, r16.prompt, r16.decode, view[0] });
+}
+
+test "beam bill: P6's staging rows bill the prompt phase only: 64 slot rows at the record stride and a page a component" {
+    const a = testing.allocator;
+    const in = try fixtureInputs(32_768);
+    const b = try billOf(a, &in);
+    defer b.free(a);
+    try testing.expectEqual(@as(u32, 64), experts.prompt_stage_rows);
+    try testing.expectEqual([2]u64{ 64 * 22_122_496 + bank.n_components * 16_384, 0 }, termOf(b, "slot_stage"));
 }
 
 test "beam bill: the keep-warm route bills MiMo's declared engine from construction; the control, none" {

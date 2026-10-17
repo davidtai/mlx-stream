@@ -56,6 +56,19 @@ pub const Experts = shared_experts.ExpertsWith(ops.MlxOps, StreamSource, Math, .
 pub const Gate = Experts.Gate;
 /// The decode lane's widest call (the scheduler's bound; Beam decodes one row a step).
 pub const decode_lane_rows: u32 = Math.decode_forward_rows;
+/// P6 (the seeded prompt's read-ahead): the stream's staging rows (`Options.prompt_stage_rows`, host pages, 1.42 GB at
+/// Beam's record). With the usage seed's residents every prompt row is full, so P1's read-ahead admits nothing and the
+/// call reads its 84 misses a layer only after its plans. A prompt layer then reads up to 64 of its predicted misses into
+/// these rows while its attention runs (about 88 to 110 ms of the drive at 1.51 ms a record), and the call copies them
+/// into their planned rows. Exact by construction.
+pub const prompt_stage_rows: u32 = 64;
+
+/// The stream's construction options: the shared route's (route.zig `streamOptionsOf`) and P6's staging rows.
+pub fn streamOptions(rows: []const u32, memory: B.SlotMemory, event: expert_event.Event, tally: expert_tally.Settings) !B.Options {
+    var opts = try route.streamOptionsOf(B, rows, memory, event, tally, false);
+    opts.prompt_stage_rows = prompt_stage_rows;
+    return opts;
+}
 
 comptime {
     if (Math.prefill_min_tokens != decode_lane_rows + 1) @compileError("beam: the scheduler's wide threshold is not the decode lane's bound");
@@ -140,7 +153,7 @@ pub const Source = struct {
         // The reader's staging holds the bank's widest span plus its page alignment and a page: refused here, once.
         if (B.S.stagingBytes(&self.sdk_bank) > settings.reader_staging_bytes) return error.BeamReaderStaging;
         const event = try expert_event.createMetal();
-        self.sdk_stream = try Stream.init(a, &self.sdk_bank, try route.streamOptionsOf(B, self.rows, .{ .mlx = stream }, event, tally, false));
+        self.sdk_stream = try Stream.init(a, &self.sdk_bank, try streamOptions(self.rows, .{ .mlx = stream }, event, tally));
         errdefer self.sdk_stream.deinit();
         self.stream_source = StreamSource.init(self.sdk_stream);
         try self.stream_source.installReadSchedule(route.read_schedule, mimo_stream.default_read_schedule_threshold);
@@ -378,10 +391,12 @@ pub const Source = struct {
     }
 };
 
-test "beam experts: the stream's options are the shared route's: overlap schedule, relocation, the phase rows' release, decode's window, staged reads" {
+test "beam experts: the stream's options are the shared route's: overlap schedule, relocation, the phase rows' release, decode's window, staged reads; P6's staging rows" {
     const testing = std.testing;
     const rows = [_]u32{ 96, 96 };
-    const opts = try route.streamOptionsOf(B, &rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, false);
+    const opts = try streamOptions(&rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 });
+    try testing.expectEqual(prompt_stage_rows, opts.prompt_stage_rows);
+    try testing.expectEqual(@as(u32, 0), (try route.streamOptionsOf(B, &rows, .host, .{ .id = 7, .object = 123 }, .{ .ratio = 0 }, false)).prompt_stage_rows);
     try testing.expect(opts.tally == null);
     try testing.expectEqual(B.S.PromptReads.overlap, opts.prompt_reads);
     try testing.expectEqual(B.S.AheadPost.whole_trim, opts.prompt_ahead);

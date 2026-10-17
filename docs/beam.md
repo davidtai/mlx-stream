@@ -79,6 +79,22 @@ rows, at most 2 tiles in flight. The dense MLP runs in tiles of 2,048 rows. Befo
 predictor posts the layer's predicted experts to the stream (MiMo's read-ahead). The routed MLP runs over the call's
 rows on the wide lane.
 
+### The staged reads (P6)
+
+The read-ahead reads only into empty prompt rows. With the usage seed, every prompt row holds a resident at the load.
+Thus the read-ahead reads nothing, and a 16K call reads its 84 misses a layer only after its plans: the drive is idle
+through each layer's attention, and the GPU waits for the reads in the MoE stage.
+
+The stream has 64 staging rows (`experts.zig` `prompt_stage_rows`; host pages, 1.42 GB). When a layer has no empty
+prompt row, its read-ahead reads its predicted experts that are not resident into the staging rows, hottest first,
+while the attention runs. At the call's posts, a load of a staged expert copies the staged row into its planned row on
+the copier thread and reads nothing; the load's waits and its gate hold until the copy is done. The plans, the slots
+and the kernels do not change, and each planned row holds its record's bytes before a kernel reads it: the change is
+exact. The staging rows go at the phase change with the prompt's transient rows and come back with them.
+
+The prompt pass's end writes one line: `beam prompt: tokens= wall_s= ssd_bytes= ahead_posted= ahead_dropped= staged=
+stage_copies= stage_unused= loads= skipped=`.
+
 Decode is serial: one row a step. The routed call takes MiMo's decode lane. Its routing barrier is the only host-GPU
 synchronization before the logits: the host reads the layer's expert ids and plans the hits and the misses. Under
 `decode_moe: hitpass` the hit wave is already committed behind the router (the expert route, below). Under `fused`
@@ -293,6 +309,7 @@ at 173 / 183 rows, temperature 0.7, top_p 0.99, seeds 1234 and 4321. Each seed g
 | `decode_kernels` | The fused texts' set, its pipelines and prepared launches under `decode_moe: hitpass` and `fused`: 20 MiB declared. At the pack's load the fused route's construction footprint is 18.6 MB more than the stock route's (host side 416.1 MB against 397.5 MB; MLX active the same). |
 | `hitpass_luts` | Under `decode_moe: hitpass`: a LUT pair for each model layer, each LUT a page (52 x 2 x 16 KiB). |
 | `glue_kernels` | Under `decode_glue: fused`: the glue's texts, their pipelines and launch configurations (`glue.zig`): 8 MiB declared, from construction. |
+| `slot_stage` | The staging rows (P6): 64 slot rows and a page a component, in the prompt phase only. |
 
 The fill gives the most decode rows and prompt rows that fit the host's ceiling less its wired margin. The floor is 8
 rows. The fill bills the rows beside the host's non-file baseline (wired + anonymous - purgeable + compressor, the
