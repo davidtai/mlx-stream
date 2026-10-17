@@ -42,8 +42,10 @@ const T = mlx.mlx_array;
 pub const top_k: u32 = 8;
 /// The most experts a routed layer of a served pack holds (config.zig refuses more): the read-ahead's host scratch.
 pub const max_experts: u32 = 256;
-/// The prompt pass's calls: at most this many rows each (MiMo's: the expert math's row scratch holds one call).
-pub const call_rows: u32 = 16_384;
+/// The prompt pass's calls: at most this many rows each (the expert math's row scratch holds one call). P5: 17,408 rows
+/// (34 attention tiles), so the 16,445-token coding prompt is one call: at 16,384 its 61-row tail was a second call
+/// that re-read 28.3 GB of misses in 2.17 s. The bill prices the widest call's prompt wave.
+pub const call_rows: u32 = 17_408;
 /// The NVFP4 format with the fused qmv decode texts (installed under `decode_moe: hitpass` and `fused`), prompt calls of
 /// at most `call_rows` rows.
 pub const Format = nvfp4_format.FormatOf(.{ .Fused = decode_kernels.FusedDecode, .max_call_tokens = call_rows });

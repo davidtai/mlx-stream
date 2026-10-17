@@ -74,7 +74,8 @@ At construction the module does these steps one time:
 
 ## Requests
 
-The prompt pass runs in calls of at most 16,384 rows. A call runs layer by layer. The attention runs in tiles of 512
+The prompt pass runs in calls of at most 17,408 rows (34 attention tiles: a 16,445-token prompt is one call). A call
+runs layer by layer. The attention runs in tiles of 512
 rows, at most 2 tiles in flight. The dense MLP runs in tiles of 2,048 rows. Before each routed layer's attention, P1's
 predictor posts the layer's predicted experts to the stream (MiMo's read-ahead). The routed MLP runs over the call's
 rows on the wide lane.
@@ -215,7 +216,8 @@ and its NVFP4 projection format are shared with glm5_next (`src/expert/nvfp4_ban
   routes give the same bits. The default resolves to `stock` where the texts are not registered (a routed geometry
   other than 5,120 / 2,560 / top-8: the fixture) and on a CPU stream, with one log line.
 - The prompt combine uses MiMo's in-place text when the hidden size is a multiple of 1,024 and the model routes 8
-  experts a token. Otherwise it uses MiMo's stock reduction (a test pack).
+  experts a token. Otherwise it uses MiMo's stock reduction (a test pack). The stock reduction holds MiMo's widest
+  call (16,384 rows): a wider call refuses (`MimoCombineTokens`).
 
 ### The decode experts, measured
 
