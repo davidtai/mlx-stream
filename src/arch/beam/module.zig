@@ -14,6 +14,7 @@ const settings = @import("settings.zig");
 const bill = @import("bill.zig");
 const graph = @import("graph.zig");
 const experts = @import("experts.zig");
+const warm = @import("warm.zig");
 const route = @import("../mimo_v2/route.zig");
 const pagecache = @import("../mimo_v2/pagecache.zig");
 const gpu_warm = @import("../mimo_v2/gpu_warm.zig");
@@ -108,6 +109,9 @@ pub const Module = struct {
         errdefer self.cache.deinit(&self.g);
         // The usage seed (`resident_seed`): before the first request; one line.
         try residency.seedResidents(gpa, io, "beam", &self.c.residency, dir, self.src);
+        // P8: the prompt pass's first GPU work (the residency of the load's buffers, the first-use kernels) at the load.
+        const warmed = try warm.run(&self.g, gpa, io, &self.c.model, &self.w, &self.cache, self.src);
+        log.info("beam prompt warm (P8): prompt kernels warmed at load in {d} ms (wired limit {d} B as the host's {s} policy; sliding layer {d} and full layer {d}: {d} tiles of {d} rows; dense layer {d}: one tile; layer {d}'s predictor over {d} rows; the {s} combine; token-identical)\n", .{ warmed.ns / std.time.ns_per_ms, warmed.wired_bytes, if (warm.hostWiresMax()) "max" else "own", warmed.plan.sliding_layer, warmed.plan.full_layer, warmed.plan.tiles, graph.tile_rows, warmed.plan.dense_layer, warmed.plan.routed_layer, warmed.plan.predict_rows, @tagName(self.src.combine_route) });
         log.info("beam routes: prompt_combine={s} read_schedule={s} drain={s} bank_view={s} decode_moe=stock call_rows={d} tile_rows={d} prompt_stage_rows={d} gpu_keep_warm={s} expert_resident_ratio={d} expert_tally_file={s}\n", .{ @tagName(self.src.combine_route), @tagName(route.read_schedule), @tagName(route.drain), @tagName(route.bank_view), experts.call_rows, graph.tile_rows, experts.prompt_stage_rows, @tagName(warm_route), self.c.tally.ratio, @tagName(self.c.tally.file) });
         log.info("mlx-stream beam installed: {d} layers ({d} sliding, {d} full; {d} dense, {d} routed); residents BF16 {d} tensors read in {d:.2} s; experts NVFP4 g16 streamed, top-{d} of {d}, {d} resident expert rows/layer, call {d}\n", .{ model.n_layers, model.nSliding(), model.nFull(), model.first_k_dense, n_moe, weights.count(), @as(f64, @floatFromInt(read_ns)) / 1e9, model.n_experts_per_tok, model.n_routed_experts, plan.rows.prompt, experts.call_rows });
         log.info("beam memory: target={d} baseline={d} process_bound={d} prompt_rows={d} decode_rows={d} reserve_tokens={d} kv=bf16 phase_rows=on growth_rows={d} forced={s}\n", .{ plan.target, plan.baseline, plan.bill.processBound(plan.rows), plan.rows.prompt, plan.rows.decode, plan.reserve, plan.rows.decode - plan.rows.prompt, if (bill.isForced(cfg)) "yes" else "no" });
