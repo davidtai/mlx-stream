@@ -67,7 +67,19 @@ pub const Linear = union(enum) {
 };
 pub const Q8 = struct { w: T, scales: T, biases: T };
 
-pub const Attention = struct { q: Linear, k: Linear, v: Linear, o: Linear, gate: Linear, gate_bias: T, q_norm: T, k_norm: T };
+pub const Attention = struct {
+    q: Linear,
+    k: Linear,
+    v: Linear,
+    o: Linear,
+    gate: Linear,
+    gate_bias: T,
+    q_norm: T,
+    k_norm: T,
+    /// `decode_glue: fused`: the q, k, v and gate projections as one projection [2 qd + 2 kd, hidden] in the pack's
+    /// format (`fuseProjections`); q / k / v / gate are then its row views.
+    qkvg: ?Linear = null,
+};
 pub const Mlp = struct { gate: Linear, up: Linear, down: Linear };
 /// The router: the F32 weight [experts, hidden] (the reference keeps it f32) and the F32 correction bias [experts].
 pub const Router = struct { w: T, bias: T };
@@ -276,6 +288,87 @@ pub const Weights = struct {
         return w.own(a, try f32Copy(s, x));
     }
 
+    /// `decode_glue: fused`: each layer's q, k, v and gate projections as one projection [2 qd + 2 kd, hidden], rows in
+    /// that order (`Attention.qkvg`), in the pack's format: the BF16 weights concatenated, or each q8 array (codes,
+    /// scales, biases) concatenated along its rows. The decode lane's one GEMV (MLX's gemv, or its qmv on q8, sums each
+    /// output row alone, in the same lanes whatever the matrix's height, so its rows are the four's bit for bit); q / k /
+    /// v / gate become its row views, which the prompt reads as it reads the four (the same values, strides and kernels;
+    /// q8: `promptView` dequantizes the views). The four originals are dropped from the weight map and MLX's cache is
+    /// cleared after each layer: the load holds one layer's projections twice at most. Then the first layer's fused GEMV
+    /// is checked against the four views' on one row, byte for byte. Once, after the residents are read (`map`: the
+    /// host's weight map the bind read from).
+    pub fn fuseProjections(w: *Weights, a: std.mem.Allocator, g: *G, map: *sdk.Weights, c: *const beam.Config) !void {
+        const qd: c_int = @intCast(c.n_heads * c.head_dim);
+        const kd: c_int = @intCast(c.n_kv_heads * c.head_dim);
+        const bounds = [_]c_int{ 0, qd, qd + kd, qd + 2 * kd, 2 * qd + 2 * kd };
+        for (w.layers, 0..) |*lw, li| {
+            const at = &lw.attn;
+            {
+                const m = g.mark();
+                defer g.resetTo(m);
+                const fused = try w.fuseRows(a, g, .{ at.q, at.k, at.v, at.gate });
+                var views: [4]Linear = undefined;
+                for (&views, 0..) |*v, i| v.* = try w.rowView(a, g, fused, bounds[i], bounds[i + 1]);
+                at.* = .{ .q = views[0], .k = views[1], .v = views[2], .o = at.o, .gate = views[3], .gate_bias = at.gate_bias, .q_norm = at.q_norm, .k_norm = at.k_norm, .qkvg = fused };
+            }
+            for ([_][]const u8{ "q_proj", "k_proj", "v_proj", "gate_proj" }) |proj| for ([_][]const u8{ "weight", "scales", "biases" }) |tail| {
+                var nb: [96]u8 = undefined;
+                map.drop(std.fmt.bufPrint(&nb, "model.layers.{d}.self_attn.{s}.{s}", .{ li, proj, tail }) catch unreachable);
+            };
+            g.clearCache();
+        }
+        try checkProjections(g, a, c, &w.layers[0].attn);
+    }
+
+    /// The projections `parts` (one format) concatenated along their rows, each array in a buffer of its own (owned),
+    /// evaluated.
+    fn fuseRows(w: *Weights, a: std.mem.Allocator, g: *G, parts: [4]Linear) !Linear {
+        switch (parts[0]) {
+            .bf16 => {
+                var xs: [4]T = undefined;
+                for (parts, &xs) |p, *x| x.* = switch (p) {
+                    .bf16 => |v| v,
+                    .q8 => return error.BeamFusedProjections,
+                };
+                return .{ .bf16 = try w.ownConcat(a, g, &xs) };
+            },
+            .q8 => {
+                var ws: [4]T = undefined;
+                var ss: [4]T = undefined;
+                var bs: [4]T = undefined;
+                for (parts, &ws, &ss, &bs) |p, *x, *sc, *b| switch (p) {
+                    .q8 => |q| {
+                        x.* = q.w;
+                        sc.* = q.scales;
+                        b.* = q.biases;
+                    },
+                    .bf16 => return error.BeamFusedProjections,
+                };
+                return .{ .q8 = .{ .w = try w.ownConcat(a, g, &ws), .scales = try w.ownConcat(a, g, &ss), .biases = try w.ownConcat(a, g, &bs) } };
+            },
+        }
+    }
+
+    fn ownConcat(w: *Weights, a: std.mem.Allocator, g: *G, xs: []const T) !T {
+        const cat = try g.concat(xs, 0);
+        try g.evalAll(&.{cat});
+        return w.own(a, g.keep(cat));
+    }
+
+    /// Rows [lo, hi) of the fused projection `f`: each array's row view (owned), evaluated.
+    fn rowView(w: *Weights, a: std.mem.Allocator, g: *G, f: Linear, lo: c_int, hi: c_int) !Linear {
+        return switch (f) {
+            .bf16 => |x| .{ .bf16 = try w.ownRows(a, g, x, lo, hi) },
+            .q8 => |q| .{ .q8 = .{ .w = try w.ownRows(a, g, q.w, lo, hi), .scales = try w.ownRows(a, g, q.scales, lo, hi), .biases = try w.ownRows(a, g, q.biases, lo, hi) } },
+        };
+    }
+
+    fn ownRows(w: *Weights, a: std.mem.Allocator, g: *G, x: T, lo: c_int, hi: c_int) !T {
+        const v = try g.slice(x, &.{ lo, 0 }, &.{ hi, g.shapeOf(x).dim(1) }, &.{ 1, 1 });
+        try g.evalAll(&.{v});
+        return w.own(a, g.keep(v));
+    }
+
     /// The gates the expert scheduler's lookahead reads, one per model layer (a dense layer's empty): the router's
     /// stored F32 weight [experts, hidden] (route.zig `scoresStored`) and its correction bias.
     pub fn gates(w: *const Weights, a: std.mem.Allocator) ![]experts.Gate {
@@ -458,6 +551,8 @@ pub fn project(g: *G, l: Linear, x: T) !T {
 pub fn promptView(g: *G, lw: *const Layer) !Layer {
     var v = lw.*;
     inline for (.{ "q", "k", "v", "o", "gate" }) |f| @field(v.attn, f) = try bf16View(g, @field(lw.attn, f));
+    // The decode glue's fused projection is the decode lane's: a prompt call (one row too) reads the four views.
+    v.attn.qkvg = null;
     if (lw.dense) |d| v.dense = .{ .gate = try bf16View(g, d.gate), .up = try bf16View(g, d.up), .down = try bf16View(g, d.down) };
     return v;
 }
@@ -581,6 +676,34 @@ fn windowMask(g: *G, a: std.mem.Allocator, pos: u32, n: u32, first: u32, keys: u
     return g.hostArray(std.mem.sliceAsBytes(buf), &.{ @intCast(n), @intCast(keys) }, .bool_);
 }
 
+const Projections = struct { q: T, k: T, v: T, gate: T };
+
+/// The attention's four projections of `xn` [n, hidden]: one GEMV (q8: one qmv) over the fused projection and its four
+/// row slices on a one-row call where `fuseProjections` fused them (the decode lane's step), else the four (`project`).
+fn attnProjections(g: *G, c: *const beam.Config, at: *const Attention, xn: T) !Projections {
+    const fused = at.qkvg;
+    if (fused == null or g.shapeOf(xn).dim(0) != 1) return .{ .q = try project(g, at.q, xn), .k = try project(g, at.k, xn), .v = try project(g, at.v, xn), .gate = try project(g, at.gate, xn) };
+    const y = try project(g, fused.?, xn);
+    const qd: c_int = @intCast(c.n_heads * c.head_dim);
+    const kd: c_int = @intCast(c.n_kv_heads * c.head_dim);
+    const b = [_]c_int{ 0, qd, qd + kd, qd + 2 * kd, 2 * qd + 2 * kd };
+    var out: [4]T = undefined;
+    for (&out, 0..) |*o, i| o.* = try g.slice(y, &.{ 0, b[i] }, &.{ 1, b[i + 1] }, &.{ 1, 1 });
+    return .{ .q = out[0], .k = out[1], .v = out[2], .gate = out[3] };
+}
+
+/// `fuseProjections`' check: layer `at`'s fused GEMV against its four views' GEMVs on one fixed row, byte for byte
+/// (error.BeamFusedProjections otherwise).
+fn checkProjections(g: *G, a: std.mem.Allocator, c: *const beam.Config, at: *const Attention) !void {
+    const m = g.mark();
+    defer g.resetTo(m);
+    const x = try glue.checkRow(g, a, c.hidden_size);
+    const fused = try attnProjections(g, c, at, x);
+    const plain: Attention = .{ .q = at.q, .k = at.k, .v = at.v, .o = at.o, .gate = at.gate, .gate_bias = at.gate_bias, .q_norm = at.q_norm, .k_norm = at.k_norm };
+    const stock = try attnProjections(g, c, &plain, x);
+    inline for (.{ "q", "k", "v", "gate" }) |f| glue.sameBytes(g, "the fused projections' " ++ f, @field(stock, f), @field(fused, f), null) catch return error.BeamFusedProjections;
+}
+
 /// One attention tile of layer `lw`: `xn` [n, hidden] (the input norm's rows) at positions [pos, pos + n) -> [n, hidden].
 pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const Layer, xn: T, pos: u32, cache: *Cache) !T {
     const n: c_int = @intCast(g.shapeOf(xn).dim(0));
@@ -594,10 +717,11 @@ pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const 
             return gg.transposeAxes(try gg.reshape(x, &.{ 1, rows, hh, d }), &.{ 0, 2, 1, 3 });
         }
     }.f;
+    const p = try attnProjections(g, c, at, xn);
     // [1, heads, n, d]: each head normed over its d (q_norm / k_norm), then RoPE on a sliding layer.
-    var q = try heads4(g, try rmsNorm(g, try g.reshape(try project(g, at.q, xn), &.{ n, heads, hd }), at.q_norm, c.rms_norm_eps), n, heads, hd);
-    var k = try heads4(g, try rmsNorm(g, try g.reshape(try project(g, at.k, xn), &.{ n, kvh, hd }), at.k_norm, c.rms_norm_eps), n, kvh, hd);
-    const v = try heads4(g, try project(g, at.v, xn), n, kvh, hd);
+    var q = try heads4(g, try rmsNorm(g, try g.reshape(p.q, &.{ n, heads, hd }), at.q_norm, c.rms_norm_eps), n, heads, hd);
+    var k = try heads4(g, try rmsNorm(g, try g.reshape(p.k, &.{ n, kvh, hd }), at.k_norm, c.rms_norm_eps), n, kvh, hd);
+    const v = try heads4(g, p.v, n, kvh, hd);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
     var out: T = undefined;
     if (lw.full) {
@@ -617,7 +741,7 @@ pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const 
     }
     // [1, n, heads, d], gated per head: attn * sigmoid(gate_proj(x) + gate_bias).
     const o = try g.transposeAxes(out, &.{ 0, 2, 1, 3 });
-    const gate = try g.sigmoid(try g.add(try g.reshape(try project(g, at.gate, xn), &.{ 1, n, heads, hd }), at.gate_bias));
+    const gate = try g.sigmoid(try g.add(try g.reshape(p.gate, &.{ 1, n, heads, hd }), at.gate_bias));
     const gated = try g.mul(o, gate);
     return project(g, at.o, try g.reshape(gated, &.{ n, heads * hd }));
 }
@@ -1135,5 +1259,65 @@ test "beam graph GPU: the f32 SwiGLU's one kernel is the op chain bit for bit (r
         const gate = try testBf16(a, &g, &shape, 3.0, 100 + i);
         const up = try testBf16(a, &g, &shape, 3.0, 200 + i);
         try expectBits("swiglu_f32", &g, try sdk_ext.quant.swigluF32Chain(G, &g, gate, up), try sdk_ext.quant.activation(G, &g, .swiglu_f32, gate, up));
+    }
+}
+
+test "beam graph GPU: the fused projections' one GEMV (q8: one qmv) is the four bit for bit; the prompt's GEMMs on their row views are the GEMMs on their own buffers (BF16 and q8)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    const h: c_int = @intCast(c.hidden_size);
+    const qd: c_int = @intCast(c.n_heads * c.head_dim);
+    const kd: c_int = @intCast(c.n_kv_heads * c.head_dim);
+    inline for (.{ beam.ResidentsFormat.bf16, beam.ResidentsFormat.affine8_g64 }) |fmt| {
+        var map = sdk.Weights.init(a);
+        defer map.deinit();
+        // One layer's projections as the residents hold them (their own buffers), in the weight map under their names.
+        const names = [_][]const u8{ "q_proj", "k_proj", "v_proj", "gate_proj" };
+        const rows = [_]c_int{ qd, kd, kd, qd };
+        var kept: [12]T = undefined;
+        var n_kept: usize = 0;
+        defer for (kept[0..n_kept]) |x| g.release(x);
+        var orig: [4]Linear = undefined;
+        for (&orig, names, rows, 0..) |*o, nm, r, i| {
+            const wt = try testBf16(a, &g, &.{ r, h }, 0.02, 1100 + i);
+            var parts: [3]T = .{ wt, undefined, undefined };
+            var np: usize = 1;
+            if (fmt == .affine8_g64) {
+                parts = try ops_be.quantizeAffine(&g, wt, beam.q8_group, beam.q8_bits);
+                np = 3;
+            }
+            const tails = [_][]const u8{ "weight", "scales", "biases" };
+            for (parts[0..np], tails[0..np]) |x, tail| {
+                kept[n_kept] = g.keep(x);
+                n_kept += 1;
+                try g.evalAll(&.{x});
+                var nb: [96]u8 = undefined;
+                try map.map.put(try a.dupe(u8, try std.fmt.bufPrint(&nb, "model.layers.0.self_attn.{s}.{s}", .{ nm, tail })), g.keep(x));
+            }
+            o.* = if (fmt == .bf16) .{ .bf16 = kept[n_kept - 1] } else .{ .q8 = .{ .w = kept[n_kept - 3], .scales = kept[n_kept - 2], .biases = kept[n_kept - 1] } };
+        }
+        const layers = try a.alloc(Layer, 1);
+        var w: Weights = .{ .embed = undefined, .norm = undefined, .head = undefined, .layers = layers };
+        defer w.deinit(a);
+        layers[0] = .{ .input_norm = undefined, .post_attn_norm = undefined, .pre_ff_norm = undefined, .post_ff_norm = undefined, .full = false, .slot = 0, .attn = .{ .q = orig[0], .k = orig[1], .v = orig[2], .o = undefined, .gate = orig[3], .gate_bias = undefined, .q_norm = undefined, .k_norm = undefined } };
+        try w.fuseProjections(a, &g, &map, &.{ .n_layers = 1, .first_k_dense = 1 });
+        try testing.expectEqual(@as(u32, 0), map.count());
+        const at = &w.layers[0].attn;
+        try testing.expect(at.qkvg != null);
+        const plain: Attention = .{ .q = orig[0], .k = orig[1], .v = orig[2], .o = undefined, .gate = orig[3], .gate_bias = undefined, .q_norm = undefined, .k_norm = undefined };
+        for ([_]c_int{ 1, 3, 512 }, 0..) |n, i| {
+            const m = g.mark();
+            defer g.resetTo(m);
+            const x = try testBf16(a, &g, &.{ n, h }, 1.0, 1200 + i);
+            const want = try attnProjections(&g, &c, &plain, x);
+            const got = try attnProjections(&g, &c, at, x);
+            inline for (.{ "q", "k", "v", "gate" }) |f| try expectBits(@tagName(fmt) ++ " projection " ++ f, &g, @field(want, f), @field(got, f));
+        }
     }
 }

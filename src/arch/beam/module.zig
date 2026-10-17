@@ -85,10 +85,16 @@ pub const Module = struct {
         const read_ns: u64 = @intCast(t_read.untilNow(io, .awake).nanoseconds);
         self.gates = try self.w.gates(gpa);
         errdefer gpa.free(self.gates);
-        // The decode glue (`decode_glue`): the texts installed here on the first routed layers' tables (their geometry,
-        // the launches per decode-lane width, the self-check against the stock ops); the stock ops otherwise.
+        // The decode glue (`decode_glue`): each layer's attention projections in one buffer (graph.zig
+        // `fuseProjections`, checked on the first layer), then the router's texts installed on the first routed layers'
+        // tables (their geometry, the launches per decode-lane width, the self-check against the stock ops); the stock
+        // ops otherwise.
         const glue_route = try self.c.decodeGlueRoute(mlx.streamIsGpu(s));
         if (glue_route == .fused) {
+            self.w.fuseProjections(gpa, &self.g, weights, model) catch |e| {
+                log.err("beam: the decode glue's fused projections refused ({s})\n", .{@errorName(e)});
+                return e;
+            };
             const first = &self.w.layers[model.first_k_dense];
             const next = if (model.moeLayers() > 1) &self.w.layers[model.first_k_dense + 1] else first;
             self.glue_kernels = glue.install(gpa, s, model, .{ .w = first.router.?.w, .bias = first.router.?.bias, .next_w = next.router.?.w, .next_bias = next.router.?.bias }, &diag) catch |e| {
