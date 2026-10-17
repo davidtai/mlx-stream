@@ -84,16 +84,23 @@ def dequantize(words, scales, biases):
 
 def error(w, words, scales, biases):
     """(relative RMS error, largest error inside the code range, largest distance past it), the last two in scales, of a
-    quantized projection against w, the BF16 bits [out, in]. Each value is inside its group's range [b, b + 255 s], so
-    it is at most half a scale off (and f32's rounding of s x q + b) and the distance past the range is 0."""
-    x = widen(w).astype(np.float64)
-    out, inn = x.shape
-    s = widen(scales).astype(np.float64)
-    b = widen(biases).astype(np.float64)
-    d = np.abs(dequantize(words, scales, biases).astype(np.float64) - x).reshape(out, -1, GROUP)
-    t = (x.reshape(out, -1, GROUP) - b[:, :, None]) / s[:, :, None]  # each value's position on its code grid
-    past = np.maximum(np.maximum(-t, t - 255), 0)
-    inside = past == 0
-    rms = float(np.sqrt(np.mean(x * x)))
-    return ((float(np.sqrt(np.mean(d * d))) / rms if rms > 0 else 0.0),
-            float(np.max(np.where(inside, d / np.abs(s)[:, :, None], 0))), float(np.max(past)))
+    quantized projection against w, the BF16 bits [out, in], in blocks of `ROWS` rows. Each value is inside its group's
+    range [b, b + 255 s], so it is at most half a scale off (and f32's rounding of s x q + b) and the distance past the
+    range is 0."""
+    out = w.shape[0]
+    err2 = ref2 = 0.0
+    inside_max = past_max = 0.0
+    for r0 in range(0, out, ROWS):
+        r1 = min(out, r0 + ROWS)
+        x = widen(w[r0:r1]).astype(np.float64)
+        s = widen(scales[r0:r1]).astype(np.float64)[:, :, None]
+        b = widen(biases[r0:r1]).astype(np.float64)[:, :, None]
+        deq = dequantize(words[r0:r1], scales[r0:r1], biases[r0:r1]).astype(np.float64)
+        d = np.abs(deq - x).reshape(r1 - r0, -1, GROUP)
+        t = (x.reshape(r1 - r0, -1, GROUP) - b) / s  # each value's position on its code grid
+        past = np.maximum(np.maximum(-t, t - 255), 0)
+        err2 += float(np.sum(d * d))
+        ref2 += float(np.sum(x * x))
+        inside_max = max(inside_max, float(np.max(np.where(past == 0, d / np.abs(s), 0))))
+        past_max = max(past_max, float(np.max(past)))
+    return (float(np.sqrt(err2 / ref2)) if ref2 > 0 else 0.0), inside_max, past_max
