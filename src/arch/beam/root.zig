@@ -1,9 +1,9 @@
 //! Reflection Beam 1.0 (`beam`) behind the `arch` kind (sdk.Arch.of): the pack mlx-stream serves (config.json, the
 //! residents in BF16 or the q8 tier (`residents_format`), the NVFP4 expert bank `experts.bin` beside
 //! `expert-manifest.json`, declared by the config's `expert_streaming` block; scripts/prepare_nvfp4_pack.py --family beam
-//! writes it). Every entry wraps the module's own;
-//! the host reaches the module once per prompt, serial step or request end, never per layer. No draft lane: every
-//! request decodes in serial steps, the plugin's sampler drawing each token.
+//! writes it). Every entry wraps the module's own; the host reaches the module once per prompt, serial step, draft round
+//! or request end, never per layer. The draft lane (lane.zig: Reflection's DFlash2 drafter, `mtp_lane`) runs a clean
+//! request's rounds; without it every request decodes in serial steps, the plugin's sampler drawing each token.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -13,6 +13,7 @@ const settings = @import("settings.zig");
 const bank = @import("../../expert/nvfp4_bank.zig");
 const bills = @import("bill.zig");
 const module = @import("module.zig");
+const lane = @import("lane.zig");
 
 pub const name = "beam";
 pub const family = "mlx-stream";
@@ -154,33 +155,49 @@ pub fn requestEnd(m: *Module) void {
     m.requestEnd();
 }
 
-/// Serial: no lane. The host arms every clean request (blockSize 1: the sampler's serial steps), so the plugin binds
-/// its sampler and draws every token (`sdk_ext.sampler`); `arm` answers `.off` and no round runs.
+/// The DFlash2 draft lane (lane.zig), installed at construction by `mtp_lane`: a round verifies up to depth + 1 rows.
+/// Without it blockSize 1: the host still arms every clean request, so the plugin binds its sampler and draws every
+/// serial token (`sdk_ext.sampler`), `arm` answers `.off` and no round runs.
 pub const draft_lane = struct {
-    pub fn blockSize(_: *const Module) u32 {
-        return 1;
+    pub fn blockSize(m: *const Module) u32 {
+        return if (m.lane) |l| l.depth + 1 else 1;
     }
 
-    pub fn laneName(_: *const Module) []const u8 {
-        return "serial";
+    pub fn laneName(m: *const Module) []const u8 {
+        return if (m.lane) |l| l.name() else "serial";
     }
 
+    /// A clean request drafts under the construction rule: `exact` is argmax equality on a greedy request (`greedy`) and
+    /// sample-then-verify on a sampled one (`stochastic`); `typical` labels every request `typical`. Logprobs, grammar
+    /// and penalties consume logits the lane never shapes and stay serial.
     pub fn arm(m: *Module, req: sdk.ArmRequest) sdk.DraftArm {
         m.sampler.arm(req);
-        return .off;
+        const l = m.lane orelse return .off;
+        l.arm(req.clean);
+        if (!req.clean) return .off;
+        return switch (l.rule) {
+            .exact => if (req.greedy) .greedy else .stochastic,
+            .typical => .typical,
+        };
     }
 
-    /// Never called: `arm` answers `.off` for every request (the host runs a round only on an armed lane).
-    pub fn round(_: *Module, _: std.mem.Allocator, _: u32, _: u32, _: sdk.SamplingParams) !sdk.DraftRound {
-        return error.BeamNoDraftLane;
+    /// The host runs a round only on an armed lane (`arm` answered other than `.off`).
+    pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32, sampling: sdk.SamplingParams) !sdk.DraftRound {
+        if (m.lane == null) return error.BeamNoDraftLane;
+        return lane.roundWith(m, a, t1, accepted_cap, sampling, {});
     }
 
-    pub fn stats(_: *const Module) sdk.DraftStats {
-        return .{};
+    pub fn stats(m: *const Module) sdk.DraftStats {
+        const l = m.lane orelse return .{};
+        const b = l.stats.base;
+        return .{ .rounds = b.rounds, .drafted = b.drafted, .accepted = b.accepted, .generated = b.generated };
     }
 
-    pub fn receipt(_: *Module, buf: []u8) []const u8 {
-        return buf[0..0];
+    /// The request's receipt line (rounds, accepted and tokens a round, the stream's misses and bytes a round, the
+    /// chunks, the gate, typical's deviations, the phases' time); the host logs it with `[spec-stats]`.
+    pub fn receipt(m: *Module, buf: []u8) []const u8 {
+        const l = m.lane orelse return buf[0..0];
+        return l.stats.line(buf, l.name(), m.src.stats());
     }
 };
 
@@ -210,7 +227,7 @@ test "beam parse: the settings block is applied at parse; a non-object block or 
     for ([_]Case{
         .{ .block = nvfp4_block ++ ",\"settings\":{\"expert_prefill_rows\":100,\"expert_rows\":120}},", .err = null },
         .{ .block = nvfp4_block ++ ",\"settings\":[1]},", .err = error.BeamSettingsBlock },
-        .{ .block = nvfp4_block ++ ",\"settings\":{\"mtp_lane\":true}},", .err = error.BeamSettingUnknown },
+        .{ .block = nvfp4_block ++ ",\"settings\":{\"decode_moe\":\"fused\"}},", .err = error.BeamSettingUnknown },
         .{ .block = "", .err = error.BeamPackRequired },
     }) |case| {
         const text = try beam.beamConfigJson(arena.allocator(), case.block);
@@ -231,7 +248,7 @@ test "beam parse: the settings block is applied at parse; a non-object block or 
     }
 }
 
-test "beam arch table: the registry builds it (the draft lane surface, serial; no prefix restore, no handover)" {
+test "beam arch table: the registry builds it (the draft lane surface; no prefix restore, no handover)" {
     const vt = comptime sdk.Arch.of(@This());
     try testing.expect(vt.request_end != null);
     try testing.expect(vt.restore_prefix == null and vt.handover == null);
@@ -239,6 +256,7 @@ test "beam arch table: the registry builds it (the draft lane surface, serial; n
     var m: Module = undefined;
     m.sampler.pending = null;
     m.sampler.active = null;
+    m.lane = null;
     try testing.expectEqual(@as(u32, 1), draft_lane.blockSize(&m));
     try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(&m, .{ .greedy = false, .clean = true, .sampling = .{ .temperature = 1.0, .top_p = 0.95, .seed = 1 } }));
     try testing.expectEqual(@as(u64, 1), m.sampler.pending.?.seed);
@@ -246,4 +264,24 @@ test "beam arch table: the registry builds it (the draft lane surface, serial; n
     try testing.expect(m.sampler.pending == null);
     try testing.expectEqualStrings("serial", draft_lane.laneName(&m));
     try testing.expectEqual(@as(u64, 0), draft_lane.stats(&m).rounds);
+    // An installed lane: depth + 1 rows a round; exact arms greedy / stochastic, typical every request; unclean stays off.
+    var l: lane.Lane = undefined;
+    l.rule = .exact;
+    l.depth = 7;
+    l.stats = .{};
+    l.pending = false;
+    l.name_len = (try lane.Lane.nameOf(&l.name_buf, l.rule, l.depth, 0)).len;
+    m.lane = &l;
+    try testing.expectEqual(@as(u32, 8), draft_lane.blockSize(&m));
+    try testing.expectEqualStrings("dflash2 exact depth 7", draft_lane.laneName(&m));
+    try testing.expectEqual(sdk.DraftArm.greedy, draft_lane.arm(&m, .{ .greedy = true, .clean = true }));
+    try testing.expect(l.pending);
+    try testing.expectEqual(sdk.DraftArm.stochastic, draft_lane.arm(&m, .{ .greedy = false, .clean = true, .sampling = .{ .temperature = 0.7, .top_p = 0.99, .seed = 1 } }));
+    try testing.expectEqual(sdk.DraftArm.off, draft_lane.arm(&m, .{ .greedy = true, .clean = false }));
+    try testing.expect(!l.pending);
+    l.rule = .{ .typical = .{ .delta = 0.4 } };
+    try testing.expectEqual(sdk.DraftArm.typical, draft_lane.arm(&m, .{ .greedy = true, .clean = true }));
+    try testing.expectEqual(sdk.DraftArm.typical, draft_lane.arm(&m, .{ .greedy = false, .clean = true, .sampling = .{ .temperature = 0.7, .top_p = 0.99, .seed = 1 } }));
+    l.stats.base.add(7, 4);
+    try testing.expectEqual(sdk.DraftStats{ .rounds = 1, .drafted = 7, .accepted = 4, .generated = 5 }, draft_lane.stats(&m));
 }
