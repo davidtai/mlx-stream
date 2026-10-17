@@ -61,6 +61,14 @@ comptime {
     _ = @import("sdk_ext/expert/residency.zig");
     _ = @import("sdk_ext/safetensors.zig");
     _ = @import("sdk_ext/settings.zig");
+    // Reflection Beam 1.0 (beam): no host surface beyond the SDK's.
+    _ = @import("arch/beam/config.zig");
+    _ = @import("arch/beam/settings.zig");
+    _ = @import("arch/beam/experts.zig");
+    _ = @import("arch/beam/graph.zig");
+    _ = @import("arch/beam/bill.zig");
+    _ = @import("arch/beam/module.zig");
+    _ = @import("arch/beam/root.zig");
     _ = @import("arch/deepseek_v41/deepseek_v41.zig");
     _ = @import("arch/deepseek_v41/ops.zig");
     _ = @import("arch/deepseek_v41/graph.zig");

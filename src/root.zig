@@ -1,7 +1,7 @@
 //! mlx-stream: the native streaming stack as one plugin: the DeepSeek-V4.1 arch, the EXL3 quant it binds (the routed
-//! experts' kernels over the package's pinned registry) and the EXL3 expert source that streams them; MiMo-V2.6-Flash
-//! and GLM-5.3 over the same expert reader. Built only where the macOS-only sources are. The module imports its own
-//! `sdk` (sdk/) and the host's `mlx_host`.
+//! experts' kernels over the package's pinned registry) and the EXL3 expert source that streams them; MiMo-V2.6-Flash,
+//! GLM-5.3, GLM-5.3-Flash and Reflection Beam 1.0 over the same expert reader. Built only where the macOS-only sources
+//! are. The module imports its own `sdk` (sdk/) and the host's `mlx_host`.
 
 pub const plugin = sdk.Plugin{
     .name = "mlx-stream",
@@ -49,11 +49,21 @@ pub const glm5_next = struct {
     pub const generation_headroom: u64 = 0;
 };
 
+/// What the host's glue calls for the fifth arch: Reflection Beam 1.0 (`beam`, the NVFP4 pack): its entry points, the
+/// context a load bills when the model sets none (the standard request: 16,384 prompt tokens and 1,024 generated) and
+/// the positions a request may generate past it (none: the context holds the generation, as glm5_next's does).
+pub const beam = struct {
+    pub const arch = @import("arch/beam/root.zig");
+    pub const default_context: u64 = @import("arch/beam/settings.zig").fill_reserve_tokens;
+    pub const generation_headroom: u64 = 0;
+};
+
 /// What the host's glue (mlx-serve `src/arch/mlx_stream.zig`) calls: the arch's entry points and their contract types.
 pub const arch = @import("arch/deepseek_v41/plugin.zig");
-/// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order: DeepSeek-V4.1 and GLM-5.3
-/// (the conformance suite's list; the host's glue binds each arch by its own entry: the root's, `mimo` and `glm`).
-pub const archs = .{ @import("arch/deepseek_v41/plugin.zig"), @import("arch/glm_moe_dsa/plugin.zig") };
+/// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order: DeepSeek-V4.1, GLM-5.3,
+/// GLM-5.3-Flash and Beam (the conformance suite's list; the host's glue binds each arch by its own entry: the root's,
+/// `mimo`, `glm`, `glm5_next` and `beam`).
+pub const archs = .{ @import("arch/deepseek_v41/plugin.zig"), @import("arch/glm_moe_dsa/plugin.zig"), glm5_next.arch, beam.arch };
 pub const sdk = @import("sdk");
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
 pub const default_context: u64 = @import("arch/deepseek_v41/bill.zig").fill_prompt_tokens;
