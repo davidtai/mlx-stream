@@ -292,6 +292,38 @@ The seed reads 8,477 records (187.5 GB) in 13.3 s at the load. The hit rate is 1
 reasoning goes to `reasoning_content` and the final channel to `content`. Tool calls come back parsed, with JSON
 arguments, on `/v1/chat/completions` and `/v1/messages`, streamed and not streamed.
 
+### The q8 pack
+
+`Beam-1.0-501B-A23B-NVFP4-q8-mlx-stream` (`--residents q8 --bank-from <the BF16 pack>`: `experts.bin` and its
+manifest are hard links) serves with the same flags. The lines of a load at the fill:
+
+```text
+beam routes: residents=affine8_g64 prompt_combine=inplace read_schedule=early_whole_trim drain=pipelined bank_view=window decode_moe=stock call_rows=16384 tile_rows=512 gpu_keep_warm=waits expert_resident_ratio=0 expert_tally_file=on
+beam memory: target=255550554112 baseline=33382694912 process_bound=222101600204 prompt_rows=180 decode_rows=191 reserve_tokens=32768 kv=bf16 phase_rows=on growth_rows=11 forced=no
+```
+
+The residents (1,274 tensors, 9,437,710,520 B) read in 0.74 s.
+
+Measured on the coding workload at the card's sampling (temperature 0.7, top_p 0.99), 1,024 generated tokens, each
+run on a fresh server, against the BF16 pack on the same host (feat/beam-tools 0c1802e7). The pinned runs set
+`expert_prefill_rows` 173 and `expert_rows` 183. The fill runs take the bill's rows. The BF16 runs use plugin 6cab6fd,
+and the pinned BF16 row is the mean of two runs.
+
+| Pack | Rows | Seed | Prefill | Decode | A decode step | TTFT | SSD read a decode token | Peak footprint |
+|---|---|---|---|---|---|---|---|---|
+| BF16 | 173/183, pinned | 1234 | 642.4 tok/s | 16.23 tok/s | 61.62 ms | 26.20 s | 260.4 MB | 217.5 GB |
+| q8 | 173/183, pinned | 1234 | 635.4 tok/s | 17.80 tok/s | 56.18 ms | 26.49 s | 258.1 MB | 210.8 GB |
+| BF16 | 174/184, fill | 1234 | 641.4 tok/s | 15.52 tok/s | 64.42 ms | 26.22 s | 295.6 MB | 218.6 GB |
+| q8 | 180/191, fill | 1234 | 634.3 tok/s | 18.85 tok/s | 53.05 ms | 26.46 s | 213.0 MB | 219.5 GB |
+| q8 | 180/191, fill | 4321 | 667.4 tok/s | 18.25 tok/s | 54.80 ms | 25.18 s | 235.1 MB | 219.5 GB |
+| BF16 | 173/184, fill | 4321 | 643.0 tok/s | 16.59 tok/s | 60.29 ms | 26.18 s | 232.6 MB | 218.6 GB |
+
+At the same rows the q8 tier takes 5.4 ms off a decode step and 6.7 GB off the peak footprint. In isolation the
+trunk's GEMVs take 8.36 ms in place of 14.27 ms. At the fill the bill gives the freed memory to the rows: 6 to 7 more
+prompt rows and 7 more decode rows, at about the same peak. Each pack samples its own text, so the SSD bytes of a
+token change from run to run. At seed 4321 the two fills read about the same bytes a token, and the q8 pack decodes
+10.0 % faster. The prefill changes by -1.1 % and +3.8 % (the mean of the two seeds: +1.3 %).
+
 ## Not done
 
 - Fused NVFP4 decode texts at Beam's geometry. glm5_next's texts are checked against its own geometry. A Beam set
