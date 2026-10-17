@@ -66,7 +66,14 @@ At construction the module does these steps one time:
 4. It opens the rate tally, the usage record and the usage seed, as glm5_next does.
 5. It allocates the KV lanes at the billed context: a ring of the window (MiMo's `SlidingRing`) for each sliding
    layer, a slab of the context for each full layer.
-6. It writes the receipt lines (`beam routes`, `mlx-stream beam installed`, `beam memory`) and compares the
+6. It warms the prompt pass (P8, `warm.zig`). Under the host's default wired policy (`MLX_SERVE_WIRED` unset or
+   `max`) it sets MLX's wired limit to the device's recommended working set, the value that the host sets after the
+   load. Then it runs each kernel that the prompt pass builds at first use one time on zeros: layer 0's attention and
+   layer 5's attention over two 512-row tiles, layer 0's dense MLP over one tile, layer 3's predictor over one call and
+   the prompt combine over one token. The GPU makes the load's buffers resident before this first work runs, so the
+   wait is in the load, not in the first request. No expert state changes: the result is token-identical. Line:
+   `beam prompt warm (P8): ...`.
+7. It writes the receipt lines (`beam routes`, `mlx-stream beam installed`, `beam memory`) and compares the
    footprint with the bill's construction terms.
 
 ## Requests
