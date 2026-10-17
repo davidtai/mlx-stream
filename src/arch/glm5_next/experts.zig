@@ -326,7 +326,7 @@ pub fn SourceOf(comptime fam: Family) type {
                 // per wave width), refused by name, under `fused` and `hitpass`; the stock gathers otherwise.
                 if (decode_moe != .stock) {
                     var diag: sdk.Diag = .{};
-                    math_n.fused = nvfp4.FusedDecode.install(a, stream, geo.hidden_size, geo.intermediate_size, top_k, 10.0, &diag) catch |e| {
+                    math_n.fused = nvfp4.FusedDecode.install(a, stream, geo.hidden_size, geo.intermediate_size, top_k, .{ .swiglu_clamped = 10.0 }, &diag) catch |e| {
                             log.err("glm5_next: the fused decode route refused: {s} ({s})\n", .{ diag.message(), @errorName(e) });
                             return e;
                     };
