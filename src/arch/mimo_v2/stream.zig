@@ -1646,6 +1646,83 @@ test "mimo hitpass: install on the fused route: the hit wave is committed behind
         try std.testing.expectEqual(@as(usize, 0), h);
     }
 }
+
+/// The routing barrier's hold as the scheduler drives it (`StreamSource.barrier_warm`): each change and the trace's node
+/// count at it.
+const HoldLog = struct {
+    g: *const HitTraceMath.Tr,
+    on: [8]bool = undefined,
+    at: [8]usize = undefined,
+    n: usize = 0,
+    fn arm(self: *HoldLog) gpu_warm.Arm {
+        return .{ .ctx = self, .f = armed, .h = held };
+    }
+    fn armed(_: *anyopaque, _: u64) void {}
+    fn held(p: *anyopaque, on: bool) void {
+        const self: *HoldLog = @ptrCast(@alignCast(p));
+        self.on[self.n] = on;
+        self.at[self.n] = self.g.nodes.items.len;
+        self.n += 1;
+    }
+};
+
+test "mimo stream source: a host-built hit wave holds the barrier's warm arm from before the ids' host read to the wave's commit; a device hit wave holds nothing" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const Tr = HitTraceMath.Tr;
+    for ([_]bool{ false, true }) |hitpass| {
+        const rows = [_]u32{ 4, 4 };
+        const f = try a.create(HitFixture);
+        defer a.destroy(f);
+        try f.init(a, &rows);
+        defer f.deinit(a);
+        var ss = StreamSource.init(f.stream);
+        var g = Tr.init(a);
+        defer g.deinit();
+        g.record_host = true;
+        var hold: HoldLog = .{ .g = &g };
+        ss.barrier_warm = hold.arm();
+        const Ex = @import("../deepseek_v41/experts.zig").ExpertsWith(Tr, StreamSource, HitTraceMath, .{});
+        const c: @import("config.zig").Config = .{ .hidden_size = 32, .moe_intermediate_size = 32, .n_layers = 3, .n_routed_experts = 64, .n_experts_per_tok = 8 };
+        var ex = try Ex.initWith(a, &g, &ss, .{ .hidden = 32, .inter = 32 }, &c, .{ .banked = true, .devroute = hitpass });
+        defer ex.deinit();
+        try ex.grow(&g, &rows);
+        // Call 1: every expert a miss (no hit wave); call 2: four hits.
+        var script: HitScript = .{ .calls = &.{ &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &.{ 0, 1, 2, 3, 8, 9, 10, 11 } } };
+        g.host_values = script.values();
+        const xf = try g.input(&.{ 1, 32 }, .bfloat16);
+        const idx = try g.input(&.{ 1, 8 }, .int32);
+        for (0..2) |call_i| {
+            const n0 = hold.n;
+            const start = g.nodes.items.len;
+            _ = try ex.at(1).routed(&g, xf, idx);
+            if (hitpass) {
+                try testing.expectEqual(n0, hold.n);
+                continue;
+            }
+            try testing.expectEqual(n0 + 2, hold.n);
+            try testing.expect(hold.on[n0] and !hold.on[n0 + 1]);
+            // The ids' host read, then (call 2) the hit wave's commit: the first commit after the read.
+            var read: ?usize = null;
+            var commit: ?usize = null;
+            for (g.nodes.items[start..], start..) |nd, i| switch (nd.op) {
+                .host_read => if (read == null) {
+                    read = i;
+                },
+                .async_eval => if (read != null and commit == null) {
+                    commit = i;
+                },
+                else => {},
+            };
+            try testing.expect(hold.at[n0] <= read.?);
+            if (call_i == 1) {
+                // Released right behind the hit wave's commit, before any miss part's wave.
+                try testing.expectEqual(commit.? + 1, hold.at[n0 + 1]);
+            } else try testing.expectEqual(read.? + 1, hold.at[n0 + 1]);
+        }
+        try ex.flush();
+    }
+}
 // ── end HITPASS CPU tests ──
 
 // The host's call sequence for an MTP-lane request against the stream (window lev1, cell mtp-typ-b1: `decode tick

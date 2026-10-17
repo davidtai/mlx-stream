@@ -105,7 +105,7 @@ pub const Module = struct {
         // The usage profile's record (`expert_usage_record`, off by default).
         try self.res.openUsage(gpa, io, "beam", &self.c.residency, self.src);
         errdefer self.res.closeUsage();
-        if (self.src.warm != null) log.info("beam gpu keep-warm installed: gpu_keep_warm=waits source={s} (MiMo X12; bill {d} B)\n", .{ if (self.c.gpu_keep_warm_requested) "setting" else "default", gpu_warm.bill_bytes });
+        if (self.src.warm != null) log.info("beam gpu keep-warm installed: gpu_keep_warm=waits source={s} (MiMo X12: the gated waits and every decode routing barrier; bill {d} B)\n", .{ if (self.c.gpu_keep_warm_requested) "setting" else "default", gpu_warm.bill_bytes });
         self.cache = try graph.Cache.init(gpa, &self.g, &self.c.model, @intCast(plan.reserve));
         errdefer self.cache.deinit(&self.g);
         // The usage seed (`resident_seed`): before the first request; one line.

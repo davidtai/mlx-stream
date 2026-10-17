@@ -170,6 +170,9 @@ pub fn For(comptime bank_mod: type, comptime params: Params) type {
             /// `gpu_keep_warm: "waits"`: the warm engine's arm, bound once at construction (null = the control). `gate` hands it the value the call's last gated wait needs (both phases);
             /// `awaitReadAhead` holds it for the host's read-ahead wait.
             warm_arm: ?gpu_warm.Arm = null,
+            /// The warm engine's arm for the decode routing barrier, bound once at construction by an arch whose decode
+            /// lane builds its hit wave on the host after the ids (null: no hold). `holdBarrier` holds it.
+            barrier_warm: ?gpu_warm.Arm = null,
 
             pub const Arrays = params.Arrays;
             pub const uses_reader = S.uses_reader;
@@ -490,6 +493,12 @@ pub fn For(comptime bank_mod: type, comptime params: Params) type {
                     return self.prompt_await(self, self.relativeLayer(layer));
                 }
                 return self.prompt_await(self, self.relativeLayer(layer));
+            }
+
+            /// The scheduler's routing-barrier hold (`ExpertsWith.barrierHold`): X12 holds the warm engine from the barrier's
+            /// wait to the host-built hit wave's commit, so that commit starts beside the warm chunk, not on an idle GPU.
+            pub fn holdBarrier(self: *StreamSource, on: bool) void {
+                if (self.barrier_warm) |w| w.holdOn(on);
             }
 
             pub fn checkReadAhead(self: *StreamSource, layer: u32, n: u32) !u32 {
