@@ -159,6 +159,8 @@ pub const PredictRoute = enum { f32, bf16, invalid };
 pub const Predictor = struct {
     rows: glue.RouterRows = .{},
     scores: *const fn (*const Predictor, *ops.MlxOps, T, T, T) anyerror!T = scoresF32,
+    /// An arch's own `scores` reads its installed kernels here (beam glue.zig `Kernels.predictor`); MiMo's routes none.
+    ctx: ?*const anyopaque = null,
 
     /// Construction: `.bf16` builds the kernel object and its per-M configs (hidden 4096, 256 experts only).
     pub fn install(route: PredictRoute, geometry: anytype) !Predictor {

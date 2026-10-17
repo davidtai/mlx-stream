@@ -1,12 +1,12 @@
 //! beam's memory bill on the shared bill core (mimo_v2/route_bill.zig), in glm5_next's form: the arch's terms (the
 //! trunk's residents and owned tables, the routers' F32 copies, the KV lanes preallocated at the billed context, the q8
 //! tier's prompt view, MLX's cache and its one buffer of overshoot, the compiler and host runtimes, the wiring, the
-//! request's waves, the sampler, the keep-warm engine) and the expert source's (MiMo's route over the NVFP4 bank:
-//! route_bill.zig `sourceTerms`), each phase billed apart. Every byte term is geometric (the arrays graph.zig and
-//! experts.zig build, by their shapes at the billed context and the prompt call's rows, in the buffers MLX allocates
-//! for them) or a declared bound; each term is an upper bound. The fill (sdk.fill) gives the most decode rows and the
-//! most prompt rows (prompt <= decode <= experts) within the host's ceiling less its wired margin, floor 8; forced rows
-//! are an operator pin, loaded as named with the overage reported.
+//! request's waves, the sampler, the keep-warm engine, the decode glue's texts) and the expert source's (MiMo's route
+//! over the NVFP4 bank: route_bill.zig `sourceTerms`), each phase billed apart. Every byte term is geometric (the arrays
+//! graph.zig and experts.zig build, by their shapes at the billed context and the prompt call's rows, in the buffers MLX
+//! allocates for them) or a declared bound; each term is an upper bound. The fill (sdk.fill) gives the most decode rows
+//! and the most prompt rows (prompt <= decode <= experts) within the host's ceiling less its wired margin, floor 8; forced
+//! rows are an operator pin, loaded as named with the overage reported.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -37,6 +37,10 @@ pub const Plan = route_bill.Plan;
 const bf16: u64 = 2;
 const f32b: u64 = 4;
 
+/// The decode glue's texts (glue.zig: two texts, the GEMV's two epilogues and the select text's four widths), their
+/// pipelines and launch configurations, declared (`glue_kernels` term; glm5_next's for its glue).
+pub const glue_kernels_bytes: u64 = 8 << 20;
+
 pub const Inputs = struct {
     model: beam.Config,
     geometry: route_bill.Geometry,
@@ -47,6 +51,8 @@ pub const Inputs = struct {
     combine: prefill_combine.Route = .inplace,
     /// MiMo's X12 keep-warm route (the setting's, not the stream's resolution: MiMo's rule).
     gpu_keep_warm: gpu_warm.Route = .off,
+    /// The decode lane's glue (`settings.Config.decodeGlueBilled`).
+    decode_glue: settings.DecodeGlue = .ops,
     page: u64 = 16_384,
 };
 
@@ -228,6 +234,8 @@ fn archTerms(a: std.mem.Allocator, in: *const Inputs) ![]Term {
         // The plugin's sampler on a row it hands the host (`sdk_ext.sampler.chosen`): eight f32 vocab rows at most.
         .{ .name = "sampler", .bytes = @splat(8 * @as(u64, c.vocab_size) * f32b), .at_construction = false },
         .{ .name = "gpu_warm", .bytes = @splat(if (in.gpu_keep_warm == .waits) gpu_warm.bill_bytes else 0), .at_construction = in.gpu_keep_warm == .waits },
+        // `decode_glue: fused`: the glue's texts, pipelines and configs (glue.zig), declared; 0 under ops.
+        .{ .name = "glue_kernels", .bytes = @splat(if (in.decode_glue == .fused) glue_kernels_bytes else 0), .at_construction = true },
     };
     return a.dupe(Term, &terms);
 }
@@ -272,6 +280,7 @@ pub fn inputsOf(a: std.mem.Allocator, io: std.Io, cfg: *const settings.Config, r
         .reserve = reserve,
         .combine = experts.combineRouteOf(cfg.model.hidden_size, cfg.model.n_experts_per_tok),
         .gpu_keep_warm = cfg.gpu_keep_warm,
+        .decode_glue = cfg.decodeGlueBilled(),
         .page = page,
     };
 }
@@ -457,6 +466,20 @@ test "beam bill: the keep-warm route bills MiMo's declared engine from construct
     defer on.free(a);
     try testing.expectEqual([2]u64{ gpu_warm.bill_bytes, gpu_warm.bill_bytes }, termOf(on, "gpu_warm"));
     try testing.expectEqual(off.fixed(.decode) + gpu_warm.bill_bytes, on.fixed(.decode));
+}
+
+test "beam bill: the fused decode glue bills its declared texts from construction; ops, none" {
+    const a = testing.allocator;
+    var in = try fixtureInputs(32_768);
+    const off = try billOf(a, &in);
+    defer off.free(a);
+    try testing.expectEqual([2]u64{ 0, 0 }, termOf(off, "glue_kernels"));
+    in.decode_glue = .fused;
+    const on = try billOf(a, &in);
+    defer on.free(a);
+    try testing.expectEqual([2]u64{ glue_kernels_bytes, glue_kernels_bytes }, termOf(on, "glue_kernels"));
+    try testing.expectEqual(off.fixed(.decode) + glue_kernels_bytes, on.fixed(.decode));
+    try testing.expectEqual(off.fixed(.prompt) + glue_kernels_bytes, on.fixed(.prompt));
 }
 
 test "beam bill: the attention tile bills the fused attention's working set and a lane copy; the prompt wave covers every stage" {

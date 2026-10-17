@@ -22,7 +22,8 @@
 //! `tile_rows` rows with at most `tiles_in_flight` committed (each sliding ring's append is at most one tile: the ring's
 //! headroom), the dense MLP in tiles, the MoE over every row at once (the wide lane), the layer's output evaluated at
 //! its end. A decode step is one row: its routed calls take the decode lane, whose routing barrier evaluates the layer up
-//! to its router; nothing else is evaluated before the logits.
+//! to its router; nothing else is evaluated before the logits. A decode-lane call's router runs the decode glue's texts
+//! where the construction installed them (glue.zig, `Routes.glue`); a prompt call's runs the stock ops.
 //!
 //! The residents route (`Linear`, `project`), fixed by the pack's `residents_format`: a BF16 projection is MLX's matmul
 //! on the transposed weight (the control). A q8 projection is MLX's `quantized_matmul` (affine, 8 bits, group 64) in a
@@ -42,6 +43,7 @@ const mimo = @import("../mimo_v2/config.zig");
 const kv = @import("../mimo_v2/kv.zig");
 const beam = @import("config.zig");
 const experts = @import("experts.zig");
+const glue = @import("glue.zig");
 
 pub const G = ops_be.MlxOps;
 pub const T = G.T;
@@ -651,6 +653,22 @@ fn mlpTiles(g: *G, a: std.mem.Allocator, c: *const beam.Config, m: Mlp, x: T, ro
 
 pub const Routing = struct { indices: T, weights: T };
 
+/// The forward's construction-time routes: the decode glue's texts (glue.zig; null under `decode_glue: ops`, or before
+/// the construction installed them).
+pub const Routes = struct {
+    glue: ?*const glue.Kernels = null,
+};
+
+/// A call's routing of `x` [n, hidden]: the decode glue's texts on a decode-lane call (`decode`) where installed, else
+/// the stock ops (`route`). The two give the same ids and weights bit for bit (glue.zig).
+fn routeOf(g: *G, c: *const beam.Config, routes: Routes, r: Router, x: T, decode: bool) !Routing {
+    if (decode) if (routes.glue) |k| {
+        const out = try glue.routeRows(g, k, r.w, r.bias, x, @intCast(g.shapeOf(x).dim(0)));
+        return .{ .indices = out.ids, .weights = out.weights };
+    };
+    return route(g, c, r, x);
+}
+
 /// DeepSeek-V3's noaux_tc group top-k (modeling_beam.py `BeamTopKRouter`): f32 logits on the F32 weight, sigmoid; the
 /// choice scores (+ the correction bias) in `n_group` groups, each group scored by the sum of its top-2; the
 /// `topk_group` best groups kept (the others' choice scores -inf); the top-k of the kept choice scores; the weights the
@@ -718,14 +736,14 @@ pub const ForcedRoutes = struct {
 };
 
 /// Routed layer `l`'s routing of rows [start, start + n) under forced routes: the forced ids, the weights at them; the
-/// router's own choice evaluated and recorded.
-fn forcedRoute(g: *G, c: *const beam.Config, r: Router, x: T, f: *const ForcedRoutes, l: u32, start: u32) !Routing {
+/// router's own choice (the call's route: `routeOf`) evaluated and recorded.
+fn forcedRoute(g: *G, c: *const beam.Config, routes: Routes, r: Router, x: T, f: *const ForcedRoutes, l: u32, start: u32, decode: bool) !Routing {
     const n: usize = @intCast(g.shapeOf(x).dim(0));
     const k: c_int = @intCast(c.n_experts_per_tok);
     const moe = l - c.first_k_dense;
     if (f.k != c.n_experts_per_tok or start + n > f.positions) return error.BeamForcedRoutes;
     const s = try routerScores(g, r, x);
-    const own = try select(g, c, s.choice);
+    const own = (try routeOf(g, c, routes, r, x, decode)).indices;
     try g.evalAll(&.{own});
     _ = try g.readU32(own, f.chosen[f.at(moe, start)..][0 .. n * f.k]);
     const inds = try g.hostArray(std.mem.sliceAsBytes(f.ids[f.at(moe, start)..][0 .. n * f.k]), &.{ @intCast(n), k }, .uint32);
@@ -757,10 +775,11 @@ fn postReadAhead(g: *G, c: *const beam.Config, lw: *const Layer, l: u32, x: T, s
 pub const Head = enum { last, all };
 
 /// One forward of `ids` at positions [start, start + ids.len) through every layer (each layer's state advanced in
-/// `cache`), the routed experts through `src`: the last row's logits f32 [1, vocab] (soft-capped), a kept handle the
-/// caller frees; under `head == .all` every row's, f32 [rows, vocab]. `force` is `{}` when served, or the parity test's
-/// `*const ForcedRoutes` (its own comptime instance: the served forward has no branch on it).
-pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Weights, ids: []const u32, start: u32, cache: *Cache, src: anytype, comptime head: Head, force: anytype) !T {
+/// `cache`), the routed experts through `src`, the construction's `routes`: the last row's logits f32 [1, vocab]
+/// (soft-capped), a kept handle the caller frees; under `head == .all` every row's, f32 [rows, vocab]. `force` is `{}`
+/// when served, or the parity test's `*const ForcedRoutes` (its own comptime instance: the served forward has no branch
+/// on it).
+pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Weights, routes: Routes, ids: []const u32, start: u32, cache: *Cache, src: anytype, comptime head: Head, force: anytype) !T {
     const rows: u32 = @intCast(ids.len);
     if (rows == 0 or rows > experts.call_rows) return error.BeamCallRows;
     if (start + rows > cache.cap) return error.ContextOverBill;
@@ -806,7 +825,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
         const x1 = try depthAdd(g, c, try rmsNorm(g, attn, lw.post_attn_norm, c.rms_norm_eps), x, beam.Config.residualIndex(l, false));
         const h = try rmsNorm(g, x1, lw.pre_ff_norm, c.rms_norm_eps);
         const f = if (lw.dense) |d| (if (prompt) try mlpTiles(g, a, c, d, h, rows) else try mlp(g, d, h)) else blk: {
-            const r = if (comptime @TypeOf(force) == void) try route(g, c, lw.router.?, h) else try forcedRoute(g, c, lw.router.?, h, force, l, start);
+            const r = if (comptime @TypeOf(force) == void) try routeOf(g, c, routes, lw.router.?, h, !prompt) else try forcedRoute(g, c, routes, lw.router.?, h, force, l, start, !prompt);
             if (prompt) try g.asyncEval(&.{ r.indices, r.weights });
             const routed = try g.adopt(try src.forward(l, h, r.indices, r.weights));
             break :blk try scaled(g, c, routed, try g.scalar(c.routed_scaling, .float32));
