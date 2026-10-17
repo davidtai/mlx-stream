@@ -816,9 +816,9 @@ fn rowMajor(g: *G, x: T) !T {
     return g.adopt(o);
 }
 
-/// `want` and `got` evaluated and equal bit for bit (same dtype and shape, every byte); the first differing element
-/// named otherwise.
-fn expectBits(name: []const u8, g: *G, want: T, got: T) !void {
+/// `want` and `got` evaluated and equal bit for bit (same dtype and shape, every byte): their element count; the first
+/// differing element named otherwise.
+fn sameBits(name: []const u8, g: *G, want: T, got: T) !usize {
     try g.evalAll(&.{ want, got });
     try testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(got));
     try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
@@ -832,7 +832,13 @@ fn expectBits(name: []const u8, g: *G, want: T, got: T) !void {
         std.debug.print("BEAM FUSED {s}: element {d} differs\n", .{ name, i / mlx.mlx_array_itemsize(w) });
         return error.BeamFusedBits;
     }
-    std.debug.print("BEAM FUSED {s} {any}: {d} elements bit-equal\n", .{ name, mlx.getShape(want), mlx.mlx_array_size(w) });
+    return mlx.mlx_array_size(w);
+}
+
+/// `sameBits`, and a line.
+fn expectBits(name: []const u8, g: *G, want: T, got: T) !void {
+    const n = try sameBits(name, g, want, got);
+    std.debug.print("BEAM FUSED {s} {any}: {d} elements bit-equal\n", .{ name, mlx.getShape(want), n });
 }
 
 test "beam graph GPU: the depth-scaled add's one kernel is the op chain bit for bit (a step's row, a tile, a call)" {
@@ -849,6 +855,8 @@ test "beam graph GPU: the depth-scaled add's one kernel is the op chain bit for 
     // Every sublayer's scales at one row; the first, a middle and the last sublayer at a tile and a whole call.
     for ([_]c_int{ 1, 512, 16_384 }, 0..) |rows, ri| {
         var i: u32 = 2;
+        var sublayers: u32 = 0;
+        var elements: usize = 0;
         while (i <= 2 * c.n_layers + 1) : (i += if (rows == 1) 1 else 51) {
             const m = g.mark();
             defer g.resetTo(m);
@@ -856,8 +864,10 @@ test "beam graph GPU: the depth-scaled add's one kernel is the op chain bit for 
             const r = try testBf16(a, &g, &.{ rows, h }, 2.0, 400 + ri * 1000 + i);
             const fi: f64 = @floatFromInt(i);
             const want = try depthAddChain(&g, x, r, try g.scalar(1.0 / @sqrt(fi), .float32), try g.scalar(@sqrt((fi - 1.0) / fi), .float32));
-            try expectBits("depth_add", &g, want, try depthAdd(&g, &c, x, r, i));
+            elements += try sameBits("depth_add", &g, want, try depthAdd(&g, &c, x, r, i));
+            sublayers += 1;
         }
+        std.debug.print("BEAM FUSED depth_add {{ {d}, {d} }}: {d} sublayers, {d} elements bit-equal\n", .{ rows, h, sublayers, elements });
     }
 }
 
