@@ -130,14 +130,14 @@ pub fn promptWaveBytes(c: *const beam.Config, t: u64, keys: u64) u64 {
 }
 
 /// The decode wave: a step's graph between two routing barriers (the layers' arrays at one row, the widest attention
-/// at `keys` keys and the widest MLP), the routed rows, the stream, and the head's logits (bf16, f32, the cap's three
-/// f32 stages). The first barrier comes after the dense layers and the first routed layer's attention: the wave holds
-/// max(2, first_k_dense + 1) layers.
+/// at `keys` keys and the widest MLP), the routed rows, the stream, and the head's logits (bf16, and the soft cap's f32:
+/// one compiled kernel). The first barrier comes after the dense layers and the first routed layer's attention: the
+/// wave holds max(2, first_k_dense + 1) layers.
 pub fn decodeWaveBytes(c: *const beam.Config, keys: u64) u64 {
     const h: u64 = c.hidden_size;
     const mlp = @max(denseRowBytes(c), moeRowBytes(c) + @as(u64, c.n_experts_per_tok) * (2 * h + 6 * @as(u64, c.moe_intermediate_size)) * bf16);
     const layer = attnTileBytes(c, 1, keys) + mlp + 9 * h * bf16;
-    return @max(2, @as(u64, c.first_k_dense) + 1) * layer + @as(u64, c.vocab_size) * (bf16 + 4 * f32b);
+    return @max(2, @as(u64, c.first_k_dense) + 1) * layer + @as(u64, c.vocab_size) * (bf16 + f32b);
 }
 
 /// The phase's largest single buffer (MLX's cache can end one freed buffer over its limit). Prompt: the router's f32

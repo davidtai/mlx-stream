@@ -441,12 +441,14 @@ const DepthAdd = struct {
 pub fn prepareFused(g: *G, c: *const beam.Config) !void {
     try g.prepareTape(DepthAdd, c);
     try g.prepareTape(ScaleBy, c);
+    try g.prepareTape(Softcap, c);
     const m = g.mark();
     defer g.resetTo(m);
     const row = try g.zeros(&.{ 1, @intCast(c.hidden_size) }, .bfloat16);
     // The full layers' query: [1, heads, rows, head_dim] against [1, 1, rows, 1] (its own signature).
     const q = try g.zeros(&.{ 1, @intCast(c.n_heads), 1, @intCast(c.head_dim) }, .bfloat16);
-    try g.evalAll(&.{ try depthAdd(g, c, row, row, 2), try scaled(g, c, row, try g.scalar(c.routed_scaling, .float32)), try scaled(g, c, q, try ssmaxScale(g, 0, 1)) });
+    const logits = try g.zeros(&.{ 1, @intCast(c.vocab_size) }, .bfloat16);
+    try g.evalAll(&.{ try depthAdd(g, c, row, row, 2), try scaled(g, c, row, try g.scalar(c.routed_scaling, .float32)), try scaled(g, c, q, try ssmaxScale(g, 0, 1)), try softcap(g, c, logits) });
 }
 
 /// The full layers' query scale at rows [pos, pos + n): (1 + (p + 1) / 2048) ^ 0.1, f32 [1, 1, n, 1].
@@ -717,12 +719,35 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
     return g.keep(try logitsOf(g, c, w, last));
 }
 
-/// The head over `x` [r, hidden]: the final norm, lm_head (bf16), then the soft cap in f32: cap * tanh(logits / cap).
+/// The head over `x` [r, hidden]: the final norm, lm_head (bf16), then the soft cap in f32: cap * tanh(logits / cap), one
+/// compiled kernel (`Softcap`).
 pub fn logitsOf(g: *G, c: *const beam.Config, w: *const Weights, x: T) !T {
-    const logits = try g.astype(try linear(g, try rmsNorm(g, x, w.norm, c.rms_norm_eps), w.head), .float32);
-    const cap: f64 = c.final_logit_softcapping;
-    return g.mul(try tanh(g, try g.mul(logits, try g.scalar(1.0 / cap, .float32))), try g.scalar(cap, .float32));
+    return softcap(g, c, try linear(g, try rmsNorm(g, x, w.norm, c.rms_norm_eps), w.head));
 }
+
+fn softcap(g: *G, c: *const beam.Config, logits: T) !T {
+    const cap: f64 = c.final_logit_softcapping;
+    var o: [1]T = undefined;
+    try g.tape(Softcap, c, &.{ logits, try g.scalar(1.0 / cap, .float32), try g.scalar(cap, .float32) }, &o);
+    return o[0];
+}
+
+/// The soft cap's op chain (the region's body, the device test's control): tanh(f32(logits) * inv) * cap, f32.
+pub fn softcapChain(g: *G, logits: T, inv: T, cap: T) !T {
+    return g.mul(try tanh(g, try g.mul(try g.astype(logits, .float32), inv)), cap);
+}
+
+/// The soft cap as one compiled kernel (shapeless): the f32 copy, the two products and the tanh in registers; only the
+/// f32 logits are written.
+const Softcap = struct {
+    pub const region: ops_be.Region = .beam_softcap;
+    pub const Ctx = beam.Config;
+    pub const n_out = 1;
+    pub const shapeless = true;
+    pub fn run(g: *G, _: *const Ctx, in: []const T, out: []T) !void {
+        out[0] = try softcapChain(g, in[0], in[1], in[2]);
+    }
+};
 
 const testing = std.testing;
 
@@ -875,6 +900,27 @@ test "beam graph GPU: the full layers' query scale is one kernel, the op chain b
         const q = try g.transposeAxes(try g.reshape(x, &.{ 1, n, heads, hd }), &.{ 0, 2, 1, 3 });
         const s = try ssmaxScale(&g, pos, rows);
         try expectBits("query_scale", &g, try scaleBy(&g, q, s), try scaled(&g, &c, q, s));
+    }
+}
+
+test "beam graph GPU: the soft cap is one kernel, the op chain bit for bit (a step's logits, a parity call's)" {
+    try deviceTest();
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = try G.init(a, stream);
+    defer g.deinit();
+    const c: beam.Config = .{};
+    try prepareFused(&g, &c);
+    const vocab: c_int = @intCast(c.vocab_size);
+    for ([_]c_int{ 1, 40 }, 0..) |rows, i| {
+        const m = g.mark();
+        defer g.resetTo(m);
+        const l = try testBf16(a, &g, &.{ rows, vocab }, 12.0, 700 + i);
+        const cap: f64 = c.final_logit_softcapping;
+        const want = try softcapChain(&g, l, try g.scalar(1.0 / cap, .float32), try g.scalar(cap, .float32));
+        try expectBits("softcap", &g, want, try softcap(&g, &c, l));
     }
 }
 
