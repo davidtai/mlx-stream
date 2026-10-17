@@ -66,6 +66,7 @@ comptime {
     _ = @import("arch/beam/settings.zig");
     _ = @import("arch/beam/experts.zig");
     _ = @import("arch/beam/graph.zig");
+    _ = @import("arch/beam/glue.zig");
     _ = @import("arch/beam/bill.zig");
     _ = @import("arch/beam/module.zig");
     _ = @import("arch/beam/root.zig");
