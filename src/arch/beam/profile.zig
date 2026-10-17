@@ -259,6 +259,7 @@ pub fn decodeEnd(src: anytype) void {
     if (state.gpu_truncated) log.info("VERIFY_GPU_TIMELINE_TRUNCATED {{\"cycles\": {d}}}\n", .{timeline.max_cycles});
     if (state.out) |base| {
         writeGpuJson(base);
+        writeDecodeRows(base);
         writeKernels(base, ".decode-kernels.tsv");
         writeReads(base, ".decode-reads.tsv");
     }
@@ -314,6 +315,51 @@ fn writeGpuJson(base: []const u8) void {
     defer aw.deinit();
     timeline.writeJson(&aw.writer) catch |e| return log.err(tag ++ "_GPU_TIMELINE json: {s}\n", .{@errorName(e)});
     writeOut(base, ".decode-timeline.json", aw.written());
+}
+
+/// The decode's command-buffer rows in commit order (the kernel log's `row` is the line's index; `queue` 0 = another
+/// queue's, the keep-warm engine's), each step's forward window and each routed layer's host stamps, the read pool's
+/// event signals: absolute ns (the read log's clock).
+fn writeDecodeRows(base: []const u8) void {
+    const st = timeline.stored();
+    {
+        var aw: std.Io.Writer.Allocating = .init(state.a);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.writeAll("row\tcycle\tphase\thost_commit_ns\tgpu_start_ns\tgpu_end_ns\thost_done_ns\tstatus\tqueue\n") catch return;
+        for (st.rows, 0..) |r, i| {
+            const cyc: i64 = if (timeline.rowCycle(r)) |x| x else -1;
+            w.print("{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{ i, cyc, timeline.rowPhase(r), r.host_commit, r.gpu_start, r.gpu_end, r.host_done, r.status, r.queue }) catch return;
+        }
+        writeOut(base, ".decode-rows.tsv", aw.written());
+    }
+    {
+        var aw: std.Io.Writer.Allocating = .init(state.a);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.writeAll("cycle\tbegin_ns\tend_ns\n") catch return;
+        for (st.verifies, 0..) |vf, i| w.print("{d}\t{d}\t{d}\n", .{ i, vf.begin, vf.end }) catch return;
+        writeOut(base, ".decode-steps.tsv", aw.written());
+    }
+    {
+        var aw: std.Io.Writer.Allocating = .init(state.a);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.writeAll("cycle\tlayer\tcall_ns\tbarrier_ns\troute_ns\thit_ns\tend_ns\tread_gauge_call_ns\tread_gauge_end_ns\tmissed\tgate_gu\tgate_down\n") catch return;
+        for (st.layers, 0..) |ls, ci| for (ls[0..st.n_layers], 0..) |l, li| {
+            if (l.t[0] == 0) continue;
+            w.print("{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{ ci, li, l.t[0], l.t[1], l.t[2], l.t[3], l.t[4], l.read_call, l.read_end, @intFromBool(l.missed), l.gate_gu, l.gate_down }) catch return;
+        };
+        writeOut(base, ".decode-layers.tsv", aw.written());
+    }
+    {
+        var aw: std.Io.Writer.Allocating = .init(state.a);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.writeAll("value\tsignal_call_ns\tbytes_landed_ns\tcall_ns\n") catch return;
+        for (timeline.storedSignals()) |sg| w.print("{d}\t{d}\t{d}\t{d}\n", .{ sg[0], sg[1], sg[2], sg[3] }) catch return;
+        writeOut(base, ".decode-signals.tsv", aw.written());
+    }
 }
 
 /// The prompt pass's command-buffer rows in commit order (the kernel log's `row` is the line's index), absolute ns.
