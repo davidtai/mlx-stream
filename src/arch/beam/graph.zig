@@ -499,14 +499,17 @@ pub fn prepareFused(g: *G, c: *const beam.Config) !void {
     try g.evalAll(&.{ try depthAdd(g, c, row, row, 2), try scaled(g, c, row, try g.scalar(c.routed_scaling, .float32)), try scaled(g, c, q, try ssmaxScale(g, 0, 1)), try softcap(g, c, logits) });
 }
 
-/// The full layers' query scale at rows [pos, pos + n): (1 + (p + 1) / 2048) ^ 0.1, f32 [1, 1, n, 1].
+/// The full layers' query scale at position `pos`: (1 + (pos + 1) / 2048) ^ 0.1 in f32.
+pub fn ssmaxAt(pos: u32) f32 {
+    const p: f32 = @floatFromInt(pos);
+    return @exp(beam.ssmax_power * std.math.log1p((p + 1) / beam.ssmax_base));
+}
+
+/// The full layers' query scale at rows [pos, pos + n): `ssmaxAt` of each, f32 [1, 1, n, 1].
 fn ssmaxScale(g: *G, pos: u32, n: u32) !T {
     var buf: [tile_rows]f32 = undefined;
     std.debug.assert(n <= tile_rows);
-    for (buf[0..n], 0..) |*x, i| {
-        const p: f32 = @floatFromInt(pos + @as(u32, @intCast(i)));
-        x.* = @exp(beam.ssmax_power * std.math.log1p((p + 1) / beam.ssmax_base));
-    }
+    for (buf[0..n], 0..) |*x, i| x.* = ssmaxAt(pos + @as(u32, @intCast(i)));
     return g.hostArray(std.mem.sliceAsBytes(buf[0..n]), &.{ 1, 1, @intCast(n), 1 }, .float32);
 }
 
@@ -549,33 +552,50 @@ fn checkProjections(g: *G, a: std.mem.Allocator, c: *const beam.Config, at: *con
     inline for (.{ "q", "k", "v", "gate" }) |f| glue.sameBytes(g, "the fused projections' " ++ f, @field(stock, f), @field(fused, f), null) catch return error.BeamFusedProjections;
 }
 
+/// `x` [rows, hh x d] as [1, hh, rows, d] (a view).
+fn heads4(g: *G, x: T, rows: c_int, hh: c_int, d: c_int) !T {
+    return g.transposeAxes(try g.reshape(x, &.{ 1, rows, hh, d }), &.{ 0, 2, 1, 3 });
+}
+
+/// A tile's query and key heads at positions [pos, pos + n) from its projections `q` [n, heads x d] and `k` [n, kv
+/// heads x d]: q [1, heads, n, d], k [1, kv heads, n, d], each head normed over its d (q_norm / k_norm), then RoPE on a
+/// sliding layer, or the query times the full layer's scale. The stock ops (two norms and two ropes, or two norms and the
+/// scale's compiled kernel); glue.zig `qkNorm` gives the same bits on a decode row in one dispatch.
+pub fn qkStock(g: *G, c: *const beam.Config, q_norm: T, k_norm: T, q: T, k: T, n: c_int, pos: u32, full: bool) !glue.Heads {
+    const heads: c_int = @intCast(c.n_heads);
+    const kvh: c_int = @intCast(c.n_kv_heads);
+    const hd: c_int = @intCast(c.head_dim);
+    var qh = try heads4(g, try rmsNorm(g, try g.reshape(q, &.{ n, heads, hd }), q_norm, c.rms_norm_eps), n, heads, hd);
+    var kh = try heads4(g, try rmsNorm(g, try g.reshape(k, &.{ n, kvh, hd }), k_norm, c.rms_norm_eps), n, kvh, hd);
+    if (full) {
+        qh = try scaled(g, c, qh, try ssmaxScale(g, pos, @intCast(n)));
+    } else {
+        qh = try rope(g, qh, c.head_dim, c.rope_theta, pos);
+        kh = try rope(g, kh, c.head_dim, c.rope_theta, pos);
+    }
+    return .{ .q = qh, .k = kh };
+}
+
 /// One attention tile of layer `lw`: `xn` [n, hidden] (the input norm's rows) at positions [pos, pos + n) -> [n, hidden].
-pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const Layer, xn: T, pos: u32, cache: *Cache) !T {
+/// A one-row tile's heads come from the decode glue's text where it is installed (`gl`), else from the stock ops.
+pub fn attention(g: *G, a: std.mem.Allocator, c: *const beam.Config, lw: *const Layer, xn: T, pos: u32, cache: *Cache, gl: ?*const glue.Kernels) !T {
     const n: c_int = @intCast(g.shapeOf(xn).dim(0));
     const nu: u32 = @intCast(n);
     const heads: c_int = @intCast(c.n_heads);
     const kvh: c_int = @intCast(c.n_kv_heads);
     const hd: c_int = @intCast(c.head_dim);
     const at = &lw.attn;
-    const heads4 = struct {
-        fn f(gg: *G, x: T, rows: c_int, hh: c_int, d: c_int) !T {
-            return gg.transposeAxes(try gg.reshape(x, &.{ 1, rows, hh, d }), &.{ 0, 2, 1, 3 });
-        }
-    }.f;
     const p = try projections(g, c, at, xn);
-    // [1, heads, n, d]: each head normed over its d (q_norm / k_norm), then RoPE on a sliding layer.
-    var q = try heads4(g, try rmsNorm(g, try g.reshape(p.q, &.{ n, heads, hd }), at.q_norm, c.rms_norm_eps), n, heads, hd);
-    var k = try heads4(g, try rmsNorm(g, try g.reshape(p.k, &.{ n, kvh, hd }), at.k_norm, c.rms_norm_eps), n, kvh, hd);
+    const qk = if (n == 1 and gl != null) try glue.qkNorm(g, gl.?, p.q, p.k, at.q_norm, at.k_norm, pos, lw.full, ssmaxAt(pos)) else try qkStock(g, c, at.q_norm, at.k_norm, p.q, p.k, n, pos, lw.full);
+    const q = qk.q;
+    const k = qk.k;
     const v = try heads4(g, p.v, n, kvh, hd);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
     var out: T = undefined;
     if (lw.full) {
-        q = try scaled(g, c, q, try ssmaxScale(g, pos, nu));
         const view = try cache.slabs[lw.slot].append(g, k, v, pos, nu);
         out = if (n > 1) try sdpa(g, q, view.k, view.v, scale, "causal", .{}) else try sdpa(g, q, view.k, view.v, scale, "", .{});
     } else {
-        q = try rope(g, q, c.head_dim, c.rope_theta, pos);
-        k = try rope(g, k, c.head_dim, c.rope_theta, pos);
         const view = try cache.rings[lw.slot].append(k, v, nu);
         const vk = try g.adopt(view.k);
         const vv = try g.adopt(view.v);
@@ -779,7 +799,7 @@ pub fn forward(g: *G, a: std.mem.Allocator, c: *const beam.Config, w: *const Wei
             const hi: u32 = @min(rows, lo + tile_rows);
             const ms = g.mark();
             const tile = if (n_tiles == 1) xn else try g.slice(xn, &.{ @intCast(lo), 0 }, &.{ @intCast(hi), hidden }, &.{ 1, 1 });
-            outs[i] = g.keep(try attention(g, a, c, lw, tile, start + lo, cache));
+            outs[i] = g.keep(try attention(g, a, c, lw, tile, start + lo, cache, routes.glue));
             n_kept += 1;
             g.resetTo(ms);
             if (!prompt) continue;

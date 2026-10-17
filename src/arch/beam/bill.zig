@@ -37,8 +37,9 @@ pub const Plan = route_bill.Plan;
 const bf16: u64 = 2;
 const f32b: u64 = 4;
 
-/// The decode glue's texts (glue.zig: two texts, the GEMV's two epilogues and the select text's four widths), their
-/// pipelines and launch configurations, declared (`glue_kernels` term; glm5_next's for its glue).
+/// The decode glue's texts (glue.zig: three texts, the GEMV's two epilogues, the select text's four widths and the q / k
+/// norm text's two modes), their pipelines and launch configurations, declared (`glue_kernels` term; glm5_next's for its
+/// glue).
 pub const glue_kernels_bytes: u64 = 8 << 20;
 
 pub const Inputs = struct {
